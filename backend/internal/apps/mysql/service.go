@@ -1,0 +1,516 @@
+package mysql
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strconv"
+	"strings"
+
+	mysqlinstaller "aifar-deployment/backend/internal/installer/mysql"
+	"aifar-deployment/backend/internal/store"
+)
+
+type Store interface {
+	GetServer(id string, includeSecret bool) (store.Server, error)
+	SaveAppInstance(v store.AppInstance) (store.AppInstance, error)
+	DeleteAppInstance(id string) error
+}
+
+type InstallRequest struct {
+	Version         string
+	Topology        string
+	Language        string
+	ServerID        string
+	ServerIDs       []string
+	DefaultPassword string
+	Parameters      map[string]any
+}
+
+type DeleteRequest struct {
+	Instance store.AppInstance
+	Server   store.Server
+	Language string
+}
+
+type Service struct {
+	store  Store
+	remote mysqlinstaller.Remote
+}
+
+type stepDef struct {
+	Name  string
+	Title string
+}
+
+type targetLogger func(target string) mysqlinstaller.Logger
+
+type stepRecorder interface {
+	StartTarget(target string)
+	FinishTarget(target, status, errText string)
+	StartStep(target, name, title string, order int)
+	FinishStep(target, name, status, errText string)
+}
+
+func NewService(s Store, remote mysqlinstaller.Remote) Service {
+	return Service{store: s, remote: remote}
+}
+
+func (s Service) Install(ctx context.Context, req InstallRequest, resources []store.Resource, log mysqlinstaller.Logger, targetLog targetLogger) error {
+	copy := CopyFor(req.Language)
+	topology := normalizeTopology(req.Topology)
+	switch topology {
+	case "innodb-cluster":
+		return s.installInnoDBCluster(ctx, req, resources, log, targetLog)
+	case "standalone":
+	default:
+		return fmt.Errorf(copy.ClusterUnsupported, topology)
+	}
+	targets := targetServerIDs(req)
+	if len(targets) != 1 {
+		return errors.New(copy.SingleTargetOnly)
+	}
+	options := mysqlOptions(req.Parameters, req.DefaultPassword)
+	if err := options.Validate(); err != nil {
+		return err
+	}
+	bundle, err := mysqlinstaller.SelectBundle(resources, req.Version)
+	if err != nil {
+		return err
+	}
+	if err := mysqlinstaller.VerifyBundle(bundle); err != nil {
+		return err
+	}
+	log.Info(copy.UsingArchive, bundle.ArchivePath)
+	log.Info(copy.UsingRPMs, len(bundle.RPMPaths))
+	target := targets[0]
+	logForServer := logForTarget(log, targetLog, target)
+	recorder, _ := log.(stepRecorder)
+	if recorder != nil {
+		recorder.StartTarget(target)
+	}
+	step := newStepRunner(logForServer, recorder, target, copy)
+	var server store.Server
+	if err := step(1, "load-server", copy.LoadServer, func() error {
+		var loadErr error
+		server, loadErr = s.store.GetServer(target, true)
+		return loadErr
+	}); err != nil {
+		msg := fmt.Sprintf(copy.LoadFailed, err)
+		logForServer.Error("%s", msg)
+		finishTarget(recorder, target, "failed", msg)
+		return err
+	}
+	if err := step(2, "verify-resource", copy.VerifyResource, func() error {
+		return mysqlinstaller.VerifyBundle(bundle)
+	}); err != nil {
+		msg := fmt.Sprintf(copy.InstallFailed, err)
+		logForServer.Error("%s", msg)
+		finishTarget(recorder, target, "failed", msg)
+		return err
+	}
+	installer := mysqlinstaller.NewInstaller(s.remote)
+	if err := step(3, "install-mysql", copy.InstallStandalone, func() error {
+		return installer.Install(ctx, server, bundle, options, logForServer)
+	}); err != nil {
+		msg := fmt.Sprintf(copy.InstallFailed, err)
+		logForServer.Error("%s", msg)
+		finishTarget(recorder, target, "failed", msg)
+		return err
+	}
+	var instance store.AppInstance
+	if err := step(4, "record-instance", copy.RecordInstance, func() error {
+		metadata, _ := json.Marshal(map[string]any{
+			"resourcePath": bundle.ArchivePath,
+			"rpmCount":     len(bundle.RPMPaths),
+			"port":         options.Port,
+			"rootUser":     options.RootUser,
+			"serviceName":  fmt.Sprintf("aifar-mysql-%d", options.Port),
+			"endpoint":     fmt.Sprintf("%s:%d", server.Host, options.Port),
+			"topology":     "standalone",
+			"auth":         "password",
+		})
+		var saveErr error
+		instance, saveErr = s.store.SaveAppInstance(store.AppInstance{
+			App:      "mysql",
+			Version:  bundle.Version,
+			ServerID: server.ID,
+			Status:   "installed",
+			Topology: "standalone",
+			Metadata: string(metadata),
+		})
+		return saveErr
+	}); err != nil {
+		msg := fmt.Sprintf(copy.RecordFailed, err)
+		logForServer.Error("%s", msg)
+		finishTarget(recorder, target, "failed", msg)
+		return err
+	}
+	logForServer.Info(copy.Installed, instance.ID)
+	finishTarget(recorder, target, "success", "")
+	return nil
+}
+
+func (s Service) installInnoDBCluster(ctx context.Context, req InstallRequest, resources []store.Resource, log mysqlinstaller.Logger, targetLog targetLogger) error {
+	copy := CopyFor(req.Language)
+	targets := targetServerIDs(req)
+	if len(targets) < 3 {
+		return errors.New(copy.ClusterNeedNodes)
+	}
+	options := mysqlOptions(req.Parameters, req.DefaultPassword)
+	if err := options.Validate(); err != nil {
+		return err
+	}
+	bundle, err := mysqlinstaller.SelectBundle(resources, req.Version)
+	if err != nil {
+		return err
+	}
+	if err := mysqlinstaller.VerifyBundle(bundle); err != nil {
+		return err
+	}
+	log.Info(copy.UsingArchive, bundle.ArchivePath)
+	log.Info(copy.UsingRPMs, len(bundle.RPMPaths))
+
+	clusterID := store.NewID("mysql_cluster")
+	clusterName := mysqlClusterName(req.Parameters)
+	preloadedServers := make(map[string]store.Server, len(targets))
+	nodes := make([]mysqlinstaller.InnoDBClusterNode, 0, len(targets))
+	for _, target := range targets {
+		server, loadErr := s.store.GetServer(target, true)
+		if loadErr != nil {
+			return loadErr
+		}
+		preloadedServers[target] = server
+		nodes = append(nodes, mysqlinstaller.InnoDBClusterNode{Host: server.Host, Port: options.Port})
+	}
+	installer := mysqlinstaller.NewInstaller(s.remote)
+	recorder, _ := log.(stepRecorder)
+	steps := mysqlInstallStepsFor("innodb-cluster", copy)
+	for _, target := range targets {
+		logForServer := logForTarget(log, targetLog, target)
+		if recorder != nil {
+			recorder.StartTarget(target)
+		}
+		step := newStepRunnerWithSteps(logForServer, recorder, target, copy, steps)
+		var server store.Server
+		if err := step(1, "load-server", copy.LoadServer, func() error {
+			server = preloadedServers[target]
+			return nil
+		}); err != nil {
+			msg := fmt.Sprintf(copy.LoadFailed, err)
+			logForServer.Error("%s", msg)
+			finishTarget(recorder, target, "failed", msg)
+			return err
+		}
+		if err := step(2, "verify-resource", copy.VerifyResource, func() error {
+			return mysqlinstaller.VerifyBundle(bundle)
+		}); err != nil {
+			msg := fmt.Sprintf(copy.InstallFailed, err)
+			logForServer.Error("%s", msg)
+			finishTarget(recorder, target, "failed", msg)
+			return err
+		}
+		if err := step(3, "install-mysql", copy.InstallStandalone, func() error {
+			return installer.Install(ctx, server, bundle, options, logForServer)
+		}); err != nil {
+			msg := fmt.Sprintf(copy.InstallFailed, err)
+			logForServer.Error("%s", msg)
+			finishTarget(recorder, target, "failed", msg)
+			return err
+		}
+	}
+
+	bootstrapTarget := targets[0]
+	bootstrapServer := preloadedServers[bootstrapTarget]
+	bootstrapLog := logForTarget(log, targetLog, bootstrapTarget)
+	bootstrapStep := newStepRunnerWithSteps(bootstrapLog, recorder, bootstrapTarget, copy, steps)
+	if err := bootstrapStep(4, "bootstrap-cluster", copy.BootstrapCluster, func() error {
+		return installer.BootstrapInnoDBCluster(ctx, bootstrapServer, mysqlinstaller.InnoDBClusterBootstrapRequest{
+			ClusterName:  clusterName,
+			RootUser:     options.RootUser,
+			RootPassword: options.RootPassword,
+			Nodes:        nodes,
+		}, bootstrapLog)
+	}); err != nil {
+		msg := fmt.Sprintf(copy.InstallFailed, err)
+		bootstrapLog.Error("%s", msg)
+		for _, target := range targets {
+			finishTarget(recorder, target, "failed", msg)
+		}
+		return err
+	}
+
+	for _, target := range targets {
+		logForServer := logForTarget(log, targetLog, target)
+		step := newStepRunnerWithSteps(logForServer, recorder, target, copy, steps)
+		server := preloadedServers[target]
+		var instance store.AppInstance
+		if err := step(5, "record-instance", copy.RecordInstance, func() error {
+			metadata, _ := json.Marshal(map[string]any{
+				"clusterId":    clusterID,
+				"clusterName":  clusterName,
+				"resourcePath": bundle.ArchivePath,
+				"rpmCount":     len(bundle.RPMPaths),
+				"port":         options.Port,
+				"rootUser":     options.RootUser,
+				"endpoint":     fmt.Sprintf("%s:%d", server.Host, options.Port),
+				"topology":     "innodb-cluster",
+				"auth":         "password",
+			})
+			var saveErr error
+			instance, saveErr = s.store.SaveAppInstance(store.AppInstance{
+				App:      "mysql",
+				Version:  bundle.Version,
+				ServerID: server.ID,
+				Status:   "installed",
+				Topology: "innodb-cluster",
+				Metadata: string(metadata),
+			})
+			return saveErr
+		}); err != nil {
+			msg := fmt.Sprintf(copy.RecordFailed, err)
+			logForServer.Error("%s", msg)
+			finishTarget(recorder, target, "failed", msg)
+			return err
+		}
+		logForServer.Info(copy.Installed, instance.ID)
+		finishTarget(recorder, target, "success", "")
+	}
+	log.Info(copy.ClusterInstalled, len(targets))
+	return nil
+}
+
+func (s Service) Delete(ctx context.Context, req DeleteRequest, log mysqlinstaller.Logger, targetLog targetLogger) error {
+	copy := DeleteCopyFor(req.Language)
+	target := req.Instance.ServerID
+	if target == "" {
+		target = req.Server.ID
+	}
+	logForServer := logForTarget(log, targetLog, target)
+	recorder, _ := log.(stepRecorder)
+	if recorder != nil {
+		recorder.StartTarget(target)
+	}
+	step := newDeleteStepRunner(logForServer, recorder, target, copy)
+	port := instancePort(req.Instance)
+	uninstaller := mysqlinstaller.NewUninstaller(s.remote)
+	if err := step(1, "remove-remote", copy.RemoveRemote, func() error {
+		return uninstaller.Uninstall(ctx, req.Server, req.Instance.Version, port, logForServer)
+	}); err != nil {
+		msg := fmt.Sprintf("%s: %v", req.Server.Name, err)
+		logForServer.Error(copy.DeleteFailed, msg)
+		finishTarget(recorder, target, "failed", msg)
+		return err
+	}
+	if err := step(2, "delete-instance", copy.DeleteInstance, func() error {
+		return s.store.DeleteAppInstance(req.Instance.ID)
+	}); err != nil {
+		msg := fmt.Sprintf("%s: %v", req.Server.Name, err)
+		logForServer.Error(copy.DeleteFailed, msg)
+		finishTarget(recorder, target, "failed", msg)
+		return err
+	}
+	logForServer.Info(copy.Deleted, req.Instance.ID)
+	finishTarget(recorder, target, "success", "")
+	return nil
+}
+
+func mysqlOptions(params map[string]any, defaultPassword string) mysqlinstaller.InstallOptions {
+	return mysqlinstaller.InstallOptions{
+		Port:         intParam(params, "port", 3306),
+		RootUser:     stringParam(params, "rootUser", "root"),
+		RootPassword: passwordParam(params, defaultPassword),
+	}
+}
+
+func passwordParam(params map[string]any, fallback string) string {
+	for _, key := range []string{"rootPassword", "password", "mysqlPassword"} {
+		if value, ok := params[key]; ok {
+			text := strings.TrimSpace(fmt.Sprint(value))
+			if text != "" {
+				return text
+			}
+		}
+	}
+	fallback = strings.TrimSpace(fallback)
+	if fallback == "" {
+		return "Oversea.123"
+	}
+	return fallback
+}
+
+func mysqlClusterName(params map[string]any) string {
+	name := stringParam(params, "clusterName", "aifarCluster")
+	replacer := strings.NewReplacer(" ", "", "-", "", "_", "")
+	name = replacer.Replace(name)
+	if name == "" {
+		return "aifarCluster"
+	}
+	return name
+}
+
+func stringParam(params map[string]any, key, fallback string) string {
+	if value, ok := params[key]; ok {
+		text := strings.TrimSpace(fmt.Sprint(value))
+		if text != "" {
+			return text
+		}
+	}
+	return fallback
+}
+
+func intParam(params map[string]any, key string, fallback int) int {
+	value, ok := params[key]
+	if !ok {
+		return fallback
+	}
+	switch v := value.(type) {
+	case int:
+		return normalizePort(v, fallback)
+	case int64:
+		return normalizePort(int(v), fallback)
+	case float64:
+		return normalizePort(int(v), fallback)
+	case string:
+		n, _ := strconv.Atoi(strings.TrimSpace(v))
+		return normalizePort(n, fallback)
+	default:
+		return fallback
+	}
+}
+
+func normalizePort(port, fallback int) int {
+	if port <= 0 || port > 65535 {
+		return fallback
+	}
+	return port
+}
+
+func targetServerIDs(req InstallRequest) []string {
+	seen := map[string]bool{}
+	var out []string
+	add := func(id string) {
+		id = strings.TrimSpace(id)
+		if id == "" || seen[id] {
+			return
+		}
+		seen[id] = true
+		out = append(out, id)
+	}
+	add(req.ServerID)
+	for _, id := range req.ServerIDs {
+		add(id)
+	}
+	return out
+}
+
+func instancePort(instance store.AppInstance) int {
+	var metadata struct {
+		Port int `json:"port"`
+	}
+	_ = json.Unmarshal([]byte(instance.Metadata), &metadata)
+	return normalizePort(metadata.Port, 3306)
+}
+
+func normalizeTopology(topology string) string {
+	topology = strings.ToLower(strings.TrimSpace(topology))
+	if topology == "" || topology == "single" {
+		return "standalone"
+	}
+	return topology
+}
+
+func mysqlInstallSteps(copy Copy) []stepDef {
+	return mysqlInstallStepsFor("standalone", copy)
+}
+
+func mysqlInstallStepsFor(topology string, copy Copy) []stepDef {
+	if normalizeTopology(topology) == "innodb-cluster" {
+		return []stepDef{
+			{Name: "load-server", Title: copy.LoadServer},
+			{Name: "verify-resource", Title: copy.VerifyResource},
+			{Name: "install-mysql", Title: copy.InstallStandalone},
+			{Name: "bootstrap-cluster", Title: copy.BootstrapCluster},
+			{Name: "record-instance", Title: copy.RecordInstance},
+		}
+	}
+	return []stepDef{
+		{Name: "load-server", Title: copy.LoadServer},
+		{Name: "verify-resource", Title: copy.VerifyResource},
+		{Name: "install-mysql", Title: copy.InstallStandalone},
+		{Name: "record-instance", Title: copy.RecordInstance},
+	}
+}
+
+func mysqlDeleteSteps(copy DeleteCopy) []stepDef {
+	return []stepDef{
+		{Name: "remove-remote", Title: copy.RemoveRemote},
+		{Name: "delete-instance", Title: copy.DeleteInstance},
+	}
+}
+
+func newStepRunner(log mysqlinstaller.Logger, recorder stepRecorder, target string, copy Copy) func(stepIndex int, stepName, label string, fn func() error) error {
+	steps := mysqlInstallSteps(copy)
+	return newStepRunnerWithSteps(log, recorder, target, copy, steps)
+}
+
+func newStepRunnerWithSteps(log mysqlinstaller.Logger, recorder stepRecorder, target string, copy Copy, steps []stepDef) func(stepIndex int, stepName, label string, fn func() error) error {
+	return func(stepIndex int, stepName, label string, fn func() error) error {
+		if recorder != nil {
+			recorder.StartStep(target, stepName, label, stepIndex)
+		}
+		log.Info(copy.StepStart, stepIndex, len(steps), label)
+		if err := fn(); err != nil {
+			log.Error(copy.StepFailed, stepIndex, len(steps), label, err)
+			if recorder != nil {
+				recorder.FinishStep(target, stepName, "failed", err.Error())
+			}
+			return err
+		}
+		log.Info(copy.StepDone, stepIndex, len(steps), label)
+		if recorder != nil {
+			recorder.FinishStep(target, stepName, "success", "")
+		}
+		return nil
+	}
+}
+
+func newDeleteStepRunner(log mysqlinstaller.Logger, recorder stepRecorder, target string, copy DeleteCopy) func(stepIndex int, stepName, label string, fn func() error) error {
+	steps := mysqlDeleteSteps(copy)
+	return func(stepIndex int, stepName, label string, fn func() error) error {
+		if recorder != nil {
+			recorder.StartStep(target, stepName, label, stepIndex)
+		}
+		log.Info(copy.StepStart, stepIndex, len(steps), label)
+		if err := fn(); err != nil {
+			log.Error(copy.StepFailed, stepIndex, len(steps), label, err)
+			if recorder != nil {
+				recorder.FinishStep(target, stepName, "failed", err.Error())
+			}
+			return err
+		}
+		log.Info(copy.StepDone, stepIndex, len(steps), label)
+		if recorder != nil {
+			recorder.FinishStep(target, stepName, "success", "")
+		}
+		return nil
+	}
+}
+
+func logForTarget(fallback mysqlinstaller.Logger, targetLog targetLogger, target string) mysqlinstaller.Logger {
+	if targetLog == nil {
+		return fallback
+	}
+	if log := targetLog(target); log != nil {
+		return log
+	}
+	return fallback
+}
+
+func finishTarget(recorder stepRecorder, target, status, errText string) {
+	if recorder == nil {
+		return
+	}
+	recorder.FinishTarget(target, status, errText)
+}

@@ -1,0 +1,38 @@
+# Dependencies and local package caches
+node_modules/
+.pnpm-store/
+.cache/
+
+# IDE and local workspace files
+.idea/
+.vscode/
+*.log
+
+# Build outputs
+bin/
+web/dist/
+dist/
+outputs/
+
+# Runtime data
+data/
+*.db
+*.db-shm
+*.db-wal
+
+# Large offline resource bundles
+resources/
+aifar-deployment.zip
+*.tar
+*.tar.gz
+*.tgz
+*.rpm
+
+# Local env overrides
+.env
+.env.*
+*.local
+
+# OS metadata
+Thumbs.db
+.DS_Store

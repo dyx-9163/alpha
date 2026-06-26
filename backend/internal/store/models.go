@@ -1,0 +1,144 @@
+package store
+
+import "time"
+
+type User struct {
+	ID           string    `json:"id"`
+	Username     string    `json:"username"`
+	Role         string    `json:"role"`
+	PasswordHash string    `json:"-"`
+	CreatedAt    time.Time `json:"createdAt"`
+}
+
+type UserSummary struct {
+	ID        string    `json:"id"`
+	Username  string    `json:"username"`
+	Role      string    `json:"role"`
+	CreatedAt time.Time `json:"createdAt"`
+}
+
+type Server struct {
+	ID         string    `json:"id"`
+	Name       string    `json:"name"`
+	Host       string    `json:"host"`
+	Port       int       `json:"port"`
+	Username   string    `json:"username"`
+	AuthType   string    `json:"authType"`
+	Password   string    `json:"-"`
+	PrivateKey string    `json:"-"`
+	Tags       string    `json:"tags"`
+	Note       string    `json:"note"`
+	DeployDir  string    `json:"deployDir"`
+	DockerHost string    `json:"dockerHost"`
+	Status     string    `json:"status"`
+	LastError  string    `json:"lastError,omitempty"`
+	CreatedAt  time.Time `json:"createdAt"`
+	UpdatedAt  time.Time `json:"updatedAt"`
+}
+
+type Task struct {
+	ID         string    `json:"id"`
+	Type       string    `json:"type"`
+	Target     string    `json:"target"`
+	Status     string    `json:"status"`
+	CreatedBy  string    `json:"createdBy"`
+	Error      string    `json:"error,omitempty"`
+	CreatedAt  time.Time `json:"createdAt"`
+	StartedAt  time.Time `json:"startedAt,omitempty"`
+	FinishedAt time.Time `json:"finishedAt,omitempty"`
+}
+
+type TaskLog struct {
+	ID        int64     `json:"id"`
+	TaskID    string    `json:"taskId"`
+	Target    string    `json:"target,omitempty"`
+	Level     string    `json:"level"`
+	Message   string    `json:"message"`
+	CreatedAt time.Time `json:"createdAt"`
+}
+
+type TaskTarget struct {
+	ID         int64     `json:"id"`
+	TaskID     string    `json:"taskId"`
+	Target     string    `json:"target"`
+	Status     string    `json:"status"`
+	Error      string    `json:"error,omitempty"`
+	CreatedAt  time.Time `json:"createdAt"`
+	StartedAt  time.Time `json:"startedAt,omitempty"`
+	FinishedAt time.Time `json:"finishedAt,omitempty"`
+}
+
+type TaskStep struct {
+	ID         int64     `json:"id"`
+	TaskID     string    `json:"taskId"`
+	Target     string    `json:"target"`
+	Name       string    `json:"name"`
+	Title      string    `json:"title"`
+	Order      int       `json:"order"`
+	Status     string    `json:"status"`
+	Error      string    `json:"error,omitempty"`
+	CreatedAt  time.Time `json:"createdAt"`
+	StartedAt  time.Time `json:"startedAt,omitempty"`
+	FinishedAt time.Time `json:"finishedAt,omitempty"`
+}
+
+type Audit struct {
+	ID        int64     `json:"id"`
+	Actor     string    `json:"actor"`
+	Action    string    `json:"action"`
+	Target    string    `json:"target"`
+	Status    string    `json:"status"`
+	Message   string    `json:"message"`
+	CreatedAt time.Time `json:"createdAt"`
+}
+
+type AuditQuery struct {
+	Page     int
+	PageSize int
+	Module   string
+	Status   string
+}
+
+type AuditPage struct {
+	Items    []Audit `json:"items"`
+	Total    int     `json:"total"`
+	Page     int     `json:"page"`
+	PageSize int     `json:"pageSize"`
+}
+
+type Resource struct {
+	ID        string    `json:"id"`
+	App       string    `json:"app"`
+	Part      string    `json:"part"`
+	Version   string    `json:"version"`
+	Path      string    `json:"path"`
+	Size      int64     `json:"size"`
+	SHA256    string    `json:"sha256,omitempty"`
+	RPMCount  int       `json:"rpmCount"`
+	CreatedAt time.Time `json:"createdAt"`
+}
+
+type AppInstance struct {
+	ID        string    `json:"id"`
+	App       string    `json:"app"`
+	Version   string    `json:"version"`
+	ServerID  string    `json:"serverId"`
+	Status    string    `json:"status"`
+	Topology  string    `json:"topology"`
+	Metadata  string    `json:"metadata"`
+	CreatedAt time.Time `json:"createdAt"`
+	UpdatedAt time.Time `json:"updatedAt"`
+}
+
+type StorageItem struct {
+	ID         string    `json:"id"`
+	InstanceID string    `json:"instanceId"`
+	Kind       string    `json:"kind"`
+	Name       string    `json:"name"`
+	Policy     string    `json:"policy,omitempty"`
+	AccessKey  string    `json:"accessKey,omitempty"`
+	SecretKey  string    `json:"secretKey,omitempty"`
+	Metadata   string    `json:"metadata,omitempty"`
+	CreatedAt  time.Time `json:"createdAt"`
+	UpdatedAt  time.Time `json:"updatedAt"`
+}
