@@ -99,7 +99,8 @@ export function mysqlInstallDialogProps(locale?: string): AppInstallDialogConfig
         name: 'clusterName',
         label: copy.clusterName,
         type: 'text',
-        defaultValue: 'aifarCluster'
+        defaultValue: 'aifarCluster',
+        visibleWhen: (values) => values.topology === 'innodb-cluster'
       },
       {
         name: 'port',
