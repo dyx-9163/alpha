@@ -6,9 +6,11 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"aifar-deployment/backend/internal/auth"
 	"aifar-deployment/backend/internal/config"
+	"aifar-deployment/backend/internal/security"
 	"aifar-deployment/backend/internal/store"
 	"aifar-deployment/backend/internal/worker"
 )
@@ -82,6 +84,46 @@ func TestFailedLoginIsAudited(t *testing.T) {
 	assertAuditExists(t, db, "auth.login", "failed", "owner", "owner")
 }
 
+func TestRepeatedFailedLoginIsLockedAndAudited(t *testing.T) {
+	api, db, _ := newAuthzTestAPI(t)
+	api.auth = security.NewLoginGuard(2, time.Minute)
+	if err := db.ResetUserPassword("owner", "correct-password"); err != nil {
+		t.Fatal(err)
+	}
+
+	first := postLogin(api, "owner", "wrong-password")
+	if first.Code != http.StatusUnauthorized {
+		t.Fatalf("expected first failure 401, got %d body=%s", first.Code, first.Body.String())
+	}
+	second := postLogin(api, "owner", "wrong-password")
+	if second.Code != http.StatusTooManyRequests {
+		t.Fatalf("expected second failure to lock with 429, got %d body=%s", second.Code, second.Body.String())
+	}
+	third := postLogin(api, "owner", "correct-password")
+	if third.Code != http.StatusTooManyRequests {
+		t.Fatalf("expected locked login to remain 429, got %d body=%s", third.Code, third.Body.String())
+	}
+	assertAuditExists(t, db, "auth.login.locked", "failed", "owner", "owner")
+}
+
+func TestSuccessfulLoginClearsFailureCounter(t *testing.T) {
+	api, db, _ := newAuthzTestAPI(t)
+	api.auth = security.NewLoginGuard(2, time.Minute)
+	if err := db.ResetUserPassword("owner", "correct-password"); err != nil {
+		t.Fatal(err)
+	}
+
+	if rec := postLogin(api, "owner", "wrong-password"); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected first failure 401, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	if rec := postLogin(api, "owner", "correct-password"); rec.Code != http.StatusOK {
+		t.Fatalf("expected success 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	if rec := postLogin(api, "owner", "wrong-password"); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected counter reset after success, got %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
 func newAuthzTestAPI(t *testing.T) (*API, *store.Store, string) {
 	t.Helper()
 	root := t.TempDir()
@@ -138,4 +180,13 @@ func assertAuditExists(t *testing.T, db *store.Store, action, status, actor, tar
 		}
 	}
 	t.Fatalf("expected audit action=%s status=%s actor=%s target=%s in %+v", action, status, actor, target, items)
+}
+
+func postLogin(api *API, username, password string) *httptest.ResponseRecorder {
+	body := `{"username":"` + username + `","password":"` + password + `"}`
+	req := httptest.NewRequest(http.MethodPost, "/api/v2/auth/login", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	api.Router().ServeHTTP(rec, req)
+	return rec
 }

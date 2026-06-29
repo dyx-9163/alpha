@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -23,6 +24,7 @@ import (
 	"aifar-deployment/backend/internal/i18n"
 	"aifar-deployment/backend/internal/rbac"
 	"aifar-deployment/backend/internal/resource"
+	"aifar-deployment/backend/internal/security"
 	serverdomain "aifar-deployment/backend/internal/servers"
 	"aifar-deployment/backend/internal/store"
 	"aifar-deployment/backend/internal/taskplan"
@@ -40,6 +42,7 @@ type API struct {
 	tasks   *worker.Manager
 	apps    *registry.Registry
 	servers serverdomain.Service
+	auth    *security.LoginGuard
 	router  chi.Router
 }
 
@@ -50,6 +53,7 @@ func New(cfg config.Config, s *store.Store, tasks *worker.Manager) *API {
 		tasks:   tasks,
 		apps:    registry.NewFromRegistered(registry.Dependencies{Store: s}),
 		servers: serverdomain.NewService(s, serverdomain.SSHProber{}, cfg.DefaultDeployDir),
+		auth:    security.NewLoginGuard(cfg.AuthMaxFailures, time.Duration(cfg.AuthLockoutSeconds)*time.Second),
 	}
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID, middleware.RealIP, middleware.Recoverer)
@@ -132,12 +136,18 @@ func (a *API) login(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &req) {
 		return
 	}
+	username := strings.TrimSpace(req.Username)
+	if username == "" {
+		username = "unknown"
+	}
+	guardKey := loginGuardKey(r, username)
+	if lockedUntil, locked := a.auth.LockedUntil(guardKey); locked {
+		a.auditLoginLocked(lang, username, lockedUntil)
+		writeAuthLocked(w, r, lockedUntil)
+		return
+	}
 	u, err := a.store.UserByUsername(req.Username)
 	if err != nil || auth.CheckPassword(u.PasswordHash, req.Password) != nil {
-		username := strings.TrimSpace(req.Username)
-		if username == "" {
-			username = "unknown"
-		}
 		_ = auditkit.Record(a.store, auditkit.Event{
 			Actor:   username,
 			Action:  "auth.login",
@@ -145,9 +155,15 @@ func (a *API) login(w http.ResponseWriter, r *http.Request) {
 			Status:  "failed",
 			Message: i18n.Text(lang, "api.authFailed"),
 		})
+		if lockedUntil, locked := a.auth.RecordFailure(guardKey); locked {
+			a.auditLoginLocked(lang, username, lockedUntil)
+			writeAuthLocked(w, r, lockedUntil)
+			return
+		}
 		writeError(w, http.StatusUnauthorized, "AUTH_FAILED", i18n.Text(lang, "api.authFailed"), nil)
 		return
 	}
+	a.auth.RecordSuccess(guardKey)
 	token, err := auth.IssueToken(a.cfg.JWTSecret, u)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "TOKEN_ERROR", err.Error(), nil)
@@ -163,6 +179,36 @@ func (a *API) login(w http.ResponseWriter, r *http.Request) {
 			"permissions":  rbac.Permissions(u.Role),
 		},
 	})
+}
+
+func (a *API) auditLoginLocked(lang, username string, lockedUntil time.Time) {
+	_ = auditkit.Record(a.store, auditkit.Event{
+		Actor:   username,
+		Action:  "auth.login.locked",
+		Target:  username,
+		Status:  "failed",
+		Message: i18n.Text(lang, "api.authLocked") + " until=" + lockedUntil.UTC().Format(time.RFC3339),
+	})
+}
+
+func writeAuthLocked(w http.ResponseWriter, r *http.Request, lockedUntil time.Time) {
+	retryAfter := int(time.Until(lockedUntil).Seconds())
+	if retryAfter < 1 {
+		retryAfter = 1
+	}
+	w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
+	writeError(w, http.StatusTooManyRequests, "AUTH_LOCKED", i18n.Text(languageFromRequest(r), "api.authLocked"), map[string]any{"retryAfterSeconds": retryAfter})
+}
+
+func loginGuardKey(r *http.Request, username string) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil || host == "" {
+		host = strings.TrimSpace(r.RemoteAddr)
+	}
+	if host == "" {
+		host = "unknown"
+	}
+	return strings.ToLower(strings.TrimSpace(username)) + "|" + host
 }
 
 func (a *API) requireAuth(next http.Handler) http.Handler {
@@ -195,6 +241,8 @@ func (a *API) getSettings(w http.ResponseWriter, r *http.Request) {
 		"resourcePath":          a.cfg.ResourceDir,
 		"staticPath":            a.cfg.StaticDir,
 		"defaultDeployDir":      a.cfg.DefaultDeployDir,
+		"authMaxFailures":       a.cfg.AuthMaxFailures,
+		"authLockoutSeconds":    a.cfg.AuthLockoutSeconds,
 		"moduleStatus": map[string]string{
 			"servers": "available", "apps": "available", "containers": "available",
 			"database": "available", "storage": "available", "terminal": "available",

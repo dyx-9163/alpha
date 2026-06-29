@@ -53,3 +53,5 @@
 - 结论：已在本地创建分支 `codex/enterprise-permission-ux` 并提交 `5da12610 enterprise permission and operations hardening`；`git push` 被安全审查拦截，原因是向外部 GitHub 远端导出工作区代码需要用户在知情后再次明确批准，当前尚未推送成功。
 - 问题：持续目标推进，补齐企业级安全事件审计，要求登录失败和权限拒绝都能留痕。
 - 结论：已在登录失败时记录 `auth.login` 失败审计，在权限拒绝时记录 `auth.permission.denied` 审计，包含账号、权限点、HTTP 方法和路径，并继续走 `auditkit`/`logmask` 脱敏链路；新增 HTTP 测试验证 401/403 安全事件入库，`pnpm web:build` 和 `pnpm test` 已通过。
+- 问题：持续目标推进，补强登录暴力尝试防护，要求安全审计之后能有实际阻断动作。
+- 结论：已新增后端 `security.LoginGuard`，按账号+来源统计失败次数并临时锁定；新增 `AIFAR_AUTH_MAX_FAILURES`、`AIFAR_AUTH_LOCKOUT_SECONDS` 到配置和 `defaults.env`；登录失败达到阈值后返回 429 和 `Retry-After`，并记录 `auth.login.locked` 审计；设置接口只读暴露当前锁定策略；`pnpm test` 已通过。
