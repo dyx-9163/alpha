@@ -112,6 +112,22 @@
         show-icon
       />
 
+      <h2 class="settings-title">{{ t('settings.healthStatus') }}</h2>
+      <KeyValueGrid :items="healthItems" class="provider-grid">
+        <template #value="{ item }">
+          <StatusTag v-if="item.key === 'status'" :status="String(item.value)" />
+          <span v-else>{{ item.value || '-' }}</span>
+        </template>
+      </KeyValueGrid>
+      <el-table :data="healthRows">
+        <el-table-column prop="name" :label="t('common.module')" width="180" />
+        <el-table-column :label="t('common.status')" width="120">
+          <template #default="{ row }"><StatusTag :status="row.status" /></template>
+        </el-table-column>
+        <el-table-column prop="message" :label="t('common.message')" min-width="180" />
+        <el-table-column prop="path" :label="t('settings.path')" min-width="260" show-overflow-tooltip />
+      </el-table>
+
       <h2 class="settings-title">{{ t('settings.providerStatus') }}</h2>
       <KeyValueGrid :items="providerItems" class="provider-grid">
         <template #value="{ item }">
@@ -139,6 +155,7 @@ import { apiDelete, apiDownload, apiGet, apiPost, apiPut } from '../api/client'
 import ConfirmAction from '../components/ConfirmAction.vue'
 import DataTable from '../components/DataTable.vue'
 import KeyValueGrid from '../components/KeyValueGrid.vue'
+import StatusTag from '../components/StatusTag.vue'
 import { usePermissions } from '../composables/usePermissions'
 import { useI18n } from '../i18n'
 import { permissions } from '../rbac'
@@ -151,6 +168,7 @@ const backupRunning = ref(false)
 const backupsLoading = ref(false)
 const retentionRunning = ref(false)
 const backups = ref<DatabaseBackup[]>([])
+const health = ref<HealthReport | null>(null)
 const platform = navigator.platform.toLowerCase().includes('win') ? 'windows' : 'linux'
 const providerModeLabel = computed(() => {
   const mode = form.providerStatus || form.providerMode || 'real'
@@ -175,6 +193,19 @@ const maintenanceItems = computed(() => [
   { key: 'auditRetentionDays', label: t('settings.auditRetention'), value: formatRetentionDays(form.auditRetentionDays) },
   { key: 'taskRetentionDays', label: t('settings.taskRetention'), value: formatRetentionDays(form.taskRetentionDays) }
 ])
+const healthItems = computed(() => [
+  { key: 'status', label: t('common.status'), value: health.value?.status || 'unknown' },
+  { key: 'checkedAt', label: t('settings.checkedAt'), value: formatDate(health.value?.checkedAt) }
+])
+const healthRows = computed(() => {
+  const components = health.value?.components || {}
+  return Object.entries(components).map(([name, component]) => ({
+    name,
+    status: component.status || 'unknown',
+    message: component.message || '-',
+    path: component.details?.path || '-'
+  }))
+})
 const backupColumns = computed(() => [
   { prop: 'name', label: t('settings.backupName'), minWidth: 240 },
   { prop: 'size', label: t('settings.backupSize'), width: 120, slot: 'size' },
@@ -189,6 +220,12 @@ type DatabaseBackup = {
   size: number
   sha256: string
   createdAt: string
+}
+
+type HealthReport = {
+  status: string
+  checkedAt: string
+  components: Record<string, { status: string; message?: string; details?: Record<string, unknown> }>
 }
 
 function moduleMessage(module: string) {
@@ -208,7 +245,7 @@ async function load() {
   form.language = locale.value
   form.deploymentConcurrency = Number(form.deploymentConcurrency)
   now.value = new Date().toISOString()
-  await loadBackups()
+  await Promise.all([loadBackups(), loadHealth()])
 }
 async function save() {
   if (!canManageSettings.value) {
@@ -269,6 +306,10 @@ async function loadBackups() {
   } finally {
     backupsLoading.value = false
   }
+}
+
+async function loadHealth() {
+  health.value = await apiGet<HealthReport>('/health').catch(() => null)
 }
 
 async function deleteBackup(name: unknown) {

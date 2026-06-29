@@ -69,3 +69,7 @@
 - 结论：后端维护服务新增单个备份文件解析复用安全文件名与目录约束；新增 `GET /api/v2/maintenance/database-backups/{name}/download`，通过授权请求下载备份并返回 SHA256/大小响应头，非法文件名返回 400、缺失文件返回 404；前端 API client 新增 `apiDownload`，设置页备份表格新增“下载”按钮；新增 HTTP 和维护服务测试覆盖下载、校验头和非法名称拒绝；`pnpm test` 与 `pnpm web:build` 已通过。
 - 问题：持续目标推进，补齐控制面数据库备份的恢复前校验能力，避免归档或恢复时才发现备份损坏或缺少关键表。
 - 结论：后端维护服务新增 `VerifyDatabaseBackup`，对指定备份执行 SQLite `integrity_check` 并校验 users/servers/tasks/audit/resources/settings 等关键表；新增 `POST /api/v2/maintenance/database-backups/{name}/verify` 任务入口，按“定位备份、完整性检查、关键表检查”记录步骤和审计；设置页备份表格新增“检查”按钮；新增维护服务与 HTTP 测试覆盖成功校验任务；`pnpm test` 与 `pnpm web:build` 已通过。
+- 问题：用户反馈优化逻辑不要过于精细，不要什么都拆分成最小粒度，也不要过度依赖设计模式。
+- 结论：后续优化优先保持功能之间清晰解耦、复用公共组件和公共能力，但避免为了抽象而抽象；简单功能可直接放在现有模块中，防止形成代码屎山或过度工程化。
+- 问题：持续目标推进，补齐控制面自身健康检查能力，便于企业部署后接入进程守护、反向代理和监控探活。
+- 结论：新增 `GET /api/v2/health/live`、`GET /api/v2/health/ready` 无鉴权探活接口，登录后 `GET /api/v2/health` 返回数据库、资源目录、静态目录和备份目录状态；store 新增轻量 `Ping()`；设置页新增“控制面健康”展示并复用现有 `KeyValueGrid`/`StatusTag`；`StatusTag` 支持 `ok/degraded`；新增 HTTP 测试覆盖 live/ready/detail；`pnpm test` 与 `pnpm web:build` 已通过。

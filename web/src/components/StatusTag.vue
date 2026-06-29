@@ -11,6 +11,10 @@ const { t } = useI18n()
 
 const label = computed(() => {
   switch (props.status) {
+    case 'ok':
+      return 'OK'
+    case 'degraded':
+      return t('status.degraded')
     case 'success':
       return t('status.success')
     case 'installed':
@@ -42,6 +46,7 @@ const label = computed(() => {
 
 const type = computed(() => {
   switch (props.status) {
+    case 'ok':
     case 'success':
     case 'installed':
     case 'running':
@@ -54,6 +59,7 @@ const type = computed(() => {
     case 'pending':
     case 'staged':
     case 'stopped':
+    case 'degraded':
       return 'warning'
     case 'missing':
       return 'danger'

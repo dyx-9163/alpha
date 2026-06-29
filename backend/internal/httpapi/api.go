@@ -60,9 +60,12 @@ func New(cfg config.Config, s *store.Store, tasks *worker.Manager) *API {
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID, middleware.RealIP, middleware.Recoverer, api.securityHeaders, api.limitRequestBody)
 	r.Route("/api/v2", func(r chi.Router) {
+		r.Get("/health/live", api.healthLive)
+		r.Get("/health/ready", api.healthReady)
 		r.Post("/auth/login", api.login)
 		r.Group(func(r chi.Router) {
 			r.Use(api.requireAuth)
+			r.Get("/health", api.healthDetail)
 			r.Get("/settings", api.getSettings)
 			r.Put("/settings", api.requirePermission(rbac.SettingsManage, api.putSettings))
 			r.Get("/maintenance/database-backups", api.requirePermission(rbac.SettingsManage, api.listDatabaseBackups))
@@ -131,6 +134,69 @@ func New(cfg config.Config, s *store.Store, tasks *worker.Manager) *API {
 	r.NotFound(api.staticFallback)
 	api.router = r
 	return api
+}
+
+func (a *API) healthLive(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "checkedAt": time.Now()})
+}
+
+func (a *API) healthReady(w http.ResponseWriter, r *http.Request) {
+	report := a.healthReport()
+	code := http.StatusOK
+	if report["status"] != "ok" {
+		code = http.StatusServiceUnavailable
+	}
+	writeJSON(w, code, report)
+}
+
+func (a *API) healthDetail(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, a.healthReport())
+}
+
+func (a *API) healthReport() map[string]any {
+	components := map[string]map[string]any{}
+	components["database"] = healthComponent(a.store.Ping(), map[string]any{"path": a.cfg.DatabasePath})
+	components["resources"] = pathComponent(a.cfg.ResourceDir, false)
+	components["static"] = pathComponent(a.cfg.StaticDir, true)
+	components["databaseBackups"] = pathComponent(a.cfg.DatabaseBackupDir, false)
+	status := "ok"
+	for _, component := range components {
+		if component["status"] != "ok" {
+			status = "degraded"
+			break
+		}
+	}
+	return map[string]any{
+		"status":     status,
+		"checkedAt":  time.Now(),
+		"components": components,
+	}
+}
+
+func healthComponent(err error, details map[string]any) map[string]any {
+	status := "ok"
+	message := ""
+	if err != nil {
+		status = "error"
+		message = err.Error()
+	}
+	return map[string]any{"status": status, "message": message, "details": details}
+}
+
+func pathComponent(path string, mustExist bool) map[string]any {
+	details := map[string]any{"path": path}
+	if strings.TrimSpace(path) == "" {
+		return map[string]any{"status": "error", "message": "path is empty", "details": details}
+	}
+	info, err := os.Stat(path)
+	if err == nil {
+		details["isDir"] = info.IsDir()
+		return map[string]any{"status": "ok", "message": "", "details": details}
+	}
+	if os.IsNotExist(err) && !mustExist {
+		return map[string]any{"status": "ok", "message": "directory will be created on demand", "details": details}
+	}
+	return map[string]any{"status": "error", "message": err.Error(), "details": details}
 }
 
 func (a *API) Router() http.Handler { return a.router }

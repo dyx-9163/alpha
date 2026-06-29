@@ -163,6 +163,43 @@ func TestRequestBodyLimitReturnsPayloadTooLarge(t *testing.T) {
 	}
 }
 
+func TestHealthEndpoints(t *testing.T) {
+	api, db, secret := newAuthzTestAPI(t)
+	token := issueTestToken(t, db, secret, "owner", "owner")
+
+	liveReq := httptest.NewRequest(http.MethodGet, "/api/v2/health/live", nil)
+	liveRec := httptest.NewRecorder()
+	api.Router().ServeHTTP(liveRec, liveReq)
+	if liveRec.Code != http.StatusOK {
+		t.Fatalf("expected live 200, got %d body=%s", liveRec.Code, liveRec.Body.String())
+	}
+
+	readyReq := httptest.NewRequest(http.MethodGet, "/api/v2/health/ready", nil)
+	readyRec := httptest.NewRecorder()
+	api.Router().ServeHTTP(readyRec, readyReq)
+	if readyRec.Code != http.StatusOK {
+		t.Fatalf("expected ready 200, got %d body=%s", readyRec.Code, readyRec.Body.String())
+	}
+
+	detailReq := httptest.NewRequest(http.MethodGet, "/api/v2/health", nil)
+	detailReq.Header.Set("Authorization", "Bearer "+token)
+	detailRec := httptest.NewRecorder()
+	api.Router().ServeHTTP(detailRec, detailReq)
+	if detailRec.Code != http.StatusOK {
+		t.Fatalf("expected health detail 200, got %d body=%s", detailRec.Code, detailRec.Body.String())
+	}
+	var body struct {
+		Status     string                    `json:"status"`
+		Components map[string]map[string]any `json:"components"`
+	}
+	if err := json.Unmarshal(detailRec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body.Status != "ok" || body.Components["database"]["status"] != "ok" {
+		t.Fatalf("unexpected health detail: %+v", body)
+	}
+}
+
 func TestSettingsExposeSecurityLimits(t *testing.T) {
 	api, db, secret := newAuthzTestAPI(t)
 	api.cfg.MaxRequestBodyBytes = 2048

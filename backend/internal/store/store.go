@@ -43,6 +43,10 @@ func OpenWithSecret(path, secret string) (*Store, error) {
 
 func (s *Store) Close() error { return s.db.Close() }
 
+func (s *Store) Ping() error {
+	return s.db.Ping()
+}
+
 func (s *Store) BackupDatabase(path string) (int64, string, error) {
 	path = strings.TrimSpace(path)
 	if path == "" {
