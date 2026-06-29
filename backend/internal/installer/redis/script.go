@@ -75,6 +75,7 @@ type SentinelNodeConfig struct {
 	RedisPort    int
 	SentinelPort int
 	Password     string
+	MasterName   string
 	MasterHost   string
 	MasterPort   int
 	Quorum       int

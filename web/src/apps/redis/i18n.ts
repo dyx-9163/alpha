@@ -12,7 +12,7 @@ export const redisMessages = {
     sourceLabel: '官方源码包',
     description: '基于离线源码包安装 Redis 单体、Sentinel 或 Cluster 拓扑。',
     installTitle: '安装 Redis',
-    hint: '单体使用单台服务器；Sentinel 和 Cluster 需要多台服务器。安装器会上传源码包和 RPM 缓存，远程编译，写入 systemd，并在健康检查通过后记录实例。',
+    hint: 'Sentinel 按官方 master group 模型部署：本次创建一个监控组，选择一个 Redis master，其余节点作为 replica，所有选中服务器运行 Sentinel；多个 master group 请分别部署。Redis Cluster 才是多主分片拓扑。',
     version: '版本',
     versionPlaceholder: '选择版本',
     servers: '目标服务器',
@@ -27,9 +27,12 @@ export const redisMessages = {
     cluster: 'Cluster',
     port: 'Redis 端口',
     sentinelPort: 'Sentinel 端口',
-    sentinelMaster: 'Sentinel 主节点',
-    sentinelMasterPlaceholder: '请选择 Redis 主节点；其他服务器作为从节点，所有节点运行 Sentinel',
-    sentinelMasterRequired: 'Sentinel 模式必须选择主节点',
+    sentinelMasterName: '监控组名称',
+    sentinelMasterNamePlaceholder: '例如 aifar-master，必须在 Sentinel 内唯一',
+    sentinelMasterNameInvalid: '监控组名称只能包含字母、数字、点、横线和下划线，最多 64 个字符',
+    sentinelMaster: 'Redis Master 节点',
+    sentinelMasterPlaceholder: '请选择当前监控组的 Redis master；其他服务器作为 replica，所有节点运行 Sentinel',
+    sentinelMasterRequired: 'Sentinel 模式必须选择 Redis master 节点',
     quorum: 'Sentinel Quorum',
     replicas: 'Cluster 副本数',
     password: 'Redis 密码',
@@ -41,7 +44,7 @@ export const redisMessages = {
     sourceLabel: 'Official source archive',
     description: 'Build and install Redis standalone, Sentinel, or Cluster topology from the offline source archive.',
     installTitle: 'Install Redis',
-    hint: 'Standalone uses one server; Sentinel and Cluster require multiple servers. The installer uploads the source archive and RPM cache, builds Redis remotely, writes systemd, and records instances after health checks pass.',
+    hint: 'Sentinel follows the official master-group model: this install creates one monitored master group, one Redis master is selected, the other nodes become replicas, and every selected server runs Sentinel. Deploy separate master groups separately. Redis Cluster is the multi-master sharding topology.',
     version: 'Version',
     versionPlaceholder: 'Select version',
     servers: 'Target server',
@@ -56,9 +59,12 @@ export const redisMessages = {
     cluster: 'Cluster',
     port: 'Redis port',
     sentinelPort: 'Sentinel port',
-    sentinelMaster: 'Sentinel master',
-    sentinelMasterPlaceholder: 'Select the Redis master; other servers become replicas and every selected server runs Sentinel',
-    sentinelMasterRequired: 'Sentinel mode requires a master server',
+    sentinelMasterName: 'Monitor name',
+    sentinelMasterNamePlaceholder: 'For example aifar-master; must be unique inside Sentinel',
+    sentinelMasterNameInvalid: 'Monitor name can contain only letters, numbers, dot, dash, and underscore, up to 64 characters',
+    sentinelMaster: 'Redis master node',
+    sentinelMasterPlaceholder: 'Select the Redis master for this monitored group; other servers become replicas and every selected server runs Sentinel',
+    sentinelMasterRequired: 'Sentinel mode requires a Redis master node',
     quorum: 'Sentinel quorum',
     replicas: 'Cluster replicas',
     password: 'Redis password',
@@ -117,6 +123,22 @@ export function redisInstallDialogProps(locale?: string): AppInstallDialogConfig
         type: 'number',
         defaultValue: 26379,
         visibleWhen: (values) => values.topology === 'sentinel'
+      },
+      {
+        name: 'masterName',
+        label: copy.sentinelMasterName,
+        type: 'text',
+        defaultValue: 'aifar-master',
+        placeholder: copy.sentinelMasterNamePlaceholder,
+        required: true,
+        visibleWhen: (values) => values.topology === 'sentinel',
+        validate: (value, values) => {
+          if (values.topology !== 'sentinel') {
+            return undefined
+          }
+          const name = String(value ?? '').trim()
+          return /^[A-Za-z0-9_.-]{1,64}$/.test(name) ? undefined : copy.sentinelMasterNameInvalid
+        }
       },
       {
         name: 'sentinelMasterId',

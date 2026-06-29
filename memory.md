@@ -1,5 +1,8 @@
 # AIFAR Memory
 
+- 问题：用户质疑 Redis Sentinel 表单设计，询问是否应支持多主、多副本、多 Sentinel 节点，并要求按官方模型设计。
+- 结论：官方 Sentinel 是可监控一个或多个 master group 的高可用机制，不是单组多主分片；本次安装模型明确为一个 master group：一个 Redis master、其余 replica、所有选中服务器运行 Sentinel。前端新增 `masterName` 监控组名称并调整提示/字段文案，后端 Sentinel 配置不再硬编码 `aifar-master`，改用 `sentinel monitor <masterName>`；`go test ./internal/apps/redis ./internal/installer/redis`、`pnpm web:build`、`pnpm test`、`pnpm backend:build`、`git diff --check` 已通过。
+
 - 问题：用户反馈 Redis 单体安装弹窗不应展示 Sentinel/Cluster 相关参数。
 - 结论：`web/src/apps/redis/i18n.ts` 已为 `sentinelPort`、`quorum` 增加 Sentinel 拓扑可见条件，为 `replicas` 增加 Cluster 拓扑可见条件；单体模式只展示 Redis 端口和密码；`pnpm web:build`、`pnpm test` 已通过。
 

@@ -6,6 +6,7 @@ INSTALL_ROOT={{shq .InstallRoot}}
 REDIS_PORT={{.RedisPort}}
 SENTINEL_PORT={{.SentinelPort}}
 REDIS_PASSWORD={{shq .Password}}
+MASTER_NAME={{shq .MasterName}}
 MASTER_HOST={{shq .MasterHost}}
 MASTER_PORT={{.MasterPort}}
 QUORUM={{.Quorum}}
@@ -36,11 +37,11 @@ daemonize no
 supervised no
 dir $INSTALL_ROOT/data
 logfile $INSTALL_ROOT/logs/sentinel.log
-sentinel monitor aifar-master $MASTER_HOST $MASTER_PORT $QUORUM
-sentinel auth-pass aifar-master $REDIS_PASSWORD
-sentinel down-after-milliseconds aifar-master 5000
-sentinel failover-timeout aifar-master 60000
-sentinel parallel-syncs aifar-master 1
+sentinel monitor $MASTER_NAME $MASTER_HOST $MASTER_PORT $QUORUM
+sentinel auth-pass $MASTER_NAME $REDIS_PASSWORD
+sentinel down-after-milliseconds $MASTER_NAME 5000
+sentinel failover-timeout $MASTER_NAME 60000
+sentinel parallel-syncs $MASTER_NAME 1
 CONF
 $SUDO install -m 0644 "$INSTALL_ROOT/conf/sentinel.conf.tmp" "$SENTINEL_CONFIG"
 

@@ -167,6 +167,10 @@ func (s Service) installSentinel(ctx context.Context, req InstallRequest, resour
 	port := redisPort(req.Parameters)
 	sentinelPort := redisSentinelPort(req.Parameters)
 	quorum := redisQuorum(req.Parameters, len(targets))
+	masterName, err := redisSentinelMasterName(req.Parameters, copy.SentinelMasterNameInvalid)
+	if err != nil {
+		return err
+	}
 	password := redisPassword(req.Parameters, req.DefaultPassword)
 	if password == "" {
 		return fmt.Errorf("redis password is required")
@@ -241,6 +245,7 @@ func (s Service) installSentinel(ctx context.Context, req InstallRequest, resour
 				RedisPort:    port,
 				SentinelPort: sentinelPort,
 				Password:     password,
+				MasterName:   masterName,
 				MasterHost:   masterServer.Host,
 				MasterPort:   port,
 				Quorum:       quorum,
@@ -261,6 +266,7 @@ func (s Service) installSentinel(ctx context.Context, req InstallRequest, resour
 				"port":           port,
 				"sentinelPort":   sentinelPort,
 				"sentinelQuorum": quorum,
+				"masterName":     masterName,
 				"role":           role,
 				"masterHost":     masterServer.Host,
 				"serviceName":    fmt.Sprintf("aifar-redis-%d", port),
@@ -541,6 +547,26 @@ func redisQuorum(params map[string]any, targetCount int) int {
 		defaultQuorum = 2
 	}
 	return intParam(params, "quorum", defaultQuorum)
+}
+
+func redisSentinelMasterName(params map[string]any, invalidMessage string) (string, error) {
+	name := strings.TrimSpace(fmt.Sprint(params["masterName"]))
+	if name == "" || name == "<nil>" {
+		name = strings.TrimSpace(fmt.Sprint(params["sentinelMasterName"]))
+	}
+	if name == "" || name == "<nil>" {
+		return "aifar-master", nil
+	}
+	if len(name) > 64 {
+		return "", errors.New(invalidMessage)
+	}
+	for _, r := range name {
+		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-' || r == '_' || r == '.' {
+			continue
+		}
+		return "", errors.New(invalidMessage)
+	}
+	return name, nil
 }
 
 func redisSentinelMasterID(params map[string]any, targets []string) (string, error) {

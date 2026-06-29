@@ -116,3 +116,27 @@ func TestRedisStandaloneScriptsRenderTemplates(t *testing.T) {
 		t.Fatalf("uninstall script did not render standalone service identity:\n%s", uninstall)
 	}
 }
+
+func TestRedisSentinelScriptUsesConfiguredMasterName(t *testing.T) {
+	script, err := configureSentinelNodeScript(SentinelNodeConfig{
+		Version:      "7.2.14",
+		InstallRoot:  "/aifar/apps/redis/7.2.14",
+		RedisPort:    6379,
+		SentinelPort: 26379,
+		Password:     "Oversea.123",
+		MasterName:   "orders-primary",
+		MasterHost:   "10.0.0.2",
+		MasterPort:   6379,
+		Quorum:       2,
+		Role:         "replica",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(script, "sentinel monitor aifar-master") {
+		t.Fatalf("sentinel script should not hard-code master name:\n%s", script)
+	}
+	if !strings.Contains(script, "MASTER_NAME='orders-primary'") || !strings.Contains(script, "sentinel monitor $MASTER_NAME $MASTER_HOST $MASTER_PORT $QUORUM") {
+		t.Fatalf("sentinel script did not render configured master name:\n%s", script)
+	}
+}
