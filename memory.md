@@ -3,6 +3,8 @@
 本文件记录后续对话的精简问题与结论。每次开始先读，结束前追加。禁止写入密码、token、私钥、完整连接串和长日志。
 
 ## 2026-06-29
+- 问题：用户反馈 MySQL 多服务器安装没有在同一任务内三台一起执行，任务中心多目标日志堆叠难查，并且已有数据目录场景仍可能在基础安装阶段报错。
+- 结论：MySQL InnoDB Cluster 基础安装阶段已按面板 `deploymentConcurrency` 在单任务内并发执行，全部目标基础安装成功后才进入 bootstrap；任务中心多目标日志右上角新增服务器选择器；MySQL 安装脚本在已有数据目录时改用配置的管理员密码探测服务，并给出凭据不匹配的明确日志；`pnpm test`、`pnpm web:build`、`git diff --check` 已通过。
 - 问题：用户要求整理当前代码功能，重写 `AGENTS.md` 和 `SKILL.md`，并要求后续所有问答都先读 `memory.md`、结束前精简记录问题与结论。
 - 结论：已建立 memory 工作流，并将当前项目定位为 Go/Chi/SQLite 后端 + Vue3/Element Plus/Vite 前端 + Docker/MySQL/Redis/MinIO 离线安装、任务系统和审计日志的运维面板。
 - 问题：用户要求把启动端口配置也放入 `config/defaults.env`。

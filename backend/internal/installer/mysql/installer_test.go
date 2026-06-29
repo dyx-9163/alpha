@@ -107,6 +107,10 @@ func TestInstallerUploadsBundleAndRunsMySQLScript(t *testing.T) {
 	if !strings.Contains(remote.installScript, `MYSQL_PWD="$ROOT_PASSWORD" "$MYSQL_BASE/bin/mysqladmin" --protocol=tcp`) {
 		t.Fatalf("installer should verify password login via mysqladmin:\n%s", remote.installScript)
 	}
+	if !strings.Contains(remote.installScript, `if [ "$NEED_SECURE" = "1" ]; then`) ||
+		!strings.Contains(remote.installScript, "Existing MySQL data directory is present") {
+		t.Fatalf("installer should use password verification for existing data directories:\n%s", remote.installScript)
+	}
 }
 
 func TestMySQLStandaloneScriptsRenderTemplates(t *testing.T) {

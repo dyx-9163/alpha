@@ -1320,8 +1320,9 @@ func (a *API) installAppName(w http.ResponseWriter, r *http.Request, app string)
 			log.Info(i18n.Text(lang, "api.installPlanPrepared"), len(plan))
 		}
 		return module.Install(ctx, moduleReq, registry.RunContext{
-			Resources: resources,
-			Log:       log,
+			Resources:   resources,
+			Log:         log,
+			Concurrency: a.store.DeploymentConcurrency(a.cfg.DeploymentConcurrency),
 			TargetLog: func(target string) registry.Logger {
 				return log.Target(target)
 			},

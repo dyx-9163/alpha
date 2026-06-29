@@ -15,8 +15,16 @@
       </div>
     </div>
 
-    <div v-if="targetGroups.length" class="target-log-list">
-      <section v-for="group in targetGroups" :key="group.key" class="target-log-group">
+    <div v-if="targetGroups.length" class="target-log-list" :class="{ 'has-toolbar': targetGroups.length > 1 }">
+      <div v-if="targetGroups.length > 1" class="target-log-toolbar">
+        <span>{{ t('table.server') }}</span>
+        <el-select v-model="selectedTargetKey" size="small" class="target-select">
+          <el-option :label="t('common.all')" value="__all__" />
+          <el-option v-for="group in targetGroups" :key="group.key" :label="group.label" :value="group.key" />
+        </el-select>
+      </div>
+
+      <section v-for="group in visibleTargetGroups" :key="group.key" class="target-log-group">
         <div class="target-header">
           <div>
             <h3>{{ group.label }}</h3>
@@ -42,7 +50,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { useI18n } from '../i18n'
 import LogOutput from './LogOutput.vue'
 import StatusTag from './StatusTag.vue'
@@ -102,6 +110,7 @@ const props = withDefaults(defineProps<{
 })
 
 const { t } = useI18n()
+const selectedTargetKey = ref('')
 
 const serverMap = computed(() => {
   const out = new Map<string, ServerSummary>()
@@ -151,6 +160,34 @@ const targetGroups = computed(() => {
     steps: group.steps.slice().sort((a, b) => a.order - b.order || a.id - b.id)
   }))
 })
+
+const visibleTargetGroups = computed(() => {
+  if (!targetGroups.value.length) {
+    return []
+  }
+  if (selectedTargetKey.value === '__all__') {
+    return targetGroups.value
+  }
+  const selected = targetGroups.value.find((group) => group.key === selectedTargetKey.value)
+  return selected ? [selected] : [targetGroups.value[0]]
+})
+
+watch(
+  targetGroups,
+  (groups) => {
+    if (!groups.length) {
+      selectedTargetKey.value = ''
+      return
+    }
+    if (selectedTargetKey.value === '__all__') {
+      return
+    }
+    if (!groups.some((group) => group.key === selectedTargetKey.value)) {
+      selectedTargetKey.value = groups[0].key
+    }
+  },
+  { immediate: true }
+)
 
 function serverLabel(target: string) {
   const server = serverMap.value.get(target)
@@ -211,10 +248,32 @@ function serverLabel(target: string) {
 
 .target-log-list {
   min-height: 0;
-  display: flex;
-  flex-direction: column;
+  display: grid;
+  grid-template-rows: minmax(0, 1fr);
   gap: 12px;
   overflow: hidden;
+}
+
+.target-log-list.has-toolbar {
+  grid-template-rows: auto minmax(0, 1fr);
+}
+
+.target-log-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  min-width: 0;
+}
+
+.target-log-toolbar span {
+  color: var(--aifar-text-secondary);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.target-select {
+  width: min(320px, 48vw);
 }
 
 .target-log-group {

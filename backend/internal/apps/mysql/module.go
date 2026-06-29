@@ -148,6 +148,7 @@ func (m Module) Install(ctx context.Context, req registry.InstallRequest, run re
 		ServerIDs:       req.ServerIDs,
 		DefaultPassword: req.DefaultPassword,
 		Parameters:      req.Parameters,
+		Concurrency:     run.Concurrency,
 	}, run.Resources, run.Log, func(target string) mysqlinstaller.Logger {
 		return run.LoggerForTarget(target)
 	})

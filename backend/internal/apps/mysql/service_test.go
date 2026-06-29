@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -43,10 +44,24 @@ func (f *fakeStore) DeleteAppInstance(id string) error {
 }
 
 type fakeRemote struct {
-	commands []string
+	mu             sync.Mutex
+	commands       []string
+	blockInstall   bool
+	installStarted chan string
+	releaseInstall chan struct{}
 }
 
 func (f *fakeRemote) Run(ctx context.Context, server store.Server, command string) (adapter.CommandResult, error) {
+	if f.blockInstall && strings.Contains(command, "install-mysql.sh") {
+		f.installStarted <- server.ID
+		select {
+		case <-ctx.Done():
+			return adapter.CommandResult{}, ctx.Err()
+		case <-f.releaseInstall:
+		}
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.commands = append(f.commands, command)
 	return adapter.CommandResult{Stdout: "ok"}, nil
 }
@@ -59,6 +74,12 @@ type fakeLogger struct{}
 
 func (fakeLogger) Info(format string, args ...any)  {}
 func (fakeLogger) Error(format string, args ...any) {}
+
+func (f *fakeRemote) joinedCommands() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return strings.Join(f.commands, "\n")
+}
 
 func TestServiceInstallsStandaloneMySQLAndRecordsInstalledInstance(t *testing.T) {
 	root := t.TempDir()
@@ -95,7 +116,7 @@ func TestServiceInstallsStandaloneMySQLAndRecordsInstalledInstance(t *testing.T)
 	if !strings.Contains(instance.Metadata, `"port":3307`) || !strings.Contains(instance.Metadata, `"endpoint":"10.0.0.4:3307"`) {
 		t.Fatalf("metadata should include endpoint and port: %s", instance.Metadata)
 	}
-	joinedCommands := strings.Join(remote.commands, "\n")
+	joinedCommands := remote.joinedCommands()
 	if !strings.Contains(joinedCommands, "install-mysql.sh") {
 		t.Fatalf("expected mysql install script to run: %s", joinedCommands)
 	}
@@ -131,9 +152,59 @@ func TestServiceInstallsInnoDBClusterAndRecordsEachNode(t *testing.T) {
 	if s.instances[0].Topology != "innodb-cluster" || strings.Contains(s.instances[0].Metadata, "Oversea.123") {
 		t.Fatalf("expected safe cluster metadata: %+v", s.instances[0])
 	}
-	joinedCommands := strings.Join(remote.commands, "\n")
+	joinedCommands := remote.joinedCommands()
 	if strings.Count(joinedCommands, `"$MYSQLSH" --js --file`) != 1 || !strings.Contains(joinedCommands, `MYSQLSH="$INSTALL_ROOT/mysql-shell/bin/mysqlsh"`) {
 		t.Fatalf("expected one innodb cluster bootstrap action: %s", joinedCommands)
+	}
+}
+
+func TestServiceInstallsInnoDBClusterBaseConcurrently(t *testing.T) {
+	root := t.TempDir()
+	archive := filepath.Join(root, "mysql-aifar-8.0.36-official-bundle.tar")
+	if err := os.WriteFile(archive, []byte("mysql"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s := &fakeStore{servers: map[string]store.Server{
+		"srv-1": {ID: "srv-1", Name: "mysql-1", Host: "10.0.0.1", DeployDir: "/aifar/apps"},
+		"srv-2": {ID: "srv-2", Name: "mysql-2", Host: "10.0.0.2", DeployDir: "/aifar/apps"},
+		"srv-3": {ID: "srv-3", Name: "mysql-3", Host: "10.0.0.3", DeployDir: "/aifar/apps"},
+	}}
+	remote := &fakeRemote{
+		blockInstall:   true,
+		installStarted: make(chan string, 3),
+		releaseInstall: make(chan struct{}),
+	}
+	service := NewService(s, remote)
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- service.Install(context.Background(), InstallRequest{
+			Version:         "8.0.36",
+			Topology:        "innodb-cluster",
+			Language:        "en",
+			DefaultPassword: "Oversea.123",
+			ServerIDs:       []string{"srv-1", "srv-2", "srv-3"},
+			Concurrency:     3,
+			Parameters:      map[string]any{"port": 3306, "rootUser": "root", "clusterName": "aifarCluster"},
+		}, []store.Resource{{App: "mysql", Part: "backend", Version: "8.0.36", Path: archive}}, fakeLogger{}, nil)
+	}()
+
+	seen := map[string]bool{}
+	for len(seen) < 3 {
+		select {
+		case target := <-remote.installStarted:
+			seen[target] = true
+		case <-time.After(2 * time.Second):
+			t.Fatalf("expected all MySQL base installs to start concurrently, got %v", seen)
+		}
+	}
+	close(remote.releaseInstall)
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("cluster install did not finish after releasing concurrent installs")
 	}
 }
 
@@ -161,7 +232,7 @@ func TestServiceDeletesMySQLRemotelyBeforeRemovingInstance(t *testing.T) {
 	if len(s.instances) != 0 {
 		t.Fatalf("expected mysql instance to be deleted: %+v", s.instances)
 	}
-	joinedCommands := strings.Join(remote.commands, "\n")
+	joinedCommands := remote.joinedCommands()
 	if !strings.Contains(joinedCommands, `systemctl disable --now "$SERVICE_NAME"`) {
 		t.Fatalf("expected remote command to stop mysql service: %s", joinedCommands)
 	}

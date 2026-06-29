@@ -155,9 +155,10 @@ type InstanceStatus struct {
 }
 
 type RunContext struct {
-	Resources []store.Resource
-	Log       Logger
-	TargetLog func(target string) Logger
+	Resources   []store.Resource
+	Log         Logger
+	TargetLog   func(target string) Logger
+	Concurrency int
 }
 
 func (r RunContext) LoggerForTarget(target string) Logger {

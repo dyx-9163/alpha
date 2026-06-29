@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 
 	"aifar-deployment/backend/internal/apps/deleteflow"
 	mysqlinstaller "aifar-deployment/backend/internal/installer/mysql"
@@ -28,6 +29,7 @@ type InstallRequest struct {
 	ServerIDs       []string
 	DefaultPassword string
 	Parameters      map[string]any
+	Concurrency     int
 }
 
 type DeleteRequest struct {
@@ -184,36 +186,16 @@ func (s Service) installInnoDBCluster(ctx context.Context, req InstallRequest, r
 	installer := mysqlinstaller.NewInstaller(s.remote)
 	recorder, _ := log.(stepRecorder)
 	steps := mysqlInstallStepsFor("innodb-cluster", copy)
-	for _, target := range targets {
-		logForServer := logForTarget(log, targetLog, target)
-		taskrun.StartTarget(recorder, target)
-		step := newStepRunnerWithSteps(logForServer, recorder, target, copy, steps)
-		var server store.Server
-		if err := step(1, "load-server", copy.LoadServer, func() error {
-			server = preloadedServers[target]
-			return nil
-		}); err != nil {
-			msg := fmt.Sprintf(copy.LoadFailed, err)
-			logForServer.Error("%s", msg)
-			finishTarget(recorder, target, "failed", msg)
-			return err
+	failedTargets, err := s.installInnoDBClusterBase(ctx, targets, preloadedServers, bundle, options, installer, recorder, steps, copy, log, targetLog, req.Concurrency)
+	if err != nil {
+		msg := fmt.Sprintf(copy.InstallFailed, err)
+		for _, target := range targets {
+			if !failedTargets[target] {
+				logForTarget(log, targetLog, target).Error("%s", msg)
+				finishTarget(recorder, target, "failed", msg)
+			}
 		}
-		if err := step(2, "verify-resource", copy.VerifyResource, func() error {
-			return mysqlinstaller.VerifyBundle(bundle)
-		}); err != nil {
-			msg := fmt.Sprintf(copy.InstallFailed, err)
-			logForServer.Error("%s", msg)
-			finishTarget(recorder, target, "failed", msg)
-			return err
-		}
-		if err := step(3, "install-mysql", copy.InstallStandalone, func() error {
-			return installer.Install(ctx, server, bundle, options, logForServer)
-		}); err != nil {
-			msg := fmt.Sprintf(copy.InstallFailed, err)
-			logForServer.Error("%s", msg)
-			finishTarget(recorder, target, "failed", msg)
-			return err
-		}
+		return err
 	}
 
 	bootstrapTarget := targets[0]
@@ -275,6 +257,71 @@ func (s Service) installInnoDBCluster(ctx context.Context, req InstallRequest, r
 	}
 	log.Info(copy.ClusterInstalled, len(targets))
 	return nil
+}
+
+func (s Service) installInnoDBClusterBase(ctx context.Context, targets []string, servers map[string]store.Server, bundle mysqlinstaller.Bundle, options mysqlinstaller.InstallOptions, installer mysqlinstaller.Installer, recorder stepRecorder, steps []stepDef, copy Copy, log mysqlinstaller.Logger, targetLog targetLogger, concurrency int) (map[string]bool, error) {
+	limit := normalizeConcurrency(concurrency, len(targets))
+	sem := make(chan struct{}, limit)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var failures []string
+	failedTargets := map[string]bool{}
+	for _, target := range targets {
+		target := target
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			select {
+			case <-ctx.Done():
+				mu.Lock()
+				failedTargets[target] = true
+				failures = append(failures, fmt.Sprintf("%s: %v", target, ctx.Err()))
+				mu.Unlock()
+				return
+			case sem <- struct{}{}:
+			}
+			defer func() { <-sem }()
+			logForServer := logForTarget(log, targetLog, target)
+			taskrun.StartTarget(recorder, target)
+			step := newStepRunnerWithSteps(logForServer, recorder, target, copy, steps)
+			server := servers[target]
+			if err := step(1, "load-server", copy.LoadServer, func() error { return nil }); err != nil {
+				recordClusterBaseFailure(&mu, failedTargets, &failures, target, fmt.Sprintf(copy.LoadFailed, err))
+				logForServer.Error("%s", fmt.Sprintf(copy.LoadFailed, err))
+				finishTarget(recorder, target, "failed", fmt.Sprintf(copy.LoadFailed, err))
+				return
+			}
+			if err := step(2, "verify-resource", copy.VerifyResource, func() error {
+				return mysqlinstaller.VerifyBundle(bundle)
+			}); err != nil {
+				msg := fmt.Sprintf(copy.InstallFailed, err)
+				recordClusterBaseFailure(&mu, failedTargets, &failures, target, msg)
+				logForServer.Error("%s", msg)
+				finishTarget(recorder, target, "failed", msg)
+				return
+			}
+			if err := step(3, "install-mysql", copy.InstallStandalone, func() error {
+				return installer.Install(ctx, server, bundle, options, logForServer)
+			}); err != nil {
+				msg := fmt.Sprintf(copy.InstallFailed, err)
+				recordClusterBaseFailure(&mu, failedTargets, &failures, target, msg)
+				logForServer.Error("%s", msg)
+				finishTarget(recorder, target, "failed", msg)
+			}
+		}()
+	}
+	wg.Wait()
+	if len(failures) > 0 {
+		return failedTargets, errors.New(strings.Join(failures, "; "))
+	}
+	return failedTargets, nil
+}
+
+func recordClusterBaseFailure(mu *sync.Mutex, failedTargets map[string]bool, failures *[]string, target, msg string) {
+	mu.Lock()
+	defer mu.Unlock()
+	failedTargets[target] = true
+	*failures = append(*failures, fmt.Sprintf("%s: %s", target, msg))
 }
 
 func (s Service) Delete(ctx context.Context, req DeleteRequest, log mysqlinstaller.Logger, targetLog targetLogger) error {
@@ -414,6 +461,19 @@ func normalizeTopology(topology string) string {
 		return "standalone"
 	}
 	return topology
+}
+
+func normalizeConcurrency(value, total int) int {
+	if total < 1 {
+		return 1
+	}
+	if value < 1 {
+		return total
+	}
+	if value > total {
+		return total
+	}
+	return value
 }
 
 func remoteInstallRoot(server store.Server, app, version string) string {
