@@ -64,6 +64,7 @@ func New(cfg config.Config, s *store.Store, tasks *worker.Manager) *API {
 			r.Use(api.requireAuth)
 			r.Get("/settings", api.getSettings)
 			r.Put("/settings", api.requirePermission(rbac.SettingsManage, api.putSettings))
+			r.Post("/maintenance/database-backup/run", api.requirePermission(rbac.SettingsManage, api.runDatabaseBackup))
 			r.Post("/maintenance/retention/run", api.requirePermission(rbac.SettingsManage, api.runRetentionCleanup))
 			r.Get("/resources", api.listResources)
 			r.Post("/resources/rescan", api.requirePermission(rbac.ResourcesScan, api.rescanResources))
@@ -240,6 +241,7 @@ func (a *API) getSettings(w http.ResponseWriter, r *http.Request) {
 		"providerStatus":        "real",
 		"providerMode":          a.cfg.ProviderMode,
 		"databasePath":          a.cfg.DatabasePath,
+		"databaseBackupDir":     a.cfg.DatabaseBackupDir,
 		"resourcePath":          a.cfg.ResourceDir,
 		"staticPath":            a.cfg.StaticDir,
 		"defaultDeployDir":      a.cfg.DefaultDeployDir,
@@ -269,6 +271,52 @@ func (a *API) putSettings(w http.ResponseWriter, r *http.Request) {
 	}
 	a.audit(r, "settings.update", "panel", "success", i18n.Text(lang, "api.settingsUpdated"))
 	a.getSettings(w, r)
+}
+
+func (a *API) runDatabaseBackup(w http.ResponseWriter, r *http.Request) {
+	lang := languageFromRequest(r)
+	target := "control-plane"
+	service := maintenance.NewService(a.store, maintenance.RetentionConfig{
+		AuditRetentionDays: a.cfg.AuditRetentionDays,
+		TaskRetentionDays:  a.cfg.TaskRetentionDays,
+	})
+	actor := currentUser(r).Username
+	task, err := a.tasks.StartWithLanguage("maintenance.database.backup", target, actor, lang, func(ctx context.Context, log worker.Logger) error {
+		log.PlanTarget(target)
+		log.PlanStep(target, "prepare-backup", i18n.Text(lang, "maintenance.prepareBackupStep"), 1)
+		log.PlanStep(target, "backup-database", i18n.Text(lang, "maintenance.backupDatabaseStep"), 2)
+		log.PlanStep(target, "verify-backup", i18n.Text(lang, "maintenance.verifyBackupStep"), 3)
+		log.StartTarget(target)
+
+		log.StartStep(target, "prepare-backup", i18n.Text(lang, "maintenance.prepareBackupStep"), 1)
+		if err := ctx.Err(); err != nil {
+			log.FinishStep(target, "prepare-backup", "cancelled", err.Error())
+			log.FinishTarget(target, "cancelled", err.Error())
+			return err
+		}
+		log.Info(i18n.Text(lang, "maintenance.backupDir"), a.cfg.DatabaseBackupDir)
+		log.FinishStep(target, "prepare-backup", "success", "")
+
+		log.StartStep(target, "backup-database", i18n.Text(lang, "maintenance.backupDatabaseStep"), 2)
+		backup, err := service.BackupDatabase(a.cfg.DatabaseBackupDir, time.Now())
+		if err != nil {
+			log.FinishStep(target, "backup-database", "failed", err.Error())
+			log.FinishTarget(target, "failed", err.Error())
+			return err
+		}
+		log.Info(i18n.Text(lang, "maintenance.backupCreated"), backup.Path)
+		log.FinishStep(target, "backup-database", "success", "")
+
+		log.StartStep(target, "verify-backup", i18n.Text(lang, "maintenance.verifyBackupStep"), 3)
+		log.Info(i18n.Text(lang, "maintenance.backupVerified"), backup.Size, backup.SHA256)
+		log.FinishStep(target, "verify-backup", "success", "")
+		log.FinishTarget(target, "success", "")
+		return nil
+	})
+	if err == nil {
+		a.audit(r, "maintenance.database.backup", target, "running", i18n.Text(lang, "api.databaseBackupStarted"))
+	}
+	respondTask(w, task, err)
 }
 
 func (a *API) runRetentionCleanup(w http.ResponseWriter, r *http.Request) {

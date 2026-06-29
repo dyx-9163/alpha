@@ -30,9 +30,16 @@
       </div>
 
       <div class="settings-block">
-        <label>{{ t('settings.retention') }}</label>
-        <KeyValueGrid :items="retentionItems" class="retention-grid" />
+        <label>{{ t('settings.dataMaintenance') }}</label>
+        <KeyValueGrid :items="maintenanceItems" class="retention-grid" />
         <div class="retention-actions">
+          <el-tooltip :content="deniedText" :disabled="canManageSettings" placement="top">
+            <span>
+              <el-button :loading="backupRunning" :disabled="!canManageSettings" @click="runDatabaseBackup">
+                {{ t('settings.runDatabaseBackup') }}
+              </el-button>
+            </span>
+          </el-tooltip>
           <el-tooltip :content="deniedText" :disabled="canManageSettings" placement="top">
             <span>
               <el-button type="primary" :loading="retentionRunning" :disabled="!canManageSettings" @click="runRetentionCleanup">
@@ -85,6 +92,7 @@ const { locale, setLocale, t } = useI18n()
 const { can, deniedText } = usePermissions()
 const form = reactive<any>({ language: locale.value, deploymentConcurrency: 2, moduleStatus: {} })
 const now = ref('')
+const backupRunning = ref(false)
 const retentionRunning = ref(false)
 const platform = navigator.platform.toLowerCase().includes('win') ? 'windows' : 'linux'
 const providerModeLabel = computed(() => {
@@ -105,7 +113,8 @@ const providerItems = computed(() => [
   { key: 'defaultDeployDir', label: t('settings.defaultDeployDir'), value: form.defaultDeployDir },
   { key: 'confirm', label: t('settings.dangerousActionsRequire'), value: t('settings.confirmTrue') }
 ])
-const retentionItems = computed(() => [
+const maintenanceItems = computed(() => [
+  { key: 'databaseBackupDir', label: t('settings.databaseBackupDir'), value: form.databaseBackupDir },
   { key: 'auditRetentionDays', label: t('settings.auditRetention'), value: formatRetentionDays(form.auditRetentionDays) },
   { key: 'taskRetentionDays', label: t('settings.taskRetention'), value: formatRetentionDays(form.taskRetentionDays) }
 ])
@@ -153,6 +162,22 @@ async function runRetentionCleanup() {
     ElMessage.error(err instanceof Error ? err.message : t('settings.retentionCleanupFailed'))
   } finally {
     retentionRunning.value = false
+  }
+}
+
+async function runDatabaseBackup() {
+  if (!canManageSettings.value) {
+    ElMessage.warning(deniedText.value)
+    return
+  }
+  backupRunning.value = true
+  try {
+    await apiPost('/maintenance/database-backup/run')
+    ElMessage.success(t('settings.databaseBackupAccepted'))
+  } catch (err) {
+    ElMessage.error(err instanceof Error ? err.message : t('settings.databaseBackupFailed'))
+  } finally {
+    backupRunning.value = false
   }
 }
 
@@ -210,6 +235,9 @@ onMounted(load)
 
 .retention-actions {
   margin-top: 12px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
 }
 
 @media (max-width: 720px) {

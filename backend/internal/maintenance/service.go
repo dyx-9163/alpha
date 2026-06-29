@@ -1,8 +1,14 @@
 package maintenance
 
-import "time"
+import (
+	"fmt"
+	"path/filepath"
+	"strings"
+	"time"
+)
 
 type Store interface {
+	BackupDatabase(path string) (int64, string, error)
 	DeleteAuditLogsBefore(cutoff time.Time) (int, error)
 	DeleteFinishedTasksBefore(cutoff time.Time) (int, error)
 }
@@ -15,6 +21,13 @@ type RetentionConfig struct {
 type RetentionPlan struct {
 	AuditCutoff time.Time
 	TaskCutoff  time.Time
+}
+
+type DatabaseBackup struct {
+	Path      string    `json:"path"`
+	Size      int64     `json:"size"`
+	SHA256    string    `json:"sha256"`
+	CreatedAt time.Time `json:"createdAt"`
 }
 
 type Service struct {
@@ -52,4 +65,21 @@ func (s Service) CleanupTasks(plan RetentionPlan) (int, error) {
 		return 0, nil
 	}
 	return s.store.DeleteFinishedTasksBefore(plan.TaskCutoff)
+}
+
+func (s Service) BackupDatabase(dir string, now time.Time) (DatabaseBackup, error) {
+	dir = strings.TrimSpace(dir)
+	if dir == "" {
+		return DatabaseBackup{}, fmt.Errorf("database backup directory is required")
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	name := fmt.Sprintf("aifar-control-plane-%s-%d.db", now.Format("20060102-150405"), now.UnixNano())
+	path := filepath.Join(dir, name)
+	size, checksum, err := s.store.BackupDatabase(path)
+	if err != nil {
+		return DatabaseBackup{}, err
+	}
+	return DatabaseBackup{Path: path, Size: size, SHA256: checksum, CreatedAt: now}, nil
 }

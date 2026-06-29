@@ -169,6 +169,7 @@ func TestSettingsExposeSecurityLimits(t *testing.T) {
 	api.cfg.AuthLockoutSeconds = 60
 	api.cfg.AuditRetentionDays = 120
 	api.cfg.TaskRetentionDays = 45
+	api.cfg.DatabaseBackupDir = filepath.Join(t.TempDir(), "control-plane-backups")
 	token := issueTestToken(t, db, secret, "owner", "owner")
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v2/settings", nil)
@@ -185,7 +186,7 @@ func TestSettingsExposeSecurityLimits(t *testing.T) {
 		t.Fatal(err)
 	}
 	if body["maxRequestBodyBytes"] != float64(2048) || body["authMaxFailures"] != float64(7) || body["authLockoutSeconds"] != float64(60) ||
-		body["auditRetentionDays"] != float64(120) || body["taskRetentionDays"] != float64(45) {
+		body["auditRetentionDays"] != float64(120) || body["taskRetentionDays"] != float64(45) || body["databaseBackupDir"] != api.cfg.DatabaseBackupDir {
 		t.Fatalf("security limits missing from settings response: %+v", body)
 	}
 }
@@ -217,6 +218,46 @@ func TestRetentionCleanupStartsTask(t *testing.T) {
 	assertAuditExists(t, db, "maintenance.retention.run", "running", "owner", "control-plane")
 }
 
+func TestDatabaseBackupStartsTaskAndCreatesFile(t *testing.T) {
+	api, db, secret := newAuthzTestAPI(t)
+	token := issueTestToken(t, db, secret, "owner", "owner")
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v2/maintenance/database-backup/run", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	rec := httptest.NewRecorder()
+
+	api.Router().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	taskID, _ := body["taskId"].(string)
+	if taskID == "" {
+		t.Fatalf("expected taskId in response: %+v", body)
+	}
+	waitForTaskStatus(t, db, taskID, "success")
+	files, err := filepath.Glob(filepath.Join(api.cfg.DatabaseBackupDir, "aifar-control-plane-*.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(files) != 1 {
+		t.Fatalf("expected one backup file, got %+v", files)
+	}
+	backup, err := store.Open(files[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer backup.Close()
+	if _, err := backup.UserByUsername("owner"); err != nil {
+		t.Fatalf("expected backed up owner to be readable: %v", err)
+	}
+	assertAuditExists(t, db, "maintenance.database.backup", "running", "owner", "control-plane")
+}
+
 func newAuthzTestAPI(t *testing.T) (*API, *store.Store, string) {
 	t.Helper()
 	root := t.TempDir()
@@ -233,6 +274,7 @@ func newAuthzTestAPI(t *testing.T) (*API, *store.Store, string) {
 		ResourceDir:           filepath.Join(root, "resources"),
 		StaticDir:             root,
 		DatabasePath:          filepath.Join(root, "aifar.db"),
+		DatabaseBackupDir:     filepath.Join(root, "backups"),
 		DefaultDeployDir:      "/aifar/apps",
 		DeploymentConcurrency: 1,
 		ProviderMode:          "real",

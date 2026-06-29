@@ -2,10 +2,12 @@ package store
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -41,12 +43,53 @@ func OpenWithSecret(path, secret string) (*Store, error) {
 
 func (s *Store) Close() error { return s.db.Close() }
 
+func (s *Store) BackupDatabase(path string) (int64, string, error) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return 0, "", errors.New("backup path is required")
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return 0, "", err
+	}
+	_ = os.Remove(path)
+	if _, err := s.db.Exec(`vacuum into ` + sqliteString(path)); err != nil {
+		_ = os.Remove(path)
+		return 0, "", err
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return 0, "", err
+	}
+	checksum, err := fileSHA256(path)
+	if err != nil {
+		return 0, "", err
+	}
+	return info.Size(), checksum, nil
+}
+
 func NewID(prefix string) string {
 	var b [12]byte
 	if _, err := rand.Read(b[:]); err != nil {
 		return fmt.Sprintf("%s_%d", prefix, time.Now().UnixNano())
 	}
 	return prefix + "_" + hex.EncodeToString(b[:])
+}
+
+func sqliteString(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "''") + "'"
+}
+
+func fileSHA256(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 func (s *Store) migrate() error {

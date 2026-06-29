@@ -11,6 +11,7 @@ type Config struct {
 	StaticDir             string `json:"staticDir"`
 	ResourceDir           string `json:"resourceDir"`
 	DatabasePath          string `json:"databasePath"`
+	DatabaseBackupDir     string `json:"databaseBackupDir"`
 	BootstrapUsername     string `json:"-"`
 	BootstrapPassword     string `json:"-"`
 	DefaultPassword       string `json:"-"`
@@ -30,11 +31,13 @@ func Load() Config {
 	root, _ := os.Getwd()
 	defaultPassword := getenv("AIFAR_DEFAULT_PASSWORD", "Oversea.123")
 	jwtSecret := getenv("AIFAR_JWT_SECRET", "aifar-local-development-secret-change-me")
+	databasePath := getenv("AIFAR_DATABASE_PATH", filepath.Join(root, "data", "aifar.db"))
 	cfg := Config{
 		Addr:                  getenv("AIFAR_ADDR", "0.0.0.0:8080"),
 		StaticDir:             getenv("AIFAR_STATIC_DIR", filepath.Join(root, "web", "dist")),
 		ResourceDir:           getenv("AIFAR_RESOURCE_DIR", filepath.Join(root, "resources")),
-		DatabasePath:          getenv("AIFAR_DATABASE_PATH", filepath.Join(root, "data", "aifar.db")),
+		DatabasePath:          databasePath,
+		DatabaseBackupDir:     getenv("AIFAR_DATABASE_BACKUP_DIR", filepath.Join(filepath.Dir(databasePath), "backups")),
 		BootstrapUsername:     getenv("AIFAR_BOOTSTRAP_USERNAME", "admin"),
 		BootstrapPassword:     getenv("AIFAR_BOOTSTRAP_PASSWORD", defaultPassword),
 		DefaultPassword:       defaultPassword,

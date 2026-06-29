@@ -247,6 +247,44 @@ func TestTaskLifecycle(t *testing.T) {
 	}
 }
 
+func TestBackupDatabase(t *testing.T) {
+	root := t.TempDir()
+	db, err := Open(filepath.Join(root, "aifar.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.BootstrapUser("admin", "secret"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.SaveServer(Server{Name: "node-1", Host: "127.0.0.1", Username: "root"}); err != nil {
+		t.Fatal(err)
+	}
+	backupPath := filepath.Join(root, "backups", "snapshot.db")
+	size, checksum, err := db.BackupDatabase(backupPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if size <= 0 || len(checksum) != 64 {
+		t.Fatalf("expected backup size and sha256, got size=%d sha=%q", size, checksum)
+	}
+	backup, err := Open(backupPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer backup.Close()
+	if _, err := backup.UserByUsername("admin"); err != nil {
+		t.Fatalf("expected backed up user to be readable: %v", err)
+	}
+	servers, err := backup.ListServers()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(servers) != 1 || servers[0].Name != "node-1" {
+		t.Fatalf("expected backed up server, got %+v", servers)
+	}
+}
+
 func TestClearTaskLogsForTasks(t *testing.T) {
 	db, err := Open(filepath.Join(t.TempDir(), "aifar.db"))
 	if err != nil {
