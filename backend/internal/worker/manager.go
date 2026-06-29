@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 
@@ -83,6 +84,13 @@ func (m *Manager) StartWithLanguage(taskType, target, actor, lang string, job Jo
 	task, err := m.store.CreateTask(store.Task{Type: taskType, Target: target, Status: "pending", CreatedBy: actor})
 	if err != nil {
 		return task, err
+	}
+	return m.StartExistingWithLanguage(task, lang, job)
+}
+
+func (m *Manager) StartExistingWithLanguage(task store.Task, lang string, job Job) (store.Task, error) {
+	if task.ID == "" {
+		return task, errors.New("task id is required")
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	m.mu.Lock()

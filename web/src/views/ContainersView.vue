@@ -6,7 +6,10 @@
         <p class="page-subtitle">{{ t('containers.subtitle') }}</p>
       </div>
       <div class="head-actions">
-        <el-input v-model="dockerHost" :placeholder="t('containers.localDocker')" clearable class="toolbar-control" />
+        <el-select v-model="selectedServerId" :placeholder="t('terminal.server')" clearable class="toolbar-control">
+          <el-option v-for="server in servers" :key="server.id" :label="serverLabel(server)" :value="server.id" />
+        </el-select>
+        <el-input v-model="dockerHost" :disabled="Boolean(selectedServerId)" :placeholder="t('containers.localDocker')" clearable class="toolbar-control" />
         <el-button @click="load">{{ t('containers.checkHost') }}</el-button>
         <el-button @click="loadActive">{{ t('common.refresh') }}</el-button>
       </div>
@@ -49,7 +52,7 @@
         <div class="sub-panel">
           <h2 class="section-title">{{ t('containers.configSummary') }}</h2>
           <div class="kv-grid">
-            <div class="key">{{ t('containers.dockerHost') }}</div><div>{{ dockerHost || t('containers.localDocker') }}</div>
+            <div class="key">{{ t('containers.dockerHost') }}</div><div>{{ targetLabel }}</div>
             <div class="key">{{ t('containers.endpoint') }}</div><div>{{ summaryData.endpoint || '-' }}</div>
             <div class="key">{{ t('containers.serverVersion') }}</div><div>{{ summaryData.version || '-' }}</div>
             <div class="key">{{ t('containers.driver') }}</div><div>{{ summaryData.driver || '-' }}</div>
@@ -124,7 +127,7 @@
       <template v-else>
         <div class="settings-grid">
           <div class="kv-grid">
-            <div class="key">{{ t('containers.dockerHost') }}</div><div>{{ dockerHost || t('containers.localDocker') }}</div>
+            <div class="key">{{ t('containers.dockerHost') }}</div><div>{{ targetLabel }}</div>
             <div class="key">{{ t('containers.endpoint') }}</div><div>{{ summaryData.endpoint || '-' }}</div>
             <div class="key">{{ t('containers.rootDir') }}</div><div>{{ summaryData.rootDir || '-' }}</div>
             <div class="key">{{ t('common.provider') }}</div><div>{{ t('common.real') }}</div>
@@ -156,6 +159,8 @@ type DockerSummaryResponse = {
 
 const { t } = useI18n()
 const dockerHost = ref('')
+const selectedServerId = ref('')
+const servers = ref<any[]>([])
 const summary = ref<DockerSummaryResponse>({})
 const collection = ref<any[]>([])
 const error = ref('')
@@ -164,6 +169,8 @@ const logsVisible = ref(false)
 const logsText = ref('')
 
 const summaryData = computed(() => summary.value.summary ?? {})
+const selectedServer = computed(() => servers.value.find((server) => server.id === selectedServerId.value) ?? null)
+const targetLabel = computed(() => selectedServer.value ? serverLabel(selectedServer.value) : dockerHost.value || t('containers.localDocker'))
 const errorTitle = computed(() => summary.value.available === false ? t('containers.notAvailable') : t('containers.checkFailed'))
 const metrics = computed(() => [
   { label: t('containers.title'), value: summaryData.value.containers ?? 0, note: t('containers.runningCount', { count: summaryData.value.running ?? 0 }) },
@@ -183,13 +190,27 @@ const normalizedDiskUsage = computed(() => {
   ]
 })
 
-function hostQuery() {
+function targetQuery() {
+  if (selectedServerId.value) {
+    return `serverId=${encodeURIComponent(selectedServerId.value)}`
+  }
   return `dockerHost=${encodeURIComponent(dockerHost.value)}`
+}
+
+function serverLabel(server: any) {
+  if (!server) {
+    return ''
+  }
+  return server.name && server.host ? `${server.name} (${server.host})` : server.name || server.host || server.id
+}
+
+async function loadServers() {
+  servers.value = asArray(await apiGet<any[] | null>('/servers').catch(() => []))
 }
 
 async function load() {
   error.value = ''
-  summary.value = await apiGet<DockerSummaryResponse>(`/containers/summary?${hostQuery()}`).catch((err) => {
+  summary.value = await apiGet<DockerSummaryResponse>(`/containers/summary?${targetQuery()}`).catch((err) => {
     error.value = err.message
     return { available: false, error: err.message }
   })
@@ -204,7 +225,7 @@ async function loadCollection() {
     collection.value = []
     return
   }
-  collection.value = asArray(await apiGet(`/containers?kind=${tab.value}&${hostQuery()}`).catch((err) => {
+  collection.value = asArray(await apiGet(`/containers?kind=${tab.value}&${targetQuery()}`).catch((err) => {
     error.value = err.message
     return []
   }))
@@ -219,19 +240,23 @@ async function loadActive() {
 }
 
 async function runContainerAction(id: string, action: string) {
-  await apiPost(`/containers/${encodeURIComponent(id)}/${action}?${hostQuery()}`)
+  await apiPost(`/containers/${encodeURIComponent(id)}/${action}?${targetQuery()}`)
   ElMessage.success(t('containers.actionAccepted'))
   setTimeout(loadCollection, 800)
 }
 
 async function openLogs(id: string) {
-  const result = await apiGet<{ logs?: string[] }>(`/containers/${encodeURIComponent(id)}/logs?tail=300&${hostQuery()}`)
+  const result = await apiGet<{ logs?: string[] }>(`/containers/${encodeURIComponent(id)}/logs?tail=300&${targetQuery()}`)
   logsText.value = asArray<string>(result.logs).join('\n')
   logsVisible.value = true
 }
 
 watch(tab, loadActive)
-onMounted(load)
+watch(selectedServerId, load)
+onMounted(async () => {
+  await loadServers()
+  await load()
+})
 </script>
 
 <style scoped>

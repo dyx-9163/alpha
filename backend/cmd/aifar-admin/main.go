@@ -16,7 +16,7 @@ func main() {
 		cmd = os.Args[1]
 	}
 
-	db, err := store.Open(cfg.DatabasePath)
+	db, err := store.OpenWithSecret(cfg.DatabasePath, cfg.CredentialSecret)
 	if err != nil {
 		log.Fatalf("open database: %v", err)
 	}

@@ -164,7 +164,6 @@ func (a *API) getSettings(w http.ResponseWriter, r *http.Request) {
 		"resourcePath":          a.cfg.ResourceDir,
 		"staticPath":            a.cfg.StaticDir,
 		"defaultDeployDir":      a.cfg.DefaultDeployDir,
-		"defaultPassword":       a.cfg.DefaultPassword,
 		"moduleStatus": map[string]string{
 			"servers": "available", "apps": "available", "containers": "available",
 			"database": "available", "storage": "available", "terminal": "available",
@@ -687,54 +686,65 @@ func (a *API) installAppName(w http.ResponseWriter, r *http.Request, app string)
 	}
 	target := strings.Join(serverIDs, ",")
 	actor := currentUser(r).Username
-	task, err := a.tasks.StartWithLanguage("apps."+def.Name+".install", target, actor, lang, func(ctx context.Context, log worker.Logger) error {
+	resources, err := a.store.ListResources()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "RESOURCE_LIST_FAILED", err.Error(), nil)
+		return
+	}
+	missing := appcatalog.MissingForInstall(def, resources, req.Version)
+	if len(missing) > 0 {
+		writeError(w, http.StatusConflict, "APP_NOT_DEPLOYABLE", fmt.Sprintf(i18n.Text(lang, "api.appNotDeployable"), def.Name, strings.Join(missing, ", ")), map[string]any{"app": def.Name, "missing": missing})
+		return
+	}
+	_, matched := appcatalog.ResolveResources(def, resources, req.Version)
+	moduleReq := registry.InstallRequest{
+		App:        def.Name,
+		Version:    req.Version,
+		Topology:   req.Topology,
+		Language:   lang,
+		ServerIDs:  serverIDs,
+		Actor:      actor,
+		Parameters: req.Parameters,
+	}
+	if len(serverIDs) == 1 {
+		moduleReq.ServerID = serverIDs[0]
+	}
+	preflight, err := module.PreflightInstall(r.Context(), moduleReq, resources)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "INSTALL_PREFLIGHT_FAILED", err.Error(), map[string]any{"app": def.Name})
+		return
+	}
+	plan, err := module.PlanInstall(r.Context(), moduleReq, resources)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "INSTALL_PLAN_FAILED", err.Error(), map[string]any{"app": def.Name})
+		return
+	}
+	if err := module.ValidateInstall(r.Context(), moduleReq, resources); err != nil {
+		writeError(w, http.StatusBadRequest, "INSTALL_VALIDATE_FAILED", err.Error(), map[string]any{"app": def.Name})
+		return
+	}
+	task, err := a.store.CreateTask(store.Task{Type: "apps." + def.Name + ".install", Target: target, Status: "pending", CreatedBy: actor})
+	if err != nil {
+		respondTask(w, task, err)
+		return
+	}
+	if err := a.storeInstallPlan(task.ID, plan); err != nil {
+		_ = a.store.DeleteTask(task.ID)
+		writeError(w, http.StatusInternalServerError, "INSTALL_PLAN_STORE_FAILED", err.Error(), map[string]any{"app": def.Name})
+		return
+	}
+	task, err = a.tasks.StartExistingWithLanguage(task, lang, func(ctx context.Context, log worker.Logger) error {
 		log.Info(i18n.Text(lang, "api.installAccepted"), def.Name, req.Version)
 		log.Info(i18n.Text(lang, "api.installTargets"), target)
 		log.Info(i18n.Text(lang, "api.resourceRoot"), a.cfg.ResourceDir)
-		resources, _ := a.store.ListResources()
-		missing := appcatalog.MissingForInstall(def, resources, req.Version)
-		if len(missing) > 0 {
-			return fmt.Errorf(i18n.Text(lang, "api.appNotDeployable"), def.Name, strings.Join(missing, ", "))
-		}
-		_, matched := appcatalog.ResolveResources(def, resources, req.Version)
 		for _, res := range matched {
 			log.Info(i18n.Text(lang, "api.resourceFound"), res.Part, res.Path)
-		}
-		moduleReq := registry.InstallRequest{
-			App:             def.Name,
-			Version:         req.Version,
-			Topology:        req.Topology,
-			Language:        lang,
-			ServerID:        req.ServerID,
-			ServerIDs:       req.ServerIDs,
-			Actor:           actor,
-			DefaultPassword: a.cfg.DefaultPassword,
-			Parameters:      req.Parameters,
-		}
-		preflight, err := module.PreflightInstall(ctx, moduleReq, resources)
-		if err != nil {
-			return err
 		}
 		for _, warning := range preflight.Warnings {
 			log.Info(i18n.Text(lang, "api.preflightWarning"), warning)
 		}
-		plan, err := module.PlanInstall(ctx, moduleReq, resources)
-		if err != nil {
-			return err
-		}
-		plannedTargets := map[string]bool{}
-		for _, step := range plan {
-			if step.Target != "" && !plannedTargets[step.Target] {
-				log.PlanTarget(step.Target)
-				plannedTargets[step.Target] = true
-			}
-			log.PlanStep(step.Target, step.Name, step.Title, step.Order)
-		}
 		if len(plan) > 0 {
 			log.Info(i18n.Text(lang, "api.installPlanPrepared"), len(plan))
-		}
-		if err := module.ValidateInstall(ctx, moduleReq, resources); err != nil {
-			return err
 		}
 		return module.Install(ctx, moduleReq, registry.RunContext{
 			Resources: resources,
@@ -748,6 +758,25 @@ func (a *API) installAppName(w http.ResponseWriter, r *http.Request, app string)
 		a.audit(r, "apps."+def.Name+".install", target, "running", task.ID)
 	}
 	respondTask(w, task, err)
+}
+
+func (a *API) storeInstallPlan(taskID string, plan []registry.InstallStepPlan) error {
+	plannedTargets := map[string]bool{}
+	for _, step := range plan {
+		if step.Target != "" && !plannedTargets[step.Target] {
+			if err := a.store.UpsertTaskTarget(taskID, step.Target, "pending", ""); err != nil {
+				return err
+			}
+			plannedTargets[step.Target] = true
+		}
+		if step.Name == "" {
+			continue
+		}
+		if err := a.store.UpsertTaskStep(taskID, step.Target, step.Name, step.Title, step.Order, "pending", ""); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func installTargetServerIDs(req installAppRequest) []string {
@@ -841,17 +870,41 @@ func (a *API) instanceAction(action string) http.HandlerFunc {
 
 func (a *API) containerSummary(w http.ResponseWriter, r *http.Request) {
 	host := dockerHostFromRequest(r)
-	summary, err := adapter.DockerSummaryForHost(r.Context(), host)
+	server, useServer, serverErr := a.dockerServerFromRequest(r)
+	if serverErr != nil {
+		respond(w, nil, serverErr)
+		return
+	}
+	var (
+		summary adapter.DockerSummary
+		err     error
+		df      any
+	)
+	if useServer {
+		var serverSummary adapter.DockerSummary
+		serverSummary, err = adapter.DockerSummaryForServer(r.Context(), server)
+		summary = serverSummary
+		df, _ = adapter.DockerSystemDFForServer(r.Context(), server)
+	} else {
+		var hostSummary adapter.DockerSummary
+		hostSummary, err = adapter.DockerSummaryForHost(r.Context(), host)
+		summary = hostSummary
+		df, _ = adapter.DockerSystemDF(r.Context(), host)
+	}
 	if err != nil {
 		writeJSON(w, http.StatusOK, map[string]any{"available": false, "error": err.Error(), "containers": 0, "images": 0, "networks": 0, "volumes": 0})
 		return
 	}
-	df, _ := adapter.DockerSystemDF(r.Context(), host)
 	writeJSON(w, http.StatusOK, map[string]any{"available": true, "summary": summary, "diskUsage": df})
 }
 
 func (a *API) containers(w http.ResponseWriter, r *http.Request) {
 	host := dockerHostFromRequest(r)
+	server, useServer, serverErr := a.dockerServerFromRequest(r)
+	if serverErr != nil {
+		respond(w, nil, serverErr)
+		return
+	}
 	kind := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("kind")))
 	if kind == "" {
 		kind = "containers"
@@ -862,15 +915,35 @@ func (a *API) containers(w http.ResponseWriter, r *http.Request) {
 	)
 	switch kind {
 	case "containers":
-		out, err = adapter.DockerContainers(r.Context(), host)
+		if useServer {
+			out, err = adapter.DockerContainersForServer(r.Context(), server)
+		} else {
+			out, err = adapter.DockerContainers(r.Context(), host)
+		}
 	case "images":
-		out, err = adapter.DockerImages(r.Context(), host)
+		if useServer {
+			out, err = adapter.DockerImagesForServer(r.Context(), server)
+		} else {
+			out, err = adapter.DockerImages(r.Context(), host)
+		}
 	case "networks", "network":
-		out, err = adapter.DockerNetworks(r.Context(), host)
+		if useServer {
+			out, err = adapter.DockerNetworksForServer(r.Context(), server)
+		} else {
+			out, err = adapter.DockerNetworks(r.Context(), host)
+		}
 	case "volumes", "volume":
-		out, err = adapter.DockerVolumes(r.Context(), host)
+		if useServer {
+			out, err = adapter.DockerVolumesForServer(r.Context(), server)
+		} else {
+			out, err = adapter.DockerVolumes(r.Context(), host)
+		}
 	case "df", "disk":
-		out, err = adapter.DockerSystemDF(r.Context(), host)
+		if useServer {
+			out, err = adapter.DockerSystemDFForServer(r.Context(), server)
+		} else {
+			out, err = adapter.DockerSystemDF(r.Context(), host)
+		}
 	default:
 		writeError(w, http.StatusBadRequest, "UNSUPPORTED_CONTAINER_KIND", "unsupported container collection", map[string]any{"kind": kind})
 		return
@@ -883,10 +956,21 @@ func (a *API) containerAction(action string) http.HandlerFunc {
 		id := chi.URLParam(r, "id")
 		lang := languageFromRequest(r)
 		host := dockerHostFromRequest(r)
+		server, useServer, serverErr := a.dockerServerFromRequest(r)
+		if serverErr != nil {
+			respond(w, nil, serverErr)
+			return
+		}
 		task, err := a.tasks.StartWithLanguage("containers.container."+action, id, currentUser(r).Username, lang, func(ctx context.Context, log worker.Logger) error {
 			log.Info(i18n.Text(lang, "api.containerActionRequested"), action, id)
-			if err := adapter.DockerContainerAction(ctx, host, id, action); err != nil {
-				return err
+			if useServer {
+				if err := adapter.DockerContainerActionForServer(ctx, server, id, action); err != nil {
+					return err
+				}
+			} else {
+				if err := adapter.DockerContainerAction(ctx, host, id, action); err != nil {
+					return err
+				}
 			}
 			log.Info(i18n.Text(lang, "api.containerActionCompleted"), action, id)
 			return nil
@@ -900,8 +984,21 @@ func (a *API) containerAction(action string) http.HandlerFunc {
 
 func (a *API) containerLogs(w http.ResponseWriter, r *http.Request) {
 	host := dockerHostFromRequest(r)
+	server, useServer, serverErr := a.dockerServerFromRequest(r)
+	if serverErr != nil {
+		respond(w, nil, serverErr)
+		return
+	}
 	tail := queryInt(r, "tail", 200)
-	logs, err := adapter.DockerContainerLogs(r.Context(), host, chi.URLParam(r, "id"), tail)
+	var (
+		logs []string
+		err  error
+	)
+	if useServer {
+		logs, err = adapter.DockerContainerLogsForServer(r.Context(), server, chi.URLParam(r, "id"), tail)
+	} else {
+		logs, err = adapter.DockerContainerLogs(r.Context(), host, chi.URLParam(r, "id"), tail)
+	}
 	respond(w, map[string]any{"logs": logs}, err)
 }
 
@@ -1068,6 +1165,18 @@ func storageKind(name string) string {
 	default:
 		return name
 	}
+}
+
+func (a *API) dockerServerFromRequest(r *http.Request) (store.Server, bool, error) {
+	serverID := strings.TrimSpace(r.URL.Query().Get("serverId"))
+	if serverID == "" {
+		return store.Server{}, false, nil
+	}
+	server, err := a.store.GetServer(serverID, true)
+	if err != nil {
+		return store.Server{}, false, err
+	}
+	return server, true, nil
 }
 
 func dockerHostFromRequest(r *http.Request) string {

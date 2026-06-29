@@ -16,10 +16,15 @@ import (
 )
 
 type Store struct {
-	db *sql.DB
+	db        *sql.DB
+	secretKey []byte
 }
 
 func Open(path string) (*Store, error) {
+	return OpenWithSecret(path, "")
+}
+
+func OpenWithSecret(path, secret string) (*Store, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return nil, err
 	}
@@ -28,7 +33,7 @@ func Open(path string) (*Store, error) {
 		return nil, err
 	}
 	db.SetMaxOpenConns(1)
-	s := &Store{db: db}
+	s := &Store{db: db, secretKey: deriveSecretKey(secret)}
 	return s, s.migrate()
 }
 
@@ -228,8 +233,18 @@ func (s *Store) GetServer(id string, includeSecret bool) (Server, error) {
 	var v Server
 	err := s.db.QueryRow(`select id,name,host,port,username,auth_type,password,private_key,tags,note,deploy_dir,docker_host,status,last_error,created_at,updated_at from servers where id=?`, id).
 		Scan(&v.ID, &v.Name, &v.Host, &v.Port, &v.Username, &v.AuthType, &v.Password, &v.PrivateKey, &v.Tags, &v.Note, &v.DeployDir, &v.DockerHost, &v.Status, &v.LastError, &v.CreatedAt, &v.UpdatedAt)
+	if err != nil {
+		return v, err
+	}
 	if !includeSecret {
 		v.Password, v.PrivateKey = "", ""
+		return v, nil
+	}
+	if v.Password, err = s.decryptSecret(v.Password); err != nil {
+		return Server{}, err
+	}
+	if v.PrivateKey, err = s.decryptSecret(v.PrivateKey); err != nil {
+		return Server{}, err
 	}
 	return v, err
 }
@@ -253,12 +268,20 @@ func (s *Store) SaveServer(v Server) (Server, error) {
 		v.Status = "unknown"
 	}
 	v.UpdatedAt = now
-	_, err := s.db.Exec(`insert into servers(id,name,host,port,username,auth_type,password,private_key,tags,note,deploy_dir,docker_host,status,last_error,created_at,updated_at)
+	stored := v
+	var err error
+	if stored.Password, err = s.encryptSecret(stored.Password); err != nil {
+		return Server{}, err
+	}
+	if stored.PrivateKey, err = s.encryptSecret(stored.PrivateKey); err != nil {
+		return Server{}, err
+	}
+	_, err = s.db.Exec(`insert into servers(id,name,host,port,username,auth_type,password,private_key,tags,note,deploy_dir,docker_host,status,last_error,created_at,updated_at)
 		values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		on conflict(id) do update set name=excluded.name,host=excluded.host,port=excluded.port,username=excluded.username,auth_type=excluded.auth_type,
 		password=coalesce(nullif(excluded.password,''),servers.password),private_key=coalesce(nullif(excluded.private_key,''),servers.private_key),
 		tags=excluded.tags,note=excluded.note,deploy_dir=excluded.deploy_dir,docker_host=excluded.docker_host,status=excluded.status,last_error=excluded.last_error,updated_at=excluded.updated_at`,
-		v.ID, v.Name, v.Host, v.Port, v.Username, v.AuthType, v.Password, v.PrivateKey, v.Tags, v.Note, v.DeployDir, v.DockerHost, v.Status, v.LastError, v.CreatedAt, v.UpdatedAt)
+		stored.ID, stored.Name, stored.Host, stored.Port, stored.Username, stored.AuthType, stored.Password, stored.PrivateKey, stored.Tags, stored.Note, stored.DeployDir, stored.DockerHost, stored.Status, stored.LastError, stored.CreatedAt, stored.UpdatedAt)
 	return v, err
 }
 
@@ -709,6 +732,7 @@ func (s *Store) ListStorageItems(instanceID, kind string) ([]StorageItem, error)
 		if err := rows.Scan(&item.ID, &item.InstanceID, &item.Kind, &item.Name, &item.Policy, &item.AccessKey, &item.SecretKey, &item.Metadata, &item.CreatedAt, &item.UpdatedAt); err != nil {
 			return nil, err
 		}
+		item.SecretKey = ""
 		out = append(out, item)
 	}
 	return out, rows.Err()
@@ -721,11 +745,19 @@ func (s *Store) SaveStorageItem(item StorageItem) (StorageItem, error) {
 		item.CreatedAt = now
 	}
 	item.UpdatedAt = now
-	_, err := s.db.Exec(`insert into storage_items(id,instance_id,kind,name,policy,access_key,secret_key,metadata,created_at,updated_at)
+	stored := item
+	var err error
+	if stored.SecretKey, err = s.encryptSecret(stored.SecretKey); err != nil {
+		return StorageItem{}, err
+	}
+	_, err = s.db.Exec(`insert into storage_items(id,instance_id,kind,name,policy,access_key,secret_key,metadata,created_at,updated_at)
 		values(?,?,?,?,?,?,?,?,?,?)
 		on conflict(instance_id,kind,name) do update set
-		policy=excluded.policy,access_key=excluded.access_key,secret_key=excluded.secret_key,metadata=excluded.metadata,updated_at=excluded.updated_at`,
-		item.ID, item.InstanceID, item.Kind, item.Name, item.Policy, item.AccessKey, item.SecretKey, item.Metadata, item.CreatedAt, item.UpdatedAt)
+		policy=excluded.policy,access_key=excluded.access_key,
+		secret_key=coalesce(nullif(excluded.secret_key,''),storage_items.secret_key),
+		metadata=excluded.metadata,updated_at=excluded.updated_at`,
+		stored.ID, stored.InstanceID, stored.Kind, stored.Name, stored.Policy, stored.AccessKey, stored.SecretKey, stored.Metadata, stored.CreatedAt, stored.UpdatedAt)
+	item.SecretKey = ""
 	return item, err
 }
 

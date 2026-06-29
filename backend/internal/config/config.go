@@ -15,6 +15,7 @@ type Config struct {
 	BootstrapPassword     string `json:"-"`
 	DefaultPassword       string `json:"-"`
 	JWTSecret             string `json:"-"`
+	CredentialSecret      string `json:"-"`
 	DeploymentConcurrency int    `json:"deploymentConcurrency"`
 	DefaultDeployDir      string `json:"defaultDeployDir"`
 	ProviderMode          string `json:"providerMode"`
@@ -23,6 +24,7 @@ type Config struct {
 func Load() Config {
 	root, _ := os.Getwd()
 	defaultPassword := getenv("AIFAR_DEFAULT_PASSWORD", "Oversea.123")
+	jwtSecret := getenv("AIFAR_JWT_SECRET", "aifar-local-development-secret-change-me")
 	cfg := Config{
 		Addr:                  getenv("AIFAR_ADDR", "0.0.0.0:8080"),
 		StaticDir:             getenv("AIFAR_STATIC_DIR", filepath.Join(root, "web", "dist")),
@@ -31,7 +33,8 @@ func Load() Config {
 		BootstrapUsername:     getenv("AIFAR_BOOTSTRAP_USERNAME", "admin"),
 		BootstrapPassword:     getenv("AIFAR_BOOTSTRAP_PASSWORD", defaultPassword),
 		DefaultPassword:       defaultPassword,
-		JWTSecret:             getenv("AIFAR_JWT_SECRET", "aifar-local-development-secret-change-me"),
+		JWTSecret:             jwtSecret,
+		CredentialSecret:      getenv("AIFAR_CREDENTIAL_SECRET", jwtSecret),
 		DeploymentConcurrency: getenvInt("AIFAR_DEPLOYMENT_CONCURRENCY", 2),
 		DefaultDeployDir:      getenv("AIFAR_DEFAULT_DEPLOY_DIR", "/aifar/apps"),
 		ProviderMode:          "real",

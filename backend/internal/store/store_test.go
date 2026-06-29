@@ -36,6 +36,80 @@ func TestBootstrapUserAndServerLifecycle(t *testing.T) {
 	}
 }
 
+func TestServerSecretsAreEncryptedAtRest(t *testing.T) {
+	db, err := OpenWithSecret(filepath.Join(t.TempDir(), "aifar.db"), "test-secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	server, err := db.SaveServer(Server{
+		Name:       "node-1",
+		Host:       "127.0.0.1",
+		Username:   "root",
+		Password:   "plain-password",
+		PrivateKey: "plain-key",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rawPassword, rawPrivateKey string
+	if err := db.db.QueryRow(`select password, private_key from servers where id=?`, server.ID).Scan(&rawPassword, &rawPrivateKey); err != nil {
+		t.Fatal(err)
+	}
+	if rawPassword == "plain-password" || rawPrivateKey == "plain-key" {
+		t.Fatalf("expected secrets to be encrypted at rest, got password=%q privateKey=%q", rawPassword, rawPrivateKey)
+	}
+	got, err := db.GetServer(server.ID, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Password != "plain-password" || got.PrivateKey != "plain-key" {
+		t.Fatalf("expected decrypted secrets, got %+v", got)
+	}
+	public, err := db.GetServer(server.ID, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if public.Password != "" || public.PrivateKey != "" {
+		t.Fatalf("expected public server payload to hide secrets, got %+v", public)
+	}
+}
+
+func TestStorageSecretKeyIsEncryptedAndHidden(t *testing.T) {
+	db, err := OpenWithSecret(filepath.Join(t.TempDir(), "aifar.db"), "test-secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	item, err := db.SaveStorageItem(StorageItem{
+		InstanceID: "app-1",
+		Kind:       "accessKey",
+		Name:       "ops",
+		AccessKey:  "ak",
+		SecretKey:  "plain-secret",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if item.SecretKey != "" {
+		t.Fatalf("expected saved storage item response to hide secret key")
+	}
+	var rawSecret string
+	if err := db.db.QueryRow(`select secret_key from storage_items where instance_id=? and kind=? and name=?`, "app-1", "accessKey", "ops").Scan(&rawSecret); err != nil {
+		t.Fatal(err)
+	}
+	if rawSecret == "plain-secret" {
+		t.Fatalf("expected storage secret key to be encrypted at rest")
+	}
+	items, err := db.ListStorageItems("app-1", "accessKey")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 || items[0].SecretKey != "" {
+		t.Fatalf("expected listed storage item to hide secret key, got %+v", items)
+	}
+}
+
 func TestTaskLifecycle(t *testing.T) {
 	db, err := Open(filepath.Join(t.TempDir(), "aifar.db"))
 	if err != nil {

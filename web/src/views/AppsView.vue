@@ -144,7 +144,7 @@ import { apiGet, apiPost, asArray } from '../api/client'
 import { pairedAppCatalog, type AppCatalogResponse, type AppStoreItem } from '../apps/registry/catalog'
 import { frontendModuleFor } from '../apps/registry/loader'
 import { resolveAppLocale } from '../apps/registry/locale'
-import type { AppFrontendModule, AppInstallDialogConfig, AppInstallField, AppInstallPayload, ServerOption } from '../apps/registry/contract'
+import type { AppFrontendModule, AppInstallPayload, ServerOption } from '../apps/registry/contract'
 import StatusTag from '../components/StatusTag.vue'
 import { useI18n } from '../i18n'
 
@@ -153,7 +153,6 @@ const router = useRouter()
 const backendCatalog = ref<AppCatalogResponse>({})
 const instances = ref<any[]>([])
 const servers = ref<ServerOption[]>([])
-const settings = ref<{ defaultPassword?: string } | null>(null)
 const activeTab = ref('all')
 const category = ref('all')
 const installSubmitting = ref(false)
@@ -165,7 +164,7 @@ const locale = computed(() => resolveAppLocale())
 const apps = computed(() => pairedAppCatalog(backendCatalog.value, locale.value))
 const filteredApps = computed(() => (category.value === 'all' ? apps.value : apps.value.filter((app) => app.category === category.value)))
 const moduleDialogComponent = computed<Component | null>(() => moduleDialogModule.value?.installDialog ?? null)
-const moduleDialogProps = computed(() => withDefaultPasswords(moduleDialogModule.value?.installDialogProps?.(locale.value) ?? {}))
+const moduleDialogProps = computed(() => moduleDialogModule.value?.installDialogProps?.(locale.value) ?? {})
 
 type AppInstanceRecord = {
   id: string
@@ -215,23 +214,9 @@ function openInstallDialog(app: AppStoreItem) {
 }
 
 async function load() {
-  settings.value = await apiGet<{ defaultPassword?: string }>('/settings').catch(() => ({ defaultPassword: 'Oversea.123' }))
   backendCatalog.value = await apiGet<AppCatalogResponse>(`/apps/catalog?lang=${locale.value}`).catch(() => ({}))
   instances.value = asArray(await apiGet<any[] | null>('/apps/instances').catch(() => []))
   servers.value = asArray(await apiGet<ServerOption[] | null>('/servers').catch(() => []))
-}
-
-function withDefaultPasswords(config: AppInstallDialogConfig): AppInstallDialogConfig {
-  const defaultPassword = settings.value?.defaultPassword || 'Oversea.123'
-  const fields = config.fields?.map((field) => withDefaultPassword(field, defaultPassword))
-  return { ...config, fields }
-}
-
-function withDefaultPassword(field: AppInstallField, defaultPassword: string): AppInstallField {
-  if (field.type !== 'password' || field.defaultValue !== undefined) {
-    return field
-  }
-  return { ...field, defaultValue: defaultPassword }
 }
 
 async function rescan() {

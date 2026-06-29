@@ -3,9 +3,12 @@ package adapter
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os/exec"
 	"strconv"
 	"strings"
+
+	"aifar-deployment/backend/internal/store"
 )
 
 type DockerSummary struct {
@@ -67,11 +70,36 @@ func DockerPing(ctx context.Context, host string) error {
 	return dockerCommand(ctx, host, "version", "--format", "{{json .Server}}").Run()
 }
 
+func DockerPingForServer(ctx context.Context, server store.Server) error {
+	_, err := dockerSSHOutput(ctx, server, "version", "--format", "{{json .Server}}")
+	return err
+}
+
 func DockerSummaryForHost(ctx context.Context, host string) (DockerSummary, error) {
 	out, err := dockerCommand(ctx, host, "info", "--format", "{{json .}}").Output()
 	if err != nil {
 		return DockerSummary{}, err
 	}
+	return dockerSummaryFromOutput(ctx, out, dockerEndpoint(host), func(ctx context.Context) ([]DockerNetwork, error) {
+		return DockerNetworks(ctx, host)
+	}, func(ctx context.Context) ([]DockerVolume, error) {
+		return DockerVolumes(ctx, host)
+	})
+}
+
+func DockerSummaryForServer(ctx context.Context, server store.Server) (DockerSummary, error) {
+	out, err := dockerSSHOutput(ctx, server, "info", "--format", "{{json .}}")
+	if err != nil {
+		return DockerSummary{}, err
+	}
+	return dockerSummaryFromOutput(ctx, out, serverDockerEndpoint(server), func(ctx context.Context) ([]DockerNetwork, error) {
+		return DockerNetworksForServer(ctx, server)
+	}, func(ctx context.Context) ([]DockerVolume, error) {
+		return DockerVolumesForServer(ctx, server)
+	})
+}
+
+func dockerSummaryFromOutput(ctx context.Context, out []byte, endpoint string, networksFn func(context.Context) ([]DockerNetwork, error), volumesFn func(context.Context) ([]DockerVolume, error)) (DockerSummary, error) {
 	var info struct {
 		Containers        any    `json:"Containers"`
 		Images            any    `json:"Images"`
@@ -81,8 +109,8 @@ func DockerSummaryForHost(ctx context.Context, host string) (DockerSummary, erro
 		DockerRootDir     string `json:"DockerRootDir"`
 	}
 	_ = json.Unmarshal(out, &info)
-	networks, _ := DockerNetworks(ctx, host)
-	volumes, _ := DockerVolumes(ctx, host)
+	networks, _ := networksFn(ctx)
+	volumes, _ := volumesFn(ctx)
 	return DockerSummary{
 		Containers: toInt(info.Containers),
 		Images:     toInt(info.Images),
@@ -92,7 +120,7 @@ func DockerSummaryForHost(ctx context.Context, host string) (DockerSummary, erro
 		Driver:     info.Driver,
 		Version:    info.ServerVersion,
 		RootDir:    info.DockerRootDir,
-		Endpoint:   dockerEndpoint(host),
+		Endpoint:   endpoint,
 	}, nil
 }
 
@@ -101,6 +129,18 @@ func DockerContainers(ctx context.Context, host string) ([]DockerContainer, erro
 	if err != nil {
 		return nil, err
 	}
+	return parseDockerContainers(out)
+}
+
+func DockerContainersForServer(ctx context.Context, server store.Server) ([]DockerContainer, error) {
+	out, err := dockerSSHOutput(ctx, server, "ps", "-a", "--format", "{{json .}}")
+	if err != nil {
+		return nil, err
+	}
+	return parseDockerContainers(out)
+}
+
+func parseDockerContainers(out []byte) ([]DockerContainer, error) {
 	var rows []struct {
 		ID        string `json:"ID"`
 		Names     string `json:"Names"`
@@ -129,6 +169,18 @@ func DockerImages(ctx context.Context, host string) ([]DockerImage, error) {
 	if err != nil {
 		return nil, err
 	}
+	return parseDockerImages(out)
+}
+
+func DockerImagesForServer(ctx context.Context, server store.Server) ([]DockerImage, error) {
+	out, err := dockerSSHOutput(ctx, server, "images", "--digests", "--format", "{{json .}}")
+	if err != nil {
+		return nil, err
+	}
+	return parseDockerImages(out)
+}
+
+func parseDockerImages(out []byte) ([]DockerImage, error) {
 	var rows []struct {
 		ID         string `json:"ID"`
 		Repository string `json:"Repository"`
@@ -154,6 +206,18 @@ func DockerNetworks(ctx context.Context, host string) ([]DockerNetwork, error) {
 	if err != nil {
 		return nil, err
 	}
+	return parseDockerNetworks(out)
+}
+
+func DockerNetworksForServer(ctx context.Context, server store.Server) ([]DockerNetwork, error) {
+	out, err := dockerSSHOutput(ctx, server, "network", "ls", "--format", "{{json .}}")
+	if err != nil {
+		return nil, err
+	}
+	return parseDockerNetworks(out)
+}
+
+func parseDockerNetworks(out []byte) ([]DockerNetwork, error) {
 	var rows []struct {
 		ID     string `json:"ID"`
 		Name   string `json:"Name"`
@@ -175,6 +239,18 @@ func DockerVolumes(ctx context.Context, host string) ([]DockerVolume, error) {
 	if err != nil {
 		return nil, err
 	}
+	return parseDockerVolumes(out)
+}
+
+func DockerVolumesForServer(ctx context.Context, server store.Server) ([]DockerVolume, error) {
+	out, err := dockerSSHOutput(ctx, server, "volume", "ls", "--format", "{{json .}}")
+	if err != nil {
+		return nil, err
+	}
+	return parseDockerVolumes(out)
+}
+
+func parseDockerVolumes(out []byte) ([]DockerVolume, error) {
 	var rows []struct {
 		Name       string `json:"Name"`
 		Driver     string `json:"Driver"`
@@ -197,6 +273,18 @@ func DockerSystemDF(ctx context.Context, host string) ([]DockerDiskUsage, error)
 	if err != nil {
 		return nil, err
 	}
+	return parseDockerSystemDF(out)
+}
+
+func DockerSystemDFForServer(ctx context.Context, server store.Server) ([]DockerDiskUsage, error) {
+	out, err := dockerSSHOutput(ctx, server, "system", "df", "--format", "{{json .}}")
+	if err != nil {
+		return nil, err
+	}
+	return parseDockerSystemDF(out)
+}
+
+func parseDockerSystemDF(out []byte) ([]DockerDiskUsage, error) {
 	var rows []struct {
 		Type        string `json:"Type"`
 		TotalCount  string `json:"TotalCount"`
@@ -228,6 +316,18 @@ func DockerContainerLogs(ctx context.Context, host, id string, tail int) ([]stri
 	return lines, nil
 }
 
+func DockerContainerLogsForServer(ctx context.Context, server store.Server, id string, tail int) ([]string, error) {
+	if tail <= 0 {
+		tail = 200
+	}
+	out, err := dockerSSHCombinedOutput(ctx, server, "logs", "--tail", strconv.Itoa(tail), id)
+	lines := splitLines(string(out))
+	if err != nil {
+		return lines, err
+	}
+	return lines, nil
+}
+
 func DockerContainerAction(ctx context.Context, host, id, action string) error {
 	switch action {
 	case "start", "stop", "restart":
@@ -237,11 +337,60 @@ func DockerContainerAction(ctx context.Context, host, id, action string) error {
 	return dockerCommand(ctx, host, action, id).Run()
 }
 
+func DockerContainerActionForServer(ctx context.Context, server store.Server, id, action string) error {
+	switch action {
+	case "start", "stop", "restart":
+	default:
+		return exec.ErrNotFound
+	}
+	_, err := dockerSSHOutput(ctx, server, action, id)
+	return err
+}
+
 func dockerCommand(ctx context.Context, host string, args ...string) *exec.Cmd {
 	if host != "" {
 		args = append([]string{"-H", host}, args...)
 	}
 	return exec.CommandContext(ctx, "docker", args...)
+}
+
+func dockerSSHOutput(ctx context.Context, server store.Server, args ...string) ([]byte, error) {
+	result, err := RunSSH(ctx, server, dockerShellCommand(args...))
+	if err != nil {
+		stderr := strings.TrimSpace(result.Stderr)
+		if stderr != "" {
+			return []byte(result.Stdout), fmt.Errorf("%w: %s", err, stderr)
+		}
+		return []byte(result.Stdout), err
+	}
+	return []byte(result.Stdout), nil
+}
+
+func dockerSSHCombinedOutput(ctx context.Context, server store.Server, args ...string) ([]byte, error) {
+	result, err := RunSSH(ctx, server, dockerShellCommand(args...))
+	out := result.Stdout
+	if strings.TrimSpace(result.Stderr) != "" {
+		if strings.TrimSpace(out) != "" {
+			out += "\n"
+		}
+		out += result.Stderr
+	}
+	return []byte(out), err
+}
+
+func dockerShellCommand(args ...string) string {
+	parts := []string{"docker"}
+	for _, arg := range args {
+		parts = append(parts, dockerShellQuote(arg))
+	}
+	return strings.Join(parts, " ")
+}
+
+func dockerShellQuote(value string) string {
+	if value == "" {
+		return "''"
+	}
+	return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
 }
 
 func dockerEndpoint(host string) string {
@@ -250,6 +399,13 @@ func dockerEndpoint(host string) string {
 		return "local"
 	}
 	return host
+}
+
+func serverDockerEndpoint(server store.Server) string {
+	if strings.TrimSpace(server.DockerHost) != "" {
+		return strings.TrimSpace(server.DockerHost)
+	}
+	return "ssh://" + server.Username + "@" + server.Host
 }
 
 func parseDockerJSONLines[T any](raw []byte, out *[]T) error {
