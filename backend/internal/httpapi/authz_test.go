@@ -280,6 +280,24 @@ func TestDatabaseBackupStartsTaskAndCreatesFile(t *testing.T) {
 		t.Fatalf("expected one listed backup with checksum, got %+v", listBody.Items)
 	}
 
+	downloadReq := httptest.NewRequest(http.MethodGet, "/api/v2/maintenance/database-backups/"+listBody.Items[0].Name+"/download", nil)
+	downloadReq.Header.Set("Authorization", "Bearer "+token)
+	downloadRec := httptest.NewRecorder()
+	api.Router().ServeHTTP(downloadRec, downloadReq)
+	if downloadRec.Code != http.StatusOK {
+		t.Fatalf("expected backup download 200, got %d body=%s", downloadRec.Code, downloadRec.Body.String())
+	}
+	if downloadRec.Body.Len() == 0 || downloadRec.Header().Get("X-AIFAR-Backup-SHA256") == "" {
+		t.Fatalf("expected backup download body and checksum header")
+	}
+	badDownloadReq := httptest.NewRequest(http.MethodGet, "/api/v2/maintenance/database-backups/other.db/download", nil)
+	badDownloadReq.Header.Set("Authorization", "Bearer "+token)
+	badDownloadRec := httptest.NewRecorder()
+	api.Router().ServeHTTP(badDownloadRec, badDownloadReq)
+	if badDownloadRec.Code != http.StatusBadRequest {
+		t.Fatalf("expected unsafe backup download 400, got %d body=%s", badDownloadRec.Code, badDownloadRec.Body.String())
+	}
+
 	deleteReq := httptest.NewRequest(http.MethodDelete, "/api/v2/maintenance/database-backups", strings.NewReader(`{"names":["`+listBody.Items[0].Name+`"]}`))
 	deleteReq.Header.Set("Authorization", "Bearer "+token)
 	deleteReq.Header.Set("Content-Type", "application/json")

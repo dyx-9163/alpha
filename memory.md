@@ -65,3 +65,5 @@
 - 结论：已新增 `AIFAR_DATABASE_BACKUP_DIR` 配置和设置页展示；store 层使用 SQLite `VACUUM INTO` 生成一致性备份并计算 SHA256；后端新增 `POST /api/v2/maintenance/database-backup/run` 任务入口，按“准备目录、备份数据库、校验文件”记录步骤和审计；设置页新增“创建数据库备份”按钮；新增 store 与 HTTP 测试验证备份文件可打开且包含控制面数据；`pnpm test` 与 `pnpm web:build` 已通过。
 - 问题：持续目标推进，补齐控制面数据库备份的可发现和可治理能力，避免只生成备份但无法查看、校验或清理。
 - 结论：后端维护服务新增备份清单扫描和安全删除，只允许删除配置备份目录下符合 `aifar-control-plane-*.db` 的文件名；新增 `GET/DELETE /api/v2/maintenance/database-backups`，删除操作记录审计并对非法文件名返回 400；设置页新增数据库备份表格，展示文件名、大小、SHA256、时间并支持确认删除；新增维护服务和 HTTP 测试覆盖清单、删除和路径穿越拒绝；`pnpm test` 与 `pnpm web:build` 已通过。
+- 问题：持续目标推进，补齐控制面数据库备份的异地保存能力，避免备份只能留在面板服务器本地目录。
+- 结论：后端维护服务新增单个备份文件解析复用安全文件名与目录约束；新增 `GET /api/v2/maintenance/database-backups/{name}/download`，通过授权请求下载备份并返回 SHA256/大小响应头，非法文件名返回 400、缺失文件返回 404；前端 API client 新增 `apiDownload`，设置页备份表格新增“下载”按钮；新增 HTTP 和维护服务测试覆盖下载、校验头和非法名称拒绝；`pnpm test` 与 `pnpm web:build` 已通过。

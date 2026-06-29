@@ -68,22 +68,31 @@
             {{ formatDate(row.createdAt) }}
           </template>
           <template #action="{ row }">
-            <ConfirmAction
-              :message="t('settings.confirmDeleteBackup', { name: row.name })"
-              :disabled="!canManageSettings"
-              type="warning"
-              @confirm="deleteBackup(row.name)"
-            >
-              <template #default="{ confirm }">
-                <el-tooltip :content="deniedText" :disabled="canManageSettings" placement="top">
-                  <span>
-                    <el-button size="small" type="danger" :disabled="!canManageSettings" @click="confirm">
-                      {{ t('common.delete') }}
-                    </el-button>
-                  </span>
-                </el-tooltip>
-              </template>
-            </ConfirmAction>
+            <div class="backup-actions">
+              <el-tooltip :content="deniedText" :disabled="canManageSettings" placement="top">
+                <span>
+                  <el-button size="small" :disabled="!canManageSettings" @click="downloadBackup(row.name)">
+                    {{ t('common.download') }}
+                  </el-button>
+                </span>
+              </el-tooltip>
+              <ConfirmAction
+                :message="t('settings.confirmDeleteBackup', { name: row.name })"
+                :disabled="!canManageSettings"
+                type="warning"
+                @confirm="deleteBackup(row.name)"
+              >
+                <template #default="{ confirm }">
+                  <el-tooltip :content="deniedText" :disabled="canManageSettings" placement="top">
+                    <span>
+                      <el-button size="small" type="danger" :disabled="!canManageSettings" @click="confirm">
+                        {{ t('common.delete') }}
+                      </el-button>
+                    </span>
+                  </el-tooltip>
+                </template>
+              </ConfirmAction>
+            </div>
           </template>
         </DataTable>
       </div>
@@ -119,7 +128,7 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref } from 'vue'
 import { ElMessage } from 'element-plus'
-import { apiDelete, apiGet, apiPost, apiPut } from '../api/client'
+import { apiDelete, apiDownload, apiGet, apiPost, apiPut } from '../api/client'
 import ConfirmAction from '../components/ConfirmAction.vue'
 import DataTable from '../components/DataTable.vue'
 import KeyValueGrid from '../components/KeyValueGrid.vue'
@@ -164,7 +173,7 @@ const backupColumns = computed(() => [
   { prop: 'size', label: t('settings.backupSize'), width: 120, slot: 'size' },
   { prop: 'sha256', label: t('settings.backupChecksum'), minWidth: 240 },
   { prop: 'createdAt', label: t('common.time'), width: 190, slot: 'createdAt' },
-  { label: t('common.operation'), width: 100, slot: 'action', fixed: 'right' as const }
+  { label: t('common.operation'), width: 170, slot: 'action', fixed: 'right' as const }
 ])
 
 type DatabaseBackup = {
@@ -269,6 +278,27 @@ async function deleteBackup(name: unknown) {
   }
 }
 
+async function downloadBackup(name: unknown) {
+  if (!canManageSettings.value || typeof name !== 'string') {
+    ElMessage.warning(deniedText.value)
+    return
+  }
+  try {
+    const file = await apiDownload(`/maintenance/database-backups/${encodeURIComponent(name)}/download`)
+    const url = URL.createObjectURL(file.blob)
+    const link = document.createElement('a')
+    link.href = url
+    link.download = file.filename || name
+    document.body.appendChild(link)
+    link.click()
+    link.remove()
+    URL.revokeObjectURL(url)
+    ElMessage.success(t('settings.backupDownloadStarted'))
+  } catch (err) {
+    ElMessage.error(err instanceof Error ? err.message : t('settings.backupDownloadFailed'))
+  }
+}
+
 function formatRetentionDays(value: unknown) {
   const count = Number(value)
   if (!Number.isFinite(count) || count < 1) {
@@ -359,6 +389,12 @@ onMounted(load)
   border: 1px solid var(--aifar-border-soft);
   border-radius: var(--aifar-radius-md);
   overflow: hidden;
+}
+
+.backup-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 
 @media (max-width: 720px) {

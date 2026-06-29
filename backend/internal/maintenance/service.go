@@ -128,6 +128,35 @@ func (s Service) ListDatabaseBackups(dir string) ([]DatabaseBackup, error) {
 	return out, nil
 }
 
+func (s Service) GetDatabaseBackup(dir, name string) (DatabaseBackup, error) {
+	name, err := validateBackupName(name)
+	if err != nil {
+		return DatabaseBackup{}, err
+	}
+	path, err := safeBackupPath(dir, name)
+	if err != nil {
+		return DatabaseBackup{}, err
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return DatabaseBackup{}, err
+	}
+	if info.IsDir() {
+		return DatabaseBackup{}, fmt.Errorf("backup is not a file: %s", name)
+	}
+	checksum, err := fileSHA256(path)
+	if err != nil {
+		return DatabaseBackup{}, err
+	}
+	return DatabaseBackup{
+		Name:      name,
+		Path:      path,
+		Size:      info.Size(),
+		SHA256:    checksum,
+		CreatedAt: info.ModTime(),
+	}, nil
+}
+
 func (s Service) DeleteDatabaseBackups(dir string, names []string) (int, []string, error) {
 	dir = strings.TrimSpace(dir)
 	if dir == "" {

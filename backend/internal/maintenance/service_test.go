@@ -46,6 +46,13 @@ func TestListAndDeleteDatabaseBackups(t *testing.T) {
 	if len(backups) != 1 || backups[0].Name != goodName || backups[0].SHA256 == "" {
 		t.Fatalf("unexpected backups: %+v", backups)
 	}
+	got, err := svc.GetDatabaseBackup(dir, goodName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Name != goodName || got.Size <= 0 || got.Path == "" {
+		t.Fatalf("unexpected backup detail: %+v", got)
+	}
 
 	deleted, names, err := svc.DeleteDatabaseBackups(dir, []string{goodName})
 	if err != nil {

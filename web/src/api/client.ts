@@ -55,8 +55,36 @@ export function apiDelete<T>(path: string, body?: unknown) {
   }).then((r) => handle<T>(r))
 }
 
+export async function apiDownload(path: string) {
+  const response = await fetch(`${API_PREFIX}${path}`, { headers: headers(false) })
+  if (!response.ok) {
+    await handle<unknown>(response)
+  }
+  return {
+    blob: await response.blob(),
+    filename: filenameFromDisposition(response.headers.get('Content-Disposition')),
+    sha256: response.headers.get('X-AIFAR-Backup-SHA256') ?? ''
+  }
+}
+
 export function asArray<T = unknown>(value: unknown): T[] {
   return Array.isArray(value) ? value as T[] : []
+}
+
+function filenameFromDisposition(value: string | null) {
+  if (!value) {
+    return ''
+  }
+  const match = /filename\*=UTF-8''([^;]+)|filename="?([^";]+)"?/i.exec(value)
+  const encoded = match?.[1] || match?.[2] || ''
+  if (!encoded) {
+    return ''
+  }
+  try {
+    return decodeURIComponent(encoded)
+  } catch {
+    return encoded
+  }
 }
 
 export function terminalUrl(serverId: string) {

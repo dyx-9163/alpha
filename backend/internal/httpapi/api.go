@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"mime"
 	"net"
 	"net/http"
 	"os"
@@ -65,6 +66,7 @@ func New(cfg config.Config, s *store.Store, tasks *worker.Manager) *API {
 			r.Get("/settings", api.getSettings)
 			r.Put("/settings", api.requirePermission(rbac.SettingsManage, api.putSettings))
 			r.Get("/maintenance/database-backups", api.requirePermission(rbac.SettingsManage, api.listDatabaseBackups))
+			r.Get("/maintenance/database-backups/{name}/download", api.requirePermission(rbac.SettingsManage, api.downloadDatabaseBackup))
 			r.Delete("/maintenance/database-backups", api.requirePermission(rbac.SettingsManage, api.deleteDatabaseBackups))
 			r.Post("/maintenance/database-backup/run", api.requirePermission(rbac.SettingsManage, api.runDatabaseBackup))
 			r.Post("/maintenance/retention/run", api.requirePermission(rbac.SettingsManage, api.runRetentionCleanup))
@@ -285,6 +287,28 @@ func (a *API) maintenanceService() maintenance.Service {
 func (a *API) listDatabaseBackups(w http.ResponseWriter, r *http.Request) {
 	backups, err := a.maintenanceService().ListDatabaseBackups(a.cfg.DatabaseBackupDir)
 	respond(w, map[string]any{"items": backups, "backupDir": a.cfg.DatabaseBackupDir}, err)
+}
+
+func (a *API) downloadDatabaseBackup(w http.ResponseWriter, r *http.Request) {
+	lang := languageFromRequest(r)
+	backup, err := a.maintenanceService().GetDatabaseBackup(a.cfg.DatabaseBackupDir, chi.URLParam(r, "name"))
+	if err != nil && isInvalidBackupNameError(err) {
+		writeError(w, http.StatusBadRequest, "INVALID_BACKUP_NAME", i18n.Text(lang, "api.invalidDatabaseBackupName"), map[string]any{"error": err.Error()})
+		return
+	}
+	if err != nil {
+		if os.IsNotExist(err) {
+			writeError(w, http.StatusNotFound, "BACKUP_NOT_FOUND", i18n.Text(lang, "api.databaseBackupNotFound"), nil)
+			return
+		}
+		respond(w, nil, err)
+		return
+	}
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": backup.Name}))
+	w.Header().Set("X-AIFAR-Backup-SHA256", backup.SHA256)
+	w.Header().Set("X-AIFAR-Backup-Size", strconv.FormatInt(backup.Size, 10))
+	http.ServeFile(w, r, backup.Path)
 }
 
 type deleteDatabaseBackupsRequest struct {
