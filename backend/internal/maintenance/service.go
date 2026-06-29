@@ -2,6 +2,7 @@ package maintenance
 
 import (
 	"crypto/sha256"
+	"database/sql"
 	"fmt"
 	"io"
 	"os"
@@ -9,6 +10,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	_ "modernc.org/sqlite"
 )
 
 type Store interface {
@@ -33,6 +36,15 @@ type DatabaseBackup struct {
 	Size      int64     `json:"size"`
 	SHA256    string    `json:"sha256"`
 	CreatedAt time.Time `json:"createdAt"`
+}
+
+type DatabaseBackupVerification struct {
+	Backup         DatabaseBackup `json:"backup"`
+	IntegrityCheck string         `json:"integrityCheck"`
+	RequiredTables []string       `json:"requiredTables"`
+	MissingTables  []string       `json:"missingTables"`
+	VerifiedAt     time.Time      `json:"verifiedAt"`
+	OK             bool           `json:"ok"`
 }
 
 type Service struct {
@@ -154,6 +166,53 @@ func (s Service) GetDatabaseBackup(dir, name string) (DatabaseBackup, error) {
 		Size:      info.Size(),
 		SHA256:    checksum,
 		CreatedAt: info.ModTime(),
+	}, nil
+}
+
+func (s Service) VerifyDatabaseBackup(dir, name string) (DatabaseBackupVerification, error) {
+	backup, err := s.GetDatabaseBackup(dir, name)
+	if err != nil {
+		return DatabaseBackupVerification{}, err
+	}
+	db, err := sql.Open("sqlite", backup.Path)
+	if err != nil {
+		return DatabaseBackupVerification{}, err
+	}
+	defer db.Close()
+	var integrity string
+	if err := db.QueryRow(`pragma integrity_check`).Scan(&integrity); err != nil {
+		return DatabaseBackupVerification{}, err
+	}
+	required := []string{"users", "servers", "tasks", "task_logs", "task_targets", "task_steps", "audit_logs", "resources", "app_instances", "storage_items", "settings"}
+	rows, err := db.Query(`select name from sqlite_master where type='table'`)
+	if err != nil {
+		return DatabaseBackupVerification{}, err
+	}
+	defer rows.Close()
+	found := map[string]bool{}
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return DatabaseBackupVerification{}, err
+		}
+		found[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		return DatabaseBackupVerification{}, err
+	}
+	missing := []string{}
+	for _, table := range required {
+		if !found[table] {
+			missing = append(missing, table)
+		}
+	}
+	return DatabaseBackupVerification{
+		Backup:         backup,
+		IntegrityCheck: integrity,
+		RequiredTables: required,
+		MissingTables:  missing,
+		VerifiedAt:     time.Now(),
+		OK:             integrity == "ok" && len(missing) == 0,
 	}, nil
 }
 

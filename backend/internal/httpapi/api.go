@@ -67,6 +67,7 @@ func New(cfg config.Config, s *store.Store, tasks *worker.Manager) *API {
 			r.Put("/settings", api.requirePermission(rbac.SettingsManage, api.putSettings))
 			r.Get("/maintenance/database-backups", api.requirePermission(rbac.SettingsManage, api.listDatabaseBackups))
 			r.Get("/maintenance/database-backups/{name}/download", api.requirePermission(rbac.SettingsManage, api.downloadDatabaseBackup))
+			r.Post("/maintenance/database-backups/{name}/verify", api.requirePermission(rbac.SettingsManage, api.verifyDatabaseBackup))
 			r.Delete("/maintenance/database-backups", api.requirePermission(rbac.SettingsManage, api.deleteDatabaseBackups))
 			r.Post("/maintenance/database-backup/run", api.requirePermission(rbac.SettingsManage, api.runDatabaseBackup))
 			r.Post("/maintenance/retention/run", api.requirePermission(rbac.SettingsManage, api.runRetentionCleanup))
@@ -309,6 +310,81 @@ func (a *API) downloadDatabaseBackup(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-AIFAR-Backup-SHA256", backup.SHA256)
 	w.Header().Set("X-AIFAR-Backup-Size", strconv.FormatInt(backup.Size, 10))
 	http.ServeFile(w, r, backup.Path)
+}
+
+func (a *API) verifyDatabaseBackup(w http.ResponseWriter, r *http.Request) {
+	lang := languageFromRequest(r)
+	name := chi.URLParam(r, "name")
+	service := a.maintenanceService()
+	if _, err := service.GetDatabaseBackup(a.cfg.DatabaseBackupDir, name); err != nil {
+		if isInvalidBackupNameError(err) {
+			writeError(w, http.StatusBadRequest, "INVALID_BACKUP_NAME", i18n.Text(lang, "api.invalidDatabaseBackupName"), map[string]any{"error": err.Error()})
+			return
+		}
+		if os.IsNotExist(err) {
+			writeError(w, http.StatusNotFound, "BACKUP_NOT_FOUND", i18n.Text(lang, "api.databaseBackupNotFound"), nil)
+			return
+		}
+		respond(w, nil, err)
+		return
+	}
+	actor := currentUser(r).Username
+	task, err := a.tasks.StartWithLanguage("maintenance.database.backup.verify", name, actor, lang, func(ctx context.Context, log worker.Logger) error {
+		log.PlanTarget(name)
+		log.PlanStep(name, "locate-backup", i18n.Text(lang, "maintenance.locateBackupStep"), 1)
+		log.PlanStep(name, "integrity-check", i18n.Text(lang, "maintenance.integrityCheckStep"), 2)
+		log.PlanStep(name, "schema-check", i18n.Text(lang, "maintenance.schemaCheckStep"), 3)
+		log.StartTarget(name)
+
+		log.StartStep(name, "locate-backup", i18n.Text(lang, "maintenance.locateBackupStep"), 1)
+		backup, err := service.GetDatabaseBackup(a.cfg.DatabaseBackupDir, name)
+		if err != nil {
+			log.FinishStep(name, "locate-backup", "failed", err.Error())
+			log.FinishTarget(name, "failed", err.Error())
+			return err
+		}
+		log.Info(i18n.Text(lang, "maintenance.backupLocated"), backup.Name, backup.Size, backup.SHA256)
+		log.FinishStep(name, "locate-backup", "success", "")
+
+		log.StartStep(name, "integrity-check", i18n.Text(lang, "maintenance.integrityCheckStep"), 2)
+		if err := ctx.Err(); err != nil {
+			log.FinishStep(name, "integrity-check", "cancelled", err.Error())
+			log.FinishTarget(name, "cancelled", err.Error())
+			return err
+		}
+		verification, err := service.VerifyDatabaseBackup(a.cfg.DatabaseBackupDir, name)
+		if err != nil {
+			log.FinishStep(name, "integrity-check", "failed", err.Error())
+			log.FinishTarget(name, "failed", err.Error())
+			return err
+		}
+		log.Info(i18n.Text(lang, "maintenance.integrityCheckResult"), verification.IntegrityCheck)
+		if verification.IntegrityCheck != "ok" {
+			err := fmt.Errorf("%s", i18n.Text(lang, "maintenance.backupVerificationFailed"))
+			log.FinishStep(name, "integrity-check", "failed", verification.IntegrityCheck)
+			log.FinishTarget(name, "failed", verification.IntegrityCheck)
+			return err
+		}
+		log.FinishStep(name, "integrity-check", "success", "")
+
+		log.StartStep(name, "schema-check", i18n.Text(lang, "maintenance.schemaCheckStep"), 3)
+		if len(verification.MissingTables) > 0 {
+			message := i18n.Text(lang, "maintenance.schemaCheckMissing", strings.Join(verification.MissingTables, ", "))
+			log.Error("%s", message)
+			log.FinishStep(name, "schema-check", "failed", message)
+			log.FinishTarget(name, "failed", message)
+			return fmt.Errorf("%s", message)
+		}
+		log.Info(i18n.Text(lang, "maintenance.schemaCheckOK"), len(verification.RequiredTables))
+		log.FinishStep(name, "schema-check", "success", "")
+		log.Info(i18n.Text(lang, "maintenance.backupVerificationCompleted"), verification.Backup.Name)
+		log.FinishTarget(name, "success", "")
+		return nil
+	})
+	if err == nil {
+		a.audit(r, "maintenance.database.backup.verify", name, "running", i18n.Text(lang, "api.databaseBackupVerifyStarted"))
+	}
+	respondTask(w, task, err)
 }
 
 type deleteDatabaseBackupsRequest struct {

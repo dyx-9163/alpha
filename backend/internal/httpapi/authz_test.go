@@ -280,6 +280,23 @@ func TestDatabaseBackupStartsTaskAndCreatesFile(t *testing.T) {
 		t.Fatalf("expected one listed backup with checksum, got %+v", listBody.Items)
 	}
 
+	verifyReq := httptest.NewRequest(http.MethodPost, "/api/v2/maintenance/database-backups/"+listBody.Items[0].Name+"/verify", nil)
+	verifyReq.Header.Set("Authorization", "Bearer "+token)
+	verifyRec := httptest.NewRecorder()
+	api.Router().ServeHTTP(verifyRec, verifyReq)
+	if verifyRec.Code != http.StatusAccepted {
+		t.Fatalf("expected backup verify 202, got %d body=%s", verifyRec.Code, verifyRec.Body.String())
+	}
+	var verifyBody map[string]any
+	if err := json.Unmarshal(verifyRec.Body.Bytes(), &verifyBody); err != nil {
+		t.Fatal(err)
+	}
+	verifyTaskID, _ := verifyBody["taskId"].(string)
+	if verifyTaskID == "" {
+		t.Fatalf("expected verify taskId in response: %+v", verifyBody)
+	}
+	waitForTaskStatus(t, db, verifyTaskID, "success")
+
 	downloadReq := httptest.NewRequest(http.MethodGet, "/api/v2/maintenance/database-backups/"+listBody.Items[0].Name+"/download", nil)
 	downloadReq.Header.Set("Authorization", "Bearer "+token)
 	downloadRec := httptest.NewRecorder()
@@ -318,6 +335,7 @@ func TestDatabaseBackupStartsTaskAndCreatesFile(t *testing.T) {
 		t.Fatalf("expected unsafe backup delete 400, got %d body=%s", badDeleteRec.Code, badDeleteRec.Body.String())
 	}
 	assertAuditExists(t, db, "maintenance.database.backup", "running", "owner", "control-plane")
+	assertAuditExists(t, db, "maintenance.database.backup.verify", "running", "owner", listBody.Items[0].Name)
 	assertAuditExists(t, db, "maintenance.database.backup.delete", "success", "owner", listBody.Items[0].Name)
 }
 

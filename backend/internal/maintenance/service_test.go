@@ -1,6 +1,8 @@
 package maintenance
 
 import (
+	"aifar-deployment/backend/internal/store"
+
 	"os"
 	"path/filepath"
 	"strings"
@@ -63,6 +65,35 @@ func TestListAndDeleteDatabaseBackups(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dir, goodName)); !os.IsNotExist(err) {
 		t.Fatalf("expected backup to be deleted, got %v", err)
+	}
+}
+
+func TestVerifyDatabaseBackup(t *testing.T) {
+	root := t.TempDir()
+	db, err := store.Open(filepath.Join(root, "aifar.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.BootstrapUser("admin", "secret"); err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(root, "backups")
+	name := "aifar-control-plane-20260629-120000-1.db"
+	if _, _, err := db.BackupDatabase(filepath.Join(dir, name)); err != nil {
+		t.Fatal(err)
+	}
+	svc := NewService(fakeStore{}, RetentionConfig{})
+
+	verification, err := svc.VerifyDatabaseBackup(dir, name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !verification.OK || verification.IntegrityCheck != "ok" || len(verification.MissingTables) != 0 {
+		t.Fatalf("expected backup verification to pass, got %+v", verification)
+	}
+	if len(verification.RequiredTables) == 0 || verification.Backup.Name != name {
+		t.Fatalf("expected verification detail, got %+v", verification)
 	}
 }
 

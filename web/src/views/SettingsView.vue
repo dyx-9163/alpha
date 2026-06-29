@@ -71,6 +71,13 @@
             <div class="backup-actions">
               <el-tooltip :content="deniedText" :disabled="canManageSettings" placement="top">
                 <span>
+                  <el-button size="small" :disabled="!canManageSettings" @click="verifyBackup(row.name)">
+                    {{ t('common.check') }}
+                  </el-button>
+                </span>
+              </el-tooltip>
+              <el-tooltip :content="deniedText" :disabled="canManageSettings" placement="top">
+                <span>
                   <el-button size="small" :disabled="!canManageSettings" @click="downloadBackup(row.name)">
                     {{ t('common.download') }}
                   </el-button>
@@ -173,7 +180,7 @@ const backupColumns = computed(() => [
   { prop: 'size', label: t('settings.backupSize'), width: 120, slot: 'size' },
   { prop: 'sha256', label: t('settings.backupChecksum'), minWidth: 240 },
   { prop: 'createdAt', label: t('common.time'), width: 190, slot: 'createdAt' },
-  { label: t('common.operation'), width: 170, slot: 'action', fixed: 'right' as const }
+  { label: t('common.operation'), width: 230, slot: 'action', fixed: 'right' as const }
 ])
 
 type DatabaseBackup = {
@@ -296,6 +303,19 @@ async function downloadBackup(name: unknown) {
     ElMessage.success(t('settings.backupDownloadStarted'))
   } catch (err) {
     ElMessage.error(err instanceof Error ? err.message : t('settings.backupDownloadFailed'))
+  }
+}
+
+async function verifyBackup(name: unknown) {
+  if (!canManageSettings.value || typeof name !== 'string') {
+    ElMessage.warning(deniedText.value)
+    return
+  }
+  try {
+    await apiPost(`/maintenance/database-backups/${encodeURIComponent(name)}/verify`)
+    ElMessage.success(t('settings.backupVerifyAccepted'))
+  } catch (err) {
+    ElMessage.error(err instanceof Error ? err.message : t('settings.backupVerifyFailed'))
   }
 }
 
