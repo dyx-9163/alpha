@@ -1,5 +1,8 @@
 # AIFAR Memory
 
+- 问题：用户反馈 MySQL 安装成功后，单体和 InnoDB Cluster 的成功日志都显示为“单体安装成功”。
+- 结论：共享 MySQL 基础安装脚本改为中性 `MySQL service` 文案，InnoDB Cluster 节点实例记录改用 `ClusterNodeInstalled`/兜底“集群节点已安装”文案，并补充测试确保集群日志不再出现 `MySQL standalone installed`；`go test ./internal/apps/mysql ./internal/installer/mysql`、`pnpm test`、`pnpm backend:build`、`git diff --check` 已通过。
+
 - 问题：用户上传新的 MySQL InnoDB Cluster 日志，基础安装已成功，但 bootstrap 阶段 `dba.configureInstance` 需要修改 `gtid_mode`、`enforce_gtid_consistency`、`server_id` 等并尝试远程重启，最终报 `mysqld is not managed by supervisor process`。
 - 结论：MySQL 安装脚本已在 `my.cnf` 中预置 InnoDB Cluster 所需的 GTID、binlog、WRITESET、relay log、log_replica_updates 配置，并由安装器按服务器 ID/主机/端口生成稳定非零 `server-id`，避免 `mysqlsh` bootstrap 阶段再要求重启；`pnpm test`、`pnpm web:build`、`pnpm backend:build`、`git diff --check` 已通过。
 

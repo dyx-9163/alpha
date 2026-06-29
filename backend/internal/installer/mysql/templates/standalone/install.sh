@@ -150,7 +150,7 @@ fi
 echo "writing MySQL systemd unit"
 cat > "$WORK_DIR/$SERVICE_NAME.service" <<SERVICE
 [Unit]
-Description=AIFAR MySQL standalone service on port $PORT
+Description=AIFAR MySQL service on port $PORT
 After=network-online.target
 Wants=network-online.target
 
@@ -244,5 +244,5 @@ fi
 
 "$MYSQL_BASE/bin/mysqld" --version
 MYSQL_PWD="$ROOT_PASSWORD" "$MYSQL_BASE/bin/mysqladmin" --protocol=tcp -h 127.0.0.1 -P "$PORT" -u "$ROOT_USER" ping
-echo "MySQL standalone service installed: $SERVICE_NAME"
+echo "MySQL service installed: $SERVICE_NAME"
 echo "MySQL endpoint: 127.0.0.1:$PORT"

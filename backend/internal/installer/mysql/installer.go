@@ -94,7 +94,7 @@ func (i Installer) Install(ctx context.Context, server store.Server, bundle Bund
 	}, log); err != nil {
 		return err
 	}
-	log.Info("install MySQL standalone service")
+	log.Info("install MySQL service")
 	if _, err := i.run(ctx, server, "sh "+installerkit.ShellQuote(scriptRemote), log); err != nil {
 		return err
 	}

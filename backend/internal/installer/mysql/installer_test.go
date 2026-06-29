@@ -98,6 +98,9 @@ func TestInstallerUploadsBundleAndRunsMySQLScript(t *testing.T) {
 	if !strings.Contains(remote.installScript, `ExecStart=$MYSQL_BASE/bin/mysqld --defaults-file=$CONFIG_FILE`) {
 		t.Fatalf("installer should write a systemd mysqld service:\n%s", remote.installScript)
 	}
+	if strings.Contains(remote.installScript, "MySQL standalone service installed") || strings.Contains(remote.installScript, "AIFAR MySQL standalone service") {
+		t.Fatalf("shared mysql service script should not report standalone-only wording:\n%s", remote.installScript)
+	}
 	if !strings.Contains(remote.installScript, `MYSQL_SHELL_BASE="$INSTALL_ROOT/mysql-shell"`) || !strings.Contains(remote.installScript, `installing MySQL Shell`) {
 		t.Fatalf("installer should extract bundled mysql shell for cluster bootstrap:\n%s", remote.installScript)
 	}

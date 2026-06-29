@@ -252,7 +252,7 @@ func (s Service) installInnoDBCluster(ctx context.Context, req InstallRequest, r
 			finishTarget(recorder, target, "failed", msg)
 			return err
 		}
-		logForServer.Info(copy.Installed, instance.ID)
+		logForServer.Info(clusterNodeInstalledMessage(copy), instance.ID)
 		finishTarget(recorder, target, "success", "")
 	}
 	log.Info(copy.ClusterInstalled, len(targets))
@@ -390,6 +390,13 @@ func mysqlClusterName(params map[string]any) string {
 		return "aifarCluster"
 	}
 	return name
+}
+
+func clusterNodeInstalledMessage(copy Copy) string {
+	if strings.TrimSpace(copy.ClusterNodeInstalled) != "" {
+		return copy.ClusterNodeInstalled
+	}
+	return "MySQL InnoDB Cluster 节点已安装，实例已记录：%s"
 }
 
 func stringParam(params map[string]any, key, fallback string) string {

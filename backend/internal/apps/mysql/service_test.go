@@ -2,6 +2,7 @@ package mysql
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -74,6 +75,27 @@ type fakeLogger struct{}
 
 func (fakeLogger) Info(format string, args ...any)  {}
 func (fakeLogger) Error(format string, args ...any) {}
+
+type recordingLogger struct {
+	mu    sync.Mutex
+	lines []string
+}
+
+func (r *recordingLogger) Info(format string, args ...any) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.lines = append(r.lines, fmt.Sprintf(format, args...))
+}
+
+func (r *recordingLogger) Error(format string, args ...any) {
+	r.Info(format, args...)
+}
+
+func (r *recordingLogger) joined() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return strings.Join(r.lines, "\n")
+}
 
 func (f *fakeRemote) joinedCommands() string {
 	f.mu.Lock()
@@ -155,6 +177,40 @@ func TestServiceInstallsInnoDBClusterAndRecordsEachNode(t *testing.T) {
 	joinedCommands := remote.joinedCommands()
 	if strings.Count(joinedCommands, `"$MYSQLSH" --js --file`) != 1 || !strings.Contains(joinedCommands, `MYSQLSH="$INSTALL_ROOT/mysql-shell/bin/mysqlsh"`) {
 		t.Fatalf("expected one innodb cluster bootstrap action: %s", joinedCommands)
+	}
+}
+
+func TestServiceLogsClusterNodeCompletionForInnoDBCluster(t *testing.T) {
+	root := t.TempDir()
+	archive := filepath.Join(root, "mysql-aifar-8.0.36-official-bundle.tar")
+	if err := os.WriteFile(archive, []byte("mysql"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s := &fakeStore{servers: map[string]store.Server{
+		"srv-1": {ID: "srv-1", Name: "mysql-1", Host: "10.0.0.1", DeployDir: "/aifar/apps"},
+		"srv-2": {ID: "srv-2", Name: "mysql-2", Host: "10.0.0.2", DeployDir: "/aifar/apps"},
+		"srv-3": {ID: "srv-3", Name: "mysql-3", Host: "10.0.0.3", DeployDir: "/aifar/apps"},
+	}}
+	remote := &fakeRemote{}
+	log := &recordingLogger{}
+	service := NewService(s, remote)
+	err := service.Install(context.Background(), InstallRequest{
+		Version:         "8.0.36",
+		Topology:        "innodb-cluster",
+		Language:        "en",
+		DefaultPassword: "Oversea.123",
+		ServerIDs:       []string{"srv-1", "srv-2", "srv-3"},
+		Parameters:      map[string]any{"port": 3306, "rootUser": "root", "clusterName": "aifarCluster"},
+	}, []store.Resource{{App: "mysql", Part: "backend", Version: "8.0.36", Path: archive}}, log, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := log.joined()
+	if !strings.Contains(lines, "MySQL InnoDB Cluster node installed") {
+		t.Fatalf("expected cluster node completion log, got:\n%s", lines)
+	}
+	if strings.Contains(lines, "MySQL standalone installed") {
+		t.Fatalf("cluster install should not log standalone completion:\n%s", lines)
 	}
 }
 

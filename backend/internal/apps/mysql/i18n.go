@@ -3,29 +3,30 @@ package mysql
 import "strings"
 
 type Copy struct {
-	CategoryLabel      string
-	SourceLabel        string
-	Description        string
-	UsingArchive       string
-	UsingRPMs          string
-	MissingRPMWarning  string
-	StepStart          string
-	StepDone           string
-	StepFailed         string
-	LoadServer         string
-	VerifyResource     string
-	InstallStandalone  string
-	BootstrapCluster   string
-	RecordInstance     string
-	LoadFailed         string
-	InstallFailed      string
-	RecordFailed       string
-	Installed          string
-	ClusterInstalled   string
-	TargetRequired     string
-	SingleTargetOnly   string
-	ClusterNeedNodes   string
-	ClusterUnsupported string
+	CategoryLabel        string
+	SourceLabel          string
+	Description          string
+	UsingArchive         string
+	UsingRPMs            string
+	MissingRPMWarning    string
+	StepStart            string
+	StepDone             string
+	StepFailed           string
+	LoadServer           string
+	VerifyResource       string
+	InstallStandalone    string
+	BootstrapCluster     string
+	RecordInstance       string
+	LoadFailed           string
+	InstallFailed        string
+	RecordFailed         string
+	Installed            string
+	ClusterNodeInstalled string
+	ClusterInstalled     string
+	TargetRequired       string
+	SingleTargetOnly     string
+	ClusterNeedNodes     string
+	ClusterUnsupported   string
 }
 
 type DeleteCopy struct {
@@ -42,29 +43,30 @@ func CopyFor(lang string) Copy {
 	switch normalizeLanguage(lang) {
 	case "en":
 		return Copy{
-			CategoryLabel:      "Database",
-			SourceLabel:        "Official binary bundle",
-			Description:        "Install MySQL standalone or InnoDB Cluster from the offline official 8.0 binary bundle.",
-			UsingArchive:       "using MySQL official bundle: %s",
-			UsingRPMs:          "using %d RPM dependency package(s)",
-			MissingRPMWarning:  "MySQL RPM cache is empty; the installer will continue if runtime dependencies already exist on the target server",
-			StepStart:          "MySQL step %d/%d started: %s",
-			StepDone:           "MySQL step %d/%d completed: %s",
-			StepFailed:         "MySQL step %d/%d failed: %s: %v",
-			LoadServer:         "load target server",
-			VerifyResource:     "verify MySQL offline bundle",
-			InstallStandalone:  "install MySQL base service",
-			BootstrapCluster:   "bootstrap MySQL InnoDB Cluster",
-			RecordInstance:     "record MySQL app instance",
-			LoadFailed:         "load server failed: %s",
-			InstallFailed:      "MySQL install failed: %s",
-			RecordFailed:       "record MySQL instance failed: %s",
-			Installed:          "MySQL standalone installed, instance recorded: %s",
-			ClusterInstalled:   "MySQL InnoDB Cluster installed, %d instance record(s) created",
-			TargetRequired:     "MySQL install requires target server(s)",
-			SingleTargetOnly:   "MySQL standalone install supports only one target server",
-			ClusterNeedNodes:   "MySQL InnoDB Cluster requires at least 3 target servers",
-			ClusterUnsupported: "MySQL topology is not supported: %s",
+			CategoryLabel:        "Database",
+			SourceLabel:          "Official binary bundle",
+			Description:          "Install MySQL standalone or InnoDB Cluster from the offline official 8.0 binary bundle.",
+			UsingArchive:         "using MySQL official bundle: %s",
+			UsingRPMs:            "using %d RPM dependency package(s)",
+			MissingRPMWarning:    "MySQL RPM cache is empty; the installer will continue if runtime dependencies already exist on the target server",
+			StepStart:            "MySQL step %d/%d started: %s",
+			StepDone:             "MySQL step %d/%d completed: %s",
+			StepFailed:           "MySQL step %d/%d failed: %s: %v",
+			LoadServer:           "load target server",
+			VerifyResource:       "verify MySQL offline bundle",
+			InstallStandalone:    "install MySQL base service",
+			BootstrapCluster:     "bootstrap MySQL InnoDB Cluster",
+			RecordInstance:       "record MySQL app instance",
+			LoadFailed:           "load server failed: %s",
+			InstallFailed:        "MySQL install failed: %s",
+			RecordFailed:         "record MySQL instance failed: %s",
+			Installed:            "MySQL standalone installed, instance recorded: %s",
+			ClusterNodeInstalled: "MySQL InnoDB Cluster node installed, instance recorded: %s",
+			ClusterInstalled:     "MySQL InnoDB Cluster installed, %d instance record(s) created",
+			TargetRequired:       "MySQL install requires target server(s)",
+			SingleTargetOnly:     "MySQL standalone install supports only one target server",
+			ClusterNeedNodes:     "MySQL InnoDB Cluster requires at least 3 target servers",
+			ClusterUnsupported:   "MySQL topology is not supported: %s",
 		}
 	default:
 		return Copy{
