@@ -1,5 +1,8 @@
 # AIFAR Memory
 
+- 问题：用户反馈 Redis 单体安装弹窗不应展示 Sentinel/Cluster 相关参数。
+- 结论：`web/src/apps/redis/i18n.ts` 已为 `sentinelPort`、`quorum` 增加 Sentinel 拓扑可见条件，为 `replicas` 增加 Cluster 拓扑可见条件；单体模式只展示 Redis 端口和密码；`pnpm web:build`、`pnpm test` 已通过。
+
 - 问题：用户询问 MySQL `server-id` 是按什么规则生成的。
 - 结论：当前规则在 `backend/internal/installer/mysql/installer.go` 中用 FNV-1a 32 位哈希计算，输入为 `server.ID|server.Host|port`，保证同一服务器同一端口稳定、不同服务器通常不同；若哈希结果为 0 则兜底为 1。
 

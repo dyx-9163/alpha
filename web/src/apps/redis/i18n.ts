@@ -115,7 +115,8 @@ export function redisInstallDialogProps(locale?: string): AppInstallDialogConfig
         name: 'sentinelPort',
         label: copy.sentinelPort,
         type: 'number',
-        defaultValue: 26379
+        defaultValue: 26379,
+        visibleWhen: (values) => values.topology === 'sentinel'
       },
       {
         name: 'sentinelMasterId',
@@ -139,13 +140,15 @@ export function redisInstallDialogProps(locale?: string): AppInstallDialogConfig
         name: 'quorum',
         label: copy.quorum,
         type: 'number',
-        defaultValue: 2
+        defaultValue: 2,
+        visibleWhen: (values) => values.topology === 'sentinel'
       },
       {
         name: 'replicas',
         label: copy.replicas,
         type: 'number',
-        defaultValue: 0
+        defaultValue: 0,
+        visibleWhen: (values) => values.topology === 'cluster'
       },
       {
         name: 'password',
