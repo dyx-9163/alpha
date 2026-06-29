@@ -1,5 +1,8 @@
 # AIFAR Memory
 
+- 问题：用户询问 MySQL `server-id` 是按什么规则生成的。
+- 结论：当前规则在 `backend/internal/installer/mysql/installer.go` 中用 FNV-1a 32 位哈希计算，输入为 `server.ID|server.Host|port`，保证同一服务器同一端口稳定、不同服务器通常不同；若哈希结果为 0 则兜底为 1。
+
 - 问题：用户反馈任务中心多服务器日志右上角服务器选择器不应展示“全部”和“控制面”，且控制面日志应固定在底部，不随服务器筛选隐藏。
 - 结论：`TaskRunPanel.vue` 的目标选择器已改为只列出真实服务器；日志展示改为选中服务器日志后追加控制面日志，控制面分组始终排在最后；`pnpm web:build`、`pnpm test`、`git diff --check` 已通过。
 
