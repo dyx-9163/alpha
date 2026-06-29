@@ -15,12 +15,11 @@
       </div>
     </div>
 
-    <div v-if="targetGroups.length" class="target-log-list" :class="{ 'has-toolbar': targetGroups.length > 1 }">
-      <div v-if="targetGroups.length > 1" class="target-log-toolbar">
+    <div v-if="targetGroups.length" class="target-log-list" :class="{ 'has-toolbar': serverTargetGroups.length > 1 }">
+      <div v-if="serverTargetGroups.length > 1" class="target-log-toolbar">
         <span>{{ t('table.server') }}</span>
         <el-select v-model="selectedTargetKey" size="small" class="target-select">
-          <el-option :label="t('common.all')" value="__all__" />
-          <el-option v-for="group in targetGroups" :key="group.key" :label="group.label" :value="group.key" />
+          <el-option v-for="group in serverTargetGroups" :key="group.key" :label="group.label" :value="group.key" />
         </el-select>
       </div>
 
@@ -155,31 +154,43 @@ const targetGroups = computed(() => {
     ensure(log.target).logs.push(log)
   }
 
-  return Array.from(groups.values()).map((group) => ({
-    ...group,
-    steps: group.steps.slice().sort((a, b) => a.order - b.order || a.id - b.id)
-  }))
+  return Array.from(groups.values())
+    .map((group) => ({
+      ...group,
+      steps: group.steps.slice().sort((a, b) => a.order - b.order || a.id - b.id)
+    }))
+    .sort((a, b) => {
+      if (!a.target && b.target) {
+        return 1
+      }
+      if (a.target && !b.target) {
+        return -1
+      }
+      return 0
+    })
 })
+
+const serverTargetGroups = computed(() => targetGroups.value.filter((group) => group.target))
+const controlPlaneGroup = computed(() => targetGroups.value.find((group) => !group.target) || null)
 
 const visibleTargetGroups = computed(() => {
   if (!targetGroups.value.length) {
     return []
   }
-  if (selectedTargetKey.value === '__all__') {
-    return targetGroups.value
+  const selected = serverTargetGroups.value.find((group) => group.key === selectedTargetKey.value)
+    || serverTargetGroups.value[0]
+  const out = selected ? [selected] : []
+  if (controlPlaneGroup.value) {
+    out.push(controlPlaneGroup.value)
   }
-  const selected = targetGroups.value.find((group) => group.key === selectedTargetKey.value)
-  return selected ? [selected] : [targetGroups.value[0]]
+  return out
 })
 
 watch(
-  targetGroups,
+  serverTargetGroups,
   (groups) => {
     if (!groups.length) {
       selectedTargetKey.value = ''
-      return
-    }
-    if (selectedTargetKey.value === '__all__') {
       return
     }
     if (!groups.some((group) => group.key === selectedTargetKey.value)) {

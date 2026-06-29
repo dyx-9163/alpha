@@ -1,5 +1,8 @@
 # AIFAR Memory
 
+- 问题：用户反馈任务中心多服务器日志右上角服务器选择器不应展示“全部”和“控制面”，且控制面日志应固定在底部，不随服务器筛选隐藏。
+- 结论：`TaskRunPanel.vue` 的目标选择器已改为只列出真实服务器；日志展示改为选中服务器日志后追加控制面日志，控制面分组始终排在最后；`pnpm web:build`、`pnpm test`、`git diff --check` 已通过。
+
 - 问题：用户反馈 MySQL 安装成功后，单体和 InnoDB Cluster 的成功日志都显示为“单体安装成功”。
 - 结论：共享 MySQL 基础安装脚本改为中性 `MySQL service` 文案，InnoDB Cluster 节点实例记录改用 `ClusterNodeInstalled`/兜底“集群节点已安装”文案，并补充测试确保集群日志不再出现 `MySQL standalone installed`；`go test ./internal/apps/mysql ./internal/installer/mysql`、`pnpm test`、`pnpm backend:build`、`git diff --check` 已通过。
 
