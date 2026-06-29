@@ -112,3 +112,5 @@
 - 结论：worker 任务管理器已接入 `deploymentConcurrency` 设置，任务先保持 pending，拿到并发槽后才进入 running，设置保存时会归一化到 1-20；MySQL 安装会写入 `report_host`，集群 bootstrap 遇到已存在集群管理员账号时会复用账号重试；`pnpm test`、`pnpm web:build`、`git diff --check` 已通过。
 - 问题：用户要求 Redis Sentinel 安装表单按官方模型改为显式选择 1 个 Redis master、多个 replica、多个 Sentinel 节点，而不是只从目标服务器里指定一个 master。
 - 结论：已将 Redis Sentinel 前端安装弹窗改为角色化配置：Master 单选、Replica 多选、Sentinel 多选，并在隐藏默认目标选择器时自动提交三组节点并集 `serverIds`；后端按角色安装和记录实例，支持专用 Sentinel 节点只安装 Redis 二进制与 Sentinel 服务，不启动无意义的数据服务；旧 `serverIds + sentinelMasterId` 调用仍兼容；`pnpm test`、`pnpm web:build`、`pnpm backend:build`、`git diff --check` 均通过。
+- 问题：用户反馈 Redis Sentinel 安装弹窗样式不对，角色标签换行错位，并询问 `Sentinel Quorum` 这一行是否可以不要。
+- 结论：已调整通用安装弹窗 label 宽度与不换行样式，缩短 Redis Sentinel 角色字段标签为 Master/Replica/Sentinel 节点，并移除前端 `Sentinel Quorum` 输入行；后端继续按 Sentinel 节点数自动计算默认 quorum；`pnpm web:build` 和 `git diff --check` 已通过。

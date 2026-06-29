@@ -30,17 +30,16 @@ export const redisMessages = {
     sentinelMasterName: '监控组名称',
     sentinelMasterNamePlaceholder: '例如 aifar-master，必须在 Sentinel 内唯一',
     sentinelMasterNameInvalid: '监控组名称只能包含字母、数字、点、横线和下划线，最多 64 个字符',
-    sentinelMaster: 'Redis Master 节点',
+    sentinelMaster: 'Master 节点',
     sentinelMasterPlaceholder: '请选择当前监控组唯一的 Redis master',
     sentinelMasterRequired: 'Sentinel 模式必须选择 Redis master 节点',
-    sentinelReplicas: 'Redis Replica 节点',
+    sentinelReplicas: 'Replica 节点',
     sentinelReplicasPlaceholder: '选择一个或多个 Redis replica 节点',
     sentinelReplicasRequired: 'Sentinel 模式至少需要选择 1 个 Redis replica 节点',
     sentinelReplicaCannotIncludeMaster: 'Replica 节点不能包含 Redis master',
     sentinelNodes: 'Sentinel 节点',
     sentinelNodesPlaceholder: '选择运行 Sentinel 的服务器，可与 master/replica 同机',
     sentinelNodesRequired: 'Sentinel 模式至少需要选择 3 个 Sentinel 节点',
-    quorum: 'Sentinel Quorum',
     replicas: 'Cluster 副本数',
     password: 'Redis 密码',
     passwordPlaceholder: '请输入 Redis 访问密码'
@@ -69,17 +68,16 @@ export const redisMessages = {
     sentinelMasterName: 'Monitor name',
     sentinelMasterNamePlaceholder: 'For example aifar-master; must be unique inside Sentinel',
     sentinelMasterNameInvalid: 'Monitor name can contain only letters, numbers, dot, dash, and underscore, up to 64 characters',
-    sentinelMaster: 'Redis master node',
+    sentinelMaster: 'Master node',
     sentinelMasterPlaceholder: 'Select the only Redis master for this monitored group',
     sentinelMasterRequired: 'Sentinel mode requires a Redis master node',
-    sentinelReplicas: 'Redis replica nodes',
+    sentinelReplicas: 'Replica nodes',
     sentinelReplicasPlaceholder: 'Select one or more Redis replica nodes',
     sentinelReplicasRequired: 'Sentinel mode requires at least 1 Redis replica node',
     sentinelReplicaCannotIncludeMaster: 'Replica nodes cannot include the Redis master',
     sentinelNodes: 'Sentinel nodes',
     sentinelNodesPlaceholder: 'Select servers that run Sentinel; they can be colocated with master/replicas',
     sentinelNodesRequired: 'Sentinel mode requires at least 3 Sentinel nodes',
-    quorum: 'Sentinel quorum',
     replicas: 'Cluster replicas',
     password: 'Redis password',
     passwordPlaceholder: 'Enter Redis access password'
@@ -212,13 +210,6 @@ export function redisInstallDialogProps(locale?: string): AppInstallDialogConfig
           const name = String(value ?? '').trim()
           return /^[A-Za-z0-9_.-]{1,64}$/.test(name) ? undefined : copy.sentinelMasterNameInvalid
         }
-      },
-      {
-        name: 'quorum',
-        label: copy.quorum,
-        type: 'number',
-        defaultValue: 2,
-        visibleWhen: (values) => values.topology === 'sentinel'
       },
       {
         name: 'replicas',

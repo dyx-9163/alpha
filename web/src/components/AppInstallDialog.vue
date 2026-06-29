@@ -11,7 +11,7 @@
 
       <el-alert v-if="dialogCopy.hint" type="info" show-icon :closable="false" :title="dialogCopy.hint" />
 
-      <el-form label-width="96px" class="install-form">
+      <el-form label-width="108px" class="install-form">
         <el-form-item :label="dialogCopy.versionLabel">
           <el-select v-model="selectedVersion" :placeholder="dialogCopy.versionPlaceholder" style="width: 100%">
             <el-option v-for="version in versions" :key="version" :label="version" :value="version" />
@@ -308,6 +308,20 @@ function submit() {
 
 .install-form {
   padding: 4px 4px 0;
+}
+
+.install-form :deep(.el-form-item) {
+  margin-bottom: 14px;
+}
+
+.install-form :deep(.el-form-item__label) {
+  min-width: 0;
+  line-height: 32px;
+  white-space: nowrap;
+}
+
+.install-form :deep(.el-form-item__content) {
+  min-width: 0;
 }
 
 .field-error {
