@@ -51,3 +51,5 @@
 - 结论：已新增前端 `rbac.ts` 与 `usePermissions`，session 持久化后端返回的权限列表；终端菜单/路由、应用安装/检测/删除、服务器保存/探测/删除/排序、任务清理/删除、审计删除、资源重扫、设置保存、容器启停、数据库备份/检测、对象存储写操作均按权限禁用或拦截；401 会清理本地 session；`pnpm web:build` 和 `pnpm test` 已通过。
 - 问题：按用户要求尝试将本轮调整推送到 GitHub。
 - 结论：已在本地创建分支 `codex/enterprise-permission-ux` 并提交 `5da12610 enterprise permission and operations hardening`；`git push` 被安全审查拦截，原因是向外部 GitHub 远端导出工作区代码需要用户在知情后再次明确批准，当前尚未推送成功。
+- 问题：持续目标推进，补齐企业级安全事件审计，要求登录失败和权限拒绝都能留痕。
+- 结论：已在登录失败时记录 `auth.login` 失败审计，在权限拒绝时记录 `auth.permission.denied` 审计，包含账号、权限点、HTTP 方法和路径，并继续走 `auditkit`/`logmask` 脱敏链路；新增 HTTP 测试验证 401/403 安全事件入库，`pnpm web:build` 和 `pnpm test` 已通过。

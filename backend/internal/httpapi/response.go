@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"aifar-deployment/backend/internal/apperror"
+	"aifar-deployment/backend/internal/auditkit"
 	"aifar-deployment/backend/internal/auth"
 	"aifar-deployment/backend/internal/i18n"
 	"aifar-deployment/backend/internal/rbac"
@@ -27,6 +28,13 @@ func currentUser(r *http.Request) auth.Claims {
 func (a *API) requirePermission(permission rbac.Permission, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !rbac.Allows(currentUser(r).Role, permission) {
+			_ = auditkit.Record(a.store, auditkit.Event{
+				Actor:   currentUser(r).Username,
+				Action:  "auth.permission.denied",
+				Target:  string(permission),
+				Status:  "failed",
+				Message: r.Method + " " + r.URL.Path,
+			})
 			writeError(w, http.StatusForbidden, "FORBIDDEN", i18n.Text(languageFromRequest(r), "api.permissionDenied"), map[string]any{"permission": string(permission)})
 			return
 		}

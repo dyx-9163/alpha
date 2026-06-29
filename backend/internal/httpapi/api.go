@@ -134,6 +134,17 @@ func (a *API) login(w http.ResponseWriter, r *http.Request) {
 	}
 	u, err := a.store.UserByUsername(req.Username)
 	if err != nil || auth.CheckPassword(u.PasswordHash, req.Password) != nil {
+		username := strings.TrimSpace(req.Username)
+		if username == "" {
+			username = "unknown"
+		}
+		_ = auditkit.Record(a.store, auditkit.Event{
+			Actor:   username,
+			Action:  "auth.login",
+			Target:  username,
+			Status:  "failed",
+			Message: i18n.Text(lang, "api.authFailed"),
+		})
 		writeError(w, http.StatusUnauthorized, "AUTH_FAILED", i18n.Text(lang, "api.authFailed"), nil)
 		return
 	}

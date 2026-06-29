@@ -27,6 +27,7 @@ func TestViewerCannotMutateSettings(t *testing.T) {
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("expected 403, got %d body=%s", rec.Code, rec.Body.String())
 	}
+	assertAuditExists(t, db, "auth.permission.denied", "failed", "viewer", "settings.manage")
 }
 
 func TestOwnerCanMutateSettings(t *testing.T) {
@@ -61,6 +62,24 @@ func TestTokenIsRejectedAfterPasswordReset(t *testing.T) {
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401, got %d body=%s", rec.Code, rec.Body.String())
 	}
+}
+
+func TestFailedLoginIsAudited(t *testing.T) {
+	api, db, _ := newAuthzTestAPI(t)
+	if err := db.ResetUserPassword("owner", "correct-password"); err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v2/auth/login", strings.NewReader(`{"username":"owner","password":"wrong-password"}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	api.Router().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	assertAuditExists(t, db, "auth.login", "failed", "owner", "owner")
 }
 
 func newAuthzTestAPI(t *testing.T) (*API, *store.Store, string) {
@@ -105,4 +124,18 @@ func issueTestToken(t *testing.T, db *store.Store, secret, username, role string
 		t.Fatal(err)
 	}
 	return token
+}
+
+func assertAuditExists(t *testing.T, db *store.Store, action, status, actor, target string) {
+	t.Helper()
+	items, err := db.ListAudit()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, item := range items {
+		if item.Action == action && item.Status == status && item.Actor == actor && item.Target == target {
+			return
+		}
+	}
+	t.Fatalf("expected audit action=%s status=%s actor=%s target=%s in %+v", action, status, actor, target, items)
 }
