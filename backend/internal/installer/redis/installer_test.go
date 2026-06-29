@@ -94,6 +94,29 @@ func TestInstallerUploadsArchiveAndRunsRealRedisScript(t *testing.T) {
 	}
 }
 
+func TestInstallerCanInstallRedisBinariesForSentinelOnlyNode(t *testing.T) {
+	root := t.TempDir()
+	archive := filepath.Join(root, "redis-7.2.14.tar.gz")
+	if err := os.WriteFile(archive, []byte("redis"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	remote := &fakeRemote{}
+	installer := NewInstaller(remote)
+	err := installer.InstallBinariesWithLanguage(context.Background(), store.Server{Name: "sentinel-1", DeployDir: "/aifar/apps"}, Bundle{
+		Version:     "7.2.14",
+		ArchivePath: archive,
+	}, 6379, "Oversea.123", testLogger{}, "en")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(remote.installScript, `Redis binaries installed for Sentinel`) {
+		t.Fatalf("installer should render sentinel-only binary install script:\n%s", remote.installScript)
+	}
+	if strings.Contains(remote.installScript, `systemctl enable --now "$SERVICE_NAME"`) {
+		t.Fatalf("sentinel-only binary install should not start redis data service:\n%s", remote.installScript)
+	}
+}
+
 func TestRedisStandaloneScriptsRenderTemplates(t *testing.T) {
 	install, err := installStandaloneScript("7.2.14", "/aifar/apps/_work/redis", "/tmp/redis.tar.gz", "/aifar/apps/redis/7.2.14", 6380, "Oversea.123")
 	if err != nil {
@@ -138,5 +161,8 @@ func TestRedisSentinelScriptUsesConfiguredMasterName(t *testing.T) {
 	}
 	if !strings.Contains(script, "MASTER_NAME='orders-primary'") || !strings.Contains(script, "sentinel monitor $MASTER_NAME $MASTER_HOST $MASTER_PORT $QUORUM") {
 		t.Fatalf("sentinel script did not render configured master name:\n%s", script)
+	}
+	if strings.Contains(script, "Requires=$SERVICE_NAME.service") {
+		t.Fatalf("sentinel unit should not require local Redis data service:\n%s", script)
 	}
 }

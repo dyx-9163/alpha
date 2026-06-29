@@ -2,6 +2,7 @@
 node_modules/
 .pnpm-store/
 .cache/
+.gocache/
 
 # IDE and local workspace files
 .idea/

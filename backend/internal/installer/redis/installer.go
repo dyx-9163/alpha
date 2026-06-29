@@ -72,6 +72,14 @@ func (i Installer) Install(ctx context.Context, server store.Server, bundle Bund
 }
 
 func (i Installer) InstallWithLanguage(ctx context.Context, server store.Server, bundle Bundle, port int, password string, log Logger, lang string) error {
+	return i.installWithMode(ctx, server, bundle, port, password, true, log, lang)
+}
+
+func (i Installer) InstallBinariesWithLanguage(ctx context.Context, server store.Server, bundle Bundle, port int, password string, log Logger, lang string) error {
+	return i.installWithMode(ctx, server, bundle, port, password, false, log, lang)
+}
+
+func (i Installer) installWithMode(ctx context.Context, server store.Server, bundle Bundle, port int, password string, startService bool, log Logger, lang string) error {
 	if err := VerifyBundle(bundle); err != nil {
 		return err
 	}
@@ -111,6 +119,9 @@ func (i Installer) InstallWithLanguage(ctx context.Context, server store.Server,
 		}
 	}
 	script, err := installStandaloneScript(bundle.Version, workDir, archiveRemote, installRoot, port, password)
+	if !startService {
+		script, err = installRedisBinariesScript(bundle.Version, workDir, archiveRemote, installRoot, port, password)
+	}
 	if err != nil {
 		return err
 	}
@@ -129,11 +140,19 @@ func (i Installer) InstallWithLanguage(ctx context.Context, server store.Server,
 	}, log); err != nil {
 		return err
 	}
-	log.Info("install Redis standalone service")
+	if startService {
+		log.Info("install Redis standalone service")
+	} else {
+		log.Info("install Redis binaries for Sentinel")
+	}
 	if _, err := i.run(ctx, server, "sh "+installerkit.ShellQuote(scriptRemote), log); err != nil {
 		return err
 	}
-	log.Info("Redis %s installed and verified on port %d", bundle.Version, port)
+	if startService {
+		log.Info("Redis %s installed and verified on port %d", bundle.Version, port)
+	} else {
+		log.Info("Redis %s binaries installed for Sentinel", bundle.Version)
+	}
 	return nil
 }
 

@@ -48,9 +48,8 @@ $SUDO install -m 0644 "$INSTALL_ROOT/conf/sentinel.conf.tmp" "$SENTINEL_CONFIG"
 cat > "$INSTALL_ROOT/conf/$SENTINEL_SERVICE.service" <<SERVICE
 [Unit]
 Description=AIFAR Redis Sentinel service on port $SENTINEL_PORT
-After=network-online.target $SERVICE_NAME.service
+After=network-online.target
 Wants=network-online.target
-Requires=$SERVICE_NAME.service
 
 [Service]
 Type=simple
@@ -64,9 +63,11 @@ WantedBy=multi-user.target
 SERVICE
 $SUDO install -m 0644 "$INSTALL_ROOT/conf/$SENTINEL_SERVICE.service" "/etc/systemd/system/$SENTINEL_SERVICE.service"
 
-echo "restarting Redis data service"
 $SUDO systemctl daemon-reload
-$SUDO systemctl restart "$SERVICE_NAME"
+if [ "$ROLE" != "sentinel" ]; then
+  echo "restarting Redis data service"
+  $SUDO systemctl restart "$SERVICE_NAME"
+fi
 echo "starting Redis Sentinel service"
 if ! $SUDO systemctl enable --now "$SENTINEL_SERVICE"; then
   echo "Redis Sentinel service failed to start"

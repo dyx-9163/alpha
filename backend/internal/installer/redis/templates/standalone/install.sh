@@ -65,6 +65,7 @@ for bin in redis-server redis-cli redis-benchmark redis-check-aof redis-check-rd
   $SUDO install -m 0755 "$SRC_DIR/src/$bin" "$INSTALL_ROOT/bin/$bin"
 done
 
+{{if .StartService}}
 echo "writing Redis configuration"
 cat > "$WORK_DIR/redis.conf" <<CONF
 bind 0.0.0.0 -::1
@@ -139,3 +140,7 @@ fi
 "$INSTALL_ROOT/bin/redis-server" --version
 "$INSTALL_ROOT/bin/redis-cli" -p "$PORT" -a "$REDIS_PASSWORD" --no-auth-warning ping
 echo "Redis standalone service installed: $SERVICE_NAME"
+{{else}}
+"$INSTALL_ROOT/bin/redis-server" --version
+echo "Redis binaries installed for Sentinel"
+{{end}}

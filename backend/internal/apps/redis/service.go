@@ -54,6 +54,14 @@ type stepRecorder interface {
 	FinishStep(target, name, status, errText string)
 }
 
+type sentinelRoleSelection struct {
+	MasterID    string
+	ReplicaIDs  []string
+	SentinelIDs []string
+	AllIDs      []string
+	Explicit    bool
+}
+
 func NewService(s Store, remote redisinstaller.Remote) Service {
 	return Service{store: s, remote: remote}
 }
@@ -156,17 +164,15 @@ func (s Service) Install(ctx context.Context, req InstallRequest, resources []st
 
 func (s Service) installSentinel(ctx context.Context, req InstallRequest, resources []store.Resource, log redisinstaller.Logger, targetLog targetLogger) error {
 	copy := CopyFor(req.Language)
-	targets := targetServerIDs(req)
-	if len(targets) < 3 {
-		return errors.New(copy.SentinelNeedNodes)
-	}
-	masterTarget, err := redisSentinelMasterID(req.Parameters, targets)
+	roles, err := redisSentinelRoles(req.Parameters, targetServerIDs(req), copy)
 	if err != nil {
 		return err
 	}
+	targets := roles.AllIDs
+	masterTarget := roles.MasterID
 	port := redisPort(req.Parameters)
 	sentinelPort := redisSentinelPort(req.Parameters)
-	quorum := redisQuorum(req.Parameters, len(targets))
+	quorum := redisQuorum(req.Parameters, len(roles.SentinelIDs))
 	masterName, err := redisSentinelMasterName(req.Parameters, copy.SentinelMasterNameInvalid)
 	if err != nil {
 		return err
@@ -189,13 +195,13 @@ func (s Service) installSentinel(ctx context.Context, req InstallRequest, resour
 	servers := make(map[string]store.Server, len(targets))
 	installer := redisinstaller.NewInstaller(s.remote)
 	recorder, _ := log.(stepRecorder)
-	steps := redisInstallStepsFor("sentinel", copy)
 	var masterServer store.Server
 	for idx, target := range targets {
 		logForServer := logForTarget(log, targetLog, target)
 		if recorder != nil {
 			recorder.StartTarget(target)
 		}
+		steps := redisSentinelStepsForTarget(copy, roles.IsSentinel(target))
 		step := newStepRunnerWithSteps(logForServer, recorder, target, copy, steps)
 		var server store.Server
 		if err := step(1, "load-server", copy.LoadServer, func() error {
@@ -226,7 +232,11 @@ func (s Service) installSentinel(ctx context.Context, req InstallRequest, resour
 			return err
 		}
 		installRoot := remoteInstallRoot(server, "redis", bundle.Version)
+		role := roles.RoleFor(target)
 		if err := step(3, "install-redis", copy.InstallStandalone, func() error {
+			if role == "sentinel" {
+				return installer.InstallBinariesWithLanguage(ctx, server, bundle, port, password, logForServer, req.Language)
+			}
 			return installer.InstallWithLanguage(ctx, server, bundle, port, password, logForServer, req.Language)
 		}); err != nil {
 			msg := fmt.Sprintf(copy.InstallFailed, err)
@@ -234,32 +244,32 @@ func (s Service) installSentinel(ctx context.Context, req InstallRequest, resour
 			finishTarget(recorder, target, "failed", msg)
 			return err
 		}
-		role := "replica"
-		if target == masterTarget {
-			role = "master"
-		}
-		if err := step(4, "configure-sentinel", copy.ConfigureSentinel, func() error {
-			return installer.ConfigureSentinelNode(ctx, server, redisinstaller.SentinelNodeConfig{
-				Version:      bundle.Version,
-				InstallRoot:  installRoot,
-				RedisPort:    port,
-				SentinelPort: sentinelPort,
-				Password:     password,
-				MasterName:   masterName,
-				MasterHost:   masterServer.Host,
-				MasterPort:   port,
-				Quorum:       quorum,
-				Role:         role,
-			}, logForServer)
-		}); err != nil {
-			msg := fmt.Sprintf(copy.InstallFailed, err)
-			logForServer.Error("%s", msg)
-			finishTarget(recorder, target, "failed", msg)
-			return err
+		recordStepIndex := 4
+		if roles.IsSentinel(target) {
+			recordStepIndex = 5
+			if err := step(4, "configure-sentinel", copy.ConfigureSentinel, func() error {
+				return installer.ConfigureSentinelNode(ctx, server, redisinstaller.SentinelNodeConfig{
+					Version:      bundle.Version,
+					InstallRoot:  installRoot,
+					RedisPort:    port,
+					SentinelPort: sentinelPort,
+					Password:     password,
+					MasterName:   masterName,
+					MasterHost:   masterServer.Host,
+					MasterPort:   port,
+					Quorum:       quorum,
+					Role:         role,
+				}, logForServer)
+			}); err != nil {
+				msg := fmt.Sprintf(copy.InstallFailed, err)
+				logForServer.Error("%s", msg)
+				finishTarget(recorder, target, "failed", msg)
+				return err
+			}
 		}
 		var instance store.AppInstance
-		if err := step(5, "record-instance", copy.RecordInstance, func() error {
-			metadata, _ := json.Marshal(map[string]any{
+		if err := step(recordStepIndex, "record-instance", copy.RecordInstance, func() error {
+			metadataMap := map[string]any{
 				"clusterId":      clusterID,
 				"resourcePath":   bundle.ArchivePath,
 				"rpmCount":       len(bundle.RPMPaths),
@@ -270,10 +280,14 @@ func (s Service) installSentinel(ctx context.Context, req InstallRequest, resour
 				"role":           role,
 				"masterHost":     masterServer.Host,
 				"serviceName":    fmt.Sprintf("aifar-redis-%d", port),
-				"sentinelName":   fmt.Sprintf("aifar-redis-sentinel-%d", sentinelPort),
+				"sentinel":       roles.IsSentinel(target),
 				"topology":       "sentinel",
 				"auth":           "password",
-			})
+			}
+			if roles.IsSentinel(target) {
+				metadataMap["sentinelName"] = fmt.Sprintf("aifar-redis-sentinel-%d", sentinelPort)
+			}
+			metadata, _ := json.Marshal(metadataMap)
 			var saveErr error
 			instance, saveErr = s.store.SaveAppInstance(store.AppInstance{
 				App:      "redis",
@@ -517,6 +531,72 @@ func targetServerIDs(req InstallRequest) []string {
 	return out
 }
 
+func (r sentinelRoleSelection) IsSentinel(target string) bool {
+	return stringInSlice(target, r.SentinelIDs)
+}
+
+func (r sentinelRoleSelection) IsReplica(target string) bool {
+	return stringInSlice(target, r.ReplicaIDs)
+}
+
+func (r sentinelRoleSelection) RoleFor(target string) string {
+	switch {
+	case target == r.MasterID:
+		return "master"
+	case r.IsReplica(target):
+		return "replica"
+	default:
+		return "sentinel"
+	}
+}
+
+func redisSentinelRoles(params map[string]any, legacyTargets []string, copy Copy) (sentinelRoleSelection, error) {
+	master := redisSentinelMasterParam(params)
+	replicas, hasReplicas := stringSliceParam(params, "replicaServerIds", "replicaIds")
+	sentinels, hasSentinels := stringSliceParam(params, "sentinelServerIds", "sentinelIds")
+	explicit := hasReplicas || hasSentinels
+	if !explicit {
+		if len(legacyTargets) < 3 {
+			return sentinelRoleSelection{}, errors.New(copy.SentinelNeedNodes)
+		}
+		selected, err := redisSentinelMasterID(params, legacyTargets, copy)
+		if err != nil {
+			return sentinelRoleSelection{}, err
+		}
+		for _, target := range legacyTargets {
+			if target != selected {
+				replicas = append(replicas, target)
+			}
+		}
+		return sentinelRoleSelection{
+			MasterID:    selected,
+			ReplicaIDs:  replicas,
+			SentinelIDs: append([]string{}, legacyTargets...),
+			AllIDs:      append([]string{}, legacyTargets...),
+		}, nil
+	}
+	if master == "" {
+		return sentinelRoleSelection{}, errors.New(copy.SentinelMasterRequired)
+	}
+	if len(replicas) == 0 {
+		return sentinelRoleSelection{}, errors.New(copy.SentinelReplicaRequired)
+	}
+	if stringInSlice(master, replicas) {
+		return sentinelRoleSelection{}, errors.New(copy.SentinelReplicaHasMaster)
+	}
+	if len(sentinels) < 3 {
+		return sentinelRoleSelection{}, errors.New(copy.SentinelNodesRequired)
+	}
+	all := uniqueStrings(append(append([]string{master}, replicas...), sentinels...))
+	return sentinelRoleSelection{
+		MasterID:    master,
+		ReplicaIDs:  replicas,
+		SentinelIDs: sentinels,
+		AllIDs:      all,
+		Explicit:    true,
+	}, nil
+}
+
 func redisPort(params map[string]any) int {
 	value, ok := params["port"]
 	if !ok {
@@ -569,23 +649,83 @@ func redisSentinelMasterName(params map[string]any, invalidMessage string) (stri
 	return name, nil
 }
 
-func redisSentinelMasterID(params map[string]any, targets []string) (string, error) {
+func redisSentinelMasterID(params map[string]any, targets []string, copy Copy) (string, error) {
 	if len(targets) == 0 {
-		return "", errors.New("redis sentinel master target is required")
+		return "", errors.New(copy.SentinelMasterRequired)
 	}
-	selected := strings.TrimSpace(fmt.Sprint(params["sentinelMasterId"]))
-	if selected == "" || selected == "<nil>" {
-		selected = strings.TrimSpace(fmt.Sprint(params["masterServerId"]))
-	}
-	if selected == "" || selected == "<nil>" {
-		return "", errors.New("redis sentinel master target is required")
+	selected := redisSentinelMasterParam(params)
+	if selected == "" {
+		return "", errors.New(copy.SentinelMasterRequired)
 	}
 	for _, target := range targets {
 		if target == selected {
 			return selected, nil
 		}
 	}
-	return "", fmt.Errorf("redis sentinel master target %s is not in selected servers", selected)
+	return "", errors.New(copy.SentinelMasterNotSelected)
+}
+
+func redisSentinelMasterParam(params map[string]any) string {
+	if params == nil {
+		return ""
+	}
+	for _, key := range []string{"sentinelMasterId", "masterServerId"} {
+		selected := strings.TrimSpace(fmt.Sprint(params[key]))
+		if selected != "" && selected != "<nil>" {
+			return selected
+		}
+	}
+	return ""
+}
+
+func stringSliceParam(params map[string]any, keys ...string) ([]string, bool) {
+	if params == nil {
+		return nil, false
+	}
+	for _, key := range keys {
+		value, ok := params[key]
+		if !ok {
+			continue
+		}
+		switch v := value.(type) {
+		case []string:
+			return uniqueStrings(v), true
+		case []any:
+			out := make([]string, 0, len(v))
+			for _, item := range v {
+				out = append(out, fmt.Sprint(item))
+			}
+			return uniqueStrings(out), true
+		case string:
+			return uniqueStrings(strings.Split(v, ",")), true
+		default:
+			return uniqueStrings([]string{fmt.Sprint(v)}), true
+		}
+	}
+	return nil, false
+}
+
+func uniqueStrings(values []string) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" || value == "<nil>" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		out = append(out, value)
+	}
+	return out
+}
+
+func stringInSlice(value string, values []string) bool {
+	for _, item := range values {
+		if item == value {
+			return true
+		}
+	}
+	return false
 }
 
 func redisClusterReplicas(params map[string]any) int {
@@ -673,13 +813,7 @@ func redisInstallSteps(copy Copy) []stepDef {
 func redisInstallStepsFor(topology string, copy Copy) []stepDef {
 	switch normalizeTopology(topology) {
 	case "sentinel":
-		return []stepDef{
-			{Name: "load-server", Title: copy.LoadServer},
-			{Name: "verify-resource", Title: copy.VerifyResource},
-			{Name: "install-redis", Title: copy.InstallStandalone},
-			{Name: "configure-sentinel", Title: copy.ConfigureSentinel},
-			{Name: "record-instance", Title: copy.RecordInstance},
-		}
+		return redisSentinelStepsForTarget(copy, true)
 	case "cluster":
 		return []stepDef{
 			{Name: "load-server", Title: copy.LoadServer},
@@ -697,6 +831,18 @@ func redisInstallStepsFor(topology string, copy Copy) []stepDef {
 			{Name: "record-instance", Title: copy.RecordInstance},
 		}
 	}
+}
+
+func redisSentinelStepsForTarget(copy Copy, runsSentinel bool) []stepDef {
+	steps := []stepDef{
+		{Name: "load-server", Title: copy.LoadServer},
+		{Name: "verify-resource", Title: copy.VerifyResource},
+		{Name: "install-redis", Title: copy.InstallStandalone},
+	}
+	if runsSentinel {
+		steps = append(steps, stepDef{Name: "configure-sentinel", Title: copy.ConfigureSentinel})
+	}
+	return append(steps, stepDef{Name: "record-instance", Title: copy.RecordInstance})
 }
 
 func redisDeleteSteps(copy DeleteCopy) []stepDef {

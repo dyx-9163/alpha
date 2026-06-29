@@ -35,6 +35,9 @@ export interface AppInstallFieldOption {
   value: string | number | boolean
 }
 
+export type AppInstallFieldValue = string | number | boolean | Array<string | number | boolean> | undefined
+export type AppInstallFieldValues = Record<string, AppInstallFieldValue>
+
 export interface AppInstallField {
   name: string
   label: string
@@ -45,6 +48,7 @@ export interface AppInstallField {
   options?: AppInstallFieldOption[]
   optionsResolver?: AppInstallFieldOptionsResolver
   visibleWhen?: AppInstallFieldVisibility
+  multiple?: boolean
   min?: number
   max?: number
   step?: number
@@ -59,23 +63,27 @@ export interface AppInstallValidationContext {
 
 export type AppInstallFieldValidator = (
   value: unknown,
-  values: Record<string, string | number | boolean | undefined>,
+  values: AppInstallFieldValues,
   context: AppInstallValidationContext
 ) => string | undefined | null
 
 export type AppInstallFieldOptionsResolver = (
-  values: Record<string, string | number | boolean | undefined>,
+  values: AppInstallFieldValues,
   context: AppInstallValidationContext
 ) => AppInstallFieldOption[]
 
 export type AppInstallFieldVisibility = (
-  values: Record<string, string | number | boolean | undefined>,
+  values: AppInstallFieldValues,
   context: AppInstallValidationContext
 ) => boolean
 
 export interface AppInstallDialogConfig {
   targetMode?: AppTargetMode
-  targetModeResolver?: (values: Record<string, unknown>) => AppTargetMode
+  targetModeResolver?: (values: AppInstallFieldValues) => AppTargetMode
+  hideTargetSelector?: boolean
+  hideTargetSelectorResolver?: (values: AppInstallFieldValues) => boolean
+  targetCountResolver?: (values: AppInstallFieldValues, context: AppInstallValidationContext) => number
+  targetIdsResolver?: (values: AppInstallFieldValues, context: AppInstallValidationContext) => string[]
   copy?: Partial<AppInstallDialogCopy>
   fields?: AppInstallField[]
 }

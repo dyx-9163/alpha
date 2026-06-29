@@ -55,12 +55,13 @@ var redisClusterBootstrapTemplate = template.Must(template.New("redis-cluster-bo
 	Parse(clusterBootstrapScriptTemplate))
 
 type standaloneInstallScriptData struct {
-	Version     string
-	WorkDir     string
-	ArchivePath string
-	InstallRoot string
-	Port        int
-	Password    string
+	Version      string
+	WorkDir      string
+	ArchivePath  string
+	InstallRoot  string
+	Port         int
+	Password     string
+	StartService bool
 }
 
 type standaloneUninstallScriptData struct {
@@ -104,13 +105,22 @@ type ClusterBootstrapNode struct {
 }
 
 func installStandaloneScript(version, workDir, archivePath, installRoot string, port int, password string) (string, error) {
+	return installRedisScript(version, workDir, archivePath, installRoot, port, password, true)
+}
+
+func installRedisBinariesScript(version, workDir, archivePath, installRoot string, port int, password string) (string, error) {
+	return installRedisScript(version, workDir, archivePath, installRoot, port, password, false)
+}
+
+func installRedisScript(version, workDir, archivePath, installRoot string, port int, password string, startService bool) (string, error) {
 	return renderRedisScript(redisStandaloneInstallTemplate, standaloneInstallScriptData{
-		Version:     version,
-		WorkDir:     workDir,
-		ArchivePath: archivePath,
-		InstallRoot: installRoot,
-		Port:        port,
-		Password:    password,
+		Version:      version,
+		WorkDir:      workDir,
+		ArchivePath:  archivePath,
+		InstallRoot:  installRoot,
+		Port:         port,
+		Password:     password,
+		StartService: startService,
 	})
 }
 

@@ -27,6 +27,11 @@ type Copy struct {
 	TargetRequired            string
 	SingleTargetOnly          string
 	SentinelNeedNodes         string
+	SentinelMasterRequired    string
+	SentinelMasterNotSelected string
+	SentinelReplicaRequired   string
+	SentinelReplicaHasMaster  string
+	SentinelNodesRequired     string
 	SentinelMasterNameInvalid string
 	ClusterNeedNodes          string
 	TopologyUnsupported       string
@@ -64,12 +69,17 @@ func CopyFor(lang string) Copy {
 			LoadFailed:                "load server failed: %s",
 			InstallFailed:             "Redis install failed: %s",
 			RecordFailed:              "record Redis instance failed: %s",
-			Installed:                 "Redis standalone installed, instance recorded: %s",
+			Installed:                 "Redis instance recorded: %s",
 			ClusterInstalled:          "Redis %s topology installed, %d instance record(s) created",
 			BatchFailed:               "Redis install finished with %d failure(s): %s",
 			TargetRequired:            "Redis install requires target server(s)",
 			SingleTargetOnly:          "Redis standalone install supports only one target server",
 			SentinelNeedNodes:         "Redis Sentinel requires at least 3 target servers",
+			SentinelMasterRequired:    "Redis Sentinel requires exactly one Redis master node",
+			SentinelMasterNotSelected: "Redis Sentinel master node must be one of the selected servers",
+			SentinelReplicaRequired:   "Redis Sentinel requires at least 1 Redis replica node",
+			SentinelReplicaHasMaster:  "Redis Sentinel replica nodes cannot include the master node",
+			SentinelNodesRequired:     "Redis Sentinel requires at least 3 Sentinel nodes",
 			SentinelMasterNameInvalid: "Redis Sentinel monitor name can contain only letters, numbers, dot, dash, and underscore, up to 64 characters",
 			ClusterNeedNodes:          "Redis Cluster requires at least 3 target servers",
 			TopologyUnsupported:       "Redis topology is not supported: %s",
@@ -94,12 +104,17 @@ func CopyFor(lang string) Copy {
 			LoadFailed:                "读取服务器失败：%s",
 			InstallFailed:             "Redis 安装失败：%s",
 			RecordFailed:              "记录 Redis 实例失败：%s",
-			Installed:                 "Redis 单体已安装，实例已记录：%s",
+			Installed:                 "Redis 实例已记录：%s",
 			ClusterInstalled:          "Redis %s 拓扑已安装，已记录 %d 个实例",
 			BatchFailed:               "Redis 安装完成，但有 %d 个失败：%s",
 			TargetRequired:            "Redis 安装需要选择目标服务器",
 			SingleTargetOnly:          "Redis 单体安装只支持一个目标服务器",
 			SentinelNeedNodes:         "Redis Sentinel 至少需要 3 台目标服务器",
+			SentinelMasterRequired:    "Redis Sentinel 必须且只能选择 1 个 Redis master 节点",
+			SentinelMasterNotSelected: "Redis Sentinel master 节点必须在已选择服务器中",
+			SentinelReplicaRequired:   "Redis Sentinel 至少需要选择 1 个 Redis replica 节点",
+			SentinelReplicaHasMaster:  "Redis Sentinel replica 节点不能包含 master 节点",
+			SentinelNodesRequired:     "Redis Sentinel 至少需要选择 3 个 Sentinel 节点",
 			SentinelMasterNameInvalid: "Redis Sentinel 监控组名称只能包含字母、数字、点、横线和下划线，最多 64 个字符",
 			ClusterNeedNodes:          "Redis Cluster 至少需要 3 台目标服务器",
 			TopologyUnsupported:       "Redis 不支持该拓扑：%s",

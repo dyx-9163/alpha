@@ -95,8 +95,22 @@ func (m Module) PlanInstall(ctx context.Context, req registry.InstallRequest, re
 	}
 	copy := CopyFor(req.Language)
 	topology := normalizeTopology(req.Topology)
-	steps := redisInstallStepsFor(topology, copy)
 	targets := req.TargetServerIDs()
+	if topology == "sentinel" {
+		roles, err := redisSentinelRoles(req.Parameters, targets, copy)
+		if err != nil {
+			return nil, err
+		}
+		plan := make([]registry.InstallStepPlan, 0, len(roles.AllIDs)*len(redisInstallStepsFor(topology, copy)))
+		for _, target := range roles.AllIDs {
+			steps := redisSentinelStepsForTarget(copy, roles.IsSentinel(target))
+			for idx, step := range steps {
+				plan = append(plan, registry.InstallStepPlan{Target: target, Name: step.Name, Title: step.Title, Order: idx + 1})
+			}
+		}
+		return plan, nil
+	}
+	steps := redisInstallStepsFor(topology, copy)
 	plan := make([]registry.InstallStepPlan, 0, len(targets)*len(steps))
 	for targetIdx, target := range targets {
 		for idx, step := range steps {
@@ -113,28 +127,28 @@ func (m Module) ValidateInstall(ctx context.Context, req registry.InstallRequest
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
-	targets := req.TargetServerIDs()
-	if len(targets) == 0 {
-		return errors.New(i18n.Text(req.Language, "redis.targetRequired"))
-	}
 	topology := normalizeTopology(req.Topology)
 	copy := CopyFor(req.Language)
+	targets := req.TargetServerIDs()
 	switch topology {
 	case "standalone":
+		if len(targets) == 0 {
+			return errors.New(i18n.Text(req.Language, "redis.targetRequired"))
+		}
 		if len(targets) > 1 {
 			return errors.New(copy.SingleTargetOnly)
 		}
 	case "sentinel":
-		if len(targets) < 3 {
-			return errors.New(copy.SentinelNeedNodes)
-		}
 		if _, err := redisSentinelMasterName(req.Parameters, copy.SentinelMasterNameInvalid); err != nil {
 			return err
 		}
-		if _, err := redisSentinelMasterID(req.Parameters, targets); err != nil {
+		if _, err := redisSentinelRoles(req.Parameters, targets, copy); err != nil {
 			return err
 		}
 	case "cluster":
+		if len(targets) == 0 {
+			return errors.New(i18n.Text(req.Language, "redis.targetRequired"))
+		}
 		if len(targets) < 3 {
 			return errors.New(copy.ClusterNeedNodes)
 		}

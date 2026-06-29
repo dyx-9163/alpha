@@ -18,7 +18,7 @@
           </el-select>
         </el-form-item>
 
-        <el-form-item :label="dialogCopy.serversLabel">
+        <el-form-item v-if="!targetSelectorHidden" :label="dialogCopy.serversLabel">
           <ServerSelector
             v-if="effectiveTargetMode === 'multiple'"
             v-model="selectedServerIds"
@@ -39,6 +39,9 @@
             v-if="field.type === 'select'"
             v-model="fieldValues[field.name]"
             :placeholder="field.placeholder"
+            :multiple="field.multiple"
+            :collapse-tags="field.multiple"
+            :collapse-tags-tooltip="field.multiple"
             style="width: 100%"
           >
             <el-option v-for="option in fieldOptions(field)" :key="String(option.value)" :label="option.label" :value="option.value" />
@@ -82,7 +85,7 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
 import type { AppStoreItem } from '../apps/registry/catalog'
-import type { AppInstallDialogCopy, AppInstallField, AppInstallPayload, AppInstallValidationContext, ServerOption } from '../apps/registry/contract'
+import type { AppInstallDialogCopy, AppInstallField, AppInstallFieldValues, AppInstallPayload, AppInstallValidationContext, ServerOption } from '../apps/registry/contract'
 import type { AppTargetMode } from '../apps/registry/model'
 import { useI18n } from '../i18n'
 import ServerSelector from './ServerSelector.vue'
@@ -96,7 +99,11 @@ const props = withDefaults(defineProps<{
   submitting?: boolean
   locale?: string
   targetMode?: AppTargetMode
-  targetModeResolver?: (values: Record<string, unknown>) => AppTargetMode
+  targetModeResolver?: (values: AppInstallFieldValues) => AppTargetMode
+  hideTargetSelector?: boolean
+  hideTargetSelectorResolver?: (values: AppInstallFieldValues) => boolean
+  targetCountResolver?: (values: AppInstallFieldValues, context: AppInstallValidationContext) => number
+  targetIdsResolver?: (values: AppInstallFieldValues, context: AppInstallValidationContext) => string[]
   copy?: Partial<AppInstallDialogCopy>
   fields?: AppInstallField[] | null
 }>(), {
@@ -111,7 +118,7 @@ const emit = defineEmits<{
 const selectedVersion = ref('')
 const selectedServerId = ref('')
 const selectedServerIds = ref<string[]>([])
-const fieldValues = ref<Record<string, string | number | boolean | undefined>>({})
+const fieldValues = ref<AppInstallFieldValues>({})
 const safeServers = computed(() => Array.isArray(props.servers) ? props.servers : [])
 const allFields = computed(() => Array.isArray(props.fields) ? props.fields : [])
 const installFields = computed(() => allFields.value.filter((field) => field.visibleWhen?.(fieldValues.value, validationContext.value) ?? true))
@@ -142,7 +149,7 @@ const versions = computed(() => {
   return props.app.versions.length ? props.app.versions : [props.app.fallbackVersion]
 })
 const effectiveTargetMode = computed(() => props.targetModeResolver?.(fieldValues.value) ?? props.targetMode)
-const selectedTargetCount = computed(() => effectiveTargetMode.value === 'multiple' ? selectedServerIds.value.length : Number(Boolean(selectedServerId.value)))
+const targetSelectorHidden = computed(() => props.hideTargetSelectorResolver?.(fieldValues.value) ?? props.hideTargetSelector ?? false)
 const selectedTargetServers = computed(() => {
   if (effectiveTargetMode.value === 'multiple') {
     const selected = new Set(selectedServerIds.value)
@@ -155,6 +162,13 @@ const validationContext = computed<AppInstallValidationContext>(() => ({
   selectedServers: selectedTargetServers.value,
   targetMode: effectiveTargetMode.value
 }))
+const hiddenTargetIds = computed(() => props.targetIdsResolver?.(fieldValues.value, validationContext.value) ?? [])
+const selectedTargetCount = computed(() => {
+  if (targetSelectorHidden.value) {
+    return Math.max(0, props.targetCountResolver?.(fieldValues.value, validationContext.value) ?? hiddenTargetIds.value.length)
+  }
+  return effectiveTargetMode.value === 'multiple' ? selectedServerIds.value.length : Number(Boolean(selectedServerId.value))
+})
 const fieldValidationMessages = computed(() => {
   return installFields.value.reduce<Record<string, string>>((messages, field) => {
     const message = field.validate?.(fieldValues.value[field.name], fieldValues.value, validationContext.value)
@@ -166,7 +180,8 @@ const fieldValidationMessages = computed(() => {
 })
 const hasFieldValidationErrors = computed(() => Object.keys(fieldValidationMessages.value).length > 0)
 const requiredFieldsReady = computed(() => installFields.value.every((field) => !field.required || isFieldValueFilled(field, fieldValues.value[field.name])))
-const canSubmit = computed(() => Boolean(selectedVersion.value && selectedTargetCount.value && requiredFieldsReady.value && !hasFieldValidationErrors.value && !props.submitting))
+const targetReady = computed(() => targetSelectorHidden.value ? (!props.targetIdsResolver || selectedTargetCount.value > 0) : selectedTargetCount.value > 0)
+const canSubmit = computed(() => Boolean(selectedVersion.value && targetReady.value && requiredFieldsReady.value && !hasFieldValidationErrors.value && !props.submitting))
 
 watch(
   () => [props.modelValue, props.app?.name, props.app?.versions.join('|'), props.targetMode, allFields.value.map((field) => field.name).join('|')],
@@ -183,7 +198,7 @@ watch(
 )
 
 function resetFieldValues() {
-  const next: Record<string, string | number | boolean | undefined> = {}
+  const next: AppInstallFieldValues = {}
   for (const field of allFields.value) {
     next[field.name] = normalizeFieldValue(field.defaultValue)
   }
@@ -195,6 +210,9 @@ function fieldOptions(field: AppInstallField) {
 }
 
 function normalizeFieldValue(value: unknown) {
+  if (Array.isArray(value)) {
+    return value.filter((item): item is string | number | boolean => typeof item === 'string' || typeof item === 'number' || typeof item === 'boolean')
+  }
   if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
     return value
   }
@@ -204,6 +222,9 @@ function normalizeFieldValue(value: unknown) {
 function isFieldValueFilled(field: AppInstallField, value: unknown) {
   if (field.type === 'switch') {
     return value !== undefined
+  }
+  if (Array.isArray(value)) {
+    return value.length > 0
   }
   return value !== undefined && value !== null && String(value).trim() !== ''
 }
@@ -220,6 +241,14 @@ function submit() {
     return
   }
   const extra = extraPayload()
+  if (targetSelectorHidden.value) {
+    if (hiddenTargetIds.value.length > 1) {
+      emit('submit', { version: selectedVersion.value, serverIds: hiddenTargetIds.value, ...extra })
+      return
+    }
+    emit('submit', { version: selectedVersion.value, serverId: hiddenTargetIds.value[0], ...extra })
+    return
+  }
   if (effectiveTargetMode.value === 'multiple') {
     emit('submit', { version: selectedVersion.value, serverIds: selectedServerIds.value, ...extra })
     return

@@ -1,4 +1,4 @@
-import type { AppInstallField } from './contract'
+import type { AppInstallField, AppInstallFieldValues } from './contract'
 import type { AppTargetMode, AppTopologyDefinition } from './model'
 
 export function defaultTopology(topologies: AppTopologyDefinition[]) {
@@ -7,7 +7,7 @@ export function defaultTopology(topologies: AppTopologyDefinition[]) {
 
 export function targetModeResolver(topologies: AppTopologyDefinition[], fallback: AppTargetMode = 'single') {
   const defaultName = defaultTopology(topologies)?.name
-  return (values: Record<string, unknown>): AppTargetMode => {
+  return (values: AppInstallFieldValues): AppTargetMode => {
     const selected = String(values.topology ?? defaultName ?? '')
     return topologies.find((item) => item.name === selected)?.targetMode ?? fallback
   }
