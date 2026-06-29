@@ -84,6 +84,18 @@ func (s *Store) DeleteAuditLogs(ids []int64) (int, error) {
 	return deleted, nil
 }
 
+func (s *Store) DeleteAuditLogsBefore(cutoff time.Time) (int, error) {
+	if cutoff.IsZero() {
+		return 0, nil
+	}
+	res, err := s.db.Exec(`delete from audit_logs where created_at < ?`, cutoff)
+	if err != nil {
+		return 0, err
+	}
+	deleted, _ := res.RowsAffected()
+	return int(deleted), nil
+}
+
 func auditWhere(query AuditQuery) (string, []any) {
 	where := []string{}
 	args := []any{}

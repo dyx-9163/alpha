@@ -29,6 +29,21 @@
         <span class="subtle-note">{{ t('settings.concurrencyNote') }}</span>
       </div>
 
+      <div class="settings-block">
+        <label>{{ t('settings.retention') }}</label>
+        <KeyValueGrid :items="retentionItems" class="retention-grid" />
+        <div class="retention-actions">
+          <el-tooltip :content="deniedText" :disabled="canManageSettings" placement="top">
+            <span>
+              <el-button type="primary" :loading="retentionRunning" :disabled="!canManageSettings" @click="runRetentionCleanup">
+                {{ t('settings.runRetentionCleanup') }}
+              </el-button>
+            </span>
+          </el-tooltip>
+        </div>
+        <span class="subtle-note">{{ t('settings.retentionNote') }}</span>
+      </div>
+
       <el-alert
         :title="t('settings.realModeTitle')"
         :description="t('settings.realModeDesc')"
@@ -60,7 +75,7 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref } from 'vue'
 import { ElMessage } from 'element-plus'
-import { apiGet, apiPut } from '../api/client'
+import { apiGet, apiPost, apiPut } from '../api/client'
 import KeyValueGrid from '../components/KeyValueGrid.vue'
 import { usePermissions } from '../composables/usePermissions'
 import { useI18n } from '../i18n'
@@ -70,6 +85,7 @@ const { locale, setLocale, t } = useI18n()
 const { can, deniedText } = usePermissions()
 const form = reactive<any>({ language: locale.value, deploymentConcurrency: 2, moduleStatus: {} })
 const now = ref('')
+const retentionRunning = ref(false)
 const platform = navigator.platform.toLowerCase().includes('win') ? 'windows' : 'linux'
 const providerModeLabel = computed(() => {
   const mode = form.providerStatus || form.providerMode || 'real'
@@ -88,6 +104,10 @@ const providerItems = computed(() => [
   { key: 'resourcePath', label: t('settings.resourcePath'), value: form.resourcePath },
   { key: 'defaultDeployDir', label: t('settings.defaultDeployDir'), value: form.defaultDeployDir },
   { key: 'confirm', label: t('settings.dangerousActionsRequire'), value: t('settings.confirmTrue') }
+])
+const retentionItems = computed(() => [
+  { key: 'auditRetentionDays', label: t('settings.auditRetention'), value: formatRetentionDays(form.auditRetentionDays) },
+  { key: 'taskRetentionDays', label: t('settings.taskRetention'), value: formatRetentionDays(form.taskRetentionDays) }
 ])
 
 function moduleMessage(module: string) {
@@ -118,6 +138,30 @@ async function save() {
   form.language = locale.value
   form.deploymentConcurrency = Number(form.deploymentConcurrency)
   now.value = new Date().toISOString()
+}
+
+async function runRetentionCleanup() {
+  if (!canManageSettings.value) {
+    ElMessage.warning(deniedText.value)
+    return
+  }
+  retentionRunning.value = true
+  try {
+    await apiPost('/maintenance/retention/run')
+    ElMessage.success(t('settings.retentionCleanupAccepted'))
+  } catch (err) {
+    ElMessage.error(err instanceof Error ? err.message : t('settings.retentionCleanupFailed'))
+  } finally {
+    retentionRunning.value = false
+  }
+}
+
+function formatRetentionDays(value: unknown) {
+  const count = Number(value)
+  if (!Number.isFinite(count) || count < 1) {
+    return '-'
+  }
+  return t('settings.days', { count })
 }
 onMounted(load)
 </script>
@@ -160,8 +204,17 @@ onMounted(load)
   grid-template-columns: minmax(150px, 180px) minmax(0, 1fr);
 }
 
+.retention-grid {
+  grid-template-columns: minmax(150px, 180px) minmax(0, 1fr);
+}
+
+.retention-actions {
+  margin-top: 12px;
+}
+
 @media (max-width: 720px) {
-  .provider-grid {
+  .provider-grid,
+  .retention-grid {
     grid-template-columns: 120px minmax(0, 1fr);
   }
 }

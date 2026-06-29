@@ -4,6 +4,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestBootstrapUserAndServerLifecycle(t *testing.T) {
@@ -301,6 +302,68 @@ func TestClearTaskLogsForTasks(t *testing.T) {
 	}
 }
 
+func TestDeleteFinishedTasksBefore(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "aifar.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	now := time.Now()
+	oldCutoff := now.Add(-48 * time.Hour)
+	oldFinished, err := db.CreateTask(Task{Type: "apps.docker.install", Target: "srv-old", Status: "success", CreatedBy: "tester", CreatedAt: oldCutoff, FinishedAt: oldCutoff})
+	if err != nil {
+		t.Fatal(err)
+	}
+	recentFinished, err := db.CreateTask(Task{Type: "apps.mysql.install", Target: "srv-recent", Status: "success", CreatedBy: "tester", CreatedAt: now, FinishedAt: now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	running, err := db.CreateTask(Task{Type: "servers.probe", Target: "srv-running", Status: "running", CreatedBy: "tester", CreatedAt: oldCutoff, StartedAt: oldCutoff})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.AddTaskLog(oldFinished.ID, "info", "old"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.UpsertTaskTarget(oldFinished.ID, "srv-old", "success", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.UpsertTaskStep(oldFinished.ID, "srv-old", "install", "install", 1, "success", ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.AddTaskLog(recentFinished.ID, "info", "recent"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.AddTaskLog(running.ID, "info", "running"); err != nil {
+		t.Fatal(err)
+	}
+
+	deleted, err := db.DeleteFinishedTasksBefore(now.Add(-24 * time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deleted != 1 {
+		t.Fatalf("expected one old finished task deleted, got %d", deleted)
+	}
+	if _, _, err := db.GetTask(oldFinished.ID); !IsNotFound(err) {
+		t.Fatalf("expected old finished task to be deleted, got %v", err)
+	}
+	for _, id := range []string{recentFinished.ID, running.ID} {
+		if _, _, err := db.GetTask(id); err != nil {
+			t.Fatalf("expected task %s to remain, got %v", id, err)
+		}
+	}
+	for _, table := range []string{"task_logs", "task_targets", "task_steps"} {
+		var count int
+		if err := db.db.QueryRow(`select count(*) from `+table+` where task_id=?`, oldFinished.ID).Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		if count != 0 {
+			t.Fatalf("expected %s rows for deleted task to be removed, got %d", table, count)
+		}
+	}
+}
+
 func TestTaskTargetsAndSteps(t *testing.T) {
 	db, err := Open(filepath.Join(t.TempDir(), "aifar.db"))
 	if err != nil {
@@ -379,6 +442,38 @@ func TestTaskPersistenceMasksSensitiveText(t *testing.T) {
 		if strings.Contains(combined, leaked) {
 			t.Fatalf("expected %q to be masked from persisted task fields: %q", leaked, combined)
 		}
+	}
+}
+
+func TestDeleteAuditLogsBefore(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "aifar.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.AddAudit("admin", "old.action", "srv-old", "success", "old"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AddAudit("admin", "recent.action", "srv-recent", "success", "recent"); err != nil {
+		t.Fatal(err)
+	}
+	oldTime := time.Now().Add(-48 * time.Hour)
+	if _, err := db.db.Exec(`update audit_logs set created_at=? where action=?`, oldTime, "old.action"); err != nil {
+		t.Fatal(err)
+	}
+	deleted, err := db.DeleteAuditLogsBefore(time.Now().Add(-24 * time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deleted != 1 {
+		t.Fatalf("expected one old audit row deleted, got %d", deleted)
+	}
+	items, err := db.ListAudit()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 || items[0].Action != "recent.action" {
+		t.Fatalf("expected only recent audit row to remain, got %+v", items)
 	}
 }
 

@@ -167,6 +167,8 @@ func TestSettingsExposeSecurityLimits(t *testing.T) {
 	api.cfg.MaxRequestBodyBytes = 2048
 	api.cfg.AuthMaxFailures = 7
 	api.cfg.AuthLockoutSeconds = 60
+	api.cfg.AuditRetentionDays = 120
+	api.cfg.TaskRetentionDays = 45
 	token := issueTestToken(t, db, secret, "owner", "owner")
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v2/settings", nil)
@@ -182,9 +184,37 @@ func TestSettingsExposeSecurityLimits(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 		t.Fatal(err)
 	}
-	if body["maxRequestBodyBytes"] != float64(2048) || body["authMaxFailures"] != float64(7) || body["authLockoutSeconds"] != float64(60) {
+	if body["maxRequestBodyBytes"] != float64(2048) || body["authMaxFailures"] != float64(7) || body["authLockoutSeconds"] != float64(60) ||
+		body["auditRetentionDays"] != float64(120) || body["taskRetentionDays"] != float64(45) {
 		t.Fatalf("security limits missing from settings response: %+v", body)
 	}
+}
+
+func TestRetentionCleanupStartsTask(t *testing.T) {
+	api, db, secret := newAuthzTestAPI(t)
+	api.cfg.AuditRetentionDays = 1
+	api.cfg.TaskRetentionDays = 1
+	token := issueTestToken(t, db, secret, "owner", "owner")
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v2/maintenance/retention/run", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	rec := httptest.NewRecorder()
+
+	api.Router().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	taskID, _ := body["taskId"].(string)
+	if taskID == "" {
+		t.Fatalf("expected taskId in response: %+v", body)
+	}
+	waitForTaskStatus(t, db, taskID, "success")
+	assertAuditExists(t, db, "maintenance.retention.run", "running", "owner", "control-plane")
 }
 
 func newAuthzTestAPI(t *testing.T) (*API, *store.Store, string) {
@@ -209,6 +239,8 @@ func newAuthzTestAPI(t *testing.T) (*API, *store.Store, string) {
 		MaxRequestBodyBytes:   1 << 20,
 		AuthMaxFailures:       5,
 		AuthLockoutSeconds:    300,
+		AuditRetentionDays:    180,
+		TaskRetentionDays:     90,
 	}
 	return New(cfg, db, worker.NewManager(db)), db, secret
 }
@@ -255,4 +287,21 @@ func postLogin(api *API, username, password string) *httptest.ResponseRecorder {
 	rec := httptest.NewRecorder()
 	api.Router().ServeHTTP(rec, req)
 	return rec
+}
+
+func waitForTaskStatus(t *testing.T, db *store.Store, taskID, want string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		task, _, err := db.GetTask(taskID)
+		if err == nil && task.Status == want {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	task, _, err := db.GetTask(taskID)
+	if err != nil {
+		t.Fatalf("task %s not found while waiting for status %s: %v", taskID, want, err)
+	}
+	t.Fatalf("expected task %s status %s, got %s", taskID, want, task.Status)
 }

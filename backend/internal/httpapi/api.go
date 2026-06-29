@@ -22,6 +22,7 @@ import (
 	"aifar-deployment/backend/internal/auth"
 	"aifar-deployment/backend/internal/config"
 	"aifar-deployment/backend/internal/i18n"
+	"aifar-deployment/backend/internal/maintenance"
 	"aifar-deployment/backend/internal/rbac"
 	"aifar-deployment/backend/internal/resource"
 	"aifar-deployment/backend/internal/security"
@@ -63,6 +64,7 @@ func New(cfg config.Config, s *store.Store, tasks *worker.Manager) *API {
 			r.Use(api.requireAuth)
 			r.Get("/settings", api.getSettings)
 			r.Put("/settings", api.requirePermission(rbac.SettingsManage, api.putSettings))
+			r.Post("/maintenance/retention/run", api.requirePermission(rbac.SettingsManage, api.runRetentionCleanup))
 			r.Get("/resources", api.listResources)
 			r.Post("/resources/rescan", api.requirePermission(rbac.ResourcesScan, api.rescanResources))
 			r.Get("/servers", api.listServers)
@@ -244,10 +246,12 @@ func (a *API) getSettings(w http.ResponseWriter, r *http.Request) {
 		"authMaxFailures":       a.cfg.AuthMaxFailures,
 		"authLockoutSeconds":    a.cfg.AuthLockoutSeconds,
 		"maxRequestBodyBytes":   a.cfg.MaxRequestBodyBytes,
+		"auditRetentionDays":    a.cfg.AuditRetentionDays,
+		"taskRetentionDays":     a.cfg.TaskRetentionDays,
 		"moduleStatus": map[string]string{
 			"servers": "available", "apps": "available", "containers": "available",
 			"database": "available", "storage": "available", "terminal": "available",
-			"audit": "available", "settings": "available",
+			"audit": "available", "settings": "available", "maintenance": "available",
 		},
 	})
 }
@@ -265,6 +269,59 @@ func (a *API) putSettings(w http.ResponseWriter, r *http.Request) {
 	}
 	a.audit(r, "settings.update", "panel", "success", i18n.Text(lang, "api.settingsUpdated"))
 	a.getSettings(w, r)
+}
+
+func (a *API) runRetentionCleanup(w http.ResponseWriter, r *http.Request) {
+	lang := languageFromRequest(r)
+	target := "control-plane"
+	service := maintenance.NewService(a.store, maintenance.RetentionConfig{
+		AuditRetentionDays: a.cfg.AuditRetentionDays,
+		TaskRetentionDays:  a.cfg.TaskRetentionDays,
+	})
+	actor := currentUser(r).Username
+	task, err := a.tasks.StartWithLanguage("maintenance.retention.run", target, actor, lang, func(ctx context.Context, log worker.Logger) error {
+		plan := service.Plan(time.Now())
+		log.PlanTarget(target)
+		log.PlanStep(target, "cleanup-audit", i18n.Text(lang, "maintenance.cleanupAuditStep"), 1)
+		log.PlanStep(target, "cleanup-tasks", i18n.Text(lang, "maintenance.cleanupTasksStep"), 2)
+		log.StartTarget(target)
+
+		log.StartStep(target, "cleanup-audit", i18n.Text(lang, "maintenance.cleanupAuditStep"), 1)
+		if err := ctx.Err(); err != nil {
+			log.FinishStep(target, "cleanup-audit", "cancelled", err.Error())
+			log.FinishTarget(target, "cancelled", err.Error())
+			return err
+		}
+		auditDeleted, err := service.CleanupAudit(plan)
+		if err != nil {
+			log.FinishStep(target, "cleanup-audit", "failed", err.Error())
+			log.FinishTarget(target, "failed", err.Error())
+			return err
+		}
+		log.Info(i18n.Text(lang, "maintenance.auditDeleted"), auditDeleted, formatRetentionCutoff(plan.AuditCutoff))
+		log.FinishStep(target, "cleanup-audit", "success", "")
+
+		log.StartStep(target, "cleanup-tasks", i18n.Text(lang, "maintenance.cleanupTasksStep"), 2)
+		if err := ctx.Err(); err != nil {
+			log.FinishStep(target, "cleanup-tasks", "cancelled", err.Error())
+			log.FinishTarget(target, "cancelled", err.Error())
+			return err
+		}
+		tasksDeleted, err := service.CleanupTasks(plan)
+		if err != nil {
+			log.FinishStep(target, "cleanup-tasks", "failed", err.Error())
+			log.FinishTarget(target, "failed", err.Error())
+			return err
+		}
+		log.Info(i18n.Text(lang, "maintenance.tasksDeleted"), tasksDeleted, formatRetentionCutoff(plan.TaskCutoff))
+		log.FinishStep(target, "cleanup-tasks", "success", "")
+		log.FinishTarget(target, "success", "")
+		return nil
+	})
+	if err == nil {
+		a.audit(r, "maintenance.retention.run", target, "running", i18n.Text(lang, "api.retentionCleanupStarted"))
+	}
+	respondTask(w, task, err)
 }
 
 func (a *API) listResources(w http.ResponseWriter, r *http.Request) {
@@ -1518,6 +1575,13 @@ func writeTerminalLine(conn *websocket.Conn, writeMu *sync.Mutex, line string) {
 	writeMu.Lock()
 	defer writeMu.Unlock()
 	_ = conn.WriteMessage(websocket.TextMessage, []byte(line+"\r\n"))
+}
+
+func formatRetentionCutoff(cutoff time.Time) string {
+	if cutoff.IsZero() {
+		return "-"
+	}
+	return cutoff.Format(time.RFC3339)
 }
 
 func (a *API) staticFallback(w http.ResponseWriter, r *http.Request) {

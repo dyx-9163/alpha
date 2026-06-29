@@ -57,3 +57,7 @@
 - 结论：已新增后端 `security.LoginGuard`，按账号+来源统计失败次数并临时锁定；新增 `AIFAR_AUTH_MAX_FAILURES`、`AIFAR_AUTH_LOCKOUT_SECONDS` 到配置和 `defaults.env`；登录失败达到阈值后返回 429 和 `Retry-After`，并记录 `auth.login.locked` 审计；设置接口只读暴露当前锁定策略；`pnpm test` 已通过。
 - 问题：持续目标推进，补齐企业级 Web 安全基线，要求统一安全响应头和请求体大小限制。
 - 结论：已新增 HTTP 安全头中间件，统一输出 `X-Content-Type-Options`、`X-Frame-Options`、`Referrer-Policy`、`Permissions-Policy`；新增 `AIFAR_MAX_REQUEST_BODY_BYTES` 配置和 `defaults.env` 默认值，请求体超限返回 413；设置接口只读暴露当前 body 限制；新增 HTTP 测试覆盖安全头、413 和设置响应，`pnpm test` 与 `pnpm web:build` 已通过。
+- 问题：用户明确后续“只把代码提交到本地仓库就行”，不再要求每次推送 GitHub。
+- 结论：后续每轮调整完成后只执行本地 commit，不再尝试 `git push`，除非用户之后再次明确要求推送。
+- 问题：持续目标推进，补齐企业级长期运行下的任务与审计日志保留清理能力，避免 SQLite 控制面数据无限增长。
+- 结论：已新增 `AIFAR_AUDIT_RETENTION_DAYS`、`AIFAR_TASK_RETENTION_DAYS` 配置和设置页展示；新增后端 `maintenance` 服务、`POST /api/v2/maintenance/retention/run` 维护任务入口，按步骤清理过期审计日志和已结束任务；store 层支持按截止时间级联删除任务日志/步骤/目标；设置页新增“执行保留清理”按钮；`pnpm test` 与 `pnpm web:build` 已通过。

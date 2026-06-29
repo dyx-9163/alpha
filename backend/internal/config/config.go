@@ -22,6 +22,8 @@ type Config struct {
 	AuthMaxFailures       int    `json:"authMaxFailures"`
 	AuthLockoutSeconds    int    `json:"authLockoutSeconds"`
 	MaxRequestBodyBytes   int64  `json:"maxRequestBodyBytes"`
+	AuditRetentionDays    int    `json:"auditRetentionDays"`
+	TaskRetentionDays     int    `json:"taskRetentionDays"`
 }
 
 func Load() Config {
@@ -44,6 +46,8 @@ func Load() Config {
 		AuthMaxFailures:       getenvInt("AIFAR_AUTH_MAX_FAILURES", 5),
 		AuthLockoutSeconds:    getenvInt("AIFAR_AUTH_LOCKOUT_SECONDS", 300),
 		MaxRequestBodyBytes:   getenvInt64("AIFAR_MAX_REQUEST_BODY_BYTES", 1<<20),
+		AuditRetentionDays:    getenvInt("AIFAR_AUDIT_RETENTION_DAYS", 180),
+		TaskRetentionDays:     getenvInt("AIFAR_TASK_RETENTION_DAYS", 90),
 	}
 	return cfg
 }
