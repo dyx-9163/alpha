@@ -1,5 +1,8 @@
 # AIFAR Memory
 
+- 问题：用户上传 MySQL 安装日志，显示已有数据目录时服务已 `active (running)`，但旧脚本停在 `waiting for MySQL socket` 并报 `MySQL socket is not ready after installation`。
+- 结论：该日志命中已修复问题，原因是运行的仍是旧后端/旧打包产物；当前源码已改为 `waiting for MySQL service readiness`，已有数据目录会用配置管理员密码探测并输出凭据不匹配提示，需要重新构建并重启后端后再安装。
+
 本文件记录后续对话的精简问题与结论。每次开始先读，结束前追加。禁止写入密码、token、私钥、完整连接串和长日志。
 
 ## 2026-06-29
