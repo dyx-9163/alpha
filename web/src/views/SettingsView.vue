@@ -29,80 +29,14 @@
         <span class="subtle-note">{{ t('settings.concurrencyNote') }}</span>
       </div>
 
-      <div class="settings-block">
-        <label>{{ t('settings.dataMaintenance') }}</label>
-        <KeyValueGrid :items="maintenanceItems" class="retention-grid" />
-        <div class="retention-actions">
-          <el-tooltip :content="deniedText" :disabled="canManageSettings" placement="top">
-            <span>
-              <el-button :loading="backupRunning" :disabled="!canManageSettings" @click="runDatabaseBackup">
-                {{ t('settings.runDatabaseBackup') }}
-              </el-button>
-            </span>
-          </el-tooltip>
-          <el-tooltip :content="deniedText" :disabled="canManageSettings" placement="top">
-            <span>
-              <el-button type="primary" :loading="retentionRunning" :disabled="!canManageSettings" @click="runRetentionCleanup">
-                {{ t('settings.runRetentionCleanup') }}
-              </el-button>
-            </span>
-          </el-tooltip>
-        </div>
-        <span class="subtle-note">{{ t('settings.retentionNote') }}</span>
-        <DataTable
-          class="backup-table"
-          :rows="backups as unknown as Record<string, unknown>[]"
-          :columns="backupColumns"
-          :title="t('settings.databaseBackups')"
-          row-key="name"
-          :height="260"
-          :loading="backupsLoading"
-        >
-          <template #toolbar>
-            <el-button size="small" :disabled="!canManageSettings" @click="loadBackups">{{ t('common.refresh') }}</el-button>
-          </template>
-          <template #size="{ row }">
-            {{ formatBytes(row.size) }}
-          </template>
-          <template #createdAt="{ row }">
-            {{ formatDate(row.createdAt) }}
-          </template>
-          <template #action="{ row }">
-            <div class="backup-actions">
-              <el-tooltip :content="deniedText" :disabled="canManageSettings" placement="top">
-                <span>
-                  <el-button size="small" :disabled="!canManageSettings" @click="verifyBackup(row.name)">
-                    {{ t('common.check') }}
-                  </el-button>
-                </span>
-              </el-tooltip>
-              <el-tooltip :content="deniedText" :disabled="canManageSettings" placement="top">
-                <span>
-                  <el-button size="small" :disabled="!canManageSettings" @click="downloadBackup(row.name)">
-                    {{ t('common.download') }}
-                  </el-button>
-                </span>
-              </el-tooltip>
-              <ConfirmAction
-                :message="t('settings.confirmDeleteBackup', { name: row.name })"
-                :disabled="!canManageSettings"
-                type="warning"
-                @confirm="deleteBackup(row.name)"
-              >
-                <template #default="{ confirm }">
-                  <el-tooltip :content="deniedText" :disabled="canManageSettings" placement="top">
-                    <span>
-                      <el-button size="small" type="danger" :disabled="!canManageSettings" @click="confirm">
-                        {{ t('common.delete') }}
-                      </el-button>
-                    </span>
-                  </el-tooltip>
-                </template>
-              </ConfirmAction>
-            </div>
-          </template>
-        </DataTable>
-      </div>
+      <DataMaintenancePanel
+        ref="maintenancePanel"
+        :backup-dir="form.databaseBackupDir"
+        :audit-retention-days="form.auditRetentionDays"
+        :task-retention-days="form.taskRetentionDays"
+        :can-manage="canManageSettings"
+        :disabled-reason="deniedText"
+      />
 
       <el-alert
         :title="t('settings.realModeTitle')"
@@ -112,21 +46,7 @@
         show-icon
       />
 
-      <h2 class="settings-title">{{ t('settings.healthStatus') }}</h2>
-      <KeyValueGrid :items="healthItems" class="provider-grid">
-        <template #value="{ item }">
-          <StatusTag v-if="item.key === 'status'" :status="String(item.value)" />
-          <span v-else>{{ item.value || '-' }}</span>
-        </template>
-      </KeyValueGrid>
-      <el-table :data="healthRows">
-        <el-table-column prop="name" :label="t('common.module')" width="180" />
-        <el-table-column :label="t('common.status')" width="120">
-          <template #default="{ row }"><StatusTag :status="row.status" /></template>
-        </el-table-column>
-        <el-table-column prop="message" :label="t('common.message')" min-width="180" />
-        <el-table-column prop="path" :label="t('settings.path')" min-width="260" show-overflow-tooltip />
-      </el-table>
+      <ControlPlaneHealthPanel ref="healthPanel" />
 
       <h2 class="settings-title">{{ t('settings.providerStatus') }}</h2>
       <KeyValueGrid :items="providerItems" class="provider-grid">
@@ -151,24 +71,24 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref } from 'vue'
 import { ElMessage } from 'element-plus'
-import { apiDelete, apiDownload, apiGet, apiPost, apiPut } from '../api/client'
-import ConfirmAction from '../components/ConfirmAction.vue'
-import DataTable from '../components/DataTable.vue'
+import { apiGet, apiPut } from '../api/client'
+import ControlPlaneHealthPanel from '../components/ControlPlaneHealthPanel.vue'
+import DataMaintenancePanel from '../components/DataMaintenancePanel.vue'
 import KeyValueGrid from '../components/KeyValueGrid.vue'
-import StatusTag from '../components/StatusTag.vue'
 import { usePermissions } from '../composables/usePermissions'
 import { useI18n } from '../i18n'
 import { permissions } from '../rbac'
+
+type RefreshablePanel = {
+  refresh: () => Promise<void> | void
+}
 
 const { locale, setLocale, t } = useI18n()
 const { can, deniedText } = usePermissions()
 const form = reactive<any>({ language: locale.value, deploymentConcurrency: 2, moduleStatus: {} })
 const now = ref('')
-const backupRunning = ref(false)
-const backupsLoading = ref(false)
-const retentionRunning = ref(false)
-const backups = ref<DatabaseBackup[]>([])
-const health = ref<HealthReport | null>(null)
+const maintenancePanel = ref<RefreshablePanel | null>(null)
+const healthPanel = ref<RefreshablePanel | null>(null)
 const platform = navigator.platform.toLowerCase().includes('win') ? 'windows' : 'linux'
 const providerModeLabel = computed(() => {
   const mode = form.providerStatus || form.providerMode || 'real'
@@ -188,45 +108,6 @@ const providerItems = computed(() => [
   { key: 'defaultDeployDir', label: t('settings.defaultDeployDir'), value: form.defaultDeployDir },
   { key: 'confirm', label: t('settings.dangerousActionsRequire'), value: t('settings.confirmTrue') }
 ])
-const maintenanceItems = computed(() => [
-  { key: 'databaseBackupDir', label: t('settings.databaseBackupDir'), value: form.databaseBackupDir },
-  { key: 'auditRetentionDays', label: t('settings.auditRetention'), value: formatRetentionDays(form.auditRetentionDays) },
-  { key: 'taskRetentionDays', label: t('settings.taskRetention'), value: formatRetentionDays(form.taskRetentionDays) }
-])
-const healthItems = computed(() => [
-  { key: 'status', label: t('common.status'), value: health.value?.status || 'unknown' },
-  { key: 'checkedAt', label: t('settings.checkedAt'), value: formatDate(health.value?.checkedAt) }
-])
-const healthRows = computed(() => {
-  const components = health.value?.components || {}
-  return Object.entries(components).map(([name, component]) => ({
-    name,
-    status: component.status || 'unknown',
-    message: component.message || '-',
-    path: component.details?.path || '-'
-  }))
-})
-const backupColumns = computed(() => [
-  { prop: 'name', label: t('settings.backupName'), minWidth: 240 },
-  { prop: 'size', label: t('settings.backupSize'), width: 120, slot: 'size' },
-  { prop: 'sha256', label: t('settings.backupChecksum'), minWidth: 240 },
-  { prop: 'createdAt', label: t('common.time'), width: 190, slot: 'createdAt' },
-  { label: t('common.operation'), width: 230, slot: 'action', fixed: 'right' as const }
-])
-
-type DatabaseBackup = {
-  name: string
-  path: string
-  size: number
-  sha256: string
-  createdAt: string
-}
-
-type HealthReport = {
-  status: string
-  checkedAt: string
-  components: Record<string, { status: string; message?: string; details?: Record<string, unknown> }>
-}
 
 function moduleMessage(module: string) {
   const key = `settings.moduleMessages.${module}`
@@ -245,7 +126,7 @@ async function load() {
   form.language = locale.value
   form.deploymentConcurrency = Number(form.deploymentConcurrency)
   now.value = new Date().toISOString()
-  await Promise.all([loadBackups(), loadHealth()])
+  await Promise.all([maintenancePanel.value?.refresh(), healthPanel.value?.refresh()])
 }
 async function save() {
   if (!canManageSettings.value) {
@@ -257,140 +138,6 @@ async function save() {
   form.language = locale.value
   form.deploymentConcurrency = Number(form.deploymentConcurrency)
   now.value = new Date().toISOString()
-}
-
-async function runRetentionCleanup() {
-  if (!canManageSettings.value) {
-    ElMessage.warning(deniedText.value)
-    return
-  }
-  retentionRunning.value = true
-  try {
-    await apiPost('/maintenance/retention/run')
-    ElMessage.success(t('settings.retentionCleanupAccepted'))
-  } catch (err) {
-    ElMessage.error(err instanceof Error ? err.message : t('settings.retentionCleanupFailed'))
-  } finally {
-    retentionRunning.value = false
-  }
-}
-
-async function runDatabaseBackup() {
-  if (!canManageSettings.value) {
-    ElMessage.warning(deniedText.value)
-    return
-  }
-  backupRunning.value = true
-  try {
-    await apiPost('/maintenance/database-backup/run')
-    ElMessage.success(t('settings.databaseBackupAccepted'))
-    window.setTimeout(() => void loadBackups(), 800)
-  } catch (err) {
-    ElMessage.error(err instanceof Error ? err.message : t('settings.databaseBackupFailed'))
-  } finally {
-    backupRunning.value = false
-  }
-}
-
-async function loadBackups() {
-  if (!canManageSettings.value) {
-    backups.value = []
-    return
-  }
-  backupsLoading.value = true
-  try {
-    const res = await apiGet<{ items?: DatabaseBackup[] }>('/maintenance/database-backups')
-    backups.value = Array.isArray(res.items) ? res.items : []
-  } catch {
-    backups.value = []
-  } finally {
-    backupsLoading.value = false
-  }
-}
-
-async function loadHealth() {
-  health.value = await apiGet<HealthReport>('/health').catch(() => null)
-}
-
-async function deleteBackup(name: unknown) {
-  if (!canManageSettings.value || typeof name !== 'string') {
-    ElMessage.warning(deniedText.value)
-    return
-  }
-  try {
-    await apiDelete('/maintenance/database-backups', { names: [name] })
-    ElMessage.success(t('settings.backupDeleted'))
-    await loadBackups()
-  } catch (err) {
-    ElMessage.error(err instanceof Error ? err.message : t('settings.backupDeleteFailed'))
-  }
-}
-
-async function downloadBackup(name: unknown) {
-  if (!canManageSettings.value || typeof name !== 'string') {
-    ElMessage.warning(deniedText.value)
-    return
-  }
-  try {
-    const file = await apiDownload(`/maintenance/database-backups/${encodeURIComponent(name)}/download`)
-    const url = URL.createObjectURL(file.blob)
-    const link = document.createElement('a')
-    link.href = url
-    link.download = file.filename || name
-    document.body.appendChild(link)
-    link.click()
-    link.remove()
-    URL.revokeObjectURL(url)
-    ElMessage.success(t('settings.backupDownloadStarted'))
-  } catch (err) {
-    ElMessage.error(err instanceof Error ? err.message : t('settings.backupDownloadFailed'))
-  }
-}
-
-async function verifyBackup(name: unknown) {
-  if (!canManageSettings.value || typeof name !== 'string') {
-    ElMessage.warning(deniedText.value)
-    return
-  }
-  try {
-    await apiPost(`/maintenance/database-backups/${encodeURIComponent(name)}/verify`)
-    ElMessage.success(t('settings.backupVerifyAccepted'))
-  } catch (err) {
-    ElMessage.error(err instanceof Error ? err.message : t('settings.backupVerifyFailed'))
-  }
-}
-
-function formatRetentionDays(value: unknown) {
-  const count = Number(value)
-  if (!Number.isFinite(count) || count < 1) {
-    return '-'
-  }
-  return t('settings.days', { count })
-}
-
-function formatBytes(value: unknown) {
-  const bytes = Number(value)
-  if (!Number.isFinite(bytes) || bytes < 0) {
-    return '-'
-  }
-  if (bytes < 1024) {
-    return `${bytes} B`
-  }
-  if (bytes < 1024 * 1024) {
-    return `${(bytes / 1024).toFixed(1)} KiB`
-  }
-  return `${(bytes / 1024 / 1024).toFixed(1)} MiB`
-}
-
-function formatDate(value: unknown) {
-  if (!value) {
-    return '-'
-  }
-  const date = new Date(String(value))
-  if (Number.isNaN(date.getTime())) {
-    return String(value)
-  }
-  return date.toLocaleString()
 }
 onMounted(load)
 </script>
@@ -433,34 +180,8 @@ onMounted(load)
   grid-template-columns: minmax(150px, 180px) minmax(0, 1fr);
 }
 
-.retention-grid {
-  grid-template-columns: minmax(150px, 180px) minmax(0, 1fr);
-}
-
-.retention-actions {
-  margin-top: 12px;
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-}
-
-.backup-table {
-  height: 300px;
-  margin-top: 12px;
-  border: 1px solid var(--aifar-border-soft);
-  border-radius: var(--aifar-radius-md);
-  overflow: hidden;
-}
-
-.backup-actions {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-
 @media (max-width: 720px) {
-  .provider-grid,
-  .retention-grid {
+  .provider-grid {
     grid-template-columns: 120px minmax(0, 1fr);
   }
 }

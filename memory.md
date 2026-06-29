@@ -73,3 +73,5 @@
 - 结论：后续优化优先保持功能之间清晰解耦、复用公共组件和公共能力，但避免为了抽象而抽象；简单功能可直接放在现有模块中，防止形成代码屎山或过度工程化。
 - 问题：持续目标推进，补齐控制面自身健康检查能力，便于企业部署后接入进程守护、反向代理和监控探活。
 - 结论：新增 `GET /api/v2/health/live`、`GET /api/v2/health/ready` 无鉴权探活接口，登录后 `GET /api/v2/health` 返回数据库、资源目录、静态目录和备份目录状态；store 新增轻量 `Ping()`；设置页新增“控制面健康”展示并复用现有 `KeyValueGrid`/`StatusTag`；`StatusTag` 支持 `ok/degraded`；新增 HTTP 测试覆盖 live/ready/detail；`pnpm test` 与 `pnpm web:build` 已通过。
+- 问题：用户要求优化不要过度精细化，当前设置页的数据维护和控制面健康逻辑开始堆在页面里，需要按功能边界解耦但避免设计模式化。
+- 结论：新增 `DataMaintenancePanel.vue` 和 `ControlPlaneHealthPanel.vue`，设置页只保留语言、并发、服务商/模块状态等页面编排；数据备份/清理和健康探活各自组件化管理，`pnpm web:build` 与 `pnpm test` 通过。
