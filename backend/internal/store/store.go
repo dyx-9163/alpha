@@ -53,7 +53,7 @@ func (s *Store) migrate() error {
 	schema := []string{
 		`create table if not exists users (
 			id text primary key, username text not null unique, role text not null,
-			password_hash text not null, created_at datetime not null
+			token_version integer not null default 1, password_hash text not null, created_at datetime not null
 		)`,
 		`create table if not exists servers (
 			id text primary key, name text not null, host text not null, port integer not null,
@@ -119,6 +119,9 @@ func (s *Store) migrate() error {
 	if err := s.ensureColumn("servers", "sort_order", `alter table servers add column sort_order integer not null default 0`); err != nil {
 		return err
 	}
+	if err := s.ensureColumn("users", "token_version", `alter table users add column token_version integer not null default 1`); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -160,8 +163,8 @@ func (s *Store) BootstrapUser(username, password string) error {
 	if err != nil {
 		return err
 	}
-	_, err = s.db.Exec(`insert into users(id, username, role, password_hash, created_at) values(?,?,?,?,?)`,
-		NewID("usr"), username, "owner", string(hash), time.Now())
+	_, err = s.db.Exec(`insert into users(id, username, role, token_version, password_hash, created_at) values(?,?,?,?,?,?)`,
+		NewID("usr"), username, "owner", 1, string(hash), time.Now())
 	return err
 }
 
@@ -170,20 +173,36 @@ func (s *Store) ResetUserPassword(username, password string) error {
 	if err != nil {
 		return err
 	}
-	res, err := s.db.Exec(`update users set password_hash=? where username=?`, string(hash), username)
+	res, err := s.db.Exec(`update users set password_hash=?, token_version=coalesce(token_version, 1)+1 where username=?`, string(hash), username)
 	if err != nil {
 		return err
 	}
 	if rows, _ := res.RowsAffected(); rows > 0 {
 		return nil
 	}
-	_, err = s.db.Exec(`insert into users(id, username, role, password_hash, created_at) values(?,?,?,?,?)`,
-		NewID("usr"), username, "owner", string(hash), time.Now())
+	_, err = s.db.Exec(`insert into users(id, username, role, token_version, password_hash, created_at) values(?,?,?,?,?,?)`,
+		NewID("usr"), username, "owner", 1, string(hash), time.Now())
 	return err
 }
 
+func (s *Store) SetUserRole(username, role string) error {
+	username = strings.TrimSpace(username)
+	role = strings.TrimSpace(role)
+	if username == "" || role == "" {
+		return errors.New("username and role are required")
+	}
+	res, err := s.db.Exec(`update users set role=?, token_version=coalesce(token_version, 1)+1 where username=?`, role, username)
+	if err != nil {
+		return err
+	}
+	if rows, _ := res.RowsAffected(); rows == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
 func (s *Store) ListUsers() ([]UserSummary, error) {
-	rows, err := s.db.Query(`select id, username, role, created_at from users order by created_at`)
+	rows, err := s.db.Query(`select id, username, role, coalesce(token_version,1), created_at from users order by created_at`)
 	if err != nil {
 		return nil, err
 	}
@@ -191,7 +210,7 @@ func (s *Store) ListUsers() ([]UserSummary, error) {
 	out := []UserSummary{}
 	for rows.Next() {
 		var u UserSummary
-		if err := rows.Scan(&u.ID, &u.Username, &u.Role, &u.CreatedAt); err != nil {
+		if err := rows.Scan(&u.ID, &u.Username, &u.Role, &u.TokenVersion, &u.CreatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, u)
@@ -212,8 +231,15 @@ func (s *Store) CountRows(table string) (int, error) {
 
 func (s *Store) UserByUsername(username string) (User, error) {
 	var u User
-	err := s.db.QueryRow(`select id, username, role, password_hash, created_at from users where username = ?`, username).
-		Scan(&u.ID, &u.Username, &u.Role, &u.PasswordHash, &u.CreatedAt)
+	err := s.db.QueryRow(`select id, username, role, coalesce(token_version,1), password_hash, created_at from users where username = ?`, username).
+		Scan(&u.ID, &u.Username, &u.Role, &u.TokenVersion, &u.PasswordHash, &u.CreatedAt)
+	return u, err
+}
+
+func (s *Store) UserByID(id string) (User, error) {
+	var u User
+	err := s.db.QueryRow(`select id, username, role, coalesce(token_version,1), password_hash, created_at from users where id = ?`, id).
+		Scan(&u.ID, &u.Username, &u.Role, &u.TokenVersion, &u.PasswordHash, &u.CreatedAt)
 	return u, err
 }
 

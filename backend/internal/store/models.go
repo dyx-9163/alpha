@@ -6,15 +6,17 @@ type User struct {
 	ID           string    `json:"id"`
 	Username     string    `json:"username"`
 	Role         string    `json:"role"`
+	TokenVersion int       `json:"tokenVersion"`
 	PasswordHash string    `json:"-"`
 	CreatedAt    time.Time `json:"createdAt"`
 }
 
 type UserSummary struct {
-	ID        string    `json:"id"`
-	Username  string    `json:"username"`
-	Role      string    `json:"role"`
-	CreatedAt time.Time `json:"createdAt"`
+	ID           string    `json:"id"`
+	Username     string    `json:"username"`
+	Role         string    `json:"role"`
+	TokenVersion int       `json:"tokenVersion"`
+	CreatedAt    time.Time `json:"createdAt"`
 }
 
 type Server struct {

@@ -1,7 +1,11 @@
 <template>
   <PageShell class="apps-page" :title="t('apps.title')" :subtitle="t('apps.subtitle')">
     <template #actions>
-      <el-button @click="rescan">{{ t('common.refresh') }}</el-button>
+      <el-tooltip :content="deniedText" :disabled="canScanResources" placement="top">
+        <span>
+          <el-button :disabled="!canScanResources" @click="rescan">{{ t('common.refresh') }}</el-button>
+        </span>
+      </el-tooltip>
     </template>
 
     <el-tabs v-model="activeTab" class="aifar-panel top-tabs">
@@ -80,6 +84,9 @@
           :instances="instances"
           :servers="servers"
           show-actions
+          :can-check="canManageApps"
+          :can-delete="canManageApps"
+          :disabled-reason="deniedText"
           @check="checkDeploymentService"
           @delete="deleteDeploymentService"
         />
@@ -128,9 +135,12 @@ import type { AppFrontendModule, AppInstallPayload, ServerOption } from '../apps
 import AppInstanceTable from '../components/AppInstanceTable.vue'
 import PageShell from '../components/PageShell.vue'
 import SecretConfirmPrompt from '../components/SecretConfirmPrompt.vue'
+import { usePermissions } from '../composables/usePermissions'
 import { useI18n } from '../i18n'
+import { permissions } from '../rbac'
 
 const { t } = useI18n()
+const { can, deniedText } = usePermissions()
 const router = useRouter()
 const backendCatalog = ref<AppCatalogResponse>({})
 const instances = ref<AppInstanceTableRecord[]>([])
@@ -145,6 +155,8 @@ const deletePromptVisible = ref(false)
 const deleteSubmitting = ref(false)
 const pendingDeleteService = ref<AppInstanceTableRecord | null>(null)
 const locale = computed(() => resolveAppLocale())
+const canManageApps = computed(() => can(permissions.appsManage))
+const canScanResources = computed(() => can(permissions.resourcesScan))
 
 const apps = computed(() => pairedAppCatalog(backendCatalog.value, locale.value))
 const filteredApps = computed(() => (category.value === 'all' ? apps.value : apps.value.filter((app) => app.category === category.value)))
@@ -177,6 +189,9 @@ function missingText(app: AppStoreItem) {
 }
 
 function deployDisabledReason(app: AppStoreItem) {
+  if (!canManageApps.value) {
+    return deniedText.value
+  }
   if (!app.backendReady) {
     return t('apps.missingBackend')
   }
@@ -209,11 +224,19 @@ async function load() {
 }
 
 async function rescan() {
+  if (!canScanResources.value) {
+    ElMessage.warning(deniedText.value)
+    return
+  }
   await apiPost('/resources/rescan')
   backendCatalog.value = await apiGet<AppCatalogResponse>(`/apps/catalog?lang=${locale.value}`).catch(() => ({}))
 }
 
 async function submitModuleInstall(payload: AppInstallPayload) {
+  if (!canManageApps.value) {
+    ElMessage.warning(deniedText.value)
+    return
+  }
   const app = moduleDialogApp.value
   if (!app) {
     return
@@ -232,6 +255,10 @@ async function submitModuleInstall(payload: AppInstallPayload) {
 }
 
 async function checkDeploymentService(row: AppInstanceTableRecord) {
+  if (!canManageApps.value) {
+    ElMessage.warning(deniedText.value)
+    return
+  }
   try {
     const result = await apiPost<{ taskId: string }>(`/apps/instances/${row.id}/check`, {
       language: locale.value
@@ -244,6 +271,10 @@ async function checkDeploymentService(row: AppInstanceTableRecord) {
 }
 
 function deleteDeploymentService(row: AppInstanceTableRecord) {
+  if (!canManageApps.value) {
+    ElMessage.warning(deniedText.value)
+    return
+  }
   pendingDeleteService.value = row
   deletePromptVisible.value = true
 }

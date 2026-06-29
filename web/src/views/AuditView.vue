@@ -12,13 +12,17 @@
           :title="t('common.delete')"
           :confirm-text="t('common.delete')"
           :cancel-text="t('common.cancel')"
-          :disabled="!selectedRows.length"
+          :disabled="!canManageAudit || !selectedRows.length"
           @confirm="deleteSelected"
         >
           <template #default="{ confirm }">
-            <el-button type="danger" plain :disabled="!selectedRows.length" @click="confirm">
-              {{ t('audit.deleteSelected', { count: selectedRows.length }) }}
-            </el-button>
+            <el-tooltip :content="deniedText" :disabled="canManageAudit || !deniedText" placement="top">
+              <span>
+                <el-button type="danger" plain :disabled="!canManageAudit || !selectedRows.length" @click="confirm">
+                  {{ t('audit.deleteSelected', { count: selectedRows.length }) }}
+                </el-button>
+              </span>
+            </el-tooltip>
           </template>
         </ConfirmAction>
       </div>
@@ -78,12 +82,14 @@
 </template>
 
 <script setup lang="ts">
-import { onMounted, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { apiDelete, apiGet, asArray } from '../api/client'
 import ConfirmAction from '../components/ConfirmAction.vue'
+import { usePermissions } from '../composables/usePermissions'
 import StatusTag from '../components/StatusTag.vue'
 import { useI18n } from '../i18n'
+import { permissions } from '../rbac'
 
 type AuditItem = {
   id: number
@@ -103,6 +109,7 @@ type AuditPage = {
 }
 
 const { t } = useI18n()
+const { can, deniedText } = usePermissions()
 const items = ref<AuditItem[]>([])
 const selectedRows = ref<AuditItem[]>([])
 const moduleFilter = ref('')
@@ -111,6 +118,7 @@ const page = ref(1)
 const pageSize = ref(20)
 const total = ref(0)
 const modules = ['auth', 'apps', 'servers', 'tasks', 'audit', 'containers', 'database', 'storage', 'settings', 'resources', 'terminal']
+const canManageAudit = computed(() => can(permissions.auditManage))
 
 async function load() {
   const params = new URLSearchParams({
@@ -139,6 +147,10 @@ async function resetAndLoad() {
 }
 
 async function deleteSelected() {
+  if (!canManageAudit.value) {
+    ElMessage.warning(deniedText.value)
+    return
+  }
   const ids = selectedRows.value.map((item) => item.id).filter(Boolean)
   if (!ids.length) {
     return

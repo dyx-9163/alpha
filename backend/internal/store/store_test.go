@@ -15,8 +15,12 @@ func TestBootstrapUserAndServerLifecycle(t *testing.T) {
 	if err := db.BootstrapUser("admin", "secret"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.UserByUsername("admin"); err != nil {
+	user, err := db.UserByUsername("admin")
+	if err != nil {
 		t.Fatal(err)
+	}
+	if user.TokenVersion != 1 {
+		t.Fatalf("expected bootstrap token version 1, got %d", user.TokenVersion)
 	}
 	server, err := db.SaveServer(Server{Name: "node-1", Host: "127.0.0.1", Username: "root"})
 	if err != nil {
@@ -34,6 +38,44 @@ func TestBootstrapUserAndServerLifecycle(t *testing.T) {
 	}
 	if len(servers) != 1 {
 		t.Fatalf("expected one server, got %d", len(servers))
+	}
+}
+
+func TestUserTokenVersionChangesOnPasswordAndRoleUpdate(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "aifar.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.ResetUserPassword("ops", "first"); err != nil {
+		t.Fatal(err)
+	}
+	user, err := db.UserByUsername("ops")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if user.TokenVersion != 1 {
+		t.Fatalf("expected initial token version 1, got %d", user.TokenVersion)
+	}
+	if err := db.ResetUserPassword("ops", "second"); err != nil {
+		t.Fatal(err)
+	}
+	user, err = db.UserByUsername("ops")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if user.TokenVersion != 2 {
+		t.Fatalf("expected password reset to increment token version to 2, got %d", user.TokenVersion)
+	}
+	if err := db.SetUserRole("ops", "operator"); err != nil {
+		t.Fatal(err)
+	}
+	user, err = db.UserByUsername("ops")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if user.Role != "operator" || user.TokenVersion != 3 {
+		t.Fatalf("expected role update to increment version, got role=%s version=%d", user.Role, user.TokenVersion)
 	}
 }
 

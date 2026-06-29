@@ -22,7 +22,11 @@
       <el-form-item :label="t('servers.note')"><el-input v-model="form.note" type="textarea" :rows="3" /></el-form-item>
       <div class="drawer-actions">
         <el-button @click="visible = false">{{ t('common.cancel') }}</el-button>
-        <el-button type="primary" @click="$emit('save')">{{ t('servers.save') }}</el-button>
+        <el-tooltip :content="props.disabledReason" :disabled="props.canSave || !props.disabledReason" placement="top">
+          <span>
+            <el-button type="primary" :disabled="!props.canSave" @click="$emit('save')">{{ t('servers.save') }}</el-button>
+          </span>
+        </el-tooltip>
       </div>
     </el-form>
   </el-drawer>
@@ -34,7 +38,10 @@ import { useI18n } from '../../i18n'
 import type { ServerFormModel } from '../types'
 
 const visible = defineModel<boolean>('visible', { default: false })
-const props = defineProps<{ form: ServerFormModel }>()
+const props = withDefaults(defineProps<{ form: ServerFormModel; canSave?: boolean; disabledReason?: string }>(), {
+  canSave: true,
+  disabledReason: ''
+})
 defineEmits<{ save: [] }>()
 const { t } = useI18n()
 const title = computed(() => props.form.id ? t('servers.editTitle') : t('servers.createTitle'))

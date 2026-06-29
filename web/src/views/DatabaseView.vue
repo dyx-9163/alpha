@@ -54,8 +54,12 @@
               <div><span>{{ t('common.status') }}</span><StatusTag :status="item.status" /></div>
             </div>
             <div class="card-actions">
-              <el-button size="small" @click="checkInstance(item.id)">{{ t('common.check') }}</el-button>
-              <el-button size="small" type="primary" plain @click="backupInstance(item.id)">{{ t('database.backupNow') }}</el-button>
+              <el-tooltip :content="deniedText" :disabled="canManageApps" placement="top">
+                <span><el-button size="small" :disabled="!canManageApps" @click="checkInstance(item.id)">{{ t('common.check') }}</el-button></span>
+              </el-tooltip>
+              <el-tooltip :content="deniedText" :disabled="canManageDatabase" placement="top">
+                <span><el-button size="small" type="primary" plain :disabled="!canManageDatabase" @click="backupInstance(item.id)">{{ t('database.backupNow') }}</el-button></span>
+              </el-tooltip>
             </div>
           </article>
         </div>
@@ -88,7 +92,9 @@ import { apiGet, apiPost, asArray } from '../api/client'
 import KeyValueGrid from '../components/KeyValueGrid.vue'
 import RunRecordTable from '../components/RunRecordTable.vue'
 import StatusTag from '../components/StatusTag.vue'
+import { usePermissions } from '../composables/usePermissions'
 import { useI18n } from '../i18n'
+import { permissions } from '../rbac'
 
 type AppInstance = {
   id: string
@@ -102,6 +108,7 @@ type AppInstance = {
 }
 
 const { t } = useI18n()
+const { can, deniedText } = usePermissions()
 const router = useRouter()
 const instances = ref<AppInstance[]>([])
 const servers = ref<any[]>([])
@@ -110,6 +117,8 @@ const tab = ref('instances')
 const search = ref('')
 const mysqlCount = computed(() => instances.value.filter((item) => item.app === 'mysql').length)
 const redisCount = computed(() => instances.value.filter((item) => item.app === 'redis').length)
+const canManageDatabase = computed(() => can(permissions.databaseManage))
+const canManageApps = computed(() => can(permissions.appsManage))
 const filteredInstances = computed(() => {
   const q = search.value.trim().toLowerCase()
   if (!q) return instances.value
@@ -148,6 +157,10 @@ function serverName(id: string) {
 }
 
 async function backupInstance(id: string) {
+  if (!canManageDatabase.value) {
+    ElMessage.warning(deniedText.value)
+    return
+  }
   const result = await apiPost<{ taskId: string }>(`/database/instances/${id}/backup`)
   ElMessage.success(t('database.backupAccepted'))
   await load()
@@ -155,6 +168,10 @@ async function backupInstance(id: string) {
 }
 
 async function checkInstance(id: string) {
+  if (!canManageApps.value) {
+    ElMessage.warning(deniedText.value)
+    return
+  }
   const result = await apiPost<{ taskId: string }>(`/apps/instances/${id}/check`)
   ElMessage.success(t('apps.checkServiceAccepted'))
   void router.push({ path: '/tasks', query: { taskId: result.taskId } })

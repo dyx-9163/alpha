@@ -22,7 +22,9 @@
         <label>{{ t('settings.concurrency') }}</label>
         <div class="head-actions">
           <el-input-number v-model="form.deploymentConcurrency" :min="1" :max="20" />
-          <el-button type="primary" @click="save">{{ t('common.save') }}</el-button>
+          <el-tooltip :content="deniedText" :disabled="canManageSettings" placement="top">
+            <span><el-button type="primary" :disabled="!canManageSettings" @click="save">{{ t('common.save') }}</el-button></span>
+          </el-tooltip>
         </div>
         <span class="subtle-note">{{ t('settings.concurrencyNote') }}</span>
       </div>
@@ -57,11 +59,15 @@
 
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref } from 'vue'
+import { ElMessage } from 'element-plus'
 import { apiGet, apiPut } from '../api/client'
 import KeyValueGrid from '../components/KeyValueGrid.vue'
+import { usePermissions } from '../composables/usePermissions'
 import { useI18n } from '../i18n'
+import { permissions } from '../rbac'
 
 const { locale, setLocale, t } = useI18n()
+const { can, deniedText } = usePermissions()
 const form = reactive<any>({ language: locale.value, deploymentConcurrency: 2, moduleStatus: {} })
 const now = ref('')
 const platform = navigator.platform.toLowerCase().includes('win') ? 'windows' : 'linux'
@@ -69,6 +75,7 @@ const providerModeLabel = computed(() => {
   const mode = form.providerStatus || form.providerMode || 'real'
   return mode === 'real' ? t('common.real') : mode
 })
+const canManageSettings = computed(() => can(permissions.settingsManage))
 const moduleRows = computed(() => {
   const modules = form.moduleStatus ?? {}
   return Object.keys(modules).map((module) => ({ module, message: moduleMessage(module), time: now.value }))
@@ -102,6 +109,10 @@ async function load() {
   now.value = new Date().toISOString()
 }
 async function save() {
+  if (!canManageSettings.value) {
+    ElMessage.warning(deniedText.value)
+    return
+  }
   setLocale(form.language)
   Object.assign(form, await apiPut('/settings', { language: form.language, deploymentConcurrency: form.deploymentConcurrency }))
   form.language = locale.value

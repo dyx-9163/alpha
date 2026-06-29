@@ -12,11 +12,13 @@
           :title="t('tasks.clearLogs')"
           :confirm-text="t('tasks.clearLogs')"
           :cancel-text="t('common.cancel')"
-          :disabled="!selectedTaskId"
+          :disabled="!canManage || !selectedTaskId"
           @confirm="clearCurrentTaskLogs"
         >
           <template #default="{ confirm }">
-            <el-button size="small" :disabled="!selectedTaskId" @click="confirm">{{ t('tasks.clearLogs') }}</el-button>
+            <el-tooltip :content="disabledReason" :disabled="canManage || !disabledReason" placement="top">
+              <span><el-button size="small" :disabled="!canManage || !selectedTaskId" @click="confirm">{{ t('tasks.clearLogs') }}</el-button></span>
+            </el-tooltip>
           </template>
         </ConfirmAction>
         <ConfirmAction
@@ -24,25 +26,33 @@
           :title="t('tasks.clearLogs')"
           :confirm-text="t('tasks.clearLogs')"
           :cancel-text="t('common.cancel')"
-          :disabled="!selectedTaskIds.length"
+          :disabled="!canManage || !selectedTaskIds.length"
           @confirm="clearSelectedTaskLogs"
         >
           <template #default="{ confirm }">
-            <el-button size="small" :disabled="!selectedTaskIds.length" @click="confirm">
-              {{ t('tasks.clearSelectedLogs', { count: selectedTaskIds.length }) }}
-            </el-button>
+            <el-tooltip :content="disabledReason" :disabled="canManage || !disabledReason" placement="top">
+              <span>
+                <el-button size="small" :disabled="!canManage || !selectedTaskIds.length" @click="confirm">
+                  {{ t('tasks.clearSelectedLogs', { count: selectedTaskIds.length }) }}
+                </el-button>
+              </span>
+            </el-tooltip>
           </template>
         </ConfirmAction>
         <DangerConfirm
           :title="deleteConfirmText"
           :confirm-text="t('common.delete')"
           :cancel-text="t('common.cancel')"
-          :disabled="!selectedTaskId && !selectedTaskIds.length"
+          :disabled="!canManage || (!selectedTaskId && !selectedTaskIds.length)"
           @confirm="deleteSelectedTask"
         >
-          <el-button size="small" type="danger" plain :disabled="!selectedTaskId && !selectedTaskIds.length">
-            {{ selectedTaskIds.length ? t('tasks.deleteSelected', { count: selectedTaskIds.length }) : t('tasks.deleteTask') }}
-          </el-button>
+          <el-tooltip :content="disabledReason" :disabled="canManage || !disabledReason" placement="top">
+            <span>
+              <el-button size="small" type="danger" plain :disabled="!canManage || (!selectedTaskId && !selectedTaskIds.length)">
+                {{ selectedTaskIds.length ? t('tasks.deleteSelected', { count: selectedTaskIds.length }) : t('tasks.deleteTask') }}
+              </el-button>
+            </span>
+          </el-tooltip>
         </DangerConfirm>
       </div>
     </div>
@@ -127,8 +137,13 @@ type ServerSummary = {
   host?: string
 }
 
-const props = defineProps<{ taskId?: string; typePrefix?: string }>()
+const props = withDefaults(defineProps<{ taskId?: string; typePrefix?: string; canManage?: boolean; disabledReason?: string }>(), {
+  canManage: true,
+  disabledReason: ''
+})
 const { t } = useI18n()
+const canManage = computed(() => props.canManage)
+const disabledReason = computed(() => props.disabledReason)
 
 const tasks = ref<Task[]>([])
 const servers = ref<ServerSummary[]>([])
@@ -221,6 +236,10 @@ function mergeLog(log: TaskLog) {
 }
 
 async function clearCurrentTaskLogs() {
+  if (!props.canManage) {
+    ElMessage.warning(props.disabledReason)
+    return
+  }
   if (!selectedTaskId.value || !detail.value) {
     return
   }
@@ -234,6 +253,10 @@ async function clearCurrentTaskLogs() {
 }
 
 async function clearSelectedTaskLogs() {
+  if (!props.canManage) {
+    ElMessage.warning(props.disabledReason)
+    return
+  }
   const ids = selectedTaskIds.value.slice()
   if (!ids.length) {
     return
@@ -252,6 +275,10 @@ async function clearSelectedTaskLogs() {
 }
 
 async function deleteSelectedTask() {
+  if (!props.canManage) {
+    ElMessage.warning(props.disabledReason)
+    return
+  }
   const ids = selectedTaskIds.value.length ? selectedTaskIds.value : selectedTaskId.value ? [selectedTaskId.value] : []
   if (!ids.length) {
     return

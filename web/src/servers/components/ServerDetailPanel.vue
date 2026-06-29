@@ -7,9 +7,15 @@
           <p>{{ server.username }}@{{ server.host }}:{{ server.port }}</p>
         </div>
         <div class="head-actions">
-          <el-button @click="$emit('edit', server)">{{ t('servers.edit') }}</el-button>
-          <el-button :loading="props.probing" @click="$emit('probe', server)">{{ t('servers.probe') }}</el-button>
-          <el-button type="danger" @click="$emit('remove', server)">{{ t('common.delete') }}</el-button>
+          <el-tooltip :content="props.disabledReason" :disabled="props.canManage || !props.disabledReason" placement="top">
+            <span><el-button :disabled="!props.canManage" @click="$emit('edit', server)">{{ t('servers.edit') }}</el-button></span>
+          </el-tooltip>
+          <el-tooltip :content="props.disabledReason" :disabled="props.canManage || !props.disabledReason" placement="top">
+            <span><el-button :loading="props.probing" :disabled="!props.canManage" @click="$emit('probe', server)">{{ t('servers.probe') }}</el-button></span>
+          </el-tooltip>
+          <el-tooltip :content="props.disabledReason" :disabled="props.canManage || !props.disabledReason" placement="top">
+            <span><el-button type="danger" :disabled="!props.canManage" @click="$emit('remove', server)">{{ t('common.delete') }}</el-button></span>
+          </el-tooltip>
         </div>
       </div>
 
@@ -72,8 +78,10 @@ import StatusTag from '../../components/StatusTag.vue'
 import { useI18n } from '../../i18n'
 import type { ServerRecord } from '../types'
 
-const props = withDefaults(defineProps<{ server: ServerRecord | null, probing?: boolean }>(), {
-  probing: false
+const props = withDefaults(defineProps<{ server: ServerRecord | null, probing?: boolean, canManage?: boolean, disabledReason?: string }>(), {
+  probing: false,
+  canManage: true,
+  disabledReason: ''
 })
 const tab = defineModel<string>('activeTab', { default: 'overview' })
 defineEmits<{

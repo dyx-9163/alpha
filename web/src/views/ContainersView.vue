@@ -59,9 +59,15 @@
           <el-table-column :label="t('common.operation')" width="280" fixed="right">
             <template #default="{ row }">
               <div class="row-actions">
-                <el-button size="small" @click="runContainerAction(row.id, 'start')">{{ t('containers.start') }}</el-button>
-                <el-button size="small" @click="runContainerAction(row.id, 'stop')">{{ t('containers.stop') }}</el-button>
-                <el-button size="small" @click="runContainerAction(row.id, 'restart')">{{ t('containers.restart') }}</el-button>
+                <el-tooltip :content="deniedText" :disabled="canManageContainers" placement="top">
+                  <span><el-button size="small" :disabled="!canManageContainers" @click="runContainerAction(row.id, 'start')">{{ t('containers.start') }}</el-button></span>
+                </el-tooltip>
+                <el-tooltip :content="deniedText" :disabled="canManageContainers" placement="top">
+                  <span><el-button size="small" :disabled="!canManageContainers" @click="runContainerAction(row.id, 'stop')">{{ t('containers.stop') }}</el-button></span>
+                </el-tooltip>
+                <el-tooltip :content="deniedText" :disabled="canManageContainers" placement="top">
+                  <span><el-button size="small" :disabled="!canManageContainers" @click="runContainerAction(row.id, 'restart')">{{ t('containers.restart') }}</el-button></span>
+                </el-tooltip>
                 <el-button size="small" @click="openLogs(row.id)">{{ t('containers.logs') }}</el-button>
               </div>
             </template>
@@ -129,7 +135,9 @@ import LogDrawer from '../components/LogDrawer.vue'
 import MetricGrid from '../components/MetricGrid.vue'
 import ServerSelector from '../components/ServerSelector.vue'
 import StatusTag from '../components/StatusTag.vue'
+import { usePermissions } from '../composables/usePermissions'
 import { useI18n } from '../i18n'
+import { permissions } from '../rbac'
 
 type DockerSummaryResponse = {
   available?: boolean
@@ -139,6 +147,7 @@ type DockerSummaryResponse = {
 }
 
 const { t } = useI18n()
+const { can, deniedText } = usePermissions()
 const selectedServerId = ref('')
 const servers = ref<any[]>([])
 const summary = ref<DockerSummaryResponse>({})
@@ -147,6 +156,7 @@ const error = ref('')
 const tab = ref('overview')
 const logsVisible = ref(false)
 const logsText = ref('')
+const canManageContainers = computed(() => can(permissions.containersManage))
 
 const summaryData = computed(() => summary.value.summary ?? {})
 const selectedServer = computed(() => servers.value.find((server) => server.id === selectedServerId.value) ?? null)
@@ -249,6 +259,10 @@ async function loadActive() {
 }
 
 async function runContainerAction(id: string, action: string) {
+  if (!canManageContainers.value) {
+    ElMessage.warning(deniedText.value)
+    return
+  }
   const query = targetQuery()
   if (!query) {
     ElMessage.warning(t('containers.selectDockerHost'))

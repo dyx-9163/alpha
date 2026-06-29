@@ -7,7 +7,11 @@
       </div>
       <div class="head-actions">
         <el-button @click="load">{{ t('servers.refresh') }}</el-button>
-        <el-button type="primary" @click="open()">{{ t('servers.add') }}</el-button>
+        <el-tooltip :content="deniedText" :disabled="canManageServers" placement="top">
+          <span>
+            <el-button type="primary" :disabled="!canManageServers" @click="openServerForm()">{{ t('servers.add') }}</el-button>
+          </span>
+        </el-tooltip>
       </div>
     </div>
 
@@ -17,36 +21,43 @@
       <ServerInventoryList
         :servers="filteredServers"
         :selected-id="selectedId"
-        :drag-disabled="Boolean(search.trim())"
+        :drag-disabled="Boolean(search.trim()) || !canManageServers"
         v-model:search="search"
         @select="selectedId = $event"
-        @reorder="reorder"
+        @reorder="reorderServers"
       />
 
       <ServerDetailPanel
         :server="selectedServer"
         :probing="selectedProbing"
+        :can-manage="canManageServers"
+        :disabled-reason="deniedText"
         v-model:active-tab="activeTab"
-        @edit="open"
-        @probe="probe"
-        @remove="remove"
+        @edit="openServerForm"
+        @probe="probeServerHost"
+        @remove="removeServer"
       />
     </div>
 
-    <ServerFormDrawer v-model:visible="drawer" :form="form" @save="save" />
+    <ServerFormDrawer v-model:visible="drawer" :form="form" :can-save="canManageServers" :disabled-reason="deniedText" @save="saveServerForm" />
   </section>
 </template>
 
 <script setup lang="ts">
 import { computed, onMounted } from 'vue'
+import { ElMessage } from 'element-plus'
 import MetricGrid from '../components/MetricGrid.vue'
+import { usePermissions } from '../composables/usePermissions'
 import { useI18n } from '../i18n'
+import { permissions } from '../rbac'
 import ServerDetailPanel from '../servers/components/ServerDetailPanel.vue'
 import ServerFormDrawer from '../servers/components/ServerFormDrawer.vue'
 import ServerInventoryList from '../servers/components/ServerInventoryList.vue'
 import { useServerWorkbench } from '../servers/useServerWorkbench'
 
 const { t } = useI18n()
+const { can, deniedText } = usePermissions()
+const canManageServers = computed(() => can(permissions.serversManage))
 const {
   filteredServers,
   selectedServer,
@@ -77,8 +88,43 @@ const serverMetrics = computed(() => [
 onMounted(async () => {
   await loadDefaults()
   await load()
-  await probeSelectedOnce()
+  if (canManageServers.value) {
+    await probeSelectedOnce()
+  }
 })
+
+function ensureServerPermission() {
+  if (canManageServers.value) {
+    return true
+  }
+  ElMessage.warning(deniedText.value)
+  return false
+}
+
+function openServerForm(row?: Parameters<typeof open>[0]) {
+  if (!ensureServerPermission()) return
+  open(row)
+}
+
+async function saveServerForm() {
+  if (!ensureServerPermission()) return
+  await save()
+}
+
+async function removeServer(row: Parameters<typeof remove>[0]) {
+  if (!ensureServerPermission()) return
+  await remove(row)
+}
+
+async function probeServerHost(row: Parameters<typeof probe>[0]) {
+  if (!ensureServerPermission()) return
+  await probe(row)
+}
+
+async function reorderServers(ids: string[]) {
+  if (!ensureServerPermission()) return
+  await reorder(ids)
+}
 </script>
 
 <style scoped>

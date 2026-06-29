@@ -11,9 +11,10 @@ import (
 )
 
 type Claims struct {
-	UserID   string `json:"userId"`
-	Username string `json:"username"`
-	Role     string `json:"role"`
+	UserID       string `json:"userId"`
+	Username     string `json:"username"`
+	Role         string `json:"role"`
+	TokenVersion int    `json:"tokenVersion"`
 	jwt.RegisteredClaims
 }
 
@@ -23,10 +24,15 @@ func CheckPassword(hash, password string) error {
 
 func IssueToken(secret string, user store.User) (string, error) {
 	now := time.Now()
+	tokenVersion := user.TokenVersion
+	if tokenVersion < 1 {
+		tokenVersion = 1
+	}
 	claims := Claims{
-		UserID:   user.ID,
-		Username: user.Username,
-		Role:     user.Role,
+		UserID:       user.ID,
+		Username:     user.Username,
+		Role:         user.Role,
+		TokenVersion: tokenVersion,
 		RegisteredClaims: jwt.RegisteredClaims{
 			Subject:   user.ID,
 			IssuedAt:  jwt.NewNumericDate(now),

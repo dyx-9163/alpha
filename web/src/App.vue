@@ -32,26 +32,28 @@
 </template>
 
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, type Component } from 'vue'
 import { Box, Coin, FolderOpened, List, Monitor, Odometer, Operation, Setting, Shop, Tickets } from '@element-plus/icons-vue'
 import zhCn from 'element-plus/es/locale/lang/zh-cn'
 import en from 'element-plus/es/locale/lang/en'
 import { useRouter } from 'vue-router'
 import { useSessionStore } from './stores/session'
 import { useI18n } from './i18n'
+import { permissions, type Permission } from './rbac'
 
 const router = useRouter()
 const session = useSessionStore()
 const { locale, t } = useI18n()
 const elementLocale = computed(() => locale.value === 'en' ? en : zhCn)
-const navItems = [
+const navItems = computed(() => allNavItems.filter((item) => !item.permission || session.hasPermission(item.permission)))
+const allNavItems: Array<{ path: string; labelKey: string; icon: Component; permission?: Permission }> = [
   { path: '/dashboard', labelKey: 'nav.dashboard', icon: Odometer },
   { path: '/apps', labelKey: 'nav.apps', icon: Shop },
   { path: '/servers', labelKey: 'nav.servers', icon: Monitor },
   { path: '/containers', labelKey: 'nav.containers', icon: Box },
   { path: '/database', labelKey: 'nav.database', icon: Coin },
   { path: '/storage', labelKey: 'nav.storage', icon: FolderOpened },
-  { path: '/terminal', labelKey: 'nav.terminal', icon: Operation },
+  { path: '/terminal', labelKey: 'nav.terminal', icon: Operation, permission: permissions.terminalConnect },
   { path: '/tasks', labelKey: 'nav.tasks', icon: List },
   { path: '/audit', labelKey: 'nav.audit', icon: Tickets },
   { path: '/settings', labelKey: 'nav.settings', icon: Setting }

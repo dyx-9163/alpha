@@ -9,7 +9,9 @@
         <el-select v-model="serverId" :placeholder="t('terminal.server')" class="toolbar-control">
           <el-option v-for="server in servers" :key="server.id" :label="server.name" :value="server.id" />
         </el-select>
-        <el-button type="primary" :disabled="!serverId" @click="connect">{{ t('terminal.connect') }}</el-button>
+        <el-tooltip :content="deniedText" :disabled="canConnectTerminal" placement="top">
+          <span><el-button type="primary" :disabled="!canConnectTerminal || !serverId" @click="connect">{{ t('terminal.connect') }}</el-button></span>
+        </el-tooltip>
         <el-button @click="newTab">{{ t('terminal.newTab') }}</el-button>
         <el-button @click="$router.push('/servers')">{{ t('terminal.openServers') }}</el-button>
       </div>
@@ -25,7 +27,9 @@
           <span>{{ connected ? t('common.connected') : t('common.disconnected') }}</span>
         </div>
         <div class="head-actions">
-          <el-button size="small" type="primary" :disabled="!serverId" @click="connect">{{ t('terminal.connect') }}</el-button>
+          <el-tooltip :content="deniedText" :disabled="canConnectTerminal" placement="top">
+            <span><el-button size="small" type="primary" :disabled="!canConnectTerminal || !serverId" @click="connect">{{ t('terminal.connect') }}</el-button></span>
+          </el-tooltip>
           <el-button size="small" @click="disconnect">{{ t('terminal.disconnect') }}</el-button>
         </div>
       </div>
@@ -36,11 +40,15 @@
 
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
+import { ElMessage } from 'element-plus'
 import { Terminal } from '@xterm/xterm'
 import { apiGet, asArray, terminalProtocols, terminalUrl } from '../api/client'
+import { usePermissions } from '../composables/usePermissions'
 import { useI18n } from '../i18n'
+import { permissions } from '../rbac'
 
 const { t } = useI18n()
+const { can, deniedText } = usePermissions()
 const servers = ref<any[]>([])
 const serverId = ref('')
 const terminalEl = ref<HTMLElement>()
@@ -52,12 +60,17 @@ let socket: WebSocket | null = null
 let resizeObserver: ResizeObserver | null = null
 const currentServer = computed(() => servers.value.find((server) => server.id === serverId.value))
 const tabLabel = computed(() => currentServer.value ? `${currentServer.value.name} - ${connected.value ? t('common.connected') : t('terminal.ready')}` : t('terminal.tab'))
+const canConnectTerminal = computed(() => can(permissions.terminalConnect))
 
 async function load() {
   servers.value = asArray(await apiGet<any[] | null>('/servers').catch(() => []))
   if (!serverId.value && servers.value.length) serverId.value = servers.value[0].id
 }
 function connect() {
+  if (!canConnectTerminal.value) {
+    ElMessage.warning(deniedText.value)
+    return
+  }
   if (!terminalEl.value || !serverId.value) return
   terminalEl.value.textContent = ''
   terminal?.dispose()

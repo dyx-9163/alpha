@@ -31,12 +31,24 @@
           <el-select v-if="tab === 'instances'" v-model="serverId" :placeholder="t('database.targetServer')" class="toolbar-control">
             <el-option v-for="server in servers" :key="server.id" :label="server.name" :value="server.id" />
           </el-select>
-          <el-button v-if="tab === 'instances'" type="primary" @click="installMinio">{{ t('storage.install') }}</el-button>
-          <el-button v-if="tab === 'buckets'" type="primary" @click="openItemDialog('bucket')">{{ t('storage.addBucket') }}</el-button>
-          <el-button v-if="tab === 'objects'" type="primary" @click="openItemDialog('object')">{{ t('storage.addObject') }}</el-button>
-          <el-button v-if="tab === 'access'" @click="openItemDialog('user')">{{ t('storage.addUser') }}</el-button>
-          <el-button v-if="tab === 'access'" type="primary" @click="openItemDialog('accessKey')">{{ t('storage.addAccessKey') }}</el-button>
-          <el-button v-if="tab === 'replica'" type="primary" @click="openItemDialog('replica')">{{ t('storage.addReplica') }}</el-button>
+          <el-tooltip :content="deniedText" :disabled="canManageStorage" placement="top">
+            <span><el-button v-if="tab === 'instances'" type="primary" :disabled="!canManageStorage" @click="installMinio">{{ t('storage.install') }}</el-button></span>
+          </el-tooltip>
+          <el-tooltip :content="deniedText" :disabled="canManageStorage" placement="top">
+            <span><el-button v-if="tab === 'buckets'" type="primary" :disabled="!canManageStorage" @click="openItemDialog('bucket')">{{ t('storage.addBucket') }}</el-button></span>
+          </el-tooltip>
+          <el-tooltip :content="deniedText" :disabled="canManageStorage" placement="top">
+            <span><el-button v-if="tab === 'objects'" type="primary" :disabled="!canManageStorage" @click="openItemDialog('object')">{{ t('storage.addObject') }}</el-button></span>
+          </el-tooltip>
+          <el-tooltip :content="deniedText" :disabled="canManageStorage" placement="top">
+            <span><el-button v-if="tab === 'access'" :disabled="!canManageStorage" @click="openItemDialog('user')">{{ t('storage.addUser') }}</el-button></span>
+          </el-tooltip>
+          <el-tooltip :content="deniedText" :disabled="canManageStorage" placement="top">
+            <span><el-button v-if="tab === 'access'" type="primary" :disabled="!canManageStorage" @click="openItemDialog('accessKey')">{{ t('storage.addAccessKey') }}</el-button></span>
+          </el-tooltip>
+          <el-tooltip :content="deniedText" :disabled="canManageStorage" placement="top">
+            <span><el-button v-if="tab === 'replica'" type="primary" :disabled="!canManageStorage" @click="openItemDialog('replica')">{{ t('storage.addReplica') }}</el-button></span>
+          </el-tooltip>
           <el-button @click="loadActive">{{ t('storage.refreshStatus') }}</el-button>
         </div>
       </div>
@@ -73,10 +85,13 @@
                     :title="t('common.delete')"
                     :confirm-text="t('common.delete')"
                     :cancel-text="t('common.cancel')"
+                    :disabled="!canManageStorage"
                     @confirm="deleteItem('user', row.id)"
                   >
                     <template #default="{ confirm }">
-                      <el-button size="small" type="danger" plain @click="confirm">{{ t('common.delete') }}</el-button>
+                      <el-tooltip :content="deniedText" :disabled="canManageStorage" placement="top">
+                        <span><el-button size="small" type="danger" plain :disabled="!canManageStorage" @click="confirm">{{ t('common.delete') }}</el-button></span>
+                      </el-tooltip>
                     </template>
                   </ConfirmAction>
                 </template>
@@ -96,10 +111,13 @@
                     :title="t('common.delete')"
                     :confirm-text="t('common.delete')"
                     :cancel-text="t('common.cancel')"
+                    :disabled="!canManageStorage"
                     @confirm="deleteItem('accessKey', row.id)"
                   >
                     <template #default="{ confirm }">
-                      <el-button size="small" type="danger" plain @click="confirm">{{ t('common.delete') }}</el-button>
+                      <el-tooltip :content="deniedText" :disabled="canManageStorage" placement="top">
+                        <span><el-button size="small" type="danger" plain :disabled="!canManageStorage" @click="confirm">{{ t('common.delete') }}</el-button></span>
+                      </el-tooltip>
                     </template>
                   </ConfirmAction>
                 </template>
@@ -135,10 +153,13 @@
                   :title="t('common.delete')"
                   :confirm-text="t('common.delete')"
                   :cancel-text="t('common.cancel')"
+                  :disabled="!canManageStorage"
                   @confirm="deleteItem(activeKind, row.id)"
                 >
                   <template #default="{ confirm }">
-                    <el-button size="small" type="danger" plain @click="confirm">{{ t('common.delete') }}</el-button>
+                    <el-tooltip :content="deniedText" :disabled="canManageStorage" placement="top">
+                      <span><el-button size="small" type="danger" plain :disabled="!canManageStorage" @click="confirm">{{ t('common.delete') }}</el-button></span>
+                    </el-tooltip>
                   </template>
                 </ConfirmAction>
               </template>
@@ -166,7 +187,9 @@
       </el-form>
       <template #footer>
         <el-button @click="itemDialogVisible = false">{{ t('common.cancel') }}</el-button>
-        <el-button type="primary" @click="saveItem">{{ t('common.save') }}</el-button>
+        <el-tooltip :content="deniedText" :disabled="canManageStorage" placement="top">
+          <span><el-button type="primary" :disabled="!canManageStorage" @click="saveItem">{{ t('common.save') }}</el-button></span>
+        </el-tooltip>
       </template>
     </el-dialog>
   </section>
@@ -181,7 +204,9 @@ import ConfirmAction from '../components/ConfirmAction.vue'
 import KeyValueGrid from '../components/KeyValueGrid.vue'
 import RunRecordTable from '../components/RunRecordTable.vue'
 import StatusTag from '../components/StatusTag.vue'
+import { usePermissions } from '../composables/usePermissions'
 import { useI18n } from '../i18n'
+import { permissions } from '../rbac'
 
 type AppInstance = {
   id: string
@@ -196,6 +221,7 @@ type AppInstance = {
 type StorageKind = 'bucket' | 'object' | 'user' | 'accessKey' | 'replica'
 
 const { t } = useI18n()
+const { can, deniedText } = usePermissions()
 const router = useRouter()
 const instances = ref<AppInstance[]>([])
 const servers = ref<any[]>([])
@@ -214,6 +240,7 @@ const collection = reactive<Record<string, any[]>>({
   accessKeys: [],
   replicas: []
 })
+const canManageStorage = computed(() => can(permissions.storageManage))
 
 const filteredInstances = computed(() => {
   const q = search.value.trim().toLowerCase()
@@ -273,11 +300,19 @@ async function loadCollection(kind: StorageKind) {
 }
 
 async function installMinio() {
+  if (!canManageStorage.value) {
+    ElMessage.warning(deniedText.value)
+    return
+  }
   const result = await apiPost<{ taskId: string }>('/storage/instances', { serverId: serverId.value, version: 'latest' })
   void router.push({ path: '/tasks', query: { taskId: result.taskId } })
 }
 
 function openItemDialog(kind: StorageKind) {
+  if (!canManageStorage.value) {
+    ElMessage.warning(deniedText.value)
+    return
+  }
   if (!selectedInstanceId.value) {
     ElMessage.warning(t('storage.noInstanceSelected'))
     return
@@ -291,6 +326,10 @@ function openItemDialog(kind: StorageKind) {
 }
 
 async function saveItem() {
+  if (!canManageStorage.value) {
+    ElMessage.warning(deniedText.value)
+    return
+  }
   await apiPost(collectionPath(itemKind.value), { ...itemForm })
   ElMessage.success(t('storage.itemSaved'))
   itemDialogVisible.value = false
@@ -298,6 +337,10 @@ async function saveItem() {
 }
 
 async function deleteItem(kind: StorageKind, id: string) {
+  if (!canManageStorage.value) {
+    ElMessage.warning(deniedText.value)
+    return
+  }
   await apiDelete(`${collectionPath(kind)}/${encodeURIComponent(id)}`)
   ElMessage.success(t('storage.itemDeleted'))
   await loadActive()

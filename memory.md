@@ -41,3 +41,11 @@
 - 结论：已新增后端 `taskplan` 统一安装计划落库，并让应用安装入口复用该模块；前端新增 `LogOutput`、`LogDrawer`，容器日志抽屉和任务运行详情已复用公共日志输出；`pnpm web:build` 和 `pnpm test` 已通过。
 - 问题：持续目标推进，继续收敛远程资源上传链路和运维概览展示。
 - 结论：已新增后端 `installer/uploadkit` 统一上传日志、mode、失败包装和 RPM 清单展开，Docker/MySQL/Redis/MinIO 安装器已接入；前端新增 `KeyValueGrid`、`MetricGrid`，容器、Dashboard、服务器、数据库、对象存储、设置页面已复用；`pnpm web:build` 和 `pnpm test` 已通过。
+- 问题：持续目标推进，补强企业级任务日志、审计日志和错误字段的敏感信息保护。
+- 结论：已新增后端 `logmask` 统一脱敏和 `auditkit` 统一审计入口；任务 target/error/log、任务目标/步骤错误、服务器 lastError、审计 target/message 落库前均会脱敏；`httpapi` 审计入口已接入 `auditkit`，`pnpm test` 已通过。
+- 问题：持续目标推进，补齐企业级后端权限边界，避免登录用户默认拥有所有高风险操作能力。
+- 结论：已新增后端 `rbac` 权限模型，定义 owner/admin/operator/viewer/auditor 与 settings/resources/servers/terminal/tasks/audit/apps/containers/database/storage 权限点；HTTP 高风险写操作、终端入口和审计删除已接入 `requirePermission`，权限拒绝支持中英文文案；新增 HTTP 路由级权限测试，`pnpm test` 已通过。
+- 问题：持续目标推进，补强 RBAC 后的会话一致性，避免改密码或角色变更后旧 token 继续生效。
+- 结论：已为用户表新增 `token_version` 迁移，JWT claims 携带版本号；`ResetUserPassword` 和 `SetUserRole` 会递增版本，`requireAuth` 会校验用户仍存在、版本一致，并用数据库当前角色刷新请求上下文；登录响应返回 `tokenVersion` 和权限列表；新增旧 token 被密码重置撤销的 HTTP 测试，`pnpm test` 已通过。
+- 问题：用户要求持续优化并新增“每次调整完成后推送 GitHub”的流程要求，本轮推进 RBAC 前端体验闭环。
+- 结论：已新增前端 `rbac.ts` 与 `usePermissions`，session 持久化后端返回的权限列表；终端菜单/路由、应用安装/检测/删除、服务器保存/探测/删除/排序、任务清理/删除、审计删除、资源重扫、设置保存、容器启停、数据库备份/检测、对象存储写操作均按权限禁用或拦截；401 会清理本地 session；`pnpm web:build` 和 `pnpm test` 已通过。

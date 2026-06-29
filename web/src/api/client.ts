@@ -16,12 +16,23 @@ function headers(json = true) {
 async function handle<T>(response: Response): Promise<T> {
   if (!response.ok) {
     const body = await response.json().catch(() => ({ message: response.statusText }))
+    if (response.status === 401) {
+      clearLocalSession()
+    }
     const err = new Error(body.message ?? response.statusText) as ApiError
     err.status = response.status
     err.details = body.details
     throw err
   }
   return response.json()
+}
+
+function clearLocalSession() {
+  localStorage.removeItem('aifar-session-token')
+  localStorage.removeItem('aifar-username')
+  localStorage.removeItem('aifar-role')
+  localStorage.removeItem('aifar-token-version')
+  localStorage.removeItem('aifar-permissions')
 }
 
 export function apiGet<T>(path: string) {

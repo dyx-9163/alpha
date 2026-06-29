@@ -21,6 +21,7 @@ import (
 	"aifar-deployment/backend/internal/auth"
 	"aifar-deployment/backend/internal/config"
 	"aifar-deployment/backend/internal/i18n"
+	"aifar-deployment/backend/internal/rbac"
 	"aifar-deployment/backend/internal/resource"
 	serverdomain "aifar-deployment/backend/internal/servers"
 	"aifar-deployment/backend/internal/store"
@@ -57,62 +58,62 @@ func New(cfg config.Config, s *store.Store, tasks *worker.Manager) *API {
 		r.Group(func(r chi.Router) {
 			r.Use(api.requireAuth)
 			r.Get("/settings", api.getSettings)
-			r.Put("/settings", api.putSettings)
+			r.Put("/settings", api.requirePermission(rbac.SettingsManage, api.putSettings))
 			r.Get("/resources", api.listResources)
-			r.Post("/resources/rescan", api.rescanResources)
+			r.Post("/resources/rescan", api.requirePermission(rbac.ResourcesScan, api.rescanResources))
 			r.Get("/servers", api.listServers)
-			r.Post("/servers", api.saveServer)
-			r.Put("/servers/order", api.reorderServers)
-			r.Put("/servers/{id}", api.saveServer)
-			r.Delete("/servers/{id}", api.deleteServer)
-			r.Post("/servers/{id}/probe", api.probeServer)
+			r.Post("/servers", api.requirePermission(rbac.ServersManage, api.saveServer))
+			r.Put("/servers/order", api.requirePermission(rbac.ServersManage, api.reorderServers))
+			r.Put("/servers/{id}", api.requirePermission(rbac.ServersManage, api.saveServer))
+			r.Delete("/servers/{id}", api.requirePermission(rbac.ServersManage, api.deleteServer))
+			r.Post("/servers/{id}/probe", api.requirePermission(rbac.ServersManage, api.probeServer))
 			r.Get("/servers/{id}/telemetry", api.serverTelemetry)
-			r.Get("/servers/{id}/terminal/ws", api.serverTerminal)
+			r.Get("/servers/{id}/terminal/ws", api.requirePermission(rbac.TerminalConnect, api.serverTerminal))
 			r.Get("/tasks", api.listTasks)
 			r.Get("/tasks/{id}", api.getTask)
 			r.Get("/tasks/{id}/events", api.taskEvents)
-			r.Post("/tasks/{id}/cancel", api.cancelTask)
-			r.Delete("/tasks/logs", api.clearTaskLogsBatch)
-			r.Delete("/tasks", api.deleteTasks)
-			r.Delete("/tasks/{id}", api.deleteTask)
-			r.Delete("/tasks/{id}/logs", api.clearTaskLogs)
+			r.Post("/tasks/{id}/cancel", api.requirePermission(rbac.TasksManage, api.cancelTask))
+			r.Delete("/tasks/logs", api.requirePermission(rbac.TasksManage, api.clearTaskLogsBatch))
+			r.Delete("/tasks", api.requirePermission(rbac.TasksManage, api.deleteTasks))
+			r.Delete("/tasks/{id}", api.requirePermission(rbac.TasksManage, api.deleteTask))
+			r.Delete("/tasks/{id}/logs", api.requirePermission(rbac.TasksManage, api.clearTaskLogs))
 			r.Get("/audit", api.listAudit)
-			r.Delete("/audit", api.deleteAudit)
+			r.Delete("/audit", api.requirePermission(rbac.AuditManage, api.deleteAudit))
 			r.Get("/apps/catalog", api.appsCatalog)
 			r.Get("/apps/instances", api.appInstances)
-			r.Post("/apps/{app}/install", api.installApp)
-			r.Post("/apps/instances/{id}/upgrade", api.instanceAction("upgrade"))
-			r.Post("/apps/instances/{id}/check", api.checkAppInstance)
-			r.Post("/apps/instances/{id}/delete", api.deleteAppInstance)
-			r.Post("/apps/instances/{id}/uninstall", api.deleteAppInstance)
+			r.Post("/apps/{app}/install", api.requirePermission(rbac.AppsManage, api.installApp))
+			r.Post("/apps/instances/{id}/upgrade", api.requirePermission(rbac.AppsManage, api.instanceAction("upgrade")))
+			r.Post("/apps/instances/{id}/check", api.requirePermission(rbac.AppsManage, api.checkAppInstance))
+			r.Post("/apps/instances/{id}/delete", api.requirePermission(rbac.AppsManage, api.deleteAppInstance))
+			r.Post("/apps/instances/{id}/uninstall", api.requirePermission(rbac.AppsManage, api.deleteAppInstance))
 			r.Get("/containers/summary", api.containerSummary)
 			r.Get("/containers", api.containers)
-			r.Post("/containers/{id}/start", api.containerAction("start"))
-			r.Post("/containers/{id}/stop", api.containerAction("stop"))
-			r.Post("/containers/{id}/restart", api.containerAction("restart"))
+			r.Post("/containers/{id}/start", api.requirePermission(rbac.ContainersManage, api.containerAction("start")))
+			r.Post("/containers/{id}/stop", api.requirePermission(rbac.ContainersManage, api.containerAction("stop")))
+			r.Post("/containers/{id}/restart", api.requirePermission(rbac.ContainersManage, api.containerAction("restart")))
 			r.Get("/containers/{id}/logs", api.containerLogs)
-			r.Get("/containers/{id}/terminal/ws", api.containerTerminal)
+			r.Get("/containers/{id}/terminal/ws", api.requirePermission(rbac.TerminalConnect, api.containerTerminal))
 			r.Get("/database/instances", api.databaseInstances)
-			r.Post("/database/instances/{id}/backup", api.databaseBackup)
-			r.Post("/database/mysql/install", api.installNamedApp("mysql"))
-			r.Post("/database/redis/install", api.installNamedApp("redis"))
+			r.Post("/database/instances/{id}/backup", api.requirePermission(rbac.DatabaseManage, api.databaseBackup))
+			r.Post("/database/mysql/install", api.requirePermission(rbac.DatabaseManage, api.installNamedApp("mysql")))
+			r.Post("/database/redis/install", api.requirePermission(rbac.DatabaseManage, api.installNamedApp("redis")))
 			r.Get("/storage/instances", api.storageInstances)
-			r.Post("/storage/instances", api.createStorageInstance)
+			r.Post("/storage/instances", api.requirePermission(rbac.StorageManage, api.createStorageInstance))
 			r.Get("/storage/{id}/buckets", api.storageCollection("buckets"))
-			r.Post("/storage/{id}/buckets", api.createStorageItem("bucket"))
-			r.Delete("/storage/{id}/buckets/{itemId}", api.deleteStorageItem("bucket"))
+			r.Post("/storage/{id}/buckets", api.requirePermission(rbac.StorageManage, api.createStorageItem("bucket")))
+			r.Delete("/storage/{id}/buckets/{itemId}", api.requirePermission(rbac.StorageManage, api.deleteStorageItem("bucket")))
 			r.Get("/storage/{id}/objects", api.storageCollection("objects"))
-			r.Post("/storage/{id}/objects", api.createStorageItem("object"))
-			r.Delete("/storage/{id}/objects/{itemId}", api.deleteStorageItem("object"))
+			r.Post("/storage/{id}/objects", api.requirePermission(rbac.StorageManage, api.createStorageItem("object")))
+			r.Delete("/storage/{id}/objects/{itemId}", api.requirePermission(rbac.StorageManage, api.deleteStorageItem("object")))
 			r.Get("/storage/{id}/users", api.storageCollection("users"))
-			r.Post("/storage/{id}/users", api.createStorageItem("user"))
-			r.Delete("/storage/{id}/users/{itemId}", api.deleteStorageItem("user"))
+			r.Post("/storage/{id}/users", api.requirePermission(rbac.StorageManage, api.createStorageItem("user")))
+			r.Delete("/storage/{id}/users/{itemId}", api.requirePermission(rbac.StorageManage, api.deleteStorageItem("user")))
 			r.Get("/storage/{id}/access-keys", api.storageCollection("accessKeys"))
-			r.Post("/storage/{id}/access-keys", api.createStorageItem("accessKey"))
-			r.Delete("/storage/{id}/access-keys/{itemId}", api.deleteStorageItem("accessKey"))
+			r.Post("/storage/{id}/access-keys", api.requirePermission(rbac.StorageManage, api.createStorageItem("accessKey")))
+			r.Delete("/storage/{id}/access-keys/{itemId}", api.requirePermission(rbac.StorageManage, api.deleteStorageItem("accessKey")))
 			r.Get("/storage/{id}/replicas", api.storageCollection("replicas"))
-			r.Post("/storage/{id}/replicas", api.createStorageItem("replica"))
-			r.Delete("/storage/{id}/replicas/{itemId}", api.deleteStorageItem("replica"))
+			r.Post("/storage/{id}/replicas", api.requirePermission(rbac.StorageManage, api.createStorageItem("replica")))
+			r.Delete("/storage/{id}/replicas/{itemId}", api.requirePermission(rbac.StorageManage, api.deleteStorageItem("replica")))
 		})
 	})
 	r.NotFound(api.staticFallback)
@@ -141,8 +142,16 @@ func (a *API) login(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "TOKEN_ERROR", err.Error(), nil)
 		return
 	}
-	_ = a.store.AddAudit(u.Username, "auth.login", u.ID, "success", "login")
-	writeJSON(w, http.StatusOK, map[string]any{"token": token, "user": map[string]any{"username": u.Username, "role": u.Role}})
+	_ = auditkit.Record(a.store, auditkit.Event{Actor: u.Username, Action: "auth.login", Target: u.ID, Status: "success", Message: "login"})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"token": token,
+		"user": map[string]any{
+			"username":     u.Username,
+			"role":         u.Role,
+			"tokenVersion": u.TokenVersion,
+			"permissions":  rbac.Permissions(u.Role),
+		},
+	})
 }
 
 func (a *API) requireAuth(next http.Handler) http.Handler {
@@ -153,6 +162,14 @@ func (a *API) requireAuth(next http.Handler) http.Handler {
 			writeError(w, http.StatusUnauthorized, "UNAUTHORIZED", i18n.Text(languageFromRequest(r), "api.authRequired"), nil)
 			return
 		}
+		user, err := a.store.UserByID(claims.UserID)
+		if err != nil || user.TokenVersion != claims.TokenVersion {
+			writeError(w, http.StatusUnauthorized, "SESSION_INVALID", i18n.Text(languageFromRequest(r), "api.sessionInvalid"), nil)
+			return
+		}
+		claims.Username = user.Username
+		claims.Role = user.Role
+		claims.TokenVersion = user.TokenVersion
 		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), ctxClaims{}, claims)))
 	})
 }
