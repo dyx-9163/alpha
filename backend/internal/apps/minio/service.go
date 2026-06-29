@@ -114,7 +114,18 @@ func (s Service) Install(ctx context.Context, req InstallRequest, resources []st
 		return err
 	}
 	installer := minioinstaller.NewInstaller(s.remote)
-	if err := step(3, "install-minio", copy.InstallStandalone, func() error {
+	installRoot := remoteInstallRoot(server, "minio", bundle.Version)
+	if err := step(3, "select-data-disk", copy.SelectDataDisk, func() error {
+		dataDir, dataErr := installer.ResolveDataDir(ctx, server, minioDataRoot(req.Parameters), installRoot, options.APIPort, logForServer)
+		options.DataDir = dataDir
+		return dataErr
+	}); err != nil {
+		msg := fmt.Sprintf(copy.InstallFailed, err)
+		logForServer.Error("%s", msg)
+		finishTarget(recorder, target, "failed", msg)
+		return err
+	}
+	if err := step(4, "install-minio", copy.InstallStandalone, func() error {
 		return installer.Install(ctx, server, bundle, options, logForServer)
 	}); err != nil {
 		msg := fmt.Sprintf(copy.InstallFailed, err)
@@ -123,7 +134,7 @@ func (s Service) Install(ctx context.Context, req InstallRequest, resources []st
 		return err
 	}
 	var instance store.AppInstance
-	if err := step(4, "record-instance", copy.RecordInstance, func() error {
+	if err := step(5, "record-instance", copy.RecordInstance, func() error {
 		metadata, _ := json.Marshal(map[string]any{
 			"resourcePath":  bundle.ArchivePath,
 			"mcPath":        bundle.MCPath,
@@ -133,6 +144,7 @@ func (s Service) Install(ctx context.Context, req InstallRequest, resources []st
 			"consolePort":   options.ConsolePort,
 			"rootUser":      options.RootUser,
 			"serviceName":   fmt.Sprintf("aifar-minio-%d", options.APIPort),
+			"dataDir":       options.DataDir,
 			"endpoint":      fmt.Sprintf("http://%s:%d", server.Host, options.APIPort),
 			"topology":      "standalone",
 			"auth":          "password",
@@ -182,22 +194,17 @@ func (s Service) installDistributed(ctx context.Context, req InstallRequest, res
 
 	clusterID := store.NewID("minio_dist")
 	preloadedServers := make(map[string]store.Server, len(targets))
-	volumes := make([]minioinstaller.DistributedVolume, 0, len(targets))
 	for _, target := range targets {
 		server, loadErr := s.store.GetServer(target, true)
 		if loadErr != nil {
 			return loadErr
 		}
 		preloadedServers[target] = server
-		volumes = append(volumes, minioinstaller.DistributedVolume{
-			Host: server.Host,
-			Port: options.APIPort,
-			Path: remoteInstallRoot(server, "minio", bundle.Version) + "/data",
-		})
 	}
 	installer := minioinstaller.NewInstaller(s.remote)
 	recorder, _ := log.(stepRecorder)
 	steps := minioInstallStepsFor("distributed", copy)
+	dataDirs := make(map[string]string, len(targets))
 	for _, target := range targets {
 		logForServer := logForTarget(log, targetLog, target)
 		if recorder != nil {
@@ -222,8 +229,21 @@ func (s Service) installDistributed(ctx context.Context, req InstallRequest, res
 			finishTarget(recorder, target, "failed", msg)
 			return err
 		}
-		if err := step(3, "install-minio", copy.InstallStandalone, func() error {
-			return installer.Install(ctx, server, bundle, options, logForServer)
+		installRoot := remoteInstallRoot(server, "minio", bundle.Version)
+		if err := step(3, "select-data-disk", copy.SelectDataDisk, func() error {
+			dataDir, dataErr := installer.ResolveDataDir(ctx, server, minioDataRoot(req.Parameters), installRoot, options.APIPort, logForServer)
+			dataDirs[target] = dataDir
+			return dataErr
+		}); err != nil {
+			msg := fmt.Sprintf(copy.InstallFailed, err)
+			logForServer.Error("%s", msg)
+			finishTarget(recorder, target, "failed", msg)
+			return err
+		}
+		nodeOptions := options
+		nodeOptions.DataDir = dataDirs[target]
+		if err := step(4, "install-minio", copy.InstallStandalone, func() error {
+			return installer.Install(ctx, server, bundle, nodeOptions, logForServer)
 		}); err != nil {
 			msg := fmt.Sprintf(copy.InstallFailed, err)
 			logForServer.Error("%s", msg)
@@ -232,12 +252,21 @@ func (s Service) installDistributed(ctx context.Context, req InstallRequest, res
 		}
 	}
 
+	volumes := make([]minioinstaller.DistributedVolume, 0, len(targets))
+	for _, target := range targets {
+		server := preloadedServers[target]
+		volumes = append(volumes, minioinstaller.DistributedVolume{
+			Host: server.Host,
+			Port: options.APIPort,
+			Path: dataDirs[target],
+		})
+	}
 	for _, target := range targets {
 		logForServer := logForTarget(log, targetLog, target)
 		step := newStepRunnerWithSteps(logForServer, recorder, target, copy, steps)
 		server := preloadedServers[target]
 		installRoot := remoteInstallRoot(server, "minio", bundle.Version)
-		if err := step(4, "configure-distributed", copy.ConfigureDistributed, func() error {
+		if err := step(5, "configure-distributed", copy.ConfigureDistributed, func() error {
 			return installer.ConfigureDistributedNode(ctx, server, minioinstaller.DistributedNodeConfig{
 				Version:      bundle.Version,
 				InstallRoot:  installRoot,
@@ -254,7 +283,7 @@ func (s Service) installDistributed(ctx context.Context, req InstallRequest, res
 			return err
 		}
 		var instance store.AppInstance
-		if err := step(5, "record-instance", copy.RecordInstance, func() error {
+		if err := step(6, "record-instance", copy.RecordInstance, func() error {
 			metadata, _ := json.Marshal(map[string]any{
 				"clusterId":      clusterID,
 				"resourcePath":   bundle.ArchivePath,
@@ -265,6 +294,7 @@ func (s Service) installDistributed(ctx context.Context, req InstallRequest, res
 				"consolePort":    options.ConsolePort,
 				"rootUser":       options.RootUser,
 				"serviceName":    fmt.Sprintf("aifar-minio-%d", options.APIPort),
+				"dataDir":        dataDirs[target],
 				"endpoint":       fmt.Sprintf("http://%s:%d", server.Host, options.APIPort),
 				"topology":       "distributed",
 				"distributedSet": len(targets),
@@ -334,6 +364,32 @@ func minioOptions(params map[string]any, defaultPassword string) minioinstaller.
 		RootUser:     stringParam(params, "rootUser", "admin"),
 		RootPassword: passwordParam(params, defaultPassword),
 	}
+}
+
+func minioDataRoot(params map[string]any) string {
+	for _, key := range []string{"dataRoot", "dataDiskRoot", "dataDir"} {
+		if value, ok := params[key]; ok {
+			text := strings.TrimSpace(fmt.Sprint(value))
+			if text != "" {
+				return text
+			}
+		}
+	}
+	return "/data/minio"
+}
+
+func validateMinioDataRoot(value string) error {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil
+	}
+	if !strings.HasPrefix(value, "/") {
+		return errors.New("MinIO data disk root must be an absolute path")
+	}
+	if strings.IndexFunc(value, func(r rune) bool { return r <= ' ' }) >= 0 {
+		return errors.New("MinIO data disk root must not contain whitespace")
+	}
+	return nil
 }
 
 func passwordParam(params map[string]any, fallback string) string {
@@ -441,6 +497,7 @@ func minioInstallStepsFor(topology string, copy Copy) []stepDef {
 		return []stepDef{
 			{Name: "load-server", Title: copy.LoadServer},
 			{Name: "verify-resource", Title: copy.VerifyResource},
+			{Name: "select-data-disk", Title: copy.SelectDataDisk},
 			{Name: "install-minio", Title: copy.InstallStandalone},
 			{Name: "configure-distributed", Title: copy.ConfigureDistributed},
 			{Name: "record-instance", Title: copy.RecordInstance},
@@ -449,6 +506,7 @@ func minioInstallStepsFor(topology string, copy Copy) []stepDef {
 	return []stepDef{
 		{Name: "load-server", Title: copy.LoadServer},
 		{Name: "verify-resource", Title: copy.VerifyResource},
+		{Name: "select-data-disk", Title: copy.SelectDataDisk},
 		{Name: "install-minio", Title: copy.InstallStandalone},
 		{Name: "record-instance", Title: copy.RecordInstance},
 	}

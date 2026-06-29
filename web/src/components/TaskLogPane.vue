@@ -378,7 +378,7 @@ function taskTime(value?: string) {
   gap: 12px;
   min-height: 0;
   min-width: 0;
-  height: calc(100vh - 210px);
+  height: 100%;
 }
 
 .task-detail {
@@ -392,7 +392,7 @@ function taskTime(value?: string) {
   padding: 10px;
   min-width: 0;
   min-height: 0;
-  overflow: auto;
+  overflow: hidden;
 }
 
 @media (max-width: 980px) {

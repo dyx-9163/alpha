@@ -120,6 +120,7 @@ export function mysqlInstallDialogProps(locale?: string): AppInstallDialogConfig
         name: 'rootPassword',
         label: copy.rootPassword,
         type: 'password',
+        defaultValue: 'Oversea.123',
         placeholder: copy.rootPasswordPlaceholder,
         required: true
       }

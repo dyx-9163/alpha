@@ -26,6 +26,9 @@ export const minioMessages = {
     distributed: '分布式',
     apiPort: 'API 端口',
     consolePort: '控制台端口',
+    dataRoot: '独立磁盘根目录',
+    dataRootPlaceholder: '例如 /data/minio；未检测到独立磁盘时自动使用系统盘',
+    dataRootInvalid: '请输入以 / 开头且不包含空格的绝对路径',
     rootUser: '管理员账号',
     rootUserPlaceholder: '请输入 MinIO 管理员账号',
     rootPassword: '管理员密码',
@@ -51,6 +54,9 @@ export const minioMessages = {
     distributed: 'Distributed',
     apiPort: 'API port',
     consolePort: 'Console port',
+    dataRoot: 'Data disk root',
+    dataRootPlaceholder: 'For example /data/minio; falls back to system disk when no independent disk is detected',
+    dataRootInvalid: 'Enter an absolute path starting with / and without whitespace',
     rootUser: 'Root user',
     rootUserPlaceholder: 'Enter MinIO root user',
     rootPassword: 'Root password',
@@ -110,6 +116,17 @@ export function minioInstallDialogProps(locale?: string): AppInstallDialogConfig
         required: true
       },
       {
+        name: 'dataRoot',
+        label: copy.dataRoot,
+        type: 'text',
+        defaultValue: '/data/minio',
+        placeholder: copy.dataRootPlaceholder,
+        validate: (value) => {
+          const text = String(value ?? '').trim()
+          return text && (!text.startsWith('/') || /\s/.test(text)) ? copy.dataRootInvalid : undefined
+        }
+      },
+      {
         name: 'rootUser',
         label: copy.rootUser,
         type: 'text',
@@ -121,6 +138,7 @@ export function minioInstallDialogProps(locale?: string): AppInstallDialogConfig
         name: 'rootPassword',
         label: copy.rootPassword,
         type: 'password',
+        defaultValue: 'Oversea.123',
         placeholder: copy.rootPasswordPlaceholder,
         required: true
       }

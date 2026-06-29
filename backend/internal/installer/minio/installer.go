@@ -7,6 +7,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -98,6 +99,7 @@ func (i Installer) Install(ctx context.Context, server store.Server, bundle Bund
 		GoModCachePath: goModCacheRemote,
 		MCRemotePath:   mcRemote,
 		InstallRoot:    installRoot,
+		DataDir:        minioDataDir(req.DataDir, installRoot),
 		APIPort:        req.APIPort,
 		ConsolePort:    req.ConsolePort,
 		RootUser:       req.RootUser,
@@ -129,6 +131,26 @@ func (i Installer) Install(ctx context.Context, server store.Server, bundle Bund
 	return nil
 }
 
+func (i Installer) ResolveDataDir(ctx context.Context, server store.Server, dataRoot, installRoot string, apiPort int, log Logger) (string, error) {
+	systemDir := path.Join(installRoot, "data")
+	preferredDir := preferredMinIODataDir(dataRoot, apiPort)
+	if preferredDir == "" {
+		log.Info("MinIO data disk root not configured; using system disk directory: %s", systemDir)
+		return systemDir, nil
+	}
+	log.Info("checking MinIO data disk root: %s", dataRoot)
+	result, err := i.run(ctx, server, minioDataDirProbeCommand(preferredDir, systemDir), log)
+	if err != nil {
+		return "", err
+	}
+	selected := selectedDataDirFromOutput(result.Stdout)
+	if selected == "" {
+		selected = systemDir
+	}
+	log.Info("selected MinIO data directory: %s", selected)
+	return selected, nil
+}
+
 func (i Installer) ConfigureDistributedNode(ctx context.Context, server store.Server, req DistributedNodeConfig, log Logger) error {
 	script, err := configureDistributedNodeScript(req)
 	if err != nil {
@@ -143,6 +165,7 @@ type InstallOptions struct {
 	ConsolePort  int
 	RootUser     string
 	RootPassword string
+	DataDir      string
 }
 
 func (o InstallOptions) Validate() error {
@@ -170,7 +193,58 @@ func (o InstallOptions) Validate() error {
 	if len(o.RootPassword) < 8 {
 		return errors.New("MinIO root password must be at least 8 characters")
 	}
+	if strings.TrimSpace(o.DataDir) != "" && !strings.HasPrefix(strings.TrimSpace(o.DataDir), "/") {
+		return errors.New("MinIO data directory must be an absolute path")
+	}
 	return nil
+}
+
+func minioDataDir(dataDir, installRoot string) string {
+	dataDir = strings.TrimSpace(dataDir)
+	if dataDir == "" {
+		return path.Join(installRoot, "data")
+	}
+	return "/" + strings.Trim(dataDir, "/")
+}
+
+func preferredMinIODataDir(dataRoot string, apiPort int) string {
+	dataRoot = strings.TrimSpace(dataRoot)
+	if dataRoot == "" {
+		return ""
+	}
+	dataRoot = "/" + strings.Trim(dataRoot, "/")
+	return path.Join(dataRoot, fmt.Sprintf("aifar-minio-%d", apiPort))
+}
+
+func minioDataDirProbeCommand(preferredDir, systemDir string) string {
+	preferredParent := path.Dir(preferredDir)
+	return strings.Join([]string{
+		"SUDO=\"\"",
+		"if [ \"$(id -u)\" != \"0\" ]; then SUDO=\"sudo -n\"; fi",
+		"PREFERRED_DIR=" + installerkit.ShellQuote(preferredDir),
+		"PREFERRED_PARENT=" + installerkit.ShellQuote(preferredParent),
+		"SYSTEM_DIR=" + installerkit.ShellQuote(systemDir),
+		"$SUDO mkdir -p \"$PREFERRED_PARENT\" \"$SYSTEM_DIR\"",
+		"ROOT_DEVICE=\"$(df -P / | awk 'NR==2 {print $1}')\"",
+		"DATA_DEVICE=\"$(df -P \"$PREFERRED_PARENT\" | awk 'NR==2 {print $1}')\"",
+		"if [ -n \"$DATA_DEVICE\" ] && [ \"$DATA_DEVICE\" != \"$ROOT_DEVICE\" ]; then",
+		"  $SUDO mkdir -p \"$PREFERRED_DIR\"",
+		"  echo \"using independent MinIO data disk: $PREFERRED_DIR ($DATA_DEVICE)\"",
+		"  echo \"AIFAR_SELECTED_MINIO_DATA_DIR=$PREFERRED_DIR\"",
+		"else",
+		"  echo \"independent MinIO data disk not found for $PREFERRED_PARENT; using system disk: $SYSTEM_DIR\"",
+		"  echo \"AIFAR_SELECTED_MINIO_DATA_DIR=$SYSTEM_DIR\"",
+		"fi",
+	}, "\n")
+}
+
+func selectedDataDirFromOutput(output string) string {
+	re := regexp.MustCompile(`(?m)^AIFAR_SELECTED_MINIO_DATA_DIR=(/.+)$`)
+	match := re.FindStringSubmatch(output)
+	if len(match) != 2 {
+		return ""
+	}
+	return strings.TrimSpace(match[1])
 }
 
 func (i Installer) run(ctx context.Context, server store.Server, command string, log Logger) (installerkit.CommandResult, error) {

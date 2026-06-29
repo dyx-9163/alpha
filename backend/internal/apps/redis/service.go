@@ -160,6 +160,10 @@ func (s Service) installSentinel(ctx context.Context, req InstallRequest, resour
 	if len(targets) < 3 {
 		return errors.New(copy.SentinelNeedNodes)
 	}
+	masterTarget, err := redisSentinelMasterID(req.Parameters, targets)
+	if err != nil {
+		return err
+	}
 	port := redisPort(req.Parameters)
 	sentinelPort := redisSentinelPort(req.Parameters)
 	quorum := redisQuorum(req.Parameters, len(targets))
@@ -182,7 +186,6 @@ func (s Service) installSentinel(ctx context.Context, req InstallRequest, resour
 	installer := redisinstaller.NewInstaller(s.remote)
 	recorder, _ := log.(stepRecorder)
 	steps := redisInstallStepsFor("sentinel", copy)
-	masterTarget := targets[0]
 	var masterServer store.Server
 	for idx, target := range targets {
 		logForServer := logForTarget(log, targetLog, target)
@@ -538,6 +541,25 @@ func redisQuorum(params map[string]any, targetCount int) int {
 		defaultQuorum = 2
 	}
 	return intParam(params, "quorum", defaultQuorum)
+}
+
+func redisSentinelMasterID(params map[string]any, targets []string) (string, error) {
+	if len(targets) == 0 {
+		return "", errors.New("redis sentinel master target is required")
+	}
+	selected := strings.TrimSpace(fmt.Sprint(params["sentinelMasterId"]))
+	if selected == "" || selected == "<nil>" {
+		selected = strings.TrimSpace(fmt.Sprint(params["masterServerId"]))
+	}
+	if selected == "" || selected == "<nil>" {
+		return "", errors.New("redis sentinel master target is required")
+	}
+	for _, target := range targets {
+		if target == selected {
+			return selected, nil
+		}
+	}
+	return "", fmt.Errorf("redis sentinel master target %s is not in selected servers", selected)
 }
 
 func redisClusterReplicas(params map[string]any) int {

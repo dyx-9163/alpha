@@ -113,7 +113,7 @@ func TestServiceInstallsRedisSentinelAndRecordsEachNode(t *testing.T) {
 		ServerIDs: []string{
 			"srv-1", "srv-2", "srv-3",
 		},
-		Parameters: map[string]any{"port": 6379, "sentinelPort": 26379, "password": "Oversea.123"},
+		Parameters: map[string]any{"port": 6379, "sentinelPort": 26379, "sentinelMasterId": "srv-2", "password": "Oversea.123"},
 	}, []store.Resource{{App: "redis", Part: "backend", Version: "7.2.14", Path: archive}}, fakeLogger{}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -123,6 +123,9 @@ func TestServiceInstallsRedisSentinelAndRecordsEachNode(t *testing.T) {
 	}
 	if s.instances[0].Topology != "sentinel" || !strings.Contains(s.instances[0].Metadata, `"sentinelPort":26379`) {
 		t.Fatalf("expected sentinel metadata: %+v", s.instances[0])
+	}
+	if !strings.Contains(s.instances[1].Metadata, `"role":"master"`) || !strings.Contains(s.instances[1].Metadata, `"masterHost":"10.0.0.2"`) {
+		t.Fatalf("expected selected srv-2 to be sentinel master: %+v", s.instances)
 	}
 	joinedCommands := strings.Join(remote.commands, "\n")
 	if !strings.Contains(joinedCommands, "AIFAR_REDIS_SENTINEL_CONFIGURE") {

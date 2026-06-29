@@ -74,6 +74,9 @@ function formatTime(value?: string) {
 
 <style scoped>
 .log-output {
+  min-width: 0;
+  max-width: 100%;
+  min-height: 0;
   overflow: auto;
   background: var(--aifar-code-bg);
   color: #dbeafe;

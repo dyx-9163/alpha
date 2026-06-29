@@ -41,7 +41,7 @@
             :placeholder="field.placeholder"
             style="width: 100%"
           >
-            <el-option v-for="option in field.options ?? []" :key="String(option.value)" :label="option.label" :value="option.value" />
+            <el-option v-for="option in fieldOptions(field)" :key="String(option.value)" :label="option.label" :value="option.value" />
           </el-select>
           <el-switch v-else-if="field.type === 'switch'" v-model="fieldValues[field.name]" />
           <el-input-number
@@ -113,7 +113,8 @@ const selectedServerId = ref('')
 const selectedServerIds = ref<string[]>([])
 const fieldValues = ref<Record<string, string | number | boolean | undefined>>({})
 const safeServers = computed(() => Array.isArray(props.servers) ? props.servers : [])
-const installFields = computed(() => Array.isArray(props.fields) ? props.fields : [])
+const allFields = computed(() => Array.isArray(props.fields) ? props.fields : [])
+const installFields = computed(() => allFields.value.filter((field) => field.visibleWhen?.(fieldValues.value, validationContext.value) ?? true))
 const defaultCopy = computed<AppInstallDialogCopy>(() => ({
   title: t('apps.install'),
   versionLabel: t('common.version'),
@@ -168,7 +169,7 @@ const requiredFieldsReady = computed(() => installFields.value.every((field) => 
 const canSubmit = computed(() => Boolean(selectedVersion.value && selectedTargetCount.value && requiredFieldsReady.value && !hasFieldValidationErrors.value && !props.submitting))
 
 watch(
-  () => [props.modelValue, props.app?.name, props.app?.versions.join('|'), props.targetMode, installFields.value.map((field) => field.name).join('|')],
+  () => [props.modelValue, props.app?.name, props.app?.versions.join('|'), props.targetMode, allFields.value.map((field) => field.name).join('|')],
   () => {
     if (!props.modelValue || !props.app) {
       return
@@ -183,10 +184,14 @@ watch(
 
 function resetFieldValues() {
   const next: Record<string, string | number | boolean | undefined> = {}
-  for (const field of installFields.value) {
+  for (const field of allFields.value) {
     next[field.name] = normalizeFieldValue(field.defaultValue)
   }
   fieldValues.value = next
+}
+
+function fieldOptions(field: AppInstallField) {
+  return field.optionsResolver?.(fieldValues.value, validationContext.value) ?? field.options ?? []
 }
 
 function normalizeFieldValue(value: unknown) {

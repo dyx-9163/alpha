@@ -31,7 +31,7 @@
           </span>
         </div>
 
-        <LogOutput :lines="group.logs" :empty-text="t('tasks.noLogs')" min-height="180px" auto-scroll />
+        <LogOutput class="target-log-output" :lines="group.logs" :empty-text="t('tasks.noLogs')" min-height="0" auto-scroll />
       </section>
     </div>
 
@@ -168,6 +168,11 @@ function serverLabel(target: string) {
 <style scoped>
 .task-run-panel {
   min-width: 0;
+  height: 100%;
+  min-height: 0;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  overflow: hidden;
 }
 
 .task-summary {
@@ -205,15 +210,28 @@ function serverLabel(target: string) {
 }
 
 .target-log-list {
-  display: grid;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
   gap: 12px;
+  overflow: hidden;
 }
 
 .target-log-group {
+  flex: 1 1 0;
+  min-height: 0;
+  display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr);
   border: 1px solid var(--aifar-border);
   border-radius: var(--aifar-radius-lg);
   overflow: hidden;
   background: #fff;
+}
+
+.target-log-output {
+  height: 100%;
+  min-height: 0 !important;
+  border-radius: 0;
 }
 
 .target-header {

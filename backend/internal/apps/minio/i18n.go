@@ -16,6 +16,7 @@ type Copy struct {
 	StepFailed             string
 	LoadServer             string
 	VerifyResource         string
+	SelectDataDisk         string
 	InstallStandalone      string
 	ConfigureDistributed   string
 	RecordInstance         string
@@ -57,6 +58,7 @@ func CopyFor(lang string) Copy {
 			StepFailed:             "MinIO step %d/%d failed: %s: %v",
 			LoadServer:             "load target server",
 			VerifyResource:         "verify MinIO offline resource",
+			SelectDataDisk:         "select MinIO data disk",
 			InstallStandalone:      "build and install MinIO base service",
 			ConfigureDistributed:   "configure MinIO distributed topology",
 			RecordInstance:         "record MinIO app instance",
@@ -85,6 +87,7 @@ func CopyFor(lang string) Copy {
 			StepFailed:             "MinIO 步骤 %d/%d 失败：%s：%v",
 			LoadServer:             "读取目标服务器",
 			VerifyResource:         "校验 MinIO 离线资源",
+			SelectDataDisk:         "选择 MinIO 数据磁盘",
 			InstallStandalone:      "编译并安装 MinIO 基础服务",
 			ConfigureDistributed:   "配置 MinIO 分布式拓扑",
 			RecordInstance:         "记录 MinIO 应用实例",

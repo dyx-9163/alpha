@@ -114,6 +114,9 @@ func TestInstallerUploadsResourcesAndRunsMinioScript(t *testing.T) {
 	if !strings.Contains(remote.installScript, `MINIO_ROOT_PASSWORD="$ROOT_PASSWORD"`) {
 		t.Fatalf("installer should write root password into env file:\n%s", remote.installScript)
 	}
+	if !strings.Contains(remote.installScript, `DATA_DIR='/aifar/apps/minio/2025-10-15T17-29-55Z/data'`) {
+		t.Fatalf("installer should render selected data directory:\n%s", remote.installScript)
+	}
 	if !strings.Contains(remote.installScript, `ExecStart=$INSTALL_ROOT/bin/minio server \$MINIO_OPTS \$MINIO_VOLUMES`) {
 		t.Fatalf("installer should use env-driven MinIO volumes and opts:\n%s", remote.installScript)
 	}
@@ -131,6 +134,7 @@ func TestMinIOStandaloneScriptsRenderTemplates(t *testing.T) {
 		GoModCachePath: "/tmp/gomod.tar.gz",
 		MCRemotePath:   "/tmp/mc",
 		InstallRoot:    "/aifar/apps/minio/2025-10-15T17-29-55Z",
+		DataDir:        "/data/minio/aifar-minio-9000",
 		APIPort:        9000,
 		ConsolePort:    9001,
 		RootUser:       "admin",

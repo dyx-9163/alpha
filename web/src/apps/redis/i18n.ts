@@ -27,6 +27,9 @@ export const redisMessages = {
     cluster: 'Cluster',
     port: 'Redis 端口',
     sentinelPort: 'Sentinel 端口',
+    sentinelMaster: 'Sentinel 主节点',
+    sentinelMasterPlaceholder: '请选择 Redis 主节点；其他服务器作为从节点，所有节点运行 Sentinel',
+    sentinelMasterRequired: 'Sentinel 模式必须选择主节点',
     quorum: 'Sentinel Quorum',
     replicas: 'Cluster 副本数',
     password: 'Redis 密码',
@@ -53,6 +56,9 @@ export const redisMessages = {
     cluster: 'Cluster',
     port: 'Redis port',
     sentinelPort: 'Sentinel port',
+    sentinelMaster: 'Sentinel master',
+    sentinelMasterPlaceholder: 'Select the Redis master; other servers become replicas and every selected server runs Sentinel',
+    sentinelMasterRequired: 'Sentinel mode requires a master server',
     quorum: 'Sentinel quorum',
     replicas: 'Cluster replicas',
     password: 'Redis password',
@@ -112,6 +118,24 @@ export function redisInstallDialogProps(locale?: string): AppInstallDialogConfig
         defaultValue: 26379
       },
       {
+        name: 'sentinelMasterId',
+        label: copy.sentinelMaster,
+        type: 'select',
+        placeholder: copy.sentinelMasterPlaceholder,
+        visibleWhen: (values) => values.topology === 'sentinel',
+        optionsResolver: (_values, context) => context.selectedServers.map((server) => ({
+          label: `${server.name} (${server.host})`,
+          value: server.id
+        })),
+        validate: (value, values, context) => {
+          if (values.topology !== 'sentinel') {
+            return undefined
+          }
+          const selected = String(value ?? '').trim()
+          return selected && context.selectedServers.some((server) => server.id === selected) ? undefined : copy.sentinelMasterRequired
+        }
+      },
+      {
         name: 'quorum',
         label: copy.quorum,
         type: 'number',
@@ -127,6 +151,7 @@ export function redisInstallDialogProps(locale?: string): AppInstallDialogConfig
         name: 'password',
         label: copy.password,
         type: 'password',
+        defaultValue: 'Oversea.123',
         placeholder: copy.passwordPlaceholder,
         required: true
       }

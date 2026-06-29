@@ -43,6 +43,8 @@ export interface AppInstallField {
   defaultValue?: unknown
   required?: boolean
   options?: AppInstallFieldOption[]
+  optionsResolver?: AppInstallFieldOptionsResolver
+  visibleWhen?: AppInstallFieldVisibility
   min?: number
   max?: number
   step?: number
@@ -60,6 +62,16 @@ export type AppInstallFieldValidator = (
   values: Record<string, string | number | boolean | undefined>,
   context: AppInstallValidationContext
 ) => string | undefined | null
+
+export type AppInstallFieldOptionsResolver = (
+  values: Record<string, string | number | boolean | undefined>,
+  context: AppInstallValidationContext
+) => AppInstallFieldOption[]
+
+export type AppInstallFieldVisibility = (
+  values: Record<string, string | number | boolean | undefined>,
+  context: AppInstallValidationContext
+) => boolean
 
 export interface AppInstallDialogConfig {
   targetMode?: AppTargetMode

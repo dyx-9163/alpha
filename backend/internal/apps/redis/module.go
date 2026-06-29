@@ -128,6 +128,9 @@ func (m Module) ValidateInstall(ctx context.Context, req registry.InstallRequest
 		if len(targets) < 3 {
 			return errors.New(copy.SentinelNeedNodes)
 		}
+		if _, err := redisSentinelMasterID(req.Parameters, targets); err != nil {
+			return err
+		}
 	case "cluster":
 		if len(targets) < 3 {
 			return errors.New(copy.ClusterNeedNodes)

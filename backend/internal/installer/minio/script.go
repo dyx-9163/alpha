@@ -65,6 +65,7 @@ type InstallScriptRequest struct {
 	GoModCachePath string
 	MCRemotePath   string
 	InstallRoot    string
+	DataDir        string
 	APIPort        int
 	ConsolePort    int
 	RootUser       string
@@ -84,6 +85,7 @@ type DistributedNodeConfig struct {
 	ConsolePort  int
 	RootUser     string
 	RootPassword string
+	DataDir      string
 	Volumes      []DistributedVolume
 }
 

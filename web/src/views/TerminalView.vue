@@ -204,14 +204,23 @@ onBeforeUnmount(() => {
   box-sizing: border-box;
   overflow: hidden;
   border-radius: var(--aifar-radius-lg);
+  padding: 8px 10px;
+  background: var(--aifar-code-bg);
+  border: 1px solid rgba(68, 112, 173, .35);
 }
 
 .terminal-box :deep(.xterm) {
   height: 100%;
+  width: 100%;
 }
 
 .terminal-box :deep(.xterm-viewport) {
   overflow-y: auto;
+}
+
+.terminal-box :deep(.xterm-screen) {
+  padding-top: 2px;
+  padding-left: 2px;
 }
 
 @media (max-width: 760px) {
