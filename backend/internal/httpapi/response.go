@@ -3,6 +3,7 @@ package httpapi
 import (
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -23,6 +24,34 @@ type ctxClaims struct{}
 func currentUser(r *http.Request) auth.Claims {
 	claims, _ := r.Context().Value(ctxClaims{}).(auth.Claims)
 	return claims
+}
+
+func (a *API) securityHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("X-Frame-Options", "DENY")
+		w.Header().Set("Referrer-Policy", "no-referrer")
+		w.Header().Set("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+		next.ServeHTTP(w, r)
+	})
+}
+
+func (a *API) limitRequestBody(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if a.cfg.MaxRequestBodyBytes > 0 && r.Body != nil && requestMayHaveBody(r.Method) {
+			r.Body = http.MaxBytesReader(w, r.Body, a.cfg.MaxRequestBodyBytes)
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func requestMayHaveBody(method string) bool {
+	switch method {
+	case http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete:
+		return true
+	default:
+		return false
+	}
 }
 
 func (a *API) requirePermission(permission rbac.Permission, next http.HandlerFunc) http.HandlerFunc {
@@ -94,6 +123,11 @@ func tokenFromWS(r *http.Request) string {
 func decode(w http.ResponseWriter, r *http.Request, dst any) bool {
 	defer r.Body.Close()
 	if err := json.NewDecoder(r.Body).Decode(dst); err != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			writeError(w, http.StatusRequestEntityTooLarge, "REQUEST_BODY_TOO_LARGE", i18n.Text(languageFromRequest(r), "api.requestBodyTooLarge"), map[string]any{"limit": maxBytesErr.Limit})
+			return false
+		}
 		writeError(w, http.StatusBadRequest, "INVALID_JSON", i18n.Text(languageFromRequest(r), "api.invalidJSON"), map[string]any{"error": err.Error()})
 		return false
 	}

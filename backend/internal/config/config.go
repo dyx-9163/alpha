@@ -21,6 +21,7 @@ type Config struct {
 	ProviderMode          string `json:"providerMode"`
 	AuthMaxFailures       int    `json:"authMaxFailures"`
 	AuthLockoutSeconds    int    `json:"authLockoutSeconds"`
+	MaxRequestBodyBytes   int64  `json:"maxRequestBodyBytes"`
 }
 
 func Load() Config {
@@ -42,6 +43,7 @@ func Load() Config {
 		ProviderMode:          "real",
 		AuthMaxFailures:       getenvInt("AIFAR_AUTH_MAX_FAILURES", 5),
 		AuthLockoutSeconds:    getenvInt("AIFAR_AUTH_LOCKOUT_SECONDS", 300),
+		MaxRequestBodyBytes:   getenvInt64("AIFAR_MAX_REQUEST_BODY_BYTES", 1<<20),
 	}
 	return cfg
 }
@@ -59,6 +61,18 @@ func getenvInt(key string, fallback int) int {
 		return fallback
 	}
 	parsed, err := strconv.Atoi(value)
+	if err != nil || parsed < 1 {
+		return fallback
+	}
+	return parsed
+}
+
+func getenvInt64(key string, fallback int64) int64 {
+	value := os.Getenv(key)
+	if value == "" {
+		return fallback
+	}
+	parsed, err := strconv.ParseInt(value, 10, 64)
 	if err != nil || parsed < 1 {
 		return fallback
 	}

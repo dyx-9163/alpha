@@ -56,7 +56,7 @@ func New(cfg config.Config, s *store.Store, tasks *worker.Manager) *API {
 		auth:    security.NewLoginGuard(cfg.AuthMaxFailures, time.Duration(cfg.AuthLockoutSeconds)*time.Second),
 	}
 	r := chi.NewRouter()
-	r.Use(middleware.RequestID, middleware.RealIP, middleware.Recoverer)
+	r.Use(middleware.RequestID, middleware.RealIP, middleware.Recoverer, api.securityHeaders, api.limitRequestBody)
 	r.Route("/api/v2", func(r chi.Router) {
 		r.Post("/auth/login", api.login)
 		r.Group(func(r chi.Router) {
@@ -243,6 +243,7 @@ func (a *API) getSettings(w http.ResponseWriter, r *http.Request) {
 		"defaultDeployDir":      a.cfg.DefaultDeployDir,
 		"authMaxFailures":       a.cfg.AuthMaxFailures,
 		"authLockoutSeconds":    a.cfg.AuthLockoutSeconds,
+		"maxRequestBodyBytes":   a.cfg.MaxRequestBodyBytes,
 		"moduleStatus": map[string]string{
 			"servers": "available", "apps": "available", "containers": "available",
 			"database": "available", "storage": "available", "terminal": "available",

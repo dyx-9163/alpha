@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -124,6 +125,68 @@ func TestSuccessfulLoginClearsFailureCounter(t *testing.T) {
 	}
 }
 
+func TestSecurityHeadersAreApplied(t *testing.T) {
+	api, _, _ := newAuthzTestAPI(t)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v2/settings", nil)
+	rec := httptest.NewRecorder()
+
+	api.Router().ServeHTTP(rec, req)
+
+	for key, want := range map[string]string{
+		"X-Content-Type-Options": "nosniff",
+		"X-Frame-Options":        "DENY",
+		"Referrer-Policy":        "no-referrer",
+	} {
+		if got := rec.Header().Get(key); got != want {
+			t.Fatalf("expected %s=%q, got %q", key, want, got)
+		}
+	}
+	if got := rec.Header().Get("Permissions-Policy"); got == "" {
+		t.Fatalf("expected Permissions-Policy header")
+	}
+}
+
+func TestRequestBodyLimitReturnsPayloadTooLarge(t *testing.T) {
+	api, _, _ := newAuthzTestAPI(t)
+	api.cfg.MaxRequestBodyBytes = 12
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v2/auth/login", strings.NewReader(`{"username":"owner","password":"too-large"}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	api.Router().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("expected 413, got %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestSettingsExposeSecurityLimits(t *testing.T) {
+	api, db, secret := newAuthzTestAPI(t)
+	api.cfg.MaxRequestBodyBytes = 2048
+	api.cfg.AuthMaxFailures = 7
+	api.cfg.AuthLockoutSeconds = 60
+	token := issueTestToken(t, db, secret, "owner", "owner")
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v2/settings", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	rec := httptest.NewRecorder()
+
+	api.Router().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body["maxRequestBodyBytes"] != float64(2048) || body["authMaxFailures"] != float64(7) || body["authLockoutSeconds"] != float64(60) {
+		t.Fatalf("security limits missing from settings response: %+v", body)
+	}
+}
+
 func newAuthzTestAPI(t *testing.T) (*API, *store.Store, string) {
 	t.Helper()
 	root := t.TempDir()
@@ -143,6 +206,9 @@ func newAuthzTestAPI(t *testing.T) (*API, *store.Store, string) {
 		DefaultDeployDir:      "/aifar/apps",
 		DeploymentConcurrency: 1,
 		ProviderMode:          "real",
+		MaxRequestBodyBytes:   1 << 20,
+		AuthMaxFailures:       5,
+		AuthLockoutSeconds:    300,
 	}
 	return New(cfg, db, worker.NewManager(db)), db, secret
 }
