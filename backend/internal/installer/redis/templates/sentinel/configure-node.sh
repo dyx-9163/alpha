@@ -33,12 +33,14 @@ cat > "$INSTALL_ROOT/conf/sentinel.conf.tmp" <<CONF
 port $SENTINEL_PORT
 bind 0.0.0.0 -::1
 protected-mode yes
+user default on >$REDIS_PASSWORD allcommands allkeys allchannels
 daemonize no
 supervised no
 dir $INSTALL_ROOT/data
 logfile $INSTALL_ROOT/logs/sentinel.log
 sentinel monitor $MASTER_NAME $MASTER_HOST $MASTER_PORT $QUORUM
 sentinel auth-pass $MASTER_NAME $REDIS_PASSWORD
+sentinel sentinel-pass $REDIS_PASSWORD
 sentinel down-after-milliseconds $MASTER_NAME 5000
 sentinel failover-timeout $MASTER_NAME 60000
 sentinel parallel-syncs $MASTER_NAME 1
@@ -69,17 +71,23 @@ if [ "$ROLE" != "sentinel" ]; then
   $SUDO systemctl restart "$SERVICE_NAME"
 fi
 echo "starting Redis Sentinel service"
-if ! $SUDO systemctl enable --now "$SENTINEL_SERVICE"; then
+if ! START_OUTPUT="$($SUDO systemctl enable --now "$SENTINEL_SERVICE" 2>&1)"; then
+  echo "$START_OUTPUT"
   echo "Redis Sentinel service failed to start"
-  $SUDO systemctl --no-pager --full status "$SENTINEL_SERVICE" || true
-  $SUDO journalctl -u "$SENTINEL_SERVICE" -n 80 --no-pager || true
+  $SUDO systemctl --no-pager --full status "$SENTINEL_SERVICE" 2>&1 || true
+  $SUDO journalctl -u "$SENTINEL_SERVICE" -n 120 --no-pager 2>&1 || true
+  echo "Redis Sentinel config:"
+  $SUDO sed -n '1,160p' "$SENTINEL_CONFIG" 2>&1 || true
   exit 1
 fi
+echo "$START_OUTPUT"
 
 echo "verifying Redis Sentinel"
-if ! "$INSTALL_ROOT/bin/redis-cli" -p "$SENTINEL_PORT" sentinel masters >/dev/null 2>&1; then
+if ! VERIFY_OUTPUT="$("$INSTALL_ROOT/bin/redis-cli" -p "$SENTINEL_PORT" -a "$REDIS_PASSWORD" --no-auth-warning sentinel masters 2>&1)"; then
+  echo "$VERIFY_OUTPUT"
   echo "Redis Sentinel is not responding"
-  $SUDO systemctl --no-pager --full status "$SENTINEL_SERVICE" || true
+  $SUDO systemctl --no-pager --full status "$SENTINEL_SERVICE" 2>&1 || true
+  $SUDO journalctl -u "$SENTINEL_SERVICE" -n 120 --no-pager 2>&1 || true
   exit 1
 fi
 echo "Redis Sentinel node configured: $ROLE"

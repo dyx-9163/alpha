@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -13,15 +14,20 @@ import (
 )
 
 type fakeStore struct {
+	mu        sync.Mutex
 	servers   map[string]store.Server
 	instances []store.AppInstance
 }
 
 func (f *fakeStore) GetServer(id string, includeSecret bool) (store.Server, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	return f.servers[id], nil
 }
 
 func (f *fakeStore) SaveAppInstance(v store.AppInstance) (store.AppInstance, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if v.ID == "" {
 		v.ID = store.NewID("app")
 	}
@@ -32,6 +38,8 @@ func (f *fakeStore) SaveAppInstance(v store.AppInstance) (store.AppInstance, err
 }
 
 func (f *fakeStore) DeleteAppInstance(id string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	next := f.instances[:0]
 	for _, instance := range f.instances {
 		if instance.ID != id {
@@ -43,16 +51,36 @@ func (f *fakeStore) DeleteAppInstance(id string) error {
 }
 
 type fakeRemote struct {
-	commands []string
+	mu             sync.Mutex
+	commands       []string
+	blockInstall   bool
+	installStarted chan string
+	releaseInstall chan struct{}
 }
 
 func (f *fakeRemote) Run(ctx context.Context, server store.Server, command string) (adapter.CommandResult, error) {
+	if f.blockInstall && strings.Contains(command, "install-minio.sh") {
+		f.installStarted <- server.ID
+		select {
+		case <-ctx.Done():
+			return adapter.CommandResult{}, ctx.Err()
+		case <-f.releaseInstall:
+		}
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.commands = append(f.commands, command)
 	return adapter.CommandResult{Stdout: "ok"}, nil
 }
 
 func (f *fakeRemote) UploadFile(ctx context.Context, server store.Server, localPath, remotePath string, mode os.FileMode) error {
 	return nil
+}
+
+func (f *fakeRemote) joinedCommands() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return strings.Join(f.commands, "\n")
 }
 
 type fakeLogger struct{}
@@ -105,7 +133,7 @@ func TestServiceInstallsStandaloneMinioAndRecordsInstalledInstance(t *testing.T)
 	if !strings.Contains(instance.Metadata, `"apiPort":9002`) || !strings.Contains(instance.Metadata, `"endpoint":"http://10.0.0.3:9002"`) || !strings.Contains(instance.Metadata, `"dataDir":"/aifar/apps/minio/2025-10-15T17-29-55Z/data"`) {
 		t.Fatalf("metadata should include endpoint and ports: %s", instance.Metadata)
 	}
-	joinedCommands := strings.Join(remote.commands, "\n")
+	joinedCommands := remote.joinedCommands()
 	if !strings.Contains(joinedCommands, "install-minio.sh") {
 		t.Fatalf("expected minio install script to run: %s", joinedCommands)
 	}
@@ -154,9 +182,77 @@ func TestServiceInstallsDistributedMinioAndRecordsEachNode(t *testing.T) {
 	if !strings.Contains(s.instances[0].Metadata, `"dataDir":"/aifar/apps/minio/2025-10-15T17-29-55Z/data"`) {
 		t.Fatalf("distributed metadata should include selected data directory: %+v", s.instances[0])
 	}
-	joinedCommands := strings.Join(remote.commands, "\n")
+	joinedCommands := remote.joinedCommands()
 	if !strings.Contains(joinedCommands, "AIFAR_MINIO_DISTRIBUTED_CONFIGURE") {
 		t.Fatalf("expected minio distributed configure action: %s", joinedCommands)
+	}
+}
+
+func TestServiceUsesConcurrencyForDistributedMinioInstalls(t *testing.T) {
+	root := t.TempDir()
+	archive := filepath.Join(root, "minio-RELEASE.2025-10-15T17-29-55Z.tar.gz")
+	goArchive := filepath.Join(root, "go", "1.24.8", "go1.24.8.linux-amd64.tar.gz")
+	goModCache := filepath.Join(root, "go", "cache", "gomodcache-linux-amd64.tar.gz")
+	for _, dir := range []string{filepath.Dir(goArchive), filepath.Dir(goModCache)} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, file := range []string{archive, goArchive, goModCache} {
+		if err := os.WriteFile(file, []byte("minio"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s := &fakeStore{servers: map[string]store.Server{
+		"srv-1": {ID: "srv-1", Name: "s3-1", Host: "10.0.0.1", DeployDir: "/aifar/apps"},
+		"srv-2": {ID: "srv-2", Name: "s3-2", Host: "10.0.0.2", DeployDir: "/aifar/apps"},
+		"srv-3": {ID: "srv-3", Name: "s3-3", Host: "10.0.0.3", DeployDir: "/aifar/apps"},
+		"srv-4": {ID: "srv-4", Name: "s3-4", Host: "10.0.0.4", DeployDir: "/aifar/apps"},
+	}}
+	remote := &fakeRemote{
+		blockInstall:   true,
+		installStarted: make(chan string, 4),
+		releaseInstall: make(chan struct{}),
+	}
+	var releaseOnce sync.Once
+	defer releaseOnce.Do(func() { close(remote.releaseInstall) })
+	service := NewService(s, remote)
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- service.Install(context.Background(), InstallRequest{
+			Version:         "2025-10-15T17-29-55Z",
+			Topology:        "distributed",
+			Language:        "en",
+			DefaultPassword: "Oversea.123",
+			ServerIDs:       []string{"srv-1", "srv-2", "srv-3", "srv-4"},
+			Concurrency:     2,
+			Parameters:      map[string]any{"apiPort": 9000, "consolePort": 9001, "rootUser": "admin"},
+		}, []store.Resource{{App: "minio", Part: "backend", Version: "2025-10-15T17-29-55Z", Path: archive}}, fakeLogger{}, nil)
+	}()
+
+	seen := map[string]bool{}
+	for len(seen) < 2 {
+		select {
+		case target := <-remote.installStarted:
+			seen[target] = true
+		case <-time.After(2 * time.Second):
+			t.Fatalf("expected two MinIO installs to start, got %v", seen)
+		}
+	}
+	select {
+	case target := <-remote.installStarted:
+		t.Fatalf("third MinIO install %s started before concurrency slot was released", target)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	releaseOnce.Do(func() { close(remote.releaseInstall) })
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("MinIO distributed install did not finish after releasing concurrent installs")
 	}
 }
 
@@ -184,7 +280,7 @@ func TestServiceDeletesMinioRemotelyBeforeRemovingInstance(t *testing.T) {
 	if len(s.instances) != 0 {
 		t.Fatalf("expected minio instance to be deleted: %+v", s.instances)
 	}
-	joinedCommands := strings.Join(remote.commands, "\n")
+	joinedCommands := remote.joinedCommands()
 	if !strings.Contains(joinedCommands, `systemctl disable --now "$SERVICE_NAME"`) {
 		t.Fatalf("expected remote command to stop minio service: %s", joinedCommands)
 	}

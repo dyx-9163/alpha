@@ -131,7 +131,7 @@ import { apiGet, apiPost, asArray } from '../api/client'
 import { pairedAppCatalog, type AppCatalogResponse, type AppStoreItem } from '../apps/registry/catalog'
 import { frontendModuleFor } from '../apps/registry/loader'
 import { resolveAppLocale } from '../apps/registry/locale'
-import type { AppFrontendModule, AppInstallPayload, ServerOption } from '../apps/registry/contract'
+import type { AppFrontendModule, AppInstallDialogContext, AppInstallPayload, ServerOption } from '../apps/registry/contract'
 import AppInstanceTable from '../components/AppInstanceTable.vue'
 import PageShell from '../components/PageShell.vue'
 import SecretConfirmPrompt from '../components/SecretConfirmPrompt.vue'
@@ -161,7 +161,11 @@ const canScanResources = computed(() => can(permissions.resourcesScan))
 const apps = computed(() => pairedAppCatalog(backendCatalog.value, locale.value))
 const filteredApps = computed(() => (category.value === 'all' ? apps.value : apps.value.filter((app) => app.category === category.value)))
 const moduleDialogComponent = computed<Component | null>(() => moduleDialogModule.value?.installDialog ?? null)
-const moduleDialogProps = computed(() => moduleDialogModule.value?.installDialogProps?.(locale.value) ?? {})
+const installDialogContext = computed<AppInstallDialogContext>(() => ({
+  servers: servers.value,
+  instances: instances.value
+}))
+const moduleDialogProps = computed(() => moduleDialogModule.value?.installDialogProps?.(locale.value, installDialogContext.value) ?? {})
 const deletePromptMessage = computed(() => {
   const row = pendingDeleteService.value
   return row ? t('apps.deleteServicePasswordPrompt', { server: serverLabel(row.serverId) }) : ''
@@ -173,6 +177,8 @@ type AppInstanceTableRecord = {
   version: string
   serverId?: string
   status?: string
+  topology?: string
+  metadata?: string
   createdAt?: string
 }
 
@@ -197,6 +203,11 @@ function deployDisabledReason(app: AppStoreItem) {
   }
   if (!app.deployable) {
     return t('apps.missing', { value: missingText(app) })
+  }
+  const module = frontendModuleFor(app.name)
+  const moduleReason = module?.deployDisabledReason?.(locale.value, installDialogContext.value)
+  if (moduleReason) {
+    return moduleReason
   }
   return ''
 }

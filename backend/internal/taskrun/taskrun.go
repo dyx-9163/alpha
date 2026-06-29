@@ -1,5 +1,10 @@
 package taskrun
 
+import (
+	"context"
+	"sync"
+)
+
 type Logger interface {
 	Info(format string, args ...any)
 	Error(format string, args ...any)
@@ -15,6 +20,11 @@ type Recorder interface {
 type Step struct {
 	Name  string
 	Title string
+}
+
+type TargetFailure struct {
+	Target string
+	Err    error
 }
 
 type Messages struct {
@@ -70,4 +80,72 @@ func FinishTarget(recorder Recorder, target, status, errText string) {
 	if recorder != nil {
 		recorder.FinishTarget(target, status, errText)
 	}
+}
+
+func RunTargets(ctx context.Context, targets []string, concurrency int, run func(target string) error) []TargetFailure {
+	if len(targets) == 0 || run == nil {
+		return nil
+	}
+	limit := NormalizeConcurrency(concurrency, len(targets))
+	sem := make(chan struct{}, limit)
+	errs := make([]error, len(targets))
+	var wg sync.WaitGroup
+	for idx, target := range targets {
+		idx, target := idx, target
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			select {
+			case <-ctx.Done():
+				errs[idx] = ctx.Err()
+				return
+			case sem <- struct{}{}:
+			}
+			defer func() { <-sem }()
+			if err := run(target); err != nil {
+				errs[idx] = err
+			}
+		}()
+	}
+	wg.Wait()
+	failures := make([]TargetFailure, 0)
+	for idx, err := range errs {
+		if err != nil {
+			failures = append(failures, TargetFailure{Target: targets[idx], Err: err})
+		}
+	}
+	return failures
+}
+
+func NormalizeConcurrency(value, total int) int {
+	if total < 1 {
+		return 1
+	}
+	if value < 1 {
+		return total
+	}
+	if value > total {
+		return total
+	}
+	return value
+}
+
+func FailureMessages(failures []TargetFailure) []string {
+	messages := make([]string, 0, len(failures))
+	for _, failure := range failures {
+		if failure.Err != nil {
+			messages = append(messages, failure.Err.Error())
+		}
+	}
+	return messages
+}
+
+func FailureTargets(failures []TargetFailure) map[string]bool {
+	out := make(map[string]bool, len(failures))
+	for _, failure := range failures {
+		if failure.Target != "" {
+			out[failure.Target] = true
+		}
+	}
+	return out
 }

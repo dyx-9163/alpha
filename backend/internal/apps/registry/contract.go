@@ -169,7 +169,8 @@ func (r RunContext) LoggerForTarget(target string) Logger {
 }
 
 type Dependencies struct {
-	Store *store.Store
+	Store           *store.Store
+	DefaultPassword string
 }
 
 type Factory func(deps Dependencies) Module

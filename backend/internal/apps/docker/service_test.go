@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -15,20 +16,27 @@ import (
 )
 
 type fakeStore struct {
+	mu        sync.Mutex
 	servers   map[string]store.Server
 	instances []store.AppInstance
 }
 
 func (f *fakeStore) GetServer(id string, includeSecret bool) (store.Server, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	return f.servers[id], nil
 }
 
 func (f *fakeStore) SaveServer(v store.Server) (store.Server, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.servers[v.ID] = v
 	return v, nil
 }
 
 func (f *fakeStore) SaveAppInstance(v store.AppInstance) (store.AppInstance, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if v.ID == "" {
 		v.ID = store.NewID("app")
 	}
@@ -50,6 +58,8 @@ func (f *fakeStore) SaveAppInstance(v store.AppInstance) (store.AppInstance, err
 }
 
 func (f *fakeStore) DeleteAppInstance(id string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	next := f.instances[:0]
 	for _, instance := range f.instances {
 		if instance.ID != id {
@@ -61,12 +71,26 @@ func (f *fakeStore) DeleteAppInstance(id string) error {
 }
 
 type fakeRemote struct {
-	commands      []string
-	failUninstall bool
-	statusStdout  string
+	mu             sync.Mutex
+	commands       []string
+	failUninstall  bool
+	statusStdout   string
+	blockInstall   bool
+	installStarted chan string
+	releaseInstall chan struct{}
 }
 
 func (f *fakeRemote) Run(ctx context.Context, server store.Server, command string) (adapter.CommandResult, error) {
+	if f.blockInstall && strings.Contains(command, "install-docker.sh") {
+		f.installStarted <- server.ID
+		select {
+		case <-ctx.Done():
+			return adapter.CommandResult{}, ctx.Err()
+		case <-f.releaseInstall:
+		}
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.commands = append(f.commands, command)
 	if f.failUninstall && strings.Contains(command, "AIFAR_DOCKER_UNINSTALL") {
 		return adapter.CommandResult{Stderr: "remote uninstall failed"}, errors.New("remote uninstall failed")
@@ -82,6 +106,18 @@ func (f *fakeRemote) Run(ctx context.Context, server store.Server, command strin
 
 func (f *fakeRemote) UploadFile(ctx context.Context, server store.Server, localPath, remotePath string, mode os.FileMode) error {
 	return nil
+}
+
+func (f *fakeRemote) joinedCommands() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return strings.Join(f.commands, "\n")
+}
+
+func (f *fakeRemote) commandCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.commands)
 }
 
 type fakeLogger struct{}
@@ -116,6 +152,61 @@ func TestServiceInstallsDockerOnMultipleServers(t *testing.T) {
 	}
 	if s.servers["srv-1"].DockerHost != "tcp://10.0.0.1:2375" {
 		t.Fatalf("expected remote docker API host to be recorded, got %s", s.servers["srv-1"].DockerHost)
+	}
+}
+
+func TestServiceUsesConcurrencyForDockerInstalls(t *testing.T) {
+	root := t.TempDir()
+	archive := filepath.Join(root, "aifar-docker-static-24.0.9-linux-x86_64.tar")
+	if err := os.WriteFile(archive, []byte("bundle"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s := &fakeStore{servers: map[string]store.Server{
+		"srv-1": {ID: "srv-1", Name: "docker-1", Host: "10.0.0.1", Username: "root"},
+		"srv-2": {ID: "srv-2", Name: "docker-2", Host: "10.0.0.2", Username: "root"},
+		"srv-3": {ID: "srv-3", Name: "docker-3", Host: "10.0.0.3", Username: "root"},
+	}}
+	remote := &fakeRemote{
+		blockInstall:   true,
+		installStarted: make(chan string, 3),
+		releaseInstall: make(chan struct{}),
+	}
+	var releaseOnce sync.Once
+	defer releaseOnce.Do(func() { close(remote.releaseInstall) })
+	service := NewService(s, remote)
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- service.Install(context.Background(), InstallRequest{
+			Version:     "24.0.9",
+			ServerIDs:   []string{"srv-1", "srv-2", "srv-3"},
+			Language:    "en",
+			Concurrency: 2,
+		}, []store.Resource{{App: "docker", Part: "backend", Version: "24.0.9", Path: archive}}, fakeLogger{}, nil)
+	}()
+
+	seen := map[string]bool{}
+	for len(seen) < 2 {
+		select {
+		case target := <-remote.installStarted:
+			seen[target] = true
+		case <-time.After(2 * time.Second):
+			t.Fatalf("expected two Docker installs to start, got %v", seen)
+		}
+	}
+	select {
+	case target := <-remote.installStarted:
+		t.Fatalf("third Docker install %s started before concurrency slot was released", target)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	releaseOnce.Do(func() { close(remote.releaseInstall) })
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Docker install did not finish after releasing concurrent installs")
 	}
 }
 
@@ -173,7 +264,7 @@ func TestServiceDeletesDockerRemotelyBeforeRemovingInstance(t *testing.T) {
 	if s.servers["srv-1"].DockerHost != "" {
 		t.Fatalf("expected DockerHost to be cleared: %+v", s.servers["srv-1"])
 	}
-	joinedCommands := strings.Join(remote.commands, "\n")
+	joinedCommands := remote.joinedCommands()
 	if !strings.Contains(joinedCommands, "systemctl disable --now docker") {
 		t.Fatalf("expected remote command to stop docker: %s", joinedCommands)
 	}
@@ -235,8 +326,8 @@ func TestModuleDeleteRequiresServerPasswordConfirmation(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected missing server password confirmation to block delete")
 	}
-	if len(remote.commands) != 0 {
-		t.Fatalf("delete must not reach remote without password confirmation: %v", remote.commands)
+	if remote.commandCount() != 0 {
+		t.Fatalf("delete must not reach remote without password confirmation: %v", remote.joinedCommands())
 	}
 	if len(s.instances) != 1 {
 		t.Fatalf("instance must remain when delete is not confirmed: %+v", s.instances)

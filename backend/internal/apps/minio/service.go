@@ -11,6 +11,7 @@ import (
 	"aifar-deployment/backend/internal/apps/deleteflow"
 	minioinstaller "aifar-deployment/backend/internal/installer/minio"
 	"aifar-deployment/backend/internal/store"
+	"aifar-deployment/backend/internal/taskrun"
 )
 
 type Store interface {
@@ -27,6 +28,7 @@ type InstallRequest struct {
 	ServerIDs       []string
 	DefaultPassword string
 	Parameters      map[string]any
+	Concurrency     int
 }
 
 type DeleteRequest struct {
@@ -204,22 +206,25 @@ func (s Service) installDistributed(ctx context.Context, req InstallRequest, res
 	installer := minioinstaller.NewInstaller(s.remote)
 	recorder, _ := log.(stepRecorder)
 	steps := minioInstallStepsFor("distributed", copy)
-	dataDirs := make(map[string]string, len(targets))
-	for _, target := range targets {
+	targetIndexes := make(map[string]int, len(targets))
+	for idx, target := range targets {
+		targetIndexes[target] = idx
+	}
+	dataDirs := make([]string, len(targets))
+	failures := taskrun.RunTargets(ctx, targets, req.Concurrency, func(target string) error {
 		logForServer := logForTarget(log, targetLog, target)
 		if recorder != nil {
 			recorder.StartTarget(target)
 		}
 		step := newStepRunnerWithSteps(logForServer, recorder, target, copy, steps)
-		var server store.Server
+		server := preloadedServers[target]
 		if err := step(1, "load-server", copy.LoadServer, func() error {
-			server = preloadedServers[target]
 			return nil
 		}); err != nil {
 			msg := fmt.Sprintf(copy.LoadFailed, err)
 			logForServer.Error("%s", msg)
 			finishTarget(recorder, target, "failed", msg)
-			return err
+			return errors.New(msg)
 		}
 		if err := step(2, "verify-resource", copy.VerifyResource, func() error {
 			return minioinstaller.VerifyBundle(bundle)
@@ -227,41 +232,53 @@ func (s Service) installDistributed(ctx context.Context, req InstallRequest, res
 			msg := fmt.Sprintf(copy.InstallFailed, err)
 			logForServer.Error("%s", msg)
 			finishTarget(recorder, target, "failed", msg)
-			return err
+			return errors.New(msg)
 		}
 		installRoot := remoteInstallRoot(server, "minio", bundle.Version)
 		if err := step(3, "select-data-disk", copy.SelectDataDisk, func() error {
 			dataDir, dataErr := installer.ResolveDataDir(ctx, server, minioDataRoot(req.Parameters), installRoot, options.APIPort, logForServer)
-			dataDirs[target] = dataDir
+			dataDirs[targetIndexes[target]] = dataDir
 			return dataErr
 		}); err != nil {
 			msg := fmt.Sprintf(copy.InstallFailed, err)
 			logForServer.Error("%s", msg)
 			finishTarget(recorder, target, "failed", msg)
-			return err
+			return errors.New(msg)
 		}
 		nodeOptions := options
-		nodeOptions.DataDir = dataDirs[target]
+		nodeOptions.DataDir = dataDirs[targetIndexes[target]]
 		if err := step(4, "install-minio", copy.InstallStandalone, func() error {
 			return installer.Install(ctx, server, bundle, nodeOptions, logForServer)
 		}); err != nil {
 			msg := fmt.Sprintf(copy.InstallFailed, err)
 			logForServer.Error("%s", msg)
 			finishTarget(recorder, target, "failed", msg)
-			return err
+			return errors.New(msg)
 		}
+		return nil
+	})
+	if len(failures) > 0 {
+		msg := fmt.Sprintf(copy.InstallFailed, strings.Join(taskrun.FailureMessages(failures), "; "))
+		failedTargets := taskrun.FailureTargets(failures)
+		for _, target := range targets {
+			if !failedTargets[target] {
+				logForTarget(log, targetLog, target).Error("%s", msg)
+				finishTarget(recorder, target, "failed", msg)
+			}
+		}
+		return errors.New(msg)
 	}
 
 	volumes := make([]minioinstaller.DistributedVolume, 0, len(targets))
-	for _, target := range targets {
+	for idx, target := range targets {
 		server := preloadedServers[target]
 		volumes = append(volumes, minioinstaller.DistributedVolume{
 			Host: server.Host,
 			Port: options.APIPort,
-			Path: dataDirs[target],
+			Path: dataDirs[idx],
 		})
 	}
-	for _, target := range targets {
+	recordFailures := taskrun.RunTargets(ctx, targets, req.Concurrency, func(target string) error {
 		logForServer := logForTarget(log, targetLog, target)
 		step := newStepRunnerWithSteps(logForServer, recorder, target, copy, steps)
 		server := preloadedServers[target]
@@ -280,7 +297,7 @@ func (s Service) installDistributed(ctx context.Context, req InstallRequest, res
 			msg := fmt.Sprintf(copy.InstallFailed, err)
 			logForServer.Error("%s", msg)
 			finishTarget(recorder, target, "failed", msg)
-			return err
+			return errors.New(msg)
 		}
 		var instance store.AppInstance
 		if err := step(6, "record-instance", copy.RecordInstance, func() error {
@@ -294,7 +311,7 @@ func (s Service) installDistributed(ctx context.Context, req InstallRequest, res
 				"consolePort":    options.ConsolePort,
 				"rootUser":       options.RootUser,
 				"serviceName":    fmt.Sprintf("aifar-minio-%d", options.APIPort),
-				"dataDir":        dataDirs[target],
+				"dataDir":        dataDirs[targetIndexes[target]],
 				"endpoint":       fmt.Sprintf("http://%s:%d", server.Host, options.APIPort),
 				"topology":       "distributed",
 				"distributedSet": len(targets),
@@ -314,10 +331,14 @@ func (s Service) installDistributed(ctx context.Context, req InstallRequest, res
 			msg := fmt.Sprintf(copy.RecordFailed, err)
 			logForServer.Error("%s", msg)
 			finishTarget(recorder, target, "failed", msg)
-			return err
+			return errors.New(msg)
 		}
 		logForServer.Info(copy.Installed, instance.ID)
 		finishTarget(recorder, target, "success", "")
+		return nil
+	})
+	if len(recordFailures) > 0 {
+		return fmt.Errorf(copy.InstallFailed, strings.Join(taskrun.FailureMessages(recordFailures), "; "))
 	}
 	log.Info(copy.DistributedInstalled, len(targets))
 	return nil

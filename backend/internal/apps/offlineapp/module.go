@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -15,6 +16,7 @@ import (
 	"aifar-deployment/backend/internal/apps/registry"
 	"aifar-deployment/backend/internal/i18n"
 	"aifar-deployment/backend/internal/store"
+	"aifar-deployment/backend/internal/taskrun"
 )
 
 type Store interface {
@@ -188,8 +190,7 @@ func (m Module) Install(ctx context.Context, req registry.InstallRequest, run re
 		return err
 	}
 	recorder, _ := run.Log.(stepRecorder)
-	var failures []string
-	for _, target := range m.targets(req) {
+	failures := taskrun.RunTargets(ctx, m.targets(req), run.Concurrency, func(target string) error {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
@@ -205,22 +206,19 @@ func (m Module) Install(ctx context.Context, req registry.InstallRequest, run re
 			server, loadErr = m.store.GetServer(target, true)
 			return loadErr
 		}, run.Log); err != nil {
-			failures = append(failures, finishFailure(recorder, target, err))
-			continue
+			return errors.New(finishFailure(recorder, target, err))
 		}
 		if err := m.runStep(def, recorder, target, 2, func() error {
 			run.Log.Info(i18n.Text(req.Language, "offline.selectedResource"), def.Name, resource.Path)
 			return nil
 		}, run.Log); err != nil {
-			failures = append(failures, finishFailure(recorder, target, err))
-			continue
+			return errors.New(finishFailure(recorder, target, err))
 		}
 		if err := m.runStep(def, recorder, target, 3, func() error {
 			run.Log.Info(i18n.Text(req.Language, "offline.installerStaged"), def.Name)
 			return nil
 		}, run.Log); err != nil {
-			failures = append(failures, finishFailure(recorder, target, err))
-			continue
+			return errors.New(finishFailure(recorder, target, err))
 		}
 		if err := m.runStep(def, recorder, target, 4, func() error {
 			metadata, _ := json.Marshal(map[string]any{
@@ -247,15 +245,15 @@ func (m Module) Install(ctx context.Context, req registry.InstallRequest, run re
 			})
 			return saveErr
 		}, run.Log); err != nil {
-			failures = append(failures, finishFailure(recorder, target, err))
-			continue
+			return errors.New(finishFailure(recorder, target, err))
 		}
 		if recorder != nil {
 			recorder.FinishTarget(target, "success", "")
 		}
-	}
+		return nil
+	})
 	if len(failures) > 0 {
-		return fmt.Errorf(i18n.Text(req.Language, "offline.installFailures"), def.Name, len(failures), strings.Join(failures, "; "))
+		return fmt.Errorf(i18n.Text(req.Language, "offline.installFailures"), def.Name, len(failures), strings.Join(taskrun.FailureMessages(failures), "; "))
 	}
 	return nil
 }

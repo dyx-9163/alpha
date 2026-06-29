@@ -17,6 +17,12 @@ var standaloneUninstallScriptTemplate string
 //go:embed templates/innodb-cluster/bootstrap.sh
 var innodbClusterBootstrapScriptTemplate string
 
+//go:embed templates/router/install.sh
+var routerInstallScriptTemplate string
+
+//go:embed templates/router/uninstall.sh
+var routerUninstallScriptTemplate string
+
 var mysqlScriptFuncs = template.FuncMap{
 	"shq": installerkit.ShellQuote,
 }
@@ -33,6 +39,14 @@ var mysqlInnoDBClusterBootstrapTemplate = template.Must(template.New("mysql-inno
 	Funcs(mysqlScriptFuncs).
 	Parse(innodbClusterBootstrapScriptTemplate))
 
+var mysqlRouterInstallTemplate = template.Must(template.New("mysql-router-install").
+	Funcs(mysqlScriptFuncs).
+	Parse(routerInstallScriptTemplate))
+
+var mysqlRouterUninstallTemplate = template.Must(template.New("mysql-router-uninstall").
+	Funcs(mysqlScriptFuncs).
+	Parse(routerUninstallScriptTemplate))
+
 func installStandaloneScript(req InstallScriptRequest) (string, error) {
 	return renderMySQLScript(mysqlStandaloneInstallTemplate, req)
 }
@@ -47,6 +61,18 @@ func uninstallStandaloneScript(version, installRoot string, port int) (string, e
 
 func bootstrapInnoDBClusterScript(req InnoDBClusterBootstrapRequest) (string, error) {
 	return renderMySQLScript(mysqlInnoDBClusterBootstrapTemplate, req)
+}
+
+func installRouterScript(req RouterInstallScriptRequest) (string, error) {
+	return renderMySQLScript(mysqlRouterInstallTemplate, req)
+}
+
+func uninstallRouterScript(version, installRoot string, basePort int) (string, error) {
+	return renderMySQLScript(mysqlRouterUninstallTemplate, RouterUninstallScriptRequest{
+		Version:     version,
+		InstallRoot: installRoot,
+		BasePort:    basePort,
+	})
 }
 
 func renderMySQLScript(tpl *template.Template, data any) (string, error) {
@@ -86,4 +112,23 @@ type InnoDBClusterBootstrapRequest struct {
 type InnoDBClusterNode struct {
 	Host string
 	Port int
+}
+
+type RouterInstallScriptRequest struct {
+	Version           string
+	WorkDir           string
+	ArchivePath       string
+	InstallRoot       string
+	BasePort          int
+	BootstrapHost     string
+	BootstrapPort     int
+	BootstrapUser     string
+	BootstrapPassword string
+	BindAddress       string
+}
+
+type RouterUninstallScriptRequest struct {
+	Version     string
+	InstallRoot string
+	BasePort    int
 }

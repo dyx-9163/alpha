@@ -162,6 +162,18 @@ func TestRedisSentinelScriptUsesConfiguredMasterName(t *testing.T) {
 	if !strings.Contains(script, "MASTER_NAME='orders-primary'") || !strings.Contains(script, "sentinel monitor $MASTER_NAME $MASTER_HOST $MASTER_PORT $QUORUM") {
 		t.Fatalf("sentinel script did not render configured master name:\n%s", script)
 	}
+	if !strings.Contains(script, `user default on >$REDIS_PASSWORD allcommands allkeys allchannels`) {
+		t.Fatalf("sentinel script should configure default ACL user for client connections:\n%s", script)
+	}
+	if !strings.Contains(script, `sentinel sentinel-pass $REDIS_PASSWORD`) {
+		t.Fatalf("sentinel script should configure sentinel-to-sentinel authentication:\n%s", script)
+	}
+	if !strings.Contains(script, `redis-cli" -p "$SENTINEL_PORT" -a "$REDIS_PASSWORD" --no-auth-warning sentinel masters`) {
+		t.Fatalf("sentinel verification should authenticate to sentinel:\n%s", script)
+	}
+	if !strings.Contains(script, `journalctl -u "$SENTINEL_SERVICE" -n 120 --no-pager`) || !strings.Contains(script, `sed -n '1,160p' "$SENTINEL_CONFIG"`) {
+		t.Fatalf("sentinel script should print service diagnostics on startup failure:\n%s", script)
+	}
 	if strings.Contains(script, "Requires=$SERVICE_NAME.service") {
 		t.Fatalf("sentinel unit should not require local Redis data service:\n%s", script)
 	}

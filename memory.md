@@ -114,3 +114,28 @@
 - 结论：已将 Redis Sentinel 前端安装弹窗改为角色化配置：Master 单选、Replica 多选、Sentinel 多选，并在隐藏默认目标选择器时自动提交三组节点并集 `serverIds`；后端按角色安装和记录实例，支持专用 Sentinel 节点只安装 Redis 二进制与 Sentinel 服务，不启动无意义的数据服务；旧 `serverIds + sentinelMasterId` 调用仍兼容；`pnpm test`、`pnpm web:build`、`pnpm backend:build`、`git diff --check` 均通过。
 - 问题：用户反馈 Redis Sentinel 安装弹窗样式不对，角色标签换行错位，并询问 `Sentinel Quorum` 这一行是否可以不要。
 - 结论：已调整通用安装弹窗 label 宽度与不换行样式，缩短 Redis Sentinel 角色字段标签为 Master/Replica/Sentinel 节点，并移除前端 `Sentinel Quorum` 输入行；后端继续按 Sentinel 节点数自动计算默认 quorum；`pnpm web:build` 和 `git diff --check` 已通过。
+## 2026-06-29
+- 问题：用户要求所有安装服务都以面板设置中的并发数为准进行并发执行。
+- 结论：新增 `taskrun.RunTargets` 作为统一目标并发执行器，Docker 多服务器安装、Redis Sentinel/Cluster、MinIO distributed 和旧 `offlineapp` 多目标安装均已接入 `RunContext.Concurrency`；MySQL InnoDB Cluster 继续使用已有并发参数路径。新增/更新并发上限测试，`pnpm test` 与 `git diff --check` 已通过。
+- 问题：用户截图反馈 Redis 连接报 `DENIED Redis is running in protected mode ... no password is set for the default user`。
+- 结论：原因是 Sentinel 配置只设置了 `sentinel auth-pass`，没有给 Sentinel 自身客户端连接设置密码；已在 `sentinel.conf` 渲染 `requirepass $REDIS_PASSWORD`，并让 Sentinel 自检命令带 `-a` 认证；`go test ./internal/installer/redis ./internal/apps/redis`、`pnpm test`、`git diff --check` 已通过。
+- 问题：用户反馈 Redis Sentinel 第 4/5 步在 `systemctl enable --now` 后失败，只看到 systemd symlink 输出和进程退出。
+- 结论：Sentinel 自身认证改为 Redis 7 官方 ACL 方式，配置默认用户 ACL 与 `sentinel sentinel-pass`，保留监控 Redis master 的 `sentinel auth-pass`；启动和自检失败时会输出 `systemctl status`、`journalctl` 与 Sentinel 配置片段；`go test ./internal/installer/redis ./internal/apps/redis`、`pnpm test`、`git diff --check` 已通过。
+- 问题：用户截图反馈 Navicat 连接 Redis Sentinel 报 `With sentinel, connection timeout and socket timeout cannot be 0`，并说明集群已创建好，先不要改代码。
+- 结论：该错误是 Navicat Sentinel 模式的本地参数校验，尚未真正连到 Sentinel/Redis；需要在 Navicat 高级设置里把 connection timeout 和 socket timeout 改成非 0 值，再按 Sentinel 主机端口、master group 名称和认证信息测试连接。
+- 问题：用户补充 Navicat 常规页参数和三台服务器 `ss -lntp` 监听截图，说明 Sentinel/Redis 配置看起来正常但 Navicat 仍报同一 timeout 校验错误。
+- 结论：截图可确认三台机器 `26379` 和 `6379` 正在监听，常规页主机、端口、组名与认证方向不像根因；该报错仍应优先定位 Navicat 高级页的 connection/socket timeout 字段是否为空或为 0，或 Navicat 未保存这些高级参数。服务端可用 `redis-cli -p 26379 SENTINEL get-master-addr-by-name <master>` 与 Windows `Test-NetConnection` 做旁路验证。
+- 问题：用户用 `redis-cli` 带 Sentinel 密码查询 master group，已正常返回当前 master 地址和 Redis 端口。
+- 结论：Sentinel 认证、master group 名称和 Sentinel 到 Redis master 发现链路均正常；Navicat 报错可进一步判定为客户端自身 Sentinel timeout 配置校验或客户端参数未保存生效，不是 AIFAR 安装出的 Redis/Sentinel 集群不可用。
+- 问题：用户反馈 Navicat Redis Sentinel 连接已恢复正常，并截图显示已能展开 Redis 数据库列表。
+- 结论：Redis Sentinel 集群和客户端连接链路已验证可用；先前问题确认为 Navicat 客户端连接参数/超时设置导致，不需要修改 AIFAR 代码。
+- 问题：用户反馈数据库页面将 MySQL InnoDB Cluster 和 Redis Sentinel 的节点拆成多个独立卡片展示，集群应该放在一起。
+- 结论：数据库实例页已改为按集群/拓扑聚合展示：多节点拓扑优先用 metadata 中的 `clusterId` 聚合，卡片内按 master/replica/sentinel 节点行展示服务器、Endpoint、状态和操作；standalone 仍显示为单节点卡片；Redis 设置说明同步为支持 standalone、Sentinel 与 Cluster；`pnpm web:build` 和 `git diff --check` 已通过。
+- 问题：用户询问数据库集群卡片中的 `Endpoint` 是否就是 master 节点。
+- 结论：Redis Sentinel 卡片的 Endpoint 当前表示 master group 指向的 Redis master 数据节点；MySQL InnoDB Cluster 卡片的 Endpoint 当前只是聚合卡选择的代表/种子节点，不应严格理解为实时 primary，后续展示文案宜区分“当前 Master/Primary”和“接入端点”。
+## 2026-06-29
+- 问题：用户要求 Redis Sentinel 显示“当前 Master”或“Master Group”，MySQL InnoDB Cluster 需要通过检测任务查询当前 primary 后回写并展示。
+- 结论：MySQL 模块已实现检测任务，检测会查询 InnoDB Cluster 当前 primary 并回写同组实例的 `currentPrimaryEndpoint` 与 primary/secondary 角色；数据库页面会按拓扑动态显示“当前 Master”“Master Group”“当前 Primary”或“接入端点”。`pnpm test`、`pnpm web:build`、`git diff --check` 已通过。
+## 2026-06-29
+- ���⣺�û�Ҫ����Ӧ���̵����� MySQL Router ��װ��ڣ�����ֻ������ MySQL InnoDB Cluster ʱ����ѡ��װ��
+- ���ۣ��������� `mysql-router` ���Ӧ��ģ���ǰ��Ӧ���̵�ģ�飬���� MySQL ���� bundle �е� Router ����ǰ���� InnoDB Cluster ʱ���ò�����ڣ���˰�װУ����봫������ `clusterId` ������ bootstrap endpoint��Router ֧�ֶ�Ŀ�겢����װ����¼����ʵ��������ж�ء�`go test ./internal/installer/mysql ./internal/apps/mysqlrouter`��`pnpm test`��`pnpm web:build`��`git diff --check` ��ͨ����

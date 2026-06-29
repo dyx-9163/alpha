@@ -8,6 +8,22 @@ export interface ServerOption {
   host: string
 }
 
+export interface AppInstanceOption {
+  id: string
+  app: string
+  version: string
+  serverId?: string
+  status?: string
+  topology?: string
+  metadata?: string
+  createdAt?: string
+}
+
+export interface AppInstallDialogContext {
+  servers: ServerOption[]
+  instances: AppInstanceOption[]
+}
+
 export interface AppInstallPayload {
   version: string
   serverId?: string
@@ -92,6 +108,7 @@ export interface AppFrontendModule {
   name: string
   manifest(locale?: string): FrontendAppDefinition
   installDialog?: Component
-  installDialogProps?(locale?: string): AppInstallDialogConfig
+  installDialogProps?(locale?: string, context?: AppInstallDialogContext): AppInstallDialogConfig
+  deployDisabledReason?(locale: string | undefined, context: AppInstallDialogContext): string
   supportsMultiTarget?: boolean
 }

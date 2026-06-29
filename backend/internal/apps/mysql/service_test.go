@@ -2,6 +2,7 @@ package mysql
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -24,13 +25,33 @@ func (f *fakeStore) GetServer(id string, includeSecret bool) (store.Server, erro
 }
 
 func (f *fakeStore) SaveAppInstance(v store.AppInstance) (store.AppInstance, error) {
+	now := time.Now()
 	if v.ID == "" {
 		v.ID = store.NewID("app")
+		v.CreatedAt = now
 	}
-	v.CreatedAt = time.Now()
-	v.UpdatedAt = v.CreatedAt
+	for idx, existing := range f.instances {
+		if existing.ID == v.ID {
+			if v.CreatedAt.IsZero() {
+				v.CreatedAt = existing.CreatedAt
+			}
+			v.UpdatedAt = now
+			f.instances[idx] = v
+			return v, nil
+		}
+	}
+	if v.CreatedAt.IsZero() {
+		v.CreatedAt = now
+	}
+	v.UpdatedAt = now
 	f.instances = append(f.instances, v)
 	return v, nil
+}
+
+func (f *fakeStore) ListAppInstances() ([]store.AppInstance, error) {
+	out := make([]store.AppInstance, len(f.instances))
+	copy(out, f.instances)
+	return out, nil
 }
 
 func (f *fakeStore) DeleteAppInstance(id string) error {
@@ -50,6 +71,7 @@ type fakeRemote struct {
 	blockInstall   bool
 	installStarted chan string
 	releaseInstall chan struct{}
+	primaryOutput  string
 }
 
 func (f *fakeRemote) Run(ctx context.Context, server store.Server, command string) (adapter.CommandResult, error) {
@@ -62,8 +84,11 @@ func (f *fakeRemote) Run(ctx context.Context, server store.Server, command strin
 		}
 	}
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.commands = append(f.commands, command)
+	f.mu.Unlock()
+	if strings.Contains(command, "replication_group_members") {
+		return adapter.CommandResult{Stdout: f.primaryOutput}, nil
+	}
 	return adapter.CommandResult{Stdout: "ok"}, nil
 }
 
@@ -214,6 +239,61 @@ func TestServiceLogsClusterNodeCompletionForInnoDBCluster(t *testing.T) {
 	}
 }
 
+func TestServiceCheckInnoDBClusterRecordsCurrentPrimary(t *testing.T) {
+	clusterID := "mysql_cluster_test"
+	now := time.Now()
+	instances := []store.AppInstance{
+		mysqlClusterInstance("app-1", "srv-1", clusterID, "10.0.0.1:3306", now),
+		mysqlClusterInstance("app-2", "srv-2", clusterID, "10.0.0.2:3306", now),
+		mysqlClusterInstance("app-3", "srv-3", clusterID, "10.0.0.3:3306", now),
+	}
+	s := &fakeStore{
+		servers: map[string]store.Server{
+			"srv-1": {ID: "srv-1", Name: "mysql-1", Host: "10.0.0.1", DeployDir: "/aifar/apps"},
+			"srv-2": {ID: "srv-2", Name: "mysql-2", Host: "10.0.0.2", DeployDir: "/aifar/apps"},
+			"srv-3": {ID: "srv-3", Name: "mysql-3", Host: "10.0.0.3", DeployDir: "/aifar/apps"},
+		},
+		instances: instances,
+	}
+	remote := &fakeRemote{primaryOutput: "10.0.0.2:3306\n"}
+	service := NewService(s, remote)
+
+	result, err := service.Check(context.Background(), CheckRequest{
+		Instance:        instances[0],
+		Server:          s.servers["srv-1"],
+		Language:        "en",
+		DefaultPassword: "Oversea.123",
+	}, fakeLogger{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != "running" {
+		t.Fatalf("expected running check result, got %+v", result)
+	}
+	for _, instance := range s.instances {
+		metadata := map[string]any{}
+		if err := json.Unmarshal([]byte(instance.Metadata), &metadata); err != nil {
+			t.Fatal(err)
+		}
+		if got := metadata["currentPrimaryEndpoint"]; got != "10.0.0.2:3306" {
+			t.Fatalf("expected current primary to be recorded for %s, got %v", instance.ID, got)
+		}
+		if instance.Status != "running" {
+			t.Fatalf("expected instance %s status running, got %s", instance.ID, instance.Status)
+		}
+		expectedRole := "secondary"
+		if metadata["endpoint"] == "10.0.0.2:3306" {
+			expectedRole = "primary"
+		}
+		if got := metadata["role"]; got != expectedRole {
+			t.Fatalf("expected %s role %s, got %v", instance.ID, expectedRole, got)
+		}
+	}
+	if !strings.Contains(remote.joinedCommands(), "replication_group_members") {
+		t.Fatal("expected check to query InnoDB Cluster replication group members")
+	}
+}
+
 func TestServiceInstallsInnoDBClusterBaseConcurrently(t *testing.T) {
 	root := t.TempDir()
 	archive := filepath.Join(root, "mysql-aifar-8.0.36-official-bundle.tar")
@@ -294,5 +374,27 @@ func TestServiceDeletesMySQLRemotelyBeforeRemovingInstance(t *testing.T) {
 	}
 	if !strings.Contains(joinedCommands, `rm -rf "$INSTALL_ROOT"`) {
 		t.Fatalf("expected remote command to remove mysql install root: %s", joinedCommands)
+	}
+}
+
+func mysqlClusterInstance(id, serverID, clusterID, endpoint string, createdAt time.Time) store.AppInstance {
+	metadata, _ := json.Marshal(map[string]any{
+		"clusterId":   clusterID,
+		"clusterName": "aifarCluster",
+		"endpoint":    endpoint,
+		"port":        3306,
+		"rootUser":    "root",
+		"topology":    "innodb-cluster",
+	})
+	return store.AppInstance{
+		ID:        id,
+		App:       "mysql",
+		Version:   "8.0.36",
+		ServerID:  serverID,
+		Status:    "installed",
+		Topology:  "innodb-cluster",
+		Metadata:  string(metadata),
+		CreatedAt: createdAt,
+		UpdatedAt: createdAt,
 	}
 }

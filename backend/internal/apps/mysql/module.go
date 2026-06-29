@@ -13,17 +13,22 @@ import (
 )
 
 type Module struct {
-	service Service
+	service         Service
+	defaultPassword string
 }
 
 func init() {
 	registry.RegisterFactory("mysql", func(deps registry.Dependencies) registry.Module {
-		return NewModule(deps.Store, adapter.SSHRemote{})
+		return NewModule(deps.Store, adapter.SSHRemote{}, deps.DefaultPassword)
 	})
 }
 
-func NewModule(s Store, remote mysqlinstaller.Remote) Module {
-	return Module{service: NewService(s, remote)}
+func NewModule(s Store, remote mysqlinstaller.Remote, defaultPassword ...string) Module {
+	password := ""
+	if len(defaultPassword) > 0 {
+		password = defaultPassword[0]
+	}
+	return Module{service: NewService(s, remote), defaultPassword: password}
 }
 
 func (m Module) Name() string {
@@ -182,4 +187,33 @@ func (m Module) Delete(ctx context.Context, req registry.DeleteRequest, run regi
 	}, run.Log, func(target string) mysqlinstaller.Logger {
 		return run.LoggerForTarget(target)
 	})
+}
+
+func (m Module) PlanCheck(ctx context.Context, req registry.CheckRequest) ([]registry.InstallStepPlan, error) {
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	copy := CheckCopyFor(req.Language)
+	steps := mysqlCheckStepsFor(instanceTopology(req.Instance), copy)
+	target := req.Instance.ServerID
+	if target == "" {
+		target = req.Server.ID
+	}
+	plan := make([]registry.InstallStepPlan, 0, len(steps))
+	for idx, step := range steps {
+		plan = append(plan, registry.InstallStepPlan{Target: target, Name: step.Name, Title: step.Title, Order: idx + 1})
+	}
+	return plan, nil
+}
+
+func (m Module) Check(ctx context.Context, req registry.CheckRequest, run registry.RunContext) (registry.InstanceStatus, error) {
+	result, err := m.service.Check(ctx, CheckRequest{
+		Instance:        req.Instance,
+		Server:          req.Server,
+		Language:        req.Language,
+		DefaultPassword: m.defaultPassword,
+	}, run.Log, func(target string) mysqlinstaller.Logger {
+		return run.LoggerForTarget(target)
+	})
+	return registry.InstanceStatus{Status: result.Status, Message: result.Message, Details: result.Details}, err
 }

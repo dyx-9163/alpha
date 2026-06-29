@@ -8,8 +8,10 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"aifar-deployment/backend/internal/apps/deleteflow"
+	"aifar-deployment/backend/internal/installer/installerkit"
 	mysqlinstaller "aifar-deployment/backend/internal/installer/mysql"
 	"aifar-deployment/backend/internal/store"
 	"aifar-deployment/backend/internal/taskrun"
@@ -18,6 +20,7 @@ import (
 type Store interface {
 	GetServer(id string, includeSecret bool) (store.Server, error)
 	SaveAppInstance(v store.AppInstance) (store.AppInstance, error)
+	ListAppInstances() ([]store.AppInstance, error)
 	DeleteAppInstance(id string) error
 }
 
@@ -36,6 +39,19 @@ type DeleteRequest struct {
 	Instance store.AppInstance
 	Server   store.Server
 	Language string
+}
+
+type CheckRequest struct {
+	Instance        store.AppInstance
+	Server          store.Server
+	Language        string
+	DefaultPassword string
+}
+
+type CheckResult struct {
+	Status  string
+	Message string
+	Details map[string]any
 }
 
 type Service struct {
@@ -358,12 +374,173 @@ func (s Service) Delete(ctx context.Context, req DeleteRequest, log mysqlinstall
 	})
 }
 
+func (s Service) Check(ctx context.Context, req CheckRequest, log mysqlinstaller.Logger, targetLog targetLogger) (CheckResult, error) {
+	copy := CheckCopyFor(req.Language)
+	target := req.Instance.ServerID
+	if target == "" {
+		target = req.Server.ID
+	}
+	logForServer := logForTarget(log, targetLog, target)
+	recorder, _ := log.(stepRecorder)
+	taskrun.StartTarget(recorder, target)
+	topology := instanceTopology(req.Instance)
+	steps := mysqlCheckStepsFor(topology, copy)
+	step := newCheckStepRunnerWithSteps(logForServer, recorder, target, copy, steps)
+	details := map[string]any{
+		"checkedAt": time.Now().UTC().Format(time.RFC3339),
+		"topology":  topology,
+	}
+
+	fail := func(err error) (CheckResult, error) {
+		msg := fmt.Sprintf(copy.CheckFailed, err)
+		_ = s.markInstanceStatus(req.Instance, "failed", map[string]any{
+			"checkedAt": details["checkedAt"],
+			"topology":  topology,
+			"error":     err.Error(),
+		})
+		finishTarget(recorder, target, "failed", msg)
+		return CheckResult{Status: "failed", Message: msg, Details: details}, err
+	}
+
+	if err := step(1, "check-runtime", copy.CheckRuntime, func() error {
+		return s.checkMySQLRuntime(ctx, req.Server, req.Instance, req.DefaultPassword, logForServer)
+	}); err != nil {
+		return fail(err)
+	}
+
+	primaryEndpoint := ""
+	nextStep := 2
+	if topology == "innodb-cluster" {
+		if err := step(2, "detect-primary", copy.DetectPrimary, func() error {
+			var detectErr error
+			primaryEndpoint, detectErr = s.detectInnoDBPrimary(ctx, req.Server, req.Instance, req.DefaultPassword, logForServer)
+			return detectErr
+		}); err != nil {
+			return fail(err)
+		}
+		details["currentPrimaryEndpoint"] = primaryEndpoint
+		nextStep = 3
+	}
+
+	if err := step(nextStep, "update-instance", copy.UpdateInstance, func() error {
+		if topology == "innodb-cluster" && primaryEndpoint != "" {
+			return s.markInnoDBClusterPrimary(req.Instance, primaryEndpoint, details)
+		}
+		return s.markInstanceStatus(req.Instance, "running", details)
+	}); err != nil {
+		return fail(err)
+	}
+
+	msg := fmt.Sprintf(copy.Checked, "running")
+	logForServer.Info("%s", msg)
+	finishTarget(recorder, target, "success", "")
+	return CheckResult{Status: "running", Message: msg, Details: details}, nil
+}
+
 func mysqlOptions(params map[string]any, defaultPassword string) mysqlinstaller.InstallOptions {
 	return mysqlinstaller.InstallOptions{
 		Port:         intParam(params, "port", 3306),
 		RootUser:     stringParam(params, "rootUser", "root"),
 		RootPassword: passwordParam(params, defaultPassword),
 	}
+}
+
+func (s Service) checkMySQLRuntime(ctx context.Context, server store.Server, instance store.AppInstance, defaultPassword string, log mysqlinstaller.Logger) error {
+	port := instancePort(instance)
+	rootUser := instanceRootUser(instance)
+	rootPassword := passwordParam(nil, defaultPassword)
+	installRoot := remoteInstallRoot(server, "mysql", instance.Version)
+	cmd := fmt.Sprintf("MYSQL_PWD=%s %s --protocol=tcp -h 127.0.0.1 -P %d -u %s ping",
+		installerkit.ShellQuote(rootPassword),
+		installerkit.ShellQuote(installRoot+"/mysql/bin/mysqladmin"),
+		port,
+		installerkit.ShellQuote(rootUser),
+	)
+	_, err := installerkit.Run(ctx, s.remote, server, cmd, log, "mysql remote command failed")
+	return err
+}
+
+func (s Service) detectInnoDBPrimary(ctx context.Context, server store.Server, instance store.AppInstance, defaultPassword string, log mysqlinstaller.Logger) (string, error) {
+	port := instancePort(instance)
+	rootUser := instanceRootUser(instance)
+	rootPassword := passwordParam(nil, defaultPassword)
+	installRoot := remoteInstallRoot(server, "mysql", instance.Version)
+	query := "SELECT CONCAT(MEMBER_HOST, ':', MEMBER_PORT) FROM performance_schema.replication_group_members WHERE MEMBER_ROLE='PRIMARY' LIMIT 1"
+	cmd := fmt.Sprintf("MYSQL_PWD=%s %s --protocol=tcp -h 127.0.0.1 -P %d -u %s --batch --skip-column-names -e %s",
+		installerkit.ShellQuote(rootPassword),
+		installerkit.ShellQuote(installRoot+"/mysql/bin/mysql"),
+		port,
+		installerkit.ShellQuote(rootUser),
+		installerkit.ShellQuote(query),
+	)
+	result, err := installerkit.Run(ctx, s.remote, server, cmd, log, "mysql remote command failed")
+	if err != nil {
+		return "", err
+	}
+	primary := firstNonEmptyLine(result.Stdout)
+	if primary == "" {
+		return "", errors.New("InnoDB Cluster primary was not returned")
+	}
+	return primary, nil
+}
+
+func (s Service) markInnoDBClusterPrimary(instance store.AppInstance, primaryEndpoint string, details map[string]any) error {
+	instances, err := s.store.ListAppInstances()
+	if err != nil {
+		return err
+	}
+	matched := false
+	detectedAt := time.Now().UTC().Format(time.RFC3339)
+	for _, candidate := range instances {
+		if !sameMySQLCluster(instance, candidate) {
+			continue
+		}
+		matched = true
+		metadata := appMetadata(candidate)
+		metadata["currentPrimaryEndpoint"] = primaryEndpoint
+		metadata["primaryEndpoint"] = primaryEndpoint
+		metadata["primaryDetectedAt"] = detectedAt
+		metadata["lastCheck"] = map[string]any{
+			"status":    "running",
+			"checkedAt": detectedAt,
+			"details":   details,
+		}
+		if normalizeEndpoint(metadataString(metadata, "endpoint")) == normalizeEndpoint(primaryEndpoint) {
+			metadata["role"] = "primary"
+		} else {
+			metadata["role"] = "secondary"
+		}
+		if metadataString(metadata, "topology") == "" {
+			metadata["topology"] = "innodb-cluster"
+		}
+		data, _ := json.Marshal(metadata)
+		candidate.Metadata = string(data)
+		candidate.Status = "running"
+		if candidate.Topology == "" {
+			candidate.Topology = "innodb-cluster"
+		}
+		if _, err := s.store.SaveAppInstance(candidate); err != nil {
+			return err
+		}
+	}
+	if !matched {
+		return s.markInstanceStatus(instance, "running", details)
+	}
+	return nil
+}
+
+func (s Service) markInstanceStatus(instance store.AppInstance, status string, details map[string]any) error {
+	metadata := appMetadata(instance)
+	metadata["lastCheck"] = map[string]any{
+		"status":    status,
+		"checkedAt": time.Now().UTC().Format(time.RFC3339),
+		"details":   details,
+	}
+	data, _ := json.Marshal(metadata)
+	instance.Metadata = string(data)
+	instance.Status = status
+	_, err := s.store.SaveAppInstance(instance)
+	return err
 }
 
 func passwordParam(params map[string]any, fallback string) string {
@@ -462,6 +639,70 @@ func instancePort(instance store.AppInstance) int {
 	return normalizePort(metadata.Port, 3306)
 }
 
+func instanceRootUser(instance store.AppInstance) string {
+	return stringParam(appMetadata(instance), "rootUser", "root")
+}
+
+func appMetadata(instance store.AppInstance) map[string]any {
+	metadata := map[string]any{}
+	_ = json.Unmarshal([]byte(instance.Metadata), &metadata)
+	if metadata == nil {
+		return map[string]any{}
+	}
+	return metadata
+}
+
+func metadataString(metadata map[string]any, key string) string {
+	value, ok := metadata[key]
+	if !ok {
+		return ""
+	}
+	text := strings.TrimSpace(fmt.Sprint(value))
+	if text == "<nil>" {
+		return ""
+	}
+	return text
+}
+
+func instanceTopology(instance store.AppInstance) string {
+	if strings.TrimSpace(instance.Topology) != "" {
+		return normalizeTopology(instance.Topology)
+	}
+	return normalizeTopology(metadataString(appMetadata(instance), "topology"))
+}
+
+func sameMySQLCluster(base, candidate store.AppInstance) bool {
+	if candidate.App != "mysql" || instanceTopology(candidate) != "innodb-cluster" {
+		return false
+	}
+	baseMetadata := appMetadata(base)
+	candidateMetadata := appMetadata(candidate)
+	if clusterID := metadataString(baseMetadata, "clusterId"); clusterID != "" {
+		return clusterID == metadataString(candidateMetadata, "clusterId")
+	}
+	if clusterName := metadataString(baseMetadata, "clusterName"); clusterName != "" {
+		return strings.EqualFold(clusterName, metadataString(candidateMetadata, "clusterName"))
+	}
+	return base.ID != "" && base.ID == candidate.ID
+}
+
+func normalizeEndpoint(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	value = strings.TrimPrefix(value, "tcp://")
+	value = strings.TrimPrefix(value, "mysql://")
+	return value
+}
+
+func firstNonEmptyLine(value string) string {
+	for _, line := range strings.Split(value, "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			return line
+		}
+	}
+	return ""
+}
+
 func normalizeTopology(topology string) string {
 	topology = strings.ToLower(strings.TrimSpace(topology))
 	if topology == "" || topology == "single" {
@@ -521,12 +762,43 @@ func mysqlDeleteSteps(copy DeleteCopy) []stepDef {
 	}
 }
 
+func mysqlCheckStepsFor(topology string, copy CheckCopy) []stepDef {
+	if normalizeTopology(topology) == "innodb-cluster" {
+		return []stepDef{
+			{Name: "check-runtime", Title: copy.CheckRuntime},
+			{Name: "detect-primary", Title: copy.DetectPrimary},
+			{Name: "update-instance", Title: copy.UpdateInstance},
+		}
+	}
+	return []stepDef{
+		{Name: "check-runtime", Title: copy.CheckRuntime},
+		{Name: "update-instance", Title: copy.UpdateInstance},
+	}
+}
+
 func newStepRunner(log mysqlinstaller.Logger, recorder stepRecorder, target string, copy Copy) func(stepIndex int, stepName, label string, fn func() error) error {
 	steps := mysqlInstallSteps(copy)
 	return newStepRunnerWithSteps(log, recorder, target, copy, steps)
 }
 
 func newStepRunnerWithSteps(log mysqlinstaller.Logger, recorder stepRecorder, target string, copy Copy, steps []stepDef) func(stepIndex int, stepName, label string, fn func() error) error {
+	runner := taskrun.Runner{
+		Log:      log,
+		Recorder: recorder,
+		Target:   target,
+		Steps:    steps,
+		Messages: taskrun.Messages{
+			StepStart:  copy.StepStart,
+			StepDone:   copy.StepDone,
+			StepFailed: copy.StepFailed,
+		},
+	}
+	return func(stepIndex int, stepName, label string, fn func() error) error {
+		return runner.Run(stepIndex, stepName, label, fn)
+	}
+}
+
+func newCheckStepRunnerWithSteps(log mysqlinstaller.Logger, recorder stepRecorder, target string, copy CheckCopy, steps []stepDef) func(stepIndex int, stepName, label string, fn func() error) error {
 	runner := taskrun.Runner{
 		Log:      log,
 		Recorder: recorder,

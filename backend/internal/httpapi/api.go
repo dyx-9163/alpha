@@ -53,7 +53,7 @@ func New(cfg config.Config, s *store.Store, tasks *worker.Manager) *API {
 		cfg:     cfg,
 		store:   s,
 		tasks:   tasks,
-		apps:    registry.NewFromRegistered(registry.Dependencies{Store: s}),
+		apps:    registry.NewFromRegistered(registry.Dependencies{Store: s, DefaultPassword: cfg.DefaultPassword}),
 		servers: serverdomain.NewService(s, serverdomain.SSHProber{}, cfg.DefaultDeployDir),
 		auth:    security.NewLoginGuard(cfg.AuthMaxFailures, time.Duration(cfg.AuthLockoutSeconds)*time.Second),
 	}

@@ -1,10 +1,13 @@
 package taskrun
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 type fakeLogger struct {
@@ -82,5 +85,45 @@ func TestRunnerRecordsFailedStep(t *testing.T) {
 	}
 	if len(log.errors) != 1 || !strings.Contains(log.errors[0], "boom") {
 		t.Fatalf("unexpected error logs: %+v", log.errors)
+	}
+}
+
+func TestRunTargetsUsesConcurrencyLimit(t *testing.T) {
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	defer releaseOnce.Do(func() { close(release) })
+	started := make(chan string, 3)
+	done := make(chan []TargetFailure, 1)
+	go func() {
+		done <- RunTargets(context.Background(), []string{"srv-1", "srv-2", "srv-3"}, 2, func(target string) error {
+			started <- target
+			<-release
+			return nil
+		})
+	}()
+
+	seen := map[string]bool{}
+	for len(seen) < 2 {
+		select {
+		case target := <-started:
+			seen[target] = true
+		case <-time.After(time.Second):
+			t.Fatalf("expected first two targets to start, got %v", seen)
+		}
+	}
+	select {
+	case target := <-started:
+		t.Fatalf("third target %s started before a concurrency slot was released", target)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	releaseOnce.Do(func() { close(release) })
+	select {
+	case failures := <-done:
+		if len(failures) != 0 {
+			t.Fatalf("unexpected failures: %+v", failures)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("targets did not finish after release")
 	}
 }

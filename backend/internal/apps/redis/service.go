@@ -11,6 +11,7 @@ import (
 	"aifar-deployment/backend/internal/apps/deleteflow"
 	redisinstaller "aifar-deployment/backend/internal/installer/redis"
 	"aifar-deployment/backend/internal/store"
+	"aifar-deployment/backend/internal/taskrun"
 )
 
 type Store interface {
@@ -27,6 +28,7 @@ type InstallRequest struct {
 	ServerIDs       []string
 	DefaultPassword string
 	Parameters      map[string]any
+	Concurrency     int
 }
 
 type DeleteRequest struct {
@@ -193,35 +195,31 @@ func (s Service) installSentinel(ctx context.Context, req InstallRequest, resour
 
 	clusterID := store.NewID("redis_sentinel")
 	servers := make(map[string]store.Server, len(targets))
+	for _, target := range targets {
+		server, loadErr := s.store.GetServer(target, true)
+		if loadErr != nil {
+			return loadErr
+		}
+		servers[target] = server
+	}
+	masterServer := servers[masterTarget]
 	installer := redisinstaller.NewInstaller(s.remote)
 	recorder, _ := log.(stepRecorder)
-	var masterServer store.Server
-	for idx, target := range targets {
+	failures := taskrun.RunTargets(ctx, targets, req.Concurrency, func(target string) error {
 		logForServer := logForTarget(log, targetLog, target)
 		if recorder != nil {
 			recorder.StartTarget(target)
 		}
 		steps := redisSentinelStepsForTarget(copy, roles.IsSentinel(target))
 		step := newStepRunnerWithSteps(logForServer, recorder, target, copy, steps)
-		var server store.Server
+		server := servers[target]
 		if err := step(1, "load-server", copy.LoadServer, func() error {
-			var loadErr error
-			server, loadErr = s.store.GetServer(target, true)
-			if loadErr == nil {
-				servers[target] = server
-				if target == masterTarget {
-					masterServer = server
-				}
-			}
-			return loadErr
+			return nil
 		}); err != nil {
 			msg := fmt.Sprintf(copy.LoadFailed, err)
 			logForServer.Error("%s", msg)
 			finishTarget(recorder, target, "failed", msg)
-			return err
-		}
-		if idx > 0 && strings.TrimSpace(masterServer.Host) == "" {
-			masterServer = servers[masterTarget]
+			return errors.New(msg)
 		}
 		if err := step(2, "verify-resource", copy.VerifyResource, func() error {
 			return redisinstaller.VerifyBundle(bundle)
@@ -229,7 +227,7 @@ func (s Service) installSentinel(ctx context.Context, req InstallRequest, resour
 			msg := fmt.Sprintf(copy.InstallFailed, err)
 			logForServer.Error("%s", msg)
 			finishTarget(recorder, target, "failed", msg)
-			return err
+			return errors.New(msg)
 		}
 		installRoot := remoteInstallRoot(server, "redis", bundle.Version)
 		role := roles.RoleFor(target)
@@ -242,7 +240,7 @@ func (s Service) installSentinel(ctx context.Context, req InstallRequest, resour
 			msg := fmt.Sprintf(copy.InstallFailed, err)
 			logForServer.Error("%s", msg)
 			finishTarget(recorder, target, "failed", msg)
-			return err
+			return errors.New(msg)
 		}
 		recordStepIndex := 4
 		if roles.IsSentinel(target) {
@@ -264,7 +262,7 @@ func (s Service) installSentinel(ctx context.Context, req InstallRequest, resour
 				msg := fmt.Sprintf(copy.InstallFailed, err)
 				logForServer.Error("%s", msg)
 				finishTarget(recorder, target, "failed", msg)
-				return err
+				return errors.New(msg)
 			}
 		}
 		var instance store.AppInstance
@@ -302,10 +300,14 @@ func (s Service) installSentinel(ctx context.Context, req InstallRequest, resour
 			msg := fmt.Sprintf(copy.RecordFailed, err)
 			logForServer.Error("%s", msg)
 			finishTarget(recorder, target, "failed", msg)
-			return err
+			return errors.New(msg)
 		}
 		logForServer.Info(copy.Installed, instance.ID)
 		finishTarget(recorder, target, "success", "")
+		return nil
+	})
+	if len(failures) > 0 {
+		return fmt.Errorf(copy.BatchFailed, len(failures), strings.Join(taskrun.FailureMessages(failures), "; "))
 	}
 	log.Info(copy.ClusterInstalled, "sentinel", len(targets))
 	return nil
@@ -350,21 +352,20 @@ func (s Service) installCluster(ctx context.Context, req InstallRequest, resourc
 	installer := redisinstaller.NewInstaller(s.remote)
 	recorder, _ := log.(stepRecorder)
 	steps := redisInstallStepsFor("cluster", copy)
-	for _, target := range targets {
+	failures := taskrun.RunTargets(ctx, targets, req.Concurrency, func(target string) error {
 		logForServer := logForTarget(log, targetLog, target)
 		if recorder != nil {
 			recorder.StartTarget(target)
 		}
 		step := newStepRunnerWithSteps(logForServer, recorder, target, copy, steps)
-		var server store.Server
+		server := preloadedServers[target]
 		if err := step(1, "load-server", copy.LoadServer, func() error {
-			server = preloadedServers[target]
 			return nil
 		}); err != nil {
 			msg := fmt.Sprintf(copy.LoadFailed, err)
 			logForServer.Error("%s", msg)
 			finishTarget(recorder, target, "failed", msg)
-			return err
+			return errors.New(msg)
 		}
 		if err := step(2, "verify-resource", copy.VerifyResource, func() error {
 			return redisinstaller.VerifyBundle(bundle)
@@ -372,7 +373,7 @@ func (s Service) installCluster(ctx context.Context, req InstallRequest, resourc
 			msg := fmt.Sprintf(copy.InstallFailed, err)
 			logForServer.Error("%s", msg)
 			finishTarget(recorder, target, "failed", msg)
-			return err
+			return errors.New(msg)
 		}
 		installRoot := remoteInstallRoot(server, "redis", bundle.Version)
 		if err := step(3, "install-redis", copy.InstallStandalone, func() error {
@@ -381,7 +382,7 @@ func (s Service) installCluster(ctx context.Context, req InstallRequest, resourc
 			msg := fmt.Sprintf(copy.InstallFailed, err)
 			logForServer.Error("%s", msg)
 			finishTarget(recorder, target, "failed", msg)
-			return err
+			return errors.New(msg)
 		}
 		if err := step(4, "enable-cluster", copy.EnableClusterNode, func() error {
 			return installer.EnableClusterNode(ctx, server, redisinstaller.ClusterNodeConfig{
@@ -394,8 +395,20 @@ func (s Service) installCluster(ctx context.Context, req InstallRequest, resourc
 			msg := fmt.Sprintf(copy.InstallFailed, err)
 			logForServer.Error("%s", msg)
 			finishTarget(recorder, target, "failed", msg)
-			return err
+			return errors.New(msg)
 		}
+		return nil
+	})
+	if len(failures) > 0 {
+		msg := fmt.Sprintf(copy.BatchFailed, len(failures), strings.Join(taskrun.FailureMessages(failures), "; "))
+		failedTargets := taskrun.FailureTargets(failures)
+		for _, target := range targets {
+			if !failedTargets[target] {
+				logForTarget(log, targetLog, target).Error("%s", msg)
+				finishTarget(recorder, target, "failed", msg)
+			}
+		}
+		return errors.New(msg)
 	}
 
 	bootstrapTarget := targets[0]
@@ -421,7 +434,7 @@ func (s Service) installCluster(ctx context.Context, req InstallRequest, resourc
 		return err
 	}
 
-	for _, target := range targets {
+	recordFailures := taskrun.RunTargets(ctx, targets, req.Concurrency, func(target string) error {
 		logForServer := logForTarget(log, targetLog, target)
 		step := newStepRunnerWithSteps(logForServer, recorder, target, copy, steps)
 		server := preloadedServers[target]
@@ -452,10 +465,14 @@ func (s Service) installCluster(ctx context.Context, req InstallRequest, resourc
 			msg := fmt.Sprintf(copy.RecordFailed, err)
 			logForServer.Error("%s", msg)
 			finishTarget(recorder, target, "failed", msg)
-			return err
+			return errors.New(msg)
 		}
 		logForServer.Info(copy.Installed, instance.ID)
 		finishTarget(recorder, target, "success", "")
+		return nil
+	})
+	if len(recordFailures) > 0 {
+		return fmt.Errorf(copy.BatchFailed, len(recordFailures), strings.Join(taskrun.FailureMessages(recordFailures), "; "))
 	}
 	log.Info(copy.ClusterInstalled, "cluster", len(targets))
 	return nil

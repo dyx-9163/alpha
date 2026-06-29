@@ -3,11 +3,13 @@ package docker
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 
 	dockerinstaller "aifar-deployment/backend/internal/installer/docker"
 	"aifar-deployment/backend/internal/store"
+	"aifar-deployment/backend/internal/taskrun"
 )
 
 type Store interface {
@@ -18,11 +20,12 @@ type Store interface {
 }
 
 type InstallRequest struct {
-	Version    string
-	Topology   string
-	Language   string
-	ServerIDs  []string
-	Parameters map[string]any
+	Version     string
+	Topology    string
+	Language    string
+	ServerIDs   []string
+	Parameters  map[string]any
+	Concurrency int
 }
 
 type DeleteRequest struct {
@@ -80,16 +83,22 @@ func (s Service) Install(ctx context.Context, req InstallRequest, resources []st
 	log.Info(copy.UsingRPMs, len(bundle.RPMPaths))
 	installer := dockerinstaller.NewInstaller(s.remote)
 	recorder, _ := log.(stepRecorder)
-	var failures []string
-	for idx, serverID := range req.ServerIDs {
+	targets := req.ServerIDs
+	targetIndexes := make(map[string]int, len(targets))
+	for idx, target := range targets {
+		targetIndexes[target] = idx + 1
+	}
+	failures := taskrun.RunTargets(ctx, targets, req.Concurrency, func(serverID string) error {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
 		if recorder != nil {
 			recorder.StartTarget(serverID)
 		}
+		idx := targetIndexes[serverID]
+		total := len(targets)
 		logForServer := logForTarget(log, targetLog, serverID)
-		step := newStepRunner(logForServer, recorder, serverID, copy, idx+1, len(req.ServerIDs))
+		step := newStepRunner(logForServer, recorder, serverID, copy, idx, total)
 		var server store.Server
 		if err := step(1, copy.LoadServer, func() error {
 			var loadErr error
@@ -97,19 +106,17 @@ func (s Service) Install(ctx context.Context, req InstallRequest, resources []st
 			return loadErr
 		}); err != nil {
 			msg := fmt.Sprintf("%s: %v", serverID, err)
-			failures = append(failures, msg)
-			logForServer.Error(copy.LoadFailed, idx+1, len(req.ServerIDs), msg)
+			logForServer.Error(copy.LoadFailed, idx, total, msg)
 			finishTarget(recorder, serverID, "failed", msg)
-			continue
+			return errors.New(msg)
 		}
 		if err := step(2, copy.InstallEngine, func() error {
 			return installer.InstallWithLanguage(ctx, server, bundle, logForServer, req.Language, options)
 		}); err != nil {
 			msg := fmt.Sprintf("%s: %v", server.Name, err)
-			failures = append(failures, msg)
-			logForServer.Error(copy.InstallFailed, idx+1, len(req.ServerIDs), msg)
+			logForServer.Error(copy.InstallFailed, idx, total, msg)
 			finishTarget(recorder, serverID, "failed", msg)
-			continue
+			return errors.New(msg)
 		}
 		server.DockerHost = dockerinstaller.RemoteAPIHost(server.Host, options.RemoteAPIPort)
 		server.Status = "available"
@@ -119,10 +126,9 @@ func (s Service) Install(ctx context.Context, req InstallRequest, resources []st
 			return err
 		}); err != nil {
 			msg := fmt.Sprintf("%s: %v", server.Name, err)
-			failures = append(failures, msg)
-			logForServer.Error(copy.UpdateFailed, idx+1, len(req.ServerIDs), msg)
+			logForServer.Error(copy.UpdateFailed, idx, total, msg)
 			finishTarget(recorder, serverID, "failed", msg)
-			continue
+			return errors.New(msg)
 		}
 		metadata, _ := json.Marshal(map[string]any{
 			"dockerHost":       server.DockerHost,
@@ -138,16 +144,16 @@ func (s Service) Install(ctx context.Context, req InstallRequest, resources []st
 			return saveErr
 		}); err != nil {
 			msg := fmt.Sprintf("%s: %v", server.Name, err)
-			failures = append(failures, msg)
-			logForServer.Error(copy.RecordFailed, idx+1, len(req.ServerIDs), msg)
+			logForServer.Error(copy.RecordFailed, idx, total, msg)
 			finishTarget(recorder, serverID, "failed", msg)
-			continue
+			return errors.New(msg)
 		}
-		logForServer.Info(copy.Installed, idx+1, len(req.ServerIDs), instance.ID)
+		logForServer.Info(copy.Installed, idx, total, instance.ID)
 		finishTarget(recorder, serverID, "success", "")
-	}
+		return nil
+	})
 	if len(failures) > 0 {
-		return fmt.Errorf(copy.BatchFailed, len(failures), strings.Join(failures, "; "))
+		return fmt.Errorf(copy.BatchFailed, len(failures), strings.Join(taskrun.FailureMessages(failures), "; "))
 	}
 	return nil
 }
