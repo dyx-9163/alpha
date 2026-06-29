@@ -38,6 +38,12 @@
         :disabled-reason="deniedText"
       />
 
+      <UserManagementPanel
+        ref="userPanel"
+        :can-manage="canManageUsers"
+        :disabled-reason="deniedText"
+      />
+
       <el-alert
         :title="t('settings.realModeTitle')"
         :description="t('settings.realModeDesc')"
@@ -75,6 +81,7 @@ import { apiGet, apiPut } from '../api/client'
 import ControlPlaneHealthPanel from '../components/ControlPlaneHealthPanel.vue'
 import DataMaintenancePanel from '../components/DataMaintenancePanel.vue'
 import KeyValueGrid from '../components/KeyValueGrid.vue'
+import UserManagementPanel from '../components/UserManagementPanel.vue'
 import { usePermissions } from '../composables/usePermissions'
 import { useI18n } from '../i18n'
 import { permissions } from '../rbac'
@@ -89,12 +96,14 @@ const form = reactive<any>({ language: locale.value, deploymentConcurrency: 2, m
 const now = ref('')
 const maintenancePanel = ref<RefreshablePanel | null>(null)
 const healthPanel = ref<RefreshablePanel | null>(null)
+const userPanel = ref<RefreshablePanel | null>(null)
 const platform = navigator.platform.toLowerCase().includes('win') ? 'windows' : 'linux'
 const providerModeLabel = computed(() => {
   const mode = form.providerStatus || form.providerMode || 'real'
   return mode === 'real' ? t('common.real') : mode
 })
 const canManageSettings = computed(() => can(permissions.settingsManage))
+const canManageUsers = computed(() => can(permissions.usersManage))
 const moduleRows = computed(() => {
   const modules = form.moduleStatus ?? {}
   return Object.keys(modules).map((module) => ({ module, message: moduleMessage(module), time: now.value }))
@@ -126,7 +135,7 @@ async function load() {
   form.language = locale.value
   form.deploymentConcurrency = Number(form.deploymentConcurrency)
   now.value = new Date().toISOString()
-  await Promise.all([maintenancePanel.value?.refresh(), healthPanel.value?.refresh()])
+  await Promise.all([maintenancePanel.value?.refresh(), userPanel.value?.refresh(), healthPanel.value?.refresh()])
 }
 async function save() {
   if (!canManageSettings.value) {

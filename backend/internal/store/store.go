@@ -215,7 +215,33 @@ func (s *Store) BootstrapUser(username, password string) error {
 	return err
 }
 
+func (s *Store) CreateUser(username, password, role string) (UserSummary, error) {
+	username = strings.TrimSpace(username)
+	role = strings.TrimSpace(role)
+	if username == "" || password == "" || role == "" {
+		return UserSummary{}, errors.New("username, password and role are required")
+	}
+	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	if err != nil {
+		return UserSummary{}, err
+	}
+	user := UserSummary{
+		ID:           NewID("usr"),
+		Username:     username,
+		Role:         role,
+		TokenVersion: 1,
+		CreatedAt:    time.Now(),
+	}
+	_, err = s.db.Exec(`insert into users(id, username, role, token_version, password_hash, created_at) values(?,?,?,?,?,?)`,
+		user.ID, user.Username, user.Role, user.TokenVersion, string(hash), user.CreatedAt)
+	if err != nil {
+		return UserSummary{}, err
+	}
+	return user, nil
+}
+
 func (s *Store) ResetUserPassword(username, password string) error {
+	username = strings.TrimSpace(username)
 	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
 	if err != nil {
 		return err
@@ -246,6 +272,12 @@ func (s *Store) SetUserRole(username, role string) error {
 		return sql.ErrNoRows
 	}
 	return nil
+}
+
+func (s *Store) CountUsersByRole(role string) (int, error) {
+	var count int
+	err := s.db.QueryRow(`select count(*) from users where lower(role)=lower(?)`, strings.TrimSpace(role)).Scan(&count)
+	return count, err
 }
 
 func (s *Store) ListUsers() ([]UserSummary, error) {

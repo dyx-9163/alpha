@@ -229,6 +229,105 @@ func TestSettingsExposeSecurityLimits(t *testing.T) {
 	}
 }
 
+func TestUserManagementLifecycle(t *testing.T) {
+	api, db, secret := newAuthzTestAPI(t)
+	ownerToken := issueTestToken(t, db, secret, "owner", "owner")
+
+	createReq := httptest.NewRequest(http.MethodPost, "/api/v2/users", strings.NewReader(`{"username":"ops","password":"StrongPass123","role":"operator"}`))
+	createReq.Header.Set("Authorization", "Bearer "+ownerToken)
+	createReq.Header.Set("Content-Type", "application/json")
+	createRec := httptest.NewRecorder()
+	api.Router().ServeHTTP(createRec, createReq)
+	if createRec.Code != http.StatusCreated {
+		t.Fatalf("expected create user 201, got %d body=%s", createRec.Code, createRec.Body.String())
+	}
+
+	roleReq := httptest.NewRequest(http.MethodPut, "/api/v2/users/ops/role", strings.NewReader(`{"role":"admin"}`))
+	roleReq.Header.Set("Authorization", "Bearer "+ownerToken)
+	roleReq.Header.Set("Content-Type", "application/json")
+	roleRec := httptest.NewRecorder()
+	api.Router().ServeHTTP(roleRec, roleReq)
+	if roleRec.Code != http.StatusOK {
+		t.Fatalf("expected role update 200, got %d body=%s", roleRec.Code, roleRec.Body.String())
+	}
+
+	passwordReq := httptest.NewRequest(http.MethodPut, "/api/v2/users/ops/password", strings.NewReader(`{"password":"NewStrongPass123"}`))
+	passwordReq.Header.Set("Authorization", "Bearer "+ownerToken)
+	passwordReq.Header.Set("Content-Type", "application/json")
+	passwordRec := httptest.NewRecorder()
+	api.Router().ServeHTTP(passwordRec, passwordReq)
+	if passwordRec.Code != http.StatusOK {
+		t.Fatalf("expected password reset 200, got %d body=%s", passwordRec.Code, passwordRec.Body.String())
+	}
+
+	loginRec := postLogin(api, "ops", "NewStrongPass123")
+	if loginRec.Code != http.StatusOK {
+		t.Fatalf("expected updated user login 200, got %d body=%s", loginRec.Code, loginRec.Body.String())
+	}
+
+	listReq := httptest.NewRequest(http.MethodGet, "/api/v2/users", nil)
+	listReq.Header.Set("Authorization", "Bearer "+ownerToken)
+	listRec := httptest.NewRecorder()
+	api.Router().ServeHTTP(listRec, listReq)
+	if listRec.Code != http.StatusOK {
+		t.Fatalf("expected list users 200, got %d body=%s", listRec.Code, listRec.Body.String())
+	}
+	var listBody struct {
+		Items []struct {
+			Username string `json:"username"`
+			Role     string `json:"role"`
+		} `json:"items"`
+	}
+	if err := json.Unmarshal(listRec.Body.Bytes(), &listBody); err != nil {
+		t.Fatal(err)
+	}
+	foundOps := false
+	for _, item := range listBody.Items {
+		if item.Username == "ops" && item.Role == "admin" {
+			foundOps = true
+		}
+	}
+	if !foundOps {
+		t.Fatalf("expected ops admin in user list: %+v", listBody.Items)
+	}
+
+	operatorToken := issueTestToken(t, db, secret, "operator", "operator")
+	deniedReq := httptest.NewRequest(http.MethodGet, "/api/v2/users", nil)
+	deniedReq.Header.Set("Authorization", "Bearer "+operatorToken)
+	deniedRec := httptest.NewRecorder()
+	api.Router().ServeHTTP(deniedRec, deniedReq)
+	if deniedRec.Code != http.StatusForbidden {
+		t.Fatalf("expected operator user list 403, got %d body=%s", deniedRec.Code, deniedRec.Body.String())
+	}
+
+	assertAuditExists(t, db, "users.create", "success", "owner", "ops")
+	assertAuditExists(t, db, "users.role.update", "success", "owner", "ops")
+	assertAuditExists(t, db, "users.password.reset", "success", "owner", "ops")
+	assertAuditExists(t, db, "auth.permission.denied", "failed", "operator", "users.manage")
+}
+
+func TestCannotDemoteLastOwner(t *testing.T) {
+	api, db, secret := newAuthzTestAPI(t)
+	ownerToken := issueTestToken(t, db, secret, "owner", "owner")
+
+	req := httptest.NewRequest(http.MethodPut, "/api/v2/users/owner/role", strings.NewReader(`{"role":"admin"}`))
+	req.Header.Set("Authorization", "Bearer "+ownerToken)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	api.Router().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected last owner demotion 400, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	user, err := db.UserByUsername("owner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if user.Role != "owner" {
+		t.Fatalf("expected owner role to remain owner, got %s", user.Role)
+	}
+}
+
 func TestRetentionCleanupStartsTask(t *testing.T) {
 	api, db, secret := newAuthzTestAPI(t)
 	api.cfg.AuditRetentionDays = 1

@@ -6,6 +6,7 @@ type Permission string
 
 const (
 	SettingsManage   Permission = "settings.manage"
+	UsersManage      Permission = "users.manage"
 	ResourcesScan    Permission = "resources.scan"
 	ServersManage    Permission = "servers.manage"
 	TerminalConnect  Permission = "terminal.connect"
@@ -49,6 +50,15 @@ func Permissions(role string) []Permission {
 	return out
 }
 
+func ValidRole(role string) bool {
+	_, ok := rolePermissions[normalizeRole(role)]
+	return ok
+}
+
+func NormalizeRole(role string) string {
+	return normalizeRole(role)
+}
+
 func normalizeRole(role string) string {
 	return strings.ToLower(strings.TrimSpace(role))
 }
@@ -56,6 +66,7 @@ func normalizeRole(role string) string {
 func allPermissions() map[Permission]struct{} {
 	return permissionSet(
 		SettingsManage,
+		UsersManage,
 		ResourcesScan,
 		ServersManage,
 		TerminalConnect,

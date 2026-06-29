@@ -75,3 +75,5 @@
 - 结论：新增 `GET /api/v2/health/live`、`GET /api/v2/health/ready` 无鉴权探活接口，登录后 `GET /api/v2/health` 返回数据库、资源目录、静态目录和备份目录状态；store 新增轻量 `Ping()`；设置页新增“控制面健康”展示并复用现有 `KeyValueGrid`/`StatusTag`；`StatusTag` 支持 `ok/degraded`；新增 HTTP 测试覆盖 live/ready/detail；`pnpm test` 与 `pnpm web:build` 已通过。
 - 问题：用户要求优化不要过度精细化，当前设置页的数据维护和控制面健康逻辑开始堆在页面里，需要按功能边界解耦但避免设计模式化。
 - 结论：新增 `DataMaintenancePanel.vue` 和 `ControlPlaneHealthPanel.vue`，设置页只保留语言、并发、服务商/模块状态等页面编排；数据备份/清理和健康探活各自组件化管理，`pnpm web:build` 与 `pnpm test` 通过。
+- 问题：持续目标推进到账号与角色治理，同时用户要求这个目标完成后先停止优化，因为还有业务代码未完成。
+- 结论：新增 `users.manage` 权限、用户管理 API、审计记录和最后一个 owner 保护；设置页新增 `UserManagementPanel.vue` 支持账号列表、新增账号、修改角色和重置密码；`pnpm test`、`pnpm web:build` 与 `git diff --check` 通过；本轮提交后先暂停继续优化，不再主动开新优化任务。

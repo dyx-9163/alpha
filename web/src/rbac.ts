@@ -1,5 +1,6 @@
 export const permissions = {
   settingsManage: 'settings.manage',
+  usersManage: 'users.manage',
   resourcesScan: 'resources.scan',
   serversManage: 'servers.manage',
   terminalConnect: 'terminal.connect',
