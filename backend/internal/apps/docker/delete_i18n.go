@@ -17,7 +17,7 @@ func DeleteCopyFor(lang string) DeleteCopy {
 	case "en":
 		return DeleteCopy{
 			RemoveRemote:   "remove Docker service and files from target server",
-			VerifyRemoved:  "verify Docker service removal",
+			VerifyRemoved:  "verify AIFAR Docker deployment removal",
 			UpdateServer:   "clear server Docker status",
 			DeleteInstance: "delete Docker app instance record",
 			StepStart:      "delete step %d/%d started: %s",
@@ -29,7 +29,7 @@ func DeleteCopyFor(lang string) DeleteCopy {
 	default:
 		return DeleteCopy{
 			RemoveRemote:   "从目标服务器移除 Docker 服务和文件",
-			VerifyRemoved:  "校验 Docker 服务已删除",
+			VerifyRemoved:  "校验 AIFAR Docker 部署已删除",
 			UpdateServer:   "清理服务器 Docker 状态",
 			DeleteInstance: "删除 Docker 应用实例记录",
 			StepStart:      "删除步骤 %d/%d 开始：%s",

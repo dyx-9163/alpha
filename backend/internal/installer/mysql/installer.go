@@ -10,19 +10,13 @@ import (
 	"strings"
 	"time"
 
-	"aifar-deployment/backend/internal/adapter"
+	"aifar-deployment/backend/internal/installer/installerkit"
+	"aifar-deployment/backend/internal/installer/uploadkit"
 	"aifar-deployment/backend/internal/store"
 )
 
-type Logger interface {
-	Info(format string, args ...any)
-	Error(format string, args ...any)
-}
-
-type Remote interface {
-	Run(ctx context.Context, server store.Server, command string) (adapter.CommandResult, error)
-	UploadFile(ctx context.Context, server store.Server, localPath, remotePath string, mode os.FileMode) error
-}
+type Logger = installerkit.Logger
+type Remote = installerkit.Remote
 
 type Installer struct {
 	remote Remote
@@ -45,25 +39,28 @@ func (i Installer) Install(ctx context.Context, server store.Server, bundle Bund
 	if err := req.Validate(); err != nil {
 		return err
 	}
-	deployDir := remoteDeployDir(server.DeployDir)
-	workDir := path.Join(deployDir, "_work", fmt.Sprintf("mysql-%s-%d", sanitize(bundle.Version), time.Now().Unix()))
+	deployDir := installerkit.RemoteDeployDir(server.DeployDir)
+	workDir := installerkit.WorkDir(deployDir, "mysql", bundle.Version, time.Now())
 	installRoot := path.Join(deployDir, "mysql", bundle.Version)
 	archiveRemote := workDir + "/" + filepath.Base(bundle.ArchivePath)
 
 	log.Info("prepare MySQL work directory: %s", workDir)
-	if _, err := i.run(ctx, server, "mkdir -p "+shellQuote(workDir+"/rpms"), log); err != nil {
+	if _, err := i.run(ctx, server, "mkdir -p "+installerkit.ShellQuote(workDir+"/rpms"), log); err != nil {
 		return err
 	}
 
-	log.Info("upload MySQL official bundle: %s", bundle.ArchivePath)
-	if err := i.remote.UploadFile(ctx, server, bundle.ArchivePath, archiveRemote, 0o644); err != nil {
-		return fmt.Errorf("upload mysql bundle failed: %w", err)
+	if err := uploadkit.Upload(ctx, i.remote, server, uploadkit.File{
+		LocalPath:      bundle.ArchivePath,
+		RemotePath:     archiveRemote,
+		LogMessage:     "upload MySQL official bundle: %s",
+		LogArgs:        []any{bundle.ArchivePath},
+		FailureMessage: "upload mysql bundle failed",
+	}, log); err != nil {
+		return err
 	}
-	for _, rpm := range bundle.RPMPaths {
-		remoteRPM := workDir + "/rpms/" + filepath.Base(rpm)
-		log.Info("upload MySQL RPM dependency: %s", filepath.Base(rpm))
-		if err := i.remote.UploadFile(ctx, server, rpm, remoteRPM, 0o644); err != nil {
-			return fmt.Errorf("upload mysql rpm %s failed: %w", filepath.Base(rpm), err)
+	for _, file := range uploadkit.RPMFiles(bundle.RPMPaths, workDir+"/rpms", "upload MySQL RPM dependency: %s", "upload mysql rpm %s failed") {
+		if err := uploadkit.Upload(ctx, i.remote, server, file, log); err != nil {
+			return err
 		}
 	}
 
@@ -80,17 +77,22 @@ func (i Installer) Install(ctx context.Context, server store.Server, bundle Bund
 		return err
 	}
 	scriptRemote := workDir + "/install-mysql.sh"
-	scriptLocal, err := writeTempScript(script)
+	scriptLocal, err := installerkit.WriteTempScript("aifar-mysql-install-*.sh", script)
 	if err != nil {
 		return err
 	}
 	defer os.Remove(scriptLocal)
-	log.Info("upload MySQL installer script")
-	if err := i.remote.UploadFile(ctx, server, scriptLocal, scriptRemote, 0o755); err != nil {
-		return fmt.Errorf("upload mysql installer script failed: %w", err)
+	if err := uploadkit.Upload(ctx, i.remote, server, uploadkit.File{
+		LocalPath:      scriptLocal,
+		RemotePath:     scriptRemote,
+		Mode:           0o755,
+		LogMessage:     "upload MySQL installer script",
+		FailureMessage: "upload mysql installer script failed",
+	}, log); err != nil {
+		return err
 	}
 	log.Info("install MySQL standalone service")
-	if _, err := i.run(ctx, server, "sh "+shellQuote(scriptRemote), log); err != nil {
+	if _, err := i.run(ctx, server, "sh "+installerkit.ShellQuote(scriptRemote), log); err != nil {
 		return err
 	}
 	log.Info("MySQL %s installed and verified on port %d", bundle.Version, req.Port)
@@ -128,52 +130,6 @@ func (o InstallOptions) Validate() error {
 	return nil
 }
 
-func (i Installer) run(ctx context.Context, server store.Server, command string, log Logger) (adapter.CommandResult, error) {
-	result, err := i.remote.Run(ctx, server, command)
-	if strings.TrimSpace(result.Stdout) != "" {
-		log.Info("%s", strings.TrimSpace(result.Stdout))
-	}
-	if strings.TrimSpace(result.Stderr) != "" {
-		if err != nil {
-			log.Error("%s", strings.TrimSpace(result.Stderr))
-		} else {
-			log.Info("%s", strings.TrimSpace(result.Stderr))
-		}
-	}
-	if err != nil {
-		return result, fmt.Errorf("mysql remote command failed: %w", err)
-	}
-	return result, nil
-}
-
-func writeTempScript(script string) (string, error) {
-	f, err := os.CreateTemp("", "aifar-mysql-install-*.sh")
-	if err != nil {
-		return "", err
-	}
-	defer f.Close()
-	if _, err := f.WriteString(script); err != nil {
-		return "", err
-	}
-	return f.Name(), nil
-}
-
-func remoteDeployDir(value string) string {
-	value = strings.TrimSpace(value)
-	if value == "" {
-		return "/aifar/apps"
-	}
-	return "/" + strings.Trim(path.Clean(value), "/")
-}
-
-func sanitize(value string) string {
-	replacer := strings.NewReplacer("/", "-", "\\", "-", ":", "-", " ", "-", "'", "")
-	return replacer.Replace(value)
-}
-
-func shellQuote(value string) string {
-	if value == "" {
-		return "''"
-	}
-	return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
+func (i Installer) run(ctx context.Context, server store.Server, command string, log Logger) (installerkit.CommandResult, error) {
+	return installerkit.Run(ctx, i.remote, server, command, log, "mysql remote command failed")
 }

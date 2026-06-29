@@ -10,19 +10,14 @@ import (
 	"strings"
 	"time"
 
-	"aifar-deployment/backend/internal/adapter"
+	"aifar-deployment/backend/internal/installer/installerkit"
+	"aifar-deployment/backend/internal/installer/uploadkit"
 	"aifar-deployment/backend/internal/store"
 )
 
-type Logger interface {
-	Info(format string, args ...any)
-	Error(format string, args ...any)
-}
+type Logger = installerkit.Logger
 
-type Remote interface {
-	Run(ctx context.Context, server store.Server, command string) (adapter.CommandResult, error)
-	UploadFile(ctx context.Context, server store.Server, localPath, remotePath string, mode os.FileMode) error
-}
+type Remote = installerkit.Remote
 
 type Installer struct {
 	remote Remote
@@ -39,8 +34,8 @@ func (i Installer) Install(ctx context.Context, server store.Server, bundle Bund
 	if err := req.Validate(); err != nil {
 		return err
 	}
-	deployDir := remoteDeployDir(server.DeployDir)
-	workDir := path.Join(deployDir, "_work", fmt.Sprintf("minio-%s-%d", sanitize(bundle.Version), time.Now().Unix()))
+	deployDir := installerkit.RemoteDeployDir(server.DeployDir)
+	workDir := installerkit.WorkDir(deployDir, "minio", bundle.Version, time.Now())
 	installRoot := path.Join(deployDir, "minio", bundle.Version)
 	archiveRemote := workDir + "/" + filepath.Base(bundle.ArchivePath)
 	goArchiveRemote := workDir + "/" + filepath.Base(bundle.GoArchivePath)
@@ -51,33 +46,47 @@ func (i Installer) Install(ctx context.Context, server store.Server, bundle Bund
 	}
 
 	log.Info("prepare MinIO work directory: %s", workDir)
-	if _, err := i.run(ctx, server, "mkdir -p "+shellQuote(workDir+"/rpms"), log); err != nil {
+	if _, err := i.run(ctx, server, "mkdir -p "+installerkit.ShellQuote(workDir+"/rpms"), log); err != nil {
 		return err
 	}
 
-	log.Info("upload MinIO source archive: %s", bundle.ArchivePath)
-	if err := i.remote.UploadFile(ctx, server, bundle.ArchivePath, archiveRemote, 0o644); err != nil {
-		return fmt.Errorf("upload minio archive failed: %w", err)
-	}
-	log.Info("upload Go toolchain archive: %s", bundle.GoArchivePath)
-	if err := i.remote.UploadFile(ctx, server, bundle.GoArchivePath, goArchiveRemote, 0o644); err != nil {
-		return fmt.Errorf("upload minio go toolchain failed: %w", err)
-	}
-	log.Info("upload Go module cache archive: %s", bundle.GoModCachePath)
-	if err := i.remote.UploadFile(ctx, server, bundle.GoModCachePath, goModCacheRemote, 0o644); err != nil {
-		return fmt.Errorf("upload minio go module cache failed: %w", err)
+	uploads := []uploadkit.File{
+		{
+			LocalPath:      bundle.ArchivePath,
+			RemotePath:     archiveRemote,
+			LogMessage:     "upload MinIO source archive: %s",
+			LogArgs:        []any{bundle.ArchivePath},
+			FailureMessage: "upload minio archive failed",
+		},
+		{
+			LocalPath:      bundle.GoArchivePath,
+			RemotePath:     goArchiveRemote,
+			LogMessage:     "upload Go toolchain archive: %s",
+			LogArgs:        []any{bundle.GoArchivePath},
+			FailureMessage: "upload minio go toolchain failed",
+		},
+		{
+			LocalPath:      bundle.GoModCachePath,
+			RemotePath:     goModCacheRemote,
+			LogMessage:     "upload Go module cache archive: %s",
+			LogArgs:        []any{bundle.GoModCachePath},
+			FailureMessage: "upload minio go module cache failed",
+		},
 	}
 	if mcRemote != "" {
-		log.Info("upload MinIO client: %s", bundle.MCPath)
-		if err := i.remote.UploadFile(ctx, server, bundle.MCPath, mcRemote, 0o755); err != nil {
-			return fmt.Errorf("upload minio client failed: %w", err)
-		}
+		uploads = append(uploads, uploadkit.File{
+			LocalPath:      bundle.MCPath,
+			RemotePath:     mcRemote,
+			Mode:           0o755,
+			LogMessage:     "upload MinIO client: %s",
+			LogArgs:        []any{bundle.MCPath},
+			FailureMessage: "upload minio client failed",
+		})
 	}
-	for _, rpm := range bundle.RPMPaths {
-		remoteRPM := workDir + "/rpms/" + filepath.Base(rpm)
-		log.Info("upload MinIO RPM dependency: %s", filepath.Base(rpm))
-		if err := i.remote.UploadFile(ctx, server, rpm, remoteRPM, 0o644); err != nil {
-			return fmt.Errorf("upload minio rpm %s failed: %w", filepath.Base(rpm), err)
+	uploads = append(uploads, uploadkit.RPMFiles(bundle.RPMPaths, workDir+"/rpms", "upload MinIO RPM dependency: %s", "upload minio rpm %s failed")...)
+	for _, file := range uploads {
+		if err := uploadkit.Upload(ctx, i.remote, server, file, log); err != nil {
+			return err
 		}
 	}
 
@@ -98,17 +107,22 @@ func (i Installer) Install(ctx context.Context, server store.Server, bundle Bund
 		return err
 	}
 	scriptRemote := workDir + "/install-minio.sh"
-	scriptLocal, err := writeTempScript(script)
+	scriptLocal, err := installerkit.WriteTempScript("aifar-minio-install-*.sh", script)
 	if err != nil {
 		return err
 	}
 	defer os.Remove(scriptLocal)
-	log.Info("upload MinIO installer script")
-	if err := i.remote.UploadFile(ctx, server, scriptLocal, scriptRemote, 0o755); err != nil {
-		return fmt.Errorf("upload minio installer script failed: %w", err)
+	if err := uploadkit.Upload(ctx, i.remote, server, uploadkit.File{
+		LocalPath:      scriptLocal,
+		RemotePath:     scriptRemote,
+		Mode:           0o755,
+		LogMessage:     "upload MinIO installer script",
+		FailureMessage: "upload minio installer script failed",
+	}, log); err != nil {
+		return err
 	}
 	log.Info("install MinIO standalone service")
-	if _, err := i.run(ctx, server, "sh "+shellQuote(scriptRemote), log); err != nil {
+	if _, err := i.run(ctx, server, "sh "+installerkit.ShellQuote(scriptRemote), log); err != nil {
 		return err
 	}
 	log.Info("MinIO %s installed and verified on ports %d/%d", bundle.Version, req.APIPort, req.ConsolePort)
@@ -159,52 +173,6 @@ func (o InstallOptions) Validate() error {
 	return nil
 }
 
-func (i Installer) run(ctx context.Context, server store.Server, command string, log Logger) (adapter.CommandResult, error) {
-	result, err := i.remote.Run(ctx, server, command)
-	if strings.TrimSpace(result.Stdout) != "" {
-		log.Info("%s", strings.TrimSpace(result.Stdout))
-	}
-	if strings.TrimSpace(result.Stderr) != "" {
-		if err != nil {
-			log.Error("%s", strings.TrimSpace(result.Stderr))
-		} else {
-			log.Info("%s", strings.TrimSpace(result.Stderr))
-		}
-	}
-	if err != nil {
-		return result, fmt.Errorf("minio remote command failed: %w", err)
-	}
-	return result, nil
-}
-
-func writeTempScript(script string) (string, error) {
-	f, err := os.CreateTemp("", "aifar-minio-install-*.sh")
-	if err != nil {
-		return "", err
-	}
-	defer f.Close()
-	if _, err := f.WriteString(script); err != nil {
-		return "", err
-	}
-	return f.Name(), nil
-}
-
-func remoteDeployDir(value string) string {
-	value = strings.TrimSpace(value)
-	if value == "" {
-		return "/aifar/apps"
-	}
-	return "/" + strings.Trim(path.Clean(value), "/")
-}
-
-func sanitize(value string) string {
-	replacer := strings.NewReplacer("/", "-", "\\", "-", ":", "-", " ", "-", "'", "")
-	return replacer.Replace(value)
-}
-
-func shellQuote(value string) string {
-	if value == "" {
-		return "''"
-	}
-	return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
+func (i Installer) run(ctx context.Context, server store.Server, command string, log Logger) (installerkit.CommandResult, error) {
+	return installerkit.Run(ctx, i.remote, server, command, log, "minio remote command failed")
 }

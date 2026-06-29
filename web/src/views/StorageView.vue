@@ -66,7 +66,21 @@
               <el-table-column prop="name" :label="t('storage.name')" min-width="160" />
               <el-table-column prop="policy" :label="t('storage.policy')" min-width="160" />
               <el-table-column prop="createdAt" :label="t('common.time')" min-width="180" />
-              <el-table-column :label="t('common.operation')" width="100"><template #default="{ row }"><el-button size="small" type="danger" plain @click="deleteItem('user', row.id)">{{ t('common.delete') }}</el-button></template></el-table-column>
+              <el-table-column :label="t('common.operation')" width="100">
+                <template #default="{ row }">
+                  <ConfirmAction
+                    :message="t('storage.confirmDeleteItem')"
+                    :title="t('common.delete')"
+                    :confirm-text="t('common.delete')"
+                    :cancel-text="t('common.cancel')"
+                    @confirm="deleteItem('user', row.id)"
+                  >
+                    <template #default="{ confirm }">
+                      <el-button size="small" type="danger" plain @click="confirm">{{ t('common.delete') }}</el-button>
+                    </template>
+                  </ConfirmAction>
+                </template>
+              </el-table-column>
             </el-table>
           </div>
           <div class="sub-panel">
@@ -75,29 +89,33 @@
               <el-table-column prop="name" :label="t('storage.name')" min-width="140" />
               <el-table-column prop="accessKey" :label="t('storage.accessKey')" min-width="180" show-overflow-tooltip />
               <el-table-column prop="policy" :label="t('storage.policy')" min-width="140" />
-              <el-table-column :label="t('common.operation')" width="100"><template #default="{ row }"><el-button size="small" type="danger" plain @click="deleteItem('accessKey', row.id)">{{ t('common.delete') }}</el-button></template></el-table-column>
+              <el-table-column :label="t('common.operation')" width="100">
+                <template #default="{ row }">
+                  <ConfirmAction
+                    :message="t('storage.confirmDeleteItem')"
+                    :title="t('common.delete')"
+                    :confirm-text="t('common.delete')"
+                    :cancel-text="t('common.cancel')"
+                    @confirm="deleteItem('accessKey', row.id)"
+                  >
+                    <template #default="{ confirm }">
+                      <el-button size="small" type="danger" plain @click="confirm">{{ t('common.delete') }}</el-button>
+                    </template>
+                  </ConfirmAction>
+                </template>
+              </el-table-column>
             </el-table>
           </div>
         </div>
       </template>
 
       <template v-else-if="tab === 'runs'">
-        <el-table :data="runTasks" height="100%">
-          <el-table-column prop="type" :label="t('table.type')" min-width="220" />
-          <el-table-column prop="target" :label="t('common.target')" min-width="180" show-overflow-tooltip />
-          <el-table-column prop="status" :label="t('common.status')" width="120"><template #default="{ row }"><StatusTag :status="row.status" /></template></el-table-column>
-          <el-table-column prop="createdAt" :label="t('common.time')" min-width="180" />
-        </el-table>
+        <RunRecordTable :records="runTasks" show-details @details="openTaskDetails" />
       </template>
 
       <template v-else-if="tab === 'settings'">
         <div class="settings-grid">
-          <div class="kv-grid">
-            <div class="key">{{ t('storage.instances') }}</div><div>{{ instances.length }}</div>
-            <div class="key">{{ t('common.provider') }}</div><div>{{ t('common.real') }}</div>
-            <div class="key">{{ t('storage.settings') }}</div><div>{{ t('storage.settingsHint') }}</div>
-            <div class="key">{{ t('storage.selectInstance') }}</div><div>{{ selectedInstanceId || '-' }}</div>
-          </div>
+          <KeyValueGrid :items="settingsItems" />
         </div>
       </template>
 
@@ -110,7 +128,21 @@
             <el-table-column prop="policy" :label="t('storage.policy')" min-width="160" show-overflow-tooltip />
             <el-table-column prop="accessKey" :label="t('storage.accessKey')" min-width="180" show-overflow-tooltip />
             <el-table-column prop="createdAt" :label="t('common.time')" min-width="180" />
-            <el-table-column :label="t('common.operation')" width="100"><template #default="{ row }"><el-button size="small" type="danger" plain @click="deleteItem(activeKind, row.id)">{{ t('common.delete') }}</el-button></template></el-table-column>
+            <el-table-column :label="t('common.operation')" width="100">
+              <template #default="{ row }">
+                <ConfirmAction
+                  :message="t('storage.confirmDeleteItem')"
+                  :title="t('common.delete')"
+                  :confirm-text="t('common.delete')"
+                  :cancel-text="t('common.cancel')"
+                  @confirm="deleteItem(activeKind, row.id)"
+                >
+                  <template #default="{ confirm }">
+                    <el-button size="small" type="danger" plain @click="confirm">{{ t('common.delete') }}</el-button>
+                  </template>
+                </ConfirmAction>
+              </template>
+            </el-table-column>
           </el-table>
         </div>
         <div v-else class="empty-state"><div><strong>{{ t('storage.noInstanceSelected') }}</strong><span>{{ t('storage.emptyDesc') }}</span></div></div>
@@ -142,9 +174,12 @@
 
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref, watch } from 'vue'
-import { ElMessage, ElMessageBox } from 'element-plus'
+import { ElMessage } from 'element-plus'
 import { useRouter } from 'vue-router'
 import { apiDelete, apiGet, apiPost, asArray } from '../api/client'
+import ConfirmAction from '../components/ConfirmAction.vue'
+import KeyValueGrid from '../components/KeyValueGrid.vue'
+import RunRecordTable from '../components/RunRecordTable.vue'
 import StatusTag from '../components/StatusTag.vue'
 import { useI18n } from '../i18n'
 
@@ -186,6 +221,12 @@ const filteredInstances = computed(() => {
   return instances.value.filter((item) => `${item.app} ${item.version} ${item.topology} ${serverName(item.serverId)}`.toLowerCase().includes(q))
 })
 const runTasks = computed(() => tasks.value.filter((item) => item.type?.startsWith('apps.minio.') || item.type?.startsWith('storage.')))
+const settingsItems = computed(() => [
+  { label: t('storage.instances'), value: instances.value.length },
+  { label: t('common.provider'), value: t('common.real') },
+  { label: t('storage.settings'), value: t('storage.settingsHint') },
+  { label: t('storage.selectInstance'), value: selectedInstanceId.value || '-' }
+])
 const activeKind = computed<StorageKind>(() => {
   if (tab.value === 'buckets') return 'bucket'
   if (tab.value === 'objects') return 'object'
@@ -257,14 +298,13 @@ async function saveItem() {
 }
 
 async function deleteItem(kind: StorageKind, id: string) {
-  try {
-    await ElMessageBox.confirm(t('storage.confirmDeleteItem'), t('common.delete'), { type: 'warning' })
-  } catch {
-    return
-  }
   await apiDelete(`${collectionPath(kind)}/${encodeURIComponent(id)}`)
   ElMessage.success(t('storage.itemDeleted'))
   await loadActive()
+}
+
+function openTaskDetails(row: { id: string }) {
+  void router.push({ path: '/tasks', query: { taskId: row.id } })
 }
 
 function collectionPath(kind: StorageKind) {

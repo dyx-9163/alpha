@@ -24,6 +24,17 @@
     </div>
 
     <template v-if="filteredTasks.length">
+      <div class="selection-toolbar">
+        <el-checkbox
+          :model-value="allFilteredSelected"
+          :indeterminate="someFilteredSelected && !allFilteredSelected"
+          @change="toggleFilteredTasks(Boolean($event))"
+        >
+          {{ t('tasks.selectAllFiltered', { count: filteredTasks.length }) }}
+        </el-checkbox>
+        <span>{{ t('tasks.selectedCount', { count: selectedSet.size }) }}</span>
+      </div>
+
       <div class="task-list-scroll">
         <div class="task-list">
           <div
@@ -121,6 +132,14 @@ const filteredTasks = computed(() => scopedTasks.value.filter((task) => {
   return categoryMatched && statusMatched
 }))
 
+const filteredTaskIds = computed(() => filteredTasks.value.map((task) => task.id))
+
+const allFilteredSelected = computed(() => {
+  return filteredTaskIds.value.length > 0 && filteredTaskIds.value.every((id) => selectedSet.value.has(id))
+})
+
+const someFilteredSelected = computed(() => filteredTaskIds.value.some((id) => selectedSet.value.has(id)))
+
 const pagedTasks = computed(() => {
   const start = (currentPage.value - 1) * pageSize.value
   return filteredTasks.value.slice(start, start + pageSize.value)
@@ -210,6 +229,19 @@ function toggleTask(id: string, checked: boolean) {
   emit('selectionChange', Array.from(ids).filter((value) => allowed.has(value)))
 }
 
+function toggleFilteredTasks(checked: boolean) {
+  const ids = new Set(props.selectedIds ?? [])
+  for (const id of filteredTaskIds.value) {
+    if (checked) {
+      ids.add(id)
+    } else {
+      ids.delete(id)
+    }
+  }
+  const allowed = new Set(scopedTasks.value.map((task) => task.id))
+  emit('selectionChange', Array.from(ids).filter((value) => allowed.has(value)))
+}
+
 function statusLabel(status: string) {
   if (status === 'running') {
     return t('common.running')
@@ -288,6 +320,24 @@ function formatTime(value?: string) {
   display: grid;
   gap: 8px;
   margin-bottom: 10px;
+}
+
+.selection-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 10px;
+  padding: 7px 8px;
+  border: 1px solid var(--aifar-border-soft);
+  border-radius: var(--aifar-radius);
+  background: #fbfdff;
+  color: var(--aifar-text-secondary);
+  font-size: 12px;
+}
+
+.selection-toolbar :deep(.el-checkbox) {
+  height: 18px;
 }
 
 .filter-option {

@@ -36,15 +36,12 @@
       />
 
       <h2 class="settings-title">{{ t('settings.providerStatus') }}</h2>
-      <div class="kv-grid provider-grid">
-        <div class="key">{{ t('settings.mode') }}</div><div><span class="status-pill success">{{ providerModeLabel }}</span></div>
-        <div class="key">{{ t('settings.platform') }}</div><div>{{ platform }}</div>
-        <div class="key">{{ t('common.message') }}</div><div>{{ t('settings.providerMessage') }}</div>
-        <div class="key">{{ t('settings.databasePath') }}</div><div>{{ form.databasePath }}</div>
-        <div class="key">{{ t('settings.resourcePath') }}</div><div>{{ form.resourcePath }}</div>
-        <div class="key">{{ t('settings.defaultDeployDir') }}</div><div>{{ form.defaultDeployDir }}</div>
-        <div class="key">{{ t('settings.dangerousActionsRequire') }}</div><div>{{ t('settings.confirmTrue') }}</div>
-      </div>
+      <KeyValueGrid :items="providerItems" class="provider-grid">
+        <template #value="{ item }">
+          <span v-if="item.key === 'mode'" class="status-pill success">{{ item.value }}</span>
+          <span v-else>{{ item.value || '-' }}</span>
+        </template>
+      </KeyValueGrid>
 
       <h2 class="settings-title">{{ t('settings.moduleStatus') }}</h2>
       <el-table :data="moduleRows">
@@ -61,6 +58,7 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref } from 'vue'
 import { apiGet, apiPut } from '../api/client'
+import KeyValueGrid from '../components/KeyValueGrid.vue'
 import { useI18n } from '../i18n'
 
 const { locale, setLocale, t } = useI18n()
@@ -75,6 +73,15 @@ const moduleRows = computed(() => {
   const modules = form.moduleStatus ?? {}
   return Object.keys(modules).map((module) => ({ module, message: moduleMessage(module), time: now.value }))
 })
+const providerItems = computed(() => [
+  { key: 'mode', label: t('settings.mode'), value: providerModeLabel.value },
+  { key: 'platform', label: t('settings.platform'), value: platform },
+  { key: 'message', label: t('common.message'), value: t('settings.providerMessage') },
+  { key: 'databasePath', label: t('settings.databasePath'), value: form.databasePath },
+  { key: 'resourcePath', label: t('settings.resourcePath'), value: form.resourcePath },
+  { key: 'defaultDeployDir', label: t('settings.defaultDeployDir'), value: form.defaultDeployDir },
+  { key: 'confirm', label: t('settings.dangerousActionsRequire'), value: t('settings.confirmTrue') }
+])
 
 function moduleMessage(module: string) {
   const key = `settings.moduleMessages.${module}`

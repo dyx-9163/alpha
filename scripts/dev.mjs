@@ -1,8 +1,18 @@
 import { spawn } from 'node:child_process'
 import { rootDir, withToolEnv } from './toolchain.mjs'
 
-const env = withToolEnv()
+const baseEnv = withToolEnv()
+const env = { ...baseEnv, AIFAR_ADDR: baseEnv.AIFAR_DEV_ADDR || '127.0.0.1:8080' }
 const children = []
+
+function localURL(addr) {
+  const target = addr.startsWith('http://') || addr.startsWith('https://') ? addr : `http://${addr}`
+  const url = new URL(target)
+  if (url.hostname === '0.0.0.0' || url.hostname === '::') {
+    url.hostname = '127.0.0.1'
+  }
+  return url.toString().replace(/\/$/, '')
+}
 
 function start(name, cmd, args, cwd, shell = false) {
   const child = spawn(cmd, args, { cwd, env, shell })
@@ -29,8 +39,8 @@ process.on('SIGINT', () => shutdown(0))
 process.on('SIGTERM', () => shutdown(0))
 
 console.log('AIFAR dev starting...')
-console.log('Backend: http://127.0.0.1:8080')
-console.log('Frontend: http://127.0.0.1:5173')
+console.log(`Backend: ${localURL(env.AIFAR_ADDR)}`)
+console.log(`Frontend: http://${env.AIFAR_VITE_HOST === '0.0.0.0' ? '127.0.0.1' : env.AIFAR_VITE_HOST}:5173`)
 
 start('api', process.execPath, ['scripts/run-backend.mjs'], rootDir)
 start('web', process.execPath, ['scripts/run-web.mjs'], rootDir)

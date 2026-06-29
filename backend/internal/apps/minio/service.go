@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 
+	"aifar-deployment/backend/internal/apps/deleteflow"
 	minioinstaller "aifar-deployment/backend/internal/installer/minio"
 	"aifar-deployment/backend/internal/store"
 )
@@ -300,31 +301,30 @@ func (s Service) Delete(ctx context.Context, req DeleteRequest, log minioinstall
 	}
 	logForServer := logForTarget(log, targetLog, target)
 	recorder, _ := log.(stepRecorder)
-	if recorder != nil {
-		recorder.StartTarget(target)
-	}
-	step := newDeleteStepRunner(logForServer, recorder, target, copy)
 	apiPort := instanceAPIPort(req.Instance)
 	uninstaller := minioinstaller.NewUninstaller(s.remote)
-	if err := step(1, "remove-remote", copy.RemoveRemote, func() error {
-		return uninstaller.Uninstall(ctx, req.Server, req.Instance.Version, apiPort, logForServer)
-	}); err != nil {
-		msg := fmt.Sprintf("%s: %v", req.Server.Name, err)
-		logForServer.Error(copy.DeleteFailed, msg)
-		finishTarget(recorder, target, "failed", msg)
-		return err
-	}
-	if err := step(2, "delete-instance", copy.DeleteInstance, func() error {
-		return s.store.DeleteAppInstance(req.Instance.ID)
-	}); err != nil {
-		msg := fmt.Sprintf("%s: %v", req.Server.Name, err)
-		logForServer.Error(copy.DeleteFailed, msg)
-		finishTarget(recorder, target, "failed", msg)
-		return err
-	}
-	logForServer.Info(copy.Deleted, req.Instance.ID)
-	finishTarget(recorder, target, "success", "")
-	return nil
+	return deleteflow.Run(deleteflow.Request{
+		Target:     target,
+		ServerName: req.Server.Name,
+		InstanceID: req.Instance.ID,
+		Log:        logForServer,
+		Recorder:   recorder,
+		Steps: []deleteflow.Step{
+			{Name: "remove-remote", Title: copy.RemoveRemote, Run: func() error {
+				return uninstaller.Uninstall(ctx, req.Server, req.Instance.Version, apiPort, logForServer)
+			}},
+			{Name: "delete-instance", Title: copy.DeleteInstance, Run: func() error {
+				return s.store.DeleteAppInstance(req.Instance.ID)
+			}},
+		},
+		Messages: deleteflow.Messages{
+			StepStart:    copy.StepStart,
+			StepDone:     copy.StepDone,
+			StepFailed:   copy.StepFailed,
+			DeleteFailed: copy.DeleteFailed,
+			Deleted:      copy.Deleted,
+		},
+	})
 }
 
 func minioOptions(params map[string]any, defaultPassword string) minioinstaller.InstallOptions {
@@ -467,28 +467,6 @@ func newStepRunner(log minioinstaller.Logger, recorder stepRecorder, target stri
 }
 
 func newStepRunnerWithSteps(log minioinstaller.Logger, recorder stepRecorder, target string, copy Copy, steps []stepDef) func(stepIndex int, stepName, label string, fn func() error) error {
-	return func(stepIndex int, stepName, label string, fn func() error) error {
-		if recorder != nil {
-			recorder.StartStep(target, stepName, label, stepIndex)
-		}
-		log.Info(copy.StepStart, stepIndex, len(steps), label)
-		if err := fn(); err != nil {
-			log.Error(copy.StepFailed, stepIndex, len(steps), label, err)
-			if recorder != nil {
-				recorder.FinishStep(target, stepName, "failed", err.Error())
-			}
-			return err
-		}
-		log.Info(copy.StepDone, stepIndex, len(steps), label)
-		if recorder != nil {
-			recorder.FinishStep(target, stepName, "success", "")
-		}
-		return nil
-	}
-}
-
-func newDeleteStepRunner(log minioinstaller.Logger, recorder stepRecorder, target string, copy DeleteCopy) func(stepIndex int, stepName, label string, fn func() error) error {
-	steps := minioDeleteSteps(copy)
 	return func(stepIndex int, stepName, label string, fn func() error) error {
 		if recorder != nil {
 			recorder.StartStep(target, stepName, label, stepIndex)

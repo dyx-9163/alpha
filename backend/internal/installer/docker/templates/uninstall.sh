@@ -21,6 +21,8 @@ for bin in containerd containerd-shim-runc-v2 ctr docker docker-init docker-prox
   $SUDO rm -f "/usr/local/bin/$bin"
 done
 $SUDO rm -f /usr/local/lib/docker/cli-plugins/docker-compose
+hash -r >/dev/null 2>&1 || true
+echo "cleared docker command cache for this shell; existing interactive shells can run: hash -r"
 
 echo "removing Docker install root: $INSTALL_ROOT"
 if [ -n "$INSTALL_ROOT" ] && [ "$INSTALL_ROOT" != "/" ] && [ -d "$INSTALL_ROOT" ]; then

@@ -111,10 +111,11 @@ func (m Module) ValidateInstall(ctx context.Context, req registry.InstallRequest
 
 func (m Module) Install(ctx context.Context, req registry.InstallRequest, run registry.RunContext) error {
 	return m.service.Install(ctx, InstallRequest{
-		Version:   req.Version,
-		Topology:  req.Topology,
-		Language:  req.Language,
-		ServerIDs: req.TargetServerIDs(),
+		Version:    req.Version,
+		Topology:   req.Topology,
+		Language:   req.Language,
+		ServerIDs:  req.TargetServerIDs(),
+		Parameters: req.Parameters,
 	}, run.Resources, run.Log, func(target string) dockerinstaller.Logger {
 		return run.LoggerForTarget(target)
 	})

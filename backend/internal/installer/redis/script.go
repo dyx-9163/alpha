@@ -4,6 +4,8 @@ import (
 	"bytes"
 	_ "embed"
 	"text/template"
+
+	"aifar-deployment/backend/internal/installer/installerkit"
 )
 
 //go:embed templates/standalone/install.sh
@@ -25,7 +27,7 @@ var clusterEnableNodeScriptTemplate string
 var clusterBootstrapScriptTemplate string
 
 var redisScriptFuncs = template.FuncMap{
-	"shq": shellQuote,
+	"shq": installerkit.ShellQuote,
 }
 
 var redisStandaloneInstallTemplate = template.Must(template.New("redis-standalone-install").

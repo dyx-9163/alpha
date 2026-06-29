@@ -25,6 +25,10 @@ func (f *fakeStore) SaveServer(v store.Server) (store.Server, error) {
 	return v, nil
 }
 
+func (f *fakeStore) ReorderServers(ids []string) error {
+	return nil
+}
+
 func (f *fakeStore) DeleteServer(id string) error {
 	f.server = store.Server{}
 	return nil

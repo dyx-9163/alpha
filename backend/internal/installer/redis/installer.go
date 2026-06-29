@@ -7,28 +7,24 @@ import (
 	"os"
 	"path"
 	"path/filepath"
-	"sort"
 	"strings"
 	"time"
 
-	"aifar-deployment/backend/internal/adapter"
+	"aifar-deployment/backend/internal/installer/installerkit"
+	"aifar-deployment/backend/internal/installer/uploadkit"
+	"aifar-deployment/backend/internal/resourcekit"
 	"aifar-deployment/backend/internal/store"
 )
 
-type Logger interface {
-	Info(format string, args ...any)
-	Error(format string, args ...any)
-}
+type Logger = installerkit.Logger
 
-type Remote interface {
-	Run(ctx context.Context, server store.Server, command string) (adapter.CommandResult, error)
-	UploadFile(ctx context.Context, server store.Server, localPath, remotePath string, mode os.FileMode) error
-}
+type Remote = installerkit.Remote
 
 type Bundle struct {
-	Version     string
-	ArchivePath string
-	RPMPaths    []string
+	Version       string
+	ArchivePath   string
+	ArchiveSHA256 string
+	RPMPaths      []string
 }
 
 type Installer struct {
@@ -40,49 +36,32 @@ func NewInstaller(remote Remote) Installer {
 }
 
 func SelectBundle(resources []store.Resource, version string) (Bundle, error) {
-	version = strings.TrimSpace(version)
-	if version == "" {
-		version = "latest"
-	}
-	candidates := make([]store.Resource, 0)
-	for _, res := range resources {
-		name := strings.ToLower(filepath.Base(res.Path))
-		if res.App != "redis" || res.Part != "backend" {
-			continue
-		}
-		if version != "latest" && res.Version != version {
-			continue
-		}
-		if strings.HasSuffix(name, ".sha256sum") || strings.HasSuffix(name, ".minisig") {
-			continue
-		}
-		if !strings.Contains(name, "redis") {
-			continue
-		}
-		candidates = append(candidates, res)
-	}
-	if len(candidates) == 0 {
+	selected, ok := resourcekit.Select(resources, resourcekit.SelectOptions{
+		App:            "redis",
+		Part:           "backend",
+		Version:        version,
+		SkipSignatures: true,
+		Match: func(baseLower string, _ store.Resource) bool {
+			return strings.Contains(baseLower, "redis")
+		},
+	})
+	if !ok {
+		version = resourcekit.NormalizeVersion(version)
 		return Bundle{}, fmt.Errorf("redis resource %s not found", version)
 	}
-	sort.Slice(candidates, func(i, j int) bool {
-		if candidates[i].Version == candidates[j].Version {
-			return candidates[i].Path < candidates[j].Path
-		}
-		return candidates[i].Version < candidates[j].Version
-	})
-	selected := candidates[len(candidates)-1]
 	return Bundle{
-		Version:     selected.Version,
-		ArchivePath: selected.Path,
-		RPMPaths:    discoverRPMs(selected.Path),
+		Version:       selected.Version,
+		ArchivePath:   selected.Path,
+		ArchiveSHA256: selected.SHA256,
+		RPMPaths:      resourcekit.ListRPMs(filepath.Join(filepath.Dir(selected.Path), "rpms")),
 	}, nil
 }
 
 func VerifyBundle(bundle Bundle) error {
-	if strings.TrimSpace(bundle.ArchivePath) == "" {
-		return errors.New("redis archive is required")
+	if err := resourcekit.VerifyFile(bundle.ArchivePath, "redis archive"); err != nil {
+		return err
 	}
-	if _, err := os.Stat(bundle.ArchivePath); err != nil {
+	if err := resourcekit.VerifySHA256(bundle.ArchivePath, bundle.ArchiveSHA256, "redis archive"); err != nil {
 		return err
 	}
 	return nil
@@ -109,23 +88,26 @@ func (i Installer) InstallWithLanguage(ctx context.Context, server store.Server,
 	if port > 65535 {
 		return fmt.Errorf("invalid redis port: %d", port)
 	}
-	deployDir := remoteDeployDir(server.DeployDir)
-	workDir := path.Join(deployDir, "_work", fmt.Sprintf("redis-%s-%d", sanitize(bundle.Version), time.Now().Unix()))
+	deployDir := installerkit.RemoteDeployDir(server.DeployDir)
+	workDir := installerkit.WorkDir(deployDir, "redis", bundle.Version, time.Now())
 	installRoot := path.Join(deployDir, "redis", bundle.Version)
 	archiveRemote := workDir + "/" + filepath.Base(bundle.ArchivePath)
 	log.Info("prepare Redis work directory: %s", workDir)
-	if _, err := i.run(ctx, server, "mkdir -p "+shellQuote(workDir+"/rpms"), log); err != nil {
+	if _, err := i.run(ctx, server, "mkdir -p "+installerkit.ShellQuote(workDir+"/rpms"), log); err != nil {
 		return err
 	}
-	log.Info("upload Redis archive: %s", bundle.ArchivePath)
-	if err := i.remote.UploadFile(ctx, server, bundle.ArchivePath, archiveRemote, 0o644); err != nil {
-		return fmt.Errorf("upload redis archive failed: %w", err)
+	if err := uploadkit.Upload(ctx, i.remote, server, uploadkit.File{
+		LocalPath:      bundle.ArchivePath,
+		RemotePath:     archiveRemote,
+		LogMessage:     "upload Redis archive: %s",
+		LogArgs:        []any{bundle.ArchivePath},
+		FailureMessage: "upload redis archive failed",
+	}, log); err != nil {
+		return err
 	}
-	for _, rpm := range bundle.RPMPaths {
-		remoteRPM := workDir + "/rpms/" + filepath.Base(rpm)
-		log.Info("upload Redis RPM dependency: %s", filepath.Base(rpm))
-		if err := i.remote.UploadFile(ctx, server, rpm, remoteRPM, 0o644); err != nil {
-			return fmt.Errorf("upload redis rpm %s failed: %w", filepath.Base(rpm), err)
+	for _, file := range uploadkit.RPMFiles(bundle.RPMPaths, workDir+"/rpms", "upload Redis RPM dependency: %s", "upload redis rpm %s failed") {
+		if err := uploadkit.Upload(ctx, i.remote, server, file, log); err != nil {
+			return err
 		}
 	}
 	script, err := installStandaloneScript(bundle.Version, workDir, archiveRemote, installRoot, port, password)
@@ -133,17 +115,22 @@ func (i Installer) InstallWithLanguage(ctx context.Context, server store.Server,
 		return err
 	}
 	scriptRemote := workDir + "/install-redis.sh"
-	scriptLocal, err := writeTempScript(script)
+	scriptLocal, err := installerkit.WriteTempScript("aifar-redis-install-*.sh", script)
 	if err != nil {
 		return err
 	}
 	defer os.Remove(scriptLocal)
-	log.Info("upload Redis installer script")
-	if err := i.remote.UploadFile(ctx, server, scriptLocal, scriptRemote, 0o755); err != nil {
-		return fmt.Errorf("upload redis installer script failed: %w", err)
+	if err := uploadkit.Upload(ctx, i.remote, server, uploadkit.File{
+		LocalPath:      scriptLocal,
+		RemotePath:     scriptRemote,
+		Mode:           0o755,
+		LogMessage:     "upload Redis installer script",
+		FailureMessage: "upload redis installer script failed",
+	}, log); err != nil {
+		return err
 	}
 	log.Info("install Redis standalone service")
-	if _, err := i.run(ctx, server, "sh "+shellQuote(scriptRemote), log); err != nil {
+	if _, err := i.run(ctx, server, "sh "+installerkit.ShellQuote(scriptRemote), log); err != nil {
 		return err
 	}
 	log.Info("Redis %s installed and verified on port %d", bundle.Version, port)
@@ -179,62 +166,6 @@ func (i Installer) runInlineScript(ctx context.Context, server store.Server, mar
 	return err
 }
 
-func (i Installer) run(ctx context.Context, server store.Server, command string, log Logger) (adapter.CommandResult, error) {
-	result, err := i.remote.Run(ctx, server, command)
-	if strings.TrimSpace(result.Stdout) != "" {
-		log.Info("%s", strings.TrimSpace(result.Stdout))
-	}
-	if strings.TrimSpace(result.Stderr) != "" {
-		if err != nil {
-			log.Error("%s", strings.TrimSpace(result.Stderr))
-		} else {
-			log.Info("%s", strings.TrimSpace(result.Stderr))
-		}
-	}
-	if err != nil {
-		return result, fmt.Errorf("redis remote command failed: %w", err)
-	}
-	return result, nil
-}
-
-func writeTempScript(script string) (string, error) {
-	f, err := os.CreateTemp("", "aifar-redis-install-*.sh")
-	if err != nil {
-		return "", err
-	}
-	defer f.Close()
-	if _, err := f.WriteString(script); err != nil {
-		return "", err
-	}
-	return f.Name(), nil
-}
-
-func discoverRPMs(archivePath string) []string {
-	rpmDir := filepath.Join(filepath.Dir(archivePath), "rpms")
-	matches, err := filepath.Glob(filepath.Join(rpmDir, "*.rpm"))
-	if err != nil {
-		return nil
-	}
-	sort.Strings(matches)
-	return matches
-}
-
-func sanitize(value string) string {
-	replacer := strings.NewReplacer("/", "-", "\\", "-", ":", "-", " ", "-", "'", "")
-	return replacer.Replace(value)
-}
-
-func remoteDeployDir(value string) string {
-	value = strings.TrimSpace(value)
-	if value == "" {
-		return "/aifar/apps"
-	}
-	return "/" + strings.Trim(path.Clean(value), "/")
-}
-
-func shellQuote(value string) string {
-	if value == "" {
-		return "''"
-	}
-	return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
+func (i Installer) run(ctx context.Context, server store.Server, command string, log Logger) (installerkit.CommandResult, error) {
+	return installerkit.Run(ctx, i.remote, server, command, log, "redis remote command failed")
 }

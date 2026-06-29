@@ -6,6 +6,7 @@ import (
 	"path"
 	"strings"
 
+	"aifar-deployment/backend/internal/installer/installerkit"
 	"aifar-deployment/backend/internal/store"
 )
 
@@ -29,25 +30,15 @@ func (u Uninstaller) UninstallWithLanguage(ctx context.Context, server store.Ser
 	if port <= 0 {
 		port = 6379
 	}
-	deployDir := remoteDeployDir(server.DeployDir)
+	deployDir := installerkit.RemoteDeployDir(server.DeployDir)
 	installRoot := path.Join(deployDir, "redis", version)
 	script, err := uninstallStandaloneScript(version, installRoot, port)
 	if err != nil {
 		return err
 	}
-	result, err := u.remote.Run(ctx, server, "sh -s <<'AIFAR_REDIS_UNINSTALL'\n"+script+"\nAIFAR_REDIS_UNINSTALL")
-	if strings.TrimSpace(result.Stdout) != "" {
-		log.Info("%s", strings.TrimSpace(result.Stdout))
-	}
-	if strings.TrimSpace(result.Stderr) != "" {
-		if err != nil {
-			log.Error("%s", strings.TrimSpace(result.Stderr))
-		} else {
-			log.Info("%s", strings.TrimSpace(result.Stderr))
-		}
-	}
+	_, err = installerkit.Run(ctx, u.remote, server, "sh -s <<'AIFAR_REDIS_UNINSTALL'\n"+script+"\nAIFAR_REDIS_UNINSTALL", log, "redis remote uninstall failed")
 	if err != nil {
-		return fmt.Errorf("redis remote uninstall failed: %w", err)
+		return err
 	}
 	return nil
 }
@@ -63,25 +54,15 @@ func (u Uninstaller) UninstallSentinelWithLanguage(ctx context.Context, server s
 	if sentinelPort <= 0 {
 		sentinelPort = 26379
 	}
-	deployDir := remoteDeployDir(server.DeployDir)
+	deployDir := installerkit.RemoteDeployDir(server.DeployDir)
 	installRoot := path.Join(deployDir, "redis", version)
 	script, err := uninstallSentinelNodeScript(version, installRoot, redisPort, sentinelPort)
 	if err != nil {
 		return err
 	}
-	result, err := u.remote.Run(ctx, server, "sh -s <<'AIFAR_REDIS_SENTINEL_UNINSTALL'\n"+script+"\nAIFAR_REDIS_SENTINEL_UNINSTALL")
-	if strings.TrimSpace(result.Stdout) != "" {
-		log.Info("%s", strings.TrimSpace(result.Stdout))
-	}
-	if strings.TrimSpace(result.Stderr) != "" {
-		if err != nil {
-			log.Error("%s", strings.TrimSpace(result.Stderr))
-		} else {
-			log.Info("%s", strings.TrimSpace(result.Stderr))
-		}
-	}
+	_, err = installerkit.Run(ctx, u.remote, server, "sh -s <<'AIFAR_REDIS_SENTINEL_UNINSTALL'\n"+script+"\nAIFAR_REDIS_SENTINEL_UNINSTALL", log, "redis sentinel remote uninstall failed")
 	if err != nil {
-		return fmt.Errorf("redis sentinel remote uninstall failed: %w", err)
+		return err
 	}
 	return nil
 }

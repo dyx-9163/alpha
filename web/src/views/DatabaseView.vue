@@ -64,32 +64,16 @@
 
       <template v-else-if="tab === 'backups'">
         <div class="muted-strip">{{ t('database.backupHint') }}</div>
-        <el-table :data="backupTasks" height="100%">
-          <el-table-column prop="type" :label="t('table.type')" min-width="180" />
-          <el-table-column prop="target" :label="t('common.target')" min-width="180" show-overflow-tooltip />
-          <el-table-column prop="status" :label="t('common.status')" width="120"><template #default="{ row }"><StatusTag :status="row.status" /></template></el-table-column>
-          <el-table-column prop="createdAt" :label="t('common.time')" min-width="180" />
-        </el-table>
+        <RunRecordTable :records="backupTasks" :type-width="180" />
       </template>
 
       <template v-else-if="tab === 'runs'">
-        <el-table :data="runTasks" height="100%">
-          <el-table-column prop="type" :label="t('table.type')" min-width="220" />
-          <el-table-column prop="target" :label="t('common.target')" min-width="180" show-overflow-tooltip />
-          <el-table-column prop="status" :label="t('common.status')" width="120"><template #default="{ row }"><StatusTag :status="row.status" /></template></el-table-column>
-          <el-table-column prop="createdAt" :label="t('common.time')" min-width="180" />
-          <el-table-column :label="t('common.operation')" width="120"><template #default="{ row }"><el-button size="small" @click="router.push({ path: '/tasks', query: { taskId: row.id } })">{{ t('common.details') }}</el-button></template></el-table-column>
-        </el-table>
+        <RunRecordTable :records="runTasks" show-details @details="openTaskDetails" />
       </template>
 
       <template v-else>
         <div class="settings-grid">
-          <div class="kv-grid">
-            <div class="key">MySQL</div><div>{{ t('database.mysqlSettings') }}</div>
-            <div class="key">Redis</div><div>{{ t('database.redisSettings') }}</div>
-            <div class="key">{{ t('common.provider') }}</div><div>{{ t('common.real') }}</div>
-            <div class="key">{{ t('database.backups') }}</div><div>{{ t('database.backupHint') }}</div>
-          </div>
+          <KeyValueGrid :items="settingsItems" />
         </div>
       </template>
     </div>
@@ -101,6 +85,8 @@ import { computed, onMounted, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { useRouter } from 'vue-router'
 import { apiGet, apiPost, asArray } from '../api/client'
+import KeyValueGrid from '../components/KeyValueGrid.vue'
+import RunRecordTable from '../components/RunRecordTable.vue'
 import StatusTag from '../components/StatusTag.vue'
 import { useI18n } from '../i18n'
 
@@ -131,6 +117,12 @@ const filteredInstances = computed(() => {
 })
 const backupTasks = computed(() => tasks.value.filter((item) => item.type === 'database.backup'))
 const runTasks = computed(() => tasks.value.filter((item) => item.type?.startsWith('apps.mysql.') || item.type?.startsWith('apps.redis.') || item.type?.startsWith('database.')))
+const settingsItems = computed(() => [
+  { label: 'MySQL', value: t('database.mysqlSettings') },
+  { label: 'Redis', value: t('database.redisSettings') },
+  { label: t('common.provider'), value: t('common.real') },
+  { label: t('database.backups'), value: t('database.backupHint') }
+])
 
 async function load() {
   instances.value = asArray(await apiGet<AppInstance[] | null>('/database/instances').catch(() => []))
@@ -166,6 +158,10 @@ async function checkInstance(id: string) {
   const result = await apiPost<{ taskId: string }>(`/apps/instances/${id}/check`)
   ElMessage.success(t('apps.checkServiceAccepted'))
   void router.push({ path: '/tasks', query: { taskId: result.taskId } })
+}
+
+function openTaskDetails(row: { id: string }) {
+  void router.push({ path: '/tasks', query: { taskId: row.id } })
 }
 
 onMounted(load)

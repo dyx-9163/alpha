@@ -2,7 +2,6 @@ package httpapi
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -18,12 +17,14 @@ import (
 	"aifar-deployment/backend/internal/appcatalog"
 	_ "aifar-deployment/backend/internal/apps/autoload"
 	"aifar-deployment/backend/internal/apps/registry"
+	"aifar-deployment/backend/internal/auditkit"
 	"aifar-deployment/backend/internal/auth"
 	"aifar-deployment/backend/internal/config"
 	"aifar-deployment/backend/internal/i18n"
 	"aifar-deployment/backend/internal/resource"
 	serverdomain "aifar-deployment/backend/internal/servers"
 	"aifar-deployment/backend/internal/store"
+	"aifar-deployment/backend/internal/taskplan"
 	"aifar-deployment/backend/internal/worker"
 
 	"github.com/go-chi/chi/v5"
@@ -61,6 +62,7 @@ func New(cfg config.Config, s *store.Store, tasks *worker.Manager) *API {
 			r.Post("/resources/rescan", api.rescanResources)
 			r.Get("/servers", api.listServers)
 			r.Post("/servers", api.saveServer)
+			r.Put("/servers/order", api.reorderServers)
 			r.Put("/servers/{id}", api.saveServer)
 			r.Delete("/servers/{id}", api.deleteServer)
 			r.Post("/servers/{id}/probe", api.probeServer)
@@ -70,6 +72,7 @@ func New(cfg config.Config, s *store.Store, tasks *worker.Manager) *API {
 			r.Get("/tasks/{id}", api.getTask)
 			r.Get("/tasks/{id}/events", api.taskEvents)
 			r.Post("/tasks/{id}/cancel", api.cancelTask)
+			r.Delete("/tasks/logs", api.clearTaskLogsBatch)
 			r.Delete("/tasks", api.deleteTasks)
 			r.Delete("/tasks/{id}", api.deleteTask)
 			r.Delete("/tasks/{id}/logs", api.clearTaskLogs)
@@ -206,6 +209,37 @@ func (a *API) listServers(w http.ResponseWriter, r *http.Request) {
 	respond(w, out, err)
 }
 
+type reorderServersRequest struct {
+	IDs []string `json:"ids"`
+}
+
+func (a *API) reorderServers(w http.ResponseWriter, r *http.Request) {
+	lang := languageFromRequest(r)
+	var req reorderServersRequest
+	if !decode(w, r, &req) {
+		return
+	}
+	ids := make([]string, 0, len(req.IDs))
+	seen := map[string]bool{}
+	for _, id := range req.IDs {
+		id = strings.TrimSpace(id)
+		if id == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
+		ids = append(ids, id)
+	}
+	if len(ids) == 0 {
+		writeError(w, http.StatusBadRequest, "IDS_REQUIRED", i18n.Text(lang, "servers.orderRequired"), nil)
+		return
+	}
+	err := a.servers.Reorder(ids)
+	if err == nil {
+		a.audit(r, "servers.reorder", strings.Join(ids, ","), "success", i18n.Text(lang, "servers.reordered"))
+	}
+	respond(w, map[string]any{"ids": ids}, err)
+}
+
 type serverSaveRequest struct {
 	ID         string  `json:"id"`
 	Name       string  `json:"name"`
@@ -221,6 +255,7 @@ type serverSaveRequest struct {
 	DockerHost *string `json:"dockerHost"`
 	Status     string  `json:"status"`
 	LastError  string  `json:"lastError"`
+	SortOrder  int     `json:"sortOrder"`
 }
 
 func (req serverSaveRequest) toStoreServer() store.Server {
@@ -243,6 +278,7 @@ func (req serverSaveRequest) toStoreServer() store.Server {
 		DockerHost: dockerHost,
 		Status:     req.Status,
 		LastError:  req.LastError,
+		SortOrder:  req.SortOrder,
 	}
 }
 
@@ -385,6 +421,7 @@ func (a *API) deleteTasks(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &req) {
 		return
 	}
+	req.IDs = cleanStringIDs(req.IDs)
 	if len(req.IDs) == 0 {
 		writeError(w, http.StatusBadRequest, "IDS_REQUIRED", i18n.Text(languageFromRequest(r), "api.idsRequired"), nil)
 		return
@@ -425,9 +462,32 @@ func (a *API) clearTaskLogs(w http.ResponseWriter, r *http.Request) {
 	}
 	err := a.store.ClearTaskLogs(id)
 	if err == nil {
-		a.audit(r, "tasks.logs.clear", id, "success", "task logs cleared")
+		a.audit(r, "tasks.logs.clear", id, "success", i18n.Text(languageFromRequest(r), "api.taskLogsCleared", 1))
 	}
 	respond(w, map[string]any{"taskId": id, "cleared": err == nil}, err)
+}
+
+func (a *API) clearTaskLogsBatch(w http.ResponseWriter, r *http.Request) {
+	var req deleteTasksRequest
+	if !decode(w, r, &req) {
+		return
+	}
+	ids := cleanStringIDs(req.IDs)
+	if len(ids) == 0 {
+		writeError(w, http.StatusBadRequest, "IDS_REQUIRED", i18n.Text(languageFromRequest(r), "api.taskLogIDsRequired"), nil)
+		return
+	}
+	for _, id := range ids {
+		if _, _, err := a.store.GetTask(id); err != nil {
+			respond(w, nil, err)
+			return
+		}
+	}
+	deleted, err := a.store.ClearTaskLogsForTasks(ids)
+	if err == nil {
+		a.audit(r, "tasks.logs.clear.batch", strconv.Itoa(len(ids)), "success", i18n.Text(languageFromRequest(r), "api.taskLogsCleared", len(ids)))
+	}
+	respond(w, map[string]any{"ids": ids, "cleared": len(ids), "logsDeleted": deleted}, err)
 }
 
 func (a *API) listAudit(w http.ResponseWriter, r *http.Request) {
@@ -728,7 +788,7 @@ func (a *API) installAppName(w http.ResponseWriter, r *http.Request, app string)
 		respondTask(w, task, err)
 		return
 	}
-	if err := a.storeInstallPlan(task.ID, plan); err != nil {
+	if err := taskplan.StorePlan(a.store, task.ID, installPlanSteps(plan)); err != nil {
 		_ = a.store.DeleteTask(task.ID)
 		writeError(w, http.StatusInternalServerError, "INSTALL_PLAN_STORE_FAILED", err.Error(), map[string]any{"app": def.Name})
 		return
@@ -760,23 +820,17 @@ func (a *API) installAppName(w http.ResponseWriter, r *http.Request, app string)
 	respondTask(w, task, err)
 }
 
-func (a *API) storeInstallPlan(taskID string, plan []registry.InstallStepPlan) error {
-	plannedTargets := map[string]bool{}
+func installPlanSteps(plan []registry.InstallStepPlan) []taskplan.Step {
+	out := make([]taskplan.Step, 0, len(plan))
 	for _, step := range plan {
-		if step.Target != "" && !plannedTargets[step.Target] {
-			if err := a.store.UpsertTaskTarget(taskID, step.Target, "pending", ""); err != nil {
-				return err
-			}
-			plannedTargets[step.Target] = true
-		}
-		if step.Name == "" {
-			continue
-		}
-		if err := a.store.UpsertTaskStep(taskID, step.Target, step.Name, step.Title, step.Order, "pending", ""); err != nil {
-			return err
-		}
+		out = append(out, taskplan.Step{
+			Target: step.Target,
+			Name:   step.Name,
+			Title:  step.Title,
+			Order:  step.Order,
+		})
 	}
-	return nil
+	return out
 }
 
 func installTargetServerIDs(req installAppRequest) []string {
@@ -851,6 +905,20 @@ func stringSliceFromRaw(value any) []string {
 	}
 }
 
+func cleanStringIDs(values []string) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		out = append(out, value)
+	}
+	return out
+}
+
 func (a *API) instanceAction(action string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		id := chi.URLParam(r, "id")
@@ -873,6 +941,10 @@ func (a *API) containerSummary(w http.ResponseWriter, r *http.Request) {
 	server, useServer, serverErr := a.dockerServerFromRequest(r)
 	if serverErr != nil {
 		respond(w, nil, serverErr)
+		return
+	}
+	if !useServer && host == "" {
+		writeError(w, http.StatusBadRequest, "DOCKER_TARGET_REQUIRED", i18n.Text(languageFromRequest(r), "api.dockerTargetRequired"), nil)
 		return
 	}
 	var (
@@ -903,6 +975,10 @@ func (a *API) containers(w http.ResponseWriter, r *http.Request) {
 	server, useServer, serverErr := a.dockerServerFromRequest(r)
 	if serverErr != nil {
 		respond(w, nil, serverErr)
+		return
+	}
+	if !useServer && host == "" {
+		writeError(w, http.StatusBadRequest, "DOCKER_TARGET_REQUIRED", i18n.Text(languageFromRequest(r), "api.dockerTargetRequired"), nil)
 		return
 	}
 	kind := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("kind")))
@@ -961,6 +1037,10 @@ func (a *API) containerAction(action string) http.HandlerFunc {
 			respond(w, nil, serverErr)
 			return
 		}
+		if !useServer && host == "" {
+			writeError(w, http.StatusBadRequest, "DOCKER_TARGET_REQUIRED", i18n.Text(lang, "api.dockerTargetRequired"), nil)
+			return
+		}
 		task, err := a.tasks.StartWithLanguage("containers.container."+action, id, currentUser(r).Username, lang, func(ctx context.Context, log worker.Logger) error {
 			log.Info(i18n.Text(lang, "api.containerActionRequested"), action, id)
 			if useServer {
@@ -987,6 +1067,10 @@ func (a *API) containerLogs(w http.ResponseWriter, r *http.Request) {
 	server, useServer, serverErr := a.dockerServerFromRequest(r)
 	if serverErr != nil {
 		respond(w, nil, serverErr)
+		return
+	}
+	if !useServer && host == "" {
+		writeError(w, http.StatusBadRequest, "DOCKER_TARGET_REQUIRED", i18n.Text(languageFromRequest(r), "api.dockerTargetRequired"), nil)
 		return
 	}
 	tail := queryInt(r, "tail", 200)
@@ -1373,105 +1457,11 @@ func (a *API) staticFallback(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) audit(r *http.Request, action, target, status, message string) {
-	_ = a.store.AddAudit(currentUser(r).Username, action, target, status, message)
-}
-
-type ctxClaims struct{}
-
-func currentUser(r *http.Request) auth.Claims {
-	claims, _ := r.Context().Value(ctxClaims{}).(auth.Claims)
-	return claims
-}
-
-func languageFromRequest(r *http.Request) string {
-	if lang := strings.TrimSpace(r.URL.Query().Get("lang")); lang != "" {
-		return lang
-	}
-	if lang := strings.TrimSpace(r.Header.Get("X-AIFAR-Language")); lang != "" {
-		return lang
-	}
-	return r.Header.Get("Accept-Language")
-}
-
-func queryInt(r *http.Request, key string, fallback int) int {
-	value := strings.TrimSpace(r.URL.Query().Get(key))
-	if value == "" {
-		return fallback
-	}
-	parsed, err := strconv.Atoi(value)
-	if err != nil {
-		return fallback
-	}
-	return parsed
-}
-
-func bearerToken(r *http.Request) string {
-	header := r.Header.Get("Authorization")
-	if strings.HasPrefix(header, "Bearer ") {
-		return strings.TrimPrefix(header, "Bearer ")
-	}
-	if token := r.URL.Query().Get("token"); token != "" {
-		return token
-	}
-	return ""
-}
-
-func tokenFromWS(r *http.Request) string {
-	if token := bearerToken(r); token != "" {
-		return token
-	}
-	for _, proto := range websocket.Subprotocols(r) {
-		if strings.HasPrefix(proto, "aifar.auth.") {
-			raw := strings.TrimPrefix(proto, "aifar.auth.")
-			data, err := base64.RawURLEncoding.DecodeString(raw)
-			if err == nil {
-				return string(data)
-			}
-		}
-	}
-	return r.URL.Query().Get("token")
-}
-
-func decode(w http.ResponseWriter, r *http.Request, dst any) bool {
-	defer r.Body.Close()
-	if err := json.NewDecoder(r.Body).Decode(dst); err != nil {
-		writeError(w, http.StatusBadRequest, "INVALID_JSON", i18n.Text(languageFromRequest(r), "api.invalidJSON"), map[string]any{"error": err.Error()})
-		return false
-	}
-	return true
-}
-
-func respond(w http.ResponseWriter, value any, err error) {
-	if err != nil {
-		code := http.StatusInternalServerError
-		if store.IsNotFound(err) {
-			code = http.StatusNotFound
-		}
-		writeError(w, code, "REQUEST_FAILED", err.Error(), nil)
-		return
-	}
-	writeJSON(w, http.StatusOK, value)
-}
-
-func respondTask(w http.ResponseWriter, task store.Task, err error) {
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "TASK_START_FAILED", err.Error(), nil)
-		return
-	}
-	writeJSON(w, http.StatusAccepted, map[string]any{"taskId": task.ID, "status": task.Status})
-}
-
-func writeJSON(w http.ResponseWriter, code int, value any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(code)
-	_ = json.NewEncoder(w).Encode(value)
-}
-
-func writeError(w http.ResponseWriter, code int, errCode, message string, details any) {
-	writeJSON(w, code, map[string]any{"code": errCode, "message": message, "details": details})
-}
-
-func writeSSE(w http.ResponseWriter, event string, value any) {
-	data, _ := json.Marshal(value)
-	_, _ = fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, data)
+	_ = auditkit.Record(a.store, auditkit.Event{
+		Actor:   currentUser(r).Username,
+		Action:  action,
+		Target:  target,
+		Status:  status,
+		Message: message,
+	})
 }

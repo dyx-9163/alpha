@@ -43,7 +43,23 @@ export interface AppInstallField {
   defaultValue?: unknown
   required?: boolean
   options?: AppInstallFieldOption[]
+  min?: number
+  max?: number
+  step?: number
+  validate?: AppInstallFieldValidator
 }
+
+export interface AppInstallValidationContext {
+  servers: ServerOption[]
+  selectedServers: ServerOption[]
+  targetMode: AppTargetMode
+}
+
+export type AppInstallFieldValidator = (
+  value: unknown,
+  values: Record<string, string | number | boolean | undefined>,
+  context: AppInstallValidationContext
+) => string | undefined | null
 
 export interface AppInstallDialogConfig {
   targetMode?: AppTargetMode

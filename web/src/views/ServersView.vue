@@ -11,27 +11,16 @@
       </div>
     </div>
 
-    <div class="metric-grid server-summary">
-      <div class="metric-card">
-        <div class="label">{{ t('servers.total') }}</div>
-        <div class="value">{{ summary.total }}</div>
-      </div>
-      <div class="metric-card">
-        <div class="label">{{ t('servers.availableCount') }}</div>
-        <div class="value">{{ summary.available }}</div>
-      </div>
-      <div class="metric-card">
-        <div class="label">{{ t('servers.unknownCount') }}</div>
-        <div class="value">{{ summary.unknown }}</div>
-      </div>
-    </div>
+    <MetricGrid :items="serverMetrics" class="server-summary" />
 
     <div class="server-workbench">
       <ServerInventoryList
         :servers="filteredServers"
         :selected-id="selectedId"
+        :drag-disabled="Boolean(search.trim())"
         v-model:search="search"
         @select="selectedId = $event"
+        @reorder="reorder"
       />
 
       <ServerDetailPanel
@@ -50,6 +39,7 @@
 
 <script setup lang="ts">
 import { computed, onMounted } from 'vue'
+import MetricGrid from '../components/MetricGrid.vue'
 import { useI18n } from '../i18n'
 import ServerDetailPanel from '../servers/components/ServerDetailPanel.vue'
 import ServerFormDrawer from '../servers/components/ServerFormDrawer.vue'
@@ -72,11 +62,17 @@ const {
   open,
   save,
   remove,
+  reorder,
   probe,
   probeSelectedOnce
 } = useServerWorkbench(t)
 
 const selectedProbing = computed(() => selectedServer.value ? probingIds.value.has(selectedServer.value.id) : false)
+const serverMetrics = computed(() => [
+  { label: t('servers.total'), value: summary.value.total },
+  { label: t('servers.availableCount'), value: summary.value.available },
+  { label: t('servers.unknownCount'), value: summary.value.unknown }
+])
 
 onMounted(async () => {
   await loadDefaults()

@@ -12,6 +12,7 @@ type Store interface {
 	ListServers() ([]store.Server, error)
 	GetServer(id string, includeSecret bool) (store.Server, error)
 	SaveServer(v store.Server) (store.Server, error)
+	ReorderServers(ids []string) error
 	DeleteServer(id string) error
 }
 
@@ -71,6 +72,10 @@ func (s Service) Save(input store.Server, lang string) (store.Server, error) {
 
 func (s Service) Delete(id string) error {
 	return s.store.DeleteServer(id)
+}
+
+func (s Service) Reorder(ids []string) error {
+	return s.store.ReorderServers(ids)
 }
 
 func (s Service) Probe(ctx context.Context, id string, lang string, log Logger) error {

@@ -1,12 +1,8 @@
 <template>
-  <section class="apps-page">
-    <div class="page-head">
-      <div>
-        <h1 class="page-title">{{ t('apps.title') }}</h1>
-        <p class="page-subtitle">{{ t('apps.subtitle') }}</p>
-      </div>
+  <PageShell class="apps-page" :title="t('apps.title')" :subtitle="t('apps.subtitle')">
+    <template #actions>
       <el-button @click="rescan">{{ t('common.refresh') }}</el-button>
-    </div>
+    </template>
 
     <el-tabs v-model="activeTab" class="aifar-panel top-tabs">
       <el-tab-pane :label="t('common.all')" name="all" />
@@ -68,16 +64,7 @@
     </div>
 
     <div v-else-if="activeTab === 'installed'" class="table-panel">
-      <el-table :data="instances">
-        <el-table-column prop="app" :label="t('table.app')" />
-        <el-table-column prop="version" :label="t('table.version')" />
-        <el-table-column prop="serverId" :label="t('table.server')" />
-        <el-table-column prop="status" :label="t('common.status')">
-          <template #default="{ row }">
-            <StatusTag :status="row.status" />
-          </template>
-        </el-table-column>
-      </el-table>
+      <AppInstanceTable :instances="instances" :servers="servers" :show-time="false" />
     </div>
 
     <div v-else-if="activeTab === 'tasks'" class="deployment-records">
@@ -89,31 +76,13 @@
           </div>
           <el-button size="small" @click="load">{{ t('common.refresh') }}</el-button>
         </div>
-        <el-table :data="instances">
-          <el-table-column prop="app" :label="t('table.app')" min-width="120" />
-          <el-table-column prop="version" :label="t('table.version')" min-width="120" />
-          <el-table-column :label="t('table.server')" min-width="180">
-            <template #default="{ row }">
-              {{ serverLabel(row.serverId) }}
-            </template>
-          </el-table-column>
-          <el-table-column prop="status" :label="t('common.status')" width="120">
-            <template #default="{ row }">
-              <StatusTag :status="row.status" />
-            </template>
-          </el-table-column>
-          <el-table-column :label="t('common.time')" min-width="180">
-            <template #default="{ row }">
-              {{ formatTime(row.createdAt) }}
-            </template>
-          </el-table-column>
-          <el-table-column :label="t('common.operation')" width="220" fixed="right">
-            <template #default="{ row }">
-              <el-button size="small" plain @click="checkDeploymentService(row)">{{ t('common.check') }}</el-button>
-              <el-button size="small" type="danger" plain @click="deleteDeploymentService(row)">{{ t('common.delete') }}</el-button>
-            </template>
-          </el-table-column>
-        </el-table>
+        <AppInstanceTable
+          :instances="instances"
+          :servers="servers"
+          show-actions
+          @check="checkDeploymentService"
+          @delete="deleteDeploymentService"
+        />
       </section>
     </div>
 
@@ -132,26 +101,39 @@
       v-bind="moduleDialogProps"
       @submit="submitModuleInstall"
     />
-  </section>
+
+    <SecretConfirmPrompt
+      v-model="deletePromptVisible"
+      :title="t('apps.deleteService')"
+      :message="deletePromptMessage"
+      :placeholder="t('apps.deleteServicePasswordPlaceholder')"
+      :confirm-text="t('common.delete')"
+      :cancel-text="t('common.cancel')"
+      :loading="deleteSubmitting"
+      @confirm="confirmDeleteDeploymentService"
+    />
+  </PageShell>
 </template>
 
 <script setup lang="ts">
 import { computed, onMounted, ref, shallowRef } from 'vue'
 import type { Component } from 'vue'
-import { ElMessage, ElMessageBox } from 'element-plus'
+import { ElMessage } from 'element-plus'
 import { useRouter } from 'vue-router'
 import { apiGet, apiPost, asArray } from '../api/client'
 import { pairedAppCatalog, type AppCatalogResponse, type AppStoreItem } from '../apps/registry/catalog'
 import { frontendModuleFor } from '../apps/registry/loader'
 import { resolveAppLocale } from '../apps/registry/locale'
 import type { AppFrontendModule, AppInstallPayload, ServerOption } from '../apps/registry/contract'
-import StatusTag from '../components/StatusTag.vue'
+import AppInstanceTable from '../components/AppInstanceTable.vue'
+import PageShell from '../components/PageShell.vue'
+import SecretConfirmPrompt from '../components/SecretConfirmPrompt.vue'
 import { useI18n } from '../i18n'
 
 const { t } = useI18n()
 const router = useRouter()
 const backendCatalog = ref<AppCatalogResponse>({})
-const instances = ref<any[]>([])
+const instances = ref<AppInstanceTableRecord[]>([])
 const servers = ref<ServerOption[]>([])
 const activeTab = ref('all')
 const category = ref('all')
@@ -159,19 +141,26 @@ const installSubmitting = ref(false)
 const moduleDialogVisible = ref(false)
 const moduleDialogApp = ref<AppStoreItem | null>(null)
 const moduleDialogModule = shallowRef<AppFrontendModule | null>(null)
+const deletePromptVisible = ref(false)
+const deleteSubmitting = ref(false)
+const pendingDeleteService = ref<AppInstanceTableRecord | null>(null)
 const locale = computed(() => resolveAppLocale())
 
 const apps = computed(() => pairedAppCatalog(backendCatalog.value, locale.value))
 const filteredApps = computed(() => (category.value === 'all' ? apps.value : apps.value.filter((app) => app.category === category.value)))
 const moduleDialogComponent = computed<Component | null>(() => moduleDialogModule.value?.installDialog ?? null)
 const moduleDialogProps = computed(() => moduleDialogModule.value?.installDialogProps?.(locale.value) ?? {})
+const deletePromptMessage = computed(() => {
+  const row = pendingDeleteService.value
+  return row ? t('apps.deleteServicePasswordPrompt', { server: serverLabel(row.serverId) }) : ''
+})
 
-type AppInstanceRecord = {
+type AppInstanceTableRecord = {
   id: string
   app: string
   version: string
-  serverId: string
-  status: string
+  serverId?: string
+  status?: string
   createdAt?: string
 }
 
@@ -215,7 +204,7 @@ function openInstallDialog(app: AppStoreItem) {
 
 async function load() {
   backendCatalog.value = await apiGet<AppCatalogResponse>(`/apps/catalog?lang=${locale.value}`).catch(() => ({}))
-  instances.value = asArray(await apiGet<any[] | null>('/apps/instances').catch(() => []))
+  instances.value = asArray(await apiGet<AppInstanceTableRecord[] | null>('/apps/instances').catch(() => []))
   servers.value = asArray(await apiGet<ServerOption[] | null>('/servers').catch(() => []))
 }
 
@@ -242,7 +231,7 @@ async function submitModuleInstall(payload: AppInstallPayload) {
   }
 }
 
-async function checkDeploymentService(row: AppInstanceRecord) {
+async function checkDeploymentService(row: AppInstanceTableRecord) {
   try {
     const result = await apiPost<{ taskId: string }>(`/apps/instances/${row.id}/check`, {
       language: locale.value
@@ -254,33 +243,34 @@ async function checkDeploymentService(row: AppInstanceRecord) {
   }
 }
 
-async function deleteDeploymentService(row: AppInstanceRecord) {
-  let password = ''
-  try {
-    const result = await ElMessageBox.prompt(
-      t('apps.deleteServicePasswordPrompt', { server: serverLabel(row.serverId) }),
-      t('apps.deleteService'),
-      {
-        inputType: 'password',
-        inputPlaceholder: t('apps.deleteServicePasswordPlaceholder'),
-        confirmButtonText: t('common.delete'),
-        cancelButtonText: t('common.cancel'),
-        type: 'warning'
-      }
-    )
-    password = String(result.value ?? '')
-  } catch {
+function deleteDeploymentService(row: AppInstanceTableRecord) {
+  pendingDeleteService.value = row
+  deletePromptVisible.value = true
+}
+
+async function confirmDeleteDeploymentService(password: string) {
+  const row = pendingDeleteService.value
+  if (!row) {
     return
   }
+  if (!password.trim()) {
+    ElMessage.warning(t('apps.deleteServicePasswordPlaceholder'))
+    return
+  }
+  deleteSubmitting.value = true
   try {
     const result = await apiPost<{ taskId: string }>(`/apps/instances/${row.id}/delete`, {
       serverPassword: password,
       language: locale.value
     })
+    deletePromptVisible.value = false
+    pendingDeleteService.value = null
     openTaskCenter(result.taskId)
     ElMessage.success(t('apps.deleteServiceAccepted'))
   } catch (err) {
     ElMessage.error(err instanceof Error ? err.message : t('apps.deleteServiceFailed'))
+  } finally {
+    deleteSubmitting.value = false
   }
 }
 
@@ -293,17 +283,6 @@ function serverLabel(serverId?: string) {
     return serverId
   }
   return server.name && server.host ? `${server.name} (${server.host})` : server.name || server.host || serverId
-}
-
-function formatTime(value?: string) {
-  if (!value) {
-    return '-'
-  }
-  const date = new Date(value)
-  if (Number.isNaN(date.getTime())) {
-    return value
-  }
-  return date.toLocaleString()
 }
 
 function openTaskCenter(taskId: string) {

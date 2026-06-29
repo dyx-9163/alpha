@@ -4,6 +4,8 @@ import (
 	"bytes"
 	_ "embed"
 	"text/template"
+
+	"aifar-deployment/backend/internal/installer/installerkit"
 )
 
 //go:embed templates/standalone/install.sh
@@ -16,7 +18,7 @@ var standaloneUninstallScriptTemplate string
 var distributedConfigureScriptTemplate string
 
 var minioScriptFuncs = template.FuncMap{
-	"shq": shellQuote,
+	"shq": installerkit.ShellQuote,
 }
 
 var minioStandaloneInstallTemplate = template.Must(template.New("minio-standalone-install").

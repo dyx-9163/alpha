@@ -6,10 +6,7 @@
         <p class="page-subtitle">{{ t('containers.subtitle') }}</p>
       </div>
       <div class="head-actions">
-        <el-select v-model="selectedServerId" :placeholder="t('terminal.server')" clearable class="toolbar-control">
-          <el-option v-for="server in servers" :key="server.id" :label="serverLabel(server)" :value="server.id" />
-        </el-select>
-        <el-input v-model="dockerHost" :disabled="Boolean(selectedServerId)" :placeholder="t('containers.localDocker')" clearable class="toolbar-control" />
+        <ServerSelector v-model="selectedServerId" :servers="dockerServers" :placeholder="t('containers.selectDockerHost')" class="toolbar-control" />
         <el-button @click="load">{{ t('containers.checkHost') }}</el-button>
         <el-button @click="loadActive">{{ t('common.refresh') }}</el-button>
       </div>
@@ -30,13 +27,7 @@
 
     <div class="workspace-card containers-main">
       <template v-if="tab === 'overview'">
-        <div class="container-metrics">
-          <div v-for="item in metrics" :key="item.label" class="metric-card">
-            <div class="label">{{ item.label }}</div>
-            <div class="value">{{ item.value }}</div>
-            <div class="subtle-note">{{ item.note }}</div>
-          </div>
-        </div>
+        <MetricGrid :items="metrics" />
 
         <div class="sub-panel">
           <h2 class="section-title">{{ t('containers.diskUsage') }}</h2>
@@ -51,14 +42,7 @@
 
         <div class="sub-panel">
           <h2 class="section-title">{{ t('containers.configSummary') }}</h2>
-          <div class="kv-grid">
-            <div class="key">{{ t('containers.dockerHost') }}</div><div>{{ targetLabel }}</div>
-            <div class="key">{{ t('containers.endpoint') }}</div><div>{{ summaryData.endpoint || '-' }}</div>
-            <div class="key">{{ t('containers.serverVersion') }}</div><div>{{ summaryData.version || '-' }}</div>
-            <div class="key">{{ t('containers.driver') }}</div><div>{{ summaryData.driver || '-' }}</div>
-            <div class="key">{{ t('containers.rootDir') }}</div><div>{{ summaryData.rootDir || '-' }}</div>
-            <div class="key">{{ t('common.status') }}</div><div><StatusTag :status="summary.available ? 'available' : 'failed'" /></div>
-          </div>
+          <KeyValueGrid :items="configSummaryItems" />
         </div>
       </template>
 
@@ -126,20 +110,13 @@
 
       <template v-else>
         <div class="settings-grid">
-          <div class="kv-grid">
-            <div class="key">{{ t('containers.dockerHost') }}</div><div>{{ targetLabel }}</div>
-            <div class="key">{{ t('containers.endpoint') }}</div><div>{{ summaryData.endpoint || '-' }}</div>
-            <div class="key">{{ t('containers.rootDir') }}</div><div>{{ summaryData.rootDir || '-' }}</div>
-            <div class="key">{{ t('common.provider') }}</div><div>{{ t('common.real') }}</div>
-          </div>
+          <KeyValueGrid :items="settingsItems" />
           <p class="muted-strip">{{ t('containers.settingsHint') }}</p>
         </div>
       </template>
     </div>
 
-    <el-drawer v-model="logsVisible" :title="t('containers.logs')" size="52%">
-      <pre class="terminal-box logs-box">{{ logsText || t('tasks.noLogs') }}</pre>
-    </el-drawer>
+    <LogDrawer v-model="logsVisible" :title="t('containers.logs')" :text="logsText" :empty-text="t('tasks.noLogs')" />
   </section>
 </template>
 
@@ -147,6 +124,10 @@
 import { computed, onMounted, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import { apiGet, apiPost, asArray } from '../api/client'
+import KeyValueGrid from '../components/KeyValueGrid.vue'
+import LogDrawer from '../components/LogDrawer.vue'
+import MetricGrid from '../components/MetricGrid.vue'
+import ServerSelector from '../components/ServerSelector.vue'
 import StatusTag from '../components/StatusTag.vue'
 import { useI18n } from '../i18n'
 
@@ -158,7 +139,6 @@ type DockerSummaryResponse = {
 }
 
 const { t } = useI18n()
-const dockerHost = ref('')
 const selectedServerId = ref('')
 const servers = ref<any[]>([])
 const summary = ref<DockerSummaryResponse>({})
@@ -170,7 +150,8 @@ const logsText = ref('')
 
 const summaryData = computed(() => summary.value.summary ?? {})
 const selectedServer = computed(() => servers.value.find((server) => server.id === selectedServerId.value) ?? null)
-const targetLabel = computed(() => selectedServer.value ? serverLabel(selectedServer.value) : dockerHost.value || t('containers.localDocker'))
+const dockerServers = computed(() => servers.value.filter((server) => String(server.dockerHost ?? '').trim() !== ''))
+const targetLabel = computed(() => selectedServer.value ? serverLabel(selectedServer.value) : t('containers.selectDockerHost'))
 const errorTitle = computed(() => summary.value.available === false ? t('containers.notAvailable') : t('containers.checkFailed'))
 const metrics = computed(() => [
   { label: t('containers.title'), value: summaryData.value.containers ?? 0, note: t('containers.runningCount', { count: summaryData.value.running ?? 0 }) },
@@ -178,6 +159,20 @@ const metrics = computed(() => [
   { label: t('containers.network'), value: summaryData.value.networks ?? 0, note: t('containers.network') },
   { label: t('containers.volumes'), value: summaryData.value.volumes ?? 0, note: t('containers.volumes') },
   { label: t('containers.registry'), value: 0, note: t('containers.controlPlaneData') }
+])
+const configSummaryItems = computed(() => [
+  { label: t('containers.dockerHost'), value: targetLabel.value },
+  { label: t('containers.endpoint'), value: summaryData.value.endpoint || '-' },
+  { label: t('containers.serverVersion'), value: summaryData.value.version || '-' },
+  { label: t('containers.driver'), value: summaryData.value.driver || '-' },
+  { label: t('containers.rootDir'), value: summaryData.value.rootDir || '-' },
+  { label: t('common.status'), status: summary.value.available ? 'available' : 'failed' }
+])
+const settingsItems = computed(() => [
+  { label: t('containers.dockerHost'), value: targetLabel.value },
+  { label: t('containers.endpoint'), value: summaryData.value.endpoint || '-' },
+  { label: t('containers.rootDir'), value: summaryData.value.rootDir || '-' },
+  { label: t('common.provider'), value: t('common.real') }
 ])
 const normalizedDiskUsage = computed(() => {
   const rows = asArray<Record<string, string>>(summary.value.diskUsage)
@@ -194,7 +189,7 @@ function targetQuery() {
   if (selectedServerId.value) {
     return `serverId=${encodeURIComponent(selectedServerId.value)}`
   }
-  return `dockerHost=${encodeURIComponent(dockerHost.value)}`
+  return ''
 }
 
 function serverLabel(server: any) {
@@ -206,11 +201,20 @@ function serverLabel(server: any) {
 
 async function loadServers() {
   servers.value = asArray(await apiGet<any[] | null>('/servers').catch(() => []))
+  if (!selectedServerId.value || !dockerServers.value.some((server) => server.id === selectedServerId.value)) {
+    selectedServerId.value = dockerServers.value[0]?.id ?? ''
+  }
 }
 
 async function load() {
   error.value = ''
-  summary.value = await apiGet<DockerSummaryResponse>(`/containers/summary?${targetQuery()}`).catch((err) => {
+  const query = targetQuery()
+  if (!query) {
+    summary.value = { available: false }
+    collection.value = []
+    return
+  }
+  summary.value = await apiGet<DockerSummaryResponse>(`/containers/summary?${query}`).catch((err) => {
     error.value = err.message
     return { available: false, error: err.message }
   })
@@ -225,7 +229,12 @@ async function loadCollection() {
     collection.value = []
     return
   }
-  collection.value = asArray(await apiGet(`/containers?kind=${tab.value}&${targetQuery()}`).catch((err) => {
+  const query = targetQuery()
+  if (!query) {
+    collection.value = []
+    return
+  }
+  collection.value = asArray(await apiGet(`/containers?kind=${tab.value}&${query}`).catch((err) => {
     error.value = err.message
     return []
   }))
@@ -240,13 +249,23 @@ async function loadActive() {
 }
 
 async function runContainerAction(id: string, action: string) {
-  await apiPost(`/containers/${encodeURIComponent(id)}/${action}?${targetQuery()}`)
+  const query = targetQuery()
+  if (!query) {
+    ElMessage.warning(t('containers.selectDockerHost'))
+    return
+  }
+  await apiPost(`/containers/${encodeURIComponent(id)}/${action}?${query}`)
   ElMessage.success(t('containers.actionAccepted'))
   setTimeout(loadCollection, 800)
 }
 
 async function openLogs(id: string) {
-  const result = await apiGet<{ logs?: string[] }>(`/containers/${encodeURIComponent(id)}/logs?tail=300&${targetQuery()}`)
+  const query = targetQuery()
+  if (!query) {
+    ElMessage.warning(t('containers.selectDockerHost'))
+    return
+  }
+  const result = await apiGet<{ logs?: string[] }>(`/containers/${encodeURIComponent(id)}/logs?tail=300&${query}`)
   logsText.value = asArray<string>(result.logs).join('\n')
   logsVisible.value = true
 }
@@ -266,13 +285,6 @@ onMounted(async () => {
   gap: 12px;
   min-height: 0;
   padding: 10px;
-}
-
-.container-metrics {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-  gap: 12px;
-  margin: 0;
 }
 
 .sub-panel {
@@ -313,25 +325,18 @@ onMounted(async () => {
   gap: 6px;
 }
 
-.logs-box {
-  height: calc(100vh - 120px);
-  overflow: auto;
-}
-
 .settings-grid {
   display: grid;
   gap: 12px;
 }
 
 @media (max-width: 1100px) {
-  .container-metrics,
   .disk-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }
 
 @media (max-width: 640px) {
-  .container-metrics,
   .disk-grid {
     grid-template-columns: 1fr;
   }

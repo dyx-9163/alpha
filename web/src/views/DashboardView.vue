@@ -13,23 +13,7 @@
       <strong>{{ now }}</strong>
     </div>
 
-    <div class="metric-grid dashboard-kpis">
-      <div class="metric-card">
-        <div class="label">{{ t('nav.servers') }}</div>
-        <div class="value">{{ servers.length }}</div>
-        <div class="subtle-note">{{ t('common.available') }} {{ availableServers }}</div>
-      </div>
-      <div class="metric-card">
-        <div class="label">{{ t('toolbox.tasks') }}</div>
-        <div class="value">{{ tasks.length }}</div>
-        <div class="subtle-note">{{ t('common.running') }} {{ runningTasks }}</div>
-      </div>
-      <div class="metric-card">
-        <div class="label">{{ t('nav.database') }}</div>
-        <div class="value">{{ databaseInstances.length }}</div>
-        <div class="subtle-note">{{ t('dashboard.databaseStatus') }}</div>
-      </div>
-    </div>
+    <MetricGrid :items="kpis" class="dashboard-kpis" />
 
     <div class="workspace-card">
       <h2 class="section-title">{{ t('dashboard.serverMetrics') }}</h2>
@@ -107,6 +91,7 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
 import { apiGet, asArray } from '../api/client'
+import MetricGrid from '../components/MetricGrid.vue'
 import StatusTag from '../components/StatusTag.vue'
 import { useI18n } from '../i18n'
 
@@ -124,6 +109,11 @@ const serverRows = computed(() => servers.value.map((server) => ({
 })))
 const availableServers = computed(() => servers.value.filter((server) => server.status === 'available').length)
 const runningTasks = computed(() => tasks.value.filter((task) => task.status === 'running').length)
+const kpis = computed(() => [
+  { label: t('nav.servers'), value: servers.value.length, note: `${t('common.available')} ${availableServers.value}` },
+  { label: t('toolbox.tasks'), value: tasks.value.length, note: `${t('common.running')} ${runningTasks.value}` },
+  { label: t('nav.database'), value: databaseInstances.value.length, note: t('dashboard.databaseStatus') }
+])
 
 function metricWidth(_row: any, fallback: number) {
   return `${fallback}%`

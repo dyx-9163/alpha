@@ -6,6 +6,7 @@ import (
 	"path"
 	"strings"
 
+	"aifar-deployment/backend/internal/installer/installerkit"
 	"aifar-deployment/backend/internal/store"
 )
 
@@ -32,7 +33,7 @@ func (i Inspector) Check(ctx context.Context, server store.Server, version strin
 	if version == "" {
 		return StatusResult{}, fmt.Errorf("docker version is required for status check")
 	}
-	installRoot := path.Join(remoteDeployDir(server.DeployDir), "docker", version)
+	installRoot := path.Join(installerkit.RemoteDeployDir(server.DeployDir), "docker", version)
 	result, err := i.remote.Run(ctx, server, dockerStatusCommand(installRoot))
 	if strings.TrimSpace(result.Stdout) != "" {
 		log.Info("%s", strings.TrimSpace(result.Stdout))
@@ -59,7 +60,7 @@ func dockerStatusCommand(installRoot string) string {
 	return "sh -s <<'AIFAR_DOCKER_STATUS'\n" + `#!/usr/bin/env sh
 set -u
 
-INSTALL_ROOT=` + shellQuote(installRoot) + `
+INSTALL_ROOT=` + installerkit.ShellQuote(installRoot) + `
 STATUS="missing"
 DOCKER_VERSION=""
 COMPOSE_VERSION=""

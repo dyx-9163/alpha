@@ -12,24 +12,25 @@
     </div>
 
     <div class="workspace-card">
-      <h2 class="section-title">{{ t('toolbox.offlineResources') }}</h2>
-      <el-table :data="resources">
-        <el-table-column prop="app" :label="t('table.app')" />
-        <el-table-column prop="version" :label="t('common.version')" />
-        <el-table-column prop="rpmCount" :label="t('toolbox.rpms')" />
-        <el-table-column prop="path" :label="t('toolbox.path')" />
-      </el-table>
+      <DataTable :rows="resources" :columns="resourceColumns" :title="t('toolbox.offlineResources')" />
     </div>
   </section>
 </template>
 
 <script setup lang="ts">
-import { onMounted, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { apiGet, apiPost, asArray } from '../api/client'
+import DataTable from '../components/DataTable.vue'
 import { useI18n } from '../i18n'
 
 const { t } = useI18n()
 const resources = ref<any[]>([])
+const resourceColumns = computed(() => [
+  { prop: 'app', label: t('table.app'), minWidth: 120 },
+  { prop: 'version', label: t('common.version'), minWidth: 150 },
+  { prop: 'rpmCount', label: t('toolbox.rpms'), width: 100, align: 'right' as const },
+  { prop: 'path', label: t('toolbox.path'), minWidth: 360 }
+])
 async function load() {
   resources.value = asArray(await apiGet<any[] | null>('/resources').catch(() => []))
 }

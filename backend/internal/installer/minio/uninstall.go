@@ -6,6 +6,7 @@ import (
 	"path"
 	"strings"
 
+	"aifar-deployment/backend/internal/installer/installerkit"
 	"aifar-deployment/backend/internal/store"
 )
 
@@ -25,25 +26,15 @@ func (u Uninstaller) Uninstall(ctx context.Context, server store.Server, version
 	if apiPort <= 0 {
 		apiPort = 9000
 	}
-	deployDir := remoteDeployDir(server.DeployDir)
+	deployDir := installerkit.RemoteDeployDir(server.DeployDir)
 	installRoot := path.Join(deployDir, "minio", version)
 	script, err := uninstallStandaloneScript(version, installRoot, apiPort)
 	if err != nil {
 		return err
 	}
-	result, err := u.remote.Run(ctx, server, "sh -s <<'AIFAR_MINIO_UNINSTALL'\n"+script+"\nAIFAR_MINIO_UNINSTALL")
-	if strings.TrimSpace(result.Stdout) != "" {
-		log.Info("%s", strings.TrimSpace(result.Stdout))
-	}
-	if strings.TrimSpace(result.Stderr) != "" {
-		if err != nil {
-			log.Error("%s", strings.TrimSpace(result.Stderr))
-		} else {
-			log.Info("%s", strings.TrimSpace(result.Stderr))
-		}
-	}
+	_, err = installerkit.Run(ctx, u.remote, server, "sh -s <<'AIFAR_MINIO_UNINSTALL'\n"+script+"\nAIFAR_MINIO_UNINSTALL", log, "minio remote uninstall failed")
 	if err != nil {
-		return fmt.Errorf("minio remote uninstall failed: %w", err)
+		return err
 	}
 	return nil
 }

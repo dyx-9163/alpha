@@ -5,6 +5,8 @@ VERSION={{shq .Version}}
 WORK_DIR={{shq .WorkDir}}
 ARCHIVE={{shq .ArchivePath}}
 INSTALL_ROOT={{shq .InstallRoot}}
+BRIDGE_CIDR={{shq .BridgeCIDR}}
+REMOTE_API_PORT={{.RemoteAPIPort}}
 DAEMON_DIR="$INSTALL_ROOT/daemon"
 DAEMON_CONFIG="$DAEMON_DIR/daemon.json"
 DATA_ROOT="$INSTALL_ROOT/data"
@@ -13,9 +15,6 @@ SUDO=""
 if [ "$(id -u)" != "0" ]; then
   SUDO="sudo -n"
 fi
-
-echo "checking required commands"
-command -v tar >/dev/null 2>&1 || { echo "tar is required"; exit 1; }
 
 echo "installing local RPM dependencies when available"
 if [ -d "$WORK_DIR/rpms" ] && ls "$WORK_DIR"/rpms/*.rpm >/dev/null 2>&1; then
@@ -38,6 +37,10 @@ if [ -d "$WORK_DIR/rpms" ] && ls "$WORK_DIR"/rpms/*.rpm >/dev/null 2>&1; then
   fi
 fi
 
+echo "checking required commands"
+command -v tar >/dev/null 2>&1 || { echo "tar is required after local RPM dependency installation"; exit 1; }
+command -v gzip >/dev/null 2>&1 || { echo "gzip is required after local RPM dependency installation"; exit 1; }
+
 echo "extracting Docker bundle"
 rm -rf "$WORK_DIR/unpacked"
 mkdir -p "$WORK_DIR/unpacked"
@@ -59,6 +62,7 @@ cat > "$WORK_DIR/daemon.json" <<JSON
   "exec-opts": ["native.cgroupdriver=systemd"],
   "data-root": "$DATA_ROOT",
   "exec-root": "$EXEC_ROOT",
+  "bip": "$BRIDGE_CIDR",
   "log-driver": "json-file",
   "log-opts": {
     "max-size": "100m",
@@ -104,7 +108,7 @@ Requires=containerd.service
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/dockerd --config-file=$DAEMON_CONFIG --containerd=/run/containerd/containerd.sock
+ExecStart=/usr/local/bin/dockerd -H unix:///var/run/docker.sock -H tcp://0.0.0.0:$REMOTE_API_PORT --config-file=$DAEMON_CONFIG --containerd=/run/containerd/containerd.sock
 ExecReload=/bin/kill -s HUP \$MAINPID
 TimeoutStartSec=0
 Restart=always
@@ -159,5 +163,12 @@ if [ "$DOCKER_READY" != "1" ]; then
   exit 1
 fi
 /usr/local/bin/docker version
+echo "verifying Docker remote API"
+if ! /usr/local/bin/docker -H "tcp://127.0.0.1:$REMOTE_API_PORT" version >/dev/null 2>&1; then
+  echo "Docker remote API is not reachable on tcp://127.0.0.1:$REMOTE_API_PORT"
+  $SUDO systemctl --no-pager --full status docker || true
+  $SUDO journalctl -u docker -n 80 --no-pager || true
+  exit 1
+fi
 echo "verifying Docker Compose"
 /usr/local/bin/docker compose version || /usr/local/bin/docker-compose version

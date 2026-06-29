@@ -1,6 +1,6 @@
 import { computed, reactive, ref } from 'vue'
-import { ElMessageBox } from 'element-plus'
-import { deleteServer, getServerDefaults, listServers, probeServer, saveServer, waitTaskDone } from './api'
+import { confirmAction } from '../composables/useConfirmAction'
+import { deleteServer, getServerDefaults, listServers, probeServer, reorderServers, saveServer, waitTaskDone } from './api'
 import type { ServerFormModel, ServerRecord } from './types'
 
 type ServerDefaults = {
@@ -24,7 +24,8 @@ export function createServerForm(row?: Partial<ServerRecord>, defaults: ServerDe
     tags: row?.tags ?? '',
     note: row?.note ?? '',
     deployDir: row?.deployDir ?? defaults.defaultDeployDir,
-    status: row?.status ?? 'unknown'
+    status: row?.status ?? 'unknown',
+    sortOrder: row?.sortOrder
   }
 }
 
@@ -82,9 +83,37 @@ export function useServerWorkbench(t: (key: string, params?: Record<string, unkn
   }
 
   async function remove(row: ServerRecord) {
-    await ElMessageBox.confirm(t('servers.confirmDelete', { name: row.name }), t('servers.confirmDeleteTitle'))
+    await confirmAction({
+      message: t('servers.confirmDelete', { name: row.name }),
+      title: t('servers.confirmDeleteTitle'),
+      confirmText: t('common.delete'),
+      cancelText: t('common.cancel')
+    })
     await deleteServer(row.id)
     await load()
+  }
+
+  function applyServerOrder(ids: string[]) {
+    const byId = new Map(servers.value.map((server) => [server.id, server]))
+    const selected = ids.map((id) => byId.get(id)).filter((server): server is ServerRecord => Boolean(server))
+    const selectedIds = new Set(selected.map((server) => server.id))
+    const rest = servers.value.filter((server) => !selectedIds.has(server.id))
+    servers.value = [...selected, ...rest]
+  }
+
+  async function reorder(ids: string[]) {
+    if (!ids.length) {
+      return
+    }
+    const previous = servers.value.slice()
+    applyServerOrder(ids)
+    try {
+      await reorderServers(ids)
+      await load()
+    } catch (err) {
+      servers.value = previous
+      throw err
+    }
   }
 
   async function probe(row: ServerRecord) {
@@ -140,6 +169,7 @@ export function useServerWorkbench(t: (key: string, params?: Record<string, unkn
     open,
     save,
     remove,
+    reorder,
     probe,
     probeSelectedOnce
   }

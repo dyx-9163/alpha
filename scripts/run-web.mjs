@@ -2,10 +2,11 @@ import { spawn } from 'node:child_process'
 import path from 'node:path'
 import { webDir, withToolEnv } from './toolchain.mjs'
 
+const env = withToolEnv()
 const viteBin = path.join(webDir, 'node_modules', 'vite', 'bin', 'vite.js')
-const child = spawn(process.execPath, [viteBin, '--host', '0.0.0.0'], {
+const child = spawn(process.execPath, [viteBin, '--host', env.AIFAR_VITE_HOST || '127.0.0.1'], {
   cwd: webDir,
-  env: withToolEnv(),
+  env,
   stdio: 'inherit',
   shell: false
 })

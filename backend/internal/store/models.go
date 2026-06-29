@@ -32,6 +32,7 @@ type Server struct {
 	DockerHost string    `json:"dockerHost"`
 	Status     string    `json:"status"`
 	LastError  string    `json:"lastError,omitempty"`
+	SortOrder  int       `json:"sortOrder"`
 	CreatedAt  time.Time `json:"createdAt"`
 	UpdatedAt  time.Time `json:"updatedAt"`
 }

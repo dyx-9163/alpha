@@ -5,19 +5,28 @@
       <span class="status-pill">{{ servers.length }}</span>
     </div>
     <el-input v-model="model" :placeholder="t('servers.search')" clearable />
-    <button
-      v-for="server in servers"
-      :key="server.id"
-      class="server-card"
-      :class="{ active: server.id === selectedId }"
-      @click="$emit('select', server.id)"
+    <DraggableList
+      v-if="servers.length"
+      class="server-draggable-list"
+      :items="servers"
+      item-key="id"
+      :disabled="dragDisabled"
+      @reorder="handleReorder"
     >
-      <strong>{{ server.name }}</strong>
-      <span>{{ server.username }}@{{ server.host }}:{{ server.port }}</span>
-      <span class="server-tags">
-        <StatusTag :status="server.status" />
-      </span>
-    </button>
+      <template #default="{ item: server }">
+        <button
+          class="server-card"
+          :class="{ active: server.id === selectedId }"
+          @click="emit('select', server.id)"
+        >
+          <strong>{{ server.name }}</strong>
+          <span>{{ server.username }}@{{ server.host }}:{{ server.port }}</span>
+          <span class="server-tags">
+            <StatusTag :status="server.status" />
+          </span>
+        </button>
+      </template>
+    </DraggableList>
     <div v-if="!servers.length" class="empty-state compact-empty">
       <div><strong>{{ t('servers.emptyTitle') }}</strong><span>{{ t('servers.emptyDesc') }}</span></div>
     </div>
@@ -26,24 +35,35 @@
 
 <script setup lang="ts">
 import { computed } from 'vue'
+import DraggableList from '../../components/DraggableList.vue'
 import StatusTag from '../../components/StatusTag.vue'
 import { useI18n } from '../../i18n'
 import type { ServerRecord } from '../types'
+
+type ReorderPayload = {
+  keys: Array<string | number>
+}
 
 const props = defineProps<{
   servers: ServerRecord[]
   selectedId: string
   search: string
+  dragDisabled?: boolean
 }>()
 const emit = defineEmits<{
   'update:search': [value: string]
   select: [id: string]
+  reorder: [ids: string[]]
 }>()
 const { t } = useI18n()
 const model = computed({
   get: () => props.search,
   set: (value: string) => emit('update:search', value)
 })
+
+function handleReorder(payload: ReorderPayload) {
+  emit('reorder', payload.keys.map(String))
+}
 </script>
 
 <style scoped>
@@ -70,9 +90,12 @@ const model = computed({
   color: var(--aifar-ink);
 }
 
+.server-draggable-list {
+  margin-top: 10px;
+}
+
 .server-card {
   width: 100%;
-  margin-top: 10px;
   border: 1px solid var(--aifar-border);
   border-radius: var(--aifar-radius-lg);
   background: #fff;

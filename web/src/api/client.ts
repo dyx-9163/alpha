@@ -50,7 +50,13 @@ export function asArray<T = unknown>(value: unknown): T[] {
 
 export function terminalUrl(serverId: string) {
   const proto = window.location.protocol === 'https:' ? 'wss' : 'ws'
-  return `${proto}://${window.location.host}${API_PREFIX}/servers/${serverId}/terminal/ws`
+  const params = new URLSearchParams()
+  const token = localStorage.getItem('aifar-session-token')
+  if (token) {
+    params.set('token', token)
+  }
+  params.set('lang', getCurrentLocale())
+  return `${proto}://${window.location.host}${API_PREFIX}/servers/${serverId}/terminal/ws?${params.toString()}`
 }
 
 export function terminalProtocols() {

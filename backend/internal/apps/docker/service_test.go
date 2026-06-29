@@ -63,6 +63,7 @@ func (f *fakeStore) DeleteAppInstance(id string) error {
 type fakeRemote struct {
 	commands      []string
 	failUninstall bool
+	statusStdout  string
 }
 
 func (f *fakeRemote) Run(ctx context.Context, server store.Server, command string) (adapter.CommandResult, error) {
@@ -71,6 +72,9 @@ func (f *fakeRemote) Run(ctx context.Context, server store.Server, command strin
 		return adapter.CommandResult{Stderr: "remote uninstall failed"}, errors.New("remote uninstall failed")
 	}
 	if strings.Contains(command, "AIFAR_DOCKER_STATUS") {
+		if f.statusStdout != "" {
+			return adapter.CommandResult{Stdout: f.statusStdout}, nil
+		}
 		return adapter.CommandResult{Stdout: "status=missing\ndockerVersion=\ncomposeVersion=\nunitExists=false\ninstallRootExists=false\n"}, nil
 	}
 	return adapter.CommandResult{Stdout: "ok"}, nil
@@ -110,6 +114,39 @@ func TestServiceInstallsDockerOnMultipleServers(t *testing.T) {
 	if s.servers["srv-1"].DockerHost == "" || s.servers["srv-2"].DockerHost == "" {
 		t.Fatalf("expected docker hosts to be recorded: %+v", s.servers)
 	}
+	if s.servers["srv-1"].DockerHost != "tcp://10.0.0.1:2375" {
+		t.Fatalf("expected remote docker API host to be recorded, got %s", s.servers["srv-1"].DockerHost)
+	}
+}
+
+func TestServiceUsesDockerInstallOptions(t *testing.T) {
+	root := t.TempDir()
+	archive := filepath.Join(root, "aifar-docker-static-24.0.9-linux-x86_64.tar")
+	if err := os.WriteFile(archive, []byte("bundle"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s := &fakeStore{servers: map[string]store.Server{
+		"srv-1": {ID: "srv-1", Name: "db-1", Host: "10.0.0.1", Username: "root"},
+	}}
+	service := NewService(s, &fakeRemote{})
+	err := service.Install(context.Background(), InstallRequest{
+		Version:   "24.0.9",
+		ServerIDs: []string{"srv-1"},
+		Language:  "en",
+		Parameters: map[string]any{
+			"dockerBridgeCIDR": "172.30.0.1/16",
+			"remoteAPIPort":    2376,
+		},
+	}, []store.Resource{{App: "docker", Part: "backend", Version: "24.0.9", Path: archive}}, fakeLogger{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.servers["srv-1"].DockerHost != "tcp://10.0.0.1:2376" {
+		t.Fatalf("expected custom remote api host, got %s", s.servers["srv-1"].DockerHost)
+	}
+	if len(s.instances) != 1 || !strings.Contains(s.instances[0].Metadata, "172.30.0.1/16") {
+		t.Fatalf("expected install options in instance metadata: %+v", s.instances)
+	}
 }
 
 func TestServiceDeletesDockerRemotelyBeforeRemovingInstance(t *testing.T) {
@@ -145,6 +182,38 @@ func TestServiceDeletesDockerRemotelyBeforeRemovingInstance(t *testing.T) {
 	}
 	if !strings.Contains(joinedCommands, "AIFAR_DOCKER_STATUS") {
 		t.Fatalf("expected remote status verification after delete: %s", joinedCommands)
+	}
+}
+
+func TestServiceDeletesDockerWhenExternalPackageDockerRemains(t *testing.T) {
+	instance := store.AppInstance{ID: "app-1", App: "docker", Version: "24.0.9", ServerID: "srv-1", Status: "installed"}
+	s := &fakeStore{
+		servers: map[string]store.Server{
+			"srv-1": {ID: "srv-1", Name: "db-1", Host: "10.0.0.1", Username: "root", DeployDir: "/aifar/apps", DockerHost: "ssh://root@10.0.0.1"},
+		},
+		instances: []store.AppInstance{instance},
+	}
+	remote := &fakeRemote{statusStdout: strings.Join([]string{
+		"status=stopped",
+		"dockerVersion=Docker version 18.09.0, build 6273e58",
+		"composeVersion=",
+		"unitExists=false",
+		"installRootExists=false",
+	}, "\n")}
+	service := NewService(s, remote)
+	err := service.Delete(context.Background(), DeleteRequest{
+		Instance: instance,
+		Server:   s.servers["srv-1"],
+		Language: "zh",
+	}, fakeLogger{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(s.instances) != 0 {
+		t.Fatalf("expected app instance to be deleted when only external docker remains: %+v", s.instances)
+	}
+	if s.servers["srv-1"].DockerHost != "" {
+		t.Fatalf("expected DockerHost to be cleared: %+v", s.servers["srv-1"])
 	}
 }
 

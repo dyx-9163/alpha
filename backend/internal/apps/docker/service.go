@@ -18,10 +18,11 @@ type Store interface {
 }
 
 type InstallRequest struct {
-	Version   string
-	Topology  string
-	Language  string
-	ServerIDs []string
+	Version    string
+	Topology   string
+	Language   string
+	ServerIDs  []string
+	Parameters map[string]any
 }
 
 type DeleteRequest struct {
@@ -74,6 +75,7 @@ func (s Service) Install(ctx context.Context, req InstallRequest, resources []st
 	if err := dockerinstaller.VerifyBundleWithLanguage(bundle, req.Language); err != nil {
 		return err
 	}
+	options := dockerInstallOptions(req.Parameters)
 	log.Info(copy.UsingArchive, bundle.ArchivePath)
 	log.Info(copy.UsingRPMs, len(bundle.RPMPaths))
 	installer := dockerinstaller.NewInstaller(s.remote)
@@ -101,7 +103,7 @@ func (s Service) Install(ctx context.Context, req InstallRequest, resources []st
 			continue
 		}
 		if err := step(2, copy.InstallEngine, func() error {
-			return installer.InstallWithLanguage(ctx, server, bundle, logForServer, req.Language)
+			return installer.InstallWithLanguage(ctx, server, bundle, logForServer, req.Language, options)
 		}); err != nil {
 			msg := fmt.Sprintf("%s: %v", server.Name, err)
 			failures = append(failures, msg)
@@ -109,7 +111,7 @@ func (s Service) Install(ctx context.Context, req InstallRequest, resources []st
 			finishTarget(recorder, serverID, "failed", msg)
 			continue
 		}
-		server.DockerHost = fmt.Sprintf("ssh://%s@%s", server.Username, server.Host)
+		server.DockerHost = dockerinstaller.RemoteAPIHost(server.Host, options.RemoteAPIPort)
 		server.Status = "available"
 		server.LastError = ""
 		if err := step(3, copy.UpdateServer, func() error {
@@ -123,9 +125,11 @@ func (s Service) Install(ctx context.Context, req InstallRequest, resources []st
 			continue
 		}
 		metadata, _ := json.Marshal(map[string]any{
-			"dockerHost":  server.DockerHost,
-			"archivePath": bundle.ArchivePath,
-			"rpmCount":    len(bundle.RPMPaths),
+			"dockerHost":       server.DockerHost,
+			"dockerBridgeCIDR": options.BridgeCIDR,
+			"remoteAPIPort":    options.RemoteAPIPort,
+			"archivePath":      bundle.ArchivePath,
+			"rpmCount":         len(bundle.RPMPaths),
 		})
 		var instance store.AppInstance
 		if err := step(4, copy.RecordInstance, func() error {
@@ -176,8 +180,8 @@ func (s Service) Delete(ctx context.Context, req DeleteRequest, log dockerinstal
 		if checkErr != nil {
 			return checkErr
 		}
-		if status.Status != "missing" {
-			return fmt.Errorf("docker removal verification failed: status=%s, installRootExists=%v, unitExists=%v", status.Status, status.InstallRootExists, status.UnitExists)
+		if status.InstallRootExists || status.UnitExists {
+			return fmt.Errorf("docker managed deployment removal verification failed: status=%s, installRootExists=%v, unitExists=%v", status.Status, status.InstallRootExists, status.UnitExists)
 		}
 		return nil
 	}); err != nil {
@@ -380,4 +384,45 @@ func finishTarget(recorder stepRecorder, target, status, errText string) {
 		return
 	}
 	recorder.FinishTarget(target, status, errText)
+}
+
+func dockerInstallOptions(parameters map[string]any) dockerinstaller.InstallOptions {
+	return dockerinstaller.NormalizeInstallOptions(dockerinstaller.InstallOptions{
+		BridgeCIDR:    stringParam(parameters, "dockerBridgeCIDR"),
+		RemoteAPIPort: intParam(parameters, "remoteAPIPort"),
+	})
+}
+
+func stringParam(parameters map[string]any, key string) string {
+	if parameters == nil {
+		return ""
+	}
+	value, ok := parameters[key]
+	if !ok || value == nil {
+		return ""
+	}
+	return strings.TrimSpace(fmt.Sprint(value))
+}
+
+func intParam(parameters map[string]any, key string) int {
+	if parameters == nil {
+		return 0
+	}
+	switch value := parameters[key].(type) {
+	case int:
+		return value
+	case int64:
+		return int(value)
+	case float64:
+		return int(value)
+	case json.Number:
+		parsed, _ := value.Int64()
+		return int(parsed)
+	case string:
+		var parsed int
+		_, _ = fmt.Sscanf(strings.TrimSpace(value), "%d", &parsed)
+		return parsed
+	default:
+		return 0
+	}
 }

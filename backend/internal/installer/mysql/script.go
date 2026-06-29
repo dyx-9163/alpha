@@ -4,6 +4,8 @@ import (
 	"bytes"
 	_ "embed"
 	"text/template"
+
+	"aifar-deployment/backend/internal/installer/installerkit"
 )
 
 //go:embed templates/standalone/install.sh
@@ -16,7 +18,7 @@ var standaloneUninstallScriptTemplate string
 var innodbClusterBootstrapScriptTemplate string
 
 var mysqlScriptFuncs = template.FuncMap{
-	"shq": shellQuote,
+	"shq": installerkit.ShellQuote,
 }
 
 var mysqlStandaloneInstallTemplate = template.Must(template.New("mysql-standalone-install").

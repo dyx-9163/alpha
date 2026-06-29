@@ -11,6 +11,8 @@ import (
 	"strings"
 	"time"
 
+	"aifar-deployment/backend/internal/logmask"
+
 	"golang.org/x/crypto/bcrypt"
 	_ "modernc.org/sqlite"
 )
@@ -57,7 +59,7 @@ func (s *Store) migrate() error {
 			id text primary key, name text not null, host text not null, port integer not null,
 			username text not null, auth_type text not null, password text, private_key text,
 			tags text, note text, deploy_dir text, docker_host text, status text, last_error text,
-			created_at datetime not null, updated_at datetime not null
+			sort_order integer not null default 0, created_at datetime not null, updated_at datetime not null
 		)`,
 		`create table if not exists tasks (
 			id text primary key, type text not null, target text, status text not null,
@@ -112,6 +114,9 @@ func (s *Store) migrate() error {
 		return err
 	}
 	if err := s.ensureColumn("task_logs", "target", `alter table task_logs add column target text not null default ''`); err != nil {
+		return err
+	}
+	if err := s.ensureColumn("servers", "sort_order", `alter table servers add column sort_order integer not null default 0`); err != nil {
 		return err
 	}
 	return nil
@@ -213,7 +218,7 @@ func (s *Store) UserByUsername(username string) (User, error) {
 }
 
 func (s *Store) ListServers() ([]Server, error) {
-	rows, err := s.db.Query(`select id,name,host,port,username,auth_type,tags,note,deploy_dir,docker_host,status,last_error,created_at,updated_at from servers order by created_at desc`)
+	rows, err := s.db.Query(`select id,name,host,port,username,auth_type,tags,note,deploy_dir,docker_host,status,last_error,coalesce(sort_order,0),created_at,updated_at from servers order by case when sort_order > 0 then 0 else 1 end, sort_order asc, created_at desc`)
 	if err != nil {
 		return nil, err
 	}
@@ -221,7 +226,7 @@ func (s *Store) ListServers() ([]Server, error) {
 	out := []Server{}
 	for rows.Next() {
 		var v Server
-		if err := rows.Scan(&v.ID, &v.Name, &v.Host, &v.Port, &v.Username, &v.AuthType, &v.Tags, &v.Note, &v.DeployDir, &v.DockerHost, &v.Status, &v.LastError, &v.CreatedAt, &v.UpdatedAt); err != nil {
+		if err := rows.Scan(&v.ID, &v.Name, &v.Host, &v.Port, &v.Username, &v.AuthType, &v.Tags, &v.Note, &v.DeployDir, &v.DockerHost, &v.Status, &v.LastError, &v.SortOrder, &v.CreatedAt, &v.UpdatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, v)
@@ -231,8 +236,8 @@ func (s *Store) ListServers() ([]Server, error) {
 
 func (s *Store) GetServer(id string, includeSecret bool) (Server, error) {
 	var v Server
-	err := s.db.QueryRow(`select id,name,host,port,username,auth_type,password,private_key,tags,note,deploy_dir,docker_host,status,last_error,created_at,updated_at from servers where id=?`, id).
-		Scan(&v.ID, &v.Name, &v.Host, &v.Port, &v.Username, &v.AuthType, &v.Password, &v.PrivateKey, &v.Tags, &v.Note, &v.DeployDir, &v.DockerHost, &v.Status, &v.LastError, &v.CreatedAt, &v.UpdatedAt)
+	err := s.db.QueryRow(`select id,name,host,port,username,auth_type,password,private_key,tags,note,deploy_dir,docker_host,status,last_error,coalesce(sort_order,0),created_at,updated_at from servers where id=?`, id).
+		Scan(&v.ID, &v.Name, &v.Host, &v.Port, &v.Username, &v.AuthType, &v.Password, &v.PrivateKey, &v.Tags, &v.Note, &v.DeployDir, &v.DockerHost, &v.Status, &v.LastError, &v.SortOrder, &v.CreatedAt, &v.UpdatedAt)
 	if err != nil {
 		return v, err
 	}
@@ -251,6 +256,7 @@ func (s *Store) GetServer(id string, includeSecret bool) (Server, error) {
 
 func (s *Store) SaveServer(v Server) (Server, error) {
 	now := time.Now()
+	isNew := strings.TrimSpace(v.ID) == ""
 	if v.ID == "" {
 		v.ID = NewID("srv")
 		v.CreatedAt = now
@@ -267,6 +273,31 @@ func (s *Store) SaveServer(v Server) (Server, error) {
 	if v.Status == "" {
 		v.Status = "unknown"
 	}
+	if v.SortOrder <= 0 {
+		if isNew {
+			sortOrder, err := s.nextServerSortOrder()
+			if err != nil {
+				return Server{}, err
+			}
+			v.SortOrder = sortOrder
+		} else {
+			var currentOrder int
+			err := s.db.QueryRow(`select coalesce(sort_order,0) from servers where id=?`, v.ID).Scan(&currentOrder)
+			if err != nil && !errors.Is(err, sql.ErrNoRows) {
+				return Server{}, err
+			}
+			if err == nil {
+				v.SortOrder = currentOrder
+			} else {
+				sortOrder, nextErr := s.nextServerSortOrder()
+				if nextErr != nil {
+					return Server{}, nextErr
+				}
+				v.SortOrder = sortOrder
+			}
+		}
+	}
+	v.LastError = logmask.Mask(v.LastError)
 	v.UpdatedAt = now
 	stored := v
 	var err error
@@ -276,13 +307,76 @@ func (s *Store) SaveServer(v Server) (Server, error) {
 	if stored.PrivateKey, err = s.encryptSecret(stored.PrivateKey); err != nil {
 		return Server{}, err
 	}
-	_, err = s.db.Exec(`insert into servers(id,name,host,port,username,auth_type,password,private_key,tags,note,deploy_dir,docker_host,status,last_error,created_at,updated_at)
-		values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+	_, err = s.db.Exec(`insert into servers(id,name,host,port,username,auth_type,password,private_key,tags,note,deploy_dir,docker_host,status,last_error,sort_order,created_at,updated_at)
+		values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		on conflict(id) do update set name=excluded.name,host=excluded.host,port=excluded.port,username=excluded.username,auth_type=excluded.auth_type,
 		password=coalesce(nullif(excluded.password,''),servers.password),private_key=coalesce(nullif(excluded.private_key,''),servers.private_key),
-		tags=excluded.tags,note=excluded.note,deploy_dir=excluded.deploy_dir,docker_host=excluded.docker_host,status=excluded.status,last_error=excluded.last_error,updated_at=excluded.updated_at`,
-		stored.ID, stored.Name, stored.Host, stored.Port, stored.Username, stored.AuthType, stored.Password, stored.PrivateKey, stored.Tags, stored.Note, stored.DeployDir, stored.DockerHost, stored.Status, stored.LastError, stored.CreatedAt, stored.UpdatedAt)
+		tags=excluded.tags,note=excluded.note,deploy_dir=excluded.deploy_dir,docker_host=excluded.docker_host,status=excluded.status,last_error=excluded.last_error,
+		sort_order=case when excluded.sort_order > 0 then excluded.sort_order else servers.sort_order end,updated_at=excluded.updated_at`,
+		stored.ID, stored.Name, stored.Host, stored.Port, stored.Username, stored.AuthType, stored.Password, stored.PrivateKey, stored.Tags, stored.Note, stored.DeployDir, stored.DockerHost, stored.Status, stored.LastError, stored.SortOrder, stored.CreatedAt, stored.UpdatedAt)
 	return v, err
+}
+
+func (s *Store) nextServerSortOrder() (int, error) {
+	var sortOrder int
+	err := s.db.QueryRow(`select coalesce(max(sort_order),0) + 1 from servers`).Scan(&sortOrder)
+	return sortOrder, err
+}
+
+func (s *Store) ReorderServers(ids []string) error {
+	ids = uniqueStrings(ids)
+	if len(ids) == 0 {
+		return nil
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	rows, err := tx.Query(`select id from servers order by case when sort_order > 0 then 0 else 1 end, sort_order asc, created_at desc`)
+	if err != nil {
+		return err
+	}
+	var existing []string
+	exists := map[string]bool{}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return err
+		}
+		existing = append(existing, id)
+		exists[id] = true
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+
+	ordered := make([]string, 0, len(existing))
+	seen := map[string]bool{}
+	for _, id := range ids {
+		if !exists[id] {
+			return sql.ErrNoRows
+		}
+		ordered = append(ordered, id)
+		seen[id] = true
+	}
+	for _, id := range existing {
+		if !seen[id] {
+			ordered = append(ordered, id)
+		}
+	}
+
+	now := time.Now()
+	for idx, id := range ordered {
+		if _, err := tx.Exec(`update servers set sort_order=?, updated_at=? where id=?`, idx+1, now, id); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 func (s *Store) DeleteServer(id string) error {
@@ -307,6 +401,8 @@ func (s *Store) CreateTask(t Task) (Task, error) {
 	if t.CreatedAt.IsZero() {
 		t.CreatedAt = time.Now()
 	}
+	t.Target = logmask.Mask(t.Target)
+	t.Error = logmask.Mask(t.Error)
 	_, err := s.db.Exec(`insert into tasks(id,type,target,status,created_by,error,created_at,started_at,finished_at) values(?,?,?,?,?,?,?,?,?)`,
 		t.ID, t.Type, t.Target, t.Status, t.CreatedBy, t.Error, t.CreatedAt, nullableTime(t.StartedAt), nullableTime(t.FinishedAt))
 	return t, err
@@ -314,6 +410,7 @@ func (s *Store) CreateTask(t Task) (Task, error) {
 
 func (s *Store) UpdateTaskStatus(id, status, errText string) error {
 	now := time.Now()
+	errText = logmask.Mask(errText)
 	switch status {
 	case "running":
 		_, err := s.db.Exec(`update tasks set status=?, started_at=? where id=?`, status, now, id)
@@ -333,6 +430,8 @@ func (s *Store) AddTaskLog(taskID, level, message string) (TaskLog, error) {
 
 func (s *Store) AddTaskTargetLog(taskID, target, level, message string) (TaskLog, error) {
 	now := time.Now()
+	target = logmask.Mask(target)
+	message = logmask.Mask(message)
 	res, err := s.db.Exec(`insert into task_logs(task_id,target,level,message,created_at) values(?,?,?,?,?)`, taskID, target, level, message, now)
 	if err != nil {
 		return TaskLog{}, err
@@ -345,6 +444,8 @@ func (s *Store) UpsertTaskTarget(taskID, target, status, errText string) error {
 	if status == "" {
 		status = "pending"
 	}
+	target = logmask.Mask(target)
+	errText = logmask.Mask(errText)
 	now := time.Now()
 	var startedAt, finishedAt any
 	switch status {
@@ -364,6 +465,8 @@ func (s *Store) UpsertTaskStep(taskID, target, name, title string, order int, st
 	if status == "" {
 		status = "pending"
 	}
+	target = logmask.Mask(target)
+	errText = logmask.Mask(errText)
 	now := time.Now()
 	var startedAt, finishedAt any
 	switch status {
@@ -524,68 +627,8 @@ func (s *Store) ClearTaskLogs(taskID string) error {
 	return err
 }
 
-func (s *Store) DeleteTaskLog(id int64) error {
-	res, err := s.db.Exec(`delete from task_logs where id=?`, id)
-	if err != nil {
-		return err
-	}
-	if rows, _ := res.RowsAffected(); rows == 0 {
-		return sql.ErrNoRows
-	}
-	return nil
-}
-
-func (s *Store) AddAudit(actor, action, target, status, message string) error {
-	_, err := s.db.Exec(`insert into audit_logs(actor,action,target,status,message,created_at) values(?,?,?,?,?,?)`,
-		actor, action, target, status, message, time.Now())
-	return err
-}
-
-func (s *Store) ListAudit() ([]Audit, error) {
-	page, err := s.ListAuditPage(AuditQuery{Page: 1, PageSize: 300})
-	if err != nil {
-		return nil, err
-	}
-	return page.Items, nil
-}
-
-func (s *Store) ListAuditPage(query AuditQuery) (AuditPage, error) {
-	if query.Page < 1 {
-		query.Page = 1
-	}
-	if query.PageSize < 1 {
-		query.PageSize = 20
-	}
-	if query.PageSize > 200 {
-		query.PageSize = 200
-	}
-	where, args := auditWhere(query)
-	var total int
-	if err := s.db.QueryRow(`select count(*) from audit_logs`+where, args...).Scan(&total); err != nil {
-		return AuditPage{}, err
-	}
-	args = append(args, query.PageSize, (query.Page-1)*query.PageSize)
-	rows, err := s.db.Query(`select id,actor,action,target,status,message,created_at from audit_logs`+where+` order by created_at desc limit ? offset ?`, args...)
-	if err != nil {
-		return AuditPage{}, err
-	}
-	defer rows.Close()
-	out := []Audit{}
-	for rows.Next() {
-		var a Audit
-		if err := rows.Scan(&a.ID, &a.Actor, &a.Action, &a.Target, &a.Status, &a.Message, &a.CreatedAt); err != nil {
-			return AuditPage{}, err
-		}
-		out = append(out, a)
-	}
-	if err := rows.Err(); err != nil {
-		return AuditPage{}, err
-	}
-	return AuditPage{Items: out, Total: total, Page: query.Page, PageSize: query.PageSize}, nil
-}
-
-func (s *Store) DeleteAuditLogs(ids []int64) (int, error) {
-	ids = uniqueInt64s(ids)
+func (s *Store) ClearTaskLogsForTasks(ids []string) (int, error) {
+	ids = uniqueStrings(ids)
 	if len(ids) == 0 {
 		return 0, nil
 	}
@@ -596,7 +639,7 @@ func (s *Store) DeleteAuditLogs(ids []int64) (int, error) {
 	defer tx.Rollback()
 	deleted := 0
 	for _, id := range ids {
-		res, err := tx.Exec(`delete from audit_logs where id=?`, id)
+		res, err := tx.Exec(`delete from task_logs where task_id=?`, id)
 		if err != nil {
 			return 0, err
 		}
@@ -608,6 +651,17 @@ func (s *Store) DeleteAuditLogs(ids []int64) (int, error) {
 		return 0, err
 	}
 	return deleted, nil
+}
+
+func (s *Store) DeleteTaskLog(id int64) error {
+	res, err := s.db.Exec(`delete from task_logs where id=?`, id)
+	if err != nil {
+		return err
+	}
+	if rows, _ := res.RowsAffected(); rows == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
 }
 
 func (s *Store) UpsertResource(r Resource) error {
@@ -669,138 +723,6 @@ func (s *Store) ListResources() ([]Resource, error) {
 		out = append(out, r)
 	}
 	return out, rows.Err()
-}
-
-func (s *Store) SaveAppInstance(v AppInstance) (AppInstance, error) {
-	now := time.Now()
-	if v.ID == "" {
-		v.ID = NewID("app")
-		v.CreatedAt = now
-	}
-	v.UpdatedAt = now
-	_, err := s.db.Exec(`insert into app_instances(id,app,version,server_id,status,topology,metadata,created_at,updated_at) values(?,?,?,?,?,?,?,?,?)
-		on conflict(id) do update set version=excluded.version,server_id=excluded.server_id,status=excluded.status,topology=excluded.topology,metadata=excluded.metadata,updated_at=excluded.updated_at`,
-		v.ID, v.App, v.Version, v.ServerID, v.Status, v.Topology, v.Metadata, v.CreatedAt, v.UpdatedAt)
-	return v, err
-}
-
-func (s *Store) ListAppInstances() ([]AppInstance, error) {
-	rows, err := s.db.Query(`select id,app,version,server_id,status,topology,metadata,created_at,updated_at from app_instances order by created_at desc`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	out := []AppInstance{}
-	for rows.Next() {
-		var v AppInstance
-		if err := rows.Scan(&v.ID, &v.App, &v.Version, &v.ServerID, &v.Status, &v.Topology, &v.Metadata, &v.CreatedAt, &v.UpdatedAt); err != nil {
-			return nil, err
-		}
-		out = append(out, v)
-	}
-	return out, rows.Err()
-}
-
-func (s *Store) GetAppInstance(id string) (AppInstance, error) {
-	var v AppInstance
-	err := s.db.QueryRow(`select id,app,version,server_id,status,topology,metadata,created_at,updated_at from app_instances where id=?`, id).
-		Scan(&v.ID, &v.App, &v.Version, &v.ServerID, &v.Status, &v.Topology, &v.Metadata, &v.CreatedAt, &v.UpdatedAt)
-	return v, err
-}
-
-func (s *Store) DeleteAppInstance(id string) error {
-	res, err := s.db.Exec(`delete from app_instances where id=?`, id)
-	if err != nil {
-		return err
-	}
-	if rows, _ := res.RowsAffected(); rows == 0 {
-		return sql.ErrNoRows
-	}
-	return nil
-}
-
-func (s *Store) ListStorageItems(instanceID, kind string) ([]StorageItem, error) {
-	rows, err := s.db.Query(`select id,instance_id,kind,name,coalesce(policy,''),coalesce(access_key,''),coalesce(secret_key,''),coalesce(metadata,''),created_at,updated_at
-		from storage_items where instance_id=? and kind=? order by created_at desc`, instanceID, kind)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	out := []StorageItem{}
-	for rows.Next() {
-		var item StorageItem
-		if err := rows.Scan(&item.ID, &item.InstanceID, &item.Kind, &item.Name, &item.Policy, &item.AccessKey, &item.SecretKey, &item.Metadata, &item.CreatedAt, &item.UpdatedAt); err != nil {
-			return nil, err
-		}
-		item.SecretKey = ""
-		out = append(out, item)
-	}
-	return out, rows.Err()
-}
-
-func (s *Store) SaveStorageItem(item StorageItem) (StorageItem, error) {
-	now := time.Now()
-	if item.ID == "" {
-		item.ID = NewID("obj")
-		item.CreatedAt = now
-	}
-	item.UpdatedAt = now
-	stored := item
-	var err error
-	if stored.SecretKey, err = s.encryptSecret(stored.SecretKey); err != nil {
-		return StorageItem{}, err
-	}
-	_, err = s.db.Exec(`insert into storage_items(id,instance_id,kind,name,policy,access_key,secret_key,metadata,created_at,updated_at)
-		values(?,?,?,?,?,?,?,?,?,?)
-		on conflict(instance_id,kind,name) do update set
-		policy=excluded.policy,access_key=excluded.access_key,
-		secret_key=coalesce(nullif(excluded.secret_key,''),storage_items.secret_key),
-		metadata=excluded.metadata,updated_at=excluded.updated_at`,
-		stored.ID, stored.InstanceID, stored.Kind, stored.Name, stored.Policy, stored.AccessKey, stored.SecretKey, stored.Metadata, stored.CreatedAt, stored.UpdatedAt)
-	item.SecretKey = ""
-	return item, err
-}
-
-func (s *Store) DeleteStorageItem(instanceID, kind, id string) error {
-	res, err := s.db.Exec(`delete from storage_items where instance_id=? and kind=? and id=?`, instanceID, kind, id)
-	if err != nil {
-		return err
-	}
-	if rows, _ := res.RowsAffected(); rows == 0 {
-		return sql.ErrNoRows
-	}
-	return nil
-}
-
-func (s *Store) GetSetting(key, fallback string) string {
-	var value string
-	if err := s.db.QueryRow(`select value from settings where key=?`, key).Scan(&value); err != nil {
-		return fallback
-	}
-	return value
-}
-
-func (s *Store) SetSetting(key, value string) error {
-	_, err := s.db.Exec(`insert into settings(key,value,updated_at) values(?,?,?)
-		on conflict(key) do update set value=excluded.value, updated_at=excluded.updated_at`, key, value, time.Now())
-	return err
-}
-
-func auditWhere(query AuditQuery) (string, []any) {
-	where := []string{}
-	args := []any{}
-	if query.Module != "" {
-		where = append(where, `action like ?`)
-		args = append(args, query.Module+".%")
-	}
-	if query.Status != "" {
-		where = append(where, `status = ?`)
-		args = append(args, query.Status)
-	}
-	if len(where) == 0 {
-		return "", args
-	}
-	return " where " + strings.Join(where, " and "), args
 }
 
 func uniqueStrings(values []string) []string {

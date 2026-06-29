@@ -14,6 +14,7 @@ export interface ServerRecord {
   deployDir?: string
   status?: ServerStatus
   lastError?: string
+  sortOrder?: number
   createdAt?: string
   updatedAt?: string
   password?: string
@@ -33,6 +34,7 @@ export interface ServerFormModel {
   note?: string
   deployDir: string
   status?: ServerStatus
+  sortOrder?: number
 }
 
 export interface ProbeTaskResponse {

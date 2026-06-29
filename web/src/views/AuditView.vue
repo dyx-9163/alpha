@@ -7,9 +7,20 @@
       </div>
       <div class="head-actions">
         <el-button @click="load">{{ t('common.refresh') }}</el-button>
-        <el-button type="danger" plain :disabled="!selectedRows.length" @click="deleteSelected">
-          {{ t('audit.deleteSelected', { count: selectedRows.length }) }}
-        </el-button>
+        <ConfirmAction
+          :message="t('audit.confirmDeleteSelected', { count: selectedRows.length })"
+          :title="t('common.delete')"
+          :confirm-text="t('common.delete')"
+          :cancel-text="t('common.cancel')"
+          :disabled="!selectedRows.length"
+          @confirm="deleteSelected"
+        >
+          <template #default="{ confirm }">
+            <el-button type="danger" plain :disabled="!selectedRows.length" @click="confirm">
+              {{ t('audit.deleteSelected', { count: selectedRows.length }) }}
+            </el-button>
+          </template>
+        </ConfirmAction>
       </div>
     </div>
 
@@ -68,8 +79,9 @@
 
 <script setup lang="ts">
 import { onMounted, ref } from 'vue'
-import { ElMessage, ElMessageBox } from 'element-plus'
+import { ElMessage } from 'element-plus'
 import { apiDelete, apiGet, asArray } from '../api/client'
+import ConfirmAction from '../components/ConfirmAction.vue'
 import StatusTag from '../components/StatusTag.vue'
 import { useI18n } from '../i18n'
 
@@ -129,11 +141,6 @@ async function resetAndLoad() {
 async function deleteSelected() {
   const ids = selectedRows.value.map((item) => item.id).filter(Boolean)
   if (!ids.length) {
-    return
-  }
-  try {
-    await ElMessageBox.confirm(t('audit.confirmDeleteSelected', { count: ids.length }), t('common.delete'), { type: 'warning' })
-  } catch {
     return
   }
   try {

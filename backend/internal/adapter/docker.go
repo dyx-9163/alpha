@@ -67,15 +67,24 @@ type DockerDiskUsage struct {
 }
 
 func DockerPing(ctx context.Context, host string) error {
+	if dockerAPIHost(host) {
+		return dockerAPIPing(ctx, host)
+	}
 	return dockerCommand(ctx, host, "version", "--format", "{{json .Server}}").Run()
 }
 
 func DockerPingForServer(ctx context.Context, server store.Server) error {
+	if dockerAPIHost(server.DockerHost) {
+		return DockerPing(ctx, server.DockerHost)
+	}
 	_, err := dockerSSHOutput(ctx, server, "version", "--format", "{{json .Server}}")
 	return err
 }
 
 func DockerSummaryForHost(ctx context.Context, host string) (DockerSummary, error) {
+	if dockerAPIHost(host) {
+		return dockerAPISummary(ctx, host)
+	}
 	out, err := dockerCommand(ctx, host, "info", "--format", "{{json .}}").Output()
 	if err != nil {
 		return DockerSummary{}, err
@@ -88,6 +97,9 @@ func DockerSummaryForHost(ctx context.Context, host string) (DockerSummary, erro
 }
 
 func DockerSummaryForServer(ctx context.Context, server store.Server) (DockerSummary, error) {
+	if dockerAPIHost(server.DockerHost) {
+		return DockerSummaryForHost(ctx, server.DockerHost)
+	}
 	out, err := dockerSSHOutput(ctx, server, "info", "--format", "{{json .}}")
 	if err != nil {
 		return DockerSummary{}, err
@@ -125,6 +137,9 @@ func dockerSummaryFromOutput(ctx context.Context, out []byte, endpoint string, n
 }
 
 func DockerContainers(ctx context.Context, host string) ([]DockerContainer, error) {
+	if dockerAPIHost(host) {
+		return dockerAPIContainers(ctx, host)
+	}
 	out, err := dockerCommand(ctx, host, "ps", "-a", "--format", "{{json .}}").Output()
 	if err != nil {
 		return nil, err
@@ -133,6 +148,9 @@ func DockerContainers(ctx context.Context, host string) ([]DockerContainer, erro
 }
 
 func DockerContainersForServer(ctx context.Context, server store.Server) ([]DockerContainer, error) {
+	if dockerAPIHost(server.DockerHost) {
+		return DockerContainers(ctx, server.DockerHost)
+	}
 	out, err := dockerSSHOutput(ctx, server, "ps", "-a", "--format", "{{json .}}")
 	if err != nil {
 		return nil, err
@@ -165,6 +183,9 @@ func parseDockerContainers(out []byte) ([]DockerContainer, error) {
 }
 
 func DockerImages(ctx context.Context, host string) ([]DockerImage, error) {
+	if dockerAPIHost(host) {
+		return dockerAPIImages(ctx, host)
+	}
 	out, err := dockerCommand(ctx, host, "images", "--digests", "--format", "{{json .}}").Output()
 	if err != nil {
 		return nil, err
@@ -173,6 +194,9 @@ func DockerImages(ctx context.Context, host string) ([]DockerImage, error) {
 }
 
 func DockerImagesForServer(ctx context.Context, server store.Server) ([]DockerImage, error) {
+	if dockerAPIHost(server.DockerHost) {
+		return DockerImages(ctx, server.DockerHost)
+	}
 	out, err := dockerSSHOutput(ctx, server, "images", "--digests", "--format", "{{json .}}")
 	if err != nil {
 		return nil, err
@@ -202,6 +226,9 @@ func parseDockerImages(out []byte) ([]DockerImage, error) {
 }
 
 func DockerNetworks(ctx context.Context, host string) ([]DockerNetwork, error) {
+	if dockerAPIHost(host) {
+		return dockerAPINetworks(ctx, host)
+	}
 	out, err := dockerCommand(ctx, host, "network", "ls", "--format", "{{json .}}").Output()
 	if err != nil {
 		return nil, err
@@ -210,6 +237,9 @@ func DockerNetworks(ctx context.Context, host string) ([]DockerNetwork, error) {
 }
 
 func DockerNetworksForServer(ctx context.Context, server store.Server) ([]DockerNetwork, error) {
+	if dockerAPIHost(server.DockerHost) {
+		return DockerNetworks(ctx, server.DockerHost)
+	}
 	out, err := dockerSSHOutput(ctx, server, "network", "ls", "--format", "{{json .}}")
 	if err != nil {
 		return nil, err
@@ -235,6 +265,9 @@ func parseDockerNetworks(out []byte) ([]DockerNetwork, error) {
 }
 
 func DockerVolumes(ctx context.Context, host string) ([]DockerVolume, error) {
+	if dockerAPIHost(host) {
+		return dockerAPIVolumes(ctx, host)
+	}
 	out, err := dockerCommand(ctx, host, "volume", "ls", "--format", "{{json .}}").Output()
 	if err != nil {
 		return nil, err
@@ -243,6 +276,9 @@ func DockerVolumes(ctx context.Context, host string) ([]DockerVolume, error) {
 }
 
 func DockerVolumesForServer(ctx context.Context, server store.Server) ([]DockerVolume, error) {
+	if dockerAPIHost(server.DockerHost) {
+		return DockerVolumes(ctx, server.DockerHost)
+	}
 	out, err := dockerSSHOutput(ctx, server, "volume", "ls", "--format", "{{json .}}")
 	if err != nil {
 		return nil, err
@@ -269,6 +305,9 @@ func parseDockerVolumes(out []byte) ([]DockerVolume, error) {
 }
 
 func DockerSystemDF(ctx context.Context, host string) ([]DockerDiskUsage, error) {
+	if dockerAPIHost(host) {
+		return dockerAPISystemDF(ctx, host)
+	}
 	out, err := dockerCommand(ctx, host, "system", "df", "--format", "{{json .}}").Output()
 	if err != nil {
 		return nil, err
@@ -277,6 +316,9 @@ func DockerSystemDF(ctx context.Context, host string) ([]DockerDiskUsage, error)
 }
 
 func DockerSystemDFForServer(ctx context.Context, server store.Server) ([]DockerDiskUsage, error) {
+	if dockerAPIHost(server.DockerHost) {
+		return DockerSystemDF(ctx, server.DockerHost)
+	}
 	out, err := dockerSSHOutput(ctx, server, "system", "df", "--format", "{{json .}}")
 	if err != nil {
 		return nil, err
@@ -308,6 +350,9 @@ func DockerContainerLogs(ctx context.Context, host, id string, tail int) ([]stri
 	if tail <= 0 {
 		tail = 200
 	}
+	if dockerAPIHost(host) {
+		return dockerAPIContainerLogs(ctx, host, id, tail)
+	}
 	out, err := dockerCommand(ctx, host, "logs", "--tail", strconv.Itoa(tail), id).CombinedOutput()
 	lines := splitLines(string(out))
 	if err != nil {
@@ -319,6 +364,9 @@ func DockerContainerLogs(ctx context.Context, host, id string, tail int) ([]stri
 func DockerContainerLogsForServer(ctx context.Context, server store.Server, id string, tail int) ([]string, error) {
 	if tail <= 0 {
 		tail = 200
+	}
+	if dockerAPIHost(server.DockerHost) {
+		return DockerContainerLogs(ctx, server.DockerHost, id, tail)
 	}
 	out, err := dockerSSHCombinedOutput(ctx, server, "logs", "--tail", strconv.Itoa(tail), id)
 	lines := splitLines(string(out))
@@ -334,6 +382,9 @@ func DockerContainerAction(ctx context.Context, host, id, action string) error {
 	default:
 		return exec.ErrNotFound
 	}
+	if dockerAPIHost(host) {
+		return dockerAPIContainerAction(ctx, host, id, action)
+	}
 	return dockerCommand(ctx, host, action, id).Run()
 }
 
@@ -342,6 +393,9 @@ func DockerContainerActionForServer(ctx context.Context, server store.Server, id
 	case "start", "stop", "restart":
 	default:
 		return exec.ErrNotFound
+	}
+	if dockerAPIHost(server.DockerHost) {
+		return DockerContainerAction(ctx, server.DockerHost, id, action)
 	}
 	_, err := dockerSSHOutput(ctx, server, action, id)
 	return err

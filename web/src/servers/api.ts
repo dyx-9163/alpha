@@ -15,6 +15,10 @@ export function deleteServer(id: string) {
   return apiDelete<{ deleted: string }>(`/servers/${id}`)
 }
 
+export function reorderServers(ids: string[]) {
+  return apiPut<{ ids: string[] }>('/servers/order', { ids })
+}
+
 export function probeServer(id: string) {
   return apiPost<ProbeTaskResponse>(`/servers/${id}/probe`)
 }

@@ -2,6 +2,7 @@ package store
 
 import (
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -72,6 +73,52 @@ func TestServerSecretsAreEncryptedAtRest(t *testing.T) {
 	}
 	if public.Password != "" || public.PrivateKey != "" {
 		t.Fatalf("expected public server payload to hide secrets, got %+v", public)
+	}
+}
+
+func TestServerReorderPersistsSortOrder(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "aifar.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	first, err := db.SaveServer(Server{Name: "node-1", Host: "10.0.0.1", Username: "root"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := db.SaveServer(Server{Name: "node-2", Host: "10.0.0.2", Username: "root"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	third, err := db.SaveServer(Server{Name: "node-3", Host: "10.0.0.3", Username: "root"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.ReorderServers([]string{second.ID, third.ID, first.ID}); err != nil {
+		t.Fatal(err)
+	}
+	servers, err := db.ListServers()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{second.ID, third.ID, first.ID}
+	if len(servers) != len(want) {
+		t.Fatalf("expected %d servers, got %d", len(want), len(servers))
+	}
+	for idx, server := range servers {
+		if server.ID != want[idx] {
+			t.Fatalf("expected server %d to be %s, got %s", idx, want[idx], server.ID)
+		}
+		if server.SortOrder != idx+1 {
+			t.Fatalf("expected sort order %d, got %d", idx+1, server.SortOrder)
+		}
+	}
+	got, err := db.GetServer(second.ID, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.SortOrder != 1 {
+		t.Fatalf("expected persisted sort order 1, got %d", got.SortOrder)
 	}
 }
 
@@ -157,6 +204,61 @@ func TestTaskLifecycle(t *testing.T) {
 	}
 }
 
+func TestClearTaskLogsForTasks(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "aifar.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	first, err := db.CreateTask(Task{Type: "apps.docker.install", Target: "srv-1", CreatedBy: "tester"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := db.CreateTask(Task{Type: "apps.mysql.install", Target: "srv-2", CreatedBy: "tester"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	third, err := db.CreateTask(Task{Type: "servers.probe", Target: "srv-3", CreatedBy: "tester"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.AddTaskLog(first.ID, "info", "first"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.AddTaskLog(second.ID, "info", "second-a"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.AddTaskLog(second.ID, "info", "second-b"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.AddTaskLog(third.ID, "info", "third"); err != nil {
+		t.Fatal(err)
+	}
+	deleted, err := db.ClearTaskLogsForTasks([]string{first.ID, second.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deleted != 3 {
+		t.Fatalf("expected 3 deleted log rows, got %d", deleted)
+	}
+	for _, id := range []string{first.ID, second.ID} {
+		_, logs, err := db.GetTask(id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(logs) != 0 {
+			t.Fatalf("expected logs for %s to be cleared, got %d", id, len(logs))
+		}
+	}
+	_, logs, err := db.GetTask(third.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(logs) != 1 {
+		t.Fatalf("expected third task logs to remain, got %d", len(logs))
+	}
+}
+
 func TestTaskTargetsAndSteps(t *testing.T) {
 	db, err := Open(filepath.Join(t.TempDir(), "aifar.db"))
 	if err != nil {
@@ -192,6 +294,73 @@ func TestTaskTargetsAndSteps(t *testing.T) {
 	}
 	if len(steps) != 1 || steps[0].Status != "success" || steps[0].Title != "load target server" {
 		t.Fatalf("unexpected steps: %+v", steps)
+	}
+}
+
+func TestTaskPersistenceMasksSensitiveText(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "aifar.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	task, err := db.CreateTask(Task{Type: "test", Target: "token=target-secret", CreatedBy: "tester", Error: "password=create-secret"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.AddTaskLog(task.ID, "error", "failed with password=log-secret"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.UpdateTaskStatus(task.ID, "failed", "token=status-secret"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.UpsertTaskTarget(task.ID, "password=target-secret", "failed", "secret=target-error"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.UpsertTaskStep(task.ID, "password=step-target", "install", "install", 1, "failed", "authorization=step-error"); err != nil {
+		t.Fatal(err)
+	}
+
+	got, logs, err := db.GetTask(task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	targets, err := db.ListTaskTargets(task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	steps, err := db.ListTaskSteps(task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	combined := got.Target + got.Error + logs[0].Message + targets[0].Target + targets[0].Error + steps[0].Target + steps[0].Error
+	for _, leaked := range []string{"target-secret", "create-secret", "log-secret", "status-secret", "target-error", "step-target", "step-error"} {
+		if strings.Contains(combined, leaked) {
+			t.Fatalf("expected %q to be masked from persisted task fields: %q", leaked, combined)
+		}
+	}
+}
+
+func TestAuditMasksSensitiveText(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "aifar.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.AddAudit("admin", "servers.save", "password=target-secret", "success", `{"token":"message-secret"}`); err != nil {
+		t.Fatal(err)
+	}
+	items, err := db.ListAudit()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("expected one audit row, got %d", len(items))
+	}
+	combined := items[0].Target + items[0].Message
+	for _, leaked := range []string{"target-secret", "message-secret"} {
+		if strings.Contains(combined, leaked) {
+			t.Fatalf("expected %q to be masked from persisted audit fields: %q", leaked, combined)
+		}
 	}
 }
 

@@ -131,7 +131,7 @@ func TestInstallerKeepsDockerDaemonConfigUnderInstallRoot(t *testing.T) {
 	if !strings.Contains(remote.installScript, `"data-root": "$DATA_ROOT"`) {
 		t.Fatalf("daemon data-root should be under install root:\n%s", remote.installScript)
 	}
-	if !strings.Contains(remote.installScript, `ExecStart=/usr/local/bin/dockerd --config-file=$DAEMON_CONFIG --containerd=/run/containerd/containerd.sock`) {
+	if !strings.Contains(remote.installScript, `--config-file=$DAEMON_CONFIG --containerd=/run/containerd/containerd.sock`) {
 		t.Fatalf("docker.service should use the custom daemon config:\n%s", remote.installScript)
 	}
 	if strings.Contains(remote.installScript, "/etc/docker/daemon.json") {
@@ -159,6 +159,48 @@ func TestDockerScriptsRenderEmbeddedTemplates(t *testing.T) {
 	}
 	if !strings.Contains(uninstall, "INSTALL_ROOT='/aifar/apps/docker/24.0.9'") {
 		t.Fatalf("uninstall script did not render install root:\n%s", uninstall)
+	}
+}
+
+func TestInstallScriptInstallsRPMsBeforeCheckingTar(t *testing.T) {
+	install, err := installScript("24.0.9", "/aifar/apps/_work/docker", "/tmp/docker.tar", "/aifar/apps/docker/24.0.9")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rpmIndex := strings.Index(install, "installing local RPM dependencies when available")
+	checkIndex := strings.Index(install, "checking required commands")
+	if rpmIndex < 0 || checkIndex < 0 {
+		t.Fatalf("install script missing RPM install or command check block:\n%s", install)
+	}
+	if rpmIndex > checkIndex {
+		t.Fatalf("RPM dependencies must be installed before checking tar/gzip:\n%s", install)
+	}
+	if !strings.Contains(install, "tar is required after local RPM dependency installation") {
+		t.Fatalf("tar check should run after local RPM installation:\n%s", install)
+	}
+	if !strings.Contains(install, "gzip is required after local RPM dependency installation") {
+		t.Fatalf("gzip check should run after local RPM installation:\n%s", install)
+	}
+}
+
+func TestInstallScriptEnablesRemoteAPIAndBridgeCIDR(t *testing.T) {
+	install, err := installScript("24.0.9", "/aifar/apps/_work/docker", "/tmp/docker.tar", "/aifar/apps/docker/24.0.9", InstallOptions{
+		BridgeCIDR:    "172.30.0.1/16",
+		RemoteAPIPort: 2376,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		`BRIDGE_CIDR='172.30.0.1/16'`,
+		`REMOTE_API_PORT=2376`,
+		`"bip": "$BRIDGE_CIDR"`,
+		`-H tcp://0.0.0.0:$REMOTE_API_PORT`,
+		`docker -H "tcp://127.0.0.1:$REMOTE_API_PORT" version`,
+	} {
+		if !strings.Contains(install, want) {
+			t.Fatalf("install script missing %q:\n%s", want, install)
+		}
 	}
 }
 

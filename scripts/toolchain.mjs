@@ -37,6 +37,8 @@ export function withToolEnv(extra = {}) {
   const currentPath = process.env[pathKey] || process.env.PATH || ''
   const prefix = [nodeDir, nodeGlobalDir, path.join(goDir, 'bin'), path.join(gopath, 'bin')].join(path.delimiter)
   const defaultPassword = process.env.AIFAR_DEFAULT_PASSWORD || defaults.AIFAR_DEFAULT_PASSWORD || 'Oversea.123'
+  const devAddr = process.env.AIFAR_DEV_ADDR || defaults.AIFAR_DEV_ADDR || '127.0.0.1:8080'
+  const viteHost = process.env.AIFAR_VITE_HOST || defaults.AIFAR_VITE_HOST || '127.0.0.1'
   return {
     ...process.env,
     [pathKey]: `${prefix}${path.delimiter}${currentPath}`,
@@ -45,7 +47,9 @@ export function withToolEnv(extra = {}) {
     GOPATH: gopath,
     GOCACHE: gocache,
     NPM_CONFIG_PREFIX: nodeGlobalDir,
-    AIFAR_ADDR: process.env.AIFAR_ADDR || '0.0.0.0:8080',
+    AIFAR_ADDR: process.env.AIFAR_ADDR || defaults.AIFAR_ADDR || '0.0.0.0:8080',
+    AIFAR_DEV_ADDR: devAddr,
+    AIFAR_VITE_HOST: viteHost,
     AIFAR_STATIC_DIR: process.env.AIFAR_STATIC_DIR || path.join(webDir, 'dist'),
     AIFAR_RESOURCE_DIR: process.env.AIFAR_RESOURCE_DIR || path.join(rootDir, 'resources'),
     AIFAR_DATABASE_PATH: process.env.AIFAR_DATABASE_PATH || path.join(rootDir, 'data', 'aifar.db'),

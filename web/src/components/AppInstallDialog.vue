@@ -19,26 +19,19 @@
         </el-form-item>
 
         <el-form-item :label="dialogCopy.serversLabel">
-          <el-select
+          <ServerSelector
             v-if="effectiveTargetMode === 'multiple'"
             v-model="selectedServerIds"
+            :servers="safeServers"
             multiple
-            collapse-tags
-            collapse-tags-tooltip
             :placeholder="dialogCopy.serversPlaceholder"
-            style="width: 100%"
-          >
-            <el-option v-for="server in safeServers" :key="server.id" :label="serverLabel(server)" :value="server.id" />
-          </el-select>
-          <el-select
+          />
+          <ServerSelector
             v-else
             v-model="selectedServerId"
-            clearable
+            :servers="safeServers"
             :placeholder="dialogCopy.serversPlaceholder"
-            style="width: 100%"
-          >
-            <el-option v-for="server in safeServers" :key="server.id" :label="serverLabel(server)" :value="server.id" />
-          </el-select>
+          />
         </el-form-item>
 
         <el-form-item v-for="field in installFields" :key="field.name" :label="field.label" :required="field.required">
@@ -55,6 +48,9 @@
             v-else-if="field.type === 'number'"
             v-model="fieldValues[field.name]"
             :placeholder="field.placeholder"
+            :min="field.min"
+            :max="field.max"
+            :step="field.step"
             style="width: 100%"
           />
           <el-input
@@ -64,6 +60,7 @@
             :show-password="field.type === 'password'"
             :placeholder="field.placeholder"
           />
+          <div v-if="fieldValidationMessages[field.name]" class="field-error">{{ fieldValidationMessages[field.name] }}</div>
         </el-form-item>
       </el-form>
 
@@ -85,9 +82,10 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
 import type { AppStoreItem } from '../apps/registry/catalog'
-import type { AppInstallDialogCopy, AppInstallField, AppInstallPayload, ServerOption } from '../apps/registry/contract'
+import type { AppInstallDialogCopy, AppInstallField, AppInstallPayload, AppInstallValidationContext, ServerOption } from '../apps/registry/contract'
 import type { AppTargetMode } from '../apps/registry/model'
 import { useI18n } from '../i18n'
+import ServerSelector from './ServerSelector.vue'
 
 const { t } = useI18n()
 
@@ -144,8 +142,30 @@ const versions = computed(() => {
 })
 const effectiveTargetMode = computed(() => props.targetModeResolver?.(fieldValues.value) ?? props.targetMode)
 const selectedTargetCount = computed(() => effectiveTargetMode.value === 'multiple' ? selectedServerIds.value.length : Number(Boolean(selectedServerId.value)))
+const selectedTargetServers = computed(() => {
+  if (effectiveTargetMode.value === 'multiple') {
+    const selected = new Set(selectedServerIds.value)
+    return safeServers.value.filter((server) => selected.has(server.id))
+  }
+  return safeServers.value.filter((server) => server.id === selectedServerId.value)
+})
+const validationContext = computed<AppInstallValidationContext>(() => ({
+  servers: safeServers.value,
+  selectedServers: selectedTargetServers.value,
+  targetMode: effectiveTargetMode.value
+}))
+const fieldValidationMessages = computed(() => {
+  return installFields.value.reduce<Record<string, string>>((messages, field) => {
+    const message = field.validate?.(fieldValues.value[field.name], fieldValues.value, validationContext.value)
+    if (message) {
+      messages[field.name] = message
+    }
+    return messages
+  }, {})
+})
+const hasFieldValidationErrors = computed(() => Object.keys(fieldValidationMessages.value).length > 0)
 const requiredFieldsReady = computed(() => installFields.value.every((field) => !field.required || isFieldValueFilled(field, fieldValues.value[field.name])))
-const canSubmit = computed(() => Boolean(selectedVersion.value && selectedTargetCount.value && requiredFieldsReady.value && !props.submitting))
+const canSubmit = computed(() => Boolean(selectedVersion.value && selectedTargetCount.value && requiredFieldsReady.value && !hasFieldValidationErrors.value && !props.submitting))
 
 watch(
   () => [props.modelValue, props.app?.name, props.app?.versions.join('|'), props.targetMode, installFields.value.map((field) => field.name).join('|')],
@@ -160,10 +180,6 @@ watch(
   },
   { immediate: true }
 )
-
-function serverLabel(server: ServerOption) {
-  return `${server.name} (${server.host})`
-}
 
 function resetFieldValues() {
   const next: Record<string, string | number | boolean | undefined> = {}
@@ -258,6 +274,14 @@ function submit() {
 
 .install-form {
   padding: 4px 4px 0;
+}
+
+.field-error {
+  width: 100%;
+  margin-top: 4px;
+  color: #d93026;
+  font-size: 12px;
+  line-height: 18px;
 }
 
 .empty-server-hint,

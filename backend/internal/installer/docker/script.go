@@ -4,6 +4,8 @@ import (
 	"bytes"
 	_ "embed"
 	"text/template"
+
+	"aifar-deployment/backend/internal/installer/installerkit"
 )
 
 //go:embed templates/install.sh
@@ -13,7 +15,7 @@ var installScriptTemplate string
 var uninstallScriptTemplate string
 
 var dockerScriptFuncs = template.FuncMap{
-	"shq": shellQuote,
+	"shq": installerkit.ShellQuote,
 }
 
 var dockerInstallTemplate = template.Must(template.New("docker-install").
@@ -25,10 +27,12 @@ var dockerUninstallTemplate = template.Must(template.New("docker-uninstall").
 	Parse(uninstallScriptTemplate))
 
 type installScriptData struct {
-	Version     string
-	WorkDir     string
-	ArchivePath string
-	InstallRoot string
+	Version       string
+	WorkDir       string
+	ArchivePath   string
+	InstallRoot   string
+	BridgeCIDR    string
+	RemoteAPIPort int
 }
 
 type uninstallScriptData struct {
@@ -36,12 +40,19 @@ type uninstallScriptData struct {
 	InstallRoot string
 }
 
-func installScript(version, workDir, archivePath, installRoot string) (string, error) {
+func installScript(version, workDir, archivePath, installRoot string, options ...InstallOptions) (string, error) {
+	normalized := InstallOptions{}
+	if len(options) > 0 {
+		normalized = options[0]
+	}
+	normalized = NormalizeInstallOptions(normalized)
 	return renderDockerScript(dockerInstallTemplate, installScriptData{
-		Version:     version,
-		WorkDir:     workDir,
-		ArchivePath: archivePath,
-		InstallRoot: installRoot,
+		Version:       version,
+		WorkDir:       workDir,
+		ArchivePath:   archivePath,
+		InstallRoot:   installRoot,
+		BridgeCIDR:    normalized.BridgeCIDR,
+		RemoteAPIPort: normalized.RemoteAPIPort,
 	})
 }
 
