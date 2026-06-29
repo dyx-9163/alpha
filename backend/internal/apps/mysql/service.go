@@ -223,6 +223,7 @@ func (s Service) installInnoDBCluster(ctx context.Context, req InstallRequest, r
 	if err := bootstrapStep(4, "bootstrap-cluster", copy.BootstrapCluster, func() error {
 		return installer.BootstrapInnoDBCluster(ctx, bootstrapServer, mysqlinstaller.InnoDBClusterBootstrapRequest{
 			ClusterName:  clusterName,
+			InstallRoot:  remoteInstallRoot(bootstrapServer, "mysql", bundle.Version),
 			RootUser:     options.RootUser,
 			RootPassword: options.RootPassword,
 			Nodes:        nodes,
@@ -413,6 +414,15 @@ func normalizeTopology(topology string) string {
 		return "standalone"
 	}
 	return topology
+}
+
+func remoteInstallRoot(server store.Server, app, version string) string {
+	deployDir := strings.TrimSpace(server.DeployDir)
+	if deployDir == "" {
+		deployDir = "/aifar/apps"
+	}
+	deployDir = "/" + strings.Trim(deployDir, "/")
+	return deployDir + "/" + app + "/" + version
 }
 
 func mysqlInstallSteps(copy Copy) []stepDef {

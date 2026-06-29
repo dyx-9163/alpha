@@ -11,6 +11,7 @@ ROOT_PASSWORD={{shq .RootPassword}}
 MYSQL_USER="aifar-mysql"
 SERVICE_NAME="aifar-mysql-$PORT"
 MYSQL_BASE="$INSTALL_ROOT/mysql"
+MYSQL_SHELL_BASE="$INSTALL_ROOT/mysql-shell"
 CONFIG_DIR="$INSTALL_ROOT/conf"
 DATA_DIR="$INSTALL_ROOT/data"
 LOG_DIR="$INSTALL_ROOT/logs"
@@ -72,6 +73,25 @@ $SUDO systemctl disable --now "$SERVICE_NAME" >/dev/null 2>&1 || true
 $SUDO rm -rf "$MYSQL_BASE"
 $SUDO mkdir -p "$MYSQL_BASE"
 $SUDO cp -a "$MYSQL_SRC"/. "$MYSQL_BASE"/
+
+MYSQL_SHELL_ARCHIVE="$(find "$WORK_DIR/bundle" -maxdepth 1 -type f \( -name 'mysql-shell-*-linux*.tar.xz' -o -name 'mysql-shell-*-linux*.tar.gz' \) | sort | head -n 1)"
+if [ -n "$MYSQL_SHELL_ARCHIVE" ] && [ -f "$MYSQL_SHELL_ARCHIVE" ]; then
+  echo "extracting MySQL Shell archive: $MYSQL_SHELL_ARCHIVE"
+  rm -rf "$WORK_DIR/unpacked-shell"
+  mkdir -p "$WORK_DIR/unpacked-shell"
+  tar -xf "$MYSQL_SHELL_ARCHIVE" -C "$WORK_DIR/unpacked-shell"
+  MYSQL_SHELL_SRC="$(find "$WORK_DIR/unpacked-shell" -maxdepth 1 -type d -name 'mysql-shell-*' | sort | head -n 1)"
+  if [ -n "$MYSQL_SHELL_SRC" ] && [ -x "$MYSQL_SHELL_SRC/bin/mysqlsh" ]; then
+    echo "installing MySQL Shell"
+    $SUDO rm -rf "$MYSQL_SHELL_BASE"
+    $SUDO mkdir -p "$MYSQL_SHELL_BASE"
+    $SUDO cp -a "$MYSQL_SHELL_SRC"/. "$MYSQL_SHELL_BASE"/
+  else
+    echo "warning: mysqlsh not found after extracting MySQL Shell archive"
+  fi
+else
+  echo "warning: MySQL Shell archive not found in bundle; InnoDB Cluster bootstrap requires mysqlsh"
+fi
 
 echo "ensuring MySQL runtime user"
 NOLOGIN="/sbin/nologin"

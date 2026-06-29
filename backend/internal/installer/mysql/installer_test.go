@@ -98,6 +98,9 @@ func TestInstallerUploadsBundleAndRunsMySQLScript(t *testing.T) {
 	if !strings.Contains(remote.installScript, `ExecStart=$MYSQL_BASE/bin/mysqld --defaults-file=$CONFIG_FILE`) {
 		t.Fatalf("installer should write a systemd mysqld service:\n%s", remote.installScript)
 	}
+	if !strings.Contains(remote.installScript, `MYSQL_SHELL_BASE="$INSTALL_ROOT/mysql-shell"`) || !strings.Contains(remote.installScript, `installing MySQL Shell`) {
+		t.Fatalf("installer should extract bundled mysql shell for cluster bootstrap:\n%s", remote.installScript)
+	}
 	if !strings.Contains(remote.installScript, `MYSQL_PWD="$ROOT_PASSWORD" "$MYSQL_BASE/bin/mysqladmin" --protocol=tcp`) {
 		t.Fatalf("installer should verify password login via mysqladmin:\n%s", remote.installScript)
 	}
@@ -121,6 +124,19 @@ func TestMySQLStandaloneScriptsRenderTemplates(t *testing.T) {
 	}
 	if !strings.Contains(install, "VERSION='8.0.36'") || !strings.Contains(install, "PORT=3307") {
 		t.Fatalf("install script did not render core standalone variables:\n%s", install)
+	}
+	bootstrap, err := bootstrapInnoDBClusterScript(InnoDBClusterBootstrapRequest{
+		ClusterName:  "aifarCluster",
+		InstallRoot:  "/aifar/apps/mysql/8.0.36",
+		RootUser:     "root",
+		RootPassword: "Oversea.123",
+		Nodes:        []InnoDBClusterNode{{Host: "10.0.0.1", Port: 3306}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(bootstrap, `MYSQLSH="$INSTALL_ROOT/mysql-shell/bin/mysqlsh"`) || !strings.Contains(bootstrap, `"$MYSQLSH" --js --file "$JS_FILE"`) {
+		t.Fatalf("bootstrap script should use bundled mysql shell:\n%s", bootstrap)
 	}
 	uninstall, err := uninstallStandaloneScript("8.0.36", "/aifar/apps/mysql/8.0.36", 3307)
 	if err != nil {

@@ -132,7 +132,7 @@ func TestServiceInstallsInnoDBClusterAndRecordsEachNode(t *testing.T) {
 		t.Fatalf("expected safe cluster metadata: %+v", s.instances[0])
 	}
 	joinedCommands := strings.Join(remote.commands, "\n")
-	if strings.Count(joinedCommands, "mysqlsh --js --file") != 1 {
+	if strings.Count(joinedCommands, `"$MYSQLSH" --js --file`) != 1 || !strings.Contains(joinedCommands, `MYSQLSH="$INSTALL_ROOT/mysql-shell/bin/mysqlsh"`) {
 		t.Fatalf("expected one innodb cluster bootstrap action: %s", joinedCommands)
 	}
 }

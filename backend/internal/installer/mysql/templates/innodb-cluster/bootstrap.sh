@@ -2,11 +2,19 @@
 set -eu
 
 CLUSTER_NAME={{shq .ClusterName}}
+INSTALL_ROOT={{shq .InstallRoot}}
 ROOT_USER={{shq .RootUser}}
 ROOT_PASSWORD={{shq .RootPassword}}
 
 echo "checking MySQL Shell"
-command -v mysqlsh >/dev/null 2>&1 || { echo "mysqlsh is required to bootstrap MySQL InnoDB Cluster"; exit 1; }
+MYSQLSH="$INSTALL_ROOT/mysql-shell/bin/mysqlsh"
+if [ ! -x "$MYSQLSH" ]; then
+  MYSQLSH="$(command -v mysqlsh || true)"
+fi
+if [ -z "$MYSQLSH" ] || [ ! -x "$MYSQLSH" ]; then
+  echo "mysqlsh is required to bootstrap MySQL InnoDB Cluster; expected $INSTALL_ROOT/mysql-shell/bin/mysqlsh"
+  exit 1
+fi
 
 JS_FILE="$(mktemp /tmp/aifar-mysql-innodb-cluster-XXXXXX.js)"
 cat > "$JS_FILE" <<'JS'
@@ -54,6 +62,6 @@ for (let i = 1; i < nodes.length; i++) {
 cluster.status();
 JS
 
-mysqlsh --js --file "$JS_FILE"
+"$MYSQLSH" --js --file "$JS_FILE"
 rm -f "$JS_FILE"
 echo "MySQL InnoDB Cluster bootstrap completed: $CLUSTER_NAME"

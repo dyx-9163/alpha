@@ -75,6 +75,7 @@ type UninstallScriptRequest struct {
 
 type InnoDBClusterBootstrapRequest struct {
 	ClusterName  string
+	InstallRoot  string
 	RootUser     string
 	RootPassword string
 	Nodes        []InnoDBClusterNode

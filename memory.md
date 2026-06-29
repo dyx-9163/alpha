@@ -83,3 +83,5 @@
 - 结论：任务中心详情改为页面内固定高度、日志框内部滚动；终端输出框铺满并保留内边距；MySQL/Redis/MinIO 安装弹窗默认密码已改为约定默认值；MinIO 安装会按目标服务器检测独立数据磁盘并回退系统盘；Redis Sentinel 模式必须选择主节点，未选主节点会在前后端校验拦截；`pnpm test`、`pnpm web:build`、`git diff --check` 已通过。
 - 问题：用户要求 MySQL 单体安装时不要展示集群信息。
 - 结论：MySQL 安装弹窗的集群名称字段已增加可见条件，仅在 `innodb-cluster` 拓扑下展示；单体安装不会再展示或提交该字段；`pnpm web:build`、`pnpm test`、`git diff --check` 已通过。
+- 问题：用户反馈 MySQL InnoDB Cluster 初始化失败，任务日志显示 bootstrap 阶段找不到 `mysqlsh`。
+- 结论：确认 MySQL 离线 bundle 内已有 MySQL Shell 包，但安装脚本未解包；已让 MySQL 基础安装同步解出并安装 bundle 内置 MySQL Shell，集群初始化优先调用安装目录内的 `mysqlsh`，前端提示也改为内置离线安装；`pnpm test`、`pnpm web:build`、`git diff --check` 已通过。
