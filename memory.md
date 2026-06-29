@@ -1,0 +1,43 @@
+# AIFAR Memory
+
+本文件记录后续对话的精简问题与结论。每次开始先读，结束前追加。禁止写入密码、token、私钥、完整连接串和长日志。
+
+## 2026-06-29
+- 问题：用户要求整理当前代码功能，重写 `AGENTS.md` 和 `SKILL.md`，并要求后续所有问答都先读 `memory.md`、结束前精简记录问题与结论。
+- 结论：已建立 memory 工作流，并将当前项目定位为 Go/Chi/SQLite 后端 + Vue3/Element Plus/Vite 前端 + Docker/MySQL/Redis/MinIO 离线安装、任务系统和审计日志的运维面板。
+- 问题：用户要求把启动端口配置也放入 `config/defaults.env`。
+- 结论：已新增 `AIFAR_ADDR=0.0.0.0:8080`，并让 `scripts/toolchain.mjs` 优先读取 defaults.env 中的 `AIFAR_ADDR`。
+- 问题：用户询问后端 8080 端口和本地开发 Vite 5173 端口能否合并。
+- 结论：生产/打包运行可只用 8080，由 Go 后端托管 `web/dist`；本地开发不建议让 Go 和 Vite 同时占用同一端口，当前 5173 通过 Vite proxy 转发 `/api/v2` 到 8080。
+- 问题：用户询问当前建议优先优化什么。
+- 结论：建议优先做配置一致性、消除已暴露 UI 的 stub 能力、生产安全默认值、安装任务可观测性与测试补强。
+- 问题：用户要求执行“让本地开发代理跟随 defaults.env 的 AIFAR_ADDR”优化。
+- 结论：已更新 `web/vite.config.ts` 从 `config/defaults.env` 或环境变量读取 `AIFAR_ADDR`，并将 `0.0.0.0`/`::` 转为 `127.0.0.1` 作为 Vite proxy 目标；`pnpm web:build` 已通过。
+- 问题：用户删除 Docker 部署服务时失败，原因是目标机还有通过 dnf 安装的系统 Docker，状态检测返回 `status=stopped`。
+- 结论：已修正 Docker 删除校验：只要求 AIFAR 管理的安装目录和 systemd unit 被移除，不再要求整机 Docker 命令消失；补充了外部 Docker 仍存在时删除成功的测试，`pnpm test` 已通过。
+- 问题：用户要求新增可复用拖拽公共组件，并且服务器清单拖拽后的顺序需要入库。
+- 结论：新增 `web/src/components/DraggableList.vue`，服务器清单已接入拖拽；后端新增 `servers.sort_order`、`PUT /api/v2/servers/order` 和排序持久化测试，搜索状态下禁用拖拽以避免保存局部过滤顺序；`pnpm test`、`pnpm web:build` 均已通过。
+- 问题：Windows 防火墙弹窗询问是否允许 `aifar-server.exe` 访问公共/专用网络，原因是本地开发启动时监听了 `0.0.0.0:8080`。
+- 结论：已将本地开发默认监听改为 `127.0.0.1`：新增 `AIFAR_DEV_ADDR=127.0.0.1:8080` 和 `AIFAR_VITE_HOST=127.0.0.1`，`pnpm dev` 使用开发地址，生产 `AIFAR_ADDR=0.0.0.0:8080` 保持不变；`pnpm web:build` 已通过。
+- 问题：多台服务器批量安装 Docker 时失败，远程日志显示 `tar is required`，但资源包已上传 `tar` 和 `gzip` RPM。
+- 结论：原因是 Docker 安装脚本先检查 `tar` 再安装本地 RPM，导致缺 `tar` 的主机无法通过上传的 `tar-*.rpm` 自修复；已调整为先安装本地 RPM，再检查 `tar`/`gzip`，并补充脚本顺序测试；`pnpm test` 已通过。
+- 问题：用户要求任务中心增加全选删除任务日志操作。
+- 结论：任务列表新增“全选当前筛选”与已选数量展示；任务工具栏新增“清空所选日志”，后端新增 `DELETE /api/v2/tasks/logs` 批量清空日志接口并保留任务、目标和步骤记录；`pnpm test`、`pnpm web:build` 均已通过。
+- 问题：Docker 安装需要开放远程 API、安装页校验 Docker 默认网段冲突、卸载后命令提示更友好、终端 SSH 不通、容器页去掉 Local Docker、多服务器部署日志右侧看不完整。
+- 结论：Docker 安装脚本已启用 `tcp://0.0.0.0:2375` 远程 API 并支持自定义桥接 CIDR/API 端口，服务器登记为 `tcp://host:port`；安装弹窗新增 IPv4 CIDR 冲突校验；卸载脚本执行 `hash -r` 并提示既有 shell 清缓存；Vite WebSocket proxy 与终端 token 查询兜底已修复；容器页只显示已登记 DockerHost 的服务器并禁用本机默认 Docker；部署日志右侧详情改为可滚动完整查看；`pnpm test`、`pnpm web:build` 均已通过。
+- 问题：用户要求全量扫描前后端，列出适合抽成公共组件/公共模块的点，并说明企业级开发运维方向原因。
+- 结论：扫描确认前端优先抽页面骨架、数据表格/操作列、高危确认、目标选择器、任务/日志面板、动态安装表单、终端面板和通用 composables；后端优先抽 HTTP 响应/错误、任务生命周期执行器、安装器工具包、应用部署生命周期、参数校验、资源包校验、审计发射器、仓储拆分、远程命令策略和 WebSocket/SSE 网关。
+- 问题：用户要求“按照建议顺序来”，依次推进后端公共模块、前端公共组件、`store.go`/`httpapi` 拆分。
+- 结论：已新增 `taskrun`、`installerkit`、`apperror`，Docker/MySQL 安装器复用公共远程执行与脚本工具，MySQL 服务复用任务步骤 runner；前端新增 `DataTable`、`ServerSelector`、`DangerConfirm`、`TaskRunPanel` 并接入工具箱、安装弹窗、容器页和任务中心；拆出 `httpapi/response.go` 及 store 的 `audit.go`、`app_instances.go`、`storage_items.go`、`settings.go`；`pnpm test` 和 `pnpm web:build` 通过。
+- 问题：用户追问是否还有需要提出为公共组件/公共模块的点。
+- 结论：建议继续提炼前端 `PageHeader/PageShell`、`ActionToolbar/FilterBar`、`AppInstanceTable`、`TaskTable`、`SecretConfirmPrompt`、`LogDrawer/TerminalOutput`、`useServerMap`、`useTaskPolling/useSSE`；后端继续提炼应用服务生命周期 runner、Redis/MinIO installerkit 接入、资源包选择与 checksum 校验、删除确认生命周期、审计发射器、HTTP 模块路由拆分、任务计划落库器、敏感信息脱敏日志器和 SSH 命令策略。
+- 问题：用户要求继续“按照建议来”抽公共组件和公共模块。
+- 结论：已新增后端 `resourcekit` 统一资源选择、RPM 枚举和 SHA256 校验，Redis/MinIO 安装与卸载复用 `installerkit`；前端新增 `PageShell`、`AppInstanceTable`、`SecretConfirmPrompt` 并接入应用商店实例/部署记录与删除确认；`pnpm web:build` 和 `pnpm test` 已通过。
+- 问题：用户询问是否还有需要提炼为公共组件的点。
+- 结论：建议下一批优先抽流程型组件/模块：前端 `ConfirmAction`、`TaskTable`、`RunRecordTable`、`TabWorkspace`、`LogDrawer/TerminalOutput`、`KeyValueGrid/MetricGrid`、`ResourceHealthCard`；后端抽删除生命周期 runner、任务计划落库器、资源上传清单、审计发射器、HTTP feature router、敏感日志脱敏器和 SSH 命令策略。
+- 问题：用户要求持续优化，直到达到企业级开发和运维部署工具标准。
+- 结论：已创建持续目标；本轮新增前端 `ConfirmAction`、`useConfirmAction`、`RunRecordTable`，并接入审计、任务日志、数据库、对象存储和服务器删除确认；后端新增 `apps/deleteflow` 并接入 MySQL/Redis/MinIO 删除生命周期；`pnpm web:build` 和 `pnpm test` 已通过。
+- 问题：持续目标推进，继续补强企业级任务可观测性和日志排障体验。
+- 结论：已新增后端 `taskplan` 统一安装计划落库，并让应用安装入口复用该模块；前端新增 `LogOutput`、`LogDrawer`，容器日志抽屉和任务运行详情已复用公共日志输出；`pnpm web:build` 和 `pnpm test` 已通过。
+- 问题：持续目标推进，继续收敛远程资源上传链路和运维概览展示。
+- 结论：已新增后端 `installer/uploadkit` 统一上传日志、mode、失败包装和 RPM 清单展开，Docker/MySQL/Redis/MinIO 安装器已接入；前端新增 `KeyValueGrid`、`MetricGrid`，容器、Dashboard、服务器、数据库、对象存储、设置页面已复用；`pnpm web:build` 和 `pnpm test` 已通过。
