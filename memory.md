@@ -1,5 +1,8 @@
 # AIFAR Memory
 
+- 问题：用户上传新的 MySQL InnoDB Cluster 日志，基础安装已成功，但 bootstrap 阶段 `dba.configureInstance` 需要修改 `gtid_mode`、`enforce_gtid_consistency`、`server_id` 等并尝试远程重启，最终报 `mysqld is not managed by supervisor process`。
+- 结论：MySQL 安装脚本已在 `my.cnf` 中预置 InnoDB Cluster 所需的 GTID、binlog、WRITESET、relay log、log_replica_updates 配置，并由安装器按服务器 ID/主机/端口生成稳定非零 `server-id`，避免 `mysqlsh` bootstrap 阶段再要求重启；`pnpm test`、`pnpm web:build`、`pnpm backend:build`、`git diff --check` 已通过。
+
 - 问题：用户上传 MySQL 安装日志，显示已有数据目录时服务已 `active (running)`，但旧脚本停在 `waiting for MySQL socket` 并报 `MySQL socket is not ready after installation`。
 - 结论：该日志命中已修复问题，原因是运行的仍是旧后端/旧打包产物；当前源码已改为 `waiting for MySQL service readiness`，已有数据目录会用配置管理员密码探测并输出凭据不匹配提示，需要重新构建并重启后端后再安装。
 

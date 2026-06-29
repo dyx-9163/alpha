@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"os"
 	"path"
 	"path/filepath"
@@ -71,6 +72,7 @@ func (i Installer) Install(ctx context.Context, server store.Server, bundle Bund
 		InstallRoot:  installRoot,
 		ReportHost:   strings.TrimSpace(server.Host),
 		Port:         req.Port,
+		ServerID:     mysqlServerID(server, req.Port),
 		RootUser:     req.RootUser,
 		RootPassword: req.RootPassword,
 	})
@@ -133,4 +135,18 @@ func (o InstallOptions) Validate() error {
 
 func (i Installer) run(ctx context.Context, server store.Server, command string, log Logger) (installerkit.CommandResult, error) {
 	return installerkit.Run(ctx, i.remote, server, command, log, "mysql remote command failed")
+}
+
+func mysqlServerID(server store.Server, port int) uint32 {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(strings.TrimSpace(server.ID)))
+	_, _ = h.Write([]byte("|"))
+	_, _ = h.Write([]byte(strings.TrimSpace(server.Host)))
+	_, _ = h.Write([]byte("|"))
+	_, _ = h.Write([]byte(fmt.Sprint(port)))
+	id := h.Sum32()
+	if id == 0 {
+		return 1
+	}
+	return id
 }

@@ -104,6 +104,20 @@ func TestInstallerUploadsBundleAndRunsMySQLScript(t *testing.T) {
 	if !strings.Contains(remote.installScript, "report_host=10.0.0.4") {
 		t.Fatalf("installer should set report_host for cluster communication:\n%s", remote.installScript)
 	}
+	for _, want := range []string{
+		"server-id=",
+		"log-bin=$LOG_DIR/mysql-bin",
+		"relay-log=$LOG_DIR/mysql-relay-bin",
+		"binlog_format=ROW",
+		"log_replica_updates=ON",
+		"gtid_mode=ON",
+		"enforce_gtid_consistency=ON",
+		"binlog_transaction_dependency_tracking=WRITESET",
+	} {
+		if !strings.Contains(remote.installScript, want) {
+			t.Fatalf("installer should preconfigure InnoDB Cluster option %q:\n%s", want, remote.installScript)
+		}
+	}
 	if !strings.Contains(remote.installScript, `MYSQL_PWD="$ROOT_PASSWORD" "$MYSQL_BASE/bin/mysqladmin" --protocol=tcp`) {
 		t.Fatalf("installer should verify password login via mysqladmin:\n%s", remote.installScript)
 	}
@@ -121,6 +135,7 @@ func TestMySQLStandaloneScriptsRenderTemplates(t *testing.T) {
 		InstallRoot:  "/aifar/apps/mysql/8.0.36",
 		ReportHost:   "10.0.0.1",
 		Port:         3307,
+		ServerID:     12345,
 		RootUser:     "root",
 		RootPassword: "Oversea.123",
 	})
@@ -132,6 +147,9 @@ func TestMySQLStandaloneScriptsRenderTemplates(t *testing.T) {
 	}
 	if !strings.Contains(install, "VERSION='8.0.36'") || !strings.Contains(install, "PORT=3307") || !strings.Contains(install, "report_host=10.0.0.1") {
 		t.Fatalf("install script did not render core standalone variables:\n%s", install)
+	}
+	if !strings.Contains(install, "server-id=12345") || !strings.Contains(install, "gtid_mode=ON") || !strings.Contains(install, "binlog_transaction_dependency_tracking=WRITESET") {
+		t.Fatalf("install script did not render InnoDB Cluster bootstrap-friendly config:\n%s", install)
 	}
 	bootstrap, err := bootstrapInnoDBClusterScript(InnoDBClusterBootstrapRequest{
 		ClusterName:  "aifarCluster",
@@ -158,5 +176,20 @@ func TestMySQLStandaloneScriptsRenderTemplates(t *testing.T) {
 	}
 	if !strings.Contains(uninstall, "SERVICE_NAME=\"aifar-mysql-$PORT\"") || !strings.Contains(uninstall, "PORT=3307") {
 		t.Fatalf("uninstall script did not render standalone service identity:\n%s", uninstall)
+	}
+}
+
+func TestMySQLServerIDIsStableAndDistinct(t *testing.T) {
+	one := mysqlServerID(store.Server{ID: "srv-1", Host: "192.168.74.128"}, 3306)
+	two := mysqlServerID(store.Server{ID: "srv-2", Host: "192.168.74.129"}, 3306)
+	again := mysqlServerID(store.Server{ID: "srv-1", Host: "192.168.74.128"}, 3306)
+	if one == 0 || two == 0 {
+		t.Fatalf("mysql server id must be non-zero: %d %d", one, two)
+	}
+	if one == two {
+		t.Fatalf("mysql server ids should differ across servers: %d", one)
+	}
+	if one != again {
+		t.Fatalf("mysql server id should be stable, got %d then %d", one, again)
 	}
 }

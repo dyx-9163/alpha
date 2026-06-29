@@ -64,6 +64,7 @@ type InstallScriptRequest struct {
 	InstallRoot  string
 	ReportHost   string
 	Port         int
+	ServerID     uint32
 	RootUser     string
 	RootPassword string
 }
