@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -251,11 +252,55 @@ func TestDatabaseBackupStartsTaskAndCreatesFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer backup.Close()
 	if _, err := backup.UserByUsername("owner"); err != nil {
+		_ = backup.Close()
 		t.Fatalf("expected backed up owner to be readable: %v", err)
 	}
+	if err := backup.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	listReq := httptest.NewRequest(http.MethodGet, "/api/v2/maintenance/database-backups", nil)
+	listReq.Header.Set("Authorization", "Bearer "+token)
+	listRec := httptest.NewRecorder()
+	api.Router().ServeHTTP(listRec, listReq)
+	if listRec.Code != http.StatusOK {
+		t.Fatalf("expected backup list 200, got %d body=%s", listRec.Code, listRec.Body.String())
+	}
+	var listBody struct {
+		Items []struct {
+			Name   string `json:"name"`
+			SHA256 string `json:"sha256"`
+		} `json:"items"`
+	}
+	if err := json.Unmarshal(listRec.Body.Bytes(), &listBody); err != nil {
+		t.Fatal(err)
+	}
+	if len(listBody.Items) != 1 || listBody.Items[0].Name == "" || listBody.Items[0].SHA256 == "" {
+		t.Fatalf("expected one listed backup with checksum, got %+v", listBody.Items)
+	}
+
+	deleteReq := httptest.NewRequest(http.MethodDelete, "/api/v2/maintenance/database-backups", strings.NewReader(`{"names":["`+listBody.Items[0].Name+`"]}`))
+	deleteReq.Header.Set("Authorization", "Bearer "+token)
+	deleteReq.Header.Set("Content-Type", "application/json")
+	deleteRec := httptest.NewRecorder()
+	api.Router().ServeHTTP(deleteRec, deleteReq)
+	if deleteRec.Code != http.StatusOK {
+		t.Fatalf("expected backup delete 200, got %d body=%s", deleteRec.Code, deleteRec.Body.String())
+	}
+	if _, err := os.Stat(files[0]); !os.IsNotExist(err) {
+		t.Fatalf("expected backup file to be deleted, got %v", err)
+	}
+	badDeleteReq := httptest.NewRequest(http.MethodDelete, "/api/v2/maintenance/database-backups", strings.NewReader(`{"names":["../aifar-control-plane-bad.db"]}`))
+	badDeleteReq.Header.Set("Authorization", "Bearer "+token)
+	badDeleteReq.Header.Set("Content-Type", "application/json")
+	badDeleteRec := httptest.NewRecorder()
+	api.Router().ServeHTTP(badDeleteRec, badDeleteReq)
+	if badDeleteRec.Code != http.StatusBadRequest {
+		t.Fatalf("expected unsafe backup delete 400, got %d body=%s", badDeleteRec.Code, badDeleteRec.Body.String())
+	}
 	assertAuditExists(t, db, "maintenance.database.backup", "running", "owner", "control-plane")
+	assertAuditExists(t, db, "maintenance.database.backup.delete", "success", "owner", listBody.Items[0].Name)
 }
 
 func newAuthzTestAPI(t *testing.T) (*API, *store.Store, string) {

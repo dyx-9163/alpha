@@ -49,6 +49,43 @@
           </el-tooltip>
         </div>
         <span class="subtle-note">{{ t('settings.retentionNote') }}</span>
+        <DataTable
+          class="backup-table"
+          :rows="backups as unknown as Record<string, unknown>[]"
+          :columns="backupColumns"
+          :title="t('settings.databaseBackups')"
+          row-key="name"
+          :height="260"
+          :loading="backupsLoading"
+        >
+          <template #toolbar>
+            <el-button size="small" :disabled="!canManageSettings" @click="loadBackups">{{ t('common.refresh') }}</el-button>
+          </template>
+          <template #size="{ row }">
+            {{ formatBytes(row.size) }}
+          </template>
+          <template #createdAt="{ row }">
+            {{ formatDate(row.createdAt) }}
+          </template>
+          <template #action="{ row }">
+            <ConfirmAction
+              :message="t('settings.confirmDeleteBackup', { name: row.name })"
+              :disabled="!canManageSettings"
+              type="warning"
+              @confirm="deleteBackup(row.name)"
+            >
+              <template #default="{ confirm }">
+                <el-tooltip :content="deniedText" :disabled="canManageSettings" placement="top">
+                  <span>
+                    <el-button size="small" type="danger" :disabled="!canManageSettings" @click="confirm">
+                      {{ t('common.delete') }}
+                    </el-button>
+                  </span>
+                </el-tooltip>
+              </template>
+            </ConfirmAction>
+          </template>
+        </DataTable>
       </div>
 
       <el-alert
@@ -82,7 +119,9 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref } from 'vue'
 import { ElMessage } from 'element-plus'
-import { apiGet, apiPost, apiPut } from '../api/client'
+import { apiDelete, apiGet, apiPost, apiPut } from '../api/client'
+import ConfirmAction from '../components/ConfirmAction.vue'
+import DataTable from '../components/DataTable.vue'
 import KeyValueGrid from '../components/KeyValueGrid.vue'
 import { usePermissions } from '../composables/usePermissions'
 import { useI18n } from '../i18n'
@@ -93,7 +132,9 @@ const { can, deniedText } = usePermissions()
 const form = reactive<any>({ language: locale.value, deploymentConcurrency: 2, moduleStatus: {} })
 const now = ref('')
 const backupRunning = ref(false)
+const backupsLoading = ref(false)
 const retentionRunning = ref(false)
+const backups = ref<DatabaseBackup[]>([])
 const platform = navigator.platform.toLowerCase().includes('win') ? 'windows' : 'linux'
 const providerModeLabel = computed(() => {
   const mode = form.providerStatus || form.providerMode || 'real'
@@ -118,6 +159,21 @@ const maintenanceItems = computed(() => [
   { key: 'auditRetentionDays', label: t('settings.auditRetention'), value: formatRetentionDays(form.auditRetentionDays) },
   { key: 'taskRetentionDays', label: t('settings.taskRetention'), value: formatRetentionDays(form.taskRetentionDays) }
 ])
+const backupColumns = computed(() => [
+  { prop: 'name', label: t('settings.backupName'), minWidth: 240 },
+  { prop: 'size', label: t('settings.backupSize'), width: 120, slot: 'size' },
+  { prop: 'sha256', label: t('settings.backupChecksum'), minWidth: 240 },
+  { prop: 'createdAt', label: t('common.time'), width: 190, slot: 'createdAt' },
+  { label: t('common.operation'), width: 100, slot: 'action', fixed: 'right' as const }
+])
+
+type DatabaseBackup = {
+  name: string
+  path: string
+  size: number
+  sha256: string
+  createdAt: string
+}
 
 function moduleMessage(module: string) {
   const key = `settings.moduleMessages.${module}`
@@ -136,6 +192,7 @@ async function load() {
   form.language = locale.value
   form.deploymentConcurrency = Number(form.deploymentConcurrency)
   now.value = new Date().toISOString()
+  await loadBackups()
 }
 async function save() {
   if (!canManageSettings.value) {
@@ -174,10 +231,41 @@ async function runDatabaseBackup() {
   try {
     await apiPost('/maintenance/database-backup/run')
     ElMessage.success(t('settings.databaseBackupAccepted'))
+    window.setTimeout(() => void loadBackups(), 800)
   } catch (err) {
     ElMessage.error(err instanceof Error ? err.message : t('settings.databaseBackupFailed'))
   } finally {
     backupRunning.value = false
+  }
+}
+
+async function loadBackups() {
+  if (!canManageSettings.value) {
+    backups.value = []
+    return
+  }
+  backupsLoading.value = true
+  try {
+    const res = await apiGet<{ items?: DatabaseBackup[] }>('/maintenance/database-backups')
+    backups.value = Array.isArray(res.items) ? res.items : []
+  } catch {
+    backups.value = []
+  } finally {
+    backupsLoading.value = false
+  }
+}
+
+async function deleteBackup(name: unknown) {
+  if (!canManageSettings.value || typeof name !== 'string') {
+    ElMessage.warning(deniedText.value)
+    return
+  }
+  try {
+    await apiDelete('/maintenance/database-backups', { names: [name] })
+    ElMessage.success(t('settings.backupDeleted'))
+    await loadBackups()
+  } catch (err) {
+    ElMessage.error(err instanceof Error ? err.message : t('settings.backupDeleteFailed'))
   }
 }
 
@@ -187,6 +275,31 @@ function formatRetentionDays(value: unknown) {
     return '-'
   }
   return t('settings.days', { count })
+}
+
+function formatBytes(value: unknown) {
+  const bytes = Number(value)
+  if (!Number.isFinite(bytes) || bytes < 0) {
+    return '-'
+  }
+  if (bytes < 1024) {
+    return `${bytes} B`
+  }
+  if (bytes < 1024 * 1024) {
+    return `${(bytes / 1024).toFixed(1)} KiB`
+  }
+  return `${(bytes / 1024 / 1024).toFixed(1)} MiB`
+}
+
+function formatDate(value: unknown) {
+  if (!value) {
+    return '-'
+  }
+  const date = new Date(String(value))
+  if (Number.isNaN(date.getTime())) {
+    return String(value)
+  }
+  return date.toLocaleString()
 }
 onMounted(load)
 </script>
@@ -238,6 +351,14 @@ onMounted(load)
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
+}
+
+.backup-table {
+  height: 300px;
+  margin-top: 12px;
+  border: 1px solid var(--aifar-border-soft);
+  border-radius: var(--aifar-radius-md);
+  overflow: hidden;
 }
 
 @media (max-width: 720px) {

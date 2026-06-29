@@ -1,8 +1,12 @@
 package maintenance
 
 import (
+	"crypto/sha256"
 	"fmt"
+	"io"
+	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 )
@@ -24,6 +28,7 @@ type RetentionPlan struct {
 }
 
 type DatabaseBackup struct {
+	Name      string    `json:"name"`
 	Path      string    `json:"path"`
 	Size      int64     `json:"size"`
 	SHA256    string    `json:"sha256"`
@@ -81,5 +86,119 @@ func (s Service) BackupDatabase(dir string, now time.Time) (DatabaseBackup, erro
 	if err != nil {
 		return DatabaseBackup{}, err
 	}
-	return DatabaseBackup{Path: path, Size: size, SHA256: checksum, CreatedAt: now}, nil
+	return DatabaseBackup{Name: name, Path: path, Size: size, SHA256: checksum, CreatedAt: now}, nil
+}
+
+func (s Service) ListDatabaseBackups(dir string) ([]DatabaseBackup, error) {
+	dir = strings.TrimSpace(dir)
+	if dir == "" {
+		return nil, fmt.Errorf("database backup directory is required")
+	}
+	matches, err := filepath.Glob(filepath.Join(dir, "aifar-control-plane-*.db"))
+	if err != nil {
+		return nil, err
+	}
+	out := make([]DatabaseBackup, 0, len(matches))
+	for _, path := range matches {
+		info, err := os.Stat(path)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return nil, err
+		}
+		if info.IsDir() {
+			continue
+		}
+		checksum, err := fileSHA256(path)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, DatabaseBackup{
+			Name:      filepath.Base(path),
+			Path:      path,
+			Size:      info.Size(),
+			SHA256:    checksum,
+			CreatedAt: info.ModTime(),
+		})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].CreatedAt.After(out[j].CreatedAt)
+	})
+	return out, nil
+}
+
+func (s Service) DeleteDatabaseBackups(dir string, names []string) (int, []string, error) {
+	dir = strings.TrimSpace(dir)
+	if dir == "" {
+		return 0, nil, fmt.Errorf("database backup directory is required")
+	}
+	deletedNames := []string{}
+	seen := map[string]bool{}
+	for _, raw := range names {
+		name, err := validateBackupName(raw)
+		if err != nil {
+			return 0, deletedNames, err
+		}
+		if seen[name] {
+			continue
+		}
+		seen[name] = true
+		path, err := safeBackupPath(dir, name)
+		if err != nil {
+			return 0, deletedNames, err
+		}
+		if err := os.Remove(path); err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return 0, deletedNames, err
+		}
+		deletedNames = append(deletedNames, name)
+	}
+	return len(deletedNames), deletedNames, nil
+}
+
+func validateBackupName(name string) (string, error) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return "", fmt.Errorf("backup name is required")
+	}
+	if filepath.Base(name) != name || strings.Contains(name, "/") || strings.Contains(name, `\`) || strings.Contains(name, ":") {
+		return "", fmt.Errorf("invalid backup name: %s", name)
+	}
+	if !strings.HasPrefix(name, "aifar-control-plane-") || !strings.HasSuffix(name, ".db") {
+		return "", fmt.Errorf("invalid backup name: %s", name)
+	}
+	return name, nil
+}
+
+func safeBackupPath(dir, name string) (string, error) {
+	absDir, err := filepath.Abs(dir)
+	if err != nil {
+		return "", err
+	}
+	path := filepath.Join(absDir, name)
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	rel, err := filepath.Rel(absDir, absPath)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+		return "", fmt.Errorf("backup path escapes backup directory")
+	}
+	return absPath, nil
+}
+
+func fileSHA256(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%x", h.Sum(nil)), nil
 }

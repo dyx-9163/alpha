@@ -63,3 +63,5 @@
 - 结论：已新增 `AIFAR_AUDIT_RETENTION_DAYS`、`AIFAR_TASK_RETENTION_DAYS` 配置和设置页展示；新增后端 `maintenance` 服务、`POST /api/v2/maintenance/retention/run` 维护任务入口，按步骤清理过期审计日志和已结束任务；store 层支持按截止时间级联删除任务日志/步骤/目标；设置页新增“执行保留清理”按钮；`pnpm test` 与 `pnpm web:build` 已通过。
 - 问题：持续目标推进，补齐企业级控制面数据库备份能力，避免清理、升级或迁移前缺少可回滚快照。
 - 结论：已新增 `AIFAR_DATABASE_BACKUP_DIR` 配置和设置页展示；store 层使用 SQLite `VACUUM INTO` 生成一致性备份并计算 SHA256；后端新增 `POST /api/v2/maintenance/database-backup/run` 任务入口，按“准备目录、备份数据库、校验文件”记录步骤和审计；设置页新增“创建数据库备份”按钮；新增 store 与 HTTP 测试验证备份文件可打开且包含控制面数据；`pnpm test` 与 `pnpm web:build` 已通过。
+- 问题：持续目标推进，补齐控制面数据库备份的可发现和可治理能力，避免只生成备份但无法查看、校验或清理。
+- 结论：后端维护服务新增备份清单扫描和安全删除，只允许删除配置备份目录下符合 `aifar-control-plane-*.db` 的文件名；新增 `GET/DELETE /api/v2/maintenance/database-backups`，删除操作记录审计并对非法文件名返回 400；设置页新增数据库备份表格，展示文件名、大小、SHA256、时间并支持确认删除；新增维护服务和 HTTP 测试覆盖清单、删除和路径穿越拒绝；`pnpm test` 与 `pnpm web:build` 已通过。

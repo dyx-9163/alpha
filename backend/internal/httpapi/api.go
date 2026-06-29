@@ -64,6 +64,8 @@ func New(cfg config.Config, s *store.Store, tasks *worker.Manager) *API {
 			r.Use(api.requireAuth)
 			r.Get("/settings", api.getSettings)
 			r.Put("/settings", api.requirePermission(rbac.SettingsManage, api.putSettings))
+			r.Get("/maintenance/database-backups", api.requirePermission(rbac.SettingsManage, api.listDatabaseBackups))
+			r.Delete("/maintenance/database-backups", api.requirePermission(rbac.SettingsManage, api.deleteDatabaseBackups))
 			r.Post("/maintenance/database-backup/run", api.requirePermission(rbac.SettingsManage, api.runDatabaseBackup))
 			r.Post("/maintenance/retention/run", api.requirePermission(rbac.SettingsManage, api.runRetentionCleanup))
 			r.Get("/resources", api.listResources)
@@ -273,13 +275,48 @@ func (a *API) putSettings(w http.ResponseWriter, r *http.Request) {
 	a.getSettings(w, r)
 }
 
-func (a *API) runDatabaseBackup(w http.ResponseWriter, r *http.Request) {
-	lang := languageFromRequest(r)
-	target := "control-plane"
-	service := maintenance.NewService(a.store, maintenance.RetentionConfig{
+func (a *API) maintenanceService() maintenance.Service {
+	return maintenance.NewService(a.store, maintenance.RetentionConfig{
 		AuditRetentionDays: a.cfg.AuditRetentionDays,
 		TaskRetentionDays:  a.cfg.TaskRetentionDays,
 	})
+}
+
+func (a *API) listDatabaseBackups(w http.ResponseWriter, r *http.Request) {
+	backups, err := a.maintenanceService().ListDatabaseBackups(a.cfg.DatabaseBackupDir)
+	respond(w, map[string]any{"items": backups, "backupDir": a.cfg.DatabaseBackupDir}, err)
+}
+
+type deleteDatabaseBackupsRequest struct {
+	Names []string `json:"names"`
+}
+
+func (a *API) deleteDatabaseBackups(w http.ResponseWriter, r *http.Request) {
+	lang := languageFromRequest(r)
+	var req deleteDatabaseBackupsRequest
+	if !decode(w, r, &req) {
+		return
+	}
+	names := cleanStringIDs(req.Names)
+	if len(names) == 0 {
+		writeError(w, http.StatusBadRequest, "NAMES_REQUIRED", i18n.Text(lang, "api.databaseBackupNamesRequired"), nil)
+		return
+	}
+	deleted, deletedNames, err := a.maintenanceService().DeleteDatabaseBackups(a.cfg.DatabaseBackupDir, names)
+	if err != nil && isInvalidBackupNameError(err) {
+		writeError(w, http.StatusBadRequest, "INVALID_BACKUP_NAME", i18n.Text(lang, "api.invalidDatabaseBackupName"), map[string]any{"error": err.Error()})
+		return
+	}
+	if err == nil {
+		a.audit(r, "maintenance.database.backup.delete", strings.Join(deletedNames, ","), "success", i18n.Text(lang, "api.databaseBackupsDeleted", deleted))
+	}
+	respond(w, map[string]any{"deleted": deleted, "names": deletedNames}, err)
+}
+
+func (a *API) runDatabaseBackup(w http.ResponseWriter, r *http.Request) {
+	lang := languageFromRequest(r)
+	target := "control-plane"
+	service := a.maintenanceService()
 	actor := currentUser(r).Username
 	task, err := a.tasks.StartWithLanguage("maintenance.database.backup", target, actor, lang, func(ctx context.Context, log worker.Logger) error {
 		log.PlanTarget(target)
@@ -322,10 +359,7 @@ func (a *API) runDatabaseBackup(w http.ResponseWriter, r *http.Request) {
 func (a *API) runRetentionCleanup(w http.ResponseWriter, r *http.Request) {
 	lang := languageFromRequest(r)
 	target := "control-plane"
-	service := maintenance.NewService(a.store, maintenance.RetentionConfig{
-		AuditRetentionDays: a.cfg.AuditRetentionDays,
-		TaskRetentionDays:  a.cfg.TaskRetentionDays,
-	})
+	service := a.maintenanceService()
 	actor := currentUser(r).Username
 	task, err := a.tasks.StartWithLanguage("maintenance.retention.run", target, actor, lang, func(ctx context.Context, log worker.Logger) error {
 		plan := service.Plan(time.Now())
@@ -1630,6 +1664,16 @@ func formatRetentionCutoff(cutoff time.Time) string {
 		return "-"
 	}
 	return cutoff.Format(time.RFC3339)
+}
+
+func isInvalidBackupNameError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "backup name is required") ||
+		strings.Contains(msg, "invalid backup name") ||
+		strings.Contains(msg, "escapes backup directory")
 }
 
 func (a *API) staticFallback(w http.ResponseWriter, r *http.Request) {
