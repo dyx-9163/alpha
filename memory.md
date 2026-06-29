@@ -49,3 +49,5 @@
 - 结论：已为用户表新增 `token_version` 迁移，JWT claims 携带版本号；`ResetUserPassword` 和 `SetUserRole` 会递增版本，`requireAuth` 会校验用户仍存在、版本一致，并用数据库当前角色刷新请求上下文；登录响应返回 `tokenVersion` 和权限列表；新增旧 token 被密码重置撤销的 HTTP 测试，`pnpm test` 已通过。
 - 问题：用户要求持续优化并新增“每次调整完成后推送 GitHub”的流程要求，本轮推进 RBAC 前端体验闭环。
 - 结论：已新增前端 `rbac.ts` 与 `usePermissions`，session 持久化后端返回的权限列表；终端菜单/路由、应用安装/检测/删除、服务器保存/探测/删除/排序、任务清理/删除、审计删除、资源重扫、设置保存、容器启停、数据库备份/检测、对象存储写操作均按权限禁用或拦截；401 会清理本地 session；`pnpm web:build` 和 `pnpm test` 已通过。
+- 问题：按用户要求尝试将本轮调整推送到 GitHub。
+- 结论：已在本地创建分支 `codex/enterprise-permission-ux` 并提交 `5da12610 enterprise permission and operations hardening`；`git push` 被安全审查拦截，原因是向外部 GitHub 远端导出工作区代码需要用户在知情后再次明确批准，当前尚未推送成功。
