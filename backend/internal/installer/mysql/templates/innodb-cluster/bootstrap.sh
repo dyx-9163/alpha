@@ -31,12 +31,24 @@ function uri(node) {
 
 for (const node of nodes) {
   print('configuring MySQL instance ' + node.host + ':' + node.port);
-  dba.configureInstance(uri(node), {
+  const configureOptions = {
     clusterAdmin: rootUser,
-    clusterAdminPassword: rootPassword,
     restart: true,
     interactive: false
-  });
+  };
+  try {
+    dba.configureInstance(uri(node), Object.assign({}, configureOptions, {
+      clusterAdminPassword: rootPassword
+    }));
+  } catch (e) {
+    const message = String(e && e.message ? e.message : e);
+    if (message.indexOf('already exists') >= 0 || message.indexOf('clusterAdminPassword is not allowed') >= 0) {
+      print('cluster admin account already exists on ' + node.host + ':' + node.port + ', reusing it');
+      dba.configureInstance(uri(node), configureOptions);
+    } else {
+      throw e;
+    }
+  }
 }
 
 shell.connect(uri(nodes[0]));

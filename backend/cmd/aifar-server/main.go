@@ -28,7 +28,7 @@ func main() {
 		log.Printf("resource scan warning: %v", err)
 	}
 
-	tasks := worker.NewManager(db)
+	tasks := worker.NewManagerWithConcurrency(db, cfg.DeploymentConcurrency)
 	api := httpapi.New(cfg, db, tasks)
 
 	log.Printf("AIFAR listening on %s", cfg.Addr)

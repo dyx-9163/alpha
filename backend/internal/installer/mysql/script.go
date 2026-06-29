@@ -62,6 +62,7 @@ type InstallScriptRequest struct {
 	WorkDir      string
 	ArchivePath  string
 	InstallRoot  string
+	ReportHost   string
 	Port         int
 	RootUser     string
 	RootPassword string

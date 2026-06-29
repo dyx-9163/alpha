@@ -341,6 +341,10 @@ func (a *API) putSettings(w http.ResponseWriter, r *http.Request) {
 	}
 	for _, key := range []string{"language", "deploymentConcurrency"} {
 		if value, ok := req[key]; ok {
+			if key == "deploymentConcurrency" {
+				_ = a.store.SetSetting(key, fmt.Sprintf("%d", store.NormalizeDeploymentConcurrency(fmt.Sprint(value), a.cfg.DeploymentConcurrency)))
+				continue
+			}
 			_ = a.store.SetSetting(key, fmt.Sprint(value))
 		}
 	}

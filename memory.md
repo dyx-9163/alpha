@@ -85,3 +85,5 @@
 - 结论：MySQL 安装弹窗的集群名称字段已增加可见条件，仅在 `innodb-cluster` 拓扑下展示；单体安装不会再展示或提交该字段；`pnpm web:build`、`pnpm test`、`git diff --check` 已通过。
 - 问题：用户反馈 MySQL InnoDB Cluster 初始化失败，任务日志显示 bootstrap 阶段找不到 `mysqlsh`。
 - 结论：确认 MySQL 离线 bundle 内已有 MySQL Shell 包，但安装脚本未解包；已让 MySQL 基础安装同步解出并安装 bundle 内置 MySQL Shell，集群初始化优先调用安装目录内的 `mysqlsh`，前端提示也改为内置离线安装；`pnpm test`、`pnpm web:build`、`git diff --check` 已通过。
+- 问题：用户要求任务中心任务执行按面板设置里的并发量自动并发，并补充 MySQL InnoDB Cluster 初始化时报 `root@%` 已存在导致 `clusterAdminPassword` 不允许。
+- 结论：worker 任务管理器已接入 `deploymentConcurrency` 设置，任务先保持 pending，拿到并发槽后才进入 running，设置保存时会归一化到 1-20；MySQL 安装会写入 `report_host`，集群 bootstrap 遇到已存在集群管理员账号时会复用账号重试；`pnpm test`、`pnpm web:build`、`git diff --check` 已通过。

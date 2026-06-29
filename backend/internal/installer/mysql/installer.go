@@ -69,6 +69,7 @@ func (i Installer) Install(ctx context.Context, server store.Server, bundle Bund
 		WorkDir:      workDir,
 		ArchivePath:  archiveRemote,
 		InstallRoot:  installRoot,
+		ReportHost:   strings.TrimSpace(server.Host),
 		Port:         req.Port,
 		RootUser:     req.RootUser,
 		RootPassword: req.RootPassword,

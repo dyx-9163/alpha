@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 
 	"aifar-deployment/backend/internal/i18n"
 	"aifar-deployment/backend/internal/store"
@@ -60,19 +61,29 @@ func (l Logger) FinishStep(target, name, status, errText string) {
 type Job func(ctx context.Context, log Logger) error
 
 type Manager struct {
-	store       *store.Store
-	mu          sync.Mutex
-	subscribers map[string]map[chan store.TaskLog]struct{}
-	cancels     map[string]context.CancelFunc
-	languages   map[string]string
+	store              *store.Store
+	defaultConcurrency int
+	mu                 sync.Mutex
+	active             int
+	subscribers        map[string]map[chan store.TaskLog]struct{}
+	cancels            map[string]context.CancelFunc
+	languages          map[string]string
 }
 
 func NewManager(s *store.Store) *Manager {
+	return NewManagerWithConcurrency(s, 2)
+}
+
+func NewManagerWithConcurrency(s *store.Store, defaultConcurrency int) *Manager {
+	if defaultConcurrency < 1 {
+		defaultConcurrency = 1
+	}
 	return &Manager{
-		store:       s,
-		subscribers: map[string]map[chan store.TaskLog]struct{}{},
-		cancels:     map[string]context.CancelFunc{},
-		languages:   map[string]string{},
+		store:              s,
+		defaultConcurrency: defaultConcurrency,
+		subscribers:        map[string]map[chan store.TaskLog]struct{}{},
+		cancels:            map[string]context.CancelFunc{},
+		languages:          map[string]string{},
 	}
 }
 
@@ -104,6 +115,11 @@ func (m *Manager) StartExistingWithLanguage(task store.Task, lang string, job Jo
 			delete(m.languages, task.ID)
 			m.mu.Unlock()
 		}()
+		if !m.acquireSlot(ctx) {
+			_ = m.store.UpdateTaskStatus(task.ID, "cancelled", ctx.Err().Error())
+			return
+		}
+		defer m.releaseSlot()
 		_ = m.store.UpdateTaskStatus(task.ID, "running", "")
 		m.AppendLog(task.ID, "info", i18n.Text(lang, "worker.taskStarted"))
 		if err := job(ctx, Logger{manager: m, taskID: task.ID}); err != nil {
@@ -119,6 +135,34 @@ func (m *Manager) StartExistingWithLanguage(task store.Task, lang string, job Jo
 		_ = m.store.UpdateTaskStatus(task.ID, "success", "")
 	}()
 	return task, nil
+}
+
+func (m *Manager) acquireSlot(ctx context.Context) bool {
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		limit := m.store.DeploymentConcurrency(m.defaultConcurrency)
+		m.mu.Lock()
+		if m.active < limit {
+			m.active++
+			m.mu.Unlock()
+			return true
+		}
+		m.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return false
+		case <-ticker.C:
+		}
+	}
+}
+
+func (m *Manager) releaseSlot() {
+	m.mu.Lock()
+	if m.active > 0 {
+		m.active--
+	}
+	m.mu.Unlock()
 }
 
 func (m *Manager) AppendLog(taskID, level, message string) {

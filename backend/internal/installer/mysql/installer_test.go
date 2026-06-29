@@ -77,7 +77,7 @@ func TestInstallerUploadsBundleAndRunsMySQLScript(t *testing.T) {
 
 	remote := &fakeRemote{}
 	installer := NewInstaller(remote)
-	err := installer.Install(context.Background(), store.Server{Name: "db-1", DeployDir: "/aifar/apps"}, Bundle{
+	err := installer.Install(context.Background(), store.Server{Name: "db-1", Host: "10.0.0.4", DeployDir: "/aifar/apps"}, Bundle{
 		Version:     "8.0.36",
 		ArchivePath: archive,
 		RPMPaths:    []string{rpm},
@@ -101,6 +101,9 @@ func TestInstallerUploadsBundleAndRunsMySQLScript(t *testing.T) {
 	if !strings.Contains(remote.installScript, `MYSQL_SHELL_BASE="$INSTALL_ROOT/mysql-shell"`) || !strings.Contains(remote.installScript, `installing MySQL Shell`) {
 		t.Fatalf("installer should extract bundled mysql shell for cluster bootstrap:\n%s", remote.installScript)
 	}
+	if !strings.Contains(remote.installScript, "report_host=10.0.0.4") {
+		t.Fatalf("installer should set report_host for cluster communication:\n%s", remote.installScript)
+	}
 	if !strings.Contains(remote.installScript, `MYSQL_PWD="$ROOT_PASSWORD" "$MYSQL_BASE/bin/mysqladmin" --protocol=tcp`) {
 		t.Fatalf("installer should verify password login via mysqladmin:\n%s", remote.installScript)
 	}
@@ -112,6 +115,7 @@ func TestMySQLStandaloneScriptsRenderTemplates(t *testing.T) {
 		WorkDir:      "/aifar/apps/_work/mysql",
 		ArchivePath:  "/tmp/mysql.tar",
 		InstallRoot:  "/aifar/apps/mysql/8.0.36",
+		ReportHost:   "10.0.0.1",
 		Port:         3307,
 		RootUser:     "root",
 		RootPassword: "Oversea.123",
@@ -122,7 +126,7 @@ func TestMySQLStandaloneScriptsRenderTemplates(t *testing.T) {
 	if strings.Contains(install, "{{") {
 		t.Fatalf("install script contains unrendered template markers:\n%s", install)
 	}
-	if !strings.Contains(install, "VERSION='8.0.36'") || !strings.Contains(install, "PORT=3307") {
+	if !strings.Contains(install, "VERSION='8.0.36'") || !strings.Contains(install, "PORT=3307") || !strings.Contains(install, "report_host=10.0.0.1") {
 		t.Fatalf("install script did not render core standalone variables:\n%s", install)
 	}
 	bootstrap, err := bootstrapInnoDBClusterScript(InnoDBClusterBootstrapRequest{
@@ -137,6 +141,9 @@ func TestMySQLStandaloneScriptsRenderTemplates(t *testing.T) {
 	}
 	if !strings.Contains(bootstrap, `MYSQLSH="$INSTALL_ROOT/mysql-shell/bin/mysqlsh"`) || !strings.Contains(bootstrap, `"$MYSQLSH" --js --file "$JS_FILE"`) {
 		t.Fatalf("bootstrap script should use bundled mysql shell:\n%s", bootstrap)
+	}
+	if !strings.Contains(bootstrap, "clusterAdminPassword is not allowed") || !strings.Contains(bootstrap, "cluster admin account already exists") {
+		t.Fatalf("bootstrap script should retry existing cluster admin accounts:\n%s", bootstrap)
 	}
 	uninstall, err := uninstallStandaloneScript("8.0.36", "/aifar/apps/mysql/8.0.36", 3307)
 	if err != nil {
