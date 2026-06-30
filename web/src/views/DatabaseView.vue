@@ -69,9 +69,15 @@
               <div><span>{{ t('database.nodes') }}</span><strong>{{ group.nodes.length }}</strong></div>
               <div class="db-grid-wide"><span>{{ groupEndpointLabel(group) }}</span><strong>{{ group.endpoint || '-' }}</strong></div>
               <div><span>{{ t('common.status') }}</span><StatusTag :status="group.status" /></div>
-              <div v-if="group.routers.length"><span>{{ t('database.mysqlRouter') }}</span><strong>{{ group.routers.length }}</strong></div>
+              <div v-if="group.routers.length">
+                <span>{{ t('database.mysqlRouter') }}</span>
+                <strong>{{ group.routers.length }}</strong>
+                <StatusTag class="db-grid-tag" :status="group.routerStatus" />
+              </div>
               <div v-if="group.routers.length" class="db-grid-wide"><span>{{ t('database.routerEndpoint') }}</span><strong>{{ routerEndpointSummary(group) }}</strong></div>
             </div>
+            <div v-if="isUnavailable(group.nodeStatus)" class="service-notice danger">{{ t('database.mysqlServiceUnavailable') }}</div>
+            <div v-if="isUnavailable(group.routerStatus)" class="service-notice danger">{{ t('database.routerServiceUnavailable') }}</div>
             <div class="node-list">
               <div v-for="node in group.nodes" :key="node.instance.id" class="node-row">
                 <div class="node-main">
@@ -127,7 +133,17 @@
     >
       <p v-if="deletePromptMessage" class="secret-confirm-message">{{ deletePromptMessage }}</p>
       <el-form label-position="top" class="multi-secret-form">
-        <el-form-item v-for="server in deleteServers" :key="server.id" :label="server.label">
+        <el-checkbox v-if="deleteServers.length > 1" v-model="sameDeletePassword" @change="handleSamePasswordToggle">{{ t('database.samePassword') }}</el-checkbox>
+        <el-form-item v-if="sameDeletePassword && deleteServers.length > 1" :label="t('database.samePasswordLabel')">
+          <el-input
+            v-model="deleteSharedPassword"
+            type="password"
+            :placeholder="t('apps.deleteServicePasswordPlaceholder')"
+            show-password
+            @keyup.enter="confirmDeleteScope"
+          />
+        </el-form-item>
+        <el-form-item v-for="server in visibleDeleteServers" v-else :key="server.id" :label="server.label">
           <el-input
             v-model="deletePasswords[server.id]"
             type="password"
@@ -194,6 +210,8 @@ type DatabaseGroup = {
   title: string
   endpoint: string
   status: string
+  nodeStatus: string
+  routerStatus: string
   createdAt: string
   metadata: InstanceMetadata
   nodes: DatabaseNode[]
@@ -224,6 +242,8 @@ const deletePromptVisible = ref(false)
 const deleteSubmitting = ref(false)
 const pendingDeleteScope = ref<DeleteScope | null>(null)
 const deletePasswords = ref<Record<string, string>>({})
+const sameDeletePassword = ref(false)
+const deleteSharedPassword = ref('')
 let monitorTimer: ReturnType<typeof setInterval> | undefined
 const monitorIntervalMs = 30000
 const mysqlGroupCount = computed(() => instanceGroups.value.filter((item) => item.app === 'mysql').length)
@@ -258,6 +278,12 @@ const deleteServers = computed(() => {
     out.push({ id, label: serverName(id) })
   }
   return out
+})
+const visibleDeleteServers = computed(() => {
+  if (sameDeletePassword.value && deleteServers.value.length > 1) {
+    return []
+  }
+  return deleteServers.value
 })
 const instanceGroups = computed(() => groupDatabaseInstances(instances.value))
 const filteredGroups = computed(() => {
@@ -389,6 +415,8 @@ function groupDatabaseInstances(items: AppInstance[]) {
         title: groupTitle(item, metadata, topology),
         endpoint: '',
         status: item.status,
+        nodeStatus: item.status,
+        routerStatus: 'unknown',
         createdAt: item.createdAt,
         metadata,
         nodes: [],
@@ -413,6 +441,8 @@ function groupDatabaseInstances(items: AppInstance[]) {
         title: routerClusterTitle(routerNode.item, routerNode.metadata),
         endpoint: '',
         status: routerNode.item.status,
+        nodeStatus: 'unknown',
+        routerStatus: routerNode.item.status,
         createdAt: routerNode.item.createdAt,
         metadata: routerNode.metadata,
         nodes: [],
@@ -433,10 +463,14 @@ function groupDatabaseInstances(items: AppInstance[]) {
         nodes: nodes.sort((a, b) => roleRank(a.role) - roleRank(b.role) || a.serverLabel.localeCompare(b.serverLabel)),
         routers: group.routers.sort((a, b) => a.serverLabel.localeCompare(b.serverLabel))
       }
+      const nodeStatus = serviceStatus(normalizedGroup.nodes)
+      const routerStatus = serviceStatus(normalizedGroup.routers)
       return {
         ...normalizedGroup,
-        endpoint: groupEndpoint(normalizedGroup),
-        status: groupStatus([...normalizedGroup.nodes, ...normalizedGroup.routers])
+        endpoint: isUnavailable(nodeStatus) ? t('database.serviceUnavailable') : groupEndpoint(normalizedGroup),
+        nodeStatus,
+        routerStatus,
+        status: groupStatus(nodeStatus, routerStatus, normalizedGroup.routers.length > 0)
       }
     })
     .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
@@ -754,7 +788,7 @@ function groupMetadataValue(group: DatabaseGroup, key: string) {
   return ''
 }
 
-function groupStatus(nodes: DatabaseNode[]) {
+function serviceStatus(nodes: DatabaseNode[]) {
   const healths = nodes.map((node) => nodeHealth(node))
   if (!healths.length) {
     return 'unknown'
@@ -763,12 +797,32 @@ function groupStatus(nodes: DatabaseNode[]) {
     return 'running'
   }
   if (healths.every((status) => status === 'offline')) {
-    return 'failed'
+    return 'unavailable'
   }
   if (healths.every((status) => status === 'unknown')) {
     return 'unknown'
   }
   return 'degraded'
+}
+
+function groupStatus(nodeStatus: string, routerStatus: string, hasRouters: boolean) {
+  if (nodeStatus === 'unavailable') {
+    return 'unavailable'
+  }
+  if (!hasRouters) {
+    return nodeStatus
+  }
+  if (nodeStatus === 'running' && routerStatus === 'running') {
+    return 'running'
+  }
+  if (nodeStatus === 'unknown' && routerStatus === 'unknown') {
+    return 'unknown'
+  }
+  return 'degraded'
+}
+
+function isUnavailable(status: string) {
+  return status === 'unavailable'
 }
 
 function groupSubtitle(group: DatabaseGroup) {
@@ -780,6 +834,9 @@ function groupSubtitle(group: DatabaseGroup) {
 }
 
 function routerEndpointSummary(group: DatabaseGroup) {
+  if (isUnavailable(group.routerStatus)) {
+    return t('database.serviceUnavailable')
+  }
   const endpoints = Array.from(new Set(group.routers.map((node) => node.endpoint).filter((endpoint) => endpoint && endpoint !== '-')))
   if (!endpoints.length) {
     return '-'
@@ -920,6 +977,8 @@ function resetDeletePrompt() {
   if (!deleteSubmitting.value) {
     pendingDeleteScope.value = null
     deletePasswords.value = {}
+    sameDeletePassword.value = false
+    deleteSharedPassword.value = ''
   }
 }
 
@@ -928,8 +987,8 @@ async function confirmDeleteScope() {
   if (!scope) {
     return
   }
-  const missing = deleteServers.value.find((server) => !String(deletePasswords.value[server.id] || '').trim())
-  if (missing) {
+  const passwords = deletePasswordPayload()
+  if (Object.keys(passwords).length !== deleteServers.value.length) {
     ElMessage.warning(t('database.deletePasswordsRequired'))
     return
   }
@@ -937,11 +996,13 @@ async function confirmDeleteScope() {
   try {
     const result = await apiPost<{ taskId: string }>('/apps/instances/batch-delete', {
       instanceIds: scope.nodes.map((node) => node.instance.id),
-      serverPasswords: deletePasswords.value
+      serverPasswords: passwords
     })
     deletePromptVisible.value = false
     pendingDeleteScope.value = null
     deletePasswords.value = {}
+    sameDeletePassword.value = false
+    deleteSharedPassword.value = ''
     ElMessage.success(t('database.uninstallTaskAccepted', { count: scope.nodes.length }))
     void router.push({ path: '/tasks', query: { taskId: result.taskId } })
   } catch (err) {
@@ -949,6 +1010,37 @@ async function confirmDeleteScope() {
   } finally {
     deleteSubmitting.value = false
   }
+}
+
+function handleSamePasswordToggle() {
+  if (sameDeletePassword.value && !deleteSharedPassword.value) {
+    const firstServer = deleteServers.value[0]
+    if (firstServer) {
+      deleteSharedPassword.value = deletePasswords.value[firstServer.id] || ''
+    }
+  }
+}
+
+function deletePasswordPayload() {
+  const out: Record<string, string> = {}
+  if (sameDeletePassword.value && deleteServers.value.length > 1) {
+    const password = deleteSharedPassword.value.trim()
+    if (!password) {
+      return out
+    }
+    for (const server of deleteServers.value) {
+      out[server.id] = password
+    }
+    return out
+  }
+  for (const server of deleteServers.value) {
+    const password = String(deletePasswords.value[server.id] || '').trim()
+    if (!password) {
+      return {}
+    }
+    out[server.id] = password
+  }
+  return out
 }
 
 function deleteErrorMessage(err: unknown) {
@@ -1104,6 +1196,24 @@ onUnmounted(stopMonitor)
   white-space: normal;
   word-break: break-word;
   line-height: 1.35;
+}
+
+.db-grid-tag {
+  margin-top: 6px;
+}
+
+.service-notice {
+  margin-top: 8px;
+  border-radius: var(--aifar-radius);
+  padding: 8px 10px;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.service-notice.danger {
+  color: #cf1322;
+  background: #fff2f0;
+  border: 1px solid #ffccc7;
 }
 
 .node-list {

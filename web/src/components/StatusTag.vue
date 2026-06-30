@@ -27,6 +27,8 @@ const label = computed(() => {
       return t('status.missing')
     case 'available':
       return t('common.available')
+    case 'unavailable':
+      return t('status.unavailable')
     case 'failed':
       return t('status.failed')
     case 'error':
@@ -52,6 +54,7 @@ const type = computed(() => {
     case 'running':
     case 'available':
       return 'success'
+    case 'unavailable':
     case 'failed':
     case 'error':
       return 'danger'
