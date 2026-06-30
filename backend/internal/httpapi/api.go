@@ -86,6 +86,7 @@ func New(cfg config.Config, s *store.Store, tasks *worker.Manager) *API {
 			r.Get("/apps/catalog", api.appsCatalog)
 			r.Get("/apps/instances", api.appInstances)
 			r.Post("/apps/{app}/install", api.requirePermission(rbac.AppsManage, api.installApp))
+			r.Post("/apps/instances/batch-delete", api.requirePermission(rbac.AppsManage, api.deleteAppInstances))
 			r.Post("/apps/instances/{id}/check", api.requirePermission(rbac.AppsManage, api.checkAppInstance))
 			r.Post("/apps/instances/{id}/delete", api.requirePermission(rbac.AppsManage, api.deleteAppInstance))
 			r.Post("/apps/instances/{id}/uninstall", api.requirePermission(rbac.AppsManage, api.deleteAppInstance))
@@ -164,6 +165,15 @@ type deleteAppInstanceRequest struct {
 	Language           string         `json:"language"`
 	Parameters         map[string]any `json:"parameters"`
 	RemoveMountedDisks *bool          `json:"removeMountedDisks"`
+}
+
+type deleteAppInstancesRequest struct {
+	InstanceIDs        []string          `json:"instanceIds"`
+	ServerPasswords    map[string]string `json:"serverPasswords"`
+	Passwords          map[string]string `json:"passwords"`
+	Language           string            `json:"language"`
+	Parameters         map[string]any    `json:"parameters"`
+	RemoveMountedDisks *bool             `json:"removeMountedDisks"`
 }
 
 type installAppRequest struct {

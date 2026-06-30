@@ -48,7 +48,19 @@
                 <strong>{{ group.title }}</strong>
                 <span>{{ groupSubtitle(group) }}</span>
               </div>
-              <StatusTag :status="group.status" />
+              <div class="db-head-actions">
+                <StatusTag :status="group.status" />
+                <el-tooltip v-if="hasMysqlClusterDelete(group)" :content="deniedText" :disabled="canManageApps" placement="top">
+                  <span>
+                    <el-button size="small" type="danger" plain :disabled="!canManageApps" @click="openDeleteGroup(group, 'mysql-cluster')">{{ t('database.uninstallMysqlCluster') }}</el-button>
+                  </span>
+                </el-tooltip>
+                <el-tooltip v-if="hasRouterClusterDelete(group)" :content="deniedText" :disabled="canManageApps" placement="top">
+                  <span>
+                    <el-button size="small" type="danger" plain :disabled="!canManageApps" @click="openDeleteGroup(group, 'mysql-router')">{{ t('database.uninstallMysqlRouterCluster') }}</el-button>
+                  </span>
+                </el-tooltip>
+              </div>
             </div>
             <div class="db-grid">
               <div><span>{{ t('database.engine') }}</span><strong>{{ group.app }}</strong></div>
@@ -69,9 +81,9 @@
                 <div class="node-tags">
                   <el-tag size="small" :type="roleTagType(node.role)" effect="plain">{{ node.roleLabel }}</el-tag>
                   <el-tag size="small" :type="nodeHealthType(node)">{{ nodeHealthLabel(node) }}</el-tag>
-                  <el-tooltip :content="deniedText" :disabled="canManageApps" placement="top">
+                  <el-tooltip v-if="showNodeDeleteButton(group)" :content="deniedText" :disabled="canManageApps" placement="top">
                     <span>
-                      <el-button size="small" type="danger" plain :disabled="!canManageApps" @click="openDeleteInstance(node.instance)">{{ t('common.uninstall') }}</el-button>
+                      <el-button size="small" type="danger" plain :disabled="!canManageApps" @click="openDeleteNodes([node], 'single')">{{ t('common.uninstall') }}</el-button>
                     </span>
                   </el-tooltip>
                 </div>
@@ -87,11 +99,6 @@
                 <div class="node-tags">
                   <el-tag size="small" :type="roleTagType(node.role)" effect="plain">{{ node.roleLabel }}</el-tag>
                   <el-tag size="small" :type="nodeHealthType(node)">{{ nodeHealthLabel(node) }}</el-tag>
-                  <el-tooltip :content="deniedText" :disabled="canManageApps" placement="top">
-                    <span>
-                      <el-button size="small" type="danger" plain :disabled="!canManageApps" @click="openDeleteInstance(node.instance)">{{ t('common.uninstall') }}</el-button>
-                    </span>
-                  </el-tooltip>
                 </div>
               </div>
             </div>
@@ -111,16 +118,30 @@
       </template>
     </div>
 
-    <SecretConfirmPrompt
+    <el-dialog
       v-model="deletePromptVisible"
-      :title="t('apps.uninstallService')"
-      :message="deletePromptMessage"
-      :placeholder="t('apps.deleteServicePasswordPlaceholder')"
-      :confirm-text="t('common.uninstall')"
-      :cancel-text="t('common.cancel')"
-      :loading="deleteSubmitting"
-      @confirm="confirmDeleteInstance"
-    />
+      :title="deletePromptTitle"
+      width="520px"
+      destroy-on-close
+      @closed="resetDeletePrompt"
+    >
+      <p v-if="deletePromptMessage" class="secret-confirm-message">{{ deletePromptMessage }}</p>
+      <el-form label-position="top" class="multi-secret-form">
+        <el-form-item v-for="server in deleteServers" :key="server.id" :label="server.label">
+          <el-input
+            v-model="deletePasswords[server.id]"
+            type="password"
+            :placeholder="t('apps.deleteServicePasswordPlaceholder')"
+            show-password
+            @keyup.enter="confirmDeleteScope"
+          />
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button :disabled="deleteSubmitting" @click="deletePromptVisible = false">{{ t('common.cancel') }}</el-button>
+        <el-button type="danger" :loading="deleteSubmitting" :disabled="!deleteServers.length" @click="confirmDeleteScope">{{ t('common.uninstall') }}</el-button>
+      </template>
+    </el-dialog>
   </section>
 </template>
 
@@ -131,7 +152,6 @@ import { useRouter } from 'vue-router'
 import { apiGet, apiPost, asArray } from '../api/client'
 import KeyValueGrid from '../components/KeyValueGrid.vue'
 import RunRecordTable from '../components/RunRecordTable.vue'
-import SecretConfirmPrompt from '../components/SecretConfirmPrompt.vue'
 import StatusTag from '../components/StatusTag.vue'
 import { usePermissions } from '../composables/usePermissions'
 import { useI18n } from '../i18n'
@@ -180,6 +200,15 @@ type DatabaseGroup = {
   routers: DatabaseNode[]
 }
 
+type DeleteScopeKind = 'single' | 'mysql-cluster' | 'mysql-router'
+
+type DeleteScope = {
+  kind: DeleteScopeKind
+  title: string
+  message: string
+  nodes: DatabaseNode[]
+}
+
 const { t } = useI18n()
 const { can, deniedText } = usePermissions()
 const router = useRouter()
@@ -193,7 +222,8 @@ const monitoringRunning = ref(false)
 const lastMonitorAt = ref('')
 const deletePromptVisible = ref(false)
 const deleteSubmitting = ref(false)
-const pendingDeleteInstance = ref<AppInstance | null>(null)
+const pendingDeleteScope = ref<DeleteScope | null>(null)
+const deletePasswords = ref<Record<string, string>>({})
 let monitorTimer: ReturnType<typeof setInterval> | undefined
 const monitorIntervalMs = 30000
 const mysqlGroupCount = computed(() => instanceGroups.value.filter((item) => item.app === 'mysql').length)
@@ -211,8 +241,23 @@ const monitoringStatusLabel = computed(() => {
   return monitoringEnabled.value ? t('database.realtimeMonitorOn') : t('database.realtimeMonitorOff')
 })
 const deletePromptMessage = computed(() => {
-  const row = pendingDeleteInstance.value
-  return row ? t('apps.deleteServicePasswordPrompt', { server: serverName(row.serverId) }) : ''
+  return pendingDeleteScope.value?.message || ''
+})
+const deletePromptTitle = computed(() => {
+  return pendingDeleteScope.value?.title || t('apps.uninstallService')
+})
+const deleteServers = computed(() => {
+  const scope = pendingDeleteScope.value
+  if (!scope) return []
+  const seen = new Set<string>()
+  const out: Array<{ id: string; label: string }> = []
+  for (const node of scope.nodes) {
+    const id = node.instance.serverId
+    if (!id || seen.has(id)) continue
+    seen.add(id)
+    out.push({ id, label: serverName(id) })
+  }
+  return out
 })
 const instanceGroups = computed(() => groupDatabaseInstances(instances.value))
 const filteredGroups = computed(() => {
@@ -804,38 +849,118 @@ function openTaskDetails(row: { id: string }) {
   void router.push({ path: '/tasks', query: { taskId: row.id } })
 }
 
-function openDeleteInstance(row: AppInstance) {
+function hasMysqlClusterDelete(group: DatabaseGroup) {
+  return group.app === 'mysql' && group.topology === 'innodb-cluster' && group.nodes.length > 0
+}
+
+function hasRouterClusterDelete(group: DatabaseGroup) {
+  return group.routers.length > 0
+}
+
+function showNodeDeleteButton(group: DatabaseGroup) {
+  return !(group.app === 'mysql' && group.topology === 'innodb-cluster')
+}
+
+function openDeleteGroup(group: DatabaseGroup, kind: DeleteScopeKind) {
+  const nodes = kind === 'mysql-router' ? group.routers : group.nodes
+  openDeleteNodes(nodes, kind, group)
+}
+
+function openDeleteNodes(nodes: DatabaseNode[], kind: DeleteScopeKind, group?: DatabaseGroup) {
   if (!canManageApps.value) {
     ElMessage.warning(deniedText.value)
     return
   }
-  pendingDeleteInstance.value = row
+  const cleanNodes = nodes.filter((node) => node.instance.id)
+  if (!cleanNodes.length) {
+    return
+  }
+  pendingDeleteScope.value = {
+    kind,
+    title: deleteScopeTitle(kind),
+    message: deleteScopeMessage(kind, cleanNodes, group),
+    nodes: cleanNodes
+  }
+  const initialPasswords: Record<string, string> = {}
+  for (const node of cleanNodes) {
+    if (node.instance.serverId) {
+      initialPasswords[node.instance.serverId] = ''
+    }
+  }
+  deletePasswords.value = initialPasswords
   deletePromptVisible.value = true
 }
 
-async function confirmDeleteInstance(password: string) {
-  const row = pendingDeleteInstance.value
-  if (!row) {
+function deleteScopeTitle(kind: DeleteScopeKind) {
+  if (kind === 'mysql-cluster') {
+    return t('database.uninstallMysqlCluster')
+  }
+  if (kind === 'mysql-router') {
+    return t('database.uninstallMysqlRouterCluster')
+  }
+  return t('apps.uninstallService')
+}
+
+function deleteScopeMessage(kind: DeleteScopeKind, nodes: DatabaseNode[], group?: DatabaseGroup) {
+  if (kind === 'single') {
+    return t('apps.deleteServicePasswordPrompt', { server: nodes[0]?.serverLabel || '' })
+  }
+  const name = kind === 'mysql-router' ? t('database.mysqlRouter') : (group?.title || t('database.cluster'))
+  return t('database.uninstallGroupPasswordPrompt', {
+    name,
+    count: uniqueServerCount(nodes)
+  })
+}
+
+function uniqueServerCount(nodes: DatabaseNode[]) {
+  return new Set(nodes.map((node) => node.instance.serverId).filter(Boolean)).size
+}
+
+function resetDeletePrompt() {
+  if (!deleteSubmitting.value) {
+    pendingDeleteScope.value = null
+    deletePasswords.value = {}
+  }
+}
+
+async function confirmDeleteScope() {
+  const scope = pendingDeleteScope.value
+  if (!scope) {
     return
   }
-  if (!password.trim()) {
-    ElMessage.warning(t('apps.deleteServicePasswordPlaceholder'))
+  const missing = deleteServers.value.find((server) => !String(deletePasswords.value[server.id] || '').trim())
+  if (missing) {
+    ElMessage.warning(t('database.deletePasswordsRequired'))
     return
   }
   deleteSubmitting.value = true
   try {
-    const result = await apiPost<{ taskId: string }>(`/apps/instances/${row.id}/delete`, {
-      serverPassword: password
+    const result = await apiPost<{ taskId: string }>('/apps/instances/batch-delete', {
+      instanceIds: scope.nodes.map((node) => node.instance.id),
+      serverPasswords: deletePasswords.value
     })
     deletePromptVisible.value = false
-    pendingDeleteInstance.value = null
-    ElMessage.success(t('apps.uninstallServiceAccepted'))
+    pendingDeleteScope.value = null
+    deletePasswords.value = {}
+    ElMessage.success(t('database.uninstallTaskAccepted', { count: scope.nodes.length }))
     void router.push({ path: '/tasks', query: { taskId: result.taskId } })
   } catch (err) {
-    ElMessage.error(err instanceof Error ? err.message : t('apps.deleteServiceFailed'))
+    ElMessage.error(deleteErrorMessage(err))
   } finally {
     deleteSubmitting.value = false
   }
+}
+
+function deleteErrorMessage(err: unknown) {
+  if (!(err instanceof Error)) {
+    return t('apps.deleteServiceFailed')
+  }
+  const details = (err as Error & { details?: Record<string, unknown> }).details
+  const serverId = stringValue(details?.serverId)
+  if (serverId) {
+    return `${serverName(serverId)}: ${err.message}`
+  }
+  return err.message
 }
 
 onMounted(async () => {
@@ -897,6 +1022,15 @@ onUnmounted(stopMonitor)
   gap: 10px;
   align-items: flex-start;
   margin-bottom: 10px;
+}
+
+.db-head-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  flex-wrap: wrap;
+  max-width: 220px;
 }
 
 .db-title-block {
@@ -1036,10 +1170,32 @@ onUnmounted(stopMonitor)
   padding: 12px;
 }
 
+.multi-secret-form {
+  display: grid;
+  gap: 8px;
+}
+
+.secret-confirm-message {
+  margin: 0 0 12px;
+  color: var(--aifar-text-secondary);
+  font-size: 14px;
+  line-height: 22px;
+}
+
 @media (max-width: 720px) {
   .monitor-actions {
     flex-wrap: wrap;
     justify-content: flex-start;
+  }
+
+  .db-head {
+    flex-wrap: wrap;
+  }
+
+  .db-head-actions {
+    justify-content: flex-start;
+    max-width: none;
+    width: 100%;
   }
 
   .node-row {

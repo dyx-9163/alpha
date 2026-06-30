@@ -130,6 +130,148 @@ func (a *API) deleteAppInstance(w http.ResponseWriter, r *http.Request) {
 	respondTask(w, task, err)
 }
 
+type preparedDeleteInstance struct {
+	instance     store.AppInstance
+	server       store.Server
+	deleteModule registry.DeleteModule
+}
+
+func (a *API) deleteAppInstances(w http.ResponseWriter, r *http.Request) {
+	lang := languageFromRequest(r)
+	var req deleteAppInstancesRequest
+	if !decode(w, r, &req) {
+		return
+	}
+	if strings.TrimSpace(req.Language) != "" {
+		lang = req.Language
+	}
+	ids := cleanStringIDs(req.InstanceIDs)
+	if len(ids) == 0 {
+		writeError(w, http.StatusBadRequest, "IDS_REQUIRED", i18n.Text(lang, "api.idsRequired"), nil)
+		return
+	}
+	passwords := req.ServerPasswords
+	if len(passwords) == 0 {
+		passwords = req.Passwords
+	}
+	items := make([]preparedDeleteInstance, 0, len(ids))
+	targets := make([]string, 0, len(ids))
+	apps := map[string]bool{}
+	seenTargets := map[string]bool{}
+	for _, id := range ids {
+		instance, err := a.store.GetAppInstance(id)
+		if err != nil {
+			respond(w, nil, err)
+			return
+		}
+		if strings.TrimSpace(instance.ServerID) == "" {
+			writeError(w, http.StatusBadRequest, "INSTANCE_SERVER_REQUIRED", i18n.Text(lang, "api.instanceServerRequired"), map[string]any{"instanceId": id})
+			return
+		}
+		server, err := a.store.GetServer(instance.ServerID, true)
+		if err != nil {
+			respond(w, nil, err)
+			return
+		}
+		if strings.TrimSpace(server.Password) == "" {
+			writeError(w, http.StatusConflict, "SERVER_PASSWORD_NOT_CONFIGURED", i18n.Text(lang, "api.serverPasswordNotConfigured"), map[string]any{"serverId": server.ID})
+			return
+		}
+		password := strings.TrimSpace(passwords[server.ID])
+		if password == "" {
+			writeError(w, http.StatusBadRequest, "SERVER_PASSWORD_REQUIRED", i18n.Text(lang, "api.serverPasswordRequired"), map[string]any{"serverId": server.ID})
+			return
+		}
+		if password != strings.TrimSpace(server.Password) {
+			writeError(w, http.StatusForbidden, "SERVER_PASSWORD_INVALID", i18n.Text(lang, "api.serverPasswordInvalid"), map[string]any{"serverId": server.ID})
+			return
+		}
+		module, ok := a.apps.Get(instance.App)
+		if !ok {
+			writeError(w, http.StatusNotFound, "APP_BACKEND_MODULE_MISSING", i18n.Text(lang, "api.appBackendMissing"), map[string]any{"app": instance.App})
+			return
+		}
+		deleteModule, ok := module.(registry.DeleteModule)
+		if !ok {
+			writeError(w, http.StatusConflict, "APP_DELETE_UNSUPPORTED", i18n.Text(lang, "api.appDeleteUnsupported"), map[string]any{"app": instance.App})
+			return
+		}
+		items = append(items, preparedDeleteInstance{instance: instance, server: server, deleteModule: deleteModule})
+		apps[instance.App] = true
+		if !seenTargets[server.ID] {
+			seenTargets[server.ID] = true
+			targets = append(targets, server.ID)
+		}
+	}
+
+	actor := currentUser(r).Username
+	target := strings.Join(targets, ",")
+	taskType := "apps.delete.batch"
+	if len(apps) == 1 {
+		taskType = "apps." + items[0].instance.App + ".delete"
+	}
+	parameters := map[string]any{}
+	for key, value := range req.Parameters {
+		parameters[key] = value
+	}
+	if req.RemoveMountedDisks != nil {
+		parameters["removeMountedDisks"] = *req.RemoveMountedDisks
+	}
+	parameters[registry.DeleteParamConfirmedWithServerPassword] = true
+	task, err := a.tasks.StartWithLanguage(taskType, target, actor, lang, func(ctx context.Context, log worker.Logger) error {
+		plannedTargets := map[string]bool{}
+		for _, item := range items {
+			deleteReq := registry.DeleteRequest{
+				Instance:   item.instance,
+				Server:     item.server,
+				Language:   lang,
+				Actor:      actor,
+				Parameters: parameters,
+			}
+			plan, err := item.deleteModule.PlanDelete(ctx, deleteReq)
+			if err != nil {
+				return err
+			}
+			for _, step := range plan {
+				if step.Target != "" && !plannedTargets[step.Target] {
+					log.PlanTarget(step.Target)
+					plannedTargets[step.Target] = true
+				}
+				log.PlanStep(step.Target, step.Name, step.Title, step.Order)
+			}
+		}
+		log.Info(i18n.Text(lang, "api.deleteInstancesRequested"), len(items), target)
+		for _, item := range items {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			deleteReq := registry.DeleteRequest{
+				Instance:   item.instance,
+				Server:     item.server,
+				Language:   lang,
+				Actor:      actor,
+				Parameters: parameters,
+			}
+			log.Info(i18n.Text(lang, "api.deleteInstanceRequested"), item.instance.App, item.instance.ID)
+			if err := item.deleteModule.Delete(ctx, deleteReq, registry.RunContext{
+				Log: log,
+				TargetLog: func(target string) registry.Logger {
+					return log.Target(target)
+				},
+			}); err != nil {
+				return err
+			}
+			log.Info(i18n.Text(lang, "api.deleteInstanceCompleted"), item.instance.App, item.instance.ID)
+		}
+		log.Info(i18n.Text(lang, "api.deleteInstancesCompleted"), len(items))
+		return nil
+	})
+	if err == nil {
+		a.audit(r, taskType, target, "running", task.ID)
+	}
+	respondTask(w, task, err)
+}
+
 func (a *API) checkAppInstance(w http.ResponseWriter, r *http.Request) {
 	lang := languageFromRequest(r)
 	id := chi.URLParam(r, "id")
