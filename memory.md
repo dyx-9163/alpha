@@ -249,3 +249,15 @@
 - 结论：能打开 MinIO Console 且提示 invalid login，说明网络、端口和 SELinux 基本不是当前阻塞点；应优先排查 systemd 实际加载的 MINIO_ROOT_USER/MINIO_ROOT_PASSWORD、是否改过 env 未重启、是否复用了旧数据目录或分布式节点 env 不一致。
 - 问题：用户反馈 MinIO 安装第 4/5 步上传 Go module cache 时失败，错误为 EOF。
 - 结论：该错误发生在 SSH 文件上传阶段，属于大文件传输链路被中断而不是 MinIO 编译脚本内部报错；uploadkit 已对 EOF、broken pipe、connection reset/timeout 等瞬时上传错误增加自动重试，并让 SSH 上传失败时携带远端 stderr，便于区分磁盘空间、权限等永久故障。
+- 问题：用户再次贴出 MinIO 第 4/5 步上传 Go module cache EOF 日志。
+- 结论：复查确认当前源码已包含 uploadkit 瞬时上传错误自动重试和 SSH stderr 透传；`pnpm test` 通过。若运行包仍出现同样的一次性 EOF，需要重新打包并用新后端重试；若重试后仍失败，再按目标机 SSH 稳定性、磁盘空间和远端目录权限排查。
+- 问题：用户贴出 MinIO 上传失败新日志，错误包含 `cat: 写入错误: No space left on device`。
+- 结论：该错误已定位为目标服务器部署目录所在文件系统空间不足；MinIO 安装包会先上传到服务器部署目录 `_work`，即使数据盘选择了独立磁盘，也需要清理或扩容 `/aifar/apps` 所在分区，或把服务器部署目录改到更大的挂载点后重试。
+- 问题：用户询问 backend/go.mod 和 backend/go.sum 的作用，以及私有化部署时公网依赖拉取的影响。
+- 结论：go.mod/go.sum 是后端构建期 Go 依赖清单与校验锁文件，运行已编译二进制时不使用；私有化运行包不应依赖公网。离线构建需要预置 Go module cache、内部 GOPROXY，或 vendor 后用 -mod=vendor；目标机 MinIO 编译脚本已设置 GOPROXY=off/GOSUMDB=off 并使用随包 go module cache。
+- 问题：用户追问 go.mod/go.sum 是否开发过程要使用。
+- 结论：开发后端时必须保留并使用 go.mod/go.sum；go build/go test/go mod tidy 会自动读取和更新它们。私有化运行不需要它们，内网开发/构建则需要内部 GOPROXY、预置 module cache 或 vendor。
+- 问题：用户确认 Go 依赖是否属于开发过程依赖，内网有这些依赖时是否可通过内网配置使用。
+- 结论：是；Go 依赖主要用于开发/构建期。内网有依赖代理或模块缓存时，可配置 GOPROXY 指向内网源并按需设置 GOSUMDB/GONOSUMDB/GOPRIVATE，运行已编译部署包不需要拉取这些依赖。
+- 问题：用户反馈服务器页进入后没有全部探测，只探测了部分服务器，并且仪表盘展示数据不完整。
+- 结论：服务器工作台进入页面后改为对当前清单所有服务器提交探测任务；仪表盘补齐真实服务器遥测、Docker 摘要、数据库实例和 MinIO 实例展示，后端 `/servers/{id}/telemetry` 不再返回占位 0，而是通过 SSH 采集 CPU、内存、部署目录磁盘和 load。验证通过：pnpm test、pnpm web:build、git diff --check。

@@ -75,7 +75,7 @@ const {
   remove,
   reorder,
   probe,
-  probeSelectedOnce
+  probeAllOnce
 } = useServerWorkbench(t)
 
 const selectedProbing = computed(() => selectedServer.value ? probingIds.value.has(selectedServer.value.id) : false)
@@ -89,7 +89,7 @@ onMounted(async () => {
   await loadDefaults()
   await load()
   if (canManageServers.value) {
-    await probeSelectedOnce()
+    await probeAllOnce()
   }
 })
 

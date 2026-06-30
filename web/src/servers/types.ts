@@ -12,6 +12,7 @@ export interface ServerRecord {
   tags?: string
   note?: string
   deployDir?: string
+  dockerHost?: string
   status?: ServerStatus
   lastError?: string
   sortOrder?: number

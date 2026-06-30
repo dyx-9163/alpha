@@ -141,8 +141,6 @@ func (a *API) serverDisks(w http.ResponseWriter, r *http.Request) {
 
 func (a *API) serverTelemetry(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
-	writeJSON(w, http.StatusOK, map[string]any{
-		"serverId": id, "cpu": 0, "memory": 0, "disk": 0, "load": []float64{0, 0, 0},
-		"sampledAt": time.Now(),
-	})
+	telemetry, err := a.servers.Telemetry(r.Context(), id)
+	respond(w, telemetry, err)
 }

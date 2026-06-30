@@ -130,6 +130,39 @@ func TestProbeFailureUpdatesServerStatus(t *testing.T) {
 	}
 }
 
+func TestTelemetryCollectsRuntimeMetrics(t *testing.T) {
+	remote := &fakeRemote{stdout: strings.Join([]string{
+		"cpu=12.5",
+		"memory=25.0|1073741824|4294967296",
+		"disk=40|2147483648|5368709120|/aifar/apps",
+		"load=0.10|0.20|0.30",
+	}, "\n")}
+	service := NewServiceWithRemote(
+		&fakeStore{server: store.Server{ID: "srv-1", Name: "db-1", Host: "10.0.0.1", Username: "root", Password: "secret", DeployDir: "/aifar/apps"}},
+		fakeProber{},
+		remote,
+	)
+	telemetry, err := service.Telemetry(context.Background(), "srv-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(remote.command, "DEPLOY_DIR='/aifar/apps'") || !strings.Contains(remote.command, "/proc/stat") {
+		t.Fatalf("expected runtime telemetry command, got %q", remote.command)
+	}
+	if telemetry.CPU != 12.5 || telemetry.CPUText != "12.5%" {
+		t.Fatalf("unexpected cpu telemetry: %+v", telemetry)
+	}
+	if telemetry.Memory != 25 || telemetry.MemoryText != "1.0 GiB / 4.0 GiB" {
+		t.Fatalf("unexpected memory telemetry: %+v", telemetry)
+	}
+	if telemetry.Disk != 40 || telemetry.DiskText != "2.0 GiB / 5.0 GiB" || telemetry.DiskPath != "/aifar/apps" {
+		t.Fatalf("unexpected disk telemetry: %+v", telemetry)
+	}
+	if len(telemetry.Load) != 3 || telemetry.Load[0] != 0.10 || telemetry.Load[2] != 0.30 {
+		t.Fatalf("unexpected load telemetry: %+v", telemetry.Load)
+	}
+}
+
 func TestListDiskDevicesDetectsUnmountedCandidates(t *testing.T) {
 	remote := &fakeRemote{stdout: `{
 		"blockdevices": [

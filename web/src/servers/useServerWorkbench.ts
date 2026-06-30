@@ -139,6 +139,18 @@ export function useServerWorkbench(t: (key: string, params?: Record<string, unkn
     }
   }
 
+  async function probeAllOnce() {
+    if (defaultProbeDone.value) {
+      return
+    }
+    defaultProbeDone.value = true
+    const snapshot = servers.value.slice()
+    if (!snapshot.length) {
+      return
+    }
+    await Promise.allSettled(snapshot.map((server) => probe(server)))
+  }
+
   function setProbing(id: string, probing: boolean) {
     const next = new Set(probingIds.value)
     if (probing) {
@@ -171,6 +183,7 @@ export function useServerWorkbench(t: (key: string, params?: Record<string, unkn
     remove,
     reorder,
     probe,
-    probeSelectedOnce
+    probeSelectedOnce,
+    probeAllOnce
   }
 }
