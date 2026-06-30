@@ -235,3 +235,5 @@
 ## 2026-06-30
 - 问题：用户要求所有服务安装成功后自动开放安装端口，并在 SELinux 中加入对应端口规则。
 - 结论：新增 installerkit 公共服务访问策略脚本片段，Docker/MySQL/Redis/Sentinel/Cluster/MinIO/MySQL Router/AIFAR 安装成功后会通过 firewalld 开放对应 TCP 端口，并在 SELinux 启用且 semanage 可用时写入对应端口类型；缺少 firewalld 或 semanage 时只记录 warning。验证通过：go test ./...、pnpm test、git diff --check。
+- 问题：用户发现 Docker 不调整 SELinux 也能启动，而其他服务更容易因为 SELinux 启动失败，询问原因。
+- 结论：Docker 通常运行在 container runtime/较宽权限域，且 2375/2376 等端口常已有 docker_port_t 默认策略；容器端口发布也多由 Docker 管理 iptables/proxy。MySQL、Redis、MinIO 等自带二进制安装在 /aifar/apps 并使用非默认端口时，更容易命中 SELinux 的端口类型或文件上下文限制；端口规则只解决 name_bind，若仍失败需继续检查 /var/log/audit/audit.log 的 AVC 并补 fcontext/restorecon 或应用专用策略。
