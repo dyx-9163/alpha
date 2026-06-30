@@ -46,6 +46,13 @@ type CheckRequest struct {
 	DefaultPassword string
 }
 
+type StartClusterRequest struct {
+	Instances       []store.AppInstance
+	Servers         []store.Server
+	Language        string
+	DefaultPassword string
+}
+
 type CheckResult struct {
 	Status  string
 	Message string
@@ -66,6 +73,14 @@ type stepRecorder interface {
 	FinishTarget(target, status, errText string)
 	StartStep(target, name, title string, order int)
 	FinishStep(target, name, status, errText string)
+}
+
+type clusterStartNode struct {
+	instance store.AppInstance
+	server   store.Server
+	endpoint string
+	host     string
+	port     int
 }
 
 func NewService(s Store, remote Remote) Service {
@@ -331,6 +346,75 @@ func (s Service) installInnoDBClusterBase(ctx context.Context, targets []string,
 	return failedTargets, nil
 }
 
+func (s Service) StartInnoDBCluster(ctx context.Context, req StartClusterRequest, log Logger, targetLog targetLogger) error {
+	copy := ClusterStartCopyFor(req.Language)
+	nodes, err := s.clusterStartNodes(req, copy)
+	if err != nil {
+		return err
+	}
+	if len(nodes) == 0 {
+		return errors.New(copy.ClusterRequired)
+	}
+	targets := clusterStartTargets(nodes)
+	recorder, _ := log.(stepRecorder)
+	for _, target := range targets {
+		taskrun.StartTarget(recorder, target)
+	}
+
+	bootstrap := nodes[0]
+	logForServer := logForTarget(log, targetLog, bootstrap.server.ID)
+	steps := mysqlClusterStartSteps(copy)
+	step := newClusterStartStepRunnerWithSteps(logForServer, recorder, bootstrap.server.ID, copy, steps)
+	fail := func(err error) error {
+		msg := fmt.Sprintf(copy.StartFailed, err)
+		logForServer.Error("%s", msg)
+		for _, target := range targets {
+			finishTarget(recorder, target, "failed", msg)
+		}
+		return err
+	}
+
+	if err := step(1, "load-cluster", copy.LoadCluster, func() error { return nil }); err != nil {
+		return fail(err)
+	}
+	installer := NewInstaller(s.remote)
+	if err := step(2, "start-cluster", copy.StartCluster, func() error {
+		return installer.StartInnoDBCluster(ctx, bootstrap.server, InnoDBClusterStartRequest{
+			ClusterName:  clusterNameFromInstance(bootstrap.instance),
+			InstallRoot:  remoteInstallRoot(bootstrap.server, "mysql", bootstrap.instance.Version),
+			RootUser:     instanceRootUser(bootstrap.instance),
+			RootPassword: passwordParam(nil, req.DefaultPassword),
+			Nodes:        innodbClusterNodes(nodes),
+		}, logForServer)
+	}); err != nil {
+		return fail(err)
+	}
+
+	primaryEndpoint := ""
+	if err := step(3, "detect-primary", copy.DetectPrimary, func() error {
+		var detectErr error
+		primaryEndpoint, detectErr = s.detectInnoDBPrimary(ctx, bootstrap.server, bootstrap.instance, req.DefaultPassword, logForServer)
+		return detectErr
+	}); err != nil {
+		return fail(err)
+	}
+	if err := step(4, "update-instance", copy.UpdateInstance, func() error {
+		return s.markInnoDBClusterStarted(bootstrap.instance, primaryEndpoint, map[string]any{
+			"status":                 "running",
+			"topology":               "innodb-cluster",
+			"currentPrimaryEndpoint": primaryEndpoint,
+		})
+	}); err != nil {
+		return fail(err)
+	}
+
+	logForServer.Info(copy.Started, primaryEndpoint)
+	for _, target := range targets {
+		finishTarget(recorder, target, "success", "")
+	}
+	return nil
+}
+
 func recordClusterBaseFailure(mu *sync.Mutex, failedTargets map[string]bool, failures *[]string, target, msg string) {
 	mu.Lock()
 	defer mu.Unlock()
@@ -453,6 +537,118 @@ func targetServerIDs(req InstallRequest) []string {
 	return out
 }
 
+func (s Service) clusterStartNodes(req StartClusterRequest, copy ClusterStartCopy) ([]clusterStartNode, error) {
+	if len(req.Instances) == 0 {
+		return nil, errors.New(copy.ClusterRequired)
+	}
+	base := req.Instances[0]
+	if base.App != "mysql" || instanceTopology(base) != "innodb-cluster" {
+		return nil, errors.New(copy.ClusterRequired)
+	}
+	serverByID := make(map[string]store.Server, len(req.Servers))
+	for _, server := range req.Servers {
+		if strings.TrimSpace(server.ID) != "" {
+			serverByID[server.ID] = server
+		}
+	}
+	nodes := make([]clusterStartNode, 0, len(req.Instances))
+	for _, instance := range req.Instances {
+		if instance.App != "mysql" || instanceTopology(instance) != "innodb-cluster" {
+			return nil, errors.New(copy.ClusterRequired)
+		}
+		if !sameMySQLCluster(base, instance) {
+			return nil, errors.New(copy.ClusterMixed)
+		}
+		serverID := strings.TrimSpace(instance.ServerID)
+		if serverID == "" {
+			return nil, errors.New(copy.ClusterNoServers)
+		}
+		server, ok := serverByID[serverID]
+		if !ok {
+			var err error
+			server, err = s.store.GetServer(serverID, true)
+			if err != nil {
+				return nil, err
+			}
+		}
+		port := instancePort(instance)
+		host := strings.TrimSpace(server.Host)
+		if host == "" {
+			return nil, errors.New(copy.ClusterNoServers)
+		}
+		nodes = append(nodes, clusterStartNode{
+			instance: instance,
+			server:   server,
+			endpoint: instanceEndpoint(instance, server, port),
+			host:     host,
+			port:     port,
+		})
+	}
+	moveClusterStartPrimaryFirst(nodes)
+	return nodes, nil
+}
+
+func moveClusterStartPrimaryFirst(nodes []clusterStartNode) {
+	primaryEndpoint := ""
+	for _, node := range nodes {
+		metadata := appMetadata(node.instance)
+		for _, key := range []string{"currentPrimaryEndpoint", "primaryEndpoint"} {
+			if primaryEndpoint = metadataString(metadata, key); primaryEndpoint != "" {
+				break
+			}
+		}
+		if primaryEndpoint != "" {
+			break
+		}
+	}
+	if primaryEndpoint == "" {
+		return
+	}
+	for idx, node := range nodes {
+		if normalizeEndpoint(node.endpoint) == normalizeEndpoint(primaryEndpoint) {
+			nodes[0], nodes[idx] = nodes[idx], nodes[0]
+			return
+		}
+	}
+}
+
+func clusterStartTargets(nodes []clusterStartNode) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(nodes))
+	for _, node := range nodes {
+		target := strings.TrimSpace(node.server.ID)
+		if target == "" || seen[target] {
+			continue
+		}
+		seen[target] = true
+		out = append(out, target)
+	}
+	return out
+}
+
+func innodbClusterNodes(nodes []clusterStartNode) []InnoDBClusterNode {
+	out := make([]InnoDBClusterNode, 0, len(nodes))
+	for _, node := range nodes {
+		out = append(out, InnoDBClusterNode{Host: node.host, Port: node.port})
+	}
+	return out
+}
+
+func clusterNameFromInstance(instance store.AppInstance) string {
+	if name := metadataString(appMetadata(instance), "clusterName"); name != "" {
+		return name
+	}
+	return "aifarCluster"
+}
+
+func instanceEndpoint(instance store.AppInstance, server store.Server, port int) string {
+	metadata := appMetadata(instance)
+	if endpoint := metadataString(metadata, "endpoint"); endpoint != "" {
+		return endpoint
+	}
+	return fmt.Sprintf("%s:%d", strings.TrimSpace(server.Host), port)
+}
+
 func normalizeTopology(topology string) string {
 	topology = strings.ToLower(strings.TrimSpace(topology))
 	if topology == "" || topology == "single" {
@@ -525,6 +721,15 @@ func mysqlCheckStepsFor(topology string, copy CheckCopy) []stepDef {
 	}
 }
 
+func mysqlClusterStartSteps(copy ClusterStartCopy) []stepDef {
+	return []stepDef{
+		{Name: "load-cluster", Title: copy.LoadCluster},
+		{Name: "start-cluster", Title: copy.StartCluster},
+		{Name: "detect-primary", Title: copy.DetectPrimary},
+		{Name: "update-instance", Title: copy.UpdateInstance},
+	}
+}
+
 func newStepRunner(log Logger, recorder stepRecorder, target string, copy Copy) func(stepIndex int, stepName, label string, fn func() error) error {
 	steps := mysqlInstallSteps(copy)
 	return newStepRunnerWithSteps(log, recorder, target, copy, steps)
@@ -548,6 +753,23 @@ func newStepRunnerWithSteps(log Logger, recorder stepRecorder, target string, co
 }
 
 func newCheckStepRunnerWithSteps(log Logger, recorder stepRecorder, target string, copy CheckCopy, steps []stepDef) func(stepIndex int, stepName, label string, fn func() error) error {
+	runner := taskrun.Runner{
+		Log:      log,
+		Recorder: recorder,
+		Target:   target,
+		Steps:    steps,
+		Messages: taskrun.Messages{
+			StepStart:  copy.StepStart,
+			StepDone:   copy.StepDone,
+			StepFailed: copy.StepFailed,
+		},
+	}
+	return func(stepIndex int, stepName, label string, fn func() error) error {
+		return runner.Run(stepIndex, stepName, label, fn)
+	}
+}
+
+func newClusterStartStepRunnerWithSteps(log Logger, recorder stepRecorder, target string, copy ClusterStartCopy, steps []stepDef) func(stepIndex int, stepName, label string, fn func() error) error {
 	runner := taskrun.Runner{
 		Log:      log,
 		Recorder: recorder,

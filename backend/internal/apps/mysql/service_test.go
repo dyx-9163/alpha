@@ -298,6 +298,62 @@ func TestServiceCheckInnoDBClusterRecordsCurrentPrimary(t *testing.T) {
 	}
 }
 
+func TestServiceStartsInnoDBClusterAndMarksAllNodesRunning(t *testing.T) {
+	clusterID := "mysql_cluster_test"
+	now := time.Now()
+	instances := []store.AppInstance{
+		mysqlClusterInstance("app-1", "srv-1", clusterID, "10.0.0.1:3306", now),
+		mysqlClusterInstance("app-2", "srv-2", clusterID, "10.0.0.2:3306", now),
+		mysqlClusterInstance("app-3", "srv-3", clusterID, "10.0.0.3:3306", now),
+	}
+	for idx := range instances {
+		instances[idx].Status = "failed"
+	}
+	s := &fakeStore{
+		servers: map[string]store.Server{
+			"srv-1": {ID: "srv-1", Name: "mysql-1", Host: "10.0.0.1", DeployDir: "/aifar/apps"},
+			"srv-2": {ID: "srv-2", Name: "mysql-2", Host: "10.0.0.2", DeployDir: "/aifar/apps"},
+			"srv-3": {ID: "srv-3", Name: "mysql-3", Host: "10.0.0.3", DeployDir: "/aifar/apps"},
+		},
+		instances: instances,
+	}
+	remote := &fakeRemote{primaryOutput: "10.0.0.2:3306\n"}
+	service := NewService(s, remote)
+
+	err := service.StartInnoDBCluster(context.Background(), StartClusterRequest{
+		Instances:       instances,
+		Servers:         []store.Server{s.servers["srv-1"], s.servers["srv-2"], s.servers["srv-3"]},
+		Language:        "en",
+		DefaultPassword: "Oversea.123",
+	}, fakeLogger{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	joinedCommands := remote.joinedCommands()
+	if !strings.Contains(joinedCommands, "rebootClusterFromCompleteOutage") || !strings.Contains(joinedCommands, "rejoinInstance") {
+		t.Fatalf("expected InnoDB Cluster start script to run, got: %s", joinedCommands)
+	}
+	for _, instance := range s.instances {
+		if instance.Status != "running" {
+			t.Fatalf("expected instance %s to be running, got %s", instance.ID, instance.Status)
+		}
+		metadata := map[string]any{}
+		if err := json.Unmarshal([]byte(instance.Metadata), &metadata); err != nil {
+			t.Fatal(err)
+		}
+		if got := metadata["currentPrimaryEndpoint"]; got != "10.0.0.2:3306" {
+			t.Fatalf("expected primary endpoint on %s, got %v", instance.ID, got)
+		}
+		expectedRole := "secondary"
+		if metadata["endpoint"] == "10.0.0.2:3306" {
+			expectedRole = "primary"
+		}
+		if got := metadata["role"]; got != expectedRole {
+			t.Fatalf("expected %s role %s, got %v", instance.ID, expectedRole, got)
+		}
+	}
+}
+
 func TestServiceInstallsInnoDBClusterBaseConcurrently(t *testing.T) {
 	root := t.TempDir()
 	archive := filepath.Join(root, "mysql-aifar-8.0.36-official-bundle.tar")

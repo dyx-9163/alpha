@@ -110,6 +110,15 @@ func (i Installer) BootstrapInnoDBCluster(ctx context.Context, server store.Serv
 	return err
 }
 
+func (i Installer) StartInnoDBCluster(ctx context.Context, server store.Server, req InnoDBClusterStartRequest, log Logger) error {
+	script, err := startInnoDBClusterScript(req)
+	if err != nil {
+		return err
+	}
+	_, err = i.run(ctx, server, "sh -s <<'AIFAR_MYSQL_INNODB_CLUSTER_START'\n"+script+"\nAIFAR_MYSQL_INNODB_CLUSTER_START", log)
+	return err
+}
+
 func (o InstallOptions) Validate() error {
 	if o.Port <= 0 || o.Port > 65535 {
 		return fmt.Errorf("invalid MySQL port: %d", o.Port)

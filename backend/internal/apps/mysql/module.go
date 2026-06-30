@@ -56,6 +56,7 @@ func (m Module) Manifest(lang string) registry.Manifest {
 		Capabilities: []string{
 			"apps.mysql.install",
 			"apps.mysql.delete",
+			"apps.mysql.cluster.start",
 			"resources.mysql.verify",
 			"databases.mysql.register",
 		},
@@ -214,4 +215,45 @@ func (m Module) Check(ctx context.Context, req registry.CheckRequest, run regist
 		return run.LoggerForTarget(target)
 	})
 	return registry.InstanceStatus{Status: result.Status, Message: result.Message, Details: result.Details}, err
+}
+
+func (m Module) PlanClusterStart(ctx context.Context, req registry.ClusterStartRequest) ([]registry.InstallStepPlan, error) {
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	copy := ClusterStartCopyFor(req.Language)
+	nodes, err := m.service.clusterStartNodes(StartClusterRequest{
+		Instances:       req.Instances,
+		Servers:         req.Servers,
+		Language:        req.Language,
+		DefaultPassword: req.DefaultPassword,
+	}, copy)
+	if err != nil {
+		return nil, err
+	}
+	if len(nodes) == 0 {
+		return nil, errors.New(copy.ClusterRequired)
+	}
+	target := nodes[0].server.ID
+	steps := mysqlClusterStartSteps(copy)
+	plan := make([]registry.InstallStepPlan, 0, len(steps))
+	for idx, step := range steps {
+		plan = append(plan, registry.InstallStepPlan{Target: target, Name: step.Name, Title: step.Title, Order: idx + 1})
+	}
+	return plan, nil
+}
+
+func (m Module) StartCluster(ctx context.Context, req registry.ClusterStartRequest, run registry.RunContext) error {
+	defaultPassword := m.defaultPassword
+	if defaultPassword == "" {
+		defaultPassword = req.DefaultPassword
+	}
+	return m.service.StartInnoDBCluster(ctx, StartClusterRequest{
+		Instances:       req.Instances,
+		Servers:         req.Servers,
+		Language:        req.Language,
+		DefaultPassword: defaultPassword,
+	}, run.Log, func(target string) Logger {
+		return run.LoggerForTarget(target)
+	})
 }

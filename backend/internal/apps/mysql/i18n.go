@@ -133,6 +133,21 @@ type CheckCopy struct {
 	Checked        string
 }
 
+type ClusterStartCopy struct {
+	StepStart        string
+	StepDone         string
+	StepFailed       string
+	LoadCluster      string
+	StartCluster     string
+	DetectPrimary    string
+	UpdateInstance   string
+	StartFailed      string
+	Started          string
+	ClusterRequired  string
+	ClusterMixed     string
+	ClusterNoServers string
+}
+
 func CheckCopyFor(lang string) CheckCopy {
 	switch normalizeLanguage(lang) {
 	case "en":
@@ -156,6 +171,41 @@ func CheckCopyFor(lang string) CheckCopy {
 			UpdateInstance: "更新 MySQL 实例状态",
 			CheckFailed:    "MySQL 检测失败：%s",
 			Checked:        "MySQL 检测完成，状态=%s",
+		}
+	}
+}
+
+func ClusterStartCopyFor(lang string) ClusterStartCopy {
+	switch normalizeLanguage(lang) {
+	case "en":
+		return ClusterStartCopy{
+			StepStart:        "MySQL cluster start step %d/%d started: %s",
+			StepDone:         "MySQL cluster start step %d/%d completed: %s",
+			StepFailed:       "MySQL cluster start step %d/%d failed: %s: %v",
+			LoadCluster:      "load InnoDB Cluster topology",
+			StartCluster:     "start MySQL InnoDB Cluster",
+			DetectPrimary:    "detect InnoDB Cluster primary",
+			UpdateInstance:   "update MySQL cluster instance status",
+			StartFailed:      "MySQL InnoDB Cluster start failed: %s",
+			Started:          "MySQL InnoDB Cluster started, primary=%s",
+			ClusterRequired:  "select MySQL InnoDB Cluster instances",
+			ClusterMixed:     "selected instances are not in the same MySQL InnoDB Cluster",
+			ClusterNoServers: "MySQL InnoDB Cluster has no linked servers",
+		}
+	default:
+		return ClusterStartCopy{
+			StepStart:        "MySQL 集群启动步骤 %d/%d 开始：%s",
+			StepDone:         "MySQL 集群启动步骤 %d/%d 完成：%s",
+			StepFailed:       "MySQL 集群启动步骤 %d/%d 失败：%s：%v",
+			LoadCluster:      "读取 InnoDB Cluster 拓扑",
+			StartCluster:     "启动 MySQL InnoDB Cluster",
+			DetectPrimary:    "识别 InnoDB Cluster 当前 Primary",
+			UpdateInstance:   "更新 MySQL 集群实例状态",
+			StartFailed:      "MySQL InnoDB Cluster 启动失败：%s",
+			Started:          "MySQL InnoDB Cluster 已启动，Primary=%s",
+			ClusterRequired:  "请选择 MySQL InnoDB Cluster 实例",
+			ClusterMixed:     "所选实例不属于同一个 MySQL InnoDB Cluster",
+			ClusterNoServers: "MySQL InnoDB Cluster 没有关联服务器",
 		}
 	}
 }

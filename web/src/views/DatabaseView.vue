@@ -50,6 +50,20 @@
               </div>
               <div class="db-head-actions">
                 <StatusTag :status="group.status" />
+                <el-tooltip v-if="hasMysqlClusterStart(group)" :content="deniedText" :disabled="canManageDatabase" placement="top">
+                  <span>
+                    <el-button
+                      size="small"
+                      type="primary"
+                      plain
+                      :loading="startingClusterId === group.id"
+                      :disabled="!canManageDatabase || (!!startingClusterId && startingClusterId !== group.id)"
+                      @click="startMysqlCluster(group)"
+                    >
+                      {{ t('database.startMysqlCluster') }}
+                    </el-button>
+                  </span>
+                </el-tooltip>
                 <el-tooltip v-if="hasMysqlClusterDelete(group)" :content="deniedText" :disabled="canManageApps" placement="top">
                   <span>
                     <el-button size="small" type="danger" plain :disabled="!canManageApps" @click="openDeleteGroup(group, 'mysql-cluster')">{{ t('database.uninstallMysqlCluster') }}</el-button>
@@ -244,6 +258,7 @@ const pendingDeleteScope = ref<DeleteScope | null>(null)
 const deletePasswords = ref<Record<string, string>>({})
 const sameDeletePassword = ref(false)
 const deleteSharedPassword = ref('')
+const startingClusterId = ref('')
 let monitorTimer: ReturnType<typeof setInterval> | undefined
 const monitorIntervalMs = 30000
 const mysqlGroupCount = computed(() => instanceGroups.value.filter((item) => item.app === 'mysql').length)
@@ -251,6 +266,7 @@ const redisGroupCount = computed(() => instanceGroups.value.filter((item) => ite
 const databaseNodeCount = computed(() => instances.value.filter((item) => item.app !== 'mysql-router').length)
 const routerInstanceCount = computed(() => instances.value.filter((item) => item.app === 'mysql-router').length)
 const canManageApps = computed(() => can(permissions.appsManage))
+const canManageDatabase = computed(() => can(permissions.databaseManage))
 const monitoringStatusLabel = computed(() => {
   if (!canManageApps.value) {
     return t('database.monitorPermissionRequired')
@@ -291,7 +307,14 @@ const filteredGroups = computed(() => {
   if (!q) return instanceGroups.value
   return instanceGroups.value.filter((group) => groupSearchText(group).includes(q))
 })
-const runTasks = computed(() => tasks.value.filter((item) => item.type?.startsWith('apps.mysql.') || item.type?.startsWith('apps.mysql-router.') || item.type?.startsWith('apps.redis.')))
+const runTasks = computed(() =>
+  tasks.value.filter((item) =>
+    item.type?.startsWith('apps.mysql.') ||
+    item.type?.startsWith('apps.mysql-router.') ||
+    item.type?.startsWith('apps.redis.') ||
+    item.type?.startsWith('database.mysql.')
+  )
+)
 const settingsItems = computed(() => [
   { label: 'MySQL', value: t('database.mysqlSettings') },
   { label: 'Redis', value: t('database.redisSettings') },
@@ -910,6 +933,10 @@ function hasMysqlClusterDelete(group: DatabaseGroup) {
   return group.app === 'mysql' && group.topology === 'innodb-cluster' && group.nodes.length > 0
 }
 
+function hasMysqlClusterStart(group: DatabaseGroup) {
+  return group.app === 'mysql' && group.topology === 'innodb-cluster' && group.nodes.length > 0
+}
+
 function hasRouterClusterDelete(group: DatabaseGroup) {
   return group.routers.length > 0
 }
@@ -921,6 +948,27 @@ function showNodeDeleteButton(group: DatabaseGroup) {
 function openDeleteGroup(group: DatabaseGroup, kind: DeleteScopeKind) {
   const nodes = kind === 'mysql-router' ? group.routers : group.nodes
   openDeleteNodes(nodes, kind, group)
+}
+
+async function startMysqlCluster(group: DatabaseGroup) {
+  if (!canManageDatabase.value) {
+    ElMessage.warning(deniedText.value)
+    return
+  }
+  const instanceIds = group.nodes.map((node) => node.instance.id).filter(Boolean)
+  if (!instanceIds.length) {
+    return
+  }
+  startingClusterId.value = group.id
+  try {
+    const result = await apiPost<{ taskId: string }>('/database/mysql/clusters/start', { instanceIds })
+    ElMessage.success(t('database.startMysqlClusterAccepted'))
+    void router.push({ path: '/tasks', query: { taskId: result.taskId } })
+  } catch (err) {
+    ElMessage.error(err instanceof Error ? err.message : t('database.startMysqlClusterFailed'))
+  } finally {
+    startingClusterId.value = ''
+  }
 }
 
 function openDeleteNodes(nodes: DatabaseNode[], kind: DeleteScopeKind, group?: DatabaseGroup) {
@@ -1122,7 +1170,7 @@ onUnmounted(stopMonitor)
   justify-content: flex-end;
   gap: 6px;
   flex-wrap: wrap;
-  max-width: 220px;
+  max-width: 320px;
 }
 
 .db-title-block {

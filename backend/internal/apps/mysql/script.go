@@ -17,6 +17,9 @@ var standaloneUninstallScriptTemplate string
 //go:embed templates/innodb-cluster/bootstrap.sh
 var innodbClusterBootstrapScriptTemplate string
 
+//go:embed templates/innodb-cluster/start.sh
+var innodbClusterStartScriptTemplate string
+
 var mysqlScriptFuncs = selinux.AddTemplateFuncs(template.FuncMap{
 	"shq": installerkit.ShellQuote,
 })
@@ -36,6 +39,10 @@ func uninstallStandaloneScript(version, installRoot, legacyInstallRoot string, p
 
 func bootstrapInnoDBClusterScript(req InnoDBClusterBootstrapRequest) (string, error) {
 	return installerkit.RenderTemplate("mysql", "innodb-cluster/bootstrap.sh", "mysql-innodb-cluster-bootstrap", innodbClusterBootstrapScriptTemplate, mysqlScriptFuncs, req)
+}
+
+func startInnoDBClusterScript(req InnoDBClusterStartRequest) (string, error) {
+	return installerkit.RenderTemplate("mysql", "innodb-cluster/start.sh", "mysql-innodb-cluster-start", innodbClusterStartScriptTemplate, mysqlScriptFuncs, req)
 }
 
 type InstallScriptRequest struct {
@@ -58,6 +65,14 @@ type UninstallScriptRequest struct {
 }
 
 type InnoDBClusterBootstrapRequest struct {
+	ClusterName  string
+	InstallRoot  string
+	RootUser     string
+	RootPassword string
+	Nodes        []InnoDBClusterNode
+}
+
+type InnoDBClusterStartRequest struct {
 	ClusterName  string
 	InstallRoot  string
 	RootUser     string

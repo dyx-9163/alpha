@@ -267,3 +267,5 @@
 - 结论：单个 MySQL 节点或 Router 进程在线时仍可能可连接，但集群高可用已降级，不应视为健康集群；数据库页改为 InnoDB 集群和 Router 集群级卸载按钮，并新增批量删除 API，先校验每台目标服务器密码后提交一个卸载任务。
 - 问题：用户要求 MySQL 服务全离线或 Router 全离线时明确提示服务不可用，并希望卸载确认支持“密码一致”。
 - 结论：数据库页按 MySQL 节点和 Router 节点分别聚合健康状态；任一服务全部离线时显示“服务不可用”标签和红色提示，MySQL 主入口也不再展示陈旧 Primary 作为可用端点。卸载弹窗新增“密码一致”选项，可用一个密码填充所有目标服务器。
+- 问题：用户反馈 MySQL 全部重启后服务进程已 running，但 InnoDB Cluster 没有自动加入，要求页面增加“启动集群”操作。
+- 结论：数据库页 MySQL InnoDB Cluster 卡片新增“启动集群”按钮，提交 `/api/v2/database/mysql/clusters/start` 异步任务；后端通过 MySQL 模块调用 mysqlsh `dba.rebootClusterFromCompleteOutage` 并 rejoin 节点，随后检测 Primary 并把集群节点状态更新为 running。验证通过：pnpm test、pnpm web:build、git diff --check。

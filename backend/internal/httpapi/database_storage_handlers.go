@@ -1,12 +1,16 @@
 package httpapi
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strings"
 
+	"aifar-deployment/backend/internal/apps/registry"
 	"aifar-deployment/backend/internal/i18n"
 	"aifar-deployment/backend/internal/store"
+	"aifar-deployment/backend/internal/worker"
 
 	"github.com/go-chi/chi/v5"
 )
@@ -24,6 +28,114 @@ func (a *API) databaseInstances(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, http.StatusOK, out)
+}
+
+func (a *API) startMySQLCluster(w http.ResponseWriter, r *http.Request) {
+	lang := languageFromRequest(r)
+	var req startMySQLClusterRequest
+	if !decode(w, r, &req) {
+		return
+	}
+	if strings.TrimSpace(req.Language) != "" {
+		lang = req.Language
+	}
+	ids := cleanStringIDs(req.InstanceIDs)
+	if len(ids) == 0 {
+		writeError(w, http.StatusBadRequest, "IDS_REQUIRED", i18n.Text(lang, "api.idsRequired"), nil)
+		return
+	}
+	module, ok := a.apps.Get("mysql")
+	if !ok {
+		writeError(w, http.StatusNotFound, "APP_BACKEND_MODULE_MISSING", i18n.Text(lang, "api.appBackendMissing"), map[string]any{"app": "mysql"})
+		return
+	}
+	clusterModule, ok := module.(registry.ClusterStartModule)
+	if !ok {
+		writeError(w, http.StatusConflict, "MYSQL_CLUSTER_START_UNSUPPORTED", i18n.Text(lang, "api.mysqlClusterStartUnsupported"), map[string]any{"app": "mysql"})
+		return
+	}
+
+	instances := make([]store.AppInstance, 0, len(ids))
+	servers := make([]store.Server, 0, len(ids))
+	serverSeen := map[string]bool{}
+	clusterKey := ""
+	for _, id := range ids {
+		instance, err := a.store.GetAppInstance(id)
+		if err != nil {
+			respond(w, nil, err)
+			return
+		}
+		if instance.App != "mysql" || appInstanceTopology(instance) != "innodb-cluster" {
+			writeError(w, http.StatusBadRequest, "MYSQL_CLUSTER_REQUIRED", i18n.Text(lang, "api.mysqlClusterRequired"), map[string]any{"instanceId": id})
+			return
+		}
+		key := mysqlClusterKey(instance)
+		if clusterKey == "" {
+			clusterKey = key
+		}
+		if key == "" || key != clusterKey {
+			writeError(w, http.StatusBadRequest, "MYSQL_CLUSTER_MIXED", i18n.Text(lang, "api.mysqlClusterMixed"), nil)
+			return
+		}
+		if strings.TrimSpace(instance.ServerID) == "" {
+			writeError(w, http.StatusBadRequest, "INSTANCE_SERVER_REQUIRED", i18n.Text(lang, "api.instanceServerRequired"), map[string]any{"instanceId": id})
+			return
+		}
+		if !serverSeen[instance.ServerID] {
+			server, err := a.store.GetServer(instance.ServerID, true)
+			if err != nil {
+				respond(w, nil, err)
+				return
+			}
+			servers = append(servers, server)
+			serverSeen[instance.ServerID] = true
+		}
+		instances = append(instances, instance)
+	}
+
+	targets := make([]string, 0, len(servers))
+	for _, server := range servers {
+		targets = append(targets, server.ID)
+	}
+	target := strings.Join(targets, ",")
+	actor := currentUser(r).Username
+	clusterReq := registry.ClusterStartRequest{
+		Instances:       instances,
+		Servers:         servers,
+		Language:        lang,
+		Actor:           actor,
+		DefaultPassword: a.cfg.DefaultPassword,
+	}
+	task, err := a.tasks.StartWithLanguage("database.mysql.cluster.start", target, actor, lang, func(ctx context.Context, log worker.Logger) error {
+		plan, err := clusterModule.PlanClusterStart(ctx, clusterReq)
+		if err != nil {
+			return err
+		}
+		plannedTargets := map[string]bool{}
+		for _, step := range plan {
+			if step.Target != "" && !plannedTargets[step.Target] {
+				log.PlanTarget(step.Target)
+				plannedTargets[step.Target] = true
+			}
+			log.PlanStep(step.Target, step.Name, step.Title, step.Order)
+		}
+		log.Info(i18n.Text(lang, "api.mysqlClusterStartRequested"), target)
+		if err := clusterModule.StartCluster(ctx, clusterReq, registry.RunContext{
+			Log:         log,
+			Concurrency: a.store.DeploymentConcurrency(a.cfg.DeploymentConcurrency),
+			TargetLog: func(target string) registry.Logger {
+				return log.Target(target)
+			},
+		}); err != nil {
+			return err
+		}
+		log.Info(i18n.Text(lang, "api.mysqlClusterStartCompleted"), len(instances))
+		return nil
+	})
+	if err == nil {
+		a.audit(r, "database.mysql.cluster.start", target, "running", task.ID)
+	}
+	respondTask(w, task, err)
 }
 
 func (a *API) storageInstances(w http.ResponseWriter, r *http.Request) {
@@ -142,4 +254,33 @@ func storageKind(name string) string {
 	default:
 		return name
 	}
+}
+
+func appInstanceTopology(instance store.AppInstance) string {
+	if value := strings.TrimSpace(instance.Topology); value != "" {
+		return strings.ToLower(value)
+	}
+	return strings.ToLower(appInstanceMetadataValue(instance, "topology"))
+}
+
+func mysqlClusterKey(instance store.AppInstance) string {
+	if value := appInstanceMetadataValue(instance, "clusterId"); value != "" {
+		return "id:" + value
+	}
+	if value := appInstanceMetadataValue(instance, "clusterName"); value != "" {
+		return "name:" + strings.ToLower(value)
+	}
+	return ""
+}
+
+func appInstanceMetadataValue(instance store.AppInstance, key string) string {
+	metadata := map[string]any{}
+	if err := json.Unmarshal([]byte(instance.Metadata), &metadata); err != nil {
+		return ""
+	}
+	value := strings.TrimSpace(fmt.Sprint(metadata[key]))
+	if value == "<nil>" {
+		return ""
+	}
+	return value
 }

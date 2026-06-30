@@ -98,6 +98,7 @@ func New(cfg config.Config, s *store.Store, tasks *worker.Manager) *API {
 			r.Get("/containers/{id}/logs", api.containerLogs)
 			r.Get("/database/instances", api.databaseInstances)
 			r.Post("/database/mysql/install", api.requirePermission(rbac.DatabaseManage, api.installNamedApp("mysql")))
+			r.Post("/database/mysql/clusters/start", api.requirePermission(rbac.DatabaseManage, api.startMySQLCluster))
 			r.Post("/database/redis/install", api.requirePermission(rbac.DatabaseManage, api.installNamedApp("redis")))
 			r.Get("/storage/instances", api.storageInstances)
 			r.Post("/storage/instances", api.requirePermission(rbac.StorageManage, api.createStorageInstance))
@@ -174,6 +175,11 @@ type deleteAppInstancesRequest struct {
 	Language           string            `json:"language"`
 	Parameters         map[string]any    `json:"parameters"`
 	RemoveMountedDisks *bool             `json:"removeMountedDisks"`
+}
+
+type startMySQLClusterRequest struct {
+	InstanceIDs []string `json:"instanceIds"`
+	Language    string   `json:"language"`
 }
 
 type installAppRequest struct {

@@ -102,6 +102,49 @@ func (s Service) markInnoDBClusterPrimary(instance store.AppInstance, primaryEnd
 	return nil
 }
 
+func (s Service) markInnoDBClusterStarted(instance store.AppInstance, primaryEndpoint string, details map[string]any) error {
+	instances, err := s.store.ListAppInstances()
+	if err != nil {
+		return err
+	}
+	matched := false
+	detectedAt := time.Now().UTC().Format(time.RFC3339)
+	for _, candidate := range instances {
+		if !sameMySQLCluster(instance, candidate) {
+			continue
+		}
+		matched = true
+		metadata := appMetadata(candidate)
+		metadata["currentPrimaryEndpoint"] = primaryEndpoint
+		metadata["primaryEndpoint"] = primaryEndpoint
+		metadata["primaryDetectedAt"] = detectedAt
+		if normalizeEndpoint(metadataString(metadata, "endpoint")) == normalizeEndpoint(primaryEndpoint) {
+			metadata["role"] = "primary"
+		} else {
+			metadata["role"] = "secondary"
+		}
+		metadata["topology"] = "innodb-cluster"
+		metadata["lastCheck"] = map[string]any{
+			"status":    "running",
+			"checkedAt": detectedAt,
+			"details":   details,
+		}
+		data, _ := json.Marshal(metadata)
+		candidate.Metadata = string(data)
+		candidate.Status = "running"
+		if candidate.Topology == "" {
+			candidate.Topology = "innodb-cluster"
+		}
+		if _, err := s.store.SaveAppInstance(candidate); err != nil {
+			return err
+		}
+	}
+	if !matched {
+		return s.markInstanceStatus(instance, "running", details)
+	}
+	return nil
+}
+
 func (s Service) markInstanceStatus(instance store.AppInstance, status string, details map[string]any) error {
 	metadata := appMetadata(instance)
 	metadata["lastCheck"] = map[string]any{

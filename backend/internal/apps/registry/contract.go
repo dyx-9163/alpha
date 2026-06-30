@@ -149,6 +149,14 @@ type CheckRequest struct {
 	Actor    string
 }
 
+type ClusterStartRequest struct {
+	Instances       []store.AppInstance
+	Servers         []store.Server
+	Language        string
+	Actor           string
+	DefaultPassword string
+}
+
 type InstanceStatus struct {
 	Status  string         `json:"status"`
 	Message string         `json:"message,omitempty"`
@@ -193,4 +201,9 @@ type DeleteModule interface {
 type CheckModule interface {
 	PlanCheck(ctx context.Context, req CheckRequest) ([]InstallStepPlan, error)
 	Check(ctx context.Context, req CheckRequest, run RunContext) (InstanceStatus, error)
+}
+
+type ClusterStartModule interface {
+	PlanClusterStart(ctx context.Context, req ClusterStartRequest) ([]InstallStepPlan, error)
+	StartCluster(ctx context.Context, req ClusterStartRequest, run RunContext) error
 }
