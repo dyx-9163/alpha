@@ -66,3 +66,61 @@ func TestBuildCatalogRequiresRegisteredBackendModuleAndResource(t *testing.T) {
 		t.Fatalf("expected backend part to be present: %+v", docker.Parts)
 	}
 }
+
+type filteredModule struct{}
+
+func (filteredModule) Name() string { return "aifar" }
+
+func (filteredModule) Manifest(lang string) registry.Manifest {
+	return registry.Manifest{
+		Name:                   "aifar",
+		Title:                  "AIFAR Service",
+		Icon:                   "AF",
+		Category:               "devops",
+		CategoryLabel:          "Application",
+		SourceLabel:            "Docker Compose bundle",
+		InstallName:            "aifar",
+		ResourceApp:            "aifar",
+		ResourceVersionPattern: "^docker-apps$",
+		RequiresServer:         true,
+		BackendReady:           true,
+		RequiredResourceParts:  []string{"backend"},
+	}
+}
+
+func (filteredModule) ValidateInstall(ctx context.Context, req registry.InstallRequest, resources []store.Resource) error {
+	return nil
+}
+
+func (filteredModule) PreflightInstall(ctx context.Context, req registry.InstallRequest, resources []store.Resource) (registry.PreflightResult, error) {
+	return registry.PreflightResult{}, nil
+}
+
+func (filteredModule) PlanInstall(ctx context.Context, req registry.InstallRequest, resources []store.Resource) ([]registry.InstallStepPlan, error) {
+	return nil, nil
+}
+
+func (filteredModule) Install(ctx context.Context, req registry.InstallRequest, run registry.RunContext) error {
+	return nil
+}
+
+func TestBuildCatalogFiltersResourceVersions(t *testing.T) {
+	resources := []store.Resource{
+		{App: "aifar", Version: "docker-apps", Part: "backend", Path: "docker-apps/.env"},
+		{App: "aifar", Version: "docker-sql", Part: "backend", Path: "docker-sql/init.sql"},
+	}
+	catalog := BuildWithModules(resources, []registry.Module{filteredModule{}}, "en")
+	item := catalog["aifar"]
+	if len(item.Versions) != 1 || item.Versions[0] != "docker-apps" {
+		t.Fatalf("expected only docker-apps version, got %+v", item.Versions)
+	}
+	def := DefinitionFromManifest(filteredModule{}.Manifest("en"))
+	selected, matched := ResolveResources(def, resources, "latest")
+	if selected != "docker-apps" || len(matched) != 1 || matched[0].Version != "docker-apps" {
+		t.Fatalf("expected latest to resolve to docker-apps only, selected=%s matched=%+v", selected, matched)
+	}
+	_, matched = ResolveResources(def, resources, "docker-sql")
+	if len(matched) != 0 {
+		t.Fatalf("expected docker-sql to be filtered out, got %+v", matched)
+	}
+}

@@ -35,6 +35,7 @@ export interface BackendCatalogItem {
   description?: string
   installName?: string
   resourceApp?: string
+  resourceVersionPattern?: string
   requiresServer?: boolean
   backendReady?: boolean
   frontendReady?: boolean

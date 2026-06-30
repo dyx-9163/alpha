@@ -39,22 +39,23 @@ type Topology struct {
 }
 
 type Manifest struct {
-	Name                  string
-	Title                 string
-	Icon                  string
-	Category              string
-	CategoryLabel         string
-	SourceLabel           string
-	FallbackVersion       string
-	Description           string
-	InstallName           string
-	ResourceApp           string
-	RequiresServer        bool
-	SupportsMultiTarget   bool
-	BackendReady          bool
-	RequiredResourceParts []string
-	Capabilities          []string
-	Topologies            []Topology
+	Name                   string
+	Title                  string
+	Icon                   string
+	Category               string
+	CategoryLabel          string
+	SourceLabel            string
+	FallbackVersion        string
+	Description            string
+	InstallName            string
+	ResourceApp            string
+	ResourceVersionPattern string
+	RequiresServer         bool
+	SupportsMultiTarget    bool
+	BackendReady           bool
+	RequiredResourceParts  []string
+	Capabilities           []string
+	Topologies             []Topology
 }
 
 func (m Manifest) SelectedTopology(name string) (Topology, bool) {
