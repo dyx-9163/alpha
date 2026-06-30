@@ -6,6 +6,7 @@ import (
 	"text/template"
 
 	"aifar-deployment/backend/internal/installer/installerkit"
+	"aifar-deployment/backend/internal/installer/selinux"
 )
 
 //go:embed templates/standalone/install.sh
@@ -17,10 +18,9 @@ var standaloneUninstallScriptTemplate string
 //go:embed templates/distributed/configure-node.sh
 var distributedConfigureScriptTemplate string
 
-var minioScriptFuncs = template.FuncMap{
-	"shq":                  installerkit.ShellQuote,
-	"serviceAccessHelpers": installerkit.ServiceAccessHelpers,
-}
+var minioScriptFuncs = selinux.AddTemplateFuncs(template.FuncMap{
+	"shq": installerkit.ShellQuote,
+})
 
 func installStandaloneScript(req InstallScriptRequest) (string, error) {
 	req = normalizeInstallScriptRequest(req)

@@ -5,6 +5,7 @@ import (
 	"text/template"
 
 	"aifar-deployment/backend/internal/installer/installerkit"
+	"aifar-deployment/backend/internal/installer/selinux"
 )
 
 //go:embed templates/install.sh
@@ -13,10 +14,9 @@ var routerInstallScriptTemplate string
 //go:embed templates/uninstall.sh
 var routerUninstallScriptTemplate string
 
-var mysqlRouterScriptFuncs = template.FuncMap{
-	"shq":                  installerkit.ShellQuote,
-	"serviceAccessHelpers": installerkit.ServiceAccessHelpers,
-}
+var mysqlRouterScriptFuncs = selinux.AddTemplateFuncs(template.FuncMap{
+	"shq": installerkit.ShellQuote,
+})
 
 func installRouterScript(req RouterInstallScriptRequest) (string, error) {
 	return installerkit.RenderTemplate("mysql-router", "install.sh", "mysql-router-install", routerInstallScriptTemplate, mysqlRouterScriptFuncs, req)

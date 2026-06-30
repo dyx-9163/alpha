@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"aifar-deployment/backend/internal/installer/installerkit"
+	"aifar-deployment/backend/internal/installer/selinux"
 	"aifar-deployment/backend/internal/installer/uploadkit"
 	"aifar-deployment/backend/internal/store"
 )
@@ -377,10 +378,9 @@ func renderInstallScript(data installScriptData) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return installerkit.RenderTemplate(AppName, "install.sh", "aifar-install", string(content), template.FuncMap{
-		"quote":                shellQuoteAny,
-		"serviceAccessHelpers": installerkit.ServiceAccessHelpers,
-	}, data)
+	return installerkit.RenderTemplate(AppName, "install.sh", "aifar-install", string(content), selinux.AddTemplateFuncs(template.FuncMap{
+		"quote": shellQuoteAny,
+	}), data)
 }
 
 func renderUninstallScript(data uninstallScriptData) (string, error) {

@@ -6,6 +6,7 @@ import (
 	"text/template"
 
 	"aifar-deployment/backend/internal/installer/installerkit"
+	"aifar-deployment/backend/internal/installer/selinux"
 )
 
 //go:embed templates/install.sh
@@ -14,10 +15,9 @@ var installScriptTemplate string
 //go:embed templates/uninstall.sh
 var uninstallScriptTemplate string
 
-var dockerScriptFuncs = template.FuncMap{
-	"shq":                  installerkit.ShellQuote,
-	"serviceAccessHelpers": installerkit.ServiceAccessHelpers,
-}
+var dockerScriptFuncs = selinux.AddTemplateFuncs(template.FuncMap{
+	"shq": installerkit.ShellQuote,
+})
 
 type installScriptData struct {
 	Version       string

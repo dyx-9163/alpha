@@ -5,6 +5,7 @@ import (
 	"text/template"
 
 	"aifar-deployment/backend/internal/installer/installerkit"
+	"aifar-deployment/backend/internal/installer/selinux"
 )
 
 //go:embed templates/standalone/install.sh
@@ -25,10 +26,9 @@ var clusterEnableNodeScriptTemplate string
 //go:embed templates/cluster/bootstrap.sh
 var clusterBootstrapScriptTemplate string
 
-var redisScriptFuncs = template.FuncMap{
-	"shq":                  installerkit.ShellQuote,
-	"serviceAccessHelpers": installerkit.ServiceAccessHelpers,
-}
+var redisScriptFuncs = selinux.AddTemplateFuncs(template.FuncMap{
+	"shq": installerkit.ShellQuote,
+})
 
 type standaloneInstallScriptData struct {
 	Version      string

@@ -5,6 +5,7 @@ import (
 	"text/template"
 
 	"aifar-deployment/backend/internal/installer/installerkit"
+	"aifar-deployment/backend/internal/installer/selinux"
 )
 
 //go:embed templates/standalone/install.sh
@@ -16,10 +17,9 @@ var standaloneUninstallScriptTemplate string
 //go:embed templates/innodb-cluster/bootstrap.sh
 var innodbClusterBootstrapScriptTemplate string
 
-var mysqlScriptFuncs = template.FuncMap{
-	"shq":                  installerkit.ShellQuote,
-	"serviceAccessHelpers": installerkit.ServiceAccessHelpers,
-}
+var mysqlScriptFuncs = selinux.AddTemplateFuncs(template.FuncMap{
+	"shq": installerkit.ShellQuote,
+})
 
 func installStandaloneScript(req InstallScriptRequest) (string, error) {
 	return installerkit.RenderTemplate("mysql", "standalone/install.sh", "mysql-standalone-install", standaloneInstallScriptTemplate, mysqlScriptFuncs, req)
