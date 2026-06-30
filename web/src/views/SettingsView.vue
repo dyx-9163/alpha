@@ -63,11 +63,11 @@
       </KeyValueGrid>
 
       <h2 class="settings-title">{{ t('settings.moduleStatus') }}</h2>
-      <el-table :data="moduleRows">
-        <el-table-column prop="module" :label="t('common.module')" />
-        <el-table-column :label="t('common.status')"><template #default><span class="status-pill success">{{ t('settings.connected') }}</span></template></el-table-column>
-        <el-table-column :label="t('common.provider')"><template #default>{{ t('common.real') }}</template></el-table-column>
-        <el-table-column prop="message" :label="t('common.message')" />
+      <el-table :data="moduleRows" :fit="false">
+        <el-table-column prop="module" :label="t('common.module')" width="160" />
+        <el-table-column :label="t('common.status')" width="140"><template #default><span class="status-pill success">{{ t('settings.connected') }}</span></template></el-table-column>
+        <el-table-column :label="t('common.provider')" width="140"><template #default>{{ t('common.real') }}</template></el-table-column>
+        <el-table-column prop="message" :label="t('common.message')" width="520" show-overflow-tooltip />
         <el-table-column prop="time" :label="t('common.time')" width="190" />
       </el-table>
     </div>

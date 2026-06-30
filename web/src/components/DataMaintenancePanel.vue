@@ -27,6 +27,7 @@
       row-key="name"
       :height="260"
       :loading="backupsLoading"
+      :fit="false"
     >
       <template #toolbar>
         <el-button size="small" :disabled="!canManage" @click="refresh">{{ t('common.refresh') }}</el-button>
@@ -112,11 +113,11 @@ const maintenanceItems = computed(() => [
   { key: 'taskRetentionDays', label: t('settings.taskRetention'), value: formatRetentionDays(props.taskRetentionDays) }
 ])
 const backupColumns = computed(() => [
-  { prop: 'name', label: t('settings.backupName'), minWidth: 240 },
-  { prop: 'size', label: t('settings.backupSize'), width: 120, slot: 'size' },
-  { prop: 'sha256', label: t('settings.backupChecksum'), minWidth: 240 },
+  { prop: 'name', label: t('settings.backupName'), width: 280 },
+  { prop: 'size', label: t('settings.backupSize'), width: 110, slot: 'size' },
+  { prop: 'sha256', label: t('settings.backupChecksum'), width: 360 },
   { prop: 'createdAt', label: t('common.time'), width: 190, slot: 'createdAt' },
-  { label: t('common.operation'), width: 230, slot: 'action', fixed: 'right' as const }
+  { label: t('common.operation'), width: 230, slot: 'action' }
 ])
 
 async function refresh() {

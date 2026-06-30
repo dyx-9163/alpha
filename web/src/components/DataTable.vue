@@ -9,6 +9,7 @@
       :data="rows"
       :height="height"
       :row-key="rowKey"
+      :fit="fit"
       @selection-change="emit('selectionChange', $event)"
     >
       <el-table-column
@@ -59,9 +60,11 @@ const props = withDefaults(defineProps<{
   rowKey?: string
   height?: string | number
   loading?: boolean
+  fit?: boolean
 }>(), {
   rowKey: 'id',
-  height: '100%'
+  height: '100%',
+  fit: true
 })
 
 const emit = defineEmits<{

@@ -22,6 +22,7 @@
       row-key="username"
       :height="260"
       :loading="loading"
+      :fit="false"
     >
       <template #toolbar>
         <el-button size="small" :disabled="!canManage" @click="refresh">{{ t('common.refresh') }}</el-button>
@@ -109,11 +110,11 @@ const users = ref<UserSummary[]>([])
 const userForm = reactive({ username: '', password: '', role: 'viewer' })
 
 const columns = computed(() => [
-  { prop: 'username', label: t('settings.accountUsername'), minWidth: 160 },
+  { prop: 'username', label: t('settings.accountUsername'), width: 240 },
   { prop: 'role', label: t('settings.accountRole'), width: 170, slot: 'role' },
   { prop: 'tokenVersion', label: t('settings.tokenVersion'), width: 130 },
   { prop: 'createdAt', label: t('common.time'), width: 190, slot: 'createdAt' },
-  { label: t('common.operation'), width: 150, slot: 'action', fixed: 'right' as const }
+  { label: t('common.operation'), width: 150, slot: 'action' }
 ])
 const dialogTitle = computed(() => dialogMode.value === 'create' ? t('settings.addUser') : t('settings.resetPasswordFor', { username: selectedUsername.value }))
 
