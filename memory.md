@@ -247,3 +247,5 @@
 - 结论：SELinux 工具模块新增 ensure_semanage 流程：需要 semanage 时先尝试从 AIFAR_SELINUX_RPM_DIR 或 WORK_DIR/rpms 安装本地 RPM，再尝试 dnf/yum 安装 policycoreutils-python-utils 或 RHEL7 的 policycoreutils-python；仍缺失时输出明确离线依赖提示并跳过规则写入。验证通过：go test ./internal/installer/selinux、go test ./...、pnpm test。
 - 问题：用户反馈 MinIO 安装成功后关闭 SELinux 仍无法登录，Console 页面提示 invalid login。
 - 结论：能打开 MinIO Console 且提示 invalid login，说明网络、端口和 SELinux 基本不是当前阻塞点；应优先排查 systemd 实际加载的 MINIO_ROOT_USER/MINIO_ROOT_PASSWORD、是否改过 env 未重启、是否复用了旧数据目录或分布式节点 env 不一致。
+- 问题：用户反馈 MinIO 安装第 4/5 步上传 Go module cache 时失败，错误为 EOF。
+- 结论：该错误发生在 SSH 文件上传阶段，属于大文件传输链路被中断而不是 MinIO 编译脚本内部报错；uploadkit 已对 EOF、broken pipe、connection reset/timeout 等瞬时上传错误增加自动重试，并让 SSH 上传失败时携带远端 stderr，便于区分磁盘空间、权限等永久故障。

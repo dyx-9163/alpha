@@ -88,6 +88,8 @@ func UploadSSHFile(ctx context.Context, server store.Server, localPath, remotePa
 		return err
 	}
 	tmpPath := remotePath + ".uploading"
+	var stderr bytes.Buffer
+	session.Stderr = &stderr
 	command := fmt.Sprintf("mkdir -p %s && cat > %s && chmod %04o %s && mv -f %s %s",
 		shellQuote(filepath.ToSlash(filepath.Dir(remotePath))),
 		shellQuote(tmpPath),
@@ -104,12 +106,12 @@ func UploadSSHFile(ctx context.Context, server store.Server, localPath, remotePa
 	closeErr := stdin.Close()
 	runErr := <-errCh
 	if copyErr != nil {
-		return copyErr
+		return uploadError(copyErr, stderr.String())
 	}
 	if closeErr != nil {
-		return closeErr
+		return uploadError(closeErr, stderr.String())
 	}
-	return runErr
+	return uploadError(runErr, stderr.String())
 }
 
 func dialSSH(ctx context.Context, server store.Server) (*ssh.Client, error) {
@@ -152,4 +154,15 @@ func shellQuote(value string) string {
 		return "''"
 	}
 	return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
+}
+
+func uploadError(err error, stderr string) error {
+	if err == nil {
+		return nil
+	}
+	stderr = strings.TrimSpace(stderr)
+	if stderr == "" {
+		return err
+	}
+	return fmt.Errorf("%w: %s", err, stderr)
 }

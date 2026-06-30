@@ -11,10 +11,12 @@ import (
 )
 
 type fakeRemote struct {
-	local  string
-	remote string
-	mode   os.FileMode
-	err    error
+	local   string
+	remote  string
+	mode    os.FileMode
+	err     error
+	errs    []error
+	uploads int
 }
 
 func (f *fakeRemote) Run(ctx context.Context, server store.Server, command string) (adapter.CommandResult, error) {
@@ -25,6 +27,12 @@ func (f *fakeRemote) UploadFile(ctx context.Context, server store.Server, localP
 	f.local = localPath
 	f.remote = remotePath
 	f.mode = mode
+	f.uploads++
+	if len(f.errs) > 0 {
+		err := f.errs[0]
+		f.errs = f.errs[1:]
+		return err
+	}
 	return f.err
 }
 
@@ -71,6 +79,44 @@ func TestUploadWrapsFailureMessage(t *testing.T) {
 	}, nil)
 	if err == nil || err.Error() != "upload local.tar failed: denied" {
 		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestUploadRetriesTransientFailure(t *testing.T) {
+	oldDelay := uploadRetryDelay
+	uploadRetryDelay = 0
+	t.Cleanup(func() { uploadRetryDelay = oldDelay })
+
+	remote := &fakeRemote{errs: []error{errors.New("EOF"), nil}}
+	err := Upload(context.Background(), remote, store.Server{}, File{
+		LocalPath:      "local.tar",
+		RemotePath:     "/remote/local.tar",
+		FailureMessage: "upload failed",
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if remote.uploads != 2 {
+		t.Fatalf("expected two upload attempts, got %d", remote.uploads)
+	}
+}
+
+func TestUploadDoesNotRetryPermanentFailure(t *testing.T) {
+	oldDelay := uploadRetryDelay
+	uploadRetryDelay = 0
+	t.Cleanup(func() { uploadRetryDelay = oldDelay })
+
+	remote := &fakeRemote{err: errors.New("no space left on device")}
+	err := Upload(context.Background(), remote, store.Server{}, File{
+		LocalPath:      "local.tar",
+		RemotePath:     "/remote/local.tar",
+		FailureMessage: "upload failed",
+	}, nil)
+	if err == nil {
+		t.Fatal("expected upload failure")
+	}
+	if remote.uploads != 1 {
+		t.Fatalf("expected one upload attempt, got %d", remote.uploads)
 	}
 }
 
