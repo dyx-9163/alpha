@@ -38,8 +38,8 @@ const targets = [
     binary: 'aifar-server-linux-amd64',
     archive: 'tar.gz',
     runtimeFiles: [
-      { source: 'deploy/deployment/start.sh', target: 'start.sh', executable: true },
-      { source: 'deploy/deployment/stop.sh', target: 'stop.sh', executable: true }
+      { source: 'scripts/start.sh', target: 'start.sh', executable: true },
+      { source: 'scripts/stop.sh', target: 'stop.sh', executable: true }
     ]
   },
   {
@@ -48,8 +48,8 @@ const targets = [
     binary: 'aifar-server-windows-amd64.exe',
     archive: 'zip',
     runtimeFiles: [
-      { source: 'deploy/deployment/start.ps1', target: 'start.ps1' },
-      { source: 'deploy/deployment/start.bat', target: 'start.bat' }
+      { source: 'scripts/start.ps1', target: 'start.ps1' },
+      { source: 'scripts/start.bat', target: 'start.bat' }
     ]
   }
 ]

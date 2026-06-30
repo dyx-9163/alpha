@@ -225,3 +225,7 @@
 ## 2026-06-30
 - 问题：用户询问 env.bat 和 env.ps1 的作用，若无用则删除。
 - 结论：env.bat/env.ps1 只是旧的本地 D:\tools PATH/GOROOT/GOPATH/GOCACHE 便捷脚本，当前已由 scripts/toolchain.mjs、scripts/package.ps1/sh 和 AIFAR_TOOL_ROOT/AIFAR_GO_CACHE 配置覆盖；已删除这两个脚本，并将 setup-dev 提示改为使用 AIFAR_TOOL_ROOT。验证通过：rg 无残留引用、pnpm test、git diff --check。
+
+## 2026-06-30
+- 问题：用户觉得 deploy/deployment 下的 start.bat、start.ps1、start.sh、stop.sh 放置奇怪，要求移到 scripts。
+- 结论：四个运行启动模板已移动到 scripts/，scripts/package-release.mjs 改为从 scripts/start.* 和 scripts/stop.sh 复制到最终发布包根目录；deploy/deployment 只保留生成出来的包目录和归档。验证通过：node scripts/package-release.mjs、pnpm test、git diff --check。
