@@ -225,6 +225,28 @@ onMounted(load)
 </script>
 
 <style scoped>
+.dashboard-page {
+  overflow-x: hidden;
+  overflow-y: scroll;
+  padding-right: 6px;
+  scrollbar-gutter: stable;
+  scrollbar-width: auto;
+}
+
+.dashboard-page::-webkit-scrollbar {
+  width: 10px;
+}
+
+.dashboard-page::-webkit-scrollbar-thumb {
+  border: 2px solid rgba(255, 255, 255, .7);
+  border-radius: 999px;
+  background: rgba(86, 101, 124, .42);
+}
+
+.dashboard-page::-webkit-scrollbar-track {
+  background: rgba(238, 243, 249, .68);
+}
+
 .dashboard-kpis {
   margin-bottom: 0;
 }
