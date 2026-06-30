@@ -275,3 +275,5 @@
 - 结论：MySQL 集群检测在 `mysqladmin ping` 成功后记录 `runtimeStatus=running`，即使后续 Primary 检测失败也保留该基础服务状态；数据库页“启动集群”按钮改为仅当 3 个 MySQL 节点 runtime 都为 offline 时可用。验证通过：pnpm test、pnpm web:build、git diff --check。
 - 问题：用户反馈 Redis Sentinel 页面没有把副本节点展示出来。
 - 结论：数据库页 Redis Sentinel 节点角色优先展示 Redis 数据角色 master/replica，再展示哨兵标记；同一服务器同时跑 Redis 与 Sentinel 时不再被单纯标成哨兵，端点展示 Redis 数据端口。验证通过：pnpm web:build、git diff --check。
+- 问题：用户澄清 Redis Sentinel 是三台都安装哨兵，其中两台同时安装 master/副本，不能把数据节点和哨兵合并成一行展示。
+- 结论：数据库页 Redis Sentinel 改为分开展示 Redis 数据节点和 Sentinel 节点；数据区只显示 master/replica 及 6379，Sentinel 区显示三台哨兵及 26379，并分别统计节点数和哨兵数。验证通过：pnpm web:build、git diff --check。

@@ -31,6 +31,7 @@
             <span class="status-pill">MySQL {{ mysqlGroupCount }}</span>
             <span class="status-pill">Redis {{ redisGroupCount }}</span>
             <span class="status-pill">{{ t('database.nodes') }} {{ databaseNodeCount }}</span>
+            <span v-if="sentinelNodeCount" class="status-pill">{{ roleLabel('sentinel') }} {{ sentinelNodeCount }}</span>
             <span v-if="routerInstanceCount" class="status-pill">{{ t('database.mysqlRouter') }} {{ routerInstanceCount }}</span>
           </div>
           <div class="monitor-actions">
@@ -81,6 +82,11 @@
               <div><span>{{ t('dashboard.topology') }}</span><strong>{{ group.topology || '-' }}</strong></div>
               <div><span>{{ t('common.version') }}</span><strong>{{ group.version }}</strong></div>
               <div><span>{{ t('database.nodes') }}</span><strong>{{ group.nodes.length }}</strong></div>
+              <div v-if="group.sentinels.length">
+                <span>{{ roleLabel('sentinel') }}</span>
+                <strong>{{ group.sentinels.length }}</strong>
+                <StatusTag class="db-grid-tag" :status="group.sentinelStatus" />
+              </div>
               <div class="db-grid-wide"><span>{{ groupEndpointLabel(group) }}</span><strong>{{ group.endpoint || '-' }}</strong></div>
               <div><span>{{ t('common.status') }}</span><StatusTag :status="group.status" /></div>
               <div v-if="group.routers.length">
@@ -92,7 +98,7 @@
             </div>
             <div v-if="isUnavailable(group.nodeStatus)" class="service-notice danger">{{ t('database.mysqlServiceUnavailable') }}</div>
             <div v-if="isUnavailable(group.routerStatus)" class="service-notice danger">{{ t('database.routerServiceUnavailable') }}</div>
-            <div class="node-list">
+            <div v-if="group.nodes.length" class="node-list">
               <div v-for="node in group.nodes" :key="node.instance.id" class="node-row">
                 <div class="node-main">
                   <strong>{{ node.serverLabel }}</strong>
@@ -100,9 +106,26 @@
                 </div>
                 <div class="node-tags">
                   <el-tag size="small" :type="roleTagType(node.role)" effect="plain">{{ node.roleLabel }}</el-tag>
-                  <el-tag v-if="nodeRunsSentinel(node) && node.role !== 'sentinel'" size="small" type="warning" effect="plain">{{ roleLabel('sentinel') }}</el-tag>
                   <el-tag size="small" :type="nodeHealthType(node)">{{ nodeHealthLabel(node) }}</el-tag>
                   <el-tooltip v-if="showNodeDeleteButton(group)" :content="deniedText" :disabled="canManageApps" placement="top">
+                    <span>
+                      <el-button size="small" type="danger" plain :disabled="!canManageApps" @click="openDeleteNodes([node], 'single')">{{ t('common.uninstall') }}</el-button>
+                    </span>
+                  </el-tooltip>
+                </div>
+              </div>
+            </div>
+            <div v-if="group.sentinels.length" class="router-list">
+              <div class="section-label">{{ roleLabel('sentinel') }}</div>
+              <div v-for="node in group.sentinels" :key="`sentinel-${node.instance.id}`" class="node-row router-row">
+                <div class="node-main">
+                  <strong>{{ node.serverLabel }}</strong>
+                  <span>{{ node.endpoint || '-' }}</span>
+                </div>
+                <div class="node-tags">
+                  <el-tag size="small" :type="roleTagType(node.role)" effect="plain">{{ node.roleLabel }}</el-tag>
+                  <el-tag size="small" :type="nodeHealthType(node)">{{ nodeHealthLabel(node) }}</el-tag>
+                  <el-tooltip v-if="showSentinelDeleteButton(group, node)" :content="deniedText" :disabled="canManageApps" placement="top">
                     <span>
                       <el-button size="small" type="danger" plain :disabled="!canManageApps" @click="openDeleteNodes([node], 'single')">{{ t('common.uninstall') }}</el-button>
                     </span>
@@ -227,10 +250,12 @@ type DatabaseGroup = {
   status: string
   nodeStatus: string
   routerStatus: string
+  sentinelStatus: string
   createdAt: string
   metadata: InstanceMetadata
   nodes: DatabaseNode[]
   routers: DatabaseNode[]
+  sentinels: DatabaseNode[]
 }
 
 type DeleteScopeKind = 'single' | 'mysql-cluster' | 'mysql-router'
@@ -264,7 +289,8 @@ let monitorTimer: ReturnType<typeof setInterval> | undefined
 const monitorIntervalMs = 30000
 const mysqlGroupCount = computed(() => instanceGroups.value.filter((item) => item.app === 'mysql').length)
 const redisGroupCount = computed(() => instanceGroups.value.filter((item) => item.app === 'redis').length)
-const databaseNodeCount = computed(() => instances.value.filter((item) => item.app !== 'mysql-router').length)
+const databaseNodeCount = computed(() => instanceGroups.value.reduce((total, group) => total + group.nodes.length, 0))
+const sentinelNodeCount = computed(() => instanceGroups.value.reduce((total, group) => total + group.sentinels.length, 0))
 const routerInstanceCount = computed(() => instances.value.filter((item) => item.app === 'mysql-router').length)
 const canManageApps = computed(() => can(permissions.appsManage))
 const canManageDatabase = computed(() => can(permissions.databaseManage))
@@ -441,14 +467,25 @@ function groupDatabaseInstances(items: AppInstance[]) {
         status: item.status,
         nodeStatus: item.status,
         routerStatus: 'unknown',
+        sentinelStatus: 'unknown',
         createdAt: item.createdAt,
         metadata,
         nodes: [],
-        routers: []
+        routers: [],
+        sentinels: []
       }
       groups.set(key, group)
     }
-    group.nodes.push(node)
+    if (item.app === 'redis' && topology === 'sentinel') {
+      if (nodeRunsSentinel(node)) {
+        group.sentinels.push(redisSentinelNode(item, metadata))
+      }
+      if (node.role !== 'sentinel') {
+        group.nodes.push(node)
+      }
+    } else {
+      group.nodes.push(node)
+    }
     if (new Date(item.createdAt).getTime() > new Date(group.createdAt).getTime()) {
       group.createdAt = item.createdAt
     }
@@ -467,10 +504,12 @@ function groupDatabaseInstances(items: AppInstance[]) {
         status: routerNode.item.status,
         nodeStatus: 'unknown',
         routerStatus: routerNode.item.status,
+        sentinelStatus: 'unknown',
         createdAt: routerNode.item.createdAt,
         metadata: routerNode.metadata,
         nodes: [],
-        routers: []
+        routers: [],
+        sentinels: []
       }
       groups.set(key, group)
     }
@@ -485,15 +524,18 @@ function groupDatabaseInstances(items: AppInstance[]) {
       const normalizedGroup = {
         ...group,
         nodes: nodes.sort((a, b) => roleRank(a.role) - roleRank(b.role) || a.serverLabel.localeCompare(b.serverLabel)),
-        routers: group.routers.sort((a, b) => a.serverLabel.localeCompare(b.serverLabel))
+        routers: group.routers.sort((a, b) => a.serverLabel.localeCompare(b.serverLabel)),
+        sentinels: group.sentinels.sort((a, b) => a.serverLabel.localeCompare(b.serverLabel))
       }
       const nodeStatus = serviceStatus(normalizedGroup.nodes)
       const routerStatus = serviceStatus(normalizedGroup.routers)
+      const sentinelStatus = serviceStatus(normalizedGroup.sentinels)
       return {
         ...normalizedGroup,
         endpoint: isUnavailable(nodeStatus) ? t('database.serviceUnavailable') : groupEndpoint(normalizedGroup),
         nodeStatus,
         routerStatus,
+        sentinelStatus,
         status: groupStatus(nodeStatus, routerStatus, normalizedGroup.routers.length > 0)
       }
     })
@@ -545,6 +587,18 @@ function databaseNode(item: AppInstance, metadata: InstanceMetadata): DatabaseNo
     metadata,
     serverLabel: serverName(item.serverId),
     endpoint: nodeEndpoint(item, metadata),
+    role,
+    roleLabel: roleLabel(role)
+  }
+}
+
+function redisSentinelNode(item: AppInstance, metadata: InstanceMetadata): DatabaseNode {
+  const role = 'sentinel'
+  return {
+    instance: item,
+    metadata,
+    serverLabel: serverName(item.serverId),
+    endpoint: redisSentinelEndpoint(item, metadata),
     role,
     roleLabel: roleLabel(role)
   }
@@ -776,6 +830,14 @@ function nodeEndpoint(item: AppInstance, metadata: InstanceMetadata) {
   return `${host}:${numberValue(metadata.port) || defaultPort(item.app)}`
 }
 
+function redisSentinelEndpoint(item: AppInstance, metadata: InstanceMetadata) {
+  const host = serverHost(item.serverId)
+  if (!host) {
+    return '-'
+  }
+  return `${host}:${numberValue(metadata.sentinelPort) || 26379}`
+}
+
 function redisDataEndpoint(item: AppInstance, metadata: InstanceMetadata) {
   const endpoint = stringValue(metadata.endpoint)
   if (endpoint) {
@@ -842,6 +904,12 @@ function groupMetadataValue(group: DatabaseGroup, key: string) {
       return value
     }
   }
+  for (const node of group.sentinels) {
+    const value = stringValue(node.metadata[key])
+    if (value) {
+      return value
+    }
+  }
   return ''
 }
 
@@ -884,6 +952,9 @@ function isUnavailable(status: string) {
 
 function groupSubtitle(group: DatabaseGroup) {
   const parts = [`${group.topology || '-'}`, `${t('database.nodes')} ${group.nodes.length}`]
+  if (group.sentinels.length) {
+    parts.push(`${roleLabel('sentinel')} ${group.sentinels.length}`)
+  }
   if (group.routers.length) {
     parts.push(`${t('database.mysqlRouter')} ${group.routers.length}`)
   }
@@ -913,7 +984,8 @@ function groupSearchText(group: DatabaseGroup) {
     stringValue(group.metadata.masterName),
     routerEndpointSummary(group),
     ...group.nodes.flatMap((node) => [node.serverLabel, node.endpoint, node.roleLabel]),
-    ...group.routers.flatMap((node) => [node.serverLabel, node.endpoint, node.roleLabel])
+    ...group.routers.flatMap((node) => [node.serverLabel, node.endpoint, node.roleLabel]),
+    ...group.sentinels.flatMap((node) => [node.serverLabel, node.endpoint, node.roleLabel])
   ].join(' ').toLowerCase()
 }
 
@@ -996,6 +1068,10 @@ function hasRouterClusterDelete(group: DatabaseGroup) {
 
 function showNodeDeleteButton(group: DatabaseGroup) {
   return !(group.app === 'mysql' && group.topology === 'innodb-cluster')
+}
+
+function showSentinelDeleteButton(group: DatabaseGroup, node: DatabaseNode) {
+  return showNodeDeleteButton(group) && !redisSentinelDataRole(node.instance, node.metadata)
 }
 
 function openDeleteGroup(group: DatabaseGroup, kind: DeleteScopeKind) {
