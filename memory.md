@@ -217,3 +217,11 @@
 ## 2026-06-30
 - 问题：用户要求打包相关内容全部迁移到 deploy，包括 bin、dist 等中间产物，最终打出的包放到 deployment 中，但打包命令仍在工程最外层运行。
 - 结论：打包入口迁移为 deploy/package.ps1、deploy/package.sh、deploy/package-build.mjs、deploy/package-release.mjs；pnpm package 从根目录执行并输出中间产物到 deploy/bin 与 deploy/dist，最终运行包输出到 deploy/deployment；根目录旧 bin、dist、web/dist 已清理，包内仍保持 bin、web/dist、resources、config、启动脚本的标准运行结构。验证通过：pnpm package、pnpm test、git diff --check（仅换行风格提示）。
+
+## 2026-06-30
+- 问题：用户要求第一张图中的 package.ps1、package.sh、package-build.mjs、package-release.mjs 还原到原来的 scripts 位置，第二张图中的 start.bat、start.ps1、start.sh、stop.sh 放入 deployment 中。
+- 结论：package 相关脚本已恢复到 scripts/；运行启动模板已移动到 deploy/deployment/ 并作为打包复制源；pnpm package 仍从根目录运行，输出 deploy/bin、deploy/dist 和 deploy/deployment/aifar-deployment-*，根目录不再生成 bin、dist、web/dist 或 start/stop 脚本。验证通过：pnpm package、pnpm test、git diff --check。
+
+## 2026-06-30
+- 问题：用户询问 env.bat 和 env.ps1 的作用，若无用则删除。
+- 结论：env.bat/env.ps1 只是旧的本地 D:\tools PATH/GOROOT/GOPATH/GOCACHE 便捷脚本，当前已由 scripts/toolchain.mjs、scripts/package.ps1/sh 和 AIFAR_TOOL_ROOT/AIFAR_GO_CACHE 配置覆盖；已删除这两个脚本，并将 setup-dev 提示改为使用 AIFAR_TOOL_ROOT。验证通过：rg 无残留引用、pnpm test、git diff --check。

@@ -14,7 +14,7 @@ if (!existsSync(backendDir)) {
 const go = goCommand()
 const check = spawnSync(go, ['version'], { env, stdio: 'ignore' })
 if (check.status !== 0) {
-  console.warn('[aifar setup] Go not found. Install Go under D:\\tools or run env.bat before backend commands.')
+  console.warn('[aifar setup] Go not found. Install Go under D:\\tools or set AIFAR_TOOL_ROOT before backend commands.')
   process.exit(0)
 }
 

@@ -1,5 +1,7 @@
 # AIFAR Deployment Agent Guide
 
+DO NOT send optional commentary
+
 本文件是后续 agent 在 `D:\workspace\aifar-deployment` 工作时的最高优先级项目约定。它以当前源码为准，而不是旧打包产物的反推愿景。
 
 ## 必读流程
