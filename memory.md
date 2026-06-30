@@ -241,3 +241,7 @@
 - 结论：没有真正“万能自动修复”的安全依赖；推荐在 installerkit 封装 SELinux Manager，优先调用系统权威工具 semanage/restorecon/setsebool/semodule/ausearch，Go 依赖可选 opencontainers/selinux 做启用状态和 context 辅助判断。端口、文件上下文和 booleans 可自动化，audit2allow/semodule 生成本地策略应作为诊断建议或需用户确认，避免过度授权。
 - 问题：用户要求把 SELinux 处理提炼成单独 Go 工具模块，供各安装服务过程复用。
 - 结论：新增 backend/internal/installer/selinux 模块，集中提供安装脚本模板函数和 SELinux/firewalld shell helper；支持端口放行、fcontext、restorecon、setsebool、近期 AVC 诊断入口。各 app 安装脚本渲染改为依赖 selinux.AddTemplateFuncs，installerkit 不再承载 SELinux 片段。验证通过：go test ./...、pnpm test、git diff --check。
+- 问题：用户询问目标机没有 semanage 时怎么办。
+- 结论：semanage 不应静默忽略；推荐安装前检测 policycoreutils-python-utils/RHEL7 的 policycoreutils-python 或通过 dnf provides 查询；离线环境应把 semanage 相关 RPM 纳入公共依赖包。没有 semanage 时端口类型不能可靠持久化，只能临时 chcon 文件上下文或提示缺工具，不能自动 setenforce 0。
+- 问题：用户要求继续处理 semanage 缺失场景。
+- 结论：SELinux 工具模块新增 ensure_semanage 流程：需要 semanage 时先尝试从 AIFAR_SELINUX_RPM_DIR 或 WORK_DIR/rpms 安装本地 RPM，再尝试 dnf/yum 安装 policycoreutils-python-utils 或 RHEL7 的 policycoreutils-python；仍缺失时输出明确离线依赖提示并跳过规则写入。验证通过：go test ./internal/installer/selinux、go test ./...、pnpm test。

@@ -43,6 +43,72 @@ selinux_is_enabled() {
   [ "$(getenforce 2>/dev/null || echo Disabled)" != "Disabled" ]
 }
 
+selinux_local_rpm_dir() {
+  if [ -n "${AIFAR_SELINUX_RPM_DIR:-}" ]; then
+    printf "%s" "$AIFAR_SELINUX_RPM_DIR"
+    return 0
+  fi
+  if [ -n "${WORK_DIR:-}" ]; then
+    printf "%s" "$WORK_DIR/rpms"
+    return 0
+  fi
+  return 1
+}
+
+install_selinux_tools_from_local_rpms() {
+  rpm_dir="$(selinux_local_rpm_dir || true)"
+  if [ -z "$rpm_dir" ] || [ ! -d "$rpm_dir" ] || ! ls "$rpm_dir"/*.rpm >/dev/null 2>&1; then
+    return 1
+  fi
+  log_file="${WORK_DIR:-/tmp}/aifar-selinux-tools-install.log"
+  echo "attempting to install SELinux management tools from local RPMs: $rpm_dir"
+  if command -v dnf >/dev/null 2>&1; then
+    $SUDO dnf -y install "$rpm_dir"/*.rpm >"$log_file" 2>&1 || true
+  elif command -v yum >/dev/null 2>&1; then
+    $SUDO yum -y install "$rpm_dir"/*.rpm >"$log_file" 2>&1 || true
+  elif command -v rpm >/dev/null 2>&1; then
+    $SUDO rpm -Uvh --replacepkgs "$rpm_dir"/*.rpm >"$log_file" 2>&1 || true
+  else
+    echo "warning: no dnf/yum/rpm command found, cannot install SELinux management tools from local RPMs"
+    return 1
+  fi
+  if command -v semanage >/dev/null 2>&1; then
+    echo "SELinux management tools installed from local RPMs"
+    return 0
+  fi
+  echo "warning: local RPM installation did not provide semanage; see $log_file"
+  return 1
+}
+
+install_selinux_tools_from_repo() {
+  echo "attempting to install SELinux management tools from system repositories"
+  if command -v dnf >/dev/null 2>&1; then
+    $SUDO dnf -y install policycoreutils-python-utils >/dev/null 2>&1 || \
+      $SUDO dnf -y install policycoreutils-python >/dev/null 2>&1 || true
+  elif command -v yum >/dev/null 2>&1; then
+    $SUDO yum -y install policycoreutils-python-utils >/dev/null 2>&1 || \
+      $SUDO yum -y install policycoreutils-python >/dev/null 2>&1 || true
+  else
+    return 1
+  fi
+  command -v semanage >/dev/null 2>&1
+}
+
+ensure_semanage() {
+  if command -v semanage >/dev/null 2>&1; then
+    return 0
+  fi
+  echo "warning: semanage not found; trying to prepare SELinux management tools"
+  install_selinux_tools_from_local_rpms || install_selinux_tools_from_repo || true
+  if command -v semanage >/dev/null 2>&1; then
+    return 0
+  fi
+  echo "warning: semanage is still unavailable"
+  echo "warning: install policycoreutils-python-utils on RHEL/openEuler/Rocky/Alma 8+ or policycoreutils-python on RHEL/CentOS 7"
+  echo "warning: offline deployments should include these RPMs in the resource rpms directory"
+  return 1
+}
+
 selinux_port_has_type() {
   semanage port -l 2>/dev/null | awk -v want_type="$1" -v want_port="$2" '
     $1 == want_type && $2 == "tcp" {
@@ -66,8 +132,8 @@ allow_selinux_ports() {
     echo "SELinux is disabled or unavailable, skip port rules"
     return 0
   fi
-  if ! command -v semanage >/dev/null 2>&1; then
-    echo "warning: semanage not found, skip SELinux port rules"
+  if ! ensure_semanage; then
+    echo "warning: skip SELinux port rules because semanage is unavailable"
     return 0
   fi
   for port in "$@"; do
@@ -90,8 +156,8 @@ set_selinux_fcontext() {
     echo "SELinux is disabled or unavailable, skip file context rule"
     return 0
   fi
-  if ! command -v semanage >/dev/null 2>&1; then
-    echo "warning: semanage not found, skip file context rule for $path_pattern"
+  if ! ensure_semanage; then
+    echo "warning: skip SELinux file context rule for $path_pattern because semanage is unavailable"
     return 0
   fi
   if $SUDO semanage fcontext -a -t "$context_type" "$path_pattern" >/dev/null 2>&1; then
