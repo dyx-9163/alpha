@@ -19,6 +19,7 @@ type Config struct {
 	CredentialSecret      string `json:"-"`
 	DeploymentConcurrency int    `json:"deploymentConcurrency"`
 	DefaultDeployDir      string `json:"defaultDeployDir"`
+	InstallerTemplateDir  string `json:"installerTemplateDir"`
 	ProviderMode          string `json:"providerMode"`
 	AuthMaxFailures       int    `json:"authMaxFailures"`
 	AuthLockoutSeconds    int    `json:"authLockoutSeconds"`
@@ -45,6 +46,7 @@ func Load() Config {
 		CredentialSecret:      getenv("AIFAR_CREDENTIAL_SECRET", jwtSecret),
 		DeploymentConcurrency: getenvInt("AIFAR_DEPLOYMENT_CONCURRENCY", 2),
 		DefaultDeployDir:      getenv("AIFAR_DEFAULT_DEPLOY_DIR", "/aifar/apps"),
+		InstallerTemplateDir:  getenv("AIFAR_INSTALLER_TEMPLATE_DIR", filepath.Join("config", "installers")),
 		ProviderMode:          "real",
 		AuthMaxFailures:       getenvInt("AIFAR_AUTH_MAX_FAILURES", 5),
 		AuthLockoutSeconds:    getenvInt("AIFAR_AUTH_LOCKOUT_SECONDS", 300),

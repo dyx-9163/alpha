@@ -9,7 +9,6 @@ export interface FrontendAppDefinition {
   category: AppCategory
   categoryLabel: string
   sourceLabel: string
-  fallbackVersion: string
   description: string
   frontendReady: true
   topologies?: AppTopologyDefinition[]
@@ -41,6 +40,7 @@ export interface BackendCatalogItem {
 export type AppCatalogResponse = Record<string, BackendCatalogItem> | BackendCatalogItem[]
 
 export type AppStoreItem = FrontendAppDefinition & {
+  fallbackVersion: string
   installName: string
   resourceApp: string
   requiresServer: boolean

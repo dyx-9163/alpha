@@ -8,7 +8,6 @@ import (
 	"aifar-deployment/backend/internal/adapter"
 	"aifar-deployment/backend/internal/apps/registry"
 	"aifar-deployment/backend/internal/i18n"
-	redisinstaller "aifar-deployment/backend/internal/installer/redis"
 	"aifar-deployment/backend/internal/store"
 )
 
@@ -23,7 +22,7 @@ func init() {
 	})
 }
 
-func NewModule(s Store, remote redisinstaller.Remote, defaultPassword ...string) Module {
+func NewModule(s Store, remote Remote, defaultPassword ...string) Module {
 	password := ""
 	if len(defaultPassword) > 0 {
 		password = defaultPassword[0]
@@ -44,7 +43,6 @@ func (m Module) Manifest(lang string) registry.Manifest {
 		Category:            "database",
 		CategoryLabel:       copy.CategoryLabel,
 		SourceLabel:         copy.SourceLabel,
-		FallbackVersion:     "7.2.14",
 		Description:         copy.Description,
 		InstallName:         "redis",
 		ResourceApp:         "redis",
@@ -84,7 +82,7 @@ func (m Module) PreflightInstall(ctx context.Context, req registry.InstallReques
 	if ctx.Err() != nil {
 		return registry.PreflightResult{}, ctx.Err()
 	}
-	bundle, err := redisinstaller.SelectBundle(resources, req.Version)
+	bundle, err := SelectBundle(resources, req.Version)
 	if err != nil {
 		return registry.PreflightResult{}, err
 	}
@@ -161,11 +159,11 @@ func (m Module) ValidateInstall(ctx context.Context, req registry.InstallRequest
 	default:
 		return errors.New(fmt.Sprintf(copy.TopologyUnsupported, topology))
 	}
-	bundle, err := redisinstaller.SelectBundle(resources, req.Version)
+	bundle, err := SelectBundle(resources, req.Version)
 	if err != nil {
 		return err
 	}
-	return redisinstaller.VerifyBundle(bundle)
+	return VerifyBundle(bundle)
 }
 
 func (m Module) Install(ctx context.Context, req registry.InstallRequest, run registry.RunContext) error {
@@ -178,7 +176,7 @@ func (m Module) Install(ctx context.Context, req registry.InstallRequest, run re
 		DefaultPassword: req.DefaultPassword,
 		Parameters:      req.Parameters,
 		Concurrency:     run.Concurrency,
-	}, run.Resources, run.Log, func(target string) redisinstaller.Logger {
+	}, run.Resources, run.Log, func(target string) Logger {
 		return run.LoggerForTarget(target)
 	})
 }
@@ -208,7 +206,7 @@ func (m Module) Delete(ctx context.Context, req registry.DeleteRequest, run regi
 		Instance: req.Instance,
 		Server:   req.Server,
 		Language: req.Language,
-	}, run.Log, func(target string) redisinstaller.Logger {
+	}, run.Log, func(target string) Logger {
 		return run.LoggerForTarget(target)
 	})
 }
@@ -236,7 +234,7 @@ func (m Module) Check(ctx context.Context, req registry.CheckRequest, run regist
 		Server:          req.Server,
 		Language:        req.Language,
 		DefaultPassword: m.defaultPassword,
-	}, run.Log, func(target string) redisinstaller.Logger {
+	}, run.Log, func(target string) Logger {
 		return run.LoggerForTarget(target)
 	})
 	return registry.InstanceStatus{Status: result.Status, Message: result.Message, Details: result.Details}, err

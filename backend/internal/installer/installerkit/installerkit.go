@@ -1,11 +1,14 @@
 package installerkit
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os"
 	"path"
+	"path/filepath"
 	"strings"
+	"text/template"
 	"time"
 
 	"aifar-deployment/backend/internal/adapter"
@@ -23,6 +26,8 @@ type Remote interface {
 	Run(ctx context.Context, server store.Server, command string) (adapter.CommandResult, error)
 	UploadFile(ctx context.Context, server store.Server, localPath, remotePath string, mode os.FileMode) error
 }
+
+const TemplateDirEnv = "AIFAR_INSTALLER_TEMPLATE_DIR"
 
 func Run(ctx context.Context, remote Remote, server store.Server, command string, log Logger, failurePrefix string) (adapter.CommandResult, error) {
 	result, err := remote.Run(ctx, server, command)
@@ -68,8 +73,52 @@ func WriteTempScript(pattern, script string) (string, error) {
 	return f.Name(), nil
 }
 
+func RenderTemplate(app, templatePath, name, embedded string, funcs template.FuncMap, data any) (string, error) {
+	source, err := TemplateSource(app, templatePath, embedded)
+	if err != nil {
+		return "", err
+	}
+	tpl, err := template.New(name).Funcs(funcs).Parse(source)
+	if err != nil {
+		return "", fmt.Errorf("parse installer template %s/%s: %w", app, templatePath, err)
+	}
+	var buf bytes.Buffer
+	if err := tpl.Execute(&buf, data); err != nil {
+		return "", fmt.Errorf("render installer template %s/%s: %w", app, templatePath, err)
+	}
+	return buf.String(), nil
+}
+
+func TemplateSource(app, templatePath, embedded string) (string, error) {
+	root := strings.TrimSpace(os.Getenv(TemplateDirEnv))
+	if root == "" {
+		root = filepath.Join("config", "installers")
+	}
+	cleanPath := filepath.Clean(filepath.FromSlash(templatePath))
+	if cleanPath == "." || filepath.IsAbs(cleanPath) || strings.HasPrefix(cleanPath, ".."+string(filepath.Separator)) || cleanPath == ".." {
+		return "", fmt.Errorf("invalid installer template path: %s", templatePath)
+	}
+	overridePath := filepath.Join(root, Sanitize(app), cleanPath)
+	content, err := os.ReadFile(overridePath)
+	if err == nil {
+		return string(content), nil
+	}
+	if os.IsNotExist(err) {
+		return embedded, nil
+	}
+	return "", fmt.Errorf("read installer template override %s: %w", overridePath, err)
+}
+
 func WorkDir(deployDir, app, version string, now time.Time) string {
 	return path.Join(RemoteDeployDir(deployDir), "_work", fmt.Sprintf("%s-%s-%d", Sanitize(app), Sanitize(version), now.Unix()))
+}
+
+func InstallRoot(deployDir, app string) string {
+	return path.Join(RemoteDeployDir(deployDir), Sanitize(app))
+}
+
+func LegacyInstallRoot(deployDir, app, version string) string {
+	return path.Join(RemoteDeployDir(deployDir), Sanitize(app), Sanitize(version))
 }
 
 func RemoteDeployDir(value string) string {

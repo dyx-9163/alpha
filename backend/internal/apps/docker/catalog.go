@@ -25,7 +25,6 @@ func Definition(lang string) CatalogDefinition {
 		Category:              "devops",
 		CategoryLabel:         copy.CategoryLabel,
 		SourceLabel:           copy.SourceLabel,
-		FallbackVersion:       "stable",
 		Description:           copy.Description,
 		InstallName:           "docker",
 		ResourceApp:           "docker",

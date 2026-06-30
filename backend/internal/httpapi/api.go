@@ -104,7 +104,6 @@ func New(cfg config.Config, s *store.Store, tasks *worker.Manager) *API {
 			r.Get("/apps/catalog", api.appsCatalog)
 			r.Get("/apps/instances", api.appInstances)
 			r.Post("/apps/{app}/install", api.requirePermission(rbac.AppsManage, api.installApp))
-			r.Post("/apps/instances/{id}/upgrade", api.requirePermission(rbac.AppsManage, api.instanceAction("upgrade")))
 			r.Post("/apps/instances/{id}/check", api.requirePermission(rbac.AppsManage, api.checkAppInstance))
 			r.Post("/apps/instances/{id}/delete", api.requirePermission(rbac.AppsManage, api.deleteAppInstance))
 			r.Post("/apps/instances/{id}/uninstall", api.requirePermission(rbac.AppsManage, api.deleteAppInstance))
@@ -116,7 +115,6 @@ func New(cfg config.Config, s *store.Store, tasks *worker.Manager) *API {
 			r.Get("/containers/{id}/logs", api.containerLogs)
 			r.Get("/containers/{id}/terminal/ws", api.requirePermission(rbac.TerminalConnect, api.containerTerminal))
 			r.Get("/database/instances", api.databaseInstances)
-			r.Post("/database/instances/{id}/backup", api.requirePermission(rbac.DatabaseManage, api.databaseBackup))
 			r.Post("/database/mysql/install", api.requirePermission(rbac.DatabaseManage, api.installNamedApp("mysql")))
 			r.Post("/database/redis/install", api.requirePermission(rbac.DatabaseManage, api.installNamedApp("redis")))
 			r.Get("/storage/instances", api.storageInstances)
@@ -1070,9 +1068,11 @@ func (a *API) appInstances(w http.ResponseWriter, r *http.Request) {
 }
 
 type deleteAppInstanceRequest struct {
-	ServerPassword string `json:"serverPassword"`
-	Password       string `json:"password"`
-	Language       string `json:"language"`
+	ServerPassword     string         `json:"serverPassword"`
+	Password           string         `json:"password"`
+	Language           string         `json:"language"`
+	Parameters         map[string]any `json:"parameters"`
+	RemoveMountedDisks *bool          `json:"removeMountedDisks"`
 }
 
 func (a *API) deleteAppInstance(w http.ResponseWriter, r *http.Request) {
@@ -1128,15 +1128,21 @@ func (a *API) deleteAppInstance(w http.ResponseWriter, r *http.Request) {
 
 	actor := currentUser(r).Username
 	target := instance.ServerID
+	parameters := map[string]any{}
+	for key, value := range req.Parameters {
+		parameters[key] = value
+	}
+	if req.RemoveMountedDisks != nil {
+		parameters["removeMountedDisks"] = *req.RemoveMountedDisks
+	}
+	parameters[registry.DeleteParamConfirmedWithServerPassword] = true
 	task, err := a.tasks.StartWithLanguage("apps."+instance.App+".delete", target, actor, lang, func(ctx context.Context, log worker.Logger) error {
 		deleteReq := registry.DeleteRequest{
-			Instance: instance,
-			Server:   server,
-			Language: lang,
-			Actor:    actor,
-			Parameters: map[string]any{
-				registry.DeleteParamConfirmedWithServerPassword: true,
-			},
+			Instance:   instance,
+			Server:     server,
+			Language:   lang,
+			Actor:      actor,
+			Parameters: parameters,
 		}
 		plan, err := deleteModule.PlanDelete(ctx, deleteReq)
 		if err != nil {
@@ -1455,23 +1461,6 @@ func cleanStringIDs(values []string) []string {
 	return out
 }
 
-func (a *API) instanceAction(action string) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		id := chi.URLParam(r, "id")
-		lang := languageFromRequest(r)
-		actor := currentUser(r).Username
-		task, err := a.tasks.StartWithLanguage("apps.instance."+action, id, actor, lang, func(ctx context.Context, log worker.Logger) error {
-			log.Info(i18n.Text(lang, "api.instanceActionRequested"), action, id)
-			log.Info("%s", i18n.Text(lang, "api.instanceAdapterReady"))
-			return nil
-		})
-		if err == nil {
-			a.audit(r, "apps.instance."+action, id, "running", task.ID)
-		}
-		respondTask(w, task, err)
-	}
-}
-
 func (a *API) containerSummary(w http.ResponseWriter, r *http.Request) {
 	host := dockerHostFromRequest(r)
 	server, useServer, serverErr := a.dockerServerFromRequest(r)
@@ -1635,38 +1624,6 @@ func (a *API) databaseInstances(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, http.StatusOK, out)
-}
-
-func (a *API) databaseBackup(w http.ResponseWriter, r *http.Request) {
-	id := chi.URLParam(r, "id")
-	lang := languageFromRequest(r)
-	instance, err := a.store.GetAppInstance(id)
-	if err != nil {
-		respond(w, nil, err)
-		return
-	}
-	if instance.App != "mysql" && instance.App != "redis" {
-		writeError(w, http.StatusBadRequest, "DATABASE_INSTANCE_REQUIRED", i18n.Text(lang, "api.databaseInstanceRequired"), map[string]any{"instanceId": id})
-		return
-	}
-	task, err := a.tasks.StartWithLanguage("database.backup", id, currentUser(r).Username, lang, func(ctx context.Context, log worker.Logger) error {
-		log.PlanTarget(id)
-		log.PlanStep(id, "prepare", i18n.Text(lang, "api.databaseBackupPrepare"), 1)
-		log.PlanStep(id, "record", i18n.Text(lang, "api.databaseBackupRecord"), 2)
-		log.StartTarget(id)
-		log.StartStep(id, "prepare", i18n.Text(lang, "api.databaseBackupPrepare"), 1)
-		log.Info("%s", i18n.Text(lang, "api.databaseBackupRequested", instance.App, instance.ID))
-		log.FinishStep(id, "prepare", "success", "")
-		log.StartStep(id, "record", i18n.Text(lang, "api.databaseBackupRecord"), 2)
-		log.Info("%s", i18n.Text(lang, "api.databaseBackupReady"))
-		log.FinishStep(id, "record", "success", "")
-		log.FinishTarget(id, "success", "")
-		return nil
-	})
-	if err == nil {
-		a.audit(r, "database.backup", id, "running", task.ID)
-	}
-	respondTask(w, task, err)
 }
 
 func (a *API) storageInstances(w http.ResponseWriter, r *http.Request) {

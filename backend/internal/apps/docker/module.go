@@ -7,7 +7,6 @@ import (
 	"aifar-deployment/backend/internal/adapter"
 	"aifar-deployment/backend/internal/apps/registry"
 	"aifar-deployment/backend/internal/i18n"
-	dockerinstaller "aifar-deployment/backend/internal/installer/docker"
 	"aifar-deployment/backend/internal/store"
 )
 
@@ -21,7 +20,7 @@ func init() {
 	})
 }
 
-func NewModule(s Store, remote dockerinstaller.Remote) Module {
+func NewModule(s Store, remote Remote) Module {
 	return Module{service: NewService(s, remote)}
 }
 
@@ -61,7 +60,7 @@ func (m Module) PreflightInstall(ctx context.Context, req registry.InstallReques
 	if ctx.Err() != nil {
 		return registry.PreflightResult{}, ctx.Err()
 	}
-	bundle, err := dockerinstaller.SelectBundleWithLanguage(resources, req.Version, req.Language)
+	bundle, err := SelectBundleWithLanguage(resources, req.Version, req.Language)
 	if err != nil {
 		return registry.PreflightResult{}, err
 	}
@@ -102,11 +101,11 @@ func (m Module) ValidateInstall(ctx context.Context, req registry.InstallRequest
 	if len(req.TargetServerIDs()) == 0 {
 		return errors.New(i18n.Text(req.Language, "docker.targetRequired"))
 	}
-	bundle, err := dockerinstaller.SelectBundleWithLanguage(resources, req.Version, req.Language)
+	bundle, err := SelectBundleWithLanguage(resources, req.Version, req.Language)
 	if err != nil {
 		return err
 	}
-	return dockerinstaller.VerifyBundleWithLanguage(bundle, req.Language)
+	return VerifyBundleWithLanguage(bundle, req.Language)
 }
 
 func (m Module) Install(ctx context.Context, req registry.InstallRequest, run registry.RunContext) error {
@@ -117,7 +116,7 @@ func (m Module) Install(ctx context.Context, req registry.InstallRequest, run re
 		ServerIDs:   req.TargetServerIDs(),
 		Parameters:  req.Parameters,
 		Concurrency: run.Concurrency,
-	}, run.Resources, run.Log, func(target string) dockerinstaller.Logger {
+	}, run.Resources, run.Log, func(target string) Logger {
 		return run.LoggerForTarget(target)
 	})
 }
@@ -152,7 +151,7 @@ func (m Module) Delete(ctx context.Context, req registry.DeleteRequest, run regi
 		Instance: req.Instance,
 		Server:   req.Server,
 		Language: req.Language,
-	}, run.Log, func(target string) dockerinstaller.Logger {
+	}, run.Log, func(target string) Logger {
 		return run.LoggerForTarget(target)
 	})
 }
@@ -184,7 +183,7 @@ func (m Module) Check(ctx context.Context, req registry.CheckRequest, run regist
 		Instance: req.Instance,
 		Server:   req.Server,
 		Language: req.Language,
-	}, run.Log, func(target string) dockerinstaller.Logger {
+	}, run.Log, func(target string) Logger {
 		return run.LoggerForTarget(target)
 	})
 	return registry.InstanceStatus{

@@ -5,15 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net"
-	"net/url"
-	"strconv"
 	"strings"
 	"time"
 
 	"aifar-deployment/backend/internal/apps/deleteflow"
-	"aifar-deployment/backend/internal/installer/installerkit"
-	mysqlinstaller "aifar-deployment/backend/internal/installer/mysql"
 	"aifar-deployment/backend/internal/store"
 	"aifar-deployment/backend/internal/taskrun"
 )
@@ -56,7 +51,7 @@ type CheckResult struct {
 
 type Service struct {
 	store  Store
-	remote mysqlinstaller.Remote
+	remote Remote
 }
 
 type clusterInfo struct {
@@ -71,7 +66,7 @@ type clusterInfo struct {
 	PrimaryDetectedAt string
 }
 
-type targetLogger func(target string) mysqlinstaller.Logger
+type targetLogger func(target string) Logger
 
 type stepRecorder interface {
 	StartTarget(target string)
@@ -80,11 +75,11 @@ type stepRecorder interface {
 	FinishStep(target, name, status, errText string)
 }
 
-func NewService(s Store, remote mysqlinstaller.Remote) Service {
+func NewService(s Store, remote Remote) Service {
 	return Service{store: s, remote: remote}
 }
 
-func (s Service) Install(ctx context.Context, req InstallRequest, resources []store.Resource, log mysqlinstaller.Logger, targetLog targetLogger) error {
+func (s Service) Install(ctx context.Context, req InstallRequest, resources []store.Resource, log Logger, targetLog targetLogger) error {
 	copy := CopyFor(req.Language)
 	if topology := normalizeRouterTopology(req.Topology); topology != "router" {
 		return fmt.Errorf(copy.RouterUnsupported, topology)
@@ -101,18 +96,18 @@ func (s Service) Install(ctx context.Context, req InstallRequest, resources []st
 	if err := options.Validate(); err != nil {
 		return err
 	}
-	bundle, err := mysqlinstaller.SelectBundle(resources, req.Version)
+	bundle, err := SelectBundle(resources, req.Version)
 	if err != nil {
 		return err
 	}
-	if err := mysqlinstaller.VerifyBundle(bundle); err != nil {
+	if err := VerifyBundle(bundle); err != nil {
 		return err
 	}
 	log.Info(copy.UsingArchive, bundle.ArchivePath)
 	log.Info(copy.UsingRPMs, len(bundle.RPMPaths))
 	log.Info(copy.UsingCluster, cluster.Name, cluster.Endpoint)
 
-	installer := mysqlinstaller.NewInstaller(s.remote)
+	installer := NewInstaller(s.remote)
 	recorder, _ := log.(stepRecorder)
 	steps := mysqlRouterInstallSteps(copy)
 	failures := taskrun.RunTargets(ctx, targets, req.Concurrency, func(target string) error {
@@ -142,7 +137,7 @@ func (s Service) Install(ctx context.Context, req InstallRequest, resources []st
 			return errors.New(msg)
 		}
 		if err := step(3, "verify-resource", copy.VerifyResource, func() error {
-			return mysqlinstaller.VerifyBundle(bundle)
+			return VerifyBundle(bundle)
 		}); err != nil {
 			msg := fmt.Sprintf(copy.InstallFailed, err)
 			logForServer.Error("%s", msg)
@@ -150,7 +145,7 @@ func (s Service) Install(ctx context.Context, req InstallRequest, resources []st
 			return errors.New(msg)
 		}
 		if err := step(4, "install-router", copy.InstallRouter, func() error {
-			return installer.InstallRouter(ctx, server, bundle, options, logForServer)
+			return installer.Install(ctx, server, bundle, options, logForServer)
 		}); err != nil {
 			msg := fmt.Sprintf(copy.InstallFailed, err)
 			logForServer.Error("%s", msg)
@@ -234,7 +229,7 @@ func (s Service) ResolveCluster(params map[string]any, copy Copy) (clusterInfo, 
 	return clusterInfo{}, errors.New(copy.ClusterMissing)
 }
 
-func (s Service) Delete(ctx context.Context, req DeleteRequest, log mysqlinstaller.Logger, targetLog targetLogger) error {
+func (s Service) Delete(ctx context.Context, req DeleteRequest, log Logger, targetLog targetLogger) error {
 	copy := DeleteCopyFor(req.Language)
 	target := req.Instance.ServerID
 	if target == "" {
@@ -243,7 +238,7 @@ func (s Service) Delete(ctx context.Context, req DeleteRequest, log mysqlinstall
 	logForServer := logForTarget(log, targetLog, target)
 	recorder, _ := log.(stepRecorder)
 	basePort := instanceBasePort(req.Instance)
-	uninstaller := mysqlinstaller.NewUninstaller(s.remote)
+	uninstaller := NewUninstaller(s.remote)
 	return deleteflow.Run(deleteflow.Request{
 		Target:     target,
 		ServerName: req.Server.Name,
@@ -252,7 +247,7 @@ func (s Service) Delete(ctx context.Context, req DeleteRequest, log mysqlinstall
 		Recorder:   recorder,
 		Steps: []deleteflow.Step{
 			{Name: "remove-remote", Title: copy.RemoveRemote, Run: func() error {
-				return uninstaller.UninstallRouter(ctx, req.Server, req.Instance.Version, basePort, logForServer)
+				return uninstaller.Uninstall(ctx, req.Server, req.Instance.Version, basePort, logForServer)
 			}},
 			{Name: "delete-instance", Title: copy.DeleteInstance, Run: func() error {
 				return s.store.DeleteAppInstance(req.Instance.ID)
@@ -268,7 +263,7 @@ func (s Service) Delete(ctx context.Context, req DeleteRequest, log mysqlinstall
 	})
 }
 
-func (s Service) Check(ctx context.Context, req CheckRequest, log mysqlinstaller.Logger, targetLog targetLogger) (CheckResult, error) {
+func (s Service) Check(ctx context.Context, req CheckRequest, log Logger, targetLog targetLogger) (CheckResult, error) {
 	copy := CopyFor(req.Language)
 	target := req.Instance.ServerID
 	if target == "" {
@@ -302,268 +297,6 @@ func (s Service) Check(ctx context.Context, req CheckRequest, log mysqlinstaller
 	return CheckResult{Status: "running", Message: msg, Details: details}, nil
 }
 
-func (s Service) checkRuntime(ctx context.Context, server store.Server, instance store.AppInstance, log mysqlinstaller.Logger) error {
-	basePort := instanceBasePort(instance)
-	installRoot := remoteInstallRoot(server, "mysql-router", instance.Version)
-	cmd := fmt.Sprintf("systemctl is-active --quiet %s && %s --version",
-		installerkit.ShellQuote(routerServiceName(basePort)),
-		installerkit.ShellQuote(installRoot+"/mysql-router/bin/mysqlrouter"),
-	)
-	_, err := installerkit.Run(ctx, s.remote, server, cmd, log, "mysql router remote command failed")
-	return err
-}
-
-func (s Service) markInstanceStatus(instance store.AppInstance, status string, details map[string]any) error {
-	metadata := appMetadata(instance)
-	metadata["lastCheck"] = map[string]any{
-		"status":    status,
-		"checkedAt": time.Now().UTC().Format(time.RFC3339),
-		"details":   details,
-	}
-	data, _ := json.Marshal(metadata)
-	instance.Metadata = string(data)
-	instance.Status = status
-	_, err := s.store.SaveAppInstance(instance)
-	return err
-}
-
-func innoDBClusters(instances []store.AppInstance) []clusterInfo {
-	type clusterAccumulator struct {
-		info clusterInfo
-	}
-	groups := map[string]*clusterAccumulator{}
-	var order []string
-	for _, instance := range instances {
-		if instance.App != "mysql" || instanceTopology(instance) != "innodb-cluster" {
-			continue
-		}
-		metadata := appMetadata(instance)
-		clusterID := metadataString(metadata, "clusterId")
-		clusterName := metadataString(metadata, "clusterName")
-		if clusterID == "" {
-			clusterID = clusterName
-		}
-		if clusterID == "" {
-			clusterID = instance.ID
-		}
-		acc := groups[clusterID]
-		if acc == nil {
-			acc = &clusterAccumulator{info: clusterInfo{
-				ID:   clusterID,
-				Name: firstNonEmpty(clusterName, clusterID),
-			}}
-			groups[clusterID] = acc
-			order = append(order, clusterID)
-		}
-		acc.info.NodeCount++
-		if clusterName != "" {
-			acc.info.Name = clusterName
-		}
-		if rootUser := metadataString(metadata, "rootUser"); rootUser != "" && acc.info.RootUser == "" {
-			acc.info.RootUser = rootUser
-		}
-		if detectedAt := metadataString(metadata, "primaryDetectedAt"); detectedAt != "" {
-			acc.info.PrimaryDetectedAt = detectedAt
-		}
-		if primary := firstNonEmpty(metadataString(metadata, "currentPrimaryEndpoint"), metadataString(metadata, "primaryEndpoint")); primary != "" {
-			acc.info.CurrentPrimary = primary
-			acc.info.Endpoint = primary
-			continue
-		}
-		if endpoint := metadataString(metadata, "endpoint"); endpoint != "" && acc.info.Endpoint == "" {
-			acc.info.Endpoint = endpoint
-		}
-	}
-	out := make([]clusterInfo, 0, len(order))
-	for _, key := range order {
-		out = append(out, groups[key].info)
-	}
-	return out
-}
-
-func mysqlRouterOptions(params map[string]any, defaultPassword string, cluster clusterInfo) mysqlinstaller.RouterInstallOptions {
-	bindAddress := stringParam(params, "bindAddress", "0.0.0.0")
-	return mysqlinstaller.RouterInstallOptions{
-		BasePort:          intParam(params, "basePort", 6446),
-		BootstrapHost:     cluster.BootstrapHost,
-		BootstrapPort:     cluster.BootstrapPort,
-		BootstrapUser:     stringParam(params, "rootUser", firstNonEmpty(cluster.RootUser, "root")),
-		BootstrapPassword: passwordParam(params, defaultPassword),
-		BindAddress:       bindAddress,
-	}
-}
-
-func passwordParam(params map[string]any, fallback string) string {
-	for _, key := range []string{"rootPassword", "password", "mysqlPassword"} {
-		if value, ok := params[key]; ok {
-			text := strings.TrimSpace(fmt.Sprint(value))
-			if text != "" {
-				return text
-			}
-		}
-	}
-	fallback = strings.TrimSpace(fallback)
-	if fallback == "" {
-		return "Oversea.123"
-	}
-	return fallback
-}
-
-func targetServerIDs(req InstallRequest) []string {
-	seen := map[string]bool{}
-	var out []string
-	add := func(id string) {
-		id = strings.TrimSpace(id)
-		if id == "" || seen[id] {
-			return
-		}
-		seen[id] = true
-		out = append(out, id)
-	}
-	add(req.ServerID)
-	for _, id := range req.ServerIDs {
-		add(id)
-	}
-	return out
-}
-
-func instanceBasePort(instance store.AppInstance) int {
-	return normalizePort(metadataInt(appMetadata(instance), "basePort"), 6446)
-}
-
-func instanceTopology(instance store.AppInstance) string {
-	if strings.TrimSpace(instance.Topology) != "" {
-		return normalizeRouterTopology(instance.Topology)
-	}
-	return normalizeRouterTopology(metadataString(appMetadata(instance), "topology"))
-}
-
-func normalizeRouterTopology(topology string) string {
-	topology = strings.ToLower(strings.TrimSpace(topology))
-	if topology == "" {
-		return "router"
-	}
-	return topology
-}
-
-func appMetadata(instance store.AppInstance) map[string]any {
-	metadata := map[string]any{}
-	_ = json.Unmarshal([]byte(instance.Metadata), &metadata)
-	if metadata == nil {
-		return map[string]any{}
-	}
-	return metadata
-}
-
-func metadataString(metadata map[string]any, key string) string {
-	value, ok := metadata[key]
-	if !ok || value == nil {
-		return ""
-	}
-	text := strings.TrimSpace(fmt.Sprint(value))
-	if text == "<nil>" {
-		return ""
-	}
-	return text
-}
-
-func metadataInt(metadata map[string]any, key string) int {
-	value, ok := metadata[key]
-	if !ok {
-		return 0
-	}
-	return intValue(value)
-}
-
-func stringParam(params map[string]any, key, fallback string) string {
-	if value, ok := params[key]; ok {
-		text := strings.TrimSpace(fmt.Sprint(value))
-		if text != "" {
-			return text
-		}
-	}
-	return fallback
-}
-
-func intParam(params map[string]any, key string, fallback int) int {
-	if value, ok := params[key]; ok {
-		return intValue(value)
-	}
-	return fallback
-}
-
-func intValue(value any) int {
-	switch v := value.(type) {
-	case int:
-		return v
-	case int64:
-		return int(v)
-	case float64:
-		return int(v)
-	case json.Number:
-		n, _ := v.Int64()
-		return int(n)
-	case string:
-		n, _ := strconv.Atoi(strings.TrimSpace(v))
-		return n
-	default:
-		return 0
-	}
-}
-
-func normalizePort(port, fallback int) int {
-	if port <= 0 || port > 65535 {
-		return fallback
-	}
-	return port
-}
-
-func parseEndpoint(value string, fallbackPort int) (string, int, error) {
-	value = strings.TrimSpace(value)
-	if value == "" {
-		return "", 0, errors.New("endpoint is empty")
-	}
-	if parsed, err := url.Parse(value); err == nil && parsed.Host != "" {
-		value = parsed.Host
-	}
-	host, portText, err := net.SplitHostPort(value)
-	if err == nil {
-		port, parseErr := strconv.Atoi(portText)
-		if parseErr != nil || port <= 0 || port > 65535 {
-			return "", 0, fmt.Errorf("invalid port %q", portText)
-		}
-		return strings.Trim(host, "[]"), port, nil
-	}
-	if idx := strings.LastIndex(value, ":"); idx > 0 && strings.Count(value, ":") == 1 {
-		host = strings.TrimSpace(value[:idx])
-		port, parseErr := strconv.Atoi(strings.TrimSpace(value[idx+1:]))
-		if parseErr != nil || port <= 0 || port > 65535 {
-			return "", 0, fmt.Errorf("invalid port in endpoint %q", value)
-		}
-		return strings.Trim(host, "[]"), port, nil
-	}
-	if fallbackPort > 0 {
-		return strings.Trim(value, "[]"), fallbackPort, nil
-	}
-	return "", 0, fmt.Errorf("endpoint %q does not include a port", value)
-}
-
-func routerServiceName(basePort int) string {
-	if basePort <= 0 {
-		basePort = 6446
-	}
-	return fmt.Sprintf("aifar-mysql-router-%d", basePort)
-}
-
-func remoteInstallRoot(server store.Server, app, version string) string {
-	deployDir := strings.TrimSpace(server.DeployDir)
-	if deployDir == "" {
-		deployDir = "/aifar/apps"
-	}
-	deployDir = "/" + strings.Trim(deployDir, "/")
-	return deployDir + "/" + app + "/" + version
-}
-
 func mysqlRouterInstallSteps(copy Copy) []taskrun.Step {
 	return []taskrun.Step{
 		{Name: "load-server", Title: copy.LoadServer},
@@ -588,7 +321,7 @@ func mysqlRouterCheckSteps(copy Copy) []taskrun.Step {
 	}
 }
 
-func newStepRunner(log mysqlinstaller.Logger, recorder stepRecorder, target string, steps []taskrun.Step, copy Copy) func(stepIndex int, stepName, label string, fn func() error) error {
+func newStepRunner(log Logger, recorder stepRecorder, target string, steps []taskrun.Step, copy Copy) func(stepIndex int, stepName, label string, fn func() error) error {
 	runner := taskrun.Runner{
 		Log:      log,
 		Recorder: recorder,
@@ -605,7 +338,7 @@ func newStepRunner(log mysqlinstaller.Logger, recorder stepRecorder, target stri
 	}
 }
 
-func logForTarget(fallback mysqlinstaller.Logger, targetLog targetLogger, target string) mysqlinstaller.Logger {
+func logForTarget(fallback Logger, targetLog targetLogger, target string) Logger {
 	if targetLog == nil {
 		return fallback
 	}
@@ -617,14 +350,4 @@ func logForTarget(fallback mysqlinstaller.Logger, targetLog targetLogger, target
 
 func finishTarget(recorder stepRecorder, target, status, errText string) {
 	taskrun.FinishTarget(recorder, target, status, errText)
-}
-
-func firstNonEmpty(values ...string) string {
-	for _, value := range values {
-		value = strings.TrimSpace(value)
-		if value != "" {
-			return value
-		}
-	}
-	return ""
 }

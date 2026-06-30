@@ -1,15 +1,13 @@
 package docker
 
 import (
+	"aifar-deployment/backend/internal/store"
+	"aifar-deployment/backend/internal/taskrun"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
-
-	dockerinstaller "aifar-deployment/backend/internal/installer/docker"
-	"aifar-deployment/backend/internal/store"
-	"aifar-deployment/backend/internal/taskrun"
 )
 
 type Store interface {
@@ -48,7 +46,7 @@ type CheckResult struct {
 
 type Service struct {
 	store  Store
-	remote dockerinstaller.Remote
+	remote Remote
 }
 
 type installStepDef struct {
@@ -56,7 +54,7 @@ type installStepDef struct {
 	Title string
 }
 
-type targetLogger func(target string) dockerinstaller.Logger
+type targetLogger func(target string) Logger
 
 type stepRecorder interface {
 	StartTarget(target string)
@@ -65,23 +63,23 @@ type stepRecorder interface {
 	FinishStep(target, name, status, errText string)
 }
 
-func NewService(s Store, remote dockerinstaller.Remote) Service {
+func NewService(s Store, remote Remote) Service {
 	return Service{store: s, remote: remote}
 }
 
-func (s Service) Install(ctx context.Context, req InstallRequest, resources []store.Resource, log dockerinstaller.Logger, targetLog targetLogger) error {
+func (s Service) Install(ctx context.Context, req InstallRequest, resources []store.Resource, log Logger, targetLog targetLogger) error {
 	copy := CopyFor(req.Language)
-	bundle, err := dockerinstaller.SelectBundleWithLanguage(resources, req.Version, req.Language)
+	bundle, err := SelectBundleWithLanguage(resources, req.Version, req.Language)
 	if err != nil {
 		return err
 	}
-	if err := dockerinstaller.VerifyBundleWithLanguage(bundle, req.Language); err != nil {
+	if err := VerifyBundleWithLanguage(bundle, req.Language); err != nil {
 		return err
 	}
 	options := dockerInstallOptions(req.Parameters)
 	log.Info(copy.UsingArchive, bundle.ArchivePath)
 	log.Info(copy.UsingRPMs, len(bundle.RPMPaths))
-	installer := dockerinstaller.NewInstaller(s.remote)
+	installer := NewInstaller(s.remote)
 	recorder, _ := log.(stepRecorder)
 	targets := req.ServerIDs
 	targetIndexes := make(map[string]int, len(targets))
@@ -118,7 +116,7 @@ func (s Service) Install(ctx context.Context, req InstallRequest, resources []st
 			finishTarget(recorder, serverID, "failed", msg)
 			return errors.New(msg)
 		}
-		server.DockerHost = dockerinstaller.RemoteAPIHost(server.Host, options.RemoteAPIPort)
+		server.DockerHost = RemoteAPIHost(server.Host, options.RemoteAPIPort)
 		server.Status = "available"
 		server.LastError = ""
 		if err := step(3, copy.UpdateServer, func() error {
@@ -158,7 +156,7 @@ func (s Service) Install(ctx context.Context, req InstallRequest, resources []st
 	return nil
 }
 
-func (s Service) Delete(ctx context.Context, req DeleteRequest, log dockerinstaller.Logger, targetLog targetLogger) error {
+func (s Service) Delete(ctx context.Context, req DeleteRequest, log Logger, targetLog targetLogger) error {
 	copy := DeleteCopyFor(req.Language)
 	server := req.Server
 	target := req.Instance.ServerID
@@ -171,7 +169,7 @@ func (s Service) Delete(ctx context.Context, req DeleteRequest, log dockerinstal
 		recorder.StartTarget(target)
 	}
 	step := newDeleteStepRunner(logForServer, recorder, target, copy)
-	uninstaller := dockerinstaller.NewUninstaller(s.remote)
+	uninstaller := NewUninstaller(s.remote)
 	if err := step(1, "remove-remote", copy.RemoveRemote, func() error {
 		return uninstaller.UninstallWithLanguage(ctx, server, req.Instance.Version, logForServer, req.Language)
 	}); err != nil {
@@ -181,7 +179,7 @@ func (s Service) Delete(ctx context.Context, req DeleteRequest, log dockerinstal
 		return err
 	}
 	if err := step(2, "verify-removed", copy.VerifyRemoved, func() error {
-		inspector := dockerinstaller.NewInspector(s.remote)
+		inspector := NewInspector(s.remote)
 		status, checkErr := inspector.Check(ctx, server, req.Instance.Version, logForServer)
 		if checkErr != nil {
 			return checkErr
@@ -219,7 +217,7 @@ func (s Service) Delete(ctx context.Context, req DeleteRequest, log dockerinstal
 	return nil
 }
 
-func (s Service) Check(ctx context.Context, req CheckRequest, log dockerinstaller.Logger, targetLog targetLogger) (CheckResult, error) {
+func (s Service) Check(ctx context.Context, req CheckRequest, log Logger, targetLog targetLogger) (CheckResult, error) {
 	copy := CheckCopyFor(req.Language)
 	server := req.Server
 	target := req.Instance.ServerID
@@ -232,10 +230,10 @@ func (s Service) Check(ctx context.Context, req CheckRequest, log dockerinstalle
 		recorder.StartTarget(target)
 	}
 	step := newCheckStepRunner(logForServer, recorder, target, copy)
-	var status dockerinstaller.StatusResult
+	var status StatusResult
 	if err := step(1, "check-runtime", copy.CheckRuntime, func() error {
 		var checkErr error
-		inspector := dockerinstaller.NewInspector(s.remote)
+		inspector := NewInspector(s.remote)
 		status, checkErr = inspector.Check(ctx, server, req.Instance.Version, logForServer)
 		return checkErr
 	}); err != nil {
@@ -266,7 +264,7 @@ func (s Service) Check(ctx context.Context, req CheckRequest, log dockerinstalle
 	return CheckResult{Status: status.Status, Message: status.Message, Details: details}, nil
 }
 
-func logForTarget(fallback dockerinstaller.Logger, targetLog targetLogger, target string) dockerinstaller.Logger {
+func logForTarget(fallback Logger, targetLog targetLogger, target string) Logger {
 	if targetLog == nil {
 		return fallback
 	}
@@ -301,7 +299,7 @@ func dockerCheckSteps(copy CheckCopy) []installStepDef {
 	}
 }
 
-func newStepRunner(log dockerinstaller.Logger, recorder stepRecorder, target string, copy Copy, targetIndex, targetTotal int) func(stepIndex int, label string, fn func() error) error {
+func newStepRunner(log Logger, recorder stepRecorder, target string, copy Copy, targetIndex, targetTotal int) func(stepIndex int, label string, fn func() error) error {
 	steps := dockerInstallSteps(copy)
 	return func(stepIndex int, label string, fn func() error) error {
 		stepName := fmt.Sprintf("step-%d", stepIndex)
@@ -328,7 +326,7 @@ func newStepRunner(log dockerinstaller.Logger, recorder stepRecorder, target str
 	}
 }
 
-func newDeleteStepRunner(log dockerinstaller.Logger, recorder stepRecorder, target string, copy DeleteCopy) func(stepIndex int, stepName, label string, fn func() error) error {
+func newDeleteStepRunner(log Logger, recorder stepRecorder, target string, copy DeleteCopy) func(stepIndex int, stepName, label string, fn func() error) error {
 	steps := dockerDeleteSteps(copy)
 	return func(stepIndex int, stepName, label string, fn func() error) error {
 		stepTotal := len(steps)
@@ -351,7 +349,7 @@ func newDeleteStepRunner(log dockerinstaller.Logger, recorder stepRecorder, targ
 	}
 }
 
-func newCheckStepRunner(log dockerinstaller.Logger, recorder stepRecorder, target string, copy CheckCopy) func(stepIndex int, stepName, label string, fn func() error) error {
+func newCheckStepRunner(log Logger, recorder stepRecorder, target string, copy CheckCopy) func(stepIndex int, stepName, label string, fn func() error) error {
 	steps := dockerCheckSteps(copy)
 	return func(stepIndex int, stepName, label string, fn func() error) error {
 		stepTotal := len(steps)
@@ -390,45 +388,4 @@ func finishTarget(recorder stepRecorder, target, status, errText string) {
 		return
 	}
 	recorder.FinishTarget(target, status, errText)
-}
-
-func dockerInstallOptions(parameters map[string]any) dockerinstaller.InstallOptions {
-	return dockerinstaller.NormalizeInstallOptions(dockerinstaller.InstallOptions{
-		BridgeCIDR:    stringParam(parameters, "dockerBridgeCIDR"),
-		RemoteAPIPort: intParam(parameters, "remoteAPIPort"),
-	})
-}
-
-func stringParam(parameters map[string]any, key string) string {
-	if parameters == nil {
-		return ""
-	}
-	value, ok := parameters[key]
-	if !ok || value == nil {
-		return ""
-	}
-	return strings.TrimSpace(fmt.Sprint(value))
-}
-
-func intParam(parameters map[string]any, key string) int {
-	if parameters == nil {
-		return 0
-	}
-	switch value := parameters[key].(type) {
-	case int:
-		return value
-	case int64:
-		return int(value)
-	case float64:
-		return int(value)
-	case json.Number:
-		parsed, _ := value.Int64()
-		return int(parsed)
-	case string:
-		var parsed int
-		_, _ = fmt.Sscanf(strings.TrimSpace(value), "%d", &parsed)
-		return parsed
-	default:
-		return 0
-	}
 }

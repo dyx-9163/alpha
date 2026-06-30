@@ -10,7 +10,6 @@ export function redisFrontendAppForLocale(locale?: string): FrontendAppDefinitio
     category: 'database',
     categoryLabel: copy.categoryLabel,
     sourceLabel: copy.sourceLabel,
-    fallbackVersion: '7.2.14',
     description: copy.description,
     frontendReady: true,
     topologies: redisTopologies(locale)

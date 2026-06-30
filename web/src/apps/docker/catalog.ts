@@ -10,7 +10,6 @@ export function dockerFrontendAppForLocale(locale?: string): FrontendAppDefiniti
     category: 'devops',
     categoryLabel: copy.categoryLabel,
     sourceLabel: copy.sourceLabel,
-    fallbackVersion: 'stable',
     description: copy.description,
     frontendReady: true,
     topologies: dockerTopologies(locale)

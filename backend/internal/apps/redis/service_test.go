@@ -421,7 +421,7 @@ func TestServiceDeletesRedisRemotelyBeforeRemovingInstance(t *testing.T) {
 	if !strings.Contains(joinedCommands, `systemctl disable --now "$SERVICE_NAME"`) {
 		t.Fatalf("expected remote command to stop redis service: %s", joinedCommands)
 	}
-	if !strings.Contains(joinedCommands, `rm -rf "$INSTALL_ROOT"`) {
+	if !strings.Contains(joinedCommands, `INSTALL_ROOT='/aifar/apps/redis'`) || !strings.Contains(joinedCommands, `rm -rf "$ROOT"`) {
 		t.Fatalf("expected remote command to remove redis install root: %s", joinedCommands)
 	}
 }

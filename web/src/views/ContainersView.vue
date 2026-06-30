@@ -9,6 +9,11 @@
         <ServerSelector v-model="selectedServerId" :servers="dockerServers" :placeholder="t('containers.selectDockerHost')" class="toolbar-control" />
         <el-button @click="load">{{ t('containers.checkHost') }}</el-button>
         <el-button @click="loadActive">{{ t('common.refresh') }}</el-button>
+        <el-tooltip v-if="selectedDockerInstance" :content="deniedText" :disabled="canManageApps" placement="top">
+          <span>
+            <el-button type="danger" plain :disabled="!canManageApps" @click="openDockerUninstall">{{ t('common.uninstall') }}</el-button>
+          </span>
+        </el-tooltip>
       </div>
     </div>
 
@@ -123,16 +128,28 @@
     </div>
 
     <LogDrawer v-model="logsVisible" :title="t('containers.logs')" :text="logsText" :empty-text="t('tasks.noLogs')" />
+    <SecretConfirmPrompt
+      v-model="deletePromptVisible"
+      :title="t('apps.uninstallService')"
+      :message="deletePromptMessage"
+      :placeholder="t('apps.deleteServicePasswordPlaceholder')"
+      :confirm-text="t('common.uninstall')"
+      :cancel-text="t('common.cancel')"
+      :loading="deleteSubmitting"
+      @confirm="confirmDockerUninstall"
+    />
   </section>
 </template>
 
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
+import { useRouter } from 'vue-router'
 import { apiGet, apiPost, asArray } from '../api/client'
 import KeyValueGrid from '../components/KeyValueGrid.vue'
 import LogDrawer from '../components/LogDrawer.vue'
 import MetricGrid from '../components/MetricGrid.vue'
+import SecretConfirmPrompt from '../components/SecretConfirmPrompt.vue'
 import ServerSelector from '../components/ServerSelector.vue'
 import StatusTag from '../components/StatusTag.vue'
 import { usePermissions } from '../composables/usePermissions'
@@ -146,23 +163,37 @@ type DockerSummaryResponse = {
   diskUsage?: Array<Record<string, string>>
 }
 
+type AppInstance = {
+  id: string
+  app: string
+  serverId: string
+  status: string
+}
+
 const { t } = useI18n()
 const { can, deniedText } = usePermissions()
+const router = useRouter()
 const selectedServerId = ref('')
 const servers = ref<any[]>([])
+const appInstances = ref<AppInstance[]>([])
 const summary = ref<DockerSummaryResponse>({})
 const collection = ref<any[]>([])
 const error = ref('')
 const tab = ref('overview')
 const logsVisible = ref(false)
 const logsText = ref('')
+const deletePromptVisible = ref(false)
+const deleteSubmitting = ref(false)
 const canManageContainers = computed(() => can(permissions.containersManage))
+const canManageApps = computed(() => can(permissions.appsManage))
 
 const summaryData = computed(() => summary.value.summary ?? {})
 const selectedServer = computed(() => servers.value.find((server) => server.id === selectedServerId.value) ?? null)
+const selectedDockerInstance = computed(() => appInstances.value.find((item) => item.app === 'docker' && item.serverId === selectedServerId.value) ?? null)
 const dockerServers = computed(() => servers.value.filter((server) => String(server.dockerHost ?? '').trim() !== ''))
 const targetLabel = computed(() => selectedServer.value ? serverLabel(selectedServer.value) : t('containers.selectDockerHost'))
 const errorTitle = computed(() => summary.value.available === false ? t('containers.notAvailable') : t('containers.checkFailed'))
+const deletePromptMessage = computed(() => selectedServer.value ? t('apps.deleteServicePasswordPrompt', { server: serverLabel(selectedServer.value) }) : '')
 const metrics = computed(() => [
   { label: t('containers.title'), value: summaryData.value.containers ?? 0, note: t('containers.runningCount', { count: summaryData.value.running ?? 0 }) },
   { label: t('containers.images'), value: summaryData.value.images ?? 0, note: t('containers.localImages') },
@@ -211,6 +242,7 @@ function serverLabel(server: any) {
 
 async function loadServers() {
   servers.value = asArray(await apiGet<any[] | null>('/servers').catch(() => []))
+  appInstances.value = asArray(await apiGet<AppInstance[] | null>('/apps/instances').catch(() => []))
   if (!selectedServerId.value || !dockerServers.value.some((server) => server.id === selectedServerId.value)) {
     selectedServerId.value = dockerServers.value[0]?.id ?? ''
   }
@@ -282,6 +314,38 @@ async function openLogs(id: string) {
   const result = await apiGet<{ logs?: string[] }>(`/containers/${encodeURIComponent(id)}/logs?tail=300&${query}`)
   logsText.value = asArray<string>(result.logs).join('\n')
   logsVisible.value = true
+}
+
+function openDockerUninstall() {
+  if (!canManageApps.value) {
+    ElMessage.warning(deniedText.value)
+    return
+  }
+  deletePromptVisible.value = true
+}
+
+async function confirmDockerUninstall(password: string) {
+  const instance = selectedDockerInstance.value
+  if (!instance) {
+    return
+  }
+  if (!password.trim()) {
+    ElMessage.warning(t('apps.deleteServicePasswordPlaceholder'))
+    return
+  }
+  deleteSubmitting.value = true
+  try {
+    const result = await apiPost<{ taskId: string }>(`/apps/instances/${instance.id}/delete`, {
+      serverPassword: password
+    })
+    deletePromptVisible.value = false
+    ElMessage.success(t('apps.uninstallServiceAccepted'))
+    void router.push({ path: '/tasks', query: { taskId: result.taskId } })
+  } catch (err) {
+    ElMessage.error(err instanceof Error ? err.message : t('apps.deleteServiceFailed'))
+  } finally {
+    deleteSubmitting.value = false
+  }
 }
 
 watch(tab, loadActive)

@@ -1,4 +1,4 @@
-# AIFAR Memory
+﻿# AIFAR Memory
 
 - 问题：用户质疑 Redis Sentinel 表单设计，询问是否应支持多主、多副本、多 Sentinel 节点，并要求按官方模型设计。
 - 结论：官方 Sentinel 是可监控一个或多个 master group 的高可用机制，不是单组多主分片；本次安装模型明确为一个 master group：一个 Redis master、其余 replica、所有选中服务器运行 Sentinel。前端新增 `masterName` 监控组名称并调整提示/字段文案，后端 Sentinel 配置不再硬编码 `aifar-master`，改用 `sentinel monitor <masterName>`；`go test ./internal/apps/redis ./internal/installer/redis`、`pnpm web:build`、`pnpm test`、`pnpm backend:build`、`git diff --check` 已通过。
@@ -137,8 +137,8 @@
 - 问题：用户要求 Redis Sentinel 显示“当前 Master”或“Master Group”，MySQL InnoDB Cluster 需要通过检测任务查询当前 primary 后回写并展示。
 - 结论：MySQL 模块已实现检测任务，检测会查询 InnoDB Cluster 当前 primary 并回写同组实例的 `currentPrimaryEndpoint` 与 primary/secondary 角色；数据库页面会按拓扑动态显示“当前 Master”“Master Group”“当前 Primary”或“接入端点”。`pnpm test`、`pnpm web:build`、`git diff --check` 已通过。
 ## 2026-06-29
-- ���⣺�û�Ҫ����Ӧ���̵����� MySQL Router ��װ��ڣ�����ֻ������ MySQL InnoDB Cluster ʱ����ѡ��װ��
-- ���ۣ��������� `mysql-router` ���Ӧ��ģ���ǰ��Ӧ���̵�ģ�飬���� MySQL ���� bundle �е� Router ����ǰ���� InnoDB Cluster ʱ���ò�����ڣ���˰�װУ����봫������ `clusterId` ������ bootstrap endpoint��Router ֧�ֶ�Ŀ�겢����װ����¼����ʵ��������ж�ء�`go test ./internal/installer/mysql ./internal/apps/mysqlrouter`��`pnpm test`��`pnpm web:build`��`git diff --check` ��ͨ����
+- 问题：用户要求在应用商店新增 MySQL Router 安装入口，并且只有已有 MySQL InnoDB Cluster 时才能选择安装。
+- 结论：新增独立 `mysql-router` 后端应用模块和前端应用商店模块，复用 MySQL 离线 bundle 中的 Router 包；前端无 InnoDB Cluster 时禁用部署入口，后端安装校验必须传入已有 `clusterId` 并解析 bootstrap endpoint；Router 支持多目标并发安装、记录独立实例、检测和卸载。`go test ./internal/installer/mysql ./internal/apps/mysqlrouter`、`pnpm test`、`pnpm web:build`、`git diff --check` 已通过。
 
 ## 2026-06-29
 - 问题：用户要求 MySQL Router 在数据库页加入对应 MySQL InnoDB Cluster 卡片中展示，而不是作为独立数据库集群。
@@ -161,17 +161,35 @@
 - 结论：MinIO 安装弹窗新增存储方式选择；本地目录模式只创建数据目录，不再自动探测/回退独立磁盘；未挂载磁盘模式要求填写 /dev/ 设备，后端会校验未挂载、格式化 ext4、写入 fstab 并挂载到数据根路径后再安装。`go test ./internal/apps/minio ./internal/installer/minio`、`pnpm test`、`pnpm web:build`、`git diff --check` 已通过。
 
 ## 2026-06-30
-- ���⣺�û�Ҫ�� MinIO δ���ش���ģʽ�µĴ����豸��Ҫ�ֹ����룬�����ɽӿڼ�������
-- ���ۣ��������������̼�������� GET /api/v2/servers/{id}/disks �ӿڣ�ͨ���ѱ��� SSH ƾ�ݶ�ȡ lsblk -J ������δ���غ�ѡ�豸����װ�������� server-disk-select �ֶ����ͣ�MinIO �ᰴ��ѡ��������̨չʾ�����������ύ serverId ���豸·����ӳ�䣻��� MinIO ��װ�������ݾ��ַ�������������Ŀ�����������У���豸��go test ./internal/servers ./internal/apps/minio��pnpm test��pnpm web:build��git diff --check ��ͨ����
+- 问题：用户要求 MinIO 未挂载磁盘模式下的磁盘设备不要手工输入，而是由接口检测出来。
+- 结论：新增服务器磁盘检测能力和 GET /api/v2/servers/{id}/disks 接口，通过已保存 SSH 凭据读取 lsblk -J 并返回未挂载候选设备；安装弹窗新增 server-disk-select 字段类型，MinIO 会按已选服务器逐台展示磁盘下拉并提交 serverId 到设备路径的映射；后端 MinIO 安装继续兼容旧字符串参数，并按目标服务器二次校验设备。go test ./internal/servers ./internal/apps/minio、pnpm test、pnpm web:build、git diff --check 已通过。
 
 ## 2026-06-30
-- ���⣺�û����ķ��������̼��ӿڷ��� ISO��������������Ŀ���豸��Ҫ��ֻ����δ���ش��̡�
-- ���ۣ����������̼�������ų����� loop/sr �豸���ӿ���Ӧ��������ѡδ���� disk/part��������ֻ�������ƶ���ISO/UDF���ѹ��غʹ��������̣�������Ը��ǷǺ�ѡ�豸�����ء�`go test ./internal/servers`��`pnpm test`��`git diff --check` ��ͨ����`memory.md` ���м��� CRLF ��ʾ��
+- 问题：用户担心服务器磁盘检测接口返回 ISO、光驱或其他非目标设备，要求只返回未挂载磁盘。
+- 结论：服务器磁盘检测命令排除常见 loop/sr 设备，接口响应仅保留候选未挂载 disk/part，并过滤只读、可移动、ISO/UDF、已挂载和带分区整盘；补充测试覆盖非候选设备不返回。`go test ./internal/servers`、`pnpm test`、`git diff --check` 已通过，`memory.md` 仍有既有 CRLF 提示。
 
 ## 2026-06-30
-- ���⣺���������̼����Ҫ���ⷵ�� ISO�����������ƶ��̡�������ϵͳ�̣�MinIO δ���ش���ģʽֻӦ���û�ѡ������δ���������̡�
-- ���ۣ����������̽ӿ���Ӧ����խΪ�����غ�ѡ���� `TYPE=disk`���ұ���δ���ء��޷�������ֻ�����ǿ��ƶ����� ISO/UDF�����Ը���ϵͳ�̡�δ���ط�����USB �̺͹��������ء�`go test ./internal/servers`��`pnpm test`��`git diff --check` ��ͨ����
+- 问题：服务器磁盘检测需要避免返回 ISO、光驱、可移动盘、分区或系统盘，MinIO 未挂载磁盘模式只应让用户选择整块未挂载数据盘。
+- 结论：服务器磁盘接口响应已收窄为仅返回候选整盘 `TYPE=disk`，且必须未挂载、无分区、非只读、非可移动、非 ISO/UDF；测试覆盖系统盘、未挂载分区、USB 盘和光驱不返回。`go test ./internal/servers`、`pnpm test`、`git diff --check` 已通过。
 
 ## 2026-06-30
-- ���⣺�û�ָ�� MinIO δ���ش��̰�װ��Ӧÿ̨������ֻ�ܵ�ѡ���̣�Ӧ�� MinIO �ٷ����̹����߼�֧�ֶ�ѡ��
-- ���ۣ���װ�����ķ���������ѡ����֧��ÿ̨��������ѡ���ύ `serverId -> []disk`��MinIO ��˼��ݾɵ��̲�����֧�ֶ������飬δ���ش���ģʽ�� `dataRoot/diskN` ���̸�ʽ�����أ�MinIO volume ʹ�� `dataRoot/diskN/minio`���ֲ�ʽ���û�������нڵ����� volume��`go test ./internal/installer/minio ./internal/apps/minio`��`pnpm web:build`��`pnpm test`��`git diff --check` ��ͨ����
+- 问题：用户指出 MinIO 未挂载磁盘安装不应每台服务器只能单选磁盘，应按 MinIO 官方多盘挂载逻辑支持多选。
+- 结论：安装弹窗的服务器磁盘选择已支持每台服务器多选，提交 `serverId -> []disk`；MinIO 后端兼容旧单盘参数并支持多盘数组，未挂载磁盘模式按 `dataRoot/diskN` 逐盘格式化挂载，MinIO volume 使用 `dataRoot/diskN/minio`，分布式配置会汇总所有节点所有 volume。`go test ./internal/installer/minio ./internal/apps/minio`、`pnpm web:build`、`pnpm test`、`git diff --check` 已通过。
+
+## 2026-06-30
+- 问题：用户要求数据库页状态必须反映数据库/Redis 服务实时探测结果，不再把服务器在线或安装状态当成数据库在线；MySQL Primary、Redis Master/Replica 也必须来自探测结果，并移除数据库页检查和备份入口。
+- 结论：MySQL InnoDB Cluster 检测只把实际被检查节点标为 running，同组仅同步当前 Primary 元数据；Redis Sentinel 测试补充未检查节点状态不被顺带改为 running；数据库页不再把 installed 当在线，Primary/Master 只读 currentPrimaryEndpoint/currentMasterEndpoint，任一节点异常或未知时集群汇总降级，行内检查/备份按钮和备份页签已移除。验证通过：go test ./internal/apps/mysql ./internal/apps/redis、pnpm test、pnpm web:build、git diff --check。
+
+## 2026-06-30
+- 问题：用户要求整理 config/defaults.env 为中英双语分类配置，并评估脚本、模块配置、版本号和前后端模块结构是否过度拆分。
+- 结论：defaults.env 已按控制面服务、本地开发、初始化与安全、部署运行时、API 限制、维护保留、工具链覆盖分类并补齐中英注释；MySQL/Redis/MinIO/MySQL Router/Docker 不再在前后端 catalog 写死 fallback version，展示和安装版本来自 resources/<app>/<version> 扫描；脚本外置建议采用“内置 go:embed 默认模板 + config/installers 覆盖模板”的生产结构，不建议把未接入的模块变量硬写进 env。验证通过：pnpm web:build、pnpm test、git diff --check。
+
+## 2026-06-30
+- 问题：用户确认按“方便运维、方便开发”的方向继续进行模块和配置收敛。
+- 结论：新增 installerkit.RenderTemplate 统一安装脚本渲染入口，默认优先读取 config/installers/<app>/<template> 覆盖模板，缺失时回退 go:embed 内置模板；Docker/MySQL/Redis/MinIO 安装脚本均已接入该入口；defaults.env 新增 AIFAR_INSTALLER_TEMPLATE_DIR 并补充 config/installers/README.md；前端应用模块移除 fallbackVersion 字段，版本只由后端资源扫描 catalog 提供。验证通过：pnpm web:build、go test ./internal/installer/installerkit ./internal/installer/docker ./internal/installer/mysql ./internal/installer/redis ./internal/installer/minio、pnpm test、git diff --check。
+## 2026-06-30
+- 问题：用户要求后端模块按每个 app 一个标准结构收敛为 module.go、service.go、options.go、status.go、templates/。
+- 结论：Docker、MySQL、Redis、MinIO 的 app-specific installer 实现已从 backend/internal/installer/<app> 移入对应 backend/internal/apps/<app>，backend/internal/installer 仅保留共享 installerkit/uploadkit；MySQL Router 拆出独立 bundle/installer/script/uninstall/options/status/templates，不再把 Router 安装生命周期挂在 MySQL 包上，模板覆盖路径调整为 mysql-router/install.sh 与 mysql-router/uninstall.sh。验证通过：go test ./internal/apps/docker ./internal/apps/mysql ./internal/apps/redis ./internal/apps/minio ./internal/apps/mysqlrouter、pnpm test、git diff --check（仅 memory.md 既有 CRLF 提示）。
+## 2026-06-30
+- 问题：用户要求去掉收敛后的多余文件和代码。
+- 结论：已删除未注册且无引用的 backend/internal/apps/offlineapp 旧共享离线占位模块；移除后端应用实例 upgrade stub 路由/handler 和数据库实例 backup stub 路由/handler，只保留真实可用的控制面 SQLite 备份维护能力；同步清理后端 offline/占位 backup/占位 upgrade i18n 文案和前端数据库页旧备份文案。验证通过：pnpm test、pnpm web:build、git diff --check（仅 memory.md 既有 CRLF 提示）。

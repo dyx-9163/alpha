@@ -24,7 +24,7 @@ export function pairedAppCatalog(payload: AppCatalogResponse, locale?: string): 
       category: frontend.category || server.category || 'database',
       categoryLabel: frontend.categoryLabel || server.categoryLabel || frontend.category,
       sourceLabel: frontend.sourceLabel || server.sourceLabel || 'Built-in',
-      fallbackVersion: frontend.fallbackVersion || server.fallbackVersion || 'latest',
+      fallbackVersion: server.fallbackVersion || '',
       description: frontend.description || server.description || '',
       installName: server.installName || frontend.name,
       resourceApp: server.resourceApp || frontend.name,

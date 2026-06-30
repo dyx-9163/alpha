@@ -56,6 +56,7 @@ export function withToolEnv(extra = {}) {
     AIFAR_DEFAULT_PASSWORD: defaultPassword,
     AIFAR_BOOTSTRAP_PASSWORD: process.env.AIFAR_BOOTSTRAP_PASSWORD || defaultPassword,
     AIFAR_DEFAULT_DEPLOY_DIR: process.env.AIFAR_DEFAULT_DEPLOY_DIR || defaults.AIFAR_DEFAULT_DEPLOY_DIR || '/aifar/apps',
+    AIFAR_INSTALLER_TEMPLATE_DIR: process.env.AIFAR_INSTALLER_TEMPLATE_DIR || defaults.AIFAR_INSTALLER_TEMPLATE_DIR || path.join(rootDir, 'config', 'installers'),
     ...extra
   }
 }

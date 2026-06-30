@@ -69,6 +69,11 @@
                 <div class="node-tags">
                   <el-tag size="small" :type="roleTagType(node.role)" effect="plain">{{ node.roleLabel }}</el-tag>
                   <el-tag size="small" :type="nodeHealthType(node)">{{ nodeHealthLabel(node) }}</el-tag>
+                  <el-tooltip :content="deniedText" :disabled="canManageApps" placement="top">
+                    <span>
+                      <el-button size="small" type="danger" plain :disabled="!canManageApps" @click="openDeleteInstance(node.instance)">{{ t('common.uninstall') }}</el-button>
+                    </span>
+                  </el-tooltip>
                 </div>
               </div>
             </div>
@@ -82,6 +87,11 @@
                 <div class="node-tags">
                   <el-tag size="small" :type="roleTagType(node.role)" effect="plain">{{ node.roleLabel }}</el-tag>
                   <el-tag size="small" :type="nodeHealthType(node)">{{ nodeHealthLabel(node) }}</el-tag>
+                  <el-tooltip :content="deniedText" :disabled="canManageApps" placement="top">
+                    <span>
+                      <el-button size="small" type="danger" plain :disabled="!canManageApps" @click="openDeleteInstance(node.instance)">{{ t('common.uninstall') }}</el-button>
+                    </span>
+                  </el-tooltip>
                 </div>
               </div>
             </div>
@@ -100,6 +110,17 @@
         </div>
       </template>
     </div>
+
+    <SecretConfirmPrompt
+      v-model="deletePromptVisible"
+      :title="t('apps.uninstallService')"
+      :message="deletePromptMessage"
+      :placeholder="t('apps.deleteServicePasswordPlaceholder')"
+      :confirm-text="t('common.uninstall')"
+      :cancel-text="t('common.cancel')"
+      :loading="deleteSubmitting"
+      @confirm="confirmDeleteInstance"
+    />
   </section>
 </template>
 
@@ -110,6 +131,7 @@ import { useRouter } from 'vue-router'
 import { apiGet, apiPost, asArray } from '../api/client'
 import KeyValueGrid from '../components/KeyValueGrid.vue'
 import RunRecordTable from '../components/RunRecordTable.vue'
+import SecretConfirmPrompt from '../components/SecretConfirmPrompt.vue'
 import StatusTag from '../components/StatusTag.vue'
 import { usePermissions } from '../composables/usePermissions'
 import { useI18n } from '../i18n'
@@ -169,6 +191,9 @@ const search = ref('')
 const monitoringEnabled = ref(true)
 const monitoringRunning = ref(false)
 const lastMonitorAt = ref('')
+const deletePromptVisible = ref(false)
+const deleteSubmitting = ref(false)
+const pendingDeleteInstance = ref<AppInstance | null>(null)
 let monitorTimer: ReturnType<typeof setInterval> | undefined
 const monitorIntervalMs = 30000
 const mysqlGroupCount = computed(() => instanceGroups.value.filter((item) => item.app === 'mysql').length)
@@ -184,6 +209,10 @@ const monitoringStatusLabel = computed(() => {
     return t('database.monitoring')
   }
   return monitoringEnabled.value ? t('database.realtimeMonitorOn') : t('database.realtimeMonitorOff')
+})
+const deletePromptMessage = computed(() => {
+  const row = pendingDeleteInstance.value
+  return row ? t('apps.deleteServicePasswordPrompt', { server: serverName(row.serverId) }) : ''
 })
 const instanceGroups = computed(() => groupDatabaseInstances(instances.value))
 const filteredGroups = computed(() => {
@@ -773,6 +802,40 @@ function normalizeEndpoint(value: string) {
 
 function openTaskDetails(row: { id: string }) {
   void router.push({ path: '/tasks', query: { taskId: row.id } })
+}
+
+function openDeleteInstance(row: AppInstance) {
+  if (!canManageApps.value) {
+    ElMessage.warning(deniedText.value)
+    return
+  }
+  pendingDeleteInstance.value = row
+  deletePromptVisible.value = true
+}
+
+async function confirmDeleteInstance(password: string) {
+  const row = pendingDeleteInstance.value
+  if (!row) {
+    return
+  }
+  if (!password.trim()) {
+    ElMessage.warning(t('apps.deleteServicePasswordPlaceholder'))
+    return
+  }
+  deleteSubmitting.value = true
+  try {
+    const result = await apiPost<{ taskId: string }>(`/apps/instances/${row.id}/delete`, {
+      serverPassword: password
+    })
+    deletePromptVisible.value = false
+    pendingDeleteInstance.value = null
+    ElMessage.success(t('apps.uninstallServiceAccepted'))
+    void router.push({ path: '/tasks', query: { taskId: result.taskId } })
+  } catch (err) {
+    ElMessage.error(err instanceof Error ? err.message : t('apps.deleteServiceFailed'))
+  } finally {
+    deleteSubmitting.value = false
+  }
 }
 
 onMounted(async () => {

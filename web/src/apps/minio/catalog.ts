@@ -10,7 +10,6 @@ export function minioFrontendAppForLocale(locale?: string): FrontendAppDefinitio
     category: 'storage',
     categoryLabel: copy.categoryLabel,
     sourceLabel: copy.sourceLabel,
-    fallbackVersion: '2025-10-15T17-29-55Z',
     description: copy.description,
     frontendReady: true,
     topologies: minioTopologies(locale)

@@ -268,7 +268,7 @@ func TestServiceDeletesDockerRemotelyBeforeRemovingInstance(t *testing.T) {
 	if !strings.Contains(joinedCommands, "systemctl disable --now docker") {
 		t.Fatalf("expected remote command to stop docker: %s", joinedCommands)
 	}
-	if !strings.Contains(joinedCommands, "rm -rf \"$INSTALL_ROOT\"") {
+	if !strings.Contains(joinedCommands, "INSTALL_ROOT='/aifar/apps/docker'") || !strings.Contains(joinedCommands, "rm -rf \"$ROOT\"") {
 		t.Fatalf("expected remote command to remove install root: %s", joinedCommands)
 	}
 	if !strings.Contains(joinedCommands, "AIFAR_DOCKER_STATUS") {

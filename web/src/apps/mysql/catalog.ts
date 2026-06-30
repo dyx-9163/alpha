@@ -10,7 +10,6 @@ export function mysqlFrontendAppForLocale(locale?: string): FrontendAppDefinitio
     category: 'database',
     categoryLabel: copy.categoryLabel,
     sourceLabel: copy.sourceLabel,
-    fallbackVersion: '8.0.36',
     description: copy.description,
     frontendReady: true,
     topologies: mysqlTopologies(locale)

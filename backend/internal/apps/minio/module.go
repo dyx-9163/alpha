@@ -8,7 +8,6 @@ import (
 	"aifar-deployment/backend/internal/adapter"
 	"aifar-deployment/backend/internal/apps/registry"
 	"aifar-deployment/backend/internal/i18n"
-	minioinstaller "aifar-deployment/backend/internal/installer/minio"
 	"aifar-deployment/backend/internal/store"
 )
 
@@ -22,7 +21,7 @@ func init() {
 	})
 }
 
-func NewModule(s Store, remote minioinstaller.Remote) Module {
+func NewModule(s Store, remote Remote) Module {
 	return Module{service: NewService(s, remote)}
 }
 
@@ -39,7 +38,6 @@ func (m Module) Manifest(lang string) registry.Manifest {
 		Category:            "storage",
 		CategoryLabel:       copy.CategoryLabel,
 		SourceLabel:         copy.SourceLabel,
-		FallbackVersion:     "2025-10-15T17-29-55Z",
 		Description:         copy.Description,
 		InstallName:         "minio",
 		ResourceApp:         "minio",
@@ -76,7 +74,7 @@ func (m Module) PreflightInstall(ctx context.Context, req registry.InstallReques
 	if ctx.Err() != nil {
 		return registry.PreflightResult{}, ctx.Err()
 	}
-	bundle, err := minioinstaller.SelectBundle(resources, req.Version)
+	bundle, err := SelectBundle(resources, req.Version)
 	if err != nil {
 		return registry.PreflightResult{}, err
 	}
@@ -126,11 +124,11 @@ func (m Module) ValidateInstall(ctx context.Context, req registry.InstallRequest
 	default:
 		return fmt.Errorf(copy.DistributedUnsupported, topology)
 	}
-	bundle, err := minioinstaller.SelectBundle(resources, req.Version)
+	bundle, err := SelectBundle(resources, req.Version)
 	if err != nil {
 		return err
 	}
-	if err := minioinstaller.VerifyBundle(bundle); err != nil {
+	if err := VerifyBundle(bundle); err != nil {
 		return err
 	}
 	if err := validateMinioStorage(req.Parameters, targets...); err != nil {
@@ -149,7 +147,7 @@ func (m Module) Install(ctx context.Context, req registry.InstallRequest, run re
 		DefaultPassword: req.DefaultPassword,
 		Parameters:      req.Parameters,
 		Concurrency:     run.Concurrency,
-	}, run.Resources, run.Log, func(target string) minioinstaller.Logger {
+	}, run.Resources, run.Log, func(target string) Logger {
 		return run.LoggerForTarget(target)
 	})
 }
@@ -176,10 +174,11 @@ func (m Module) Delete(ctx context.Context, req registry.DeleteRequest, run regi
 		return errors.New(i18n.Text(req.Language, "api.deleteRequiresServerPasswordConfirmation"))
 	}
 	return m.service.Delete(ctx, DeleteRequest{
-		Instance: req.Instance,
-		Server:   req.Server,
-		Language: req.Language,
-	}, run.Log, func(target string) minioinstaller.Logger {
+		Instance:   req.Instance,
+		Server:     req.Server,
+		Language:   req.Language,
+		Parameters: req.Parameters,
+	}, run.Log, func(target string) Logger {
 		return run.LoggerForTarget(target)
 	})
 }

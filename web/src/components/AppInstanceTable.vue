@@ -16,7 +16,7 @@
             <el-button size="small" plain :disabled="!props.canCheck" @click="emitCheck(row)">{{ t('common.check') }}</el-button>
           </span>
         </el-tooltip>
-        <el-tooltip :content="props.disabledReason" :disabled="props.canDelete || !props.disabledReason" placement="top">
+        <el-tooltip v-if="props.showDelete" :content="props.disabledReason" :disabled="props.canDelete || !props.disabledReason" placement="top">
           <span>
             <el-button size="small" type="danger" plain :disabled="!props.canDelete" @click="emitDelete(row)">{{ t('common.delete') }}</el-button>
           </span>
@@ -63,6 +63,7 @@ const props = withDefaults(defineProps<{
   rowKey?: string
   height?: string | number
   showActions?: boolean
+  showDelete?: boolean
   showTime?: boolean
   canCheck?: boolean
   canDelete?: boolean
@@ -71,6 +72,7 @@ const props = withDefaults(defineProps<{
   servers: () => [],
   rowKey: 'id',
   height: '100%',
+  showDelete: true,
   showTime: true,
   canCheck: true,
   canDelete: true,

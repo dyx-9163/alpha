@@ -181,7 +181,10 @@ const versions = computed(() => {
   if (!props.app) {
     return []
   }
-  return props.app.versions.length ? props.app.versions : [props.app.fallbackVersion]
+  if (props.app.versions.length) {
+    return props.app.versions
+  }
+  return props.app.fallbackVersion ? [props.app.fallbackVersion] : []
 })
 const effectiveTargetMode = computed(() => props.targetModeResolver?.(fieldValues.value) ?? props.targetMode)
 const targetSelectorHidden = computed(() => props.hideTargetSelectorResolver?.(fieldValues.value) ?? props.hideTargetSelector ?? false)

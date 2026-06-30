@@ -61,6 +61,15 @@
           <el-table-column :label="t('common.endpoint')" min-width="220" show-overflow-tooltip><template #default="{ row }">{{ metadataOf(row).endpoint || '-' }}</template></el-table-column>
           <el-table-column prop="topology" :label="t('dashboard.topology')" width="140" />
           <el-table-column prop="status" :label="t('common.status')" width="120"><template #default="{ row }"><StatusTag :status="row.status" /></template></el-table-column>
+          <el-table-column :label="t('common.operation')" width="120" fixed="right">
+            <template #default="{ row }">
+              <el-tooltip :content="deniedText" :disabled="canManageApps" placement="top">
+                <span>
+                  <el-button size="small" type="danger" plain :disabled="!canManageApps" @click="openDeleteInstance(row)">{{ t('common.uninstall') }}</el-button>
+                </span>
+              </el-tooltip>
+            </template>
+          </el-table-column>
         </el-table>
         <div v-else class="empty-state storage-empty">
           <div>
@@ -170,6 +179,19 @@
       </template>
     </div>
 
+    <el-dialog v-model="deleteDialogVisible" :title="t('apps.uninstallService')" width="460px" destroy-on-close @closed="resetDeleteDialog">
+      <p class="secret-confirm-message">{{ deletePromptMessage }}</p>
+      <el-input v-model="deletePassword" type="password" :placeholder="t('apps.deleteServicePasswordPlaceholder')" show-password autofocus @keyup.enter="confirmDeleteInstance" />
+      <el-checkbox v-if="deleteInstanceUsesMountedDisks" v-model="deleteRemoveMountedDisks" class="delete-disk-option">
+        {{ t('storage.removeMountedDisks') }}
+      </el-checkbox>
+      <p v-if="deleteInstanceUsesMountedDisks" class="delete-disk-hint">{{ t('storage.removeMountedDisksHint') }}</p>
+      <template #footer>
+        <el-button :disabled="deleteSubmitting" @click="deleteDialogVisible = false">{{ t('common.cancel') }}</el-button>
+        <el-button type="danger" :loading="deleteSubmitting" @click="confirmDeleteInstance">{{ t('common.uninstall') }}</el-button>
+      </template>
+    </el-dialog>
+
     <el-dialog v-model="itemDialogVisible" :title="dialogTitle" width="520px">
       <el-form label-position="top">
         <el-form-item :label="t('storage.name')">
@@ -231,6 +253,11 @@ const selectedInstanceId = ref('')
 const tab = ref('instances')
 const search = ref('')
 const itemDialogVisible = ref(false)
+const deleteDialogVisible = ref(false)
+const deleteSubmitting = ref(false)
+const deletePassword = ref('')
+const deleteRemoveMountedDisks = ref(false)
+const pendingDeleteInstance = ref<AppInstance | null>(null)
 const itemKind = ref<StorageKind>('bucket')
 const itemForm = reactive({ name: '', policy: '', accessKey: '', secretKey: '' })
 const collection = reactive<Record<string, any[]>>({
@@ -241,6 +268,7 @@ const collection = reactive<Record<string, any[]>>({
   replicas: []
 })
 const canManageStorage = computed(() => can(permissions.storageManage))
+const canManageApps = computed(() => can(permissions.appsManage))
 
 const filteredInstances = computed(() => {
   const q = search.value.trim().toLowerCase()
@@ -270,6 +298,14 @@ const dialogTitle = computed(() => {
     replica: t('storage.addReplica')
   }
   return labels[itemKind.value]
+})
+const deletePromptMessage = computed(() => {
+  const row = pendingDeleteInstance.value
+  return row ? t('apps.deleteServicePasswordPrompt', { server: serverName(row.serverId) }) : ''
+})
+const deleteInstanceUsesMountedDisks = computed(() => {
+  const row = pendingDeleteInstance.value
+  return row ? String(metadataOf(row).storageMode || '') === 'unmounted-disk' : false
 })
 
 async function load() {
@@ -344,6 +380,48 @@ async function deleteItem(kind: StorageKind, id: string) {
   await apiDelete(`${collectionPath(kind)}/${encodeURIComponent(id)}`)
   ElMessage.success(t('storage.itemDeleted'))
   await loadActive()
+}
+
+function openDeleteInstance(row: AppInstance) {
+  if (!canManageApps.value) {
+    ElMessage.warning(deniedText.value)
+    return
+  }
+  pendingDeleteInstance.value = row
+  deletePassword.value = ''
+  deleteRemoveMountedDisks.value = false
+  deleteDialogVisible.value = true
+}
+
+function resetDeleteDialog() {
+  deletePassword.value = ''
+  deleteRemoveMountedDisks.value = false
+  pendingDeleteInstance.value = null
+}
+
+async function confirmDeleteInstance() {
+  const row = pendingDeleteInstance.value
+  if (!row) {
+    return
+  }
+  if (!deletePassword.value.trim()) {
+    ElMessage.warning(t('apps.deleteServicePasswordPlaceholder'))
+    return
+  }
+  deleteSubmitting.value = true
+  try {
+    const result = await apiPost<{ taskId: string }>(`/apps/instances/${row.id}/delete`, {
+      serverPassword: deletePassword.value,
+      removeMountedDisks: deleteInstanceUsesMountedDisks.value && deleteRemoveMountedDisks.value
+    })
+    deleteDialogVisible.value = false
+    ElMessage.success(t('apps.uninstallServiceAccepted'))
+    void router.push({ path: '/tasks', query: { taskId: result.taskId } })
+  } catch (err) {
+    ElMessage.error(err instanceof Error ? err.message : t('apps.deleteServiceFailed'))
+  } finally {
+    deleteSubmitting.value = false
+  }
 }
 
 function openTaskDetails(row: { id: string }) {
@@ -431,6 +509,24 @@ onMounted(load)
   min-height: 0;
   height: 100%;
   padding: 12px;
+}
+
+.secret-confirm-message {
+  margin: 0 0 12px;
+  color: var(--aifar-text-secondary);
+  font-size: 14px;
+  line-height: 22px;
+}
+
+.delete-disk-option {
+  margin-top: 12px;
+}
+
+.delete-disk-hint {
+  margin: 4px 0 0;
+  color: var(--aifar-text-tertiary);
+  font-size: 12px;
+  line-height: 20px;
 }
 
 @media (max-width: 1100px) {

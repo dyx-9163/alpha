@@ -85,10 +85,10 @@
           :servers="servers"
           show-actions
           :can-check="canManageApps"
-          :can-delete="canManageApps"
+          :can-delete="false"
+          :show-delete="false"
           :disabled-reason="deniedText"
           @check="checkDeploymentService"
-          @delete="deleteDeploymentService"
         />
       </section>
     </div>
@@ -108,17 +108,6 @@
       v-bind="moduleDialogProps"
       @submit="submitModuleInstall"
     />
-
-    <SecretConfirmPrompt
-      v-model="deletePromptVisible"
-      :title="t('apps.deleteService')"
-      :message="deletePromptMessage"
-      :placeholder="t('apps.deleteServicePasswordPlaceholder')"
-      :confirm-text="t('common.delete')"
-      :cancel-text="t('common.cancel')"
-      :loading="deleteSubmitting"
-      @confirm="confirmDeleteDeploymentService"
-    />
   </PageShell>
 </template>
 
@@ -134,7 +123,6 @@ import { resolveAppLocale } from '../apps/registry/locale'
 import type { AppFrontendModule, AppInstallDialogContext, AppInstallPayload, ServerOption } from '../apps/registry/contract'
 import AppInstanceTable from '../components/AppInstanceTable.vue'
 import PageShell from '../components/PageShell.vue'
-import SecretConfirmPrompt from '../components/SecretConfirmPrompt.vue'
 import { usePermissions } from '../composables/usePermissions'
 import { useI18n } from '../i18n'
 import { permissions } from '../rbac'
@@ -151,9 +139,6 @@ const installSubmitting = ref(false)
 const moduleDialogVisible = ref(false)
 const moduleDialogApp = ref<AppStoreItem | null>(null)
 const moduleDialogModule = shallowRef<AppFrontendModule | null>(null)
-const deletePromptVisible = ref(false)
-const deleteSubmitting = ref(false)
-const pendingDeleteService = ref<AppInstanceTableRecord | null>(null)
 const locale = computed(() => resolveAppLocale())
 const canManageApps = computed(() => can(permissions.appsManage))
 const canScanResources = computed(() => can(permissions.resourcesScan))
@@ -166,10 +151,6 @@ const installDialogContext = computed<AppInstallDialogContext>(() => ({
   instances: instances.value
 }))
 const moduleDialogProps = computed(() => moduleDialogModule.value?.installDialogProps?.(locale.value, installDialogContext.value) ?? {})
-const deletePromptMessage = computed(() => {
-  const row = pendingDeleteService.value
-  return row ? t('apps.deleteServicePasswordPrompt', { server: serverLabel(row.serverId) }) : ''
-})
 
 type AppInstanceTableRecord = {
   id: string
@@ -183,7 +164,7 @@ type AppInstanceTableRecord = {
 }
 
 function displayVersion(app: AppStoreItem) {
-  return app.versions.at(-1) ?? app.fallbackVersion
+  return app.versions.at(-1) || app.fallbackVersion || '-'
 }
 
 function countByCategory(name: string) {
@@ -279,52 +260,6 @@ async function checkDeploymentService(row: AppInstanceTableRecord) {
   } catch (err) {
     ElMessage.error(err instanceof Error ? err.message : t('apps.checkServiceFailed'))
   }
-}
-
-function deleteDeploymentService(row: AppInstanceTableRecord) {
-  if (!canManageApps.value) {
-    ElMessage.warning(deniedText.value)
-    return
-  }
-  pendingDeleteService.value = row
-  deletePromptVisible.value = true
-}
-
-async function confirmDeleteDeploymentService(password: string) {
-  const row = pendingDeleteService.value
-  if (!row) {
-    return
-  }
-  if (!password.trim()) {
-    ElMessage.warning(t('apps.deleteServicePasswordPlaceholder'))
-    return
-  }
-  deleteSubmitting.value = true
-  try {
-    const result = await apiPost<{ taskId: string }>(`/apps/instances/${row.id}/delete`, {
-      serverPassword: password,
-      language: locale.value
-    })
-    deletePromptVisible.value = false
-    pendingDeleteService.value = null
-    openTaskCenter(result.taskId)
-    ElMessage.success(t('apps.deleteServiceAccepted'))
-  } catch (err) {
-    ElMessage.error(err instanceof Error ? err.message : t('apps.deleteServiceFailed'))
-  } finally {
-    deleteSubmitting.value = false
-  }
-}
-
-function serverLabel(serverId?: string) {
-  if (!serverId) {
-    return '-'
-  }
-  const server = servers.value.find((item) => item.id === serverId)
-  if (!server) {
-    return serverId
-  }
-  return server.name && server.host ? `${server.name} (${server.host})` : server.name || server.host || serverId
 }
 
 function openTaskCenter(taskId: string) {

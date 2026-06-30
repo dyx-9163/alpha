@@ -8,7 +8,6 @@ import (
 	"aifar-deployment/backend/internal/adapter"
 	"aifar-deployment/backend/internal/apps/registry"
 	"aifar-deployment/backend/internal/i18n"
-	mysqlinstaller "aifar-deployment/backend/internal/installer/mysql"
 	"aifar-deployment/backend/internal/store"
 )
 
@@ -23,7 +22,7 @@ func init() {
 	})
 }
 
-func NewModule(s Store, remote mysqlinstaller.Remote, defaultPassword ...string) Module {
+func NewModule(s Store, remote Remote, defaultPassword ...string) Module {
 	password := ""
 	if len(defaultPassword) > 0 {
 		password = defaultPassword[0]
@@ -44,7 +43,6 @@ func (m Module) Manifest(lang string) registry.Manifest {
 		Category:            "database",
 		CategoryLabel:       copy.CategoryLabel,
 		SourceLabel:         copy.SourceLabel,
-		FallbackVersion:     "8.0.36",
 		Description:         copy.Description,
 		InstallName:         "mysql",
 		ResourceApp:         "mysql",
@@ -81,7 +79,7 @@ func (m Module) PreflightInstall(ctx context.Context, req registry.InstallReques
 	if ctx.Err() != nil {
 		return registry.PreflightResult{}, ctx.Err()
 	}
-	bundle, err := mysqlinstaller.SelectBundle(resources, req.Version)
+	bundle, err := SelectBundle(resources, req.Version)
 	if err != nil {
 		return registry.PreflightResult{}, err
 	}
@@ -134,11 +132,11 @@ func (m Module) ValidateInstall(ctx context.Context, req registry.InstallRequest
 	default:
 		return fmt.Errorf(copy.ClusterUnsupported, topology)
 	}
-	bundle, err := mysqlinstaller.SelectBundle(resources, req.Version)
+	bundle, err := SelectBundle(resources, req.Version)
 	if err != nil {
 		return err
 	}
-	if err := mysqlinstaller.VerifyBundle(bundle); err != nil {
+	if err := VerifyBundle(bundle); err != nil {
 		return err
 	}
 	return mysqlOptions(req.Parameters, req.DefaultPassword).Validate()
@@ -154,7 +152,7 @@ func (m Module) Install(ctx context.Context, req registry.InstallRequest, run re
 		DefaultPassword: req.DefaultPassword,
 		Parameters:      req.Parameters,
 		Concurrency:     run.Concurrency,
-	}, run.Resources, run.Log, func(target string) mysqlinstaller.Logger {
+	}, run.Resources, run.Log, func(target string) Logger {
 		return run.LoggerForTarget(target)
 	})
 }
@@ -184,7 +182,7 @@ func (m Module) Delete(ctx context.Context, req registry.DeleteRequest, run regi
 		Instance: req.Instance,
 		Server:   req.Server,
 		Language: req.Language,
-	}, run.Log, func(target string) mysqlinstaller.Logger {
+	}, run.Log, func(target string) Logger {
 		return run.LoggerForTarget(target)
 	})
 }
@@ -212,7 +210,7 @@ func (m Module) Check(ctx context.Context, req registry.CheckRequest, run regist
 		Server:          req.Server,
 		Language:        req.Language,
 		DefaultPassword: m.defaultPassword,
-	}, run.Log, func(target string) mysqlinstaller.Logger {
+	}, run.Log, func(target string) Logger {
 		return run.LoggerForTarget(target)
 	})
 	return registry.InstanceStatus{Status: result.Status, Message: result.Message, Details: result.Details}, err

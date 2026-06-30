@@ -376,7 +376,7 @@ func TestServiceDeletesMySQLRemotelyBeforeRemovingInstance(t *testing.T) {
 	if !strings.Contains(joinedCommands, `systemctl disable --now "$SERVICE_NAME"`) {
 		t.Fatalf("expected remote command to stop mysql service: %s", joinedCommands)
 	}
-	if !strings.Contains(joinedCommands, `rm -rf "$INSTALL_ROOT"`) {
+	if !strings.Contains(joinedCommands, `INSTALL_ROOT='/aifar/apps/mysql'`) || !strings.Contains(joinedCommands, `rm -rf "$ROOT"`) {
 		t.Fatalf("expected remote command to remove mysql install root: %s", joinedCommands)
 	}
 }

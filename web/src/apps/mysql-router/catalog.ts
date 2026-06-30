@@ -10,7 +10,6 @@ export function mysqlRouterFrontendAppForLocale(locale?: string): FrontendAppDef
     category: 'database',
     categoryLabel: copy.categoryLabel,
     sourceLabel: copy.sourceLabel,
-    fallbackVersion: '8.0.36',
     description: copy.description,
     frontendReady: true,
     topologies: [{ name: 'router', label: 'Router', targetMode: 'multiple', minTargets: 1, default: true }]
