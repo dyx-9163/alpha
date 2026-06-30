@@ -283,6 +283,7 @@ const tab = ref('instances')
 const search = ref('')
 const monitoringEnabled = ref(true)
 const monitoringRunning = ref(false)
+const monitorStartedAt = ref(0)
 const lastMonitorAt = ref('')
 const deletePromptVisible = ref(false)
 const deleteSubmitting = ref(false)
@@ -393,6 +394,7 @@ async function runRealtimeCheck(manual: boolean) {
     return
   }
   monitoringRunning.value = true
+  monitorStartedAt.value = Date.now()
   try {
     await load()
     const taskIds: string[] = []
@@ -653,7 +655,7 @@ function virtualRedisNode(group: DatabaseGroup, endpoint: string, role: string):
     topology: 'sentinel',
     role,
     endpoint,
-    lastCheck: { status: 'running' }
+    lastCheck: { status: 'unknown' }
   }
   if (role === 'sentinel') {
     metadata.sentinel = true
@@ -663,7 +665,7 @@ function virtualRedisNode(group: DatabaseGroup, endpoint: string, role: string):
     app: 'redis',
     version: group.version,
     serverId: server?.id || '',
-    status: 'running',
+    status: 'unknown',
     topology: 'sentinel',
     metadata: '',
     createdAt: group.createdAt
@@ -849,18 +851,67 @@ function nodeHealthType(node: DatabaseNode) {
 }
 
 function nodeHealth(node: DatabaseNode) {
-  if (['failed', 'error', 'missing', 'stopped'].includes(node.instance.status)) {
+  if (serverStatusOffline(nodeServerStatus(node))) {
+    return 'offline'
+  }
+  if (['failed', 'error', 'missing', 'stopped', 'offline', 'unavailable'].includes(node.instance.status)) {
     return 'offline'
   }
   const lastCheckStatus = stringValue(node.metadata.lastCheck?.status)
   const status = lastCheckStatus || node.instance.status
-  if (['ok', 'success', 'running', 'available'].includes(status)) {
+  if (node.virtual && !serverStatusOnline(nodeServerStatus(node))) {
+    return 'unknown'
+  }
+  if (monitoringRunning.value && statusIsOnline(status) && isNodeCheckStaleForCurrentMonitor(node)) {
+    return 'unknown'
+  }
+  if (statusIsOnline(status)) {
     return 'online'
   }
-  if (['failed', 'error', 'missing', 'stopped'].includes(status)) {
+  if (statusIsOffline(status)) {
     return 'offline'
   }
   return 'unknown'
+}
+
+function isNodeCheckStaleForCurrentMonitor(node: DatabaseNode) {
+  if (!monitorStartedAt.value) {
+    return false
+  }
+  const checkedAt = nodeLastCheckedAt(node)
+  return checkedAt === 0 || checkedAt + 1000 < monitorStartedAt.value
+}
+
+function nodeLastCheckedAt(node: DatabaseNode) {
+  const value = stringValue(node.metadata.lastCheck?.checkedAt || node.metadata.lastCheck?.details?.checkedAt)
+  if (!value) {
+    return 0
+  }
+  const time = new Date(value).getTime()
+  return Number.isNaN(time) ? 0 : time
+}
+
+function nodeServerStatus(node: DatabaseNode) {
+  const server = node.instance.serverId
+    ? servers.value.find((item) => item.id === node.instance.serverId)
+    : serverByEndpoint(node.endpoint)
+  return String(server?.status || '').trim().toLowerCase()
+}
+
+function serverStatusOnline(status: string) {
+  return ['available', 'running', 'success', 'ok'].includes(status)
+}
+
+function serverStatusOffline(status: string) {
+  return ['failed', 'error', 'missing', 'stopped', 'offline', 'unavailable'].includes(status)
+}
+
+function statusIsOnline(status: string) {
+  return ['ok', 'success', 'running', 'available'].includes(status)
+}
+
+function statusIsOffline(status: string) {
+  return ['failed', 'error', 'missing', 'stopped', 'offline', 'unavailable'].includes(status)
 }
 
 function nodeRunsSentinel(node: DatabaseNode) {
@@ -1012,6 +1063,10 @@ function serviceStatus(nodes: DatabaseNode[]) {
   const healths = nodes.map((node) => nodeHealth(node))
   if (!healths.length) {
     return 'unknown'
+  }
+  const realHealths = nodes.filter((node) => !node.virtual).map((node) => nodeHealth(node))
+  if (realHealths.length && realHealths.every((status) => status === 'offline') && healths.every((status) => status !== 'online')) {
+    return 'unavailable'
   }
   if (healths.every((status) => status === 'online')) {
     return 'running'

@@ -74,6 +74,7 @@ type fakeRemote struct {
 	mu             sync.Mutex
 	commands       []string
 	responses      map[string]adapter.CommandResult
+	failAll        bool
 	blockInstall   bool
 	installStarted chan string
 	releaseInstall chan struct{}
@@ -91,6 +92,9 @@ func (f *fakeRemote) Run(ctx context.Context, server store.Server, command strin
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.commands = append(f.commands, command)
+	if f.failAll {
+		return adapter.CommandResult{}, fmt.Errorf("remote offline")
+	}
 	for needle, result := range f.responses {
 		if strings.Contains(command, needle) {
 			return result, nil
@@ -343,6 +347,55 @@ func TestServiceChecksRedisSentinelAndUpdatesCurrentMasterRoles(t *testing.T) {
 	}
 	if !strings.Contains(remote.joinedCommands(), "SENTINEL replicas") || !strings.Contains(remote.joinedCommands(), "SENTINEL sentinels") {
 		t.Fatal("expected check to query Redis Sentinel replicas and sentinel peers")
+	}
+}
+
+func TestServiceCheckFailureClearsStaleRedisSentinelTopology(t *testing.T) {
+	s := &fakeStore{servers: map[string]store.Server{
+		"srv-1": {ID: "srv-1", Name: "redis-1", Host: "10.0.0.1", DeployDir: "/aifar/apps"},
+	}}
+	metadata, _ := json.Marshal(map[string]any{
+		"clusterId":             "redis_sentinel_test",
+		"port":                  6379,
+		"sentinelPort":          26379,
+		"masterName":            "orders-primary",
+		"role":                  "master",
+		"sentinel":              true,
+		"topology":              "sentinel",
+		"currentMasterEndpoint": "10.0.0.1:6379",
+		"replicaEndpoints":      []string{"10.0.0.2:6379"},
+		"sentinelEndpoints":     []string{"10.0.0.1:26379", "10.0.0.2:26379"},
+		"masterDetectedAt":      time.Now().UTC().Format(time.RFC3339),
+	})
+	instance, err := s.SaveAppInstance(store.AppInstance{
+		App:      "redis",
+		Version:  "7.2.14",
+		ServerID: "srv-1",
+		Status:   "running",
+		Topology: "sentinel",
+		Metadata: string(metadata),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := NewService(s, &fakeRemote{failAll: true})
+	if _, err := service.Check(context.Background(), CheckRequest{
+		Instance:        instance,
+		Server:          s.servers["srv-1"],
+		Language:        "en",
+		DefaultPassword: "Oversea.123",
+	}, fakeLogger{}, nil); err == nil {
+		t.Fatal("expected check to fail when remote is offline")
+	}
+	updated := s.instances[0]
+	if updated.Status != "failed" {
+		t.Fatalf("expected failed status, got %s", updated.Status)
+	}
+	updatedMetadata := metadataForTest(t, updated)
+	for _, key := range []string{"currentMasterEndpoint", "replicaEndpoints", "sentinelEndpoints", "masterDetectedAt"} {
+		if _, ok := updatedMetadata[key]; ok {
+			t.Fatalf("expected stale %s to be cleared, got metadata %+v", key, updatedMetadata)
+		}
 	}
 }
 

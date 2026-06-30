@@ -345,6 +345,9 @@ func (s Service) markRedisInstanceStatus(instance store.AppInstance, status, rol
 	if role != "" {
 		metadata["role"] = role
 	}
+	if !redisStatusHealthy(status) {
+		clearRedisDiscoveredTopology(metadata)
+	}
 	metadata["lastCheck"] = map[string]any{
 		"status":    status,
 		"checkedAt": time.Now().UTC().Format(time.RFC3339),
@@ -359,4 +362,20 @@ func (s Service) markRedisInstanceStatus(instance store.AppInstance, status, rol
 
 func (s Service) markInstanceStatus(instance store.AppInstance, status string, details map[string]any) error {
 	return s.markRedisInstanceStatus(instance, status, instanceRole(instance), details)
+}
+
+func redisStatusHealthy(status string) bool {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "ok", "success", "running", "available":
+		return true
+	default:
+		return false
+	}
+}
+
+func clearRedisDiscoveredTopology(metadata map[string]any) {
+	delete(metadata, "currentMasterEndpoint")
+	delete(metadata, "replicaEndpoints")
+	delete(metadata, "sentinelEndpoints")
+	delete(metadata, "masterDetectedAt")
 }
