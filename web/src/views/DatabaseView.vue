@@ -100,6 +100,7 @@
                 </div>
                 <div class="node-tags">
                   <el-tag size="small" :type="roleTagType(node.role)" effect="plain">{{ node.roleLabel }}</el-tag>
+                  <el-tag v-if="nodeRunsSentinel(node) && node.role !== 'sentinel'" size="small" type="warning" effect="plain">{{ roleLabel('sentinel') }}</el-tag>
                   <el-tag size="small" :type="nodeHealthType(node)">{{ nodeHealthLabel(node) }}</el-tag>
                   <el-tooltip v-if="showNodeDeleteButton(group)" :content="deniedText" :disabled="canManageApps" placement="top">
                     <span>
@@ -557,9 +558,6 @@ function nodeRole(item: AppInstance, metadata: InstanceMetadata) {
   if (topology === 'standalone') {
     return 'standalone'
   }
-  if (item.app === 'redis' && topology === 'sentinel' && (metadataBool(metadata, 'sentinel') || checkedOrStaticSentinelRole(metadata))) {
-    return 'sentinel'
-  }
   if (item.app === 'mysql' && topology === 'innodb-cluster') {
     const currentPrimary = stringValue(metadata.currentPrimaryEndpoint)
     const endpoint = stringValue(metadata.endpoint)
@@ -571,13 +569,12 @@ function nodeRole(item: AppInstance, metadata: InstanceMetadata) {
     }
   }
   if (item.app === 'redis' && topology === 'sentinel') {
-    const currentMaster = stringValue(metadata.currentMasterEndpoint)
-    const endpoint = stringValue(metadata.endpoint)
-    if (currentMaster && normalizeEndpoint(endpoint) === normalizeEndpoint(currentMaster)) {
-      return 'master'
+    const dataRole = redisSentinelDataRole(item, metadata)
+    if (dataRole) {
+      return dataRole
     }
-    if (currentMaster && endpoint) {
-      return 'replica'
+    if (metadataBool(metadata, 'sentinel') || checkedOrStaticSentinelRole(metadata)) {
+      return 'sentinel'
     }
   }
   const checkedRole = checkedMetadataRole(metadata)
@@ -585,6 +582,27 @@ function nodeRole(item: AppInstance, metadata: InstanceMetadata) {
     return checkedRole
   }
   return 'node'
+}
+
+function redisSentinelDataRole(item: AppInstance, metadata: InstanceMetadata) {
+  const staticRole = stringValue(metadata.role) || stringValue(metadata.clusterRole)
+  if (['master', 'replica'].includes(staticRole)) {
+    return staticRole
+  }
+  if (staticRole === 'sentinel' || metadataBool(metadata, 'sentinel')) {
+    return ''
+  }
+  if (item.app === 'redis' && normalizedTopology(item, metadata) === 'sentinel') {
+    const currentMaster = stringValue(metadata.currentMasterEndpoint)
+    const endpoint = redisDataEndpoint(item, metadata)
+    if (currentMaster && normalizeEndpoint(endpoint) === normalizeEndpoint(currentMaster)) {
+      return 'master'
+    }
+    if (currentMaster && endpoint) {
+      return 'replica'
+    }
+  }
+  return ''
 }
 
 function normalizeGroupNodeRoles(group: DatabaseGroup) {
@@ -716,6 +734,10 @@ function nodeHealth(node: DatabaseNode) {
   return 'unknown'
 }
 
+function nodeRunsSentinel(node: DatabaseNode) {
+  return node.instance.app === 'redis' && normalizedTopology(node.instance, node.metadata) === 'sentinel' && metadataBool(node.metadata, 'sentinel')
+}
+
 function roleRank(role: string) {
   switch (role) {
     case 'primary':
@@ -752,6 +774,18 @@ function nodeEndpoint(item: AppInstance, metadata: InstanceMetadata) {
     return `${host}:${numberValue(metadata.basePort) || 6446}`
   }
   return `${host}:${numberValue(metadata.port) || defaultPort(item.app)}`
+}
+
+function redisDataEndpoint(item: AppInstance, metadata: InstanceMetadata) {
+  const endpoint = stringValue(metadata.endpoint)
+  if (endpoint) {
+    return endpoint
+  }
+  const host = serverHost(item.serverId)
+  if (!host) {
+    return ''
+  }
+  return `${host}:${numberValue(metadata.port) || 6379}`
 }
 
 function groupEndpoint(group: DatabaseGroup) {
@@ -922,7 +956,7 @@ function metadataBool(metadata: InstanceMetadata, key: string) {
 }
 
 function normalizeEndpoint(value: string) {
-  return value.trim().toLowerCase().replace(/^tcp:\/\//, '').replace(/^mysql:\/\//, '')
+  return value.trim().toLowerCase().replace(/^tcp:\/\//, '').replace(/^mysql:\/\//, '').replace(/^redis:\/\//, '')
 }
 
 function openTaskDetails(row: { id: string }) {

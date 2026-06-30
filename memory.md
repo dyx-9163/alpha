@@ -273,3 +273,5 @@
 - 结论：数据库页将 MySQL InnoDB Cluster 的 `nodeStatus === running` 视为集群已正常，此时禁用“启动集群”按钮，并在点击入口二次拦截。验证通过：pnpm web:build、git diff --check。
 - 问题：用户要求 MySQL InnoDB Cluster 只有 3 个 MySQL 基础服务全部掉线时才能使用“启动集群”，部分服务或服务已启动场景也要置灰。
 - 结论：MySQL 集群检测在 `mysqladmin ping` 成功后记录 `runtimeStatus=running`，即使后续 Primary 检测失败也保留该基础服务状态；数据库页“启动集群”按钮改为仅当 3 个 MySQL 节点 runtime 都为 offline 时可用。验证通过：pnpm test、pnpm web:build、git diff --check。
+- 问题：用户反馈 Redis Sentinel 页面没有把副本节点展示出来。
+- 结论：数据库页 Redis Sentinel 节点角色优先展示 Redis 数据角色 master/replica，再展示哨兵标记；同一服务器同时跑 Redis 与 Sentinel 时不再被单纯标成哨兵，端点展示 Redis 数据端口。验证通过：pnpm web:build、git diff --check。
