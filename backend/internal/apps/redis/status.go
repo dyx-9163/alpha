@@ -68,6 +68,9 @@ func (s Service) detectRedisRole(ctx context.Context, server store.Server, insta
 		if err != nil {
 			return role, redisSentinelTopology{}, err
 		}
+		if detected := s.detectRedisDataRoleQuiet(ctx, server, instance, password); detected != "" {
+			role = detected
+		}
 		instanceEndpoint := s.redisInstanceEndpoint(instance, appMetadata(instance))
 		if role != "sentinel" && normalizeEndpoint(instanceEndpoint) == normalizeEndpoint(sentinelTopology.MasterEndpoint) {
 			role = "master"
@@ -90,26 +93,42 @@ func (s Service) detectRedisRole(ctx context.Context, server store.Server, insta
 }
 
 func (s Service) detectRedisDataRole(ctx context.Context, server store.Server, instance store.AppInstance, password string, log Logger) (string, error) {
+	cmd := redisDataRoleCommand(server, instance, password)
+	result, err := installerkit.Run(ctx, s.remote, server, cmd, log, "redis remote command failed")
+	if err != nil {
+		return "", err
+	}
+	return parseRedisDataRole(result.Stdout), nil
+}
+
+func (s Service) detectRedisDataRoleQuiet(ctx context.Context, server store.Server, instance store.AppInstance, password string) string {
+	result, err := s.remote.Run(ctx, server, redisDataRoleCommand(server, instance, password))
+	if err != nil {
+		return ""
+	}
+	return parseRedisDataRole(result.Stdout)
+}
+
+func redisDataRoleCommand(server store.Server, instance store.AppInstance, password string) string {
 	installRoot := remoteInstallRoot(server, "redis", instance.Version)
 	legacyInstallRoot := remoteLegacyInstallRoot(server, "redis", instance.Version)
 	port := instancePort(instance)
-	cmd := fmt.Sprintf("INSTALL_ROOT=%s\nLEGACY_ROOT=%s\nif [ ! -x \"$INSTALL_ROOT/bin/redis-cli\" ] && [ -x \"$LEGACY_ROOT/bin/redis-cli\" ]; then INSTALL_ROOT=\"$LEGACY_ROOT\"; fi\nREDISCLI_AUTH=%s \"$INSTALL_ROOT/bin/redis-cli\" -p %d --raw --no-auth-warning ROLE",
+	return fmt.Sprintf("INSTALL_ROOT=%s\nLEGACY_ROOT=%s\nif [ ! -x \"$INSTALL_ROOT/bin/redis-cli\" ] && [ -x \"$LEGACY_ROOT/bin/redis-cli\" ]; then INSTALL_ROOT=\"$LEGACY_ROOT\"; fi\nREDISCLI_AUTH=%s \"$INSTALL_ROOT/bin/redis-cli\" -p %d --raw --no-auth-warning ROLE",
 		installerkit.ShellQuote(installRoot),
 		installerkit.ShellQuote(legacyInstallRoot),
 		installerkit.ShellQuote(password),
 		port,
 	)
-	result, err := installerkit.Run(ctx, s.remote, server, cmd, log, "redis remote command failed")
-	if err != nil {
-		return "", err
-	}
-	switch strings.ToLower(firstNonEmptyLine(result.Stdout)) {
+}
+
+func parseRedisDataRole(stdout string) string {
+	switch strings.ToLower(firstNonEmptyLine(stdout)) {
 	case "master":
-		return "master", nil
+		return "master"
 	case "slave", "replica":
-		return "replica", nil
+		return "replica"
 	default:
-		return "", nil
+		return ""
 	}
 }
 
@@ -170,7 +189,27 @@ func (s Service) detectRedisSentinelTopology(ctx context.Context, server store.S
 	if strings.TrimSpace(sentinelServer.Host) != "" {
 		out.SentinelEndpoints = appendUniqueEndpoint(out.SentinelEndpoints, fmt.Sprintf("%s:%d", sentinelServer.Host, sentinelPort))
 	}
+	for _, endpoint := range append([]string{out.MasterEndpoint}, out.ReplicaEndpoints...) {
+		host, _ := splitEndpoint(endpoint)
+		if host != "" && s.probeRedisSentinelEndpoint(ctx, sentinelServer, sentinelInstance, password, host, sentinelPort) {
+			out.SentinelEndpoints = appendUniqueEndpoint(out.SentinelEndpoints, fmt.Sprintf("%s:%d", host, sentinelPort))
+		}
+	}
 	return out, nil
+}
+
+func (s Service) probeRedisSentinelEndpoint(ctx context.Context, server store.Server, instance store.AppInstance, password, host string, sentinelPort int) bool {
+	installRoot := remoteInstallRoot(server, "redis", instance.Version)
+	legacyInstallRoot := remoteLegacyInstallRoot(server, "redis", instance.Version)
+	cmd := fmt.Sprintf("INSTALL_ROOT=%s\nLEGACY_ROOT=%s\nif [ ! -x \"$INSTALL_ROOT/bin/redis-cli\" ] && [ -x \"$LEGACY_ROOT/bin/redis-cli\" ]; then INSTALL_ROOT=\"$LEGACY_ROOT\"; fi\nREDISCLI_AUTH=%s \"$INSTALL_ROOT/bin/redis-cli\" -h %s -p %d --raw --no-auth-warning PING >/dev/null",
+		installerkit.ShellQuote(installRoot),
+		installerkit.ShellQuote(legacyInstallRoot),
+		installerkit.ShellQuote(password),
+		installerkit.ShellQuote(host),
+		sentinelPort,
+	)
+	_, err := s.remote.Run(ctx, server, cmd)
+	return err == nil
 }
 
 func (s Service) findRedisSentinelPeer(instance store.AppInstance) (store.AppInstance, store.Server, error) {
@@ -211,12 +250,15 @@ func (s Service) markRedisSentinelMaster(instance store.AppInstance, checkedRole
 		metadata["replicaEndpoints"] = sentinelTopology.ReplicaEndpoints
 		metadata["sentinelEndpoints"] = sentinelTopology.SentinelEndpoints
 		role := metadataString(metadata, "role")
-		if role != "sentinel" {
-			if normalizeEndpoint(s.redisInstanceEndpoint(candidate, metadata)) == normalizeEndpoint(masterEndpoint) {
-				role = "master"
-			} else {
-				role = "replica"
-			}
+		candidateEndpoint := s.redisInstanceEndpoint(candidate, metadata)
+		if normalizeEndpoint(candidateEndpoint) == normalizeEndpoint(masterEndpoint) {
+			role = "master"
+			metadata["role"] = role
+		} else if endpointInList(candidateEndpoint, sentinelTopology.ReplicaEndpoints) {
+			role = "replica"
+			metadata["role"] = role
+		} else if role != "sentinel" && strings.TrimSpace(candidateEndpoint) != "" {
+			role = "replica"
 			metadata["role"] = role
 		}
 		if candidate.ID == instance.ID {
@@ -272,6 +314,19 @@ func appendUniqueEndpoint(endpoints []string, endpoint string) []string {
 		}
 	}
 	return append(endpoints, endpoint)
+}
+
+func endpointInList(endpoint string, endpoints []string) bool {
+	endpoint = normalizeEndpoint(endpoint)
+	if endpoint == "" {
+		return false
+	}
+	for _, candidate := range endpoints {
+		if endpoint == normalizeEndpoint(candidate) {
+			return true
+		}
+	}
+	return false
 }
 
 func (s Service) redisInstanceEndpoint(instance store.AppInstance, metadata map[string]any) string {
