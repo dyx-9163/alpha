@@ -277,3 +277,5 @@
 - 结论：数据库页 Redis Sentinel 节点角色优先展示 Redis 数据角色 master/replica，再展示哨兵标记；同一服务器同时跑 Redis 与 Sentinel 时不再被单纯标成哨兵，端点展示 Redis 数据端口。验证通过：pnpm web:build、git diff --check。
 - 问题：用户澄清 Redis Sentinel 是三台都安装哨兵，其中两台同时安装 master/副本，不能把数据节点和哨兵合并成一行展示。
 - 结论：数据库页 Redis Sentinel 改为分开展示 Redis 数据节点和 Sentinel 节点；数据区只显示 master/replica 及 6379，Sentinel 区显示三台哨兵及 26379，并分别统计节点数和哨兵数。验证通过：pnpm web:build、git diff --check。
+- 问题：用户继续反馈 Redis Sentinel 仍只展示已登记的两台哨兵，主节点出来了但没有发现副本节点。
+- 结论：Redis 检测新增查询 Sentinel 拓扑：`SENTINEL replicas` 记录副本端点，`SENTINEL sentinels` 记录哨兵端点；数据库页会根据检测到的端点补充未登记的虚拟 master/replica/sentinel 行，虚拟行不提供卸载按钮。验证通过：pnpm test、pnpm web:build、git diff --check。

@@ -107,7 +107,7 @@
                 <div class="node-tags">
                   <el-tag size="small" :type="roleTagType(node.role)" effect="plain">{{ node.roleLabel }}</el-tag>
                   <el-tag size="small" :type="nodeHealthType(node)">{{ nodeHealthLabel(node) }}</el-tag>
-                  <el-tooltip v-if="showNodeDeleteButton(group)" :content="deniedText" :disabled="canManageApps" placement="top">
+                  <el-tooltip v-if="showNodeDeleteButton(group, node)" :content="deniedText" :disabled="canManageApps" placement="top">
                     <span>
                       <el-button size="small" type="danger" plain :disabled="!canManageApps" @click="openDeleteNodes([node], 'single')">{{ t('common.uninstall') }}</el-button>
                     </span>
@@ -238,6 +238,7 @@ type DatabaseNode = {
   endpoint: string
   role: string
   roleLabel: string
+  virtual?: boolean
 }
 
 type DatabaseGroup = {
@@ -520,12 +521,13 @@ function groupDatabaseInstances(items: AppInstance[]) {
   }
   return Array.from(groups.values())
     .map((group) => {
-      const nodes = normalizeGroupNodeRoles(group)
+      const hydratedGroup = withRedisSentinelDiscoveredNodes(group)
+      const nodes = normalizeGroupNodeRoles(hydratedGroup)
       const normalizedGroup = {
-        ...group,
+        ...hydratedGroup,
         nodes: nodes.sort((a, b) => roleRank(a.role) - roleRank(b.role) || a.serverLabel.localeCompare(b.serverLabel)),
-        routers: group.routers.sort((a, b) => a.serverLabel.localeCompare(b.serverLabel)),
-        sentinels: group.sentinels.sort((a, b) => a.serverLabel.localeCompare(b.serverLabel))
+        routers: hydratedGroup.routers.sort((a, b) => a.serverLabel.localeCompare(b.serverLabel)),
+        sentinels: hydratedGroup.sentinels.sort((a, b) => a.serverLabel.localeCompare(b.serverLabel))
       }
       const nodeStatus = serviceStatus(normalizedGroup.nodes)
       const routerStatus = serviceStatus(normalizedGroup.routers)
@@ -601,6 +603,74 @@ function redisSentinelNode(item: AppInstance, metadata: InstanceMetadata): Datab
     endpoint: redisSentinelEndpoint(item, metadata),
     role,
     roleLabel: roleLabel(role)
+  }
+}
+
+function withRedisSentinelDiscoveredNodes(group: DatabaseGroup): DatabaseGroup {
+  if (group.app !== 'redis' || group.topology !== 'sentinel') {
+    return group
+  }
+  const next: DatabaseGroup = {
+    ...group,
+    nodes: [...group.nodes],
+    sentinels: [...group.sentinels]
+  }
+  const masterEndpoint = redisMasterEndpoint(next)
+  if (masterEndpoint) {
+    ensureRedisDataNode(next, masterEndpoint, 'master')
+  }
+  for (const endpoint of groupMetadataList(next, 'replicaEndpoints')) {
+    ensureRedisDataNode(next, endpoint, 'replica')
+  }
+  for (const endpoint of groupMetadataList(next, 'sentinelEndpoints')) {
+    ensureRedisSentinelNode(next, endpoint)
+  }
+  return next
+}
+
+function ensureRedisDataNode(group: DatabaseGroup, endpoint: string, role: string) {
+  if (!endpoint || hasEndpoint(group.nodes, endpoint)) {
+    return
+  }
+  group.nodes.push(virtualRedisNode(group, endpoint, role))
+}
+
+function ensureRedisSentinelNode(group: DatabaseGroup, endpoint: string) {
+  if (!endpoint || hasEndpoint(group.sentinels, endpoint)) {
+    return
+  }
+  group.sentinels.push(virtualRedisNode(group, endpoint, 'sentinel'))
+}
+
+function virtualRedisNode(group: DatabaseGroup, endpoint: string, role: string): DatabaseNode {
+  const server = serverByEndpoint(endpoint)
+  const metadata: InstanceMetadata = {
+    topology: 'sentinel',
+    role,
+    endpoint,
+    lastCheck: { status: 'running' }
+  }
+  if (role === 'sentinel') {
+    metadata.sentinel = true
+  }
+  const instance: AppInstance = {
+    id: `virtual-${group.id}-${role}-${normalizeEndpoint(endpoint)}`,
+    app: 'redis',
+    version: group.version,
+    serverId: server?.id || '',
+    status: 'running',
+    topology: 'sentinel',
+    metadata: '',
+    createdAt: group.createdAt
+  }
+  return {
+    instance,
+    metadata,
+    serverLabel: server ? `${server.name} (${server.host})` : endpointHost(endpoint) || endpoint,
+    endpoint,
+    role,
+    roleLabel: roleLabel(role),
+    virtual: true
   }
 }
 
@@ -913,6 +983,26 @@ function groupMetadataValue(group: DatabaseGroup, key: string) {
   return ''
 }
 
+function groupMetadataList(group: DatabaseGroup, key: string) {
+  const out: string[] = []
+  const add = (value: unknown) => {
+    for (const item of stringListValue(value)) {
+      if (!out.some((existing) => normalizeEndpoint(existing) === normalizeEndpoint(item))) {
+        out.push(item)
+      }
+    }
+  }
+  add(group.metadata[key])
+  for (const node of [...group.nodes, ...group.routers, ...group.sentinels]) {
+    add(node.metadata[key])
+  }
+  return out
+}
+
+function hasEndpoint(nodes: DatabaseNode[], endpoint: string) {
+  return nodes.some((node) => normalizeEndpoint(node.endpoint) === normalizeEndpoint(endpoint))
+}
+
 function serviceStatus(nodes: DatabaseNode[]) {
   const healths = nodes.map((node) => nodeHealth(node))
   if (!healths.length) {
@@ -1009,9 +1099,41 @@ function serverHost(id: string) {
   return server?.host || ''
 }
 
+function serverByEndpoint(endpoint: string) {
+  const host = endpointHost(endpoint)
+  return servers.value.find((item) => String(item.host || '').trim() === host)
+}
+
+function endpointHost(endpoint: string) {
+  const normalized = normalizeEndpoint(endpoint)
+  const idx = normalized.lastIndexOf(':')
+  return idx > 0 ? normalized.slice(0, idx) : normalized
+}
+
 function stringValue(value: unknown) {
   const out = String(value ?? '').trim()
   return out === '<nil>' ? '' : out
+}
+
+function stringListValue(value: unknown): string[] {
+  if (Array.isArray(value)) {
+    return value.map((item) => stringValue(item)).filter(Boolean)
+  }
+  const text = stringValue(value)
+  if (!text) {
+    return []
+  }
+  if (text.startsWith('[')) {
+    try {
+      const parsed = JSON.parse(text)
+      if (Array.isArray(parsed)) {
+        return parsed.map((item) => stringValue(item)).filter(Boolean)
+      }
+    } catch {
+      return []
+    }
+  }
+  return text.split(',').map((item) => item.trim()).filter(Boolean)
 }
 
 function numberValue(value: unknown) {
@@ -1066,12 +1188,15 @@ function hasRouterClusterDelete(group: DatabaseGroup) {
   return group.routers.length > 0
 }
 
-function showNodeDeleteButton(group: DatabaseGroup) {
+function showNodeDeleteButton(group: DatabaseGroup, node?: DatabaseNode) {
+  if (node?.virtual) {
+    return false
+  }
   return !(group.app === 'mysql' && group.topology === 'innodb-cluster')
 }
 
 function showSentinelDeleteButton(group: DatabaseGroup, node: DatabaseNode) {
-  return showNodeDeleteButton(group) && !redisSentinelDataRole(node.instance, node.metadata)
+  return showNodeDeleteButton(group, node) && !redisSentinelDataRole(node.instance, node.metadata)
 }
 
 function openDeleteGroup(group: DatabaseGroup, kind: DeleteScopeKind) {

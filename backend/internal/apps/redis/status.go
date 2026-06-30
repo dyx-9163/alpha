@@ -12,6 +12,12 @@ import (
 	"aifar-deployment/backend/internal/store"
 )
 
+type redisSentinelTopology struct {
+	MasterEndpoint    string
+	ReplicaEndpoints  []string
+	SentinelEndpoints []string
+}
+
 func (s Service) checkRedisRuntime(ctx context.Context, server store.Server, instance store.AppInstance, defaultPassword string, log Logger) error {
 	metadata := appMetadata(instance)
 	role := metadataString(metadata, "role")
@@ -53,33 +59,34 @@ func (s Service) checkRedisRuntime(ctx context.Context, server store.Server, ins
 	return err
 }
 
-func (s Service) detectRedisRole(ctx context.Context, server store.Server, instance store.AppInstance, defaultPassword string, log Logger) (string, string, error) {
+func (s Service) detectRedisRole(ctx context.Context, server store.Server, instance store.AppInstance, defaultPassword string, log Logger) (string, redisSentinelTopology, error) {
 	topology := instanceTopology(instance)
 	role := instanceRole(instance)
 	password := redisPassword(nil, defaultPassword)
 	if topology == "sentinel" {
-		endpoint, err := s.detectRedisSentinelMaster(ctx, server, instance, password, log)
+		sentinelTopology, err := s.detectRedisSentinelTopology(ctx, server, instance, password, log)
 		if err != nil {
-			return role, "", err
+			return role, redisSentinelTopology{}, err
 		}
-		if role != "sentinel" && normalizeEndpoint(instanceEndpoint(instance)) == normalizeEndpoint(endpoint) {
+		instanceEndpoint := s.redisInstanceEndpoint(instance, appMetadata(instance))
+		if role != "sentinel" && normalizeEndpoint(instanceEndpoint) == normalizeEndpoint(sentinelTopology.MasterEndpoint) {
 			role = "master"
 		} else if role != "sentinel" {
 			role = "replica"
 		}
-		return role, endpoint, nil
+		return role, sentinelTopology, nil
 	}
 	if role == "sentinel" {
-		return role, "", nil
+		return role, redisSentinelTopology{}, nil
 	}
 	detected, err := s.detectRedisDataRole(ctx, server, instance, password, log)
 	if err != nil {
-		return role, "", err
+		return role, redisSentinelTopology{}, err
 	}
 	if detected != "" {
 		role = detected
 	}
-	return role, "", nil
+	return role, redisSentinelTopology{}, nil
 }
 
 func (s Service) detectRedisDataRole(ctx context.Context, server store.Server, instance store.AppInstance, password string, log Logger) (string, error) {
@@ -106,13 +113,13 @@ func (s Service) detectRedisDataRole(ctx context.Context, server store.Server, i
 	}
 }
 
-func (s Service) detectRedisSentinelMaster(ctx context.Context, server store.Server, instance store.AppInstance, password string, log Logger) (string, error) {
+func (s Service) detectRedisSentinelTopology(ctx context.Context, server store.Server, instance store.AppInstance, password string, log Logger) (redisSentinelTopology, error) {
 	sentinelInstance := instance
 	sentinelServer := server
 	if !instanceHasSentinel(instance) {
 		peerInstance, peerServer, err := s.findRedisSentinelPeer(instance)
 		if err != nil {
-			return "", err
+			return redisSentinelTopology{}, err
 		}
 		sentinelInstance = peerInstance
 		sentinelServer = peerServer
@@ -125,22 +132,45 @@ func (s Service) detectRedisSentinelMaster(ctx context.Context, server store.Ser
 	sentinelPort := instanceSentinelPort(sentinelInstance)
 	installRoot := remoteInstallRoot(sentinelServer, "redis", sentinelInstance.Version)
 	legacyInstallRoot := remoteLegacyInstallRoot(sentinelServer, "redis", sentinelInstance.Version)
-	cmd := fmt.Sprintf("INSTALL_ROOT=%s\nLEGACY_ROOT=%s\nif [ ! -x \"$INSTALL_ROOT/bin/redis-cli\" ] && [ -x \"$LEGACY_ROOT/bin/redis-cli\" ]; then INSTALL_ROOT=\"$LEGACY_ROOT\"; fi\nREDISCLI_AUTH=%s \"$INSTALL_ROOT/bin/redis-cli\" -p %d --raw --no-auth-warning SENTINEL get-master-addr-by-name %s",
+	baseCmd := fmt.Sprintf("INSTALL_ROOT=%s\nLEGACY_ROOT=%s\nif [ ! -x \"$INSTALL_ROOT/bin/redis-cli\" ] && [ -x \"$LEGACY_ROOT/bin/redis-cli\" ]; then INSTALL_ROOT=\"$LEGACY_ROOT\"; fi\nREDISCLI_AUTH=%s \"$INSTALL_ROOT/bin/redis-cli\" -p %d --raw --no-auth-warning",
 		installerkit.ShellQuote(installRoot),
 		installerkit.ShellQuote(legacyInstallRoot),
 		installerkit.ShellQuote(password),
 		sentinelPort,
+	)
+	masterCmd := fmt.Sprintf("%s SENTINEL get-master-addr-by-name %s",
+		baseCmd,
 		installerkit.ShellQuote(masterName),
 	)
-	result, err := installerkit.Run(ctx, s.remote, sentinelServer, cmd, log, "redis sentinel remote command failed")
+	result, err := installerkit.Run(ctx, s.remote, sentinelServer, masterCmd, log, "redis sentinel remote command failed")
 	if err != nil {
-		return "", err
+		return redisSentinelTopology{}, err
 	}
 	lines := nonEmptyLines(result.Stdout)
 	if len(lines) < 2 {
-		return "", errors.New("Redis Sentinel did not return current master address")
+		return redisSentinelTopology{}, errors.New("Redis Sentinel did not return current master address")
 	}
-	return fmt.Sprintf("%s:%s", lines[0], lines[1]), nil
+	out := redisSentinelTopology{
+		MasterEndpoint: fmt.Sprintf("%s:%s", lines[0], lines[1]),
+	}
+	replicaCmd := fmt.Sprintf("%s SENTINEL replicas %s",
+		baseCmd,
+		installerkit.ShellQuote(masterName),
+	)
+	if result, err := installerkit.Run(ctx, s.remote, sentinelServer, replicaCmd, log, "redis sentinel replicas command failed"); err == nil {
+		out.ReplicaEndpoints = parseRedisSentinelEndpointRows(result.Stdout)
+	}
+	sentinelsCmd := fmt.Sprintf("%s SENTINEL sentinels %s",
+		baseCmd,
+		installerkit.ShellQuote(masterName),
+	)
+	if result, err := installerkit.Run(ctx, s.remote, sentinelServer, sentinelsCmd, log, "redis sentinel peers command failed"); err == nil {
+		out.SentinelEndpoints = parseRedisSentinelEndpointRows(result.Stdout)
+	}
+	if strings.TrimSpace(sentinelServer.Host) != "" {
+		out.SentinelEndpoints = appendUniqueEndpoint(out.SentinelEndpoints, fmt.Sprintf("%s:%d", sentinelServer.Host, sentinelPort))
+	}
+	return out, nil
 }
 
 func (s Service) findRedisSentinelPeer(instance store.AppInstance) (store.AppInstance, store.Server, error) {
@@ -161,11 +191,12 @@ func (s Service) findRedisSentinelPeer(instance store.AppInstance) (store.AppIns
 	return store.AppInstance{}, store.Server{}, errors.New("Redis Sentinel peer was not found")
 }
 
-func (s Service) markRedisSentinelMaster(instance store.AppInstance, checkedRole, masterEndpoint string, details map[string]any) error {
+func (s Service) markRedisSentinelMaster(instance store.AppInstance, checkedRole string, sentinelTopology redisSentinelTopology, details map[string]any) error {
 	instances, err := s.store.ListAppInstances()
 	if err != nil {
 		return err
 	}
+	masterEndpoint := sentinelTopology.MasterEndpoint
 	masterHost, masterPort := splitEndpoint(masterEndpoint)
 	detectedAt := time.Now().UTC().Format(time.RFC3339)
 	for _, candidate := range instances {
@@ -177,6 +208,8 @@ func (s Service) markRedisSentinelMaster(instance store.AppInstance, checkedRole
 		metadata["masterHost"] = masterHost
 		metadata["masterPort"] = masterPort
 		metadata["masterDetectedAt"] = detectedAt
+		metadata["replicaEndpoints"] = sentinelTopology.ReplicaEndpoints
+		metadata["sentinelEndpoints"] = sentinelTopology.SentinelEndpoints
 		role := metadataString(metadata, "role")
 		if role != "sentinel" {
 			if normalizeEndpoint(s.redisInstanceEndpoint(candidate, metadata)) == normalizeEndpoint(masterEndpoint) {
@@ -202,6 +235,43 @@ func (s Service) markRedisSentinelMaster(instance store.AppInstance, checkedRole
 		}
 	}
 	return nil
+}
+
+func parseRedisSentinelEndpointRows(stdout string) []string {
+	lines := nonEmptyLines(stdout)
+	fields := map[string]string{}
+	var endpoints []string
+	flush := func() {
+		ip := strings.TrimSpace(fields["ip"])
+		port := strings.TrimSpace(fields["port"])
+		if ip != "" && port != "" {
+			endpoints = appendUniqueEndpoint(endpoints, fmt.Sprintf("%s:%s", ip, port))
+		}
+		fields = map[string]string{}
+	}
+	for idx := 0; idx+1 < len(lines); idx += 2 {
+		key := strings.ToLower(strings.TrimSpace(lines[idx]))
+		value := strings.TrimSpace(lines[idx+1])
+		if key == "name" && len(fields) > 0 {
+			flush()
+		}
+		fields[key] = value
+	}
+	flush()
+	return endpoints
+}
+
+func appendUniqueEndpoint(endpoints []string, endpoint string) []string {
+	endpoint = normalizeEndpoint(endpoint)
+	if endpoint == "" {
+		return endpoints
+	}
+	for _, existing := range endpoints {
+		if normalizeEndpoint(existing) == endpoint {
+			return endpoints
+		}
+	}
+	return append(endpoints, endpoint)
 }
 
 func (s Service) redisInstanceEndpoint(instance store.AppInstance, metadata map[string]any) string {

@@ -3,6 +3,7 @@ package redis
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -120,6 +121,19 @@ func metadataForTest(t *testing.T, instance store.AppInstance) map[string]any {
 		t.Fatal(err)
 	}
 	return metadata
+}
+
+func metadataListContains(value any, want string) bool {
+	items, ok := value.([]any)
+	if !ok {
+		return false
+	}
+	for _, item := range items {
+		if strings.TrimSpace(fmt.Sprint(item)) == want {
+			return true
+		}
+	}
+	return false
 }
 
 func TestServiceInstallsStandaloneRedisAndRecordsInstalledInstance(t *testing.T) {
@@ -261,6 +275,22 @@ func TestServiceChecksRedisSentinelAndUpdatesCurrentMasterRoles(t *testing.T) {
 	}
 	remote.responses = map[string]adapter.CommandResult{
 		"SENTINEL get-master-addr-by-name": {Stdout: "10.0.0.1\n6379\n"},
+		"SENTINEL replicas": {Stdout: strings.Join([]string{
+			"name", "10.0.0.2:6379",
+			"ip", "10.0.0.2",
+			"port", "6379",
+			"flags", "slave",
+		}, "\n")},
+		"SENTINEL sentinels": {Stdout: strings.Join([]string{
+			"name", "redis-1",
+			"ip", "10.0.0.1",
+			"port", "26379",
+			"flags", "sentinel",
+			"name", "redis-3",
+			"ip", "10.0.0.3",
+			"port", "26379",
+			"flags", "sentinel",
+		}, "\n")},
 	}
 	instancesByServer := map[string]store.AppInstance{}
 	for _, instance := range s.instances {
@@ -299,8 +329,20 @@ func TestServiceChecksRedisSentinelAndUpdatesCurrentMasterRoles(t *testing.T) {
 	if got := metadataForTest(t, instancesByServer["srv-1"])["currentMasterEndpoint"]; got != "10.0.0.1:6379" {
 		t.Fatalf("expected current master endpoint to be recorded, got %v", got)
 	}
+	metadata := metadataForTest(t, instancesByServer["srv-2"])
+	if !metadataListContains(metadata["replicaEndpoints"], "10.0.0.2:6379") {
+		t.Fatalf("expected detected replica endpoints to be recorded, got %v", metadata["replicaEndpoints"])
+	}
+	for _, endpoint := range []string{"10.0.0.1:26379", "10.0.0.2:26379", "10.0.0.3:26379"} {
+		if !metadataListContains(metadata["sentinelEndpoints"], endpoint) {
+			t.Fatalf("expected detected sentinel endpoint %s to be recorded, got %v", endpoint, metadata["sentinelEndpoints"])
+		}
+	}
 	if !strings.Contains(remote.joinedCommands(), "SENTINEL get-master-addr-by-name") {
 		t.Fatal("expected check to query Redis Sentinel current master")
+	}
+	if !strings.Contains(remote.joinedCommands(), "SENTINEL replicas") || !strings.Contains(remote.joinedCommands(), "SENTINEL sentinels") {
+		t.Fatal("expected check to query Redis Sentinel replicas and sentinel peers")
 	}
 }
 

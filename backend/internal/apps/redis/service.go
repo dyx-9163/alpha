@@ -557,26 +557,28 @@ func (s Service) Check(ctx context.Context, req CheckRequest, log Logger, target
 	}
 
 	role := instanceRole(req.Instance)
-	currentMasterEndpoint := ""
+	sentinelTopology := redisSentinelTopology{}
 	nextStep := 2
 	if topology == "sentinel" || topology == "cluster" {
 		if err := step(2, "detect-role", copyWithFallback(copy.DetectRole, "检测 Redis 当前角色"), func() error {
 			var detectErr error
-			role, currentMasterEndpoint, detectErr = s.detectRedisRole(ctx, req.Server, req.Instance, req.DefaultPassword, logForServer)
+			role, sentinelTopology, detectErr = s.detectRedisRole(ctx, req.Server, req.Instance, req.DefaultPassword, logForServer)
 			return detectErr
 		}); err != nil {
 			return fail(err)
 		}
 		details["role"] = role
-		if currentMasterEndpoint != "" {
-			details["currentMasterEndpoint"] = currentMasterEndpoint
+		if sentinelTopology.MasterEndpoint != "" {
+			details["currentMasterEndpoint"] = sentinelTopology.MasterEndpoint
+			details["replicaEndpoints"] = sentinelTopology.ReplicaEndpoints
+			details["sentinelEndpoints"] = sentinelTopology.SentinelEndpoints
 		}
 		nextStep = 3
 	}
 
 	if err := step(nextStep, "update-instance", copyWithFallback(copy.UpdateInstance, "更新 Redis 实例状态"), func() error {
-		if topology == "sentinel" && currentMasterEndpoint != "" {
-			return s.markRedisSentinelMaster(req.Instance, role, currentMasterEndpoint, details)
+		if topology == "sentinel" && sentinelTopology.MasterEndpoint != "" {
+			return s.markRedisSentinelMaster(req.Instance, role, sentinelTopology, details)
 		}
 		return s.markRedisInstanceStatus(req.Instance, "running", role, details)
 	}); err != nil {
