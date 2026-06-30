@@ -302,6 +302,10 @@ section {
   background: transparent;
 }
 
+.content-body > section > * {
+  flex-shrink: 0;
+}
+
 .content-body > section > .workspace-card:last-child,
 .content-body > section > .table-panel:last-child,
 .content-body > section > .empty-panel:last-child,
