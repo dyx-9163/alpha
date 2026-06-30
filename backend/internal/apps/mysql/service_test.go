@@ -278,8 +278,12 @@ func TestServiceCheckInnoDBClusterRecordsCurrentPrimary(t *testing.T) {
 		if got := metadata["currentPrimaryEndpoint"]; got != "10.0.0.2:3306" {
 			t.Fatalf("expected current primary to be recorded for %s, got %v", instance.ID, got)
 		}
-		if instance.Status != "running" {
-			t.Fatalf("expected instance %s status running, got %s", instance.ID, instance.Status)
+		expectedStatus := "installed"
+		if instance.ID == "app-1" {
+			expectedStatus = "running"
+		}
+		if instance.Status != expectedStatus {
+			t.Fatalf("expected instance %s status %s, got %s", instance.ID, expectedStatus, instance.Status)
 		}
 		expectedRole := "secondary"
 		if metadata["endpoint"] == "10.0.0.2:3306" {

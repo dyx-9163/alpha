@@ -3,6 +3,7 @@ package minio
 import (
 	"bytes"
 	_ "embed"
+	"strings"
 	"text/template"
 
 	"aifar-deployment/backend/internal/installer/installerkit"
@@ -34,6 +35,7 @@ var minioDistributedConfigureTemplate = template.Must(template.New("minio-distri
 	Parse(distributedConfigureScriptTemplate))
 
 func installStandaloneScript(req InstallScriptRequest) (string, error) {
+	req = normalizeInstallScriptRequest(req)
 	return renderMinIOScript(minioStandaloneInstallTemplate, req)
 }
 
@@ -57,6 +59,15 @@ func renderMinIOScript(tpl *template.Template, data any) (string, error) {
 	return buf.String(), nil
 }
 
+func normalizeInstallScriptRequest(req InstallScriptRequest) InstallScriptRequest {
+	req.DataDirs = minioVolumeDirs(req.DataDir, req.DataDirs, req.InstallRoot)
+	req.DataDir = req.DataDirs[0]
+	if strings.TrimSpace(req.VolumeList) == "" {
+		req.VolumeList = strings.Join(req.DataDirs, " ")
+	}
+	return req
+}
+
 type InstallScriptRequest struct {
 	Version        string
 	WorkDir        string
@@ -66,6 +77,8 @@ type InstallScriptRequest struct {
 	MCRemotePath   string
 	InstallRoot    string
 	DataDir        string
+	DataDirs       []string
+	VolumeList     string
 	APIPort        int
 	ConsolePort    int
 	RootUser       string

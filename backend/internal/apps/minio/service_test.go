@@ -130,7 +130,7 @@ func TestServiceInstallsStandaloneMinioAndRecordsInstalledInstance(t *testing.T)
 	if strings.Contains(instance.Metadata, "Oversea.123") {
 		t.Fatalf("metadata must not store root password: %s", instance.Metadata)
 	}
-	if !strings.Contains(instance.Metadata, `"apiPort":9002`) || !strings.Contains(instance.Metadata, `"endpoint":"http://10.0.0.3:9002"`) || !strings.Contains(instance.Metadata, `"dataDir":"/aifar/apps/minio/2025-10-15T17-29-55Z/data"`) {
+	if !strings.Contains(instance.Metadata, `"apiPort":9002`) || !strings.Contains(instance.Metadata, `"endpoint":"http://10.0.0.3:9002"`) || !strings.Contains(instance.Metadata, `"dataDir":"/data/minio/aifar-minio-9002"`) || !strings.Contains(instance.Metadata, `"storageMode":"local-disk"`) {
 		t.Fatalf("metadata should include endpoint and ports: %s", instance.Metadata)
 	}
 	joinedCommands := remote.joinedCommands()
@@ -179,7 +179,7 @@ func TestServiceInstallsDistributedMinioAndRecordsEachNode(t *testing.T) {
 	if s.instances[0].Topology != "distributed" || strings.Contains(s.instances[0].Metadata, "Oversea.123") {
 		t.Fatalf("expected safe distributed metadata: %+v", s.instances[0])
 	}
-	if !strings.Contains(s.instances[0].Metadata, `"dataDir":"/aifar/apps/minio/2025-10-15T17-29-55Z/data"`) {
+	if !strings.Contains(s.instances[0].Metadata, `"dataDir":"/data/minio/aifar-minio-9000"`) || !strings.Contains(s.instances[0].Metadata, `"storageMode":"local-disk"`) {
 		t.Fatalf("distributed metadata should include selected data directory: %+v", s.instances[0])
 	}
 	joinedCommands := remote.joinedCommands()
@@ -262,6 +262,59 @@ func TestMinioPasswordFallsBackToDefaultPassword(t *testing.T) {
 	}
 	if got := passwordParam(map[string]any{"rootPassword": "custom-password"}, "Oversea.123"); got != "custom-password" {
 		t.Fatalf("expected explicit minio password, got %q", got)
+	}
+}
+
+func TestValidateMinioStorageRequiresDeviceForUnmountedDisk(t *testing.T) {
+	err := validateMinioStorage(map[string]any{
+		"storageMode": "unmounted-disk",
+		"dataRoot":    "/data/minio",
+	})
+	if err == nil || !strings.Contains(err.Error(), "requires a disk device") {
+		t.Fatalf("expected missing disk device validation error, got %v", err)
+	}
+	if err := validateMinioStorage(map[string]any{
+		"storageMode": "unmounted-disk",
+		"dataRoot":    "/data/minio",
+		"diskDevice":  "/dev/sdb",
+	}); err != nil {
+		t.Fatalf("expected valid unmounted disk storage config: %v", err)
+	}
+	if err := validateMinioStorage(map[string]any{
+		"storageMode": "unmounted-disk",
+		"dataRoot":    "/data/minio",
+		"diskDevice": map[string]any{
+			"srv-1": "/dev/sdb",
+			"srv-2": "/dev/vdb",
+		},
+	}, "srv-1", "srv-2"); err != nil {
+		t.Fatalf("expected valid per-server unmounted disk config: %v", err)
+	}
+	if err := validateMinioStorage(map[string]any{
+		"storageMode": "unmounted-disk",
+		"dataRoot":    "/data/minio",
+		"diskDevice": map[string]any{
+			"srv-1": []any{"/dev/sdb", "/dev/sdc"},
+			"srv-2": []any{"/dev/vdb", "/dev/vdc"},
+		},
+	}, "srv-1", "srv-2"); err != nil {
+		t.Fatalf("expected valid per-server multi-disk storage config: %v", err)
+	}
+	err = validateMinioStorage(map[string]any{
+		"storageMode": "unmounted-disk",
+		"dataRoot":    "/data/minio",
+		"diskDevice": map[string]any{
+			"srv-1": "/dev/sdb",
+		},
+	}, "srv-1", "srv-2")
+	if err == nil || !strings.Contains(err.Error(), "requires a disk device") {
+		t.Fatalf("expected missing per-server disk validation error, got %v", err)
+	}
+	if err := validateMinioStorage(map[string]any{
+		"storageMode": "local-disk",
+		"dataRoot":    "/data/minio",
+	}); err != nil {
+		t.Fatalf("expected valid local storage config: %v", err)
 	}
 }
 

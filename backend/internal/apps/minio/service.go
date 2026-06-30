@@ -117,9 +117,12 @@ func (s Service) Install(ctx context.Context, req InstallRequest, resources []st
 	}
 	installer := minioinstaller.NewInstaller(s.remote)
 	installRoot := remoteInstallRoot(server, "minio", bundle.Version)
+	var dataDirs []string
 	if err := step(3, "select-data-disk", copy.SelectDataDisk, func() error {
-		dataDir, dataErr := installer.ResolveDataDir(ctx, server, minioDataRoot(req.Parameters), installRoot, options.APIPort, logForServer)
-		options.DataDir = dataDir
+		var dataErr error
+		dataDirs, dataErr = installer.ResolveDataDirs(ctx, server, minioDataDirRequest(req.Parameters, installRoot, options.APIPort, server.ID), logForServer)
+		options.DataDirs = dataDirs
+		options.DataDir = firstString(dataDirs)
 		return dataErr
 	}); err != nil {
 		msg := fmt.Sprintf(copy.InstallFailed, err)
@@ -146,7 +149,12 @@ func (s Service) Install(ctx context.Context, req InstallRequest, resources []st
 			"consolePort":   options.ConsolePort,
 			"rootUser":      options.RootUser,
 			"serviceName":   fmt.Sprintf("aifar-minio-%d", options.APIPort),
+			"storageMode":   minioStorageMode(req.Parameters),
+			"dataRoot":      minioDataRoot(req.Parameters),
+			"diskDevice":    minioDiskDeviceForServer(req.Parameters, server.ID),
+			"diskDevices":   minioDiskDevicesForServer(req.Parameters, server.ID),
 			"dataDir":       options.DataDir,
+			"dataDirs":      dataDirs,
 			"endpoint":      fmt.Sprintf("http://%s:%d", server.Host, options.APIPort),
 			"topology":      "standalone",
 			"auth":          "password",
@@ -210,7 +218,7 @@ func (s Service) installDistributed(ctx context.Context, req InstallRequest, res
 	for idx, target := range targets {
 		targetIndexes[target] = idx
 	}
-	dataDirs := make([]string, len(targets))
+	dataDirs := make([][]string, len(targets))
 	failures := taskrun.RunTargets(ctx, targets, req.Concurrency, func(target string) error {
 		logForServer := logForTarget(log, targetLog, target)
 		if recorder != nil {
@@ -236,8 +244,8 @@ func (s Service) installDistributed(ctx context.Context, req InstallRequest, res
 		}
 		installRoot := remoteInstallRoot(server, "minio", bundle.Version)
 		if err := step(3, "select-data-disk", copy.SelectDataDisk, func() error {
-			dataDir, dataErr := installer.ResolveDataDir(ctx, server, minioDataRoot(req.Parameters), installRoot, options.APIPort, logForServer)
-			dataDirs[targetIndexes[target]] = dataDir
+			nodeDataDirs, dataErr := installer.ResolveDataDirs(ctx, server, minioDataDirRequest(req.Parameters, installRoot, options.APIPort, server.ID), logForServer)
+			dataDirs[targetIndexes[target]] = nodeDataDirs
 			return dataErr
 		}); err != nil {
 			msg := fmt.Sprintf(copy.InstallFailed, err)
@@ -246,7 +254,8 @@ func (s Service) installDistributed(ctx context.Context, req InstallRequest, res
 			return errors.New(msg)
 		}
 		nodeOptions := options
-		nodeOptions.DataDir = dataDirs[targetIndexes[target]]
+		nodeOptions.DataDirs = dataDirs[targetIndexes[target]]
+		nodeOptions.DataDir = firstString(nodeOptions.DataDirs)
 		if err := step(4, "install-minio", copy.InstallStandalone, func() error {
 			return installer.Install(ctx, server, bundle, nodeOptions, logForServer)
 		}); err != nil {
@@ -272,11 +281,13 @@ func (s Service) installDistributed(ctx context.Context, req InstallRequest, res
 	volumes := make([]minioinstaller.DistributedVolume, 0, len(targets))
 	for idx, target := range targets {
 		server := preloadedServers[target]
-		volumes = append(volumes, minioinstaller.DistributedVolume{
-			Host: server.Host,
-			Port: options.APIPort,
-			Path: dataDirs[idx],
-		})
+		for _, dataDir := range dataDirs[idx] {
+			volumes = append(volumes, minioinstaller.DistributedVolume{
+				Host: server.Host,
+				Port: options.APIPort,
+				Path: dataDir,
+			})
+		}
 	}
 	recordFailures := taskrun.RunTargets(ctx, targets, req.Concurrency, func(target string) error {
 		logForServer := logForTarget(log, targetLog, target)
@@ -311,10 +322,16 @@ func (s Service) installDistributed(ctx context.Context, req InstallRequest, res
 				"consolePort":    options.ConsolePort,
 				"rootUser":       options.RootUser,
 				"serviceName":    fmt.Sprintf("aifar-minio-%d", options.APIPort),
-				"dataDir":        dataDirs[targetIndexes[target]],
+				"storageMode":    minioStorageMode(req.Parameters),
+				"dataRoot":       minioDataRoot(req.Parameters),
+				"diskDevice":     minioDiskDeviceForServer(req.Parameters, server.ID),
+				"diskDevices":    minioDiskDevicesForServer(req.Parameters, server.ID),
+				"dataDir":        firstString(dataDirs[targetIndexes[target]]),
+				"dataDirs":       dataDirs[targetIndexes[target]],
 				"endpoint":       fmt.Sprintf("http://%s:%d", server.Host, options.APIPort),
 				"topology":       "distributed",
 				"distributedSet": len(targets),
+				"volumeCount":    len(volumes),
 				"auth":           "password",
 			})
 			var saveErr error
@@ -399,6 +416,174 @@ func minioDataRoot(params map[string]any) string {
 	return "/data/minio"
 }
 
+func minioStorageMode(params map[string]any) string {
+	for _, key := range []string{"storageMode", "dataStorageMode", "diskMode"} {
+		if value, ok := params[key]; ok {
+			switch strings.ToLower(strings.TrimSpace(fmt.Sprint(value))) {
+			case "unmounted", "unmounted-disk", "raw-disk", "disk", "device":
+				return minioinstaller.StorageModeUnmountedDisk
+			case "local", "local-disk", "local-dir", "directory", "":
+				return minioinstaller.StorageModeLocalDisk
+			}
+		}
+	}
+	return minioinstaller.StorageModeLocalDisk
+}
+
+func minioDiskDevice(params map[string]any) string {
+	return minioDiskDeviceForServer(params, "")
+}
+
+func minioDiskDeviceForServer(params map[string]any, serverID string) string {
+	return firstString(minioDiskDevicesForServer(params, serverID))
+}
+
+func minioDiskDevicesForServer(params map[string]any, serverID string) []string {
+	for _, key := range []string{"diskDevice", "dataDevice", "blockDevice"} {
+		if value, ok := params[key]; ok {
+			return diskDevicesFromValue(value, serverID)
+		}
+	}
+	return nil
+}
+
+func diskDevicesFromValue(value any, serverID string) []string {
+	if value == nil {
+		return nil
+	}
+	serverID = strings.TrimSpace(serverID)
+	switch typed := value.(type) {
+	case map[string]any:
+		return diskDevicesFromAnyMap(typed, serverID)
+	case map[string]string:
+		if serverID != "" {
+			return cleanDiskDevices([]any{typed[serverID]})
+		}
+		if len(typed) == 1 {
+			for _, device := range typed {
+				return cleanDiskDevices([]any{device})
+			}
+		}
+	case map[any]any:
+		converted := make(map[string]any, len(typed))
+		for key, device := range typed {
+			converted[strings.TrimSpace(fmt.Sprint(key))] = device
+		}
+		return diskDevicesFromAnyMap(converted, serverID)
+	case []any:
+		return cleanDiskDevices(typed)
+	case []string:
+		values := make([]any, 0, len(typed))
+		for _, device := range typed {
+			values = append(values, device)
+		}
+		return cleanDiskDevices(values)
+	default:
+		return cleanDiskDevices([]any{typed})
+	}
+	return nil
+}
+
+func diskDevicesFromAnyMap(values map[string]any, serverID string) []string {
+	if serverID != "" {
+		device, ok := values[serverID]
+		if !ok || device == nil {
+			return nil
+		}
+		return diskDevicesFromValue(device, "")
+	}
+	if len(values) == 1 {
+		for _, device := range values {
+			if device == nil {
+				return nil
+			}
+			return diskDevicesFromValue(device, "")
+		}
+	}
+	return nil
+}
+
+func cleanDiskDevices(values []any) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		device := strings.TrimSpace(fmt.Sprint(value))
+		if device == "" || seen[device] {
+			continue
+		}
+		seen[device] = true
+		out = append(out, device)
+	}
+	return out
+}
+
+func minioDataDirRequest(params map[string]any, installRoot string, apiPort int, serverID string) minioinstaller.DataDirRequest {
+	return minioinstaller.DataDirRequest{
+		Mode:        minioStorageMode(params),
+		DataRoot:    minioDataRoot(params),
+		DiskDevice:  minioDiskDeviceForServer(params, serverID),
+		DiskDevices: minioDiskDevicesForServer(params, serverID),
+		InstallRoot: installRoot,
+		APIPort:     apiPort,
+	}
+}
+
+func validateMinioStorage(params map[string]any, targets ...string) error {
+	mode := minioStorageMode(params)
+	if mode != minioinstaller.StorageModeLocalDisk && mode != minioinstaller.StorageModeUnmountedDisk {
+		return fmt.Errorf("unsupported MinIO storage mode: %s", mode)
+	}
+	if err := validateMinioDataRoot(minioDataRoot(params)); err != nil {
+		return err
+	}
+	if mode == minioinstaller.StorageModeUnmountedDisk {
+		if len(targets) == 0 {
+			targets = []string{""}
+		}
+		for _, target := range targets {
+			devices := minioDiskDevicesForServer(params, target)
+			if len(devices) == 0 {
+				return errors.New("MinIO unmounted disk mode requires a disk device")
+			}
+			for _, device := range devices {
+				if err := validateMinioDiskDevice(device); err != nil {
+					return err
+				}
+			}
+			if err := validateUniqueMinioDiskDevices(devices); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func validateMinioDiskDevice(device string) error {
+	device = strings.TrimSpace(device)
+	if device == "" {
+		return errors.New("MinIO unmounted disk mode requires a disk device")
+	}
+	if !strings.HasPrefix(device, "/dev/") {
+		return errors.New("MinIO disk device must start with /dev/")
+	}
+	if strings.IndexFunc(device, func(r rune) bool { return r <= ' ' }) >= 0 {
+		return errors.New("MinIO disk device must not contain whitespace")
+	}
+	return nil
+}
+
+func validateUniqueMinioDiskDevices(devices []string) error {
+	seen := map[string]bool{}
+	for _, device := range devices {
+		device = strings.TrimSpace(device)
+		if seen[device] {
+			return fmt.Errorf("MinIO disk device is selected more than once: %s", device)
+		}
+		seen[device] = true
+	}
+	return nil
+}
+
 func validateMinioDataRoot(value string) error {
 	value = strings.TrimSpace(value)
 	if value == "" {
@@ -406,6 +591,9 @@ func validateMinioDataRoot(value string) error {
 	}
 	if !strings.HasPrefix(value, "/") {
 		return errors.New("MinIO data disk root must be an absolute path")
+	}
+	if strings.Trim(value, "/") == "" {
+		return errors.New("MinIO data disk root must not be /")
 	}
 	if strings.IndexFunc(value, func(r rune) bool { return r <= ' ' }) >= 0 {
 		return errors.New("MinIO data disk root must not contain whitespace")
@@ -581,4 +769,14 @@ func finishTarget(recorder stepRecorder, target, status, errText string) {
 		return
 	}
 	recorder.FinishTarget(target, status, errText)
+}
+
+func firstString(values []string) string {
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value != "" {
+			return value
+		}
+	}
+	return ""
 }

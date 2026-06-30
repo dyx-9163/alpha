@@ -44,14 +44,21 @@ export interface AppInstallDialogCopy {
   submit: string
 }
 
-export type AppInstallFieldType = 'text' | 'password' | 'number' | 'select' | 'switch'
+export type AppInstallFieldType = 'text' | 'password' | 'number' | 'select' | 'switch' | 'server-disk-select'
 
 export interface AppInstallFieldOption {
   label: string
   value: string | number | boolean
+  disabled?: boolean
 }
 
-export type AppInstallFieldValue = string | number | boolean | Array<string | number | boolean> | undefined
+export type AppInstallFieldValue =
+  | string
+  | number
+  | boolean
+  | Array<string | number | boolean>
+  | Record<string, string | string[]>
+  | undefined
 export type AppInstallFieldValues = Record<string, AppInstallFieldValue>
 
 export interface AppInstallField {

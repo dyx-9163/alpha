@@ -91,6 +91,7 @@ func (i Installer) Install(ctx context.Context, server store.Server, bundle Bund
 		}
 	}
 
+	volumeDirs := minioVolumeDirs(req.DataDir, req.DataDirs, installRoot)
 	script, err := installStandaloneScript(InstallScriptRequest{
 		Version:        bundle.Version,
 		WorkDir:        workDir,
@@ -99,7 +100,9 @@ func (i Installer) Install(ctx context.Context, server store.Server, bundle Bund
 		GoModCachePath: goModCacheRemote,
 		MCRemotePath:   mcRemote,
 		InstallRoot:    installRoot,
-		DataDir:        minioDataDir(req.DataDir, installRoot),
+		DataDir:        volumeDirs[0],
+		DataDirs:       volumeDirs,
+		VolumeList:     strings.Join(volumeDirs, " "),
 		APIPort:        req.APIPort,
 		ConsolePort:    req.ConsolePort,
 		RootUser:       req.RootUser,
@@ -131,24 +134,58 @@ func (i Installer) Install(ctx context.Context, server store.Server, bundle Bund
 	return nil
 }
 
-func (i Installer) ResolveDataDir(ctx context.Context, server store.Server, dataRoot, installRoot string, apiPort int, log Logger) (string, error) {
-	systemDir := path.Join(installRoot, "data")
-	preferredDir := preferredMinIODataDir(dataRoot, apiPort)
-	if preferredDir == "" {
-		log.Info("MinIO data disk root not configured; using system disk directory: %s", systemDir)
-		return systemDir, nil
-	}
-	log.Info("checking MinIO data disk root: %s", dataRoot)
-	result, err := i.run(ctx, server, minioDataDirProbeCommand(preferredDir, systemDir), log)
+func (i Installer) ResolveDataDir(ctx context.Context, server store.Server, req DataDirRequest, log Logger) (string, error) {
+	dataDirs, err := i.ResolveDataDirs(ctx, server, req, log)
 	if err != nil {
 		return "", err
 	}
-	selected := selectedDataDirFromOutput(result.Stdout)
-	if selected == "" {
-		selected = systemDir
+	if len(dataDirs) == 0 {
+		return "", errors.New("MinIO data directory was not selected")
 	}
-	log.Info("selected MinIO data directory: %s", selected)
-	return selected, nil
+	return dataDirs[0], nil
+}
+
+func (i Installer) ResolveDataDirs(ctx context.Context, server store.Server, req DataDirRequest, log Logger) ([]string, error) {
+	systemDir := path.Join(req.InstallRoot, "data")
+	selectedDir := preferredMinIODataDir(req.DataRoot, req.APIPort)
+	if selectedDir == "" {
+		selectedDir = systemDir
+	}
+	switch normalizeMinIOStorageMode(req.Mode) {
+	case StorageModeLocalDisk:
+		log.Info("using MinIO local data directory: %s", selectedDir)
+		if _, err := i.run(ctx, server, minioLocalDataDirCommand(selectedDir), log); err != nil {
+			return nil, err
+		}
+		return []string{selectedDir}, nil
+	case StorageModeUnmountedDisk:
+		devices := minioRequestDiskDevices(req)
+		if len(devices) == 0 {
+			return nil, errors.New("MinIO unmounted disk mode requires a disk device")
+		}
+		if strings.TrimSpace(req.DataRoot) == "" {
+			return nil, errors.New("MinIO unmounted disk mode requires a data root")
+		}
+		dataDirs := make([]string, 0, len(devices))
+		for idx, device := range devices {
+			mountRoot := minioDiskMountRoot(req.DataRoot, idx)
+			dataDir := path.Join(mountRoot, "minio")
+			log.Info("preparing unmounted MinIO data disk: %s -> %s", device, mountRoot)
+			result, err := i.run(ctx, server, minioUnmountedDiskDataDirCommand(device, mountRoot, dataDir), log)
+			if err != nil {
+				return nil, err
+			}
+			selected := selectedDataDirFromOutput(result.Stdout)
+			if selected == "" {
+				selected = dataDir
+			}
+			log.Info("selected MinIO data directory: %s", selected)
+			dataDirs = append(dataDirs, selected)
+		}
+		return dataDirs, nil
+	default:
+		return nil, fmt.Errorf("unsupported MinIO storage mode: %s", req.Mode)
+	}
 }
 
 func (i Installer) ConfigureDistributedNode(ctx context.Context, server store.Server, req DistributedNodeConfig, log Logger) error {
@@ -166,6 +203,21 @@ type InstallOptions struct {
 	RootUser     string
 	RootPassword string
 	DataDir      string
+	DataDirs     []string
+}
+
+const (
+	StorageModeLocalDisk     = "local-disk"
+	StorageModeUnmountedDisk = "unmounted-disk"
+)
+
+type DataDirRequest struct {
+	Mode        string
+	DataRoot    string
+	DiskDevice  string
+	DiskDevices []string
+	InstallRoot string
+	APIPort     int
 }
 
 func (o InstallOptions) Validate() error {
@@ -196,6 +248,11 @@ func (o InstallOptions) Validate() error {
 	if strings.TrimSpace(o.DataDir) != "" && !strings.HasPrefix(strings.TrimSpace(o.DataDir), "/") {
 		return errors.New("MinIO data directory must be an absolute path")
 	}
+	for _, dir := range o.DataDirs {
+		if strings.TrimSpace(dir) != "" && !strings.HasPrefix(strings.TrimSpace(dir), "/") {
+			return errors.New("MinIO data directory must be an absolute path")
+		}
+	}
 	return nil
 }
 
@@ -207,6 +264,20 @@ func minioDataDir(dataDir, installRoot string) string {
 	return "/" + strings.Trim(dataDir, "/")
 }
 
+func minioVolumeDirs(dataDir string, dataDirs []string, installRoot string) []string {
+	out := make([]string, 0, len(dataDirs)+1)
+	for _, dir := range dataDirs {
+		dir = strings.TrimSpace(dir)
+		if dir != "" {
+			out = append(out, minioDataDir(dir, installRoot))
+		}
+	}
+	if len(out) == 0 {
+		out = append(out, minioDataDir(dataDir, installRoot))
+	}
+	return out
+}
+
 func preferredMinIODataDir(dataRoot string, apiPort int) string {
 	dataRoot = strings.TrimSpace(dataRoot)
 	if dataRoot == "" {
@@ -216,25 +287,113 @@ func preferredMinIODataDir(dataRoot string, apiPort int) string {
 	return path.Join(dataRoot, fmt.Sprintf("aifar-minio-%d", apiPort))
 }
 
-func minioDataDirProbeCommand(preferredDir, systemDir string) string {
-	preferredParent := path.Dir(preferredDir)
+func minioRequestDiskDevices(req DataDirRequest) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(req.DiskDevices)+1)
+	add := func(device string) {
+		device = strings.TrimSpace(device)
+		if device == "" || seen[device] {
+			return
+		}
+		seen[device] = true
+		out = append(out, device)
+	}
+	for _, device := range req.DiskDevices {
+		add(device)
+	}
+	add(req.DiskDevice)
+	return out
+}
+
+func minioDiskMountRoot(dataRoot string, index int) string {
+	dataRoot = "/" + strings.Trim(strings.TrimSpace(dataRoot), "/")
+	return path.Join(dataRoot, fmt.Sprintf("disk%d", index+1))
+}
+
+func normalizeMinIOStorageMode(mode string) string {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "", "local", "local-disk", "local-dir", "directory":
+		return StorageModeLocalDisk
+	case "unmounted", "unmounted-disk", "raw-disk", "disk", "device":
+		return StorageModeUnmountedDisk
+	default:
+		return strings.ToLower(strings.TrimSpace(mode))
+	}
+}
+
+func minioLocalDataDirCommand(dataDir string) string {
 	return strings.Join([]string{
 		"SUDO=\"\"",
 		"if [ \"$(id -u)\" != \"0\" ]; then SUDO=\"sudo -n\"; fi",
-		"PREFERRED_DIR=" + installerkit.ShellQuote(preferredDir),
-		"PREFERRED_PARENT=" + installerkit.ShellQuote(preferredParent),
-		"SYSTEM_DIR=" + installerkit.ShellQuote(systemDir),
-		"$SUDO mkdir -p \"$PREFERRED_PARENT\" \"$SYSTEM_DIR\"",
-		"ROOT_DEVICE=\"$(df -P / | awk 'NR==2 {print $1}')\"",
-		"DATA_DEVICE=\"$(df -P \"$PREFERRED_PARENT\" | awk 'NR==2 {print $1}')\"",
-		"if [ -n \"$DATA_DEVICE\" ] && [ \"$DATA_DEVICE\" != \"$ROOT_DEVICE\" ]; then",
-		"  $SUDO mkdir -p \"$PREFERRED_DIR\"",
-		"  echo \"using independent MinIO data disk: $PREFERRED_DIR ($DATA_DEVICE)\"",
-		"  echo \"AIFAR_SELECTED_MINIO_DATA_DIR=$PREFERRED_DIR\"",
-		"else",
-		"  echo \"independent MinIO data disk not found for $PREFERRED_PARENT; using system disk: $SYSTEM_DIR\"",
-		"  echo \"AIFAR_SELECTED_MINIO_DATA_DIR=$SYSTEM_DIR\"",
+		"DATA_DIR=" + installerkit.ShellQuote(dataDir),
+		"$SUDO mkdir -p \"$DATA_DIR\"",
+		"echo \"using local MinIO data directory: $DATA_DIR\"",
+		"echo \"AIFAR_SELECTED_MINIO_DATA_DIR=$DATA_DIR\"",
+	}, "\n")
+}
+
+func minioUnmountedDiskDataDirCommand(device, mountRoot, dataDir string) string {
+	mountRoot = "/" + strings.Trim(strings.TrimSpace(mountRoot), "/")
+	return strings.Join([]string{
+		"SUDO=\"\"",
+		"if [ \"$(id -u)\" != \"0\" ]; then SUDO=\"sudo -n\"; fi",
+		"DATA_DEVICE=" + installerkit.ShellQuote(strings.TrimSpace(device)),
+		"MOUNT_ROOT=" + installerkit.ShellQuote(mountRoot),
+		"DATA_DIR=" + installerkit.ShellQuote(dataDir),
+		"command -v lsblk >/dev/null 2>&1 || { echo \"lsblk is required to prepare MinIO data disk\"; exit 1; }",
+		"command -v mkfs.ext4 >/dev/null 2>&1 || { echo \"mkfs.ext4 is required to prepare MinIO data disk\"; exit 1; }",
+		"command -v blkid >/dev/null 2>&1 || { echo \"blkid is required to prepare MinIO data disk\"; exit 1; }",
+		"[ -b \"$DATA_DEVICE\" ] || { echo \"MinIO data device is not a block device: $DATA_DEVICE\"; exit 1; }",
+		"DEVICE_TYPE=\"$(lsblk -dn -o TYPE \"$DATA_DEVICE\" | head -n 1)\"",
+		"if [ \"$DEVICE_TYPE\" != \"disk\" ]; then",
+		"  echo \"MinIO data device must be an unpartitioned disk: $DATA_DEVICE ($DEVICE_TYPE)\"",
+		"  exit 1",
 		"fi",
+		"DEVICE_RO=\"$(lsblk -dn -o RO \"$DATA_DEVICE\" | head -n 1)\"",
+		"if [ \"$DEVICE_RO\" = \"1\" ]; then",
+		"  echo \"MinIO data disk is read-only: $DATA_DEVICE\"",
+		"  exit 1",
+		"fi",
+		"DEVICE_RM=\"$(lsblk -dn -o RM \"$DATA_DEVICE\" | head -n 1)\"",
+		"if [ \"$DEVICE_RM\" = \"1\" ]; then",
+		"  echo \"MinIO data disk is removable: $DATA_DEVICE\"",
+		"  exit 1",
+		"fi",
+		"DEVICE_FSTYPE=\"$(lsblk -dn -o FSTYPE \"$DATA_DEVICE\" | head -n 1)\"",
+		"if [ \"$DEVICE_FSTYPE\" = \"iso9660\" ] || [ \"$DEVICE_FSTYPE\" = \"udf\" ]; then",
+		"  echo \"MinIO data disk looks like optical media: $DATA_DEVICE ($DEVICE_FSTYPE)\"",
+		"  exit 1",
+		"fi",
+		"if lsblk -nr -o MOUNTPOINT \"$DATA_DEVICE\" | grep -q .; then",
+		"  echo \"MinIO data device or one of its partitions is already mounted: $DATA_DEVICE\"",
+		"  exit 1",
+		"fi",
+		"if [ \"$(lsblk -nr \"$DATA_DEVICE\" | wc -l)\" -gt 1 ]; then",
+		"  echo \"MinIO data disk has partitions; select a clean unmounted disk or prepare it manually: $DATA_DEVICE\"",
+		"  exit 1",
+		"fi",
+		"if findmnt \"$MOUNT_ROOT\" >/dev/null 2>&1; then",
+		"  echo \"MinIO mount root is already mounted: $MOUNT_ROOT\"",
+		"  exit 1",
+		"fi",
+		"if [ -d \"$MOUNT_ROOT\" ] && find \"$MOUNT_ROOT\" -mindepth 1 -maxdepth 1 | grep -q .; then",
+		"  echo \"MinIO mount root must be empty before mounting data disk: $MOUNT_ROOT\"",
+		"  exit 1",
+		"fi",
+		"echo \"formatting MinIO data device as ext4: $DATA_DEVICE\"",
+		"$SUDO mkfs.ext4 -F \"$DATA_DEVICE\"",
+		"UUID=\"$(blkid -s UUID -o value \"$DATA_DEVICE\")\"",
+		"[ -n \"$UUID\" ] || { echo \"unable to read UUID from MinIO data device: $DATA_DEVICE\"; exit 1; }",
+		"$SUDO mkdir -p \"$MOUNT_ROOT\"",
+		"FSTAB_TMP=\"$(mktemp)\"",
+		"if [ -f /etc/fstab ]; then awk -v mount_root=\"$MOUNT_ROOT\" '$2 != mount_root {print}' /etc/fstab > \"$FSTAB_TMP\"; else : > \"$FSTAB_TMP\"; fi",
+		"echo \"UUID=$UUID $MOUNT_ROOT ext4 defaults,nofail 0 2\" >> \"$FSTAB_TMP\"",
+		"$SUDO install -m 0644 \"$FSTAB_TMP\" /etc/fstab",
+		"rm -f \"$FSTAB_TMP\"",
+		"$SUDO mount \"$MOUNT_ROOT\"",
+		"$SUDO mkdir -p \"$DATA_DIR\"",
+		"echo \"mounted MinIO data disk: $DATA_DEVICE -> $MOUNT_ROOT\"",
+		"echo \"AIFAR_SELECTED_MINIO_DATA_DIR=$DATA_DIR\"",
 	}, "\n")
 }
 

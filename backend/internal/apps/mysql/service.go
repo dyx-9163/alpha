@@ -500,11 +500,6 @@ func (s Service) markInnoDBClusterPrimary(instance store.AppInstance, primaryEnd
 		metadata["currentPrimaryEndpoint"] = primaryEndpoint
 		metadata["primaryEndpoint"] = primaryEndpoint
 		metadata["primaryDetectedAt"] = detectedAt
-		metadata["lastCheck"] = map[string]any{
-			"status":    "running",
-			"checkedAt": detectedAt,
-			"details":   details,
-		}
 		if normalizeEndpoint(metadataString(metadata, "endpoint")) == normalizeEndpoint(primaryEndpoint) {
 			metadata["role"] = "primary"
 		} else {
@@ -513,9 +508,16 @@ func (s Service) markInnoDBClusterPrimary(instance store.AppInstance, primaryEnd
 		if metadataString(metadata, "topology") == "" {
 			metadata["topology"] = "innodb-cluster"
 		}
+		if candidate.ID == instance.ID {
+			metadata["lastCheck"] = map[string]any{
+				"status":    "running",
+				"checkedAt": detectedAt,
+				"details":   details,
+			}
+			candidate.Status = "running"
+		}
 		data, _ := json.Marshal(metadata)
 		candidate.Metadata = string(data)
-		candidate.Status = "running"
 		if candidate.Topology == "" {
 			candidate.Topology = "innodb-cluster"
 		}

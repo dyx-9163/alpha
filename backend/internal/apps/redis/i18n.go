@@ -35,6 +35,11 @@ type Copy struct {
 	SentinelMasterNameInvalid string
 	ClusterNeedNodes          string
 	TopologyUnsupported       string
+	CheckRuntime              string
+	DetectRole                string
+	UpdateInstance            string
+	CheckFailed               string
+	Checked                   string
 }
 
 type DeleteCopy struct {
@@ -83,6 +88,11 @@ func CopyFor(lang string) Copy {
 			SentinelMasterNameInvalid: "Redis Sentinel monitor name can contain only letters, numbers, dot, dash, and underscore, up to 64 characters",
 			ClusterNeedNodes:          "Redis Cluster requires at least 3 target servers",
 			TopologyUnsupported:       "Redis topology is not supported: %s",
+			CheckRuntime:              "check Redis runtime",
+			DetectRole:                "detect Redis current role",
+			UpdateInstance:            "update Redis instance status",
+			CheckFailed:               "Redis check failed: %s",
+			Checked:                   "Redis instance checked: %s",
 		}
 	default:
 		return Copy{

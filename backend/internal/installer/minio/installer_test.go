@@ -125,6 +125,92 @@ func TestInstallerUploadsResourcesAndRunsMinioScript(t *testing.T) {
 	}
 }
 
+func TestInstallerResolveDataDirUsesLocalDirectoryMode(t *testing.T) {
+	remote := &fakeRemote{}
+	installer := NewInstaller(remote)
+	dataDir, err := installer.ResolveDataDir(context.Background(), store.Server{Name: "s3-1"}, DataDirRequest{
+		Mode:        StorageModeLocalDisk,
+		DataRoot:    "/data/minio",
+		InstallRoot: "/aifar/apps/minio/2025-10-15T17-29-55Z",
+		APIPort:     9000,
+	}, testLogger{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dataDir != "/data/minio/aifar-minio-9000" {
+		t.Fatalf("unexpected local data dir: %s", dataDir)
+	}
+	joined := strings.Join(remote.commands, "\n")
+	if !strings.Contains(joined, `DATA_DIR='/data/minio/aifar-minio-9000'`) || !strings.Contains(joined, `mkdir -p "$DATA_DIR"`) {
+		t.Fatalf("local mode should create the selected data directory: %s", joined)
+	}
+	if strings.Contains(joined, "lsblk") || strings.Contains(joined, "mkfs.ext4") {
+		t.Fatalf("local mode must not probe or format disks: %s", joined)
+	}
+}
+
+func TestInstallerResolveDataDirPreparesUnmountedDisk(t *testing.T) {
+	remote := &fakeRemote{}
+	installer := NewInstaller(remote)
+	dataDir, err := installer.ResolveDataDir(context.Background(), store.Server{Name: "s3-1"}, DataDirRequest{
+		Mode:        StorageModeUnmountedDisk,
+		DataRoot:    "/data/minio",
+		DiskDevice:  "/dev/sdb",
+		InstallRoot: "/aifar/apps/minio/2025-10-15T17-29-55Z",
+		APIPort:     9000,
+	}, testLogger{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dataDir != "/data/minio/disk1/minio" {
+		t.Fatalf("unexpected unmounted disk data dir: %s", dataDir)
+	}
+	joined := strings.Join(remote.commands, "\n")
+	for _, want := range []string{
+		`DATA_DEVICE='/dev/sdb'`,
+		`MOUNT_ROOT='/data/minio/disk1'`,
+		`mkfs.ext4 -F "$DATA_DEVICE"`,
+		`UUID=$UUID $MOUNT_ROOT ext4 defaults,nofail 0 2`,
+		`mount "$MOUNT_ROOT"`,
+		`AIFAR_SELECTED_MINIO_DATA_DIR=$DATA_DIR`,
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("unmounted disk command missing %q:\n%s", want, joined)
+		}
+	}
+}
+
+func TestInstallerResolveDataDirsPreparesMultipleUnmountedDisks(t *testing.T) {
+	remote := &fakeRemote{}
+	installer := NewInstaller(remote)
+	dataDirs, err := installer.ResolveDataDirs(context.Background(), store.Server{Name: "s3-1"}, DataDirRequest{
+		Mode:        StorageModeUnmountedDisk,
+		DataRoot:    "/data/minio",
+		DiskDevices: []string{"/dev/sdb", "/dev/sdc"},
+		InstallRoot: "/aifar/apps/minio/2025-10-15T17-29-55Z",
+		APIPort:     9000,
+	}, testLogger{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantDirs := []string{"/data/minio/disk1/minio", "/data/minio/disk2/minio"}
+	if strings.Join(dataDirs, "|") != strings.Join(wantDirs, "|") {
+		t.Fatalf("unexpected unmounted disk data dirs: %+v", dataDirs)
+	}
+	joined := strings.Join(remote.commands, "\n")
+	for _, want := range []string{
+		`DATA_DEVICE='/dev/sdb'`,
+		`MOUNT_ROOT='/data/minio/disk1'`,
+		`DATA_DEVICE='/dev/sdc'`,
+		`MOUNT_ROOT='/data/minio/disk2'`,
+		`DEVICE_RM="$(lsblk -dn -o RM "$DATA_DEVICE" | head -n 1)"`,
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("multiple unmounted disk command missing %q:\n%s", want, joined)
+		}
+	}
+}
+
 func TestMinIOStandaloneScriptsRenderTemplates(t *testing.T) {
 	install, err := installStandaloneScript(InstallScriptRequest{
 		Version:        "2025-10-15T17-29-55Z",

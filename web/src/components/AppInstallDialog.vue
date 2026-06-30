@@ -35,8 +35,35 @@
         </el-form-item>
 
         <el-form-item v-for="field in installFields" :key="field.name" :label="field.label" :required="field.required">
+          <div v-if="field.type === 'server-disk-select'" class="server-disk-select-list">
+            <div v-for="server in selectedTargetServers" :key="server.id" class="server-disk-row">
+              <div class="server-disk-label">{{ serverLabel(server) }}</div>
+              <el-select
+                :model-value="serverDiskValue(field.name, server.id, field.multiple)"
+                :placeholder="field.placeholder"
+                :loading="serverDiskLoading(server.id)"
+                :multiple="field.multiple"
+                :collapse-tags="field.multiple"
+                :collapse-tags-tooltip="field.multiple"
+                filterable
+                style="width: 100%"
+                @update:model-value="(value: string | string[]) => setServerDiskValue(field.name, server.id, value, field.multiple)"
+              >
+                <el-option
+                  v-for="option in serverDiskOptions(server.id)"
+                  :key="String(option.value)"
+                  :label="option.label"
+                  :value="option.value"
+                  :disabled="option.disabled"
+                />
+              </el-select>
+              <div v-if="serverDiskError(server.id)" class="field-error">{{ serverDiskError(server.id) }}</div>
+              <div v-else-if="serverDiskEmpty(server.id)" class="field-hint">{{ t('apps.noDiskCandidates') }}</div>
+            </div>
+            <div v-if="!selectedTargetServers.length" class="field-hint">{{ dialogCopy.serversPlaceholder }}</div>
+          </div>
           <el-select
-            v-if="field.type === 'select'"
+            v-else-if="field.type === 'select'"
             v-model="fieldValues[field.name]"
             :placeholder="field.placeholder"
             :multiple="field.multiple"
@@ -44,7 +71,13 @@
             :collapse-tags-tooltip="field.multiple"
             style="width: 100%"
           >
-            <el-option v-for="option in fieldOptions(field)" :key="String(option.value)" :label="option.label" :value="option.value" />
+            <el-option
+              v-for="option in fieldOptions(field)"
+              :key="String(option.value)"
+              :label="option.label"
+              :value="option.value"
+              :disabled="option.disabled"
+            />
           </el-select>
           <el-switch v-else-if="field.type === 'switch'" v-model="fieldValues[field.name]" />
           <el-input-number
@@ -84,8 +117,9 @@
 
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
+import { apiGet } from '../api/client'
 import type { AppStoreItem } from '../apps/registry/catalog'
-import type { AppInstallDialogCopy, AppInstallField, AppInstallFieldValues, AppInstallPayload, AppInstallValidationContext, ServerOption } from '../apps/registry/contract'
+import type { AppInstallDialogCopy, AppInstallField, AppInstallFieldOption, AppInstallFieldValues, AppInstallPayload, AppInstallValidationContext, ServerOption } from '../apps/registry/contract'
 import type { AppTargetMode } from '../apps/registry/model'
 import { useI18n } from '../i18n'
 import ServerSelector from './ServerSelector.vue'
@@ -119,6 +153,7 @@ const selectedVersion = ref('')
 const selectedServerId = ref('')
 const selectedServerIds = ref<string[]>([])
 const fieldValues = ref<AppInstallFieldValues>({})
+const serverDiskStates = ref<Record<string, ServerDiskState>>({})
 const safeServers = computed(() => Array.isArray(props.servers) ? props.servers : [])
 const allFields = computed(() => Array.isArray(props.fields) ? props.fields : [])
 const installFields = computed(() => allFields.value.filter((field) => field.visibleWhen?.(fieldValues.value, validationContext.value) ?? true))
@@ -192,7 +227,21 @@ watch(
     selectedVersion.value = props.app.versions.at(-1) ?? props.app.fallbackVersion
     selectedServerId.value = ''
     selectedServerIds.value = []
+    serverDiskStates.value = {}
     resetFieldValues()
+  },
+  { immediate: true }
+)
+
+watch(
+  () => ({
+    visible: props.modelValue,
+    diskFields: installFields.value.filter((field) => field.type === 'server-disk-select').map((field) => field.name).join('|'),
+    targets: selectedTargetServers.value.map((server) => server.id).join('|')
+  }),
+  () => {
+    pruneServerDiskFieldValues()
+    void refreshServerDiskOptions()
   },
   { immediate: true }
 )
@@ -216,10 +265,17 @@ function normalizeFieldValue(value: unknown) {
   if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
     return value
   }
+  if (isServerDiskRecord(value)) {
+    return cloneServerDiskRecord(value)
+  }
   return undefined
 }
 
 function isFieldValueFilled(field: AppInstallField, value: unknown) {
+  if (field.type === 'server-disk-select') {
+    const values = serverDiskRecord(value)
+    return selectedTargetServers.value.length > 0 && selectedTargetServers.value.every((server) => serverDiskSelectionFilled(values[server.id], field.multiple))
+  }
   if (field.type === 'switch') {
     return value !== undefined
   }
@@ -231,9 +287,179 @@ function isFieldValueFilled(field: AppInstallField, value: unknown) {
 
 function extraPayload() {
   return installFields.value.reduce<Record<string, unknown>>((payload, field) => {
-    payload[field.name] = fieldValues.value[field.name]
+    payload[field.name] = field.type === 'server-disk-select' ? prunedServerDiskValue(field.name, field.multiple) : fieldValues.value[field.name]
     return payload
   }, {})
+}
+
+type ServerDiskDevice = {
+  path?: string
+  type?: string
+  sizeHuman?: string
+  model?: string
+  fstype?: string
+  candidate?: boolean
+}
+
+type ServerDiskResponse = {
+  devices?: ServerDiskDevice[]
+}
+
+type ServerDiskState = {
+  loading: boolean
+  loaded: boolean
+  error: string
+  options: AppInstallFieldOption[]
+}
+
+function serverLabel(server: ServerOption) {
+  if (server.name && server.host) {
+    return `${server.name} (${server.host})`
+  }
+  return server.name || server.host || server.id
+}
+
+function serverDiskOptions(serverId: string) {
+  return serverDiskStates.value[serverId]?.options ?? []
+}
+
+function serverDiskLoading(serverId: string) {
+  return Boolean(serverDiskStates.value[serverId]?.loading)
+}
+
+function serverDiskError(serverId: string) {
+  return serverDiskStates.value[serverId]?.error ?? ''
+}
+
+function serverDiskEmpty(serverId: string) {
+  const state = serverDiskStates.value[serverId]
+  return Boolean(state?.loaded && !state.loading && !state.error && state.options.length === 0)
+}
+
+function serverDiskValue(fieldName: string, serverId: string, multiple?: boolean) {
+  const value = serverDiskRecord(fieldValues.value[fieldName])[serverId]
+  if (multiple) {
+    return Array.isArray(value) ? value : value ? [value] : []
+  }
+  return Array.isArray(value) ? value : value ?? ''
+}
+
+function setServerDiskValue(fieldName: string, serverId: string, value: string | string[], multiple?: boolean) {
+  const current = serverDiskRecord(fieldValues.value[fieldName])
+  fieldValues.value = {
+    ...fieldValues.value,
+    [fieldName]: {
+      ...current,
+      [serverId]: multiple ? stringArray(value) : String(value ?? '').trim()
+    }
+  }
+}
+
+function pruneServerDiskFieldValues() {
+  const diskFields = allFields.value.filter((field) => field.type === 'server-disk-select')
+  if (!diskFields.length) {
+    return
+  }
+  const selected = new Set(selectedTargetServers.value.map((server) => server.id))
+  const next = { ...fieldValues.value }
+  let changed = false
+  for (const field of diskFields) {
+    const current = serverDiskRecord(next[field.name])
+    const pruned: ServerDiskRecord = {}
+    for (const serverId of selected) {
+      if (serverDiskSelectionFilled(current[serverId], field.multiple)) {
+        pruned[serverId] = current[serverId]
+      }
+    }
+    if (JSON.stringify(current) !== JSON.stringify(pruned)) {
+      next[field.name] = pruned
+      changed = true
+    }
+  }
+  if (changed) {
+    fieldValues.value = next
+  }
+}
+
+function prunedServerDiskValue(fieldName: string, multiple?: boolean) {
+  const selected = new Set(selectedTargetServers.value.map((server) => server.id))
+  const current = serverDiskRecord(fieldValues.value[fieldName])
+  return Object.fromEntries(Object.entries(current).filter(([serverId, value]) => selected.has(serverId) && serverDiskSelectionFilled(value, multiple)))
+}
+
+async function refreshServerDiskOptions() {
+  if (!props.modelValue || !installFields.value.some((field) => field.type === 'server-disk-select')) {
+    return
+  }
+  await Promise.all(selectedTargetServers.value.map((server) => loadServerDiskOptions(server.id)))
+}
+
+async function loadServerDiskOptions(serverId: string) {
+  const existing = serverDiskStates.value[serverId]
+  if (existing?.loading || existing?.loaded) {
+    return
+  }
+  serverDiskStates.value = {
+    ...serverDiskStates.value,
+    [serverId]: { loading: true, loaded: false, error: '', options: [] }
+  }
+  try {
+    const response = await apiGet<ServerDiskResponse>(`/servers/${encodeURIComponent(serverId)}/disks`)
+    const options = (Array.isArray(response.devices) ? response.devices : [])
+      .filter((device) => device.candidate && device.path)
+      .map((device) => ({ label: diskOptionLabel(device), value: String(device.path) }))
+    serverDiskStates.value = {
+      ...serverDiskStates.value,
+      [serverId]: { loading: false, loaded: true, error: '', options }
+    }
+  } catch (error) {
+    serverDiskStates.value = {
+      ...serverDiskStates.value,
+      [serverId]: {
+        loading: false,
+        loaded: true,
+        error: error instanceof Error ? error.message : t('apps.diskDetectFailed'),
+        options: []
+      }
+    }
+  }
+}
+
+function diskOptionLabel(device: ServerDiskDevice) {
+  return [device.path, device.sizeHuman, device.type, device.fstype ? `fs ${device.fstype}` : '', device.model]
+    .filter((part) => typeof part === 'string' && part.trim())
+    .join(' - ')
+}
+
+type ServerDiskValue = string | string[]
+type ServerDiskRecord = Record<string, ServerDiskValue>
+
+function isServerDiskRecord(value: unknown): value is ServerDiskRecord {
+  return Boolean(value && typeof value === 'object' && !Array.isArray(value) && Object.values(value).every((item) => {
+    return typeof item === 'string' || (Array.isArray(item) && item.every((entry) => typeof entry === 'string'))
+  }))
+}
+
+function serverDiskRecord(value: unknown): ServerDiskRecord {
+  return isServerDiskRecord(value) ? cloneServerDiskRecord(value) : {}
+}
+
+function cloneServerDiskRecord(value: ServerDiskRecord): ServerDiskRecord {
+  return Object.fromEntries(Object.entries(value).map(([serverId, item]) => [serverId, Array.isArray(item) ? [...item] : item]))
+}
+
+function stringArray(value: string | string[]) {
+  return (Array.isArray(value) ? value : [value]).map((item) => String(item ?? '').trim()).filter(Boolean)
+}
+
+function serverDiskSelectionFilled(value: unknown, multiple?: boolean) {
+  if (Array.isArray(value)) {
+    return value.some((item) => String(item ?? '').trim())
+  }
+  if (multiple) {
+    return false
+  }
+  return typeof value === 'string' && value.trim() !== ''
 }
 
 function submit() {
@@ -332,6 +558,37 @@ function submit() {
   line-height: 18px;
 }
 
+.field-hint {
+  width: 100%;
+  margin-top: 4px;
+  color: var(--aifar-text-secondary);
+  font-size: 12px;
+  line-height: 18px;
+}
+
+.server-disk-select-list {
+  width: 100%;
+  display: grid;
+  gap: 8px;
+}
+
+.server-disk-row {
+  display: grid;
+  grid-template-columns: minmax(160px, 220px) minmax(0, 1fr);
+  gap: 8px;
+  align-items: start;
+}
+
+.server-disk-label {
+  min-height: 32px;
+  display: flex;
+  align-items: center;
+  color: var(--aifar-text-secondary);
+  font-size: 13px;
+  line-height: 18px;
+  word-break: break-word;
+}
+
 .empty-server-hint,
 .target-summary {
   min-height: 32px;
@@ -370,6 +627,11 @@ function submit() {
 
   .install-form :deep(.el-form-item__content) {
     margin-left: 0 !important;
+  }
+
+  .server-disk-row {
+    grid-template-columns: 1fr;
+    gap: 4px;
   }
 }
 </style>

@@ -9,6 +9,7 @@ GOMODCACHE_ARCHIVE={{shq .GoModCachePath}}
 MC_BINARY={{shq .MCRemotePath}}
 INSTALL_ROOT={{shq .InstallRoot}}
 DATA_DIR={{shq .DataDir}}
+MINIO_VOLUME_LIST={{shq .VolumeList}}
 API_PORT={{.APIPort}}
 CONSOLE_PORT={{.ConsolePort}}
 ROOT_USER={{shq .RootUser}}
@@ -47,7 +48,10 @@ if [ -d "$WORK_DIR/rpms" ] && ls "$WORK_DIR"/rpms/*.rpm >/dev/null 2>&1; then
 fi
 
 echo "preparing MinIO install directories"
-$SUDO mkdir -p "$INSTALL_ROOT/bin" "$CONFIG_DIR" "$DATA_DIR" "$LOG_DIR" "$RUN_DIR" /etc/systemd/system
+$SUDO mkdir -p "$INSTALL_ROOT/bin" "$CONFIG_DIR" "$LOG_DIR" "$RUN_DIR" /etc/systemd/system
+{{range .DataDirs}}
+$SUDO mkdir -p {{shq .}}
+{{end}}
 rm -rf "$WORK_DIR/toolchain" "$WORK_DIR/gomodcache" "$WORK_DIR/unpacked" "$WORK_DIR/gopath"
 mkdir -p "$WORK_DIR/toolchain" "$WORK_DIR/gomodcache" "$WORK_DIR/unpacked" "$WORK_DIR/gopath"
 
@@ -105,7 +109,7 @@ echo "writing MinIO environment"
 cat > "$WORK_DIR/minio.env" <<CONF
 MINIO_ROOT_USER="$ROOT_USER"
 MINIO_ROOT_PASSWORD="$ROOT_PASSWORD"
-MINIO_VOLUMES="$DATA_DIR"
+MINIO_VOLUMES="$MINIO_VOLUME_LIST"
 MINIO_OPTS="--address :$API_PORT --console-address :$CONSOLE_PORT"
 CONF
 $SUDO install -m 0600 "$WORK_DIR/minio.env" "$ENV_FILE"

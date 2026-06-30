@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 
+	"aifar-deployment/backend/internal/adapter"
 	"aifar-deployment/backend/internal/store"
 )
 
@@ -18,6 +19,10 @@ type Store interface {
 
 type Prober interface {
 	Probe(ctx context.Context, server store.Server) error
+}
+
+type RemoteRunner interface {
+	Run(ctx context.Context, server store.Server, command string) (adapter.CommandResult, error)
 }
 
 type Logger interface {
@@ -34,6 +39,7 @@ type Logger interface {
 type Service struct {
 	store            Store
 	prober           Prober
+	remote           RemoteRunner
 	defaultDeployDir string
 }
 
@@ -51,11 +57,18 @@ func IsValidationError(err error) bool {
 }
 
 func NewService(s Store, prober Prober, defaultDeployDir ...string) Service {
+	return NewServiceWithRemote(s, prober, adapter.SSHRemote{}, defaultDeployDir...)
+}
+
+func NewServiceWithRemote(s Store, prober Prober, remote RemoteRunner, defaultDeployDir ...string) Service {
 	deployDir := "/aifar/apps"
 	if len(defaultDeployDir) > 0 && strings.TrimSpace(defaultDeployDir[0]) != "" {
 		deployDir = strings.TrimSpace(defaultDeployDir[0])
 	}
-	return Service{store: s, prober: prober, defaultDeployDir: deployDir}
+	if remote == nil {
+		remote = adapter.SSHRemote{}
+	}
+	return Service{store: s, prober: prober, remote: remote, defaultDeployDir: deployDir}
 }
 
 func (s Service) List() ([]store.Server, error) {

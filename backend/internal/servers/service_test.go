@@ -3,8 +3,10 @@ package servers
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
+	"aifar-deployment/backend/internal/adapter"
 	"aifar-deployment/backend/internal/store"
 )
 
@@ -40,6 +42,20 @@ type fakeProber struct {
 
 func (f fakeProber) Probe(ctx context.Context, server store.Server) error {
 	return f.err
+}
+
+type fakeRemote struct {
+	stdout  string
+	command string
+	err     error
+}
+
+func (f *fakeRemote) Run(ctx context.Context, server store.Server, command string) (adapter.CommandResult, error) {
+	f.command = command
+	if f.err != nil {
+		return adapter.CommandResult{}, f.err
+	}
+	return adapter.CommandResult{Stdout: f.stdout}, nil
 }
 
 type fakeLogger struct {
@@ -111,5 +127,43 @@ func TestProbeFailureUpdatesServerStatus(t *testing.T) {
 	}
 	if s.server.LastError != probeErr.Error() {
 		t.Fatalf("expected last error %q, got %q", probeErr.Error(), s.server.LastError)
+	}
+}
+
+func TestListDiskDevicesDetectsUnmountedCandidates(t *testing.T) {
+	remote := &fakeRemote{stdout: `{
+		"blockdevices": [
+			{"name":"sda","path":"/dev/sda","type":"disk","size":107374182400,"mountpoint":null,"fstype":null,"model":"system","ro":false,"rm":false,"children":[
+				{"name":"sda1","path":"/dev/sda1","type":"part","size":1073741824,"mountpoint":"/boot","fstype":"xfs","model":"","ro":false,"rm":false},
+				{"name":"sda2","path":"/dev/sda2","type":"part","size":106300440576,"mountpoint":"/","fstype":"xfs","model":"","ro":false,"rm":false},
+				{"name":"sda3","path":"/dev/sda3","type":"part","size":8589934592,"mountpoint":null,"fstype":null,"model":"","ro":false,"rm":false}
+			]},
+			{"name":"sdb","path":"/dev/sdb","type":"disk","size":214748364800,"mountpoint":null,"fstype":null,"model":"data","ro":false,"rm":false},
+			{"name":"sdc","path":"/dev/sdc","type":"disk","size":8589934592,"mountpoint":null,"fstype":null,"model":"usb","ro":false,"rm":true},
+			{"name":"sr0","path":"/dev/sr0","type":"rom","size":1073741312,"mountpoint":null,"fstype":"iso9660","model":"cdrom","ro":true,"rm":true}
+		]
+	}`}
+	service := NewServiceWithRemote(
+		&fakeStore{server: store.Server{ID: "srv-1", Name: "s3-1", Host: "10.0.0.1", Username: "root", Password: "secret"}},
+		fakeProber{},
+		remote,
+	)
+
+	inventory, err := service.ListDiskDevices(context.Background(), "srv-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inventory.ServerID != "srv-1" {
+		t.Fatalf("expected server id srv-1, got %s", inventory.ServerID)
+	}
+	if !strings.Contains(remote.command, "lsblk -b -J") || !strings.Contains(remote.command, "-e 7,11") {
+		t.Fatalf("expected filtered lsblk json command, got %q", remote.command)
+	}
+	if len(inventory.Devices) != 1 {
+		t.Fatalf("expected only selectable unmounted disks, got %+v", inventory.Devices)
+	}
+	dataDisk := inventory.Devices[0]
+	if dataDisk.Path != "/dev/sdb" || !dataDisk.Candidate || dataDisk.SizeHuman == "" {
+		t.Fatalf("expected /dev/sdb to be selectable, devices=%+v", inventory.Devices)
 	}
 }

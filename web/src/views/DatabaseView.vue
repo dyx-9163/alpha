@@ -12,14 +12,13 @@
     </div>
 
     <div class="aifar-panel status-line">
-      <span class="subtle-note">{{ t('database.notChecked') }}</span>
-      <span class="status-pill success">{{ t('common.connected') }}</span>
       <span class="subtle-note">{{ t('database.instanceCount', { count: instances.length }) }}</span>
+      <span class="status-pill" :class="{ success: monitoringEnabled }">{{ monitoringStatusLabel }}</span>
+      <span v-if="lastMonitorAt" class="subtle-note">{{ t('database.lastMonitoredAt') }} {{ lastMonitorAt }}</span>
     </div>
 
     <el-tabs v-model="tab" class="tab-strip">
       <el-tab-pane :label="t('database.instances')" name="instances" />
-      <el-tab-pane :label="t('database.backups')" name="backups" />
       <el-tab-pane :label="t('database.runs')" name="runs" />
       <el-tab-pane :label="t('apps.settings')" name="settings" />
     </el-tabs>
@@ -31,9 +30,14 @@
             <span class="status-pill">{{ t('common.all') }} {{ instanceGroups.length }}</span>
             <span class="status-pill">MySQL {{ mysqlGroupCount }}</span>
             <span class="status-pill">Redis {{ redisGroupCount }}</span>
-            <span class="status-pill">{{ t('database.nodes') }} {{ instances.length }}</span>
+            <span class="status-pill">{{ t('database.nodes') }} {{ databaseNodeCount }}</span>
+            <span v-if="routerInstanceCount" class="status-pill">{{ t('database.mysqlRouter') }} {{ routerInstanceCount }}</span>
           </div>
-          <el-input v-model="search" :placeholder="t('common.search')" clearable class="toolbar-control is-sm" />
+          <div class="monitor-actions">
+            <el-switch v-model="monitoringEnabled" :disabled="!canManageApps" :active-text="t('database.realtimeMonitor')" @change="handleMonitoringToggle" />
+            <el-button size="small" :loading="monitoringRunning" :disabled="!canManageApps" @click="runRealtimeCheck(true)">{{ t('database.monitorNow') }}</el-button>
+            <el-input v-model="search" :placeholder="t('common.search')" clearable class="toolbar-control is-sm" />
+          </div>
         </div>
 
         <div class="db-card-grid" v-if="filteredGroups.length">
@@ -51,8 +55,10 @@
               <div><span>{{ t('dashboard.topology') }}</span><strong>{{ group.topology || '-' }}</strong></div>
               <div><span>{{ t('common.version') }}</span><strong>{{ group.version }}</strong></div>
               <div><span>{{ t('database.nodes') }}</span><strong>{{ group.nodes.length }}</strong></div>
-              <div><span>{{ groupEndpointLabel(group) }}</span><strong>{{ group.endpoint || '-' }}</strong></div>
+              <div class="db-grid-wide"><span>{{ groupEndpointLabel(group) }}</span><strong>{{ group.endpoint || '-' }}</strong></div>
               <div><span>{{ t('common.status') }}</span><StatusTag :status="group.status" /></div>
+              <div v-if="group.routers.length"><span>{{ t('database.mysqlRouter') }}</span><strong>{{ group.routers.length }}</strong></div>
+              <div v-if="group.routers.length" class="db-grid-wide"><span>{{ t('database.routerEndpoint') }}</span><strong>{{ routerEndpointSummary(group) }}</strong></div>
             </div>
             <div class="node-list">
               <div v-for="node in group.nodes" :key="node.instance.id" class="node-row">
@@ -60,26 +66,28 @@
                   <strong>{{ node.serverLabel }}</strong>
                   <span>{{ node.endpoint || '-' }}</span>
                 </div>
-                <el-tag size="small" effect="plain">{{ node.roleLabel }}</el-tag>
-                <StatusTag :status="node.instance.status" />
-                <div class="node-actions">
-                  <el-tooltip :content="deniedText" :disabled="canManageApps" placement="top">
-                    <span><el-button size="small" :disabled="!canManageApps" @click="checkInstance(node.instance.id)">{{ t('common.check') }}</el-button></span>
-                  </el-tooltip>
-                  <el-tooltip :content="deniedText" :disabled="canManageDatabase" placement="top">
-                    <span><el-button size="small" type="primary" plain :disabled="!canManageDatabase" @click="backupInstance(node.instance.id)">{{ t('database.backupNow') }}</el-button></span>
-                  </el-tooltip>
+                <div class="node-tags">
+                  <el-tag size="small" :type="roleTagType(node.role)" effect="plain">{{ node.roleLabel }}</el-tag>
+                  <el-tag size="small" :type="nodeHealthType(node)">{{ nodeHealthLabel(node) }}</el-tag>
+                </div>
+              </div>
+            </div>
+            <div v-if="group.routers.length" class="router-list">
+              <div class="section-label">{{ t('database.mysqlRouter') }}</div>
+              <div v-for="node in group.routers" :key="node.instance.id" class="node-row router-row">
+                <div class="node-main">
+                  <strong>{{ node.serverLabel }}</strong>
+                  <span>{{ node.endpoint || '-' }}</span>
+                </div>
+                <div class="node-tags">
+                  <el-tag size="small" :type="roleTagType(node.role)" effect="plain">{{ node.roleLabel }}</el-tag>
+                  <el-tag size="small" :type="nodeHealthType(node)">{{ nodeHealthLabel(node) }}</el-tag>
                 </div>
               </div>
             </div>
           </article>
         </div>
         <div v-else class="empty-state"><div><strong>{{ t('database.noInstancesTitle') }}</strong><span>{{ t('database.noInstancesDesc') }}</span></div></div>
-      </template>
-
-      <template v-else-if="tab === 'backups'">
-        <div class="muted-strip">{{ t('database.backupHint') }}</div>
-        <RunRecordTable :records="backupTasks" :type-width="180" />
       </template>
 
       <template v-else-if="tab === 'runs'">
@@ -96,7 +104,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { useRouter } from 'vue-router'
 import { apiGet, apiPost, asArray } from '../api/client'
@@ -116,6 +124,13 @@ type AppInstance = {
   topology: string
   metadata: string
   createdAt: string
+}
+
+type TaskRecord = {
+  id: string
+  type: string
+  target: string
+  status: string
 }
 
 type InstanceMetadata = Record<string, any>
@@ -140,6 +155,7 @@ type DatabaseGroup = {
   createdAt: string
   metadata: InstanceMetadata
   nodes: DatabaseNode[]
+  routers: DatabaseNode[]
 }
 
 const { t } = useI18n()
@@ -147,32 +163,126 @@ const { can, deniedText } = usePermissions()
 const router = useRouter()
 const instances = ref<AppInstance[]>([])
 const servers = ref<any[]>([])
-const tasks = ref<any[]>([])
+const tasks = ref<TaskRecord[]>([])
 const tab = ref('instances')
 const search = ref('')
+const monitoringEnabled = ref(true)
+const monitoringRunning = ref(false)
+const lastMonitorAt = ref('')
+let monitorTimer: ReturnType<typeof setInterval> | undefined
+const monitorIntervalMs = 30000
 const mysqlGroupCount = computed(() => instanceGroups.value.filter((item) => item.app === 'mysql').length)
 const redisGroupCount = computed(() => instanceGroups.value.filter((item) => item.app === 'redis').length)
-const canManageDatabase = computed(() => can(permissions.databaseManage))
+const databaseNodeCount = computed(() => instances.value.filter((item) => item.app !== 'mysql-router').length)
+const routerInstanceCount = computed(() => instances.value.filter((item) => item.app === 'mysql-router').length)
 const canManageApps = computed(() => can(permissions.appsManage))
+const monitoringStatusLabel = computed(() => {
+  if (!canManageApps.value) {
+    return t('database.monitorPermissionRequired')
+  }
+  if (monitoringRunning.value) {
+    return t('database.monitoring')
+  }
+  return monitoringEnabled.value ? t('database.realtimeMonitorOn') : t('database.realtimeMonitorOff')
+})
 const instanceGroups = computed(() => groupDatabaseInstances(instances.value))
 const filteredGroups = computed(() => {
   const q = search.value.trim().toLowerCase()
   if (!q) return instanceGroups.value
   return instanceGroups.value.filter((group) => groupSearchText(group).includes(q))
 })
-const backupTasks = computed(() => tasks.value.filter((item) => item.type === 'database.backup'))
-const runTasks = computed(() => tasks.value.filter((item) => item.type?.startsWith('apps.mysql.') || item.type?.startsWith('apps.redis.') || item.type?.startsWith('database.')))
+const runTasks = computed(() => tasks.value.filter((item) => item.type?.startsWith('apps.mysql.') || item.type?.startsWith('apps.mysql-router.') || item.type?.startsWith('apps.redis.')))
 const settingsItems = computed(() => [
   { label: 'MySQL', value: t('database.mysqlSettings') },
   { label: 'Redis', value: t('database.redisSettings') },
-  { label: t('common.provider'), value: t('common.real') },
-  { label: t('database.backups'), value: t('database.backupHint') }
+  { label: t('common.provider'), value: t('common.real') }
 ])
 
 async function load() {
   instances.value = asArray(await apiGet<AppInstance[] | null>('/database/instances').catch(() => []))
   servers.value = asArray(await apiGet<any[] | null>('/servers').catch(() => []))
-  tasks.value = asArray(await apiGet<any[] | null>('/tasks').catch(() => []))
+  tasks.value = asArray<TaskRecord>(await apiGet<TaskRecord[] | null>('/tasks').catch(() => []))
+}
+
+function startMonitor() {
+  stopMonitor()
+  monitorTimer = setInterval(() => {
+    if (monitoringEnabled.value && tab.value === 'instances') {
+      void runRealtimeCheck(false)
+    }
+  }, monitorIntervalMs)
+}
+
+function stopMonitor() {
+  if (monitorTimer) {
+    clearInterval(monitorTimer)
+    monitorTimer = undefined
+  }
+}
+
+function handleMonitoringToggle() {
+  if (monitoringEnabled.value) {
+    void runRealtimeCheck(false)
+  }
+}
+
+async function runRealtimeCheck(manual: boolean) {
+  if (!canManageApps.value) {
+    if (manual) {
+      ElMessage.warning(deniedText.value)
+    }
+    return
+  }
+  if (monitoringRunning.value) {
+    return
+  }
+  monitoringRunning.value = true
+  try {
+    await load()
+    const taskIds: string[] = []
+    for (const instance of instances.value.filter(isMonitorableInstance)) {
+      try {
+        const result = await apiPost<{ taskId: string }>(`/apps/instances/${instance.id}/check`)
+        if (result.taskId) {
+          taskIds.push(result.taskId)
+        }
+      } catch (err) {
+        if (manual) {
+          ElMessage.warning((err as Error).message)
+        }
+      }
+    }
+    if (taskIds.length) {
+      await waitForTasks(taskIds)
+    }
+    lastMonitorAt.value = new Date().toLocaleTimeString()
+    await load()
+  } finally {
+    monitoringRunning.value = false
+  }
+}
+
+function isMonitorableInstance(instance: AppInstance) {
+  return ['mysql', 'redis', 'mysql-router'].includes(instance.app)
+}
+
+async function waitForTasks(taskIds: string[]) {
+  const pending = new Set(taskIds)
+  const deadline = Date.now() + 90000
+  while (pending.size && Date.now() < deadline) {
+    await delay(2000)
+    const latest = asArray<TaskRecord>(await apiGet<TaskRecord[] | null>('/tasks').catch(() => []))
+    tasks.value = latest
+    for (const task of latest) {
+      if (pending.has(task.id) && !['pending', 'running'].includes(task.status)) {
+        pending.delete(task.id)
+      }
+    }
+  }
+}
+
+function delay(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
 function metadataOf(item: AppInstance) {
@@ -185,8 +295,13 @@ function metadataOf(item: AppInstance) {
 
 function groupDatabaseInstances(items: AppInstance[]) {
   const groups = new Map<string, DatabaseGroup>()
+  const routers: Array<{ item: AppInstance; metadata: InstanceMetadata; node: DatabaseNode }> = []
   for (const item of items) {
     const metadata = metadataOf(item)
+    if (item.app === 'mysql-router') {
+      routers.push({ item, metadata, node: databaseNode(item, metadata) })
+      continue
+    }
     const topology = normalizedTopology(item, metadata)
     const key = groupKey(item, metadata, topology)
     const node = databaseNode(item, metadata)
@@ -202,7 +317,8 @@ function groupDatabaseInstances(items: AppInstance[]) {
         status: item.status,
         createdAt: item.createdAt,
         metadata,
-        nodes: []
+        nodes: [],
+        routers: []
       }
       groups.set(key, group)
     }
@@ -211,13 +327,44 @@ function groupDatabaseInstances(items: AppInstance[]) {
       group.createdAt = item.createdAt
     }
   }
+  for (const routerNode of routers) {
+    const key = routerClusterGroupKey(routerNode.item, routerNode.metadata)
+    let group = groups.get(key)
+    if (!group) {
+      group = {
+        id: key,
+        app: 'mysql',
+        topology: 'innodb-cluster',
+        version: routerNode.item.version,
+        title: routerClusterTitle(routerNode.item, routerNode.metadata),
+        endpoint: '',
+        status: routerNode.item.status,
+        createdAt: routerNode.item.createdAt,
+        metadata: routerNode.metadata,
+        nodes: [],
+        routers: []
+      }
+      groups.set(key, group)
+    }
+    group.routers.push(routerNode.node)
+    if (new Date(routerNode.item.createdAt).getTime() > new Date(group.createdAt).getTime()) {
+      group.createdAt = routerNode.item.createdAt
+    }
+  }
   return Array.from(groups.values())
-    .map((group) => ({
-      ...group,
-      nodes: group.nodes.sort((a, b) => roleRank(a.role) - roleRank(b.role) || a.serverLabel.localeCompare(b.serverLabel)),
-      endpoint: groupEndpoint(group),
-      status: groupStatus(group.nodes)
-    }))
+    .map((group) => {
+      const nodes = normalizeGroupNodeRoles(group)
+      const normalizedGroup = {
+        ...group,
+        nodes: nodes.sort((a, b) => roleRank(a.role) - roleRank(b.role) || a.serverLabel.localeCompare(b.serverLabel)),
+        routers: group.routers.sort((a, b) => a.serverLabel.localeCompare(b.serverLabel))
+      }
+      return {
+        ...normalizedGroup,
+        endpoint: groupEndpoint(normalizedGroup),
+        status: groupStatus([...normalizedGroup.nodes, ...normalizedGroup.routers])
+      }
+    })
     .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
 }
 
@@ -231,6 +378,11 @@ function groupKey(item: AppInstance, metadata: InstanceMetadata, topology: strin
   }
   const stable = stringValue(metadata.clusterId) || stringValue(metadata.clusterName) || stringValue(metadata.masterName)
   return stable ? `${item.app}:${topology}:${stable}` : `${item.app}:${topology}:${item.id}`
+}
+
+function routerClusterGroupKey(item: AppInstance, metadata: InstanceMetadata) {
+  const stable = stringValue(metadata.clusterId) || stringValue(metadata.clusterName)
+  return stable ? `mysql:innodb-cluster:${stable}` : `mysql:innodb-cluster:${item.id}`
 }
 
 function isClusterTopology(topology: string) {
@@ -250,6 +402,10 @@ function groupTitle(item: AppInstance, metadata: InstanceMetadata, topology: str
   return `${item.app}-${item.id.slice(-6)}`
 }
 
+function routerClusterTitle(item: AppInstance, metadata: InstanceMetadata) {
+  return `mysql-${stringValue(metadata.clusterName) || stringValue(metadata.clusterId) || item.id.slice(-6)}`
+}
+
 function databaseNode(item: AppInstance, metadata: InstanceMetadata): DatabaseNode {
   const role = nodeRole(item, metadata)
   return {
@@ -263,16 +419,18 @@ function databaseNode(item: AppInstance, metadata: InstanceMetadata): DatabaseNo
 }
 
 function nodeRole(item: AppInstance, metadata: InstanceMetadata) {
-  const role = stringValue(metadata.role) || stringValue(metadata.clusterRole)
-  if (role) {
-    return role
+  if (item.app === 'mysql-router') {
+    return 'router'
   }
   const topology = normalizedTopology(item, metadata)
   if (topology === 'standalone') {
     return 'standalone'
   }
+  if (item.app === 'redis' && topology === 'sentinel' && (metadataBool(metadata, 'sentinel') || checkedOrStaticSentinelRole(metadata))) {
+    return 'sentinel'
+  }
   if (item.app === 'mysql' && topology === 'innodb-cluster') {
-    const currentPrimary = stringValue(metadata.currentPrimaryEndpoint) || stringValue(metadata.primaryEndpoint)
+    const currentPrimary = stringValue(metadata.currentPrimaryEndpoint)
     const endpoint = stringValue(metadata.endpoint)
     if (currentPrimary && normalizeEndpoint(endpoint) === normalizeEndpoint(currentPrimary)) {
       return 'primary'
@@ -281,7 +439,74 @@ function nodeRole(item: AppInstance, metadata: InstanceMetadata) {
       return 'secondary'
     }
   }
+  if (item.app === 'redis' && topology === 'sentinel') {
+    const currentMaster = stringValue(metadata.currentMasterEndpoint)
+    const endpoint = stringValue(metadata.endpoint)
+    if (currentMaster && normalizeEndpoint(endpoint) === normalizeEndpoint(currentMaster)) {
+      return 'master'
+    }
+    if (currentMaster && endpoint) {
+      return 'replica'
+    }
+  }
+  const checkedRole = checkedMetadataRole(metadata)
+  if (checkedRole) {
+    return checkedRole
+  }
   return 'node'
+}
+
+function normalizeGroupNodeRoles(group: DatabaseGroup) {
+  if (group.app === 'mysql' && group.topology === 'innodb-cluster') {
+    const primaryEndpoint = groupCurrentPrimaryEndpoint(group)
+    if (!primaryEndpoint) {
+      return group.nodes
+    }
+    return group.nodes.map((node) => {
+      const role = normalizeEndpoint(node.endpoint) === normalizeEndpoint(primaryEndpoint) ? 'primary' : 'secondary'
+      return nodeWithRole(node, role)
+    })
+  }
+  if (group.app === 'redis' && group.topology === 'sentinel') {
+    const masterEndpoint = redisMasterEndpoint(group)
+    return group.nodes.map((node) => {
+      if (node.role === 'sentinel') {
+        return node
+      }
+      if (masterEndpoint && normalizeEndpoint(node.endpoint) === normalizeEndpoint(masterEndpoint)) {
+        return nodeWithRole(node, 'master')
+      }
+      if (masterEndpoint && node.endpoint && node.endpoint !== '-') {
+        return nodeWithRole(node, 'replica')
+      }
+      return ['master', 'replica'].includes(node.role) ? nodeWithRole(node, 'node') : node
+    })
+  }
+  return group.nodes
+}
+
+function nodeWithRole(node: DatabaseNode, role: string): DatabaseNode {
+  if (node.role === role) {
+    return node
+  }
+  return {
+    ...node,
+    role,
+    roleLabel: roleLabel(role)
+  }
+}
+
+function checkedMetadataRole(metadata: InstanceMetadata) {
+  const lastCheck = metadata.lastCheck || {}
+  const status = stringValue(lastCheck.status)
+  if (!['ok', 'success', 'running', 'available'].includes(status)) {
+    return ''
+  }
+  return stringValue(metadata.role) || stringValue(metadata.clusterRole)
+}
+
+function checkedOrStaticSentinelRole(metadata: InstanceMetadata) {
+  return stringValue(metadata.role) === 'sentinel' || stringValue(metadata.clusterRole) === 'sentinel'
 }
 
 function roleLabel(role: string) {
@@ -296,11 +521,68 @@ function roleLabel(role: string) {
       return t('database.role.replica')
     case 'sentinel':
       return t('database.role.sentinel')
+    case 'router':
+      return t('database.role.router')
     case 'standalone':
       return t('database.role.standalone')
     default:
       return t('database.role.node')
   }
+}
+
+function roleTagType(role: string) {
+  switch (role) {
+    case 'primary':
+    case 'master':
+      return 'primary'
+    case 'secondary':
+    case 'replica':
+      return 'info'
+    case 'sentinel':
+    case 'router':
+      return 'warning'
+    case 'standalone':
+      return 'success'
+    default:
+      return 'info'
+  }
+}
+
+function nodeHealthLabel(node: DatabaseNode) {
+  switch (nodeHealth(node)) {
+    case 'online':
+      return t('database.health.online')
+    case 'offline':
+      return t('database.health.offline')
+    default:
+      return t('database.health.unknown')
+  }
+}
+
+function nodeHealthType(node: DatabaseNode) {
+  switch (nodeHealth(node)) {
+    case 'online':
+      return 'success'
+    case 'offline':
+      return 'danger'
+    default:
+      return 'info'
+  }
+}
+
+function nodeHealth(node: DatabaseNode) {
+  if (['failed', 'error', 'missing', 'stopped'].includes(node.instance.status)) {
+    return 'offline'
+  }
+  const lastCheckStatus = stringValue(node.metadata.lastCheck?.status)
+  const status = lastCheckStatus || node.instance.status
+  if (['ok', 'success', 'running', 'available'].includes(status)) {
+    return 'online'
+  }
+  if (['failed', 'error', 'missing', 'stopped'].includes(status)) {
+    return 'offline'
+  }
+  return 'unknown'
 }
 
 function roleRank(role: string) {
@@ -315,8 +597,10 @@ function roleRank(role: string) {
       return 2
     case 'sentinel':
       return 3
-    default:
+    case 'router':
       return 4
+    default:
+      return 5
   }
 }
 
@@ -333,15 +617,18 @@ function nodeEndpoint(item: AppInstance, metadata: InstanceMetadata) {
   if (item.app === 'redis' && topology === 'sentinel' && nodeRole(item, metadata) === 'sentinel') {
     return `${host}:${numberValue(metadata.sentinelPort) || 26379}`
   }
+  if (item.app === 'mysql-router') {
+    return `${host}:${numberValue(metadata.basePort) || 6446}`
+  }
   return `${host}:${numberValue(metadata.port) || defaultPort(item.app)}`
 }
 
 function groupEndpoint(group: DatabaseGroup) {
   if (group.app === 'redis' && group.topology === 'sentinel') {
-    const masterHost = groupMetadataValue(group, 'masterHost')
+    const currentMaster = redisMasterEndpoint(group)
     const masterName = groupMetadataValue(group, 'masterName')
-    if (masterHost) {
-      return `${masterName || 'master'} -> ${masterHost}:${groupPort(group) || 6379}`
+    if (currentMaster) {
+      return `${masterName || 'master'} -> ${currentMaster}`
     }
     return masterName || group.title
   }
@@ -355,9 +642,13 @@ function groupEndpoint(group: DatabaseGroup) {
   return preferred?.endpoint || '-'
 }
 
+function redisMasterEndpoint(group: DatabaseGroup) {
+  return groupMetadataValue(group, 'currentMasterEndpoint')
+}
+
 function groupEndpointLabel(group: DatabaseGroup) {
   if (group.app === 'redis' && group.topology === 'sentinel') {
-    return groupMetadataValue(group, 'masterHost') ? t('database.currentMaster') : t('database.masterGroup')
+    return redisMasterEndpoint(group) ? t('database.currentMaster') : t('database.masterGroup')
   }
   if (group.app === 'mysql' && group.topology === 'innodb-cluster') {
     return groupCurrentPrimaryEndpoint(group) ? t('database.currentPrimary') : t('database.accessEndpoint')
@@ -366,7 +657,7 @@ function groupEndpointLabel(group: DatabaseGroup) {
 }
 
 function groupCurrentPrimaryEndpoint(group: DatabaseGroup) {
-  return groupMetadataValue(group, 'currentPrimaryEndpoint') || groupMetadataValue(group, 'primaryEndpoint')
+  return groupMetadataValue(group, 'currentPrimaryEndpoint')
 }
 
 function groupMetadataValue(group: DatabaseGroup, key: string) {
@@ -380,39 +671,46 @@ function groupMetadataValue(group: DatabaseGroup, key: string) {
       return value
     }
   }
-  return ''
-}
-
-function groupPort(group: DatabaseGroup) {
-  const direct = numberValue(group.metadata.port)
-  if (direct) {
-    return direct
-  }
-  for (const node of group.nodes) {
-    const value = numberValue(node.metadata.port)
+  for (const node of group.routers) {
+    const value = stringValue(node.metadata[key])
     if (value) {
       return value
     }
   }
-  return 0
+  return ''
 }
 
 function groupStatus(nodes: DatabaseNode[]) {
-  const statuses = nodes.map((node) => node.instance.status)
-  if (statuses.some((status) => ['failed', 'error', 'missing'].includes(status))) {
-    return statuses.find((status) => ['failed', 'error', 'missing'].includes(status)) || 'error'
+  const healths = nodes.map((node) => nodeHealth(node))
+  if (!healths.length) {
+    return 'unknown'
   }
-  if (statuses.every((status) => status === 'installed')) {
-    return 'installed'
-  }
-  if (statuses.every((status) => status === 'running')) {
+  if (healths.every((status) => status === 'online')) {
     return 'running'
   }
-  return statuses[0] || 'unknown'
+  if (healths.every((status) => status === 'offline')) {
+    return 'failed'
+  }
+  if (healths.every((status) => status === 'unknown')) {
+    return 'unknown'
+  }
+  return 'degraded'
 }
 
 function groupSubtitle(group: DatabaseGroup) {
-  return `${group.topology || '-'} / ${t('database.nodes')} ${group.nodes.length}`
+  const parts = [`${group.topology || '-'}`, `${t('database.nodes')} ${group.nodes.length}`]
+  if (group.routers.length) {
+    parts.push(`${t('database.mysqlRouter')} ${group.routers.length}`)
+  }
+  return parts.join(' / ')
+}
+
+function routerEndpointSummary(group: DatabaseGroup) {
+  const endpoints = Array.from(new Set(group.routers.map((node) => node.endpoint).filter((endpoint) => endpoint && endpoint !== '-')))
+  if (!endpoints.length) {
+    return '-'
+  }
+  return endpoints.join(', ')
 }
 
 function groupSearchText(group: DatabaseGroup) {
@@ -425,12 +723,20 @@ function groupSearchText(group: DatabaseGroup) {
     groupCurrentPrimaryEndpoint(group),
     stringValue(group.metadata.clusterName),
     stringValue(group.metadata.masterName),
-    ...group.nodes.flatMap((node) => [node.serverLabel, node.endpoint, node.roleLabel])
+    routerEndpointSummary(group),
+    ...group.nodes.flatMap((node) => [node.serverLabel, node.endpoint, node.roleLabel]),
+    ...group.routers.flatMap((node) => [node.serverLabel, node.endpoint, node.roleLabel])
   ].join(' ').toLowerCase()
 }
 
 function defaultPort(app: string) {
-  return app === 'redis' ? 6379 : 3306
+  if (app === 'redis') {
+    return 6379
+  }
+  if (app === 'mysql-router') {
+    return 6446
+  }
+  return 3306
 }
 
 function serverName(id: string) {
@@ -453,36 +759,29 @@ function numberValue(value: unknown) {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : 0
 }
 
+function metadataBool(metadata: InstanceMetadata, key: string) {
+  const value = metadata[key]
+  if (typeof value === 'boolean') {
+    return value
+  }
+  return ['true', '1', 'yes'].includes(String(value ?? '').trim().toLowerCase())
+}
+
 function normalizeEndpoint(value: string) {
   return value.trim().toLowerCase().replace(/^tcp:\/\//, '').replace(/^mysql:\/\//, '')
-}
-
-async function backupInstance(id: string) {
-  if (!canManageDatabase.value) {
-    ElMessage.warning(deniedText.value)
-    return
-  }
-  const result = await apiPost<{ taskId: string }>(`/database/instances/${id}/backup`)
-  ElMessage.success(t('database.backupAccepted'))
-  await load()
-  void router.push({ path: '/tasks', query: { taskId: result.taskId } })
-}
-
-async function checkInstance(id: string) {
-  if (!canManageApps.value) {
-    ElMessage.warning(deniedText.value)
-    return
-  }
-  const result = await apiPost<{ taskId: string }>(`/apps/instances/${id}/check`)
-  ElMessage.success(t('apps.checkServiceAccepted'))
-  void router.push({ path: '/tasks', query: { taskId: result.taskId } })
 }
 
 function openTaskDetails(row: { id: string }) {
   void router.push({ path: '/tasks', query: { taskId: row.id } })
 }
 
-onMounted(load)
+onMounted(async () => {
+  await load()
+  startMonitor()
+  void runRealtimeCheck(false)
+})
+
+onUnmounted(stopMonitor)
 </script>
 
 <style scoped>
@@ -496,6 +795,14 @@ onMounted(load)
   display: flex;
   flex-direction: column;
   min-height: 0;
+}
+
+.monitor-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+  min-width: 0;
 }
 
 .db-card-grid {
@@ -577,6 +884,10 @@ onMounted(load)
   min-width: 0;
 }
 
+.db-grid .db-grid-wide {
+  grid-column: 1 / -1;
+}
+
 .db-grid span {
   display: block;
   color: var(--aifar-text-tertiary);
@@ -590,21 +901,47 @@ onMounted(load)
   white-space: nowrap;
 }
 
+.db-grid-wide strong {
+  overflow: visible;
+  text-overflow: clip;
+  white-space: normal;
+  word-break: break-word;
+  line-height: 1.35;
+}
+
 .node-list {
   display: grid;
   gap: 8px;
   margin-top: 12px;
 }
 
+.router-list {
+  display: grid;
+  gap: 8px;
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px dashed var(--aifar-border-soft);
+}
+
+.section-label {
+  color: var(--aifar-text-secondary);
+  font-size: 12px;
+  font-weight: 700;
+}
+
 .node-row {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto auto auto;
+  grid-template-columns: minmax(0, 1fr) auto;
   align-items: center;
   gap: 8px;
   border: 1px solid var(--aifar-border-soft);
   border-radius: var(--aifar-radius);
   padding: 8px;
   background: #fff;
+}
+
+.router-row {
+  background: #f8fbff;
 }
 
 .node-main {
@@ -624,12 +961,12 @@ onMounted(load)
   font-size: 12px;
 }
 
-.node-actions {
+.node-tags {
   display: flex;
   align-items: center;
   justify-content: flex-end;
-  gap: 8px;
-  min-width: 0;
+  gap: 6px;
+  white-space: nowrap;
 }
 
 .settings-grid {
@@ -637,14 +974,18 @@ onMounted(load)
 }
 
 @media (max-width: 720px) {
+  .monitor-actions {
+    flex-wrap: wrap;
+    justify-content: flex-start;
+  }
+
   .node-row {
     grid-template-columns: minmax(0, 1fr) auto;
   }
 
-  .node-actions {
-    grid-column: 1 / -1;
+  .node-tags {
     justify-content: flex-start;
-    flex-wrap: wrap;
   }
+
 }
 </style>

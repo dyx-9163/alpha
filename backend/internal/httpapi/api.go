@@ -2,7 +2,9 @@ package httpapi
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime"
@@ -86,6 +88,7 @@ func New(cfg config.Config, s *store.Store, tasks *worker.Manager) *API {
 			r.Put("/servers/{id}", api.requirePermission(rbac.ServersManage, api.saveServer))
 			r.Delete("/servers/{id}", api.requirePermission(rbac.ServersManage, api.deleteServer))
 			r.Post("/servers/{id}/probe", api.requirePermission(rbac.ServersManage, api.probeServer))
+			r.Get("/servers/{id}/disks", api.requirePermission(rbac.AppsManage, api.serverDisks))
 			r.Get("/servers/{id}/telemetry", api.serverTelemetry)
 			r.Get("/servers/{id}/terminal/ws", api.requirePermission(rbac.TerminalConnect, api.serverTerminal))
 			r.Get("/tasks", api.listTasks)
@@ -841,6 +844,25 @@ func (a *API) probeServer(w http.ResponseWriter, r *http.Request) {
 		a.audit(r, "servers.probe", id, "running", task.ID)
 	}
 	respondTask(w, task, err)
+}
+
+func (a *API) serverDisks(w http.ResponseWriter, r *http.Request) {
+	lang := languageFromRequest(r)
+	id := chi.URLParam(r, "id")
+	inventory, err := a.servers.ListDiskDevices(r.Context(), id)
+	if err == nil {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"serverId":  inventory.ServerID,
+			"devices":   inventory.Devices,
+			"sampledAt": time.Now(),
+		})
+		return
+	}
+	if errors.Is(err, sql.ErrNoRows) {
+		writeError(w, http.StatusNotFound, "SERVER_NOT_FOUND", i18n.Text(lang, "api.serverNotFound"), map[string]any{"serverId": id})
+		return
+	}
+	writeError(w, http.StatusBadGateway, "SERVER_DISK_DETECT_FAILED", i18n.Text(lang, "api.serverDiskDetectFailed"), map[string]any{"serverId": id, "error": err.Error()})
 }
 
 func (a *API) serverTelemetry(w http.ResponseWriter, r *http.Request) {
@@ -1608,7 +1630,7 @@ func (a *API) databaseInstances(w http.ResponseWriter, r *http.Request) {
 	}
 	var out []store.AppInstance
 	for _, instance := range instances {
-		if instance.App == "mysql" || instance.App == "redis" {
+		if instance.App == "mysql" || instance.App == "redis" || instance.App == "mysql-router" {
 			out = append(out, instance)
 		}
 	}

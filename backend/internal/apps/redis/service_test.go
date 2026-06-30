@@ -2,6 +2,7 @@ package redis
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -33,8 +34,26 @@ func (f *fakeStore) SaveAppInstance(v store.AppInstance) (store.AppInstance, err
 	}
 	v.CreatedAt = time.Now()
 	v.UpdatedAt = v.CreatedAt
+	for idx := range f.instances {
+		if f.instances[idx].ID == v.ID {
+			if f.instances[idx].CreatedAt.IsZero() {
+				f.instances[idx].CreatedAt = v.CreatedAt
+			}
+			v.CreatedAt = f.instances[idx].CreatedAt
+			f.instances[idx] = v
+			return v, nil
+		}
+	}
 	f.instances = append(f.instances, v)
 	return v, nil
+}
+
+func (f *fakeStore) ListAppInstances() ([]store.AppInstance, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]store.AppInstance, len(f.instances))
+	copy(out, f.instances)
+	return out, nil
 }
 
 func (f *fakeStore) DeleteAppInstance(id string) error {
@@ -53,6 +72,7 @@ func (f *fakeStore) DeleteAppInstance(id string) error {
 type fakeRemote struct {
 	mu             sync.Mutex
 	commands       []string
+	responses      map[string]adapter.CommandResult
 	blockInstall   bool
 	installStarted chan string
 	releaseInstall chan struct{}
@@ -70,6 +90,11 @@ func (f *fakeRemote) Run(ctx context.Context, server store.Server, command strin
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.commands = append(f.commands, command)
+	for needle, result := range f.responses {
+		if strings.Contains(command, needle) {
+			return result, nil
+		}
+	}
 	return adapter.CommandResult{Stdout: "ok"}, nil
 }
 
@@ -87,6 +112,15 @@ type fakeLogger struct{}
 
 func (fakeLogger) Info(format string, args ...any)  {}
 func (fakeLogger) Error(format string, args ...any) {}
+
+func metadataForTest(t *testing.T, instance store.AppInstance) map[string]any {
+	t.Helper()
+	var metadata map[string]any
+	if err := json.Unmarshal([]byte(instance.Metadata), &metadata); err != nil {
+		t.Fatal(err)
+	}
+	return metadata
+}
 
 func TestServiceInstallsStandaloneRedisAndRecordsInstalledInstance(t *testing.T) {
 	root := t.TempDir()
@@ -192,6 +226,81 @@ func TestRedisSentinelMasterNameDefaultsAndValidates(t *testing.T) {
 	}
 	if _, err := redisSentinelMasterName(map[string]any{"masterName": "bad name"}, "invalid"); err == nil {
 		t.Fatal("expected invalid sentinel master name to fail")
+	}
+}
+
+func TestServiceChecksRedisSentinelAndUpdatesCurrentMasterRoles(t *testing.T) {
+	root := t.TempDir()
+	archive := filepath.Join(root, "redis-7.2.14.tar.gz")
+	if err := os.WriteFile(archive, []byte("redis"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s := &fakeStore{servers: map[string]store.Server{
+		"srv-1": {ID: "srv-1", Name: "redis-1", Host: "10.0.0.1", DeployDir: "/aifar/apps"},
+		"srv-2": {ID: "srv-2", Name: "redis-2", Host: "10.0.0.2", DeployDir: "/aifar/apps"},
+		"srv-3": {ID: "srv-3", Name: "redis-3", Host: "10.0.0.3", DeployDir: "/aifar/apps"},
+	}}
+	remote := &fakeRemote{}
+	service := NewService(s, remote)
+	err := service.Install(context.Background(), InstallRequest{
+		Version:  "7.2.14",
+		Topology: "sentinel",
+		Language: "en",
+		Parameters: map[string]any{
+			"port":              6379,
+			"sentinelPort":      26379,
+			"masterName":        "orders-primary",
+			"sentinelMasterId":  "srv-2",
+			"replicaServerIds":  []string{"srv-1"},
+			"sentinelServerIds": []string{"srv-2", "srv-1", "srv-3"},
+			"password":          "Oversea.123",
+		},
+	}, []store.Resource{{App: "redis", Part: "backend", Version: "7.2.14", Path: archive}}, fakeLogger{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	remote.responses = map[string]adapter.CommandResult{
+		"SENTINEL get-master-addr-by-name": {Stdout: "10.0.0.1\n6379\n"},
+	}
+	instancesByServer := map[string]store.AppInstance{}
+	for _, instance := range s.instances {
+		instancesByServer[instance.ServerID] = instance
+	}
+	if _, err := service.Check(context.Background(), CheckRequest{
+		Instance:        instancesByServer["srv-2"],
+		Server:          s.servers["srv-2"],
+		Language:        "en",
+		DefaultPassword: "Oversea.123",
+	}, fakeLogger{}, nil); err != nil {
+		t.Fatal(err)
+	}
+	instancesByServer = map[string]store.AppInstance{}
+	for _, instance := range s.instances {
+		instancesByServer[instance.ServerID] = instance
+	}
+	if got := metadataForTest(t, instancesByServer["srv-1"])["role"]; got != "master" {
+		t.Fatalf("expected srv-1 to become master, got %v", got)
+	}
+	if got := metadataForTest(t, instancesByServer["srv-2"])["role"]; got != "replica" {
+		t.Fatalf("expected srv-2 to become replica, got %v", got)
+	}
+	if got := metadataForTest(t, instancesByServer["srv-3"])["role"]; got != "sentinel" {
+		t.Fatalf("expected srv-3 to remain sentinel, got %v", got)
+	}
+	if instancesByServer["srv-2"].Status != "running" {
+		t.Fatalf("expected checked instance to be running, got %s", instancesByServer["srv-2"].Status)
+	}
+	if instancesByServer["srv-1"].Status != "installed" {
+		t.Fatalf("expected unchecked data instance status to stay installed, got %s", instancesByServer["srv-1"].Status)
+	}
+	if instancesByServer["srv-3"].Status != "installed" {
+		t.Fatalf("expected unchecked sentinel instance status to stay installed, got %s", instancesByServer["srv-3"].Status)
+	}
+	if got := metadataForTest(t, instancesByServer["srv-1"])["currentMasterEndpoint"]; got != "10.0.0.1:6379" {
+		t.Fatalf("expected current master endpoint to be recorded, got %v", got)
+	}
+	if !strings.Contains(remote.joinedCommands(), "SENTINEL get-master-addr-by-name") {
+		t.Fatal("expected check to query Redis Sentinel current master")
 	}
 }
 

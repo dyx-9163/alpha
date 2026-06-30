@@ -133,7 +133,7 @@ func (m Module) ValidateInstall(ctx context.Context, req registry.InstallRequest
 	if err := minioinstaller.VerifyBundle(bundle); err != nil {
 		return err
 	}
-	if err := validateMinioDataRoot(minioDataRoot(req.Parameters)); err != nil {
+	if err := validateMinioStorage(req.Parameters, targets...); err != nil {
 		return err
 	}
 	return minioOptions(req.Parameters, req.DefaultPassword).Validate()
