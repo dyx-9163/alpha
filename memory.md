@@ -291,3 +291,5 @@
 - 结论：原因是主内容区为固定高度 flex 列布局，非末尾面板默认允许收缩，服务器指标卡被压缩后裁掉了最后一行；已禁止页面直接子块默认收缩，超出时交给页面滚动。验证通过：pnpm web:build、git diff --check。
 - 问题：用户关闭所有服务器后，数据库页 Redis Sentinel 监测仍显示部分节点在线。
 - 结论：修正数据库页健康判断：服务器状态已失败时对应数据库/Redis 节点强制离线，监测进行中不再展示旧的在线状态，Redis 运行时发现的虚拟节点默认未知；Redis 后端检测失败时清理旧的 Sentinel 拓扑缓存，避免旧 replica/sentinel 端点继续被当成在线。验证通过：pnpm test、pnpm web:build、git diff --check。
+- 问题：用户要求 MySQL “启动集群”只在集群不生效但每个 MySQL 基础服务都已启动时可点，并修正 Redis 卡片错误显示 MySQL 服务不可用。
+- 结论：数据库页启动集群按钮改为要求 InnoDB Cluster 状态不可用/降级/失败且全部 MySQL runtime 在线，服务器离线会强制禁用；Redis 不可用提示改为“Redis 服务不可用”。验证通过：pnpm web:build、git diff --check。

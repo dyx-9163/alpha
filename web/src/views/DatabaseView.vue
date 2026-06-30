@@ -101,7 +101,7 @@
               </div>
               <div v-if="group.routers.length" class="db-grid-wide"><span>{{ t('database.routerEndpoint') }}</span><strong>{{ routerEndpointSummary(group) }}</strong></div>
             </div>
-            <div v-if="isUnavailable(group.nodeStatus)" class="service-notice danger">{{ t('database.mysqlServiceUnavailable') }}</div>
+            <div v-if="isUnavailable(group.nodeStatus)" class="service-notice danger">{{ databaseServiceUnavailableText(group) }}</div>
             <div v-if="isUnavailable(group.routerStatus)" class="service-notice danger">{{ t('database.routerServiceUnavailable') }}</div>
             <div v-if="group.nodes.length" class="node-list">
               <div v-for="node in group.nodes" :key="node.instance.id" class="node-row">
@@ -1100,6 +1100,10 @@ function isUnavailable(status: string) {
   return status === 'unavailable'
 }
 
+function databaseServiceUnavailableText(group: DatabaseGroup) {
+  return group.app === 'redis' ? t('database.redisServiceUnavailable') : t('database.mysqlServiceUnavailable')
+}
+
 function groupSubtitle(group: DatabaseGroup) {
   const parts = [`${group.topology || '-'}`, `${t('database.nodes')} ${group.nodes.length}`]
   if (group.sentinels.length) {
@@ -1226,14 +1230,21 @@ function hasMysqlClusterStart(group: DatabaseGroup) {
 }
 
 function isMysqlClusterStartDisabled(group: DatabaseGroup) {
-  return !canManageDatabase.value || !isMysqlClusterCompleteOutage(group) || (!!startingClusterId.value && startingClusterId.value !== group.id)
+  return !canManageDatabase.value || !isMysqlClusterStartable(group) || (!!startingClusterId.value && startingClusterId.value !== group.id)
 }
 
-function isMysqlClusterCompleteOutage(group: DatabaseGroup) {
-  return group.nodes.length >= 3 && group.nodes.every((node) => mysqlRuntimeHealth(node) === 'offline')
+function isMysqlClusterStartable(group: DatabaseGroup) {
+  return group.nodes.length >= 3 && isMysqlClusterIneffective(group) && group.nodes.every((node) => mysqlRuntimeHealth(node) === 'online')
+}
+
+function isMysqlClusterIneffective(group: DatabaseGroup) {
+  return ['unavailable', 'degraded', 'failed', 'error'].includes(group.nodeStatus)
 }
 
 function mysqlRuntimeHealth(node: DatabaseNode) {
+  if (serverStatusOffline(nodeServerStatus(node))) {
+    return 'offline'
+  }
   const runtimeStatus = stringValue(node.metadata.lastCheck?.details?.runtimeStatus || node.metadata.mysqlRuntimeStatus || node.metadata.runtimeStatus)
   if (['ok', 'success', 'running', 'available'].includes(runtimeStatus)) {
     return 'online'
@@ -1304,7 +1315,7 @@ async function startMysqlCluster(group: DatabaseGroup) {
     ElMessage.warning(deniedText.value)
     return
   }
-  if (!isMysqlClusterCompleteOutage(group)) {
+  if (!isMysqlClusterStartable(group)) {
     return
   }
   const instanceIds = group.nodes.map((node) => node.instance.id).filter(Boolean)
