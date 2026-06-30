@@ -248,10 +248,13 @@ onMounted(load)
 }
 
 .dashboard-split {
+  flex: 0 0 auto;
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(420px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 360px), 1fr));
   gap: 12px;
   margin-top: 0;
+  min-width: 0;
+  overflow: visible;
 }
 
 .dashboard-split > .workspace-card {
@@ -261,7 +264,7 @@ onMounted(load)
 }
 
 .dashboard-split :deep(.el-table) {
-  flex: 1 1 auto;
+  flex: 0 0 auto;
 }
 
 @media (max-width: 1200px) {

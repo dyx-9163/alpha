@@ -283,3 +283,5 @@
 - 结论：数据库页 Redis 卡片顶部新增统一“卸载 Redis”按钮，批量提交该 Redis 组内所有真实登记实例；Redis 数据节点和哨兵节点行不再显示卸载按钮，虚拟发现节点也不会参与卸载。验证通过：pnpm web:build、git diff --check。
 - 问题：用户指出实际 Redis Sentinel 拓扑是 3 个哨兵、2 个 Redis 数据服务，页面统计仍不匹配。
 - 结论：Redis Sentinel 检测不再只依赖实例原始 role；会静默探测本机 Redis ROLE 修正被误标为 sentinel 的数据节点，并对 master/replica 主机探测 sentinel 端口，补齐“数据节点 2、哨兵 3”的运行时拓扑。验证通过：pnpm test、git diff --check。
+- 问题：用户要求调整所有页面布局，避免不同分辨率下内容被裁剪或看起来未加载。
+- 结论：全局布局改为主内容区按页面滚动，侧边栏菜单独立滚动，移动端恢复文档流滚动；仪表盘底部状态卡不再被固定高度挤压，宽度按可用空间自适应。验证通过：pnpm web:build、git diff --check。
