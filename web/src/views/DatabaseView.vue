@@ -70,6 +70,11 @@
                     <el-button size="small" type="danger" plain :disabled="!canManageApps" @click="openDeleteGroup(group, 'mysql-cluster')">{{ t('database.uninstallMysqlCluster') }}</el-button>
                   </span>
                 </el-tooltip>
+                <el-tooltip v-if="hasRedisGroupDelete(group)" :content="deniedText" :disabled="canManageApps" placement="top">
+                  <span>
+                    <el-button size="small" type="danger" plain :disabled="!canManageApps" @click="openDeleteGroup(group, 'redis-group')">{{ t('database.uninstallRedisGroup') }}</el-button>
+                  </span>
+                </el-tooltip>
                 <el-tooltip v-if="hasRouterClusterDelete(group)" :content="deniedText" :disabled="canManageApps" placement="top">
                   <span>
                     <el-button size="small" type="danger" plain :disabled="!canManageApps" @click="openDeleteGroup(group, 'mysql-router')">{{ t('database.uninstallMysqlRouterCluster') }}</el-button>
@@ -259,7 +264,7 @@ type DatabaseGroup = {
   sentinels: DatabaseNode[]
 }
 
-type DeleteScopeKind = 'single' | 'mysql-cluster' | 'mysql-router'
+type DeleteScopeKind = 'single' | 'mysql-cluster' | 'mysql-router' | 'redis-group'
 
 type DeleteScope = {
   kind: DeleteScopeKind
@@ -1188,8 +1193,15 @@ function hasRouterClusterDelete(group: DatabaseGroup) {
   return group.routers.length > 0
 }
 
+function hasRedisGroupDelete(group: DatabaseGroup) {
+  return group.app === 'redis' && redisGroupDeleteNodes(group).length > 0
+}
+
 function showNodeDeleteButton(group: DatabaseGroup, node?: DatabaseNode) {
   if (node?.virtual) {
+    return false
+  }
+  if (group.app === 'redis') {
     return false
   }
   return !(group.app === 'mysql' && group.topology === 'innodb-cluster')
@@ -1200,8 +1212,36 @@ function showSentinelDeleteButton(group: DatabaseGroup, node: DatabaseNode) {
 }
 
 function openDeleteGroup(group: DatabaseGroup, kind: DeleteScopeKind) {
-  const nodes = kind === 'mysql-router' ? group.routers : group.nodes
+  const nodes = groupDeleteNodes(group, kind)
   openDeleteNodes(nodes, kind, group)
+}
+
+function groupDeleteNodes(group: DatabaseGroup, kind: DeleteScopeKind) {
+  if (kind === 'mysql-router') {
+    return group.routers
+  }
+  if (kind === 'redis-group') {
+    return redisGroupDeleteNodes(group)
+  }
+  return group.nodes
+}
+
+function redisGroupDeleteNodes(group: DatabaseGroup) {
+  return uniqueRealNodes([...group.nodes, ...group.sentinels])
+}
+
+function uniqueRealNodes(nodes: DatabaseNode[]) {
+  const seen = new Set<string>()
+  const out: DatabaseNode[] = []
+  for (const node of nodes) {
+    const id = node.instance.id
+    if (node.virtual || !id || !node.instance.serverId || seen.has(id)) {
+      continue
+    }
+    seen.add(id)
+    out.push(node)
+  }
+  return out
 }
 
 async function startMysqlCluster(group: DatabaseGroup) {
@@ -1233,7 +1273,7 @@ function openDeleteNodes(nodes: DatabaseNode[], kind: DeleteScopeKind, group?: D
     ElMessage.warning(deniedText.value)
     return
   }
-  const cleanNodes = nodes.filter((node) => node.instance.id)
+  const cleanNodes = uniqueRealNodes(nodes)
   if (!cleanNodes.length) {
     return
   }
@@ -1259,6 +1299,9 @@ function deleteScopeTitle(kind: DeleteScopeKind) {
   }
   if (kind === 'mysql-router') {
     return t('database.uninstallMysqlRouterCluster')
+  }
+  if (kind === 'redis-group') {
+    return t('database.uninstallRedisGroup')
   }
   return t('apps.uninstallService')
 }

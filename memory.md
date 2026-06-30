@@ -279,3 +279,5 @@
 - 结论：数据库页 Redis Sentinel 改为分开展示 Redis 数据节点和 Sentinel 节点；数据区只显示 master/replica 及 6379，Sentinel 区显示三台哨兵及 26379，并分别统计节点数和哨兵数。验证通过：pnpm web:build、git diff --check。
 - 问题：用户继续反馈 Redis Sentinel 仍只展示已登记的两台哨兵，主节点出来了但没有发现副本节点。
 - 结论：Redis 检测新增查询 Sentinel 拓扑：`SENTINEL replicas` 记录副本端点，`SENTINEL sentinels` 记录哨兵端点；数据库页会根据检测到的端点补充未登记的虚拟 master/replica/sentinel 行，虚拟行不提供卸载按钮。验证通过：pnpm test、pnpm web:build、git diff --check。
+- 问题：用户要求 Redis 卸载也统一放到卡片顶部操作，不在节点行逐个卸载。
+- 结论：数据库页 Redis 卡片顶部新增统一“卸载 Redis”按钮，批量提交该 Redis 组内所有真实登记实例；Redis 数据节点和哨兵节点行不再显示卸载按钮，虚拟发现节点也不会参与卸载。验证通过：pnpm web:build、git diff --check。
