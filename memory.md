@@ -230,4 +230,8 @@
 - 问题：用户觉得 deploy/deployment 下的 start.bat、start.ps1、start.sh、stop.sh 放置奇怪，要求移到 scripts。
 - 结论：四个运行启动模板已移动到 scripts/，scripts/package-release.mjs 改为从 scripts/start.* 和 scripts/stop.sh 复制到最终发布包根目录；deploy/deployment 只保留生成出来的包目录和归档。验证通过：node scripts/package-release.mjs、pnpm test、git diff --check。
 - 问题：用户要求在应用商店新增 AIFAR 服务安装，并扫描已放入 resources/aifar 的 Docker Compose 应用包后给出优化建议和部署代码。
-- 结论：新增 AIFAR 后端应用模块和前端应用商店模块；catalog 支持资源版本过滤，AIFAR 只展示/安装 docker-apps，避免 docker-sql 被误选为版本；安装会整体上传 resources/aifar 包，目标目录使用标准 /aifar/apps/aifar，不带版本号，支持写入 Nacos/数据库/端口/网络配置、可选 SQL 初始化、检测和卸载。验证通过：go test ./...、pnpm web:build、git diff --check；本地提交 16203ffa。
+- 结论：新增 AIFAR 后端应用模块和前端应用商店模块；catalog 支持资源版本过滤，AIFAR 只展示/安装 docker-apps，避免 docker-sql 被误选为版本；安装会整体上传 resources/aifar 包，目标目录使用标准 /aifar/apps/aifar，不带版本号，支持写入 Nacos/数据库/端口/网络配置、可选 SQL 初始化、检测和卸载。验证通过：go test ./...、pnpm web:build、git diff --check；本地提交 cd44190d。
+
+## 2026-06-30
+- 问题：用户要求所有服务安装成功后自动开放安装端口，并在 SELinux 中加入对应端口规则。
+- 结论：新增 installerkit 公共服务访问策略脚本片段，Docker/MySQL/Redis/Sentinel/Cluster/MinIO/MySQL Router/AIFAR 安装成功后会通过 firewalld 开放对应 TCP 端口，并在 SELinux 启用且 semanage 可用时写入对应端口类型；缺少 firewalld 或 semanage 时只记录 warning。验证通过：go test ./...、pnpm test、git diff --check。

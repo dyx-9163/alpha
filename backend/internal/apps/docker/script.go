@@ -15,7 +15,8 @@ var installScriptTemplate string
 var uninstallScriptTemplate string
 
 var dockerScriptFuncs = template.FuncMap{
-	"shq": installerkit.ShellQuote,
+	"shq":                  installerkit.ShellQuote,
+	"serviceAccessHelpers": installerkit.ServiceAccessHelpers,
 }
 
 type installScriptData struct {

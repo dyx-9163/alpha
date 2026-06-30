@@ -92,6 +92,10 @@ func TestInstallerUploadsArchiveAndRunsRealRedisScript(t *testing.T) {
 	if !strings.Contains(remote.installScript, `"$INSTALL_ROOT/bin/redis-cli" -p "$PORT" -a "$REDIS_PASSWORD" --no-auth-warning ping`) {
 		t.Fatalf("installer should verify redis-cli ping:\n%s", remote.installScript)
 	}
+	if !strings.Contains(remote.installScript, `open_firewall_ports "$PORT"`) ||
+		!strings.Contains(remote.installScript, `allow_selinux_ports redis_port_t "$PORT"`) {
+		t.Fatalf("installer should open firewall and SELinux rules for the Redis port:\n%s", remote.installScript)
+	}
 }
 
 func TestInstallerCanInstallRedisBinariesForSentinelOnlyNode(t *testing.T) {
@@ -176,5 +180,30 @@ func TestRedisSentinelScriptUsesConfiguredMasterName(t *testing.T) {
 	}
 	if strings.Contains(script, "Requires=$SERVICE_NAME.service") {
 		t.Fatalf("sentinel unit should not require local Redis data service:\n%s", script)
+	}
+	if !strings.Contains(script, `open_firewall_ports "$REDIS_PORT" "$SENTINEL_PORT"`) ||
+		!strings.Contains(script, `allow_selinux_ports redis_port_t "$REDIS_PORT" "$SENTINEL_PORT"`) {
+		t.Fatalf("sentinel script should open Redis and Sentinel ports:\n%s", script)
+	}
+}
+
+func TestRedisClusterScriptOpensServiceAndBusPorts(t *testing.T) {
+	script, err := enableClusterNodeScript(ClusterNodeConfig{
+		Version:     "7.2.14",
+		InstallRoot: "/aifar/apps/redis",
+		Port:        6379,
+		Password:    "Oversea.123",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		`BUS_PORT=$((PORT + 10000))`,
+		`open_firewall_ports "$PORT" "$BUS_PORT"`,
+		`allow_selinux_ports redis_port_t "$PORT" "$BUS_PORT"`,
+	} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("cluster script missing %q:\n%s", want, script)
+		}
 	}
 }

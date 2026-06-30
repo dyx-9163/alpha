@@ -378,7 +378,8 @@ func renderInstallScript(data installScriptData) (string, error) {
 		return "", err
 	}
 	return installerkit.RenderTemplate(AppName, "install.sh", "aifar-install", string(content), template.FuncMap{
-		"quote": shellQuoteAny,
+		"quote":                shellQuoteAny,
+		"serviceAccessHelpers": installerkit.ServiceAccessHelpers,
 	}, data)
 }
 

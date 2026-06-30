@@ -74,6 +74,8 @@ func TestInstallerUploadsBundleAndRunsMySQLRouterScript(t *testing.T) {
 		`--conf-base-port "$BASE_PORT"`,
 		`SERVICE_NAME="aifar-mysql-router"`,
 		`ExecStart=$ROUTER_BASE/bin/mysqlrouter -c $ROUTER_DIR/mysqlrouter.conf`,
+		`open_firewall_ports "$BASE_PORT" "$((BASE_PORT + 1))" "$((BASE_PORT + 2))" "$((BASE_PORT + 3))"`,
+		`allow_selinux_ports mysqld_port_t "$BASE_PORT" "$((BASE_PORT + 1))" "$((BASE_PORT + 2))" "$((BASE_PORT + 3))"`,
 	} {
 		if !strings.Contains(remote.routerInstallScript, want) {
 			t.Fatalf("router installer should contain %q:\n%s", want, remote.routerInstallScript)

@@ -13,6 +13,8 @@ if [ "$(id -u)" != "0" ]; then
   SUDO="sudo -n"
 fi
 
+{{ serviceAccessHelpers }}
+
 echo "enabling Redis Cluster mode on port $PORT"
 if ! grep -q "^cluster-enabled yes" "$CONFIG_FILE"; then
   cat >> "$CONFIG_FILE" <<CONF
@@ -34,4 +36,7 @@ if ! "$INSTALL_ROOT/bin/redis-cli" -p "$PORT" -a "$REDIS_PASSWORD" --no-auth-war
   $SUDO systemctl --no-pager --full status "$LEGACY_SERVICE_NAME" || true
   exit 1
 fi
+BUS_PORT=$((PORT + 10000))
+open_firewall_ports "$PORT" "$BUS_PORT"
+allow_selinux_ports redis_port_t "$PORT" "$BUS_PORT"
 echo "Redis Cluster node enabled: $PORT"

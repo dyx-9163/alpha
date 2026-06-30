@@ -25,6 +25,8 @@ if [ "$(id -u)" != "0" ]; then
   SUDO="sudo -n"
 fi
 
+{{ serviceAccessHelpers }}
+
 echo "checking MinIO build commands"
 command -v tar >/dev/null 2>&1 || { echo "tar is required"; exit 1; }
 
@@ -175,5 +177,7 @@ if [ "$MINIO_READY" != "1" ]; then
 fi
 
 "$INSTALL_ROOT/bin/minio" --version
+open_firewall_ports "$API_PORT" "$CONSOLE_PORT"
+allow_selinux_ports http_port_t "$API_PORT" "$CONSOLE_PORT"
 echo "MinIO standalone service installed: $SERVICE_NAME"
 echo "MinIO API endpoint: http://127.0.0.1:$API_PORT"

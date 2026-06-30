@@ -25,6 +25,8 @@ if [ "$(id -u)" != "0" ]; then
   SUDO="sudo -n"
 fi
 
+{{ serviceAccessHelpers }}
+
 echo "checking MySQL binary install commands"
 command -v tar >/dev/null 2>&1 || { echo "tar is required"; exit 1; }
 
@@ -247,5 +249,7 @@ fi
 
 "$MYSQL_BASE/bin/mysqld" --version
 MYSQL_PWD="$ROOT_PASSWORD" "$MYSQL_BASE/bin/mysqladmin" --protocol=tcp -h 127.0.0.1 -P "$PORT" -u "$ROOT_USER" ping
+open_firewall_ports "$PORT"
+allow_selinux_ports mysqld_port_t "$PORT"
 echo "MySQL service installed: $SERVICE_NAME"
 echo "MySQL endpoint: 127.0.0.1:$PORT"

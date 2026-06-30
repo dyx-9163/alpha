@@ -14,7 +14,8 @@ var routerInstallScriptTemplate string
 var routerUninstallScriptTemplate string
 
 var mysqlRouterScriptFuncs = template.FuncMap{
-	"shq": installerkit.ShellQuote,
+	"shq":                  installerkit.ShellQuote,
+	"serviceAccessHelpers": installerkit.ServiceAccessHelpers,
 }
 
 func installRouterScript(req RouterInstallScriptRequest) (string, error) {

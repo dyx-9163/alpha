@@ -124,6 +124,10 @@ func TestInstallerUploadsBundleAndRunsMySQLScript(t *testing.T) {
 	if !strings.Contains(remote.installScript, `MYSQL_PWD="$ROOT_PASSWORD" "$MYSQL_BASE/bin/mysqladmin" --protocol=tcp`) {
 		t.Fatalf("installer should verify password login via mysqladmin:\n%s", remote.installScript)
 	}
+	if !strings.Contains(remote.installScript, `open_firewall_ports "$PORT"`) ||
+		!strings.Contains(remote.installScript, `allow_selinux_ports mysqld_port_t "$PORT"`) {
+		t.Fatalf("installer should open firewall and SELinux rules for the MySQL port:\n%s", remote.installScript)
+	}
 	if !strings.Contains(remote.installScript, `if [ "$NEED_SECURE" = "1" ]; then`) ||
 		!strings.Contains(remote.installScript, "Existing MySQL data directory is present") {
 		t.Fatalf("installer should use password verification for existing data directories:\n%s", remote.installScript)

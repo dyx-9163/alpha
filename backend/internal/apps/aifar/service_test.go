@@ -64,10 +64,11 @@ func (f *fakeStore) DeleteAppInstance(id string) error {
 }
 
 type fakeRemote struct {
-	mu           sync.Mutex
-	commands     []string
-	uploads      []string
-	statusStdout string
+	mu            sync.Mutex
+	commands      []string
+	uploads       []string
+	installScript string
+	statusStdout  string
 }
 
 func (f *fakeRemote) Run(ctx context.Context, server store.Server, command string) (adapter.CommandResult, error) {
@@ -84,6 +85,13 @@ func (f *fakeRemote) UploadFile(ctx context.Context, server store.Server, localP
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.uploads = append(f.uploads, filepath.Base(localPath)+"->"+remotePath)
+	if strings.HasSuffix(remotePath, "/install-aifar.sh") {
+		content, err := os.ReadFile(localPath)
+		if err != nil {
+			return err
+		}
+		f.installScript = string(content)
+	}
 	return nil
 }
 
@@ -145,6 +153,10 @@ func TestServiceInstallsAIFARServiceFromDockerAppsBundle(t *testing.T) {
 	}
 	if !strings.Contains(remote.joinedUploads(), "aifar-service-bundle-") || !strings.Contains(remote.joinedCommands(), "install-aifar.sh") {
 		t.Fatalf("expected bundle upload and install script run, uploads=%s commands=%s", remote.joinedUploads(), remote.joinedCommands())
+	}
+	if !strings.Contains(remote.installScript, `open_firewall_ports "$GATEWAY_PORT" "$WEB_VUE3_PORT" "$NACOS_PORT_WEB" "$NACOS_PORT_API"`) ||
+		!strings.Contains(remote.installScript, `allow_selinux_ports http_port_t "$GATEWAY_PORT" "$WEB_VUE3_PORT" "$NACOS_PORT_WEB" "$NACOS_PORT_API"`) {
+		t.Fatalf("AIFAR install script should open firewall and SELinux rules for service ports:\n%s", remote.installScript)
 	}
 }
 

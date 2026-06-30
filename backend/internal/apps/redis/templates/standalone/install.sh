@@ -19,6 +19,8 @@ if [ "$(id -u)" != "0" ]; then
   SUDO="sudo -n"
 fi
 
+{{ serviceAccessHelpers }}
+
 echo "checking Redis build commands"
 command -v tar >/dev/null 2>&1 || { echo "tar is required"; exit 1; }
 
@@ -143,6 +145,8 @@ if [ "$REDIS_READY" != "1" ]; then
 fi
 "$INSTALL_ROOT/bin/redis-server" --version
 "$INSTALL_ROOT/bin/redis-cli" -p "$PORT" -a "$REDIS_PASSWORD" --no-auth-warning ping
+open_firewall_ports "$PORT"
+allow_selinux_ports redis_port_t "$PORT"
 echo "Redis standalone service installed: $SERVICE_NAME"
 {{else}}
 "$INSTALL_ROOT/bin/redis-server" --version

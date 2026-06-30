@@ -32,6 +32,11 @@ fail() {
   exit 1
 }
 
+SUDO=""
+if [ "$(id -u)" != "0" ]; then
+  SUDO="sudo -n"
+fi
+
 compose() {
   if docker compose version >/dev/null 2>&1; then
     docker compose "$@"
@@ -54,6 +59,8 @@ set_env() {
   printf "%s=%s\n" "$key" "$value" >> "$tmp"
   mv "$tmp" "$file"
 }
+
+{{ serviceAccessHelpers }}
 
 down_existing() {
   [ -d "$APP_DIR" ] || return 0
@@ -126,5 +133,7 @@ for service in $SERVICE_ORDER; do
   )
 done
 
+open_firewall_ports "$GATEWAY_PORT" "$WEB_VUE3_PORT" "$NACOS_PORT_WEB" "$NACOS_PORT_API"
+allow_selinux_ports http_port_t "$GATEWAY_PORT" "$WEB_VUE3_PORT" "$NACOS_PORT_WEB" "$NACOS_PORT_API"
 echo "AIFAR service deployed under $INSTALL_ROOT"
 docker ps --filter "network=$NETWORK_NAME"

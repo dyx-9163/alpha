@@ -17,7 +17,8 @@ var standaloneUninstallScriptTemplate string
 var innodbClusterBootstrapScriptTemplate string
 
 var mysqlScriptFuncs = template.FuncMap{
-	"shq": installerkit.ShellQuote,
+	"shq":                  installerkit.ShellQuote,
+	"serviceAccessHelpers": installerkit.ServiceAccessHelpers,
 }
 
 func installStandaloneScript(req InstallScriptRequest) (string, error) {

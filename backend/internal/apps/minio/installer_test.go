@@ -123,6 +123,10 @@ func TestInstallerUploadsResourcesAndRunsMinioScript(t *testing.T) {
 	if !strings.Contains(remote.installScript, `/minio/health/live`) {
 		t.Fatalf("installer should verify MinIO health:\n%s", remote.installScript)
 	}
+	if !strings.Contains(remote.installScript, `open_firewall_ports "$API_PORT" "$CONSOLE_PORT"`) ||
+		!strings.Contains(remote.installScript, `allow_selinux_ports http_port_t "$API_PORT" "$CONSOLE_PORT"`) {
+		t.Fatalf("installer should open firewall and SELinux rules for MinIO ports:\n%s", remote.installScript)
+	}
 }
 
 func TestInstallerResolveDataDirUsesLocalDirectoryMode(t *testing.T) {
@@ -234,6 +238,22 @@ func TestMinIOStandaloneScriptsRenderTemplates(t *testing.T) {
 	}
 	if !strings.Contains(install, "VERSION='2025-10-15T17-29-55Z'") || !strings.Contains(install, "API_PORT=9000") || !strings.Contains(install, "CONSOLE_PORT=9001") {
 		t.Fatalf("install script did not render core standalone variables:\n%s", install)
+	}
+	distributed, err := configureDistributedNodeScript(DistributedNodeConfig{
+		Version:      "2025-10-15T17-29-55Z",
+		InstallRoot:  "/aifar/apps/minio",
+		APIPort:      9000,
+		ConsolePort:  9001,
+		RootUser:     "admin",
+		RootPassword: "Oversea.123",
+		Volumes:      []DistributedVolume{{Host: "10.0.0.1", Port: 9000, Path: "/data/minio"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(distributed, `open_firewall_ports "$API_PORT" "$CONSOLE_PORT"`) ||
+		!strings.Contains(distributed, `allow_selinux_ports http_port_t "$API_PORT" "$CONSOLE_PORT"`) {
+		t.Fatalf("distributed script should open firewall and SELinux rules for MinIO ports:\n%s", distributed)
 	}
 	uninstall, err := uninstallStandaloneScript("2025-10-15T17-29-55Z", "/aifar/apps/minio", "/aifar/apps/minio/2025-10-15T17-29-55Z", 9000, UninstallOptions{})
 	if err != nil {

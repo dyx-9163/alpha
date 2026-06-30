@@ -16,6 +16,8 @@ if [ "$(id -u)" != "0" ]; then
   SUDO="sudo -n"
 fi
 
+{{ serviceAccessHelpers }}
+
 echo "installing local RPM dependencies when available"
 if [ -d "$WORK_DIR/rpms" ] && ls "$WORK_DIR"/rpms/*.rpm >/dev/null 2>&1; then
   if command -v rpm >/dev/null 2>&1; then
@@ -172,3 +174,5 @@ if ! /usr/local/bin/docker -H "tcp://127.0.0.1:$REMOTE_API_PORT" version >/dev/n
 fi
 echo "verifying Docker Compose"
 /usr/local/bin/docker compose version || /usr/local/bin/docker-compose version
+open_firewall_ports "$REMOTE_API_PORT"
+allow_selinux_ports docker_port_t "$REMOTE_API_PORT"

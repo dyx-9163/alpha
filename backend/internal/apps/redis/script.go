@@ -26,7 +26,8 @@ var clusterEnableNodeScriptTemplate string
 var clusterBootstrapScriptTemplate string
 
 var redisScriptFuncs = template.FuncMap{
-	"shq": installerkit.ShellQuote,
+	"shq":                  installerkit.ShellQuote,
+	"serviceAccessHelpers": installerkit.ServiceAccessHelpers,
 }
 
 type standaloneInstallScriptData struct {

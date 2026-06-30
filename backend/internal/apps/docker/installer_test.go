@@ -197,6 +197,8 @@ func TestInstallScriptEnablesRemoteAPIAndBridgeCIDR(t *testing.T) {
 		`"bip": "$BRIDGE_CIDR"`,
 		`-H tcp://0.0.0.0:$REMOTE_API_PORT`,
 		`docker -H "tcp://127.0.0.1:$REMOTE_API_PORT" version`,
+		`open_firewall_ports "$REMOTE_API_PORT"`,
+		`allow_selinux_ports docker_port_t "$REMOTE_API_PORT"`,
 	} {
 		if !strings.Contains(install, want) {
 			t.Fatalf("install script missing %q:\n%s", want, install)

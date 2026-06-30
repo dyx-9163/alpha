@@ -16,6 +16,8 @@ if [ "$(id -u)" != "0" ]; then
   SUDO="sudo -n"
 fi
 
+{{ serviceAccessHelpers }}
+
 MINIO_VOLUMES="{{range .Volumes}}http://{{.Host}}:{{.Port}}{{.Path}} {{end}}"
 
 echo "configuring MinIO distributed service"
@@ -64,4 +66,6 @@ if [ "$MINIO_READY" != "1" ]; then
   $SUDO systemctl --no-pager --full status "$SERVICE_NAME" || true
   exit 1
 fi
+open_firewall_ports "$API_PORT" "$CONSOLE_PORT"
+allow_selinux_ports http_port_t "$API_PORT" "$CONSOLE_PORT"
 echo "MinIO distributed node configured"

@@ -18,7 +18,8 @@ var standaloneUninstallScriptTemplate string
 var distributedConfigureScriptTemplate string
 
 var minioScriptFuncs = template.FuncMap{
-	"shq": installerkit.ShellQuote,
+	"shq":                  installerkit.ShellQuote,
+	"serviceAccessHelpers": installerkit.ServiceAccessHelpers,
 }
 
 func installStandaloneScript(req InstallScriptRequest) (string, error) {

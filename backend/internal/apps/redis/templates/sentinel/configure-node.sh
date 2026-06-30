@@ -22,6 +22,8 @@ if [ "$(id -u)" != "0" ]; then
   SUDO="sudo -n"
 fi
 
+{{ serviceAccessHelpers }}
+
 echo "configuring Redis Sentinel node: $ROLE"
 if [ "$ROLE" = "replica" ]; then
   if ! grep -q "^replicaof " "$CONFIG_FILE"; then
@@ -96,5 +98,12 @@ if ! VERIFY_OUTPUT="$("$INSTALL_ROOT/bin/redis-cli" -p "$SENTINEL_PORT" -a "$RED
   $SUDO systemctl --no-pager --full status "$SENTINEL_SERVICE" 2>&1 || true
   $SUDO journalctl -u "$SENTINEL_SERVICE" -n 120 --no-pager 2>&1 || true
   exit 1
+fi
+if [ "$ROLE" = "sentinel" ]; then
+  open_firewall_ports "$SENTINEL_PORT"
+  allow_selinux_ports redis_port_t "$SENTINEL_PORT"
+else
+  open_firewall_ports "$REDIS_PORT" "$SENTINEL_PORT"
+  allow_selinux_ports redis_port_t "$REDIS_PORT" "$SENTINEL_PORT"
 fi
 echo "Redis Sentinel node configured: $ROLE"

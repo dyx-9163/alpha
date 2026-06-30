@@ -22,6 +22,8 @@ if [ "$(id -u)" != "0" ]; then
   SUDO="sudo -n"
 fi
 
+{{ serviceAccessHelpers }}
+
 echo "installing local RPM dependencies when available"
 if [ -d "$WORK_DIR/rpms" ] && ls "$WORK_DIR"/rpms/*.rpm >/dev/null 2>&1; then
   if command -v rpm >/dev/null 2>&1; then
@@ -143,5 +145,7 @@ if ! $SUDO systemctl is-active --quiet "$SERVICE_NAME"; then
 fi
 
 "$ROUTER_BASE/bin/mysqlrouter" --version
+open_firewall_ports "$BASE_PORT" "$((BASE_PORT + 1))" "$((BASE_PORT + 2))" "$((BASE_PORT + 3))"
+allow_selinux_ports mysqld_port_t "$BASE_PORT" "$((BASE_PORT + 1))" "$((BASE_PORT + 2))" "$((BASE_PORT + 3))"
 echo "MySQL Router service installed: $SERVICE_NAME"
 echo "MySQL Router classic read-write endpoint: 0.0.0.0:$BASE_PORT"
