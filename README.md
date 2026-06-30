@@ -53,7 +53,7 @@ On Windows:
 
 ## Packaging
 
-Use `scripts/package.sh` or `scripts/package.ps1` after Go and pnpm are available. They install dependencies, build the frontend and backend, then stage clean runtime packages under `dist/`.
+Use `scripts/package.sh` or `scripts/package.ps1` after Go and pnpm are available. They install dependencies, build package-only artifacts under `deploy/bin` and `deploy/dist`, then stage clean runtime packages under `deploy/deployment`.
 
 ```bash
 sh scripts/package.sh
@@ -73,7 +73,7 @@ pnpm package
 
 Release packages are platform-specific:
 
-- `dist/aifar-deployment-<version>-linux-amd64/` and `.tar.gz`
-- `dist/aifar-deployment-<version>-windows-amd64/` and `.zip`
+- `deploy/deployment/aifar-deployment-<version>-linux-amd64/` and `.tar.gz`
+- `deploy/deployment/aifar-deployment-<version>-windows-amd64/` and `.zip`
 
 Each package contains only runtime assets: `bin/`, `web/dist/`, `resources/` when present, `config/`, startup scripts, `VERSION`, and `checksums.txt`. Source code, `node_modules/`, `data/`, logs, caches, and development scripts are not included.

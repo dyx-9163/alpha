@@ -8,7 +8,7 @@
     "postinstall": "node scripts/setup-dev.mjs",
     "dev": "node scripts/dev.mjs",
     "build": "node scripts/build-web.mjs && node scripts/build-backend.mjs",
-    "package": "pnpm build && node scripts/package-release.mjs",
+    "package": "node scripts/package-build.mjs",
     "release": "node scripts/package-release.mjs",
     "test": "node scripts/test.mjs",
     "db:inspect": "node scripts/admin.mjs inspect",

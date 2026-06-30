@@ -3,7 +3,9 @@ import path from 'node:path'
 import { spawnSync } from 'node:child_process'
 import { backendDir, goCommand, rootDir, withToolEnv } from './toolchain.mjs'
 
-const binDir = path.join(rootDir, 'bin')
+const binDir = process.env.AIFAR_BIN_DIR
+  ? path.resolve(rootDir, process.env.AIFAR_BIN_DIR)
+  : path.join(rootDir, 'bin')
 mkdirSync(binDir, { recursive: true })
 
 const targets = [

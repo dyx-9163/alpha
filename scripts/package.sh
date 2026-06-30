@@ -15,6 +15,5 @@ export GOCACHE="${AIFAR_GO_CACHE:-$ROOT/.cache/go-build}"
 mkdir -p "$GOCACHE"
 cd "$ROOT"
 pnpm install
-pnpm build
-node scripts/package-release.mjs
-echo "Package artifacts generated under $ROOT/dist"
+node scripts/package-build.mjs
+echo "Package artifacts generated under $ROOT/deploy/deployment"

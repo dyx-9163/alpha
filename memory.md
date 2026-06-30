@@ -209,3 +209,11 @@
 ## 2026-06-30
 - 问题：用户确认按打包收敛建议执行。
 - 结论：新增 scripts/package-release.mjs，pnpm package 与 scripts/package.ps1/sh 会构建后生成 dist/aifar-deployment-<version>-linux-amd64 和 windows-amd64 运行包、checksums、VERSION 以及 tar.gz/zip；包内只包含 bin、web/dist、resources、config、启动脚本和 README，排除源码、node_modules、data、日志、缓存和开发脚本；package.ps1/sh 默认 Go cache 改到 .cache/go-build。验证通过：pnpm test、pnpm package、git diff --check（仅既有换行风格提示）。
+
+## 2026-06-30
+- 问题：用户指出工程里还有多个 start.bat，担心启动入口重复。
+- 结论：deploy/start.bat、deploy/start.ps1、deploy/start.sh、deploy/stop.sh 只是转发到根目录脚本的重复包装，已删除；工程现在只保留根目录 start.bat、start.ps1、start.sh、stop.sh 作为唯一运行入口。验证通过：rg 启动脚本与 deploy 引用检查、git diff --check。
+
+## 2026-06-30
+- 问题：用户要求打包相关内容全部迁移到 deploy，包括 bin、dist 等中间产物，最终打出的包放到 deployment 中，但打包命令仍在工程最外层运行。
+- 结论：打包入口迁移为 deploy/package.ps1、deploy/package.sh、deploy/package-build.mjs、deploy/package-release.mjs；pnpm package 从根目录执行并输出中间产物到 deploy/bin 与 deploy/dist，最终运行包输出到 deploy/deployment；根目录旧 bin、dist、web/dist 已清理，包内仍保持 bin、web/dist、resources、config、启动脚本的标准运行结构。验证通过：pnpm package、pnpm test、git diff --check（仅换行风格提示）。

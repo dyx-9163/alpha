@@ -17,9 +17,8 @@ $pnpm = Join-Path $nodeGlobal "pnpm.cmd"
 Push-Location $root
 try {
   & $pnpm install
-  & $pnpm build
-  & node scripts/package-release.mjs
+  & node scripts/package-build.mjs
 } finally {
   Pop-Location
 }
-Write-Host "Package artifacts generated under $(Join-Path $root 'dist')"
+Write-Host "Package artifacts generated under $(Join-Path $root 'deploy\deployment')"

@@ -30,7 +30,7 @@ AIFAR Deployment 是一个可离线部署的 Linux 运维面板：
 - 根目录 `package.json` 提供 `pnpm dev`、`pnpm build`、`pnpm package`、`pnpm test`、`pnpm backend:dev`、`pnpm web:dev` 等命令。
 - `scripts/toolchain.mjs` 优先使用 `D:\tools` 下 Node、Go、GOPATH、GOCACHE，并注入 AIFAR 默认环境变量。
 - `scripts/build-web.mjs` 执行 `vue-tsc --noEmit` 与 Vite build；`scripts/build-backend.mjs` 交叉编译 Linux/Windows amd64 服务端二进制。
-- `scripts/package-release.mjs` 把运行时所需的 `bin/`、`web/dist/`、`resources/`、`config/` 与启动脚本暂存到 `dist/`，并生成 checksums 与平台归档。
+- `scripts/package-build.mjs` 将打包中间产物输出到 `deploy/bin` 和 `deploy/dist`；`scripts/package-release.mjs` 把运行时所需文件暂存到 `deploy/deployment`，并生成 checksums 与平台归档。
 - `scripts/test.mjs` 当前只运行后端 `go test ./...`。
 
 ### 后端配置

@@ -17,13 +17,15 @@ import { fileURLToPath } from 'node:url'
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url))
 const rootDir = path.resolve(scriptDir, '..')
-const distDir = path.join(rootDir, 'dist')
+const deploymentDir = path.join(rootDir, 'deploy', 'deployment')
+const buildBinDir = path.join(rootDir, 'deploy', 'bin')
+const buildWebDistDir = path.join(rootDir, 'deploy', 'dist')
 const packageJson = JSON.parse(readFileSync(path.join(rootDir, 'package.json'), 'utf8'))
 const baseName = `${packageJson.name}-${packageJson.version}`
 const warnings = []
 
 const commonEntries = [
-  { kind: 'dir', source: 'web/dist', target: 'web/dist', required: true },
+  { kind: 'dir', source: 'deploy/dist', target: 'web/dist', required: true },
   { kind: 'dir', source: 'resources', target: 'resources', required: false },
   { kind: 'dir', source: 'config', target: 'config', required: true },
   { kind: 'file', source: 'README.md', target: 'README.md', required: false }
@@ -36,8 +38,8 @@ const targets = [
     binary: 'aifar-server-linux-amd64',
     archive: 'tar.gz',
     runtimeFiles: [
-      { source: 'start.sh', target: 'start.sh', executable: true },
-      { source: 'stop.sh', target: 'stop.sh', executable: true }
+      { source: 'deploy/deployment/start.sh', target: 'start.sh', executable: true },
+      { source: 'deploy/deployment/stop.sh', target: 'stop.sh', executable: true }
     ]
   },
   {
@@ -46,8 +48,8 @@ const targets = [
     binary: 'aifar-server-windows-amd64.exe',
     archive: 'zip',
     runtimeFiles: [
-      { source: 'start.ps1', target: 'start.ps1' },
-      { source: 'start.bat', target: 'start.bat' }
+      { source: 'deploy/deployment/start.ps1', target: 'start.ps1' },
+      { source: 'deploy/deployment/start.bat', target: 'start.bat' }
     ]
   }
 ]
@@ -132,11 +134,11 @@ function writeVersionFile(packageDir, target) {
 
 function buildPackage(target) {
   const packageName = `${baseName}-${target.platform}-${target.arch}`
-  const packageDir = path.join(distDir, packageName)
+  const packageDir = path.join(deploymentDir, packageName)
   const archivePath =
     target.archive === 'tar.gz'
-      ? path.join(distDir, `${packageName}.tar.gz`)
-      : path.join(distDir, `${packageName}.zip`)
+      ? path.join(deploymentDir, `${packageName}.tar.gz`)
+      : path.join(deploymentDir, `${packageName}.zip`)
 
   console.log(`[package] staging ${packageName}`)
   removePath(packageDir)
@@ -145,9 +147,9 @@ function buildPackage(target) {
 
   for (const entry of commonEntries) copyEntry(entry, packageDir)
 
-  const binarySource = path.join(rootDir, 'bin', target.binary)
+  const binarySource = path.join(buildBinDir, target.binary)
   if (!existsSync(binarySource)) {
-    throw new Error(`Missing backend binary: bin/${target.binary}. Run pnpm build first.`)
+    throw new Error(`Missing backend binary: deploy/bin/${target.binary}. Run pnpm package first.`)
   }
   const binaryTarget = path.join(packageDir, 'bin', target.binary)
   mkdirSync(path.dirname(binaryTarget), { recursive: true })
@@ -170,7 +172,7 @@ function psQuote(value) {
 
 function createArchive(target, packageName, packageDir, archivePath) {
   if (target.archive === 'tar.gz') {
-    const result = spawnSync('tar', ['-czf', archivePath, '-C', distDir, packageName], {
+    const result = spawnSync('tar', ['-czf', archivePath, '-C', deploymentDir, packageName], {
       cwd: rootDir,
       stdio: 'inherit'
     })
@@ -200,7 +202,7 @@ function createArchive(target, packageName, packageDir, archivePath) {
   }
 
   const result = spawnSync('zip', ['-qr', archivePath, packageName], {
-    cwd: distDir,
+    cwd: deploymentDir,
     stdio: 'inherit'
   })
   if (result.status !== 0) {
@@ -218,15 +220,14 @@ function ensureRequiredBuildOutputs() {
     }
   }
 
-  const webDist = path.join(rootDir, 'web', 'dist')
-  const webStat = existsSync(webDist) ? statSync(webDist) : undefined
+  const webStat = existsSync(buildWebDistDir) ? statSync(buildWebDistDir) : undefined
   if (!webStat?.isDirectory()) {
-    throw new Error('Missing web/dist. Run pnpm build before packaging.')
+    throw new Error('Missing deploy/dist. Run pnpm package before staging a release.')
   }
 }
 
 ensureRequiredBuildOutputs()
-mkdirSync(distDir, { recursive: true })
+mkdirSync(deploymentDir, { recursive: true })
 for (const target of targets) buildPackage(target)
 
 if (warnings.length) {
@@ -234,4 +235,4 @@ if (warnings.length) {
   for (const warning of warnings) console.warn(`- ${warning}`)
 }
 
-console.log(`\n[package] release artifacts generated under ${path.relative(rootDir, distDir) || distDir}`)
+console.log(`\n[package] release artifacts generated under ${path.relative(rootDir, deploymentDir) || deploymentDir}`)
