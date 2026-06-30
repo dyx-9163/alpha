@@ -6,7 +6,8 @@ $nodeDir = Join-Path $toolRoot "node"
 $goDir = Join-Path $toolRoot "go"
 $nodeGlobal = Join-Path $toolRoot "node-global"
 $goPath = Join-Path $toolRoot "gopath"
-$goCache = Join-Path $toolRoot "gocache"
+$goCache = $env:AIFAR_GO_CACHE
+if (-not $goCache) { $goCache = Join-Path $root ".cache\go-build" }
 $env:Path = "$nodeDir;$nodeGlobal;$goDir\bin;$goPath\bin;$env:Path"
 $env:GOROOT = $goDir
 $env:GOPATH = $goPath
@@ -17,7 +18,8 @@ Push-Location $root
 try {
   & $pnpm install
   & $pnpm build
+  & node scripts/package-release.mjs
 } finally {
   Pop-Location
 }
-Write-Host "Package artifacts generated under $root"
+Write-Host "Package artifacts generated under $(Join-Path $root 'dist')"

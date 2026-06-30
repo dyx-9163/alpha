@@ -4,9 +4,9 @@ Rebuilt source tree for the AIFAR Linux deployment/control panel, based on the s
 
 ## Stack
 
-- Backend: Go 1.24, Chi, SQLite via `modernc.org/sqlite`, JWT, bcrypt, SSH, Docker Go client.
+- Backend: Go 1.24, Chi, SQLite via `modernc.org/sqlite`, JWT, bcrypt, SSH, Docker CLI adapter.
 - Frontend: Vue 3, TypeScript, Vite, Element Plus, Pinia, Vue Router, xterm.js.
-- Runtime layout: `bin/`, `web/dist/`, `resources/`, `config/defaults.env`, `start.sh`, `stop.sh`.
+- Runtime package layout: `bin/`, `web/dist/`, `resources/`, `config/defaults.env`, startup scripts.
 
 ## Development
 
@@ -21,6 +21,7 @@ Useful root commands:
 
 ```bash
 pnpm build
+pnpm package
 pnpm test
 pnpm backend:dev
 pnpm web:dev
@@ -52,4 +53,27 @@ On Windows:
 
 ## Packaging
 
-Use `scripts/package.sh` or `scripts/package.ps1` after Go and pnpm are available. The package scripts build `web/dist` and place Linux/Windows binaries under `bin/`.
+Use `scripts/package.sh` or `scripts/package.ps1` after Go and pnpm are available. They install dependencies, build the frontend and backend, then stage clean runtime packages under `dist/`.
+
+```bash
+sh scripts/package.sh
+```
+
+On Windows:
+
+```powershell
+.\scripts\package.ps1
+```
+
+You can also run:
+
+```bash
+pnpm package
+```
+
+Release packages are platform-specific:
+
+- `dist/aifar-deployment-<version>-linux-amd64/` and `.tar.gz`
+- `dist/aifar-deployment-<version>-windows-amd64/` and `.zip`
+
+Each package contains only runtime assets: `bin/`, `web/dist/`, `resources/` when present, `config/`, startup scripts, `VERSION`, and `checksums.txt`. Source code, `node_modules/`, `data/`, logs, caches, and development scripts are not included.

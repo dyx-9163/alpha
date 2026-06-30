@@ -201,3 +201,11 @@
 ## 2026-06-30
 - 问题：用户要求按上一轮结构审视建议继续收敛代码层级，合并和去掉多余文件。
 - 结论：已移除容器终端 echo/stub 路由与文案、同步更新 AGENTS.md 旧描述；前端删除 DangerConfirm 并统一使用 ConfirmAction，registry 小文件收并到 types/catalog；后端 Docker/MySQL i18n 小文件并回 i18n.go，MySQL Router bundle 转发并入 installer.go；httpapi/api.go 拆为同包粗粒度 handler 文件并保留路由初始化。验证通过：pnpm test、pnpm web:build、git diff --check（仅 memory.md 既有 CRLF 提示）。
+
+## 2026-06-30
+- 问题：用户询问当前打包结构是否合理，是否需要迁移位置或去掉内容。
+- 结论：当前运行布局 bin/web/dist/resources/config/defaults.env/start 脚本方向正确，但 scripts/package.* 只构建不生成独立发行目录或压缩包，源码根和运行根混用；建议新增 dist/release staging，只打入 bin、web/dist、resources、config、运行脚本和说明，排除源码、node_modules、data、outputs、缓存与开发脚本，并统一根目录与 deploy 的启动脚本入口。
+
+## 2026-06-30
+- 问题：用户确认按打包收敛建议执行。
+- 结论：新增 scripts/package-release.mjs，pnpm package 与 scripts/package.ps1/sh 会构建后生成 dist/aifar-deployment-<version>-linux-amd64 和 windows-amd64 运行包、checksums、VERSION 以及 tar.gz/zip；包内只包含 bin、web/dist、resources、config、启动脚本和 README，排除源码、node_modules、data、日志、缓存和开发脚本；package.ps1/sh 默认 Go cache 改到 .cache/go-build。验证通过：pnpm test、pnpm package、git diff --check（仅既有换行风格提示）。
