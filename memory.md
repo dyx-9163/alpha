@@ -245,3 +245,5 @@
 - 结论：semanage 不应静默忽略；推荐安装前检测 policycoreutils-python-utils/RHEL7 的 policycoreutils-python 或通过 dnf provides 查询；离线环境应把 semanage 相关 RPM 纳入公共依赖包。没有 semanage 时端口类型不能可靠持久化，只能临时 chcon 文件上下文或提示缺工具，不能自动 setenforce 0。
 - 问题：用户要求继续处理 semanage 缺失场景。
 - 结论：SELinux 工具模块新增 ensure_semanage 流程：需要 semanage 时先尝试从 AIFAR_SELINUX_RPM_DIR 或 WORK_DIR/rpms 安装本地 RPM，再尝试 dnf/yum 安装 policycoreutils-python-utils 或 RHEL7 的 policycoreutils-python；仍缺失时输出明确离线依赖提示并跳过规则写入。验证通过：go test ./internal/installer/selinux、go test ./...、pnpm test。
+- 问题：用户反馈 MinIO 安装成功后关闭 SELinux 仍无法登录，Console 页面提示 invalid login。
+- 结论：能打开 MinIO Console 且提示 invalid login，说明网络、端口和 SELinux 基本不是当前阻塞点；应优先排查 systemd 实际加载的 MINIO_ROOT_USER/MINIO_ROOT_PASSWORD、是否改过 env 未重启、是否复用了旧数据目录或分布式节点 env 不一致。
