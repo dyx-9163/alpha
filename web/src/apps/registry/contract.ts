@@ -1,6 +1,5 @@
 import type { Component } from 'vue'
-import type { FrontendAppDefinition } from './types'
-import type { AppTargetMode } from './model'
+import type { AppTargetMode, FrontendAppDefinition } from './types'
 
 export interface ServerOption {
   id: string

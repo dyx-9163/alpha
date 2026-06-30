@@ -58,9 +58,9 @@ AIFAR Deployment 是一个可离线部署的 Linux 运维面板：
 - Servers：列表、保存、删除、探测、telemetry、SSH terminal WebSocket
 - Tasks：列表、详情、SSE events、取消、删除、清日志
 - Audit：列表和批量删除
-- Apps：catalog、instances、install、check、delete/uninstall、upgrade stub
-- Containers：summary、containers/images/networks/volumes/df、start/stop/restart、logs、container terminal stub
-- Database：MySQL/Redis instances、backup task stub、MySQL/Redis install aliases
+- Apps：catalog、instances、install、check、delete/uninstall
+- Containers：summary、containers/images/networks/volumes/df、start/stop/restart、logs
+- Database：MySQL/Redis instances、MySQL/Redis install aliases
 - Storage：MinIO instances、MinIO install alias、bucket/object/user/access-key/replica 控制面记录
 
 所有已接入的变更操作必须返回 task id 或写审计。不要新增同步阻塞式远程变更 API。
@@ -168,14 +168,14 @@ AIFAR Deployment 是一个可离线部署的 Linux 运维面板：
   - distributed 至少 4 台。
   - 需要 MinIO 包、mc、Go 工具链/缓存和 RPM 缓存。
   - 支持安装、分布式节点配置、记录实例、远程卸载和删除实例。
-- `backend/internal/apps/offlineapp` 仍存在，但当前 MySQL/Redis/MinIO 已经有具体安装服务；不要再把它当作这些模块的主实现。
 
 ### 安装器与 Adapter
 
 - SSH 运行命令和上传文件在 `backend/internal/adapter/ssh.go`，具体安装器通过接口依赖它。
 - Docker 运行时管理在 `backend/internal/adapter/docker.go`，当前通过本机 `docker` CLI 或 SSH 到目标服务器执行 Docker CLI，不是 Docker Go client。
-- 安装器在 `backend/internal/installer/{docker,mysql,redis,minio}`，负责选择资源、校验 SHA256、上传资源/RPM、生成脚本、执行安装或卸载。
-- 安装脚本模板在对应 installer 的 `templates/` 目录，用 `go:embed` 加载。
+- 具体应用安装器在 `backend/internal/apps/<app>`，负责选择资源、校验 SHA256、上传资源/RPM、生成脚本、执行安装或卸载。
+- 共享安装器工具在 `backend/internal/installer/{installerkit,uploadkit}`。
+- 安装脚本模板在对应应用的 `templates/` 目录，用 `go:embed` 加载，并支持 `config/installers` 覆盖。
 
 ### 当前前端功能
 
@@ -200,9 +200,9 @@ AIFAR Deployment 是一个可离线部署的 Linux 运维面板：
 - Servers：企业工作台，使用 `web/src/servers` 模块管理列表、表单、详情和探测。
 - Apps：企业应用商店，使用前后端 registry + 资源准入。
 - Containers：支持本机 Docker host 或选择服务器，经 API 查询 summary、containers、images、networks、volumes、df，支持容器 start/stop/restart 与 logs。
-- Database：展示 MySQL/Redis app instances，支持跳转应用商店部署、实例检测、备份任务 stub。
+- Database：聚合展示 MySQL/Redis/MySQL Router app instances，支持跳转应用商店部署，并通过实时监测展示数据库/Redis 节点状态与角色。
 - Storage：展示 MinIO instances，维护 bucket/object/user/access-key/replica 的控制面记录；当前不是完整 MinIO S3/mc 实操。
-- Terminal：xterm.js 连接服务器 SSH WebSocket；容器终端后端目前是 echo/stub。
+- Terminal：xterm.js 连接服务器 SSH WebSocket。
 - Tasks：任务中心展示任务列表、target 分组、步骤状态和 SSE 日志。
 - Audit：审计列表与删除。
 - Settings：面板设置与语言。
@@ -210,9 +210,6 @@ AIFAR Deployment 是一个可离线部署的 Linux 运维面板：
 
 ## 当前明确缺口
 
-- 容器终端不是 Docker exec 真终端，后端仍是通用 echo/stub。
-- `apps.instances.upgrade` 是任务占位，不执行真实升级。
-- 数据库备份是任务占位，尚未接入 `mysqldump`、`redis-cli BGSAVE` 或备份文件管理。
 - Storage 的 bucket/object/user/access-key/replica 是控制面记录，不等同于真实 MinIO API 操作。
 - Docker runtime 管理依赖 Docker CLI，不是 Go Docker client。
 - Store 迁移当前为内嵌 `migrate()`，没有独立 migrations 目录。

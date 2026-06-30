@@ -1,5 +1,5 @@
 import type { AppInstallField, AppInstallFieldValues } from './contract'
-import type { AppTargetMode, AppTopologyDefinition } from './model'
+import type { AppTargetMode, AppTopologyDefinition } from './types'
 
 export function defaultTopology(topologies: AppTopologyDefinition[]) {
   return topologies.find((item) => item.default) ?? topologies[0]

@@ -1,6 +1,9 @@
 import { frontendAppCatalog } from './loader'
-import { canPairApp } from './validation'
-import type { AppCatalogResponse, AppStoreItem, BackendCatalogItem } from './types'
+import type { AppCatalogResponse, AppStoreItem, BackendCatalogItem, FrontendAppDefinition } from './types'
+
+function canPairApp(frontend: FrontendAppDefinition, backend?: BackendCatalogItem) {
+  return Boolean(frontend.frontendReady && backend?.backendReady)
+}
 
 export function normalizeBackendCatalog(payload: AppCatalogResponse): Record<string, BackendCatalogItem> {
   if (Array.isArray(payload)) {

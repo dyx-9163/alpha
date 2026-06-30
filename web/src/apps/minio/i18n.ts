@@ -1,7 +1,7 @@
-import { resolveAppLocale, type AppLocale } from '../registry/locale'
+import { resolveAppLocale, type AppLocale } from '../registry/types'
 import { targetModeResolver, topologySelectField } from '../registry/topology'
 import type { AppInstallDialogConfig, AppInstallDialogCopy } from '../registry/contract'
-import type { AppTopologyDefinition } from '../registry/model'
+import type { AppTopologyDefinition } from '../registry/types'
 
 export type MinioLocale = AppLocale
 

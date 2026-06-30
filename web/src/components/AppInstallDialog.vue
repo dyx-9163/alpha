@@ -120,7 +120,7 @@ import { computed, ref, watch } from 'vue'
 import { apiGet } from '../api/client'
 import type { AppStoreItem } from '../apps/registry/catalog'
 import type { AppInstallDialogCopy, AppInstallField, AppInstallFieldOption, AppInstallFieldValues, AppInstallPayload, AppInstallValidationContext, ServerOption } from '../apps/registry/contract'
-import type { AppTargetMode } from '../apps/registry/model'
+import type { AppTargetMode } from '../apps/registry/types'
 import { useI18n } from '../i18n'
 import ServerSelector from './ServerSelector.vue'
 

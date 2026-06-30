@@ -1,4 +1,4 @@
-import { resolveAppLocale, type AppLocale } from '../registry/locale'
+import { resolveAppLocale, type AppLocale } from '../registry/types'
 import type { AppInstallDialogConfig, AppInstallDialogContext, AppInstallFieldOption } from '../registry/contract'
 
 export type MysqlRouterLocale = AppLocale

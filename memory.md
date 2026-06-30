@@ -193,3 +193,11 @@
 ## 2026-06-30
 - 问题：用户要求去掉收敛后的多余文件和代码。
 - 结论：已删除未注册且无引用的 backend/internal/apps/offlineapp 旧共享离线占位模块；移除后端应用实例 upgrade stub 路由/handler 和数据库实例 backup stub 路由/handler，只保留真实可用的控制面 SQLite 备份维护能力；同步清理后端 offline/占位 backup/占位 upgrade i18n 文案和前端数据库页旧备份文案。验证通过：pnpm test、pnpm web:build、git diff --check（仅 memory.md 既有 CRLF 提示）。
+
+## 2026-06-30
+- 问题：读取当前开发层级结构，判断还有哪些文件、模块、接口适合合并或去掉。
+- 结论：后端应用安装器已基本收敛到 apps/<app> 标准结构；优先清理容器终端 echo/stub、滞后的 AGENTS.md/文档引用、前端 DangerConfirm 与细碎 registry 文件；httpapi/api.go 应按粗粒度能力拆文件但保持同包；taskplan/taskrun/resourcekit/uploadkit 等共享能力暂不建议合并。
+
+## 2026-06-30
+- 问题：用户要求按上一轮结构审视建议继续收敛代码层级，合并和去掉多余文件。
+- 结论：已移除容器终端 echo/stub 路由与文案、同步更新 AGENTS.md 旧描述；前端删除 DangerConfirm 并统一使用 ConfirmAction，registry 小文件收并到 types/catalog；后端 Docker/MySQL i18n 小文件并回 i18n.go，MySQL Router bundle 转发并入 installer.go；httpapi/api.go 拆为同包粗粒度 handler 文件并保留路由初始化。验证通过：pnpm test、pnpm web:build、git diff --check（仅 memory.md 既有 CRLF 提示）。

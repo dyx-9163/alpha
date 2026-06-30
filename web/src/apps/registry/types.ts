@@ -1,6 +1,16 @@
-import type { AppTopologyDefinition } from './model'
+import { getCurrentLocale, resolveLocale } from '../../i18n'
 
 export type AppCategory = 'database' | 'devops' | 'storage'
+export type AppTargetMode = 'single' | 'multiple'
+export type AppLocale = 'zh' | 'en'
+
+export interface AppTopologyDefinition {
+  name: string
+  label: string
+  targetMode: AppTargetMode
+  minTargets?: number
+  default?: boolean
+}
 
 export interface FrontendAppDefinition {
   name: string
@@ -51,4 +61,8 @@ export type AppStoreItem = FrontendAppDefinition & {
   deployable: boolean
   missing: string[]
   topologies: AppTopologyDefinition[]
+}
+
+export function resolveAppLocale(locale?: string): AppLocale {
+  return resolveLocale(locale || getCurrentLocale())
 }

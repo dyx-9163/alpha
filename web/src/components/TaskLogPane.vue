@@ -39,21 +39,25 @@
             </el-tooltip>
           </template>
         </ConfirmAction>
-        <DangerConfirm
-          :title="deleteConfirmText"
+        <ConfirmAction
+          :message="deleteConfirmText"
+          :title="t('tasks.deleteTask')"
           :confirm-text="t('common.delete')"
           :cancel-text="t('common.cancel')"
+          type="error"
           :disabled="!canManage || (!selectedTaskId && !selectedTaskIds.length)"
           @confirm="deleteSelectedTask"
         >
-          <el-tooltip :content="disabledReason" :disabled="canManage || !disabledReason" placement="top">
-            <span>
-              <el-button size="small" type="danger" plain :disabled="!canManage || (!selectedTaskId && !selectedTaskIds.length)">
-                {{ selectedTaskIds.length ? t('tasks.deleteSelected', { count: selectedTaskIds.length }) : t('tasks.deleteTask') }}
-              </el-button>
-            </span>
-          </el-tooltip>
-        </DangerConfirm>
+          <template #default="{ confirm }">
+            <el-tooltip :content="disabledReason" :disabled="canManage || !disabledReason" placement="top">
+              <span>
+                <el-button size="small" type="danger" plain :disabled="!canManage || (!selectedTaskId && !selectedTaskIds.length)" @click="confirm">
+                  {{ selectedTaskIds.length ? t('tasks.deleteSelected', { count: selectedTaskIds.length }) : t('tasks.deleteTask') }}
+                </el-button>
+              </span>
+            </el-tooltip>
+          </template>
+        </ConfirmAction>
       </div>
     </div>
 
@@ -81,7 +85,6 @@ import { ElMessage } from 'element-plus'
 import { apiDelete, apiGet, asArray } from '../api/client'
 import { useI18n } from '../i18n'
 import ConfirmAction from './ConfirmAction.vue'
-import DangerConfirm from './DangerConfirm.vue'
 import TaskListPanel from './TaskListPanel.vue'
 import TaskRunPanel from './TaskRunPanel.vue'
 
