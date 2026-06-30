@@ -269,3 +269,5 @@
 - 结论：数据库页按 MySQL 节点和 Router 节点分别聚合健康状态；任一服务全部离线时显示“服务不可用”标签和红色提示，MySQL 主入口也不再展示陈旧 Primary 作为可用端点。卸载弹窗新增“密码一致”选项，可用一个密码填充所有目标服务器。
 - 问题：用户反馈 MySQL 全部重启后服务进程已 running，但 InnoDB Cluster 没有自动加入，要求页面增加“启动集群”操作。
 - 结论：数据库页 MySQL InnoDB Cluster 卡片新增“启动集群”按钮，提交 `/api/v2/database/mysql/clusters/start` 异步任务；后端通过 MySQL 模块调用 mysqlsh `dba.rebootClusterFromCompleteOutage` 并 rejoin 节点，随后检测 Primary 并把集群节点状态更新为 running。验证通过：pnpm test、pnpm web:build、git diff --check。
+- 问题：用户要求 MySQL 集群状态监测正常时，“启动集群”按钮置灰。
+- 结论：数据库页将 MySQL InnoDB Cluster 的 `nodeStatus === running` 视为集群已正常，此时禁用“启动集群”按钮，并在点击入口二次拦截。验证通过：pnpm web:build、git diff --check。

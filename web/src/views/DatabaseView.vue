@@ -57,7 +57,7 @@
                       type="primary"
                       plain
                       :loading="startingClusterId === group.id"
-                      :disabled="!canManageDatabase || (!!startingClusterId && startingClusterId !== group.id)"
+                      :disabled="isMysqlClusterStartDisabled(group)"
                       @click="startMysqlCluster(group)"
                     >
                       {{ t('database.startMysqlCluster') }}
@@ -937,6 +937,14 @@ function hasMysqlClusterStart(group: DatabaseGroup) {
   return group.app === 'mysql' && group.topology === 'innodb-cluster' && group.nodes.length > 0
 }
 
+function isMysqlClusterStartDisabled(group: DatabaseGroup) {
+  return !canManageDatabase.value || isMysqlClusterHealthy(group) || (!!startingClusterId.value && startingClusterId.value !== group.id)
+}
+
+function isMysqlClusterHealthy(group: DatabaseGroup) {
+  return group.nodeStatus === 'running'
+}
+
 function hasRouterClusterDelete(group: DatabaseGroup) {
   return group.routers.length > 0
 }
@@ -953,6 +961,9 @@ function openDeleteGroup(group: DatabaseGroup, kind: DeleteScopeKind) {
 async function startMysqlCluster(group: DatabaseGroup) {
   if (!canManageDatabase.value) {
     ElMessage.warning(deniedText.value)
+    return
+  }
+  if (isMysqlClusterHealthy(group)) {
     return
   }
   const instanceIds = group.nodes.map((node) => node.instance.id).filter(Boolean)
