@@ -271,3 +271,5 @@
 - 结论：数据库页 MySQL InnoDB Cluster 卡片新增“启动集群”按钮，提交 `/api/v2/database/mysql/clusters/start` 异步任务；后端通过 MySQL 模块调用 mysqlsh `dba.rebootClusterFromCompleteOutage` 并 rejoin 节点，随后检测 Primary 并把集群节点状态更新为 running。验证通过：pnpm test、pnpm web:build、git diff --check。
 - 问题：用户要求 MySQL 集群状态监测正常时，“启动集群”按钮置灰。
 - 结论：数据库页将 MySQL InnoDB Cluster 的 `nodeStatus === running` 视为集群已正常，此时禁用“启动集群”按钮，并在点击入口二次拦截。验证通过：pnpm web:build、git diff --check。
+- 问题：用户要求 MySQL InnoDB Cluster 只有 3 个 MySQL 基础服务全部掉线时才能使用“启动集群”，部分服务或服务已启动场景也要置灰。
+- 结论：MySQL 集群检测在 `mysqladmin ping` 成功后记录 `runtimeStatus=running`，即使后续 Primary 检测失败也保留该基础服务状态；数据库页“启动集群”按钮改为仅当 3 个 MySQL 节点 runtime 都为 offline 时可用。验证通过：pnpm test、pnpm web:build、git diff --check。

@@ -298,6 +298,48 @@ func TestServiceCheckInnoDBClusterRecordsCurrentPrimary(t *testing.T) {
 	}
 }
 
+func TestServiceCheckInnoDBClusterRecordsRuntimeWhenPrimaryMissing(t *testing.T) {
+	clusterID := "mysql_cluster_test"
+	now := time.Now()
+	instances := []store.AppInstance{
+		mysqlClusterInstance("app-1", "srv-1", clusterID, "10.0.0.1:3306", now),
+		mysqlClusterInstance("app-2", "srv-2", clusterID, "10.0.0.2:3306", now),
+		mysqlClusterInstance("app-3", "srv-3", clusterID, "10.0.0.3:3306", now),
+	}
+	s := &fakeStore{
+		servers: map[string]store.Server{
+			"srv-1": {ID: "srv-1", Name: "mysql-1", Host: "10.0.0.1", DeployDir: "/aifar/apps"},
+			"srv-2": {ID: "srv-2", Name: "mysql-2", Host: "10.0.0.2", DeployDir: "/aifar/apps"},
+			"srv-3": {ID: "srv-3", Name: "mysql-3", Host: "10.0.0.3", DeployDir: "/aifar/apps"},
+		},
+		instances: instances,
+	}
+	remote := &fakeRemote{}
+	service := NewService(s, remote)
+
+	_, err := service.Check(context.Background(), CheckRequest{
+		Instance:        instances[0],
+		Server:          s.servers["srv-1"],
+		Language:        "en",
+		DefaultPassword: "Oversea.123",
+	}, fakeLogger{}, nil)
+	if err == nil {
+		t.Fatal("expected missing primary to fail cluster check")
+	}
+	metadata := map[string]any{}
+	if err := json.Unmarshal([]byte(s.instances[0].Metadata), &metadata); err != nil {
+		t.Fatal(err)
+	}
+	lastCheck, _ := metadata["lastCheck"].(map[string]any)
+	details, _ := lastCheck["details"].(map[string]any)
+	if got := details["runtimeStatus"]; got != "running" {
+		t.Fatalf("expected runtimeStatus running after mysqladmin ping succeeded, got %v", got)
+	}
+	if s.instances[0].Status != "failed" {
+		t.Fatalf("expected cluster check status failed, got %s", s.instances[0].Status)
+	}
+}
+
 func TestServiceStartsInnoDBClusterAndMarksAllNodesRunning(t *testing.T) {
 	clusterID := "mysql_cluster_test"
 	now := time.Now()

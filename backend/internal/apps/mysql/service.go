@@ -475,11 +475,12 @@ func (s Service) Check(ctx context.Context, req CheckRequest, log Logger, target
 
 	fail := func(err error) (CheckResult, error) {
 		msg := fmt.Sprintf(copy.CheckFailed, err)
-		_ = s.markInstanceStatus(req.Instance, "failed", map[string]any{
-			"checkedAt": details["checkedAt"],
-			"topology":  topology,
-			"error":     err.Error(),
-		})
+		failureDetails := map[string]any{}
+		for key, value := range details {
+			failureDetails[key] = value
+		}
+		failureDetails["error"] = err.Error()
+		_ = s.markInstanceStatus(req.Instance, "failed", failureDetails)
 		finishTarget(recorder, target, "failed", msg)
 		return CheckResult{Status: "failed", Message: msg, Details: details}, err
 	}
@@ -487,8 +488,10 @@ func (s Service) Check(ctx context.Context, req CheckRequest, log Logger, target
 	if err := step(1, "check-runtime", copy.CheckRuntime, func() error {
 		return s.checkMySQLRuntime(ctx, req.Server, req.Instance, req.DefaultPassword, logForServer)
 	}); err != nil {
+		details["runtimeStatus"] = "offline"
 		return fail(err)
 	}
+	details["runtimeStatus"] = "running"
 
 	primaryEndpoint := ""
 	nextStep := 2

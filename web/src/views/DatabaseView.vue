@@ -938,11 +938,22 @@ function hasMysqlClusterStart(group: DatabaseGroup) {
 }
 
 function isMysqlClusterStartDisabled(group: DatabaseGroup) {
-  return !canManageDatabase.value || isMysqlClusterHealthy(group) || (!!startingClusterId.value && startingClusterId.value !== group.id)
+  return !canManageDatabase.value || !isMysqlClusterCompleteOutage(group) || (!!startingClusterId.value && startingClusterId.value !== group.id)
 }
 
-function isMysqlClusterHealthy(group: DatabaseGroup) {
-  return group.nodeStatus === 'running'
+function isMysqlClusterCompleteOutage(group: DatabaseGroup) {
+  return group.nodes.length >= 3 && group.nodes.every((node) => mysqlRuntimeHealth(node) === 'offline')
+}
+
+function mysqlRuntimeHealth(node: DatabaseNode) {
+  const runtimeStatus = stringValue(node.metadata.lastCheck?.details?.runtimeStatus || node.metadata.mysqlRuntimeStatus || node.metadata.runtimeStatus)
+  if (['ok', 'success', 'running', 'available'].includes(runtimeStatus)) {
+    return 'online'
+  }
+  if (['failed', 'error', 'missing', 'stopped', 'offline', 'unavailable'].includes(runtimeStatus)) {
+    return 'offline'
+  }
+  return nodeHealth(node)
 }
 
 function hasRouterClusterDelete(group: DatabaseGroup) {
@@ -963,7 +974,7 @@ async function startMysqlCluster(group: DatabaseGroup) {
     ElMessage.warning(deniedText.value)
     return
   }
-  if (isMysqlClusterHealthy(group)) {
+  if (!isMysqlClusterCompleteOutage(group)) {
     return
   }
   const instanceIds = group.nodes.map((node) => node.instance.id).filter(Boolean)
