@@ -33,10 +33,6 @@ export const aifarMessages = {
     networkName: 'Docker 网络',
     appCPUs: 'CPU 限制',
     appMemoryLimit: '内存限制',
-    gatewayPort: 'Gateway 端口',
-    webPort: 'Web 端口',
-    nacosWebPort: 'Nacos Web 端口',
-    nacosApiPort: 'Nacos API 端口',
     nacosUser: 'Nacos 用户',
     nacosPassword: 'Nacos 密码',
     nacosNamespace: 'Nacos 命名空间',
@@ -86,10 +82,6 @@ export const aifarMessages = {
     networkName: 'Docker network',
     appCPUs: 'CPU limit',
     appMemoryLimit: 'Memory limit',
-    gatewayPort: 'Gateway port',
-    webPort: 'Web port',
-    nacosWebPort: 'Nacos web port',
-    nacosApiPort: 'Nacos API port',
     nacosUser: 'Nacos user',
     nacosPassword: 'Nacos password',
     nacosNamespace: 'Nacos namespace',
@@ -171,10 +163,6 @@ export function aifarInstallDialogProps(locale?: string, context?: AppInstallDia
       },
       requiredText('appCPUs', copy.appCPUs, '2.0', copy),
       requiredText('appMemoryLimit', copy.appMemoryLimit, '2GB', copy),
-      portField('gatewayPort', copy.gatewayPort, 38000, copy),
-      portField('webPort', copy.webPort, 8080, copy),
-      portField('nacosWebPort', copy.nacosWebPort, 30099, copy),
-      portField('nacosApiPort', copy.nacosApiPort, 31099, copy),
       requiredText('nacosUser', copy.nacosUser, 'nacos', copy),
       {
         ...requiredText('nacosPassword', copy.nacosPassword, 'oversea.nacos', copy),
@@ -318,15 +306,29 @@ function redisInstanceOptions(context?: AppInstallDialogContext): AppInstallFiel
   return (context?.instances ?? [])
     .filter((instance) => instance.app === 'redis')
     .map((instance) => ({
-      label: dependencyLabel(instance, context, 'Redis'),
+      label: redisDependencyLabel(instance, context),
       value: instance.id
     }))
 }
 
-function dependencyLabel(instance: AppInstanceOption, context: AppInstallDialogContext | undefined, prefix: string) {
+function redisDependencyLabel(instance: AppInstanceOption, context: AppInstallDialogContext | undefined) {
   const metadata = parseMetadata(instance.metadata)
   const topology = String(instance.topology || metadata.topology || '').trim()
-  const endpoint = String(metadata.endpoint || metadata.clusterEndpoint || metadata.currentMasterEndpoint || '').trim()
+  if (topology.toLowerCase() !== 'sentinel') {
+    return dependencyLabel(instance, context, 'Redis')
+  }
+  const sentinelPort = numberFromMetadata(metadata.sentinelPort, 26379)
+  const sentinelEndpoint =
+    endpointWithDefaultPort(firstEndpoint(metadata.sentinelEndpoint), sentinelPort) ||
+    redisSentinelEndpointForServer(instance, context, metadata, sentinelPort) ||
+    endpointFromHost(firstEndpoint(metadata.endpoint) || firstEndpoint(metadata.currentMasterEndpoint), sentinelPort)
+  return dependencyLabel(instance, context, 'Redis', sentinelEndpoint)
+}
+
+function dependencyLabel(instance: AppInstanceOption, context: AppInstallDialogContext | undefined, prefix: string, preferredEndpoint?: string) {
+  const metadata = parseMetadata(instance.metadata)
+  const topology = String(instance.topology || metadata.topology || '').trim()
+  const endpoint = String(preferredEndpoint || metadata.endpoint || metadata.clusterEndpoint || metadata.currentMasterEndpoint || '').trim()
   const server = (context?.servers ?? []).find((item) => item.id === instance.serverId)
   const serverText = server ? `${server.name || server.id} (${server.host})` : instance.serverId
   const parts = [prefix]
@@ -339,6 +341,78 @@ function dependencyLabel(instance: AppInstanceOption, context: AppInstallDialogC
     parts.push(serverText)
   }
   return parts.join(' / ')
+}
+
+function firstEndpoint(value: unknown) {
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const endpoint = String(item ?? '').trim()
+      if (endpoint) {
+        return endpoint
+      }
+    }
+    return ''
+  }
+  return String(value ?? '').trim()
+}
+
+function redisSentinelEndpointForServer(
+  instance: AppInstanceOption,
+  context: AppInstallDialogContext | undefined,
+  metadata: Record<string, unknown>,
+  port: number
+) {
+  const server = (context?.servers ?? []).find((item) => item.id === instance.serverId)
+  const host = String(server?.host ?? '').trim()
+  if (!host) {
+    return ''
+  }
+  const matching = endpointList(metadata.sentinelEndpoints).find((endpoint) => endpointHost(endpoint) === host)
+  return endpointWithDefaultPort(matching, port) || `${host}:${port}`
+}
+
+function endpointList(value: unknown) {
+  if (Array.isArray(value)) {
+    return value.map((item) => String(item ?? '').trim()).filter(Boolean)
+  }
+  return String(value ?? '')
+    .split(/[,\n\r;]+/)
+    .map((item) => item.trim())
+    .filter(Boolean)
+}
+
+function endpointWithDefaultPort(endpoint: string | undefined, port: number) {
+  const text = String(endpoint ?? '').trim()
+  if (!text) {
+    return ''
+  }
+  return text.includes(':') ? text : `${text}:${port}`
+}
+
+function endpointFromHost(endpoint: string, port: number) {
+  const host = endpointHost(endpoint)
+  return host ? `${host}:${port}` : ''
+}
+
+function endpointHost(endpoint: string | undefined) {
+  let text = String(endpoint ?? '').trim()
+  if (!text) {
+    return ''
+  }
+  const schemeIndex = text.indexOf('://')
+  if (schemeIndex >= 0) {
+    text = text.slice(schemeIndex + 3)
+  }
+  const slashIndex = text.indexOf('/')
+  if (slashIndex >= 0) {
+    text = text.slice(0, slashIndex)
+  }
+  return text.split(':')[0]?.trim() ?? ''
+}
+
+function numberFromMetadata(value: unknown, fallback: number) {
+  const parsed = Number(value)
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback
 }
 
 function parseMetadata(value?: string) {

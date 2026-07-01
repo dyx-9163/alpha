@@ -375,3 +375,11 @@
 - 结论：AIFAR 安装弹窗新增 MySQL/Redis 来源选择，可选择已登记实例或手动填写；后端安装参数会解析 MySQL Router、Redis Sentinel/Cluster/Standalone 端点，并把 Spring/AIFAR 连接环境变量写入部署 `.env`，实例 metadata 不保存数据库或 Redis 密码。验证通过：pnpm test、pnpm web:build、git diff --check。
 - 问题：用户要求将部署链路和 Docker 资源中的 alpha 命名统一改为 aifar。
 - 结论：AIFAR 默认网络、Nacos 数据库名、SQL 文件名、安装脚本、前端默认值、Docker 镜像/容器/JAR/插件文件名、Nginx 代理和离线前端可见标题已统一为 aifar；保留 Java/Nacos 插件和编译产物中的 `alpha.*` 技术类名、CSS 前缀/标准库术语等运行时内部引用，避免破坏当前 Jar 和前端包。验证通过：pnpm test、pnpm web:build、git diff --check。
+- 问题：用户反馈 AIFAR 安装弹窗选择已部署 Redis Sentinel 时下拉项展示的是 6379，未体现 Sentinel 26379 端口。
+- 结论：AIFAR 安装弹窗的 Redis Sentinel 实例标签改为优先展示 `sentinelEndpoint`/`sentinelEndpoints`，缺失时按服务器主机和 `sentinelPort` 兜底，因此下拉项会显示 26379；非 Sentinel Redis 仍展示原数据端口。验证通过：pnpm web:build、git diff --check。
+- 问题：用户反馈 Redis Sentinel 下拉项虽然显示 26379，但三条都显示同一个 Sentinel 地址，无法看到实际节点列表。
+- 结论：Redis Sentinel 实例标签改为优先按当前实例的 `sentinelEndpoint` 展示；没有单节点 endpoint 时按当前实例所属服务器主机从 `sentinelEndpoints` 列表匹配，仍缺失时用当前实例数据 endpoint 的 host 加 `sentinelPort` 兜底，因此每条选项会显示各自实际 Sentinel 节点地址。验证通过：pnpm web:build、git diff --check。
+- 问题：用户要求新增 Nacos 部署应用，安装包来自 `resources/nacos`，并支持单体和 3 节点 cluster mode。
+- 结论：新增 Nacos 前后端应用模块，后端从 `resources/nacos` 选择 Nacos server 与 x64/aarch64 JDK 包，支持 standalone 与固定 3 节点 cluster 安装、卸载和运行检测；前端应用商店新增 Nacos 安装弹窗，cluster 模式要求选择 3 个节点并填写外部 MySQL 连接。验证通过：pnpm test、pnpm web:build、git diff --check。
+- 问题：用户认为 AIFAR 安装弹窗里的 Gateway/Web/Nacos Web/Nacos API 端口配置无用，要求去掉。
+- 结论：AIFAR 安装弹窗移除这 4 个端口字段，后端仍使用默认端口值；验证通过：pnpm web:build、git diff --check。
