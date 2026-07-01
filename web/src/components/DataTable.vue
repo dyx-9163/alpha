@@ -1,5 +1,5 @@
 <template>
-  <div class="data-table">
+  <div class="data-table" :style="tableStyle">
     <div v-if="$slots.toolbar || title" class="data-table-toolbar">
       <strong v-if="title">{{ title }}</strong>
       <slot name="toolbar" />
@@ -40,6 +40,8 @@
 </template>
 
 <script setup lang="ts">
+import { computed } from 'vue'
+
 type TableColumn = {
   prop?: string
   label?: string
@@ -61,6 +63,7 @@ const props = withDefaults(defineProps<{
   height?: string | number
   loading?: boolean
   fit?: boolean
+  tableWidth?: string | number
 }>(), {
   rowKey: 'id',
   height: '100%',
@@ -70,6 +73,17 @@ const props = withDefaults(defineProps<{
 const emit = defineEmits<{
   selectionChange: [rows: Record<string, unknown>[]]
 }>()
+
+const tableStyle = computed(() => {
+  if (props.tableWidth === undefined || props.tableWidth === null || props.tableWidth === '') {
+    return undefined
+  }
+  const width = typeof props.tableWidth === 'number' ? `${props.tableWidth}px` : props.tableWidth
+  return {
+    width,
+    maxWidth: '100%'
+  }
+})
 
 function columnKey(column: TableColumn) {
   return column.type || column.prop || column.label || column.slot || 'column'

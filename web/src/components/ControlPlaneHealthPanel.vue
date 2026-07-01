@@ -10,7 +10,7 @@
         <span v-else>{{ item.value || '-' }}</span>
       </template>
     </KeyValueGrid>
-    <el-table :data="healthRows" v-loading="loading" :fit="false">
+    <el-table :data="healthRows" v-loading="loading" :fit="false" style="width: 1080px; max-width: 100%;">
       <el-table-column prop="name" :label="t('common.module')" width="180" />
       <el-table-column :label="t('common.status')" width="120">
         <template #default="{ row }"><StatusTag :status="row.status" /></template>

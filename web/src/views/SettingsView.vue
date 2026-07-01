@@ -63,7 +63,7 @@
       </KeyValueGrid>
 
       <h2 class="settings-title">{{ t('settings.moduleStatus') }}</h2>
-      <el-table :data="moduleRows" :fit="false">
+      <el-table :data="moduleRows" :fit="false" style="width: 1150px; max-width: 100%;">
         <el-table-column prop="module" :label="t('common.module')" width="160" />
         <el-table-column :label="t('common.status')" width="140"><template #default><span class="status-pill success">{{ t('settings.connected') }}</span></template></el-table-column>
         <el-table-column :label="t('common.provider')" width="140"><template #default>{{ t('common.real') }}</template></el-table-column>

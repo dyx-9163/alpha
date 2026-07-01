@@ -23,6 +23,7 @@
       :height="260"
       :loading="loading"
       :fit="false"
+      :table-width="880"
     >
       <template #toolbar>
         <el-button size="small" :disabled="!canManage" @click="refresh">{{ t('common.refresh') }}</el-button>
