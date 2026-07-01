@@ -559,8 +559,16 @@ func (s Service) Check(ctx context.Context, req CheckRequest, log Logger, target
 	role := instanceRole(req.Instance)
 	sentinelTopology := redisSentinelTopology{}
 	nextStep := 2
+	if topology == "sentinel" {
+		if err := step(nextStep, "ensure-service-access", copyWithFallback(copy.EnsureServiceAccess, "ensure Redis service access"), func() error {
+			return s.ensureRedisServiceAccess(ctx, req.Server, req.Instance, logForServer)
+		}); err != nil {
+			return fail(err)
+		}
+		nextStep++
+	}
 	if topology == "sentinel" || topology == "cluster" {
-		if err := step(2, "detect-role", copyWithFallback(copy.DetectRole, "检测 Redis 当前角色"), func() error {
+		if err := step(nextStep, "detect-role", copyWithFallback(copy.DetectRole, "检测 Redis 当前角色"), func() error {
 			var detectErr error
 			role, sentinelTopology, detectErr = s.detectRedisRole(ctx, req.Server, req.Instance, req.DefaultPassword, logForServer)
 			return detectErr
@@ -573,7 +581,7 @@ func (s Service) Check(ctx context.Context, req CheckRequest, log Logger, target
 			details["replicaEndpoints"] = sentinelTopology.ReplicaEndpoints
 			details["sentinelEndpoints"] = sentinelTopology.SentinelEndpoints
 		}
-		nextStep = 3
+		nextStep++
 	}
 
 	if err := step(nextStep, "update-instance", copyWithFallback(copy.UpdateInstance, "更新 Redis 实例状态"), func() error {
@@ -784,6 +792,9 @@ func redisSentinelStepsForTarget(copy Copy, runsSentinel bool) []stepDef {
 func redisCheckStepsFor(topology string, copy Copy) []stepDef {
 	steps := []stepDef{
 		{Name: "check-runtime", Title: copyWithFallback(copy.CheckRuntime, "检查 Redis 运行状态")},
+	}
+	if topology == "sentinel" {
+		steps = append(steps, stepDef{Name: "ensure-service-access", Title: copyWithFallback(copy.EnsureServiceAccess, "ensure Redis service access")})
 	}
 	if topology == "sentinel" || topology == "cluster" {
 		steps = append(steps, stepDef{Name: "detect-role", Title: copyWithFallback(copy.DetectRole, "检测 Redis 当前角色")})

@@ -185,6 +185,11 @@ func TestRedisSentinelScriptUsesConfiguredMasterName(t *testing.T) {
 		!strings.Contains(script, `allow_selinux_ports redis_port_t "$REDIS_PORT" "$SENTINEL_PORT"`) {
 		t.Fatalf("sentinel script should open Redis and Sentinel ports:\n%s", script)
 	}
+	openIdx := strings.Index(script, `open_firewall_ports "$REDIS_PORT" "$SENTINEL_PORT"`)
+	startIdx := strings.Index(script, `systemctl enable --now "$SENTINEL_SERVICE"`)
+	if openIdx < 0 || startIdx < 0 || openIdx > startIdx {
+		t.Fatalf("sentinel script should open service ports before starting Sentinel:\n%s", script)
+	}
 }
 
 func TestRedisClusterScriptOpensServiceAndBusPorts(t *testing.T) {

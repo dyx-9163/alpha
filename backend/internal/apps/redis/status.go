@@ -5,10 +5,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
 	"aifar-deployment/backend/internal/installer/installerkit"
+	"aifar-deployment/backend/internal/installer/selinux"
 	"aifar-deployment/backend/internal/store"
 )
 
@@ -57,6 +59,53 @@ func (s Service) checkRedisRuntime(ctx context.Context, server store.Server, ins
 	}
 	_, err := installerkit.Run(ctx, s.remote, server, resolveRoot+"\n"+strings.Join(checks, " && "), log, "redis remote command failed")
 	return err
+}
+
+func (s Service) ensureRedisServiceAccess(ctx context.Context, server store.Server, instance store.AppInstance, log Logger) error {
+	topology := instanceTopology(instance)
+	role := instanceRole(instance)
+	var ports []int
+	if role != "sentinel" {
+		ports = append(ports, instancePort(instance))
+	}
+	if topology == "sentinel" && instanceHasSentinel(instance) {
+		ports = append(ports, instanceSentinelPort(instance))
+	}
+	ports = uniqueRedisPorts(ports)
+	if len(ports) == 0 {
+		return nil
+	}
+	quotedPorts := make([]string, 0, len(ports))
+	for _, port := range ports {
+		quotedPorts = append(quotedPorts, installerkit.ShellQuote(strconv.Itoa(port)))
+	}
+	portArgs := strings.Join(quotedPorts, " ")
+	cmd := fmt.Sprintf(`SUDO=""
+if [ "$(id -u)" != "0" ]; then
+  SUDO="sudo -n"
+fi
+%s
+open_firewall_ports %s
+allow_selinux_ports redis_port_t %s`,
+		selinux.ServiceAccessHelpers(),
+		portArgs,
+		portArgs,
+	)
+	_, err := installerkit.Run(ctx, s.remote, server, cmd, log, "redis service access rule failed")
+	return err
+}
+
+func uniqueRedisPorts(ports []int) []int {
+	seen := map[int]bool{}
+	out := make([]int, 0, len(ports))
+	for _, port := range ports {
+		if port <= 0 || port > 65535 || seen[port] {
+			continue
+		}
+		seen[port] = true
+		out = append(out, port)
+	}
+	return out
 }
 
 func (s Service) detectRedisRole(ctx context.Context, server store.Server, instance store.AppInstance, defaultPassword string, log Logger) (string, redisSentinelTopology, error) {

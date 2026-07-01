@@ -309,3 +309,5 @@
 - 结论：MySQL 检测新增 systemd/端口级运行时探测，集群检查失败时仍记录单体运行状态；数据库页节点在线展示改用 MySQL 运行时健康，集群状态仍按 Primary/集群健康判定，因此单体全在线但集群不可用时可启用“启动集群”。验证通过：go test ./internal/apps/mysql、pnpm test、pnpm web:build、git diff --check。
 - 问题：用户询问 Redis Sentinel 只有 192.168.74.133:26379 从 Navicat 连接超时，131/132 正常的原因。
 - 结论：截图显示 133 的 Sentinel 配置和监听都存在，Navicat 报 timed out 更像 133 主机防火墙/安全策略拦截 26379，而不是密码、组名或 bind 配置错误；建议从客户端和 131/132 对 133:26379 做 TCP 连通性测试，并检查/放行 133 的 firewalld/iptables/nftables 26379/tcp。
+- 问题：用户发现 Redis Sentinel 的 192.168.74.133 节点监听了 26379，但 firewalld 未自动添加 26379/tcp。
+- 结论：Redis Sentinel 配置脚本改为启动前后幂等确保 Redis/Sentinel 端口的 firewalld 与 SELinux 规则；Redis Sentinel 检测任务也会补齐既有实例缺失的服务访问规则，重新执行监测即可修复缺失的 26379/tcp。验证通过：go test ./internal/apps/redis ./internal/installer/selinux、pnpm test、git diff --check。

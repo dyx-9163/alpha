@@ -36,6 +36,7 @@ type Copy struct {
 	ClusterNeedNodes          string
 	TopologyUnsupported       string
 	CheckRuntime              string
+	EnsureServiceAccess       string
 	DetectRole                string
 	UpdateInstance            string
 	CheckFailed               string
@@ -89,6 +90,7 @@ func CopyFor(lang string) Copy {
 			ClusterNeedNodes:          "Redis Cluster requires at least 3 target servers",
 			TopologyUnsupported:       "Redis topology is not supported: %s",
 			CheckRuntime:              "check Redis runtime",
+			EnsureServiceAccess:       "ensure Redis service access",
 			DetectRole:                "detect Redis current role",
 			UpdateInstance:            "update Redis instance status",
 			CheckFailed:               "Redis check failed: %s",
@@ -128,6 +130,7 @@ func CopyFor(lang string) Copy {
 			SentinelMasterNameInvalid: "Redis Sentinel 监控组名称只能包含字母、数字、点、横线和下划线，最多 64 个字符",
 			ClusterNeedNodes:          "Redis Cluster 至少需要 3 台目标服务器",
 			TopologyUnsupported:       "Redis 不支持该拓扑：%s",
+			EnsureServiceAccess:       "确保 Redis 服务访问端口",
 		}
 	}
 }

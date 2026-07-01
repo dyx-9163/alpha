@@ -342,10 +342,15 @@ func TestServiceChecksRedisSentinelAndUpdatesCurrentMasterRoles(t *testing.T) {
 			t.Fatalf("expected detected sentinel endpoint %s to be recorded, got %v", endpoint, metadata["sentinelEndpoints"])
 		}
 	}
-	if !strings.Contains(remote.joinedCommands(), "SENTINEL get-master-addr-by-name") {
+	joinedCommands := remote.joinedCommands()
+	if !strings.Contains(joinedCommands, "open_firewall_ports '6379' '26379'") ||
+		!strings.Contains(joinedCommands, "allow_selinux_ports redis_port_t '6379' '26379'") {
+		t.Fatalf("expected check to ensure Redis Sentinel service access rules: %s", joinedCommands)
+	}
+	if !strings.Contains(joinedCommands, "SENTINEL get-master-addr-by-name") {
 		t.Fatal("expected check to query Redis Sentinel current master")
 	}
-	if !strings.Contains(remote.joinedCommands(), "SENTINEL replicas") || !strings.Contains(remote.joinedCommands(), "SENTINEL sentinels") {
+	if !strings.Contains(joinedCommands, "SENTINEL replicas") || !strings.Contains(joinedCommands, "SENTINEL sentinels") {
 		t.Fatal("expected check to query Redis Sentinel replicas and sentinel peers")
 	}
 }
