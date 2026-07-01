@@ -33,7 +33,7 @@ const (
 	defaultMemoryLimit   = "2GB"
 	defaultGatewayPort   = 38000
 	defaultWebPort       = 8080
-	defaultNacosWebPort  = 9849
+	defaultNacosWebPort  = 8848
 	defaultNacosAPIPort  = 9848
 	defaultDBPort        = 3306
 	defaultRedisHost     = "localhost"
@@ -47,7 +47,6 @@ const (
 )
 
 var serviceOrder = []string{
-	"nacos",
 	"oauth",
 	"permission",
 	"system",
@@ -71,7 +70,6 @@ var reverseServiceOrder = []string{
 	"system",
 	"permission",
 	"oauth",
-	"nacos",
 }
 
 type InstallOptions struct {
@@ -83,6 +81,9 @@ type InstallOptions struct {
 	WebPort                 int
 	NacosWebPort            int
 	NacosAPIPort            int
+	NacosSource             string
+	NacosInstanceID         string
+	NacosHost               string
 	NacosUser               string
 	NacosPassword           string
 	NacosNamespace          string
@@ -123,6 +124,7 @@ func optionsFromParameters(parameters map[string]any) InstallOptions {
 		WebPort:        defaultWebPort,
 		NacosWebPort:   defaultNacosWebPort,
 		NacosAPIPort:   defaultNacosAPIPort,
+		NacosSource:    dependencyManual,
 		NacosUser:      defaultNacosUser,
 		NacosPassword:  defaultNacosPassword,
 		NacosNamespace: defaultNacosNS,
@@ -143,7 +145,11 @@ func optionsFromParameters(parameters map[string]any) InstallOptions {
 	opts.GatewayPort = intParam(parameters, "gatewayPort", opts.GatewayPort)
 	opts.WebPort = intParam(parameters, "webPort", opts.WebPort)
 	opts.NacosWebPort = intParam(parameters, "nacosWebPort", opts.NacosWebPort)
+	opts.NacosWebPort = intParam(parameters, "nacosPort", opts.NacosWebPort)
 	opts.NacosAPIPort = intParam(parameters, "nacosApiPort", opts.NacosAPIPort)
+	opts.NacosSource = normalizeDependencySource(stringParam(parameters, "nacosSource", opts.NacosSource))
+	opts.NacosInstanceID = stringParam(parameters, "nacosInstanceId", opts.NacosInstanceID)
+	opts.NacosHost = stringParam(parameters, "nacosHost", opts.NacosHost)
 	opts.NacosUser = stringParam(parameters, "nacosUser", opts.NacosUser)
 	opts.NacosPassword = stringParam(parameters, "nacosPassword", opts.NacosPassword)
 	opts.NacosNamespace = stringParam(parameters, "nacosNamespace", opts.NacosNamespace)
@@ -181,6 +187,12 @@ func (o InstallOptions) Validate() error {
 	if strings.TrimSpace(o.DBNameNacos) == "" {
 		return fmt.Errorf("nacos database name is required")
 	}
+	if o.NacosSource == dependencyExisting && strings.TrimSpace(o.NacosInstanceID) == "" {
+		return fmt.Errorf("nacos instance is required")
+	}
+	if strings.TrimSpace(o.NacosHost) == "" {
+		return fmt.Errorf("nacos host is required")
+	}
 	if o.RedisSource == dependencyExisting && strings.TrimSpace(o.RedisInstanceID) == "" {
 		return fmt.Errorf("redis instance is required")
 	}
@@ -214,6 +226,7 @@ func (o InstallOptions) Validate() error {
 		"networkName":    o.NetworkName,
 		"appCPUs":        o.AppCPUs,
 		"appMemoryLimit": o.AppMemoryLimit,
+		"nacosHost":      o.NacosHost,
 		"nacosUser":      o.NacosUser,
 		"nacosPassword":  o.NacosPassword,
 		"nacosNamespace": o.NacosNamespace,
@@ -311,7 +324,7 @@ func VerifyBundle(bundle Bundle) error {
 	if _, err := os.Stat(filepath.Join(bundle.AppDir, ".env")); err != nil {
 		return fmt.Errorf("AIFAR common .env is required: %w", err)
 	}
-	for _, service := range []string{"nacos", "gateway", "web-vue3"} {
+	for _, service := range []string{"gateway", "web-vue3"} {
 		if _, err := os.Stat(filepath.Join(bundle.AppDir, service, "docker-compose.yaml")); err != nil {
 			return fmt.Errorf("AIFAR service %s docker-compose.yaml is required: %w", service, err)
 		}
@@ -342,6 +355,12 @@ func CreateBundleArchive(bundle Bundle) (string, error) {
 			return err
 		}
 		if rel == "." {
+			return nil
+		}
+		if skipBundleEntry(rel) {
+			if entry.IsDir() {
+				return filepath.SkipDir
+			}
 			return nil
 		}
 		info, err := entry.Info()
@@ -381,6 +400,11 @@ func CreateBundleArchive(bundle Bundle) (string, error) {
 		return "", err
 	}
 	return path, nil
+}
+
+func skipBundleEntry(rel string) bool {
+	slash := filepath.ToSlash(rel)
+	return slash == appBundleDir+"/nacos" || strings.HasPrefix(slash, appBundleDir+"/nacos/")
 }
 
 func inferAppDir(pathValue string) string {

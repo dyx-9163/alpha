@@ -11,15 +11,21 @@ import (
 )
 
 func (s Service) resolveInstallOptions(options InstallOptions) (InstallOptions, error) {
+	options.NacosSource = normalizeDependencySource(options.NacosSource)
 	options.DBSource = normalizeDependencySource(options.DBSource)
 	options.RedisSource = normalizeDependencySource(options.RedisSource)
 	options.RedisMode = normalizeRedisMode(options.RedisMode)
-	if options.DBSource != dependencyExisting && options.RedisSource != dependencyExisting {
+	if options.NacosSource != dependencyExisting && options.DBSource != dependencyExisting && options.RedisSource != dependencyExisting {
 		return options, nil
 	}
 	instances, err := s.store.ListAppInstances()
 	if err != nil {
 		return options, err
+	}
+	if options.NacosSource == dependencyExisting {
+		if err := s.resolveNacosDependency(&options, instances); err != nil {
+			return options, err
+		}
 	}
 	if options.DBSource == dependencyExisting {
 		if err := s.resolveMySQLDependency(&options, instances); err != nil {
@@ -32,6 +38,22 @@ func (s Service) resolveInstallOptions(options InstallOptions) (InstallOptions, 
 		}
 	}
 	return options, nil
+}
+
+func (s Service) resolveNacosDependency(options *InstallOptions, instances []store.AppInstance) error {
+	selected, ok := findDependencyInstance(instances, options.NacosInstanceID)
+	if !ok {
+		return fmt.Errorf("selected nacos instance was not found")
+	}
+	if selected.App != "nacos" {
+		return fmt.Errorf("selected nacos instance is not a Nacos instance")
+	}
+	endpoint, ok := s.instanceEndpoint(selected, defaultNacosWebPort, []string{"endpoint", "clusterEndpoint"}, []string{"port"})
+	if !ok {
+		return fmt.Errorf("selected nacos instance has no usable endpoint")
+	}
+	options.NacosHost = endpoint.Host
+	return nil
 }
 
 func (s Service) resolveMySQLDependency(options *InstallOptions, instances []store.AppInstance) error {

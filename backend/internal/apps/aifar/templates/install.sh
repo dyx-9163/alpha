@@ -17,6 +17,7 @@ GATEWAY_PORT={{ quote .Options.GatewayPort }}
 WEB_VUE3_PORT={{ quote .Options.WebPort }}
 NACOS_PORT_WEB={{ quote .Options.NacosWebPort }}
 NACOS_PORT_API={{ quote .Options.NacosAPIPort }}
+NACOS_CONNECT_HOST={{ quote .Options.NacosHost }}
 NACOS_USER={{ quote .Options.NacosUser }}
 NACOS_PASSWORD={{ quote .Options.NacosPassword }}
 NACOS_NS={{ quote .Options.NacosNamespace }}
@@ -113,27 +114,6 @@ resolve_system_timezone() {
   esac
 }
 
-patch_nacos_server_port() {
-  props="$APP_DIR/nacos/conf/application.properties"
-  [ -f "$props" ] || return 0
-  tmp="${props}.tmp"
-  awk -v port="$NACOS_PORT_WEB" '
-    BEGIN { patched = 0 }
-    /^server[.]port=/ {
-      print "server.port=" port
-      patched = 1
-      next
-    }
-    { print }
-    END {
-      if (!patched) {
-        print "server.port=" port
-      }
-    }
-  ' "$props" > "$tmp"
-  mv "$tmp" "$props"
-}
-
 sql_literal_escape() {
   printf "%s" "$1" | sed "s/'/''/g"
 }
@@ -150,7 +130,7 @@ patch_nacos_sql_namespace() {
 down_existing() {
   [ -d "$APP_DIR" ] || return 0
   prepare_compose_networks || true
-  for service in web-vue3 gateway meeting contacts im message file system permission oauth nacos; do
+  for service in web-vue3 gateway meeting contacts im message file system permission oauth; do
     [ -f "$APP_DIR/$service/docker-compose.yaml" ] || continue
     (
       cd "$APP_DIR/$service"
@@ -191,7 +171,7 @@ set_env NACOS_PORT_WEB "$NACOS_PORT_WEB" "$ROOT_ENV"
 set_env NACOS_PORT_API "$NACOS_PORT_API" "$ROOT_ENV"
 set_env NACOS_USER "$NACOS_USER" "$ROOT_ENV"
 set_env NACOS_PASSWORD "$NACOS_PASSWORD" "$ROOT_ENV"
-set_env NACOS_HOST "aifar-nacos:${NACOS_PORT_WEB}" "$ROOT_ENV"
+set_env NACOS_HOST "${NACOS_CONNECT_HOST}:${NACOS_PORT_WEB}" "$ROOT_ENV"
 set_env NACOS_NS "$NACOS_NS" "$ROOT_ENV"
 set_env AIFAR_DB_HOST "$DB_HOST" "$ROOT_ENV"
 set_env AIFAR_DB_PORT "$DB_PORT" "$ROOT_ENV"
@@ -215,25 +195,7 @@ set_env SPRING_DATA_REDIS_DATABASE "$REDIS_DATABASE" "$ROOT_ENV"
 set_env SPRING_DATA_REDIS_SENTINEL_MASTER "$REDIS_SENTINEL_MASTER" "$ROOT_ENV"
 set_env SPRING_DATA_REDIS_SENTINEL_NODES "$REDIS_SENTINEL_NODES" "$ROOT_ENV"
 set_env SPRING_DATA_REDIS_CLUSTER_NODES "$REDIS_CLUSTER_NODES" "$ROOT_ENV"
-patch_nacos_server_port
 patch_nacos_sql_namespace
-
-NACOS_ENV="$APP_DIR/nacos/.env"
-set_env DB_HOST "$DB_HOST" "$NACOS_ENV"
-set_env DB_PORT "$DB_PORT" "$NACOS_ENV"
-set_env DB_NAME_NACOS "$DB_NAME_NACOS" "$NACOS_ENV"
-set_env DB_USER "$DB_USER" "$NACOS_ENV"
-set_env DB_PASSWORD "$DB_PASSWORD" "$NACOS_ENV"
-set_env REDIS_MODE "$REDIS_MODE" "$NACOS_ENV"
-set_env REDIS_HOST "$REDIS_HOST" "$NACOS_ENV"
-set_env REDIS_PORT "$REDIS_PORT" "$NACOS_ENV"
-set_env REDIS_DATABASE "$REDIS_DATABASE" "$NACOS_ENV"
-set_env REDIS_SENTINEL_MASTER "$REDIS_SENTINEL_MASTER" "$NACOS_ENV"
-set_env REDIS_SENTINEL_NODES "$REDIS_SENTINEL_NODES" "$NACOS_ENV"
-set_env REDIS_CLUSTER_NODES "$REDIS_CLUSTER_NODES" "$NACOS_ENV"
-if [ -n "$REDIS_PASSWORD" ]; then
-  set_env REDIS_PASSWORD "$REDIS_PASSWORD" "$NACOS_ENV"
-fi
 
 if [ "$INIT_SQL" = "true" ]; then
   command -v mysql >/dev/null 2>&1 || fail "mysql client is required when SQL initialization is enabled"
@@ -254,7 +216,7 @@ for service in $SERVICE_ORDER; do
   )
 done
 
-open_firewall_ports "$GATEWAY_PORT" "$WEB_VUE3_PORT" "$NACOS_PORT_WEB" "$NACOS_PORT_API"
-allow_selinux_ports http_port_t "$GATEWAY_PORT" "$WEB_VUE3_PORT" "$NACOS_PORT_WEB" "$NACOS_PORT_API"
+open_firewall_ports "$GATEWAY_PORT" "$WEB_VUE3_PORT"
+allow_selinux_ports http_port_t "$GATEWAY_PORT" "$WEB_VUE3_PORT"
 echo "AIFAR service deployed under $INSTALL_ROOT"
 docker ps --filter "network=$NETWORK_NAME"

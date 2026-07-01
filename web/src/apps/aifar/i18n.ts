@@ -19,7 +19,7 @@ export const aifarMessages = {
     sourceLabel: 'Docker Compose 离线包',
     description: '基于 resources/aifar/docker-apps 离线包部署 AIFAR 微服务。',
     installTitle: '安装 AIFAR 服务',
-    hint: '目标服务器需要先安装 Docker Engine 和 Docker Compose；可选择已部署 MySQL/Redis，连接参数会写入服务环境变量。勾选初始化 SQL 时，目标服务器还需要 mysql 客户端。',
+    hint: '目标服务器需要先安装 Docker Engine 和 Docker Compose；可选择已部署 Nacos/MySQL/Redis，连接参数会写入服务环境变量。勾选初始化 SQL 时，目标服务器还需要 mysql 客户端。',
     version: '版本',
     versionPlaceholder: '选择 docker-apps 资源包',
     servers: '目标服务器',
@@ -33,6 +33,14 @@ export const aifarMessages = {
     networkName: 'Docker 网络',
     appCPUs: 'CPU 限制',
     appMemoryLimit: '内存限制',
+    nacosSource: 'Nacos 来源',
+    nacosSourceExisting: '选择已部署 Nacos',
+    nacosSourceManual: '手动填写 Nacos',
+    nacosInstance: '已部署 Nacos',
+    nacosInstancePlaceholder: '选择 Nacos 实例',
+    noNacosInstances: '暂无可选 Nacos 实例',
+    nacosHost: 'Nacos 主机',
+    nacosPort: 'Nacos 端口',
     nacosUser: 'Nacos 用户',
     nacosPassword: 'Nacos 密码',
     nacosNamespace: 'Nacos 命名空间',
@@ -68,7 +76,7 @@ export const aifarMessages = {
     sourceLabel: 'Docker Compose bundle',
     description: 'Deploy AIFAR microservices from the resources/aifar/docker-apps offline bundle.',
     installTitle: 'Install AIFAR Service',
-    hint: 'Target server must already have Docker Engine and Docker Compose. Deployed MySQL/Redis instances can be selected and connection settings are written to service environment variables. SQL initialization also requires mysql client on the target server.',
+    hint: 'Target server must already have Docker Engine and Docker Compose. Deployed Nacos/MySQL/Redis instances can be selected and connection settings are written to service environment variables. SQL initialization also requires mysql client on the target server.',
     version: 'Version',
     versionPlaceholder: 'Select docker-apps bundle',
     servers: 'Target server',
@@ -82,6 +90,14 @@ export const aifarMessages = {
     networkName: 'Docker network',
     appCPUs: 'CPU limit',
     appMemoryLimit: 'Memory limit',
+    nacosSource: 'Nacos source',
+    nacosSourceExisting: 'Use deployed Nacos',
+    nacosSourceManual: 'Enter Nacos manually',
+    nacosInstance: 'Deployed Nacos',
+    nacosInstancePlaceholder: 'Select a Nacos instance',
+    noNacosInstances: 'No selectable Nacos instances',
+    nacosHost: 'Nacos host',
+    nacosPort: 'Nacos port',
     nacosUser: 'Nacos user',
     nacosPassword: 'Nacos password',
     nacosNamespace: 'Nacos namespace',
@@ -128,10 +144,13 @@ export function aifarTopologies(locale?: string): AppTopologyDefinition[] {
 
 export function aifarInstallDialogProps(locale?: string, context?: AppInstallDialogContext): AppInstallDialogConfig {
   const copy = aifarCopy(locale)
+  const nacosOptions = nacosInstanceOptions(context)
   const mysqlOptions = mysqlInstanceOptions(context)
   const redisOptions = redisInstanceOptions(context)
+  const nacosSourceDefault = nacosOptions.length ? 'existing' : 'manual'
   const mysqlSourceDefault = mysqlOptions.length ? 'existing' : 'manual'
   const redisSourceDefault = redisOptions.length ? 'existing' : 'manual'
+  const nacosSelectOptions = nacosOptions.length ? nacosOptions : [{ label: copy.noNacosInstances, value: '', disabled: true }]
   const mysqlSelectOptions = mysqlOptions.length ? mysqlOptions : [{ label: copy.noDbInstances, value: '', disabled: true }]
   const redisSelectOptions = redisOptions.length ? redisOptions : [{ label: copy.noRedisInstances, value: '', disabled: true }]
   const dialogCopy: AppInstallDialogCopy = {
@@ -163,6 +182,19 @@ export function aifarInstallDialogProps(locale?: string, context?: AppInstallDia
       },
       requiredText('appCPUs', copy.appCPUs, '2.0', copy),
       requiredText('appMemoryLimit', copy.appMemoryLimit, '2GB', copy),
+      selectField('nacosSource', copy.nacosSource, [
+        { label: copy.nacosSourceExisting, value: 'existing', disabled: nacosOptions.length === 0 },
+        { label: copy.nacosSourceManual, value: 'manual' }
+      ], nacosSourceDefault, copy),
+      {
+        ...selectField('nacosInstanceId', copy.nacosInstance, nacosSelectOptions, nacosOptions[0]?.value ?? '', copy, copy.nacosInstancePlaceholder),
+        visibleWhen: sourceIs('nacosSource', 'existing')
+      },
+      {
+        ...requiredText('nacosHost', copy.nacosHost, '', copy),
+        visibleWhen: sourceIsNot('nacosSource', 'existing')
+      },
+      portField('nacosPort', copy.nacosPort, 8848, copy),
       requiredText('nacosUser', copy.nacosUser, 'nacos', copy),
       {
         ...requiredText('nacosPassword', copy.nacosPassword, 'oversea.nacos', copy),
@@ -291,6 +323,15 @@ function sourceIs(name: string, value: string) {
 
 function sourceIsNot(name: string, value: string) {
   return (values: AppInstallFieldValues) => values[name] !== value
+}
+
+function nacosInstanceOptions(context?: AppInstallDialogContext): AppInstallFieldOption[] {
+  return (context?.instances ?? [])
+    .filter((instance) => instance.app === 'nacos')
+    .map((instance) => ({
+      label: dependencyLabel(instance, context, 'Nacos'),
+      value: instance.id
+    }))
 }
 
 function mysqlInstanceOptions(context?: AppInstallDialogContext): AppInstallFieldOption[] {

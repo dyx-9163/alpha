@@ -1,8 +1,11 @@
 package aifar
 
 import (
+	"archive/tar"
+	"compress/gzip"
 	"context"
 	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -122,7 +125,7 @@ func (fakeLogger) Error(format string, args ...any) {}
 
 func TestOptionsDefaultsUseRequestedAIFARValues(t *testing.T) {
 	opts := optionsFromParameters(nil)
-	if opts.Timezone != "system" || opts.NacosWebPort != 9849 || opts.NacosNamespace != "prod" {
+	if opts.Timezone != "system" || opts.NacosWebPort != 8848 || opts.NacosNamespace != "prod" || opts.NacosSource != dependencyManual {
 		t.Fatalf("unexpected defaults: %+v", opts)
 	}
 	if got := installRootFromDeployDir("/aifar/apps"); got != "/aifar/apps/admin" {
@@ -146,6 +149,7 @@ func TestServiceInstallsAIFARServiceFromDockerAppsBundle(t *testing.T) {
 			"dbPort":     3306,
 			"dbUser":     "root",
 			"dbPassword": "secret-value",
+			"nacosHost":  "10.0.0.50",
 			"webPort":    18080,
 		},
 	}, []store.Resource{{App: "aifar", Part: "backend", Version: "docker-apps", Path: filepath.Join(root, "docker-apps", ".env")}}, fakeLogger{}, nil)
@@ -169,12 +173,16 @@ func TestServiceInstallsAIFARServiceFromDockerAppsBundle(t *testing.T) {
 	if metadata["endpoint"] != "10.0.0.10:18080" || metadata["networkName"] != defaultNetworkName {
 		t.Fatalf("unexpected metadata: %s", instance.Metadata)
 	}
+	if metadata["nacosEndpoint"] != "10.0.0.50:8848" || metadata["nacosHost"] != "10.0.0.50" || int(metadata["nacosPort"].(float64)) != 8848 {
+		t.Fatalf("expected external Nacos endpoint metadata, got %s", instance.Metadata)
+	}
 	if !strings.Contains(remote.joinedUploads(), "aifar-service-bundle-") || !strings.Contains(remote.joinedCommands(), "install-aifar.sh") {
 		t.Fatalf("expected bundle upload and install script run, uploads=%s commands=%s", remote.joinedUploads(), remote.joinedCommands())
 	}
-	if !strings.Contains(remote.installScript, `open_firewall_ports "$GATEWAY_PORT" "$WEB_VUE3_PORT" "$NACOS_PORT_WEB" "$NACOS_PORT_API"`) ||
-		!strings.Contains(remote.installScript, `allow_selinux_ports http_port_t "$GATEWAY_PORT" "$WEB_VUE3_PORT" "$NACOS_PORT_WEB" "$NACOS_PORT_API"`) {
-		t.Fatalf("AIFAR install script should open firewall and SELinux rules for service ports:\n%s", remote.installScript)
+	if !strings.Contains(remote.installScript, `open_firewall_ports "$GATEWAY_PORT" "$WEB_VUE3_PORT"`) ||
+		!strings.Contains(remote.installScript, `allow_selinux_ports http_port_t "$GATEWAY_PORT" "$WEB_VUE3_PORT"`) ||
+		strings.Contains(remote.installScript, `open_firewall_ports "$GATEWAY_PORT" "$WEB_VUE3_PORT" "$NACOS_PORT_WEB"`) {
+		t.Fatalf("AIFAR install script should open only AIFAR service ports:\n%s", remote.installScript)
 	}
 	if !strings.Contains(remote.installScript, "prepare_compose_networks") || !strings.Contains(remote.installScript, "external: true") {
 		t.Fatalf("AIFAR install script should mark shared Docker network as external:\n%s", remote.installScript)
@@ -182,8 +190,15 @@ func TestServiceInstallsAIFARServiceFromDockerAppsBundle(t *testing.T) {
 	if !strings.Contains(remote.installScript, "resolve_system_timezone") || !strings.Contains(remote.installScript, "timedatectl show -p Timezone") {
 		t.Fatalf("AIFAR install script should resolve system timezone:\n%s", remote.installScript)
 	}
-	if !strings.Contains(remote.installScript, "patch_nacos_server_port") || !strings.Contains(remote.installScript, "patch_nacos_sql_namespace") {
-		t.Fatalf("AIFAR install script should patch Nacos defaults from install options:\n%s", remote.installScript)
+	if strings.Contains(remote.installScript, "aifar-nacos:${NACOS_PORT_WEB}") || strings.Contains(remote.installScript, `NACOS_ENV="$APP_DIR/nacos/.env"`) {
+		t.Fatalf("AIFAR install script should not configure bundled Nacos:\n%s", remote.installScript)
+	}
+	if !strings.Contains(remote.installScript, "NACOS_CONNECT_HOST='10.0.0.50'") ||
+		!strings.Contains(remote.installScript, `set_env NACOS_HOST "${NACOS_CONNECT_HOST}:${NACOS_PORT_WEB}" "$ROOT_ENV"`) {
+		t.Fatalf("AIFAR install script should use the external Nacos endpoint:\n%s", remote.installScript)
+	}
+	if strings.Contains(remote.installScript, "patch_nacos_server_port") || !strings.Contains(remote.installScript, "patch_nacos_sql_namespace") {
+		t.Fatalf("AIFAR install script should only patch Nacos SQL namespace defaults:\n%s", remote.installScript)
 	}
 }
 
@@ -269,6 +284,7 @@ func TestServiceResolvesManagedDatabaseAndRedisInstances(t *testing.T) {
 			"dbNameNacos":     "aifar_cloud_nacos",
 			"dbUser":          "root",
 			"dbPassword":      "secret-value",
+			"nacosHost":       "10.0.0.50",
 			"redisSource":     "existing",
 			"redisInstanceId": "redis-node-1",
 			"redisPassword":   "redis-secret",
@@ -313,6 +329,78 @@ func TestServiceResolvesManagedDatabaseAndRedisInstances(t *testing.T) {
 	}
 }
 
+func TestServiceResolvesManagedNacosInstance(t *testing.T) {
+	root := createAIFARBundle(t)
+	s := &fakeStore{
+		servers: map[string]store.Server{
+			"app-1":   {ID: "app-1", Name: "app-1", Host: "10.0.0.10", DeployDir: "/aifar/apps"},
+			"nacos-1": {ID: "nacos-1", Name: "nacos-1", Host: "10.0.0.50", DeployDir: "/aifar/apps"},
+		},
+		instances: []store.AppInstance{
+			{
+				ID:       "nacos-node-1",
+				App:      "nacos",
+				Version:  "2.4.3",
+				ServerID: "nacos-1",
+				Status:   "running",
+				Topology: "standalone",
+				Metadata: mustMetadata(t, map[string]any{
+					"endpoint": "http://10.0.0.50:9849/nacos",
+					"port":     9849,
+				}),
+			},
+		},
+	}
+	remote := &fakeRemote{}
+	service := NewService(s, remote)
+	err := service.Install(context.Background(), InstallRequest{
+		Version:  "latest",
+		ServerID: "app-1",
+		Language: "en",
+		Parameters: map[string]any{
+			"nacosSource":     "existing",
+			"nacosInstanceId": "nacos-node-1",
+			"nacosPort":       8848,
+			"dbHost":          "10.0.0.20",
+			"dbPort":          3306,
+			"dbUser":          "root",
+			"dbPassword":      "secret-value",
+		},
+	}, []store.Resource{{App: "aifar", Part: "backend", Version: "docker-apps", Path: filepath.Join(root, "docker-apps", ".env")}}, fakeLogger{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var instance store.AppInstance
+	for _, candidate := range s.instances {
+		if candidate.App == "aifar" {
+			instance = candidate
+			break
+		}
+	}
+	if instance.ID == "" {
+		t.Fatalf("expected AIFAR instance, got %+v", s.instances)
+	}
+	metadata := map[string]any{}
+	if err := json.Unmarshal([]byte(instance.Metadata), &metadata); err != nil {
+		t.Fatal(err)
+	}
+	if metadata["nacosSource"] != "existing" || metadata["nacosInstanceId"] != "nacos-node-1" {
+		t.Fatalf("expected managed Nacos source metadata, got %s", instance.Metadata)
+	}
+	if metadata["nacosHost"] != "10.0.0.50" || int(metadata["nacosPort"].(float64)) != 8848 || metadata["nacosEndpoint"] != "10.0.0.50:8848" {
+		t.Fatalf("expected selected Nacos host with overridden port, got %s", instance.Metadata)
+	}
+	for _, want := range []string{
+		"NACOS_CONNECT_HOST='10.0.0.50'",
+		"NACOS_PORT_WEB='8848'",
+		`set_env NACOS_HOST "${NACOS_CONNECT_HOST}:${NACOS_PORT_WEB}" "$ROOT_ENV"`,
+	} {
+		if !strings.Contains(remote.installScript, want) {
+			t.Fatalf("install script should contain %q:\n%s", want, remote.installScript)
+		}
+	}
+}
+
 func TestSelectBundleIgnoresDockerSQLVersion(t *testing.T) {
 	root := createAIFARBundle(t)
 	resources := []store.Resource{
@@ -328,6 +416,54 @@ func TestSelectBundleIgnoresDockerSQLVersion(t *testing.T) {
 	}
 	if _, err := SelectBundle(resources, "docker-sql"); err == nil {
 		t.Fatal("expected docker-sql to be rejected as an installable AIFAR version")
+	}
+}
+
+func TestCreateBundleArchiveExcludesBundledNacos(t *testing.T) {
+	root := createAIFARBundle(t)
+	nacosDir := filepath.Join(root, "docker-apps", "nacos")
+	if err := os.MkdirAll(nacosDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(nacosDir, "docker-compose.yaml"), []byte("services: {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(nacosDir, ".env"), []byte("APP_CONTAINER_NAME=aifar-nacos\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	archivePath, err := CreateBundleArchive(Bundle{
+		Version: appBundleVersion,
+		Root:    root,
+		AppDir:  filepath.Join(root, appBundleDir),
+		SQLDir:  filepath.Join(root, sqlBundleDir),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(archivePath)
+
+	file, err := os.Open(archivePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	gz, err := gzip.NewReader(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gz.Close()
+	tr := tar.NewReader(gz)
+	for {
+		header, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.HasPrefix(header.Name, "docker-apps/nacos") {
+			t.Fatalf("archive should exclude bundled Nacos, found %s", header.Name)
+		}
 	}
 }
 
@@ -356,10 +492,10 @@ func TestServiceChecksAIFARServiceAndUpdatesStatus(t *testing.T) {
 	remote := &fakeRemote{statusStdout: strings.Join([]string{
 		"status=degraded",
 		"installRootExists=true",
-		"totalContainers=3",
-		"runningContainers=2",
+		"totalContainers=2",
+		"runningContainers=1",
 		"unhealthyContainers=1",
-		"containers=aifar-nacos:true:healthy,aifar-gateway:false:,aifar-web-vue3:true:unhealthy,",
+		"containers=aifar-gateway:false:,aifar-web-vue3:true:unhealthy,",
 	}, "\n")}
 	service := NewService(s, remote)
 	result, err := service.Check(context.Background(), CheckRequest{Instance: instance, Server: s.servers["srv-1"], Language: "en"}, fakeLogger{}, nil)
@@ -394,7 +530,7 @@ func createAIFARBundle(t *testing.T) string {
 	if err := os.WriteFile(filepath.Join(appDir, ".env"), []byte("APP_NETWORK_NAME=aifar-network\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	for _, service := range []string{"nacos", "gateway", "web-vue3"} {
+	for _, service := range []string{"gateway", "web-vue3"} {
 		dir := filepath.Join(appDir, service)
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			t.Fatal(err)
