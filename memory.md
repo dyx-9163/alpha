@@ -411,3 +411,7 @@
 - 结论：Gateway 当前从 Nacos 读到的路由仍指向旧服务名 `alpha-oauth`，而新部署服务应注册为 `aifar-oauth`；应检查 Nacos `prod` 命名空间的 `router.yaml` 是否仍含 `alpha-*`，发布为 `aifar-*` 后重启或刷新 Gateway。
 - 问题：用户询问 `web-vue3/oauth` 的 `.env` 中哪个参数影响 `alpha-oauth`/`aifar-oauth`。
 - 结论：`SPRING_APPLICATION_NAME=aifar-oauth` 决定 Spring 服务注册到 Nacos 的服务名；Gateway 日志里的 `alpha-oauth` 来自 Gateway 路由配置或旧 Nacos 配置，不是 `APP_IMAGE`/`APP_CONTAINER_NAME`。
+- 问题：用户反馈 `aifar-oauth` 调用时报 `No servers available for service: alpha-permission`，但 Nacos 服务列表已有 `aifar-permission`。
+- 结论：`SPRING_APPLICATION_NAME=aifar-permission` 只决定 permission 服务注册名；OAuth 作为调用方请求 `alpha-permission` 通常来自 OAuth JAR 内的 `@FeignClient(name/value="alpha-permission")` 或调用方配置/常量，需把调用方 Feign 目标名也统一成 `aifar-permission` 并重启。
+- 问题：用户贴出 `router.yaml` 已全部使用 `aifar-*`，但 OAuth 仍请求 `alpha-permission`。
+- 结论：`router.yaml` 只控制 Gateway 入站路由，不控制服务内部 Feign 调用；日志线程在 `aifar-oauth`，说明调用方 OAuth 的 Feign 目标仍是旧的 `alpha-permission`，需要改 OAuth/公共 API JAR 内的 Feign 声明或先统一回 `alpha-*` 服务名。
