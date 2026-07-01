@@ -407,3 +407,5 @@
 - 结论：该错误表示运行时配置对象没有挂到 `window.__PRODUCTION__AIFAR__CONF__`，常见原因是 `/_app.config.js` 未加载、仍是旧的 `__PRODUCTION__ALPHA__CONF__`，或浏览器/代理缓存了旧配置；需检查浏览器 Network 中 `/_app.config.js` 的响应内容。
 - 问题：用户询问如何重新构建并启动已部署的 AIFAR `web-vue3` 前端容器。
 - 结论：在目标服务器进入 `/aifar/apps/admin/docker-apps/web-vue3`，使用 `docker compose --env-file ../.env --env-file .env -f docker-compose.yaml up -d --build --force-recreate`；如基础镜像未加载，先执行 `docker load -i ../../docker-images/nginx-stable-alpine.tar`。
+- 问题：用户提供 Gateway 日志 `No servers available for service: alpha-oauth`。
+- 结论：Gateway 当前从 Nacos 读到的路由仍指向旧服务名 `alpha-oauth`，而新部署服务应注册为 `aifar-oauth`；应检查 Nacos `prod` 命名空间的 `router.yaml` 是否仍含 `alpha-*`，发布为 `aifar-*` 后重启或刷新 Gateway。
