@@ -33,10 +33,10 @@ func (m Module) Name() string {
 func (m Module) Manifest(lang string) registry.Manifest {
 	copy := redisapp.CopyFor(lang)
 	title := "Redis Sentinel"
-	description := "Install and configure Redis Sentinel for Redis base services from the Redis offline source archive."
+	description := "Deploy Redis Sentinel high availability in one flow: Redis data services with one master and replicas, plus Sentinel on every target server."
 	if normalizeLanguage(lang) != "en" {
 		title = "Redis 哨兵"
-		description = "基于 Redis 离线源码包安装并配置 Redis Sentinel，高可用监控独立于 Redis 基础服务安装。"
+		description = "一体化部署 Redis Sentinel 高可用：Redis 数据服务默认 1 主多从，所有目标服务器运行 Sentinel。"
 	}
 	return registry.Manifest{
 		Name:                moduleName,

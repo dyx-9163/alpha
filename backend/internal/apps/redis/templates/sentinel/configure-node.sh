@@ -37,13 +37,20 @@ ensure_service_access() {
 echo "configuring Redis Sentinel node: $ROLE"
 ensure_service_access
 
+CONFIG_TMP="$(mktemp)"
 if [ "$ROLE" = "replica" ]; then
-  if ! grep -q "^replicaof " "$CONFIG_FILE"; then
-    cat >> "$CONFIG_FILE" <<CONF
+  awk '!/^replicaof / { print }' "$CONFIG_FILE" > "$CONFIG_TMP"
+  cat >> "$CONFIG_TMP" <<CONF
 replicaof $MASTER_HOST $MASTER_PORT
 CONF
+  $SUDO install -m 0644 "$CONFIG_TMP" "$CONFIG_FILE"
+else
+  if grep -q "^replicaof " "$CONFIG_FILE"; then
+    awk '!/^replicaof / { print }' "$CONFIG_FILE" > "$CONFIG_TMP"
+    $SUDO install -m 0644 "$CONFIG_TMP" "$CONFIG_FILE"
   fi
 fi
+rm -f "$CONFIG_TMP"
 
 cat > "$INSTALL_ROOT/conf/sentinel.conf.tmp" <<CONF
 port $SENTINEL_PORT

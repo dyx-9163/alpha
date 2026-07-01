@@ -323,3 +323,7 @@
 - 结论：如果目标是 Redis Sentinel 主从高可用，应选择单体，并在需要作为 Redis 数据节点的服务器上分别安装基础服务，再通过 Redis 哨兵入口配置 Sentinel；Redis Cluster 是分片集群，不用于 Sentinel 主从高可用。
 - 问题：用户要求 Redis 单体安装增加“本次安装要使用哨兵”选项，并让后续安装 Redis 哨兵时可以选择这些基础服务。
 - 结论：Redis 单体安装新增“本次安装用于 Redis 哨兵”开关并写入实例 metadata；Redis 哨兵安装只展示已标记用于哨兵的 standalone Redis 基础服务作为 Master/Replica 候选。验证通过：go test ./internal/apps/redis ./internal/apps/redissentinel、pnpm web:build、pnpm test、git diff --check。
+- 问题：用户复核 Redis Sentinel 资料后认为主从数据节点配置并不等同普通单体，生产也应是 1 主 2 从 + 至少 3 哨兵，询问部署是否应放在一起。
+- 结论：产品默认部署体验应提供“Redis Sentinel 高可用”一体化向导，一次性配置 1 主 2 从和 3 个 Sentinel；底层模块仍可拆分为 Redis 数据服务与 Sentinel 运行服务，保留接入已有 Redis 的高级模式。
+- 问题：用户确认按 Redis Sentinel 一体化部署方案调整。
+- 结论：Redis Sentinel 安装入口改为默认一体化部署，目标服务器选择至少 3 台后从已选服务器中选初始 Master，其余自动作为 Replica，所有目标同时安装 Sentinel；后端 `redis-sentinel` 默认不再校验已有基础服务，而是安装 Redis 数据服务并配置 Sentinel，`useExistingRedis` 保留高级接入已有基础服务模式。验证通过：go test ./internal/apps/redis ./internal/apps/redissentinel、pnpm web:build、pnpm test、git diff --check。

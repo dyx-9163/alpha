@@ -241,5 +241,5 @@ func (m Module) Check(ctx context.Context, req registry.CheckRequest, run regist
 }
 
 func redisSentinelOnlyInstall(req registry.InstallRequest) bool {
-	return req.App == "redis-sentinel"
+	return req.App == "redis-sentinel" && redisUseExistingBase(req.Parameters)
 }

@@ -26,12 +26,51 @@ func TestManifestUsesRedisResourceAndSentinelTopology(t *testing.T) {
 	}
 }
 
-func TestPlanUsesSentinelOnlyInstallSteps(t *testing.T) {
+func TestPlanUsesIntegratedSentinelInstallSteps(t *testing.T) {
+	plan, err := NewModule(nil, nil).PlanInstall(context.Background(), registry.InstallRequest{
+		App:      moduleName,
+		Topology: "sentinel",
+		Language: "en",
+		ServerIDs: []string{
+			"srv-2",
+			"srv-1",
+			"srv-3",
+		},
+		Parameters: map[string]any{
+			"sentinelMasterId": "srv-2",
+			"password":         "Oversea.123",
+		},
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stepByTarget := map[string]map[string]bool{}
+	for _, step := range plan {
+		if stepByTarget[step.Target] == nil {
+			stepByTarget[step.Target] = map[string]bool{}
+		}
+		stepByTarget[step.Target][step.Name] = true
+	}
+	for _, target := range []string{"srv-1", "srv-2", "srv-3"} {
+		if !stepByTarget[target]["install-redis"] {
+			t.Fatalf("expected target %s to install Redis data service: %#v", target, plan)
+		}
+		if !stepByTarget[target]["configure-sentinel"] {
+			t.Fatalf("expected target %s to configure Sentinel: %#v", target, plan)
+		}
+	}
+	if stepByTarget["srv-1"]["verify-redis-base"] || stepByTarget["srv-3"]["install-sentinel-binaries"] {
+		t.Fatalf("default Redis Sentinel install should be integrated, not existing-base mode: %#v", plan)
+	}
+}
+
+func TestPlanCanUseExistingRedisBaseWhenRequested(t *testing.T) {
 	plan, err := NewModule(nil, nil).PlanInstall(context.Background(), registry.InstallRequest{
 		App:      moduleName,
 		Topology: "sentinel",
 		Language: "en",
 		Parameters: map[string]any{
+			"useExistingRedis":  true,
 			"sentinelMasterId":  "srv-2",
 			"replicaServerIds":  []string{"srv-1"},
 			"sentinelServerIds": []string{"srv-2", "srv-1", "srv-3"},

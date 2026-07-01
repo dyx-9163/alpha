@@ -31,15 +31,23 @@ func redisPassword(params map[string]any, fallback string) string {
 }
 
 func redisSentinelEligible(params map[string]any) bool {
+	return boolParam(params, "sentinelEligible", "useForSentinel")
+}
+
+func redisUseExistingBase(params map[string]any) bool {
+	return boolParam(params, "useExistingRedis", "sentinelOnly")
+}
+
+func boolParam(params map[string]any, keys ...string) bool {
 	if params == nil {
 		return false
 	}
-	value, ok := params["sentinelEligible"]
-	if !ok {
-		value, ok = params["useForSentinel"]
-	}
-	if !ok {
-		return false
+	var value any
+	for _, key := range keys {
+		if v, ok := params[key]; ok {
+			value = v
+			break
+		}
 	}
 	switch v := value.(type) {
 	case bool:
