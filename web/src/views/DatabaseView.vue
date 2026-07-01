@@ -25,10 +25,6 @@
 
     <div class="workspace-card database-main">
       <template v-if="tab === 'instances'">
-        <div v-if="!initialInstancesReady" class="database-loading">
-          <el-skeleton animated :rows="10" />
-        </div>
-        <template v-else>
         <div class="table-toolbar">
           <div class="head-actions">
             <span class="status-pill">{{ t('common.all') }} {{ instanceGroups.length }}</span>
@@ -152,7 +148,6 @@
           </article>
         </div>
         <div v-else class="empty-state"><div><strong>{{ t('database.noInstancesTitle') }}</strong><span>{{ t('database.noInstancesDesc') }}</span></div></div>
-        </template>
       </template>
 
       <template v-else-if="tab === 'runs'">
@@ -288,7 +283,6 @@ const tab = ref('instances')
 const search = ref('')
 const monitoringEnabled = ref(true)
 const monitoringRunning = ref(false)
-const initialInstancesReady = ref(false)
 const monitorStartedAt = ref(0)
 const lastMonitorAt = ref('')
 const deletePromptVisible = ref(false)
@@ -407,7 +401,7 @@ function handleMonitoringToggle() {
   }
 }
 
-async function runRealtimeCheck(manual: boolean, options: { deferInitialLoad?: boolean } = {}) {
+async function runRealtimeCheck(manual: boolean) {
   if (!canManageApps.value) {
     if (manual) {
       ElMessage.warning(deniedText.value)
@@ -421,9 +415,7 @@ async function runRealtimeCheck(manual: boolean, options: { deferInitialLoad?: b
   monitorStartedAt.value = Date.now()
   try {
     const state = await fetchDatabaseState()
-    if (!options.deferInitialLoad) {
-      applyDatabaseState(state)
-    }
+    applyDatabaseState(state)
     const taskIds: string[] = []
     for (const instance of state.instances.filter(isMonitorableInstance)) {
       try {
@@ -515,7 +507,7 @@ function groupDatabaseInstances(items: AppInstance[]) {
       if (nodeRunsSentinel(node)) {
         group.sentinels.push(redisSentinelNode(item, metadata))
       }
-      if (node.role !== 'sentinel') {
+      if (nodeIsRedisDataNode(node)) {
         group.nodes.push(node)
       }
     } else {
@@ -556,12 +548,14 @@ function groupDatabaseInstances(items: AppInstance[]) {
   return Array.from(groups.values())
     .map((group) => {
       const hydratedGroup = withRedisSentinelDiscoveredNodes(group)
-      const nodes = normalizeGroupNodeRoles(hydratedGroup)
+      const nodes = uniqueDatabaseNodes(normalizeGroupNodeRoles(hydratedGroup))
+      const routers = uniqueDatabaseNodes(hydratedGroup.routers)
+      const sentinels = uniqueDatabaseNodes(hydratedGroup.sentinels)
       const normalizedGroup = {
         ...hydratedGroup,
         nodes: nodes.sort((a, b) => roleRank(a.role) - roleRank(b.role) || a.serverLabel.localeCompare(b.serverLabel)),
-        routers: hydratedGroup.routers.sort((a, b) => a.serverLabel.localeCompare(b.serverLabel)),
-        sentinels: hydratedGroup.sentinels.sort((a, b) => a.serverLabel.localeCompare(b.serverLabel))
+        routers: routers.sort((a, b) => a.serverLabel.localeCompare(b.serverLabel)),
+        sentinels: sentinels.sort((a, b) => a.serverLabel.localeCompare(b.serverLabel))
       }
       const nodeStatus = normalizedGroup.app === 'mysql' && normalizedGroup.topology === 'innodb-cluster'
         ? mysqlClusterServiceStatus(normalizedGroup)
@@ -794,6 +788,39 @@ function normalizeGroupNodeRoles(group: DatabaseGroup) {
   return group.nodes
 }
 
+function uniqueDatabaseNodes(nodes: DatabaseNode[]) {
+  const byKey = new Map<string, DatabaseNode>()
+  for (const node of nodes) {
+    const key = normalizeNodeIdentity(node)
+    const current = byKey.get(key)
+    if (!current || shouldPreferNode(node, current)) {
+      byKey.set(key, node)
+    }
+  }
+  return Array.from(byKey.values())
+}
+
+function normalizeNodeIdentity(node: DatabaseNode) {
+  const endpoint = normalizeEndpoint(node.endpoint)
+  if (endpoint && endpoint !== '-') {
+    return endpoint
+  }
+  const serverKey = node.instance.serverId || endpointHost(node.endpoint) || node.serverLabel
+  return `${serverKey}:${node.role}`
+}
+
+function shouldPreferNode(candidate: DatabaseNode, current: DatabaseNode) {
+  if (current.virtual !== candidate.virtual) {
+    return current.virtual && !candidate.virtual
+  }
+  const candidateRank = roleRank(candidate.role)
+  const currentRank = roleRank(current.role)
+  if (candidateRank !== currentRank) {
+    return candidateRank < currentRank
+  }
+  return nodeLastCheckedAt(candidate) > nodeLastCheckedAt(current)
+}
+
 function nodeWithRole(node: DatabaseNode, role: string): DatabaseNode {
   if (node.role === role) {
     return node
@@ -963,6 +990,14 @@ function statusIsOffline(status: string) {
 
 function nodeRunsSentinel(node: DatabaseNode) {
   return node.instance.app === 'redis' && normalizedTopology(node.instance, node.metadata) === 'sentinel' && metadataBool(node.metadata, 'sentinel')
+}
+
+function nodeIsRedisDataNode(node: DatabaseNode) {
+  if (node.role === 'sentinel') {
+    return false
+  }
+  const endpoint = normalizeEndpoint(node.endpoint)
+  return !!endpoint && endpoint !== '-'
 }
 
 function roleRank(role: string) {
@@ -1576,15 +1611,10 @@ function deleteErrorMessage(err: unknown) {
 }
 
 onMounted(async () => {
-  try {
-    if (monitoringEnabled.value && canManageApps.value) {
-      await runRealtimeCheck(false, { deferInitialLoad: true })
-    } else {
-      await load()
-    }
-  } finally {
-    initialInstancesReady.value = true
-    startMonitor()
+  await load()
+  startMonitor()
+  if (monitoringEnabled.value && canManageApps.value) {
+    void runRealtimeCheck(false)
   }
 })
 
@@ -1602,10 +1632,6 @@ onUnmounted(stopMonitor)
   display: flex;
   flex-direction: column;
   min-height: 0;
-}
-
-.database-loading {
-  padding: 16px;
 }
 
 .monitor-actions {
