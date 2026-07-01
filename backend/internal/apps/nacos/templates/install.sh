@@ -101,7 +101,7 @@ fi
 cat >> "$TMP_PROPS" <<CONF
 # AIFAR BEGIN
 server.port=$PORT
-nacos.core.auth.enabled=false
+nacos.core.auth.enabled=true
 nacos.core.auth.server.identity.key=aifar
 nacos.core.auth.server.identity.value=aifar
 nacos.core.auth.plugin.nacos.token.secret.key=Rm9yQWlmYXJPZmZsaW5lRGVwbG95bWVudE9ubHkzMkJ5dGVz

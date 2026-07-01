@@ -387,3 +387,5 @@
 - 结论：`Created symlink` 是 systemctl enable 的正常输出，不是失败原因；安装脚本改为先 enable 再 restart，并以 Nacos readiness 作为最终成功判定，避免 systemctl 启动返回码的短暂误判；同时失败时输出 systemd/journal 和 Nacos start.out/nacos.log 等诊断日志，并让 systemd 正确传入 `CUSTOM_NACOS_MEMORY`。验证通过：pnpm test、git diff --check。
 - 问题：用户提供 Nacos 启动日志并询问是否是没有统一 key。
 - 结论：根因不是 Nacos token/identity key 不统一，而是 Nacos 连接 MySQL 时 MySQL 8 `caching_sha2_password` 认证触发 `Public Key Retrieval is not allowed`；Nacos JDBC URL 已追加 `allowPublicKeyRetrieval=true`，用于允许 JDBC 驱动获取 MySQL 公钥。验证通过：go test ./internal/apps/nacos、pnpm test、git diff --check。
+- 问题：用户截图显示 Nacos 2.4.3 控制台提示“当前集群没有开启鉴权”，要求在配置中开启鉴权。
+- 结论：Nacos 安装脚本的 AIFAR 配置块已将 `nacos.core.auth.enabled` 默认改为 `true`，并补充脚本渲染测试锁定该配置；验证通过：go test ./internal/apps/nacos（使用工作区 GOCACHE）、pnpm test、git diff --check。

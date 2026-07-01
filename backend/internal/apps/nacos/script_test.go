@@ -28,6 +28,7 @@ func TestInstallNacosScriptRendersClusterConfig(t *testing.T) {
 	}
 	for _, want := range []string{
 		"10.0.0.1:8848",
+		"nacos.core.auth.enabled=true",
 		"spring.sql.init.platform=mysql",
 		"allowPublicKeyRetrieval=true",
 		"Environment=\"CUSTOM_NACOS_MEMORY=-Xms$JVM_XMS -Xmx$JVM_XMX -Xmn$JVM_XMN\"",
