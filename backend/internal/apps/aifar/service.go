@@ -26,6 +26,7 @@ type Remote = installerkit.Remote
 
 type Store interface {
 	GetServer(id string, includeSecret bool) (store.Server, error)
+	ListAppInstances() ([]store.AppInstance, error)
 	SaveAppInstance(v store.AppInstance) (store.AppInstance, error)
 	DeleteAppInstance(id string) error
 }
@@ -108,6 +109,11 @@ func (s Service) Install(ctx context.Context, req InstallRequest, resources []st
 	var archiveLocal string
 	options := optionsFromParameters(req.Parameters)
 	if err := step(2, func() error {
+		var resolveErr error
+		options, resolveErr = s.resolveInstallOptions(options)
+		if resolveErr != nil {
+			return resolveErr
+		}
 		var bundleErr error
 		bundle, bundleErr = SelectBundle(resources, req.Version)
 		if bundleErr != nil {
@@ -120,7 +126,7 @@ func (s Service) Install(ctx context.Context, req InstallRequest, resources []st
 			return err
 		}
 		if options.InitSQL {
-			if _, err := os.Stat(filepath.Join(bundle.SQLDir, "alpha_cloud_nacos.sql")); err != nil {
+			if _, err := os.Stat(filepath.Join(bundle.SQLDir, "aifar_cloud_nacos.sql")); err != nil {
 				return fmt.Errorf("SQL initialization file is required: %w", err)
 			}
 		}
@@ -198,23 +204,34 @@ func (s Service) Install(ctx context.Context, req InstallRequest, resources []st
 	var instance store.AppInstance
 	if err := step(5, func() error {
 		metadata, _ := json.Marshal(map[string]any{
-			"installRoot":     installRoot,
-			"appDir":          installRoot + "/" + appBundleDir,
-			"sqlDir":          installRoot + "/" + sqlBundleDir,
-			"networkName":     options.NetworkName,
-			"endpoint":        fmt.Sprintf("%s:%d", server.Host, options.WebPort),
-			"gatewayEndpoint": fmt.Sprintf("%s:%d", server.Host, options.GatewayPort),
-			"nacosEndpoint":   fmt.Sprintf("%s:%d", server.Host, options.NacosWebPort),
-			"webPort":         options.WebPort,
-			"gatewayPort":     options.GatewayPort,
-			"nacosWebPort":    options.NacosWebPort,
-			"nacosApiPort":    options.NacosAPIPort,
-			"dbHost":          options.DBHost,
-			"dbPort":          options.DBPort,
-			"dbNameNacos":     options.DBNameNacos,
-			"dbUser":          options.DBUser,
-			"initSql":         options.InitSQL,
-			"services":        serviceOrder,
+			"installRoot":             installRoot,
+			"appDir":                  installRoot + "/" + appBundleDir,
+			"sqlDir":                  installRoot + "/" + sqlBundleDir,
+			"networkName":             options.NetworkName,
+			"endpoint":                fmt.Sprintf("%s:%d", server.Host, options.WebPort),
+			"gatewayEndpoint":         fmt.Sprintf("%s:%d", server.Host, options.GatewayPort),
+			"nacosEndpoint":           fmt.Sprintf("%s:%d", server.Host, options.NacosWebPort),
+			"webPort":                 options.WebPort,
+			"gatewayPort":             options.GatewayPort,
+			"nacosWebPort":            options.NacosWebPort,
+			"nacosApiPort":            options.NacosAPIPort,
+			"dbSource":                options.DBSource,
+			"dbInstanceId":            options.DBInstanceID,
+			"dbHost":                  options.DBHost,
+			"dbPort":                  options.DBPort,
+			"dbNameNacos":             options.DBNameNacos,
+			"dbUser":                  options.DBUser,
+			"redisSource":             options.RedisSource,
+			"redisInstanceId":         options.RedisInstanceID,
+			"redisMode":               options.RedisMode,
+			"redisHost":               options.RedisHost,
+			"redisPort":               options.RedisPort,
+			"redisDatabase":           options.RedisDatabase,
+			"redisSentinelMasterName": options.RedisSentinelMasterName,
+			"redisSentinelNodes":      options.RedisSentinelNodes,
+			"redisClusterNodes":       options.RedisClusterNodes,
+			"initSql":                 options.InitSQL,
+			"services":                serviceOrder,
 		})
 		var saveErr error
 		instance, saveErr = s.store.SaveAppInstance(store.AppInstance{

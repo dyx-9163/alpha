@@ -26,6 +26,14 @@ func (f *fakeStore) GetServer(id string, includeSecret bool) (store.Server, erro
 	return f.servers[id], nil
 }
 
+func (f *fakeStore) ListAppInstances() ([]store.AppInstance, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]store.AppInstance, len(f.instances))
+	copy(out, f.instances)
+	return out, nil
+}
+
 func (f *fakeStore) SaveAppInstance(v store.AppInstance) (store.AppInstance, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -160,10 +168,136 @@ func TestServiceInstallsAIFARServiceFromDockerAppsBundle(t *testing.T) {
 	}
 }
 
+func TestServiceResolvesManagedDatabaseAndRedisInstances(t *testing.T) {
+	root := createAIFARBundle(t)
+	s := &fakeStore{
+		servers: map[string]store.Server{
+			"app-1":    {ID: "app-1", Name: "app-1", Host: "10.0.0.10", DeployDir: "/aifar/apps"},
+			"mysql-1":  {ID: "mysql-1", Name: "mysql-1", Host: "10.0.0.31", DeployDir: "/aifar/apps"},
+			"router-1": {ID: "router-1", Name: "router-1", Host: "10.0.0.30", DeployDir: "/aifar/apps"},
+			"redis-1":  {ID: "redis-1", Name: "redis-1", Host: "10.0.0.41", DeployDir: "/aifar/apps"},
+			"redis-2":  {ID: "redis-2", Name: "redis-2", Host: "10.0.0.42", DeployDir: "/aifar/apps"},
+		},
+		instances: []store.AppInstance{
+			{
+				ID:       "mysql-node-1",
+				App:      "mysql",
+				Version:  "8.0.36",
+				ServerID: "mysql-1",
+				Status:   "running",
+				Topology: "innodb-cluster",
+				Metadata: mustMetadata(t, map[string]any{
+					"clusterId": "mysql-cluster-1",
+					"endpoint":  "10.0.0.31:3306",
+					"topology":  "innodb-cluster",
+				}),
+			},
+			{
+				ID:       "mysql-router-1",
+				App:      "mysql-router",
+				Version:  "8.0.36",
+				ServerID: "router-1",
+				Status:   "running",
+				Topology: "router",
+				Metadata: mustMetadata(t, map[string]any{
+					"clusterId": "mysql-cluster-1",
+					"basePort":  6446,
+					"endpoint":  "10.0.0.30:6446",
+					"topology":  "router",
+				}),
+			},
+			{
+				ID:       "redis-node-1",
+				App:      "redis",
+				Version:  "7.2.14",
+				ServerID: "redis-1",
+				Status:   "running",
+				Topology: "sentinel",
+				Metadata: mustMetadata(t, map[string]any{
+					"clusterId":    "redis-sentinel-1",
+					"masterName":   "aifar-master",
+					"sentinel":     true,
+					"sentinelPort": 26379,
+					"topology":     "sentinel",
+				}),
+			},
+			{
+				ID:       "redis-node-2",
+				App:      "redis",
+				Version:  "7.2.14",
+				ServerID: "redis-2",
+				Status:   "running",
+				Topology: "sentinel",
+				Metadata: mustMetadata(t, map[string]any{
+					"clusterId":    "redis-sentinel-1",
+					"masterName":   "aifar-master",
+					"sentinel":     true,
+					"sentinelPort": 26379,
+					"topology":     "sentinel",
+				}),
+			},
+		},
+	}
+	remote := &fakeRemote{}
+	service := NewService(s, remote)
+	err := service.Install(context.Background(), InstallRequest{
+		Version:  "latest",
+		ServerID: "app-1",
+		Language: "en",
+		Parameters: map[string]any{
+			"dbSource":        "existing",
+			"dbInstanceId":    "mysql-node-1",
+			"dbNameNacos":     "aifar_cloud_nacos",
+			"dbUser":          "root",
+			"dbPassword":      "secret-value",
+			"redisSource":     "existing",
+			"redisInstanceId": "redis-node-1",
+			"redisPassword":   "redis-secret",
+		},
+	}, []store.Resource{{App: "aifar", Part: "backend", Version: "docker-apps", Path: filepath.Join(root, "docker-apps", ".env")}}, fakeLogger{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var instance store.AppInstance
+	for _, candidate := range s.instances {
+		if candidate.App == "aifar" {
+			instance = candidate
+			break
+		}
+	}
+	if instance.ID == "" {
+		t.Fatalf("expected AIFAR instance, got %+v", s.instances)
+	}
+	if strings.Contains(instance.Metadata, "secret-value") || strings.Contains(instance.Metadata, "redis-secret") {
+		t.Fatalf("metadata must not store database or redis passwords: %s", instance.Metadata)
+	}
+	metadata := map[string]any{}
+	if err := json.Unmarshal([]byte(instance.Metadata), &metadata); err != nil {
+		t.Fatal(err)
+	}
+	if metadata["dbHost"] != "10.0.0.30" || int(metadata["dbPort"].(float64)) != 6446 {
+		t.Fatalf("expected MySQL Router endpoint to be used, got %s", instance.Metadata)
+	}
+	if metadata["redisMode"] != "sentinel" || metadata["redisHost"] != "10.0.0.41" || int(metadata["redisPort"].(float64)) != 26379 {
+		t.Fatalf("expected Redis Sentinel endpoint to be used, got %s", instance.Metadata)
+	}
+	for _, want := range []string{
+		"DB_HOST='10.0.0.30'",
+		"DB_PORT='6446'",
+		"REDIS_MODE='sentinel'",
+		"REDIS_SENTINEL_MASTER='aifar-master'",
+		"REDIS_SENTINEL_NODES='10.0.0.41:26379,10.0.0.42:26379'",
+	} {
+		if !strings.Contains(remote.installScript, want) {
+			t.Fatalf("install script should contain %q:\n%s", want, remote.installScript)
+		}
+	}
+}
+
 func TestSelectBundleIgnoresDockerSQLVersion(t *testing.T) {
 	root := createAIFARBundle(t)
 	resources := []store.Resource{
-		{App: "aifar", Part: "backend", Version: "docker-sql", Path: filepath.Join(root, "docker-sql", "alpha_init.sql")},
+		{App: "aifar", Part: "backend", Version: "docker-sql", Path: filepath.Join(root, "docker-sql", "aifar_init.sql")},
 		{App: "aifar", Part: "backend", Version: "docker-apps", Path: filepath.Join(root, "docker-apps", ".env")},
 	}
 	bundle, err := SelectBundle(resources, "latest")
@@ -176,6 +310,15 @@ func TestSelectBundleIgnoresDockerSQLVersion(t *testing.T) {
 	if _, err := SelectBundle(resources, "docker-sql"); err == nil {
 		t.Fatal("expected docker-sql to be rejected as an installable AIFAR version")
 	}
+}
+
+func mustMetadata(t *testing.T, value map[string]any) string {
+	t.Helper()
+	data, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(data)
 }
 
 func TestServiceChecksAIFARServiceAndUpdatesStatus(t *testing.T) {
@@ -197,7 +340,7 @@ func TestServiceChecksAIFARServiceAndUpdatesStatus(t *testing.T) {
 		"totalContainers=3",
 		"runningContainers=2",
 		"unhealthyContainers=1",
-		"containers=alpha-nacos:true:healthy,alpha-gateway:false:,alpha-web-vue3:true:unhealthy,",
+		"containers=aifar-nacos:true:healthy,aifar-gateway:false:,aifar-web-vue3:true:unhealthy,",
 	}, "\n")}
 	service := NewService(s, remote)
 	result, err := service.Check(context.Background(), CheckRequest{Instance: instance, Server: s.servers["srv-1"], Language: "en"}, fakeLogger{}, nil)
@@ -207,7 +350,7 @@ func TestServiceChecksAIFARServiceAndUpdatesStatus(t *testing.T) {
 	if result.Status != "degraded" {
 		t.Fatalf("expected degraded status, got %+v", result)
 	}
-	if len(s.instances) != 1 || s.instances[0].Status != "degraded" || !strings.Contains(s.instances[0].Metadata, "alpha-gateway") {
+	if len(s.instances) != 1 || s.instances[0].Status != "degraded" || !strings.Contains(s.instances[0].Metadata, "aifar-gateway") {
 		t.Fatalf("expected status to be persisted: %+v", s.instances)
 	}
 }
@@ -220,16 +363,16 @@ func createAIFARBundle(t *testing.T) string {
 	if err := os.MkdirAll(sqlDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(sqlDir, "alpha_cloud_nacos.sql"), []byte("select 1;"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(sqlDir, "aifar_cloud_nacos.sql"), []byte("select 1;"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(sqlDir, "alpha_init.sql"), []byte("select 1;"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(sqlDir, "aifar_init.sql"), []byte("select 1;"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.MkdirAll(appDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(appDir, ".env"), []byte("APP_NETWORK_NAME=alpha-network\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(appDir, ".env"), []byte("APP_NETWORK_NAME=aifar-network\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	for _, service := range []string{"nacos", "gateway", "web-vue3"} {
@@ -237,7 +380,7 @@ func createAIFARBundle(t *testing.T) string {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			t.Fatal(err)
 		}
-		if err := os.WriteFile(filepath.Join(dir, ".env"), []byte("APP_CONTAINER_NAME=alpha-"+service+"\n"), 0o644); err != nil {
+		if err := os.WriteFile(filepath.Join(dir, ".env"), []byte("APP_CONTAINER_NAME=aifar-"+service+"\n"), 0o644); err != nil {
 			t.Fatal(err)
 		}
 		if err := os.WriteFile(filepath.Join(dir, "docker-compose.yaml"), []byte("services: {}\n"), 0o644); err != nil {

@@ -111,11 +111,15 @@ func (m Module) ValidateInstall(ctx context.Context, req registry.InstallRequest
 		return err
 	}
 	opts := optionsFromParameters(req.Parameters)
+	opts, err = m.service.resolveInstallOptions(opts)
+	if err != nil {
+		return err
+	}
 	if err := opts.Validate(); err != nil {
 		return err
 	}
 	if opts.InitSQL {
-		sqlPath := filepath.Join(bundle.SQLDir, "alpha_cloud_nacos.sql")
+		sqlPath := filepath.Join(bundle.SQLDir, "aifar_cloud_nacos.sql")
 		if _, err := os.Stat(sqlPath); err != nil {
 			return fmt.Errorf("SQL initialization requires %s: %w", sqlPath, err)
 		}

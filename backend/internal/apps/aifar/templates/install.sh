@@ -25,6 +25,14 @@ DB_PORT={{ quote .Options.DBPort }}
 DB_NAME_NACOS={{ quote .Options.DBNameNacos }}
 DB_USER={{ quote .Options.DBUser }}
 DB_PASSWORD={{ quote .Options.DBPassword }}
+REDIS_MODE={{ quote .Options.RedisMode }}
+REDIS_HOST={{ quote .Options.RedisHost }}
+REDIS_PORT={{ quote .Options.RedisPort }}
+REDIS_PASSWORD={{ quote .Options.RedisPassword }}
+REDIS_DATABASE={{ quote .Options.RedisDatabase }}
+REDIS_SENTINEL_MASTER={{ quote .Options.RedisSentinelMasterName }}
+REDIS_SENTINEL_NODES={{ quote .Options.RedisSentinelNodesCSV }}
+REDIS_CLUSTER_NODES={{ quote .Options.RedisClusterNodesCSV }}
 INIT_SQL={{ quote .Options.InitSQL }}
 
 fail() {
@@ -104,8 +112,30 @@ set_env NACOS_PORT_WEB "$NACOS_PORT_WEB" "$ROOT_ENV"
 set_env NACOS_PORT_API "$NACOS_PORT_API" "$ROOT_ENV"
 set_env NACOS_USER "$NACOS_USER" "$ROOT_ENV"
 set_env NACOS_PASSWORD "$NACOS_PASSWORD" "$ROOT_ENV"
-set_env NACOS_HOST "alpha-nacos:${NACOS_PORT_WEB}" "$ROOT_ENV"
+set_env NACOS_HOST "aifar-nacos:${NACOS_PORT_WEB}" "$ROOT_ENV"
 set_env NACOS_NS "$NACOS_NS" "$ROOT_ENV"
+set_env AIFAR_DB_HOST "$DB_HOST" "$ROOT_ENV"
+set_env AIFAR_DB_PORT "$DB_PORT" "$ROOT_ENV"
+set_env AIFAR_DB_NAME_NACOS "$DB_NAME_NACOS" "$ROOT_ENV"
+set_env AIFAR_DB_USER "$DB_USER" "$ROOT_ENV"
+set_env SPRING_DATASOURCE_HOST "$DB_HOST" "$ROOT_ENV"
+set_env SPRING_DATASOURCE_PORT "$DB_PORT" "$ROOT_ENV"
+set_env SPRING_DATASOURCE_USERNAME "$DB_USER" "$ROOT_ENV"
+set_env SPRING_DATASOURCE_PASSWORD "$DB_PASSWORD" "$ROOT_ENV"
+set_env AIFAR_REDIS_MODE "$REDIS_MODE" "$ROOT_ENV"
+set_env AIFAR_REDIS_HOST "$REDIS_HOST" "$ROOT_ENV"
+set_env AIFAR_REDIS_PORT "$REDIS_PORT" "$ROOT_ENV"
+set_env AIFAR_REDIS_DATABASE "$REDIS_DATABASE" "$ROOT_ENV"
+set_env AIFAR_REDIS_SENTINEL_MASTER "$REDIS_SENTINEL_MASTER" "$ROOT_ENV"
+set_env AIFAR_REDIS_SENTINEL_NODES "$REDIS_SENTINEL_NODES" "$ROOT_ENV"
+set_env AIFAR_REDIS_CLUSTER_NODES "$REDIS_CLUSTER_NODES" "$ROOT_ENV"
+set_env SPRING_DATA_REDIS_HOST "$REDIS_HOST" "$ROOT_ENV"
+set_env SPRING_DATA_REDIS_PORT "$REDIS_PORT" "$ROOT_ENV"
+set_env SPRING_DATA_REDIS_PASSWORD "$REDIS_PASSWORD" "$ROOT_ENV"
+set_env SPRING_DATA_REDIS_DATABASE "$REDIS_DATABASE" "$ROOT_ENV"
+set_env SPRING_DATA_REDIS_SENTINEL_MASTER "$REDIS_SENTINEL_MASTER" "$ROOT_ENV"
+set_env SPRING_DATA_REDIS_SENTINEL_NODES "$REDIS_SENTINEL_NODES" "$ROOT_ENV"
+set_env SPRING_DATA_REDIS_CLUSTER_NODES "$REDIS_CLUSTER_NODES" "$ROOT_ENV"
 
 NACOS_ENV="$APP_DIR/nacos/.env"
 set_env DB_HOST "$DB_HOST" "$NACOS_ENV"
@@ -113,13 +143,23 @@ set_env DB_PORT "$DB_PORT" "$NACOS_ENV"
 set_env DB_NAME_NACOS "$DB_NAME_NACOS" "$NACOS_ENV"
 set_env DB_USER "$DB_USER" "$NACOS_ENV"
 set_env DB_PASSWORD "$DB_PASSWORD" "$NACOS_ENV"
+set_env REDIS_MODE "$REDIS_MODE" "$NACOS_ENV"
+set_env REDIS_HOST "$REDIS_HOST" "$NACOS_ENV"
+set_env REDIS_PORT "$REDIS_PORT" "$NACOS_ENV"
+set_env REDIS_DATABASE "$REDIS_DATABASE" "$NACOS_ENV"
+set_env REDIS_SENTINEL_MASTER "$REDIS_SENTINEL_MASTER" "$NACOS_ENV"
+set_env REDIS_SENTINEL_NODES "$REDIS_SENTINEL_NODES" "$NACOS_ENV"
+set_env REDIS_CLUSTER_NODES "$REDIS_CLUSTER_NODES" "$NACOS_ENV"
+if [ -n "$REDIS_PASSWORD" ]; then
+  set_env REDIS_PASSWORD "$REDIS_PASSWORD" "$NACOS_ENV"
+fi
 
 if [ "$INIT_SQL" = "true" ]; then
   command -v mysql >/dev/null 2>&1 || fail "mysql client is required when SQL initialization is enabled"
-  [ -f "$SQL_DIR/alpha_cloud_nacos.sql" ] || fail "nacos SQL file is missing"
-  mysql --protocol=tcp -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" "-p$DB_PASSWORD" < "$SQL_DIR/alpha_cloud_nacos.sql"
-  if [ -f "$SQL_DIR/alpha_init.sql" ]; then
-    mysql --protocol=tcp -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" "-p$DB_PASSWORD" < "$SQL_DIR/alpha_init.sql"
+  [ -f "$SQL_DIR/aifar_cloud_nacos.sql" ] || fail "nacos SQL file is missing"
+  mysql --protocol=tcp -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" "-p$DB_PASSWORD" < "$SQL_DIR/aifar_cloud_nacos.sql"
+  if [ -f "$SQL_DIR/aifar_init.sql" ]; then
+    mysql --protocol=tcp -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" "-p$DB_PASSWORD" < "$SQL_DIR/aifar_init.sql"
   fi
 fi
 

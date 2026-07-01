@@ -22,9 +22,9 @@ const (
 	appBundleDir         = "docker-apps"
 	sqlBundleDir         = "docker-sql"
 	defaultTopology      = "single"
-	defaultNetworkName   = "alpha-network"
+	defaultNetworkName   = "aifar-network"
 	defaultTimezone      = "Asia/Phnom_Penh"
-	defaultDBNameNacos   = "alpha_cloud_nacos"
+	defaultDBNameNacos   = "aifar_nacos"
 	defaultNacosUser     = "nacos"
 	defaultNacosPassword = "oversea.nacos"
 	defaultNacosNS       = "dyx"
@@ -35,6 +35,14 @@ const (
 	defaultNacosWebPort  = 30099
 	defaultNacosAPIPort  = 31099
 	defaultDBPort        = 3306
+	defaultRedisHost     = "localhost"
+	defaultRedisPort     = 6379
+	defaultRedisDatabase = 1
+	dependencyManual     = "manual"
+	dependencyExisting   = "existing"
+	redisModeStandalone  = "standalone"
+	redisModeSentinel    = "sentinel"
+	redisModeCluster     = "cluster"
 )
 
 var serviceOrder = []string{
@@ -66,23 +74,35 @@ var reverseServiceOrder = []string{
 }
 
 type InstallOptions struct {
-	Timezone       string
-	NetworkName    string
-	AppCPUs        string
-	AppMemoryLimit string
-	GatewayPort    int
-	WebPort        int
-	NacosWebPort   int
-	NacosAPIPort   int
-	NacosUser      string
-	NacosPassword  string
-	NacosNamespace string
-	DBHost         string
-	DBPort         int
-	DBNameNacos    string
-	DBUser         string
-	DBPassword     string
-	InitSQL        bool
+	Timezone                string
+	NetworkName             string
+	AppCPUs                 string
+	AppMemoryLimit          string
+	GatewayPort             int
+	WebPort                 int
+	NacosWebPort            int
+	NacosAPIPort            int
+	NacosUser               string
+	NacosPassword           string
+	NacosNamespace          string
+	DBSource                string
+	DBInstanceID            string
+	DBHost                  string
+	DBPort                  int
+	DBNameNacos             string
+	DBUser                  string
+	DBPassword              string
+	RedisSource             string
+	RedisInstanceID         string
+	RedisMode               string
+	RedisHost               string
+	RedisPort               int
+	RedisPassword           string
+	RedisDatabase           int
+	RedisSentinelMasterName string
+	RedisSentinelNodes      []string
+	RedisClusterNodes       []string
+	InitSQL                 bool
 }
 
 type Bundle struct {
@@ -105,9 +125,15 @@ func optionsFromParameters(parameters map[string]any) InstallOptions {
 		NacosUser:      defaultNacosUser,
 		NacosPassword:  defaultNacosPassword,
 		NacosNamespace: defaultNacosNS,
+		DBSource:       dependencyManual,
 		DBPort:         defaultDBPort,
 		DBNameNacos:    defaultDBNameNacos,
 		DBUser:         "root",
+		RedisSource:    dependencyManual,
+		RedisMode:      redisModeStandalone,
+		RedisHost:      defaultRedisHost,
+		RedisPort:      defaultRedisPort,
+		RedisDatabase:  defaultRedisDatabase,
 	}
 	opts.Timezone = stringParam(parameters, "timezone", opts.Timezone)
 	opts.NetworkName = stringParam(parameters, "networkName", opts.NetworkName)
@@ -120,16 +146,28 @@ func optionsFromParameters(parameters map[string]any) InstallOptions {
 	opts.NacosUser = stringParam(parameters, "nacosUser", opts.NacosUser)
 	opts.NacosPassword = stringParam(parameters, "nacosPassword", opts.NacosPassword)
 	opts.NacosNamespace = stringParam(parameters, "nacosNamespace", opts.NacosNamespace)
+	opts.DBSource = normalizeDependencySource(stringParam(parameters, "dbSource", opts.DBSource))
+	opts.DBInstanceID = stringParam(parameters, "dbInstanceId", opts.DBInstanceID)
 	opts.DBHost = stringParam(parameters, "dbHost", opts.DBHost)
 	opts.DBPort = intParam(parameters, "dbPort", opts.DBPort)
 	opts.DBNameNacos = stringParam(parameters, "dbNameNacos", opts.DBNameNacos)
 	opts.DBUser = stringParam(parameters, "dbUser", opts.DBUser)
 	opts.DBPassword = stringParam(parameters, "dbPassword", opts.DBPassword)
+	opts.RedisSource = normalizeDependencySource(stringParam(parameters, "redisSource", opts.RedisSource))
+	opts.RedisInstanceID = stringParam(parameters, "redisInstanceId", opts.RedisInstanceID)
+	opts.RedisMode = normalizeRedisMode(stringParam(parameters, "redisMode", opts.RedisMode))
+	opts.RedisHost = stringParam(parameters, "redisHost", opts.RedisHost)
+	opts.RedisPort = intParam(parameters, "redisPort", opts.RedisPort)
+	opts.RedisPassword = stringParam(parameters, "redisPassword", opts.RedisPassword)
+	opts.RedisDatabase = intParam(parameters, "redisDatabase", opts.RedisDatabase)
 	opts.InitSQL = boolParam(parameters, "initSql", false)
 	return opts
 }
 
 func (o InstallOptions) Validate() error {
+	if o.DBSource == dependencyExisting && strings.TrimSpace(o.DBInstanceID) == "" {
+		return fmt.Errorf("database instance is required")
+	}
 	if strings.TrimSpace(o.DBHost) == "" {
 		return fmt.Errorf("database host is required")
 	}
@@ -142,8 +180,33 @@ func (o InstallOptions) Validate() error {
 	if strings.TrimSpace(o.DBNameNacos) == "" {
 		return fmt.Errorf("nacos database name is required")
 	}
-	if !validPort(o.DBPort) || !validPort(o.GatewayPort) || !validPort(o.WebPort) || !validPort(o.NacosWebPort) || !validPort(o.NacosAPIPort) {
+	if o.RedisSource == dependencyExisting && strings.TrimSpace(o.RedisInstanceID) == "" {
+		return fmt.Errorf("redis instance is required")
+	}
+	if strings.TrimSpace(o.RedisHost) == "" {
+		return fmt.Errorf("redis host is required")
+	}
+	if !validPort(o.DBPort) || !validPort(o.RedisPort) || !validPort(o.GatewayPort) || !validPort(o.WebPort) || !validPort(o.NacosWebPort) || !validPort(o.NacosAPIPort) {
 		return fmt.Errorf("ports must be between 1 and 65535")
+	}
+	if o.RedisDatabase < 0 || o.RedisDatabase > 15 {
+		return fmt.Errorf("redis database must be between 0 and 15")
+	}
+	switch normalizeRedisMode(o.RedisMode) {
+	case redisModeStandalone:
+	case redisModeSentinel:
+		if strings.TrimSpace(o.RedisSentinelMasterName) == "" {
+			return fmt.Errorf("redis sentinel master name is required")
+		}
+		if len(o.RedisSentinelNodes) == 0 {
+			return fmt.Errorf("redis sentinel nodes are required")
+		}
+	case redisModeCluster:
+		if len(o.RedisClusterNodes) == 0 {
+			return fmt.Errorf("redis cluster nodes are required")
+		}
+	default:
+		return fmt.Errorf("unsupported redis mode: %s", o.RedisMode)
 	}
 	for name, value := range map[string]string{
 		"timezone":       o.Timezone,
@@ -153,6 +216,9 @@ func (o InstallOptions) Validate() error {
 		"nacosUser":      o.NacosUser,
 		"nacosPassword":  o.NacosPassword,
 		"nacosNamespace": o.NacosNamespace,
+		"dbHost":         o.DBHost,
+		"redisHost":      o.RedisHost,
+		"redisMode":      o.RedisMode,
 	} {
 		if strings.TrimSpace(value) == "" {
 			return fmt.Errorf("%s is required", name)
@@ -161,7 +227,42 @@ func (o InstallOptions) Validate() error {
 			return fmt.Errorf("%s must not contain newlines", name)
 		}
 	}
+	for name, value := range map[string]string{
+		"redisSentinelMasterName": o.RedisSentinelMasterName,
+	} {
+		if strings.ContainsAny(value, "\r\n") {
+			return fmt.Errorf("%s must not contain newlines", name)
+		}
+	}
 	return nil
+}
+
+func (o InstallOptions) RedisSentinelNodesCSV() string {
+	return strings.Join(o.RedisSentinelNodes, ",")
+}
+
+func (o InstallOptions) RedisClusterNodesCSV() string {
+	return strings.Join(o.RedisClusterNodes, ",")
+}
+
+func normalizeDependencySource(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case dependencyExisting:
+		return dependencyExisting
+	default:
+		return dependencyManual
+	}
+}
+
+func normalizeRedisMode(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case redisModeSentinel:
+		return redisModeSentinel
+	case redisModeCluster:
+		return redisModeCluster
+	default:
+		return redisModeStandalone
+	}
 }
 
 func SelectBundle(resources []store.Resource, version string) (Bundle, error) {

@@ -369,3 +369,9 @@
 - 结论：对象存储实例页移除了 MinIO 安装入口；MinIO 后端新增实例健康检查，探测本机 `/minio/health/live` 并把状态写入 `lastCheck`，前端进入实例页和点击刷新状态时触发检测，展示“可用/不可用/探测中”。验证通过：go test ./internal/apps/minio、pnpm test、pnpm web:build、git diff --check。
 - 问题：用户要求对象存储实例页像数据库页一样卡片化展示 Bucket replication，一眼看出哪些 Bucket 在哪些 MinIO 节点之间同步。
 - 结论：对象存储实例页改为 MinIO 卡片分组展示；按 bucket replication group 合并实例，展示同步 Bucket、双向同步端点、复制档位和各 MinIO 节点实时状态/卸载入口。验证通过：pnpm web:build、git diff --check。
+- 问题：用户询问 AIFAR 应用安装选择已部署 MySQL/Redis 时是否最好通过环境变量接入。
+- 结论：建议面板选择已登记的 MySQL/Redis 实例作为配置来源，安装器解析出连接端点后写入 Docker Compose `.env`；环境变量适合作为部署注入载体，若后续要改 Nacos 配置应由安装器统一落库。MySQL 集群优先使用 Router endpoint，Redis Sentinel 优先使用 sentinel endpoints + masterName。
+- 问题：用户确认执行 AIFAR 安装接入已部署 MySQL/Redis 的调整。
+- 结论：AIFAR 安装弹窗新增 MySQL/Redis 来源选择，可选择已登记实例或手动填写；后端安装参数会解析 MySQL Router、Redis Sentinel/Cluster/Standalone 端点，并把 Spring/AIFAR 连接环境变量写入部署 `.env`，实例 metadata 不保存数据库或 Redis 密码。验证通过：pnpm test、pnpm web:build、git diff --check。
+- 问题：用户要求将部署链路和 Docker 资源中的 alpha 命名统一改为 aifar。
+- 结论：AIFAR 默认网络、Nacos 数据库名、SQL 文件名、安装脚本、前端默认值、Docker 镜像/容器/JAR/插件文件名、Nginx 代理和离线前端可见标题已统一为 aifar；保留 Java/Nacos 插件和编译产物中的 `alpha.*` 技术类名、CSS 前缀/标准库术语等运行时内部引用，避免破坏当前 Jar 和前端包。验证通过：pnpm test、pnpm web:build、git diff --check。
