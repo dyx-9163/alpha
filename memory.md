@@ -337,3 +337,5 @@
 - 结论：数据库页 MySQL 卡片统一为一个“卸载 MySQL”入口；InnoDB Cluster 会按 Router 优先、MySQL 节点随后一起提交批量卸载，standalone 只提交当前实例；节点行不再重复展示 MySQL 单点卸载按钮。验证通过：pnpm web:build、git diff --check。
 - 问题：用户反馈 Redis Sentinel 实际选择 3 个节点卸载时确认框只显示 2 台服务器密码。
 - 结论：原因是 1 台 Redis/Sentinel 节点只来自 Sentinel 拓扑发现，还没有登记到 `app_instances`，卸载接口只会提交真实登记实例。Redis Sentinel 检测已改为根据发现到的 master/replica/sentinel 端点自动补登记同组缺失服务器；重新执行实时监测后卸载确认会按 3 台目标服务器展示。验证通过：go test ./internal/apps/redis、pnpm test、git diff --check。
+- 问题：用户要求去掉数据库卡片中重复的 Redis 当前 Master 和 MySQL Router 端点摘要。
+- 结论：数据库页隐藏 Redis Sentinel 的当前 Master 摘要，并移除 MySQL Router 端点摘要；主/副/哨兵/Router 明细仍在节点列表展示，MySQL 当前 Primary 保留。验证通过：pnpm web:build、git diff --check。

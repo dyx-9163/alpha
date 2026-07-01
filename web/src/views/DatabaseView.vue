@@ -87,14 +87,13 @@
                 <strong>{{ group.sentinels.length }}</strong>
                 <StatusTag class="db-grid-tag" :status="group.sentinelStatus" />
               </div>
-              <div class="db-grid-wide"><span>{{ groupEndpointLabel(group) }}</span><strong>{{ group.endpoint || '-' }}</strong></div>
+              <div v-if="showGroupEndpoint(group)" class="db-grid-wide"><span>{{ groupEndpointLabel(group) }}</span><strong>{{ group.endpoint || '-' }}</strong></div>
               <div><span>{{ t('common.status') }}</span><StatusTag :status="group.status" /></div>
               <div v-if="group.routers.length">
                 <span>{{ t('database.mysqlRouter') }}</span>
                 <strong>{{ group.routers.length }}</strong>
                 <StatusTag class="db-grid-tag" :status="group.routerStatus" />
               </div>
-              <div v-if="group.routers.length" class="db-grid-wide"><span>{{ t('database.routerEndpoint') }}</span><strong>{{ routerEndpointSummary(group) }}</strong></div>
             </div>
             <div v-if="isUnavailable(group.nodeStatus)" class="service-notice danger">{{ databaseServiceUnavailableText(group) }}</div>
             <div v-if="isUnavailable(group.routerStatus)" class="service-notice danger">{{ t('database.routerServiceUnavailable') }}</div>
@@ -1023,6 +1022,10 @@ function groupEndpointLabel(group: DatabaseGroup) {
     return groupCurrentPrimaryEndpoint(group) ? t('database.currentPrimary') : t('database.accessEndpoint')
   }
   return t('common.endpoint')
+}
+
+function showGroupEndpoint(group: DatabaseGroup) {
+  return !(group.app === 'redis' && group.topology === 'sentinel')
 }
 
 function groupCurrentPrimaryEndpoint(group: DatabaseGroup) {
