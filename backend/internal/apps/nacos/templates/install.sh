@@ -38,6 +38,18 @@ open_firewall_port() {
   fi
 }
 
+dump_nacos_diagnostics() {
+  echo "Nacos systemd status"
+  $SUDO systemctl --no-pager --full status "$SERVICE_NAME" || true
+  $SUDO journalctl -u "$SERVICE_NAME" -n 120 --no-pager || true
+  for LOG_FILE in "$NACOS_HOME/logs/start.out" "$NACOS_HOME/logs/nacos.log" "$NACOS_HOME/logs/config.log" "$NACOS_HOME/logs/naming-server.log"; do
+    if [ -f "$LOG_FILE" ]; then
+      echo "----- $LOG_FILE -----"
+      $SUDO tail -n 120 "$LOG_FILE" || true
+    fi
+  done
+}
+
 echo "checking Nacos install commands"
 command -v tar >/dev/null 2>&1 || { echo "tar is required"; exit 1; }
 command -v find >/dev/null 2>&1 || { echo "find is required"; exit 1; }
@@ -98,7 +110,7 @@ if [ "$DB_ENABLED" = "1" ]; then
   cat >> "$TMP_PROPS" <<CONF
 spring.sql.init.platform=mysql
 db.num=1
-db.url.0=jdbc:mysql://$DB_HOST:$DB_PORT/$DB_NAME?characterEncoding=utf8&connectTimeout=1000&socketTimeout=3000&autoReconnect=true&useSSL=false&serverTimezone=Asia/Shanghai
+db.url.0=jdbc:mysql://$DB_HOST:$DB_PORT/$DB_NAME?characterEncoding=utf8&connectTimeout=1000&socketTimeout=3000&autoReconnect=true&useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Shanghai
 db.user.0=$DB_USER
 db.password.0=$DB_PASSWORD
 CONF
@@ -139,6 +151,7 @@ Environment=JAVA_HOME=$JDK_HOME
 Environment=JVM_XMS=$JVM_XMS
 Environment=JVM_XMX=$JVM_XMX
 Environment=JVM_XMN=$JVM_XMN
+Environment="CUSTOM_NACOS_MEMORY=-Xms$JVM_XMS -Xmx$JVM_XMX -Xmn$JVM_XMN"
 ExecStart=$NACOS_HOME/bin/startup.sh -m $MODE
 ExecStop=$NACOS_HOME/bin/shutdown.sh
 Restart=on-failure
@@ -153,11 +166,15 @@ $SUDO install -m 0644 "$WORK_DIR/$SERVICE_NAME.service" "/etc/systemd/system/$SE
 
 echo "enabling and starting Nacos"
 $SUDO systemctl daemon-reload
-if ! $SUDO systemctl enable --now "$SERVICE_NAME"; then
-  echo "Nacos service failed to start"
-  $SUDO systemctl --no-pager --full status "$SERVICE_NAME" || true
-  $SUDO journalctl -u "$SERVICE_NAME" -n 120 --no-pager || true
+if ! $SUDO systemctl enable "$SERVICE_NAME"; then
+  echo "Nacos service failed to enable"
+  dump_nacos_diagnostics
   exit 1
+fi
+START_FAILED=0
+if ! $SUDO systemctl restart "$SERVICE_NAME"; then
+  START_FAILED=1
+  echo "Nacos service start command returned non-zero; waiting for readiness before failing"
 fi
 
 echo "waiting for Nacos readiness"
@@ -175,8 +192,10 @@ for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27
 done
 if [ "$READY" != "1" ]; then
   echo "Nacos is not reachable after installation"
-  $SUDO systemctl --no-pager --full status "$SERVICE_NAME" || true
-  $SUDO journalctl -u "$SERVICE_NAME" -n 120 --no-pager || true
+  if [ "$START_FAILED" = "1" ]; then
+    echo "Nacos service start command also returned non-zero"
+  fi
+  dump_nacos_diagnostics
   exit 1
 fi
 

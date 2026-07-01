@@ -26,7 +26,15 @@ func TestInstallNacosScriptRendersClusterConfig(t *testing.T) {
 	if err != nil {
 		t.Fatalf("installNacosScript returned error: %v", err)
 	}
-	for _, want := range []string{"10.0.0.1:8848", "spring.sql.init.platform=mysql", "ExecStart=$NACOS_HOME/bin/startup.sh -m $MODE"} {
+	for _, want := range []string{
+		"10.0.0.1:8848",
+		"spring.sql.init.platform=mysql",
+		"allowPublicKeyRetrieval=true",
+		"Environment=\"CUSTOM_NACOS_MEMORY=-Xms$JVM_XMS -Xmx$JVM_XMX -Xmn$JVM_XMN\"",
+		"ExecStart=$NACOS_HOME/bin/startup.sh -m $MODE",
+		"systemctl restart \"$SERVICE_NAME\"",
+		"dump_nacos_diagnostics",
+	} {
 		if !strings.Contains(script, want) {
 			t.Fatalf("rendered script missing %q", want)
 		}

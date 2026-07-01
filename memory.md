@@ -383,3 +383,7 @@
 - 结论：新增 Nacos 前后端应用模块，后端从 `resources/nacos` 选择 Nacos server 与 x64/aarch64 JDK 包，支持 standalone 与固定 3 节点 cluster 安装、卸载和运行检测；前端应用商店新增 Nacos 安装弹窗，cluster 模式要求选择 3 个节点并填写外部 MySQL 连接。验证通过：pnpm test、pnpm web:build、git diff --check。
 - 问题：用户认为 AIFAR 安装弹窗里的 Gateway/Web/Nacos Web/Nacos API 端口配置无用，要求去掉。
 - 结论：AIFAR 安装弹窗移除这 4 个端口字段，后端仍使用默认端口值；验证通过：pnpm web:build、git diff --check。
+- 问题：用户反馈 Nacos 安装第 3/4 步在创建 systemd symlink 后报 `nacos remote command failed: Process exited with status 1`。
+- 结论：`Created symlink` 是 systemctl enable 的正常输出，不是失败原因；安装脚本改为先 enable 再 restart，并以 Nacos readiness 作为最终成功判定，避免 systemctl 启动返回码的短暂误判；同时失败时输出 systemd/journal 和 Nacos start.out/nacos.log 等诊断日志，并让 systemd 正确传入 `CUSTOM_NACOS_MEMORY`。验证通过：pnpm test、git diff --check。
+- 问题：用户提供 Nacos 启动日志并询问是否是没有统一 key。
+- 结论：根因不是 Nacos token/identity key 不统一，而是 Nacos 连接 MySQL 时 MySQL 8 `caching_sha2_password` 认证触发 `Public Key Retrieval is not allowed`；Nacos JDBC URL 已追加 `allowPublicKeyRetrieval=true`，用于允许 JDBC 驱动获取 MySQL 公钥。验证通过：go test ./internal/apps/nacos、pnpm test、git diff --check。
