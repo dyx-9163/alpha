@@ -82,6 +82,7 @@ const selectedProbing = computed(() => selectedServer.value ? probingIds.value.h
 const serverMetrics = computed(() => [
   { label: t('servers.total'), value: summary.value.total },
   { label: t('servers.availableCount'), value: summary.value.available },
+  { label: t('servers.probingCount'), value: summary.value.probing },
   { label: t('servers.unknownCount'), value: summary.value.unknown }
 ])
 

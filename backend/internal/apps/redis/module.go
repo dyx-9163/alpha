@@ -67,13 +67,11 @@ func redisTopologies(lang string) []registry.Topology {
 	if normalizeLanguage(lang) == "en" {
 		return []registry.Topology{
 			{Name: "standalone", Label: "Standalone", TargetMode: registry.TargetModeSingle, MinTargets: 1, Default: true},
-			{Name: "sentinel", Label: "Sentinel", TargetMode: registry.TargetModeMultiple, MinTargets: 3},
 			{Name: "cluster", Label: "Cluster", TargetMode: registry.TargetModeMultiple, MinTargets: 3},
 		}
 	}
 	return []registry.Topology{
 		{Name: "standalone", Label: "单体", TargetMode: registry.TargetModeSingle, MinTargets: 1, Default: true},
-		{Name: "sentinel", Label: "Sentinel", TargetMode: registry.TargetModeMultiple, MinTargets: 3},
 		{Name: "cluster", Label: "Cluster", TargetMode: registry.TargetModeMultiple, MinTargets: 3},
 	}
 }

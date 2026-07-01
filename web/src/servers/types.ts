@@ -1,4 +1,4 @@
-export type ServerStatus = 'available' | 'unknown' | 'failed' | 'running' | string
+export type ServerStatus = 'available' | 'unknown' | 'failed' | 'running' | 'probing' | string
 
 export type AuthType = 'password' | 'privateKey' | string
 

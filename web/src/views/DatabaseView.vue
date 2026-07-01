@@ -346,6 +346,7 @@ const runTasks = computed(() =>
     item.type?.startsWith('apps.mysql.') ||
     item.type?.startsWith('apps.mysql-router.') ||
     item.type?.startsWith('apps.redis.') ||
+    item.type?.startsWith('apps.redis-sentinel.') ||
     item.type?.startsWith('database.mysql.')
   )
 )
@@ -836,6 +837,8 @@ function nodeHealthLabel(node: DatabaseNode) {
       return t('database.health.online')
     case 'offline':
       return t('database.health.offline')
+    case 'probing':
+      return t('database.health.probing')
     default:
       return t('database.health.unknown')
   }
@@ -847,6 +850,8 @@ function nodeHealthType(node: DatabaseNode) {
       return 'success'
     case 'offline':
       return 'danger'
+    case 'probing':
+      return 'warning'
     default:
       return 'info'
   }
@@ -874,8 +879,8 @@ function baseNodeHealth(node: DatabaseNode) {
   if (node.virtual && !serverStatusOnline(nodeServerStatus(node))) {
     return 'unknown'
   }
-  if (monitoringRunning.value && statusIsOnline(status) && isNodeCheckStaleForCurrentMonitor(node)) {
-    return 'unknown'
+  if (monitoringRunning.value && !statusIsOffline(status) && isNodeCheckStaleForCurrentMonitor(node)) {
+    return 'probing'
   }
   if (statusIsOnline(status)) {
     return 'online'
@@ -1090,6 +1095,9 @@ function serviceStatus(nodes: DatabaseNode[]) {
   if (healths.every((status) => status === 'offline')) {
     return 'unavailable'
   }
+  if (healths.some((status) => status === 'probing')) {
+    return 'probing'
+  }
   if (healths.every((status) => status === 'unknown')) {
     return 'unknown'
   }
@@ -1103,6 +1111,9 @@ function mysqlClusterServiceStatus(group: DatabaseGroup) {
   }
   if (runtimeHealths.every((status) => status === 'offline')) {
     return 'unavailable'
+  }
+  if (runtimeHealths.some((status) => status === 'probing')) {
+    return 'probing'
   }
   const clusterHealths = group.nodes.map((node) => baseNodeHealth(node))
   const hasPrimary = !!groupCurrentPrimaryEndpoint(group)
@@ -1124,6 +1135,9 @@ function groupStatus(nodeStatus: string, routerStatus: string, hasRouters: boole
   }
   if (!hasRouters) {
     return nodeStatus
+  }
+  if (nodeStatus === 'probing' || routerStatus === 'probing') {
+    return 'probing'
   }
   if (nodeStatus === 'running' && routerStatus === 'running') {
     return 'running'
@@ -1284,8 +1298,8 @@ function mysqlRuntimeHealth(node: DatabaseNode) {
     return 'offline'
   }
   const runtimeStatus = mysqlRuntimeStatus(node)
-  if (monitoringRunning.value && statusIsOnline(runtimeStatus) && isNodeCheckStaleForCurrentMonitor(node)) {
-    return 'unknown'
+  if (monitoringRunning.value && !statusIsOffline(runtimeStatus) && isNodeCheckStaleForCurrentMonitor(node)) {
+    return 'probing'
   }
   if (statusIsOnline(runtimeStatus)) {
     return 'online'

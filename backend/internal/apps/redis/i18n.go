@@ -59,7 +59,7 @@ func CopyFor(lang string) Copy {
 		return Copy{
 			CategoryLabel:             "Database",
 			SourceLabel:               "Official source archive",
-			Description:               "Build and install Redis standalone, Sentinel, or Cluster topology from the offline source archive.",
+			Description:               "Build and install Redis base services for standalone or Cluster topology from the offline source archive.",
 			UsingArchive:              "using Redis archive: %s",
 			UsingRPMs:                 "using %d RPM dependency package(s)",
 			StepStart:                 "Redis step %d/%d started: %s",
@@ -100,7 +100,7 @@ func CopyFor(lang string) Copy {
 		return Copy{
 			CategoryLabel:             "数据库",
 			SourceLabel:               "官方源码包",
-			Description:               "基于离线源码包安装 Redis 单体、Sentinel 或 Cluster 拓扑。",
+			Description:               "基于离线源码包安装 Redis 基础服务，支持单体和 Cluster 拓扑。",
 			UsingArchive:              "使用 Redis 资源包：%s",
 			UsingRPMs:                 "使用 %d 个 RPM 依赖包",
 			StepStart:                 "Redis 步骤 %d/%d 开始：%s",

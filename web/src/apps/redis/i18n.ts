@@ -10,9 +10,9 @@ export const redisMessages = {
     title: 'Redis',
     categoryLabel: '数据库',
     sourceLabel: '官方源码包',
-    description: '基于离线源码包安装 Redis 单体、Sentinel 或 Cluster 拓扑。',
+    description: '基于离线源码包安装 Redis 基础服务，支持单体和 Cluster 拓扑。',
     installTitle: '安装 Redis',
-    hint: 'Sentinel 按官方 master group 模型部署：本次创建一个监控组，Redis Master 只能选 1 台，Replica 可选多台，Sentinel 节点可选多台且建议至少 3 台奇数节点；Sentinel 可与 Master/Replica 同机，也可独立部署。多个 master group 请分别部署，Redis Cluster 才是多主分片拓扑。',
+    hint: '这里安装 Redis 基础服务。需要高可用哨兵时，请先完成 Redis 基础服务，再使用 Redis 哨兵安装入口配置 Sentinel。',
     version: '版本',
     versionPlaceholder: '选择版本',
     servers: '目标服务器',
@@ -48,9 +48,9 @@ export const redisMessages = {
     title: 'Redis',
     categoryLabel: 'Database',
     sourceLabel: 'Official source archive',
-    description: 'Build and install Redis standalone, Sentinel, or Cluster topology from the offline source archive.',
+    description: 'Build and install Redis base services for standalone or Cluster topology from the offline source archive.',
     installTitle: 'Install Redis',
-    hint: 'Sentinel follows the official master-group model: this install creates one monitored group, exactly one Redis master is selected, replicas can be multiple nodes, and Sentinel can run on multiple nodes with at least 3 odd nodes recommended. Sentinel may be colocated with master/replicas or deployed on dedicated nodes. Deploy separate master groups separately; Redis Cluster is the multi-master sharding topology.',
+    hint: 'Install Redis base services here. For Sentinel high availability, install the Redis base service first, then use the Redis Sentinel installer to configure Sentinel.',
     version: 'Version',
     versionPlaceholder: 'Select version',
     servers: 'Target server',
@@ -96,7 +96,6 @@ export function redisTopologies(locale?: string): AppTopologyDefinition[] {
   const copy = redisCopy(locale)
   return [
     { name: 'standalone', label: copy.standalone, targetMode: 'single', minTargets: 1, default: true },
-    { name: 'sentinel', label: copy.sentinel, targetMode: 'multiple', minTargets: 3 },
     { name: 'cluster', label: copy.cluster, targetMode: 'multiple', minTargets: 3 }
   ]
 }

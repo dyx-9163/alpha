@@ -39,6 +39,9 @@ const label = computed(() => {
       return t('status.pending')
     case 'staged':
       return t('status.staged')
+    case 'probing':
+    case 'checking':
+      return t('status.probing')
     case 'unknown':
       return t('common.unknown')
     default:
@@ -61,6 +64,8 @@ const type = computed(() => {
     case 'deploying':
     case 'pending':
     case 'staged':
+    case 'probing':
+    case 'checking':
     case 'stopped':
     case 'degraded':
       return 'warning'

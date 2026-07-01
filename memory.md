@@ -311,3 +311,5 @@
 - 结论：截图显示 133 的 Sentinel 配置和监听都存在，Navicat 报 timed out 更像 133 主机防火墙/安全策略拦截 26379，而不是密码、组名或 bind 配置错误；建议从客户端和 131/132 对 133:26379 做 TCP 连通性测试，并检查/放行 133 的 firewalld/iptables/nftables 26379/tcp。
 - 问题：用户发现 Redis Sentinel 的 192.168.74.133 节点监听了 26379，但 firewalld 未自动添加 26379/tcp。
 - 结论：Redis Sentinel 配置脚本改为启动前后幂等确保 Redis/Sentinel 端口的 firewalld 与 SELinux 规则；Redis Sentinel 检测任务也会补齐既有实例缺失的服务访问规则，重新执行监测即可修复缺失的 26379/tcp。验证通过：go test ./internal/apps/redis ./internal/installer/selinux、pnpm test、git diff --check。
+- 问题：用户要求所有探测过程中的“未知”改为“探测中”，并把 Redis 安装像 MySQL 一样拆成基础服务安装和哨兵安装。
+- 结论：服务器探测和数据库实时监测的进行中状态统一展示为“探测中”；应用商店 Redis 基础服务仅保留单体/Cluster，新增独立 Redis Sentinel 前后端模块并复用 Redis 离线资源。验证通过：pnpm test、pnpm web:build、git diff --check。

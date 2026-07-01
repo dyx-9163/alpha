@@ -51,6 +51,7 @@ export function useServerWorkbench(t: (key: string, params?: Record<string, unkn
   const summary = computed(() => ({
     total: servers.value.length,
     available: servers.value.filter((server) => server.status === 'available').length,
+    probing: servers.value.filter((server) => server.status === 'probing').length,
     unknown: servers.value.filter((server) => !server.status || server.status === 'unknown').length
   }))
 
@@ -118,7 +119,7 @@ export function useServerWorkbench(t: (key: string, params?: Record<string, unkn
 
   async function probe(row: ServerRecord) {
     setProbing(row.id, true)
-    patchServerStatus(row.id, 'running', '')
+    patchServerStatus(row.id, 'probing', '')
     activeTab.value = 'overview'
     try {
       const result = await probeServer(row.id)

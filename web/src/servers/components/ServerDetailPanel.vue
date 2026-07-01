@@ -32,7 +32,7 @@
             <div class="key">{{ t('servers.name') }}</div><div>{{ server.name }}</div>
             <div class="key">{{ t('servers.host') }}</div><div>{{ server.host }}</div>
             <div class="key">{{ t('servers.username') }}</div><div>{{ server.username }}</div>
-            <div class="key">{{ t('common.status') }}</div><div><StatusTag :status="server.status" /></div>
+            <div class="key">{{ t('common.status') }}</div><div><StatusTag :status="displayedStatus" /></div>
             <div class="key">{{ t('servers.deployDir') }}</div><div>{{ server.deployDir || '/aifar/apps' }}</div>
             <div class="key">{{ t('servers.tags') }}</div><div>{{ server.tags || '-' }}</div>
             <div class="key">{{ t('common.message') }}</div><div>{{ server.lastError || t('common.available') }}</div>
@@ -45,7 +45,7 @@
           <div class="capability-grid">
             <div class="capability-card">
               <span>{{ t('servers.sshCapability') }}</span>
-              <StatusTag :status="server.status" />
+              <StatusTag :status="displayedStatus" />
             </div>
           </div>
         </section>
@@ -60,7 +60,7 @@
       <div v-else-if="tab === 'runtime'" class="capability-grid runtime-grid">
         <div class="metric-card">
           <div class="label">SSH</div>
-          <div class="value">{{ server.status === 'available' ? t('common.available') : t('common.unknown') }}</div>
+          <div class="value">{{ runtimeStatusText }}</div>
         </div>
         <div class="metric-card">
           <div class="label">{{ t('servers.deployDir') }}</div>
@@ -91,6 +91,16 @@ defineEmits<{
 }>()
 const { t } = useI18n()
 const authTypeLabel = computed(() => props.server?.authType === 'privateKey' ? t('servers.authPrivateKey') : t('servers.authPassword'))
+const displayedStatus = computed(() => props.probing ? 'probing' : props.server?.status || 'unknown')
+const runtimeStatusText = computed(() => {
+  if (displayedStatus.value === 'available') {
+    return t('common.available')
+  }
+  if (displayedStatus.value === 'probing') {
+    return t('common.probing')
+  }
+  return t('common.unknown')
+})
 </script>
 
 <style scoped>
