@@ -51,6 +51,7 @@ func (m Module) Manifest(lang string) registry.Manifest {
 		Capabilities: []string{
 			"apps.minio.install",
 			"apps.minio.delete",
+			"apps.minio.check",
 			"resources.minio.verify",
 			"storage.minio.register",
 		},
@@ -192,4 +193,32 @@ func (m Module) Delete(ctx context.Context, req registry.DeleteRequest, run regi
 	}, run.Log, func(target string) Logger {
 		return run.LoggerForTarget(target)
 	})
+}
+
+func (m Module) PlanCheck(ctx context.Context, req registry.CheckRequest) ([]registry.InstallStepPlan, error) {
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	copy := CheckCopyFor(req.Language)
+	steps := minioCheckSteps(copy)
+	target := req.Instance.ServerID
+	if target == "" {
+		target = req.Server.ID
+	}
+	plan := make([]registry.InstallStepPlan, 0, len(steps))
+	for idx, step := range steps {
+		plan = append(plan, registry.InstallStepPlan{Target: target, Name: step.Name, Title: step.Title, Order: idx + 1})
+	}
+	return plan, nil
+}
+
+func (m Module) Check(ctx context.Context, req registry.CheckRequest, run registry.RunContext) (registry.InstanceStatus, error) {
+	result, err := m.service.Check(ctx, CheckRequest{
+		Instance: req.Instance,
+		Server:   req.Server,
+		Language: req.Language,
+	}, run.Log, func(target string) Logger {
+		return run.LoggerForTarget(target)
+	})
+	return registry.InstanceStatus{Status: result.Status, Message: result.Message, Details: result.Details}, err
 }

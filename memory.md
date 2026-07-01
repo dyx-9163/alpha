@@ -365,3 +365,5 @@
 - 结论：200M 会落入 MinIO 大对象复制范畴，且同机数据库使磁盘 I/O 成为主要风险；建议默认异步复制、恢复追赶期 priority=slow、max_lrg_workers=1、max_workers=8-16，避免自动全量 resync，并优先用独立磁盘/网络或 OS QoS 限制复制流量。
 - 问题：用户反馈 Redis 数据节点停止后，同宿主 Sentinel 节点也被页面标成离线，但 Sentinel 端口仍可正常连接。
 - 结论：Redis Sentinel 检测已拆分数据服务和 Sentinel 服务状态，分别写入数据 `lastCheck` 与 `sentinelLastCheck`；前端 Sentinel 行使用独立 Sentinel 状态展示，数据节点停止不再覆盖同宿主 Sentinel 在线状态；`go test ./internal/apps/redis`、`pnpm web:build`、`pnpm test`、`git diff --check` 已通过。
+- 问题：用户要求对象存储页面去掉 MinIO 安装按钮，并且实例状态不能显示“已安装”，要实时探测 MinIO 是否可用。
+- 结论：对象存储实例页移除了 MinIO 安装入口；MinIO 后端新增实例健康检查，探测本机 `/minio/health/live` 并把状态写入 `lastCheck`，前端进入实例页和点击刷新状态时触发检测，展示“可用/不可用/探测中”。验证通过：go test ./internal/apps/minio、pnpm test、pnpm web:build、git diff --check。

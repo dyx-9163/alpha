@@ -28,12 +28,6 @@
           <el-select v-if="tab !== 'instances'" v-model="selectedInstanceId" :placeholder="t('storage.selectInstance')" class="toolbar-control">
             <el-option v-for="item in instances" :key="item.id" :label="instanceLabel(item)" :value="item.id" />
           </el-select>
-          <el-select v-if="tab === 'instances'" v-model="serverId" :placeholder="t('database.targetServer')" class="toolbar-control">
-            <el-option v-for="server in servers" :key="server.id" :label="server.name" :value="server.id" />
-          </el-select>
-          <el-tooltip :content="deniedText" :disabled="canManageStorage" placement="top">
-            <span><el-button v-if="tab === 'instances'" type="primary" :disabled="!canManageStorage" @click="installMinio">{{ t('storage.install') }}</el-button></span>
-          </el-tooltip>
           <el-tooltip :content="deniedText" :disabled="canManageStorage" placement="top">
             <span><el-button v-if="tab === 'buckets'" type="primary" :disabled="!canManageStorage" @click="openItemDialog('bucket')">{{ t('storage.addBucket') }}</el-button></span>
           </el-tooltip>
@@ -49,7 +43,7 @@
           <el-tooltip :content="deniedText" :disabled="canManageStorage" placement="top">
             <span><el-button v-if="tab === 'replica'" type="primary" :disabled="!canManageStorage" @click="openItemDialog('replica')">{{ t('storage.addReplica') }}</el-button></span>
           </el-tooltip>
-          <el-button @click="loadActive">{{ t('storage.refreshStatus') }}</el-button>
+          <el-button :loading="checkingInstances" @click="loadActive(true)">{{ t('storage.refreshStatus') }}</el-button>
         </div>
       </div>
 
@@ -60,7 +54,7 @@
           <el-table-column :label="t('storage.server')" min-width="220"><template #default="{ row }">{{ serverName(row.serverId) }}</template></el-table-column>
           <el-table-column :label="t('common.endpoint')" min-width="220" show-overflow-tooltip><template #default="{ row }">{{ metadataOf(row).endpoint || '-' }}</template></el-table-column>
           <el-table-column prop="topology" :label="t('dashboard.topology')" width="140" />
-          <el-table-column prop="status" :label="t('common.status')" width="120"><template #default="{ row }"><StatusTag :status="row.status" /></template></el-table-column>
+          <el-table-column prop="status" :label="t('common.status')" width="120"><template #default="{ row }"><StatusTag :status="displayInstanceStatus(row)" /></template></el-table-column>
           <el-table-column :label="t('common.operation')" width="120" fixed="right">
             <template #default="{ row }">
               <el-tooltip :content="deniedText" :disabled="canManageApps" placement="top">
@@ -248,10 +242,11 @@ const router = useRouter()
 const instances = ref<AppInstance[]>([])
 const servers = ref<any[]>([])
 const tasks = ref<any[]>([])
-const serverId = ref('')
 const selectedInstanceId = ref('')
 const tab = ref('instances')
 const search = ref('')
+const checkingInstances = ref(false)
+const checkingInstanceIds = ref<Set<string>>(new Set())
 const itemDialogVisible = ref(false)
 const deleteDialogVisible = ref(false)
 const deleteSubmitting = ref(false)
@@ -309,16 +304,29 @@ const deleteInstanceUsesMountedDisks = computed(() => {
 })
 
 async function load() {
-  instances.value = asArray(await apiGet<AppInstance[] | null>('/storage/instances').catch(() => []))
-  servers.value = asArray(await apiGet<any[] | null>('/servers').catch(() => []))
-  tasks.value = asArray(await apiGet<any[] | null>('/tasks').catch(() => []))
+  await reloadStorageState()
   if (!selectedInstanceId.value && instances.value.length) {
     selectedInstanceId.value = instances.value[0].id
   }
   await loadActive()
 }
 
-async function loadActive() {
+async function reloadStorageState() {
+  const [nextInstances, nextServers, nextTasks] = await Promise.all([
+    apiGet<AppInstance[] | null>('/storage/instances').catch(() => []),
+    apiGet<any[] | null>('/servers').catch(() => []),
+    apiGet<any[] | null>('/tasks').catch(() => [])
+  ])
+  instances.value = asArray(nextInstances)
+  servers.value = asArray(nextServers)
+  tasks.value = asArray(nextTasks)
+}
+
+async function loadActive(manual = false) {
+  if (tab.value === 'instances') {
+    await refreshMinioStatus(manual)
+    return
+  }
   if (!selectedInstanceId.value) return
   if (tab.value === 'buckets') await loadCollection('bucket')
   if (tab.value === 'objects') await loadCollection('object')
@@ -333,15 +341,6 @@ async function loadCollection(kind: StorageKind) {
   const path = collectionPath(kind)
   const result = await apiGet<{ items?: any[] }>(path).catch(() => ({ items: [] }))
   collection[collectionKey(kind)] = asArray(result.items)
-}
-
-async function installMinio() {
-  if (!canManageStorage.value) {
-    ElMessage.warning(deniedText.value)
-    return
-  }
-  const result = await apiPost<{ taskId: string }>('/storage/instances', { serverId: serverId.value, version: 'latest' })
-  void router.push({ path: '/tasks', query: { taskId: result.taskId } })
 }
 
 function openItemDialog(kind: StorageKind) {
@@ -459,6 +458,80 @@ function metadataOf(item: AppInstance) {
   }
 }
 
+function displayInstanceStatus(item: AppInstance) {
+  if (checkingInstanceIds.value.has(item.id)) {
+    return 'checking'
+  }
+  const lastCheck = metadataOf(item).lastCheck as Record<string, any> | undefined
+  const checkedStatus = String(lastCheck?.status || '').trim()
+  if (checkedStatus) {
+    return checkedStatus
+  }
+  if (item.status === 'installed') {
+    return 'checking'
+  }
+  return item.status
+}
+
+async function refreshMinioStatus(manual = false) {
+  if (!canManageApps.value) {
+    if (manual) {
+      ElMessage.warning(deniedText.value)
+    }
+    return
+  }
+  if (checkingInstances.value) {
+    return
+  }
+  const rows = instances.value.filter((item) => item.app === 'minio')
+  if (!rows.length) {
+    return
+  }
+  checkingInstances.value = true
+  checkingInstanceIds.value = new Set(rows.map((item) => item.id))
+  try {
+    const taskIds: string[] = []
+    for (const item of rows) {
+      try {
+        const result = await apiPost<{ taskId: string }>(`/apps/instances/${item.id}/check`)
+        if (result.taskId) {
+          taskIds.push(result.taskId)
+        }
+      } catch (err) {
+        if (manual) {
+          ElMessage.warning(err instanceof Error ? err.message : t('apps.checkServiceFailed'))
+        }
+      }
+    }
+    if (taskIds.length) {
+      await waitForTasks(taskIds)
+    }
+    await reloadStorageState()
+  } finally {
+    checkingInstances.value = false
+    checkingInstanceIds.value = new Set()
+  }
+}
+
+async function waitForTasks(taskIds: string[]) {
+  const pending = new Set(taskIds)
+  const deadline = Date.now() + 30000
+  while (pending.size && Date.now() < deadline) {
+    await delay(500)
+    const latest = asArray<any>(await apiGet<any[] | null>('/tasks').catch(() => []))
+    tasks.value = latest
+    for (const task of latest) {
+      if (pending.has(task.id) && !['pending', 'running'].includes(task.status)) {
+        pending.delete(task.id)
+      }
+    }
+  }
+}
+
+function delay(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
 function serverName(id: string) {
   const server = servers.value.find((item) => item.id === id)
   return server ? `${server.name} (${server.host})` : id || '-'
@@ -468,7 +541,9 @@ function instanceLabel(item: AppInstance) {
   return `${item.app}-${item.id.slice(-6)} / ${serverName(item.serverId)}`
 }
 
-watch([tab, selectedInstanceId], loadActive)
+watch([tab, selectedInstanceId], () => {
+  void loadActive()
+})
 onMounted(load)
 </script>
 

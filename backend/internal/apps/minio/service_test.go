@@ -30,9 +30,23 @@ func (f *fakeStore) SaveAppInstance(v store.AppInstance) (store.AppInstance, err
 	defer f.mu.Unlock()
 	if v.ID == "" {
 		v.ID = store.NewID("app")
+		v.CreatedAt = time.Now()
+	} else {
+		for idx := range f.instances {
+			if f.instances[idx].ID == v.ID {
+				if v.CreatedAt.IsZero() {
+					v.CreatedAt = f.instances[idx].CreatedAt
+				}
+				v.UpdatedAt = time.Now()
+				f.instances[idx] = v
+				return v, nil
+			}
+		}
 	}
-	v.CreatedAt = time.Now()
-	v.UpdatedAt = v.CreatedAt
+	if v.CreatedAt.IsZero() {
+		v.CreatedAt = time.Now()
+	}
+	v.UpdatedAt = time.Now()
 	f.instances = append(f.instances, v)
 	return v, nil
 }
@@ -407,5 +421,40 @@ func TestServiceDeletesMinioRemotelyBeforeRemovingInstance(t *testing.T) {
 	}
 	if !strings.Contains(joinedCommands, `INSTALL_ROOT='/aifar/apps/minio'`) || !strings.Contains(joinedCommands, `rm -rf "$ROOT"`) {
 		t.Fatalf("expected remote command to remove minio install root: %s", joinedCommands)
+	}
+}
+
+func TestServiceChecksMinioHealthAndUpdatesInstanceStatus(t *testing.T) {
+	instance := store.AppInstance{
+		ID:       "app-1",
+		App:      "minio",
+		Version:  "2025-10-15T17-29-55Z",
+		ServerID: "srv-1",
+		Status:   "installed",
+		Topology: "standalone",
+		Metadata: `{"apiPort":9002,"endpoint":"http://10.0.0.3:9002","serviceName":"aifar-minio"}`,
+	}
+	s := &fakeStore{
+		servers:   map[string]store.Server{"srv-1": {ID: "srv-1", Name: "s3-1", Host: "10.0.0.3", DeployDir: "/aifar/apps"}},
+		instances: []store.AppInstance{instance},
+	}
+	remote := &fakeRemote{}
+	service := NewService(s, remote)
+	result, err := service.Check(context.Background(), CheckRequest{Instance: instance, Server: s.servers["srv-1"], Language: "en"}, fakeLogger{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != "available" {
+		t.Fatalf("expected available minio status, got %+v", result)
+	}
+	if len(s.instances) != 1 || s.instances[0].Status != "available" {
+		t.Fatalf("expected minio instance status to be updated in place: %+v", s.instances)
+	}
+	if !strings.Contains(s.instances[0].Metadata, `"lastCheck"`) || !strings.Contains(s.instances[0].Metadata, `"status":"available"`) {
+		t.Fatalf("expected lastCheck metadata to be recorded: %s", s.instances[0].Metadata)
+	}
+	joinedCommands := remote.joinedCommands()
+	if !strings.Contains(joinedCommands, "/minio/health/live") || !strings.Contains(joinedCommands, "API_PORT=9002") {
+		t.Fatalf("expected health endpoint probe command: %s", joinedCommands)
 	}
 }
