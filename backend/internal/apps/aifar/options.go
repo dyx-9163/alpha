@@ -33,7 +33,7 @@ const (
 	defaultMemoryLimit   = "2GB"
 	defaultGatewayPort   = 38000
 	defaultWebPort       = 8080
-	defaultNacosWebPort  = 8848
+	defaultNacosWebPort  = 9849
 	defaultNacosAPIPort  = 9848
 	defaultDBPort        = 3306
 	defaultRedisHost     = "localhost"

@@ -397,3 +397,5 @@
 - 结论：Sentinel 模式下应用配置应去掉单机 `host/port`，改用 `spring.data.redis.sentinel.master` 和所有 Sentinel 节点 `host:26379`；`database`、Redis 数据密码和 lettuce 连接池仍保留，若 Sentinel 自身启用认证再单独配置 `sentinel.password`。
 - 问题：用户提供 AIFAR 服务安装日志，Docker Compose 因已存在 `aifar-network` 且缺少 Compose network label 失败。
 - 结论：AIFAR 安装脚本改为把共享 Docker 网络作为 external network 处理：安装前确保网络存在，并将各服务 compose 文件的 `${APP_NETWORK_NAME}` 网络标记为 `external: true`，避免预创建网络与 Compose label 校验冲突。验证通过：`go test ./internal/apps/aifar`、`pnpm test`、`git diff --check`。
+- 问题：用户要求 AIFAR 内置 Nacos 默认端口改为 9849、命名空间为 prod、时区默认使用系统时区，并确认安装目录使用 `/aifar/apps/admin`。
+- 结论：AIFAR 默认 Nacos Web 端口已改为 9849；安装脚本会按安装参数修正 Nacos `server.port`，将随包 SQL 中旧 `dyx` 命名空间改写为目标命名空间，并在 `timezone=system` 时解析目标机系统时区；安装根目录保持 `/aifar/apps/admin`。验证通过：`go test ./internal/apps/aifar`、`pnpm test`、`git diff --check`。

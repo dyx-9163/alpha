@@ -113,6 +113,40 @@ resolve_system_timezone() {
   esac
 }
 
+patch_nacos_server_port() {
+  props="$APP_DIR/nacos/conf/application.properties"
+  [ -f "$props" ] || return 0
+  tmp="${props}.tmp"
+  awk -v port="$NACOS_PORT_WEB" '
+    BEGIN { patched = 0 }
+    /^server[.]port=/ {
+      print "server.port=" port
+      patched = 1
+      next
+    }
+    { print }
+    END {
+      if (!patched) {
+        print "server.port=" port
+      }
+    }
+  ' "$props" > "$tmp"
+  mv "$tmp" "$props"
+}
+
+sql_literal_escape() {
+  printf "%s" "$1" | sed "s/'/''/g"
+}
+
+patch_nacos_sql_namespace() {
+  sql_file="$SQL_DIR/aifar_cloud_nacos.sql"
+  [ -f "$sql_file" ] || return 0
+  escaped_ns="$(sql_literal_escape "$NACOS_NS")"
+  tmp="${sql_file}.tmp"
+  awk -v replacement="'$escaped_ns'" "{ gsub(/'dyx'/, replacement); print }" "$sql_file" > "$tmp"
+  mv "$tmp" "$sql_file"
+}
+
 down_existing() {
   [ -d "$APP_DIR" ] || return 0
   prepare_compose_networks || true
@@ -181,6 +215,8 @@ set_env SPRING_DATA_REDIS_DATABASE "$REDIS_DATABASE" "$ROOT_ENV"
 set_env SPRING_DATA_REDIS_SENTINEL_MASTER "$REDIS_SENTINEL_MASTER" "$ROOT_ENV"
 set_env SPRING_DATA_REDIS_SENTINEL_NODES "$REDIS_SENTINEL_NODES" "$ROOT_ENV"
 set_env SPRING_DATA_REDIS_CLUSTER_NODES "$REDIS_CLUSTER_NODES" "$ROOT_ENV"
+patch_nacos_server_port
+patch_nacos_sql_namespace
 
 NACOS_ENV="$APP_DIR/nacos/.env"
 set_env DB_HOST "$DB_HOST" "$NACOS_ENV"

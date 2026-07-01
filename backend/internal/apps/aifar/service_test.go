@@ -182,6 +182,9 @@ func TestServiceInstallsAIFARServiceFromDockerAppsBundle(t *testing.T) {
 	if !strings.Contains(remote.installScript, "resolve_system_timezone") || !strings.Contains(remote.installScript, "timedatectl show -p Timezone") {
 		t.Fatalf("AIFAR install script should resolve system timezone:\n%s", remote.installScript)
 	}
+	if !strings.Contains(remote.installScript, "patch_nacos_server_port") || !strings.Contains(remote.installScript, "patch_nacos_sql_namespace") {
+		t.Fatalf("AIFAR install script should patch Nacos defaults from install options:\n%s", remote.installScript)
+	}
 }
 
 func TestServiceResolvesManagedDatabaseAndRedisInstances(t *testing.T) {
