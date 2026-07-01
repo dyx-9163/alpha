@@ -61,11 +61,13 @@ func minioTopologies(lang string) []registry.Topology {
 	if normalizeLanguage(lang) == "en" {
 		return []registry.Topology{
 			{Name: "standalone", Label: "Standalone", TargetMode: registry.TargetModeSingle, MinTargets: 1, Default: true},
+			{Name: "bucket-replication", Label: "Bucket replication DR", TargetMode: registry.TargetModeMultiple, MinTargets: 2},
 			{Name: "distributed", Label: "Distributed", TargetMode: registry.TargetModeMultiple, MinTargets: 4},
 		}
 	}
 	return []registry.Topology{
 		{Name: "standalone", Label: "单体", TargetMode: registry.TargetModeSingle, MinTargets: 1, Default: true},
+		{Name: "bucket-replication", Label: "Bucket 复制容灾", TargetMode: registry.TargetModeMultiple, MinTargets: 2},
 		{Name: "distributed", Label: "分布式", TargetMode: registry.TargetModeMultiple, MinTargets: 4},
 	}
 }
@@ -117,6 +119,10 @@ func (m Module) ValidateInstall(ctx context.Context, req registry.InstallRequest
 		if len(targets) > 1 {
 			return errors.New(copy.SingleTargetOnly)
 		}
+	case "bucket-replication":
+		if len(targets) != 2 {
+			return errors.New(copy.BucketReplicationNeedNodes)
+		}
 	case "distributed":
 		if len(targets) < 4 {
 			return errors.New(copy.DistributedNeedNodes)
@@ -133,6 +139,11 @@ func (m Module) ValidateInstall(ctx context.Context, req registry.InstallRequest
 	}
 	if err := validateMinioStorage(req.Parameters, targets...); err != nil {
 		return err
+	}
+	if topology == "bucket-replication" {
+		if err := validateMinioReplicationOptions(minioReplicationOptions(req.Parameters)); err != nil {
+			return err
+		}
 	}
 	return minioOptions(req.Parameters, req.DefaultPassword).Validate()
 }

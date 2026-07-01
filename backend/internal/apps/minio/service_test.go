@@ -188,6 +188,64 @@ func TestServiceInstallsDistributedMinioAndRecordsEachNode(t *testing.T) {
 	}
 }
 
+func TestServiceInstallsBucketReplicationMinioAndRecordsEachNode(t *testing.T) {
+	root := t.TempDir()
+	archive := filepath.Join(root, "minio-RELEASE.2025-10-15T17-29-55Z.tar.gz")
+	goArchive := filepath.Join(root, "go", "1.24.8", "go1.24.8.linux-amd64.tar.gz")
+	goModCache := filepath.Join(root, "go", "cache", "gomodcache-linux-amd64.tar.gz")
+	mc := filepath.Join(root, "mc.linux-amd64.RELEASE.2025-08-13T08-35-41Z")
+	for _, dir := range []string{filepath.Dir(goArchive), filepath.Dir(goModCache)} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, file := range []string{archive, goArchive, goModCache, mc} {
+		if err := os.WriteFile(file, []byte("minio"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s := &fakeStore{servers: map[string]store.Server{
+		"srv-1": {ID: "srv-1", Name: "s3-a", Host: "10.0.0.1", DeployDir: "/aifar/apps"},
+		"srv-2": {ID: "srv-2", Name: "s3-b", Host: "10.0.0.2", DeployDir: "/aifar/apps"},
+	}}
+	remote := &fakeRemote{}
+	service := NewService(s, remote)
+	err := service.Install(context.Background(), InstallRequest{
+		Version:         "2025-10-15T17-29-55Z",
+		Topology:        "bucket-replication",
+		Language:        "en",
+		DefaultPassword: "Oversea.123",
+		ServerIDs:       []string{"srv-1", "srv-2"},
+		Parameters: map[string]any{
+			"apiPort":                    9000,
+			"consolePort":                9001,
+			"rootUser":                   "admin",
+			"replicationBuckets":         "aifar,logs",
+			"replicationPriority":        "slow",
+			"replicationMaxWorkers":      8,
+			"replicationMaxLargeWorkers": 1,
+		},
+	}, []store.Resource{{App: "minio", Part: "backend", Version: "2025-10-15T17-29-55Z", Path: archive}}, fakeLogger{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(s.instances) != 2 {
+		t.Fatalf("expected two minio replication instances, got %d", len(s.instances))
+	}
+	for _, instance := range s.instances {
+		if instance.Topology != "bucket-replication" || !strings.Contains(instance.Metadata, `"replicationMode":"bucket"`) || strings.Contains(instance.Metadata, "Oversea.123") {
+			t.Fatalf("expected safe bucket replication metadata: %+v", instance)
+		}
+		if !strings.Contains(instance.Metadata, `"replicationMaxWorkers":8`) || !strings.Contains(instance.Metadata, `"replicationMaxLargeWorkers":1`) {
+			t.Fatalf("expected replication tuning metadata: %s", instance.Metadata)
+		}
+	}
+	joinedCommands := remote.joinedCommands()
+	if !strings.Contains(joinedCommands, "AIFAR_MINIO_BUCKET_REPLICATION") || !strings.Contains(joinedCommands, `"$MC" replicate add`) {
+		t.Fatalf("expected bucket replication configure action: %s", joinedCommands)
+	}
+}
+
 func TestServiceUsesConcurrencyForDistributedMinioInstalls(t *testing.T) {
 	root := t.TempDir()
 	archive := filepath.Join(root, "minio-RELEASE.2025-10-15T17-29-55Z.tar.gz")
@@ -315,6 +373,16 @@ func TestValidateMinioStorageRequiresDeviceForUnmountedDisk(t *testing.T) {
 		"dataRoot":    "/data/minio",
 	}); err != nil {
 		t.Fatalf("expected valid local storage config: %v", err)
+	}
+}
+
+func TestMinioReplicationOptionsDefaultToConservativeAsyncProfile(t *testing.T) {
+	options := minioReplicationOptions(map[string]any{})
+	if strings.Join(options.Buckets, ",") != "aifar" || options.Priority != "slow" || options.MaxWorkers != 8 || options.MaxLargeWorkers != 1 || options.ReplicateDeletes {
+		t.Fatalf("unexpected default replication options: %+v", options)
+	}
+	if err := validateMinioReplicationOptions(options); err != nil {
+		t.Fatalf("expected default replication options to be valid: %v", err)
 	}
 }
 

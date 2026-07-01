@@ -10,9 +10,9 @@ export const minioMessages = {
     title: 'MinIO',
     categoryLabel: '对象存储',
     sourceLabel: '官方源码包',
-    description: '基于离线源码包安装 MinIO 单体或分布式拓扑。',
+    description: '基于离线源码包安装 MinIO 单体、Bucket 复制容灾或分布式拓扑。',
     installTitle: '安装 MinIO',
-    hint: '单体使用单台服务器；分布式拓扑至少需要 4 台服务器。存储可直接使用本地目录，或按每块磁盘独立挂载点的方式格式化并挂载多块未挂载磁盘。',
+    hint: '单体使用单台服务器；Bucket 复制容灾使用 2 台单节点 MinIO 并配置双向异步 Bucket replication；分布式拓扑至少需要 4 台服务器。',
     version: '版本',
     versionPlaceholder: '选择版本',
     servers: '目标服务器',
@@ -23,7 +23,18 @@ export const minioMessages = {
     submit: '开始安装',
     topology: '拓扑',
     standalone: '单体',
+    bucketReplication: 'Bucket 复制容灾',
     distributed: '分布式',
+    replicationBuckets: '复制 Bucket',
+    replicationBucketsPlaceholder: '多个 Bucket 用逗号分隔，例如 aifar, logs',
+    replicationBucketsInvalid: 'Bucket 名称只能使用小写字母、数字、点和短横线，长度 3-63，多个名称用逗号分隔',
+    replicationPriority: '复制优先级',
+    replicationPrioritySlow: '保守',
+    replicationPriorityAuto: '均衡',
+    replicationPriorityFast: '快速',
+    replicationMaxWorkers: '复制并发',
+    replicationMaxLargeWorkers: '大文件并发',
+    replicateDeletes: '复制删除',
     storageMode: '存储方式',
     storageModeLocal: '直接使用本地目录',
     storageModeUnmounted: '使用未挂载磁盘',
@@ -44,9 +55,9 @@ export const minioMessages = {
     title: 'MinIO',
     categoryLabel: 'Storage',
     sourceLabel: 'Official source archive',
-    description: 'Build and install MinIO standalone or distributed topology from the offline source archive.',
+    description: 'Build and install MinIO standalone, bucket replication DR, or distributed topology from the offline source archive.',
     installTitle: 'Install MinIO',
-    hint: 'Standalone uses one server; distributed topology requires at least 4 servers. Storage can use a local directory directly or format and mount one or more unmounted disks with one mount point per disk.',
+    hint: 'Standalone uses one server; bucket replication DR uses two standalone MinIO nodes with two-way async bucket replication; distributed topology requires at least 4 servers.',
     version: 'Version',
     versionPlaceholder: 'Select version',
     servers: 'Target server',
@@ -57,7 +68,18 @@ export const minioMessages = {
     submit: 'Start install',
     topology: 'Topology',
     standalone: 'Standalone',
+    bucketReplication: 'Bucket replication DR',
     distributed: 'Distributed',
+    replicationBuckets: 'Replication buckets',
+    replicationBucketsPlaceholder: 'Separate multiple buckets with commas, for example aifar, logs',
+    replicationBucketsInvalid: 'Bucket names must use lowercase letters, numbers, dots, and hyphens, be 3-63 chars, and be separated by commas',
+    replicationPriority: 'Replication priority',
+    replicationPrioritySlow: 'Conservative',
+    replicationPriorityAuto: 'Balanced',
+    replicationPriorityFast: 'Fast',
+    replicationMaxWorkers: 'Replication workers',
+    replicationMaxLargeWorkers: 'Large object workers',
+    replicateDeletes: 'Replicate deletes',
     storageMode: 'Storage mode',
     storageModeLocal: 'Use local directory',
     storageModeUnmounted: 'Use unmounted disk',
@@ -88,6 +110,7 @@ export function minioTopologies(locale?: string): AppTopologyDefinition[] {
   const copy = minioCopy(locale)
   return [
     { name: 'standalone', label: copy.standalone, targetMode: 'single', minTargets: 1, default: true },
+    { name: 'bucket-replication', label: copy.bucketReplication, targetMode: 'multiple', minTargets: 2 },
     { name: 'distributed', label: copy.distributed, targetMode: 'multiple', minTargets: 4 }
   ]
 }
@@ -138,6 +161,58 @@ export function minioInstallDialogProps(locale?: string, context?: AppInstallDia
         type: 'number',
         defaultValue: 9001,
         required: true
+      },
+      {
+        name: 'replicationBuckets',
+        label: copy.replicationBuckets,
+        type: 'text',
+        defaultValue: 'aifar',
+        placeholder: copy.replicationBucketsPlaceholder,
+        required: true,
+        visibleWhen: (values) => values.topology === 'bucket-replication',
+        validate: (value) => validateBucketList(value, copy.replicationBucketsInvalid)
+      },
+      {
+        name: 'replicationPriority',
+        label: copy.replicationPriority,
+        type: 'select',
+        defaultValue: 'slow',
+        required: true,
+        visibleWhen: (values) => values.topology === 'bucket-replication',
+        options: [
+          { label: copy.replicationPrioritySlow, value: 'slow' },
+          { label: copy.replicationPriorityAuto, value: 'auto' },
+          { label: copy.replicationPriorityFast, value: 'fast' }
+        ]
+      },
+      {
+        name: 'replicationMaxWorkers',
+        label: copy.replicationMaxWorkers,
+        type: 'number',
+        defaultValue: 8,
+        min: 1,
+        max: 512,
+        step: 1,
+        required: true,
+        visibleWhen: (values) => values.topology === 'bucket-replication'
+      },
+      {
+        name: 'replicationMaxLargeWorkers',
+        label: copy.replicationMaxLargeWorkers,
+        type: 'number',
+        defaultValue: 1,
+        min: 1,
+        max: 64,
+        step: 1,
+        required: true,
+        visibleWhen: (values) => values.topology === 'bucket-replication'
+      },
+      {
+        name: 'replicateDeletes',
+        label: copy.replicateDeletes,
+        type: 'switch',
+        defaultValue: false,
+        visibleWhen: (values) => values.topology === 'bucket-replication'
       },
       {
         name: 'dataRoot',
@@ -196,4 +271,16 @@ function minioDefaultDataRoot(defaultDeployDir?: string) {
     return '/aifar/apps/minio/data'
   }
   return `${deployDir.replace(/\/+$/, '')}/minio/data`
+}
+
+function validateBucketList(value: unknown, message: string) {
+  const text = String(value ?? '').trim()
+  if (!text) {
+    return message
+  }
+  const names = text.split(/[,\s;]+/).map((item) => item.trim()).filter(Boolean)
+  const bucketRe = /^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$/
+  return names.every((name) => bucketRe.test(name) && !name.includes('..') && !name.includes('.-') && !name.includes('-.'))
+    ? undefined
+    : message
 }

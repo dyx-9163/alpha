@@ -117,6 +117,9 @@ MINIO_ROOT_USER="$ROOT_USER"
 MINIO_ROOT_PASSWORD="$ROOT_PASSWORD"
 MINIO_VOLUMES="$MINIO_VOLUME_LIST"
 MINIO_OPTS="--address :$API_PORT --console-address :$CONSOLE_PORT"
+{{if .ReplicationPriority}}MINIO_API_REPLICATION_PRIORITY={{shq .ReplicationPriority}}{{end}}
+{{if gt .ReplicationMaxWorkers 0}}MINIO_API_REPLICATION_MAX_WORKERS={{.ReplicationMaxWorkers}}{{end}}
+{{if gt .ReplicationMaxLargeWorkers 0}}MINIO_API_REPLICATION_MAX_LRG_WORKERS={{.ReplicationMaxLargeWorkers}}{{end}}
 CONF
 $SUDO install -m 0600 "$WORK_DIR/minio.env" "$ENV_FILE"
 

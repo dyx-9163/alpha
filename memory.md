@@ -345,3 +345,21 @@
 - 结论：原因是页面先渲染控制面实例记录，再异步加载服务器清单并执行实例检测，期间会短暂显示未归一化的 Redis/MySQL 拓扑。数据库页初次进入改为先完成首轮实时检测再展示实例卡片，并把实例、服务器和任务数据改为一次性原子更新，避免中间态闪烁。验证通过：pnpm web:build、git diff --check。
 - 问题：用户反馈数据库页为避免中间态而等待首轮实时检测，导致骨架屏接近 10 秒才消失。
 - 结论：数据库页改为先快速加载并展示本地控制面快照，再后台执行实时监测；保留实例/服务器/任务原子加载，并在前端去重 Redis Sentinel 数据节点、哨兵和 Router，减少首屏未监测前的重复行。验证通过：pnpm web:build、git diff --check。
+- 问题：用户询问当前 MinIO 分布式集群实现，并判断在只有 2-3 台服务器、主要诉求为容灾时是否应采用 bucket replication。
+- 结论：当前 MinIO distributed 是 4 台及以上服务器组成一个 MinIO erasure/quorum 集群，所有节点共享同一 MINIO_VOLUMES 列表；2-3 台服务器场景更适合多个 standalone MinIO 加异步 bucket replication 做容灾，但面板当前 Storage replica 仍是控制面记录，尚未真正下发 MinIO replication 配置。
+- 问题：用户选择 MinIO 1 主 + 1 灾备方案，询问是否可以双向复制以及问题。
+- 结论：MinIO 支持 active-active/two-way bucket replication，但 1 主 + 1 灾备更建议默认单向 active-passive；双向复制适合两端都承担读写的场景，会引入异步一致性、冲突/删除标记、生命周期规则一致性、故障恢复切换和复制积压监控等运维复杂度。
+- 问题：用户接受 MinIO 主备异步复制且确认不会出现同名写入，继续追问删除/生命周期、故障回切和复制积压如何约束。
+- 结论：建议产品层固定为 active-passive：只有主站可写、灾备默认只读；强制 bucket versioning，删除/生命周期按“镜像容灾”或“防误删容灾”二选一；故障切换必须由面板切换 active site 并禁止旧主自动回写；恢复时先按新主到旧主 resync，再允许回切；面板持续监控 replication status/backlog/failed。
+- 问题：用户说明 MinIO 实际使用方式为 A 服务连接 MinIO A，B 服务连接 MinIO B，正常只有 A 承载业务，A down 后 B 接管。
+- 结论：该场景是应用层 active-passive 主备；推荐默认单向 A->B bucket replication，故障切换时把 B 标记为 active 并阻断 A 写入，A 恢复后先执行 B->A 反向同步/重同步并确认复制积压和失败项清零，再决定保持 B active 或回切 A。
+- 问题：用户明确 MinIO 容灾要使用 bucket replication，而不是 site replication。
+- 结论：方案应限定为按 bucket 配置对象级复制；站点级配置、IAM、用户、策略、bucket 创建、应用连接信息等不能依赖复制自动同步，需要由面板显式在两端创建/校验，并只对业务 bucket 建立 A->B 或故障后的 B->A 复制关系。
+- 问题：用户说明 A/B 服务不可能同时承载流量，询问 MinIO bucket replication 做双向复制是否还有问题。
+- 结论：在严格单活写入约束下，双向 bucket replication 可行，主要风险降为异步 RPO、删除/生命周期策略一致性、复制队列积压和误切换；产品应仍维护 active 站点、禁止两边同时写，并监控 pending/failed/backlog。
+- 问题：用户补充客户侧通过 DNS 切换保证主应用只连接对应 MinIO，不会同时承载流量。
+- 结论：可把流量切换职责交给客户 DNS，面板侧提供双向 bucket replication 配置、两端 bucket/versioning/IAM/policy 校验和复制状态监控；仍需提示 DNS TTL/连接池导致的短暂重叠风险以及异步复制 RPO。
+- 问题：用户担心 MinIO bucket replication 在故障恢复后追赶同步占满网络和磁盘 I/O，询问能否单独设置以保证服务不 down。
+- 结论：MinIO 可通过 replication priority、max_workers、max_lrg_workers 和异步复制降低复制资源占用，但这属于进程级复制调优，不是精确的单 bucket 带宽上限；建议面板提供“复制保护模式”，恢复期默认 slow + 小 worker 数，并监控 backlog、失败项、API 延迟、CPU、磁盘和网络，必要时配合独立复制网卡/VLAN 或 OS 网络 QoS 做硬限速。
+- 问题：用户补充客户单文件最大 200M，服务器 32C/64GB 且同机部署 MySQL、Redis、Nacos。
+- 结论：200M 会落入 MinIO 大对象复制范畴，且同机数据库使磁盘 I/O 成为主要风险；建议默认异步复制、恢复追赶期 priority=slow、max_lrg_workers=1、max_workers=8-16，避免自动全量 resync，并优先用独立磁盘/网络或 OS QoS 限制复制流量。

@@ -18,6 +18,9 @@ var standaloneUninstallScriptTemplate string
 //go:embed templates/distributed/configure-node.sh
 var distributedConfigureScriptTemplate string
 
+//go:embed templates/replication/configure-bucket.sh
+var bucketReplicationConfigureScriptTemplate string
+
 var minioScriptFuncs = selinux.AddTemplateFuncs(template.FuncMap{
 	"shq": installerkit.ShellQuote,
 })
@@ -42,6 +45,10 @@ func configureDistributedNodeScript(req DistributedNodeConfig) (string, error) {
 	return installerkit.RenderTemplate("minio", "distributed/configure-node.sh", "minio-distributed-configure", distributedConfigureScriptTemplate, minioScriptFuncs, req)
 }
 
+func configureBucketReplicationScript(req BucketReplicationConfig) (string, error) {
+	return installerkit.RenderTemplate("minio", "replication/configure-bucket.sh", "minio-bucket-replication-configure", bucketReplicationConfigureScriptTemplate, minioScriptFuncs, req)
+}
+
 func normalizeInstallScriptRequest(req InstallScriptRequest) InstallScriptRequest {
 	req.DataDirs = minioVolumeDirs(req.DataDir, req.DataDirs, req.InstallRoot)
 	req.DataDir = req.DataDirs[0]
@@ -52,20 +59,23 @@ func normalizeInstallScriptRequest(req InstallScriptRequest) InstallScriptReques
 }
 
 type InstallScriptRequest struct {
-	Version        string
-	WorkDir        string
-	ArchivePath    string
-	GoArchivePath  string
-	GoModCachePath string
-	MCRemotePath   string
-	InstallRoot    string
-	DataDir        string
-	DataDirs       []string
-	VolumeList     string
-	APIPort        int
-	ConsolePort    int
-	RootUser       string
-	RootPassword   string
+	Version                    string
+	WorkDir                    string
+	ArchivePath                string
+	GoArchivePath              string
+	GoModCachePath             string
+	MCRemotePath               string
+	InstallRoot                string
+	DataDir                    string
+	DataDirs                   []string
+	VolumeList                 string
+	APIPort                    int
+	ConsolePort                int
+	RootUser                   string
+	RootPassword               string
+	ReplicationPriority        string
+	ReplicationMaxWorkers      int
+	ReplicationMaxLargeWorkers int
 }
 
 type UninstallScriptRequest struct {
@@ -92,4 +102,16 @@ type DistributedVolume struct {
 	Host string
 	Port int
 	Path string
+}
+
+type BucketReplicationConfig struct {
+	InstallRoot      string
+	APIPort          int
+	LocalEndpoint    string
+	PeerEndpoint     string
+	PeerRemotePrefix string
+	RootUser         string
+	RootPassword     string
+	Buckets          []string
+	ReplicateDeletes bool
 }

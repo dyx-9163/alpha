@@ -114,6 +114,9 @@ func TestInstallerUploadsResourcesAndRunsMinioScript(t *testing.T) {
 	if !strings.Contains(remote.installScript, `MINIO_ROOT_PASSWORD="$ROOT_PASSWORD"`) {
 		t.Fatalf("installer should write root password into env file:\n%s", remote.installScript)
 	}
+	if strings.Contains(remote.installScript, `MINIO_API_REPLICATION_PRIORITY`) {
+		t.Fatalf("standalone installer should not set replication tuning without replication options:\n%s", remote.installScript)
+	}
 	if !strings.Contains(remote.installScript, `DATA_DIR='/aifar/apps/minio/data'`) {
 		t.Fatalf("installer should render selected data directory:\n%s", remote.installScript)
 	}
@@ -239,6 +242,30 @@ func TestMinIOStandaloneScriptsRenderTemplates(t *testing.T) {
 	if !strings.Contains(install, "VERSION='2025-10-15T17-29-55Z'") || !strings.Contains(install, "API_PORT=9000") || !strings.Contains(install, "CONSOLE_PORT=9001") {
 		t.Fatalf("install script did not render core standalone variables:\n%s", install)
 	}
+	replicationInstall, err := installStandaloneScript(InstallScriptRequest{
+		Version:                    "2025-10-15T17-29-55Z",
+		WorkDir:                    "/aifar/apps/_work/minio",
+		ArchivePath:                "/tmp/minio.tar.gz",
+		GoArchivePath:              "/tmp/go.tar.gz",
+		GoModCachePath:             "/tmp/gomod.tar.gz",
+		InstallRoot:                "/aifar/apps/minio",
+		DataDir:                    "/data/minio",
+		APIPort:                    9000,
+		ConsolePort:                9001,
+		RootUser:                   "admin",
+		RootPassword:               "Oversea.123",
+		ReplicationPriority:        "slow",
+		ReplicationMaxWorkers:      8,
+		ReplicationMaxLargeWorkers: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(replicationInstall, "MINIO_API_REPLICATION_PRIORITY='slow'") ||
+		!strings.Contains(replicationInstall, "MINIO_API_REPLICATION_MAX_WORKERS=8") ||
+		!strings.Contains(replicationInstall, "MINIO_API_REPLICATION_MAX_LRG_WORKERS=1") {
+		t.Fatalf("install script should render replication tuning env vars:\n%s", replicationInstall)
+	}
 	distributed, err := configureDistributedNodeScript(DistributedNodeConfig{
 		Version:      "2025-10-15T17-29-55Z",
 		InstallRoot:  "/aifar/apps/minio",
@@ -254,6 +281,22 @@ func TestMinIOStandaloneScriptsRenderTemplates(t *testing.T) {
 	if !strings.Contains(distributed, `open_firewall_ports "$API_PORT" "$CONSOLE_PORT"`) ||
 		!strings.Contains(distributed, `allow_selinux_ports http_port_t "$API_PORT" "$CONSOLE_PORT"`) {
 		t.Fatalf("distributed script should open firewall and SELinux rules for MinIO ports:\n%s", distributed)
+	}
+	replication, err := configureBucketReplicationScript(BucketReplicationConfig{
+		InstallRoot:      "/aifar/apps/minio",
+		APIPort:          9000,
+		LocalEndpoint:    "http://127.0.0.1:9000",
+		PeerEndpoint:     "http://10.0.0.2:9000",
+		PeerRemotePrefix: "http://admin:secret@10.0.0.2:9000",
+		RootUser:         "admin",
+		RootPassword:     "Oversea.123",
+		Buckets:          []string{"aifar"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(replication, `"$MC" replicate add "$LOCAL_ALIAS/$BUCKET"`) || !strings.Contains(replication, `REPLICATE_FLAGS="existing-objects"`) {
+		t.Fatalf("replication script should configure bucket replication:\n%s", replication)
 	}
 	uninstall, err := uninstallStandaloneScript("2025-10-15T17-29-55Z", "/aifar/apps/minio", "/aifar/apps/minio/2025-10-15T17-29-55Z", 9000, UninstallOptions{})
 	if err != nil {

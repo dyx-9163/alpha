@@ -3,32 +3,35 @@ package minio
 import "strings"
 
 type Copy struct {
-	CategoryLabel          string
-	SourceLabel            string
-	Description            string
-	UsingArchive           string
-	UsingGoToolchain       string
-	UsingGoModCache        string
-	UsingRPMs              string
-	MissingRPMWarning      string
-	StepStart              string
-	StepDone               string
-	StepFailed             string
-	LoadServer             string
-	VerifyResource         string
-	SelectDataDisk         string
-	InstallStandalone      string
-	ConfigureDistributed   string
-	RecordInstance         string
-	LoadFailed             string
-	InstallFailed          string
-	RecordFailed           string
-	Installed              string
-	DistributedInstalled   string
-	TargetRequired         string
-	SingleTargetOnly       string
-	DistributedNeedNodes   string
-	DistributedUnsupported string
+	CategoryLabel              string
+	SourceLabel                string
+	Description                string
+	UsingArchive               string
+	UsingGoToolchain           string
+	UsingGoModCache            string
+	UsingRPMs                  string
+	MissingRPMWarning          string
+	StepStart                  string
+	StepDone                   string
+	StepFailed                 string
+	LoadServer                 string
+	VerifyResource             string
+	SelectDataDisk             string
+	InstallStandalone          string
+	ConfigureDistributed       string
+	ConfigureBucketReplication string
+	RecordInstance             string
+	LoadFailed                 string
+	InstallFailed              string
+	RecordFailed               string
+	Installed                  string
+	DistributedInstalled       string
+	BucketReplicationInstalled string
+	TargetRequired             string
+	SingleTargetOnly           string
+	DistributedNeedNodes       string
+	BucketReplicationNeedNodes string
+	DistributedUnsupported     string
 }
 
 type DeleteCopy struct {
@@ -45,61 +48,67 @@ func CopyFor(lang string) Copy {
 	switch normalizeLanguage(lang) {
 	case "en":
 		return Copy{
-			CategoryLabel:          "Storage",
-			SourceLabel:            "Official source archive",
-			Description:            "Build and install MinIO standalone or distributed topology from the offline source archive.",
-			UsingArchive:           "using MinIO archive: %s",
-			UsingGoToolchain:       "using Go toolchain: %s",
-			UsingGoModCache:        "using Go module cache: %s",
-			UsingRPMs:              "using %d RPM dependency package(s)",
-			MissingRPMWarning:      "MinIO RPM cache is empty; the installer will continue if build dependencies already exist on the target server",
-			StepStart:              "MinIO step %d/%d started: %s",
-			StepDone:               "MinIO step %d/%d completed: %s",
-			StepFailed:             "MinIO step %d/%d failed: %s: %v",
-			LoadServer:             "load target server",
-			VerifyResource:         "verify MinIO offline resource",
-			SelectDataDisk:         "select MinIO data disk",
-			InstallStandalone:      "build and install MinIO base service",
-			ConfigureDistributed:   "configure MinIO distributed topology",
-			RecordInstance:         "record MinIO app instance",
-			LoadFailed:             "load server failed: %s",
-			InstallFailed:          "MinIO install failed: %s",
-			RecordFailed:           "record MinIO instance failed: %s",
-			Installed:              "MinIO standalone installed, instance recorded: %s",
-			DistributedInstalled:   "MinIO distributed topology installed, %d instance record(s) created",
-			TargetRequired:         "MinIO install requires target server(s)",
-			SingleTargetOnly:       "MinIO standalone install supports only one target server",
-			DistributedNeedNodes:   "MinIO distributed topology requires at least 4 target servers",
-			DistributedUnsupported: "MinIO topology is not supported: %s",
+			CategoryLabel:              "Storage",
+			SourceLabel:                "Official source archive",
+			Description:                "Build and install MinIO standalone, bucket replication DR, or distributed topology from the offline source archive.",
+			UsingArchive:               "using MinIO archive: %s",
+			UsingGoToolchain:           "using Go toolchain: %s",
+			UsingGoModCache:            "using Go module cache: %s",
+			UsingRPMs:                  "using %d RPM dependency package(s)",
+			MissingRPMWarning:          "MinIO RPM cache is empty; the installer will continue if build dependencies already exist on the target server",
+			StepStart:                  "MinIO step %d/%d started: %s",
+			StepDone:                   "MinIO step %d/%d completed: %s",
+			StepFailed:                 "MinIO step %d/%d failed: %s: %v",
+			LoadServer:                 "load target server",
+			VerifyResource:             "verify MinIO offline resource",
+			SelectDataDisk:             "select MinIO data disk",
+			InstallStandalone:          "build and install MinIO base service",
+			ConfigureDistributed:       "configure MinIO distributed topology",
+			ConfigureBucketReplication: "configure MinIO bucket replication",
+			RecordInstance:             "record MinIO app instance",
+			LoadFailed:                 "load server failed: %s",
+			InstallFailed:              "MinIO install failed: %s",
+			RecordFailed:               "record MinIO instance failed: %s",
+			Installed:                  "MinIO standalone installed, instance recorded: %s",
+			DistributedInstalled:       "MinIO distributed topology installed, %d instance record(s) created",
+			BucketReplicationInstalled: "MinIO bucket replication topology installed, %d instance record(s) created",
+			TargetRequired:             "MinIO install requires target server(s)",
+			SingleTargetOnly:           "MinIO standalone install supports only one target server",
+			DistributedNeedNodes:       "MinIO distributed topology requires at least 4 target servers",
+			BucketReplicationNeedNodes: "MinIO bucket replication requires exactly 2 target servers",
+			DistributedUnsupported:     "MinIO topology is not supported: %s",
 		}
 	default:
 		return Copy{
-			CategoryLabel:          "对象存储",
-			SourceLabel:            "官方源码包",
-			Description:            "基于离线源码包安装 MinIO 单体或分布式拓扑。",
-			UsingArchive:           "使用 MinIO 源码包：%s",
-			UsingGoToolchain:       "使用 Go 工具链：%s",
-			UsingGoModCache:        "使用 Go 模块缓存：%s",
-			UsingRPMs:              "使用 %d 个 RPM 依赖包",
-			MissingRPMWarning:      "MinIO RPM 缓存为空；如果目标服务器已经具备构建依赖，安装会继续执行",
-			StepStart:              "MinIO 步骤 %d/%d 开始：%s",
-			StepDone:               "MinIO 步骤 %d/%d 完成：%s",
-			StepFailed:             "MinIO 步骤 %d/%d 失败：%s：%v",
-			LoadServer:             "读取目标服务器",
-			VerifyResource:         "校验 MinIO 离线资源",
-			SelectDataDisk:         "选择 MinIO 数据磁盘",
-			InstallStandalone:      "编译并安装 MinIO 基础服务",
-			ConfigureDistributed:   "配置 MinIO 分布式拓扑",
-			RecordInstance:         "记录 MinIO 应用实例",
-			LoadFailed:             "读取服务器失败：%s",
-			InstallFailed:          "MinIO 安装失败：%s",
-			RecordFailed:           "记录 MinIO 实例失败：%s",
-			Installed:              "MinIO 单体已安装，实例已记录：%s",
-			DistributedInstalled:   "MinIO 分布式拓扑已安装，已记录 %d 个实例",
-			TargetRequired:         "MinIO 安装需要选择目标服务器",
-			SingleTargetOnly:       "MinIO 单体安装只支持一个目标服务器",
-			DistributedNeedNodes:   "MinIO 分布式拓扑至少需要 4 台目标服务器",
-			DistributedUnsupported: "MinIO 不支持该拓扑：%s",
+			CategoryLabel:              "对象存储",
+			SourceLabel:                "官方源码包",
+			Description:                "基于离线源码包安装 MinIO 单体、Bucket 复制容灾或分布式拓扑。",
+			UsingArchive:               "使用 MinIO 源码包：%s",
+			UsingGoToolchain:           "使用 Go 工具链：%s",
+			UsingGoModCache:            "使用 Go 模块缓存：%s",
+			UsingRPMs:                  "使用 %d 个 RPM 依赖包",
+			MissingRPMWarning:          "MinIO RPM 缓存为空；如果目标服务器已经具备构建依赖，安装会继续执行",
+			StepStart:                  "MinIO 步骤 %d/%d 开始：%s",
+			StepDone:                   "MinIO 步骤 %d/%d 完成：%s",
+			StepFailed:                 "MinIO 步骤 %d/%d 失败：%s：%v",
+			LoadServer:                 "读取目标服务器",
+			VerifyResource:             "校验 MinIO 离线资源",
+			SelectDataDisk:             "选择 MinIO 数据磁盘",
+			InstallStandalone:          "编译并安装 MinIO 基础服务",
+			ConfigureDistributed:       "配置 MinIO 分布式拓扑",
+			ConfigureBucketReplication: "配置 MinIO Bucket 复制",
+			RecordInstance:             "记录 MinIO 应用实例",
+			LoadFailed:                 "读取服务器失败：%s",
+			InstallFailed:              "MinIO 安装失败：%s",
+			RecordFailed:               "记录 MinIO 实例失败：%s",
+			Installed:                  "MinIO 单体已安装，实例已记录：%s",
+			DistributedInstalled:       "MinIO 分布式拓扑已安装，已记录 %d 个实例",
+			BucketReplicationInstalled: "MinIO Bucket 复制拓扑已安装，已记录 %d 个实例",
+			TargetRequired:             "MinIO 安装需要选择目标服务器",
+			SingleTargetOnly:           "MinIO 单体安装只支持一个目标服务器",
+			DistributedNeedNodes:       "MinIO 分布式拓扑至少需要 4 台目标服务器",
+			BucketReplicationNeedNodes: "MinIO Bucket 复制需要且只支持 2 台目标服务器",
+			DistributedUnsupported:     "MinIO 不支持该拓扑：%s",
 		}
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path"
 	"path/filepath"
@@ -93,20 +94,23 @@ func (i Installer) Install(ctx context.Context, server store.Server, bundle Bund
 
 	volumeDirs := minioVolumeDirs(req.DataDir, req.DataDirs, installRoot)
 	script, err := installStandaloneScript(InstallScriptRequest{
-		Version:        bundle.Version,
-		WorkDir:        workDir,
-		ArchivePath:    archiveRemote,
-		GoArchivePath:  goArchiveRemote,
-		GoModCachePath: goModCacheRemote,
-		MCRemotePath:   mcRemote,
-		InstallRoot:    installRoot,
-		DataDir:        volumeDirs[0],
-		DataDirs:       volumeDirs,
-		VolumeList:     strings.Join(volumeDirs, " "),
-		APIPort:        req.APIPort,
-		ConsolePort:    req.ConsolePort,
-		RootUser:       req.RootUser,
-		RootPassword:   req.RootPassword,
+		Version:                    bundle.Version,
+		WorkDir:                    workDir,
+		ArchivePath:                archiveRemote,
+		GoArchivePath:              goArchiveRemote,
+		GoModCachePath:             goModCacheRemote,
+		MCRemotePath:               mcRemote,
+		InstallRoot:                installRoot,
+		DataDir:                    volumeDirs[0],
+		DataDirs:                   volumeDirs,
+		VolumeList:                 strings.Join(volumeDirs, " "),
+		APIPort:                    req.APIPort,
+		ConsolePort:                req.ConsolePort,
+		RootUser:                   req.RootUser,
+		RootPassword:               req.RootPassword,
+		ReplicationPriority:        req.ReplicationPriority,
+		ReplicationMaxWorkers:      req.ReplicationMaxWorkers,
+		ReplicationMaxLargeWorkers: req.ReplicationMaxLargeWorkers,
 	})
 	if err != nil {
 		return err
@@ -197,13 +201,25 @@ func (i Installer) ConfigureDistributedNode(ctx context.Context, server store.Se
 	return err
 }
 
+func (i Installer) ConfigureBucketReplication(ctx context.Context, server store.Server, req BucketReplicationConfig, log Logger) error {
+	script, err := configureBucketReplicationScript(req)
+	if err != nil {
+		return err
+	}
+	_, err = i.run(ctx, server, "sh -s <<'AIFAR_MINIO_BUCKET_REPLICATION'\n"+script+"\nAIFAR_MINIO_BUCKET_REPLICATION", log)
+	return err
+}
+
 type InstallOptions struct {
-	APIPort      int
-	ConsolePort  int
-	RootUser     string
-	RootPassword string
-	DataDir      string
-	DataDirs     []string
+	APIPort                    int
+	ConsolePort                int
+	RootUser                   string
+	RootPassword               string
+	DataDir                    string
+	DataDirs                   []string
+	ReplicationPriority        string
+	ReplicationMaxWorkers      int
+	ReplicationMaxLargeWorkers int
 }
 
 const (
@@ -421,6 +437,19 @@ func selectedDataDirFromOutput(output string) string {
 		return ""
 	}
 	return strings.TrimSpace(match[1])
+}
+
+func minioEndpoint(host string, port int) string {
+	return fmt.Sprintf("http://%s:%d", strings.TrimSpace(host), port)
+}
+
+func minioRemoteBucketPrefix(host string, port int, user, password string) string {
+	u := url.URL{
+		Scheme: "http",
+		Host:   fmt.Sprintf("%s:%d", strings.TrimSpace(host), port),
+		User:   url.UserPassword(user, password),
+	}
+	return u.String()
 }
 
 func (i Installer) run(ctx context.Context, server store.Server, command string, log Logger) (installerkit.CommandResult, error) {

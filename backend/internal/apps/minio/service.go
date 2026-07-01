@@ -66,6 +66,8 @@ func (s Service) Install(ctx context.Context, req InstallRequest, resources []st
 	switch topology {
 	case "distributed":
 		return s.installDistributed(ctx, req, resources, log, targetLog)
+	case "bucket-replication":
+		return s.installBucketReplication(ctx, req, resources, log, targetLog)
 	case "standalone":
 	default:
 		return fmt.Errorf(copy.DistributedUnsupported, topology)
@@ -361,6 +363,195 @@ func (s Service) installDistributed(ctx context.Context, req InstallRequest, res
 	return nil
 }
 
+func (s Service) installBucketReplication(ctx context.Context, req InstallRequest, resources []store.Resource, log Logger, targetLog targetLogger) error {
+	copy := CopyFor(req.Language)
+	targets := targetServerIDs(req)
+	if len(targets) != 2 {
+		return errors.New(copy.BucketReplicationNeedNodes)
+	}
+	options := minioOptions(req.Parameters, req.DefaultPassword)
+	replication := minioReplicationOptions(req.Parameters)
+	if err := validateMinioReplicationOptions(replication); err != nil {
+		return err
+	}
+	options.ReplicationPriority = replication.Priority
+	options.ReplicationMaxWorkers = replication.MaxWorkers
+	options.ReplicationMaxLargeWorkers = replication.MaxLargeWorkers
+	if err := options.Validate(); err != nil {
+		return err
+	}
+	bundle, err := SelectBundle(resources, req.Version)
+	if err != nil {
+		return err
+	}
+	if err := VerifyBundle(bundle); err != nil {
+		return err
+	}
+	log.Info(copy.UsingArchive, bundle.ArchivePath)
+	log.Info(copy.UsingGoToolchain, bundle.GoArchivePath)
+	log.Info(copy.UsingGoModCache, bundle.GoModCachePath)
+	log.Info(copy.UsingRPMs, len(bundle.RPMPaths))
+
+	groupID := store.NewID("minio_rep")
+	preloadedServers := make(map[string]store.Server, len(targets))
+	for _, target := range targets {
+		server, loadErr := s.store.GetServer(target, true)
+		if loadErr != nil {
+			return loadErr
+		}
+		preloadedServers[target] = server
+	}
+
+	installer := NewInstaller(s.remote)
+	recorder, _ := log.(stepRecorder)
+	steps := minioInstallStepsFor("bucket-replication", copy)
+	targetIndexes := make(map[string]int, len(targets))
+	for idx, target := range targets {
+		targetIndexes[target] = idx
+	}
+	dataDirs := make([][]string, len(targets))
+	failures := taskrun.RunTargets(ctx, targets, req.Concurrency, func(target string) error {
+		logForServer := logForTarget(log, targetLog, target)
+		if recorder != nil {
+			recorder.StartTarget(target)
+		}
+		step := newStepRunnerWithSteps(logForServer, recorder, target, copy, steps)
+		server := preloadedServers[target]
+		if err := step(1, "load-server", copy.LoadServer, func() error {
+			return nil
+		}); err != nil {
+			msg := fmt.Sprintf(copy.LoadFailed, err)
+			logForServer.Error("%s", msg)
+			finishTarget(recorder, target, "failed", msg)
+			return errors.New(msg)
+		}
+		if err := step(2, "verify-resource", copy.VerifyResource, func() error {
+			return VerifyBundle(bundle)
+		}); err != nil {
+			msg := fmt.Sprintf(copy.InstallFailed, err)
+			logForServer.Error("%s", msg)
+			finishTarget(recorder, target, "failed", msg)
+			return errors.New(msg)
+		}
+		installRoot := remoteInstallRoot(server, "minio", bundle.Version)
+		if err := step(3, "select-data-disk", copy.SelectDataDisk, func() error {
+			nodeDataDirs, dataErr := installer.ResolveDataDirs(ctx, server, minioDataDirRequest(req.Parameters, installRoot, options.APIPort, server.ID), logForServer)
+			dataDirs[targetIndexes[target]] = nodeDataDirs
+			return dataErr
+		}); err != nil {
+			msg := fmt.Sprintf(copy.InstallFailed, err)
+			logForServer.Error("%s", msg)
+			finishTarget(recorder, target, "failed", msg)
+			return errors.New(msg)
+		}
+		nodeOptions := options
+		nodeOptions.DataDirs = dataDirs[targetIndexes[target]]
+		nodeOptions.DataDir = firstString(nodeOptions.DataDirs)
+		if err := step(4, "install-minio", copy.InstallStandalone, func() error {
+			return installer.Install(ctx, server, bundle, nodeOptions, logForServer)
+		}); err != nil {
+			msg := fmt.Sprintf(copy.InstallFailed, err)
+			logForServer.Error("%s", msg)
+			finishTarget(recorder, target, "failed", msg)
+			return errors.New(msg)
+		}
+		return nil
+	})
+	if len(failures) > 0 {
+		msg := fmt.Sprintf(copy.InstallFailed, strings.Join(taskrun.FailureMessages(failures), "; "))
+		failedTargets := taskrun.FailureTargets(failures)
+		for _, target := range targets {
+			if !failedTargets[target] {
+				logForTarget(log, targetLog, target).Error("%s", msg)
+				finishTarget(recorder, target, "failed", msg)
+			}
+		}
+		return errors.New(msg)
+	}
+
+	recordFailures := taskrun.RunTargets(ctx, targets, req.Concurrency, func(target string) error {
+		logForServer := logForTarget(log, targetLog, target)
+		step := newStepRunnerWithSteps(logForServer, recorder, target, copy, steps)
+		idx := targetIndexes[target]
+		peerTarget := targets[1-idx]
+		server := preloadedServers[target]
+		peer := preloadedServers[peerTarget]
+		installRoot := remoteInstallRoot(server, "minio", bundle.Version)
+		if err := step(5, "configure-bucket-replication", copy.ConfigureBucketReplication, func() error {
+			return installer.ConfigureBucketReplication(ctx, server, BucketReplicationConfig{
+				InstallRoot:      installRoot,
+				APIPort:          options.APIPort,
+				LocalEndpoint:    fmt.Sprintf("http://127.0.0.1:%d", options.APIPort),
+				PeerEndpoint:     minioEndpoint(peer.Host, options.APIPort),
+				PeerRemotePrefix: minioRemoteBucketPrefix(peer.Host, options.APIPort, options.RootUser, options.RootPassword),
+				RootUser:         options.RootUser,
+				RootPassword:     options.RootPassword,
+				Buckets:          replication.Buckets,
+				ReplicateDeletes: replication.ReplicateDeletes,
+			}, logForServer)
+		}); err != nil {
+			msg := fmt.Sprintf(copy.InstallFailed, err)
+			logForServer.Error("%s", msg)
+			finishTarget(recorder, target, "failed", msg)
+			return errors.New(msg)
+		}
+		var instance store.AppInstance
+		if err := step(6, "record-instance", copy.RecordInstance, func() error {
+			metadata, _ := json.Marshal(map[string]any{
+				"replicationGroupId":         groupID,
+				"replicationMode":            "bucket",
+				"replicationBuckets":         replication.Buckets,
+				"replicationPriority":        replication.Priority,
+				"replicationMaxWorkers":      replication.MaxWorkers,
+				"replicationMaxLargeWorkers": replication.MaxLargeWorkers,
+				"replicateDeletes":           replication.ReplicateDeletes,
+				"peerServerId":               peer.ID,
+				"peerEndpoint":               minioEndpoint(peer.Host, options.APIPort),
+				"resourcePath":               bundle.ArchivePath,
+				"mcPath":                     bundle.MCPath,
+				"goArchivePath":              bundle.GoArchivePath,
+				"rpmCount":                   len(bundle.RPMPaths),
+				"apiPort":                    options.APIPort,
+				"consolePort":                options.ConsolePort,
+				"rootUser":                   options.RootUser,
+				"serviceName":                "aifar-minio",
+				"storageMode":                minioStorageMode(req.Parameters),
+				"dataRoot":                   minioDataRoot(req.Parameters),
+				"diskDevice":                 minioDiskDeviceForServer(req.Parameters, server.ID),
+				"diskDevices":                minioDiskDevicesForServer(req.Parameters, server.ID),
+				"dataDir":                    firstString(dataDirs[idx]),
+				"dataDirs":                   dataDirs[idx],
+				"endpoint":                   minioEndpoint(server.Host, options.APIPort),
+				"topology":                   "bucket-replication",
+				"auth":                       "password",
+			})
+			var saveErr error
+			instance, saveErr = s.store.SaveAppInstance(store.AppInstance{
+				App:      "minio",
+				Version:  bundle.Version,
+				ServerID: server.ID,
+				Status:   "installed",
+				Topology: "bucket-replication",
+				Metadata: string(metadata),
+			})
+			return saveErr
+		}); err != nil {
+			msg := fmt.Sprintf(copy.RecordFailed, err)
+			logForServer.Error("%s", msg)
+			finishTarget(recorder, target, "failed", msg)
+			return errors.New(msg)
+		}
+		logForServer.Info(copy.Installed, instance.ID)
+		finishTarget(recorder, target, "success", "")
+		return nil
+	})
+	if len(recordFailures) > 0 {
+		return fmt.Errorf(copy.InstallFailed, strings.Join(taskrun.FailureMessages(recordFailures), "; "))
+	}
+	log.Info(copy.BucketReplicationInstalled, len(targets))
+	return nil
+}
+
 func (s Service) Delete(ctx context.Context, req DeleteRequest, log Logger, targetLog targetLogger) error {
 	copy := DeleteCopyFor(req.Language)
 	target := req.Instance.ServerID
@@ -419,6 +610,9 @@ func normalizeTopology(topology string) string {
 	if topology == "" || topology == "single" {
 		return "standalone"
 	}
+	if topology == "replication" || topology == "bucket" || topology == "bucket-replication-dr" {
+		return "bucket-replication"
+	}
 	return topology
 }
 
@@ -431,13 +625,23 @@ func minioInstallSteps(copy Copy) []stepDef {
 }
 
 func minioInstallStepsFor(topology string, copy Copy) []stepDef {
-	if normalizeTopology(topology) == "distributed" {
+	switch normalizeTopology(topology) {
+	case "distributed":
 		return []stepDef{
 			{Name: "load-server", Title: copy.LoadServer},
 			{Name: "verify-resource", Title: copy.VerifyResource},
 			{Name: "select-data-disk", Title: copy.SelectDataDisk},
 			{Name: "install-minio", Title: copy.InstallStandalone},
 			{Name: "configure-distributed", Title: copy.ConfigureDistributed},
+			{Name: "record-instance", Title: copy.RecordInstance},
+		}
+	case "bucket-replication":
+		return []stepDef{
+			{Name: "load-server", Title: copy.LoadServer},
+			{Name: "verify-resource", Title: copy.VerifyResource},
+			{Name: "select-data-disk", Title: copy.SelectDataDisk},
+			{Name: "install-minio", Title: copy.InstallStandalone},
+			{Name: "configure-bucket-replication", Title: copy.ConfigureBucketReplication},
 			{Name: "record-instance", Title: copy.RecordInstance},
 		}
 	}
