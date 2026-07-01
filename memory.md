@@ -409,3 +409,5 @@
 - 结论：在目标服务器进入 `/aifar/apps/admin/docker-apps/web-vue3`，使用 `docker compose --env-file ../.env --env-file .env -f docker-compose.yaml up -d --build --force-recreate`；如基础镜像未加载，先执行 `docker load -i ../../docker-images/nginx-stable-alpine.tar`。
 - 问题：用户提供 Gateway 日志 `No servers available for service: alpha-oauth`。
 - 结论：Gateway 当前从 Nacos 读到的路由仍指向旧服务名 `alpha-oauth`，而新部署服务应注册为 `aifar-oauth`；应检查 Nacos `prod` 命名空间的 `router.yaml` 是否仍含 `alpha-*`，发布为 `aifar-*` 后重启或刷新 Gateway。
+- 问题：用户询问 `web-vue3/oauth` 的 `.env` 中哪个参数影响 `alpha-oauth`/`aifar-oauth`。
+- 结论：`SPRING_APPLICATION_NAME=aifar-oauth` 决定 Spring 服务注册到 Nacos 的服务名；Gateway 日志里的 `alpha-oauth` 来自 Gateway 路由配置或旧 Nacos 配置，不是 `APP_IMAGE`/`APP_CONTAINER_NAME`。
