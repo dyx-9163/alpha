@@ -10,13 +10,13 @@
         <span v-else>{{ item.value || '-' }}</span>
       </template>
     </KeyValueGrid>
-    <el-table :data="healthRows" v-loading="loading">
+    <el-table :data="healthRows" v-loading="loading" :fit="false">
       <el-table-column prop="name" :label="t('common.module')" width="180" />
       <el-table-column :label="t('common.status')" width="120">
         <template #default="{ row }"><StatusTag :status="row.status" /></template>
       </el-table-column>
-      <el-table-column prop="message" :label="t('common.message')" min-width="180" />
-      <el-table-column prop="path" :label="t('settings.path')" min-width="260" show-overflow-tooltip />
+      <el-table-column prop="message" :label="t('common.message')" width="360" show-overflow-tooltip />
+      <el-table-column prop="path" :label="t('settings.path')" width="420" show-overflow-tooltip />
     </el-table>
   </section>
 </template>
