@@ -205,6 +205,18 @@ func TestServiceInstallsAIFARServiceFromDockerAppsBundle(t *testing.T) {
 	if strings.Contains(remote.installScript, "patch_nacos_server_port") || !strings.Contains(remote.installScript, "patch_nacos_sql_namespace") {
 		t.Fatalf("AIFAR install script should only patch Nacos SQL namespace defaults:\n%s", remote.installScript)
 	}
+	for _, want := range []string{
+		"patch_alpha_service_names",
+		"patch_nacos_sql_service_names",
+		"gateway alpha-gateway",
+		"permission alpha-permission",
+		`set_env SPRING_APPLICATION_NAME "$app_name" "$env_file"`,
+		`sed "s/aifar-${service}/${app_name}/g"`,
+	} {
+		if !strings.Contains(remote.installScript, want) {
+			t.Fatalf("AIFAR install script should force alpha service names with %q:\n%s", want, remote.installScript)
+		}
+	}
 }
 
 func TestServiceResolvesManagedDatabaseAndRedisInstances(t *testing.T) {

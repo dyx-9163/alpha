@@ -141,6 +141,50 @@ patch_nacos_sql_namespace() {
   mv "$tmp" "$sql_file"
 }
 
+alpha_service_pairs() {
+  cat <<'EOF'
+gateway alpha-gateway
+oauth alpha-oauth
+permission alpha-permission
+system alpha-system
+file alpha-file
+message alpha-message
+im alpha-im
+contacts alpha-contacts
+meeting alpha-meeting
+example alpha-example
+extend alpha-extend
+email alpha-email
+datareport alpha-datareport
+visualdev alpha-visualdev
+workflow alpha-workflow
+tenant alpha-tenant
+scheduletask alpha-scheduletask
+visualdata alpha-visualdata
+app alpha-app
+flowForm alpha-flowForm
+schedule alpha-schedule
+EOF
+}
+
+patch_alpha_service_names() {
+  alpha_service_pairs | while read -r service app_name; do
+    env_file="$APP_DIR/$service/.env"
+    [ -f "$env_file" ] || continue
+    set_env SPRING_APPLICATION_NAME "$app_name" "$env_file"
+  done
+}
+
+patch_nacos_sql_service_names() {
+  sql_file="$SQL_DIR/aifar_cloud_nacos.sql"
+  [ -f "$sql_file" ] || return 0
+  alpha_service_pairs | while read -r service app_name; do
+    tmp="${sql_file}.tmp"
+    sed "s/aifar-${service}/${app_name}/g" "$sql_file" > "$tmp"
+    mv "$tmp" "$sql_file"
+  done
+}
+
 down_existing() {
   [ -d "$APP_DIR" ] || return 0
   prepare_compose_networks || true
@@ -213,6 +257,8 @@ set_env SPRING_DATA_REDIS_SENTINEL_MASTER "$REDIS_SENTINEL_MASTER" "$ROOT_ENV"
 set_env SPRING_DATA_REDIS_SENTINEL_NODES "$REDIS_SENTINEL_NODES" "$ROOT_ENV"
 set_env SPRING_DATA_REDIS_CLUSTER_NODES "$REDIS_CLUSTER_NODES" "$ROOT_ENV"
 patch_nacos_sql_namespace
+patch_alpha_service_names
+patch_nacos_sql_service_names
 load_docker_images
 require_local_image "bellsoft/liberica-openjre-rocky:21"
 require_local_image "nginx:stable-alpine"

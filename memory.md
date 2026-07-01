@@ -415,3 +415,5 @@
 - 结论：`SPRING_APPLICATION_NAME=aifar-permission` 只决定 permission 服务注册名；OAuth 作为调用方请求 `alpha-permission` 通常来自 OAuth JAR 内的 `@FeignClient(name/value="alpha-permission")` 或调用方配置/常量，需把调用方 Feign 目标名也统一成 `aifar-permission` 并重启。
 - 问题：用户贴出 `router.yaml` 已全部使用 `aifar-*`，但 OAuth 仍请求 `alpha-permission`。
 - 结论：`router.yaml` 只控制 Gateway 入站路由，不控制服务内部 Feign 调用；日志线程在 `aifar-oauth`，说明调用方 OAuth 的 Feign 目标仍是旧的 `alpha-permission`，需要改 OAuth/公共 API JAR 内的 Feign 声明或先统一回 `alpha-*` 服务名。
+- 问题：用户要求把 AIFAR env 中的 `SPRING_APPLICATION_NAME` 改回 `alpha-*`，让注册到 Nacos 的服务名全部使用 alpha 前缀，避免修改 Java 代码。
+- 结论：AIFAR 安装脚本会在部署时覆盖各 Java 服务 `.env` 的 `SPRING_APPLICATION_NAME=alpha-*`，并同步把导入 Nacos 的 SQL 中 Gateway/Dubbo 服务名从 `aifar-*` 改为 `alpha-*`；Docker 镜像名和容器名仍保持 `aifar-*`。验证通过：`go test ./internal/apps/aifar`、`pnpm test`、`git diff --check`。
