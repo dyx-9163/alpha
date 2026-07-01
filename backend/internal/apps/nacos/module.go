@@ -124,6 +124,11 @@ func (m Module) ValidateInstall(ctx context.Context, req registry.InstallRequest
 		return fmt.Errorf(copy.TopologyUnsupported, topology)
 	}
 	options := nacosOptions(req.Parameters, topology)
+	resolvedOptions, err := m.service.resolveInstallOptions(options)
+	if err != nil {
+		return err
+	}
+	options = resolvedOptions
 	if err := options.Validate(); err != nil {
 		return err
 	}

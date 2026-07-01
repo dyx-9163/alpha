@@ -29,3 +29,22 @@ func TestNacosOptionsValidateClusterDatabase(t *testing.T) {
 		t.Fatalf("Validate returned error: %v", err)
 	}
 }
+
+func TestNacosOptionsDefaultDatabaseNameAndUser(t *testing.T) {
+	options := nacosOptions(map[string]any{
+		"dbHost":     "192.168.1.10",
+		"dbPassword": "Oversea.123",
+	}, "cluster")
+	if options.Database.Name != "aifar_nacos" {
+		t.Fatalf("expected default database name aifar_nacos, got %q", options.Database.Name)
+	}
+	if options.Database.User != "root" {
+		t.Fatalf("expected default database user root, got %q", options.Database.User)
+	}
+	if options.Database.Source != databaseSourceManual {
+		t.Fatalf("expected manual database source, got %q", options.Database.Source)
+	}
+	if err := options.Validate(); err != nil {
+		t.Fatalf("Validate returned error: %v", err)
+	}
+}

@@ -22,14 +22,21 @@ type InstallOptions struct {
 }
 
 type DatabaseOptions struct {
-	Enabled  bool
-	Host     string
-	Port     int
-	Name     string
-	User     string
-	Password string
-	Init     bool
+	Enabled    bool
+	Source     string
+	InstanceID string
+	Host       string
+	Port       int
+	Name       string
+	User       string
+	Password   string
+	Init       bool
 }
+
+const (
+	databaseSourceManual   = "manual"
+	databaseSourceExisting = "existing"
+)
 
 func nacosOptions(params map[string]any, topology string) InstallOptions {
 	port := intParam(params, "port", 8848)
@@ -43,13 +50,15 @@ func nacosOptions(params map[string]any, topology string) InstallOptions {
 		JVMXMX:       stringParam(params, "jvmXmx", "512m"),
 		JVMXMN:       stringParam(params, "jvmXmn", "256m"),
 		Database: DatabaseOptions{
-			Enabled:  normalizeTopology(topology) == "cluster",
-			Host:     stringParam(params, "dbHost", ""),
-			Port:     intParam(params, "dbPort", 3306),
-			Name:     stringParam(params, "dbName", "nacos_config"),
-			User:     stringParam(params, "dbUser", "nacos"),
-			Password: stringParam(params, "dbPassword", ""),
-			Init:     boolParam(params["initDatabase"]),
+			Enabled:    normalizeTopology(topology) == "cluster",
+			Source:     normalizeDatabaseSource(stringParam(params, "dbSource", databaseSourceManual)),
+			InstanceID: stringParam(params, "dbInstanceId", ""),
+			Host:       stringParam(params, "dbHost", ""),
+			Port:       intParam(params, "dbPort", 3306),
+			Name:       stringParam(params, "dbName", "aifar_nacos"),
+			User:       stringParam(params, "dbUser", "root"),
+			Password:   stringParam(params, "dbPassword", ""),
+			Init:       boolParam(params["initDatabase"]),
 		},
 	}
 }
@@ -69,6 +78,9 @@ func (o InstallOptions) Validate() error {
 		}
 	}
 	if o.Database.Enabled {
+		if o.Database.Source == databaseSourceExisting && strings.TrimSpace(o.Database.InstanceID) == "" {
+			return errors.New("Nacos cluster mode requires a selected MySQL database instance")
+		}
 		if strings.TrimSpace(o.Database.Host) == "" {
 			return errors.New("Nacos cluster mode requires MySQL database host")
 		}
@@ -86,6 +98,15 @@ func (o InstallOptions) Validate() error {
 		}
 	}
 	return nil
+}
+
+func normalizeDatabaseSource(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case databaseSourceExisting:
+		return databaseSourceExisting
+	default:
+		return databaseSourceManual
+	}
 }
 
 func normalizeTopology(topology string) string {

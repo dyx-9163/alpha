@@ -2,9 +2,12 @@ import { resolveAppLocale, type AppLocale } from '../registry/types'
 import { targetModeResolver, topologySelectField } from '../registry/topology'
 import type {
   AppInstallDialogConfig,
+  AppInstallDialogContext,
   AppInstallDialogCopy,
+  AppInstallField,
   AppInstallFieldOption,
   AppInstallFieldValues,
+  AppInstanceOption,
   ServerOption
 } from '../registry/contract'
 import type { AppTopologyDefinition } from '../registry/types'
@@ -18,7 +21,7 @@ export const nacosMessages = {
     sourceLabel: 'resources/nacos 离线包',
     description: '基于 resources/nacos 离线包安装 Nacos，支持单体和 3 节点 Cluster 模式。',
     installTitle: '安装 Nacos',
-    hint: '单体模式使用内置存储；Cluster 模式固定选择 3 台 Nacos 节点，并需要填写外部 MySQL 数据库连接信息。',
+    hint: '单体模式使用内置存储；Cluster 模式固定选择 3 台 Nacos 节点，可选择已部署 MySQL 或手动填写 MySQL 连接信息。',
     version: '版本',
     versionPlaceholder: '选择版本',
     servers: '目标服务器',
@@ -37,13 +40,21 @@ export const nacosMessages = {
     jvmXms: 'JVM Xms',
     jvmXmx: 'JVM Xmx',
     jvmXmn: 'JVM Xmn',
+    dbSource: 'MySQL 来源',
+    dbSourceExisting: '选择已部署 MySQL',
+    dbSourceManual: '手动填写 MySQL',
+    dbInstance: '已部署 MySQL',
+    dbInstancePlaceholder: '选择 MySQL 或 MySQL Router 实例',
+    noDbInstances: '暂无可选 MySQL 实例',
     dbHost: '数据库主机',
     dbHostPlaceholder: '例如 192.168.74.132',
     dbPort: '数据库端口',
     dbName: '数据库名',
     dbUser: '数据库用户',
     dbPassword: '数据库密码',
-    initDatabase: '初始化 Nacos SQL'
+    initDatabase: '初始化 Nacos SQL',
+    portInvalid: '端口必须在 1-65535 之间',
+    textRequired: '该配置不能为空'
   },
   en: {
     title: 'Nacos',
@@ -51,7 +62,7 @@ export const nacosMessages = {
     sourceLabel: 'Offline resources/nacos package',
     description: 'Install Nacos standalone or three-node cluster mode from the offline Nacos package.',
     installTitle: 'Install Nacos',
-    hint: 'Standalone mode uses embedded storage. Cluster mode always uses exactly 3 Nacos nodes and requires an external MySQL database connection.',
+    hint: 'Standalone mode uses embedded storage. Cluster mode always uses exactly 3 Nacos nodes and can use a deployed MySQL instance or a manually entered MySQL connection.',
     version: 'Version',
     versionPlaceholder: 'Select version',
     servers: 'Target server',
@@ -70,13 +81,21 @@ export const nacosMessages = {
     jvmXms: 'JVM Xms',
     jvmXmx: 'JVM Xmx',
     jvmXmn: 'JVM Xmn',
+    dbSource: 'MySQL source',
+    dbSourceExisting: 'Use deployed MySQL',
+    dbSourceManual: 'Enter MySQL manually',
+    dbInstance: 'Deployed MySQL',
+    dbInstancePlaceholder: 'Select a MySQL or MySQL Router instance',
+    noDbInstances: 'No selectable MySQL instances',
     dbHost: 'Database host',
     dbHostPlaceholder: 'For example 192.168.74.132',
     dbPort: 'Database port',
     dbName: 'Database name',
     dbUser: 'Database user',
     dbPassword: 'Database password',
-    initDatabase: 'Initialize Nacos SQL'
+    initDatabase: 'Initialize Nacos SQL',
+    portInvalid: 'Port must be between 1 and 65535',
+    textRequired: 'This value is required'
   }
 }
 
@@ -96,9 +115,12 @@ export function nacosTopologies(locale?: string): AppTopologyDefinition[] {
   ]
 }
 
-export function nacosInstallDialogProps(locale?: string): AppInstallDialogConfig {
+export function nacosInstallDialogProps(locale?: string, context?: AppInstallDialogContext): AppInstallDialogConfig {
   const copy = nacosCopy(locale)
   const topologies = nacosTopologies(locale)
+  const mysqlOptions = mysqlInstanceOptions(context)
+  const mysqlSourceDefault = mysqlOptions.length ? 'existing' : 'manual'
+  const mysqlSelectOptions = mysqlOptions.length ? mysqlOptions : [{ label: copy.noDbInstances, value: '', disabled: true }]
   const dialogCopy: AppInstallDialogCopy = {
     title: copy.installTitle,
     hint: copy.hint,
@@ -138,78 +160,104 @@ export function nacosInstallDialogProps(locale?: string): AppInstallDialogConfig
         defaultValue: 8848,
         min: 1,
         max: 65535,
-        required: true
-      },
-      {
-        name: 'jvmXms',
-        label: copy.jvmXms,
-        type: 'text',
-        defaultValue: '512m',
-        required: true
-      },
-      {
-        name: 'jvmXmx',
-        label: copy.jvmXmx,
-        type: 'text',
-        defaultValue: '512m',
-        required: true
-      },
-      {
-        name: 'jvmXmn',
-        label: copy.jvmXmn,
-        type: 'text',
-        defaultValue: '256m',
-        required: true
-      },
-      {
-        name: 'dbHost',
-        label: copy.dbHost,
-        type: 'text',
-        placeholder: copy.dbHostPlaceholder,
         required: true,
-        visibleWhen: (values) => values.topology === 'cluster'
+        validate: (value) => validPort(value) ? undefined : copy.portInvalid
+      },
+      requiredText('jvmXms', copy.jvmXms, '512m', copy),
+      requiredText('jvmXmx', copy.jvmXmx, '512m', copy),
+      requiredText('jvmXmn', copy.jvmXmn, '256m', copy),
+      {
+        ...selectField('dbSource', copy.dbSource, [
+          { label: copy.dbSourceExisting, value: 'existing', disabled: mysqlOptions.length === 0 },
+          { label: copy.dbSourceManual, value: 'manual' }
+        ], mysqlSourceDefault, copy),
+        visibleWhen: topologyIs('cluster')
       },
       {
-        name: 'dbPort',
-        label: copy.dbPort,
-        type: 'number',
-        defaultValue: 3306,
-        min: 1,
-        max: 65535,
-        required: true,
-        visibleWhen: (values) => values.topology === 'cluster'
+        ...selectField('dbInstanceId', copy.dbInstance, mysqlSelectOptions, mysqlOptions[0]?.value ?? '', copy, copy.dbInstancePlaceholder),
+        visibleWhen: allVisible(topologyIs('cluster'), sourceIs('dbSource', 'existing'))
       },
       {
-        name: 'dbName',
-        label: copy.dbName,
-        type: 'text',
-        defaultValue: 'nacos_config',
-        required: true,
-        visibleWhen: (values) => values.topology === 'cluster'
+        ...requiredText('dbHost', copy.dbHost, '', copy, copy.dbHostPlaceholder),
+        visibleWhen: allVisible(topologyIs('cluster'), sourceIsNot('dbSource', 'existing'))
       },
       {
-        name: 'dbUser',
-        label: copy.dbUser,
-        type: 'text',
-        defaultValue: 'nacos',
-        required: true,
-        visibleWhen: (values) => values.topology === 'cluster'
+        ...portField('dbPort', copy.dbPort, 3306, copy),
+        visibleWhen: allVisible(topologyIs('cluster'), sourceIsNot('dbSource', 'existing'))
       },
       {
-        name: 'dbPassword',
-        label: copy.dbPassword,
+        ...requiredText('dbName', copy.dbName, 'aifar_nacos', copy),
+        visibleWhen: topologyIs('cluster')
+      },
+      {
+        ...requiredText('dbUser', copy.dbUser, 'root', copy),
+        visibleWhen: topologyIs('cluster')
+      },
+      {
+        ...requiredText('dbPassword', copy.dbPassword, '', copy),
         type: 'password',
-        required: true,
-        visibleWhen: (values) => values.topology === 'cluster'
+        visibleWhen: topologyIs('cluster')
       },
       {
         name: 'initDatabase',
         label: copy.initDatabase,
         type: 'switch',
         defaultValue: false,
-        visibleWhen: (values) => values.topology === 'cluster'
+        visibleWhen: topologyIs('cluster')
       }
     ]
+  }
+}
+
+function requiredText(
+  name: string,
+  label: string,
+  defaultValue: string,
+  copy: ReturnType<typeof nacosCopy>,
+  placeholder?: string
+) {
+  return {
+    name,
+    label,
+    type: 'text' as const,
+    defaultValue,
+    placeholder,
+    required: true,
+    validate: (value: unknown) => String(value ?? '').trim() ? undefined : copy.textRequired
+  }
+}
+
+function portField(name: string, label: string, defaultValue: number, copy: ReturnType<typeof nacosCopy>) {
+  return {
+    name,
+    label,
+    type: 'number' as const,
+    defaultValue,
+    required: true,
+    min: 1,
+    max: 65535,
+    step: 1,
+    validate: (value: unknown) => validPort(value) ? undefined : copy.portInvalid
+  }
+}
+
+function selectField(
+  name: string,
+  label: string,
+  options: AppInstallFieldOption[],
+  defaultValue: string | number | boolean,
+  copy: ReturnType<typeof nacosCopy>,
+  placeholder?: string
+): AppInstallField {
+  return {
+    name,
+    label,
+    type: 'select',
+    options,
+    defaultValue,
+    placeholder,
+    required: true,
+    validate: (value) => String(value ?? '').trim() ? undefined : copy.textRequired
   }
 }
 
@@ -222,6 +270,66 @@ function serverOptions(servers: ServerOption[]): AppInstallFieldOption[] {
 
 function serverLabel(server: ServerOption) {
   return server.name && server.host ? `${server.name} (${server.host})` : server.name || server.host || server.id
+}
+
+function topologyIs(topology: string) {
+  return (values: AppInstallFieldValues) => values.topology === topology
+}
+
+function sourceIs(name: string, value: string) {
+  return (values: AppInstallFieldValues) => values[name] === value
+}
+
+function sourceIsNot(name: string, value: string) {
+  return (values: AppInstallFieldValues) => values[name] !== value
+}
+
+function allVisible(...checks: Array<(values: AppInstallFieldValues) => boolean>) {
+  return (values: AppInstallFieldValues) => checks.every((check) => check(values))
+}
+
+function mysqlInstanceOptions(context?: AppInstallDialogContext): AppInstallFieldOption[] {
+  return (context?.instances ?? [])
+    .filter((instance) => instance.app === 'mysql' || instance.app === 'mysql-router')
+    .map((instance) => ({
+      label: dependencyLabel(instance, context, instance.app === 'mysql-router' ? 'MySQL Router' : 'MySQL'),
+      value: instance.id
+    }))
+}
+
+function dependencyLabel(instance: AppInstanceOption, context: AppInstallDialogContext | undefined, prefix: string) {
+  const metadata = parseMetadata(instance.metadata)
+  const topology = String(instance.topology || metadata.topology || '').trim()
+  const endpoint = String(metadata.endpoint || metadata.clusterEndpoint || '').trim()
+  const server = (context?.servers ?? []).find((item) => item.id === instance.serverId)
+  const serverText = server ? `${server.name || server.id} (${server.host})` : instance.serverId
+  const parts = [prefix]
+  if (topology) {
+    parts.push(topology)
+  }
+  if (endpoint) {
+    parts.push(endpoint)
+  } else if (serverText) {
+    parts.push(serverText)
+  }
+  return parts.join(' / ')
+}
+
+function parseMetadata(value?: string) {
+  if (!value) {
+    return {} as Record<string, unknown>
+  }
+  try {
+    const parsed = JSON.parse(value)
+    return parsed && typeof parsed === 'object' ? parsed as Record<string, unknown> : {}
+  } catch {
+    return {}
+  }
+}
+
+function validPort(value: unknown) {
+  const port = Number(value)
+  return Number.isInteger(port) && port >= 1 && port <= 65535
 }
 
 function stringArray(value: unknown) {

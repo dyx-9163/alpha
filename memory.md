@@ -391,3 +391,5 @@
 - 结论：Nacos 安装脚本的 AIFAR 配置块已将 `nacos.core.auth.enabled` 默认改为 `true`，并补充脚本渲染测试锁定该配置；验证通过：go test ./internal/apps/nacos（使用工作区 GOCACHE）、pnpm test、git diff --check。
 - 问题：用户要求在菜单栏新增 Nacos 管理界面，布局和数据库页同模式。
 - 结论：新增 `/nacos` 页面和侧边栏入口，支持 Nacos 实例/集群卡片、节点状态、实时监测、部署记录、配置摘要和整组卸载；后端新增 `GET /api/v2/nacos/instances`，新安装 Nacos metadata 记录 `authEnabled=true`。验证通过：pnpm web:build、pnpm test、git diff --check。
+- 问题：用户要求 Nacos 安装数据库配置像 AIFAR 一样支持“已部署 MySQL/手动填写 MySQL”，并将默认数据库改为 `aifar_nacos`、默认用户改为 `root`。
+- 结论：Nacos 安装弹窗新增 MySQL 来源选择，已部署模式可选 MySQL 或 MySQL Router；后端会解析所选实例并优先使用同集群 Router endpoint，同时默认 `dbName=aifar_nacos`、`dbUser=root`。验证通过：pnpm web:build、pnpm test、git diff --check。

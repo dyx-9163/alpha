@@ -16,6 +16,7 @@ import (
 
 type Store interface {
 	GetServer(id string, includeSecret bool) (store.Server, error)
+	ListAppInstances() ([]store.AppInstance, error)
 	SaveAppInstance(v store.AppInstance) (store.AppInstance, error)
 	DeleteAppInstance(id string) error
 }
@@ -91,6 +92,11 @@ func (s Service) Install(ctx context.Context, req InstallRequest, resources []st
 		return fmt.Errorf(copy.TopologyUnsupported, topology)
 	}
 	options := nacosOptions(req.Parameters, topology)
+	resolvedOptions, err := s.resolveInstallOptions(options)
+	if err != nil {
+		return err
+	}
+	options = resolvedOptions
 	if err := options.Validate(); err != nil {
 		return err
 	}
@@ -177,6 +183,8 @@ func (s Service) Install(ctx context.Context, req InstallRequest, resources []st
 				metadataMap["dbPort"] = options.Database.Port
 				metadataMap["dbName"] = options.Database.Name
 				metadataMap["dbUser"] = options.Database.User
+				metadataMap["dbSource"] = options.Database.Source
+				metadataMap["dbInstanceId"] = options.Database.InstanceID
 			}
 			metadata, _ := json.Marshal(metadataMap)
 			var saveErr error
