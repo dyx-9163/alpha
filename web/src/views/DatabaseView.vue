@@ -25,6 +25,10 @@
 
     <div class="workspace-card database-main">
       <template v-if="tab === 'instances'">
+        <div v-if="!initialInstancesReady" class="database-loading">
+          <el-skeleton animated :rows="10" />
+        </div>
+        <template v-else>
         <div class="table-toolbar">
           <div class="head-actions">
             <span class="status-pill">{{ t('common.all') }} {{ instanceGroups.length }}</span>
@@ -148,6 +152,7 @@
           </article>
         </div>
         <div v-else class="empty-state"><div><strong>{{ t('database.noInstancesTitle') }}</strong><span>{{ t('database.noInstancesDesc') }}</span></div></div>
+        </template>
       </template>
 
       <template v-else-if="tab === 'runs'">
@@ -267,6 +272,12 @@ type DeleteScope = {
   nodes: DatabaseNode[]
 }
 
+type DatabaseState = {
+  instances: AppInstance[]
+  servers: any[]
+  tasks: TaskRecord[]
+}
+
 const { t } = useI18n()
 const { can, deniedText } = usePermissions()
 const router = useRouter()
@@ -277,6 +288,7 @@ const tab = ref('instances')
 const search = ref('')
 const monitoringEnabled = ref(true)
 const monitoringRunning = ref(false)
+const initialInstancesReady = ref(false)
 const monitorStartedAt = ref(0)
 const lastMonitorAt = ref('')
 const deletePromptVisible = ref(false)
@@ -351,9 +363,26 @@ const settingsItems = computed(() => [
 ])
 
 async function load() {
-  instances.value = asArray(await apiGet<AppInstance[] | null>('/database/instances').catch(() => []))
-  servers.value = asArray(await apiGet<any[] | null>('/servers').catch(() => []))
-  tasks.value = asArray<TaskRecord>(await apiGet<TaskRecord[] | null>('/tasks').catch(() => []))
+  applyDatabaseState(await fetchDatabaseState())
+}
+
+async function fetchDatabaseState(): Promise<DatabaseState> {
+  const [nextInstances, nextServers, nextTasks] = await Promise.all([
+    apiGet<AppInstance[] | null>('/database/instances').catch(() => []),
+    apiGet<any[] | null>('/servers').catch(() => []),
+    apiGet<TaskRecord[] | null>('/tasks').catch(() => [])
+  ])
+  return {
+    instances: asArray(nextInstances),
+    servers: asArray(nextServers),
+    tasks: asArray<TaskRecord>(nextTasks)
+  }
+}
+
+function applyDatabaseState(state: DatabaseState) {
+  instances.value = state.instances
+  servers.value = state.servers
+  tasks.value = state.tasks
 }
 
 function startMonitor() {
@@ -378,7 +407,7 @@ function handleMonitoringToggle() {
   }
 }
 
-async function runRealtimeCheck(manual: boolean) {
+async function runRealtimeCheck(manual: boolean, options: { deferInitialLoad?: boolean } = {}) {
   if (!canManageApps.value) {
     if (manual) {
       ElMessage.warning(deniedText.value)
@@ -391,9 +420,12 @@ async function runRealtimeCheck(manual: boolean) {
   monitoringRunning.value = true
   monitorStartedAt.value = Date.now()
   try {
-    await load()
+    const state = await fetchDatabaseState()
+    if (!options.deferInitialLoad) {
+      applyDatabaseState(state)
+    }
     const taskIds: string[] = []
-    for (const instance of instances.value.filter(isMonitorableInstance)) {
+    for (const instance of state.instances.filter(isMonitorableInstance)) {
       try {
         const result = await apiPost<{ taskId: string }>(`/apps/instances/${instance.id}/check`)
         if (result.taskId) {
@@ -409,7 +441,7 @@ async function runRealtimeCheck(manual: boolean) {
       await waitForTasks(taskIds)
     }
     lastMonitorAt.value = new Date().toLocaleTimeString()
-    await load()
+    applyDatabaseState(await fetchDatabaseState())
   } finally {
     monitoringRunning.value = false
   }
@@ -1544,9 +1576,16 @@ function deleteErrorMessage(err: unknown) {
 }
 
 onMounted(async () => {
-  await load()
-  startMonitor()
-  void runRealtimeCheck(false)
+  try {
+    if (monitoringEnabled.value && canManageApps.value) {
+      await runRealtimeCheck(false, { deferInitialLoad: true })
+    } else {
+      await load()
+    }
+  } finally {
+    initialInstancesReady.value = true
+    startMonitor()
+  }
 })
 
 onUnmounted(stopMonitor)
@@ -1563,6 +1602,10 @@ onUnmounted(stopMonitor)
   display: flex;
   flex-direction: column;
   min-height: 0;
+}
+
+.database-loading {
+  padding: 16px;
 }
 
 .monitor-actions {

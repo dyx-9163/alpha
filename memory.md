@@ -341,3 +341,5 @@
 - 结论：数据库页隐藏 Redis Sentinel 的当前 Master 摘要，并移除 MySQL Router 端点摘要；主/副/哨兵/Router 明细仍在节点列表展示，MySQL 当前 Primary 保留。验证通过：pnpm web:build、git diff --check。
 - 问题：用户建议 MinIO 数据目录根路径默认改为标准安装目录下的 `AIFAR_DEFAULT_DEPLOY_DIR/minio/data`。
 - 结论：该默认值更符合面板统一部署目录约定；MinIO 安装弹窗会按 `/settings.defaultDeployDir/minio/data` 生成默认值，后端缺省值按当前标准默认 `/aifar/apps/minio/data` 兜底，并更新 MinIO 安装记录测试。验证通过：pnpm test、pnpm web:build、git diff --check。
+- 问题：用户反馈数据库页进入时先显示未监测/未补全的旧拓扑状态，随后才变成实时监测后的正确布局。
+- 结论：原因是页面先渲染控制面实例记录，再异步加载服务器清单并执行实例检测，期间会短暂显示未归一化的 Redis/MySQL 拓扑。数据库页初次进入改为先完成首轮实时检测再展示实例卡片，并把实例、服务器和任务数据改为一次性原子更新，避免中间态闪烁。验证通过：pnpm web:build、git diff --check。
