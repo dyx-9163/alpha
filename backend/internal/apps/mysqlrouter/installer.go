@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	mysqlapp "aifar-deployment/backend/internal/apps/mysql"
+	"aifar-deployment/backend/internal/apps/mysqlbundle"
 	"aifar-deployment/backend/internal/installer/installerkit"
 	"aifar-deployment/backend/internal/installer/uploadkit"
 	"aifar-deployment/backend/internal/store"
@@ -17,14 +17,14 @@ import (
 
 type Logger = installerkit.Logger
 type Remote = installerkit.Remote
-type Bundle = mysqlapp.Bundle
+type Bundle = mysqlbundle.Bundle
 
 func SelectBundle(resources []store.Resource, version string) (Bundle, error) {
-	return mysqlapp.SelectBundle(resources, version)
+	return mysqlbundle.SelectBundle(resources, version)
 }
 
 func VerifyBundle(bundle Bundle) error {
-	return mysqlapp.VerifyBundle(bundle)
+	return mysqlbundle.VerifyBundle(bundle)
 }
 
 type Installer struct {

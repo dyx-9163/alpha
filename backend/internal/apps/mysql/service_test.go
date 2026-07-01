@@ -213,6 +213,74 @@ func TestServiceInstallsInnoDBClusterAndRecordsEachNode(t *testing.T) {
 	}
 }
 
+func TestServiceInstallsInnoDBClusterWithIntegratedRouterTargets(t *testing.T) {
+	root := t.TempDir()
+	archive := filepath.Join(root, "mysql-aifar-8.0.36-official-bundle.tar")
+	if err := os.WriteFile(archive, []byte("mysql"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s := &fakeStore{servers: map[string]store.Server{
+		"srv-1":    {ID: "srv-1", Name: "mysql-1", Host: "10.0.0.1", DeployDir: "/aifar/apps"},
+		"srv-2":    {ID: "srv-2", Name: "mysql-2", Host: "10.0.0.2", DeployDir: "/aifar/apps"},
+		"srv-3":    {ID: "srv-3", Name: "mysql-3", Host: "10.0.0.3", DeployDir: "/aifar/apps"},
+		"router-1": {ID: "router-1", Name: "router-1", Host: "10.0.0.9", DeployDir: "/aifar/apps"},
+	}}
+	remote := &fakeRemote{}
+	service := NewService(s, remote)
+	err := service.Install(context.Background(), InstallRequest{
+		Version:         "8.0.36",
+		Topology:        "innodb-cluster",
+		Language:        "en",
+		DefaultPassword: "Oversea.123",
+		ServerIDs:       []string{"srv-1", "srv-2", "srv-3", "router-1"},
+		Parameters: map[string]any{
+			"port":            3306,
+			"rootUser":        "root",
+			"rootPassword":    "Oversea.123",
+			"clusterName":     "aifarCluster",
+			"mysqlServerIds":  []any{"srv-1", "srv-2", "srv-3"},
+			"installRouter":   true,
+			"routerServerIds": []any{"router-1"},
+			"routerBasePort":  6446,
+		},
+	}, []store.Resource{{App: "mysql", Part: "backend", Version: "8.0.36", Path: archive}}, fakeLogger{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mysqlInstances, routerInstances []store.AppInstance
+	for _, instance := range s.instances {
+		switch instance.App {
+		case "mysql":
+			mysqlInstances = append(mysqlInstances, instance)
+		case "mysql-router":
+			routerInstances = append(routerInstances, instance)
+		}
+	}
+	if len(mysqlInstances) != 3 || len(routerInstances) != 1 {
+		t.Fatalf("expected 3 mysql instances and 1 router instance, got mysql=%d router=%d all=%+v", len(mysqlInstances), len(routerInstances), s.instances)
+	}
+	router := routerInstances[0]
+	if router.ServerID != "router-1" || router.Topology != "router" || router.Status != "installed" {
+		t.Fatalf("expected installed router instance on router-1, got %+v", router)
+	}
+	metadata := map[string]any{}
+	if err := json.Unmarshal([]byte(router.Metadata), &metadata); err != nil {
+		t.Fatal(err)
+	}
+	if metadata["clusterId"] == "" || metadata["clusterName"] != "aifarCluster" || metadata["endpoint"] != "10.0.0.9:6446" {
+		t.Fatalf("unexpected router metadata: %s", router.Metadata)
+	}
+	if int(metadata["basePort"].(float64)) != 6446 || metadata["bootstrapEndpoint"] != "10.0.0.1:3306" {
+		t.Fatalf("unexpected router port/bootstrap metadata: %s", router.Metadata)
+	}
+	if strings.Contains(router.Metadata, "Oversea.123") {
+		t.Fatalf("metadata must not store mysql password: %s", router.Metadata)
+	}
+	if !strings.Contains(remote.joinedCommands(), "install-mysql-router.sh") {
+		t.Fatalf("expected integrated router installer to run: %s", remote.joinedCommands())
+	}
+}
+
 func TestServiceLogsClusterNodeCompletionForInnoDBCluster(t *testing.T) {
 	root := t.TempDir()
 	archive := filepath.Join(root, "mysql-aifar-8.0.36-official-bundle.tar")

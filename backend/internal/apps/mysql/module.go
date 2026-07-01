@@ -56,6 +56,7 @@ func (m Module) Manifest(lang string) registry.Manifest {
 		Capabilities: []string{
 			"apps.mysql.install",
 			"apps.mysql.delete",
+			"apps.mysql-router.install",
 			"apps.mysql.cluster.start",
 			"resources.mysql.verify",
 			"databases.mysql.register",
@@ -99,6 +100,9 @@ func (m Module) PlanInstall(ctx context.Context, req registry.InstallRequest, re
 	topology := normalizeTopology(req.Topology)
 	steps := mysqlInstallStepsFor(topology, copy)
 	targets := req.TargetServerIDs()
+	if topology == "innodb-cluster" {
+		targets = mysqlClusterServerIDs(req.Parameters, targets)
+	}
 	plan := make([]registry.InstallStepPlan, 0, len(targets)*len(steps))
 	for targetIdx, target := range targets {
 		for idx, step := range steps {
@@ -106,6 +110,22 @@ func (m Module) PlanInstall(ctx context.Context, req registry.InstallRequest, re
 				continue
 			}
 			plan = append(plan, registry.InstallStepPlan{Target: target, Name: step.Name, Title: step.Title, Order: idx + 1})
+		}
+	}
+	if topology == "innodb-cluster" && mysqlRouterEnabled(req.Parameters) {
+		mysqlTargetSet := map[string]bool{}
+		for _, target := range targets {
+			mysqlTargetSet[target] = true
+		}
+		routerSteps := mysqlIntegratedRouterSteps(copy)
+		for _, target := range mysqlRouterServerIDs(req.Parameters, targets) {
+			offset := 0
+			if mysqlTargetSet[target] {
+				offset = len(steps)
+			}
+			for idx, step := range routerSteps {
+				plan = append(plan, registry.InstallStepPlan{Target: target, Name: step.Name, Title: step.Title, Order: offset + idx + 1})
+			}
 		}
 	}
 	return plan, nil
@@ -116,19 +136,29 @@ func (m Module) ValidateInstall(ctx context.Context, req registry.InstallRequest
 		return ctx.Err()
 	}
 	copy := CopyFor(req.Language)
-	targets := req.TargetServerIDs()
-	if len(targets) == 0 {
+	requestedTargets := req.TargetServerIDs()
+	if len(requestedTargets) == 0 {
 		return errors.New(copy.TargetRequired)
 	}
 	topology := normalizeTopology(req.Topology)
 	switch topology {
 	case "standalone":
-		if len(targets) > 1 {
+		if len(requestedTargets) > 1 {
 			return errors.New(copy.SingleTargetOnly)
 		}
 	case "innodb-cluster":
+		targets := mysqlClusterServerIDs(req.Parameters, requestedTargets)
 		if len(targets) < 3 {
 			return errors.New(copy.ClusterNeedNodes)
+		}
+		if mysqlRouterEnabled(req.Parameters) {
+			if len(mysqlRouterServerIDs(req.Parameters, targets)) == 0 {
+				return errors.New(copy.RouterTargetsRequired)
+			}
+			basePort := mysqlRouterBasePort(req.Parameters)
+			if basePort <= 0 || basePort+3 > 65535 {
+				return fmt.Errorf("invalid MySQL Router base port: %d", basePort)
+			}
 		}
 	default:
 		return fmt.Errorf(copy.ClusterUnsupported, topology)

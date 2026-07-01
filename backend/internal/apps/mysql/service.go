@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"aifar-deployment/backend/internal/apps/deleteflow"
+	mysqlrouter "aifar-deployment/backend/internal/apps/mysqlrouter"
 	"aifar-deployment/backend/internal/installer/installerkit"
 	"aifar-deployment/backend/internal/store"
 	"aifar-deployment/backend/internal/taskrun"
@@ -182,7 +183,8 @@ func (s Service) Install(ctx context.Context, req InstallRequest, resources []st
 
 func (s Service) installInnoDBCluster(ctx context.Context, req InstallRequest, resources []store.Resource, log Logger, targetLog targetLogger) error {
 	copy := CopyFor(req.Language)
-	targets := targetServerIDs(req)
+	requestedTargets := targetServerIDs(req)
+	targets := mysqlClusterServerIDs(req.Parameters, requestedTargets)
 	if len(targets) < 3 {
 		return errors.New(copy.ClusterNeedNodes)
 	}
@@ -284,6 +286,11 @@ func (s Service) installInnoDBCluster(ctx context.Context, req InstallRequest, r
 		logForServer.Info(clusterNodeInstalledMessage(copy), instance.ID)
 		finishTarget(recorder, target, "success", "")
 	}
+	if mysqlRouterEnabled(req.Parameters) {
+		if err := s.installIntegratedMySQLRouters(ctx, req, bundle, clusterID, clusterName, targets, preloadedServers, bootstrapServer, options, log, targetLog, recorder, copy); err != nil {
+			return err
+		}
+	}
 	log.Info(copy.ClusterInstalled, len(targets))
 	return nil
 }
@@ -344,6 +351,117 @@ func (s Service) installInnoDBClusterBase(ctx context.Context, targets []string,
 		return failedTargets, errors.New(strings.Join(failures, "; "))
 	}
 	return failedTargets, nil
+}
+
+func (s Service) installIntegratedMySQLRouters(ctx context.Context, req InstallRequest, bundle Bundle, clusterID, clusterName string, clusterTargets []string, preloadedServers map[string]store.Server, bootstrapServer store.Server, options InstallOptions, log Logger, targetLog targetLogger, recorder stepRecorder, copy Copy) error {
+	routerTargets := mysqlRouterServerIDs(req.Parameters, clusterTargets)
+	if len(routerTargets) == 0 {
+		return errors.New(copy.RouterTargetsRequired)
+	}
+	basePort := mysqlRouterBasePort(req.Parameters)
+	routerOptions := mysqlrouter.RouterInstallOptions{
+		BasePort:          basePort,
+		BootstrapHost:     bootstrapServer.Host,
+		BootstrapPort:     options.Port,
+		BootstrapUser:     options.RootUser,
+		BootstrapPassword: options.RootPassword,
+		BindAddress:       mysqlRouterBindAddress(req.Parameters),
+	}
+	if err := routerOptions.Validate(); err != nil {
+		return err
+	}
+	clusterEndpoint := fmt.Sprintf("%s:%d", bootstrapServer.Host, options.Port)
+	log.Info(copy.InstallRouterGroup, len(routerTargets))
+
+	installer := mysqlrouter.NewInstaller(s.remote)
+	clusterTargetSet := stringSet(clusterTargets)
+	mysqlSteps := mysqlInstallStepsFor("innodb-cluster", copy)
+	routerSteps := mysqlIntegratedRouterSteps(copy)
+	failures := taskrun.RunTargets(ctx, routerTargets, req.Concurrency, func(target string) error {
+		logForServer := logForTarget(log, targetLog, target)
+		taskrun.StartTarget(recorder, target)
+		stepIndexOffset := 0
+		steps := routerSteps
+		if clusterTargetSet[target] {
+			stepIndexOffset = len(mysqlSteps)
+			steps = append(append([]stepDef{}, mysqlSteps...), routerSteps...)
+		}
+		step := newStepRunnerWithSteps(logForServer, recorder, target, copy, steps)
+		var server store.Server
+		if err := step(stepIndexOffset+1, "router-load-server", copy.LoadRouterServer, func() error {
+			if cached, ok := preloadedServers[target]; ok {
+				server = cached
+				return nil
+			}
+			var loadErr error
+			server, loadErr = s.store.GetServer(target, true)
+			return loadErr
+		}); err != nil {
+			msg := fmt.Sprintf(copy.LoadFailed, err)
+			logForServer.Error("%s", msg)
+			finishTarget(recorder, target, "failed", msg)
+			return errors.New(msg)
+		}
+		if err := step(stepIndexOffset+2, "router-verify-resource", copy.VerifyResource, func() error {
+			return VerifyBundle(bundle)
+		}); err != nil {
+			msg := fmt.Sprintf(copy.InstallFailed, err)
+			logForServer.Error("%s", msg)
+			finishTarget(recorder, target, "failed", msg)
+			return errors.New(msg)
+		}
+		if err := step(stepIndexOffset+3, "install-router", copy.InstallRouter, func() error {
+			return installer.Install(ctx, server, bundle, routerOptions, logForServer)
+		}); err != nil {
+			msg := fmt.Sprintf(copy.InstallFailed, err)
+			logForServer.Error("%s", msg)
+			finishTarget(recorder, target, "failed", msg)
+			return errors.New(msg)
+		}
+		var instance store.AppInstance
+		if err := step(stepIndexOffset+4, "record-router-instance", copy.RecordRouterInstance, func() error {
+			metadata, _ := json.Marshal(map[string]any{
+				"clusterId":         clusterID,
+				"clusterName":       clusterName,
+				"clusterEndpoint":   clusterEndpoint,
+				"bootstrapEndpoint": fmt.Sprintf("%s:%d", routerOptions.BootstrapHost, routerOptions.BootstrapPort),
+				"resourcePath":      bundle.ArchivePath,
+				"rpmCount":          len(bundle.RPMPaths),
+				"basePort":          routerOptions.BasePort,
+				"readWritePort":     routerOptions.BasePort,
+				"readOnlyPort":      routerOptions.BasePort + 1,
+				"xReadWritePort":    routerOptions.BasePort + 2,
+				"xReadOnlyPort":     routerOptions.BasePort + 3,
+				"bindAddress":       routerOptions.BindAddress,
+				"serviceName":       "aifar-mysql-router",
+				"endpoint":          fmt.Sprintf("%s:%d", server.Host, routerOptions.BasePort),
+				"topology":          "router",
+				"auth":              "password",
+			})
+			var saveErr error
+			instance, saveErr = s.store.SaveAppInstance(store.AppInstance{
+				App:      "mysql-router",
+				Version:  bundle.Version,
+				ServerID: server.ID,
+				Status:   "installed",
+				Topology: "router",
+				Metadata: string(metadata),
+			})
+			return saveErr
+		}); err != nil {
+			msg := fmt.Sprintf(copy.RecordFailed, err)
+			logForServer.Error("%s", msg)
+			finishTarget(recorder, target, "failed", msg)
+			return errors.New(msg)
+		}
+		logForServer.Info(copy.RouterInstalled, instance.ID)
+		finishTarget(recorder, target, "success", "")
+		return nil
+	})
+	if len(failures) > 0 {
+		return fmt.Errorf(copy.RouterInstallFailed, strings.Join(taskrun.FailureMessages(failures), "; "))
+	}
+	return nil
 }
 
 func (s Service) StartInnoDBCluster(ctx context.Context, req StartClusterRequest, log Logger, targetLog targetLogger) error {
@@ -715,6 +833,15 @@ func mysqlInstallStepsFor(topology string, copy Copy) []stepDef {
 	}
 }
 
+func mysqlIntegratedRouterSteps(copy Copy) []stepDef {
+	return []stepDef{
+		{Name: "router-load-server", Title: copy.LoadRouterServer},
+		{Name: "router-verify-resource", Title: copy.VerifyResource},
+		{Name: "install-router", Title: copy.InstallRouter},
+		{Name: "record-router-instance", Title: copy.RecordRouterInstance},
+	}
+}
+
 func mysqlDeleteSteps(copy DeleteCopy) []stepDef {
 	return []stepDef{
 		{Name: "remove-remote", Title: copy.RemoveRemote},
@@ -813,4 +940,15 @@ func logForTarget(fallback Logger, targetLog targetLogger, target string) Logger
 
 func finishTarget(recorder stepRecorder, target, status, errText string) {
 	taskrun.FinishTarget(recorder, target, status, errText)
+}
+
+func stringSet(values []string) map[string]bool {
+	out := make(map[string]bool, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value != "" {
+			out[value] = true
+		}
+	}
+	return out
 }
