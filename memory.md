@@ -333,3 +333,5 @@
 - 结论：MySQL 安装弹窗在 InnoDB Cluster 拓扑下新增 MySQL 数据节点、是否安装 Router、Router 节点和 Router 起始端口配置；后端 MySQL 集群安装会在 bootstrap 后按所选 Router 节点安装并记录 `mysql-router` 实例，保留后端 mysql-router 模块用于既有实例检测/卸载，移除前端独立 MySQL Router 应用入口。验证通过：go test ./internal/apps/mysql ./internal/apps/mysqlrouter ./internal/apps/mysqlbundle、pnpm test、pnpm web:build、git diff --check。
 - 问题：用户反馈 Redis Sentinel 安装第 4/5 步“配置 Redis Sentinel 拓扑”失败，但目标机服务看起来已经安装完成。
 - 结论：原因是脚本在 `systemctl enable --now` 后立即执行一次 `redis-cli sentinel masters` 验证；systemd `Type=simple` 返回时 Sentinel 进程可能刚启动、端口尚未完全可用，导致验证误报失败，而前面的配置和服务启动已经落地。已改为最多等待 15 秒重试 Sentinel 验证，避免这种已安装但任务失败的假阴性。验证通过：go test ./internal/apps/redis、pnpm test、git diff --check。
+- 问题：用户要求数据库卸载界面按单体/集群整体删除，并将 MySQL 与 MySQL Router 卸载合并成一个入口。
+- 结论：数据库页 MySQL 卡片统一为一个“卸载 MySQL”入口；InnoDB Cluster 会按 Router 优先、MySQL 节点随后一起提交批量卸载，standalone 只提交当前实例；节点行不再重复展示 MySQL 单点卸载按钮。验证通过：pnpm web:build、git diff --check。
