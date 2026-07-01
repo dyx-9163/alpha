@@ -324,6 +324,11 @@ func VerifyBundle(bundle Bundle) error {
 	if _, err := os.Stat(filepath.Join(bundle.AppDir, ".env")); err != nil {
 		return fmt.Errorf("AIFAR common .env is required: %w", err)
 	}
+	for _, image := range []string{"openjre-rocky-21.tar", "nginx-stable-alpine.tar"} {
+		if _, err := os.Stat(filepath.Join(bundle.Root, "docker-images", image)); err != nil {
+			return fmt.Errorf("AIFAR offline Docker image %s is required: %w", image, err)
+		}
+	}
 	for _, service := range []string{"gateway", "web-vue3"} {
 		if _, err := os.Stat(filepath.Join(bundle.AppDir, service, "docker-compose.yaml")); err != nil {
 			return fmt.Errorf("AIFAR service %s docker-compose.yaml is required: %w", service, err)

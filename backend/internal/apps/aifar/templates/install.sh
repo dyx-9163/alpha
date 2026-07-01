@@ -7,6 +7,7 @@ ARCHIVE={{ quote .ArchiveRemote }}
 SERVICE_ORDER={{ quote .ServiceOrder }}
 APP_DIR="$INSTALL_ROOT/docker-apps"
 SQL_DIR="$INSTALL_ROOT/docker-sql"
+IMAGE_DIR="$INSTALL_ROOT/docker-images"
 TMP_DIR="$INSTALL_ROOT/.extract-$$"
 
 TIMEZONE={{ quote .Options.Timezone }}
@@ -93,6 +94,19 @@ prepare_compose_networks() {
   done
 }
 
+load_docker_images() {
+  [ -d "$IMAGE_DIR" ] || return 0
+  for image_tar in "$IMAGE_DIR"/*.tar; do
+    [ -f "$image_tar" ] || continue
+    docker load -i "$image_tar"
+  done
+}
+
+require_local_image() {
+  image="$1"
+  docker image inspect "$image" >/dev/null 2>&1 || fail "required offline Docker image is missing after docker load: $image"
+}
+
 resolve_system_timezone() {
   case "$TIMEZONE" in
     ""|"system"|"SYSTEM"|"System")
@@ -151,10 +165,13 @@ mkdir -p "$TMP_DIR"
 tar -xzf "$ARCHIVE" -C "$TMP_DIR"
 [ -d "$TMP_DIR/docker-apps" ] || fail "docker-apps directory is missing in bundle"
 
-rm -rf "$APP_DIR" "$SQL_DIR"
+rm -rf "$APP_DIR" "$SQL_DIR" "$IMAGE_DIR"
 mv "$TMP_DIR/docker-apps" "$APP_DIR"
 if [ -d "$TMP_DIR/docker-sql" ]; then
   mv "$TMP_DIR/docker-sql" "$SQL_DIR"
+fi
+if [ -d "$TMP_DIR/docker-images" ]; then
+  mv "$TMP_DIR/docker-images" "$IMAGE_DIR"
 fi
 rm -rf "$TMP_DIR"
 
@@ -196,6 +213,9 @@ set_env SPRING_DATA_REDIS_SENTINEL_MASTER "$REDIS_SENTINEL_MASTER" "$ROOT_ENV"
 set_env SPRING_DATA_REDIS_SENTINEL_NODES "$REDIS_SENTINEL_NODES" "$ROOT_ENV"
 set_env SPRING_DATA_REDIS_CLUSTER_NODES "$REDIS_CLUSTER_NODES" "$ROOT_ENV"
 patch_nacos_sql_namespace
+load_docker_images
+require_local_image "bellsoft/liberica-openjre-rocky:21"
+require_local_image "nginx:stable-alpine"
 
 if [ "$INIT_SQL" = "true" ]; then
   command -v mysql >/dev/null 2>&1 || fail "mysql client is required when SQL initialization is enabled"

@@ -197,6 +197,11 @@ func TestServiceInstallsAIFARServiceFromDockerAppsBundle(t *testing.T) {
 		!strings.Contains(remote.installScript, `set_env NACOS_HOST "${NACOS_CONNECT_HOST}:${NACOS_PORT_WEB}" "$ROOT_ENV"`) {
 		t.Fatalf("AIFAR install script should use the external Nacos endpoint:\n%s", remote.installScript)
 	}
+	if !strings.Contains(remote.installScript, "load_docker_images") ||
+		!strings.Contains(remote.installScript, `require_local_image "bellsoft/liberica-openjre-rocky:21"`) ||
+		!strings.Contains(remote.installScript, `require_local_image "nginx:stable-alpine"`) {
+		t.Fatalf("AIFAR install script should load offline Docker base images before build:\n%s", remote.installScript)
+	}
 	if strings.Contains(remote.installScript, "patch_nacos_server_port") || !strings.Contains(remote.installScript, "patch_nacos_sql_namespace") {
 		t.Fatalf("AIFAR install script should only patch Nacos SQL namespace defaults:\n%s", remote.installScript)
 	}
@@ -515,7 +520,11 @@ func createAIFARBundle(t *testing.T) string {
 	root := t.TempDir()
 	appDir := filepath.Join(root, "docker-apps")
 	sqlDir := filepath.Join(root, "docker-sql")
+	imageDir := filepath.Join(root, "docker-images")
 	if err := os.MkdirAll(sqlDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(imageDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(sqlDir, "aifar_cloud_nacos.sql"), []byte("select 1;"), 0o644); err != nil {
@@ -523,6 +532,11 @@ func createAIFARBundle(t *testing.T) string {
 	}
 	if err := os.WriteFile(filepath.Join(sqlDir, "aifar_init.sql"), []byte("select 1;"), 0o644); err != nil {
 		t.Fatal(err)
+	}
+	for _, image := range []string{"openjre-rocky-21.tar", "nginx-stable-alpine.tar"} {
+		if err := os.WriteFile(filepath.Join(imageDir, image), []byte("fake image tar"), 0o644); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if err := os.MkdirAll(appDir, 0o755); err != nil {
 		t.Fatal(err)

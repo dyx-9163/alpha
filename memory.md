@@ -401,3 +401,5 @@
 - 结论：AIFAR 默认 Nacos Web 端口已改为 9849；安装脚本会按安装参数修正 Nacos `server.port`，将随包 SQL 中旧 `dyx` 命名空间改写为目标命名空间，并在 `timezone=system` 时解析目标机系统时区；安装根目录保持 `/aifar/apps/admin`。验证通过：`go test ./internal/apps/aifar`、`pnpm test`、`git diff --check`。
 - 问题：用户要求 AIFAR Docker Compose 中不再部署 Nacos，并把 AIFAR 连接 Nacos 的默认端口改为 8848，前端可覆盖。
 - 结论：AIFAR 安装改为接入外部 Nacos，不再把 `nacos` 纳入服务启动/停止/状态检查/防火墙端口，上传部署包也排除 `docker-apps/nacos`；安装弹窗新增 Nacos 来源、实例、主机和端口字段，端口默认 8848 且会写入服务 `.env`。验证通过：`go test ./internal/apps/aifar`、`pnpm web:build`、`pnpm test`、`git diff --check`。
+- 问题：用户反馈 AIFAR 安装构建 `oauth` 镜像时因拉取 Docker Hub 基础镜像 `bellsoft/liberica-openjre-rocky:21` 失败。
+- 结论：AIFAR 安装脚本改为保留并加载随包 `docker-images/*.tar`，构建前校验 `bellsoft/liberica-openjre-rocky:21` 和 `nginx:stable-alpine` 已在本地，避免离线部署时访问 Docker Hub；资源校验也要求基础镜像 tar 存在。验证通过：`go test ./internal/apps/aifar`、`pnpm test`、`git diff --check`。
