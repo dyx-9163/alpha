@@ -339,3 +339,5 @@
 - 结论：原因是 1 台 Redis/Sentinel 节点只来自 Sentinel 拓扑发现，还没有登记到 `app_instances`，卸载接口只会提交真实登记实例。Redis Sentinel 检测已改为根据发现到的 master/replica/sentinel 端点自动补登记同组缺失服务器；重新执行实时监测后卸载确认会按 3 台目标服务器展示。验证通过：go test ./internal/apps/redis、pnpm test、git diff --check。
 - 问题：用户要求去掉数据库卡片中重复的 Redis 当前 Master 和 MySQL Router 端点摘要。
 - 结论：数据库页隐藏 Redis Sentinel 的当前 Master 摘要，并移除 MySQL Router 端点摘要；主/副/哨兵/Router 明细仍在节点列表展示，MySQL 当前 Primary 保留。验证通过：pnpm web:build、git diff --check。
+- 问题：用户建议 MinIO 数据目录根路径默认改为标准安装目录下的 `AIFAR_DEFAULT_DEPLOY_DIR/minio/data`。
+- 结论：该默认值更符合面板统一部署目录约定；MinIO 安装弹窗会按 `/settings.defaultDeployDir/minio/data` 生成默认值，后端缺省值按当前标准默认 `/aifar/apps/minio/data` 兜底，并更新 MinIO 安装记录测试。验证通过：pnpm test、pnpm web:build、git diff --check。

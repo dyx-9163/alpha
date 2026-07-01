@@ -7,6 +7,8 @@ import (
 	"strings"
 )
 
+const defaultMinioDataRoot = "/aifar/apps/minio/data"
+
 func minioOptions(params map[string]any, defaultPassword string) InstallOptions {
 	return InstallOptions{
 		APIPort:      intParam(params, "apiPort", 9000),
@@ -25,7 +27,7 @@ func minioDataRoot(params map[string]any) string {
 			}
 		}
 	}
-	return "/data/minio"
+	return defaultMinioDataRoot
 }
 
 func minioStorageMode(params map[string]any) string {

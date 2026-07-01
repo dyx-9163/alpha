@@ -21,6 +21,7 @@ export interface AppInstanceOption {
 export interface AppInstallDialogContext {
   servers: ServerOption[]
   instances: AppInstanceOption[]
+  defaultDeployDir?: string
 }
 
 export interface AppInstallPayload {

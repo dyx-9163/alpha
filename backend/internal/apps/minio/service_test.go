@@ -130,7 +130,7 @@ func TestServiceInstallsStandaloneMinioAndRecordsInstalledInstance(t *testing.T)
 	if strings.Contains(instance.Metadata, "Oversea.123") {
 		t.Fatalf("metadata must not store root password: %s", instance.Metadata)
 	}
-	if !strings.Contains(instance.Metadata, `"apiPort":9002`) || !strings.Contains(instance.Metadata, `"endpoint":"http://10.0.0.3:9002"`) || !strings.Contains(instance.Metadata, `"dataDir":"/data/minio"`) || !strings.Contains(instance.Metadata, `"storageMode":"local-disk"`) {
+	if !strings.Contains(instance.Metadata, `"apiPort":9002`) || !strings.Contains(instance.Metadata, `"endpoint":"http://10.0.0.3:9002"`) || !strings.Contains(instance.Metadata, `"dataDir":"/aifar/apps/minio/data"`) || !strings.Contains(instance.Metadata, `"storageMode":"local-disk"`) {
 		t.Fatalf("metadata should include endpoint and ports: %s", instance.Metadata)
 	}
 	joinedCommands := remote.joinedCommands()
@@ -179,7 +179,7 @@ func TestServiceInstallsDistributedMinioAndRecordsEachNode(t *testing.T) {
 	if s.instances[0].Topology != "distributed" || strings.Contains(s.instances[0].Metadata, "Oversea.123") {
 		t.Fatalf("expected safe distributed metadata: %+v", s.instances[0])
 	}
-	if !strings.Contains(s.instances[0].Metadata, `"dataDir":"/data/minio"`) || !strings.Contains(s.instances[0].Metadata, `"storageMode":"local-disk"`) {
+	if !strings.Contains(s.instances[0].Metadata, `"dataDir":"/aifar/apps/minio/data"`) || !strings.Contains(s.instances[0].Metadata, `"storageMode":"local-disk"`) {
 		t.Fatalf("distributed metadata should include selected data directory: %+v", s.instances[0])
 	}
 	joinedCommands := remote.joinedCommands()

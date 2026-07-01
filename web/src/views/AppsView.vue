@@ -133,6 +133,7 @@ const router = useRouter()
 const backendCatalog = ref<AppCatalogResponse>({})
 const instances = ref<AppInstanceTableRecord[]>([])
 const servers = ref<ServerOption[]>([])
+const appSettings = ref<{ defaultDeployDir?: string }>({})
 const activeTab = ref('all')
 const category = ref('all')
 const installSubmitting = ref(false)
@@ -148,7 +149,8 @@ const filteredApps = computed(() => (category.value === 'all' ? apps.value : app
 const moduleDialogComponent = computed<Component | null>(() => moduleDialogModule.value?.installDialog ?? null)
 const installDialogContext = computed<AppInstallDialogContext>(() => ({
   servers: servers.value,
-  instances: instances.value
+  instances: instances.value,
+  defaultDeployDir: appSettings.value.defaultDeployDir || '/aifar/apps'
 }))
 const moduleDialogProps = computed(() => moduleDialogModule.value?.installDialogProps?.(locale.value, installDialogContext.value) ?? {})
 
@@ -213,6 +215,7 @@ async function load() {
   backendCatalog.value = await apiGet<AppCatalogResponse>(`/apps/catalog?lang=${locale.value}`).catch(() => ({}))
   instances.value = asArray(await apiGet<AppInstanceTableRecord[] | null>('/apps/instances').catch(() => []))
   servers.value = asArray(await apiGet<ServerOption[] | null>('/servers').catch(() => []))
+  appSettings.value = await apiGet<{ defaultDeployDir?: string }>('/settings').catch(() => ({ defaultDeployDir: '/aifar/apps' }))
 }
 
 async function rescan() {

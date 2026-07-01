@@ -1,6 +1,6 @@
 import { resolveAppLocale, type AppLocale } from '../registry/types'
 import { targetModeResolver, topologySelectField } from '../registry/topology'
-import type { AppInstallDialogConfig, AppInstallDialogCopy } from '../registry/contract'
+import type { AppInstallDialogConfig, AppInstallDialogContext, AppInstallDialogCopy } from '../registry/contract'
 import type { AppTopologyDefinition } from '../registry/types'
 
 export type MinioLocale = AppLocale
@@ -30,7 +30,7 @@ export const minioMessages = {
     apiPort: 'API 端口',
     consolePort: '控制台端口',
     dataRoot: '数据目录根路径',
-    dataRootPlaceholder: '例如 /data/minio；本地目录模式直接创建，磁盘模式会作为挂载点',
+    dataRootPlaceholder: '例如 /aifar/apps/minio/data；本地目录模式直接创建，磁盘模式会作为挂载点',
     dataRootInvalid: '请输入以 / 开头且不包含空格的绝对路径，不能直接填写 /',
     diskDevice: '磁盘设备',
     diskDevicePlaceholder: '请先选择目标服务器，再从检测到的未挂载磁盘中选择一块或多块',
@@ -64,7 +64,7 @@ export const minioMessages = {
     apiPort: 'API port',
     consolePort: 'Console port',
     dataRoot: 'Data root',
-    dataRootPlaceholder: 'For example /data/minio; local mode creates it directly, disk mode uses it as the mount point',
+    dataRootPlaceholder: 'For example /aifar/apps/minio/data; local mode creates it directly, disk mode uses it as the mount point',
     dataRootInvalid: 'Enter an absolute path starting with /, without whitespace, and not / itself',
     diskDevice: 'Disk device',
     diskDevicePlaceholder: 'Select target servers first, then choose one or more detected unmounted disks',
@@ -92,9 +92,10 @@ export function minioTopologies(locale?: string): AppTopologyDefinition[] {
   ]
 }
 
-export function minioInstallDialogProps(locale?: string): AppInstallDialogConfig {
+export function minioInstallDialogProps(locale?: string, context?: AppInstallDialogContext): AppInstallDialogConfig {
   const copy = minioCopy(locale)
   const topologies = minioTopologies(locale)
+  const defaultDataRoot = minioDefaultDataRoot(context?.defaultDeployDir)
   const dialogCopy: AppInstallDialogCopy = {
     title: copy.installTitle,
     hint: copy.hint,
@@ -142,7 +143,7 @@ export function minioInstallDialogProps(locale?: string): AppInstallDialogConfig
         name: 'dataRoot',
         label: copy.dataRoot,
         type: 'text',
-        defaultValue: '/data/minio',
+        defaultValue: defaultDataRoot,
         placeholder: copy.dataRootPlaceholder,
         required: true,
         validate: (value) => {
@@ -187,4 +188,12 @@ export function minioInstallDialogProps(locale?: string): AppInstallDialogConfig
       }
     ]
   }
+}
+
+function minioDefaultDataRoot(defaultDeployDir?: string) {
+  const deployDir = String(defaultDeployDir || '/aifar/apps').trim()
+  if (!deployDir || !deployDir.startsWith('/') || /\s/.test(deployDir)) {
+    return '/aifar/apps/minio/data'
+  }
+  return `${deployDir.replace(/\/+$/, '')}/minio/data`
 }
