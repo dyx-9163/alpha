@@ -9,67 +9,85 @@
     </div>
 
     <div class="workspace-card settings-card">
-      <div class="settings-block">
-        <label>{{ t('settings.language') }}</label>
-        <el-radio-group v-model="form.language" @change="changeLanguage">
-          <el-radio-button label="zh">{{ t('settings.chinese') }}</el-radio-button>
-          <el-radio-button label="en">{{ t('settings.english') }}</el-radio-button>
-        </el-radio-group>
-        <span class="subtle-note">{{ t('settings.languageNote') }}</span>
-      </div>
+      <el-tabs v-model="activeTab" class="settings-tabs">
+        <el-tab-pane :label="t('settings.generalSettings')" name="general">
+          <div class="settings-tab-pane">
+            <div class="settings-block">
+              <label>{{ t('settings.language') }}</label>
+              <el-radio-group v-model="form.language" @change="changeLanguage">
+                <el-radio-button label="zh">{{ t('settings.chinese') }}</el-radio-button>
+                <el-radio-button label="en">{{ t('settings.english') }}</el-radio-button>
+              </el-radio-group>
+              <span class="subtle-note">{{ t('settings.languageNote') }}</span>
+            </div>
 
-      <div class="settings-block">
-        <label>{{ t('settings.concurrency') }}</label>
-        <div class="head-actions">
-          <el-input-number v-model="form.deploymentConcurrency" :min="1" :max="20" />
-          <el-tooltip :content="deniedText" :disabled="canManageSettings" placement="top">
-            <span><el-button type="primary" :disabled="!canManageSettings" @click="save">{{ t('common.save') }}</el-button></span>
-          </el-tooltip>
-        </div>
-        <span class="subtle-note">{{ t('settings.concurrencyNote') }}</span>
-      </div>
+            <div class="settings-block">
+              <label>{{ t('settings.concurrency') }}</label>
+              <div class="head-actions">
+                <el-input-number v-model="form.deploymentConcurrency" :min="1" :max="20" />
+                <el-tooltip :content="deniedText" :disabled="canManageSettings" placement="top">
+                  <span><el-button type="primary" :disabled="!canManageSettings" @click="save">{{ t('common.save') }}</el-button></span>
+                </el-tooltip>
+              </div>
+              <span class="subtle-note">{{ t('settings.concurrencyNote') }}</span>
+            </div>
+          </div>
+        </el-tab-pane>
 
-      <DataMaintenancePanel
-        ref="maintenancePanel"
-        :backup-dir="form.databaseBackupDir"
-        :audit-retention-days="form.auditRetentionDays"
-        :task-retention-days="form.taskRetentionDays"
-        :can-manage="canManageSettings"
-        :disabled-reason="deniedText"
-      />
+        <el-tab-pane :label="t('settings.dataMaintenance')" name="maintenance">
+          <div class="settings-tab-pane">
+            <DataMaintenancePanel
+              ref="maintenancePanel"
+              :backup-dir="form.databaseBackupDir"
+              :audit-retention-days="form.auditRetentionDays"
+              :task-retention-days="form.taskRetentionDays"
+              :can-manage="canManageSettings"
+              :disabled-reason="deniedText"
+            />
+          </div>
+        </el-tab-pane>
 
-      <UserManagementPanel
-        ref="userPanel"
-        :can-manage="canManageUsers"
-        :disabled-reason="deniedText"
-      />
+        <el-tab-pane :label="t('settings.userManagement')" name="users">
+          <div class="settings-tab-pane">
+            <UserManagementPanel
+              ref="userPanel"
+              :can-manage="canManageUsers"
+              :disabled-reason="deniedText"
+            />
+          </div>
+        </el-tab-pane>
 
-      <el-alert
-        :title="t('settings.realModeTitle')"
-        :description="t('settings.realModeDesc')"
-        type="warning"
-        :closable="false"
-        show-icon
-      />
+        <el-tab-pane :label="t('settings.statusOverview')" name="status">
+          <div class="settings-tab-pane">
+            <el-alert
+              :title="t('settings.realModeTitle')"
+              :description="t('settings.realModeDesc')"
+              type="warning"
+              :closable="false"
+              show-icon
+            />
 
-      <ControlPlaneHealthPanel ref="healthPanel" />
+            <ControlPlaneHealthPanel ref="healthPanel" />
 
-      <h2 class="settings-title">{{ t('settings.providerStatus') }}</h2>
-      <KeyValueGrid :items="providerItems" class="provider-grid">
-        <template #value="{ item }">
-          <span v-if="item.key === 'mode'" class="status-pill success">{{ item.value }}</span>
-          <span v-else>{{ item.value || '-' }}</span>
-        </template>
-      </KeyValueGrid>
+            <h2 class="settings-title">{{ t('settings.providerStatus') }}</h2>
+            <KeyValueGrid :items="providerItems" class="provider-grid">
+              <template #value="{ item }">
+                <span v-if="item.key === 'mode'" class="status-pill success">{{ item.value }}</span>
+                <span v-else>{{ item.value || '-' }}</span>
+              </template>
+            </KeyValueGrid>
 
-      <h2 class="settings-title">{{ t('settings.moduleStatus') }}</h2>
-      <el-table :data="moduleRows" :fit="false" style="width: 1150px; max-width: 100%;">
-        <el-table-column prop="module" :label="t('common.module')" width="160" />
-        <el-table-column :label="t('common.status')" width="140"><template #default><span class="status-pill success">{{ t('settings.connected') }}</span></template></el-table-column>
-        <el-table-column :label="t('common.provider')" width="140"><template #default>{{ t('common.real') }}</template></el-table-column>
-        <el-table-column prop="message" :label="t('common.message')" width="520" show-overflow-tooltip />
-        <el-table-column prop="time" :label="t('common.time')" width="190" />
-      </el-table>
+            <h2 class="settings-title">{{ t('settings.moduleStatus') }}</h2>
+            <el-table :data="moduleRows" :fit="false" style="width: 1150px; max-width: 100%;">
+              <el-table-column prop="module" :label="t('common.module')" width="160" />
+              <el-table-column :label="t('common.status')" width="140"><template #default><span class="status-pill success">{{ t('settings.connected') }}</span></template></el-table-column>
+              <el-table-column :label="t('common.provider')" width="140"><template #default>{{ t('common.real') }}</template></el-table-column>
+              <el-table-column prop="message" :label="t('common.message')" width="520" show-overflow-tooltip />
+              <el-table-column prop="time" :label="t('common.time')" width="190" />
+            </el-table>
+          </div>
+        </el-tab-pane>
+      </el-tabs>
     </div>
   </section>
 </template>
@@ -93,6 +111,7 @@ type RefreshablePanel = {
 const { locale, setLocale, t } = useI18n()
 const { can, deniedText } = usePermissions()
 const form = reactive<any>({ language: locale.value, deploymentConcurrency: 2, moduleStatus: {} })
+const activeTab = ref('general')
 const now = ref('')
 const maintenancePanel = ref<RefreshablePanel | null>(null)
 const healthPanel = ref<RefreshablePanel | null>(null)
@@ -153,9 +172,22 @@ onMounted(load)
 
 <style scoped>
 .settings-card {
-  padding: 12px;
+  padding: 0 12px 12px;
+}
+
+.settings-tabs {
+  min-width: 0;
+}
+
+.settings-tabs :deep(.el-tabs__header) {
+  margin: 0 0 12px;
+}
+
+.settings-tab-pane {
+  min-width: 0;
   display: grid;
   gap: 12px;
+  align-content: start;
 }
 
 .settings-block {
