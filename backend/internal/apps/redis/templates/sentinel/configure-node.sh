@@ -111,12 +111,22 @@ fi
 echo "$START_OUTPUT"
 
 echo "verifying Redis Sentinel"
-if ! VERIFY_OUTPUT="$("$INSTALL_ROOT/bin/redis-cli" -p "$SENTINEL_PORT" -a "$REDIS_PASSWORD" --no-auth-warning sentinel masters 2>&1)"; then
+SENTINEL_READY=0
+VERIFY_OUTPUT=""
+for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+  if VERIFY_OUTPUT="$("$INSTALL_ROOT/bin/redis-cli" -p "$SENTINEL_PORT" -a "$REDIS_PASSWORD" --no-auth-warning sentinel masters 2>&1)"; then
+    SENTINEL_READY=1
+    break
+  fi
+  sleep 1
+done
+if [ "$SENTINEL_READY" != "1" ]; then
   echo "$VERIFY_OUTPUT"
   echo "Redis Sentinel is not responding"
   $SUDO systemctl --no-pager --full status "$SENTINEL_SERVICE" 2>&1 || true
   $SUDO journalctl -u "$SENTINEL_SERVICE" -n 120 --no-pager 2>&1 || true
   exit 1
 fi
+echo "$VERIFY_OUTPUT"
 ensure_service_access
 echo "Redis Sentinel node configured: $ROLE"

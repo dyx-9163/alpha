@@ -331,3 +331,5 @@
 - 结论：Redis 应用恢复 Sentinel 高可用拓扑，安装弹窗在 Sentinel 模式下分开选择 Redis 数据节点、初始 Master 和 Sentinel 节点；后端 Redis Sentinel 角色解析支持 `redisDataServerIds` 推导 replica，并移除独立 `redis-sentinel` 前后端模块注册。验证通过：go test ./internal/apps/redis（使用工作区 GOCACHE）、pnpm test、pnpm web:build、git diff --check。
 - 问题：用户要求 MySQL Router 也合并到 MGR/InnoDB Cluster 集群部署中。
 - 结论：MySQL 安装弹窗在 InnoDB Cluster 拓扑下新增 MySQL 数据节点、是否安装 Router、Router 节点和 Router 起始端口配置；后端 MySQL 集群安装会在 bootstrap 后按所选 Router 节点安装并记录 `mysql-router` 实例，保留后端 mysql-router 模块用于既有实例检测/卸载，移除前端独立 MySQL Router 应用入口。验证通过：go test ./internal/apps/mysql ./internal/apps/mysqlrouter ./internal/apps/mysqlbundle、pnpm test、pnpm web:build、git diff --check。
+- 问题：用户反馈 Redis Sentinel 安装第 4/5 步“配置 Redis Sentinel 拓扑”失败，但目标机服务看起来已经安装完成。
+- 结论：原因是脚本在 `systemctl enable --now` 后立即执行一次 `redis-cli sentinel masters` 验证；systemd `Type=simple` 返回时 Sentinel 进程可能刚启动、端口尚未完全可用，导致验证误报失败，而前面的配置和服务启动已经落地。已改为最多等待 15 秒重试 Sentinel 验证，避免这种已安装但任务失败的假阴性。验证通过：go test ./internal/apps/redis、pnpm test、git diff --check。

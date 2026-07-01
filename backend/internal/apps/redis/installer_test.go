@@ -195,6 +195,9 @@ func TestRedisSentinelScriptUsesConfiguredMasterName(t *testing.T) {
 	if !strings.Contains(script, `redis-cli" -p "$SENTINEL_PORT" -a "$REDIS_PASSWORD" --no-auth-warning sentinel masters`) {
 		t.Fatalf("sentinel verification should authenticate to sentinel:\n%s", script)
 	}
+	if !strings.Contains(script, `for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15`) || !strings.Contains(script, `SENTINEL_READY=1`) {
+		t.Fatalf("sentinel verification should wait for the service to become ready:\n%s", script)
+	}
 	if !strings.Contains(script, `journalctl -u "$SENTINEL_SERVICE" -n 120 --no-pager`) || !strings.Contains(script, `sed -n '1,160p' "$SENTINEL_CONFIG"`) {
 		t.Fatalf("sentinel script should print service diagnostics on startup failure:\n%s", script)
 	}
