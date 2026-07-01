@@ -315,3 +315,5 @@
 - 结论：服务器探测和数据库实时监测的进行中状态统一展示为“探测中”；应用商店 Redis 基础服务仅保留单体/Cluster，新增独立 Redis Sentinel 前后端模块并复用 Redis 离线资源。验证通过：pnpm test、pnpm web:build、git diff --check。
 - 问题：用户询问 Redis 安装是建议基础服务和哨兵分开，还是合并到一起。
 - 结论：建议产品能力上分开管理，部署体验上可提供一键高可用向导；Redis 数据服务和 Sentinel 的生命周期、节点数量、端口、防火墙、卸载和故障处理都不同，分开更安全清晰。
+- 问题：用户询问 Redis 代码接下来应如何调整以落实基础服务与哨兵拆分。
+- 结论：下一步应让后端行为也真拆分：Redis 基础安装只负责数据服务，Redis Sentinel 安装只校验/复用已有数据服务并安装/配置 Sentinel；master/replica 节点不再重复编译安装 Redis 基础服务，sentinel-only 节点只安装运行 Sentinel 所需 binaries。
