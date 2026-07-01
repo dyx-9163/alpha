@@ -150,7 +150,7 @@ export function aifarInstallDialogProps(locale?: string, context?: AppInstallDia
     targetMode: 'single',
     copy: dialogCopy,
     fields: [
-      requiredText('timezone', copy.timezone, 'Asia/Phnom_Penh', copy),
+      requiredText('timezone', copy.timezone, 'system', copy),
       {
         ...requiredText('networkName', copy.networkName, 'aifar-network', copy),
         validate: (value) => {
@@ -168,7 +168,7 @@ export function aifarInstallDialogProps(locale?: string, context?: AppInstallDia
         ...requiredText('nacosPassword', copy.nacosPassword, 'oversea.nacos', copy),
         type: 'password'
       },
-      requiredText('nacosNamespace', copy.nacosNamespace, 'dyx', copy),
+      requiredText('nacosNamespace', copy.nacosNamespace, 'prod', copy),
       selectField('dbSource', copy.dbSource, [
         { label: copy.dbSourceExisting, value: 'existing', disabled: mysqlOptions.length === 0 },
         { label: copy.dbSourceManual, value: 'manual' }

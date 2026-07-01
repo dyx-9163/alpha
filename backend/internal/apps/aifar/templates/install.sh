@@ -92,6 +92,27 @@ prepare_compose_networks() {
   done
 }
 
+resolve_system_timezone() {
+  case "$TIMEZONE" in
+    ""|"system"|"SYSTEM"|"System")
+      detected=""
+      if command -v timedatectl >/dev/null 2>&1; then
+        detected="$(timedatectl show -p Timezone --value 2>/dev/null || true)"
+      fi
+      if [ -z "$detected" ] && [ -f /etc/timezone ]; then
+        detected="$(head -n 1 /etc/timezone 2>/dev/null || true)"
+      fi
+      if [ -z "$detected" ] && [ -L /etc/localtime ]; then
+        localtime_target="$(readlink /etc/localtime 2>/dev/null || true)"
+        case "$localtime_target" in
+          */zoneinfo/*) detected="${localtime_target#*/zoneinfo/}" ;;
+        esac
+      fi
+      TIMEZONE="${detected:-UTC}"
+      ;;
+  esac
+}
+
 down_existing() {
   [ -d "$APP_DIR" ] || return 0
   prepare_compose_networks || true
@@ -124,6 +145,7 @@ fi
 rm -rf "$TMP_DIR"
 
 ROOT_ENV="$APP_DIR/.env"
+resolve_system_timezone
 set_env TZ "$TIMEZONE" "$ROOT_ENV"
 set_env APP_CPUS "$APP_CPUS" "$ROOT_ENV"
 set_env APP_MEMORY_LIMIT "$APP_MEMORY_LIMIT" "$ROOT_ENV"

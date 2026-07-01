@@ -143,7 +143,7 @@ func (s Service) Install(ctx context.Context, req InstallRequest, resources []st
 
 	deployDir := installerkit.RemoteDeployDir(server.DeployDir)
 	workDir := installerkit.WorkDir(deployDir, AppName, bundle.Version, time.Now())
-	installRoot := installerkit.InstallRoot(deployDir, AppName)
+	installRoot := installRootFromDeployDir(deployDir)
 	archiveRemote := workDir + "/" + filepath.Base(archiveLocal)
 	scriptRemote := workDir + "/install-aifar.sh"
 
@@ -269,7 +269,7 @@ func (s Service) Delete(ctx context.Context, req DeleteRequest, log Logger, targ
 	step := newStepRunner(logForServer, recorder, target, deleteSteps(copy), copy.StepStart, copy.StepDone, copy.StepFailed)
 	metadata := metadataFromInstance(req.Instance)
 	networkName := stringFromMetadata(metadata, "networkName", defaultNetworkName)
-	installRoot := stringFromMetadata(metadata, "installRoot", installerkit.InstallRoot(installerkit.RemoteDeployDir(req.Server.DeployDir), AppName))
+	installRoot := stringFromMetadata(metadata, "installRoot", installRootFromDeployDir(req.Server.DeployDir))
 
 	if err := step(1, func() error {
 		script, err := renderUninstallScript(uninstallScriptData{
@@ -331,7 +331,7 @@ func (s Service) Check(ctx context.Context, req CheckRequest, log Logger, target
 	}
 	step := newStepRunner(logForServer, recorder, target, checkSteps(copy), copy.StepStart, copy.StepDone, copy.StepFailed)
 	metadata := metadataFromInstance(req.Instance)
-	installRoot := stringFromMetadata(metadata, "installRoot", installerkit.InstallRoot(installerkit.RemoteDeployDir(req.Server.DeployDir), AppName))
+	installRoot := stringFromMetadata(metadata, "installRoot", installRootFromDeployDir(req.Server.DeployDir))
 	var status StatusResult
 	if err := step(1, func() error {
 		var checkErr error
@@ -412,6 +412,10 @@ func renderUninstallScript(data uninstallScriptData) (string, error) {
 
 func shellQuoteAny(value any) string {
 	return installerkit.ShellQuote(fmt.Sprint(value))
+}
+
+func installRootFromDeployDir(deployDir string) string {
+	return installerkit.InstallRoot(installerkit.RemoteDeployDir(deployDir), installDirName)
 }
 
 func logForTarget(fallback Logger, targetLog targetLogger, target string) Logger {

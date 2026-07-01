@@ -31,7 +31,7 @@ func NewInspector(remote Remote) Inspector {
 func (i Inspector) Check(ctx context.Context, server store.Server, installRoot string, log Logger) (StatusResult, error) {
 	installRoot = strings.TrimSpace(installRoot)
 	if installRoot == "" {
-		installRoot = installerkit.InstallRoot(installerkit.RemoteDeployDir(server.DeployDir), AppName)
+		installRoot = installRootFromDeployDir(server.DeployDir)
 	}
 	result, err := i.remote.Run(ctx, server, statusCommand(installRoot))
 	installerkit.LogCommandResult(result, err, log)

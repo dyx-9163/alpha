@@ -120,6 +120,16 @@ type fakeLogger struct{}
 func (fakeLogger) Info(format string, args ...any)  {}
 func (fakeLogger) Error(format string, args ...any) {}
 
+func TestOptionsDefaultsUseRequestedAIFARValues(t *testing.T) {
+	opts := optionsFromParameters(nil)
+	if opts.Timezone != "system" || opts.NacosWebPort != 9849 || opts.NacosNamespace != "prod" {
+		t.Fatalf("unexpected defaults: %+v", opts)
+	}
+	if got := installRootFromDeployDir("/aifar/apps"); got != "/aifar/apps/admin" {
+		t.Fatalf("expected AIFAR install root /aifar/apps/admin, got %s", got)
+	}
+}
+
 func TestServiceInstallsAIFARServiceFromDockerAppsBundle(t *testing.T) {
 	root := createAIFARBundle(t)
 	s := &fakeStore{servers: map[string]store.Server{
@@ -168,6 +178,9 @@ func TestServiceInstallsAIFARServiceFromDockerAppsBundle(t *testing.T) {
 	}
 	if !strings.Contains(remote.installScript, "prepare_compose_networks") || !strings.Contains(remote.installScript, "external: true") {
 		t.Fatalf("AIFAR install script should mark shared Docker network as external:\n%s", remote.installScript)
+	}
+	if !strings.Contains(remote.installScript, "resolve_system_timezone") || !strings.Contains(remote.installScript, "timedatectl show -p Timezone") {
+		t.Fatalf("AIFAR install script should resolve system timezone:\n%s", remote.installScript)
 	}
 }
 
@@ -331,7 +344,7 @@ func TestServiceChecksAIFARServiceAndUpdatesStatus(t *testing.T) {
 		Version:  "docker-apps",
 		ServerID: "srv-1",
 		Status:   "installed",
-		Metadata: `{"installRoot":"/aifar/apps/aifar"}`,
+		Metadata: `{"installRoot":"/aifar/apps/admin"}`,
 	}
 	s := &fakeStore{
 		servers:   map[string]store.Server{"srv-1": {ID: "srv-1", Name: "app-1", Host: "10.0.0.10", DeployDir: "/aifar/apps"}},
