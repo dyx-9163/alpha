@@ -105,9 +105,10 @@ func (r sentinelRoleSelection) RoleFor(target string) string {
 
 func redisSentinelRoles(params map[string]any, legacyTargets []string, copy Copy) (sentinelRoleSelection, error) {
 	master := redisSentinelMasterParam(params)
+	dataNodes, hasDataNodes := stringSliceParam(params, "redisDataServerIds", "dataServerIds")
 	replicas, hasReplicas := stringSliceParam(params, "replicaServerIds", "replicaIds")
 	sentinels, hasSentinels := stringSliceParam(params, "sentinelServerIds", "sentinelIds")
-	explicit := hasReplicas || hasSentinels
+	explicit := hasDataNodes || hasReplicas || hasSentinels
 	if !explicit {
 		if len(legacyTargets) < 3 {
 			return sentinelRoleSelection{}, errors.New(copy.SentinelNeedNodes)
@@ -131,6 +132,20 @@ func redisSentinelRoles(params map[string]any, legacyTargets []string, copy Copy
 	if master == "" {
 		return sentinelRoleSelection{}, errors.New(copy.SentinelMasterRequired)
 	}
+	if hasDataNodes {
+		if len(dataNodes) < 3 {
+			return sentinelRoleSelection{}, errors.New(copy.SentinelNeedNodes)
+		}
+		if !stringInSlice(master, dataNodes) {
+			return sentinelRoleSelection{}, errors.New(copy.SentinelMasterNotSelected)
+		}
+		replicas = replicasFromDataNodes(dataNodes, master)
+	} else if !hasReplicas && len(legacyTargets) > 0 {
+		if !stringInSlice(master, legacyTargets) {
+			return sentinelRoleSelection{}, errors.New(copy.SentinelMasterNotSelected)
+		}
+		replicas = replicasFromDataNodes(legacyTargets, master)
+	}
 	if len(replicas) == 0 {
 		return sentinelRoleSelection{}, errors.New(copy.SentinelReplicaRequired)
 	}
@@ -148,6 +163,16 @@ func redisSentinelRoles(params map[string]any, legacyTargets []string, copy Copy
 		AllIDs:      all,
 		Explicit:    true,
 	}, nil
+}
+
+func replicasFromDataNodes(dataNodes []string, master string) []string {
+	replicas := make([]string, 0, len(dataNodes))
+	for _, target := range dataNodes {
+		if target != master {
+			replicas = append(replicas, target)
+		}
+	}
+	return replicas
 }
 
 func redisPort(params map[string]any) int {

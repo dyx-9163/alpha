@@ -67,11 +67,13 @@ func redisTopologies(lang string) []registry.Topology {
 	if normalizeLanguage(lang) == "en" {
 		return []registry.Topology{
 			{Name: "standalone", Label: "Standalone", TargetMode: registry.TargetModeSingle, MinTargets: 1, Default: true},
+			{Name: "sentinel", Label: "Sentinel HA", TargetMode: registry.TargetModeMultiple, MinTargets: 3},
 			{Name: "cluster", Label: "Cluster", TargetMode: registry.TargetModeMultiple, MinTargets: 3},
 		}
 	}
 	return []registry.Topology{
 		{Name: "standalone", Label: "单体", TargetMode: registry.TargetModeSingle, MinTargets: 1, Default: true},
+		{Name: "sentinel", Label: "Sentinel 高可用", TargetMode: registry.TargetModeMultiple, MinTargets: 3},
 		{Name: "cluster", Label: "Cluster", TargetMode: registry.TargetModeMultiple, MinTargets: 3},
 	}
 }
@@ -241,5 +243,5 @@ func (m Module) Check(ctx context.Context, req registry.CheckRequest, run regist
 }
 
 func redisSentinelOnlyInstall(req registry.InstallRequest) bool {
-	return req.App == "redis-sentinel" && redisUseExistingBase(req.Parameters)
+	return normalizeTopology(req.Topology) == "sentinel" && redisUseExistingBase(req.Parameters)
 }

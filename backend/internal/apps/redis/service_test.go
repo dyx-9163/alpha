@@ -238,6 +238,32 @@ func TestServiceInstallsRedisSentinelAndRecordsEachNode(t *testing.T) {
 	}
 }
 
+func TestRedisSentinelRolesDerivesReplicasFromDataNodes(t *testing.T) {
+	roles, err := redisSentinelRoles(map[string]any{
+		"sentinelMasterId":   "srv-1",
+		"redisDataServerIds": []string{"srv-1", "srv-2", "srv-3"},
+		"sentinelServerIds":  []string{"srv-4", "srv-5", "srv-6"},
+	}, nil, CopyFor("en"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if roles.MasterID != "srv-1" {
+		t.Fatalf("master = %q, want srv-1", roles.MasterID)
+	}
+	if strings.Join(roles.ReplicaIDs, ",") != "srv-2,srv-3" {
+		t.Fatalf("replicas = %#v, want srv-2/srv-3", roles.ReplicaIDs)
+	}
+	if strings.Join(roles.SentinelIDs, ",") != "srv-4,srv-5,srv-6" {
+		t.Fatalf("sentinels = %#v, want dedicated sentinel servers", roles.SentinelIDs)
+	}
+	if strings.Join(roles.AllIDs, ",") != "srv-1,srv-2,srv-3,srv-4,srv-5,srv-6" {
+		t.Fatalf("all IDs = %#v, want data and sentinel servers", roles.AllIDs)
+	}
+	if roles.RoleFor("srv-4") != "sentinel" {
+		t.Fatalf("dedicated sentinel role = %q, want sentinel", roles.RoleFor("srv-4"))
+	}
+}
+
 func TestServiceInstallsRedisSentinelOnlyWithoutReinstallingDataNodes(t *testing.T) {
 	root := t.TempDir()
 	archive := filepath.Join(root, "redis-7.2.14.tar.gz")

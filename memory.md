@@ -327,3 +327,5 @@
 - 结论：产品默认部署体验应提供“Redis Sentinel 高可用”一体化向导，一次性配置 1 主 2 从和 3 个 Sentinel；底层模块仍可拆分为 Redis 数据服务与 Sentinel 运行服务，保留接入已有 Redis 的高级模式。
 - 问题：用户确认按 Redis Sentinel 一体化部署方案调整。
 - 结论：Redis Sentinel 安装入口改为默认一体化部署，目标服务器选择至少 3 台后从已选服务器中选初始 Master，其余自动作为 Replica，所有目标同时安装 Sentinel；后端 `redis-sentinel` 默认不再校验已有基础服务，而是安装 Redis 数据服务并配置 Sentinel，`useExistingRedis` 保留高级接入已有基础服务模式。验证通过：go test ./internal/apps/redis ./internal/apps/redissentinel、pnpm web:build、pnpm test、git diff --check。
+- 问题：用户要求 Redis Sentinel 部署合并到 Redis 应用内，并支持 Redis 数据节点与 Sentinel 节点分开选择。
+- 结论：Redis 应用恢复 Sentinel 高可用拓扑，安装弹窗在 Sentinel 模式下分开选择 Redis 数据节点、初始 Master 和 Sentinel 节点；后端 Redis Sentinel 角色解析支持 `redisDataServerIds` 推导 replica，并移除独立 `redis-sentinel` 前后端模块注册。验证通过：go test ./internal/apps/redis（使用工作区 GOCACHE）、pnpm test、pnpm web:build、git diff --check。
