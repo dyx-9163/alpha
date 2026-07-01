@@ -485,10 +485,22 @@ func (s Service) Check(ctx context.Context, req CheckRequest, log Logger, target
 		return CheckResult{Status: "failed", Message: msg, Details: details}, err
 	}
 
+	var runtimeProbe mysqlRuntimeProbe
 	if err := step(1, "check-runtime", copy.CheckRuntime, func() error {
-		return s.checkMySQLRuntime(ctx, req.Server, req.Instance, req.DefaultPassword, logForServer)
+		var err error
+		runtimeProbe, err = s.probeMySQLRuntime(ctx, req.Server, req.Instance, req.DefaultPassword, logForServer)
+		mergeDetails(details, runtimeProbe.details())
+		if err != nil {
+			return err
+		}
+		if topology != "innodb-cluster" && !runtimeProbe.pingRunning() {
+			return errors.New("MySQL ping failed")
+		}
+		return nil
 	}); err != nil {
-		details["runtimeStatus"] = "offline"
+		if _, ok := details["runtimeStatus"]; !ok {
+			details["runtimeStatus"] = "offline"
+		}
 		return fail(err)
 	}
 	details["runtimeStatus"] = "running"

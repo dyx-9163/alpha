@@ -536,7 +536,9 @@ function groupDatabaseInstances(items: AppInstance[]) {
         routers: hydratedGroup.routers.sort((a, b) => a.serverLabel.localeCompare(b.serverLabel)),
         sentinels: hydratedGroup.sentinels.sort((a, b) => a.serverLabel.localeCompare(b.serverLabel))
       }
-      const nodeStatus = serviceStatus(normalizedGroup.nodes)
+      const nodeStatus = normalizedGroup.app === 'mysql' && normalizedGroup.topology === 'innodb-cluster'
+        ? mysqlClusterServiceStatus(normalizedGroup)
+        : serviceStatus(normalizedGroup.nodes)
       const routerStatus = serviceStatus(normalizedGroup.routers)
       const sentinelStatus = serviceStatus(normalizedGroup.sentinels)
       return {
@@ -851,6 +853,16 @@ function nodeHealthType(node: DatabaseNode) {
 }
 
 function nodeHealth(node: DatabaseNode) {
+  if (isMysqlInnoDBNode(node)) {
+    const runtimeHealth = mysqlRuntimeHealth(node)
+    if (runtimeHealth !== 'unknown') {
+      return runtimeHealth
+    }
+  }
+  return baseNodeHealth(node)
+}
+
+function baseNodeHealth(node: DatabaseNode) {
   if (serverStatusOffline(nodeServerStatus(node))) {
     return 'offline'
   }
@@ -872,6 +884,10 @@ function nodeHealth(node: DatabaseNode) {
     return 'offline'
   }
   return 'unknown'
+}
+
+function isMysqlInnoDBNode(node: DatabaseNode) {
+  return node.instance.app === 'mysql' && normalizedTopology(node.instance, node.metadata) === 'innodb-cluster'
 }
 
 function isNodeCheckStaleForCurrentMonitor(node: DatabaseNode) {
@@ -1080,6 +1096,28 @@ function serviceStatus(nodes: DatabaseNode[]) {
   return 'degraded'
 }
 
+function mysqlClusterServiceStatus(group: DatabaseGroup) {
+  const runtimeHealths = group.nodes.map((node) => mysqlRuntimeHealth(node))
+  if (!runtimeHealths.length) {
+    return 'unknown'
+  }
+  if (runtimeHealths.every((status) => status === 'offline')) {
+    return 'unavailable'
+  }
+  const clusterHealths = group.nodes.map((node) => baseNodeHealth(node))
+  const hasPrimary = !!groupCurrentPrimaryEndpoint(group)
+  if (hasPrimary && clusterHealths.every((status) => status === 'online')) {
+    return 'running'
+  }
+  if (runtimeHealths.every((status) => status === 'online')) {
+    return 'unavailable'
+  }
+  if (runtimeHealths.some((status) => status === 'online')) {
+    return 'degraded'
+  }
+  return 'unknown'
+}
+
 function groupStatus(nodeStatus: string, routerStatus: string, hasRouters: boolean) {
   if (nodeStatus === 'unavailable') {
     return 'unavailable'
@@ -1245,14 +1283,28 @@ function mysqlRuntimeHealth(node: DatabaseNode) {
   if (serverStatusOffline(nodeServerStatus(node))) {
     return 'offline'
   }
-  const runtimeStatus = stringValue(node.metadata.lastCheck?.details?.runtimeStatus || node.metadata.mysqlRuntimeStatus || node.metadata.runtimeStatus)
-  if (['ok', 'success', 'running', 'available'].includes(runtimeStatus)) {
+  const runtimeStatus = mysqlRuntimeStatus(node)
+  if (monitoringRunning.value && statusIsOnline(runtimeStatus) && isNodeCheckStaleForCurrentMonitor(node)) {
+    return 'unknown'
+  }
+  if (statusIsOnline(runtimeStatus)) {
     return 'online'
   }
-  if (['failed', 'error', 'missing', 'stopped', 'offline', 'unavailable'].includes(runtimeStatus)) {
+  if (statusIsOffline(runtimeStatus)) {
     return 'offline'
   }
-  return nodeHealth(node)
+  return baseNodeHealth(node)
+}
+
+function mysqlRuntimeStatus(node: DatabaseNode) {
+  const details = node.metadata.lastCheck?.details || {}
+  return stringValue(
+    details.runtimeStatus ||
+    details.mysqlServiceStatus ||
+    details.mysqlPortStatus ||
+    node.metadata.mysqlRuntimeStatus ||
+    node.metadata.runtimeStatus
+  )
 }
 
 function hasRouterClusterDelete(group: DatabaseGroup) {

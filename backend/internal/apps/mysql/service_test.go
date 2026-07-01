@@ -72,6 +72,7 @@ type fakeRemote struct {
 	installStarted chan string
 	releaseInstall chan struct{}
 	primaryOutput  string
+	runtimeOutput  string
 }
 
 func (f *fakeRemote) Run(ctx context.Context, server store.Server, command string) (adapter.CommandResult, error) {
@@ -86,6 +87,13 @@ func (f *fakeRemote) Run(ctx context.Context, server store.Server, command strin
 	f.mu.Lock()
 	f.commands = append(f.commands, command)
 	f.mu.Unlock()
+	if strings.Contains(command, "AIFAR_MYSQL_RUNTIME_PROBE=1") {
+		output := f.runtimeOutput
+		if strings.TrimSpace(output) == "" {
+			output = "runtimeStatus=running\nmysqlPingStatus=running\nmysqlServiceStatus=running\nmysqlPortStatus=running\nmysqlRuntimeSource=mysqladmin\n"
+		}
+		return adapter.CommandResult{Stdout: output}, nil
+	}
 	if strings.Contains(command, "replication_group_members") {
 		return adapter.CommandResult{Stdout: f.primaryOutput}, nil
 	}
@@ -334,6 +342,57 @@ func TestServiceCheckInnoDBClusterRecordsRuntimeWhenPrimaryMissing(t *testing.T)
 	details, _ := lastCheck["details"].(map[string]any)
 	if got := details["runtimeStatus"]; got != "running" {
 		t.Fatalf("expected runtimeStatus running after mysqladmin ping succeeded, got %v", got)
+	}
+	if s.instances[0].Status != "failed" {
+		t.Fatalf("expected cluster check status failed, got %s", s.instances[0].Status)
+	}
+}
+
+func TestServiceCheckInnoDBClusterUsesSystemdRuntimeWhenPrimaryMissing(t *testing.T) {
+	clusterID := "mysql_cluster_test"
+	now := time.Now()
+	instances := []store.AppInstance{
+		mysqlClusterInstance("app-1", "srv-1", clusterID, "10.0.0.1:3306", now),
+		mysqlClusterInstance("app-2", "srv-2", clusterID, "10.0.0.2:3306", now),
+		mysqlClusterInstance("app-3", "srv-3", clusterID, "10.0.0.3:3306", now),
+	}
+	s := &fakeStore{
+		servers: map[string]store.Server{
+			"srv-1": {ID: "srv-1", Name: "mysql-1", Host: "10.0.0.1", DeployDir: "/aifar/apps"},
+			"srv-2": {ID: "srv-2", Name: "mysql-2", Host: "10.0.0.2", DeployDir: "/aifar/apps"},
+			"srv-3": {ID: "srv-3", Name: "mysql-3", Host: "10.0.0.3", DeployDir: "/aifar/apps"},
+		},
+		instances: instances,
+	}
+	remote := &fakeRemote{runtimeOutput: "runtimeStatus=running\nmysqlPingStatus=offline\nmysqlServiceStatus=running\nmysqlPortStatus=offline\nmysqlRuntimeSource=systemd\n"}
+	service := NewService(s, remote)
+
+	_, err := service.Check(context.Background(), CheckRequest{
+		Instance:        instances[0],
+		Server:          s.servers["srv-1"],
+		Language:        "en",
+		DefaultPassword: "Oversea.123",
+	}, fakeLogger{}, nil)
+	if err == nil {
+		t.Fatal("expected missing primary to fail cluster check")
+	}
+	metadata := map[string]any{}
+	if err := json.Unmarshal([]byte(s.instances[0].Metadata), &metadata); err != nil {
+		t.Fatal(err)
+	}
+	lastCheck, _ := metadata["lastCheck"].(map[string]any)
+	details, _ := lastCheck["details"].(map[string]any)
+	if got := details["runtimeStatus"]; got != "running" {
+		t.Fatalf("expected runtimeStatus running from systemd service, got %v", got)
+	}
+	if got := details["mysqlPingStatus"]; got != "offline" {
+		t.Fatalf("expected mysqlPingStatus offline, got %v", got)
+	}
+	if got := details["mysqlServiceStatus"]; got != "running" {
+		t.Fatalf("expected mysqlServiceStatus running, got %v", got)
+	}
+	if got := details["mysqlRuntimeSource"]; got != "systemd" {
+		t.Fatalf("expected mysqlRuntimeSource systemd, got %v", got)
 	}
 	if s.instances[0].Status != "failed" {
 		t.Fatalf("expected cluster check status failed, got %s", s.instances[0].Status)
