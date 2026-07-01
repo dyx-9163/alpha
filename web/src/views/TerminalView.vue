@@ -5,33 +5,33 @@
         <h1 class="page-title">{{ t('terminal.title') }}</h1>
         <p class="page-subtitle">{{ t('terminal.subtitle') }}</p>
       </div>
-      <div class="head-actions">
-        <el-select v-model="serverId" :placeholder="t('terminal.server')" class="toolbar-control">
+      <el-button @click="$router.push('/servers')">{{ t('terminal.openServers') }}</el-button>
+    </div>
+
+    <div class="aifar-panel terminal-toolbar">
+      <div class="terminal-control-group">
+        <span class="terminal-control-label">{{ t('terminal.server') }}</span>
+        <el-select v-model="serverId" :placeholder="t('terminal.server')" class="toolbar-control is-lg">
           <el-option v-for="server in servers" :key="server.id" :label="server.name" :value="server.id" />
         </el-select>
+        <span class="status-pill" :class="connected ? 'success' : ''">{{ connectionStatus }}</span>
+      </div>
+      <div class="head-actions terminal-toolbar-actions">
         <el-tooltip :content="deniedText" :disabled="canConnectTerminal" placement="top">
           <span><el-button type="primary" :disabled="!canConnectTerminal || !serverId" @click="connect">{{ t('terminal.connect') }}</el-button></span>
         </el-tooltip>
+        <el-button :disabled="!connected" @click="disconnect">{{ t('terminal.disconnect') }}</el-button>
         <el-button @click="newTab">{{ t('terminal.newTab') }}</el-button>
-        <el-button @click="$router.push('/servers')">{{ t('terminal.openServers') }}</el-button>
       </div>
     </div>
 
     <div class="workspace-card terminal-panel">
-      <el-tabs v-model="activeTab">
-        <el-tab-pane :label="tabLabel" name="main" />
-      </el-tabs>
-      <div class="terminal-head">
+      <div class="terminal-session-head">
         <div>
           <strong>{{ currentServer?.name || t('terminal.notSelected') }}</strong>
-          <span>{{ connected ? t('common.connected') : t('common.disconnected') }}</span>
+          <span>{{ currentServerMeta }}</span>
         </div>
-        <div class="head-actions">
-          <el-tooltip :content="deniedText" :disabled="canConnectTerminal" placement="top">
-            <span><el-button size="small" type="primary" :disabled="!canConnectTerminal || !serverId" @click="connect">{{ t('terminal.connect') }}</el-button></span>
-          </el-tooltip>
-          <el-button size="small" @click="disconnect">{{ t('terminal.disconnect') }}</el-button>
-        </div>
+        <span class="status-pill" :class="connected ? 'success' : ''">{{ connectionStatus }}</span>
       </div>
       <div ref="terminalEl" class="terminal-box">{{ fallback }}</div>
     </div>
@@ -53,13 +53,19 @@ const servers = ref<any[]>([])
 const serverId = ref('')
 const terminalEl = ref<HTMLElement>()
 const fallback = ref(t('terminal.fallback'))
-const activeTab = ref('main')
 const connected = ref(false)
 let terminal: Terminal | null = null
 let socket: WebSocket | null = null
 let resizeObserver: ResizeObserver | null = null
 const currentServer = computed(() => servers.value.find((server) => server.id === serverId.value))
-const tabLabel = computed(() => currentServer.value ? `${currentServer.value.name} - ${connected.value ? t('common.connected') : t('terminal.ready')}` : t('terminal.tab'))
+const connectionStatus = computed(() => connected.value ? t('common.connected') : t('common.disconnected'))
+const currentServerMeta = computed(() => {
+  const server = currentServer.value
+  if (!server) return t('terminal.fallback')
+  const host = server.host || server.id
+  const port = server.port || 22
+  return `${host}:${port}`
+})
 const canConnectTerminal = computed(() => can(permissions.terminalConnect))
 
 async function load() {
@@ -74,7 +80,12 @@ function connect() {
   if (!terminalEl.value || !serverId.value) return
   terminalEl.value.textContent = ''
   terminal?.dispose()
-  terminal = new Terminal({ cursorBlink: true, fontSize: 13 })
+  terminal = new Terminal({
+    cursorBlink: true,
+    fontFamily: '"Cascadia Mono", Consolas, "SFMono-Regular", monospace',
+    fontSize: 13,
+    lineHeight: 1.2,
+  })
   terminal.open(terminalEl.value)
   observeTerminalSize()
   scheduleTerminalFit()
@@ -131,7 +142,9 @@ function observeTerminalSize() {
 function scheduleTerminalFit() {
   void nextTick(() => {
     fitTerminal()
+    window.requestAnimationFrame(fitTerminal)
     window.setTimeout(fitTerminal, 50)
+    window.setTimeout(fitTerminal, 150)
   })
 }
 
@@ -142,8 +155,10 @@ function fitTerminal() {
   const height = terminalEl.value.clientHeight - parseFloat(style.paddingTop) - parseFloat(style.paddingBottom)
   const measure = terminalEl.value.querySelector('.xterm-char-measure-element') as HTMLElement | null
   const rect = measure?.getBoundingClientRect()
-  const cellWidth = rect && rect.width > 0 ? rect.width : 8
-  const cellHeight = rect && rect.height > 0 ? rect.height : 17
+  const measuredCellWidth = rect?.width ?? 0
+  const measuredCellHeight = rect?.height ?? 0
+  const cellWidth = measuredCellWidth >= 4 && measuredCellWidth <= 20 ? measuredCellWidth : 8
+  const cellHeight = measuredCellHeight >= 10 && measuredCellHeight <= 32 ? measuredCellHeight : 17
   const cols = Math.max(20, Math.floor(width / cellWidth))
   const rows = Math.max(8, Math.floor(height / cellHeight))
   if (cols !== terminal.cols || rows !== terminal.rows) {
@@ -164,36 +179,60 @@ onBeforeUnmount(() => {
   min-height: 0;
 }
 
+.terminal-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px 16px;
+  padding: 12px 14px;
+}
+
+.terminal-control-group {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.terminal-control-label {
+  flex: 0 0 auto;
+  color: var(--aifar-text-secondary);
+  font-size: 12px;
+  font-weight: 750;
+}
+
+.terminal-toolbar-actions {
+  justify-content: flex-end;
+}
+
 .terminal-panel {
-  padding: 12px;
+  padding: 14px;
   display: grid;
-  grid-template-rows: auto auto minmax(0, 1fr);
+  grid-template-rows: auto minmax(0, 1fr);
+  gap: 12px;
   min-height: 0;
+  height: clamp(520px, calc(100dvh - 176px), 820px);
   overflow: hidden !important;
 }
 
-.terminal-panel :deep(.el-tabs__header) {
-  margin-bottom: 10px;
-}
-
-.terminal-head {
+.terminal-session-head {
   display: flex;
   justify-content: space-between;
   align-items: center;
   gap: 12px;
-  margin-bottom: 12px;
-  padding: 10px 12px;
+  padding: 12px 14px;
   border: 1px solid var(--aifar-border-soft);
   border-radius: var(--aifar-radius-lg);
   background: #fbfdff;
 }
 
-.terminal-head strong,
-.terminal-head span {
+.terminal-session-head strong,
+.terminal-session-head span {
   display: block;
 }
 
-.terminal-head span {
+.terminal-session-head span {
   color: var(--aifar-text-secondary);
   font-size: 12px;
 }
@@ -224,9 +263,24 @@ onBeforeUnmount(() => {
 }
 
 @media (max-width: 760px) {
-  .terminal-head {
+  .terminal-toolbar,
+  .terminal-session-head {
     align-items: flex-start;
     flex-direction: column;
+  }
+
+  .terminal-control-group {
+    align-items: stretch;
+    flex-direction: column;
+    width: 100%;
+  }
+
+  .terminal-toolbar-actions {
+    width: 100%;
+  }
+
+  .terminal-panel {
+    height: 560px;
   }
 }
 </style>
