@@ -166,6 +166,9 @@ func TestServiceInstallsAIFARServiceFromDockerAppsBundle(t *testing.T) {
 		!strings.Contains(remote.installScript, `allow_selinux_ports http_port_t "$GATEWAY_PORT" "$WEB_VUE3_PORT" "$NACOS_PORT_WEB" "$NACOS_PORT_API"`) {
 		t.Fatalf("AIFAR install script should open firewall and SELinux rules for service ports:\n%s", remote.installScript)
 	}
+	if !strings.Contains(remote.installScript, "prepare_compose_networks") || !strings.Contains(remote.installScript, "external: true") {
+		t.Fatalf("AIFAR install script should mark shared Docker network as external:\n%s", remote.installScript)
+	}
 }
 
 func TestServiceResolvesManagedDatabaseAndRedisInstances(t *testing.T) {

@@ -393,3 +393,7 @@
 - 结论：新增 `/nacos` 页面和侧边栏入口，支持 Nacos 实例/集群卡片、节点状态、实时监测、部署记录、配置摘要和整组卸载；后端新增 `GET /api/v2/nacos/instances`，新安装 Nacos metadata 记录 `authEnabled=true`。验证通过：pnpm web:build、pnpm test、git diff --check。
 - 问题：用户要求 Nacos 安装数据库配置像 AIFAR 一样支持“已部署 MySQL/手动填写 MySQL”，并将默认数据库改为 `aifar_nacos`、默认用户改为 `root`。
 - 结论：Nacos 安装弹窗新增 MySQL 来源选择，已部署模式可选 MySQL 或 MySQL Router；后端会解析所选实例并优先使用同集群 Router endpoint，同时默认 `dbName=aifar_nacos`、`dbUser=root`。验证通过：pnpm web:build、pnpm test、git diff --check。
+- 问题：用户询问 Spring Redis 单机配置切换到 Redis Sentinel 模式应如何填写。
+- 结论：Sentinel 模式下应用配置应去掉单机 `host/port`，改用 `spring.data.redis.sentinel.master` 和所有 Sentinel 节点 `host:26379`；`database`、Redis 数据密码和 lettuce 连接池仍保留，若 Sentinel 自身启用认证再单独配置 `sentinel.password`。
+- 问题：用户提供 AIFAR 服务安装日志，Docker Compose 因已存在 `aifar-network` 且缺少 Compose network label 失败。
+- 结论：AIFAR 安装脚本改为把共享 Docker 网络作为 external network 处理：安装前确保网络存在，并将各服务 compose 文件的 `${APP_NETWORK_NAME}` 网络标记为 `external: true`，避免预创建网络与 Compose label 校验冲突。验证通过：`go test ./internal/apps/aifar`、`pnpm test`、`git diff --check`。

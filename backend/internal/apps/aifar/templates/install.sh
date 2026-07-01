@@ -70,8 +70,31 @@ set_env() {
 
 {{ serviceAccessHelpers }}
 
+prepare_compose_networks() {
+  docker network inspect "$NETWORK_NAME" >/dev/null 2>&1 || docker network create --driver bridge "$NETWORK_NAME" >/dev/null
+  for compose_file in "$APP_DIR"/*/docker-compose.yaml; do
+    [ -f "$compose_file" ] || continue
+    tmp="${compose_file}.tmp"
+    awk '
+      /^[^[:space:]].*:/ {
+        in_networks = ($0 ~ /^networks:[[:space:]]*$/)
+      }
+      in_networks && /^[[:space:]]+driver:[[:space:]]/ { next }
+      in_networks && /^[[:space:]]+external:[[:space:]]/ { next }
+      {
+        print
+        if (in_networks && $0 ~ /^[[:space:]]+name:[[:space:]]*/ && $0 ~ /APP_NETWORK_NAME/) {
+          print "    external: true"
+        }
+      }
+    ' "$compose_file" > "$tmp"
+    mv "$tmp" "$compose_file"
+  done
+}
+
 down_existing() {
   [ -d "$APP_DIR" ] || return 0
+  prepare_compose_networks || true
   for service in web-vue3 gateway meeting contacts im message file system permission oauth nacos; do
     [ -f "$APP_DIR/$service/docker-compose.yaml" ] || continue
     (
@@ -163,7 +186,7 @@ if [ "$INIT_SQL" = "true" ]; then
   fi
 fi
 
-docker network inspect "$NETWORK_NAME" >/dev/null 2>&1 || docker network create --driver bridge "$NETWORK_NAME" >/dev/null
+prepare_compose_networks
 
 for service in $SERVICE_ORDER; do
   [ -f "$APP_DIR/$service/docker-compose.yaml" ] || continue
