@@ -1,6 +1,11 @@
 package redissentinel
 
-import "testing"
+import (
+	"context"
+	"testing"
+
+	"aifar-deployment/backend/internal/apps/registry"
+)
 
 func TestManifestUsesRedisResourceAndSentinelTopology(t *testing.T) {
 	manifest := NewModule(nil, nil).Manifest("en")
@@ -18,5 +23,40 @@ func TestManifestUsesRedisResourceAndSentinelTopology(t *testing.T) {
 	}
 	if !manifest.Topologies[0].Default {
 		t.Fatal("sentinel topology should be default")
+	}
+}
+
+func TestPlanUsesSentinelOnlyInstallSteps(t *testing.T) {
+	plan, err := NewModule(nil, nil).PlanInstall(context.Background(), registry.InstallRequest{
+		App:      moduleName,
+		Topology: "sentinel",
+		Language: "en",
+		Parameters: map[string]any{
+			"sentinelMasterId":  "srv-2",
+			"replicaServerIds":  []string{"srv-1"},
+			"sentinelServerIds": []string{"srv-2", "srv-1", "srv-3"},
+			"password":          "Oversea.123",
+		},
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stepByTarget := map[string]map[string]bool{}
+	for _, step := range plan {
+		if stepByTarget[step.Target] == nil {
+			stepByTarget[step.Target] = map[string]bool{}
+		}
+		stepByTarget[step.Target][step.Name] = true
+	}
+	for _, target := range []string{"srv-1", "srv-2"} {
+		if !stepByTarget[target]["verify-redis-base"] {
+			t.Fatalf("expected data target %s to verify existing Redis base service: %#v", target, plan)
+		}
+		if stepByTarget[target]["install-redis"] {
+			t.Fatalf("data target %s should not reinstall Redis base service: %#v", target, plan)
+		}
+	}
+	if !stepByTarget["srv-3"]["install-sentinel-binaries"] {
+		t.Fatalf("expected sentinel-only target to install Sentinel runtime binaries: %#v", plan)
 	}
 }

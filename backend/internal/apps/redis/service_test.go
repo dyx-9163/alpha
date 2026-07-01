@@ -234,6 +234,61 @@ func TestServiceInstallsRedisSentinelAndRecordsEachNode(t *testing.T) {
 	}
 }
 
+func TestServiceInstallsRedisSentinelOnlyWithoutReinstallingDataNodes(t *testing.T) {
+	root := t.TempDir()
+	archive := filepath.Join(root, "redis-7.2.14.tar.gz")
+	if err := os.WriteFile(archive, []byte("redis"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s := &fakeStore{servers: map[string]store.Server{
+		"srv-1": {ID: "srv-1", Name: "redis-1", Host: "10.0.0.1", DeployDir: "/aifar/apps"},
+		"srv-2": {ID: "srv-2", Name: "redis-2", Host: "10.0.0.2", DeployDir: "/aifar/apps"},
+		"srv-3": {ID: "srv-3", Name: "redis-3", Host: "10.0.0.3", DeployDir: "/aifar/apps"},
+	}}
+	remote := &fakeRemote{}
+	service := NewService(s, remote)
+	err := service.Install(context.Background(), InstallRequest{
+		Version:      "7.2.14",
+		Topology:     "sentinel",
+		Language:     "en",
+		SentinelOnly: true,
+		Parameters: map[string]any{
+			"port":              6379,
+			"sentinelPort":      26379,
+			"masterName":        "orders-primary",
+			"sentinelMasterId":  "srv-2",
+			"replicaServerIds":  []string{"srv-1"},
+			"sentinelServerIds": []string{"srv-2", "srv-1", "srv-3"},
+			"password":          "Oversea.123",
+		},
+	}, []store.Resource{{App: "redis", Part: "backend", Version: "7.2.14", Path: archive}}, fakeLogger{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(s.instances) != 3 {
+		t.Fatalf("expected three sentinel instances, got %d", len(s.instances))
+	}
+	joinedCommands := remote.joinedCommands()
+	if !strings.Contains(joinedCommands, "AIFAR_REDIS_BASE_VERIFY") {
+		t.Fatalf("expected data nodes to verify existing Redis base service: %s", joinedCommands)
+	}
+	if strings.Count(joinedCommands, "install-redis.sh") != 1 {
+		t.Fatalf("expected only sentinel-only node to install runtime binaries: %s", joinedCommands)
+	}
+	if !strings.Contains(joinedCommands, "AIFAR_REDIS_SENTINEL_CONFIGURE") {
+		t.Fatalf("expected sentinel configure action: %s", joinedCommands)
+	}
+	instancesByServer := map[string]store.AppInstance{}
+	for _, instance := range s.instances {
+		instancesByServer[instance.ServerID] = instance
+	}
+	if !strings.Contains(instancesByServer["srv-2"].Metadata, `"role":"master"`) ||
+		!strings.Contains(instancesByServer["srv-1"].Metadata, `"role":"replica"`) ||
+		!strings.Contains(instancesByServer["srv-3"].Metadata, `"role":"sentinel"`) {
+		t.Fatalf("expected sentinel-only install to preserve data and sentinel roles: %+v", s.instances)
+	}
+}
+
 func TestRedisSentinelMasterNameDefaultsAndValidates(t *testing.T) {
 	defaultName, err := redisSentinelMasterName(nil, "invalid")
 	if err != nil {

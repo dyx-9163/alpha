@@ -103,9 +103,10 @@ func (m Module) PlanInstall(ctx context.Context, req registry.InstallRequest, re
 		if err != nil {
 			return nil, err
 		}
+		sentinelOnly := redisSentinelOnlyInstall(req)
 		plan := make([]registry.InstallStepPlan, 0, len(roles.AllIDs)*len(redisInstallStepsFor(topology, copy)))
 		for _, target := range roles.AllIDs {
-			steps := redisSentinelStepsForTarget(copy, roles.IsSentinel(target))
+			steps := redisSentinelStepsForTarget(copy, roles.IsSentinel(target), sentinelOnly, roles.RoleFor(target))
 			for idx, step := range steps {
 				plan = append(plan, registry.InstallStepPlan{Target: target, Name: step.Name, Title: step.Title, Order: idx + 1})
 			}
@@ -174,6 +175,7 @@ func (m Module) Install(ctx context.Context, req registry.InstallRequest, run re
 		DefaultPassword: req.DefaultPassword,
 		Parameters:      req.Parameters,
 		Concurrency:     run.Concurrency,
+		SentinelOnly:    redisSentinelOnlyInstall(req),
 	}, run.Resources, run.Log, func(target string) Logger {
 		return run.LoggerForTarget(target)
 	})
@@ -236,4 +238,8 @@ func (m Module) Check(ctx context.Context, req registry.CheckRequest, run regist
 		return run.LoggerForTarget(target)
 	})
 	return registry.InstanceStatus{Status: result.Status, Message: result.Message, Details: result.Details}, err
+}
+
+func redisSentinelOnlyInstall(req registry.InstallRequest) bool {
+	return req.App == "redis-sentinel"
 }

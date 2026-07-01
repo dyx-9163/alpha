@@ -17,6 +17,9 @@ var standaloneUninstallScriptTemplate string
 //go:embed templates/sentinel/configure-node.sh
 var sentinelConfigureScriptTemplate string
 
+//go:embed templates/sentinel/verify-base.sh
+var sentinelVerifyBaseScriptTemplate string
+
 //go:embed templates/sentinel/uninstall-node.sh
 var sentinelUninstallScriptTemplate string
 
@@ -58,6 +61,13 @@ type SentinelNodeConfig struct {
 	MasterPort   int
 	Quorum       int
 	Role         string
+}
+
+type RedisBaseVerifyConfig struct {
+	Version     string
+	InstallRoot string
+	Port        int
+	Password    string
 }
 
 type ClusterNodeConfig struct {
@@ -112,6 +122,10 @@ func uninstallStandaloneScript(version, installRoot, legacyInstallRoot string, p
 
 func configureSentinelNodeScript(req SentinelNodeConfig) (string, error) {
 	return installerkit.RenderTemplate("redis", "sentinel/configure-node.sh", "redis-sentinel-configure", sentinelConfigureScriptTemplate, redisScriptFuncs, req)
+}
+
+func verifyRedisBaseScript(req RedisBaseVerifyConfig) (string, error) {
+	return installerkit.RenderTemplate("redis", "sentinel/verify-base.sh", "redis-sentinel-verify-base", sentinelVerifyBaseScriptTemplate, redisScriptFuncs, req)
 }
 
 func uninstallSentinelNodeScript(version, installRoot, legacyInstallRoot string, redisPort, sentinelPort int) (string, error) {

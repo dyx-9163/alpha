@@ -317,3 +317,5 @@
 - 结论：建议产品能力上分开管理，部署体验上可提供一键高可用向导；Redis 数据服务和 Sentinel 的生命周期、节点数量、端口、防火墙、卸载和故障处理都不同，分开更安全清晰。
 - 问题：用户询问 Redis 代码接下来应如何调整以落实基础服务与哨兵拆分。
 - 结论：下一步应让后端行为也真拆分：Redis 基础安装只负责数据服务，Redis Sentinel 安装只校验/复用已有数据服务并安装/配置 Sentinel；master/replica 节点不再重复编译安装 Redis 基础服务，sentinel-only 节点只安装运行 Sentinel 所需 binaries。
+- 问题：用户要求开始执行 Redis 基础服务与 Sentinel 安装拆分改造。
+- 结论：Redis Sentinel 后端安装已改为 sentinel-only 行为：master/replica 节点先校验已有 Redis 基础服务，不再重复编译安装；纯 Sentinel 节点只安装运行文件；任务计划和步骤名同步拆分为校验基础服务、安装 Sentinel 运行文件、配置 Sentinel。验证通过：go test ./internal/apps/redis ./internal/apps/redissentinel、pnpm test、git diff --check。

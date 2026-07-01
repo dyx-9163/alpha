@@ -31,6 +31,7 @@ type InstallRequest struct {
 	DefaultPassword string
 	Parameters      map[string]any
 	Concurrency     int
+	SentinelOnly    bool
 }
 
 type DeleteRequest struct {
@@ -217,7 +218,9 @@ func (s Service) installSentinel(ctx context.Context, req InstallRequest, resour
 		if recorder != nil {
 			recorder.StartTarget(target)
 		}
-		steps := redisSentinelStepsForTarget(copy, roles.IsSentinel(target))
+		role := roles.RoleFor(target)
+		runsSentinel := roles.IsSentinel(target)
+		steps := redisSentinelStepsForTarget(copy, runsSentinel, req.SentinelOnly, role)
 		step := newStepRunnerWithSteps(logForServer, recorder, target, copy, steps)
 		server := servers[target]
 		if err := step(1, "load-server", copy.LoadServer, func() error {
@@ -237,20 +240,37 @@ func (s Service) installSentinel(ctx context.Context, req InstallRequest, resour
 			return errors.New(msg)
 		}
 		installRoot := remoteInstallRoot(server, "redis", bundle.Version)
-		role := roles.RoleFor(target)
-		if err := step(3, "install-redis", copy.InstallStandalone, func() error {
+		installStepName := "install-redis"
+		installStepTitle := copy.InstallStandalone
+		installAction := func() error {
 			if role == "sentinel" {
 				return installer.InstallBinariesWithLanguage(ctx, server, bundle, port, password, logForServer, req.Language)
 			}
 			return installer.InstallWithLanguage(ctx, server, bundle, port, password, logForServer, req.Language)
-		}); err != nil {
+		}
+		if req.SentinelOnly {
+			if role == "sentinel" {
+				installStepName = "install-sentinel-binaries"
+				installStepTitle = copy.InstallSentinelBinaries
+				installAction = func() error {
+					return installer.InstallBinariesWithLanguage(ctx, server, bundle, port, password, logForServer, req.Language)
+				}
+			} else {
+				installStepName = "verify-redis-base"
+				installStepTitle = copy.VerifyBaseService
+				installAction = func() error {
+					return installer.VerifyBaseWithLanguage(ctx, server, bundle.Version, port, password, logForServer, req.Language)
+				}
+			}
+		}
+		if err := step(3, installStepName, installStepTitle, installAction); err != nil {
 			msg := fmt.Sprintf(copy.InstallFailed, err)
 			logForServer.Error("%s", msg)
 			finishTarget(recorder, target, "failed", msg)
 			return errors.New(msg)
 		}
 		recordStepIndex := 4
-		if roles.IsSentinel(target) {
+		if runsSentinel {
 			recordStepIndex = 5
 			if err := step(4, "configure-sentinel", copy.ConfigureSentinel, func() error {
 				return installer.ConfigureSentinelNode(ctx, server, SentinelNodeConfig{
@@ -285,11 +305,11 @@ func (s Service) installSentinel(ctx context.Context, req InstallRequest, resour
 				"role":           role,
 				"masterHost":     masterServer.Host,
 				"serviceName":    "aifar-redis",
-				"sentinel":       roles.IsSentinel(target),
+				"sentinel":       runsSentinel,
 				"topology":       "sentinel",
 				"auth":           "password",
 			}
-			if roles.IsSentinel(target) {
+			if runsSentinel {
 				metadataMap["sentinelName"] = "aifar-redis-sentinel"
 			}
 			metadata, _ := json.Marshal(metadataMap)
@@ -757,7 +777,7 @@ func redisInstallSteps(copy Copy) []stepDef {
 func redisInstallStepsFor(topology string, copy Copy) []stepDef {
 	switch normalizeTopology(topology) {
 	case "sentinel":
-		return redisSentinelStepsForTarget(copy, true)
+		return redisSentinelStepsForTarget(copy, true, false, "master")
 	case "cluster":
 		return []stepDef{
 			{Name: "load-server", Title: copy.LoadServer},
@@ -777,11 +797,19 @@ func redisInstallStepsFor(topology string, copy Copy) []stepDef {
 	}
 }
 
-func redisSentinelStepsForTarget(copy Copy, runsSentinel bool) []stepDef {
+func redisSentinelStepsForTarget(copy Copy, runsSentinel bool, sentinelOnly bool, role string) []stepDef {
+	installStep := stepDef{Name: "install-redis", Title: copy.InstallStandalone}
+	if sentinelOnly {
+		if role == "sentinel" {
+			installStep = stepDef{Name: "install-sentinel-binaries", Title: copy.InstallSentinelBinaries}
+		} else {
+			installStep = stepDef{Name: "verify-redis-base", Title: copy.VerifyBaseService}
+		}
+	}
 	steps := []stepDef{
 		{Name: "load-server", Title: copy.LoadServer},
 		{Name: "verify-resource", Title: copy.VerifyResource},
-		{Name: "install-redis", Title: copy.InstallStandalone},
+		installStep,
 	}
 	if runsSentinel {
 		steps = append(steps, stepDef{Name: "configure-sentinel", Title: copy.ConfigureSentinel})

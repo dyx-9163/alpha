@@ -78,6 +78,38 @@ func (i Installer) InstallBinariesWithLanguage(ctx context.Context, server store
 	return i.installWithMode(ctx, server, bundle, port, password, false, log, lang)
 }
 
+func (i Installer) VerifyBaseWithLanguage(ctx context.Context, server store.Server, version string, port int, password string, log Logger, lang string) error {
+	password = strings.TrimSpace(password)
+	if password == "" {
+		return errors.New("redis password is required")
+	}
+	if strings.IndexFunc(password, func(r rune) bool { return r <= ' ' }) >= 0 {
+		return errors.New("redis password must not contain whitespace")
+	}
+	if port <= 0 {
+		port = 6379
+	}
+	if port > 65535 {
+		return fmt.Errorf("invalid redis port: %d", port)
+	}
+	installRoot := installerkit.InstallRoot(server.DeployDir, "redis")
+	script, err := verifyRedisBaseScript(RedisBaseVerifyConfig{
+		Version:     version,
+		InstallRoot: installRoot,
+		Port:        port,
+		Password:    password,
+	})
+	if err != nil {
+		return err
+	}
+	log.Info("verify Redis base service for Sentinel")
+	if err := i.runInlineScript(ctx, server, "AIFAR_REDIS_BASE_VERIFY", script, log); err != nil {
+		return err
+	}
+	log.Info("Redis base service verified on port %d", port)
+	return nil
+}
+
 func (i Installer) installWithMode(ctx context.Context, server store.Server, bundle Bundle, port int, password string, startService bool, log Logger, lang string) error {
 	if err := VerifyBundle(bundle); err != nil {
 		return err

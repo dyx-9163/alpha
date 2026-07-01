@@ -121,6 +121,26 @@ func TestInstallerCanInstallRedisBinariesForSentinelOnlyNode(t *testing.T) {
 	}
 }
 
+func TestInstallerVerifiesExistingRedisBaseServiceForSentinel(t *testing.T) {
+	remote := &installerFakeRemote{}
+	installer := NewInstaller(remote)
+	err := installer.VerifyBaseWithLanguage(context.Background(), store.Server{Name: "redis-1", DeployDir: "/aifar/apps"}, "7.2.14", 6379, "Oversea.123", installerTestLogger{}, "en")
+	if err != nil {
+		t.Fatal(err)
+	}
+	joinedCommands := strings.Join(remote.commands, "\n")
+	for _, want := range []string{
+		"AIFAR_REDIS_BASE_VERIFY",
+		`systemctl is-active --quiet "$SERVICE_NAME"`,
+		`"$INSTALL_ROOT/bin/redis-cli" -p "$PORT" -a "$REDIS_PASSWORD" --no-auth-warning ping`,
+		"install Redis base service first",
+	} {
+		if !strings.Contains(joinedCommands, want) {
+			t.Fatalf("verify base script missing %q:\n%s", want, joinedCommands)
+		}
+	}
+}
+
 func TestRedisStandaloneScriptsRenderTemplates(t *testing.T) {
 	install, err := installStandaloneScript("7.2.14", "/aifar/apps/_work/redis", "/tmp/redis.tar.gz", "/aifar/apps/redis", 6380, "Oversea.123")
 	if err != nil {

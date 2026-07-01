@@ -14,6 +14,8 @@ type Copy struct {
 	LoadServer                string
 	VerifyResource            string
 	InstallStandalone         string
+	VerifyBaseService         string
+	InstallSentinelBinaries   string
 	ConfigureSentinel         string
 	EnableClusterNode         string
 	BootstrapCluster          string
@@ -68,6 +70,8 @@ func CopyFor(lang string) Copy {
 			LoadServer:                "load target server",
 			VerifyResource:            "verify Redis offline archive",
 			InstallStandalone:         "compile and install Redis base service",
+			VerifyBaseService:         "verify Redis base service",
+			InstallSentinelBinaries:   "install Redis Sentinel runtime files",
 			ConfigureSentinel:         "configure Redis Sentinel topology",
 			EnableClusterNode:         "enable Redis Cluster node",
 			BootstrapCluster:          "bootstrap Redis Cluster",
@@ -109,6 +113,8 @@ func CopyFor(lang string) Copy {
 			LoadServer:                "读取目标服务器",
 			VerifyResource:            "校验 Redis 离线包",
 			InstallStandalone:         "编译并安装 Redis 基础服务",
+			VerifyBaseService:         "校验 Redis 基础服务",
+			InstallSentinelBinaries:   "安装 Redis Sentinel 运行文件",
 			ConfigureSentinel:         "配置 Redis Sentinel 拓扑",
 			EnableClusterNode:         "启用 Redis Cluster 节点",
 			BootstrapCluster:          "初始化 Redis Cluster",
