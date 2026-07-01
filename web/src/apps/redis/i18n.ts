@@ -26,6 +26,7 @@ export const redisMessages = {
     sentinel: 'Sentinel',
     cluster: 'Cluster',
     port: 'Redis 端口',
+    sentinelEligible: '本次安装用于 Redis 哨兵',
     sentinelPort: 'Sentinel 端口',
     sentinelMasterName: '监控组名称',
     sentinelMasterNamePlaceholder: '例如 aifar-master，必须在 Sentinel 内唯一',
@@ -64,6 +65,7 @@ export const redisMessages = {
     sentinel: 'Sentinel',
     cluster: 'Cluster',
     port: 'Redis port',
+    sentinelEligible: 'Use this install for Redis Sentinel',
     sentinelPort: 'Sentinel port',
     sentinelMasterName: 'Monitor name',
     sentinelMasterNamePlaceholder: 'For example aifar-master; must be unique inside Sentinel',
@@ -130,6 +132,13 @@ export function redisInstallDialogProps(locale?: string): AppInstallDialogConfig
         type: 'number',
         defaultValue: 6379,
         required: true
+      },
+      {
+        name: 'sentinelEligible',
+        label: copy.sentinelEligible,
+        type: 'switch',
+        defaultValue: false,
+        visibleWhen: (values) => values.topology === 'standalone'
       },
       {
         name: 'sentinelMasterId',

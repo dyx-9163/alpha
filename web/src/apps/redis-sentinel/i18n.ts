@@ -16,7 +16,7 @@ export const redisSentinelMessages = {
     sourceLabel: '官方源码包',
     description: '在 Redis 基础服务之上安装并配置 Redis Sentinel 高可用监控。',
     installTitle: '安装 Redis 哨兵',
-    hint: '请先安装 Redis 基础服务，再选择 1 个 Master、至少 1 个 Replica，以及至少 3 个 Sentinel 节点。Sentinel 可以与 Master/Replica 同机，也可以部署在独立服务器上。',
+    hint: '请先安装 Redis 基础服务并勾选“本次安装用于 Redis 哨兵”，再选择 1 个 Master、至少 1 个 Replica，以及至少 3 个 Sentinel 节点。Sentinel 可以与 Master/Replica 同机，也可以部署在独立服务器上。',
     version: '版本',
     versionPlaceholder: '选择版本',
     servers: 'Sentinel 目标服务器',
@@ -25,7 +25,7 @@ export const redisSentinelMessages = {
     selectedCount: (count: number) => `已选择 ${count} 台服务器`,
     cancel: '取消',
     submit: '开始安装',
-    noRedisBase: '请先安装至少 2 个 Redis 基础服务，再安装 Redis 哨兵。',
+    noRedisBase: '请先安装至少 2 个已标记用于 Redis 哨兵的 Redis 基础服务。',
     port: 'Redis 端口',
     sentinelPort: 'Sentinel 端口',
     sentinelMasterName: '监控组名称',
@@ -50,7 +50,7 @@ export const redisSentinelMessages = {
     sourceLabel: 'Official source archive',
     description: 'Install and configure Redis Sentinel high availability for Redis base services.',
     installTitle: 'Install Redis Sentinel',
-    hint: 'Install Redis base services first, then select exactly one master, at least one replica, and at least three Sentinel nodes. Sentinel can be colocated with Redis nodes or installed on dedicated servers.',
+    hint: 'Install Redis base services first and enable "Use this install for Redis Sentinel", then select exactly one master, at least one replica, and at least three Sentinel nodes. Sentinel can be colocated with Redis nodes or installed on dedicated servers.',
     version: 'Version',
     versionPlaceholder: 'Select version',
     servers: 'Sentinel target servers',
@@ -59,7 +59,7 @@ export const redisSentinelMessages = {
     selectedCount: (count: number) => `${count} server(s) selected`,
     cancel: 'Cancel',
     submit: 'Start install',
-    noRedisBase: 'Install at least 2 Redis base services before installing Redis Sentinel.',
+    noRedisBase: 'Install at least 2 Redis base services marked for Redis Sentinel first.',
     port: 'Redis port',
     sentinelPort: 'Sentinel port',
     sentinelMasterName: 'Monitor name',
@@ -197,7 +197,10 @@ function redisDataNodeOptions(context?: AppInstallDialogContext): AppInstallFiel
     }
     const metadata = parseMetadata(instance.metadata)
     const topology = text(instance.topology || metadata.topology).toLowerCase()
-    if (topology === 'cluster') {
+    if (topology !== 'standalone') {
+      continue
+    }
+    if (!truthy(metadata.sentinelEligible ?? metadata.useForSentinel)) {
       continue
     }
     const role = text(metadata.role).toLowerCase()
@@ -258,6 +261,17 @@ function parseMetadata(value?: string) {
 
 function text(value: unknown) {
   return value === undefined || value === null ? '' : String(value).trim()
+}
+
+function truthy(value: unknown) {
+  if (typeof value === 'boolean') {
+    return value
+  }
+  if (typeof value === 'number') {
+    return value === 1
+  }
+  const normalized = text(value).toLowerCase()
+  return normalized === 'true' || normalized === '1' || normalized === 'yes' || normalized === 'on'
 }
 
 function stringField(value: unknown) {

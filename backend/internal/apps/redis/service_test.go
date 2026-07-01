@@ -156,7 +156,7 @@ func TestServiceInstallsStandaloneRedisAndRecordsInstalledInstance(t *testing.T)
 		ServerID:   "srv-1",
 		Topology:   "standalone",
 		Language:   "en",
-		Parameters: map[string]any{"port": 6380, "password": "Oversea.123"},
+		Parameters: map[string]any{"port": 6380, "password": "Oversea.123", "sentinelEligible": true},
 	}, []store.Resource{{App: "redis", Part: "backend", Version: "7.2.14", Path: archive}}, fakeLogger{}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -166,6 +166,10 @@ func TestServiceInstallsStandaloneRedisAndRecordsInstalledInstance(t *testing.T)
 	}
 	if s.instances[0].Status != "installed" || s.instances[0].Topology != "standalone" {
 		t.Fatalf("expected installed standalone instance: %+v", s.instances[0])
+	}
+	metadata := metadataForTest(t, s.instances[0])
+	if got := metadata["sentinelEligible"]; got != true {
+		t.Fatalf("expected standalone instance to be marked sentinel eligible, got %v", got)
 	}
 	joinedCommands := remote.joinedCommands()
 	if !strings.Contains(joinedCommands, "install-redis.sh") {
@@ -554,6 +558,21 @@ func TestRedisPasswordFallsBackToDefaultPassword(t *testing.T) {
 	}
 	if got := redisPassword(map[string]any{"password": "custom"}, "Oversea.123"); got != "custom" {
 		t.Fatalf("expected explicit redis password, got %q", got)
+	}
+}
+
+func TestRedisSentinelEligibleParam(t *testing.T) {
+	if redisSentinelEligible(nil) {
+		t.Fatal("expected missing sentinel eligibility flag to be false")
+	}
+	if !redisSentinelEligible(map[string]any{"sentinelEligible": true}) {
+		t.Fatal("expected boolean sentinel eligibility flag to be true")
+	}
+	if !redisSentinelEligible(map[string]any{"useForSentinel": "yes"}) {
+		t.Fatal("expected legacy sentinel eligibility flag to be accepted")
+	}
+	if redisSentinelEligible(map[string]any{"sentinelEligible": "false"}) {
+		t.Fatal("expected false sentinel eligibility string to be false")
 	}
 }
 

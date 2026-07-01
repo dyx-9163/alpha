@@ -30,6 +30,34 @@ func redisPassword(params map[string]any, fallback string) string {
 	return password
 }
 
+func redisSentinelEligible(params map[string]any) bool {
+	if params == nil {
+		return false
+	}
+	value, ok := params["sentinelEligible"]
+	if !ok {
+		value, ok = params["useForSentinel"]
+	}
+	if !ok {
+		return false
+	}
+	switch v := value.(type) {
+	case bool:
+		return v
+	case string:
+		text := strings.ToLower(strings.TrimSpace(v))
+		return text == "true" || text == "1" || text == "yes" || text == "on"
+	case int:
+		return v == 1
+	case int64:
+		return v == 1
+	case float64:
+		return v == 1
+	default:
+		return false
+	}
+}
+
 func targetServerIDs(req InstallRequest) []string {
 	seen := map[string]bool{}
 	var out []string

@@ -321,3 +321,5 @@
 - 结论：Redis Sentinel 后端安装已改为 sentinel-only 行为：master/replica 节点先校验已有 Redis 基础服务，不再重复编译安装；纯 Sentinel 节点只安装运行文件；任务计划和步骤名同步拆分为校验基础服务、安装 Sentinel 运行文件、配置 Sentinel。验证通过：go test ./internal/apps/redis ./internal/apps/redissentinel、pnpm test、git diff --check。
 - 问题：用户询问安装 Redis 基础服务时应选择单体还是集群。
 - 结论：如果目标是 Redis Sentinel 主从高可用，应选择单体，并在需要作为 Redis 数据节点的服务器上分别安装基础服务，再通过 Redis 哨兵入口配置 Sentinel；Redis Cluster 是分片集群，不用于 Sentinel 主从高可用。
+- 问题：用户要求 Redis 单体安装增加“本次安装要使用哨兵”选项，并让后续安装 Redis 哨兵时可以选择这些基础服务。
+- 结论：Redis 单体安装新增“本次安装用于 Redis 哨兵”开关并写入实例 metadata；Redis 哨兵安装只展示已标记用于哨兵的 standalone Redis 基础服务作为 Master/Replica 候选。验证通过：go test ./internal/apps/redis ./internal/apps/redissentinel、pnpm web:build、pnpm test、git diff --check。

@@ -144,12 +144,13 @@ func (s Service) Install(ctx context.Context, req InstallRequest, resources []st
 	var instance store.AppInstance
 	if err := step(4, "record-instance", copy.RecordInstance, func() error {
 		metadata, _ := json.Marshal(map[string]any{
-			"resourcePath": bundle.ArchivePath,
-			"rpmCount":     len(bundle.RPMPaths),
-			"port":         port,
-			"serviceName":  "aifar-redis",
-			"topology":     "standalone",
-			"auth":         "password",
+			"resourcePath":     bundle.ArchivePath,
+			"rpmCount":         len(bundle.RPMPaths),
+			"port":             port,
+			"serviceName":      "aifar-redis",
+			"topology":         "standalone",
+			"auth":             "password",
+			"sentinelEligible": redisSentinelEligible(req.Parameters),
 		})
 		var saveErr error
 		instance, saveErr = s.store.SaveAppInstance(store.AppInstance{
