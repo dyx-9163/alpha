@@ -307,3 +307,5 @@
 - 结论：终端页改为标准页头、独立连接工具栏和终端工作区三段布局，去掉重复连接区；终端容器使用稳定响应式高度，并修正 xterm 尺寸测量避免内容被压窄换行。验证通过：pnpm web:build、git diff --check。
 - 问题：用户反馈 MySQL 三个单体服务已重启运行，但 InnoDB Cluster 未自动恢复，页面应探测到“单体已启动、集群未启用”并允许点击“启动集群”。
 - 结论：MySQL 检测新增 systemd/端口级运行时探测，集群检查失败时仍记录单体运行状态；数据库页节点在线展示改用 MySQL 运行时健康，集群状态仍按 Primary/集群健康判定，因此单体全在线但集群不可用时可启用“启动集群”。验证通过：go test ./internal/apps/mysql、pnpm test、pnpm web:build、git diff --check。
+- 问题：用户询问 Redis Sentinel 只有 192.168.74.133:26379 从 Navicat 连接超时，131/132 正常的原因。
+- 结论：截图显示 133 的 Sentinel 配置和监听都存在，Navicat 报 timed out 更像 133 主机防火墙/安全策略拦截 26379，而不是密码、组名或 bind 配置错误；建议从客户端和 131/132 对 133:26379 做 TCP 连通性测试，并检查/放行 133 的 firewalld/iptables/nftables 26379/tcp。
