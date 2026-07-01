@@ -405,3 +405,5 @@
 - 结论：AIFAR 安装脚本改为保留并加载随包 `docker-images/*.tar`，构建前校验 `bellsoft/liberica-openjre-rocky:21` 和 `nginx:stable-alpine` 已在本地，避免离线部署时访问 Docker Hub；资源校验也要求基础镜像 tar 存在。验证通过：`go test ./internal/apps/aifar`、`pnpm test`、`git diff --check`。
 - 问题：用户截图中 AIFAR 前端白屏，控制台报 `Cannot destructure property 'VITE_GLOB_APP_TITLE' ... as it is undefined`。
 - 结论：该错误表示运行时配置对象没有挂到 `window.__PRODUCTION__AIFAR__CONF__`，常见原因是 `/_app.config.js` 未加载、仍是旧的 `__PRODUCTION__ALPHA__CONF__`，或浏览器/代理缓存了旧配置；需检查浏览器 Network 中 `/_app.config.js` 的响应内容。
+- 问题：用户询问如何重新构建并启动已部署的 AIFAR `web-vue3` 前端容器。
+- 结论：在目标服务器进入 `/aifar/apps/admin/docker-apps/web-vue3`，使用 `docker compose --env-file ../.env --env-file .env -f docker-compose.yaml up -d --build --force-recreate`；如基础镜像未加载，先执行 `docker load -i ../../docker-images/nginx-stable-alpine.tar`。
