@@ -48,23 +48,82 @@
       </div>
 
       <template v-if="tab === 'instances'">
-        <el-table v-if="filteredInstances.length" :data="filteredInstances" height="100%">
-          <el-table-column prop="app" :label="t('storage.service')" width="120" />
-          <el-table-column prop="version" :label="t('common.version')" min-width="180" />
-          <el-table-column :label="t('storage.server')" min-width="220"><template #default="{ row }">{{ serverName(row.serverId) }}</template></el-table-column>
-          <el-table-column :label="t('common.endpoint')" min-width="220" show-overflow-tooltip><template #default="{ row }">{{ metadataOf(row).endpoint || '-' }}</template></el-table-column>
-          <el-table-column prop="topology" :label="t('dashboard.topology')" width="140" />
-          <el-table-column prop="status" :label="t('common.status')" width="120"><template #default="{ row }"><StatusTag :status="displayInstanceStatus(row)" /></template></el-table-column>
-          <el-table-column :label="t('common.operation')" width="120" fixed="right">
-            <template #default="{ row }">
-              <el-tooltip :content="deniedText" :disabled="canManageApps" placement="top">
-                <span>
-                  <el-button size="small" type="danger" plain :disabled="!canManageApps" @click="openDeleteInstance(row)">{{ t('common.uninstall') }}</el-button>
-                </span>
-              </el-tooltip>
-            </template>
-          </el-table-column>
-        </el-table>
+        <div v-if="storageGroups.length" class="storage-card-grid">
+          <article v-for="group in storageGroups" :key="group.id" class="storage-card">
+            <div class="storage-head">
+              <div class="app-icon small">S3</div>
+              <div class="storage-title-block">
+                <strong>{{ group.title }}</strong>
+                <span>{{ group.topology }} / {{ t('storage.minioNodes') }} {{ group.nodes.length }}</span>
+              </div>
+              <div class="storage-head-actions">
+                <StatusTag :status="group.status" />
+              </div>
+            </div>
+
+            <div class="storage-info-grid">
+              <div>
+                <span>{{ t('storage.service') }}</span>
+                <strong>minio</strong>
+              </div>
+              <div>
+                <span>{{ t('common.version') }}</span>
+                <strong>{{ group.version || '-' }}</strong>
+              </div>
+              <div>
+                <span>{{ t('dashboard.topology') }}</span>
+                <strong>{{ group.topology || '-' }}</strong>
+              </div>
+              <div>
+                <span>{{ t('storage.minioNodes') }}</span>
+                <strong>{{ group.nodes.length }}</strong>
+              </div>
+              <div class="storage-info-wide">
+                <span>{{ t('storage.replicationBuckets') }}</span>
+                <strong>{{ displayBuckets(group) }}</strong>
+              </div>
+              <div v-if="isBucketReplication(group)" class="storage-info-wide">
+                <span>{{ t('storage.replicationProfile') }}</span>
+                <strong>{{ replicationProfileText(group) }}</strong>
+              </div>
+            </div>
+
+            <div v-if="isBucketReplication(group)" class="bucket-sync-list">
+              <div class="section-label">{{ t('storage.bucketSync') }}</div>
+              <div v-for="pair in replicationPairs(group)" :key="pair.key" class="sync-row">
+                <div class="sync-bucket">{{ pair.bucket }}</div>
+                <div class="sync-endpoint">
+                  <span>{{ pair.source?.roleLabel || '-' }}</span>
+                  <strong>{{ syncEndpointLabel(pair.source, pair.bucket) }}</strong>
+                </div>
+                <div class="sync-arrow">{{ t('storage.twoWaySync') }}</div>
+                <div class="sync-endpoint">
+                  <span>{{ pair.target?.roleLabel || '-' }}</span>
+                  <strong>{{ syncEndpointLabel(pair.target, pair.bucket) }}</strong>
+                </div>
+              </div>
+            </div>
+
+            <div class="storage-node-list">
+              <div class="section-label">{{ t('storage.minioNodes') }}</div>
+              <div v-for="node in group.nodes" :key="node.instance.id" class="storage-node-row">
+                <div class="storage-node-main">
+                  <strong>{{ node.serverLabel }}</strong>
+                  <span>{{ node.endpoint }}</span>
+                </div>
+                <div class="storage-node-tags">
+                  <el-tag size="small" type="info">{{ node.roleLabel }}</el-tag>
+                  <StatusTag :status="node.status" />
+                  <el-tooltip :content="deniedText" :disabled="canManageApps" placement="top">
+                    <span>
+                      <el-button size="small" type="danger" plain :disabled="!canManageApps" @click="openDeleteInstance(node.instance)">{{ t('common.uninstall') }}</el-button>
+                    </span>
+                  </el-tooltip>
+                </div>
+              </div>
+            </div>
+          </article>
+        </div>
         <div v-else class="empty-state storage-empty">
           <div>
             <strong>{{ t('storage.emptyTitle') }}</strong>
@@ -234,6 +293,38 @@ type AppInstance = {
   metadata: string
 }
 
+type InstanceMetadata = Record<string, any>
+
+type StorageNode = {
+  instance: AppInstance
+  metadata: InstanceMetadata
+  serverLabel: string
+  endpoint: string
+  status: string
+  roleLabel: string
+}
+
+type StorageGroup = {
+  id: string
+  title: string
+  version: string
+  topology: string
+  status: string
+  nodes: StorageNode[]
+  buckets: string[]
+  priority: string
+  maxWorkers: string
+  maxLargeWorkers: string
+  replicateDeletes: boolean
+}
+
+type ReplicationPair = {
+  key: string
+  bucket: string
+  source?: StorageNode
+  target?: StorageNode
+}
+
 type StorageKind = 'bucket' | 'object' | 'user' | 'accessKey' | 'replica'
 
 const { t } = useI18n()
@@ -265,10 +356,11 @@ const collection = reactive<Record<string, any[]>>({
 const canManageStorage = computed(() => can(permissions.storageManage))
 const canManageApps = computed(() => can(permissions.appsManage))
 
-const filteredInstances = computed(() => {
+const storageGroups = computed(() => {
   const q = search.value.trim().toLowerCase()
-  if (!q) return instances.value
-  return instances.value.filter((item) => `${item.app} ${item.version} ${item.topology} ${serverName(item.serverId)}`.toLowerCase().includes(q))
+  const groups = buildStorageGroups(instances.value.filter((item) => item.app === 'minio'))
+  if (!q) return groups
+  return groups.filter((group) => storageGroupSearchText(group).includes(q))
 })
 const runTasks = computed(() => tasks.value.filter((item) => item.type?.startsWith('apps.minio.') || item.type?.startsWith('storage.')))
 const settingsItems = computed(() => [
@@ -452,10 +544,183 @@ function collectionKey(kind: StorageKind) {
 
 function metadataOf(item: AppInstance) {
   try {
-    return JSON.parse(item.metadata || '{}') as Record<string, any>
+    return JSON.parse(item.metadata || '{}') as InstanceMetadata
   } catch {
     return {}
   }
+}
+
+function buildStorageGroups(rows: AppInstance[]): StorageGroup[] {
+  const groups = new Map<string, { items: AppInstance[]; metas: Map<string, InstanceMetadata> }>()
+  for (const item of rows) {
+    const metadata = metadataOf(item)
+    const replicationGroupId = stringValue(metadata.replicationGroupId)
+    const key = replicationGroupId ? `replication:${replicationGroupId}` : `instance:${item.id}`
+    const group = groups.get(key) ?? { items: [], metas: new Map<string, InstanceMetadata>() }
+    group.items.push(item)
+    group.metas.set(item.id, metadata)
+    groups.set(key, group)
+  }
+  return Array.from(groups.entries()).map(([id, group]) => createStorageGroup(id, group.items, group.metas))
+}
+
+function createStorageGroup(id: string, items: AppInstance[], metas: Map<string, InstanceMetadata>): StorageGroup {
+  const sortedItems = [...items].sort((a, b) => serverName(a.serverId).localeCompare(serverName(b.serverId)))
+  const first = sortedItems[0]
+  const firstMetadata = first ? metas.get(first.id) ?? metadataOf(first) : {}
+  const topology = stringValue(firstMetadata.topology) || first?.topology || '-'
+  const buckets = uniqueValues(sortedItems.flatMap((item) => bucketsFromMetadata(metas.get(item.id) ?? metadataOf(item))))
+  const nodes = sortedItems.map((item, index) => createStorageNode(item, metas.get(item.id) ?? metadataOf(item), topology, index))
+  const versions = uniqueValues(sortedItems.map((item) => item.version).filter(Boolean))
+  return {
+    id,
+    title: storageGroupTitle(id, topology, first),
+    version: versions.join(', '),
+    topology,
+    status: storageGroupStatus(nodes),
+    nodes,
+    buckets,
+    priority: stringValue(firstMetadata.replicationPriority),
+    maxWorkers: stringValue(firstMetadata.replicationMaxWorkers),
+    maxLargeWorkers: stringValue(firstMetadata.replicationMaxLargeWorkers),
+    replicateDeletes: truthyValue(firstMetadata.replicateDeletes)
+  }
+}
+
+function createStorageNode(item: AppInstance, metadata: InstanceMetadata, topology: string, index: number): StorageNode {
+  return {
+    instance: item,
+    metadata,
+    serverLabel: serverName(item.serverId),
+    endpoint: stringValue(metadata.endpoint) || endpointFromServer(item, metadata),
+    status: displayInstanceStatus(item),
+    roleLabel: storageNodeRole(topology, index)
+  }
+}
+
+function storageGroupTitle(id: string, topology: string, first?: AppInstance) {
+  if (isBucketReplicationTopology(topology)) {
+    const suffix = id.startsWith('replication:') ? id.replace('replication:', '').slice(-6) : first?.id.slice(-6)
+    return suffix ? `minio-bucket-replication-${suffix}` : 'minio-bucket-replication'
+  }
+  if (topology === 'distributed') {
+    return 'minio-distributed'
+  }
+  return first ? `minio-${serverName(first.serverId)}` : 'minio'
+}
+
+function storageNodeRole(topology: string, index: number) {
+  if (isBucketReplicationTopology(topology)) {
+    if (index === 0) return t('storage.siteA')
+    if (index === 1) return t('storage.siteB')
+    return `${t('storage.site')} ${index + 1}`
+  }
+  return `${t('storage.minioNode')} ${index + 1}`
+}
+
+function endpointFromServer(item: AppInstance, metadata: InstanceMetadata) {
+  const server = servers.value.find((candidate) => candidate.id === item.serverId)
+  const port = stringValue(metadata.apiPort) || '9000'
+  return server?.host ? `http://${server.host}:${port}` : '-'
+}
+
+function bucketsFromMetadata(metadata: InstanceMetadata) {
+  return [
+    ...stringList(metadata.replicationBuckets),
+    ...stringList(metadata.buckets),
+    stringValue(metadata.bucket)
+  ].filter(Boolean)
+}
+
+function storageGroupStatus(nodes: StorageNode[]) {
+  const statuses = nodes.map((node) => node.status)
+  if (!statuses.length) return 'unknown'
+  if (statuses.some((status) => ['checking', 'probing', 'pending'].includes(status))) return 'checking'
+  if (statuses.every(isHealthyStatus)) return 'available'
+  if (statuses.some(isHealthyStatus)) return 'degraded'
+  if (statuses.some((status) => ['unavailable', 'failed', 'error', 'missing', 'stopped'].includes(status))) return 'unavailable'
+  return statuses[0] || 'unknown'
+}
+
+function isHealthyStatus(status: string) {
+  return ['ok', 'success', 'installed', 'running', 'available'].includes(status)
+}
+
+function isBucketReplication(group: StorageGroup) {
+  return isBucketReplicationTopology(group.topology)
+}
+
+function isBucketReplicationTopology(topology: string) {
+  return topology === 'bucket-replication'
+}
+
+function replicationPairs(group: StorageGroup): ReplicationPair[] {
+  const buckets = group.buckets.length ? group.buckets : ['-']
+  return buckets.map((bucket) => ({
+    key: `${group.id}:${bucket}`,
+    bucket,
+    source: group.nodes[0],
+    target: group.nodes[1]
+  }))
+}
+
+function displayBuckets(group: StorageGroup) {
+  return group.buckets.length ? group.buckets.join(', ') : '-'
+}
+
+function replicationProfileText(group: StorageGroup) {
+  const priority = group.priority || '-'
+  const workers = group.maxWorkers || '-'
+  const largeWorkers = group.maxLargeWorkers || '-'
+  const deleteMode = group.replicateDeletes ? t('storage.deleteSyncOn') : t('storage.deleteSyncOff')
+  return `${t('storage.replicationPriority')} ${priority} | ${t('storage.replicationWorkers')} ${workers}/${largeWorkers} | ${deleteMode}`
+}
+
+function syncEndpointLabel(node: StorageNode | undefined, bucket: string) {
+  if (!node) return '-'
+  return bucket && bucket !== '-' ? `${node.endpoint}/${bucket}` : node.endpoint
+}
+
+function storageGroupSearchText(group: StorageGroup) {
+  return [
+    group.title,
+    group.version,
+    group.topology,
+    ...group.buckets,
+    ...group.nodes.flatMap((node) => [node.serverLabel, node.endpoint, node.roleLabel, node.status])
+  ].join(' ').toLowerCase()
+}
+
+function uniqueValues(values: string[]) {
+  return Array.from(new Set(values.map((value) => value.trim()).filter(Boolean)))
+}
+
+function stringValue(value: unknown) {
+  return value === null || value === undefined ? '' : String(value).trim()
+}
+
+function stringList(value: unknown) {
+  if (Array.isArray(value)) {
+    return value.map(stringValue).filter(Boolean)
+  }
+  const raw = stringValue(value)
+  if (!raw) return []
+  if (raw.startsWith('[')) {
+    try {
+      const parsed = JSON.parse(raw)
+      if (Array.isArray(parsed)) {
+        return parsed.map(stringValue).filter(Boolean)
+      }
+    } catch {
+      return []
+    }
+  }
+  return raw.split(',').map((item) => item.trim()).filter(Boolean)
+}
+
+function truthyValue(value: unknown) {
+  if (typeof value === 'boolean') return value
+  return ['true', '1', 'yes', 'on'].includes(stringValue(value).toLowerCase())
 }
 
 function displayInstanceStatus(item: AppInstance) {
@@ -558,6 +823,230 @@ onMounted(load)
   min-height: clamp(180px, 28vh, 260px);
 }
 
+.storage-card-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 420px), 1fr));
+  gap: 12px;
+  padding: 12px;
+  min-height: 0;
+  overflow: auto;
+}
+
+.storage-card {
+  border: 1px solid var(--aifar-border);
+  border-radius: var(--aifar-radius-lg);
+  background: #fff;
+  padding: 12px;
+  box-shadow: 0 1px 2px rgba(15, 35, 68, .03);
+  transition: border-color .16s ease, box-shadow .16s ease, transform .16s ease;
+}
+
+.storage-card:hover {
+  border-color: #91caff;
+  box-shadow: var(--aifar-shadow-raised);
+  transform: translateY(-1px);
+}
+
+.storage-head {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  margin-bottom: 10px;
+}
+
+.storage-title-block {
+  min-width: 0;
+  flex: 1;
+}
+
+.storage-head strong,
+.storage-head span {
+  display: block;
+}
+
+.storage-head strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.storage-head span {
+  color: var(--aifar-text-tertiary);
+  font-size: 12px;
+}
+
+.storage-head-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  flex-wrap: wrap;
+  max-width: 240px;
+}
+
+.app-icon.small {
+  width: 34px;
+  height: 34px;
+  border-radius: 6px;
+  display: grid;
+  place-items: center;
+  background: var(--aifar-primary-soft);
+  color: var(--aifar-primary);
+  border: 1px solid #bae0ff;
+  font-weight: 850;
+}
+
+.storage-info-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+.storage-info-grid div {
+  min-height: 54px;
+  border: 1px solid var(--aifar-border-soft);
+  border-radius: var(--aifar-radius);
+  background: #f7fbff;
+  padding: 8px;
+  min-width: 0;
+}
+
+.storage-info-grid .storage-info-wide {
+  grid-column: 1 / -1;
+}
+
+.storage-info-grid span {
+  display: block;
+  color: var(--aifar-text-tertiary);
+  font-size: 11px;
+}
+
+.storage-info-grid strong {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.storage-info-wide strong {
+  overflow: visible;
+  text-overflow: clip;
+  white-space: normal;
+  word-break: break-word;
+  line-height: 1.35;
+}
+
+.bucket-sync-list,
+.storage-node-list {
+  display: grid;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.storage-node-list {
+  padding-top: 10px;
+  border-top: 1px dashed var(--aifar-border-soft);
+}
+
+.section-label {
+  color: var(--aifar-text-secondary);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.sync-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto minmax(0, 1fr);
+  align-items: center;
+  gap: 8px;
+  border: 1px solid var(--aifar-border-soft);
+  border-radius: var(--aifar-radius);
+  padding: 8px;
+  background: #f8fbff;
+}
+
+.sync-bucket {
+  max-width: 120px;
+  padding: 3px 8px;
+  border: 1px solid #91caff;
+  border-radius: var(--aifar-radius);
+  background: #e6f4ff;
+  color: var(--aifar-primary);
+  font-size: 12px;
+  font-weight: 800;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sync-endpoint {
+  min-width: 0;
+}
+
+.sync-endpoint span,
+.sync-endpoint strong {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sync-endpoint span {
+  color: var(--aifar-text-tertiary);
+  font-size: 11px;
+}
+
+.sync-endpoint strong {
+  font-size: 12px;
+}
+
+.sync-arrow {
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: #f6ffed;
+  border: 1px solid #b7eb8f;
+  color: #389e0d;
+  font-size: 12px;
+  font-weight: 800;
+  white-space: nowrap;
+}
+
+.storage-node-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid var(--aifar-border-soft);
+  border-radius: var(--aifar-radius);
+  padding: 8px;
+  background: #fff;
+}
+
+.storage-node-main {
+  min-width: 0;
+}
+
+.storage-node-main strong,
+.storage-node-main span {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.storage-node-main span {
+  color: var(--aifar-text-tertiary);
+  font-size: 12px;
+}
+
+.storage-node-tags {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  white-space: nowrap;
+}
+
 .access-grid {
   display: grid;
   grid-template-columns: 1fr 1fr;
@@ -607,6 +1096,23 @@ onMounted(load)
 @media (max-width: 1100px) {
   .access-grid {
     grid-template-columns: 1fr;
+  }
+
+  .sync-row {
+    grid-template-columns: 1fr;
+  }
+
+  .sync-arrow {
+    width: fit-content;
+  }
+
+  .storage-node-row {
+    grid-template-columns: 1fr;
+  }
+
+  .storage-node-tags {
+    justify-content: flex-start;
+    flex-wrap: wrap;
   }
 }
 </style>

@@ -367,3 +367,5 @@
 - 结论：Redis Sentinel 检测已拆分数据服务和 Sentinel 服务状态，分别写入数据 `lastCheck` 与 `sentinelLastCheck`；前端 Sentinel 行使用独立 Sentinel 状态展示，数据节点停止不再覆盖同宿主 Sentinel 在线状态；`go test ./internal/apps/redis`、`pnpm web:build`、`pnpm test`、`git diff --check` 已通过。
 - 问题：用户要求对象存储页面去掉 MinIO 安装按钮，并且实例状态不能显示“已安装”，要实时探测 MinIO 是否可用。
 - 结论：对象存储实例页移除了 MinIO 安装入口；MinIO 后端新增实例健康检查，探测本机 `/minio/health/live` 并把状态写入 `lastCheck`，前端进入实例页和点击刷新状态时触发检测，展示“可用/不可用/探测中”。验证通过：go test ./internal/apps/minio、pnpm test、pnpm web:build、git diff --check。
+- 问题：用户要求对象存储实例页像数据库页一样卡片化展示 Bucket replication，一眼看出哪些 Bucket 在哪些 MinIO 节点之间同步。
+- 结论：对象存储实例页改为 MinIO 卡片分组展示；按 bucket replication group 合并实例，展示同步 Bucket、双向同步端点、复制档位和各 MinIO 节点实时状态/卸载入口。验证通过：pnpm web:build、git diff --check。
