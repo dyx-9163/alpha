@@ -568,7 +568,11 @@ function groupDatabaseInstances(items: AppInstance[]) {
         nodeStatus,
         routerStatus,
         sentinelStatus,
-        status: groupStatus(nodeStatus, routerStatus, normalizedGroup.routers.length > 0)
+        status: groupStatus(
+          nodeStatus,
+          normalizedGroup.routers.length > 0 ? routerStatus : sentinelStatus,
+          normalizedGroup.routers.length > 0 || normalizedGroup.sentinels.length > 0
+        )
       }
     })
     .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
@@ -626,13 +630,28 @@ function databaseNode(item: AppInstance, metadata: InstanceMetadata): DatabaseNo
 
 function redisSentinelNode(item: AppInstance, metadata: InstanceMetadata): DatabaseNode {
   const role = 'sentinel'
+  const sentinelMetadata = redisSentinelNodeMetadata(metadata)
   return {
-    instance: item,
-    metadata,
+    instance: {
+      ...item,
+      status: stringValue(sentinelMetadata.lastCheck?.status) || item.status
+    },
+    metadata: sentinelMetadata,
     serverLabel: serverName(item.serverId),
     endpoint: redisSentinelEndpoint(item, metadata),
     role,
     roleLabel: roleLabel(role)
+  }
+}
+
+function redisSentinelNodeMetadata(metadata: InstanceMetadata): InstanceMetadata {
+  const sentinelLastCheck = metadata.sentinelLastCheck
+  if (!sentinelLastCheck || typeof sentinelLastCheck !== 'object') {
+    return metadata
+  }
+  return {
+    ...metadata,
+    lastCheck: sentinelLastCheck
   }
 }
 

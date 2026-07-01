@@ -84,6 +84,7 @@ type fakeRemote struct {
 	mu             sync.Mutex
 	commands       []string
 	responses      map[string]adapter.CommandResult
+	failures       map[string]error
 	failAll        bool
 	blockInstall   bool
 	installStarted chan string
@@ -104,6 +105,14 @@ func (f *fakeRemote) Run(ctx context.Context, server store.Server, command strin
 	f.commands = append(f.commands, command)
 	if f.failAll {
 		return adapter.CommandResult{}, fmt.Errorf("remote offline")
+	}
+	for needle, err := range f.failures {
+		if strings.Contains(command, needle) {
+			if err != nil {
+				return adapter.CommandResult{}, err
+			}
+			return adapter.CommandResult{}, fmt.Errorf("remote command failed")
+		}
 	}
 	for needle, result := range f.responses {
 		if strings.Contains(command, needle) {
@@ -447,6 +456,100 @@ func TestServiceChecksRedisSentinelAndUpdatesCurrentMasterRoles(t *testing.T) {
 	}
 	if !strings.Contains(joinedCommands, "SENTINEL replicas") || !strings.Contains(joinedCommands, "SENTINEL sentinels") {
 		t.Fatal("expected check to query Redis Sentinel replicas and sentinel peers")
+	}
+}
+
+func TestServiceCheckRedisSentinelKeepsSentinelOnlineWhenDataNodeStops(t *testing.T) {
+	root := t.TempDir()
+	archive := filepath.Join(root, "redis-7.2.14.tar.gz")
+	if err := os.WriteFile(archive, []byte("redis"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s := &fakeStore{servers: map[string]store.Server{
+		"srv-1": {ID: "srv-1", Name: "redis-1", Host: "10.0.0.1", DeployDir: "/aifar/apps"},
+		"srv-2": {ID: "srv-2", Name: "redis-2", Host: "10.0.0.2", DeployDir: "/aifar/apps"},
+		"srv-3": {ID: "srv-3", Name: "redis-3", Host: "10.0.0.3", DeployDir: "/aifar/apps"},
+	}}
+	remote := &fakeRemote{}
+	service := NewService(s, remote)
+	err := service.Install(context.Background(), InstallRequest{
+		Version:  "7.2.14",
+		Topology: "sentinel",
+		Language: "en",
+		Parameters: map[string]any{
+			"port":              6379,
+			"sentinelPort":      26379,
+			"masterName":        "orders-primary",
+			"sentinelMasterId":  "srv-1",
+			"replicaServerIds":  []string{"srv-2", "srv-3"},
+			"sentinelServerIds": []string{"srv-1", "srv-2", "srv-3"},
+			"password":          "Oversea.123",
+		},
+	}, []store.Resource{{App: "redis", Part: "backend", Version: "7.2.14", Path: archive}}, fakeLogger{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	remote.responses = map[string]adapter.CommandResult{
+		"SENTINEL get-master-addr-by-name": {Stdout: "10.0.0.1\n6379\n"},
+		"SENTINEL replicas": {Stdout: strings.Join([]string{
+			"name", "10.0.0.2:6379",
+			"ip", "10.0.0.2",
+			"port", "6379",
+			"flags", "slave",
+			"name", "10.0.0.3:6379",
+			"ip", "10.0.0.3",
+			"port", "6379",
+			"flags", "slave",
+		}, "\n")},
+		"SENTINEL sentinels": {Stdout: strings.Join([]string{
+			"name", "redis-2",
+			"ip", "10.0.0.2",
+			"port", "26379",
+			"flags", "sentinel",
+			"name", "redis-3",
+			"ip", "10.0.0.3",
+			"port", "26379",
+			"flags", "sentinel",
+		}, "\n")},
+	}
+	remote.failures = map[string]error{
+		"-p 6379 --no-auth-warning PING": fmt.Errorf("redis data service stopped"),
+	}
+	instancesByServer := map[string]store.AppInstance{}
+	for _, instance := range s.instances {
+		instancesByServer[instance.ServerID] = instance
+	}
+	result, err := service.Check(context.Background(), CheckRequest{
+		Instance:        instancesByServer["srv-3"],
+		Server:          s.servers["srv-3"],
+		Language:        "en",
+		DefaultPassword: "Oversea.123",
+	}, fakeLogger{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != "degraded" {
+		t.Fatalf("expected degraded check result, got %+v", result)
+	}
+	instancesByServer = map[string]store.AppInstance{}
+	for _, instance := range s.instances {
+		instancesByServer[instance.ServerID] = instance
+	}
+	checked := instancesByServer["srv-3"]
+	if checked.Status != "degraded" {
+		t.Fatalf("expected checked instance status degraded, got %s", checked.Status)
+	}
+	metadata := metadataForTest(t, checked)
+	lastCheck, _ := metadata["lastCheck"].(map[string]any)
+	if got := lastCheck["status"]; got != "failed" {
+		t.Fatalf("expected Redis data lastCheck failed, got %v", got)
+	}
+	sentinelLastCheck, _ := metadata["sentinelLastCheck"].(map[string]any)
+	if got := sentinelLastCheck["status"]; got != "running" {
+		t.Fatalf("expected Redis Sentinel lastCheck running, got %v", got)
+	}
+	if got := metadata["currentMasterEndpoint"]; got != "10.0.0.1:6379" {
+		t.Fatalf("expected Sentinel topology to remain available, got %v", got)
 	}
 }
 

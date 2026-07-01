@@ -363,3 +363,5 @@
 - 结论：MinIO 可通过 replication priority、max_workers、max_lrg_workers 和异步复制降低复制资源占用，但这属于进程级复制调优，不是精确的单 bucket 带宽上限；建议面板提供“复制保护模式”，恢复期默认 slow + 小 worker 数，并监控 backlog、失败项、API 延迟、CPU、磁盘和网络，必要时配合独立复制网卡/VLAN 或 OS 网络 QoS 做硬限速。
 - 问题：用户补充客户单文件最大 200M，服务器 32C/64GB 且同机部署 MySQL、Redis、Nacos。
 - 结论：200M 会落入 MinIO 大对象复制范畴，且同机数据库使磁盘 I/O 成为主要风险；建议默认异步复制、恢复追赶期 priority=slow、max_lrg_workers=1、max_workers=8-16，避免自动全量 resync，并优先用独立磁盘/网络或 OS QoS 限制复制流量。
+- 问题：用户反馈 Redis 数据节点停止后，同宿主 Sentinel 节点也被页面标成离线，但 Sentinel 端口仍可正常连接。
+- 结论：Redis Sentinel 检测已拆分数据服务和 Sentinel 服务状态，分别写入数据 `lastCheck` 与 `sentinelLastCheck`；前端 Sentinel 行使用独立 Sentinel 状态展示，数据节点停止不再覆盖同宿主 Sentinel 在线状态；`go test ./internal/apps/redis`、`pnpm web:build`、`pnpm test`、`git diff --check` 已通过。

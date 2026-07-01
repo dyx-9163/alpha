@@ -560,20 +560,30 @@ func (s Service) Check(ctx context.Context, req CheckRequest, log Logger, target
 		"checkedAt": time.Now().UTC().Format(time.RFC3339),
 		"topology":  topology,
 	}
+	runtimeStatus := redisRuntimeCheckResult{}
 
 	fail := func(err error) (CheckResult, error) {
 		msg := fmt.Sprintf(copyWithFallback(copy.CheckFailed, "Redis 检测失败：%s"), err)
-		_ = s.markInstanceStatus(req.Instance, "failed", map[string]any{
+		failDetails := map[string]any{
 			"checkedAt": details["checkedAt"],
 			"topology":  topology,
 			"error":     err.Error(),
-		})
+		}
+		runtimeStatus.applyDetails(failDetails)
+		if topology == "sentinel" && (runtimeStatus.Data.Checked || runtimeStatus.Sentinel.Checked) {
+			_ = s.markRedisSentinelRuntimeStatus(req.Instance, instanceRole(req.Instance), failDetails, runtimeStatus)
+		} else {
+			_ = s.markInstanceStatus(req.Instance, "failed", failDetails)
+		}
 		finishTarget(recorder, target, "failed", msg)
 		return CheckResult{Status: "failed", Message: msg, Details: details}, err
 	}
 
 	if err := step(1, "check-runtime", copyWithFallback(copy.CheckRuntime, "检查 Redis 运行状态"), func() error {
-		return s.checkRedisRuntime(ctx, req.Server, req.Instance, req.DefaultPassword, logForServer)
+		var runtimeErr error
+		runtimeStatus, runtimeErr = s.checkRedisRuntime(ctx, req.Server, req.Instance, req.DefaultPassword, logForServer)
+		runtimeStatus.applyDetails(details)
+		return runtimeErr
 	}); err != nil {
 		return fail(err)
 	}
@@ -592,6 +602,13 @@ func (s Service) Check(ctx context.Context, req CheckRequest, log Logger, target
 	if topology == "sentinel" || topology == "cluster" {
 		if err := step(nextStep, "detect-role", copyWithFallback(copy.DetectRole, "检测 Redis 当前角色"), func() error {
 			var detectErr error
+			if topology == "sentinel" && runtimeStatus.Sentinel.Checked && !redisStatusHealthy(runtimeStatus.Sentinel.Status) {
+				role, detectErr = s.detectRedisDataRole(ctx, req.Server, req.Instance, redisPassword(nil, req.DefaultPassword), logForServer)
+				if role == "" {
+					role = instanceRole(req.Instance)
+				}
+				return detectErr
+			}
 			role, sentinelTopology, detectErr = s.detectRedisRole(ctx, req.Server, req.Instance, req.DefaultPassword, logForServer)
 			return detectErr
 		}); err != nil {
@@ -608,7 +625,10 @@ func (s Service) Check(ctx context.Context, req CheckRequest, log Logger, target
 
 	if err := step(nextStep, "update-instance", copyWithFallback(copy.UpdateInstance, "更新 Redis 实例状态"), func() error {
 		if topology == "sentinel" && sentinelTopology.MasterEndpoint != "" {
-			return s.markRedisSentinelMaster(req.Instance, role, sentinelTopology, details)
+			return s.markRedisSentinelMaster(req.Instance, role, sentinelTopology, details, runtimeStatus)
+		}
+		if topology == "sentinel" {
+			return s.markRedisSentinelRuntimeStatus(req.Instance, role, details, runtimeStatus)
 		}
 		return s.markRedisInstanceStatus(req.Instance, "running", role, details)
 	}); err != nil {
@@ -616,9 +636,16 @@ func (s Service) Check(ctx context.Context, req CheckRequest, log Logger, target
 	}
 
 	msg := fmt.Sprintf(copyWithFallback(copy.Checked, "Redis 实例检测完成：%s"), "running")
+	status := "running"
+	if topology == "sentinel" {
+		status = runtimeStatus.aggregateStatus()
+	}
+	if status != "running" {
+		msg = fmt.Sprintf(copyWithFallback(copy.Checked, "Redis instance checked: %s"), status)
+	}
 	logForServer.Info("%s", msg)
 	finishTarget(recorder, target, "success", "")
-	return CheckResult{Status: "running", Message: msg, Details: details}, nil
+	return CheckResult{Status: status, Message: msg, Details: details}, nil
 }
 
 func instancePort(instance store.AppInstance) int {

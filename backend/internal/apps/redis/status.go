@@ -20,7 +20,18 @@ type redisSentinelTopology struct {
 	SentinelEndpoints []string
 }
 
-func (s Service) checkRedisRuntime(ctx context.Context, server store.Server, instance store.AppInstance, defaultPassword string, log Logger) error {
+type redisRuntimeComponentStatus struct {
+	Checked bool
+	Status  string
+	Error   string
+}
+
+type redisRuntimeCheckResult struct {
+	Data     redisRuntimeComponentStatus
+	Sentinel redisRuntimeComponentStatus
+}
+
+func (s Service) checkRedisRuntime(ctx context.Context, server store.Server, instance store.AppInstance, defaultPassword string, log Logger) (redisRuntimeCheckResult, error) {
 	metadata := appMetadata(instance)
 	role := metadataString(metadata, "role")
 	topology := instanceTopology(instance)
@@ -31,33 +42,172 @@ func (s Service) checkRedisRuntime(ctx context.Context, server store.Server, ins
 		installerkit.ShellQuote(installRoot),
 		installerkit.ShellQuote(legacyInstallRoot),
 	)
-	var checks []string
+	result := redisRuntimeCheckResult{}
 	if role != "sentinel" {
 		port := instancePort(instance)
-		checks = append(checks, fmt.Sprintf("(systemctl is-active --quiet %s || systemctl is-active --quiet %s)",
-			installerkit.ShellQuote("aifar-redis"),
-			installerkit.ShellQuote(fmt.Sprintf("aifar-redis-%d", port)),
-		))
-		checks = append(checks, fmt.Sprintf("REDISCLI_AUTH=%s \"$INSTALL_ROOT/bin/redis-cli\" -p %d --no-auth-warning PING >/dev/null",
-			installerkit.ShellQuote(password),
-			port,
-		))
+		cmd := resolveRoot + "\n" + strings.Join([]string{
+			fmt.Sprintf("(systemctl is-active --quiet %s || systemctl is-active --quiet %s)",
+				installerkit.ShellQuote("aifar-redis"),
+				installerkit.ShellQuote(fmt.Sprintf("aifar-redis-%d", port)),
+			),
+			fmt.Sprintf("REDISCLI_AUTH=%s \"$INSTALL_ROOT/bin/redis-cli\" -p %d --no-auth-warning PING >/dev/null",
+				installerkit.ShellQuote(password),
+				port,
+			),
+		}, " && ")
+		result.Data = redisRuntimeComponentStatus{Checked: true, Status: "running"}
+		if _, err := installerkit.Run(ctx, s.remote, server, cmd, log, "redis data service check failed"); err != nil {
+			result.Data.Status = "failed"
+			result.Data.Error = err.Error()
+		}
 	}
 	if topology == "sentinel" && (metadataBool(metadata, "sentinel") || role == "sentinel") {
 		sentinelPort := instanceSentinelPort(instance)
-		checks = append(checks, fmt.Sprintf("(systemctl is-active --quiet %s || systemctl is-active --quiet %s)",
-			installerkit.ShellQuote("aifar-redis-sentinel"),
-			installerkit.ShellQuote(fmt.Sprintf("aifar-redis-sentinel-%d", sentinelPort)),
-		))
-		checks = append(checks, fmt.Sprintf("REDISCLI_AUTH=%s \"$INSTALL_ROOT/bin/redis-cli\" -p %d --no-auth-warning PING >/dev/null",
-			installerkit.ShellQuote(password),
-			sentinelPort,
-		))
+		cmd := resolveRoot + "\n" + strings.Join([]string{
+			fmt.Sprintf("(systemctl is-active --quiet %s || systemctl is-active --quiet %s)",
+				installerkit.ShellQuote("aifar-redis-sentinel"),
+				installerkit.ShellQuote(fmt.Sprintf("aifar-redis-sentinel-%d", sentinelPort)),
+			),
+			fmt.Sprintf("REDISCLI_AUTH=%s \"$INSTALL_ROOT/bin/redis-cli\" -p %d --no-auth-warning PING >/dev/null",
+				installerkit.ShellQuote(password),
+				sentinelPort,
+			),
+		}, " && ")
+		result.Sentinel = redisRuntimeComponentStatus{Checked: true, Status: "running"}
+		if _, err := installerkit.Run(ctx, s.remote, server, cmd, log, "redis sentinel service check failed"); err != nil {
+			result.Sentinel.Status = "failed"
+			result.Sentinel.Error = err.Error()
+		}
 	}
-	if len(checks) == 0 {
-		return errors.New("redis runtime check has no service to verify")
+	if !result.Data.Checked && !result.Sentinel.Checked {
+		return result, errors.New("redis runtime check has no service to verify")
 	}
-	_, err := installerkit.Run(ctx, s.remote, server, resolveRoot+"\n"+strings.Join(checks, " && "), log, "redis remote command failed")
+	if result.allCheckedServicesFailed() {
+		return result, result.error()
+	}
+	return result, nil
+}
+
+func (r redisRuntimeCheckResult) allCheckedServicesFailed() bool {
+	checked := false
+	for _, component := range []redisRuntimeComponentStatus{r.Data, r.Sentinel} {
+		if !component.Checked {
+			continue
+		}
+		checked = true
+		if redisStatusHealthy(component.Status) {
+			return false
+		}
+	}
+	return checked
+}
+
+func (r redisRuntimeCheckResult) aggregateStatus() string {
+	statuses := make([]string, 0, 2)
+	for _, component := range []redisRuntimeComponentStatus{r.Data, r.Sentinel} {
+		if component.Checked {
+			statuses = append(statuses, component.Status)
+		}
+	}
+	if len(statuses) == 0 {
+		return "unknown"
+	}
+	allRunning := true
+	allFailed := true
+	for _, status := range statuses {
+		if !redisStatusHealthy(status) {
+			allRunning = false
+		}
+		if redisStatusHealthy(status) {
+			allFailed = false
+		}
+	}
+	if allRunning {
+		return "running"
+	}
+	if allFailed {
+		return "failed"
+	}
+	return "degraded"
+}
+
+func (r redisRuntimeCheckResult) error() error {
+	var parts []string
+	if r.Data.Checked && !redisStatusHealthy(r.Data.Status) {
+		if strings.TrimSpace(r.Data.Error) != "" {
+			parts = append(parts, r.Data.Error)
+		} else {
+			parts = append(parts, "Redis data service is unavailable")
+		}
+	}
+	if r.Sentinel.Checked && !redisStatusHealthy(r.Sentinel.Status) {
+		if strings.TrimSpace(r.Sentinel.Error) != "" {
+			parts = append(parts, r.Sentinel.Error)
+		} else {
+			parts = append(parts, "Redis Sentinel service is unavailable")
+		}
+	}
+	if len(parts) == 0 {
+		return nil
+	}
+	return errors.New(strings.Join(parts, "; "))
+}
+
+func (r redisRuntimeCheckResult) applyDetails(details map[string]any) {
+	if r.Data.Checked {
+		details["dataStatus"] = r.Data.Status
+		if strings.TrimSpace(r.Data.Error) != "" {
+			details["dataError"] = r.Data.Error
+		}
+	}
+	if r.Sentinel.Checked {
+		details["sentinelStatus"] = r.Sentinel.Status
+		if strings.TrimSpace(r.Sentinel.Error) != "" {
+			details["sentinelError"] = r.Sentinel.Error
+		}
+	}
+}
+
+func redisRuntimeLastCheck(status string, checkedAt any, details map[string]any, componentError string) map[string]any {
+	out := map[string]any{
+		"status":    status,
+		"checkedAt": checkedAt,
+		"details":   details,
+	}
+	if strings.TrimSpace(componentError) != "" {
+		out["error"] = componentError
+	}
+	return out
+}
+
+func applyRedisRuntimeMetadata(metadata map[string]any, runtime redisRuntimeCheckResult, aggregateStatus string, details map[string]any) {
+	checkedAt := details["checkedAt"]
+	if runtime.Data.Checked {
+		metadata["lastCheck"] = redisRuntimeLastCheck(runtime.Data.Status, checkedAt, details, runtime.Data.Error)
+	} else {
+		metadata["lastCheck"] = redisRuntimeLastCheck(aggregateStatus, checkedAt, details, "")
+	}
+	if runtime.Sentinel.Checked {
+		metadata["sentinelLastCheck"] = redisRuntimeLastCheck(runtime.Sentinel.Status, checkedAt, details, runtime.Sentinel.Error)
+	} else {
+		delete(metadata, "sentinelLastCheck")
+	}
+}
+
+func (s Service) markRedisSentinelRuntimeStatus(instance store.AppInstance, role string, details map[string]any, runtime redisRuntimeCheckResult) error {
+	metadata := appMetadata(instance)
+	if role != "" {
+		metadata["role"] = role
+	}
+	status := runtime.aggregateStatus()
+	if runtime.Sentinel.Checked && !redisStatusHealthy(runtime.Sentinel.Status) {
+		clearRedisDiscoveredTopology(metadata)
+	}
+	applyRedisRuntimeMetadata(metadata, runtime, status, details)
+	data, _ := json.Marshal(metadata)
+	instance.Metadata = string(data)
+	instance.Status = status
+	_, err := s.store.SaveAppInstance(instance)
 	return err
 }
 
@@ -279,7 +429,7 @@ func (s Service) findRedisSentinelPeer(instance store.AppInstance) (store.AppIns
 	return store.AppInstance{}, store.Server{}, errors.New("Redis Sentinel peer was not found")
 }
 
-func (s Service) markRedisSentinelMaster(instance store.AppInstance, checkedRole string, sentinelTopology redisSentinelTopology, details map[string]any) error {
+func (s Service) markRedisSentinelMaster(instance store.AppInstance, checkedRole string, sentinelTopology redisSentinelTopology, details map[string]any, runtime redisRuntimeCheckResult) error {
 	instances, err := s.store.ListAppInstances()
 	if err != nil {
 		return err
@@ -312,12 +462,12 @@ func (s Service) markRedisSentinelMaster(instance store.AppInstance, checkedRole
 		}
 		if candidate.ID == instance.ID {
 			metadata["role"] = checkedRole
-			metadata["lastCheck"] = map[string]any{
-				"status":    "running",
-				"checkedAt": detectedAt,
-				"details":   details,
+			if !runtime.Data.Checked && !runtime.Sentinel.Checked {
+				runtime.Data = redisRuntimeComponentStatus{Checked: true, Status: "running"}
 			}
-			candidate.Status = "running"
+			status := runtime.aggregateStatus()
+			applyRedisRuntimeMetadata(metadata, runtime, status, details)
+			candidate.Status = status
 		}
 		data, _ := json.Marshal(metadata)
 		candidate.Metadata = string(data)
