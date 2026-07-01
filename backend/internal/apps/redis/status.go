@@ -325,7 +325,155 @@ func (s Service) markRedisSentinelMaster(instance store.AppInstance, checkedRole
 			return err
 		}
 	}
+	return s.ensureRedisSentinelDiscoveredInstances(instance, instances, sentinelTopology, detectedAt)
+}
+
+type discoveredRedisSentinelNode struct {
+	server            store.Server
+	role              string
+	dataEndpoint      string
+	dataPort          int
+	hasSentinel       bool
+	sentinelPort      int
+	masterHost        string
+	masterPort        int
+	masterEndpoint    string
+	replicaEndpoints  []string
+	sentinelEndpoints []string
+}
+
+func (s Service) ensureRedisSentinelDiscoveredInstances(base store.AppInstance, existing []store.AppInstance, topology redisSentinelTopology, detectedAt string) error {
+	if topology.MasterEndpoint == "" {
+		return nil
+	}
+	servers, err := s.store.ListServers()
+	if err != nil {
+		return err
+	}
+	baseMetadata := appMetadata(base)
+	existingServerIDs := map[string]bool{}
+	for _, candidate := range existing {
+		if sameRedisSentinelGroup(base, candidate) {
+			existingServerIDs[candidate.ServerID] = true
+		}
+	}
+	masterHost, masterPort := splitEndpoint(topology.MasterEndpoint)
+	discovered := map[string]*discoveredRedisSentinelNode{}
+	serverByHost := redisServersByHost(servers)
+	add := func(endpoint string) (*discoveredRedisSentinelNode, bool) {
+		host, _ := splitEndpoint(endpoint)
+		server, ok := serverByHost[normalizeRedisHost(host)]
+		if !ok || strings.TrimSpace(server.ID) == "" {
+			return nil, false
+		}
+		node := discovered[server.ID]
+		if node == nil {
+			node = &discoveredRedisSentinelNode{
+				server:            server,
+				masterHost:        masterHost,
+				masterPort:        masterPort,
+				masterEndpoint:    topology.MasterEndpoint,
+				replicaEndpoints:  topology.ReplicaEndpoints,
+				sentinelEndpoints: topology.SentinelEndpoints,
+			}
+			discovered[server.ID] = node
+		}
+		return node, true
+	}
+	if node, ok := add(topology.MasterEndpoint); ok {
+		node.role = "master"
+		node.dataEndpoint = normalizeEndpoint(topology.MasterEndpoint)
+		node.dataPort = masterPort
+	}
+	for _, endpoint := range topology.ReplicaEndpoints {
+		if node, ok := add(endpoint); ok && node.role == "" {
+			_, port := splitEndpoint(endpoint)
+			node.role = "replica"
+			node.dataEndpoint = normalizeEndpoint(endpoint)
+			node.dataPort = port
+		}
+	}
+	for _, endpoint := range topology.SentinelEndpoints {
+		if node, ok := add(endpoint); ok {
+			_, port := splitEndpoint(endpoint)
+			node.hasSentinel = true
+			node.sentinelPort = port
+		}
+	}
+	for _, node := range discovered {
+		if existingServerIDs[node.server.ID] {
+			continue
+		}
+		instance := store.AppInstance{
+			App:      "redis",
+			Version:  base.Version,
+			ServerID: node.server.ID,
+			Status:   "installed",
+			Topology: "sentinel",
+		}
+		metadata := redisDiscoveredInstanceMetadata(baseMetadata, node, detectedAt)
+		data, _ := json.Marshal(metadata)
+		instance.Metadata = string(data)
+		if _, err := s.store.SaveAppInstance(instance); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+func redisDiscoveredInstanceMetadata(base map[string]any, node *discoveredRedisSentinelNode, detectedAt string) map[string]any {
+	metadata := map[string]any{}
+	for key, value := range base {
+		metadata[key] = value
+	}
+	role := node.role
+	if role == "" && node.hasSentinel {
+		role = "sentinel"
+	}
+	metadata["topology"] = "sentinel"
+	metadata["role"] = role
+	metadata["port"] = node.dataPort
+	if node.dataPort <= 0 {
+		metadata["port"] = intParam(base, "port", 6379)
+	}
+	if node.dataEndpoint != "" {
+		metadata["endpoint"] = node.dataEndpoint
+	} else {
+		delete(metadata, "endpoint")
+	}
+	if node.hasSentinel {
+		metadata["sentinel"] = true
+		metadata["sentinelName"] = "aifar-redis-sentinel"
+		metadata["sentinelPort"] = node.sentinelPort
+		if node.sentinelPort <= 0 {
+			metadata["sentinelPort"] = intParam(base, "sentinelPort", 26379)
+		}
+	} else {
+		metadata["sentinel"] = false
+		delete(metadata, "sentinelName")
+	}
+	metadata["currentMasterEndpoint"] = node.masterEndpoint
+	metadata["masterHost"] = node.masterHost
+	metadata["masterPort"] = node.masterPort
+	metadata["masterDetectedAt"] = detectedAt
+	metadata["replicaEndpoints"] = node.replicaEndpoints
+	metadata["sentinelEndpoints"] = node.sentinelEndpoints
+	return metadata
+}
+
+func redisServersByHost(servers []store.Server) map[string]store.Server {
+	out := map[string]store.Server{}
+	for _, server := range servers {
+		host := normalizeRedisHost(server.Host)
+		if host != "" {
+			out[host] = server
+		}
+	}
+	return out
+}
+
+func normalizeRedisHost(value string) string {
+	return strings.ToLower(strings.Trim(strings.TrimSpace(value), "[]"))
 }
 
 func parseRedisSentinelEndpointRows(stdout string) []string {

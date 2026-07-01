@@ -335,3 +335,5 @@
 - 结论：原因是脚本在 `systemctl enable --now` 后立即执行一次 `redis-cli sentinel masters` 验证；systemd `Type=simple` 返回时 Sentinel 进程可能刚启动、端口尚未完全可用，导致验证误报失败，而前面的配置和服务启动已经落地。已改为最多等待 15 秒重试 Sentinel 验证，避免这种已安装但任务失败的假阴性。验证通过：go test ./internal/apps/redis、pnpm test、git diff --check。
 - 问题：用户要求数据库卸载界面按单体/集群整体删除，并将 MySQL 与 MySQL Router 卸载合并成一个入口。
 - 结论：数据库页 MySQL 卡片统一为一个“卸载 MySQL”入口；InnoDB Cluster 会按 Router 优先、MySQL 节点随后一起提交批量卸载，standalone 只提交当前实例；节点行不再重复展示 MySQL 单点卸载按钮。验证通过：pnpm web:build、git diff --check。
+- 问题：用户反馈 Redis Sentinel 实际选择 3 个节点卸载时确认框只显示 2 台服务器密码。
+- 结论：原因是 1 台 Redis/Sentinel 节点只来自 Sentinel 拓扑发现，还没有登记到 `app_instances`，卸载接口只会提交真实登记实例。Redis Sentinel 检测已改为根据发现到的 master/replica/sentinel 端点自动补登记同组缺失服务器；重新执行实时监测后卸载确认会按 3 台目标服务器展示。验证通过：go test ./internal/apps/redis、pnpm test、git diff --check。

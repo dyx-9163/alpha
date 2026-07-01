@@ -27,6 +27,16 @@ func (f *fakeStore) GetServer(id string, includeSecret bool) (store.Server, erro
 	return f.servers[id], nil
 }
 
+func (f *fakeStore) ListServers() ([]store.Server, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]store.Server, 0, len(f.servers))
+	for _, server := range f.servers {
+		out = append(out, server)
+	}
+	return out, nil
+}
+
 func (f *fakeStore) SaveAppInstance(v store.AppInstance) (store.AppInstance, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -437,6 +447,94 @@ func TestServiceChecksRedisSentinelAndUpdatesCurrentMasterRoles(t *testing.T) {
 	}
 	if !strings.Contains(joinedCommands, "SENTINEL replicas") || !strings.Contains(joinedCommands, "SENTINEL sentinels") {
 		t.Fatal("expected check to query Redis Sentinel replicas and sentinel peers")
+	}
+}
+
+func TestServiceCheckBackfillsDiscoveredRedisSentinelInstances(t *testing.T) {
+	s := &fakeStore{servers: map[string]store.Server{
+		"srv-1": {ID: "srv-1", Name: "redis-1", Host: "10.0.0.1", DeployDir: "/aifar/apps"},
+		"srv-2": {ID: "srv-2", Name: "redis-2", Host: "10.0.0.2", DeployDir: "/aifar/apps"},
+		"srv-3": {ID: "srv-3", Name: "redis-3", Host: "10.0.0.3", DeployDir: "/aifar/apps"},
+	}}
+	baseMetadata := map[string]any{
+		"clusterId":    "redis_sentinel_test",
+		"port":         6379,
+		"sentinelPort": 26379,
+		"masterName":   "orders-primary",
+		"sentinel":     true,
+		"topology":     "sentinel",
+	}
+	for _, serverID := range []string{"srv-1", "srv-2"} {
+		metadata := map[string]any{}
+		for key, value := range baseMetadata {
+			metadata[key] = value
+		}
+		metadata["role"] = "replica"
+		metadata["endpoint"] = fmt.Sprintf("10.0.0.%s:6379", strings.TrimPrefix(serverID, "srv-"))
+		data, _ := json.Marshal(metadata)
+		if _, err := s.SaveAppInstance(store.AppInstance{
+			App:      "redis",
+			Version:  "7.2.14",
+			ServerID: serverID,
+			Status:   "installed",
+			Topology: "sentinel",
+			Metadata: string(data),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	remote := &fakeRemote{responses: map[string]adapter.CommandResult{
+		"SENTINEL get-master-addr-by-name": {Stdout: "10.0.0.3\n6379\n"},
+		"SENTINEL replicas": {Stdout: strings.Join([]string{
+			"name", "10.0.0.1:6379",
+			"ip", "10.0.0.1",
+			"port", "6379",
+			"flags", "slave",
+		}, "\n")},
+		"SENTINEL sentinels": {Stdout: strings.Join([]string{
+			"name", "redis-1",
+			"ip", "10.0.0.1",
+			"port", "26379",
+			"flags", "sentinel",
+			"name", "redis-3",
+			"ip", "10.0.0.3",
+			"port", "26379",
+			"flags", "sentinel",
+		}, "\n")},
+	}}
+	service := NewService(s, remote)
+	instancesByServer := map[string]store.AppInstance{}
+	for _, instance := range s.instances {
+		instancesByServer[instance.ServerID] = instance
+	}
+	if _, err := service.Check(context.Background(), CheckRequest{
+		Instance:        instancesByServer["srv-2"],
+		Server:          s.servers["srv-2"],
+		Language:        "en",
+		DefaultPassword: "Oversea.123",
+	}, fakeLogger{}, nil); err != nil {
+		t.Fatal(err)
+	}
+	instancesByServer = map[string]store.AppInstance{}
+	for _, instance := range s.instances {
+		instancesByServer[instance.ServerID] = instance
+	}
+	backfilled := instancesByServer["srv-3"]
+	if backfilled.ID == "" {
+		t.Fatalf("expected discovered Redis Sentinel node on srv-3 to be registered: %+v", s.instances)
+	}
+	metadata := metadataForTest(t, backfilled)
+	if got := metadata["role"]; got != "master" {
+		t.Fatalf("expected backfilled node role master, got %v", got)
+	}
+	if got := metadata["sentinel"]; got != true {
+		t.Fatalf("expected backfilled node to include sentinel service, got %v", got)
+	}
+	if got := metadata["endpoint"]; got != "10.0.0.3:6379" {
+		t.Fatalf("expected backfilled data endpoint, got %v", got)
+	}
+	if got := metadata["sentinelPort"]; fmt.Sprint(got) != "26379" {
+		t.Fatalf("expected backfilled sentinel port, got %v", got)
 	}
 }
 
