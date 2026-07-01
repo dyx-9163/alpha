@@ -100,6 +100,7 @@ func New(cfg config.Config, s *store.Store, tasks *worker.Manager) *API {
 			r.Post("/database/mysql/install", api.requirePermission(rbac.DatabaseManage, api.installNamedApp("mysql")))
 			r.Post("/database/mysql/clusters/start", api.requirePermission(rbac.DatabaseManage, api.startMySQLCluster))
 			r.Post("/database/redis/install", api.requirePermission(rbac.DatabaseManage, api.installNamedApp("redis")))
+			r.Get("/nacos/instances", api.nacosInstances)
 			r.Get("/storage/instances", api.storageInstances)
 			r.Post("/storage/instances", api.requirePermission(rbac.StorageManage, api.createStorageInstance))
 			r.Get("/storage/{id}/buckets", api.storageCollection("buckets"))

@@ -166,6 +166,7 @@ func (s Service) Install(ctx context.Context, req InstallRequest, resources []st
 				"raftPort":       options.RaftPort,
 				"serviceName":    "aifar-nacos",
 				"endpoint":       fmt.Sprintf("http://%s:%d/nacos", server.Host, options.Port),
+				"authEnabled":    true,
 				"topology":       topology,
 				"mode":           topology,
 			}

@@ -153,6 +153,21 @@ func (a *API) storageInstances(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, out)
 }
 
+func (a *API) nacosInstances(w http.ResponseWriter, r *http.Request) {
+	instances, err := a.store.ListAppInstances()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "NACOS_LIST_FAILED", err.Error(), nil)
+		return
+	}
+	var out []store.AppInstance
+	for _, instance := range instances {
+		if instance.App == "nacos" {
+			out = append(out, instance)
+		}
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
 func (a *API) createStorageInstance(w http.ResponseWriter, r *http.Request) {
 	a.installAppName(w, r, "minio")
 }

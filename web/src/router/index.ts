@@ -5,6 +5,7 @@ import AppsView from '../views/AppsView.vue'
 import ContainersView from '../views/ContainersView.vue'
 import ServersView from '../views/ServersView.vue'
 import DatabaseView from '../views/DatabaseView.vue'
+import NacosView from '../views/NacosView.vue'
 import StorageView from '../views/StorageView.vue'
 import TerminalView from '../views/TerminalView.vue'
 import TasksView from '../views/TasksView.vue'
@@ -23,6 +24,7 @@ const router = createRouter({
     { path: '/containers', component: ContainersView },
     { path: '/servers', component: ServersView },
     { path: '/database', component: DatabaseView },
+    { path: '/nacos', component: NacosView },
     { path: '/storage', component: StorageView },
     { path: '/terminal', component: TerminalView, meta: { permission: permissions.terminalConnect } },
     { path: '/tasks', component: TasksView },
