@@ -172,6 +172,22 @@ func (a *API) registerInstallCredentials(_ context.Context, app string, req regi
 			NamePrefix:         "MinIO",
 			SkipIfCredentialID: "rootCredentialId",
 		}, actor, log)
+	case "nacos":
+		a.registerPasswordCredential(credentialRegisterRequest{
+			App:                app,
+			Kind:               "nacos",
+			Purpose:            "admin",
+			Language:           req.Language,
+			Parameters:         req.Parameters,
+			User:               paramString(req.Parameters, "nacosUser", "nacos"),
+			Password:           firstParamString(req.Parameters, []string{"nacosPassword", "password"}, "nacos"),
+			ServerIDs:          req.TargetServerIDs(),
+			Port:               paramInt(req.Parameters, "port", 8848),
+			EndpointScheme:     "http",
+			EndpointPath:       "nacos",
+			NamePrefix:         "Nacos",
+			SkipIfCredentialID: "nacosCredentialId",
+		}, actor, log)
 	}
 }
 
@@ -214,6 +230,7 @@ type credentialRegisterRequest struct {
 	ServerIDs          []string
 	Port               int
 	EndpointScheme     string
+	EndpointPath       string
 	NamePrefix         string
 	SkipIfCredentialID string
 }
@@ -228,7 +245,7 @@ func (a *API) registerPasswordCredential(req credentialRegisterRequest, actor st
 			log.Error("credential registration skipped for %s: %v", serverID, err)
 			continue
 		}
-		endpoint := netEndpoint(req.EndpointScheme, server.Host, req.Port)
+		endpoint := endpointWithPath(netEndpoint(req.EndpointScheme, server.Host, req.Port), req.EndpointPath)
 		credential := store.Credential{
 			Name:     credentialName(req.NamePrefix, server),
 			Kind:     req.Kind,
@@ -375,6 +392,15 @@ func netEndpoint(scheme, host string, port int) string {
 		return strings.TrimSpace(scheme) + "://" + endpoint
 	}
 	return endpoint
+}
+
+func endpointWithPath(endpoint, path string) string {
+	endpoint = strings.TrimRight(strings.TrimSpace(endpoint), "/")
+	path = strings.Trim(strings.TrimSpace(path), "/")
+	if endpoint == "" || path == "" {
+		return endpoint
+	}
+	return endpoint + "/" + path
 }
 
 func paramString(params map[string]any, key, fallback string) string {

@@ -447,3 +447,5 @@
 - 结论：建议设计为“凭据中心/密钥管理”作为控制面事实源，安装器只引用 credentialId，运行时临时解密并生成目标机配置产物；凭据要加密存储、按用途绑定 app 实例、支持版本/轮换/审计，并区分“使用权限”和“查看明文权限”。
 - 问题：用户确认执行统一凭据/密钥管理设计。
 - 结论：已新增凭据中心后端表、加密存储、版本记录最近 3 个、实例绑定、RBAC 权限和 `/api/v2/credentials` API；安装入口支持 credentialId 解密注入并绑定到实例，MySQL/Redis/MinIO 安装成功后自动登记凭据；前端新增凭据中心页面、菜单入口，并在 MySQL/Redis/MinIO/Nacos/AIFAR 安装弹窗接入凭据选择。验证通过：`go test ./internal/store ./internal/httpapi`、`pnpm web:build`、`pnpm test`、`git diff --check`。
+- 问题：用户反馈 Nacos 安装成功后没有自动加入凭据中心。
+- 结论：原因是上一版自动登记只覆盖 MySQL/Redis/MinIO；已补上 Nacos 安装成功后按默认控制台账号登记 `nacos` 类型凭据，并绑定到对应 Nacos app instance，endpoint 使用 `http://host:port/nacos`。验证通过：`go test ./internal/httpapi`、`pnpm test`、`git diff --check`。
