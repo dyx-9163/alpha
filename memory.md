@@ -485,3 +485,5 @@
 - 结论：AIFAR 安装弹窗已移除 MySQL/Redis/MinIO 实例来源选择，恢复时区、Docker 网络、CPU/内存、Nacos namespace、MySQL 初始化、Redis 模式/DB/凭据、MinIO endpoint/bucket/domain/basePath 等手动参数；后端同步移除 DB/Redis/MinIO 实例解析字段，只保留 Nacos 实例解析，安装脚本继续禁止注入 `SPRING_DATA_REDIS_*`、`SPRING_DATASOURCE_*`、`DROMARA_X_FILE_STORAGE_*` 等业务运行时环境变量。验证通过：`pnpm web:build`、`go test ./internal/apps/aifar`、`pnpm test`、`git diff --check`。
 - 问题：用户询问只更新 AIFAR Docker 内某些服务的 JAR 包或前端代码时，如何设计操作并保留版本回滚。
 - 结论：建议把“部分服务更新”仍建模为应用实例级新 release：以上一个完整 release 为基线，只替换选中的服务 artifact/image，未变更服务继承旧 manifest；每个 release 都保存完整 manifest、服务 artifact SHA256、镜像 tag、配置 hash 和变更列表。回滚优先按完整 release 回滚；若做单服务回滚，也应生成一个新的 partial release，而不是直接改容器文件。
+- 问题：用户确认执行 AIFAR 部分服务更新操作能力。
+- 结论：新增 AIFAR 制品更新任务入口，支持在已安装 AIFAR 实例上选择服务并上传 Java `.jar` 或前端 zip/tar/tgz/tar.gz；后端以上一版完整 release 为基线生成 partial release，只重建选中服务，失败时回滚该服务，控制面记录 artifact SHA256、变更服务、release manifest 并保留最近 3 个成功 release；默认请求体上限提高到 512MiB 以支持制品上传。验证通过：`go test ./internal/apps/aifar ./internal/httpapi`、`pnpm test`、`pnpm web:build`、`pnpm backend:build`、`git diff --check`。

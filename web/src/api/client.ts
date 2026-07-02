@@ -43,6 +43,10 @@ export function apiPost<T>(path: string, body?: unknown) {
   return fetch(`${API_PREFIX}${path}`, { method: 'POST', headers: headers(), body: JSON.stringify(body ?? {}) }).then((r) => handle<T>(r))
 }
 
+export function apiPostForm<T>(path: string, body: FormData) {
+  return fetch(`${API_PREFIX}${path}`, { method: 'POST', headers: headers(false), body }).then((r) => handle<T>(r))
+}
+
 export function apiPut<T>(path: string, body?: unknown) {
   return fetch(`${API_PREFIX}${path}`, { method: 'PUT', headers: headers(), body: JSON.stringify(body ?? {}) }).then((r) => handle<T>(r))
 }

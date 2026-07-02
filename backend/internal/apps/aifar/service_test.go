@@ -120,6 +120,7 @@ type fakeRemote struct {
 	commands      []string
 	uploads       []string
 	installScript string
+	updateScript  string
 	statusStdout  string
 }
 
@@ -143,6 +144,13 @@ func (f *fakeRemote) UploadFile(ctx context.Context, server store.Server, localP
 			return err
 		}
 		f.installScript = string(content)
+	}
+	if strings.HasSuffix(remotePath, "/update-aifar-artifact.sh") {
+		content, err := os.ReadFile(localPath)
+		if err != nil {
+			return err
+		}
+		f.updateScript = string(content)
 	}
 	return nil
 }
@@ -386,6 +394,92 @@ func TestServiceUsesManualBusinessDependencyParameters(t *testing.T) {
 		if !strings.Contains(remote.installScript, want) {
 			t.Fatalf("install script should contain %q:\n%s", want, remote.installScript)
 		}
+	}
+}
+
+func TestServiceUpdatesAIFARServiceArtifactAsPartialRelease(t *testing.T) {
+	artifactDir := t.TempDir()
+	artifactPath := filepath.Join(artifactDir, "oauth.jar")
+	if err := os.WriteFile(artifactPath, []byte("new oauth jar"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	instance := store.AppInstance{
+		ID:       "aifar-1",
+		App:      "aifar",
+		Version:  "docker-apps",
+		ServerID: "srv-1",
+		Status:   "installed",
+		Topology: defaultTopology,
+		Metadata: mustMetadata(t, map[string]any{
+			"installRoot":      "/aifar/apps/admin",
+			"layout":           releaseLayout,
+			"releaseId":        "20260701T010203.000000000Z-docker-apps",
+			"releaseVersion":   "docker-apps",
+			"releasePath":      "/aifar/apps/admin/releases/20260701T010203.000000000Z-docker-apps",
+			"currentRelease":   "/aifar/apps/admin/current",
+			"configHash":       "base-config-hash",
+			"releaseRetention": releaseKeepCount,
+			"services":         serviceOrder,
+		}),
+	}
+	s := &fakeStore{
+		servers: map[string]store.Server{
+			"srv-1": {ID: "srv-1", Name: "app-1", Host: "10.0.0.10", DeployDir: "/aifar/apps"},
+		},
+		instances: []store.AppInstance{instance},
+	}
+	remote := &fakeRemote{}
+	service := NewService(s, remote)
+	err := service.UpdateArtifact(context.Background(), ArtifactUpdateRequest{
+		Instance:          instance,
+		Server:            s.servers["srv-1"],
+		Language:          "en",
+		ServiceName:       "oauth",
+		ArtifactLocalPath: artifactPath,
+		ArtifactFileName:  "oauth.jar",
+	}, fakeLogger{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(remote.joinedUploads(), "oauth.jar") || !strings.Contains(remote.joinedCommands(), "update-aifar-artifact.sh") {
+		t.Fatalf("expected artifact upload and update script run, uploads=%s commands=%s", remote.joinedUploads(), remote.joinedCommands())
+	}
+	for _, want := range []string{
+		`SERVICE_NAME='oauth'`,
+		`cp -a "$BASE_RELEASE/." "$RELEASE_DIR/"`,
+		`apply_java_artifact`,
+		`retag_selected_service`,
+		`compose --env-file env/compose.env -f compose.yaml up -d --build "$SERVICE_NAME"`,
+		`rollback_service "$BASE_RELEASE"`,
+		`"kind": "partial"`,
+		`"changedServices": ["$SERVICE_NAME"]`,
+	} {
+		if !strings.Contains(remote.updateScript, want) {
+			t.Fatalf("update script should contain %q:\n%s", want, remote.updateScript)
+		}
+	}
+	if strings.Contains(remote.updateScript, "cleanup_release_images") || strings.Contains(remote.updateScript, "docker image rm") {
+		t.Fatalf("partial update script should not delete inherited image refs:\n%s", remote.updateScript)
+	}
+	if len(s.instances) != 1 {
+		t.Fatalf("expected one instance, got %+v", s.instances)
+	}
+	var metadata map[string]any
+	if err := json.Unmarshal([]byte(s.instances[0].Metadata), &metadata); err != nil {
+		t.Fatal(err)
+	}
+	if metadata["releaseId"] == "20260701T010203.000000000Z-docker-apps" || metadata["configHash"] == "base-config-hash" {
+		t.Fatalf("expected release metadata to change, got %s", s.instances[0].Metadata)
+	}
+	lastUpdate, ok := metadata["lastPartialUpdate"].(map[string]any)
+	if !ok || lastUpdate["service"] != "oauth" || lastUpdate["artifactFile"] != "oauth.jar" || lastUpdate["artifactSHA256"] == "" {
+		t.Fatalf("expected lastPartialUpdate metadata, got %s", s.instances[0].Metadata)
+	}
+	if len(s.releases) != 1 || s.releases[0].InstanceID != instance.ID || s.releases[0].Status != "success" {
+		t.Fatalf("expected one partial release, got %+v", s.releases)
+	}
+	if !strings.Contains(s.releases[0].ManifestJSON, `"kind":"partial"`) || !strings.Contains(s.releases[0].ManifestJSON, `"changedServices":["oauth"]`) {
+		t.Fatalf("expected partial release manifest, got %s", s.releases[0].ManifestJSON)
 	}
 }
 

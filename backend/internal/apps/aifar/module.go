@@ -54,6 +54,7 @@ func (m Module) Manifest(lang string) registry.Manifest {
 		Capabilities: []string{
 			"apps.aifar.install",
 			"apps.aifar.check",
+			"apps.aifar.update-artifact",
 			"apps.aifar.delete",
 			"servers.credential.use",
 			"docker.compose.deploy",
@@ -199,6 +200,52 @@ func (m Module) Check(ctx context.Context, req registry.CheckRequest, run regist
 		return run.LoggerForTarget(target)
 	})
 	return registry.InstanceStatus{Status: status.Status, Message: status.Message, Details: status.Details}, err
+}
+
+func (m Module) PlanArtifactUpdate(ctx context.Context, req registry.ArtifactUpdateRequest) ([]registry.InstallStepPlan, error) {
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	copy := updateCopyFor(req.Language)
+	target := req.Instance.ServerID
+	if target == "" {
+		target = req.Server.ID
+	}
+	steps := updateSteps(copy)
+	plan := make([]registry.InstallStepPlan, 0, len(steps))
+	for idx, step := range steps {
+		plan = append(plan, registry.InstallStepPlan{Target: target, Name: step.Name, Title: step.Title, Order: idx + 1})
+	}
+	return plan, nil
+}
+
+func (m Module) ValidateArtifactUpdate(ctx context.Context, req registry.ArtifactUpdateRequest) error {
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	return m.service.ValidateArtifactUpdate(ArtifactUpdateRequest{
+		Instance:          req.Instance,
+		Server:            req.Server,
+		Language:          req.Language,
+		Actor:             req.Actor,
+		ServiceName:       req.ServiceName,
+		ArtifactLocalPath: req.ArtifactLocalPath,
+		ArtifactFileName:  req.ArtifactFileName,
+	})
+}
+
+func (m Module) UpdateArtifact(ctx context.Context, req registry.ArtifactUpdateRequest, run registry.RunContext) error {
+	return m.service.UpdateArtifact(ctx, ArtifactUpdateRequest{
+		Instance:          req.Instance,
+		Server:            req.Server,
+		Language:          req.Language,
+		Actor:             req.Actor,
+		ServiceName:       req.ServiceName,
+		ArtifactLocalPath: req.ArtifactLocalPath,
+		ArtifactFileName:  req.ArtifactFileName,
+	}, run.Log, func(target string) Logger {
+		return run.LoggerForTarget(target)
+	})
 }
 
 func firstTarget(req registry.InstallRequest) string {

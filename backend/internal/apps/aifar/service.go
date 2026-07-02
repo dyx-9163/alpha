@@ -2,10 +2,13 @@ package aifar
 
 import (
 	"context"
+	"crypto/sha256"
 	"embed"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -18,7 +21,7 @@ import (
 	"aifar-deployment/backend/internal/store"
 )
 
-//go:embed templates/install.sh templates/uninstall.sh
+//go:embed templates/install.sh templates/uninstall.sh templates/update-artifact.sh
 var templateFS embed.FS
 
 type Logger = installerkit.Logger
@@ -54,6 +57,16 @@ type CheckRequest struct {
 	Instance store.AppInstance
 	Server   store.Server
 	Language string
+}
+
+type ArtifactUpdateRequest struct {
+	Instance          store.AppInstance
+	Server            store.Server
+	Language          string
+	Actor             string
+	ServiceName       string
+	ArtifactLocalPath string
+	ArtifactFileName  string
 }
 
 type CheckResult struct {
@@ -331,6 +344,293 @@ func releaseManifest(version, releaseID string, releaseTime time.Time, configHas
 	}
 }
 
+func partialReleaseManifest(version, releaseID string, releaseTime time.Time, configHash, baseReleaseID string, artifact artifactInfo) map[string]any {
+	return map[string]any{
+		"app":              AppName,
+		"version":          version,
+		"releaseId":        releaseID,
+		"layout":           releaseLayout,
+		"kind":             "partial",
+		"status":           "success",
+		"configHash":       configHash,
+		"baseReleaseId":    baseReleaseID,
+		"createdAt":        releaseTime.Format(time.RFC3339),
+		"releaseRetention": releaseKeepCount,
+		"services":         serviceOrder,
+		"changedServices":  []string{artifact.ServiceName},
+		"artifacts": map[string]any{
+			artifact.ServiceName: map[string]any{
+				"file":   artifact.FileName,
+				"sha256": artifact.SHA256,
+				"size":   artifact.Size,
+			},
+		},
+	}
+}
+
+type artifactInfo struct {
+	ServiceName string
+	FileName    string
+	SHA256      string
+	Size        int64
+}
+
+func (s Service) ValidateArtifactUpdate(req ArtifactUpdateRequest) error {
+	copy := updateCopyFor(req.Language)
+	_, err := artifactInfoFromRequest(req, copy)
+	return err
+}
+
+func (s Service) UpdateArtifact(ctx context.Context, req ArtifactUpdateRequest, log Logger, targetLog targetLogger) error {
+	copy := updateCopyFor(req.Language)
+	target := req.Instance.ServerID
+	if target == "" {
+		target = req.Server.ID
+	}
+	logForServer := logForTarget(log, targetLog, target)
+	recorder, _ := log.(stepRecorder)
+	if recorder != nil {
+		recorder.StartTarget(target)
+	}
+	step := newStepRunner(logForServer, recorder, target, updateSteps(copy), copy.StepStart, copy.StepDone, copy.StepFailed)
+
+	var artifact artifactInfo
+	var metadata map[string]any
+	var installRoot string
+	var version string
+	var releaseTime time.Time
+	var releaseID string
+	var baseReleaseID string
+	var configHash string
+	var workDir string
+	var artifactRemote string
+	var scriptRemote string
+
+	if err := step(1, func() error {
+		var err error
+		artifact, err = artifactInfoFromRequest(req, copy)
+		if err != nil {
+			return err
+		}
+		metadata = metadataFromInstance(req.Instance)
+		installRoot = stringFromMetadata(metadata, "installRoot", installRootFromDeployDir(req.Server.DeployDir))
+		version = stringFromMetadata(metadata, "releaseVersion", req.Instance.Version)
+		if strings.TrimSpace(version) == "" {
+			version = appBundleVersion
+		}
+		baseReleaseID = stringFromMetadata(metadata, "releaseId", "")
+		releaseTime = time.Now().UTC()
+		releaseID = newReleaseID("partial-"+artifact.ServiceName, releaseTime)
+		configHash = partialUpdateConfigHash(stringFromMetadata(metadata, "configHash", ""), artifact.ServiceName, artifact.FileName, artifact.SHA256)
+		deployDir := installerkit.RemoteDeployDir(req.Server.DeployDir)
+		workDir = installerkit.WorkDir(deployDir, AppName+"-"+artifact.ServiceName, version, releaseTime)
+		artifactRemote = workDir + "/" + installerkit.Sanitize(artifact.FileName)
+		scriptRemote = workDir + "/update-aifar-artifact.sh"
+		return nil
+	}); err != nil {
+		msg := fmt.Sprintf(copy.UpdateFailed, err)
+		logForServer.Error("%s", msg)
+		finishTarget(recorder, target, "failed", msg)
+		return err
+	}
+
+	if err := step(2, func() error {
+		logForServer.Info(copy.PrepareWorkDir, workDir)
+		if _, err := installerkit.Run(ctx, s.remote, req.Server, "mkdir -p "+installerkit.ShellQuote(workDir), logForServer, copy.RemoteCommandFailed); err != nil {
+			return err
+		}
+		if err := uploadkit.Upload(ctx, s.remote, req.Server, uploadkit.File{
+			LocalPath:      req.ArtifactLocalPath,
+			RemotePath:     artifactRemote,
+			LogMessage:     copy.UploadArtifact,
+			LogArgs:        []any{artifact.ServiceName, artifact.FileName},
+			FailureMessage: copy.UploadArtifactFailed,
+		}, logForServer); err != nil {
+			return err
+		}
+		script, err := renderUpdateScript(updateScriptData{
+			InstallRoot:      installRoot,
+			WorkDir:          workDir,
+			ServiceOrder:     serviceOrderText(),
+			ServiceName:      artifact.ServiceName,
+			ArtifactRemote:   artifactRemote,
+			ArtifactFileName: artifact.FileName,
+			ArtifactSHA256:   artifact.SHA256,
+			ArtifactSize:     artifact.Size,
+			Version:          version,
+			ReleaseID:        releaseID,
+			CreatedAt:        releaseTime.Format(time.RFC3339),
+			ConfigHash:       configHash,
+			ReleaseKeepCount: releaseKeepCount,
+		})
+		if err != nil {
+			return err
+		}
+		scriptLocal, err := installerkit.WriteTempScript("aifar-service-update-*.sh", script)
+		if err != nil {
+			return err
+		}
+		defer os.Remove(scriptLocal)
+		return uploadkit.Upload(ctx, s.remote, req.Server, uploadkit.File{
+			LocalPath:      scriptLocal,
+			RemotePath:     scriptRemote,
+			Mode:           0o755,
+			LogMessage:     copy.UploadScript,
+			FailureMessage: copy.UploadScriptFailed,
+		}, logForServer)
+	}); err != nil {
+		msg := fmt.Sprintf(copy.UpdateFailed, err)
+		logForServer.Error("%s", msg)
+		finishTarget(recorder, target, "failed", msg)
+		return err
+	}
+
+	if err := step(3, func() error {
+		logForServer.Info(copy.Deploying, artifact.ServiceName)
+		_, err := installerkit.Run(ctx, s.remote, req.Server, "sh "+installerkit.ShellQuote(scriptRemote), logForServer, copy.RemoteCommandFailed)
+		return err
+	}); err != nil {
+		msg := fmt.Sprintf(copy.UpdateFailed, err)
+		logForServer.Error("%s", msg)
+		finishTarget(recorder, target, "failed", msg)
+		return err
+	}
+
+	if err := step(4, func() error {
+		metadata["releaseId"] = releaseID
+		metadata["releasePath"] = installRoot + "/" + releasesDirName + "/" + releaseID
+		metadata["releaseVersion"] = version
+		metadata["releaseCreatedAt"] = releaseTime.Format(time.RFC3339)
+		metadata["configHash"] = configHash
+		metadata["lastPartialUpdate"] = map[string]any{
+			"service":        artifact.ServiceName,
+			"artifactFile":   artifact.FileName,
+			"artifactSHA256": artifact.SHA256,
+			"artifactSize":   artifact.Size,
+			"baseReleaseId":  baseReleaseID,
+			"releaseId":      releaseID,
+			"updatedAt":      releaseTime.Format(time.RFC3339),
+		}
+		data, _ := json.Marshal(metadata)
+		next := req.Instance
+		next.Status = "installed"
+		next.Version = version
+		next.Metadata = string(data)
+		saved, err := s.store.SaveAppInstance(next)
+		if err != nil {
+			return err
+		}
+		if releases, ok := s.store.(releaseStore); ok {
+			manifest, _ := json.Marshal(partialReleaseManifest(version, releaseID, releaseTime, configHash, baseReleaseID, artifact))
+			if _, err := releases.SaveAppRelease(store.AppRelease{
+				InstanceID:   saved.ID,
+				App:          AppName,
+				Version:      version,
+				ReleaseID:    releaseID,
+				ServerID:     target,
+				Status:       "success",
+				ManifestJSON: string(manifest),
+				ConfigHash:   configHash,
+				CreatedAt:    releaseTime,
+				ActivatedAt:  releaseTime,
+			}); err != nil {
+				return err
+			}
+			if _, err := releases.DeleteOldAppReleases(saved.ID, releaseKeepCount); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		msg := fmt.Sprintf(copy.RecordFailed, err)
+		logForServer.Error("%s", msg)
+		finishTarget(recorder, target, "failed", msg)
+		return err
+	}
+
+	logForServer.Info(copy.Updated, releaseID)
+	finishTarget(recorder, target, "success", "")
+	return nil
+}
+
+func artifactInfoFromRequest(req ArtifactUpdateRequest, copy UpdateCopy) (artifactInfo, error) {
+	if req.Instance.App != AppName {
+		return artifactInfo{}, errors.New(copy.UnsupportedInstance)
+	}
+	if strings.TrimSpace(req.Instance.ServerID) == "" && strings.TrimSpace(req.Server.ID) == "" {
+		return artifactInfo{}, errors.New(copy.TargetRequired)
+	}
+	serviceName := cleanAIFARServiceName(req.ServiceName)
+	if !aifarServiceSupported(serviceName) {
+		return artifactInfo{}, fmt.Errorf(copy.UnsupportedService, req.ServiceName)
+	}
+	localPath := strings.TrimSpace(req.ArtifactLocalPath)
+	if localPath == "" {
+		return artifactInfo{}, errors.New(copy.ArtifactRequired)
+	}
+	stat, err := os.Stat(localPath)
+	if err != nil {
+		return artifactInfo{}, err
+	}
+	if stat.IsDir() || stat.Size() == 0 {
+		return artifactInfo{}, errors.New(copy.ArtifactRequired)
+	}
+	fileName := strings.TrimSpace(req.ArtifactFileName)
+	if fileName == "" {
+		fileName = filepath.Base(localPath)
+	}
+	fileName = filepath.Base(fileName)
+	if fileName == "." || fileName == string(filepath.Separator) || strings.TrimSpace(fileName) == "" {
+		return artifactInfo{}, errors.New(copy.ArtifactRequired)
+	}
+	if !artifactTypeAllowed(serviceName, fileName) {
+		return artifactInfo{}, fmt.Errorf(copy.ArtifactTypeInvalid, serviceName)
+	}
+	sum, size, err := fileSHA256(localPath)
+	if err != nil {
+		return artifactInfo{}, err
+	}
+	return artifactInfo{ServiceName: serviceName, FileName: fileName, SHA256: sum, Size: size}, nil
+}
+
+func cleanAIFARServiceName(value string) string {
+	return strings.ToLower(strings.TrimSpace(value))
+}
+
+func aifarServiceSupported(serviceName string) bool {
+	for _, service := range serviceOrder {
+		if service == serviceName {
+			return true
+		}
+	}
+	return false
+}
+
+func artifactTypeAllowed(serviceName, fileName string) bool {
+	name := strings.ToLower(strings.TrimSpace(fileName))
+	if serviceName == "web-vue3" {
+		return strings.HasSuffix(name, ".zip") ||
+			strings.HasSuffix(name, ".tar") ||
+			strings.HasSuffix(name, ".tgz") ||
+			strings.HasSuffix(name, ".tar.gz")
+	}
+	return strings.HasSuffix(name, ".jar")
+}
+
+func fileSHA256(path string) (string, int64, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return "", 0, err
+	}
+	defer file.Close()
+	hash := sha256.New()
+	size, err := io.Copy(hash, file)
+	if err != nil {
+		return "", 0, err
+	}
+	return hex.EncodeToString(hash.Sum(nil)), size, nil
+}
+
 func (s Service) existingAIFARInstanceID(serverID, installRoot string) (string, error) {
 	instances, err := s.store.ListAppInstances()
 	if err != nil {
@@ -528,6 +828,22 @@ type uninstallScriptData struct {
 	ServiceOrder string
 }
 
+type updateScriptData struct {
+	InstallRoot      string
+	WorkDir          string
+	ServiceOrder     string
+	ServiceName      string
+	ArtifactRemote   string
+	ArtifactFileName string
+	ArtifactSHA256   string
+	ArtifactSize     int64
+	Version          string
+	ReleaseID        string
+	CreatedAt        string
+	ConfigHash       string
+	ReleaseKeepCount int
+}
+
 func renderInstallScript(data installScriptData) (string, error) {
 	content, err := templateFS.ReadFile("templates/install.sh")
 	if err != nil {
@@ -544,6 +860,16 @@ func renderUninstallScript(data uninstallScriptData) (string, error) {
 		return "", err
 	}
 	return installerkit.RenderTemplate(AppName, "uninstall.sh", "aifar-uninstall", string(content), template.FuncMap{
+		"quote": shellQuoteAny,
+	}, data)
+}
+
+func renderUpdateScript(data updateScriptData) (string, error) {
+	content, err := templateFS.ReadFile("templates/update-artifact.sh")
+	if err != nil {
+		return "", err
+	}
+	return installerkit.RenderTemplate(AppName, "update-artifact.sh", "aifar-update", string(content), template.FuncMap{
 		"quote": shellQuoteAny,
 	}, data)
 }
@@ -638,5 +964,14 @@ func checkSteps(copy CheckCopy) []installStepDef {
 	return []installStepDef{
 		{Name: "check-runtime", Title: copy.CheckRuntime},
 		{Name: "update-instance", Title: copy.UpdateInstance},
+	}
+}
+
+func updateSteps(copy UpdateCopy) []installStepDef {
+	return []installStepDef{
+		{Name: "validate-artifact", Title: copy.ValidateRequest},
+		{Name: "upload-artifact", Title: copy.UploadArtifactStep},
+		{Name: "apply-update", Title: copy.ApplyUpdate},
+		{Name: "record-release", Title: copy.RecordRelease},
 	}
 }

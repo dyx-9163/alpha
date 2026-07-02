@@ -84,3 +84,14 @@ func installConfigHash(options InstallOptions) string {
 	sum := sha256.Sum256(data)
 	return hex.EncodeToString(sum[:])
 }
+
+func partialUpdateConfigHash(baseHash, serviceName, artifactName, artifactSHA256 string) string {
+	data, _ := json.Marshal(map[string]any{
+		"baseConfigHash": baseHash,
+		"service":        serviceName,
+		"artifact":       artifactName,
+		"artifactSHA256": artifactSHA256,
+	})
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
+}

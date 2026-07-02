@@ -68,7 +68,20 @@
     </div>
 
     <div v-else-if="activeTab === 'installed'" class="table-panel">
-      <AppInstanceTable :instances="instances" :servers="servers" :show-time="false" />
+      <AppInstanceTable
+        :instances="instances"
+        :servers="servers"
+        :show-time="false"
+        show-actions
+        :show-check="false"
+        :show-delete="false"
+        show-update
+        :can-update="canManageApps"
+        :can-update-row="canUpdateArtifact"
+        :update-label="t('apps.updateService')"
+        :disabled-reason="deniedText"
+        @update="openAifarUpdate"
+      />
     </div>
 
     <div v-else-if="activeTab === 'tasks'" class="deployment-records">
@@ -108,15 +121,46 @@
       v-bind="moduleDialogProps"
       @submit="submitModuleInstall"
     />
+
+    <el-dialog v-model="aifarUpdateVisible" :title="t('apps.aifarUpdateTitle')" width="560px" destroy-on-close>
+      <el-form label-width="112px" class="aifar-update-form">
+        <el-form-item :label="t('apps.aifarUpdateInstance')">
+          <el-input :model-value="selectedAifarInstanceLabel" disabled />
+        </el-form-item>
+        <el-form-item :label="t('apps.aifarUpdateService')" required>
+          <el-select v-model="aifarUpdateService" filterable>
+            <el-option v-for="service in aifarServiceOptions" :key="service.value" :label="service.label" :value="service.value" />
+          </el-select>
+        </el-form-item>
+        <el-form-item :label="t('apps.aifarUpdateArtifact')" required>
+          <el-upload
+            :key="aifarUpdateService"
+            :auto-upload="false"
+            :limit="1"
+            :accept="aifarArtifactAccept"
+            :on-change="handleAifarArtifactChange"
+            :on-remove="clearAifarArtifact"
+          >
+            <el-button>{{ t('apps.aifarUpdateChooseArtifact') }}</el-button>
+          </el-upload>
+          <div class="artifact-hint">{{ aifarArtifactHint }}</div>
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="aifarUpdateVisible = false">{{ t('common.cancel') }}</el-button>
+        <el-button type="primary" :loading="aifarUpdateSubmitting" @click="submitAifarUpdate">{{ t('apps.aifarUpdateSubmit') }}</el-button>
+      </template>
+    </el-dialog>
   </PageShell>
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, ref, shallowRef } from 'vue'
+import { computed, onMounted, ref, shallowRef, watch } from 'vue'
 import type { Component } from 'vue'
 import { ElMessage } from 'element-plus'
+import type { UploadFile } from 'element-plus'
 import { useRouter } from 'vue-router'
-import { apiGet, apiPost, asArray } from '../api/client'
+import { apiGet, apiPost, apiPostForm, asArray } from '../api/client'
 import { pairedAppCatalog, type AppCatalogResponse, type AppStoreItem } from '../apps/registry/catalog'
 import { frontendModuleFor } from '../apps/registry/loader'
 import { resolveAppLocale } from '../apps/registry/types'
@@ -141,6 +185,11 @@ const installSubmitting = ref(false)
 const moduleDialogVisible = ref(false)
 const moduleDialogApp = ref<AppStoreItem | null>(null)
 const moduleDialogModule = shallowRef<AppFrontendModule | null>(null)
+const aifarUpdateVisible = ref(false)
+const aifarUpdateSubmitting = ref(false)
+const aifarUpdateInstance = ref<AppInstanceTableRecord | null>(null)
+const aifarUpdateService = ref('oauth')
+const aifarArtifactFile = ref<File | null>(null)
 const locale = computed(() => resolveAppLocale())
 const canManageApps = computed(() => can(permissions.appsManage))
 const canScanResources = computed(() => can(permissions.resourcesScan))
@@ -163,6 +212,27 @@ const moduleDialogProps = computed(() => {
   const { targetServerFilter, ...props } = moduleDialogConfig.value
   return props
 })
+const aifarServiceOptions = [
+  'oauth',
+  'permission',
+  'system',
+  'file',
+  'message',
+  'im',
+  'contacts',
+  'meeting',
+  'gateway',
+  'web-vue3'
+].map((name) => ({ value: name, label: name }))
+const selectedAifarInstanceLabel = computed(() => {
+  const row = aifarUpdateInstance.value
+  if (!row) {
+    return '-'
+  }
+  return `${row.app} / ${row.version} / ${serverLabel(row.serverId)}`
+})
+const aifarArtifactAccept = computed(() => (aifarUpdateService.value === 'web-vue3' ? '.zip,.tar,.tgz,.tar.gz' : '.jar'))
+const aifarArtifactHint = computed(() => (aifarUpdateService.value === 'web-vue3' ? t('apps.aifarUpdateFrontendHint') : t('apps.aifarUpdateJarHint')))
 
 type AppInstanceTableRecord = {
   id: string
@@ -276,9 +346,78 @@ async function checkDeploymentService(row: AppInstanceTableRecord) {
   }
 }
 
+function canUpdateArtifact(row: AppInstanceTableRecord) {
+  return row.app === 'aifar'
+}
+
+function openAifarUpdate(row: AppInstanceTableRecord) {
+  if (!canManageApps.value) {
+    ElMessage.warning(deniedText.value)
+    return
+  }
+  if (!canUpdateArtifact(row)) {
+    return
+  }
+  aifarUpdateInstance.value = row
+  aifarUpdateService.value = 'oauth'
+  aifarArtifactFile.value = null
+  aifarUpdateVisible.value = true
+}
+
+function handleAifarArtifactChange(file: UploadFile) {
+  aifarArtifactFile.value = file.raw ?? null
+}
+
+function clearAifarArtifact() {
+  aifarArtifactFile.value = null
+}
+
+async function submitAifarUpdate() {
+  if (!canManageApps.value) {
+    ElMessage.warning(deniedText.value)
+    return
+  }
+  const instance = aifarUpdateInstance.value
+  if (!instance || !aifarArtifactFile.value) {
+    ElMessage.warning(t('apps.aifarUpdateArtifactRequired'))
+    return
+  }
+  const form = new FormData()
+  form.append('language', locale.value)
+  form.append('service', aifarUpdateService.value)
+  form.append('artifact', aifarArtifactFile.value, aifarArtifactFile.value.name)
+  aifarUpdateSubmitting.value = true
+  try {
+    const result = await apiPostForm<{ taskId: string }>(`/apps/instances/${instance.id}/aifar/update-artifact`, form)
+    aifarUpdateVisible.value = false
+    aifarArtifactFile.value = null
+    openTaskCenter(result.taskId)
+    ElMessage.success(t('apps.aifarUpdateAccepted'))
+  } catch (err) {
+    ElMessage.error(err instanceof Error ? err.message : t('apps.aifarUpdateFailed'))
+  } finally {
+    aifarUpdateSubmitting.value = false
+  }
+}
+
+function serverLabel(serverId?: string) {
+  if (!serverId) {
+    return '-'
+  }
+  const server = servers.value.find((item) => item.id === serverId)
+  if (!server) {
+    return serverId
+  }
+  return server.name && server.host ? `${server.name} (${server.host})` : server.name || server.host || serverId
+}
+
 function openTaskCenter(taskId: string) {
   void router.push({ path: '/tasks', query: { taskId } })
 }
+
+watch(aifarUpdateService, () => {
+  aifarArtifactFile.value = null
+})
 
 onMounted(load)
 </script>
@@ -518,6 +657,19 @@ onMounted(load)
 
 .empty-panel {
   color: var(--aifar-text-secondary);
+}
+
+.aifar-update-form :deep(.el-select),
+.aifar-update-form :deep(.el-input) {
+  width: 100%;
+}
+
+.artifact-hint {
+  width: 100%;
+  margin-top: 6px;
+  color: var(--aifar-text-tertiary);
+  font-size: 12px;
+  line-height: 18px;
 }
 
 @media (max-width: 980px) {

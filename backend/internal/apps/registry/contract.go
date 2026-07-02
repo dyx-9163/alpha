@@ -149,6 +149,16 @@ type CheckRequest struct {
 	Actor    string
 }
 
+type ArtifactUpdateRequest struct {
+	Instance          store.AppInstance
+	Server            store.Server
+	Language          string
+	Actor             string
+	ServiceName       string
+	ArtifactLocalPath string
+	ArtifactFileName  string
+}
+
 type ClusterStartRequest struct {
 	Instances       []store.AppInstance
 	Servers         []store.Server
@@ -201,6 +211,12 @@ type DeleteModule interface {
 type CheckModule interface {
 	PlanCheck(ctx context.Context, req CheckRequest) ([]InstallStepPlan, error)
 	Check(ctx context.Context, req CheckRequest, run RunContext) (InstanceStatus, error)
+}
+
+type ArtifactUpdateModule interface {
+	PlanArtifactUpdate(ctx context.Context, req ArtifactUpdateRequest) ([]InstallStepPlan, error)
+	ValidateArtifactUpdate(ctx context.Context, req ArtifactUpdateRequest) error
+	UpdateArtifact(ctx context.Context, req ArtifactUpdateRequest, run RunContext) error
 }
 
 type ClusterStartModule interface {

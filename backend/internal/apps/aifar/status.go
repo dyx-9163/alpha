@@ -236,6 +236,31 @@ type CheckCopy struct {
 	Checked        string
 }
 
+type UpdateCopy struct {
+	ValidateRequest      string
+	UploadArtifactStep   string
+	ApplyUpdate          string
+	RecordRelease        string
+	StepStart            string
+	StepDone             string
+	StepFailed           string
+	TargetRequired       string
+	UnsupportedInstance  string
+	UnsupportedService   string
+	ArtifactRequired     string
+	ArtifactTypeInvalid  string
+	PrepareWorkDir       string
+	UploadArtifact       string
+	UploadArtifactFailed string
+	UploadScript         string
+	UploadScriptFailed   string
+	Deploying            string
+	RemoteCommandFailed  string
+	UpdateFailed         string
+	RecordFailed         string
+	Updated              string
+}
+
 func copyFor(lang string) Copy {
 	if normalizeLanguage(lang) == "en" {
 		return Copy{
@@ -298,6 +323,59 @@ func copyFor(lang string) Copy {
 		InstallFailed:         "AIFAR 服务安装失败：%v",
 		RecordFailed:          "记录 AIFAR 服务实例失败：%v",
 		Installed:             "AIFAR 服务已安装，实例已记录：%s",
+	}
+}
+
+func updateCopyFor(lang string) UpdateCopy {
+	if normalizeLanguage(lang) == "en" {
+		return UpdateCopy{
+			ValidateRequest:      "validate AIFAR service artifact",
+			UploadArtifactStep:   "upload service artifact",
+			ApplyUpdate:          "create partial release and update service",
+			RecordRelease:        "record partial release",
+			StepStart:            "AIFAR update step %d/%d started: %s",
+			StepDone:             "AIFAR update step %d/%d completed: %s",
+			StepFailed:           "AIFAR update step %d/%d failed: %s: %v",
+			TargetRequired:       "AIFAR service update requires a target server",
+			UnsupportedInstance:  "only AIFAR service instances support artifact updates",
+			UnsupportedService:   "unsupported AIFAR service: %s",
+			ArtifactRequired:     "service artifact file is required",
+			ArtifactTypeInvalid:  "artifact type is invalid for %s",
+			PrepareWorkDir:       "preparing remote update work directory: %s",
+			UploadArtifact:       "uploading %s artifact: %s",
+			UploadArtifactFailed: "upload AIFAR service artifact",
+			UploadScript:         "uploading AIFAR service update script",
+			UploadScriptFailed:   "upload AIFAR service update script",
+			Deploying:            "updating AIFAR service %s as a partial release",
+			RemoteCommandFailed:  "AIFAR partial update remote command failed",
+			UpdateFailed:         "AIFAR service update failed: %v",
+			RecordFailed:         "record AIFAR partial release failed: %v",
+			Updated:              "AIFAR service updated, release recorded: %s",
+		}
+	}
+	return UpdateCopy{
+		ValidateRequest:      "校验 AIFAR 服务制品",
+		UploadArtifactStep:   "上传服务制品",
+		ApplyUpdate:          "创建部分更新版本并更新服务",
+		RecordRelease:        "记录部分更新版本",
+		StepStart:            "AIFAR 更新步骤 %d/%d 开始：%s",
+		StepDone:             "AIFAR 更新步骤 %d/%d 完成：%s",
+		StepFailed:           "AIFAR 更新步骤 %d/%d 失败：%s：%v",
+		TargetRequired:       "AIFAR 服务更新需要目标服务器",
+		UnsupportedInstance:  "只有 AIFAR 服务实例支持制品更新",
+		UnsupportedService:   "不支持的 AIFAR 服务：%s",
+		ArtifactRequired:     "请选择服务制品文件",
+		ArtifactTypeInvalid:  "%s 的制品类型不正确",
+		PrepareWorkDir:       "准备远程更新工作目录：%s",
+		UploadArtifact:       "上传 %s 制品：%s",
+		UploadArtifactFailed: "上传 AIFAR 服务制品失败",
+		UploadScript:         "上传 AIFAR 服务更新脚本",
+		UploadScriptFailed:   "上传 AIFAR 服务更新脚本失败",
+		Deploying:            "正在以部分版本更新 AIFAR 服务 %s",
+		RemoteCommandFailed:  "AIFAR 部分更新远程命令执行失败",
+		UpdateFailed:         "AIFAR 服务更新失败：%v",
+		RecordFailed:         "记录 AIFAR 部分更新版本失败：%v",
+		Updated:              "AIFAR 服务已更新，版本已记录：%s",
 	}
 }
 

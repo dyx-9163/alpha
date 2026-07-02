@@ -11,9 +11,14 @@
     </template>
     <template v-if="showActions" #actions="{ row }">
       <div class="instance-actions">
-        <el-tooltip :content="props.disabledReason" :disabled="props.canCheck || !props.disabledReason" placement="top">
+        <el-tooltip v-if="props.showCheck" :content="props.disabledReason" :disabled="props.canCheck || !props.disabledReason" placement="top">
           <span>
             <el-button size="small" plain :disabled="!props.canCheck" @click="emitCheck(row)">{{ t('common.check') }}</el-button>
+          </span>
+        </el-tooltip>
+        <el-tooltip v-if="props.showUpdate && rowUpdateable(row)" :content="props.disabledReason" :disabled="props.canUpdate || !props.disabledReason" placement="top">
+          <span>
+            <el-button size="small" type="primary" plain :disabled="!props.canUpdate" @click="emitUpdate(row)">{{ props.updateLabel || t('common.update') }}</el-button>
           </span>
         </el-tooltip>
         <el-tooltip v-if="props.showDelete" :content="props.disabledReason" :disabled="props.canDelete || !props.disabledReason" placement="top">
@@ -63,25 +68,35 @@ const props = withDefaults(defineProps<{
   rowKey?: string
   height?: string | number
   showActions?: boolean
+  showCheck?: boolean
   showDelete?: boolean
+  showUpdate?: boolean
   showTime?: boolean
   canCheck?: boolean
   canDelete?: boolean
+  canUpdate?: boolean
+  updateLabel?: string
+  canUpdateRow?: (row: AppInstanceTableRecord) => boolean
   disabledReason?: string
 }>(), {
   servers: () => [],
   rowKey: 'id',
   height: '100%',
+  showCheck: true,
   showDelete: true,
+  showUpdate: false,
   showTime: true,
   canCheck: true,
   canDelete: true,
+  canUpdate: true,
+  updateLabel: '',
   disabledReason: ''
 })
 
 const emit = defineEmits<{
   check: [row: AppInstanceTableRecord]
   delete: [row: AppInstanceTableRecord]
+  update: [row: AppInstanceTableRecord]
 }>()
 
 const { t } = useI18n()
@@ -99,7 +114,7 @@ const columns = computed(() => {
     base.push({ prop: 'createdAt', label: t('common.time'), minWidth: 180, slot: 'time' })
   }
   if (props.showActions) {
-    base.push({ label: t('common.operation'), width: 220, fixed: 'right', slot: 'actions', showOverflowTooltip: false })
+    base.push({ label: t('common.operation'), width: props.showUpdate ? 300 : 220, fixed: 'right', slot: 'actions', showOverflowTooltip: false })
   }
   return base
 })
@@ -120,6 +135,18 @@ function emitDelete(row: Record<string, unknown>) {
     return
   }
   emit('delete', asInstance(row))
+}
+
+function emitUpdate(row: Record<string, unknown>) {
+  if (!props.canUpdate || !rowUpdateable(row)) {
+    return
+  }
+  emit('update', asInstance(row))
+}
+
+function rowUpdateable(row: Record<string, unknown>) {
+  const instance = asInstance(row)
+  return props.canUpdateRow ? props.canUpdateRow(instance) : true
 }
 
 function serverLabel(serverId?: string) {
