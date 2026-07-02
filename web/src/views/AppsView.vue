@@ -127,14 +127,20 @@
         <el-form-item :label="t('apps.aifarUpdateInstance')">
           <el-input :model-value="selectedAifarInstanceLabel" disabled />
         </el-form-item>
-        <el-form-item :label="t('apps.aifarUpdateService')" required>
+        <el-form-item :label="t('apps.aifarUpdateMode')" required>
+          <el-radio-group v-model="aifarUpdateMode">
+            <el-radio-button label="single">{{ t('apps.aifarUpdateSingleMode') }}</el-radio-button>
+            <el-radio-button label="bundle">{{ t('apps.aifarUpdateBundleMode') }}</el-radio-button>
+          </el-radio-group>
+        </el-form-item>
+        <el-form-item v-if="aifarUpdateMode === 'single'" :label="t('apps.aifarUpdateService')" required>
           <el-select v-model="aifarUpdateService" filterable>
             <el-option v-for="service in aifarServiceOptions" :key="service.value" :label="service.label" :value="service.value" />
           </el-select>
         </el-form-item>
         <el-form-item :label="t('apps.aifarUpdateArtifact')" required>
           <el-upload
-            :key="aifarUpdateService"
+            :key="`${aifarUpdateMode}-${aifarUpdateService}`"
             :auto-upload="false"
             :limit="1"
             :accept="aifarArtifactAccept"
@@ -188,6 +194,7 @@ const moduleDialogModule = shallowRef<AppFrontendModule | null>(null)
 const aifarUpdateVisible = ref(false)
 const aifarUpdateSubmitting = ref(false)
 const aifarUpdateInstance = ref<AppInstanceTableRecord | null>(null)
+const aifarUpdateMode = ref<'single' | 'bundle'>('single')
 const aifarUpdateService = ref('oauth')
 const aifarArtifactFile = ref<File | null>(null)
 const locale = computed(() => resolveAppLocale())
@@ -231,8 +238,18 @@ const selectedAifarInstanceLabel = computed(() => {
   }
   return `${row.app} / ${row.version} / ${serverLabel(row.serverId)}`
 })
-const aifarArtifactAccept = computed(() => (aifarUpdateService.value === 'web-vue3' ? '.zip,.tar,.tgz,.tar.gz' : '.jar'))
-const aifarArtifactHint = computed(() => (aifarUpdateService.value === 'web-vue3' ? t('apps.aifarUpdateFrontendHint') : t('apps.aifarUpdateJarHint')))
+const aifarArtifactAccept = computed(() => {
+  if (aifarUpdateMode.value === 'bundle') {
+    return '.zip'
+  }
+  return aifarUpdateService.value === 'web-vue3' ? '.zip,.tar,.tgz,.tar.gz' : '.jar'
+})
+const aifarArtifactHint = computed(() => {
+  if (aifarUpdateMode.value === 'bundle') {
+    return t('apps.aifarUpdateBundleHint')
+  }
+  return aifarUpdateService.value === 'web-vue3' ? t('apps.aifarUpdateFrontendHint') : t('apps.aifarUpdateJarHint')
+})
 
 type AppInstanceTableRecord = {
   id: string
@@ -359,6 +376,7 @@ function openAifarUpdate(row: AppInstanceTableRecord) {
     return
   }
   aifarUpdateInstance.value = row
+  aifarUpdateMode.value = 'single'
   aifarUpdateService.value = 'oauth'
   aifarArtifactFile.value = null
   aifarUpdateVisible.value = true
@@ -384,11 +402,18 @@ async function submitAifarUpdate() {
   }
   const form = new FormData()
   form.append('language', locale.value)
-  form.append('service', aifarUpdateService.value)
-  form.append('artifact', aifarArtifactFile.value, aifarArtifactFile.value.name)
+  if (aifarUpdateMode.value === 'bundle') {
+    form.append('bundle', aifarArtifactFile.value, aifarArtifactFile.value.name)
+  } else {
+    form.append('service', aifarUpdateService.value)
+    form.append('artifact', aifarArtifactFile.value, aifarArtifactFile.value.name)
+  }
   aifarUpdateSubmitting.value = true
   try {
-    const result = await apiPostForm<{ taskId: string }>(`/apps/instances/${instance.id}/aifar/update-artifact`, form)
+    const endpoint = aifarUpdateMode.value === 'bundle'
+      ? `/apps/instances/${instance.id}/aifar/update-artifact-bundle`
+      : `/apps/instances/${instance.id}/aifar/update-artifact`
+    const result = await apiPostForm<{ taskId: string }>(endpoint, form)
     aifarUpdateVisible.value = false
     aifarArtifactFile.value = null
     openTaskCenter(result.taskId)
@@ -415,7 +440,7 @@ function openTaskCenter(taskId: string) {
   void router.push({ path: '/tasks', query: { taskId } })
 }
 
-watch(aifarUpdateService, () => {
+watch([aifarUpdateService, aifarUpdateMode], () => {
   aifarArtifactFile.value = null
 })
 

@@ -29,6 +29,7 @@ type Remote = installerkit.Remote
 
 type Store interface {
 	GetServer(id string, includeSecret bool) (store.Server, error)
+	GetAppInstance(id string) (store.AppInstance, error)
 	ListAppInstances() ([]store.AppInstance, error)
 	SaveAppInstance(v store.AppInstance) (store.AppInstance, error)
 	DeleteAppInstance(id string) error
@@ -67,6 +68,15 @@ type ArtifactUpdateRequest struct {
 	ServiceName       string
 	ArtifactLocalPath string
 	ArtifactFileName  string
+}
+
+type ArtifactBundleUpdateRequest struct {
+	Instance        store.AppInstance
+	Server          store.Server
+	Language        string
+	Actor           string
+	BundleLocalPath string
+	BundleFileName  string
 }
 
 type CheckResult struct {

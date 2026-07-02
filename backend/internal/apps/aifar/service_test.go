@@ -2,8 +2,12 @@ package aifar
 
 import (
 	"archive/tar"
+	"archive/zip"
 	"compress/gzip"
 	"context"
+	"crypto/sha256"
+	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"os"
@@ -37,6 +41,17 @@ func (f *fakeStore) ListAppInstances() ([]store.AppInstance, error) {
 	out := make([]store.AppInstance, len(f.instances))
 	copy(out, f.instances)
 	return out, nil
+}
+
+func (f *fakeStore) GetAppInstance(id string) (store.AppInstance, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, instance := range f.instances {
+		if instance.ID == id {
+			return instance, nil
+		}
+	}
+	return store.AppInstance{}, sql.ErrNoRows
 }
 
 func (f *fakeStore) SaveAppInstance(v store.AppInstance) (store.AppInstance, error) {
@@ -171,6 +186,96 @@ type fakeLogger struct{}
 
 func (fakeLogger) Info(format string, args ...any)  {}
 func (fakeLogger) Error(format string, args ...any) {}
+
+type bundleTestArtifact struct {
+	Service  string
+	Module   string
+	FileName string
+	Content  string
+}
+
+func installedAIFARInstance(t *testing.T) store.AppInstance {
+	t.Helper()
+	return store.AppInstance{
+		ID:       "aifar-1",
+		App:      "aifar",
+		Version:  "docker-apps",
+		ServerID: "srv-1",
+		Status:   "installed",
+		Topology: defaultTopology,
+		Metadata: mustMetadata(t, map[string]any{
+			"installRoot":      "/aifar/apps/admin",
+			"layout":           releaseLayout,
+			"releaseId":        "20260701T010203.000000000Z-docker-apps",
+			"releaseVersion":   "docker-apps",
+			"releasePath":      "/aifar/apps/admin/releases/20260701T010203.000000000Z-docker-apps",
+			"currentRelease":   "/aifar/apps/admin/current",
+			"configHash":       "base-config-hash",
+			"releaseRetention": releaseKeepCount,
+			"services":         serviceOrder,
+		}),
+	}
+}
+
+func writeAlphaJarBundle(t *testing.T, artifacts []bundleTestArtifact) string {
+	t.Helper()
+	dir := t.TempDir()
+	bundlePath := filepath.Join(dir, "aifar-alpha-jars-test.zip")
+	file, err := os.Create(bundlePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	zipWriter := zip.NewWriter(file)
+	manifestServices := make([]map[string]any, 0, len(artifacts))
+	for _, artifact := range artifacts {
+		rel := pathJoinSlash("artifacts", artifact.Service, artifact.FileName)
+		writer, err := zipWriter.Create(rel)
+		if err != nil {
+			t.Fatal(err)
+		}
+		content := []byte(artifact.Content)
+		if _, err := writer.Write(content); err != nil {
+			t.Fatal(err)
+		}
+		sum := sha256.Sum256(content)
+		manifestServices = append(manifestServices, map[string]any{
+			"service":  artifact.Service,
+			"module":   artifact.Module,
+			"artifact": rel,
+			"fileName": artifact.FileName,
+			"sha256":   hex.EncodeToString(sum[:]),
+			"size":     len(content),
+		})
+	}
+	manifest := map[string]any{
+		"schema":   artifactBundleSchema,
+		"app":      AppName,
+		"kind":     "alpha-java-cloud-jars",
+		"services": manifestServices,
+	}
+	manifestData, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writer, err := zipWriter.Create(artifactBundleManifestName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writer.Write(manifestData); err != nil {
+		t.Fatal(err)
+	}
+	if err := zipWriter.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return bundlePath
+}
+
+func pathJoinSlash(parts ...string) string {
+	return strings.Join(parts, "/")
+}
 
 func TestOptionsDefaultsUseRequestedAIFARValues(t *testing.T) {
 	opts := optionsFromParameters(nil)
@@ -505,6 +610,97 @@ func TestServiceUpdatesAIFARServiceArtifactAsPartialRelease(t *testing.T) {
 	}
 	if !strings.Contains(s.releases[0].ManifestJSON, `"kind":"partial"`) || !strings.Contains(s.releases[0].ManifestJSON, `"changedServices":["oauth"]`) {
 		t.Fatalf("expected partial release manifest, got %s", s.releases[0].ManifestJSON)
+	}
+}
+
+func TestServiceUpdatesAIFARArtifactBundleAsPartialReleases(t *testing.T) {
+	bundlePath := writeAlphaJarBundle(t, []bundleTestArtifact{
+		{Service: "oauth", Module: "alpha-oauth", FileName: "alpha-oauth.jar", Content: "new oauth jar"},
+		{Service: "gateway", Module: "alpha-gateway", FileName: "alpha-gateway.jar", Content: "new gateway jar"},
+	})
+	instance := installedAIFARInstance(t)
+	s := &fakeStore{
+		servers: map[string]store.Server{
+			"srv-1": {ID: "srv-1", Name: "app-1", Host: "10.0.0.10", DeployDir: "/aifar/apps"},
+		},
+		instances: []store.AppInstance{instance},
+	}
+	remote := &fakeRemote{}
+	service := NewService(s, remote)
+	err := service.UpdateArtifactBundle(context.Background(), ArtifactBundleUpdateRequest{
+		Instance:        instance,
+		Server:          s.servers["srv-1"],
+		Language:        "en",
+		BundleLocalPath: bundlePath,
+		BundleFileName:  filepath.Base(bundlePath),
+	}, fakeLogger{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	uploads := remote.joinedUploads()
+	if !strings.Contains(uploads, "alpha-oauth.jar") || !strings.Contains(uploads, "alpha-gateway.jar") {
+		t.Fatalf("expected both service jars to be uploaded, uploads=%s", uploads)
+	}
+	if count := strings.Count(remote.joinedCommands(), "update-aifar-artifact.sh"); count != 2 {
+		t.Fatalf("expected two update script runs, commands=%s", remote.joinedCommands())
+	}
+	if len(s.releases) != 2 {
+		t.Fatalf("expected two partial releases, got %+v", s.releases)
+	}
+	if !strings.Contains(s.releases[0].ManifestJSON, `"changedServices":["oauth"]`) ||
+		!strings.Contains(s.releases[1].ManifestJSON, `"changedServices":["gateway"]`) {
+		t.Fatalf("expected per-service release manifests, got %+v", s.releases)
+	}
+	var metadata map[string]any
+	if err := json.Unmarshal([]byte(s.instances[0].Metadata), &metadata); err != nil {
+		t.Fatal(err)
+	}
+	lastUpdate, ok := metadata["lastPartialUpdate"].(map[string]any)
+	if !ok || lastUpdate["service"] != "gateway" || lastUpdate["artifactFile"] != "alpha-gateway.jar" {
+		t.Fatalf("expected final metadata to point at gateway update, got %s", s.instances[0].Metadata)
+	}
+}
+
+func TestModulePlansArtifactBundleUpdateWithServicePrefixedSteps(t *testing.T) {
+	bundlePath := writeAlphaJarBundle(t, []bundleTestArtifact{
+		{Service: "oauth", Module: "alpha-oauth", FileName: "alpha-oauth.jar", Content: "new oauth jar"},
+		{Service: "gateway", Module: "alpha-gateway", FileName: "alpha-gateway.jar", Content: "new gateway jar"},
+	})
+	instance := installedAIFARInstance(t)
+	s := &fakeStore{
+		servers: map[string]store.Server{
+			"srv-1": {ID: "srv-1", Name: "app-1", Host: "10.0.0.10", DeployDir: "/aifar/apps"},
+		},
+		instances: []store.AppInstance{instance},
+	}
+	module := NewModule(s, &fakeRemote{})
+	plan, err := module.PlanArtifactBundleUpdate(context.Background(), registry.ArtifactBundleUpdateRequest{
+		Instance:        instance,
+		Server:          s.servers["srv-1"],
+		Language:        "en",
+		BundleLocalPath: bundlePath,
+		BundleFileName:  filepath.Base(bundlePath),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan) != 8 {
+		t.Fatalf("expected 8 planned steps, got %+v", plan)
+	}
+	wantNames := []string{
+		"oauth-validate-artifact",
+		"oauth-upload-artifact",
+		"oauth-apply-update",
+		"oauth-record-release",
+		"gateway-validate-artifact",
+		"gateway-upload-artifact",
+		"gateway-apply-update",
+		"gateway-record-release",
+	}
+	for idx, want := range wantNames {
+		if plan[idx].Name != want || plan[idx].Order != idx+1 {
+			t.Fatalf("unexpected plan step %d: %+v", idx, plan[idx])
+		}
 	}
 }
 

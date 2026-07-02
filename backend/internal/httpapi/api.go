@@ -89,6 +89,7 @@ func New(cfg config.Config, s *store.Store, tasks *worker.Manager) *API {
 			r.Post("/apps/instances/batch-delete", api.requirePermission(rbac.AppsManage, api.deleteAppInstances))
 			r.Post("/apps/instances/{id}/check", api.requirePermission(rbac.AppsManage, api.checkAppInstance))
 			r.Post("/apps/instances/{id}/aifar/update-artifact", api.requirePermission(rbac.AppsManage, api.updateAppInstanceArtifact))
+			r.Post("/apps/instances/{id}/aifar/update-artifact-bundle", api.requirePermission(rbac.AppsManage, api.updateAppInstanceArtifactBundle))
 			r.Post("/apps/instances/{id}/delete", api.requirePermission(rbac.AppsManage, api.deleteAppInstance))
 			r.Post("/apps/instances/{id}/uninstall", api.requirePermission(rbac.AppsManage, api.deleteAppInstance))
 			r.Get("/credentials", api.requirePermission(rbac.CredentialsUse, api.listCredentials))

@@ -497,3 +497,5 @@
 - 结论：新增 `scripts/export-alpha-jars.ps1`，默认扫描 alpha Java Cloud 的 Maven/Gradle jar 输出，按 oauth/permission/system/file/message/im/contacts/meeting/gateway 映射复制到 `artifacts/<service>/alpha-*.jar`，生成 `manifest.json` 和 zip；该包格式为后续平台批量导入入口准备。
 - 问题：用户运行 `export-alpha-jars.ps1` 时被 Windows PowerShell 执行策略拦截。
 - 结论：可用一次性 `powershell.exe -NoProfile -ExecutionPolicy Bypass -File ...` 绕过；已新增 `scripts/export-alpha-jars.cmd` 包装脚本，直接调用同名 ps1 并携带 `ExecutionPolicy Bypass`。
+- 问题：用户确认调整部署工具，希望导出的 AIFAR/alpha JAR 批量包可直接上传平台并自动按服务更新、备份和回滚。
+- 结论：新增 AIFAR 制品批量包更新入口，接受 `aifar-alpha-jars-*.zip`，读取 `manifest.json` 后按服务串行复用现有 partial release 更新链路；每个服务仍生成可回滚的 release 记录，任务步骤按服务名前缀区分，前端更新弹窗新增“单服务/批量包”模式。

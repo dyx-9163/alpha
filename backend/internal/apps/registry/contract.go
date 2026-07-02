@@ -159,6 +159,15 @@ type ArtifactUpdateRequest struct {
 	ArtifactFileName  string
 }
 
+type ArtifactBundleUpdateRequest struct {
+	Instance        store.AppInstance
+	Server          store.Server
+	Language        string
+	Actor           string
+	BundleLocalPath string
+	BundleFileName  string
+}
+
 type ClusterStartRequest struct {
 	Instances       []store.AppInstance
 	Servers         []store.Server
@@ -217,6 +226,12 @@ type ArtifactUpdateModule interface {
 	PlanArtifactUpdate(ctx context.Context, req ArtifactUpdateRequest) ([]InstallStepPlan, error)
 	ValidateArtifactUpdate(ctx context.Context, req ArtifactUpdateRequest) error
 	UpdateArtifact(ctx context.Context, req ArtifactUpdateRequest, run RunContext) error
+}
+
+type ArtifactBundleUpdateModule interface {
+	PlanArtifactBundleUpdate(ctx context.Context, req ArtifactBundleUpdateRequest) ([]InstallStepPlan, error)
+	ValidateArtifactBundleUpdate(ctx context.Context, req ArtifactBundleUpdateRequest) error
+	UpdateArtifactBundle(ctx context.Context, req ArtifactBundleUpdateRequest, run RunContext) error
 }
 
 type ClusterStartModule interface {

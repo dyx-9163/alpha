@@ -240,6 +240,73 @@ func (m Module) UpdateArtifact(ctx context.Context, req registry.ArtifactUpdateR
 	})
 }
 
+func (m Module) PlanArtifactBundleUpdate(ctx context.Context, req registry.ArtifactBundleUpdateRequest) ([]registry.InstallStepPlan, error) {
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	copy := updateCopyFor(req.Language)
+	items, cleanup, err := m.service.artifactBundleItemsFromRequest(ArtifactBundleUpdateRequest{
+		Instance:        req.Instance,
+		Server:          req.Server,
+		Language:        req.Language,
+		Actor:           req.Actor,
+		BundleLocalPath: req.BundleLocalPath,
+		BundleFileName:  req.BundleFileName,
+	}, copy, false)
+	if cleanup != nil {
+		defer cleanup()
+	}
+	if err != nil {
+		return nil, err
+	}
+	target := req.Instance.ServerID
+	if target == "" {
+		target = req.Server.ID
+	}
+	steps := updateSteps(copy)
+	plan := make([]registry.InstallStepPlan, 0, len(items)*len(steps))
+	order := 1
+	for _, item := range items {
+		for _, step := range steps {
+			plan = append(plan, registry.InstallStepPlan{
+				Target: target,
+				Name:   prefixedUpdateStepName(item.ServiceName, step.Name),
+				Title:  prefixedUpdateStepTitle(item.ServiceName, step.Title),
+				Order:  order,
+			})
+			order++
+		}
+	}
+	return plan, nil
+}
+
+func (m Module) ValidateArtifactBundleUpdate(ctx context.Context, req registry.ArtifactBundleUpdateRequest) error {
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	return m.service.ValidateArtifactBundleUpdate(ArtifactBundleUpdateRequest{
+		Instance:        req.Instance,
+		Server:          req.Server,
+		Language:        req.Language,
+		Actor:           req.Actor,
+		BundleLocalPath: req.BundleLocalPath,
+		BundleFileName:  req.BundleFileName,
+	})
+}
+
+func (m Module) UpdateArtifactBundle(ctx context.Context, req registry.ArtifactBundleUpdateRequest, run registry.RunContext) error {
+	return m.service.UpdateArtifactBundle(ctx, ArtifactBundleUpdateRequest{
+		Instance:        req.Instance,
+		Server:          req.Server,
+		Language:        req.Language,
+		Actor:           req.Actor,
+		BundleLocalPath: req.BundleLocalPath,
+		BundleFileName:  req.BundleFileName,
+	}, run.Log, func(target string) Logger {
+		return run.LoggerForTarget(target)
+	})
+}
+
 func firstTarget(req registry.InstallRequest) string {
 	targets := req.TargetServerIDs()
 	if len(targets) == 0 {
