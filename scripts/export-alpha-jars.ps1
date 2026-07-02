@@ -198,7 +198,9 @@ $manifest = [ordered]@{
 }
 
 $manifestPath = Join-Path $packageDir "manifest.json"
-$manifest | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $manifestPath -Encoding UTF8
+$manifestJson = $manifest | ConvertTo-Json -Depth 8
+$utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+[System.IO.File]::WriteAllText($manifestPath, $manifestJson, $utf8NoBom)
 
 if (-not $NoZip) {
   $zipPath = Join-Path $OutputRoot "$packageName.zip"

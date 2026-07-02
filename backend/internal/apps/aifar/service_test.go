@@ -219,6 +219,11 @@ func installedAIFARInstance(t *testing.T) store.AppInstance {
 
 func writeAlphaJarBundle(t *testing.T, artifacts []bundleTestArtifact) string {
 	t.Helper()
+	return writeAlphaJarBundleWithManifestPrefix(t, artifacts, nil)
+}
+
+func writeAlphaJarBundleWithManifestPrefix(t *testing.T, artifacts []bundleTestArtifact, manifestPrefix []byte) string {
+	t.Helper()
 	dir := t.TempDir()
 	bundlePath := filepath.Join(dir, "aifar-alpha-jars-test.zip")
 	file, err := os.Create(bundlePath)
@@ -256,6 +261,9 @@ func writeAlphaJarBundle(t *testing.T, artifacts []bundleTestArtifact) string {
 	manifestData, err := json.Marshal(manifest)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if len(manifestPrefix) > 0 {
+		manifestData = append(append([]byte{}, manifestPrefix...), manifestData...)
 	}
 	writer, err := zipWriter.Create(artifactBundleManifestName)
 	if err != nil {
@@ -658,6 +666,23 @@ func TestServiceUpdatesAIFARArtifactBundleAsPartialReleases(t *testing.T) {
 	lastUpdate, ok := metadata["lastPartialUpdate"].(map[string]any)
 	if !ok || lastUpdate["service"] != "gateway" || lastUpdate["artifactFile"] != "alpha-gateway.jar" {
 		t.Fatalf("expected final metadata to point at gateway update, got %s", s.instances[0].Metadata)
+	}
+}
+
+func TestServiceAcceptsArtifactBundleManifestWithUTF8BOM(t *testing.T) {
+	bundlePath := writeAlphaJarBundleWithManifestPrefix(t, []bundleTestArtifact{
+		{Service: "oauth", Module: "alpha-oauth", FileName: "alpha-oauth.jar", Content: "new oauth jar"},
+	}, []byte{0xEF, 0xBB, 0xBF})
+	service := Service{}
+	err := service.ValidateArtifactBundleUpdate(ArtifactBundleUpdateRequest{
+		Instance:        installedAIFARInstance(t),
+		Server:          store.Server{ID: "srv-1"},
+		Language:        "en",
+		BundleLocalPath: bundlePath,
+		BundleFileName:  filepath.Base(bundlePath),
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
 }
 

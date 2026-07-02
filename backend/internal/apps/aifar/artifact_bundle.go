@@ -2,6 +2,7 @@ package aifar
 
 import (
 	"archive/zip"
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -259,6 +260,7 @@ func readArtifactBundleManifest(file *zip.File) (artifactBundleManifest, error) 
 	if err != nil {
 		return manifest, err
 	}
+	data = bytes.TrimPrefix(data, []byte{0xEF, 0xBB, 0xBF})
 	if err := json.Unmarshal(data, &manifest); err != nil {
 		return manifest, err
 	}

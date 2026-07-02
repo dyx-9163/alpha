@@ -503,3 +503,5 @@
 - 结论：批量 JAR zip 可能超过原 512MiB 请求体限制或后端未重启导致连接中断；默认 `AIFAR_MAX_REQUEST_BODY_BYTES` 提升到 2GiB，前端提交前按 `/settings` 实际限制检查文件大小，浏览器网络错误改为中文排查提示，后端 multipart 超限返回结构化 413。
 - 问题：用户上传 AIFAR 批量 JAR 包时页面提示 `2239.2 GiB` 超过 `2048.0 GiB` 限制。
 - 结论：前端文件大小展示少了 KiB 单位层导致数值被放大 1024 倍，已修正为 B/KiB/MiB/GiB/TiB；批量包实际约 2.2 GiB，默认 `AIFAR_MAX_REQUEST_BODY_BYTES` 提升到 4 GiB，需重启后端或更新运行环境变量后生效。
+- 问题：用户上传 `scripts/export-alpha-jars.ps1` 导出的批量包时报 `manifest` JSON 开头非法字符。
+- 结论：Windows PowerShell 5.1 的 `Set-Content -Encoding UTF8` 会给 `manifest.json` 写入 UTF-8 BOM，Go JSON 解析器拒绝该前缀；已改导出脚本写无 BOM JSON，同时后端读取 manifest 时兼容已有带 BOM 的旧包。
