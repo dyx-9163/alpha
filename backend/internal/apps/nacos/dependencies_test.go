@@ -23,6 +23,13 @@ func (s *dependencyStore) ListAppInstances() ([]store.AppInstance, error) {
 }
 
 func (s *dependencyStore) SaveAppInstance(v store.AppInstance) (store.AppInstance, error) {
+	for i := range s.instances {
+		if s.instances[i].ID == v.ID {
+			s.instances[i] = v
+			return v, nil
+		}
+	}
+	s.instances = append(s.instances, v)
 	return v, nil
 }
 
@@ -77,6 +84,41 @@ func TestResolveNacosDatabaseDependencyUsesMySQLRouter(t *testing.T) {
 	}
 	if err := resolved.Validate(); err != nil {
 		t.Fatalf("resolved options should validate: %v", err)
+	}
+}
+
+func TestMarkInstanceStatusRunningClearsInstallFailureMetadata(t *testing.T) {
+	instance := store.AppInstance{
+		ID:     "nacos-1",
+		App:    "nacos",
+		Status: "failed",
+		Metadata: nacosTestMetadata(t, map[string]any{
+			"installFailed": true,
+			"failedAt":      "2026-07-01T01:02:03Z",
+			"taskId":        "task-1",
+			"error":         "old failure",
+			"port":          8848,
+		}),
+	}
+	s := &dependencyStore{instances: []store.AppInstance{instance}}
+	service := NewService(s, nil)
+	if err := service.markInstanceStatus(instance, "running", map[string]any{"checkedAt": "2026-07-02T01:02:03Z"}); err != nil {
+		t.Fatalf("markInstanceStatus returned error: %v", err)
+	}
+	if len(s.instances) != 1 || s.instances[0].Status != "running" {
+		t.Fatalf("expected saved running instance, got %+v", s.instances)
+	}
+	var metadata map[string]any
+	if err := json.Unmarshal([]byte(s.instances[0].Metadata), &metadata); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"installFailed", "failedAt", "taskId", "error"} {
+		if _, ok := metadata[key]; ok {
+			t.Fatalf("expected %s to be cleared after successful check, got %s", key, s.instances[0].Metadata)
+		}
+	}
+	if _, ok := metadata["lastCheck"].(map[string]any); !ok {
+		t.Fatalf("expected lastCheck metadata, got %s", s.instances[0].Metadata)
 	}
 }
 

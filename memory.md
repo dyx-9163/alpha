@@ -489,3 +489,5 @@
 - 结论：新增 AIFAR 制品更新任务入口，支持在已安装 AIFAR 实例上选择服务并上传 Java `.jar` 或前端 zip/tar/tgz/tar.gz；后端以上一版完整 release 为基线生成 partial release，只重建选中服务，失败时回滚该服务，控制面记录 artifact SHA256、变更服务、release manifest 并保留最近 3 个成功 release；默认请求体上限提高到 512MiB 以支持制品上传。验证通过：`go test ./internal/apps/aifar ./internal/httpapi`、`pnpm test`、`pnpm web:build`、`pnpm backend:build`、`git diff --check`。
 - 问题：用户要求去掉 AIFAR 安装弹窗中的数据库、Redis、MinIO、初始化 SQL 等业务依赖配置，因为运行配置已固定在 Nacos。
 - 结论：AIFAR 安装弹窗只保留 Docker/Nacos 与部署自身参数；后端安装选项、配置 hash、实例元数据和安装脚本不再读取、校验、记录或预检 MySQL/Redis/MinIO/SQL 初始化参数，归档也排除 `docker-sql`。验证通过：`go test ./internal/apps/aifar`、`pnpm test`、`pnpm web:build`、`git diff --check`。
+- 问题：用户反馈 Nacos 明明可访问但监测显示失败，并指出 AIFAR 单服务制品更新不应复制整个 release 包。
+- 结论：Nacos 检测改为先验证 readiness/端口再使用 systemd 诊断，运行时检测失败写 `unavailable` 而不是安装失败 `failed`，成功检测会清除旧 installFailed 元数据；AIFAR 部分更新改为只复制 compose/env 骨架和目标服务目录，并沿 baseReleaseId 查找服务目录、保护被 partial release 引用的 base release 以支持回滚。

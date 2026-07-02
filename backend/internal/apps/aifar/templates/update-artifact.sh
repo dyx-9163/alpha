@@ -80,6 +80,41 @@ current_release() {
   fi
 }
 
+manifest_value() {
+  file="$1"
+  key="$2"
+  [ -f "$file" ] || return 1
+  sed -n "s/.*\"$key\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" "$file" | head -n 1
+}
+
+release_by_id() {
+  id="$(printf "%s" "$1" | tr -d '\r\n')"
+  [ -n "$id" ] || return 1
+  candidate="$RELEASES_DIR/$id"
+  [ -d "$candidate" ] || return 1
+  printf "%s" "$candidate"
+}
+
+release_for_service() {
+  service="$1"
+  candidate="$2"
+  seen=""
+  while [ -n "$candidate" ] && [ -d "$candidate" ]; do
+    resolved="$(readlink -f "$candidate" 2>/dev/null || printf "%s" "$candidate")"
+    case " $seen " in
+      *" $resolved "*) break ;;
+    esac
+    seen="$seen $resolved"
+    if [ -d "$candidate/docker-apps/$service" ]; then
+      printf "%s" "$candidate"
+      return 0
+    fi
+    base_id="$(manifest_value "$candidate/.aifar/manifest.json" baseReleaseId || true)"
+    candidate="$(release_by_id "$base_id" || true)"
+  done
+  return 1
+}
+
 service_known() {
   for service in $SERVICE_ORDER; do
     [ "$service" = "$SERVICE_NAME" ] && return 0
@@ -94,6 +129,34 @@ verify_artifact() {
     [ "$actual" = "$ARTIFACT_SHA256" ] || fail "artifact SHA256 mismatch: expected $ARTIFACT_SHA256 got $actual"
   else
     echo "warning: sha256sum not found, skip remote artifact checksum verification"
+  fi
+}
+
+copy_file_required() {
+  source="$1"
+  target="$2"
+  [ -f "$source" ] || fail "required release file is missing: $source"
+  mkdir -p "$(dirname "$target")"
+  cp "$source" "$target"
+}
+
+copy_shared_release_files() {
+  source="$1"
+  [ -f "$source/compose.yaml" ] || fail "current AIFAR release compose.yaml is missing"
+  [ -d "$source/env" ] || fail "current AIFAR release env directory is missing"
+  mkdir -p "$RELEASE_DIR" "$ENV_DIR" "$APP_DIR" "$AIFAR_DIR"
+  copy_file_required "$source/compose.yaml" "$RELEASE_DIR/compose.yaml"
+  cp -a "$source/env/." "$ENV_DIR/"
+}
+
+copy_service_release_files() {
+  source="$1"
+  service_dir="$source/docker-apps/$SERVICE_NAME"
+  [ -d "$service_dir" ] || fail "service directory is missing in release chain: $SERVICE_NAME"
+  mkdir -p "$APP_DIR"
+  cp -a "$service_dir" "$APP_DIR/$SERVICE_NAME"
+  if [ ! -f "$ENV_DIR/$SERVICE_NAME.env" ]; then
+    copy_file_required "$source/env/$SERVICE_NAME.env" "$ENV_DIR/$SERVICE_NAME.env"
   fi
 }
 
@@ -312,18 +375,49 @@ write_manifest() {
 MANIFEST
 }
 
+release_chain_ids() {
+  candidate="$1"
+  seen=""
+  while [ -n "$candidate" ] && [ -d "$candidate" ]; do
+    id="$(basename "$candidate")"
+    case " $seen " in
+      *" $id "*) break ;;
+    esac
+    seen="$seen $id"
+    printf "%s\n" "$id"
+    base_id="$(manifest_value "$candidate/.aifar/manifest.json" baseReleaseId || true)"
+    candidate="$(release_by_id "$base_id" || true)"
+  done
+}
+
+release_id_protected() {
+  id="$1"
+  for keep_id in $PROTECTED_RELEASE_IDS; do
+    [ "$keep_id" = "$id" ] && return 0
+  done
+  return 1
+}
+
 cleanup_old_releases() {
   [ -d "$RELEASES_DIR" ] || return 0
   current="$(current_release || true)"
+  PROTECTED_RELEASE_IDS=""
+  if [ -n "$current" ]; then
+    PROTECTED_RELEASE_IDS="$(release_chain_ids "$current" || true)"
+  fi
   count=0
   find "$RELEASES_DIR" -mindepth 1 -maxdepth 1 -type d | sort -r | while read -r release_dir; do
     [ -f "$release_dir/.aifar/manifest.json" ] || continue
     grep -q '"status"[[:space:]]*:[[:space:]]*"success"' "$release_dir/.aifar/manifest.json" || continue
     count=$((count + 1))
     if [ "$count" -le "$RELEASE_KEEP_COUNT" ]; then
+      PROTECTED_RELEASE_IDS="$PROTECTED_RELEASE_IDS $(release_chain_ids "$release_dir" || true)"
       continue
     fi
     if [ -n "$current" ] && [ "$(readlink -f "$release_dir" 2>/dev/null || printf "%s" "$release_dir")" = "$current" ]; then
+      continue
+    fi
+    if release_id_protected "$(basename "$release_dir")"; then
       continue
     fi
     rm -rf "$release_dir"
@@ -339,14 +433,15 @@ BASE_RELEASE="$(current_release || true)"
 [ -n "$BASE_RELEASE" ] || fail "current AIFAR release is missing"
 [ -d "$BASE_RELEASE" ] || fail "current AIFAR release directory is missing: $BASE_RELEASE"
 [ -f "$BASE_RELEASE/compose.yaml" ] || fail "current AIFAR release compose.yaml is missing"
-[ -d "$BASE_RELEASE/docker-apps/$SERVICE_NAME" ] || fail "service directory is missing in current release: $SERVICE_NAME"
 BASE_RELEASE_ID="$(basename "$BASE_RELEASE")"
+SERVICE_BASE_RELEASE="$(release_for_service "$SERVICE_NAME" "$BASE_RELEASE" || true)"
+[ -n "$SERVICE_BASE_RELEASE" ] || fail "service directory is missing in current release chain: $SERVICE_NAME"
 
 mkdir -p "$INSTALL_ROOT" "$WORK_DIR" "$RELEASES_DIR"
 rm -rf "$RELEASE_DIR" "$TMP_ARTIFACT_DIR"
-mkdir -p "$RELEASE_DIR"
-cp -a "$BASE_RELEASE/." "$RELEASE_DIR/"
-mkdir -p "$ENV_DIR" "$AIFAR_DIR"
+mkdir -p "$RELEASE_DIR" "$ENV_DIR" "$AIFAR_DIR"
+copy_shared_release_files "$BASE_RELEASE"
+copy_service_release_files "$SERVICE_BASE_RELEASE"
 
 apply_artifact
 retag_selected_service
@@ -355,13 +450,13 @@ ensure_network
 
 if ! start_updated_service; then
   write_manifest "failed" "$BASE_RELEASE_ID"
-  rollback_service "$BASE_RELEASE"
+  rollback_service "$SERVICE_BASE_RELEASE"
   fail "AIFAR service $SERVICE_NAME failed to start in partial release $RELEASE_ID"
 fi
 
 if ! wait_service_ready; then
   write_manifest "failed" "$BASE_RELEASE_ID"
-  rollback_service "$BASE_RELEASE"
+  rollback_service "$SERVICE_BASE_RELEASE"
   fail "AIFAR service $SERVICE_NAME did not become stable in partial release $RELEASE_ID"
 fi
 

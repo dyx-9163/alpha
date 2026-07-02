@@ -273,9 +273,9 @@ func (s Service) Check(ctx context.Context, req CheckRequest, log Logger, target
 	fail := func(err error) (CheckResult, error) {
 		msg := fmt.Sprintf(copy.CheckFailed, err)
 		details["error"] = err.Error()
-		_ = s.markInstanceStatus(req.Instance, "failed", details)
+		_ = s.markInstanceStatus(req.Instance, "unavailable", details)
 		finishTarget(recorder, target, "failed", msg)
-		return CheckResult{Status: "failed", Message: msg, Details: details}, err
+		return CheckResult{Status: "unavailable", Message: msg, Details: details}, err
 	}
 	if err := step(1, "check-runtime", copy.CheckRuntime, func() error {
 		return NewInstaller(s.remote).Check(ctx, req.Server, instancePort(req.Instance), logForServer)
@@ -298,6 +298,12 @@ func (s Service) markInstanceStatus(instance store.AppInstance, status string, d
 	_ = json.Unmarshal([]byte(instance.Metadata), &metadata)
 	if metadata == nil {
 		metadata = map[string]any{}
+	}
+	if status == "running" {
+		delete(metadata, "installFailed")
+		delete(metadata, "failedAt")
+		delete(metadata, "taskId")
+		delete(metadata, "error")
 	}
 	metadata["lastCheck"] = details
 	metadataJSON, _ := json.Marshal(metadata)

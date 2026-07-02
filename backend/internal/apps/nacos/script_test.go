@@ -86,3 +86,22 @@ func TestInstallNacosScriptAllowsLocalClusterStorage(t *testing.T) {
 		t.Fatalf("script should render custom Nacos credentials")
 	}
 }
+
+func TestCheckNacosScriptPrefersReachabilityBeforeSystemd(t *testing.T) {
+	script, err := checkNacosScript(CheckScriptRequest{
+		InstallRoot: "/aifar/apps/nacos",
+		Port:        8848,
+	})
+	if err != nil {
+		t.Fatalf("checkNacosScript returned error: %v", err)
+	}
+	readinessIndex := strings.Index(script, "/nacos/v1/console/health/readiness")
+	portIndex := strings.Index(script, "Nacos port is listening")
+	systemdIndex := strings.Index(script, "systemctl is-active")
+	if readinessIndex < 0 || portIndex < 0 || systemdIndex < 0 {
+		t.Fatalf("check script missing readiness, port, or systemd checks:\n%s", script)
+	}
+	if readinessIndex > systemdIndex || portIndex > systemdIndex {
+		t.Fatalf("check script should verify HTTP/port reachability before systemd status:\n%s", script)
+	}
+}

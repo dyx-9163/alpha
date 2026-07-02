@@ -757,7 +757,7 @@ async function runRealtimeCheck(manual: boolean) {
   }
   const state = await fetchNacosState()
   applyNacosState(state)
-  const rows = state.instances.filter((item) => item.app === 'nacos' && !isInstallFailedInstance(item, metadataOf(item)))
+  const rows = state.instances.filter((item) => item.app === 'nacos')
   if (!rows.length) {
     lastMonitorAt.value = new Date().toLocaleTimeString()
     return
@@ -914,7 +914,7 @@ function isInstallFailedGroup(group: NacosGroup) {
 }
 
 function isInstallFailedInstance(item: AppInstance, metadata: InstanceMetadata) {
-  return item.status === 'failed' || truthyValue(metadata.installFailed)
+  return truthyValue(metadata.installFailed)
 }
 
 function nacosDatabaseSummary(metadata: InstanceMetadata) {
