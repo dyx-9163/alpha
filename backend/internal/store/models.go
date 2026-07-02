@@ -147,6 +147,52 @@ type AppRelease struct {
 	ActivatedAt  time.Time `json:"activatedAt,omitempty"`
 }
 
+type Credential struct {
+	ID             string            `json:"id"`
+	Name           string            `json:"name"`
+	Kind           string            `json:"kind"`
+	Username       string            `json:"username,omitempty"`
+	Endpoint       string            `json:"endpoint,omitempty"`
+	Scope          string            `json:"scope"`
+	Status         string            `json:"status"`
+	App            string            `json:"app,omitempty"`
+	ServerID       string            `json:"serverId,omitempty"`
+	AppInstanceID  string            `json:"appInstanceId,omitempty"`
+	Purpose        string            `json:"purpose,omitempty"`
+	Tags           string            `json:"tags,omitempty"`
+	HasSecret      bool              `json:"hasSecret"`
+	SecretPreview  string            `json:"secretPreview,omitempty"`
+	Secret         map[string]string `json:"-"`
+	CurrentVersion int               `json:"currentVersion"`
+	CreatedBy      string            `json:"createdBy,omitempty"`
+	CreatedAt      time.Time         `json:"createdAt"`
+	UpdatedAt      time.Time         `json:"updatedAt"`
+}
+
+type CredentialVersion struct {
+	ID           string    `json:"id"`
+	CredentialID string    `json:"credentialId"`
+	Version      int       `json:"version"`
+	CreatedBy    string    `json:"createdBy,omitempty"`
+	CreatedAt    time.Time `json:"createdAt"`
+	RetiredAt    time.Time `json:"retiredAt,omitempty"`
+}
+
+type CredentialBinding struct {
+	ID            string    `json:"id"`
+	CredentialID  string    `json:"credentialId"`
+	AppInstanceID string    `json:"appInstanceId"`
+	Purpose       string    `json:"purpose"`
+	ServiceName   string    `json:"serviceName,omitempty"`
+	CreatedAt     time.Time `json:"createdAt"`
+}
+
+type CredentialQuery struct {
+	Kind   string
+	Status string
+	Q      string
+}
+
 type StorageItem struct {
 	ID         string    `json:"id"`
 	InstanceID string    `json:"instanceId"`

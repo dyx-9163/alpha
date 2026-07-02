@@ -9,7 +9,9 @@ export const permissions = {
   appsManage: 'apps.manage',
   containersManage: 'containers.manage',
   databaseManage: 'database.manage',
-  storageManage: 'storage.manage'
+  storageManage: 'storage.manage',
+  credentialsUse: 'credentials.use',
+  credentialsManage: 'credentials.manage'
 } as const
 
 export type Permission = typeof permissions[keyof typeof permissions]
@@ -25,7 +27,8 @@ const rolePermissions: Record<string, Permission[]> = {
     permissions.appsManage,
     permissions.containersManage,
     permissions.databaseManage,
-    permissions.storageManage
+    permissions.storageManage,
+    permissions.credentialsUse
   ],
   viewer: [],
   auditor: []
@@ -36,7 +39,10 @@ export function permissionsForRole(role: string) {
 }
 
 export function normalizePermissions(role: string, granted?: string[]) {
-  const values = Array.isArray(granted) && granted.length ? granted : permissionsForRole(role)
+  const values = [
+    ...permissionsForRole(role),
+    ...(Array.isArray(granted) ? granted : [])
+  ]
   return Array.from(new Set(values.filter((value): value is Permission => isPermission(value))))
 }
 

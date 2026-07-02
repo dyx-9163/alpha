@@ -90,6 +90,11 @@ func New(cfg config.Config, s *store.Store, tasks *worker.Manager) *API {
 			r.Post("/apps/instances/{id}/check", api.requirePermission(rbac.AppsManage, api.checkAppInstance))
 			r.Post("/apps/instances/{id}/delete", api.requirePermission(rbac.AppsManage, api.deleteAppInstance))
 			r.Post("/apps/instances/{id}/uninstall", api.requirePermission(rbac.AppsManage, api.deleteAppInstance))
+			r.Get("/credentials", api.requirePermission(rbac.CredentialsUse, api.listCredentials))
+			r.Post("/credentials", api.requirePermission(rbac.CredentialsManage, api.saveCredential))
+			r.Get("/credentials/{id}", api.requirePermission(rbac.CredentialsUse, api.getCredential))
+			r.Put("/credentials/{id}", api.requirePermission(rbac.CredentialsManage, api.saveCredential))
+			r.Delete("/credentials/{id}", api.requirePermission(rbac.CredentialsManage, api.deleteCredential))
 			r.Get("/containers/summary", api.containerSummary)
 			r.Get("/containers", api.containers)
 			r.Post("/containers/actions", api.requirePermission(rbac.ContainersManage, api.containerBatchAction))
@@ -183,6 +188,26 @@ type deleteAppInstancesRequest struct {
 type containerBatchActionRequest struct {
 	Action string   `json:"action"`
 	IDs    []string `json:"ids"`
+}
+
+type credentialSaveRequest struct {
+	ID            string            `json:"id"`
+	Name          string            `json:"name"`
+	Kind          string            `json:"kind"`
+	Username      string            `json:"username"`
+	Endpoint      string            `json:"endpoint"`
+	Scope         string            `json:"scope"`
+	Status        string            `json:"status"`
+	App           string            `json:"app"`
+	ServerID      string            `json:"serverId"`
+	AppInstanceID string            `json:"appInstanceId"`
+	Purpose       string            `json:"purpose"`
+	Tags          string            `json:"tags"`
+	Secret        map[string]string `json:"secret"`
+	Password      string            `json:"password"`
+	SecretKey     string            `json:"secretKey"`
+	Token         string            `json:"token"`
+	PrivateKey    string            `json:"privateKey"`
 }
 
 type startMySQLClusterRequest struct {

@@ -5,23 +5,25 @@ import "strings"
 type Permission string
 
 const (
-	SettingsManage   Permission = "settings.manage"
-	UsersManage      Permission = "users.manage"
-	ResourcesScan    Permission = "resources.scan"
-	ServersManage    Permission = "servers.manage"
-	TerminalConnect  Permission = "terminal.connect"
-	TasksManage      Permission = "tasks.manage"
-	AuditManage      Permission = "audit.manage"
-	AppsManage       Permission = "apps.manage"
-	ContainersManage Permission = "containers.manage"
-	DatabaseManage   Permission = "database.manage"
-	StorageManage    Permission = "storage.manage"
+	SettingsManage    Permission = "settings.manage"
+	UsersManage       Permission = "users.manage"
+	ResourcesScan     Permission = "resources.scan"
+	ServersManage     Permission = "servers.manage"
+	TerminalConnect   Permission = "terminal.connect"
+	TasksManage       Permission = "tasks.manage"
+	AuditManage       Permission = "audit.manage"
+	AppsManage        Permission = "apps.manage"
+	ContainersManage  Permission = "containers.manage"
+	DatabaseManage    Permission = "database.manage"
+	StorageManage     Permission = "storage.manage"
+	CredentialsUse    Permission = "credentials.use"
+	CredentialsManage Permission = "credentials.manage"
 )
 
 var rolePermissions = map[string]map[Permission]struct{}{
 	"owner":    allPermissions(),
 	"admin":    allPermissions(),
-	"operator": permissionSet(ResourcesScan, ServersManage, TerminalConnect, TasksManage, AppsManage, ContainersManage, DatabaseManage, StorageManage),
+	"operator": permissionSet(ResourcesScan, ServersManage, TerminalConnect, TasksManage, AppsManage, ContainersManage, DatabaseManage, StorageManage, CredentialsUse),
 	"viewer":   permissionSet(),
 	"auditor":  permissionSet(),
 }
@@ -76,6 +78,8 @@ func allPermissions() map[Permission]struct{} {
 		ContainersManage,
 		DatabaseManage,
 		StorageManage,
+		CredentialsUse,
+		CredentialsManage,
 	)
 }
 

@@ -50,6 +50,9 @@ export const nacosMessages = {
     dbHostPlaceholder: '例如 192.168.74.132',
     dbPort: '数据库端口',
     dbName: '数据库名',
+    dbCredential: 'MySQL 凭据',
+    dbCredentialPlaceholder: '可选择凭据中心已有 MySQL 凭据',
+    dbCredentialManual: '手动输入数据库账号',
     dbUser: '数据库用户',
     dbPassword: '数据库密码',
     initDatabase: '初始化 Nacos SQL',
@@ -91,6 +94,9 @@ export const nacosMessages = {
     dbHostPlaceholder: 'For example 192.168.74.132',
     dbPort: 'Database port',
     dbName: 'Database name',
+    dbCredential: 'MySQL credential',
+    dbCredentialPlaceholder: 'Select a MySQL credential from the credential center',
+    dbCredentialManual: 'Enter database account manually',
     dbUser: 'Database user',
     dbPassword: 'Database password',
     initDatabase: 'Initialize Nacos SQL',
@@ -190,13 +196,17 @@ export function nacosInstallDialogProps(locale?: string, context?: AppInstallDia
         visibleWhen: topologyIs('cluster')
       },
       {
-        ...requiredText('dbUser', copy.dbUser, 'root', copy),
+        ...selectField('dbCredentialId', copy.dbCredential, credentialOptions(context, 'mysql', copy.dbCredentialManual), '', copy, copy.dbCredentialPlaceholder, false),
         visibleWhen: topologyIs('cluster')
+      },
+      {
+        ...requiredText('dbUser', copy.dbUser, 'root', copy),
+        visibleWhen: allVisible(topologyIs('cluster'), (values) => !values.dbCredentialId)
       },
       {
         ...requiredText('dbPassword', copy.dbPassword, '', copy),
         type: 'password',
-        visibleWhen: topologyIs('cluster')
+        visibleWhen: allVisible(topologyIs('cluster'), (values) => !values.dbCredentialId)
       },
       {
         name: 'initDatabase',
@@ -247,7 +257,8 @@ function selectField(
   options: AppInstallFieldOption[],
   defaultValue: string | number | boolean,
   copy: ReturnType<typeof nacosCopy>,
-  placeholder?: string
+  placeholder?: string,
+  required = true
 ): AppInstallField {
   return {
     name,
@@ -256,8 +267,8 @@ function selectField(
     options,
     defaultValue,
     placeholder,
-    required: true,
-    validate: (value) => String(value ?? '').trim() ? undefined : copy.textRequired
+    required,
+    validate: required ? (value) => String(value ?? '').trim() ? undefined : copy.textRequired : undefined
   }
 }
 
@@ -295,6 +306,18 @@ function mysqlInstanceOptions(context?: AppInstallDialogContext): AppInstallFiel
       label: dependencyLabel(instance, context, instance.app === 'mysql-router' ? 'MySQL Router' : 'MySQL'),
       value: instance.id
     }))
+}
+
+function credentialOptions(context: AppInstallDialogContext | undefined, kind: string, manualLabel: string): AppInstallFieldOption[] {
+  return [
+    { label: manualLabel, value: '' },
+    ...(context?.credentials ?? [])
+      .filter((credential) => credential.kind === kind && credential.status !== 'retired')
+      .map((credential) => ({
+        label: [credential.name, credential.username, credential.endpoint].filter(Boolean).join(' / '),
+        value: credential.id
+      }))
+  ]
 }
 
 function dependencyLabel(instance: AppInstanceOption, context: AppInstallDialogContext | undefined, prefix: string) {

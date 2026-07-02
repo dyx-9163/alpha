@@ -18,9 +18,20 @@ export interface AppInstanceOption {
   createdAt?: string
 }
 
+export interface CredentialOption {
+  id: string
+  name: string
+  kind: string
+  username?: string
+  endpoint?: string
+  status?: string
+  purpose?: string
+}
+
 export interface AppInstallDialogContext {
   servers: ServerOption[]
   instances: AppInstanceOption[]
+  credentials?: CredentialOption[]
   defaultDeployDir?: string
 }
 

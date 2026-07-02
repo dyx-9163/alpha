@@ -148,6 +148,25 @@ func (s *Store) migrate() error {
 			config_hash text, created_at datetime not null, activated_at datetime
 		)`,
 		`create unique index if not exists app_releases_instance_release on app_releases(instance_id, release_id)`,
+		`create table if not exists credentials (
+			id text primary key, name text not null, kind text not null, username text, endpoint text,
+			scope text not null, status text not null, app text, server_id text, app_instance_id text,
+			purpose text, tags text, secret_cipher text, secret_fingerprint text,
+			current_version integer not null default 0, created_by text,
+			created_at datetime not null, updated_at datetime not null
+		)`,
+		`create index if not exists credentials_kind_status on credentials(kind, status)`,
+		`create table if not exists credential_versions (
+			id text primary key, credential_id text not null, version integer not null,
+			secret_cipher text not null, secret_fingerprint text, created_by text,
+			created_at datetime not null, retired_at datetime,
+			unique(credential_id, version)
+		)`,
+		`create table if not exists credential_bindings (
+			id text primary key, credential_id text not null, app_instance_id text not null,
+			purpose text not null, service_name text, created_at datetime not null,
+			unique(credential_id, app_instance_id, purpose)
+		)`,
 		`create table if not exists storage_items (
 			id text primary key, instance_id text not null, kind text not null, name text not null,
 			policy text, access_key text, secret_key text, metadata text,
@@ -305,7 +324,7 @@ func (s *Store) ListUsers() ([]UserSummary, error) {
 
 func (s *Store) CountRows(table string) (int, error) {
 	switch table {
-	case "users", "servers", "tasks", "task_logs", "task_targets", "task_steps", "audit_logs", "resources", "app_instances", "app_releases", "storage_items", "settings":
+	case "users", "servers", "tasks", "task_logs", "task_targets", "task_steps", "audit_logs", "resources", "app_instances", "app_releases", "credentials", "credential_versions", "credential_bindings", "storage_items", "settings":
 	default:
 		return 0, fmt.Errorf("unsupported table %q", table)
 	}

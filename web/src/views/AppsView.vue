@@ -120,7 +120,7 @@ import { apiGet, apiPost, asArray } from '../api/client'
 import { pairedAppCatalog, type AppCatalogResponse, type AppStoreItem } from '../apps/registry/catalog'
 import { frontendModuleFor } from '../apps/registry/loader'
 import { resolveAppLocale } from '../apps/registry/types'
-import type { AppFrontendModule, AppInstallDialogContext, AppInstallPayload, ServerOption } from '../apps/registry/contract'
+import type { AppFrontendModule, AppInstallDialogContext, AppInstallPayload, CredentialOption, ServerOption } from '../apps/registry/contract'
 import AppInstanceTable from '../components/AppInstanceTable.vue'
 import PageShell from '../components/PageShell.vue'
 import { usePermissions } from '../composables/usePermissions'
@@ -134,6 +134,7 @@ const backendCatalog = ref<AppCatalogResponse>({})
 const instances = ref<AppInstanceTableRecord[]>([])
 const servers = ref<ServerOption[]>([])
 const appSettings = ref<{ defaultDeployDir?: string }>({})
+const credentials = ref<CredentialOption[]>([])
 const activeTab = ref('all')
 const category = ref('all')
 const installSubmitting = ref(false)
@@ -150,6 +151,7 @@ const moduleDialogComponent = computed<Component | null>(() => moduleDialogModul
 const installDialogContext = computed<AppInstallDialogContext>(() => ({
   servers: servers.value,
   instances: instances.value,
+  credentials: credentials.value,
   defaultDeployDir: appSettings.value.defaultDeployDir || '/aifar/apps'
 }))
 const moduleDialogProps = computed(() => moduleDialogModule.value?.installDialogProps?.(locale.value, installDialogContext.value) ?? {})
@@ -215,6 +217,7 @@ async function load() {
   backendCatalog.value = await apiGet<AppCatalogResponse>(`/apps/catalog?lang=${locale.value}`).catch(() => ({}))
   instances.value = asArray(await apiGet<AppInstanceTableRecord[] | null>('/apps/instances').catch(() => []))
   servers.value = asArray(await apiGet<ServerOption[] | null>('/servers').catch(() => []))
+  credentials.value = asArray(await apiGet<CredentialOption[] | null>('/credentials?status=active').catch(() => []))
   appSettings.value = await apiGet<{ defaultDeployDir?: string }>('/settings').catch(() => ({ defaultDeployDir: '/aifar/apps' }))
 }
 

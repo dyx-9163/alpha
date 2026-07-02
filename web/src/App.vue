@@ -33,7 +33,7 @@
 
 <script setup lang="ts">
 import { computed, type Component } from 'vue'
-import { Box, Coin, Connection, FolderOpened, List, Monitor, Odometer, Operation, Setting, Shop, Tickets } from '@element-plus/icons-vue'
+import { Box, Coin, Connection, FolderOpened, Key, List, Monitor, Odometer, Operation, Setting, Shop, Tickets } from '@element-plus/icons-vue'
 import zhCn from 'element-plus/es/locale/lang/zh-cn'
 import en from 'element-plus/es/locale/lang/en'
 import { useRouter } from 'vue-router'
@@ -54,6 +54,7 @@ const allNavItems: Array<{ path: string; labelKey: string; icon: Component; perm
   { path: '/database', labelKey: 'nav.database', icon: Coin },
   { path: '/nacos', labelKey: 'nav.nacos', icon: Connection },
   { path: '/storage', labelKey: 'nav.storage', icon: FolderOpened },
+  { path: '/credentials', labelKey: 'nav.credentials', icon: Key, permission: permissions.credentialsUse },
   { path: '/terminal', labelKey: 'nav.terminal', icon: Operation, permission: permissions.terminalConnect },
   { path: '/tasks', labelKey: 'nav.tasks', icon: List },
   { path: '/audit', labelKey: 'nav.audit', icon: Tickets },

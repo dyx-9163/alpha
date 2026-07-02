@@ -351,6 +351,12 @@ func (a *API) installNamedApp(name string) http.HandlerFunc {
 
 func (a *API) installAppName(w http.ResponseWriter, r *http.Request, app string) {
 	req := decodeInstallAppRequest(r)
+	resolvedParameters, err := a.resolveCredentialParameters(r, req.Parameters)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "CREDENTIAL_RESOLVE_FAILED", err.Error(), nil)
+		return
+	}
+	req.Parameters = resolvedParameters
 	if req.Version == "" {
 		req.Version = "latest"
 	}
@@ -388,13 +394,14 @@ func (a *API) installAppName(w http.ResponseWriter, r *http.Request, app string)
 	}
 	_, matched := appcatalog.ResolveResources(def, resources, req.Version)
 	moduleReq := registry.InstallRequest{
-		App:        def.Name,
-		Version:    req.Version,
-		Topology:   req.Topology,
-		Language:   lang,
-		ServerIDs:  serverIDs,
-		Actor:      actor,
-		Parameters: req.Parameters,
+		App:             def.Name,
+		Version:         req.Version,
+		Topology:        req.Topology,
+		Language:        lang,
+		ServerIDs:       serverIDs,
+		Actor:           actor,
+		DefaultPassword: a.cfg.DefaultPassword,
+		Parameters:      req.Parameters,
 	}
 	if len(serverIDs) == 1 {
 		moduleReq.ServerID = serverIDs[0]
@@ -436,14 +443,18 @@ func (a *API) installAppName(w http.ResponseWriter, r *http.Request, app string)
 		if len(plan) > 0 {
 			log.Info(i18n.Text(lang, "api.installPlanPrepared"), len(plan))
 		}
-		return module.Install(ctx, moduleReq, registry.RunContext{
+		if err := module.Install(ctx, moduleReq, registry.RunContext{
 			Resources:   resources,
 			Log:         log,
 			Concurrency: a.store.DeploymentConcurrency(a.cfg.DeploymentConcurrency),
 			TargetLog: func(target string) registry.Logger {
 				return log.Target(target)
 			},
-		})
+		}); err != nil {
+			return err
+		}
+		a.registerInstallCredentials(ctx, def.Name, moduleReq, actor, log)
+		return nil
 	})
 	if err == nil {
 		a.audit(r, "apps."+def.Name+".install", target, "running", task.ID)

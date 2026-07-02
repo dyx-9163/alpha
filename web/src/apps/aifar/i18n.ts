@@ -41,6 +41,9 @@ export const aifarMessages = {
     noNacosInstances: '暂无可选 Nacos 实例',
     nacosHost: 'Nacos 主机',
     nacosPort: 'Nacos 端口',
+    nacosCredential: 'Nacos 凭据',
+    nacosCredentialPlaceholder: '可选择凭据中心已有 Nacos 凭据',
+    nacosCredentialManual: '手动输入 Nacos 账号',
     nacosUser: 'Nacos 用户',
     nacosPassword: 'Nacos 密码',
     nacosNamespace: 'Nacos 命名空间',
@@ -53,6 +56,9 @@ export const aifarMessages = {
     dbHost: '数据库主机',
     dbPort: '数据库端口',
     dbNameNacos: 'Nacos 数据库',
+    dbCredential: 'MySQL 凭据',
+    dbCredentialPlaceholder: '可选择凭据中心已有 MySQL 凭据',
+    dbCredentialManual: '手动输入数据库账号',
     dbUser: '数据库用户',
     dbPassword: '数据库密码',
     redisSource: 'Redis 来源',
@@ -63,6 +69,9 @@ export const aifarMessages = {
     noRedisInstances: '暂无可选 Redis 实例',
     redisHost: 'Redis 主机',
     redisPort: 'Redis 端口',
+    redisCredential: 'Redis 凭据',
+    redisCredentialPlaceholder: '可选择凭据中心已有 Redis 凭据',
+    redisCredentialManual: '手动输入 Redis 密码',
     redisPassword: 'Redis 密码',
     redisDatabase: 'Redis 数据库',
     minioEnableStorage: '启用 MinIO 存储',
@@ -74,6 +83,9 @@ export const aifarMessages = {
     noMinioInstances: '暂无可选 MinIO 实例',
     minioEndpoint: 'MinIO 地址',
     minioPlatform: '存储平台标识',
+    minioCredential: 'MinIO 凭据',
+    minioCredentialPlaceholder: '可选择凭据中心已有 MinIO 凭据',
+    minioCredentialManual: '手动输入 MinIO 密钥',
     minioAccessKey: 'MinIO Access Key',
     minioSecretKey: 'MinIO Secret Key',
     minioBucketName: 'MinIO Bucket',
@@ -112,6 +124,9 @@ export const aifarMessages = {
     noNacosInstances: 'No selectable Nacos instances',
     nacosHost: 'Nacos host',
     nacosPort: 'Nacos port',
+    nacosCredential: 'Nacos credential',
+    nacosCredentialPlaceholder: 'Select a Nacos credential from the credential center',
+    nacosCredentialManual: 'Enter Nacos account manually',
     nacosUser: 'Nacos user',
     nacosPassword: 'Nacos password',
     nacosNamespace: 'Nacos namespace',
@@ -124,6 +139,9 @@ export const aifarMessages = {
     dbHost: 'Database host',
     dbPort: 'Database port',
     dbNameNacos: 'Nacos database',
+    dbCredential: 'MySQL credential',
+    dbCredentialPlaceholder: 'Select a MySQL credential from the credential center',
+    dbCredentialManual: 'Enter database account manually',
     dbUser: 'Database user',
     dbPassword: 'Database password',
     redisSource: 'Redis source',
@@ -134,6 +152,9 @@ export const aifarMessages = {
     noRedisInstances: 'No selectable Redis instances',
     redisHost: 'Redis host',
     redisPort: 'Redis port',
+    redisCredential: 'Redis credential',
+    redisCredentialPlaceholder: 'Select a Redis credential from the credential center',
+    redisCredentialManual: 'Enter Redis password manually',
     redisPassword: 'Redis password',
     redisDatabase: 'Redis database',
     minioEnableStorage: 'Enable MinIO storage',
@@ -145,6 +166,9 @@ export const aifarMessages = {
     noMinioInstances: 'No selectable MinIO instances',
     minioEndpoint: 'MinIO endpoint',
     minioPlatform: 'Storage platform',
+    minioCredential: 'MinIO credential',
+    minioCredentialPlaceholder: 'Select a MinIO credential from the credential center',
+    minioCredentialManual: 'Enter MinIO keys manually',
     minioAccessKey: 'MinIO access key',
     minioSecretKey: 'MinIO secret key',
     minioBucketName: 'MinIO bucket',
@@ -226,10 +250,15 @@ export function aifarInstallDialogProps(locale?: string, context?: AppInstallDia
         visibleWhen: sourceIsNot('nacosSource', 'existing')
       },
       portField('nacosPort', copy.nacosPort, 8848, copy),
-      requiredText('nacosUser', copy.nacosUser, 'nacos', copy),
+      selectField('nacosCredentialId', copy.nacosCredential, credentialOptions(context, 'nacos', copy.nacosCredentialManual), '', copy, copy.nacosCredentialPlaceholder, false),
+      {
+        ...requiredText('nacosUser', copy.nacosUser, 'nacos', copy),
+        visibleWhen: (values) => !values.nacosCredentialId
+      },
       {
         ...requiredText('nacosPassword', copy.nacosPassword, 'oversea.nacos', copy),
-        type: 'password'
+        type: 'password',
+        visibleWhen: (values) => !values.nacosCredentialId
       },
       requiredText('nacosNamespace', copy.nacosNamespace, 'prod', copy),
       selectField('dbSource', copy.dbSource, [
@@ -249,10 +278,15 @@ export function aifarInstallDialogProps(locale?: string, context?: AppInstallDia
         visibleWhen: sourceIsNot('dbSource', 'existing')
       },
       requiredText('dbNameNacos', copy.dbNameNacos, 'aifar_nacos', copy),
-      requiredText('dbUser', copy.dbUser, 'root', copy),
+      selectField('dbCredentialId', copy.dbCredential, credentialOptions(context, 'mysql', copy.dbCredentialManual), '', copy, copy.dbCredentialPlaceholder, false),
+      {
+        ...requiredText('dbUser', copy.dbUser, 'root', copy),
+        visibleWhen: (values) => !values.dbCredentialId
+      },
       {
         ...requiredText('dbPassword', copy.dbPassword, '', copy),
-        type: 'password'
+        type: 'password',
+        visibleWhen: (values) => !values.dbCredentialId
       },
       selectField('redisSource', copy.redisSource, [
         { label: copy.redisSourceExisting, value: 'existing', disabled: redisOptions.length === 0 },
@@ -271,10 +305,19 @@ export function aifarInstallDialogProps(locale?: string, context?: AppInstallDia
         visibleWhen: sourceIsNot('redisSource', 'existing')
       },
       {
+        name: 'redisCredentialId',
+        label: copy.redisCredential,
+        type: 'select',
+        defaultValue: '',
+        placeholder: copy.redisCredentialPlaceholder,
+        options: credentialOptions(context, 'redis', copy.redisCredentialManual)
+      },
+      {
         name: 'redisPassword',
         label: copy.redisPassword,
         type: 'password',
-        defaultValue: ''
+        defaultValue: '',
+        visibleWhen: (values) => !values.redisCredentialId
       },
       {
         name: 'redisDatabase',
@@ -316,14 +359,23 @@ export function aifarInstallDialogProps(locale?: string, context?: AppInstallDia
         visibleWhen: valueTruthy('minioEnableStorage')
       },
       {
+        name: 'minioCredentialId',
+        label: copy.minioCredential,
+        type: 'select',
+        defaultValue: '',
+        placeholder: copy.minioCredentialPlaceholder,
+        options: credentialOptions(context, 'minio', copy.minioCredentialManual),
+        visibleWhen: valueTruthy('minioEnableStorage')
+      },
+      {
         ...requiredText('minioAccessKey', copy.minioAccessKey, '', copy),
         type: 'password',
-        visibleWhen: valueTruthy('minioEnableStorage')
+        visibleWhen: allVisible(valueTruthy('minioEnableStorage'), (values) => !values.minioCredentialId)
       },
       {
         ...requiredText('minioSecretKey', copy.minioSecretKey, '', copy),
         type: 'password',
-        visibleWhen: valueTruthy('minioEnableStorage')
+        visibleWhen: allVisible(valueTruthy('minioEnableStorage'), (values) => !values.minioCredentialId)
       },
       {
         ...requiredText('minioBucketName', copy.minioBucketName, 'aifar', copy),
@@ -387,7 +439,8 @@ function selectField(
   options: AppInstallFieldOption[],
   defaultValue: string | number | boolean,
   copy: ReturnType<typeof aifarCopy>,
-  placeholder?: string
+  placeholder?: string,
+  required = true
 ): AppInstallField {
   return {
     name,
@@ -396,8 +449,8 @@ function selectField(
     options,
     defaultValue,
     placeholder,
-    required: true,
-    validate: (value) => String(value ?? '').trim() ? undefined : copy.textRequired
+    required,
+    validate: required ? (value) => String(value ?? '').trim() ? undefined : copy.textRequired : undefined
   }
 }
 
@@ -419,6 +472,22 @@ function enabledSourceIs(enabledName: string, sourceName: string, value: string)
 
 function enabledSourceIsNot(enabledName: string, sourceName: string, value: string) {
   return (values: AppInstallFieldValues) => values[enabledName] !== false && values[sourceName] !== value
+}
+
+function allVisible(...checks: Array<(values: AppInstallFieldValues) => boolean>) {
+  return (values: AppInstallFieldValues) => checks.every((check) => check(values))
+}
+
+function credentialOptions(context: AppInstallDialogContext | undefined, kind: string, manualLabel: string): AppInstallFieldOption[] {
+  return [
+    { label: manualLabel, value: '' },
+    ...(context?.credentials ?? [])
+      .filter((credential) => credential.kind === kind && credential.status !== 'retired')
+      .map((credential) => ({
+        label: [credential.name, credential.username, credential.endpoint].filter(Boolean).join(' / '),
+        value: credential.id
+      }))
+  ]
 }
 
 function nacosInstanceOptions(context?: AppInstallDialogContext): AppInstallFieldOption[] {
