@@ -417,3 +417,19 @@
 - 结论：`router.yaml` 只控制 Gateway 入站路由，不控制服务内部 Feign 调用；日志线程在 `aifar-oauth`，说明调用方 OAuth 的 Feign 目标仍是旧的 `alpha-permission`，需要改 OAuth/公共 API JAR 内的 Feign 声明或先统一回 `alpha-*` 服务名。
 - 问题：用户要求把 AIFAR env 中的 `SPRING_APPLICATION_NAME` 改回 `alpha-*`，让注册到 Nacos 的服务名全部使用 alpha 前缀，避免修改 Java 代码。
 - 结论：AIFAR 安装脚本会在部署时覆盖各 Java 服务 `.env` 的 `SPRING_APPLICATION_NAME=alpha-*`，并同步把导入 Nacos 的 SQL 中 Gateway/Dubbo 服务名从 `aifar-*` 改为 `alpha-*`；Docker 镜像名和容器名仍保持 `aifar-*`。验证通过：`go test ./internal/apps/aifar`、`pnpm test`、`git diff --check`。
+- 问题：用户询问为什么 `web-vue3` 会以 `aifar-web-vue3` 出现在 Nacos 注册中心。
+- 结论：当前资源包里的 `web-vue3` 是 Nginx 静态前端，`.env` 只有 `APP_IMAGE`/`APP_CONTAINER_NAME`，没有 `SPRING_APPLICATION_NAME`，安装脚本也不会把它注册到 Nacos；若 Nacos 中出现 `aifar-web-vue3`，优先按旧注册残留或其他进程注册排查，点服务详情看实例 IP/端口与健康实例数。
+- 问题：用户提供 `alpha-oauth` 日志，显示 `No servers available for service: alpha-system`、数据库异常、语言内容拉取超时和 `Illegal Requests:/`。
+- 结论：核心问题是 OAuth 已按 `alpha-oauth` 启动，但同命名空间下没有健康的 `alpha-system` 实例；需确认 system 服务 `.env` 为 `SPRING_APPLICATION_NAME=alpha-system` 并重建/重启，且 Nacos `prod` 命名空间能看到健康实例。`Illegal Requests:/` 多半是健康检查访问根路径引起的噪音。
+- 问题：用户截图显示 Nacos `prod` 命名空间中已有健康的 `alpha-system`、`alpha-oauth` 等服务。
+- 结论：若日志仍报 `No servers available for service: alpha-system`，优先重启 `alpha-oauth` 清掉本地负载均衡/发现缓存；若重启后仍报错，再检查 OAuth 容器实际读取的 Nacos server、namespace、group 是否与截图中的 `prod`/`DEFAULT_GROUP` 完全一致。
+- 问题：用户在 `aifar-oauth` 容器内直接 curl Nacos instance list，返回 403 `user not found!`。
+- 结论：这是 Nacos 鉴权开启后的未认证请求，不能据此判断 `alpha-system` 不存在；需要先调用 Nacos 登录接口获取 accessToken，再带 token 查询实例列表。AIFAR JAR 内配置会从 `NACOS_USER`/`NACOS_PASSWORD` 映射到 `spring.cloud.nacos.username/password`。
+- 问题：用户询问 AIFAR 应用商店安装中根目录公共 `.env` + 服务目录 `.env` 的双层环境文件设计是否合理。
+- 结论：双层 `.env` 作为“公共配置 + 服务私有配置”是可接受的，但当前根 `.env` 同时承担 Compose 插值、容器运行时环境和安装器持久配置，且会把数据库/Redis/Nacos 密码注入到所有服务甚至前端 Nginx，建议后续拆成 `compose.env`、`runtime.env`/`secrets.env`、各服务 `service.env`，并优先考虑单个根 `compose.yaml` 或固定脚本入口降低误操作。
+- 问题：用户强调运维操作都会在管理界面进行，设计应按最合适方案而不是兼顾手工操作。
+- 结论：AIFAR 部署配置应以面板数据库/安装参数为事实源，目标机 env/compose 文件只作为生成产物；推荐收敛为单根 `compose.yaml` + 面板生成的 `env/compose.env`、`env/java-common.env`、`env/java-secrets.env`、按服务 env，并通过配置版本/config hash 检测手工漂移。
+- 问题：用户补充 AIFAR 应用部署设计需要考虑版本升级，并保留每个最近三个版本。
+- 结论：AIFAR 应按应用实例级原子升级设计，而不是按单个微服务零散升级；目标机使用 `releases/<releaseId>/` + `current` 指针，面板记录 release manifest/config hash，只保留每个实例最近 3 个成功 release、对应配置快照和被引用镜像，升级失败可回滚到最近成功版本。
+- 问题：用户确认按 AIFAR 部署配置与版本升级建议改造实现。
+- 结论：AIFAR 安装已改为面板参数生成单根 `compose.yaml`、分层 env、`releases/<releaseId>/` + `current` 指针和 release manifest；控制面新增 `app_releases` 记录并按实例保留最近 3 个成功 release，状态检测可返回 current release/releaseId。验证通过：`pnpm test`、`git diff --check`。
