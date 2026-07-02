@@ -316,88 +316,11 @@ func TestServiceInstallsAIFARServiceFromDockerAppsBundle(t *testing.T) {
 	}
 }
 
-func TestServiceResolvesManagedDatabaseAndRedisInstances(t *testing.T) {
+func TestServiceUsesManualBusinessDependencyParameters(t *testing.T) {
 	root := createAIFARBundle(t)
 	s := &fakeStore{
 		servers: map[string]store.Server{
-			"app-1":    {ID: "app-1", Name: "app-1", Host: "10.0.0.10", DeployDir: "/aifar/apps"},
-			"mysql-1":  {ID: "mysql-1", Name: "mysql-1", Host: "10.0.0.31", DeployDir: "/aifar/apps"},
-			"router-1": {ID: "router-1", Name: "router-1", Host: "10.0.0.30", DeployDir: "/aifar/apps"},
-			"redis-1":  {ID: "redis-1", Name: "redis-1", Host: "10.0.0.41", DeployDir: "/aifar/apps"},
-			"redis-2":  {ID: "redis-2", Name: "redis-2", Host: "10.0.0.42", DeployDir: "/aifar/apps"},
-			"minio-1":  {ID: "minio-1", Name: "minio-1", Host: "10.0.0.60", DeployDir: "/aifar/apps"},
-		},
-		instances: []store.AppInstance{
-			{
-				ID:       "mysql-node-1",
-				App:      "mysql",
-				Version:  "8.0.36",
-				ServerID: "mysql-1",
-				Status:   "running",
-				Topology: "innodb-cluster",
-				Metadata: mustMetadata(t, map[string]any{
-					"clusterId": "mysql-cluster-1",
-					"endpoint":  "10.0.0.31:3306",
-					"topology":  "innodb-cluster",
-				}),
-			},
-			{
-				ID:       "mysql-router-1",
-				App:      "mysql-router",
-				Version:  "8.0.36",
-				ServerID: "router-1",
-				Status:   "running",
-				Topology: "router",
-				Metadata: mustMetadata(t, map[string]any{
-					"clusterId": "mysql-cluster-1",
-					"basePort":  6446,
-					"endpoint":  "10.0.0.30:6446",
-					"topology":  "router",
-				}),
-			},
-			{
-				ID:       "redis-node-1",
-				App:      "redis",
-				Version:  "7.2.14",
-				ServerID: "redis-1",
-				Status:   "running",
-				Topology: "sentinel",
-				Metadata: mustMetadata(t, map[string]any{
-					"clusterId":    "redis-sentinel-1",
-					"masterName":   "aifar-master",
-					"sentinel":     true,
-					"sentinelPort": 26379,
-					"topology":     "sentinel",
-				}),
-			},
-			{
-				ID:       "redis-node-2",
-				App:      "redis",
-				Version:  "7.2.14",
-				ServerID: "redis-2",
-				Status:   "running",
-				Topology: "sentinel",
-				Metadata: mustMetadata(t, map[string]any{
-					"clusterId":    "redis-sentinel-1",
-					"masterName":   "aifar-master",
-					"sentinel":     true,
-					"sentinelPort": 26379,
-					"topology":     "sentinel",
-				}),
-			},
-			{
-				ID:       "minio-node-1",
-				App:      "minio",
-				Version:  "2025-10-15T17-29-55Z",
-				ServerID: "minio-1",
-				Status:   "running",
-				Topology: "standalone",
-				Metadata: mustMetadata(t, map[string]any{
-					"endpoint": "http://10.0.0.60:9000",
-					"apiPort":  9000,
-					"topology": "standalone",
-				}),
-			},
+			"app-1": {ID: "app-1", Name: "app-1", Host: "10.0.0.10", DeployDir: "/aifar/apps"},
 		},
 	}
 	remote := &fakeRemote{}
@@ -407,13 +330,15 @@ func TestServiceResolvesManagedDatabaseAndRedisInstances(t *testing.T) {
 		ServerID: "app-1",
 		Language: "en",
 		Parameters: map[string]any{
-			"dbSource":        "existing",
-			"dbInstanceId":    "mysql-node-1",
-			"nacosHost":       "10.0.0.50",
-			"redisSource":     "existing",
-			"redisInstanceId": "redis-node-1",
-			"minioSource":     "existing",
-			"minioInstanceId": "minio-node-1",
+			"dbHost":                  "10.0.0.30",
+			"dbPort":                  6446,
+			"nacosHost":               "10.0.0.50",
+			"redisMode":               "sentinel",
+			"redisHost":               "10.0.0.41",
+			"redisPort":               26379,
+			"redisSentinelMasterName": "alpha-master",
+			"redisSentinelNodes":      "10.0.0.41:26379,10.0.0.42:26379",
+			"minioEndpoint":           "http://10.0.0.60:9000",
 		},
 	}, []store.Resource{{App: "aifar", Part: "backend", Version: "docker-apps", Path: filepath.Join(root, "docker-apps", ".env")}}, fakeLogger{}, nil)
 	if err != nil {
@@ -437,19 +362,24 @@ func TestServiceResolvesManagedDatabaseAndRedisInstances(t *testing.T) {
 		t.Fatal(err)
 	}
 	if metadata["dbHost"] != "10.0.0.30" || int(metadata["dbPort"].(float64)) != 6446 {
-		t.Fatalf("expected MySQL Router endpoint to be used, got %s", instance.Metadata)
+		t.Fatalf("expected manual MySQL endpoint to be used, got %s", instance.Metadata)
 	}
 	if metadata["redisMode"] != "sentinel" || metadata["redisHost"] != "10.0.0.41" || int(metadata["redisPort"].(float64)) != 26379 {
-		t.Fatalf("expected Redis Sentinel endpoint to be used, got %s", instance.Metadata)
+		t.Fatalf("expected manual Redis Sentinel endpoint to be used, got %s", instance.Metadata)
 	}
-	if metadata["minioSource"] != "existing" || metadata["minioInstanceId"] != "minio-node-1" || metadata["minioEndpoint"] != "http://10.0.0.60:9000" {
-		t.Fatalf("expected selected MinIO endpoint to be used, got %s", instance.Metadata)
+	if metadata["minioEndpoint"] != "http://10.0.0.60:9000" {
+		t.Fatalf("expected manual MinIO endpoint to be used, got %s", instance.Metadata)
+	}
+	for _, removed := range []string{"dbSource", "dbInstanceId", "redisSource", "redisInstanceId", "minioSource", "minioInstanceId"} {
+		if _, ok := metadata[removed]; ok {
+			t.Fatalf("metadata should not keep managed dependency field %s: %s", removed, instance.Metadata)
+		}
 	}
 	for _, want := range []string{
 		"DB_HOST='10.0.0.30'",
 		"DB_PORT='6446'",
 		"REDIS_MODE='sentinel'",
-		"REDIS_SENTINEL_MASTER='aifar-master'",
+		"REDIS_SENTINEL_MASTER='alpha-master'",
 		"REDIS_SENTINEL_NODES='10.0.0.41:26379,10.0.0.42:26379'",
 		"MINIO_ENDPOINT='http://10.0.0.60:9000'",
 	} {

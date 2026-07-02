@@ -48,12 +48,6 @@ export const aifarMessages = {
     nacosUser: 'Nacos 用户',
     nacosPassword: 'Nacos 密码',
     nacosNamespace: 'Nacos 命名空间',
-    dbSource: 'MySQL 来源',
-    dbSourceExisting: '选择已部署 MySQL',
-    dbSourceManual: '手动填写 MySQL',
-    dbInstance: '已部署 MySQL',
-    dbInstancePlaceholder: '选择 MySQL 或 MySQL Router 实例',
-    noDbInstances: '暂无可选 MySQL 实例',
     dbHost: '数据库主机',
     dbPort: '数据库端口',
     dbNameNacos: 'Nacos 数据库',
@@ -62,12 +56,6 @@ export const aifarMessages = {
     dbCredentialManual: '手动输入数据库账号',
     dbUser: '数据库用户',
     dbPassword: '数据库密码',
-    redisSource: 'Redis 来源',
-    redisSourceExisting: '选择已部署 Redis',
-    redisSourceManual: '手动填写 Redis',
-    redisInstance: '已部署 Redis',
-    redisInstancePlaceholder: '选择 Redis 实例',
-    noRedisInstances: '暂无可选 Redis 实例',
     redisHost: 'Redis 主机',
     redisPort: 'Redis 端口',
     redisCredential: 'Redis 凭据',
@@ -75,13 +63,14 @@ export const aifarMessages = {
     redisCredentialManual: '手动输入 Redis 密码',
     redisPassword: 'Redis 密码',
     redisDatabase: 'Redis 数据库',
+    redisMode: 'Redis 模式',
+    redisModeStandalone: '单体',
+    redisModeSentinel: 'Sentinel',
+    redisModeCluster: 'Cluster',
+    redisSentinelMasterName: 'Sentinel Master',
+    redisSentinelNodes: 'Sentinel 节点',
+    redisClusterNodes: 'Cluster 节点',
     minioEnableStorage: '启用 MinIO 存储',
-    minioSource: 'MinIO 来源',
-    minioSourceExisting: '选择已部署 MinIO',
-    minioSourceManual: '手动填写 MinIO',
-    minioInstance: '已部署 MinIO',
-    minioInstancePlaceholder: '选择 MinIO 实例',
-    noMinioInstances: '暂无可选 MinIO 实例',
     minioEndpoint: 'MinIO 地址',
     minioPlatform: '存储平台标识',
     minioCredential: 'MinIO 凭据',
@@ -132,12 +121,6 @@ export const aifarMessages = {
     nacosUser: 'Nacos user',
     nacosPassword: 'Nacos password',
     nacosNamespace: 'Nacos namespace',
-    dbSource: 'MySQL source',
-    dbSourceExisting: 'Use deployed MySQL',
-    dbSourceManual: 'Enter MySQL manually',
-    dbInstance: 'Deployed MySQL',
-    dbInstancePlaceholder: 'Select a MySQL or MySQL Router instance',
-    noDbInstances: 'No selectable MySQL instances',
     dbHost: 'Database host',
     dbPort: 'Database port',
     dbNameNacos: 'Nacos database',
@@ -146,12 +129,6 @@ export const aifarMessages = {
     dbCredentialManual: 'Enter database account manually',
     dbUser: 'Database user',
     dbPassword: 'Database password',
-    redisSource: 'Redis source',
-    redisSourceExisting: 'Use deployed Redis',
-    redisSourceManual: 'Enter Redis manually',
-    redisInstance: 'Deployed Redis',
-    redisInstancePlaceholder: 'Select a Redis instance',
-    noRedisInstances: 'No selectable Redis instances',
     redisHost: 'Redis host',
     redisPort: 'Redis port',
     redisCredential: 'Redis credential',
@@ -159,13 +136,14 @@ export const aifarMessages = {
     redisCredentialManual: 'Enter Redis password manually',
     redisPassword: 'Redis password',
     redisDatabase: 'Redis database',
+    redisMode: 'Redis mode',
+    redisModeStandalone: 'Standalone',
+    redisModeSentinel: 'Sentinel',
+    redisModeCluster: 'Cluster',
+    redisSentinelMasterName: 'Sentinel master',
+    redisSentinelNodes: 'Sentinel nodes',
+    redisClusterNodes: 'Cluster nodes',
     minioEnableStorage: 'Enable MinIO storage',
-    minioSource: 'MinIO source',
-    minioSourceExisting: 'Use deployed MinIO',
-    minioSourceManual: 'Enter MinIO manually',
-    minioInstance: 'Deployed MinIO',
-    minioInstancePlaceholder: 'Select a MinIO instance',
-    noMinioInstances: 'No selectable MinIO instances',
     minioEndpoint: 'MinIO endpoint',
     minioPlatform: 'Storage platform',
     minioCredential: 'MinIO credential',
@@ -199,17 +177,8 @@ export function aifarTopologies(locale?: string): AppTopologyDefinition[] {
 export function aifarInstallDialogProps(locale?: string, context?: AppInstallDialogContext): AppInstallDialogConfig {
   const copy = aifarCopy(locale)
   const nacosOptions = nacosInstanceOptions(context)
-  const mysqlOptions = mysqlInstanceOptions(context)
-  const redisOptions = redisInstanceOptions(context)
-  const minioOptions = minioInstanceOptions(context)
   const nacosSourceDefault = nacosOptions.length ? 'existing' : 'manual'
-  const mysqlSourceDefault = mysqlOptions.length ? 'existing' : 'manual'
-  const redisSourceDefault = redisOptions.length ? 'existing' : 'manual'
-  const minioSourceDefault = minioOptions.length ? 'existing' : 'manual'
   const nacosSelectOptions = nacosOptions.length ? nacosOptions : [{ label: copy.noNacosInstances, value: '', disabled: true }]
-  const mysqlSelectOptions = mysqlOptions.length ? mysqlOptions : [{ label: copy.noDbInstances, value: '', disabled: true }]
-  const redisSelectOptions = redisOptions.length ? redisOptions : [{ label: copy.noRedisInstances, value: '', disabled: true }]
-  const minioSelectOptions = minioOptions.length ? minioOptions : [{ label: copy.noMinioInstances, value: '', disabled: true }]
   const dialogCopy: AppInstallDialogCopy = {
     title: copy.installTitle,
     hint: copy.hint,
@@ -227,6 +196,10 @@ export function aifarInstallDialogProps(locale?: string, context?: AppInstallDia
     targetServerFilter: (server, filterContext) => dockerReadyServerIds(filterContext).has(server.id),
     copy: dialogCopy,
     fields: [
+      requiredText('timezone', copy.timezone, 'system', copy),
+      networkField(copy),
+      requiredText('appCPUs', copy.appCPUs, '2.0', copy),
+      requiredText('appMemoryLimit', copy.appMemoryLimit, '2GB', copy),
       selectField('nacosSource', copy.nacosSource, [
         { label: copy.nacosSourceExisting, value: 'existing', disabled: nacosOptions.length === 0 },
         { label: copy.nacosSourceManual, value: 'manual' }
@@ -253,49 +226,82 @@ export function aifarInstallDialogProps(locale?: string, context?: AppInstallDia
         type: 'password',
         visibleWhen: (values) => !values.nacosCredentialId
       },
-      selectField('dbSource', copy.dbSource, [
-        { label: copy.dbSourceExisting, value: 'existing', disabled: mysqlOptions.length === 0 },
-        { label: copy.dbSourceManual, value: 'manual' }
-      ], mysqlSourceDefault, copy),
+      requiredText('nacosNamespace', copy.nacosNamespace, 'prod', copy),
+      requiredText('dbHost', copy.dbHost, '', copy),
+      portField('dbPort', copy.dbPort, 3306, copy),
+      optionalText('dbNameNacos', copy.dbNameNacos, 'aifar_nacos'),
+      switchField('initSql', copy.initSql, false),
       {
-        ...selectField('dbInstanceId', copy.dbInstance, mysqlSelectOptions, mysqlOptions[0]?.value ?? '', copy, copy.dbInstancePlaceholder),
-        visibleWhen: sourceIs('dbSource', 'existing')
+        ...selectField('dbCredentialId', copy.dbCredential, credentialOptions(context, 'mysql', copy.dbCredentialManual), '', copy, copy.dbCredentialPlaceholder, false),
+        visibleWhen: sourceIs('initSql', true)
       },
       {
-        ...requiredText('dbHost', copy.dbHost, '', copy),
-        visibleWhen: sourceIsNot('dbSource', 'existing')
+        ...requiredText('dbUser', copy.dbUser, 'root', copy),
+        visibleWhen: (values) => Boolean(values.initSql) && !values.dbCredentialId
       },
       {
-        ...portField('dbPort', copy.dbPort, 3306, copy),
-        visibleWhen: sourceIsNot('dbSource', 'existing')
+        ...requiredText('dbPassword', copy.dbPassword, '', copy),
+        type: 'password',
+        visibleWhen: (values) => Boolean(values.initSql) && !values.dbCredentialId
       },
-      selectField('redisSource', copy.redisSource, [
-        { label: copy.redisSourceExisting, value: 'existing', disabled: redisOptions.length === 0 },
-        { label: copy.redisSourceManual, value: 'manual' }
-      ], redisSourceDefault, copy),
+      requiredText('redisHost', copy.redisHost, 'localhost', copy),
+      portField('redisPort', copy.redisPort, 6379, copy),
+      selectField('redisMode', copy.redisMode, [
+        { label: copy.redisModeStandalone, value: 'standalone' },
+        { label: copy.redisModeSentinel, value: 'sentinel' },
+        { label: copy.redisModeCluster, value: 'cluster' }
+      ], 'standalone', copy),
+      selectField('redisCredentialId', copy.redisCredential, credentialOptions(context, 'redis', copy.redisCredentialManual), '', copy, copy.redisCredentialPlaceholder, false),
       {
-        ...selectField('redisInstanceId', copy.redisInstance, redisSelectOptions, redisOptions[0]?.value ?? '', copy, copy.redisInstancePlaceholder),
-        visibleWhen: sourceIs('redisSource', 'existing')
+        ...optionalText('redisPassword', copy.redisPassword, '', 'password'),
+        visibleWhen: (values) => !values.redisCredentialId
+      },
+      portField('redisDatabase', copy.redisDatabase, 1, copy, 0, 15),
+      {
+        ...requiredText('redisSentinelMasterName', copy.redisSentinelMasterName, 'aifar-master', copy),
+        visibleWhen: sourceIs('redisMode', 'sentinel')
       },
       {
-        ...requiredText('redisHost', copy.redisHost, 'localhost', copy),
-        visibleWhen: sourceIsNot('redisSource', 'existing')
+        ...requiredText('redisSentinelNodes', copy.redisSentinelNodes, '', copy),
+        visibleWhen: sourceIs('redisMode', 'sentinel')
       },
       {
-        ...portField('redisPort', copy.redisPort, 6379, copy),
-        visibleWhen: sourceIsNot('redisSource', 'existing')
+        ...requiredText('redisClusterNodes', copy.redisClusterNodes, '', copy),
+        visibleWhen: sourceIs('redisMode', 'cluster')
       },
-      selectField('minioSource', copy.minioSource, [
-        { label: copy.minioSourceExisting, value: 'existing', disabled: minioOptions.length === 0 },
-        { label: copy.minioSourceManual, value: 'manual' }
-      ], minioSourceDefault, copy),
-      {
-        ...selectField('minioInstanceId', copy.minioInstance, minioSelectOptions, minioOptions[0]?.value ?? '', copy, copy.minioInstancePlaceholder),
-        visibleWhen: sourceIs('minioSource', 'existing')
-      },
+      switchField('minioEnableStorage', copy.minioEnableStorage, true),
       {
         ...requiredText('minioEndpoint', copy.minioEndpoint, '', copy),
-        visibleWhen: sourceIsNot('minioSource', 'existing')
+        visibleWhen: sourceIs('minioEnableStorage', true)
+      },
+      {
+        ...requiredText('minioPlatform', copy.minioPlatform, 'minio-1', copy),
+        visibleWhen: sourceIs('minioEnableStorage', true)
+      },
+      {
+        ...selectField('minioCredentialId', copy.minioCredential, credentialOptions(context, 'minio', copy.minioCredentialManual), '', copy, copy.minioCredentialPlaceholder, false),
+        visibleWhen: sourceIs('minioEnableStorage', true)
+      },
+      {
+        ...requiredText('minioAccessKey', copy.minioAccessKey, '', copy),
+        visibleWhen: (values) => Boolean(values.minioEnableStorage) && !values.minioCredentialId
+      },
+      {
+        ...requiredText('minioSecretKey', copy.minioSecretKey, '', copy),
+        type: 'password',
+        visibleWhen: (values) => Boolean(values.minioEnableStorage) && !values.minioCredentialId
+      },
+      {
+        ...requiredText('minioBucketName', copy.minioBucketName, 'aifar', copy),
+        visibleWhen: sourceIs('minioEnableStorage', true)
+      },
+      {
+        ...optionalText('minioDomain', copy.minioDomain, ''),
+        visibleWhen: sourceIs('minioEnableStorage', true)
+      },
+      {
+        ...optionalText('minioBasePath', copy.minioBasePath, ''),
+        visibleWhen: sourceIs('minioEnableStorage', true)
       }
     ]
   }
@@ -317,19 +323,50 @@ function requiredText(name: string, label: string, defaultValue: string, copy: R
   }
 }
 
-function portField(name: string, label: string, defaultValue: number, copy: ReturnType<typeof aifarCopy>) {
+function optionalText(name: string, label: string, defaultValue: string, type: 'text' | 'password' = 'text'): AppInstallField {
+  return {
+    name,
+    label,
+    type,
+    defaultValue,
+    required: false
+  }
+}
+
+function networkField(copy: ReturnType<typeof aifarCopy>): AppInstallField {
+  return {
+    ...requiredText('networkName', copy.networkName, 'aifar-network', copy),
+    validate: (value: unknown) => {
+      const text = String(value ?? '').trim()
+      if (!text) return copy.textRequired
+      return /\s/.test(text) ? copy.networkInvalid : undefined
+    }
+  }
+}
+
+function switchField(name: string, label: string, defaultValue: boolean): AppInstallField {
+  return {
+    name,
+    label,
+    type: 'switch',
+    defaultValue,
+    required: false
+  }
+}
+
+function portField(name: string, label: string, defaultValue: number, copy: ReturnType<typeof aifarCopy>, min = 1, max = 65535) {
   return {
     name,
     label,
     type: 'number' as const,
     defaultValue,
     required: true,
-    min: 1,
-    max: 65535,
+    min,
+    max,
     step: 1,
     validate: (value: unknown) => {
       const port = Number(value)
-      return Number.isInteger(port) && port >= 1 && port <= 65535 ? undefined : copy.portInvalid
+      return Number.isInteger(port) && port >= min && port <= max ? undefined : copy.portInvalid
     }
   }
 }
@@ -355,11 +392,11 @@ function selectField(
   }
 }
 
-function sourceIs(name: string, value: string) {
+function sourceIs(name: string, value: string | number | boolean) {
   return (values: AppInstallFieldValues) => values[name] === value
 }
 
-function sourceIsNot(name: string, value: string) {
+function sourceIsNot(name: string, value: string | number | boolean) {
   return (values: AppInstallFieldValues) => values[name] !== value
 }
 
@@ -384,47 +421,6 @@ function nacosInstanceOptions(context?: AppInstallDialogContext): AppInstallFiel
     }))
 }
 
-function mysqlInstanceOptions(context?: AppInstallDialogContext): AppInstallFieldOption[] {
-  return (context?.instances ?? [])
-    .filter((instance) => instance.app === 'mysql' || instance.app === 'mysql-router')
-    .map((instance) => ({
-      label: dependencyLabel(instance, context, instance.app === 'mysql-router' ? 'MySQL Router' : 'MySQL'),
-      value: instance.id
-    }))
-}
-
-function redisInstanceOptions(context?: AppInstallDialogContext): AppInstallFieldOption[] {
-  return (context?.instances ?? [])
-    .filter((instance) => instance.app === 'redis')
-    .map((instance) => ({
-      label: redisDependencyLabel(instance, context),
-      value: instance.id
-    }))
-}
-
-function minioInstanceOptions(context?: AppInstallDialogContext): AppInstallFieldOption[] {
-  return (context?.instances ?? [])
-    .filter((instance) => instance.app === 'minio')
-    .map((instance) => ({
-      label: dependencyLabel(instance, context, 'MinIO'),
-      value: instance.id
-    }))
-}
-
-function redisDependencyLabel(instance: AppInstanceOption, context: AppInstallDialogContext | undefined) {
-  const metadata = parseMetadata(instance.metadata)
-  const topology = String(instance.topology || metadata.topology || '').trim()
-  if (topology.toLowerCase() !== 'sentinel') {
-    return dependencyLabel(instance, context, 'Redis')
-  }
-  const sentinelPort = numberFromMetadata(metadata.sentinelPort, 26379)
-  const sentinelEndpoint =
-    endpointWithDefaultPort(firstEndpoint(metadata.sentinelEndpoint), sentinelPort) ||
-    redisSentinelEndpointForServer(instance, context, metadata, sentinelPort) ||
-    endpointFromHost(firstEndpoint(metadata.endpoint) || firstEndpoint(metadata.currentMasterEndpoint), sentinelPort)
-  return dependencyLabel(instance, context, 'Redis', sentinelEndpoint)
-}
-
 function dependencyLabel(instance: AppInstanceOption, context: AppInstallDialogContext | undefined, prefix: string, preferredEndpoint?: string) {
   const metadata = parseMetadata(instance.metadata)
   const topology = String(instance.topology || metadata.topology || '').trim()
@@ -441,78 +437,6 @@ function dependencyLabel(instance: AppInstanceOption, context: AppInstallDialogC
     parts.push(serverText)
   }
   return parts.join(' / ')
-}
-
-function firstEndpoint(value: unknown) {
-  if (Array.isArray(value)) {
-    for (const item of value) {
-      const endpoint = String(item ?? '').trim()
-      if (endpoint) {
-        return endpoint
-      }
-    }
-    return ''
-  }
-  return String(value ?? '').trim()
-}
-
-function redisSentinelEndpointForServer(
-  instance: AppInstanceOption,
-  context: AppInstallDialogContext | undefined,
-  metadata: Record<string, unknown>,
-  port: number
-) {
-  const server = (context?.servers ?? []).find((item) => item.id === instance.serverId)
-  const host = String(server?.host ?? '').trim()
-  if (!host) {
-    return ''
-  }
-  const matching = endpointList(metadata.sentinelEndpoints).find((endpoint) => endpointHost(endpoint) === host)
-  return endpointWithDefaultPort(matching, port) || `${host}:${port}`
-}
-
-function endpointList(value: unknown) {
-  if (Array.isArray(value)) {
-    return value.map((item) => String(item ?? '').trim()).filter(Boolean)
-  }
-  return String(value ?? '')
-    .split(/[,\n\r;]+/)
-    .map((item) => item.trim())
-    .filter(Boolean)
-}
-
-function endpointWithDefaultPort(endpoint: string | undefined, port: number) {
-  const text = String(endpoint ?? '').trim()
-  if (!text) {
-    return ''
-  }
-  return text.includes(':') ? text : `${text}:${port}`
-}
-
-function endpointFromHost(endpoint: string, port: number) {
-  const host = endpointHost(endpoint)
-  return host ? `${host}:${port}` : ''
-}
-
-function endpointHost(endpoint: string | undefined) {
-  let text = String(endpoint ?? '').trim()
-  if (!text) {
-    return ''
-  }
-  const schemeIndex = text.indexOf('://')
-  if (schemeIndex >= 0) {
-    text = text.slice(schemeIndex + 3)
-  }
-  const slashIndex = text.indexOf('/')
-  if (slashIndex >= 0) {
-    text = text.slice(0, slashIndex)
-  }
-  return text.split(':')[0]?.trim() ?? ''
-}
-
-function numberFromMetadata(value: unknown, fallback: number) {
-  const parsed = Number(value)
-  return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback
 }
 
 function parseMetadata(value?: string) {

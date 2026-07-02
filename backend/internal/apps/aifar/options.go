@@ -90,15 +90,11 @@ type InstallOptions struct {
 	NacosUser               string
 	NacosPassword           string
 	NacosNamespace          string
-	DBSource                string
-	DBInstanceID            string
 	DBHost                  string
 	DBPort                  int
 	DBNameNacos             string
 	DBUser                  string
 	DBPassword              string
-	RedisSource             string
-	RedisInstanceID         string
 	RedisMode               string
 	RedisHost               string
 	RedisPort               int
@@ -107,8 +103,6 @@ type InstallOptions struct {
 	RedisSentinelMasterName string
 	RedisSentinelNodes      []string
 	RedisClusterNodes       []string
-	MinioSource             string
-	MinioInstanceID         string
 	MinioEnableStorage      bool
 	MinioPlatform           string
 	MinioEndpoint           string
@@ -141,16 +135,13 @@ func optionsFromParameters(parameters map[string]any) InstallOptions {
 		NacosUser:          defaultNacosUser,
 		NacosPassword:      defaultNacosPassword,
 		NacosNamespace:     defaultNacosNS,
-		DBSource:           dependencyManual,
 		DBPort:             defaultDBPort,
 		DBNameNacos:        defaultDBNameNacos,
 		DBUser:             "root",
-		RedisSource:        dependencyManual,
 		RedisMode:          redisModeStandalone,
 		RedisHost:          defaultRedisHost,
 		RedisPort:          defaultRedisPort,
 		RedisDatabase:      defaultRedisDatabase,
-		MinioSource:        dependencyManual,
 		MinioEnableStorage: true,
 		MinioPlatform:      defaultMinioPlatform,
 		MinioBucketName:    defaultMinioBucket,
@@ -170,22 +161,19 @@ func optionsFromParameters(parameters map[string]any) InstallOptions {
 	opts.NacosUser = stringParam(parameters, "nacosUser", opts.NacosUser)
 	opts.NacosPassword = stringParam(parameters, "nacosPassword", opts.NacosPassword)
 	opts.NacosNamespace = stringParam(parameters, "nacosNamespace", opts.NacosNamespace)
-	opts.DBSource = normalizeDependencySource(stringParam(parameters, "dbSource", opts.DBSource))
-	opts.DBInstanceID = stringParam(parameters, "dbInstanceId", opts.DBInstanceID)
 	opts.DBHost = stringParam(parameters, "dbHost", opts.DBHost)
 	opts.DBPort = intParam(parameters, "dbPort", opts.DBPort)
 	opts.DBNameNacos = stringParam(parameters, "dbNameNacos", opts.DBNameNacos)
 	opts.DBUser = stringParam(parameters, "dbUser", opts.DBUser)
 	opts.DBPassword = stringParam(parameters, "dbPassword", opts.DBPassword)
-	opts.RedisSource = normalizeDependencySource(stringParam(parameters, "redisSource", opts.RedisSource))
-	opts.RedisInstanceID = stringParam(parameters, "redisInstanceId", opts.RedisInstanceID)
 	opts.RedisMode = normalizeRedisMode(stringParam(parameters, "redisMode", opts.RedisMode))
 	opts.RedisHost = stringParam(parameters, "redisHost", opts.RedisHost)
 	opts.RedisPort = intParam(parameters, "redisPort", opts.RedisPort)
 	opts.RedisPassword = stringParam(parameters, "redisPassword", opts.RedisPassword)
 	opts.RedisDatabase = intParam(parameters, "redisDatabase", opts.RedisDatabase)
-	opts.MinioSource = normalizeDependencySource(stringParam(parameters, "minioSource", opts.MinioSource))
-	opts.MinioInstanceID = stringParam(parameters, "minioInstanceId", opts.MinioInstanceID)
+	opts.RedisSentinelMasterName = stringParam(parameters, "redisSentinelMasterName", opts.RedisSentinelMasterName)
+	opts.RedisSentinelNodes = stringListParam(parameters, "redisSentinelNodes", opts.RedisSentinelNodes)
+	opts.RedisClusterNodes = stringListParam(parameters, "redisClusterNodes", opts.RedisClusterNodes)
 	opts.MinioEnableStorage = boolParam(parameters, "minioEnableStorage", opts.MinioEnableStorage)
 	opts.MinioPlatform = stringParam(parameters, "minioPlatform", opts.MinioPlatform)
 	opts.MinioEndpoint = stringParam(parameters, "minioEndpoint", opts.MinioEndpoint)
@@ -202,9 +190,6 @@ func optionsFromParameters(parameters map[string]any) InstallOptions {
 }
 
 func (o InstallOptions) Validate() error {
-	if o.DBSource == dependencyExisting && strings.TrimSpace(o.DBInstanceID) == "" {
-		return fmt.Errorf("database instance is required")
-	}
 	if strings.TrimSpace(o.DBHost) == "" {
 		return fmt.Errorf("database host is required")
 	}
@@ -224,12 +209,6 @@ func (o InstallOptions) Validate() error {
 	}
 	if strings.TrimSpace(o.NacosHost) == "" {
 		return fmt.Errorf("nacos host is required")
-	}
-	if o.RedisSource == dependencyExisting && strings.TrimSpace(o.RedisInstanceID) == "" {
-		return fmt.Errorf("redis instance is required")
-	}
-	if o.MinioEnableStorage && o.MinioSource == dependencyExisting && strings.TrimSpace(o.MinioInstanceID) == "" {
-		return fmt.Errorf("minio instance is required")
 	}
 	if strings.TrimSpace(o.RedisHost) == "" {
 		return fmt.Errorf("redis host is required")
@@ -539,6 +518,39 @@ func boolParam(parameters map[string]any, name string, fallback bool) bool {
 	default:
 		return fallback
 	}
+}
+
+func stringListParam(parameters map[string]any, name string, fallback []string) []string {
+	value, ok := parameters[name]
+	if !ok || value == nil {
+		return fallback
+	}
+	var out []string
+	appendValue := func(item any) {
+		for _, part := range strings.FieldsFunc(fmt.Sprint(item), func(r rune) bool {
+			return r == ',' || r == ';' || r == '\n' || r == '\r'
+		}) {
+			if text := strings.TrimSpace(part); text != "" {
+				out = append(out, text)
+			}
+		}
+	}
+	switch v := value.(type) {
+	case []string:
+		for _, item := range v {
+			appendValue(item)
+		}
+	case []any:
+		for _, item := range v {
+			appendValue(item)
+		}
+	default:
+		appendValue(v)
+	}
+	if len(out) == 0 {
+		return fallback
+	}
+	return out
 }
 
 func validPort(port int) bool {
