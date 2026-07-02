@@ -495,3 +495,5 @@
 - 结论：原因是 `sh` 函数变量默认全局，`copy_file_required` 内的 `source` 覆盖了 `copy_shared_release_files` 的 `source`，导致 env 路径拼到 `compose.yaml` 后面；已将更新脚本内嵌套函数变量改为唯一前缀变量，并增加测试防止再次使用独立 `source="$1"`。
 - 问题：用户希望 Windows 脚本从 `D:\workspace\alpha\backend\alpha-java-cloud` 自动导出 `alpha-oauth` 等服务 jar，形成可整体上传给部署平台的更新包。
 - 结论：新增 `scripts/export-alpha-jars.ps1`，默认扫描 alpha Java Cloud 的 Maven/Gradle jar 输出，按 oauth/permission/system/file/message/im/contacts/meeting/gateway 映射复制到 `artifacts/<service>/alpha-*.jar`，生成 `manifest.json` 和 zip；该包格式为后续平台批量导入入口准备。
+- 问题：用户运行 `export-alpha-jars.ps1` 时被 Windows PowerShell 执行策略拦截。
+- 结论：可用一次性 `powershell.exe -NoProfile -ExecutionPolicy Bypass -File ...` 绕过；已新增 `scripts/export-alpha-jars.cmd` 包装脚本，直接调用同名 ps1 并携带 `ExecutionPolicy Bypass`。
