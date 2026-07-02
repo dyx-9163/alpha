@@ -39,6 +39,9 @@ const (
 	defaultRedisHost     = "localhost"
 	defaultRedisPort     = 6379
 	defaultRedisDatabase = 1
+	defaultMinioPlatform = "minio-1"
+	defaultMinioBucket   = "aifar"
+	defaultMinioAPIPort  = 9000
 	dependencyManual     = "manual"
 	dependencyExisting   = "existing"
 	redisModeStandalone  = "standalone"
@@ -104,6 +107,16 @@ type InstallOptions struct {
 	RedisSentinelMasterName string
 	RedisSentinelNodes      []string
 	RedisClusterNodes       []string
+	MinioSource             string
+	MinioInstanceID         string
+	MinioEnableStorage      bool
+	MinioPlatform           string
+	MinioEndpoint           string
+	MinioAccessKey          string
+	MinioSecretKey          string
+	MinioBucketName         string
+	MinioDomain             string
+	MinioBasePath           string
 	InitSQL                 bool
 }
 
@@ -116,27 +129,31 @@ type Bundle struct {
 
 func optionsFromParameters(parameters map[string]any) InstallOptions {
 	opts := InstallOptions{
-		Timezone:       defaultTimezone,
-		NetworkName:    defaultNetworkName,
-		AppCPUs:        defaultAppCPUs,
-		AppMemoryLimit: defaultMemoryLimit,
-		GatewayPort:    defaultGatewayPort,
-		WebPort:        defaultWebPort,
-		NacosWebPort:   defaultNacosWebPort,
-		NacosAPIPort:   defaultNacosAPIPort,
-		NacosSource:    dependencyManual,
-		NacosUser:      defaultNacosUser,
-		NacosPassword:  defaultNacosPassword,
-		NacosNamespace: defaultNacosNS,
-		DBSource:       dependencyManual,
-		DBPort:         defaultDBPort,
-		DBNameNacos:    defaultDBNameNacos,
-		DBUser:         "root",
-		RedisSource:    dependencyManual,
-		RedisMode:      redisModeStandalone,
-		RedisHost:      defaultRedisHost,
-		RedisPort:      defaultRedisPort,
-		RedisDatabase:  defaultRedisDatabase,
+		Timezone:           defaultTimezone,
+		NetworkName:        defaultNetworkName,
+		AppCPUs:            defaultAppCPUs,
+		AppMemoryLimit:     defaultMemoryLimit,
+		GatewayPort:        defaultGatewayPort,
+		WebPort:            defaultWebPort,
+		NacosWebPort:       defaultNacosWebPort,
+		NacosAPIPort:       defaultNacosAPIPort,
+		NacosSource:        dependencyManual,
+		NacosUser:          defaultNacosUser,
+		NacosPassword:      defaultNacosPassword,
+		NacosNamespace:     defaultNacosNS,
+		DBSource:           dependencyManual,
+		DBPort:             defaultDBPort,
+		DBNameNacos:        defaultDBNameNacos,
+		DBUser:             "root",
+		RedisSource:        dependencyManual,
+		RedisMode:          redisModeStandalone,
+		RedisHost:          defaultRedisHost,
+		RedisPort:          defaultRedisPort,
+		RedisDatabase:      defaultRedisDatabase,
+		MinioSource:        dependencyManual,
+		MinioEnableStorage: true,
+		MinioPlatform:      defaultMinioPlatform,
+		MinioBucketName:    defaultMinioBucket,
 	}
 	opts.Timezone = stringParam(parameters, "timezone", opts.Timezone)
 	opts.NetworkName = stringParam(parameters, "networkName", opts.NetworkName)
@@ -167,6 +184,19 @@ func optionsFromParameters(parameters map[string]any) InstallOptions {
 	opts.RedisPort = intParam(parameters, "redisPort", opts.RedisPort)
 	opts.RedisPassword = stringParam(parameters, "redisPassword", opts.RedisPassword)
 	opts.RedisDatabase = intParam(parameters, "redisDatabase", opts.RedisDatabase)
+	opts.MinioSource = normalizeDependencySource(stringParam(parameters, "minioSource", opts.MinioSource))
+	opts.MinioInstanceID = stringParam(parameters, "minioInstanceId", opts.MinioInstanceID)
+	opts.MinioEnableStorage = boolParam(parameters, "minioEnableStorage", opts.MinioEnableStorage)
+	opts.MinioPlatform = stringParam(parameters, "minioPlatform", opts.MinioPlatform)
+	opts.MinioEndpoint = stringParam(parameters, "minioEndpoint", opts.MinioEndpoint)
+	opts.MinioAccessKey = stringParam(parameters, "minioAccessKey", opts.MinioAccessKey)
+	opts.MinioSecretKey = stringParam(parameters, "minioSecretKey", opts.MinioSecretKey)
+	opts.MinioBucketName = stringParam(parameters, "minioBucketName", opts.MinioBucketName)
+	opts.MinioDomain = stringParam(parameters, "minioDomain", opts.MinioDomain)
+	opts.MinioBasePath = stringParam(parameters, "minioBasePath", opts.MinioBasePath)
+	if strings.TrimSpace(opts.MinioDomain) == "" {
+		opts.MinioDomain = deriveMinioDomain(opts.MinioEndpoint, opts.MinioBucketName)
+	}
 	opts.InitSQL = boolParam(parameters, "initSql", false)
 	return opts
 }
@@ -196,8 +226,28 @@ func (o InstallOptions) Validate() error {
 	if o.RedisSource == dependencyExisting && strings.TrimSpace(o.RedisInstanceID) == "" {
 		return fmt.Errorf("redis instance is required")
 	}
+	if o.MinioEnableStorage && o.MinioSource == dependencyExisting && strings.TrimSpace(o.MinioInstanceID) == "" {
+		return fmt.Errorf("minio instance is required")
+	}
 	if strings.TrimSpace(o.RedisHost) == "" {
 		return fmt.Errorf("redis host is required")
+	}
+	if o.MinioEnableStorage {
+		if strings.TrimSpace(o.MinioEndpoint) == "" {
+			return fmt.Errorf("minio endpoint is required")
+		}
+		if strings.TrimSpace(o.MinioAccessKey) == "" {
+			return fmt.Errorf("minio access key is required")
+		}
+		if strings.TrimSpace(o.MinioSecretKey) == "" {
+			return fmt.Errorf("minio secret key is required")
+		}
+		if strings.TrimSpace(o.MinioBucketName) == "" {
+			return fmt.Errorf("minio bucket name is required")
+		}
+		if strings.TrimSpace(o.MinioPlatform) == "" {
+			return fmt.Errorf("minio platform is required")
+		}
 	}
 	if !validPort(o.DBPort) || !validPort(o.RedisPort) || !validPort(o.GatewayPort) || !validPort(o.WebPort) || !validPort(o.NacosWebPort) || !validPort(o.NacosAPIPort) {
 		return fmt.Errorf("ports must be between 1 and 65535")
@@ -222,19 +272,26 @@ func (o InstallOptions) Validate() error {
 		return fmt.Errorf("unsupported redis mode: %s", o.RedisMode)
 	}
 	for name, value := range map[string]string{
-		"timezone":       o.Timezone,
-		"networkName":    o.NetworkName,
-		"appCPUs":        o.AppCPUs,
-		"appMemoryLimit": o.AppMemoryLimit,
-		"nacosHost":      o.NacosHost,
-		"nacosUser":      o.NacosUser,
-		"nacosPassword":  o.NacosPassword,
-		"nacosNamespace": o.NacosNamespace,
-		"dbHost":         o.DBHost,
-		"redisHost":      o.RedisHost,
-		"redisMode":      o.RedisMode,
+		"timezone":        o.Timezone,
+		"networkName":     o.NetworkName,
+		"appCPUs":         o.AppCPUs,
+		"appMemoryLimit":  o.AppMemoryLimit,
+		"nacosHost":       o.NacosHost,
+		"nacosUser":       o.NacosUser,
+		"nacosPassword":   o.NacosPassword,
+		"nacosNamespace":  o.NacosNamespace,
+		"dbHost":          o.DBHost,
+		"redisHost":       o.RedisHost,
+		"redisMode":       o.RedisMode,
+		"minioPlatform":   o.MinioPlatform,
+		"minioEndpoint":   o.MinioEndpoint,
+		"minioAccessKey":  o.MinioAccessKey,
+		"minioSecretKey":  o.MinioSecretKey,
+		"minioBucketName": o.MinioBucketName,
+		"minioDomain":     o.MinioDomain,
+		"minioBasePath":   o.MinioBasePath,
 	} {
-		if strings.TrimSpace(value) == "" {
+		if strings.TrimSpace(value) == "" && !strings.HasPrefix(name, "minio") {
 			return fmt.Errorf("%s is required", name)
 		}
 		if strings.ContainsAny(value, "\r\n") {
@@ -257,6 +314,15 @@ func (o InstallOptions) RedisSentinelNodesCSV() string {
 
 func (o InstallOptions) RedisClusterNodesCSV() string {
 	return strings.Join(o.RedisClusterNodes, ",")
+}
+
+func deriveMinioDomain(endpoint, bucket string) string {
+	endpoint = strings.TrimRight(strings.TrimSpace(endpoint), "/")
+	bucket = strings.Trim(strings.TrimSpace(bucket), "/")
+	if endpoint == "" || bucket == "" {
+		return endpoint
+	}
+	return endpoint + "/" + bucket + "/"
 }
 
 func normalizeDependencySource(value string) string {

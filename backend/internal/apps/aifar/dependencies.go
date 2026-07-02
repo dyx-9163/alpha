@@ -14,8 +14,10 @@ func (s Service) resolveInstallOptions(options InstallOptions) (InstallOptions, 
 	options.NacosSource = normalizeDependencySource(options.NacosSource)
 	options.DBSource = normalizeDependencySource(options.DBSource)
 	options.RedisSource = normalizeDependencySource(options.RedisSource)
+	options.MinioSource = normalizeDependencySource(options.MinioSource)
 	options.RedisMode = normalizeRedisMode(options.RedisMode)
-	if options.NacosSource != dependencyExisting && options.DBSource != dependencyExisting && options.RedisSource != dependencyExisting {
+	minioNeedsResolve := options.MinioEnableStorage && options.MinioSource == dependencyExisting
+	if options.NacosSource != dependencyExisting && options.DBSource != dependencyExisting && options.RedisSource != dependencyExisting && !minioNeedsResolve {
 		return options, nil
 	}
 	instances, err := s.store.ListAppInstances()
@@ -34,6 +36,11 @@ func (s Service) resolveInstallOptions(options InstallOptions) (InstallOptions, 
 	}
 	if options.RedisSource == dependencyExisting {
 		if err := s.resolveRedisDependency(&options, instances); err != nil {
+			return options, err
+		}
+	}
+	if minioNeedsResolve {
+		if err := s.resolveMinioDependency(&options, instances); err != nil {
 			return options, err
 		}
 	}
@@ -126,6 +133,28 @@ func (s Service) resolveRedisDependency(options *InstallOptions, instances []sto
 		options.RedisMode = redisModeStandalone
 		options.RedisHost = endpoint.Host
 		options.RedisPort = endpoint.Port
+	}
+	return nil
+}
+
+func (s Service) resolveMinioDependency(options *InstallOptions, instances []store.AppInstance) error {
+	selected, ok := findDependencyInstance(instances, options.MinioInstanceID)
+	if !ok {
+		return fmt.Errorf("selected minio instance was not found")
+	}
+	if selected.App != "minio" {
+		return fmt.Errorf("selected minio instance is not a MinIO instance")
+	}
+	metadata := metadataFromInstance(selected)
+	if endpoint, ok := endpointURLFromMetadata(metadata, defaultMinioAPIPort); ok {
+		options.MinioEndpoint = endpoint
+	} else if endpoint, ok := s.instanceEndpoint(selected, defaultMinioAPIPort, []string{"endpoint", "peerEndpoint"}, []string{"apiPort", "port"}); ok {
+		options.MinioEndpoint = fmt.Sprintf("http://%s:%d", endpoint.Host, endpoint.Port)
+	} else {
+		return fmt.Errorf("selected minio instance has no usable endpoint")
+	}
+	if strings.TrimSpace(options.MinioDomain) == "" {
+		options.MinioDomain = deriveMinioDomain(options.MinioEndpoint, options.MinioBucketName)
 	}
 	return nil
 }
@@ -302,6 +331,22 @@ func splitEndpoint(value string, defaultPort int) (dependencyEndpoint, bool) {
 		return dependencyEndpoint{Host: strings.TrimSpace(value), Port: defaultPort}, true
 	}
 	return dependencyEndpoint{}, false
+}
+
+func endpointURLFromMetadata(metadata map[string]any, defaultPort int) (string, bool) {
+	for _, key := range []string{"endpoint", "peerEndpoint"} {
+		raw := stringFromMetadata(metadata, key, "")
+		endpoint, ok := splitEndpoint(raw, defaultPort)
+		if !ok {
+			continue
+		}
+		scheme := "http"
+		if parsed, err := url.Parse(raw); err == nil && parsed.Scheme != "" {
+			scheme = parsed.Scheme
+		}
+		return fmt.Sprintf("%s://%s:%d", scheme, endpoint.Host, endpoint.Port), true
+	}
+	return "", false
 }
 
 func intFromMetadata(metadata map[string]any, key string, fallback int) int {

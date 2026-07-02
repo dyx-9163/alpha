@@ -19,7 +19,7 @@ export const aifarMessages = {
     sourceLabel: 'Docker Compose 离线包',
     description: '基于 resources/aifar/docker-apps 离线包部署 AIFAR 微服务。',
     installTitle: '安装 AIFAR 服务',
-    hint: '目标服务器需要先安装 Docker Engine 和 Docker Compose；可选择已部署 Nacos/MySQL/Redis，连接参数会写入服务环境变量。勾选初始化 SQL 时，目标服务器还需要 mysql 客户端。',
+    hint: '目标服务器需要先安装 Docker Engine 和 Docker Compose；可选择已部署 Nacos/MySQL/Redis/MinIO，连接参数会写入服务环境变量。勾选初始化 SQL 时，目标服务器还需要 mysql 客户端。',
     version: '版本',
     versionPlaceholder: '选择 docker-apps 资源包',
     servers: '目标服务器',
@@ -65,6 +65,20 @@ export const aifarMessages = {
     redisPort: 'Redis 端口',
     redisPassword: 'Redis 密码',
     redisDatabase: 'Redis 数据库',
+    minioEnableStorage: '启用 MinIO 存储',
+    minioSource: 'MinIO 来源',
+    minioSourceExisting: '选择已部署 MinIO',
+    minioSourceManual: '手动填写 MinIO',
+    minioInstance: '已部署 MinIO',
+    minioInstancePlaceholder: '选择 MinIO 实例',
+    noMinioInstances: '暂无可选 MinIO 实例',
+    minioEndpoint: 'MinIO 地址',
+    minioPlatform: '存储平台标识',
+    minioAccessKey: 'MinIO Access Key',
+    minioSecretKey: 'MinIO Secret Key',
+    minioBucketName: 'MinIO Bucket',
+    minioDomain: '访问域名',
+    minioBasePath: '基础路径',
     initSql: '初始化 SQL',
     portInvalid: '端口必须在 1-65535 之间',
     textRequired: '该配置不能为空',
@@ -76,7 +90,7 @@ export const aifarMessages = {
     sourceLabel: 'Docker Compose bundle',
     description: 'Deploy AIFAR microservices from the resources/aifar/docker-apps offline bundle.',
     installTitle: 'Install AIFAR Service',
-    hint: 'Target server must already have Docker Engine and Docker Compose. Deployed Nacos/MySQL/Redis instances can be selected and connection settings are written to service environment variables. SQL initialization also requires mysql client on the target server.',
+    hint: 'Target server must already have Docker Engine and Docker Compose. Deployed Nacos/MySQL/Redis/MinIO instances can be selected and connection settings are written to service environment variables. SQL initialization also requires mysql client on the target server.',
     version: 'Version',
     versionPlaceholder: 'Select docker-apps bundle',
     servers: 'Target server',
@@ -122,6 +136,20 @@ export const aifarMessages = {
     redisPort: 'Redis port',
     redisPassword: 'Redis password',
     redisDatabase: 'Redis database',
+    minioEnableStorage: 'Enable MinIO storage',
+    minioSource: 'MinIO source',
+    minioSourceExisting: 'Use deployed MinIO',
+    minioSourceManual: 'Enter MinIO manually',
+    minioInstance: 'Deployed MinIO',
+    minioInstancePlaceholder: 'Select a MinIO instance',
+    noMinioInstances: 'No selectable MinIO instances',
+    minioEndpoint: 'MinIO endpoint',
+    minioPlatform: 'Storage platform',
+    minioAccessKey: 'MinIO access key',
+    minioSecretKey: 'MinIO secret key',
+    minioBucketName: 'MinIO bucket',
+    minioDomain: 'Access domain',
+    minioBasePath: 'Base path',
     initSql: 'Initialize SQL',
     portInvalid: 'Port must be between 1 and 65535',
     textRequired: 'This value is required',
@@ -147,12 +175,15 @@ export function aifarInstallDialogProps(locale?: string, context?: AppInstallDia
   const nacosOptions = nacosInstanceOptions(context)
   const mysqlOptions = mysqlInstanceOptions(context)
   const redisOptions = redisInstanceOptions(context)
+  const minioOptions = minioInstanceOptions(context)
   const nacosSourceDefault = nacosOptions.length ? 'existing' : 'manual'
   const mysqlSourceDefault = mysqlOptions.length ? 'existing' : 'manual'
   const redisSourceDefault = redisOptions.length ? 'existing' : 'manual'
+  const minioSourceDefault = minioOptions.length ? 'existing' : 'manual'
   const nacosSelectOptions = nacosOptions.length ? nacosOptions : [{ label: copy.noNacosInstances, value: '', disabled: true }]
   const mysqlSelectOptions = mysqlOptions.length ? mysqlOptions : [{ label: copy.noDbInstances, value: '', disabled: true }]
   const redisSelectOptions = redisOptions.length ? redisOptions : [{ label: copy.noRedisInstances, value: '', disabled: true }]
+  const minioSelectOptions = minioOptions.length ? minioOptions : [{ label: copy.noMinioInstances, value: '', disabled: true }]
   const dialogCopy: AppInstallDialogCopy = {
     title: copy.installTitle,
     hint: copy.hint,
@@ -260,6 +291,59 @@ export function aifarInstallDialogProps(locale?: string, context?: AppInstallDia
         }
       },
       {
+        name: 'minioEnableStorage',
+        label: copy.minioEnableStorage,
+        type: 'switch',
+        defaultValue: true
+      },
+      {
+        ...selectField('minioSource', copy.minioSource, [
+          { label: copy.minioSourceExisting, value: 'existing', disabled: minioOptions.length === 0 },
+          { label: copy.minioSourceManual, value: 'manual' }
+        ], minioSourceDefault, copy),
+        visibleWhen: valueTruthy('minioEnableStorage')
+      },
+      {
+        ...selectField('minioInstanceId', copy.minioInstance, minioSelectOptions, minioOptions[0]?.value ?? '', copy, copy.minioInstancePlaceholder),
+        visibleWhen: enabledSourceIs('minioEnableStorage', 'minioSource', 'existing')
+      },
+      {
+        ...requiredText('minioEndpoint', copy.minioEndpoint, '', copy),
+        visibleWhen: enabledSourceIsNot('minioEnableStorage', 'minioSource', 'existing')
+      },
+      {
+        ...requiredText('minioPlatform', copy.minioPlatform, 'minio-1', copy),
+        visibleWhen: valueTruthy('minioEnableStorage')
+      },
+      {
+        ...requiredText('minioAccessKey', copy.minioAccessKey, '', copy),
+        type: 'password',
+        visibleWhen: valueTruthy('minioEnableStorage')
+      },
+      {
+        ...requiredText('minioSecretKey', copy.minioSecretKey, '', copy),
+        type: 'password',
+        visibleWhen: valueTruthy('minioEnableStorage')
+      },
+      {
+        ...requiredText('minioBucketName', copy.minioBucketName, 'aifar', copy),
+        visibleWhen: valueTruthy('minioEnableStorage')
+      },
+      {
+        name: 'minioDomain',
+        label: copy.minioDomain,
+        type: 'text',
+        defaultValue: '',
+        visibleWhen: valueTruthy('minioEnableStorage')
+      },
+      {
+        name: 'minioBasePath',
+        label: copy.minioBasePath,
+        type: 'text',
+        defaultValue: '',
+        visibleWhen: valueTruthy('minioEnableStorage')
+      },
+      {
         name: 'initSql',
         label: copy.initSql,
         type: 'switch',
@@ -325,6 +409,18 @@ function sourceIsNot(name: string, value: string) {
   return (values: AppInstallFieldValues) => values[name] !== value
 }
 
+function valueTruthy(name: string) {
+  return (values: AppInstallFieldValues) => values[name] !== false
+}
+
+function enabledSourceIs(enabledName: string, sourceName: string, value: string) {
+  return (values: AppInstallFieldValues) => values[enabledName] !== false && values[sourceName] === value
+}
+
+function enabledSourceIsNot(enabledName: string, sourceName: string, value: string) {
+  return (values: AppInstallFieldValues) => values[enabledName] !== false && values[sourceName] !== value
+}
+
 function nacosInstanceOptions(context?: AppInstallDialogContext): AppInstallFieldOption[] {
   return (context?.instances ?? [])
     .filter((instance) => instance.app === 'nacos')
@@ -348,6 +444,15 @@ function redisInstanceOptions(context?: AppInstallDialogContext): AppInstallFiel
     .filter((instance) => instance.app === 'redis')
     .map((instance) => ({
       label: redisDependencyLabel(instance, context),
+      value: instance.id
+    }))
+}
+
+function minioInstanceOptions(context?: AppInstallDialogContext): AppInstallFieldOption[] {
+  return (context?.instances ?? [])
+    .filter((instance) => instance.app === 'minio')
+    .map((instance) => ({
+      label: dependencyLabel(instance, context, 'MinIO'),
       value: instance.id
     }))
 }

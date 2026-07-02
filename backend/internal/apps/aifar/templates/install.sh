@@ -46,6 +46,14 @@ REDIS_DATABASE={{ quote .Options.RedisDatabase }}
 REDIS_SENTINEL_MASTER={{ quote .Options.RedisSentinelMasterName }}
 REDIS_SENTINEL_NODES={{ quote .Options.RedisSentinelNodesCSV }}
 REDIS_CLUSTER_NODES={{ quote .Options.RedisClusterNodesCSV }}
+MINIO_ENABLE_STORAGE={{ quote .Options.MinioEnableStorage }}
+MINIO_PLATFORM={{ quote .Options.MinioPlatform }}
+MINIO_ENDPOINT={{ quote .Options.MinioEndpoint }}
+MINIO_ACCESS_KEY={{ quote .Options.MinioAccessKey }}
+MINIO_SECRET_KEY={{ quote .Options.MinioSecretKey }}
+MINIO_BUCKET_NAME={{ quote .Options.MinioBucketName }}
+MINIO_DOMAIN={{ quote .Options.MinioDomain }}
+MINIO_BASE_PATH={{ quote .Options.MinioBasePath }}
 INIT_SQL={{ quote .Options.InitSQL }}
 
 fail() {
@@ -117,6 +125,189 @@ load_docker_images() {
 require_local_image() {
   image="$1"
   docker image inspect "$image" >/dev/null 2>&1 || fail "required offline Docker image is missing after docker load: $image"
+}
+
+parse_host_port() {
+  value="$1"
+  fallback_port="$2"
+  text="$value"
+  case "$text" in
+    *://*) text="${text#*://}" ;;
+  esac
+  text="${text%%/*}"
+  PARSED_HOST=""
+  PARSED_PORT="$fallback_port"
+  case "$text" in
+    *:*)
+      PARSED_HOST="${text%:*}"
+      PARSED_PORT="${text##*:}"
+      ;;
+    *)
+      PARSED_HOST="$text"
+      ;;
+  esac
+}
+
+tcp_probe() {
+  host="$1"
+  port="$2"
+  if command -v nc >/dev/null 2>&1; then
+    nc -z -w 3 "$host" "$port" >/dev/null 2>&1
+    return $?
+  fi
+  if command -v bash >/dev/null 2>&1; then
+    if command -v timeout >/dev/null 2>&1; then
+      timeout 5 bash -c "</dev/tcp/$host/$port" >/dev/null 2>&1
+      return $?
+    fi
+    bash -c "</dev/tcp/$host/$port" >/dev/null 2>&1
+    return $?
+  fi
+  return 2
+}
+
+check_tcp_dependency() {
+  name="$1"
+  host="$2"
+  port="$3"
+  [ -n "$host" ] || fail "$name dependency host is empty"
+  if tcp_probe "$host" "$port"; then
+    echo "$name dependency is reachable at $host:$port"
+    return 0
+  fi
+  fail "$name dependency is not reachable at $host:$port"
+}
+
+http_probe() {
+  url="$1"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsS --connect-timeout 5 "$url" >/dev/null 2>&1
+    return $?
+  fi
+  if command -v wget >/dev/null 2>&1; then
+    wget -q -T 5 -O /dev/null "$url" >/dev/null 2>&1
+    return $?
+  fi
+  return 2
+}
+
+check_nacos_dependency() {
+  url="http://${NACOS_CONNECT_HOST}:${NACOS_PORT_WEB}/nacos/v1/console/health/readiness"
+  if http_probe "$url"; then
+    echo "Nacos dependency is ready at ${NACOS_CONNECT_HOST}:${NACOS_PORT_WEB}"
+    return 0
+  fi
+  rc=$?
+  if [ "$rc" = "2" ]; then
+    check_tcp_dependency "Nacos" "$NACOS_CONNECT_HOST" "$NACOS_PORT_WEB"
+    return 0
+  fi
+  fail "Nacos dependency readiness check failed at $url"
+}
+
+check_mysql_dependency() {
+  if command -v mysql >/dev/null 2>&1; then
+    if mysql --protocol=tcp -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" "-p$DB_PASSWORD" -N -s -e "select 1" >/dev/null 2>&1; then
+      echo "MySQL dependency is ready at $DB_HOST:$DB_PORT"
+      return 0
+    fi
+    fail "MySQL dependency authentication or readiness check failed at $DB_HOST:$DB_PORT"
+  fi
+  check_tcp_dependency "MySQL" "$DB_HOST" "$DB_PORT"
+}
+
+check_redis_endpoint() {
+  host="$1"
+  port="$2"
+  label="$3"
+  if command -v redis-cli >/dev/null 2>&1; then
+    if [ -n "$REDIS_PASSWORD" ]; then
+      if redis-cli -h "$host" -p "$port" -a "$REDIS_PASSWORD" --no-auth-warning ping >/dev/null 2>&1; then
+        echo "$label dependency is ready at $host:$port"
+        return 0
+      fi
+    elif redis-cli -h "$host" -p "$port" ping >/dev/null 2>&1; then
+      echo "$label dependency is ready at $host:$port"
+      return 0
+    fi
+    fail "$label dependency ping failed at $host:$port"
+  fi
+  check_tcp_dependency "$label" "$host" "$port"
+}
+
+check_endpoint_list() {
+  label="$1"
+  endpoints="$2"
+  fallback_port="$3"
+  [ -n "$endpoints" ] || fail "$label dependency endpoints are empty"
+  old_ifs="$IFS"
+  IFS=","
+  for endpoint in $endpoints; do
+    IFS="$old_ifs"
+    parse_host_port "$endpoint" "$fallback_port"
+    check_redis_endpoint "$PARSED_HOST" "$PARSED_PORT" "$label"
+    IFS=","
+  done
+  IFS="$old_ifs"
+}
+
+check_tcp_endpoint_list() {
+  label="$1"
+  endpoints="$2"
+  fallback_port="$3"
+  [ -n "$endpoints" ] || fail "$label dependency endpoints are empty"
+  old_ifs="$IFS"
+  IFS=","
+  for endpoint in $endpoints; do
+    IFS="$old_ifs"
+    parse_host_port "$endpoint" "$fallback_port"
+    check_tcp_dependency "$label" "$PARSED_HOST" "$PARSED_PORT"
+    IFS=","
+  done
+  IFS="$old_ifs"
+}
+
+check_redis_dependency() {
+  case "$REDIS_MODE" in
+    sentinel)
+      check_tcp_endpoint_list "Redis Sentinel" "$REDIS_SENTINEL_NODES" 26379
+      ;;
+    cluster)
+      check_endpoint_list "Redis Cluster" "$REDIS_CLUSTER_NODES" "$REDIS_PORT"
+      ;;
+    *)
+      check_redis_endpoint "$REDIS_HOST" "$REDIS_PORT" "Redis"
+      ;;
+  esac
+}
+
+check_minio_dependency() {
+  [ "$MINIO_ENABLE_STORAGE" = "true" ] || return 0
+  endpoint="${MINIO_ENDPOINT%/}"
+  [ -n "$endpoint" ] || fail "MinIO endpoint is empty"
+  case "$endpoint" in
+    http://*|https://*) health_url="$endpoint/minio/health/live" ;;
+    *) health_url="http://$endpoint/minio/health/live" ;;
+  esac
+  if http_probe "$health_url"; then
+    echo "MinIO dependency is ready at $endpoint"
+    return 0
+  fi
+  rc=$?
+  parse_host_port "$endpoint" 9000
+  if [ "$rc" = "2" ]; then
+    check_tcp_dependency "MinIO" "$PARSED_HOST" "$PARSED_PORT"
+    return 0
+  fi
+  fail "MinIO dependency readiness check failed at $health_url"
+}
+
+check_dependencies() {
+  echo "checking AIFAR external dependencies"
+  check_nacos_dependency
+  check_mysql_dependency
+  check_redis_dependency
+  check_minio_dependency
 }
 
 resolve_system_timezone() {
@@ -229,6 +420,8 @@ write_compose_env() {
   set_env APP_HEALTH_TIMEOUT "$(read_env_value "$source_env" APP_HEALTH_TIMEOUT 5s)" "$compose_env"
   set_env APP_HEALTH_RETRIES "$(read_env_value "$source_env" APP_HEALTH_RETRIES 3)" "$compose_env"
   set_env APP_HEALTH_START_PERIOD "$(read_env_value "$source_env" APP_HEALTH_START_PERIOD 30s)" "$compose_env"
+  set_env APP_STARTUP_TIMEOUT "$(read_env_value "$source_env" APP_STARTUP_TIMEOUT 180)" "$compose_env"
+  set_env APP_STABLE_WINDOW "$(read_env_value "$source_env" APP_STABLE_WINDOW 10)" "$compose_env"
   set_env GATEWAY_PORT "$GATEWAY_PORT" "$compose_env"
   set_env WEB_VUE3_PORT "$WEB_VUE3_PORT" "$compose_env"
   set_env OAUTH_PORT "$(read_env_value "$source_env" OAUTH_PORT 38001)" "$compose_env"
@@ -272,9 +465,24 @@ write_java_env() {
   set_env SPRING_DATA_REDIS_SENTINEL_MASTER "$REDIS_SENTINEL_MASTER" "$common_env"
   set_env SPRING_DATA_REDIS_SENTINEL_NODES "$REDIS_SENTINEL_NODES" "$common_env"
   set_env SPRING_DATA_REDIS_CLUSTER_NODES "$REDIS_CLUSTER_NODES" "$common_env"
+  set_env AIFAR_MINIO_ENABLE_STORAGE "$MINIO_ENABLE_STORAGE" "$common_env"
+  set_env AIFAR_MINIO_PLATFORM "$MINIO_PLATFORM" "$common_env"
+  set_env AIFAR_MINIO_ENDPOINT "$MINIO_ENDPOINT" "$common_env"
+  set_env AIFAR_MINIO_BUCKET_NAME "$MINIO_BUCKET_NAME" "$common_env"
+  set_env AIFAR_MINIO_DOMAIN "$MINIO_DOMAIN" "$common_env"
+  set_env AIFAR_MINIO_BASE_PATH "$MINIO_BASE_PATH" "$common_env"
+  set_env DROMARA_X_FILE_STORAGE_DEFAULT_PLATFORM "$MINIO_PLATFORM" "$common_env"
+  set_env DROMARA_X_FILE_STORAGE_MINIO_0_PLATFORM "$MINIO_PLATFORM" "$common_env"
+  set_env DROMARA_X_FILE_STORAGE_MINIO_0_ENABLE_STORAGE "$MINIO_ENABLE_STORAGE" "$common_env"
+  set_env DROMARA_X_FILE_STORAGE_MINIO_0_END_POINT "$MINIO_ENDPOINT" "$common_env"
+  set_env DROMARA_X_FILE_STORAGE_MINIO_0_BUCKET_NAME "$MINIO_BUCKET_NAME" "$common_env"
+  set_env DROMARA_X_FILE_STORAGE_MINIO_0_DOMAIN "$MINIO_DOMAIN" "$common_env"
+  set_env DROMARA_X_FILE_STORAGE_MINIO_0_BASE_PATH "$MINIO_BASE_PATH" "$common_env"
   set_env NACOS_PASSWORD "$NACOS_PASSWORD" "$secrets_env"
   set_env SPRING_DATASOURCE_PASSWORD "$DB_PASSWORD" "$secrets_env"
   set_env SPRING_DATA_REDIS_PASSWORD "$REDIS_PASSWORD" "$secrets_env"
+  set_env DROMARA_X_FILE_STORAGE_MINIO_0_ACCESS_KEY "$MINIO_ACCESS_KEY" "$secrets_env"
+  set_env DROMARA_X_FILE_STORAGE_MINIO_0_SECRET_KEY "$MINIO_SECRET_KEY" "$secrets_env"
   chmod 0644 "$common_env"
   chmod 0600 "$secrets_env"
 }
@@ -423,8 +631,101 @@ down_legacy() {
 start_release() {
   (
     cd "$RELEASE_DIR"
+    APP_RESTART_POLICY=no
+    export APP_RESTART_POLICY
     compose --env-file env/compose.env -f compose.yaml up -d --build
   )
+}
+
+container_for_service() {
+  service="$1"
+  read_env_value "$ENV_DIR/$service.env" APP_CONTAINER_NAME ""
+}
+
+container_status() {
+  docker inspect --format '{{ "{{" }}.State.Status{{ "}}" }}' "$1" 2>/dev/null || true
+}
+
+container_health() {
+  docker inspect --format '{{ "{{" }}if .State.Health{{ "}}" }}{{ "{{" }}.State.Health.Status{{ "}}" }}{{ "{{" }}end{{ "}}" }}' "$1" 2>/dev/null || true
+}
+
+container_restart_count() {
+  docker inspect --format '{{ "{{" }}.RestartCount{{ "}}" }}' "$1" 2>/dev/null || printf "0"
+}
+
+service_runtime_ready() {
+  service="$1"
+  container="$(container_for_service "$service")"
+  [ -n "$container" ] || return 0
+  status="$(container_status "$container")"
+  if [ "$status" != "running" ]; then
+    echo "$service container $container is not running: ${status:-missing}" >&2
+    return 1
+  fi
+  health="$(container_health "$container")"
+  if [ -n "$health" ] && [ "$health" != "healthy" ]; then
+    echo "$service container $container health is $health" >&2
+    return 1
+  fi
+  if [ "$service" != "web-vue3" ]; then
+    restarts="$(container_restart_count "$container")"
+    case "$restarts" in
+      ""|*[!0-9]*) restarts=0 ;;
+    esac
+    if [ "$restarts" -gt 0 ]; then
+      echo "$service container $container restarted $restarts time(s) during startup" >&2
+      return 1
+    fi
+  fi
+  return 0
+}
+
+wait_release_ready() {
+  startup_timeout="$(read_env_value "$ENV_DIR/compose.env" APP_STARTUP_TIMEOUT 180)"
+  stable_window="$(read_env_value "$ENV_DIR/compose.env" APP_STABLE_WINDOW 10)"
+  case "$startup_timeout" in
+    ""|*[!0-9]*) startup_timeout=180 ;;
+  esac
+  deadline=$(( $(date +%s) + startup_timeout ))
+  while :; do
+    pending=""
+    for service in $SERVICE_ORDER; do
+      [ -f "$ENV_DIR/$service.env" ] || continue
+      if ! service_runtime_ready "$service"; then
+        pending="$pending $service"
+      fi
+    done
+    if [ -z "$pending" ]; then
+      break
+    fi
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+      echo "AIFAR release $RELEASE_ID did not become ready:$pending" >&2
+      return 1
+    fi
+    sleep 3
+  done
+  case "$stable_window" in
+    ""|*[!0-9]*) stable_window=10 ;;
+  esac
+  if [ "$stable_window" -gt 0 ]; then
+    sleep "$stable_window"
+  fi
+  for service in $SERVICE_ORDER; do
+    [ -f "$ENV_DIR/$service.env" ] || continue
+    service_runtime_ready "$service" || return 1
+  done
+}
+
+apply_restart_policy() {
+  policy="$(read_env_value "$ENV_DIR/compose.env" APP_RESTART_POLICY unless-stopped)"
+  [ -n "$policy" ] || policy="unless-stopped"
+  for service in $SERVICE_ORDER; do
+    [ -f "$ENV_DIR/$service.env" ] || continue
+    container="$(container_for_service "$service")"
+    [ -n "$container" ] || continue
+    docker update --restart "$policy" "$container" >/dev/null 2>&1 || true
+  done
 }
 
 activate_release() {
@@ -510,6 +811,7 @@ write_manifest "pending"
 load_docker_images
 require_local_image "bellsoft/liberica-openjre-rocky:21"
 require_local_image "nginx:stable-alpine"
+check_dependencies
 
 if [ "$INIT_SQL" = "true" ]; then
   command -v mysql >/dev/null 2>&1 || fail "mysql client is required when SQL initialization is enabled"
@@ -532,6 +834,14 @@ if ! start_release; then
   fail "AIFAR release $RELEASE_ID failed to start"
 fi
 
+if ! wait_release_ready; then
+  write_manifest "failed"
+  down_release "$RELEASE_DIR"
+  rollback_release "$previous_release"
+  fail "AIFAR release $RELEASE_ID did not become stable"
+fi
+
+apply_restart_policy
 write_manifest "success"
 activate_release
 cleanup_old_releases

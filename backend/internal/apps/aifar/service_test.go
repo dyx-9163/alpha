@@ -165,7 +165,7 @@ func (fakeLogger) Error(format string, args ...any) {}
 
 func TestOptionsDefaultsUseRequestedAIFARValues(t *testing.T) {
 	opts := optionsFromParameters(nil)
-	if opts.Timezone != "system" || opts.NacosWebPort != 8848 || opts.NacosNamespace != "prod" || opts.NacosSource != dependencyManual {
+	if opts.Timezone != "system" || opts.NacosWebPort != 8848 || opts.NacosNamespace != "prod" || opts.NacosSource != dependencyManual || !opts.MinioEnableStorage {
 		t.Fatalf("unexpected defaults: %+v", opts)
 	}
 	if got := installRootFromDeployDir("/aifar/apps"); got != "/aifar/apps/admin" {
@@ -185,12 +185,15 @@ func TestServiceInstallsAIFARServiceFromDockerAppsBundle(t *testing.T) {
 		ServerID: "srv-1",
 		Language: "en",
 		Parameters: map[string]any{
-			"dbHost":     "10.0.0.20",
-			"dbPort":     3306,
-			"dbUser":     "root",
-			"dbPassword": "secret-value",
-			"nacosHost":  "10.0.0.50",
-			"webPort":    18080,
+			"dbHost":         "10.0.0.20",
+			"dbPort":         3306,
+			"dbUser":         "root",
+			"dbPassword":     "secret-value",
+			"nacosHost":      "10.0.0.50",
+			"webPort":        18080,
+			"minioEndpoint":  "http://10.0.0.60:9000",
+			"minioAccessKey": "aifar-file",
+			"minioSecretKey": "minio-secret",
 		},
 	}, []store.Resource{{App: "aifar", Part: "backend", Version: "docker-apps", Path: filepath.Join(root, "docker-apps", ".env")}}, fakeLogger{}, nil)
 	if err != nil {
@@ -203,8 +206,8 @@ func TestServiceInstallsAIFARServiceFromDockerAppsBundle(t *testing.T) {
 	if instance.App != "aifar" || instance.Version != "docker-apps" || instance.ServerID != "srv-1" || instance.Status != "installed" {
 		t.Fatalf("unexpected instance: %+v", instance)
 	}
-	if strings.Contains(instance.Metadata, "secret-value") {
-		t.Fatalf("metadata must not store database password: %s", instance.Metadata)
+	if strings.Contains(instance.Metadata, "secret-value") || strings.Contains(instance.Metadata, "minio-secret") || strings.Contains(instance.Metadata, "aifar-file") {
+		t.Fatalf("metadata must not store database password or MinIO credentials: %s", instance.Metadata)
 	}
 	metadata := map[string]any{}
 	if err := json.Unmarshal([]byte(instance.Metadata), &metadata); err != nil {
@@ -221,6 +224,9 @@ func TestServiceInstallsAIFARServiceFromDockerAppsBundle(t *testing.T) {
 	}
 	if metadata["nacosEndpoint"] != "10.0.0.50:8848" || metadata["nacosHost"] != "10.0.0.50" || int(metadata["nacosPort"].(float64)) != 8848 {
 		t.Fatalf("expected external Nacos endpoint metadata, got %s", instance.Metadata)
+	}
+	if metadata["minioEndpoint"] != "http://10.0.0.60:9000" || metadata["minioBucketName"] != "aifar" || metadata["minioDomain"] != "http://10.0.0.60:9000/aifar/" {
+		t.Fatalf("expected MinIO metadata without credentials, got %s", instance.Metadata)
 	}
 	if !strings.Contains(remote.joinedUploads(), "aifar-service-bundle-") || !strings.Contains(remote.joinedCommands(), "install-aifar.sh") {
 		t.Fatalf("expected bundle upload and install script run, uploads=%s commands=%s", remote.joinedUploads(), remote.joinedCommands())
@@ -250,6 +256,19 @@ func TestServiceInstallsAIFARServiceFromDockerAppsBundle(t *testing.T) {
 		!strings.Contains(remote.installScript, `require_local_image "nginx:stable-alpine"`) {
 		t.Fatalf("AIFAR install script should load offline Docker base images before build:\n%s", remote.installScript)
 	}
+	for _, want := range []string{
+		"check_dependencies",
+		"check_nacos_dependency",
+		"check_mysql_dependency",
+		"check_redis_dependency",
+		"check_minio_dependency",
+		`DROMARA_X_FILE_STORAGE_MINIO_0_ACCESS_KEY`,
+		`DROMARA_X_FILE_STORAGE_MINIO_0_SECRET_KEY`,
+	} {
+		if !strings.Contains(remote.installScript, want) {
+			t.Fatalf("AIFAR install script should include dependency checks and MinIO env with %q:\n%s", want, remote.installScript)
+		}
+	}
 	if strings.Contains(remote.installScript, "patch_nacos_server_port") || !strings.Contains(remote.installScript, "patch_nacos_sql_namespace") {
 		t.Fatalf("AIFAR install script should only patch Nacos SQL namespace defaults:\n%s", remote.installScript)
 	}
@@ -270,7 +289,9 @@ func TestServiceInstallsAIFARServiceFromDockerAppsBundle(t *testing.T) {
 		`CURRENT_LINK="$INSTALL_ROOT/current"`,
 		`java-common.env`,
 		`java-secrets.env`,
-		`compose --env-file env/compose.env -f compose.yaml up -d --build`,
+		`APP_RESTART_POLICY=no`,
+		`wait_release_ready`,
+		`apply_restart_policy`,
 		`cleanup_old_releases`,
 		`RELEASE_KEEP_COUNT=3`,
 	} {
@@ -289,6 +310,7 @@ func TestServiceResolvesManagedDatabaseAndRedisInstances(t *testing.T) {
 			"router-1": {ID: "router-1", Name: "router-1", Host: "10.0.0.30", DeployDir: "/aifar/apps"},
 			"redis-1":  {ID: "redis-1", Name: "redis-1", Host: "10.0.0.41", DeployDir: "/aifar/apps"},
 			"redis-2":  {ID: "redis-2", Name: "redis-2", Host: "10.0.0.42", DeployDir: "/aifar/apps"},
+			"minio-1":  {ID: "minio-1", Name: "minio-1", Host: "10.0.0.60", DeployDir: "/aifar/apps"},
 		},
 		instances: []store.AppInstance{
 			{
@@ -348,6 +370,19 @@ func TestServiceResolvesManagedDatabaseAndRedisInstances(t *testing.T) {
 					"topology":     "sentinel",
 				}),
 			},
+			{
+				ID:       "minio-node-1",
+				App:      "minio",
+				Version:  "2025-10-15T17-29-55Z",
+				ServerID: "minio-1",
+				Status:   "running",
+				Topology: "standalone",
+				Metadata: mustMetadata(t, map[string]any{
+					"endpoint": "http://10.0.0.60:9000",
+					"apiPort":  9000,
+					"topology": "standalone",
+				}),
+			},
 		},
 	}
 	remote := &fakeRemote{}
@@ -366,6 +401,10 @@ func TestServiceResolvesManagedDatabaseAndRedisInstances(t *testing.T) {
 			"redisSource":     "existing",
 			"redisInstanceId": "redis-node-1",
 			"redisPassword":   "redis-secret",
+			"minioSource":     "existing",
+			"minioInstanceId": "minio-node-1",
+			"minioAccessKey":  "aifar-file",
+			"minioSecretKey":  "minio-secret",
 		},
 	}, []store.Resource{{App: "aifar", Part: "backend", Version: "docker-apps", Path: filepath.Join(root, "docker-apps", ".env")}}, fakeLogger{}, nil)
 	if err != nil {
@@ -381,8 +420,8 @@ func TestServiceResolvesManagedDatabaseAndRedisInstances(t *testing.T) {
 	if instance.ID == "" {
 		t.Fatalf("expected AIFAR instance, got %+v", s.instances)
 	}
-	if strings.Contains(instance.Metadata, "secret-value") || strings.Contains(instance.Metadata, "redis-secret") {
-		t.Fatalf("metadata must not store database or redis passwords: %s", instance.Metadata)
+	if strings.Contains(instance.Metadata, "secret-value") || strings.Contains(instance.Metadata, "redis-secret") || strings.Contains(instance.Metadata, "minio-secret") || strings.Contains(instance.Metadata, "aifar-file") {
+		t.Fatalf("metadata must not store database, redis, or minio credentials: %s", instance.Metadata)
 	}
 	metadata := map[string]any{}
 	if err := json.Unmarshal([]byte(instance.Metadata), &metadata); err != nil {
@@ -394,12 +433,16 @@ func TestServiceResolvesManagedDatabaseAndRedisInstances(t *testing.T) {
 	if metadata["redisMode"] != "sentinel" || metadata["redisHost"] != "10.0.0.41" || int(metadata["redisPort"].(float64)) != 26379 {
 		t.Fatalf("expected Redis Sentinel endpoint to be used, got %s", instance.Metadata)
 	}
+	if metadata["minioSource"] != "existing" || metadata["minioInstanceId"] != "minio-node-1" || metadata["minioEndpoint"] != "http://10.0.0.60:9000" {
+		t.Fatalf("expected selected MinIO endpoint to be used, got %s", instance.Metadata)
+	}
 	for _, want := range []string{
 		"DB_HOST='10.0.0.30'",
 		"DB_PORT='6446'",
 		"REDIS_MODE='sentinel'",
 		"REDIS_SENTINEL_MASTER='aifar-master'",
 		"REDIS_SENTINEL_NODES='10.0.0.41:26379,10.0.0.42:26379'",
+		"MINIO_ENDPOINT='http://10.0.0.60:9000'",
 	} {
 		if !strings.Contains(remote.installScript, want) {
 			t.Fatalf("install script should contain %q:\n%s", want, remote.installScript)
@@ -443,6 +486,9 @@ func TestServiceResolvesManagedNacosInstance(t *testing.T) {
 			"dbPort":          3306,
 			"dbUser":          "root",
 			"dbPassword":      "secret-value",
+			"minioEndpoint":   "http://10.0.0.60:9000",
+			"minioAccessKey":  "aifar-file",
+			"minioSecretKey":  "minio-secret",
 		},
 	}, []store.Resource{{App: "aifar", Part: "backend", Version: "docker-apps", Path: filepath.Join(root, "docker-apps", ".env")}}, fakeLogger{}, nil)
 	if err != nil {

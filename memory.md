@@ -433,3 +433,11 @@
 - 结论：AIFAR 应按应用实例级原子升级设计，而不是按单个微服务零散升级；目标机使用 `releases/<releaseId>/` + `current` 指针，面板记录 release manifest/config hash，只保留每个实例最近 3 个成功 release、对应配置快照和被引用镜像，升级失败可回滚到最近成功版本。
 - 问题：用户确认按 AIFAR 部署配置与版本升级建议改造实现。
 - 结论：AIFAR 安装已改为面板参数生成单根 `compose.yaml`、分层 env、`releases/<releaseId>/` + `current` 指针和 release manifest；控制面新增 `app_releases` 记录并按实例保留最近 3 个成功 release，状态检测可返回 current release/releaseId。验证通过：`pnpm test`、`git diff --check`。
+- 问题：用户询问 AIFAR 配置中的 MinIO `access-key` 和 `secret-key` 应如何申请。
+- 结论：MinIO 应为应用单独创建 Access Key/Secret Key，推荐在 Console 的 Access Keys 中创建并限制到业务 bucket；也可用 `mc admin accesskey create` 为已有用户生成，secret 只在创建时可见，需要安全保存。
+- 问题：用户追问 MinIO 是否可以直接使用登录名密码作为 `access-key`/`secret-key`。
+- 结论：MinIO 的登录用户名/密码本身也是一组 S3 凭证，技术上可直接作为 `access-key`/`secret-key`；生产更推荐为应用创建独立 access key 或低权限用户，避免使用管理员登录凭证。
+- 问题：用户反馈 MinIO 文件存储配置重启服务后可用。
+- 结论：`fileStorage is null` 属于 alpha-file 未加载到文件存储配置或 platform 未匹配，重启后配置生效说明当前服务不支持该存储配置热刷新，后续修改存储配置需重启 alpha-file。
+- 问题：用户要求 AIFAR 除 web-vue3 外的服务启动前先校验数据库、Nacos、MinIO、Redis 是否正常，并修复重复启动导致健康检查误通过的问题。
+- 结论：AIFAR 安装已新增外部依赖预检，MinIO 作为安装参数进入管理界面和后端配置；新 release 在切流前以禁用重启策略启动，等待容器稳定且非 web-vue3 无重启后才恢复正式 restart policy，失败会回滚到旧 release。
