@@ -479,3 +479,5 @@
 - 结论：`write_java_env` 已收敛为只写 `TZ`、Nacos 连接信息和 Nacos 密码，不再注入 `SPRING_DATA_REDIS_*`、`SPRING_DATASOURCE_*`、`DROMARA_X_FILE_STORAGE_*`、`AIFAR_DB_*`、`AIFAR_REDIS_*`、`AIFAR_MINIO_*`；安装参数仍用于依赖预检和实例元数据。验证通过：`go test ./internal/apps/aifar`、`pnpm test`、`git diff --check`。
 - 问题：用户要求清理 AIFAR 安装弹窗及其他模块部署中无用或固定配置项，避免固定配置继续暴露给用户填写。
 - 结论：AIFAR 弹窗只保留目标服务器、Nacos/MySQL/Redis/MinIO 来源/实例/手动地址与 Nacos 凭据；移除时区、网络、CPU/内存、Nacos 命名空间、DB/Redis/MinIO 业务凭据、Redis DB、MinIO bucket/domain/basePath、初始化 SQL 等固定或由 Nacos 管理的字段；Nacos/MySQL/Redis/MinIO 模块也移除端口/JVM/集群名/默认服务端口等固定项。AIFAR 后端同步放松业务凭据校验，已部署 Nacos 会从实例元数据解析端口。验证通过：`go test ./internal/apps/aifar`、`pnpm web:build`、`pnpm test`、`git diff --check`。
+- 问题：用户要求容器页状态列根据 Docker 容器实际状态展示。
+- 结论：容器表格不再把非 running 统一显示为已停止，改为按 Docker 返回的 state/status 展示 created/running/restarting/paused/exited/dead 等状态，健康异常会显示为运行异常，并用 tooltip 展示 Docker 原始 status；验证通过：`pnpm web:build`、`git diff --check`。

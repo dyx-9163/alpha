@@ -74,8 +74,14 @@
             <el-table-column type="selection" width="44" />
             <el-table-column prop="name" :label="t('containers.name')" min-width="160" show-overflow-tooltip />
             <el-table-column prop="image" :label="t('containers.image')" min-width="190" show-overflow-tooltip />
-            <el-table-column prop="state" :label="t('common.status')" width="120">
-              <template #default="{ row }"><StatusTag :status="row.state === 'running' ? 'running' : 'stopped'" /></template>
+            <el-table-column prop="state" :label="t('common.status')" width="130">
+              <template #default="{ row }">
+                <el-tooltip :content="containerStatusDetail(row)" :disabled="!containerStatusDetail(row)" placement="top">
+                  <span>
+                    <StatusTag :status="containerStatusKind(row)" :label="containerStatusLabel(row)" />
+                  </span>
+                </el-tooltip>
+              </template>
             </el-table-column>
             <el-table-column prop="ports" :label="t('containers.ports')" min-width="180" show-overflow-tooltip />
             <el-table-column prop="networks" :label="t('containers.network')" min-width="140" show-overflow-tooltip />
@@ -241,6 +247,15 @@ const settingsItems = computed(() => [
 ])
 const selectedContainerIds = computed(() => selectedContainerRows.value.map((row) => String(row?.id ?? '').trim()).filter(Boolean))
 const selectedRunningContainers = computed(() => selectedContainerRows.value.filter(isRunningContainer))
+const containerStateLabelKeys: Record<string, string> = {
+  created: 'containers.state.created',
+  restarting: 'containers.state.restarting',
+  running: 'containers.state.running',
+  removing: 'containers.state.removing',
+  paused: 'containers.state.paused',
+  exited: 'containers.state.exited',
+  dead: 'containers.state.dead'
+}
 const batchActionDisabledReason = computed(() => {
   if (!canManageContainers.value) return deniedText.value
   if (!selectedContainerIds.value.length) return t('containers.selectContainers')
@@ -407,8 +422,48 @@ function onContainerSelectionChange(rows: any[]) {
   selectedContainerRows.value = rows
 }
 
+function containerState(row: any) {
+  return String(row?.state ?? '').trim().toLowerCase()
+}
+
+function containerStatusDetail(row: any) {
+  return String(row?.status || row?.state || '').trim()
+}
+
+function containerStatusKind(row: any) {
+  const state = containerState(row)
+  const detail = containerStatusDetail(row).toLowerCase()
+  if (state === 'running' && detail.includes('(unhealthy)')) return 'failed'
+  if (state === 'running' && (detail.includes('(health: starting)') || detail.includes('(starting)'))) return 'pending'
+  switch (state) {
+    case 'running':
+      return 'running'
+    case 'exited':
+      return 'stopped'
+    case 'created':
+    case 'restarting':
+    case 'removing':
+      return 'pending'
+    case 'paused':
+      return 'degraded'
+    case 'dead':
+      return 'failed'
+    default:
+      return 'unknown'
+  }
+}
+
+function containerStatusLabel(row: any) {
+  const state = containerState(row)
+  const detail = containerStatusDetail(row).toLowerCase()
+  if (state === 'running' && detail.includes('(unhealthy)')) return t('containers.state.unhealthy')
+  if (state === 'running' && (detail.includes('(health: starting)') || detail.includes('(starting)'))) return t('containers.state.healthStarting')
+  const labelKey = containerStateLabelKeys[state]
+  return labelKey ? t(labelKey) : String(row?.state || '').trim() || t('common.unknown')
+}
+
 function isRunningContainer(row: any) {
-  return String(row?.state ?? '').toLowerCase() === 'running'
+  return containerState(row) === 'running'
 }
 
 function containerRemoveDisabledReason(row: any) {

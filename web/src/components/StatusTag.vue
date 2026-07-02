@@ -6,10 +6,13 @@
 import { computed } from 'vue'
 import { useI18n } from '../i18n'
 
-const props = defineProps<{ status?: string }>()
+const props = defineProps<{ status?: string; label?: string }>()
 const { t } = useI18n()
 
 const label = computed(() => {
+  if (props.label) {
+    return props.label
+  }
   switch (props.status) {
     case 'ok':
       return 'OK'
