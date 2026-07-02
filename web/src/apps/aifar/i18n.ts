@@ -19,7 +19,7 @@ export const aifarMessages = {
     sourceLabel: 'Docker Compose 离线包',
     description: '基于 resources/aifar/docker-apps 离线包部署 AIFAR 微服务。',
     installTitle: '安装 AIFAR 服务',
-    hint: '目标服务器需要先安装 Docker Engine 和 Docker Compose；选择已部署的 Nacos/MySQL/Redis/MinIO 后，安装器只做依赖预检和启动必需配置，业务配置请在 Nacos 中维护。',
+    hint: '目标服务器需要先安装 Docker Engine 和 Docker Compose；安装器只连接已部署的 Nacos，业务运行配置请在 Nacos 中维护。',
     version: '版本',
     versionPlaceholder: '选择 docker-apps 资源包',
     servers: '目标服务器',
@@ -48,40 +48,6 @@ export const aifarMessages = {
     nacosUser: 'Nacos 用户',
     nacosPassword: 'Nacos 密码',
     nacosNamespace: 'Nacos 命名空间',
-    dbHost: '数据库主机',
-    dbPort: '数据库端口',
-    dbNameNacos: 'Nacos 数据库',
-    dbCredential: 'MySQL 凭据',
-    dbCredentialPlaceholder: '可选择凭据中心已有 MySQL 凭据',
-    dbCredentialManual: '手动输入数据库账号',
-    dbUser: '数据库用户',
-    dbPassword: '数据库密码',
-    redisHost: 'Redis 主机',
-    redisPort: 'Redis 端口',
-    redisCredential: 'Redis 凭据',
-    redisCredentialPlaceholder: '可选择凭据中心已有 Redis 凭据',
-    redisCredentialManual: '手动输入 Redis 密码',
-    redisPassword: 'Redis 密码',
-    redisDatabase: 'Redis 数据库',
-    redisMode: 'Redis 模式',
-    redisModeStandalone: '单体',
-    redisModeSentinel: 'Sentinel',
-    redisModeCluster: 'Cluster',
-    redisSentinelMasterName: 'Sentinel Master',
-    redisSentinelNodes: 'Sentinel 节点',
-    redisClusterNodes: 'Cluster 节点',
-    minioEnableStorage: '启用 MinIO 存储',
-    minioEndpoint: 'MinIO 地址',
-    minioPlatform: '存储平台标识',
-    minioCredential: 'MinIO 凭据',
-    minioCredentialPlaceholder: '可选择凭据中心已有 MinIO 凭据',
-    minioCredentialManual: '手动输入 MinIO 密钥',
-    minioAccessKey: 'MinIO Access Key',
-    minioSecretKey: 'MinIO Secret Key',
-    minioBucketName: 'MinIO Bucket',
-    minioDomain: '访问域名',
-    minioBasePath: '基础路径',
-    initSql: '初始化 SQL',
     portInvalid: '端口必须在 1-65535 之间',
     textRequired: '该配置不能为空',
     networkInvalid: 'Docker 网络名不能包含空格'
@@ -92,7 +58,7 @@ export const aifarMessages = {
     sourceLabel: 'Docker Compose bundle',
     description: 'Deploy AIFAR microservices from the resources/aifar/docker-apps offline bundle.',
     installTitle: 'Install AIFAR Service',
-    hint: 'Target server must already have Docker Engine and Docker Compose. Select deployed Nacos/MySQL/Redis/MinIO instances for dependency checks and bootstrap only; keep business runtime configuration in Nacos.',
+    hint: 'Target server must already have Docker Engine and Docker Compose. The installer only connects to deployed Nacos; keep business runtime configuration in Nacos.',
     version: 'Version',
     versionPlaceholder: 'Select docker-apps bundle',
     servers: 'Target server',
@@ -121,40 +87,6 @@ export const aifarMessages = {
     nacosUser: 'Nacos user',
     nacosPassword: 'Nacos password',
     nacosNamespace: 'Nacos namespace',
-    dbHost: 'Database host',
-    dbPort: 'Database port',
-    dbNameNacos: 'Nacos database',
-    dbCredential: 'MySQL credential',
-    dbCredentialPlaceholder: 'Select a MySQL credential from the credential center',
-    dbCredentialManual: 'Enter database account manually',
-    dbUser: 'Database user',
-    dbPassword: 'Database password',
-    redisHost: 'Redis host',
-    redisPort: 'Redis port',
-    redisCredential: 'Redis credential',
-    redisCredentialPlaceholder: 'Select a Redis credential from the credential center',
-    redisCredentialManual: 'Enter Redis password manually',
-    redisPassword: 'Redis password',
-    redisDatabase: 'Redis database',
-    redisMode: 'Redis mode',
-    redisModeStandalone: 'Standalone',
-    redisModeSentinel: 'Sentinel',
-    redisModeCluster: 'Cluster',
-    redisSentinelMasterName: 'Sentinel master',
-    redisSentinelNodes: 'Sentinel nodes',
-    redisClusterNodes: 'Cluster nodes',
-    minioEnableStorage: 'Enable MinIO storage',
-    minioEndpoint: 'MinIO endpoint',
-    minioPlatform: 'Storage platform',
-    minioCredential: 'MinIO credential',
-    minioCredentialPlaceholder: 'Select a MinIO credential from the credential center',
-    minioCredentialManual: 'Enter MinIO keys manually',
-    minioAccessKey: 'MinIO access key',
-    minioSecretKey: 'MinIO secret key',
-    minioBucketName: 'MinIO bucket',
-    minioDomain: 'Access domain',
-    minioBasePath: 'Base path',
-    initSql: 'Initialize SQL',
     portInvalid: 'Port must be between 1 and 65535',
     textRequired: 'This value is required',
     networkInvalid: 'Docker network name must not contain whitespace'
@@ -226,83 +158,7 @@ export function aifarInstallDialogProps(locale?: string, context?: AppInstallDia
         type: 'password',
         visibleWhen: (values) => !values.nacosCredentialId
       },
-      requiredText('nacosNamespace', copy.nacosNamespace, 'prod', copy),
-      requiredText('dbHost', copy.dbHost, '', copy),
-      portField('dbPort', copy.dbPort, 3306, copy),
-      optionalText('dbNameNacos', copy.dbNameNacos, 'aifar_nacos'),
-      switchField('initSql', copy.initSql, false),
-      {
-        ...selectField('dbCredentialId', copy.dbCredential, credentialOptions(context, 'mysql', copy.dbCredentialManual), '', copy, copy.dbCredentialPlaceholder, false),
-        visibleWhen: sourceIs('initSql', true)
-      },
-      {
-        ...requiredText('dbUser', copy.dbUser, 'root', copy),
-        visibleWhen: (values) => Boolean(values.initSql) && !values.dbCredentialId
-      },
-      {
-        ...requiredText('dbPassword', copy.dbPassword, '', copy),
-        type: 'password',
-        visibleWhen: (values) => Boolean(values.initSql) && !values.dbCredentialId
-      },
-      requiredText('redisHost', copy.redisHost, 'localhost', copy),
-      portField('redisPort', copy.redisPort, 6379, copy),
-      selectField('redisMode', copy.redisMode, [
-        { label: copy.redisModeStandalone, value: 'standalone' },
-        { label: copy.redisModeSentinel, value: 'sentinel' },
-        { label: copy.redisModeCluster, value: 'cluster' }
-      ], 'standalone', copy),
-      selectField('redisCredentialId', copy.redisCredential, credentialOptions(context, 'redis', copy.redisCredentialManual), '', copy, copy.redisCredentialPlaceholder, false),
-      {
-        ...optionalText('redisPassword', copy.redisPassword, '', 'password'),
-        visibleWhen: (values) => !values.redisCredentialId
-      },
-      portField('redisDatabase', copy.redisDatabase, 1, copy, 0, 15),
-      {
-        ...requiredText('redisSentinelMasterName', copy.redisSentinelMasterName, 'aifar-master', copy),
-        visibleWhen: sourceIs('redisMode', 'sentinel')
-      },
-      {
-        ...requiredText('redisSentinelNodes', copy.redisSentinelNodes, '', copy),
-        visibleWhen: sourceIs('redisMode', 'sentinel')
-      },
-      {
-        ...requiredText('redisClusterNodes', copy.redisClusterNodes, '', copy),
-        visibleWhen: sourceIs('redisMode', 'cluster')
-      },
-      switchField('minioEnableStorage', copy.minioEnableStorage, true),
-      {
-        ...requiredText('minioEndpoint', copy.minioEndpoint, '', copy),
-        visibleWhen: sourceIs('minioEnableStorage', true)
-      },
-      {
-        ...requiredText('minioPlatform', copy.minioPlatform, 'minio-1', copy),
-        visibleWhen: sourceIs('minioEnableStorage', true)
-      },
-      {
-        ...selectField('minioCredentialId', copy.minioCredential, credentialOptions(context, 'minio', copy.minioCredentialManual), '', copy, copy.minioCredentialPlaceholder, false),
-        visibleWhen: sourceIs('minioEnableStorage', true)
-      },
-      {
-        ...requiredText('minioAccessKey', copy.minioAccessKey, '', copy),
-        visibleWhen: (values) => Boolean(values.minioEnableStorage) && !values.minioCredentialId
-      },
-      {
-        ...requiredText('minioSecretKey', copy.minioSecretKey, '', copy),
-        type: 'password',
-        visibleWhen: (values) => Boolean(values.minioEnableStorage) && !values.minioCredentialId
-      },
-      {
-        ...requiredText('minioBucketName', copy.minioBucketName, 'aifar', copy),
-        visibleWhen: sourceIs('minioEnableStorage', true)
-      },
-      {
-        ...optionalText('minioDomain', copy.minioDomain, ''),
-        visibleWhen: sourceIs('minioEnableStorage', true)
-      },
-      {
-        ...optionalText('minioBasePath', copy.minioBasePath, ''),
-        visibleWhen: sourceIs('minioEnableStorage', true)
-      }
+      requiredText('nacosNamespace', copy.nacosNamespace, 'prod', copy)
     ]
   }
 }
@@ -323,16 +179,6 @@ function requiredText(name: string, label: string, defaultValue: string, copy: R
   }
 }
 
-function optionalText(name: string, label: string, defaultValue: string, type: 'text' | 'password' = 'text'): AppInstallField {
-  return {
-    name,
-    label,
-    type,
-    defaultValue,
-    required: false
-  }
-}
-
 function networkField(copy: ReturnType<typeof aifarCopy>): AppInstallField {
   return {
     ...requiredText('networkName', copy.networkName, 'aifar-network', copy),
@@ -341,16 +187,6 @@ function networkField(copy: ReturnType<typeof aifarCopy>): AppInstallField {
       if (!text) return copy.textRequired
       return /\s/.test(text) ? copy.networkInvalid : undefined
     }
-  }
-}
-
-function switchField(name: string, label: string, defaultValue: boolean): AppInstallField {
-  return {
-    name,
-    label,
-    type: 'switch',
-    defaultValue,
-    required: false
   }
 }
 

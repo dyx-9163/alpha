@@ -4,8 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
 	"strings"
 
 	"aifar-deployment/backend/internal/adapter"
@@ -122,12 +120,6 @@ func (m Module) ValidateInstall(ctx context.Context, req registry.InstallRequest
 	}
 	if err := opts.Validate(); err != nil {
 		return err
-	}
-	if opts.InitSQL {
-		sqlPath := filepath.Join(bundle.SQLDir, "aifar_cloud_nacos.sql")
-		if _, err := os.Stat(sqlPath); err != nil {
-			return fmt.Errorf("SQL initialization requires %s: %w", sqlPath, err)
-		}
 	}
 	return nil
 }

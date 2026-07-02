@@ -25,7 +25,6 @@ const (
 	defaultTopology      = "single"
 	defaultNetworkName   = "aifar-network"
 	defaultTimezone      = "system"
-	defaultDBNameNacos   = "aifar_nacos"
 	defaultNacosUser     = "nacos"
 	defaultNacosPassword = "oversea.nacos"
 	defaultNacosNS       = "prod"
@@ -35,18 +34,8 @@ const (
 	defaultWebPort       = 8080
 	defaultNacosWebPort  = 8848
 	defaultNacosAPIPort  = 9848
-	defaultDBPort        = 3306
-	defaultRedisHost     = "localhost"
-	defaultRedisPort     = 6379
-	defaultRedisDatabase = 1
-	defaultMinioPlatform = "minio-1"
-	defaultMinioBucket   = "aifar"
-	defaultMinioAPIPort  = 9000
 	dependencyManual     = "manual"
 	dependencyExisting   = "existing"
-	redisModeStandalone  = "standalone"
-	redisModeSentinel    = "sentinel"
-	redisModeCluster     = "cluster"
 )
 
 var serviceOrder = []string{
@@ -76,42 +65,20 @@ var reverseServiceOrder = []string{
 }
 
 type InstallOptions struct {
-	Timezone                string
-	NetworkName             string
-	AppCPUs                 string
-	AppMemoryLimit          string
-	GatewayPort             int
-	WebPort                 int
-	NacosWebPort            int
-	NacosAPIPort            int
-	NacosSource             string
-	NacosInstanceID         string
-	NacosHost               string
-	NacosUser               string
-	NacosPassword           string
-	NacosNamespace          string
-	DBHost                  string
-	DBPort                  int
-	DBNameNacos             string
-	DBUser                  string
-	DBPassword              string
-	RedisMode               string
-	RedisHost               string
-	RedisPort               int
-	RedisPassword           string
-	RedisDatabase           int
-	RedisSentinelMasterName string
-	RedisSentinelNodes      []string
-	RedisClusterNodes       []string
-	MinioEnableStorage      bool
-	MinioPlatform           string
-	MinioEndpoint           string
-	MinioAccessKey          string
-	MinioSecretKey          string
-	MinioBucketName         string
-	MinioDomain             string
-	MinioBasePath           string
-	InitSQL                 bool
+	Timezone        string
+	NetworkName     string
+	AppCPUs         string
+	AppMemoryLimit  string
+	GatewayPort     int
+	WebPort         int
+	NacosWebPort    int
+	NacosAPIPort    int
+	NacosSource     string
+	NacosInstanceID string
+	NacosHost       string
+	NacosUser       string
+	NacosPassword   string
+	NacosNamespace  string
 }
 
 type Bundle struct {
@@ -123,28 +90,18 @@ type Bundle struct {
 
 func optionsFromParameters(parameters map[string]any) InstallOptions {
 	opts := InstallOptions{
-		Timezone:           defaultTimezone,
-		NetworkName:        defaultNetworkName,
-		AppCPUs:            defaultAppCPUs,
-		AppMemoryLimit:     defaultMemoryLimit,
-		GatewayPort:        defaultGatewayPort,
-		WebPort:            defaultWebPort,
-		NacosWebPort:       defaultNacosWebPort,
-		NacosAPIPort:       defaultNacosAPIPort,
-		NacosSource:        dependencyManual,
-		NacosUser:          defaultNacosUser,
-		NacosPassword:      defaultNacosPassword,
-		NacosNamespace:     defaultNacosNS,
-		DBPort:             defaultDBPort,
-		DBNameNacos:        defaultDBNameNacos,
-		DBUser:             "root",
-		RedisMode:          redisModeStandalone,
-		RedisHost:          defaultRedisHost,
-		RedisPort:          defaultRedisPort,
-		RedisDatabase:      defaultRedisDatabase,
-		MinioEnableStorage: true,
-		MinioPlatform:      defaultMinioPlatform,
-		MinioBucketName:    defaultMinioBucket,
+		Timezone:       defaultTimezone,
+		NetworkName:    defaultNetworkName,
+		AppCPUs:        defaultAppCPUs,
+		AppMemoryLimit: defaultMemoryLimit,
+		GatewayPort:    defaultGatewayPort,
+		WebPort:        defaultWebPort,
+		NacosWebPort:   defaultNacosWebPort,
+		NacosAPIPort:   defaultNacosAPIPort,
+		NacosSource:    dependencyManual,
+		NacosUser:      defaultNacosUser,
+		NacosPassword:  defaultNacosPassword,
+		NacosNamespace: defaultNacosNS,
 	}
 	opts.Timezone = stringParam(parameters, "timezone", opts.Timezone)
 	opts.NetworkName = stringParam(parameters, "networkName", opts.NetworkName)
@@ -161,137 +118,37 @@ func optionsFromParameters(parameters map[string]any) InstallOptions {
 	opts.NacosUser = stringParam(parameters, "nacosUser", opts.NacosUser)
 	opts.NacosPassword = stringParam(parameters, "nacosPassword", opts.NacosPassword)
 	opts.NacosNamespace = stringParam(parameters, "nacosNamespace", opts.NacosNamespace)
-	opts.DBHost = stringParam(parameters, "dbHost", opts.DBHost)
-	opts.DBPort = intParam(parameters, "dbPort", opts.DBPort)
-	opts.DBNameNacos = stringParam(parameters, "dbNameNacos", opts.DBNameNacos)
-	opts.DBUser = stringParam(parameters, "dbUser", opts.DBUser)
-	opts.DBPassword = stringParam(parameters, "dbPassword", opts.DBPassword)
-	opts.RedisMode = normalizeRedisMode(stringParam(parameters, "redisMode", opts.RedisMode))
-	opts.RedisHost = stringParam(parameters, "redisHost", opts.RedisHost)
-	opts.RedisPort = intParam(parameters, "redisPort", opts.RedisPort)
-	opts.RedisPassword = stringParam(parameters, "redisPassword", opts.RedisPassword)
-	opts.RedisDatabase = intParam(parameters, "redisDatabase", opts.RedisDatabase)
-	opts.RedisSentinelMasterName = stringParam(parameters, "redisSentinelMasterName", opts.RedisSentinelMasterName)
-	opts.RedisSentinelNodes = stringListParam(parameters, "redisSentinelNodes", opts.RedisSentinelNodes)
-	opts.RedisClusterNodes = stringListParam(parameters, "redisClusterNodes", opts.RedisClusterNodes)
-	opts.MinioEnableStorage = boolParam(parameters, "minioEnableStorage", opts.MinioEnableStorage)
-	opts.MinioPlatform = stringParam(parameters, "minioPlatform", opts.MinioPlatform)
-	opts.MinioEndpoint = stringParam(parameters, "minioEndpoint", opts.MinioEndpoint)
-	opts.MinioAccessKey = stringParam(parameters, "minioAccessKey", opts.MinioAccessKey)
-	opts.MinioSecretKey = stringParam(parameters, "minioSecretKey", opts.MinioSecretKey)
-	opts.MinioBucketName = stringParam(parameters, "minioBucketName", opts.MinioBucketName)
-	opts.MinioDomain = stringParam(parameters, "minioDomain", opts.MinioDomain)
-	opts.MinioBasePath = stringParam(parameters, "minioBasePath", opts.MinioBasePath)
-	if strings.TrimSpace(opts.MinioDomain) == "" {
-		opts.MinioDomain = deriveMinioDomain(opts.MinioEndpoint, opts.MinioBucketName)
-	}
-	opts.InitSQL = boolParam(parameters, "initSql", false)
 	return opts
 }
 
 func (o InstallOptions) Validate() error {
-	if strings.TrimSpace(o.DBHost) == "" {
-		return fmt.Errorf("database host is required")
-	}
-	if o.InitSQL {
-		if strings.TrimSpace(o.DBUser) == "" {
-			return fmt.Errorf("database user is required")
-		}
-		if strings.TrimSpace(o.DBPassword) == "" {
-			return fmt.Errorf("database password is required")
-		}
-		if strings.TrimSpace(o.DBNameNacos) == "" {
-			return fmt.Errorf("nacos database name is required")
-		}
-	}
 	if o.NacosSource == dependencyExisting && strings.TrimSpace(o.NacosInstanceID) == "" {
 		return fmt.Errorf("nacos instance is required")
 	}
 	if strings.TrimSpace(o.NacosHost) == "" {
 		return fmt.Errorf("nacos host is required")
 	}
-	if strings.TrimSpace(o.RedisHost) == "" {
-		return fmt.Errorf("redis host is required")
-	}
-	if o.MinioEnableStorage {
-		if strings.TrimSpace(o.MinioEndpoint) == "" {
-			return fmt.Errorf("minio endpoint is required")
-		}
-	}
-	if !validPort(o.DBPort) || !validPort(o.RedisPort) || !validPort(o.GatewayPort) || !validPort(o.WebPort) || !validPort(o.NacosWebPort) || !validPort(o.NacosAPIPort) {
+	if !validPort(o.GatewayPort) || !validPort(o.WebPort) || !validPort(o.NacosWebPort) || !validPort(o.NacosAPIPort) {
 		return fmt.Errorf("ports must be between 1 and 65535")
 	}
-	if o.RedisDatabase < 0 || o.RedisDatabase > 15 {
-		return fmt.Errorf("redis database must be between 0 and 15")
-	}
-	switch normalizeRedisMode(o.RedisMode) {
-	case redisModeStandalone:
-	case redisModeSentinel:
-		if strings.TrimSpace(o.RedisSentinelMasterName) == "" {
-			return fmt.Errorf("redis sentinel master name is required")
-		}
-		if len(o.RedisSentinelNodes) == 0 {
-			return fmt.Errorf("redis sentinel nodes are required")
-		}
-	case redisModeCluster:
-		if len(o.RedisClusterNodes) == 0 {
-			return fmt.Errorf("redis cluster nodes are required")
-		}
-	default:
-		return fmt.Errorf("unsupported redis mode: %s", o.RedisMode)
-	}
 	for name, value := range map[string]string{
-		"timezone":        o.Timezone,
-		"networkName":     o.NetworkName,
-		"appCPUs":         o.AppCPUs,
-		"appMemoryLimit":  o.AppMemoryLimit,
-		"nacosHost":       o.NacosHost,
-		"nacosUser":       o.NacosUser,
-		"nacosPassword":   o.NacosPassword,
-		"nacosNamespace":  o.NacosNamespace,
-		"dbHost":          o.DBHost,
-		"redisHost":       o.RedisHost,
-		"redisMode":       o.RedisMode,
-		"minioPlatform":   o.MinioPlatform,
-		"minioEndpoint":   o.MinioEndpoint,
-		"minioAccessKey":  o.MinioAccessKey,
-		"minioSecretKey":  o.MinioSecretKey,
-		"minioBucketName": o.MinioBucketName,
-		"minioDomain":     o.MinioDomain,
-		"minioBasePath":   o.MinioBasePath,
+		"timezone":       o.Timezone,
+		"networkName":    o.NetworkName,
+		"appCPUs":        o.AppCPUs,
+		"appMemoryLimit": o.AppMemoryLimit,
+		"nacosHost":      o.NacosHost,
+		"nacosUser":      o.NacosUser,
+		"nacosPassword":  o.NacosPassword,
+		"nacosNamespace": o.NacosNamespace,
 	} {
-		if strings.TrimSpace(value) == "" && !strings.HasPrefix(name, "minio") {
+		if strings.TrimSpace(value) == "" {
 			return fmt.Errorf("%s is required", name)
 		}
 		if strings.ContainsAny(value, "\r\n") {
 			return fmt.Errorf("%s must not contain newlines", name)
 		}
 	}
-	for name, value := range map[string]string{
-		"redisSentinelMasterName": o.RedisSentinelMasterName,
-	} {
-		if strings.ContainsAny(value, "\r\n") {
-			return fmt.Errorf("%s must not contain newlines", name)
-		}
-	}
 	return nil
-}
-
-func (o InstallOptions) RedisSentinelNodesCSV() string {
-	return strings.Join(o.RedisSentinelNodes, ",")
-}
-
-func (o InstallOptions) RedisClusterNodesCSV() string {
-	return strings.Join(o.RedisClusterNodes, ",")
-}
-
-func deriveMinioDomain(endpoint, bucket string) string {
-	endpoint = strings.TrimRight(strings.TrimSpace(endpoint), "/")
-	bucket = strings.Trim(strings.TrimSpace(bucket), "/")
-	if endpoint == "" || bucket == "" {
-		return endpoint
-	}
-	return endpoint + "/" + bucket + "/"
 }
 
 func normalizeDependencySource(value string) string {
@@ -300,17 +157,6 @@ func normalizeDependencySource(value string) string {
 		return dependencyExisting
 	default:
 		return dependencyManual
-	}
-}
-
-func normalizeRedisMode(value string) string {
-	switch strings.ToLower(strings.TrimSpace(value)) {
-	case redisModeSentinel:
-		return redisModeSentinel
-	case redisModeCluster:
-		return redisModeCluster
-	default:
-		return redisModeStandalone
 	}
 }
 
@@ -444,7 +290,10 @@ func CreateBundleArchive(bundle Bundle) (string, error) {
 
 func skipBundleEntry(rel string) bool {
 	slash := filepath.ToSlash(rel)
-	return slash == appBundleDir+"/nacos" || strings.HasPrefix(slash, appBundleDir+"/nacos/")
+	return slash == appBundleDir+"/nacos" ||
+		strings.HasPrefix(slash, appBundleDir+"/nacos/") ||
+		slash == sqlBundleDir ||
+		strings.HasPrefix(slash, sqlBundleDir+"/")
 }
 
 func inferAppDir(pathValue string) string {
@@ -502,55 +351,6 @@ func intParam(parameters map[string]any, name string, fallback int) int {
 		}
 	}
 	return fallback
-}
-
-func boolParam(parameters map[string]any, name string, fallback bool) bool {
-	value, ok := parameters[name]
-	if !ok || value == nil {
-		return fallback
-	}
-	switch v := value.(type) {
-	case bool:
-		return v
-	case string:
-		v = strings.TrimSpace(strings.ToLower(v))
-		return v == "true" || v == "1" || v == "yes"
-	default:
-		return fallback
-	}
-}
-
-func stringListParam(parameters map[string]any, name string, fallback []string) []string {
-	value, ok := parameters[name]
-	if !ok || value == nil {
-		return fallback
-	}
-	var out []string
-	appendValue := func(item any) {
-		for _, part := range strings.FieldsFunc(fmt.Sprint(item), func(r rune) bool {
-			return r == ',' || r == ';' || r == '\n' || r == '\r'
-		}) {
-			if text := strings.TrimSpace(part); text != "" {
-				out = append(out, text)
-			}
-		}
-	}
-	switch v := value.(type) {
-	case []string:
-		for _, item := range v {
-			appendValue(item)
-		}
-	case []any:
-		for _, item := range v {
-			appendValue(item)
-		}
-	default:
-		appendValue(v)
-	}
-	if len(out) == 0 {
-		return fallback
-	}
-	return out
 }
 
 func validPort(port int) bool {

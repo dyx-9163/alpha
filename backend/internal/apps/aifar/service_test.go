@@ -174,7 +174,7 @@ func (fakeLogger) Error(format string, args ...any) {}
 
 func TestOptionsDefaultsUseRequestedAIFARValues(t *testing.T) {
 	opts := optionsFromParameters(nil)
-	if opts.Timezone != "system" || opts.NacosWebPort != 8848 || opts.NacosNamespace != "prod" || opts.NacosSource != dependencyManual || !opts.MinioEnableStorage {
+	if opts.Timezone != "system" || opts.NacosWebPort != 8848 || opts.NacosNamespace != "prod" || opts.NacosSource != dependencyManual {
 		t.Fatalf("unexpected defaults: %+v", opts)
 	}
 	if got := installRootFromDeployDir("/aifar/apps"); got != "/aifar/apps/admin" {
@@ -194,11 +194,8 @@ func TestServiceInstallsAIFARServiceFromDockerAppsBundle(t *testing.T) {
 		ServerID: "srv-1",
 		Language: "en",
 		Parameters: map[string]any{
-			"dbHost":        "10.0.0.20",
-			"dbPort":        3306,
-			"nacosHost":     "10.0.0.50",
-			"webPort":       18080,
-			"minioEndpoint": "http://10.0.0.60:9000",
+			"nacosHost": "10.0.0.50",
+			"webPort":   18080,
 		},
 	}, []store.Resource{{App: "aifar", Part: "backend", Version: "docker-apps", Path: filepath.Join(root, "docker-apps", ".env")}}, fakeLogger{}, nil)
 	if err != nil {
@@ -229,9 +226,6 @@ func TestServiceInstallsAIFARServiceFromDockerAppsBundle(t *testing.T) {
 	}
 	if metadata["nacosEndpoint"] != "10.0.0.50:8848" || metadata["nacosHost"] != "10.0.0.50" || int(metadata["nacosPort"].(float64)) != 8848 {
 		t.Fatalf("expected external Nacos endpoint metadata, got %s", instance.Metadata)
-	}
-	if metadata["minioEndpoint"] != "http://10.0.0.60:9000" || metadata["minioBucketName"] != "aifar" || metadata["minioDomain"] != "http://10.0.0.60:9000/aifar/" {
-		t.Fatalf("expected MinIO metadata without credentials, got %s", instance.Metadata)
 	}
 	if !strings.Contains(remote.joinedUploads(), "aifar-service-bundle-") || !strings.Contains(remote.joinedCommands(), "install-aifar.sh") {
 		t.Fatalf("expected bundle upload and install script run, uploads=%s commands=%s", remote.joinedUploads(), remote.joinedCommands())
@@ -264,9 +258,6 @@ func TestServiceInstallsAIFARServiceFromDockerAppsBundle(t *testing.T) {
 	for _, want := range []string{
 		"check_dependencies",
 		"check_nacos_dependency",
-		"check_mysql_dependency",
-		"check_redis_dependency",
-		"check_minio_dependency",
 	} {
 		if !strings.Contains(remote.installScript, want) {
 			t.Fatalf("AIFAR install script should include dependency checks with %q:\n%s", want, remote.installScript)
@@ -287,21 +278,25 @@ func TestServiceInstallsAIFARServiceFromDockerAppsBundle(t *testing.T) {
 		`set_env SPRING_DATA_REDIS`,
 		`set_env AIFAR_MINIO`,
 		`set_env DROMARA_X_FILE_STORAGE`,
+		`DB_HOST=`,
+		`REDIS_`,
+		`MINIO_`,
+		`INIT_SQL`,
+		`check_mysql_dependency`,
+		`check_redis_dependency`,
+		`check_minio_dependency`,
+		`docker-sql`,
+		`patch_nacos_sql`,
 	} {
 		if strings.Contains(remote.installScript, forbidden) {
 			t.Fatalf("AIFAR install script should not inject business runtime env %q:\n%s", forbidden, remote.installScript)
 		}
 	}
-	if strings.Contains(remote.installScript, "patch_nacos_server_port") || !strings.Contains(remote.installScript, "patch_nacos_sql_namespace") {
-		t.Fatalf("AIFAR install script should only patch Nacos SQL namespace defaults:\n%s", remote.installScript)
-	}
 	for _, want := range []string{
-		"patch_nacos_sql_service_names",
 		"alpha_service_name",
 		"gateway alpha-gateway",
 		"permission alpha-permission",
 		`set_env SPRING_APPLICATION_NAME "$app_name" "$service_env"`,
-		`sed "s/aifar-${service}/${app_name}/g"`,
 	} {
 		if !strings.Contains(remote.installScript, want) {
 			t.Fatalf("AIFAR install script should force alpha service names with %q:\n%s", want, remote.installScript)
@@ -324,7 +319,7 @@ func TestServiceInstallsAIFARServiceFromDockerAppsBundle(t *testing.T) {
 	}
 }
 
-func TestServiceUsesManualBusinessDependencyParameters(t *testing.T) {
+func TestServiceIgnoresBusinessDependencyParameters(t *testing.T) {
 	root := createAIFARBundle(t)
 	s := &fakeStore{
 		servers: map[string]store.Server{
@@ -369,30 +364,49 @@ func TestServiceUsesManualBusinessDependencyParameters(t *testing.T) {
 	if err := json.Unmarshal([]byte(instance.Metadata), &metadata); err != nil {
 		t.Fatal(err)
 	}
-	if metadata["dbHost"] != "10.0.0.30" || int(metadata["dbPort"].(float64)) != 6446 {
-		t.Fatalf("expected manual MySQL endpoint to be used, got %s", instance.Metadata)
-	}
-	if metadata["redisMode"] != "sentinel" || metadata["redisHost"] != "10.0.0.41" || int(metadata["redisPort"].(float64)) != 26379 {
-		t.Fatalf("expected manual Redis Sentinel endpoint to be used, got %s", instance.Metadata)
-	}
-	if metadata["minioEndpoint"] != "http://10.0.0.60:9000" {
-		t.Fatalf("expected manual MinIO endpoint to be used, got %s", instance.Metadata)
-	}
-	for _, removed := range []string{"dbSource", "dbInstanceId", "redisSource", "redisInstanceId", "minioSource", "minioInstanceId"} {
+	for _, removed := range []string{
+		"dbHost",
+		"dbPort",
+		"dbNameNacos",
+		"dbUser",
+		"dbSource",
+		"dbInstanceId",
+		"redisMode",
+		"redisHost",
+		"redisPort",
+		"redisDatabase",
+		"redisSentinelMasterName",
+		"redisSentinelNodes",
+		"redisClusterNodes",
+		"redisSource",
+		"redisInstanceId",
+		"minioEnableStorage",
+		"minioPlatform",
+		"minioEndpoint",
+		"minioBucketName",
+		"minioDomain",
+		"minioBasePath",
+		"minioSource",
+		"minioInstanceId",
+		"initSql",
+	} {
 		if _, ok := metadata[removed]; ok {
-			t.Fatalf("metadata should not keep managed dependency field %s: %s", removed, instance.Metadata)
+			t.Fatalf("metadata should not keep business dependency field %s: %s", removed, instance.Metadata)
 		}
 	}
-	for _, want := range []string{
+	for _, forbidden := range []string{
 		"DB_HOST='10.0.0.30'",
 		"DB_PORT='6446'",
+		"DB_USER=",
+		"DB_PASSWORD=",
 		"REDIS_MODE='sentinel'",
 		"REDIS_SENTINEL_MASTER='alpha-master'",
 		"REDIS_SENTINEL_NODES='10.0.0.41:26379,10.0.0.42:26379'",
 		"MINIO_ENDPOINT='http://10.0.0.60:9000'",
+		"INIT_SQL=",
 	} {
-		if !strings.Contains(remote.installScript, want) {
-			t.Fatalf("install script should contain %q:\n%s", want, remote.installScript)
+		if strings.Contains(remote.installScript, forbidden) {
+			t.Fatalf("install script should ignore business dependency parameter %q:\n%s", forbidden, remote.installScript)
 		}
 	}
 }
@@ -514,9 +528,6 @@ func TestServiceResolvesManagedNacosInstance(t *testing.T) {
 		Parameters: map[string]any{
 			"nacosSource":     "existing",
 			"nacosInstanceId": "nacos-node-1",
-			"dbHost":          "10.0.0.20",
-			"dbPort":          3306,
-			"minioEndpoint":   "http://10.0.0.60:9000",
 		},
 	}, []store.Resource{{App: "aifar", Part: "backend", Version: "docker-apps", Path: filepath.Join(root, "docker-apps", ".env")}}, fakeLogger{}, nil)
 	if err != nil {
@@ -649,7 +660,7 @@ func TestSelectBundleIgnoresDockerSQLVersion(t *testing.T) {
 	}
 }
 
-func TestCreateBundleArchiveExcludesBundledNacos(t *testing.T) {
+func TestCreateBundleArchiveExcludesBundledNacosAndSQL(t *testing.T) {
 	root := createAIFARBundle(t)
 	nacosDir := filepath.Join(root, "docker-apps", "nacos")
 	if err := os.MkdirAll(nacosDir, 0o755); err != nil {
@@ -691,8 +702,8 @@ func TestCreateBundleArchiveExcludesBundledNacos(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if strings.HasPrefix(header.Name, "docker-apps/nacos") {
-			t.Fatalf("archive should exclude bundled Nacos, found %s", header.Name)
+		if strings.HasPrefix(header.Name, "docker-apps/nacos") || strings.HasPrefix(header.Name, "docker-sql") {
+			t.Fatalf("archive should exclude bundled Nacos and SQL assets, found %s", header.Name)
 		}
 	}
 }
@@ -712,10 +723,7 @@ func aifarModuleValidationResources(root string) []store.Resource {
 
 func aifarModuleValidationParams() map[string]any {
 	return map[string]any{
-		"nacosHost":     "10.0.0.50",
-		"dbHost":        "10.0.0.20",
-		"dbPort":        3306,
-		"minioEndpoint": "http://10.0.0.60:9000",
+		"nacosHost": "10.0.0.50",
 	}
 }
 

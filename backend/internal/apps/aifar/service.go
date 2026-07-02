@@ -143,11 +143,6 @@ func (s Service) Install(ctx context.Context, req InstallRequest, resources []st
 		if err := options.Validate(); err != nil {
 			return err
 		}
-		if options.InitSQL {
-			if _, err := os.Stat(filepath.Join(bundle.SQLDir, "aifar_cloud_nacos.sql")); err != nil {
-				return fmt.Errorf("SQL initialization file is required: %w", err)
-			}
-		}
 		var archiveErr error
 		archiveLocal, archiveErr = CreateBundleArchive(bundle)
 		return archiveErr
@@ -284,49 +279,30 @@ func (s Service) Install(ctx context.Context, req InstallRequest, resources []st
 
 func installMetadata(server store.Server, installRoot, version, releaseID string, releaseTime time.Time, configHash string, options InstallOptions) map[string]any {
 	return map[string]any{
-		"installRoot":             installRoot,
-		"layout":                  releaseLayout,
-		"currentRelease":          installRoot + "/" + currentLinkName,
-		"releaseId":               releaseID,
-		"releasePath":             installRoot + "/" + releasesDirName + "/" + releaseID,
-		"releaseVersion":          version,
-		"releaseRetention":        releaseKeepCount,
-		"releaseCreatedAt":        releaseTime.Format(time.RFC3339),
-		"configHash":              configHash,
-		"appDir":                  installRoot + "/" + currentLinkName + "/" + appBundleDir,
-		"sqlDir":                  installRoot + "/" + currentLinkName + "/" + sqlBundleDir,
-		"envDir":                  installRoot + "/" + currentLinkName + "/" + releaseEnvDirName,
-		"networkName":             options.NetworkName,
-		"endpoint":                fmt.Sprintf("%s:%d", server.Host, options.WebPort),
-		"gatewayEndpoint":         fmt.Sprintf("%s:%d", server.Host, options.GatewayPort),
-		"nacosEndpoint":           fmt.Sprintf("%s:%d", options.NacosHost, options.NacosWebPort),
-		"webPort":                 options.WebPort,
-		"gatewayPort":             options.GatewayPort,
-		"nacosSource":             options.NacosSource,
-		"nacosInstanceId":         options.NacosInstanceID,
-		"nacosHost":               options.NacosHost,
-		"nacosPort":               options.NacosWebPort,
-		"nacosWebPort":            options.NacosWebPort,
-		"nacosApiPort":            options.NacosAPIPort,
-		"dbHost":                  options.DBHost,
-		"dbPort":                  options.DBPort,
-		"dbNameNacos":             options.DBNameNacos,
-		"dbUser":                  options.DBUser,
-		"redisMode":               options.RedisMode,
-		"redisHost":               options.RedisHost,
-		"redisPort":               options.RedisPort,
-		"redisDatabase":           options.RedisDatabase,
-		"redisSentinelMasterName": options.RedisSentinelMasterName,
-		"redisSentinelNodes":      options.RedisSentinelNodes,
-		"redisClusterNodes":       options.RedisClusterNodes,
-		"minioEnableStorage":      options.MinioEnableStorage,
-		"minioPlatform":           options.MinioPlatform,
-		"minioEndpoint":           options.MinioEndpoint,
-		"minioBucketName":         options.MinioBucketName,
-		"minioDomain":             options.MinioDomain,
-		"minioBasePath":           options.MinioBasePath,
-		"initSql":                 options.InitSQL,
-		"services":                serviceOrder,
+		"installRoot":      installRoot,
+		"layout":           releaseLayout,
+		"currentRelease":   installRoot + "/" + currentLinkName,
+		"releaseId":        releaseID,
+		"releasePath":      installRoot + "/" + releasesDirName + "/" + releaseID,
+		"releaseVersion":   version,
+		"releaseRetention": releaseKeepCount,
+		"releaseCreatedAt": releaseTime.Format(time.RFC3339),
+		"configHash":       configHash,
+		"appDir":           installRoot + "/" + currentLinkName + "/" + appBundleDir,
+		"envDir":           installRoot + "/" + currentLinkName + "/" + releaseEnvDirName,
+		"networkName":      options.NetworkName,
+		"endpoint":         fmt.Sprintf("%s:%d", server.Host, options.WebPort),
+		"gatewayEndpoint":  fmt.Sprintf("%s:%d", server.Host, options.GatewayPort),
+		"nacosEndpoint":    fmt.Sprintf("%s:%d", options.NacosHost, options.NacosWebPort),
+		"webPort":          options.WebPort,
+		"gatewayPort":      options.GatewayPort,
+		"nacosSource":      options.NacosSource,
+		"nacosInstanceId":  options.NacosInstanceID,
+		"nacosHost":        options.NacosHost,
+		"nacosPort":        options.NacosWebPort,
+		"nacosWebPort":     options.NacosWebPort,
+		"nacosApiPort":     options.NacosAPIPort,
+		"services":         serviceOrder,
 	}
 }
 

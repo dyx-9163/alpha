@@ -12,7 +12,6 @@ import (
 
 func (s Service) resolveInstallOptions(options InstallOptions) (InstallOptions, error) {
 	options.NacosSource = normalizeDependencySource(options.NacosSource)
-	options.RedisMode = normalizeRedisMode(options.RedisMode)
 	if options.NacosSource != dependencyExisting {
 		return options, nil
 	}

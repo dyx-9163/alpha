@@ -15,7 +15,6 @@ RELEASES_DIR="$INSTALL_ROOT/releases"
 CURRENT_LINK="$INSTALL_ROOT/current"
 RELEASE_DIR="$RELEASES_DIR/$RELEASE_ID"
 APP_DIR="$RELEASE_DIR/docker-apps"
-SQL_DIR="$RELEASE_DIR/docker-sql"
 IMAGE_DIR="$RELEASE_DIR/docker-images"
 ENV_DIR="$RELEASE_DIR/env"
 AIFAR_DIR="$RELEASE_DIR/.aifar"
@@ -33,20 +32,6 @@ NACOS_CONNECT_HOST={{ quote .Options.NacosHost }}
 NACOS_USER={{ quote .Options.NacosUser }}
 NACOS_PASSWORD={{ quote .Options.NacosPassword }}
 NACOS_NS={{ quote .Options.NacosNamespace }}
-DB_HOST={{ quote .Options.DBHost }}
-DB_PORT={{ quote .Options.DBPort }}
-DB_USER={{ quote .Options.DBUser }}
-DB_PASSWORD={{ quote .Options.DBPassword }}
-REDIS_MODE={{ quote .Options.RedisMode }}
-REDIS_HOST={{ quote .Options.RedisHost }}
-REDIS_PORT={{ quote .Options.RedisPort }}
-REDIS_PASSWORD={{ quote .Options.RedisPassword }}
-REDIS_SENTINEL_MASTER={{ quote .Options.RedisSentinelMasterName }}
-REDIS_SENTINEL_NODES={{ quote .Options.RedisSentinelNodesCSV }}
-REDIS_CLUSTER_NODES={{ quote .Options.RedisClusterNodesCSV }}
-MINIO_ENABLE_STORAGE={{ quote .Options.MinioEnableStorage }}
-MINIO_ENDPOINT={{ quote .Options.MinioEndpoint }}
-INIT_SQL={{ quote .Options.InitSQL }}
 
 fail() {
   echo "ERROR: $*" >&2
@@ -119,27 +104,6 @@ require_local_image() {
   docker image inspect "$image" >/dev/null 2>&1 || fail "required offline Docker image is missing after docker load: $image"
 }
 
-parse_host_port() {
-  value="$1"
-  fallback_port="$2"
-  text="$value"
-  case "$text" in
-    *://*) text="${text#*://}" ;;
-  esac
-  text="${text%%/*}"
-  PARSED_HOST=""
-  PARSED_PORT="$fallback_port"
-  case "$text" in
-    *:*)
-      PARSED_HOST="${text%:*}"
-      PARSED_PORT="${text##*:}"
-      ;;
-    *)
-      PARSED_HOST="$text"
-      ;;
-  esac
-}
-
 tcp_probe() {
   host="$1"
   port="$2"
@@ -197,108 +161,9 @@ check_nacos_dependency() {
   fail "Nacos dependency readiness check failed at $url"
 }
 
-check_mysql_dependency() {
-  if [ "$INIT_SQL" != "true" ]; then
-    check_tcp_dependency "MySQL" "$DB_HOST" "$DB_PORT"
-    return 0
-  fi
-  if command -v mysql >/dev/null 2>&1; then
-    if mysql --protocol=tcp -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" "-p$DB_PASSWORD" -N -s -e "select 1" >/dev/null 2>&1; then
-      echo "MySQL dependency is ready at $DB_HOST:$DB_PORT"
-      return 0
-    fi
-    fail "MySQL dependency authentication or readiness check failed at $DB_HOST:$DB_PORT"
-  fi
-  check_tcp_dependency "MySQL" "$DB_HOST" "$DB_PORT"
-}
-
-check_redis_endpoint() {
-  host="$1"
-  port="$2"
-  label="$3"
-  if [ -n "$REDIS_PASSWORD" ] && command -v redis-cli >/dev/null 2>&1; then
-    if redis-cli -h "$host" -p "$port" -a "$REDIS_PASSWORD" --no-auth-warning ping >/dev/null 2>&1; then
-      echo "$label dependency is ready at $host:$port"
-      return 0
-    fi
-    fail "$label dependency ping failed at $host:$port"
-  fi
-  check_tcp_dependency "$label" "$host" "$port"
-}
-
-check_endpoint_list() {
-  label="$1"
-  endpoints="$2"
-  fallback_port="$3"
-  [ -n "$endpoints" ] || fail "$label dependency endpoints are empty"
-  old_ifs="$IFS"
-  IFS=","
-  for endpoint in $endpoints; do
-    IFS="$old_ifs"
-    parse_host_port "$endpoint" "$fallback_port"
-    check_redis_endpoint "$PARSED_HOST" "$PARSED_PORT" "$label"
-    IFS=","
-  done
-  IFS="$old_ifs"
-}
-
-check_tcp_endpoint_list() {
-  label="$1"
-  endpoints="$2"
-  fallback_port="$3"
-  [ -n "$endpoints" ] || fail "$label dependency endpoints are empty"
-  old_ifs="$IFS"
-  IFS=","
-  for endpoint in $endpoints; do
-    IFS="$old_ifs"
-    parse_host_port "$endpoint" "$fallback_port"
-    check_tcp_dependency "$label" "$PARSED_HOST" "$PARSED_PORT"
-    IFS=","
-  done
-  IFS="$old_ifs"
-}
-
-check_redis_dependency() {
-  case "$REDIS_MODE" in
-    sentinel)
-      check_tcp_endpoint_list "Redis Sentinel" "$REDIS_SENTINEL_NODES" 26379
-      ;;
-    cluster)
-      check_endpoint_list "Redis Cluster" "$REDIS_CLUSTER_NODES" "$REDIS_PORT"
-      ;;
-    *)
-      check_redis_endpoint "$REDIS_HOST" "$REDIS_PORT" "Redis"
-      ;;
-  esac
-}
-
-check_minio_dependency() {
-  [ "$MINIO_ENABLE_STORAGE" = "true" ] || return 0
-  endpoint="${MINIO_ENDPOINT%/}"
-  [ -n "$endpoint" ] || fail "MinIO endpoint is empty"
-  case "$endpoint" in
-    http://*|https://*) health_url="$endpoint/minio/health/live" ;;
-    *) health_url="http://$endpoint/minio/health/live" ;;
-  esac
-  if http_probe "$health_url"; then
-    echo "MinIO dependency is ready at $endpoint"
-    return 0
-  fi
-  rc=$?
-  parse_host_port "$endpoint" 9000
-  if [ "$rc" = "2" ]; then
-    check_tcp_dependency "MinIO" "$PARSED_HOST" "$PARSED_PORT"
-    return 0
-  fi
-  fail "MinIO dependency readiness check failed at $health_url"
-}
-
 check_dependencies() {
   echo "checking AIFAR external dependencies"
   check_nacos_dependency
-  check_mysql_dependency
-  check_redis_dependency
-  check_minio_dependency
 }
 
 resolve_system_timezone() {
@@ -320,19 +185,6 @@ resolve_system_timezone() {
       TIMEZONE="${detected:-UTC}"
       ;;
   esac
-}
-
-sql_literal_escape() {
-  printf "%s" "$1" | sed "s/'/''/g"
-}
-
-patch_nacos_sql_namespace() {
-  sql_file="$SQL_DIR/aifar_cloud_nacos.sql"
-  [ -f "$sql_file" ] || return 0
-  escaped_ns="$(sql_literal_escape "$NACOS_NS")"
-  tmp="${sql_file}.tmp"
-  awk -v replacement="'$escaped_ns'" "{ gsub(/'dyx'/, replacement); print }" "$sql_file" > "$tmp"
-  mv "$tmp" "$sql_file"
 }
 
 alpha_service_pairs() {
@@ -364,16 +216,6 @@ EOF
 alpha_service_name() {
   service="$1"
   alpha_service_pairs | awk -v s="$service" '$1==s {print $2; exit}'
-}
-
-patch_nacos_sql_service_names() {
-  sql_file="$SQL_DIR/aifar_cloud_nacos.sql"
-  [ -f "$sql_file" ] || return 0
-  alpha_service_pairs | while read -r service app_name; do
-    tmp="${sql_file}.tmp"
-    sed "s/aifar-${service}/${app_name}/g" "$sql_file" > "$tmp"
-    mv "$tmp" "$sql_file"
-  done
 }
 
 service_port_var() {
@@ -745,9 +587,6 @@ tar -xzf "$ARCHIVE" -C "$TMP_DIR"
 
 mkdir -p "$RELEASE_DIR"
 mv "$TMP_DIR/docker-apps" "$APP_DIR"
-if [ -d "$TMP_DIR/docker-sql" ]; then
-  mv "$TMP_DIR/docker-sql" "$SQL_DIR"
-fi
 if [ -d "$TMP_DIR/docker-images" ]; then
   mv "$TMP_DIR/docker-images" "$IMAGE_DIR"
 fi
@@ -755,8 +594,6 @@ rm -rf "$TMP_DIR"
 mkdir -p "$ENV_DIR" "$AIFAR_DIR"
 
 resolve_system_timezone
-patch_nacos_sql_namespace
-patch_nacos_sql_service_names
 write_compose_env
 write_java_env
 write_service_envs
@@ -766,15 +603,6 @@ load_docker_images
 require_local_image "bellsoft/liberica-openjre-rocky:21"
 require_local_image "nginx:stable-alpine"
 check_dependencies
-
-if [ "$INIT_SQL" = "true" ]; then
-  command -v mysql >/dev/null 2>&1 || fail "mysql client is required when SQL initialization is enabled"
-  [ -f "$SQL_DIR/aifar_cloud_nacos.sql" ] || fail "nacos SQL file is missing"
-  mysql --protocol=tcp -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" "-p$DB_PASSWORD" < "$SQL_DIR/aifar_cloud_nacos.sql"
-  if [ -f "$SQL_DIR/aifar_init.sql" ]; then
-    mysql --protocol=tcp -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" "-p$DB_PASSWORD" < "$SQL_DIR/aifar_init.sql"
-  fi
-fi
 
 ensure_network
 previous_release="$(current_release || true)"
