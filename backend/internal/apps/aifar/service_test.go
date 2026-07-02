@@ -463,6 +463,9 @@ func TestServiceUpdatesAIFARServiceArtifactAsPartialRelease(t *testing.T) {
 		`SERVICE_BASE_RELEASE="$(release_for_service "$SERVICE_NAME" "$BASE_RELEASE" || true)"`,
 		`copy_shared_release_files "$BASE_RELEASE"`,
 		`copy_service_release_files "$SERVICE_BASE_RELEASE"`,
+		`cfr_source="$1"`,
+		`csrf_source="$1"`,
+		`cp -a "$csrf_source/env/." "$ENV_DIR/"`,
 		`apply_java_artifact`,
 		`retag_selected_service`,
 		`compose --env-file env/compose.env -f compose.yaml up -d --build "$SERVICE_NAME"`,
@@ -476,6 +479,9 @@ func TestServiceUpdatesAIFARServiceArtifactAsPartialRelease(t *testing.T) {
 	}
 	if strings.Contains(remote.updateScript, `cp -a "$BASE_RELEASE/." "$RELEASE_DIR/"`) {
 		t.Fatalf("partial update script should not copy the whole base release:\n%s", remote.updateScript)
+	}
+	if strings.Contains(remote.updateScript, "\n  source=\"$1\"") {
+		t.Fatalf("partial update script should not reuse global shell variable source:\n%s", remote.updateScript)
 	}
 	if strings.Contains(remote.updateScript, "cleanup_release_images") || strings.Contains(remote.updateScript, "docker image rm") {
 		t.Fatalf("partial update script should not delete inherited image refs:\n%s", remote.updateScript)

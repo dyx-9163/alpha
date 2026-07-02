@@ -491,3 +491,5 @@
 - 结论：AIFAR 安装弹窗只保留 Docker/Nacos 与部署自身参数；后端安装选项、配置 hash、实例元数据和安装脚本不再读取、校验、记录或预检 MySQL/Redis/MinIO/SQL 初始化参数，归档也排除 `docker-sql`。验证通过：`go test ./internal/apps/aifar`、`pnpm test`、`pnpm web:build`、`git diff --check`。
 - 问题：用户反馈 Nacos 明明可访问但监测显示失败，并指出 AIFAR 单服务制品更新不应复制整个 release 包。
 - 结论：Nacos 检测改为先验证 readiness/端口再使用 systemd 诊断，运行时检测失败写 `unavailable` 而不是安装失败 `failed`，成功检测会清除旧 installFailed 元数据；AIFAR 部分更新改为只复制 compose/env 骨架和目标服务目录，并沿 baseReleaseId 查找服务目录、保护被 partial release 引用的 base release 以支持回滚。
+- 问题：用户执行 AIFAR 部分更新时报 `.../compose.yaml/env/. Not a directory`。
+- 结论：原因是 `sh` 函数变量默认全局，`copy_file_required` 内的 `source` 覆盖了 `copy_shared_release_files` 的 `source`，导致 env 路径拼到 `compose.yaml` 后面；已将更新脚本内嵌套函数变量改为唯一前缀变量，并增加测试防止再次使用独立 `source="$1"`。

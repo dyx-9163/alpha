@@ -81,36 +81,36 @@ current_release() {
 }
 
 manifest_value() {
-  file="$1"
-  key="$2"
-  [ -f "$file" ] || return 1
-  sed -n "s/.*\"$key\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" "$file" | head -n 1
+  mv_file="$1"
+  mv_key="$2"
+  [ -f "$mv_file" ] || return 1
+  sed -n "s/.*\"$mv_key\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" "$mv_file" | head -n 1
 }
 
 release_by_id() {
-  id="$(printf "%s" "$1" | tr -d '\r\n')"
-  [ -n "$id" ] || return 1
-  candidate="$RELEASES_DIR/$id"
-  [ -d "$candidate" ] || return 1
-  printf "%s" "$candidate"
+  rbi_id="$(printf "%s" "$1" | tr -d '\r\n')"
+  [ -n "$rbi_id" ] || return 1
+  rbi_candidate="$RELEASES_DIR/$rbi_id"
+  [ -d "$rbi_candidate" ] || return 1
+  printf "%s" "$rbi_candidate"
 }
 
 release_for_service() {
-  service="$1"
-  candidate="$2"
-  seen=""
-  while [ -n "$candidate" ] && [ -d "$candidate" ]; do
-    resolved="$(readlink -f "$candidate" 2>/dev/null || printf "%s" "$candidate")"
-    case " $seen " in
-      *" $resolved "*) break ;;
+  rfs_service="$1"
+  rfs_candidate="$2"
+  rfs_seen=""
+  while [ -n "$rfs_candidate" ] && [ -d "$rfs_candidate" ]; do
+    rfs_resolved="$(readlink -f "$rfs_candidate" 2>/dev/null || printf "%s" "$rfs_candidate")"
+    case " $rfs_seen " in
+      *" $rfs_resolved "*) break ;;
     esac
-    seen="$seen $resolved"
-    if [ -d "$candidate/docker-apps/$service" ]; then
-      printf "%s" "$candidate"
+    rfs_seen="$rfs_seen $rfs_resolved"
+    if [ -d "$rfs_candidate/docker-apps/$rfs_service" ]; then
+      printf "%s" "$rfs_candidate"
       return 0
     fi
-    base_id="$(manifest_value "$candidate/.aifar/manifest.json" baseReleaseId || true)"
-    candidate="$(release_by_id "$base_id" || true)"
+    rfs_base_id="$(manifest_value "$rfs_candidate/.aifar/manifest.json" baseReleaseId || true)"
+    rfs_candidate="$(release_by_id "$rfs_base_id" || true)"
   done
   return 1
 }
@@ -133,30 +133,30 @@ verify_artifact() {
 }
 
 copy_file_required() {
-  source="$1"
-  target="$2"
-  [ -f "$source" ] || fail "required release file is missing: $source"
-  mkdir -p "$(dirname "$target")"
-  cp "$source" "$target"
+  cfr_source="$1"
+  cfr_target="$2"
+  [ -f "$cfr_source" ] || fail "required release file is missing: $cfr_source"
+  mkdir -p "$(dirname "$cfr_target")"
+  cp "$cfr_source" "$cfr_target"
 }
 
 copy_shared_release_files() {
-  source="$1"
-  [ -f "$source/compose.yaml" ] || fail "current AIFAR release compose.yaml is missing"
-  [ -d "$source/env" ] || fail "current AIFAR release env directory is missing"
+  csrf_source="$1"
+  [ -f "$csrf_source/compose.yaml" ] || fail "current AIFAR release compose.yaml is missing"
+  [ -d "$csrf_source/env" ] || fail "current AIFAR release env directory is missing"
   mkdir -p "$RELEASE_DIR" "$ENV_DIR" "$APP_DIR" "$AIFAR_DIR"
-  copy_file_required "$source/compose.yaml" "$RELEASE_DIR/compose.yaml"
-  cp -a "$source/env/." "$ENV_DIR/"
+  copy_file_required "$csrf_source/compose.yaml" "$RELEASE_DIR/compose.yaml"
+  cp -a "$csrf_source/env/." "$ENV_DIR/"
 }
 
 copy_service_release_files() {
-  source="$1"
-  service_dir="$source/docker-apps/$SERVICE_NAME"
-  [ -d "$service_dir" ] || fail "service directory is missing in release chain: $SERVICE_NAME"
+  csrf_service_source="$1"
+  csrf_service_dir="$csrf_service_source/docker-apps/$SERVICE_NAME"
+  [ -d "$csrf_service_dir" ] || fail "service directory is missing in release chain: $SERVICE_NAME"
   mkdir -p "$APP_DIR"
-  cp -a "$service_dir" "$APP_DIR/$SERVICE_NAME"
+  cp -a "$csrf_service_dir" "$APP_DIR/$SERVICE_NAME"
   if [ ! -f "$ENV_DIR/$SERVICE_NAME.env" ]; then
-    copy_file_required "$source/env/$SERVICE_NAME.env" "$ENV_DIR/$SERVICE_NAME.env"
+    copy_file_required "$csrf_service_source/env/$SERVICE_NAME.env" "$ENV_DIR/$SERVICE_NAME.env"
   fi
 }
 
@@ -376,24 +376,24 @@ MANIFEST
 }
 
 release_chain_ids() {
-  candidate="$1"
-  seen=""
-  while [ -n "$candidate" ] && [ -d "$candidate" ]; do
-    id="$(basename "$candidate")"
-    case " $seen " in
-      *" $id "*) break ;;
+  rci_candidate="$1"
+  rci_seen=""
+  while [ -n "$rci_candidate" ] && [ -d "$rci_candidate" ]; do
+    rci_id="$(basename "$rci_candidate")"
+    case " $rci_seen " in
+      *" $rci_id "*) break ;;
     esac
-    seen="$seen $id"
-    printf "%s\n" "$id"
-    base_id="$(manifest_value "$candidate/.aifar/manifest.json" baseReleaseId || true)"
-    candidate="$(release_by_id "$base_id" || true)"
+    rci_seen="$rci_seen $rci_id"
+    printf "%s\n" "$rci_id"
+    rci_base_id="$(manifest_value "$rci_candidate/.aifar/manifest.json" baseReleaseId || true)"
+    rci_candidate="$(release_by_id "$rci_base_id" || true)"
   done
 }
 
 release_id_protected() {
-  id="$1"
-  for keep_id in $PROTECTED_RELEASE_IDS; do
-    [ "$keep_id" = "$id" ] && return 0
+  rip_id="$1"
+  for rip_keep_id in $PROTECTED_RELEASE_IDS; do
+    [ "$rip_keep_id" = "$rip_id" ] && return 0
   done
   return 1
 }
