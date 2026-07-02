@@ -148,6 +148,12 @@ func (s *Store) migrate() error {
 			config_hash text, created_at datetime not null, activated_at datetime
 		)`,
 		`create unique index if not exists app_releases_instance_release on app_releases(instance_id, release_id)`,
+		`create table if not exists nacos_config_revisions (
+			id text primary key, nacos_instance_id text not null, namespace text not null, group_name text not null,
+			data_id text not null, content_cipher text not null, content_hash text not null, metadata text,
+			created_by text, created_at datetime not null, published_at datetime not null
+		)`,
+		`create index if not exists nacos_config_revisions_lookup on nacos_config_revisions(nacos_instance_id, namespace, group_name, data_id, published_at)`,
 		`create table if not exists credentials (
 			id text primary key, name text not null, kind text not null, username text, endpoint text,
 			scope text not null, status text not null, app text, server_id text, app_instance_id text,
@@ -324,7 +330,7 @@ func (s *Store) ListUsers() ([]UserSummary, error) {
 
 func (s *Store) CountRows(table string) (int, error) {
 	switch table {
-	case "users", "servers", "tasks", "task_logs", "task_targets", "task_steps", "audit_logs", "resources", "app_instances", "app_releases", "credentials", "credential_versions", "credential_bindings", "storage_items", "settings":
+	case "users", "servers", "tasks", "task_logs", "task_targets", "task_steps", "audit_logs", "resources", "app_instances", "app_releases", "nacos_config_revisions", "credentials", "credential_versions", "credential_bindings", "storage_items", "settings":
 	default:
 		return 0, fmt.Errorf("unsupported table %q", table)
 	}

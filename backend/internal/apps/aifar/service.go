@@ -354,6 +354,44 @@ func (s Service) existingAIFARInstanceID(serverID, installRoot string) (string, 
 	return "", nil
 }
 
+func (s Service) ensureDockerRuntimeReady(serverID string, copy Copy) error {
+	instances, err := s.store.ListAppInstances()
+	if err != nil {
+		return err
+	}
+	for _, instance := range instances {
+		if instance.App == "docker" && instance.ServerID == serverID && dockerRuntimeReady(instance) {
+			return nil
+		}
+	}
+	return errors.New(copy.DockerRuntimeRequired)
+}
+
+func dockerRuntimeReady(instance store.AppInstance) bool {
+	if !dockerStatusReady(instance.Status) {
+		return false
+	}
+	metadata := metadataFromInstance(instance)
+	lastCheck, ok := metadata["lastCheck"].(map[string]any)
+	if !ok {
+		return true
+	}
+	if status := strings.TrimSpace(fmt.Sprint(lastCheck["status"])); status != "" && !dockerStatusReady(status) {
+		return false
+	}
+	return strings.TrimSpace(fmt.Sprint(lastCheck["dockerVersion"])) != "" &&
+		strings.TrimSpace(fmt.Sprint(lastCheck["composeVersion"])) != ""
+}
+
+func dockerStatusReady(status string) bool {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "installed", "running", "available", "ok", "success":
+		return true
+	default:
+		return false
+	}
+}
+
 func (s Service) Delete(ctx context.Context, req DeleteRequest, log Logger, targetLog targetLogger) error {
 	copy := deleteCopyFor(req.Language)
 	target := req.Instance.ServerID

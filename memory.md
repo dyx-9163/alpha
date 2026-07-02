@@ -449,3 +449,23 @@
 - 结论：已新增凭据中心后端表、加密存储、版本记录最近 3 个、实例绑定、RBAC 权限和 `/api/v2/credentials` API；安装入口支持 credentialId 解密注入并绑定到实例，MySQL/Redis/MinIO 安装成功后自动登记凭据；前端新增凭据中心页面、菜单入口，并在 MySQL/Redis/MinIO/Nacos/AIFAR 安装弹窗接入凭据选择。验证通过：`go test ./internal/store ./internal/httpapi`、`pnpm web:build`、`pnpm test`、`git diff --check`。
 - 问题：用户反馈 Nacos 安装成功后没有自动加入凭据中心。
 - 结论：原因是上一版自动登记只覆盖 MySQL/Redis/MinIO；已补上 Nacos 安装成功后按默认控制台账号登记 `nacos` 类型凭据，并绑定到对应 Nacos app instance，endpoint 使用 `http://host:port/nacos`。验证通过：`go test ./internal/httpapi`、`pnpm test`、`git diff --check`。
+- 问题：用户要求所有服务即使安装失败，也要在对应模块加载出来并提示安装失败，便于卸载残留文件。
+- 结论：安装任务失败时由 API 记录 `status=failed` 的 app instance，并写入端口、endpoint、taskId、installFailed 等清理所需元数据；数据库、Nacos、对象存储页面会展示失败提醒并跳过自动健康检查，保留卸载入口用于清理。
+- 问题：用户要求 AIFAR 安装目标服务器只能选择已安装 Docker Engine 和 Docker Compose 的服务器。
+- 结论：AIFAR 安装弹窗按 Docker app instance 与检测结果过滤目标服务器，并在没有 Docker/Compose 就绪主机时禁用安装；后端 `ValidateInstall` 同步校验目标服务器存在健康 Docker+Compose 记录，防止绕过前端。
+- 问题：用户要求所有服务单体安装也能选择凭据，并且 Nacos 单体和集群安装都可不连接数据库、使用本地存储。
+- 结论：Nacos 安装新增 Nacos 管理凭据选择，单体/集群默认使用本地存储，MySQL 改为可选存储来源；后端 Nacos 安装参数、脚本和校验支持本地存储及自定义 Nacos 凭据，DB 初始化仅在启用 MySQL 时执行。验证通过：`go test ./internal/apps/nacos`、`pnpm test`、`pnpm web:build`、`git diff --check`。
+- 问题：用户询问如何管理 Nacos 里的 Redis/MySQL 单体和集群配置。
+- 结论：建议以面板数据库中的 MySQL/Redis 实例和凭据中心为事实源，由面板生成并发布 Nacos YAML；MySQL 集群应用侧只连 MySQL Router，Redis 单体/Sentinel/Cluster 按拓扑生成不同 Spring 配置，发布前预览 diff、检测连接并保留最近 3 个配置版本。
+- 问题：用户询问在平台新增“Nacos 配置管理/发布”能力应设计成什么样。
+- 结论：该能力应作为面板生成运行配置并发布到 Nacos 的配置发布中心，包含目标 Nacos/namespace/group/Data ID、应用服务、MySQL/Redis/MinIO 等依赖选择、凭据绑定、YAML 预览 diff、连通性校验、任务化发布、最近 3 个版本与回滚。
+- 问题：用户确认执行新增“Nacos 配置管理/发布”能力。
+- 结论：已在 Nacos 页面新增配置发布页签，支持选择 Nacos/MySQL/Redis/MinIO 实例与凭据、生成脱敏 YAML 预览、读取当前 Nacos 配置比对、发布/回滚任务；后端新增 Nacos 配置发布 API、Nacos HTTP 客户端、加密配置版本表，并按 Data ID 保留最近 3 个版本。验证通过：go test ./internal/store ./internal/httpapi、pnpm test、pnpm web:build、git diff --check。
+- 问题：用户询问 Docker 是否能给容器分命名空间或其他分类。
+- 结论：Docker Engine 没有类似 Kubernetes Namespace 的业务分类对象；容器隔离层的 namespace 是 Linux 隔离机制，不适合做管理分类。平台侧应优先用 Compose project、Docker labels、容器/网络/卷命名前缀和面板实例元数据实现应用、实例、release、服务、环境等分组。
+- 问题：用户追问 Docker images 是否能分类。
+- 结论：Docker Engine 本地镜像没有业务命名空间对象，镜像分类应通过 registry/repository/tag 命名规范、OCI/Docker image labels、面板 release manifest 和 app instance 元数据共同实现；AIFAR 应记录每个 release 使用的 image refs，并用 labels/命名前缀区分 app、service、version、release、base/runtime，清理镜像时只删除未被最近 release 引用的镜像。
+- 问题：用户截图显示 Nacos 配置发布预览时报 `nacos login failed: 403 user not found!`。
+- 结论：Nacos 安装脚本不再跳过默认 `nacos/nacos` 账号校验，安装后会尝试登录、创建或更新目标 Nacos 管理用户，并在最终登录失败时中止；自动登记的 Nacos 凭据会写回 appInstanceId，旧凭据列表会从绑定表兜底暴露实例关联，配置发布的 Nacos 登录错误改为明确提示所选凭据被目标 Nacos 拒绝且不泄露密码。验证通过：`go test ./internal/store ./internal/apps/nacos ./internal/httpapi`、`pnpm test`、`git diff --check`。
+- 问题：用户询问当前 Nacos 配置发布使用的用户名密码是否为 `nacos/nacos`。
+- 结论：Nacos 安装与自动登记凭据的默认用户名/密码是 `nacos/nacos`；配置发布实际使用的是页面所选凭据中心记录，用户名可见，密码为加密保存的 secret，若曾选择自定义凭据或手动修改过凭据中心，则不一定仍是默认密码。

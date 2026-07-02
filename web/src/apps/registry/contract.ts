@@ -5,6 +5,8 @@ export interface ServerOption {
   id: string
   name: string
   host: string
+  status?: string
+  dockerHost?: string
 }
 
 export interface AppInstanceOption {
@@ -113,6 +115,7 @@ export type AppInstallFieldVisibility = (
 
 export interface AppInstallDialogConfig {
   targetMode?: AppTargetMode
+  targetServerFilter?: (server: ServerOption, context: AppInstallDialogContext) => boolean
   targetModeResolver?: (values: AppInstallFieldValues) => AppTargetMode
   hideTargetSelector?: boolean
   hideTargetSelectorResolver?: (values: AppInstallFieldValues) => boolean

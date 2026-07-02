@@ -95,6 +95,7 @@
                 <StatusTag class="db-grid-tag" :status="group.routerStatus" />
               </div>
             </div>
+            <div v-if="isInstallFailedGroup(group)" class="service-notice danger">{{ t('apps.installFailedCleanupHint') }}</div>
             <div v-if="isUnavailable(group.nodeStatus)" class="service-notice danger">{{ databaseServiceUnavailableText(group) }}</div>
             <div v-if="isUnavailable(group.routerStatus)" class="service-notice danger">{{ t('database.routerServiceUnavailable') }}</div>
             <div v-if="group.nodes.length" class="node-list">
@@ -440,7 +441,7 @@ async function runRealtimeCheck(manual: boolean) {
 }
 
 function isMonitorableInstance(instance: AppInstance) {
-  return ['mysql', 'redis', 'mysql-router'].includes(instance.app)
+  return ['mysql', 'redis', 'mysql-router'].includes(instance.app) && !isInstallFailedInstance(instance, metadataOf(instance))
 }
 
 async function waitForTasks(taskIds: string[]) {
@@ -1234,6 +1235,14 @@ function groupStatus(nodeStatus: string, routerStatus: string, hasRouters: boole
 
 function isUnavailable(status: string) {
   return status === 'unavailable'
+}
+
+function isInstallFailedGroup(group: DatabaseGroup) {
+  return [...group.nodes, ...group.routers, ...group.sentinels].some((node) => isInstallFailedInstance(node.instance, node.metadata))
+}
+
+function isInstallFailedInstance(instance: AppInstance, metadata: InstanceMetadata) {
+  return instance.status === 'failed' || metadataBool(metadata, 'installFailed')
 }
 
 function databaseServiceUnavailableText(group: DatabaseGroup) {

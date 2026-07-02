@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"aifar-deployment/backend/internal/adapter"
+	"aifar-deployment/backend/internal/apps/registry"
 	"aifar-deployment/backend/internal/store"
 )
 
@@ -525,6 +526,83 @@ func TestServiceResolvesManagedNacosInstance(t *testing.T) {
 	}
 }
 
+func TestModuleValidateInstallRequiresDockerRuntime(t *testing.T) {
+	root := createAIFARBundle(t)
+	module := NewModule(&fakeStore{servers: map[string]store.Server{
+		"srv-1": {ID: "srv-1", Name: "app-1", Host: "10.0.0.10", DeployDir: "/aifar/apps"},
+	}}, &fakeRemote{})
+	err := module.ValidateInstall(context.Background(), registry.InstallRequest{
+		Version:    "latest",
+		ServerID:   "srv-1",
+		Language:   "en",
+		Parameters: aifarModuleValidationParams(),
+	}, aifarModuleValidationResources(root))
+	if err == nil || !strings.Contains(err.Error(), "Docker Engine") {
+		t.Fatalf("expected Docker runtime validation error, got %v", err)
+	}
+}
+
+func TestModuleValidateInstallAcceptsDockerRuntime(t *testing.T) {
+	root := createAIFARBundle(t)
+	module := NewModule(&fakeStore{
+		servers: map[string]store.Server{
+			"srv-1": {ID: "srv-1", Name: "app-1", Host: "10.0.0.10", DeployDir: "/aifar/apps"},
+		},
+		instances: []store.AppInstance{
+			{
+				ID:       "docker-1",
+				App:      "docker",
+				Version:  "24.0.9",
+				ServerID: "srv-1",
+				Status:   "installed",
+				Metadata: mustMetadata(t, map[string]any{"dockerHost": "tcp://10.0.0.10:2375"}),
+			},
+		},
+	}, &fakeRemote{})
+	err := module.ValidateInstall(context.Background(), registry.InstallRequest{
+		Version:    "latest",
+		ServerID:   "srv-1",
+		Language:   "en",
+		Parameters: aifarModuleValidationParams(),
+	}, aifarModuleValidationResources(root))
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestModuleValidateInstallRejectsDockerWithoutCompose(t *testing.T) {
+	root := createAIFARBundle(t)
+	module := NewModule(&fakeStore{
+		servers: map[string]store.Server{
+			"srv-1": {ID: "srv-1", Name: "app-1", Host: "10.0.0.10", DeployDir: "/aifar/apps"},
+		},
+		instances: []store.AppInstance{
+			{
+				ID:       "docker-1",
+				App:      "docker",
+				Version:  "24.0.9",
+				ServerID: "srv-1",
+				Status:   "running",
+				Metadata: mustMetadata(t, map[string]any{
+					"lastCheck": map[string]any{
+						"dockerVersion":  "Docker version 24.0.9",
+						"composeVersion": "",
+					},
+				}),
+			},
+		},
+	}, &fakeRemote{})
+	err := module.ValidateInstall(context.Background(), registry.InstallRequest{
+		Version:    "latest",
+		ServerID:   "srv-1",
+		Language:   "en",
+		Parameters: aifarModuleValidationParams(),
+	}, aifarModuleValidationResources(root))
+	if err == nil || !strings.Contains(err.Error(), "Docker Engine") {
+		t.Fatalf("expected Docker Compose validation error, got %v", err)
+	}
+}
+
 func TestSelectBundleIgnoresDockerSQLVersion(t *testing.T) {
 	root := createAIFARBundle(t)
 	resources := []store.Resource{
@@ -598,6 +676,23 @@ func mustMetadata(t *testing.T, value map[string]any) string {
 		t.Fatal(err)
 	}
 	return string(data)
+}
+
+func aifarModuleValidationResources(root string) []store.Resource {
+	return []store.Resource{{App: "aifar", Part: "backend", Version: "docker-apps", Path: filepath.Join(root, "docker-apps", ".env")}}
+}
+
+func aifarModuleValidationParams() map[string]any {
+	return map[string]any{
+		"nacosHost":      "10.0.0.50",
+		"dbHost":         "10.0.0.20",
+		"dbPort":         3306,
+		"dbUser":         "root",
+		"dbPassword":     "secret-value",
+		"minioEndpoint":  "http://10.0.0.60:9000",
+		"minioAccessKey": "aifar-file",
+		"minioSecretKey": "minio-secret",
+	}
 }
 
 func TestServiceChecksAIFARServiceAndUpdatesStatus(t *testing.T) {

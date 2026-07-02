@@ -23,8 +23,9 @@ export const aifarMessages = {
     version: '版本',
     versionPlaceholder: '选择 docker-apps 资源包',
     servers: '目标服务器',
-    serversPlaceholder: '选择一台已安装 Docker 的服务器',
-    noServers: '暂无服务器，请先在服务器工作台添加目标主机。',
+    serversPlaceholder: '选择一台已安装 Docker Engine 和 Docker Compose 的服务器',
+    noServers: '暂无已安装 Docker Engine 和 Docker Compose 的服务器，请先在应用商店安装 Docker 并执行检测。',
+    noDockerReadyServers: '暂无已安装 Docker Engine 和 Docker Compose 的服务器，请先在应用商店安装 Docker 并执行检测。',
     selectedCount: (count: number) => `已选择 ${count} 台服务器`,
     cancel: '取消',
     submit: '开始安装',
@@ -106,8 +107,9 @@ export const aifarMessages = {
     version: 'Version',
     versionPlaceholder: 'Select docker-apps bundle',
     servers: 'Target server',
-    serversPlaceholder: 'Select one Docker-ready server',
-    noServers: 'No servers yet. Add target hosts in the server workbench first.',
+    serversPlaceholder: 'Select one Docker Engine + Docker Compose ready server',
+    noServers: 'No Docker Engine + Docker Compose ready servers. Install Docker from the app store and run a check first.',
+    noDockerReadyServers: 'No Docker Engine + Docker Compose ready servers. Install Docker from the app store and run a check first.',
     selectedCount: (count: number) => `${count} server(s) selected`,
     cancel: 'Cancel',
     submit: 'Start install',
@@ -222,6 +224,7 @@ export function aifarInstallDialogProps(locale?: string, context?: AppInstallDia
   }
   return {
     targetMode: 'single',
+    targetServerFilter: (server, filterContext) => dockerReadyServerIds(filterContext).has(server.id),
     copy: dialogCopy,
     fields: [
       requiredText('timezone', copy.timezone, 'system', copy),
@@ -403,6 +406,11 @@ export function aifarInstallDialogProps(locale?: string, context?: AppInstallDia
       }
     ]
   }
+}
+
+export function aifarDeployDisabledReason(locale?: string, context?: AppInstallDialogContext) {
+  const copy = aifarCopy(locale)
+  return dockerReadyServerIds(context).size > 0 ? '' : copy.noDockerReadyServers
 }
 
 function requiredText(name: string, label: string, defaultValue: string, copy: ReturnType<typeof aifarCopy>) {
@@ -640,4 +648,42 @@ function parseMetadata(value?: string) {
   } catch {
     return {}
   }
+}
+
+function dockerReadyServerIds(context?: AppInstallDialogContext) {
+  const out = new Set<string>()
+  for (const instance of context?.instances ?? []) {
+    if (isDockerReadyInstance(instance)) {
+      out.add(instance.serverId || '')
+    }
+  }
+  out.delete('')
+  return out
+}
+
+function isDockerReadyInstance(instance: AppInstanceOption) {
+  if (instance.app !== 'docker' || !instance.serverId) {
+    return false
+  }
+  if (!statusReady(instance.status)) {
+    return false
+  }
+  const metadata = parseMetadata(instance.metadata)
+  const lastCheck = metadataRecord(metadata.lastCheck)
+  if (!lastCheck) {
+    return true
+  }
+  const checkedStatus = String(lastCheck.status ?? instance.status ?? '').trim()
+  if (checkedStatus && !statusReady(checkedStatus)) {
+    return false
+  }
+  return String(lastCheck.dockerVersion ?? '').trim() !== '' && String(lastCheck.composeVersion ?? '').trim() !== ''
+}
+
+function metadataRecord(value: unknown) {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null
+}
+
+function statusReady(value: unknown) {
+  return ['installed', 'running', 'available', 'ok', 'success'].includes(String(value ?? '').trim().toLowerCase())
 }

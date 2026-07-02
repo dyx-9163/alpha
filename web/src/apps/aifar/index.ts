@@ -1,5 +1,5 @@
 import { aifarFrontendAppForLocale } from './catalog'
-import { aifarInstallDialogProps } from './i18n'
+import { aifarDeployDisabledReason, aifarInstallDialogProps } from './i18n'
 import AppInstallDialog from '../../components/AppInstallDialog.vue'
 import type { AppFrontendModule } from '../registry/contract'
 
@@ -8,6 +8,7 @@ export const aifarFrontendModule: AppFrontendModule = {
   manifest: aifarFrontendAppForLocale,
   installDialog: AppInstallDialog,
   installDialogProps: aifarInstallDialogProps,
+  deployDisabledReason: aifarDeployDisabledReason,
   supportsMultiTarget: false
 }
 

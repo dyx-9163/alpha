@@ -88,6 +88,8 @@
               </div>
             </div>
 
+            <div v-if="isInstallFailedGroup(group)" class="service-notice danger">{{ t('apps.installFailedCleanupHint') }}</div>
+
             <div v-if="isBucketReplication(group)" class="bucket-sync-list">
               <div class="section-label">{{ t('storage.bucketSync') }}</div>
               <div v-for="pair in replicationPairs(group)" :key="pair.key" class="sync-row">
@@ -724,10 +726,14 @@ function truthyValue(value: unknown) {
 }
 
 function displayInstanceStatus(item: AppInstance) {
+  const metadata = metadataOf(item)
+  if (isInstallFailedInstance(item, metadata)) {
+    return 'failed'
+  }
   if (checkingInstanceIds.value.has(item.id)) {
     return 'checking'
   }
-  const lastCheck = metadataOf(item).lastCheck as Record<string, any> | undefined
+  const lastCheck = metadata.lastCheck as Record<string, any> | undefined
   const checkedStatus = String(lastCheck?.status || '').trim()
   if (checkedStatus) {
     return checkedStatus
@@ -748,7 +754,7 @@ async function refreshMinioStatus(manual = false) {
   if (checkingInstances.value) {
     return
   }
-  const rows = instances.value.filter((item) => item.app === 'minio')
+  const rows = instances.value.filter((item) => item.app === 'minio' && !isInstallFailedInstance(item, metadataOf(item)))
   if (!rows.length) {
     return
   }
@@ -800,6 +806,14 @@ function delay(ms: number) {
 function serverName(id: string) {
   const server = servers.value.find((item) => item.id === id)
   return server ? `${server.name} (${server.host})` : id || '-'
+}
+
+function isInstallFailedGroup(group: StorageGroup) {
+  return group.nodes.some((node) => isInstallFailedInstance(node.instance, node.metadata))
+}
+
+function isInstallFailedInstance(item: AppInstance, metadata: InstanceMetadata) {
+  return item.status === 'failed' || truthyValue(metadata.installFailed)
 }
 
 function instanceLabel(item: AppInstance) {
@@ -1045,6 +1059,20 @@ onMounted(load)
   justify-content: flex-end;
   gap: 6px;
   white-space: nowrap;
+}
+
+.service-notice {
+  margin-top: 8px;
+  border-radius: var(--aifar-radius);
+  padding: 8px 10px;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.service-notice.danger {
+  color: #cf1322;
+  background: #fff2f0;
+  border: 1px solid #ffccc7;
 }
 
 .access-grid {

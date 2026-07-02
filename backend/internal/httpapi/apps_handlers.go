@@ -430,6 +430,7 @@ func (a *API) installAppName(w http.ResponseWriter, r *http.Request, app string)
 		writeError(w, http.StatusInternalServerError, "INSTALL_PLAN_STORE_FAILED", err.Error(), map[string]any{"app": def.Name})
 		return
 	}
+	installStartedAt := task.CreatedAt
 	task, err = a.tasks.StartExistingWithLanguage(task, lang, func(ctx context.Context, log worker.Logger) error {
 		log.Info(i18n.Text(lang, "api.installAccepted"), def.Name, req.Version)
 		log.Info(i18n.Text(lang, "api.installTargets"), target)
@@ -451,6 +452,11 @@ func (a *API) installAppName(w http.ResponseWriter, r *http.Request, app string)
 				return log.Target(target)
 			},
 		}); err != nil {
+			if count, recordErr := a.recordFailedInstallInstances(ctx, moduleReq, installStartedAt, task.ID, err); recordErr != nil {
+				log.Error(i18n.Text(lang, "api.installFailedInstanceRecordFailed"), recordErr)
+			} else if count > 0 {
+				log.Info(i18n.Text(lang, "api.installFailedInstanceRecorded"), count)
+			}
 			return err
 		}
 		a.registerInstallCredentials(ctx, def.Name, moduleReq, actor, log)

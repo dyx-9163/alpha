@@ -21,7 +21,7 @@ export const nacosMessages = {
     sourceLabel: 'resources/nacos 离线包',
     description: '基于 resources/nacos 离线包安装 Nacos，支持单体和 3 节点 Cluster 模式。',
     installTitle: '安装 Nacos',
-    hint: '单体模式使用内置存储；Cluster 模式固定选择 3 台 Nacos 节点，可选择已部署 MySQL 或手动填写 MySQL 连接信息。',
+    hint: '单体和集群模式默认都可以使用本地存储；需要外部持久化时再选择已部署 MySQL 或手动填写 MySQL。',
     version: '版本',
     versionPlaceholder: '选择版本',
     servers: '目标服务器',
@@ -40,7 +40,13 @@ export const nacosMessages = {
     jvmXms: 'JVM Xms',
     jvmXmx: 'JVM Xmx',
     jvmXmn: 'JVM Xmn',
-    dbSource: 'MySQL 来源',
+    nacosCredential: 'Nacos 凭据',
+    nacosCredentialPlaceholder: '可选择凭据中心已有 Nacos 凭据',
+    nacosCredentialManual: '手动输入 Nacos 账号',
+    nacosUser: 'Nacos 用户',
+    nacosPassword: 'Nacos 密码',
+    dbSource: '存储来源',
+    dbSourceLocal: '使用本地存储',
     dbSourceExisting: '选择已部署 MySQL',
     dbSourceManual: '手动填写 MySQL',
     dbInstance: '已部署 MySQL',
@@ -65,7 +71,7 @@ export const nacosMessages = {
     sourceLabel: 'Offline resources/nacos package',
     description: 'Install Nacos standalone or three-node cluster mode from the offline Nacos package.',
     installTitle: 'Install Nacos',
-    hint: 'Standalone mode uses embedded storage. Cluster mode always uses exactly 3 Nacos nodes and can use a deployed MySQL instance or a manually entered MySQL connection.',
+    hint: 'Standalone and cluster mode can use local storage by default. MySQL is optional when you want external persistence.',
     version: 'Version',
     versionPlaceholder: 'Select version',
     servers: 'Target server',
@@ -84,7 +90,13 @@ export const nacosMessages = {
     jvmXms: 'JVM Xms',
     jvmXmx: 'JVM Xmx',
     jvmXmn: 'JVM Xmn',
-    dbSource: 'MySQL source',
+    nacosCredential: 'Nacos credential',
+    nacosCredentialPlaceholder: 'Select a Nacos credential from the credential center',
+    nacosCredentialManual: 'Enter Nacos account manually',
+    nacosUser: 'Nacos user',
+    nacosPassword: 'Nacos password',
+    dbSource: 'Storage source',
+    dbSourceLocal: 'Use local storage',
     dbSourceExisting: 'Use deployed MySQL',
     dbSourceManual: 'Enter MySQL manually',
     dbInstance: 'Deployed MySQL',
@@ -125,7 +137,7 @@ export function nacosInstallDialogProps(locale?: string, context?: AppInstallDia
   const copy = nacosCopy(locale)
   const topologies = nacosTopologies(locale)
   const mysqlOptions = mysqlInstanceOptions(context)
-  const mysqlSourceDefault = mysqlOptions.length ? 'existing' : 'manual'
+  const mysqlSourceDefault = 'local'
   const mysqlSelectOptions = mysqlOptions.length ? mysqlOptions : [{ label: copy.noDbInstances, value: '', disabled: true }]
   const dialogCopy: AppInstallDialogCopy = {
     title: copy.installTitle,
@@ -173,47 +185,59 @@ export function nacosInstallDialogProps(locale?: string, context?: AppInstallDia
       requiredText('jvmXmx', copy.jvmXmx, '512m', copy),
       requiredText('jvmXmn', copy.jvmXmn, '256m', copy),
       {
+        ...selectField('nacosCredentialId', copy.nacosCredential, credentialOptions(context, 'nacos', copy.nacosCredentialManual), '', copy, copy.nacosCredentialPlaceholder, false)
+      },
+      {
+        ...requiredText('nacosUser', copy.nacosUser, 'nacos', copy),
+        visibleWhen: (values) => !values.nacosCredentialId
+      },
+      {
+        ...requiredText('nacosPassword', copy.nacosPassword, 'nacos', copy),
+        type: 'password',
+        visibleWhen: (values) => !values.nacosCredentialId
+      },
+      {
         ...selectField('dbSource', copy.dbSource, [
+          { label: copy.dbSourceLocal, value: 'local' },
           { label: copy.dbSourceExisting, value: 'existing', disabled: mysqlOptions.length === 0 },
           { label: copy.dbSourceManual, value: 'manual' }
         ], mysqlSourceDefault, copy),
-        visibleWhen: topologyIs('cluster')
       },
       {
         ...selectField('dbInstanceId', copy.dbInstance, mysqlSelectOptions, mysqlOptions[0]?.value ?? '', copy, copy.dbInstancePlaceholder),
-        visibleWhen: allVisible(topologyIs('cluster'), sourceIs('dbSource', 'existing'))
+        visibleWhen: sourceIs('dbSource', 'existing')
       },
       {
         ...requiredText('dbHost', copy.dbHost, '', copy, copy.dbHostPlaceholder),
-        visibleWhen: allVisible(topologyIs('cluster'), sourceIsNot('dbSource', 'existing'))
+        visibleWhen: sourceIs('dbSource', 'manual')
       },
       {
         ...portField('dbPort', copy.dbPort, 3306, copy),
-        visibleWhen: allVisible(topologyIs('cluster'), sourceIsNot('dbSource', 'existing'))
+        visibleWhen: sourceIs('dbSource', 'manual')
       },
       {
         ...requiredText('dbName', copy.dbName, 'aifar_nacos', copy),
-        visibleWhen: topologyIs('cluster')
+        visibleWhen: sourceIsNot('dbSource', 'local')
       },
       {
         ...selectField('dbCredentialId', copy.dbCredential, credentialOptions(context, 'mysql', copy.dbCredentialManual), '', copy, copy.dbCredentialPlaceholder, false),
-        visibleWhen: topologyIs('cluster')
+        visibleWhen: sourceIsNot('dbSource', 'local')
       },
       {
         ...requiredText('dbUser', copy.dbUser, 'root', copy),
-        visibleWhen: allVisible(topologyIs('cluster'), (values) => !values.dbCredentialId)
+        visibleWhen: allVisible(sourceIsNot('dbSource', 'local'), (values) => !values.dbCredentialId)
       },
       {
         ...requiredText('dbPassword', copy.dbPassword, '', copy),
         type: 'password',
-        visibleWhen: allVisible(topologyIs('cluster'), (values) => !values.dbCredentialId)
+        visibleWhen: allVisible(sourceIsNot('dbSource', 'local'), (values) => !values.dbCredentialId)
       },
       {
         name: 'initDatabase',
         label: copy.initDatabase,
         type: 'switch',
         defaultValue: false,
-        visibleWhen: topologyIs('cluster')
+        visibleWhen: sourceIsNot('dbSource', 'local')
       }
     ]
   }
@@ -281,10 +305,6 @@ function serverOptions(servers: ServerOption[]): AppInstallFieldOption[] {
 
 function serverLabel(server: ServerOption) {
   return server.name && server.host ? `${server.name} (${server.host})` : server.name || server.host || server.id
-}
-
-function topologyIs(topology: string) {
-  return (values: AppInstallFieldValues) => values.topology === topology
 }
 
 function sourceIs(name: string, value: string) {

@@ -102,7 +102,7 @@
       v-if="moduleDialogComponent"
       v-model="moduleDialogVisible"
       :app="moduleDialogApp"
-      :servers="servers"
+      :servers="moduleDialogServers"
       :submitting="installSubmitting"
       :locale="locale"
       v-bind="moduleDialogProps"
@@ -154,7 +154,15 @@ const installDialogContext = computed<AppInstallDialogContext>(() => ({
   credentials: credentials.value,
   defaultDeployDir: appSettings.value.defaultDeployDir || '/aifar/apps'
 }))
-const moduleDialogProps = computed(() => moduleDialogModule.value?.installDialogProps?.(locale.value, installDialogContext.value) ?? {})
+const moduleDialogConfig = computed(() => moduleDialogModule.value?.installDialogProps?.(locale.value, installDialogContext.value) ?? {})
+const moduleDialogServers = computed(() => {
+  const filter = moduleDialogConfig.value.targetServerFilter
+  return filter ? servers.value.filter((server) => filter(server, installDialogContext.value)) : servers.value
+})
+const moduleDialogProps = computed(() => {
+  const { targetServerFilter, ...props } = moduleDialogConfig.value
+  return props
+})
 
 type AppInstanceTableRecord = {
   id: string

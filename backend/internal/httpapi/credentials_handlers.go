@@ -207,7 +207,7 @@ func (a *API) bindInstallCredentialReferences(app string, req registry.InstallRe
 			continue
 		}
 		for _, serverID := range req.TargetServerIDs() {
-			a.bindCredentialToLatestInstance(id, app, serverID, purpose)
+			a.bindCredentialToLatestInstance(id, app, serverID, purpose, false)
 		}
 	}
 }
@@ -267,7 +267,7 @@ func (a *API) registerPasswordCredential(req credentialRegisterRequest, actor st
 			log.Error("credential registration failed for %s: %v", serverID, err)
 			continue
 		}
-		a.bindCredentialToLatestInstance(saved.ID, req.App, serverID, req.Purpose)
+		a.bindCredentialToLatestInstance(saved.ID, req.App, serverID, req.Purpose, true)
 		log.Info(i18n.Text(req.Language, "api.credentialRegistered"), saved.Name)
 	}
 }
@@ -346,7 +346,7 @@ func credentialSecretValue(secret map[string]string, secretKeyPreferred bool) st
 	return ""
 }
 
-func (a *API) bindCredentialToLatestInstance(credentialID, app, serverID, purpose string) {
+func (a *API) bindCredentialToLatestInstance(credentialID, app, serverID, purpose string, updateCredentialRecord bool) {
 	instances, err := a.store.ListAppInstances()
 	if err != nil {
 		return
@@ -362,6 +362,13 @@ func (a *API) bindCredentialToLatestInstance(credentialID, app, serverID, purpos
 	}
 	if selected.ID == "" {
 		return
+	}
+	if updateCredentialRecord {
+		if credential, err := a.store.GetCredential(credentialID, false); err == nil && strings.TrimSpace(credential.AppInstanceID) == "" {
+			credential.AppInstanceID = selected.ID
+			credential.Secret = nil
+			_, _ = a.store.SaveCredential(credential)
+		}
 	}
 	_, _ = a.store.BindCredential(store.CredentialBinding{
 		CredentialID:  credentialID,

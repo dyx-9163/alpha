@@ -10,15 +10,17 @@ import (
 )
 
 type InstallOptions struct {
-	Topology     string
-	Port         int
-	GRPCPort     int
-	GRPCRaftPort int
-	RaftPort     int
-	JVMXMS       string
-	JVMXMX       string
-	JVMXMN       string
-	Database     DatabaseOptions
+	Topology      string
+	Port          int
+	GRPCPort      int
+	GRPCRaftPort  int
+	RaftPort      int
+	JVMXMS        string
+	JVMXMX        string
+	JVMXMN        string
+	AdminUser     string
+	AdminPassword string
+	Database      DatabaseOptions
 }
 
 type DatabaseOptions struct {
@@ -34,31 +36,35 @@ type DatabaseOptions struct {
 }
 
 const (
+	databaseSourceLocal    = "local"
 	databaseSourceManual   = "manual"
 	databaseSourceExisting = "existing"
 )
 
 func nacosOptions(params map[string]any, topology string) InstallOptions {
 	port := intParam(params, "port", 8848)
+	databaseSource := normalizeDatabaseSource(stringParam(params, "dbSource", databaseSourceLocal))
 	return InstallOptions{
-		Topology:     normalizeTopology(topology),
-		Port:         port,
-		GRPCPort:     intParam(params, "grpcPort", port+1000),
-		GRPCRaftPort: intParam(params, "grpcRaftPort", port+1001),
-		RaftPort:     intParam(params, "raftPort", 7848),
-		JVMXMS:       stringParam(params, "jvmXms", "512m"),
-		JVMXMX:       stringParam(params, "jvmXmx", "512m"),
-		JVMXMN:       stringParam(params, "jvmXmn", "256m"),
+		Topology:      normalizeTopology(topology),
+		Port:          port,
+		GRPCPort:      intParam(params, "grpcPort", port+1000),
+		GRPCRaftPort:  intParam(params, "grpcRaftPort", port+1001),
+		RaftPort:      intParam(params, "raftPort", 7848),
+		JVMXMS:        stringParam(params, "jvmXms", "512m"),
+		JVMXMX:        stringParam(params, "jvmXmx", "512m"),
+		JVMXMN:        stringParam(params, "jvmXmn", "256m"),
+		AdminUser:     stringParam(params, "nacosUser", "nacos"),
+		AdminPassword: stringParam(params, "nacosPassword", "nacos"),
 		Database: DatabaseOptions{
-			Enabled:    normalizeTopology(topology) == "cluster",
-			Source:     normalizeDatabaseSource(stringParam(params, "dbSource", databaseSourceManual)),
+			Enabled:    databaseSource != databaseSourceLocal,
+			Source:     databaseSource,
 			InstanceID: stringParam(params, "dbInstanceId", ""),
 			Host:       stringParam(params, "dbHost", ""),
 			Port:       intParam(params, "dbPort", 3306),
 			Name:       stringParam(params, "dbName", "aifar_nacos"),
 			User:       stringParam(params, "dbUser", "root"),
 			Password:   stringParam(params, "dbPassword", ""),
-			Init:       boolParam(params["initDatabase"]),
+			Init:       databaseSource != databaseSourceLocal && boolParam(params["initDatabase"]),
 		},
 	}
 }
@@ -77,12 +83,18 @@ func (o InstallOptions) Validate() error {
 			return fmt.Errorf("%s is required and must not contain whitespace", label)
 		}
 	}
+	if strings.TrimSpace(o.AdminUser) == "" || strings.IndexFunc(o.AdminUser, func(r rune) bool { return r <= ' ' }) >= 0 {
+		return errors.New("Nacos admin user is required and must not contain whitespace")
+	}
+	if strings.TrimSpace(o.AdminPassword) == "" || strings.IndexFunc(o.AdminPassword, func(r rune) bool { return r <= ' ' }) >= 0 {
+		return errors.New("Nacos admin password is required and must not contain whitespace")
+	}
 	if o.Database.Enabled {
 		if o.Database.Source == databaseSourceExisting && strings.TrimSpace(o.Database.InstanceID) == "" {
-			return errors.New("Nacos cluster mode requires a selected MySQL database instance")
+			return errors.New("Nacos requires a selected MySQL database instance")
 		}
 		if strings.TrimSpace(o.Database.Host) == "" {
-			return errors.New("Nacos cluster mode requires MySQL database host")
+			return errors.New("Nacos requires MySQL database host")
 		}
 		if o.Database.Port <= 0 || o.Database.Port > 65535 {
 			return fmt.Errorf("invalid Nacos database port: %d", o.Database.Port)
@@ -104,8 +116,12 @@ func normalizeDatabaseSource(value string) string {
 	switch strings.ToLower(strings.TrimSpace(value)) {
 	case databaseSourceExisting:
 		return databaseSourceExisting
-	default:
+	case databaseSourceManual:
 		return databaseSourceManual
+	case "embedded", "none", databaseSourceLocal:
+		return databaseSourceLocal
+	default:
+		return databaseSourceLocal
 	}
 }
 

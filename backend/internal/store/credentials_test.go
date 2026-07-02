@@ -108,3 +108,34 @@ func TestDeleteBoundCredentialFails(t *testing.T) {
 		t.Fatal("expected deleting a bound credential to fail")
 	}
 }
+
+func TestCredentialListFallsBackToBindingAppInstanceID(t *testing.T) {
+	s, err := OpenWithSecret(filepath.Join(t.TempDir(), "aifar.db"), "test-secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	credential, err := s.SaveCredential(Credential{Name: "nacos", Kind: "nacos", Secret: map[string]string{"password": "secret"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.BindCredential(CredentialBinding{CredentialID: credential.ID, AppInstanceID: "nacos_instance_1", Purpose: "admin"}); err != nil {
+		t.Fatal(err)
+	}
+
+	list, err := s.ListCredentials(CredentialQuery{Kind: "nacos"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list) != 1 || list[0].AppInstanceID != "nacos_instance_1" {
+		t.Fatalf("expected app instance from credential binding, got %+v", list)
+	}
+	got, err := s.GetCredential(credential.ID, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.AppInstanceID != "nacos_instance_1" {
+		t.Fatalf("expected get credential to expose binding app instance, got %+v", got)
+	}
+}

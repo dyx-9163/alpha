@@ -50,7 +50,7 @@ func TestRegisterInstallCredentialsIncludesNacos(t *testing.T) {
 		t.Fatalf("expected one nacos credential, got %+v", credentials)
 	}
 	credential := credentials[0]
-	if credential.Username != "nacos" || credential.Endpoint != "http://192.168.74.132:8848/nacos" || credential.Purpose != "admin" || !credential.HasSecret {
+	if credential.Username != "nacos" || credential.Endpoint != "http://192.168.74.132:8848/nacos" || credential.Purpose != "admin" || credential.AppInstanceID != instance.ID || !credential.HasSecret {
 		t.Fatalf("unexpected nacos credential: %+v", credential)
 	}
 	withSecret, err := db.GetCredential(credential.ID, true)

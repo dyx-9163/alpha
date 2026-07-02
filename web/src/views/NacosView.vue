@@ -19,6 +19,7 @@
 
     <el-tabs v-model="tab" class="tab-strip">
       <el-tab-pane :label="t('nacos.instances')" name="instances" />
+      <el-tab-pane :label="t('nacos.configPublish')" name="configs" />
       <el-tab-pane :label="t('nacos.runs')" name="runs" />
       <el-tab-pane :label="t('nacos.settings')" name="settings" />
     </el-tabs>
@@ -92,6 +93,7 @@
               </div>
             </div>
 
+            <div v-if="isInstallFailedGroup(group)" class="service-notice danger">{{ t('apps.installFailedCleanupHint') }}</div>
             <div v-if="isUnavailable(group.status)" class="service-notice danger">{{ t('nacos.serviceUnavailable') }}</div>
 
             <div class="nacos-node-list">
@@ -114,6 +116,144 @@
           <div>
             <strong>{{ t('nacos.noInstancesTitle') }}</strong>
             <span>{{ t('nacos.noInstancesDesc') }}</span>
+          </div>
+        </div>
+      </template>
+
+      <template v-else-if="tab === 'configs'">
+        <div class="config-publish-grid">
+          <div class="config-form-panel">
+            <div class="config-section-head">
+              <strong>{{ t('nacos.configTarget') }}</strong>
+              <el-tag size="small" effect="plain">{{ configForm.namespace }} / {{ configForm.group }}</el-tag>
+            </div>
+            <el-form label-position="top" class="config-form">
+              <el-form-item :label="t('nacos.configNacosInstance')">
+                <el-select v-model="configForm.nacosInstanceId" filterable class="full-width" :placeholder="t('nacos.selectNacosInstance')" @change="handleConfigNacosChange">
+                  <el-option v-for="option in nacosConfigInstanceOptions" :key="option.value" :label="option.label" :value="option.value" />
+                </el-select>
+              </el-form-item>
+              <el-form-item :label="t('nacos.configNacosCredential')">
+                <el-select v-model="configForm.nacosCredentialId" filterable class="full-width" :placeholder="t('nacos.selectCredential')">
+                  <el-option v-for="credential in nacosCredentials" :key="credential.id" :label="credentialLabel(credential)" :value="credential.id" />
+                </el-select>
+              </el-form-item>
+              <div class="config-field-row">
+                <el-form-item :label="t('nacos.namespace')">
+                  <el-input v-model="configForm.namespace" />
+                </el-form-item>
+                <el-form-item :label="t('nacos.group')">
+                  <el-input v-model="configForm.group" />
+                </el-form-item>
+              </div>
+              <el-form-item :label="t('nacos.dataId')">
+                <el-input v-model="configForm.dataId" />
+              </el-form-item>
+
+              <div class="config-section-toggle">
+                <el-checkbox v-model="configForm.includeDatasource">{{ t('nacos.configDatasource') }}</el-checkbox>
+              </div>
+              <template v-if="configForm.includeDatasource">
+                <el-form-item :label="t('nacos.configMysqlInstance')">
+                  <el-select v-model="configForm.mysqlInstanceId" filterable class="full-width" :placeholder="t('nacos.selectMysqlInstance')" @change="handleConfigMysqlChange">
+                    <el-option v-for="instance in mysqlConfigInstances" :key="instance.id" :label="databaseInstanceLabel(instance)" :value="instance.id" />
+                  </el-select>
+                </el-form-item>
+                <el-form-item :label="t('nacos.configMysqlCredential')">
+                  <el-select v-model="configForm.mysqlCredentialId" filterable class="full-width" :placeholder="t('nacos.selectCredential')">
+                    <el-option v-for="credential in mysqlCredentials" :key="credential.id" :label="credentialLabel(credential)" :value="credential.id" />
+                  </el-select>
+                </el-form-item>
+                <el-form-item :label="t('nacos.databaseName')">
+                  <el-input v-model="configForm.databaseName" />
+                </el-form-item>
+              </template>
+
+              <div class="config-section-toggle">
+                <el-checkbox v-model="configForm.includeRedis">{{ t('nacos.configRedis') }}</el-checkbox>
+              </div>
+              <template v-if="configForm.includeRedis">
+                <el-form-item :label="t('nacos.configRedisInstance')">
+                  <el-select v-model="configForm.redisInstanceId" filterable class="full-width" :placeholder="t('nacos.selectRedisInstance')" @change="handleConfigRedisChange">
+                    <el-option v-for="instance in redisConfigInstances" :key="instance.id" :label="databaseInstanceLabel(instance)" :value="instance.id" />
+                  </el-select>
+                </el-form-item>
+                <el-form-item :label="t('nacos.configRedisCredential')">
+                  <el-select v-model="configForm.redisCredentialId" filterable class="full-width" :placeholder="t('nacos.selectCredential')">
+                    <el-option v-for="credential in redisCredentials" :key="credential.id" :label="credentialLabel(credential)" :value="credential.id" />
+                  </el-select>
+                </el-form-item>
+                <el-form-item :label="t('nacos.redisDatabase')">
+                  <el-input-number v-model="configForm.redisDatabase" :min="0" :max="15" controls-position="right" class="full-width" />
+                </el-form-item>
+              </template>
+
+              <div class="config-section-toggle">
+                <el-checkbox v-model="configForm.includeMinio">{{ t('nacos.configMinio') }}</el-checkbox>
+              </div>
+              <template v-if="configForm.includeMinio">
+                <el-form-item :label="t('nacos.configMinioInstance')">
+                  <el-select v-model="configForm.minioInstanceId" filterable class="full-width" :placeholder="t('nacos.selectMinioInstance')" @change="handleConfigMinioChange">
+                    <el-option v-for="instance in minioConfigInstances" :key="instance.id" :label="storageInstanceLabel(instance)" :value="instance.id" />
+                  </el-select>
+                </el-form-item>
+                <el-form-item :label="t('nacos.configMinioCredential')">
+                  <el-select v-model="configForm.minioCredentialId" filterable class="full-width" :placeholder="t('nacos.selectCredential')">
+                    <el-option v-for="credential in minioCredentials" :key="credential.id" :label="credentialLabel(credential)" :value="credential.id" />
+                  </el-select>
+                </el-form-item>
+                <div class="config-field-row">
+                  <el-form-item :label="t('nacos.minioBucket')">
+                    <el-input v-model="configForm.minioBucket" />
+                  </el-form-item>
+                  <el-form-item :label="t('nacos.minioPlatform')">
+                    <el-input v-model="configForm.minioPlatform" />
+                  </el-form-item>
+                </div>
+              </template>
+            </el-form>
+          </div>
+
+          <div class="config-preview-panel">
+            <div class="config-preview-toolbar">
+              <div class="config-summary">
+                <el-tag :type="configPreview?.changed ? 'warning' : 'success'" effect="plain">
+                  {{ configPreview ? (configPreview.changed ? t('nacos.configChanged') : t('nacos.configUnchanged')) : t('nacos.configNotPreviewed') }}
+                </el-tag>
+                <span v-for="item in configSummary" :key="item">{{ item }}</span>
+              </div>
+              <div class="head-actions">
+                <el-button :loading="configPreviewLoading" :disabled="!canManageApps" @click="previewNacosConfig">{{ t('nacos.previewConfig') }}</el-button>
+                <el-button type="primary" :loading="configPublishLoading" :disabled="!canManageApps" @click="publishNacosConfig">{{ t('nacos.publishConfig') }}</el-button>
+              </div>
+            </div>
+            <div class="config-code-grid">
+              <div>
+                <div class="section-label">{{ t('nacos.generatedConfig') }}</div>
+                <pre class="config-code">{{ configPreview?.generated || t('common.noData') }}</pre>
+              </div>
+              <div>
+                <div class="section-label">{{ t('nacos.currentConfig') }}</div>
+                <pre class="config-code">{{ configPreview?.current || t('common.noData') }}</pre>
+              </div>
+            </div>
+            <div class="config-revision-head">
+              <strong>{{ t('nacos.configRevisions') }}</strong>
+              <span class="subtle-note">{{ t('nacos.configRevisionKeep') }}</span>
+            </div>
+            <el-table :data="configRevisions" size="small" class="config-revision-table" :empty-text="t('common.noData')">
+              <el-table-column prop="dataId" :label="t('nacos.dataId')" min-width="180" />
+              <el-table-column prop="contentHash" :label="t('nacos.contentHash')" min-width="160">
+                <template #default="{ row }">{{ shortHash(row.contentHash) }}</template>
+              </el-table-column>
+              <el-table-column prop="createdBy" :label="t('common.actor')" width="120" />
+              <el-table-column prop="publishedAt" :label="t('common.time')" width="190" />
+              <el-table-column :label="t('common.operation')" width="110" fixed="right">
+                <template #default="{ row }">
+                  <el-button size="small" :loading="configRollbackId === row.id" :disabled="!canManageApps" @click="rollbackNacosConfig(row)">{{ t('nacos.rollbackConfig') }}</el-button>
+                </template>
+              </el-table-column>
+            </el-table>
           </div>
         </div>
       </template>
@@ -149,7 +289,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import { useRouter } from 'vue-router'
 import { apiGet, apiPost, asArray } from '../api/client'
@@ -169,6 +309,59 @@ type AppInstance = {
   topology: string
   metadata: string
   createdAt: string
+}
+
+type Credential = {
+  id: string
+  name: string
+  kind: string
+  username?: string
+  endpoint?: string
+  status: string
+  appInstanceId?: string
+  serverId?: string
+}
+
+type NacosConfigRevision = {
+  id: string
+  nacosInstanceId: string
+  namespace: string
+  group: string
+  dataId: string
+  contentHash: string
+  createdBy: string
+  publishedAt: string
+}
+
+type NacosConfigPreview = {
+  generated: string
+  current: string
+  changed: boolean
+  summary: string[]
+  revisions: NacosConfigRevision[]
+}
+
+type ConfigForm = {
+  nacosInstanceId: string
+  nacosCredentialId: string
+  namespace: string
+  group: string
+  dataId: string
+  appName: string
+  profile: string
+  includeDatasource: boolean
+  mysqlInstanceId: string
+  mysqlCredentialId: string
+  databaseName: string
+  includeRedis: boolean
+  redisInstanceId: string
+  redisCredentialId: string
+  redisDatabase: number
+  includeMinio: boolean
+  minioInstanceId: string
+  minioCredentialId: string
+  minioBucket: string
+  minioPlatform: string
 }
 
 type TaskRecord = {
@@ -207,6 +400,9 @@ type NacosState = {
   instances: AppInstance[]
   servers: any[]
   tasks: TaskRecord[]
+  credentials: Credential[]
+  databaseInstances: AppInstance[]
+  storageInstances: AppInstance[]
 }
 
 const { t } = useI18n()
@@ -215,12 +411,42 @@ const router = useRouter()
 const instances = ref<AppInstance[]>([])
 const servers = ref<any[]>([])
 const tasks = ref<TaskRecord[]>([])
+const credentials = ref<Credential[]>([])
+const databaseInstances = ref<AppInstance[]>([])
+const storageInstances = ref<AppInstance[]>([])
 const tab = ref('instances')
 const search = ref('')
 const monitoringEnabled = ref(true)
 const monitoringRunning = ref(false)
 const lastMonitorAt = ref('')
 const checkingInstanceIds = ref<Set<string>>(new Set())
+const configForm = ref<ConfigForm>({
+  nacosInstanceId: '',
+  nacosCredentialId: '',
+  namespace: 'prod',
+  group: 'DEFAULT_GROUP',
+  dataId: 'application-prod.yml',
+  appName: 'aifar',
+  profile: 'prod',
+  includeDatasource: true,
+  mysqlInstanceId: '',
+  mysqlCredentialId: '',
+  databaseName: 'aifar_admin',
+  includeRedis: true,
+  redisInstanceId: '',
+  redisCredentialId: '',
+  redisDatabase: 1,
+  includeMinio: false,
+  minioInstanceId: '',
+  minioCredentialId: '',
+  minioBucket: 'aifar',
+  minioPlatform: 'minio-1'
+})
+const configPreview = ref<NacosConfigPreview | null>(null)
+const configRevisions = ref<NacosConfigRevision[]>([])
+const configPreviewLoading = ref(false)
+const configPublishLoading = ref(false)
+const configRollbackId = ref('')
 const deletePromptVisible = ref(false)
 const deleteSubmitting = ref(false)
 const pendingDeleteGroup = ref<NacosGroup | null>(null)
@@ -241,6 +467,19 @@ const clusterGroupCount = computed(() => nacosGroups.value.filter((group) => gro
 const standaloneGroupCount = computed(() => nacosGroups.value.filter((group) => group.topology !== 'cluster').length)
 const nacosNodeCount = computed(() => nacosGroups.value.reduce((total, group) => total + group.nodes.length, 0))
 const runTasks = computed(() => tasks.value.filter((item) => item.type?.startsWith('apps.nacos.')))
+const activeCredentials = computed(() => credentials.value.filter((item) => item.status === 'active'))
+const nacosCredentials = computed(() => activeCredentials.value.filter((item) => item.kind === 'nacos' || item.kind === 'generic'))
+const mysqlCredentials = computed(() => activeCredentials.value.filter((item) => item.kind === 'mysql' || item.kind === 'generic'))
+const redisCredentials = computed(() => activeCredentials.value.filter((item) => item.kind === 'redis' || item.kind === 'generic'))
+const minioCredentials = computed(() => activeCredentials.value.filter((item) => item.kind === 'minio' || item.kind === 'generic'))
+const mysqlConfigInstances = computed(() => databaseInstances.value.filter((item) => ['mysql', 'mysql-router'].includes(item.app) && item.status !== 'failed'))
+const redisConfigInstances = computed(() => databaseInstances.value.filter((item) => item.app === 'redis' && item.status !== 'failed'))
+const minioConfigInstances = computed(() => storageInstances.value.filter((item) => item.app === 'minio' && item.status !== 'failed'))
+const nacosConfigInstanceOptions = computed(() => nacosGroups.value.flatMap((group) => group.nodes.map((node) => ({
+  value: node.instance.id,
+  label: `${group.title} / ${node.endpoint}`
+}))))
+const configSummary = computed(() => configPreview.value?.summary?.length ? configPreview.value.summary : [configForm.value.dataId])
 const monitoringStatusLabel = computed(() => {
   if (!canManageApps.value) return t('nacos.monitorPermissionRequired')
   if (monitoringRunning.value) return t('nacos.monitoring')
@@ -281,15 +520,21 @@ async function load() {
 }
 
 async function fetchNacosState(): Promise<NacosState> {
-  const [nextInstances, nextServers, nextTasks] = await Promise.all([
+  const [nextInstances, nextServers, nextTasks, nextCredentials, nextDatabaseInstances, nextStorageInstances] = await Promise.all([
     apiGet<AppInstance[] | null>('/nacos/instances').catch(() => []),
     apiGet<any[] | null>('/servers').catch(() => []),
-    apiGet<TaskRecord[] | null>('/tasks').catch(() => [])
+    apiGet<TaskRecord[] | null>('/tasks').catch(() => []),
+    apiGet<Credential[] | null>('/credentials').catch(() => []),
+    apiGet<AppInstance[] | null>('/database/instances').catch(() => []),
+    apiGet<AppInstance[] | null>('/storage/instances').catch(() => [])
   ])
   return {
     instances: asArray<AppInstance>(nextInstances).filter((item) => item.app === 'nacos'),
     servers: asArray(nextServers),
-    tasks: asArray<TaskRecord>(nextTasks)
+    tasks: asArray<TaskRecord>(nextTasks),
+    credentials: asArray<Credential>(nextCredentials),
+    databaseInstances: asArray<AppInstance>(nextDatabaseInstances),
+    storageInstances: asArray<AppInstance>(nextStorageInstances)
   }
 }
 
@@ -297,6 +542,185 @@ function applyNacosState(state: NacosState) {
   instances.value = state.instances
   servers.value = state.servers
   tasks.value = state.tasks
+  credentials.value = state.credentials
+  databaseInstances.value = state.databaseInstances
+  storageInstances.value = state.storageInstances
+  syncConfigDefaults()
+}
+
+function syncConfigDefaults() {
+  const firstNacos = nacosConfigInstanceOptions.value[0]
+  if (!configForm.value.nacosInstanceId && firstNacos) {
+    configForm.value.nacosInstanceId = firstNacos.value
+  }
+  if (!configForm.value.nacosCredentialId) {
+    configForm.value.nacosCredentialId = bestCredentialId('nacos', configForm.value.nacosInstanceId)
+  }
+  if (!configForm.value.mysqlInstanceId && mysqlConfigInstances.value.length) {
+    const router = mysqlConfigInstances.value.find((item) => item.app === 'mysql-router')
+    configForm.value.mysqlInstanceId = (router ?? mysqlConfigInstances.value[0]).id
+  }
+  if (!configForm.value.mysqlCredentialId) {
+    configForm.value.mysqlCredentialId = bestCredentialId('mysql', configForm.value.mysqlInstanceId)
+  }
+  if (!configForm.value.redisInstanceId && redisConfigInstances.value.length) {
+    configForm.value.redisInstanceId = redisConfigInstances.value[0].id
+  }
+  if (!configForm.value.redisCredentialId) {
+    configForm.value.redisCredentialId = bestCredentialId('redis', configForm.value.redisInstanceId)
+  }
+  if (!configForm.value.minioInstanceId && minioConfigInstances.value.length) {
+    configForm.value.minioInstanceId = minioConfigInstances.value[0].id
+  }
+  if (!configForm.value.minioCredentialId) {
+    configForm.value.minioCredentialId = bestCredentialId('minio', configForm.value.minioInstanceId)
+  }
+}
+
+function handleConfigNacosChange() {
+  configForm.value.nacosCredentialId = bestCredentialId('nacos', configForm.value.nacosInstanceId)
+  clearConfigPreview()
+}
+
+function handleConfigMysqlChange() {
+  configForm.value.mysqlCredentialId = bestCredentialId('mysql', configForm.value.mysqlInstanceId)
+  clearConfigPreview()
+}
+
+function handleConfigRedisChange() {
+  configForm.value.redisCredentialId = bestCredentialId('redis', configForm.value.redisInstanceId)
+  clearConfigPreview()
+}
+
+function handleConfigMinioChange() {
+  configForm.value.minioCredentialId = bestCredentialId('minio', configForm.value.minioInstanceId)
+  clearConfigPreview()
+}
+
+function clearConfigPreview() {
+  configPreview.value = null
+}
+
+function bestCredentialId(kind: string, instanceId: string) {
+  const list = activeCredentials.value.filter((item) => item.kind === kind || item.kind === 'generic')
+  if (!list.length) return ''
+  const instance = findInstanceById(instanceId)
+  const exact = list.find((item) => item.appInstanceId === instanceId)
+  if (exact) return exact.id
+  const byServer = instance?.serverId ? list.find((item) => item.serverId === instance.serverId) : undefined
+  if (byServer) return byServer.id
+  return list[0].id
+}
+
+function findInstanceById(id: string) {
+  return [...instances.value, ...databaseInstances.value, ...storageInstances.value].find((item) => item.id === id)
+}
+
+function configPayload() {
+  return {
+    ...configForm.value,
+    redisDatabase: Number(configForm.value.redisDatabase) || 0
+  }
+}
+
+function validateConfigForm() {
+  if (!configForm.value.nacosInstanceId || !configForm.value.nacosCredentialId) {
+    ElMessage.warning(t('nacos.configNacosRequired'))
+    return false
+  }
+  if (configForm.value.includeDatasource && (!configForm.value.mysqlInstanceId || !configForm.value.mysqlCredentialId)) {
+    ElMessage.warning(t('nacos.configMysqlRequired'))
+    return false
+  }
+  if (configForm.value.includeRedis && (!configForm.value.redisInstanceId || !configForm.value.redisCredentialId)) {
+    ElMessage.warning(t('nacos.configRedisRequired'))
+    return false
+  }
+  if (configForm.value.includeMinio && (!configForm.value.minioInstanceId || !configForm.value.minioCredentialId)) {
+    ElMessage.warning(t('nacos.configMinioRequired'))
+    return false
+  }
+  if (!configForm.value.includeDatasource && !configForm.value.includeRedis && !configForm.value.includeMinio) {
+    ElMessage.warning(t('nacos.configSectionRequired'))
+    return false
+  }
+  return true
+}
+
+async function previewNacosConfig() {
+  if (!canManageApps.value) {
+    ElMessage.warning(deniedText.value)
+    return
+  }
+  if (!validateConfigForm()) return
+  configPreviewLoading.value = true
+  try {
+    const result = await apiPost<NacosConfigPreview>('/nacos/configs/preview', configPayload())
+    configPreview.value = result
+    configRevisions.value = asArray<NacosConfigRevision>(result.revisions)
+  } catch (err) {
+    ElMessage.error(err instanceof Error ? err.message : t('nacos.previewFailed'))
+  } finally {
+    configPreviewLoading.value = false
+  }
+}
+
+async function publishNacosConfig() {
+  if (!canManageApps.value) {
+    ElMessage.warning(deniedText.value)
+    return
+  }
+  if (!validateConfigForm()) return
+  configPublishLoading.value = true
+  try {
+    const result = await apiPost<{ taskId: string }>('/nacos/configs/publish', configPayload())
+    ElMessage.success(t('nacos.publishAccepted'))
+    void router.push({ path: '/tasks', query: { taskId: result.taskId } })
+  } catch (err) {
+    ElMessage.error(err instanceof Error ? err.message : t('nacos.publishFailed'))
+  } finally {
+    configPublishLoading.value = false
+  }
+}
+
+async function loadConfigRevisions() {
+  const form = configForm.value
+  if (!form.nacosInstanceId || !form.namespace || !form.group || !form.dataId) {
+    configRevisions.value = []
+    return
+  }
+  const params = new URLSearchParams({
+    nacosInstanceId: form.nacosInstanceId,
+    namespace: form.namespace,
+    group: form.group,
+    dataId: form.dataId,
+    limit: '3'
+  })
+  configRevisions.value = asArray<NacosConfigRevision>(await apiGet<NacosConfigRevision[] | null>(`/nacos/configs/revisions?${params.toString()}`).catch(() => []))
+}
+
+async function rollbackNacosConfig(row: NacosConfigRevision) {
+  if (!canManageApps.value) {
+    ElMessage.warning(deniedText.value)
+    return
+  }
+  if (!configForm.value.nacosCredentialId) {
+    ElMessage.warning(t('nacos.configNacosRequired'))
+    return
+  }
+  configRollbackId.value = row.id
+  try {
+    const result = await apiPost<{ taskId: string }>('/nacos/configs/rollback', {
+      revisionId: row.id,
+      nacosCredentialId: configForm.value.nacosCredentialId
+    })
+    ElMessage.success(t('nacos.rollbackAccepted'))
+    void router.push({ path: '/tasks', query: { taskId: result.taskId } })
+  } catch (err) {
+    ElMessage.error(err instanceof Error ? err.message : t('nacos.rollbackFailed'))
+  } finally {
+    configRollbackId.value = ''
+  }
 }
 
 function startMonitor() {
@@ -333,7 +757,7 @@ async function runRealtimeCheck(manual: boolean) {
   }
   const state = await fetchNacosState()
   applyNacosState(state)
-  const rows = state.instances.filter((item) => item.app === 'nacos')
+  const rows = state.instances.filter((item) => item.app === 'nacos' && !isInstallFailedInstance(item, metadataOf(item)))
   if (!rows.length) {
     lastMonitorAt.value = new Date().toLocaleTimeString()
     return
@@ -472,6 +896,10 @@ function isUnavailable(status: string) {
 }
 
 function displayInstanceStatus(item: AppInstance) {
+  const metadata = metadataOf(item)
+  if (isInstallFailedInstance(item, metadata)) {
+    return 'failed'
+  }
   if (checkingInstanceIds.value.has(item.id)) {
     return 'checking'
   }
@@ -479,6 +907,14 @@ function displayInstanceStatus(item: AppInstance) {
     return item.status
   }
   return item.status === 'installed' ? 'checking' : item.status || 'unknown'
+}
+
+function isInstallFailedGroup(group: NacosGroup) {
+  return group.nodes.some((node) => isInstallFailedInstance(node.instance, node.metadata))
+}
+
+function isInstallFailedInstance(item: AppInstance, metadata: InstanceMetadata) {
+  return item.status === 'failed' || truthyValue(metadata.installFailed)
 }
 
 function nacosDatabaseSummary(metadata: InstanceMetadata) {
@@ -510,6 +946,35 @@ function endpointFromServer(item: AppInstance, metadata: InstanceMetadata) {
   const server = servers.value.find((candidate) => candidate.id === item.serverId)
   const port = stringValue(metadata.port) || '8848'
   return server?.host ? `http://${server.host}:${port}/nacos` : '-'
+}
+
+function databaseInstanceLabel(item: AppInstance) {
+  const metadata = metadataOf(item)
+  const topology = normalizedTopology(item, metadata)
+  const endpoint = stringValue(metadata.endpoint) || stringValue(metadata.clusterEndpoint) || instanceEndpoint(item, metadata)
+  return `${item.app} / ${topology} / ${endpoint || serverName(item.serverId)}`
+}
+
+function storageInstanceLabel(item: AppInstance) {
+  const metadata = metadataOf(item)
+  const endpoint = stringValue(metadata.endpoint) || instanceEndpoint(item, metadata)
+  return `MinIO / ${item.topology || stringValue(metadata.topology) || '-'} / ${endpoint || serverName(item.serverId)}`
+}
+
+function instanceEndpoint(item: AppInstance, metadata: InstanceMetadata) {
+  const server = servers.value.find((candidate) => candidate.id === item.serverId)
+  const port = stringValue(metadata.port) || stringValue(metadata.apiPort)
+  if (!server?.host) return ''
+  return port ? `${server.host}:${port}` : server.host
+}
+
+function credentialLabel(item: Credential) {
+  const parts = [item.name || item.kind, item.username, item.endpoint].map((part) => String(part || '').trim()).filter(Boolean)
+  return parts.join(' / ')
+}
+
+function shortHash(value: string) {
+  return value ? value.slice(0, 12) : '-'
 }
 
 function metadataOf(item: AppInstance) {
@@ -655,8 +1120,17 @@ async function confirmDeleteScope() {
   }
 }
 
+watch(
+  () => [configForm.value.nacosInstanceId, configForm.value.namespace, configForm.value.group, configForm.value.dataId].join('|'),
+  () => {
+    clearConfigPreview()
+    void loadConfigRevisions()
+  }
+)
+
 onMounted(async () => {
   await load()
+  await loadConfigRevisions()
   startMonitor()
   if (monitoringEnabled.value && canManageApps.value) {
     void runRealtimeCheck(false)
@@ -868,6 +1342,103 @@ onUnmounted(stopMonitor)
   padding: 12px;
 }
 
+.config-publish-grid {
+  display: grid;
+  grid-template-columns: minmax(320px, 420px) minmax(0, 1fr);
+  gap: 12px;
+  padding: 12px;
+  min-height: 0;
+}
+
+.config-form-panel,
+.config-preview-panel {
+  min-width: 0;
+  border: 1px solid var(--aifar-border-soft);
+  border-radius: var(--aifar-radius-lg);
+  background: #fff;
+  padding: 12px;
+}
+
+.config-section-head,
+.config-preview-toolbar,
+.config-revision-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.config-section-head strong,
+.config-revision-head strong {
+  font-size: 14px;
+}
+
+.config-form {
+  display: grid;
+  gap: 2px;
+}
+
+.config-field-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+
+.config-section-toggle {
+  border-top: 1px dashed var(--aifar-border-soft);
+  padding-top: 10px;
+  margin-top: 2px;
+}
+
+.full-width {
+  width: 100%;
+}
+
+.config-preview-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  overflow: hidden;
+}
+
+.config-summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  min-width: 0;
+  color: var(--aifar-text-secondary);
+  font-size: 12px;
+}
+
+.config-code-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  min-height: 360px;
+}
+
+.config-code {
+  min-height: 330px;
+  max-height: 520px;
+  overflow: auto;
+  margin: 6px 0 0;
+  border: 1px solid var(--aifar-border-soft);
+  border-radius: var(--aifar-radius);
+  background: #0f172a;
+  color: #d7e2f3;
+  padding: 10px;
+  font-size: 12px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.config-revision-table {
+  width: 100%;
+}
+
 .multi-secret-form {
   display: grid;
   gap: 8px;
@@ -881,6 +1452,12 @@ onUnmounted(stopMonitor)
 }
 
 @media (max-width: 720px) {
+  .config-publish-grid,
+  .config-code-grid,
+  .config-field-row {
+    grid-template-columns: 1fr;
+  }
+
   .monitor-actions,
   .nacos-node-tags {
     flex-wrap: wrap;

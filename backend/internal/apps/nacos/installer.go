@@ -68,21 +68,23 @@ func (i Installer) Install(ctx context.Context, server store.Server, bundle Bund
 	}
 
 	script, err := installNacosScript(InstallScriptRequest{
-		Version:      bundle.Version,
-		Mode:         req.Topology,
-		WorkDir:      workDir,
-		ArchivePath:  archiveRemote,
-		JDKPath:      jdkRemote,
-		InstallRoot:  installRoot,
-		Port:         req.Port,
-		GRPCPort:     req.GRPCPort,
-		GRPCRaftPort: req.GRPCRaftPort,
-		RaftPort:     req.RaftPort,
-		JVMXMS:       req.JVMXMS,
-		JVMXMX:       req.JVMXMX,
-		JVMXMN:       req.JVMXMN,
-		Database:     req.Database,
-		ClusterNodes: nodes,
+		Version:       bundle.Version,
+		Mode:          req.Topology,
+		WorkDir:       workDir,
+		ArchivePath:   archiveRemote,
+		JDKPath:       jdkRemote,
+		InstallRoot:   installRoot,
+		Port:          req.Port,
+		GRPCPort:      req.GRPCPort,
+		GRPCRaftPort:  req.GRPCRaftPort,
+		RaftPort:      req.RaftPort,
+		JVMXMS:        req.JVMXMS,
+		JVMXMX:        req.JVMXMX,
+		JVMXMN:        req.JVMXMN,
+		AdminUser:     req.AdminUser,
+		AdminPassword: req.AdminPassword,
+		Database:      req.Database,
+		ClusterNodes:  nodes,
 	})
 	if err != nil {
 		return err

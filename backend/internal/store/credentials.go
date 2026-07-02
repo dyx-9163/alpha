@@ -30,7 +30,7 @@ func (s *Store) ListCredentials(query CredentialQuery) ([]Credential, error) {
 		args = append(args, like, like, like, like, like)
 	}
 	rows, err := s.db.Query(`select id,name,kind,coalesce(username,''),coalesce(endpoint,''),scope,status,
-		coalesce(app,''),coalesce(server_id,''),coalesce(app_instance_id,''),coalesce(purpose,''),coalesce(tags,''),
+		coalesce(app,''),coalesce(server_id,''),coalesce(nullif(app_instance_id,''),(select cb.app_instance_id from credential_bindings cb where cb.credential_id=credentials.id order by cb.created_at desc limit 1),''),coalesce(purpose,''),coalesce(tags,''),
 		coalesce(secret_cipher,''),current_version,coalesce(created_by,''),created_at,updated_at
 		from credentials where `+strings.Join(clauses, " and ")+` order by updated_at desc`, args...)
 	if err != nil {
@@ -52,7 +52,7 @@ func (s *Store) GetCredential(id string, includeSecret bool) (Credential, error)
 	var item Credential
 	var cipher string
 	err := s.db.QueryRow(`select id,name,kind,coalesce(username,''),coalesce(endpoint,''),scope,status,
-		coalesce(app,''),coalesce(server_id,''),coalesce(app_instance_id,''),coalesce(purpose,''),coalesce(tags,''),
+		coalesce(app,''),coalesce(server_id,''),coalesce(nullif(app_instance_id,''),(select cb.app_instance_id from credential_bindings cb where cb.credential_id=credentials.id order by cb.created_at desc limit 1),''),coalesce(purpose,''),coalesce(tags,''),
 		coalesce(secret_cipher,''),current_version,coalesce(created_by,''),created_at,updated_at
 		from credentials where id=?`, strings.TrimSpace(id)).
 		Scan(&item.ID, &item.Name, &item.Kind, &item.Username, &item.Endpoint, &item.Scope, &item.Status,

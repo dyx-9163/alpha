@@ -173,17 +173,21 @@ func (s Service) Install(ctx context.Context, req InstallRequest, resources []st
 				"serviceName":    "aifar-nacos",
 				"endpoint":       fmt.Sprintf("http://%s:%d/nacos", server.Host, options.Port),
 				"authEnabled":    true,
+				"nacosUser":      options.AdminUser,
 				"topology":       topology,
 				"mode":           topology,
+				"dbSource":       options.Database.Source,
+				"dbEnabled":      options.Database.Enabled,
 			}
 			if topology == "cluster" {
 				metadataMap["clusterId"] = clusterID
 				metadataMap["clusterNodes"] = clusterNodes
+			}
+			if options.Database.Enabled {
 				metadataMap["dbHost"] = options.Database.Host
 				metadataMap["dbPort"] = options.Database.Port
 				metadataMap["dbName"] = options.Database.Name
 				metadataMap["dbUser"] = options.Database.User
-				metadataMap["dbSource"] = options.Database.Source
 				metadataMap["dbInstanceId"] = options.Database.InstanceID
 			}
 			metadata, _ := json.Marshal(metadataMap)

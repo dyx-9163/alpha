@@ -14,6 +14,8 @@ RAFT_PORT={{.RaftPort}}
 JVM_XMS={{shq .JVMXMS}}
 JVM_XMX={{shq .JVMXMX}}
 JVM_XMN={{shq .JVMXMN}}
+NACOS_USER={{shq .AdminUser}}
+NACOS_PASSWORD={{shq .AdminPassword}}
 DB_ENABLED={{if .Database.Enabled}}1{{else}}0{{end}}
 DB_HOST={{shq .Database.Host}}
 DB_PORT={{.Database.Port}}
@@ -48,6 +50,62 @@ dump_nacos_diagnostics() {
       $SUDO tail -n 120 "$LOG_FILE" || true
     fi
   done
+}
+
+nacos_access_token() {
+  USERNAME="$1"
+  PASSWORD="$2"
+  RESPONSE="$(curl -fsS --max-time 5 -X POST "http://127.0.0.1:$PORT/nacos/v1/auth/users/login" \
+    --data-urlencode "username=$USERNAME" \
+    --data-urlencode "password=$PASSWORD" 2>/dev/null || true)"
+  printf "%s" "$RESPONSE" | sed -n 's/.*"accessToken"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p'
+}
+
+nacos_user_url() {
+  TOKEN="$1"
+  URL="http://127.0.0.1:$PORT/nacos/v1/auth/users"
+  if [ -n "$TOKEN" ]; then
+    URL="$URL?accessToken=$TOKEN"
+  fi
+  printf "%s" "$URL"
+}
+
+nacos_create_user() {
+  TOKEN="$1"
+  curl -fsS --max-time 5 -X POST "$(nacos_user_url "$TOKEN")" \
+    --data-urlencode "username=$NACOS_USER" \
+    --data-urlencode "password=$NACOS_PASSWORD" >/dev/null 2>&1
+}
+
+nacos_update_user() {
+  TOKEN="$1"
+  curl -fsS --max-time 5 -X PUT "$(nacos_user_url "$TOKEN")" \
+    --data-urlencode "username=$NACOS_USER" \
+    --data-urlencode "newPassword=$NACOS_PASSWORD" >/dev/null 2>&1
+}
+
+configure_nacos_admin_user() {
+  [ -n "$NACOS_USER" ] || { echo "Nacos admin user is required"; exit 1; }
+  [ -n "$NACOS_PASSWORD" ] || { echo "Nacos admin password is required"; exit 1; }
+  command -v curl >/dev/null 2>&1 || { echo "curl is required to configure Nacos credentials"; exit 1; }
+
+  TOKEN="$(nacos_access_token "$NACOS_USER" "$NACOS_PASSWORD")"
+  [ -n "$TOKEN" ] && return 0
+
+  TOKEN="$(nacos_access_token nacos nacos)"
+  if [ -z "$TOKEN" ]; then
+    if ! nacos_create_user ""; then
+      echo "unable to authenticate to Nacos for credential configuration"
+      exit 1
+    fi
+  elif [ "$NACOS_USER" = "nacos" ]; then
+    nacos_update_user "$TOKEN" || true
+  else
+    nacos_create_user "$TOKEN" || nacos_update_user "$TOKEN" || true
+  fi
+
+  TOKEN="$(nacos_access_token "$NACOS_USER" "$NACOS_PASSWORD")"
+  [ -n "$TOKEN" ] || { echo "Nacos credential verification failed"; exit 1; }
 }
 
 echo "checking Nacos install commands"
@@ -128,7 +186,7 @@ if [ "$MODE" = "cluster" ]; then
   $SUDO install -m 0644 "$WORK_DIR/cluster.conf" "$NACOS_HOME/conf/cluster.conf"
 fi
 
-if [ "$INIT_DATABASE" = "1" ]; then
+if [ "$DB_ENABLED" = "1" ] && [ "$INIT_DATABASE" = "1" ]; then
   echo "initializing Nacos MySQL schema"
   command -v mysql >/dev/null 2>&1 || { echo "mysql client is required when init database is enabled"; exit 1; }
   MYSQL_PWD="$DB_PASSWORD" mysql -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" -e "CREATE DATABASE IF NOT EXISTS \`$DB_NAME\` DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;"
@@ -198,6 +256,8 @@ if [ "$READY" != "1" ]; then
   dump_nacos_diagnostics
   exit 1
 fi
+
+configure_nacos_admin_user
 
 open_firewall_port "$PORT"
 open_firewall_port "$GRPC_PORT"

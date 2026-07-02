@@ -19,6 +19,7 @@ func TestClusterServerIDsPreferExplicitNacosServers(t *testing.T) {
 
 func TestNacosOptionsValidateClusterDatabase(t *testing.T) {
 	options := nacosOptions(map[string]any{
+		"dbSource":   "manual",
 		"dbHost":     "192.168.1.10",
 		"dbPort":     3306,
 		"dbName":     "nacos_config",
@@ -41,8 +42,21 @@ func TestNacosOptionsDefaultDatabaseNameAndUser(t *testing.T) {
 	if options.Database.User != "root" {
 		t.Fatalf("expected default database user root, got %q", options.Database.User)
 	}
-	if options.Database.Source != databaseSourceManual {
-		t.Fatalf("expected manual database source, got %q", options.Database.Source)
+	if options.Database.Source != databaseSourceLocal || options.Database.Enabled {
+		t.Fatalf("expected local database source disabled by default, got %+v", options.Database)
+	}
+	if err := options.Validate(); err != nil {
+		t.Fatalf("Validate returned error: %v", err)
+	}
+}
+
+func TestNacosOptionsValidateAdminCredential(t *testing.T) {
+	options := nacosOptions(map[string]any{
+		"nacosUser":     "ops",
+		"nacosPassword": "Nacos.123",
+	}, "standalone")
+	if options.AdminUser != "ops" || options.AdminPassword != "Nacos.123" {
+		t.Fatalf("expected custom Nacos credential, got %+v", options)
 	}
 	if err := options.Validate(); err != nil {
 		t.Fatalf("Validate returned error: %v", err)

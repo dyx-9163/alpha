@@ -28,21 +28,23 @@ type NacosClusterNode struct {
 }
 
 type InstallScriptRequest struct {
-	Version      string
-	Mode         string
-	WorkDir      string
-	ArchivePath  string
-	JDKPath      string
-	InstallRoot  string
-	Port         int
-	GRPCPort     int
-	GRPCRaftPort int
-	RaftPort     int
-	JVMXMS       string
-	JVMXMX       string
-	JVMXMN       string
-	Database     DatabaseOptions
-	ClusterNodes []NacosClusterNode
+	Version       string
+	Mode          string
+	WorkDir       string
+	ArchivePath   string
+	JDKPath       string
+	InstallRoot   string
+	Port          int
+	GRPCPort      int
+	GRPCRaftPort  int
+	RaftPort      int
+	JVMXMS        string
+	JVMXMX        string
+	JVMXMN        string
+	AdminUser     string
+	AdminPassword string
+	Database      DatabaseOptions
+	ClusterNodes  []NacosClusterNode
 }
 
 type UninstallScriptRequest struct {

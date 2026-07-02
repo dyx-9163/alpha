@@ -147,6 +147,28 @@ type AppRelease struct {
 	ActivatedAt  time.Time `json:"activatedAt,omitempty"`
 }
 
+type NacosConfigRevision struct {
+	ID              string    `json:"id"`
+	NacosInstanceID string    `json:"nacosInstanceId"`
+	Namespace       string    `json:"namespace"`
+	Group           string    `json:"group"`
+	DataID          string    `json:"dataId"`
+	Content         string    `json:"content,omitempty"`
+	ContentHash     string    `json:"contentHash"`
+	Metadata        string    `json:"metadata,omitempty"`
+	CreatedBy       string    `json:"createdBy,omitempty"`
+	CreatedAt       time.Time `json:"createdAt"`
+	PublishedAt     time.Time `json:"publishedAt,omitempty"`
+}
+
+type NacosConfigRevisionQuery struct {
+	NacosInstanceID string
+	Namespace       string
+	Group           string
+	DataID          string
+	Limit           int
+}
+
 type Credential struct {
 	ID             string            `json:"id"`
 	Name           string            `json:"name"`

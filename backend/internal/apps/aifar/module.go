@@ -100,6 +100,10 @@ func (m Module) ValidateInstall(ctx context.Context, req registry.InstallRequest
 	if len(req.TargetServerIDs()) > 1 {
 		return errors.New(copy.SingleTargetOnly)
 	}
+	target := req.TargetServerIDs()[0]
+	if err := m.service.ensureDockerRuntimeReady(target, copy); err != nil {
+		return err
+	}
 	if topology := strings.TrimSpace(req.Topology); topology != "" && !strings.EqualFold(topology, defaultTopology) {
 		return fmt.Errorf(copy.TopologyUnsupported, topology)
 	}
