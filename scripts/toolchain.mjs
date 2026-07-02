@@ -57,6 +57,7 @@ export function withToolEnv(extra = {}) {
     AIFAR_BOOTSTRAP_PASSWORD: process.env.AIFAR_BOOTSTRAP_PASSWORD || defaultPassword,
     AIFAR_DEFAULT_DEPLOY_DIR: process.env.AIFAR_DEFAULT_DEPLOY_DIR || defaults.AIFAR_DEFAULT_DEPLOY_DIR || '/aifar/apps',
     AIFAR_INSTALLER_TEMPLATE_DIR: process.env.AIFAR_INSTALLER_TEMPLATE_DIR || defaults.AIFAR_INSTALLER_TEMPLATE_DIR || path.join(rootDir, 'config', 'installers'),
+    AIFAR_MAX_REQUEST_BODY_BYTES: process.env.AIFAR_MAX_REQUEST_BODY_BYTES || defaults.AIFAR_MAX_REQUEST_BODY_BYTES || String(2 * 1024 * 1024 * 1024),
     ...extra
   }
 }

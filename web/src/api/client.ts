@@ -36,19 +36,19 @@ function clearLocalSession() {
 }
 
 export function apiGet<T>(path: string) {
-  return fetch(`${API_PREFIX}${path}`, { headers: headers(false) }).then((r) => handle<T>(r))
+  return fetch(`${API_PREFIX}${path}`, { headers: headers(false) }).then((r) => handle<T>(r)).catch(rethrowFetchError)
 }
 
 export function apiPost<T>(path: string, body?: unknown) {
-  return fetch(`${API_PREFIX}${path}`, { method: 'POST', headers: headers(), body: JSON.stringify(body ?? {}) }).then((r) => handle<T>(r))
+  return fetch(`${API_PREFIX}${path}`, { method: 'POST', headers: headers(), body: JSON.stringify(body ?? {}) }).then((r) => handle<T>(r)).catch(rethrowFetchError)
 }
 
 export function apiPostForm<T>(path: string, body: FormData) {
-  return fetch(`${API_PREFIX}${path}`, { method: 'POST', headers: headers(false), body }).then((r) => handle<T>(r))
+  return fetch(`${API_PREFIX}${path}`, { method: 'POST', headers: headers(false), body }).then((r) => handle<T>(r)).catch(rethrowFetchError)
 }
 
 export function apiPut<T>(path: string, body?: unknown) {
-  return fetch(`${API_PREFIX}${path}`, { method: 'PUT', headers: headers(), body: JSON.stringify(body ?? {}) }).then((r) => handle<T>(r))
+  return fetch(`${API_PREFIX}${path}`, { method: 'PUT', headers: headers(), body: JSON.stringify(body ?? {}) }).then((r) => handle<T>(r)).catch(rethrowFetchError)
 }
 
 export function apiDelete<T>(path: string, body?: unknown) {
@@ -56,7 +56,7 @@ export function apiDelete<T>(path: string, body?: unknown) {
     method: 'DELETE',
     headers: headers(body !== undefined),
     body: body === undefined ? undefined : JSON.stringify(body)
-  }).then((r) => handle<T>(r))
+  }).then((r) => handle<T>(r)).catch(rethrowFetchError)
 }
 
 export async function apiDownload(path: string) {
@@ -73,6 +73,21 @@ export async function apiDownload(path: string) {
 
 export function asArray<T = unknown>(value: unknown): T[] {
   return Array.isArray(value) ? value as T[] : []
+}
+
+function rethrowFetchError(err: unknown): never {
+  const message = err instanceof Error ? err.message : String(err)
+  if (err instanceof TypeError && /fetch|network|failed/i.test(message)) {
+    throw new Error(networkErrorMessage())
+  }
+  throw err
+}
+
+function networkErrorMessage() {
+  if (getCurrentLocale() === 'en') {
+    return 'Could not reach the backend. Confirm the backend service was rebuilt and restarted, the API address is reachable, and the upload package does not exceed the request size limit.'
+  }
+  return '无法连接后端或上传被中断。请确认后端已重新构建并重启、API 地址可访问，并检查上传包是否超过请求体大小限制。'
 }
 
 function filenameFromDisposition(value: string | null) {

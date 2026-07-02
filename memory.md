@@ -499,3 +499,5 @@
 - 结论：可用一次性 `powershell.exe -NoProfile -ExecutionPolicy Bypass -File ...` 绕过；已新增 `scripts/export-alpha-jars.cmd` 包装脚本，直接调用同名 ps1 并携带 `ExecutionPolicy Bypass`。
 - 问题：用户确认调整部署工具，希望导出的 AIFAR/alpha JAR 批量包可直接上传平台并自动按服务更新、备份和回滚。
 - 结论：新增 AIFAR 制品批量包更新入口，接受 `aifar-alpha-jars-*.zip`，读取 `manifest.json` 后按服务串行复用现有 partial release 更新链路；每个服务仍生成可回滚的 release 记录，任务步骤按服务名前缀区分，前端更新弹窗新增“单服务/批量包”模式。
+- 问题：用户上传 AIFAR 批量制品包时页面只提示 `Failed to fetch`。
+- 结论：批量 JAR zip 可能超过原 512MiB 请求体限制或后端未重启导致连接中断；默认 `AIFAR_MAX_REQUEST_BODY_BYTES` 提升到 2GiB，前端提交前按 `/settings` 实际限制检查文件大小，浏览器网络错误改为中文排查提示，后端 multipart 超限返回结构化 413。

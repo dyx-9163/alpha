@@ -183,7 +183,7 @@ const router = useRouter()
 const backendCatalog = ref<AppCatalogResponse>({})
 const instances = ref<AppInstanceTableRecord[]>([])
 const servers = ref<ServerOption[]>([])
-const appSettings = ref<{ defaultDeployDir?: string }>({})
+const appSettings = ref<{ defaultDeployDir?: string; maxRequestBodyBytes?: number }>({})
 const credentials = ref<CredentialOption[]>([])
 const activeTab = ref('all')
 const category = ref('all')
@@ -313,7 +313,7 @@ async function load() {
   instances.value = asArray(await apiGet<AppInstanceTableRecord[] | null>('/apps/instances').catch(() => []))
   servers.value = asArray(await apiGet<ServerOption[] | null>('/servers').catch(() => []))
   credentials.value = asArray(await apiGet<CredentialOption[] | null>('/credentials?status=active').catch(() => []))
-  appSettings.value = await apiGet<{ defaultDeployDir?: string }>('/settings').catch(() => ({ defaultDeployDir: '/aifar/apps' }))
+  appSettings.value = await apiGet<{ defaultDeployDir?: string; maxRequestBodyBytes?: number }>('/settings').catch(() => ({ defaultDeployDir: '/aifar/apps' }))
 }
 
 async function rescan() {
@@ -400,6 +400,14 @@ async function submitAifarUpdate() {
     ElMessage.warning(t('apps.aifarUpdateArtifactRequired'))
     return
   }
+  const uploadLimit = Number(appSettings.value.maxRequestBodyBytes || 0)
+  if (uploadLimit > 0 && aifarArtifactFile.value.size > uploadLimit) {
+    ElMessage.error(t('apps.aifarUpdateArtifactTooLarge', {
+      size: formatBytes(aifarArtifactFile.value.size),
+      limit: formatBytes(uploadLimit)
+    }))
+    return
+  }
   const form = new FormData()
   form.append('language', locale.value)
   if (aifarUpdateMode.value === 'bundle') {
@@ -438,6 +446,20 @@ function serverLabel(serverId?: string) {
 
 function openTaskCenter(taskId: string) {
   void router.push({ path: '/tasks', query: { taskId } })
+}
+
+function formatBytes(value: number) {
+  if (!Number.isFinite(value) || value <= 0) {
+    return '0 B'
+  }
+  const units = ['B', 'MiB', 'GiB']
+  let size = value
+  let idx = 0
+  while (size >= 1024 && idx < units.length - 1) {
+    size /= 1024
+    idx++
+  }
+  return `${size.toFixed(idx === 0 ? 0 : 1)} ${units[idx]}`
 }
 
 watch([aifarUpdateService, aifarUpdateMode], () => {

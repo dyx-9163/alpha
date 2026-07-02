@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"os"
@@ -20,7 +21,7 @@ import (
 func (a *API) updateAppInstanceArtifact(w http.ResponseWriter, r *http.Request) {
 	lang := languageFromRequest(r)
 	if err := r.ParseMultipartForm(32 << 20); err != nil {
-		writeError(w, http.StatusBadRequest, "ARTIFACT_UPLOAD_INVALID", err.Error(), nil)
+		writeMultipartParseError(w, r, "ARTIFACT_UPLOAD_INVALID", err)
 		return
 	}
 	if value := strings.TrimSpace(r.FormValue("language")); value != "" {
@@ -129,7 +130,7 @@ func (a *API) updateAppInstanceArtifact(w http.ResponseWriter, r *http.Request) 
 func (a *API) updateAppInstanceArtifactBundle(w http.ResponseWriter, r *http.Request) {
 	lang := languageFromRequest(r)
 	if err := r.ParseMultipartForm(32 << 20); err != nil {
-		writeError(w, http.StatusBadRequest, "ARTIFACT_BUNDLE_UPLOAD_INVALID", err.Error(), nil)
+		writeMultipartParseError(w, r, "ARTIFACT_BUNDLE_UPLOAD_INVALID", err)
 		return
 	}
 	if value := strings.TrimSpace(r.FormValue("language")); value != "" {
@@ -234,6 +235,15 @@ func (a *API) updateAppInstanceArtifactBundle(w http.ResponseWriter, r *http.Req
 		a.audit(r, "apps."+instance.App+".update-artifact-bundle", target, "running", task.ID)
 	}
 	respondTask(w, task, err)
+}
+
+func writeMultipartParseError(w http.ResponseWriter, r *http.Request, errCode string, err error) {
+	var maxBytesErr *http.MaxBytesError
+	if errors.As(err, &maxBytesErr) {
+		writeError(w, http.StatusRequestEntityTooLarge, "REQUEST_BODY_TOO_LARGE", i18n.Text(languageFromRequest(r), "api.requestBodyTooLarge"), map[string]any{"limit": maxBytesErr.Limit})
+		return
+	}
+	writeError(w, http.StatusBadRequest, errCode, err.Error(), nil)
 }
 
 func saveMultipartArtifact(file io.Reader, originalName string) (string, error) {

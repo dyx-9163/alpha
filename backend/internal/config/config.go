@@ -50,7 +50,7 @@ func Load() Config {
 		ProviderMode:          "real",
 		AuthMaxFailures:       getenvInt("AIFAR_AUTH_MAX_FAILURES", 5),
 		AuthLockoutSeconds:    getenvInt("AIFAR_AUTH_LOCKOUT_SECONDS", 300),
-		MaxRequestBodyBytes:   getenvInt64("AIFAR_MAX_REQUEST_BODY_BYTES", 512<<20),
+		MaxRequestBodyBytes:   getenvInt64("AIFAR_MAX_REQUEST_BODY_BYTES", 2<<30),
 		AuditRetentionDays:    getenvInt("AIFAR_AUDIT_RETENTION_DAYS", 180),
 		TaskRetentionDays:     getenvInt("AIFAR_TASK_RETENTION_DAYS", 90),
 	}
