@@ -31,6 +31,11 @@ type Store interface {
 	DeleteAppInstance(id string) error
 }
 
+type releaseStore interface {
+	SaveAppRelease(v store.AppRelease) (store.AppRelease, error)
+	DeleteOldAppReleases(instanceID string, keep int) (int, error)
+}
+
 type InstallRequest struct {
 	Version    string
 	Topology   string
@@ -142,7 +147,10 @@ func (s Service) Install(ctx context.Context, req InstallRequest, resources []st
 	defer os.Remove(archiveLocal)
 
 	deployDir := installerkit.RemoteDeployDir(server.DeployDir)
-	workDir := installerkit.WorkDir(deployDir, AppName, bundle.Version, time.Now())
+	releaseTime := time.Now().UTC()
+	releaseID := newReleaseID(bundle.Version, releaseTime)
+	configHash := installConfigHash(options)
+	workDir := installerkit.WorkDir(deployDir, AppName, bundle.Version, releaseTime)
 	installRoot := installRootFromDeployDir(deployDir)
 	archiveRemote := workDir + "/" + filepath.Base(archiveLocal)
 	scriptRemote := workDir + "/install-aifar.sh"
@@ -162,11 +170,16 @@ func (s Service) Install(ctx context.Context, req InstallRequest, resources []st
 			return err
 		}
 		script, err := renderInstallScript(installScriptData{
-			InstallRoot:   installRoot,
-			WorkDir:       workDir,
-			ArchiveRemote: archiveRemote,
-			ServiceOrder:  serviceOrderText(),
-			Options:       options,
+			InstallRoot:      installRoot,
+			WorkDir:          workDir,
+			ArchiveRemote:    archiveRemote,
+			ServiceOrder:     serviceOrderText(),
+			Version:          bundle.Version,
+			ReleaseID:        releaseID,
+			CreatedAt:        releaseTime.Format(time.RFC3339),
+			ConfigHash:       configHash,
+			ReleaseKeepCount: releaseKeepCount,
+			Options:          options,
 		})
 		if err != nil {
 			return err
@@ -203,50 +216,47 @@ func (s Service) Install(ctx context.Context, req InstallRequest, resources []st
 
 	var instance store.AppInstance
 	if err := step(5, func() error {
-		metadata, _ := json.Marshal(map[string]any{
-			"installRoot":             installRoot,
-			"appDir":                  installRoot + "/" + appBundleDir,
-			"sqlDir":                  installRoot + "/" + sqlBundleDir,
-			"networkName":             options.NetworkName,
-			"endpoint":                fmt.Sprintf("%s:%d", server.Host, options.WebPort),
-			"gatewayEndpoint":         fmt.Sprintf("%s:%d", server.Host, options.GatewayPort),
-			"nacosEndpoint":           fmt.Sprintf("%s:%d", options.NacosHost, options.NacosWebPort),
-			"webPort":                 options.WebPort,
-			"gatewayPort":             options.GatewayPort,
-			"nacosSource":             options.NacosSource,
-			"nacosInstanceId":         options.NacosInstanceID,
-			"nacosHost":               options.NacosHost,
-			"nacosPort":               options.NacosWebPort,
-			"nacosWebPort":            options.NacosWebPort,
-			"nacosApiPort":            options.NacosAPIPort,
-			"dbSource":                options.DBSource,
-			"dbInstanceId":            options.DBInstanceID,
-			"dbHost":                  options.DBHost,
-			"dbPort":                  options.DBPort,
-			"dbNameNacos":             options.DBNameNacos,
-			"dbUser":                  options.DBUser,
-			"redisSource":             options.RedisSource,
-			"redisInstanceId":         options.RedisInstanceID,
-			"redisMode":               options.RedisMode,
-			"redisHost":               options.RedisHost,
-			"redisPort":               options.RedisPort,
-			"redisDatabase":           options.RedisDatabase,
-			"redisSentinelMasterName": options.RedisSentinelMasterName,
-			"redisSentinelNodes":      options.RedisSentinelNodes,
-			"redisClusterNodes":       options.RedisClusterNodes,
-			"initSql":                 options.InitSQL,
-			"services":                serviceOrder,
-		})
-		var saveErr error
-		instance, saveErr = s.store.SaveAppInstance(store.AppInstance{
+		metadata := installMetadata(server, installRoot, bundle.Version, releaseID, releaseTime, configHash, options)
+		instanceID, err := s.existingAIFARInstanceID(target, installRoot)
+		if err != nil {
+			return err
+		}
+		data, _ := json.Marshal(metadata)
+		instance = store.AppInstance{
+			ID:       instanceID,
 			App:      AppName,
 			Version:  bundle.Version,
 			ServerID: target,
 			Status:   "installed",
 			Topology: defaultTopology,
-			Metadata: string(metadata),
-		})
-		return saveErr
+			Metadata: string(data),
+		}
+		var saveErr error
+		instance, saveErr = s.store.SaveAppInstance(instance)
+		if saveErr != nil {
+			return saveErr
+		}
+		if releases, ok := s.store.(releaseStore); ok {
+			manifest, _ := json.Marshal(releaseManifest(bundle.Version, releaseID, releaseTime, configHash))
+			if _, err := releases.SaveAppRelease(store.AppRelease{
+				InstanceID:   instance.ID,
+				App:          AppName,
+				Version:      bundle.Version,
+				ReleaseID:    releaseID,
+				ServerID:     target,
+				Status:       "success",
+				ManifestJSON: string(manifest),
+				ConfigHash:   configHash,
+				CreatedAt:    releaseTime,
+				ActivatedAt:  releaseTime,
+			}); err != nil {
+				return err
+			}
+			if _, err := releases.DeleteOldAppReleases(instance.ID, releaseKeepCount); err != nil {
+				return err
+			}
+		}
+		return nil
 	}); err != nil {
 		msg := fmt.Sprintf(copy.RecordFailed, err)
 		logForServer.Error("%s", msg)
@@ -257,6 +267,83 @@ func (s Service) Install(ctx context.Context, req InstallRequest, resources []st
 	logForServer.Info(copy.Installed, instance.ID)
 	finishTarget(recorder, target, "success", "")
 	return nil
+}
+
+func installMetadata(server store.Server, installRoot, version, releaseID string, releaseTime time.Time, configHash string, options InstallOptions) map[string]any {
+	return map[string]any{
+		"installRoot":             installRoot,
+		"layout":                  releaseLayout,
+		"currentRelease":          installRoot + "/" + currentLinkName,
+		"releaseId":               releaseID,
+		"releasePath":             installRoot + "/" + releasesDirName + "/" + releaseID,
+		"releaseVersion":          version,
+		"releaseRetention":        releaseKeepCount,
+		"releaseCreatedAt":        releaseTime.Format(time.RFC3339),
+		"configHash":              configHash,
+		"appDir":                  installRoot + "/" + currentLinkName + "/" + appBundleDir,
+		"sqlDir":                  installRoot + "/" + currentLinkName + "/" + sqlBundleDir,
+		"envDir":                  installRoot + "/" + currentLinkName + "/" + releaseEnvDirName,
+		"networkName":             options.NetworkName,
+		"endpoint":                fmt.Sprintf("%s:%d", server.Host, options.WebPort),
+		"gatewayEndpoint":         fmt.Sprintf("%s:%d", server.Host, options.GatewayPort),
+		"nacosEndpoint":           fmt.Sprintf("%s:%d", options.NacosHost, options.NacosWebPort),
+		"webPort":                 options.WebPort,
+		"gatewayPort":             options.GatewayPort,
+		"nacosSource":             options.NacosSource,
+		"nacosInstanceId":         options.NacosInstanceID,
+		"nacosHost":               options.NacosHost,
+		"nacosPort":               options.NacosWebPort,
+		"nacosWebPort":            options.NacosWebPort,
+		"nacosApiPort":            options.NacosAPIPort,
+		"dbSource":                options.DBSource,
+		"dbInstanceId":            options.DBInstanceID,
+		"dbHost":                  options.DBHost,
+		"dbPort":                  options.DBPort,
+		"dbNameNacos":             options.DBNameNacos,
+		"dbUser":                  options.DBUser,
+		"redisSource":             options.RedisSource,
+		"redisInstanceId":         options.RedisInstanceID,
+		"redisMode":               options.RedisMode,
+		"redisHost":               options.RedisHost,
+		"redisPort":               options.RedisPort,
+		"redisDatabase":           options.RedisDatabase,
+		"redisSentinelMasterName": options.RedisSentinelMasterName,
+		"redisSentinelNodes":      options.RedisSentinelNodes,
+		"redisClusterNodes":       options.RedisClusterNodes,
+		"initSql":                 options.InitSQL,
+		"services":                serviceOrder,
+	}
+}
+
+func releaseManifest(version, releaseID string, releaseTime time.Time, configHash string) map[string]any {
+	return map[string]any{
+		"app":              AppName,
+		"version":          version,
+		"releaseId":        releaseID,
+		"layout":           releaseLayout,
+		"status":           "success",
+		"configHash":       configHash,
+		"createdAt":        releaseTime.Format(time.RFC3339),
+		"releaseRetention": releaseKeepCount,
+		"services":         serviceOrder,
+	}
+}
+
+func (s Service) existingAIFARInstanceID(serverID, installRoot string) (string, error) {
+	instances, err := s.store.ListAppInstances()
+	if err != nil {
+		return "", err
+	}
+	for _, candidate := range instances {
+		if candidate.App != AppName || candidate.ServerID != serverID {
+			continue
+		}
+		metadata := metadataFromInstance(candidate)
+		if stringFromMetadata(metadata, "installRoot", installRoot) == installRoot {
+			return candidate.ID, nil
+		}
+	}
+	return "", nil
 }
 
 func (s Service) Delete(ctx context.Context, req DeleteRequest, log Logger, targetLog targetLogger) error {
@@ -351,6 +438,8 @@ func (s Service) Check(ctx context.Context, req CheckRequest, log Logger, target
 	details := map[string]any{
 		"message":             status.Message,
 		"installRoot":         status.InstallRoot,
+		"currentRelease":      status.CurrentRelease,
+		"releaseId":           status.ReleaseID,
 		"installRootExists":   status.InstallRootExists,
 		"totalContainers":     status.TotalContainers,
 		"runningContainers":   status.RunningContainers,
@@ -381,11 +470,16 @@ func (s Service) markInstanceStatus(instance store.AppInstance, status string, d
 }
 
 type installScriptData struct {
-	InstallRoot   string
-	WorkDir       string
-	ArchiveRemote string
-	ServiceOrder  string
-	Options       InstallOptions
+	InstallRoot      string
+	WorkDir          string
+	ArchiveRemote    string
+	ServiceOrder     string
+	Version          string
+	ReleaseID        string
+	CreatedAt        string
+	ConfigHash       string
+	ReleaseKeepCount int
+	Options          InstallOptions
 }
 
 type uninstallScriptData struct {

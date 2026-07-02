@@ -13,6 +13,8 @@ type StatusResult struct {
 	Status              string
 	Message             string
 	InstallRoot         string
+	CurrentRelease      string
+	ReleaseID           string
 	InstallRootExists   bool
 	TotalContainers     int
 	RunningContainers   int
@@ -51,7 +53,11 @@ func statusCommand(installRoot string) string {
 set -u
 
 INSTALL_ROOT=` + installerkit.ShellQuote(installRoot) + `
+CURRENT_LINK="$INSTALL_ROOT/` + currentLinkName + `"
+CURRENT_RELEASE=""
+RELEASE_ID=""
 APP_DIR="$INSTALL_ROOT/` + appBundleDir + `"
+ENV_DIR=""
 STATUS="missing"
 INSTALL_ROOT_EXISTS="false"
 TOTAL=0
@@ -64,9 +70,19 @@ if [ -d "$INSTALL_ROOT" ]; then
   STATUS="stopped"
 fi
 
+if [ -L "$CURRENT_LINK" ] || [ -d "$CURRENT_LINK" ]; then
+  CURRENT_RELEASE="$(readlink -f "$CURRENT_LINK" 2>/dev/null || printf "%s" "$CURRENT_LINK")"
+  APP_DIR="$CURRENT_LINK/` + appBundleDir + `"
+  ENV_DIR="$CURRENT_LINK/` + releaseEnvDirName + `"
+  if [ -f "$CURRENT_LINK/.aifar/manifest.json" ]; then
+    RELEASE_ID="$(awk -F\" '/"releaseId"[[:space:]]*:/ {print $4; exit}' "$CURRENT_LINK/.aifar/manifest.json" 2>/dev/null || true)"
+  fi
+fi
+
 if command -v docker >/dev/null 2>&1 && [ -d "$APP_DIR" ]; then
   for service in ` + serviceOrderText() + `; do
-    env_file="$APP_DIR/$service/.env"
+    env_file="$ENV_DIR/$service.env"
+    [ -f "$env_file" ] || env_file="$APP_DIR/$service/.env"
     [ -f "$env_file" ] || continue
     name="$(awk -F= '$1=="APP_CONTAINER_NAME"{print $2}' "$env_file" | tail -n 1)"
     [ -n "$name" ] || continue
@@ -90,6 +106,8 @@ fi
 
 echo "status=$STATUS"
 echo "installRootExists=$INSTALL_ROOT_EXISTS"
+echo "currentRelease=$CURRENT_RELEASE"
+echo "releaseId=$RELEASE_ID"
 echo "totalContainers=$TOTAL"
 echo "runningContainers=$RUNNING"
 echo "unhealthyContainers=$UNHEALTHY"
@@ -109,6 +127,10 @@ func parseStatusOutput(output string) StatusResult {
 			result.Status = strings.TrimSpace(value)
 		case "installRootExists":
 			result.InstallRootExists = strings.EqualFold(strings.TrimSpace(value), "true")
+		case "currentRelease":
+			result.CurrentRelease = strings.TrimSpace(value)
+		case "releaseId":
+			result.ReleaseID = strings.TrimSpace(value)
 		case "totalContainers":
 			result.TotalContainers = atoi(value)
 		case "runningContainers":

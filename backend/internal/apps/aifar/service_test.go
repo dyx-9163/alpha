@@ -21,6 +21,7 @@ type fakeStore struct {
 	mu        sync.Mutex
 	servers   map[string]store.Server
 	instances []store.AppInstance
+	releases  []store.AppRelease
 }
 
 func (f *fakeStore) GetServer(id string, includeSecret bool) (store.Server, error) {
@@ -72,6 +73,45 @@ func (f *fakeStore) DeleteAppInstance(id string) error {
 	}
 	f.instances = next
 	return nil
+}
+
+func (f *fakeStore) SaveAppRelease(v store.AppRelease) (store.AppRelease, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if v.ID == "" {
+		v.ID = store.NewID("rel")
+	}
+	for idx, existing := range f.releases {
+		if existing.InstanceID == v.InstanceID && existing.ReleaseID == v.ReleaseID {
+			f.releases[idx] = v
+			return v, nil
+		}
+	}
+	f.releases = append(f.releases, v)
+	return v, nil
+}
+
+func (f *fakeStore) DeleteOldAppReleases(instanceID string, keep int) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if keep < 1 {
+		keep = 1
+	}
+	count := 0
+	next := f.releases[:0]
+	deleted := 0
+	for _, release := range f.releases {
+		if release.InstanceID == instanceID && release.Status == "success" {
+			count++
+			if count > keep {
+				deleted++
+				continue
+			}
+		}
+		next = append(next, release)
+	}
+	f.releases = next
+	return deleted, nil
 }
 
 type fakeRemote struct {
@@ -173,6 +213,12 @@ func TestServiceInstallsAIFARServiceFromDockerAppsBundle(t *testing.T) {
 	if metadata["endpoint"] != "10.0.0.10:18080" || metadata["networkName"] != defaultNetworkName {
 		t.Fatalf("unexpected metadata: %s", instance.Metadata)
 	}
+	if metadata["layout"] != releaseLayout || metadata["releaseId"] == "" || metadata["releaseRetention"].(float64) != releaseKeepCount {
+		t.Fatalf("expected release layout metadata, got %s", instance.Metadata)
+	}
+	if len(s.releases) != 1 || s.releases[0].InstanceID != instance.ID || s.releases[0].Status != "success" {
+		t.Fatalf("expected one recorded release, got %+v", s.releases)
+	}
 	if metadata["nacosEndpoint"] != "10.0.0.50:8848" || metadata["nacosHost"] != "10.0.0.50" || int(metadata["nacosPort"].(float64)) != 8848 {
 		t.Fatalf("expected external Nacos endpoint metadata, got %s", instance.Metadata)
 	}
@@ -184,8 +230,10 @@ func TestServiceInstallsAIFARServiceFromDockerAppsBundle(t *testing.T) {
 		strings.Contains(remote.installScript, `open_firewall_ports "$GATEWAY_PORT" "$WEB_VUE3_PORT" "$NACOS_PORT_WEB"`) {
 		t.Fatalf("AIFAR install script should open only AIFAR service ports:\n%s", remote.installScript)
 	}
-	if !strings.Contains(remote.installScript, "prepare_compose_networks") || !strings.Contains(remote.installScript, "external: true") {
-		t.Fatalf("AIFAR install script should mark shared Docker network as external:\n%s", remote.installScript)
+	if !strings.Contains(remote.installScript, "ensure_network") ||
+		!strings.Contains(remote.installScript, "external: true") ||
+		!strings.Contains(remote.installScript, "name: ${APP_NETWORK_NAME}") {
+		t.Fatalf("AIFAR install script should create and use the shared Docker network as external:\n%s", remote.installScript)
 	}
 	if !strings.Contains(remote.installScript, "resolve_system_timezone") || !strings.Contains(remote.installScript, "timedatectl show -p Timezone") {
 		t.Fatalf("AIFAR install script should resolve system timezone:\n%s", remote.installScript)
@@ -194,7 +242,7 @@ func TestServiceInstallsAIFARServiceFromDockerAppsBundle(t *testing.T) {
 		t.Fatalf("AIFAR install script should not configure bundled Nacos:\n%s", remote.installScript)
 	}
 	if !strings.Contains(remote.installScript, "NACOS_CONNECT_HOST='10.0.0.50'") ||
-		!strings.Contains(remote.installScript, `set_env NACOS_HOST "${NACOS_CONNECT_HOST}:${NACOS_PORT_WEB}" "$ROOT_ENV"`) {
+		!strings.Contains(remote.installScript, `set_env NACOS_HOST "${NACOS_CONNECT_HOST}:${NACOS_PORT_WEB}" "$common_env"`) {
 		t.Fatalf("AIFAR install script should use the external Nacos endpoint:\n%s", remote.installScript)
 	}
 	if !strings.Contains(remote.installScript, "load_docker_images") ||
@@ -206,15 +254,28 @@ func TestServiceInstallsAIFARServiceFromDockerAppsBundle(t *testing.T) {
 		t.Fatalf("AIFAR install script should only patch Nacos SQL namespace defaults:\n%s", remote.installScript)
 	}
 	for _, want := range []string{
-		"patch_alpha_service_names",
 		"patch_nacos_sql_service_names",
+		"alpha_service_name",
 		"gateway alpha-gateway",
 		"permission alpha-permission",
-		`set_env SPRING_APPLICATION_NAME "$app_name" "$env_file"`,
+		`set_env SPRING_APPLICATION_NAME "$app_name" "$service_env"`,
 		`sed "s/aifar-${service}/${app_name}/g"`,
 	} {
 		if !strings.Contains(remote.installScript, want) {
 			t.Fatalf("AIFAR install script should force alpha service names with %q:\n%s", want, remote.installScript)
+		}
+	}
+	for _, want := range []string{
+		`RELEASES_DIR="$INSTALL_ROOT/releases"`,
+		`CURRENT_LINK="$INSTALL_ROOT/current"`,
+		`java-common.env`,
+		`java-secrets.env`,
+		`compose --env-file env/compose.env -f compose.yaml up -d --build`,
+		`cleanup_old_releases`,
+		`RELEASE_KEEP_COUNT=3`,
+	} {
+		if !strings.Contains(remote.installScript, want) {
+			t.Fatalf("AIFAR install script should include release-based layout with %q:\n%s", want, remote.installScript)
 		}
 	}
 }
@@ -410,7 +471,7 @@ func TestServiceResolvesManagedNacosInstance(t *testing.T) {
 	for _, want := range []string{
 		"NACOS_CONNECT_HOST='10.0.0.50'",
 		"NACOS_PORT_WEB='8848'",
-		`set_env NACOS_HOST "${NACOS_CONNECT_HOST}:${NACOS_PORT_WEB}" "$ROOT_ENV"`,
+		`set_env NACOS_HOST "${NACOS_CONNECT_HOST}:${NACOS_PORT_WEB}" "$common_env"`,
 	} {
 		if !strings.Contains(remote.installScript, want) {
 			t.Fatalf("install script should contain %q:\n%s", want, remote.installScript)

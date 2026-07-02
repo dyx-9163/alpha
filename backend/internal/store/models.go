@@ -133,6 +133,20 @@ type AppInstance struct {
 	UpdatedAt time.Time `json:"updatedAt"`
 }
 
+type AppRelease struct {
+	ID           string    `json:"id"`
+	InstanceID   string    `json:"instanceId"`
+	App          string    `json:"app"`
+	Version      string    `json:"version"`
+	ReleaseID    string    `json:"releaseId"`
+	ServerID     string    `json:"serverId"`
+	Status       string    `json:"status"`
+	ManifestJSON string    `json:"manifestJson"`
+	ConfigHash   string    `json:"configHash"`
+	CreatedAt    time.Time `json:"createdAt"`
+	ActivatedAt  time.Time `json:"activatedAt,omitempty"`
+}
+
 type StorageItem struct {
 	ID         string    `json:"id"`
 	InstanceID string    `json:"instanceId"`

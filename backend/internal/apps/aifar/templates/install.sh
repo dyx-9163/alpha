@@ -5,10 +5,21 @@ INSTALL_ROOT={{ quote .InstallRoot }}
 WORK_DIR={{ quote .WorkDir }}
 ARCHIVE={{ quote .ArchiveRemote }}
 SERVICE_ORDER={{ quote .ServiceOrder }}
-APP_DIR="$INSTALL_ROOT/docker-apps"
-SQL_DIR="$INSTALL_ROOT/docker-sql"
-IMAGE_DIR="$INSTALL_ROOT/docker-images"
-TMP_DIR="$INSTALL_ROOT/.extract-$$"
+VERSION={{ quote .Version }}
+RELEASE_ID={{ quote .ReleaseID }}
+CREATED_AT={{ quote .CreatedAt }}
+CONFIG_HASH={{ quote .ConfigHash }}
+RELEASE_KEEP_COUNT={{ .ReleaseKeepCount }}
+
+RELEASES_DIR="$INSTALL_ROOT/releases"
+CURRENT_LINK="$INSTALL_ROOT/current"
+RELEASE_DIR="$RELEASES_DIR/$RELEASE_ID"
+APP_DIR="$RELEASE_DIR/docker-apps"
+SQL_DIR="$RELEASE_DIR/docker-sql"
+IMAGE_DIR="$RELEASE_DIR/docker-images"
+ENV_DIR="$RELEASE_DIR/env"
+AIFAR_DIR="$RELEASE_DIR/.aifar"
+TMP_DIR="$INSTALL_ROOT/.extract-$RELEASE_ID-$$"
 
 TIMEZONE={{ quote .Options.Timezone }}
 NETWORK_NAME={{ quote .Options.NetworkName }}
@@ -70,29 +81,30 @@ set_env() {
   mv "$tmp" "$file"
 }
 
-{{ serviceAccessHelpers }}
-
-prepare_compose_networks() {
-  docker network inspect "$NETWORK_NAME" >/dev/null 2>&1 || docker network create --driver bridge "$NETWORK_NAME" >/dev/null
-  for compose_file in "$APP_DIR"/*/docker-compose.yaml; do
-    [ -f "$compose_file" ] || continue
-    tmp="${compose_file}.tmp"
-    awk '
-      /^[^[:space:]].*:/ {
-        in_networks = ($0 ~ /^networks:[[:space:]]*$/)
-      }
-      in_networks && /^[[:space:]]+driver:[[:space:]]/ { next }
-      in_networks && /^[[:space:]]+external:[[:space:]]/ { next }
-      {
-        print
-        if (in_networks && $0 ~ /^[[:space:]]+name:[[:space:]]*/ && $0 ~ /APP_NETWORK_NAME/) {
-          print "    external: true"
-        }
-      }
-    ' "$compose_file" > "$tmp"
-    mv "$tmp" "$compose_file"
-  done
+read_env_value() {
+  file="$1"
+  key="$2"
+  fallback="$3"
+  if [ -f "$file" ]; then
+    value="$(awk -F= -v k="$key" '$1==k {sub(/^[^=]*=/,""); print; exit}' "$file" 2>/dev/null || true)"
+    if [ -n "$value" ]; then
+      printf "%s" "$value"
+      return
+    fi
+  fi
+  printf "%s" "$fallback"
 }
+
+retag_image() {
+  image="$1"
+  case "$image" in
+    *@*) printf "%s" "$image" ;;
+    *:*) printf "%s:%s" "${image%:*}" "$RELEASE_ID" ;;
+    *) printf "%s:%s" "$image" "$RELEASE_ID" ;;
+  esac
+}
+
+{{ serviceAccessHelpers }}
 
 load_docker_images() {
   [ -d "$IMAGE_DIR" ] || return 0
@@ -167,12 +179,9 @@ schedule alpha-schedule
 EOF
 }
 
-patch_alpha_service_names() {
-  alpha_service_pairs | while read -r service app_name; do
-    env_file="$APP_DIR/$service/.env"
-    [ -f "$env_file" ] || continue
-    set_env SPRING_APPLICATION_NAME "$app_name" "$env_file"
-  done
+alpha_service_name() {
+  service="$1"
+  alpha_service_pairs | awk -v s="$service" '$1==s {print $2; exit}'
 }
 
 patch_nacos_sql_service_names() {
@@ -185,15 +194,286 @@ patch_nacos_sql_service_names() {
   done
 }
 
-down_existing() {
-  [ -d "$APP_DIR" ] || return 0
-  prepare_compose_networks || true
+service_port_var() {
+  case "$1" in
+    gateway) printf "GATEWAY_PORT" ;;
+    oauth) printf "OAUTH_PORT" ;;
+    permission) printf "PERMISSION_PORT" ;;
+    system) printf "SYSTEM_PORT" ;;
+    file) printf "FILE_PORT" ;;
+    message) printf "MESSAGE_PORT" ;;
+    im) printf "IM_PORT" ;;
+    contacts) printf "CONTACTS_PORT" ;;
+    meeting) printf "MEETING_PORT" ;;
+    web-vue3) printf "WEB_VUE3_PORT" ;;
+    *) printf "" ;;
+  esac
+}
+
+write_compose_env() {
+  source_env="$APP_DIR/.env"
+  compose_env="$ENV_DIR/compose.env"
+  : > "$compose_env"
+  set_env COMPOSE_PROJECT_NAME "aifar-admin" "$compose_env"
+  set_env TZ "$TIMEZONE" "$compose_env"
+  set_env APP_CPUS "$APP_CPUS" "$compose_env"
+  set_env APP_MEMORY_LIMIT "$APP_MEMORY_LIMIT" "$compose_env"
+  set_env APP_RESTART_POLICY "$(read_env_value "$source_env" APP_RESTART_POLICY unless-stopped)" "$compose_env"
+  set_env APP_NETWORK_NAME "$NETWORK_NAME" "$compose_env"
+  set_env APP_NETWORK_DRIVER "bridge" "$compose_env"
+  set_env APP_HEALTH_PROTOCOL "$(read_env_value "$source_env" APP_HEALTH_PROTOCOL http)" "$compose_env"
+  set_env APP_HEALTH_HOST "$(read_env_value "$source_env" APP_HEALTH_HOST 127.0.0.1)" "$compose_env"
+  set_env APP_HEALTH_PATH "$(read_env_value "$source_env" APP_HEALTH_PATH '')" "$compose_env"
+  set_env APP_HEALTH_CONNECT_TIMEOUT "$(read_env_value "$source_env" APP_HEALTH_CONNECT_TIMEOUT 3)" "$compose_env"
+  set_env APP_HEALTH_INTERVAL "$(read_env_value "$source_env" APP_HEALTH_INTERVAL 15s)" "$compose_env"
+  set_env APP_HEALTH_TIMEOUT "$(read_env_value "$source_env" APP_HEALTH_TIMEOUT 5s)" "$compose_env"
+  set_env APP_HEALTH_RETRIES "$(read_env_value "$source_env" APP_HEALTH_RETRIES 3)" "$compose_env"
+  set_env APP_HEALTH_START_PERIOD "$(read_env_value "$source_env" APP_HEALTH_START_PERIOD 30s)" "$compose_env"
+  set_env GATEWAY_PORT "$GATEWAY_PORT" "$compose_env"
+  set_env WEB_VUE3_PORT "$WEB_VUE3_PORT" "$compose_env"
+  set_env OAUTH_PORT "$(read_env_value "$source_env" OAUTH_PORT 38001)" "$compose_env"
+  set_env PERMISSION_PORT "$(read_env_value "$source_env" PERMISSION_PORT 38010)" "$compose_env"
+  set_env SYSTEM_PORT "$(read_env_value "$source_env" SYSTEM_PORT 38002)" "$compose_env"
+  set_env FILE_PORT "$(read_env_value "$source_env" FILE_PORT 38005)" "$compose_env"
+  set_env MESSAGE_PORT "$(read_env_value "$source_env" MESSAGE_PORT 38008)" "$compose_env"
+  set_env IM_PORT "$(read_env_value "$source_env" IM_PORT 38031)" "$compose_env"
+  set_env CONTACTS_PORT "$(read_env_value "$source_env" CONTACTS_PORT 38032)" "$compose_env"
+  set_env MEETING_PORT "$(read_env_value "$source_env" MEETING_PORT 38033)" "$compose_env"
+}
+
+write_java_env() {
+  common_env="$ENV_DIR/java-common.env"
+  secrets_env="$ENV_DIR/java-secrets.env"
+  : > "$common_env"
+  : > "$secrets_env"
+  set_env TZ "$TIMEZONE" "$common_env"
+  set_env NACOS_HOST "${NACOS_CONNECT_HOST}:${NACOS_PORT_WEB}" "$common_env"
+  set_env NACOS_PORT_WEB "$NACOS_PORT_WEB" "$common_env"
+  set_env NACOS_PORT_API "$NACOS_PORT_API" "$common_env"
+  set_env NACOS_USER "$NACOS_USER" "$common_env"
+  set_env NACOS_NS "$NACOS_NS" "$common_env"
+  set_env AIFAR_DB_HOST "$DB_HOST" "$common_env"
+  set_env AIFAR_DB_PORT "$DB_PORT" "$common_env"
+  set_env AIFAR_DB_NAME_NACOS "$DB_NAME_NACOS" "$common_env"
+  set_env AIFAR_DB_USER "$DB_USER" "$common_env"
+  set_env SPRING_DATASOURCE_HOST "$DB_HOST" "$common_env"
+  set_env SPRING_DATASOURCE_PORT "$DB_PORT" "$common_env"
+  set_env SPRING_DATASOURCE_USERNAME "$DB_USER" "$common_env"
+  set_env AIFAR_REDIS_MODE "$REDIS_MODE" "$common_env"
+  set_env AIFAR_REDIS_HOST "$REDIS_HOST" "$common_env"
+  set_env AIFAR_REDIS_PORT "$REDIS_PORT" "$common_env"
+  set_env AIFAR_REDIS_DATABASE "$REDIS_DATABASE" "$common_env"
+  set_env AIFAR_REDIS_SENTINEL_MASTER "$REDIS_SENTINEL_MASTER" "$common_env"
+  set_env AIFAR_REDIS_SENTINEL_NODES "$REDIS_SENTINEL_NODES" "$common_env"
+  set_env AIFAR_REDIS_CLUSTER_NODES "$REDIS_CLUSTER_NODES" "$common_env"
+  set_env SPRING_DATA_REDIS_HOST "$REDIS_HOST" "$common_env"
+  set_env SPRING_DATA_REDIS_PORT "$REDIS_PORT" "$common_env"
+  set_env SPRING_DATA_REDIS_DATABASE "$REDIS_DATABASE" "$common_env"
+  set_env SPRING_DATA_REDIS_SENTINEL_MASTER "$REDIS_SENTINEL_MASTER" "$common_env"
+  set_env SPRING_DATA_REDIS_SENTINEL_NODES "$REDIS_SENTINEL_NODES" "$common_env"
+  set_env SPRING_DATA_REDIS_CLUSTER_NODES "$REDIS_CLUSTER_NODES" "$common_env"
+  set_env NACOS_PASSWORD "$NACOS_PASSWORD" "$secrets_env"
+  set_env SPRING_DATASOURCE_PASSWORD "$DB_PASSWORD" "$secrets_env"
+  set_env SPRING_DATA_REDIS_PASSWORD "$REDIS_PASSWORD" "$secrets_env"
+  chmod 0644 "$common_env"
+  chmod 0600 "$secrets_env"
+}
+
+write_service_envs() {
+  for service in $SERVICE_ORDER; do
+    [ -d "$APP_DIR/$service" ] || continue
+    source_env="$APP_DIR/$service/.env"
+    service_env="$ENV_DIR/$service.env"
+    image="$(retag_image "$(read_env_value "$source_env" APP_IMAGE "aifar-$service:latest")")"
+    container="$(read_env_value "$source_env" APP_CONTAINER_NAME "aifar-$service")"
+    : > "$service_env"
+    set_env APP_IMAGE "$image" "$service_env"
+    set_env APP_CONTAINER_NAME "$container" "$service_env"
+    app_name="$(alpha_service_name "$service")"
+    if [ -n "$app_name" ]; then
+      set_env SPRING_APPLICATION_NAME "$app_name" "$service_env"
+    fi
+    chmod 0644 "$service_env"
+  done
+}
+
+append_compose_service() {
+  service="$1"
+  port_var="$(service_port_var "$service")"
+  service_env="$ENV_DIR/$service.env"
+  [ -f "$service_env" ] || return 0
+  image="$(read_env_value "$service_env" APP_IMAGE "aifar-$service:$RELEASE_ID")"
+  container="$(read_env_value "$service_env" APP_CONTAINER_NAME "aifar-$service")"
+  cat >> "$RELEASE_DIR/compose.yaml" <<YAML
+  $service:
+    build:
+      context: ./docker-apps/$service
+      dockerfile: Dockerfile
+    image: $image
+    container_name: $container
+    restart: \${APP_RESTART_POLICY}
+YAML
+  if [ "$service" = "web-vue3" ]; then
+    cat >> "$RELEASE_DIR/compose.yaml" <<YAML
+    env_file:
+      - ./env/$service.env
+YAML
+  else
+    cat >> "$RELEASE_DIR/compose.yaml" <<YAML
+    env_file:
+      - ./env/java-common.env
+      - ./env/java-secrets.env
+      - ./env/$service.env
+YAML
+  fi
+  if [ -n "$port_var" ]; then
+    printf '    ports:\n' >> "$RELEASE_DIR/compose.yaml"
+    printf '      - "${%s}:${%s}"\n' "$port_var" "$port_var" >> "$RELEASE_DIR/compose.yaml"
+    cat >> "$RELEASE_DIR/compose.yaml" <<YAML
+    healthcheck:
+YAML
+    if [ "$service" = "web-vue3" ]; then
+      printf '      test: ["CMD-SHELL", "wget -q -T ${APP_HEALTH_CONNECT_TIMEOUT} -O /dev/null ${APP_HEALTH_PROTOCOL}://${APP_HEALTH_HOST}:${%s}${APP_HEALTH_PATH} || exit 1"]\n' "$port_var" >> "$RELEASE_DIR/compose.yaml"
+    else
+      printf '      test: ["CMD-SHELL", "curl -fsS --connect-timeout ${APP_HEALTH_CONNECT_TIMEOUT} ${APP_HEALTH_PROTOCOL}://${APP_HEALTH_HOST}:${%s}${APP_HEALTH_PATH} >/dev/null || exit 1"]\n' "$port_var" >> "$RELEASE_DIR/compose.yaml"
+    fi
+    cat >> "$RELEASE_DIR/compose.yaml" <<YAML
+      interval: \${APP_HEALTH_INTERVAL}
+      timeout: \${APP_HEALTH_TIMEOUT}
+      retries: \${APP_HEALTH_RETRIES}
+      start_period: \${APP_HEALTH_START_PERIOD}
+YAML
+  fi
+  cat >> "$RELEASE_DIR/compose.yaml" <<YAML
+    environment:
+      TZ: \${TZ}
+    cpus: \${APP_CPUS}
+    mem_limit: \${APP_MEMORY_LIMIT}
+    networks:
+      - app-network
+
+YAML
+}
+
+write_root_compose() {
+  cat > "$RELEASE_DIR/compose.yaml" <<'YAML'
+services:
+YAML
+  for service in $SERVICE_ORDER; do
+    [ -d "$APP_DIR/$service" ] || continue
+    append_compose_service "$service"
+  done
+  cat >> "$RELEASE_DIR/compose.yaml" <<'YAML'
+networks:
+  app-network:
+    external: true
+    name: ${APP_NETWORK_NAME}
+YAML
+}
+
+write_manifest() {
+  status="$1"
+  mkdir -p "$AIFAR_DIR"
+  cat > "$AIFAR_DIR/manifest.json" <<MANIFEST
+{
+  "app": "aifar",
+  "version": "$VERSION",
+  "releaseId": "$RELEASE_ID",
+  "layout": "release-v1",
+  "status": "$status",
+  "configHash": "$CONFIG_HASH",
+  "createdAt": "$CREATED_AT",
+  "releaseRetention": $RELEASE_KEEP_COUNT
+}
+MANIFEST
+}
+
+ensure_network() {
+  docker network inspect "$NETWORK_NAME" >/dev/null 2>&1 || docker network create --driver bridge "$NETWORK_NAME" >/dev/null
+}
+
+current_release() {
+  if [ -L "$CURRENT_LINK" ] || [ -d "$CURRENT_LINK" ]; then
+    readlink -f "$CURRENT_LINK" 2>/dev/null || printf "%s" "$CURRENT_LINK"
+  fi
+}
+
+down_release() {
+  release_dir="$1"
+  [ -n "$release_dir" ] || return 0
+  [ -f "$release_dir/compose.yaml" ] || return 0
+  (
+    cd "$release_dir"
+    compose --env-file env/compose.env -f compose.yaml down --remove-orphans || true
+  )
+}
+
+down_legacy() {
+  legacy_app_dir="$INSTALL_ROOT/docker-apps"
+  [ -d "$legacy_app_dir" ] || return 0
   for service in web-vue3 gateway meeting contacts im message file system permission oauth; do
-    [ -f "$APP_DIR/$service/docker-compose.yaml" ] || continue
+    [ -f "$legacy_app_dir/$service/docker-compose.yaml" ] || continue
     (
-      cd "$APP_DIR/$service"
+      cd "$legacy_app_dir/$service"
       compose --env-file ../.env --env-file .env -f docker-compose.yaml down --remove-orphans || true
     )
+  done
+}
+
+start_release() {
+  (
+    cd "$RELEASE_DIR"
+    compose --env-file env/compose.env -f compose.yaml up -d --build
+  )
+}
+
+activate_release() {
+  if [ -L "$CURRENT_LINK" ] || [ -f "$CURRENT_LINK" ]; then
+    rm -f "$CURRENT_LINK"
+  elif [ -d "$CURRENT_LINK" ]; then
+    rm -rf "$CURRENT_LINK"
+  fi
+  ln -s "$RELEASE_DIR" "$CURRENT_LINK"
+}
+
+rollback_release() {
+  previous="$1"
+  [ -n "$previous" ] || return 0
+  [ -f "$previous/compose.yaml" ] || return 0
+  echo "rolling back to previous AIFAR release: $previous"
+  (
+    cd "$previous"
+    compose --env-file env/compose.env -f compose.yaml up -d || true
+  )
+}
+
+cleanup_release_images() {
+  release_dir="$1"
+  [ -d "$release_dir/env" ] || return 0
+  for env_file in "$release_dir"/env/*.env; do
+    [ -f "$env_file" ] || continue
+    image="$(read_env_value "$env_file" APP_IMAGE '')"
+    [ -n "$image" ] || continue
+    docker image rm -f "$image" >/dev/null 2>&1 || true
+  done
+}
+
+cleanup_old_releases() {
+  [ -d "$RELEASES_DIR" ] || return 0
+  current="$(current_release || true)"
+  count=0
+  find "$RELEASES_DIR" -mindepth 1 -maxdepth 1 -type d | sort -r | while read -r release_dir; do
+    [ -f "$release_dir/.aifar/manifest.json" ] || continue
+    grep -q '"status"[[:space:]]*:[[:space:]]*"success"' "$release_dir/.aifar/manifest.json" || continue
+    count=$((count + 1))
+    if [ "$count" -le "$RELEASE_KEEP_COUNT" ]; then
+      continue
+    fi
+    if [ -n "$current" ] && [ "$(readlink -f "$release_dir" 2>/dev/null || printf "%s" "$release_dir")" = "$current" ]; then
+      continue
+    fi
+    cleanup_release_images "$release_dir"
+    rm -rf "$release_dir"
   done
 }
 
@@ -202,14 +482,13 @@ docker info >/dev/null 2>&1 || fail "docker daemon is not available"
 command -v tar >/dev/null 2>&1 || fail "tar command is required"
 [ -f "$ARCHIVE" ] || fail "bundle archive not found: $ARCHIVE"
 
-mkdir -p "$INSTALL_ROOT" "$WORK_DIR"
-down_existing
-rm -rf "$TMP_DIR"
+mkdir -p "$INSTALL_ROOT" "$WORK_DIR" "$RELEASES_DIR"
+rm -rf "$TMP_DIR" "$RELEASE_DIR"
 mkdir -p "$TMP_DIR"
 tar -xzf "$ARCHIVE" -C "$TMP_DIR"
 [ -d "$TMP_DIR/docker-apps" ] || fail "docker-apps directory is missing in bundle"
 
-rm -rf "$APP_DIR" "$SQL_DIR" "$IMAGE_DIR"
+mkdir -p "$RELEASE_DIR"
 mv "$TMP_DIR/docker-apps" "$APP_DIR"
 if [ -d "$TMP_DIR/docker-sql" ]; then
   mv "$TMP_DIR/docker-sql" "$SQL_DIR"
@@ -218,47 +497,16 @@ if [ -d "$TMP_DIR/docker-images" ]; then
   mv "$TMP_DIR/docker-images" "$IMAGE_DIR"
 fi
 rm -rf "$TMP_DIR"
+mkdir -p "$ENV_DIR" "$AIFAR_DIR"
 
-ROOT_ENV="$APP_DIR/.env"
 resolve_system_timezone
-set_env TZ "$TIMEZONE" "$ROOT_ENV"
-set_env APP_CPUS "$APP_CPUS" "$ROOT_ENV"
-set_env APP_MEMORY_LIMIT "$APP_MEMORY_LIMIT" "$ROOT_ENV"
-set_env APP_NETWORK_NAME "$NETWORK_NAME" "$ROOT_ENV"
-set_env APP_NETWORK_DRIVER "bridge" "$ROOT_ENV"
-set_env GATEWAY_PORT "$GATEWAY_PORT" "$ROOT_ENV"
-set_env WEB_VUE3_PORT "$WEB_VUE3_PORT" "$ROOT_ENV"
-set_env NACOS_PORT_WEB "$NACOS_PORT_WEB" "$ROOT_ENV"
-set_env NACOS_PORT_API "$NACOS_PORT_API" "$ROOT_ENV"
-set_env NACOS_USER "$NACOS_USER" "$ROOT_ENV"
-set_env NACOS_PASSWORD "$NACOS_PASSWORD" "$ROOT_ENV"
-set_env NACOS_HOST "${NACOS_CONNECT_HOST}:${NACOS_PORT_WEB}" "$ROOT_ENV"
-set_env NACOS_NS "$NACOS_NS" "$ROOT_ENV"
-set_env AIFAR_DB_HOST "$DB_HOST" "$ROOT_ENV"
-set_env AIFAR_DB_PORT "$DB_PORT" "$ROOT_ENV"
-set_env AIFAR_DB_NAME_NACOS "$DB_NAME_NACOS" "$ROOT_ENV"
-set_env AIFAR_DB_USER "$DB_USER" "$ROOT_ENV"
-set_env SPRING_DATASOURCE_HOST "$DB_HOST" "$ROOT_ENV"
-set_env SPRING_DATASOURCE_PORT "$DB_PORT" "$ROOT_ENV"
-set_env SPRING_DATASOURCE_USERNAME "$DB_USER" "$ROOT_ENV"
-set_env SPRING_DATASOURCE_PASSWORD "$DB_PASSWORD" "$ROOT_ENV"
-set_env AIFAR_REDIS_MODE "$REDIS_MODE" "$ROOT_ENV"
-set_env AIFAR_REDIS_HOST "$REDIS_HOST" "$ROOT_ENV"
-set_env AIFAR_REDIS_PORT "$REDIS_PORT" "$ROOT_ENV"
-set_env AIFAR_REDIS_DATABASE "$REDIS_DATABASE" "$ROOT_ENV"
-set_env AIFAR_REDIS_SENTINEL_MASTER "$REDIS_SENTINEL_MASTER" "$ROOT_ENV"
-set_env AIFAR_REDIS_SENTINEL_NODES "$REDIS_SENTINEL_NODES" "$ROOT_ENV"
-set_env AIFAR_REDIS_CLUSTER_NODES "$REDIS_CLUSTER_NODES" "$ROOT_ENV"
-set_env SPRING_DATA_REDIS_HOST "$REDIS_HOST" "$ROOT_ENV"
-set_env SPRING_DATA_REDIS_PORT "$REDIS_PORT" "$ROOT_ENV"
-set_env SPRING_DATA_REDIS_PASSWORD "$REDIS_PASSWORD" "$ROOT_ENV"
-set_env SPRING_DATA_REDIS_DATABASE "$REDIS_DATABASE" "$ROOT_ENV"
-set_env SPRING_DATA_REDIS_SENTINEL_MASTER "$REDIS_SENTINEL_MASTER" "$ROOT_ENV"
-set_env SPRING_DATA_REDIS_SENTINEL_NODES "$REDIS_SENTINEL_NODES" "$ROOT_ENV"
-set_env SPRING_DATA_REDIS_CLUSTER_NODES "$REDIS_CLUSTER_NODES" "$ROOT_ENV"
 patch_nacos_sql_namespace
-patch_alpha_service_names
 patch_nacos_sql_service_names
+write_compose_env
+write_java_env
+write_service_envs
+write_root_compose
+write_manifest "pending"
 load_docker_images
 require_local_image "bellsoft/liberica-openjre-rocky:21"
 require_local_image "nginx:stable-alpine"
@@ -272,17 +520,23 @@ if [ "$INIT_SQL" = "true" ]; then
   fi
 fi
 
-prepare_compose_networks
+ensure_network
+previous_release="$(current_release || true)"
+down_release "$previous_release"
+down_legacy
 
-for service in $SERVICE_ORDER; do
-  [ -f "$APP_DIR/$service/docker-compose.yaml" ] || continue
-  (
-    cd "$APP_DIR/$service"
-    compose --env-file ../.env --env-file .env -f docker-compose.yaml up -d --build
-  )
-done
+if ! start_release; then
+  write_manifest "failed"
+  down_release "$RELEASE_DIR"
+  rollback_release "$previous_release"
+  fail "AIFAR release $RELEASE_ID failed to start"
+fi
+
+write_manifest "success"
+activate_release
+cleanup_old_releases
 
 open_firewall_ports "$GATEWAY_PORT" "$WEB_VUE3_PORT"
 allow_selinux_ports http_port_t "$GATEWAY_PORT" "$WEB_VUE3_PORT"
-echo "AIFAR service deployed under $INSTALL_ROOT"
+echo "AIFAR service deployed under $INSTALL_ROOT release $RELEASE_ID"
 docker ps --filter "network=$NETWORK_NAME"

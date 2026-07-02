@@ -142,6 +142,12 @@ func (s *Store) migrate() error {
 			id text primary key, app text not null, version text not null, server_id text,
 			status text not null, topology text, metadata text, created_at datetime not null, updated_at datetime not null
 		)`,
+		`create table if not exists app_releases (
+			id text primary key, instance_id text not null, app text not null, version text not null,
+			release_id text not null, server_id text, status text not null, manifest_json text,
+			config_hash text, created_at datetime not null, activated_at datetime
+		)`,
+		`create unique index if not exists app_releases_instance_release on app_releases(instance_id, release_id)`,
 		`create table if not exists storage_items (
 			id text primary key, instance_id text not null, kind text not null, name text not null,
 			policy text, access_key text, secret_key text, metadata text,
@@ -299,7 +305,7 @@ func (s *Store) ListUsers() ([]UserSummary, error) {
 
 func (s *Store) CountRows(table string) (int, error) {
 	switch table {
-	case "users", "servers", "tasks", "task_logs", "task_targets", "task_steps", "audit_logs", "resources", "app_instances", "storage_items", "settings":
+	case "users", "servers", "tasks", "task_logs", "task_targets", "task_steps", "audit_logs", "resources", "app_instances", "app_releases", "storage_items", "settings":
 	default:
 		return 0, fmt.Errorf("unsupported table %q", table)
 	}

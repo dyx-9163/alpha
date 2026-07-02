@@ -556,10 +556,77 @@ func TestAppInstanceLifecycle(t *testing.T) {
 	if got.App != "docker" || got.ServerID != "srv-1" {
 		t.Fatalf("unexpected app instance: %+v", got)
 	}
+	if _, err := db.SaveAppRelease(AppRelease{
+		InstanceID:   instance.ID,
+		App:          "docker",
+		Version:      "24.0.9",
+		ReleaseID:    "20260702T120000Z-24.0.9",
+		ServerID:     "srv-1",
+		Status:       "success",
+		ManifestJSON: `{"releaseId":"20260702T120000Z-24.0.9"}`,
+		ConfigHash:   strings.Repeat("a", 64),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	releases, err := db.ListAppReleases(instance.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(releases) != 1 || releases[0].ReleaseID != "20260702T120000Z-24.0.9" {
+		t.Fatalf("unexpected app releases: %+v", releases)
+	}
 	if err := db.DeleteAppInstance(instance.ID); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.GetAppInstance(instance.ID); !IsNotFound(err) {
 		t.Fatalf("expected deleted app instance to be missing, got %v", err)
+	}
+	releases, err = db.ListAppReleases(instance.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(releases) != 0 {
+		t.Fatalf("expected app releases to be deleted with instance, got %+v", releases)
+	}
+}
+
+func TestAppReleaseRetentionKeepsLatestThreeSuccesses(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "aifar.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	instance, err := db.SaveAppInstance(AppInstance{App: "aifar", Version: "docker-apps", ServerID: "srv-1", Status: "installed"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for idx := 0; idx < 5; idx++ {
+		_, err := db.SaveAppRelease(AppRelease{
+			InstanceID:  instance.ID,
+			App:         "aifar",
+			Version:     "docker-apps",
+			ReleaseID:   "rel-" + string(rune('0'+idx)),
+			ServerID:    "srv-1",
+			Status:      "success",
+			CreatedAt:   time.Date(2026, 7, 2, 12, idx, 0, 0, time.UTC),
+			ActivatedAt: time.Date(2026, 7, 2, 12, idx, 0, 0, time.UTC),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	deleted, err := db.DeleteOldAppReleases(instance.ID, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deleted != 2 {
+		t.Fatalf("expected two old releases deleted, got %d", deleted)
+	}
+	releases, err := db.ListAppReleases(instance.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(releases) != 3 || releases[0].ReleaseID != "rel-4" || releases[2].ReleaseID != "rel-2" {
+		t.Fatalf("expected latest three releases, got %+v", releases)
 	}
 }
