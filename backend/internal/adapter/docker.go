@@ -377,28 +377,37 @@ func DockerContainerLogsForServer(ctx context.Context, server store.Server, id s
 }
 
 func DockerContainerAction(ctx context.Context, host, id, action string) error {
-	switch action {
-	case "start", "stop", "restart":
-	default:
+	command, ok := dockerContainerCommand(action)
+	if !ok {
 		return exec.ErrNotFound
 	}
 	if dockerAPIHost(host) {
 		return dockerAPIContainerAction(ctx, host, id, action)
 	}
-	return dockerCommand(ctx, host, action, id).Run()
+	return dockerCommand(ctx, host, command, id).Run()
 }
 
 func DockerContainerActionForServer(ctx context.Context, server store.Server, id, action string) error {
-	switch action {
-	case "start", "stop", "restart":
-	default:
+	command, ok := dockerContainerCommand(action)
+	if !ok {
 		return exec.ErrNotFound
 	}
 	if dockerAPIHost(server.DockerHost) {
 		return DockerContainerAction(ctx, server.DockerHost, id, action)
 	}
-	_, err := dockerSSHOutput(ctx, server, action, id)
+	_, err := dockerSSHOutput(ctx, server, command, id)
 	return err
+}
+
+func dockerContainerCommand(action string) (string, bool) {
+	switch action {
+	case "start", "stop", "restart":
+		return action, true
+	case "remove", "rm":
+		return "rm", true
+	default:
+		return "", false
+	}
 }
 
 func dockerCommand(ctx context.Context, host string, args ...string) *exec.Cmd {

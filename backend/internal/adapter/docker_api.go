@@ -312,6 +312,9 @@ func dockerAPIContainerLogs(ctx context.Context, host, id string, tail int) ([]s
 }
 
 func dockerAPIContainerAction(ctx context.Context, host, id, action string) error {
+	if action == "remove" || action == "rm" {
+		return dockerAPIJSON(ctx, http.MethodDelete, host, "/containers/"+url.PathEscape(id), nil, nil)
+	}
 	return dockerAPIJSON(ctx, http.MethodPost, host, "/containers/"+url.PathEscape(id)+"/"+action, nil, nil)
 }
 

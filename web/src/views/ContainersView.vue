@@ -52,32 +52,55 @@
       </template>
 
       <template v-else-if="tab === 'containers'">
-        <el-table :data="collection" height="100%">
-          <el-table-column prop="name" :label="t('containers.name')" min-width="160" show-overflow-tooltip />
-          <el-table-column prop="image" :label="t('containers.image')" min-width="190" show-overflow-tooltip />
-          <el-table-column prop="state" :label="t('common.status')" width="120">
-            <template #default="{ row }"><StatusTag :status="row.state === 'running' ? 'running' : 'stopped'" /></template>
-          </el-table-column>
-          <el-table-column prop="ports" :label="t('containers.ports')" min-width="180" show-overflow-tooltip />
-          <el-table-column prop="networks" :label="t('containers.network')" min-width="140" show-overflow-tooltip />
-          <el-table-column prop="createdAt" :label="t('containers.created')" min-width="170" show-overflow-tooltip />
-          <el-table-column :label="t('common.operation')" width="280" fixed="right">
-            <template #default="{ row }">
-              <div class="row-actions">
-                <el-tooltip :content="deniedText" :disabled="canManageContainers" placement="top">
-                  <span><el-button size="small" :disabled="!canManageContainers" @click="runContainerAction(row.id, 'start')">{{ t('containers.start') }}</el-button></span>
-                </el-tooltip>
-                <el-tooltip :content="deniedText" :disabled="canManageContainers" placement="top">
-                  <span><el-button size="small" :disabled="!canManageContainers" @click="runContainerAction(row.id, 'stop')">{{ t('containers.stop') }}</el-button></span>
-                </el-tooltip>
-                <el-tooltip :content="deniedText" :disabled="canManageContainers" placement="top">
-                  <span><el-button size="small" :disabled="!canManageContainers" @click="runContainerAction(row.id, 'restart')">{{ t('containers.restart') }}</el-button></span>
-                </el-tooltip>
-                <el-button size="small" @click="openLogs(row.id)">{{ t('containers.logs') }}</el-button>
-              </div>
-            </template>
-          </el-table-column>
-        </el-table>
+        <div class="table-toolbar">
+          <span class="selection-summary">{{ t('containers.selectedCount', { count: selectedContainerRows.length }) }}</span>
+          <div class="toolbar-actions">
+            <el-tooltip :content="batchActionDisabledReason" :disabled="!batchActionDisabledReason" placement="top">
+              <span><el-button size="small" :disabled="batchActionDisabled" @click="runContainerBatchAction('start')">{{ t('containers.batchStart') }}</el-button></span>
+            </el-tooltip>
+            <el-tooltip :content="batchActionDisabledReason" :disabled="!batchActionDisabledReason" placement="top">
+              <span><el-button size="small" :disabled="batchActionDisabled" @click="runContainerBatchAction('stop')">{{ t('containers.batchStop') }}</el-button></span>
+            </el-tooltip>
+            <el-tooltip :content="batchActionDisabledReason" :disabled="!batchActionDisabledReason" placement="top">
+              <span><el-button size="small" :disabled="batchActionDisabled" @click="runContainerBatchAction('restart')">{{ t('containers.batchRestart') }}</el-button></span>
+            </el-tooltip>
+            <el-tooltip :content="batchRemoveDisabledReason" :disabled="!batchRemoveDisabledReason" placement="top">
+              <span><el-button size="small" type="danger" plain :disabled="batchRemoveDisabled" @click="runContainerBatchAction('remove')">{{ t('containers.batchUninstall') }}</el-button></span>
+            </el-tooltip>
+          </div>
+        </div>
+        <div class="container-table-body">
+          <el-table :data="collection" height="100%" row-key="id" @selection-change="onContainerSelectionChange">
+            <el-table-column type="selection" width="44" />
+            <el-table-column prop="name" :label="t('containers.name')" min-width="160" show-overflow-tooltip />
+            <el-table-column prop="image" :label="t('containers.image')" min-width="190" show-overflow-tooltip />
+            <el-table-column prop="state" :label="t('common.status')" width="120">
+              <template #default="{ row }"><StatusTag :status="row.state === 'running' ? 'running' : 'stopped'" /></template>
+            </el-table-column>
+            <el-table-column prop="ports" :label="t('containers.ports')" min-width="180" show-overflow-tooltip />
+            <el-table-column prop="networks" :label="t('containers.network')" min-width="140" show-overflow-tooltip />
+            <el-table-column prop="createdAt" :label="t('containers.created')" min-width="170" show-overflow-tooltip />
+            <el-table-column :label="t('common.operation')" width="340" fixed="right">
+              <template #default="{ row }">
+                <div class="row-actions">
+                  <el-tooltip :content="deniedText" :disabled="canManageContainers" placement="top">
+                    <span><el-button size="small" :disabled="!canManageContainers" @click="runContainerAction(row.id, 'start')">{{ t('containers.start') }}</el-button></span>
+                  </el-tooltip>
+                  <el-tooltip :content="deniedText" :disabled="canManageContainers" placement="top">
+                    <span><el-button size="small" :disabled="!canManageContainers" @click="runContainerAction(row.id, 'stop')">{{ t('containers.stop') }}</el-button></span>
+                  </el-tooltip>
+                  <el-tooltip :content="deniedText" :disabled="canManageContainers" placement="top">
+                    <span><el-button size="small" :disabled="!canManageContainers" @click="runContainerAction(row.id, 'restart')">{{ t('containers.restart') }}</el-button></span>
+                  </el-tooltip>
+                  <el-tooltip :content="containerRemoveDisabledReason(row)" :disabled="!containerRemoveDisabledReason(row)" placement="top">
+                    <span><el-button size="small" type="danger" plain :disabled="Boolean(containerRemoveDisabledReason(row))" @click="runContainerBatchAction('remove', [row])">{{ t('containers.uninstall') }}</el-button></span>
+                  </el-tooltip>
+                  <el-button size="small" @click="openLogs(row.id)">{{ t('containers.logs') }}</el-button>
+                </div>
+              </template>
+            </el-table-column>
+          </el-table>
+        </div>
       </template>
 
       <template v-else-if="tab === 'images'">
@@ -143,7 +166,7 @@
 
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from 'vue'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import { useRouter } from 'vue-router'
 import { apiGet, apiPost, asArray } from '../api/client'
 import KeyValueGrid from '../components/KeyValueGrid.vue'
@@ -178,6 +201,7 @@ const servers = ref<any[]>([])
 const appInstances = ref<AppInstance[]>([])
 const summary = ref<DockerSummaryResponse>({})
 const collection = ref<any[]>([])
+const selectedContainerRows = ref<any[]>([])
 const error = ref('')
 const tab = ref('overview')
 const logsVisible = ref(false)
@@ -215,6 +239,20 @@ const settingsItems = computed(() => [
   { label: t('containers.rootDir'), value: summaryData.value.rootDir || '-' },
   { label: t('common.provider'), value: t('common.real') }
 ])
+const selectedContainerIds = computed(() => selectedContainerRows.value.map((row) => String(row?.id ?? '').trim()).filter(Boolean))
+const selectedRunningContainers = computed(() => selectedContainerRows.value.filter(isRunningContainer))
+const batchActionDisabledReason = computed(() => {
+  if (!canManageContainers.value) return deniedText.value
+  if (!selectedContainerIds.value.length) return t('containers.selectContainers')
+  return ''
+})
+const batchActionDisabled = computed(() => Boolean(batchActionDisabledReason.value))
+const batchRemoveDisabledReason = computed(() => {
+  if (batchActionDisabledReason.value) return batchActionDisabledReason.value
+  if (selectedRunningContainers.value.length) return t('containers.stopBeforeUninstall')
+  return ''
+})
+const batchRemoveDisabled = computed(() => Boolean(batchRemoveDisabledReason.value))
 const normalizedDiskUsage = computed(() => {
   const rows = asArray<Record<string, string>>(summary.value.diskUsage)
   if (rows.length) return rows
@@ -254,6 +292,7 @@ async function load() {
   if (!query) {
     summary.value = { available: false }
     collection.value = []
+    selectedContainerRows.value = []
     return
   }
   summary.value = await apiGet<DockerSummaryResponse>(`/containers/summary?${query}`).catch((err) => {
@@ -269,13 +308,16 @@ async function load() {
 async function loadCollection() {
   if (tab.value === 'overview' || tab.value === 'registry' || tab.value === 'settings') {
     collection.value = []
+    selectedContainerRows.value = []
     return
   }
   const query = targetQuery()
   if (!query) {
     collection.value = []
+    selectedContainerRows.value = []
     return
   }
+  selectedContainerRows.value = []
   collection.value = asArray(await apiGet(`/containers?kind=${tab.value}&${query}`).catch((err) => {
     error.value = err.message
     return []
@@ -300,9 +342,54 @@ async function runContainerAction(id: string, action: string) {
     ElMessage.warning(t('containers.selectDockerHost'))
     return
   }
-  await apiPost(`/containers/${encodeURIComponent(id)}/${action}?${query}`)
-  ElMessage.success(t('containers.actionAccepted'))
-  setTimeout(loadCollection, 800)
+  try {
+    await apiPost(`/containers/${encodeURIComponent(id)}/${action}?${query}`)
+    ElMessage.success(t('containers.actionAccepted'))
+    setTimeout(loadCollection, 800)
+  } catch (err) {
+    ElMessage.error(err instanceof Error ? err.message : t('containers.actionFailed'))
+  }
+}
+
+async function runContainerBatchAction(action: string, rows = selectedContainerRows.value) {
+  if (!canManageContainers.value) {
+    ElMessage.warning(deniedText.value)
+    return
+  }
+  const query = targetQuery()
+  if (!query) {
+    ElMessage.warning(t('containers.selectDockerHost'))
+    return
+  }
+  const selectedRows = rows.filter((row) => String(row?.id ?? '').trim())
+  const ids = selectedRows.map((row) => String(row.id).trim())
+  if (!ids.length) {
+    ElMessage.warning(t('containers.selectContainers'))
+    return
+  }
+  if (action === 'remove') {
+    if (selectedRows.some(isRunningContainer)) {
+      ElMessage.warning(t('containers.stopBeforeUninstall'))
+      return
+    }
+    try {
+      await ElMessageBox.confirm(t('containers.confirmUninstallSelected', { count: ids.length }), t('containers.uninstall'), {
+        type: 'warning',
+        confirmButtonText: t('containers.uninstall'),
+        cancelButtonText: t('common.cancel')
+      })
+    } catch {
+      return
+    }
+  }
+  try {
+    await apiPost(`/containers/actions?${query}`, { action, ids })
+    ElMessage.success(t('containers.batchActionAccepted'))
+    selectedContainerRows.value = []
+    setTimeout(loadCollection, 800)
+  } catch (err) {
+    ElMessage.error(err instanceof Error ? err.message : t('containers.actionFailed'))
+  }
 }
 
 async function openLogs(id: string) {
@@ -314,6 +401,20 @@ async function openLogs(id: string) {
   const result = await apiGet<{ logs?: string[] }>(`/containers/${encodeURIComponent(id)}/logs?tail=300&${query}`)
   logsText.value = asArray<string>(result.logs).join('\n')
   logsVisible.value = true
+}
+
+function onContainerSelectionChange(rows: any[]) {
+  selectedContainerRows.value = rows
+}
+
+function isRunningContainer(row: any) {
+  return String(row?.state ?? '').toLowerCase() === 'running'
+}
+
+function containerRemoveDisabledReason(row: any) {
+  if (!canManageContainers.value) return deniedText.value
+  if (isRunningContainer(row)) return t('containers.stopBeforeUninstall')
+  return ''
 }
 
 function openDockerUninstall() {
@@ -403,6 +504,33 @@ onMounted(async () => {
   gap: 6px;
 }
 
+.table-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 40px;
+  padding: 0 2px 8px;
+}
+
+.selection-summary {
+  color: var(--aifar-text-secondary);
+  font-size: 13px;
+  white-space: nowrap;
+}
+
+.toolbar-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.container-table-body {
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
 .settings-grid {
   display: grid;
   gap: 12px;
@@ -417,6 +545,15 @@ onMounted(async () => {
 @media (max-width: 640px) {
   .disk-grid {
     grid-template-columns: 1fr;
+  }
+
+  .table-toolbar {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .toolbar-actions {
+    justify-content: flex-start;
   }
 }
 </style>

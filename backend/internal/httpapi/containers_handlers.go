@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"strings"
 
@@ -106,8 +107,17 @@ func (a *API) containers(w http.ResponseWriter, r *http.Request) {
 
 func (a *API) containerAction(action string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		id := chi.URLParam(r, "id")
+		action = normalizeContainerAction(action)
 		lang := languageFromRequest(r)
+		if action == "" {
+			writeError(w, http.StatusBadRequest, "UNSUPPORTED_CONTAINER_ACTION", i18n.Text(lang, "api.unsupportedContainerAction"), nil)
+			return
+		}
+		id := strings.TrimSpace(chi.URLParam(r, "id"))
+		if id == "" {
+			writeError(w, http.StatusBadRequest, "IDS_REQUIRED", i18n.Text(lang, "api.containerIDsRequired"), nil)
+			return
+		}
 		host := dockerHostFromRequest(r)
 		server, useServer, serverErr := a.dockerServerFromRequest(r)
 		if serverErr != nil {
@@ -118,16 +128,13 @@ func (a *API) containerAction(action string) http.HandlerFunc {
 			writeError(w, http.StatusBadRequest, "DOCKER_TARGET_REQUIRED", i18n.Text(lang, "api.dockerTargetRequired"), nil)
 			return
 		}
+		if action == "remove" && a.rejectRunningContainerRemove(w, r, server, useServer, host, []string{id}) {
+			return
+		}
 		task, err := a.tasks.StartWithLanguage("containers.container."+action, id, currentUser(r).Username, lang, func(ctx context.Context, log worker.Logger) error {
 			log.Info(i18n.Text(lang, "api.containerActionRequested"), action, id)
-			if useServer {
-				if err := adapter.DockerContainerActionForServer(ctx, server, id, action); err != nil {
-					return err
-				}
-			} else {
-				if err := adapter.DockerContainerAction(ctx, host, id, action); err != nil {
-					return err
-				}
+			if err := runDockerContainerAction(ctx, server, useServer, host, id, action); err != nil {
+				return err
 			}
 			log.Info(i18n.Text(lang, "api.containerActionCompleted"), action, id)
 			return nil
@@ -137,6 +144,54 @@ func (a *API) containerAction(action string) http.HandlerFunc {
 		}
 		respondTask(w, task, err)
 	}
+}
+
+func (a *API) containerBatchAction(w http.ResponseWriter, r *http.Request) {
+	lang := languageFromRequest(r)
+	var req containerBatchActionRequest
+	if !decode(w, r, &req) {
+		return
+	}
+	action := normalizeContainerAction(req.Action)
+	if action == "" {
+		writeError(w, http.StatusBadRequest, "UNSUPPORTED_CONTAINER_ACTION", i18n.Text(lang, "api.unsupportedContainerAction"), map[string]any{"action": req.Action})
+		return
+	}
+	ids := normalizeContainerIDs(req.IDs)
+	if len(ids) == 0 {
+		writeError(w, http.StatusBadRequest, "IDS_REQUIRED", i18n.Text(lang, "api.containerIDsRequired"), nil)
+		return
+	}
+	host := dockerHostFromRequest(r)
+	server, useServer, serverErr := a.dockerServerFromRequest(r)
+	if serverErr != nil {
+		respond(w, nil, serverErr)
+		return
+	}
+	if !useServer && host == "" {
+		writeError(w, http.StatusBadRequest, "DOCKER_TARGET_REQUIRED", i18n.Text(lang, "api.dockerTargetRequired"), nil)
+		return
+	}
+	if action == "remove" && a.rejectRunningContainerRemove(w, r, server, useServer, host, ids) {
+		return
+	}
+	target := strings.Join(ids, ",")
+	task, err := a.tasks.StartWithLanguage("containers.container.batch."+action, target, currentUser(r).Username, lang, func(ctx context.Context, log worker.Logger) error {
+		log.Info(i18n.Text(lang, "api.containerBatchActionRequested"), action, len(ids))
+		for _, id := range ids {
+			log.Info(i18n.Text(lang, "api.containerActionRequested"), action, id)
+			if err := runDockerContainerAction(ctx, server, useServer, host, id, action); err != nil {
+				return fmt.Errorf("%s %s: %w", action, id, err)
+			}
+			log.Info(i18n.Text(lang, "api.containerActionCompleted"), action, id)
+		}
+		log.Info(i18n.Text(lang, "api.containerBatchActionCompleted"), action, len(ids))
+		return nil
+	})
+	if err == nil {
+		a.audit(r, "containers.container.batch."+action, target, "running", task.ID)
+	}
+	respondTask(w, task, err)
 }
 
 func (a *API) containerLogs(w http.ResponseWriter, r *http.Request) {
@@ -177,4 +232,96 @@ func (a *API) dockerServerFromRequest(r *http.Request) (store.Server, bool, erro
 
 func dockerHostFromRequest(r *http.Request) string {
 	return strings.TrimSpace(r.URL.Query().Get("dockerHost"))
+}
+
+func runDockerContainerAction(ctx context.Context, server store.Server, useServer bool, host, id, action string) error {
+	if useServer {
+		return adapter.DockerContainerActionForServer(ctx, server, id, action)
+	}
+	return adapter.DockerContainerAction(ctx, host, id, action)
+}
+
+func (a *API) rejectRunningContainerRemove(w http.ResponseWriter, r *http.Request, server store.Server, useServer bool, host string, ids []string) bool {
+	running, err := a.selectedRunningContainers(r.Context(), server, useServer, host, ids)
+	if err != nil {
+		respond(w, nil, err)
+		return true
+	}
+	if len(running) == 0 {
+		return false
+	}
+	writeError(w, http.StatusConflict, "CONTAINER_RUNNING_CANNOT_REMOVE", i18n.Text(languageFromRequest(r), "api.containerRunningCannotRemove"), map[string]any{"containers": running})
+	return true
+}
+
+func (a *API) selectedRunningContainers(ctx context.Context, server store.Server, useServer bool, host string, ids []string) ([]string, error) {
+	var (
+		rows []adapter.DockerContainer
+		err  error
+	)
+	if useServer {
+		rows, err = adapter.DockerContainersForServer(ctx, server)
+	} else {
+		rows, err = adapter.DockerContainers(ctx, host)
+	}
+	if err != nil {
+		return nil, err
+	}
+	running := make([]string, 0)
+	for _, row := range rows {
+		if !strings.EqualFold(strings.TrimSpace(row.State), "running") {
+			continue
+		}
+		for _, id := range ids {
+			if containerMatchesID(row, id) {
+				running = append(running, containerLabel(row))
+				break
+			}
+		}
+	}
+	return running, nil
+}
+
+func normalizeContainerAction(action string) string {
+	switch strings.ToLower(strings.TrimSpace(action)) {
+	case "start", "stop", "restart":
+		return strings.ToLower(strings.TrimSpace(action))
+	case "remove", "rm", "delete", "uninstall":
+		return "remove"
+	default:
+		return ""
+	}
+}
+
+func normalizeContainerIDs(ids []string) []string {
+	out := make([]string, 0, len(ids))
+	seen := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		id = strings.TrimSpace(id)
+		if id == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
+		out = append(out, id)
+	}
+	return out
+}
+
+func containerMatchesID(row adapter.DockerContainer, id string) bool {
+	needle := strings.ToLower(strings.TrimSpace(id))
+	if needle == "" {
+		return false
+	}
+	rowID := strings.ToLower(strings.TrimSpace(row.ID))
+	if rowID != "" && (rowID == needle || strings.HasPrefix(rowID, needle) || strings.HasPrefix(needle, rowID)) {
+		return true
+	}
+	return strings.ToLower(strings.TrimSpace(row.Name)) == needle
+}
+
+func containerLabel(row adapter.DockerContainer) string {
+	if strings.TrimSpace(row.Name) != "" {
+		return row.Name
+	}
+	return row.ID
 }

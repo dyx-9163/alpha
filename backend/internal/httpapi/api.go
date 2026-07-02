@@ -92,9 +92,11 @@ func New(cfg config.Config, s *store.Store, tasks *worker.Manager) *API {
 			r.Post("/apps/instances/{id}/uninstall", api.requirePermission(rbac.AppsManage, api.deleteAppInstance))
 			r.Get("/containers/summary", api.containerSummary)
 			r.Get("/containers", api.containers)
+			r.Post("/containers/actions", api.requirePermission(rbac.ContainersManage, api.containerBatchAction))
 			r.Post("/containers/{id}/start", api.requirePermission(rbac.ContainersManage, api.containerAction("start")))
 			r.Post("/containers/{id}/stop", api.requirePermission(rbac.ContainersManage, api.containerAction("stop")))
 			r.Post("/containers/{id}/restart", api.requirePermission(rbac.ContainersManage, api.containerAction("restart")))
+			r.Post("/containers/{id}/remove", api.requirePermission(rbac.ContainersManage, api.containerAction("remove")))
 			r.Get("/containers/{id}/logs", api.containerLogs)
 			r.Get("/database/instances", api.databaseInstances)
 			r.Post("/database/mysql/install", api.requirePermission(rbac.DatabaseManage, api.installNamedApp("mysql")))
@@ -176,6 +178,11 @@ type deleteAppInstancesRequest struct {
 	Language           string            `json:"language"`
 	Parameters         map[string]any    `json:"parameters"`
 	RemoveMountedDisks *bool             `json:"removeMountedDisks"`
+}
+
+type containerBatchActionRequest struct {
+	Action string   `json:"action"`
+	IDs    []string `json:"ids"`
 }
 
 type startMySQLClusterRequest struct {
