@@ -13,7 +13,13 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"sort"
 	"strings"
+	"time"
+
+	"aifar-deployment/backend/internal/installer/installerkit"
+	"aifar-deployment/backend/internal/installer/uploadkit"
+	"aifar-deployment/backend/internal/store"
 )
 
 const (
@@ -66,54 +72,235 @@ func (s Service) UpdateArtifactBundle(ctx context.Context, req ArtifactBundleUpd
 	if len(items) == 0 {
 		return errors.New(copy.BundleEmpty)
 	}
+	orderBundleItems(items)
 
 	target := req.Instance.ServerID
 	if target == "" {
 		target = req.Server.ID
 	}
+	logForServer := logForTarget(log, targetLog, target)
 	recorder, _ := log.(stepRecorder)
-	stepsPerService := len(updateSteps(copy))
-	current := req.Instance
+	if recorder != nil {
+		recorder.StartTarget(target)
+	}
+	step := newStepRunner(logForServer, recorder, target, updateSteps(copy), copy.StepStart, copy.StepDone, copy.StepFailed)
+	concurrency := store.NormalizeDeploymentConcurrency(fmt.Sprint(req.Concurrency), 1)
+	artifacts := make([]artifactInfo, 0, len(items))
+	for _, item := range items {
+		artifacts = append(artifacts, artifactInfo{
+			ServiceName: item.ServiceName,
+			FileName:    item.FileName,
+			SHA256:      item.SHA256,
+			Size:        item.Size,
+		})
+	}
+
+	var metadata map[string]any
+	var installRoot string
+	var version string
+	var releaseTime time.Time
+	var releaseID string
+	var baseReleaseID string
+	var configHash string
+	var composeProject string
+	var ingressNetwork string
+	var internalNetwork string
+	var ingressContainer string
+	var gatewayPort int
+	var webPort int
+	var workDir string
+	var scriptRemote string
+	var scriptArtifacts []bundleUpdateScriptArtifact
+
 	log.Info(copy.BundleUpdating, len(items))
-	for idx, item := range items {
+
+	if err := step(1, func() error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if idx > 0 {
-			current, err = s.store.GetAppInstance(req.Instance.ID)
-			if err != nil {
+		metadata = metadataFromInstance(req.Instance)
+		installRoot = stringFromMetadata(metadata, "installRoot", installRootFromDeployDir(req.Server.DeployDir))
+		version = stringFromMetadata(metadata, "releaseVersion", req.Instance.Version)
+		if strings.TrimSpace(version) == "" {
+			version = appBundleVersion
+		}
+		baseReleaseID = stringFromMetadata(metadata, "releaseId", "")
+		releaseTime = time.Now().UTC()
+		releaseID = newReleaseID("partial-bundle", releaseTime)
+		configHash = partialBundleUpdateConfigHash(stringFromMetadata(metadata, "configHash", ""), artifacts)
+		composeProject = composeProjectName(releaseID)
+		ingressNetwork = stringFromMetadata(metadata, "ingressNetwork", stringFromMetadata(metadata, "networkName", defaultNetworkName))
+		internalNetwork = releaseInternalNetworkName(releaseID)
+		ingressContainer = stringFromMetadata(metadata, "ingressContainer", ingressContainerName())
+		gatewayPort = intFromMetadata(metadata, "gatewayPort", defaultGatewayPort)
+		webPort = intFromMetadata(metadata, "webPort", defaultWebPort)
+		deployDir := installerkit.RemoteDeployDir(req.Server.DeployDir)
+		workDir = installerkit.WorkDir(deployDir, AppName+"-bundle", version, releaseTime)
+		scriptRemote = workDir + "/update-aifar-artifact-bundle.sh"
+		scriptArtifacts = make([]bundleUpdateScriptArtifact, 0, len(items))
+		for _, item := range items {
+			scriptArtifacts = append(scriptArtifacts, bundleUpdateScriptArtifact{
+				ServiceName:    item.ServiceName,
+				ArtifactRemote: workDir + "/" + item.ServiceName + "/" + installerkit.Sanitize(item.FileName),
+				ArtifactFile:   item.FileName,
+				ArtifactSHA256: item.SHA256,
+				ArtifactSize:   item.Size,
+			})
+		}
+		return nil
+	}); err != nil {
+		msg := fmt.Sprintf(copy.UpdateFailed, err)
+		logForServer.Error("%s", msg)
+		finishTarget(recorder, target, "failed", msg)
+		return err
+	}
+
+	if err := step(2, func() error {
+		logForServer.Info(copy.PrepareWorkDir, workDir)
+		if _, err := installerkit.Run(ctx, s.remote, req.Server, "mkdir -p "+installerkit.ShellQuote(workDir), logForServer, copy.RemoteCommandFailed); err != nil {
+			return err
+		}
+		for idx, item := range items {
+			logForServer.Info(copy.BundleServiceUpdating, idx+1, len(items), item.ServiceName)
+			if err := uploadkit.Upload(ctx, s.remote, req.Server, uploadkit.File{
+				LocalPath:      item.LocalPath,
+				RemotePath:     scriptArtifacts[idx].ArtifactRemote,
+				LogMessage:     copy.UploadArtifact,
+				LogArgs:        []any{item.ServiceName, item.FileName},
+				FailureMessage: copy.UploadArtifactFailed,
+			}, logForServer); err != nil {
 				return err
 			}
 		}
-		serviceLog := log
-		if recorder != nil {
-			serviceLog = prefixedStepLogger{
-				Logger:      log,
-				recorder:    recorder,
-				prefix:      item.ServiceName,
-				titlePrefix: item.ServiceName,
-				orderOffset: idx * stepsPerService,
-			}
-		}
-		log.Info(copy.BundleServiceUpdating, idx+1, len(items), item.ServiceName)
-		if err := s.UpdateArtifact(ctx, ArtifactUpdateRequest{
-			Instance:          current,
-			Server:            req.Server,
-			Language:          req.Language,
-			Actor:             req.Actor,
-			ServiceName:       item.ServiceName,
-			ArtifactLocalPath: item.LocalPath,
-			ArtifactFileName:  item.FileName,
-		}, serviceLog, targetLog); err != nil {
-			return err
-		}
-		current, err = s.store.GetAppInstance(req.Instance.ID)
+		script, err := renderBundleUpdateScript(bundleUpdateScriptData{
+			InstallRoot:      installRoot,
+			WorkDir:          workDir,
+			ServiceOrder:     serviceOrderText(),
+			ChangedServices:  artifactServiceNamesText(artifacts),
+			Artifacts:        scriptArtifacts,
+			Version:          version,
+			ReleaseID:        releaseID,
+			CreatedAt:        releaseTime.Format(time.RFC3339),
+			ConfigHash:       configHash,
+			ReleaseKeepCount: releaseKeepCount,
+			ComposeProject:   composeProject,
+			IngressNetwork:   ingressNetwork,
+			InternalNetwork:  internalNetwork,
+			IngressContainer: ingressContainer,
+			Concurrency:      concurrency,
+		})
 		if err != nil {
 			return err
 		}
+		scriptLocal, err := installerkit.WriteTempScript("aifar-service-bundle-update-*.sh", script)
+		if err != nil {
+			return err
+		}
+		defer os.Remove(scriptLocal)
+		return uploadkit.Upload(ctx, s.remote, req.Server, uploadkit.File{
+			LocalPath:      scriptLocal,
+			RemotePath:     scriptRemote,
+			Mode:           0o755,
+			LogMessage:     copy.UploadScript,
+			FailureMessage: copy.UploadScriptFailed,
+		}, logForServer)
+	}); err != nil {
+		msg := fmt.Sprintf(copy.UpdateFailed, err)
+		logForServer.Error("%s", msg)
+		finishTarget(recorder, target, "failed", msg)
+		return err
 	}
-	log.Info(copy.BundleUpdated, target, len(items))
+
+	if err := step(3, func() error {
+		logForServer.Info(copy.Deploying, artifactServiceNamesText(artifacts))
+		_, err := installerkit.Run(ctx, s.remote, req.Server, "sh "+installerkit.ShellQuote(scriptRemote), logForServer, copy.RemoteCommandFailed)
+		return err
+	}); err != nil {
+		msg := fmt.Sprintf(copy.UpdateFailed, err)
+		logForServer.Error("%s", msg)
+		finishTarget(recorder, target, "failed", msg)
+		return err
+	}
+
+	if err := step(4, func() error {
+		metadata["releaseId"] = releaseID
+		metadata["releasePath"] = installRoot + "/" + releasesDirName + "/" + releaseID
+		metadata["releaseVersion"] = version
+		metadata["releaseCreatedAt"] = releaseTime.Format(time.RFC3339)
+		metadata["configHash"] = configHash
+		for key, value := range partialOrchestrationMetadata(metadata, installRoot, releaseID, ingressNetwork, gatewayPort, webPort, artifactServiceNames(artifacts)) {
+			metadata[key] = value
+		}
+		metadata["lastPartialUpdate"] = map[string]any{
+			"service":               "bundle",
+			"changedServices":       artifactServiceNames(artifacts),
+			"baseReleaseId":         baseReleaseID,
+			"releaseId":             releaseID,
+			"updatedAt":             releaseTime.Format(time.RFC3339),
+			"deploymentConcurrency": concurrency,
+		}
+		data, _ := json.Marshal(metadata)
+		next := req.Instance
+		next.Status = "installed"
+		next.Version = version
+		next.Metadata = string(data)
+		saved, err := s.store.SaveAppInstance(next)
+		if err != nil {
+			return err
+		}
+		if releases, ok := s.store.(releaseStore); ok {
+			manifest, _ := json.Marshal(partialBundleReleaseManifest(version, releaseID, releaseTime, configHash, baseReleaseID, ingressNetwork, gatewayPort, webPort, artifacts, concurrency))
+			if _, err := releases.SaveAppRelease(store.AppRelease{
+				InstanceID:   saved.ID,
+				App:          AppName,
+				Version:      version,
+				ReleaseID:    releaseID,
+				ServerID:     target,
+				Status:       "success",
+				ManifestJSON: string(manifest),
+				ConfigHash:   configHash,
+				CreatedAt:    releaseTime,
+				ActivatedAt:  releaseTime,
+			}); err != nil {
+				return err
+			}
+			if _, err := releases.DeleteOldAppReleases(saved.ID, releaseKeepCount); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		msg := fmt.Sprintf(copy.RecordFailed, err)
+		logForServer.Error("%s", msg)
+		finishTarget(recorder, target, "failed", msg)
+		return err
+	}
+
+	logForServer.Info(copy.BundleUpdated, target, len(items))
+	finishTarget(recorder, target, "success", "")
 	return nil
+}
+
+func orderBundleItems(items []artifactBundleItem) {
+	order := make(map[string]int, len(serviceOrder))
+	for idx, service := range serviceOrder {
+		order[service] = idx
+	}
+	sort.SliceStable(items, func(i, j int) bool {
+		return order[items[i].ServiceName] < order[items[j].ServiceName]
+	})
+}
+
+func artifactServiceNames(artifacts []artifactInfo) []string {
+	out := make([]string, 0, len(artifacts))
+	for _, artifact := range artifacts {
+		out = append(out, artifact.ServiceName)
+	}
+	return out
+}
+
+func artifactServiceNamesText(artifacts []artifactInfo) string {
+	return strings.Join(artifactServiceNames(artifacts), " ")
 }
 
 func (s Service) artifactBundleItemsFromRequest(req ArtifactBundleUpdateRequest, copy UpdateCopy, extract bool) ([]artifactBundleItem, func(), error) {
@@ -325,48 +512,4 @@ func extractBundleArtifact(file *zip.File, localPath string) (string, int64, err
 		return "", 0, err
 	}
 	return hex.EncodeToString(hash.Sum(nil)), size, nil
-}
-
-func prefixedUpdateStepName(serviceName, stepName string) string {
-	return cleanAIFARServiceName(serviceName) + "-" + strings.TrimSpace(stepName)
-}
-
-func prefixedUpdateStepTitle(serviceName, title string) string {
-	serviceName = cleanAIFARServiceName(serviceName)
-	if serviceName == "" {
-		return title
-	}
-	return serviceName + " / " + title
-}
-
-type prefixedStepLogger struct {
-	Logger
-	recorder    stepRecorder
-	prefix      string
-	titlePrefix string
-	orderOffset int
-}
-
-func (l prefixedStepLogger) StartTarget(target string) {
-	if l.recorder != nil {
-		l.recorder.StartTarget(target)
-	}
-}
-
-func (l prefixedStepLogger) FinishTarget(target, status, errText string) {
-	if l.recorder != nil {
-		l.recorder.FinishTarget(target, status, errText)
-	}
-}
-
-func (l prefixedStepLogger) StartStep(target, name, title string, order int) {
-	if l.recorder != nil {
-		l.recorder.StartStep(target, prefixedUpdateStepName(l.prefix, name), prefixedUpdateStepTitle(l.titlePrefix, title), l.orderOffset+order)
-	}
-}
-
-func (l prefixedStepLogger) FinishStep(target, name, status, errText string) {
-	if l.recorder != nil {
-		l.recorder.FinishStep(target, prefixedUpdateStepName(l.prefix, name), status, errText)
-	}
 }

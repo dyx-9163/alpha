@@ -218,7 +218,8 @@ func (a *API) updateAppInstanceArtifactBundle(w http.ResponseWriter, r *http.Req
 		defer os.Remove(bundlePath)
 		log.Info(i18n.Text(lang, "api.artifactBundleUpdateRequested"), instance.App, instance.ID, header.Filename)
 		if err := updateModule.UpdateArtifactBundle(ctx, req, registry.RunContext{
-			Log: log,
+			Log:         log,
+			Concurrency: a.store.DeploymentConcurrency(a.cfg.DeploymentConcurrency),
 			TargetLog: func(target string) registry.Logger {
 				return log.Target(target)
 			},

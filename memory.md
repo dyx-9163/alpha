@@ -525,3 +525,7 @@
 - 结论：已从当前工作树创建并切换到 `codex/custom-orchestration`，后续改动限定在自定义 release 编排、健康检查、切流、回滚和版本保留相关范围内。
 - 问题：用户要求在 `codex/custom-orchestration` 分支实现 AIFAR 自定义 Docker/Compose 发布编排方案。
 - 结论：已实现普通 Docker/Compose 下的 release 编排：业务容器使用动态 releaseId/project/container/internal network 和 labels，不再直接绑定宿主机端口；新增稳定 nginx ingress 绑定外部 gateway/web 端口并 reload 切流；安装和制品更新改为先启新 release/服务、健康检查、切 ingress/current、再停旧版本；状态检测识别 ingress 和链外旧容器，partial release 的 base chain 不误判 stale；release 保留策略保护最近 3 个成功 release 及 partial base 链。验证通过：`go test ./internal/apps/aifar ./internal/store ./internal/httpapi`、`pnpm test`、`git diff --check`。
+- 问题：用户询问如何测试 AIFAR 自定义 Docker/Compose 发布编排，以及更新时能否使用部署并发。
+- 结论：测试应覆盖新装、单服务更新、批量包更新、失败回滚和状态检测；当前 AIFAR 批量包更新在同一实例内仍按服务串行执行，不建议直接套用部署并发，因为多个 partial release 会竞争 `current`、ingress reload、旧容器停止和 release 清理。若未来要并发，建议改为“一个批量包生成一个多服务 partial release”，再用 bounded concurrency 并发构建/启动非入口服务，gateway/web-vue3 仍靠后切流。
+- 问题：用户要求按“一个批量包生成一个多服务 partial release，并在 release 内用 deploymentConcurrency 并发启动非入口服务，gateway/web-vue3 靠后切流”的方向改造。
+- 结论：AIFAR 批量制品包更新已改为一次生成一个多服务 partial release；后端从设置读取 `deploymentConcurrency` 传入远端脚本，脚本按 AIFAR 服务顺序处理制品，非入口服务按并发批次启动并健康检查，gateway/web-vue3 顺序靠后，全部成功后 reload ingress、停旧服务、切 current，并记录单个 release manifest。验证通过：`go test ./internal/apps/aifar ./internal/store ./internal/httpapi`、`pnpm test`、`git diff --check`。

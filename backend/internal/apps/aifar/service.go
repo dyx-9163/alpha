@@ -21,7 +21,7 @@ import (
 	"aifar-deployment/backend/internal/store"
 )
 
-//go:embed templates/install.sh templates/uninstall.sh templates/update-artifact.sh
+//go:embed templates/install.sh templates/uninstall.sh templates/update-artifact.sh templates/update-artifact-bundle.sh
 var templateFS embed.FS
 
 type Logger = installerkit.Logger
@@ -77,6 +77,7 @@ type ArtifactBundleUpdateRequest struct {
 	Actor           string
 	BundleLocalPath string
 	BundleFileName  string
+	Concurrency     int
 }
 
 type CheckResult struct {
@@ -328,6 +329,38 @@ func installMetadata(server store.Server, installRoot, version, releaseID string
 	return metadata
 }
 
+func partialOrchestrationMetadata(current map[string]any, installRoot, releaseID, ingressNetwork string, gatewayPort, webPort int, changedServices []string) map[string]any {
+	next := releaseOrchestrationMetadata(installRoot, releaseID, ingressNetwork, gatewayPort, webPort)
+	changed := map[string]bool{}
+	for _, service := range changedServices {
+		changed[service] = true
+	}
+	if currentRoutes, ok := current["activeRoutes"].(map[string]any); ok {
+		routes := map[string]any{}
+		for key, value := range currentRoutes {
+			routes[key] = value
+		}
+		if changed["gateway"] {
+			routes["gateway"] = map[string]any{"container": releaseContainerName("gateway", releaseID), "port": gatewayPort}
+		}
+		if changed["web-vue3"] {
+			routes["web-vue3"] = map[string]any{"container": releaseContainerName("web-vue3", releaseID), "port": webPort}
+		}
+		next["activeRoutes"] = routes
+	}
+	if currentContainers, ok := current["containers"].(map[string]any); ok {
+		containers := map[string]any{}
+		for key, value := range currentContainers {
+			containers[key] = value
+		}
+		for _, service := range changedServices {
+			containers[service] = releaseContainerName(service, releaseID)
+		}
+		next["containers"] = containers
+	}
+	return next
+}
+
 func releaseManifest(version, releaseID string, releaseTime time.Time, configHash, ingressNetwork string, gatewayPort, webPort int) map[string]any {
 	manifest := map[string]any{
 		"app":              AppName,
@@ -368,6 +401,39 @@ func partialReleaseManifest(version, releaseID string, releaseTime time.Time, co
 				"size":   artifact.Size,
 			},
 		},
+	}
+	for key, value := range releaseManifestFields(releaseID, ingressNetwork, gatewayPort, webPort) {
+		manifest[key] = value
+	}
+	return manifest
+}
+
+func partialBundleReleaseManifest(version, releaseID string, releaseTime time.Time, configHash, baseReleaseID, ingressNetwork string, gatewayPort, webPort int, artifacts []artifactInfo, concurrency int) map[string]any {
+	changed := make([]string, 0, len(artifacts))
+	artifactMap := make(map[string]any, len(artifacts))
+	for _, artifact := range artifacts {
+		changed = append(changed, artifact.ServiceName)
+		artifactMap[artifact.ServiceName] = map[string]any{
+			"file":   artifact.FileName,
+			"sha256": artifact.SHA256,
+			"size":   artifact.Size,
+		}
+	}
+	manifest := map[string]any{
+		"app":                   AppName,
+		"version":               version,
+		"releaseId":             releaseID,
+		"layout":                releaseLayout,
+		"kind":                  "partial",
+		"status":                "success",
+		"configHash":            configHash,
+		"baseReleaseId":         baseReleaseID,
+		"createdAt":             releaseTime.Format(time.RFC3339),
+		"releaseRetention":      releaseKeepCount,
+		"services":              serviceOrder,
+		"changedServices":       changed,
+		"deploymentConcurrency": concurrency,
+		"artifacts":             artifactMap,
 	}
 	for key, value := range releaseManifestFields(releaseID, ingressNetwork, gatewayPort, webPort) {
 		manifest[key] = value
@@ -525,7 +591,7 @@ func (s Service) UpdateArtifact(ctx context.Context, req ArtifactUpdateRequest, 
 		metadata["releaseVersion"] = version
 		metadata["releaseCreatedAt"] = releaseTime.Format(time.RFC3339)
 		metadata["configHash"] = configHash
-		for key, value := range releaseOrchestrationMetadata(installRoot, releaseID, ingressNetwork, gatewayPort, webPort) {
+		for key, value := range partialOrchestrationMetadata(metadata, installRoot, releaseID, ingressNetwork, gatewayPort, webPort, []string{artifact.ServiceName}) {
 			metadata[key] = value
 		}
 		metadata["lastPartialUpdate"] = map[string]any{
@@ -880,6 +946,32 @@ type updateScriptData struct {
 	IngressContainer string
 }
 
+type bundleUpdateScriptArtifact struct {
+	ServiceName    string
+	ArtifactRemote string
+	ArtifactFile   string
+	ArtifactSHA256 string
+	ArtifactSize   int64
+}
+
+type bundleUpdateScriptData struct {
+	InstallRoot      string
+	WorkDir          string
+	ServiceOrder     string
+	ChangedServices  string
+	Artifacts        []bundleUpdateScriptArtifact
+	Version          string
+	ReleaseID        string
+	CreatedAt        string
+	ConfigHash       string
+	ReleaseKeepCount int
+	ComposeProject   string
+	IngressNetwork   string
+	InternalNetwork  string
+	IngressContainer string
+	Concurrency      int
+}
+
 func renderInstallScript(data installScriptData) (string, error) {
 	content, err := templateFS.ReadFile("templates/install.sh")
 	if err != nil {
@@ -906,6 +998,16 @@ func renderUpdateScript(data updateScriptData) (string, error) {
 		return "", err
 	}
 	return installerkit.RenderTemplate(AppName, "update-artifact.sh", "aifar-update", string(content), template.FuncMap{
+		"quote": shellQuoteAny,
+	}, data)
+}
+
+func renderBundleUpdateScript(data bundleUpdateScriptData) (string, error) {
+	content, err := templateFS.ReadFile("templates/update-artifact-bundle.sh")
+	if err != nil {
+		return "", err
+	}
+	return installerkit.RenderTemplate(AppName, "update-artifact-bundle.sh", "aifar-update-bundle", string(content), template.FuncMap{
 		"quote": shellQuoteAny,
 	}, data)
 }

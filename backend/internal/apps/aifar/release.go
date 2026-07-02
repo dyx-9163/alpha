@@ -197,3 +197,12 @@ func partialUpdateConfigHash(baseHash, serviceName, artifactName, artifactSHA256
 	sum := sha256.Sum256(data)
 	return hex.EncodeToString(sum[:])
 }
+
+func partialBundleUpdateConfigHash(baseHash string, artifacts []artifactInfo) string {
+	data, _ := json.Marshal(map[string]any{
+		"baseConfigHash": baseHash,
+		"artifacts":      artifacts,
+	})
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
+}

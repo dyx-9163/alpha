@@ -245,7 +245,7 @@ func (m Module) PlanArtifactBundleUpdate(ctx context.Context, req registry.Artif
 		return nil, ctx.Err()
 	}
 	copy := updateCopyFor(req.Language)
-	items, cleanup, err := m.service.artifactBundleItemsFromRequest(ArtifactBundleUpdateRequest{
+	_, cleanup, err := m.service.artifactBundleItemsFromRequest(ArtifactBundleUpdateRequest{
 		Instance:        req.Instance,
 		Server:          req.Server,
 		Language:        req.Language,
@@ -264,18 +264,14 @@ func (m Module) PlanArtifactBundleUpdate(ctx context.Context, req registry.Artif
 		target = req.Server.ID
 	}
 	steps := updateSteps(copy)
-	plan := make([]registry.InstallStepPlan, 0, len(items)*len(steps))
-	order := 1
-	for _, item := range items {
-		for _, step := range steps {
-			plan = append(plan, registry.InstallStepPlan{
-				Target: target,
-				Name:   prefixedUpdateStepName(item.ServiceName, step.Name),
-				Title:  prefixedUpdateStepTitle(item.ServiceName, step.Title),
-				Order:  order,
-			})
-			order++
-		}
+	plan := make([]registry.InstallStepPlan, 0, len(steps))
+	for idx, step := range steps {
+		plan = append(plan, registry.InstallStepPlan{
+			Target: target,
+			Name:   step.Name,
+			Title:  step.Title,
+			Order:  idx + 1,
+		})
 	}
 	return plan, nil
 }
@@ -302,6 +298,7 @@ func (m Module) UpdateArtifactBundle(ctx context.Context, req registry.ArtifactB
 		Actor:           req.Actor,
 		BundleLocalPath: req.BundleLocalPath,
 		BundleFileName:  req.BundleFileName,
+		Concurrency:     run.Concurrency,
 	}, run.Log, func(target string) Logger {
 		return run.LoggerForTarget(target)
 	})

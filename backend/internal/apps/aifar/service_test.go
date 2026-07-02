@@ -136,6 +136,7 @@ type fakeRemote struct {
 	uploads       []string
 	installScript string
 	updateScript  string
+	bundleScript  string
 	statusStdout  string
 }
 
@@ -166,6 +167,13 @@ func (f *fakeRemote) UploadFile(ctx context.Context, server store.Server, localP
 			return err
 		}
 		f.updateScript = string(content)
+	}
+	if strings.HasSuffix(remotePath, "/update-aifar-artifact-bundle.sh") {
+		content, err := os.ReadFile(localPath)
+		if err != nil {
+			return err
+		}
+		f.bundleScript = string(content)
 	}
 	return nil
 }
@@ -653,7 +661,7 @@ func TestServiceUpdatesAIFARServiceArtifactAsPartialRelease(t *testing.T) {
 	}
 }
 
-func TestServiceUpdatesAIFARArtifactBundleAsPartialReleases(t *testing.T) {
+func TestServiceUpdatesAIFARArtifactBundleAsSingleMultiServicePartialRelease(t *testing.T) {
 	bundlePath := writeAlphaJarBundle(t, []bundleTestArtifact{
 		{Service: "oauth", Module: "alpha-oauth", FileName: "alpha-oauth.jar", Content: "new oauth jar"},
 		{Service: "gateway", Module: "alpha-gateway", FileName: "alpha-gateway.jar", Content: "new gateway jar"},
@@ -673,6 +681,7 @@ func TestServiceUpdatesAIFARArtifactBundleAsPartialReleases(t *testing.T) {
 		Language:        "en",
 		BundleLocalPath: bundlePath,
 		BundleFileName:  filepath.Base(bundlePath),
+		Concurrency:     3,
 	}, fakeLogger{}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -681,23 +690,36 @@ func TestServiceUpdatesAIFARArtifactBundleAsPartialReleases(t *testing.T) {
 	if !strings.Contains(uploads, "alpha-oauth.jar") || !strings.Contains(uploads, "alpha-gateway.jar") {
 		t.Fatalf("expected both service jars to be uploaded, uploads=%s", uploads)
 	}
-	if count := strings.Count(remote.joinedCommands(), "update-aifar-artifact.sh"); count != 2 {
-		t.Fatalf("expected two update script runs, commands=%s", remote.joinedCommands())
+	if count := strings.Count(remote.joinedCommands(), "update-aifar-artifact-bundle.sh"); count != 1 {
+		t.Fatalf("expected one bundle update script run, commands=%s", remote.joinedCommands())
 	}
-	if len(s.releases) != 2 {
-		t.Fatalf("expected two partial releases, got %+v", s.releases)
+	for _, want := range []string{
+		`CHANGED_SERVICES='oauth gateway'`,
+		`DEPLOYMENT_CONCURRENCY=3`,
+		`run_parallel_services $non_entry_services`,
+		`for service in gateway web-vue3; do`,
+		`configure_ingress_if_needed`,
+		`stop_old_changed_services`,
+		`"changedServices": ["oauth", "gateway"]`,
+	} {
+		if !strings.Contains(remote.bundleScript, want) {
+			t.Fatalf("bundle update script should contain %q:\n%s", want, remote.bundleScript)
+		}
 	}
-	if !strings.Contains(s.releases[0].ManifestJSON, `"changedServices":["oauth"]`) ||
-		!strings.Contains(s.releases[1].ManifestJSON, `"changedServices":["gateway"]`) {
-		t.Fatalf("expected per-service release manifests, got %+v", s.releases)
+	if len(s.releases) != 1 {
+		t.Fatalf("expected one multi-service partial release, got %+v", s.releases)
+	}
+	if !strings.Contains(s.releases[0].ManifestJSON, `"changedServices":["oauth","gateway"]`) ||
+		!strings.Contains(s.releases[0].ManifestJSON, `"deploymentConcurrency":3`) {
+		t.Fatalf("expected multi-service release manifest, got %+v", s.releases)
 	}
 	var metadata map[string]any
 	if err := json.Unmarshal([]byte(s.instances[0].Metadata), &metadata); err != nil {
 		t.Fatal(err)
 	}
 	lastUpdate, ok := metadata["lastPartialUpdate"].(map[string]any)
-	if !ok || lastUpdate["service"] != "gateway" || lastUpdate["artifactFile"] != "alpha-gateway.jar" {
-		t.Fatalf("expected final metadata to point at gateway update, got %s", s.instances[0].Metadata)
+	if !ok || lastUpdate["service"] != "bundle" || int(lastUpdate["deploymentConcurrency"].(float64)) != 3 {
+		t.Fatalf("expected final metadata to point at bundle update, got %s", s.instances[0].Metadata)
 	}
 }
 
@@ -718,7 +740,7 @@ func TestServiceAcceptsArtifactBundleManifestWithUTF8BOM(t *testing.T) {
 	}
 }
 
-func TestModulePlansArtifactBundleUpdateWithServicePrefixedSteps(t *testing.T) {
+func TestModulePlansArtifactBundleUpdateAsSinglePartialRelease(t *testing.T) {
 	bundlePath := writeAlphaJarBundle(t, []bundleTestArtifact{
 		{Service: "oauth", Module: "alpha-oauth", FileName: "alpha-oauth.jar", Content: "new oauth jar"},
 		{Service: "gateway", Module: "alpha-gateway", FileName: "alpha-gateway.jar", Content: "new gateway jar"},
@@ -741,18 +763,14 @@ func TestModulePlansArtifactBundleUpdateWithServicePrefixedSteps(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(plan) != 8 {
-		t.Fatalf("expected 8 planned steps, got %+v", plan)
+	if len(plan) != 4 {
+		t.Fatalf("expected 4 planned steps, got %+v", plan)
 	}
 	wantNames := []string{
-		"oauth-validate-artifact",
-		"oauth-upload-artifact",
-		"oauth-apply-update",
-		"oauth-record-release",
-		"gateway-validate-artifact",
-		"gateway-upload-artifact",
-		"gateway-apply-update",
-		"gateway-record-release",
+		"validate-artifact",
+		"upload-artifact",
+		"apply-update",
+		"record-release",
 	}
 	for idx, want := range wantNames {
 		if plan[idx].Name != want || plan[idx].Order != idx+1 {
