@@ -452,7 +452,7 @@ function formatBytes(value: number) {
   if (!Number.isFinite(value) || value <= 0) {
     return '0 B'
   }
-  const units = ['B', 'MiB', 'GiB']
+  const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB']
   let size = value
   let idx = 0
   while (size >= 1024 && idx < units.length - 1) {

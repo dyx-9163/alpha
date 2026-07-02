@@ -501,3 +501,5 @@
 - 结论：新增 AIFAR 制品批量包更新入口，接受 `aifar-alpha-jars-*.zip`，读取 `manifest.json` 后按服务串行复用现有 partial release 更新链路；每个服务仍生成可回滚的 release 记录，任务步骤按服务名前缀区分，前端更新弹窗新增“单服务/批量包”模式。
 - 问题：用户上传 AIFAR 批量制品包时页面只提示 `Failed to fetch`。
 - 结论：批量 JAR zip 可能超过原 512MiB 请求体限制或后端未重启导致连接中断；默认 `AIFAR_MAX_REQUEST_BODY_BYTES` 提升到 2GiB，前端提交前按 `/settings` 实际限制检查文件大小，浏览器网络错误改为中文排查提示，后端 multipart 超限返回结构化 413。
+- 问题：用户上传 AIFAR 批量 JAR 包时页面提示 `2239.2 GiB` 超过 `2048.0 GiB` 限制。
+- 结论：前端文件大小展示少了 KiB 单位层导致数值被放大 1024 倍，已修正为 B/KiB/MiB/GiB/TiB；批量包实际约 2.2 GiB，默认 `AIFAR_MAX_REQUEST_BODY_BYTES` 提升到 4 GiB，需重启后端或更新运行环境变量后生效。
