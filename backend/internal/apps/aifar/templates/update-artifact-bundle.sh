@@ -309,6 +309,26 @@ retag_service() {
   set_env APP_CONTAINER_NAME "$(service_container_name "$rs_service")" "$service_env"
 }
 
+patch_compose_service_release() {
+  pcs_service="$1"
+  pcs_image="$(read_env_value "$ENV_DIR/$pcs_service.env" APP_IMAGE "")"
+  pcs_container="$(read_env_value "$ENV_DIR/$pcs_service.env" APP_CONTAINER_NAME "")"
+  [ -n "$pcs_image" ] || fail "service image is empty: $pcs_service"
+  [ -n "$pcs_container" ] || fail "service container name is empty: $pcs_service"
+  pcs_tmp="$RELEASE_DIR/compose.yaml.tmp"
+  awk -v svc="$pcs_service" -v image="$pcs_image" -v container="$pcs_container" -v release="$RELEASE_ID" -v project="$COMPOSE_PROJECT_NAME" '
+    function service_header(line) { return line ~ /^  [A-Za-z0-9_-]+:$/ }
+    $0 == "  " svc ":" { in_service=1; print; next }
+    in_service && service_header($0) { in_service=0 }
+    in_service && $0 ~ /^    image:/ { print "    image: " image; next }
+    in_service && $0 ~ /^    container_name:/ { print "    container_name: " container; next }
+    in_service && $0 ~ /^      aifar\.release:/ { print "      aifar.release: \"" release "\""; next }
+    in_service && $0 ~ /^      aifar\.compose-project:/ { print "      aifar.compose-project: \"" project "\""; next }
+    { print }
+  ' "$RELEASE_DIR/compose.yaml" > "$pcs_tmp"
+  mv "$pcs_tmp" "$RELEASE_DIR/compose.yaml"
+}
+
 ensure_network() {
   network="$(read_env_value "$ENV_DIR/compose.env" AIFAR_INGRESS_NETWORK "$INGRESS_NETWORK")"
   docker network inspect "$network" >/dev/null 2>&1 || docker network create --driver bridge "$network" >/dev/null
@@ -492,7 +512,7 @@ start_service() {
     cd "$RELEASE_DIR"
     APP_RESTART_POLICY=no
     export APP_RESTART_POLICY
-    compose --env-file env/compose.env -f compose.yaml up -d --build "$service"
+    compose --env-file env/compose.env -f compose.yaml up -d --build --no-deps "$service"
   )
 }
 
@@ -574,7 +594,7 @@ rollback_changed_services() {
     echo "rolling back $service to previous AIFAR release: $previous"
     (
       cd "$previous"
-      compose --env-file env/compose.env -f compose.yaml up -d "$service" || true
+      compose --env-file env/compose.env -f compose.yaml up -d --no-deps "$service" || true
     )
   done
 }
@@ -743,6 +763,7 @@ write_partial_compose_env
 for service in $CHANGED_SERVICES; do
   apply_service_artifact "$service"
   retag_service "$service"
+  patch_compose_service_release "$service"
 done
 
 write_manifest "pending" "$BASE_RELEASE_ID"
