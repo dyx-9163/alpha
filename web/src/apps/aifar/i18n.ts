@@ -19,7 +19,7 @@ export const aifarMessages = {
     sourceLabel: 'Docker Compose 离线包',
     description: '基于 resources/aifar/docker-apps 离线包部署 AIFAR 微服务。',
     installTitle: '安装 AIFAR 服务',
-    hint: '目标服务器需要先安装 Docker Engine 和 Docker Compose；可选择已部署 Nacos/MySQL/Redis/MinIO，连接参数会写入服务环境变量。勾选初始化 SQL 时，目标服务器还需要 mysql 客户端。',
+    hint: '目标服务器需要先安装 Docker Engine 和 Docker Compose；选择已部署的 Nacos/MySQL/Redis/MinIO 后，安装器只做依赖预检和启动必需配置，业务配置请在 Nacos 中维护。',
     version: '版本',
     versionPlaceholder: '选择 docker-apps 资源包',
     servers: '目标服务器',
@@ -103,7 +103,7 @@ export const aifarMessages = {
     sourceLabel: 'Docker Compose bundle',
     description: 'Deploy AIFAR microservices from the resources/aifar/docker-apps offline bundle.',
     installTitle: 'Install AIFAR Service',
-    hint: 'Target server must already have Docker Engine and Docker Compose. Deployed Nacos/MySQL/Redis/MinIO instances can be selected and connection settings are written to service environment variables. SQL initialization also requires mysql client on the target server.',
+    hint: 'Target server must already have Docker Engine and Docker Compose. Select deployed Nacos/MySQL/Redis/MinIO instances for dependency checks and bootstrap only; keep business runtime configuration in Nacos.',
     version: 'Version',
     versionPlaceholder: 'Select docker-apps bundle',
     servers: 'Target server',
@@ -227,19 +227,6 @@ export function aifarInstallDialogProps(locale?: string, context?: AppInstallDia
     targetServerFilter: (server, filterContext) => dockerReadyServerIds(filterContext).has(server.id),
     copy: dialogCopy,
     fields: [
-      requiredText('timezone', copy.timezone, 'system', copy),
-      {
-        ...requiredText('networkName', copy.networkName, 'aifar-network', copy),
-        validate: (value) => {
-          const text = String(value ?? '').trim()
-          if (!text) {
-            return copy.textRequired
-          }
-          return /\s/.test(text) ? copy.networkInvalid : undefined
-        }
-      },
-      requiredText('appCPUs', copy.appCPUs, '2.0', copy),
-      requiredText('appMemoryLimit', copy.appMemoryLimit, '2GB', copy),
       selectField('nacosSource', copy.nacosSource, [
         { label: copy.nacosSourceExisting, value: 'existing', disabled: nacosOptions.length === 0 },
         { label: copy.nacosSourceManual, value: 'manual' }
@@ -252,7 +239,10 @@ export function aifarInstallDialogProps(locale?: string, context?: AppInstallDia
         ...requiredText('nacosHost', copy.nacosHost, '', copy),
         visibleWhen: sourceIsNot('nacosSource', 'existing')
       },
-      portField('nacosPort', copy.nacosPort, 8848, copy),
+      {
+        ...portField('nacosPort', copy.nacosPort, 8848, copy),
+        visibleWhen: sourceIsNot('nacosSource', 'existing')
+      },
       selectField('nacosCredentialId', copy.nacosCredential, credentialOptions(context, 'nacos', copy.nacosCredentialManual), '', copy, copy.nacosCredentialPlaceholder, false),
       {
         ...requiredText('nacosUser', copy.nacosUser, 'nacos', copy),
@@ -263,7 +253,6 @@ export function aifarInstallDialogProps(locale?: string, context?: AppInstallDia
         type: 'password',
         visibleWhen: (values) => !values.nacosCredentialId
       },
-      requiredText('nacosNamespace', copy.nacosNamespace, 'prod', copy),
       selectField('dbSource', copy.dbSource, [
         { label: copy.dbSourceExisting, value: 'existing', disabled: mysqlOptions.length === 0 },
         { label: copy.dbSourceManual, value: 'manual' }
@@ -279,17 +268,6 @@ export function aifarInstallDialogProps(locale?: string, context?: AppInstallDia
       {
         ...portField('dbPort', copy.dbPort, 3306, copy),
         visibleWhen: sourceIsNot('dbSource', 'existing')
-      },
-      requiredText('dbNameNacos', copy.dbNameNacos, 'aifar_nacos', copy),
-      selectField('dbCredentialId', copy.dbCredential, credentialOptions(context, 'mysql', copy.dbCredentialManual), '', copy, copy.dbCredentialPlaceholder, false),
-      {
-        ...requiredText('dbUser', copy.dbUser, 'root', copy),
-        visibleWhen: (values) => !values.dbCredentialId
-      },
-      {
-        ...requiredText('dbPassword', copy.dbPassword, '', copy),
-        type: 'password',
-        visibleWhen: (values) => !values.dbCredentialId
       },
       selectField('redisSource', copy.redisSource, [
         { label: copy.redisSourceExisting, value: 'existing', disabled: redisOptions.length === 0 },
@@ -307,102 +285,17 @@ export function aifarInstallDialogProps(locale?: string, context?: AppInstallDia
         ...portField('redisPort', copy.redisPort, 6379, copy),
         visibleWhen: sourceIsNot('redisSource', 'existing')
       },
-      {
-        name: 'redisCredentialId',
-        label: copy.redisCredential,
-        type: 'select',
-        defaultValue: '',
-        placeholder: copy.redisCredentialPlaceholder,
-        options: credentialOptions(context, 'redis', copy.redisCredentialManual)
-      },
-      {
-        name: 'redisPassword',
-        label: copy.redisPassword,
-        type: 'password',
-        defaultValue: '',
-        visibleWhen: (values) => !values.redisCredentialId
-      },
-      {
-        name: 'redisDatabase',
-        label: copy.redisDatabase,
-        type: 'number',
-        defaultValue: 1,
-        required: true,
-        min: 0,
-        max: 15,
-        step: 1,
-        validate: (value) => {
-          const database = Number(value)
-          return Number.isInteger(database) && database >= 0 && database <= 15 ? undefined : copy.textRequired
-        }
-      },
-      {
-        name: 'minioEnableStorage',
-        label: copy.minioEnableStorage,
-        type: 'switch',
-        defaultValue: true
-      },
-      {
-        ...selectField('minioSource', copy.minioSource, [
-          { label: copy.minioSourceExisting, value: 'existing', disabled: minioOptions.length === 0 },
-          { label: copy.minioSourceManual, value: 'manual' }
-        ], minioSourceDefault, copy),
-        visibleWhen: valueTruthy('minioEnableStorage')
-      },
+      selectField('minioSource', copy.minioSource, [
+        { label: copy.minioSourceExisting, value: 'existing', disabled: minioOptions.length === 0 },
+        { label: copy.minioSourceManual, value: 'manual' }
+      ], minioSourceDefault, copy),
       {
         ...selectField('minioInstanceId', copy.minioInstance, minioSelectOptions, minioOptions[0]?.value ?? '', copy, copy.minioInstancePlaceholder),
-        visibleWhen: enabledSourceIs('minioEnableStorage', 'minioSource', 'existing')
+        visibleWhen: sourceIs('minioSource', 'existing')
       },
       {
         ...requiredText('minioEndpoint', copy.minioEndpoint, '', copy),
-        visibleWhen: enabledSourceIsNot('minioEnableStorage', 'minioSource', 'existing')
-      },
-      {
-        ...requiredText('minioPlatform', copy.minioPlatform, 'minio-1', copy),
-        visibleWhen: valueTruthy('minioEnableStorage')
-      },
-      {
-        name: 'minioCredentialId',
-        label: copy.minioCredential,
-        type: 'select',
-        defaultValue: '',
-        placeholder: copy.minioCredentialPlaceholder,
-        options: credentialOptions(context, 'minio', copy.minioCredentialManual),
-        visibleWhen: valueTruthy('minioEnableStorage')
-      },
-      {
-        ...requiredText('minioAccessKey', copy.minioAccessKey, '', copy),
-        type: 'password',
-        visibleWhen: allVisible(valueTruthy('minioEnableStorage'), (values) => !values.minioCredentialId)
-      },
-      {
-        ...requiredText('minioSecretKey', copy.minioSecretKey, '', copy),
-        type: 'password',
-        visibleWhen: allVisible(valueTruthy('minioEnableStorage'), (values) => !values.minioCredentialId)
-      },
-      {
-        ...requiredText('minioBucketName', copy.minioBucketName, 'aifar', copy),
-        visibleWhen: valueTruthy('minioEnableStorage')
-      },
-      {
-        name: 'minioDomain',
-        label: copy.minioDomain,
-        type: 'text',
-        defaultValue: '',
-        visibleWhen: valueTruthy('minioEnableStorage')
-      },
-      {
-        name: 'minioBasePath',
-        label: copy.minioBasePath,
-        type: 'text',
-        defaultValue: '',
-        visibleWhen: valueTruthy('minioEnableStorage')
-      },
-      {
-        name: 'initSql',
-        label: copy.initSql,
-        type: 'switch',
-        defaultValue: false
+        visibleWhen: sourceIsNot('minioSource', 'existing')
       }
     ]
   }
@@ -468,22 +361,6 @@ function sourceIs(name: string, value: string) {
 
 function sourceIsNot(name: string, value: string) {
   return (values: AppInstallFieldValues) => values[name] !== value
-}
-
-function valueTruthy(name: string) {
-  return (values: AppInstallFieldValues) => values[name] !== false
-}
-
-function enabledSourceIs(enabledName: string, sourceName: string, value: string) {
-  return (values: AppInstallFieldValues) => values[enabledName] !== false && values[sourceName] === value
-}
-
-function enabledSourceIsNot(enabledName: string, sourceName: string, value: string) {
-  return (values: AppInstallFieldValues) => values[enabledName] !== false && values[sourceName] !== value
-}
-
-function allVisible(...checks: Array<(values: AppInstallFieldValues) => boolean>) {
-  return (values: AppInstallFieldValues) => checks.every((check) => check(values))
 }
 
 function credentialOptions(context: AppInstallDialogContext | undefined, kind: string, manualLabel: string): AppInstallFieldOption[] {

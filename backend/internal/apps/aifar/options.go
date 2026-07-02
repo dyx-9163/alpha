@@ -208,14 +208,16 @@ func (o InstallOptions) Validate() error {
 	if strings.TrimSpace(o.DBHost) == "" {
 		return fmt.Errorf("database host is required")
 	}
-	if strings.TrimSpace(o.DBUser) == "" {
-		return fmt.Errorf("database user is required")
-	}
-	if strings.TrimSpace(o.DBPassword) == "" {
-		return fmt.Errorf("database password is required")
-	}
-	if strings.TrimSpace(o.DBNameNacos) == "" {
-		return fmt.Errorf("nacos database name is required")
+	if o.InitSQL {
+		if strings.TrimSpace(o.DBUser) == "" {
+			return fmt.Errorf("database user is required")
+		}
+		if strings.TrimSpace(o.DBPassword) == "" {
+			return fmt.Errorf("database password is required")
+		}
+		if strings.TrimSpace(o.DBNameNacos) == "" {
+			return fmt.Errorf("nacos database name is required")
+		}
 	}
 	if o.NacosSource == dependencyExisting && strings.TrimSpace(o.NacosInstanceID) == "" {
 		return fmt.Errorf("nacos instance is required")
@@ -235,18 +237,6 @@ func (o InstallOptions) Validate() error {
 	if o.MinioEnableStorage {
 		if strings.TrimSpace(o.MinioEndpoint) == "" {
 			return fmt.Errorf("minio endpoint is required")
-		}
-		if strings.TrimSpace(o.MinioAccessKey) == "" {
-			return fmt.Errorf("minio access key is required")
-		}
-		if strings.TrimSpace(o.MinioSecretKey) == "" {
-			return fmt.Errorf("minio secret key is required")
-		}
-		if strings.TrimSpace(o.MinioBucketName) == "" {
-			return fmt.Errorf("minio bucket name is required")
-		}
-		if strings.TrimSpace(o.MinioPlatform) == "" {
-			return fmt.Errorf("minio platform is required")
 		}
 	}
 	if !validPort(o.DBPort) || !validPort(o.RedisPort) || !validPort(o.GatewayPort) || !validPort(o.WebPort) || !validPort(o.NacosWebPort) || !validPort(o.NacosAPIPort) {

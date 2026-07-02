@@ -169,31 +169,6 @@ export function redisInstallDialogProps(locale?: string, context?: AppInstallDia
         validate: (value) => stringArray(value).length >= 3 ? undefined : copy.sentinelServersRequired
       },
       {
-        name: 'port',
-        label: copy.port,
-        type: 'number',
-        defaultValue: 6379,
-        required: true
-      },
-      {
-        name: 'sentinelPort',
-        label: copy.sentinelPort,
-        type: 'number',
-        defaultValue: 26379,
-        required: true,
-        visibleWhen: (values) => values.topology === 'sentinel'
-      },
-      {
-        name: 'masterName',
-        label: copy.sentinelMasterName,
-        type: 'text',
-        defaultValue: 'aifar-master',
-        placeholder: copy.sentinelMasterNamePlaceholder,
-        required: true,
-        visibleWhen: (values) => values.topology === 'sentinel',
-        validate: (value) => /^[A-Za-z0-9_.-]{1,64}$/.test(String(value ?? '').trim()) ? undefined : copy.sentinelMasterNameInvalid
-      },
-      {
         name: 'replicas',
         label: copy.replicas,
         type: 'number',

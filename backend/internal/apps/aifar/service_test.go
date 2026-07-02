@@ -186,15 +186,11 @@ func TestServiceInstallsAIFARServiceFromDockerAppsBundle(t *testing.T) {
 		ServerID: "srv-1",
 		Language: "en",
 		Parameters: map[string]any{
-			"dbHost":         "10.0.0.20",
-			"dbPort":         3306,
-			"dbUser":         "root",
-			"dbPassword":     "secret-value",
-			"nacosHost":      "10.0.0.50",
-			"webPort":        18080,
-			"minioEndpoint":  "http://10.0.0.60:9000",
-			"minioAccessKey": "aifar-file",
-			"minioSecretKey": "minio-secret",
+			"dbHost":        "10.0.0.20",
+			"dbPort":        3306,
+			"nacosHost":     "10.0.0.50",
+			"webPort":       18080,
+			"minioEndpoint": "http://10.0.0.60:9000",
 		},
 	}, []store.Resource{{App: "aifar", Part: "backend", Version: "docker-apps", Path: filepath.Join(root, "docker-apps", ".env")}}, fakeLogger{}, nil)
 	if err != nil {
@@ -413,17 +409,11 @@ func TestServiceResolvesManagedDatabaseAndRedisInstances(t *testing.T) {
 		Parameters: map[string]any{
 			"dbSource":        "existing",
 			"dbInstanceId":    "mysql-node-1",
-			"dbNameNacos":     "aifar_cloud_nacos",
-			"dbUser":          "root",
-			"dbPassword":      "secret-value",
 			"nacosHost":       "10.0.0.50",
 			"redisSource":     "existing",
 			"redisInstanceId": "redis-node-1",
-			"redisPassword":   "redis-secret",
 			"minioSource":     "existing",
 			"minioInstanceId": "minio-node-1",
-			"minioAccessKey":  "aifar-file",
-			"minioSecretKey":  "minio-secret",
 		},
 	}, []store.Resource{{App: "aifar", Part: "backend", Version: "docker-apps", Path: filepath.Join(root, "docker-apps", ".env")}}, fakeLogger{}, nil)
 	if err != nil {
@@ -500,14 +490,9 @@ func TestServiceResolvesManagedNacosInstance(t *testing.T) {
 		Parameters: map[string]any{
 			"nacosSource":     "existing",
 			"nacosInstanceId": "nacos-node-1",
-			"nacosPort":       8848,
 			"dbHost":          "10.0.0.20",
 			"dbPort":          3306,
-			"dbUser":          "root",
-			"dbPassword":      "secret-value",
 			"minioEndpoint":   "http://10.0.0.60:9000",
-			"minioAccessKey":  "aifar-file",
-			"minioSecretKey":  "minio-secret",
 		},
 	}, []store.Resource{{App: "aifar", Part: "backend", Version: "docker-apps", Path: filepath.Join(root, "docker-apps", ".env")}}, fakeLogger{}, nil)
 	if err != nil {
@@ -530,12 +515,13 @@ func TestServiceResolvesManagedNacosInstance(t *testing.T) {
 	if metadata["nacosSource"] != "existing" || metadata["nacosInstanceId"] != "nacos-node-1" {
 		t.Fatalf("expected managed Nacos source metadata, got %s", instance.Metadata)
 	}
-	if metadata["nacosHost"] != "10.0.0.50" || int(metadata["nacosPort"].(float64)) != 8848 || metadata["nacosEndpoint"] != "10.0.0.50:8848" {
-		t.Fatalf("expected selected Nacos host with overridden port, got %s", instance.Metadata)
+	if metadata["nacosHost"] != "10.0.0.50" || int(metadata["nacosPort"].(float64)) != 9849 || metadata["nacosEndpoint"] != "10.0.0.50:9849" || int(metadata["nacosApiPort"].(float64)) != 10849 {
+		t.Fatalf("expected selected Nacos host and ports from instance metadata, got %s", instance.Metadata)
 	}
 	for _, want := range []string{
 		"NACOS_CONNECT_HOST='10.0.0.50'",
-		"NACOS_PORT_WEB='8848'",
+		"NACOS_PORT_WEB='9849'",
+		"NACOS_PORT_API='10849'",
 		`set_env NACOS_HOST "${NACOS_CONNECT_HOST}:${NACOS_PORT_WEB}" "$common_env"`,
 	} {
 		if !strings.Contains(remote.installScript, want) {
@@ -702,14 +688,10 @@ func aifarModuleValidationResources(root string) []store.Resource {
 
 func aifarModuleValidationParams() map[string]any {
 	return map[string]any{
-		"nacosHost":      "10.0.0.50",
-		"dbHost":         "10.0.0.20",
-		"dbPort":         3306,
-		"dbUser":         "root",
-		"dbPassword":     "secret-value",
-		"minioEndpoint":  "http://10.0.0.60:9000",
-		"minioAccessKey": "aifar-file",
-		"minioSecretKey": "minio-secret",
+		"nacosHost":     "10.0.0.50",
+		"dbHost":        "10.0.0.20",
+		"dbPort":        3306,
+		"minioEndpoint": "http://10.0.0.60:9000",
 	}
 }
 

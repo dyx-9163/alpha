@@ -60,6 +60,13 @@ func (s Service) resolveNacosDependency(options *InstallOptions, instances []sto
 		return fmt.Errorf("selected nacos instance has no usable endpoint")
 	}
 	options.NacosHost = endpoint.Host
+	options.NacosWebPort = endpoint.Port
+	metadata := metadataFromInstance(selected)
+	if grpcPort := intFromMetadata(metadata, "grpcPort", 0); validPort(grpcPort) {
+		options.NacosAPIPort = grpcPort
+	} else if validPort(endpoint.Port + 1000) {
+		options.NacosAPIPort = endpoint.Port + 1000
+	}
 	return nil
 }
 

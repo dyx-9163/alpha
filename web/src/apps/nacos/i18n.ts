@@ -172,19 +172,6 @@ export function nacosInstallDialogProps(locale?: string, context?: AppInstallDia
         validate: (value) => stringArray(value).length === 3 ? undefined : copy.clusterServersRequired
       },
       {
-        name: 'port',
-        label: copy.port,
-        type: 'number',
-        defaultValue: 8848,
-        min: 1,
-        max: 65535,
-        required: true,
-        validate: (value) => validPort(value) ? undefined : copy.portInvalid
-      },
-      requiredText('jvmXms', copy.jvmXms, '512m', copy),
-      requiredText('jvmXmx', copy.jvmXmx, '512m', copy),
-      requiredText('jvmXmn', copy.jvmXmn, '256m', copy),
-      {
         ...selectField('nacosCredentialId', copy.nacosCredential, credentialOptions(context, 'nacos', copy.nacosCredentialManual), '', copy, copy.nacosCredentialPlaceholder, false)
       },
       {
@@ -214,10 +201,6 @@ export function nacosInstallDialogProps(locale?: string, context?: AppInstallDia
       {
         ...portField('dbPort', copy.dbPort, 3306, copy),
         visibleWhen: sourceIs('dbSource', 'manual')
-      },
-      {
-        ...requiredText('dbName', copy.dbName, 'aifar_nacos', copy),
-        visibleWhen: sourceIsNot('dbSource', 'local')
       },
       {
         ...selectField('dbCredentialId', copy.dbCredential, credentialOptions(context, 'mysql', copy.dbCredentialManual), '', copy, copy.dbCredentialPlaceholder, false),

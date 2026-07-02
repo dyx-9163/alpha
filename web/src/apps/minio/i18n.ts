@@ -155,20 +155,6 @@ export function minioInstallDialogProps(locale?: string, context?: AppInstallDia
         ]
       },
       {
-        name: 'apiPort',
-        label: copy.apiPort,
-        type: 'number',
-        defaultValue: 9000,
-        required: true
-      },
-      {
-        name: 'consolePort',
-        label: copy.consolePort,
-        type: 'number',
-        defaultValue: 9001,
-        required: true
-      },
-      {
         name: 'replicationBuckets',
         label: copy.replicationBuckets,
         type: 'text',

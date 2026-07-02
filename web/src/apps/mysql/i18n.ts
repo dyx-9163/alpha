@@ -141,13 +141,6 @@ export function mysqlInstallDialogProps(locale?: string, context?: AppInstallDia
         validate: (value) => stringArray(value).length >= 3 ? undefined : copy.clusterServersRequired
       },
       {
-        name: 'clusterName',
-        label: copy.clusterName,
-        type: 'text',
-        defaultValue: 'aifarCluster',
-        visibleWhen: (values) => values.topology === 'innodb-cluster'
-      },
-      {
         name: 'installRouter',
         label: copy.installRouter,
         type: 'switch',
@@ -164,30 +157,6 @@ export function mysqlInstallDialogProps(locale?: string, context?: AppInstallDia
         visibleWhen: (values) => values.topology === 'innodb-cluster' && values.installRouter !== false,
         optionsResolver: (_values, context) => serverOptions(context.servers),
         validate: (value, values) => values.installRouter === false || stringArray(value).length > 0 ? undefined : copy.routerServersRequired
-      },
-      {
-        name: 'routerBasePort',
-        label: copy.routerBasePort,
-        type: 'number',
-        defaultValue: 6446,
-        min: 1,
-        max: 65532,
-        required: true,
-        visibleWhen: (values) => values.topology === 'innodb-cluster' && values.installRouter !== false,
-        validate: (value, values) => {
-          if (values.installRouter === false) {
-            return undefined
-          }
-          const port = Number(value)
-          return Number.isInteger(port) && port >= 1 && port <= 65532 ? undefined : copy.routerBasePortInvalid
-        }
-      },
-      {
-        name: 'port',
-        label: copy.port,
-        type: 'number',
-        defaultValue: 3306,
-        required: true
       },
       {
         name: 'rootCredentialId',

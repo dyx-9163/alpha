@@ -477,3 +477,5 @@
 - 结论：Spring Boot 会将容器环境变量以 relaxed binding 映射为配置属性，例如 `SPRING_DATA_REDIS_SENTINEL_NODES` -> `spring.data.redis.sentinel.nodes`；环境变量通常优先级高于 Nacos 配置中心。只要 sentinel nodes 存在，Redisson 自动配置会选择 Sentinel 模式，即使 Nacos 中也存在 standalone host/port。
 - 问题：用户要求去掉 AIFAR 安装脚本中多余的 Java 容器环境变量，以便自行在 Nacos 中配置数据库、Redis、MinIO 等业务配置。
 - 结论：`write_java_env` 已收敛为只写 `TZ`、Nacos 连接信息和 Nacos 密码，不再注入 `SPRING_DATA_REDIS_*`、`SPRING_DATASOURCE_*`、`DROMARA_X_FILE_STORAGE_*`、`AIFAR_DB_*`、`AIFAR_REDIS_*`、`AIFAR_MINIO_*`；安装参数仍用于依赖预检和实例元数据。验证通过：`go test ./internal/apps/aifar`、`pnpm test`、`git diff --check`。
+- 问题：用户要求清理 AIFAR 安装弹窗及其他模块部署中无用或固定配置项，避免固定配置继续暴露给用户填写。
+- 结论：AIFAR 弹窗只保留目标服务器、Nacos/MySQL/Redis/MinIO 来源/实例/手动地址与 Nacos 凭据；移除时区、网络、CPU/内存、Nacos 命名空间、DB/Redis/MinIO 业务凭据、Redis DB、MinIO bucket/domain/basePath、初始化 SQL 等固定或由 Nacos 管理的字段；Nacos/MySQL/Redis/MinIO 模块也移除端口/JVM/集群名/默认服务端口等固定项。AIFAR 后端同步放松业务凭据校验，已部署 Nacos 会从实例元数据解析端口。验证通过：`go test ./internal/apps/aifar`、`pnpm web:build`、`pnpm test`、`git diff --check`。
