@@ -14,6 +14,10 @@ RELEASE_ID={{ quote .ReleaseID }}
 CREATED_AT={{ quote .CreatedAt }}
 CONFIG_HASH={{ quote .ConfigHash }}
 RELEASE_KEEP_COUNT={{ .ReleaseKeepCount }}
+COMPOSE_PROJECT_NAME={{ quote .ComposeProject }}
+INGRESS_NETWORK={{ quote .IngressNetwork }}
+INTERNAL_NETWORK={{ quote .InternalNetwork }}
+INGRESS_CONTAINER={{ quote .IngressContainer }}
 
 RELEASES_DIR="$INSTALL_ROOT/releases"
 CURRENT_LINK="$INSTALL_ROOT/current"
@@ -21,6 +25,9 @@ RELEASE_DIR="$RELEASES_DIR/$RELEASE_ID"
 APP_DIR="$RELEASE_DIR/docker-apps"
 ENV_DIR="$RELEASE_DIR/env"
 AIFAR_DIR="$RELEASE_DIR/.aifar"
+INGRESS_DIR="$INSTALL_ROOT/ingress"
+INGRESS_CONFIG="$INGRESS_DIR/nginx.conf"
+INGRESS_CONFIG_BACKUP="$INGRESS_DIR/nginx.conf.previous"
 TMP_ARTIFACT_DIR="$INSTALL_ROOT/.partial-$RELEASE_ID-$$"
 
 fail() {
@@ -72,6 +79,10 @@ retag_image() {
     *:*) printf "%s:%s" "${image%:*}" "$RELEASE_ID" ;;
     *) printf "%s:%s" "$image" "$RELEASE_ID" ;;
   esac
+}
+
+service_container_name() {
+  printf "aifar-%s-%s" "$1" "$RELEASE_ID" | tr '. _/' '----'
 }
 
 current_release() {
@@ -160,6 +171,16 @@ copy_service_release_files() {
   fi
 }
 
+write_partial_compose_env() {
+  compose_env="$ENV_DIR/compose.env"
+  [ -f "$compose_env" ] || fail "compose env is missing: $compose_env"
+  set_env COMPOSE_PROJECT_NAME "$COMPOSE_PROJECT_NAME" "$compose_env"
+  set_env AIFAR_RELEASE_ID "$RELEASE_ID" "$compose_env"
+  set_env APP_NETWORK_NAME "$INGRESS_NETWORK" "$compose_env"
+  set_env AIFAR_INGRESS_NETWORK "$INGRESS_NETWORK" "$compose_env"
+  set_env AIFAR_INTERNAL_NETWORK "$INTERNAL_NETWORK" "$compose_env"
+}
+
 apply_java_artifact() {
   case "$ARTIFACT_FILE" in
     *.jar) ;;
@@ -228,16 +249,35 @@ retag_selected_service() {
   [ -f "$service_env" ] || fail "service env not found: $service_env"
   image="$(read_env_value "$service_env" APP_IMAGE "$(read_env_value "$source_env" APP_IMAGE "aifar-$SERVICE_NAME:latest")")"
   set_env APP_IMAGE "$(retag_image "$image")" "$service_env"
+  set_env APP_CONTAINER_NAME "$(service_container_name "$SERVICE_NAME")" "$service_env"
 }
 
 ensure_network() {
-  network="$(read_env_value "$ENV_DIR/compose.env" APP_NETWORK_NAME aifar-network)"
+  network="$(read_env_value "$ENV_DIR/compose.env" AIFAR_INGRESS_NETWORK "$INGRESS_NETWORK")"
   docker network inspect "$network" >/dev/null 2>&1 || docker network create --driver bridge "$network" >/dev/null
 }
 
 container_for_service() {
   service="$1"
   read_env_value "$ENV_DIR/$service.env" APP_CONTAINER_NAME ""
+}
+
+container_for_service_in_release() {
+  cf_release="$1"
+  cf_service="$2"
+  read_env_value "$cf_release/env/$cf_service.env" APP_CONTAINER_NAME ""
+}
+
+route_container_for_service() {
+  rc_service="$1"
+  if [ "$rc_service" = "$SERVICE_NAME" ]; then
+    container_for_service "$rc_service"
+    return
+  fi
+  rc_release="$(release_for_service "$rc_service" "$BASE_RELEASE" || true)"
+  if [ -n "$rc_release" ]; then
+    container_for_service_in_release "$rc_release" "$rc_service"
+  fi
 }
 
 container_status() {
@@ -305,6 +345,78 @@ wait_service_ready() {
   service_runtime_ready "$SERVICE_NAME"
 }
 
+write_ingress_config() {
+  mkdir -p "$INGRESS_DIR"
+  gateway_container="$(route_container_for_service gateway)"
+  web_container="$(route_container_for_service web-vue3)"
+  gateway_port="$(read_env_value "$ENV_DIR/compose.env" GATEWAY_PORT 38000)"
+  web_port="$(read_env_value "$ENV_DIR/compose.env" WEB_VUE3_PORT 8080)"
+  [ -n "$gateway_container" ] || fail "gateway route container is empty"
+  [ -n "$web_container" ] || fail "web-vue3 route container is empty"
+  tmp="$INGRESS_CONFIG.tmp"
+  cat > "$tmp" <<NGINX
+events {}
+http {
+  upstream aifar_gateway {
+    server ${gateway_container}:${gateway_port};
+  }
+  upstream aifar_web {
+    server ${web_container}:${web_port};
+  }
+  server {
+    listen ${gateway_port};
+    location / {
+      proxy_set_header Host \$host;
+      proxy_set_header X-Real-IP \$remote_addr;
+      proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+      proxy_set_header X-Forwarded-Proto \$scheme;
+      proxy_pass http://aifar_gateway;
+    }
+  }
+  server {
+    listen ${web_port};
+    location / {
+      proxy_set_header Host \$host;
+      proxy_set_header X-Real-IP \$remote_addr;
+      proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+      proxy_set_header X-Forwarded-Proto \$scheme;
+      proxy_pass http://aifar_web;
+    }
+  }
+}
+NGINX
+  mv "$tmp" "$INGRESS_CONFIG"
+}
+
+ingress_running() {
+  [ "$(docker inspect --format '{{ "{{" }}.State.Running{{ "}}" }}' "$INGRESS_CONTAINER" 2>/dev/null || echo false)" = "true" ]
+}
+
+reload_ingress() {
+  docker exec "$INGRESS_CONTAINER" nginx -t >/dev/null
+  docker exec "$INGRESS_CONTAINER" nginx -s reload >/dev/null
+}
+
+configure_ingress_if_needed() {
+  case "$SERVICE_NAME" in
+    gateway|web-vue3) ;;
+    *) return 0 ;;
+  esac
+  mkdir -p "$INGRESS_DIR"
+  if [ -f "$INGRESS_CONFIG" ]; then
+    cp "$INGRESS_CONFIG" "$INGRESS_CONFIG_BACKUP"
+  fi
+  write_ingress_config
+  if ingress_running && reload_ingress; then
+    return 0
+  fi
+  if [ -f "$INGRESS_CONFIG_BACKUP" ]; then
+    cp "$INGRESS_CONFIG_BACKUP" "$INGRESS_CONFIG"
+    reload_ingress || true
+  fi
+  return 1
+}
+
 apply_restart_policy_for_service() {
   policy="$(read_env_value "$ENV_DIR/compose.env" APP_RESTART_POLICY unless-stopped)"
   [ -n "$policy" ] || policy="unless-stopped"
@@ -319,6 +431,18 @@ start_updated_service() {
     APP_RESTART_POLICY=no
     export APP_RESTART_POLICY
     compose --env-file env/compose.env -f compose.yaml up -d --build "$SERVICE_NAME"
+  )
+}
+
+stop_service_in_release() {
+  ss_release="$1"
+  ss_service="$2"
+  [ -n "$ss_release" ] || return 0
+  [ -f "$ss_release/compose.yaml" ] || return 0
+  (
+    cd "$ss_release"
+    compose --env-file env/compose.env -f compose.yaml stop "$ss_service" >/dev/null 2>&1 || true
+    compose --env-file env/compose.env -f compose.yaml rm -f "$ss_service" >/dev/null 2>&1 || true
   )
 }
 
@@ -363,7 +487,17 @@ write_manifest() {
   "baseReleaseId": "$base_release_id",
   "createdAt": "$CREATED_AT",
   "releaseRetention": $RELEASE_KEEP_COUNT,
+  "composeProject": "$COMPOSE_PROJECT_NAME",
+  "ingressNetwork": "$INGRESS_NETWORK",
+  "internalNetwork": "$INTERNAL_NETWORK",
   "changedServices": ["$SERVICE_NAME"],
+  "containers": {
+    "$SERVICE_NAME": "$(container_for_service "$SERVICE_NAME")"
+  },
+  "routes": {
+    "gateway": {"container": "$(route_container_for_service gateway)", "port": $(read_env_value "$ENV_DIR/compose.env" GATEWAY_PORT 38000)},
+    "web-vue3": {"container": "$(route_container_for_service web-vue3)", "port": $(read_env_value "$ENV_DIR/compose.env" WEB_VUE3_PORT 8080)}
+  },
   "artifacts": {
     "$SERVICE_NAME": {
       "file": "$artifact_file_json",
@@ -442,6 +576,7 @@ rm -rf "$RELEASE_DIR" "$TMP_ARTIFACT_DIR"
 mkdir -p "$RELEASE_DIR" "$ENV_DIR" "$AIFAR_DIR"
 copy_shared_release_files "$BASE_RELEASE"
 copy_service_release_files "$SERVICE_BASE_RELEASE"
+write_partial_compose_env
 
 apply_artifact
 retag_selected_service
@@ -450,17 +585,27 @@ ensure_network
 
 if ! start_updated_service; then
   write_manifest "failed" "$BASE_RELEASE_ID"
+  stop_service_in_release "$RELEASE_DIR" "$SERVICE_NAME"
   rollback_service "$SERVICE_BASE_RELEASE"
   fail "AIFAR service $SERVICE_NAME failed to start in partial release $RELEASE_ID"
 fi
 
 if ! wait_service_ready; then
   write_manifest "failed" "$BASE_RELEASE_ID"
+  stop_service_in_release "$RELEASE_DIR" "$SERVICE_NAME"
   rollback_service "$SERVICE_BASE_RELEASE"
   fail "AIFAR service $SERVICE_NAME did not become stable in partial release $RELEASE_ID"
 fi
 
+if ! configure_ingress_if_needed; then
+  write_manifest "failed" "$BASE_RELEASE_ID"
+  stop_service_in_release "$RELEASE_DIR" "$SERVICE_NAME"
+  rollback_service "$SERVICE_BASE_RELEASE"
+  fail "AIFAR ingress switch failed for service $SERVICE_NAME in partial release $RELEASE_ID"
+fi
+
 apply_restart_policy_for_service
+stop_service_in_release "$SERVICE_BASE_RELEASE" "$SERVICE_NAME"
 write_manifest "success" "$BASE_RELEASE_ID"
 activate_release
 cleanup_old_releases

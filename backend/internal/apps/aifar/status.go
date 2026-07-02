@@ -19,6 +19,8 @@ type StatusResult struct {
 	TotalContainers     int
 	RunningContainers   int
 	UnhealthyContainers int
+	StaleContainers     int
+	IngressRunning      bool
 	Containers          []string
 }
 
@@ -63,7 +65,40 @@ INSTALL_ROOT_EXISTS="false"
 TOTAL=0
 RUNNING=0
 UNHEALTHY=0
+STALE=0
+INGRESS_RUNNING="false"
 CONTAINERS=""
+ACTIVE_RELEASE_IDS=""
+
+manifest_json_value() {
+  mjv_file="$1"
+  mjv_key="$2"
+  [ -f "$mjv_file" ] || return 1
+  awk -F\" -v key="$mjv_key" '$0 ~ "\"" key "\"[[:space:]]*:" {print $4; exit}' "$mjv_file" 2>/dev/null
+}
+
+release_by_id() {
+  rbi_id="$1"
+  [ -n "$rbi_id" ] || return 1
+  rbi_dir="$INSTALL_ROOT/` + releasesDirName + `/$rbi_id"
+  [ -d "$rbi_dir" ] || return 1
+  printf "%s" "$rbi_dir"
+}
+
+release_chain_ids() {
+  rci_dir="$1"
+  rci_seen=""
+  while [ -n "$rci_dir" ] && [ -d "$rci_dir" ]; do
+    rci_id="$(basename "$rci_dir")"
+    case " $rci_seen " in
+      *" $rci_id "*) break ;;
+    esac
+    rci_seen="$rci_seen $rci_id"
+    printf "%s\n" "$rci_id"
+    rci_base="$(manifest_json_value "$rci_dir/.aifar/manifest.json" baseReleaseId || true)"
+    rci_dir="$(release_by_id "$rci_base" || true)"
+  done
+}
 
 if [ -d "$INSTALL_ROOT" ]; then
   INSTALL_ROOT_EXISTS="true"
@@ -75,11 +110,16 @@ if [ -L "$CURRENT_LINK" ] || [ -d "$CURRENT_LINK" ]; then
   APP_DIR="$CURRENT_LINK/` + appBundleDir + `"
   ENV_DIR="$CURRENT_LINK/` + releaseEnvDirName + `"
   if [ -f "$CURRENT_LINK/.aifar/manifest.json" ]; then
-    RELEASE_ID="$(awk -F\" '/"releaseId"[[:space:]]*:/ {print $4; exit}' "$CURRENT_LINK/.aifar/manifest.json" 2>/dev/null || true)"
+    RELEASE_ID="$(manifest_json_value "$CURRENT_LINK/.aifar/manifest.json" releaseId || true)"
   fi
+  ACTIVE_RELEASE_IDS="$(release_chain_ids "$CURRENT_RELEASE" | tr '\n' ' ' || true)"
 fi
 
-if command -v docker >/dev/null 2>&1 && [ -d "$APP_DIR" ]; then
+if command -v docker >/dev/null 2>&1 && { [ -d "$APP_DIR" ] || [ -d "$ENV_DIR" ]; }; then
+  ingress_running="$(docker inspect -f '{{.State.Running}}' "` + ingressContainerName() + `" 2>/dev/null || echo false)"
+  if [ "$ingress_running" = "true" ]; then
+    INGRESS_RUNNING="true"
+  fi
   for service in ` + serviceOrderText() + `; do
     env_file="$ENV_DIR/$service.env"
     [ -f "$env_file" ] || env_file="$APP_DIR/$service/.env"
@@ -97,7 +137,22 @@ if command -v docker >/dev/null 2>&1 && [ -d "$APP_DIR" ]; then
       UNHEALTHY=$((UNHEALTHY + 1))
     fi
   done
-  if [ "$TOTAL" -gt 0 ] && [ "$RUNNING" -eq "$TOTAL" ] && [ "$UNHEALTHY" -eq 0 ]; then
+  if [ -n "$RELEASE_ID" ]; then
+    stale_lines="$(docker ps --filter "label=aifar.app=aifar" --filter "label=aifar.install-root=$INSTALL_ROOT" --format '{{.Names}}|{{.Label "aifar.release"}}' 2>/dev/null || true)"
+    if [ -n "$stale_lines" ]; then
+      while IFS='|' read -r stale_name stale_release; do
+        [ -n "$stale_name" ] || continue
+        [ "$stale_release" = "ingress" ] && continue
+        case " $ACTIVE_RELEASE_IDS " in
+          *" $stale_release "*) continue ;;
+        esac
+        STALE=$((STALE + 1))
+      done <<EOF
+$stale_lines
+EOF
+    fi
+  fi
+  if [ "$TOTAL" -gt 0 ] && [ "$RUNNING" -eq "$TOTAL" ] && [ "$UNHEALTHY" -eq 0 ] && [ "$INGRESS_RUNNING" = "true" ]; then
     STATUS="running"
   elif [ "$RUNNING" -gt 0 ]; then
     STATUS="degraded"
@@ -111,6 +166,8 @@ echo "releaseId=$RELEASE_ID"
 echo "totalContainers=$TOTAL"
 echo "runningContainers=$RUNNING"
 echo "unhealthyContainers=$UNHEALTHY"
+echo "staleContainers=$STALE"
+echo "ingressRunning=$INGRESS_RUNNING"
 echo "containers=$CONTAINERS"
 ` + "\nAIFAR_SERVICE_STATUS"
 }
@@ -137,6 +194,10 @@ func parseStatusOutput(output string) StatusResult {
 			result.RunningContainers = atoi(value)
 		case "unhealthyContainers":
 			result.UnhealthyContainers = atoi(value)
+		case "staleContainers":
+			result.StaleContainers = atoi(value)
+		case "ingressRunning":
+			result.IngressRunning = strings.EqualFold(strings.TrimSpace(value), "true")
 		case "containers":
 			result.Containers = parseContainers(value)
 		}

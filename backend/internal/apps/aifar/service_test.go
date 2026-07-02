@@ -321,7 +321,7 @@ func TestServiceInstallsAIFARServiceFromDockerAppsBundle(t *testing.T) {
 	if instance.App != "aifar" || instance.Version != "docker-apps" || instance.ServerID != "srv-1" || instance.Status != "installed" {
 		t.Fatalf("unexpected instance: %+v", instance)
 	}
-	if strings.Contains(instance.Metadata, "secret-value") || strings.Contains(instance.Metadata, "minio-secret") || strings.Contains(instance.Metadata, "aifar-file") {
+	if strings.Contains(instance.Metadata, "secret-value") || strings.Contains(instance.Metadata, "minio-secret") {
 		t.Fatalf("metadata must not store database password or MinIO credentials: %s", instance.Metadata)
 	}
 	metadata := map[string]any{}
@@ -333,6 +333,12 @@ func TestServiceInstallsAIFARServiceFromDockerAppsBundle(t *testing.T) {
 	}
 	if metadata["layout"] != releaseLayout || metadata["releaseId"] == "" || metadata["releaseRetention"].(float64) != releaseKeepCount {
 		t.Fatalf("expected release layout metadata, got %s", instance.Metadata)
+	}
+	if metadata["composeProject"] == "" || metadata["ingressContainer"] != ingressContainerName() || metadata["ingressNetwork"] != defaultNetworkName || metadata["internalNetwork"] == "" {
+		t.Fatalf("expected orchestration metadata, got %s", instance.Metadata)
+	}
+	if !strings.Contains(instance.Metadata, "aifar-gateway-") || !strings.Contains(instance.Metadata, "activeRoutes") {
+		t.Fatalf("expected active route metadata with release containers, got %s", instance.Metadata)
 	}
 	if len(s.releases) != 1 || s.releases[0].InstanceID != instance.ID || s.releases[0].Status != "success" {
 		t.Fatalf("expected one recorded release, got %+v", s.releases)
@@ -350,8 +356,29 @@ func TestServiceInstallsAIFARServiceFromDockerAppsBundle(t *testing.T) {
 	}
 	if !strings.Contains(remote.installScript, "ensure_network") ||
 		!strings.Contains(remote.installScript, "external: true") ||
-		!strings.Contains(remote.installScript, "name: ${APP_NETWORK_NAME}") {
+		!strings.Contains(remote.installScript, "name: ${AIFAR_INGRESS_NETWORK}") ||
+		!strings.Contains(remote.installScript, "name: ${AIFAR_INTERNAL_NETWORK}") {
 		t.Fatalf("AIFAR install script should create and use the shared Docker network as external:\n%s", remote.installScript)
+	}
+	for _, want := range []string{
+		`set_env COMPOSE_PROJECT_NAME "$COMPOSE_PROJECT_NAME" "$compose_env"`,
+		`set_env AIFAR_INTERNAL_NETWORK "$INTERNAL_NETWORK" "$compose_env"`,
+		`container="$(service_container_name "$service")"`,
+		`expose:`,
+		`aifar.release: "$RELEASE_ID"`,
+		`configure_ingress`,
+		`nginx -s reload`,
+	} {
+		if !strings.Contains(remote.installScript, want) {
+			t.Fatalf("AIFAR install script should include custom orchestration with %q:\n%s", want, remote.installScript)
+		}
+	}
+	if strings.Contains(remote.installScript, `      - "${GATEWAY_PORT}:${GATEWAY_PORT}"`) ||
+		strings.Contains(remote.installScript, `      - "${WEB_VUE3_PORT}:${WEB_VUE3_PORT}"`) {
+		t.Fatalf("AIFAR business services should not bind host ports directly:\n%s", remote.installScript)
+	}
+	if strings.Index(remote.installScript, "down_release \"$previous_release\"") < strings.Index(remote.installScript, "if ! start_release; then") {
+		t.Fatalf("AIFAR install script should start the new release before stopping the previous one:\n%s", remote.installScript)
 	}
 	if !strings.Contains(remote.installScript, "resolve_system_timezone") || !strings.Contains(remote.installScript, "timedatectl show -p Timezone") {
 		t.Fatalf("AIFAR install script should resolve system timezone:\n%s", remote.installScript)
@@ -470,7 +497,7 @@ func TestServiceIgnoresBusinessDependencyParameters(t *testing.T) {
 	if instance.ID == "" {
 		t.Fatalf("expected AIFAR instance, got %+v", s.instances)
 	}
-	if strings.Contains(instance.Metadata, "secret-value") || strings.Contains(instance.Metadata, "redis-secret") || strings.Contains(instance.Metadata, "minio-secret") || strings.Contains(instance.Metadata, "aifar-file") {
+	if strings.Contains(instance.Metadata, "secret-value") || strings.Contains(instance.Metadata, "redis-secret") || strings.Contains(instance.Metadata, "minio-secret") {
 		t.Fatalf("metadata must not store database, redis, or minio credentials: %s", instance.Metadata)
 	}
 	metadata := map[string]any{}
@@ -579,11 +606,16 @@ func TestServiceUpdatesAIFARServiceArtifactAsPartialRelease(t *testing.T) {
 		`cfr_source="$1"`,
 		`csrf_source="$1"`,
 		`cp -a "$csrf_source/env/." "$ENV_DIR/"`,
+		`write_partial_compose_env`,
 		`apply_java_artifact`,
 		`retag_selected_service`,
+		`set_env APP_CONTAINER_NAME "$(service_container_name "$SERVICE_NAME")" "$service_env"`,
 		`compose --env-file env/compose.env -f compose.yaml up -d --build "$SERVICE_NAME"`,
+		`configure_ingress_if_needed`,
+		`stop_service_in_release "$SERVICE_BASE_RELEASE" "$SERVICE_NAME"`,
 		`rollback_service "$SERVICE_BASE_RELEASE"`,
 		`"kind": "partial"`,
+		`"composeProject": "$COMPOSE_PROJECT_NAME"`,
 		`"changedServices": ["$SERVICE_NAME"]`,
 	} {
 		if !strings.Contains(remote.updateScript, want) {
@@ -990,6 +1022,41 @@ func TestServiceChecksAIFARServiceAndUpdatesStatus(t *testing.T) {
 	}
 	if len(s.instances) != 1 || s.instances[0].Status != "degraded" || !strings.Contains(s.instances[0].Metadata, "aifar-gateway") {
 		t.Fatalf("expected status to be persisted: %+v", s.instances)
+	}
+}
+
+func TestParseStatusOutputIncludesIngressAndStaleContainers(t *testing.T) {
+	status := parseStatusOutput(strings.Join([]string{
+		"status=running",
+		"installRootExists=true",
+		"currentRelease=/aifar/apps/admin/current",
+		"releaseId=rel-new",
+		"totalContainers=2",
+		"runningContainers=2",
+		"unhealthyContainers=0",
+		"staleContainers=1",
+		"ingressRunning=true",
+		"containers=aifar-gateway-rel-new:true:healthy,aifar-web-vue3-rel-new:true:healthy,",
+	}, "\n"))
+	if status.Status != "running" || !status.IngressRunning || status.StaleContainers != 1 {
+		t.Fatalf("expected ingress and stale status fields, got %+v", status)
+	}
+	if len(status.Containers) != 2 {
+		t.Fatalf("expected parsed current containers, got %+v", status.Containers)
+	}
+}
+
+func TestStatusCommandExcludesPartialBaseChainFromStaleContainers(t *testing.T) {
+	command := statusCommand("/aifar/apps/admin")
+	for _, want := range []string{
+		"release_chain_ids",
+		"baseReleaseId",
+		`ACTIVE_RELEASE_IDS="$(release_chain_ids "$CURRENT_RELEASE" | tr '\n' ' ' || true)"`,
+		`case " $ACTIVE_RELEASE_IDS " in`,
+	} {
+		if !strings.Contains(command, want) {
+			t.Fatalf("status command should protect active partial release chain with %q:\n%s", want, command)
+		}
 	}
 }
 

@@ -505,3 +505,23 @@
 - 结论：前端文件大小展示少了 KiB 单位层导致数值被放大 1024 倍，已修正为 B/KiB/MiB/GiB/TiB；批量包实际约 2.2 GiB，默认 `AIFAR_MAX_REQUEST_BODY_BYTES` 提升到 4 GiB，需重启后端或更新运行环境变量后生效。
 - 问题：用户上传 `scripts/export-alpha-jars.ps1` 导出的批量包时报 `manifest` JSON 开头非法字符。
 - 结论：Windows PowerShell 5.1 的 `Set-Content -Encoding UTF8` 会给 `manifest.json` 写入 UTF-8 BOM，Go JSON 解析器拒绝该前缀；已改导出脚本写无 BOM JSON，同时后端读取 manifest 时兼容已有带 BOM 的旧包。
+- 问题：用户询问 Docker 是否有办法做滚动更新。
+- 结论：Docker Swarm 的 service 有原生 rolling update；单机 Docker Engine/Compose 没有真正控制器式滚动更新，AIFAR 当前 Compose/release 模型更适合做应用实例级新 release、健康检查、切流、保留旧 release 回滚，或在多副本/多节点场景按实例逐个替换。
+- 问题：用户追问不用 Docker Swarm 是否也能做滚动更新。
+- 结论：不用 Swarm 可以实现平台编排式滚动/蓝绿更新：单机单副本只能做先起新版本、健康检查、切流、停旧版本；多副本或多服务器可按实例逐个更新并失败回滚，但 Docker Compose 本身不提供完整滚动更新控制器。
+- 问题：用户询问建议 AIFAR 自己做滚动更新编排还是使用 Docker Swarm。
+- 结论：建议 AIFAR 当前阶段自己做 release 编排，不把 Swarm 作为核心依赖；Swarm 适合已有多节点服务调度、replica、routing mesh 诉求的场景，但会引入集群管理、网络和架构约束，且不天然解决当前 JAR/前端制品级更新、版本保留、审计和回滚模型。
+- 问题：用户追问 AIFAR 自己做能否达到滚动更新效果。
+- 结论：可以做到用户感知上的滚动/蓝绿更新效果：有多副本或多节点时逐个启动新 release、健康检查、切流、停止旧实例；单机单副本只能做到先起新版本并切流或短暂停机替换，无法实现严格意义的无损滚动。
+- 问题：用户询问如何让端口、容器名、网络和网关配置支持新旧版本共存。
+- 结论：核心是让宿主机只暴露稳定入口网关，业务容器不直接绑定固定宿主机端口；每个 release 使用唯一 Compose project/container name/labels，并接入共享 ingress 网络；网关或 Nacos 服务发现负责把流量从旧 release 切到新 release，切流成功后再停旧容器。
+- 问题：用户询问滚动/蓝绿发布设计中哪些资源应固定、哪些应动态。
+- 结论：固定的是应用实例 ID、部署根目录、外部访问入口、网关容器、共享 ingress 网络、Nacos 服务名和持久化数据卷；动态的是 releaseId、Compose project、业务容器名、release 内部网络、制品目录、镜像/标签、临时端口或内部路由目标、网关 upstream 指向和 current 指针。
+- 问题：用户从长期发展角度询问应自研发布编排还是使用 Docker Swarm，因为 Docker service 能力只在 Swarm 上。
+- 结论：建议 AIFAR 以自研 release 编排为主，并把运行后端抽象出来，当前先落 Compose/普通 Docker；Swarm 可作为未来可选 runtime backend。原因是 Swarm service 适合镜像级副本/滚动更新/调度，但会要求用户进入 Swarm 集群模型，且不直接覆盖 AIFAR 的离线 JAR/前端制品更新、版本保留、审计、Nacos 配置发布和实例级回滚需求。
+- 问题：用户确认是否从各方面都应直接用普通 Docker 并由 AIFAR 自定义编排。
+- 结论：明确建议主线采用普通 Docker/Compose + AIFAR 自定义 release 编排；AIFAR 负责安装、更新、健康检查、切流、回滚、审计和版本保留，Docker 只作为容器运行时。Swarm 不作为默认依赖，只保留未来可选适配空间。
+- 问题：用户要求创建新分支，专门做 Docker/Compose 自定义编排，不和其他功能混合修改。
+- 结论：已从当前工作树创建并切换到 `codex/custom-orchestration`，后续改动限定在自定义 release 编排、健康检查、切流、回滚和版本保留相关范围内。
+- 问题：用户要求在 `codex/custom-orchestration` 分支实现 AIFAR 自定义 Docker/Compose 发布编排方案。
+- 结论：已实现普通 Docker/Compose 下的 release 编排：业务容器使用动态 releaseId/project/container/internal network 和 labels，不再直接绑定宿主机端口；新增稳定 nginx ingress 绑定外部 gateway/web 端口并 reload 切流；安装和制品更新改为先启新 release/服务、健康检查、切 ingress/current、再停旧版本；状态检测识别 ingress 和链外旧容器，partial release 的 base chain 不误判 stale；release 保留策略保护最近 3 个成功 release 及 partial base 链。验证通过：`go test ./internal/apps/aifar ./internal/store ./internal/httpapi`、`pnpm test`、`git diff --check`。

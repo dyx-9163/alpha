@@ -2,6 +2,7 @@ package store
 
 import (
 	"database/sql"
+	"encoding/json"
 	"time"
 )
 
@@ -100,28 +101,44 @@ func (s *Store) DeleteOldAppReleases(instanceID string, keep int) (int, error) {
 	if keep < 1 {
 		keep = 1
 	}
-	rows, err := s.db.Query(`select id from app_releases where instance_id=? and status='success' order by activated_at desc, created_at desc`, instanceID)
+	rows, err := s.db.Query(`select id,release_id,coalesce(manifest_json,'') from app_releases where instance_id=? and status='success' order by activated_at desc, created_at desc`, instanceID)
 	if err != nil {
 		return 0, err
 	}
 	defer rows.Close()
-	var ids []string
+	type releaseRow struct {
+		id       string
+		release  string
+		manifest string
+	}
+	var rowsData []releaseRow
 	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
+		var row releaseRow
+		if err := rows.Scan(&row.id, &row.release, &row.manifest); err != nil {
 			return 0, err
 		}
-		ids = append(ids, id)
+		rowsData = append(rowsData, row)
 	}
 	if err := rows.Err(); err != nil {
 		return 0, err
 	}
-	if len(ids) <= keep {
+	if len(rowsData) <= keep {
 		return 0, nil
 	}
+	manifests := map[string]string{}
+	for _, row := range rowsData {
+		manifests[row.release] = row.manifest
+	}
+	protected := map[string]bool{}
+	for _, row := range rowsData[:keep] {
+		protectReleaseChain(row.release, manifests, protected)
+	}
 	deleted := 0
-	for _, id := range ids[keep:] {
-		res, err := s.db.Exec(`delete from app_releases where id=?`, id)
+	for _, row := range rowsData[keep:] {
+		if protected[row.release] {
+			continue
+		}
+		res, err := s.db.Exec(`delete from app_releases where id=?`, row.id)
 		if err != nil {
 			return deleted, err
 		}
@@ -130,4 +147,26 @@ func (s *Store) DeleteOldAppReleases(instanceID string, keep int) (int, error) {
 		}
 	}
 	return deleted, nil
+}
+
+func protectReleaseChain(releaseID string, manifests map[string]string, protected map[string]bool) {
+	seen := map[string]bool{}
+	for releaseID != "" {
+		if seen[releaseID] {
+			return
+		}
+		seen[releaseID] = true
+		protected[releaseID] = true
+		manifest := manifests[releaseID]
+		if manifest == "" {
+			return
+		}
+		var data struct {
+			BaseReleaseID string `json:"baseReleaseId"`
+		}
+		if err := json.Unmarshal([]byte(manifest), &data); err != nil {
+			return
+		}
+		releaseID = data.BaseReleaseID
+	}
 }

@@ -168,6 +168,10 @@ func (s Service) Install(ctx context.Context, req InstallRequest, resources []st
 	releaseTime := time.Now().UTC()
 	releaseID := newReleaseID(bundle.Version, releaseTime)
 	configHash := installConfigHash(options)
+	composeProject := composeProjectName(releaseID)
+	ingressNetwork := options.NetworkName
+	internalNetwork := releaseInternalNetworkName(releaseID)
+	ingressContainer := ingressContainerName()
 	workDir := installerkit.WorkDir(deployDir, AppName, bundle.Version, releaseTime)
 	installRoot := installRootFromDeployDir(deployDir)
 	archiveRemote := workDir + "/" + filepath.Base(archiveLocal)
@@ -197,6 +201,10 @@ func (s Service) Install(ctx context.Context, req InstallRequest, resources []st
 			CreatedAt:        releaseTime.Format(time.RFC3339),
 			ConfigHash:       configHash,
 			ReleaseKeepCount: releaseKeepCount,
+			ComposeProject:   composeProject,
+			IngressNetwork:   ingressNetwork,
+			InternalNetwork:  internalNetwork,
+			IngressContainer: ingressContainer,
 			Options:          options,
 		})
 		if err != nil {
@@ -255,7 +263,7 @@ func (s Service) Install(ctx context.Context, req InstallRequest, resources []st
 			return saveErr
 		}
 		if releases, ok := s.store.(releaseStore); ok {
-			manifest, _ := json.Marshal(releaseManifest(bundle.Version, releaseID, releaseTime, configHash))
+			manifest, _ := json.Marshal(releaseManifest(bundle.Version, releaseID, releaseTime, configHash, ingressNetwork, options.GatewayPort, options.WebPort))
 			if _, err := releases.SaveAppRelease(store.AppRelease{
 				InstanceID:   instance.ID,
 				App:          AppName,
@@ -288,7 +296,7 @@ func (s Service) Install(ctx context.Context, req InstallRequest, resources []st
 }
 
 func installMetadata(server store.Server, installRoot, version, releaseID string, releaseTime time.Time, configHash string, options InstallOptions) map[string]any {
-	return map[string]any{
+	metadata := map[string]any{
 		"installRoot":      installRoot,
 		"layout":           releaseLayout,
 		"currentRelease":   installRoot + "/" + currentLinkName,
@@ -314,24 +322,33 @@ func installMetadata(server store.Server, installRoot, version, releaseID string
 		"nacosApiPort":     options.NacosAPIPort,
 		"services":         serviceOrder,
 	}
+	for key, value := range releaseOrchestrationMetadata(installRoot, releaseID, options.NetworkName, options.GatewayPort, options.WebPort) {
+		metadata[key] = value
+	}
+	return metadata
 }
 
-func releaseManifest(version, releaseID string, releaseTime time.Time, configHash string) map[string]any {
-	return map[string]any{
+func releaseManifest(version, releaseID string, releaseTime time.Time, configHash, ingressNetwork string, gatewayPort, webPort int) map[string]any {
+	manifest := map[string]any{
 		"app":              AppName,
 		"version":          version,
 		"releaseId":        releaseID,
 		"layout":           releaseLayout,
+		"kind":             "full",
 		"status":           "success",
 		"configHash":       configHash,
 		"createdAt":        releaseTime.Format(time.RFC3339),
 		"releaseRetention": releaseKeepCount,
 		"services":         serviceOrder,
 	}
+	for key, value := range releaseManifestFields(releaseID, ingressNetwork, gatewayPort, webPort) {
+		manifest[key] = value
+	}
+	return manifest
 }
 
-func partialReleaseManifest(version, releaseID string, releaseTime time.Time, configHash, baseReleaseID string, artifact artifactInfo) map[string]any {
-	return map[string]any{
+func partialReleaseManifest(version, releaseID string, releaseTime time.Time, configHash, baseReleaseID, ingressNetwork string, gatewayPort, webPort int, artifact artifactInfo) map[string]any {
+	manifest := map[string]any{
 		"app":              AppName,
 		"version":          version,
 		"releaseId":        releaseID,
@@ -352,6 +369,10 @@ func partialReleaseManifest(version, releaseID string, releaseTime time.Time, co
 			},
 		},
 	}
+	for key, value := range releaseManifestFields(releaseID, ingressNetwork, gatewayPort, webPort) {
+		manifest[key] = value
+	}
+	return manifest
 }
 
 type artifactInfo struct {
@@ -388,6 +409,12 @@ func (s Service) UpdateArtifact(ctx context.Context, req ArtifactUpdateRequest, 
 	var releaseID string
 	var baseReleaseID string
 	var configHash string
+	var composeProject string
+	var ingressNetwork string
+	var internalNetwork string
+	var ingressContainer string
+	var gatewayPort int
+	var webPort int
 	var workDir string
 	var artifactRemote string
 	var scriptRemote string
@@ -408,6 +435,12 @@ func (s Service) UpdateArtifact(ctx context.Context, req ArtifactUpdateRequest, 
 		releaseTime = time.Now().UTC()
 		releaseID = newReleaseID("partial-"+artifact.ServiceName, releaseTime)
 		configHash = partialUpdateConfigHash(stringFromMetadata(metadata, "configHash", ""), artifact.ServiceName, artifact.FileName, artifact.SHA256)
+		composeProject = composeProjectName(releaseID)
+		ingressNetwork = stringFromMetadata(metadata, "ingressNetwork", stringFromMetadata(metadata, "networkName", defaultNetworkName))
+		internalNetwork = releaseInternalNetworkName(releaseID)
+		ingressContainer = stringFromMetadata(metadata, "ingressContainer", ingressContainerName())
+		gatewayPort = intFromMetadata(metadata, "gatewayPort", defaultGatewayPort)
+		webPort = intFromMetadata(metadata, "webPort", defaultWebPort)
 		deployDir := installerkit.RemoteDeployDir(req.Server.DeployDir)
 		workDir = installerkit.WorkDir(deployDir, AppName+"-"+artifact.ServiceName, version, releaseTime)
 		artifactRemote = workDir + "/" + installerkit.Sanitize(artifact.FileName)
@@ -448,6 +481,10 @@ func (s Service) UpdateArtifact(ctx context.Context, req ArtifactUpdateRequest, 
 			CreatedAt:        releaseTime.Format(time.RFC3339),
 			ConfigHash:       configHash,
 			ReleaseKeepCount: releaseKeepCount,
+			ComposeProject:   composeProject,
+			IngressNetwork:   ingressNetwork,
+			InternalNetwork:  internalNetwork,
+			IngressContainer: ingressContainer,
 		})
 		if err != nil {
 			return err
@@ -488,6 +525,9 @@ func (s Service) UpdateArtifact(ctx context.Context, req ArtifactUpdateRequest, 
 		metadata["releaseVersion"] = version
 		metadata["releaseCreatedAt"] = releaseTime.Format(time.RFC3339)
 		metadata["configHash"] = configHash
+		for key, value := range releaseOrchestrationMetadata(installRoot, releaseID, ingressNetwork, gatewayPort, webPort) {
+			metadata[key] = value
+		}
 		metadata["lastPartialUpdate"] = map[string]any{
 			"service":        artifact.ServiceName,
 			"artifactFile":   artifact.FileName,
@@ -507,7 +547,7 @@ func (s Service) UpdateArtifact(ctx context.Context, req ArtifactUpdateRequest, 
 			return err
 		}
 		if releases, ok := s.store.(releaseStore); ok {
-			manifest, _ := json.Marshal(partialReleaseManifest(version, releaseID, releaseTime, configHash, baseReleaseID, artifact))
+			manifest, _ := json.Marshal(partialReleaseManifest(version, releaseID, releaseTime, configHash, baseReleaseID, ingressNetwork, gatewayPort, webPort, artifact))
 			if _, err := releases.SaveAppRelease(store.AppRelease{
 				InstanceID:   saved.ID,
 				App:          AppName,
@@ -770,6 +810,8 @@ func (s Service) Check(ctx context.Context, req CheckRequest, log Logger, target
 		"totalContainers":     status.TotalContainers,
 		"runningContainers":   status.RunningContainers,
 		"unhealthyContainers": status.UnhealthyContainers,
+		"staleContainers":     status.StaleContainers,
+		"ingressRunning":      status.IngressRunning,
 		"containers":          status.Containers,
 	}
 	if err := step(2, func() error {
@@ -805,6 +847,10 @@ type installScriptData struct {
 	CreatedAt        string
 	ConfigHash       string
 	ReleaseKeepCount int
+	ComposeProject   string
+	IngressNetwork   string
+	InternalNetwork  string
+	IngressContainer string
 	Options          InstallOptions
 }
 
@@ -828,6 +874,10 @@ type updateScriptData struct {
 	CreatedAt        string
 	ConfigHash       string
 	ReleaseKeepCount int
+	ComposeProject   string
+	IngressNetwork   string
+	InternalNetwork  string
+	IngressContainer string
 }
 
 func renderInstallScript(data installScriptData) (string, error) {

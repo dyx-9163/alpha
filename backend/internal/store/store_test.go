@@ -630,3 +630,70 @@ func TestAppReleaseRetentionKeepsLatestThreeSuccesses(t *testing.T) {
 		t.Fatalf("expected latest three releases, got %+v", releases)
 	}
 }
+
+func TestAppReleaseRetentionProtectsPartialBaseChain(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "aifar.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	instance, err := db.SaveAppInstance(AppInstance{App: "aifar", Version: "docker-apps", ServerID: "srv-1", Status: "installed"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	releases := []struct {
+		id     string
+		base   string
+		minute int
+		status string
+	}{
+		{id: "base-1", minute: 1, status: "success"},
+		{id: "base-2", minute: 2, status: "success"},
+		{id: "base-3", minute: 3, status: "success"},
+		{id: "partial-4", base: "base-1", minute: 4, status: "success"},
+		{id: "partial-5", base: "partial-4", minute: 5, status: "success"},
+	}
+	for _, release := range releases {
+		manifest := `{"releaseId":"` + release.id + `"}`
+		if release.base != "" {
+			manifest = `{"releaseId":"` + release.id + `","baseReleaseId":"` + release.base + `"}`
+		}
+		_, err := db.SaveAppRelease(AppRelease{
+			InstanceID:   instance.ID,
+			App:          "aifar",
+			Version:      "docker-apps",
+			ReleaseID:    release.id,
+			ServerID:     "srv-1",
+			Status:       release.status,
+			ManifestJSON: manifest,
+			CreatedAt:    time.Date(2026, 7, 2, 12, release.minute, 0, 0, time.UTC),
+			ActivatedAt:  time.Date(2026, 7, 2, 12, release.minute, 0, 0, time.UTC),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	deleted, err := db.DeleteOldAppReleases(instance.ID, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deleted != 1 {
+		t.Fatalf("expected only unprotected old release deleted, got %d", deleted)
+	}
+	got, err := db.ListAppReleases(instance.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	kept := map[string]bool{}
+	for _, release := range got {
+		kept[release.ReleaseID] = true
+	}
+	for _, want := range []string{"partial-5", "partial-4", "base-3", "base-1"} {
+		if !kept[want] {
+			t.Fatalf("expected protected release %s to be kept, got %+v", want, got)
+		}
+	}
+	if kept["base-2"] {
+		t.Fatalf("expected unprotected base-2 to be deleted, got %+v", got)
+	}
+}

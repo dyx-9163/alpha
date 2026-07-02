@@ -6,6 +6,8 @@ NETWORK_NAME={{ quote .NetworkName }}
 SERVICE_ORDER={{ quote .ServiceOrder }}
 CURRENT_LINK="$INSTALL_ROOT/current"
 APP_DIR="$INSTALL_ROOT/docker-apps"
+RELEASES_DIR="$INSTALL_ROOT/releases"
+INGRESS_CONTAINER="aifar-admin-ingress"
 
 compose() {
   if docker compose version >/dev/null 2>&1; then
@@ -40,9 +42,15 @@ down_legacy() {
 }
 
 if command -v docker >/dev/null 2>&1 && [ -d "$INSTALL_ROOT" ]; then
+  docker rm -f "$INGRESS_CONTAINER" >/dev/null 2>&1 || true
   if [ -L "$CURRENT_LINK" ] || [ -d "$CURRENT_LINK" ]; then
     current_release="$(readlink -f "$CURRENT_LINK" 2>/dev/null || printf "%s" "$CURRENT_LINK")"
     down_release "$current_release"
+  fi
+  if [ -d "$RELEASES_DIR" ]; then
+    find "$RELEASES_DIR" -mindepth 1 -maxdepth 1 -type d | while read -r release_dir; do
+      down_release "$release_dir"
+    done
   fi
   down_legacy
 fi
