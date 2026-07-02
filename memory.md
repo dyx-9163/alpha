@@ -483,3 +483,5 @@
 - 结论：容器表格不再把非 running 统一显示为已停止，改为按 Docker 返回的 state/status 展示 created/running/restarting/paused/exited/dead 等状态，健康异常会显示为运行异常，并用 tooltip 展示 Docker 原始 status；验证通过：`pnpm web:build`、`git diff --check`。
 - 问题：用户要求 AIFAR 安装弹窗去掉 MySQL/Redis/MinIO 的“来源/已部署实例”选择，同时把其他可自定义参数恢复到页面上，并继续避免 Java 环境变量覆盖 Nacos 配置。
 - 结论：AIFAR 安装弹窗已移除 MySQL/Redis/MinIO 实例来源选择，恢复时区、Docker 网络、CPU/内存、Nacos namespace、MySQL 初始化、Redis 模式/DB/凭据、MinIO endpoint/bucket/domain/basePath 等手动参数；后端同步移除 DB/Redis/MinIO 实例解析字段，只保留 Nacos 实例解析，安装脚本继续禁止注入 `SPRING_DATA_REDIS_*`、`SPRING_DATASOURCE_*`、`DROMARA_X_FILE_STORAGE_*` 等业务运行时环境变量。验证通过：`pnpm web:build`、`go test ./internal/apps/aifar`、`pnpm test`、`git diff --check`。
+- 问题：用户询问只更新 AIFAR Docker 内某些服务的 JAR 包或前端代码时，如何设计操作并保留版本回滚。
+- 结论：建议把“部分服务更新”仍建模为应用实例级新 release：以上一个完整 release 为基线，只替换选中的服务 artifact/image，未变更服务继承旧 manifest；每个 release 都保存完整 manifest、服务 artifact SHA256、镜像 tag、配置 hash 和变更列表。回滚优先按完整 release 回滚；若做单服务回滚，也应生成一个新的 partial release，而不是直接改容器文件。
