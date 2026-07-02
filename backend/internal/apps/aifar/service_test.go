@@ -263,11 +263,29 @@ func TestServiceInstallsAIFARServiceFromDockerAppsBundle(t *testing.T) {
 		"check_mysql_dependency",
 		"check_redis_dependency",
 		"check_minio_dependency",
-		`DROMARA_X_FILE_STORAGE_MINIO_0_ACCESS_KEY`,
-		`DROMARA_X_FILE_STORAGE_MINIO_0_SECRET_KEY`,
 	} {
 		if !strings.Contains(remote.installScript, want) {
-			t.Fatalf("AIFAR install script should include dependency checks and MinIO env with %q:\n%s", want, remote.installScript)
+			t.Fatalf("AIFAR install script should include dependency checks with %q:\n%s", want, remote.installScript)
+		}
+	}
+	for _, want := range []string{
+		`set_env NACOS_HOST "${NACOS_CONNECT_HOST}:${NACOS_PORT_WEB}" "$common_env"`,
+		`set_env NACOS_PASSWORD "$NACOS_PASSWORD" "$secrets_env"`,
+	} {
+		if !strings.Contains(remote.installScript, want) {
+			t.Fatalf("AIFAR install script should keep Nacos bootstrap env with %q:\n%s", want, remote.installScript)
+		}
+	}
+	for _, forbidden := range []string{
+		`set_env AIFAR_DB_`,
+		`set_env SPRING_DATASOURCE`,
+		`set_env AIFAR_REDIS`,
+		`set_env SPRING_DATA_REDIS`,
+		`set_env AIFAR_MINIO`,
+		`set_env DROMARA_X_FILE_STORAGE`,
+	} {
+		if strings.Contains(remote.installScript, forbidden) {
+			t.Fatalf("AIFAR install script should not inject business runtime env %q:\n%s", forbidden, remote.installScript)
 		}
 	}
 	if strings.Contains(remote.installScript, "patch_nacos_server_port") || !strings.Contains(remote.installScript, "patch_nacos_sql_namespace") {

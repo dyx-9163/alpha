@@ -469,3 +469,11 @@
 - 结论：Nacos 安装脚本不再跳过默认 `nacos/nacos` 账号校验，安装后会尝试登录、创建或更新目标 Nacos 管理用户，并在最终登录失败时中止；自动登记的 Nacos 凭据会写回 appInstanceId，旧凭据列表会从绑定表兜底暴露实例关联，配置发布的 Nacos 登录错误改为明确提示所选凭据被目标 Nacos 拒绝且不泄露密码。验证通过：`go test ./internal/store ./internal/apps/nacos ./internal/httpapi`、`pnpm test`、`git diff --check`。
 - 问题：用户询问当前 Nacos 配置发布使用的用户名密码是否为 `nacos/nacos`。
 - 结论：Nacos 安装与自动登记凭据的默认用户名/密码是 `nacos/nacos`；配置发布实际使用的是页面所选凭据中心记录，用户名可见，密码为加密保存的 secret，若曾选择自定义凭据或手动修改过凭据中心，则不一定仍是默认密码。
+- 问题：用户提供 Spring 启动异常，Redisson 提示 `Unable to connect to Redis sentinel servers`，并询问 Nacos 中明明配置 Redis 单体，是否被环境变量覆盖。
+- 结论：异常中的 `192.168.74.132/133/134:26379` 明确表示运行时仍按 Redis Sentinel 模式启动；如果 Nacos 配置中心确实只有 standalone，则优先检查 AIFAR 当前 release 的 `env/java-common.env` 和容器实际环境变量中是否残留 `SPRING_DATA_REDIS_SENTINEL_*`，这类环境变量优先级会高于 Nacos 配置并触发 Redisson Sentinel 模式。
+- 问题：用户贴出当前 release `env/java-common.env`，其中 `AIFAR_REDIS_MODE=sentinel` 且 `SPRING_DATA_REDIS_SENTINEL_NODES` 指向三台 26379。
+- 结论：已确认当前容器 env 覆盖了 Nacos 的 Redis 单体配置；临时修复应删除 `SPRING_DATA_REDIS_SENTINEL_*`/`SPRING_DATA_REDIS_CLUSTER_NODES` 并把 `SPRING_DATA_REDIS_HOST/PORT` 改为单体 Redis 地址后强制重建容器，长期应考虑不再向 Java 容器注入会覆盖 Nacos 的 `SPRING_DATA_REDIS_*`。
+- 问题：用户追问为什么应用不走 Nacos 中 Redis 单体配置，而会被环境变量覆盖。
+- 结论：Spring Boot 会将容器环境变量以 relaxed binding 映射为配置属性，例如 `SPRING_DATA_REDIS_SENTINEL_NODES` -> `spring.data.redis.sentinel.nodes`；环境变量通常优先级高于 Nacos 配置中心。只要 sentinel nodes 存在，Redisson 自动配置会选择 Sentinel 模式，即使 Nacos 中也存在 standalone host/port。
+- 问题：用户要求去掉 AIFAR 安装脚本中多余的 Java 容器环境变量，以便自行在 Nacos 中配置数据库、Redis、MinIO 等业务配置。
+- 结论：`write_java_env` 已收敛为只写 `TZ`、Nacos 连接信息和 Nacos 密码，不再注入 `SPRING_DATA_REDIS_*`、`SPRING_DATASOURCE_*`、`DROMARA_X_FILE_STORAGE_*`、`AIFAR_DB_*`、`AIFAR_REDIS_*`、`AIFAR_MINIO_*`；安装参数仍用于依赖预检和实例元数据。验证通过：`go test ./internal/apps/aifar`、`pnpm test`、`git diff --check`。
