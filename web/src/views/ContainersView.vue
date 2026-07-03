@@ -265,6 +265,23 @@ const containerStateLabelKeys: Record<string, string> = {
   exited: 'containers.state.exited',
   dead: 'containers.state.dead'
 }
+const containerActionLabelKeys: Record<string, string> = {
+  start: 'containers.start',
+  stop: 'containers.stop',
+  restart: 'containers.restart',
+  remove: 'containers.uninstall'
+}
+const singleContainerConfirmKeys: Record<string, string> = {
+  start: 'containers.confirmStartContainer',
+  stop: 'containers.confirmStopContainer',
+  restart: 'containers.confirmRestartContainer'
+}
+const batchContainerConfirmKeys: Record<string, string> = {
+  start: 'containers.confirmBatchStart',
+  stop: 'containers.confirmBatchStop',
+  restart: 'containers.confirmBatchRestart',
+  remove: 'containers.confirmUninstallSelected'
+}
 const batchActionDisabledReason = computed(() => {
   if (!canManageContainers.value) return deniedText.value
   if (!selectedContainerIds.value.length) return t('containers.selectContainers')
@@ -366,6 +383,12 @@ async function runContainerAction(id: string, action: string) {
     ElMessage.warning(t('containers.selectDockerHost'))
     return
   }
+  const row = collection.value.find((item) => String(item?.id ?? '').trim() === id)
+  const confirmKey = singleContainerConfirmKeys[action]
+  if (confirmKey) {
+    const ok = await confirmContainerAction(action, t(confirmKey, { name: containerDisplayName(row) || id }))
+    if (!ok) return
+  }
   try {
     await apiPost(`/containers/${encodeURIComponent(id)}/${action}?${query}`)
     ElMessage.success(t('containers.actionAccepted'))
@@ -396,15 +419,11 @@ async function runContainerBatchAction(action: string, rows = selectedContainerR
       ElMessage.warning(t('containers.stopBeforeUninstall'))
       return
     }
-    try {
-      await ElMessageBox.confirm(t('containers.confirmUninstallSelected', { count: ids.length }), t('containers.uninstall'), {
-        type: 'warning',
-        confirmButtonText: t('containers.uninstall'),
-        cancelButtonText: t('common.cancel')
-      })
-    } catch {
-      return
-    }
+  }
+  const confirmKey = batchContainerConfirmKeys[action]
+  if (confirmKey) {
+    const ok = await confirmContainerAction(action, t(confirmKey, { count: ids.length }))
+    if (!ok) return
   }
   try {
     await apiPost(`/containers/actions?${query}`, { action, ids })
@@ -506,6 +525,25 @@ function containerStatusLabel(row: any) {
 
 function isRunningContainer(row: any) {
   return containerState(row) === 'running'
+}
+
+function containerDisplayName(row: any) {
+  return String(row?.name || row?.id || '').trim()
+}
+
+async function confirmContainerAction(action: string, message: string) {
+  const labelKey = containerActionLabelKeys[action]
+  const label = labelKey ? t(labelKey) : action
+  try {
+    await ElMessageBox.confirm(message, label, {
+      type: 'warning',
+      confirmButtonText: label,
+      cancelButtonText: t('common.cancel')
+    })
+    return true
+  } catch {
+    return false
+  }
 }
 
 function imageReference(row: any) {

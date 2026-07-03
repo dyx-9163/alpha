@@ -565,3 +565,13 @@
 - 结论：更深层最可能是 `web-vue3` 镜像内 nginx 配置仍写死 `proxy_pass http://aifar-gateway:38000`，而自定义 release 编排把 gateway 改成动态容器名且没有固定 `aifar-gateway` DNS/alias；nginx 启动时解析不到 upstream 会直接退出，端口映射不能解决这个容器内 DNS 问题。
 - 问题：用户确认 `web-vue3` nginx 报 `host not found in upstream "aifar-gateway"`，询问应如何调整。
 - 结论：已在 AIFAR 安装、单服务更新和批量更新脚本中增加 `patch_web_nginx_gateway_target`，构建 `web-vue3` 镜像前把 `web-vue3/nginx/default.conf` 中的 `http://aifar-gateway:<port>` 替换为当前有效 gateway 容器名和端口，避免固定 alias 与新旧 gateway 共存冲突。
+
+## 2026-07-03
+- 问题：用户询问容器 CPU 设置为 2C 后，大并发时为什么会看到 CPU 200% 多，是否正常。
+- 结论：Docker/Linux 统计中 100% 通常代表占满 1 个逻辑 CPU，2C 容器满载接近 200% 属正常；若长期明显超过 200%，需确认是否只是 cpu shares/reservation 而非硬限制，或 Compose 配置是否真正写入 `NanoCpus`/`CpuQuota`。
+- 问题：用户贴出 `docker inspect` 显示 `NanoCpus=2000000000 CpuQuota=0 CpuPeriod=0`。
+- 结论：`NanoCpus=2000000000` 代表 Docker 已设置 2 个 CPU 的硬限制；`CpuQuota/CpuPeriod=0` 是因为使用 NanoCpus 表达限制，不代表未限制。
+- 问题：用户追问已限制 2C 后为什么仍能看到超过 200%。
+- 结论：`docker stats` 是采样计算值而非硬限制判定值，CPU cgroup 按调度周期限制“平均可用 CPU 时间”；容器线程可短时间在多个核上并行后再被 throttle，叠加采样窗口、内核统计和四舍五入，会出现略超 200% 的读数。
+- 问题：用户要求容器页“需要的动作”增加二次确认。
+- 结论：容器页已为单个启动/停止/重启和批量启动/停止/重启增加确认弹窗；已有批量卸载、删除镜像和 Docker 服务卸载确认保持不变，并补充 zh/en 文案。
