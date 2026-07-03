@@ -204,6 +204,7 @@ type bundleTestArtifact struct {
 
 func installedAIFARInstance(t *testing.T) store.AppInstance {
 	t.Helper()
+	releaseID := "20260701T010203.000000000Z-docker-apps"
 	return store.AppInstance{
 		ID:       "aifar-1",
 		App:      "aifar",
@@ -214,13 +215,15 @@ func installedAIFARInstance(t *testing.T) store.AppInstance {
 		Metadata: mustMetadata(t, map[string]any{
 			"installRoot":      "/aifar/apps/admin",
 			"layout":           releaseLayout,
-			"releaseId":        "20260701T010203.000000000Z-docker-apps",
+			"releaseId":        releaseID,
 			"releaseVersion":   "docker-apps",
-			"releasePath":      "/aifar/apps/admin/releases/20260701T010203.000000000Z-docker-apps",
+			"releasePath":      "/aifar/apps/admin/releases/" + releaseID,
 			"currentRelease":   "/aifar/apps/admin/current",
 			"configHash":       "base-config-hash",
 			"releaseRetention": releaseKeepCount,
 			"services":         serviceOrder,
+			"containers":       releaseContainers(releaseID),
+			"activeRoutes":     releaseRoutes(releaseID, defaultGatewayPort, defaultWebPort),
 		}),
 	}
 }
@@ -569,25 +572,7 @@ func TestServiceUpdatesAIFARServiceArtifactAsPartialRelease(t *testing.T) {
 	if err := os.WriteFile(artifactPath, []byte("new oauth jar"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	instance := store.AppInstance{
-		ID:       "aifar-1",
-		App:      "aifar",
-		Version:  "docker-apps",
-		ServerID: "srv-1",
-		Status:   "installed",
-		Topology: defaultTopology,
-		Metadata: mustMetadata(t, map[string]any{
-			"installRoot":      "/aifar/apps/admin",
-			"layout":           releaseLayout,
-			"releaseId":        "20260701T010203.000000000Z-docker-apps",
-			"releaseVersion":   "docker-apps",
-			"releasePath":      "/aifar/apps/admin/releases/20260701T010203.000000000Z-docker-apps",
-			"currentRelease":   "/aifar/apps/admin/current",
-			"configHash":       "base-config-hash",
-			"releaseRetention": releaseKeepCount,
-			"services":         serviceOrder,
-		}),
-	}
+	instance := installedAIFARInstance(t)
 	s := &fakeStore{
 		servers: map[string]store.Server{
 			"srv-1": {ID: "srv-1", Name: "app-1", Host: "10.0.0.10", DeployDir: "/aifar/apps"},
@@ -615,9 +600,15 @@ func TestServiceUpdatesAIFARServiceArtifactAsPartialRelease(t *testing.T) {
 		`SERVICE_BASE_RELEASE="$(release_for_service "$SERVICE_NAME" "$BASE_RELEASE" || true)"`,
 		`copy_shared_release_files "$BASE_RELEASE"`,
 		`copy_service_release_files "$SERVICE_BASE_RELEASE"`,
+		`materialize_effective_service_dirs`,
+		`link_inherited_service_files "$mes_service" "$mes_source"`,
+		`csrf_real_dir="$(readlink -f "$csrf_service_dir"`,
+		`changed service directory must be materialized`,
+		`ln -s "$lis_real_dir" "$APP_DIR/$lis_service"`,
 		`cfr_source="$1"`,
 		`csrf_source="$1"`,
 		`cp -a "$csrf_source/env/." "$ENV_DIR/"`,
+		`write_containers_json`,
 		`write_partial_compose_env`,
 		`apply_java_artifact`,
 		`retag_selected_service`,
@@ -669,6 +660,21 @@ func TestServiceUpdatesAIFARServiceArtifactAsPartialRelease(t *testing.T) {
 	if !strings.Contains(s.releases[0].ManifestJSON, `"kind":"partial"`) || !strings.Contains(s.releases[0].ManifestJSON, `"changedServices":["oauth"]`) {
 		t.Fatalf("expected partial release manifest, got %s", s.releases[0].ManifestJSON)
 	}
+	var manifest map[string]any
+	if err := json.Unmarshal([]byte(s.releases[0].ManifestJSON), &manifest); err != nil {
+		t.Fatal(err)
+	}
+	releaseID, _ := metadata["releaseId"].(string)
+	containers, _ := manifest["containers"].(map[string]any)
+	if containers["oauth"] != releaseContainerName("oauth", releaseID) ||
+		containers["gateway"] != releaseContainerName("gateway", "20260701T010203.000000000Z-docker-apps") {
+		t.Fatalf("expected effective partial containers, got %s", s.releases[0].ManifestJSON)
+	}
+	routes, _ := manifest["routes"].(map[string]any)
+	gatewayRoute, _ := routes["gateway"].(map[string]any)
+	if gatewayRoute["container"] != releaseContainerName("gateway", "20260701T010203.000000000Z-docker-apps") {
+		t.Fatalf("expected partial gateway route to inherit base release, got %s", s.releases[0].ManifestJSON)
+	}
 }
 
 func TestServiceUpdatesAIFARArtifactBundleAsSingleMultiServicePartialRelease(t *testing.T) {
@@ -708,6 +714,12 @@ func TestServiceUpdatesAIFARArtifactBundleAsSingleMultiServicePartialRelease(t *
 		`DEPLOYMENT_CONCURRENCY=3`,
 		`run_parallel_services $non_entry_services`,
 		`for service in gateway web-vue3; do`,
+		`materialize_effective_service_dirs`,
+		`link_inherited_service_files "$mes_service" "$mes_source"`,
+		`csrf_real_dir="$(readlink -f "$csrf_service_dir"`,
+		`changed service directory must be materialized`,
+		`ln -s "$lis_real_dir" "$APP_DIR/$lis_service"`,
+		`write_containers_json`,
 		`patch_compose_service_release "$service"`,
 		`compose --env-file env/compose.env -f compose.yaml up -d --build --no-deps "$service"`,
 		`configure_ingress_if_needed`,
@@ -732,6 +744,23 @@ func TestServiceUpdatesAIFARArtifactBundleAsSingleMultiServicePartialRelease(t *
 	var metadata map[string]any
 	if err := json.Unmarshal([]byte(s.instances[0].Metadata), &metadata); err != nil {
 		t.Fatal(err)
+	}
+	var manifest map[string]any
+	if err := json.Unmarshal([]byte(s.releases[0].ManifestJSON), &manifest); err != nil {
+		t.Fatal(err)
+	}
+	releaseID, _ := metadata["releaseId"].(string)
+	containers, _ := manifest["containers"].(map[string]any)
+	if containers["gateway"] != releaseContainerName("gateway", releaseID) ||
+		containers["web-vue3"] != releaseContainerName("web-vue3", "20260701T010203.000000000Z-docker-apps") {
+		t.Fatalf("expected effective bundle containers, got %s", s.releases[0].ManifestJSON)
+	}
+	routes, _ := manifest["routes"].(map[string]any)
+	gatewayRoute, _ := routes["gateway"].(map[string]any)
+	webRoute, _ := routes["web-vue3"].(map[string]any)
+	if gatewayRoute["container"] != releaseContainerName("gateway", releaseID) ||
+		webRoute["container"] != releaseContainerName("web-vue3", "20260701T010203.000000000Z-docker-apps") {
+		t.Fatalf("expected effective bundle routes, got %s", s.releases[0].ManifestJSON)
 	}
 	lastUpdate, ok := metadata["lastPartialUpdate"].(map[string]any)
 	if !ok || lastUpdate["service"] != "bundle" || int(lastUpdate["deploymentConcurrency"].(float64)) != 3 {

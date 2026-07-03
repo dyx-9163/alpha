@@ -361,6 +361,34 @@ func partialOrchestrationMetadata(current map[string]any, installRoot, releaseID
 	return next
 }
 
+func mapFromMetadataValue(value any) map[string]any {
+	switch typed := value.(type) {
+	case map[string]any:
+		out := make(map[string]any, len(typed))
+		for key, value := range typed {
+			out[key] = value
+		}
+		return out
+	case map[string]string:
+		out := make(map[string]any, len(typed))
+		for key, value := range typed {
+			out[key] = value
+		}
+		return out
+	default:
+		return nil
+	}
+}
+
+func applyEffectiveReleaseFields(manifest map[string]any, orchestration map[string]any) {
+	if containers := mapFromMetadataValue(orchestration["containers"]); len(containers) > 0 {
+		manifest["containers"] = containers
+	}
+	if routes := mapFromMetadataValue(orchestration["activeRoutes"]); len(routes) > 0 {
+		manifest["routes"] = routes
+	}
+}
+
 func releaseManifest(version, releaseID string, releaseTime time.Time, configHash, ingressNetwork string, gatewayPort, webPort int) map[string]any {
 	manifest := map[string]any{
 		"app":              AppName,
@@ -380,7 +408,7 @@ func releaseManifest(version, releaseID string, releaseTime time.Time, configHas
 	return manifest
 }
 
-func partialReleaseManifest(version, releaseID string, releaseTime time.Time, configHash, baseReleaseID, ingressNetwork string, gatewayPort, webPort int, artifact artifactInfo) map[string]any {
+func partialReleaseManifest(version, releaseID string, releaseTime time.Time, configHash, baseReleaseID, ingressNetwork string, gatewayPort, webPort int, artifact artifactInfo, orchestration map[string]any) map[string]any {
 	manifest := map[string]any{
 		"app":              AppName,
 		"version":          version,
@@ -405,10 +433,11 @@ func partialReleaseManifest(version, releaseID string, releaseTime time.Time, co
 	for key, value := range releaseManifestFields(releaseID, ingressNetwork, gatewayPort, webPort) {
 		manifest[key] = value
 	}
+	applyEffectiveReleaseFields(manifest, orchestration)
 	return manifest
 }
 
-func partialBundleReleaseManifest(version, releaseID string, releaseTime time.Time, configHash, baseReleaseID, ingressNetwork string, gatewayPort, webPort int, artifacts []artifactInfo, concurrency int) map[string]any {
+func partialBundleReleaseManifest(version, releaseID string, releaseTime time.Time, configHash, baseReleaseID, ingressNetwork string, gatewayPort, webPort int, artifacts []artifactInfo, concurrency int, orchestration map[string]any) map[string]any {
 	changed := make([]string, 0, len(artifacts))
 	artifactMap := make(map[string]any, len(artifacts))
 	for _, artifact := range artifacts {
@@ -438,6 +467,7 @@ func partialBundleReleaseManifest(version, releaseID string, releaseTime time.Ti
 	for key, value := range releaseManifestFields(releaseID, ingressNetwork, gatewayPort, webPort) {
 		manifest[key] = value
 	}
+	applyEffectiveReleaseFields(manifest, orchestration)
 	return manifest
 }
 
@@ -591,7 +621,8 @@ func (s Service) UpdateArtifact(ctx context.Context, req ArtifactUpdateRequest, 
 		metadata["releaseVersion"] = version
 		metadata["releaseCreatedAt"] = releaseTime.Format(time.RFC3339)
 		metadata["configHash"] = configHash
-		for key, value := range partialOrchestrationMetadata(metadata, installRoot, releaseID, ingressNetwork, gatewayPort, webPort, []string{artifact.ServiceName}) {
+		orchestration := partialOrchestrationMetadata(metadata, installRoot, releaseID, ingressNetwork, gatewayPort, webPort, []string{artifact.ServiceName})
+		for key, value := range orchestration {
 			metadata[key] = value
 		}
 		metadata["lastPartialUpdate"] = map[string]any{
@@ -613,7 +644,7 @@ func (s Service) UpdateArtifact(ctx context.Context, req ArtifactUpdateRequest, 
 			return err
 		}
 		if releases, ok := s.store.(releaseStore); ok {
-			manifest, _ := json.Marshal(partialReleaseManifest(version, releaseID, releaseTime, configHash, baseReleaseID, ingressNetwork, gatewayPort, webPort, artifact))
+			manifest, _ := json.Marshal(partialReleaseManifest(version, releaseID, releaseTime, configHash, baseReleaseID, ingressNetwork, gatewayPort, webPort, artifact, orchestration))
 			if _, err := releases.SaveAppRelease(store.AppRelease{
 				InstanceID:   saved.ID,
 				App:          AppName,

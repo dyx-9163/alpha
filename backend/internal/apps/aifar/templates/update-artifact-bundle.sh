@@ -212,11 +212,42 @@ copy_service_release_files() {
   csrf_service_source="$2"
   csrf_service_dir="$csrf_service_source/docker-apps/$csrf_service"
   [ -d "$csrf_service_dir" ] || fail "service directory is missing in release chain: $csrf_service"
+  csrf_real_dir="$(readlink -f "$csrf_service_dir" 2>/dev/null || printf "%s" "$csrf_service_dir")"
+  [ -d "$csrf_real_dir" ] || fail "service directory is missing in release chain: $csrf_service"
   mkdir -p "$APP_DIR"
-  cp -a "$csrf_service_dir" "$APP_DIR/$csrf_service"
+  rm -rf "$APP_DIR/$csrf_service"
+  cp -a "$csrf_real_dir" "$APP_DIR/$csrf_service"
+  [ ! -L "$APP_DIR/$csrf_service" ] || fail "changed service directory must be materialized: $csrf_service"
   if [ ! -f "$ENV_DIR/$csrf_service.env" ]; then
     copy_file_required "$csrf_service_source/env/$csrf_service.env" "$ENV_DIR/$csrf_service.env"
   fi
+}
+
+link_inherited_service_files() {
+  lis_service="$1"
+  lis_source="$2"
+  lis_service_dir="$lis_source/docker-apps/$lis_service"
+  [ -d "$lis_service_dir" ] || fail "service directory is missing in release chain: $lis_service"
+  lis_real_dir="$(readlink -f "$lis_service_dir" 2>/dev/null || printf "%s" "$lis_service_dir")"
+  [ -d "$lis_real_dir" ] || fail "service directory is missing in release chain: $lis_service"
+  mkdir -p "$APP_DIR"
+  if [ ! -e "$APP_DIR/$lis_service" ] && [ ! -L "$APP_DIR/$lis_service" ]; then
+    ln -s "$lis_real_dir" "$APP_DIR/$lis_service"
+  fi
+  if [ ! -f "$ENV_DIR/$lis_service.env" ]; then
+    copy_file_required "$lis_source/env/$lis_service.env" "$ENV_DIR/$lis_service.env"
+  fi
+}
+
+materialize_effective_service_dirs() {
+  for mes_service in $SERVICE_ORDER; do
+    if [ -e "$APP_DIR/$mes_service" ] || [ -L "$APP_DIR/$mes_service" ]; then
+      continue
+    fi
+    mes_source="$(release_for_service "$mes_service" "$BASE_RELEASE" || true)"
+    [ -n "$mes_source" ] || fail "service directory is missing in current release chain: $mes_service"
+    link_inherited_service_files "$mes_service" "$mes_source"
+  done
 }
 
 write_partial_compose_env() {
@@ -347,8 +378,9 @@ container_for_service_in_release() {
 
 route_container_for_service() {
   rc_service="$1"
-  if service_changed "$rc_service"; then
-    container_for_service "$rc_service"
+  rc_container="$(container_for_service "$rc_service")"
+  if [ -n "$rc_container" ]; then
+    printf "%s" "$rc_container"
     return
   fi
   rc_release="$(release_for_service "$rc_service" "$BASE_RELEASE" || true)"
@@ -668,6 +700,19 @@ json_escape() {
   printf "%s" "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
 }
 
+write_containers_json() {
+  wc_first=1
+  for wc_service in $SERVICE_ORDER; do
+    wc_container="$(container_for_service "$wc_service")"
+    [ -n "$wc_container" ] || continue
+    if [ "$wc_first" -eq 0 ]; then
+      printf ",\n"
+    fi
+    printf '    "%s": "%s"' "$wc_service" "$wc_container"
+    wc_first=0
+  done
+}
+
 write_manifest() {
   status="$1"
   base_release_id="$2"
@@ -690,9 +735,7 @@ write_manifest() {
   "internalNetwork": "$INTERNAL_NETWORK",
   "changedServices": [{{ range $index, $artifact := .Artifacts }}{{ if $index }}, {{ end }}"{{ $artifact.ServiceName }}"{{ end }}],
   "containers": {
-{{- range $index, $artifact := .Artifacts }}
-    {{ if $index }},{{ end }}"{{ $artifact.ServiceName }}": "$(container_for_service "{{ $artifact.ServiceName }}")"
-{{- end }}
+$(write_containers_json)
   },
   "routes": {
     "gateway": {"container": "$(route_container_for_service gateway)", "port": $(read_env_value "$ENV_DIR/compose.env" GATEWAY_PORT 38000)},
@@ -807,6 +850,7 @@ for service in $CHANGED_SERVICES; do
   copy_service_release_files "$service" "$service_base_release"
 done
 
+materialize_effective_service_dirs
 write_partial_compose_env
 
 for service in $CHANGED_SERVICES; do

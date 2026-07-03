@@ -533,3 +533,5 @@
 - 结论：原因是 partial update 复制 base `compose.yaml` 后只改了服务 env，未同步改 `compose.yaml` 中写死的 `image`、`container_name` 和 release labels，导致 Compose 仍在处理旧容器；已在单服务和批量更新脚本中 patch 变更服务的 compose service 块，并用 `--no-deps` 启动/回滚单服务，避免触碰未更新依赖服务。验证通过：`go test ./internal/apps/aifar ./internal/store ./internal/httpapi`、`pnpm test`、`git diff --check`。
 - 问题：用户截图显示 AIFAR 前端静态资源 200，但 `getLoginConfig` XHR 502，询问是否 nginx 配置有问题。
 - 结论：根因是自定义编排把 gateway 容器名改为 release 动态名后，`web-vue3` 容器内 nginx 仍按固定 `aifar-gateway:38000` 转发 `/api/` 和 `/im/ws/`；已改为由稳定 ingress 在 web 端口直接转发 API/WebSocket 到当前 gateway upstream，并让旧 ingress 配置在后续制品更新时自动补写路由。
+- 问题：用户指出非入口服务更新后 ingress 未更新，并担心分两次更新前后端时 `current` 只指向最新 partial，版本逻辑不完整。
+- 结论：确认 partial release 应表达“当前有效版本快照”，而不是只含本次变更目录；已改为在 partial release 中 materialize 全量服务视图，未变更服务用基线 release 目录链接继承，manifest/metadata 的 containers/routes 记录整套 active container，ingress 配置从 effective env 读取当前入口容器。
