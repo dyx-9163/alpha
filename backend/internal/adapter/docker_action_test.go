@@ -68,3 +68,23 @@ func TestDockerAPIContainerActionStartUsesPost(t *testing.T) {
 		t.Fatalf("path = %s, want /containers/abc123/start", gotPath)
 	}
 }
+
+func TestDockerAPIImageRemoveEscapesImageReference(t *testing.T) {
+	var gotMethod, gotPath string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod = r.Method
+		gotPath = r.URL.EscapedPath()
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	if err := dockerAPIImageRemove(context.Background(), server.URL, "registry.example.com/ns/app:1.0"); err != nil {
+		t.Fatalf("dockerAPIImageRemove failed: %v", err)
+	}
+	if gotMethod != http.MethodDelete {
+		t.Fatalf("method = %s, want DELETE", gotMethod)
+	}
+	if gotPath != "/images/registry.example.com%2Fns%2Fapp:1.0" {
+		t.Fatalf("path = %s, want escaped image path", gotPath)
+	}
+}

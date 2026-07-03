@@ -194,6 +194,41 @@ func (a *API) containerBatchAction(w http.ResponseWriter, r *http.Request) {
 	respondTask(w, task, err)
 }
 
+func (a *API) containerImageRemove(w http.ResponseWriter, r *http.Request) {
+	lang := languageFromRequest(r)
+	var req containerImageRemoveRequest
+	if !decode(w, r, &req) {
+		return
+	}
+	id := strings.TrimSpace(req.ID)
+	if id == "" {
+		writeError(w, http.StatusBadRequest, "IMAGE_ID_REQUIRED", i18n.Text(lang, "api.containerImageIDRequired"), nil)
+		return
+	}
+	host := dockerHostFromRequest(r)
+	server, useServer, serverErr := a.dockerServerFromRequest(r)
+	if serverErr != nil {
+		respond(w, nil, serverErr)
+		return
+	}
+	if !useServer && host == "" {
+		writeError(w, http.StatusBadRequest, "DOCKER_TARGET_REQUIRED", i18n.Text(lang, "api.dockerTargetRequired"), nil)
+		return
+	}
+	task, err := a.tasks.StartWithLanguage("containers.image.remove", id, currentUser(r).Username, lang, func(ctx context.Context, log worker.Logger) error {
+		log.Info(i18n.Text(lang, "api.containerImageRemoveRequested"), id)
+		if err := runDockerImageRemove(ctx, server, useServer, host, id); err != nil {
+			return err
+		}
+		log.Info(i18n.Text(lang, "api.containerImageRemoveCompleted"), id)
+		return nil
+	})
+	if err == nil {
+		a.audit(r, "containers.image.remove", id, "running", task.ID)
+	}
+	respondTask(w, task, err)
+}
+
 func (a *API) containerLogs(w http.ResponseWriter, r *http.Request) {
 	host := dockerHostFromRequest(r)
 	server, useServer, serverErr := a.dockerServerFromRequest(r)
@@ -239,6 +274,13 @@ func runDockerContainerAction(ctx context.Context, server store.Server, useServe
 		return adapter.DockerContainerActionForServer(ctx, server, id, action)
 	}
 	return adapter.DockerContainerAction(ctx, host, id, action)
+}
+
+func runDockerImageRemove(ctx context.Context, server store.Server, useServer bool, host, id string) error {
+	if useServer {
+		return adapter.DockerImageRemoveForServer(ctx, server, id)
+	}
+	return adapter.DockerImageRemove(ctx, host, id)
 }
 
 func (a *API) rejectRunningContainerRemove(w http.ResponseWriter, r *http.Request, server store.Server, useServer bool, host string, ids []string) bool {

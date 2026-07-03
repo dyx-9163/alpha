@@ -50,6 +50,49 @@ func TestOwnerCanMutateSettings(t *testing.T) {
 	}
 }
 
+func TestContainerImageRemoveStartsTask(t *testing.T) {
+	api, db, secret := newAuthzTestAPI(t)
+	var gotMethod, gotPath string
+	dockerAPI := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod = r.Method
+		gotPath = r.URL.EscapedPath()
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer dockerAPI.Close()
+	server, err := db.SaveServer(store.Server{Name: "docker-1", Host: "10.0.0.10", Username: "root", DockerHost: dockerAPI.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := issueTestToken(t, db, secret, "owner", "owner")
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v2/containers/images/remove?serverId="+server.ID, strings.NewReader(`{"id":"repo/app:1.0"}`))
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	api.Router().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	taskID, _ := body["taskId"].(string)
+	if taskID == "" {
+		t.Fatalf("expected taskId in response: %+v", body)
+	}
+	waitForTaskStatus(t, db, taskID, "success")
+	if gotMethod != http.MethodDelete {
+		t.Fatalf("method = %s, want DELETE", gotMethod)
+	}
+	if gotPath != "/images/repo%2Fapp:1.0" {
+		t.Fatalf("path = %s, want escaped image path", gotPath)
+	}
+	assertAuditExists(t, db, "containers.image.remove", "running", "owner", "repo/app:1.0")
+}
+
 func TestTokenIsRejectedAfterPasswordReset(t *testing.T) {
 	api, db, secret := newAuthzTestAPI(t)
 	token := issueTestToken(t, db, secret, "owner", "owner")

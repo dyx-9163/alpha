@@ -44,7 +44,15 @@ func dockerAPIURL(host, apiPath string, query url.Values) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	u.Path = strings.TrimRight(u.Path, "/") + "/" + strings.TrimLeft(apiPath, "/")
+	rawPath := strings.TrimRight(u.EscapedPath(), "/") + "/" + strings.TrimLeft(apiPath, "/")
+	decodedPath, err := url.PathUnescape(rawPath)
+	if err != nil {
+		return "", err
+	}
+	u.Path = decodedPath
+	if rawPath != decodedPath {
+		u.RawPath = rawPath
+	}
 	u.RawQuery = query.Encode()
 	return u.String(), nil
 }
@@ -316,6 +324,10 @@ func dockerAPIContainerAction(ctx context.Context, host, id, action string) erro
 		return dockerAPIJSON(ctx, http.MethodDelete, host, "/containers/"+url.PathEscape(id), nil, nil)
 	}
 	return dockerAPIJSON(ctx, http.MethodPost, host, "/containers/"+url.PathEscape(id)+"/"+action, nil, nil)
+}
+
+func dockerAPIImageRemove(ctx context.Context, host, id string) error {
+	return dockerAPIJSON(ctx, http.MethodDelete, host, "/images/"+url.PathEscape(id), nil, nil)
 }
 
 func decodeDockerLogBytes(raw []byte) []string {

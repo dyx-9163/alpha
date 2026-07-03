@@ -117,6 +117,15 @@
           <el-table-column prop="size" :label="t('containers.size')" width="120" />
           <el-table-column prop="digest" :label="t('containers.digest')" min-width="220" show-overflow-tooltip />
           <el-table-column prop="createdAt" :label="t('containers.created')" min-width="170" show-overflow-tooltip />
+          <el-table-column :label="t('common.operation')" width="110" fixed="right">
+            <template #default="{ row }">
+              <el-tooltip :content="deniedText" :disabled="canManageContainers" placement="top">
+                <span>
+                  <el-button size="small" type="danger" plain :disabled="!canManageContainers" @click="deleteImage(row)">{{ t('containers.deleteImage') }}</el-button>
+                </span>
+              </el-tooltip>
+            </template>
+          </el-table-column>
         </el-table>
       </template>
 
@@ -407,6 +416,39 @@ async function runContainerBatchAction(action: string, rows = selectedContainerR
   }
 }
 
+async function deleteImage(row: any) {
+  if (!canManageContainers.value) {
+    ElMessage.warning(deniedText.value)
+    return
+  }
+  const query = targetQuery()
+  if (!query) {
+    ElMessage.warning(t('containers.selectDockerHost'))
+    return
+  }
+  const id = imageReference(row)
+  if (!id) {
+    ElMessage.warning(t('containers.selectImage'))
+    return
+  }
+  try {
+    await ElMessageBox.confirm(t('containers.confirmDeleteImage', { image: id }), t('containers.deleteImage'), {
+      type: 'warning',
+      confirmButtonText: t('containers.deleteImage'),
+      cancelButtonText: t('common.cancel')
+    })
+  } catch {
+    return
+  }
+  try {
+    await apiPost(`/containers/images/remove?${query}`, { id })
+    ElMessage.success(t('containers.imageRemoveAccepted'))
+    setTimeout(loadCollection, 800)
+  } catch (err) {
+    ElMessage.error(err instanceof Error ? err.message : t('containers.imageRemoveFailed'))
+  }
+}
+
 async function openLogs(id: string) {
   const query = targetQuery()
   if (!query) {
@@ -464,6 +506,16 @@ function containerStatusLabel(row: any) {
 
 function isRunningContainer(row: any) {
   return containerState(row) === 'running'
+}
+
+function imageReference(row: any) {
+  const repository = String(row?.repository ?? '').trim()
+  const tag = String(row?.tag ?? '').trim()
+  const id = String(row?.id ?? '').trim()
+  if (repository && repository !== '<none>' && tag && tag !== '<none>') {
+    return `${repository}:${tag}`
+  }
+  return id
 }
 
 function containerRemoveDisabledReason(row: any) {

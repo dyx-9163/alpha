@@ -543,3 +543,5 @@
 - 结论：当前分支代码中单服务更新在 `SERVICE_NAME` 为 `gateway` 或 `web-vue3` 时会重写并 reload ingress；批量更新只要 changed services 包含入口服务也会重写并 reload。若目标机未更新，多半是运行的部署平台版本旧，或新入口服务健康检查失败导致没有进入切流步骤。
 - 问题：用户分别单独重新上传 oauth 和 gateway 后服务不可用，截图显示两个新容器位于不同 release 内网，gateway 日志访问 oauth 的 `38001` 超时。
 - 结论：根因是 Java/Nacos 服务发现可能注册 release 独有内网 IP，分批 partial 后 gateway 与 oauth 跨 release 内网不可达；已改为新业务服务只挂稳定共享网络，partial 更新会规范化服务网络块，并在过渡期把新容器连接到旧 release 链 legacy 内网以兼容已有注册 IP。
+- 问题：用户要求容器模块增加删除镜像动作。
+- 结论：容器镜像列表新增删除按钮；后端新增 `POST /containers/images/remove` 异步任务接口，沿用 `containers.manage` 权限、任务日志和审计，底层支持 Docker API/CLI/SSH 删除镜像且不默认强制删除被容器引用的镜像。

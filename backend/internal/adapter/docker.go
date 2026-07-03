@@ -204,6 +204,21 @@ func DockerImagesForServer(ctx context.Context, server store.Server) ([]DockerIm
 	return parseDockerImages(out)
 }
 
+func DockerImageRemove(ctx context.Context, host, id string) error {
+	if dockerAPIHost(host) {
+		return dockerAPIImageRemove(ctx, host, id)
+	}
+	return dockerCommand(ctx, host, "image", "rm", id).Run()
+}
+
+func DockerImageRemoveForServer(ctx context.Context, server store.Server, id string) error {
+	if dockerAPIHost(server.DockerHost) {
+		return DockerImageRemove(ctx, server.DockerHost, id)
+	}
+	_, err := dockerSSHOutput(ctx, server, "image", "rm", id)
+	return err
+}
+
 func parseDockerImages(out []byte) ([]DockerImage, error) {
 	var rows []struct {
 		ID         string `json:"ID"`

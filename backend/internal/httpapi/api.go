@@ -100,6 +100,7 @@ func New(cfg config.Config, s *store.Store, tasks *worker.Manager) *API {
 			r.Get("/containers/summary", api.containerSummary)
 			r.Get("/containers", api.containers)
 			r.Post("/containers/actions", api.requirePermission(rbac.ContainersManage, api.containerBatchAction))
+			r.Post("/containers/images/remove", api.requirePermission(rbac.ContainersManage, api.containerImageRemove))
 			r.Post("/containers/{id}/start", api.requirePermission(rbac.ContainersManage, api.containerAction("start")))
 			r.Post("/containers/{id}/stop", api.requirePermission(rbac.ContainersManage, api.containerAction("stop")))
 			r.Post("/containers/{id}/restart", api.requirePermission(rbac.ContainersManage, api.containerAction("restart")))
@@ -194,6 +195,10 @@ type deleteAppInstancesRequest struct {
 type containerBatchActionRequest struct {
 	Action string   `json:"action"`
 	IDs    []string `json:"ids"`
+}
+
+type containerImageRemoveRequest struct {
+	ID string `json:"id"`
 }
 
 type credentialSaveRequest struct {
