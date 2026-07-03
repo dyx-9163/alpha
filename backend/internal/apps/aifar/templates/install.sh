@@ -558,6 +558,14 @@ write_ingress_config() {
   cat > "$tmp" <<NGINX
 events {}
 http {
+  map \$http_upgrade \$connection_upgrade {
+    default upgrade;
+    '' close;
+  }
+  map \$http_x_forwarded_for \$client_real_ip {
+    ~^(?<first_ip>[^,]+) \$first_ip;
+    default \$remote_addr;
+  }
   upstream aifar_gateway {
     server ${gateway_container}:${GATEWAY_PORT};
   }
@@ -566,21 +574,54 @@ http {
   }
   server {
     listen ${GATEWAY_PORT};
+    client_max_body_size 1000m;
+    proxy_connect_timeout 300s;
+    proxy_buffering off;
+    proxy_request_buffering off;
     location / {
-      proxy_set_header Host \$host;
-      proxy_set_header X-Real-IP \$remote_addr;
+      proxy_set_header Host \$http_host;
+      proxy_set_header X-Real-IP \$client_real_ip;
       proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
       proxy_set_header X-Forwarded-Proto \$scheme;
+      proxy_set_header X-NginX-Proxy true;
       proxy_pass http://aifar_gateway;
     }
   }
   server {
     listen ${WEB_VUE3_PORT};
-    location / {
-      proxy_set_header Host \$host;
-      proxy_set_header X-Real-IP \$remote_addr;
+    client_max_body_size 1000m;
+    proxy_connect_timeout 300s;
+    proxy_buffering off;
+    proxy_request_buffering off;
+    location /api/ {
+      proxy_intercept_errors off;
+      proxy_set_header Host \$http_host;
+      proxy_set_header X-Real-IP \$client_real_ip;
       proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
       proxy_set_header X-Forwarded-Proto \$scheme;
+      proxy_set_header X-NginX-Proxy true;
+      proxy_pass http://aifar_gateway;
+    }
+    location /im/ws/ {
+      proxy_intercept_errors off;
+      proxy_http_version 1.1;
+      proxy_set_header Upgrade \$http_upgrade;
+      proxy_set_header Connection \$connection_upgrade;
+      proxy_set_header Host \$http_host;
+      proxy_set_header X-Real-IP \$client_real_ip;
+      proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+      proxy_set_header X-Forwarded-Proto \$scheme;
+      proxy_set_header X-NginX-Proxy true;
+      proxy_read_timeout 3600s;
+      proxy_send_timeout 3600s;
+      proxy_pass http://aifar_gateway;
+    }
+    location / {
+      proxy_set_header Host \$http_host;
+      proxy_set_header X-Real-IP \$client_real_ip;
+      proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+      proxy_set_header X-Forwarded-Proto \$scheme;
+      proxy_set_header X-NginX-Proxy true;
       proxy_pass http://aifar_web;
     }
   }

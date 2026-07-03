@@ -531,3 +531,5 @@
 - 结论：AIFAR 批量制品包更新已改为一次生成一个多服务 partial release；后端从设置读取 `deploymentConcurrency` 传入远端脚本，脚本按 AIFAR 服务顺序处理制品，非入口服务按并发批次启动并健康检查，gateway/web-vue3 顺序靠后，全部成功后 reload ingress、停旧服务、切 current，并记录单个 release manifest。验证通过：`go test ./internal/apps/aifar ./internal/store ./internal/httpapi`、`pnpm test`、`git diff --check`。
 - 问题：用户实测 AIFAR 制品更新时新实例出现后很快消失，对应旧模块被重启，滚动更新效果没有达成。
 - 结论：原因是 partial update 复制 base `compose.yaml` 后只改了服务 env，未同步改 `compose.yaml` 中写死的 `image`、`container_name` 和 release labels，导致 Compose 仍在处理旧容器；已在单服务和批量更新脚本中 patch 变更服务的 compose service 块，并用 `--no-deps` 启动/回滚单服务，避免触碰未更新依赖服务。验证通过：`go test ./internal/apps/aifar ./internal/store ./internal/httpapi`、`pnpm test`、`git diff --check`。
+- 问题：用户截图显示 AIFAR 前端静态资源 200，但 `getLoginConfig` XHR 502，询问是否 nginx 配置有问题。
+- 结论：根因是自定义编排把 gateway 容器名改为 release 动态名后，`web-vue3` 容器内 nginx 仍按固定 `aifar-gateway:38000` 转发 `/api/` 和 `/im/ws/`；已改为由稳定 ingress 在 web 端口直接转发 API/WebSocket 到当前 gateway upstream，并让旧 ingress 配置在后续制品更新时自动补写路由。

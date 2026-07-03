@@ -377,6 +377,14 @@ write_ingress_config() {
   cat > "$tmp" <<NGINX
 events {}
 http {
+  map \$http_upgrade \$connection_upgrade {
+    default upgrade;
+    '' close;
+  }
+  map \$http_x_forwarded_for \$client_real_ip {
+    ~^(?<first_ip>[^,]+) \$first_ip;
+    default \$remote_addr;
+  }
   upstream aifar_gateway {
     server ${gateway_container}:${gateway_port};
   }
@@ -385,21 +393,54 @@ http {
   }
   server {
     listen ${gateway_port};
+    client_max_body_size 1000m;
+    proxy_connect_timeout 300s;
+    proxy_buffering off;
+    proxy_request_buffering off;
     location / {
-      proxy_set_header Host \$host;
-      proxy_set_header X-Real-IP \$remote_addr;
+      proxy_set_header Host \$http_host;
+      proxy_set_header X-Real-IP \$client_real_ip;
       proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
       proxy_set_header X-Forwarded-Proto \$scheme;
+      proxy_set_header X-NginX-Proxy true;
       proxy_pass http://aifar_gateway;
     }
   }
   server {
     listen ${web_port};
-    location / {
-      proxy_set_header Host \$host;
-      proxy_set_header X-Real-IP \$remote_addr;
+    client_max_body_size 1000m;
+    proxy_connect_timeout 300s;
+    proxy_buffering off;
+    proxy_request_buffering off;
+    location /api/ {
+      proxy_intercept_errors off;
+      proxy_set_header Host \$http_host;
+      proxy_set_header X-Real-IP \$client_real_ip;
       proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
       proxy_set_header X-Forwarded-Proto \$scheme;
+      proxy_set_header X-NginX-Proxy true;
+      proxy_pass http://aifar_gateway;
+    }
+    location /im/ws/ {
+      proxy_intercept_errors off;
+      proxy_http_version 1.1;
+      proxy_set_header Upgrade \$http_upgrade;
+      proxy_set_header Connection \$connection_upgrade;
+      proxy_set_header Host \$http_host;
+      proxy_set_header X-Real-IP \$client_real_ip;
+      proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+      proxy_set_header X-Forwarded-Proto \$scheme;
+      proxy_set_header X-NginX-Proxy true;
+      proxy_read_timeout 3600s;
+      proxy_send_timeout 3600s;
+      proxy_pass http://aifar_gateway;
+    }
+    location / {
+      proxy_set_header Host \$http_host;
+      proxy_set_header X-Real-IP \$client_real_ip;
+      proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+      proxy_set_header X-Forwarded-Proto \$scheme;
+      proxy_set_header X-NginX-Proxy true;
       proxy_pass http://aifar_web;
     }
   }
@@ -417,10 +458,22 @@ reload_ingress() {
   docker exec "$INGRESS_CONTAINER" nginx -s reload >/dev/null
 }
 
+ingress_config_needs_route_patch() {
+  [ -f "$INGRESS_CONFIG" ] || return 0
+  grep -q 'location /api/' "$INGRESS_CONFIG" || return 0
+  grep -q 'location /im/ws/' "$INGRESS_CONFIG" || return 0
+  grep -q 'proxy_pass http://aifar_gateway;' "$INGRESS_CONFIG" || return 0
+  return 1
+}
+
 configure_ingress_if_needed() {
   case "$SERVICE_NAME" in
     gateway|web-vue3) ;;
-    *) return 0 ;;
+    *)
+      if ! ingress_config_needs_route_patch; then
+        return 0
+      fi
+      ;;
   esac
   mkdir -p "$INGRESS_DIR"
   if [ -f "$INGRESS_CONFIG" ]; then

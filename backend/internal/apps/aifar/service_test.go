@@ -376,6 +376,10 @@ func TestServiceInstallsAIFARServiceFromDockerAppsBundle(t *testing.T) {
 		`aifar.release: "$RELEASE_ID"`,
 		`configure_ingress`,
 		`nginx -s reload`,
+		`location /api/`,
+		`location /im/ws/`,
+		`proxy_pass http://aifar_gateway;`,
+		`proxy_set_header Connection \$connection_upgrade;`,
 	} {
 		if !strings.Contains(remote.installScript, want) {
 			t.Fatalf("AIFAR install script should include custom orchestration with %q:\n%s", want, remote.installScript)
@@ -622,6 +626,10 @@ func TestServiceUpdatesAIFARServiceArtifactAsPartialRelease(t *testing.T) {
 		`aifar.release: \"" release "\""`,
 		`compose --env-file env/compose.env -f compose.yaml up -d --build --no-deps "$SERVICE_NAME"`,
 		`configure_ingress_if_needed`,
+		`ingress_config_needs_route_patch`,
+		`location /api/`,
+		`location /im/ws/`,
+		`proxy_pass http://aifar_gateway;`,
 		`stop_service_in_release "$SERVICE_BASE_RELEASE" "$SERVICE_NAME"`,
 		`rollback_service "$SERVICE_BASE_RELEASE"`,
 		`"kind": "partial"`,
@@ -703,6 +711,10 @@ func TestServiceUpdatesAIFARArtifactBundleAsSingleMultiServicePartialRelease(t *
 		`patch_compose_service_release "$service"`,
 		`compose --env-file env/compose.env -f compose.yaml up -d --build --no-deps "$service"`,
 		`configure_ingress_if_needed`,
+		`ingress_config_needs_route_patch`,
+		`location /api/`,
+		`location /im/ws/`,
+		`proxy_pass http://aifar_gateway;`,
 		`stop_old_changed_services`,
 		`"changedServices": ["oauth", "gateway"]`,
 	} {
