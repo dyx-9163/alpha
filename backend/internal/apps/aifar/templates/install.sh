@@ -380,7 +380,6 @@ YAML
     mem_limit: \${APP_MEMORY_LIMIT}
     networks:
       - ingress
-      - internal
 
 YAML
 }
@@ -398,8 +397,6 @@ networks:
   ingress:
     external: true
     name: ${AIFAR_INGRESS_NETWORK}
-  internal:
-    name: ${AIFAR_INTERNAL_NETWORK}
 YAML
 }
 

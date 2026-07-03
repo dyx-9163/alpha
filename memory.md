@@ -539,3 +539,7 @@
 - 结论：Kubernetes 不是不更新路由状态，而是 Ingress 指向稳定 Service，Service endpoints 由控制器更新；Docker/Compose 默认缺少这一层。AIFAR 可以用稳定 Docker network alias、HAProxy/Traefik runtime API 或自研 endpoint controller 模拟，但当前 nginx reload 方案更简单确定，非入口服务更新本身不需要 ingress 变更。
 - 问题：用户截图显示单独更新 gateway 后容器启动日志完成但面板健康检查为运行异常。
 - 结论：日志显示容器名/应用名是 gateway，但实际启动类为 `AlphaOauthApplication` 且 Tomcat 端口为 38001，说明 gateway 更新很可能上传了 oauth JAR；健康检查按 GATEWAY_PORT=38000 打自然失败。已补充服务制品文件名防呆，并让 Java 服务 env 写入 SERVER_PORT 与 compose/healthcheck 端口保持一致。
+- 问题：用户追问当前是否仍然是前端和 gateway 变更后没有自动更新 ingress。
+- 结论：当前分支代码中单服务更新在 `SERVICE_NAME` 为 `gateway` 或 `web-vue3` 时会重写并 reload ingress；批量更新只要 changed services 包含入口服务也会重写并 reload。若目标机未更新，多半是运行的部署平台版本旧，或新入口服务健康检查失败导致没有进入切流步骤。
+- 问题：用户分别单独重新上传 oauth 和 gateway 后服务不可用，截图显示两个新容器位于不同 release 内网，gateway 日志访问 oauth 的 `38001` 超时。
+- 结论：根因是 Java/Nacos 服务发现可能注册 release 独有内网 IP，分批 partial 后 gateway 与 oauth 跨 release 内网不可达；已改为新业务服务只挂稳定共享网络，partial 更新会规范化服务网络块，并在过渡期把新容器连接到旧 release 链 legacy 内网以兼容已有注册 IP。

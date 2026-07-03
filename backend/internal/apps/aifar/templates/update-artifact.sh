@@ -320,11 +320,14 @@ patch_compose_service_release() {
   awk -v svc="$pcs_service" -v image="$pcs_image" -v container="$pcs_container" -v release="$RELEASE_ID" -v project="$COMPOSE_PROJECT_NAME" '
     function service_header(line) { return line ~ /^  [A-Za-z0-9_-]+:$/ }
     $0 == "  " svc ":" { in_service=1; print; next }
-    in_service && service_header($0) { in_service=0 }
+    in_service && service_header($0) { in_service=0; skip_networks=0 }
     in_service && $0 ~ /^    image:/ { print "    image: " image; next }
     in_service && $0 ~ /^    container_name:/ { print "    container_name: " container; next }
     in_service && $0 ~ /^      aifar\.release:/ { print "      aifar.release: \"" release "\""; next }
     in_service && $0 ~ /^      aifar\.compose-project:/ { print "      aifar.compose-project: \"" project "\""; next }
+    in_service && $0 ~ /^    networks:/ { print "    networks:"; print "      - ingress"; skip_networks=1; next }
+    in_service && skip_networks && $0 ~ /^      - / { next }
+    in_service && skip_networks { skip_networks=0 }
     { print }
   ' "$RELEASE_DIR/compose.yaml" > "$pcs_tmp"
   mv "$pcs_tmp" "$RELEASE_DIR/compose.yaml"
@@ -333,6 +336,41 @@ patch_compose_service_release() {
 ensure_network() {
   network="$(read_env_value "$ENV_DIR/compose.env" AIFAR_INGRESS_NETWORK "$INGRESS_NETWORK")"
   docker network inspect "$network" >/dev/null 2>&1 || docker network create --driver bridge "$network" >/dev/null
+}
+
+release_internal_network() {
+  rin_release="$1"
+  [ -n "$rin_release" ] || return 0
+  read_env_value "$rin_release/env/compose.env" AIFAR_INTERNAL_NETWORK ""
+}
+
+connect_container_to_network() {
+  ctn_container="$1"
+  ctn_network="$2"
+  [ -n "$ctn_container" ] || return 0
+  [ -n "$ctn_network" ] || return 0
+  [ "$ctn_network" != "$INGRESS_NETWORK" ] || return 0
+  [ "$ctn_network" != "$INTERNAL_NETWORK" ] || return 0
+  docker network inspect "$ctn_network" >/dev/null 2>&1 || return 0
+  docker network connect "$ctn_network" "$ctn_container" >/dev/null 2>&1 || true
+}
+
+connect_service_to_legacy_internal_networks() {
+  csl_service="$1"
+  csl_container="$(container_for_service "$csl_service")"
+  [ -n "$csl_container" ] || return 0
+  csl_seen=""
+  for csl_peer in $SERVICE_ORDER; do
+    csl_source="$(release_for_service "$csl_peer" "$BASE_RELEASE" || true)"
+    [ -n "$csl_source" ] || continue
+    csl_network="$(release_internal_network "$csl_source")"
+    [ -n "$csl_network" ] || continue
+    case " $csl_seen " in
+      *" $csl_network "*) continue ;;
+    esac
+    csl_seen="$csl_seen $csl_network"
+    connect_container_to_network "$csl_container" "$csl_network"
+  done
 }
 
 container_for_service() {
@@ -736,6 +774,7 @@ if ! start_updated_service; then
   rollback_service "$SERVICE_BASE_RELEASE"
   fail "AIFAR service $SERVICE_NAME failed to start in partial release $RELEASE_ID"
 fi
+connect_service_to_legacy_internal_networks "$SERVICE_NAME"
 
 if ! wait_service_ready; then
   write_manifest "failed" "$BASE_RELEASE_ID"

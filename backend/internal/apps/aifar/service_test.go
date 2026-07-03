@@ -368,7 +368,8 @@ func TestServiceInstallsAIFARServiceFromDockerAppsBundle(t *testing.T) {
 	if !strings.Contains(remote.installScript, "ensure_network") ||
 		!strings.Contains(remote.installScript, "external: true") ||
 		!strings.Contains(remote.installScript, "name: ${AIFAR_INGRESS_NETWORK}") ||
-		!strings.Contains(remote.installScript, "name: ${AIFAR_INTERNAL_NETWORK}") {
+		strings.Contains(remote.installScript, "name: ${AIFAR_INTERNAL_NETWORK}") ||
+		strings.Contains(remote.installScript, "      - internal") {
 		t.Fatalf("AIFAR install script should create and use the shared Docker network as external:\n%s", remote.installScript)
 	}
 	for _, want := range []string{
@@ -618,6 +619,9 @@ func TestServiceUpdatesAIFARServiceArtifactAsPartialRelease(t *testing.T) {
 		`set_env SERVER_PORT "$srp_port_value" "$ENV_DIR/$srp_service.env"`,
 		`patch_compose_service_release "$SERVICE_NAME"`,
 		`aifar.release: \"" release "\""`,
+		`print "    networks:"; print "      - ingress"`,
+		`docker network connect "$ctn_network" "$ctn_container"`,
+		`connect_service_to_legacy_internal_networks "$SERVICE_NAME"`,
 		`compose --env-file env/compose.env -f compose.yaml up -d --build --no-deps "$SERVICE_NAME"`,
 		`configure_ingress_if_needed`,
 		`ingress_config_needs_route_patch`,
@@ -726,6 +730,9 @@ func TestServiceUpdatesAIFARArtifactBundleAsSingleMultiServicePartialRelease(t *
 		`ln -s "$lis_real_dir" "$APP_DIR/$lis_service"`,
 		`write_containers_json`,
 		`patch_compose_service_release "$service"`,
+		`print "    networks:"; print "      - ingress"`,
+		`docker network connect "$ctn_network" "$ctn_container"`,
+		`connect_service_to_legacy_internal_networks "$service"`,
 		`compose --env-file env/compose.env -f compose.yaml up -d --build --no-deps "$service"`,
 		`configure_ingress_if_needed`,
 		`ingress_config_needs_route_patch`,
