@@ -5,6 +5,7 @@ INSTALL_ROOT={{ quote .InstallRoot }}
 WORK_DIR={{ quote .WorkDir }}
 SERVICE_ORDER={{ quote .ServiceOrder }}
 SERVICE_NAME={{ quote .ServiceName }}
+DESIRED_REPLICAS={{ quote .DesiredReplicas }}
 ARTIFACT_REMOTE={{ quote .ArtifactRemote }}
 ARTIFACT_FILE={{ quote .ArtifactFileName }}
 ARTIFACT_SHA256={{ quote .ArtifactSHA256 }}
@@ -85,6 +86,13 @@ service_container_name() {
   printf "aifar-%s-%s" "$1" "$RELEASE_ID" | tr '. _/' '----'
 }
 
+replica_container_name() {
+  rcn_service="$1"
+  rcn_replica="$2"
+  rcn_base="$(service_container_name "$rcn_service")"
+  case "$rcn_replica" in ""|1) printf "%s" "$rcn_base" ;; *) printf "%s-r%s" "$rcn_base" "$rcn_replica" ;; esac
+}
+
 current_release() {
   if [ -L "$CURRENT_LINK" ] || [ -d "$CURRENT_LINK" ]; then
     readlink -f "$CURRENT_LINK" 2>/dev/null || printf "%s" "$CURRENT_LINK"
@@ -159,6 +167,25 @@ service_known() {
     [ "$service" = "$SERVICE_NAME" ] && return 0
   done
   return 1
+}
+
+service_changed() {
+  [ "$1" = "$SERVICE_NAME" ]
+}
+
+desired_replicas_for_service() {
+  drfs_service="$1"
+  drfs_value=""
+  for drfs_pair in $DESIRED_REPLICAS; do
+    case "$drfs_pair" in
+      "$drfs_service="*) drfs_value="${drfs_pair#*=}" ;;
+    esac
+  done
+  case "$drfs_value" in ""|*[!0-9]*) drfs_value=1 ;; esac
+  if [ "$drfs_value" -lt 1 ]; then
+    drfs_value=1
+  fi
+  printf "%s" "$drfs_value"
 }
 
 service_port_var() {
@@ -397,7 +424,10 @@ connect_container_to_network() {
 
 connect_service_to_legacy_internal_networks() {
   csl_service="$1"
-  csl_container="$(container_for_service "$csl_service")"
+  csl_container="${2:-}"
+  if [ -z "$csl_container" ]; then
+    csl_container="$(container_for_service "$csl_service")"
+  fi
   [ -n "$csl_container" ] || return 0
   csl_seen=""
   for csl_peer in $SERVICE_ORDER; do
@@ -451,7 +481,10 @@ container_restart_count() {
 
 service_runtime_ready() {
   service="$1"
-  container="$(container_for_service "$service")"
+  container="${2:-}"
+  if [ -z "$container" ]; then
+    container="$(container_for_service "$service")"
+  fi
   [ -n "$container" ] || return 0
   status="$(container_status "$container")"
   if [ "$status" != "running" ]; then
@@ -478,17 +511,19 @@ service_runtime_ready() {
 
 wait_service_ready() {
   startup_timeout="$(read_env_value "$ENV_DIR/compose.env" APP_STARTUP_TIMEOUT 180)"
+  service="${1:-$SERVICE_NAME}"
+  container="${2:-}"
   stable_window="$(read_env_value "$ENV_DIR/compose.env" APP_STABLE_WINDOW 10)"
   case "$startup_timeout" in
     ""|*[!0-9]*) startup_timeout=180 ;;
   esac
   deadline=$(( $(date +%s) + startup_timeout ))
   while :; do
-    if service_runtime_ready "$SERVICE_NAME"; then
+    if service_runtime_ready "$service" "$container"; then
       break
     fi
     if [ "$(date +%s)" -ge "$deadline" ]; then
-      echo "AIFAR service $SERVICE_NAME did not become ready in release $RELEASE_ID" >&2
+      echo "AIFAR service $service did not become ready in release $RELEASE_ID" >&2
       return 1
     fi
     sleep 3
@@ -499,17 +534,43 @@ wait_service_ready() {
   if [ "$stable_window" -gt 0 ]; then
     sleep "$stable_window"
   fi
-  service_runtime_ready "$SERVICE_NAME"
+  service_runtime_ready "$service" "$container"
+}
+
+list_containers_by_label() {
+  lcb_service="$1"
+  lcb_release="${2:-}"
+  if [ -n "$lcb_release" ]; then
+    docker ps --filter "label=aifar.app=aifar" \
+      --filter "label=aifar.install-root=$INSTALL_ROOT" \
+      --filter "label=aifar.service=$lcb_service" \
+      --filter "label=aifar.release=$lcb_release" \
+      --format '{{ "{{" }}.Names{{ "}}" }}' 2>/dev/null || true
+    return
+  fi
+  docker ps --filter "label=aifar.app=aifar" \
+    --filter "label=aifar.install-root=$INSTALL_ROOT" \
+    --filter "label=aifar.service=$lcb_service" \
+    --format '{{ "{{" }}.Names{{ "}}" }}' 2>/dev/null || true
+}
+
+list_route_containers() {
+  lrc_service="$1"
+  if service_changed "$lrc_service"; then
+    list_containers_by_label "$lrc_service" "$RELEASE_ID"
+    return
+  fi
+  list_containers_by_label "$lrc_service" ""
 }
 
 write_ingress_config() {
   mkdir -p "$INGRESS_DIR"
-  gateway_container="$(route_container_for_service gateway)"
-  web_container="$(route_container_for_service web-vue3)"
   gateway_port="$(read_env_value "$ENV_DIR/compose.env" GATEWAY_PORT 38000)"
   web_port="$(read_env_value "$ENV_DIR/compose.env" WEB_VUE3_PORT 8080)"
-  [ -n "$gateway_container" ] || fail "gateway route container is empty"
-  [ -n "$web_container" ] || fail "web-vue3 route container is empty"
+  gateway_servers="$(list_route_containers gateway)"
+  web_servers="$(list_route_containers web-vue3)"
+  [ -n "$gateway_servers" ] || fail "gateway upstream has no running endpoints"
+  [ -n "$web_servers" ] || fail "web-vue3 upstream has no running endpoints"
   tmp="$INGRESS_CONFIG.tmp"
   cat > "$tmp" <<NGINX
 events {}
@@ -523,10 +584,18 @@ http {
     default \$remote_addr;
   }
   upstream aifar_gateway {
-    server ${gateway_container}:${gateway_port};
+NGINX
+  for endpoint in $gateway_servers; do
+    printf "    server %s:%s;\n" "$endpoint" "$gateway_port" >> "$tmp"
+  done
+  cat >> "$tmp" <<NGINX
   }
   upstream aifar_web {
-    server ${web_container}:${web_port};
+NGINX
+  for endpoint in $web_servers; do
+    printf "    server %s:%s;\n" "$endpoint" "$web_port" >> "$tmp"
+  done
+  cat >> "$tmp" <<NGINX
   }
   server {
     listen ${gateway_port};
@@ -632,9 +701,10 @@ configure_ingress_if_needed() {
 apply_restart_policy_for_service() {
   policy="$(read_env_value "$ENV_DIR/compose.env" APP_RESTART_POLICY unless-stopped)"
   [ -n "$policy" ] || policy="unless-stopped"
-  container="$(container_for_service "$SERVICE_NAME")"
-  [ -n "$container" ] || return 0
-  docker update --restart "$policy" "$container" >/dev/null 2>&1 || true
+  list_containers_by_label "$SERVICE_NAME" "$RELEASE_ID" | while read -r container; do
+    [ -n "$container" ] || continue
+    docker update --restart "$policy" "$container" >/dev/null 2>&1 || true
+  done
 }
 
 start_updated_service() {
@@ -644,6 +714,71 @@ start_updated_service() {
     export APP_RESTART_POLICY
     compose --env-file env/compose.env -f compose.yaml up -d --build --no-deps "$SERVICE_NAME"
   )
+}
+
+start_replica_container() {
+  src_service="$1"
+  src_replica="$2"
+  src_container="$(replica_container_name "$src_service" "$src_replica")"
+  src_service_env="$ENV_DIR/$src_service.env"
+  src_compose_env="$ENV_DIR/compose.env"
+  src_image="$(read_env_value "$src_service_env" APP_IMAGE "")"
+  [ -n "$src_image" ] || fail "service image is empty: $src_service"
+  src_port_var="$(service_port_var "$src_service")"
+  src_port="$(read_env_value "$src_compose_env" "$src_port_var" "")"
+  src_health_protocol="$(read_env_value "$src_compose_env" APP_HEALTH_PROTOCOL http)"
+  src_health_host="$(read_env_value "$src_compose_env" APP_HEALTH_HOST 127.0.0.1)"
+  src_health_path="$(read_env_value "$src_compose_env" APP_HEALTH_PATH "")"
+  src_health_connect_timeout="$(read_env_value "$src_compose_env" APP_HEALTH_CONNECT_TIMEOUT 3)"
+  src_health_interval="$(read_env_value "$src_compose_env" APP_HEALTH_INTERVAL 15s)"
+  src_health_timeout="$(read_env_value "$src_compose_env" APP_HEALTH_TIMEOUT 5s)"
+  src_health_retries="$(read_env_value "$src_compose_env" APP_HEALTH_RETRIES 3)"
+  src_health_start_period="$(read_env_value "$src_compose_env" APP_HEALTH_START_PERIOD 30s)"
+  src_app_cpus="$(read_env_value "$src_compose_env" APP_CPUS "")"
+  src_memory_limit="$(read_env_value "$src_compose_env" APP_MEMORY_LIMIT "")"
+  src_tz="$(read_env_value "$src_compose_env" TZ system)"
+  src_env_args=""
+  if [ "$src_service" = "web-vue3" ]; then
+    src_env_args="$src_env_args --env-file $src_service_env"
+    src_health_cmd="wget -q -T $src_health_connect_timeout -O /dev/null ${src_health_protocol}://${src_health_host}:${src_port}${src_health_path} || exit 1"
+  else
+    src_env_args="$src_env_args --env-file $ENV_DIR/java-common.env --env-file $ENV_DIR/java-secrets.env --env-file $src_service_env"
+    src_health_cmd="curl -fsS --connect-timeout $src_health_connect_timeout ${src_health_protocol}://${src_health_host}:${src_port}${src_health_path} >/dev/null || exit 1"
+  fi
+  docker rm -f "$src_container" >/dev/null 2>&1 || true
+  docker run -d \
+    --name "$src_container" \
+    --restart no \
+    --label aifar.app=aifar \
+    --label "aifar.install-root=$INSTALL_ROOT" \
+    --label "aifar.release=$RELEASE_ID" \
+    --label "aifar.service=$src_service" \
+    --label "aifar.replica=$src_replica" \
+    --network "$INGRESS_NETWORK" \
+    --cpus "$src_app_cpus" \
+    --memory "$src_memory_limit" \
+    --health-cmd "$src_health_cmd" \
+    --health-interval "$src_health_interval" \
+    --health-timeout "$src_health_timeout" \
+    --health-retries "$src_health_retries" \
+    --health-start-period "$src_health_start_period" \
+    -e "APP_CONTAINER_NAME=$src_container" \
+    -e "TZ=$src_tz" \
+    $src_env_args \
+    "$src_image" >/dev/null
+  connect_service_to_legacy_internal_networks "$src_service" "$src_container"
+  wait_service_ready "$src_service" "$src_container"
+}
+
+start_additional_replicas() {
+  sar_service="$1"
+  sar_desired="$(desired_replicas_for_service "$sar_service")"
+  [ "$sar_desired" -gt 1 ] || return 0
+  sar_replica=2
+  while [ "$sar_replica" -le "$sar_desired" ]; do
+    start_replica_container "$sar_service" "$sar_replica"
+    sar_replica=$((sar_replica + 1))
+  done
 }
 
 stop_service_in_release() {
@@ -656,6 +791,15 @@ stop_service_in_release() {
     compose --env-file env/compose.env -f compose.yaml stop "$ss_service" >/dev/null 2>&1 || true
     compose --env-file env/compose.env -f compose.yaml rm -f "$ss_service" >/dev/null 2>&1 || true
   )
+  ss_release_id="$(basename "$ss_release")"
+  docker ps -a --filter "label=aifar.app=aifar" \
+    --filter "label=aifar.install-root=$INSTALL_ROOT" \
+    --filter "label=aifar.release=$ss_release_id" \
+    --filter "label=aifar.service=$ss_service" \
+    --format '{{ "{{" }}.Names{{ "}}" }}' 2>/dev/null | while read -r ss_container; do
+      [ -n "$ss_container" ] || continue
+      docker rm -f "$ss_container" >/dev/null 2>&1 || true
+    done
 }
 
 rollback_service() {
@@ -826,6 +970,13 @@ if ! wait_service_ready; then
   stop_service_in_release "$RELEASE_DIR" "$SERVICE_NAME"
   rollback_service "$SERVICE_BASE_RELEASE"
   fail "AIFAR service $SERVICE_NAME did not become stable in partial release $RELEASE_ID"
+fi
+
+if ! start_additional_replicas "$SERVICE_NAME"; then
+  write_manifest "failed" "$BASE_RELEASE_ID"
+  stop_service_in_release "$RELEASE_DIR" "$SERVICE_NAME"
+  rollback_service "$SERVICE_BASE_RELEASE"
+  fail "AIFAR service $SERVICE_NAME replicas did not become stable in partial release $RELEASE_ID"
 fi
 
 if ! configure_ingress_if_needed; then

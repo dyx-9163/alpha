@@ -22,7 +22,7 @@ import (
 	"aifar-deployment/backend/internal/store"
 )
 
-//go:embed templates/install.sh templates/uninstall.sh templates/update-artifact.sh templates/update-artifact-bundle.sh
+//go:embed templates/install.sh templates/uninstall.sh templates/update-artifact.sh templates/update-artifact-bundle.sh templates/autoscale-out.sh
 var templateFS embed.FS
 
 type Logger = installerkit.Logger
@@ -79,6 +79,15 @@ type ArtifactBundleUpdateRequest struct {
 	BundleLocalPath string
 	BundleFileName  string
 	Concurrency     int
+}
+
+type ScaleOutRequest struct {
+	Instance    store.AppInstance
+	Server      store.Server
+	Language    string
+	Actor       string
+	ServiceName string
+	Reason      string
 }
 
 type CheckResult struct {
@@ -301,6 +310,7 @@ func installMetadata(server store.Server, installRoot, version, releaseID string
 	metadata := map[string]any{
 		"installRoot":      installRoot,
 		"layout":           releaseLayout,
+		"releasePhase":     releasePhaseActive,
 		"currentRelease":   installRoot + "/" + currentLinkName,
 		"releaseId":        releaseID,
 		"releasePath":      installRoot + "/" + releasesDirName + "/" + releaseID,
@@ -359,6 +369,21 @@ func partialOrchestrationMetadata(current map[string]any, installRoot, releaseID
 		}
 		next["containers"] = containers
 	}
+	next["releasePhase"] = releasePhaseActive
+	desired := desiredReplicasFromMetadata(current)
+	next["desiredReplicas"] = desired
+	activeEndpoints := activeEndpointsFromMetadata(current)
+	for _, service := range changedServices {
+		replicas := desired[service]
+		if replicas < 1 {
+			replicas = 1
+			desired[service] = replicas
+		}
+		activeEndpoints[service] = releaseEndpointsForService(service, releaseID, replicas, gatewayPort, webPort)
+	}
+	next["activeEndpoints"] = activeEndpoints
+	next["activeServices"] = activeServicesFromEndpoints(desired, activeEndpoints)
+	next["autoscalePolicy"] = autoscalePolicyFromMetadata(current).metadata()
 	return next
 }
 
@@ -391,6 +416,8 @@ func applyEffectiveReleaseFields(manifest map[string]any, orchestration map[stri
 }
 
 func releaseManifest(version, releaseID string, releaseTime time.Time, configHash, ingressNetwork string, gatewayPort, webPort int) map[string]any {
+	desired := defaultDesiredReplicas()
+	endpoints := releaseActiveEndpoints(releaseID, gatewayPort, webPort)
 	manifest := map[string]any{
 		"app":              AppName,
 		"version":          version,
@@ -398,10 +425,15 @@ func releaseManifest(version, releaseID string, releaseTime time.Time, configHas
 		"layout":           releaseLayout,
 		"kind":             "full",
 		"status":           "success",
+		"phase":            releasePhaseActive,
 		"configHash":       configHash,
 		"createdAt":        releaseTime.Format(time.RFC3339),
 		"releaseRetention": releaseKeepCount,
 		"services":         serviceOrder,
+		"desiredReplicas":  desired,
+		"endpoints":        endpoints,
+		"activeServices":   activeServicesFromEndpoints(desired, endpoints),
+		"autoscalePolicy":  defaultAutoscalePolicy().metadata(),
 	}
 	for key, value := range releaseManifestFields(releaseID, ingressNetwork, gatewayPort, webPort) {
 		manifest[key] = value
@@ -417,6 +449,7 @@ func partialReleaseManifest(version, releaseID string, releaseTime time.Time, co
 		"layout":           releaseLayout,
 		"kind":             "partial",
 		"status":           "success",
+		"phase":            releasePhaseActive,
 		"configHash":       configHash,
 		"baseReleaseId":    baseReleaseID,
 		"createdAt":        releaseTime.Format(time.RFC3339),
@@ -435,6 +468,7 @@ func partialReleaseManifest(version, releaseID string, releaseTime time.Time, co
 		manifest[key] = value
 	}
 	applyEffectiveReleaseFields(manifest, orchestration)
+	applyEffectiveServiceFields(manifest, orchestration)
 	return manifest
 }
 
@@ -456,6 +490,7 @@ func partialBundleReleaseManifest(version, releaseID string, releaseTime time.Ti
 		"layout":                releaseLayout,
 		"kind":                  "partial",
 		"status":                "success",
+		"phase":                 releasePhaseActive,
 		"configHash":            configHash,
 		"baseReleaseId":         baseReleaseID,
 		"createdAt":             releaseTime.Format(time.RFC3339),
@@ -469,6 +504,7 @@ func partialBundleReleaseManifest(version, releaseID string, releaseTime time.Ti
 		manifest[key] = value
 	}
 	applyEffectiveReleaseFields(manifest, orchestration)
+	applyEffectiveServiceFields(manifest, orchestration)
 	return manifest
 }
 
@@ -497,6 +533,15 @@ func (s Service) UpdateArtifact(ctx context.Context, req ArtifactUpdateRequest, 
 		recorder.StartTarget(target)
 	}
 	step := newStepRunner(logForServer, recorder, target, updateSteps(copy), copy.StepStart, copy.StepDone, copy.StepFailed)
+	lockedInstance, err := s.acquireOrchestrationLock(req.Instance.ID, "update-artifact", strings.TrimSpace(req.ServiceName), req.Actor)
+	if err != nil {
+		msg := fmt.Sprintf(copy.UpdateFailed, err)
+		logForServer.Error("%s", msg)
+		finishTarget(recorder, target, "failed", msg)
+		return err
+	}
+	defer s.releaseOrchestrationLock(req.Instance.ID, "update-artifact")
+	req.Instance = lockedInstance
 
 	var artifact artifactInfo
 	var metadata map[string]any
@@ -582,6 +627,7 @@ func (s Service) UpdateArtifact(ctx context.Context, req ArtifactUpdateRequest, 
 			IngressNetwork:   ingressNetwork,
 			InternalNetwork:  internalNetwork,
 			IngressContainer: ingressContainer,
+			DesiredReplicas:  replicaAssignments(map[string]int{artifact.ServiceName: desiredReplicasFromMetadata(metadata)[artifact.ServiceName]}),
 		})
 		if err != nil {
 			return err
@@ -851,6 +897,15 @@ func (s Service) Delete(ctx context.Context, req DeleteRequest, log Logger, targ
 		recorder.StartTarget(target)
 	}
 	step := newStepRunner(logForServer, recorder, target, deleteSteps(copy), copy.StepStart, copy.StepDone, copy.StepFailed)
+	lockedInstance, err := s.acquireOrchestrationLock(req.Instance.ID, "delete", "", "")
+	if err != nil {
+		msg := fmt.Sprintf(copy.DeleteFailed, err)
+		logForServer.Error("%s", msg)
+		finishTarget(recorder, target, "failed", msg)
+		return err
+	}
+	defer s.releaseOrchestrationLock(req.Instance.ID, "delete")
+	req.Instance = lockedInstance
 	metadata := metadataFromInstance(req.Instance)
 	networkName := stringFromMetadata(metadata, "networkName", defaultNetworkName)
 	installRoot := stringFromMetadata(metadata, "installRoot", installRootFromDeployDir(req.Server.DeployDir))
@@ -917,9 +972,17 @@ func (s Service) Check(ctx context.Context, req CheckRequest, log Logger, target
 	metadata := metadataFromInstance(req.Instance)
 	installRoot := stringFromMetadata(metadata, "installRoot", installRootFromDeployDir(req.Server.DeployDir))
 	var status StatusResult
+	var scaleStatus autoscaleStatus
+	var scaleStatusOK bool
 	if err := step(1, func() error {
 		var checkErr error
 		status, checkErr = NewInspector(s.remote).Check(ctx, req.Server, installRoot, logForServer)
+		if checkErr == nil {
+			if collected, collectErr := collectAutoscaleStatus(ctx, s.remote, req.Server, installRoot); collectErr == nil {
+				scaleStatus = collected
+				scaleStatusOK = true
+			}
+		}
 		return checkErr
 	}); err != nil {
 		msg := fmt.Sprintf(copy.CheckFailed, err)
@@ -940,6 +1003,11 @@ func (s Service) Check(ctx context.Context, req CheckRequest, log Logger, target
 		"staleContainers":     status.StaleContainers,
 		"ingressRunning":      status.IngressRunning,
 		"containers":          status.Containers,
+	}
+	if scaleStatusOK {
+		details["activeEndpoints"] = activeEndpointsFromMetrics(scaleStatus.Endpoints)
+		details["activeServices"] = activeServicesFromEndpoints(desiredReplicasFromMetadata(metadata), activeEndpointsFromMetrics(scaleStatus.Endpoints))
+		details["autoscaleMetrics"] = metricsMetadata(scaleStatus.Endpoints, time.Now().UTC())
 	}
 	if err := step(2, func() error {
 		return s.markInstanceStatus(req.Instance, status.Status, details)
@@ -992,6 +1060,7 @@ type updateScriptData struct {
 	WorkDir          string
 	ServiceOrder     string
 	ServiceName      string
+	DesiredReplicas  string
 	ArtifactRemote   string
 	ArtifactFileName string
 	ArtifactSHA256   string
@@ -1020,6 +1089,7 @@ type bundleUpdateScriptData struct {
 	WorkDir          string
 	ServiceOrder     string
 	ChangedServices  string
+	DesiredReplicas  string
 	Artifacts        []bundleUpdateScriptArtifact
 	Version          string
 	ReleaseID        string
@@ -1031,6 +1101,17 @@ type bundleUpdateScriptData struct {
 	InternalNetwork  string
 	IngressContainer string
 	Concurrency      int
+}
+
+type autoscaleOutScriptData struct {
+	InstallRoot      string
+	ServiceName      string
+	ReleaseID        string
+	ReplicaID        int
+	ContainerName    string
+	IngressNetwork   string
+	IngressContainer string
+	MaxReplicas      int
 }
 
 func renderInstallScript(data installScriptData) (string, error) {
@@ -1071,6 +1152,46 @@ func renderBundleUpdateScript(data bundleUpdateScriptData) (string, error) {
 	return installerkit.RenderTemplate(AppName, "update-artifact-bundle.sh", "aifar-update-bundle", string(content), template.FuncMap{
 		"quote": shellQuoteAny,
 	}, data)
+}
+
+func renderAutoscaleOutScript(data autoscaleOutScriptData) (string, error) {
+	content, err := templateFS.ReadFile("templates/autoscale-out.sh")
+	if err != nil {
+		return "", err
+	}
+	return installerkit.RenderTemplate(AppName, "autoscale-out.sh", "aifar-autoscale-out", string(content), template.FuncMap{
+		"quote": shellQuoteAny,
+	}, data)
+}
+
+func replicaAssignmentsForServices(desired map[string]int, services []string) string {
+	selected := make(map[string]int, len(services))
+	for _, service := range services {
+		replicas := desired[service]
+		if replicas < 1 {
+			replicas = 1
+		}
+		selected[service] = replicas
+	}
+	return replicaAssignments(selected)
+}
+
+func replicaAssignments(desired map[string]int) string {
+	if len(desired) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(desired))
+	for _, service := range serviceOrder {
+		replicas, ok := desired[service]
+		if !ok {
+			continue
+		}
+		if replicas < 1 {
+			replicas = 1
+		}
+		parts = append(parts, fmt.Sprintf("%s=%d", service, replicas))
+	}
+	return strings.Join(parts, " ")
 }
 
 func shellQuoteAny(value any) string {

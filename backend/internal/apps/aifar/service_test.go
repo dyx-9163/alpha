@@ -131,13 +131,16 @@ func (f *fakeStore) DeleteOldAppReleases(instanceID string, keep int) (int, erro
 }
 
 type fakeRemote struct {
-	mu            sync.Mutex
-	commands      []string
-	uploads       []string
-	installScript string
-	updateScript  string
-	bundleScript  string
-	statusStdout  string
+	mu                      sync.Mutex
+	commands                []string
+	uploads                 []string
+	installScript           string
+	updateScript            string
+	bundleScript            string
+	autoscaleScript         string
+	statusStdout            string
+	autoscaleStatusStdouts  []string
+	autoscaleStatusFallback string
 }
 
 func (f *fakeRemote) Run(ctx context.Context, server store.Server, command string) (adapter.CommandResult, error) {
@@ -146,6 +149,17 @@ func (f *fakeRemote) Run(ctx context.Context, server store.Server, command strin
 	f.commands = append(f.commands, command)
 	if strings.Contains(command, "AIFAR_SERVICE_STATUS") && f.statusStdout != "" {
 		return adapter.CommandResult{Stdout: f.statusStdout}, nil
+	}
+	if strings.Contains(command, "AIFAR_AUTOSCALE_STATUS") {
+		if len(f.autoscaleStatusStdouts) > 0 {
+			stdout := f.autoscaleStatusStdouts[0]
+			f.autoscaleStatusStdouts = f.autoscaleStatusStdouts[1:]
+			return adapter.CommandResult{Stdout: stdout}, nil
+		}
+		return adapter.CommandResult{Stdout: f.autoscaleStatusFallback}, nil
+	}
+	if strings.Contains(command, "AIFAR_AUTOSCALE_OUT") {
+		f.autoscaleScript = command
 	}
 	return adapter.CommandResult{Stdout: "ok"}, nil
 }
@@ -290,6 +304,178 @@ func writeAlphaJarBundleWithManifestPrefix(t *testing.T, artifacts []bundleTestA
 		t.Fatal(err)
 	}
 	return bundlePath
+}
+
+func TestAutoscalePolicyDefaultsAndTrigger(t *testing.T) {
+	now := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
+	instance := installedAIFARInstance(t)
+	metadata := metadataFromInstance(instance)
+	signals := map[string]any{
+		"permission": map[string]any{"since": now.Add(-6 * time.Minute).Format(time.RFC3339)},
+	}
+	metadata["autoscaleSignals"] = signals
+	status := autoscaleStatus{Endpoints: []autoscaleMetric{{
+		Service:          "permission",
+		Container:        "aifar-permission-rel",
+		ReleaseID:        "rel",
+		ReplicaID:        1,
+		Port:             defaultPermissionPort,
+		Running:          true,
+		Health:           "healthy",
+		MemoryPercent:    86,
+		MemoryLimitBytes: 2 * 1024 * 1024 * 1024,
+	}}}
+	next, decision := evaluateAutoscale(instance, metadata, status, autoscalePolicyFromMetadata(metadata), now)
+	if decision.Service != "permission" {
+		t.Fatalf("expected permission scale decision, got %+v", decision)
+	}
+	policy := autoscalePolicyFromMetadata(next)
+	if !policy.Enabled || policy.MemoryThreshold != 80 || policy.MaxReplicas != 3 || policy.ScaleIn {
+		t.Fatalf("unexpected autoscale defaults: %+v", policy)
+	}
+}
+
+func TestAutoscaleDoesNotTriggerWithoutMemoryLimitOrDuringCooldown(t *testing.T) {
+	now := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
+	instance := installedAIFARInstance(t)
+	metadata := metadataFromInstance(instance)
+	metadata["autoscaleSignals"] = map[string]any{
+		"permission": map[string]any{
+			"since":        now.Add(-10 * time.Minute).Format(time.RFC3339),
+			"lastScaledAt": now.Add(-2 * time.Minute).Format(time.RFC3339),
+		},
+	}
+	status := autoscaleStatus{Endpoints: []autoscaleMetric{{
+		Service:          "permission",
+		Container:        "aifar-permission-rel",
+		ReleaseID:        "rel",
+		ReplicaID:        1,
+		Port:             defaultPermissionPort,
+		Running:          true,
+		Health:           "healthy",
+		MemoryPercent:    90,
+		MemoryLimitBytes: 2 * 1024 * 1024 * 1024,
+	}}}
+	_, decision := evaluateAutoscale(instance, metadata, status, autoscalePolicyFromMetadata(metadata), now)
+	if decision.Service != "" {
+		t.Fatalf("expected cooldown to suppress scale out, got %+v", decision)
+	}
+	metadata["autoscaleSignals"] = map[string]any{
+		"permission": map[string]any{"since": now.Add(-10 * time.Minute).Format(time.RFC3339)},
+	}
+	status.Endpoints[0].MemoryLimitBytes = 0
+	_, decision = evaluateAutoscale(instance, metadata, status, autoscalePolicyFromMetadata(metadata), now)
+	if decision.Service != "" {
+		t.Fatalf("expected missing memory limit to suppress scale out, got %+v", decision)
+	}
+}
+
+func TestAutoscaleOutScriptUsesReplicaContainerAndEscapedDockerFormats(t *testing.T) {
+	script, err := renderAutoscaleOutScript(autoscaleOutScriptData{
+		InstallRoot:      "/aifar/apps/admin",
+		ServiceName:      "permission",
+		ReleaseID:        "rel-1",
+		ReplicaID:        2,
+		ContainerName:    "aifar-permission-rel-1-r2",
+		IngressNetwork:   "aifar-network",
+		IngressContainer: ingressContainerName(),
+		MaxReplicas:      3,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		`--name "$CONTAINER_NAME"`,
+		`--label "aifar.replica=$REPLICA_ID"`,
+		`--format '{{.Names}}'`,
+		`docker run -d`,
+	} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("autoscale script missing %q:\n%s", want, script)
+		}
+	}
+}
+
+func TestScaleOutCreatesReplicaAndUpdatesEndpointMetadata(t *testing.T) {
+	instance := installedAIFARInstance(t)
+	s := &fakeStore{
+		servers: map[string]store.Server{"srv-1": {ID: "srv-1", Host: "10.0.0.10", DeployDir: "/aifar/apps"}},
+		instances: []store.AppInstance{
+			instance,
+		},
+	}
+	remote := &fakeRemote{autoscaleStatusStdouts: []string{
+		"endpoint=permission|aifar-permission-rel|rel|1|38010|true|healthy|86|2147483648\nhostMemoryAvailableBytes=8589934592\n",
+		"endpoint=permission|aifar-permission-rel|rel|1|38010|true|healthy|50|2147483648\nendpoint=permission|aifar-permission-rel-r2|rel|2|38010|true|healthy|5|2147483648\nhostMemoryAvailableBytes=6442450944\n",
+	}}
+	service := NewService(s, remote)
+	err := service.ScaleOut(context.Background(), ScaleOutRequest{
+		Instance:    instance,
+		Server:      s.servers["srv-1"],
+		Actor:       "system",
+		ServiceName: "permission",
+		Reason:      "test",
+	}, fakeLogger{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(remote.autoscaleScript, "AIFAR_AUTOSCALE_OUT") || !strings.Contains(remote.autoscaleScript, "aifar-permission-20260701t010203.000000000z-docker-apps-r2") {
+		t.Fatalf("expected autoscale remote script to run with replica container, got:\n%s", remote.autoscaleScript)
+	}
+	saved, err := s.GetAppInstance(instance.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	metadata := metadataFromInstance(saved)
+	desired := desiredReplicasFromMetadata(metadata)
+	if desired["permission"] != 2 {
+		t.Fatalf("expected permission desired replicas 2, got %v metadata=%s", desired["permission"], saved.Metadata)
+	}
+	endpoints, ok := metadata["activeEndpoints"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected activeEndpoints metadata, got %s", saved.Metadata)
+	}
+	if endpointCount(endpoints["permission"]) != 2 {
+		t.Fatalf("expected two permission endpoints, got %s", saved.Metadata)
+	}
+	if _, locked := metadata["orchestrationLock"]; locked {
+		t.Fatalf("expected orchestration lock to be released, got %s", saved.Metadata)
+	}
+}
+
+func TestPartialOrchestrationPreservesDesiredReplicasForChangedService(t *testing.T) {
+	current := map[string]any{
+		"releaseId":   "base-release",
+		"gatewayPort": float64(defaultGatewayPort),
+		"webPort":     float64(defaultWebPort),
+		"desiredReplicas": map[string]any{
+			"permission": float64(2),
+			"gateway":    float64(1),
+		},
+		"activeEndpoints": map[string]any{
+			"permission": []any{
+				map[string]any{"container": releaseContainerName("permission", "base-release"), "releaseId": "base-release", "replicaId": float64(1), "port": float64(defaultPermissionPort)},
+				map[string]any{"container": releaseReplicaContainerName("permission", "base-release", 2), "releaseId": "base-release", "replicaId": float64(2), "port": float64(defaultPermissionPort)},
+			},
+			"gateway": []any{
+				map[string]any{"container": releaseContainerName("gateway", "base-release"), "releaseId": "base-release", "replicaId": float64(1), "port": float64(defaultGatewayPort)},
+			},
+		},
+	}
+	next := partialOrchestrationMetadata(current, "/data/apps/admin", "new-release", defaultNetworkName, defaultGatewayPort, defaultWebPort, []string{"permission"})
+	desired := desiredReplicasFromMetadata(next)
+	if desired["permission"] != 2 {
+		t.Fatalf("expected changed service desired replicas to stay 2, got %+v", desired)
+	}
+	endpoints := activeEndpointsFromMetadata(next)
+	if endpointCount(endpoints["permission"]) != 2 {
+		t.Fatalf("expected two new permission endpoints, got %+v", endpoints["permission"])
+	}
+	data, _ := json.Marshal(endpoints["permission"])
+	if !strings.Contains(string(data), releaseContainerName("permission", "new-release")) ||
+		!strings.Contains(string(data), releaseReplicaContainerName("permission", "new-release", 2)) {
+		t.Fatalf("expected endpoints to point at new release replicas, got %s", data)
+	}
 }
 
 func pathJoinSlash(parts ...string) string {
@@ -602,6 +788,7 @@ func TestServiceUpdatesAIFARServiceArtifactAsPartialRelease(t *testing.T) {
 	}
 	for _, want := range []string{
 		`SERVICE_NAME='oauth'`,
+		`DESIRED_REPLICAS='oauth=1'`,
 		`SERVICE_BASE_RELEASE="$(release_for_service "$SERVICE_NAME" "$BASE_RELEASE" || true)"`,
 		`release_owning_service_dir()`,
 		`[ ! -L "$rfs_service_dir" ]`,
@@ -624,6 +811,7 @@ func TestServiceUpdatesAIFARServiceArtifactAsPartialRelease(t *testing.T) {
 		`patch_web_nginx_gateway_target`,
 		`gateway_container="$(route_container_for_service gateway)"`,
 		`set_env APP_CONTAINER_NAME "$(service_container_name "$SERVICE_NAME")" "$service_env"`,
+		`replica_container_name()`,
 		`set_service_runtime_port "$SERVICE_NAME"`,
 		`set_env SERVER_PORT "$srp_port_value" "$ENV_DIR/$srp_service.env"`,
 		`patch_compose_service_release "$SERVICE_NAME"`,
@@ -632,7 +820,12 @@ func TestServiceUpdatesAIFARServiceArtifactAsPartialRelease(t *testing.T) {
 		`docker network connect "$ctn_network" "$ctn_container"`,
 		`connect_service_to_legacy_internal_networks "$SERVICE_NAME"`,
 		`compose --env-file env/compose.env -f compose.yaml up -d --build --no-deps "$SERVICE_NAME"`,
+		`start_additional_replicas "$SERVICE_NAME"`,
+		`docker run -d`,
+		`--label "aifar.replica=$src_replica"`,
 		`configure_ingress_if_needed`,
+		`list_route_containers gateway`,
+		`--filter "label=aifar.release=$lcb_release"`,
 		`ingress_config_needs_route_patch`,
 		`reloading AIFAR ingress $INGRESS_CONTAINER`,
 		`AIFAR ingress reloaded`,
@@ -729,12 +922,14 @@ func TestServiceUpdatesAIFARArtifactBundleAsSingleMultiServicePartialRelease(t *
 	}
 	for _, want := range []string{
 		`CHANGED_SERVICES='oauth gateway'`,
+		`DESIRED_REPLICAS='oauth=1 gateway=1'`,
 		`DEPLOYMENT_CONCURRENCY=3`,
 		`release_owning_service_dir()`,
 		`[ ! -L "$rfs_service_dir" ]`,
 		`rfs_owner="$(release_owning_service_dir "$rfs_service" "$rfs_real_dir" || true)"`,
 		`run_parallel_services $non_entry_services`,
 		`for service in gateway web-vue3; do`,
+		`replica_container_name()`,
 		`set_service_runtime_port "$rs_service"`,
 		`set_env SERVER_PORT "$srp_port_value" "$ENV_DIR/$srp_service.env"`,
 		`materialize_effective_service_dirs`,
@@ -751,7 +946,12 @@ func TestServiceUpdatesAIFARArtifactBundleAsSingleMultiServicePartialRelease(t *
 		`docker network connect "$ctn_network" "$ctn_container"`,
 		`connect_service_to_legacy_internal_networks "$service"`,
 		`compose --env-file env/compose.env -f compose.yaml up -d --build --no-deps "$service"`,
+		`start_additional_replicas "$service"`,
+		`docker run -d`,
+		`--label "aifar.replica=$src_replica"`,
 		`configure_ingress_if_needed`,
+		`list_route_containers gateway`,
+		`--filter "label=aifar.release=$lcb_release"`,
 		`ingress_config_needs_route_patch`,
 		`reloading AIFAR ingress $INGRESS_CONTAINER`,
 		`AIFAR ingress reloaded`,

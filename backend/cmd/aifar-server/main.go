@@ -1,9 +1,12 @@
 package main
 
 import (
+	"context"
 	"log"
 	"net/http"
 
+	"aifar-deployment/backend/internal/adapter"
+	"aifar-deployment/backend/internal/apps/aifar"
 	"aifar-deployment/backend/internal/config"
 	"aifar-deployment/backend/internal/httpapi"
 	"aifar-deployment/backend/internal/resource"
@@ -29,6 +32,7 @@ func main() {
 	}
 
 	tasks := worker.NewManagerWithConcurrency(db, cfg.DeploymentConcurrency)
+	aifar.NewAutoscaler(db, tasks, adapter.SSHRemote{}).Start(context.Background())
 	api := httpapi.New(cfg, db, tasks)
 
 	log.Printf("AIFAR listening on %s", cfg.Addr)

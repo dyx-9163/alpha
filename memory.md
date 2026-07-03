@@ -573,5 +573,39 @@
 - 结论：`NanoCpus=2000000000` 代表 Docker 已设置 2 个 CPU 的硬限制；`CpuQuota/CpuPeriod=0` 是因为使用 NanoCpus 表达限制，不代表未限制。
 - 问题：用户追问已限制 2C 后为什么仍能看到超过 200%。
 - 结论：`docker stats` 是采样计算值而非硬限制判定值，CPU cgroup 按调度周期限制“平均可用 CPU 时间”；容器线程可短时间在多个核上并行后再被 throttle，叠加采样窗口、内核统计和四舍五入，会出现略超 200% 的读数。
+- 问题：用户贴出容器 cgroup v1 `cpu.stat`：`nr_periods 2659`、`nr_throttled 1`、`throttled_time 1849039`。
+- 结论：该数据表示 2659 个 CPU 调度周期内只被限流 1 次，限流总时间约 1.85ms，说明 2C 限制存在但当前几乎没有成为瓶颈；若压测时 `nr_throttled` 和 `throttled_time` 快速增长，才代表 CPU quota 被持续打满。
+- 问题：用户询问大并发区间是否建议加大容器 CPU。
+- 结论：不应只因 `docker stats` 偶发超过 200% 就加 CPU；建议依据压测期间 CPU 持续使用率、cgroup throttle 增量、接口延迟/P95/P99、错误率和下游瓶颈判断。若稳定接近 2C 且 throttle 快速增长或延迟升高，可将 gateway 等入口服务从 2C 提到 3-4C，并保留 30%-40% 峰值余量。
+- 问题：用户询问 Docker 是否可以动态变更 CPU/内存等运行参数。
+- 结论：Docker 可通过 `docker update` 动态调整运行中容器的 CPU、内存、pids 等 cgroup 资源限制；但端口、环境变量、挂载、镜像、命令等通常需重建容器。Compose/AIFAR 场景还必须同步更新 compose/release 配置，否则下次重建会恢复旧值；Java 服务调大 CPU 可立即影响调度，内存/线程/GC 等启动期参数更适合重启或滚动重建。
+- 问题：用户询问前面判断 JVM 大小时是否用到了实际 Dockerfile。
+- 结论：前面未直接读取目标部署包里的 Dockerfile；依据的是 Docker inspect 内存限制、cgroup 信息和仓库 AIFAR 安装脚本未统一注入 `-Xmx` 的事实。实际 JVM 大小仍需查看容器 `cmdline`、环境变量、`jcmd VM.flags/GC.heap_info` 或目标 release 的 `docker-apps/<service>/Dockerfile`。
+- 问题：用户指出 `resources/aifar/docker-apps` 下存在实际 Dockerfile。
+- 结论：已确认 AIFAR Java 服务 Dockerfile 位于 `resources/aifar/docker-apps/<service>/Dockerfile`，gateway/contacts/file/im/meeting/message/oauth/permission/system 均显式使用 `-Xms256m -Xmx512m`；web-vue3 为前端 nginx 容器无 JVM 堆参数。前面“按默认容器内存推导”的说法需以 Dockerfile 显式值为准。
+- 问题：用户询问 Dockerfile 是否可以按当前 Docker 容器内存百分比设置 JVM。
+- 结论：可以使用 JVM 容器感知参数 `-XX:InitialRAMPercentage` 和 `-XX:MaxRAMPercentage`，由 Java 21 启动时按 cgroup 容器内存限制计算堆大小；需移除固定 `-Xms/-Xmx`，推荐通过 `JAVA_TOOL_OPTIONS` 注入默认百分比，变更需要重建/重启容器才会影响已运行 JVM。
+- 问题：用户询问能否像 CPU 一样动态调整内存，并让 JVM 参数也动态调整。
+- 结论：Docker 可用 `docker update --memory/--memory-swap` 动态调整容器 cgroup 内存限制，但 HotSpot JVM 的 `-Xmx`、`MaxRAMPercentage`、DirectMemory 等关键上限在启动时确定，运行中不会随 cgroup 变化自动重算；正式调整 JVM 堆应通过重启/滚动重建服务生效，平台可提供临时资源热调整和带重启的 JVM 调整两种操作。
+- 问题：用户确认 JVM 是否没法热调整。
+- 结论：标准 HotSpot JVM 可热调整少量标记为 `manageable` 的运行参数，但 `-Xmx/-Xms/MaxRAMPercentage` 等堆上限和启动期内存参数不能在线修改；JVM 只会在启动时确定的 `Xms` 到 `Xmx` 范围内自动伸缩，扩大堆上限必须重启或滚动重建。
+- 问题：用户截图展示 permission 容器 `cpu.stat` 和 `docker stats`，询问资源状态。
+- 结论：permission 容器 CPU 约 192.6% 且 `nr_throttled/nr_periods` 约 7.3%，累计限流时间约 2771 秒，说明峰值时 2C 已成为 CPU 瓶颈；建议以增量观察为准，若压测期间 throttle 持续增长且延迟升高，可将 permission CPU 提到 3-4C 或做横向/滚动扩容。内存约 1.07GiB/2GiB 不等于 JVM heap，当前 Dockerfile `Xmx=512m`，额外内存多来自非堆、线程栈、direct/native 等。
+- 问题：用户提供 Nacos 数据库配置和 `Database Connection Failed` 截图，错误包含 Druid `GetConnectionTimeoutException: wait millis 10669, active 48, maxActive 50, creating 0`。
+- 结论：该错误核心是 Druid 连接池等待连接超时，不是典型数据库地址/密码错误；permission 服务在高并发下 CPU 已接近 2C 且存在 throttle，可能导致请求/SQL 持有连接变久。建议先关闭生产 SQL 打印，观察慢 SQL/连接池 active 增量和 MySQL `max_connections/processlist`，再按数据库承载能力调大 permission CPU、JVM 堆和必要的 Druid `max-active/max-wait`。
+- 问题：用户询问大量并发时数据库本身连接数是否也要调大，当前 MySQL 最大连接数为 1500。
+- 结论：MySQL `max_connections=1500` 对当前单套 9 个 Java 服务、每服务 Druid `max-active=50` 的理论 450 连接预算通常够用，瓶颈更可能先在应用连接池、CPU throttle、慢 SQL 或锁等待；是否调大应看 `Max_used_connections`、`Threads_connected`、`Threads_running` 和 processlist，不能只因并发大盲目提高。
+- 问题：用户询问 Druid 是什么。
+- 结论：Druid 是 Java 应用常用的数据库连接池/监控组件，负责预先维护一批 MySQL 连接供业务线程复用；`max-active` 是池内最大活跃连接数，`GetConnectionTimeoutException` 表示业务线程在 `max-wait` 时间内没有等到可用连接。
+- 问题：用户询问为什么 permission 模块连接池拿不到连接后，contacts 模块也连不上 permission。
+- 结论：contacts 日志 `No servers available for service: alpha-permission` 表示服务发现没有可用 permission 实例，不是普通 TCP 连接超时；高并发下 permission CPU 被 2C 限流、Druid 连接池打满、线程堆积或重启/健康心跳失败，可能导致 Nacos 将 permission 标记为不健康或移除，contacts 通过 Feign/LoadBalancer 就解析不到实例。
+- 问题：用户说明 5 分钟压测同一接口 2 万次，请求打崩相关模块数据库连接池，要求分析大致原因。
+- 结论：2 万/5 分钟平均约 66.7 QPS，本身不算极端；连接池崩溃说明单请求在 permission 内部连接持有时间偏长或峰值突刺更高。主要链路是 permission Druid `max-active=50` 接近打满，2C CPU 限流、SQL 打印、JVM `Xmx512m`、线程堆积、慢 SQL/锁等待都会延长连接归还时间；随后 Nacos 健康/心跳异常使 contacts 发现不到 `alpha-permission`，形成级联故障。
 - 问题：用户要求容器页“需要的动作”增加二次确认。
 - 结论：容器页已为单个启动/停止/重启和批量启动/停止/重启增加确认弹窗；已有批量卸载、删除镜像和 Docker 服务卸载确认保持不变，并补充 zh/en 文案。
+- 问题：用户询问当前 AIFAR Docker/Compose 滚动更新若要优化到企业级，应从哪些方面推进。
+- 结论：优先方向应是稳定服务层、健康检查/readiness、发布状态机、流量切换与连接排空、失败回滚、制品校验、可观测性、并发锁和资源治理；不要重写完整 Kubernetes，而是在 AIFAR 自定义编排中补齐 Docker/Compose 缺失的发布控制面。
+- 问题：用户要求按“内存超过 80% 自动创建新服务并接入流量”的企业级滚动更新与自动扩容计划实现。
+- 结论：已新增 AIFAR autoscale controller，默认每分钟扫描实例，按 Docker 容器内存使用率持续 5 分钟超过 80%、冷却 10 分钟、最多 3 副本触发 `aifar.scale.out` worker 任务；扩容脚本复用当前 release 的 image/env/网络，用 `docker run` 创建带 labels 的 replica，readiness 通过后入口服务 reload 多 upstream ingress，metadata 记录 activeEndpoints/desiredReplicas/autoscaleMetrics/lastScaleEvents，并为更新/批量更新/卸载/扩容加入实例编排锁。验证通过：`go test ./internal/apps/aifar ./internal/store ./internal/httpapi`、`pnpm test`、`git diff --check`。
+- 问题：实现自检发现单服务/批量更新在已有多副本时仍会退回单副本，入口 upstream 也可能包含旧入口容器。
+- 结论：已补齐多副本滚动更新：partial update 保留 changed service 的 `desiredReplicas`，r1 继续由 Compose 构建启动，r2/r3 复用新 release image/env 通过 `docker run` 创建并逐个 readiness；全部新副本 ready 后入口 nginx 只写新 release 的 gateway/web-vue3 endpoint，成功 reload 后再按 label 清理旧 release 全部副本。
