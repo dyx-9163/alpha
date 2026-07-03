@@ -133,6 +133,32 @@ service_known() {
   return 1
 }
 
+service_port_var() {
+  case "$1" in
+    gateway) printf "GATEWAY_PORT" ;;
+    oauth) printf "OAUTH_PORT" ;;
+    permission) printf "PERMISSION_PORT" ;;
+    system) printf "SYSTEM_PORT" ;;
+    file) printf "FILE_PORT" ;;
+    message) printf "MESSAGE_PORT" ;;
+    im) printf "IM_PORT" ;;
+    contacts) printf "CONTACTS_PORT" ;;
+    meeting) printf "MEETING_PORT" ;;
+    web-vue3) printf "WEB_VUE3_PORT" ;;
+    *) printf "" ;;
+  esac
+}
+
+set_service_runtime_port() {
+  srp_service="$1"
+  [ "$srp_service" != "web-vue3" ] || return 0
+  srp_port_var="$(service_port_var "$srp_service")"
+  [ -n "$srp_port_var" ] || return 0
+  srp_port_value="$(read_env_value "$ENV_DIR/compose.env" "$srp_port_var" "")"
+  [ -n "$srp_port_value" ] || return 0
+  set_env SERVER_PORT "$srp_port_value" "$ENV_DIR/$srp_service.env"
+}
+
 verify_artifact() {
   [ -f "$ARTIFACT_REMOTE" ] || fail "artifact file not found: $ARTIFACT_REMOTE"
   if command -v sha256sum >/dev/null 2>&1; then
@@ -281,6 +307,7 @@ retag_selected_service() {
   image="$(read_env_value "$service_env" APP_IMAGE "$(read_env_value "$source_env" APP_IMAGE "aifar-$SERVICE_NAME:latest")")"
   set_env APP_IMAGE "$(retag_image "$image")" "$service_env"
   set_env APP_CONTAINER_NAME "$(service_container_name "$SERVICE_NAME")" "$service_env"
+  set_service_runtime_port "$SERVICE_NAME"
 }
 
 patch_compose_service_release() {

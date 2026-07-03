@@ -14,6 +14,7 @@ import (
 	"strings"
 	"text/template"
 	"time"
+	"unicode"
 
 	"aifar-deployment/backend/internal/installer/installerkit"
 	"aifar-deployment/backend/internal/installer/selinux"
@@ -709,6 +710,9 @@ func artifactInfoFromRequest(req ArtifactUpdateRequest, copy UpdateCopy) (artifa
 	if !artifactTypeAllowed(serviceName, fileName) {
 		return artifactInfo{}, fmt.Errorf(copy.ArtifactTypeInvalid, serviceName)
 	}
+	if !artifactFileMatchesService(serviceName, fileName) {
+		return artifactInfo{}, fmt.Errorf(copy.ArtifactTypeInvalid, serviceName)
+	}
 	sum, size, err := fileSHA256(localPath)
 	if err != nil {
 		return artifactInfo{}, err
@@ -738,6 +742,32 @@ func artifactTypeAllowed(serviceName, fileName string) bool {
 			strings.HasSuffix(name, ".tar.gz")
 	}
 	return strings.HasSuffix(name, ".jar")
+}
+
+func artifactFileMatchesService(serviceName, fileName string) bool {
+	if serviceName == "web-vue3" {
+		return true
+	}
+	hint := artifactFileServiceHint(fileName)
+	return hint == "" || hint == serviceName
+}
+
+func artifactFileServiceHint(fileName string) string {
+	name := strings.ToLower(filepath.Base(strings.TrimSpace(fileName)))
+	tokens := strings.FieldsFunc(name, func(r rune) bool {
+		return !unicode.IsLetter(r) && !unicode.IsDigit(r)
+	})
+	for _, token := range tokens {
+		for _, service := range serviceOrder {
+			if service == "web-vue3" {
+				continue
+			}
+			if token == service {
+				return service
+			}
+		}
+	}
+	return ""
 }
 
 func fileSHA256(path string) (string, int64, error) {

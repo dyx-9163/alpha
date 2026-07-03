@@ -408,6 +408,9 @@ func (s Service) artifactBundleItemsFromRequest(req ArtifactBundleUpdateRequest,
 		if !artifactTypeAllowed(serviceName, fileName) {
 			return fail(fmt.Errorf(copy.ArtifactTypeInvalid, serviceName))
 		}
+		if !artifactFileMatchesService(serviceName, fileName) {
+			return fail(fmt.Errorf(copy.ArtifactTypeInvalid, serviceName))
+		}
 		item := artifactBundleItem{ServiceName: serviceName, FileName: fileName}
 		if extract {
 			localPath := filepath.Join(tempDir, serviceName, fileName)

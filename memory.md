@@ -535,3 +535,7 @@
 - 结论：根因是自定义编排把 gateway 容器名改为 release 动态名后，`web-vue3` 容器内 nginx 仍按固定 `aifar-gateway:38000` 转发 `/api/` 和 `/im/ws/`；已改为由稳定 ingress 在 web 端口直接转发 API/WebSocket 到当前 gateway upstream，并让旧 ingress 配置在后续制品更新时自动补写路由。
 - 问题：用户指出非入口服务更新后 ingress 未更新，并担心分两次更新前后端时 `current` 只指向最新 partial，版本逻辑不完整。
 - 结论：确认 partial release 应表达“当前有效版本快照”，而不是只含本次变更目录；已改为在 partial release 中 materialize 全量服务视图，未变更服务用基线 release 目录链接继承，manifest/metadata 的 containers/routes 记录整套 active container，ingress 配置从 effective env 读取当前入口容器。
+- 问题：用户询问当前发布逻辑是否是上传包建任务、创建新服务、启动后修改 ingress，并追问能否像 Kubernetes 一样不修改 ingress。
+- 结论：Kubernetes 不是不更新路由状态，而是 Ingress 指向稳定 Service，Service endpoints 由控制器更新；Docker/Compose 默认缺少这一层。AIFAR 可以用稳定 Docker network alias、HAProxy/Traefik runtime API 或自研 endpoint controller 模拟，但当前 nginx reload 方案更简单确定，非入口服务更新本身不需要 ingress 变更。
+- 问题：用户截图显示单独更新 gateway 后容器启动日志完成但面板健康检查为运行异常。
+- 结论：日志显示容器名/应用名是 gateway，但实际启动类为 `AlphaOauthApplication` 且 Tomcat 端口为 38001，说明 gateway 更新很可能上传了 oauth JAR；健康检查按 GATEWAY_PORT=38000 打自然失败。已补充服务制品文件名防呆，并让 Java 服务 env 写入 SERVER_PORT 与 compose/healthcheck 端口保持一致。

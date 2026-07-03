@@ -452,6 +452,7 @@ func TestServiceInstallsAIFARServiceFromDockerAppsBundle(t *testing.T) {
 		"gateway alpha-gateway",
 		"permission alpha-permission",
 		`set_env SPRING_APPLICATION_NAME "$app_name" "$service_env"`,
+		`set_env SERVER_PORT "$port_value" "$service_env"`,
 	} {
 		if !strings.Contains(remote.installScript, want) {
 			t.Fatalf("AIFAR install script should force alpha service names with %q:\n%s", want, remote.installScript)
@@ -613,6 +614,8 @@ func TestServiceUpdatesAIFARServiceArtifactAsPartialRelease(t *testing.T) {
 		`apply_java_artifact`,
 		`retag_selected_service`,
 		`set_env APP_CONTAINER_NAME "$(service_container_name "$SERVICE_NAME")" "$service_env"`,
+		`set_service_runtime_port "$SERVICE_NAME"`,
+		`set_env SERVER_PORT "$srp_port_value" "$ENV_DIR/$srp_service.env"`,
 		`patch_compose_service_release "$SERVICE_NAME"`,
 		`aifar.release: \"" release "\""`,
 		`compose --env-file env/compose.env -f compose.yaml up -d --build --no-deps "$SERVICE_NAME"`,
@@ -714,6 +717,8 @@ func TestServiceUpdatesAIFARArtifactBundleAsSingleMultiServicePartialRelease(t *
 		`DEPLOYMENT_CONCURRENCY=3`,
 		`run_parallel_services $non_entry_services`,
 		`for service in gateway web-vue3; do`,
+		`set_service_runtime_port "$rs_service"`,
+		`set_env SERVER_PORT "$srp_port_value" "$ENV_DIR/$srp_service.env"`,
 		`materialize_effective_service_dirs`,
 		`link_inherited_service_files "$mes_service" "$mes_source"`,
 		`csrf_real_dir="$(readlink -f "$csrf_service_dir"`,
@@ -768,6 +773,26 @@ func TestServiceUpdatesAIFARArtifactBundleAsSingleMultiServicePartialRelease(t *
 	}
 }
 
+func TestServiceRejectsMismatchedJavaArtifactFileName(t *testing.T) {
+	dir := t.TempDir()
+	artifactPath := filepath.Join(dir, "alpha-oauth.jar")
+	if err := os.WriteFile(artifactPath, []byte("oauth jar"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	service := Service{}
+	err := service.ValidateArtifactUpdate(ArtifactUpdateRequest{
+		Instance:          installedAIFARInstance(t),
+		Server:            store.Server{ID: "srv-1"},
+		Language:          "en",
+		ServiceName:       "gateway",
+		ArtifactLocalPath: artifactPath,
+		ArtifactFileName:  "alpha-oauth.jar",
+	})
+	if err == nil {
+		t.Fatal("expected mismatched gateway/oauth artifact to be rejected")
+	}
+}
+
 func TestServiceAcceptsArtifactBundleManifestWithUTF8BOM(t *testing.T) {
 	bundlePath := writeAlphaJarBundleWithManifestPrefix(t, []bundleTestArtifact{
 		{Service: "oauth", Module: "alpha-oauth", FileName: "alpha-oauth.jar", Content: "new oauth jar"},
@@ -782,6 +807,23 @@ func TestServiceAcceptsArtifactBundleManifestWithUTF8BOM(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestServiceRejectsMismatchedArtifactBundleFileName(t *testing.T) {
+	bundlePath := writeAlphaJarBundle(t, []bundleTestArtifact{
+		{Service: "gateway", Module: "alpha-gateway", FileName: "alpha-oauth.jar", Content: "wrong jar"},
+	})
+	service := Service{}
+	err := service.ValidateArtifactBundleUpdate(ArtifactBundleUpdateRequest{
+		Instance:        installedAIFARInstance(t),
+		Server:          store.Server{ID: "srv-1"},
+		Language:        "en",
+		BundleLocalPath: bundlePath,
+		BundleFileName:  filepath.Base(bundlePath),
+	})
+	if err == nil {
+		t.Fatal("expected mismatched bundle artifact file name to be rejected")
 	}
 }
 

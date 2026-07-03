@@ -311,6 +311,11 @@ write_service_envs() {
     if [ -n "$app_name" ]; then
       set_env SPRING_APPLICATION_NAME "$app_name" "$service_env"
     fi
+    port_var="$(service_port_var "$service")"
+    if [ "$service" != "web-vue3" ] && [ -n "$port_var" ]; then
+      port_value="$(read_env_value "$ENV_DIR/compose.env" "$port_var" "")"
+      [ -n "$port_value" ] && set_env SERVER_PORT "$port_value" "$service_env"
+    fi
     chmod 0644 "$service_env"
   done
 }
