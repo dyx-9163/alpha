@@ -320,6 +320,18 @@ write_service_envs() {
   done
 }
 
+patch_web_nginx_gateway_target() {
+  nginx_conf="$APP_DIR/web-vue3/nginx/default.conf"
+  [ -f "$nginx_conf" ] || return 0
+  gateway_container="$(container_for_service gateway)"
+  gateway_port="$(read_env_value "$ENV_DIR/compose.env" GATEWAY_PORT "$GATEWAY_PORT")"
+  [ -n "$gateway_container" ] || fail "gateway container name is empty for web nginx config"
+  [ -n "$gateway_port" ] || gateway_port="$GATEWAY_PORT"
+  tmp="$nginx_conf.tmp"
+  sed "s#http://aifar-gateway:[0-9][0-9]*#http://${gateway_container}:${gateway_port}#g; s#http://aifar-gateway#http://${gateway_container}:${gateway_port}#g" "$nginx_conf" > "$tmp"
+  mv "$tmp" "$nginx_conf"
+}
+
 append_compose_service() {
   service="$1"
   port_var="$(service_port_var "$service")"
@@ -760,6 +772,7 @@ resolve_system_timezone
 write_compose_env
 write_java_env
 write_service_envs
+patch_web_nginx_gateway_target
 write_root_compose
 write_manifest "pending"
 load_docker_images

@@ -328,6 +328,18 @@ apply_artifact() {
   fi
 }
 
+patch_web_nginx_gateway_target() {
+  nginx_conf="$APP_DIR/web-vue3/nginx/default.conf"
+  [ -f "$nginx_conf" ] || return 0
+  gateway_container="$(route_container_for_service gateway)"
+  gateway_port="$(read_env_value "$ENV_DIR/compose.env" GATEWAY_PORT 38000)"
+  [ -n "$gateway_container" ] || fail "gateway route container is empty for web nginx config"
+  [ -n "$gateway_port" ] || gateway_port=38000
+  tmp="$nginx_conf.tmp"
+  sed "s#http://aifar-gateway:[0-9][0-9]*#http://${gateway_container}:${gateway_port}#g; s#http://aifar-gateway#http://${gateway_container}:${gateway_port}#g" "$nginx_conf" > "$tmp"
+  mv "$tmp" "$nginx_conf"
+}
+
 retag_selected_service() {
   service_env="$ENV_DIR/$SERVICE_NAME.env"
   source_env="$APP_DIR/$SERVICE_NAME/.env"
@@ -794,6 +806,9 @@ write_partial_compose_env
 
 apply_artifact
 retag_selected_service
+if [ "$SERVICE_NAME" = "web-vue3" ]; then
+  patch_web_nginx_gateway_target
+fi
 patch_compose_service_release "$SERVICE_NAME"
 write_manifest "pending" "$BASE_RELEASE_ID"
 ensure_network

@@ -549,3 +549,19 @@
 - 结论：整体打包使用 `pnpm package`，会构建前端到 `deploy/dist`、后端到 `deploy/bin`，并调用 release staging 生成 `deploy/deployment` 下的运行目录和归档；单独只生成归档前置产物已存在时可用 `pnpm release`。
 - 问题：用户追问单独更新 gateway 后旧 gateway 没有关闭，以及更新完 ingress nginx 配置变更但容器没有重启。
 - 结论：旧 gateway 未停是 partial release 继承服务目录使用 symlink，`release_for_service` 误把 current partial 当成服务归属 release；已改为解析 symlink 并找到真实 owner release 后再停止旧服务。ingress 设计上不重启容器，只执行 `nginx -s reload`，已补任务日志显示 reload 开始和成功。
+- 问题：用户询问 Docker + Docker Compose 能否做到类似 Kubernetes 的 ingress、service、container 三层模型。
+- 结论：Docker/Compose 可以通过稳定入口代理、共享网络/alias 或动态代理、自研 endpoint controller 模拟出 ingress/service/container 三层，但 Compose 本身没有 Kubernetes Service/Endpoint 控制器、readiness gate 和自动滚动更新语义；AIFAR 若要接近 K8s，应显式实现“稳定服务层”，而不是只依赖 Compose service 名。
+- 问题：用户询问是否建议 AIFAR 自己做 Docker/Compose 下类似 Kubernetes 的 ingress/service/container 这一套。
+- 结论：建议自己做一层轻量 release/service 编排，但不要重写 Kubernetes 全套；AIFAR 应只实现固定入口、服务 endpoint 映射、健康检查、切流、回滚和审计，复杂调度、副本控制、自愈和跨节点 Service 能力保留未来接入 K8s/Swarm/Nomad 的空间。
+- 问题：用户询问 Docker iptables `DOCKER` nat 链缺失错误是否重启 Docker 即可。
+- 结论：通常重启 Docker daemon 可以让 Docker 重新初始化 iptables/nat 链，是首选恢复动作；若 firewalld/iptables 后端不一致或规则被持续清理，重启后仍会复发，需要检查防火墙和 iptables-nft/legacy 配置。
+- 问题：用户提供 AIFAR 安装日志，Compose 容器均创建启动后健康检查反复提示 `web-vue3 ... is not running: exited`。
+- 结论：该错误的直接原因是前端 `web-vue3` 容器启动后自行退出，导致 release 健康检查失败；Compose/Docker 网络创建已成功，需查看该容器日志才能确定是 nginx 配置错误、前端包/入口命令问题还是镜像内文件缺失。
+- 问题：用户询问如何按当前 AIFAR 部署目录手动启动安装生成的镜像/容器。
+- 结论：当前默认服务器部署目录 `/aifar/apps` 对应 AIFAR install root `/aifar/apps/admin`，release 在 `releases/<releaseId>` 下；失败安装未必更新 `current`，应进入日志中的 release 目录，使用 `docker compose --env-file env/compose.env -f compose.yaml up -d` 或指定服务名手动启动，并通过 `docker logs` 查看退出原因。
+- 问题：用户追问 AIFAR 安装失败后 `docker ps -a` 没有容器留痕的原因。
+- 结论：该安装日志显示容器已创建并启动，但 `web-vue3` 退出导致 `wait_release_ready` 失败；安装脚本失败分支随后执行 `docker compose ... down --remove-orphans` 清理当前 release 容器，所以 `docker ps -a` 看不到留存容器，镜像仍可能保留。
+- 问题：用户追问 `web-vue3` 容器没启动只是表象，里层原因是什么。
+- 结论：更深层最可能是 `web-vue3` 镜像内 nginx 配置仍写死 `proxy_pass http://aifar-gateway:38000`，而自定义 release 编排把 gateway 改成动态容器名且没有固定 `aifar-gateway` DNS/alias；nginx 启动时解析不到 upstream 会直接退出，端口映射不能解决这个容器内 DNS 问题。
+- 问题：用户确认 `web-vue3` nginx 报 `host not found in upstream "aifar-gateway"`，询问应如何调整。
+- 结论：已在 AIFAR 安装、单服务更新和批量更新脚本中增加 `patch_web_nginx_gateway_target`，构建 `web-vue3` 镜像前把 `web-vue3/nginx/default.conf` 中的 `http://aifar-gateway:<port>` 替换为当前有效 gateway 容器名和端口，避免固定 alias 与新旧 gateway 共存冲突。
