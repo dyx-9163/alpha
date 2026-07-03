@@ -545,3 +545,7 @@
 - 结论：根因是 Java/Nacos 服务发现可能注册 release 独有内网 IP，分批 partial 后 gateway 与 oauth 跨 release 内网不可达；已改为新业务服务只挂稳定共享网络，partial 更新会规范化服务网络块，并在过渡期把新容器连接到旧 release 链 legacy 内网以兼容已有注册 IP。
 - 问题：用户要求容器模块增加删除镜像动作。
 - 结论：容器镜像列表新增删除按钮；后端新增 `POST /containers/images/remove` 异步任务接口，沿用 `containers.manage` 权限、任务日志和审计，底层支持 Docker API/CLI/SSH 删除镜像且不默认强制删除被容器引用的镜像。
+- 问题：用户询问项目整体打包命令。
+- 结论：整体打包使用 `pnpm package`，会构建前端到 `deploy/dist`、后端到 `deploy/bin`，并调用 release staging 生成 `deploy/deployment` 下的运行目录和归档；单独只生成归档前置产物已存在时可用 `pnpm release`。
+- 问题：用户追问单独更新 gateway 后旧 gateway 没有关闭，以及更新完 ingress nginx 配置变更但容器没有重启。
+- 结论：旧 gateway 未停是 partial release 继承服务目录使用 symlink，`release_for_service` 误把 current partial 当成服务归属 release；已改为解析 symlink 并找到真实 owner release 后再停止旧服务。ingress 设计上不重启容器，只执行 `nginx -s reload`，已补任务日志显示 reload 开始和成功。

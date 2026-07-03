@@ -103,6 +103,23 @@ release_by_id() {
   printf "%s" "$rbi_candidate"
 }
 
+release_owning_service_dir() {
+  ros_service="$1"
+  ros_real_dir="$2"
+  for ros_release in "$RELEASES_DIR"/*; do
+    [ -d "$ros_release" ] || continue
+    ros_service_dir="$ros_release/docker-apps/$ros_service"
+    [ -e "$ros_service_dir" ] || [ -L "$ros_service_dir" ] || continue
+    [ ! -L "$ros_service_dir" ] || continue
+    ros_candidate_real="$(readlink -f "$ros_service_dir" 2>/dev/null || printf "%s" "$ros_service_dir")"
+    if [ "$ros_candidate_real" = "$ros_real_dir" ]; then
+      printf "%s" "$ros_release"
+      return 0
+    fi
+  done
+  return 1
+}
+
 release_for_service() {
   rfs_service="$1"
   rfs_candidate="$2"
@@ -113,7 +130,18 @@ release_for_service() {
       *" $rfs_resolved "*) break ;;
     esac
     rfs_seen="$rfs_seen $rfs_resolved"
-    if [ -d "$rfs_candidate/docker-apps/$rfs_service" ]; then
+    rfs_service_dir="$rfs_candidate/docker-apps/$rfs_service"
+    if [ -d "$rfs_service_dir" ] || [ -L "$rfs_service_dir" ]; then
+      if [ ! -L "$rfs_service_dir" ]; then
+        printf "%s" "$rfs_candidate"
+        return 0
+      fi
+      rfs_real_dir="$(readlink -f "$rfs_service_dir" 2>/dev/null || printf "%s" "$rfs_service_dir")"
+      rfs_owner="$(release_owning_service_dir "$rfs_service" "$rfs_real_dir" || true)"
+      if [ -n "$rfs_owner" ]; then
+        printf "%s" "$rfs_owner"
+        return 0
+      fi
       printf "%s" "$rfs_candidate"
       return 0
     fi
@@ -608,8 +636,10 @@ ingress_running() {
 }
 
 reload_ingress() {
+  echo "reloading AIFAR ingress $INGRESS_CONTAINER"
   docker exec "$INGRESS_CONTAINER" nginx -t >/dev/null
   docker exec "$INGRESS_CONTAINER" nginx -s reload >/dev/null
+  echo "AIFAR ingress reloaded"
 }
 
 ingress_config_needs_route_patch() {
