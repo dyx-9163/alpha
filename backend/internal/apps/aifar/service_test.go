@@ -247,6 +247,17 @@ type fakeLogger struct{}
 func (fakeLogger) Info(format string, args ...any)  {}
 func (fakeLogger) Error(format string, args ...any) {}
 
+func withFakeRuntimeAgentBinary(t *testing.T) string {
+	t.Helper()
+	root := t.TempDir()
+	agent := filepath.Join(root, "aifar-agent-linux-amd64")
+	if err := os.WriteFile(agent, []byte("agent"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("AIFAR_AGENT_BINARY", agent)
+	return agent
+}
+
 type bundleTestArtifact struct {
 	Service  string
 	Module   string
@@ -536,6 +547,7 @@ func TestOptionsDefaultsUseRequestedAIFARValues(t *testing.T) {
 }
 
 func TestServiceInstallsAIFARServiceFromDockerAppsBundle(t *testing.T) {
+	withFakeRuntimeAgentBinary(t)
 	root := createAIFARBundle(t)
 	s := &fakeStore{servers: map[string]store.Server{
 		"srv-1": {ID: "srv-1", Name: "app-1", Host: "10.0.0.10", DeployDir: "/aifar/apps"},
@@ -585,6 +597,10 @@ func TestServiceInstallsAIFARServiceFromDockerAppsBundle(t *testing.T) {
 	}
 	for _, want := range []string{
 		`ORCHESTRATION_MODEL="k8s-like-v1"`,
+		`AGENT_BINARY='/aifar/apps/_work/aifar-docker-apps-`,
+		`install -m 0755 "$AGENT_BINARY" /usr/local/bin/aifar-agent`,
+		`ExecStart=/usr/local/bin/aifar-agent serve --addr $AGENT_LISTEN_ADDR`,
+		`systemctl enable --now aifar-agent`,
 		`RUNTIME_DIR="$INSTALL_ROOT/runtime"`,
 		`NACOS_REGISTRATION_MODE="agent-proxy"`,
 		`check_agent_dependency`,
@@ -613,6 +629,9 @@ func TestServiceInstallsAIFARServiceFromDockerAppsBundle(t *testing.T) {
 	}
 	if strings.LastIndex(remote.installScript, "check_agent_dependency") > strings.LastIndex(remote.installScript, "build_images") {
 		t.Fatalf("AIFAR install script should check aifar-agent before building images:\n%s", remote.installScript)
+	}
+	if !strings.Contains(remote.joinedUploads(), "aifar-agent-linux-amd64->/aifar/apps/_work/aifar-docker-apps-") {
+		t.Fatalf("AIFAR install should upload runtime agent, uploads=%s", remote.joinedUploads())
 	}
 	if strings.Contains(remote.installScript, `/"Status"/ {print $4; exit}`) {
 		t.Fatalf("AIFAR install script should not parse Docker health from the first JSON Status field:\n%s", remote.installScript)

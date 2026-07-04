@@ -4,6 +4,7 @@ set -eu
 INSTALL_ROOT={{ quote .InstallRoot }}
 WORK_DIR={{ quote .WorkDir }}
 ARCHIVE={{ quote .ArchiveRemote }}
+AGENT_BINARY={{ quote .AgentBinaryRemote }}
 SERVICE_ORDER={{ quote .ServiceOrder }}
 VERSION={{ quote .Version }}
 REVISION={{ quote .ReleaseID }}
@@ -32,6 +33,11 @@ NACOS_PASSWORD={{ quote .Options.NacosPassword }}
 NACOS_NS={{ quote .Options.NacosNamespace }}
 NACOS_REGISTRATION_MODE="agent-proxy"
 ORCHESTRATION_MODEL="k8s-like-v1"
+AGENT_LISTEN_ADDR="127.0.0.1:18081"
+SUDO=""
+if [ "$(id -u)" != "0" ]; then
+  SUDO="sudo -n"
+fi
 
 fail() {
   echo "ERROR: $*" >&2
@@ -180,9 +186,49 @@ check_nacos_dependency() {
   fail "Nacos dependency readiness check failed at $url"
 }
 
+agent_status_ok() {
+  command -v aifar-agent >/dev/null 2>&1 && aifar-agent status >/dev/null 2>&1
+}
+
+install_agent_dependency() {
+  if agent_status_ok; then
+    echo "aifar-agent is already running"
+    return 0
+  fi
+  [ -n "$AGENT_BINARY" ] && [ -f "$AGENT_BINARY" ] || fail "aifar-agent is not installed and no agent binary was uploaded; rebuild the backend or use a release package containing bin/aifar-agent-linux-amd64"
+  echo "installing AIFAR runtime agent"
+  $SUDO mkdir -p /etc/aifar /var/lib/aifar-agent /var/log/aifar-agent
+  $SUDO install -m 0755 "$AGENT_BINARY" /usr/local/bin/aifar-agent
+  cat > "$WORK_DIR/aifar-agent.service" <<SERVICE
+[Unit]
+Description=AIFAR Runtime Agent
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/aifar-agent serve --addr $AGENT_LISTEN_ADDR
+Restart=always
+RestartSec=2
+WorkingDirectory=/var/lib/aifar-agent
+
+[Install]
+WantedBy=multi-user.target
+SERVICE
+  $SUDO install -m 0644 "$WORK_DIR/aifar-agent.service" /etc/systemd/system/aifar-agent.service
+  $SUDO systemctl daemon-reload
+  if ! $SUDO systemctl enable --now aifar-agent; then
+    echo "AIFAR runtime agent service failed to start"
+    $SUDO systemctl --no-pager --full status aifar-agent || true
+    $SUDO journalctl -u aifar-agent -n 80 --no-pager || true
+    exit 1
+  fi
+  aifar-agent status >/dev/null 2>&1 || fail "aifar-agent service is not reachable after installation"
+}
+
 check_agent_dependency() {
-  command -v aifar-agent >/dev/null 2>&1 || fail "aifar-agent is required; install or upgrade Docker runtime first"
-  aifar-agent status >/dev/null 2>&1 || fail "aifar-agent service is not reachable; install or upgrade Docker runtime first"
+  install_agent_dependency
 }
 
 resolve_system_timezone() {

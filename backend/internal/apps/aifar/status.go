@@ -217,6 +217,8 @@ type Copy struct {
 	PrepareWorkDir        string
 	UploadBundle          string
 	UploadBundleFailed    string
+	UploadAgent           string
+	UploadAgentFailed     string
 	UploadScript          string
 	UploadScriptFailed    string
 	Deploying             string
@@ -308,6 +310,8 @@ func copyFor(lang string) Copy {
 			PrepareWorkDir:        "preparing remote work directory: %s",
 			UploadBundle:          "uploading AIFAR service bundle: %s",
 			UploadBundleFailed:    "upload AIFAR service bundle",
+			UploadAgent:           "uploading AIFAR runtime agent",
+			UploadAgentFailed:     "upload AIFAR runtime agent",
 			UploadScript:          "uploading AIFAR service install script",
 			UploadScriptFailed:    "upload AIFAR service install script",
 			Deploying:             "deploying AIFAR Docker Compose services",
@@ -339,6 +343,8 @@ func copyFor(lang string) Copy {
 		PrepareWorkDir:        "准备远程工作目录：%s",
 		UploadBundle:          "上传 AIFAR 服务包：%s",
 		UploadBundleFailed:    "上传 AIFAR 服务包失败",
+		UploadAgent:           "上传 AIFAR runtime agent",
+		UploadAgentFailed:     "上传 AIFAR runtime agent 失败",
 		UploadScript:          "上传 AIFAR 服务安装脚本",
 		UploadScriptFailed:    "上传 AIFAR 服务安装脚本失败",
 		Deploying:             "正在部署 AIFAR Docker Compose 服务",

@@ -202,6 +202,11 @@ func (s Service) Install(ctx context.Context, req InstallRequest, resources []st
 	workDir := installerkit.WorkDir(deployDir, AppName, bundle.Version, releaseTime)
 	installRoot := installRootFromDeployDir(deployDir)
 	archiveRemote := workDir + "/" + filepath.Base(archiveLocal)
+	agentLocal := findRuntimeAgentBinary()
+	agentRemote := ""
+	if agentLocal != "" {
+		agentRemote = workDir + "/" + filepath.Base(agentLocal)
+	}
 	scriptRemote := workDir + "/install-aifar.sh"
 
 	if err := step(3, func() error {
@@ -218,17 +223,29 @@ func (s Service) Install(ctx context.Context, req InstallRequest, resources []st
 		}, logForServer); err != nil {
 			return err
 		}
+		if agentLocal != "" {
+			if err := uploadkit.Upload(ctx, s.remote, server, uploadkit.File{
+				LocalPath:      agentLocal,
+				RemotePath:     agentRemote,
+				Mode:           0o755,
+				LogMessage:     copy.UploadAgent,
+				FailureMessage: copy.UploadAgentFailed,
+			}, logForServer); err != nil {
+				return err
+			}
+		}
 		script, err := renderInstallScript(installScriptData{
-			InstallRoot:    installRoot,
-			WorkDir:        workDir,
-			ArchiveRemote:  archiveRemote,
-			ServiceOrder:   strings.Join(options.SelectedServices, " "),
-			Version:        bundle.Version,
-			ReleaseID:      releaseID,
-			CreatedAt:      releaseTime.Format(time.RFC3339),
-			ConfigHash:     configHash,
-			IngressNetwork: ingressNetwork,
-			Options:        options,
+			InstallRoot:       installRoot,
+			WorkDir:           workDir,
+			ArchiveRemote:     archiveRemote,
+			AgentBinaryRemote: agentRemote,
+			ServiceOrder:      strings.Join(options.SelectedServices, " "),
+			Version:           bundle.Version,
+			ReleaseID:         releaseID,
+			CreatedAt:         releaseTime.Format(time.RFC3339),
+			ConfigHash:        configHash,
+			IngressNetwork:    ingressNetwork,
+			Options:           options,
 		})
 		if err != nil {
 			return err
@@ -1219,17 +1236,53 @@ func (s Service) markInstanceStatus(instance store.AppInstance, status string, d
 	return err
 }
 
+func findRuntimeAgentBinary() string {
+	if value := os.Getenv("AIFAR_AGENT_BINARY"); value != "" {
+		if fileExists(value) {
+			return value
+		}
+		return ""
+	}
+	names := []string{"aifar-agent-linux-amd64", "aifar-agent"}
+	candidates := []string{}
+	if exe, err := os.Executable(); err == nil {
+		dir := filepath.Dir(exe)
+		for _, name := range names {
+			candidates = append(candidates, filepath.Join(dir, name), filepath.Join(dir, "..", "bin", name))
+		}
+	}
+	for _, name := range names {
+		candidates = append(candidates,
+			filepath.Join("deploy", "bin", name),
+			filepath.Join("bin", name),
+			name,
+		)
+	}
+	for _, candidate := range candidates {
+		if fileExists(candidate) {
+			return candidate
+		}
+	}
+	return ""
+}
+
+func fileExists(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && !info.IsDir()
+}
+
 type installScriptData struct {
-	InstallRoot    string
-	WorkDir        string
-	ArchiveRemote  string
-	ServiceOrder   string
-	Version        string
-	ReleaseID      string
-	CreatedAt      string
-	ConfigHash     string
-	IngressNetwork string
-	Options        InstallOptions
+	InstallRoot       string
+	WorkDir           string
+	ArchiveRemote     string
+	AgentBinaryRemote string
+	ServiceOrder      string
+	Version           string
+	ReleaseID         string
+	CreatedAt         string
+	ConfigHash        string
+	IngressNetwork    string
+	Options           InstallOptions
 }
 
 type uninstallScriptData struct {
