@@ -375,13 +375,13 @@ health_cmd_for_service() {
   host="$(read_env_value "$ENV_DIR/compose.env" APP_HEALTH_HOST 127.0.0.1)"
   path="$(read_env_value "$ENV_DIR/compose.env" APP_HEALTH_PATH "")"
   timeout="$(read_env_value "$ENV_DIR/compose.env" APP_HEALTH_CONNECT_TIMEOUT 3)"
-  if [ -z "$path" ] && [ "$service" != "web-vue3" ]; then
-    path="/actuator/health"
-  fi
   if [ "$service" = "web-vue3" ]; then
+    [ -n "$path" ] || path="/"
     printf "wget -q -T %s -O /dev/null %s://%s:%s%s || exit 1" "$timeout" "$protocol" "$host" "$port" "$path"
-  else
+  elif [ -n "$path" ]; then
     printf "curl -fsS --connect-timeout %s %s://%s:%s%s >/dev/null || exit 1" "$timeout" "$protocol" "$host" "$port" "$path"
+  else
+    printf "curl -sS --connect-timeout %s -o /dev/null %s://%s:%s/ || exit 1" "$timeout" "$protocol" "$host" "$port"
   fi
 }
 

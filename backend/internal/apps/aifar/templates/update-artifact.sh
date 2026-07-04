@@ -208,9 +208,6 @@ start_pod() {
   health_protocol="$(read_env_value "$compose_env" APP_HEALTH_PROTOCOL http)"
   health_host="$(read_env_value "$compose_env" APP_HEALTH_HOST 127.0.0.1)"
   health_path="$(read_env_value "$compose_env" APP_HEALTH_PATH "")"
-  if [ -z "$health_path" ] && [ "$SERVICE_NAME" != "web-vue3" ]; then
-    health_path="/actuator/health"
-  fi
   health_connect_timeout="$(read_env_value "$compose_env" APP_HEALTH_CONNECT_TIMEOUT 3)"
   health_interval="$(read_env_value "$compose_env" APP_HEALTH_INTERVAL 15s)"
   health_timeout="$(read_env_value "$compose_env" APP_HEALTH_TIMEOUT 5s)"
@@ -223,11 +220,15 @@ start_pod() {
 
   docker rm -f "$container" >/dev/null 2>&1 || true
   if [ "$SERVICE_NAME" = "web-vue3" ]; then
+    [ -n "$health_path" ] || health_path="/"
     env_args="--env-file $service_env"
     health_cmd="wget -q -T $health_connect_timeout -O /dev/null ${health_protocol}://${health_host}:${port}${health_path} || exit 1"
-  else
+  elif [ -n "$health_path" ]; then
     env_args="--env-file $ENV_DIR/java-common.env --env-file $ENV_DIR/java-secrets.env --env-file $service_env"
     health_cmd="curl -fsS --connect-timeout $health_connect_timeout ${health_protocol}://${health_host}:${port}${health_path} >/dev/null || exit 1"
+  else
+    env_args="--env-file $ENV_DIR/java-common.env --env-file $ENV_DIR/java-secrets.env --env-file $service_env"
+    health_cmd="curl -sS --connect-timeout $health_connect_timeout -o /dev/null ${health_protocol}://${health_host}:${port}/ || exit 1"
   fi
 
   docker run -d \

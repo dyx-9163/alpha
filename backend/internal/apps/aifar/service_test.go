@@ -433,7 +433,7 @@ func TestAutoscaleOutScriptUsesReplicaContainerAndEscapedDockerFormats(t *testin
 		`--label "aifar.replica=$REPLICA_ID"`,
 		`--format '{{.Names}}'`,
 		`docker run -d`,
-		`health_path="/actuator/health"`,
+		`curl -sS --connect-timeout $health_connect_timeout -o /dev/null ${health_protocol}://${health_host}:${port}/ || exit 1`,
 		`APP_STARTUP_TIMEOUT 300`,
 	} {
 		if !strings.Contains(script, want) {
@@ -604,7 +604,7 @@ func TestServiceInstallsAIFARServiceFromDockerAppsBundle(t *testing.T) {
 		`docker inspect --format '{{.State.Status}}'`,
 		`docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{end}}'`,
 		`docker logs --tail 120 "$container"`,
-		`path="/actuator/health"`,
+		`curl -sS --connect-timeout %s -o /dev/null %s://%s:%s/ || exit 1`,
 		`health="$(container_health "$name")"`,
 		`start_ingress`,
 		`verify_ingress_ports`,
@@ -931,7 +931,7 @@ func TestServiceUpdatesAIFARServiceArtifactAsPartialRelease(t *testing.T) {
 		`write_service_proxy_config "$SERVICE_NAME" "$REVISION"`,
 		`reload_service_proxy`,
 		`stop_old_pods`,
-		`health_path="/actuator/health"`,
+		`curl -sS --connect-timeout $health_connect_timeout -o /dev/null ${health_protocol}://${health_host}:${port}/ || exit 1`,
 		`APP_STARTUP_TIMEOUT 300`,
 		`"kind": "rollout"`,
 	} {
@@ -1083,7 +1083,7 @@ func TestServiceUpdatesAIFARArtifactBundleAsSingleMultiServicePartialRelease(t *
 		`write_service_proxy_config "$service"`,
 		`reload_service_proxy "$service"`,
 		`stop_old_pods "$service"`,
-		`health_path="/actuator/health"`,
+		`curl -sS --connect-timeout $health_connect_timeout -o /dev/null ${health_protocol}://${health_host}:${port}/ || exit 1`,
 		`APP_STARTUP_TIMEOUT 300`,
 		`"kind": "rollout-bundle"`,
 	} {

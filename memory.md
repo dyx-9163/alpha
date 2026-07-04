@@ -641,3 +641,5 @@
 - 结论：当前实现只是 Runtime Agent 化的过渡阶段：已新增 `aifar-agent` 并优先由 agent reconcile ingress，但 service proxy 和 ingress 数据面仍是 nginx 容器；若按目标形态，应继续把 svc/ingress 全部迁入宿主机 `aifar-agent/aifar-proxy` 管理，业务侧只保留 Pod 容器。
 - 问题：用户要求按“只针对容器模块”的最终方案实现 AIFAR Runtime 视图与操作台。
 - 结论：容器页新增 AIFAR 运行时 Tab，按服务展示副本、Pod、Endpoint、Ingress 和 agent 状态；默认隐藏 `aifar.component=service-proxy/ingress` 基础设施容器，仅排障开关可见且不可普通操作；新增 `/containers/aifar/runtime`、runtime reconcile、service scale-out 任务入口，agent 不可用时降级展示并拒绝变更；AIFAR 模块通过 registry 可选接口承载扩容和入口重建。
+- 问题：用户反馈 AIFAR 服务进程已启动成功，但容器页仍显示 gateway/system/permission/oauth 健康检查异常，gateway 日志出现 `Gateway actuator endpoint rejected, path=/actuator/health`。
+- 结论：根因是 AIFAR 脚本默认把 Java 服务空健康路径补成 `/actuator/health`，该路径被 gateway/业务过滤器拒绝，导致 Docker healthcheck 误判 unhealthy；已改为无显式 `APP_HEALTH_PATH` 时 Java 服务只检查本地 HTTP 端口响应，显式配置路径时仍严格检查，覆盖新装、单服务更新、批量更新和自动扩容。
