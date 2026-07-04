@@ -86,7 +86,7 @@
             <el-table-column prop="ports" :label="t('containers.ports')" min-width="180" show-overflow-tooltip />
             <el-table-column prop="networks" :label="t('containers.network')" min-width="140" show-overflow-tooltip />
             <el-table-column prop="createdAt" :label="t('containers.created')" min-width="170" show-overflow-tooltip />
-            <el-table-column :label="t('common.operation')" width="340" fixed="right">
+            <el-table-column :label="t('common.operation')" width="420" fixed="right">
               <template #default="{ row }">
                 <div class="row-actions">
                   <el-tooltip :content="deniedText" :disabled="canManageContainers" placement="top">
@@ -100,6 +100,9 @@
                   </el-tooltip>
                   <el-tooltip :content="containerRemoveDisabledReason(row)" :disabled="!containerRemoveDisabledReason(row)" placement="top">
                     <span><el-button size="small" type="danger" plain :disabled="Boolean(containerRemoveDisabledReason(row))" @click="runContainerBatchAction('remove', [row])">{{ t('containers.uninstall') }}</el-button></span>
+                  </el-tooltip>
+                  <el-tooltip v-if="isAifarManagedContainer(row)" :content="aifarUpdateDisabledReason(row)" :disabled="!aifarUpdateDisabledReason(row)" placement="top">
+                    <span><el-button size="small" type="primary" plain :disabled="Boolean(aifarUpdateDisabledReason(row))" @click="openAifarUpdate(row)">{{ t('containers.updateService') }}</el-button></span>
                   </el-tooltip>
                   <el-button size="small" @click="openLogs(row.id)">{{ t('containers.logs') }}</el-button>
                 </div>
@@ -166,6 +169,44 @@
     </div>
 
     <LogDrawer v-model="logsVisible" :title="t('containers.logs')" :text="logsText" :empty-text="t('tasks.noLogs')" />
+    <el-dialog v-model="aifarUpdateVisible" :title="t('apps.aifarUpdateTitle')" width="560px" destroy-on-close>
+      <el-form label-width="112px" class="aifar-update-form">
+        <el-form-item :label="t('containers.updateContainer')">
+          <el-input :model-value="selectedAifarContainerLabel" disabled />
+        </el-form-item>
+        <el-form-item :label="t('apps.aifarUpdateInstance')">
+          <el-input :model-value="selectedAifarInstanceLabel" disabled />
+        </el-form-item>
+        <el-form-item :label="t('apps.aifarUpdateMode')" required>
+          <el-radio-group v-model="aifarUpdateMode">
+            <el-radio-button label="single">{{ t('apps.aifarUpdateSingleMode') }}</el-radio-button>
+            <el-radio-button label="bundle">{{ t('apps.aifarUpdateBundleMode') }}</el-radio-button>
+          </el-radio-group>
+        </el-form-item>
+        <el-form-item v-if="aifarUpdateMode === 'single'" :label="t('apps.aifarUpdateService')" required>
+          <el-select v-model="aifarUpdateService" filterable>
+            <el-option v-for="service in aifarServiceOptions" :key="service.value" :label="service.label" :value="service.value" />
+          </el-select>
+        </el-form-item>
+        <el-form-item :label="t('apps.aifarUpdateArtifact')" required>
+          <el-upload
+            :key="`${aifarUpdateMode}-${aifarUpdateService}`"
+            :auto-upload="false"
+            :limit="1"
+            :accept="aifarArtifactAccept"
+            :on-change="handleAifarArtifactChange"
+            :on-remove="clearAifarArtifact"
+          >
+            <el-button>{{ t('apps.aifarUpdateChooseArtifact') }}</el-button>
+          </el-upload>
+          <div class="artifact-hint">{{ aifarArtifactHint }}</div>
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="aifarUpdateVisible = false">{{ t('common.cancel') }}</el-button>
+        <el-button type="primary" :loading="aifarUpdateSubmitting" @click="submitAifarUpdate">{{ t('apps.aifarUpdateSubmit') }}</el-button>
+      </template>
+    </el-dialog>
     <SecretConfirmPrompt
       v-model="deletePromptVisible"
       :title="t('apps.uninstallService')"
@@ -182,8 +223,9 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
+import type { UploadFile } from 'element-plus'
 import { useRouter } from 'vue-router'
-import { apiGet, apiPost, asArray } from '../api/client'
+import { apiGet, apiPost, apiPostForm, asArray } from '../api/client'
 import KeyValueGrid from '../components/KeyValueGrid.vue'
 import LogDrawer from '../components/LogDrawer.vue'
 import MetricGrid from '../components/MetricGrid.vue'
@@ -191,7 +233,7 @@ import SecretConfirmPrompt from '../components/SecretConfirmPrompt.vue'
 import ServerSelector from '../components/ServerSelector.vue'
 import StatusTag from '../components/StatusTag.vue'
 import { usePermissions } from '../composables/usePermissions'
-import { useI18n } from '../i18n'
+import { getCurrentLocale, useI18n } from '../i18n'
 import { permissions } from '../rbac'
 
 type DockerSummaryResponse = {
@@ -205,7 +247,9 @@ type AppInstance = {
   id: string
   app: string
   serverId: string
+  version?: string
   status: string
+  metadata?: string
 }
 
 const { t } = useI18n()
@@ -214,6 +258,7 @@ const router = useRouter()
 const selectedServerId = ref('')
 const servers = ref<any[]>([])
 const appInstances = ref<AppInstance[]>([])
+const appSettings = ref<{ maxRequestBodyBytes?: number }>({})
 const summary = ref<DockerSummaryResponse>({})
 const collection = ref<any[]>([])
 const selectedContainerRows = ref<any[]>([])
@@ -221,6 +266,12 @@ const error = ref('')
 const tab = ref('overview')
 const logsVisible = ref(false)
 const logsText = ref('')
+const aifarUpdateVisible = ref(false)
+const aifarUpdateSubmitting = ref(false)
+const aifarUpdateContainer = ref<any | null>(null)
+const aifarUpdateMode = ref<'single' | 'bundle'>('single')
+const aifarUpdateService = ref('oauth')
+const aifarArtifactFile = ref<File | null>(null)
 const deletePromptVisible = ref(false)
 const deleteSubmitting = ref(false)
 const canManageContainers = computed(() => can(permissions.containersManage))
@@ -304,6 +355,41 @@ const normalizedDiskUsage = computed(() => {
     { type: t('containers.buildCache'), size: '0 B', reclaimable: '-' }
   ]
 })
+const aifarServiceOptions = [
+  'oauth',
+  'permission',
+  'system',
+  'file',
+  'message',
+  'im',
+  'contacts',
+  'meeting',
+  'gateway',
+  'web-vue3'
+].map((name) => ({ value: name, label: name }))
+const selectedAifarUpdateInstance = computed(() => aifarInstanceForContainer(aifarUpdateContainer.value))
+const selectedAifarContainerLabel = computed(() => containerDisplayName(aifarUpdateContainer.value) || '-')
+const selectedAifarInstanceLabel = computed(() => {
+  const instance = selectedAifarUpdateInstance.value
+  if (!instance) {
+    return '-'
+  }
+  const server = servers.value.find((item) => item.id === instance.serverId)
+  const serverText = server ? serverLabel(server) : instance.serverId
+  return `${instance.app} / ${instance.version || '-'} / ${serverText}`
+})
+const aifarArtifactAccept = computed(() => {
+  if (aifarUpdateMode.value === 'bundle') {
+    return '.zip'
+  }
+  return aifarUpdateService.value === 'web-vue3' ? '.zip,.tar,.tgz,.tar.gz' : '.jar'
+})
+const aifarArtifactHint = computed(() => {
+  if (aifarUpdateMode.value === 'bundle') {
+    return t('apps.aifarUpdateBundleHint')
+  }
+  return aifarUpdateService.value === 'web-vue3' ? t('apps.aifarUpdateFrontendHint') : t('apps.aifarUpdateJarHint')
+})
 
 function targetQuery() {
   if (selectedServerId.value) {
@@ -322,6 +408,7 @@ function serverLabel(server: any) {
 async function loadServers() {
   servers.value = asArray(await apiGet<any[] | null>('/servers').catch(() => []))
   appInstances.value = asArray(await apiGet<AppInstance[] | null>('/apps/instances').catch(() => []))
+  appSettings.value = await apiGet<{ maxRequestBodyBytes?: number }>('/settings').catch(() => ({}))
   if (!selectedServerId.value || !dockerServers.value.some((server) => server.id === selectedServerId.value)) {
     selectedServerId.value = dockerServers.value[0]?.id ?? ''
   }
@@ -531,6 +618,146 @@ function containerDisplayName(row: any) {
   return String(row?.name || row?.id || '').trim()
 }
 
+function containerLabels(row: any): Record<string, string> {
+  const labels = row?.labels
+  if (!labels || typeof labels !== 'object' || Array.isArray(labels)) {
+    return {}
+  }
+  return labels as Record<string, string>
+}
+
+function aifarServiceFromContainer(row: any) {
+  const labels = containerLabels(row)
+  const labelService = String(labels['aifar.service'] || '').trim()
+  if (aifarServiceOptions.some((item) => item.value === labelService)) {
+    return labelService
+  }
+  const name = containerDisplayName(row).toLowerCase()
+  const match = aifarServiceOptions.find((item) => name.startsWith(`aifar-${item.value}-`))
+  return match?.value || ''
+}
+
+function isAifarManagedContainer(row: any) {
+  const labels = containerLabels(row)
+  if (String(labels['aifar.app'] || '').trim() === 'aifar' && aifarServiceFromContainer(row)) {
+    return true
+  }
+  return Boolean(aifarServiceFromContainer(row) && containerDisplayName(row).toLowerCase().startsWith('aifar-'))
+}
+
+function metadataOf(instance: AppInstance): Record<string, any> {
+  if (!instance.metadata) {
+    return {}
+  }
+  try {
+    const parsed = JSON.parse(instance.metadata)
+    return parsed && typeof parsed === 'object' ? parsed : {}
+  } catch {
+    return {}
+  }
+}
+
+function aifarInstanceForContainer(row: any) {
+  if (!row) {
+    return null
+  }
+  const labels = containerLabels(row)
+  const installRoot = String(labels['aifar.install-root'] || '').trim()
+  const candidates = appInstances.value.filter((item) => item.app === 'aifar' && item.serverId === selectedServerId.value)
+  if (installRoot) {
+    const matched = candidates.find((item) => String(metadataOf(item).installRoot || '').trim() === installRoot)
+    if (matched) {
+      return matched
+    }
+  }
+  return candidates[0] ?? null
+}
+
+function aifarUpdateDisabledReason(row: any) {
+  if (!canManageApps.value) return deniedText.value
+  if (!aifarServiceFromContainer(row)) return t('containers.updateServiceUnknown')
+  if (!aifarInstanceForContainer(row)) return t('containers.updateServiceInstanceMissing')
+  return ''
+}
+
+function openAifarUpdate(row: any) {
+  const reason = aifarUpdateDisabledReason(row)
+  if (reason) {
+    ElMessage.warning(reason)
+    return
+  }
+  aifarUpdateContainer.value = row
+  aifarUpdateMode.value = 'single'
+  aifarUpdateService.value = aifarServiceFromContainer(row) || 'oauth'
+  aifarArtifactFile.value = null
+  aifarUpdateVisible.value = true
+}
+
+function handleAifarArtifactChange(file: UploadFile) {
+  aifarArtifactFile.value = file.raw ?? null
+}
+
+function clearAifarArtifact() {
+  aifarArtifactFile.value = null
+}
+
+async function submitAifarUpdate() {
+  if (!canManageApps.value) {
+    ElMessage.warning(deniedText.value)
+    return
+  }
+  const instance = selectedAifarUpdateInstance.value
+  if (!instance || !aifarArtifactFile.value) {
+    ElMessage.warning(t('apps.aifarUpdateArtifactRequired'))
+    return
+  }
+  const uploadLimit = Number(appSettings.value.maxRequestBodyBytes || 0)
+  if (uploadLimit > 0 && aifarArtifactFile.value.size > uploadLimit) {
+    ElMessage.error(t('apps.aifarUpdateArtifactTooLarge', {
+      size: formatBytes(aifarArtifactFile.value.size),
+      limit: formatBytes(uploadLimit)
+    }))
+    return
+  }
+  const form = new FormData()
+  form.append('language', getCurrentLocale())
+  if (aifarUpdateMode.value === 'bundle') {
+    form.append('bundle', aifarArtifactFile.value, aifarArtifactFile.value.name)
+  } else {
+    form.append('service', aifarUpdateService.value)
+    form.append('artifact', aifarArtifactFile.value, aifarArtifactFile.value.name)
+  }
+  aifarUpdateSubmitting.value = true
+  try {
+    const endpoint = aifarUpdateMode.value === 'bundle'
+      ? `/apps/instances/${instance.id}/aifar/update-artifact-bundle`
+      : `/apps/instances/${instance.id}/aifar/update-artifact`
+    const result = await apiPostForm<{ taskId: string }>(endpoint, form)
+    aifarUpdateVisible.value = false
+    aifarArtifactFile.value = null
+    void router.push({ path: '/tasks', query: { taskId: result.taskId } })
+    ElMessage.success(t('apps.aifarUpdateAccepted'))
+  } catch (err) {
+    ElMessage.error(err instanceof Error ? err.message : t('apps.aifarUpdateFailed'))
+  } finally {
+    aifarUpdateSubmitting.value = false
+  }
+}
+
+function formatBytes(value: number) {
+  if (!Number.isFinite(value) || value <= 0) {
+    return '0 B'
+  }
+  const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB']
+  let size = value
+  let idx = 0
+  while (size >= 1024 && idx < units.length - 1) {
+    size /= 1024
+    idx++
+  }
+  return `${size.toFixed(idx === 0 ? 0 : 1)} ${units[idx]}`
+}
+
 async function confirmContainerAction(action: string, message: string) {
   const labelKey = containerActionLabelKeys[action]
   const label = labelKey ? t(labelKey) : action
@@ -595,6 +822,9 @@ async function confirmDockerUninstall(password: string) {
 }
 
 watch(tab, loadActive)
+watch([aifarUpdateService, aifarUpdateMode], () => {
+  aifarArtifactFile.value = null
+})
 watch(selectedServerId, load)
 onMounted(async () => {
   await loadServers()
@@ -674,6 +904,19 @@ onMounted(async () => {
 .container-table-body {
   flex: 1 1 auto;
   min-height: 0;
+}
+
+.aifar-update-form :deep(.el-select),
+.aifar-update-form :deep(.el-input) {
+  width: 100%;
+}
+
+.artifact-hint {
+  width: 100%;
+  margin-top: 6px;
+  color: var(--aifar-text-tertiary);
+  font-size: 12px;
+  line-height: 18px;
 }
 
 .settings-grid {

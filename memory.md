@@ -609,3 +609,7 @@
 - 结论：已新增 AIFAR autoscale controller，默认每分钟扫描实例，按 Docker 容器内存使用率持续 5 分钟超过 80%、冷却 10 分钟、最多 3 副本触发 `aifar.scale.out` worker 任务；扩容脚本复用当前 release 的 image/env/网络，用 `docker run` 创建带 labels 的 replica，readiness 通过后入口服务 reload 多 upstream ingress，metadata 记录 activeEndpoints/desiredReplicas/autoscaleMetrics/lastScaleEvents，并为更新/批量更新/卸载/扩容加入实例编排锁。验证通过：`go test ./internal/apps/aifar ./internal/store ./internal/httpapi`、`pnpm test`、`git diff --check`。
 - 问题：实现自检发现单服务/批量更新在已有多副本时仍会退回单副本，入口 upstream 也可能包含旧入口容器。
 - 结论：已补齐多副本滚动更新：partial update 保留 changed service 的 `desiredReplicas`，r1 继续由 Compose 构建启动，r2/r3 复用新 release image/env 通过 `docker run` 创建并逐个 readiness；全部新副本 ready 后入口 nginx 只写新 release 的 gateway/web-vue3 endpoint，成功 reload 后再按 label 清理旧 release 全部副本。
+
+## 2026-07-04
+- 问题：用户要求删除应用商店里的“更新”模块/入口，服务更新改到容器模块执行。
+- 结论：应用商店已移除“更新”Tab、已安装列表的“更新服务”按钮和 AIFAR 更新弹窗；容器列表改为基于 Docker labels 识别 AIFAR 容器，在对应行展示“更新服务”，并复用 AIFAR 单服务/批量包制品更新接口；后端容器列表现在返回 labels 以便前端匹配 `aifar.service` 和 `aifar.install-root`。

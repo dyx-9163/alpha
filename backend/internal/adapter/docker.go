@@ -24,14 +24,15 @@ type DockerSummary struct {
 }
 
 type DockerContainer struct {
-	ID        string `json:"id"`
-	Name      string `json:"name"`
-	Image     string `json:"image"`
-	State     string `json:"state"`
-	Status    string `json:"status"`
-	Ports     string `json:"ports"`
-	Networks  string `json:"networks"`
-	CreatedAt string `json:"createdAt"`
+	ID        string            `json:"id"`
+	Name      string            `json:"name"`
+	Image     string            `json:"image"`
+	State     string            `json:"state"`
+	Status    string            `json:"status"`
+	Ports     string            `json:"ports"`
+	Networks  string            `json:"networks"`
+	CreatedAt string            `json:"createdAt"`
+	Labels    map[string]string `json:"labels,omitempty"`
 }
 
 type DockerImage struct {
@@ -168,6 +169,7 @@ func parseDockerContainers(out []byte) ([]DockerContainer, error) {
 		Ports     string `json:"Ports"`
 		Networks  string `json:"Networks"`
 		CreatedAt string `json:"CreatedAt"`
+		Labels    string `json:"Labels"`
 	}
 	if err := parseDockerJSONLines(out, &rows); err != nil {
 		return nil, err
@@ -177,9 +179,34 @@ func parseDockerContainers(out []byte) ([]DockerContainer, error) {
 		items = append(items, DockerContainer{
 			ID: row.ID, Name: row.Names, Image: row.Image, State: row.State,
 			Status: row.Status, Ports: row.Ports, Networks: row.Networks, CreatedAt: row.CreatedAt,
+			Labels: parseDockerLabelList(row.Labels),
 		})
 	}
 	return items, nil
+}
+
+func parseDockerLabelList(value string) map[string]string {
+	out := map[string]string{}
+	for _, item := range strings.Split(value, ",") {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+		key, val, ok := strings.Cut(item, "=")
+		key = strings.TrimSpace(key)
+		if key == "" {
+			continue
+		}
+		if ok {
+			out[key] = strings.TrimSpace(val)
+		} else {
+			out[key] = ""
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 func DockerImages(ctx context.Context, host string) ([]DockerImage, error) {

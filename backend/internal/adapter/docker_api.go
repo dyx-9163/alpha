@@ -146,6 +146,7 @@ func dockerAPIContainers(ctx context.Context, host string) ([]DockerContainer, e
 		Status          string
 		Created         int64
 		Ports           []dockerAPIPort
+		Labels          map[string]string
 		NetworkSettings struct {
 			Networks map[string]any
 		}
@@ -169,9 +170,21 @@ func dockerAPIContainers(ctx context.Context, host string) ([]DockerContainer, e
 			Ports:     formatDockerAPIPorts(row.Ports),
 			Networks:  sortedKeys(row.NetworkSettings.Networks),
 			CreatedAt: formatUnix(row.Created),
+			Labels:    cloneStringMap(row.Labels),
 		})
 	}
 	return out, nil
+}
+
+func cloneStringMap(in map[string]string) map[string]string {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(in))
+	for key, value := range in {
+		out[key] = value
+	}
+	return out
 }
 
 type dockerAPIPort struct {

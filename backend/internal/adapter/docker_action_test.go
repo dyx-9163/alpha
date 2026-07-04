@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -86,5 +87,21 @@ func TestDockerAPIImageRemoveEscapesImageReference(t *testing.T) {
 	}
 	if gotPath != "/images/registry.example.com%2Fns%2Fapp:1.0" {
 		t.Fatalf("path = %s, want escaped image path", gotPath)
+	}
+}
+
+func TestParseDockerContainersIncludesLabels(t *testing.T) {
+	rows := strings.Join([]string{
+		`{"ID":"abc123","Names":"aifar-oauth-release","Image":"aifar-oauth:release","State":"running","Status":"Up 2 minutes","Ports":"38001/tcp","Networks":"aifar-network","CreatedAt":"now","Labels":"aifar.app=aifar,aifar.service=oauth,aifar.install-root=/aifar/apps/admin"}`,
+	}, "\n")
+	containers, err := parseDockerContainers([]byte(rows))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(containers) != 1 {
+		t.Fatalf("expected one container, got %+v", containers)
+	}
+	if containers[0].Labels["aifar.app"] != "aifar" || containers[0].Labels["aifar.service"] != "oauth" || containers[0].Labels["aifar.install-root"] != "/aifar/apps/admin" {
+		t.Fatalf("expected AIFAR labels, got %+v", containers[0].Labels)
 	}
 }
