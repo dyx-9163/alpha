@@ -281,14 +281,13 @@ func (s Service) ScaleOut(ctx context.Context, req ScaleOutRequest, log Logger, 
 	}
 	containerName := podContainerName(service, releaseID, replicaID)
 	script, err := renderAutoscaleOutScript(autoscaleOutScriptData{
-		InstallRoot:      installRoot,
-		ServiceName:      service,
-		ReleaseID:        releaseID,
-		ReplicaID:        replicaID,
-		ContainerName:    containerName,
-		IngressNetwork:   stringFromMetadata(metadata, "ingressNetwork", stringFromMetadata(metadata, "networkName", defaultNetworkName)),
-		IngressContainer: stringFromMetadata(metadata, "ingressContainer", ingressContainerName()),
-		MaxReplicas:      policy.MaxReplicas,
+		InstallRoot:    installRoot,
+		ServiceName:    service,
+		ReleaseID:      releaseID,
+		ReplicaID:      replicaID,
+		ContainerName:  containerName,
+		IngressNetwork: stringFromMetadata(metadata, "ingressNetwork", stringFromMetadata(metadata, "networkName", defaultNetworkName)),
+		MaxReplicas:    policy.MaxReplicas,
 	})
 	if err != nil {
 		finishTarget(recorder, target, "failed", err.Error())

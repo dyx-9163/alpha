@@ -11,7 +11,6 @@ MAX_REPLICAS={{ .MaxReplicas }}
 
 RUNTIME_DIR="$INSTALL_ROOT/runtime"
 ENV_DIR="$RUNTIME_DIR/env"
-PROXY_DIR="$RUNTIME_DIR/service-proxies"
 
 fail() {
   echo "$*" >&2

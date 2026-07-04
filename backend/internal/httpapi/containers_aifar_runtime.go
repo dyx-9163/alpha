@@ -324,7 +324,7 @@ func (a *API) buildAIFARRuntime(ctx context.Context, server store.Server) (aifar
 		if instance.App != "aifar" || instance.ServerID != server.ID {
 			continue
 		}
-		a.appendAIFARInstanceRuntime(&response, instance, containers, containersByName, statsByName)
+		a.appendAIFARInstanceRuntime(&response, instance, containersByName, statsByName)
 	}
 	if len(response.Instances) == 0 {
 		response.RuntimeStatus = degradedIfReady(response.RuntimeStatus)
@@ -334,7 +334,7 @@ func (a *API) buildAIFARRuntime(ctx context.Context, server store.Server) (aifar
 	return response, nil
 }
 
-func (a *API) appendAIFARInstanceRuntime(response *aifarRuntimeResponse, instance store.AppInstance, containers []adapter.DockerContainer, containersByName map[string]adapter.DockerContainer, statsByName map[string]adapter.DockerContainerStat) {
+func (a *API) appendAIFARInstanceRuntime(response *aifarRuntimeResponse, instance store.AppInstance, containersByName map[string]adapter.DockerContainer, statsByName map[string]adapter.DockerContainerStat) {
 	metadata := runtimeMetadata(instance.Metadata)
 	installRoot := normalizeRuntimeInstallRoot(runtimeString(metadata, "installRoot", ""))
 	model := strings.TrimSpace(runtimeString(metadata, "orchestrationModel", ""))
@@ -358,9 +358,6 @@ func (a *API) appendAIFARInstanceRuntime(response *aifarRuntimeResponse, instanc
 	replicasets, _ := a.store.ListAIFARReplicaSets(instance.ID)
 	pods, _ := a.store.ListAIFARPods(instance.ID)
 	endpoints, _ := a.store.ListAIFARServiceEndpoints(instance.ID)
-	if len(pods) == 0 {
-		pods = fallbackAIFARPodsFromContainers(instance.ID, installRoot, containers)
-	}
 	replicaImage := latestReplicaImages(replicasets)
 	readyByService := readyEndpointCounts(endpoints)
 	podsByService := map[string][]aifarRuntimePod{}
@@ -551,29 +548,6 @@ func runtimePodStatus(pod store.AIFARPod, row adapter.DockerContainer, found boo
 	}
 }
 
-func fallbackAIFARPodsFromContainers(instanceID, installRoot string, containers []adapter.DockerContainer) []store.AIFARPod {
-	out := []store.AIFARPod{}
-	for _, row := range containers {
-		labels := row.Labels
-		if labels["aifar.app"] != "aifar" || labels["aifar.component"] != "pod" {
-			continue
-		}
-		if installRoot != "" && normalizeRuntimeInstallRoot(labels["aifar.install-root"]) != installRoot {
-			continue
-		}
-		out = append(out, store.AIFARPod{
-			InstanceID:    instanceID,
-			ServiceName:   labels["aifar.service"],
-			Revision:      firstRuntimeValue(labels["aifar.revision"], labels["aifar.release"]),
-			PodID:         firstRuntimeValue(labels["aifar.pod"], labels["aifar.replica"]),
-			ContainerName: row.Name,
-			Status:        row.State,
-			Ready:         strings.EqualFold(row.State, "running") && !strings.Contains(strings.ToLower(row.Status), "unhealthy"),
-		})
-	}
-	return out
-}
-
 func latestReplicaImages(items []store.AIFARReplicaSet) map[string]string {
 	out := map[string]string{}
 	for _, item := range items {
@@ -718,16 +692,6 @@ func normalizeRuntimeInstallRoot(value string) string {
 		value = strings.TrimSuffix(value, "/")
 	}
 	return value
-}
-
-func firstRuntimeValue(values ...string) string {
-	for _, value := range values {
-		value = strings.TrimSpace(value)
-		if value != "" {
-			return value
-		}
-	}
-	return ""
 }
 
 func degradedIfReady(status string) string {

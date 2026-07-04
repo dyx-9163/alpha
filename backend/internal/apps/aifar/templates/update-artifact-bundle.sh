@@ -11,13 +11,11 @@ REVISION={{ quote .ReleaseID }}
 CREATED_AT={{ quote .CreatedAt }}
 CONFIG_HASH={{ quote .ConfigHash }}
 INGRESS_NETWORK={{ quote .IngressNetwork }}
-INGRESS_CONTAINER={{ quote .IngressContainer }}
 DEPLOYMENT_CONCURRENCY={{ .Concurrency }}
 
 RUNTIME_DIR="$INSTALL_ROOT/runtime"
 APP_DIR="$RUNTIME_DIR/docker-apps"
 ENV_DIR="$RUNTIME_DIR/env"
-PROXY_DIR="$RUNTIME_DIR/service-proxies"
 TMP_DIR="$INSTALL_ROOT/.rollout-bundle-$REVISION-$$"
 DRAIN_SECONDS="${DRAIN_SECONDS:-30}"
 ORCHESTRATION_MODEL="k8s-like-v1"

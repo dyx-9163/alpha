@@ -10,13 +10,11 @@ REVISION={{ quote .ReleaseID }}
 CREATED_AT={{ quote .CreatedAt }}
 CONFIG_HASH={{ quote .ConfigHash }}
 INGRESS_NETWORK={{ quote .IngressNetwork }}
-INGRESS_CONTAINER={{ quote .IngressContainer }}
 
 RUNTIME_DIR="$INSTALL_ROOT/runtime"
 APP_DIR="$RUNTIME_DIR/docker-apps"
 IMAGE_DIR="$RUNTIME_DIR/docker-images"
 ENV_DIR="$RUNTIME_DIR/env"
-PROXY_DIR="$RUNTIME_DIR/service-proxies"
 INGRESS_DIR="$RUNTIME_DIR/ingress"
 AIFAR_DIR="$INSTALL_ROOT/.aifar"
 TMP_DIR="$INSTALL_ROOT/.extract-$REVISION-$$"
@@ -80,10 +78,6 @@ retag_image() {
 
 pod_name() {
   printf "aifar-pod-admin-%s-%s-r%s" "$1" "$2" "$3" | tr '. _/' '----'
-}
-
-service_proxy_name() {
-  printf "aifar-svc-admin-%s" "$1" | tr '. _/' '----'
 }
 
 alpha_service_pairs() {
@@ -508,19 +502,8 @@ JSON
 }
 
 cleanup_failed_install() {
-  docker rm -f "$INGRESS_CONTAINER" >/dev/null 2>&1 || true
-  for service in $SERVICE_ORDER; do
-    docker rm -f "$(service_proxy_name "$service")" >/dev/null 2>&1 || true
-  done
   pods="$(docker ps -a --filter "label=aifar.app=aifar" --filter "label=aifar.install-root=$INSTALL_ROOT" --filter "label=aifar.component=pod" --format '{{ "{{" }}.Names{{ "}}" }}' 2>/dev/null || true)"
   [ -z "$pods" ] || docker rm -f $pods >/dev/null 2>&1 || true
-}
-
-remove_runtime_infra_containers() {
-  docker rm -f "$INGRESS_CONTAINER" >/dev/null 2>&1 || true
-  for service in $SERVICE_ORDER; do
-    docker rm -f "$(service_proxy_name "$service")" >/dev/null 2>&1 || true
-  done
 }
 
 command -v docker >/dev/null 2>&1 || fail "docker command is required"
@@ -528,7 +511,7 @@ docker info >/dev/null 2>&1 || fail "docker daemon is not available"
 command -v tar >/dev/null 2>&1 || fail "tar command is required"
 [ -f "$ARCHIVE" ] || fail "bundle archive not found: $ARCHIVE"
 
-mkdir -p "$INSTALL_ROOT" "$WORK_DIR" "$RUNTIME_DIR" "$ENV_DIR" "$PROXY_DIR" "$INGRESS_DIR" "$AIFAR_DIR"
+mkdir -p "$INSTALL_ROOT" "$WORK_DIR" "$RUNTIME_DIR" "$ENV_DIR" "$INGRESS_DIR" "$AIFAR_DIR"
 rm -rf "$TMP_DIR" "$APP_DIR" "$IMAGE_DIR"
 mkdir -p "$TMP_DIR"
 tar -xzf "$ARCHIVE" -C "$TMP_DIR"
@@ -550,7 +533,6 @@ load_docker_images
 require_local_image "bellsoft/liberica-openjre-rocky:21"
 require_local_image "nginx:stable-alpine"
 ensure_network
-remove_runtime_infra_containers
 build_images
 
 for service in $SERVICE_ORDER; do

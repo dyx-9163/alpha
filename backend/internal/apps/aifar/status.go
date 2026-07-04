@@ -14,7 +14,6 @@ type StatusResult struct {
 	Message             string
 	InstallRoot         string
 	OrchestrationModel  string
-	CurrentRelease      string
 	ReleaseID           string
 	InstallRootExists   bool
 	TotalContainers     int
@@ -22,7 +21,6 @@ type StatusResult struct {
 	UnhealthyContainers int
 	StaleContainers     int
 	IngressRunning      bool
-	ServiceProxies      int
 	Containers          []string
 }
 
@@ -67,7 +65,6 @@ RUNNING=0
 UNHEALTHY=0
 STALE=0
 INGRESS_RUNNING="false"
-SERVICE_PROXIES=0
 CONTAINERS=""
 
 manifest_json_value() {
@@ -107,29 +104,6 @@ if command -v docker >/dev/null 2>&1 && [ "$MODEL" = "` + orchestrationModelK8sL
       fi
     done
   done
-  if [ "$INGRESS_RUNNING" = "true" ]; then
-    SERVICE_PROXIES=$RUNNING
-  fi
-  if [ "$TOTAL" -gt 0 ] && [ "$RUNNING" -eq "$TOTAL" ] && [ "$UNHEALTHY" -eq 0 ] && [ "$INGRESS_RUNNING" = "true" ]; then
-    STATUS="running"
-  elif [ "$RUNNING" -gt 0 ]; then
-    STATUS="degraded"
-  fi
-elif command -v docker >/dev/null 2>&1 && [ "$INSTALL_ROOT_EXISTS" = "true" ]; then
-  MODEL="` + legacyOrchestrationModel + `"
-  names="$(docker ps -a --filter "label=aifar.app=aifar" --filter "label=aifar.install-root=$INSTALL_ROOT" --format '{{.Names}}' 2>/dev/null || true)"
-  for name in $names; do
-    TOTAL=$((TOTAL + 1))
-    running="$(docker inspect -f '{{.State.Running}}' "$name" 2>/dev/null || echo false)"
-    health="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{end}}' "$name" 2>/dev/null || true)"
-    CONTAINERS="${CONTAINERS}${name}:${running}:${health},"
-    if [ "$running" = "true" ]; then
-      RUNNING=$((RUNNING + 1))
-    fi
-    if [ "$health" = "unhealthy" ]; then
-      UNHEALTHY=$((UNHEALTHY + 1))
-    fi
-  done
   if [ "$TOTAL" -gt 0 ] && [ "$RUNNING" -eq "$TOTAL" ] && [ "$UNHEALTHY" -eq 0 ] && [ "$INGRESS_RUNNING" = "true" ]; then
     STATUS="running"
   elif [ "$RUNNING" -gt 0 ]; then
@@ -140,14 +114,12 @@ fi
 echo "status=$STATUS"
 echo "installRootExists=$INSTALL_ROOT_EXISTS"
 echo "orchestrationModel=$MODEL"
-echo "currentRelease="
 echo "releaseId=$RELEASE_ID"
 echo "totalContainers=$TOTAL"
 echo "runningContainers=$RUNNING"
 echo "unhealthyContainers=$UNHEALTHY"
 echo "staleContainers=$STALE"
 echo "ingressRunning=$INGRESS_RUNNING"
-echo "serviceProxies=$SERVICE_PROXIES"
 echo "containers=$CONTAINERS"
 ` + "\nAIFAR_SERVICE_STATUS"
 }
@@ -166,8 +138,6 @@ func parseStatusOutput(output string) StatusResult {
 			result.InstallRootExists = strings.EqualFold(strings.TrimSpace(value), "true")
 		case "orchestrationModel":
 			result.OrchestrationModel = strings.TrimSpace(value)
-		case "currentRelease":
-			result.CurrentRelease = strings.TrimSpace(value)
 		case "releaseId":
 			result.ReleaseID = strings.TrimSpace(value)
 		case "totalContainers":
@@ -180,8 +150,6 @@ func parseStatusOutput(output string) StatusResult {
 			result.StaleContainers = atoi(value)
 		case "ingressRunning":
 			result.IngressRunning = strings.EqualFold(strings.TrimSpace(value), "true")
-		case "serviceProxies":
-			result.ServiceProxies = atoi(value)
 		case "containers":
 			result.Containers = parseContainers(value)
 		}

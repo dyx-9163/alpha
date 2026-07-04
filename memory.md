@@ -657,3 +657,5 @@
 - 结论：`aifar-agent` 定位为每台目标 Linux 服务器上的 systemd 运行时代理，负责承接 AIFAR 的 Service/Ingress 能力：监听宿主机端口、按 Docker labels 发现 healthy 业务 Pod、维护流量转发、对外提供 status/reconcile/remove API，并让 AIFAR 后端只提交期望状态，不再把 svc/ingress 作为 Docker 容器管理。
 - 问题：用户贴出 `web-vue3` nginx 启动失败：`host not found in upstream "aifar-pod-admin-gateway-..."`，但 gateway Pod 已 healthy。
 - 结论：根因是 web-vue3 nginx 配置残留旧逻辑，启动时依赖 Docker DNS 解析 gateway Pod 名；在 agent 模型下 `/api` 和 websocket 应由宿主机 `aifar-agent` 入口层转发，web 容器只服务静态页面。已从安装脚本移除 gateway Pod 替换逻辑，并在新装、单服务更新、批量更新中剥离 web nginx 的 `/api` 和 `/im/ws` 代理块。
+- 问题：用户要求去掉老版本部署 AIFAR 应用的代码逻辑，只保留 agents。
+- 结论：AIFAR 安装、更新、批量更新、扩容和卸载脚本已移除旧 nginx ingress/service-proxy/current release/Compose fallback 路径，只保留 `aifar-agent` runtime spec 与业务 Pod；状态检测和容器 runtime 也不再从 legacy Docker 容器反推 AIFAR 运行时。

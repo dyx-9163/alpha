@@ -114,10 +114,7 @@ func (s Service) UpdateArtifactBundle(ctx context.Context, req ArtifactBundleUpd
 	var releaseID string
 	var baseReleaseID string
 	var configHash string
-	var composeProject string
 	var ingressNetwork string
-	var internalNetwork string
-	var ingressContainer string
 	var gatewayPort int
 	var webPort int
 	var workDir string
@@ -143,10 +140,7 @@ func (s Service) UpdateArtifactBundle(ctx context.Context, req ArtifactBundleUpd
 		releaseTime = time.Now().UTC()
 		releaseID = newReleaseID("rollout-bundle", releaseTime)
 		configHash = partialBundleUpdateConfigHash(stringFromMetadata(metadata, "configHash", ""), artifacts)
-		composeProject = composeProjectName(releaseID)
 		ingressNetwork = stringFromMetadata(metadata, "ingressNetwork", stringFromMetadata(metadata, "networkName", defaultNetworkName))
-		internalNetwork = releaseInternalNetworkName(releaseID)
-		ingressContainer = stringFromMetadata(metadata, "ingressContainer", ingressContainerName())
 		gatewayPort = intFromMetadata(metadata, "gatewayPort", defaultGatewayPort)
 		webPort = intFromMetadata(metadata, "webPort", defaultWebPort)
 		deployDir := installerkit.RemoteDeployDir(req.Server.DeployDir)
@@ -188,22 +182,18 @@ func (s Service) UpdateArtifactBundle(ctx context.Context, req ArtifactBundleUpd
 			}
 		}
 		script, err := renderBundleUpdateScript(bundleUpdateScriptData{
-			InstallRoot:      installRoot,
-			WorkDir:          workDir,
-			ServiceOrder:     serviceOrderText(),
-			ChangedServices:  artifactServiceNamesText(artifacts),
-			Artifacts:        scriptArtifacts,
-			Version:          version,
-			ReleaseID:        releaseID,
-			CreatedAt:        releaseTime.Format(time.RFC3339),
-			ConfigHash:       configHash,
-			ReleaseKeepCount: releaseKeepCount,
-			ComposeProject:   composeProject,
-			IngressNetwork:   ingressNetwork,
-			InternalNetwork:  internalNetwork,
-			IngressContainer: ingressContainer,
-			Concurrency:      concurrency,
-			DesiredReplicas:  replicaAssignmentsForServices(desiredReplicasFromMetadata(metadata), artifactServiceNames(artifacts)),
+			InstallRoot:     installRoot,
+			WorkDir:         workDir,
+			ServiceOrder:    serviceOrderText(),
+			ChangedServices: artifactServiceNamesText(artifacts),
+			Artifacts:       scriptArtifacts,
+			Version:         version,
+			ReleaseID:       releaseID,
+			CreatedAt:       releaseTime.Format(time.RFC3339),
+			ConfigHash:      configHash,
+			IngressNetwork:  ingressNetwork,
+			Concurrency:     concurrency,
+			DesiredReplicas: replicaAssignmentsForServices(desiredReplicasFromMetadata(metadata), artifactServiceNames(artifacts)),
 		})
 		if err != nil {
 			return err

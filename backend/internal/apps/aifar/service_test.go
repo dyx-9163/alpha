@@ -260,13 +260,11 @@ func installedAIFARInstance(t *testing.T) store.AppInstance {
 	metadata := map[string]any{
 		"installRoot":           "/aifar/apps/admin",
 		"runtimeDir":            "/aifar/apps/admin/runtime",
-		"layout":                releaseLayout,
 		"orchestrationModel":    orchestrationModelK8sLikeV1,
 		"releaseId":             releaseID,
 		"currentRevision":       releaseID,
 		"releaseVersion":        "docker-apps",
 		"configHash":            "base-config-hash",
-		"releaseRetention":      releaseKeepCount,
 		"services":              serviceOrder,
 		"gatewayPort":           defaultGatewayPort,
 		"webPort":               defaultWebPort,
@@ -416,14 +414,13 @@ func TestAutoscaleDoesNotTriggerWithoutMemoryLimitOrDuringCooldown(t *testing.T)
 
 func TestAutoscaleOutScriptUsesReplicaContainerAndEscapedDockerFormats(t *testing.T) {
 	script, err := renderAutoscaleOutScript(autoscaleOutScriptData{
-		InstallRoot:      "/aifar/apps/admin",
-		ServiceName:      "permission",
-		ReleaseID:        "rel-1",
-		ReplicaID:        2,
-		ContainerName:    "aifar-permission-rel-1-r2",
-		IngressNetwork:   "aifar-network",
-		IngressContainer: ingressContainerName(),
-		MaxReplicas:      3,
+		InstallRoot:    "/aifar/apps/admin",
+		ServiceName:    "permission",
+		ReleaseID:      "rel-1",
+		ReplicaID:      2,
+		ContainerName:  "aifar-permission-rel-1-r2",
+		IngressNetwork: "aifar-network",
+		MaxReplicas:    3,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -489,7 +486,7 @@ func TestScaleOutCreatesReplicaAndUpdatesEndpointMetadata(t *testing.T) {
 	}
 }
 
-func TestPartialOrchestrationPreservesDesiredReplicasForChangedService(t *testing.T) {
+func TestRolloutOrchestrationPreservesDesiredReplicasForChangedService(t *testing.T) {
 	current := map[string]any{
 		"releaseId":   "base-release",
 		"gatewayPort": float64(defaultGatewayPort),
@@ -508,7 +505,7 @@ func TestPartialOrchestrationPreservesDesiredReplicasForChangedService(t *testin
 			},
 		},
 	}
-	next := partialOrchestrationMetadata(current, "/data/apps/admin", "new-release", defaultNetworkName, defaultGatewayPort, defaultWebPort, []string{"permission"})
+	next := rolloutOrchestrationMetadata(current, "/data/apps/admin", "new-release", defaultNetworkName, defaultGatewayPort, defaultWebPort, []string{"permission"})
 	desired := desiredReplicasFromMetadata(next)
 	if desired["permission"] != 2 {
 		t.Fatalf("expected changed service desired replicas to stay 2, got %+v", desired)
@@ -574,10 +571,7 @@ func TestServiceInstallsAIFARServiceFromDockerAppsBundle(t *testing.T) {
 	if metadata["endpoint"] != "10.0.0.10:18080" || metadata["networkName"] != defaultNetworkName {
 		t.Fatalf("unexpected metadata: %s", instance.Metadata)
 	}
-	if metadata["layout"] != releaseLayout || metadata["releaseId"] == "" || metadata["releaseRetention"].(float64) != releaseKeepCount {
-		t.Fatalf("expected release layout metadata, got %s", instance.Metadata)
-	}
-	if metadata["composeProject"] == "" || metadata["runtimeService"] != "aifar-agent" || metadata["ingressNetwork"] != defaultNetworkName || metadata["internalNetwork"] == "" {
+	if metadata["releaseId"] == "" || metadata["runtimeService"] != "aifar-agent" || metadata["ingressNetwork"] != defaultNetworkName {
 		t.Fatalf("expected orchestration metadata, got %s", instance.Metadata)
 	}
 	if metadata["orchestrationModel"] != orchestrationModelK8sLikeV1 || !strings.Contains(instance.Metadata, "agent-proxy") || strings.Contains(instance.Metadata, "aifar-svc-admin-gateway") || !strings.Contains(instance.Metadata, "aifar-pod-admin-gateway") {
@@ -601,7 +595,6 @@ func TestServiceInstallsAIFARServiceFromDockerAppsBundle(t *testing.T) {
 		`runtime-spec.json`,
 		`"services": [`,
 		`"gatewayService": "gateway"`,
-		`remove_runtime_infra_containers`,
 		`container_status()`,
 		`docker inspect --format '{{.State.Status}}'`,
 		`docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{end}}'`,
@@ -623,54 +616,20 @@ func TestServiceInstallsAIFARServiceFromDockerAppsBundle(t *testing.T) {
 		`patch_web_nginx_gateway_target`,
 		`aifar-gateway`,
 		`proxy_pass http://aifar_gateway;`,
+		`aifar-admin-ingress`,
+		`aifar-svc-admin-`,
+		`remove_runtime_infra_containers`,
+		`nginx -s reload`,
+		`CURRENT_LINK="$INSTALL_ROOT/current"`,
+		`RELEASES_DIR="$INSTALL_ROOT/releases"`,
 	} {
 		if strings.Contains(remote.installScript, legacy) {
 			t.Fatalf("AIFAR install script should not make web-vue3 depend on gateway DNS %q:\n%s", legacy, remote.installScript)
 		}
 	}
-	return
-	if !strings.Contains(remote.joinedUploads(), "aifar-service-bundle-") || !strings.Contains(remote.joinedCommands(), "install-aifar.sh") {
-		t.Fatalf("expected bundle upload and install script run, uploads=%s commands=%s", remote.joinedUploads(), remote.joinedCommands())
-	}
-	if !strings.Contains(remote.installScript, `open_firewall_ports "$GATEWAY_PORT" "$WEB_VUE3_PORT"`) ||
-		!strings.Contains(remote.installScript, `allow_selinux_ports http_port_t "$GATEWAY_PORT" "$WEB_VUE3_PORT"`) ||
-		strings.Contains(remote.installScript, `open_firewall_ports "$GATEWAY_PORT" "$WEB_VUE3_PORT" "$NACOS_PORT_WEB"`) {
-		t.Fatalf("AIFAR install script should open only AIFAR service ports:\n%s", remote.installScript)
-	}
-	if !strings.Contains(remote.installScript, "ensure_network") ||
-		!strings.Contains(remote.installScript, "external: true") ||
-		!strings.Contains(remote.installScript, "name: ${AIFAR_INGRESS_NETWORK}") ||
-		strings.Contains(remote.installScript, "name: ${AIFAR_INTERNAL_NETWORK}") ||
-		strings.Contains(remote.installScript, "      - internal") {
-		t.Fatalf("AIFAR install script should create and use the shared Docker network as external:\n%s", remote.installScript)
-	}
-	for _, want := range []string{
-		`set_env COMPOSE_PROJECT_NAME "$COMPOSE_PROJECT_NAME" "$compose_env"`,
-		`set_env AIFAR_INTERNAL_NETWORK "$INTERNAL_NETWORK" "$compose_env"`,
-		`container="$(service_container_name "$service")"`,
-		`patch_web_nginx_gateway_target`,
-		`gateway_container="$(container_for_service gateway)"`,
-		`placeholder="__AIFAR_GATEWAY_UPSTREAM__"`,
-		`sed "s#http://aifar-gateway[-A-Za-z0-9_.]*:[0-9][0-9]*#${placeholder}#g; s#http://aifar-gateway[-A-Za-z0-9_.]*#${placeholder}#g; s#${placeholder}#http://${gateway_container}:${gateway_port}#g"`,
-		`expose:`,
-		`aifar.release: "$RELEASE_ID"`,
-		`configure_ingress`,
-		`nginx -s reload`,
-		`location /api/`,
-		`location /im/ws/`,
-		`proxy_pass http://aifar_gateway;`,
-		`proxy_set_header Connection \$connection_upgrade;`,
-	} {
-		if !strings.Contains(remote.installScript, want) {
-			t.Fatalf("AIFAR install script should include custom orchestration with %q:\n%s", want, remote.installScript)
-		}
-	}
 	if strings.Contains(remote.installScript, `      - "${GATEWAY_PORT}:${GATEWAY_PORT}"`) ||
 		strings.Contains(remote.installScript, `      - "${WEB_VUE3_PORT}:${WEB_VUE3_PORT}"`) {
 		t.Fatalf("AIFAR business services should not bind host ports directly:\n%s", remote.installScript)
-	}
-	if strings.Index(remote.installScript, "down_release \"$previous_release\"") < strings.Index(remote.installScript, "if ! start_release; then") {
-		t.Fatalf("AIFAR install script should start the new release before stopping the previous one:\n%s", remote.installScript)
 	}
 	if !strings.Contains(remote.installScript, "resolve_system_timezone") || !strings.Contains(remote.installScript, "timedatectl show -p Timezone") {
 		t.Fatalf("AIFAR install script should resolve system timezone:\n%s", remote.installScript)
@@ -688,7 +647,6 @@ func TestServiceInstallsAIFARServiceFromDockerAppsBundle(t *testing.T) {
 		t.Fatalf("AIFAR install script should load offline Docker base images before build:\n%s", remote.installScript)
 	}
 	for _, want := range []string{
-		"check_dependencies",
 		"check_nacos_dependency",
 	} {
 		if !strings.Contains(remote.installScript, want) {
@@ -733,21 +691,6 @@ func TestServiceInstallsAIFARServiceFromDockerAppsBundle(t *testing.T) {
 	} {
 		if !strings.Contains(remote.installScript, want) {
 			t.Fatalf("AIFAR install script should force alpha service names with %q:\n%s", want, remote.installScript)
-		}
-	}
-	for _, want := range []string{
-		`RELEASES_DIR="$INSTALL_ROOT/releases"`,
-		`CURRENT_LINK="$INSTALL_ROOT/current"`,
-		`java-common.env`,
-		`java-secrets.env`,
-		`APP_RESTART_POLICY=no`,
-		`wait_release_ready`,
-		`apply_restart_policy`,
-		`cleanup_old_releases`,
-		`RELEASE_KEEP_COUNT=3`,
-	} {
-		if !strings.Contains(remote.installScript, want) {
-			t.Fatalf("AIFAR install script should include release-based layout with %q:\n%s", want, remote.installScript)
 		}
 	}
 }
@@ -946,72 +889,6 @@ func TestServiceUpdatesAIFARServiceArtifactAsPartialRelease(t *testing.T) {
 			t.Fatalf("rollout update script should contain %q:\n%s", want, remote.updateScript)
 		}
 	}
-	return
-	for _, want := range []string{
-		`SERVICE_NAME='oauth'`,
-		`DESIRED_REPLICAS='oauth=1'`,
-		`SERVICE_BASE_RELEASE="$(release_for_service "$SERVICE_NAME" "$BASE_RELEASE" || true)"`,
-		`release_owning_service_dir()`,
-		`[ ! -L "$rfs_service_dir" ]`,
-		`rfs_owner="$(release_owning_service_dir "$rfs_service" "$rfs_real_dir" || true)"`,
-		`copy_shared_release_files "$BASE_RELEASE"`,
-		`copy_service_release_files "$SERVICE_BASE_RELEASE"`,
-		`materialize_effective_service_dirs`,
-		`link_inherited_service_files "$mes_service" "$mes_source"`,
-		`csrf_real_dir="$(readlink -f "$csrf_service_dir"`,
-		`changed service directory must be materialized`,
-		`ln -s "$lis_real_dir" "$APP_DIR/$lis_service"`,
-		`cfr_source="$1"`,
-		`csrf_source="$1"`,
-		`cp -a "$csrf_source/env/." "$ENV_DIR/"`,
-		`write_containers_json`,
-		`write_partial_compose_env`,
-		`apply_java_artifact`,
-		`retag_selected_service`,
-		`if [ "$SERVICE_NAME" = "web-vue3" ]; then`,
-		`patch_web_nginx_gateway_target`,
-		`gateway_container="$(route_container_for_service gateway)"`,
-		`set_env APP_CONTAINER_NAME "$(service_container_name "$SERVICE_NAME")" "$service_env"`,
-		`replica_container_name()`,
-		`set_service_runtime_port "$SERVICE_NAME"`,
-		`set_env SERVER_PORT "$srp_port_value" "$ENV_DIR/$srp_service.env"`,
-		`patch_compose_service_release "$SERVICE_NAME"`,
-		`aifar.release: \"" release "\""`,
-		`print "    networks:"; print "      - ingress"`,
-		`docker network connect "$ctn_network" "$ctn_container"`,
-		`connect_service_to_legacy_internal_networks "$SERVICE_NAME"`,
-		`compose --env-file env/compose.env -f compose.yaml up -d --build --no-deps "$SERVICE_NAME"`,
-		`start_additional_replicas "$SERVICE_NAME"`,
-		`docker run -d`,
-		`--label "aifar.replica=$src_replica"`,
-		`configure_ingress_if_needed`,
-		`list_route_containers gateway`,
-		`--filter "label=aifar.release=$lcb_release"`,
-		`ingress_config_needs_route_patch`,
-		`reloading AIFAR ingress $INGRESS_CONTAINER`,
-		`AIFAR ingress reloaded`,
-		`location /api/`,
-		`location /im/ws/`,
-		`proxy_pass http://aifar_gateway;`,
-		`stop_service_in_release "$SERVICE_BASE_RELEASE" "$SERVICE_NAME"`,
-		`rollback_service "$SERVICE_BASE_RELEASE"`,
-		`"kind": "partial"`,
-		`"composeProject": "$COMPOSE_PROJECT_NAME"`,
-		`"changedServices": ["$SERVICE_NAME"]`,
-	} {
-		if !strings.Contains(remote.updateScript, want) {
-			t.Fatalf("update script should contain %q:\n%s", want, remote.updateScript)
-		}
-	}
-	if strings.Contains(remote.updateScript, `cp -a "$BASE_RELEASE/." "$RELEASE_DIR/"`) {
-		t.Fatalf("partial update script should not copy the whole base release:\n%s", remote.updateScript)
-	}
-	if strings.Contains(remote.updateScript, "\n  source=\"$1\"") {
-		t.Fatalf("partial update script should not reuse global shell variable source:\n%s", remote.updateScript)
-	}
-	if strings.Contains(remote.updateScript, "cleanup_release_images") || strings.Contains(remote.updateScript, "docker image rm") {
-		t.Fatalf("partial update script should not delete inherited image refs:\n%s", remote.updateScript)
-	}
 	if len(s.instances) != 1 {
 		t.Fatalf("expected one instance, got %+v", s.instances)
 	}
@@ -1022,15 +899,15 @@ func TestServiceUpdatesAIFARServiceArtifactAsPartialRelease(t *testing.T) {
 	if metadata["releaseId"] == "20260701T010203.000000000Z-docker-apps" || metadata["configHash"] == "base-config-hash" {
 		t.Fatalf("expected release metadata to change, got %s", s.instances[0].Metadata)
 	}
-	lastUpdate, ok := metadata["lastPartialUpdate"].(map[string]any)
+	lastUpdate, ok := metadata["lastRollout"].(map[string]any)
 	if !ok || lastUpdate["service"] != "oauth" || lastUpdate["artifactFile"] != "oauth.jar" || lastUpdate["artifactSHA256"] == "" {
-		t.Fatalf("expected lastPartialUpdate metadata, got %s", s.instances[0].Metadata)
+		t.Fatalf("expected lastRollout metadata, got %s", s.instances[0].Metadata)
 	}
 	if len(s.releases) != 1 || s.releases[0].InstanceID != instance.ID || s.releases[0].Status != "success" {
-		t.Fatalf("expected one partial release, got %+v", s.releases)
+		t.Fatalf("expected one rollout release, got %+v", s.releases)
 	}
-	if !strings.Contains(s.releases[0].ManifestJSON, `"kind":"partial"`) || !strings.Contains(s.releases[0].ManifestJSON, `"changedServices":["oauth"]`) {
-		t.Fatalf("expected partial release manifest, got %s", s.releases[0].ManifestJSON)
+	if !strings.Contains(s.releases[0].ManifestJSON, `"kind":"rollout"`) || !strings.Contains(s.releases[0].ManifestJSON, `"changedServices":["oauth"]`) {
+		t.Fatalf("expected rollout release manifest, got %s", s.releases[0].ManifestJSON)
 	}
 	var manifest map[string]any
 	if err := json.Unmarshal([]byte(s.releases[0].ManifestJSON), &manifest); err != nil {
@@ -1038,14 +915,8 @@ func TestServiceUpdatesAIFARServiceArtifactAsPartialRelease(t *testing.T) {
 	}
 	releaseID, _ := metadata["releaseId"].(string)
 	containers, _ := manifest["containers"].(map[string]any)
-	if containers["oauth"] != releaseContainerName("oauth", releaseID) ||
-		containers["gateway"] != releaseContainerName("gateway", "20260701T010203.000000000Z-docker-apps") {
-		t.Fatalf("expected effective partial containers, got %s", s.releases[0].ManifestJSON)
-	}
-	routes, _ := manifest["routes"].(map[string]any)
-	gatewayRoute, _ := routes["gateway"].(map[string]any)
-	if gatewayRoute["container"] != releaseContainerName("gateway", "20260701T010203.000000000Z-docker-apps") {
-		t.Fatalf("expected partial gateway route to inherit base release, got %s", s.releases[0].ManifestJSON)
+	if containers["oauth"] != releaseContainerName("oauth", releaseID) {
+		t.Fatalf("expected oauth container to point at rollout revision, got %s", s.releases[0].ManifestJSON)
 	}
 }
 
@@ -1099,56 +970,11 @@ func TestServiceUpdatesAIFARArtifactBundleAsSingleMultiServicePartialRelease(t *
 			t.Fatalf("bundle rollout script should contain %q:\n%s", want, remote.bundleScript)
 		}
 	}
-	return
-	for _, want := range []string{
-		`CHANGED_SERVICES='oauth gateway'`,
-		`DESIRED_REPLICAS='oauth=1 gateway=1'`,
-		`DEPLOYMENT_CONCURRENCY=3`,
-		`release_owning_service_dir()`,
-		`[ ! -L "$rfs_service_dir" ]`,
-		`rfs_owner="$(release_owning_service_dir "$rfs_service" "$rfs_real_dir" || true)"`,
-		`run_parallel_services $non_entry_services`,
-		`for service in gateway web-vue3; do`,
-		`replica_container_name()`,
-		`set_service_runtime_port "$rs_service"`,
-		`set_env SERVER_PORT "$srp_port_value" "$ENV_DIR/$srp_service.env"`,
-		`materialize_effective_service_dirs`,
-		`link_inherited_service_files "$mes_service" "$mes_source"`,
-		`csrf_real_dir="$(readlink -f "$csrf_service_dir"`,
-		`changed service directory must be materialized`,
-		`ln -s "$lis_real_dir" "$APP_DIR/$lis_service"`,
-		`write_containers_json`,
-		`patch_compose_service_release "$service"`,
-		`if service_changed web-vue3; then`,
-		`patch_web_nginx_gateway_target`,
-		`gateway_container="$(route_container_for_service gateway)"`,
-		`print "    networks:"; print "      - ingress"`,
-		`docker network connect "$ctn_network" "$ctn_container"`,
-		`connect_service_to_legacy_internal_networks "$service"`,
-		`compose --env-file env/compose.env -f compose.yaml up -d --build --no-deps "$service"`,
-		`start_additional_replicas "$service"`,
-		`docker run -d`,
-		`--label "aifar.replica=$src_replica"`,
-		`configure_ingress_if_needed`,
-		`list_route_containers gateway`,
-		`--filter "label=aifar.release=$lcb_release"`,
-		`ingress_config_needs_route_patch`,
-		`reloading AIFAR ingress $INGRESS_CONTAINER`,
-		`AIFAR ingress reloaded`,
-		`location /api/`,
-		`location /im/ws/`,
-		`proxy_pass http://aifar_gateway;`,
-		`stop_old_changed_services`,
-		`"changedServices": ["oauth", "gateway"]`,
-	} {
-		if !strings.Contains(remote.bundleScript, want) {
-			t.Fatalf("bundle update script should contain %q:\n%s", want, remote.bundleScript)
-		}
-	}
 	if len(s.releases) != 1 {
-		t.Fatalf("expected one multi-service partial release, got %+v", s.releases)
+		t.Fatalf("expected one multi-service rollout release, got %+v", s.releases)
 	}
-	if !strings.Contains(s.releases[0].ManifestJSON, `"changedServices":["oauth","gateway"]`) ||
+	if !strings.Contains(s.releases[0].ManifestJSON, `"kind":"rollout-bundle"`) ||
+		!strings.Contains(s.releases[0].ManifestJSON, `"changedServices":["oauth","gateway"]`) ||
 		!strings.Contains(s.releases[0].ManifestJSON, `"deploymentConcurrency":3`) {
 		t.Fatalf("expected multi-service release manifest, got %+v", s.releases)
 	}
@@ -1162,18 +988,10 @@ func TestServiceUpdatesAIFARArtifactBundleAsSingleMultiServicePartialRelease(t *
 	}
 	releaseID, _ := metadata["releaseId"].(string)
 	containers, _ := manifest["containers"].(map[string]any)
-	if containers["gateway"] != releaseContainerName("gateway", releaseID) ||
-		containers["web-vue3"] != releaseContainerName("web-vue3", "20260701T010203.000000000Z-docker-apps") {
+	if containers["gateway"] != releaseContainerName("gateway", releaseID) {
 		t.Fatalf("expected effective bundle containers, got %s", s.releases[0].ManifestJSON)
 	}
-	routes, _ := manifest["routes"].(map[string]any)
-	gatewayRoute, _ := routes["gateway"].(map[string]any)
-	webRoute, _ := routes["web-vue3"].(map[string]any)
-	if gatewayRoute["container"] != releaseContainerName("gateway", releaseID) ||
-		webRoute["container"] != releaseContainerName("web-vue3", "20260701T010203.000000000Z-docker-apps") {
-		t.Fatalf("expected effective bundle routes, got %s", s.releases[0].ManifestJSON)
-	}
-	lastUpdate, ok := metadata["lastPartialUpdate"].(map[string]any)
+	lastUpdate, ok := metadata["lastRollout"].(map[string]any)
 	if !ok || lastUpdate["service"] != "bundle" || int(lastUpdate["deploymentConcurrency"].(float64)) != 3 {
 		t.Fatalf("expected final metadata to point at bundle update, got %s", s.instances[0].Metadata)
 	}
@@ -1556,7 +1374,6 @@ func TestParseStatusOutputIncludesIngressAndStaleContainers(t *testing.T) {
 	status := parseStatusOutput(strings.Join([]string{
 		"status=running",
 		"installRootExists=true",
-		"currentRelease=/aifar/apps/admin/current",
 		"releaseId=rel-new",
 		"totalContainers=2",
 		"runningContainers=2",
@@ -1580,10 +1397,18 @@ func TestStatusCommandScansK8sLikePodsAndAgentRuntime(t *testing.T) {
 		`[ "$MODEL" = "k8s-like-v1" ]`,
 		`aifar-agent status`,
 		`label=aifar.component=pod`,
-		`serviceProxies=$SERVICE_PROXIES`,
 	} {
 		if !strings.Contains(command, want) {
 			t.Fatalf("status command should inspect k8s-like orchestration with %q:\n%s", want, command)
+		}
+	}
+	for _, forbidden := range []string{
+		`legacy-release-v1`,
+		`serviceProxies=`,
+		`currentRelease=`,
+	} {
+		if strings.Contains(command, forbidden) {
+			t.Fatalf("status command should be agent-only and not include %q:\n%s", forbidden, command)
 		}
 	}
 }

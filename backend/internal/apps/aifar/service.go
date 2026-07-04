@@ -198,10 +198,7 @@ func (s Service) Install(ctx context.Context, req InstallRequest, resources []st
 	releaseTime := time.Now().UTC()
 	releaseID := newReleaseID(bundle.Version, releaseTime)
 	configHash := installConfigHash(options)
-	composeProject := composeProjectName(releaseID)
 	ingressNetwork := options.NetworkName
-	internalNetwork := releaseInternalNetworkName(releaseID)
-	ingressContainer := ingressContainerName()
 	workDir := installerkit.WorkDir(deployDir, AppName, bundle.Version, releaseTime)
 	installRoot := installRootFromDeployDir(deployDir)
 	archiveRemote := workDir + "/" + filepath.Base(archiveLocal)
@@ -222,20 +219,16 @@ func (s Service) Install(ctx context.Context, req InstallRequest, resources []st
 			return err
 		}
 		script, err := renderInstallScript(installScriptData{
-			InstallRoot:      installRoot,
-			WorkDir:          workDir,
-			ArchiveRemote:    archiveRemote,
-			ServiceOrder:     strings.Join(options.SelectedServices, " "),
-			Version:          bundle.Version,
-			ReleaseID:        releaseID,
-			CreatedAt:        releaseTime.Format(time.RFC3339),
-			ConfigHash:       configHash,
-			ReleaseKeepCount: releaseKeepCount,
-			ComposeProject:   composeProject,
-			IngressNetwork:   ingressNetwork,
-			InternalNetwork:  internalNetwork,
-			IngressContainer: ingressContainer,
-			Options:          options,
+			InstallRoot:    installRoot,
+			WorkDir:        workDir,
+			ArchiveRemote:  archiveRemote,
+			ServiceOrder:   strings.Join(options.SelectedServices, " "),
+			Version:        bundle.Version,
+			ReleaseID:      releaseID,
+			CreatedAt:      releaseTime.Format(time.RFC3339),
+			ConfigHash:     configHash,
+			IngressNetwork: ingressNetwork,
+			Options:        options,
 		})
 		if err != nil {
 			return err
@@ -333,13 +326,11 @@ func installMetadata(server store.Server, installRoot, version, releaseID string
 	metadata := map[string]any{
 		"installRoot":           installRoot,
 		"runtimeDir":            runtimeDir,
-		"layout":                releaseLayout,
 		"orchestrationModel":    orchestrationModelK8sLikeV1,
 		"releasePhase":          releasePhaseActive,
 		"currentRevision":       releaseID,
 		"releaseId":             releaseID,
 		"releaseVersion":        version,
-		"releaseRetention":      releaseKeepCount,
 		"releaseCreatedAt":      releaseTime.Format(time.RFC3339),
 		"configHash":            configHash,
 		"appDir":                runtimeDir + "/" + appBundleDir,
@@ -555,7 +546,7 @@ func rolloutOrchestrationMetadata(current map[string]any, installRoot, revision,
 	next["activeServices"] = activeServicesFromEndpointsForServices(desired, activeEndpoints, servicesFromMetadata(next))
 	next["serviceRevisions"] = serviceRevisions
 	next["containers"] = containers
-	next["activeRoutes"] = releaseRoutes(revision, gatewayPort, webPort)
+	next["activeRoutes"] = releaseRoutes(gatewayPort, webPort)
 	next["autoscalePolicy"] = autoscalePolicyFromMetadata(current).metadata()
 	return next
 }
@@ -573,53 +564,6 @@ func serviceRevisionsFromMetadata(metadata map[string]any) map[string]any {
 		}
 	}
 	return out
-}
-
-func partialOrchestrationMetadata(current map[string]any, installRoot, releaseID, ingressNetwork string, gatewayPort, webPort int, changedServices []string) map[string]any {
-	next := releaseOrchestrationMetadata(installRoot, releaseID, ingressNetwork, gatewayPort, webPort, servicesFromMetadata(current))
-	changed := map[string]bool{}
-	for _, service := range changedServices {
-		changed[service] = true
-	}
-	if currentRoutes, ok := current["activeRoutes"].(map[string]any); ok {
-		routes := map[string]any{}
-		for key, value := range currentRoutes {
-			routes[key] = value
-		}
-		if changed["gateway"] {
-			routes["gateway"] = map[string]any{"container": releaseContainerName("gateway", releaseID), "port": gatewayPort}
-		}
-		if changed["web-vue3"] {
-			routes["web-vue3"] = map[string]any{"container": releaseContainerName("web-vue3", releaseID), "port": webPort}
-		}
-		next["activeRoutes"] = routes
-	}
-	if currentContainers, ok := current["containers"].(map[string]any); ok {
-		containers := map[string]any{}
-		for key, value := range currentContainers {
-			containers[key] = value
-		}
-		for _, service := range changedServices {
-			containers[service] = releaseContainerName(service, releaseID)
-		}
-		next["containers"] = containers
-	}
-	next["releasePhase"] = releasePhaseActive
-	desired := desiredReplicasFromMetadata(current)
-	next["desiredReplicas"] = desired
-	activeEndpoints := activeEndpointsFromMetadata(current)
-	for _, service := range changedServices {
-		replicas := desired[service]
-		if replicas < 1 {
-			replicas = 1
-			desired[service] = replicas
-		}
-		activeEndpoints[service] = releaseEndpointsForService(service, releaseID, replicas, gatewayPort, webPort)
-	}
-	next["activeEndpoints"] = activeEndpoints
-	next["activeServices"] = activeServicesFromEndpoints(desired, activeEndpoints)
-	next["autoscalePolicy"] = autoscalePolicyFromMetadata(current).metadata()
-	return next
 }
 
 func mapFromMetadataValue(value any) map[string]any {
@@ -655,21 +599,19 @@ func releaseManifest(version, releaseID string, releaseTime time.Time, configHas
 	desired := desiredReplicasForServices(services)
 	endpoints := releaseActiveEndpointsForServices(releaseID, gatewayPort, webPort, services)
 	manifest := map[string]any{
-		"app":              AppName,
-		"version":          version,
-		"releaseId":        releaseID,
-		"layout":           releaseLayout,
-		"kind":             "full",
-		"status":           "success",
-		"phase":            releasePhaseActive,
-		"configHash":       configHash,
-		"createdAt":        releaseTime.Format(time.RFC3339),
-		"releaseRetention": releaseKeepCount,
-		"services":         services,
-		"desiredReplicas":  desired,
-		"endpoints":        endpoints,
-		"activeServices":   activeServicesFromEndpointsForServices(desired, endpoints, services),
-		"autoscalePolicy":  defaultAutoscalePolicy().metadata(),
+		"app":             AppName,
+		"version":         version,
+		"releaseId":       releaseID,
+		"kind":            "full",
+		"status":          "success",
+		"phase":           releasePhaseActive,
+		"configHash":      configHash,
+		"createdAt":       releaseTime.Format(time.RFC3339),
+		"services":        services,
+		"desiredReplicas": desired,
+		"endpoints":       endpoints,
+		"activeServices":  activeServicesFromEndpointsForServices(desired, endpoints, services),
+		"autoscalePolicy": defaultAutoscalePolicy().metadata(),
 	}
 	for key, value := range releaseManifestFields(releaseID, ingressNetwork, gatewayPort, webPort, services) {
 		manifest[key] = value
@@ -682,14 +624,12 @@ func rolloutReleaseManifest(version, releaseID string, releaseTime time.Time, co
 		"app":              AppName,
 		"version":          version,
 		"releaseId":        releaseID,
-		"layout":           releaseLayout,
 		"kind":             "rollout",
 		"status":           "success",
 		"phase":            releasePhaseActive,
 		"configHash":       configHash,
 		"previousRevision": baseReleaseID,
 		"createdAt":        releaseTime.Format(time.RFC3339),
-		"releaseRetention": releaseKeepCount,
 		"services":         servicesFromMetadata(orchestration),
 		"changedServices":  []string{artifact.ServiceName},
 		"artifacts": map[string]any{
@@ -723,14 +663,12 @@ func rolloutBundleReleaseManifest(version, releaseID string, releaseTime time.Ti
 		"app":                   AppName,
 		"version":               version,
 		"releaseId":             releaseID,
-		"layout":                releaseLayout,
 		"kind":                  "rollout-bundle",
 		"status":                "success",
 		"phase":                 releasePhaseActive,
 		"configHash":            configHash,
 		"previousRevision":      baseReleaseID,
 		"createdAt":             releaseTime.Format(time.RFC3339),
-		"releaseRetention":      releaseKeepCount,
 		"services":              servicesFromMetadata(orchestration),
 		"changedServices":       changed,
 		"deploymentConcurrency": concurrency,
@@ -790,10 +728,7 @@ func (s Service) UpdateArtifact(ctx context.Context, req ArtifactUpdateRequest, 
 	var releaseID string
 	var baseReleaseID string
 	var configHash string
-	var composeProject string
 	var ingressNetwork string
-	var internalNetwork string
-	var ingressContainer string
 	var gatewayPort int
 	var webPort int
 	var workDir string
@@ -819,10 +754,7 @@ func (s Service) UpdateArtifact(ctx context.Context, req ArtifactUpdateRequest, 
 		releaseTime = time.Now().UTC()
 		releaseID = newReleaseID("rollout-"+artifact.ServiceName, releaseTime)
 		configHash = partialUpdateConfigHash(stringFromMetadata(metadata, "configHash", ""), artifact.ServiceName, artifact.FileName, artifact.SHA256)
-		composeProject = composeProjectName(releaseID)
 		ingressNetwork = stringFromMetadata(metadata, "ingressNetwork", stringFromMetadata(metadata, "networkName", defaultNetworkName))
-		internalNetwork = releaseInternalNetworkName(releaseID)
-		ingressContainer = stringFromMetadata(metadata, "ingressContainer", ingressContainerName())
 		gatewayPort = intFromMetadata(metadata, "gatewayPort", defaultGatewayPort)
 		webPort = intFromMetadata(metadata, "webPort", defaultWebPort)
 		deployDir := installerkit.RemoteDeployDir(req.Server.DeployDir)
@@ -864,11 +796,7 @@ func (s Service) UpdateArtifact(ctx context.Context, req ArtifactUpdateRequest, 
 			ReleaseID:        releaseID,
 			CreatedAt:        releaseTime.Format(time.RFC3339),
 			ConfigHash:       configHash,
-			ReleaseKeepCount: releaseKeepCount,
-			ComposeProject:   composeProject,
 			IngressNetwork:   ingressNetwork,
-			InternalNetwork:  internalNetwork,
-			IngressContainer: ingressContainer,
 			DesiredReplicas:  replicaAssignments(map[string]int{artifact.ServiceName: desiredReplicasFromMetadata(metadata)[artifact.ServiceName]}),
 		})
 		if err != nil {
@@ -1254,7 +1182,6 @@ func (s Service) Check(ctx context.Context, req CheckRequest, log Logger, target
 		"installRoot":         status.InstallRoot,
 		"orchestrationModel":  status.OrchestrationModel,
 		"legacy":              status.OrchestrationModel == legacyOrchestrationModel,
-		"currentRelease":      status.CurrentRelease,
 		"releaseId":           status.ReleaseID,
 		"installRootExists":   status.InstallRootExists,
 		"totalContainers":     status.TotalContainers,
@@ -1262,7 +1189,6 @@ func (s Service) Check(ctx context.Context, req CheckRequest, log Logger, target
 		"unhealthyContainers": status.UnhealthyContainers,
 		"staleContainers":     status.StaleContainers,
 		"ingressRunning":      status.IngressRunning,
-		"serviceProxies":      status.ServiceProxies,
 		"containers":          status.Containers,
 	}
 	if scaleStatusOK {
@@ -1294,20 +1220,16 @@ func (s Service) markInstanceStatus(instance store.AppInstance, status string, d
 }
 
 type installScriptData struct {
-	InstallRoot      string
-	WorkDir          string
-	ArchiveRemote    string
-	ServiceOrder     string
-	Version          string
-	ReleaseID        string
-	CreatedAt        string
-	ConfigHash       string
-	ReleaseKeepCount int
-	ComposeProject   string
-	IngressNetwork   string
-	InternalNetwork  string
-	IngressContainer string
-	Options          InstallOptions
+	InstallRoot    string
+	WorkDir        string
+	ArchiveRemote  string
+	ServiceOrder   string
+	Version        string
+	ReleaseID      string
+	CreatedAt      string
+	ConfigHash     string
+	IngressNetwork string
+	Options        InstallOptions
 }
 
 type uninstallScriptData struct {
@@ -1330,11 +1252,7 @@ type updateScriptData struct {
 	ReleaseID        string
 	CreatedAt        string
 	ConfigHash       string
-	ReleaseKeepCount int
-	ComposeProject   string
 	IngressNetwork   string
-	InternalNetwork  string
-	IngressContainer string
 }
 
 type bundleUpdateScriptArtifact struct {
@@ -1346,33 +1264,28 @@ type bundleUpdateScriptArtifact struct {
 }
 
 type bundleUpdateScriptData struct {
-	InstallRoot      string
-	WorkDir          string
-	ServiceOrder     string
-	ChangedServices  string
-	DesiredReplicas  string
-	Artifacts        []bundleUpdateScriptArtifact
-	Version          string
-	ReleaseID        string
-	CreatedAt        string
-	ConfigHash       string
-	ReleaseKeepCount int
-	ComposeProject   string
-	IngressNetwork   string
-	InternalNetwork  string
-	IngressContainer string
-	Concurrency      int
+	InstallRoot     string
+	WorkDir         string
+	ServiceOrder    string
+	ChangedServices string
+	DesiredReplicas string
+	Artifacts       []bundleUpdateScriptArtifact
+	Version         string
+	ReleaseID       string
+	CreatedAt       string
+	ConfigHash      string
+	IngressNetwork  string
+	Concurrency     int
 }
 
 type autoscaleOutScriptData struct {
-	InstallRoot      string
-	ServiceName      string
-	ReleaseID        string
-	ReplicaID        int
-	ContainerName    string
-	IngressNetwork   string
-	IngressContainer string
-	MaxReplicas      int
+	InstallRoot    string
+	ServiceName    string
+	ReleaseID      string
+	ReplicaID      int
+	ContainerName  string
+	IngressNetwork string
+	MaxReplicas    int
 }
 
 func renderInstallScript(data installScriptData) (string, error) {
