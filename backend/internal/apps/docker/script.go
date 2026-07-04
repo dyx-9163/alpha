@@ -20,12 +20,13 @@ var dockerScriptFuncs = selinux.AddTemplateFuncs(template.FuncMap{
 })
 
 type installScriptData struct {
-	Version       string
-	WorkDir       string
-	ArchivePath   string
-	InstallRoot   string
-	BridgeCIDR    string
-	RemoteAPIPort int
+	Version         string
+	WorkDir         string
+	ArchivePath     string
+	InstallRoot     string
+	BridgeCIDR      string
+	RemoteAPIPort   int
+	AgentBinaryPath string
 }
 
 type uninstallScriptData struct {
@@ -35,18 +36,23 @@ type uninstallScriptData struct {
 }
 
 func installScript(version, workDir, archivePath, installRoot string, options ...InstallOptions) (string, error) {
+	return installScriptWithAgent(version, workDir, archivePath, installRoot, "", options...)
+}
+
+func installScriptWithAgent(version, workDir, archivePath, installRoot, agentBinaryPath string, options ...InstallOptions) (string, error) {
 	normalized := InstallOptions{}
 	if len(options) > 0 {
 		normalized = options[0]
 	}
 	normalized = NormalizeInstallOptions(normalized)
 	return installerkit.RenderTemplate("docker", "install.sh", "docker-install", installScriptTemplate, dockerScriptFuncs, installScriptData{
-		Version:       version,
-		WorkDir:       workDir,
-		ArchivePath:   archivePath,
-		InstallRoot:   installRoot,
-		BridgeCIDR:    normalized.BridgeCIDR,
-		RemoteAPIPort: normalized.RemoteAPIPort,
+		Version:         version,
+		WorkDir:         workDir,
+		ArchivePath:     archivePath,
+		InstallRoot:     installRoot,
+		BridgeCIDR:      normalized.BridgeCIDR,
+		RemoteAPIPort:   normalized.RemoteAPIPort,
+		AgentBinaryPath: agentBinaryPath,
 	})
 }
 

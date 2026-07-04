@@ -7,6 +7,8 @@ ARCHIVE={{shq .ArchivePath}}
 INSTALL_ROOT={{shq .InstallRoot}}
 BRIDGE_CIDR={{shq .BridgeCIDR}}
 REMOTE_API_PORT={{.RemoteAPIPort}}
+AGENT_BINARY={{shq .AgentBinaryPath}}
+AGENT_LISTEN_ADDR="127.0.0.1:18081"
 DAEMON_DIR="$INSTALL_ROOT/daemon"
 DAEMON_CONFIG="$DAEMON_DIR/daemon.json"
 DATA_ROOT="$INSTALL_ROOT/data"
@@ -132,6 +134,32 @@ SERVICE
 $SUDO install -m 0644 "$WORK_DIR/containerd.service" /etc/systemd/system/containerd.service
 $SUDO install -m 0644 "$WORK_DIR/docker.service" /etc/systemd/system/docker.service
 
+if [ -n "$AGENT_BINARY" ] && [ -f "$AGENT_BINARY" ]; then
+  echo "installing AIFAR runtime agent"
+  $SUDO mkdir -p /etc/aifar /var/lib/aifar-agent /var/log/aifar-agent
+  $SUDO install -m 0755 "$AGENT_BINARY" /usr/local/bin/aifar-agent
+  cat > "$WORK_DIR/aifar-agent.service" <<SERVICE
+[Unit]
+Description=AIFAR Runtime Agent
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/aifar-agent serve --addr $AGENT_LISTEN_ADDR
+Restart=always
+RestartSec=2
+WorkingDirectory=/var/lib/aifar-agent
+
+[Install]
+WantedBy=multi-user.target
+SERVICE
+  $SUDO install -m 0644 "$WORK_DIR/aifar-agent.service" /etc/systemd/system/aifar-agent.service
+else
+  echo "AIFAR runtime agent binary was not uploaded; skip agent installation"
+fi
+
 echo "enabling and starting services"
 $SUDO systemctl daemon-reload
 if ! $SUDO systemctl enable --now containerd; then
@@ -171,6 +199,16 @@ if ! /usr/local/bin/docker -H "tcp://127.0.0.1:$REMOTE_API_PORT" version >/dev/n
   $SUDO systemctl --no-pager --full status docker || true
   $SUDO journalctl -u docker -n 80 --no-pager || true
   exit 1
+fi
+
+if [ -n "$AGENT_BINARY" ] && [ -f "$AGENT_BINARY" ]; then
+  if ! $SUDO systemctl enable --now aifar-agent; then
+    echo "AIFAR runtime agent service failed to start"
+    $SUDO systemctl --no-pager --full status aifar-agent || true
+    $SUDO journalctl -u aifar-agent -n 80 --no-pager || true
+    exit 1
+  fi
+  /usr/local/bin/aifar-agent health
 fi
 echo "verifying Docker Compose"
 /usr/local/bin/docker compose version || /usr/local/bin/docker-compose version

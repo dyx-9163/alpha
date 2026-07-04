@@ -59,7 +59,20 @@ func (i Installer) InstallWithLanguage(ctx context.Context, server store.Server,
 			return err
 		}
 	}
-	script, err := installScript(bundle.Version, workDir, archiveRemote, installRoot, options)
+	agentRemote := ""
+	if agentLocal := findAgentBinary(); agentLocal != "" {
+		agentRemote = workDir + "/" + filepath.Base(agentLocal)
+		if err := uploadkit.Upload(ctx, i.remote, server, uploadkit.File{
+			LocalPath:      agentLocal,
+			RemotePath:     agentRemote,
+			Mode:           0o755,
+			LogMessage:     i18n.Text(lang, "docker.uploadAgent"),
+			FailureMessage: i18n.Text(lang, "docker.uploadAgentFailed"),
+		}, log); err != nil {
+			return err
+		}
+	}
+	script, err := installScriptWithAgent(bundle.Version, workDir, archiveRemote, installRoot, agentRemote, options)
 	if err != nil {
 		return err
 	}
@@ -84,6 +97,38 @@ func (i Installer) InstallWithLanguage(ctx context.Context, server store.Server,
 	}
 	log.Info(i18n.Text(lang, "docker.installFinished"), bundle.Version)
 	return nil
+}
+
+func findAgentBinary() string {
+	if value := os.Getenv("AIFAR_AGENT_BINARY"); value != "" && fileExists(value) {
+		return value
+	}
+	names := []string{"aifar-agent-linux-amd64", "aifar-agent"}
+	candidates := []string{}
+	if exe, err := os.Executable(); err == nil {
+		dir := filepath.Dir(exe)
+		for _, name := range names {
+			candidates = append(candidates, filepath.Join(dir, name), filepath.Join(dir, "..", "bin", name))
+		}
+	}
+	for _, name := range names {
+		candidates = append(candidates,
+			filepath.Join("deploy", "bin", name),
+			filepath.Join("bin", name),
+			name,
+		)
+	}
+	for _, candidate := range candidates {
+		if fileExists(candidate) {
+			return candidate
+		}
+	}
+	return ""
+}
+
+func fileExists(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && !info.IsDir()
 }
 
 func (i Installer) run(ctx context.Context, server store.Server, command string, log Logger, lang string) (installerkit.CommandResult, error) {

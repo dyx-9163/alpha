@@ -565,6 +565,55 @@ start_ingress() {
     -v "$conf:/etc/nginx/nginx.conf:ro" \
     nginx:stable-alpine >/dev/null
   docker exec "$INGRESS_CONTAINER" nginx -t >/dev/null
+  echo "AIFAR Ingress started: $INGRESS_CONTAINER exposes gateway:$GATEWAY_PORT web:$WEB_VUE3_PORT"
+}
+
+verify_ingress_ports() {
+  running="$(docker inspect -f '{{ "{{" }}.State.Running{{ "}}" }}' "$INGRESS_CONTAINER" 2>/dev/null || echo false)"
+  [ "$running" = "true" ] || fail "AIFAR ingress is not running: $INGRESS_CONTAINER"
+  ports="$(docker port "$INGRESS_CONTAINER" 2>/dev/null || true)"
+  printf "%s\n" "$ports" | grep -q "${GATEWAY_PORT}/tcp" || fail "AIFAR ingress does not publish gateway port $GATEWAY_PORT"
+  printf "%s\n" "$ports" | grep -q "${WEB_VUE3_PORT}/tcp" || fail "AIFAR ingress does not publish web port $WEB_VUE3_PORT"
+  echo "AIFAR Ingress ports verified:"
+  printf "%s\n" "$ports"
+}
+
+write_runtime_spec() {
+  gateway_proxy="$(service_proxy_name gateway)"
+  web_proxy="$(service_proxy_name web-vue3)"
+  spec="$INGRESS_DIR/runtime-spec.json"
+  mkdir -p "$INGRESS_DIR"
+  cat > "$spec" <<JSON
+{
+  "version": "runtime-v1",
+  "instanceId": "admin",
+  "installRoot": "${INSTALL_ROOT}",
+  "network": "${INGRESS_NETWORK}",
+  "ingress": {
+    "container": "${INGRESS_CONTAINER}",
+    "image": "nginx:stable-alpine",
+    "configPath": "${INGRESS_DIR}/nginx.conf",
+    "gatewayService": "${gateway_proxy}",
+    "webService": "${web_proxy}",
+    "gatewayPort": ${GATEWAY_PORT},
+    "webPort": ${WEB_VUE3_PORT}
+  }
+}
+JSON
+  printf "%s" "$spec"
+}
+
+reconcile_ingress() {
+  if command -v aifar-agent >/dev/null 2>&1; then
+    spec="$(write_runtime_spec)"
+    echo "reconciling AIFAR ingress through aifar-agent: $spec"
+    aifar-agent reconcile-ingress --spec "$spec"
+    return
+  fi
+  echo "warning: aifar-agent not found; falling back to embedded nginx ingress creation"
+  write_ingress_config
+  start_ingress
+  verify_ingress_ports
 }
 
 write_model_manifest() {
@@ -647,8 +696,7 @@ for service in $SERVICE_ORDER; do
   reload_service_proxy "$service"
 done
 
-write_ingress_config
-start_ingress
+reconcile_ingress
 open_firewall_ports "$GATEWAY_PORT" "$WEB_VUE3_PORT"
 allow_selinux_ports http_port_t "$GATEWAY_PORT" "$WEB_VUE3_PORT"
 write_model_manifest

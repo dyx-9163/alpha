@@ -458,7 +458,10 @@ func ensureK8sLikeInstance(instance store.AppInstance, copy UpdateCopy) error {
 }
 
 func ensureK8sLikeMetadata(metadata map[string]any, copy UpdateCopy) error {
-	model := strings.TrimSpace(fmt.Sprint(metadata["orchestrationModel"]))
+	model := ""
+	if value, ok := metadata["orchestrationModel"]; ok {
+		model = strings.TrimSpace(fmt.Sprint(value))
+	}
 	if model == orchestrationModelK8sLikeV1 {
 		return nil
 	}
@@ -1068,16 +1071,29 @@ func (s Service) existingAIFARInstanceID(serverID, installRoot string) (string, 
 	if err != nil {
 		return "", err
 	}
+	targetRoot := normalizeInstallRoot(installRoot)
 	for _, candidate := range instances {
 		if candidate.App != AppName || candidate.ServerID != serverID {
 			continue
 		}
 		metadata := metadataFromInstance(candidate)
-		if stringFromMetadata(metadata, "installRoot", installRoot) == installRoot {
+		candidateRoot := normalizeInstallRoot(stringFromMetadata(metadata, "installRoot", ""))
+		if candidateRoot != "" && candidateRoot == targetRoot {
 			return candidate.ID, nil
 		}
 	}
 	return "", nil
+}
+
+func normalizeInstallRoot(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	for len(value) > 1 && strings.HasSuffix(value, "/") {
+		value = strings.TrimSuffix(value, "/")
+	}
+	return value
 }
 
 func (s Service) ensureDockerRuntimeReady(serverID string, copy Copy) error {

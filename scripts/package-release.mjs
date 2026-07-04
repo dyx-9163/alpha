@@ -37,6 +37,7 @@ const targets = [
     arch: 'amd64',
     binary: 'aifar-server-linux-amd64',
     archive: 'tar.gz',
+    extraBinaries: ['aifar-agent-linux-amd64'],
     runtimeFiles: [
       { source: 'scripts/start.sh', target: 'start.sh', executable: true },
       { source: 'scripts/stop.sh', target: 'stop.sh', executable: true }
@@ -63,7 +64,7 @@ function ensureInside(parent, child) {
 
 function removePath(targetPath) {
   ensureInside(rootDir, targetPath)
-  rmSync(targetPath, { force: true, recursive: true })
+  rmSync(targetPath, { force: true, maxRetries: 5, recursive: true, retryDelay: 500 })
 }
 
 function copyEntry(entry, packageDir) {
@@ -134,14 +135,16 @@ function writeVersionFile(packageDir, target) {
 
 function buildPackage(target) {
   const packageName = `${baseName}-${target.platform}-${target.arch}`
-  const packageDir = path.join(deploymentDir, packageName)
+  const finalPackageDir = path.join(deploymentDir, packageName)
+  const stagingRoot = path.join(rootDir, 'deploy', '.stage', `${process.pid}-${Date.now().toString(36)}`)
+  const packageDir = path.join(stagingRoot, packageName)
   const archivePath =
     target.archive === 'tar.gz'
       ? path.join(deploymentDir, `${packageName}.tar.gz`)
       : path.join(deploymentDir, `${packageName}.zip`)
 
   console.log(`[package] staging ${packageName}`)
-  removePath(packageDir)
+  removePath(stagingRoot)
   removePath(archivePath)
   mkdirSync(packageDir, { recursive: true })
 
@@ -156,14 +159,48 @@ function buildPackage(target) {
   copyFileSync(binarySource, binaryTarget)
   if (target.platform === 'linux') chmodBestEffort(binaryTarget, 0o755)
 
+  for (const extraBinary of target.extraBinaries || []) {
+    const extraSource = path.join(buildBinDir, extraBinary)
+    if (!existsSync(extraSource)) {
+      throw new Error(`Missing backend binary: deploy/bin/${extraBinary}. Run pnpm package first.`)
+    }
+    const extraTarget = path.join(packageDir, 'bin', extraBinary)
+    mkdirSync(path.dirname(extraTarget), { recursive: true })
+    copyFileSync(extraSource, extraTarget)
+    if (target.platform === 'linux') chmodBestEffort(extraTarget, 0o755)
+  }
+
   for (const runtimeFile of target.runtimeFiles) {
     copyEntry({ kind: 'file', required: true, ...runtimeFile }, packageDir)
   }
 
   writeVersionFile(packageDir, target)
   writeChecksums(packageDir)
-  createArchive(target, packageName, packageDir, archivePath)
-  console.log(`[package] ready ${path.relative(rootDir, packageDir)}`)
+  const archiveCreated = createArchive(target, packageName, packageDir, archivePath)
+  let finalPackageReady = false
+  if (archiveCreated) {
+    try {
+      removePath(finalPackageDir)
+      cpSync(packageDir, finalPackageDir, { dereference: true, force: true, recursive: true })
+      finalPackageReady = true
+    } catch (error) {
+      warnings.push(
+        `Could not refresh package directory ${path.relative(rootDir, finalPackageDir)}: ${error.message}`
+      )
+    }
+  }
+
+  try {
+    removePath(stagingRoot)
+  } catch (error) {
+    warnings.push(`Could not remove staging directory ${path.relative(rootDir, stagingRoot)}: ${error.message}`)
+  }
+
+  if (finalPackageReady) {
+    console.log(`[package] ready ${path.relative(rootDir, finalPackageDir)}`)
+  } else if (archiveCreated) {
+    console.log(`[package] ready ${path.relative(rootDir, archivePath)}`)
+  }
 }
 
 function psQuote(value) {
@@ -171,17 +208,18 @@ function psQuote(value) {
 }
 
 function createArchive(target, packageName, packageDir, archivePath) {
+  const packageParentDir = path.dirname(packageDir)
   if (target.archive === 'tar.gz') {
-    const result = spawnSync('tar', ['-czf', archivePath, '-C', deploymentDir, packageName], {
+    const result = spawnSync('tar', ['-czf', archivePath, '-C', packageParentDir, packageName], {
       cwd: rootDir,
       stdio: 'inherit'
     })
     if (result.status !== 0) {
-      warnings.push(`Could not create tar archive for ${packageName}; package directory was still generated.`)
-      return
+      warnings.push(`Could not create tar archive for ${packageName}; release archive was skipped.`)
+      return false
     }
     console.log(`[package] archive ${path.relative(rootDir, archivePath)}`)
-    return
+    return true
   }
 
   if (process.platform === 'win32') {
@@ -194,22 +232,23 @@ function createArchive(target, packageName, packageDir, archivePath) {
       stdio: 'inherit'
     })
     if (result.status !== 0) {
-      warnings.push(`Could not create zip archive for ${packageName}; package directory was still generated.`)
-      return
+      warnings.push(`Could not create zip archive for ${packageName}; release archive was skipped.`)
+      return false
     }
     console.log(`[package] archive ${path.relative(rootDir, archivePath)}`)
-    return
+    return true
   }
 
   const result = spawnSync('zip', ['-qr', archivePath, packageName], {
-    cwd: deploymentDir,
+    cwd: packageParentDir,
     stdio: 'inherit'
   })
   if (result.status !== 0) {
-    warnings.push(`Could not create zip archive for ${packageName}; install zip or archive the package directory manually.`)
-    return
+    warnings.push(`Could not create zip archive for ${packageName}; release archive was skipped.`)
+    return false
   }
   console.log(`[package] archive ${path.relative(rootDir, archivePath)}`)
+  return true
 }
 
 function ensureRequiredBuildOutputs() {

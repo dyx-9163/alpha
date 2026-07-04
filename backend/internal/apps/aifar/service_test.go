@@ -130,6 +130,44 @@ func (f *fakeStore) DeleteOldAppReleases(instanceID string, keep int) (int, erro
 	return deleted, nil
 }
 
+func TestEnsureK8sLikeMetadataTreatsMissingModelAsLegacy(t *testing.T) {
+	err := ensureK8sLikeMetadata(map[string]any{}, UpdateCopy{
+		LegacyUpdateUnsupported: "legacy model %s",
+	})
+	if err == nil || !strings.Contains(err.Error(), legacyOrchestrationModel) {
+		t.Fatalf("expected missing orchestration model to be reported as legacy, got %v", err)
+	}
+	if strings.Contains(err.Error(), "<nil>") {
+		t.Fatalf("missing orchestration model should not leak <nil>: %v", err)
+	}
+}
+
+func TestExistingAIFARInstanceIDRequiresExplicitInstallRoot(t *testing.T) {
+	svc := Service{store: &fakeStore{instances: []store.AppInstance{
+		{ID: "legacy", App: AppName, ServerID: "srv-1", Metadata: `{}`},
+		{ID: "other-root", App: AppName, ServerID: "srv-1", Metadata: `{"installRoot":"/aifar/apps/other"}`},
+		{ID: "same-root", App: AppName, ServerID: "srv-1", Metadata: `{"installRoot":"/aifar/apps/admin/"}`},
+	}}}
+	id, err := svc.existingAIFARInstanceID("srv-1", "/aifar/apps/admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id != "same-root" {
+		t.Fatalf("expected explicit installRoot match, got %q", id)
+	}
+
+	svc = Service{store: &fakeStore{instances: []store.AppInstance{
+		{ID: "legacy", App: AppName, ServerID: "srv-1", Metadata: `{}`},
+	}}}
+	id, err = svc.existingAIFARInstanceID("srv-1", "/aifar/apps/admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id != "" {
+		t.Fatalf("legacy instance without installRoot must not be reused, got %q", id)
+	}
+}
+
 type fakeRemote struct {
 	mu                      sync.Mutex
 	commands                []string
@@ -557,9 +595,17 @@ func TestServiceInstallsAIFARServiceFromDockerAppsBundle(t *testing.T) {
 		`SPRING_CLOUD_NACOS_DISCOVERY_REGISTER_ENABLED "false"`,
 		`start_pod "$service" 1`,
 		`write_service_proxy_config "$service"`,
+		`reconcile_ingress`,
+		`aifar-agent reconcile-ingress --spec "$spec"`,
+		`runtime-spec.json`,
+		`start_ingress`,
+		`verify_ingress_ports`,
+		`AIFAR Ingress started`,
 		`upstream aifar_gateway_service`,
 		`proxy_pass http://aifar_gateway_service;`,
 		`proxy_pass http://aifar_web_service;`,
+		`-p "${GATEWAY_PORT}:${GATEWAY_PORT}"`,
+		`-p "${WEB_VUE3_PORT}:${WEB_VUE3_PORT}"`,
 	} {
 		if !strings.Contains(remote.installScript, want) {
 			t.Fatalf("AIFAR install script should include k8s-like orchestration with %q:\n%s", want, remote.installScript)

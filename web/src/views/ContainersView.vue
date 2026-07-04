@@ -101,7 +101,7 @@
                   <el-tooltip :content="containerRemoveDisabledReason(row)" :disabled="!containerRemoveDisabledReason(row)" placement="top">
                     <span><el-button size="small" type="danger" plain :disabled="Boolean(containerRemoveDisabledReason(row))" @click="runContainerBatchAction('remove', [row])">{{ t('containers.uninstall') }}</el-button></span>
                   </el-tooltip>
-                  <el-tooltip v-if="isAifarManagedContainer(row)" :content="aifarUpdateDisabledReason(row)" :disabled="!aifarUpdateDisabledReason(row)" placement="top">
+                  <el-tooltip v-if="isAifarUpdatableContainer(row)" :content="aifarUpdateDisabledReason(row)" :disabled="!aifarUpdateDisabledReason(row)" placement="top">
                     <span><el-button size="small" type="primary" plain :disabled="Boolean(aifarUpdateDisabledReason(row))" @click="openAifarUpdate(row)">{{ t('containers.updateService') }}</el-button></span>
                   </el-tooltip>
                   <el-button size="small" @click="openLogs(row.id)">{{ t('containers.logs') }}</el-button>
@@ -633,16 +633,42 @@ function aifarServiceFromContainer(row: any) {
     return labelService
   }
   const name = containerDisplayName(row).toLowerCase()
+  const k8sMatch = aifarServiceOptions.find((item) =>
+    name.startsWith(`aifar-pod-admin-${item.value}-`) || name === `aifar-svc-admin-${item.value}`
+  )
+  if (k8sMatch) {
+    return k8sMatch.value
+  }
   const match = aifarServiceOptions.find((item) => name.startsWith(`aifar-${item.value}-`))
   return match?.value || ''
 }
 
-function isAifarManagedContainer(row: any) {
+function aifarComponentFromContainer(row: any) {
   const labels = containerLabels(row)
-  if (String(labels['aifar.app'] || '').trim() === 'aifar' && aifarServiceFromContainer(row)) {
+  const component = String(labels['aifar.component'] || '').trim()
+  if (component) {
+    return component
+  }
+  const name = containerDisplayName(row).toLowerCase()
+  if (name.startsWith('aifar-pod-admin-')) {
+    return 'pod'
+  }
+  if (name.startsWith('aifar-svc-admin-')) {
+    return 'service-proxy'
+  }
+  if (name === 'aifar-admin-ingress') {
+    return 'ingress'
+  }
+  return ''
+}
+
+function isAifarUpdatableContainer(row: any) {
+  const labels = containerLabels(row)
+  if (String(labels['aifar.app'] || '').trim() === 'aifar' && aifarComponentFromContainer(row) === 'pod' && aifarServiceFromContainer(row)) {
     return true
   }
-  return Boolean(aifarServiceFromContainer(row) && containerDisplayName(row).toLowerCase().startsWith('aifar-'))
+  const name = containerDisplayName(row).toLowerCase()
+  return Boolean(aifarComponentFromContainer(row) === 'pod' && aifarServiceFromContainer(row) && name.startsWith('aifar-pod-admin-'))
 }
 
 function metadataOf(instance: AppInstance): Record<string, any> {
@@ -662,15 +688,29 @@ function aifarInstanceForContainer(row: any) {
     return null
   }
   const labels = containerLabels(row)
-  const installRoot = String(labels['aifar.install-root'] || '').trim()
+  const installRoot = normalizeInstallRoot(String(labels['aifar.install-root'] || ''))
   const candidates = appInstances.value.filter((item) => item.app === 'aifar' && item.serverId === selectedServerId.value)
   if (installRoot) {
-    const matched = candidates.find((item) => String(metadataOf(item).installRoot || '').trim() === installRoot)
+    const exact = candidates.filter((item) => normalizeInstallRoot(String(metadataOf(item).installRoot || '')) === installRoot)
+    const matched = exact.find((item) => String(metadataOf(item).orchestrationModel || '').trim() === 'k8s-like-v1') ?? exact[0]
     if (matched) {
       return matched
     }
+    return null
   }
-  return candidates[0] ?? null
+  const k8sCandidates = candidates.filter((item) => String(metadataOf(item).orchestrationModel || '').trim() === 'k8s-like-v1')
+  if (k8sCandidates.length === 1) {
+    return k8sCandidates[0]
+  }
+  return candidates.length === 1 ? candidates[0] : null
+}
+
+function normalizeInstallRoot(value: string) {
+  let text = String(value || '').trim()
+  while (text.length > 1 && text.endsWith('/')) {
+    text = text.slice(0, -1)
+  }
+  return text
 }
 
 function aifarUpdateDisabledReason(row: any) {

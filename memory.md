@@ -617,3 +617,19 @@
 - 结论：根因是前端 nginx upstream 替换脚本存在二次替换风险，动态 gateway 容器名以 `aifar-gateway` 开头，第二个 sed 表达式会再次匹配并生成畸形 `proxy_pass`；已改为占位符三段替换，安装、单服务更新和批量更新均兼容静态 `aifar-gateway` 与旧动态 gateway upstream。
 - 问题：用户要求将 AIFAR 滚动更新重构为模拟 Kubernetes 的 Deployment/ReplicaSet/Pod/Service/Ingress 模型，不再依赖 global current/partial release/ingress reload 切流。
 - 结论：AIFAR 新安装改为 k8s-like-v1：每服务稳定 nginx service proxy，业务 Pod 禁用 Nacos 自注册，Java 服务由 service proxy 注册 Nacos，固定 ingress 只指 gateway/web-vue3 proxy；单服务/批量包更新改为 Deployment rollout，只更新服务 endpoints，批量非入口服务按并发发布，gateway/web-vue3 靠后；新增 AIFAR deployments/replicasets/pods/endpoints store 表和 CRUD，legacy 实例拒绝更新但保留检测/卸载。
+- 问题：用户询问新版 k8s-like AIFAR 滚动更新如何操作，并截图显示旧编排模型 `<nil>` 不支持滚动更新。
+- 结论：新版更新入口仍在容器页的 Pod 行“更新服务”，但必须是新安装写入 `orchestrationModel=k8s-like-v1` 的实例；`<nil>` 表示控制面 `app_instances.metadata` 缺少该字段，需要用新版面板重新安装 AIFAR 或后续做受控迁移/修复，不能只凭容器名判断为新模型。
+- 问题：用户确认已重新部署，追问为什么部署后有 20 个实例且更新仍提示旧编排模型 `<nil>`。
+- 结论：k8s-like 模型每个业务服务会创建 1 个 Pod 和 1 个 Service Proxy，10 个服务约 20 个容器，另有固定 ingress，属于设计结果；代码缺陷是容器页找不到精确 installRoot 时会退回同服务器第一个 AIFAR 实例，且安装复用旧实例 ID 时把缺失 installRoot 的 legacy 记录当作匹配。已改为只允许 Pod 行更新、按 installRoot 精确匹配 k8s-like 实例，旧记录缺失模型不再显示 `<nil>`。
+- 问题：用户询问新版 AIFAR 是否能做多实例。
+- 结论：若指单个服务多副本，k8s-like 模型已具备基础能力：service proxy upstream 可挂多个 Pod，autoscale 可按内存阈值自动 scale-out，滚动更新会保留 desiredReplicas；若指同一服务器部署多套完整 AIFAR 实例，当前固定 `aifar-svc-admin-*`、`aifar-admin-ingress` 和外部端口，仍需实例名/端口/网络命名隔离后才能支持。
+- 问题：用户发现新版部署后容器列表里似乎没有把端口映射到宿主机，都是内部端口。
+- 结论：k8s-like 模型设计上只有固定 ingress 容器暴露宿主机端口，业务 Pod 和 service proxy 都只使用 Docker 内部端口；安装脚本 `start_ingress` 当前会对 `aifar-admin-ingress` 执行 `-p ${GATEWAY_PORT}:${GATEWAY_PORT}` 和 `-p ${WEB_VUE3_PORT}:${WEB_VUE3_PORT}`，若该容器也无 `0.0.0.0` 映射，需检查是否运行最新脚本或 ingress 启动失败。
+- 问题：用户指出实际部署没有直接创建 ingress。
+- 结论：安装模板已补强 ingress postflight：`start_ingress` 创建 `aifar-admin-ingress` 后输出明确日志，并新增 `verify_ingress_ports` 校验容器 running 且 `docker port` 包含 gateway/web 宿主机映射；缺失映射时安装直接失败，避免只创建 Pod/Service Proxy 却被误判成功。
+- 问题：用户询问为什么不把 service/ingress 做成 Docker 依赖工具或操作系统服务，而是在 AIFAR 代码里生成 nginx 编排。
+- 结论：短期用 nginx 容器是为了离线、隔离、易回滚和少改宿主机；长期企业级更合理的是抽出 `aifar-agent/aifar-proxy` 作为每台服务器的稳定依赖，由 agent/systemd 或常驻容器监听 Docker labels、维护 endpoints、生成/热加载代理配置，AIFAR 后端只提交期望状态。
+- 问题：用户要求提供 AIFAR Runtime Agent 化的计划。
+- 结论：计划应分三阶段：先新增每台服务器常驻 `aifar-agent` 并暴露 reconcile/status API；再把 AIFAR service proxy/ingress 从安装脚本迁入 agent 管理；最后支持多实例命名空间、手动/自动多副本、状态展示和 legacy 兼容。短期保留 nginx/Envoy 作为 data plane，但由 agent 管理而非后端脚本拼装。
+- 问题：用户要求按推荐逻辑顺序执行 AIFAR Runtime Agent 化。
+- 结论：已新增 `aifar-agent` CLI/HTTP runtime，支持 `health`、`reconcile-ingress --spec` 和本地 HTTP reconcile；Docker 安装会在发现 agent 二进制时上传并安装 systemd `aifar-agent`；AIFAR 安装会写入 runtime spec 并优先交给 agent 创建/校验 ingress，agent 不存在时回退旧 nginx 容器逻辑；Linux 打包包含 `bin/aifar-agent-linux-amd64`，release staging 改为临时目录生成归档以规避旧 Windows 目录锁。
