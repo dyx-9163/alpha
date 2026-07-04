@@ -433,6 +433,8 @@ func TestAutoscaleOutScriptUsesReplicaContainerAndEscapedDockerFormats(t *testin
 		`--label "aifar.replica=$REPLICA_ID"`,
 		`--format '{{.Names}}'`,
 		`docker run -d`,
+		`health_path="/actuator/health"`,
+		`APP_STARTUP_TIMEOUT 300`,
 	} {
 		if !strings.Contains(script, want) {
 			t.Fatalf("autoscale script missing %q:\n%s", want, script)
@@ -598,6 +600,12 @@ func TestServiceInstallsAIFARServiceFromDockerAppsBundle(t *testing.T) {
 		`reconcile_ingress`,
 		`aifar-agent reconcile-ingress --spec "$spec"`,
 		`runtime-spec.json`,
+		`container_status()`,
+		`docker inspect --format '{{.State.Status}}'`,
+		`docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{end}}'`,
+		`docker logs --tail 120 "$container"`,
+		`path="/actuator/health"`,
+		`health="$(container_health "$name")"`,
 		`start_ingress`,
 		`verify_ingress_ports`,
 		`AIFAR Ingress started`,
@@ -610,6 +618,9 @@ func TestServiceInstallsAIFARServiceFromDockerAppsBundle(t *testing.T) {
 		if !strings.Contains(remote.installScript, want) {
 			t.Fatalf("AIFAR install script should include k8s-like orchestration with %q:\n%s", want, remote.installScript)
 		}
+	}
+	if strings.Contains(remote.installScript, `/"Status"/ {print $4; exit}`) {
+		t.Fatalf("AIFAR install script should not parse Docker health from the first JSON Status field:\n%s", remote.installScript)
 	}
 	return
 	if !strings.Contains(remote.joinedUploads(), "aifar-service-bundle-") || !strings.Contains(remote.joinedCommands(), "install-aifar.sh") {
@@ -865,6 +876,8 @@ func TestServiceUpdatesAIFARServiceArtifactAsPartialRelease(t *testing.T) {
 		`write_service_proxy_config "$SERVICE_NAME" "$REVISION"`,
 		`reload_service_proxy`,
 		`stop_old_pods`,
+		`health_path="/actuator/health"`,
+		`APP_STARTUP_TIMEOUT 300`,
 		`"kind": "rollout"`,
 	} {
 		if !strings.Contains(remote.updateScript, want) {
@@ -1015,6 +1028,8 @@ func TestServiceUpdatesAIFARArtifactBundleAsSingleMultiServicePartialRelease(t *
 		`write_service_proxy_config "$service"`,
 		`reload_service_proxy "$service"`,
 		`stop_old_pods "$service"`,
+		`health_path="/actuator/health"`,
+		`APP_STARTUP_TIMEOUT 300`,
 		`"kind": "rollout-bundle"`,
 	} {
 		if !strings.Contains(remote.bundleScript, want) {

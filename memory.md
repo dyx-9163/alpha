@@ -633,3 +633,5 @@
 - 结论：计划应分三阶段：先新增每台服务器常驻 `aifar-agent` 并暴露 reconcile/status API；再把 AIFAR service proxy/ingress 从安装脚本迁入 agent 管理；最后支持多实例命名空间、手动/自动多副本、状态展示和 legacy 兼容。短期保留 nginx/Envoy 作为 data plane，但由 agent 管理而非后端脚本拼装。
 - 问题：用户要求按推荐逻辑顺序执行 AIFAR Runtime Agent 化。
 - 结论：已新增 `aifar-agent` CLI/HTTP runtime，支持 `health`、`reconcile-ingress --spec` 和本地 HTTP reconcile；Docker 安装会在发现 agent 二进制时上传并安装 systemd `aifar-agent`；AIFAR 安装会写入 runtime spec 并优先交给 agent 创建/校验 ingress，agent 不存在时回退旧 nginx 容器逻辑；Linux 打包包含 `bin/aifar-agent-linux-amd64`，release staging 改为临时目录生成归档以规避旧 Windows 目录锁。
+- 问题：用户贴出新版安装日志，`oauth` Pod 启动后最终报 `AIFAR Pod did not become ready`。
+- 结论：根因是初装脚本用 `docker inspect` JSON + awk 读取第一个 `"Status"`，会把容器运行态 `running` 误当成 health 状态，导致 healthy Pod 也可能一直等到超时；已改为 Docker format 明确读取 `.State.Status` 和 `.State.Health.Status`，超时输出容器日志，并将 Java Pod 默认 readiness path 改为 `/actuator/health`、web 仍为 `/`，启动等待默认 300 秒。

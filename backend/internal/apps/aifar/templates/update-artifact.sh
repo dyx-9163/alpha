@@ -179,8 +179,8 @@ container_health() {
 
 wait_pod_ready() {
   container="$1"
-  timeout="$(read_env_value "$ENV_DIR/compose.env" APP_STARTUP_TIMEOUT 180)"
-  case "$timeout" in ""|*[!0-9]*) timeout=180 ;; esac
+  timeout="$(read_env_value "$ENV_DIR/compose.env" APP_STARTUP_TIMEOUT 300)"
+  case "$timeout" in ""|*[!0-9]*) timeout=300 ;; esac
   deadline=$(( $(date +%s) + timeout ))
   while [ "$(date +%s)" -lt "$deadline" ]; do
     status="$(container_status "$container")"
@@ -208,6 +208,9 @@ start_pod() {
   health_protocol="$(read_env_value "$compose_env" APP_HEALTH_PROTOCOL http)"
   health_host="$(read_env_value "$compose_env" APP_HEALTH_HOST 127.0.0.1)"
   health_path="$(read_env_value "$compose_env" APP_HEALTH_PATH "")"
+  if [ -z "$health_path" ] && [ "$SERVICE_NAME" != "web-vue3" ]; then
+    health_path="/actuator/health"
+  fi
   health_connect_timeout="$(read_env_value "$compose_env" APP_HEALTH_CONNECT_TIMEOUT 3)"
   health_interval="$(read_env_value "$compose_env" APP_HEALTH_INTERVAL 15s)"
   health_timeout="$(read_env_value "$compose_env" APP_HEALTH_TIMEOUT 5s)"

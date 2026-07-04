@@ -224,7 +224,7 @@ write_compose_env() {
   set_env APP_HEALTH_TIMEOUT "$(read_env_value "$source_env" APP_HEALTH_TIMEOUT 5s)" "$compose_env"
   set_env APP_HEALTH_RETRIES "$(read_env_value "$source_env" APP_HEALTH_RETRIES 3)" "$compose_env"
   set_env APP_HEALTH_START_PERIOD "$(read_env_value "$source_env" APP_HEALTH_START_PERIOD 30s)" "$compose_env"
-  set_env APP_STARTUP_TIMEOUT "$(read_env_value "$source_env" APP_STARTUP_TIMEOUT 180)" "$compose_env"
+  set_env APP_STARTUP_TIMEOUT "$(read_env_value "$source_env" APP_STARTUP_TIMEOUT 300)" "$compose_env"
   set_env APP_STABLE_WINDOW "$(read_env_value "$source_env" APP_STABLE_WINDOW 10)" "$compose_env"
   set_env GATEWAY_PORT "$GATEWAY_PORT" "$compose_env"
   set_env WEB_VUE3_PORT "$WEB_VUE3_PORT" "$compose_env"
@@ -375,11 +375,22 @@ health_cmd_for_service() {
   host="$(read_env_value "$ENV_DIR/compose.env" APP_HEALTH_HOST 127.0.0.1)"
   path="$(read_env_value "$ENV_DIR/compose.env" APP_HEALTH_PATH "")"
   timeout="$(read_env_value "$ENV_DIR/compose.env" APP_HEALTH_CONNECT_TIMEOUT 3)"
+  if [ -z "$path" ] && [ "$service" != "web-vue3" ]; then
+    path="/actuator/health"
+  fi
   if [ "$service" = "web-vue3" ]; then
     printf "wget -q -T %s -O /dev/null %s://%s:%s%s || exit 1" "$timeout" "$protocol" "$host" "$port" "$path"
   else
     printf "curl -fsS --connect-timeout %s %s://%s:%s%s >/dev/null || exit 1" "$timeout" "$protocol" "$host" "$port" "$path"
   fi
+}
+
+container_status() {
+  docker inspect --format '{{ "{{" }}.State.Status{{ "}}" }}' "$1" 2>/dev/null || true
+}
+
+container_health() {
+  docker inspect --format '{{ "{{" }}if .State.Health{{ "}}" }}{{ "{{" }}.State.Health.Status{{ "}}" }}{{ "{{" }}end{{ "}}" }}' "$1" 2>/dev/null || true
 }
 
 start_pod() {
@@ -430,21 +441,20 @@ start_pod() {
 
 wait_pod_ready() {
   container="$1"
-  timeout="$(read_env_value "$ENV_DIR/compose.env" APP_STARTUP_TIMEOUT 180)"
+  timeout="$(read_env_value "$ENV_DIR/compose.env" APP_STARTUP_TIMEOUT 300)"
+  case "$timeout" in ""|*[!0-9]*) timeout=300 ;; esac
   deadline=$(( $(date +%s) + timeout ))
   while [ "$(date +%s)" -lt "$deadline" ]; do
-    running="$(docker inspect "$container" 2>/dev/null | awk -F: '/"Running"/ {gsub(/[ ,]/,"",$2); print $2; exit}' || true)"
-    health="$(docker inspect "$container" 2>/dev/null | awk -F\" '/"Status"/ {print $4; exit}' || true)"
-    if [ "$running" != "true" ]; then
-      echo "$container is not running yet"
-    elif [ "$health" = "healthy" ] || [ -z "$health" ]; then
-      echo "$container is ready"
+    status="$(container_status "$container")"
+    health="$(container_health "$container")"
+    if [ "$status" = "running" ] && { [ "$health" = "healthy" ] || [ -z "$health" ]; }; then
+      echo "AIFAR Pod ready: $container"
       return 0
-    else
-      echo "$container health is $health"
     fi
+    echo "$container status=${status:-missing} health=${health:-none}"
     sleep 5
   done
+  docker logs --tail 120 "$container" >&2 || true
   return 1
 }
 
@@ -470,7 +480,7 @@ NGINX
   names="$(docker ps --filter "label=aifar.app=aifar" --filter "label=aifar.install-root=$INSTALL_ROOT" --filter "label=aifar.component=pod" --filter "label=aifar.service=$service" --filter "label=aifar.revision=$REVISION" --format '{{ "{{" }}.Names{{ "}}" }}' 2>/dev/null || true)"
   [ -n "$names" ] || fail "service $service has no ready pods"
   for name in $names; do
-    health="$(docker inspect "$name" 2>/dev/null | awk -F\" '/"Status"/ {print $4; exit}' || true)"
+    health="$(container_health "$name")"
     [ -z "$health" ] || [ "$health" = "healthy" ] || continue
     printf "    server %s:%s;\n" "$name" "$port" >> "$tmp"
   done
