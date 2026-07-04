@@ -653,3 +653,7 @@
 - 结论：根因是 service proxy 配置生成后用 `mv "$tmp" "$conf"` 替换单文件 bind mount 的宿主机文件，Docker 容器仍绑定旧 inode，所以容器内继续看到初始空配置；已改为已有配置文件原地覆盖，避免新装/更新/扩容后 service proxy 继续返回 503。
 - 问题：用户明确要求红框中的 `aifar-admin-ingress` 和 `aifar-svc-admin-*` 不应作为 Docker 容器运行，应作为 Docker 依赖注册到 Linux systemd。
 - 结论：已把方向改正为 systemd `aifar-agent` 数据面：agent 常驻宿主机并监听 gateway/web/Java 服务端口，按 Docker labels 动态发现 healthy Pod 并反向代理；AIFAR 安装不再创建 nginx ingress/service-proxy 容器，更新/批量/扩容改为 reconcile agent runtime spec，Nacos 注册到宿主机 agent 端口，容器 runtime DTO 显示 `aifar-agent:<service>`，检测逻辑要求 `aifar-agent status` 成功。
+- 问题：用户询问 `aifar-agent` 服务的具体作用。
+- 结论：`aifar-agent` 定位为每台目标 Linux 服务器上的 systemd 运行时代理，负责承接 AIFAR 的 Service/Ingress 能力：监听宿主机端口、按 Docker labels 发现 healthy 业务 Pod、维护流量转发、对外提供 status/reconcile/remove API，并让 AIFAR 后端只提交期望状态，不再把 svc/ingress 作为 Docker 容器管理。
+- 问题：用户贴出 `web-vue3` nginx 启动失败：`host not found in upstream "aifar-pod-admin-gateway-..."`，但 gateway Pod 已 healthy。
+- 结论：根因是 web-vue3 nginx 配置残留旧逻辑，启动时依赖 Docker DNS 解析 gateway Pod 名；在 agent 模型下 `/api` 和 websocket 应由宿主机 `aifar-agent` 入口层转发，web 容器只服务静态页面。已从安装脚本移除 gateway Pod 替换逻辑，并在新装、单服务更新、批量更新中剥离 web nginx 的 `/api` 和 `/im/ws` 代理块。

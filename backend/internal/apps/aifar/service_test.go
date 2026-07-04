@@ -608,6 +608,9 @@ func TestServiceInstallsAIFARServiceFromDockerAppsBundle(t *testing.T) {
 		`docker logs --tail 120 "$container"`,
 		`curl -sS --connect-timeout %s -o /dev/null %s://%s:%s/ || exit 1`,
 		`health="$(container_health "$container")"`,
+		`strip_web_nginx_runtime_routes`,
+		`/^[[:space:]]*location[[:space:]]+\/api\/[[:space:]]*\{/`,
+		`/^[[:space:]]*location[[:space:]]+\/im\/ws\/[[:space:]]*\{/`,
 	} {
 		if !strings.Contains(remote.installScript, want) {
 			t.Fatalf("AIFAR install script should include k8s-like orchestration with %q:\n%s", want, remote.installScript)
@@ -615,6 +618,15 @@ func TestServiceInstallsAIFARServiceFromDockerAppsBundle(t *testing.T) {
 	}
 	if strings.Contains(remote.installScript, `/"Status"/ {print $4; exit}`) {
 		t.Fatalf("AIFAR install script should not parse Docker health from the first JSON Status field:\n%s", remote.installScript)
+	}
+	for _, legacy := range []string{
+		`patch_web_nginx_gateway_target`,
+		`aifar-gateway`,
+		`proxy_pass http://aifar_gateway;`,
+	} {
+		if strings.Contains(remote.installScript, legacy) {
+			t.Fatalf("AIFAR install script should not make web-vue3 depend on gateway DNS %q:\n%s", legacy, remote.installScript)
+		}
 	}
 	return
 	if !strings.Contains(remote.joinedUploads(), "aifar-service-bundle-") || !strings.Contains(remote.joinedCommands(), "install-aifar.sh") {
@@ -925,6 +937,7 @@ func TestServiceUpdatesAIFARServiceArtifactAsPartialRelease(t *testing.T) {
 		`reconcile_runtime`,
 		`aifar-agent reconcile-ingress --spec "$spec"`,
 		`stop_old_pods`,
+		`strip_web_nginx_runtime_routes "$service_dir"`,
 		`curl -sS --connect-timeout $health_connect_timeout -o /dev/null ${health_protocol}://${health_host}:${port}/ || exit 1`,
 		`APP_STARTUP_TIMEOUT 300`,
 		`"kind": "rollout"`,
@@ -1077,6 +1090,7 @@ func TestServiceUpdatesAIFARArtifactBundleAsSingleMultiServicePartialRelease(t *
 		`reconcile_runtime`,
 		`aifar-agent reconcile-ingress --spec "$spec"`,
 		`stop_old_pods "$service"`,
+		`strip_web_nginx_runtime_routes "$service_dir"`,
 		`curl -sS --connect-timeout $health_connect_timeout -o /dev/null ${health_protocol}://${health_host}:${port}/ || exit 1`,
 		`APP_STARTUP_TIMEOUT 300`,
 		`"kind": "rollout-bundle"`,

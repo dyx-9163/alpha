@@ -255,13 +255,28 @@ write_java_env() {
   chmod 0600 "$secrets_env"
 }
 
-patch_web_nginx_gateway_target() {
+strip_web_nginx_runtime_routes() {
   nginx_conf="$APP_DIR/web-vue3/nginx/default.conf"
   [ -f "$nginx_conf" ] || return 0
-  gateway_proxy="$(pod_name gateway "$REVISION" 1)"
   tmp="$nginx_conf.tmp"
-  placeholder="__AIFAR_GATEWAY_POD__"
-  sed "s#http://aifar-gateway[-A-Za-z0-9_.]*:[0-9][0-9]*#${placeholder}#g; s#http://aifar-gateway[-A-Za-z0-9_.]*#${placeholder}#g; s#${placeholder}#http://${gateway_proxy}:${GATEWAY_PORT}#g" "$nginx_conf" > "$tmp"
+  awk '
+    /^[[:space:]]*location[[:space:]]+\/api\/[[:space:]]*\{/ || /^[[:space:]]*location[[:space:]]+\/im\/ws\/[[:space:]]*\{/ {
+      skip = 1
+      depth = 0
+    }
+    skip {
+      line = $0
+      opens = gsub(/\{/, "{", line)
+      line = $0
+      closes = gsub(/\}/, "}", line)
+      depth += opens - closes
+      if (depth <= 0) {
+        skip = 0
+      }
+      next
+    }
+    { print }
+  ' "$nginx_conf" > "$tmp"
   mv "$tmp" "$nginx_conf"
 }
 
@@ -530,7 +545,7 @@ resolve_system_timezone
 write_compose_env
 write_java_env
 write_service_envs
-patch_web_nginx_gateway_target
+strip_web_nginx_runtime_routes
 load_docker_images
 require_local_image "bellsoft/liberica-openjre-rocky:21"
 require_local_image "nginx:stable-alpine"

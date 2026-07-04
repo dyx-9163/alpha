@@ -55,6 +55,32 @@ set_env() {
   mv "$tmp" "$file"
 }
 
+strip_web_nginx_runtime_routes() {
+  service_dir="$1"
+  nginx_conf="$service_dir/nginx/default.conf"
+  [ -f "$nginx_conf" ] || return 0
+  tmp="$nginx_conf.tmp"
+  awk '
+    /^[[:space:]]*location[[:space:]]+\/api\/[[:space:]]*\{/ || /^[[:space:]]*location[[:space:]]+\/im\/ws\/[[:space:]]*\{/ {
+      skip = 1
+      depth = 0
+    }
+    skip {
+      line = $0
+      opens = gsub(/\{/, "{", line)
+      line = $0
+      closes = gsub(/\}/, "}", line)
+      depth += opens - closes
+      if (depth <= 0) {
+        skip = 0
+      }
+      next
+    }
+    { print }
+  ' "$nginx_conf" > "$tmp"
+  mv "$tmp" "$nginx_conf"
+}
+
 service_known() {
   for service in $SERVICE_ORDER; do
     [ "$service" = "$SERVICE_NAME" ] && return 0
@@ -133,6 +159,7 @@ apply_artifact() {
         mkdir -p "$service_dir/dist"
         cp -a "$TMP_DIR/web/." "$service_dir/dist/"
       fi
+      strip_web_nginx_runtime_routes "$service_dir"
       ;;
     *)
       mkdir -p "$service_dir"
