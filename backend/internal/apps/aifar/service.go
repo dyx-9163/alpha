@@ -101,6 +101,14 @@ type ScaleOutRequest struct {
 	Reason      string
 }
 
+type RuntimeReconcileRequest struct {
+	Instance store.AppInstance
+	Server   store.Server
+	Language string
+	Actor    string
+	Reason   string
+}
+
 type CheckResult struct {
 	Status  string
 	Message string

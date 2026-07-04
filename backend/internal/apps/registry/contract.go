@@ -168,6 +168,23 @@ type ArtifactBundleUpdateRequest struct {
 	BundleFileName  string
 }
 
+type ServiceScaleOutRequest struct {
+	Instance    store.AppInstance
+	Server      store.Server
+	Language    string
+	Actor       string
+	ServiceName string
+	Reason      string
+}
+
+type RuntimeReconcileRequest struct {
+	Instance store.AppInstance
+	Server   store.Server
+	Language string
+	Actor    string
+	Reason   string
+}
+
 type ClusterStartRequest struct {
 	Instances       []store.AppInstance
 	Servers         []store.Server
@@ -232,6 +249,14 @@ type ArtifactBundleUpdateModule interface {
 	PlanArtifactBundleUpdate(ctx context.Context, req ArtifactBundleUpdateRequest) ([]InstallStepPlan, error)
 	ValidateArtifactBundleUpdate(ctx context.Context, req ArtifactBundleUpdateRequest) error
 	UpdateArtifactBundle(ctx context.Context, req ArtifactBundleUpdateRequest, run RunContext) error
+}
+
+type ServiceScaleOutModule interface {
+	ScaleOutService(ctx context.Context, req ServiceScaleOutRequest, run RunContext) error
+}
+
+type RuntimeReconcileModule interface {
+	ReconcileRuntime(ctx context.Context, req RuntimeReconcileRequest, run RunContext) error
 }
 
 type ClusterStartModule interface {

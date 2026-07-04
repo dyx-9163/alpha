@@ -59,6 +59,16 @@ type DockerVolume struct {
 	Size       string `json:"size"`
 }
 
+type DockerContainerStat struct {
+	ID            string  `json:"id,omitempty"`
+	Name          string  `json:"name,omitempty"`
+	CPUPerc       float64 `json:"cpuPercent"`
+	MemPerc       float64 `json:"memoryPercent"`
+	MemUsage      string  `json:"memoryUsage,omitempty"`
+	RawCPUPerc    string  `json:"rawCpuPercent,omitempty"`
+	RawMemPercent string  `json:"rawMemoryPercent,omitempty"`
+}
+
 type DockerDiskUsage struct {
 	Type        string `json:"type"`
 	Total       string `json:"total"`
@@ -418,6 +428,63 @@ func DockerContainerLogsForServer(ctx context.Context, server store.Server, id s
 	return lines, nil
 }
 
+func DockerContainerStats(ctx context.Context, host string, ids []string) ([]DockerContainerStat, error) {
+	ids = normalizeDockerArgs(ids)
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	args := append([]string{"stats", "--no-stream", "--format", "{{json .}}"}, ids...)
+	out, err := dockerCommand(ctx, host, args...).Output()
+	if err != nil {
+		return nil, err
+	}
+	return parseDockerContainerStats(out)
+}
+
+func DockerContainerStatsForServer(ctx context.Context, server store.Server, ids []string) ([]DockerContainerStat, error) {
+	ids = normalizeDockerArgs(ids)
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	if dockerAPIHost(server.DockerHost) {
+		return DockerContainerStats(ctx, server.DockerHost, ids)
+	}
+	args := append([]string{"stats", "--no-stream", "--format", "{{json .}}"}, ids...)
+	out, err := dockerSSHOutput(ctx, server, args...)
+	if err != nil {
+		return nil, err
+	}
+	return parseDockerContainerStats(out)
+}
+
+func parseDockerContainerStats(out []byte) ([]DockerContainerStat, error) {
+	var rows []struct {
+		Container string `json:"Container"`
+		ID        string `json:"ID"`
+		Name      string `json:"Name"`
+		CPUPerc   string `json:"CPUPerc"`
+		MemPerc   string `json:"MemPerc"`
+		MemUsage  string `json:"MemUsage"`
+	}
+	if err := parseDockerJSONLines(out, &rows); err != nil {
+		return nil, err
+	}
+	items := make([]DockerContainerStat, 0, len(rows))
+	for _, row := range rows {
+		id := firstNonEmptyString(row.ID, row.Container)
+		items = append(items, DockerContainerStat{
+			ID:            id,
+			Name:          row.Name,
+			CPUPerc:       parsePercent(row.CPUPerc),
+			MemPerc:       parsePercent(row.MemPerc),
+			MemUsage:      row.MemUsage,
+			RawCPUPerc:    row.CPUPerc,
+			RawMemPercent: row.MemPerc,
+		})
+	}
+	return items, nil
+}
+
 func DockerContainerAction(ctx context.Context, host, id, action string) error {
 	command, ok := dockerContainerCommand(action)
 	if !ok {
@@ -496,6 +563,39 @@ func dockerShellQuote(value string) string {
 		return "''"
 	}
 	return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
+}
+
+func normalizeDockerArgs(values []string) []string {
+	out := make([]string, 0, len(values))
+	seen := map[string]bool{}
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		out = append(out, value)
+	}
+	return out
+}
+
+func parsePercent(value string) float64 {
+	value = strings.TrimSpace(strings.TrimSuffix(value, "%"))
+	if value == "" {
+		return 0
+	}
+	n, _ := strconv.ParseFloat(value, 64)
+	return n
+}
+
+func firstNonEmptyString(values ...string) string {
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func dockerEndpoint(host string) string {

@@ -637,3 +637,7 @@
 - 结论：根因是初装脚本用 `docker inspect` JSON + awk 读取第一个 `"Status"`，会把容器运行态 `running` 误当成 health 状态，导致 healthy Pod 也可能一直等到超时；已改为 Docker format 明确读取 `.State.Status` 和 `.State.Health.Status`，超时输出容器日志，并将 Java Pod 默认 readiness path 改为 `/actuator/health`、web 仍为 `/`，启动等待默认 300 秒。
 - 问题：用户要求 AIFAR 安装弹窗支持选择安装哪些模块。
 - 结论：AIFAR 安装新增 `selectedServices` 多选字段，默认全选；`gateway` 和 `web-vue3` 作为固定入口必选，其余 Java 服务可选。后端会规范化所选服务并补齐入口模块，安装脚本只构建/启动所选服务，实例 metadata、release manifest、desiredReplicas、endpoints 和 service proxies 也只记录所选模块。
+- 问题：用户追问为什么当前仍使用 Docker/nginx 容器作为 svc 和 ingress，而不是做成依赖 Docker 的插件/宿主机服务。
+- 结论：当前实现只是 Runtime Agent 化的过渡阶段：已新增 `aifar-agent` 并优先由 agent reconcile ingress，但 service proxy 和 ingress 数据面仍是 nginx 容器；若按目标形态，应继续把 svc/ingress 全部迁入宿主机 `aifar-agent/aifar-proxy` 管理，业务侧只保留 Pod 容器。
+- 问题：用户要求按“只针对容器模块”的最终方案实现 AIFAR Runtime 视图与操作台。
+- 结论：容器页新增 AIFAR 运行时 Tab，按服务展示副本、Pod、Endpoint、Ingress 和 agent 状态；默认隐藏 `aifar.component=service-proxy/ingress` 基础设施容器，仅排障开关可见且不可普通操作；新增 `/containers/aifar/runtime`、runtime reconcile、service scale-out 任务入口，agent 不可用时降级展示并拒绝变更；AIFAR 模块通过 registry 可选接口承载扩容和入口重建。

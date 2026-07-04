@@ -25,6 +25,12 @@ func main() {
 			os.Exit(1)
 		}
 		fmt.Println(`{"status":"ok"}`)
+	case "status":
+		if err := health(context.Background()); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		writeAgentStatus(os.Stdout)
 	case "reconcile-ingress":
 		cmd := flag.NewFlagSet("reconcile-ingress", flag.ExitOnError)
 		specPath := cmd.String("spec", "", "path to runtime spec json")
@@ -56,7 +62,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: aifar-agent health | reconcile-ingress --spec <file> | serve [--addr 127.0.0.1:18081]")
+	fmt.Fprintln(os.Stderr, "usage: aifar-agent health | status | reconcile-ingress --spec <file> | serve [--addr 127.0.0.1:18081]")
 }
 
 func readSpec(path string) (runtimeagent.RuntimeSpec, error) {
@@ -91,6 +97,17 @@ func serve(addr string) error {
 		}
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
+	mux.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if err := health(r.Context()); err != nil {
+			http.Error(w, err.Error(), http.StatusServiceUnavailable)
+			return
+		}
+		writeJSON(w, http.StatusOK, agentStatus())
+	})
 	mux.HandleFunc("/runtime/reconcile", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -117,4 +134,20 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(value)
+}
+
+func agentStatus() map[string]any {
+	return map[string]any{
+		"status":  "running",
+		"version": runtimeagent.DefaultAgentVersion,
+		"features": []string{
+			"health",
+			"reconcile-ingress",
+			"status",
+		},
+	}
+}
+
+func writeAgentStatus(out *os.File) {
+	_ = json.NewEncoder(out).Encode(agentStatus())
 }

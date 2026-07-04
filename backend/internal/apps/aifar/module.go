@@ -304,6 +304,31 @@ func (m Module) UpdateArtifactBundle(ctx context.Context, req registry.ArtifactB
 	})
 }
 
+func (m Module) ScaleOutService(ctx context.Context, req registry.ServiceScaleOutRequest, run registry.RunContext) error {
+	return m.service.ScaleOut(ctx, ScaleOutRequest{
+		Instance:    req.Instance,
+		Server:      req.Server,
+		Language:    req.Language,
+		Actor:       req.Actor,
+		ServiceName: req.ServiceName,
+		Reason:      req.Reason,
+	}, run.Log, func(target string) Logger {
+		return run.LoggerForTarget(target)
+	})
+}
+
+func (m Module) ReconcileRuntime(ctx context.Context, req registry.RuntimeReconcileRequest, run registry.RunContext) error {
+	return m.service.ReconcileRuntime(ctx, RuntimeReconcileRequest{
+		Instance: req.Instance,
+		Server:   req.Server,
+		Language: req.Language,
+		Actor:    req.Actor,
+		Reason:   req.Reason,
+	}, run.Log, func(target string) Logger {
+		return run.LoggerForTarget(target)
+	})
+}
+
 func firstTarget(req registry.InstallRequest) string {
 	targets := req.TargetServerIDs()
 	if len(targets) == 0 {
