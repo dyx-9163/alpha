@@ -217,7 +217,7 @@ func (s Service) Install(ctx context.Context, req InstallRequest, resources []st
 			InstallRoot:      installRoot,
 			WorkDir:          workDir,
 			ArchiveRemote:    archiveRemote,
-			ServiceOrder:     serviceOrderText(),
+			ServiceOrder:     strings.Join(options.SelectedServices, " "),
 			Version:          bundle.Version,
 			ReleaseID:        releaseID,
 			CreatedAt:        releaseTime.Format(time.RFC3339),
@@ -288,7 +288,7 @@ func (s Service) Install(ctx context.Context, req InstallRequest, resources []st
 			return err
 		}
 		if releases, ok := s.store.(releaseStore); ok {
-			manifest, _ := json.Marshal(releaseManifest(bundle.Version, releaseID, releaseTime, configHash, ingressNetwork, options.GatewayPort, options.WebPort))
+			manifest, _ := json.Marshal(releaseManifest(bundle.Version, releaseID, releaseTime, configHash, ingressNetwork, options.GatewayPort, options.WebPort, options.SelectedServices))
 			if _, err := releases.SaveAppRelease(store.AppRelease{
 				InstanceID:   instance.ID,
 				App:          AppName,
@@ -349,14 +349,14 @@ func installMetadata(server store.Server, installRoot, version, releaseID string
 		"nacosPort":             options.NacosWebPort,
 		"nacosWebPort":          options.NacosWebPort,
 		"nacosApiPort":          options.NacosAPIPort,
-		"services":              serviceOrder,
+		"services":              options.SelectedServices,
 		"rolloutDefaults": map[string]any{
 			"maxSurge":       1,
 			"maxUnavailable": 0,
 			"drainSeconds":   30,
 		},
 	}
-	for key, value := range releaseOrchestrationMetadata(installRoot, releaseID, options.NetworkName, options.GatewayPort, options.WebPort) {
+	for key, value := range releaseOrchestrationMetadata(installRoot, releaseID, options.NetworkName, options.GatewayPort, options.WebPort, options.SelectedServices) {
 		metadata[key] = value
 	}
 	return metadata
@@ -364,7 +364,7 @@ func installMetadata(server store.Server, installRoot, version, releaseID string
 
 func (s Service) saveInitialControlPlane(instanceID, revision, version, configHash string, options InstallOptions, now time.Time) error {
 	if orch, ok := s.store.(aifarOrchestrationStore); ok {
-		return saveControlPlaneRevision(orch, instanceID, version, revision, configHash, defaultDesiredReplicas(), options.GatewayPort, options.WebPort, serviceOrder, now)
+		return saveControlPlaneRevision(orch, instanceID, version, revision, configHash, desiredReplicasForServices(options.SelectedServices), options.GatewayPort, options.WebPort, options.SelectedServices, now)
 	}
 	return nil
 }
@@ -518,7 +518,7 @@ func endpointRevision(item map[string]any) string {
 
 func rolloutOrchestrationMetadata(current map[string]any, installRoot, revision, ingressNetwork string, gatewayPort, webPort int, changedServices []string) map[string]any {
 	next := copyMetadata(current)
-	for key, value := range releaseOrchestrationMetadata(installRoot, revision, ingressNetwork, gatewayPort, webPort) {
+	for key, value := range releaseOrchestrationMetadata(installRoot, revision, ingressNetwork, gatewayPort, webPort, servicesFromMetadata(current)) {
 		if _, exists := next[key]; !exists {
 			next[key] = value
 		}
@@ -544,7 +544,7 @@ func rolloutOrchestrationMetadata(current map[string]any, installRoot, revision,
 	}
 	next["desiredReplicas"] = desired
 	next["activeEndpoints"] = activeEndpoints
-	next["activeServices"] = activeServicesFromEndpoints(desired, activeEndpoints)
+	next["activeServices"] = activeServicesFromEndpointsForServices(desired, activeEndpoints, servicesFromMetadata(next))
 	next["serviceRevisions"] = serviceRevisions
 	next["containers"] = containers
 	next["activeRoutes"] = releaseRoutes(revision, gatewayPort, webPort)
@@ -568,7 +568,7 @@ func serviceRevisionsFromMetadata(metadata map[string]any) map[string]any {
 }
 
 func partialOrchestrationMetadata(current map[string]any, installRoot, releaseID, ingressNetwork string, gatewayPort, webPort int, changedServices []string) map[string]any {
-	next := releaseOrchestrationMetadata(installRoot, releaseID, ingressNetwork, gatewayPort, webPort)
+	next := releaseOrchestrationMetadata(installRoot, releaseID, ingressNetwork, gatewayPort, webPort, servicesFromMetadata(current))
 	changed := map[string]bool{}
 	for _, service := range changedServices {
 		changed[service] = true
@@ -642,9 +642,10 @@ func applyEffectiveReleaseFields(manifest map[string]any, orchestration map[stri
 	}
 }
 
-func releaseManifest(version, releaseID string, releaseTime time.Time, configHash, ingressNetwork string, gatewayPort, webPort int) map[string]any {
-	desired := defaultDesiredReplicas()
-	endpoints := releaseActiveEndpoints(releaseID, gatewayPort, webPort)
+func releaseManifest(version, releaseID string, releaseTime time.Time, configHash, ingressNetwork string, gatewayPort, webPort int, services []string) map[string]any {
+	services = serviceListOrDefault(services)
+	desired := desiredReplicasForServices(services)
+	endpoints := releaseActiveEndpointsForServices(releaseID, gatewayPort, webPort, services)
 	manifest := map[string]any{
 		"app":              AppName,
 		"version":          version,
@@ -656,13 +657,13 @@ func releaseManifest(version, releaseID string, releaseTime time.Time, configHas
 		"configHash":       configHash,
 		"createdAt":        releaseTime.Format(time.RFC3339),
 		"releaseRetention": releaseKeepCount,
-		"services":         serviceOrder,
+		"services":         services,
 		"desiredReplicas":  desired,
 		"endpoints":        endpoints,
-		"activeServices":   activeServicesFromEndpoints(desired, endpoints),
+		"activeServices":   activeServicesFromEndpointsForServices(desired, endpoints, services),
 		"autoscalePolicy":  defaultAutoscalePolicy().metadata(),
 	}
-	for key, value := range releaseManifestFields(releaseID, ingressNetwork, gatewayPort, webPort) {
+	for key, value := range releaseManifestFields(releaseID, ingressNetwork, gatewayPort, webPort, services) {
 		manifest[key] = value
 	}
 	return manifest
@@ -681,7 +682,7 @@ func rolloutReleaseManifest(version, releaseID string, releaseTime time.Time, co
 		"previousRevision": baseReleaseID,
 		"createdAt":        releaseTime.Format(time.RFC3339),
 		"releaseRetention": releaseKeepCount,
-		"services":         serviceOrder,
+		"services":         servicesFromMetadata(orchestration),
 		"changedServices":  []string{artifact.ServiceName},
 		"artifacts": map[string]any{
 			artifact.ServiceName: map[string]any{
@@ -691,7 +692,7 @@ func rolloutReleaseManifest(version, releaseID string, releaseTime time.Time, co
 			},
 		},
 	}
-	for key, value := range releaseManifestFields(releaseID, ingressNetwork, gatewayPort, webPort) {
+	for key, value := range releaseManifestFields(releaseID, ingressNetwork, gatewayPort, webPort, servicesFromMetadata(orchestration)) {
 		manifest[key] = value
 	}
 	applyEffectiveReleaseFields(manifest, orchestration)
@@ -722,12 +723,12 @@ func rolloutBundleReleaseManifest(version, releaseID string, releaseTime time.Ti
 		"previousRevision":      baseReleaseID,
 		"createdAt":             releaseTime.Format(time.RFC3339),
 		"releaseRetention":      releaseKeepCount,
-		"services":              serviceOrder,
+		"services":              servicesFromMetadata(orchestration),
 		"changedServices":       changed,
 		"deploymentConcurrency": concurrency,
 		"artifacts":             artifactMap,
 	}
-	for key, value := range releaseManifestFields(releaseID, ingressNetwork, gatewayPort, webPort) {
+	for key, value := range releaseManifestFields(releaseID, ingressNetwork, gatewayPort, webPort, servicesFromMetadata(orchestration)) {
 		manifest[key] = value
 	}
 	applyEffectiveReleaseFields(manifest, orchestration)

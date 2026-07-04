@@ -272,7 +272,7 @@ func installedAIFARInstance(t *testing.T) store.AppInstance {
 		"webPort":               defaultWebPort,
 		"nacosRegistrationMode": "service-proxy",
 	}
-	for key, value := range releaseOrchestrationMetadata("/aifar/apps/admin", releaseID, defaultNetworkName, defaultGatewayPort, defaultWebPort) {
+	for key, value := range releaseOrchestrationMetadata("/aifar/apps/admin", releaseID, defaultNetworkName, defaultGatewayPort, defaultWebPort, serviceOrder) {
 		metadata[key] = value
 	}
 	return store.AppInstance{
@@ -743,6 +743,61 @@ func TestServiceInstallsAIFARServiceFromDockerAppsBundle(t *testing.T) {
 		if !strings.Contains(remote.installScript, want) {
 			t.Fatalf("AIFAR install script should include release-based layout with %q:\n%s", want, remote.installScript)
 		}
+	}
+}
+
+func TestServiceInstallsSelectedAIFARModules(t *testing.T) {
+	root := createAIFARBundle(t)
+	s := &fakeStore{servers: map[string]store.Server{
+		"srv-1": {ID: "srv-1", Name: "app-1", Host: "10.0.0.10", DeployDir: "/aifar/apps"},
+	}}
+	remote := &fakeRemote{}
+	service := NewService(s, remote)
+	err := service.Install(context.Background(), InstallRequest{
+		Version:  "latest",
+		ServerID: "srv-1",
+		Language: "en",
+		Parameters: map[string]any{
+			"nacosHost":        "10.0.0.50",
+			"selectedServices": []string{"oauth", "gateway", "web-vue3"},
+		},
+	}, []store.Resource{{App: "aifar", Part: "backend", Version: "docker-apps", Path: filepath.Join(root, "docker-apps", ".env")}}, fakeLogger{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(remote.installScript, `SERVICE_ORDER='oauth gateway web-vue3'`) {
+		t.Fatalf("install script should only iterate selected services, got:\n%s", remote.installScript)
+	}
+	if strings.Contains(remote.installScript, `SERVICE_ORDER='oauth permission system file message im contacts meeting gateway web-vue3'`) {
+		t.Fatalf("install script should not use all services when selectedServices is provided:\n%s", remote.installScript)
+	}
+	if len(s.instances) != 1 {
+		t.Fatalf("expected one AIFAR instance, got %+v", s.instances)
+	}
+	metadata := map[string]any{}
+	if err := json.Unmarshal([]byte(s.instances[0].Metadata), &metadata); err != nil {
+		t.Fatal(err)
+	}
+	if got := stringSliceFromAny(metadata["services"]); strings.Join(got, " ") != "oauth gateway web-vue3" {
+		t.Fatalf("expected selected services in metadata, got %#v from %s", got, s.instances[0].Metadata)
+	}
+	containers := mapFromMetadataValue(metadata["containers"])
+	if _, ok := containers["permission"]; ok {
+		t.Fatalf("metadata should not include unselected permission container: %s", s.instances[0].Metadata)
+	}
+	if len(s.releases) != 1 {
+		t.Fatalf("expected one recorded release, got %+v", s.releases)
+	}
+	manifest := map[string]any{}
+	if err := json.Unmarshal([]byte(s.releases[0].ManifestJSON), &manifest); err != nil {
+		t.Fatal(err)
+	}
+	if got := stringSliceFromAny(manifest["services"]); strings.Join(got, " ") != "oauth gateway web-vue3" {
+		t.Fatalf("expected selected services in manifest, got %#v from %s", got, s.releases[0].ManifestJSON)
+	}
+	releaseContainers := mapFromMetadataValue(manifest["containers"])
+	if _, ok := releaseContainers["permission"]; ok {
+		t.Fatalf("manifest should not include unselected permission container: %s", s.releases[0].ManifestJSON)
 	}
 }
 
@@ -1427,6 +1482,22 @@ func mustMetadata(t *testing.T, value map[string]any) string {
 		t.Fatal(err)
 	}
 	return string(data)
+}
+
+func stringSliceFromAny(value any) []string {
+	switch items := value.(type) {
+	case []string:
+		return append([]string(nil), items...)
+	case []any:
+		out := make([]string, 0, len(items))
+		for _, item := range items {
+			if text, ok := item.(string); ok {
+				out = append(out, strings.TrimSpace(text))
+			}
+		}
+		return out
+	}
+	return nil
 }
 
 func aifarModuleValidationResources(root string) []store.Resource {

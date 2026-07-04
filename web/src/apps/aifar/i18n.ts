@@ -34,6 +34,19 @@ export const aifarMessages = {
     networkName: 'Docker 网络',
     appCPUs: 'CPU 限制',
     appMemoryLimit: '内存限制',
+    selectedServices: '安装模块',
+    selectedServicesPlaceholder: '选择需要安装的 AIFAR 模块',
+    selectedServicesRequired: '至少需要 gateway 和 web-vue3',
+    serviceOauth: '认证 oauth',
+    servicePermission: '权限 permission',
+    serviceSystem: '系统 system',
+    serviceFile: '文件 file',
+    serviceMessage: '消息 message',
+    serviceIm: '即时通讯 im',
+    serviceContacts: '通讯录 contacts',
+    serviceMeeting: '会议 meeting',
+    serviceGateway: '入口 gateway（必选）',
+    serviceWeb: '前端 web-vue3（必选）',
     nacosSource: 'Nacos 来源',
     nacosSourceExisting: '选择已部署 Nacos',
     nacosSourceManual: '手动填写 Nacos',
@@ -73,6 +86,19 @@ export const aifarMessages = {
     networkName: 'Docker network',
     appCPUs: 'CPU limit',
     appMemoryLimit: 'Memory limit',
+    selectedServices: 'Install modules',
+    selectedServicesPlaceholder: 'Select AIFAR modules to install',
+    selectedServicesRequired: 'At least gateway and web-vue3 are required',
+    serviceOauth: 'Auth oauth',
+    servicePermission: 'Permission',
+    serviceSystem: 'System',
+    serviceFile: 'File',
+    serviceMessage: 'Message',
+    serviceIm: 'IM',
+    serviceContacts: 'Contacts',
+    serviceMeeting: 'Meeting',
+    serviceGateway: 'Gateway (required)',
+    serviceWeb: 'Web Vue3 (required)',
     nacosSource: 'Nacos source',
     nacosSourceExisting: 'Use deployed Nacos',
     nacosSourceManual: 'Enter Nacos manually',
@@ -132,6 +158,7 @@ export function aifarInstallDialogProps(locale?: string, context?: AppInstallDia
       networkField(copy),
       requiredText('appCPUs', copy.appCPUs, '2.0', copy),
       requiredText('appMemoryLimit', copy.appMemoryLimit, '2GB', copy),
+      selectedServicesField(copy),
       selectField('nacosSource', copy.nacosSource, [
         { label: copy.nacosSourceExisting, value: 'existing', disabled: nacosOptions.length === 0 },
         { label: copy.nacosSourceManual, value: 'manual' }
@@ -190,6 +217,47 @@ function networkField(copy: ReturnType<typeof aifarCopy>): AppInstallField {
   }
 }
 
+const defaultAifarServices = [
+  'oauth',
+  'permission',
+  'system',
+  'file',
+  'message',
+  'im',
+  'contacts',
+  'meeting',
+  'gateway',
+  'web-vue3'
+]
+
+function selectedServicesField(copy: ReturnType<typeof aifarCopy>): AppInstallField {
+  return {
+    name: 'selectedServices',
+    label: copy.selectedServices,
+    type: 'select',
+    multiple: true,
+    required: true,
+    defaultValue: defaultAifarServices,
+    placeholder: copy.selectedServicesPlaceholder,
+    options: [
+      { label: copy.serviceOauth, value: 'oauth' },
+      { label: copy.servicePermission, value: 'permission' },
+      { label: copy.serviceSystem, value: 'system' },
+      { label: copy.serviceFile, value: 'file' },
+      { label: copy.serviceMessage, value: 'message' },
+      { label: copy.serviceIm, value: 'im' },
+      { label: copy.serviceContacts, value: 'contacts' },
+      { label: copy.serviceMeeting, value: 'meeting' },
+      { label: copy.serviceGateway, value: 'gateway', disabled: true },
+      { label: copy.serviceWeb, value: 'web-vue3', disabled: true }
+    ],
+    validate: (value: unknown) => {
+      const selected = new Set(stringArray(value))
+      return selected.has('gateway') && selected.has('web-vue3') ? undefined : copy.selectedServicesRequired
+    }
+  }
+}
+
 function portField(name: string, label: string, defaultValue: number, copy: ReturnType<typeof aifarCopy>, min = 1, max = 65535) {
   return {
     name,
@@ -234,6 +302,14 @@ function sourceIs(name: string, value: string | number | boolean) {
 
 function sourceIsNot(name: string, value: string | number | boolean) {
   return (values: AppInstallFieldValues) => values[name] !== value
+}
+
+function stringArray(value: unknown) {
+  if (Array.isArray(value)) {
+    return value.map((item) => String(item ?? '').trim()).filter(Boolean)
+  }
+  const text = String(value ?? '').trim()
+  return text ? [text] : []
 }
 
 function credentialOptions(context: AppInstallDialogContext | undefined, kind: string, manualLabel: string): AppInstallFieldOption[] {

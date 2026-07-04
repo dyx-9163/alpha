@@ -65,20 +65,21 @@ var reverseServiceOrder = []string{
 }
 
 type InstallOptions struct {
-	Timezone        string
-	NetworkName     string
-	AppCPUs         string
-	AppMemoryLimit  string
-	GatewayPort     int
-	WebPort         int
-	NacosWebPort    int
-	NacosAPIPort    int
-	NacosSource     string
-	NacosInstanceID string
-	NacosHost       string
-	NacosUser       string
-	NacosPassword   string
-	NacosNamespace  string
+	Timezone         string
+	NetworkName      string
+	AppCPUs          string
+	AppMemoryLimit   string
+	GatewayPort      int
+	WebPort          int
+	NacosWebPort     int
+	NacosAPIPort     int
+	NacosSource      string
+	NacosInstanceID  string
+	NacosHost        string
+	NacosUser        string
+	NacosPassword    string
+	NacosNamespace   string
+	SelectedServices []string
 }
 
 type Bundle struct {
@@ -90,18 +91,19 @@ type Bundle struct {
 
 func optionsFromParameters(parameters map[string]any) InstallOptions {
 	opts := InstallOptions{
-		Timezone:       defaultTimezone,
-		NetworkName:    defaultNetworkName,
-		AppCPUs:        defaultAppCPUs,
-		AppMemoryLimit: defaultMemoryLimit,
-		GatewayPort:    defaultGatewayPort,
-		WebPort:        defaultWebPort,
-		NacosWebPort:   defaultNacosWebPort,
-		NacosAPIPort:   defaultNacosAPIPort,
-		NacosSource:    dependencyManual,
-		NacosUser:      defaultNacosUser,
-		NacosPassword:  defaultNacosPassword,
-		NacosNamespace: defaultNacosNS,
+		Timezone:         defaultTimezone,
+		NetworkName:      defaultNetworkName,
+		AppCPUs:          defaultAppCPUs,
+		AppMemoryLimit:   defaultMemoryLimit,
+		GatewayPort:      defaultGatewayPort,
+		WebPort:          defaultWebPort,
+		NacosWebPort:     defaultNacosWebPort,
+		NacosAPIPort:     defaultNacosAPIPort,
+		NacosSource:      dependencyManual,
+		NacosUser:        defaultNacosUser,
+		NacosPassword:    defaultNacosPassword,
+		NacosNamespace:   defaultNacosNS,
+		SelectedServices: defaultInstallServices(),
 	}
 	opts.Timezone = stringParam(parameters, "timezone", opts.Timezone)
 	opts.NetworkName = stringParam(parameters, "networkName", opts.NetworkName)
@@ -118,6 +120,7 @@ func optionsFromParameters(parameters map[string]any) InstallOptions {
 	opts.NacosUser = stringParam(parameters, "nacosUser", opts.NacosUser)
 	opts.NacosPassword = stringParam(parameters, "nacosPassword", opts.NacosPassword)
 	opts.NacosNamespace = stringParam(parameters, "nacosNamespace", opts.NacosNamespace)
+	opts.SelectedServices = normalizeSelectedServices(sliceParam(parameters, "selectedServices", opts.SelectedServices))
 	return opts
 }
 
@@ -149,6 +152,32 @@ func (o InstallOptions) Validate() error {
 		}
 	}
 	return nil
+}
+
+func defaultInstallServices() []string {
+	return append([]string(nil), serviceOrder...)
+}
+
+func normalizeSelectedServices(values []string) []string {
+	selected := make(map[string]bool, len(values)+2)
+	for _, value := range values {
+		service := cleanAIFARServiceName(value)
+		if aifarServiceSupported(service) {
+			selected[service] = true
+		}
+	}
+	selected["gateway"] = true
+	selected["web-vue3"] = true
+	out := make([]string, 0, len(serviceOrder))
+	for _, service := range serviceOrder {
+		if selected[service] {
+			out = append(out, service)
+		}
+	}
+	if len(out) == 0 {
+		return defaultInstallServices()
+	}
+	return out
 }
 
 func normalizeDependencySource(value string) string {
@@ -351,6 +380,43 @@ func intParam(parameters map[string]any, name string, fallback int) int {
 		}
 	}
 	return fallback
+}
+
+func sliceParam(parameters map[string]any, name string, fallback []string) []string {
+	value, ok := parameters[name]
+	if !ok || value == nil {
+		return append([]string(nil), fallback...)
+	}
+	switch v := value.(type) {
+	case []string:
+		return append([]string(nil), v...)
+	case []any:
+		out := make([]string, 0, len(v))
+		for _, item := range v {
+			text := strings.TrimSpace(fmt.Sprint(item))
+			if text != "" {
+				out = append(out, text)
+			}
+		}
+		if len(out) > 0 {
+			return out
+		}
+	case string:
+		parts := strings.FieldsFunc(v, func(r rune) bool {
+			return r == ',' || r == ';' || r == ' ' || r == '\n' || r == '\t'
+		})
+		out := make([]string, 0, len(parts))
+		for _, part := range parts {
+			text := strings.TrimSpace(part)
+			if text != "" {
+				out = append(out, text)
+			}
+		}
+		if len(out) > 0 {
+			return out
+		}
+	}
+	return append([]string(nil), fallback...)
 }
 
 func validPort(port int) bool {

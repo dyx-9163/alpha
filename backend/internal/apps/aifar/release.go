@@ -159,16 +159,26 @@ func sanitizeContainerName(value string) string {
 }
 
 func releaseContainers(releaseID string) map[string]string {
-	out := make(map[string]string, len(serviceOrder))
-	for _, service := range serviceOrder {
+	return releaseContainersForServices(releaseID, serviceOrder)
+}
+
+func releaseContainersForServices(releaseID string, services []string) map[string]string {
+	services = serviceListOrDefault(services)
+	out := make(map[string]string, len(services))
+	for _, service := range services {
 		out[service] = podContainerName(service, releaseID, 1)
 	}
 	return out
 }
 
 func defaultDesiredReplicas() map[string]int {
-	out := make(map[string]int, len(serviceOrder))
-	for _, service := range serviceOrder {
+	return desiredReplicasForServices(serviceOrder)
+}
+
+func desiredReplicasForServices(services []string) map[string]int {
+	services = serviceListOrDefault(services)
+	out := make(map[string]int, len(services))
+	for _, service := range services {
 		out[service] = 1
 	}
 	return out
@@ -226,16 +236,26 @@ func releaseEndpointsForService(service, releaseID string, replicas, gatewayPort
 }
 
 func releaseActiveEndpoints(releaseID string, gatewayPort, webPort int) map[string]any {
-	out := make(map[string]any, len(serviceOrder))
-	for _, service := range serviceOrder {
+	return releaseActiveEndpointsForServices(releaseID, gatewayPort, webPort, serviceOrder)
+}
+
+func releaseActiveEndpointsForServices(releaseID string, gatewayPort, webPort int, services []string) map[string]any {
+	services = serviceListOrDefault(services)
+	out := make(map[string]any, len(services))
+	for _, service := range services {
 		out[service] = releaseEndpointsForService(service, releaseID, 1, gatewayPort, webPort)
 	}
 	return out
 }
 
 func activeServicesFromEndpoints(desired map[string]int, endpoints map[string]any) map[string]any {
-	out := make(map[string]any, len(serviceOrder))
-	for _, service := range serviceOrder {
+	return activeServicesFromEndpointsForServices(desired, endpoints, serviceOrder)
+}
+
+func activeServicesFromEndpointsForServices(desired map[string]int, endpoints map[string]any, services []string) map[string]any {
+	services = serviceListOrDefault(services)
+	out := make(map[string]any, len(services))
+	for _, service := range services {
 		out[service] = map[string]any{
 			"desiredReplicas": desired[service],
 			"activeEndpoints": endpoints[service],
@@ -324,11 +344,12 @@ func releaseRoutes(releaseID string, gatewayPort, webPort int) map[string]any {
 	}
 }
 
-func releaseOrchestrationMetadata(installRoot, releaseID, ingressNetwork string, gatewayPort, webPort int) map[string]any {
-	desired := defaultDesiredReplicas()
-	activeEndpoints := releaseActiveEndpoints(releaseID, gatewayPort, webPort)
+func releaseOrchestrationMetadata(installRoot, releaseID, ingressNetwork string, gatewayPort, webPort int, services []string) map[string]any {
+	services = serviceListOrDefault(services)
+	desired := desiredReplicasForServices(services)
+	activeEndpoints := releaseActiveEndpointsForServices(releaseID, gatewayPort, webPort, services)
 	serviceProxies := map[string]any{}
-	for _, service := range serviceOrder {
+	for _, service := range services {
 		serviceProxies[service] = map[string]any{
 			"container": serviceProxyName(service),
 			"port":      serviceDefaultPort(service, gatewayPort, webPort),
@@ -343,29 +364,72 @@ func releaseOrchestrationMetadata(installRoot, releaseID, ingressNetwork string,
 		"ingressConfigPath":  ingressConfigPath(installRoot),
 		"serviceProxies":     serviceProxies,
 		"activeRoutes":       releaseRoutes(releaseID, gatewayPort, webPort),
-		"containers":         releaseContainers(releaseID),
+		"containers":         releaseContainersForServices(releaseID, services),
 		"desiredReplicas":    desired,
 		"activeEndpoints":    activeEndpoints,
-		"activeServices":     activeServicesFromEndpoints(desired, activeEndpoints),
+		"activeServices":     activeServicesFromEndpointsForServices(desired, activeEndpoints, services),
 		"autoscalePolicy":    defaultAutoscalePolicy().metadata(),
 		"releasePhase":       releasePhaseActive,
 	}
 }
 
-func releaseManifestFields(releaseID, ingressNetwork string, gatewayPort, webPort int) map[string]any {
-	desired := defaultDesiredReplicas()
-	endpoints := releaseActiveEndpoints(releaseID, gatewayPort, webPort)
+func releaseManifestFields(releaseID, ingressNetwork string, gatewayPort, webPort int, services []string) map[string]any {
+	services = serviceListOrDefault(services)
+	desired := desiredReplicasForServices(services)
+	endpoints := releaseActiveEndpointsForServices(releaseID, gatewayPort, webPort, services)
 	return map[string]any{
 		"orchestrationModel": orchestrationModelK8sLikeV1,
 		"composeProject":     composeProjectName(releaseID),
 		"ingressNetwork":     ingressNetwork,
 		"internalNetwork":    releaseInternalNetworkName(releaseID),
-		"containers":         releaseContainers(releaseID),
+		"containers":         releaseContainersForServices(releaseID, services),
 		"routes":             releaseRoutes(releaseID, gatewayPort, webPort),
 		"desiredReplicas":    desired,
 		"endpoints":          endpoints,
-		"activeServices":     activeServicesFromEndpoints(desired, endpoints),
+		"activeServices":     activeServicesFromEndpointsForServices(desired, endpoints, services),
 	}
+}
+
+func serviceListOrDefault(services []string) []string {
+	if len(services) == 0 {
+		return serviceOrder
+	}
+	selected := make(map[string]bool, len(services))
+	out := make([]string, 0, len(services))
+	for _, service := range services {
+		service = cleanAIFARServiceName(service)
+		if !aifarServiceSupported(service) || selected[service] {
+			continue
+		}
+		selected[service] = true
+	}
+	for _, service := range serviceOrder {
+		if selected[service] {
+			out = append(out, service)
+		}
+	}
+	if len(out) == 0 {
+		return serviceOrder
+	}
+	return out
+}
+
+func servicesFromMetadata(metadata map[string]any) []string {
+	raw, ok := metadata["services"]
+	if !ok {
+		return serviceOrder
+	}
+	switch items := raw.(type) {
+	case []string:
+		return serviceListOrDefault(items)
+	case []any:
+		values := make([]string, 0, len(items))
+		for _, item := range items {
+			values = append(values, fmt.Sprint(item))
+		}
+		return serviceListOrDefault(values)
+	}
+	return serviceOrder
 }
 
 func installConfigHash(options InstallOptions) string {
@@ -383,7 +447,7 @@ func installConfigHash(options InstallOptions) string {
 		"nacosHost":       options.NacosHost,
 		"nacosUser":       options.NacosUser,
 		"nacosNamespace":  options.NacosNamespace,
-		"services":        serviceOrder,
+		"services":        options.SelectedServices,
 	})
 	sum := sha256.Sum256(data)
 	return hex.EncodeToString(sum[:])

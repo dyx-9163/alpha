@@ -635,3 +635,5 @@
 - 结论：已新增 `aifar-agent` CLI/HTTP runtime，支持 `health`、`reconcile-ingress --spec` 和本地 HTTP reconcile；Docker 安装会在发现 agent 二进制时上传并安装 systemd `aifar-agent`；AIFAR 安装会写入 runtime spec 并优先交给 agent 创建/校验 ingress，agent 不存在时回退旧 nginx 容器逻辑；Linux 打包包含 `bin/aifar-agent-linux-amd64`，release staging 改为临时目录生成归档以规避旧 Windows 目录锁。
 - 问题：用户贴出新版安装日志，`oauth` Pod 启动后最终报 `AIFAR Pod did not become ready`。
 - 结论：根因是初装脚本用 `docker inspect` JSON + awk 读取第一个 `"Status"`，会把容器运行态 `running` 误当成 health 状态，导致 healthy Pod 也可能一直等到超时；已改为 Docker format 明确读取 `.State.Status` 和 `.State.Health.Status`，超时输出容器日志，并将 Java Pod 默认 readiness path 改为 `/actuator/health`、web 仍为 `/`，启动等待默认 300 秒。
+- 问题：用户要求 AIFAR 安装弹窗支持选择安装哪些模块。
+- 结论：AIFAR 安装新增 `selectedServices` 多选字段，默认全选；`gateway` 和 `web-vue3` 作为固定入口必选，其余 Java 服务可选。后端会规范化所选服务并补齐入口模块，安装脚本只构建/启动所选服务，实例 metadata、release manifest、desiredReplicas、endpoints 和 service proxies 也只记录所选模块。
