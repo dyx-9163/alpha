@@ -663,3 +663,5 @@
 - 结论：原因是目标机缺少 systemd `aifar-agent`，旧 Docker runtime 安装曾允许跳过 agent；已改为 Docker 安装缺少 agent 二进制直接失败并校验 `aifar-agent status`，AIFAR 安装/更新/扩容也在解包、构建或创建 Pod 前先检查 agent 可达。
 - 问题：用户再次贴出 AIFAR 安装直接报 `aifar-agent is required`。
 - 结论：AIFAR 安装现在会随安装任务上传 `aifar-agent-linux-amd64`，目标机 agent 不存在或不可达时自动安装 `/usr/local/bin/aifar-agent` 并注册 systemd 服务；已有健康 agent 时跳过安装，仍只保留宿主机 agent + 业务 Pod 模型。
+- 问题：用户贴出 `aifar-agent is not installed and no agent binary was uploaded`，AIFAR 安装脚本未收到 agent 二进制路径。
+- 结论：根因是开发态后端从 `backend/` 目录启动时只查找了 `backend/bin`，没有找到仓库根目录 `bin/aifar-agent-linux-amd64`；已新增共享 `agentdist.FindBinary`，AIFAR/Docker 安装统一从当前目录、父级 `bin`、`deploy/bin` 和打包目录查找 agent。

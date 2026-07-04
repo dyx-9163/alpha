@@ -16,6 +16,7 @@ import (
 	"time"
 	"unicode"
 
+	"aifar-deployment/backend/internal/agentdist"
 	"aifar-deployment/backend/internal/installer/installerkit"
 	"aifar-deployment/backend/internal/installer/selinux"
 	"aifar-deployment/backend/internal/installer/uploadkit"
@@ -202,7 +203,7 @@ func (s Service) Install(ctx context.Context, req InstallRequest, resources []st
 	workDir := installerkit.WorkDir(deployDir, AppName, bundle.Version, releaseTime)
 	installRoot := installRootFromDeployDir(deployDir)
 	archiveRemote := workDir + "/" + filepath.Base(archiveLocal)
-	agentLocal := findRuntimeAgentBinary()
+	agentLocal := agentdist.FindBinary()
 	agentRemote := ""
 	if agentLocal != "" {
 		agentRemote = workDir + "/" + filepath.Base(agentLocal)
@@ -1234,41 +1235,6 @@ func (s Service) markInstanceStatus(instance store.AppInstance, status string, d
 	instance.Metadata = string(next)
 	_, err := s.store.SaveAppInstance(instance)
 	return err
-}
-
-func findRuntimeAgentBinary() string {
-	if value := os.Getenv("AIFAR_AGENT_BINARY"); value != "" {
-		if fileExists(value) {
-			return value
-		}
-		return ""
-	}
-	names := []string{"aifar-agent-linux-amd64", "aifar-agent"}
-	candidates := []string{}
-	if exe, err := os.Executable(); err == nil {
-		dir := filepath.Dir(exe)
-		for _, name := range names {
-			candidates = append(candidates, filepath.Join(dir, name), filepath.Join(dir, "..", "bin", name))
-		}
-	}
-	for _, name := range names {
-		candidates = append(candidates,
-			filepath.Join("deploy", "bin", name),
-			filepath.Join("bin", name),
-			name,
-		)
-	}
-	for _, candidate := range candidates {
-		if fileExists(candidate) {
-			return candidate
-		}
-	}
-	return ""
-}
-
-func fileExists(path string) bool {
-	info, err := os.Stat(path)
-	return err == nil && !info.IsDir()
 }
 
 type installScriptData struct {

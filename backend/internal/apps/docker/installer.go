@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"aifar-deployment/backend/internal/agentdist"
 	"aifar-deployment/backend/internal/i18n"
 	"aifar-deployment/backend/internal/installer/installerkit"
 	"aifar-deployment/backend/internal/installer/uploadkit"
@@ -37,7 +38,7 @@ func (i Installer) InstallWithLanguage(ctx context.Context, server store.Server,
 		options = opts[0]
 	}
 	options = NormalizeInstallOptions(options)
-	agentLocal := findAgentBinary()
+	agentLocal := agentdist.FindBinary()
 	if agentLocal == "" {
 		return errors.New(i18n.Text(lang, "docker.agentBinaryRequired"))
 	}
@@ -98,41 +99,6 @@ func (i Installer) InstallWithLanguage(ctx context.Context, server store.Server,
 	}
 	log.Info(i18n.Text(lang, "docker.installFinished"), bundle.Version)
 	return nil
-}
-
-func findAgentBinary() string {
-	if value := os.Getenv("AIFAR_AGENT_BINARY"); value != "" {
-		if fileExists(value) {
-			return value
-		}
-		return ""
-	}
-	names := []string{"aifar-agent-linux-amd64", "aifar-agent"}
-	candidates := []string{}
-	if exe, err := os.Executable(); err == nil {
-		dir := filepath.Dir(exe)
-		for _, name := range names {
-			candidates = append(candidates, filepath.Join(dir, name), filepath.Join(dir, "..", "bin", name))
-		}
-	}
-	for _, name := range names {
-		candidates = append(candidates,
-			filepath.Join("deploy", "bin", name),
-			filepath.Join("bin", name),
-			name,
-		)
-	}
-	for _, candidate := range candidates {
-		if fileExists(candidate) {
-			return candidate
-		}
-	}
-	return ""
-}
-
-func fileExists(path string) bool {
-	info, err := os.Stat(path)
-	return err == nil && !info.IsDir()
 }
 
 func (i Installer) run(ctx context.Context, server store.Server, command string, log Logger, lang string) (installerkit.CommandResult, error) {
