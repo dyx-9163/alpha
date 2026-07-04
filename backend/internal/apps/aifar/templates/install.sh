@@ -187,7 +187,17 @@ check_nacos_dependency() {
 }
 
 agent_status_ok() {
-  command -v aifar-agent >/dev/null 2>&1 && aifar-agent status >/dev/null 2>&1
+  command -v aifar-agent >/dev/null 2>&1 && wait_agent_status
+}
+
+wait_agent_status() {
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do
+    if aifar-agent status >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
 }
 
 install_agent_dependency() {
@@ -224,7 +234,12 @@ SERVICE
     $SUDO journalctl -u aifar-agent -n 80 --no-pager || true
     exit 1
   fi
-  aifar-agent status >/dev/null 2>&1 || fail "aifar-agent service is not reachable after installation"
+  if ! wait_agent_status; then
+    echo "aifar-agent service is not reachable after installation"
+    $SUDO systemctl --no-pager --full status aifar-agent || true
+    $SUDO journalctl -u aifar-agent -n 80 --no-pager || true
+    exit 1
+  fi
 }
 
 check_agent_dependency() {

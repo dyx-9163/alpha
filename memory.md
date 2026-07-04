@@ -665,3 +665,5 @@
 - 结论：AIFAR 安装现在会随安装任务上传 `aifar-agent-linux-amd64`，目标机 agent 不存在或不可达时自动安装 `/usr/local/bin/aifar-agent` 并注册 systemd 服务；已有健康 agent 时跳过安装，仍只保留宿主机 agent + 业务 Pod 模型。
 - 问题：用户贴出 `aifar-agent is not installed and no agent binary was uploaded`，AIFAR 安装脚本未收到 agent 二进制路径。
 - 结论：根因是开发态后端从 `backend/` 目录启动时只查找了 `backend/bin`，没有找到仓库根目录 `bin/aifar-agent-linux-amd64`；已新增共享 `agentdist.FindBinary`，AIFAR/Docker 安装统一从当前目录、父级 `bin`、`deploy/bin` 和打包目录查找 agent。
+- 问题：用户贴出 `aifar-agent service is not reachable after installation`，但目标机 `ss -lntp` 显示 `aifar-agent` 已监听 `127.0.0.1:18081`。
+- 结论：根因是 `aifar-agent status` 的 `/status` handler 还会执行 `docker info`，导致 agent API 已启动但 Docker 健康探测失败时被误报为不可达；已将 `/status` 改为只返回 agent 自身运行状态，Docker 探测保留在 `/health`，并让安装脚本等待 agent API 就绪后再继续。

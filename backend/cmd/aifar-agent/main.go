@@ -108,13 +108,19 @@ func serve(addr string) error {
 	if err := manager.Load(context.Background()); err != nil {
 		return err
 	}
+	server := &http.Server{Addr: addr, Handler: newAgentHandler(manager, health), ReadHeaderTimeout: 10 * time.Second}
+	log.Printf("aifar-agent listening on %s", addr)
+	return server.ListenAndServe()
+}
+
+func newAgentHandler(manager *runtimeagent.Manager, healthCheck func(context.Context) error) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		if err := health(r.Context()); err != nil {
+		if err := healthCheck(r.Context()); err != nil {
 			http.Error(w, err.Error(), http.StatusServiceUnavailable)
 			return
 		}
@@ -123,10 +129,6 @@ func serve(addr string) error {
 	mux.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		if err := health(r.Context()); err != nil {
-			http.Error(w, err.Error(), http.StatusServiceUnavailable)
 			return
 		}
 		writeJSON(w, http.StatusOK, manager.Status())
@@ -164,9 +166,7 @@ func serve(addr string) error {
 		}
 		writeJSON(w, http.StatusOK, map[string]string{"status": "removed"})
 	})
-	server := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
-	log.Printf("aifar-agent listening on %s", addr)
-	return server.ListenAndServe()
+	return mux
 }
 
 func postRuntimeSpec(ctx context.Context, addr string, spec runtimeagent.RuntimeSpec) error {

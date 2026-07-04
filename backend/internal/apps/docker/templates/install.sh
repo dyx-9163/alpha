@@ -20,6 +20,16 @@ fi
 
 {{ serviceAccessHelpers }}
 
+wait_agent_status() {
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do
+    if /usr/local/bin/aifar-agent status >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
 echo "installing local RPM dependencies when available"
 if [ -d "$WORK_DIR/rpms" ] && ls "$WORK_DIR"/rpms/*.rpm >/dev/null 2>&1; then
   if command -v rpm >/dev/null 2>&1; then
@@ -204,7 +214,7 @@ if ! $SUDO systemctl enable --now aifar-agent; then
   $SUDO journalctl -u aifar-agent -n 80 --no-pager || true
   exit 1
 fi
-if ! /usr/local/bin/aifar-agent status >/dev/null; then
+if ! wait_agent_status; then
   echo "AIFAR runtime agent API is not reachable"
   $SUDO systemctl --no-pager --full status aifar-agent || true
   $SUDO journalctl -u aifar-agent -n 80 --no-pager || true
