@@ -126,6 +126,7 @@ func (fakeLogger) Info(format string, args ...any)  {}
 func (fakeLogger) Error(format string, args ...any) {}
 
 func TestServiceInstallsDockerOnMultipleServers(t *testing.T) {
+	withFakeAgentBinary(t)
 	root := t.TempDir()
 	archive := filepath.Join(root, "aifar-docker-static-24.0.9-linux-x86_64.tar")
 	if err := os.WriteFile(archive, []byte("bundle"), 0o644); err != nil {
@@ -156,6 +157,7 @@ func TestServiceInstallsDockerOnMultipleServers(t *testing.T) {
 }
 
 func TestServiceUsesConcurrencyForDockerInstalls(t *testing.T) {
+	withFakeAgentBinary(t)
 	root := t.TempDir()
 	archive := filepath.Join(root, "aifar-docker-static-24.0.9-linux-x86_64.tar")
 	if err := os.WriteFile(archive, []byte("bundle"), 0o644); err != nil {
@@ -211,6 +213,7 @@ func TestServiceUsesConcurrencyForDockerInstalls(t *testing.T) {
 }
 
 func TestServiceUsesDockerInstallOptions(t *testing.T) {
+	withFakeAgentBinary(t)
 	root := t.TempDir()
 	archive := filepath.Join(root, "aifar-docker-static-24.0.9-linux-x86_64.tar")
 	if err := os.WriteFile(archive, []byte("bundle"), 0o644); err != nil {

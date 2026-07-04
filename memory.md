@@ -659,3 +659,5 @@
 - 结论：根因是 web-vue3 nginx 配置残留旧逻辑，启动时依赖 Docker DNS 解析 gateway Pod 名；在 agent 模型下 `/api` 和 websocket 应由宿主机 `aifar-agent` 入口层转发，web 容器只服务静态页面。已从安装脚本移除 gateway Pod 替换逻辑，并在新装、单服务更新、批量更新中剥离 web nginx 的 `/api` 和 `/im/ws` 代理块。
 - 问题：用户要求去掉老版本部署 AIFAR 应用的代码逻辑，只保留 agents。
 - 结论：AIFAR 安装、更新、批量更新、扩容和卸载脚本已移除旧 nginx ingress/service-proxy/current release/Compose fallback 路径，只保留 `aifar-agent` runtime spec 与业务 Pod；状态检测和容器 runtime 也不再从 legacy Docker 容器反推 AIFAR 运行时。
+- 问题：用户贴出 AIFAR 安装日志，镜像构建后才报 `aifar-agent is required; install or upgrade Docker runtime first`。
+- 结论：原因是目标机缺少 systemd `aifar-agent`，旧 Docker runtime 安装曾允许跳过 agent；已改为 Docker 安装缺少 agent 二进制直接失败并校验 `aifar-agent status`，AIFAR 安装/更新/扩容也在解包、构建或创建 Pod 前先检查 agent 可达。

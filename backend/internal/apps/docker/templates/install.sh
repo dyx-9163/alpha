@@ -134,11 +134,11 @@ SERVICE
 $SUDO install -m 0644 "$WORK_DIR/containerd.service" /etc/systemd/system/containerd.service
 $SUDO install -m 0644 "$WORK_DIR/docker.service" /etc/systemd/system/docker.service
 
-if [ -n "$AGENT_BINARY" ] && [ -f "$AGENT_BINARY" ]; then
-  echo "installing AIFAR runtime agent"
-  $SUDO mkdir -p /etc/aifar /var/lib/aifar-agent /var/log/aifar-agent
-  $SUDO install -m 0755 "$AGENT_BINARY" /usr/local/bin/aifar-agent
-  cat > "$WORK_DIR/aifar-agent.service" <<SERVICE
+[ -n "$AGENT_BINARY" ] && [ -f "$AGENT_BINARY" ] || { echo "AIFAR runtime agent binary is required"; exit 1; }
+echo "installing AIFAR runtime agent"
+$SUDO mkdir -p /etc/aifar /var/lib/aifar-agent /var/log/aifar-agent
+$SUDO install -m 0755 "$AGENT_BINARY" /usr/local/bin/aifar-agent
+cat > "$WORK_DIR/aifar-agent.service" <<SERVICE
 [Unit]
 Description=AIFAR Runtime Agent
 After=network-online.target docker.service
@@ -155,10 +155,7 @@ WorkingDirectory=/var/lib/aifar-agent
 [Install]
 WantedBy=multi-user.target
 SERVICE
-  $SUDO install -m 0644 "$WORK_DIR/aifar-agent.service" /etc/systemd/system/aifar-agent.service
-else
-  echo "AIFAR runtime agent binary was not uploaded; skip agent installation"
-fi
+$SUDO install -m 0644 "$WORK_DIR/aifar-agent.service" /etc/systemd/system/aifar-agent.service
 
 echo "enabling and starting services"
 $SUDO systemctl daemon-reload
@@ -201,14 +198,17 @@ if ! /usr/local/bin/docker -H "tcp://127.0.0.1:$REMOTE_API_PORT" version >/dev/n
   exit 1
 fi
 
-if [ -n "$AGENT_BINARY" ] && [ -f "$AGENT_BINARY" ]; then
-  if ! $SUDO systemctl enable --now aifar-agent; then
-    echo "AIFAR runtime agent service failed to start"
-    $SUDO systemctl --no-pager --full status aifar-agent || true
-    $SUDO journalctl -u aifar-agent -n 80 --no-pager || true
-    exit 1
-  fi
-  /usr/local/bin/aifar-agent health
+if ! $SUDO systemctl enable --now aifar-agent; then
+  echo "AIFAR runtime agent service failed to start"
+  $SUDO systemctl --no-pager --full status aifar-agent || true
+  $SUDO journalctl -u aifar-agent -n 80 --no-pager || true
+  exit 1
+fi
+if ! /usr/local/bin/aifar-agent status >/dev/null; then
+  echo "AIFAR runtime agent API is not reachable"
+  $SUDO systemctl --no-pager --full status aifar-agent || true
+  $SUDO journalctl -u aifar-agent -n 80 --no-pager || true
+  exit 1
 fi
 echo "verifying Docker Compose"
 /usr/local/bin/docker compose version || /usr/local/bin/docker-compose version

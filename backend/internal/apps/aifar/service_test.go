@@ -587,6 +587,8 @@ func TestServiceInstallsAIFARServiceFromDockerAppsBundle(t *testing.T) {
 		`ORCHESTRATION_MODEL="k8s-like-v1"`,
 		`RUNTIME_DIR="$INSTALL_ROOT/runtime"`,
 		`NACOS_REGISTRATION_MODE="agent-proxy"`,
+		`check_agent_dependency`,
+		`aifar-agent status >/dev/null 2>&1`,
 		`register_nacos_proxy`,
 		`SPRING_CLOUD_NACOS_DISCOVERY_REGISTER_ENABLED "false"`,
 		`start_pod "$service" 1`,
@@ -608,6 +610,9 @@ func TestServiceInstallsAIFARServiceFromDockerAppsBundle(t *testing.T) {
 		if !strings.Contains(remote.installScript, want) {
 			t.Fatalf("AIFAR install script should include k8s-like orchestration with %q:\n%s", want, remote.installScript)
 		}
+	}
+	if strings.LastIndex(remote.installScript, "check_agent_dependency") > strings.LastIndex(remote.installScript, "build_images") {
+		t.Fatalf("AIFAR install script should check aifar-agent before building images:\n%s", remote.installScript)
 	}
 	if strings.Contains(remote.installScript, `/"Status"/ {print $4; exit}`) {
 		t.Fatalf("AIFAR install script should not parse Docker health from the first JSON Status field:\n%s", remote.installScript)

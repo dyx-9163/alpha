@@ -50,6 +50,11 @@ set_env() {
   mv "$tmp" "$file"
 }
 
+check_agent_dependency() {
+  command -v aifar-agent >/dev/null 2>&1 || fail "aifar-agent is required; install or upgrade Docker runtime first"
+  aifar-agent status >/dev/null 2>&1 || fail "aifar-agent service is not reachable; install or upgrade Docker runtime first"
+}
+
 strip_web_nginx_runtime_routes() {
   service_dir="$1"
   nginx_conf="$service_dir/nginx/default.conf"
@@ -313,7 +318,7 @@ start_pod() {
 
 reconcile_runtime() {
   spec="$INSTALL_ROOT/runtime/ingress/runtime-spec.json"
-  command -v aifar-agent >/dev/null 2>&1 || fail "aifar-agent is required; install or upgrade Docker runtime first"
+  check_agent_dependency
   [ -f "$spec" ] || fail "AIFAR runtime spec is missing: $spec"
   aifar-agent reconcile-ingress --spec "$spec"
 }
@@ -405,6 +410,7 @@ JSON
 
 command -v docker >/dev/null 2>&1 || fail "docker command is required"
 docker info >/dev/null 2>&1 || fail "docker daemon is not available"
+check_agent_dependency
 [ -d "$APP_DIR" ] || fail "AIFAR runtime app directory is missing"
 [ -d "$ENV_DIR" ] || fail "AIFAR runtime env directory is missing"
 [ -f "$INSTALL_ROOT/.aifar/model.json" ] || fail "AIFAR k8s-like model manifest is missing"

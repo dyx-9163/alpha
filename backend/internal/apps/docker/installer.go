@@ -37,6 +37,10 @@ func (i Installer) InstallWithLanguage(ctx context.Context, server store.Server,
 		options = opts[0]
 	}
 	options = NormalizeInstallOptions(options)
+	agentLocal := findAgentBinary()
+	if agentLocal == "" {
+		return errors.New(i18n.Text(lang, "docker.agentBinaryRequired"))
+	}
 	deployDir := installerkit.RemoteDeployDir(server.DeployDir)
 	workDir := installerkit.WorkDir(deployDir, "docker", bundle.Version, time.Now())
 	installRoot := installerkit.InstallRoot(deployDir, "docker")
@@ -59,18 +63,15 @@ func (i Installer) InstallWithLanguage(ctx context.Context, server store.Server,
 			return err
 		}
 	}
-	agentRemote := ""
-	if agentLocal := findAgentBinary(); agentLocal != "" {
-		agentRemote = workDir + "/" + filepath.Base(agentLocal)
-		if err := uploadkit.Upload(ctx, i.remote, server, uploadkit.File{
-			LocalPath:      agentLocal,
-			RemotePath:     agentRemote,
-			Mode:           0o755,
-			LogMessage:     i18n.Text(lang, "docker.uploadAgent"),
-			FailureMessage: i18n.Text(lang, "docker.uploadAgentFailed"),
-		}, log); err != nil {
-			return err
-		}
+	agentRemote := workDir + "/" + filepath.Base(agentLocal)
+	if err := uploadkit.Upload(ctx, i.remote, server, uploadkit.File{
+		LocalPath:      agentLocal,
+		RemotePath:     agentRemote,
+		Mode:           0o755,
+		LogMessage:     i18n.Text(lang, "docker.uploadAgent"),
+		FailureMessage: i18n.Text(lang, "docker.uploadAgentFailed"),
+	}, log); err != nil {
+		return err
 	}
 	script, err := installScriptWithAgent(bundle.Version, workDir, archiveRemote, installRoot, agentRemote, options)
 	if err != nil {
@@ -100,8 +101,11 @@ func (i Installer) InstallWithLanguage(ctx context.Context, server store.Server,
 }
 
 func findAgentBinary() string {
-	if value := os.Getenv("AIFAR_AGENT_BINARY"); value != "" && fileExists(value) {
-		return value
+	if value := os.Getenv("AIFAR_AGENT_BINARY"); value != "" {
+		if fileExists(value) {
+			return value
+		}
+		return ""
 	}
 	names := []string{"aifar-agent-linux-amd64", "aifar-agent"}
 	candidates := []string{}

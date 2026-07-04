@@ -53,6 +53,11 @@ service_port() {
   read_env_value "$ENV_DIR/compose.env" "$var" ""
 }
 
+check_agent_dependency() {
+  command -v aifar-agent >/dev/null 2>&1 || fail "aifar-agent is required; install or upgrade Docker runtime first"
+  aifar-agent status >/dev/null 2>&1 || fail "aifar-agent service is not reachable; install or upgrade Docker runtime first"
+}
+
 memory_to_bytes() {
   value="$(printf "%s" "$1" | tr '[:upper:]' '[:lower:]' | tr -d ' ')"
   case "$value" in
@@ -102,13 +107,14 @@ wait_container_ready() {
 
 reconcile_runtime() {
   spec="$INSTALL_ROOT/runtime/ingress/runtime-spec.json"
-  command -v aifar-agent >/dev/null 2>&1 || fail "aifar-agent is required; install or upgrade Docker runtime first"
+  check_agent_dependency
   [ -f "$spec" ] || fail "AIFAR runtime spec is missing: $spec"
   aifar-agent reconcile-ingress --spec "$spec"
 }
 
 command -v docker >/dev/null 2>&1 || fail "docker command is required"
 docker info >/dev/null 2>&1 || fail "docker daemon is not available"
+check_agent_dependency
 [ -f "$INSTALL_ROOT/.aifar/model.json" ] || fail "AIFAR k8s-like model manifest is missing"
 grep -q '"model"[[:space:]]*:[[:space:]]*"k8s-like-v1"' "$INSTALL_ROOT/.aifar/model.json" || fail "AIFAR instance is legacy; reinstall with k8s-like orchestration"
 [ -d "$ENV_DIR" ] || fail "AIFAR runtime env directory is missing"

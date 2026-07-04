@@ -180,6 +180,11 @@ check_nacos_dependency() {
   fail "Nacos dependency readiness check failed at $url"
 }
 
+check_agent_dependency() {
+  command -v aifar-agent >/dev/null 2>&1 || fail "aifar-agent is required; install or upgrade Docker runtime first"
+  aifar-agent status >/dev/null 2>&1 || fail "aifar-agent service is not reachable; install or upgrade Docker runtime first"
+}
+
 resolve_system_timezone() {
   case "$TIMEZONE" in
     ""|"system"|"SYSTEM"|"System")
@@ -480,7 +485,7 @@ JSON
 }
 
 reconcile_ingress() {
-  command -v aifar-agent >/dev/null 2>&1 || fail "aifar-agent is required; install or upgrade Docker runtime first"
+  check_agent_dependency
   spec="$(write_runtime_spec)"
   echo "reconciling AIFAR runtime through aifar-agent: $spec"
   aifar-agent reconcile-ingress --spec "$spec"
@@ -510,6 +515,7 @@ command -v docker >/dev/null 2>&1 || fail "docker command is required"
 docker info >/dev/null 2>&1 || fail "docker daemon is not available"
 command -v tar >/dev/null 2>&1 || fail "tar command is required"
 [ -f "$ARCHIVE" ] || fail "bundle archive not found: $ARCHIVE"
+check_agent_dependency
 
 mkdir -p "$INSTALL_ROOT" "$WORK_DIR" "$RUNTIME_DIR" "$ENV_DIR" "$INGRESS_DIR" "$AIFAR_DIR"
 rm -rf "$TMP_DIR" "$APP_DIR" "$IMAGE_DIR"

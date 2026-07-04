@@ -54,6 +54,17 @@ func (l *installerCollectingLogger) Error(format string, args ...any) {
 	l.errors = append(l.errors, fmt.Sprintf(format, args...))
 }
 
+func withFakeAgentBinary(t *testing.T) string {
+	t.Helper()
+	root := t.TempDir()
+	agent := filepath.Join(root, "aifar-agent-linux-amd64")
+	if err := os.WriteFile(agent, []byte("agent"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("AIFAR_AGENT_BINARY", agent)
+	return agent
+}
+
 func TestSelectBundleUsesCurrentDockerResource(t *testing.T) {
 	root := t.TempDir()
 	bundle := filepath.Join(root, "aifar-docker-static-24.0.9-linux-x86_64.tar")
@@ -77,6 +88,7 @@ func TestSelectBundleUsesCurrentDockerResource(t *testing.T) {
 }
 
 func TestInstallerUploadsBundleRPMsAndRunsScript(t *testing.T) {
+	withFakeAgentBinary(t)
 	remote := &installerFakeRemote{}
 	installer := NewInstaller(remote)
 	err := installer.Install(context.Background(), store.Server{Name: "db-1", DeployDir: "/aifar/apps"}, Bundle{
@@ -101,12 +113,7 @@ func TestInstallerUploadsBundleRPMsAndRunsScript(t *testing.T) {
 }
 
 func TestInstallerUploadsAndInstallsRuntimeAgentWhenAvailable(t *testing.T) {
-	root := t.TempDir()
-	agent := filepath.Join(root, "aifar-agent-linux-amd64")
-	if err := os.WriteFile(agent, []byte("agent"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("AIFAR_AGENT_BINARY", agent)
+	withFakeAgentBinary(t)
 	remote := &installerFakeRemote{}
 	installer := NewInstaller(remote)
 	err := installer.Install(context.Background(), store.Server{Name: "db-1", DeployDir: "/aifar/apps"}, Bundle{
@@ -126,7 +133,7 @@ func TestInstallerUploadsAndInstallsRuntimeAgentWhenAvailable(t *testing.T) {
 		`Description=AIFAR Runtime Agent`,
 		`ExecStart=/usr/local/bin/aifar-agent serve --addr $AGENT_LISTEN_ADDR`,
 		`systemctl enable --now aifar-agent`,
-		`/usr/local/bin/aifar-agent health`,
+		`/usr/local/bin/aifar-agent status`,
 	} {
 		if !strings.Contains(remote.installScript, want) {
 			t.Fatalf("install script missing %q:\n%s", want, remote.installScript)
@@ -134,7 +141,24 @@ func TestInstallerUploadsAndInstallsRuntimeAgentWhenAvailable(t *testing.T) {
 	}
 }
 
+func TestInstallerRequiresRuntimeAgentBinary(t *testing.T) {
+	t.Setenv("AIFAR_AGENT_BINARY", filepath.Join(t.TempDir(), "missing-agent"))
+	remote := &installerFakeRemote{}
+	installer := NewInstaller(remote)
+	err := installer.InstallWithLanguage(context.Background(), store.Server{Name: "db-1", DeployDir: "/aifar/apps"}, Bundle{
+		Version:     "24.0.9",
+		ArchivePath: filepath.Join("resources", "docker", "24.0.9", "aifar-docker-static-24.0.9-linux-x86_64.tar"),
+	}, installerTestLogger{}, "en")
+	if err == nil || !strings.Contains(err.Error(), "AIFAR Agent binary is missing") {
+		t.Fatalf("expected missing agent binary error, got %v", err)
+	}
+	if len(remote.uploads) != 0 || len(remote.commands) != 0 {
+		t.Fatalf("installer should fail before remote work when agent is missing, uploads=%v commands=%v", remote.uploads, remote.commands)
+	}
+}
+
 func TestInstallerDefaultsRemoteWorkDirToAifarApps(t *testing.T) {
+	withFakeAgentBinary(t)
 	remote := &installerFakeRemote{}
 	installer := NewInstaller(remote)
 	err := installer.Install(context.Background(), store.Server{Name: "db-1"}, Bundle{
@@ -150,6 +174,7 @@ func TestInstallerDefaultsRemoteWorkDirToAifarApps(t *testing.T) {
 }
 
 func TestInstallerKeepsDockerDaemonConfigUnderInstallRoot(t *testing.T) {
+	withFakeAgentBinary(t)
 	remote := &installerFakeRemote{}
 	installer := NewInstaller(remote)
 	err := installer.Install(context.Background(), store.Server{Name: "db-1", DeployDir: "/aifar/apps"}, Bundle{
