@@ -643,3 +643,11 @@
 - 结论：容器页新增 AIFAR 运行时 Tab，按服务展示副本、Pod、Endpoint、Ingress 和 agent 状态；默认隐藏 `aifar.component=service-proxy/ingress` 基础设施容器，仅排障开关可见且不可普通操作；新增 `/containers/aifar/runtime`、runtime reconcile、service scale-out 任务入口，agent 不可用时降级展示并拒绝变更；AIFAR 模块通过 registry 可选接口承载扩容和入口重建。
 - 问题：用户反馈 AIFAR 服务进程已启动成功，但容器页仍显示 gateway/system/permission/oauth 健康检查异常，gateway 日志出现 `Gateway actuator endpoint rejected, path=/actuator/health`。
 - 结论：根因是 AIFAR 脚本默认把 Java 服务空健康路径补成 `/actuator/health`，该路径被 gateway/业务过滤器拒绝，导致 Docker healthcheck 误判 unhealthy；已改为无显式 `APP_HEALTH_PATH` 时 Java 服务只检查本地 HTTP 端口响应，显式配置路径时仍严格检查，覆盖新装、单服务更新、批量更新和自动扩容。
+- 问题：用户询问服务器 `ss -lntp` 输出里哪一个是 `aifar-agent`。
+- 结论：`aifar-agent` 应作为宿主机进程/systemd 服务运行，默认监听 `127.0.0.1:18081`，进程名应显示为 `aifar-agent`；截图中未出现 `18081` 或 `aifar-agent`，说明该服务器 agent 大概率未安装或未运行。
+- 问题：用户贴出 `aifar-admin-ingress` nginx 配置和 `docker ps`，排查浏览器访问 503。
+- 结论：ingress 配置已正确指向 `aifar-svc-admin-gateway:38000` 和 `aifar-svc-admin-web-vue3:8080`，外部端口映射也存在；若仍返回 503，问题在下一层 service proxy 未写入 ready Pod upstream 或仍是 `return 503` 空配置，而不是 ingress 外层配置。
+- 问题：用户执行 `systemctl status aifar-agent --no-pager` 返回 `Unit aifar-agent.service could not be found`。
+- 结论：目标服务器未安装 `aifar-agent` systemd 服务；当前 AIFAR service/ingress 只能走安装脚本的 nginx 容器回退逻辑，agent 相关 reconcile/status 能力不可用，需要重新安装/升级 Docker 依赖或手动安装 `/usr/local/bin/aifar-agent` 与 systemd unit。
+- 问题：用户确认 `aifar-svc-admin-web-vue3` 和 `aifar-svc-admin-gateway` 的 nginx 配置仍是 `return 503`，但 Pod 均 healthy。
+- 结论：根因是 service proxy 配置生成后用 `mv "$tmp" "$conf"` 替换单文件 bind mount 的宿主机文件，Docker 容器仍绑定旧 inode，所以容器内继续看到初始空配置；已改为已有配置文件原地覆盖，避免新装/更新/扩容后 service proxy 继续返回 503。

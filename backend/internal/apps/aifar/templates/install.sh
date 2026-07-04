@@ -498,7 +498,12 @@ NGINX
   }
 }
 NGINX
-  mv "$tmp" "$conf"
+  if [ -f "$conf" ]; then
+    cat "$tmp" > "$conf"
+    rm -f "$tmp"
+  else
+    mv "$tmp" "$conf"
+  fi
 }
 
 reload_service_proxy() {
