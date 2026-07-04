@@ -651,3 +651,5 @@
 - 结论：目标服务器未安装 `aifar-agent` systemd 服务；当前 AIFAR service/ingress 只能走安装脚本的 nginx 容器回退逻辑，agent 相关 reconcile/status 能力不可用，需要重新安装/升级 Docker 依赖或手动安装 `/usr/local/bin/aifar-agent` 与 systemd unit。
 - 问题：用户确认 `aifar-svc-admin-web-vue3` 和 `aifar-svc-admin-gateway` 的 nginx 配置仍是 `return 503`，但 Pod 均 healthy。
 - 结论：根因是 service proxy 配置生成后用 `mv "$tmp" "$conf"` 替换单文件 bind mount 的宿主机文件，Docker 容器仍绑定旧 inode，所以容器内继续看到初始空配置；已改为已有配置文件原地覆盖，避免新装/更新/扩容后 service proxy 继续返回 503。
+- 问题：用户明确要求红框中的 `aifar-admin-ingress` 和 `aifar-svc-admin-*` 不应作为 Docker 容器运行，应作为 Docker 依赖注册到 Linux systemd。
+- 结论：已把方向改正为 systemd `aifar-agent` 数据面：agent 常驻宿主机并监听 gateway/web/Java 服务端口，按 Docker labels 动态发现 healthy Pod 并反向代理；AIFAR 安装不再创建 nginx ingress/service-proxy 容器，更新/批量/扩容改为 reconcile agent runtime spec，Nacos 注册到宿主机 agent 端口，容器 runtime DTO 显示 `aifar-agent:<service>`，检测逻辑要求 `aifar-agent status` 成功。

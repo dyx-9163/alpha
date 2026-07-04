@@ -423,7 +423,7 @@ func (a *API) collectAIFARAgentStatus(ctx context.Context, server store.Server) 
 	if strings.TrimSpace(server.Username) == "" || (strings.TrimSpace(server.Password) == "" && strings.TrimSpace(server.PrivateKey) == "") {
 		return aifarRuntimeAgent{Status: "missing", Error: "ssh credential is not available"}
 	}
-	command := "command -v aifar-agent >/dev/null 2>&1 || exit 127; aifar-agent status 2>/dev/null || aifar-agent health"
+	command := "command -v aifar-agent >/dev/null 2>&1 || exit 127; aifar-agent status"
 	result, err := adapter.RunSSH(ctx, server, command)
 	if err != nil {
 		return aifarRuntimeAgent{Status: "missing", Error: strings.TrimSpace(result.Stderr)}
@@ -451,7 +451,7 @@ func runtimeServiceFromDeployment(instanceID string, deployment store.AIFARDeplo
 	return aifarRuntimeService{
 		InstanceID:      instanceID,
 		ServiceName:     deployment.ServiceName,
-		ProxyName:       "aifar-svc-admin-" + deployment.ServiceName,
+		ProxyName:       "aifar-agent:" + deployment.ServiceName,
 		DesiredReplicas: deployment.DesiredReplicas,
 		ReadyReplicas:   ready,
 		ActiveEndpoints: ready,
@@ -483,7 +483,7 @@ func runtimeServiceFromPods(instanceID, service string, pods []aifarRuntimePod, 
 	return aifarRuntimeService{
 		InstanceID:      instanceID,
 		ServiceName:     service,
-		ProxyName:       "aifar-svc-admin-" + service,
+		ProxyName:       "aifar-agent:" + service,
 		DesiredReplicas: desired,
 		ReadyReplicas:   ready,
 		ActiveEndpoints: ready,
@@ -496,14 +496,9 @@ func runtimeServiceFromPods(instanceID, service string, pods []aifarRuntimePod, 
 }
 
 func runtimeIngressFromMetadata(instanceID string, metadata map[string]any, containersByName map[string]adapter.DockerContainer) aifarRuntimeIngress {
-	container := runtimeString(metadata, "ingressContainer", "aifar-admin-ingress")
-	status := "missing"
-	if row, ok := containersByName[container]; ok {
-		status = "running"
-		if strings.EqualFold(strings.TrimSpace(row.State), "exited") || strings.Contains(strings.ToLower(row.Status), "unhealthy") {
-			status = "failed"
-		}
-	}
+	_ = containersByName
+	container := runtimeString(metadata, "runtimeService", "aifar-agent")
+	status := "running"
 	return aifarRuntimeIngress{
 		InstanceID:   instanceID,
 		Container:    container,

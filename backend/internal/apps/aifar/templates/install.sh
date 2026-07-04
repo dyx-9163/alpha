@@ -32,7 +32,7 @@ NACOS_CONNECT_HOST={{ quote .Options.NacosHost }}
 NACOS_USER={{ quote .Options.NacosUser }}
 NACOS_PASSWORD={{ quote .Options.NacosPassword }}
 NACOS_NS={{ quote .Options.NacosNamespace }}
-NACOS_REGISTRATION_MODE="service-proxy"
+NACOS_REGISTRATION_MODE="agent-proxy"
 ORCHESTRATION_MODEL="k8s-like-v1"
 
 fail() {
@@ -258,9 +258,9 @@ write_java_env() {
 patch_web_nginx_gateway_target() {
   nginx_conf="$APP_DIR/web-vue3/nginx/default.conf"
   [ -f "$nginx_conf" ] || return 0
-  gateway_proxy="$(service_proxy_name gateway)"
+  gateway_proxy="$(pod_name gateway "$REVISION" 1)"
   tmp="$nginx_conf.tmp"
-  placeholder="__AIFAR_GATEWAY_SERVICE_PROXY__"
+  placeholder="__AIFAR_GATEWAY_POD__"
   sed "s#http://aifar-gateway[-A-Za-z0-9_.]*:[0-9][0-9]*#${placeholder}#g; s#http://aifar-gateway[-A-Za-z0-9_.]*#${placeholder}#g; s#${placeholder}#http://${gateway_proxy}:${GATEWAY_PORT}#g" "$nginx_conf" > "$tmp"
   mv "$tmp" "$nginx_conf"
 }
@@ -274,7 +274,7 @@ write_service_envs() {
     : > "$service_env"
     set_env APP_IMAGE "$image" "$service_env"
     set_env APP_CONTAINER_NAME "$(pod_name "$service" "$REVISION" 1)" "$service_env"
-    set_env AIFAR_SERVICE_PROXY "$(service_proxy_name "$service")" "$service_env"
+    set_env AIFAR_SERVICE_PROXY "aifar-agent" "$service_env"
     app_name="$(alpha_service_name "$service")"
     if [ -n "$app_name" ]; then
       set_env SPRING_APPLICATION_NAME "$app_name" "$service_env"
@@ -297,46 +297,15 @@ build_images() {
   done
 }
 
-empty_proxy_config() {
-  service="$1"
-  port="$(service_port "$service")"
-  conf="$PROXY_DIR/$service/nginx.conf"
-  mkdir -p "$(dirname "$conf")"
-  cat > "$conf" <<NGINX
-events {}
-http {
-  server {
-    listen ${port};
-    location / {
-      return 503;
-    }
-  }
-}
-NGINX
-}
-
-start_service_proxy() {
-  service="$1"
-  proxy="$(service_proxy_name "$service")"
-  conf="$PROXY_DIR/$service/nginx.conf"
-  port="$(service_port "$service")"
-  docker rm -f "$proxy" >/dev/null 2>&1 || true
-  docker run -d \
-    --name "$proxy" \
-    --restart unless-stopped \
-    --label aifar.app=aifar \
-    --label "aifar.install-root=$INSTALL_ROOT" \
-    --label "aifar.component=service-proxy" \
-    --label "aifar.service=$service" \
-    --network "$INGRESS_NETWORK" \
-    -v "$conf:/etc/nginx/nginx.conf:ro" \
-    nginx:stable-alpine >/dev/null
-  docker exec "$proxy" nginx -t >/dev/null
-  echo "AIFAR Service proxy started: $service -> $proxy:$port"
-}
-
-proxy_ip() {
-  docker inspect "$1" | awk -F\" '/"IPAddress"/ && $4 != "" {print $4; exit}'
+agent_host_ip() {
+  if command -v ip >/dev/null 2>&1; then
+    route_ip="$(ip route get "$NACOS_CONNECT_HOST" 2>/dev/null | awk '{for (i=1;i<=NF;i++) if ($i=="src") {print $(i+1); exit}}' || true)"
+    if [ -n "$route_ip" ]; then
+      printf "%s" "$route_ip"
+      return
+    fi
+  fi
+  hostname -I 2>/dev/null | awk '{print $1; exit}'
 }
 
 nacos_access_token() {
@@ -351,10 +320,9 @@ register_nacos_proxy() {
   service="$1"
   app_name="$(alpha_service_name "$service")"
   [ -n "$app_name" ] || return 0
-  proxy="$(service_proxy_name "$service")"
-  ip="$(proxy_ip "$proxy")"
+  ip="$(agent_host_ip)"
   port="$(service_port "$service")"
-  [ -n "$ip" ] || fail "service proxy IP is empty for $service"
+  [ -n "$ip" ] || fail "AIFAR agent host IP is empty for $service"
   token="$(nacos_access_token || true)"
   token_arg=""
   [ -z "$token" ] || token_arg="&accessToken=$token"
@@ -362,9 +330,9 @@ register_nacos_proxy() {
   if command -v curl >/dev/null 2>&1; then
     curl -fsS -X DELETE "$url" >/dev/null 2>&1 || true
     curl -fsS -X POST "$url" >/dev/null 2>&1 || fail "register Nacos service proxy failed: $app_name"
-    echo "Nacos service proxy registered: $app_name -> $ip:$port"
+    echo "Nacos agent proxy registered: $app_name -> $ip:$port"
   else
-    echo "curl is not available; skip Nacos service proxy registration for $app_name"
+    echo "curl is not available; skip Nacos agent proxy registration for $app_name"
   fi
 }
 
@@ -466,136 +434,7 @@ wait_initial_pods_ready() {
   done
 }
 
-write_service_proxy_config() {
-  service="$1"
-  port="$(service_port "$service")"
-  conf="$PROXY_DIR/$service/nginx.conf"
-  tmp="$conf.tmp"
-  mkdir -p "$(dirname "$conf")"
-  cat > "$tmp" <<NGINX
-events {}
-http {
-  upstream aifar_${service}_pods {
-NGINX
-  names="$(docker ps --filter "label=aifar.app=aifar" --filter "label=aifar.install-root=$INSTALL_ROOT" --filter "label=aifar.component=pod" --filter "label=aifar.service=$service" --filter "label=aifar.revision=$REVISION" --format '{{ "{{" }}.Names{{ "}}" }}' 2>/dev/null || true)"
-  [ -n "$names" ] || fail "service $service has no ready pods"
-  for name in $names; do
-    health="$(container_health "$name")"
-    [ -z "$health" ] || [ "$health" = "healthy" ] || continue
-    printf "    server %s:%s;\n" "$name" "$port" >> "$tmp"
-  done
-  cat >> "$tmp" <<NGINX
-  }
-  server {
-    listen ${port};
-    location / {
-      proxy_set_header Host \$host;
-      proxy_set_header X-Real-IP \$remote_addr;
-      proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-      proxy_set_header X-Forwarded-Proto \$scheme;
-      proxy_pass http://aifar_${service}_pods;
-    }
-  }
-}
-NGINX
-  if [ -f "$conf" ]; then
-    cat "$tmp" > "$conf"
-    rm -f "$tmp"
-  else
-    mv "$tmp" "$conf"
-  fi
-}
-
-reload_service_proxy() {
-  service="$1"
-  proxy="$(service_proxy_name "$service")"
-  docker exec "$proxy" nginx -t >/dev/null
-  docker exec "$proxy" nginx -s reload >/dev/null
-  echo "AIFAR Service endpoints activated: $service"
-}
-
-write_ingress_config() {
-  gateway_proxy="$(service_proxy_name gateway)"
-  web_proxy="$(service_proxy_name web-vue3)"
-  conf="$INGRESS_DIR/nginx.conf"
-  mkdir -p "$INGRESS_DIR"
-  cat > "$conf" <<NGINX
-events {}
-http {
-  map \$http_upgrade \$connection_upgrade {
-    default upgrade;
-    '' close;
-  }
-  upstream aifar_gateway_service {
-    server ${gateway_proxy}:${GATEWAY_PORT};
-  }
-  upstream aifar_web_service {
-    server ${web_proxy}:${WEB_VUE3_PORT};
-  }
-  server {
-    listen ${GATEWAY_PORT};
-    location / {
-      proxy_set_header Host \$host;
-      proxy_set_header X-Real-IP \$remote_addr;
-      proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-      proxy_set_header X-Forwarded-Proto \$scheme;
-      proxy_pass http://aifar_gateway_service;
-    }
-  }
-  server {
-    listen ${WEB_VUE3_PORT};
-    location /api/ {
-      proxy_pass http://aifar_gateway_service;
-    }
-    location /im/ws/ {
-      proxy_http_version 1.1;
-      proxy_set_header Upgrade \$http_upgrade;
-      proxy_set_header Connection \$connection_upgrade;
-      proxy_pass http://aifar_gateway_service;
-    }
-    location / {
-      proxy_set_header Host \$host;
-      proxy_set_header X-Real-IP \$remote_addr;
-      proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-      proxy_set_header X-Forwarded-Proto \$scheme;
-      proxy_pass http://aifar_web_service;
-    }
-  }
-}
-NGINX
-}
-
-start_ingress() {
-  conf="$INGRESS_DIR/nginx.conf"
-  docker rm -f "$INGRESS_CONTAINER" >/dev/null 2>&1 || true
-  docker run -d \
-    --name "$INGRESS_CONTAINER" \
-    --restart unless-stopped \
-    --label aifar.app=aifar \
-    --label "aifar.install-root=$INSTALL_ROOT" \
-    --label "aifar.component=ingress" \
-    --network "$INGRESS_NETWORK" \
-    -p "${GATEWAY_PORT}:${GATEWAY_PORT}" \
-    -p "${WEB_VUE3_PORT}:${WEB_VUE3_PORT}" \
-    -v "$conf:/etc/nginx/nginx.conf:ro" \
-    nginx:stable-alpine >/dev/null
-  docker exec "$INGRESS_CONTAINER" nginx -t >/dev/null
-  echo "AIFAR Ingress started: $INGRESS_CONTAINER exposes gateway:$GATEWAY_PORT web:$WEB_VUE3_PORT"
-}
-
-verify_ingress_ports() {
-  running="$(docker inspect -f '{{ "{{" }}.State.Running{{ "}}" }}' "$INGRESS_CONTAINER" 2>/dev/null || echo false)"
-  [ "$running" = "true" ] || fail "AIFAR ingress is not running: $INGRESS_CONTAINER"
-  ports="$(docker port "$INGRESS_CONTAINER" 2>/dev/null || true)"
-  printf "%s\n" "$ports" | grep -q "${GATEWAY_PORT}/tcp" || fail "AIFAR ingress does not publish gateway port $GATEWAY_PORT"
-  printf "%s\n" "$ports" | grep -q "${WEB_VUE3_PORT}/tcp" || fail "AIFAR ingress does not publish web port $WEB_VUE3_PORT"
-  echo "AIFAR Ingress ports verified:"
-  printf "%s\n" "$ports"
-}
-
 write_runtime_spec() {
-  gateway_proxy="$(service_proxy_name gateway)"
-  web_proxy="$(service_proxy_name web-vue3)"
   spec="$INGRESS_DIR/runtime-spec.json"
   mkdir -p "$INGRESS_DIR"
   cat > "$spec" <<JSON
@@ -604,12 +443,25 @@ write_runtime_spec() {
   "instanceId": "admin",
   "installRoot": "${INSTALL_ROOT}",
   "network": "${INGRESS_NETWORK}",
+  "services": [
+JSON
+  first_service=1
+  for service in $SERVICE_ORDER; do
+    [ -f "$ENV_DIR/$service.env" ] || continue
+    port="$(service_port "$service")"
+    app_name="$(alpha_service_name "$service")"
+    if [ "$first_service" = "1" ]; then
+      first_service=0
+    else
+      printf ",\n" >> "$spec"
+    fi
+    printf '    {"name":"%s","appName":"%s","port":%s}' "$service" "$app_name" "$port" >> "$spec"
+  done
+  cat >> "$spec" <<JSON
+  ],
   "ingress": {
-    "container": "${INGRESS_CONTAINER}",
-    "image": "nginx:stable-alpine",
-    "configPath": "${INGRESS_DIR}/nginx.conf",
-    "gatewayService": "${gateway_proxy}",
-    "webService": "${web_proxy}",
+    "gatewayService": "gateway",
+    "webService": "web-vue3",
     "gatewayPort": ${GATEWAY_PORT},
     "webPort": ${WEB_VUE3_PORT}
   }
@@ -619,16 +471,10 @@ JSON
 }
 
 reconcile_ingress() {
-  if command -v aifar-agent >/dev/null 2>&1; then
-    spec="$(write_runtime_spec)"
-    echo "reconciling AIFAR ingress through aifar-agent: $spec"
-    aifar-agent reconcile-ingress --spec "$spec"
-    return
-  fi
-  echo "warning: aifar-agent not found; falling back to embedded nginx ingress creation"
-  write_ingress_config
-  start_ingress
-  verify_ingress_ports
+  command -v aifar-agent >/dev/null 2>&1 || fail "aifar-agent is required; install or upgrade Docker runtime first"
+  spec="$(write_runtime_spec)"
+  echo "reconciling AIFAR runtime through aifar-agent: $spec"
+  aifar-agent reconcile-ingress --spec "$spec"
 }
 
 write_model_manifest() {
@@ -653,6 +499,13 @@ cleanup_failed_install() {
   done
   pods="$(docker ps -a --filter "label=aifar.app=aifar" --filter "label=aifar.install-root=$INSTALL_ROOT" --filter "label=aifar.component=pod" --format '{{ "{{" }}.Names{{ "}}" }}' 2>/dev/null || true)"
   [ -z "$pods" ] || docker rm -f $pods >/dev/null 2>&1 || true
+}
+
+remove_runtime_infra_containers() {
+  docker rm -f "$INGRESS_CONTAINER" >/dev/null 2>&1 || true
+  for service in $SERVICE_ORDER; do
+    docker rm -f "$(service_proxy_name "$service")" >/dev/null 2>&1 || true
+  done
 }
 
 command -v docker >/dev/null 2>&1 || fail "docker command is required"
@@ -682,19 +535,8 @@ load_docker_images
 require_local_image "bellsoft/liberica-openjre-rocky:21"
 require_local_image "nginx:stable-alpine"
 ensure_network
+remove_runtime_infra_containers
 build_images
-
-for service in $SERVICE_ORDER; do
-  [ -f "$ENV_DIR/$service.env" ] || continue
-  empty_proxy_config "$service"
-  start_service_proxy "$service"
-done
-
-for service in $SERVICE_ORDER; do
-  [ "$service" = "web-vue3" ] && continue
-  [ -f "$ENV_DIR/$service.env" ] || continue
-  register_nacos_proxy "$service"
-done
 
 for service in $SERVICE_ORDER; do
   start_pod "$service" 1
@@ -705,13 +547,14 @@ if ! wait_initial_pods_ready; then
   fail "AIFAR initial Pods did not become stable"
 fi
 
+reconcile_ingress
+
 for service in $SERVICE_ORDER; do
+  [ "$service" = "web-vue3" ] && continue
   [ -f "$ENV_DIR/$service.env" ] || continue
-  write_service_proxy_config "$service"
-  reload_service_proxy "$service"
+  register_nacos_proxy "$service"
 done
 
-reconcile_ingress
 open_firewall_ports "$GATEWAY_PORT" "$WEB_VUE3_PORT"
 allow_selinux_ports http_port_t "$GATEWAY_PORT" "$WEB_VUE3_PORT"
 write_model_manifest

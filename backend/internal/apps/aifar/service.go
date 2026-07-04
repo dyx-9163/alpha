@@ -348,7 +348,7 @@ func installMetadata(server store.Server, installRoot, version, releaseID string
 		"endpoint":              fmt.Sprintf("%s:%d", server.Host, options.WebPort),
 		"gatewayEndpoint":       fmt.Sprintf("%s:%d", server.Host, options.GatewayPort),
 		"nacosEndpoint":         fmt.Sprintf("%s:%d", options.NacosHost, options.NacosWebPort),
-		"nacosRegistrationMode": "service-proxy",
+		"nacosRegistrationMode": "agent-proxy",
 		"webPort":               options.WebPort,
 		"gatewayPort":           options.GatewayPort,
 		"nacosSource":           options.NacosSource,

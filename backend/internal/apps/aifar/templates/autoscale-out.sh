@@ -54,10 +54,6 @@ service_port() {
   read_env_value "$ENV_DIR/compose.env" "$var" ""
 }
 
-service_proxy_name() {
-  printf "aifar-svc-admin-%s" "$1" | tr '. _/' '----'
-}
-
 memory_to_bytes() {
   value="$(printf "%s" "$1" | tr '[:upper:]' '[:lower:]' | tr -d ' ')"
   case "$value" in
@@ -105,53 +101,11 @@ wait_container_ready() {
   return 1
 }
 
-write_service_proxy_config() {
-  port="$(service_port "$SERVICE_NAME")"
-  conf="$PROXY_DIR/$SERVICE_NAME/nginx.conf"
-  tmp="$conf.tmp"
-  mkdir -p "$(dirname "$conf")"
-  names="$(docker ps --filter "label=aifar.app=aifar" --filter "label=aifar.install-root=$INSTALL_ROOT" --filter "label=aifar.component=pod" --filter "label=aifar.service=$SERVICE_NAME" --filter "label=aifar.revision=$REVISION" --format '{{ "{{" }}.Names{{ "}}" }}' 2>/dev/null || true)"
-  [ -n "$names" ] || fail "service $SERVICE_NAME has no ready pods"
-  cat > "$tmp" <<NGINX
-events {}
-http {
-  upstream aifar_${SERVICE_NAME}_pods {
-NGINX
-  for name in $names; do
-    health="$(container_health "$name")"
-    [ -z "$health" ] || [ "$health" = "healthy" ] || continue
-    printf "    server %s:%s;\n" "$name" "$port" >> "$tmp"
-  done
-  cat >> "$tmp" <<NGINX
-  }
-  server {
-    listen ${port};
-    client_max_body_size 1000m;
-    proxy_connect_timeout 300s;
-    proxy_buffering off;
-    proxy_request_buffering off;
-    location / {
-      proxy_set_header Host \$host;
-      proxy_set_header X-Real-IP \$remote_addr;
-      proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-      proxy_set_header X-Forwarded-Proto \$scheme;
-      proxy_pass http://aifar_${SERVICE_NAME}_pods;
-    }
-  }
-}
-NGINX
-  if [ -f "$conf" ]; then
-    cat "$tmp" > "$conf"
-    rm -f "$tmp"
-  else
-    mv "$tmp" "$conf"
-  fi
-}
-
-reload_service_proxy() {
-  proxy="$(service_proxy_name "$SERVICE_NAME")"
-  docker exec "$proxy" nginx -t >/dev/null
-  docker exec "$proxy" nginx -s reload >/dev/null
+reconcile_runtime() {
+  spec="$INSTALL_ROOT/runtime/ingress/runtime-spec.json"
+  command -v aifar-agent >/dev/null 2>&1 || fail "aifar-agent is required; install or upgrade Docker runtime first"
+  [ -f "$spec" ] || fail "AIFAR runtime spec is missing: $spec"
+  aifar-agent reconcile-ingress --spec "$spec"
 }
 
 command -v docker >/dev/null 2>&1 || fail "docker command is required"
@@ -241,9 +195,9 @@ if ! wait_container_ready "$CONTAINER_NAME"; then
   fail "new AIFAR service Pod did not become ready: $CONTAINER_NAME"
 fi
 
-if ! write_service_proxy_config || ! reload_service_proxy; then
+if ! reconcile_runtime; then
   docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
-  fail "AIFAR service proxy reload failed for autoscaled endpoint"
+  fail "AIFAR runtime reconcile failed for autoscaled endpoint"
 fi
 
 docker update --restart "$restart_policy" "$CONTAINER_NAME" >/dev/null 2>&1 || true

@@ -42,6 +42,9 @@ down_legacy() {
 }
 
 if command -v docker >/dev/null 2>&1 && [ -d "$INSTALL_ROOT" ]; then
+  if command -v aifar-agent >/dev/null 2>&1; then
+    aifar-agent remove-instance --instance admin >/dev/null 2>&1 || true
+  fi
   managed="$(docker ps -a --filter "label=aifar.app=aifar" --filter "label=aifar.install-root=$INSTALL_ROOT" --format '{{ "{{" }}.Names{{ "}}" }}' 2>/dev/null || true)"
   [ -z "$managed" ] || docker rm -f $managed >/dev/null 2>&1 || true
   docker rm -f "$INGRESS_CONTAINER" >/dev/null 2>&1 || true

@@ -88,16 +88,10 @@ if [ -f "$MODEL_FILE" ]; then
 fi
 
 if command -v docker >/dev/null 2>&1 && [ "$MODEL" = "` + orchestrationModelK8sLikeV1 + `" ]; then
-  ingress_running="$(docker inspect -f '{{.State.Running}}' "` + ingressContainerName() + `" 2>/dev/null || echo false)"
-  if [ "$ingress_running" = "true" ]; then
+  if command -v aifar-agent >/dev/null 2>&1 && aifar-agent status >/dev/null 2>&1; then
     INGRESS_RUNNING="true"
   fi
   for service in ` + serviceOrderText() + `; do
-    proxy="aifar-svc-admin-$service"
-    proxy_running="$(docker inspect -f '{{.State.Running}}' "$proxy" 2>/dev/null || echo false)"
-    if [ "$proxy_running" = "true" ]; then
-      SERVICE_PROXIES=$((SERVICE_PROXIES + 1))
-    fi
     names="$(docker ps -a --filter "label=aifar.app=aifar" --filter "label=aifar.install-root=$INSTALL_ROOT" --filter "label=aifar.component=pod" --filter "label=aifar.service=$service" --format '{{.Names}}' 2>/dev/null || true)"
     for name in $names; do
       TOTAL=$((TOTAL + 1))
@@ -113,7 +107,10 @@ if command -v docker >/dev/null 2>&1 && [ "$MODEL" = "` + orchestrationModelK8sL
       fi
     done
   done
-  if [ "$TOTAL" -gt 0 ] && [ "$RUNNING" -eq "$TOTAL" ] && [ "$UNHEALTHY" -eq 0 ] && [ "$INGRESS_RUNNING" = "true" ] && [ "$SERVICE_PROXIES" -gt 0 ]; then
+  if [ "$INGRESS_RUNNING" = "true" ]; then
+    SERVICE_PROXIES=$RUNNING
+  fi
+  if [ "$TOTAL" -gt 0 ] && [ "$RUNNING" -eq "$TOTAL" ] && [ "$UNHEALTHY" -eq 0 ] && [ "$INGRESS_RUNNING" = "true" ]; then
     STATUS="running"
   elif [ "$RUNNING" -gt 0 ]; then
     STATUS="degraded"

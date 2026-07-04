@@ -270,7 +270,7 @@ func installedAIFARInstance(t *testing.T) store.AppInstance {
 		"services":              serviceOrder,
 		"gatewayPort":           defaultGatewayPort,
 		"webPort":               defaultWebPort,
-		"nacosRegistrationMode": "service-proxy",
+		"nacosRegistrationMode": "agent-proxy",
 	}
 	for key, value := range releaseOrchestrationMetadata("/aifar/apps/admin", releaseID, defaultNetworkName, defaultGatewayPort, defaultWebPort, serviceOrder) {
 		metadata[key] = value
@@ -577,11 +577,11 @@ func TestServiceInstallsAIFARServiceFromDockerAppsBundle(t *testing.T) {
 	if metadata["layout"] != releaseLayout || metadata["releaseId"] == "" || metadata["releaseRetention"].(float64) != releaseKeepCount {
 		t.Fatalf("expected release layout metadata, got %s", instance.Metadata)
 	}
-	if metadata["composeProject"] == "" || metadata["ingressContainer"] != ingressContainerName() || metadata["ingressNetwork"] != defaultNetworkName || metadata["internalNetwork"] == "" {
+	if metadata["composeProject"] == "" || metadata["runtimeService"] != "aifar-agent" || metadata["ingressNetwork"] != defaultNetworkName || metadata["internalNetwork"] == "" {
 		t.Fatalf("expected orchestration metadata, got %s", instance.Metadata)
 	}
-	if metadata["orchestrationModel"] != orchestrationModelK8sLikeV1 || !strings.Contains(instance.Metadata, "aifar-svc-admin-gateway") || !strings.Contains(instance.Metadata, "aifar-pod-admin-gateway") {
-		t.Fatalf("expected k8s-like service proxy and pod metadata, got %s", instance.Metadata)
+	if metadata["orchestrationModel"] != orchestrationModelK8sLikeV1 || !strings.Contains(instance.Metadata, "agent-proxy") || strings.Contains(instance.Metadata, "aifar-svc-admin-gateway") || !strings.Contains(instance.Metadata, "aifar-pod-admin-gateway") {
+		t.Fatalf("expected k8s-like agent proxy and pod metadata, got %s", instance.Metadata)
 	}
 	if len(s.releases) != 1 || s.releases[0].InstanceID != instance.ID || s.releases[0].Status != "success" {
 		t.Fatalf("expected one recorded release, got %+v", s.releases)
@@ -592,29 +592,22 @@ func TestServiceInstallsAIFARServiceFromDockerAppsBundle(t *testing.T) {
 	for _, want := range []string{
 		`ORCHESTRATION_MODEL="k8s-like-v1"`,
 		`RUNTIME_DIR="$INSTALL_ROOT/runtime"`,
-		`start_service_proxy`,
+		`NACOS_REGISTRATION_MODE="agent-proxy"`,
 		`register_nacos_proxy`,
 		`SPRING_CLOUD_NACOS_DISCOVERY_REGISTER_ENABLED "false"`,
 		`start_pod "$service" 1`,
-		`write_service_proxy_config "$service"`,
 		`reconcile_ingress`,
 		`aifar-agent reconcile-ingress --spec "$spec"`,
 		`runtime-spec.json`,
+		`"services": [`,
+		`"gatewayService": "gateway"`,
+		`remove_runtime_infra_containers`,
 		`container_status()`,
 		`docker inspect --format '{{.State.Status}}'`,
 		`docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{end}}'`,
 		`docker logs --tail 120 "$container"`,
 		`curl -sS --connect-timeout %s -o /dev/null %s://%s:%s/ || exit 1`,
-		`cat "$tmp" > "$conf"`,
-		`health="$(container_health "$name")"`,
-		`start_ingress`,
-		`verify_ingress_ports`,
-		`AIFAR Ingress started`,
-		`upstream aifar_gateway_service`,
-		`proxy_pass http://aifar_gateway_service;`,
-		`proxy_pass http://aifar_web_service;`,
-		`-p "${GATEWAY_PORT}:${GATEWAY_PORT}"`,
-		`-p "${WEB_VUE3_PORT}:${WEB_VUE3_PORT}"`,
+		`health="$(container_health "$container")"`,
 	} {
 		if !strings.Contains(remote.installScript, want) {
 			t.Fatalf("AIFAR install script should include k8s-like orchestration with %q:\n%s", want, remote.installScript)
@@ -929,10 +922,9 @@ func TestServiceUpdatesAIFARServiceArtifactAsPartialRelease(t *testing.T) {
 		`apply_artifact`,
 		`docker build -t "$image" "$APP_DIR/$SERVICE_NAME"`,
 		`start_pod "$replica"`,
-		`write_service_proxy_config "$SERVICE_NAME" "$REVISION"`,
-		`reload_service_proxy`,
+		`reconcile_runtime`,
+		`aifar-agent reconcile-ingress --spec "$spec"`,
 		`stop_old_pods`,
-		`cat "$tmp" > "$conf"`,
 		`curl -sS --connect-timeout $health_connect_timeout -o /dev/null ${health_protocol}://${health_host}:${port}/ || exit 1`,
 		`APP_STARTUP_TIMEOUT 300`,
 		`"kind": "rollout"`,
@@ -1082,10 +1074,9 @@ func TestServiceUpdatesAIFARArtifactBundleAsSingleMultiServicePartialRelease(t *
 		`run_parallel_group "$non_entry"`,
 		`service_changed gateway && rollout_service gateway`,
 		`service_changed web-vue3 && rollout_service web-vue3`,
-		`write_service_proxy_config "$service"`,
-		`reload_service_proxy "$service"`,
+		`reconcile_runtime`,
+		`aifar-agent reconcile-ingress --spec "$spec"`,
 		`stop_old_pods "$service"`,
-		`cat "$tmp" > "$conf"`,
 		`curl -sS --connect-timeout $health_connect_timeout -o /dev/null ${health_protocol}://${health_host}:${port}/ || exit 1`,
 		`APP_STARTUP_TIMEOUT 300`,
 		`"kind": "rollout-bundle"`,
@@ -1568,13 +1559,13 @@ func TestParseStatusOutputIncludesIngressAndStaleContainers(t *testing.T) {
 	}
 }
 
-func TestStatusCommandScansK8sLikePodsAndServiceProxies(t *testing.T) {
+func TestStatusCommandScansK8sLikePodsAndAgentRuntime(t *testing.T) {
 	command := statusCommand("/aifar/apps/admin")
 	for _, want := range []string{
 		`MODEL_FILE="$INSTALL_ROOT/.aifar/model.json"`,
 		`[ "$MODEL" = "k8s-like-v1" ]`,
+		`aifar-agent status`,
 		`label=aifar.component=pod`,
-		`proxy="aifar-svc-admin-$service"`,
 		`serviceProxies=$SERVICE_PROXIES`,
 	} {
 		if !strings.Contains(command, want) {

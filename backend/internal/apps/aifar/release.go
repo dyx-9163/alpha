@@ -334,12 +334,14 @@ func activeEndpointsFromMetadata(metadata map[string]any) map[string]any {
 func releaseRoutes(releaseID string, gatewayPort, webPort int) map[string]any {
 	return map[string]any{
 		"gateway": map[string]any{
-			"container": serviceProxyName("gateway"),
-			"port":      gatewayPort,
+			"systemdService": "aifar-agent",
+			"service":        "gateway",
+			"port":           gatewayPort,
 		},
 		"web-vue3": map[string]any{
-			"container": serviceProxyName("web-vue3"),
-			"port":      webPort,
+			"systemdService": "aifar-agent",
+			"service":        "web-vue3",
+			"port":           webPort,
 		},
 	}
 }
@@ -351,8 +353,8 @@ func releaseOrchestrationMetadata(installRoot, releaseID, ingressNetwork string,
 	serviceProxies := map[string]any{}
 	for _, service := range services {
 		serviceProxies[service] = map[string]any{
-			"container": serviceProxyName(service),
-			"port":      serviceDefaultPort(service, gatewayPort, webPort),
+			"systemdService": "aifar-agent",
+			"port":           serviceDefaultPort(service, gatewayPort, webPort),
 		}
 	}
 	return map[string]any{
@@ -360,7 +362,7 @@ func releaseOrchestrationMetadata(installRoot, releaseID, ingressNetwork string,
 		"composeProject":     composeProjectName(releaseID),
 		"ingressNetwork":     ingressNetwork,
 		"internalNetwork":    releaseInternalNetworkName(releaseID),
-		"ingressContainer":   ingressContainerName(),
+		"runtimeService":     "aifar-agent",
 		"ingressConfigPath":  ingressConfigPath(installRoot),
 		"serviceProxies":     serviceProxies,
 		"activeRoutes":       releaseRoutes(releaseID, gatewayPort, webPort),
