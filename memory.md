@@ -667,3 +667,5 @@
 - 结论：根因是开发态后端从 `backend/` 目录启动时只查找了 `backend/bin`，没有找到仓库根目录 `bin/aifar-agent-linux-amd64`；已新增共享 `agentdist.FindBinary`，AIFAR/Docker 安装统一从当前目录、父级 `bin`、`deploy/bin` 和打包目录查找 agent。
 - 问题：用户贴出 `aifar-agent service is not reachable after installation`，但目标机 `ss -lntp` 显示 `aifar-agent` 已监听 `127.0.0.1:18081`。
 - 结论：根因是 `aifar-agent status` 的 `/status` handler 还会执行 `docker info`，导致 agent API 已启动但 Docker 健康探测失败时被误报为不可达；已将 `/status` 改为只返回 agent 自身运行状态，Docker 探测保留在 `/health`，并让安装脚本等待 agent API 就绪后再继续。
+- 问题：用户部署成功后截图显示只有 `127.0.0.1:18081` 的 `aifar-agent` 控制端口，没有 `8080/38000` 入口端口，询问是否能访问。
+- 结论：当前状态还不能外部访问，说明业务 Pod 已启动但 agent 数据面没有生效；AIFAR 安装脚本已改为只要上传了 agent 二进制就强制升级/重启 systemd agent，并在 `reconcile-ingress` 后校验 `GATEWAY_PORT` 和 `WEB_VUE3_PORT` 已监听，避免旧 agent 被跳过升级。

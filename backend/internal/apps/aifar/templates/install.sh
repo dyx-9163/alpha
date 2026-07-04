@@ -201,12 +201,14 @@ wait_agent_status() {
 }
 
 install_agent_dependency() {
-  if agent_status_ok; then
-    echo "aifar-agent is already running"
-    return 0
+  if [ -z "$AGENT_BINARY" ] || [ ! -f "$AGENT_BINARY" ]; then
+    if agent_status_ok; then
+      echo "aifar-agent is already running"
+      return 0
+    fi
+    fail "aifar-agent is not installed and no agent binary was uploaded; rebuild the backend or use a release package containing bin/aifar-agent-linux-amd64"
   fi
-  [ -n "$AGENT_BINARY" ] && [ -f "$AGENT_BINARY" ] || fail "aifar-agent is not installed and no agent binary was uploaded; rebuild the backend or use a release package containing bin/aifar-agent-linux-amd64"
-  echo "installing AIFAR runtime agent"
+  echo "installing or upgrading AIFAR runtime agent"
   $SUDO mkdir -p /etc/aifar /var/lib/aifar-agent /var/log/aifar-agent
   $SUDO install -m 0755 "$AGENT_BINARY" /usr/local/bin/aifar-agent
   cat > "$WORK_DIR/aifar-agent.service" <<SERVICE
@@ -228,7 +230,13 @@ WantedBy=multi-user.target
 SERVICE
   $SUDO install -m 0644 "$WORK_DIR/aifar-agent.service" /etc/systemd/system/aifar-agent.service
   $SUDO systemctl daemon-reload
-  if ! $SUDO systemctl enable --now aifar-agent; then
+  if $SUDO systemctl is-active --quiet aifar-agent; then
+    $SUDO systemctl enable aifar-agent >/dev/null 2>&1 || true
+    agent_start_cmd="restart"
+  else
+    agent_start_cmd="enable --now"
+  fi
+  if ! $SUDO systemctl $agent_start_cmd aifar-agent; then
     echo "AIFAR runtime agent service failed to start"
     $SUDO systemctl --no-pager --full status aifar-agent || true
     $SUDO journalctl -u aifar-agent -n 80 --no-pager || true
@@ -550,6 +558,22 @@ reconcile_ingress() {
   spec="$(write_runtime_spec)"
   echo "reconciling AIFAR runtime through aifar-agent: $spec"
   aifar-agent reconcile-ingress --spec "$spec"
+  wait_runtime_ports
+}
+
+wait_runtime_ports() {
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do
+    if tcp_probe 127.0.0.1 "$GATEWAY_PORT" && tcp_probe 127.0.0.1 "$WEB_VUE3_PORT"; then
+      echo "AIFAR runtime ingress ports are listening: gateway=$GATEWAY_PORT web=$WEB_VUE3_PORT"
+      return 0
+    fi
+    sleep 1
+  done
+  echo "AIFAR runtime ingress ports are not listening after reconcile"
+  aifar-agent status || true
+  $SUDO systemctl --no-pager --full status aifar-agent || true
+  $SUDO journalctl -u aifar-agent -n 80 --no-pager || true
+  return 1
 }
 
 write_model_manifest() {
