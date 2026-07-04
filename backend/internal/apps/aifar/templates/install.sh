@@ -328,7 +328,8 @@ patch_web_nginx_gateway_target() {
   [ -n "$gateway_container" ] || fail "gateway container name is empty for web nginx config"
   [ -n "$gateway_port" ] || gateway_port="$GATEWAY_PORT"
   tmp="$nginx_conf.tmp"
-  sed "s#http://aifar-gateway:[0-9][0-9]*#http://${gateway_container}:${gateway_port}#g; s#http://aifar-gateway#http://${gateway_container}:${gateway_port}#g" "$nginx_conf" > "$tmp"
+  placeholder="__AIFAR_GATEWAY_UPSTREAM__"
+  sed "s#http://aifar-gateway[-A-Za-z0-9_.]*:[0-9][0-9]*#${placeholder}#g; s#http://aifar-gateway[-A-Za-z0-9_.]*#${placeholder}#g; s#${placeholder}#http://${gateway_container}:${gateway_port}#g" "$nginx_conf" > "$tmp"
   mv "$tmp" "$nginx_conf"
 }
 

@@ -613,3 +613,5 @@
 ## 2026-07-04
 - 问题：用户要求删除应用商店里的“更新”模块/入口，服务更新改到容器模块执行。
 - 结论：应用商店已移除“更新”Tab、已安装列表的“更新服务”按钮和 AIFAR 更新弹窗；容器列表改为基于 Docker labels 识别 AIFAR 容器，在对应行展示“更新服务”，并复用 AIFAR 单服务/批量包制品更新接口；后端容器列表现在返回 labels 以便前端匹配 `aifar.service` 和 `aifar.install-root`。
+- 问题：用户上传 AIFAR 安装失败日志，所有容器启动后 `web-vue3` 反复 `is not running: exited`，最终 release 健康检查失败并清理容器。
+- 结论：根因是前端 nginx upstream 替换脚本存在二次替换风险，动态 gateway 容器名以 `aifar-gateway` 开头，第二个 sed 表达式会再次匹配并生成畸形 `proxy_pass`；已改为占位符三段替换，安装、单服务更新和批量更新均兼容静态 `aifar-gateway` 与旧动态 gateway upstream。
