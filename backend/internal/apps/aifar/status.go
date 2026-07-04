@@ -13,6 +13,7 @@ type StatusResult struct {
 	Status              string
 	Message             string
 	InstallRoot         string
+	OrchestrationModel  string
 	CurrentRelease      string
 	ReleaseID           string
 	InstallRootExists   bool
@@ -21,6 +22,7 @@ type StatusResult struct {
 	UnhealthyContainers int
 	StaleContainers     int
 	IngressRunning      bool
+	ServiceProxies      int
 	Containers          []string
 }
 
@@ -55,11 +57,9 @@ func statusCommand(installRoot string) string {
 set -u
 
 INSTALL_ROOT=` + installerkit.ShellQuote(installRoot) + `
-CURRENT_LINK="$INSTALL_ROOT/` + currentLinkName + `"
-CURRENT_RELEASE=""
+MODEL_FILE="$INSTALL_ROOT/.aifar/model.json"
+MODEL=""
 RELEASE_ID=""
-APP_DIR="$INSTALL_ROOT/` + appBundleDir + `"
-ENV_DIR=""
 STATUS="missing"
 INSTALL_ROOT_EXISTS="false"
 TOTAL=0
@@ -67,8 +67,8 @@ RUNNING=0
 UNHEALTHY=0
 STALE=0
 INGRESS_RUNNING="false"
+SERVICE_PROXIES=0
 CONTAINERS=""
-ACTIVE_RELEASE_IDS=""
 
 manifest_json_value() {
   mjv_file="$1"
@@ -77,55 +77,51 @@ manifest_json_value() {
   awk -F\" -v key="$mjv_key" '$0 ~ "\"" key "\"[[:space:]]*:" {print $4; exit}' "$mjv_file" 2>/dev/null
 }
 
-release_by_id() {
-  rbi_id="$1"
-  [ -n "$rbi_id" ] || return 1
-  rbi_dir="$INSTALL_ROOT/` + releasesDirName + `/$rbi_id"
-  [ -d "$rbi_dir" ] || return 1
-  printf "%s" "$rbi_dir"
-}
-
-release_chain_ids() {
-  rci_dir="$1"
-  rci_seen=""
-  while [ -n "$rci_dir" ] && [ -d "$rci_dir" ]; do
-    rci_id="$(basename "$rci_dir")"
-    case " $rci_seen " in
-      *" $rci_id "*) break ;;
-    esac
-    rci_seen="$rci_seen $rci_id"
-    printf "%s\n" "$rci_id"
-    rci_base="$(manifest_json_value "$rci_dir/.aifar/manifest.json" baseReleaseId || true)"
-    rci_dir="$(release_by_id "$rci_base" || true)"
-  done
-}
-
 if [ -d "$INSTALL_ROOT" ]; then
   INSTALL_ROOT_EXISTS="true"
   STATUS="stopped"
 fi
 
-if [ -L "$CURRENT_LINK" ] || [ -d "$CURRENT_LINK" ]; then
-  CURRENT_RELEASE="$(readlink -f "$CURRENT_LINK" 2>/dev/null || printf "%s" "$CURRENT_LINK")"
-  APP_DIR="$CURRENT_LINK/` + appBundleDir + `"
-  ENV_DIR="$CURRENT_LINK/` + releaseEnvDirName + `"
-  if [ -f "$CURRENT_LINK/.aifar/manifest.json" ]; then
-    RELEASE_ID="$(manifest_json_value "$CURRENT_LINK/.aifar/manifest.json" releaseId || true)"
-  fi
-  ACTIVE_RELEASE_IDS="$(release_chain_ids "$CURRENT_RELEASE" | tr '\n' ' ' || true)"
+if [ -f "$MODEL_FILE" ]; then
+  MODEL="$(manifest_json_value "$MODEL_FILE" model || true)"
+  RELEASE_ID="$(manifest_json_value "$MODEL_FILE" revision || true)"
 fi
 
-if command -v docker >/dev/null 2>&1 && { [ -d "$APP_DIR" ] || [ -d "$ENV_DIR" ]; }; then
+if command -v docker >/dev/null 2>&1 && [ "$MODEL" = "` + orchestrationModelK8sLikeV1 + `" ]; then
   ingress_running="$(docker inspect -f '{{.State.Running}}' "` + ingressContainerName() + `" 2>/dev/null || echo false)"
   if [ "$ingress_running" = "true" ]; then
     INGRESS_RUNNING="true"
   fi
   for service in ` + serviceOrderText() + `; do
-    env_file="$ENV_DIR/$service.env"
-    [ -f "$env_file" ] || env_file="$APP_DIR/$service/.env"
-    [ -f "$env_file" ] || continue
-    name="$(awk -F= '$1=="APP_CONTAINER_NAME"{print $2}' "$env_file" | tail -n 1)"
-    [ -n "$name" ] || continue
+    proxy="aifar-svc-admin-$service"
+    proxy_running="$(docker inspect -f '{{.State.Running}}' "$proxy" 2>/dev/null || echo false)"
+    if [ "$proxy_running" = "true" ]; then
+      SERVICE_PROXIES=$((SERVICE_PROXIES + 1))
+    fi
+    names="$(docker ps -a --filter "label=aifar.app=aifar" --filter "label=aifar.install-root=$INSTALL_ROOT" --filter "label=aifar.component=pod" --filter "label=aifar.service=$service" --format '{{.Names}}' 2>/dev/null || true)"
+    for name in $names; do
+      TOTAL=$((TOTAL + 1))
+      running="$(docker inspect -f '{{.State.Running}}' "$name" 2>/dev/null || echo false)"
+      health="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{end}}' "$name" 2>/dev/null || true)"
+      revision="$(docker inspect -f '{{index .Config.Labels "aifar.revision"}}' "$name" 2>/dev/null || true)"
+      CONTAINERS="${CONTAINERS}${service}:${name}:${revision}:${running}:${health},"
+      if [ "$running" = "true" ]; then
+        RUNNING=$((RUNNING + 1))
+      fi
+      if [ "$health" = "unhealthy" ]; then
+        UNHEALTHY=$((UNHEALTHY + 1))
+      fi
+    done
+  done
+  if [ "$TOTAL" -gt 0 ] && [ "$RUNNING" -eq "$TOTAL" ] && [ "$UNHEALTHY" -eq 0 ] && [ "$INGRESS_RUNNING" = "true" ] && [ "$SERVICE_PROXIES" -gt 0 ]; then
+    STATUS="running"
+  elif [ "$RUNNING" -gt 0 ]; then
+    STATUS="degraded"
+  fi
+elif command -v docker >/dev/null 2>&1 && [ "$INSTALL_ROOT_EXISTS" = "true" ]; then
+  MODEL="` + legacyOrchestrationModel + `"
+  names="$(docker ps -a --filter "label=aifar.app=aifar" --filter "label=aifar.install-root=$INSTALL_ROOT" --format '{{.Names}}' 2>/dev/null || true)"
+  for name in $names; do
     TOTAL=$((TOTAL + 1))
     running="$(docker inspect -f '{{.State.Running}}' "$name" 2>/dev/null || echo false)"
     health="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{end}}' "$name" 2>/dev/null || true)"
@@ -137,21 +133,6 @@ if command -v docker >/dev/null 2>&1 && { [ -d "$APP_DIR" ] || [ -d "$ENV_DIR" ]
       UNHEALTHY=$((UNHEALTHY + 1))
     fi
   done
-  if [ -n "$RELEASE_ID" ]; then
-    stale_lines="$(docker ps --filter "label=aifar.app=aifar" --filter "label=aifar.install-root=$INSTALL_ROOT" --format '{{.Names}}|{{.Label "aifar.release"}}' 2>/dev/null || true)"
-    if [ -n "$stale_lines" ]; then
-      while IFS='|' read -r stale_name stale_release; do
-        [ -n "$stale_name" ] || continue
-        [ "$stale_release" = "ingress" ] && continue
-        case " $ACTIVE_RELEASE_IDS " in
-          *" $stale_release "*) continue ;;
-        esac
-        STALE=$((STALE + 1))
-      done <<EOF
-$stale_lines
-EOF
-    fi
-  fi
   if [ "$TOTAL" -gt 0 ] && [ "$RUNNING" -eq "$TOTAL" ] && [ "$UNHEALTHY" -eq 0 ] && [ "$INGRESS_RUNNING" = "true" ]; then
     STATUS="running"
   elif [ "$RUNNING" -gt 0 ]; then
@@ -161,13 +142,15 @@ fi
 
 echo "status=$STATUS"
 echo "installRootExists=$INSTALL_ROOT_EXISTS"
-echo "currentRelease=$CURRENT_RELEASE"
+echo "orchestrationModel=$MODEL"
+echo "currentRelease="
 echo "releaseId=$RELEASE_ID"
 echo "totalContainers=$TOTAL"
 echo "runningContainers=$RUNNING"
 echo "unhealthyContainers=$UNHEALTHY"
 echo "staleContainers=$STALE"
 echo "ingressRunning=$INGRESS_RUNNING"
+echo "serviceProxies=$SERVICE_PROXIES"
 echo "containers=$CONTAINERS"
 ` + "\nAIFAR_SERVICE_STATUS"
 }
@@ -184,6 +167,8 @@ func parseStatusOutput(output string) StatusResult {
 			result.Status = strings.TrimSpace(value)
 		case "installRootExists":
 			result.InstallRootExists = strings.EqualFold(strings.TrimSpace(value), "true")
+		case "orchestrationModel":
+			result.OrchestrationModel = strings.TrimSpace(value)
 		case "currentRelease":
 			result.CurrentRelease = strings.TrimSpace(value)
 		case "releaseId":
@@ -198,6 +183,8 @@ func parseStatusOutput(output string) StatusResult {
 			result.StaleContainers = atoi(value)
 		case "ingressRunning":
 			result.IngressRunning = strings.EqualFold(strings.TrimSpace(value), "true")
+		case "serviceProxies":
+			result.ServiceProxies = atoi(value)
 		case "containers":
 			result.Containers = parseContainers(value)
 		}
@@ -298,37 +285,38 @@ type CheckCopy struct {
 }
 
 type UpdateCopy struct {
-	ValidateRequest        string
-	UploadArtifactStep     string
-	ApplyUpdate            string
-	RecordRelease          string
-	StepStart              string
-	StepDone               string
-	StepFailed             string
-	TargetRequired         string
-	UnsupportedInstance    string
-	UnsupportedService     string
-	ArtifactRequired       string
-	ArtifactTypeInvalid    string
-	BundleRequired         string
-	BundleManifestRequired string
-	BundleEmpty            string
-	BundleInvalid          string
-	BundleDuplicateService string
-	BundleArtifactMissing  string
-	PrepareWorkDir         string
-	UploadArtifact         string
-	UploadArtifactFailed   string
-	UploadScript           string
-	UploadScriptFailed     string
-	Deploying              string
-	RemoteCommandFailed    string
-	UpdateFailed           string
-	RecordFailed           string
-	Updated                string
-	BundleUpdating         string
-	BundleServiceUpdating  string
-	BundleUpdated          string
+	ValidateRequest         string
+	UploadArtifactStep      string
+	ApplyUpdate             string
+	RecordRelease           string
+	StepStart               string
+	StepDone                string
+	StepFailed              string
+	TargetRequired          string
+	UnsupportedInstance     string
+	UnsupportedService      string
+	ArtifactRequired        string
+	ArtifactTypeInvalid     string
+	BundleRequired          string
+	BundleManifestRequired  string
+	BundleEmpty             string
+	BundleInvalid           string
+	BundleDuplicateService  string
+	BundleArtifactMissing   string
+	LegacyUpdateUnsupported string
+	PrepareWorkDir          string
+	UploadArtifact          string
+	UploadArtifactFailed    string
+	UploadScript            string
+	UploadScriptFailed      string
+	Deploying               string
+	RemoteCommandFailed     string
+	UpdateFailed            string
+	RecordFailed            string
+	Updated                 string
+	BundleUpdating          string
+	BundleServiceUpdating   string
+	BundleUpdated           string
 }
 
 func copyFor(lang string) Copy {
@@ -399,71 +387,73 @@ func copyFor(lang string) Copy {
 func updateCopyFor(lang string) UpdateCopy {
 	if normalizeLanguage(lang) == "en" {
 		return UpdateCopy{
-			ValidateRequest:        "validate AIFAR service artifact",
-			UploadArtifactStep:     "upload service artifact",
-			ApplyUpdate:            "create partial release and update service",
-			RecordRelease:          "record partial release",
-			StepStart:              "AIFAR update step %d/%d started: %s",
-			StepDone:               "AIFAR update step %d/%d completed: %s",
-			StepFailed:             "AIFAR update step %d/%d failed: %s: %v",
-			TargetRequired:         "AIFAR service update requires a target server",
-			UnsupportedInstance:    "only AIFAR service instances support artifact updates",
-			UnsupportedService:     "unsupported AIFAR service: %s",
-			ArtifactRequired:       "service artifact file is required",
-			ArtifactTypeInvalid:    "artifact type is invalid for %s",
-			BundleRequired:         "artifact bundle zip file is required",
-			BundleManifestRequired: "artifact bundle manifest.json is required",
-			BundleEmpty:            "artifact bundle does not contain any service artifact",
-			BundleInvalid:          "artifact bundle is invalid: %v",
-			BundleDuplicateService: "duplicate service in artifact bundle: %s",
-			BundleArtifactMissing:  "artifact file is missing from bundle: %s",
-			PrepareWorkDir:         "preparing remote update work directory: %s",
-			UploadArtifact:         "uploading %s artifact: %s",
-			UploadArtifactFailed:   "upload AIFAR service artifact",
-			UploadScript:           "uploading AIFAR service update script",
-			UploadScriptFailed:     "upload AIFAR service update script",
-			Deploying:              "updating AIFAR service %s as a partial release",
-			RemoteCommandFailed:    "AIFAR partial update remote command failed",
-			UpdateFailed:           "AIFAR service update failed: %v",
-			RecordFailed:           "record AIFAR partial release failed: %v",
-			Updated:                "AIFAR service updated, release recorded: %s",
-			BundleUpdating:         "updating %d AIFAR service artifact(s) from bundle",
-			BundleServiceUpdating:  "bundle update service %d/%d: %s",
-			BundleUpdated:          "AIFAR artifact bundle update completed on %s, services: %d",
+			ValidateRequest:         "validate AIFAR service artifact",
+			UploadArtifactStep:      "upload service artifact",
+			ApplyUpdate:             "roll out AIFAR Deployment revision",
+			RecordRelease:           "record rollout revision",
+			StepStart:               "AIFAR update step %d/%d started: %s",
+			StepDone:                "AIFAR update step %d/%d completed: %s",
+			StepFailed:              "AIFAR update step %d/%d failed: %s: %v",
+			TargetRequired:          "AIFAR service update requires a target server",
+			UnsupportedInstance:     "only AIFAR service instances support artifact updates",
+			UnsupportedService:      "unsupported AIFAR service: %s",
+			ArtifactRequired:        "service artifact file is required",
+			ArtifactTypeInvalid:     "artifact type is invalid for %s",
+			BundleRequired:          "artifact bundle zip file is required",
+			BundleManifestRequired:  "artifact bundle manifest.json is required",
+			BundleEmpty:             "artifact bundle does not contain any service artifact",
+			BundleInvalid:           "artifact bundle is invalid: %v",
+			BundleDuplicateService:  "duplicate service in artifact bundle: %s",
+			BundleArtifactMissing:   "artifact file is missing from bundle: %s",
+			LegacyUpdateUnsupported: "legacy AIFAR orchestration model %s does not support rolling updates; reinstall with k8s-like orchestration first",
+			PrepareWorkDir:          "preparing remote update work directory: %s",
+			UploadArtifact:          "uploading %s artifact: %s",
+			UploadArtifactFailed:    "upload AIFAR service artifact",
+			UploadScript:            "uploading AIFAR service update script",
+			UploadScriptFailed:      "upload AIFAR service update script",
+			Deploying:               "rolling out AIFAR service %s",
+			RemoteCommandFailed:     "AIFAR rollout remote command failed",
+			UpdateFailed:            "AIFAR service update failed: %v",
+			RecordFailed:            "record AIFAR rollout revision failed: %v",
+			Updated:                 "AIFAR service rollout recorded: %s",
+			BundleUpdating:          "updating %d AIFAR service artifact(s) from bundle",
+			BundleServiceUpdating:   "bundle update service %d/%d: %s",
+			BundleUpdated:           "AIFAR artifact bundle update completed on %s, services: %d",
 		}
 	}
 	return UpdateCopy{
-		ValidateRequest:        "校验 AIFAR 服务制品",
-		UploadArtifactStep:     "上传服务制品",
-		ApplyUpdate:            "创建部分更新版本并更新服务",
-		RecordRelease:          "记录部分更新版本",
-		StepStart:              "AIFAR 更新步骤 %d/%d 开始：%s",
-		StepDone:               "AIFAR 更新步骤 %d/%d 完成：%s",
-		StepFailed:             "AIFAR 更新步骤 %d/%d 失败：%s：%v",
-		TargetRequired:         "AIFAR 服务更新需要目标服务器",
-		UnsupportedInstance:    "只有 AIFAR 服务实例支持制品更新",
-		UnsupportedService:     "不支持的 AIFAR 服务：%s",
-		ArtifactRequired:       "请选择服务制品文件",
-		ArtifactTypeInvalid:    "%s 的制品类型不正确",
-		BundleRequired:         "请选择 AIFAR 制品批量包 zip 文件",
-		BundleManifestRequired: "AIFAR 制品批量包缺少 manifest.json",
-		BundleEmpty:            "AIFAR 制品批量包没有包含任何服务制品",
-		BundleInvalid:          "AIFAR 制品批量包无效：%v",
-		BundleDuplicateService: "AIFAR 制品批量包中服务重复：%s",
-		BundleArtifactMissing:  "AIFAR 制品批量包中缺少制品文件：%s",
-		PrepareWorkDir:         "准备远程更新工作目录：%s",
-		UploadArtifact:         "上传 %s 制品：%s",
-		UploadArtifactFailed:   "上传 AIFAR 服务制品失败",
-		UploadScript:           "上传 AIFAR 服务更新脚本",
-		UploadScriptFailed:     "上传 AIFAR 服务更新脚本失败",
-		Deploying:              "正在以部分版本更新 AIFAR 服务 %s",
-		RemoteCommandFailed:    "AIFAR 部分更新远程命令执行失败",
-		UpdateFailed:           "AIFAR 服务更新失败：%v",
-		RecordFailed:           "记录 AIFAR 部分更新版本失败：%v",
-		Updated:                "AIFAR 服务已更新，版本已记录：%s",
-		BundleUpdating:         "正在从批量包更新 %d 个 AIFAR 服务制品",
-		BundleServiceUpdating:  "批量更新服务 %d/%d：%s",
-		BundleUpdated:          "AIFAR 批量制品更新完成，目标：%s，服务数：%d",
+		ValidateRequest:         "校验 AIFAR 服务制品",
+		UploadArtifactStep:      "上传服务制品",
+		ApplyUpdate:             "滚动发布 AIFAR Deployment revision",
+		RecordRelease:           "记录滚动发布 revision",
+		StepStart:               "AIFAR 更新步骤 %d/%d 开始：%s",
+		StepDone:                "AIFAR 更新步骤 %d/%d 完成：%s",
+		StepFailed:              "AIFAR 更新步骤 %d/%d 失败：%s：%v",
+		TargetRequired:          "AIFAR 服务更新需要目标服务器",
+		UnsupportedInstance:     "只有 AIFAR 服务实例支持制品更新",
+		UnsupportedService:      "不支持的 AIFAR 服务：%s",
+		ArtifactRequired:        "请选择服务制品文件",
+		ArtifactTypeInvalid:     "%s 的制品类型不正确",
+		BundleRequired:          "请选择 AIFAR 制品批量包 zip 文件",
+		BundleManifestRequired:  "AIFAR 制品批量包缺少 manifest.json",
+		BundleEmpty:             "AIFAR 制品批量包没有包含任何服务制品",
+		BundleInvalid:           "AIFAR 制品批量包无效：%v",
+		BundleDuplicateService:  "AIFAR 制品批量包中服务重复：%s",
+		BundleArtifactMissing:   "AIFAR 制品批量包中缺少制品文件：%s",
+		LegacyUpdateUnsupported: "旧 AIFAR 编排模型 %s 不支持滚动更新，请先使用 k8s-like 编排重新安装",
+		PrepareWorkDir:          "准备远程更新工作目录：%s",
+		UploadArtifact:          "上传 %s 制品：%s",
+		UploadArtifactFailed:    "上传 AIFAR 服务制品失败",
+		UploadScript:            "上传 AIFAR 服务更新脚本",
+		UploadScriptFailed:      "上传 AIFAR 服务更新脚本失败",
+		Deploying:               "正在滚动发布 AIFAR 服务 %s",
+		RemoteCommandFailed:     "AIFAR 滚动发布远程命令执行失败",
+		UpdateFailed:            "AIFAR 服务更新失败：%v",
+		RecordFailed:            "记录 AIFAR 滚动发布 revision 失败：%v",
+		Updated:                 "AIFAR 服务滚动发布已记录：%s",
+		BundleUpdating:          "正在从批量包更新 %d 个 AIFAR 服务制品",
+		BundleServiceUpdating:   "批量更新服务 %d/%d：%s",
+		BundleUpdated:           "AIFAR 批量制品更新完成，目标：%s，服务数：%d",
 	}
 }
 

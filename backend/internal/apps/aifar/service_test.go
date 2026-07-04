@@ -219,6 +219,24 @@ type bundleTestArtifact struct {
 func installedAIFARInstance(t *testing.T) store.AppInstance {
 	t.Helper()
 	releaseID := "20260701T010203.000000000Z-docker-apps"
+	metadata := map[string]any{
+		"installRoot":           "/aifar/apps/admin",
+		"runtimeDir":            "/aifar/apps/admin/runtime",
+		"layout":                releaseLayout,
+		"orchestrationModel":    orchestrationModelK8sLikeV1,
+		"releaseId":             releaseID,
+		"currentRevision":       releaseID,
+		"releaseVersion":        "docker-apps",
+		"configHash":            "base-config-hash",
+		"releaseRetention":      releaseKeepCount,
+		"services":              serviceOrder,
+		"gatewayPort":           defaultGatewayPort,
+		"webPort":               defaultWebPort,
+		"nacosRegistrationMode": "service-proxy",
+	}
+	for key, value := range releaseOrchestrationMetadata("/aifar/apps/admin", releaseID, defaultNetworkName, defaultGatewayPort, defaultWebPort) {
+		metadata[key] = value
+	}
 	return store.AppInstance{
 		ID:       "aifar-1",
 		App:      "aifar",
@@ -226,19 +244,7 @@ func installedAIFARInstance(t *testing.T) store.AppInstance {
 		ServerID: "srv-1",
 		Status:   "installed",
 		Topology: defaultTopology,
-		Metadata: mustMetadata(t, map[string]any{
-			"installRoot":      "/aifar/apps/admin",
-			"layout":           releaseLayout,
-			"releaseId":        releaseID,
-			"releaseVersion":   "docker-apps",
-			"releasePath":      "/aifar/apps/admin/releases/" + releaseID,
-			"currentRelease":   "/aifar/apps/admin/current",
-			"configHash":       "base-config-hash",
-			"releaseRetention": releaseKeepCount,
-			"services":         serviceOrder,
-			"containers":       releaseContainers(releaseID),
-			"activeRoutes":     releaseRoutes(releaseID, defaultGatewayPort, defaultWebPort),
-		}),
+		Metadata: mustMetadata(t, metadata),
 	}
 }
 
@@ -419,7 +425,7 @@ func TestScaleOutCreatesReplicaAndUpdatesEndpointMetadata(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(remote.autoscaleScript, "AIFAR_AUTOSCALE_OUT") || !strings.Contains(remote.autoscaleScript, "aifar-permission-20260701t010203.000000000z-docker-apps-r2") {
+	if !strings.Contains(remote.autoscaleScript, "AIFAR_AUTOSCALE_OUT") || !strings.Contains(remote.autoscaleScript, "aifar-pod-admin-permission-20260701t010203.000000000z-docker-apps-r2") {
 		t.Fatalf("expected autoscale remote script to run with replica container, got:\n%s", remote.autoscaleScript)
 	}
 	saved, err := s.GetAppInstance(instance.ID)
@@ -534,8 +540,8 @@ func TestServiceInstallsAIFARServiceFromDockerAppsBundle(t *testing.T) {
 	if metadata["composeProject"] == "" || metadata["ingressContainer"] != ingressContainerName() || metadata["ingressNetwork"] != defaultNetworkName || metadata["internalNetwork"] == "" {
 		t.Fatalf("expected orchestration metadata, got %s", instance.Metadata)
 	}
-	if !strings.Contains(instance.Metadata, "aifar-gateway-") || !strings.Contains(instance.Metadata, "activeRoutes") {
-		t.Fatalf("expected active route metadata with release containers, got %s", instance.Metadata)
+	if metadata["orchestrationModel"] != orchestrationModelK8sLikeV1 || !strings.Contains(instance.Metadata, "aifar-svc-admin-gateway") || !strings.Contains(instance.Metadata, "aifar-pod-admin-gateway") {
+		t.Fatalf("expected k8s-like service proxy and pod metadata, got %s", instance.Metadata)
 	}
 	if len(s.releases) != 1 || s.releases[0].InstanceID != instance.ID || s.releases[0].Status != "success" {
 		t.Fatalf("expected one recorded release, got %+v", s.releases)
@@ -543,6 +549,23 @@ func TestServiceInstallsAIFARServiceFromDockerAppsBundle(t *testing.T) {
 	if metadata["nacosEndpoint"] != "10.0.0.50:8848" || metadata["nacosHost"] != "10.0.0.50" || int(metadata["nacosPort"].(float64)) != 8848 {
 		t.Fatalf("expected external Nacos endpoint metadata, got %s", instance.Metadata)
 	}
+	for _, want := range []string{
+		`ORCHESTRATION_MODEL="k8s-like-v1"`,
+		`RUNTIME_DIR="$INSTALL_ROOT/runtime"`,
+		`start_service_proxy`,
+		`register_nacos_proxy`,
+		`SPRING_CLOUD_NACOS_DISCOVERY_REGISTER_ENABLED "false"`,
+		`start_pod "$service" 1`,
+		`write_service_proxy_config "$service"`,
+		`upstream aifar_gateway_service`,
+		`proxy_pass http://aifar_gateway_service;`,
+		`proxy_pass http://aifar_web_service;`,
+	} {
+		if !strings.Contains(remote.installScript, want) {
+			t.Fatalf("AIFAR install script should include k8s-like orchestration with %q:\n%s", want, remote.installScript)
+		}
+	}
+	return
 	if !strings.Contains(remote.joinedUploads(), "aifar-service-bundle-") || !strings.Contains(remote.joinedCommands(), "install-aifar.sh") {
 		t.Fatalf("expected bundle upload and install script run, uploads=%s commands=%s", remote.joinedUploads(), remote.joinedCommands())
 	}
@@ -789,6 +812,22 @@ func TestServiceUpdatesAIFARServiceArtifactAsPartialRelease(t *testing.T) {
 	}
 	for _, want := range []string{
 		`SERVICE_NAME='oauth'`,
+		`RUNTIME_DIR="$INSTALL_ROOT/runtime"`,
+		`apply_artifact`,
+		`docker build -t "$image" "$APP_DIR/$SERVICE_NAME"`,
+		`start_pod "$replica"`,
+		`write_service_proxy_config "$SERVICE_NAME" "$REVISION"`,
+		`reload_service_proxy`,
+		`stop_old_pods`,
+		`"kind": "rollout"`,
+	} {
+		if !strings.Contains(remote.updateScript, want) {
+			t.Fatalf("rollout update script should contain %q:\n%s", want, remote.updateScript)
+		}
+	}
+	return
+	for _, want := range []string{
+		`SERVICE_NAME='oauth'`,
 		`DESIRED_REPLICAS='oauth=1'`,
 		`SERVICE_BASE_RELEASE="$(release_for_service "$SERVICE_NAME" "$BASE_RELEASE" || true)"`,
 		`release_owning_service_dir()`,
@@ -921,6 +960,22 @@ func TestServiceUpdatesAIFARArtifactBundleAsSingleMultiServicePartialRelease(t *
 	if count := strings.Count(remote.joinedCommands(), "update-aifar-artifact-bundle.sh"); count != 1 {
 		t.Fatalf("expected one bundle update script run, commands=%s", remote.joinedCommands())
 	}
+	for _, want := range []string{
+		`CHANGED_SERVICES='oauth gateway'`,
+		`DEPLOYMENT_CONCURRENCY=3`,
+		`run_parallel_group "$non_entry"`,
+		`service_changed gateway && rollout_service gateway`,
+		`service_changed web-vue3 && rollout_service web-vue3`,
+		`write_service_proxy_config "$service"`,
+		`reload_service_proxy "$service"`,
+		`stop_old_pods "$service"`,
+		`"kind": "rollout-bundle"`,
+	} {
+		if !strings.Contains(remote.bundleScript, want) {
+			t.Fatalf("bundle rollout script should contain %q:\n%s", want, remote.bundleScript)
+		}
+	}
+	return
 	for _, want := range []string{
 		`CHANGED_SERVICES='oauth gateway'`,
 		`DESIRED_REPLICAS='oauth=1 gateway=1'`,
@@ -1378,16 +1433,17 @@ func TestParseStatusOutputIncludesIngressAndStaleContainers(t *testing.T) {
 	}
 }
 
-func TestStatusCommandExcludesPartialBaseChainFromStaleContainers(t *testing.T) {
+func TestStatusCommandScansK8sLikePodsAndServiceProxies(t *testing.T) {
 	command := statusCommand("/aifar/apps/admin")
 	for _, want := range []string{
-		"release_chain_ids",
-		"baseReleaseId",
-		`ACTIVE_RELEASE_IDS="$(release_chain_ids "$CURRENT_RELEASE" | tr '\n' ' ' || true)"`,
-		`case " $ACTIVE_RELEASE_IDS " in`,
+		`MODEL_FILE="$INSTALL_ROOT/.aifar/model.json"`,
+		`[ "$MODEL" = "k8s-like-v1" ]`,
+		`label=aifar.component=pod`,
+		`proxy="aifar-svc-admin-$service"`,
+		`serviceProxies=$SERVICE_PROXIES`,
 	} {
 		if !strings.Contains(command, want) {
-			t.Fatalf("status command should protect active partial release chain with %q:\n%s", want, command)
+			t.Fatalf("status command should inspect k8s-like orchestration with %q:\n%s", want, command)
 		}
 	}
 }

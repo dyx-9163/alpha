@@ -42,6 +42,8 @@ down_legacy() {
 }
 
 if command -v docker >/dev/null 2>&1 && [ -d "$INSTALL_ROOT" ]; then
+  managed="$(docker ps -a --filter "label=aifar.app=aifar" --filter "label=aifar.install-root=$INSTALL_ROOT" --format '{{ "{{" }}.Names{{ "}}" }}' 2>/dev/null || true)"
+  [ -z "$managed" ] || docker rm -f $managed >/dev/null 2>&1 || true
   docker rm -f "$INGRESS_CONTAINER" >/dev/null 2>&1 || true
   if [ -L "$CURRENT_LINK" ] || [ -d "$CURRENT_LINK" ]; then
     current_release="$(readlink -f "$CURRENT_LINK" 2>/dev/null || printf "%s" "$CURRENT_LINK")"

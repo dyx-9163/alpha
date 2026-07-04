@@ -44,6 +44,9 @@ func (s *Store) GetAppInstance(id string) (AppInstance, error) {
 }
 
 func (s *Store) DeleteAppInstance(id string) error {
+	if err := s.DeleteAIFAROrchestration(id); err != nil {
+		return err
+	}
 	if _, err := s.db.Exec(`delete from app_releases where instance_id=?`, id); err != nil {
 		return err
 	}

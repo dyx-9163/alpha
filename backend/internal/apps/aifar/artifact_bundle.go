@@ -53,6 +53,9 @@ type artifactBundleItem struct {
 
 func (s Service) ValidateArtifactBundleUpdate(req ArtifactBundleUpdateRequest) error {
 	copy := updateCopyFor(req.Language)
+	if err := ensureK8sLikeInstance(req.Instance, copy); err != nil {
+		return err
+	}
 	_, cleanup, err := s.artifactBundleItemsFromRequest(req, copy, false)
 	if cleanup != nil {
 		cleanup()
@@ -128,14 +131,17 @@ func (s Service) UpdateArtifactBundle(ctx context.Context, req ArtifactBundleUpd
 			return err
 		}
 		metadata = metadataFromInstance(req.Instance)
+		if err := ensureK8sLikeMetadata(metadata, copy); err != nil {
+			return err
+		}
 		installRoot = stringFromMetadata(metadata, "installRoot", installRootFromDeployDir(req.Server.DeployDir))
 		version = stringFromMetadata(metadata, "releaseVersion", req.Instance.Version)
 		if strings.TrimSpace(version) == "" {
 			version = appBundleVersion
 		}
-		baseReleaseID = stringFromMetadata(metadata, "releaseId", "")
+		baseReleaseID = stringFromMetadata(metadata, "currentRevision", stringFromMetadata(metadata, "releaseId", ""))
 		releaseTime = time.Now().UTC()
-		releaseID = newReleaseID("partial-bundle", releaseTime)
+		releaseID = newReleaseID("rollout-bundle", releaseTime)
 		configHash = partialBundleUpdateConfigHash(stringFromMetadata(metadata, "configHash", ""), artifacts)
 		composeProject = composeProjectName(releaseID)
 		ingressNetwork = stringFromMetadata(metadata, "ingressNetwork", stringFromMetadata(metadata, "networkName", defaultNetworkName))
@@ -234,15 +240,15 @@ func (s Service) UpdateArtifactBundle(ctx context.Context, req ArtifactBundleUpd
 
 	if err := step(4, func() error {
 		metadata["releaseId"] = releaseID
-		metadata["releasePath"] = installRoot + "/" + releasesDirName + "/" + releaseID
+		metadata["currentRevision"] = releaseID
 		metadata["releaseVersion"] = version
 		metadata["releaseCreatedAt"] = releaseTime.Format(time.RFC3339)
 		metadata["configHash"] = configHash
-		orchestration := partialOrchestrationMetadata(metadata, installRoot, releaseID, ingressNetwork, gatewayPort, webPort, artifactServiceNames(artifacts))
+		orchestration := rolloutOrchestrationMetadata(metadata, installRoot, releaseID, ingressNetwork, gatewayPort, webPort, artifactServiceNames(artifacts))
 		for key, value := range orchestration {
 			metadata[key] = value
 		}
-		metadata["lastPartialUpdate"] = map[string]any{
+		metadata["lastRollout"] = map[string]any{
 			"service":               "bundle",
 			"changedServices":       artifactServiceNames(artifacts),
 			"baseReleaseId":         baseReleaseID,
@@ -259,8 +265,14 @@ func (s Service) UpdateArtifactBundle(ctx context.Context, req ArtifactBundleUpd
 		if err != nil {
 			return err
 		}
+		desired := desiredReplicasFromMetadata(metadata)
+		for _, artifact := range artifacts {
+			if err := s.saveRolloutControlPlane(saved.ID, version, releaseID, artifact.ServiceName, artifact.SHA256, desired[artifact.ServiceName], gatewayPort, webPort, releaseTime); err != nil {
+				return err
+			}
+		}
 		if releases, ok := s.store.(releaseStore); ok {
-			manifest, _ := json.Marshal(partialBundleReleaseManifest(version, releaseID, releaseTime, configHash, baseReleaseID, ingressNetwork, gatewayPort, webPort, artifacts, concurrency, orchestration))
+			manifest, _ := json.Marshal(rolloutBundleReleaseManifest(version, releaseID, releaseTime, configHash, baseReleaseID, ingressNetwork, gatewayPort, webPort, artifacts, concurrency, orchestration))
 			if _, err := releases.SaveAppRelease(store.AppRelease{
 				InstanceID:   saved.ID,
 				App:          AppName,

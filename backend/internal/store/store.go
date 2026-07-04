@@ -148,6 +148,39 @@ func (s *Store) migrate() error {
 			config_hash text, created_at datetime not null, activated_at datetime
 		)`,
 		`create unique index if not exists app_releases_instance_release on app_releases(instance_id, release_id)`,
+		`create table if not exists aifar_deployments (
+			id text primary key, instance_id text not null, service_name text not null,
+			desired_replicas integer not null, current_revision text not null, updating_revision text,
+			strategy_json text, status text not null, metadata_json text,
+			created_at datetime not null, updated_at datetime not null,
+			unique(instance_id, service_name)
+		)`,
+		`create index if not exists aifar_deployments_instance on aifar_deployments(instance_id)`,
+		`create table if not exists aifar_replicasets (
+			id text primary key, instance_id text not null, service_name text not null,
+			revision text not null, image text not null, artifact_hash text,
+			desired_pods integer not null, ready_pods integer not null,
+			status text not null, metadata_json text,
+			created_at datetime not null, updated_at datetime not null,
+			unique(instance_id, service_name, revision)
+		)`,
+		`create index if not exists aifar_replicasets_instance on aifar_replicasets(instance_id)`,
+		`create table if not exists aifar_pods (
+			id text primary key, instance_id text not null, service_name text not null,
+			revision text not null, pod_id text not null, container_name text not null,
+			port integer not null, status text not null, ready integer not null, metadata_json text,
+			created_at datetime not null, updated_at datetime not null,
+			unique(instance_id, service_name, pod_id)
+		)`,
+		`create index if not exists aifar_pods_instance on aifar_pods(instance_id)`,
+		`create table if not exists aifar_service_endpoints (
+			id text primary key, instance_id text not null, service_name text not null,
+			pod_id text not null, container_name text not null, revision text not null,
+			port integer not null, state text not null, ready integer not null, metadata_json text,
+			created_at datetime not null, updated_at datetime not null,
+			unique(instance_id, service_name, pod_id)
+		)`,
+		`create index if not exists aifar_service_endpoints_instance on aifar_service_endpoints(instance_id)`,
 		`create table if not exists nacos_config_revisions (
 			id text primary key, nacos_instance_id text not null, namespace text not null, group_name text not null,
 			data_id text not null, content_cipher text not null, content_hash text not null, metadata text,

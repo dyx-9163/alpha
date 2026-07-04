@@ -147,6 +147,65 @@ type AppRelease struct {
 	ActivatedAt  time.Time `json:"activatedAt,omitempty"`
 }
 
+type AIFARDeployment struct {
+	ID               string    `json:"id"`
+	InstanceID       string    `json:"instanceId"`
+	ServiceName      string    `json:"serviceName"`
+	DesiredReplicas  int       `json:"desiredReplicas"`
+	CurrentRevision  string    `json:"currentRevision"`
+	UpdatingRevision string    `json:"updatingRevision,omitempty"`
+	StrategyJSON     string    `json:"strategyJson,omitempty"`
+	Status           string    `json:"status"`
+	MetadataJSON     string    `json:"metadataJson,omitempty"`
+	CreatedAt        time.Time `json:"createdAt"`
+	UpdatedAt        time.Time `json:"updatedAt"`
+}
+
+type AIFARReplicaSet struct {
+	ID           string    `json:"id"`
+	InstanceID   string    `json:"instanceId"`
+	ServiceName  string    `json:"serviceName"`
+	Revision     string    `json:"revision"`
+	Image        string    `json:"image"`
+	ArtifactHash string    `json:"artifactHash,omitempty"`
+	DesiredPods  int       `json:"desiredPods"`
+	ReadyPods    int       `json:"readyPods"`
+	Status       string    `json:"status"`
+	MetadataJSON string    `json:"metadataJson,omitempty"`
+	CreatedAt    time.Time `json:"createdAt"`
+	UpdatedAt    time.Time `json:"updatedAt"`
+}
+
+type AIFARPod struct {
+	ID            string    `json:"id"`
+	InstanceID    string    `json:"instanceId"`
+	ServiceName   string    `json:"serviceName"`
+	Revision      string    `json:"revision"`
+	PodID         string    `json:"podId"`
+	ContainerName string    `json:"containerName"`
+	Port          int       `json:"port"`
+	Status        string    `json:"status"`
+	Ready         bool      `json:"ready"`
+	MetadataJSON  string    `json:"metadataJson,omitempty"`
+	CreatedAt     time.Time `json:"createdAt"`
+	UpdatedAt     time.Time `json:"updatedAt"`
+}
+
+type AIFARServiceEndpoint struct {
+	ID            string    `json:"id"`
+	InstanceID    string    `json:"instanceId"`
+	ServiceName   string    `json:"serviceName"`
+	PodID         string    `json:"podId"`
+	ContainerName string    `json:"containerName"`
+	Revision      string    `json:"revision"`
+	Port          int       `json:"port"`
+	State         string    `json:"state"`
+	Ready         bool      `json:"ready"`
+	MetadataJSON  string    `json:"metadataJson,omitempty"`
+	CreatedAt     time.Time `json:"createdAt"`
+	UpdatedAt     time.Time `json:"updatedAt"`
+}
+
 type NacosConfigRevision struct {
 	ID              string    `json:"id"`
 	NacosInstanceID string    `json:"nacosInstanceId"`

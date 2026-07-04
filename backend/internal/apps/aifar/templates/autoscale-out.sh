@@ -3,18 +3,15 @@ set -eu
 
 INSTALL_ROOT={{ quote .InstallRoot }}
 SERVICE_NAME={{ quote .ServiceName }}
-RELEASE_ID={{ quote .ReleaseID }}
+REVISION={{ quote .ReleaseID }}
 REPLICA_ID={{ .ReplicaID }}
 CONTAINER_NAME={{ quote .ContainerName }}
 INGRESS_NETWORK={{ quote .IngressNetwork }}
-INGRESS_CONTAINER={{ quote .IngressContainer }}
 MAX_REPLICAS={{ .MaxReplicas }}
 
-CURRENT_LINK="$INSTALL_ROOT/current"
-ENV_DIR="$CURRENT_LINK/env"
-INGRESS_DIR="$INSTALL_ROOT/ingress"
-INGRESS_CONFIG="$INGRESS_DIR/nginx.conf"
-INGRESS_CONFIG_BACKUP="$INGRESS_CONFIG.bak"
+RUNTIME_DIR="$INSTALL_ROOT/runtime"
+ENV_DIR="$RUNTIME_DIR/env"
+PROXY_DIR="$RUNTIME_DIR/service-proxies"
 
 fail() {
   echo "$*" >&2
@@ -22,17 +19,17 @@ fail() {
 }
 
 read_env_value() {
-  rev_file="$1"
-  rev_key="$2"
-  rev_default="${3:-}"
-  if [ -f "$rev_file" ]; then
-    rev_value="$(awk -F= -v key="$rev_key" '$1==key {print substr($0, index($0, "=")+1)}' "$rev_file" | tail -n 1)"
-    if [ -n "$rev_value" ]; then
-      printf "%s" "$rev_value"
+  file="$1"
+  key="$2"
+  fallback="${3:-}"
+  if [ -f "$file" ]; then
+    value="$(awk -F= -v k="$key" '$1==k {print substr($0, index($0, "=")+1)}' "$file" | tail -n 1)"
+    if [ -n "$value" ]; then
+      printf "%s" "$value"
       return 0
     fi
   fi
-  printf "%s" "$rev_default"
+  printf "%s" "$fallback"
 }
 
 service_port_var() {
@@ -51,23 +48,34 @@ service_port_var() {
   esac
 }
 
+service_port() {
+  var="$(service_port_var "$1")"
+  [ -n "$var" ] || fail "unsupported service port: $1"
+  read_env_value "$ENV_DIR/compose.env" "$var" ""
+}
+
+service_proxy_name() {
+  printf "aifar-svc-admin-%s" "$1" | tr '. _/' '----'
+}
+
 memory_to_bytes() {
-  mtb_value="$(printf "%s" "$1" | tr '[:upper:]' '[:lower:]' | tr -d ' ')"
-  case "$mtb_value" in
-    *gib) mtb_num="${mtb_value%gib}"; awk -v n="$mtb_num" 'BEGIN {printf "%.0f", n*1024*1024*1024}' ;;
-    *gb) mtb_num="${mtb_value%gb}"; awk -v n="$mtb_num" 'BEGIN {printf "%.0f", n*1000*1000*1000}' ;;
-    *mib) mtb_num="${mtb_value%mib}"; awk -v n="$mtb_num" 'BEGIN {printf "%.0f", n*1024*1024}' ;;
-    *mb) mtb_num="${mtb_value%mb}"; awk -v n="$mtb_num" 'BEGIN {printf "%.0f", n*1000*1000}' ;;
-    *kib) mtb_num="${mtb_value%kib}"; awk -v n="$mtb_num" 'BEGIN {printf "%.0f", n*1024}' ;;
-    *kb) mtb_num="${mtb_value%kb}"; awk -v n="$mtb_num" 'BEGIN {printf "%.0f", n*1000}' ;;
+  value="$(printf "%s" "$1" | tr '[:upper:]' '[:lower:]' | tr -d ' ')"
+  case "$value" in
+    *gib) n="${value%gib}"; awk -v n="$n" 'BEGIN {printf "%.0f", n*1024*1024*1024}' ;;
+    *gb) n="${value%gb}"; awk -v n="$n" 'BEGIN {printf "%.0f", n*1000*1000*1000}' ;;
+    *mib) n="${value%mib}"; awk -v n="$n" 'BEGIN {printf "%.0f", n*1024*1024}' ;;
+    *mb) n="${value%mb}"; awk -v n="$n" 'BEGIN {printf "%.0f", n*1000*1000}' ;;
+    *kib) n="${value%kib}"; awk -v n="$n" 'BEGIN {printf "%.0f", n*1024}' ;;
+    *kb) n="${value%kb}"; awk -v n="$n" 'BEGIN {printf "%.0f", n*1000}' ;;
     ''|*[!0-9]*) printf "0" ;;
-    *) printf "%s" "$mtb_value" ;;
+    *) printf "%s" "$value" ;;
   esac
 }
 
-service_container_count() {
+service_pod_count() {
   docker ps --filter "label=aifar.app=aifar" \
     --filter "label=aifar.install-root=$INSTALL_ROOT" \
+    --filter "label=aifar.component=pod" \
     --filter "label=aifar.service=$SERVICE_NAME" \
     --format '{{ "{{" }}.Names{{ "}}" }}' 2>/dev/null | wc -l | tr -d ' '
 }
@@ -80,160 +88,75 @@ container_health() {
   docker inspect --format '{{ "{{" }}if .State.Health{{ "}}" }}{{ "{{" }}.State.Health.Status{{ "}}" }}{{ "{{" }}end{{ "}}" }}' "$1" 2>/dev/null || true
 }
 
-container_restart_count() {
-  docker inspect --format '{{ "{{" }}.RestartCount{{ "}}" }}' "$1" 2>/dev/null || printf "0"
-}
-
 wait_container_ready() {
-  wcr_container="$1"
-  wcr_timeout="$(read_env_value "$ENV_DIR/compose.env" APP_STARTUP_TIMEOUT 180)"
-  case "$wcr_timeout" in ""|*[!0-9]*) wcr_timeout=180 ;; esac
-  wcr_deadline=$(( $(date +%s) + wcr_timeout ))
-  while :; do
-    wcr_status="$(container_status "$wcr_container")"
-    wcr_health="$(container_health "$wcr_container")"
-    if [ "$wcr_status" = "running" ] && { [ -z "$wcr_health" ] || [ "$wcr_health" = "healthy" ]; }; then
-      break
-    fi
-    if [ "$(date +%s)" -ge "$wcr_deadline" ]; then
-      docker logs --tail 120 "$wcr_container" >&2 || true
-      return 1
+  container="$1"
+  timeout="$(read_env_value "$ENV_DIR/compose.env" APP_STARTUP_TIMEOUT 180)"
+  case "$timeout" in ""|*[!0-9]*) timeout=180 ;; esac
+  deadline=$(( $(date +%s) + timeout ))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    status="$(container_status "$container")"
+    health="$(container_health "$container")"
+    if [ "$status" = "running" ] && { [ -z "$health" ] || [ "$health" = "healthy" ]; }; then
+      return 0
     fi
     sleep 3
   done
-  wcr_restarts="$(container_restart_count "$wcr_container")"
-  case "$wcr_restarts" in ""|*[!0-9]*) wcr_restarts=0 ;; esac
-  if [ "$SERVICE_NAME" != "web-vue3" ] && [ "$wcr_restarts" -gt 0 ]; then
-    docker logs --tail 120 "$wcr_container" >&2 || true
-    return 1
-  fi
+  docker logs --tail 120 "$container" >&2 || true
+  return 1
 }
 
-list_running_containers() {
-  lrc_service="$1"
-  docker ps --filter "label=aifar.app=aifar" \
-    --filter "label=aifar.install-root=$INSTALL_ROOT" \
-    --filter "label=aifar.service=$lrc_service" \
-    --format '{{ "{{" }}.Names{{ "}}" }}' 2>/dev/null || true
-}
-
-write_ingress_config() {
-  mkdir -p "$INGRESS_DIR"
-  gateway_port="$(read_env_value "$ENV_DIR/compose.env" GATEWAY_PORT 38000)"
-  web_port="$(read_env_value "$ENV_DIR/compose.env" WEB_VUE3_PORT 8080)"
-  gateway_servers="$(list_running_containers gateway)"
-  web_servers="$(list_running_containers web-vue3)"
-  [ -n "$gateway_servers" ] || fail "gateway upstream has no running endpoints"
-  [ -n "$web_servers" ] || fail "web-vue3 upstream has no running endpoints"
-  tmp="$INGRESS_CONFIG.tmp"
+write_service_proxy_config() {
+  port="$(service_port "$SERVICE_NAME")"
+  conf="$PROXY_DIR/$SERVICE_NAME/nginx.conf"
+  tmp="$conf.tmp"
+  mkdir -p "$(dirname "$conf")"
+  names="$(docker ps --filter "label=aifar.app=aifar" --filter "label=aifar.install-root=$INSTALL_ROOT" --filter "label=aifar.component=pod" --filter "label=aifar.service=$SERVICE_NAME" --filter "label=aifar.revision=$REVISION" --format '{{ "{{" }}.Names{{ "}}" }}' 2>/dev/null || true)"
+  [ -n "$names" ] || fail "service $SERVICE_NAME has no ready pods"
   cat > "$tmp" <<NGINX
 events {}
 http {
-  map \$http_upgrade \$connection_upgrade {
-    default upgrade;
-    '' close;
-  }
-  map \$http_x_forwarded_for \$client_real_ip {
-    ~^(?<first_ip>[^,]+) \$first_ip;
-    default \$remote_addr;
-  }
-  upstream aifar_gateway {
+  upstream aifar_${SERVICE_NAME}_pods {
 NGINX
-  for endpoint in $gateway_servers; do
-    printf "    server %s:%s;\n" "$endpoint" "$gateway_port" >> "$tmp"
-  done
-  cat >> "$tmp" <<NGINX
-  }
-  upstream aifar_web {
-NGINX
-  for endpoint in $web_servers; do
-    printf "    server %s:%s;\n" "$endpoint" "$web_port" >> "$tmp"
+  for name in $names; do
+    health="$(container_health "$name")"
+    [ -z "$health" ] || [ "$health" = "healthy" ] || continue
+    printf "    server %s:%s;\n" "$name" "$port" >> "$tmp"
   done
   cat >> "$tmp" <<NGINX
   }
   server {
-    listen ${gateway_port};
+    listen ${port};
     client_max_body_size 1000m;
     proxy_connect_timeout 300s;
     proxy_buffering off;
     proxy_request_buffering off;
     location / {
-      proxy_set_header Host \$http_host;
-      proxy_set_header X-Real-IP \$client_real_ip;
+      proxy_set_header Host \$host;
+      proxy_set_header X-Real-IP \$remote_addr;
       proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
       proxy_set_header X-Forwarded-Proto \$scheme;
-      proxy_set_header X-NginX-Proxy true;
-      proxy_pass http://aifar_gateway;
-    }
-  }
-  server {
-    listen ${web_port};
-    client_max_body_size 1000m;
-    proxy_connect_timeout 300s;
-    proxy_buffering off;
-    proxy_request_buffering off;
-    location /api/ {
-      proxy_intercept_errors off;
-      proxy_set_header Host \$http_host;
-      proxy_set_header X-Real-IP \$client_real_ip;
-      proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-      proxy_set_header X-Forwarded-Proto \$scheme;
-      proxy_set_header X-NginX-Proxy true;
-      proxy_pass http://aifar_gateway;
-    }
-    location /im/ws/ {
-      proxy_intercept_errors off;
-      proxy_http_version 1.1;
-      proxy_set_header Upgrade \$http_upgrade;
-      proxy_set_header Connection \$connection_upgrade;
-      proxy_set_header Host \$http_host;
-      proxy_set_header X-Real-IP \$client_real_ip;
-      proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-      proxy_set_header X-Forwarded-Proto \$scheme;
-      proxy_set_header X-NginX-Proxy true;
-      proxy_read_timeout 3600s;
-      proxy_send_timeout 3600s;
-      proxy_pass http://aifar_gateway;
-    }
-    location / {
-      proxy_set_header Host \$http_host;
-      proxy_set_header X-Real-IP \$client_real_ip;
-      proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-      proxy_set_header X-Forwarded-Proto \$scheme;
-      proxy_set_header X-NginX-Proxy true;
-      proxy_pass http://aifar_web;
+      proxy_pass http://aifar_${SERVICE_NAME}_pods;
     }
   }
 }
 NGINX
-  mv "$tmp" "$INGRESS_CONFIG"
+  mv "$tmp" "$conf"
 }
 
-reload_ingress_if_needed() {
-  case "$SERVICE_NAME" in
-    gateway|web-vue3) ;;
-    *) return 0 ;;
-  esac
-  if [ -f "$INGRESS_CONFIG" ]; then
-    cp "$INGRESS_CONFIG" "$INGRESS_CONFIG_BACKUP"
-  fi
-  write_ingress_config
-  if docker exec "$INGRESS_CONTAINER" nginx -t >/dev/null && docker exec "$INGRESS_CONTAINER" nginx -s reload >/dev/null; then
-    return 0
-  fi
-  if [ -f "$INGRESS_CONFIG_BACKUP" ]; then
-    cp "$INGRESS_CONFIG_BACKUP" "$INGRESS_CONFIG"
-    docker exec "$INGRESS_CONTAINER" nginx -s reload >/dev/null 2>&1 || true
-  fi
-  return 1
+reload_service_proxy() {
+  proxy="$(service_proxy_name "$SERVICE_NAME")"
+  docker exec "$proxy" nginx -t >/dev/null
+  docker exec "$proxy" nginx -s reload >/dev/null
 }
 
 command -v docker >/dev/null 2>&1 || fail "docker command is required"
 docker info >/dev/null 2>&1 || fail "docker daemon is not available"
-[ -d "$ENV_DIR" ] || fail "AIFAR current release env directory is missing"
+[ -f "$INSTALL_ROOT/.aifar/model.json" ] || fail "AIFAR k8s-like model manifest is missing"
+grep -q '"model"[[:space:]]*:[[:space:]]*"k8s-like-v1"' "$INSTALL_ROOT/.aifar/model.json" || fail "AIFAR instance is legacy; reinstall with k8s-like orchestration"
+[ -d "$ENV_DIR" ] || fail "AIFAR runtime env directory is missing"
 [ -f "$ENV_DIR/$SERVICE_NAME.env" ] || fail "AIFAR service env is missing: $SERVICE_NAME"
 
-count="$(service_container_count)"
+count="$(service_pod_count)"
 case "$count" in ""|*[!0-9]*) count=0 ;; esac
 if [ "$count" -ge "$MAX_REPLICAS" ]; then
   fail "AIFAR service $SERVICE_NAME already reached max replicas: $MAX_REPLICAS"
@@ -255,9 +178,7 @@ if [ "$available_bytes" -lt $((required_bytes + reserve_bytes)) ]; then
   fail "host memory is insufficient for a new $SERVICE_NAME replica"
 fi
 
-docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
-port_var="$(service_port_var "$SERVICE_NAME")"
-port="$(read_env_value "$compose_env" "$port_var" "")"
+port="$(service_port "$SERVICE_NAME")"
 health_protocol="$(read_env_value "$compose_env" APP_HEALTH_PROTOCOL http)"
 health_host="$(read_env_value "$compose_env" APP_HEALTH_HOST 127.0.0.1)"
 health_path="$(read_env_value "$compose_env" APP_HEALTH_PATH "")"
@@ -269,13 +190,16 @@ health_start_period="$(read_env_value "$compose_env" APP_HEALTH_START_PERIOD 30s
 app_cpus="$(read_env_value "$compose_env" APP_CPUS "")"
 restart_policy="$(read_env_value "$compose_env" APP_RESTART_POLICY unless-stopped)"
 tz_value="$(read_env_value "$compose_env" TZ system)"
+resource_args=""
+[ -z "$app_cpus" ] || resource_args="$resource_args --cpus $app_cpus"
+[ -z "$app_memory_limit" ] || resource_args="$resource_args --memory $app_memory_limit"
 
-env_args=""
+docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
 if [ "$SERVICE_NAME" = "web-vue3" ]; then
-  env_args="$env_args --env-file $service_env"
+  env_args="--env-file $service_env"
   health_cmd="wget -q -T $health_connect_timeout -O /dev/null ${health_protocol}://${health_host}:${port}${health_path} || exit 1"
 else
-  env_args="$env_args --env-file $ENV_DIR/java-common.env --env-file $ENV_DIR/java-secrets.env --env-file $service_env"
+  env_args="--env-file $ENV_DIR/java-common.env --env-file $ENV_DIR/java-secrets.env --env-file $service_env"
   health_cmd="curl -fsS --connect-timeout $health_connect_timeout ${health_protocol}://${health_host}:${port}${health_path} >/dev/null || exit 1"
 fi
 
@@ -284,13 +208,15 @@ docker run -d \
   --restart no \
   --label aifar.app=aifar \
   --label "aifar.install-root=$INSTALL_ROOT" \
-  --label "aifar.release=$RELEASE_ID" \
+  --label "aifar.component=pod" \
   --label "aifar.service=$SERVICE_NAME" \
+  --label "aifar.revision=$REVISION" \
+  --label "aifar.release=$REVISION" \
+  --label "aifar.pod=$CONTAINER_NAME" \
   --label "aifar.replica=$REPLICA_ID" \
   --label aifar.autoscaled=true \
   --network "$INGRESS_NETWORK" \
-  --cpus "$app_cpus" \
-  --memory "$app_memory_limit" \
+  $resource_args \
   --health-cmd "$health_cmd" \
   --health-interval "$health_interval" \
   --health-timeout "$health_timeout" \
@@ -303,13 +229,13 @@ docker run -d \
 
 if ! wait_container_ready "$CONTAINER_NAME"; then
   docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
-  fail "new AIFAR service replica did not become ready: $CONTAINER_NAME"
+  fail "new AIFAR service Pod did not become ready: $CONTAINER_NAME"
 fi
 
-if ! reload_ingress_if_needed; then
+if ! write_service_proxy_config || ! reload_service_proxy; then
   docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
-  fail "AIFAR ingress reload failed for autoscaled endpoint"
+  fail "AIFAR service proxy reload failed for autoscaled endpoint"
 fi
 
 docker update --restart "$restart_policy" "$CONTAINER_NAME" >/dev/null 2>&1 || true
-echo "AIFAR service $SERVICE_NAME scaled out with $CONTAINER_NAME"
+echo "AIFAR service $SERVICE_NAME scaled out with Pod $CONTAINER_NAME"

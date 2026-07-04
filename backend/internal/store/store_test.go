@@ -42,6 +42,89 @@ func TestBootstrapUserAndServerLifecycle(t *testing.T) {
 	}
 }
 
+func TestAIFAROrchestrationCRUDAndInstanceCleanup(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "aifar.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	instance, err := db.SaveAppInstance(AppInstance{App: "aifar", Version: "docker-apps", ServerID: "srv-1", Status: "installed"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.SaveAIFARDeployment(AIFARDeployment{
+		InstanceID:      instance.ID,
+		ServiceName:     "permission",
+		DesiredReplicas: 2,
+		CurrentRevision: "rev-1",
+		StrategyJSON:    `{"maxSurge":1,"maxUnavailable":0}`,
+		Status:          "active",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.SaveAIFARReplicaSet(AIFARReplicaSet{
+		InstanceID:  instance.ID,
+		ServiceName: "permission",
+		Revision:    "rev-1",
+		Image:       "aifar-permission:rev-1",
+		DesiredPods: 2,
+		ReadyPods:   2,
+		Status:      "active",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.SaveAIFARPod(AIFARPod{
+		InstanceID:    instance.ID,
+		ServiceName:   "permission",
+		Revision:      "rev-1",
+		PodID:         "permission-rev-1-r1",
+		ContainerName: "aifar-pod-admin-permission-rev-1-r1",
+		Port:          38010,
+		Status:        "ready",
+		Ready:         true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.ReplaceAIFARServiceEndpoints(instance.ID, "permission", []AIFARServiceEndpoint{{
+		InstanceID:    instance.ID,
+		ServiceName:   "permission",
+		PodID:         "permission-rev-1-r1",
+		ContainerName: "aifar-pod-admin-permission-rev-1-r1",
+		Revision:      "rev-1",
+		Port:          38010,
+		State:         "active",
+		Ready:         true,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	deployments, err := db.ListAIFARDeployments(instance.ID)
+	if err != nil || len(deployments) != 1 || deployments[0].DesiredReplicas != 2 {
+		t.Fatalf("unexpected deployments: %+v err=%v", deployments, err)
+	}
+	replicaSets, err := db.ListAIFARReplicaSets(instance.ID)
+	if err != nil || len(replicaSets) != 1 || replicaSets[0].Revision != "rev-1" {
+		t.Fatalf("unexpected replica sets: %+v err=%v", replicaSets, err)
+	}
+	pods, err := db.ListAIFARPods(instance.ID)
+	if err != nil || len(pods) != 1 || !pods[0].Ready {
+		t.Fatalf("unexpected pods: %+v err=%v", pods, err)
+	}
+	endpoints, err := db.ListAIFARServiceEndpoints(instance.ID)
+	if err != nil || len(endpoints) != 1 || endpoints[0].State != "active" {
+		t.Fatalf("unexpected endpoints: %+v err=%v", endpoints, err)
+	}
+	if err := db.DeleteAppInstance(instance.ID); err != nil {
+		t.Fatal(err)
+	}
+	pods, err = db.ListAIFARPods(instance.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pods) != 0 {
+		t.Fatalf("expected AIFAR pods to be deleted with instance, got %+v", pods)
+	}
+}
+
 func TestUserTokenVersionChangesOnPasswordAndRoleUpdate(t *testing.T) {
 	db, err := Open(filepath.Join(t.TempDir(), "aifar.db"))
 	if err != nil {

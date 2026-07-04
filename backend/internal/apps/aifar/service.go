@@ -41,6 +41,17 @@ type releaseStore interface {
 	DeleteOldAppReleases(instanceID string, keep int) (int, error)
 }
 
+type aifarOrchestrationStore interface {
+	SaveAIFARDeployment(v store.AIFARDeployment) (store.AIFARDeployment, error)
+	ListAIFARDeployments(instanceID string) ([]store.AIFARDeployment, error)
+	SaveAIFARReplicaSet(v store.AIFARReplicaSet) (store.AIFARReplicaSet, error)
+	ListAIFARReplicaSets(instanceID string) ([]store.AIFARReplicaSet, error)
+	SaveAIFARPod(v store.AIFARPod) (store.AIFARPod, error)
+	ListAIFARPods(instanceID string) ([]store.AIFARPod, error)
+	ReplaceAIFARServiceEndpoints(instanceID, serviceName string, endpoints []store.AIFARServiceEndpoint) error
+	ListAIFARServiceEndpoints(instanceID string) ([]store.AIFARServiceEndpoint, error)
+}
+
 type InstallRequest struct {
 	Version    string
 	Topology   string
@@ -273,6 +284,9 @@ func (s Service) Install(ctx context.Context, req InstallRequest, resources []st
 		if saveErr != nil {
 			return saveErr
 		}
+		if err := s.saveInitialControlPlane(instance.ID, releaseID, bundle.Version, configHash, options, releaseTime); err != nil {
+			return err
+		}
 		if releases, ok := s.store.(releaseStore); ok {
 			manifest, _ := json.Marshal(releaseManifest(bundle.Version, releaseID, releaseTime, configHash, ingressNetwork, options.GatewayPort, options.WebPort))
 			if _, err := releases.SaveAppRelease(store.AppRelease{
@@ -307,37 +321,247 @@ func (s Service) Install(ctx context.Context, req InstallRequest, resources []st
 }
 
 func installMetadata(server store.Server, installRoot, version, releaseID string, releaseTime time.Time, configHash string, options InstallOptions) map[string]any {
+	runtimeDir := installRoot + "/runtime"
 	metadata := map[string]any{
-		"installRoot":      installRoot,
-		"layout":           releaseLayout,
-		"releasePhase":     releasePhaseActive,
-		"currentRelease":   installRoot + "/" + currentLinkName,
-		"releaseId":        releaseID,
-		"releasePath":      installRoot + "/" + releasesDirName + "/" + releaseID,
-		"releaseVersion":   version,
-		"releaseRetention": releaseKeepCount,
-		"releaseCreatedAt": releaseTime.Format(time.RFC3339),
-		"configHash":       configHash,
-		"appDir":           installRoot + "/" + currentLinkName + "/" + appBundleDir,
-		"envDir":           installRoot + "/" + currentLinkName + "/" + releaseEnvDirName,
-		"networkName":      options.NetworkName,
-		"endpoint":         fmt.Sprintf("%s:%d", server.Host, options.WebPort),
-		"gatewayEndpoint":  fmt.Sprintf("%s:%d", server.Host, options.GatewayPort),
-		"nacosEndpoint":    fmt.Sprintf("%s:%d", options.NacosHost, options.NacosWebPort),
-		"webPort":          options.WebPort,
-		"gatewayPort":      options.GatewayPort,
-		"nacosSource":      options.NacosSource,
-		"nacosInstanceId":  options.NacosInstanceID,
-		"nacosHost":        options.NacosHost,
-		"nacosPort":        options.NacosWebPort,
-		"nacosWebPort":     options.NacosWebPort,
-		"nacosApiPort":     options.NacosAPIPort,
-		"services":         serviceOrder,
+		"installRoot":           installRoot,
+		"runtimeDir":            runtimeDir,
+		"layout":                releaseLayout,
+		"orchestrationModel":    orchestrationModelK8sLikeV1,
+		"releasePhase":          releasePhaseActive,
+		"currentRevision":       releaseID,
+		"releaseId":             releaseID,
+		"releaseVersion":        version,
+		"releaseRetention":      releaseKeepCount,
+		"releaseCreatedAt":      releaseTime.Format(time.RFC3339),
+		"configHash":            configHash,
+		"appDir":                runtimeDir + "/" + appBundleDir,
+		"envDir":                runtimeDir + "/" + releaseEnvDirName,
+		"networkName":           options.NetworkName,
+		"endpoint":              fmt.Sprintf("%s:%d", server.Host, options.WebPort),
+		"gatewayEndpoint":       fmt.Sprintf("%s:%d", server.Host, options.GatewayPort),
+		"nacosEndpoint":         fmt.Sprintf("%s:%d", options.NacosHost, options.NacosWebPort),
+		"nacosRegistrationMode": "service-proxy",
+		"webPort":               options.WebPort,
+		"gatewayPort":           options.GatewayPort,
+		"nacosSource":           options.NacosSource,
+		"nacosInstanceId":       options.NacosInstanceID,
+		"nacosHost":             options.NacosHost,
+		"nacosPort":             options.NacosWebPort,
+		"nacosWebPort":          options.NacosWebPort,
+		"nacosApiPort":          options.NacosAPIPort,
+		"services":              serviceOrder,
+		"rolloutDefaults": map[string]any{
+			"maxSurge":       1,
+			"maxUnavailable": 0,
+			"drainSeconds":   30,
+		},
 	}
 	for key, value := range releaseOrchestrationMetadata(installRoot, releaseID, options.NetworkName, options.GatewayPort, options.WebPort) {
 		metadata[key] = value
 	}
 	return metadata
+}
+
+func (s Service) saveInitialControlPlane(instanceID, revision, version, configHash string, options InstallOptions, now time.Time) error {
+	if orch, ok := s.store.(aifarOrchestrationStore); ok {
+		return saveControlPlaneRevision(orch, instanceID, version, revision, configHash, defaultDesiredReplicas(), options.GatewayPort, options.WebPort, serviceOrder, now)
+	}
+	return nil
+}
+
+func (s Service) saveRolloutControlPlane(instanceID, version, revision, serviceName, artifactHash string, replicas, gatewayPort, webPort int, now time.Time) error {
+	if replicas < 1 {
+		replicas = 1
+	}
+	if orch, ok := s.store.(aifarOrchestrationStore); ok {
+		return saveControlPlaneRevision(orch, instanceID, version, revision, artifactHash, map[string]int{serviceName: replicas}, gatewayPort, webPort, []string{serviceName}, now)
+	}
+	return nil
+}
+
+func saveControlPlaneRevision(orch aifarOrchestrationStore, instanceID, version, revision, artifactHash string, desired map[string]int, gatewayPort, webPort int, services []string, now time.Time) error {
+	strategy := `{"type":"RollingUpdate","maxSurge":1,"maxUnavailable":0,"drainSeconds":30}`
+	for _, service := range services {
+		replicas := desired[service]
+		if replicas < 1 {
+			replicas = 1
+		}
+		port := serviceDefaultPort(service, gatewayPort, webPort)
+		if _, err := orch.SaveAIFARDeployment(store.AIFARDeployment{
+			InstanceID:      instanceID,
+			ServiceName:     service,
+			DesiredReplicas: replicas,
+			CurrentRevision: revision,
+			StrategyJSON:    strategy,
+			Status:          "active",
+			MetadataJSON:    `{"model":"` + orchestrationModelK8sLikeV1 + `"}`,
+			CreatedAt:       now,
+		}); err != nil {
+			return err
+		}
+		if _, err := orch.SaveAIFARReplicaSet(store.AIFARReplicaSet{
+			InstanceID:   instanceID,
+			ServiceName:  service,
+			Revision:     revision,
+			Image:        fmt.Sprintf("aifar-%s:%s", service, revision),
+			ArtifactHash: artifactHash,
+			DesiredPods:  replicas,
+			ReadyPods:    replicas,
+			Status:       "active",
+			MetadataJSON: fmt.Sprintf(`{"version":%q}`, version),
+			CreatedAt:    now,
+		}); err != nil {
+			return err
+		}
+		endpoints := make([]store.AIFARServiceEndpoint, 0, replicas)
+		for replicaID := 1; replicaID <= replicas; replicaID++ {
+			pod := store.AIFARPod{
+				InstanceID:    instanceID,
+				ServiceName:   service,
+				Revision:      revision,
+				PodID:         podID(service, revision, replicaID),
+				ContainerName: podContainerName(service, revision, replicaID),
+				Port:          port,
+				Status:        "ready",
+				Ready:         true,
+				MetadataJSON:  fmt.Sprintf(`{"replicaId":%d}`, replicaID),
+				CreatedAt:     now,
+			}
+			if _, err := orch.SaveAIFARPod(pod); err != nil {
+				return err
+			}
+			endpoints = append(endpoints, store.AIFARServiceEndpoint{
+				InstanceID:    instanceID,
+				ServiceName:   service,
+				PodID:         pod.PodID,
+				ContainerName: pod.ContainerName,
+				Revision:      revision,
+				Port:          port,
+				State:         "active",
+				Ready:         true,
+				MetadataJSON:  pod.MetadataJSON,
+				CreatedAt:     now,
+			})
+		}
+		if err := orch.ReplaceAIFARServiceEndpoints(instanceID, service, endpoints); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func ensureK8sLikeInstance(instance store.AppInstance, copy UpdateCopy) error {
+	if instance.App != AppName {
+		return errors.New(copy.UnsupportedInstance)
+	}
+	return ensureK8sLikeMetadata(metadataFromInstance(instance), copy)
+}
+
+func ensureK8sLikeMetadata(metadata map[string]any, copy UpdateCopy) error {
+	model := strings.TrimSpace(fmt.Sprint(metadata["orchestrationModel"]))
+	if model == orchestrationModelK8sLikeV1 {
+		return nil
+	}
+	if model == "" {
+		model = legacyOrchestrationModel
+	}
+	return fmt.Errorf(copy.LegacyUpdateUnsupported, model)
+}
+
+func currentRevisionForService(metadata map[string]any, serviceName string) string {
+	if endpoints, ok := metadata["activeEndpoints"].(map[string]any); ok {
+		if items, ok := endpoints[serviceName]; ok {
+			if revision := firstEndpointRevision(items); revision != "" {
+				return revision
+			}
+		}
+	}
+	if revisions, ok := metadata["serviceRevisions"].(map[string]any); ok {
+		if revision := strings.TrimSpace(fmt.Sprint(revisions[serviceName])); revision != "" {
+			return revision
+		}
+	}
+	return stringFromMetadata(metadata, "currentRevision", stringFromMetadata(metadata, "releaseId", ""))
+}
+
+func firstEndpointRevision(value any) string {
+	switch items := value.(type) {
+	case []map[string]any:
+		for _, item := range items {
+			if revision := endpointRevision(item); revision != "" {
+				return revision
+			}
+		}
+	case []any:
+		for _, raw := range items {
+			if item, ok := raw.(map[string]any); ok {
+				if revision := endpointRevision(item); revision != "" {
+					return revision
+				}
+			}
+		}
+	}
+	return ""
+}
+
+func endpointRevision(item map[string]any) string {
+	for _, key := range []string{"revision", "releaseId"} {
+		if revision := strings.TrimSpace(fmt.Sprint(item[key])); revision != "" {
+			return revision
+		}
+	}
+	return ""
+}
+
+func rolloutOrchestrationMetadata(current map[string]any, installRoot, revision, ingressNetwork string, gatewayPort, webPort int, changedServices []string) map[string]any {
+	next := copyMetadata(current)
+	for key, value := range releaseOrchestrationMetadata(installRoot, revision, ingressNetwork, gatewayPort, webPort) {
+		if _, exists := next[key]; !exists {
+			next[key] = value
+		}
+	}
+	next["orchestrationModel"] = orchestrationModelK8sLikeV1
+	next["releasePhase"] = releasePhaseActive
+	desired := desiredReplicasFromMetadata(current)
+	activeEndpoints := activeEndpointsFromMetadata(current)
+	serviceRevisions := serviceRevisionsFromMetadata(current)
+	containers := mapFromMetadataValue(current["containers"])
+	if containers == nil {
+		containers = map[string]any{}
+	}
+	for _, service := range changedServices {
+		replicas := desired[service]
+		if replicas < 1 {
+			replicas = 1
+			desired[service] = replicas
+		}
+		activeEndpoints[service] = releaseEndpointsForService(service, revision, replicas, gatewayPort, webPort)
+		serviceRevisions[service] = revision
+		containers[service] = podContainerName(service, revision, 1)
+	}
+	next["desiredReplicas"] = desired
+	next["activeEndpoints"] = activeEndpoints
+	next["activeServices"] = activeServicesFromEndpoints(desired, activeEndpoints)
+	next["serviceRevisions"] = serviceRevisions
+	next["containers"] = containers
+	next["activeRoutes"] = releaseRoutes(revision, gatewayPort, webPort)
+	next["autoscalePolicy"] = autoscalePolicyFromMetadata(current).metadata()
+	return next
+}
+
+func serviceRevisionsFromMetadata(metadata map[string]any) map[string]any {
+	out := map[string]any{}
+	if raw, ok := metadata["serviceRevisions"].(map[string]any); ok {
+		for key, value := range raw {
+			out[key] = value
+		}
+	}
+	for _, service := range serviceOrder {
+		if _, ok := out[service]; !ok {
+			out[service] = currentRevisionForService(metadata, service)
+		}
+	}
+	return out
 }
 
 func partialOrchestrationMetadata(current map[string]any, installRoot, releaseID, ingressNetwork string, gatewayPort, webPort int, changedServices []string) map[string]any {
@@ -441,17 +665,17 @@ func releaseManifest(version, releaseID string, releaseTime time.Time, configHas
 	return manifest
 }
 
-func partialReleaseManifest(version, releaseID string, releaseTime time.Time, configHash, baseReleaseID, ingressNetwork string, gatewayPort, webPort int, artifact artifactInfo, orchestration map[string]any) map[string]any {
+func rolloutReleaseManifest(version, releaseID string, releaseTime time.Time, configHash, baseReleaseID, ingressNetwork string, gatewayPort, webPort int, artifact artifactInfo, orchestration map[string]any) map[string]any {
 	manifest := map[string]any{
 		"app":              AppName,
 		"version":          version,
 		"releaseId":        releaseID,
 		"layout":           releaseLayout,
-		"kind":             "partial",
+		"kind":             "rollout",
 		"status":           "success",
 		"phase":            releasePhaseActive,
 		"configHash":       configHash,
-		"baseReleaseId":    baseReleaseID,
+		"previousRevision": baseReleaseID,
 		"createdAt":        releaseTime.Format(time.RFC3339),
 		"releaseRetention": releaseKeepCount,
 		"services":         serviceOrder,
@@ -472,7 +696,7 @@ func partialReleaseManifest(version, releaseID string, releaseTime time.Time, co
 	return manifest
 }
 
-func partialBundleReleaseManifest(version, releaseID string, releaseTime time.Time, configHash, baseReleaseID, ingressNetwork string, gatewayPort, webPort int, artifacts []artifactInfo, concurrency int, orchestration map[string]any) map[string]any {
+func rolloutBundleReleaseManifest(version, releaseID string, releaseTime time.Time, configHash, baseReleaseID, ingressNetwork string, gatewayPort, webPort int, artifacts []artifactInfo, concurrency int, orchestration map[string]any) map[string]any {
 	changed := make([]string, 0, len(artifacts))
 	artifactMap := make(map[string]any, len(artifacts))
 	for _, artifact := range artifacts {
@@ -488,11 +712,11 @@ func partialBundleReleaseManifest(version, releaseID string, releaseTime time.Ti
 		"version":               version,
 		"releaseId":             releaseID,
 		"layout":                releaseLayout,
-		"kind":                  "partial",
+		"kind":                  "rollout-bundle",
 		"status":                "success",
 		"phase":                 releasePhaseActive,
 		"configHash":            configHash,
-		"baseReleaseId":         baseReleaseID,
+		"previousRevision":      baseReleaseID,
 		"createdAt":             releaseTime.Format(time.RFC3339),
 		"releaseRetention":      releaseKeepCount,
 		"services":              serviceOrder,
@@ -517,6 +741,9 @@ type artifactInfo struct {
 
 func (s Service) ValidateArtifactUpdate(req ArtifactUpdateRequest) error {
 	copy := updateCopyFor(req.Language)
+	if err := ensureK8sLikeInstance(req.Instance, copy); err != nil {
+		return err
+	}
 	_, err := artifactInfoFromRequest(req, copy)
 	return err
 }
@@ -568,14 +795,17 @@ func (s Service) UpdateArtifact(ctx context.Context, req ArtifactUpdateRequest, 
 			return err
 		}
 		metadata = metadataFromInstance(req.Instance)
+		if err := ensureK8sLikeMetadata(metadata, copy); err != nil {
+			return err
+		}
 		installRoot = stringFromMetadata(metadata, "installRoot", installRootFromDeployDir(req.Server.DeployDir))
 		version = stringFromMetadata(metadata, "releaseVersion", req.Instance.Version)
 		if strings.TrimSpace(version) == "" {
 			version = appBundleVersion
 		}
-		baseReleaseID = stringFromMetadata(metadata, "releaseId", "")
+		baseReleaseID = currentRevisionForService(metadata, artifact.ServiceName)
 		releaseTime = time.Now().UTC()
-		releaseID = newReleaseID("partial-"+artifact.ServiceName, releaseTime)
+		releaseID = newReleaseID("rollout-"+artifact.ServiceName, releaseTime)
 		configHash = partialUpdateConfigHash(stringFromMetadata(metadata, "configHash", ""), artifact.ServiceName, artifact.FileName, artifact.SHA256)
 		composeProject = composeProjectName(releaseID)
 		ingressNetwork = stringFromMetadata(metadata, "ingressNetwork", stringFromMetadata(metadata, "networkName", defaultNetworkName))
@@ -664,15 +894,15 @@ func (s Service) UpdateArtifact(ctx context.Context, req ArtifactUpdateRequest, 
 
 	if err := step(4, func() error {
 		metadata["releaseId"] = releaseID
-		metadata["releasePath"] = installRoot + "/" + releasesDirName + "/" + releaseID
+		metadata["currentRevision"] = releaseID
 		metadata["releaseVersion"] = version
 		metadata["releaseCreatedAt"] = releaseTime.Format(time.RFC3339)
 		metadata["configHash"] = configHash
-		orchestration := partialOrchestrationMetadata(metadata, installRoot, releaseID, ingressNetwork, gatewayPort, webPort, []string{artifact.ServiceName})
+		orchestration := rolloutOrchestrationMetadata(metadata, installRoot, releaseID, ingressNetwork, gatewayPort, webPort, []string{artifact.ServiceName})
 		for key, value := range orchestration {
 			metadata[key] = value
 		}
-		metadata["lastPartialUpdate"] = map[string]any{
+		metadata["lastRollout"] = map[string]any{
 			"service":        artifact.ServiceName,
 			"artifactFile":   artifact.FileName,
 			"artifactSHA256": artifact.SHA256,
@@ -690,8 +920,11 @@ func (s Service) UpdateArtifact(ctx context.Context, req ArtifactUpdateRequest, 
 		if err != nil {
 			return err
 		}
+		if err := s.saveRolloutControlPlane(saved.ID, version, releaseID, artifact.ServiceName, artifact.SHA256, desiredReplicasFromMetadata(metadata)[artifact.ServiceName], gatewayPort, webPort, releaseTime); err != nil {
+			return err
+		}
 		if releases, ok := s.store.(releaseStore); ok {
-			manifest, _ := json.Marshal(partialReleaseManifest(version, releaseID, releaseTime, configHash, baseReleaseID, ingressNetwork, gatewayPort, webPort, artifact, orchestration))
+			manifest, _ := json.Marshal(rolloutReleaseManifest(version, releaseID, releaseTime, configHash, baseReleaseID, ingressNetwork, gatewayPort, webPort, artifact, orchestration))
 			if _, err := releases.SaveAppRelease(store.AppRelease{
 				InstanceID:   saved.ID,
 				App:          AppName,
@@ -994,6 +1227,8 @@ func (s Service) Check(ctx context.Context, req CheckRequest, log Logger, target
 	details := map[string]any{
 		"message":             status.Message,
 		"installRoot":         status.InstallRoot,
+		"orchestrationModel":  status.OrchestrationModel,
+		"legacy":              status.OrchestrationModel == legacyOrchestrationModel,
 		"currentRelease":      status.CurrentRelease,
 		"releaseId":           status.ReleaseID,
 		"installRootExists":   status.InstallRootExists,
@@ -1002,6 +1237,7 @@ func (s Service) Check(ctx context.Context, req CheckRequest, log Logger, target
 		"unhealthyContainers": status.UnhealthyContainers,
 		"staleContainers":     status.StaleContainers,
 		"ingressRunning":      status.IngressRunning,
+		"serviceProxies":      status.ServiceProxies,
 		"containers":          status.Containers,
 	}
 	if scaleStatusOK {

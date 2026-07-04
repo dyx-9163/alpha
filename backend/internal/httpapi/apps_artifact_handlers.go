@@ -93,7 +93,8 @@ func (a *API) updateAppInstanceArtifact(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusBadRequest, "ARTIFACT_UPDATE_PLAN_FAILED", err.Error(), map[string]any{"app": instance.App, "service": serviceName})
 		return
 	}
-	task, err := a.store.CreateTask(store.Task{Type: "apps." + instance.App + ".update-artifact", Target: target, Status: "pending", CreatedBy: actor})
+	taskType := artifactUpdateTaskType(instance.App)
+	task, err := a.store.CreateTask(store.Task{Type: taskType, Target: target, Status: "pending", CreatedBy: actor})
 	if err != nil {
 		respondTask(w, task, err)
 		return
@@ -122,7 +123,7 @@ func (a *API) updateAppInstanceArtifact(w http.ResponseWriter, r *http.Request) 
 		_ = os.Remove(artifactPath)
 	}
 	if err == nil {
-		a.audit(r, "apps."+instance.App+".update-artifact", target, "running", task.ID)
+		a.audit(r, taskType, target, "running", task.ID)
 	}
 	respondTask(w, task, err)
 }
@@ -203,7 +204,8 @@ func (a *API) updateAppInstanceArtifactBundle(w http.ResponseWriter, r *http.Req
 		writeError(w, http.StatusBadRequest, "ARTIFACT_BUNDLE_UPDATE_PLAN_FAILED", err.Error(), map[string]any{"app": instance.App})
 		return
 	}
-	task, err := a.store.CreateTask(store.Task{Type: "apps." + instance.App + ".update-artifact-bundle", Target: target, Status: "pending", CreatedBy: actor})
+	taskType := artifactBundleUpdateTaskType(instance.App)
+	task, err := a.store.CreateTask(store.Task{Type: taskType, Target: target, Status: "pending", CreatedBy: actor})
 	if err != nil {
 		respondTask(w, task, err)
 		return
@@ -233,9 +235,23 @@ func (a *API) updateAppInstanceArtifactBundle(w http.ResponseWriter, r *http.Req
 		_ = os.Remove(bundlePath)
 	}
 	if err == nil {
-		a.audit(r, "apps."+instance.App+".update-artifact-bundle", target, "running", task.ID)
+		a.audit(r, taskType, target, "running", task.ID)
 	}
 	respondTask(w, task, err)
+}
+
+func artifactUpdateTaskType(app string) string {
+	if strings.EqualFold(strings.TrimSpace(app), "aifar") {
+		return "aifar.rollout"
+	}
+	return "apps." + app + ".update-artifact"
+}
+
+func artifactBundleUpdateTaskType(app string) string {
+	if strings.EqualFold(strings.TrimSpace(app), "aifar") {
+		return "aifar.rollout.bundle"
+	}
+	return "apps." + app + ".update-artifact-bundle"
 }
 
 func writeMultipartParseError(w http.ResponseWriter, r *http.Request, errCode string, err error) {

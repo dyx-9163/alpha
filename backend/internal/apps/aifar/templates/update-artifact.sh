@@ -11,155 +11,48 @@ ARTIFACT_FILE={{ quote .ArtifactFileName }}
 ARTIFACT_SHA256={{ quote .ArtifactSHA256 }}
 ARTIFACT_SIZE={{ .ArtifactSize }}
 VERSION={{ quote .Version }}
-RELEASE_ID={{ quote .ReleaseID }}
+REVISION={{ quote .ReleaseID }}
 CREATED_AT={{ quote .CreatedAt }}
 CONFIG_HASH={{ quote .ConfigHash }}
-RELEASE_KEEP_COUNT={{ .ReleaseKeepCount }}
-COMPOSE_PROJECT_NAME={{ quote .ComposeProject }}
 INGRESS_NETWORK={{ quote .IngressNetwork }}
-INTERNAL_NETWORK={{ quote .InternalNetwork }}
 INGRESS_CONTAINER={{ quote .IngressContainer }}
 
-RELEASES_DIR="$INSTALL_ROOT/releases"
-CURRENT_LINK="$INSTALL_ROOT/current"
-RELEASE_DIR="$RELEASES_DIR/$RELEASE_ID"
-APP_DIR="$RELEASE_DIR/docker-apps"
-ENV_DIR="$RELEASE_DIR/env"
-AIFAR_DIR="$RELEASE_DIR/.aifar"
-INGRESS_DIR="$INSTALL_ROOT/ingress"
-INGRESS_CONFIG="$INGRESS_DIR/nginx.conf"
-INGRESS_CONFIG_BACKUP="$INGRESS_DIR/nginx.conf.previous"
-TMP_ARTIFACT_DIR="$INSTALL_ROOT/.partial-$RELEASE_ID-$$"
+RUNTIME_DIR="$INSTALL_ROOT/runtime"
+APP_DIR="$RUNTIME_DIR/docker-apps"
+ENV_DIR="$RUNTIME_DIR/env"
+PROXY_DIR="$RUNTIME_DIR/service-proxies"
+TMP_DIR="$INSTALL_ROOT/.rollout-$REVISION-$$"
+DRAIN_SECONDS="${DRAIN_SECONDS:-30}"
+ORCHESTRATION_MODEL="k8s-like-v1"
 
 fail() {
   echo "ERROR: $*" >&2
   exit 1
 }
 
-compose() {
-  if docker compose version >/dev/null 2>&1; then
-    docker compose "$@"
-    return
+read_env_value() {
+  file="$1"
+  key="$2"
+  fallback="${3:-}"
+  if [ -f "$file" ]; then
+    value="$(awk -F= -v k="$key" '$1==k {print substr($0, index($0, "=")+1)}' "$file" | tail -n 1)"
+    if [ -n "$value" ]; then
+      printf "%s" "$value"
+      return 0
+    fi
   fi
-  if command -v docker-compose >/dev/null 2>&1; then
-    docker-compose "$@"
-    return
-  fi
-  fail "docker compose or docker-compose is required"
+  printf "%s" "$fallback"
 }
 
 set_env() {
   key="$1"
   value="$2"
   file="$3"
-  tmp="${file}.tmp"
+  tmp="$file.tmp"
   [ -f "$file" ] || touch "$file"
   grep -v "^${key}=" "$file" > "$tmp" || true
   printf "%s=%s\n" "$key" "$value" >> "$tmp"
   mv "$tmp" "$file"
-}
-
-read_env_value() {
-  file="$1"
-  key="$2"
-  fallback="$3"
-  if [ -f "$file" ]; then
-    value="$(awk -F= -v k="$key" '$1==k {sub(/^[^=]*=/,""); print; exit}' "$file" 2>/dev/null || true)"
-    if [ -n "$value" ]; then
-      printf "%s" "$value"
-      return
-    fi
-  fi
-  printf "%s" "$fallback"
-}
-
-retag_image() {
-  image="$1"
-  case "$image" in
-    *@*) printf "%s" "$image" ;;
-    *:*) printf "%s:%s" "${image%:*}" "$RELEASE_ID" ;;
-    *) printf "%s:%s" "$image" "$RELEASE_ID" ;;
-  esac
-}
-
-service_container_name() {
-  printf "aifar-%s-%s" "$1" "$RELEASE_ID" | tr '. _/' '----'
-}
-
-replica_container_name() {
-  rcn_service="$1"
-  rcn_replica="$2"
-  rcn_base="$(service_container_name "$rcn_service")"
-  case "$rcn_replica" in ""|1) printf "%s" "$rcn_base" ;; *) printf "%s-r%s" "$rcn_base" "$rcn_replica" ;; esac
-}
-
-current_release() {
-  if [ -L "$CURRENT_LINK" ] || [ -d "$CURRENT_LINK" ]; then
-    readlink -f "$CURRENT_LINK" 2>/dev/null || printf "%s" "$CURRENT_LINK"
-  fi
-}
-
-manifest_value() {
-  mv_file="$1"
-  mv_key="$2"
-  [ -f "$mv_file" ] || return 1
-  sed -n "s/.*\"$mv_key\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" "$mv_file" | head -n 1
-}
-
-release_by_id() {
-  rbi_id="$(printf "%s" "$1" | tr -d '\r\n')"
-  [ -n "$rbi_id" ] || return 1
-  rbi_candidate="$RELEASES_DIR/$rbi_id"
-  [ -d "$rbi_candidate" ] || return 1
-  printf "%s" "$rbi_candidate"
-}
-
-release_owning_service_dir() {
-  ros_service="$1"
-  ros_real_dir="$2"
-  for ros_release in "$RELEASES_DIR"/*; do
-    [ -d "$ros_release" ] || continue
-    ros_service_dir="$ros_release/docker-apps/$ros_service"
-    [ -e "$ros_service_dir" ] || [ -L "$ros_service_dir" ] || continue
-    [ ! -L "$ros_service_dir" ] || continue
-    ros_candidate_real="$(readlink -f "$ros_service_dir" 2>/dev/null || printf "%s" "$ros_service_dir")"
-    if [ "$ros_candidate_real" = "$ros_real_dir" ]; then
-      printf "%s" "$ros_release"
-      return 0
-    fi
-  done
-  return 1
-}
-
-release_for_service() {
-  rfs_service="$1"
-  rfs_candidate="$2"
-  rfs_seen=""
-  while [ -n "$rfs_candidate" ] && [ -d "$rfs_candidate" ]; do
-    rfs_resolved="$(readlink -f "$rfs_candidate" 2>/dev/null || printf "%s" "$rfs_candidate")"
-    case " $rfs_seen " in
-      *" $rfs_resolved "*) break ;;
-    esac
-    rfs_seen="$rfs_seen $rfs_resolved"
-    rfs_service_dir="$rfs_candidate/docker-apps/$rfs_service"
-    if [ -d "$rfs_service_dir" ] || [ -L "$rfs_service_dir" ]; then
-      if [ ! -L "$rfs_service_dir" ]; then
-        printf "%s" "$rfs_candidate"
-        return 0
-      fi
-      rfs_real_dir="$(readlink -f "$rfs_service_dir" 2>/dev/null || printf "%s" "$rfs_service_dir")"
-      rfs_owner="$(release_owning_service_dir "$rfs_service" "$rfs_real_dir" || true)"
-      if [ -n "$rfs_owner" ]; then
-        printf "%s" "$rfs_owner"
-        return 0
-      fi
-      printf "%s" "$rfs_candidate"
-      return 0
-    fi
-    rfs_base_id="$(manifest_value "$rfs_candidate/.aifar/manifest.json" baseReleaseId || true)"
-    rfs_candidate="$(release_by_id "$rfs_base_id" || true)"
-  done
-  return 1
 }
 
 service_known() {
@@ -167,25 +60,6 @@ service_known() {
     [ "$service" = "$SERVICE_NAME" ] && return 0
   done
   return 1
-}
-
-service_changed() {
-  [ "$1" = "$SERVICE_NAME" ]
-}
-
-desired_replicas_for_service() {
-  drfs_service="$1"
-  drfs_value=""
-  for drfs_pair in $DESIRED_REPLICAS; do
-    case "$drfs_pair" in
-      "$drfs_service="*) drfs_value="${drfs_pair#*=}" ;;
-    esac
-  done
-  case "$drfs_value" in ""|*[!0-9]*) drfs_value=1 ;; esac
-  if [ "$drfs_value" -lt 1 ]; then
-    drfs_value=1
-  fi
-  printf "%s" "$drfs_value"
 }
 
 service_port_var() {
@@ -204,268 +78,95 @@ service_port_var() {
   esac
 }
 
-set_service_runtime_port() {
-  srp_service="$1"
-  [ "$srp_service" != "web-vue3" ] || return 0
-  srp_port_var="$(service_port_var "$srp_service")"
-  [ -n "$srp_port_var" ] || return 0
-  srp_port_value="$(read_env_value "$ENV_DIR/compose.env" "$srp_port_var" "")"
-  [ -n "$srp_port_value" ] || return 0
-  set_env SERVER_PORT "$srp_port_value" "$ENV_DIR/$srp_service.env"
+service_port() {
+  var="$(service_port_var "$1")"
+  [ -n "$var" ] || fail "unsupported service port: $1"
+  read_env_value "$ENV_DIR/compose.env" "$var" ""
 }
 
-verify_artifact() {
-  [ -f "$ARTIFACT_REMOTE" ] || fail "artifact file not found: $ARTIFACT_REMOTE"
-  if command -v sha256sum >/dev/null 2>&1; then
-    actual="$(sha256sum "$ARTIFACT_REMOTE" | awk '{print $1}')"
-    [ "$actual" = "$ARTIFACT_SHA256" ] || fail "artifact SHA256 mismatch: expected $ARTIFACT_SHA256 got $actual"
-  else
-    echo "warning: sha256sum not found, skip remote artifact checksum verification"
-  fi
-}
-
-copy_file_required() {
-  cfr_source="$1"
-  cfr_target="$2"
-  [ -f "$cfr_source" ] || fail "required release file is missing: $cfr_source"
-  mkdir -p "$(dirname "$cfr_target")"
-  cp "$cfr_source" "$cfr_target"
-}
-
-copy_shared_release_files() {
-  csrf_source="$1"
-  [ -f "$csrf_source/compose.yaml" ] || fail "current AIFAR release compose.yaml is missing"
-  [ -d "$csrf_source/env" ] || fail "current AIFAR release env directory is missing"
-  mkdir -p "$RELEASE_DIR" "$ENV_DIR" "$APP_DIR" "$AIFAR_DIR"
-  copy_file_required "$csrf_source/compose.yaml" "$RELEASE_DIR/compose.yaml"
-  cp -a "$csrf_source/env/." "$ENV_DIR/"
-}
-
-copy_service_release_files() {
-  csrf_service_source="$1"
-  csrf_service_dir="$csrf_service_source/docker-apps/$SERVICE_NAME"
-  [ -d "$csrf_service_dir" ] || fail "service directory is missing in release chain: $SERVICE_NAME"
-  csrf_real_dir="$(readlink -f "$csrf_service_dir" 2>/dev/null || printf "%s" "$csrf_service_dir")"
-  [ -d "$csrf_real_dir" ] || fail "service directory is missing in release chain: $SERVICE_NAME"
-  mkdir -p "$APP_DIR"
-  rm -rf "$APP_DIR/$SERVICE_NAME"
-  cp -a "$csrf_real_dir" "$APP_DIR/$SERVICE_NAME"
-  [ ! -L "$APP_DIR/$SERVICE_NAME" ] || fail "changed service directory must be materialized: $SERVICE_NAME"
-  if [ ! -f "$ENV_DIR/$SERVICE_NAME.env" ]; then
-    copy_file_required "$csrf_service_source/env/$SERVICE_NAME.env" "$ENV_DIR/$SERVICE_NAME.env"
-  fi
-}
-
-link_inherited_service_files() {
-  lis_service="$1"
-  lis_source="$2"
-  lis_service_dir="$lis_source/docker-apps/$lis_service"
-  [ -d "$lis_service_dir" ] || fail "service directory is missing in release chain: $lis_service"
-  lis_real_dir="$(readlink -f "$lis_service_dir" 2>/dev/null || printf "%s" "$lis_service_dir")"
-  [ -d "$lis_real_dir" ] || fail "service directory is missing in release chain: $lis_service"
-  mkdir -p "$APP_DIR"
-  if [ ! -e "$APP_DIR/$lis_service" ] && [ ! -L "$APP_DIR/$lis_service" ]; then
-    ln -s "$lis_real_dir" "$APP_DIR/$lis_service"
-  fi
-  if [ ! -f "$ENV_DIR/$lis_service.env" ]; then
-    copy_file_required "$lis_source/env/$lis_service.env" "$ENV_DIR/$lis_service.env"
-  fi
-}
-
-materialize_effective_service_dirs() {
-  for mes_service in $SERVICE_ORDER; do
-    if [ -e "$APP_DIR/$mes_service" ] || [ -L "$APP_DIR/$mes_service" ]; then
-      continue
-    fi
-    mes_source="$(release_for_service "$mes_service" "$BASE_RELEASE" || true)"
-    [ -n "$mes_source" ] || fail "service directory is missing in current release chain: $mes_service"
-    link_inherited_service_files "$mes_service" "$mes_source"
+desired_replicas_for_service() {
+  value=""
+  for pair in $DESIRED_REPLICAS; do
+    case "$pair" in
+      "$SERVICE_NAME="*) value="${pair#*=}" ;;
+    esac
   done
+  case "$value" in ""|*[!0-9]*) value=1 ;; esac
+  [ "$value" -ge 1 ] || value=1
+  printf "%s" "$value"
 }
 
-write_partial_compose_env() {
-  compose_env="$ENV_DIR/compose.env"
-  [ -f "$compose_env" ] || fail "compose env is missing: $compose_env"
-  set_env COMPOSE_PROJECT_NAME "$COMPOSE_PROJECT_NAME" "$compose_env"
-  set_env AIFAR_RELEASE_ID "$RELEASE_ID" "$compose_env"
-  set_env APP_NETWORK_NAME "$INGRESS_NETWORK" "$compose_env"
-  set_env AIFAR_INGRESS_NETWORK "$INGRESS_NETWORK" "$compose_env"
-  set_env AIFAR_INTERNAL_NETWORK "$INTERNAL_NETWORK" "$compose_env"
+pod_name() {
+  service="$1"
+  revision="$2"
+  replica="$3"
+  printf "aifar-pod-admin-%s-%s-r%s" "$service" "$revision" "$replica" | tr '. _/' '----'
 }
 
-apply_java_artifact() {
-  case "$ARTIFACT_FILE" in
-    *.jar) ;;
-    *) fail "$SERVICE_NAME update requires a .jar artifact" ;;
+service_proxy_name() {
+  printf "aifar-svc-admin-%s" "$1" | tr '. _/' '----'
+}
+
+retag_image() {
+  image="$1"
+  case "$image" in
+    *@*) printf "%s" "$image" ;;
+    *:*) printf "%s:%s" "${image%:*}" "$REVISION" ;;
+    *) printf "%s:%s" "$image" "$REVISION" ;;
   esac
-  service_dir="$APP_DIR/$SERVICE_NAME"
-  [ -d "$service_dir" ] || fail "service directory not found: $service_dir"
-  target_dir="$service_dir/target"
-  mkdir -p "$target_dir"
-  rm -f "$target_dir"/*.jar
-  cp "$ARTIFACT_REMOTE" "$target_dir/$ARTIFACT_FILE"
-}
-
-frontend_source_dir() {
-  if [ -f "$TMP_ARTIFACT_DIR/index.html" ]; then
-    printf "%s" "$TMP_ARTIFACT_DIR"
-    return
-  fi
-  if [ -d "$TMP_ARTIFACT_DIR/dist" ] && [ -f "$TMP_ARTIFACT_DIR/dist/index.html" ]; then
-    printf "%s" "$TMP_ARTIFACT_DIR/dist"
-    return
-  fi
-  candidate="$(find "$TMP_ARTIFACT_DIR" -mindepth 1 -maxdepth 1 -type d | head -n 1 || true)"
-  if [ -n "$candidate" ] && [ -f "$candidate/index.html" ]; then
-    printf "%s" "$candidate"
-    return
-  fi
-  if [ -n "$candidate" ] && [ -d "$candidate/dist" ] && [ -f "$candidate/dist/index.html" ]; then
-    printf "%s" "$candidate/dist"
-    return
-  fi
-  return 1
-}
-
-apply_frontend_artifact() {
-  rm -rf "$TMP_ARTIFACT_DIR"
-  mkdir -p "$TMP_ARTIFACT_DIR"
-  case "$ARTIFACT_FILE" in
-    *.tar.gz|*.tgz) tar -xzf "$ARTIFACT_REMOTE" -C "$TMP_ARTIFACT_DIR" ;;
-    *.tar) tar -xf "$ARTIFACT_REMOTE" -C "$TMP_ARTIFACT_DIR" ;;
-    *.zip)
-      command -v unzip >/dev/null 2>&1 || fail "unzip is required for frontend zip artifacts"
-      unzip -q "$ARTIFACT_REMOTE" -d "$TMP_ARTIFACT_DIR"
-      ;;
-    *) fail "web-vue3 update requires a zip, tar, tgz, or tar.gz artifact" ;;
-  esac
-  source_dir="$(frontend_source_dir || true)"
-  [ -n "$source_dir" ] || fail "frontend artifact must contain index.html or dist/index.html"
-  target_dir="$APP_DIR/web-vue3/dist"
-  rm -rf "$target_dir"
-  mkdir -p "$target_dir"
-  cp -a "$source_dir/." "$target_dir/"
 }
 
 apply_artifact() {
-  if [ "$SERVICE_NAME" = "web-vue3" ]; then
-    apply_frontend_artifact
-  else
-    apply_java_artifact
-  fi
+  service_dir="$APP_DIR/$SERVICE_NAME"
+  [ -d "$service_dir" ] || fail "service directory is missing: $SERVICE_NAME"
+  [ -f "$ARTIFACT_REMOTE" ] || fail "artifact file is missing: $ARTIFACT_REMOTE"
+  actual="$(sha256sum "$ARTIFACT_REMOTE" | awk '{print $1}')"
+  [ "$actual" = "$ARTIFACT_SHA256" ] || fail "artifact checksum mismatch for $ARTIFACT_FILE"
+  case "$SERVICE_NAME" in
+    web-vue3)
+      rm -rf "$service_dir/dist" "$service_dir/html" "$TMP_DIR"
+      mkdir -p "$TMP_DIR/web"
+      case "$ARTIFACT_FILE" in
+        *.zip) unzip -q "$ARTIFACT_REMOTE" -d "$TMP_DIR/web" ;;
+        *.tar|*.tgz|*.tar.gz) tar -xf "$ARTIFACT_REMOTE" -C "$TMP_DIR/web" ;;
+        *) fail "unsupported web artifact type: $ARTIFACT_FILE" ;;
+      esac
+      if [ -d "$TMP_DIR/web/dist" ]; then
+        cp -a "$TMP_DIR/web/dist" "$service_dir/dist"
+      else
+        mkdir -p "$service_dir/dist"
+        cp -a "$TMP_DIR/web/." "$service_dir/dist/"
+      fi
+      ;;
+    *)
+      mkdir -p "$service_dir"
+      cp "$ARTIFACT_REMOTE" "$service_dir/app.jar"
+      ;;
+  esac
 }
 
-patch_web_nginx_gateway_target() {
-  nginx_conf="$APP_DIR/web-vue3/nginx/default.conf"
-  [ -f "$nginx_conf" ] || return 0
-  gateway_container="$(route_container_for_service gateway)"
-  gateway_port="$(read_env_value "$ENV_DIR/compose.env" GATEWAY_PORT 38000)"
-  [ -n "$gateway_container" ] || fail "gateway route container is empty for web nginx config"
-  [ -n "$gateway_port" ] || gateway_port=38000
-  tmp="$nginx_conf.tmp"
-  placeholder="__AIFAR_GATEWAY_UPSTREAM__"
-  sed "s#http://aifar-gateway[-A-Za-z0-9_.]*:[0-9][0-9]*#${placeholder}#g; s#http://aifar-gateway[-A-Za-z0-9_.]*#${placeholder}#g; s#${placeholder}#http://${gateway_container}:${gateway_port}#g" "$nginx_conf" > "$tmp"
-  mv "$tmp" "$nginx_conf"
-}
-
-retag_selected_service() {
+ensure_service_runtime_env() {
   service_env="$ENV_DIR/$SERVICE_NAME.env"
-  source_env="$APP_DIR/$SERVICE_NAME/.env"
-  [ -f "$service_env" ] || fail "service env not found: $service_env"
-  image="$(read_env_value "$service_env" APP_IMAGE "$(read_env_value "$source_env" APP_IMAGE "aifar-$SERVICE_NAME:latest")")"
-  set_env APP_IMAGE "$(retag_image "$image")" "$service_env"
-  set_env APP_CONTAINER_NAME "$(service_container_name "$SERVICE_NAME")" "$service_env"
-  set_service_runtime_port "$SERVICE_NAME"
-}
-
-patch_compose_service_release() {
-  pcs_service="$1"
-  pcs_image="$(read_env_value "$ENV_DIR/$pcs_service.env" APP_IMAGE "")"
-  pcs_container="$(read_env_value "$ENV_DIR/$pcs_service.env" APP_CONTAINER_NAME "")"
-  [ -n "$pcs_image" ] || fail "service image is empty: $pcs_service"
-  [ -n "$pcs_container" ] || fail "service container name is empty: $pcs_service"
-  pcs_tmp="$RELEASE_DIR/compose.yaml.tmp"
-  awk -v svc="$pcs_service" -v image="$pcs_image" -v container="$pcs_container" -v release="$RELEASE_ID" -v project="$COMPOSE_PROJECT_NAME" '
-    function service_header(line) { return line ~ /^  [A-Za-z0-9_-]+:$/ }
-    $0 == "  " svc ":" { in_service=1; print; next }
-    in_service && service_header($0) { in_service=0; skip_networks=0 }
-    in_service && $0 ~ /^    image:/ { print "    image: " image; next }
-    in_service && $0 ~ /^    container_name:/ { print "    container_name: " container; next }
-    in_service && $0 ~ /^      aifar\.release:/ { print "      aifar.release: \"" release "\""; next }
-    in_service && $0 ~ /^      aifar\.compose-project:/ { print "      aifar.compose-project: \"" project "\""; next }
-    in_service && $0 ~ /^    networks:/ { print "    networks:"; print "      - ingress"; skip_networks=1; next }
-    in_service && skip_networks && $0 ~ /^      - / { next }
-    in_service && skip_networks { skip_networks=0 }
-    { print }
-  ' "$RELEASE_DIR/compose.yaml" > "$pcs_tmp"
-  mv "$pcs_tmp" "$RELEASE_DIR/compose.yaml"
-}
-
-ensure_network() {
-  network="$(read_env_value "$ENV_DIR/compose.env" AIFAR_INGRESS_NETWORK "$INGRESS_NETWORK")"
-  docker network inspect "$network" >/dev/null 2>&1 || docker network create --driver bridge "$network" >/dev/null
-}
-
-release_internal_network() {
-  rin_release="$1"
-  [ -n "$rin_release" ] || return 0
-  read_env_value "$rin_release/env/compose.env" AIFAR_INTERNAL_NETWORK ""
-}
-
-connect_container_to_network() {
-  ctn_container="$1"
-  ctn_network="$2"
-  [ -n "$ctn_container" ] || return 0
-  [ -n "$ctn_network" ] || return 0
-  [ "$ctn_network" != "$INGRESS_NETWORK" ] || return 0
-  [ "$ctn_network" != "$INTERNAL_NETWORK" ] || return 0
-  docker network inspect "$ctn_network" >/dev/null 2>&1 || return 0
-  docker network connect "$ctn_network" "$ctn_container" >/dev/null 2>&1 || true
-}
-
-connect_service_to_legacy_internal_networks() {
-  csl_service="$1"
-  csl_container="${2:-}"
-  if [ -z "$csl_container" ]; then
-    csl_container="$(container_for_service "$csl_service")"
+  [ -f "$service_env" ] || fail "service env is missing: $SERVICE_NAME"
+  image="$(read_env_value "$service_env" APP_IMAGE "")"
+  [ -n "$image" ] || image="aifar-$SERVICE_NAME:$REVISION"
+  new_image="$(retag_image "$image")"
+  set_env APP_IMAGE "$new_image" "$service_env"
+  set_env APP_CONTAINER_NAME "$(pod_name "$SERVICE_NAME" "$REVISION" 1)" "$service_env"
+  set_env AIFAR_REVISION "$REVISION" "$service_env"
+  if [ "$SERVICE_NAME" != "web-vue3" ]; then
+    port="$(service_port "$SERVICE_NAME")"
+    [ -n "$port" ] || fail "service port is missing: $SERVICE_NAME"
+    set_env SERVER_PORT "$port" "$service_env"
+    set_env SPRING_CLOUD_NACOS_DISCOVERY_REGISTER_ENABLED false "$service_env"
   fi
-  [ -n "$csl_container" ] || return 0
-  csl_seen=""
-  for csl_peer in $SERVICE_ORDER; do
-    csl_source="$(release_for_service "$csl_peer" "$BASE_RELEASE" || true)"
-    [ -n "$csl_source" ] || continue
-    csl_network="$(release_internal_network "$csl_source")"
-    [ -n "$csl_network" ] || continue
-    case " $csl_seen " in
-      *" $csl_network "*) continue ;;
-    esac
-    csl_seen="$csl_seen $csl_network"
-    connect_container_to_network "$csl_container" "$csl_network"
-  done
 }
 
-container_for_service() {
-  service="$1"
-  read_env_value "$ENV_DIR/$service.env" APP_CONTAINER_NAME ""
-}
-
-container_for_service_in_release() {
-  cf_release="$1"
-  cf_service="$2"
-  read_env_value "$cf_release/env/$cf_service.env" APP_CONTAINER_NAME ""
-}
-
-route_container_for_service() {
-  rc_service="$1"
-  rc_container="$(container_for_service "$rc_service")"
-  if [ -n "$rc_container" ]; then
-    printf "%s" "$rc_container"
-    return
-  fi
-  rc_release="$(release_for_service "$rc_service" "$BASE_RELEASE" || true)"
-  if [ -n "$rc_release" ]; then
-    container_for_service_in_release "$rc_release" "$rc_service"
-  fi
+build_image() {
+  service_env="$ENV_DIR/$SERVICE_NAME.env"
+  image="$(read_env_value "$service_env" APP_IMAGE "")"
+  [ -n "$image" ] || fail "service image is empty: $SERVICE_NAME"
+  docker build -t "$image" "$APP_DIR/$SERVICE_NAME"
 }
 
 container_status() {
@@ -476,522 +177,190 @@ container_health() {
   docker inspect --format '{{ "{{" }}if .State.Health{{ "}}" }}{{ "{{" }}.State.Health.Status{{ "}}" }}{{ "{{" }}end{{ "}}" }}' "$1" 2>/dev/null || true
 }
 
-container_restart_count() {
-  docker inspect --format '{{ "{{" }}.RestartCount{{ "}}" }}' "$1" 2>/dev/null || printf "0"
-}
-
-service_runtime_ready() {
-  service="$1"
-  container="${2:-}"
-  if [ -z "$container" ]; then
-    container="$(container_for_service "$service")"
-  fi
-  [ -n "$container" ] || return 0
-  status="$(container_status "$container")"
-  if [ "$status" != "running" ]; then
-    echo "$service container $container is not running: ${status:-missing}" >&2
-    return 1
-  fi
-  health="$(container_health "$container")"
-  if [ -n "$health" ] && [ "$health" != "healthy" ]; then
-    echo "$service container $container health is $health" >&2
-    return 1
-  fi
-  if [ "$service" != "web-vue3" ]; then
-    restarts="$(container_restart_count "$container")"
-    case "$restarts" in
-      ""|*[!0-9]*) restarts=0 ;;
-    esac
-    if [ "$restarts" -gt 0 ]; then
-      echo "$service container $container restarted $restarts time(s) during startup" >&2
-      return 1
+wait_pod_ready() {
+  container="$1"
+  timeout="$(read_env_value "$ENV_DIR/compose.env" APP_STARTUP_TIMEOUT 180)"
+  case "$timeout" in ""|*[!0-9]*) timeout=180 ;; esac
+  deadline=$(( $(date +%s) + timeout ))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    status="$(container_status "$container")"
+    health="$(container_health "$container")"
+    if [ "$status" = "running" ] && { [ -z "$health" ] || [ "$health" = "healthy" ]; }; then
+      echo "Pod ready: $container"
+      return 0
     fi
-  fi
-  return 0
-}
-
-wait_service_ready() {
-  startup_timeout="$(read_env_value "$ENV_DIR/compose.env" APP_STARTUP_TIMEOUT 180)"
-  service="${1:-$SERVICE_NAME}"
-  container="${2:-}"
-  stable_window="$(read_env_value "$ENV_DIR/compose.env" APP_STABLE_WINDOW 10)"
-  case "$startup_timeout" in
-    ""|*[!0-9]*) startup_timeout=180 ;;
-  esac
-  deadline=$(( $(date +%s) + startup_timeout ))
-  while :; do
-    if service_runtime_ready "$service" "$container"; then
-      break
-    fi
-    if [ "$(date +%s)" -ge "$deadline" ]; then
-      echo "AIFAR service $service did not become ready in release $RELEASE_ID" >&2
-      return 1
-    fi
-    sleep 3
+    sleep 5
   done
-  case "$stable_window" in
-    ""|*[!0-9]*) stable_window=10 ;;
-  esac
-  if [ "$stable_window" -gt 0 ]; then
-    sleep "$stable_window"
-  fi
-  service_runtime_ready "$service" "$container"
-}
-
-list_containers_by_label() {
-  lcb_service="$1"
-  lcb_release="${2:-}"
-  if [ -n "$lcb_release" ]; then
-    docker ps --filter "label=aifar.app=aifar" \
-      --filter "label=aifar.install-root=$INSTALL_ROOT" \
-      --filter "label=aifar.service=$lcb_service" \
-      --filter "label=aifar.release=$lcb_release" \
-      --format '{{ "{{" }}.Names{{ "}}" }}' 2>/dev/null || true
-    return
-  fi
-  docker ps --filter "label=aifar.app=aifar" \
-    --filter "label=aifar.install-root=$INSTALL_ROOT" \
-    --filter "label=aifar.service=$lcb_service" \
-    --format '{{ "{{" }}.Names{{ "}}" }}' 2>/dev/null || true
-}
-
-list_route_containers() {
-  lrc_service="$1"
-  if service_changed "$lrc_service"; then
-    list_containers_by_label "$lrc_service" "$RELEASE_ID"
-    return
-  fi
-  list_containers_by_label "$lrc_service" ""
-}
-
-write_ingress_config() {
-  mkdir -p "$INGRESS_DIR"
-  gateway_port="$(read_env_value "$ENV_DIR/compose.env" GATEWAY_PORT 38000)"
-  web_port="$(read_env_value "$ENV_DIR/compose.env" WEB_VUE3_PORT 8080)"
-  gateway_servers="$(list_route_containers gateway)"
-  web_servers="$(list_route_containers web-vue3)"
-  [ -n "$gateway_servers" ] || fail "gateway upstream has no running endpoints"
-  [ -n "$web_servers" ] || fail "web-vue3 upstream has no running endpoints"
-  tmp="$INGRESS_CONFIG.tmp"
-  cat > "$tmp" <<NGINX
-events {}
-http {
-  map \$http_upgrade \$connection_upgrade {
-    default upgrade;
-    '' close;
-  }
-  map \$http_x_forwarded_for \$client_real_ip {
-    ~^(?<first_ip>[^,]+) \$first_ip;
-    default \$remote_addr;
-  }
-  upstream aifar_gateway {
-NGINX
-  for endpoint in $gateway_servers; do
-    printf "    server %s:%s;\n" "$endpoint" "$gateway_port" >> "$tmp"
-  done
-  cat >> "$tmp" <<NGINX
-  }
-  upstream aifar_web {
-NGINX
-  for endpoint in $web_servers; do
-    printf "    server %s:%s;\n" "$endpoint" "$web_port" >> "$tmp"
-  done
-  cat >> "$tmp" <<NGINX
-  }
-  server {
-    listen ${gateway_port};
-    client_max_body_size 1000m;
-    proxy_connect_timeout 300s;
-    proxy_buffering off;
-    proxy_request_buffering off;
-    location / {
-      proxy_set_header Host \$http_host;
-      proxy_set_header X-Real-IP \$client_real_ip;
-      proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-      proxy_set_header X-Forwarded-Proto \$scheme;
-      proxy_set_header X-NginX-Proxy true;
-      proxy_pass http://aifar_gateway;
-    }
-  }
-  server {
-    listen ${web_port};
-    client_max_body_size 1000m;
-    proxy_connect_timeout 300s;
-    proxy_buffering off;
-    proxy_request_buffering off;
-    location /api/ {
-      proxy_intercept_errors off;
-      proxy_set_header Host \$http_host;
-      proxy_set_header X-Real-IP \$client_real_ip;
-      proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-      proxy_set_header X-Forwarded-Proto \$scheme;
-      proxy_set_header X-NginX-Proxy true;
-      proxy_pass http://aifar_gateway;
-    }
-    location /im/ws/ {
-      proxy_intercept_errors off;
-      proxy_http_version 1.1;
-      proxy_set_header Upgrade \$http_upgrade;
-      proxy_set_header Connection \$connection_upgrade;
-      proxy_set_header Host \$http_host;
-      proxy_set_header X-Real-IP \$client_real_ip;
-      proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-      proxy_set_header X-Forwarded-Proto \$scheme;
-      proxy_set_header X-NginX-Proxy true;
-      proxy_read_timeout 3600s;
-      proxy_send_timeout 3600s;
-      proxy_pass http://aifar_gateway;
-    }
-    location / {
-      proxy_set_header Host \$http_host;
-      proxy_set_header X-Real-IP \$client_real_ip;
-      proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-      proxy_set_header X-Forwarded-Proto \$scheme;
-      proxy_set_header X-NginX-Proxy true;
-      proxy_pass http://aifar_web;
-    }
-  }
-}
-NGINX
-  mv "$tmp" "$INGRESS_CONFIG"
-}
-
-ingress_running() {
-  [ "$(docker inspect --format '{{ "{{" }}.State.Running{{ "}}" }}' "$INGRESS_CONTAINER" 2>/dev/null || echo false)" = "true" ]
-}
-
-reload_ingress() {
-  echo "reloading AIFAR ingress $INGRESS_CONTAINER"
-  docker exec "$INGRESS_CONTAINER" nginx -t >/dev/null
-  docker exec "$INGRESS_CONTAINER" nginx -s reload >/dev/null
-  echo "AIFAR ingress reloaded"
-}
-
-ingress_config_needs_route_patch() {
-  [ -f "$INGRESS_CONFIG" ] || return 0
-  grep -q 'location /api/' "$INGRESS_CONFIG" || return 0
-  grep -q 'location /im/ws/' "$INGRESS_CONFIG" || return 0
-  grep -q 'proxy_pass http://aifar_gateway;' "$INGRESS_CONFIG" || return 0
+  docker logs --tail 120 "$container" >&2 || true
   return 1
 }
 
-configure_ingress_if_needed() {
-  case "$SERVICE_NAME" in
-    gateway|web-vue3) ;;
-    *)
-      if ! ingress_config_needs_route_patch; then
-        return 0
-      fi
-      ;;
-  esac
-  mkdir -p "$INGRESS_DIR"
-  if [ -f "$INGRESS_CONFIG" ]; then
-    cp "$INGRESS_CONFIG" "$INGRESS_CONFIG_BACKUP"
-  fi
-  write_ingress_config
-  if ingress_running && reload_ingress; then
-    return 0
-  fi
-  if [ -f "$INGRESS_CONFIG_BACKUP" ]; then
-    cp "$INGRESS_CONFIG_BACKUP" "$INGRESS_CONFIG"
-    reload_ingress || true
-  fi
-  return 1
-}
+start_pod() {
+  replica="$1"
+  container="$(pod_name "$SERVICE_NAME" "$REVISION" "$replica")"
+  service_env="$ENV_DIR/$SERVICE_NAME.env"
+  compose_env="$ENV_DIR/compose.env"
+  image="$(read_env_value "$service_env" APP_IMAGE "")"
+  port="$(service_port "$SERVICE_NAME")"
+  app_memory_limit="$(read_env_value "$compose_env" APP_MEMORY_LIMIT "")"
+  app_cpus="$(read_env_value "$compose_env" APP_CPUS "")"
+  restart_policy="$(read_env_value "$compose_env" APP_RESTART_POLICY unless-stopped)"
+  health_protocol="$(read_env_value "$compose_env" APP_HEALTH_PROTOCOL http)"
+  health_host="$(read_env_value "$compose_env" APP_HEALTH_HOST 127.0.0.1)"
+  health_path="$(read_env_value "$compose_env" APP_HEALTH_PATH "")"
+  health_connect_timeout="$(read_env_value "$compose_env" APP_HEALTH_CONNECT_TIMEOUT 3)"
+  health_interval="$(read_env_value "$compose_env" APP_HEALTH_INTERVAL 15s)"
+  health_timeout="$(read_env_value "$compose_env" APP_HEALTH_TIMEOUT 5s)"
+  health_retries="$(read_env_value "$compose_env" APP_HEALTH_RETRIES 3)"
+  health_start_period="$(read_env_value "$compose_env" APP_HEALTH_START_PERIOD 30s)"
+  tz_value="$(read_env_value "$compose_env" TZ system)"
+  resource_args=""
+  [ -z "$app_cpus" ] || resource_args="$resource_args --cpus $app_cpus"
+  [ -z "$app_memory_limit" ] || resource_args="$resource_args --memory $app_memory_limit"
 
-apply_restart_policy_for_service() {
-  policy="$(read_env_value "$ENV_DIR/compose.env" APP_RESTART_POLICY unless-stopped)"
-  [ -n "$policy" ] || policy="unless-stopped"
-  list_containers_by_label "$SERVICE_NAME" "$RELEASE_ID" | while read -r container; do
-    [ -n "$container" ] || continue
-    docker update --restart "$policy" "$container" >/dev/null 2>&1 || true
-  done
-}
-
-start_updated_service() {
-  (
-    cd "$RELEASE_DIR"
-    APP_RESTART_POLICY=no
-    export APP_RESTART_POLICY
-    compose --env-file env/compose.env -f compose.yaml up -d --build --no-deps "$SERVICE_NAME"
-  )
-}
-
-start_replica_container() {
-  src_service="$1"
-  src_replica="$2"
-  src_container="$(replica_container_name "$src_service" "$src_replica")"
-  src_service_env="$ENV_DIR/$src_service.env"
-  src_compose_env="$ENV_DIR/compose.env"
-  src_image="$(read_env_value "$src_service_env" APP_IMAGE "")"
-  [ -n "$src_image" ] || fail "service image is empty: $src_service"
-  src_port_var="$(service_port_var "$src_service")"
-  src_port="$(read_env_value "$src_compose_env" "$src_port_var" "")"
-  src_health_protocol="$(read_env_value "$src_compose_env" APP_HEALTH_PROTOCOL http)"
-  src_health_host="$(read_env_value "$src_compose_env" APP_HEALTH_HOST 127.0.0.1)"
-  src_health_path="$(read_env_value "$src_compose_env" APP_HEALTH_PATH "")"
-  src_health_connect_timeout="$(read_env_value "$src_compose_env" APP_HEALTH_CONNECT_TIMEOUT 3)"
-  src_health_interval="$(read_env_value "$src_compose_env" APP_HEALTH_INTERVAL 15s)"
-  src_health_timeout="$(read_env_value "$src_compose_env" APP_HEALTH_TIMEOUT 5s)"
-  src_health_retries="$(read_env_value "$src_compose_env" APP_HEALTH_RETRIES 3)"
-  src_health_start_period="$(read_env_value "$src_compose_env" APP_HEALTH_START_PERIOD 30s)"
-  src_app_cpus="$(read_env_value "$src_compose_env" APP_CPUS "")"
-  src_memory_limit="$(read_env_value "$src_compose_env" APP_MEMORY_LIMIT "")"
-  src_tz="$(read_env_value "$src_compose_env" TZ system)"
-  src_env_args=""
-  if [ "$src_service" = "web-vue3" ]; then
-    src_env_args="$src_env_args --env-file $src_service_env"
-    src_health_cmd="wget -q -T $src_health_connect_timeout -O /dev/null ${src_health_protocol}://${src_health_host}:${src_port}${src_health_path} || exit 1"
+  docker rm -f "$container" >/dev/null 2>&1 || true
+  if [ "$SERVICE_NAME" = "web-vue3" ]; then
+    env_args="--env-file $service_env"
+    health_cmd="wget -q -T $health_connect_timeout -O /dev/null ${health_protocol}://${health_host}:${port}${health_path} || exit 1"
   else
-    src_env_args="$src_env_args --env-file $ENV_DIR/java-common.env --env-file $ENV_DIR/java-secrets.env --env-file $src_service_env"
-    src_health_cmd="curl -fsS --connect-timeout $src_health_connect_timeout ${src_health_protocol}://${src_health_host}:${src_port}${src_health_path} >/dev/null || exit 1"
+    env_args="--env-file $ENV_DIR/java-common.env --env-file $ENV_DIR/java-secrets.env --env-file $service_env"
+    health_cmd="curl -fsS --connect-timeout $health_connect_timeout ${health_protocol}://${health_host}:${port}${health_path} >/dev/null || exit 1"
   fi
-  docker rm -f "$src_container" >/dev/null 2>&1 || true
+
   docker run -d \
-    --name "$src_container" \
+    --name "$container" \
     --restart no \
     --label aifar.app=aifar \
     --label "aifar.install-root=$INSTALL_ROOT" \
-    --label "aifar.release=$RELEASE_ID" \
-    --label "aifar.service=$src_service" \
-    --label "aifar.replica=$src_replica" \
+    --label "aifar.component=pod" \
+    --label "aifar.service=$SERVICE_NAME" \
+    --label "aifar.revision=$REVISION" \
+    --label "aifar.release=$REVISION" \
+    --label "aifar.pod=$(pod_name "$SERVICE_NAME" "$REVISION" "$replica")" \
+    --label "aifar.replica=$replica" \
     --network "$INGRESS_NETWORK" \
-    --cpus "$src_app_cpus" \
-    --memory "$src_memory_limit" \
-    --health-cmd "$src_health_cmd" \
-    --health-interval "$src_health_interval" \
-    --health-timeout "$src_health_timeout" \
-    --health-retries "$src_health_retries" \
-    --health-start-period "$src_health_start_period" \
-    -e "APP_CONTAINER_NAME=$src_container" \
-    -e "TZ=$src_tz" \
-    $src_env_args \
-    "$src_image" >/dev/null
-  connect_service_to_legacy_internal_networks "$src_service" "$src_container"
-  wait_service_ready "$src_service" "$src_container"
+    $resource_args \
+    --health-cmd "$health_cmd" \
+    --health-interval "$health_interval" \
+    --health-timeout "$health_timeout" \
+    --health-retries "$health_retries" \
+    --health-start-period "$health_start_period" \
+    -e "APP_CONTAINER_NAME=$container" \
+    -e "TZ=$tz_value" \
+    $env_args \
+    "$image" >/dev/null
+  wait_pod_ready "$container" || return 1
+  docker update --restart "$restart_policy" "$container" >/dev/null 2>&1 || true
 }
 
-start_additional_replicas() {
-  sar_service="$1"
-  sar_desired="$(desired_replicas_for_service "$sar_service")"
-  [ "$sar_desired" -gt 1 ] || return 0
-  sar_replica=2
-  while [ "$sar_replica" -le "$sar_desired" ]; do
-    start_replica_container "$sar_service" "$sar_replica"
-    sar_replica=$((sar_replica + 1))
+write_service_proxy_config() {
+  service="$1"
+  revision="$2"
+  port="$(service_port "$service")"
+  conf="$PROXY_DIR/$service/nginx.conf"
+  tmp="$conf.tmp"
+  mkdir -p "$(dirname "$conf")"
+  names="$(docker ps --filter "label=aifar.app=aifar" --filter "label=aifar.install-root=$INSTALL_ROOT" --filter "label=aifar.component=pod" --filter "label=aifar.service=$service" --filter "label=aifar.revision=$revision" --format '{{ "{{" }}.Names{{ "}}" }}' 2>/dev/null || true)"
+  [ -n "$names" ] || fail "service $service has no ready pods for revision $revision"
+  cat > "$tmp" <<NGINX
+events {}
+http {
+  upstream aifar_${service}_pods {
+NGINX
+  for name in $names; do
+    health="$(container_health "$name")"
+    [ -z "$health" ] || [ "$health" = "healthy" ] || continue
+    printf "    server %s:%s;\n" "$name" "$port" >> "$tmp"
   done
-}
-
-stop_service_in_release() {
-  ss_release="$1"
-  ss_service="$2"
-  [ -n "$ss_release" ] || return 0
-  [ -f "$ss_release/compose.yaml" ] || return 0
-  (
-    cd "$ss_release"
-    compose --env-file env/compose.env -f compose.yaml stop "$ss_service" >/dev/null 2>&1 || true
-    compose --env-file env/compose.env -f compose.yaml rm -f "$ss_service" >/dev/null 2>&1 || true
-  )
-  ss_release_id="$(basename "$ss_release")"
-  docker ps -a --filter "label=aifar.app=aifar" \
-    --filter "label=aifar.install-root=$INSTALL_ROOT" \
-    --filter "label=aifar.release=$ss_release_id" \
-    --filter "label=aifar.service=$ss_service" \
-    --format '{{ "{{" }}.Names{{ "}}" }}' 2>/dev/null | while read -r ss_container; do
-      [ -n "$ss_container" ] || continue
-      docker rm -f "$ss_container" >/dev/null 2>&1 || true
-    done
-}
-
-rollback_service() {
-  previous="$1"
-  [ -n "$previous" ] || return 0
-  [ -f "$previous/compose.yaml" ] || return 0
-  echo "rolling back $SERVICE_NAME to previous AIFAR release: $previous"
-  (
-    cd "$previous"
-    compose --env-file env/compose.env -f compose.yaml up -d --no-deps "$SERVICE_NAME" || true
-  )
-}
-
-activate_release() {
-  if [ -L "$CURRENT_LINK" ] || [ -f "$CURRENT_LINK" ]; then
-    rm -f "$CURRENT_LINK"
-  elif [ -d "$CURRENT_LINK" ]; then
-    rm -rf "$CURRENT_LINK"
-  fi
-  ln -s "$RELEASE_DIR" "$CURRENT_LINK"
-}
-
-json_escape() {
-  printf "%s" "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
-}
-
-write_containers_json() {
-  wc_first=1
-  for wc_service in $SERVICE_ORDER; do
-    wc_container="$(container_for_service "$wc_service")"
-    [ -n "$wc_container" ] || continue
-    if [ "$wc_first" -eq 0 ]; then
-      printf ",\n"
-    fi
-    printf '    "%s": "%s"' "$wc_service" "$wc_container"
-    wc_first=0
-  done
-}
-
-write_manifest() {
-  status="$1"
-  base_release_id="$2"
-  artifact_file_json="$(json_escape "$ARTIFACT_FILE")"
-  mkdir -p "$AIFAR_DIR"
-  cat > "$AIFAR_DIR/manifest.json" <<MANIFEST
-{
-  "app": "aifar",
-  "version": "$VERSION",
-  "releaseId": "$RELEASE_ID",
-  "layout": "release-v1",
-  "kind": "partial",
-  "status": "$status",
-  "configHash": "$CONFIG_HASH",
-  "baseReleaseId": "$base_release_id",
-  "createdAt": "$CREATED_AT",
-  "releaseRetention": $RELEASE_KEEP_COUNT,
-  "composeProject": "$COMPOSE_PROJECT_NAME",
-  "ingressNetwork": "$INGRESS_NETWORK",
-  "internalNetwork": "$INTERNAL_NETWORK",
-  "changedServices": ["$SERVICE_NAME"],
-  "containers": {
-$(write_containers_json)
-  },
-  "routes": {
-    "gateway": {"container": "$(route_container_for_service gateway)", "port": $(read_env_value "$ENV_DIR/compose.env" GATEWAY_PORT 38000)},
-    "web-vue3": {"container": "$(route_container_for_service web-vue3)", "port": $(read_env_value "$ENV_DIR/compose.env" WEB_VUE3_PORT 8080)}
-  },
-  "artifacts": {
-    "$SERVICE_NAME": {
-      "file": "$artifact_file_json",
-      "sha256": "$ARTIFACT_SHA256",
-      "size": $ARTIFACT_SIZE
+  cat >> "$tmp" <<NGINX
+  }
+  server {
+    listen ${port};
+    client_max_body_size 1000m;
+    proxy_connect_timeout 300s;
+    proxy_buffering off;
+    proxy_request_buffering off;
+    location / {
+      proxy_set_header Host \$host;
+      proxy_set_header X-Real-IP \$remote_addr;
+      proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+      proxy_set_header X-Forwarded-Proto \$scheme;
+      proxy_pass http://aifar_${service}_pods;
     }
   }
 }
-MANIFEST
+NGINX
+  mv "$tmp" "$conf"
 }
 
-release_chain_ids() {
-  rci_candidate="$1"
-  rci_seen=""
-  while [ -n "$rci_candidate" ] && [ -d "$rci_candidate" ]; do
-    rci_id="$(basename "$rci_candidate")"
-    case " $rci_seen " in
-      *" $rci_id "*) break ;;
-    esac
-    rci_seen="$rci_seen $rci_id"
-    printf "%s\n" "$rci_id"
-    rci_base_id="$(manifest_value "$rci_candidate/.aifar/manifest.json" baseReleaseId || true)"
-    rci_candidate="$(release_by_id "$rci_base_id" || true)"
+reload_service_proxy() {
+  proxy="$(service_proxy_name "$SERVICE_NAME")"
+  docker exec "$proxy" nginx -t >/dev/null
+  docker exec "$proxy" nginx -s reload >/dev/null
+}
+
+stop_old_pods() {
+  old="$(docker ps -a --filter "label=aifar.app=aifar" --filter "label=aifar.install-root=$INSTALL_ROOT" --filter "label=aifar.component=pod" --filter "label=aifar.service=$SERVICE_NAME" --format '{{ "{{" }}.Names{{ "}}" }}|{{ "{{" }}.Label "aifar.revision"{{ "}}" }}' 2>/dev/null || true)"
+  [ -z "$old" ] && return 0
+  sleep "$DRAIN_SECONDS"
+  printf "%s\n" "$old" | while IFS='|' read -r name revision; do
+    [ -n "$name" ] || continue
+    [ "$revision" != "$REVISION" ] || continue
+    docker rm -f "$name" >/dev/null 2>&1 || true
   done
 }
 
-release_id_protected() {
-  rip_id="$1"
-  for rip_keep_id in $PROTECTED_RELEASE_IDS; do
-    [ "$rip_keep_id" = "$rip_id" ] && return 0
-  done
-  return 1
+write_model_manifest() {
+  mkdir -p "$INSTALL_ROOT/.aifar"
+  cat > "$INSTALL_ROOT/.aifar/last-rollout.json" <<JSON
+{
+  "model": "${ORCHESTRATION_MODEL}",
+  "kind": "rollout",
+  "service": "${SERVICE_NAME}",
+  "revision": "${REVISION}",
+  "version": "${VERSION}",
+  "createdAt": "${CREATED_AT}",
+  "configHash": "${CONFIG_HASH}",
+  "artifact": {
+    "file": "${ARTIFACT_FILE}",
+    "sha256": "${ARTIFACT_SHA256}",
+    "size": ${ARTIFACT_SIZE}
+  }
+}
+JSON
 }
 
-cleanup_old_releases() {
-  [ -d "$RELEASES_DIR" ] || return 0
-  current="$(current_release || true)"
-  PROTECTED_RELEASE_IDS=""
-  if [ -n "$current" ]; then
-    PROTECTED_RELEASE_IDS="$(release_chain_ids "$current" || true)"
-  fi
-  count=0
-  find "$RELEASES_DIR" -mindepth 1 -maxdepth 1 -type d | sort -r | while read -r release_dir; do
-    [ -f "$release_dir/.aifar/manifest.json" ] || continue
-    grep -q '"status"[[:space:]]*:[[:space:]]*"success"' "$release_dir/.aifar/manifest.json" || continue
-    count=$((count + 1))
-    if [ "$count" -le "$RELEASE_KEEP_COUNT" ]; then
-      PROTECTED_RELEASE_IDS="$PROTECTED_RELEASE_IDS $(release_chain_ids "$release_dir" || true)"
-      continue
-    fi
-    if [ -n "$current" ] && [ "$(readlink -f "$release_dir" 2>/dev/null || printf "%s" "$release_dir")" = "$current" ]; then
-      continue
-    fi
-    if release_id_protected "$(basename "$release_dir")"; then
-      continue
-    fi
-    rm -rf "$release_dir"
-  done
+cleanup_failed_rollout() {
+  pods="$(docker ps -a --filter "label=aifar.app=aifar" --filter "label=aifar.install-root=$INSTALL_ROOT" --filter "label=aifar.component=pod" --filter "label=aifar.service=$SERVICE_NAME" --filter "label=aifar.revision=$REVISION" --format '{{ "{{" }}.Names{{ "}}" }}' 2>/dev/null || true)"
+  [ -z "$pods" ] || docker rm -f $pods >/dev/null 2>&1 || true
 }
 
 command -v docker >/dev/null 2>&1 || fail "docker command is required"
 docker info >/dev/null 2>&1 || fail "docker daemon is not available"
 service_known || fail "unsupported AIFAR service: $SERVICE_NAME"
-verify_artifact
+[ -d "$APP_DIR" ] || fail "AIFAR runtime app directory is missing"
+[ -d "$ENV_DIR" ] || fail "AIFAR runtime env directory is missing"
+[ -f "$INSTALL_ROOT/.aifar/model.json" ] || fail "AIFAR k8s-like model manifest is missing"
+grep -q '"model"[[:space:]]*:[[:space:]]*"k8s-like-v1"' "$INSTALL_ROOT/.aifar/model.json" || fail "AIFAR instance is legacy; reinstall with k8s-like orchestration"
 
-BASE_RELEASE="$(current_release || true)"
-[ -n "$BASE_RELEASE" ] || fail "current AIFAR release is missing"
-[ -d "$BASE_RELEASE" ] || fail "current AIFAR release directory is missing: $BASE_RELEASE"
-[ -f "$BASE_RELEASE/compose.yaml" ] || fail "current AIFAR release compose.yaml is missing"
-BASE_RELEASE_ID="$(basename "$BASE_RELEASE")"
-SERVICE_BASE_RELEASE="$(release_for_service "$SERVICE_NAME" "$BASE_RELEASE" || true)"
-[ -n "$SERVICE_BASE_RELEASE" ] || fail "service directory is missing in current release chain: $SERVICE_NAME"
-
-mkdir -p "$INSTALL_ROOT" "$WORK_DIR" "$RELEASES_DIR"
-rm -rf "$RELEASE_DIR" "$TMP_ARTIFACT_DIR"
-mkdir -p "$RELEASE_DIR" "$ENV_DIR" "$AIFAR_DIR"
-copy_shared_release_files "$BASE_RELEASE"
-copy_service_release_files "$SERVICE_BASE_RELEASE"
-materialize_effective_service_dirs
-write_partial_compose_env
-
+trap 'cleanup_failed_rollout' INT TERM
 apply_artifact
-retag_selected_service
-if [ "$SERVICE_NAME" = "web-vue3" ]; then
-  patch_web_nginx_gateway_target
+ensure_service_runtime_env
+build_image
+desired="$(desired_replicas_for_service)"
+replica=1
+while [ "$replica" -le "$desired" ]; do
+  if ! start_pod "$replica"; then
+    cleanup_failed_rollout
+    fail "new AIFAR Pod did not become ready for $SERVICE_NAME replica $replica"
+  fi
+  replica=$((replica + 1))
+done
+write_service_proxy_config "$SERVICE_NAME" "$REVISION"
+if ! reload_service_proxy; then
+  cleanup_failed_rollout
+  fail "AIFAR service proxy reload failed: $SERVICE_NAME"
 fi
-patch_compose_service_release "$SERVICE_NAME"
-write_manifest "pending" "$BASE_RELEASE_ID"
-ensure_network
-
-if ! start_updated_service; then
-  write_manifest "failed" "$BASE_RELEASE_ID"
-  stop_service_in_release "$RELEASE_DIR" "$SERVICE_NAME"
-  rollback_service "$SERVICE_BASE_RELEASE"
-  fail "AIFAR service $SERVICE_NAME failed to start in partial release $RELEASE_ID"
-fi
-connect_service_to_legacy_internal_networks "$SERVICE_NAME"
-
-if ! wait_service_ready; then
-  write_manifest "failed" "$BASE_RELEASE_ID"
-  stop_service_in_release "$RELEASE_DIR" "$SERVICE_NAME"
-  rollback_service "$SERVICE_BASE_RELEASE"
-  fail "AIFAR service $SERVICE_NAME did not become stable in partial release $RELEASE_ID"
-fi
-
-if ! start_additional_replicas "$SERVICE_NAME"; then
-  write_manifest "failed" "$BASE_RELEASE_ID"
-  stop_service_in_release "$RELEASE_DIR" "$SERVICE_NAME"
-  rollback_service "$SERVICE_BASE_RELEASE"
-  fail "AIFAR service $SERVICE_NAME replicas did not become stable in partial release $RELEASE_ID"
-fi
-
-if ! configure_ingress_if_needed; then
-  write_manifest "failed" "$BASE_RELEASE_ID"
-  stop_service_in_release "$RELEASE_DIR" "$SERVICE_NAME"
-  rollback_service "$SERVICE_BASE_RELEASE"
-  fail "AIFAR ingress switch failed for service $SERVICE_NAME in partial release $RELEASE_ID"
-fi
-
-apply_restart_policy_for_service
-stop_service_in_release "$SERVICE_BASE_RELEASE" "$SERVICE_NAME"
-write_manifest "success" "$BASE_RELEASE_ID"
-activate_release
-cleanup_old_releases
-rm -rf "$TMP_ARTIFACT_DIR"
-
-echo "AIFAR service $SERVICE_NAME updated under $INSTALL_ROOT release $RELEASE_ID"
+stop_old_pods
+write_model_manifest
+echo "AIFAR Deployment rollout completed: $SERVICE_NAME -> $REVISION"

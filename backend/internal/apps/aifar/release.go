@@ -10,14 +10,16 @@ import (
 )
 
 const (
-	releaseLayout      = "release-v1"
-	releasePhaseActive = "active"
-	releaseKeepCount   = 3
-	releasesDirName    = "releases"
-	currentLinkName    = "current"
-	releaseEnvDirName  = "env"
-	ingressDirName     = "ingress"
-	ingressConfigName  = "nginx.conf"
+	releaseLayout               = "release-v1"
+	releasePhaseActive          = "active"
+	orchestrationModelK8sLikeV1 = "k8s-like-v1"
+	legacyOrchestrationModel    = "legacy-release-v1"
+	releaseKeepCount            = 3
+	releasesDirName             = "releases"
+	currentLinkName             = "current"
+	releaseEnvDirName           = "env"
+	ingressDirName              = "ingress"
+	ingressConfigName           = "nginx.conf"
 
 	defaultOauthPort      = 38001
 	defaultPermissionPort = 38010
@@ -64,15 +66,11 @@ func composeProjectName(releaseID string) string {
 }
 
 func releaseContainerName(serviceName, releaseID string) string {
-	return sanitizeContainerName("aifar-" + serviceName + "-" + releaseID)
+	return podContainerName(serviceName, releaseID, 1)
 }
 
 func releaseReplicaContainerName(serviceName, releaseID string, replicaID int) string {
-	base := releaseContainerName(serviceName, releaseID)
-	if replicaID <= 1 {
-		return base
-	}
-	return sanitizeContainerName(fmt.Sprintf("%s-r%d", base, replicaID))
+	return podContainerName(serviceName, releaseID, replicaID)
 }
 
 func releaseInternalNetworkName(releaseID string) string {
@@ -81,6 +79,24 @@ func releaseInternalNetworkName(releaseID string) string {
 
 func ingressContainerName() string {
 	return "aifar-admin-ingress"
+}
+
+func serviceProxyName(serviceName string) string {
+	return sanitizeContainerName("aifar-svc-admin-" + serviceName)
+}
+
+func podContainerName(serviceName, revision string, replicaID int) string {
+	if replicaID < 1 {
+		replicaID = 1
+	}
+	return sanitizeContainerName(fmt.Sprintf("aifar-pod-admin-%s-%s-r%d", serviceName, revision, replicaID))
+}
+
+func podID(serviceName, revision string, replicaID int) string {
+	if replicaID < 1 {
+		replicaID = 1
+	}
+	return sanitizeContainerName(fmt.Sprintf("%s-%s-r%d", serviceName, revision, replicaID))
 }
 
 func ingressConfigPath(installRoot string) string {
@@ -145,7 +161,7 @@ func sanitizeContainerName(value string) string {
 func releaseContainers(releaseID string) map[string]string {
 	out := make(map[string]string, len(serviceOrder))
 	for _, service := range serviceOrder {
-		out[service] = releaseContainerName(service, releaseID)
+		out[service] = podContainerName(service, releaseID, 1)
 	}
 	return out
 }
@@ -187,8 +203,10 @@ func serviceDefaultPort(service string, gatewayPort, webPort int) int {
 
 func releaseEndpoint(service, releaseID string, replicaID, port int) map[string]any {
 	return map[string]any{
-		"container": releaseReplicaContainerName(service, releaseID, replicaID),
+		"container": podContainerName(service, releaseID, replicaID),
 		"releaseId": releaseID,
+		"revision":  releaseID,
+		"podId":     podID(service, releaseID, replicaID),
 		"replicaId": replicaID,
 		"port":      port,
 		"state":     "active",
@@ -296,11 +314,11 @@ func activeEndpointsFromMetadata(metadata map[string]any) map[string]any {
 func releaseRoutes(releaseID string, gatewayPort, webPort int) map[string]any {
 	return map[string]any{
 		"gateway": map[string]any{
-			"container": releaseContainerName("gateway", releaseID),
+			"container": serviceProxyName("gateway"),
 			"port":      gatewayPort,
 		},
 		"web-vue3": map[string]any{
-			"container": releaseContainerName("web-vue3", releaseID),
+			"container": serviceProxyName("web-vue3"),
 			"port":      webPort,
 		},
 	}
@@ -309,19 +327,28 @@ func releaseRoutes(releaseID string, gatewayPort, webPort int) map[string]any {
 func releaseOrchestrationMetadata(installRoot, releaseID, ingressNetwork string, gatewayPort, webPort int) map[string]any {
 	desired := defaultDesiredReplicas()
 	activeEndpoints := releaseActiveEndpoints(releaseID, gatewayPort, webPort)
+	serviceProxies := map[string]any{}
+	for _, service := range serviceOrder {
+		serviceProxies[service] = map[string]any{
+			"container": serviceProxyName(service),
+			"port":      serviceDefaultPort(service, gatewayPort, webPort),
+		}
+	}
 	return map[string]any{
-		"composeProject":    composeProjectName(releaseID),
-		"ingressNetwork":    ingressNetwork,
-		"internalNetwork":   releaseInternalNetworkName(releaseID),
-		"ingressContainer":  ingressContainerName(),
-		"ingressConfigPath": ingressConfigPath(installRoot),
-		"activeRoutes":      releaseRoutes(releaseID, gatewayPort, webPort),
-		"containers":        releaseContainers(releaseID),
-		"desiredReplicas":   desired,
-		"activeEndpoints":   activeEndpoints,
-		"activeServices":    activeServicesFromEndpoints(desired, activeEndpoints),
-		"autoscalePolicy":   defaultAutoscalePolicy().metadata(),
-		"releasePhase":      releasePhaseActive,
+		"orchestrationModel": orchestrationModelK8sLikeV1,
+		"composeProject":     composeProjectName(releaseID),
+		"ingressNetwork":     ingressNetwork,
+		"internalNetwork":    releaseInternalNetworkName(releaseID),
+		"ingressContainer":   ingressContainerName(),
+		"ingressConfigPath":  ingressConfigPath(installRoot),
+		"serviceProxies":     serviceProxies,
+		"activeRoutes":       releaseRoutes(releaseID, gatewayPort, webPort),
+		"containers":         releaseContainers(releaseID),
+		"desiredReplicas":    desired,
+		"activeEndpoints":    activeEndpoints,
+		"activeServices":     activeServicesFromEndpoints(desired, activeEndpoints),
+		"autoscalePolicy":    defaultAutoscalePolicy().metadata(),
+		"releasePhase":       releasePhaseActive,
 	}
 }
 
@@ -329,14 +356,15 @@ func releaseManifestFields(releaseID, ingressNetwork string, gatewayPort, webPor
 	desired := defaultDesiredReplicas()
 	endpoints := releaseActiveEndpoints(releaseID, gatewayPort, webPort)
 	return map[string]any{
-		"composeProject":  composeProjectName(releaseID),
-		"ingressNetwork":  ingressNetwork,
-		"internalNetwork": releaseInternalNetworkName(releaseID),
-		"containers":      releaseContainers(releaseID),
-		"routes":          releaseRoutes(releaseID, gatewayPort, webPort),
-		"desiredReplicas": desired,
-		"endpoints":       endpoints,
-		"activeServices":  activeServicesFromEndpoints(desired, endpoints),
+		"orchestrationModel": orchestrationModelK8sLikeV1,
+		"composeProject":     composeProjectName(releaseID),
+		"ingressNetwork":     ingressNetwork,
+		"internalNetwork":    releaseInternalNetworkName(releaseID),
+		"containers":         releaseContainers(releaseID),
+		"routes":             releaseRoutes(releaseID, gatewayPort, webPort),
+		"desiredReplicas":    desired,
+		"endpoints":          endpoints,
+		"activeServices":     activeServicesFromEndpoints(desired, endpoints),
 	}
 }
 

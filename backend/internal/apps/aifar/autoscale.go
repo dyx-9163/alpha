@@ -247,6 +247,10 @@ func (s Service) ScaleOut(ctx context.Context, req ScaleOutRequest, log Logger, 
 	defer s.releaseOrchestrationLock(req.Instance.ID, "autoscale")
 
 	metadata := metadataFromInstance(current)
+	if err := ensureK8sLikeMetadata(metadata, UpdateCopy{LegacyUpdateUnsupported: "legacy AIFAR orchestration model %s does not support autoscale; reinstall with k8s-like orchestration first"}); err != nil {
+		finishTarget(recorder, target, "failed", err.Error())
+		return err
+	}
 	policy := autoscalePolicyFromMetadata(metadata)
 	if !policy.Enabled {
 		err := errors.New("AIFAR autoscale is disabled")
@@ -254,9 +258,9 @@ func (s Service) ScaleOut(ctx context.Context, req ScaleOutRequest, log Logger, 
 		return err
 	}
 	installRoot := stringFromMetadata(metadata, "installRoot", installRootFromDeployDir(req.Server.DeployDir))
-	releaseID := stringFromMetadata(metadata, "releaseId", "")
+	releaseID := currentRevisionForService(metadata, service)
 	if releaseID == "" {
-		err := errors.New("AIFAR release id is missing")
+		err := errors.New("AIFAR service revision is missing")
 		finishTarget(recorder, target, "failed", err.Error())
 		return err
 	}
@@ -275,7 +279,7 @@ func (s Service) ScaleOut(ctx context.Context, req ScaleOutRequest, log Logger, 
 	if replicaID < 2 {
 		replicaID = currentReplicas + 1
 	}
-	containerName := autoscaleReplicaContainerName(service, releaseID, replicaID)
+	containerName := podContainerName(service, releaseID, replicaID)
 	script, err := renderAutoscaleOutScript(autoscaleOutScriptData{
 		InstallRoot:      installRoot,
 		ServiceName:      service,
@@ -312,6 +316,7 @@ func (s Service) ScaleOut(ctx context.Context, req ScaleOutRequest, log Logger, 
 	nextMetadata["desiredReplicas"] = desired
 	nextMetadata["activeEndpoints"] = activeEndpoints
 	nextMetadata["activeServices"] = activeServicesFromEndpoints(desired, activeEndpoints)
+	nextMetadata["serviceRevisions"] = serviceRevisionsFromMetadata(nextMetadata)
 	nextMetadata["autoscalePolicy"] = policy.metadata()
 	nextMetadata["autoscaleMetrics"] = metricsMetadata(status.Endpoints, now)
 	nextMetadata = recordAutoscaleEvent(nextMetadata, "scaled-out", service, containerName, now)
@@ -323,6 +328,10 @@ func (s Service) ScaleOut(ctx context.Context, req ScaleOutRequest, log Logger, 
 	nextMetadata["autoscaleSignals"] = signals
 	delete(nextMetadata, "orchestrationLock")
 	if err := saveMetadata(s.store, current, nextMetadata); err != nil {
+		finishTarget(recorder, target, "failed", err.Error())
+		return err
+	}
+	if err := s.saveRolloutControlPlane(current.ID, current.Version, releaseID, service, "", desired[service], intFromMetadata(nextMetadata, "gatewayPort", defaultGatewayPort), intFromMetadata(nextMetadata, "webPort", defaultWebPort), now); err != nil {
 		finishTarget(recorder, target, "failed", err.Error())
 		return err
 	}
@@ -378,8 +387,7 @@ func autoscaleStatusCommand(installRoot string) string {
 	return "sh -s <<'AIFAR_AUTOSCALE_STATUS'\n" + `#!/usr/bin/env sh
 set -u
 INSTALL_ROOT=` + installerkit.ShellQuote(installRoot) + `
-CURRENT_LINK="$INSTALL_ROOT/` + currentLinkName + `"
-ENV_DIR="$CURRENT_LINK/` + releaseEnvDirName + `"
+ENV_DIR="$INSTALL_ROOT/runtime/` + releaseEnvDirName + `"
 
 read_env_value() {
   rev_file="$1"
@@ -415,11 +423,11 @@ if command -v docker >/dev/null 2>&1 && [ -d "$ENV_DIR" ]; then
   for service in ` + serviceOrderText() + `; do
     port_var="$(service_port_var "$service")"
     port="$(read_env_value "$ENV_DIR/compose.env" "$port_var" 0)"
-    names="$(docker ps -a --filter "label=aifar.app=aifar" --filter "label=aifar.install-root=$INSTALL_ROOT" --filter "label=aifar.service=$service" --format '{{.Names}}' 2>/dev/null || true)"
+    names="$(docker ps -a --filter "label=aifar.app=aifar" --filter "label=aifar.install-root=$INSTALL_ROOT" --filter "label=aifar.component=pod" --filter "label=aifar.service=$service" --format '{{.Names}}' 2>/dev/null || true)"
     for name in $names; do
       running="$(docker inspect -f '{{.State.Running}}' "$name" 2>/dev/null || echo false)"
       health="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{end}}' "$name" 2>/dev/null || true)"
-      release="$(docker inspect -f '{{index .Config.Labels "aifar.release"}}' "$name" 2>/dev/null || true)"
+      release="$(docker inspect -f '{{index .Config.Labels "aifar.revision"}}' "$name" 2>/dev/null || true)"
       replica="$(docker inspect -f '{{index .Config.Labels "aifar.replica"}}' "$name" 2>/dev/null || true)"
       [ -n "$replica" ] || replica=1
       mem="$(docker stats --no-stream --format '{{.MemPerc}}' "$name" 2>/dev/null | tr -d ' %' || true)"
