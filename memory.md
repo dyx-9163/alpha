@@ -771,3 +771,5 @@
 - 结论：`health` 只检查本机 Docker 可用性；`serve` 是常驻控制器和数据面；`status` 查询常驻 agent 的运行态；`reconcile-runtime` 提交 RuntimeSpec 并触发创建/删除 Pod、刷新 endpoints、监听 Service 端口和持久化 spec；`remove-instance` 移除某实例路由/state 并摘 Nacos；`register-nacos`/`deregister-nacos` 按 spec 或 state 维护 Nacos 代理实例，`*-proxies` 为同义别名。
 - 问题：用户要求把 `aifar-agent` 命令说明放入文档并提交到本地 Git。
 - 结论：已在 `README.md` 新增 `AIFAR agent runtime commands` 章节，列出 `health`、`serve`、`status`、`reconcile-runtime` 及兼容别名、`remove-instance`、Nacos 注册/摘除命令的用途和注意事项，并准备本地提交。
+- 问题：用户要求 `README.md` 中英文双语。
+- 结论：已将 `README.md` 整理为中英文双语结构，覆盖项目介绍、技术栈、开发命令、服务端环境变量、AIFAR agent runtime 命令、离线资源和打包说明。
