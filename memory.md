@@ -759,3 +759,5 @@
 - 结论：runtime-v2 不再使用 Docker Compose 启动服务，已删除各服务目录下旧 `docker-compose.yaml`；保留 `.env`、`Dockerfile`、Jar、web dist 和 nginx 配置等安装构建仍需文件。
 - 问题：用户询问 `services` 下 `.env` 是否能做成公用或移到其他地方。
 - 结论：runtime-v2 标准调整为 `services/` 只放构建上下文和业务工件；服务级 `.env` 不再需要，公共默认项移到 `runtime/defaults.env`，安装时再生成远端 `$RUNTIME_DIR/env/*.env` 和 RuntimeSpec。
+- 问题：用户删除 Dockerfile 中固定 `-Xms256m`、`-Xmx512m` 后，询问现在 JVM 百分比在哪里设置。
+- 结论：JVM 内存改由 AIFAR runtime 生成的 `java-jvm.options` / `java-jvm.<service>.options` 控制，默认 `InitialRAMPercentage=20`、`MaxRAMPercentage=70`，安装和运行配置都会写入远端 `$RUNTIME_DIR/env` 后由容器 entrypoint 读取。
