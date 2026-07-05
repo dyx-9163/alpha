@@ -31,6 +31,10 @@ func TestNormalizeSpecDefaultsRuntimeV2Fields(t *testing.T) {
 	if len(spec.Deployments) != 1 || len(spec.Deployments[0].Ports) != 1 || spec.Deployments[0].Ports[0].ContainerPort != 18080 {
 		t.Fatalf("expected deployment port to default from targetPort, got %#v", spec.Deployments)
 	}
+	strategy := spec.Deployments[0].Strategy
+	if strategy.Type != DefaultDeploymentStrategyType || strategy.MaxSurge != DefaultDeploymentMaxSurge || strategy.MaxUnavailable != DefaultDeploymentMaxUnavailable || strategy.ProgressDeadlineSeconds != DefaultProgressDeadlineSeconds || strategy.RollbackOnFailure == nil || !*strategy.RollbackOnFailure {
+		t.Fatalf("expected rolling update strategy defaults, got %#v", strategy)
+	}
 	spec.Deployments[0].PodRevision = "rev-1"
 	data, err := json.Marshal(spec.Deployments[0])
 	if err != nil {
@@ -39,6 +43,21 @@ func TestNormalizeSpecDefaultsRuntimeV2Fields(t *testing.T) {
 	text := string(data)
 	if !strings.Contains(text, `"podRevision":"rev-1"`) || strings.Contains(text, `"revision"`) {
 		t.Fatalf("expected runtime spec deployment to expose podRevision only, got %s", text)
+	}
+}
+
+func TestDeploymentStrategyDoesNotAffectPodSpecHash(t *testing.T) {
+	base := DeploymentSpec{
+		ServiceName: "oauth",
+		Image:       "aifar-oauth:rev-1",
+		PodRevision: "rev-1",
+		Replicas:    1,
+		Ports:       []ContainerPort{{Name: "http", ContainerPort: 38001}},
+	}
+	changed := base
+	changed.Strategy = DeploymentStrategySpec{Type: "RollingUpdate", MaxSurge: 2, MaxUnavailable: 1, ProgressDeadlineSeconds: 60}
+	if deploymentSpecHash(base) != deploymentSpecHash(changed) {
+		t.Fatal("strategy changes should not force existing pods to be recreated")
 	}
 }
 

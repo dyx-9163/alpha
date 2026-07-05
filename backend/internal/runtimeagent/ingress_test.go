@@ -13,24 +13,34 @@ import (
 )
 
 type fakeRunner struct {
+	mu         sync.Mutex
 	calls      []string
 	endpointIP string
 }
 
 func (f *fakeRunner) Run(ctx context.Context, name string, args ...string) (CommandResult, error) {
 	call := name + " " + strings.Join(args, " ")
+	f.mu.Lock()
 	f.calls = append(f.calls, call)
+	endpointIP := f.endpointIP
+	f.mu.Unlock()
 	if strings.Contains(call, " ps ") {
 		return CommandResult{Stdout: "aifar-pod-admin-gateway-r1\n"}, nil
 	}
 	if strings.Contains(call, " inspect ") {
-		ip := f.endpointIP
+		ip := endpointIP
 		if ip == "" {
 			ip = "172.20.0.10"
 		}
 		return CommandResult{Stdout: "true|healthy|" + ip + "\n"}, nil
 	}
 	return CommandResult{Stdout: "ok\n"}, nil
+}
+
+func (f *fakeRunner) callsString() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return strings.Join(f.calls, "\n")
 }
 
 func TestManagerAppliesRuntimeSpecAsHostListeners(t *testing.T) {
@@ -85,7 +95,7 @@ func TestManagerDiscoversReadyDockerPodEndpoints(t *testing.T) {
 	if len(endpoints) != 1 || endpoints[0].Address != "172.20.0.10:38000" {
 		t.Fatalf("unexpected endpoints: %#v", endpoints)
 	}
-	calls := strings.Join(runner.calls, "\n")
+	calls := runner.callsString()
 	for _, want := range []string{
 		"docker ps --filter label=aifar.app=aifar",
 		"--filter label=aifar.component=pod",
@@ -142,8 +152,8 @@ func TestManagerKeepsFileUploadChunksOnSameEndpoint(t *testing.T) {
 	}
 	first := httptest.NewRequest("POST", "http://alpha-file/upload?identifier=upload-1&chunkNumber=1", nil)
 	second := httptest.NewRequest("POST", "http://alpha-file/upload?identifier=upload-1&chunkNumber=2", nil)
-	gotFirst := manager.selectEndpoint(first, "admin", "file", endpoints)
-	gotSecond := manager.selectEndpoint(second, "admin", "file", endpoints)
+	gotFirst := manager.selectEndpoint(first, "admin", "file", "stable", endpoints)
+	gotSecond := manager.selectEndpoint(second, "admin", "file", "stable", endpoints)
 	if gotFirst != gotSecond {
 		t.Fatalf("expected chunks with same upload identifier to use same file endpoint, got %#v and %#v", gotFirst, gotSecond)
 	}
@@ -159,10 +169,86 @@ func TestManagerUsesGatewayAffinityForSameClient(t *testing.T) {
 	first.Header.Set("Authorization", "Bearer user-token")
 	second := httptest.NewRequest("GET", "http://aifar/api/files", nil)
 	second.Header.Set("Authorization", "Bearer user-token")
-	gotFirst := manager.selectEndpoint(first, "admin", "gateway", endpoints)
-	gotSecond := manager.selectEndpoint(second, "admin", "gateway", endpoints)
+	gotFirst := manager.selectEndpoint(first, "admin", "gateway", "stable", endpoints)
+	gotSecond := manager.selectEndpoint(second, "admin", "gateway", "stable", endpoints)
 	if gotFirst != gotSecond {
 		t.Fatalf("expected same authenticated client to use same gateway endpoint, got %#v and %#v", gotFirst, gotSecond)
+	}
+}
+
+func TestManagerUsesRoundRobinWhenAffinityPolicyDisablesStickyRouting(t *testing.T) {
+	manager := NewManager(ManagerOptions{StateDir: t.TempDir(), Runner: &fakeRunner{}})
+	endpoints := []endpoint{
+		{Container: "aifar-pod-admin-oauth-a", Address: "172.20.0.31:38001"},
+		{Container: "aifar-pod-admin-oauth-b", Address: "172.20.0.32:38001"},
+	}
+	first := httptest.NewRequest("GET", "http://alpha-oauth/user", nil)
+	first.Header.Set("Authorization", "Bearer user-token")
+	second := httptest.NewRequest("GET", "http://alpha-oauth/user", nil)
+	second.Header.Set("Authorization", "Bearer user-token")
+	gotFirst := manager.selectEndpoint(first, "admin", "oauth", "round-robin", endpoints)
+	gotSecond := manager.selectEndpoint(second, "admin", "oauth", "round-robin", endpoints)
+	if gotFirst == gotSecond {
+		t.Fatalf("expected round-robin policy to rotate endpoints, got %#v twice", gotFirst)
+	}
+}
+
+func TestManagerReconcilesDeploymentsConcurrently(t *testing.T) {
+	runner := newConcurrentDeploymentRunner("oauth", "system")
+	defer runner.releaseRuns()
+	manager := NewManager(ManagerOptions{StateDir: t.TempDir(), Runner: runner})
+	oauthPort := freePort(t)
+	systemPort := freePort(t)
+	gatewayPort := freePort(t)
+	webPort := freePort(t)
+	spec := NormalizeSpec(RuntimeSpec{
+		InstanceID:  "admin",
+		InstallRoot: "/aifar/apps/admin",
+		Network:     "aifar-network",
+		Deployments: []DeploymentSpec{
+			{
+				ServiceName: "oauth",
+				Image:       "aifar-oauth:rev-1",
+				PodRevision: "rev-1",
+				Replicas:    1,
+				Ports:       []ContainerPort{{Name: "http", ContainerPort: oauthPort}},
+			},
+			{
+				ServiceName: "system",
+				Image:       "aifar-system:rev-1",
+				PodRevision: "rev-1",
+				Replicas:    1,
+				Ports:       []ContainerPort{{Name: "http", ContainerPort: systemPort}},
+			},
+		},
+		Services: []ServiceSpec{
+			{Name: "oauth", AppName: "alpha-oauth", Port: oauthPort, TargetPort: oauthPort},
+			{Name: "system", AppName: "alpha-system", Port: systemPort, TargetPort: systemPort},
+		},
+		Ingress: IngressSpec{
+			GatewayPort: gatewayPort,
+			WebPort:     webPort,
+		},
+	})
+	applyDone := make(chan error, 1)
+	go func() {
+		applyDone <- manager.Apply(context.Background(), spec)
+	}()
+
+	select {
+	case <-runner.allStarted:
+	case err := <-applyDone:
+		t.Fatalf("apply finished before both deployments started: %v", err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("deployments were not reconciled concurrently")
+	}
+
+	runner.releaseRuns()
+	if err := <-applyDone; err != nil {
+		t.Fatalf("apply failed: %v", err)
+	}
+	if err := manager.Remove(context.Background(), "admin"); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -232,6 +318,40 @@ func TestManagerSerializesApplyAndResyncDuringScaleOut(t *testing.T) {
 	}
 }
 
+func TestManagerRollsBackNewPodsWhenRollingUpdateFails(t *testing.T) {
+	deployment := DeploymentSpec{
+		ServiceName: "oauth",
+		Image:       "aifar-oauth:rev-2",
+		PodRevision: "rev-2",
+		Replicas:    2,
+		Ports:       []ContainerPort{{Name: "http", ContainerPort: 38001}},
+	}
+	runner := newRollbackRunner(deploymentSpecHash(deployment))
+	manager := NewManager(ManagerOptions{StateDir: t.TempDir(), Runner: runner})
+	spec := NormalizeSpec(RuntimeSpec{
+		InstanceID:  "admin",
+		InstallRoot: "/aifar/apps/admin",
+		Network:     "aifar-network",
+		Deployments: []DeploymentSpec{deployment},
+		Services:    []ServiceSpec{{Name: "oauth", AppName: "alpha-oauth", Port: 38001, TargetPort: 38001}},
+		Ingress: IngressSpec{
+			GatewayPort: freePort(t),
+			WebPort:     freePort(t),
+		},
+	})
+	if err := manager.Apply(context.Background(), spec); err == nil {
+		t.Fatal("expected rolling update failure")
+	}
+	if !runner.removed("aifar-pod-admin-oauth-rev-2-r1") {
+		t.Fatalf("expected new revision replica 1 to be rolled back, removals:\n%s", strings.Join(runner.removedCalls(), "\n"))
+	}
+	for _, call := range runner.removedCalls() {
+		if strings.Contains(call, "rev-1") {
+			t.Fatalf("old revision should not be removed during failed rollout, got %s", call)
+		}
+	}
+}
+
 func TestManagerContainerReadyDiagnosticsIncludesInspectAndLogs(t *testing.T) {
 	runner := &diagnosticRunner{}
 	manager := NewManager(ManagerOptions{StateDir: t.TempDir(), Runner: runner})
@@ -250,6 +370,86 @@ func TestManagerContainerReadyDiagnosticsIncludesInspectAndLogs(t *testing.T) {
 	}
 }
 
+type concurrentDeploymentRunner struct {
+	mu             sync.Mutex
+	expected       map[string]bool
+	started        map[string]bool
+	allStarted     chan struct{}
+	allStartedOnce sync.Once
+	release        chan struct{}
+	releaseOnce    sync.Once
+}
+
+func newConcurrentDeploymentRunner(services ...string) *concurrentDeploymentRunner {
+	expected := map[string]bool{}
+	for _, service := range services {
+		expected[service] = true
+	}
+	return &concurrentDeploymentRunner{
+		expected:   expected,
+		started:    map[string]bool{},
+		allStarted: make(chan struct{}),
+		release:    make(chan struct{}),
+	}
+}
+
+func (r *concurrentDeploymentRunner) Run(ctx context.Context, name string, args ...string) (CommandResult, error) {
+	call := name + " " + strings.Join(args, " ")
+	switch {
+	case strings.Contains(call, "docker inspect -f {{.Id}}"):
+		return CommandResult{}, errors.New("not found")
+	case strings.Contains(call, "docker run "):
+		r.markStarted(containerNameArg(args))
+		select {
+		case <-r.release:
+			return CommandResult{Stdout: "new-container\n"}, nil
+		case <-ctx.Done():
+			return CommandResult{}, ctx.Err()
+		}
+	case strings.Contains(call, "NetworkSettings"):
+		return CommandResult{Stdout: "true|healthy|172.20.0.10\n"}, nil
+	case strings.Contains(call, "docker inspect -f {{.State.Running}}|"):
+		return CommandResult{Stdout: "true|healthy\n"}, nil
+	case strings.Contains(call, "docker ps"):
+		return CommandResult{}, nil
+	default:
+		return CommandResult{Stdout: "ok\n"}, nil
+	}
+}
+
+func (r *concurrentDeploymentRunner) markStarted(container string) {
+	service := ""
+	for candidate := range r.expected {
+		if strings.Contains(container, "-"+candidate+"-") {
+			service = candidate
+			break
+		}
+	}
+	if service == "" {
+		return
+	}
+	r.mu.Lock()
+	r.started[service] = true
+	allStarted := len(r.started) == len(r.expected)
+	r.mu.Unlock()
+	if allStarted {
+		r.allStartedOnce.Do(func() { close(r.allStarted) })
+	}
+}
+
+func (r *concurrentDeploymentRunner) releaseRuns() {
+	r.releaseOnce.Do(func() { close(r.release) })
+}
+
+func containerNameArg(args []string) string {
+	for i, arg := range args {
+		if arg == "--name" && i+1 < len(args) {
+			return args[i+1]
+		}
+	}
+	return ""
+}
+
 type scaleOutRaceRunner struct {
 	mu         sync.Mutex
 	hash       string
@@ -257,6 +457,7 @@ type scaleOutRaceRunner struct {
 	runStarted chan struct{}
 	runOnce    sync.Once
 	removed    []string
+	r2Started  bool
 }
 
 func newScaleOutRaceRunner(hash string) *scaleOutRaceRunner {
@@ -279,13 +480,19 @@ func (r *scaleOutRaceRunner) Run(ctx context.Context, name string, args ...strin
 		return CommandResult{Stdout: r.hash + "\n"}, nil
 	case strings.Contains(call, "docker run "):
 		if strings.Contains(call, "r2") {
+			r.mu.Lock()
+			r.r2Started = true
+			r.mu.Unlock()
 			r.runOnce.Do(func() { close(r.runStarted) })
 		}
 		return CommandResult{Stdout: "new-container\n"}, nil
 	case strings.Contains(call, "docker inspect -f {{.State.Running}}|") && strings.Contains(call, "NetworkSettings"):
 		return CommandResult{Stdout: "true|healthy|172.20.0.10\n"}, nil
 	case strings.Contains(call, "docker inspect -f {{.State.Running}}|"):
-		if strings.HasSuffix(call, "r2") {
+		r.mu.Lock()
+		r2Started := r.r2Started
+		r.mu.Unlock()
+		if strings.HasSuffix(call, "r2") && r2Started {
 			select {
 			case <-r.ready:
 			case <-ctx.Done():
@@ -318,6 +525,65 @@ func (r *scaleOutRaceRunner) removedReplica2() bool {
 	return false
 }
 
+type rollbackRunner struct {
+	mu       sync.Mutex
+	hash     string
+	removals []string
+}
+
+func newRollbackRunner(hash string) *rollbackRunner {
+	return &rollbackRunner{hash: hash}
+}
+
+func (r *rollbackRunner) Run(ctx context.Context, name string, args ...string) (CommandResult, error) {
+	call := name + " " + strings.Join(args, " ")
+	switch {
+	case strings.Contains(call, "docker inspect -f {{.Id}}"):
+		if strings.Contains(call, "rev-2") {
+			return CommandResult{}, errors.New("not found")
+		}
+		return CommandResult{Stdout: "container-id\n"}, nil
+	case strings.Contains(call, `{{index .Config.Labels "aifar.spec-hash"}}`):
+		return CommandResult{Stdout: r.hash + "\n"}, nil
+	case strings.Contains(call, "docker run ") && strings.Contains(call, "rev-2-r2"):
+		return CommandResult{}, errors.New("image pull failed")
+	case strings.Contains(call, "docker run "):
+		return CommandResult{Stdout: "new-container\n"}, nil
+	case strings.Contains(call, "docker inspect -f {{.State.Running}}|") && strings.Contains(call, "NetworkSettings"):
+		return CommandResult{Stdout: "true|healthy|172.20.0.40\n"}, nil
+	case strings.Contains(call, "docker inspect -f {{.State.Running}}|"):
+		return CommandResult{Stdout: "true|healthy\n"}, nil
+	case strings.Contains(call, "docker ps -a") && strings.Contains(call, `{{.Label "aifar.replica"}}`):
+		return CommandResult{Stdout: "aifar-pod-admin-oauth-rev-1-r1|1|rev-1|oldhash\naifar-pod-admin-oauth-rev-1-r2|2|rev-1|oldhash\naifar-pod-admin-oauth-rev-2-r1|1|rev-2|" + r.hash + "\n"}, nil
+	case strings.Contains(call, "docker ps "):
+		return CommandResult{Stdout: "aifar-pod-admin-oauth-rev-1-r1\naifar-pod-admin-oauth-rev-1-r2\naifar-pod-admin-oauth-rev-2-r1\n"}, nil
+	case strings.Contains(call, "docker rm -f"):
+		r.mu.Lock()
+		r.removals = append(r.removals, call)
+		r.mu.Unlock()
+		return CommandResult{Stdout: "removed\n"}, nil
+	default:
+		return CommandResult{Stdout: "ok\n"}, nil
+	}
+}
+
+func (r *rollbackRunner) removed(container string) bool {
+	for _, call := range r.removedCalls() {
+		if strings.Contains(call, container) {
+			return true
+		}
+	}
+	return false
+}
+
+func (r *rollbackRunner) removedCalls() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]string, len(r.removals))
+	copy(out, r.removals)
+	return out
+}
+
 type diagnosticRunner struct{}
 
 func (diagnosticRunner) Run(ctx context.Context, name string, args ...string) (CommandResult, error) {
@@ -334,20 +600,37 @@ func (diagnosticRunner) Run(ctx context.Context, name string, args ...string) (C
 	}
 }
 
+var freePortState = struct {
+	sync.Mutex
+	used map[int]bool
+}{used: map[int]bool{}}
+
 func freePort(t *testing.T) int {
 	t.Helper()
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
+	for attempts := 0; attempts < 100; attempts++ {
+		listener, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, port, err := net.SplitHostPort(listener.Addr().String())
+		_ = listener.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		n, err := strconv.Atoi(port)
+		if err != nil {
+			t.Fatal(err)
+		}
+		freePortState.Lock()
+		used := freePortState.used[n]
+		if !used {
+			freePortState.used[n] = true
+		}
+		freePortState.Unlock()
+		if !used {
+			return n
+		}
 	}
-	defer listener.Close()
-	_, port, err := net.SplitHostPort(listener.Addr().String())
-	if err != nil {
-		t.Fatal(err)
-	}
-	n, err := strconv.Atoi(port)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return n
+	t.Fatal("could not allocate a unique test port")
+	return 0
 }

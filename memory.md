@@ -805,3 +805,103 @@
 - 结论：两者不改变服务调用地址和 Java 业务逻辑，差异在 Nacos 实例生命周期。`ephemeral=true` 是临时实例，依赖心跳，agent 掉线后 Nacos 自动剔除，适合容器/Pod/agent 代理；`ephemeral=false` 是持久实例，适合固定机器服务，agent 异常退出时容易留下 stale 实例，需要 `deregister-nacos` 或人工清理。AIFAR 新装应优先统一 `true`，仅对已被 Nacos 固定为 persistent 的历史服务 fallback 为 `false`。
 - 问题：用户要求在 AIFAR Runtime 页面增加下线某个 deployment 的功能，并给 Nacos `ephemeral` 配置加页面开关，便于测试 Nacos 服务状态。
 - 结论：已新增服务下线入口：将目标服务期望副本数设置为 0，RuntimeSpec 允许 0 副本，agent reconcile 删除对应 Pod 并在 Nacos 代理注册阶段摘除该服务；运行参数弹窗新增 `Nacos ephemeral` 开关并写入 spec，安装/补装/扩容/更新/运行配置脚本统一读取该配置。
+- 问题：用户反馈服务下线后再扩容其他服务时，agent 误启动已下线的 file Pod，导致扩容失败。
+- 结论：根因是 autoscale-out 脚本在生成全量 RuntimeSpec 时，缺少控制面 desiredReplicas 快照，遇到下线服务会按 Docker 当前数量/默认 1 误恢复。已改为后端把完整 desiredReplicas 传给脚本，脚本优先使用控制面快照，扩容完成后也不会用残留 endpoint 反推已下线服务；补充测试覆盖 `file=0` 时扩容其他服务仍保持 0。
+- 问题：用户询问当前更新单个 AIFAR 模块（如 alpha-gateway）是否属于滚动更新。
+- 结论：当前 runtime-v2 单服务更新会只改该服务的 APP_IMAGE/AIFAR_REVISION，生成全量 RuntimeSpec 后由 aifar-agent 先创建并等待新 revision Pod 健康，再删除旧 revision Pod；它不是先停后起，但也不是严格按 K8s maxSurge/maxUnavailable 逐个切流的滚动更新，更接近服务级“新副本就绪后整体替换旧副本”。
+- 问题：用户询问当前服务级整体替换方式和 K8s 式滚动更新哪种更好。
+- 结论：建议保留 AIFAR 当前轻量 Docker/agent 模型，不直接照搬完整 K8s；但应把 agent 更新策略升级为 K8s-like RollingUpdate，支持 maxSurge/maxUnavailable、逐副本就绪后切换、drain、progress timeout 和失败回滚。单副本场景当前方式可接受，多副本和生产稳定性场景 K8s-like 策略更好。
+- 问题：用户询问同一服务有多个实例/副本时，流量转发是随机、每请求切换还是每用户固定链路。
+- 结论：当前 aifar-agent 不使用随机；ready endpoints 缓存按容器名排序。`gateway` 和 `file` 通过稳定哈希做亲和，优先使用 X-AIFAR-Affinity、上传/文件标识、trace/request id、Authorization、query、cookie，最后 remote IP，所以同一 token/上传标识/客户端 IP 通常固定到同一 Pod；其它服务按 instance/service 计数器做 round-robin，每个请求轮询到下一个 Pod。RuntimeSpec 中 affinityPolicy 字段存在，但当前选择逻辑实际硬编码 gateway/file 亲和。
+- 问题：用户反馈 gateway 日志报 `No servers available for service: alpha-oauth`，但 Nacos 控制台 `prod` 命名空间能看到 `alpha-oauth` 健康实例。
+- 结论：该日志发生在 Spring Cloud LoadBalancer 选实例前，说明 gateway 的 Nacos discovery 客户端当时拿到的 `alpha-oauth` 实例列表为空，不是已经转发到 agent/oauth 后连接失败。重点排查 gateway 容器内 `NACOS_HOST/NACOS_NS/group` 是否和 Nacos 控制台一致、Nacos 实例详情是否是 agentHost:38001、以及启动/reconcile 时 Nacos 代理注册晚于 gateway 首次请求导致空发现结果被缓存；现场可先 `aifar-agent register-nacos --spec ...` 重放注册并重启 gateway 清空本地发现缓存。
+- 问题：用户提供 Nacos `alpha-oauth` 服务详情截图，显示实例 `192.168.74.132:38001`、临时实例 true、健康 true。
+- 结论：Nacos 代理注册本身正确，符合 agent-only 模型；若 gateway 仍报 `No servers available`，问题集中在 gateway 本地 discovery/loadbalancer 缓存或 gateway 容器实际 Nacos 配置/命名空间不一致，优先重启 gateway 并从容器内查询 Nacos 实例列表验证。
+- 问题：用户在 gateway 容器内直接请求 `http://192.168.74.132:38001/actuator/health`，返回 403 `Interface cannot be accessed`。
+- 结论：gateway 容器到 agent oauth service 端口网络可达，agent 到 oauth Pod 的转发链路也可达；403 是业务/安全过滤返回，不是连接失败。若 gateway 仍报 `No servers available for service: alpha-oauth`，根因基本锁定为 gateway 本地 Nacos discovery/loadbalancer 空实例缓存或注册晚于首次请求的启动时序问题，需重启 gateway 清缓存，后续代码应避免 gateway 早于 Nacos 代理注册接流量。
+- 问题：用户询问如何在 Windows 上配置 nginx，把 `http://192.168.74.132:8080` 代理给别人访问。
+- 结论：Windows nginx 可监听 80 或自定义端口，`proxy_pass http://192.168.74.132:8080`，并保留 Host、X-Forwarded-*、WebSocket Upgrade、较长 timeout；同时需确认 Windows 到 upstream 可达并放行 Windows 防火墙入站端口。
+- 问题：用户询问 aifar-agent 部署 deployment 时是否是同步模式，能否异步全部一起执行。
+- 结论：当前 agent runtime-v2 的 `reconcileDeployments/ensureDeployment` 是串行处理 deployments 和 replicas，并在 `runContainer` 后等待 Pod ready；安装脚本 `install.sh` 构建镜像也串行，`update-artifact-bundle.sh` 只对非入口服务的制品准备做了有界并发。可以改成有界并发，但不建议无序全部并发，推荐后端服务并发、endpoint/Nacos 就绪后再启动 gateway/web，并继续用 `reconcileMu` 串行化 Apply/Resync/Remove。
+- 问题：用户认为 aifar-agent 的 deployment 执行不应由 `DEPLOYMENT_CONCURRENCY` 控制，而应默认所有 deployment 一起跑，因为服务器资源应提前准备充足。
+- 结论：已将 `runtimeagent.reconcileDeployments` 改为对所有有镜像的 deployment 并发执行 `ensureDeployment`，不读取 `DEPLOYMENT_CONCURRENCY`；继续保留外层 `reconcileMu` 串行化 Apply/Resync/Remove，同一 deployment 内部副本仍按原逻辑顺序处理。新增并发单测并加固测试 runner/端口分配，`GOCACHE=.gocache go test ./...` 通过。
+- 问题：用户提供 Windows/nginx 反向代理配置，Java 调用联系人搜索时收到 nginx 502 并被包装成 500 ScriptException。
+- 结论：Java 已连到 nginx，问题在 nginx 到 upstream 没拿到有效响应；优先检查 upstream 服务是否监听对外地址、端口和防火墙是否放行、nginx error.log 的 `connect failed`/`upstream timed out`，若联系人搜索是业务网关接口则不要误代理到面板端口。
+- 问题：用户要求在容器页“镜像”tab 增加批量删除镜像动作。
+- 结论：已在镜像表增加复选框、已选数量和“批量删除镜像”按钮；前端批量提交 `{ ids }` 到原 `/containers/images/remove` 接口。后端该接口兼容单个 `id` 和多个 `ids`，多镜像时创建一个 `containers.image.batch.remove` 任务并写审计；新增中英文文案和后端批量删除测试，`go test ./...` 与 `pnpm web:build` 通过。
+- 问题：用户询问 aifar-agent 后续应如何优化。
+- 结论：建议继续把 aifar-agent 定位为轻量 kubelet + kube-proxy + Nacos 代理，不扩张成完整 K8s/Swarm。优先优化发布策略、状态可观测、Service 路由策略、Nacos 注册状态机、RuntimeSpec 版本化与本地状态恢复；短期先做 RollingUpdate/回滚、按 spec 使用 affinityPolicy、详细状态接口和 Nacos ready gate。
+- 问题：用户要求给出 aifar-agent 第一阶段优化计划。
+- 结论：第一阶段建议拆成 4 个可验收包：先扩展 RuntimeSpec 状态/策略字段与兼容默认值；实现同 deployment 内 RollingUpdate、失败回滚和 progress deadline；增强 agent status/doctor 与 AIFAR Runtime 页面可观测；最后加 Nacos ready gate，确保 service endpoint 与 Nacos 注册就绪后再放入口流量。
+- 问题：用户确认执行 aifar-agent 第一阶段优化。
+- 结论：已落地 RuntimeSpec deployment strategy 默认值、同 deployment 新 revision 先起后删旧的 RollingUpdate 保护、失败回滚、progress deadline、按 service `affinityPolicy` 执行稳定哈希/轮询、agent `/status` 输出 deployment/service/Nacos 细粒度状态、AIFAR Runtime 页面展示端点/Nacos/发布状态，并让 `reconcile-runtime` 对 Nacos env/注册失败启用 ready gate；`pnpm test` 和 `pnpm web:build` 通过。
+- 问题：用户询问本轮 `aifar-agent` 是否有更新，是否需要传到服务器。
+- 结论：本轮改动包含 `aifar-agent` 运行时核心逻辑，目标服务器若要生效必须重新构建 Linux amd64 agent 二进制并替换 `/usr/local/bin/aifar-agent`，然后重启 agent；当前已验证源码和前端构建，但尚未在本轮生成新的 agent 二进制。
+- 问题：用户询问此次 `aifar-agent` 更新需要测试哪些功能。
+- 结论：重点测试新 agent 替换和状态可见性、单服务/多服务发布、失败回滚、Nacos ready gate、服务下线/扩容保持、`affinityPolicy` 路由，以及 AIFAR Runtime 页面端点/Nacos/发布状态展示；若要验证页面新列，还需要同步部署面板后端和前端构建产物。
+- 问题：用户询问 AIFAR Runtime 页面“重建入口”按钮的作用。
+- 结论：“重建入口”会创建 `aifar.reconcile` 任务，在目标机执行 `aifar-agent reconcile-runtime --spec <runtime-spec.json>` 并补开服务端口；它用于按现有 RuntimeSpec 重新同步 agent 监听入口、endpoint 缓存和 Nacos 代理注册，正常不更新镜像/版本/副本，也不重装业务 Pod，除非现有容器缺失或与 spec 漂移需要修复。
+- 问题：用户询问 AIFAR Runtime 页面排版是否应像云平台一样按 Deployment、Service、Pod 排布。
+- 结论：建议采用云平台资源模型但保持 AIFAR 轻量语义：顶部实例/Agent/Ingress 摘要，主体按 Deployments、Services、Pods、Ingress/Nacos 分区或标签页展示；Deployment 表达期望态和发布，Service 表达稳定入口/Nacos/Endpoint，Pod 表达实际容器实例，支持从 Deployment 展开查看关联 Service 与 Pods。
+- 问题：用户反馈 AIFAR Runtime 页面全部一起加载很卡。
+- 结论：当前页面进入时会一次性采集 Docker containers、所有 Pod stats、控制面 deployment/service/pod/endpoint 并同时渲染服务表和 Pod 表，确实容易卡；建议拆成云平台式资源 tabs 并做懒加载，默认只加载 overview/deployments/services，Pods 和 stats 在进入 Pods tab 或展开详情时再查询。
+- 问题：用户要求执行 AIFAR Runtime 页面云平台式 Deployment/Service/Pod 排布和懒加载优化。
+- 结论：后端 `/containers/aifar/runtime` 新增 `includePods/includeStats` 查询参数，默认兼容旧全量返回，前端 AIFAR Runtime 改为 Deployments、Services、Pods、Ingress/Nacos 内部 tabs；默认只加载 Deployment/Service 摘要，Pods 与 stats 进入 Pods tab 后再拉取，并补充跳过 Docker 容器查询的后端测试；`pnpm web:build`、`pnpm test`、`git diff --check` 已通过。
+- 问题：用户反馈 AIFAR Runtime 的 Pods 页面加载慢，且 service 选择框清空按钮不可用。
+- 结论：Pods tab 默认只加载 Pod 列表和状态，不再默认调用较慢的 Docker stats；新增“刷新指标”按钮单独拉 CPU/内存；service 筛选清空改为显式处理并对空值容错，避免 Element Plus clear 将值置空后 `.trim()` 异常；`pnpm web:build` 与 `git diff --check` 已通过。
+- 问题：用户询问当前部署目录下没有 deployment/service/pod 对应目录是否需要调整，并提出 aifar-agent 应独立安装、未来复用于其他服务。
+- 结论：Deployment/Service/Pod 应作为 RuntimeSpec 和 agent 状态里的逻辑资源，不建议简单照搬为应用目录下的物理目录；落盘结构应继续以 artifacts/env/images/services/spec 为主，agent 自身应从 AIFAR 应用目录中剥离为服务器级能力。建议先在单仓内把 agent 做成独立代码模块/安装模块，再视稳定性拆独立仓库；AIFAR 安装应依赖已安装 agent，卸载 AIFAR 只 remove-instance，不默认卸载宿主机 agent。
+- 问题：用户询问 AIFAR Runtime 页面里的 Deployment、Service、Pod 分别代表什么，以及当前展示是否正确。
+- 结论：当前 Deployment 是控制面 `AIFARDeployment` 期望态叠加 agent deploymentStatus，表示每个服务的发布/副本/镜像版本；Service 是从 deployment/endpoints/agent serviceStatus 拼出的稳定流量入口与 Nacos/Endpoint 状态；Pod 是控制面 Pod 记录叠加 Docker 容器状态和可选 stats，表示具体容器副本。方向基本正确，但 Service 的来源应进一步改为 RuntimeSpec `services[]`/agent serviceStatus 为主，Pod 应更多以 agent/Docker 实际状态为准；UI 文案可考虑改为“服务部署 / 服务入口 / 容器副本”以减少 K8s 目录式误解。
+- 问题：用户追问 Deployment 和 Service 的数据具体从哪里来。
+- 结论：Deployment 主数据来自 SQLite `aifar_deployments`，由 AIFAR 安装/更新/扩缩容链路的 `SaveAIFARDeployment` 写入，页面接口再叠加 `aifar-agent status` 的 `deploymentStatus`；Service 不是独立表，当前由 deployment 记录派生一行，再叠加 SQLite `aifar_service_endpoints` 的 endpoint 数量和 agent `serviceStatus` 的 Endpoint/Nacos 状态。
+- 问题：用户询问容器页顶部菜单最终保留哪些页签足够。
+- 结论：建议顶层页签收敛为“总览、AIFAR Runtime、容器、镜像”四个，必要时保留“配置”为第五个；Network、Volumes、Registry 不作为第一层页签，合并到资源/镜像/高级配置或更多入口。
+- 问题：用户确认按企业级运维方向收敛容器页菜单，并要求继续执行。
+- 结论：容器页顶层页签已收敛为“概览、AIFAR 运行时、容器、镜像”；Network、Volumes、Registry、主机配置收纳到“镜像”页内部资源 tabs，并新增 `resourceTab` 独立驱动集合接口加载；页面副标题改为企业运维语义；`pnpm web:build` 与 `git diff --check` 已通过。
+- 问题：用户要求分析一份 `aifar-agent status` 输出。
+- 结论：该 agent 为 `runtime-v2` 且具备 rolling-update、nacos-ready-gate、service-affinity-policy、runtime-status-detail 等新特性；实例 `admin` 下 file/gateway/oauth/permission/system/web-vue3 均 ready，contacts/im/meeting/message 为 desired=0 offline，Endpoint 与副本数一致，Nacos 对 Java 服务注册 ready。需注意 offline 服务仍在 listeners 中占端口，且当前 healthCheck 多数只验证 HTTP 可达，不严格验证业务 readiness。
+- 问题：用户询问 `aifar-agent status` 的结果是怎么出来的。
+- 结论：`aifar-agent status` 是 CLI 向常驻 agent 的 `127.0.0.1:18081/status` 发 GET 请求，返回 `runtimeagent.Manager.Status()` 的内存快照；其中 spec 字段来自 `/var/lib/aifar-agent/instances/<instance>/runtime-spec.json` 或最新 reconcile 提交，deploymentStatus 来自 agent reconcile 时 Docker 容器检查，endpoints/serviceStatus 来自 Docker `ps/inspect` 刷新的 endpoint cache，Nacos 状态来自注册/心跳同步结果。
+- 问题：用户询问 AIFAR Runtime 页面中的 Ingress 当前是什么体现。
+- 结论：当前 Ingress 不是 K8s 独立资源或单独 nginx 容器，而是 RuntimeSpec 的入口配置加 `aifar-agent` 内置 HTTP 反向代理监听；默认 gateway 走 38000、web-vue3 走 8080，agent 按 service endpoint cache 转发到 ready Pod。页面上的 Ingress 数据主要来自实例 metadata 的 endpoint/gatewayEndpoint/port/runtimeService，并与 Nacos 服务注册状态放在同一视图展示。
+- 问题：用户确认是否“对外开放的端口就是现在的 Ingress”。
+- 结论：用户访问意义上的对外入口是 Ingress 端口，默认 Web 8080、Gateway 38000；但当前 agent 也会为每个 Runtime Service 监听对应 listenPort，如 oauth 38001 等，用于 Nacos/内部服务代理。代码使用 `net.Listen(":port")` 绑定所有网卡，实际是否对外可访问还取决于主机防火墙/安全组。
+- 问题：用户贴出 aifar-agent Nacos proxy register/deregister 日志，询问这些端口是否就是 Ingress。
+- 结论：日志中的 `alpha-gateway -> 38000` 同时是 Gateway 对外入口和 Nacos 服务发现地址；`alpha-oauth -> 38001`、`alpha-permission -> 38010` 等是各业务服务的 agent 代理端口，主要给 Nacos/内部调用使用；message/im/contacts/meeting 因下线或期望副本为 0 被从 Nacos 注销。
+- 问题：用户询问 Nacos 为什么注册宿主机 IP + agent 代理端口，而不是 Pod/容器内部 IP + 端口。
+- 结论：AIFAR Runtime v2 采用 agent-only 服务发现模型；Docker 容器内部 IP 不稳定且跨主机通常不可路由，注册 Pod IP 会带来滚动更新实例抖动、下线残留和每个业务容器自注册负担。注册 hostIP:servicePort 让 Nacos 指向稳定服务入口，agent 统一做 endpoint cache、ready gate、负载/亲和、滚动切换和注销；服务代理端口应限制在内部网络，公网只建议开放 Web/Gateway 入口。
+- 问题：用户询问 38000 是否可以不用对外开放，只开放 8080。
+- 结论：当前默认 web-nginx 模式下，浏览器访问 8080，前端 API 使用同源 `/api/v2`，web-vue3 nginx 将 `/api/` 和 `/im/ws` 转发到宿主机 gateway 端口 38000，因此公网/外部用户入口可以只开放 8080；但 38000 不能停用，仍需供 web-vue3 容器、agent/Nacos 注册和内网服务发现访问。运维上建议安全组/防火墙只让外部访问 8080/未来 443，38000 及 38001 等服务代理端口限制在本机、Docker 网络或受信内网。
+- 问题：用户质疑其它 agent 代理端口是否也必须开放，因为 Nacos 注册后要能访问。
+- 结论：更准确说法是 Nacos 服务端本身通常不主动访问 380xx 端口；当前 agent-proxy 临时实例由 agent 注册和心跳。真正需要访问 380xx 的是通过 Nacos 发现服务的消费者，如 gateway 调 oauth 会拿到 `hostIP:38001` 并连接该端口。因此 38000/38001/38002/38005/38010 等端口必须对 Docker 容器网络和受信应用内网可达，但不应对公网或普通外部用户开放。
+- 问题：用户询问每次 AIFAR 部署后 `docker images -a` 为什么出现很多 `<none>` 镜像。
+- 结论：AIFAR install/update 脚本会按 revision 对每个服务执行 `docker build -t aifar-服务:<revision>`；`docker images -a` 会显示构建中间层和 dangling image，重复部署/更新 jar 或前端 dist 后，旧构建层或被新 tag 替换的旧镜像会以 `<none>:<none>` 展示。它们通常不是运行容器本身，可用 `docker image ls -f dangling=true`、`docker system df -v` 判断；安全清理优先用 `docker image prune -f`，谨慎使用 `docker system prune -a` 以免删除可回滚旧 revision 镜像。
+- 问题：用户指出容器概览里的“镜像”数量像是 `docker images -a`，建议改成 `docker images` 口径。
+- 结论：已调整 Docker summary 统计口径：保留 `/info` 用于容器、运行数、驱动、版本等字段，但 `summary.images` 改为 `DockerImages`/`/images/json` 可见镜像列表长度，等价于 `docker images` 而不是 Docker info 的 `Images` 总数；补充 Docker API 单测验证 info 返回 47 时按镜像列表返回 2。`pnpm test` 与 `git diff --check` 通过。
+- 问题：用户提出希望将 `aifar-agent` 调整为标准化部署工具，支持自定义导入 jar、Vue、Go、Python 等部署包，并自定义 Ingress、Deployment、Pod 等资源。
+- 结论：方向应从 AIFAR 专用 runtime-v2 演进为通用声明式 RuntimeApp：保留现有 agent 轻量 kubelet/kube-proxy 能力和 RuntimeSpec 兼容层，新增标准包 manifest、artifact/build abstraction、通用 Deployment/Service/Ingress 路由模型和多 runtime 类型。实现上应避免自由 shell，采用受控模板/运行时类型；先做 spec v3 + CLI/后端导入闭环，再做面板 UI 和迁移。
+- 问题：用户澄清不要定义具体项目形态，而是要做类似 Kubernetes 设计逻辑的通用单机工具。
+- 结论：后续设计应以通用资源模型为核心，而不是业务包结构：单机 Node、Pod、Deployment、Service、Ingress、Config、Secret、Volume、Job 等资源均声明式管理；jar/Vue/Go/Python 只属于可选 Build/Artifact 层，最终产物应转成 image 或 runnable bundle 后由 Deployment/Pod 消费。核心 agent 负责 desired state reconciliation、容器运行、Service 代理、Ingress 路由、状态观测和插件式 discovery，不绑定 AIFAR 服务名或固定业务默认值。
+- 问题：用户要求创建一份专门用于反复讨论单机 Kubernetes-like 资源抽象逻辑的设计 md。
+- 结论：已新增 `design/single-node-k8s-runtime-resource-design.md` 草案，内容聚焦通用单机编排资源模型，不绑定具体业务项目；覆盖目标/非目标、K8s 对应关系、系统分层、通用资源 envelope、Node/Pod/Deployment/Service/Ingress/Config/Secret/Volume/Job/Build 资源、reconcile 流程、网络模型、discovery 插件、runtime driver、store、CLI/API、迁移关系、第一阶段闭环和待讨论问题。
+- 问题：用户询问通用单机 Kubernetes-like runtime 的逻辑调整是否只调整 `aifar-agent`。
+- 结论：已在设计文档补充“调整边界”：核心资源 API、store、controllers、runtime driver、network plane、discovery plugin 和 CLI 应收敛到 agent；现有后端只作为 agent 安装/升级、资源提交代理、审计和任务层，前端作为通用资源工作台。第一阶段可只实现 agent + CLI 最小闭环，不要求面板同步完整改造。
+- 问题：用户确认通用单机 runtime 是否应像 Kubernetes 一样核心只接镜像。
+- 结论：设计决策调整为核心 runtime 只消费 image；jar/Vue/Go/Python 等语言制品必须先由外部 Build/Import 平面转成镜像或导入标准 image archive，再由 Deployment/Pod 的 `containers[].image` 使用。Build/Import 不进入核心 agent reconcile API，agent 核心只负责拉取/导入镜像、创建容器、资源 reconcile、Service/Ingress 和状态观测。
+- 问题：用户询问通用 runtime 要支持 SSL/TLS 能力时应该放在哪一层。
+- 结论：SSL/TLS 语义应放在 Ingress/Network Plane，由 IngressProxy 默认终止 TLS；证书和私钥通过 Secret 保存并由 Ingress 引用，Service 和 Pod 默认不承担证书终止。端到端 HTTPS、TLS passthrough、mTLS、ACME 自动签发属于后续增强能力。
+- 问题：用户询问 Kubernetes 是否用 Go 编写。
+- 结论：Kubernetes 核心组件主要使用 Go 编写，这也是其适合做云原生控制器、agent、网络代理和容器编排系统的重要原因之一。
+- 问题：用户询问 `aifar-agent` 应拆成多个核心组件，还是一个组件管理全部。
+- 结论：第一阶段建议采用单二进制、单常驻进程的 modular monolith：核心控制器、store、runtime driver、Service/Ingress proxy、discovery、status/events/logs 都在一个 `aifar-agent` 进程内，代码内部按模块和接口拆分。External Build/Import worker、外部网关、registry/cache、ACME/cert issuer 等外围能力才考虑独立进程或插件。
+- 问题：用户询问如果要给 `aifar-agent` 更名，建议改成什么。
+- 结论：建议产品/组件名改为 AIFAR Runtime，二进制和 systemd 服务名使用 `aifar-runtime`/`aifar-runtime.service`；CLI 可使用 `aifarctl` 或 `aifar-runtimectl`。原因是该组件未来是单机编排执行面，不只是面板附属 agent。
+- 问题：用户询问 `Dongfang` 是否适合作为 `aifar-agent` 新名称。
+- 结论：`Dongfang` 比 `East` 更有品牌辨识度，适合作为产品品牌或代号，但不建议单独作为基础设施组件名；更推荐 `Dongfang Runtime`，二进制可用 `dongfangd` 或保守使用 `aifar-runtime`，CLI 可用 `dongfangctl` 或 `aifarctl`。
+- 问题：用户决定暂时使用 `Aifar Runtime` 作为 `aifar-agent` 新名称。
+- 结论：设计文档已统一暂定为 `AIFAR Runtime`：产品/组件名 `AIFAR Runtime`，二进制 `aifar-runtime`，systemd 服务 `aifar-runtime.service`，CLI `aifarctl`，旧实现/兼容称呼保留 `aifar-agent`。
+- 问题：用户要求开一个单独分支，暂时只做 AIFAR Runtime。
+- 结论：已从当前工作状态创建并切换到 `codex/aifar-runtime` 分支，后续 AIFAR Runtime 的设计和实现先集中在该分支推进。
+- 问题：用户询问之前分支未提交的代码去了哪里。
+- 结论：未提交改动没有丢失；它们属于 Git 工作区状态，不是某个分支上的提交。当前已切回 `codex/aifar-runtime`，这些未提交改动都保留在该分支工作区中；原 `codex/aifar-agent-runtime-v2` 分支和新分支目前指向同一个基准提交。

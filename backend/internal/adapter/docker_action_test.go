@@ -90,6 +90,42 @@ func TestDockerAPIImageRemoveEscapesImageReference(t *testing.T) {
 	}
 }
 
+func TestDockerAPISummaryCountsVisibleImagesFromImageList(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/info":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"Containers":9,"Images":47,"ContainersRunning":4,"Driver":"overlay2","ServerVersion":"24.0.9","DockerRootDir":"/var/lib/docker"}`))
+		case "/images/json":
+			if r.URL.Query().Get("all") != "" {
+				t.Fatalf("summary image count should use docker images semantics, got all=%q", r.URL.Query().Get("all"))
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`[{"Id":"sha256:a","RepoTags":["aifar-gateway:rev"],"Size":10,"Created":1},{"Id":"sha256:b","RepoTags":["<none>:<none>"],"Size":20,"Created":1}]`))
+		case "/networks":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`[]`))
+		case "/volumes":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"Volumes":[]}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	summary, err := dockerAPISummary(context.Background(), server.URL)
+	if err != nil {
+		t.Fatalf("dockerAPISummary failed: %v", err)
+	}
+	if summary.Images != 2 {
+		t.Fatalf("summary.Images = %d, want visible image list count 2", summary.Images)
+	}
+	if summary.Containers != 9 || summary.Running != 4 {
+		t.Fatalf("summary lost info fields: %+v", summary)
+	}
+}
+
 func TestParseDockerContainersIncludesLabels(t *testing.T) {
 	rows := strings.Join([]string{
 		`{"ID":"abc123","Names":"aifar-oauth-release","Image":"aifar-oauth:release","State":"running","Status":"Up 2 minutes","Ports":"38001/tcp","Networks":"aifar-network","CreatedAt":"now","Labels":"aifar.app=aifar,aifar.service=oauth,aifar.install-root=/aifar/apps/admin"}`,

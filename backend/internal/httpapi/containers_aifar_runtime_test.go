@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"aifar-deployment/backend/internal/adapter"
@@ -51,6 +52,41 @@ func TestAIFARRuntimeReturnsDegradedControlPlaneWhenAgentMissing(t *testing.T) {
 	}
 	if len(body.Services) != 1 || body.Services[0].ServiceName != "permission" || body.Services[0].AppName != "alpha-permission" || body.Services[0].Status != "ready" {
 		t.Fatalf("unexpected services: %+v", body.Services)
+	}
+}
+
+func TestAIFARRuntimeCanSkipPodsAndStats(t *testing.T) {
+	api, db, secret := newAuthzTestAPI(t)
+	var dockerCalled atomic.Bool
+	dockerAPI := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		dockerCalled.Store(true)
+		http.NotFound(w, r)
+	}))
+	defer dockerAPI.Close()
+	server, _ := seedAIFARRuntimeFixture(t, db, dockerAPI.URL)
+	token := issueTestToken(t, db, secret, "owner", "owner")
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v2/containers/aifar/runtime?serverId="+server.ID+"&includePods=0&includeStats=0", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	rec := httptest.NewRecorder()
+
+	api.Router().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	if dockerCalled.Load() {
+		t.Fatal("expected runtime summary request to skip Docker container calls")
+	}
+	var body aifarRuntimeResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if len(body.Pods) != 0 {
+		t.Fatalf("expected pods to be omitted, got %+v", body.Pods)
+	}
+	if len(body.Deployments) != 1 || len(body.Services) != 1 {
+		t.Fatalf("expected deployment and service summaries, got deployments=%+v services=%+v", body.Deployments, body.Services)
 	}
 }
 
@@ -118,7 +154,7 @@ func TestAIFARRuntimeServiceSummaryIgnoresNilResidualRecords(t *testing.T) {
 	api.appendAIFARInstanceRuntime(&response, instance, map[string]adapter.DockerContainer{
 		"aifar-pod-admin-file-rev-good-r1": {Name: "aifar-pod-admin-file-rev-good-r1", Image: "aifar-file:rev-good", State: "running", Status: "Up 1 minute (healthy)"},
 		"aifar-pod-admin-file-rev-good-r2": {Name: "aifar-pod-admin-file-rev-good-r2", Image: "aifar-file:rev-good", State: "running", Status: "Up 1 minute (healthy)"},
-	}, nil)
+	}, map[string]adapter.DockerContainerStat{}, aifarRuntimeBuildOptions{IncludePods: true})
 
 	if len(response.Services) != 1 {
 		t.Fatalf("expected one service, got %+v", response.Services)

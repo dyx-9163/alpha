@@ -100,7 +100,9 @@ func DockerSummaryForHost(ctx context.Context, host string) (DockerSummary, erro
 	if err != nil {
 		return DockerSummary{}, err
 	}
-	return dockerSummaryFromOutput(ctx, out, dockerEndpoint(host), func(ctx context.Context) ([]DockerNetwork, error) {
+	return dockerSummaryFromOutput(ctx, out, dockerEndpoint(host), func(ctx context.Context) ([]DockerImage, error) {
+		return DockerImages(ctx, host)
+	}, func(ctx context.Context) ([]DockerNetwork, error) {
 		return DockerNetworks(ctx, host)
 	}, func(ctx context.Context) ([]DockerVolume, error) {
 		return DockerVolumes(ctx, host)
@@ -115,14 +117,16 @@ func DockerSummaryForServer(ctx context.Context, server store.Server) (DockerSum
 	if err != nil {
 		return DockerSummary{}, err
 	}
-	return dockerSummaryFromOutput(ctx, out, serverDockerEndpoint(server), func(ctx context.Context) ([]DockerNetwork, error) {
+	return dockerSummaryFromOutput(ctx, out, serverDockerEndpoint(server), func(ctx context.Context) ([]DockerImage, error) {
+		return DockerImagesForServer(ctx, server)
+	}, func(ctx context.Context) ([]DockerNetwork, error) {
 		return DockerNetworksForServer(ctx, server)
 	}, func(ctx context.Context) ([]DockerVolume, error) {
 		return DockerVolumesForServer(ctx, server)
 	})
 }
 
-func dockerSummaryFromOutput(ctx context.Context, out []byte, endpoint string, networksFn func(context.Context) ([]DockerNetwork, error), volumesFn func(context.Context) ([]DockerVolume, error)) (DockerSummary, error) {
+func dockerSummaryFromOutput(ctx context.Context, out []byte, endpoint string, imagesFn func(context.Context) ([]DockerImage, error), networksFn func(context.Context) ([]DockerNetwork, error), volumesFn func(context.Context) ([]DockerVolume, error)) (DockerSummary, error) {
 	var info struct {
 		Containers        any    `json:"Containers"`
 		Images            any    `json:"Images"`
@@ -132,11 +136,15 @@ func dockerSummaryFromOutput(ctx context.Context, out []byte, endpoint string, n
 		DockerRootDir     string `json:"DockerRootDir"`
 	}
 	_ = json.Unmarshal(out, &info)
+	imageCount := toInt(info.Images)
+	if images, err := imagesFn(ctx); err == nil {
+		imageCount = len(images)
+	}
 	networks, _ := networksFn(ctx)
 	volumes, _ := volumesFn(ctx)
 	return DockerSummary{
 		Containers: toInt(info.Containers),
-		Images:     toInt(info.Images),
+		Images:     imageCount,
 		Running:    toInt(info.ContainersRunning),
 		Networks:   len(networks),
 		Volumes:    len(volumes),

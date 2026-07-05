@@ -33,17 +33,22 @@ func (r Reconciler) ReconcileRuntime(ctx context.Context, spec RuntimeSpec) erro
 	if r.Manager == nil {
 		return errors.New("runtime manager is required")
 	}
+	spec = NormalizeSpec(spec)
 	if err := r.Manager.Apply(ctx, spec); err != nil {
 		return err
 	}
 	if err := SyncNacosProxyRegistrations(ctx, NacosProxySyncOptions{
-		Specs:  []RuntimeSpec{NormalizeSpec(spec)},
-		Action: NacosProxyRegister,
-		Log:    r.Log,
+		Specs:             []RuntimeSpec{spec},
+		Action:            NacosProxyRegister,
+		Log:               r.Log,
+		RequireConfigured: true,
 	}); err != nil {
 		logf(r.Log, "sync AIFAR Nacos proxies after runtime reconcile failed: %v\n", err)
+		r.Manager.MarkNacosProxyStatus([]RuntimeSpec{spec}, err)
+		return err
 	}
-	logf(r.Log, "AIFAR agent reconciled runtime instance %s\n", NormalizeSpec(spec).InstanceID)
+	r.Manager.MarkNacosProxyStatus([]RuntimeSpec{spec}, nil)
+	logf(r.Log, "AIFAR agent reconciled runtime instance %s\n", spec.InstanceID)
 	return nil
 }
 
@@ -68,6 +73,8 @@ type Manager struct {
 	servers     map[int]*http.Server
 	next        map[string]uint64
 	endpoints   map[string][]endpoint
+	deployments map[string]deploymentRuntimeStatus
+	services    map[string]serviceRuntimeStatus
 }
 
 type proxyRoute struct {
@@ -81,6 +88,46 @@ type endpoint struct {
 	Address   string
 }
 
+type deploymentRuntimeStatus struct {
+	InstanceID        string                 `json:"instanceId"`
+	ServiceName       string                 `json:"serviceName"`
+	DeploymentName    string                 `json:"deploymentName,omitempty"`
+	PodRevision       string                 `json:"podRevision,omitempty"`
+	Image             string                 `json:"image,omitempty"`
+	Strategy          DeploymentStrategySpec `json:"strategy"`
+	DesiredReplicas   int                    `json:"desiredReplicas"`
+	CurrentReplicas   int                    `json:"currentReplicas"`
+	ReadyReplicas     int                    `json:"readyReplicas"`
+	UpdatedReplicas   int                    `json:"updatedReplicas"`
+	AvailableReplicas int                    `json:"availableReplicas"`
+	Status            string                 `json:"status"`
+	LastReconcileAt   string                 `json:"lastReconcileAt,omitempty"`
+	LastError         string                 `json:"lastError,omitempty"`
+}
+
+type serviceRuntimeStatus struct {
+	InstanceID            string `json:"instanceId"`
+	ServiceName           string `json:"serviceName"`
+	AppName               string `json:"appName,omitempty"`
+	EndpointCount         int    `json:"endpointCount"`
+	ReadyEndpointCount    int    `json:"readyEndpointCount"`
+	NacosRegistered       bool   `json:"nacosRegistered,omitempty"`
+	NacosReady            bool   `json:"nacosReady,omitempty"`
+	LastNacosHeartbeatAt  string `json:"lastNacosHeartbeatAt,omitempty"`
+	LastNacosError        string `json:"lastNacosError,omitempty"`
+	Status                string `json:"status"`
+	LastEndpointRefreshAt string `json:"lastEndpointRefreshAt,omitempty"`
+}
+
+type deploymentPodState struct {
+	Name     string
+	Replica  int
+	Revision string
+	SpecHash string
+	Running  bool
+	Healthy  bool
+}
+
 func NewManager(options ManagerOptions) *Manager {
 	stateDir := strings.TrimSpace(options.StateDir)
 	if stateDir == "" {
@@ -91,14 +138,16 @@ func NewManager(options ManagerOptions) *Manager {
 		runner = ExecRunner{}
 	}
 	return &Manager{
-		stateDir:  stateDir,
-		runner:    runner,
-		log:       options.Log,
-		specs:     map[string]RuntimeSpec{},
-		routes:    map[int]proxyRoute{},
-		servers:   map[int]*http.Server{},
-		next:      map[string]uint64{},
-		endpoints: map[string][]endpoint{},
+		stateDir:    stateDir,
+		runner:      runner,
+		log:         options.Log,
+		specs:       map[string]RuntimeSpec{},
+		routes:      map[int]proxyRoute{},
+		servers:     map[int]*http.Server{},
+		next:        map[string]uint64{},
+		endpoints:   map[string][]endpoint{},
+		deployments: map[string]deploymentRuntimeStatus{},
+		services:    map[string]serviceRuntimeStatus{},
 	}
 }
 
@@ -181,6 +230,7 @@ func (m *Manager) Remove(ctx context.Context, instanceID string) error {
 	m.mu.Lock()
 	spec, hasSpec = m.specs[instanceID]
 	delete(m.specs, instanceID)
+	m.deleteInstanceRuntimeStatusLocked(instanceID)
 	for port, route := range m.routes {
 		if route.InstanceID != instanceID {
 			continue
@@ -219,14 +269,16 @@ func (m *Manager) Status() map[string]any {
 	for _, id := range sortedSpecIDs(m.specs) {
 		spec := m.specs[id]
 		instances = append(instances, map[string]any{
-			"instanceId":  spec.InstanceID,
-			"installRoot": spec.InstallRoot,
-			"network":     spec.Network,
-			"deployments": spec.Deployments,
-			"services":    spec.Services,
-			"ingress":     spec.Ingress,
-			"endpoints":   m.endpointsForInstanceLocked(spec.InstanceID),
-			"nacos":       spec.Nacos,
+			"instanceId":       spec.InstanceID,
+			"installRoot":      spec.InstallRoot,
+			"network":          spec.Network,
+			"deployments":      spec.Deployments,
+			"services":         spec.Services,
+			"ingress":          spec.Ingress,
+			"endpoints":        m.endpointsForInstanceLocked(spec.InstanceID),
+			"deploymentStatus": m.deploymentStatusForInstanceLocked(spec.InstanceID),
+			"serviceStatus":    m.serviceStatusForInstanceLocked(spec.InstanceID),
+			"nacos":            spec.Nacos,
 		})
 	}
 	return map[string]any{
@@ -244,6 +296,10 @@ func (m *Manager) Status() map[string]any {
 			"docker-events",
 			"periodic-resync",
 			"reconcile-runtime",
+			"rolling-update",
+			"nacos-ready-gate",
+			"service-affinity-policy",
+			"runtime-status-detail",
 			"status",
 		},
 	}
@@ -287,6 +343,9 @@ func (m *Manager) StartRuntimeResync(ctx context.Context, interval time.Duration
 			options.Action = NacosProxyRegister
 			if err := SyncNacosProxyRegistrations(ctx, options); err != nil {
 				logf(m.log, "AIFAR runtime periodic Nacos replay failed: %v\n", err)
+				m.MarkNacosProxyStatus(specs, err)
+			} else {
+				m.MarkNacosProxyStatus(specs, nil)
 			}
 		}
 	}
@@ -399,7 +458,7 @@ func (m *Manager) handleProxy(port int) func(http.ResponseWriter, *http.Request)
 			http.Error(w, "AIFAR runtime service has no ready endpoints", http.StatusServiceUnavailable)
 			return
 		}
-		ep := m.selectEndpoint(r, spec.InstanceID, service, endpoints)
+		ep := m.selectEndpoint(r, spec.InstanceID, service, affinityPolicyForService(spec, service), endpoints)
 		target := &url.URL{Scheme: "http", Host: ep.Address}
 		proxy := httputil.NewSingleHostReverseProxy(target)
 		originalDirector := proxy.Director
@@ -434,43 +493,126 @@ func (m *Manager) resolveRoute(port int, path string) (RuntimeSpec, string, bool
 }
 
 func (m *Manager) reconcileDeployments(ctx context.Context, spec RuntimeSpec) error {
+	deployments := make([]DeploymentSpec, 0, len(spec.Deployments))
 	for _, deployment := range spec.Deployments {
 		if strings.TrimSpace(deployment.Image) == "" {
 			continue
 		}
-		if err := m.ensureDeployment(ctx, spec, deployment); err != nil {
-			return err
-		}
+		deployments = append(deployments, deployment)
 	}
-	return nil
+	if len(deployments) == 0 {
+		return nil
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	var wg sync.WaitGroup
+	var errMu sync.Mutex
+	var firstErr error
+	for _, deployment := range deployments {
+		deployment := deployment
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := m.ensureDeployment(ctx, spec, deployment); err != nil {
+				deploymentName := strings.TrimSpace(deployment.DeploymentName)
+				if deploymentName == "" {
+					deploymentName = deployment.ServiceName
+				}
+				err = fmt.Errorf("reconcile AIFAR deployment %s: %w", deploymentName, err)
+				errMu.Lock()
+				if firstErr == nil {
+					firstErr = err
+					cancel()
+				}
+				errMu.Unlock()
+			}
+		}()
+	}
+	wg.Wait()
+	return firstErr
 }
 
 func (m *Manager) ensureDeployment(ctx context.Context, spec RuntimeSpec, deployment DeploymentSpec) error {
+	deployment.Strategy = NormalizeDeploymentStrategy(deployment.Strategy)
+	if deployment.Strategy.ProgressDeadlineSeconds > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, time.Duration(deployment.Strategy.ProgressDeadlineSeconds)*time.Second)
+		defer cancel()
+	}
+	m.setDeploymentStatusFromDocker(ctx, spec, deployment, "rolling", "")
+	created := []string{}
 	for replica := 1; replica <= deployment.Replicas; replica++ {
 		name := containerNameForDeployment(spec, deployment, replica)
 		exists, err := m.containerExists(ctx, name)
 		if err != nil {
+			m.setDeploymentStatusFromDocker(ctx, spec, deployment, "failed", err.Error())
 			return err
 		}
 		if exists {
 			recreate, err := m.containerNeedsRecreate(ctx, name, deployment)
 			if err != nil {
+				m.setDeploymentStatusFromDocker(ctx, spec, deployment, "failed", err.Error())
 				return err
 			}
 			if recreate {
 				if _, err := m.runner.Run(ctx, "docker", "rm", "-f", name); err != nil {
-					return fmt.Errorf("replace drifted AIFAR pod %s: %w", name, err)
+					err = fmt.Errorf("replace drifted AIFAR pod %s: %w", name, err)
+					m.setDeploymentStatusFromDocker(ctx, spec, deployment, "failed", err.Error())
+					return err
 				}
 				exists = false
 			}
 		}
 		if !exists {
 			if err := m.runContainer(ctx, spec, deployment, replica, name); err != nil {
+				if deploymentRollbackOnFailure(deployment) {
+					m.rollbackCreatedPods(ctx, created)
+				}
+				m.setDeploymentStatusFromDocker(ctx, spec, deployment, "failed", err.Error())
+				return err
+			}
+			created = append(created, name)
+			if err := m.refreshServiceEndpoint(ctx, spec, deployment.ServiceName); err != nil {
+				if deploymentRollbackOnFailure(deployment) {
+					m.rollbackCreatedPods(ctx, created)
+				}
+				m.setDeploymentStatusFromDocker(ctx, spec, deployment, "failed", err.Error())
 				return err
 			}
 		}
 	}
-	return m.removeExtraReplicas(ctx, spec, deployment)
+	if err := m.removeExtraReplicas(ctx, spec, deployment); err != nil {
+		m.setDeploymentStatusFromDocker(ctx, spec, deployment, "failed", err.Error())
+		return err
+	}
+	if err := m.refreshServiceEndpoint(ctx, spec, deployment.ServiceName); err != nil {
+		m.setDeploymentStatusFromDocker(ctx, spec, deployment, "failed", err.Error())
+		return err
+	}
+	m.setDeploymentStatusFromDocker(ctx, spec, deployment, "ready", "")
+	return nil
+}
+
+func deploymentRollbackOnFailure(deployment DeploymentSpec) bool {
+	if deployment.Strategy.RollbackOnFailure == nil {
+		return DefaultDeploymentRollbackOnError
+	}
+	return *deployment.Strategy.RollbackOnFailure
+}
+
+func (m *Manager) rollbackCreatedPods(ctx context.Context, names []string) {
+	if len(names) == 0 {
+		return
+	}
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	defer cancel()
+	for _, name := range names {
+		if strings.TrimSpace(name) == "" {
+			continue
+		}
+		_, _ = m.runner.Run(cleanupCtx, "docker", "rm", "-f", name)
+		logf(m.log, "AIFAR runtime rollback removed pod container=%s\n", name)
+	}
 }
 
 func (m *Manager) containerExists(ctx context.Context, name string) (bool, error) {
@@ -649,40 +791,71 @@ func trimDiagnosticOutput(value string, max int) string {
 }
 
 func (m *Manager) removeExtraReplicas(ctx context.Context, spec RuntimeSpec, deployment DeploymentSpec) error {
+	pods, err := m.listDeploymentPods(ctx, spec, deployment)
+	if err != nil {
+		return nil
+	}
+	desiredHash := deploymentSpecHash(deployment)
+	for _, pod := range pods {
+		revisionDrifted := strings.TrimSpace(deployment.PodRevision) != "" && pod.Revision != "" && pod.Revision != strings.TrimSpace(deployment.PodRevision)
+		specDrifted := pod.SpecHash != "" && pod.SpecHash != desiredHash && (pod.Revision == "" || pod.Revision == strings.TrimSpace(deployment.PodRevision))
+		if pod.Replica > deployment.Replicas || revisionDrifted || specDrifted {
+			_, _ = m.runner.Run(ctx, "docker", "rm", "-f", pod.Name)
+			logf(m.log, "AIFAR runtime pod removed service=%s replica=%d container=%s\n", deployment.ServiceName, pod.Replica, pod.Name)
+		}
+	}
+	return nil
+}
+
+func (m *Manager) listDeploymentPods(ctx context.Context, spec RuntimeSpec, deployment DeploymentSpec) ([]deploymentPodState, error) {
 	result, err := m.runner.Run(ctx, "docker",
 		"ps", "-a",
 		"--filter", "label=aifar.app=aifar",
 		"--filter", "label=aifar.install-root="+spec.InstallRoot,
 		"--filter", "label=aifar.component=pod",
 		"--filter", "label=aifar.service="+deployment.ServiceName,
-		"--format", `{{.Names}}|{{.Label "aifar.replica"}}|{{.Label "aifar.revision"}}`,
+		"--format", `{{.Names}}|{{.Label "aifar.replica"}}|{{.Label "aifar.revision"}}|{{.Label "aifar.spec-hash"}}`,
 	)
 	if err != nil {
-		return nil
+		return nil, err
 	}
+	pods := []deploymentPodState{}
 	for _, line := range strings.Split(strings.TrimSpace(result.Stdout), "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" {
 			continue
 		}
-		parts := strings.SplitN(line, "|", 3)
-		if len(parts) < 2 {
+		parts := strings.Split(line, "|")
+		if len(parts) == 0 {
 			continue
 		}
-		name := strings.TrimSpace(parts[0])
-		replicaText := strings.TrimSpace(parts[1])
-		revision := ""
-		if len(parts) == 3 {
-			revision = strings.TrimSpace(parts[2])
+		pod := deploymentPodState{Name: strings.TrimSpace(parts[0])}
+		if pod.Name == "" {
+			continue
 		}
-		replica, _ := strconv.Atoi(strings.TrimSpace(replicaText))
-		revisionDrifted := strings.TrimSpace(deployment.PodRevision) != "" && revision != "" && revision != strings.TrimSpace(deployment.PodRevision)
-		if replica > deployment.Replicas || revisionDrifted {
-			_, _ = m.runner.Run(ctx, "docker", "rm", "-f", name)
-			logf(m.log, "AIFAR runtime pod removed service=%s replica=%d container=%s\n", deployment.ServiceName, replica, name)
+		if len(parts) > 1 {
+			pod.Replica, _ = strconv.Atoi(strings.TrimSpace(parts[1]))
 		}
+		if len(parts) > 2 {
+			pod.Revision = strings.TrimSpace(parts[2])
+		}
+		if len(parts) > 3 {
+			pod.SpecHash = strings.TrimSpace(parts[3])
+		}
+		inspect, err := m.runner.Run(ctx, "docker", "inspect", "-f", `{{.State.Running}}|{{if .State.Health}}{{.State.Health.Status}}{{end}}`, pod.Name)
+		if err == nil {
+			state := strings.Split(strings.TrimSpace(inspect.Stdout), "|")
+			pod.Running = len(state) > 0 && state[0] == "true"
+			health := ""
+			if len(state) > 1 {
+				health = strings.TrimSpace(state[1])
+			}
+			pod.Healthy = pod.Running && (health == "" || health == "healthy")
+		}
+		pods = append(pods, pod)
 	}
-	return nil
+	sort.Slice(pods, func(i, j int) bool { return pods[i].Name < pods[j].Name })
+	return pods, nil
 }
 
 func (m *Manager) refreshInstanceEndpoints(ctx context.Context, spec RuntimeSpec) error {
@@ -697,9 +870,47 @@ func (m *Manager) refreshInstanceEndpoints(ctx context.Context, spec RuntimeSpec
 	m.mu.Lock()
 	for service, endpoints := range refreshed {
 		m.endpoints[endpointKey(spec.InstanceID, service)] = endpoints
+		if serviceSpec, ok := serviceByName(spec, service); ok {
+			m.setServiceEndpointStatusLocked(spec, serviceSpec, endpoints)
+		}
 	}
 	m.mu.Unlock()
 	return nil
+}
+
+func (m *Manager) refreshServiceEndpoint(ctx context.Context, spec RuntimeSpec, service string) error {
+	serviceSpec, ok := serviceByName(spec, service)
+	if !ok {
+		return fmt.Errorf("AIFAR runtime service %s is not configured", service)
+	}
+	endpoints, err := m.discoverEndpoints(ctx, spec, service)
+	if err != nil {
+		return err
+	}
+	m.mu.Lock()
+	m.endpoints[endpointKey(spec.InstanceID, service)] = endpoints
+	m.setServiceEndpointStatusLocked(spec, serviceSpec, endpoints)
+	m.mu.Unlock()
+	return nil
+}
+
+func (m *Manager) setServiceEndpointStatusLocked(spec RuntimeSpec, service ServiceSpec, endpoints []endpoint) {
+	status := "ready"
+	if replicas, ok := serviceDesiredReplicas(spec, service.Name); ok && replicas == 0 {
+		status = "offline"
+	} else if len(endpoints) == 0 {
+		status = "no-endpoints"
+	}
+	key := endpointKey(spec.InstanceID, service.Name)
+	current := m.services[key]
+	current.InstanceID = spec.InstanceID
+	current.ServiceName = service.Name
+	current.AppName = serviceAppName(service)
+	current.EndpointCount = len(endpoints)
+	current.ReadyEndpointCount = len(endpoints)
+	current.Status = status
+	current.LastEndpointRefreshAt = time.Now().Format(time.RFC3339)
+	m.services[key] = current
 }
 
 func (m *Manager) cachedEndpoints(instanceID, service string) []endpoint {
@@ -734,6 +945,150 @@ func (m *Manager) endpointsForInstanceLocked(instanceID string) map[string][]end
 		out[service] = copied
 	}
 	return out
+}
+
+func (m *Manager) deploymentStatusForInstanceLocked(instanceID string) []deploymentRuntimeStatus {
+	out := []deploymentRuntimeStatus{}
+	prefix := instanceID + "/"
+	for key, status := range m.deployments {
+		if strings.HasPrefix(key, prefix) {
+			out = append(out, status)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ServiceName < out[j].ServiceName })
+	return out
+}
+
+func (m *Manager) serviceStatusForInstanceLocked(instanceID string) []serviceRuntimeStatus {
+	out := []serviceRuntimeStatus{}
+	prefix := instanceID + "/"
+	for key, status := range m.services {
+		if strings.HasPrefix(key, prefix) {
+			out = append(out, status)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ServiceName < out[j].ServiceName })
+	return out
+}
+
+func (m *Manager) deleteInstanceRuntimeStatusLocked(instanceID string) {
+	prefix := instanceID + "/"
+	for key := range m.endpoints {
+		if strings.HasPrefix(key, prefix) {
+			delete(m.endpoints, key)
+		}
+	}
+	for key := range m.deployments {
+		if strings.HasPrefix(key, prefix) {
+			delete(m.deployments, key)
+		}
+	}
+	for key := range m.services {
+		if strings.HasPrefix(key, prefix) {
+			delete(m.services, key)
+		}
+	}
+}
+
+func (m *Manager) setDeploymentStatusFromDocker(ctx context.Context, spec RuntimeSpec, deployment DeploymentSpec, status, lastError string) {
+	statusCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	pods, err := m.listDeploymentPods(statusCtx, spec, deployment)
+	if err != nil && strings.TrimSpace(lastError) == "" {
+		lastError = err.Error()
+	}
+	desiredHash := deploymentSpecHash(deployment)
+	desiredRevision := strings.TrimSpace(deployment.PodRevision)
+	runtimeStatus := deploymentRuntimeStatus{
+		InstanceID:      spec.InstanceID,
+		ServiceName:     deployment.ServiceName,
+		DeploymentName:  deployment.DeploymentName,
+		PodRevision:     deployment.PodRevision,
+		Image:           deployment.Image,
+		Strategy:        NormalizeDeploymentStrategy(deployment.Strategy),
+		DesiredReplicas: deployment.Replicas,
+		Status:          status,
+		LastReconcileAt: time.Now().Format(time.RFC3339),
+		LastError:       strings.TrimSpace(lastError),
+	}
+	for _, pod := range pods {
+		runtimeStatus.CurrentReplicas++
+		if pod.Healthy {
+			runtimeStatus.ReadyReplicas++
+			runtimeStatus.AvailableReplicas++
+		}
+		revisionMatches := desiredRevision == "" || pod.Revision == "" || pod.Revision == desiredRevision
+		hashMatches := pod.SpecHash == "" || pod.SpecHash == desiredHash
+		if pod.Replica <= deployment.Replicas && revisionMatches && hashMatches {
+			runtimeStatus.UpdatedReplicas++
+		}
+	}
+	if runtimeStatus.LastError != "" {
+		runtimeStatus.Status = "failed"
+	} else if deployment.Replicas == 0 {
+		runtimeStatus.Status = "offline"
+	} else if runtimeStatus.UpdatedReplicas < deployment.Replicas {
+		runtimeStatus.Status = "rolling"
+	} else if runtimeStatus.ReadyReplicas < deployment.Replicas {
+		runtimeStatus.Status = "degraded"
+	} else if runtimeStatus.Status == "" {
+		runtimeStatus.Status = "ready"
+	}
+	m.mu.Lock()
+	m.deployments[endpointKey(spec.InstanceID, deployment.ServiceName)] = runtimeStatus
+	m.mu.Unlock()
+}
+
+func (m *Manager) MarkNacosProxyStatus(specs []RuntimeSpec, syncErr error) {
+	now := time.Now().Format(time.RFC3339)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, raw := range specs {
+		spec := NormalizeSpec(raw)
+		_, hasEnv := nacosEnvForSpec(spec)
+		for _, service := range spec.Services {
+			if !serviceRegistersInNacos(spec, service) {
+				continue
+			}
+			key := endpointKey(spec.InstanceID, service.Name)
+			status := m.services[key]
+			status.InstanceID = spec.InstanceID
+			status.ServiceName = service.Name
+			status.AppName = serviceAppName(service)
+			if replicas, ok := serviceDesiredReplicas(spec, service.Name); ok && replicas == 0 {
+				status.NacosRegistered = false
+				status.NacosReady = false
+				status.LastNacosError = ""
+				if status.Status == "" || status.Status == "ready" || status.Status == "no-endpoints" {
+					status.Status = "offline"
+				}
+				m.services[key] = status
+				continue
+			}
+			if !hasEnv {
+				status.NacosRegistered = false
+				status.NacosReady = false
+				status.LastNacosError = "nacos env is not configured"
+			} else if syncErr != nil {
+				status.NacosRegistered = false
+				status.NacosReady = false
+				status.LastNacosError = strings.TrimSpace(syncErr.Error())
+			} else {
+				status.NacosRegistered = true
+				status.NacosReady = true
+				status.LastNacosHeartbeatAt = now
+				status.LastNacosError = ""
+			}
+			if status.Status == "" {
+				if status.EndpointCount == 0 {
+					status.Status = "no-endpoints"
+				} else {
+					status.Status = "ready"
+				}
+			}
+			m.services[key] = status
+		}
+	}
 }
 
 func endpointKey(instanceID, service string) string {
@@ -789,11 +1144,33 @@ func (m *Manager) discoverEndpoints(ctx context.Context, spec RuntimeSpec, servi
 	return endpoints, nil
 }
 
-func (m *Manager) selectEndpoint(r *http.Request, instanceID, service string, endpoints []endpoint) endpoint {
-	if key := affinityKeyForRequest(service, r); key != "" {
-		return endpoints[int(stableHash(key)%uint64(len(endpoints)))]
+func (m *Manager) selectEndpoint(r *http.Request, instanceID, service, policy string, endpoints []endpoint) endpoint {
+	if affinityPolicyUsesStableKey(service, policy) {
+		if key := affinityKeyForRequest(r); key != "" {
+			return endpoints[int(stableHash(key)%uint64(len(endpoints)))]
+		}
+	}
+	if strings.EqualFold(strings.TrimSpace(policy), "random") {
+		return endpoints[int(stableHash(strconv.FormatInt(time.Now().UnixNano(), 10))%uint64(len(endpoints)))]
 	}
 	return m.pickEndpoint(instanceID, service, endpoints)
+}
+
+func affinityPolicyForService(spec RuntimeSpec, service string) string {
+	if serviceSpec, ok := serviceByName(spec, service); ok {
+		return strings.TrimSpace(serviceSpec.AffinityPolicy)
+	}
+	return ""
+}
+
+func affinityPolicyUsesStableKey(service, policy string) bool {
+	switch strings.ToLower(strings.TrimSpace(policy)) {
+	case "stable", "consistent-hash", "consistenthash", "hash", "ip-hash", "iphash", "sticky":
+		return true
+	case "round-robin", "roundrobin", "none", "off":
+		return false
+	}
+	return serviceNeedsAffinity(service)
 }
 
 func (m *Manager) pickEndpoint(instanceID, service string, endpoints []endpoint) endpoint {
@@ -805,8 +1182,8 @@ func (m *Manager) pickEndpoint(instanceID, service string, endpoints []endpoint)
 	return endpoints[int(index%uint64(len(endpoints)))]
 }
 
-func affinityKeyForRequest(service string, r *http.Request) string {
-	if !serviceNeedsAffinity(service) || r == nil {
+func affinityKeyForRequest(r *http.Request) string {
+	if r == nil {
 		return ""
 	}
 	for _, header := range []string{

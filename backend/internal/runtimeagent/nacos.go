@@ -25,12 +25,13 @@ const (
 )
 
 type NacosProxySyncOptions struct {
-	StateDir string
-	Specs    []RuntimeSpec
-	Action   NacosProxyAction
-	AgentIP  string
-	Client   *http.Client
-	Log      io.Writer
+	StateDir          string
+	Specs             []RuntimeSpec
+	Action            NacosProxyAction
+	AgentIP           string
+	Client            *http.Client
+	Log               io.Writer
+	RequireConfigured bool
 }
 
 type nacosRuntimeEnv struct {
@@ -64,6 +65,9 @@ func SyncNacosProxyRegistrations(ctx context.Context, options NacosProxySyncOpti
 		spec := NormalizeSpec(raw)
 		env, ok := nacosEnvForSpec(spec)
 		if !ok {
+			if options.RequireConfigured && specHasNacosProxyServices(spec) {
+				errs = append(errs, fmt.Sprintf("%s: nacos env is not configured", spec.InstanceID))
+			}
 			continue
 		}
 		agentIP := strings.TrimSpace(options.AgentIP)
@@ -104,6 +108,15 @@ func SyncNacosProxyRegistrations(ctx context.Context, options NacosProxySyncOpti
 		return fmt.Errorf("sync AIFAR Nacos proxies: %s", strings.Join(errs, "; "))
 	}
 	return nil
+}
+
+func specHasNacosProxyServices(spec RuntimeSpec) bool {
+	for _, service := range spec.Services {
+		if serviceRegistersInNacos(spec, service) {
+			return true
+		}
+	}
+	return false
 }
 
 func StartNacosProxyHeartbeat(ctx context.Context, options NacosProxySyncOptions) {

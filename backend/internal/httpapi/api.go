@@ -206,7 +206,8 @@ type containerBatchActionRequest struct {
 }
 
 type containerImageRemoveRequest struct {
-	ID string `json:"id"`
+	ID  string   `json:"id"`
+	IDs []string `json:"ids"`
 }
 
 type credentialSaveRequest struct {

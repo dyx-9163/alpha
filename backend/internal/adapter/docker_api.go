@@ -122,11 +122,15 @@ func dockerAPISummary(ctx context.Context, host string) (DockerSummary, error) {
 	if err := dockerAPIJSON(ctx, http.MethodGet, host, "/info", nil, &info); err != nil {
 		return DockerSummary{}, err
 	}
+	imageCount := info.Images
+	if images, err := dockerAPIImages(ctx, host); err == nil {
+		imageCount = len(images)
+	}
 	networks, _ := dockerAPINetworks(ctx, host)
 	volumes, _ := dockerAPIVolumes(ctx, host)
 	return DockerSummary{
 		Containers: info.Containers,
-		Images:     info.Images,
+		Images:     imageCount,
 		Running:    info.ContainersRunning,
 		Networks:   len(networks),
 		Volumes:    len(volumes),

@@ -279,16 +279,19 @@ func (s Service) ScaleOut(ctx context.Context, req ScaleOutRequest, log Logger, 
 	if replicaID < 2 {
 		replicaID = currentReplicas + 1
 	}
+	desiredBeforeScale := desiredReplicasFromMetadata(metadata)
+	desiredBeforeScale[service] = replicaID
 	containerName := podContainerName(service, releaseID, replicaID)
 	workDir := installerkit.WorkDir(req.Server.DeployDir, AppName+"-agent", "runtime-v2", time.Now().UTC())
 	script, err := renderAutoscaleOutScript(autoscaleOutScriptData{
-		InstallRoot:    installRoot,
-		ServiceName:    service,
-		ReleaseID:      releaseID,
-		ReplicaID:      replicaID,
-		ContainerName:  containerName,
-		IngressNetwork: stringFromMetadata(metadata, "ingressNetwork", stringFromMetadata(metadata, "networkName", defaultNetworkName)),
-		MaxReplicas:    policy.MaxReplicas,
+		InstallRoot:     installRoot,
+		ServiceName:     service,
+		ReleaseID:       releaseID,
+		ReplicaID:       replicaID,
+		ContainerName:   containerName,
+		IngressNetwork:  stringFromMetadata(metadata, "ingressNetwork", stringFromMetadata(metadata, "networkName", defaultNetworkName)),
+		MaxReplicas:     policy.MaxReplicas,
+		DesiredReplicas: replicaAssignments(desiredBeforeScale),
 	})
 	if err != nil {
 		finishTarget(recorder, target, "failed", err.Error())
@@ -312,8 +315,16 @@ func (s Service) ScaleOut(ctx context.Context, req ScaleOutRequest, log Logger, 
 	desired := desiredReplicasFromMetadata(nextMetadata)
 	activeEndpoints := activeEndpointsFromMetrics(status.Endpoints)
 	for svc, endpoints := range activeEndpoints {
+		if svc != service && desired[svc] == 0 {
+			continue
+		}
 		if count := endpointCount(endpoints); count > 0 {
 			desired[svc] = count
+		}
+	}
+	for svc, replicas := range desired {
+		if svc != service && replicas == 0 {
+			delete(activeEndpoints, svc)
 		}
 	}
 	now := time.Now().UTC()

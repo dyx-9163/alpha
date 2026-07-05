@@ -7,6 +7,12 @@ const (
 	DefaultNetwork      = "aifar-network"
 	DefaultStateDir     = "/var/lib/aifar-agent/instances"
 	DefaultIngressMode  = "web-nginx"
+
+	DefaultDeploymentStrategyType    = "RollingUpdate"
+	DefaultDeploymentMaxSurge        = 1
+	DefaultDeploymentMaxUnavailable  = 0
+	DefaultProgressDeadlineSeconds   = 300
+	DefaultDeploymentRollbackOnError = true
 )
 
 type RuntimeSpec struct {
@@ -38,20 +44,29 @@ type ServiceSpec struct {
 }
 
 type DeploymentSpec struct {
-	ServiceName    string            `json:"serviceName"`
-	DeploymentName string            `json:"deploymentName,omitempty"`
-	Image          string            `json:"image,omitempty"`
-	PodRevision    string            `json:"podRevision,omitempty"`
-	Replicas       int               `json:"replicas,omitempty"`
-	Ports          []ContainerPort   `json:"ports,omitempty"`
-	EnvFiles       []string          `json:"envFiles,omitempty"`
-	Volumes        []VolumeMount     `json:"volumes,omitempty"`
-	Resources      ResourceSpec      `json:"resources,omitempty"`
-	HealthCheck    HealthCheckSpec   `json:"healthCheck,omitempty"`
-	Entrypoint     []string          `json:"entrypoint,omitempty"`
-	Command        []string          `json:"command,omitempty"`
-	Environment    map[string]string `json:"environment,omitempty"`
-	Labels         map[string]string `json:"labels,omitempty"`
+	ServiceName    string                 `json:"serviceName"`
+	DeploymentName string                 `json:"deploymentName,omitempty"`
+	Image          string                 `json:"image,omitempty"`
+	PodRevision    string                 `json:"podRevision,omitempty"`
+	Replicas       int                    `json:"replicas,omitempty"`
+	Strategy       DeploymentStrategySpec `json:"strategy,omitempty"`
+	Ports          []ContainerPort        `json:"ports,omitempty"`
+	EnvFiles       []string               `json:"envFiles,omitempty"`
+	Volumes        []VolumeMount          `json:"volumes,omitempty"`
+	Resources      ResourceSpec           `json:"resources,omitempty"`
+	HealthCheck    HealthCheckSpec        `json:"healthCheck,omitempty"`
+	Entrypoint     []string               `json:"entrypoint,omitempty"`
+	Command        []string               `json:"command,omitempty"`
+	Environment    map[string]string      `json:"environment,omitempty"`
+	Labels         map[string]string      `json:"labels,omitempty"`
+}
+
+type DeploymentStrategySpec struct {
+	Type                    string `json:"type,omitempty"`
+	MaxSurge                int    `json:"maxSurge,omitempty"`
+	MaxUnavailable          int    `json:"maxUnavailable,omitempty"`
+	ProgressDeadlineSeconds int    `json:"progressDeadlineSeconds,omitempty"`
+	RollbackOnFailure       *bool  `json:"rollbackOnFailure,omitempty"`
 }
 
 type ContainerPort struct {
@@ -167,6 +182,7 @@ func NormalizeSpec(spec RuntimeSpec) RuntimeSpec {
 		if deployment.Replicas < 0 {
 			deployment.Replicas = 0
 		}
+		deployment.Strategy = NormalizeDeploymentStrategy(deployment.Strategy)
 		if len(deployment.Ports) == 0 {
 			if service, ok := serviceByName(spec, deployment.ServiceName); ok {
 				deployment.Ports = []ContainerPort{{Name: "http", ContainerPort: service.TargetPort}}
@@ -177,4 +193,27 @@ func NormalizeSpec(spec RuntimeSpec) RuntimeSpec {
 	}
 	spec.Deployments = deployments
 	return spec
+}
+
+func NormalizeDeploymentStrategy(strategy DeploymentStrategySpec) DeploymentStrategySpec {
+	if strategy.Type == "" {
+		strategy.Type = DefaultDeploymentStrategyType
+	}
+	if strategy.MaxSurge < 0 {
+		strategy.MaxSurge = 0
+	}
+	if strategy.MaxSurge == 0 && strategy.MaxUnavailable == 0 {
+		strategy.MaxSurge = DefaultDeploymentMaxSurge
+	}
+	if strategy.MaxUnavailable < 0 {
+		strategy.MaxUnavailable = DefaultDeploymentMaxUnavailable
+	}
+	if strategy.ProgressDeadlineSeconds <= 0 {
+		strategy.ProgressDeadlineSeconds = DefaultProgressDeadlineSeconds
+	}
+	if strategy.RollbackOnFailure == nil {
+		value := DefaultDeploymentRollbackOnError
+		strategy.RollbackOnFailure = &value
+	}
+	return strategy
 }

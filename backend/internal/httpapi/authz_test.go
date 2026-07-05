@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -91,6 +92,61 @@ func TestContainerImageRemoveStartsTask(t *testing.T) {
 		t.Fatalf("path = %s, want escaped image path", gotPath)
 	}
 	assertAuditExists(t, db, "containers.image.remove", "running", "owner", "repo/app:1.0")
+}
+
+func TestContainerImageBatchRemoveStartsSingleTask(t *testing.T) {
+	api, db, secret := newAuthzTestAPI(t)
+	var mu sync.Mutex
+	var gotMethods []string
+	var gotPaths []string
+	dockerAPI := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		gotMethods = append(gotMethods, r.Method)
+		gotPaths = append(gotPaths, r.URL.EscapedPath())
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer dockerAPI.Close()
+	server, err := db.SaveServer(store.Server{Name: "docker-1", Host: "10.0.0.10", Username: "root", DockerHost: dockerAPI.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := issueTestToken(t, db, secret, "owner", "owner")
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v2/containers/images/remove?serverId="+server.ID, strings.NewReader(`{"ids":["repo/app:1.0","repo/worker:2.0"]}`))
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	api.Router().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	taskID, _ := body["taskId"].(string)
+	if taskID == "" {
+		t.Fatalf("expected taskId in response: %+v", body)
+	}
+	waitForTaskStatus(t, db, taskID, "success")
+	mu.Lock()
+	defer mu.Unlock()
+	if len(gotMethods) != 2 || gotMethods[0] != http.MethodDelete || gotMethods[1] != http.MethodDelete {
+		t.Fatalf("methods = %+v, want two DELETE calls", gotMethods)
+	}
+	wantPaths := []string{"/images/repo%2Fapp:1.0", "/images/repo%2Fworker:2.0"}
+	if len(gotPaths) != len(wantPaths) {
+		t.Fatalf("paths = %+v, want %+v", gotPaths, wantPaths)
+	}
+	for i := range wantPaths {
+		if gotPaths[i] != wantPaths[i] {
+			t.Fatalf("path[%d] = %s, want %s", i, gotPaths[i], wantPaths[i])
+		}
+	}
+	assertAuditExists(t, db, "containers.image.batch.remove", "running", "owner", "repo/app:1.0,repo/worker:2.0")
 }
 
 func TestTokenIsRejectedAfterPasswordReset(t *testing.T) {

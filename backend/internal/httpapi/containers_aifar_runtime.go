@@ -31,12 +31,54 @@ type aifarRuntimeResponse struct {
 	Warnings      []string                 `json:"warnings,omitempty"`
 }
 
+type aifarRuntimeBuildOptions struct {
+	IncludePods  bool
+	IncludeStats bool
+}
+
 type aifarRuntimeAgent struct {
-	Status   string   `json:"status"`
-	Version  string   `json:"version,omitempty"`
-	Mode     string   `json:"mode,omitempty"`
-	Error    string   `json:"error,omitempty"`
-	Features []string `json:"features,omitempty"`
+	Status    string                     `json:"status"`
+	Version   string                     `json:"version,omitempty"`
+	Mode      string                     `json:"mode,omitempty"`
+	Error     string                     `json:"error,omitempty"`
+	Features  []string                   `json:"features,omitempty"`
+	Instances []aifarAgentInstanceStatus `json:"instances,omitempty"`
+}
+
+type aifarAgentInstanceStatus struct {
+	InstanceID       string                       `json:"instanceId"`
+	DeploymentStatus []aifarAgentDeploymentStatus `json:"deploymentStatus"`
+	ServiceStatus    []aifarAgentServiceStatus    `json:"serviceStatus"`
+}
+
+type aifarAgentDeploymentStatus struct {
+	InstanceID        string `json:"instanceId"`
+	ServiceName       string `json:"serviceName"`
+	DeploymentName    string `json:"deploymentName,omitempty"`
+	PodRevision       string `json:"podRevision,omitempty"`
+	Image             string `json:"image,omitempty"`
+	DesiredReplicas   int    `json:"desiredReplicas"`
+	CurrentReplicas   int    `json:"currentReplicas"`
+	ReadyReplicas     int    `json:"readyReplicas"`
+	UpdatedReplicas   int    `json:"updatedReplicas"`
+	AvailableReplicas int    `json:"availableReplicas"`
+	Status            string `json:"status"`
+	LastReconcileAt   string `json:"lastReconcileAt,omitempty"`
+	LastError         string `json:"lastError,omitempty"`
+}
+
+type aifarAgentServiceStatus struct {
+	InstanceID            string `json:"instanceId"`
+	ServiceName           string `json:"serviceName"`
+	AppName               string `json:"appName,omitempty"`
+	EndpointCount         int    `json:"endpointCount"`
+	ReadyEndpointCount    int    `json:"readyEndpointCount"`
+	NacosRegistered       bool   `json:"nacosRegistered,omitempty"`
+	NacosReady            bool   `json:"nacosReady,omitempty"`
+	LastNacosHeartbeatAt  string `json:"lastNacosHeartbeatAt,omitempty"`
+	LastNacosError        string `json:"lastNacosError,omitempty"`
+	Status                string `json:"status"`
+	LastEndpointRefreshAt string `json:"lastEndpointRefreshAt,omitempty"`
 }
 
 type aifarRuntimeInstance struct {
@@ -57,7 +99,10 @@ type aifarRuntimeDeployment struct {
 	ServiceName         string `json:"serviceName"`
 	AppName             string `json:"appName"`
 	DesiredReplicas     int    `json:"desiredReplicas"`
+	CurrentReplicas     int    `json:"currentReplicas,omitempty"`
 	ReadyReplicas       int    `json:"readyReplicas"`
+	UpdatedReplicas     int    `json:"updatedReplicas,omitempty"`
+	AvailableReplicas   int    `json:"availableReplicas,omitempty"`
 	PodRevision         string `json:"podRevision,omitempty"`
 	UpdatingPodRevision string `json:"updatingPodRevision,omitempty"`
 	Image               string `json:"image,omitempty"`
@@ -84,18 +129,25 @@ type aifarRuntimePod struct {
 }
 
 type aifarRuntimeService struct {
-	InstanceID      string  `json:"instanceId"`
-	ServiceName     string  `json:"serviceName"`
-	AppName         string  `json:"appName"`
-	ProxyName       string  `json:"proxyName,omitempty"`
-	DesiredReplicas int     `json:"desiredReplicas"`
-	ReadyReplicas   int     `json:"readyReplicas"`
-	ActiveEndpoints int     `json:"activeEndpoints"`
-	Image           string  `json:"image,omitempty"`
-	Status          string  `json:"status"`
-	CPUPercent      float64 `json:"cpuPercent,omitempty"`
-	MemoryPercent   float64 `json:"memoryPercent,omitempty"`
-	FailureReason   string  `json:"failureReason,omitempty"`
+	InstanceID         string  `json:"instanceId"`
+	ServiceName        string  `json:"serviceName"`
+	AppName            string  `json:"appName"`
+	ProxyName          string  `json:"proxyName,omitempty"`
+	DesiredReplicas    int     `json:"desiredReplicas"`
+	ReadyReplicas      int     `json:"readyReplicas"`
+	ActiveEndpoints    int     `json:"activeEndpoints"`
+	EndpointCount      int     `json:"endpointCount,omitempty"`
+	ReadyEndpointCount int     `json:"readyEndpointCount,omitempty"`
+	Image              string  `json:"image,omitempty"`
+	Status             string  `json:"status"`
+	RolloutStatus      string  `json:"rolloutStatus,omitempty"`
+	NacosRegistered    bool    `json:"nacosRegistered,omitempty"`
+	NacosReady         bool    `json:"nacosReady,omitempty"`
+	LastNacosError     string  `json:"lastNacosError,omitempty"`
+	LastError          string  `json:"lastError,omitempty"`
+	CPUPercent         float64 `json:"cpuPercent,omitempty"`
+	MemoryPercent      float64 `json:"memoryPercent,omitempty"`
+	FailureReason      string  `json:"failureReason,omitempty"`
 }
 
 type aifarRuntimeIngress struct {
@@ -139,7 +191,10 @@ func (a *API) aifarRuntime(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "DOCKER_TARGET_REQUIRED", i18n.Text(lang, "api.dockerTargetRequired"), nil)
 		return
 	}
-	response, err := a.buildAIFARRuntime(r.Context(), server)
+	response, err := a.buildAIFARRuntime(r.Context(), server, aifarRuntimeBuildOptions{
+		IncludePods:  queryBool(r, "includePods", true),
+		IncludeStats: queryBool(r, "includeStats", true),
+	})
 	respond(w, response, err)
 }
 
@@ -605,7 +660,7 @@ func (a *API) findAIFARInstanceForRuntimeAction(serverID, requestedID string) (s
 	return store.AppInstance{}, fmt.Errorf("multiple agent-runtime-v2 AIFAR instances were found; instanceId is required")
 }
 
-func (a *API) buildAIFARRuntime(ctx context.Context, server store.Server) (aifarRuntimeResponse, error) {
+func (a *API) buildAIFARRuntime(ctx context.Context, server store.Server, options aifarRuntimeBuildOptions) (aifarRuntimeResponse, error) {
 	response := aifarRuntimeResponse{
 		ServerID:      server.ID,
 		RuntimeStatus: "ready",
@@ -619,25 +674,32 @@ func (a *API) buildAIFARRuntime(ctx context.Context, server store.Server) (aifar
 	if err != nil {
 		return response, err
 	}
-	containers, err := adapter.DockerContainersForServer(ctx, server)
-	if err != nil {
-		response.RuntimeStatus = "degraded"
-		response.Warnings = append(response.Warnings, "failed to read Docker containers: "+err.Error())
+	containers := []adapter.DockerContainer{}
+	if options.IncludePods || options.IncludeStats {
+		var err error
+		containers, err = adapter.DockerContainersForServer(ctx, server)
+		if err != nil {
+			response.RuntimeStatus = "degraded"
+			response.Warnings = append(response.Warnings, "failed to read Docker containers: "+err.Error())
+		}
 	}
 	containersByName := mapContainersByName(containers)
 	statsByName := map[string]adapter.DockerContainerStat{}
-	if names := aifarPodContainerNames(containers); len(names) > 0 {
-		if stats, err := adapter.DockerContainerStatsForServer(ctx, server, names); err == nil {
-			statsByName = mapStatsByName(stats)
-		} else {
-			response.Warnings = append(response.Warnings, "failed to read Docker stats: "+err.Error())
+	if options.IncludeStats {
+		names := aifarPodContainerNames(containers)
+		if len(names) > 0 {
+			if stats, err := adapter.DockerContainerStatsForServer(ctx, server, names); err == nil {
+				statsByName = mapStatsByName(stats)
+			} else {
+				response.Warnings = append(response.Warnings, "failed to read Docker stats: "+err.Error())
+			}
 		}
 	}
 	for _, instance := range instances {
 		if instance.App != "aifar" || instance.ServerID != server.ID {
 			continue
 		}
-		a.appendAIFARInstanceRuntime(&response, instance, containersByName, statsByName)
+		a.appendAIFARInstanceRuntime(&response, instance, containersByName, statsByName, options)
 	}
 	if len(response.Instances) == 0 {
 		response.RuntimeStatus = degradedIfReady(response.RuntimeStatus)
@@ -647,7 +709,7 @@ func (a *API) buildAIFARRuntime(ctx context.Context, server store.Server) (aifar
 	return response, nil
 }
 
-func (a *API) appendAIFARInstanceRuntime(response *aifarRuntimeResponse, instance store.AppInstance, containersByName map[string]adapter.DockerContainer, statsByName map[string]adapter.DockerContainerStat) {
+func (a *API) appendAIFARInstanceRuntime(response *aifarRuntimeResponse, instance store.AppInstance, containersByName map[string]adapter.DockerContainer, statsByName map[string]adapter.DockerContainerStat, options aifarRuntimeBuildOptions) {
 	metadata := runtimeMetadata(instance.Metadata)
 	installRoot := normalizeRuntimeInstallRoot(runtimeString(metadata, "installRoot", ""))
 	model := strings.TrimSpace(runtimeString(metadata, "orchestrationModel", ""))
@@ -674,37 +736,41 @@ func (a *API) appendAIFARInstanceRuntime(response *aifarRuntimeResponse, instanc
 	endpoints, _ := a.store.ListAIFARServiceEndpoints(instance.ID)
 	replicaImage := latestReplicaImages(replicasets)
 	endpointReadyByService := readyEndpointCounts(endpoints)
+	agentDeployments := response.Agent.deploymentStatusByService(instance.ID)
+	agentServices := response.Agent.serviceStatusByService(instance.ID)
 	readyByService := map[string]int{}
 	podsByService := map[string][]aifarRuntimePod{}
-	for _, pod := range pods {
-		row, ok := containersByName[pod.ContainerName]
-		stat := statsByName[pod.ContainerName]
-		status, ready := runtimePodStatus(pod, row, ok)
-		revision := cleanRuntimeText(pod.Revision)
-		image := cleanRuntimeText(row.Image)
-		if image == "" {
-			image = replicaImage[pod.ServiceName]
-		}
-		item := aifarRuntimePod{
-			InstanceID:    instance.ID,
-			ServiceName:   pod.ServiceName,
-			PodID:         pod.PodID,
-			ContainerName: pod.ContainerName,
-			Revision:      revision,
-			Image:         image,
-			Port:          pod.Port,
-			Status:        status,
-			Ready:         ready,
-			CPUPercent:    stat.CPUPerc,
-			MemoryPercent: stat.MemPerc,
-			MemoryUsage:   stat.MemUsage,
-			CreatedAt:     pod.CreatedAt.Format("2006-01-02T15:04:05Z07:00"),
-			UpdatedAt:     pod.UpdatedAt.Format("2006-01-02T15:04:05Z07:00"),
-		}
-		response.Pods = append(response.Pods, item)
-		podsByService[pod.ServiceName] = append(podsByService[pod.ServiceName], item)
-		if ready {
-			readyByService[pod.ServiceName]++
+	if options.IncludePods {
+		for _, pod := range pods {
+			row, ok := containersByName[pod.ContainerName]
+			stat := statsByName[pod.ContainerName]
+			status, ready := runtimePodStatus(pod, row, ok)
+			revision := cleanRuntimeText(pod.Revision)
+			image := cleanRuntimeText(row.Image)
+			if image == "" {
+				image = replicaImage[pod.ServiceName]
+			}
+			item := aifarRuntimePod{
+				InstanceID:    instance.ID,
+				ServiceName:   pod.ServiceName,
+				PodID:         pod.PodID,
+				ContainerName: pod.ContainerName,
+				Revision:      revision,
+				Image:         image,
+				Port:          pod.Port,
+				Status:        status,
+				Ready:         ready,
+				CPUPercent:    stat.CPUPerc,
+				MemoryPercent: stat.MemPerc,
+				MemoryUsage:   stat.MemUsage,
+				CreatedAt:     pod.CreatedAt.Format("2006-01-02T15:04:05Z07:00"),
+				UpdatedAt:     pod.UpdatedAt.Format("2006-01-02T15:04:05Z07:00"),
+			}
+			response.Pods = append(response.Pods, item)
+			podsByService[pod.ServiceName] = append(podsByService[pod.ServiceName], item)
+			if ready {
+				readyByService[pod.ServiceName]++
+			}
 		}
 	}
 	seenServices := map[string]bool{}
@@ -716,28 +782,51 @@ func (a *API) appendAIFARInstanceRuntime(response *aifarRuntimeResponse, instanc
 		}
 		image := replicaImage[deployment.ServiceName]
 		status := runtimeServiceStatus(deployment, ready)
+		agentDeployment, hasAgentDeployment := agentDeployments[deployment.ServiceName]
+		if hasAgentDeployment {
+			if agentDeployment.ReadyReplicas > 0 || agentDeployment.DesiredReplicas > 0 {
+				ready = agentDeployment.ReadyReplicas
+			}
+			if cleanRuntimeText(agentDeployment.Image) != "" {
+				image = cleanRuntimeText(agentDeployment.Image)
+			}
+			if cleanRuntimeText(agentDeployment.Status) != "" {
+				status = cleanRuntimeText(agentDeployment.Status)
+			}
+		}
 		appName := aifarRuntimeAppName(deployment.ServiceName)
+		failureReason := runtimeString(runtimeMetadata(deployment.MetadataJSON), "failureReason", "")
+		if hasAgentDeployment && cleanRuntimeText(agentDeployment.LastError) != "" {
+			failureReason = cleanRuntimeText(agentDeployment.LastError)
+		}
 		response.Deployments = append(response.Deployments, aifarRuntimeDeployment{
 			InstanceID:          instance.ID,
 			DeploymentName:      appName,
 			ServiceName:         deployment.ServiceName,
 			AppName:             appName,
 			DesiredReplicas:     deployment.DesiredReplicas,
+			CurrentReplicas:     agentDeployment.CurrentReplicas,
 			ReadyReplicas:       ready,
+			UpdatedReplicas:     agentDeployment.UpdatedReplicas,
+			AvailableReplicas:   agentDeployment.AvailableReplicas,
 			PodRevision:         effectiveServiceRevision(deployment.CurrentRevision, podsByService[deployment.ServiceName]),
 			UpdatingPodRevision: cleanRuntimeText(deployment.UpdatingRevision),
 			Image:               image,
 			Status:              status,
 			UpdatedAt:           deployment.UpdatedAt.Format("2006-01-02T15:04:05Z07:00"),
-			FailureReason:       runtimeString(runtimeMetadata(deployment.MetadataJSON), "failureReason", ""),
+			FailureReason:       failureReason,
 		})
-		response.Services = append(response.Services, runtimeServiceFromDeployment(instance.ID, deployment, podsByService[deployment.ServiceName], ready, image, status))
+		serviceRow := runtimeServiceFromDeployment(instance.ID, deployment, podsByService[deployment.ServiceName], ready, image, status)
+		applyAgentStatusToRuntimeService(&serviceRow, agentServices[deployment.ServiceName], agentDeployment)
+		response.Services = append(response.Services, serviceRow)
 	}
 	for service, servicePods := range podsByService {
 		if seenServices[service] {
 			continue
 		}
-		response.Services = append(response.Services, runtimeServiceFromPods(instance.ID, service, servicePods, readyByService[service], replicaImage[service]))
+		serviceRow := runtimeServiceFromPods(instance.ID, service, servicePods, readyByService[service], replicaImage[service])
+		applyAgentStatusToRuntimeService(&serviceRow, agentServices[service], agentDeployments[service])
+		response.Services = append(response.Services, serviceRow)
 	}
 	response.Ingress = append(response.Ingress, runtimeIngressFromMetadata(instance.ID, metadata, containersByName))
 }
@@ -752,9 +841,10 @@ func (a *API) collectAIFARAgentStatus(ctx context.Context, server store.Server) 
 		return aifarRuntimeAgent{Status: "missing", Error: strings.TrimSpace(result.Stderr)}
 	}
 	var parsed struct {
-		Status   string   `json:"status"`
-		Version  string   `json:"version"`
-		Features []string `json:"features"`
+		Status    string                     `json:"status"`
+		Version   string                     `json:"version"`
+		Features  []string                   `json:"features"`
+		Instances []aifarAgentInstanceStatus `json:"instances"`
 	}
 	if err := json.Unmarshal([]byte(result.Stdout), &parsed); err != nil {
 		return aifarRuntimeAgent{Status: "degraded", Error: err.Error()}
@@ -766,7 +856,37 @@ func (a *API) collectAIFARAgentStatus(ctx context.Context, server store.Server) 
 	if status == "" {
 		status = "running"
 	}
-	return aifarRuntimeAgent{Status: status, Version: parsed.Version, Mode: "systemd", Features: parsed.Features}
+	return aifarRuntimeAgent{Status: status, Version: parsed.Version, Mode: "systemd", Features: parsed.Features, Instances: parsed.Instances}
+}
+
+func (agent aifarRuntimeAgent) deploymentStatusByService(instanceID string) map[string]aifarAgentDeploymentStatus {
+	out := map[string]aifarAgentDeploymentStatus{}
+	for _, instance := range agent.Instances {
+		if instance.InstanceID != instanceID {
+			continue
+		}
+		for _, status := range instance.DeploymentStatus {
+			if service := cleanRuntimeText(status.ServiceName); service != "" {
+				out[service] = status
+			}
+		}
+	}
+	return out
+}
+
+func (agent aifarRuntimeAgent) serviceStatusByService(instanceID string) map[string]aifarAgentServiceStatus {
+	out := map[string]aifarAgentServiceStatus{}
+	for _, instance := range agent.Instances {
+		if instance.InstanceID != instanceID {
+			continue
+		}
+		for _, status := range instance.ServiceStatus {
+			if service := cleanRuntimeText(status.ServiceName); service != "" {
+				out[service] = status
+			}
+		}
+	}
+	return out
 }
 
 func runtimeServiceFromDeployment(instanceID string, deployment store.AIFARDeployment, pods []aifarRuntimePod, ready int, image, status string) aifarRuntimeService {
@@ -775,18 +895,20 @@ func runtimeServiceFromDeployment(instanceID string, deployment store.AIFARDeplo
 		image = firstRuntimePodImage(pods)
 	}
 	return aifarRuntimeService{
-		InstanceID:      instanceID,
-		ServiceName:     deployment.ServiceName,
-		AppName:         aifarRuntimeAppName(deployment.ServiceName),
-		ProxyName:       "aifar-agent:" + deployment.ServiceName,
-		DesiredReplicas: deployment.DesiredReplicas,
-		ReadyReplicas:   ready,
-		ActiveEndpoints: ready,
-		Image:           image,
-		Status:          status,
-		CPUPercent:      cpu,
-		MemoryPercent:   mem,
-		FailureReason:   runtimeString(runtimeMetadata(deployment.MetadataJSON), "failureReason", ""),
+		InstanceID:         instanceID,
+		ServiceName:        deployment.ServiceName,
+		AppName:            aifarRuntimeAppName(deployment.ServiceName),
+		ProxyName:          "aifar-agent:" + deployment.ServiceName,
+		DesiredReplicas:    deployment.DesiredReplicas,
+		ReadyReplicas:      ready,
+		ActiveEndpoints:    ready,
+		EndpointCount:      ready,
+		ReadyEndpointCount: ready,
+		Image:              image,
+		Status:             status,
+		CPUPercent:         cpu,
+		MemoryPercent:      mem,
+		FailureReason:      runtimeString(runtimeMetadata(deployment.MetadataJSON), "failureReason", ""),
 	}
 }
 
@@ -810,17 +932,55 @@ func runtimeServiceFromPods(instanceID, service string, pods []aifarRuntimePod, 
 		image = firstRuntimePodImage(pods)
 	}
 	return aifarRuntimeService{
-		InstanceID:      instanceID,
-		ServiceName:     service,
-		AppName:         aifarRuntimeAppName(service),
-		ProxyName:       "aifar-agent:" + service,
-		DesiredReplicas: desired,
-		ReadyReplicas:   ready,
-		ActiveEndpoints: ready,
-		Image:           image,
-		Status:          status,
-		CPUPercent:      cpu,
-		MemoryPercent:   mem,
+		InstanceID:         instanceID,
+		ServiceName:        service,
+		AppName:            aifarRuntimeAppName(service),
+		ProxyName:          "aifar-agent:" + service,
+		DesiredReplicas:    desired,
+		ReadyReplicas:      ready,
+		ActiveEndpoints:    ready,
+		EndpointCount:      ready,
+		ReadyEndpointCount: ready,
+		Image:              image,
+		Status:             status,
+		CPUPercent:         cpu,
+		MemoryPercent:      mem,
+	}
+}
+
+func applyAgentStatusToRuntimeService(row *aifarRuntimeService, serviceStatus aifarAgentServiceStatus, deploymentStatus aifarAgentDeploymentStatus) {
+	if row == nil {
+		return
+	}
+	if serviceStatus.ServiceName != "" {
+		row.EndpointCount = serviceStatus.EndpointCount
+		row.ReadyEndpointCount = serviceStatus.ReadyEndpointCount
+		row.ActiveEndpoints = serviceStatus.ReadyEndpointCount
+		row.NacosRegistered = serviceStatus.NacosRegistered
+		row.NacosReady = serviceStatus.NacosReady
+		row.LastNacosError = cleanRuntimeText(serviceStatus.LastNacosError)
+		if cleanRuntimeText(serviceStatus.Status) != "" {
+			row.Status = cleanRuntimeText(serviceStatus.Status)
+		}
+	}
+	if deploymentStatus.ServiceName != "" {
+		row.DesiredReplicas = deploymentStatus.DesiredReplicas
+		row.ReadyReplicas = deploymentStatus.ReadyReplicas
+		row.RolloutStatus = cleanRuntimeText(deploymentStatus.Status)
+		row.LastError = cleanRuntimeText(deploymentStatus.LastError)
+		if cleanRuntimeText(deploymentStatus.Image) != "" {
+			row.Image = cleanRuntimeText(deploymentStatus.Image)
+		}
+		switch row.RolloutStatus {
+		case "failed", "rolling", "degraded", "offline":
+			row.Status = row.RolloutStatus
+		}
+	}
+	if row.LastError == "" && row.LastNacosError != "" {
+		row.LastError = row.LastNacosError
+	}
+	if row.LastNacosError != "" && row.Status == "ready" {
+		row.Status = "degraded"
 	}
 }
 

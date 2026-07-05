@@ -19,13 +19,9 @@
 
     <el-tabs v-model="tab" class="tab-strip">
       <el-tab-pane :label="t('containers.overview')" name="overview" />
-      <el-tab-pane :label="t('containers.title')" name="containers" />
       <el-tab-pane :label="t('containers.aifarRuntime')" name="aifar-runtime" />
+      <el-tab-pane :label="t('containers.title')" name="containers" />
       <el-tab-pane :label="t('containers.images')" name="images" />
-      <el-tab-pane :label="t('containers.network')" name="networks" />
-      <el-tab-pane :label="t('containers.volumes')" name="volumes" />
-      <el-tab-pane :label="t('containers.registry')" name="registry" />
-      <el-tab-pane :label="t('containers.settings')" name="settings" />
     </el-tabs>
 
     <el-alert v-if="error" :title="errorTitle" :description="error" type="warning" :closable="false" show-icon />
@@ -170,113 +166,212 @@
           </div>
           <template v-else>
             <KeyValueGrid :items="runtimeSummaryItems" />
-            <el-table :data="selectedRuntimeServices" height="48%" row-key="serviceName">
-              <el-table-column prop="serviceName" :label="t('containers.service')" min-width="130" show-overflow-tooltip />
-              <el-table-column prop="status" :label="t('common.status')" width="130">
-                <template #default="{ row }">
-                  <StatusTag :status="aifarRuntimeStatusKind(row.status)" :label="aifarRuntimeStatusLabel(row.status)" />
-                </template>
-              </el-table-column>
-              <el-table-column :label="t('containers.replicas')" width="120">
-                <template #default="{ row }">{{ row.readyReplicas }} / {{ row.desiredReplicas }}</template>
-              </el-table-column>
-              <el-table-column prop="appName" :label="t('containers.appName')" min-width="170" show-overflow-tooltip />
-              <el-table-column prop="image" :label="t('containers.image')" min-width="220" show-overflow-tooltip />
-              <el-table-column :label="t('containers.cpu')" width="90">
-                <template #default="{ row }">{{ percentText(row.cpuPercent) }}</template>
-              </el-table-column>
-              <el-table-column :label="t('containers.memory')" width="100">
-                <template #default="{ row }">{{ percentText(row.memoryPercent) }}</template>
-              </el-table-column>
-              <el-table-column :label="t('common.operation')" width="300" fixed="right">
-                <template #default="{ row }">
-                  <div class="row-actions">
-                    <el-tooltip :content="aifarRuntimeActionDisabledReason" :disabled="!aifarRuntimeActionDisabledReason" placement="top">
-                      <span><el-button size="small" type="primary" plain :disabled="Boolean(aifarRuntimeActionDisabledReason)" @click="openAifarRuntimeServiceUpdate(row)">{{ t('containers.updateService') }}</el-button></span>
-                    </el-tooltip>
-                    <el-tooltip :content="aifarRuntimeActionDisabledReason" :disabled="!aifarRuntimeActionDisabledReason" placement="top">
-                      <span><el-button size="small" :disabled="Boolean(aifarRuntimeActionDisabledReason)" @click="scaleOutAifarService(row.serviceName)">{{ t('containers.scaleOut') }}</el-button></span>
-                    </el-tooltip>
-                    <el-tooltip :content="aifarRuntimeOfflineDisabledReason(row)" :disabled="!aifarRuntimeOfflineDisabledReason(row)" placement="top">
-                      <span><el-button size="small" type="danger" plain :disabled="Boolean(aifarRuntimeOfflineDisabledReason(row))" @click="offlineAifarService(row)">{{ t('containers.offlineDeployment') }}</el-button></span>
-                    </el-tooltip>
+            <el-tabs v-model="runtimeResourceTab" class="runtime-resource-tabs">
+              <el-tab-pane :label="t('containers.deployments')" name="deployments">
+                <div class="runtime-resource-panel">
+                  <el-table :data="selectedRuntimeDeployments" height="100%" row-key="serviceName">
+                    <el-table-column prop="deploymentName" :label="t('containers.deployment')" min-width="170" show-overflow-tooltip />
+                    <el-table-column prop="serviceName" :label="t('containers.service')" width="130" show-overflow-tooltip />
+                    <el-table-column prop="status" :label="t('common.status')" width="120">
+                      <template #default="{ row }">
+                        <StatusTag :status="aifarRuntimeStatusKind(row.status)" :label="aifarRuntimeStatusLabel(row.status)" />
+                      </template>
+                    </el-table-column>
+                    <el-table-column :label="t('containers.replicas')" width="130">
+                      <template #default="{ row }">{{ runtimeDeploymentReplicaText(row) }}</template>
+                    </el-table-column>
+                    <el-table-column :label="t('containers.rollout')" width="120">
+                      <template #default="{ row }">
+                        <el-tooltip :content="row.failureReason" :disabled="!row.failureReason" placement="top">
+                          <span><StatusTag :status="aifarRuntimeStatusKind(row.status)" :label="aifarRuntimeStatusLabel(row.status)" /></span>
+                        </el-tooltip>
+                      </template>
+                    </el-table-column>
+                    <el-table-column prop="podRevision" :label="t('containers.revision')" min-width="180" show-overflow-tooltip />
+                    <el-table-column prop="image" :label="t('containers.image')" min-width="240" show-overflow-tooltip />
+                    <el-table-column :label="t('common.operation')" width="300" fixed="right">
+                      <template #default="{ row }">
+                        <div class="row-actions">
+                          <el-tooltip :content="aifarRuntimeActionDisabledReason" :disabled="!aifarRuntimeActionDisabledReason" placement="top">
+                            <span><el-button size="small" type="primary" plain :disabled="Boolean(aifarRuntimeActionDisabledReason)" @click="openAifarRuntimeServiceUpdate(runtimeServiceForDeployment(row))">{{ t('containers.updateService') }}</el-button></span>
+                          </el-tooltip>
+                          <el-tooltip :content="aifarRuntimeActionDisabledReason" :disabled="!aifarRuntimeActionDisabledReason" placement="top">
+                            <span><el-button size="small" :disabled="Boolean(aifarRuntimeActionDisabledReason)" @click="scaleOutAifarService(row.serviceName)">{{ t('containers.scaleOut') }}</el-button></span>
+                          </el-tooltip>
+                          <el-tooltip :content="aifarRuntimeOfflineDisabledReason(runtimeServiceForDeployment(row))" :disabled="!aifarRuntimeOfflineDisabledReason(runtimeServiceForDeployment(row))" placement="top">
+                            <span><el-button size="small" type="danger" plain :disabled="Boolean(aifarRuntimeOfflineDisabledReason(runtimeServiceForDeployment(row)))" @click="offlineAifarService(runtimeServiceForDeployment(row))">{{ t('containers.offlineDeployment') }}</el-button></span>
+                          </el-tooltip>
+                        </div>
+                      </template>
+                    </el-table-column>
+                  </el-table>
+                </div>
+              </el-tab-pane>
+              <el-tab-pane :label="t('containers.services')" name="services">
+                <div class="runtime-resource-panel">
+                  <el-table :data="selectedRuntimeServices" height="100%" row-key="serviceName">
+                    <el-table-column prop="serviceName" :label="t('containers.service')" min-width="130" show-overflow-tooltip />
+                    <el-table-column prop="appName" :label="t('containers.appName')" min-width="170" show-overflow-tooltip />
+                    <el-table-column prop="status" :label="t('common.status')" width="120">
+                      <template #default="{ row }">
+                        <StatusTag :status="aifarRuntimeStatusKind(row.status)" :label="aifarRuntimeStatusLabel(row.status)" />
+                      </template>
+                    </el-table-column>
+                    <el-table-column :label="t('containers.endpoint')" width="110">
+                      <template #default="{ row }">{{ runtimeEndpointText(row) }}</template>
+                    </el-table-column>
+                    <el-table-column label="Nacos" width="120">
+                      <template #default="{ row }">
+                        <el-tooltip :content="row.lastNacosError" :disabled="!row.lastNacosError" placement="top">
+                          <span><StatusTag :status="aifarRuntimeStatusKind(runtimeNacosStatus(row))" :label="aifarRuntimeStatusLabel(runtimeNacosStatus(row))" /></span>
+                        </el-tooltip>
+                      </template>
+                    </el-table-column>
+                    <el-table-column prop="proxyName" :label="t('containers.proxy')" min-width="170" show-overflow-tooltip />
+                    <el-table-column prop="image" :label="t('containers.image')" min-width="240" show-overflow-tooltip />
+                    <el-table-column :label="t('containers.cpu')" width="90">
+                      <template #default="{ row }">{{ percentText(row.cpuPercent) }}</template>
+                    </el-table-column>
+                    <el-table-column :label="t('containers.memory')" width="100">
+                      <template #default="{ row }">{{ percentText(row.memoryPercent) }}</template>
+                    </el-table-column>
+                  </el-table>
+                </div>
+              </el-tab-pane>
+              <el-tab-pane :label="t('containers.pods')" name="pods">
+                <div class="runtime-resource-panel">
+                  <div class="runtime-tab-toolbar">
+                    <el-select v-model="runtimePodServiceFilter" size="small" clearable class="runtime-service-filter" :placeholder="t('containers.service')" @clear="clearRuntimePodServiceFilter">
+                      <el-option v-for="service in installedRuntimeServiceNamesList" :key="service" :label="service" :value="service" />
+                    </el-select>
+                    <div class="runtime-tab-actions">
+                      <el-button size="small" :loading="loading" @click="ensureRuntimePodsLoaded(true)">{{ t('common.refresh') }}</el-button>
+                      <el-button size="small" plain :loading="loading" @click="ensureRuntimePodsLoaded(true, true)">{{ t('containers.refreshPodStats') }}</el-button>
+                    </div>
                   </div>
-                </template>
-              </el-table-column>
-            </el-table>
-            <el-table :data="selectedRuntimePods" height="42%" row-key="containerName">
-              <el-table-column prop="containerName" :label="t('containers.name')" min-width="220" show-overflow-tooltip />
-              <el-table-column prop="serviceName" :label="t('containers.service')" width="120" show-overflow-tooltip />
-              <el-table-column prop="status" :label="t('common.status')" width="120">
-                <template #default="{ row }">
-                  <StatusTag :status="aifarRuntimeStatusKind(row.status)" :label="aifarRuntimeStatusLabel(row.status)" />
-                </template>
-              </el-table-column>
-              <el-table-column prop="revision" :label="t('containers.revision')" min-width="170" show-overflow-tooltip />
-              <el-table-column :label="t('containers.cpu')" width="90">
-                <template #default="{ row }">{{ percentText(row.cpuPercent) }}</template>
-              </el-table-column>
-              <el-table-column :label="t('containers.memory')" width="110">
-                <template #default="{ row }">{{ row.memoryUsage || percentText(row.memoryPercent) }}</template>
-              </el-table-column>
-            </el-table>
+                  <div v-if="!runtimePodsLoadedForCurrentScope" class="runtime-lazy-state">
+                    <el-button size="small" type="primary" plain :loading="loading" @click="ensureRuntimePodsLoaded(true)">{{ t('containers.loadPods') }}</el-button>
+                  </div>
+                  <el-table v-else :data="selectedRuntimePods" height="100%" row-key="containerName">
+                    <el-table-column prop="containerName" :label="t('containers.name')" min-width="260" show-overflow-tooltip />
+                    <el-table-column prop="serviceName" :label="t('containers.service')" width="120" show-overflow-tooltip />
+                    <el-table-column prop="status" :label="t('common.status')" width="120">
+                      <template #default="{ row }">
+                        <StatusTag :status="aifarRuntimeStatusKind(row.status)" :label="aifarRuntimeStatusLabel(row.status)" />
+                      </template>
+                    </el-table-column>
+                    <el-table-column prop="revision" :label="t('containers.revision')" min-width="180" show-overflow-tooltip />
+                    <el-table-column prop="image" :label="t('containers.image')" min-width="220" show-overflow-tooltip />
+                    <el-table-column :label="t('containers.cpu')" width="90">
+                      <template #default="{ row }">{{ percentText(row.cpuPercent) }}</template>
+                    </el-table-column>
+                    <el-table-column :label="t('containers.memory')" width="120">
+                      <template #default="{ row }">{{ row.memoryUsage || percentText(row.memoryPercent) }}</template>
+                    </el-table-column>
+                  </el-table>
+                </div>
+              </el-tab-pane>
+              <el-tab-pane :label="t('containers.ingressAndNacos')" name="ingress">
+                <div class="runtime-resource-panel">
+                  <KeyValueGrid :items="runtimeIngressItems" />
+                  <el-table :data="selectedRuntimeServices" height="calc(100% - 96px)" row-key="serviceName">
+                    <el-table-column prop="serviceName" :label="t('containers.service')" min-width="130" />
+                    <el-table-column prop="appName" :label="t('containers.appName')" min-width="170" show-overflow-tooltip />
+                    <el-table-column :label="t('containers.endpoint')" width="110">
+                      <template #default="{ row }">{{ runtimeEndpointText(row) }}</template>
+                    </el-table-column>
+                    <el-table-column label="Nacos" width="120">
+                      <template #default="{ row }">
+                        <el-tooltip :content="row.lastNacosError" :disabled="!row.lastNacosError" placement="top">
+                          <span><StatusTag :status="aifarRuntimeStatusKind(runtimeNacosStatus(row))" :label="aifarRuntimeStatusLabel(runtimeNacosStatus(row))" /></span>
+                        </el-tooltip>
+                      </template>
+                    </el-table-column>
+                    <el-table-column prop="lastNacosError" :label="t('containers.lastApplyError')" min-width="260" show-overflow-tooltip />
+                  </el-table>
+                </div>
+              </el-tab-pane>
+            </el-tabs>
           </template>
         </div>
       </template>
 
       <template v-else-if="tab === 'images'">
-        <el-table :data="collection" height="100%">
-          <el-table-column prop="repository" :label="t('containers.repository')" min-width="220" show-overflow-tooltip />
-          <el-table-column prop="tag" :label="t('containers.tag')" width="140" show-overflow-tooltip />
-          <el-table-column prop="id" label="ID" min-width="150" show-overflow-tooltip />
-          <el-table-column prop="size" :label="t('containers.size')" width="120" />
-          <el-table-column prop="digest" :label="t('containers.digest')" min-width="220" show-overflow-tooltip />
-          <el-table-column prop="createdAt" :label="t('containers.created')" min-width="170" show-overflow-tooltip />
-          <el-table-column :label="t('common.operation')" width="110" fixed="right">
-            <template #default="{ row }">
-              <el-tooltip :content="deniedText" :disabled="canManageContainers" placement="top">
-                <span>
-                  <el-button size="small" type="danger" plain :disabled="!canManageContainers" @click="deleteImage(row)">{{ t('containers.deleteImage') }}</el-button>
-                </span>
-              </el-tooltip>
-            </template>
-          </el-table-column>
-        </el-table>
-      </template>
-
-      <template v-else-if="tab === 'networks'">
-        <el-table :data="collection" height="100%">
-          <el-table-column prop="name" :label="t('containers.name')" min-width="180" />
-          <el-table-column prop="id" label="ID" min-width="150" show-overflow-tooltip />
-          <el-table-column prop="driver" :label="t('containers.driver')" min-width="150" />
-          <el-table-column prop="scope" :label="t('containers.scope')" min-width="120" />
-        </el-table>
-      </template>
-
-      <template v-else-if="tab === 'volumes'">
-        <el-table :data="collection" height="100%">
-          <el-table-column prop="name" :label="t('containers.name')" min-width="180" show-overflow-tooltip />
-          <el-table-column prop="driver" :label="t('containers.driver')" width="140" />
-          <el-table-column prop="scope" :label="t('containers.scope')" width="120" />
-          <el-table-column prop="mountpoint" :label="t('containers.mountpoint')" min-width="260" show-overflow-tooltip />
-          <el-table-column prop="size" :label="t('containers.size')" width="120" />
-        </el-table>
-      </template>
-
-      <template v-else-if="tab === 'registry'">
-        <div class="empty-state">
-          <div>
-            <strong>{{ t('containers.registry') }}</strong>
-            <span>{{ t('containers.registryHint') }}</span>
-          </div>
-        </div>
-      </template>
-
-      <template v-else>
-        <div class="settings-grid">
-          <KeyValueGrid :items="settingsItems" />
-          <p class="muted-strip">{{ t('containers.settingsHint') }}</p>
-        </div>
+        <el-tabs v-model="resourceTab" class="resource-tabs">
+          <el-tab-pane :label="t('containers.images')" name="images">
+            <div class="resource-panel">
+              <div class="table-toolbar">
+                <span class="selection-summary">{{ t('containers.selectedImageCount', { count: selectedImageRows.length }) }}</span>
+                <div class="toolbar-actions">
+                  <el-tooltip :content="batchImageRemoveDisabledReason" :disabled="!batchImageRemoveDisabledReason" placement="top">
+                    <span>
+                      <el-button size="small" type="danger" plain :disabled="batchImageRemoveDisabled" @click="deleteSelectedImages">{{ t('containers.batchDeleteImages') }}</el-button>
+                    </span>
+                  </el-tooltip>
+                </div>
+              </div>
+              <div class="container-table-body">
+                <el-table :data="collection" height="100%" :row-key="imageRowKey" @selection-change="onImageSelectionChange">
+                  <el-table-column type="selection" width="44" />
+                  <el-table-column prop="repository" :label="t('containers.repository')" min-width="220" show-overflow-tooltip />
+                  <el-table-column prop="tag" :label="t('containers.tag')" width="140" show-overflow-tooltip />
+                  <el-table-column prop="id" label="ID" min-width="150" show-overflow-tooltip />
+                  <el-table-column prop="size" :label="t('containers.size')" width="120" />
+                  <el-table-column prop="digest" :label="t('containers.digest')" min-width="220" show-overflow-tooltip />
+                  <el-table-column prop="createdAt" :label="t('containers.created')" min-width="170" show-overflow-tooltip />
+                  <el-table-column :label="t('common.operation')" width="110" fixed="right">
+                    <template #default="{ row }">
+                      <el-tooltip :content="deniedText" :disabled="canManageContainers" placement="top">
+                        <span>
+                          <el-button size="small" type="danger" plain :disabled="!canManageContainers" @click="deleteImage(row)">{{ t('containers.deleteImage') }}</el-button>
+                        </span>
+                      </el-tooltip>
+                    </template>
+                  </el-table-column>
+                </el-table>
+              </div>
+            </div>
+          </el-tab-pane>
+          <el-tab-pane :label="t('containers.network')" name="networks">
+            <div class="resource-panel">
+              <el-table :data="collection" height="100%">
+                <el-table-column prop="name" :label="t('containers.name')" min-width="180" />
+                <el-table-column prop="id" label="ID" min-width="150" show-overflow-tooltip />
+                <el-table-column prop="driver" :label="t('containers.driver')" min-width="150" />
+                <el-table-column prop="scope" :label="t('containers.scope')" min-width="120" />
+              </el-table>
+            </div>
+          </el-tab-pane>
+          <el-tab-pane :label="t('containers.volumes')" name="volumes">
+            <div class="resource-panel">
+              <el-table :data="collection" height="100%">
+                <el-table-column prop="name" :label="t('containers.name')" min-width="180" show-overflow-tooltip />
+                <el-table-column prop="driver" :label="t('containers.driver')" width="140" />
+                <el-table-column prop="scope" :label="t('containers.scope')" width="120" />
+                <el-table-column prop="mountpoint" :label="t('containers.mountpoint')" min-width="260" show-overflow-tooltip />
+                <el-table-column prop="size" :label="t('containers.size')" width="120" />
+              </el-table>
+            </div>
+          </el-tab-pane>
+          <el-tab-pane :label="t('containers.registry')" name="registry">
+            <div class="resource-panel">
+              <div class="empty-state">
+                <div>
+                  <strong>{{ t('containers.registry') }}</strong>
+                  <span>{{ t('containers.registryHint') }}</span>
+                </div>
+              </div>
+            </div>
+          </el-tab-pane>
+          <el-tab-pane :label="t('containers.hostConfig')" name="settings">
+            <div class="resource-panel">
+              <div class="settings-grid">
+                <KeyValueGrid :items="settingsItems" />
+                <p class="muted-strip">{{ t('containers.settingsHint') }}</p>
+              </div>
+            </div>
+          </el-tab-pane>
+        </el-tabs>
       </template>
     </div>
 
@@ -495,10 +590,35 @@ type AifarRuntimeService = {
   desiredReplicas?: number
   readyReplicas?: number
   activeEndpoints?: number
+  endpointCount?: number
+  readyEndpointCount?: number
   image?: string
   status?: string
+  rolloutStatus?: string
+  nacosRegistered?: boolean
+  nacosReady?: boolean
+  lastNacosError?: string
+  lastError?: string
   cpuPercent?: number
   memoryPercent?: number
+  failureReason?: string
+}
+
+type AifarRuntimeDeployment = {
+  instanceId: string
+  deploymentName?: string
+  serviceName: string
+  appName?: string
+  desiredReplicas?: number
+  currentReplicas?: number
+  readyReplicas?: number
+  updatedReplicas?: number
+  availableReplicas?: number
+  podRevision?: string
+  updatingPodRevision?: string
+  image?: string
+  status?: string
+  updatedAt?: string
   failureReason?: string
 }
 
@@ -533,6 +653,7 @@ type AifarRuntimeResponse = {
   runtimeStatus?: string
   agent?: AifarRuntimeAgent
   instances?: AifarRuntimeInstance[]
+  deployments?: AifarRuntimeDeployment[]
   services?: AifarRuntimeService[]
   pods?: AifarRuntimePod[]
   ingress?: AifarRuntimeIngress[]
@@ -556,8 +677,10 @@ const summaryCache = ref<Record<string, DockerSummaryResponse>>({})
 const collectionCache = ref<Record<string, any[]>>({})
 const runtimeCache = ref<Record<string, AifarRuntimeResponse>>({})
 const selectedContainerRows = ref<any[]>([])
+const selectedImageRows = ref<any[]>([])
 const error = ref('')
-const tab = ref('overview')
+const tab = ref<'overview' | 'aifar-runtime' | 'containers' | 'images'>('overview')
+const resourceTab = ref<'images' | 'networks' | 'volumes' | 'registry' | 'settings'>('images')
 const logsVisible = ref(false)
 const logsText = ref('')
 const aifarUpdateVisible = ref(false)
@@ -571,6 +694,10 @@ const aifarArtifactFile = ref<File | null>(null)
 const showAifarRuntimeInfra = ref(false)
 const aifarRuntime = ref<AifarRuntimeResponse>({ runtimeStatus: 'unknown', agent: { status: 'unknown' }, instances: [], services: [], pods: [], ingress: [], warnings: [] })
 const selectedRuntimeInstanceId = ref('')
+const runtimeResourceTab = ref<'deployments' | 'services' | 'pods' | 'ingress'>('deployments')
+const runtimePodServiceFilter = ref('')
+const runtimePodsLoaded = ref<Record<string, boolean>>({})
+const runtimePodStatsLoaded = ref<Record<string, boolean>>({})
 const runtimeConfigVisible = ref(false)
 const runtimeConfigSubmitting = ref(false)
 const runtimeConfigForm = ref<RuntimeConfigFormValues>({
@@ -600,8 +727,7 @@ const metrics = computed(() => [
   { label: t('containers.title'), value: summaryData.value.containers ?? 0, note: t('containers.runningCount', { count: summaryData.value.running ?? 0 }) },
   { label: t('containers.images'), value: summaryData.value.images ?? 0, note: t('containers.localImages') },
   { label: t('containers.network'), value: summaryData.value.networks ?? 0, note: t('containers.network') },
-  { label: t('containers.volumes'), value: summaryData.value.volumes ?? 0, note: t('containers.volumes') },
-  { label: t('containers.registry'), value: 0, note: t('containers.controlPlaneData') }
+  { label: t('containers.volumes'), value: summaryData.value.volumes ?? 0, note: t('containers.volumes') }
 ])
 const configSummaryItems = computed(() => [
   { label: t('containers.dockerHost'), value: targetLabel.value },
@@ -619,6 +745,7 @@ const settingsItems = computed(() => [
 ])
 const selectedContainerIds = computed(() => selectedContainerRows.value.filter(containerRowSelectable).map((row) => String(row?.id ?? '').trim()).filter(Boolean))
 const selectedRunningContainers = computed(() => selectedContainerRows.value.filter((row) => containerRowSelectable(row) && isRunningContainer(row)))
+const selectedImageIds = computed(() => uniqueValues(selectedImageRows.value.map(imageReference).filter(Boolean)))
 const containerTableRows = computed(() => {
   if (showAifarRuntimeInfra.value) {
     return collection.value
@@ -663,6 +790,12 @@ const batchRemoveDisabledReason = computed(() => {
   return ''
 })
 const batchRemoveDisabled = computed(() => Boolean(batchRemoveDisabledReason.value))
+const batchImageRemoveDisabledReason = computed(() => {
+  if (!canManageContainers.value) return deniedText.value
+  if (!selectedImageIds.value.length) return t('containers.selectImages')
+  return ''
+})
+const batchImageRemoveDisabled = computed(() => Boolean(batchImageRemoveDisabledReason.value))
 const normalizedDiskUsage = computed(() => {
   const rows = asArray<Record<string, string>>(summary.value.diskUsage)
   if (rows.length) return rows
@@ -727,11 +860,26 @@ const selectedRuntimeAppInstance = computed(() => {
   }
 })
 const selectedRuntimeServices = computed(() => asArray<AifarRuntimeService>(aifarRuntime.value.services).filter((item) => item.instanceId === selectedRuntimeInstance.value?.id))
-const selectedRuntimePods = computed(() => asArray<AifarRuntimePod>(aifarRuntime.value.pods).filter((item) => item.instanceId === selectedRuntimeInstance.value?.id))
-const staleRuntimePodCount = computed(() => selectedRuntimePods.value.filter((item) => String(item.status || '').trim() === 'stale').length)
+const selectedRuntimeDeployments = computed(() => asArray<AifarRuntimeDeployment>(aifarRuntime.value.deployments).filter((item) => item.instanceId === selectedRuntimeInstance.value?.id))
+const selectedRuntimePodsRaw = computed(() => asArray<AifarRuntimePod>(aifarRuntime.value.pods).filter((item) => item.instanceId === selectedRuntimeInstance.value?.id))
+const selectedRuntimePods = computed(() => {
+  const service = String(runtimePodServiceFilter.value || '').trim()
+  if (!service) return selectedRuntimePodsRaw.value
+  return selectedRuntimePodsRaw.value.filter((item) => item.serviceName === service)
+})
+const staleRuntimePodCount = computed(() => selectedRuntimePodsRaw.value.filter((item) => String(item.status || '').trim() === 'stale').length)
 const selectedRuntimeIngress = computed(() => asArray<AifarRuntimeIngress>(aifarRuntime.value.ingress).find((item) => item.instanceId === selectedRuntimeInstance.value?.id) ?? null)
 const aifarRuntimeWarnings = computed(() => asArray<string>(aifarRuntime.value.warnings))
 const installedRuntimeServiceNames = computed(() => new Set(selectedRuntimeServices.value.map((item) => item.serviceName).filter(Boolean)))
+const runtimeServiceMap = computed(() => {
+  const out = new Map<string, AifarRuntimeService>()
+  for (const service of selectedRuntimeServices.value) {
+    if (service.serviceName) out.set(service.serviceName, service)
+  }
+  return out
+})
+const runtimePodsLoadedForCurrentScope = computed(() => Boolean(runtimePodsLoaded.value[runtimeCacheKey('pods')]))
+const runtimePodStatsLoadedForCurrentScope = computed(() => Boolean(runtimePodStatsLoaded.value[runtimeCacheKey('pods')]))
 const installedRuntimeServiceNamesList = computed(() => aifarServiceOptions.map((item) => item.value).filter((service) => installedRuntimeServiceNames.value.has(service)))
 const missingRuntimeServiceOptions = computed(() => aifarServiceOptions.filter((item) => !installedRuntimeServiceNames.value.has(item.value)))
 const runtimeInstanceManageDisabledReason = computed(() => {
@@ -772,6 +920,20 @@ const runtimeSummaryItems = computed(() => {
     { label: t('containers.agent'), value: aifarRuntime.value.agent?.version || aifarRuntime.value.agent?.status || '-', status: aifarRuntime.value.agent?.status || 'unknown' }
   ]
 })
+const runtimeIngressItems = computed(() => {
+  const ingress = selectedRuntimeIngress.value
+  const config = selectedRuntimeConfig.value
+  return [
+    { label: t('containers.ingress'), value: ingress?.container || '-', status: ingress?.status || 'unknown' },
+    { label: t('containers.webRoute'), value: ingress?.webRoute || selectedRuntimeInstance.value?.endpoint || '-' },
+    { label: t('containers.gatewayRoute'), value: ingress?.gatewayRoute || selectedRuntimeInstance.value?.gatewayEndpoint || '-' },
+    { label: t('containers.gatewayPort'), value: ingress?.gatewayPort || '-' },
+    { label: t('containers.webPort'), value: ingress?.webPort || '-' },
+    { label: t('containers.nacosEphemeral'), value: config.nacosEphemeral === false ? 'false' : 'true' },
+    { label: t('containers.agent'), value: aifarRuntime.value.agent?.version || aifarRuntime.value.agent?.status || '-', status: aifarRuntime.value.agent?.status || 'unknown' },
+    { label: t('containers.lastApplyStatus'), value: runtimeApplyStatusLabel(config.lastApplyStatus), status: config.lastApplyStatus || 'unknown' }
+  ]
+})
 const runtimeConfigMetaItems = computed(() => {
   const config = selectedRuntimeConfig.value
   return [
@@ -798,12 +960,26 @@ function summaryCacheKey(includeDisk: boolean) {
   return `${cacheScope()}:summary:${includeDisk ? 'disk' : 'base'}`
 }
 
-function collectionCacheKey(kind = tab.value) {
+function activeCollectionKind() {
+  if (tab.value === 'images') {
+    return resourceTab.value
+  }
+  if (tab.value === 'containers') {
+    return 'containers'
+  }
+  return ''
+}
+
+function collectionBackedKind(kind = activeCollectionKind()) {
+  return kind === 'containers' || kind === 'images' || kind === 'networks' || kind === 'volumes'
+}
+
+function collectionCacheKey(kind = activeCollectionKind()) {
   return `${cacheScope()}:collection:${kind}`
 }
 
-function runtimeCacheKey() {
-  return `${cacheScope()}:aifar-runtime`
+function runtimeCacheKey(scope: 'base' | 'pods' = 'base') {
+  return `${cacheScope()}:aifar-runtime:${scope}`
 }
 
 async function withLoading<T>(fn: () => Promise<T>) {
@@ -888,27 +1064,32 @@ async function loadCollection(force = false) {
   if (tab.value === 'aifar-runtime') {
     collection.value = []
     selectedContainerRows.value = []
+    selectedImageRows.value = []
     await loadAifarRuntime(force)
     return
   }
-  if (tab.value === 'overview' || tab.value === 'registry' || tab.value === 'settings') {
+  const kind = activeCollectionKind()
+  if (!collectionBackedKind(kind)) {
     collection.value = []
     selectedContainerRows.value = []
+    selectedImageRows.value = []
     return
   }
   const query = targetQuery()
   if (!query) {
     collection.value = []
     selectedContainerRows.value = []
+    selectedImageRows.value = []
     return
   }
   selectedContainerRows.value = []
-  const key = collectionCacheKey()
+  selectedImageRows.value = []
+  const key = collectionCacheKey(kind)
   if (!force && collectionCache.value[key]) {
     collection.value = collectionCache.value[key]
     return
   }
-  const next = asArray(await apiGet(`/containers?kind=${tab.value}&${query}`).catch((err) => {
+  const next = asArray(await apiGet(`/containers?kind=${kind}&${query}`).catch((err) => {
     error.value = err.message
     return []
   }))
@@ -916,7 +1097,7 @@ async function loadCollection(force = false) {
   collectionCache.value = { ...collectionCache.value, [key]: next }
 }
 
-async function loadAifarRuntime(force = false) {
+async function loadAifarRuntime(force = false, includePods = runtimeResourceTab.value === 'pods', includeStats = false) {
   return withLoading(async () => {
     const query = targetQuery()
     if (!query) {
@@ -924,22 +1105,42 @@ async function loadAifarRuntime(force = false) {
       selectedRuntimeInstanceId.value = ''
       return
     }
-    const key = runtimeCacheKey()
-    if (!force && runtimeCache.value[key]) {
-      aifarRuntime.value = runtimeCache.value[key]
+    const scope = includePods ? 'pods' : 'base'
+    const key = runtimeCacheKey(scope)
+    const cacheHasRequiredStats = !includeStats || runtimePodStatsLoaded.value[key]
+    if (!force && runtimeCache.value[key] && cacheHasRequiredStats) {
+      aifarRuntime.value = includePods ? runtimeCache.value[key] : { ...runtimeCache.value[key], pods: asArray<AifarRuntimePod>(aifarRuntime.value.pods) }
       return
     }
-    const next = await apiGet<AifarRuntimeResponse>(`/containers/aifar/runtime?${query}`).catch((err) => {
+    const next = await apiGet<AifarRuntimeResponse>(`/containers/aifar/runtime?${query}&includePods=${includePods ? 1 : 0}&includeStats=${includeStats ? 1 : 0}`).catch((err) => {
       error.value = err.message
       return { runtimeStatus: 'degraded', agent: { status: 'missing', error: err.message }, instances: [], services: [], pods: [], ingress: [], warnings: [err.message] }
     })
-    aifarRuntime.value = next
-    runtimeCache.value = { ...runtimeCache.value, [key]: next }
+    const currentPods = asArray<AifarRuntimePod>(aifarRuntime.value.pods)
+    const merged = includePods ? next : { ...next, pods: currentPods }
+    aifarRuntime.value = merged
+    runtimeCache.value = { ...runtimeCache.value, [key]: merged }
+    if (includePods) {
+      const podsKey = runtimeCacheKey('pods')
+      runtimePodsLoaded.value = { ...runtimePodsLoaded.value, [podsKey]: true }
+      runtimePodStatsLoaded.value = { ...runtimePodStatsLoaded.value, [podsKey]: includeStats }
+      runtimeCache.value = { ...runtimeCache.value, [runtimeCacheKey('base')]: { ...merged, pods: [] } }
+    }
     const instances = asArray<AifarRuntimeInstance>(aifarRuntime.value.instances)
     if (!instances.some((instance) => instance.id === selectedRuntimeInstanceId.value)) {
       selectedRuntimeInstanceId.value = instances.find((instance) => !instance.legacy)?.id ?? instances[0]?.id ?? ''
     }
   })
+}
+
+async function ensureRuntimePodsLoaded(force = false, includeStats = false) {
+  if (!targetQuery()) return
+  if (!force && runtimePodsLoadedForCurrentScope.value && (!includeStats || runtimePodStatsLoadedForCurrentScope.value)) return
+  await loadAifarRuntime(force, true, includeStats)
+}
+
+function clearRuntimePodServiceFilter() {
+  runtimePodServiceFilter.value = ''
 }
 
 async function loadActive(force = false) {
@@ -1021,6 +1222,14 @@ async function runContainerBatchAction(action: string, rows = selectedContainerR
 }
 
 async function deleteImage(row: any) {
+  await removeImages([row], 'single')
+}
+
+async function deleteSelectedImages() {
+  await removeImages(selectedImageRows.value, 'batch')
+}
+
+async function removeImages(rows: any[], mode: 'single' | 'batch') {
   if (!canManageContainers.value) {
     ElMessage.warning(deniedText.value)
     return
@@ -1030,23 +1239,28 @@ async function deleteImage(row: any) {
     ElMessage.warning(t('containers.selectDockerHost'))
     return
   }
-  const id = imageReference(row)
-  if (!id) {
-    ElMessage.warning(t('containers.selectImage'))
+  const ids = uniqueValues(rows.map(imageReference).filter(Boolean))
+  if (!ids.length) {
+    ElMessage.warning(mode === 'batch' ? t('containers.selectImages') : t('containers.selectImage'))
     return
   }
   try {
-    await ElMessageBox.confirm(t('containers.confirmDeleteImage', { image: id }), t('containers.deleteImage'), {
+    const message = mode === 'batch'
+      ? t('containers.confirmDeleteSelectedImages', { count: ids.length })
+      : t('containers.confirmDeleteImage', { image: ids[0] })
+    const title = mode === 'batch' ? t('containers.batchDeleteImages') : t('containers.deleteImage')
+    await ElMessageBox.confirm(message, title, {
       type: 'warning',
-      confirmButtonText: t('containers.deleteImage'),
+      confirmButtonText: title,
       cancelButtonText: t('common.cancel')
     })
   } catch {
     return
   }
   try {
-    await apiPost(`/containers/images/remove?${query}`, { id })
-    ElMessage.success(t('containers.imageRemoveAccepted'))
+    await apiPost(`/containers/images/remove?${query}`, mode === 'batch' ? { ids } : { id: ids[0] })
+    ElMessage.success(mode === 'batch' ? t('containers.imageBatchRemoveAccepted') : t('containers.imageRemoveAccepted'))
+    selectedImageRows.value = []
     setTimeout(() => {
       void load(true)
     }, 800)
@@ -1068,6 +1282,10 @@ async function openLogs(id: string) {
 
 function onContainerSelectionChange(rows: any[]) {
   selectedContainerRows.value = rows.filter(containerRowSelectable)
+}
+
+function onImageSelectionChange(rows: any[]) {
+  selectedImageRows.value = rows.filter((row) => imageReference(row))
 }
 
 function containerState(row: any) {
@@ -1200,6 +1418,57 @@ function aifarRuntimeStatusLabel(status?: string) {
   const key = `containers.runtimeStatus.${String(status || 'unknown').trim() || 'unknown'}`
   const value = t(key)
   return value === key ? String(status || t('common.unknown')) : value
+}
+
+function runtimeEndpointText(row: AifarRuntimeService) {
+  const ready = Number(row.readyEndpointCount ?? row.activeEndpoints ?? row.readyReplicas ?? 0)
+  const total = Number(row.endpointCount ?? row.activeEndpoints ?? ready)
+  return `${Number.isFinite(ready) ? ready : 0} / ${Number.isFinite(total) ? total : 0}`
+}
+
+function runtimeDeploymentReplicaText(row: AifarRuntimeDeployment) {
+  const ready = Number(row.readyReplicas ?? row.availableReplicas ?? 0)
+  const desired = Number(row.desiredReplicas ?? 0)
+  const updated = Number(row.updatedReplicas ?? 0)
+  const base = `${Number.isFinite(ready) ? ready : 0} / ${Number.isFinite(desired) ? desired : 0}`
+  if (updated > 0 && updated !== ready) {
+    return `${base} (${updated})`
+  }
+  return base
+}
+
+function runtimeServiceForDeployment(row: AifarRuntimeDeployment): AifarRuntimeService {
+  const existing = runtimeServiceMap.value.get(row.serviceName)
+  if (existing) {
+    return existing
+  }
+  return {
+    instanceId: row.instanceId,
+    serviceName: row.serviceName,
+    appName: row.appName || row.deploymentName || row.serviceName,
+    desiredReplicas: row.desiredReplicas,
+    readyReplicas: row.readyReplicas,
+    image: row.image,
+    status: row.status,
+    rolloutStatus: row.status,
+    failureReason: row.failureReason
+  }
+}
+
+function runtimeNacosStatus(row: AifarRuntimeService) {
+  if (row.nacosReady) {
+    return 'ready'
+  }
+  if (row.lastNacosError) {
+    return 'failed'
+  }
+  if (row.nacosRegistered) {
+    return 'running'
+  }
+  if (row.status === 'offline') {
+    return 'offline'
+  }
+  return 'unknown'
 }
 
 function runtimeApplyStatusLabel(status?: string) {
@@ -1824,6 +2093,22 @@ function imageReference(row: any) {
   return id
 }
 
+function imageRowKey(row: any) {
+  return imageReference(row) || `${String(row?.repository ?? '').trim()}:${String(row?.tag ?? '').trim()}:${String(row?.id ?? '').trim()}`
+}
+
+function uniqueValues(values: string[]) {
+  const seen = new Set<string>()
+  const out: string[] = []
+  for (const value of values) {
+    const next = value.trim()
+    if (!next || seen.has(next)) continue
+    seen.add(next)
+    out.push(next)
+  }
+  return out
+}
+
 function containerRemoveDisabledReason(row: any) {
   if (!canManageContainers.value) return deniedText.value
   if (isRunningContainer(row)) return t('containers.stopBeforeUninstall')
@@ -1864,6 +2149,19 @@ async function confirmDockerUninstall(password: string) {
 
 watch(tab, () => {
   void loadActive(false)
+})
+watch(resourceTab, () => {
+  if (tab.value === 'images') {
+    void loadActive(false)
+  }
+})
+watch(runtimeResourceTab, (next) => {
+  if (next === 'pods') {
+    void ensureRuntimePodsLoaded(false)
+  }
+})
+watch(selectedRuntimeInstanceId, () => {
+  runtimePodServiceFilter.value = ''
 })
 watch([aifarUpdateService, aifarUpdateMode], () => {
   aifarArtifactFile.value = null
@@ -1958,6 +2256,30 @@ onMounted(async () => {
   min-height: 0;
 }
 
+.resource-tabs {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.resource-tabs :deep(.el-tabs__content) {
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+.resource-tabs :deep(.el-tab-pane) {
+  height: 100%;
+}
+
+.resource-panel {
+  height: 100%;
+  min-height: 360px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
 .runtime-workspace {
   display: flex;
   flex: 1 1 auto;
@@ -1984,6 +2306,58 @@ onMounted(async () => {
 
 .runtime-instance-select {
   width: 280px;
+}
+
+.runtime-resource-tabs {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.runtime-resource-tabs :deep(.el-tabs__content) {
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+.runtime-resource-tabs :deep(.el-tab-pane) {
+  height: 100%;
+}
+
+.runtime-resource-panel {
+  height: 100%;
+  min-height: 360px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.runtime-tab-toolbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  min-height: 32px;
+}
+
+.runtime-tab-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.runtime-service-filter {
+  width: 180px;
+}
+
+.runtime-lazy-state {
+  flex: 1 1 auto;
+  min-height: 220px;
+  display: grid;
+  place-items: center;
+  border: 1px dashed var(--aifar-border-soft);
+  border-radius: var(--aifar-radius);
+  background: #f8fbff;
 }
 
 .aifar-update-form :deep(.el-select),

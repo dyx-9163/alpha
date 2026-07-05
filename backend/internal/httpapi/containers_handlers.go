@@ -242,8 +242,8 @@ func (a *API) containerImageRemove(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &req) {
 		return
 	}
-	id := strings.TrimSpace(req.ID)
-	if id == "" {
+	ids := normalizeContainerIDs(append(req.IDs, req.ID))
+	if len(ids) == 0 {
 		writeError(w, http.StatusBadRequest, "IMAGE_ID_REQUIRED", i18n.Text(lang, "api.containerImageIDRequired"), nil)
 		return
 	}
@@ -257,16 +257,29 @@ func (a *API) containerImageRemove(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "DOCKER_TARGET_REQUIRED", i18n.Text(lang, "api.dockerTargetRequired"), nil)
 		return
 	}
-	task, err := a.tasks.StartWithLanguage("containers.image.remove", id, currentUser(r).Username, lang, func(ctx context.Context, log worker.Logger) error {
-		log.Info(i18n.Text(lang, "api.containerImageRemoveRequested"), id)
-		if err := runDockerImageRemove(ctx, server, useServer, host, id); err != nil {
-			return err
+	target := strings.Join(ids, ",")
+	action := "containers.image.remove"
+	if len(ids) > 1 {
+		action = "containers.image.batch.remove"
+	}
+	task, err := a.tasks.StartWithLanguage(action, target, currentUser(r).Username, lang, func(ctx context.Context, log worker.Logger) error {
+		if len(ids) > 1 {
+			log.Info(i18n.Text(lang, "api.containerImageBatchRemoveRequested"), len(ids))
 		}
-		log.Info(i18n.Text(lang, "api.containerImageRemoveCompleted"), id)
+		for _, id := range ids {
+			log.Info(i18n.Text(lang, "api.containerImageRemoveRequested"), id)
+			if err := runDockerImageRemove(ctx, server, useServer, host, id); err != nil {
+				return fmt.Errorf("remove image %s: %w", id, err)
+			}
+			log.Info(i18n.Text(lang, "api.containerImageRemoveCompleted"), id)
+		}
+		if len(ids) > 1 {
+			log.Info(i18n.Text(lang, "api.containerImageBatchRemoveCompleted"), len(ids))
+		}
 		return nil
 	})
 	if err == nil {
-		a.audit(r, "containers.image.remove", id, "running", task.ID)
+		a.audit(r, action, target, "running", task.ID)
 	}
 	respondTask(w, task, err)
 }
