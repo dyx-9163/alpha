@@ -803,3 +803,5 @@
 - 结论：Nacos 控制台服务列表通常不直接展示服务级 ephemeral/persistent 类型；直接证据来自 Nacos OpenAPI 注册返回的错误 `Current service DEFAULT_GROUP@@alpha-oauth is persistent service, can't register ephemeral instance`。有实例时可通过 `/nacos/v1/ns/instance/list` 查看 `hosts[].ephemeral`，无实例或隐藏空服务时可通过临时注册探针或 Nacos naming 日志验证。
 - 问题：用户询问使用 `ephemeral=true` 和 `ephemeral=false` 有什么影响。
 - 结论：两者不改变服务调用地址和 Java 业务逻辑，差异在 Nacos 实例生命周期。`ephemeral=true` 是临时实例，依赖心跳，agent 掉线后 Nacos 自动剔除，适合容器/Pod/agent 代理；`ephemeral=false` 是持久实例，适合固定机器服务，agent 异常退出时容易留下 stale 实例，需要 `deregister-nacos` 或人工清理。AIFAR 新装应优先统一 `true`，仅对已被 Nacos 固定为 persistent 的历史服务 fallback 为 `false`。
+- 问题：用户要求在 AIFAR Runtime 页面增加下线某个 deployment 的功能，并给 Nacos `ephemeral` 配置加页面开关，便于测试 Nacos 服务状态。
+- 结论：已新增服务下线入口：将目标服务期望副本数设置为 0，RuntimeSpec 允许 0 副本，agent reconcile 删除对应 Pod 并在 Nacos 代理注册阶段摘除该服务；运行参数弹窗新增 `Nacos ephemeral` 开关并写入 spec，安装/补装/扩容/更新/运行配置脚本统一读取该配置。
