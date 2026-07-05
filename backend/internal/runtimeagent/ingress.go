@@ -58,15 +58,16 @@ type ManagerOptions struct {
 }
 
 type Manager struct {
-	mu        sync.RWMutex
-	stateDir  string
-	runner    CommandRunner
-	log       io.Writer
-	specs     map[string]RuntimeSpec
-	routes    map[int]proxyRoute
-	servers   map[int]*http.Server
-	next      map[string]uint64
-	endpoints map[string][]endpoint
+	mu          sync.RWMutex
+	reconcileMu sync.Mutex
+	stateDir    string
+	runner      CommandRunner
+	log         io.Writer
+	specs       map[string]RuntimeSpec
+	routes      map[int]proxyRoute
+	servers     map[int]*http.Server
+	next        map[string]uint64
+	endpoints   map[string][]endpoint
 }
 
 type proxyRoute struct {
@@ -126,6 +127,8 @@ func (m *Manager) Load(ctx context.Context) error {
 }
 
 func (m *Manager) Apply(ctx context.Context, spec RuntimeSpec) error {
+	m.reconcileMu.Lock()
+	defer m.reconcileMu.Unlock()
 	spec = NormalizeSpec(spec)
 	if err := validateRuntimeSpec(spec); err != nil {
 		return err
@@ -166,6 +169,8 @@ func (m *Manager) Apply(ctx context.Context, spec RuntimeSpec) error {
 }
 
 func (m *Manager) Remove(ctx context.Context, instanceID string) error {
+	m.reconcileMu.Lock()
+	defer m.reconcileMu.Unlock()
 	instanceID = strings.TrimSpace(instanceID)
 	if instanceID == "" {
 		instanceID = "admin"
@@ -245,6 +250,8 @@ func (m *Manager) Status() map[string]any {
 }
 
 func (m *Manager) Resync(ctx context.Context) error {
+	m.reconcileMu.Lock()
+	defer m.reconcileMu.Unlock()
 	for _, spec := range m.snapshotSpecs() {
 		if err := m.reconcileDeployments(ctx, spec); err != nil {
 			return err
@@ -267,12 +274,12 @@ func (m *Manager) StartRuntimeResync(ctx context.Context, interval time.Duration
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			specs := m.snapshotSpecs()
-			if len(specs) == 0 {
-				continue
-			}
 			if err := m.Resync(ctx); err != nil {
 				logf(m.log, "AIFAR runtime periodic resync failed: %v\n", err)
+				continue
+			}
+			specs := m.snapshotSpecs()
+			if len(specs) == 0 {
 				continue
 			}
 			options := nacosOptions
@@ -564,9 +571,11 @@ func (m *Manager) runContainer(ctx context.Context, spec RuntimeSpec, deployment
 
 func (m *Manager) waitContainerReady(ctx context.Context, name string) error {
 	deadline := time.Now().Add(5 * time.Minute)
+	lastInspect := ""
 	for {
 		result, err := m.runner.Run(ctx, "docker", "inspect", "-f", `{{.State.Running}}|{{if .State.Health}}{{.State.Health.Status}}{{end}}`, name)
 		if err == nil {
+			lastInspect = strings.TrimSpace(result.Stdout)
 			parts := strings.SplitN(strings.TrimSpace(result.Stdout), "|", 2)
 			running := len(parts) > 0 && parts[0] == "true"
 			health := ""
@@ -576,8 +585,17 @@ func (m *Manager) waitContainerReady(ctx context.Context, name string) error {
 			if running && (health == "" || health == "healthy") {
 				return nil
 			}
+		} else {
+			lastInspect = strings.TrimSpace(err.Error())
+			if strings.TrimSpace(result.Stderr) != "" {
+				lastInspect += ": " + strings.TrimSpace(result.Stderr)
+			}
 		}
 		if time.Now().After(deadline) {
+			diagnostics := m.containerReadyDiagnostics(ctx, name, lastInspect)
+			if diagnostics != "" {
+				return fmt.Errorf("AIFAR pod did not become ready: %s\n%s", name, diagnostics)
+			}
 			return fmt.Errorf("AIFAR pod did not become ready: %s", name)
 		}
 		select {
@@ -586,6 +604,48 @@ func (m *Manager) waitContainerReady(ctx context.Context, name string) error {
 		case <-time.After(3 * time.Second):
 		}
 	}
+}
+
+func (m *Manager) containerReadyDiagnostics(ctx context.Context, name, lastInspect string) string {
+	var b strings.Builder
+	if strings.TrimSpace(lastInspect) != "" {
+		fmt.Fprintf(&b, "last inspect: %s\n", trimDiagnosticOutput(lastInspect, 1024))
+	}
+	inspectFormat := `status={{.State.Status}} running={{.State.Running}} exitCode={{.State.ExitCode}} error={{.State.Error}} oomKilled={{.State.OOMKilled}}{{if .State.Health}} health={{.State.Health.Status}}{{end}}`
+	if result, err := m.runner.Run(ctx, "docker", "inspect", "-f", inspectFormat, name); err != nil {
+		fmt.Fprintf(&b, "inspect failed: %v", err)
+		if strings.TrimSpace(result.Stderr) != "" {
+			fmt.Fprintf(&b, ": %s", trimDiagnosticOutput(strings.TrimSpace(result.Stderr), 1024))
+		}
+		b.WriteString("\n")
+	} else if strings.TrimSpace(result.Stdout) != "" {
+		fmt.Fprintf(&b, "inspect: %s\n", trimDiagnosticOutput(strings.TrimSpace(result.Stdout), 2048))
+	}
+	healthFormat := `{{if .State.Health}}{{range .State.Health.Log}}{{println .Start "exit=" .ExitCode "output=" .Output}}{{end}}{{end}}`
+	if result, err := m.runner.Run(ctx, "docker", "inspect", "-f", healthFormat, name); err == nil && strings.TrimSpace(result.Stdout) != "" {
+		fmt.Fprintf(&b, "health log:\n%s\n", trimDiagnosticOutput(strings.TrimSpace(result.Stdout), 4096))
+	}
+	if result, err := m.runner.Run(ctx, "docker", "logs", "--tail", "120", name); err != nil {
+		fmt.Fprintf(&b, "logs failed: %v", err)
+		if strings.TrimSpace(result.Stderr) != "" {
+			fmt.Fprintf(&b, ": %s", trimDiagnosticOutput(strings.TrimSpace(result.Stderr), 1024))
+		}
+		b.WriteString("\n")
+	} else {
+		logs := strings.TrimSpace(strings.TrimSpace(result.Stdout) + "\n" + strings.TrimSpace(result.Stderr))
+		if logs != "" {
+			fmt.Fprintf(&b, "logs:\n%s\n", trimDiagnosticOutput(logs, 8192))
+		}
+	}
+	return strings.TrimSpace(b.String())
+}
+
+func trimDiagnosticOutput(value string, max int) string {
+	value = strings.TrimSpace(value)
+	if max <= 0 || len(value) <= max {
+		return value
+	}
+	return value[:max] + "...(truncated)"
 }
 
 func (m *Manager) removeExtraReplicas(ctx context.Context, spec RuntimeSpec, deployment DeploymentSpec) error {

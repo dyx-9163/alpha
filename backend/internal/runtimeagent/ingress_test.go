@@ -2,11 +2,14 @@ package runtimeagent
 
 import (
 	"context"
+	"errors"
 	"net"
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 type fakeRunner struct {
@@ -160,6 +163,174 @@ func TestManagerUsesGatewayAffinityForSameClient(t *testing.T) {
 	gotSecond := manager.selectEndpoint(second, "admin", "gateway", endpoints)
 	if gotFirst != gotSecond {
 		t.Fatalf("expected same authenticated client to use same gateway endpoint, got %#v and %#v", gotFirst, gotSecond)
+	}
+}
+
+func TestManagerSerializesApplyAndResyncDuringScaleOut(t *testing.T) {
+	deployment := DeploymentSpec{
+		ServiceName: "file",
+		Image:       "aifar-file:rev-1",
+		Revision:    "rev-1",
+		Replicas:    2,
+		Ports:       []ContainerPort{{Name: "http", ContainerPort: 38005}},
+	}
+	runner := newScaleOutRaceRunner(deploymentSpecHash(deployment))
+	manager := NewManager(ManagerOptions{StateDir: t.TempDir(), Runner: runner})
+	oldSpec := NormalizeSpec(RuntimeSpec{
+		InstanceID:  "admin",
+		InstallRoot: "/aifar/apps/admin",
+		Network:     "aifar-network",
+		Deployments: []DeploymentSpec{{
+			ServiceName: "file",
+			Image:       "aifar-file:rev-1",
+			Revision:    "rev-1",
+			Replicas:    1,
+			Ports:       []ContainerPort{{Name: "http", ContainerPort: 38005}},
+		}},
+		Services: []ServiceSpec{{Name: "file", AppName: "alpha-file", Port: 38005, TargetPort: 38005}},
+	})
+	newSpec := oldSpec
+	newSpec.Deployments = []DeploymentSpec{deployment}
+
+	manager.mu.Lock()
+	manager.specs[oldSpec.InstanceID] = oldSpec
+	manager.mu.Unlock()
+
+	applyDone := make(chan error, 1)
+	go func() {
+		applyDone <- manager.Apply(context.Background(), newSpec)
+	}()
+
+	select {
+	case <-runner.runStarted:
+	case err := <-applyDone:
+		t.Fatalf("apply finished before replica 2 started: %v", err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("replica 2 was not started")
+	}
+
+	resyncDone := make(chan error, 1)
+	go func() {
+		resyncDone <- manager.Resync(context.Background())
+	}()
+
+	select {
+	case err := <-resyncDone:
+		t.Fatalf("resync was not serialized with apply, err=%v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(runner.ready)
+	if err := <-applyDone; err != nil {
+		t.Fatalf("apply failed: %v", err)
+	}
+	if err := <-resyncDone; err != nil {
+		t.Fatalf("resync failed: %v", err)
+	}
+	if runner.removedReplica2() {
+		t.Fatal("resync removed replica 2 while scale-out apply was in progress")
+	}
+}
+
+func TestManagerContainerReadyDiagnosticsIncludesInspectAndLogs(t *testing.T) {
+	runner := &diagnosticRunner{}
+	manager := NewManager(ManagerOptions{StateDir: t.TempDir(), Runner: runner})
+	got := manager.containerReadyDiagnostics(context.Background(), "aifar-pod-admin-file-rev-r2", "false|unhealthy")
+	for _, want := range []string{
+		"last inspect: false|unhealthy",
+		"inspect: status=exited",
+		"health log:",
+		"connection refused",
+		"logs:",
+		"application failed to start",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("expected diagnostics to contain %q, got:\n%s", want, got)
+		}
+	}
+}
+
+type scaleOutRaceRunner struct {
+	mu         sync.Mutex
+	hash       string
+	ready      chan struct{}
+	runStarted chan struct{}
+	runOnce    sync.Once
+	removed    []string
+}
+
+func newScaleOutRaceRunner(hash string) *scaleOutRaceRunner {
+	return &scaleOutRaceRunner{
+		hash:       hash,
+		ready:      make(chan struct{}),
+		runStarted: make(chan struct{}),
+	}
+}
+
+func (r *scaleOutRaceRunner) Run(ctx context.Context, name string, args ...string) (CommandResult, error) {
+	call := name + " " + strings.Join(args, " ")
+	switch {
+	case strings.Contains(call, "docker inspect -f {{.Id}}"):
+		if strings.HasSuffix(call, "r2") {
+			return CommandResult{}, errors.New("not found")
+		}
+		return CommandResult{Stdout: "container-id\n"}, nil
+	case strings.Contains(call, `{{index .Config.Labels "aifar.spec-hash"}}`):
+		return CommandResult{Stdout: r.hash + "\n"}, nil
+	case strings.Contains(call, "docker run "):
+		if strings.Contains(call, "r2") {
+			r.runOnce.Do(func() { close(r.runStarted) })
+		}
+		return CommandResult{Stdout: "new-container\n"}, nil
+	case strings.Contains(call, "docker inspect -f {{.State.Running}}|") && strings.Contains(call, "NetworkSettings"):
+		return CommandResult{Stdout: "true|healthy|172.20.0.10\n"}, nil
+	case strings.Contains(call, "docker inspect -f {{.State.Running}}|"):
+		if strings.HasSuffix(call, "r2") {
+			select {
+			case <-r.ready:
+			case <-ctx.Done():
+				return CommandResult{}, ctx.Err()
+			}
+		}
+		return CommandResult{Stdout: "true|healthy\n"}, nil
+	case strings.Contains(call, "docker ps -a") && strings.Contains(call, `{{.Label "aifar.replica"}}`):
+		return CommandResult{Stdout: "aifar-pod-admin-file-rev-1-r1|1|rev-1\naifar-pod-admin-file-rev-1-r2|2|rev-1\n"}, nil
+	case strings.Contains(call, "docker ps "):
+		return CommandResult{Stdout: "aifar-pod-admin-file-rev-1-r1\naifar-pod-admin-file-rev-1-r2\n"}, nil
+	case strings.Contains(call, "docker rm -f"):
+		r.mu.Lock()
+		r.removed = append(r.removed, call)
+		r.mu.Unlock()
+		return CommandResult{Stdout: "removed\n"}, nil
+	default:
+		return CommandResult{Stdout: "ok\n"}, nil
+	}
+}
+
+func (r *scaleOutRaceRunner) removedReplica2() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, call := range r.removed {
+		if strings.Contains(call, "r2") {
+			return true
+		}
+	}
+	return false
+}
+
+type diagnosticRunner struct{}
+
+func (diagnosticRunner) Run(ctx context.Context, name string, args ...string) (CommandResult, error) {
+	call := name + " " + strings.Join(args, " ")
+	switch {
+	case strings.Contains(call, "status={{.State.Status}}"):
+		return CommandResult{Stdout: "status=exited running=false exitCode=1 error= oomKilled=false health=unhealthy\n"}, nil
+	case strings.Contains(call, "State.Health.Log"):
+		return CommandResult{Stdout: "2026-07-05 exit= 1 output= connection refused\n"}, nil
+	case strings.Contains(call, "docker logs"):
+		return CommandResult{Stdout: "application failed to start\n"}, nil
+	default:
+		return CommandResult{}, nil
 	}
 }
 
