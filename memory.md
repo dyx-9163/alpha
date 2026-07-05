@@ -783,3 +783,5 @@
 - 结论：原因是旧扩容/状态聚合链路把 metadata 或 Docker label 缺失值当成字符串 `<nil>`/`<no value>` 写入 revision，随后生成了 `--nil--` 控制面 Pod/Endpoint 记录；已清洗无效 revision，并让 Runtime 服务汇总优先使用真实 running Pod，残留只在 Pod 列表中标记为 stale。
 - 问题：用户反馈容器页几个页签加载很慢。
 - 结论：容器摘要接口默认不再执行较慢的 `docker system df`，仅概览请求 `includeDisk=1` 时查询磁盘并与 summary 并发；前端容器页按服务器和页签缓存列表/AIFAR Runtime，普通切页复用缓存，刷新、检查主机和变更操作才强制重拉，减少重复 Docker 查询。
+- 问题：用户询问 AIFAR Runtime 中 Deployment/Service 的 Revision 是否应固定为 `alpha-gateway` 等服务名，只有镜像和 Pod 动态变化。
+- 结论：固定服务身份的方向合理，但不应把固定服务名叫 `Revision`；Deployment/Service 应展示稳定的 service/app name，例如 `alpha-gateway`，而动态发布批次/镜像 tag/Pod template hash 才应叫 revision，Pod 和 image 继续携带动态 revision 便于滚动、清理和排障。
