@@ -763,3 +763,5 @@
 - 结论：JVM 内存改由 AIFAR runtime 生成的 `java-jvm.options` / `java-jvm.<service>.options` 控制，默认 `InitialRAMPercentage=20`、`MaxRAMPercentage=70`，安装和运行配置都会写入远端 `$RUNTIME_DIR/env` 后由容器 entrypoint 读取。
 - 问题：用户发现存在 `java-common.env`，询问 `services` 下 Dockerfile 是否也没用。
 - 结论：runtime-v2 当前仍用 Dockerfile 做 `docker build`，把 Jar/web dist 打进镜像；`java-common.env` 只是运行时 envFiles 注入。Java Dockerfile 的 COPY/FROM 仍有用，但 ENTRYPOINT 已被 RuntimeSpec 覆盖，后续可收敛为公共 Java/Web Dockerfile 模板。
+- 问题：用户说明 cleanup 是发现 AIFAR 安装成功后无 Pod/Endpoint 才手动执行，安装成功本身已有问题。
+- 结论：排查发现安装成功判定过弱，且本地 `bin/aifar-agent-linux-amd64` 曾是旧二进制。已加强 runtime-v2 安装脚本：agent status 必须包含 `reconcile-runtime`、`local-runtime-controller`、`endpoint-cache` 特征，reconcile 后还要按 Docker labels 等待当前 revision Pod 容器存在，否则安装失败；本地 agent 构建产物已重新生成。

@@ -211,12 +211,20 @@ agent_status_ok() {
 
 wait_agent_status() {
   for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do
-    if aifar-agent status >/dev/null 2>&1; then
+    if agent_runtime_status="$(aifar-agent status 2>/dev/null)" && agent_has_runtime_features "$agent_runtime_status"; then
       return 0
     fi
     sleep 1
   done
   return 1
+}
+
+agent_has_runtime_features() {
+  status="$1"
+  printf "%s" "$status" | grep -q '"reconcile-runtime"' || return 1
+  printf "%s" "$status" | grep -q '"local-runtime-controller"' || return 1
+  printf "%s" "$status" | grep -q '"endpoint-cache"' || return 1
+  return 0
 }
 
 install_agent_dependency() {
@@ -558,7 +566,39 @@ reconcile_runtime() {
   spec="$(write_runtime_spec)"
   echo "reconciling AIFAR runtime through aifar-agent: $spec"
   aifar-agent reconcile-runtime --spec "$spec"
+  wait_runtime_pods
   wait_runtime_ports
+}
+
+wait_runtime_pods() {
+  expected=0
+  for service in $SERVICE_ORDER; do
+    [ -f "$ENV_DIR/$service.env" ] && expected=$((expected + 1))
+  done
+  [ "$expected" -gt 0 ] || fail "AIFAR runtime has no selected services"
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    count="$(docker ps -a \
+      --filter "label=aifar.app=aifar" \
+      --filter "label=aifar.install-root=$INSTALL_ROOT" \
+      --filter "label=aifar.component=pod" \
+      --filter "label=aifar.revision=$REVISION" \
+      --format '{{ "{{" }}.Names{{ "}}" }}' 2>/dev/null | wc -l | tr -d ' ')"
+    if [ "${count:-0}" -ge "$expected" ]; then
+      echo "AIFAR runtime Pod containers are present: $count/$expected"
+      return 0
+    fi
+    sleep 3
+  done
+  echo "AIFAR runtime Pod containers are missing after reconcile"
+  docker ps -a \
+    --filter "label=aifar.app=aifar" \
+    --filter "label=aifar.install-root=$INSTALL_ROOT" \
+    --filter "label=aifar.component=pod" \
+    --format 'table {{ "{{" }}.Names{{ "}}" }}\t{{ "{{" }}.Status{{ "}}" }}\t{{ "{{" }}.Image{{ "}}" }}' || true
+  aifar-agent status || true
+  $SUDO systemctl --no-pager --full status aifar-agent || true
+  $SUDO journalctl -u aifar-agent -n 120 --no-pager || true
+  return 1
 }
 
 wait_runtime_ports() {
