@@ -775,3 +775,5 @@
 - 结论：已将 `README.md` 整理为中英文双语结构，覆盖项目介绍、技术栈、开发命令、服务端环境变量、AIFAR agent runtime 命令、离线资源和打包说明。
 - 问题：用户反馈 AIFAR `file` 服务扩容失败，agent 报 `AIFAR pod did not become ready`，并说明实际目标机没有看到新容器。
 - 结论：根因指向 agent runtime-v2 的并发 reconcile 竞态：`Apply` 在新 spec 完成前未更新内存期望态，后台 periodic/Docker-event `Resync` 可能按旧 spec 将刚创建的 r2 副本当作多余容器删除。已为 `Apply`/`Resync`/`Remove` 增加串行化锁，并增强 Pod ready 超时诊断，输出 inspect、health log 和 docker logs。
+- 问题：用户询问 AIFAR runtime 中 `Revision` 是什么，`Service` 在哪里，是否属于 `aifar-agent`。
+- 结论：`Revision` 是每个业务服务当前镜像/配置发布批次标识，会写入 RuntimeSpec deployment、容器名和 `aifar.revision` label，用于滚动和清理旧副本；`Service` 是 RuntimeSpec 中的稳定流量入口定义，由 AIFAR 生成并交给 `aifar-agent` 执行，agent 负责监听 service port、维护 endpoint、负载均衡和 Nacos 代理注册。
