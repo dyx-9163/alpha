@@ -185,6 +185,27 @@ type RuntimeReconcileRequest struct {
 	Reason   string
 }
 
+type RuntimeConfigValues struct {
+	AppCPUs                 string  `json:"appCPUs,omitempty"`
+	AppMemoryLimit          string  `json:"appMemoryLimit,omitempty"`
+	JVMInitialRAMPercentage float64 `json:"jvmInitialRAMPercentage,omitempty"`
+	JVMMaxRAMPercentage     float64 `json:"jvmMaxRAMPercentage,omitempty"`
+}
+
+type RuntimeConfigPayload struct {
+	Global   RuntimeConfigValues            `json:"global"`
+	Services map[string]RuntimeConfigValues `json:"services,omitempty"`
+}
+
+type RuntimeConfigRequest struct {
+	Instance store.AppInstance
+	Server   store.Server
+	Language string
+	Actor    string
+	Reason   string
+	Config   RuntimeConfigPayload
+}
+
 type ClusterStartRequest struct {
 	Instances       []store.AppInstance
 	Servers         []store.Server
@@ -200,6 +221,7 @@ type InstanceStatus struct {
 }
 
 type RunContext struct {
+	TaskID      string
 	Resources   []store.Resource
 	Log         Logger
 	TargetLog   func(target string) Logger
@@ -257,6 +279,11 @@ type ServiceScaleOutModule interface {
 
 type RuntimeReconcileModule interface {
 	ReconcileRuntime(ctx context.Context, req RuntimeReconcileRequest, run RunContext) error
+}
+
+type RuntimeConfigModule interface {
+	ValidateRuntimeConfig(ctx context.Context, req RuntimeConfigRequest) error
+	ApplyRuntimeConfig(ctx context.Context, req RuntimeConfigRequest, run RunContext) error
 }
 
 type ClusterStartModule interface {

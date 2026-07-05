@@ -41,7 +41,7 @@ func (a *API) recordFailedInstallInstances(ctx context.Context, req registry.Ins
 			App:      req.App,
 			Version:  req.Version,
 			ServerID: serverID,
-			Status:   "failed",
+			Status:   failedInstallStatus(req.App),
 			Topology: normalizedInstallTopology(req.Topology),
 			Metadata: string(raw),
 		})
@@ -70,7 +70,7 @@ func installInstanceRecordedAfter(instances []store.AppInstance, app, serverID s
 
 func failedInstallInstanceExists(instances []store.AppInstance, app, serverID, taskID string) bool {
 	for _, item := range instances {
-		if item.App != app || item.ServerID != serverID || item.Status != "failed" {
+		if item.App != app || item.ServerID != serverID || !isFailedInstallStatus(item.Status) {
 			continue
 		}
 		metadata := map[string]any{}
@@ -79,6 +79,22 @@ func failedInstallInstanceExists(instances []store.AppInstance, app, serverID, t
 		}
 	}
 	return false
+}
+
+func failedInstallStatus(app string) string {
+	if strings.EqualFold(strings.TrimSpace(app), "aifar") {
+		return "install_failed"
+	}
+	return "failed"
+}
+
+func isFailedInstallStatus(status string) bool {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "failed", "install_failed":
+		return true
+	default:
+		return false
+	}
 }
 
 func (a *API) failedInstallMetadata(req registry.InstallRequest, serverID, taskID string, installErr error) (map[string]any, error) {

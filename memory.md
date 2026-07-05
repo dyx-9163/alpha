@@ -669,3 +669,23 @@
 - 结论：根因是 `aifar-agent status` 的 `/status` handler 还会执行 `docker info`，导致 agent API 已启动但 Docker 健康探测失败时被误报为不可达；已将 `/status` 改为只返回 agent 自身运行状态，Docker 探测保留在 `/health`，并让安装脚本等待 agent API 就绪后再继续。
 - 问题：用户部署成功后截图显示只有 `127.0.0.1:18081` 的 `aifar-agent` 控制端口，没有 `8080/38000` 入口端口，询问是否能访问。
 - 结论：当前状态还不能外部访问，说明业务 Pod 已启动但 agent 数据面没有生效；AIFAR 安装脚本已改为只要上传了 agent 二进制就强制升级/重启 systemd agent，并在 `reconcile-ingress` 后校验 `GATEWAY_PORT` 和 `WEB_VUE3_PORT` 已监听，避免旧 agent 被跳过升级。
+- 问题：用户询问端口到底由谁开放，如果 Docker 实例直接映射端口，agent 的作用是什么。
+- 结论：当前推荐模型中宿主机监听端口由 systemd `aifar-agent` 负责，Docker 业务 Pod 不直接 `-p` 暴露；agent 相当于单机版 Service/Ingress，负责稳定入口、发现 healthy Pod、负载均衡、滚动切流和 endpoint 管理。若业务容器直接绑定宿主机端口，agent 的核心流量治理价值会被绕开，滚动更新也会回到端口冲突和单实例切换问题。
+- 问题：用户确认本机 `curl http://127.0.0.1:8080/` connection refused，`journalctl -u aifar-agent` 只有 `listening on 127.0.0.1:18081`。
+- 结论：这说明防火墙不是主因，agent 只启动了控制面端口，尚未收到或未成功应用 AIFAR runtime spec；正常应在 journal 中出现 `AIFAR runtime applied instance=admin ports=...`，并由 `aifar-agent` 监听 `8080/38000`。
+- 问题：用户用 Docker labels 确认当前 AIFAR Pod 的 `aifar.install-root` 均为 `/aifar/apps/admin`。
+- 结论：installRoot 没有偏差，缺失的是 `/aifar/apps/admin/runtime/ingress/runtime-spec.json`；当前部署只完成了业务 Pod 层，未完成 agent runtime spec 写入和 reconcile，因此 agent `instances/listeners` 为空。
+- 问题：用户询问代码里是否有对 AIFAR service/agent runtime 的注册或更新动作。
+- 结论：有两类动作：安装脚本 `write_runtime_spec` 写 `/runtime/ingress/runtime-spec.json` 并执行 `aifar-agent reconcile-ingress --spec`，agent `Apply` 后启动宿主机监听并保存 spec；Java 服务还会通过 `register_nacos_proxy` 注册 agent 代理到 Nacos。单服务/批量更新只复用已有 runtime spec 做 reconcile，不重写缺失的 spec。
+- 问题：用户询问 `aifar-agent` 服务和 nginx 服务的区别。
+- 结论：nginx 主要是通用数据面反向代理，依赖静态/半动态配置和 reload；`aifar-agent` 是 AIFAR 的单机运行时控制器加代理，负责接收 runtime spec、发现 Docker Pod labels/health、维护 Service/Ingress 监听、滚动切流和状态 API。若只需要固定转发 nginx 足够，若要模拟 K8s Service/Ingress 和滚动更新，需要 agent 这类控制面。
+- 问题：用户要求实现 AIFAR Runtime CPU/Memory/JVM 百分比配置，改配置后不 rebuild 镜像，重启容器即可生效。
+- 结论：已新增 DB metadata `runtimeConfig` 期望态、AIFAR RuntimeConfigModule、`GET/PUT /containers/aifar/runtime/config`、容器页运行参数弹窗；安装/更新/批量更新/扩容脚本改为挂载 `/runtime/env` 并用动态 JVM entrypoint，apply 任务渲染 compose/resource/JVM options 文件，执行 `docker update`，必要时滚动重启或一次性重建缺少动态标签的 Java Pod。
+- 问题：用户询问软件升级时老版本 SQLite 是否自动升级、哪些表/字段会自动创建。
+- 结论：当前 Store.Open 每次启动会运行内嵌 migrate，自动创建缺失表/索引，并只自动补 `resources.part`、`task_logs.target`、`servers.sort_order`、`users.token_version` 四个缺失列；`runtimeConfig` 放在 `app_instances.metadata` 中无需新增表字段，但当前没有 `schema_version`/迁移历史/自动备份/旧 metadata 全量转换，legacy AIFAR 实例不会自动变成新的 runtime-config/k8s-like 模型。
+- 问题：用户要求按新的 agent-only 模型实现 AIFAR 服务安装逻辑重设计。
+- 结论：AIFAR 安装已改为安装前写 `installing` 期望实例、成功写 `installed` 和 release/control-plane、失败写 `install_failed`；同服务器同 installRoot 的非失败实例会阻止重复安装。runtime spec canonical 路径改为 `/aifar/apps/admin/runtime/agent/runtime-spec.json`，脚本与 agent CLI 使用 `reconcile-runtime`，安装失败 cleanup 只清理本 revision Pod/spec/agent runtime instance。前端安装弹窗补充 gateway/web 端口和 JVM 百分比字段。
+- 问题：用户询问当前 AIFAR 安装过程有哪些步骤，以及后续新增很多应用时安装逻辑应抽公共还是每个模块自写。
+- 结论：当前安装链路为 HTTP registry/worker 创建任务，AIFAR 模块校验与生成期望模型，DB 写 `installing`，上传 bundle/agent/script，远程脚本检查 Docker/agent/Nacos、渲染 env/JVM/resource、加载镜像、建网络、构建镜像、启动 Pod、等待 ready、runtime reconcile、Nacos 代理注册、开放端口、写 manifest，最后 DB 写 `installed`/release/control-plane；建议抽“公共安装生命周期骨架+工具库”，保留各应用自己的资源校验、拓扑、脚本渲染、ready/bootstrap 逻辑，避免万能安装器。
+- 问题：用户截图显示 AIFAR 安装 API 返回 400，并说明已重启当前服务。
+- 结论：截图中的 `Content-Length: 176` 对应后端同服务器同 `/aifar/apps/admin` 已存在 AIFAR 实例的拒绝信息；重启服务不会清空 SQLite 控制面状态。已让安装任务把 `taskId` 写入 AIFAR `installing` metadata，并在同 installRoot 重试时复用失败记录、旧版本无 taskId 的 `installing` 记录，或已结束/不存在任务留下的 `installing` 记录；真正 `pending/running/installed` 仍阻止重复安装；`pnpm test` 通过。

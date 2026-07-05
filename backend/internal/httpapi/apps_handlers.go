@@ -445,6 +445,7 @@ func (a *API) installAppName(w http.ResponseWriter, r *http.Request, app string)
 			log.Info(i18n.Text(lang, "api.installPlanPrepared"), len(plan))
 		}
 		if err := module.Install(ctx, moduleReq, registry.RunContext{
+			TaskID:      task.ID,
 			Resources:   resources,
 			Log:         log,
 			Concurrency: a.store.DeploymentConcurrency(a.cfg.DeploymentConcurrency),

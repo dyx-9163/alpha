@@ -103,6 +103,13 @@ func (m Module) ValidateInstall(ctx context.Context, req registry.InstallRequest
 	if err := m.service.ensureDockerRuntimeReady(target, copy); err != nil {
 		return err
 	}
+	server, err := m.service.store.GetServer(target, false)
+	if err != nil {
+		return err
+	}
+	if _, err := m.service.reusableAIFARInstallInstanceID(target, installRootFromDeployDir(server.DeployDir)); err != nil {
+		return err
+	}
 	if topology := strings.TrimSpace(req.Topology); topology != "" && !strings.EqualFold(topology, defaultTopology) {
 		return fmt.Errorf(copy.TopologyUnsupported, topology)
 	}
@@ -129,6 +136,8 @@ func (m Module) Install(ctx context.Context, req registry.InstallRequest, run re
 		Version:    req.Version,
 		Topology:   req.Topology,
 		Language:   req.Language,
+		Actor:      req.Actor,
+		TaskID:     run.TaskID,
 		ServerID:   firstTarget(req),
 		Parameters: req.Parameters,
 	}, run.Resources, run.Log, func(target string) Logger {
@@ -324,6 +333,30 @@ func (m Module) ReconcileRuntime(ctx context.Context, req registry.RuntimeReconc
 		Language: req.Language,
 		Actor:    req.Actor,
 		Reason:   req.Reason,
+	}, run.Log, func(target string) Logger {
+		return run.LoggerForTarget(target)
+	})
+}
+
+func (m Module) ValidateRuntimeConfig(ctx context.Context, req registry.RuntimeConfigRequest) error {
+	return m.service.ValidateRuntimeConfig(ctx, RuntimeConfigRequest{
+		Instance: req.Instance,
+		Server:   req.Server,
+		Language: req.Language,
+		Actor:    req.Actor,
+		Reason:   req.Reason,
+		Config:   req.Config,
+	})
+}
+
+func (m Module) ApplyRuntimeConfig(ctx context.Context, req registry.RuntimeConfigRequest, run registry.RunContext) error {
+	return m.service.ApplyRuntimeConfig(ctx, RuntimeConfigRequest{
+		Instance: req.Instance,
+		Server:   req.Server,
+		Language: req.Language,
+		Actor:    req.Actor,
+		Reason:   req.Reason,
+		Config:   req.Config,
 	}, run.Log, func(target string) Logger {
 		return run.LoggerForTarget(target)
 	})

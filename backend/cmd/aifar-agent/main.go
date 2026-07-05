@@ -38,8 +38,8 @@ func main() {
 			os.Exit(1)
 		}
 		fmt.Println(string(data))
-	case "reconcile-ingress":
-		cmd := flag.NewFlagSet("reconcile-ingress", flag.ExitOnError)
+	case "reconcile-runtime", "reconcile":
+		cmd := flag.NewFlagSet(os.Args[1], flag.ExitOnError)
 		specPath := cmd.String("spec", "", "path to runtime spec json")
 		addr := cmd.String("addr", "127.0.0.1:18081", "agent API address")
 		_ = cmd.Parse(os.Args[2:])
@@ -81,7 +81,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: aifar-agent health | status | reconcile-ingress --spec <file> | remove-instance [--instance admin] | serve [--addr 127.0.0.1:18081]")
+	fmt.Fprintln(os.Stderr, "usage: aifar-agent health | status | reconcile-runtime --spec <file> | remove-instance [--instance admin] | serve [--addr 127.0.0.1:18081]")
 }
 
 func readSpec(path string) (runtimeagent.RuntimeSpec, error) {
@@ -144,7 +144,7 @@ func newAgentHandler(manager *runtimeagent.Manager, healthCheck func(context.Con
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		if err := (runtimeagent.Reconciler{Manager: manager, Log: os.Stdout}).ReconcileIngress(r.Context(), spec); err != nil {
+		if err := (runtimeagent.Reconciler{Manager: manager, Log: os.Stdout}).ReconcileRuntime(r.Context(), spec); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -241,7 +241,7 @@ func agentStatus() map[string]any {
 		"features": []string{
 			"health",
 			"host-proxy",
-			"reconcile-ingress",
+			"reconcile-runtime",
 			"remove-instance",
 			"status",
 		},

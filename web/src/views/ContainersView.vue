@@ -135,6 +135,9 @@
                 <el-option v-for="instance in aifarRuntimeInstances" :key="instance.id" :label="runtimeInstanceLabel(instance)" :value="instance.id" />
               </el-select>
               <el-tooltip :content="aifarRuntimeActionDisabledReason" :disabled="!aifarRuntimeActionDisabledReason" placement="top">
+                <span><el-button size="small" type="primary" :disabled="Boolean(aifarRuntimeActionDisabledReason)" @click="openRuntimeConfigDialog">{{ t('containers.runtimeConfig') }}</el-button></span>
+              </el-tooltip>
+              <el-tooltip :content="aifarRuntimeActionDisabledReason" :disabled="!aifarRuntimeActionDisabledReason" placement="top">
                 <span><el-button size="small" type="primary" plain :disabled="Boolean(aifarRuntimeActionDisabledReason)" @click="openAifarRuntimeBundleUpdate">{{ t('containers.bundleUpdate') }}</el-button></span>
               </el-tooltip>
               <el-tooltip :content="aifarRuntimeActionDisabledReason" :disabled="!aifarRuntimeActionDisabledReason" placement="top">
@@ -304,6 +307,53 @@
         <el-button type="primary" :loading="aifarUpdateSubmitting" @click="submitAifarUpdate">{{ t('apps.aifarUpdateSubmit') }}</el-button>
       </template>
     </el-dialog>
+    <el-dialog v-model="runtimeConfigVisible" :title="t('containers.runtimeConfig')" width="780px" destroy-on-close>
+      <div class="runtime-config-dialog">
+        <KeyValueGrid :items="runtimeConfigMetaItems" />
+        <el-form label-width="148px" class="runtime-config-form">
+          <el-form-item :label="t('containers.runtimeConfigCpu')" required>
+            <el-input v-model="runtimeConfigForm.appCPUs" />
+          </el-form-item>
+          <el-form-item :label="t('containers.runtimeConfigMemory')" required>
+            <el-input v-model="runtimeConfigForm.appMemoryLimit" />
+          </el-form-item>
+          <el-form-item :label="t('containers.jvmInitialRam')" required>
+            <el-input-number v-model="runtimeConfigForm.jvmInitialRAMPercentage" :min="1" :max="90" :step="1" controls-position="right" />
+          </el-form-item>
+          <el-form-item :label="t('containers.jvmMaxRam')" required>
+            <el-input-number v-model="runtimeConfigForm.jvmMaxRAMPercentage" :min="1" :max="90" :step="1" controls-position="right" />
+          </el-form-item>
+        </el-form>
+        <div class="runtime-config-section-title">{{ t('containers.runtimeConfigOverrides') }}</div>
+        <el-table :data="runtimeConfigRows" max-height="300" row-key="serviceName" class="runtime-config-table">
+          <el-table-column prop="serviceName" :label="t('containers.service')" width="120" />
+          <el-table-column :label="t('containers.runtimeConfigCpu')" min-width="130">
+            <template #default="{ row }">
+              <el-input v-model="row.appCPUs" :placeholder="t('containers.inheritGlobal')" />
+            </template>
+          </el-table-column>
+          <el-table-column :label="t('containers.runtimeConfigMemory')" min-width="140">
+            <template #default="{ row }">
+              <el-input v-model="row.appMemoryLimit" :placeholder="t('containers.inheritGlobal')" />
+            </template>
+          </el-table-column>
+          <el-table-column :label="t('containers.jvmInitialRam')" min-width="130">
+            <template #default="{ row }">
+              <el-input v-model="row.jvmInitialRAMPercentage" :disabled="row.serviceName === 'web-vue3'" :placeholder="t('containers.inheritGlobal')" />
+            </template>
+          </el-table-column>
+          <el-table-column :label="t('containers.jvmMaxRam')" min-width="130">
+            <template #default="{ row }">
+              <el-input v-model="row.jvmMaxRAMPercentage" :disabled="row.serviceName === 'web-vue3'" :placeholder="t('containers.inheritGlobal')" />
+            </template>
+          </el-table-column>
+        </el-table>
+      </div>
+      <template #footer>
+        <el-button @click="runtimeConfigVisible = false">{{ t('common.cancel') }}</el-button>
+        <el-button type="primary" :loading="runtimeConfigSubmitting" @click="submitRuntimeConfig">{{ t('containers.applyRuntimeConfig') }}</el-button>
+      </template>
+    </el-dialog>
     <SecretConfirmPrompt
       v-model="deletePromptVisible"
       :title="t('apps.uninstallService')"
@@ -322,7 +372,7 @@ import { computed, onMounted, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import type { UploadFile } from 'element-plus'
 import { useRouter } from 'vue-router'
-import { apiGet, apiPost, apiPostForm, asArray } from '../api/client'
+import { apiGet, apiPost, apiPostForm, apiPut, asArray } from '../api/client'
 import KeyValueGrid from '../components/KeyValueGrid.vue'
 import LogDrawer from '../components/LogDrawer.vue'
 import MetricGrid from '../components/MetricGrid.vue'
@@ -358,6 +408,34 @@ type AifarRuntimeInstance = {
   installRoot?: string
   endpoint?: string
   gatewayEndpoint?: string
+  runtimeConfig?: RuntimeConfigState
+}
+
+type RuntimeConfigValues = {
+  appCPUs?: string
+  appMemoryLimit?: string
+  jvmInitialRAMPercentage?: number
+  jvmMaxRAMPercentage?: number
+}
+
+type RuntimeConfigState = {
+  configVersion?: number
+  updatedAt?: string
+  updatedBy?: string
+  global?: RuntimeConfigValues
+  services?: Record<string, RuntimeConfigValues>
+  appliedVersion?: number
+  lastAppliedAt?: string
+  lastApplyStatus?: string
+  lastApplyError?: string
+}
+
+type RuntimeConfigServiceRow = {
+  serviceName: string
+  appCPUs: string
+  appMemoryLimit: string
+  jvmInitialRAMPercentage: string
+  jvmMaxRAMPercentage: string
 }
 
 type AifarRuntimeAgent = {
@@ -445,6 +523,15 @@ const aifarArtifactFile = ref<File | null>(null)
 const showAifarRuntimeInfra = ref(false)
 const aifarRuntime = ref<AifarRuntimeResponse>({ runtimeStatus: 'unknown', agent: { status: 'unknown' }, instances: [], services: [], pods: [], ingress: [], warnings: [] })
 const selectedRuntimeInstanceId = ref('')
+const runtimeConfigVisible = ref(false)
+const runtimeConfigSubmitting = ref(false)
+const runtimeConfigForm = ref<Required<RuntimeConfigValues>>({
+  appCPUs: '2.0',
+  appMemoryLimit: '2GB',
+  jvmInitialRAMPercentage: 20,
+  jvmMaxRAMPercentage: 70
+})
+const runtimeConfigRows = ref<RuntimeConfigServiceRow[]>([])
 const deletePromptVisible = ref(false)
 const deleteSubmitting = ref(false)
 const canManageContainers = computed(() => can(permissions.containersManage))
@@ -574,6 +661,7 @@ const selectedRuntimeInstance = computed(() => {
   const current = aifarRuntimeInstances.value.find((instance) => instance.id === selectedRuntimeInstanceId.value)
   return current ?? aifarRuntimeInstances.value[0] ?? null
 })
+const selectedRuntimeConfig = computed(() => selectedRuntimeInstance.value?.runtimeConfig ?? defaultRuntimeConfigState())
 const selectedRuntimeAppInstance = computed(() => {
   const runtimeInstance = selectedRuntimeInstance.value
   if (!runtimeInstance) return null
@@ -601,13 +689,25 @@ const aifarRuntimeActionDisabledReason = computed(() => {
 const runtimeSummaryItems = computed(() => {
   const instance = selectedRuntimeInstance.value
   const ingress = selectedRuntimeIngress.value
+  const config = selectedRuntimeConfig.value
   return [
     { label: t('containers.aifarInstance'), value: instance ? runtimeInstanceLabel(instance) : '-' },
     { label: t('containers.installRoot'), value: instance?.installRoot || '-' },
     { label: t('containers.webRoute'), value: ingress?.webRoute || instance?.endpoint || '-' },
     { label: t('containers.gatewayRoute'), value: ingress?.gatewayRoute || instance?.gatewayEndpoint || '-' },
+    { label: t('containers.runtimeConfigVersion'), value: `${config.configVersion ?? '-'} / ${config.appliedVersion ?? '-'}`, status: config.lastApplyStatus || 'unknown' },
     { label: t('containers.ingress'), value: ingress?.container || '-', status: ingress?.status || 'unknown' },
     { label: t('containers.agent'), value: aifarRuntime.value.agent?.version || aifarRuntime.value.agent?.status || '-', status: aifarRuntime.value.agent?.status || 'unknown' }
+  ]
+})
+const runtimeConfigMetaItems = computed(() => {
+  const config = selectedRuntimeConfig.value
+  return [
+    { label: t('containers.runtimeConfigDesiredVersion'), value: config.configVersion ?? '-' },
+    { label: t('containers.runtimeConfigAppliedVersion'), value: config.appliedVersion ?? '-' },
+    { label: t('containers.lastApplyStatus'), value: runtimeApplyStatusLabel(config.lastApplyStatus), status: config.lastApplyStatus || 'unknown' },
+    { label: t('containers.lastAppliedAt'), value: config.lastAppliedAt || '-' },
+    { label: t('containers.lastApplyError'), value: config.lastApplyError || '-' }
   ]
 })
 
@@ -946,6 +1046,12 @@ function aifarRuntimeStatusLabel(status?: string) {
   return value === key ? String(status || t('common.unknown')) : value
 }
 
+function runtimeApplyStatusLabel(status?: string) {
+  const key = `containers.runtimeApplyStatus.${String(status || 'unknown').trim() || 'unknown'}`
+  const value = t(key)
+  return value === key ? String(status || t('common.unknown')) : value
+}
+
 function percentText(value?: number) {
   const n = Number(value || 0)
   if (!Number.isFinite(n) || n <= 0) {
@@ -954,10 +1060,115 @@ function percentText(value?: number) {
   return `${n.toFixed(1)}%`
 }
 
+function defaultRuntimeConfigState(): RuntimeConfigState {
+  return {
+    configVersion: 1,
+    appliedVersion: 1,
+    lastApplyStatus: 'applied',
+    global: {
+      appCPUs: '2.0',
+      appMemoryLimit: '2GB',
+      jvmInitialRAMPercentage: 20,
+      jvmMaxRAMPercentage: 70
+    },
+    services: {}
+  }
+}
+
+function normalizedRuntimeValues(values?: RuntimeConfigValues): Required<RuntimeConfigValues> {
+  return {
+    appCPUs: String(values?.appCPUs || '2.0').trim(),
+    appMemoryLimit: String(values?.appMemoryLimit || '2GB').trim(),
+    jvmInitialRAMPercentage: Number(values?.jvmInitialRAMPercentage || 20),
+    jvmMaxRAMPercentage: Number(values?.jvmMaxRAMPercentage || 70)
+  }
+}
+
+function runtimeConfigNumberText(value?: number) {
+  if (value === undefined || value === null || Number(value) <= 0) {
+    return ''
+  }
+  return String(value)
+}
+
 function runtimeInstanceLabel(instance: AifarRuntimeInstance) {
   const model = instance.orchestrationModel || t('common.unknown')
   const root = instance.installRoot || instance.id
   return `${instance.version || 'aifar'} / ${model} / ${root}`
+}
+
+function openRuntimeConfigDialog() {
+  const reason = aifarRuntimeActionDisabledReason.value
+  if (reason) {
+    ElMessage.warning(reason)
+    return
+  }
+  const state = selectedRuntimeConfig.value
+  const global = normalizedRuntimeValues(state.global)
+  runtimeConfigForm.value = { ...global }
+  const overrides = state.services || {}
+  const services = selectedRuntimeServices.value.length
+    ? selectedRuntimeServices.value.map((item) => item.serviceName)
+    : aifarServiceOptions.map((item) => item.value)
+  runtimeConfigRows.value = services.map((serviceName) => {
+    const values = overrides[serviceName] || {}
+    return {
+      serviceName,
+      appCPUs: String(values.appCPUs || '').trim(),
+      appMemoryLimit: String(values.appMemoryLimit || '').trim(),
+      jvmInitialRAMPercentage: serviceName === 'web-vue3' ? '' : runtimeConfigNumberText(values.jvmInitialRAMPercentage),
+      jvmMaxRAMPercentage: serviceName === 'web-vue3' ? '' : runtimeConfigNumberText(values.jvmMaxRAMPercentage)
+    }
+  })
+  runtimeConfigVisible.value = true
+}
+
+function validateRuntimeConfigValues(values: Required<RuntimeConfigValues>) {
+  const cpuPattern = /^[0-9]+(\.[0-9]+)?$/
+  const memoryPattern = /^[1-9][0-9]*(b|k|m|g|kb|mb|gb|kib|mib|gib)?$/i
+  if (!cpuPattern.test(values.appCPUs) || Number(values.appCPUs) <= 0) return t('containers.runtimeConfigCpuInvalid')
+  if (!memoryPattern.test(values.appMemoryLimit)) return t('containers.runtimeConfigMemoryInvalid')
+  if (!Number.isFinite(values.jvmInitialRAMPercentage) || !Number.isFinite(values.jvmMaxRAMPercentage)) return t('containers.runtimeConfigJvmInvalid')
+  if (values.jvmInitialRAMPercentage <= 0 || values.jvmMaxRAMPercentage <= 0 || values.jvmMaxRAMPercentage > 90) return t('containers.runtimeConfigJvmInvalid')
+  if (values.jvmInitialRAMPercentage > values.jvmMaxRAMPercentage) return t('containers.runtimeConfigJvmOrderInvalid')
+  return ''
+}
+
+function optionalRuntimeNumber(value: string) {
+  const text = String(value || '').trim()
+  if (!text) return undefined
+  const n = Number(text)
+  return Number.isFinite(n) ? n : Number.NaN
+}
+
+function buildRuntimeServiceOverrides() {
+  const services: Record<string, RuntimeConfigValues> = {}
+  for (const row of runtimeConfigRows.value) {
+    const values: RuntimeConfigValues = {}
+    if (row.appCPUs.trim()) values.appCPUs = row.appCPUs.trim()
+    if (row.appMemoryLimit.trim()) values.appMemoryLimit = row.appMemoryLimit.trim()
+    if (row.serviceName !== 'web-vue3') {
+      const initial = optionalRuntimeNumber(row.jvmInitialRAMPercentage)
+      const max = optionalRuntimeNumber(row.jvmMaxRAMPercentage)
+      if (initial !== undefined) {
+        if (!Number.isFinite(initial)) throw new Error(`${row.serviceName}: ${t('containers.runtimeConfigJvmInvalid')}`)
+        values.jvmInitialRAMPercentage = initial
+      }
+      if (max !== undefined) {
+        if (!Number.isFinite(max)) throw new Error(`${row.serviceName}: ${t('containers.runtimeConfigJvmInvalid')}`)
+        values.jvmMaxRAMPercentage = max
+      }
+    }
+    if (Object.keys(values).length) {
+      const effective = normalizedRuntimeValues({ ...runtimeConfigForm.value, ...values })
+      const err = validateRuntimeConfigValues(effective)
+      if (err) {
+        throw new Error(`${row.serviceName}: ${err}`)
+      }
+      services[row.serviceName] = values
+    }
+  }
+  return services
 }
 
 function isAifarUpdatableContainer(row: any) {
@@ -1122,6 +1333,58 @@ async function submitAifarUpdate() {
     ElMessage.error(err instanceof Error ? err.message : t('apps.aifarUpdateFailed'))
   } finally {
     aifarUpdateSubmitting.value = false
+  }
+}
+
+async function submitRuntimeConfig() {
+  const reason = aifarRuntimeActionDisabledReason.value
+  if (reason) {
+    ElMessage.warning(reason)
+    return
+  }
+  const instanceId = selectedRuntimeInstance.value?.id
+  if (!instanceId) {
+    ElMessage.warning(t('containers.selectAifarInstance'))
+    return
+  }
+  const global = normalizedRuntimeValues(runtimeConfigForm.value)
+  const validation = validateRuntimeConfigValues(global)
+  if (validation) {
+    ElMessage.warning(validation)
+    return
+  }
+  let services: Record<string, RuntimeConfigValues>
+  try {
+    services = buildRuntimeServiceOverrides()
+  } catch (err) {
+    ElMessage.warning(err instanceof Error ? err.message : t('containers.runtimeConfigInvalid'))
+    return
+  }
+  try {
+    await ElMessageBox.confirm(t('containers.confirmApplyRuntimeConfig'), t('containers.runtimeConfig'), {
+      type: 'warning',
+      confirmButtonText: t('containers.applyRuntimeConfig'),
+      cancelButtonText: t('common.cancel')
+    })
+  } catch {
+    return
+  }
+  const query = targetQuery()
+  runtimeConfigSubmitting.value = true
+  try {
+    const result = await apiPut<{ taskId: string }>(`/containers/aifar/runtime/config?${query}`, {
+      instanceId,
+      global,
+      services
+    })
+    runtimeConfigVisible.value = false
+    ElMessage.success(t('containers.runtimeConfigApplyStarted'))
+    void router.push({ path: '/tasks', query: { taskId: result.taskId } })
+    void loadAifarRuntime()
+  } catch (err) {
+    ElMessage.error(err instanceof Error ? err.message : t('containers.runtimeActionFailed'))
+  } finally {
+    runtimeConfigSubmitting.value = false
   }
 }
 
@@ -1392,6 +1655,36 @@ onMounted(async () => {
   line-height: 18px;
 }
 
+.runtime-config-dialog {
+  display: grid;
+  gap: 12px;
+}
+
+.runtime-config-form {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0 12px;
+}
+
+.runtime-config-form :deep(.el-form-item) {
+  margin-bottom: 12px;
+}
+
+.runtime-config-form :deep(.el-input),
+.runtime-config-form :deep(.el-input-number) {
+  width: 100%;
+}
+
+.runtime-config-section-title {
+  color: var(--aifar-ink);
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.runtime-config-table :deep(.el-input) {
+  width: 100%;
+}
+
 .settings-grid {
   display: grid;
   gap: 12px;
@@ -1424,6 +1717,10 @@ onMounted(async () => {
 
   .runtime-instance-select {
     width: 100%;
+  }
+
+  .runtime-config-form {
+    grid-template-columns: 1fr;
   }
 }
 </style>

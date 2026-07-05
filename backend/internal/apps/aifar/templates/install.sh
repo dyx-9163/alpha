@@ -16,13 +16,16 @@ RUNTIME_DIR="$INSTALL_ROOT/runtime"
 APP_DIR="$RUNTIME_DIR/docker-apps"
 IMAGE_DIR="$RUNTIME_DIR/docker-images"
 ENV_DIR="$RUNTIME_DIR/env"
-INGRESS_DIR="$RUNTIME_DIR/ingress"
+AGENT_DIR="$RUNTIME_DIR/agent"
 AIFAR_DIR="$INSTALL_ROOT/.aifar"
 TMP_DIR="$INSTALL_ROOT/.extract-$REVISION-$$"
+INSTALL_SUCCEEDED=0
 
 TIMEZONE={{ quote .Options.Timezone }}
 APP_CPUS={{ quote .Options.AppCPUs }}
 APP_MEMORY_LIMIT={{ quote .Options.AppMemoryLimit }}
+JVM_INITIAL_RAM_PERCENTAGE={{ quote .Options.JVMInitialRAMPercentage }}
+JVM_MAX_RAM_PERCENTAGE={{ quote .Options.JVMMaxRAMPercentage }}
 GATEWAY_PORT={{ quote .Options.GatewayPort }}
 WEB_VUE3_PORT={{ quote .Options.WebPort }}
 NACOS_PORT_WEB={{ quote .Options.NacosWebPort }}
@@ -281,8 +284,11 @@ write_compose_env() {
   set_env AIFAR_REVISION "$REVISION" "$compose_env"
   set_env AIFAR_NETWORK "$INGRESS_NETWORK" "$compose_env"
   set_env TZ "$TIMEZONE" "$compose_env"
+  set_env AIFAR_RUNTIME_CONFIG_VERSION "1" "$compose_env"
   set_env APP_CPUS "$APP_CPUS" "$compose_env"
   set_env APP_MEMORY_LIMIT "$APP_MEMORY_LIMIT" "$compose_env"
+  set_env JVM_INITIAL_RAM_PERCENTAGE "$JVM_INITIAL_RAM_PERCENTAGE" "$compose_env"
+  set_env JVM_MAX_RAM_PERCENTAGE "$JVM_MAX_RAM_PERCENTAGE" "$compose_env"
   set_env APP_RESTART_POLICY "$(read_env_value "$source_env" APP_RESTART_POLICY unless-stopped)" "$compose_env"
   set_env APP_HEALTH_PROTOCOL "$(read_env_value "$source_env" APP_HEALTH_PROTOCOL http)" "$compose_env"
   set_env APP_HEALTH_HOST "$(read_env_value "$source_env" APP_HEALTH_HOST 127.0.0.1)" "$compose_env"
@@ -321,6 +327,59 @@ write_java_env() {
   set_env NACOS_PASSWORD "$NACOS_PASSWORD" "$secrets_env"
   chmod 0644 "$common_env"
   chmod 0600 "$secrets_env"
+}
+
+resource_file_for_service() {
+  printf "%s/resource.%s.env" "$ENV_DIR" "$1"
+}
+
+resource_value() {
+  service="$1"
+  key="$2"
+  fallback="$3"
+  file="$(resource_file_for_service "$service")"
+  read_env_value "$file" "$key" "$fallback"
+}
+
+write_jvm_options() {
+  file="$1"
+  initial="$2"
+  max="$3"
+  cat > "$file" <<EOF
+-XX:+UseContainerSupport
+-XX:InitialRAMPercentage=${initial}
+-XX:MaxRAMPercentage=${max}
+-XX:+ExitOnOutOfMemoryError
+EOF
+  chmod 0644 "$file"
+}
+
+write_runtime_resource_files() {
+  write_jvm_options "$ENV_DIR/java-jvm.options" "$JVM_INITIAL_RAM_PERCENTAGE" "$JVM_MAX_RAM_PERCENTAGE"
+  for service in $SERVICE_ORDER; do
+    resource_file="$(resource_file_for_service "$service")"
+    : > "$resource_file"
+    set_env APP_CPUS "$APP_CPUS" "$resource_file"
+    set_env APP_MEMORY_LIMIT "$APP_MEMORY_LIMIT" "$resource_file"
+    chmod 0644 "$resource_file"
+    [ "$service" = "web-vue3" ] || write_jvm_options "$ENV_DIR/java-jvm.$service.options" "$JVM_INITIAL_RAM_PERCENTAGE" "$JVM_MAX_RAM_PERCENTAGE"
+  done
+}
+
+java_start_command() {
+  cat <<'EOF'
+opts_file="/opt/aifar/runtime/env/java-jvm.${AIFAR_SERVICE_NAME}.options"
+[ -f "$opts_file" ] || opts_file="/opt/aifar/runtime/env/java-jvm.options"
+java_opts=""
+[ -f "$opts_file" ] && java_opts="$(tr '\n' ' ' < "$opts_file")"
+jar="aifar-${AIFAR_SERVICE_NAME}.jar"
+[ -f app.jar ] && jar="app.jar"
+if [ ! -f "$jar" ]; then
+  jar="$(find . -maxdepth 1 -type f -name '*.jar' 2>/dev/null | head -n 1 | sed 's#^\./##')"
+fi
+[ -n "$jar" ] && [ -f "$jar" ] || { echo "AIFAR jar is missing for ${AIFAR_SERVICE_NAME}" >&2; exit 1; }
+exec java $java_opts --add-opens=java.base/java.lang=ALL-UNNAMED --add-opens=java.base/java.lang.reflect=ALL-UNNAMED --add-opens=java.base/java.lang.invoke=ALL-UNNAMED --add-opens=java.base/java.math=ALL-UNNAMED --add-opens=java.base/sun.net.util=ALL-UNNAMED --add-opens=java.base/java.io=ALL-UNNAMED --add-opens=java.base/java.net=ALL-UNNAMED --add-opens=java.base/java.nio=ALL-UNNAMED --add-opens=java.base/java.security=ALL-UNNAMED --add-opens=java.base/java.text=ALL-UNNAMED --add-opens=java.base/java.time=ALL-UNNAMED --add-opens=java.base/java.util=ALL-UNNAMED --add-opens=java.base/jdk.internal.module=ALL-UNNAMED --add-opens=java.base/sun.security.util=ALL-UNNAMED -Dfile.encoding=utf8 -Djava.security.egd=file:/dev/./urandom -jar "$jar"
+EOF
 }
 
 strip_web_nginx_runtime_routes() {
@@ -458,35 +517,67 @@ start_pod() {
   health_start_period="$(read_env_value "$ENV_DIR/compose.env" APP_HEALTH_START_PERIOD 30s)"
   restart_policy="$(read_env_value "$ENV_DIR/compose.env" APP_RESTART_POLICY unless-stopped)"
   health_cmd="$(health_cmd_for_service "$service")"
+  app_cpus="$(resource_value "$service" APP_CPUS "$APP_CPUS")"
+  app_memory_limit="$(resource_value "$service" APP_MEMORY_LIMIT "$APP_MEMORY_LIMIT")"
   resource_args=""
-  [ -z "$APP_CPUS" ] || resource_args="$resource_args --cpus $APP_CPUS"
-  [ -z "$APP_MEMORY_LIMIT" ] || resource_args="$resource_args --memory $APP_MEMORY_LIMIT"
+  [ -z "$app_cpus" ] || resource_args="$resource_args --cpus $app_cpus"
+  [ -z "$app_memory_limit" ] || resource_args="$resource_args --memory $app_memory_limit --memory-swap $app_memory_limit"
   docker rm -f "$container" >/dev/null 2>&1 || true
   env_args="--env-file $service_env"
   if [ "$service" != "web-vue3" ]; then
     env_args="--env-file $ENV_DIR/java-common.env --env-file $ENV_DIR/java-secrets.env --env-file $service_env"
+    java_cmd="$(java_start_command)"
+    # shellcheck disable=SC2086
+    docker run -d \
+      --name "$container" \
+      --restart "$restart_policy" \
+      --label aifar.app=aifar \
+      --label "aifar.install-root=$INSTALL_ROOT" \
+      --label "aifar.component=pod" \
+      --label "aifar.service=$service" \
+      --label "aifar.revision=$REVISION" \
+      --label "aifar.pod=$service-$REVISION-r$replica" \
+      --label "aifar.replica=$replica" \
+      --label aifar.dynamic-jvm=true \
+      --network "$INGRESS_NETWORK" \
+      $resource_args \
+      --health-cmd "$health_cmd" \
+      --health-interval "$health_interval" \
+      --health-timeout "$health_timeout" \
+      --health-retries "$health_retries" \
+      --health-start-period "$health_start_period" \
+      -e "APP_CONTAINER_NAME=$container" \
+      -e "AIFAR_SERVICE_NAME=$service" \
+      -e "TZ=$TIMEZONE" \
+      $env_args \
+      -v "$ENV_DIR:/opt/aifar/runtime/env:ro" \
+      --entrypoint /bin/sh \
+      "$image" -c "$java_cmd" >/dev/null
+  else
+    # shellcheck disable=SC2086
+    docker run -d \
+      --name "$container" \
+      --restart "$restart_policy" \
+      --label aifar.app=aifar \
+      --label "aifar.install-root=$INSTALL_ROOT" \
+      --label "aifar.component=pod" \
+      --label "aifar.service=$service" \
+      --label "aifar.revision=$REVISION" \
+      --label "aifar.pod=$service-$REVISION-r$replica" \
+      --label "aifar.replica=$replica" \
+      --label aifar.dynamic-jvm=false \
+      --network "$INGRESS_NETWORK" \
+      $resource_args \
+      --health-cmd "$health_cmd" \
+      --health-interval "$health_interval" \
+      --health-timeout "$health_timeout" \
+      --health-retries "$health_retries" \
+      --health-start-period "$health_start_period" \
+      -e "APP_CONTAINER_NAME=$container" \
+      -e "TZ=$TIMEZONE" \
+      $env_args \
+      "$image" >/dev/null
   fi
-  # shellcheck disable=SC2086
-  docker run -d \
-    --name "$container" \
-    --restart "$restart_policy" \
-    --label aifar.app=aifar \
-    --label "aifar.install-root=$INSTALL_ROOT" \
-    --label "aifar.component=pod" \
-    --label "aifar.service=$service" \
-    --label "aifar.revision=$REVISION" \
-    --label "aifar.pod=$service-$REVISION-r$replica" \
-    --label "aifar.replica=$replica" \
-    --network "$INGRESS_NETWORK" \
-    $resource_args \
-    --health-cmd "$health_cmd" \
-    --health-interval "$health_interval" \
-    --health-timeout "$health_timeout" \
-    --health-retries "$health_retries" \
-    --health-start-period "$health_start_period" \
-    -e "TZ=$TIMEZONE" \
-    $env_args \
-    "$image" >/dev/null
   echo "AIFAR Pod started: $service revision=$REVISION replica=$replica container=$container"
 }
 
@@ -518,8 +609,8 @@ wait_initial_pods_ready() {
 }
 
 write_runtime_spec() {
-  spec="$INGRESS_DIR/runtime-spec.json"
-  mkdir -p "$INGRESS_DIR"
+  spec="$AGENT_DIR/runtime-spec.json"
+  mkdir -p "$AGENT_DIR"
   cat > "$spec" <<JSON
 {
   "version": "runtime-v1",
@@ -553,23 +644,23 @@ JSON
   printf "%s" "$spec"
 }
 
-reconcile_ingress() {
+reconcile_runtime() {
   check_agent_dependency
   spec="$(write_runtime_spec)"
   echo "reconciling AIFAR runtime through aifar-agent: $spec"
-  aifar-agent reconcile-ingress --spec "$spec"
+  aifar-agent reconcile-runtime --spec "$spec"
   wait_runtime_ports
 }
 
 wait_runtime_ports() {
   for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do
     if tcp_probe 127.0.0.1 "$GATEWAY_PORT" && tcp_probe 127.0.0.1 "$WEB_VUE3_PORT"; then
-      echo "AIFAR runtime ingress ports are listening: gateway=$GATEWAY_PORT web=$WEB_VUE3_PORT"
+      echo "AIFAR runtime ports are listening: gateway=$GATEWAY_PORT web=$WEB_VUE3_PORT"
       return 0
     fi
     sleep 1
   done
-  echo "AIFAR runtime ingress ports are not listening after reconcile"
+  echo "AIFAR runtime ports are not listening after reconcile"
   aifar-agent status || true
   $SUDO systemctl --no-pager --full status aifar-agent || true
   $SUDO journalctl -u aifar-agent -n 80 --no-pager || true
@@ -592,8 +683,12 @@ JSON
 }
 
 cleanup_failed_install() {
-  pods="$(docker ps -a --filter "label=aifar.app=aifar" --filter "label=aifar.install-root=$INSTALL_ROOT" --filter "label=aifar.component=pod" --format '{{ "{{" }}.Names{{ "}}" }}' 2>/dev/null || true)"
+  [ "$INSTALL_SUCCEEDED" = "1" ] && return 0
+  pods="$(docker ps -a --filter "label=aifar.app=aifar" --filter "label=aifar.install-root=$INSTALL_ROOT" --filter "label=aifar.component=pod" --filter "label=aifar.revision=$REVISION" --format '{{ "{{" }}.Names{{ "}}" }}' 2>/dev/null || true)"
   [ -z "$pods" ] || docker rm -f $pods >/dev/null 2>&1 || true
+  rm -f "$AGENT_DIR/runtime-spec.json" >/dev/null 2>&1 || true
+  command -v aifar-agent >/dev/null 2>&1 && aifar-agent remove-instance --instance admin >/dev/null 2>&1 || true
+  rm -rf "$TMP_DIR" >/dev/null 2>&1 || true
 }
 
 command -v docker >/dev/null 2>&1 || fail "docker command is required"
@@ -602,7 +697,7 @@ command -v tar >/dev/null 2>&1 || fail "tar command is required"
 [ -f "$ARCHIVE" ] || fail "bundle archive not found: $ARCHIVE"
 check_agent_dependency
 
-mkdir -p "$INSTALL_ROOT" "$WORK_DIR" "$RUNTIME_DIR" "$ENV_DIR" "$INGRESS_DIR" "$AIFAR_DIR"
+mkdir -p "$INSTALL_ROOT" "$WORK_DIR" "$RUNTIME_DIR" "$ENV_DIR" "$AGENT_DIR" "$AIFAR_DIR"
 rm -rf "$TMP_DIR" "$APP_DIR" "$IMAGE_DIR"
 mkdir -p "$TMP_DIR"
 tar -xzf "$ARCHIVE" -C "$TMP_DIR"
@@ -613,12 +708,13 @@ if [ -d "$TMP_DIR/docker-images" ]; then
 fi
 rm -rf "$TMP_DIR"
 
-trap 'cleanup_failed_install' INT TERM
+trap 'cleanup_failed_install' EXIT INT TERM
 check_nacos_dependency
 resolve_system_timezone
 write_compose_env
 write_java_env
 write_service_envs
+write_runtime_resource_files
 strip_web_nginx_runtime_routes
 load_docker_images
 require_local_image "bellsoft/liberica-openjre-rocky:21"
@@ -635,7 +731,7 @@ if ! wait_initial_pods_ready; then
   fail "AIFAR initial Pods did not become stable"
 fi
 
-reconcile_ingress
+reconcile_runtime
 
 for service in $SERVICE_ORDER; do
   [ "$service" = "web-vue3" ] && continue
@@ -646,5 +742,6 @@ done
 open_firewall_ports "$GATEWAY_PORT" "$WEB_VUE3_PORT"
 allow_selinux_ports http_port_t "$GATEWAY_PORT" "$WEB_VUE3_PORT"
 write_model_manifest
-trap - INT TERM
+INSTALL_SUCCEEDED=1
+trap - EXIT INT TERM
 echo "AIFAR k8s-like orchestration installed, revision $REVISION"

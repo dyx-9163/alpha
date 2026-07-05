@@ -36,16 +36,16 @@ func (s Service) ReconcileRuntime(ctx context.Context, req RuntimeReconcileReque
 		finishTarget(recorder, target, "failed", err.Error())
 		return err
 	}
-	specPath := stringFromMetadata(metadata, "runtimeSpecPath", installRoot+"/runtime/ingress/runtime-spec.json")
+	specPath := stringFromMetadata(metadata, "runtimeSpecPath", runtimeSpecPath(installRoot))
 	command := "command -v aifar-agent >/dev/null 2>&1 || { echo 'aifar-agent is not installed' >&2; exit 1; }; " +
 		"test -f " + installerkit.ShellQuote(specPath) + " || { echo 'AIFAR runtime spec is missing' >&2; exit 1; }; " +
-		"aifar-agent reconcile-ingress --spec " + installerkit.ShellQuote(specPath)
-	logForServer.Info("reconciling AIFAR runtime ingress for instance %s", current.ID)
+		"aifar-agent reconcile-runtime --spec " + installerkit.ShellQuote(specPath)
+	logForServer.Info("reconciling AIFAR runtime for instance %s", current.ID)
 	if _, err := installerkit.Run(ctx, s.remote, req.Server, command, logForServer, "AIFAR runtime reconcile failed"); err != nil {
 		finishTarget(recorder, target, "failed", err.Error())
 		return err
 	}
-	logForServer.Info("AIFAR runtime ingress reconciled for instance %s", current.ID)
+	logForServer.Info("AIFAR runtime reconciled for instance %s", current.ID)
 	finishTarget(recorder, target, "success", "")
 	return nil
 }

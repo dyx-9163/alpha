@@ -86,6 +86,10 @@ export const aifarMessages = {
     networkName: 'Docker network',
     appCPUs: 'CPU limit',
     appMemoryLimit: 'Memory limit',
+    gatewayPort: 'Gateway entry port',
+    webPort: 'Web entry port',
+    jvmInitialRAMPercentage: 'JVM initial RAM %',
+    jvmMaxRAMPercentage: 'JVM max RAM %',
     selectedServices: 'Install modules',
     selectedServicesPlaceholder: 'Select AIFAR modules to install',
     selectedServicesRequired: 'At least gateway and web-vue3 are required',
@@ -114,6 +118,8 @@ export const aifarMessages = {
     nacosPassword: 'Nacos password',
     nacosNamespace: 'Nacos namespace',
     portInvalid: 'Port must be between 1 and 65535',
+    numberInvalid: 'Value is outside the allowed range',
+    jvmRangeInvalid: 'JVM initial RAM percentage must be less than or equal to max RAM percentage',
     textRequired: 'This value is required',
     networkInvalid: 'Docker network name must not contain whitespace'
   }
@@ -158,6 +164,10 @@ export function aifarInstallDialogProps(locale?: string, context?: AppInstallDia
       networkField(copy),
       requiredText('appCPUs', copy.appCPUs, '2.0', copy),
       requiredText('appMemoryLimit', copy.appMemoryLimit, '2GB', copy),
+      portField('gatewayPort', labelText(copy, 'gatewayPort', 'Gateway entry port'), 38000, copy),
+      portField('webPort', labelText(copy, 'webPort', 'Web entry port'), 8080, copy),
+      percentageField('jvmInitialRAMPercentage', labelText(copy, 'jvmInitialRAMPercentage', 'JVM initial RAM %'), 20, copy),
+      percentageField('jvmMaxRAMPercentage', labelText(copy, 'jvmMaxRAMPercentage', 'JVM max RAM %'), 70, copy),
       selectedServicesField(copy),
       selectField('nacosSource', copy.nacosSource, [
         { label: copy.nacosSourceExisting, value: 'existing', disabled: nacosOptions.length === 0 },
@@ -273,6 +283,36 @@ function portField(name: string, label: string, defaultValue: number, copy: Retu
       return Number.isInteger(port) && port >= min && port <= max ? undefined : copy.portInvalid
     }
   }
+}
+
+function percentageField(name: string, label: string, defaultValue: number, copy: ReturnType<typeof aifarCopy>) {
+  return {
+    name,
+    label,
+    type: 'number' as const,
+    defaultValue,
+    required: true,
+    min: 1,
+    max: 90,
+    step: 1,
+    validate: (value: unknown, values: AppInstallFieldValues) => {
+      const current = Number(value)
+      if (!Number.isFinite(current) || current < 1 || current > 90) {
+        return labelText(copy, 'numberInvalid', 'Value is outside the allowed range')
+      }
+      const initial = Number(values.jvmInitialRAMPercentage ?? 20)
+      const max = Number(values.jvmMaxRAMPercentage ?? 70)
+      if (Number.isFinite(initial) && Number.isFinite(max) && initial > max) {
+        return labelText(copy, 'jvmRangeInvalid', 'JVM initial RAM percentage must be less than or equal to max RAM percentage')
+      }
+      return undefined
+    }
+  }
+}
+
+function labelText(copy: ReturnType<typeof aifarCopy>, key: string, fallback: string) {
+  const value = (copy as Record<string, unknown>)[key]
+  return typeof value === 'string' && value.trim() ? value : fallback
 }
 
 function selectField(

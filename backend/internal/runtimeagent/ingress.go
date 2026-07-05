@@ -24,7 +24,7 @@ type Reconciler struct {
 	Log     io.Writer
 }
 
-func (r Reconciler) ReconcileIngress(ctx context.Context, spec RuntimeSpec) error {
+func (r Reconciler) ReconcileRuntime(ctx context.Context, spec RuntimeSpec) error {
 	if r.Manager == nil {
 		return errors.New("runtime manager is required")
 	}
@@ -33,6 +33,10 @@ func (r Reconciler) ReconcileIngress(ctx context.Context, spec RuntimeSpec) erro
 	}
 	logf(r.Log, "AIFAR agent reconciled runtime instance %s\n", NormalizeSpec(spec).InstanceID)
 	return nil
+}
+
+func (r Reconciler) ReconcileIngress(ctx context.Context, spec RuntimeSpec) error {
+	return r.ReconcileRuntime(ctx, spec)
 }
 
 type ManagerOptions struct {
@@ -193,7 +197,7 @@ func (m *Manager) Status() map[string]any {
 		"features": []string{
 			"health",
 			"host-proxy",
-			"reconcile-ingress",
+			"reconcile-runtime",
 			"status",
 		},
 	}
@@ -374,7 +378,7 @@ func validateRuntimeSpec(spec RuntimeSpec) error {
 		return errors.New("runtime network is required")
 	}
 	if spec.Ingress.GatewayPort <= 0 || spec.Ingress.WebPort <= 0 {
-		return errors.New("ingress ports must be positive")
+		return errors.New("runtime proxy ports must be positive")
 	}
 	if spec.Ingress.GatewayPort == spec.Ingress.WebPort {
 		return errors.New("gateway and web ingress ports must be different")

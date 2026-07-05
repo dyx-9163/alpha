@@ -3,6 +3,7 @@ package aifar
 import (
 	"archive/tar"
 	"compress/gzip"
+	"encoding/json"
 	"fmt"
 	"io"
 	"io/fs"
@@ -65,21 +66,23 @@ var reverseServiceOrder = []string{
 }
 
 type InstallOptions struct {
-	Timezone         string
-	NetworkName      string
-	AppCPUs          string
-	AppMemoryLimit   string
-	GatewayPort      int
-	WebPort          int
-	NacosWebPort     int
-	NacosAPIPort     int
-	NacosSource      string
-	NacosInstanceID  string
-	NacosHost        string
-	NacosUser        string
-	NacosPassword    string
-	NacosNamespace   string
-	SelectedServices []string
+	Timezone                string
+	NetworkName             string
+	AppCPUs                 string
+	AppMemoryLimit          string
+	JVMInitialRAMPercentage float64
+	JVMMaxRAMPercentage     float64
+	GatewayPort             int
+	WebPort                 int
+	NacosWebPort            int
+	NacosAPIPort            int
+	NacosSource             string
+	NacosInstanceID         string
+	NacosHost               string
+	NacosUser               string
+	NacosPassword           string
+	NacosNamespace          string
+	SelectedServices        []string
 }
 
 type Bundle struct {
@@ -91,24 +94,28 @@ type Bundle struct {
 
 func optionsFromParameters(parameters map[string]any) InstallOptions {
 	opts := InstallOptions{
-		Timezone:         defaultTimezone,
-		NetworkName:      defaultNetworkName,
-		AppCPUs:          defaultAppCPUs,
-		AppMemoryLimit:   defaultMemoryLimit,
-		GatewayPort:      defaultGatewayPort,
-		WebPort:          defaultWebPort,
-		NacosWebPort:     defaultNacosWebPort,
-		NacosAPIPort:     defaultNacosAPIPort,
-		NacosSource:      dependencyManual,
-		NacosUser:        defaultNacosUser,
-		NacosPassword:    defaultNacosPassword,
-		NacosNamespace:   defaultNacosNS,
-		SelectedServices: defaultInstallServices(),
+		Timezone:                defaultTimezone,
+		NetworkName:             defaultNetworkName,
+		AppCPUs:                 defaultAppCPUs,
+		AppMemoryLimit:          defaultMemoryLimit,
+		JVMInitialRAMPercentage: defaultJVMInitialRAMPercentage,
+		JVMMaxRAMPercentage:     defaultJVMMaxRAMPercentage,
+		GatewayPort:             defaultGatewayPort,
+		WebPort:                 defaultWebPort,
+		NacosWebPort:            defaultNacosWebPort,
+		NacosAPIPort:            defaultNacosAPIPort,
+		NacosSource:             dependencyManual,
+		NacosUser:               defaultNacosUser,
+		NacosPassword:           defaultNacosPassword,
+		NacosNamespace:          defaultNacosNS,
+		SelectedServices:        defaultInstallServices(),
 	}
 	opts.Timezone = stringParam(parameters, "timezone", opts.Timezone)
 	opts.NetworkName = stringParam(parameters, "networkName", opts.NetworkName)
 	opts.AppCPUs = stringParam(parameters, "appCPUs", opts.AppCPUs)
 	opts.AppMemoryLimit = stringParam(parameters, "appMemoryLimit", opts.AppMemoryLimit)
+	opts.JVMInitialRAMPercentage = floatParam(parameters, "jvmInitialRAMPercentage", opts.JVMInitialRAMPercentage)
+	opts.JVMMaxRAMPercentage = floatParam(parameters, "jvmMaxRAMPercentage", opts.JVMMaxRAMPercentage)
 	opts.GatewayPort = intParam(parameters, "gatewayPort", opts.GatewayPort)
 	opts.WebPort = intParam(parameters, "webPort", opts.WebPort)
 	opts.NacosWebPort = intParam(parameters, "nacosWebPort", opts.NacosWebPort)
@@ -150,6 +157,14 @@ func (o InstallOptions) Validate() error {
 		if strings.ContainsAny(value, "\r\n") {
 			return fmt.Errorf("%s must not contain newlines", name)
 		}
+	}
+	if err := validateRuntimeConfigValues(RuntimeConfigValues{
+		AppCPUs:                 o.AppCPUs,
+		AppMemoryLimit:          o.AppMemoryLimit,
+		JVMInitialRAMPercentage: o.JVMInitialRAMPercentage,
+		JVMMaxRAMPercentage:     o.JVMMaxRAMPercentage,
+	}, true); err != nil {
+		return err
 	}
 	return nil
 }
@@ -375,6 +390,34 @@ func intParam(parameters map[string]any, name string, fallback int) int {
 		return int(v)
 	case string:
 		n, err := strconv.Atoi(strings.TrimSpace(v))
+		if err == nil {
+			return n
+		}
+	}
+	return fallback
+}
+
+func floatParam(parameters map[string]any, name string, fallback float64) float64 {
+	value, ok := parameters[name]
+	if !ok || value == nil {
+		return fallback
+	}
+	switch v := value.(type) {
+	case float64:
+		return v
+	case float32:
+		return float64(v)
+	case int:
+		return float64(v)
+	case int64:
+		return float64(v)
+	case json.Number:
+		n, err := v.Float64()
+		if err == nil {
+			return n
+		}
+	case string:
+		n, err := strconv.ParseFloat(strings.TrimSpace(v), 64)
 		if err == nil {
 			return n
 		}

@@ -15,7 +15,7 @@ const (
 	legacyOrchestrationModel    = "legacy-release-v1"
 	releaseKeepCount            = 3
 	releaseEnvDirName           = "env"
-	ingressDirName              = "ingress"
+	runtimeSpecDirName          = "agent"
 
 	defaultOauthPort      = 38001
 	defaultPermissionPort = 38010
@@ -26,6 +26,10 @@ const (
 	defaultContactsPort   = 38032
 	defaultMeetingPort    = 38033
 )
+
+func runtimeSpecPath(installRoot string) string {
+	return strings.TrimRight(installRoot, "/") + "/runtime/" + runtimeSpecDirName + "/runtime-spec.json"
+}
 
 func newReleaseID(version string, t time.Time) string {
 	t = t.UTC()
@@ -370,20 +374,22 @@ func servicesFromMetadata(metadata map[string]any) []string {
 
 func installConfigHash(options InstallOptions) string {
 	data, _ := json.Marshal(map[string]any{
-		"timezone":        options.Timezone,
-		"networkName":     options.NetworkName,
-		"appCPUs":         options.AppCPUs,
-		"appMemoryLimit":  options.AppMemoryLimit,
-		"gatewayPort":     options.GatewayPort,
-		"webPort":         options.WebPort,
-		"nacosWebPort":    options.NacosWebPort,
-		"nacosAPIPort":    options.NacosAPIPort,
-		"nacosSource":     options.NacosSource,
-		"nacosInstanceId": options.NacosInstanceID,
-		"nacosHost":       options.NacosHost,
-		"nacosUser":       options.NacosUser,
-		"nacosNamespace":  options.NacosNamespace,
-		"services":        options.SelectedServices,
+		"timezone":                options.Timezone,
+		"networkName":             options.NetworkName,
+		"appCPUs":                 options.AppCPUs,
+		"appMemoryLimit":          options.AppMemoryLimit,
+		"jvmInitialRAMPercentage": options.JVMInitialRAMPercentage,
+		"jvmMaxRAMPercentage":     options.JVMMaxRAMPercentage,
+		"gatewayPort":             options.GatewayPort,
+		"webPort":                 options.WebPort,
+		"nacosWebPort":            options.NacosWebPort,
+		"nacosAPIPort":            options.NacosAPIPort,
+		"nacosSource":             options.NacosSource,
+		"nacosInstanceId":         options.NacosInstanceID,
+		"nacosHost":               options.NacosHost,
+		"nacosUser":               options.NacosUser,
+		"nacosNamespace":          options.NacosNamespace,
+		"services":                options.SelectedServices,
 	})
 	sum := sha256.Sum256(data)
 	return hex.EncodeToString(sum[:])

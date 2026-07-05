@@ -33,6 +33,7 @@ const label = computed(() => {
     case 'unavailable':
       return t('status.unavailable')
     case 'failed':
+    case 'install_failed':
       return t('status.failed')
     case 'error':
       return t('status.error')
@@ -62,6 +63,7 @@ const type = computed(() => {
       return 'success'
     case 'unavailable':
     case 'failed':
+    case 'install_failed':
     case 'error':
       return 'danger'
     case 'deploying':

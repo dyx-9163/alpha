@@ -40,14 +40,15 @@ type aifarRuntimeAgent struct {
 }
 
 type aifarRuntimeInstance struct {
-	ID                 string `json:"id"`
-	Version            string `json:"version"`
-	Status             string `json:"status"`
-	OrchestrationModel string `json:"orchestrationModel,omitempty"`
-	Legacy             bool   `json:"legacy"`
-	InstallRoot        string `json:"installRoot,omitempty"`
-	Endpoint           string `json:"endpoint,omitempty"`
-	GatewayEndpoint    string `json:"gatewayEndpoint,omitempty"`
+	ID                 string         `json:"id"`
+	Version            string         `json:"version"`
+	Status             string         `json:"status"`
+	OrchestrationModel string         `json:"orchestrationModel,omitempty"`
+	Legacy             bool           `json:"legacy"`
+	InstallRoot        string         `json:"installRoot,omitempty"`
+	Endpoint           string         `json:"endpoint,omitempty"`
+	GatewayEndpoint    string         `json:"gatewayEndpoint,omitempty"`
+	RuntimeConfig      map[string]any `json:"runtimeConfig,omitempty"`
 }
 
 type aifarRuntimeDeployment struct {
@@ -111,6 +112,13 @@ type aifarRuntimeActionRequest struct {
 	Reason     string `json:"reason"`
 }
 
+type aifarRuntimeConfigApplyRequest struct {
+	InstanceID string                                  `json:"instanceId"`
+	Reason     string                                  `json:"reason"`
+	Global     registry.RuntimeConfigValues            `json:"global"`
+	Services   map[string]registry.RuntimeConfigValues `json:"services,omitempty"`
+}
+
 func (a *API) aifarRuntime(w http.ResponseWriter, r *http.Request) {
 	lang := languageFromRequest(r)
 	server, useServer, err := a.dockerServerFromRequest(r)
@@ -172,6 +180,75 @@ func (a *API) aifarRuntimeReconcile(w http.ResponseWriter, r *http.Request) {
 	respondTask(w, task, err)
 }
 
+func (a *API) aifarRuntimeConfig(w http.ResponseWriter, r *http.Request) {
+	lang := languageFromRequest(r)
+	req := aifarRuntimeConfigApplyRequest{}
+	if !decode(w, r, &req) {
+		return
+	}
+	server, instance, ok := a.resolveAIFARRuntimeActionTargetForInstance(w, r, req.InstanceID)
+	if !ok {
+		return
+	}
+	module, ok := a.apps.Get(instance.App)
+	if !ok {
+		writeError(w, http.StatusNotFound, "APP_BACKEND_MODULE_MISSING", i18n.Text(lang, "api.appBackendMissing"), map[string]any{"app": instance.App})
+		return
+	}
+	configModule, ok := module.(registry.RuntimeConfigModule)
+	if !ok {
+		writeError(w, http.StatusConflict, "AIFAR_RUNTIME_CONFIG_UNSUPPORTED", "AIFAR runtime config is not supported", map[string]any{"app": instance.App})
+		return
+	}
+	actor := currentUser(r).Username
+	configReq := registry.RuntimeConfigRequest{
+		Instance: instance,
+		Server:   server,
+		Language: lang,
+		Actor:    actor,
+		Reason:   strings.TrimSpace(req.Reason),
+		Config: registry.RuntimeConfigPayload{
+			Global:   req.Global,
+			Services: req.Services,
+		},
+	}
+	if err := configModule.ValidateRuntimeConfig(r.Context(), configReq); err != nil {
+		writeError(w, http.StatusBadRequest, "AIFAR_RUNTIME_CONFIG_INVALID", err.Error(), nil)
+		return
+	}
+	task, err := a.tasks.StartWithLanguage("aifar.runtime.config", instance.ID, actor, lang, func(ctx context.Context, log worker.Logger) error {
+		current, err := a.store.GetAppInstance(instance.ID)
+		if err != nil {
+			return err
+		}
+		server, err := a.store.GetServer(current.ServerID, true)
+		if err != nil {
+			return err
+		}
+		log.Info("applying AIFAR runtime config for instance %s", current.ID)
+		return configModule.ApplyRuntimeConfig(ctx, registry.RuntimeConfigRequest{
+			Instance: current,
+			Server:   server,
+			Language: lang,
+			Actor:    actor,
+			Reason:   strings.TrimSpace(req.Reason),
+			Config: registry.RuntimeConfigPayload{
+				Global:   req.Global,
+				Services: req.Services,
+			},
+		}, registry.RunContext{
+			Log: log,
+			TargetLog: func(target string) registry.Logger {
+				return log.Target(target)
+			},
+		})
+	})
+	if err == nil {
+		a.audit(r, "aifar.runtime.config", instance.ID, "running", task.ID)
+	}
+	respondTask(w, task, err)
+}
+
 func (a *API) aifarRuntimeScaleOut(w http.ResponseWriter, r *http.Request) {
 	lang := languageFromRequest(r)
 	service := strings.TrimSpace(chi.URLParam(r, "service"))
@@ -226,6 +303,16 @@ func (a *API) aifarRuntimeScaleOut(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) resolveAIFARRuntimeActionTarget(w http.ResponseWriter, r *http.Request) (store.Server, store.AppInstance, bool) {
+	req := aifarRuntimeActionRequest{}
+	if r.Body != nil && r.ContentLength != 0 {
+		if !decode(w, r, &req) {
+			return store.Server{}, store.AppInstance{}, false
+		}
+	}
+	return a.resolveAIFARRuntimeActionTargetForInstance(w, r, req.InstanceID)
+}
+
+func (a *API) resolveAIFARRuntimeActionTargetForInstance(w http.ResponseWriter, r *http.Request, requestedID string) (store.Server, store.AppInstance, bool) {
 	lang := languageFromRequest(r)
 	server, useServer, err := a.dockerServerFromRequest(r)
 	if err != nil {
@@ -236,13 +323,7 @@ func (a *API) resolveAIFARRuntimeActionTarget(w http.ResponseWriter, r *http.Req
 		writeError(w, http.StatusBadRequest, "DOCKER_TARGET_REQUIRED", i18n.Text(lang, "api.dockerTargetRequired"), nil)
 		return store.Server{}, store.AppInstance{}, false
 	}
-	req := aifarRuntimeActionRequest{}
-	if r.Body != nil && r.ContentLength != 0 {
-		if !decode(w, r, &req) {
-			return store.Server{}, store.AppInstance{}, false
-		}
-	}
-	instance, err := a.findAIFARInstanceForRuntimeAction(server.ID, req.InstanceID)
+	instance, err := a.findAIFARInstanceForRuntimeAction(server.ID, strings.TrimSpace(requestedID))
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "AIFAR_INSTANCE_REQUIRED", err.Error(), nil)
 		return store.Server{}, store.AppInstance{}, false
@@ -348,6 +429,7 @@ func (a *API) appendAIFARInstanceRuntime(response *aifarRuntimeResponse, instanc
 		InstallRoot:        installRoot,
 		Endpoint:           runtimeString(metadata, "endpoint", ""),
 		GatewayEndpoint:    runtimeString(metadata, "gatewayEndpoint", ""),
+		RuntimeConfig:      runtimeConfigFromRuntimeMetadata(metadata),
 	})
 	if legacy {
 		response.RuntimeStatus = degradedIfReady(response.RuntimeStatus)
@@ -684,6 +766,24 @@ func runtimeInt(metadata map[string]any, key string, fallback int) int {
 		}
 	}
 	return fallback
+}
+
+func runtimeConfigFromRuntimeMetadata(metadata map[string]any) map[string]any {
+	if raw, ok := metadata["runtimeConfig"].(map[string]any); ok && len(raw) > 0 {
+		return raw
+	}
+	return map[string]any{
+		"configVersion":   1,
+		"appliedVersion":  1,
+		"lastApplyStatus": "applied",
+		"global": map[string]any{
+			"appCPUs":                 runtimeString(metadata, "appCPUs", "2.0"),
+			"appMemoryLimit":          runtimeString(metadata, "appMemoryLimit", "2GB"),
+			"jvmInitialRAMPercentage": 20,
+			"jvmMaxRAMPercentage":     70,
+		},
+		"services": map[string]any{},
+	}
 }
 
 func normalizeRuntimeInstallRoot(value string) string {

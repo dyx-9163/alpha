@@ -43,6 +43,9 @@ func TestAIFARRuntimeReturnsDegradedControlPlaneWhenAgentMissing(t *testing.T) {
 	if len(body.Instances) != 1 || body.Instances[0].ID != instance.ID || body.Instances[0].Legacy {
 		t.Fatalf("unexpected instances: %+v", body.Instances)
 	}
+	if body.Instances[0].RuntimeConfig == nil || body.Instances[0].RuntimeConfig["global"] == nil {
+		t.Fatalf("expected runtime config in instance response: %+v", body.Instances[0])
+	}
 	if len(body.Services) != 1 || body.Services[0].ServiceName != "permission" || body.Services[0].Status != "ready" {
 		t.Fatalf("unexpected services: %+v", body.Services)
 	}
@@ -62,6 +65,35 @@ func TestAIFARRuntimeScaleOutRequiresAgent(t *testing.T) {
 	token := issueTestToken(t, db, secret, "owner", "owner")
 
 	req := httptest.NewRequest(http.MethodPost, "/api/v2/containers/aifar/services/permission/scale-out?serverId="+server.ID, strings.NewReader(`{"instanceId":"`+instance.ID+`"}`))
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	api.Router().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("expected 409, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "AIFAR_AGENT_REQUIRED") {
+		t.Fatalf("expected agent-required error, got %s", rec.Body.String())
+	}
+}
+
+func TestAIFARRuntimeConfigRequiresAgent(t *testing.T) {
+	api, db, secret := newAuthzTestAPI(t)
+	dockerAPI := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/containers/json" {
+			_ = json.NewEncoder(w).Encode([]map[string]any{})
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer dockerAPI.Close()
+	server, instance := seedAIFARRuntimeFixture(t, db, dockerAPI.URL)
+	token := issueTestToken(t, db, secret, "owner", "owner")
+
+	body := `{"instanceId":"` + instance.ID + `","global":{"appCPUs":"3.0","appMemoryLimit":"3GB","jvmInitialRAMPercentage":25,"jvmMaxRAMPercentage":75}}`
+	req := httptest.NewRequest(http.MethodPut, "/api/v2/containers/aifar/runtime/config?serverId="+server.ID, strings.NewReader(body))
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()

@@ -23,7 +23,7 @@ import (
 	"aifar-deployment/backend/internal/store"
 )
 
-//go:embed templates/install.sh templates/uninstall.sh templates/update-artifact.sh templates/update-artifact-bundle.sh templates/autoscale-out.sh
+//go:embed templates/install.sh templates/uninstall.sh templates/update-artifact.sh templates/update-artifact-bundle.sh templates/autoscale-out.sh templates/runtime-config.sh
 var templateFS embed.FS
 
 type Logger = installerkit.Logger
@@ -53,10 +53,16 @@ type aifarOrchestrationStore interface {
 	ListAIFARServiceEndpoints(instanceID string) ([]store.AIFARServiceEndpoint, error)
 }
 
+type taskLookupStore interface {
+	GetTask(id string) (store.Task, []store.TaskLog, error)
+}
+
 type InstallRequest struct {
 	Version    string
 	Topology   string
 	Language   string
+	Actor      string
+	TaskID     string
 	ServerID   string
 	Parameters map[string]any
 }
@@ -209,8 +215,39 @@ func (s Service) Install(ctx context.Context, req InstallRequest, resources []st
 		agentRemote = workDir + "/" + filepath.Base(agentLocal)
 	}
 	scriptRemote := workDir + "/install-aifar.sh"
+	metadata := installMetadata(server, installRoot, bundle.Version, releaseID, releaseTime, configHash, options, req.Actor)
+	metadata["installState"] = "installing"
+	if strings.TrimSpace(req.TaskID) != "" {
+		metadata["taskId"] = strings.TrimSpace(req.TaskID)
+	}
+	var instance store.AppInstance
 
 	if err := step(3, func() error {
+		instanceID, err := s.reusableAIFARInstallInstanceID(target, installRoot)
+		if err != nil {
+			return err
+		}
+		data, _ := json.Marshal(metadata)
+		instance = store.AppInstance{
+			ID:       instanceID,
+			App:      AppName,
+			Version:  bundle.Version,
+			ServerID: target,
+			Status:   "installing",
+			Topology: defaultTopology,
+			Metadata: string(data),
+		}
+		var saveErr error
+		instance, saveErr = s.store.SaveAppInstance(instance)
+		return saveErr
+	}); err != nil {
+		msg := fmt.Sprintf(copy.RecordFailed, err)
+		logForServer.Error("%s", msg)
+		finishTarget(recorder, target, "failed", msg)
+		return err
+	}
+
+	if err := step(4, func() error {
 		logForServer.Info(copy.PrepareWorkDir, workDir)
 		if _, err := installerkit.Run(ctx, s.remote, server, "mkdir -p "+installerkit.ShellQuote(workDir), logForServer, copy.RemoteCommandFailed); err != nil {
 			return err
@@ -264,33 +301,33 @@ func (s Service) Install(ctx context.Context, req InstallRequest, resources []st
 			FailureMessage: copy.UploadScriptFailed,
 		}, logForServer)
 	}); err != nil {
+		_ = s.markInstallFailed(instance, metadata, err)
 		msg := fmt.Sprintf(copy.InstallFailed, err)
 		logForServer.Error("%s", msg)
 		finishTarget(recorder, target, "failed", msg)
 		return err
 	}
 
-	if err := step(4, func() error {
+	if err := step(5, func() error {
 		logForServer.Info(copy.Deploying)
 		_, err := installerkit.Run(ctx, s.remote, server, "sh "+installerkit.ShellQuote(scriptRemote), logForServer, copy.RemoteCommandFailed)
 		return err
 	}); err != nil {
+		_ = s.markInstallFailed(instance, metadata, err)
 		msg := fmt.Sprintf(copy.InstallFailed, err)
 		logForServer.Error("%s", msg)
 		finishTarget(recorder, target, "failed", msg)
 		return err
 	}
 
-	var instance store.AppInstance
-	if err := step(5, func() error {
-		metadata := installMetadata(server, installRoot, bundle.Version, releaseID, releaseTime, configHash, options)
-		instanceID, err := s.existingAIFARInstanceID(target, installRoot)
-		if err != nil {
-			return err
-		}
+	if err := step(6, func() error {
+		delete(metadata, "installFailed")
+		delete(metadata, "failedAt")
+		delete(metadata, "error")
+		metadata["installState"] = "installed"
 		data, _ := json.Marshal(metadata)
 		instance = store.AppInstance{
-			ID:       instanceID,
+			ID:       instance.ID,
 			App:      AppName,
 			Version:  bundle.Version,
 			ServerID: target,
@@ -328,6 +365,7 @@ func (s Service) Install(ctx context.Context, req InstallRequest, resources []st
 		}
 		return nil
 	}); err != nil {
+		_ = s.markInstallFailed(instance, metadata, err)
 		msg := fmt.Sprintf(copy.RecordFailed, err)
 		logForServer.Error("%s", msg)
 		finishTarget(recorder, target, "failed", msg)
@@ -339,7 +377,7 @@ func (s Service) Install(ctx context.Context, req InstallRequest, resources []st
 	return nil
 }
 
-func installMetadata(server store.Server, installRoot, version, releaseID string, releaseTime time.Time, configHash string, options InstallOptions) map[string]any {
+func installMetadata(server store.Server, installRoot, version, releaseID string, releaseTime time.Time, configHash string, options InstallOptions, actor string) map[string]any {
 	runtimeDir := installRoot + "/runtime"
 	metadata := map[string]any{
 		"installRoot":           installRoot,
@@ -353,20 +391,30 @@ func installMetadata(server store.Server, installRoot, version, releaseID string
 		"configHash":            configHash,
 		"appDir":                runtimeDir + "/" + appBundleDir,
 		"envDir":                runtimeDir + "/" + releaseEnvDirName,
+		"runtimeSpecPath":       runtimeSpecPath(installRoot),
 		"networkName":           options.NetworkName,
+		"appCPUs":               options.AppCPUs,
+		"appMemoryLimit":        options.AppMemoryLimit,
+		"runtimeConfigMode":     "dynamic-jvm-v1",
+		"runtimeConfig":         runtimeConfigFromOptions(options, actor, releaseTime),
 		"endpoint":              fmt.Sprintf("%s:%d", server.Host, options.WebPort),
 		"gatewayEndpoint":       fmt.Sprintf("%s:%d", server.Host, options.GatewayPort),
 		"nacosEndpoint":         fmt.Sprintf("%s:%d", options.NacosHost, options.NacosWebPort),
 		"nacosRegistrationMode": "agent-proxy",
-		"webPort":               options.WebPort,
-		"gatewayPort":           options.GatewayPort,
-		"nacosSource":           options.NacosSource,
-		"nacosInstanceId":       options.NacosInstanceID,
-		"nacosHost":             options.NacosHost,
-		"nacosPort":             options.NacosWebPort,
-		"nacosWebPort":          options.NacosWebPort,
-		"nacosApiPort":          options.NacosAPIPort,
-		"services":              options.SelectedServices,
+		"agent": map[string]any{
+			"systemdService": "aifar-agent",
+			"controlAddress": "127.0.0.1:18081",
+			"specPath":       runtimeSpecPath(installRoot),
+		},
+		"webPort":         options.WebPort,
+		"gatewayPort":     options.GatewayPort,
+		"nacosSource":     options.NacosSource,
+		"nacosInstanceId": options.NacosInstanceID,
+		"nacosHost":       options.NacosHost,
+		"nacosPort":       options.NacosWebPort,
+		"nacosWebPort":    options.NacosWebPort,
+		"nacosApiPort":    options.NacosAPIPort,
+		"services":        options.SelectedServices,
 		"rolloutDefaults": map[string]any{
 			"maxSurge":       1,
 			"maxUnavailable": 0,
@@ -1022,6 +1070,10 @@ func fileSHA256(path string) (string, int64, error) {
 }
 
 func (s Service) existingAIFARInstanceID(serverID, installRoot string) (string, error) {
+	return s.reusableAIFARInstallInstanceID(serverID, installRoot)
+}
+
+func (s Service) reusableAIFARInstallInstanceID(serverID, installRoot string) (string, error) {
 	instances, err := s.store.ListAppInstances()
 	if err != nil {
 		return "", err
@@ -1034,10 +1086,98 @@ func (s Service) existingAIFARInstanceID(serverID, installRoot string) (string, 
 		metadata := metadataFromInstance(candidate)
 		candidateRoot := normalizeInstallRoot(stringFromMetadata(metadata, "installRoot", ""))
 		if candidateRoot != "" && candidateRoot == targetRoot {
-			return candidate.ID, nil
+			if s.reusableAIFARInstallInstance(candidate, metadata) {
+				return candidate.ID, nil
+			}
+			return "", fmt.Errorf("AIFAR service already exists on this server at %s; uninstall it before installing again", installRoot)
 		}
 	}
 	return "", nil
+}
+
+func (s Service) reusableAIFARInstallInstance(instance store.AppInstance, metadata map[string]any) bool {
+	if aifarInstallFailedInstance(instance, metadata) {
+		return true
+	}
+	if !aifarInstallingInstance(instance, metadata) {
+		return false
+	}
+	taskID := stringFromMetadata(metadata, "taskId", "")
+	if taskID == "" {
+		return true
+	}
+	tasks, ok := s.store.(taskLookupStore)
+	if !ok {
+		return false
+	}
+	task, _, err := tasks.GetTask(taskID)
+	if err != nil {
+		return store.IsNotFound(err)
+	}
+	return !activeTaskStatus(task.Status)
+}
+
+func aifarInstallingInstance(instance store.AppInstance, metadata map[string]any) bool {
+	status := strings.ToLower(strings.TrimSpace(instance.Status))
+	state := strings.ToLower(strings.TrimSpace(fmt.Sprint(metadata["installState"])))
+	return status == "installing" || state == "installing"
+}
+
+func activeTaskStatus(status string) bool {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "pending", "running":
+		return true
+	default:
+		return false
+	}
+}
+
+func aifarInstallFailedInstance(instance store.AppInstance, metadata map[string]any) bool {
+	switch strings.ToLower(strings.TrimSpace(instance.Status)) {
+	case "failed", "install_failed":
+		return true
+	}
+	return boolFromMetadata(metadata, "installFailed")
+}
+
+func boolFromMetadata(metadata map[string]any, key string) bool {
+	switch value := metadata[key].(type) {
+	case bool:
+		return value
+	case string:
+		text := strings.TrimSpace(strings.ToLower(value))
+		return text == "true" || text == "1" || text == "yes"
+	default:
+		return false
+	}
+}
+
+func (s Service) markInstallFailed(instance store.AppInstance, metadata map[string]any, installErr error) error {
+	if strings.TrimSpace(instance.ID) == "" {
+		return nil
+	}
+	next := copyMetadata(metadata)
+	next["installFailed"] = true
+	next["installState"] = "install_failed"
+	next["failedAt"] = time.Now().UTC().Format(time.RFC3339)
+	next["error"] = truncateAIFARError(installErr)
+	raw, _ := json.Marshal(next)
+	instance.Status = "install_failed"
+	instance.Metadata = string(raw)
+	_, err := s.store.SaveAppInstance(instance)
+	return err
+}
+
+func truncateAIFARError(err error) string {
+	if err == nil {
+		return ""
+	}
+	text := strings.TrimSpace(err.Error())
+	const max = 500
+	if len(text) <= max {
+		return text
+	}
+	return text[:max] + "..."
 }
 
 func normalizeInstallRoot(value string) string {
@@ -1357,6 +1497,16 @@ func renderAutoscaleOutScript(data autoscaleOutScriptData) (string, error) {
 	}, data)
 }
 
+func renderRuntimeConfigScript(data runtimeConfigScriptData) (string, error) {
+	content, err := templateFS.ReadFile("templates/runtime-config.sh")
+	if err != nil {
+		return "", err
+	}
+	return installerkit.RenderTemplate(AppName, "runtime-config.sh", "aifar-runtime-config", string(content), template.FuncMap{
+		"quote": shellQuoteAny,
+	}, data)
+}
+
 func replicaAssignmentsForServices(desired map[string]int, services []string) string {
 	selected := make(map[string]int, len(services))
 	for _, service := range services {
@@ -1459,9 +1609,10 @@ func installSteps(copy Copy) []installStepDef {
 	return []installStepDef{
 		{Name: "load-server", Title: copy.LoadServer},
 		{Name: "verify-resource", Title: copy.VerifyResource},
+		{Name: "record-desired-instance", Title: copy.RecordInstance},
 		{Name: "upload-bundle", Title: copy.UploadBundleStep},
-		{Name: "deploy-compose", Title: copy.DeployCompose},
-		{Name: "record-instance", Title: copy.RecordInstance},
+		{Name: "deploy-runtime", Title: copy.DeployCompose},
+		{Name: "record-installed-instance", Title: copy.RecordInstance},
 	}
 }
 
