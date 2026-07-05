@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -339,6 +340,17 @@ func syncNacosProxy(ctx context.Context, client *http.Client, env nacosRuntimeEn
 	switch action {
 	case NacosProxyRegister:
 		_ = doNacosRequest(ctx, client, http.MethodDelete, endpoint, true)
+		err := doNacosRequest(ctx, client, http.MethodPost, endpoint, false)
+		if err == nil {
+			return nil
+		}
+		if !isNacosServiceTypeConflict(err) {
+			return err
+		}
+		serviceEndpoint := nacosServiceURL(env, appName, token)
+		if cleanupErr := doNacosRequest(ctx, client, http.MethodDelete, serviceEndpoint, true); cleanupErr != nil {
+			return fmt.Errorf("%w; delete conflicting Nacos service %s failed: %v", err, appName, cleanupErr)
+		}
 		return doNacosRequest(ctx, client, http.MethodPost, endpoint, false)
 	case NacosProxyDeregister:
 		return doNacosRequest(ctx, client, http.MethodDelete, endpoint, true)
@@ -361,6 +373,19 @@ func nacosInstanceURL(env nacosRuntimeEnv, appName, ip string, port int, token s
 		query.Set("accessToken", token)
 	}
 	return env.BaseURL + "/nacos/v1/ns/instance?" + query.Encode()
+}
+
+func nacosServiceURL(env nacosRuntimeEnv, appName, token string) string {
+	query := url.Values{}
+	query.Set("serviceName", appName)
+	query.Set("namespaceId", env.Namespace)
+	if strings.TrimSpace(env.Group) != "" {
+		query.Set("groupName", strings.TrimSpace(env.Group))
+	}
+	if token = strings.TrimSpace(token); token != "" {
+		query.Set("accessToken", token)
+	}
+	return env.BaseURL + "/nacos/v1/ns/service?" + query.Encode()
 }
 
 func nacosHeartbeatURL(env nacosRuntimeEnv, spec RuntimeSpec, appName, ip string, port int, token string) string {
@@ -394,6 +419,27 @@ func specNacosEphemeral(spec RuntimeSpec) bool {
 	return spec.Nacos.Ephemeral == nil || *spec.Nacos.Ephemeral
 }
 
+type nacosHTTPError struct {
+	Method     string
+	StatusCode int
+	Status     string
+	Body       string
+}
+
+func (e *nacosHTTPError) Error() string {
+	return fmt.Sprintf("%s %s: %s", e.Method, e.Status, strings.TrimSpace(e.Body))
+}
+
+func isNacosServiceTypeConflict(err error) bool {
+	var httpErr *nacosHTTPError
+	if !errors.As(err, &httpErr) || httpErr.StatusCode != http.StatusBadRequest {
+		return false
+	}
+	body := strings.ToLower(httpErr.Body)
+	return strings.Contains(body, "current service") &&
+		(strings.Contains(body, "ephemeral") || strings.Contains(body, "persistent"))
+}
+
 func doNacosRequest(ctx context.Context, client *http.Client, method, endpoint string, allowNotFound bool) error {
 	req, err := http.NewRequestWithContext(ctx, method, endpoint, nil)
 	if err != nil {
@@ -409,7 +455,12 @@ func doNacosRequest(ctx context.Context, client *http.Client, method, endpoint s
 	}
 	if resp.StatusCode >= 300 {
 		data, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return fmt.Errorf("%s %s: %s", method, resp.Status, strings.TrimSpace(string(data)))
+		return &nacosHTTPError{
+			Method:     method,
+			StatusCode: resp.StatusCode,
+			Status:     resp.Status,
+			Body:       strings.TrimSpace(string(data)),
+		}
 	}
 	return nil
 }

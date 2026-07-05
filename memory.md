@@ -789,3 +789,5 @@
 - 结论：RuntimeSpec v2 的 Deployment 动态版本字段从 `revision` 改为 `podRevision`，新增固定 `deploymentName`；Service/Deployment 对外返回固定 `appName/deploymentName`，容器页服务表展示应用名，动态 Revision 只保留在 Pod/镜像/发布记录层；Nacos 仍只注册 Java 服务，跳过 `web-vue3`。
 - 问题：用户截图显示 OAuth Pod 已运行，但 Nacos `prod` 服务列表缺少 `alpha-oauth`。
 - 结论：当前 agent-only 模型中 Java Pod 自注册被禁用，Nacos 应由 `aifar-agent` 按 RuntimeSpec 注册 `alpha-oauth -> agentHost:38001`。代码映射和 skip 逻辑确认 OAuth 不会被设计性跳过；优先排查目标机运行的 agent/spec 是否为最新、spec 的 `services[]` 是否包含 `oauth/alpha-oauth`，以及 `aifar-agent reconcile-runtime` 或 Nacos 心跳日志是否注册失败。
+- 问题：用户提供 agent 日志显示 `alpha-oauth` Nacos 注册 POST/心跳 PUT 返回 400，Nacos 页面即使关闭“隐藏空服务”也看不到 `alpha-oauth`。
+- 结论：RuntimeSpec 已包含 `oauth/alpha-oauth/38001`，agent 也已尝试注册；根因是 Nacos 内部存在同名服务类型冲突或残留元数据，导致临时实例注册被拒绝。已让 `aifar-agent` 在注册代理实例遇到 Nacos ephemeral/persistent 类型冲突时自动删除同名 Nacos Service 并重试注册，覆盖页面不可见残留；`go test ./internal/runtimeagent ./cmd/aifar-agent`、`pnpm test`、`pnpm backend:build` 已通过。

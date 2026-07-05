@@ -111,3 +111,65 @@ func TestSyncNacosProxyRegistrationsRegistersByDeletingThenPosting(t *testing.T)
 		t.Fatalf("register should delete stale instance before post, got:\n%s", joined)
 	}
 }
+
+func TestSyncNacosProxyRegistrationsRepairsServiceTypeConflict(t *testing.T) {
+	requests := []string{}
+	instancePosts := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests = append(requests, r.Method+" "+r.URL.Path+"?"+r.URL.RawQuery)
+		if r.URL.Path == "/nacos/v1/auth/users/login" {
+			_, _ = w.Write([]byte(`{"accessToken":"token-1"}`))
+			return
+		}
+		if r.URL.Path == "/nacos/v1/ns/instance" && r.Method == http.MethodPost {
+			instancePosts++
+			if instancePosts == 1 {
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = w.Write([]byte(`errCode: 400, errMsg: Current service DEFAULT_GROUP@@alpha-oauth is persistent service, can't register ephemeral instance.`))
+				return
+			}
+		}
+		_, _ = w.Write([]byte(`ok`))
+	}))
+	defer server.Close()
+
+	installRoot := t.TempDir()
+	envDir := filepath.Join(installRoot, "runtime", "env")
+	if err := os.MkdirAll(envDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(envDir, "java-common.env"), []byte("NACOS_HOST="+strings.TrimPrefix(server.URL, "http://")+"\nNACOS_NS=prod\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := SyncNacosProxyRegistrations(context.Background(), NacosProxySyncOptions{
+		Specs: []RuntimeSpec{{
+			InstanceID:  "admin",
+			InstallRoot: installRoot,
+			Services:    []ServiceSpec{{Name: "oauth", AppName: "alpha-oauth", Port: 38001}},
+			Nacos:       NacosSpec{Group: "DEFAULT_GROUP"},
+		}},
+		Action:  NacosProxyRegister,
+		AgentIP: "192.168.74.132",
+		Client:  server.Client(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	joined := strings.Join(requests, "\n")
+	firstPost := strings.Index(joined, "POST /nacos/v1/ns/instance?")
+	serviceDelete := strings.Index(joined, "DELETE /nacos/v1/ns/service?")
+	lastPost := strings.LastIndex(joined, "POST /nacos/v1/ns/instance?")
+	if firstPost < 0 || serviceDelete < 0 || lastPost <= firstPost || !(firstPost < serviceDelete && serviceDelete < lastPost) {
+		t.Fatalf("expected instance POST, service DELETE, then instance POST retry, got:\n%s", joined)
+	}
+	for _, want := range []string{
+		"serviceName=alpha-oauth",
+		"groupName=DEFAULT_GROUP",
+		"namespaceId=prod",
+		"ephemeral=true",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("expected Nacos repair request containing %q, got:\n%s", want, joined)
+		}
+	}
+}
