@@ -115,6 +115,7 @@ func TestSyncNacosProxyRegistrationsRegistersByDeletingThenPosting(t *testing.T)
 func TestSyncNacosProxyRegistrationsRepairsServiceTypeConflict(t *testing.T) {
 	requests := []string{}
 	instancePosts := 0
+	var logs strings.Builder
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requests = append(requests, r.Method+" "+r.URL.Path+"?"+r.URL.RawQuery)
 		if r.URL.Path == "/nacos/v1/auth/users/login" {
@@ -125,7 +126,7 @@ func TestSyncNacosProxyRegistrationsRepairsServiceTypeConflict(t *testing.T) {
 			instancePosts++
 			if instancePosts == 1 {
 				w.WriteHeader(http.StatusBadRequest)
-				_, _ = w.Write([]byte(`errCode: 400, errMsg: Current service DEFAULT_GROUP@@alpha-oauth is persistent service, can't register ephemeral instance.`))
+				_, _ = w.Write([]byte(`errCode: 400, errMsg: Current service DEFAULT_GROUP@@alpha-oauth`))
 				return
 			}
 		}
@@ -151,6 +152,7 @@ func TestSyncNacosProxyRegistrationsRepairsServiceTypeConflict(t *testing.T) {
 		Action:  NacosProxyRegister,
 		AgentIP: "192.168.74.132",
 		Client:  server.Client(),
+		Log:     &logs,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -164,12 +166,17 @@ func TestSyncNacosProxyRegistrationsRepairsServiceTypeConflict(t *testing.T) {
 	}
 	for _, want := range []string{
 		"serviceName=alpha-oauth",
+		"serviceName=DEFAULT_GROUP%40%40alpha-oauth",
 		"groupName=DEFAULT_GROUP",
 		"namespaceId=prod",
 		"ephemeral=true",
+		"ephemeral=false",
 	} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("expected Nacos repair request containing %q, got:\n%s", want, joined)
 		}
+	}
+	if !strings.Contains(logs.String(), "cleanup service metadata: alpha-oauth") {
+		t.Fatalf("expected repair log, got %q", logs.String())
 	}
 }

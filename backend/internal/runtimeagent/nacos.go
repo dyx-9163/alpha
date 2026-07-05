@@ -83,7 +83,7 @@ func SyncNacosProxyRegistrations(ctx context.Context, options NacosProxySyncOpti
 			if appName == "" || service.Port <= 0 {
 				continue
 			}
-			if err := syncNacosProxy(ctx, client, env, action, spec, appName, agentIP, service.Port, token); err != nil {
+			if err := syncNacosProxy(ctx, client, env, action, spec, appName, agentIP, service.Port, token, options.Log); err != nil {
 				errs = append(errs, fmt.Sprintf("%s/%s: %v", spec.InstanceID, service.Name, err))
 				continue
 			}
@@ -335,28 +335,54 @@ func nacosAccessToken(ctx context.Context, client *http.Client, env nacosRuntime
 	return strings.TrimSpace(body.AccessToken)
 }
 
-func syncNacosProxy(ctx context.Context, client *http.Client, env nacosRuntimeEnv, action NacosProxyAction, spec RuntimeSpec, appName, ip string, port int, token string) error {
+func syncNacosProxy(ctx context.Context, client *http.Client, env nacosRuntimeEnv, action NacosProxyAction, spec RuntimeSpec, appName, ip string, port int, token string, log io.Writer) error {
 	endpoint := nacosInstanceURL(env, appName, ip, port, token, specNacosEphemeral(spec))
 	switch action {
 	case NacosProxyRegister:
-		_ = doNacosRequest(ctx, client, http.MethodDelete, endpoint, true)
+		cleanupNacosProxyInstance(ctx, client, env, appName, ip, port, token)
 		err := doNacosRequest(ctx, client, http.MethodPost, endpoint, false)
 		if err == nil {
 			return nil
 		}
-		if !isNacosServiceTypeConflict(err) {
+		if !isNacosServiceConflict(err) {
 			return err
 		}
-		serviceEndpoint := nacosServiceURL(env, appName, token)
-		if cleanupErr := doNacosRequest(ctx, client, http.MethodDelete, serviceEndpoint, true); cleanupErr != nil {
-			return fmt.Errorf("%w; delete conflicting Nacos service %s failed: %v", err, appName, cleanupErr)
+		logf(log, "AIFAR Nacos proxy register conflict, cleanup service metadata: %s\n", appName)
+		if cleanupErr := cleanupNacosProxyServiceConflict(ctx, client, env, appName, ip, port, token); cleanupErr != nil {
+			return fmt.Errorf("%w; cleanup conflicting Nacos service %s failed: %v", err, appName, cleanupErr)
 		}
-		return doNacosRequest(ctx, client, http.MethodPost, endpoint, false)
+		time.Sleep(200 * time.Millisecond)
+		if retryErr := doNacosRequest(ctx, client, http.MethodPost, endpoint, false); retryErr != nil {
+			return fmt.Errorf("%w; retry after cleanup failed: %v", err, retryErr)
+		}
+		return nil
 	case NacosProxyDeregister:
+		cleanupNacosProxyInstance(ctx, client, env, appName, ip, port, token)
 		return doNacosRequest(ctx, client, http.MethodDelete, endpoint, true)
 	default:
 		return fmt.Errorf("unsupported Nacos proxy action %q", action)
 	}
+}
+
+func cleanupNacosProxyInstance(ctx context.Context, client *http.Client, env nacosRuntimeEnv, appName, ip string, port int, token string) {
+	for _, ephemeral := range []bool{true, false} {
+		endpoint := nacosInstanceURL(env, appName, ip, port, token, ephemeral)
+		_ = doNacosRequest(ctx, client, http.MethodDelete, endpoint, true)
+	}
+}
+
+func cleanupNacosProxyServiceConflict(ctx context.Context, client *http.Client, env nacosRuntimeEnv, appName, ip string, port int, token string) error {
+	cleanupNacosProxyInstance(ctx, client, env, appName, ip, port, token)
+	var errs []string
+	for _, endpoint := range nacosServiceCleanupURLs(env, appName, token) {
+		if err := doNacosRequest(ctx, client, http.MethodDelete, endpoint, true); err != nil {
+			errs = append(errs, err.Error())
+		}
+	}
+	if len(errs) == len(nacosServiceCleanupURLs(env, appName, token)) && len(errs) > 0 {
+		return errors.New(strings.Join(errs, "; "))
+	}
+	return nil
 }
 
 func nacosInstanceURL(env nacosRuntimeEnv, appName, ip string, port int, token string, ephemeral bool) string {
@@ -386,6 +412,28 @@ func nacosServiceURL(env nacosRuntimeEnv, appName, token string) string {
 		query.Set("accessToken", token)
 	}
 	return env.BaseURL + "/nacos/v1/ns/service?" + query.Encode()
+}
+
+func nacosGroupedServiceURL(env nacosRuntimeEnv, appName, token string) string {
+	group := strings.TrimSpace(env.Group)
+	if group == "" {
+		return ""
+	}
+	query := url.Values{}
+	query.Set("serviceName", group+"@@"+appName)
+	query.Set("namespaceId", env.Namespace)
+	if token = strings.TrimSpace(token); token != "" {
+		query.Set("accessToken", token)
+	}
+	return env.BaseURL + "/nacos/v1/ns/service?" + query.Encode()
+}
+
+func nacosServiceCleanupURLs(env nacosRuntimeEnv, appName, token string) []string {
+	urls := []string{nacosServiceURL(env, appName, token)}
+	if grouped := nacosGroupedServiceURL(env, appName, token); grouped != "" {
+		urls = append(urls, grouped)
+	}
+	return urls
 }
 
 func nacosHeartbeatURL(env nacosRuntimeEnv, spec RuntimeSpec, appName, ip string, port int, token string) string {
@@ -430,14 +478,13 @@ func (e *nacosHTTPError) Error() string {
 	return fmt.Sprintf("%s %s: %s", e.Method, e.Status, strings.TrimSpace(e.Body))
 }
 
-func isNacosServiceTypeConflict(err error) bool {
+func isNacosServiceConflict(err error) bool {
 	var httpErr *nacosHTTPError
 	if !errors.As(err, &httpErr) || httpErr.StatusCode != http.StatusBadRequest {
 		return false
 	}
 	body := strings.ToLower(httpErr.Body)
-	return strings.Contains(body, "current service") &&
-		(strings.Contains(body, "ephemeral") || strings.Contains(body, "persistent"))
+	return strings.Contains(body, "current service")
 }
 
 func doNacosRequest(ctx context.Context, client *http.Client, method, endpoint string, allowNotFound bool) error {
