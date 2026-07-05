@@ -755,3 +755,5 @@
 - 结论：两者在副本期望态、滚动、Service 转发和 endpoint 负载均衡上有重叠；但 AIFAR runtime-v2 当前定位应是 AIFAR 专用的单机/轻量运行时、安装链路和 Nacos 代理数据面，不应扩张成通用多节点调度器。若未来要做多节点通用编排，应抽 RuntimeProvider，优先接 Swarm/K8s，而不是重写完整 Swarm/K8s。
 - 问题：用户要求将 AIFAR Docker 包标准调整为不兼容老版本，并优化部署过程。
 - 结论：AIFAR 离线包标准改为 `resources/aifar/runtime-v2/{manifest.json,services,images,runtime}`；安装准入只接受 `aifar-runtime-bundle-v2` manifest，不再兼容旧 `docker-apps`/`docker-images`，脚本解包后按 RuntimeSpec v2 交给 agent reconcile。
+- 问题：用户要求删除 `resources/aifar/runtime-v2/services` 中已不用的文件。
+- 结论：runtime-v2 不再使用 Docker Compose 启动服务，已删除各服务目录下旧 `docker-compose.yaml`；保留 `.env`、`Dockerfile`、Jar、web dist 和 nginx 配置等安装构建仍需文件。
