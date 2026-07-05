@@ -13,8 +13,8 @@ CONFIG_HASH={{ quote .ConfigHash }}
 INGRESS_NETWORK={{ quote .IngressNetwork }}
 
 RUNTIME_DIR="$INSTALL_ROOT/runtime"
-APP_DIR="$RUNTIME_DIR/docker-apps"
-IMAGE_DIR="$RUNTIME_DIR/docker-images"
+APP_DIR="$RUNTIME_DIR/services"
+IMAGE_DIR="$RUNTIME_DIR/images"
 ENV_DIR="$RUNTIME_DIR/env"
 AGENT_DIR="$RUNTIME_DIR/agent"
 AIFAR_DIR="$INSTALL_ROOT/.aifar"
@@ -610,11 +610,16 @@ mkdir -p "$INSTALL_ROOT" "$WORK_DIR" "$RUNTIME_DIR" "$ENV_DIR" "$AGENT_DIR" "$AI
 rm -rf "$TMP_DIR" "$APP_DIR" "$IMAGE_DIR"
 mkdir -p "$TMP_DIR"
 tar -xzf "$ARCHIVE" -C "$TMP_DIR"
-[ -d "$TMP_DIR/docker-apps" ] || fail "docker-apps directory is missing in bundle"
-mv "$TMP_DIR/docker-apps" "$APP_DIR"
-if [ -d "$TMP_DIR/docker-images" ]; then
-  mv "$TMP_DIR/docker-images" "$IMAGE_DIR"
+[ -f "$TMP_DIR/manifest.json" ] || fail "runtime-v2 manifest.json is missing in bundle"
+[ -d "$TMP_DIR/services" ] || fail "services directory is missing in runtime-v2 bundle"
+[ -d "$TMP_DIR/images" ] || fail "images directory is missing in runtime-v2 bundle"
+mv "$TMP_DIR/services" "$APP_DIR"
+mv "$TMP_DIR/images" "$IMAGE_DIR"
+if [ -d "$TMP_DIR/runtime" ]; then
+  rm -rf "$RUNTIME_DIR/bundle"
+  mv "$TMP_DIR/runtime" "$RUNTIME_DIR/bundle"
 fi
+cp "$TMP_DIR/manifest.json" "$RUNTIME_DIR/manifest.json"
 rm -rf "$TMP_DIR"
 
 trap 'cleanup_failed_install' EXIT INT TERM

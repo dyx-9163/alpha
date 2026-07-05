@@ -96,3 +96,25 @@ func TestScanUsesVersionManifestChecksum(t *testing.T) {
 		t.Fatalf("expected manifest sha256 to be applied, got %+v", out[0])
 	}
 }
+
+func TestScanCanUseManifestAsDirectoryBundleEntry(t *testing.T) {
+	root := t.TempDir()
+	appDir := filepath.Join(root, "aifar", "runtime-v2")
+	if err := os.MkdirAll(filepath.Join(appDir, "services"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	manifest := `{"schema":"aifar-runtime-bundle-v2","version":"runtime-v2","files":{"manifest.json":{"part":"backend"}}}`
+	if err := os.WriteFile(filepath.Join(appDir, "manifest.json"), []byte(manifest), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out, err := Scan(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out) != 1 {
+		t.Fatalf("expected one manifest resource, got %d", len(out))
+	}
+	if out[0].App != "aifar" || out[0].Part != "backend" || out[0].Version != "runtime-v2" || filepath.Base(out[0].Path) != "manifest.json" {
+		t.Fatalf("unexpected manifest resource: %+v", out[0])
+	}
+}

@@ -19,9 +19,12 @@ import (
 const (
 	AppName              = "aifar"
 	resourceApp          = "aifar"
-	appBundleVersion     = "docker-apps"
-	appBundleDir         = "docker-apps"
-	sqlBundleDir         = "docker-sql"
+	appBundleVersion     = "runtime-v2"
+	appBundleSchema      = "aifar-runtime-bundle-v2"
+	appBundleDir         = "services"
+	imageBundleDir       = "images"
+	runtimeBundleDir     = "runtime"
+	bundleManifestName   = "manifest.json"
 	installDirName       = "admin"
 	defaultTopology      = "single"
 	defaultNetworkName   = "aifar-network"
@@ -86,10 +89,19 @@ type InstallOptions struct {
 }
 
 type Bundle struct {
-	Version string
-	Root    string
-	AppDir  string
-	SQLDir  string
+	Version      string
+	Root         string
+	AppDir       string
+	ImageDir     string
+	RuntimeDir   string
+	ManifestPath string
+}
+
+type runtimeBundleManifest struct {
+	Schema   string   `json:"schema"`
+	Version  string   `json:"version"`
+	Services []string `json:"services"`
+	Images   []string `json:"images"`
 }
 
 func optionsFromParameters(parameters map[string]any) InstallOptions {
@@ -217,29 +229,40 @@ func SelectBundle(resources []store.Resource, version string) (Bundle, error) {
 		if res.App != resourceApp || res.Part != "backend" || res.Version != appBundleVersion {
 			continue
 		}
-		appDir := inferAppDir(res.Path)
-		if appDir == "" {
+		root := inferBundleRoot(res.Path)
+		if root == "" {
 			continue
 		}
-		candidates = append(candidates, store.Resource{Version: res.Version, Path: appDir})
+		candidates = append(candidates, store.Resource{Version: res.Version, Path: root})
 	}
 	if len(candidates) == 0 {
-		return Bundle{}, fmt.Errorf("AIFAR Docker Compose bundle was not found under resources/aifar/%s", appBundleVersion)
+		return Bundle{}, fmt.Errorf("AIFAR runtime-v2 bundle was not found under resources/aifar/%s", appBundleVersion)
 	}
 	sort.Slice(candidates, func(i, j int) bool { return candidates[i].Path < candidates[j].Path })
-	appDir := candidates[0].Path
-	root := filepath.Dir(appDir)
+	root := candidates[0].Path
 	return Bundle{
-		Version: appBundleVersion,
-		Root:    root,
-		AppDir:  appDir,
-		SQLDir:  filepath.Join(root, sqlBundleDir),
+		Version:      appBundleVersion,
+		Root:         root,
+		AppDir:       filepath.Join(root, appBundleDir),
+		ImageDir:     filepath.Join(root, imageBundleDir),
+		RuntimeDir:   filepath.Join(root, runtimeBundleDir),
+		ManifestPath: filepath.Join(root, bundleManifestName),
 	}, nil
 }
 
 func VerifyBundle(bundle Bundle) error {
 	if strings.TrimSpace(bundle.Root) == "" || strings.TrimSpace(bundle.AppDir) == "" {
 		return fmt.Errorf("AIFAR bundle path is empty")
+	}
+	manifest, err := readRuntimeBundleManifest(bundle.ManifestPath)
+	if err != nil {
+		return err
+	}
+	if manifest.Schema != appBundleSchema {
+		return fmt.Errorf("AIFAR bundle schema must be %s, got %s", appBundleSchema, manifest.Schema)
+	}
+	if manifest.Version != "" && manifest.Version != appBundleVersion {
+		return fmt.Errorf("AIFAR bundle manifest version must be %s, got %s", appBundleVersion, manifest.Version)
 	}
 	if info, err := os.Stat(bundle.AppDir); err != nil {
 		return err
@@ -249,17 +272,47 @@ func VerifyBundle(bundle Bundle) error {
 	if _, err := os.Stat(filepath.Join(bundle.AppDir, ".env")); err != nil {
 		return fmt.Errorf("AIFAR common .env is required: %w", err)
 	}
-	for _, image := range []string{"openjre-rocky-21.tar", "nginx-stable-alpine.tar"} {
-		if _, err := os.Stat(filepath.Join(bundle.Root, "docker-images", image)); err != nil {
+	requiredImages := manifest.Images
+	if len(requiredImages) == 0 {
+		requiredImages = []string{"openjre-rocky-21.tar", "nginx-stable-alpine.tar"}
+	}
+	for _, image := range requiredImages {
+		if _, err := os.Stat(filepath.Join(bundle.ImageDir, image)); err != nil {
 			return fmt.Errorf("AIFAR offline Docker image %s is required: %w", image, err)
 		}
 	}
-	for _, service := range []string{"gateway", "web-vue3"} {
-		if _, err := os.Stat(filepath.Join(bundle.AppDir, service, "docker-compose.yaml")); err != nil {
-			return fmt.Errorf("AIFAR service %s docker-compose.yaml is required: %w", service, err)
+	requiredServices := manifest.Services
+	if len(requiredServices) == 0 {
+		requiredServices = serviceOrder
+	}
+	for _, service := range requiredServices {
+		service = cleanAIFARServiceName(service)
+		if !aifarServiceSupported(service) {
+			return fmt.Errorf("AIFAR service %s is not supported by runtime-v2", service)
+		}
+		if _, err := os.Stat(filepath.Join(bundle.AppDir, service, "Dockerfile")); err != nil {
+			return fmt.Errorf("AIFAR service %s Dockerfile is required: %w", service, err)
+		}
+		if _, err := os.Stat(filepath.Join(bundle.AppDir, service, ".env")); err != nil {
+			return fmt.Errorf("AIFAR service %s .env is required: %w", service, err)
 		}
 	}
 	return nil
+}
+
+func readRuntimeBundleManifest(pathValue string) (runtimeBundleManifest, error) {
+	var manifest runtimeBundleManifest
+	if strings.TrimSpace(pathValue) == "" {
+		return manifest, fmt.Errorf("AIFAR runtime-v2 manifest path is empty")
+	}
+	data, err := os.ReadFile(pathValue)
+	if err != nil {
+		return manifest, fmt.Errorf("AIFAR runtime-v2 manifest is required: %w", err)
+	}
+	if err := json.Unmarshal(data, &manifest); err != nil {
+		return manifest, fmt.Errorf("AIFAR runtime-v2 manifest is invalid: %w", err)
+	}
+	return manifest, nil
 }
 
 func CreateBundleArchive(bundle Bundle) (string, error) {
@@ -336,22 +389,24 @@ func skipBundleEntry(rel string) bool {
 	slash := filepath.ToSlash(rel)
 	return slash == appBundleDir+"/nacos" ||
 		strings.HasPrefix(slash, appBundleDir+"/nacos/") ||
-		slash == sqlBundleDir ||
-		strings.HasPrefix(slash, sqlBundleDir+"/")
+		(strings.HasPrefix(slash, appBundleDir+"/") && strings.HasSuffix(slash, "/docker-compose.yaml"))
 }
 
-func inferAppDir(pathValue string) string {
+func inferBundleRoot(pathValue string) string {
 	pathValue = filepath.Clean(pathValue)
-	info, err := os.Stat(pathValue)
-	if err == nil && info.IsDir() && filepath.Base(pathValue) == appBundleDir {
-		return pathValue
+	current := pathValue
+	if info, err := os.Stat(current); err == nil && !info.IsDir() {
+		current = filepath.Dir(current)
 	}
-	dir := filepath.Dir(pathValue)
-	if filepath.Base(dir) == appBundleDir {
-		return dir
-	}
-	if filepath.Base(pathValue) == appBundleDir {
-		return pathValue
+	for {
+		if filepath.Base(current) == appBundleVersion {
+			return current
+		}
+		next := filepath.Dir(current)
+		if next == current || next == "." {
+			break
+		}
+		current = next
 	}
 	return ""
 }

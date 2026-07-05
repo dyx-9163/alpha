@@ -55,7 +55,7 @@ func (m Module) Manifest(lang string) registry.Manifest {
 			"apps.aifar.update-artifact",
 			"apps.aifar.delete",
 			"servers.credential.use",
-			"docker.compose.deploy",
+			"aifar.runtime-v2.deploy",
 		},
 	}
 }

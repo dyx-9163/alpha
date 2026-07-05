@@ -1243,11 +1243,10 @@ func dockerRuntimeReady(instance store.AppInstance) bool {
 	if !ok {
 		return true
 	}
-	if status := strings.TrimSpace(fmt.Sprint(lastCheck["status"])); status != "" && !dockerStatusReady(status) {
+	if status := mapText(lastCheck, "status"); status != "" && !dockerStatusReady(status) {
 		return false
 	}
-	return strings.TrimSpace(fmt.Sprint(lastCheck["dockerVersion"])) != "" &&
-		strings.TrimSpace(fmt.Sprint(lastCheck["composeVersion"])) != ""
+	return mapText(lastCheck, "dockerVersion") != ""
 }
 
 func dockerStatusReady(status string) bool {
@@ -1257,6 +1256,14 @@ func dockerStatusReady(status string) bool {
 	default:
 		return false
 	}
+}
+
+func mapText(values map[string]any, key string) string {
+	value, ok := values[key]
+	if !ok || value == nil {
+		return ""
+	}
+	return strings.TrimSpace(fmt.Sprint(value))
 }
 
 func (s Service) Delete(ctx context.Context, req DeleteRequest, log Logger, targetLog targetLogger) error {

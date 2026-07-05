@@ -235,7 +235,7 @@ func seedAIFARRuntimeFixture(t *testing.T, db *store.Store, dockerHost string) (
 	}
 	instance, err := db.SaveAppInstance(store.AppInstance{
 		App:      "aifar",
-		Version:  "docker-apps",
+		Version:  "runtime-v2",
 		ServerID: server.ID,
 		Status:   "installed",
 		Metadata: `{"orchestrationModel":"agent-runtime-v2","installRoot":"/aifar/apps/admin","endpoint":"10.0.0.10:8080","gatewayEndpoint":"10.0.0.10:38000","gatewayPort":38000,"webPort":8080,"runtimeService":"aifar-agent"}`,

@@ -17,7 +17,7 @@ CONFIG_HASH={{ quote .ConfigHash }}
 INGRESS_NETWORK={{ quote .IngressNetwork }}
 
 RUNTIME_DIR="$INSTALL_ROOT/runtime"
-APP_DIR="$RUNTIME_DIR/docker-apps"
+APP_DIR="$RUNTIME_DIR/services"
 ENV_DIR="$RUNTIME_DIR/env"
 TMP_DIR="$INSTALL_ROOT/.rollout-$REVISION-$$"
 DRAIN_SECONDS="${DRAIN_SECONDS:-30}"

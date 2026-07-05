@@ -67,10 +67,20 @@ func scanVersion(app, part, version, versionPath string) ([]store.Resource, erro
 	}
 	for _, entry := range entries {
 		name := entry.Name()
-		if name == "rpms" || strings.EqualFold(name, "manifest.json") {
+		path := filepath.Join(versionPath, name)
+		if name == "rpms" {
 			continue
 		}
-		path := filepath.Join(versionPath, name)
+		if strings.EqualFold(name, "manifest.json") {
+			if !entry.IsDir() {
+				if resource, ok, err := manifestEntryResource(app, part, version, path, rpmCount, manifest); err != nil {
+					return nil, err
+				} else if ok {
+					out = append(out, resource)
+				}
+			}
+			continue
+		}
 		if entry.IsDir() {
 			nestedPart := normalizePart(name)
 			if nestedPart == "" {
@@ -108,6 +118,33 @@ func scanVersion(app, part, version, versionPath string) ([]store.Resource, erro
 		})
 	}
 	return out, nil
+}
+
+func manifestEntryResource(app, part, version, path string, rpmCount int, manifest map[string]manifestFile) (store.Resource, bool, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return store.Resource{}, false, err
+	}
+	hash, manifestPart := manifestResource(manifest, filepath.Base(path))
+	if manifestPart == "" {
+		return store.Resource{}, false, nil
+	}
+	resourcePart := part
+	if manifestPart != "" {
+		resourcePart = manifestPart
+	}
+	if shouldHash(filepath.Base(path), info.Size()) && hash == "" {
+		hash, _ = sha256File(path)
+	}
+	return store.Resource{
+		App:      app,
+		Part:     resourcePart,
+		Version:  version,
+		Path:     path,
+		Size:     info.Size(),
+		SHA256:   hash,
+		RPMCount: rpmCount,
+	}, true, nil
 }
 
 func scanResourceFiles(app, part, version, dir string, rpmCount int, manifest map[string]manifestFile, baseRel string) ([]store.Resource, error) {

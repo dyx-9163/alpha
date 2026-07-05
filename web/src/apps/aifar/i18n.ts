@@ -16,16 +16,16 @@ export const aifarMessages = {
   zh: {
     title: 'AIFAR 服务',
     categoryLabel: '应用服务',
-    sourceLabel: 'Docker Compose 离线包',
-    description: '基于 resources/aifar/docker-apps 离线包部署 AIFAR 微服务。',
+    sourceLabel: 'Runtime v2 离线包',
+    description: '基于 resources/aifar/runtime-v2 离线发布包部署 AIFAR 微服务。',
     installTitle: '安装 AIFAR 服务',
-    hint: '目标服务器需要先安装 Docker Engine 和 Docker Compose；安装器只连接已部署的 Nacos，业务运行配置请在 Nacos 中维护。',
+    hint: '目标服务器需要先安装 Docker Engine；安装器只连接已部署的 Nacos，业务运行配置请在 Nacos 中维护。',
     version: '版本',
-    versionPlaceholder: '选择 docker-apps 资源包',
+    versionPlaceholder: '选择 runtime-v2 资源包',
     servers: '目标服务器',
-    serversPlaceholder: '选择一台已安装 Docker Engine 和 Docker Compose 的服务器',
-    noServers: '暂无已安装 Docker Engine 和 Docker Compose 的服务器，请先在应用商店安装 Docker 并执行检测。',
-    noDockerReadyServers: '暂无已安装 Docker Engine 和 Docker Compose 的服务器，请先在应用商店安装 Docker 并执行检测。',
+    serversPlaceholder: '选择一台 Docker Engine 就绪的服务器',
+    noServers: '暂无 Docker Engine 就绪的服务器，请先在应用商店安装 Docker 并执行检测。',
+    noDockerReadyServers: '暂无 Docker Engine 就绪的服务器，请先在应用商店安装 Docker 并执行检测。',
     selectedCount: (count: number) => `已选择 ${count} 台服务器`,
     cancel: '取消',
     submit: '开始安装',
@@ -68,16 +68,16 @@ export const aifarMessages = {
   en: {
     title: 'AIFAR Service',
     categoryLabel: 'Application',
-    sourceLabel: 'Docker Compose bundle',
-    description: 'Deploy AIFAR microservices from the resources/aifar/docker-apps offline bundle.',
+    sourceLabel: 'Runtime v2 bundle',
+    description: 'Deploy AIFAR microservices from the resources/aifar/runtime-v2 offline release bundle.',
     installTitle: 'Install AIFAR Service',
-    hint: 'Target server must already have Docker Engine and Docker Compose. The installer only connects to deployed Nacos; keep business runtime configuration in Nacos.',
+    hint: 'Target server must already have Docker Engine. The installer only connects to deployed Nacos; keep business runtime configuration in Nacos.',
     version: 'Version',
-    versionPlaceholder: 'Select docker-apps bundle',
+    versionPlaceholder: 'Select runtime-v2 bundle',
     servers: 'Target server',
-    serversPlaceholder: 'Select one Docker Engine + Docker Compose ready server',
-    noServers: 'No Docker Engine + Docker Compose ready servers. Install Docker from the app store and run a check first.',
-    noDockerReadyServers: 'No Docker Engine + Docker Compose ready servers. Install Docker from the app store and run a check first.',
+    serversPlaceholder: 'Select one Docker Engine ready server',
+    noServers: 'No Docker Engine ready servers. Install Docker from the app store and run a check first.',
+    noDockerReadyServers: 'No Docker Engine ready servers. Install Docker from the app store and run a check first.',
     selectedCount: (count: number) => `${count} server(s) selected`,
     cancel: 'Cancel',
     submit: 'Start install',
@@ -430,7 +430,7 @@ function isDockerReadyInstance(instance: AppInstanceOption) {
   if (checkedStatus && !statusReady(checkedStatus)) {
     return false
   }
-  return String(lastCheck.dockerVersion ?? '').trim() !== '' && String(lastCheck.composeVersion ?? '').trim() !== ''
+  return String(lastCheck.dockerVersion ?? '').trim() !== ''
 }
 
 function metadataRecord(value: unknown) {

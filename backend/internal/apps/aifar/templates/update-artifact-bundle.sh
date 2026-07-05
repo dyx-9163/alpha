@@ -14,7 +14,7 @@ INGRESS_NETWORK={{ quote .IngressNetwork }}
 DEPLOYMENT_CONCURRENCY={{ .Concurrency }}
 
 RUNTIME_DIR="$INSTALL_ROOT/runtime"
-APP_DIR="$RUNTIME_DIR/docker-apps"
+APP_DIR="$RUNTIME_DIR/services"
 ENV_DIR="$RUNTIME_DIR/env"
 TMP_DIR="$INSTALL_ROOT/.rollout-bundle-$REVISION-$$"
 DRAIN_SECONDS="${DRAIN_SECONDS:-30}"

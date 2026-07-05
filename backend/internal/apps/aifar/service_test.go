@@ -517,14 +517,14 @@ type bundleTestArtifact struct {
 
 func installedAIFARInstance(t *testing.T) store.AppInstance {
 	t.Helper()
-	releaseID := "20260701T010203.000000000Z-docker-apps"
+	releaseID := "20260701T010203.000000000Z-runtime-v2"
 	metadata := map[string]any{
 		"installRoot":           "/aifar/apps/admin",
 		"runtimeDir":            "/aifar/apps/admin/runtime",
 		"orchestrationModel":    orchestrationModelK8sLikeV1,
 		"releaseId":             releaseID,
 		"currentRevision":       releaseID,
-		"releaseVersion":        "docker-apps",
+		"releaseVersion":        "runtime-v2",
 		"configHash":            "base-config-hash",
 		"services":              serviceOrder,
 		"gatewayPort":           defaultGatewayPort,
@@ -537,7 +537,7 @@ func installedAIFARInstance(t *testing.T) store.AppInstance {
 	return store.AppInstance{
 		ID:       "aifar-1",
 		App:      "aifar",
-		Version:  "docker-apps",
+		Version:  "runtime-v2",
 		ServerID: "srv-1",
 		Status:   "installed",
 		Topology: defaultTopology,
@@ -729,7 +729,7 @@ func TestScaleOutCreatesReplicaAndUpdatesEndpointMetadata(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(remote.autoscaleScript, "AIFAR_AUTOSCALE_OUT") || !strings.Contains(remote.autoscaleScript, "aifar-pod-admin-permission-20260701t010203.000000000z-docker-apps-r2") {
+	if !strings.Contains(remote.autoscaleScript, "AIFAR_AUTOSCALE_OUT") || !strings.Contains(remote.autoscaleScript, "aifar-pod-admin-permission-20260701t010203.000000000z-runtime-v2-r2") {
 		t.Fatalf("expected autoscale remote script to run with replica container, got:\n%s", remote.autoscaleScript)
 	}
 	saved, err := s.GetAppInstance(instance.ID)
@@ -923,7 +923,7 @@ func TestOptionsDefaultsUseRequestedAIFARValues(t *testing.T) {
 	}
 }
 
-func TestServiceInstallsAIFARServiceFromDockerAppsBundle(t *testing.T) {
+func TestServiceInstallsAIFARServiceFromRuntimeV2Bundle(t *testing.T) {
 	withFakeRuntimeAgentBinary(t)
 	root := createAIFARBundle(t)
 	s := &fakeStore{servers: map[string]store.Server{
@@ -939,7 +939,7 @@ func TestServiceInstallsAIFARServiceFromDockerAppsBundle(t *testing.T) {
 			"nacosHost": "10.0.0.50",
 			"webPort":   18080,
 		},
-	}, []store.Resource{{App: "aifar", Part: "backend", Version: "docker-apps", Path: filepath.Join(root, "docker-apps", ".env")}}, fakeLogger{}, nil)
+	}, aifarModuleValidationResources(root), fakeLogger{}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -947,7 +947,7 @@ func TestServiceInstallsAIFARServiceFromDockerAppsBundle(t *testing.T) {
 		t.Fatalf("expected one AIFAR instance, got %+v", s.instances)
 	}
 	instance := s.instances[0]
-	if instance.App != "aifar" || instance.Version != "docker-apps" || instance.ServerID != "srv-1" || instance.Status != "installed" {
+	if instance.App != "aifar" || instance.Version != "runtime-v2" || instance.ServerID != "srv-1" || instance.Status != "installed" {
 		t.Fatalf("unexpected instance: %+v", instance)
 	}
 	if strings.Contains(instance.Metadata, "secret-value") || strings.Contains(instance.Metadata, "minio-secret") {
@@ -980,13 +980,17 @@ func TestServiceInstallsAIFARServiceFromDockerAppsBundle(t *testing.T) {
 	}
 	for _, want := range []string{
 		`ORCHESTRATION_MODEL="agent-runtime-v2"`,
-		`AGENT_BINARY='/aifar/apps/_work/aifar-docker-apps-`,
+		`AGENT_BINARY='/aifar/apps/_work/aifar-runtime-v2-`,
 		`install -m 0755 "$AGENT_BINARY" /usr/local/bin/aifar-agent`,
 		`installing or upgrading AIFAR runtime agent`,
 		`ExecStart=/usr/local/bin/aifar-agent serve --addr $AGENT_LISTEN_ADDR`,
 		`ExecStopPost=-/usr/local/bin/aifar-agent deregister-nacos --state-dir /var/lib/aifar-agent/instances`,
 		`systemctl $agent_start_cmd aifar-agent`,
 		`RUNTIME_DIR="$INSTALL_ROOT/runtime"`,
+		`APP_DIR="$RUNTIME_DIR/services"`,
+		`IMAGE_DIR="$RUNTIME_DIR/images"`,
+		`[ -f "$TMP_DIR/manifest.json" ] || fail "runtime-v2 manifest.json is missing in bundle"`,
+		`[ -d "$TMP_DIR/services" ] || fail "services directory is missing in runtime-v2 bundle"`,
 		`NACOS_REGISTRATION_MODE="agent-proxy"`,
 		`check_agent_dependency`,
 		`aifar-agent status >/dev/null 2>&1`,
@@ -1013,7 +1017,7 @@ func TestServiceInstallsAIFARServiceFromDockerAppsBundle(t *testing.T) {
 	if strings.LastIndex(remote.installScript, "check_agent_dependency") > strings.LastIndex(remote.installScript, "build_images") {
 		t.Fatalf("AIFAR install script should check aifar-agent before building images:\n%s", remote.installScript)
 	}
-	if !strings.Contains(remote.joinedUploads(), "aifar-agent-linux-amd64->/aifar/apps/_work/aifar-docker-apps-") {
+	if !strings.Contains(remote.joinedUploads(), "aifar-agent-linux-amd64->/aifar/apps/_work/aifar-runtime-v2-") {
 		t.Fatalf("AIFAR install should upload runtime agent, uploads=%s", remote.joinedUploads())
 	}
 	if strings.Contains(remote.installScript, `/"Status"/ {print $4; exit}`) {
@@ -1121,7 +1125,7 @@ func TestServiceMarksAIFARInstallFailedWhenRemoteDeployFails(t *testing.T) {
 		Parameters: map[string]any{
 			"nacosHost": "10.0.0.50",
 		},
-	}, []store.Resource{{App: "aifar", Part: "backend", Version: "docker-apps", Path: filepath.Join(root, "docker-apps", ".env")}}, fakeLogger{}, nil)
+	}, []store.Resource{{App: "aifar", Part: "backend", Version: "runtime-v2", Path: filepath.Join(root, appBundleVersion, bundleManifestName)}}, fakeLogger{}, nil)
 	if err == nil {
 		t.Fatal("expected remote deploy failure")
 	}
@@ -1156,7 +1160,7 @@ func TestServiceInstallsSelectedAIFARModules(t *testing.T) {
 			"nacosHost":        "10.0.0.50",
 			"selectedServices": []string{"oauth", "gateway", "web-vue3"},
 		},
-	}, []store.Resource{{App: "aifar", Part: "backend", Version: "docker-apps", Path: filepath.Join(root, "docker-apps", ".env")}}, fakeLogger{}, nil)
+	}, []store.Resource{{App: "aifar", Part: "backend", Version: "runtime-v2", Path: filepath.Join(root, appBundleVersion, bundleManifestName)}}, fakeLogger{}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1206,7 +1210,7 @@ func TestServiceInstallsMissingAIFARModulesAfterInitialInstall(t *testing.T) {
 	instance := installedAIFARInstance(t)
 	metadata := metadataFromInstance(instance)
 	initialServices := []string{"gateway", "web-vue3"}
-	for key, value := range releaseOrchestrationMetadata("/aifar/apps/admin", "20260701T010203.000000000Z-docker-apps", defaultNetworkName, defaultGatewayPort, defaultWebPort, initialServices) {
+	for key, value := range releaseOrchestrationMetadata("/aifar/apps/admin", "20260701T010203.000000000Z-runtime-v2", defaultNetworkName, defaultGatewayPort, defaultWebPort, initialServices) {
 		metadata[key] = value
 	}
 	metadata["services"] = initialServices
@@ -1421,7 +1425,7 @@ func TestServiceIgnoresBusinessDependencyParameters(t *testing.T) {
 			"redisSentinelNodes":      "10.0.0.41:26379,10.0.0.42:26379",
 			"minioEndpoint":           "http://10.0.0.60:9000",
 		},
-	}, []store.Resource{{App: "aifar", Part: "backend", Version: "docker-apps", Path: filepath.Join(root, "docker-apps", ".env")}}, fakeLogger{}, nil)
+	}, []store.Resource{{App: "aifar", Part: "backend", Version: "runtime-v2", Path: filepath.Join(root, appBundleVersion, bundleManifestName)}}, fakeLogger{}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1542,7 +1546,7 @@ func TestServiceUpdatesAIFARServiceArtifactAsPartialRelease(t *testing.T) {
 	if err := json.Unmarshal([]byte(s.instances[0].Metadata), &metadata); err != nil {
 		t.Fatal(err)
 	}
-	if metadata["releaseId"] == "20260701T010203.000000000Z-docker-apps" || metadata["configHash"] == "base-config-hash" {
+	if metadata["releaseId"] == "20260701T010203.000000000Z-runtime-v2" || metadata["configHash"] == "base-config-hash" {
 		t.Fatalf("expected release metadata to change, got %s", s.instances[0].Metadata)
 	}
 	lastUpdate, ok := metadata["lastRollout"].(map[string]any)
@@ -1768,7 +1772,7 @@ func TestServiceResolvesManagedNacosInstance(t *testing.T) {
 			"nacosSource":     "existing",
 			"nacosInstanceId": "nacos-node-1",
 		},
-	}, []store.Resource{{App: "aifar", Part: "backend", Version: "docker-apps", Path: filepath.Join(root, "docker-apps", ".env")}}, fakeLogger{}, nil)
+	}, []store.Resource{{App: "aifar", Part: "backend", Version: "runtime-v2", Path: filepath.Join(root, appBundleVersion, bundleManifestName)}}, fakeLogger{}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1848,60 +1852,66 @@ func TestModuleValidateInstallAcceptsDockerRuntime(t *testing.T) {
 	}
 }
 
-func TestModuleValidateInstallRejectsDockerWithoutCompose(t *testing.T) {
+func TestModuleValidateInstallAllowsDockerWithoutCompose(t *testing.T) {
 	root := createAIFARBundle(t)
-	module := NewModule(&fakeStore{
+	dockerInstance := store.AppInstance{
+		ID:       "docker-1",
+		App:      "docker",
+		Version:  "24.0.9",
+		ServerID: "srv-1",
+		Status:   "running",
+		Metadata: mustMetadata(t, map[string]any{
+			"lastCheck": map[string]any{
+				"dockerVersion":  "Docker version 24.0.9",
+				"composeVersion": "",
+			},
+		}),
+	}
+	if !dockerRuntimeReady(dockerInstance) {
+		t.Fatal("expected Docker runtime readiness to ignore missing composeVersion")
+	}
+	store := &fakeStore{
 		servers: map[string]store.Server{
 			"srv-1": {ID: "srv-1", Name: "app-1", Host: "10.0.0.10", DeployDir: "/aifar/apps"},
 		},
-		instances: []store.AppInstance{
-			{
-				ID:       "docker-1",
-				App:      "docker",
-				Version:  "24.0.9",
-				ServerID: "srv-1",
-				Status:   "running",
-				Metadata: mustMetadata(t, map[string]any{
-					"lastCheck": map[string]any{
-						"dockerVersion":  "Docker version 24.0.9",
-						"composeVersion": "",
-					},
-				}),
-			},
-		},
-	}, &fakeRemote{})
+		instances: []store.AppInstance{dockerInstance},
+	}
+	module := NewModule(store, &fakeRemote{})
+	if err := module.service.ensureDockerRuntimeReady("srv-1", copyFor("en")); err != nil {
+		t.Fatalf("expected service Docker runtime check to pass without Compose, got %v", err)
+	}
 	err := module.ValidateInstall(context.Background(), registry.InstallRequest{
 		Version:    "latest",
 		ServerID:   "srv-1",
 		Language:   "en",
 		Parameters: aifarModuleValidationParams(),
 	}, aifarModuleValidationResources(root))
-	if err == nil || !strings.Contains(err.Error(), "Docker Engine") {
-		t.Fatalf("expected Docker Compose validation error, got %v", err)
+	if err != nil {
+		t.Fatalf("expected Docker Engine validation to pass without Compose, got %v", err)
 	}
 }
 
-func TestSelectBundleIgnoresDockerSQLVersion(t *testing.T) {
+func TestSelectBundleRequiresRuntimeV2ManifestResource(t *testing.T) {
 	root := createAIFARBundle(t)
 	resources := []store.Resource{
-		{App: "aifar", Part: "backend", Version: "docker-sql", Path: filepath.Join(root, "docker-sql", "aifar_init.sql")},
 		{App: "aifar", Part: "backend", Version: "docker-apps", Path: filepath.Join(root, "docker-apps", ".env")},
+		{App: "aifar", Part: "backend", Version: "runtime-v2", Path: filepath.Join(root, appBundleVersion, bundleManifestName)},
 	}
 	bundle, err := SelectBundle(resources, "latest")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if bundle.Version != "docker-apps" || filepath.Base(bundle.AppDir) != "docker-apps" {
-		t.Fatalf("expected docker-apps bundle, got %+v", bundle)
+	if bundle.Version != "runtime-v2" || filepath.Base(bundle.Root) != "runtime-v2" || filepath.Base(bundle.AppDir) != "services" {
+		t.Fatalf("expected runtime-v2 bundle, got %+v", bundle)
 	}
-	if _, err := SelectBundle(resources, "docker-sql"); err == nil {
-		t.Fatal("expected docker-sql to be rejected as an installable AIFAR version")
+	if _, err := SelectBundle(resources, "docker-apps"); err == nil {
+		t.Fatal("expected docker-apps to be rejected as an installable AIFAR version")
 	}
 }
 
-func TestCreateBundleArchiveExcludesBundledNacosAndSQL(t *testing.T) {
+func TestCreateBundleArchiveExcludesBundledNacos(t *testing.T) {
 	root := createAIFARBundle(t)
-	nacosDir := filepath.Join(root, "docker-apps", "nacos")
+	nacosDir := filepath.Join(root, appBundleVersion, appBundleDir, "nacos")
 	if err := os.MkdirAll(nacosDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -1912,10 +1922,12 @@ func TestCreateBundleArchiveExcludesBundledNacosAndSQL(t *testing.T) {
 		t.Fatal(err)
 	}
 	archivePath, err := CreateBundleArchive(Bundle{
-		Version: appBundleVersion,
-		Root:    root,
-		AppDir:  filepath.Join(root, appBundleDir),
-		SQLDir:  filepath.Join(root, sqlBundleDir),
+		Version:      appBundleVersion,
+		Root:         filepath.Join(root, appBundleVersion),
+		AppDir:       filepath.Join(root, appBundleVersion, appBundleDir),
+		ImageDir:     filepath.Join(root, appBundleVersion, imageBundleDir),
+		RuntimeDir:   filepath.Join(root, appBundleVersion, runtimeBundleDir),
+		ManifestPath: filepath.Join(root, appBundleVersion, bundleManifestName),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1941,8 +1953,8 @@ func TestCreateBundleArchiveExcludesBundledNacosAndSQL(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if strings.HasPrefix(header.Name, "docker-apps/nacos") || strings.HasPrefix(header.Name, "docker-sql") {
-			t.Fatalf("archive should exclude bundled Nacos and SQL assets, found %s", header.Name)
+		if strings.HasPrefix(header.Name, "services/nacos") || strings.HasSuffix(header.Name, "/docker-compose.yaml") {
+			t.Fatalf("archive should exclude legacy runtime assets, found %s", header.Name)
 		}
 	}
 }
@@ -1973,7 +1985,7 @@ func stringSliceFromAny(value any) []string {
 }
 
 func aifarModuleValidationResources(root string) []store.Resource {
-	return []store.Resource{{App: "aifar", Part: "backend", Version: "docker-apps", Path: filepath.Join(root, "docker-apps", ".env")}}
+	return []store.Resource{{App: "aifar", Part: "backend", Version: "runtime-v2", Path: filepath.Join(root, appBundleVersion, bundleManifestName)}}
 }
 
 func aifarModuleValidationParams() map[string]any {
@@ -1986,7 +1998,7 @@ func TestServiceChecksAIFARServiceAndUpdatesStatus(t *testing.T) {
 	instance := store.AppInstance{
 		ID:       "app-1",
 		App:      "aifar",
-		Version:  "docker-apps",
+		Version:  "runtime-v2",
 		ServerID: "srv-1",
 		Status:   "installed",
 		Metadata: `{"installRoot":"/aifar/apps/admin"}`,
@@ -2062,19 +2074,35 @@ func TestStatusCommandScansK8sLikePodsAndAgentRuntime(t *testing.T) {
 func createAIFARBundle(t *testing.T) string {
 	t.Helper()
 	root := t.TempDir()
-	appDir := filepath.Join(root, "docker-apps")
-	sqlDir := filepath.Join(root, "docker-sql")
-	imageDir := filepath.Join(root, "docker-images")
-	if err := os.MkdirAll(sqlDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
+	bundleRoot := filepath.Join(root, appBundleVersion)
+	appDir := filepath.Join(bundleRoot, appBundleDir)
+	imageDir := filepath.Join(bundleRoot, imageBundleDir)
+	runtimeDir := filepath.Join(bundleRoot, runtimeBundleDir)
 	if err := os.MkdirAll(imageDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(sqlDir, "aifar_cloud_nacos.sql"), []byte("select 1;"), 0o644); err != nil {
+	if err := os.MkdirAll(runtimeDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(sqlDir, "aifar_init.sql"), []byte("select 1;"), 0o644); err != nil {
+	manifest := map[string]any{
+		"schema":   appBundleSchema,
+		"version":  appBundleVersion,
+		"services": serviceOrder,
+		"images":   []string{"openjre-rocky-21.tar", "nginx-stable-alpine.tar"},
+		"layout": map[string]string{
+			"services": appBundleDir,
+			"images":   imageBundleDir,
+			"runtime":  runtimeBundleDir,
+		},
+		"files": map[string]any{
+			bundleManifestName: map[string]string{"part": "backend"},
+		},
+	}
+	manifestData, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bundleRoot, bundleManifestName), manifestData, 0o644); err != nil {
 		t.Fatal(err)
 	}
 	for _, image := range []string{"openjre-rocky-21.tar", "nginx-stable-alpine.tar"} {
@@ -2088,7 +2116,7 @@ func createAIFARBundle(t *testing.T) string {
 	if err := os.WriteFile(filepath.Join(appDir, ".env"), []byte("APP_NETWORK_NAME=aifar-network\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	for _, service := range []string{"gateway", "web-vue3"} {
+	for _, service := range serviceOrder {
 		dir := filepath.Join(appDir, service)
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			t.Fatal(err)
@@ -2096,7 +2124,7 @@ func createAIFARBundle(t *testing.T) string {
 		if err := os.WriteFile(filepath.Join(dir, ".env"), []byte("APP_CONTAINER_NAME=aifar-"+service+"\n"), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		if err := os.WriteFile(filepath.Join(dir, "docker-compose.yaml"), []byte("services: {}\n"), 0o644); err != nil {
+		if err := os.WriteFile(filepath.Join(dir, "Dockerfile"), []byte("FROM scratch\n"), 0o644); err != nil {
 			t.Fatal(err)
 		}
 	}
