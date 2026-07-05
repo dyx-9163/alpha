@@ -37,6 +37,29 @@ The server reads:
 - `AIFAR_BOOTSTRAP_USERNAME`, default `admin`
 - `AIFAR_BOOTSTRAP_PASSWORD`, default from `AIFAR_DEFAULT_PASSWORD`
 
+## AIFAR agent runtime commands
+
+`aifar-agent` is the local runtime-v2 controller and service data plane used by
+AIFAR application deployments. The long-running command is `serve`; most other
+commands are small clients that either check local prerequisites or call the
+agent API on `127.0.0.1:18081`.
+
+| Command | Purpose |
+| --- | --- |
+| `aifar-agent health` | Checks whether the host Docker daemon is reachable by running `docker info`. Prints `{"status":"ok"}` on success. |
+| `aifar-agent serve --addr 127.0.0.1:18081` | Starts the persistent agent. It loads runtime specs from `/var/lib/aifar-agent/instances`, reconciles Docker pods, keeps the endpoint cache fresh, listens on service proxy ports, watches Docker events, runs periodic resync, and maintains Nacos proxy registration and heartbeat. |
+| `aifar-agent status --addr 127.0.0.1:18081` | Reads the running agent status, including listeners, instances, deployments, services, endpoints, Nacos config, and feature flags. Requires `serve` to be running. |
+| `aifar-agent reconcile-runtime --spec runtime-spec.json --addr 127.0.0.1:18081` | Submits a RuntimeSpec v2 to the running agent. The agent aligns desired state by creating, deleting, or rolling Docker pods; refreshing endpoints; starting service proxy listeners; persisting the spec; and registering Nacos proxy instances. Installs, service add-ons, scale-out, and updates should use this command. |
+| `aifar-agent reconcile-ingress --spec runtime-spec.json --addr 127.0.0.1:18081` | Compatibility alias for `reconcile-runtime`, kept for older scripts. Prefer `reconcile-runtime` in new code. |
+| `aifar-agent reconcile --spec runtime-spec.json --addr 127.0.0.1:18081` | Compatibility alias for `reconcile-runtime`. |
+| `aifar-agent remove-instance --instance admin --addr 127.0.0.1:18081` | Removes one runtime instance from the running agent, stops unused proxy listeners, deletes the local agent state for that instance, and tries to deregister its Nacos proxy instances. This is not a full business uninstall and does not remove the install root by itself. |
+| `aifar-agent register-nacos --state-dir /var/lib/aifar-agent/instances` | Replays Nacos proxy registrations for all specs in the state directory. Nacos receives stable `agentIP:servicePort` entries, not pod IPs. |
+| `aifar-agent register-nacos --spec runtime-spec.json --agent-ip 192.168.x.x` | Registers Nacos proxy instances for one spec and optionally forces the registered agent IP. |
+| `aifar-agent register-nacos-proxies ...` | Alias for `register-nacos`. |
+| `aifar-agent deregister-nacos --state-dir /var/lib/aifar-agent/instances` | Deregisters Nacos proxy instances for specs in the state directory. This is used by stop hooks and manual cleanup. |
+| `aifar-agent deregister-nacos --spec runtime-spec.json --agent-ip 192.168.x.x` | Deregisters Nacos proxy instances for one spec and optional agent IP. |
+| `aifar-agent deregister-nacos-proxies ...` | Alias for `deregister-nacos`. |
+
 ## Offline resources
 
 The large resource files are not recreated as source. Extract them from the surviving package:

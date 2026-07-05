@@ -765,3 +765,9 @@
 - 结论：runtime-v2 当前仍用 Dockerfile 做 `docker build`，把 Jar/web dist 打进镜像；`java-common.env` 只是运行时 envFiles 注入。Java Dockerfile 的 COPY/FROM 仍有用，但 ENTRYPOINT 已被 RuntimeSpec 覆盖，后续可收敛为公共 Java/Web Dockerfile 模板。
 - 问题：用户说明 cleanup 是发现 AIFAR 安装成功后无 Pod/Endpoint 才手动执行，安装成功本身已有问题。
 - 结论：排查发现安装成功判定过弱，且本地 `bin/aifar-agent-linux-amd64` 曾是旧二进制。已加强 runtime-v2 安装脚本：agent status 必须包含 `reconcile-runtime`、`local-runtime-controller`、`endpoint-cache` 特征，reconcile 后还要按 Docker labels 等待当前 revision Pod 容器存在，否则安装失败；本地 agent 构建产物已重新生成。
+- 问题：用户询问当前 `aifar-agent` 有哪些命令。
+- 结论：当前分支 `aifar-agent` 支持 `health`、`status`、`reconcile-runtime`、兼容别名 `reconcile-ingress`/`reconcile`、`remove-instance`、`register-nacos`/`register-nacos-proxies`、`deregister-nacos`/`deregister-nacos-proxies`、`serve`；默认 agent API 地址为 `127.0.0.1:18081`，默认状态目录为 `/var/lib/aifar-agent/instances`。
+- 问题：用户要求逐个说明 `aifar-agent` 每个命令的用途。
+- 结论：`health` 只检查本机 Docker 可用性；`serve` 是常驻控制器和数据面；`status` 查询常驻 agent 的运行态；`reconcile-runtime` 提交 RuntimeSpec 并触发创建/删除 Pod、刷新 endpoints、监听 Service 端口和持久化 spec；`remove-instance` 移除某实例路由/state 并摘 Nacos；`register-nacos`/`deregister-nacos` 按 spec 或 state 维护 Nacos 代理实例，`*-proxies` 为同义别名。
+- 问题：用户要求把 `aifar-agent` 命令说明放入文档并提交到本地 Git。
+- 结论：已在 `README.md` 新增 `AIFAR agent runtime commands` 章节，列出 `health`、`serve`、`status`、`reconcile-runtime` 及兼容别名、`remove-instance`、Nacos 注册/摘除命令的用途和注意事项，并准备本地提交。
