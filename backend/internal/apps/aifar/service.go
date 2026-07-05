@@ -1538,13 +1538,14 @@ type bundleUpdateScriptData struct {
 }
 
 type autoscaleOutScriptData struct {
-	InstallRoot    string
-	ServiceName    string
-	ReleaseID      string
-	ReplicaID      int
-	ContainerName  string
-	IngressNetwork string
-	MaxReplicas    int
+	InstallRoot     string
+	ServiceName     string
+	ReleaseID       string
+	ReplicaID       int
+	ContainerName   string
+	IngressNetwork  string
+	MaxReplicas     int
+	DesiredReplicas string
 }
 
 type scaleServiceScriptData struct {

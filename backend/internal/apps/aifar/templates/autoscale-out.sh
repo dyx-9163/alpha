@@ -8,6 +8,7 @@ REPLICA_ID={{ .ReplicaID }}
 CONTAINER_NAME={{ quote .ContainerName }}
 INGRESS_NETWORK={{ quote .IngressNetwork }}
 MAX_REPLICAS={{ .MaxReplicas }}
+CONTROL_PLANE_DESIRED_REPLICAS={{ quote .DesiredReplicas }}
 
 RUNTIME_DIR="$INSTALL_ROOT/runtime"
 ENV_DIR="$RUNTIME_DIR/env"
@@ -179,6 +180,12 @@ replicas_for_service() {
     printf "%s" "$REPLICA_ID"
     return
   fi
+  if value="$(desired_replicas_from_pairs "$service" "$CONTROL_PLANE_DESIRED_REPLICAS")"; then
+    case "$value" in ""|*[!0-9]*) value=1 ;; esac
+    [ "$value" -ge 0 ] || value=0
+    printf "%s" "$value"
+    return
+  fi
   if value="$(desired_replicas_from_env "$service")"; then
     case "$value" in ""|*[!0-9]*) value=1 ;; esac
     [ "$value" -ge 0 ] || value=0
@@ -198,14 +205,20 @@ replicas_for_service() {
   printf "%s" "$replicas"
 }
 
-desired_replicas_from_env() {
+desired_replicas_from_pairs() {
   wanted="$1"
-  for pair in $(read_env_value "$ENV_DIR/compose.env" AIFAR_DESIRED_REPLICAS ""); do
+  pairs="$2"
+  for pair in $pairs; do
     case "$pair" in
       "$wanted="*) printf "%s" "${pair#*=}"; return 0 ;;
     esac
   done
   return 1
+}
+
+desired_replicas_from_env() {
+  wanted="$1"
+  desired_replicas_from_pairs "$wanted" "$(read_env_value "$ENV_DIR/compose.env" AIFAR_DESIRED_REPLICAS "")"
 }
 
 write_desired_replicas_env() {

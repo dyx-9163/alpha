@@ -719,13 +719,14 @@ func TestAutoscaleDoesNotTriggerWithoutMemoryLimitOrDuringCooldown(t *testing.T)
 
 func TestAutoscaleOutScriptUsesReplicaContainerAndEscapedDockerFormats(t *testing.T) {
 	script, err := renderAutoscaleOutScript(autoscaleOutScriptData{
-		InstallRoot:    "/aifar/apps/admin",
-		ServiceName:    "permission",
-		ReleaseID:      "rel-1",
-		ReplicaID:      2,
-		ContainerName:  "aifar-permission-rel-1-r2",
-		IngressNetwork: "aifar-network",
-		MaxReplicas:    3,
+		InstallRoot:     "/aifar/apps/admin",
+		ServiceName:     "permission",
+		ReleaseID:       "rel-1",
+		ReplicaID:       2,
+		ContainerName:   "aifar-permission-rel-1-r2",
+		IngressNetwork:  "aifar-network",
+		MaxReplicas:     3,
+		DesiredReplicas: "gateway=1 file=0 permission=2",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -734,6 +735,8 @@ func TestAutoscaleOutScriptUsesReplicaContainerAndEscapedDockerFormats(t *testin
 		`--format '{{.Names}}'`,
 		`"version": "runtime-v2"`,
 		`"mode": "web-nginx"`,
+		`CONTROL_PLANE_DESIRED_REPLICAS='gateway=1 file=0 permission=2'`,
+		`desired_replicas_from_pairs`,
 		`nacos_ephemeral`,
 		`"ephemeral": $(nacos_ephemeral)`,
 		`replicas_for_service`,
@@ -754,6 +757,11 @@ func TestAutoscaleOutScriptUsesReplicaContainerAndEscapedDockerFormats(t *testin
 func TestScaleOutCreatesReplicaAndUpdatesEndpointMetadata(t *testing.T) {
 	withFakeRuntimeAgentBinary(t)
 	instance := installedAIFARInstance(t)
+	metadata := metadataFromInstance(instance)
+	desiredBefore := desiredReplicasFromMetadata(metadata)
+	desiredBefore["file"] = 0
+	metadata["desiredReplicas"] = desiredBefore
+	instance.Metadata = mustMetadata(t, metadata)
 	s := &fakeStore{
 		servers: map[string]store.Server{"srv-1": {ID: "srv-1", Host: "10.0.0.10", DeployDir: "/aifar/apps"}},
 		instances: []store.AppInstance{
@@ -762,7 +770,7 @@ func TestScaleOutCreatesReplicaAndUpdatesEndpointMetadata(t *testing.T) {
 	}
 	remote := &fakeRemote{autoscaleStatusStdouts: []string{
 		"endpoint=permission|aifar-permission-rel|rel|1|38010|true|healthy|86|2147483648\nhostMemoryAvailableBytes=8589934592\n",
-		"endpoint=permission|aifar-permission-rel|rel|1|38010|true|healthy|50|2147483648\nendpoint=permission|aifar-permission-rel-r2|rel|2|38010|true|healthy|5|2147483648\nhostMemoryAvailableBytes=6442450944\n",
+		"endpoint=permission|aifar-permission-rel|rel|1|38010|true|healthy|50|2147483648\nendpoint=permission|aifar-permission-rel-r2|rel|2|38010|true|healthy|5|2147483648\nendpoint=file|aifar-file-stale|rel|1|38005|true|healthy|5|2147483648\nhostMemoryAvailableBytes=6442450944\n",
 	}}
 	service := NewService(s, remote)
 	err := service.ScaleOut(context.Background(), ScaleOutRequest{
@@ -778,6 +786,9 @@ func TestScaleOutCreatesReplicaAndUpdatesEndpointMetadata(t *testing.T) {
 	if !strings.Contains(remote.autoscaleScript, "AIFAR_AUTOSCALE_OUT") || !strings.Contains(remote.autoscaleScript, "aifar-pod-admin-permission-20260701t010203.000000000z-runtime-v2-r2") {
 		t.Fatalf("expected autoscale remote script to run with replica container, got:\n%s", remote.autoscaleScript)
 	}
+	if !strings.Contains(remote.autoscaleScript, "CONTROL_PLANE_DESIRED_REPLICAS=") || !strings.Contains(remote.autoscaleScript, "file=0") || !strings.Contains(remote.autoscaleScript, "permission=2") {
+		t.Fatalf("expected autoscale script to carry control-plane desired replicas, got:\n%s", remote.autoscaleScript)
+	}
 	uploads := remote.joinedUploads()
 	if !strings.Contains(uploads, "aifar-agent-linux-amd64->/aifar/apps/_work/aifar-agent-runtime-v2-") {
 		t.Fatalf("expected scale-out to upload current runtime agent, uploads=%s", uploads)
@@ -792,19 +803,25 @@ func TestScaleOutCreatesReplicaAndUpdatesEndpointMetadata(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	metadata := metadataFromInstance(saved)
-	desired := desiredReplicasFromMetadata(metadata)
+	savedMetadata := metadataFromInstance(saved)
+	desired := desiredReplicasFromMetadata(savedMetadata)
 	if desired["permission"] != 2 {
 		t.Fatalf("expected permission desired replicas 2, got %v metadata=%s", desired["permission"], saved.Metadata)
 	}
-	endpoints, ok := metadata["activeEndpoints"].(map[string]any)
+	if desired["file"] != 0 {
+		t.Fatalf("expected offline file desired replicas to stay 0, got %v metadata=%s", desired["file"], saved.Metadata)
+	}
+	endpoints, ok := savedMetadata["activeEndpoints"].(map[string]any)
 	if !ok {
 		t.Fatalf("expected activeEndpoints metadata, got %s", saved.Metadata)
 	}
 	if endpointCount(endpoints["permission"]) != 2 {
 		t.Fatalf("expected two permission endpoints, got %s", saved.Metadata)
 	}
-	if _, locked := metadata["orchestrationLock"]; locked {
+	if endpointCount(endpoints["file"]) != 0 {
+		t.Fatalf("expected offline file endpoints to be ignored, got %s", saved.Metadata)
+	}
+	if _, locked := savedMetadata["orchestrationLock"]; locked {
 		t.Fatalf("expected orchestration lock to be released, got %s", saved.Metadata)
 	}
 }

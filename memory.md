@@ -805,3 +805,5 @@
 - 结论：两者不改变服务调用地址和 Java 业务逻辑，差异在 Nacos 实例生命周期。`ephemeral=true` 是临时实例，依赖心跳，agent 掉线后 Nacos 自动剔除，适合容器/Pod/agent 代理；`ephemeral=false` 是持久实例，适合固定机器服务，agent 异常退出时容易留下 stale 实例，需要 `deregister-nacos` 或人工清理。AIFAR 新装应优先统一 `true`，仅对已被 Nacos 固定为 persistent 的历史服务 fallback 为 `false`。
 - 问题：用户要求在 AIFAR Runtime 页面增加下线某个 deployment 的功能，并给 Nacos `ephemeral` 配置加页面开关，便于测试 Nacos 服务状态。
 - 结论：已新增服务下线入口：将目标服务期望副本数设置为 0，RuntimeSpec 允许 0 副本，agent reconcile 删除对应 Pod 并在 Nacos 代理注册阶段摘除该服务；运行参数弹窗新增 `Nacos ephemeral` 开关并写入 spec，安装/补装/扩容/更新/运行配置脚本统一读取该配置。
+- 问题：用户反馈服务下线后再扩容其他服务时，agent 误启动已下线的 file Pod，导致扩容失败。
+- 结论：根因是 autoscale-out 脚本在生成全量 RuntimeSpec 时，缺少控制面 desiredReplicas 快照，遇到下线服务会按 Docker 当前数量/默认 1 误恢复。已改为后端把完整 desiredReplicas 传给脚本，脚本优先使用控制面快照，扩容完成后也不会用残留 endpoint 反推已下线服务；补充测试覆盖 `file=0` 时扩容其他服务仍保持 0。
