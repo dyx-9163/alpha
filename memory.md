@@ -787,3 +787,5 @@
 - 结论：固定服务身份的方向合理，但不应把固定服务名叫 `Revision`；Deployment/Service 应展示稳定的 service/app name，例如 `alpha-gateway`，而动态发布批次/镜像 tag/Pod template hash 才应叫 revision，Pod 和 image 继续携带动态 revision 便于滚动、清理和排障。
 - 问题：用户要求按不兼容旧版本方式改造 Deployment/Service 固定身份，历史记录会删除后重新安装。
 - 结论：RuntimeSpec v2 的 Deployment 动态版本字段从 `revision` 改为 `podRevision`，新增固定 `deploymentName`；Service/Deployment 对外返回固定 `appName/deploymentName`，容器页服务表展示应用名，动态 Revision 只保留在 Pod/镜像/发布记录层；Nacos 仍只注册 Java 服务，跳过 `web-vue3`。
+- 问题：用户截图显示 OAuth Pod 已运行，但 Nacos `prod` 服务列表缺少 `alpha-oauth`。
+- 结论：当前 agent-only 模型中 Java Pod 自注册被禁用，Nacos 应由 `aifar-agent` 按 RuntimeSpec 注册 `alpha-oauth -> agentHost:38001`。代码映射和 skip 逻辑确认 OAuth 不会被设计性跳过；优先排查目标机运行的 agent/spec 是否为最新、spec 的 `services[]` 是否包含 `oauth/alpha-oauth`，以及 `aifar-agent reconcile-runtime` 或 Nacos 心跳日志是否注册失败。
