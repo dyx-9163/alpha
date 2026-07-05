@@ -757,3 +757,5 @@
 - 结论：AIFAR 离线包标准改为 `resources/aifar/runtime-v2/{manifest.json,services,images,runtime}`；安装准入只接受 `aifar-runtime-bundle-v2` manifest，不再兼容旧 `docker-apps`/`docker-images`，脚本解包后按 RuntimeSpec v2 交给 agent reconcile。
 - 问题：用户要求删除 `resources/aifar/runtime-v2/services` 中已不用的文件。
 - 结论：runtime-v2 不再使用 Docker Compose 启动服务，已删除各服务目录下旧 `docker-compose.yaml`；保留 `.env`、`Dockerfile`、Jar、web dist 和 nginx 配置等安装构建仍需文件。
+- 问题：用户询问 `services` 下 `.env` 是否能做成公用或移到其他地方。
+- 结论：runtime-v2 标准调整为 `services/` 只放构建上下文和业务工件；服务级 `.env` 不再需要，公共默认项移到 `runtime/defaults.env`，安装时再生成远端 `$RUNTIME_DIR/env/*.env` 和 RuntimeSpec。

@@ -196,9 +196,8 @@ check_agent_dependency() {
 
 write_service_env() {
   service="$1"
-  source_env="$APP_DIR/$service/.env"
   service_env="$ENV_DIR/$service.env"
-  image="$(retag_image "$(read_env_value "$source_env" APP_IMAGE "aifar-$service:latest")")"
+  image="$(retag_image "aifar-$service:latest")"
   : > "$service_env"
   set_env APP_IMAGE "$image" "$service_env"
   set_env APP_CONTAINER_NAME "$(pod_name "$service" "$REVISION" 1)" "$service_env"

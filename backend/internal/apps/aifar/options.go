@@ -25,6 +25,7 @@ const (
 	imageBundleDir       = "images"
 	runtimeBundleDir     = "runtime"
 	bundleManifestName   = "manifest.json"
+	runtimeDefaultsName  = "defaults.env"
 	installDirName       = "admin"
 	defaultTopology      = "single"
 	defaultNetworkName   = "aifar-network"
@@ -269,8 +270,8 @@ func VerifyBundle(bundle Bundle) error {
 	} else if !info.IsDir() {
 		return fmt.Errorf("AIFAR app bundle is not a directory: %s", bundle.AppDir)
 	}
-	if _, err := os.Stat(filepath.Join(bundle.AppDir, ".env")); err != nil {
-		return fmt.Errorf("AIFAR common .env is required: %w", err)
+	if _, err := os.Stat(filepath.Join(bundle.RuntimeDir, runtimeDefaultsName)); err != nil {
+		return fmt.Errorf("AIFAR runtime defaults.env is required: %w", err)
 	}
 	requiredImages := manifest.Images
 	if len(requiredImages) == 0 {
@@ -292,9 +293,6 @@ func VerifyBundle(bundle Bundle) error {
 		}
 		if _, err := os.Stat(filepath.Join(bundle.AppDir, service, "Dockerfile")); err != nil {
 			return fmt.Errorf("AIFAR service %s Dockerfile is required: %w", service, err)
-		}
-		if _, err := os.Stat(filepath.Join(bundle.AppDir, service, ".env")); err != nil {
-			return fmt.Errorf("AIFAR service %s .env is required: %w", service, err)
 		}
 	}
 	return nil

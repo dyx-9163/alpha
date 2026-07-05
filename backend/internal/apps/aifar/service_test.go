@@ -989,8 +989,10 @@ func TestServiceInstallsAIFARServiceFromRuntimeV2Bundle(t *testing.T) {
 		`RUNTIME_DIR="$INSTALL_ROOT/runtime"`,
 		`APP_DIR="$RUNTIME_DIR/services"`,
 		`IMAGE_DIR="$RUNTIME_DIR/images"`,
+		`DEFAULT_ENV="$BUNDLE_DIR/defaults.env"`,
 		`[ -f "$TMP_DIR/manifest.json" ] || fail "runtime-v2 manifest.json is missing in bundle"`,
 		`[ -d "$TMP_DIR/services" ] || fail "services directory is missing in runtime-v2 bundle"`,
+		`[ -f "$TMP_DIR/runtime/defaults.env" ] || fail "runtime/defaults.env is missing in runtime-v2 bundle"`,
 		`NACOS_REGISTRATION_MODE="agent-proxy"`,
 		`check_agent_dependency`,
 		`aifar-agent status >/dev/null 2>&1`,
@@ -2113,15 +2115,12 @@ func createAIFARBundle(t *testing.T) string {
 	if err := os.MkdirAll(appDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(appDir, ".env"), []byte("APP_NETWORK_NAME=aifar-network\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(runtimeDir, runtimeDefaultsName), []byte("APP_RESTART_POLICY=unless-stopped\nAPP_HEALTH_INTERVAL=15s\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	for _, service := range serviceOrder {
 		dir := filepath.Join(appDir, service)
 		if err := os.MkdirAll(dir, 0o755); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(filepath.Join(dir, ".env"), []byte("APP_CONTAINER_NAME=aifar-"+service+"\n"), 0o644); err != nil {
 			t.Fatal(err)
 		}
 		if err := os.WriteFile(filepath.Join(dir, "Dockerfile"), []byte("FROM scratch\n"), 0o644); err != nil {
