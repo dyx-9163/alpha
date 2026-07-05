@@ -687,15 +687,21 @@ func TestAutoscaleOutScriptUsesReplicaContainerAndEscapedDockerFormats(t *testin
 		t.Fatal(err)
 	}
 	for _, want := range []string{
-		`--name "$CONTAINER_NAME"`,
-		`--label "aifar.replica=$REPLICA_ID"`,
 		`--format '{{.Names}}'`,
-		`docker run -d`,
-		`curl -sS --connect-timeout $health_connect_timeout -o /dev/null ${health_protocol}://${health_host}:${port}/ || exit 1`,
-		`APP_STARTUP_TIMEOUT 300`,
+		`"version": "runtime-v2"`,
+		`"mode": "web-nginx"`,
+		`"ephemeral": true`,
+		`replicas_for_service`,
+		`write_runtime_spec`,
+		`aifar-agent reconcile-runtime --spec "$spec"`,
 	} {
 		if !strings.Contains(script, want) {
 			t.Fatalf("autoscale script missing %q:\n%s", want, script)
+		}
+	}
+	for _, legacy := range []string{`docker run -d`, `--name "$CONTAINER_NAME"`, `ephemeral=false`} {
+		if strings.Contains(script, legacy) {
+			t.Fatalf("autoscale script should not contain legacy direct runtime action %q:\n%s", legacy, script)
 		}
 	}
 }
@@ -840,14 +846,18 @@ func TestRuntimeConfigScriptRendersDynamicJavaApply(t *testing.T) {
 		`resource.%s.env`,
 		`java-jvm.options`,
 		`java-jvm.$service.options`,
-		`docker update --cpus "$cpus"`,
-		`--memory-swap "$memory"`,
-		`--label aifar.dynamic-jvm=true`,
-		`--entrypoint /bin/sh`,
+		`java-entrypoint.sh`,
+		`"version": "runtime-v2"`,
+		`"resources": {"cpus":"%s","memory":"%s"}`,
 		`aifar-agent reconcile-runtime --spec "$spec"`,
 	} {
 		if !strings.Contains(script, want) {
 			t.Fatalf("runtime config script missing %q:\n%s", want, script)
+		}
+	}
+	for _, legacy := range []string{`docker update --cpus`, `docker restart`, `docker run -d`} {
+		if strings.Contains(script, legacy) {
+			t.Fatalf("runtime config script should not contain legacy direct container mutation %q:\n%s", legacy, script)
 		}
 	}
 }
@@ -969,7 +979,7 @@ func TestServiceInstallsAIFARServiceFromDockerAppsBundle(t *testing.T) {
 		t.Fatalf("expected external Nacos endpoint metadata, got %s", instance.Metadata)
 	}
 	for _, want := range []string{
-		`ORCHESTRATION_MODEL="k8s-like-v1"`,
+		`ORCHESTRATION_MODEL="agent-runtime-v2"`,
 		`AGENT_BINARY='/aifar/apps/_work/aifar-docker-apps-`,
 		`install -m 0755 "$AGENT_BINARY" /usr/local/bin/aifar-agent`,
 		`installing or upgrading AIFAR runtime agent`,
@@ -980,9 +990,7 @@ func TestServiceInstallsAIFARServiceFromDockerAppsBundle(t *testing.T) {
 		`NACOS_REGISTRATION_MODE="agent-proxy"`,
 		`check_agent_dependency`,
 		`aifar-agent status >/dev/null 2>&1`,
-		`register_nacos_proxy`,
 		`SPRING_CLOUD_NACOS_DISCOVERY_REGISTER_ENABLED "false"`,
-		`start_pod "$service" 1`,
 		`reconcile_runtime`,
 		`aifar-agent reconcile-runtime --spec "$spec"`,
 		`wait_runtime_ports`,
@@ -990,20 +998,16 @@ func TestServiceInstallsAIFARServiceFromDockerAppsBundle(t *testing.T) {
 		`tcp_probe 127.0.0.1 "$WEB_VUE3_PORT"`,
 		`AIFAR runtime ports are listening`,
 		`runtime-spec.json`,
+		`"version": "runtime-v2"`,
+		`"deployments": [`,
 		`"services": [`,
+		`"mode": "web-nginx"`,
 		`"gatewayService": "gateway"`,
-		`container_status()`,
-		`docker inspect --format '{{.State.Status}}'`,
-		`docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{end}}'`,
-		`docker logs --tail 120 "$container"`,
+		`"ephemeral": true`,
 		`curl -sS --connect-timeout %s -o /dev/null %s://%s:%s/ || exit 1`,
-		`health="$(container_health "$container")"`,
-		`strip_web_nginx_runtime_routes`,
-		`/^[[:space:]]*location[[:space:]]+\/api\/[[:space:]]*\{/`,
-		`/^[[:space:]]*location[[:space:]]+\/im\/ws\/[[:space:]]*\{/`,
 	} {
 		if !strings.Contains(remote.installScript, want) {
-			t.Fatalf("AIFAR install script should include k8s-like orchestration with %q:\n%s", want, remote.installScript)
+			t.Fatalf("AIFAR install script should include agent-runtime-v2 orchestration with %q:\n%s", want, remote.installScript)
 		}
 	}
 	if strings.LastIndex(remote.installScript, "check_agent_dependency") > strings.LastIndex(remote.installScript, "build_images") {
@@ -1025,6 +1029,10 @@ func TestServiceInstallsAIFARServiceFromDockerAppsBundle(t *testing.T) {
 		`nginx -s reload`,
 		`CURRENT_LINK="$INSTALL_ROOT/current"`,
 		`RELEASES_DIR="$INSTALL_ROOT/releases"`,
+		`register_nacos_proxy`,
+		`start_pod "$service"`,
+		`strip_web_nginx_runtime_routes`,
+		`ephemeral=false`,
 	} {
 		if strings.Contains(remote.installScript, legacy) {
 			t.Fatalf("AIFAR install script should not make web-vue3 depend on gateway DNS %q:\n%s", legacy, remote.installScript)
@@ -1292,13 +1300,13 @@ func TestServiceRuntimeReconcileRepairsNacosProxyRegistration(t *testing.T) {
 		`aifar-agent reconcile-runtime --spec "$SPEC_PATH"`,
 		`open_service_ports gateway oauth permission system file message im contacts meeting web-vue3`,
 		`allow_selinux_ports http_port_t $ports`,
-		`register_nacos_proxy "$service"`,
-		`oauth alpha-oauth`,
-		`curl -fsS -X POST "$url"`,
 	} {
 		if !strings.Contains(remote.runtimeReconcileScript, want) {
 			t.Fatalf("runtime reconcile script should contain %q:\n%s", want, remote.runtimeReconcileScript)
 		}
+	}
+	if strings.Contains(remote.runtimeReconcileScript, "register_nacos_proxy") || strings.Contains(remote.runtimeReconcileScript, "ephemeral=false") {
+		t.Fatalf("runtime reconcile script should leave Nacos registration to aifar-agent:\n%s", remote.runtimeReconcileScript)
 	}
 }
 
@@ -1515,13 +1523,12 @@ func TestServiceUpdatesAIFARServiceArtifactAsPartialRelease(t *testing.T) {
 		`RUNTIME_DIR="$INSTALL_ROOT/runtime"`,
 		`apply_artifact`,
 		`docker build -t "$image" "$APP_DIR/$SERVICE_NAME"`,
-		`start_pod "$replica"`,
+		`write_runtime_spec`,
+		`"version": "runtime-v2"`,
+		`"deployments": [`,
+		`"healthCheck": {"command":"`,
 		`reconcile_runtime`,
 		`aifar-agent reconcile-runtime --spec "$spec"`,
-		`stop_old_pods`,
-		`strip_web_nginx_runtime_routes "$service_dir"`,
-		`curl -sS --connect-timeout $health_connect_timeout -o /dev/null ${health_protocol}://${health_host}:${port}/ || exit 1`,
-		`APP_STARTUP_TIMEOUT 300`,
 		`"kind": "rollout"`,
 	} {
 		if !strings.Contains(remote.updateScript, want) {
@@ -1597,12 +1604,12 @@ func TestServiceUpdatesAIFARArtifactBundleAsSingleMultiServicePartialRelease(t *
 		`run_parallel_group "$non_entry"`,
 		`service_changed gateway && rollout_service gateway`,
 		`service_changed web-vue3 && rollout_service web-vue3`,
+		`write_runtime_spec`,
+		`"version": "runtime-v2"`,
+		`"deployments": [`,
+		`"healthCheck": {"command":"`,
 		`reconcile_runtime`,
 		`aifar-agent reconcile-runtime --spec "$spec"`,
-		`stop_old_pods "$service"`,
-		`strip_web_nginx_runtime_routes "$service_dir"`,
-		`curl -sS --connect-timeout $health_connect_timeout -o /dev/null ${health_protocol}://${health_host}:${port}/ || exit 1`,
-		`APP_STARTUP_TIMEOUT 300`,
 		`"kind": "rollout-bundle"`,
 	} {
 		if !strings.Contains(remote.bundleScript, want) {
@@ -2033,7 +2040,7 @@ func TestStatusCommandScansK8sLikePodsAndAgentRuntime(t *testing.T) {
 	command := statusCommand("/aifar/apps/admin")
 	for _, want := range []string{
 		`MODEL_FILE="$INSTALL_ROOT/.aifar/model.json"`,
-		`[ "$MODEL" = "k8s-like-v1" ]`,
+		`[ "$MODEL" = "agent-runtime-v2" ]`,
 		`aifar-agent status`,
 		`label=aifar.component=pod`,
 	} {

@@ -1,7 +1,10 @@
 package runtimeagent
 
 import (
+	"bufio"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,6 +15,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -54,14 +58,15 @@ type ManagerOptions struct {
 }
 
 type Manager struct {
-	mu       sync.RWMutex
-	stateDir string
-	runner   CommandRunner
-	log      io.Writer
-	specs    map[string]RuntimeSpec
-	routes   map[int]proxyRoute
-	servers  map[int]*http.Server
-	next     map[string]uint64
+	mu        sync.RWMutex
+	stateDir  string
+	runner    CommandRunner
+	log       io.Writer
+	specs     map[string]RuntimeSpec
+	routes    map[int]proxyRoute
+	servers   map[int]*http.Server
+	next      map[string]uint64
+	endpoints map[string][]endpoint
 }
 
 type proxyRoute struct {
@@ -85,13 +90,14 @@ func NewManager(options ManagerOptions) *Manager {
 		runner = ExecRunner{}
 	}
 	return &Manager{
-		stateDir: stateDir,
-		runner:   runner,
-		log:      options.Log,
-		specs:    map[string]RuntimeSpec{},
-		routes:   map[int]proxyRoute{},
-		servers:  map[int]*http.Server{},
-		next:     map[string]uint64{},
+		stateDir:  stateDir,
+		runner:    runner,
+		log:       options.Log,
+		specs:     map[string]RuntimeSpec{},
+		routes:    map[int]proxyRoute{},
+		servers:   map[int]*http.Server{},
+		next:      map[string]uint64{},
+		endpoints: map[string][]endpoint{},
 	}
 }
 
@@ -122,6 +128,12 @@ func (m *Manager) Load(ctx context.Context) error {
 func (m *Manager) Apply(ctx context.Context, spec RuntimeSpec) error {
 	spec = NormalizeSpec(spec)
 	if err := validateRuntimeSpec(spec); err != nil {
+		return err
+	}
+	if err := m.reconcileDeployments(ctx, spec); err != nil {
+		return err
+	}
+	if err := m.refreshInstanceEndpoints(ctx, spec); err != nil {
 		return err
 	}
 	routes := routesForSpec(spec)
@@ -205,8 +217,11 @@ func (m *Manager) Status() map[string]any {
 			"instanceId":  spec.InstanceID,
 			"installRoot": spec.InstallRoot,
 			"network":     spec.Network,
+			"deployments": spec.Deployments,
 			"services":    spec.Services,
 			"ingress":     spec.Ingress,
+			"endpoints":   m.endpointsForInstanceLocked(spec.InstanceID),
+			"nacos":       spec.Nacos,
 		})
 	}
 	return map[string]any{
@@ -217,12 +232,115 @@ func (m *Manager) Status() map[string]any {
 		"features": []string{
 			"health",
 			"host-proxy",
+			"local-runtime-controller",
 			"nacos-proxy-deregister",
 			"nacos-proxy-register",
+			"endpoint-cache",
+			"docker-events",
+			"periodic-resync",
 			"reconcile-runtime",
 			"status",
 		},
 	}
+}
+
+func (m *Manager) Resync(ctx context.Context) error {
+	for _, spec := range m.snapshotSpecs() {
+		if err := m.reconcileDeployments(ctx, spec); err != nil {
+			return err
+		}
+		if err := m.refreshInstanceEndpoints(ctx, spec); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (m *Manager) StartRuntimeResync(ctx context.Context, interval time.Duration, nacosOptions NacosProxySyncOptions) {
+	if interval <= 0 {
+		interval = 30 * time.Second
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			specs := m.snapshotSpecs()
+			if len(specs) == 0 {
+				continue
+			}
+			if err := m.Resync(ctx); err != nil {
+				logf(m.log, "AIFAR runtime periodic resync failed: %v\n", err)
+				continue
+			}
+			options := nacosOptions
+			options.Specs = specs
+			options.Action = NacosProxyRegister
+			if err := SyncNacosProxyRegistrations(ctx, options); err != nil {
+				logf(m.log, "AIFAR runtime periodic Nacos replay failed: %v\n", err)
+			}
+		}
+	}
+}
+
+func (m *Manager) StartDockerEventSync(ctx context.Context, debounce time.Duration) {
+	if debounce <= 0 {
+		debounce = 2 * time.Second
+	}
+	for ctx.Err() == nil {
+		if err := m.watchDockerEvents(ctx, debounce); err != nil && ctx.Err() == nil {
+			logf(m.log, "AIFAR Docker event watcher stopped: %v\n", err)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(5 * time.Second):
+			}
+		}
+	}
+}
+
+func (m *Manager) watchDockerEvents(ctx context.Context, debounce time.Duration) error {
+	cmd := exec.CommandContext(ctx, "docker", "events",
+		"--filter", "type=container",
+		"--filter", "label=aifar.app=aifar",
+		"--format", "{{.TimeNano}} {{.Action}} {{.Actor.Attributes.aifar.service}}",
+	)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return err
+	}
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return err
+	}
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	go func() {
+		data, _ := io.ReadAll(stderr)
+		if len(strings.TrimSpace(string(data))) > 0 {
+			logf(m.log, "AIFAR Docker events stderr: %s\n", strings.TrimSpace(string(data)))
+		}
+	}()
+	scanner := bufio.NewScanner(stdout)
+	for scanner.Scan() {
+		select {
+		case <-ctx.Done():
+			_ = cmd.Wait()
+			return ctx.Err()
+		case <-time.After(debounce):
+		}
+		if err := m.Resync(ctx); err != nil {
+			logf(m.log, "AIFAR runtime Docker event resync failed: %v\n", err)
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		_ = cmd.Wait()
+		return err
+	}
+	return cmd.Wait()
 }
 
 func (m *Manager) startPort(port int) error {
@@ -269,11 +387,7 @@ func (m *Manager) handleProxy(port int) func(http.ResponseWriter, *http.Request)
 			http.Error(w, "AIFAR runtime route is not configured", http.StatusServiceUnavailable)
 			return
 		}
-		endpoints, err := m.discoverEndpoints(r.Context(), spec, service)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadGateway)
-			return
-		}
+		endpoints := m.cachedEndpoints(spec.InstanceID, service)
 		if len(endpoints) == 0 {
 			http.Error(w, "AIFAR runtime service has no ready endpoints", http.StatusServiceUnavailable)
 			return
@@ -306,10 +420,264 @@ func (m *Manager) resolveRoute(port int, path string) (RuntimeSpec, string, bool
 		return RuntimeSpec{}, "", false
 	}
 	service := route.Service
-	if route.WebIngress && (strings.HasPrefix(path, "/api/") || strings.HasPrefix(path, "/im/ws/")) {
+	if spec.Ingress.Mode != DefaultIngressMode && route.WebIngress && (strings.HasPrefix(path, "/api/") || strings.HasPrefix(path, "/im/ws/")) {
 		service = spec.Ingress.GatewayService
 	}
 	return spec, service, true
+}
+
+func (m *Manager) reconcileDeployments(ctx context.Context, spec RuntimeSpec) error {
+	for _, deployment := range spec.Deployments {
+		if strings.TrimSpace(deployment.Image) == "" {
+			continue
+		}
+		if err := m.ensureDeployment(ctx, spec, deployment); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (m *Manager) ensureDeployment(ctx context.Context, spec RuntimeSpec, deployment DeploymentSpec) error {
+	for replica := 1; replica <= deployment.Replicas; replica++ {
+		name := containerNameForDeployment(spec, deployment, replica)
+		exists, err := m.containerExists(ctx, name)
+		if err != nil {
+			return err
+		}
+		if exists {
+			recreate, err := m.containerNeedsRecreate(ctx, name, deployment)
+			if err != nil {
+				return err
+			}
+			if recreate {
+				if _, err := m.runner.Run(ctx, "docker", "rm", "-f", name); err != nil {
+					return fmt.Errorf("replace drifted AIFAR pod %s: %w", name, err)
+				}
+				exists = false
+			}
+		}
+		if !exists {
+			if err := m.runContainer(ctx, spec, deployment, replica, name); err != nil {
+				return err
+			}
+		}
+	}
+	return m.removeExtraReplicas(ctx, spec, deployment)
+}
+
+func (m *Manager) containerExists(ctx context.Context, name string) (bool, error) {
+	_, err := m.runner.Run(ctx, "docker", "inspect", "-f", "{{.Id}}", name)
+	if err == nil {
+		return true, nil
+	}
+	return false, nil
+}
+
+func (m *Manager) containerNeedsRecreate(ctx context.Context, name string, deployment DeploymentSpec) (bool, error) {
+	result, err := m.runner.Run(ctx, "docker", "inspect", "-f", `{{index .Config.Labels "aifar.spec-hash"}}`, name)
+	if err != nil {
+		return false, nil
+	}
+	current := strings.TrimSpace(result.Stdout)
+	return current == "" || current != deploymentSpecHash(deployment), nil
+}
+
+func (m *Manager) runContainer(ctx context.Context, spec RuntimeSpec, deployment DeploymentSpec, replica int, name string) error {
+	args := []string{"run", "-d", "--name", name, "--restart", "unless-stopped"}
+	args = append(args,
+		"--label", "aifar.app=aifar",
+		"--label", "aifar.runtime-version=2",
+		"--label", "aifar.spec-hash="+deploymentSpecHash(deployment),
+		"--label", "aifar.install-root="+spec.InstallRoot,
+		"--label", "aifar.component=pod",
+		"--label", "aifar.instance="+spec.InstanceID,
+		"--label", "aifar.service="+deployment.ServiceName,
+		"--label", "aifar.revision="+deployment.Revision,
+		"--label", "aifar.release="+deployment.Revision,
+		"--label", fmt.Sprintf("aifar.pod=%s", name),
+		"--label", fmt.Sprintf("aifar.replica=%d", replica),
+		"--network", spec.Network,
+		"--add-host", "host.docker.internal:host-gateway",
+	)
+	for key, value := range deployment.Labels {
+		if strings.TrimSpace(key) != "" {
+			args = append(args, "--label", key+"="+value)
+		}
+	}
+	if deployment.Resources.CPUs != "" {
+		args = append(args, "--cpus", deployment.Resources.CPUs)
+	}
+	if deployment.Resources.Memory != "" {
+		args = append(args, "--memory", deployment.Resources.Memory, "--memory-swap", deployment.Resources.Memory)
+	}
+	if deployment.HealthCheck.Command != "" {
+		args = append(args, "--health-cmd", deployment.HealthCheck.Command)
+		if deployment.HealthCheck.Interval != "" {
+			args = append(args, "--health-interval", deployment.HealthCheck.Interval)
+		}
+		if deployment.HealthCheck.Timeout != "" {
+			args = append(args, "--health-timeout", deployment.HealthCheck.Timeout)
+		}
+		if deployment.HealthCheck.Retries > 0 {
+			args = append(args, "--health-retries", strconv.Itoa(deployment.HealthCheck.Retries))
+		}
+		if deployment.HealthCheck.StartPeriod != "" {
+			args = append(args, "--health-start-period", deployment.HealthCheck.StartPeriod)
+		}
+	}
+	for _, envFile := range deployment.EnvFiles {
+		if strings.TrimSpace(envFile) != "" {
+			args = append(args, "--env-file", envFile)
+		}
+	}
+	for key, value := range deployment.Environment {
+		if strings.TrimSpace(key) != "" {
+			value = strings.ReplaceAll(value, "${containerName}", name)
+			args = append(args, "-e", key+"="+value)
+		}
+	}
+	for _, volume := range deployment.Volumes {
+		if volume.Source == "" || volume.Target == "" {
+			continue
+		}
+		mount := volume.Source + ":" + volume.Target
+		if volume.ReadOnly {
+			mount += ":ro"
+		}
+		args = append(args, "-v", mount)
+	}
+	if len(deployment.Entrypoint) > 0 {
+		args = append(args, "--entrypoint", strings.Join(deployment.Entrypoint, " "))
+	}
+	args = append(args, deployment.Image)
+	args = append(args, deployment.Command...)
+	if _, err := m.runner.Run(ctx, "docker", args...); err != nil {
+		return fmt.Errorf("start AIFAR pod %s: %w", name, err)
+	}
+	if err := m.waitContainerReady(ctx, name); err != nil {
+		return err
+	}
+	logf(m.log, "AIFAR runtime pod started service=%s replica=%d container=%s\n", deployment.ServiceName, replica, name)
+	return nil
+}
+
+func (m *Manager) waitContainerReady(ctx context.Context, name string) error {
+	deadline := time.Now().Add(5 * time.Minute)
+	for {
+		result, err := m.runner.Run(ctx, "docker", "inspect", "-f", `{{.State.Running}}|{{if .State.Health}}{{.State.Health.Status}}{{end}}`, name)
+		if err == nil {
+			parts := strings.SplitN(strings.TrimSpace(result.Stdout), "|", 2)
+			running := len(parts) > 0 && parts[0] == "true"
+			health := ""
+			if len(parts) > 1 {
+				health = parts[1]
+			}
+			if running && (health == "" || health == "healthy") {
+				return nil
+			}
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("AIFAR pod did not become ready: %s", name)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(3 * time.Second):
+		}
+	}
+}
+
+func (m *Manager) removeExtraReplicas(ctx context.Context, spec RuntimeSpec, deployment DeploymentSpec) error {
+	result, err := m.runner.Run(ctx, "docker",
+		"ps", "-a",
+		"--filter", "label=aifar.app=aifar",
+		"--filter", "label=aifar.install-root="+spec.InstallRoot,
+		"--filter", "label=aifar.component=pod",
+		"--filter", "label=aifar.service="+deployment.ServiceName,
+		"--format", `{{.Names}}|{{.Label "aifar.replica"}}|{{.Label "aifar.revision"}}`,
+	)
+	if err != nil {
+		return nil
+	}
+	for _, line := range strings.Split(strings.TrimSpace(result.Stdout), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		parts := strings.SplitN(line, "|", 3)
+		if len(parts) < 2 {
+			continue
+		}
+		name := strings.TrimSpace(parts[0])
+		replicaText := strings.TrimSpace(parts[1])
+		revision := ""
+		if len(parts) == 3 {
+			revision = strings.TrimSpace(parts[2])
+		}
+		replica, _ := strconv.Atoi(strings.TrimSpace(replicaText))
+		revisionDrifted := strings.TrimSpace(deployment.Revision) != "" && revision != "" && revision != strings.TrimSpace(deployment.Revision)
+		if replica > deployment.Replicas || revisionDrifted {
+			_, _ = m.runner.Run(ctx, "docker", "rm", "-f", name)
+			logf(m.log, "AIFAR runtime pod removed service=%s replica=%d container=%s\n", deployment.ServiceName, replica, name)
+		}
+	}
+	return nil
+}
+
+func (m *Manager) refreshInstanceEndpoints(ctx context.Context, spec RuntimeSpec) error {
+	refreshed := map[string][]endpoint{}
+	for _, service := range spec.Services {
+		endpoints, err := m.discoverEndpoints(ctx, spec, service.Name)
+		if err != nil {
+			return err
+		}
+		refreshed[service.Name] = endpoints
+	}
+	m.mu.Lock()
+	for service, endpoints := range refreshed {
+		m.endpoints[endpointKey(spec.InstanceID, service)] = endpoints
+	}
+	m.mu.Unlock()
+	return nil
+}
+
+func (m *Manager) cachedEndpoints(instanceID, service string) []endpoint {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	items := m.endpoints[endpointKey(instanceID, service)]
+	out := make([]endpoint, len(items))
+	copy(out, items)
+	return out
+}
+
+func (m *Manager) snapshotSpecs() []RuntimeSpec {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	specs := make([]RuntimeSpec, 0, len(m.specs))
+	for _, id := range sortedSpecIDs(m.specs) {
+		specs = append(specs, m.specs[id])
+	}
+	return specs
+}
+
+func (m *Manager) endpointsForInstanceLocked(instanceID string) map[string][]endpoint {
+	out := map[string][]endpoint{}
+	prefix := instanceID + "/"
+	for key, items := range m.endpoints {
+		if !strings.HasPrefix(key, prefix) {
+			continue
+		}
+		service := strings.TrimPrefix(key, prefix)
+		copied := make([]endpoint, len(items))
+		copy(copied, items)
+		out[service] = copied
+	}
+	return out
+}
+
+func endpointKey(instanceID, service string) string {
+	return instanceID + "/" + service
 }
 
 func (m *Manager) discoverEndpoints(ctx context.Context, spec RuntimeSpec, service string) ([]endpoint, error) {
@@ -352,7 +720,7 @@ func (m *Manager) discoverEndpoints(ctx context.Context, spec RuntimeSpec, servi
 		}
 		endpoints = append(endpoints, endpoint{
 			Container: name,
-			Address:   net.JoinHostPort(ip, strconv.Itoa(serviceSpec.Port)),
+			Address:   net.JoinHostPort(ip, strconv.Itoa(serviceSpec.TargetPort)),
 		})
 	}
 	sort.Slice(endpoints, func(i, j int) bool {
@@ -489,13 +857,13 @@ func validateRuntimeSpec(spec RuntimeSpec) error {
 		if strings.TrimSpace(service.Name) == "" {
 			return errors.New("runtime service name is required")
 		}
-		if service.Port <= 0 {
+		if service.ListenPort <= 0 || service.TargetPort <= 0 {
 			return fmt.Errorf("runtime service %s port must be positive", service.Name)
 		}
-		if previous := ports[service.Port]; previous != "" && previous != service.Name {
-			return fmt.Errorf("runtime port %d is used by both %s and %s", service.Port, previous, service.Name)
+		if previous := ports[service.ListenPort]; previous != "" && previous != service.Name {
+			return fmt.Errorf("runtime port %d is used by both %s and %s", service.ListenPort, previous, service.Name)
 		}
-		ports[service.Port] = service.Name
+		ports[service.ListenPort] = service.Name
 	}
 	return nil
 }
@@ -503,7 +871,7 @@ func validateRuntimeSpec(spec RuntimeSpec) error {
 func routesForSpec(spec RuntimeSpec) map[int]proxyRoute {
 	routes := map[int]proxyRoute{}
 	for _, service := range spec.Services {
-		routes[service.Port] = proxyRoute{
+		routes[service.ListenPort] = proxyRoute{
 			InstanceID: spec.InstanceID,
 			Service:    service.Name,
 			WebIngress: service.Name == spec.Ingress.WebService,
@@ -512,6 +880,72 @@ func routesForSpec(spec RuntimeSpec) map[int]proxyRoute {
 	routes[spec.Ingress.GatewayPort] = proxyRoute{InstanceID: spec.InstanceID, Service: spec.Ingress.GatewayService}
 	routes[spec.Ingress.WebPort] = proxyRoute{InstanceID: spec.InstanceID, Service: spec.Ingress.WebService, WebIngress: true}
 	return routes
+}
+
+func containerNameForDeployment(spec RuntimeSpec, deployment DeploymentSpec, replica int) string {
+	revision := strings.TrimSpace(deployment.Revision)
+	if revision == "" {
+		revision = "current"
+	}
+	return sanitizeDockerName(fmt.Sprintf("aifar-pod-%s-%s-%s-r%d", spec.InstanceID, deployment.ServiceName, revision, replica))
+}
+
+func sanitizeDockerName(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	if value == "" {
+		return "aifar-pod"
+	}
+	var b strings.Builder
+	for _, r := range value {
+		switch {
+		case r >= 'a' && r <= 'z':
+			b.WriteRune(r)
+		case r >= '0' && r <= '9':
+			b.WriteRune(r)
+		case r == '-', r == '_', r == '.':
+			b.WriteRune(r)
+		default:
+			b.WriteByte('-')
+		}
+	}
+	out := strings.Trim(b.String(), "-_.")
+	if out == "" {
+		return "aifar-pod"
+	}
+	return out
+}
+
+func deploymentSpecHash(deployment DeploymentSpec) string {
+	type hashDeployment struct {
+		ServiceName string            `json:"serviceName"`
+		Image       string            `json:"image,omitempty"`
+		Revision    string            `json:"revision,omitempty"`
+		Ports       []ContainerPort   `json:"ports,omitempty"`
+		EnvFiles    []string          `json:"envFiles,omitempty"`
+		Volumes     []VolumeMount     `json:"volumes,omitempty"`
+		Resources   ResourceSpec      `json:"resources,omitempty"`
+		HealthCheck HealthCheckSpec   `json:"healthCheck,omitempty"`
+		Entrypoint  []string          `json:"entrypoint,omitempty"`
+		Command     []string          `json:"command,omitempty"`
+		Environment map[string]string `json:"environment,omitempty"`
+		Labels      map[string]string `json:"labels,omitempty"`
+	}
+	data, _ := json.Marshal(hashDeployment{
+		ServiceName: deployment.ServiceName,
+		Image:       deployment.Image,
+		Revision:    deployment.Revision,
+		Ports:       deployment.Ports,
+		EnvFiles:    deployment.EnvFiles,
+		Volumes:     deployment.Volumes,
+		Resources:   deployment.Resources,
+		HealthCheck: deployment.HealthCheck,
+		Entrypoint:  deployment.Entrypoint,
+		Command:     deployment.Command,
+		Environment: deployment.Environment,
+		Labels:      deployment.Labels,
+	})
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
 }
 
 func serviceByName(spec RuntimeSpec, name string) (ServiceSpec, bool) {

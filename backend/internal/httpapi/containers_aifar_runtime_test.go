@@ -238,7 +238,7 @@ func seedAIFARRuntimeFixture(t *testing.T, db *store.Store, dockerHost string) (
 		Version:  "docker-apps",
 		ServerID: server.ID,
 		Status:   "installed",
-		Metadata: `{"orchestrationModel":"k8s-like-v1","installRoot":"/aifar/apps/admin","endpoint":"10.0.0.10:8080","gatewayEndpoint":"10.0.0.10:38000","gatewayPort":38000,"webPort":8080,"runtimeService":"aifar-agent"}`,
+		Metadata: `{"orchestrationModel":"agent-runtime-v2","installRoot":"/aifar/apps/admin","endpoint":"10.0.0.10:8080","gatewayEndpoint":"10.0.0.10:38000","gatewayPort":38000,"webPort":8080,"runtimeService":"aifar-agent"}`,
 	})
 	if err != nil {
 		t.Fatal(err)

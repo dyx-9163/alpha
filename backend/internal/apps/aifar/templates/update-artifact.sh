@@ -21,7 +21,7 @@ APP_DIR="$RUNTIME_DIR/docker-apps"
 ENV_DIR="$RUNTIME_DIR/env"
 TMP_DIR="$INSTALL_ROOT/.rollout-$REVISION-$$"
 DRAIN_SECONDS="${DRAIN_SECONDS:-30}"
-ORCHESTRATION_MODEL="k8s-like-v1"
+ORCHESTRATION_MODEL="agent-runtime-v2"
 
 fail() {
   echo "ERROR: $*" >&2
@@ -53,35 +53,13 @@ set_env() {
   mv "$tmp" "$file"
 }
 
+json_escape() {
+  printf "%s" "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
 check_agent_dependency() {
   command -v aifar-agent >/dev/null 2>&1 || fail "aifar-agent is required; install or upgrade Docker runtime first"
   aifar-agent status >/dev/null 2>&1 || fail "aifar-agent service is not reachable; install or upgrade Docker runtime first"
-}
-
-strip_web_nginx_runtime_routes() {
-  service_dir="$1"
-  nginx_conf="$service_dir/nginx/default.conf"
-  [ -f "$nginx_conf" ] || return 0
-  tmp="$nginx_conf.tmp"
-  awk '
-    /^[[:space:]]*location[[:space:]]+\/api\/[[:space:]]*\{/ || /^[[:space:]]*location[[:space:]]+\/im\/ws\/[[:space:]]*\{/ {
-      skip = 1
-      depth = 0
-    }
-    skip {
-      line = $0
-      opens = gsub(/\{/, "{", line)
-      line = $0
-      closes = gsub(/\}/, "}", line)
-      depth += opens - closes
-      if (depth <= 0) {
-        skip = 0
-      }
-      next
-    }
-    { print }
-  ' "$nginx_conf" > "$tmp"
-  mv "$tmp" "$nginx_conf"
 }
 
 service_known() {
@@ -111,6 +89,21 @@ service_port() {
   var="$(service_port_var "$1")"
   [ -n "$var" ] || fail "unsupported service port: $1"
   read_env_value "$ENV_DIR/compose.env" "$var" ""
+}
+
+alpha_service_name() {
+  case "$1" in
+    gateway) printf "alpha-gateway" ;;
+    oauth) printf "alpha-oauth" ;;
+    permission) printf "alpha-permission" ;;
+    system) printf "alpha-system" ;;
+    file) printf "alpha-file" ;;
+    message) printf "alpha-message" ;;
+    im) printf "alpha-im" ;;
+    contacts) printf "alpha-contacts" ;;
+    meeting) printf "alpha-meeting" ;;
+    *) printf "" ;;
+  esac
 }
 
 resource_file_for_service() {
@@ -184,6 +177,26 @@ desired_replicas_for_service() {
   printf "%s" "$value"
 }
 
+current_replicas_for_service() {
+  docker ps --filter "label=aifar.app=aifar" \
+    --filter "label=aifar.install-root=$INSTALL_ROOT" \
+    --filter "label=aifar.component=pod" \
+    --filter "label=aifar.service=$1" \
+    --format '{{ "{{" }}.Names{{ "}}" }}' 2>/dev/null | wc -l | tr -d ' '
+}
+
+replicas_for_service() {
+  service="$1"
+  if [ "$service" = "$SERVICE_NAME" ]; then
+    desired_replicas_for_service
+    return
+  fi
+  replicas="$(current_replicas_for_service "$service")"
+  case "$replicas" in ""|*[!0-9]*) replicas=1 ;; esac
+  [ "$replicas" -ge 1 ] || replicas=1
+  printf "%s" "$replicas"
+}
+
 pod_name() {
   service="$1"
   revision="$2"
@@ -221,7 +234,6 @@ apply_artifact() {
         mkdir -p "$service_dir/dist"
         cp -a "$TMP_DIR/web/." "$service_dir/dist/"
       fi
-      strip_web_nginx_runtime_routes "$service_dir"
       ;;
     *)
       mkdir -p "$service_dir"
@@ -254,132 +266,106 @@ build_image() {
   docker build -t "$image" "$APP_DIR/$SERVICE_NAME"
 }
 
-container_status() {
-  docker inspect --format '{{ "{{" }}.State.Status{{ "}}" }}' "$1" 2>/dev/null || true
-}
-
-container_health() {
-  docker inspect --format '{{ "{{" }}if .State.Health{{ "}}" }}{{ "{{" }}.State.Health.Status{{ "}}" }}{{ "{{" }}end{{ "}}" }}' "$1" 2>/dev/null || true
-}
-
-wait_pod_ready() {
-  container="$1"
-  timeout="$(read_env_value "$ENV_DIR/compose.env" APP_STARTUP_TIMEOUT 300)"
-  case "$timeout" in ""|*[!0-9]*) timeout=300 ;; esac
-  deadline=$(( $(date +%s) + timeout ))
-  while [ "$(date +%s)" -lt "$deadline" ]; do
-    status="$(container_status "$container")"
-    health="$(container_health "$container")"
-    if [ "$status" = "running" ] && { [ -z "$health" ] || [ "$health" = "healthy" ]; }; then
-      echo "Pod ready: $container"
-      return 0
-    fi
-    sleep 5
-  done
-  docker logs --tail 120 "$container" >&2 || true
-  return 1
-}
-
-start_pod() {
-  replica="$1"
-  container="$(pod_name "$SERVICE_NAME" "$REVISION" "$replica")"
-  service_env="$ENV_DIR/$SERVICE_NAME.env"
-  compose_env="$ENV_DIR/compose.env"
-  image="$(read_env_value "$service_env" APP_IMAGE "")"
-  port="$(service_port "$SERVICE_NAME")"
-  app_memory_limit="$(resource_value "$SERVICE_NAME" APP_MEMORY_LIMIT "$(read_env_value "$compose_env" APP_MEMORY_LIMIT "")")"
-  app_cpus="$(resource_value "$SERVICE_NAME" APP_CPUS "$(read_env_value "$compose_env" APP_CPUS "")")"
-  restart_policy="$(read_env_value "$compose_env" APP_RESTART_POLICY unless-stopped)"
-  health_protocol="$(read_env_value "$compose_env" APP_HEALTH_PROTOCOL http)"
-  health_host="$(read_env_value "$compose_env" APP_HEALTH_HOST 127.0.0.1)"
-  health_path="$(read_env_value "$compose_env" APP_HEALTH_PATH "")"
-  health_connect_timeout="$(read_env_value "$compose_env" APP_HEALTH_CONNECT_TIMEOUT 3)"
-  health_interval="$(read_env_value "$compose_env" APP_HEALTH_INTERVAL 15s)"
-  health_timeout="$(read_env_value "$compose_env" APP_HEALTH_TIMEOUT 5s)"
-  health_retries="$(read_env_value "$compose_env" APP_HEALTH_RETRIES 3)"
-  health_start_period="$(read_env_value "$compose_env" APP_HEALTH_START_PERIOD 30s)"
-  tz_value="$(read_env_value "$compose_env" TZ system)"
-  resource_args=""
-  [ -z "$app_cpus" ] || resource_args="$resource_args --cpus $app_cpus"
-  [ -z "$app_memory_limit" ] || resource_args="$resource_args --memory $app_memory_limit --memory-swap $app_memory_limit"
-
-  docker rm -f "$container" >/dev/null 2>&1 || true
-  if [ "$SERVICE_NAME" = "web-vue3" ]; then
-    [ -n "$health_path" ] || health_path="/"
-    env_args="--env-file $service_env"
-    health_cmd="wget -q -T $health_connect_timeout -O /dev/null ${health_protocol}://${health_host}:${port}${health_path} || exit 1"
-  elif [ -n "$health_path" ]; then
-    env_args="--env-file $ENV_DIR/java-common.env --env-file $ENV_DIR/java-secrets.env --env-file $service_env"
-    health_cmd="curl -fsS --connect-timeout $health_connect_timeout ${health_protocol}://${health_host}:${port}${health_path} >/dev/null || exit 1"
-  else
-    env_args="--env-file $ENV_DIR/java-common.env --env-file $ENV_DIR/java-secrets.env --env-file $service_env"
-    health_cmd="curl -sS --connect-timeout $health_connect_timeout -o /dev/null ${health_protocol}://${health_host}:${port}/ || exit 1"
-  fi
-
-  if [ "$SERVICE_NAME" = "web-vue3" ]; then
-    # shellcheck disable=SC2086
-    docker run -d \
-      --name "$container" \
-      --restart no \
-      --label aifar.app=aifar \
-      --label "aifar.install-root=$INSTALL_ROOT" \
-      --label "aifar.component=pod" \
-      --label "aifar.service=$SERVICE_NAME" \
-      --label "aifar.revision=$REVISION" \
-      --label "aifar.release=$REVISION" \
-      --label "aifar.pod=$(pod_name "$SERVICE_NAME" "$REVISION" "$replica")" \
-      --label "aifar.replica=$replica" \
-      --label aifar.dynamic-jvm=false \
-      --network "$INGRESS_NETWORK" \
-      $resource_args \
-      --health-cmd "$health_cmd" \
-      --health-interval "$health_interval" \
-      --health-timeout "$health_timeout" \
-      --health-retries "$health_retries" \
-      --health-start-period "$health_start_period" \
-      -e "APP_CONTAINER_NAME=$container" \
-      -e "TZ=$tz_value" \
-      $env_args \
-      "$image" >/dev/null
-  else
-    java_cmd="$(java_start_command)"
-    # shellcheck disable=SC2086
-    docker run -d \
-      --name "$container" \
-      --restart no \
-      --label aifar.app=aifar \
-      --label "aifar.install-root=$INSTALL_ROOT" \
-      --label "aifar.component=pod" \
-      --label "aifar.service=$SERVICE_NAME" \
-      --label "aifar.revision=$REVISION" \
-      --label "aifar.release=$REVISION" \
-      --label "aifar.pod=$(pod_name "$SERVICE_NAME" "$REVISION" "$replica")" \
-      --label "aifar.replica=$replica" \
-      --label aifar.dynamic-jvm=true \
-      --network "$INGRESS_NETWORK" \
-      $resource_args \
-      --health-cmd "$health_cmd" \
-      --health-interval "$health_interval" \
-      --health-timeout "$health_timeout" \
-      --health-retries "$health_retries" \
-      --health-start-period "$health_start_period" \
-      -e "APP_CONTAINER_NAME=$container" \
-      -e "AIFAR_SERVICE_NAME=$SERVICE_NAME" \
-      -e "TZ=$tz_value" \
-      $env_args \
-      -v "$ENV_DIR:/opt/aifar/runtime/env:ro" \
-      --entrypoint /bin/sh \
-      "$image" -c "$java_cmd" >/dev/null
-  fi
-  wait_pod_ready "$container" || return 1
-  docker update --restart "$restart_policy" "$container" >/dev/null 2>&1 || true
-}
-
 reconcile_runtime() {
   spec="$INSTALL_ROOT/runtime/agent/runtime-spec.json"
   check_agent_dependency
+  write_runtime_spec >/dev/null
   [ -f "$spec" ] || fail "AIFAR runtime spec is missing: $spec"
   aifar-agent reconcile-runtime --spec "$spec"
+}
+
+write_runtime_spec() {
+  spec="$INSTALL_ROOT/runtime/agent/runtime-spec.json"
+  gateway_port="$(read_env_value "$ENV_DIR/compose.env" GATEWAY_PORT 38000)"
+  web_port="$(read_env_value "$ENV_DIR/compose.env" WEB_VUE3_PORT 8080)"
+  nacos_ns="$(read_env_value "$ENV_DIR/java-common.env" NACOS_NS prod)"
+  tz_value="$(read_env_value "$ENV_DIR/compose.env" TZ system)"
+  mkdir -p "$INSTALL_ROOT/runtime/agent"
+  cat > "$spec" <<JSON
+{
+  "version": "runtime-v2",
+  "instanceId": "admin",
+  "installRoot": "${INSTALL_ROOT}",
+  "network": "${INGRESS_NETWORK}",
+  "deployments": [
+JSON
+  first_deployment=1
+  for service in $SERVICE_ORDER; do
+    service_env="$ENV_DIR/$service.env"
+    [ -f "$service_env" ] || continue
+    image="$(read_env_value "$service_env" APP_IMAGE "aifar-$service:$REVISION")"
+    service_revision="$(read_env_value "$service_env" AIFAR_REVISION "$REVISION")"
+    replicas="$(replicas_for_service "$service")"
+    port="$(service_port "$service")"
+    health_cmd="$(health_cmd_for_service "$service")"
+    app_cpus="$(resource_value "$service" APP_CPUS "$(read_env_value "$ENV_DIR/compose.env" APP_CPUS "")")"
+    app_memory_limit="$(resource_value "$service" APP_MEMORY_LIMIT "$(read_env_value "$ENV_DIR/compose.env" APP_MEMORY_LIMIT "")")"
+    if [ "$first_deployment" = "1" ]; then
+      first_deployment=0
+    else
+      printf ",\n" >> "$spec"
+    fi
+    printf '    {\n' >> "$spec"
+    printf '      "serviceName": "%s",\n' "$service" >> "$spec"
+    printf '      "image": "%s",\n' "$(json_escape "$image")" >> "$spec"
+    printf '      "revision": "%s",\n' "$(json_escape "$service_revision")" >> "$spec"
+    printf '      "replicas": %s,\n' "$replicas" >> "$spec"
+    printf '      "ports": [{"name":"http","containerPort":%s}],\n' "$port" >> "$spec"
+    if [ "$service" = "web-vue3" ]; then
+      printf '      "envFiles": ["%s"],\n' "$(json_escape "$service_env")" >> "$spec"
+      printf '      "environment": {"APP_CONTAINER_NAME":"${containerName}","TZ":"%s"},\n' "$(json_escape "$tz_value")" >> "$spec"
+    else
+      printf '      "envFiles": ["%s","%s","%s"],\n' "$(json_escape "$ENV_DIR/java-common.env")" "$(json_escape "$ENV_DIR/java-secrets.env")" "$(json_escape "$service_env")" >> "$spec"
+      printf '      "volumes": [{"source":"%s","target":"/opt/aifar/runtime/env","readOnly":true}],\n' "$(json_escape "$ENV_DIR")" >> "$spec"
+      printf '      "entrypoint": ["/bin/sh"],\n' >> "$spec"
+      printf '      "command": ["/opt/aifar/runtime/env/java-entrypoint.sh"],\n' >> "$spec"
+      printf '      "environment": {"APP_CONTAINER_NAME":"${containerName}","AIFAR_SERVICE_NAME":"%s","TZ":"%s"},\n' "$service" "$(json_escape "$tz_value")" >> "$spec"
+    fi
+    printf '      "resources": {"cpus":"%s","memory":"%s"},\n' "$(json_escape "$app_cpus")" "$(json_escape "$app_memory_limit")" >> "$spec"
+    printf '      "healthCheck": {"command":"%s","interval":"%s","timeout":"%s","retries":%s,"startPeriod":"%s"}\n' \
+      "$(json_escape "$health_cmd")" \
+      "$(json_escape "$(read_env_value "$ENV_DIR/compose.env" APP_HEALTH_INTERVAL 15s)")" \
+      "$(json_escape "$(read_env_value "$ENV_DIR/compose.env" APP_HEALTH_TIMEOUT 5s)")" \
+      "$(read_env_value "$ENV_DIR/compose.env" APP_HEALTH_RETRIES 3)" \
+      "$(json_escape "$(read_env_value "$ENV_DIR/compose.env" APP_HEALTH_START_PERIOD 30s)")" >> "$spec"
+    printf '    }' >> "$spec"
+  done
+  cat >> "$spec" <<JSON
+  ],
+  "services": [
+JSON
+  first_service=1
+  for service in $SERVICE_ORDER; do
+    [ -f "$ENV_DIR/$service.env" ] || continue
+    port="$(service_port "$service")"
+    app_name="$(alpha_service_name "$service")"
+    if [ "$first_service" = "1" ]; then
+      first_service=0
+    else
+      printf ",\n" >> "$spec"
+    fi
+    affinity="round-robin"
+    case "$service" in gateway|file) affinity="stable" ;; esac
+    printf '    {"name":"%s","appName":"%s","listenPort":%s,"targetPort":%s,"affinityPolicy":"%s"}' "$service" "$app_name" "$port" "$port" "$affinity" >> "$spec"
+  done
+  cat >> "$spec" <<JSON
+  ],
+  "ingress": {
+    "mode": "web-nginx",
+    "gatewayService": "gateway",
+    "webService": "web-vue3",
+    "gatewayPort": ${gateway_port},
+    "webPort": ${web_port}
+  },
+  "nacos": {
+    "namespace": "${nacos_ns}",
+    "group": "DEFAULT_GROUP",
+    "ephemeral": true,
+    "agentIPStrategy": "auto"
+  }
+}
+JSON
+  printf "%s" "$spec"
 }
 
 stop_old_pods() {
@@ -424,27 +410,19 @@ check_agent_dependency
 service_known || fail "unsupported AIFAR service: $SERVICE_NAME"
 [ -d "$APP_DIR" ] || fail "AIFAR runtime app directory is missing"
 [ -d "$ENV_DIR" ] || fail "AIFAR runtime env directory is missing"
-[ -f "$INSTALL_ROOT/.aifar/model.json" ] || fail "AIFAR k8s-like model manifest is missing"
-grep -q '"model"[[:space:]]*:[[:space:]]*"k8s-like-v1"' "$INSTALL_ROOT/.aifar/model.json" || fail "AIFAR instance is legacy; reinstall with k8s-like orchestration"
+[ -f "$INSTALL_ROOT/.aifar/model.json" ] || fail "AIFAR agent-runtime-v2 model manifest is missing"
+grep -q '"model"[[:space:]]*:[[:space:]]*"agent-runtime-v2"' "$INSTALL_ROOT/.aifar/model.json" || fail "AIFAR_RUNTIME_REINSTALL_REQUIRED: reinstall AIFAR with agent-runtime-v2"
 
 trap 'cleanup_failed_rollout' INT TERM
+java_start_command > "$ENV_DIR/java-entrypoint.sh"
+chmod 0755 "$ENV_DIR/java-entrypoint.sh"
 apply_artifact
 ensure_service_runtime_env
 ensure_runtime_config_files
 build_image
-desired="$(desired_replicas_for_service)"
-replica=1
-while [ "$replica" -le "$desired" ]; do
-  if ! start_pod "$replica"; then
-    cleanup_failed_rollout
-    fail "new AIFAR Pod did not become ready for $SERVICE_NAME replica $replica"
-  fi
-  replica=$((replica + 1))
-done
 if ! reconcile_runtime; then
   cleanup_failed_rollout
   fail "AIFAR runtime reconcile failed: $SERVICE_NAME"
 fi
-stop_old_pods
 write_model_manifest
 echo "AIFAR Deployment rollout completed: $SERVICE_NAME -> $REVISION"

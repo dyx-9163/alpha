@@ -83,66 +83,9 @@ open_service_ports() {
   allow_selinux_ports http_port_t $ports
 }
 
-agent_host_ip() {
-  nacos_host="$(read_env_value "$ENV_DIR/java-common.env" NACOS_HOST "")"
-  nacos_connect_host="${nacos_host%:*}"
-  if command -v ip >/dev/null 2>&1 && [ -n "$nacos_connect_host" ]; then
-    route_ip="$(ip route get "$nacos_connect_host" 2>/dev/null | awk '{for (i=1;i<=NF;i++) if ($i=="src") {print $(i+1); exit}}' || true)"
-    if [ -n "$route_ip" ]; then
-      printf "%s" "$route_ip"
-      return
-    fi
-  fi
-  hostname -I 2>/dev/null | awk '{print $1; exit}'
-}
-
-nacos_access_token() {
-  nacos_host="$(read_env_value "$ENV_DIR/java-common.env" NACOS_HOST "")"
-  nacos_connect_host="${nacos_host%:*}"
-  nacos_port="$(read_env_value "$ENV_DIR/java-common.env" NACOS_PORT_WEB "${nacos_host##*:}")"
-  nacos_user="$(read_env_value "$ENV_DIR/java-common.env" NACOS_USER nacos)"
-  nacos_password="$(read_env_value "$ENV_DIR/java-secrets.env" NACOS_PASSWORD "")"
-  if command -v curl >/dev/null 2>&1 && [ -n "$nacos_connect_host" ] && [ -n "$nacos_port" ]; then
-    body="$(curl -fsS -X POST "http://${nacos_connect_host}:${nacos_port}/nacos/v1/auth/users/login" -d "username=${nacos_user}&password=${nacos_password}" 2>/dev/null || true)"
-    token="$(printf "%s" "$body" | sed -n 's/.*"accessToken"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
-    [ -n "$token" ] && printf "%s" "$token"
-  fi
-}
-
-register_nacos_proxy() {
-  service="$1"
-  app_name="$(alpha_service_name "$service")"
-  [ -n "$app_name" ] || return 0
-  nacos_host="$(read_env_value "$ENV_DIR/java-common.env" NACOS_HOST "")"
-  nacos_connect_host="${nacos_host%:*}"
-  nacos_port="$(read_env_value "$ENV_DIR/java-common.env" NACOS_PORT_WEB "${nacos_host##*:}")"
-  nacos_ns="$(read_env_value "$ENV_DIR/java-common.env" NACOS_NS prod)"
-  ip="$(agent_host_ip)"
-  port="$(service_port "$service")"
-  [ -n "$ip" ] || fail "AIFAR agent host IP is empty for $service"
-  [ -n "$nacos_connect_host" ] || fail "Nacos host is missing for $service"
-  [ -n "$port" ] || fail "AIFAR service port is empty for $service"
-  token="$(nacos_access_token || true)"
-  token_arg=""
-  [ -z "$token" ] || token_arg="&accessToken=$token"
-  url="http://${nacos_connect_host}:${nacos_port}/nacos/v1/ns/instance?serviceName=${app_name}&ip=${ip}&port=${port}&namespaceId=${nacos_ns}&ephemeral=false${token_arg}"
-  if command -v curl >/dev/null 2>&1; then
-    curl -fsS -X DELETE "$url" >/dev/null 2>&1 || true
-    curl -fsS -X POST "$url" >/dev/null 2>&1 || fail "register Nacos service proxy failed: $app_name"
-    echo "Nacos agent proxy registered: $app_name -> $ip:$port"
-  else
-    echo "curl is not available; skip Nacos agent proxy registration for $app_name"
-  fi
-}
-
 command -v aifar-agent >/dev/null 2>&1 || fail "aifar-agent is not installed"
 [ -f "$SPEC_PATH" ] || fail "AIFAR runtime spec is missing"
 [ -d "$ENV_DIR" ] || fail "AIFAR runtime env directory is missing"
 
 aifar-agent reconcile-runtime --spec "$SPEC_PATH"
 open_service_ports gateway oauth permission system file message im contacts meeting web-vue3
-
-for service in gateway oauth permission system file message im contacts meeting; do
-  [ -f "$ENV_DIR/$service.env" ] || continue
-  register_nacos_proxy "$service"
-done

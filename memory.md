@@ -749,3 +749,5 @@
 - 结论：这些不是同一种“业务服务”。Deployment、ReplicaSet、Service、EndpointSlice 是 K8s API 资源；Deployment/ReplicaSet 控制循环通常运行在 kube-controller-manager 中；EndpointSlice 由控制器维护；kube-proxy 是每个节点上的数据面进程/DaemonSet。业务上每个应用通常是“1 个 Deployment + 1 个 Service + N 个 Pod + 对应 EndpointSlice”，控制器是集群公共组件，不是每个应用单独部署一套。
 - 问题：用户询问能否把 K8s 这套 Deployment/Service/Endpoint 思路照搬到 aifar-agent。
 - 结论：可以借鉴并在 agent 中实现轻量版运行时模型，但不建议照搬完整 K8s。推荐 AIFAR 后端保存期望态，agent 负责本机 reconcile：根据 DeploymentSpec 创建/删除 Docker Pod，维护 EndpointSlice 缓存，暴露 Service 代理端口，注册 Nacos，并通过 Docker events + 全量同步保持一致。这样 agent 更像 kubelet + kube-proxy 的本机合体。
+- 问题：用户要求在独立分支实现 AIFAR Agent Runtime v2，重构安装链路和容器 Runtime，并采用 web-vue3 nginx 统一 HTTP 入口。
+- 结论：已在 `codex/aifar-agent-runtime-v2` 实现 runtime-v2：agent 读取 RuntimeSpec v2 reconcile Docker Pod/Endpoint cache/Service proxy/Nacos ephemeral 注册与心跳，安装/补装/扩容/更新/运行配置脚本改为写 spec 后调用 agent，web-vue3 nginx 负责 `/`、`/api`、`/im/ws`，旧模型统一提示 `AIFAR_RUNTIME_REINSTALL_REQUIRED`。

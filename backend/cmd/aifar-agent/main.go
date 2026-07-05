@@ -109,17 +109,22 @@ func health(ctx context.Context) error {
 }
 
 func serve(addr string) error {
+	ctx := context.Background()
 	manager := runtimeagent.NewManager(runtimeagent.ManagerOptions{Log: os.Stdout})
-	if err := manager.Load(context.Background()); err != nil {
+	if err := manager.Load(ctx); err != nil {
 		return err
 	}
-	if err := runtimeagent.SyncNacosProxyRegistrations(context.Background(), runtimeagent.NacosProxySyncOptions{
+	nacosOptions := runtimeagent.NacosProxySyncOptions{
 		StateDir: runtimeagent.DefaultStateDir,
 		Action:   runtimeagent.NacosProxyRegister,
 		Log:      os.Stdout,
-	}); err != nil {
+	}
+	if err := runtimeagent.SyncNacosProxyRegistrations(ctx, nacosOptions); err != nil {
 		log.Printf("sync AIFAR Nacos proxies on startup failed: %v", err)
 	}
+	go runtimeagent.StartNacosProxyHeartbeat(ctx, nacosOptions)
+	go manager.StartRuntimeResync(ctx, 30*time.Second, nacosOptions)
+	go manager.StartDockerEventSync(ctx, 2*time.Second)
 	server := &http.Server{Addr: addr, Handler: newAgentHandler(manager, health), ReadHeaderTimeout: 10 * time.Second}
 	log.Printf("aifar-agent listening on %s", addr)
 	return server.ListenAndServe()

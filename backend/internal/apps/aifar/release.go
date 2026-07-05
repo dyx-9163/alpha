@@ -11,7 +11,7 @@ import (
 
 const (
 	releasePhaseActive          = "active"
-	orchestrationModelK8sLikeV1 = "k8s-like-v1"
+	orchestrationModelK8sLikeV1 = "agent-runtime-v2"
 	legacyOrchestrationModel    = "legacy-release-v1"
 	releaseKeepCount            = 3
 	releaseEnvDirName           = "env"

@@ -531,6 +531,7 @@ type AifarRuntimeResponse = {
 const { t } = useI18n()
 const { can, deniedText } = usePermissions()
 const router = useRouter()
+const AIFAR_RUNTIME_MODEL = 'agent-runtime-v2'
 const selectedServerId = ref('')
 const servers = ref<any[]>([])
 const appInstances = ref<AppInstance[]>([])
@@ -1253,13 +1254,13 @@ function aifarInstanceForContainer(row: any) {
   const candidates = appInstances.value.filter((item) => item.app === 'aifar' && item.serverId === selectedServerId.value)
   if (installRoot) {
     const exact = candidates.filter((item) => normalizeInstallRoot(String(metadataOf(item).installRoot || '')) === installRoot)
-    const matched = exact.find((item) => String(metadataOf(item).orchestrationModel || '').trim() === 'k8s-like-v1') ?? exact[0]
+    const matched = exact.find((item) => String(metadataOf(item).orchestrationModel || '').trim() === AIFAR_RUNTIME_MODEL) ?? exact[0]
     if (matched) {
       return matched
     }
     return null
   }
-  const k8sCandidates = candidates.filter((item) => String(metadataOf(item).orchestrationModel || '').trim() === 'k8s-like-v1')
+  const k8sCandidates = candidates.filter((item) => String(metadataOf(item).orchestrationModel || '').trim() === AIFAR_RUNTIME_MODEL)
   if (k8sCandidates.length === 1) {
     return k8sCandidates[0]
   }

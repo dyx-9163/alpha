@@ -17,7 +17,7 @@ import (
 	"github.com/go-chi/chi/v5"
 )
 
-const aifarK8sLikeModel = "k8s-like-v1"
+const aifarK8sLikeModel = "agent-runtime-v2"
 
 type aifarRuntimeResponse struct {
 	ServerID      string                   `json:"serverId"`
@@ -501,7 +501,7 @@ func (a *API) resolveAIFARRuntimeActionTargetForInstanceWithAgent(w http.Respons
 	}
 	metadata := runtimeMetadata(instance.Metadata)
 	if strings.TrimSpace(runtimeString(metadata, "orchestrationModel", "")) != aifarK8sLikeModel {
-		writeError(w, http.StatusConflict, "AIFAR_LEGACY_RUNTIME", "legacy AIFAR orchestration model does not support this runtime action", map[string]any{"instanceId": instance.ID})
+		writeError(w, http.StatusConflict, "AIFAR_RUNTIME_REINSTALL_REQUIRED", "legacy AIFAR orchestration model does not support this runtime action; reinstall with agent-runtime-v2", map[string]any{"instanceId": instance.ID})
 		return store.Server{}, store.AppInstance{}, false
 	}
 	if requireAgent {
@@ -541,9 +541,9 @@ func (a *API) findAIFARInstanceForRuntimeAction(serverID, requestedID string) (s
 		return candidates[0], nil
 	}
 	if len(candidates) == 0 {
-		return store.AppInstance{}, fmt.Errorf("no k8s-like AIFAR instance was found on this server")
+		return store.AppInstance{}, fmt.Errorf("no agent-runtime-v2 AIFAR instance was found on this server")
 	}
-	return store.AppInstance{}, fmt.Errorf("multiple k8s-like AIFAR instances were found; instanceId is required")
+	return store.AppInstance{}, fmt.Errorf("multiple agent-runtime-v2 AIFAR instances were found; instanceId is required")
 }
 
 func (a *API) buildAIFARRuntime(ctx context.Context, server store.Server) (aifarRuntimeResponse, error) {
@@ -606,7 +606,7 @@ func (a *API) appendAIFARInstanceRuntime(response *aifarRuntimeResponse, instanc
 	})
 	if legacy {
 		response.RuntimeStatus = degradedIfReady(response.RuntimeStatus)
-		response.Warnings = append(response.Warnings, "legacy AIFAR instance "+instance.ID+" does not support runtime actions")
+		response.Warnings = append(response.Warnings, "legacy AIFAR instance "+instance.ID+" requires reinstall with agent-runtime-v2")
 		return
 	}
 	deployments, _ := a.store.ListAIFARDeployments(instance.ID)

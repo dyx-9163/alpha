@@ -36,6 +36,7 @@ type nacosRuntimeEnv struct {
 	BaseURL   string
 	HostPort  string
 	Namespace string
+	Group     string
 	User      string
 	Password  string
 }
@@ -78,7 +79,7 @@ func SyncNacosProxyRegistrations(ctx context.Context, options NacosProxySyncOpti
 			if appName == "" || service.Port <= 0 {
 				continue
 			}
-			if err := syncNacosProxy(ctx, client, env, action, appName, agentIP, service.Port, token); err != nil {
+			if err := syncNacosProxy(ctx, client, env, action, spec, appName, agentIP, service.Port, token); err != nil {
 				errs = append(errs, fmt.Sprintf("%s/%s: %v", spec.InstanceID, service.Name, err))
 				continue
 			}
@@ -87,6 +88,79 @@ func SyncNacosProxyRegistrations(ctx context.Context, options NacosProxySyncOpti
 	}
 	if len(errs) > 0 {
 		return fmt.Errorf("sync AIFAR Nacos proxies: %s", strings.Join(errs, "; "))
+	}
+	return nil
+}
+
+func StartNacosProxyHeartbeat(ctx context.Context, options NacosProxySyncOptions) {
+	interval := 5 * time.Second
+	if options.Client == nil {
+		options.Client = &http.Client{Timeout: 5 * time.Second}
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		if err := HeartbeatNacosProxyRegistrations(ctx, options); err != nil {
+			logf(options.Log, "AIFAR Nacos proxy heartbeat failed, replay registrations: %v\n", err)
+			register := options
+			register.Action = NacosProxyRegister
+			if replayErr := SyncNacosProxyRegistrations(ctx, register); replayErr != nil {
+				logf(options.Log, "AIFAR Nacos proxy registration replay failed: %v\n", replayErr)
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+func HeartbeatNacosProxyRegistrations(ctx context.Context, options NacosProxySyncOptions) error {
+	specs := options.Specs
+	if len(specs) == 0 {
+		loaded, err := loadRuntimeSpecsForNacos(options.StateDir)
+		if err != nil {
+			return err
+		}
+		specs = loaded
+	}
+	client := options.Client
+	if client == nil {
+		client = &http.Client{Timeout: 5 * time.Second}
+	}
+	var errs []string
+	for _, raw := range specs {
+		spec := NormalizeSpec(raw)
+		if !specNacosEphemeral(spec) {
+			continue
+		}
+		env, ok := nacosEnvForSpec(spec)
+		if !ok {
+			continue
+		}
+		agentIP := strings.TrimSpace(options.AgentIP)
+		if agentIP == "" {
+			agentIP = localIPForNacos(env.HostPort)
+		}
+		if agentIP == "" {
+			errs = append(errs, fmt.Sprintf("%s: resolve agent host IP", spec.InstanceID))
+			continue
+		}
+		token := nacosAccessToken(ctx, client, env)
+		for _, service := range spec.Services {
+			appName := serviceAppName(service)
+			if appName == "" || service.Port <= 0 {
+				continue
+			}
+			endpoint := nacosHeartbeatURL(env, spec, appName, agentIP, service.Port, token)
+			if err := doNacosRequest(ctx, client, http.MethodPut, endpoint, false); err != nil {
+				errs = append(errs, fmt.Sprintf("%s/%s: %v", spec.InstanceID, service.Name, err))
+			}
+		}
+	}
+	if len(errs) > 0 {
+		return fmt.Errorf("heartbeat AIFAR Nacos proxies: %s", strings.Join(errs, "; "))
 	}
 	return nil
 }
@@ -141,6 +215,10 @@ func nacosEnvForSpec(spec RuntimeSpec) (nacosRuntimeEnv, bool) {
 	if namespace == "" {
 		namespace = "prod"
 	}
+	group := strings.TrimSpace(common["NACOS_GROUP"])
+	if group == "" {
+		group = strings.TrimSpace(spec.Nacos.Group)
+	}
 	user := strings.TrimSpace(common["NACOS_USER"])
 	if user == "" {
 		user = "nacos"
@@ -149,6 +227,7 @@ func nacosEnvForSpec(spec RuntimeSpec) (nacosRuntimeEnv, bool) {
 		BaseURL:   "http://" + hostPort,
 		HostPort:  hostPort,
 		Namespace: namespace,
+		Group:     group,
 		User:      user,
 		Password:  strings.TrimSpace(secrets["NACOS_PASSWORD"]),
 	}, true
@@ -239,8 +318,8 @@ func nacosAccessToken(ctx context.Context, client *http.Client, env nacosRuntime
 	return strings.TrimSpace(body.AccessToken)
 }
 
-func syncNacosProxy(ctx context.Context, client *http.Client, env nacosRuntimeEnv, action NacosProxyAction, appName, ip string, port int, token string) error {
-	endpoint := nacosInstanceURL(env, appName, ip, port, token)
+func syncNacosProxy(ctx context.Context, client *http.Client, env nacosRuntimeEnv, action NacosProxyAction, spec RuntimeSpec, appName, ip string, port int, token string) error {
+	endpoint := nacosInstanceURL(env, appName, ip, port, token, specNacosEphemeral(spec))
 	switch action {
 	case NacosProxyRegister:
 		_ = doNacosRequest(ctx, client, http.MethodDelete, endpoint, true)
@@ -252,17 +331,51 @@ func syncNacosProxy(ctx context.Context, client *http.Client, env nacosRuntimeEn
 	}
 }
 
-func nacosInstanceURL(env nacosRuntimeEnv, appName, ip string, port int, token string) string {
+func nacosInstanceURL(env nacosRuntimeEnv, appName, ip string, port int, token string, ephemeral bool) string {
 	query := url.Values{}
 	query.Set("serviceName", appName)
 	query.Set("ip", ip)
 	query.Set("port", strconv.Itoa(port))
 	query.Set("namespaceId", env.Namespace)
-	query.Set("ephemeral", "false")
+	query.Set("ephemeral", strconv.FormatBool(ephemeral))
+	if strings.TrimSpace(env.Group) != "" {
+		query.Set("groupName", strings.TrimSpace(env.Group))
+	}
 	if token = strings.TrimSpace(token); token != "" {
 		query.Set("accessToken", token)
 	}
 	return env.BaseURL + "/nacos/v1/ns/instance?" + query.Encode()
+}
+
+func nacosHeartbeatURL(env nacosRuntimeEnv, spec RuntimeSpec, appName, ip string, port int, token string) string {
+	query := url.Values{}
+	query.Set("serviceName", appName)
+	query.Set("ip", ip)
+	query.Set("port", strconv.Itoa(port))
+	query.Set("namespaceId", env.Namespace)
+	query.Set("ephemeral", strconv.FormatBool(specNacosEphemeral(spec)))
+	if group := strings.TrimSpace(env.Group); group != "" {
+		query.Set("groupName", group)
+	}
+	beat := map[string]any{
+		"serviceName": appName,
+		"ip":          ip,
+		"port":        port,
+	}
+	if group := strings.TrimSpace(env.Group); group != "" {
+		beat["groupName"] = group
+	}
+	data, _ := json.Marshal(beat)
+	query.Set("beat", string(data))
+	if token = strings.TrimSpace(token); token != "" {
+		query.Set("accessToken", token)
+	}
+	return env.BaseURL + "/nacos/v1/ns/instance/beat?" + query.Encode()
+}
+
+func specNacosEphemeral(spec RuntimeSpec) bool {
+	spec = NormalizeSpec(spec)
+	return spec.Nacos.Ephemeral == nil || *spec.Nacos.Ephemeral
 }
 
 func doNacosRequest(ctx context.Context, client *http.Client, method, endpoint string, allowNotFound bool) error {

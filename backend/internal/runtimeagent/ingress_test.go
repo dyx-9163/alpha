@@ -10,7 +10,8 @@ import (
 )
 
 type fakeRunner struct {
-	calls []string
+	calls      []string
+	endpointIP string
 }
 
 func (f *fakeRunner) Run(ctx context.Context, name string, args ...string) (CommandResult, error) {
@@ -20,7 +21,11 @@ func (f *fakeRunner) Run(ctx context.Context, name string, args ...string) (Comm
 		return CommandResult{Stdout: "aifar-pod-admin-gateway-r1\n"}, nil
 	}
 	if strings.Contains(call, " inspect ") {
-		return CommandResult{Stdout: "true|healthy|172.20.0.10\n"}, nil
+		ip := f.endpointIP
+		if ip == "" {
+			ip = "172.20.0.10"
+		}
+		return CommandResult{Stdout: "true|healthy|" + ip + "\n"}, nil
 	}
 	return CommandResult{Stdout: "ok\n"}, nil
 }
@@ -87,6 +92,42 @@ func TestManagerDiscoversReadyDockerPodEndpoints(t *testing.T) {
 		if !strings.Contains(calls, want) {
 			t.Fatalf("expected docker call containing %q, got:\n%s", want, calls)
 		}
+	}
+}
+
+func TestManagerResyncRefreshesEndpointCache(t *testing.T) {
+	gatewayPort := freePort(t)
+	webPort := freePort(t)
+	runner := &fakeRunner{}
+	manager := NewManager(ManagerOptions{StateDir: t.TempDir(), Runner: runner})
+	spec := RuntimeSpec{
+		InstanceID:  "admin",
+		InstallRoot: "/aifar/apps/admin",
+		Network:     "aifar-network",
+		Services: []ServiceSpec{
+			{Name: "gateway", AppName: "alpha-gateway", Port: gatewayPort},
+			{Name: "web-vue3", Port: webPort},
+		},
+		Ingress: IngressSpec{
+			GatewayService: "gateway",
+			WebService:     "web-vue3",
+			GatewayPort:    gatewayPort,
+			WebPort:        webPort,
+		},
+	}
+	if err := manager.Apply(context.Background(), spec); err != nil {
+		t.Fatal(err)
+	}
+	runner.endpointIP = "172.20.0.11"
+	if err := manager.Resync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	endpoints := manager.cachedEndpoints("admin", "gateway")
+	if len(endpoints) != 1 || endpoints[0].Address != "172.20.0.11:"+strconv.Itoa(gatewayPort) {
+		t.Fatalf("expected resync to refresh endpoint cache, got %#v", endpoints)
+	}
+	if err := manager.Remove(context.Background(), "admin"); err != nil {
+		t.Fatal(err)
 	}
 }
 

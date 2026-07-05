@@ -60,7 +60,7 @@ func TestSyncNacosProxyRegistrationsDeregistersAgentProxyInstances(t *testing.T)
 		"ip=192.168.74.132",
 		"port=38005",
 		"namespaceId=prod",
-		"ephemeral=false",
+		"ephemeral=true",
 		"accessToken=token-1",
 	} {
 		if !strings.Contains(joined, want) {
