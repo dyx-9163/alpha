@@ -305,10 +305,12 @@ JSON
     else
       printf ",\n" >> "$spec"
     fi
+    deployment_name="$(alpha_service_name "$service")"
     printf '    {\n' >> "$spec"
     printf '      "serviceName": "%s",\n' "$service" >> "$spec"
+    printf '      "deploymentName": "%s",\n' "$(json_escape "$deployment_name")" >> "$spec"
     printf '      "image": "%s",\n' "$(json_escape "$image")" >> "$spec"
-    printf '      "revision": "%s",\n' "$(json_escape "$service_revision")" >> "$spec"
+    printf '      "podRevision": "%s",\n' "$(json_escape "$service_revision")" >> "$spec"
     printf '      "replicas": %s,\n' "$replicas" >> "$spec"
     printf '      "ports": [{"name":"http","containerPort":%s}],\n' "$port" >> "$spec"
     if [ "$service" = "web-vue3" ]; then

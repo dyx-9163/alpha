@@ -785,3 +785,5 @@
 - 结论：容器摘要接口默认不再执行较慢的 `docker system df`，仅概览请求 `includeDisk=1` 时查询磁盘并与 summary 并发；前端容器页按服务器和页签缓存列表/AIFAR Runtime，普通切页复用缓存，刷新、检查主机和变更操作才强制重拉，减少重复 Docker 查询。
 - 问题：用户询问 AIFAR Runtime 中 Deployment/Service 的 Revision 是否应固定为 `alpha-gateway` 等服务名，只有镜像和 Pod 动态变化。
 - 结论：固定服务身份的方向合理，但不应把固定服务名叫 `Revision`；Deployment/Service 应展示稳定的 service/app name，例如 `alpha-gateway`，而动态发布批次/镜像 tag/Pod template hash 才应叫 revision，Pod 和 image 继续携带动态 revision 便于滚动、清理和排障。
+- 问题：用户要求按不兼容旧版本方式改造 Deployment/Service 固定身份，历史记录会删除后重新安装。
+- 结论：RuntimeSpec v2 的 Deployment 动态版本字段从 `revision` 改为 `podRevision`，新增固定 `deploymentName`；Service/Deployment 对外返回固定 `appName/deploymentName`，容器页服务表展示应用名，动态 Revision 只保留在 Pod/镜像/发布记录层；Nacos 仍只注册 Java 服务，跳过 `web-vue3`。

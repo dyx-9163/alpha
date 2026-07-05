@@ -486,6 +486,7 @@ JSON
     service_env="$ENV_DIR/$service.env"
     [ -f "$service_env" ] || continue
     image="$(read_env_value "$service_env" APP_IMAGE "aifar-$service:$REVISION")"
+    deployment_name="$(alpha_service_name "$service")"
     port="$(service_port "$service")"
     health_cmd="$(health_cmd_for_service "$service")"
     app_cpus="$(resource_value "$service" APP_CPUS "$APP_CPUS")"
@@ -497,8 +498,9 @@ JSON
     fi
     printf '    {\n' >> "$spec"
     printf '      "serviceName": "%s",\n' "$service" >> "$spec"
+    printf '      "deploymentName": "%s",\n' "$(json_escape "$deployment_name")" >> "$spec"
     printf '      "image": "%s",\n' "$(json_escape "$image")" >> "$spec"
-    printf '      "revision": "%s",\n' "$(json_escape "$REVISION")" >> "$spec"
+    printf '      "podRevision": "%s",\n' "$(json_escape "$REVISION")" >> "$spec"
     printf '      "replicas": 1,\n' >> "$spec"
     printf '      "ports": [{"name":"http","containerPort":%s}],\n' "$port" >> "$spec"
     if [ "$service" = "web-vue3" ]; then

@@ -258,6 +258,7 @@ JSON
     health_cmd="$(health_cmd_for_service "$service")"
     cpus="$(resource_value "$service" APP_CPUS "$(service_cpus "$service")")"
     memory="$(resource_value "$service" APP_MEMORY_LIMIT "$(service_memory "$service")")"
+    deployment_name="$(alpha_service_name "$service")"
     if [ "$first_deployment" = "1" ]; then
       first_deployment=0
     else
@@ -265,8 +266,9 @@ JSON
     fi
     printf '    {\n' >> "$spec"
     printf '      "serviceName": "%s",\n' "$service" >> "$spec"
+    printf '      "deploymentName": "%s",\n' "$(json_escape "$deployment_name")" >> "$spec"
     printf '      "image": "%s",\n' "$(json_escape "$image")" >> "$spec"
-    printf '      "revision": "%s",\n' "$(json_escape "$revision")" >> "$spec"
+    printf '      "podRevision": "%s",\n' "$(json_escape "$revision")" >> "$spec"
     printf '      "replicas": %s,\n' "$replicas" >> "$spec"
     printf '      "ports": [{"name":"http","containerPort":%s}],\n' "$port" >> "$spec"
     if [ "$service" = "web-vue3" ]; then

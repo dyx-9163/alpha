@@ -170,7 +170,7 @@ func TestManagerSerializesApplyAndResyncDuringScaleOut(t *testing.T) {
 	deployment := DeploymentSpec{
 		ServiceName: "file",
 		Image:       "aifar-file:rev-1",
-		Revision:    "rev-1",
+		PodRevision: "rev-1",
 		Replicas:    2,
 		Ports:       []ContainerPort{{Name: "http", ContainerPort: 38005}},
 	}
@@ -183,7 +183,7 @@ func TestManagerSerializesApplyAndResyncDuringScaleOut(t *testing.T) {
 		Deployments: []DeploymentSpec{{
 			ServiceName: "file",
 			Image:       "aifar-file:rev-1",
-			Revision:    "rev-1",
+			PodRevision: "rev-1",
 			Replicas:    1,
 			Ports:       []ContainerPort{{Name: "http", ContainerPort: 38005}},
 		}},

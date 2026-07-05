@@ -75,6 +75,9 @@ func SyncNacosProxyRegistrations(ctx context.Context, options NacosProxySyncOpti
 		}
 		token := nacosAccessToken(ctx, client, env)
 		for _, service := range spec.Services {
+			if !serviceRegistersInNacos(spec, service) {
+				continue
+			}
 			appName := serviceAppName(service)
 			if appName == "" || service.Port <= 0 {
 				continue
@@ -149,6 +152,9 @@ func HeartbeatNacosProxyRegistrations(ctx context.Context, options NacosProxySyn
 		}
 		token := nacosAccessToken(ctx, client, env)
 		for _, service := range spec.Services {
+			if !serviceRegistersInNacos(spec, service) {
+				continue
+			}
 			appName := serviceAppName(service)
 			if appName == "" || service.Port <= 0 {
 				continue
@@ -287,9 +293,19 @@ func serviceAppName(service ServiceSpec) string {
 		return "alpha-contacts"
 	case "meeting":
 		return "alpha-meeting"
+	case "web-vue3":
+		return "web-vue3"
 	default:
 		return ""
 	}
+}
+
+func serviceRegistersInNacos(spec RuntimeSpec, service ServiceSpec) bool {
+	name := strings.TrimSpace(service.Name)
+	if name == "" || name == strings.TrimSpace(spec.Ingress.WebService) || name == "web-vue3" {
+		return false
+	}
+	return true
 }
 
 func nacosAccessToken(ctx context.Context, client *http.Client, env nacosRuntimeEnv) string {

@@ -239,6 +239,7 @@ JSON
     fi
     app_cpus="$(resource_value "$service" APP_CPUS "$(read_env_value "$ENV_DIR/compose.env" APP_CPUS "")")"
     app_memory_limit="$(resource_value "$service" APP_MEMORY_LIMIT "$(read_env_value "$ENV_DIR/compose.env" APP_MEMORY_LIMIT "")")"
+    deployment_name="$(alpha_service_name "$service")"
     if [ "$first_deployment" = "1" ]; then
       first_deployment=0
     else
@@ -246,8 +247,9 @@ JSON
     fi
     printf '    {\n' >> "$spec"
     printf '      "serviceName": "%s",\n' "$service" >> "$spec"
+    printf '      "deploymentName": "%s",\n' "$(json_escape "$deployment_name")" >> "$spec"
     printf '      "image": "%s",\n' "$(json_escape "$image")" >> "$spec"
-    printf '      "revision": "%s",\n' "$(json_escape "$service_revision")" >> "$spec"
+    printf '      "podRevision": "%s",\n' "$(json_escape "$service_revision")" >> "$spec"
     printf '      "replicas": %s,\n' "$replicas" >> "$spec"
     printf '      "ports": [{"name":"http","containerPort":%s}],\n' "$port" >> "$spec"
     if [ "$service" = "web-vue3" ]; then

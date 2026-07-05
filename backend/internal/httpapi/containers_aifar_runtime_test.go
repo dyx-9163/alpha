@@ -49,7 +49,7 @@ func TestAIFARRuntimeReturnsDegradedControlPlaneWhenAgentMissing(t *testing.T) {
 	if body.Instances[0].RuntimeConfig == nil || body.Instances[0].RuntimeConfig["global"] == nil {
 		t.Fatalf("expected runtime config in instance response: %+v", body.Instances[0])
 	}
-	if len(body.Services) != 1 || body.Services[0].ServiceName != "permission" || body.Services[0].Status != "ready" {
+	if len(body.Services) != 1 || body.Services[0].ServiceName != "permission" || body.Services[0].AppName != "alpha-permission" || body.Services[0].Status != "ready" {
 		t.Fatalf("unexpected services: %+v", body.Services)
 	}
 }
@@ -123,8 +123,11 @@ func TestAIFARRuntimeServiceSummaryIgnoresNilResidualRecords(t *testing.T) {
 	if len(response.Services) != 1 {
 		t.Fatalf("expected one service, got %+v", response.Services)
 	}
+	if len(response.Deployments) != 1 || response.Deployments[0].DeploymentName != "alpha-file" || response.Deployments[0].PodRevision != "rev-good" {
+		t.Fatalf("expected deployment identity and pod revision to be split, got %+v", response.Deployments)
+	}
 	service := response.Services[0]
-	if service.CurrentRevision != "rev-good" || service.Image != "aifar-file:rev-good" || service.ReadyReplicas != 2 || service.Status != "ready" {
+	if service.AppName != "alpha-file" || service.Image != "aifar-file:rev-good" || service.ReadyReplicas != 2 || service.Status != "ready" {
 		t.Fatalf("expected service summary to use real ready pods, got %+v", service)
 	}
 	stale := 0

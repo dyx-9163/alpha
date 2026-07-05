@@ -180,7 +180,7 @@
               <el-table-column :label="t('containers.replicas')" width="120">
                 <template #default="{ row }">{{ row.readyReplicas }} / {{ row.desiredReplicas }}</template>
               </el-table-column>
-              <el-table-column prop="currentRevision" :label="t('containers.revision')" min-width="170" show-overflow-tooltip />
+              <el-table-column prop="appName" :label="t('containers.appName')" min-width="170" show-overflow-tooltip />
               <el-table-column prop="image" :label="t('containers.image')" min-width="220" show-overflow-tooltip />
               <el-table-column :label="t('containers.cpu')" width="90">
                 <template #default="{ row }">{{ percentText(row.cpuPercent) }}</template>
@@ -479,11 +479,11 @@ type AifarRuntimeAgent = {
 type AifarRuntimeService = {
   instanceId: string
   serviceName: string
+  appName?: string
   proxyName?: string
   desiredReplicas?: number
   readyReplicas?: number
   activeEndpoints?: number
-  currentRevision?: string
   image?: string
   status?: string
   cpuPercent?: number

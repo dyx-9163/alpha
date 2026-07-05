@@ -38,24 +38,25 @@ type ServiceSpec struct {
 }
 
 type DeploymentSpec struct {
-	ServiceName string            `json:"serviceName"`
-	Image       string            `json:"image,omitempty"`
-	Revision    string            `json:"revision,omitempty"`
-	Replicas    int               `json:"replicas,omitempty"`
-	Ports       []ContainerPort   `json:"ports,omitempty"`
-	EnvFiles    []string          `json:"envFiles,omitempty"`
-	Volumes     []VolumeMount     `json:"volumes,omitempty"`
-	Resources   ResourceSpec      `json:"resources,omitempty"`
-	HealthCheck HealthCheckSpec   `json:"healthCheck,omitempty"`
-	Entrypoint   []string          `json:"entrypoint,omitempty"`
-	Command      []string          `json:"command,omitempty"`
-	Environment map[string]string `json:"environment,omitempty"`
-	Labels      map[string]string `json:"labels,omitempty"`
+	ServiceName    string            `json:"serviceName"`
+	DeploymentName string            `json:"deploymentName,omitempty"`
+	Image          string            `json:"image,omitempty"`
+	PodRevision    string            `json:"podRevision,omitempty"`
+	Replicas       int               `json:"replicas,omitempty"`
+	Ports          []ContainerPort   `json:"ports,omitempty"`
+	EnvFiles       []string          `json:"envFiles,omitempty"`
+	Volumes        []VolumeMount     `json:"volumes,omitempty"`
+	Resources      ResourceSpec      `json:"resources,omitempty"`
+	HealthCheck    HealthCheckSpec   `json:"healthCheck,omitempty"`
+	Entrypoint     []string          `json:"entrypoint,omitempty"`
+	Command        []string          `json:"command,omitempty"`
+	Environment    map[string]string `json:"environment,omitempty"`
+	Labels         map[string]string `json:"labels,omitempty"`
 }
 
 type ContainerPort struct {
 	Name          string `json:"name,omitempty"`
-	ContainerPort int   `json:"containerPort"`
+	ContainerPort int    `json:"containerPort"`
 }
 
 type VolumeMount struct {
@@ -125,6 +126,9 @@ func NormalizeSpec(spec RuntimeSpec) RuntimeSpec {
 		if service.Name == "" || seen[service.Name] {
 			continue
 		}
+		if service.AppName == "" {
+			service.AppName = serviceAppName(service)
+		}
 		if service.ListenPort == 0 {
 			service.ListenPort = service.Port
 		}
@@ -144,7 +148,7 @@ func NormalizeSpec(spec RuntimeSpec) RuntimeSpec {
 		services = append(services, ServiceSpec{Name: spec.Ingress.GatewayService, AppName: "alpha-gateway", Port: spec.Ingress.GatewayPort, ListenPort: spec.Ingress.GatewayPort, TargetPort: spec.Ingress.GatewayPort})
 	}
 	if !seen[spec.Ingress.WebService] {
-		services = append(services, ServiceSpec{Name: spec.Ingress.WebService, Port: spec.Ingress.WebPort, ListenPort: spec.Ingress.WebPort, TargetPort: spec.Ingress.WebPort})
+		services = append(services, ServiceSpec{Name: spec.Ingress.WebService, AppName: "web-vue3", Port: spec.Ingress.WebPort, ListenPort: spec.Ingress.WebPort, TargetPort: spec.Ingress.WebPort})
 	}
 	spec.Services = services
 	deploymentSeen := map[string]bool{}
@@ -152,6 +156,13 @@ func NormalizeSpec(spec RuntimeSpec) RuntimeSpec {
 	for _, deployment := range spec.Deployments {
 		if deployment.ServiceName == "" || deploymentSeen[deployment.ServiceName] {
 			continue
+		}
+		if deployment.DeploymentName == "" {
+			if service, ok := serviceByName(spec, deployment.ServiceName); ok && service.AppName != "" {
+				deployment.DeploymentName = service.AppName
+			} else {
+				deployment.DeploymentName = serviceAppName(ServiceSpec{Name: deployment.ServiceName})
+			}
 		}
 		if deployment.Replicas < 1 {
 			deployment.Replicas = 1

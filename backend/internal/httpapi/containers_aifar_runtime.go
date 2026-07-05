@@ -52,16 +52,18 @@ type aifarRuntimeInstance struct {
 }
 
 type aifarRuntimeDeployment struct {
-	InstanceID       string `json:"instanceId"`
-	ServiceName      string `json:"serviceName"`
-	DesiredReplicas  int    `json:"desiredReplicas"`
-	ReadyReplicas    int    `json:"readyReplicas"`
-	CurrentRevision  string `json:"currentRevision,omitempty"`
-	UpdatingRevision string `json:"updatingRevision,omitempty"`
-	Image            string `json:"image,omitempty"`
-	Status           string `json:"status"`
-	UpdatedAt        string `json:"updatedAt,omitempty"`
-	FailureReason    string `json:"failureReason,omitempty"`
+	InstanceID          string `json:"instanceId"`
+	DeploymentName      string `json:"deploymentName"`
+	ServiceName         string `json:"serviceName"`
+	AppName             string `json:"appName"`
+	DesiredReplicas     int    `json:"desiredReplicas"`
+	ReadyReplicas       int    `json:"readyReplicas"`
+	PodRevision         string `json:"podRevision,omitempty"`
+	UpdatingPodRevision string `json:"updatingPodRevision,omitempty"`
+	Image               string `json:"image,omitempty"`
+	Status              string `json:"status"`
+	UpdatedAt           string `json:"updatedAt,omitempty"`
+	FailureReason       string `json:"failureReason,omitempty"`
 }
 
 type aifarRuntimePod struct {
@@ -84,11 +86,11 @@ type aifarRuntimePod struct {
 type aifarRuntimeService struct {
 	InstanceID      string  `json:"instanceId"`
 	ServiceName     string  `json:"serviceName"`
+	AppName         string  `json:"appName"`
 	ProxyName       string  `json:"proxyName,omitempty"`
 	DesiredReplicas int     `json:"desiredReplicas"`
 	ReadyReplicas   int     `json:"readyReplicas"`
 	ActiveEndpoints int     `json:"activeEndpoints"`
-	CurrentRevision string  `json:"currentRevision,omitempty"`
 	Image           string  `json:"image,omitempty"`
 	Status          string  `json:"status"`
 	CPUPercent      float64 `json:"cpuPercent,omitempty"`
@@ -657,17 +659,20 @@ func (a *API) appendAIFARInstanceRuntime(response *aifarRuntimeResponse, instanc
 		}
 		image := replicaImage[deployment.ServiceName]
 		status := runtimeServiceStatus(deployment, ready)
+		appName := aifarRuntimeAppName(deployment.ServiceName)
 		response.Deployments = append(response.Deployments, aifarRuntimeDeployment{
-			InstanceID:       instance.ID,
-			ServiceName:      deployment.ServiceName,
-			DesiredReplicas:  deployment.DesiredReplicas,
-			ReadyReplicas:    ready,
-			CurrentRevision:  effectiveServiceRevision(deployment.CurrentRevision, podsByService[deployment.ServiceName]),
-			UpdatingRevision: cleanRuntimeText(deployment.UpdatingRevision),
-			Image:            image,
-			Status:           status,
-			UpdatedAt:        deployment.UpdatedAt.Format("2006-01-02T15:04:05Z07:00"),
-			FailureReason:    runtimeString(runtimeMetadata(deployment.MetadataJSON), "failureReason", ""),
+			InstanceID:          instance.ID,
+			DeploymentName:      appName,
+			ServiceName:         deployment.ServiceName,
+			AppName:             appName,
+			DesiredReplicas:     deployment.DesiredReplicas,
+			ReadyReplicas:       ready,
+			PodRevision:         effectiveServiceRevision(deployment.CurrentRevision, podsByService[deployment.ServiceName]),
+			UpdatingPodRevision: cleanRuntimeText(deployment.UpdatingRevision),
+			Image:               image,
+			Status:              status,
+			UpdatedAt:           deployment.UpdatedAt.Format("2006-01-02T15:04:05Z07:00"),
+			FailureReason:       runtimeString(runtimeMetadata(deployment.MetadataJSON), "failureReason", ""),
 		})
 		response.Services = append(response.Services, runtimeServiceFromDeployment(instance.ID, deployment, podsByService[deployment.ServiceName], ready, image, status))
 	}
@@ -709,18 +714,17 @@ func (a *API) collectAIFARAgentStatus(ctx context.Context, server store.Server) 
 
 func runtimeServiceFromDeployment(instanceID string, deployment store.AIFARDeployment, pods []aifarRuntimePod, ready int, image, status string) aifarRuntimeService {
 	cpu, mem := averagePodLoad(pods)
-	revision := effectiveServiceRevision(deployment.CurrentRevision, pods)
 	if image == "" {
 		image = firstRuntimePodImage(pods)
 	}
 	return aifarRuntimeService{
 		InstanceID:      instanceID,
 		ServiceName:     deployment.ServiceName,
+		AppName:         aifarRuntimeAppName(deployment.ServiceName),
 		ProxyName:       "aifar-agent:" + deployment.ServiceName,
 		DesiredReplicas: deployment.DesiredReplicas,
 		ReadyReplicas:   ready,
 		ActiveEndpoints: ready,
-		CurrentRevision: revision,
 		Image:           image,
 		Status:          status,
 		CPUPercent:      cpu,
@@ -742,10 +746,6 @@ func runtimeServiceFromPods(instanceID, service string, pods []aifarRuntimePod, 
 	} else if ready < desired {
 		status = "degraded"
 	}
-	revision := firstRuntimePodRevision(activePods)
-	if revision == "" {
-		revision = firstRuntimePodRevision(pods)
-	}
 	if image == "" {
 		image = firstRuntimePodImage(activePods)
 	}
@@ -755,15 +755,42 @@ func runtimeServiceFromPods(instanceID, service string, pods []aifarRuntimePod, 
 	return aifarRuntimeService{
 		InstanceID:      instanceID,
 		ServiceName:     service,
+		AppName:         aifarRuntimeAppName(service),
 		ProxyName:       "aifar-agent:" + service,
 		DesiredReplicas: desired,
 		ReadyReplicas:   ready,
 		ActiveEndpoints: ready,
-		CurrentRevision: revision,
 		Image:           image,
 		Status:          status,
 		CPUPercent:      cpu,
 		MemoryPercent:   mem,
+	}
+}
+
+func aifarRuntimeAppName(service string) string {
+	switch strings.TrimSpace(service) {
+	case "gateway":
+		return "alpha-gateway"
+	case "oauth":
+		return "alpha-oauth"
+	case "permission":
+		return "alpha-permission"
+	case "system":
+		return "alpha-system"
+	case "file":
+		return "alpha-file"
+	case "message":
+		return "alpha-message"
+	case "im":
+		return "alpha-im"
+	case "contacts":
+		return "alpha-contacts"
+	case "meeting":
+		return "alpha-meeting"
+	case "web-vue3":
+		return "web-vue3"
+	default:
+		return strings.TrimSpace(service)
 	}
 }
 

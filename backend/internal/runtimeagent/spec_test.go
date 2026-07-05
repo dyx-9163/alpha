@@ -1,6 +1,10 @@
 package runtimeagent
 
-import "testing"
+import (
+	"encoding/json"
+	"strings"
+	"testing"
+)
 
 func TestNormalizeSpecDefaultsRuntimeV2Fields(t *testing.T) {
 	spec := NormalizeSpec(RuntimeSpec{
@@ -21,11 +25,20 @@ func TestNormalizeSpecDefaultsRuntimeV2Fields(t *testing.T) {
 		t.Fatalf("expected Nacos ephemeral default, got %#v", spec.Nacos.Ephemeral)
 	}
 	file, ok := serviceByName(spec, "file")
-	if !ok || file.ListenPort != 38005 || file.TargetPort != 18080 {
+	if !ok || file.ListenPort != 38005 || file.TargetPort != 18080 || file.AppName != "alpha-file" {
 		t.Fatalf("expected file service listen/target ports to be preserved, got %#v", file)
 	}
 	if len(spec.Deployments) != 1 || len(spec.Deployments[0].Ports) != 1 || spec.Deployments[0].Ports[0].ContainerPort != 18080 {
 		t.Fatalf("expected deployment port to default from targetPort, got %#v", spec.Deployments)
+	}
+	spec.Deployments[0].PodRevision = "rev-1"
+	data, err := json.Marshal(spec.Deployments[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(data)
+	if !strings.Contains(text, `"podRevision":"rev-1"`) || strings.Contains(text, `"revision"`) {
+		t.Fatalf("expected runtime spec deployment to expose podRevision only, got %s", text)
 	}
 }
 
