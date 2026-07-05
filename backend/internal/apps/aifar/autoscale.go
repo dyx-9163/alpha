@@ -280,6 +280,7 @@ func (s Service) ScaleOut(ctx context.Context, req ScaleOutRequest, log Logger, 
 		replicaID = currentReplicas + 1
 	}
 	containerName := podContainerName(service, releaseID, replicaID)
+	workDir := installerkit.WorkDir(req.Server.DeployDir, AppName+"-agent", "runtime-v2", time.Now().UTC())
 	script, err := renderAutoscaleOutScript(autoscaleOutScriptData{
 		InstallRoot:    installRoot,
 		ServiceName:    service,
@@ -290,6 +291,10 @@ func (s Service) ScaleOut(ctx context.Context, req ScaleOutRequest, log Logger, 
 		MaxReplicas:    policy.MaxReplicas,
 	})
 	if err != nil {
+		finishTarget(recorder, target, "failed", err.Error())
+		return err
+	}
+	if err := s.ensureRuntimeAgent(ctx, req.Server, workDir, req.Language, logForServer); err != nil {
 		finishTarget(recorder, target, "failed", err.Error())
 		return err
 	}

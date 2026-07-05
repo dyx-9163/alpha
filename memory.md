@@ -777,3 +777,5 @@
 - 结论：根因指向 agent runtime-v2 的并发 reconcile 竞态：`Apply` 在新 spec 完成前未更新内存期望态，后台 periodic/Docker-event `Resync` 可能按旧 spec 将刚创建的 r2 副本当作多余容器删除。已为 `Apply`/`Resync`/`Remove` 增加串行化锁，并增强 Pod ready 超时诊断，输出 inspect、health log 和 docker logs。
 - 问题：用户询问 AIFAR runtime 中 `Revision` 是什么，`Service` 在哪里，是否属于 `aifar-agent`。
 - 结论：`Revision` 是每个业务服务当前镜像/配置发布批次标识，会写入 RuntimeSpec deployment、容器名和 `aifar.revision` label，用于滚动和清理旧副本；`Service` 是 RuntimeSpec 中的稳定流量入口定义，由 AIFAR 生成并交给 `aifar-agent` 执行，agent 负责监听 service port、维护 endpoint、负载均衡和 Nacos 代理注册。
+- 问题：用户要求继续处理未完成的 AIFAR service 扩容失败问题。
+- 结论：除 agent 内部 `Apply`/`Resync`/`Remove` 串行化外，又补上操作链路缺口：`ScaleOut` 在执行 autoscale 脚本前会上传当前 `aifar-agent-linux-amd64`、安装到目标机 `/usr/local/bin/aifar-agent`、重启并等待 runtime-v2 特征可用，避免目标机继续运行旧 agent 导致扩容失败。

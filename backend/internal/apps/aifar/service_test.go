@@ -707,6 +707,7 @@ func TestAutoscaleOutScriptUsesReplicaContainerAndEscapedDockerFormats(t *testin
 }
 
 func TestScaleOutCreatesReplicaAndUpdatesEndpointMetadata(t *testing.T) {
+	withFakeRuntimeAgentBinary(t)
 	instance := installedAIFARInstance(t)
 	s := &fakeStore{
 		servers: map[string]store.Server{"srv-1": {ID: "srv-1", Host: "10.0.0.10", DeployDir: "/aifar/apps"}},
@@ -731,6 +732,16 @@ func TestScaleOutCreatesReplicaAndUpdatesEndpointMetadata(t *testing.T) {
 	}
 	if !strings.Contains(remote.autoscaleScript, "AIFAR_AUTOSCALE_OUT") || !strings.Contains(remote.autoscaleScript, "aifar-pod-admin-permission-20260701t010203.000000000z-runtime-v2-r2") {
 		t.Fatalf("expected autoscale remote script to run with replica container, got:\n%s", remote.autoscaleScript)
+	}
+	uploads := remote.joinedUploads()
+	if !strings.Contains(uploads, "aifar-agent-linux-amd64->/aifar/apps/_work/aifar-agent-runtime-v2-") {
+		t.Fatalf("expected scale-out to upload current runtime agent, uploads=%s", uploads)
+	}
+	commands := remote.joinedCommands()
+	upgradeIndex := strings.Index(commands, "AIFAR_AGENT_UPGRADE")
+	scaleIndex := strings.Index(commands, "AIFAR_AUTOSCALE_OUT")
+	if upgradeIndex < 0 || scaleIndex < 0 || upgradeIndex > scaleIndex {
+		t.Fatalf("expected scale-out to upgrade agent before autoscale script, commands:\n%s", commands)
 	}
 	saved, err := s.GetAppInstance(instance.ID)
 	if err != nil {

@@ -175,6 +175,55 @@ func NewService(s Store, remote Remote) Service {
 	return Service{store: s, remote: remote}
 }
 
+func (s Service) ensureRuntimeAgent(ctx context.Context, server store.Server, workDir, lang string, log Logger) error {
+	copy := copyFor(lang)
+	agentLocal := agentdist.FindBinary()
+	if agentLocal == "" {
+		return errors.New("AIFAR runtime agent binary is missing; rebuild the backend or use a release package containing bin/aifar-agent-linux-amd64")
+	}
+	workDir = strings.TrimRight(strings.TrimSpace(workDir), "/")
+	if workDir == "" {
+		workDir = installerkit.WorkDir(server.DeployDir, AppName+"-agent", "runtime-v2", time.Now().UTC())
+	}
+	if _, err := installerkit.Run(ctx, s.remote, server, "mkdir -p "+installerkit.ShellQuote(workDir), log, copy.RemoteCommandFailed); err != nil {
+		return err
+	}
+	agentRemote := workDir + "/" + filepath.Base(agentLocal)
+	if err := uploadkit.Upload(ctx, s.remote, server, uploadkit.File{
+		LocalPath:      agentLocal,
+		RemotePath:     agentRemote,
+		Mode:           0o755,
+		LogMessage:     copy.UploadAgent,
+		FailureMessage: copy.UploadAgentFailed,
+	}, log); err != nil {
+		return err
+	}
+	command := strings.Join([]string{
+		"set -eu",
+		"echo AIFAR_AGENT_UPGRADE",
+		"SUDO=\"\"",
+		"if [ \"$(id -u)\" != \"0\" ]; then SUDO=\"sudo\"; fi",
+		"$SUDO install -m 0755 " + installerkit.ShellQuote(agentRemote) + " /usr/local/bin/aifar-agent",
+		"if command -v systemctl >/dev/null 2>&1; then",
+		"  $SUDO systemctl daemon-reload >/dev/null 2>&1 || true",
+		"  $SUDO systemctl restart aifar-agent",
+		"else",
+		"  echo \"systemctl is required to restart aifar-agent\" >&2",
+		"  exit 1",
+		"fi",
+		"for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do",
+		"  if status=\"$(aifar-agent status 2>/dev/null)\" && printf \"%s\" \"$status\" | grep -q '\"reconcile-runtime\"' && printf \"%s\" \"$status\" | grep -q '\"local-runtime-controller\"' && printf \"%s\" \"$status\" | grep -q '\"endpoint-cache\"'; then",
+		"    exit 0",
+		"  fi",
+		"  sleep 1",
+		"done",
+		"echo \"aifar-agent service is not reachable after upgrade\" >&2",
+		"exit 1",
+	}, "\n")
+	_, err := installerkit.Run(ctx, s.remote, server, command, log, "AIFAR runtime agent upgrade failed")
+	return err
+}
+
 func (s Service) Install(ctx context.Context, req InstallRequest, resources []store.Resource, log Logger, targetLog targetLogger) error {
 	copy := copyFor(req.Language)
 	target := strings.TrimSpace(req.ServerID)
