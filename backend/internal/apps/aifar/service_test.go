@@ -322,6 +322,46 @@ func TestEnsureK8sLikeMetadataTreatsMissingModelAsLegacy(t *testing.T) {
 	}
 }
 
+func TestRevisionHelpersIgnoreNilMetadataValues(t *testing.T) {
+	metadata := map[string]any{
+		"activeEndpoints": map[string]any{
+			"file": []any{map[string]any{"releaseId": nil}},
+		},
+		"serviceRevisions": map[string]any{
+			"file":    nil,
+			"gateway": "<no value>",
+		},
+		"currentRevision": nil,
+		"releaseId":       nil,
+	}
+	if got := currentRevisionForService(metadata, "file"); got != "" {
+		t.Fatalf("expected nil file revision to be ignored, got %q", got)
+	}
+	if got := endpointRevision(map[string]any{"revision": "<nil>", "releaseId": "rev-1"}); got != "rev-1" {
+		t.Fatalf("expected endpoint revision to skip invalid revision, got %q", got)
+	}
+	revisions := serviceRevisionsFromMetadata(metadata)
+	if _, ok := revisions["file"]; ok {
+		t.Fatalf("expected invalid file revision to be omitted, got %+v", revisions)
+	}
+	if _, ok := revisions["gateway"]; ok {
+		t.Fatalf("expected invalid gateway revision to be omitted, got %+v", revisions)
+	}
+	if got := stringFromMetadata(map[string]any{"value": nil}, "value", "fallback"); got != "fallback" {
+		t.Fatalf("expected nil metadata string to use fallback, got %q", got)
+	}
+}
+
+func TestParseAutoscaleStatusCleansInvalidReleaseID(t *testing.T) {
+	status := parseAutoscaleStatus("endpoint=file|aifar-pod-admin-file--nil--r2|<no value>|2|38005|true|healthy|1|2147483648\n")
+	if len(status.Endpoints) != 1 {
+		t.Fatalf("expected one endpoint, got %+v", status.Endpoints)
+	}
+	if status.Endpoints[0].ReleaseID != "" {
+		t.Fatalf("expected invalid release id to be empty, got %q", status.Endpoints[0].ReleaseID)
+	}
+}
+
 func TestReusableAIFARInstallInstanceIDRejectsActiveSameRoot(t *testing.T) {
 	svc := Service{store: &fakeStore{instances: []store.AppInstance{
 		{ID: "legacy", App: AppName, ServerID: "srv-1", Status: "installed", Metadata: `{}`},

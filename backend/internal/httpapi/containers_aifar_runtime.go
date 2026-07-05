@@ -614,13 +614,15 @@ func (a *API) appendAIFARInstanceRuntime(response *aifarRuntimeResponse, instanc
 	pods, _ := a.store.ListAIFARPods(instance.ID)
 	endpoints, _ := a.store.ListAIFARServiceEndpoints(instance.ID)
 	replicaImage := latestReplicaImages(replicasets)
-	readyByService := readyEndpointCounts(endpoints)
+	endpointReadyByService := readyEndpointCounts(endpoints)
+	readyByService := map[string]int{}
 	podsByService := map[string][]aifarRuntimePod{}
 	for _, pod := range pods {
 		row, ok := containersByName[pod.ContainerName]
 		stat := statsByName[pod.ContainerName]
 		status, ready := runtimePodStatus(pod, row, ok)
-		image := row.Image
+		revision := cleanRuntimeText(pod.Revision)
+		image := cleanRuntimeText(row.Image)
 		if image == "" {
 			image = replicaImage[pod.ServiceName]
 		}
@@ -629,7 +631,7 @@ func (a *API) appendAIFARInstanceRuntime(response *aifarRuntimeResponse, instanc
 			ServiceName:   pod.ServiceName,
 			PodID:         pod.PodID,
 			ContainerName: pod.ContainerName,
-			Revision:      pod.Revision,
+			Revision:      revision,
 			Image:         image,
 			Port:          pod.Port,
 			Status:        status,
@@ -642,25 +644,32 @@ func (a *API) appendAIFARInstanceRuntime(response *aifarRuntimeResponse, instanc
 		}
 		response.Pods = append(response.Pods, item)
 		podsByService[pod.ServiceName] = append(podsByService[pod.ServiceName], item)
+		if ready {
+			readyByService[pod.ServiceName]++
+		}
 	}
 	seenServices := map[string]bool{}
 	for _, deployment := range deployments {
 		seenServices[deployment.ServiceName] = true
+		ready := readyByService[deployment.ServiceName]
+		if ready == 0 && (len(podsByService[deployment.ServiceName]) == 0 || response.Agent.Status != "running") {
+			ready = endpointReadyByService[deployment.ServiceName]
+		}
 		image := replicaImage[deployment.ServiceName]
-		status := runtimeServiceStatus(deployment, readyByService[deployment.ServiceName])
+		status := runtimeServiceStatus(deployment, ready)
 		response.Deployments = append(response.Deployments, aifarRuntimeDeployment{
 			InstanceID:       instance.ID,
 			ServiceName:      deployment.ServiceName,
 			DesiredReplicas:  deployment.DesiredReplicas,
-			ReadyReplicas:    readyByService[deployment.ServiceName],
-			CurrentRevision:  deployment.CurrentRevision,
-			UpdatingRevision: deployment.UpdatingRevision,
+			ReadyReplicas:    ready,
+			CurrentRevision:  effectiveServiceRevision(deployment.CurrentRevision, podsByService[deployment.ServiceName]),
+			UpdatingRevision: cleanRuntimeText(deployment.UpdatingRevision),
 			Image:            image,
 			Status:           status,
 			UpdatedAt:        deployment.UpdatedAt.Format("2006-01-02T15:04:05Z07:00"),
 			FailureReason:    runtimeString(runtimeMetadata(deployment.MetadataJSON), "failureReason", ""),
 		})
-		response.Services = append(response.Services, runtimeServiceFromDeployment(instance.ID, deployment, podsByService[deployment.ServiceName], readyByService[deployment.ServiceName], image, status))
+		response.Services = append(response.Services, runtimeServiceFromDeployment(instance.ID, deployment, podsByService[deployment.ServiceName], ready, image, status))
 	}
 	for service, servicePods := range podsByService {
 		if seenServices[service] {
@@ -700,6 +709,10 @@ func (a *API) collectAIFARAgentStatus(ctx context.Context, server store.Server) 
 
 func runtimeServiceFromDeployment(instanceID string, deployment store.AIFARDeployment, pods []aifarRuntimePod, ready int, image, status string) aifarRuntimeService {
 	cpu, mem := averagePodLoad(pods)
+	revision := effectiveServiceRevision(deployment.CurrentRevision, pods)
+	if image == "" {
+		image = firstRuntimePodImage(pods)
+	}
 	return aifarRuntimeService{
 		InstanceID:      instanceID,
 		ServiceName:     deployment.ServiceName,
@@ -707,7 +720,7 @@ func runtimeServiceFromDeployment(instanceID string, deployment store.AIFARDeplo
 		DesiredReplicas: deployment.DesiredReplicas,
 		ReadyReplicas:   ready,
 		ActiveEndpoints: ready,
-		CurrentRevision: deployment.CurrentRevision,
+		CurrentRevision: revision,
 		Image:           image,
 		Status:          status,
 		CPUPercent:      cpu,
@@ -718,19 +731,26 @@ func runtimeServiceFromDeployment(instanceID string, deployment store.AIFARDeplo
 
 func runtimeServiceFromPods(instanceID, service string, pods []aifarRuntimePod, ready int, image string) aifarRuntimeService {
 	cpu, mem := averagePodLoad(pods)
-	desired := len(pods)
+	activePods := activeRuntimePods(pods)
+	desired := len(activePods)
+	if desired == 0 {
+		desired = len(pods)
+	}
 	status := "ready"
 	if ready == 0 {
 		status = "no-endpoints"
 	} else if ready < desired {
 		status = "degraded"
 	}
-	revision := ""
-	if len(pods) > 0 {
-		revision = pods[0].Revision
-		if image == "" {
-			image = pods[0].Image
-		}
+	revision := firstRuntimePodRevision(activePods)
+	if revision == "" {
+		revision = firstRuntimePodRevision(pods)
+	}
+	if image == "" {
+		image = firstRuntimePodImage(activePods)
+	}
+	if image == "" {
+		image = firstRuntimePodImage(pods)
 	}
 	return aifarRuntimeService{
 		InstanceID:      instanceID,
@@ -806,8 +826,15 @@ func runtimePodStatus(pod store.AIFARPod, row adapter.DockerContainer, found boo
 func latestReplicaImages(items []store.AIFARReplicaSet) map[string]string {
 	out := map[string]string{}
 	for _, item := range items {
+		if cleanRuntimeText(item.Revision) == "" {
+			continue
+		}
+		image := cleanRuntimeText(item.Image)
+		if image == "" {
+			continue
+		}
 		if out[item.ServiceName] == "" {
-			out[item.ServiceName] = item.Image
+			out[item.ServiceName] = image
 		}
 	}
 	return out
@@ -816,8 +843,59 @@ func latestReplicaImages(items []store.AIFARReplicaSet) map[string]string {
 func readyEndpointCounts(endpoints []store.AIFARServiceEndpoint) map[string]int {
 	out := map[string]int{}
 	for _, endpoint := range endpoints {
-		if endpoint.Ready && strings.EqualFold(endpoint.State, "active") {
+		if endpoint.Ready && strings.EqualFold(endpoint.State, "active") && cleanRuntimeText(endpoint.Revision) != "" {
 			out[endpoint.ServiceName]++
+		}
+	}
+	return out
+}
+
+func effectiveServiceRevision(revision string, pods []aifarRuntimePod) string {
+	if revision = cleanRuntimeText(revision); revision != "" {
+		return revision
+	}
+	return firstRuntimePodRevision(pods)
+}
+
+func firstRuntimePodRevision(pods []aifarRuntimePod) string {
+	for _, pod := range pods {
+		if pod.Status == "stale" {
+			continue
+		}
+		if revision := cleanRuntimeText(pod.Revision); revision != "" {
+			return revision
+		}
+	}
+	for _, pod := range pods {
+		if revision := cleanRuntimeText(pod.Revision); revision != "" {
+			return revision
+		}
+	}
+	return ""
+}
+
+func firstRuntimePodImage(pods []aifarRuntimePod) string {
+	for _, pod := range pods {
+		if pod.Status == "stale" {
+			continue
+		}
+		if image := cleanRuntimeText(pod.Image); image != "" {
+			return image
+		}
+	}
+	for _, pod := range pods {
+		if image := cleanRuntimeText(pod.Image); image != "" {
+			return image
+		}
+	}
+	return ""
+}
+
+func activeRuntimePods(pods []aifarRuntimePod) []aifarRuntimePod {
+	out := make([]aifarRuntimePod, 0, len(pods))
+	for _, pod := range pods {
+		if pod.Status != "stale" {
+			out = append(out, pod)
 		}
 	}
 	return out
@@ -916,12 +994,25 @@ func runtimeString(metadata map[string]any, key, fallback string) string {
 	if value, ok := metadata[key]; ok {
 		switch v := value.(type) {
 		case string:
-			if strings.TrimSpace(v) != "" {
-				return strings.TrimSpace(v)
+			if text := cleanRuntimeText(v); text != "" {
+				return text
 			}
 		}
 	}
 	return fallback
+}
+
+func cleanRuntimeText(value string) string {
+	text := strings.TrimSpace(value)
+	lower := strings.ToLower(text)
+	switch {
+	case lower == "", lower == "<nil>", lower == "<no value>", lower == "nil", lower == "null":
+		return ""
+	case strings.Contains(lower, "<nil>"), strings.Contains(lower, "<no value>"):
+		return ""
+	default:
+		return text
+	}
 }
 
 func runtimeInt(metadata map[string]any, key string, fallback int) int {

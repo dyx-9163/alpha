@@ -369,10 +369,15 @@ func parseAutoscaleStatus(output string) autoscaleStatus {
 			if len(parts) < 9 {
 				continue
 			}
+			service := metadataText(parts[0])
+			container := metadataText(parts[1])
+			if service == "" || container == "" {
+				continue
+			}
 			status.Endpoints = append(status.Endpoints, autoscaleMetric{
-				Service:          parts[0],
-				Container:        parts[1],
-				ReleaseID:        parts[2],
+				Service:          service,
+				Container:        container,
+				ReleaseID:        metadataText(parts[2]),
 				ReplicaID:        atoiDefault(parts[3], 1),
 				Port:             atoiDefault(parts[4], 0),
 				Running:          strings.EqualFold(parts[5], "true"),

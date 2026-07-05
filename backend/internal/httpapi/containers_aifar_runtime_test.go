@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"aifar-deployment/backend/internal/adapter"
 	"aifar-deployment/backend/internal/apps/registry"
 	"aifar-deployment/backend/internal/store"
 )
@@ -50,6 +51,93 @@ func TestAIFARRuntimeReturnsDegradedControlPlaneWhenAgentMissing(t *testing.T) {
 	}
 	if len(body.Services) != 1 || body.Services[0].ServiceName != "permission" || body.Services[0].Status != "ready" {
 		t.Fatalf("unexpected services: %+v", body.Services)
+	}
+}
+
+func TestAIFARRuntimeServiceSummaryIgnoresNilResidualRecords(t *testing.T) {
+	api, db, _ := newAuthzTestAPI(t)
+	instance, err := db.SaveAppInstance(store.AppInstance{
+		App:      "aifar",
+		Version:  "runtime-v2",
+		ServerID: "srv-1",
+		Status:   "installed",
+		Metadata: `{"orchestrationModel":"agent-runtime-v2","installRoot":"/aifar/apps/admin"}`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.SaveAIFARDeployment(store.AIFARDeployment{
+		InstanceID:      instance.ID,
+		ServiceName:     "file",
+		DesiredReplicas: 2,
+		CurrentRevision: "<nil>",
+		Status:          "ready",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.SaveAIFARReplicaSet(store.AIFARReplicaSet{
+		InstanceID:  instance.ID,
+		ServiceName: "file",
+		Revision:    "rev-good",
+		Image:       "aifar-file:rev-good",
+		DesiredPods: 2,
+		ReadyPods:   2,
+		Status:      "ready",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.SaveAIFARReplicaSet(store.AIFARReplicaSet{
+		InstanceID:  instance.ID,
+		ServiceName: "file",
+		Revision:    "<nil>",
+		Image:       "aifar-file:<nil>",
+		DesiredPods: 2,
+		ReadyPods:   2,
+		Status:      "ready",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, pod := range []store.AIFARPod{
+		{InstanceID: instance.ID, ServiceName: "file", Revision: "<nil>", PodID: "file--nil--r1", ContainerName: "aifar-pod-admin-file--nil--r1", Port: 38005, Status: "ready", Ready: true},
+		{InstanceID: instance.ID, ServiceName: "file", Revision: "<nil>", PodID: "file--nil--r2", ContainerName: "aifar-pod-admin-file--nil--r2", Port: 38005, Status: "ready", Ready: true},
+		{InstanceID: instance.ID, ServiceName: "file", Revision: "rev-good", PodID: "file-rev-good-r1", ContainerName: "aifar-pod-admin-file-rev-good-r1", Port: 38005, Status: "ready", Ready: true},
+		{InstanceID: instance.ID, ServiceName: "file", Revision: "rev-good", PodID: "file-rev-good-r2", ContainerName: "aifar-pod-admin-file-rev-good-r2", Port: 38005, Status: "ready", Ready: true},
+	} {
+		if _, err := db.SaveAIFARPod(pod); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.ReplaceAIFARServiceEndpoints(instance.ID, "file", []store.AIFARServiceEndpoint{
+		{InstanceID: instance.ID, ServiceName: "file", PodID: "file--nil--r1", ContainerName: "aifar-pod-admin-file--nil--r1", Revision: "<nil>", Port: 38005, State: "active", Ready: true},
+		{InstanceID: instance.ID, ServiceName: "file", PodID: "file--nil--r2", ContainerName: "aifar-pod-admin-file--nil--r2", Revision: "<nil>", Port: 38005, State: "active", Ready: true},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	response := aifarRuntimeResponse{RuntimeStatus: "ready", Agent: aifarRuntimeAgent{Status: "running"}}
+	api.appendAIFARInstanceRuntime(&response, instance, map[string]adapter.DockerContainer{
+		"aifar-pod-admin-file-rev-good-r1": {Name: "aifar-pod-admin-file-rev-good-r1", Image: "aifar-file:rev-good", State: "running", Status: "Up 1 minute (healthy)"},
+		"aifar-pod-admin-file-rev-good-r2": {Name: "aifar-pod-admin-file-rev-good-r2", Image: "aifar-file:rev-good", State: "running", Status: "Up 1 minute (healthy)"},
+	}, nil)
+
+	if len(response.Services) != 1 {
+		t.Fatalf("expected one service, got %+v", response.Services)
+	}
+	service := response.Services[0]
+	if service.CurrentRevision != "rev-good" || service.Image != "aifar-file:rev-good" || service.ReadyReplicas != 2 || service.Status != "ready" {
+		t.Fatalf("expected service summary to use real ready pods, got %+v", service)
+	}
+	stale := 0
+	for _, pod := range response.Pods {
+		if strings.Contains(pod.ContainerName, "--nil--") {
+			stale++
+			if pod.Status != "stale" || pod.Revision != "" {
+				t.Fatalf("expected nil residual pod to be stale with empty revision, got %+v", pod)
+			}
+		}
+	}
+	if stale != 2 {
+		t.Fatalf("expected two stale residual pods, got %d in %+v", stale, response.Pods)
 	}
 }
 

@@ -624,7 +624,7 @@ func currentRevisionForService(metadata map[string]any, serviceName string) stri
 		}
 	}
 	if revisions, ok := metadata["serviceRevisions"].(map[string]any); ok {
-		if revision := strings.TrimSpace(fmt.Sprint(revisions[serviceName])); revision != "" {
+		if revision := metadataText(revisions[serviceName]); revision != "" {
 			return revision
 		}
 	}
@@ -653,7 +653,7 @@ func firstEndpointRevision(value any) string {
 
 func endpointRevision(item map[string]any) string {
 	for _, key := range []string{"revision", "releaseId"} {
-		if revision := strings.TrimSpace(fmt.Sprint(item[key])); revision != "" {
+		if revision := metadataText(item[key]); revision != "" {
 			return revision
 		}
 	}
@@ -700,12 +700,16 @@ func serviceRevisionsFromMetadata(metadata map[string]any) map[string]any {
 	out := map[string]any{}
 	if raw, ok := metadata["serviceRevisions"].(map[string]any); ok {
 		for key, value := range raw {
-			out[key] = value
+			if revision := metadataText(value); revision != "" {
+				out[key] = revision
+			}
 		}
 	}
 	for _, service := range serviceOrder {
 		if _, ok := out[service]; !ok {
-			out[service] = currentRevisionForService(metadata, service)
+			if revision := currentRevisionForService(metadata, service); revision != "" {
+				out[service] = revision
+			}
 		}
 	}
 	return out
@@ -1683,12 +1687,24 @@ func metadataFromInstance(instance store.AppInstance) map[string]any {
 
 func stringFromMetadata(metadata map[string]any, key, fallback string) string {
 	if value, ok := metadata[key]; ok {
-		text := strings.TrimSpace(fmt.Sprint(value))
-		if text != "" {
+		if text := metadataText(value); text != "" {
 			return text
 		}
 	}
 	return fallback
+}
+
+func metadataText(value any) string {
+	if value == nil {
+		return ""
+	}
+	text := strings.TrimSpace(fmt.Sprint(value))
+	switch strings.ToLower(text) {
+	case "", "<nil>", "<no value>", "nil", "null":
+		return ""
+	default:
+		return text
+	}
 }
 
 func installSteps(copy Copy) []installStepDef {

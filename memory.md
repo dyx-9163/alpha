@@ -779,3 +779,5 @@
 - 结论：`Revision` 是每个业务服务当前镜像/配置发布批次标识，会写入 RuntimeSpec deployment、容器名和 `aifar.revision` label，用于滚动和清理旧副本；`Service` 是 RuntimeSpec 中的稳定流量入口定义，由 AIFAR 生成并交给 `aifar-agent` 执行，agent 负责监听 service port、维护 endpoint、负载均衡和 Nacos 代理注册。
 - 问题：用户要求继续处理未完成的 AIFAR service 扩容失败问题。
 - 结论：除 agent 内部 `Apply`/`Resync`/`Remove` 串行化外，又补上操作链路缺口：`ScaleOut` 在执行 autoscale 脚本前会上传当前 `aifar-agent-linux-amd64`、安装到目标机 `/usr/local/bin/aifar-agent`、重启并等待 runtime-v2 特征可用，避免目标机继续运行旧 agent 导致扩容失败。
+- 问题：用户截图显示 file 服务行 Revision/Image 为 `<nil>`，下面出现 `aifar-pod-admin-file--nil--r1/r2` 残留。
+- 结论：原因是旧扩容/状态聚合链路把 metadata 或 Docker label 缺失值当成字符串 `<nil>`/`<no value>` 写入 revision，随后生成了 `--nil--` 控制面 Pod/Endpoint 记录；已清洗无效 revision，并让 Runtime 服务汇总优先使用真实 running Pod，残留只在 Pod 列表中标记为 stale。
