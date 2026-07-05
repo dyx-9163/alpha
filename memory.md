@@ -761,3 +761,5 @@
 - 结论：runtime-v2 标准调整为 `services/` 只放构建上下文和业务工件；服务级 `.env` 不再需要，公共默认项移到 `runtime/defaults.env`，安装时再生成远端 `$RUNTIME_DIR/env/*.env` 和 RuntimeSpec。
 - 问题：用户删除 Dockerfile 中固定 `-Xms256m`、`-Xmx512m` 后，询问现在 JVM 百分比在哪里设置。
 - 结论：JVM 内存改由 AIFAR runtime 生成的 `java-jvm.options` / `java-jvm.<service>.options` 控制，默认 `InitialRAMPercentage=20`、`MaxRAMPercentage=70`，安装和运行配置都会写入远端 `$RUNTIME_DIR/env` 后由容器 entrypoint 读取。
+- 问题：用户发现存在 `java-common.env`，询问 `services` 下 Dockerfile 是否也没用。
+- 结论：runtime-v2 当前仍用 Dockerfile 做 `docker build`，把 Jar/web dist 打进镜像；`java-common.env` 只是运行时 envFiles 注入。Java Dockerfile 的 COPY/FROM 仍有用，但 ENTRYPOINT 已被 RuntimeSpec 覆盖，后续可收敛为公共 Java/Web Dockerfile 模板。
