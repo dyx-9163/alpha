@@ -124,9 +124,9 @@ func TestSyncNacosProxyRegistrationsRepairsServiceTypeConflict(t *testing.T) {
 		}
 		if r.URL.Path == "/nacos/v1/ns/instance" && r.Method == http.MethodPost {
 			instancePosts++
-			if instancePosts == 1 {
+			if r.URL.Query().Get("ephemeral") == "true" {
 				w.WriteHeader(http.StatusBadRequest)
-				_, _ = w.Write([]byte(`errCode: 400, errMsg: Current service DEFAULT_GROUP@@alpha-oauth`))
+				_, _ = w.Write([]byte(`errCode: 400, errMsg: Current service DEFAULT_GROUP@@alpha-oauth is persistent service, can't register ephemeral instance.`))
 				return
 			}
 		}
@@ -160,9 +160,9 @@ func TestSyncNacosProxyRegistrationsRepairsServiceTypeConflict(t *testing.T) {
 	joined := strings.Join(requests, "\n")
 	firstPost := strings.Index(joined, "POST /nacos/v1/ns/instance?")
 	serviceDelete := strings.Index(joined, "DELETE /nacos/v1/ns/service?")
-	lastPost := strings.LastIndex(joined, "POST /nacos/v1/ns/instance?")
-	if firstPost < 0 || serviceDelete < 0 || lastPost <= firstPost || !(firstPost < serviceDelete && serviceDelete < lastPost) {
-		t.Fatalf("expected instance POST, service DELETE, then instance POST retry, got:\n%s", joined)
+	fallbackPost := strings.LastIndex(joined, "POST /nacos/v1/ns/instance?")
+	if firstPost < 0 || serviceDelete < 0 || fallbackPost <= firstPost || !(firstPost < serviceDelete && serviceDelete < fallbackPost) {
+		t.Fatalf("expected instance POST, service DELETE, then instance POST fallback, got:\n%s", joined)
 	}
 	for _, want := range []string{
 		"serviceName=alpha-oauth",
@@ -178,5 +178,54 @@ func TestSyncNacosProxyRegistrationsRepairsServiceTypeConflict(t *testing.T) {
 	}
 	if !strings.Contains(logs.String(), "cleanup service metadata: alpha-oauth") {
 		t.Fatalf("expected repair log, got %q", logs.String())
+	}
+	if !strings.Contains(logs.String(), "fallback: alpha-oauth ephemeral=false") {
+		t.Fatalf("expected persistent fallback log, got %q", logs.String())
+	}
+	if instancePosts < 3 {
+		t.Fatalf("expected initial post, retry, and fallback post, got %d requests:\n%s", instancePosts, joined)
+	}
+}
+
+func TestHeartbeatNacosProxyRegistrationsIgnoresPersistentServiceConflict(t *testing.T) {
+	requests := []string{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests = append(requests, r.Method+" "+r.URL.Path+"?"+r.URL.RawQuery)
+		if r.URL.Path == "/nacos/v1/auth/users/login" {
+			_, _ = w.Write([]byte(`{"accessToken":"token-1"}`))
+			return
+		}
+		if r.URL.Path == "/nacos/v1/ns/instance/beat" && r.Method == http.MethodPut {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`errCode: 400, errMsg: Current service DEFAULT_GROUP@@alpha-oauth is persistent service, can't register ephemeral instance.`))
+			return
+		}
+		_, _ = w.Write([]byte(`ok`))
+	}))
+	defer server.Close()
+
+	installRoot := t.TempDir()
+	envDir := filepath.Join(installRoot, "runtime", "env")
+	if err := os.MkdirAll(envDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(envDir, "java-common.env"), []byte("NACOS_HOST="+strings.TrimPrefix(server.URL, "http://")+"\nNACOS_NS=prod\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := HeartbeatNacosProxyRegistrations(context.Background(), NacosProxySyncOptions{
+		Specs: []RuntimeSpec{{
+			InstanceID:  "admin",
+			InstallRoot: installRoot,
+			Services:    []ServiceSpec{{Name: "oauth", AppName: "alpha-oauth", Port: 38001}},
+			Nacos:       NacosSpec{Group: "DEFAULT_GROUP"},
+		}},
+		AgentIP: "192.168.74.132",
+		Client:  server.Client(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(requests, "\n")
+	if !strings.Contains(joined, "PUT /nacos/v1/ns/instance/beat?") || !strings.Contains(joined, "serviceName=alpha-oauth") {
+		t.Fatalf("expected heartbeat request, got:\n%s", joined)
 	}
 }

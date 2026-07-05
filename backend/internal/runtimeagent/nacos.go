@@ -162,6 +162,9 @@ func HeartbeatNacosProxyRegistrations(ctx context.Context, options NacosProxySyn
 			}
 			endpoint := nacosHeartbeatURL(env, spec, appName, agentIP, service.Port, token)
 			if err := doNacosRequest(ctx, client, http.MethodPut, endpoint, false); err != nil {
+				if fallbackEphemeral, ok := nacosServiceConflictEphemeral(err); ok && fallbackEphemeral != specNacosEphemeral(spec) {
+					continue
+				}
 				errs = append(errs, fmt.Sprintf("%s/%s: %v", spec.InstanceID, service.Name, err))
 			}
 		}
@@ -353,6 +356,14 @@ func syncNacosProxy(ctx context.Context, client *http.Client, env nacosRuntimeEn
 		}
 		time.Sleep(200 * time.Millisecond)
 		if retryErr := doNacosRequest(ctx, client, http.MethodPost, endpoint, false); retryErr != nil {
+			if fallbackEphemeral, ok := nacosServiceConflictEphemeral(retryErr); ok && fallbackEphemeral != specNacosEphemeral(spec) {
+				fallbackEndpoint := nacosInstanceURL(env, appName, ip, port, token, fallbackEphemeral)
+				logf(log, "AIFAR Nacos proxy register fallback: %s ephemeral=%t\n", appName, fallbackEphemeral)
+				if fallbackErr := doNacosRequest(ctx, client, http.MethodPost, fallbackEndpoint, false); fallbackErr != nil {
+					return fmt.Errorf("%w; retry after cleanup failed: %v; fallback ephemeral=%t failed: %v", err, retryErr, fallbackEphemeral, fallbackErr)
+				}
+				return nil
+			}
 			return fmt.Errorf("%w; retry after cleanup failed: %v", err, retryErr)
 		}
 		return nil
@@ -479,12 +490,34 @@ func (e *nacosHTTPError) Error() string {
 }
 
 func isNacosServiceConflict(err error) bool {
+	_, ok := nacosServiceConflict(err)
+	return ok
+}
+
+func nacosServiceConflictEphemeral(err error) (bool, bool) {
+	body, ok := nacosServiceConflict(err)
+	if !ok {
+		return false, false
+	}
+	if strings.Contains(body, "persistent service") && strings.Contains(body, "ephemeral instance") {
+		return false, true
+	}
+	if strings.Contains(body, "ephemeral service") && strings.Contains(body, "persistent instance") {
+		return true, true
+	}
+	return false, false
+}
+
+func nacosServiceConflict(err error) (string, bool) {
 	var httpErr *nacosHTTPError
 	if !errors.As(err, &httpErr) || httpErr.StatusCode != http.StatusBadRequest {
-		return false
+		return "", false
 	}
 	body := strings.ToLower(httpErr.Body)
-	return strings.Contains(body, "current service")
+	if !strings.Contains(body, "current service") {
+		return "", false
+	}
+	return body, true
 }
 
 func doNacosRequest(ctx context.Context, client *http.Client, method, endpoint string, allowNotFound bool) error {
