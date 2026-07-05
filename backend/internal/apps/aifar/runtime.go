@@ -4,9 +4,16 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"text/template"
 
 	"aifar-deployment/backend/internal/installer/installerkit"
+	"aifar-deployment/backend/internal/installer/selinux"
 )
+
+type runtimeReconcileScriptData struct {
+	InstallRoot string
+	SpecPath    string
+}
 
 func (s Service) ReconcileRuntime(ctx context.Context, req RuntimeReconcileRequest, log Logger, targetLog targetLogger) error {
 	target := req.Instance.ServerID
@@ -37,15 +44,30 @@ func (s Service) ReconcileRuntime(ctx context.Context, req RuntimeReconcileReque
 		return err
 	}
 	specPath := stringFromMetadata(metadata, "runtimeSpecPath", runtimeSpecPath(installRoot))
-	command := "command -v aifar-agent >/dev/null 2>&1 || { echo 'aifar-agent is not installed' >&2; exit 1; }; " +
-		"test -f " + installerkit.ShellQuote(specPath) + " || { echo 'AIFAR runtime spec is missing' >&2; exit 1; }; " +
-		"aifar-agent reconcile-runtime --spec " + installerkit.ShellQuote(specPath)
+	script, err := renderRuntimeReconcileScript(runtimeReconcileScriptData{
+		InstallRoot: installRoot,
+		SpecPath:    specPath,
+	})
+	if err != nil {
+		finishTarget(recorder, target, "failed", err.Error())
+		return err
+	}
 	logForServer.Info("reconciling AIFAR runtime for instance %s", current.ID)
-	if _, err := installerkit.Run(ctx, s.remote, req.Server, command, logForServer, "AIFAR runtime reconcile failed"); err != nil {
+	if _, err := installerkit.Run(ctx, s.remote, req.Server, "sh -s <<'AIFAR_RUNTIME_RECONCILE'\n"+script+"\nAIFAR_RUNTIME_RECONCILE", logForServer, "AIFAR runtime reconcile failed"); err != nil {
 		finishTarget(recorder, target, "failed", err.Error())
 		return err
 	}
 	logForServer.Info("AIFAR runtime reconciled for instance %s", current.ID)
 	finishTarget(recorder, target, "success", "")
 	return nil
+}
+
+func renderRuntimeReconcileScript(data runtimeReconcileScriptData) (string, error) {
+	content, err := templateFS.ReadFile("templates/runtime-reconcile.sh")
+	if err != nil {
+		return "", err
+	}
+	return installerkit.RenderTemplate(AppName, "runtime-reconcile.sh", "aifar-runtime-reconcile", string(content), selinux.AddTemplateFuncs(template.FuncMap{
+		"quote": shellQuoteAny,
+	}), data)
 }

@@ -158,6 +158,7 @@ Requires=docker.service
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/aifar-agent serve --addr $AGENT_LISTEN_ADDR
+ExecStopPost=-/usr/local/bin/aifar-agent deregister-nacos --state-dir /var/lib/aifar-agent/instances
 Restart=always
 RestartSec=2
 WorkingDirectory=/var/lib/aifar-agent

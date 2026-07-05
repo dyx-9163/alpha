@@ -132,6 +132,7 @@ func TestInstallerUploadsAndInstallsRuntimeAgentWhenAvailable(t *testing.T) {
 		`install -m 0755 "$AGENT_BINARY" /usr/local/bin/aifar-agent`,
 		`Description=AIFAR Runtime Agent`,
 		`ExecStart=/usr/local/bin/aifar-agent serve --addr $AGENT_LISTEN_ADDR`,
+		`ExecStopPost=-/usr/local/bin/aifar-agent deregister-nacos --state-dir /var/lib/aifar-agent/instances`,
 		`systemctl enable --now aifar-agent`,
 		`/usr/local/bin/aifar-agent status`,
 	} {

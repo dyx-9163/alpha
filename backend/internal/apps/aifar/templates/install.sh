@@ -132,6 +132,20 @@ service_port() {
 
 {{ serviceAccessHelpers }}
 
+open_service_ports() {
+  ports=""
+  for service in "$@"; do
+    port="$(service_port "$service")"
+    [ -n "$port" ] && [ "$port" != "0" ] || continue
+    ports="$ports $port"
+  done
+  [ -n "$ports" ] || return 0
+  # shellcheck disable=SC2086
+  open_firewall_ports $ports
+  # shellcheck disable=SC2086
+  allow_selinux_ports http_port_t $ports
+}
+
 load_docker_images() {
   [ -d "$IMAGE_DIR" ] || return 0
   for image_tar in "$IMAGE_DIR"/*.tar; do
@@ -224,6 +238,7 @@ Requires=docker.service
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/aifar-agent serve --addr $AGENT_LISTEN_ADDR
+ExecStopPost=-/usr/local/bin/aifar-agent deregister-nacos --state-dir /var/lib/aifar-agent/instances
 Restart=always
 RestartSec=2
 WorkingDirectory=/var/lib/aifar-agent
@@ -739,8 +754,7 @@ for service in $SERVICE_ORDER; do
   register_nacos_proxy "$service"
 done
 
-open_firewall_ports "$GATEWAY_PORT" "$WEB_VUE3_PORT"
-allow_selinux_ports http_port_t "$GATEWAY_PORT" "$WEB_VUE3_PORT"
+open_service_ports $SERVICE_ORDER
 write_model_manifest
 INSTALL_SUCCEEDED=1
 trap - EXIT INT TERM

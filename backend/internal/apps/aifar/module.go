@@ -326,6 +326,19 @@ func (m Module) ScaleOutService(ctx context.Context, req registry.ServiceScaleOu
 	})
 }
 
+func (m Module) InstallServices(ctx context.Context, req registry.ServiceInstallRequest, run registry.RunContext) error {
+	return m.service.InstallServices(ctx, InstallServicesRequest{
+		Instance: req.Instance,
+		Server:   req.Server,
+		Language: req.Language,
+		Actor:    req.Actor,
+		Services: req.Services,
+		Reason:   req.Reason,
+	}, run.Log, func(target string) Logger {
+		return run.LoggerForTarget(target)
+	})
+}
+
 func (m Module) ReconcileRuntime(ctx context.Context, req registry.RuntimeReconcileRequest, run registry.RunContext) error {
 	return m.service.ReconcileRuntime(ctx, RuntimeReconcileRequest{
 		Instance: req.Instance,
@@ -357,6 +370,30 @@ func (m Module) ApplyRuntimeConfig(ctx context.Context, req registry.RuntimeConf
 		Actor:    req.Actor,
 		Reason:   req.Reason,
 		Config:   req.Config,
+	}, run.Log, func(target string) Logger {
+		return run.LoggerForTarget(target)
+	})
+}
+
+func (m Module) CleanupRuntimeStalePods(ctx context.Context, req registry.RuntimeCleanupRequest, run registry.RunContext) error {
+	return m.service.CleanupRuntimeStalePods(ctx, RuntimeCleanupRequest{
+		Instance: req.Instance,
+		Server:   req.Server,
+		Language: req.Language,
+		Actor:    req.Actor,
+		Reason:   req.Reason,
+	}, run.Log, func(target string) Logger {
+		return run.LoggerForTarget(target)
+	})
+}
+
+func (m Module) UninstallRuntimeAgent(ctx context.Context, req registry.RuntimeAgentUninstallRequest, run registry.RunContext) error {
+	return m.service.UninstallRuntimeAgent(ctx, RuntimeAgentUninstallRequest{
+		Instance: req.Instance,
+		Server:   req.Server,
+		Language: req.Language,
+		Actor:    req.Actor,
+		Reason:   req.Reason,
 	}, run.Log, func(target string) Logger {
 		return run.LoggerForTarget(target)
 	})

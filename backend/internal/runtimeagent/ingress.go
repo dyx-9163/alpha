@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"net"
 	"net/http"
@@ -30,6 +31,13 @@ func (r Reconciler) ReconcileRuntime(ctx context.Context, spec RuntimeSpec) erro
 	}
 	if err := r.Manager.Apply(ctx, spec); err != nil {
 		return err
+	}
+	if err := SyncNacosProxyRegistrations(ctx, NacosProxySyncOptions{
+		Specs:  []RuntimeSpec{NormalizeSpec(spec)},
+		Action: NacosProxyRegister,
+		Log:    r.Log,
+	}); err != nil {
+		logf(r.Log, "sync AIFAR Nacos proxies after runtime reconcile failed: %v\n", err)
 	}
 	logf(r.Log, "AIFAR agent reconciled runtime instance %s\n", NormalizeSpec(spec).InstanceID)
 	return nil
@@ -151,7 +159,10 @@ func (m *Manager) Remove(ctx context.Context, instanceID string) error {
 		instanceID = "admin"
 	}
 	portsToStop := []int{}
+	var spec RuntimeSpec
+	var hasSpec bool
 	m.mu.Lock()
+	spec, hasSpec = m.specs[instanceID]
 	delete(m.specs, instanceID)
 	for port, route := range m.routes {
 		if route.InstanceID != instanceID {
@@ -165,6 +176,15 @@ func (m *Manager) Remove(ctx context.Context, instanceID string) error {
 	m.mu.Unlock()
 	for _, port := range portsToStop {
 		m.stopPort(ctx, port)
+	}
+	if hasSpec {
+		if err := SyncNacosProxyRegistrations(ctx, NacosProxySyncOptions{
+			Specs:  []RuntimeSpec{spec},
+			Action: NacosProxyDeregister,
+			Log:    m.log,
+		}); err != nil {
+			logf(m.log, "sync AIFAR Nacos proxies after runtime remove failed: %v\n", err)
+		}
 	}
 	_ = os.RemoveAll(filepath.Join(m.stateDir, instanceID))
 	return nil
@@ -197,6 +217,8 @@ func (m *Manager) Status() map[string]any {
 		"features": []string{
 			"health",
 			"host-proxy",
+			"nacos-proxy-deregister",
+			"nacos-proxy-register",
 			"reconcile-runtime",
 			"status",
 		},
@@ -256,7 +278,7 @@ func (m *Manager) handleProxy(port int) func(http.ResponseWriter, *http.Request)
 			http.Error(w, "AIFAR runtime service has no ready endpoints", http.StatusServiceUnavailable)
 			return
 		}
-		ep := m.pickEndpoint(spec.InstanceID, service, endpoints)
+		ep := m.selectEndpoint(r, spec.InstanceID, service, endpoints)
 		target := &url.URL{Scheme: "http", Host: ep.Address}
 		proxy := httputil.NewSingleHostReverseProxy(target)
 		originalDirector := proxy.Director
@@ -333,7 +355,17 @@ func (m *Manager) discoverEndpoints(ctx context.Context, spec RuntimeSpec, servi
 			Address:   net.JoinHostPort(ip, strconv.Itoa(serviceSpec.Port)),
 		})
 	}
+	sort.Slice(endpoints, func(i, j int) bool {
+		return endpoints[i].Container < endpoints[j].Container
+	})
 	return endpoints, nil
+}
+
+func (m *Manager) selectEndpoint(r *http.Request, instanceID, service string, endpoints []endpoint) endpoint {
+	if key := affinityKeyForRequest(service, r); key != "" {
+		return endpoints[int(stableHash(key)%uint64(len(endpoints)))]
+	}
+	return m.pickEndpoint(instanceID, service, endpoints)
 }
 
 func (m *Manager) pickEndpoint(instanceID, service string, endpoints []endpoint) endpoint {
@@ -343,6 +375,69 @@ func (m *Manager) pickEndpoint(instanceID, service string, endpoints []endpoint)
 	m.next[key] = index + 1
 	m.mu.Unlock()
 	return endpoints[int(index%uint64(len(endpoints)))]
+}
+
+func affinityKeyForRequest(service string, r *http.Request) string {
+	if !serviceNeedsAffinity(service) || r == nil {
+		return ""
+	}
+	for _, header := range []string{
+		"X-AIFAR-Affinity",
+		"X-Upload-Id",
+		"X-File-Md5",
+		"X-File-Hash",
+		"X-Trace-Id",
+		"X-Request-Id",
+		"Authorization",
+	} {
+		if value := strings.TrimSpace(r.Header.Get(header)); value != "" {
+			return header + ":" + value
+		}
+	}
+	query := r.URL.Query()
+	for _, key := range []string{
+		"identifier",
+		"uploadId",
+		"fileMd5",
+		"md5",
+		"hash",
+		"traceId",
+		"guid",
+		"uuid",
+		"fileId",
+	} {
+		if value := strings.TrimSpace(query.Get(key)); value != "" {
+			return "query:" + key + ":" + value
+		}
+	}
+	for _, name := range []string{"aifar-session-token", "token", "SESSION", "JSESSIONID"} {
+		if cookie, err := r.Cookie(name); err == nil && strings.TrimSpace(cookie.Value) != "" {
+			return "cookie:" + name + ":" + strings.TrimSpace(cookie.Value)
+		}
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = strings.TrimSpace(r.RemoteAddr)
+	}
+	if host != "" {
+		return "remote:" + host
+	}
+	return ""
+}
+
+func serviceNeedsAffinity(service string) bool {
+	switch strings.TrimSpace(service) {
+	case "file", "gateway":
+		return true
+	default:
+		return false
+	}
+}
+
+func stableHash(value string) uint64 {
+	hash := fnv.New64a()
+	_, _ = hash.Write([]byte(value))
+	return hash.Sum64()
 }
 
 func (m *Manager) writeSpec(spec RuntimeSpec) error {

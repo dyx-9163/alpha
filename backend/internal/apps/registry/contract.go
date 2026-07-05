@@ -177,6 +177,15 @@ type ServiceScaleOutRequest struct {
 	Reason      string
 }
 
+type ServiceInstallRequest struct {
+	Instance store.AppInstance
+	Server   store.Server
+	Language string
+	Actor    string
+	Services []string
+	Reason   string
+}
+
 type RuntimeReconcileRequest struct {
 	Instance store.AppInstance
 	Server   store.Server
@@ -204,6 +213,22 @@ type RuntimeConfigRequest struct {
 	Actor    string
 	Reason   string
 	Config   RuntimeConfigPayload
+}
+
+type RuntimeCleanupRequest struct {
+	Instance store.AppInstance
+	Server   store.Server
+	Language string
+	Actor    string
+	Reason   string
+}
+
+type RuntimeAgentUninstallRequest struct {
+	Instance store.AppInstance
+	Server   store.Server
+	Language string
+	Actor    string
+	Reason   string
 }
 
 type ClusterStartRequest struct {
@@ -277,6 +302,10 @@ type ServiceScaleOutModule interface {
 	ScaleOutService(ctx context.Context, req ServiceScaleOutRequest, run RunContext) error
 }
 
+type ServiceInstallModule interface {
+	InstallServices(ctx context.Context, req ServiceInstallRequest, run RunContext) error
+}
+
 type RuntimeReconcileModule interface {
 	ReconcileRuntime(ctx context.Context, req RuntimeReconcileRequest, run RunContext) error
 }
@@ -284,6 +313,14 @@ type RuntimeReconcileModule interface {
 type RuntimeConfigModule interface {
 	ValidateRuntimeConfig(ctx context.Context, req RuntimeConfigRequest) error
 	ApplyRuntimeConfig(ctx context.Context, req RuntimeConfigRequest, run RunContext) error
+}
+
+type RuntimeCleanupModule interface {
+	CleanupRuntimeStalePods(ctx context.Context, req RuntimeCleanupRequest, run RunContext) error
+}
+
+type RuntimeAgentUninstallModule interface {
+	UninstallRuntimeAgent(ctx context.Context, req RuntimeAgentUninstallRequest, run RunContext) error
 }
 
 type ClusterStartModule interface {

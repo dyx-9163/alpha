@@ -265,6 +265,51 @@ func (f *fakeStore) ListAIFARServiceEndpoints(instanceID string) ([]store.AIFARS
 	return out, nil
 }
 
+func (f *fakeStore) PruneAIFARPodRecords(instanceID string, existingContainerNames []string) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	keep := stringSet(existingContainerNames)
+	next := f.pods[:0]
+	deleted := 0
+	for _, item := range f.pods {
+		if item.InstanceID == instanceID && !keep[item.ContainerName] {
+			deleted++
+			continue
+		}
+		next = append(next, item)
+	}
+	f.pods = next
+	return deleted, nil
+}
+
+func (f *fakeStore) PruneAIFARServiceEndpointRecords(instanceID string, existingContainerNames []string) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	keep := stringSet(existingContainerNames)
+	next := f.endpoints[:0]
+	deleted := 0
+	for _, item := range f.endpoints {
+		if item.InstanceID == instanceID && !keep[item.ContainerName] {
+			deleted++
+			continue
+		}
+		next = append(next, item)
+	}
+	f.endpoints = next
+	return deleted, nil
+}
+
+func stringSet(values []string) map[string]bool {
+	out := map[string]bool{}
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value != "" {
+			out[value] = true
+		}
+	}
+	return out
+}
+
 func TestEnsureK8sLikeMetadataTreatsMissingModelAsLegacy(t *testing.T) {
 	err := ensureK8sLikeMetadata(map[string]any{}, UpdateCopy{
 		LegacyUpdateUnsupported: "legacy model %s",
@@ -358,6 +403,10 @@ type fakeRemote struct {
 	bundleScript            string
 	autoscaleScript         string
 	runtimeConfigScript     string
+	serviceInstallScript    string
+	runtimeReconcileScript  string
+	runtimePodScanStdout    string
+	runtimeAgentUninstall   string
 	statusStdout            string
 	autoscaleStatusStdouts  []string
 	autoscaleStatusFallback string
@@ -387,6 +436,18 @@ func (f *fakeRemote) Run(ctx context.Context, server store.Server, command strin
 	}
 	if strings.Contains(command, "AIFAR_RUNTIME_CONFIG") {
 		f.runtimeConfigScript = command
+	}
+	if strings.Contains(command, "AIFAR_SERVICE_INSTALL") {
+		f.serviceInstallScript = command
+	}
+	if strings.Contains(command, "AIFAR_RUNTIME_RECONCILE") {
+		f.runtimeReconcileScript = command
+	}
+	if strings.Contains(command, "AIFAR_RUNTIME_POD_SCAN") {
+		return adapter.CommandResult{Stdout: f.runtimePodScanStdout}, nil
+	}
+	if strings.Contains(command, "AIFAR_AGENT_UNINSTALL") {
+		f.runtimeAgentUninstall = command
 	}
 	return adapter.CommandResult{Stdout: "ok"}, nil
 }
@@ -913,6 +974,7 @@ func TestServiceInstallsAIFARServiceFromDockerAppsBundle(t *testing.T) {
 		`install -m 0755 "$AGENT_BINARY" /usr/local/bin/aifar-agent`,
 		`installing or upgrading AIFAR runtime agent`,
 		`ExecStart=/usr/local/bin/aifar-agent serve --addr $AGENT_LISTEN_ADDR`,
+		`ExecStopPost=-/usr/local/bin/aifar-agent deregister-nacos --state-dir /var/lib/aifar-agent/instances`,
 		`systemctl $agent_start_cmd aifar-agent`,
 		`RUNTIME_DIR="$INSTALL_ROOT/runtime"`,
 		`NACOS_REGISTRATION_MODE="agent-proxy"`,
@@ -1096,6 +1158,9 @@ func TestServiceInstallsSelectedAIFARModules(t *testing.T) {
 	if strings.Contains(remote.installScript, `SERVICE_ORDER='oauth permission system file message im contacts meeting gateway web-vue3'`) {
 		t.Fatalf("install script should not use all services when selectedServices is provided:\n%s", remote.installScript)
 	}
+	if !strings.Contains(remote.installScript, `open_service_ports $SERVICE_ORDER`) {
+		t.Fatalf("install script should open selected runtime service ports:\n%s", remote.installScript)
+	}
 	if len(s.instances) != 1 {
 		t.Fatalf("expected one AIFAR instance, got %+v", s.instances)
 	}
@@ -1126,6 +1191,201 @@ func TestServiceInstallsSelectedAIFARModules(t *testing.T) {
 	releaseContainers := mapFromMetadataValue(manifest["containers"])
 	if _, ok := releaseContainers["permission"]; ok {
 		t.Fatalf("manifest should not include unselected permission container: %s", s.releases[0].ManifestJSON)
+	}
+}
+
+func TestServiceInstallsMissingAIFARModulesAfterInitialInstall(t *testing.T) {
+	instance := installedAIFARInstance(t)
+	metadata := metadataFromInstance(instance)
+	initialServices := []string{"gateway", "web-vue3"}
+	for key, value := range releaseOrchestrationMetadata("/aifar/apps/admin", "20260701T010203.000000000Z-docker-apps", defaultNetworkName, defaultGatewayPort, defaultWebPort, initialServices) {
+		metadata[key] = value
+	}
+	metadata["services"] = initialServices
+	instance.Metadata = mustMetadata(t, metadata)
+	s := &fakeStore{
+		servers: map[string]store.Server{
+			"srv-1": {ID: "srv-1", Name: "app-1", Host: "10.0.0.10", DeployDir: "/aifar/apps"},
+		},
+		instances: []store.AppInstance{instance},
+	}
+	remote := &fakeRemote{}
+	service := NewService(s, remote)
+	err := service.InstallServices(context.Background(), InstallServicesRequest{
+		Instance: instance,
+		Server:   s.servers["srv-1"],
+		Language: "en",
+		Actor:    "admin",
+		Services: []string{"file", "system"},
+		Reason:   "install missed services",
+	}, fakeLogger{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		`AIFAR_SERVICE_INSTALL`,
+		`NEW_SERVICES='system file'`,
+		`SERVICE_ORDER='system file gateway web-vue3'`,
+		`docker build -t "$image" "$APP_DIR/$service"`,
+		`aifar-agent reconcile-runtime --spec "$spec"`,
+		`open_service_ports $NEW_SERVICES`,
+		`allow_selinux_ports http_port_t $ports`,
+		`trap 'cleanup_failed_service_install' EXIT INT TERM`,
+	} {
+		if !strings.Contains(remote.serviceInstallScript, want) {
+			t.Fatalf("service install script should contain %q:\n%s", want, remote.serviceInstallScript)
+		}
+	}
+	if len(s.instances) != 1 || s.instances[0].Status != "installed" {
+		t.Fatalf("expected installed instance, got %+v", s.instances)
+	}
+	next := metadataFromInstance(s.instances[0])
+	if got := strings.Join(servicesFromMetadata(next), " "); got != "system file gateway web-vue3" {
+		t.Fatalf("expected merged services in metadata, got %q from %s", got, s.instances[0].Metadata)
+	}
+	if _, ok := next["orchestrationLock"]; ok {
+		t.Fatalf("service install should clear orchestration lock: %s", s.instances[0].Metadata)
+	}
+	last, ok := next["lastServiceInstall"].(map[string]any)
+	if !ok || strings.Join(stringSliceFromAny(last["services"]), " ") != "system file" {
+		t.Fatalf("expected lastServiceInstall metadata, got %s", s.instances[0].Metadata)
+	}
+	desired := mapFromMetadataValue(next["desiredReplicas"])
+	for _, serviceName := range []string{"system", "file", "gateway", "web-vue3"} {
+		if intFromAny(desired[serviceName], 0) != 1 {
+			t.Fatalf("expected desired replica for %s, got %#v in %s", serviceName, desired, s.instances[0].Metadata)
+		}
+	}
+	if _, ok := desired["oauth"]; ok {
+		t.Fatalf("metadata should not add uninstalled oauth desired replica: %#v", desired)
+	}
+	if len(s.deployments) != 2 || len(s.replicaSets) != 2 || len(s.pods) != 2 || len(s.endpoints) != 2 {
+		t.Fatalf("expected control-plane rows for two newly installed services, deployments=%d replicaSets=%d pods=%d endpoints=%d", len(s.deployments), len(s.replicaSets), len(s.pods), len(s.endpoints))
+	}
+	if len(s.releases) != 1 || !strings.Contains(s.releases[0].ManifestJSON, `"kind":"service-install"`) || !strings.Contains(s.releases[0].ManifestJSON, `"installedServices":["system","file"]`) {
+		t.Fatalf("expected service-install release manifest, got %+v", s.releases)
+	}
+}
+
+func TestServiceRuntimeReconcileRepairsNacosProxyRegistration(t *testing.T) {
+	instance := installedAIFARInstance(t)
+	s := &fakeStore{
+		servers: map[string]store.Server{
+			"srv-1": {ID: "srv-1", Name: "app-1", Host: "10.0.0.10", DeployDir: "/aifar/apps"},
+		},
+		instances: []store.AppInstance{instance},
+	}
+	remote := &fakeRemote{}
+	service := NewService(s, remote)
+	err := service.ReconcileRuntime(context.Background(), RuntimeReconcileRequest{
+		Instance: instance,
+		Server:   s.servers["srv-1"],
+		Language: "en",
+		Actor:    "admin",
+		Reason:   "repair runtime entry",
+	}, fakeLogger{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		`AIFAR_RUNTIME_RECONCILE`,
+		`aifar-agent reconcile-runtime --spec "$SPEC_PATH"`,
+		`open_service_ports gateway oauth permission system file message im contacts meeting web-vue3`,
+		`allow_selinux_ports http_port_t $ports`,
+		`register_nacos_proxy "$service"`,
+		`oauth alpha-oauth`,
+		`curl -fsS -X POST "$url"`,
+	} {
+		if !strings.Contains(remote.runtimeReconcileScript, want) {
+			t.Fatalf("runtime reconcile script should contain %q:\n%s", want, remote.runtimeReconcileScript)
+		}
+	}
+}
+
+func TestServiceCleanupRuntimeStalePodsPrunesControlPlaneRecords(t *testing.T) {
+	instance := installedAIFARInstance(t)
+	s := &fakeStore{
+		servers: map[string]store.Server{
+			"srv-1": {ID: "srv-1", Name: "app-1", Host: "10.0.0.10", DeployDir: "/aifar/apps"},
+		},
+		instances: []store.AppInstance{instance},
+		pods: []store.AIFARPod{
+			{InstanceID: instance.ID, ServiceName: "gateway", Revision: "rev-1", PodID: "gateway-rev-1-r1", ContainerName: "aifar-pod-admin-gateway-rev-1-r1", Port: 38000, Ready: true},
+			{InstanceID: instance.ID, ServiceName: "gateway", Revision: "rev-old", PodID: "gateway-rev-old-r1", ContainerName: "aifar-pod-admin-gateway-rev-old-r1", Port: 38000, Ready: true},
+		},
+		endpoints: []store.AIFARServiceEndpoint{
+			{InstanceID: instance.ID, ServiceName: "gateway", PodID: "gateway-rev-1-r1", ContainerName: "aifar-pod-admin-gateway-rev-1-r1", Revision: "rev-1", Port: 38000, State: "active", Ready: true},
+			{InstanceID: instance.ID, ServiceName: "gateway", PodID: "gateway-rev-old-r1", ContainerName: "aifar-pod-admin-gateway-rev-old-r1", Revision: "rev-old", Port: 38000, State: "active", Ready: true},
+		},
+	}
+	remote := &fakeRemote{runtimePodScanStdout: "aifar-pod-admin-gateway-rev-1-r1\n"}
+	service := NewService(s, remote)
+	err := service.CleanupRuntimeStalePods(context.Background(), RuntimeCleanupRequest{
+		Instance: instance,
+		Server:   s.servers["srv-1"],
+		Language: "en",
+		Actor:    "admin",
+		Reason:   "clear stale rows",
+	}, fakeLogger{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(s.pods) != 1 || s.pods[0].ContainerName != "aifar-pod-admin-gateway-rev-1-r1" {
+		t.Fatalf("expected only existing pod record to remain, got %+v", s.pods)
+	}
+	if len(s.endpoints) != 1 || s.endpoints[0].ContainerName != "aifar-pod-admin-gateway-rev-1-r1" {
+		t.Fatalf("expected only existing endpoint record to remain, got %+v", s.endpoints)
+	}
+	if !strings.Contains(remote.joinedCommands(), `label=aifar.install-root=$INSTALL_ROOT`) {
+		t.Fatalf("expected cleanup scan to filter by install root label, commands=%s", remote.joinedCommands())
+	}
+	metadata := metadataFromInstance(s.instances[0])
+	if _, ok := metadata["lastRuntimeCleanup"].(map[string]any); !ok {
+		t.Fatalf("expected cleanup metadata, got %s", s.instances[0].Metadata)
+	}
+	if _, ok := metadata["orchestrationLock"]; ok {
+		t.Fatalf("cleanup should clear orchestration lock: %s", s.instances[0].Metadata)
+	}
+}
+
+func TestServiceUninstallsRuntimeAgentWithoutRemovingBusinessPods(t *testing.T) {
+	instance := installedAIFARInstance(t)
+	s := &fakeStore{
+		servers: map[string]store.Server{
+			"srv-1": {ID: "srv-1", Name: "app-1", Host: "10.0.0.10", DeployDir: "/aifar/apps"},
+		},
+		instances: []store.AppInstance{instance},
+	}
+	remote := &fakeRemote{}
+	service := NewService(s, remote)
+	err := service.UninstallRuntimeAgent(context.Background(), RuntimeAgentUninstallRequest{
+		Instance: instance,
+		Server:   s.servers["srv-1"],
+		Language: "en",
+		Actor:    "admin",
+		Reason:   "operator cleanup",
+	}, fakeLogger{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		`AIFAR_AGENT_UNINSTALL`,
+		`aifar-agent deregister-nacos --spec "$SPEC_PATH"`,
+		`aifar-agent remove-instance --instance "$INSTANCE_ID"`,
+		`systemctl stop aifar-agent`,
+		`rm -f /etc/systemd/system/aifar-agent.service`,
+		`rm -f /usr/local/bin/aifar-agent`,
+	} {
+		if !strings.Contains(remote.runtimeAgentUninstall, want) {
+			t.Fatalf("agent uninstall command should contain %q:\n%s", want, remote.runtimeAgentUninstall)
+		}
+	}
+	metadata := metadataFromInstance(s.instances[0])
+	if metadata["agentUninstalledAt"] == nil {
+		t.Fatalf("expected agent uninstall metadata, got %s", s.instances[0].Metadata)
+	}
+	if strings.Contains(remote.runtimeAgentUninstall, "docker rm") || strings.Contains(remote.runtimeAgentUninstall, "rm -rf \"$INSTALL_ROOT\"") {
+		t.Fatalf("agent uninstall should not remove business pods or install root:\n%s", remote.runtimeAgentUninstall)
 	}
 }
 

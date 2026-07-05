@@ -689,3 +689,63 @@
 - 结论：当前安装链路为 HTTP registry/worker 创建任务，AIFAR 模块校验与生成期望模型，DB 写 `installing`，上传 bundle/agent/script，远程脚本检查 Docker/agent/Nacos、渲染 env/JVM/resource、加载镜像、建网络、构建镜像、启动 Pod、等待 ready、runtime reconcile、Nacos 代理注册、开放端口、写 manifest，最后 DB 写 `installed`/release/control-plane；建议抽“公共安装生命周期骨架+工具库”，保留各应用自己的资源校验、拓扑、脚本渲染、ready/bootstrap 逻辑，避免万能安装器。
 - 问题：用户截图显示 AIFAR 安装 API 返回 400，并说明已重启当前服务。
 - 结论：截图中的 `Content-Length: 176` 对应后端同服务器同 `/aifar/apps/admin` 已存在 AIFAR 实例的拒绝信息；重启服务不会清空 SQLite 控制面状态。已让安装任务把 `taskId` 写入 AIFAR `installing` metadata，并在同 installRoot 重试时复用失败记录、旧版本无 taskId 的 `installing` 记录，或已结束/不存在任务留下的 `installing` 记录；真正 `pending/running/installed` 仍阻止重复安装；`pnpm test` 通过。
+- 问题：用户截图显示 IDE 打开 `data/aifar.db` 查询时报 `[SQLITE_BUSY] database file is locked`。
+- 结论：本地仍有 `aifar-server` 进程运行，且 `data/aifar.db-journal` 存在，说明 SQLite 正处于/残留 rollback journal 锁状态；查询或手工清理前应先停后端服务，等待 journal 自动恢复/消失，或在停服后复制 DB 副本查看，不能在服务写入任务/日志时直接改库。
+- 问题：用户贴出 AIFAR 安装第 5/6 步失败，目标机 `aifar-agent` usage 只显示 `reconcile-ingress`，而脚本调用 `reconcile-runtime`。
+- 结论：根因是安装任务上传的 `bin/aifar-agent-linux-amd64` 仍是旧二进制，源码已改成 `reconcile-runtime` 但本地 agent bin 未重建。已让新 agent CLI 兼容 `reconcile-ingress` 别名并在 status features 中声明，同时重新构建 `bin/aifar-agent-linux-amd64`；二进制字符串已包含 `reconcile-runtime`/`reconcile-ingress`，`pnpm test` 通过。
+- 问题：用户询问如果现在要多个 `web-vue3` 实例和其他 AIFAR 服务实例应该怎么操作。
+- 结论：当前已支持 AIFAR Runtime 手动 scale-out：容器页 AIFAR Runtime 中每个已安装 service 可点“扩容副本”，或调用 `POST /api/v2/containers/aifar/services/{service}/scale-out`，一次增加 1 个同 revision Pod 并由 agent reconcile 接入流量；默认 autoscalePolicy 最多 3 副本，支持自动扩容但不支持 scale-in/一次设置目标副本数，未安装的 service 因缺少 revision 不能直接扩容。
+- 问题：用户确认流量被打入两个 gateway，询问这是如何做到的。
+- 结论：`aifar-agent` 在宿主机监听 gateway/web/service 端口，按 runtime spec 建路由；每个请求通过 Docker labels 动态发现同 installRoot、同 service 的 running/healthy Pod，取容器在 Docker 网络中的 IP 和服务端口，然后用 per instance/service 的计数器做简单 round-robin 反向代理。web 入口的 `/api/` 和 `/im/ws/` 会被 agent 特判转到 gateway。
+- 问题：用户询问 agent 为何用 `docker ps --filter label=...` 查询服务 Pod，以及每次请求都执行 Docker CLI 是否会造成压力或导致 agent 崩溃。
+- 结论：这些 label filter 用于只发现当前 AIFAR 实例、当前 service、业务 Pod 的真实运行容器，避免依赖可能漂移的 DB 或宿主机端口；但当前实现确实每请求执行 `docker ps` 和若干 `docker inspect`，低流量验证可用，高并发会增加 Docker daemon/进程创建/延迟压力。后续应改为 agent 内存 endpoint 缓存 + reconcile/事件/短周期刷新，请求路径只读缓存并做 round-robin。
+- 问题：用户询问是否不做后台刷新、改为监听 Docker events 更好。
+- 结论：Docker events 适合作为 endpoint cache 的主更新机制，比每请求发现或高频轮询更轻；但 events 不是持久队列，agent 启动前、断线期间或 Docker daemon 重启期间的事件会丢。因此推荐“启动/reconcile/事件流重连时全量同步 + Docker events 增量更新 + 请求路径只读缓存”，可选低频审计或代理失败触发异步 resync 作为兜底。
+- 问题：用户确认 gateway 到 file 走 Spring Cloud 内部调用 Nacos，并询问当前 agent 是否不是把所有流量都打给 `web-vue3`。
+- 结论：当前 agent 不是全量转发到 `web-vue3`，而是按 runtime spec 建路由：web 入口普通路径转 `web-vue3`，web 入口 `/api/` 和 `/im/ws/` 转 gateway，gateway 入口转 gateway，各服务端口转对应 service；Nacos 注册的是 agentHost:servicePort，因此 gateway 调 file 时会进入 agent 的 file 服务代理，再由 agent 选择 file Pod。
+- 问题：用户在普通容器列表看到 AIFAR Pod，但无法直接扩展服务副本。
+- 结论：容器页普通 `containers` tab 已为 AIFAR 业务 Pod 行新增“扩容副本”入口，按 Docker labels/安装目录匹配 DB 中的 k8s-like AIFAR 实例后复用现有 scale-out worker API；Runtime tab 原扩容入口继续可用，`pnpm web:build` 已通过。
+- 问题：用户澄清不是要扩容副本，而是初装时只选了部分 AIFAR 服务，后续还要安装其他服务。
+- 结论：新增 AIFAR service install worker/API/UI：`POST /api/v2/containers/aifar/services/install` 按 typed services 补装未安装模块，远程脚本复用同一 bundle/runtime env/agent 模型构建并启动缺失 Pod、reconcile runtime、注册 Nacos 代理并更新 metadata/release/control-plane；普通容器列表移除“扩容副本”误入口，AIFAR Runtime 工具栏新增“安装服务”弹窗；`pnpm test`、`pnpm web:build` 已通过。
+- 问题：用户反馈 IM 模块启动完成但访问不到服务。
+- 结论：原因不在 IM Pod ready，而在 agent 数据面端口链路：IM 通过 Nacos 注册 `alpha-im -> agentHost:IM_PORT` 后由 `aifar-agent` 转发到 IM Pod，补装脚本原先没有开放新增服务端口/SELinux 端口。已让初装和补装都按所选服务开放 agent 代理端口，并补充脚本渲染测试；`go test ./internal/apps/aifar`、`pnpm test`、`git diff --check` 已通过。
+- 问题：用户截图展示 `ss -lntp` 和 `firewall-cmd --list-port` 排查 IM 访问失败。
+- 结论：现场 `aifar-agent` 已监听 `*:38031`，说明 IM agent 代理入口已创建；但 firewalld 仅放行了 `38000/tcp`、`8080/tcp` 等，缺少 `38031/tcp`，因此外部或容器经宿主机 IP 访问 `alpha-im -> agentHost:38031` 会被防火墙拦截。
+- 问题：用户反馈 OAuth 模块已启动但 Nacos 服务列表没有 `alpha-oauth`。
+- 结论：OAuth 日志显示已连接 Nacos 配置中心并启动成功，当前 agent-only 模型会设置 `SPRING_CLOUD_NACOS_DISCOVERY_REGISTER_ENABLED=false` 禁止 Java Pod 自注册；Nacos 应由 AIFAR 脚本注册 `alpha-oauth -> aifar-agent:OAUTH_PORT` 代理实例。已让 Runtime 入口重建执行脚本化 reconcile，同时开放服务端口/SELinux 端口并重注册所有 Java 服务的 Nacos 代理；`go test ./internal/apps/aifar`、`pnpm test`、`git diff --check` 已通过。
+- 问题：用户追问为什么扩容曾正常，但手动删除 Nacos 全部服务后重启 gateway/oauth 仍注册不回来。
+- 结论：扩容只依赖已有 Nacos 服务入口和 agent 通过 Docker labels 发现新 Pod；删除 Nacos 服务后，`alpha-* -> agentHost:servicePort` 代理实例被移除，而 Java Pod 自注册在 agent-only 模型中被禁用，容器重启不会自动 POST 回 Nacos。恢复应执行 AIFAR Runtime 入口重建/运行时 reconcile，让 AIFAR 根据 DB/runtime env 重新注册 Nacos 代理；不要直接打开 Pod 自注册，否则会注册容器 IP 而绕开 agent 模型。
+- 问题：用户询问为什么 agent-only 模型要禁用 Java Pod 自注册，改由 AIFAR/agent 注册 Nacos 代理入口。
+- 结论：设计目标是让 Nacos 只暴露稳定的 `alpha-* -> agentHost:servicePort` 虚拟服务入口，真实 Pod IP、副本、健康、滚动更新和负载均衡由 `aifar-agent` 管理，避免 Nacos 直接暴露容器 IP 导致端口/网络/滚动切流/多副本治理混乱。当前不足是 Nacos 手工删除后的漂移需 reconcile 修复，后续应增加周期/事件驱动的自动 Nacos 代理重放。
+- 问题：用户截图显示启动了两个 file Pod，但 Nacos `alpha-file` 服务详情只展示一个实例。
+- 结论：这是当前 agent-only 模型的预期表现：同一服务器上每个 AIFAR service 只向 Nacos 注册一个稳定代理实例 `agentHost:servicePort`，多个 file Pod 是该代理入口后面的 endpoints，由 `aifar-agent` 做健康发现和负载均衡；Nacos 实例数表示代理入口数，不表示 Pod 副本数。若未来多服务器部署，则通常每台服务器一个 agent 代理实例，Nacos 才会显示多个实例。
+- 问题：用户反馈 file 双副本后分片上传报 `[MG/NOT_READY]`，同一 traceId 的 chunks 在两个 file 实例都出现缺失。
+- 结论：根因是 file 分片上传依赖本地临时目录，agent 对 file 请求做 round-robin 会把同一上传会话的不同 chunk 分发到不同 file Pod，导致每个 Pod 都只看到部分分片。已将 `aifar-agent` 对 `file` 和 `gateway` 服务改为按上传标识/Header/Cookie/客户端来源做稳定粘连，并固定 endpoint 排序；新 `bin/aifar-agent-linux-amd64` 已重建，`go test ./internal/runtimeagent ./cmd/aifar-agent`、`pnpm test`、`pnpm backend:build`、`git diff --check` 已通过。
+- 问题：用户指出 `aifar-agent` 停止时没有自动停止/摘除 Nacos 服务注册。
+- 结论：因为当前 Nacos 代理实例使用 `ephemeral=false`，agent 停止后 Nacos 不会靠心跳自动移除。已新增 `aifar-agent register-nacos/deregister-nacos`，agent 启动和 runtime reconcile 会重放 Nacos 代理注册，`remove-instance` 和 systemd `ExecStopPost` 会尽力摘除 Nacos 代理；Docker/AIFAR 安装的 agent unit 均加入停止钩子。新 `bin/aifar-agent-linux-amd64` 已重建，`go test ./internal/runtimeagent ./cmd/aifar-agent ./internal/apps/aifar ./internal/apps/docker`、`pnpm test`、`pnpm backend:build`、`git diff --check` 已通过。
+- 问题：用户询问是否把 Nacos 代理注册从 `ephemeral=false` 改为 `ephemeral=true` 更好。
+- 结论：长期更推荐 `ephemeral=true`，但不能只改参数；agent 必须作为 Nacos 临时实例客户端持续心跳、失败重注册、启动时注册、停止时尽快 deregister。这样 agent 崩溃、kill -9、断电时 Nacos 能自动剔除坏入口，比仅靠 systemd `ExecStopPost` 更可靠；当前 `ephemeral=false + ExecStopPost` 是过渡方案。
+- 问题：用户询问 K8s 服务注册通常用内网地址，为什么 AIFAR Nacos 代理注册用宿主机地址。
+- 结论：K8s 的 Pod/Service 内网地址依赖 CNI/ClusterIP，是集群内可路由的稳定地址；当前 AIFAR 是 Docker 单机/多机 agent 模型，Docker 容器 IP 通常只在本宿主机 bridge 网络可达，跨服务器或从其他组件访问不稳定。因此 Nacos 注册的是每台服务器的 agent 内网 IP + servicePort，相当于 node-local Service 入口；后续可把注册地址策略显式配置为 nodeInternalIP/customIP/VIP，并避免误用公网 IP。
+- 问题：用户询问 k8s-like 标准代理在单服务器多实例时应走 agent 入口还是 web-vue3/nginx 入口。
+- 结论：当前 AIFAR agent-only/k8s-like 模型采用宿主机 aifar-agent 作为 Ingress/Service 数据面：浏览器访问 agent 的 web 端口，静态页面转 web-vue3 Pod，/api 与 /im/ws 转 gateway Pod；gateway 通过 Nacos 访问各服务时，Nacos 注册的是 agentHost:servicePort，再由 agent 负载均衡到同服务的多个 Pod。web-vue3/nginx 只服务静态页面，不再代理 API。
+- 问题：用户指出当前模型和标准 K8s 不一致，询问若要改成 K8s 一致应如何操作。
+- 结论：真正 K8s 一致应新增 Kubernetes runtime/topology，用 Deployment/Service/Ingress/EndpointSlice/Pod 网络承载副本、入口和负载均衡；浏览器走 Ingress 到 web/gateway Service，gateway 到后端服务走 K8s Service DNS 或在 Nacos 中注册 Pod/Service 内网地址。纯 Docker/agent 模式只能模拟 K8s，若继续保留则应拆出 Ingress、Service、Endpoint cache 三层，而不是让 web-vue3/nginx 代理 API。
+- 问题：用户表示暂不现实切 K8s，希望在当前 Docker/agent 模型下改成 web-vue3 作为统一入口。
+- 结论：推荐改造为“web-vue3/nginx 做北向 HTTP 入口，aifar-agent 保留 Service/Endpoint 数据面”：宿主机 8080 仍由 agent 或宿主入口稳定转发到 web-vue3 多副本，web-vue3 nginx 负责 /、/api、/im/ws 路由；/api 与 /im/ws 的 upstream 不直连 gateway Pod 名，而是连 agent 的 gateway service 端口，gateway 再通过 Nacos 访问 agent 注册的各后端 service 端口。
+- 问题：用户确认“宿主机 8080 -> agent web 入口 -> web-vue3 nginx -> /api 转 agent gateway -> gateway -> Nacos -> agent service -> 后端 Pod”是否属于标准设计。
+- 结论：这是在不引入 K8s 前提下较标准、可维护的单机/轻量编排设计：北向入口、前端静态代理、服务发现、服务负载均衡分层清晰；但它不是原生 K8s 标准，属于 Docker 场景下对 Ingress/Service/Endpoint 的工程化模拟。关键边界是 nginx 不直连 Pod，只连稳定 Service 入口；agent 不承载业务路径规则，只维护 Service/Endpoint。
+- 问题：用户追问若采用该设计，Docker 容器内部彼此不互通但 agent 服务互通是否可行。
+- 结论：原则上可行，容器间无需直连，所有服务调用可走“容器 -> agent service port -> 目标 Pod”；但必须保证容器能访问 agent 对外/内网监听地址，agent 也能访问各 Pod 的真实容器 IP/端口。agent 不能只监听 127.0.0.1 给容器使用，Linux Docker 需通过 host-gateway、docker0 网关、节点内网 IP 或显式监听地址打通。
+- 问题：用户询问 K8s 是否也是“容器不必彼此直连，只要服务层互通”的逻辑。
+- 结论：K8s 思路相似但实现更完整：业务访问稳定 Service/DNS/ClusterIP，不感知 Pod 副本；kube-proxy/eBPF/IPVS 与 CNI 把 Service 转发到 Pod Endpoint。区别是 K8s 默认 Pod 网络通常全局互通，Service 是稳定抽象和负载均衡层，不是因为 Pod 完全不能互通；NetworkPolicy 可进一步限制直连，只允许经 Service/入口访问。
+- 问题：用户追问现在 aifar-agent 的作用是否就是 Service。
+- 结论：可以把 aifar-agent 理解为当前轻量运行时的 Service/Endpoint 数据面，但它不只是业务 Service：还负责宿主机稳定端口、Docker Pod endpoint 发现、负载均衡/粘连、runtime spec reconcile、状态检查以及 Nacos 代理注册。后续若改为 web-vue3 统一入口，应让 agent 更聚焦 Service/Endpoint，HTTP 路径路由交给 nginx。
+- 问题：用户询问服务扩容是否也是 aifar-agent 在做。
+- 结论：当前扩容不是由 agent 独立决策并创建容器，而是 AIFAR 后端/worker 触发 AIFAR 模块执行远程 autoscale-out 脚本，脚本用 Docker 创建新 Pod 副本，然后调用 `aifar-agent reconcile-runtime`；agent 负责发现新 endpoint、更新路由、负载均衡和流量接入。类比 K8s：后端/脚本更像 Deployment/ReplicaSet 控制器，agent 更像 Service/kube-proxy/Endpoint 数据面。
+- 问题：用户要求在 AIFAR Runtime 管理页增加一键卸载 agent/清理残留能力，并询问运行时页里每次出现的“残留”是什么。
+- 结论：运行时页的“残留”主要是 AIFAR 控制面 `aifar_pods`/`aifar_service_endpoints` 仍有记录，但目标 Docker 已查不到对应 Pod 容器，常见于更新、扩容或失败清理后的旧记录漂移。已新增任务化 `cleanup-stale` 清理入口，按目标 Docker label 扫描结果裁剪本地控制面记录；新增任务化 `uninstall-agent`，用于摘除 Nacos 代理、停止并删除宿主机 `aifar-agent` systemd/binary/state，但不删除业务 Pod 和 installRoot。
+- 问题：用户询问 K8s 中 Deployment/ReplicaSet 控制器、Service/kube-proxy/EndpointSlice 算几个服务。
+- 结论：这些不是同一种“业务服务”。Deployment、ReplicaSet、Service、EndpointSlice 是 K8s API 资源；Deployment/ReplicaSet 控制循环通常运行在 kube-controller-manager 中；EndpointSlice 由控制器维护；kube-proxy 是每个节点上的数据面进程/DaemonSet。业务上每个应用通常是“1 个 Deployment + 1 个 Service + N 个 Pod + 对应 EndpointSlice”，控制器是集群公共组件，不是每个应用单独部署一套。
+- 问题：用户询问能否把 K8s 这套 Deployment/Service/Endpoint 思路照搬到 aifar-agent。
+- 结论：可以借鉴并在 agent 中实现轻量版运行时模型，但不建议照搬完整 K8s。推荐 AIFAR 后端保存期望态，agent 负责本机 reconcile：根据 DeploymentSpec 创建/删除 Docker Pod，维护 EndpointSlice 缓存，暴露 Service 代理端口，注册 Nacos，并通过 Docker events + 全量同步保持一致。这样 agent 更像 kubelet + kube-proxy 的本机合体。

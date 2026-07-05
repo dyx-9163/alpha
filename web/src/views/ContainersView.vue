@@ -93,7 +93,7 @@
             <el-table-column prop="ports" :label="t('containers.ports')" min-width="180" show-overflow-tooltip />
             <el-table-column prop="networks" :label="t('containers.network')" min-width="140" show-overflow-tooltip />
             <el-table-column prop="createdAt" :label="t('containers.created')" min-width="170" show-overflow-tooltip />
-            <el-table-column :label="t('common.operation')" width="420" fixed="right">
+            <el-table-column :label="t('common.operation')" width="430" fixed="right">
               <template #default="{ row }">
                 <div class="row-actions">
                   <template v-if="!isAifarRuntimeInfraContainer(row)">
@@ -137,11 +137,20 @@
               <el-tooltip :content="aifarRuntimeActionDisabledReason" :disabled="!aifarRuntimeActionDisabledReason" placement="top">
                 <span><el-button size="small" type="primary" :disabled="Boolean(aifarRuntimeActionDisabledReason)" @click="openRuntimeConfigDialog">{{ t('containers.runtimeConfig') }}</el-button></span>
               </el-tooltip>
+              <el-tooltip :content="serviceInstallDisabledReason" :disabled="!serviceInstallDisabledReason" placement="top">
+                <span><el-button size="small" type="primary" plain :disabled="Boolean(serviceInstallDisabledReason)" @click="openServiceInstallDialog">{{ t('containers.installServices') }}</el-button></span>
+              </el-tooltip>
               <el-tooltip :content="aifarRuntimeActionDisabledReason" :disabled="!aifarRuntimeActionDisabledReason" placement="top">
                 <span><el-button size="small" type="primary" plain :disabled="Boolean(aifarRuntimeActionDisabledReason)" @click="openAifarRuntimeBundleUpdate">{{ t('containers.bundleUpdate') }}</el-button></span>
               </el-tooltip>
               <el-tooltip :content="aifarRuntimeActionDisabledReason" :disabled="!aifarRuntimeActionDisabledReason" placement="top">
                 <span><el-button size="small" :disabled="Boolean(aifarRuntimeActionDisabledReason)" @click="reconcileAifarRuntime">{{ t('containers.reconcileRuntime') }}</el-button></span>
+              </el-tooltip>
+              <el-tooltip :content="runtimeCleanupDisabledReason" :disabled="!runtimeCleanupDisabledReason" placement="top">
+                <span><el-button size="small" type="warning" plain :disabled="Boolean(runtimeCleanupDisabledReason)" @click="cleanupAifarRuntimeStale">{{ t('containers.cleanupStaleRuntime') }}</el-button></span>
+              </el-tooltip>
+              <el-tooltip :content="runtimeAgentUninstallDisabledReason" :disabled="!runtimeAgentUninstallDisabledReason" placement="top">
+                <span><el-button size="small" type="danger" plain :disabled="Boolean(runtimeAgentUninstallDisabledReason)" @click="uninstallAifarRuntimeAgent">{{ t('containers.uninstallAgent') }}</el-button></span>
               </el-tooltip>
               <el-button size="small" @click="loadAifarRuntime">{{ t('common.refresh') }}</el-button>
             </div>
@@ -305,6 +314,27 @@
       <template #footer>
         <el-button @click="aifarUpdateVisible = false">{{ t('common.cancel') }}</el-button>
         <el-button type="primary" :loading="aifarUpdateSubmitting" @click="submitAifarUpdate">{{ t('apps.aifarUpdateSubmit') }}</el-button>
+      </template>
+    </el-dialog>
+    <el-dialog v-model="serviceInstallVisible" :title="t('containers.installServicesDialog')" width="560px" destroy-on-close>
+      <div class="service-install-dialog">
+        <div>
+          <div class="runtime-config-section-title">{{ t('containers.installedServices') }}</div>
+          <div class="service-tag-list">
+            <el-tag v-for="service in installedRuntimeServiceNamesList" :key="service" size="small">{{ service }}</el-tag>
+          </div>
+        </div>
+        <div>
+          <div class="runtime-config-section-title">{{ t('containers.installableServices') }}</div>
+          <el-empty v-if="!missingRuntimeServiceOptions.length" :description="t('containers.noMissingServices')" />
+          <el-checkbox-group v-else v-model="serviceInstallSelection" class="service-install-options">
+            <el-checkbox v-for="service in missingRuntimeServiceOptions" :key="service.value" :label="service.value">{{ service.label }}</el-checkbox>
+          </el-checkbox-group>
+        </div>
+      </div>
+      <template #footer>
+        <el-button @click="serviceInstallVisible = false">{{ t('common.cancel') }}</el-button>
+        <el-button type="primary" :loading="serviceInstallSubmitting" @click="submitAifarServiceInstall">{{ t('containers.installServices') }}</el-button>
       </template>
     </el-dialog>
     <el-dialog v-model="runtimeConfigVisible" :title="t('containers.runtimeConfig')" width="780px" destroy-on-close>
@@ -532,6 +562,9 @@ const runtimeConfigForm = ref<Required<RuntimeConfigValues>>({
   jvmMaxRAMPercentage: 70
 })
 const runtimeConfigRows = ref<RuntimeConfigServiceRow[]>([])
+const serviceInstallVisible = ref(false)
+const serviceInstallSubmitting = ref(false)
+const serviceInstallSelection = ref<string[]>([])
 const deletePromptVisible = ref(false)
 const deleteSubmitting = ref(false)
 const canManageContainers = computed(() => can(permissions.containersManage))
@@ -676,14 +709,33 @@ const selectedRuntimeAppInstance = computed(() => {
 })
 const selectedRuntimeServices = computed(() => asArray<AifarRuntimeService>(aifarRuntime.value.services).filter((item) => item.instanceId === selectedRuntimeInstance.value?.id))
 const selectedRuntimePods = computed(() => asArray<AifarRuntimePod>(aifarRuntime.value.pods).filter((item) => item.instanceId === selectedRuntimeInstance.value?.id))
+const staleRuntimePodCount = computed(() => selectedRuntimePods.value.filter((item) => String(item.status || '').trim() === 'stale').length)
 const selectedRuntimeIngress = computed(() => asArray<AifarRuntimeIngress>(aifarRuntime.value.ingress).find((item) => item.instanceId === selectedRuntimeInstance.value?.id) ?? null)
 const aifarRuntimeWarnings = computed(() => asArray<string>(aifarRuntime.value.warnings))
-const aifarRuntimeActionDisabledReason = computed(() => {
+const installedRuntimeServiceNames = computed(() => new Set(selectedRuntimeServices.value.map((item) => item.serviceName).filter(Boolean)))
+const installedRuntimeServiceNamesList = computed(() => aifarServiceOptions.map((item) => item.value).filter((service) => installedRuntimeServiceNames.value.has(service)))
+const missingRuntimeServiceOptions = computed(() => aifarServiceOptions.filter((item) => !installedRuntimeServiceNames.value.has(item.value)))
+const runtimeInstanceManageDisabledReason = computed(() => {
   if (!canManageApps.value) return deniedText.value
   if (!selectedRuntimeInstance.value) return t('containers.selectAifarInstance')
   if (selectedRuntimeInstance.value.legacy) return t('containers.legacyRuntimeDisabled')
+  return ''
+})
+const aifarRuntimeActionDisabledReason = computed(() => {
+  if (runtimeInstanceManageDisabledReason.value) return runtimeInstanceManageDisabledReason.value
   if (String(aifarRuntime.value.runtimeStatus || '').trim() !== 'ready') return t('containers.runtimeDegradedDisabled')
   if (String(aifarRuntime.value.agent?.status || '').trim() !== 'running') return t('containers.agentUnavailableDisabled')
+  return ''
+})
+const runtimeCleanupDisabledReason = computed(() => {
+  if (runtimeInstanceManageDisabledReason.value) return runtimeInstanceManageDisabledReason.value
+  if (!staleRuntimePodCount.value) return t('containers.noStaleRuntimePods')
+  return ''
+})
+const runtimeAgentUninstallDisabledReason = computed(() => runtimeInstanceManageDisabledReason.value)
+const serviceInstallDisabledReason = computed(() => {
+  if (aifarRuntimeActionDisabledReason.value) return aifarRuntimeActionDisabledReason.value
+  if (!missingRuntimeServiceOptions.value.length) return t('containers.noMissingServices')
   return ''
 })
 const runtimeSummaryItems = computed(() => {
@@ -1418,6 +1470,126 @@ async function reconcileAifarRuntime() {
   }
 }
 
+async function cleanupAifarRuntimeStale() {
+  const reason = runtimeCleanupDisabledReason.value
+  if (reason) {
+    ElMessage.warning(reason)
+    return
+  }
+  const instanceId = selectedRuntimeInstance.value?.id
+  if (!instanceId) {
+    ElMessage.warning(t('containers.selectAifarInstance'))
+    return
+  }
+  try {
+    await ElMessageBox.confirm(t('containers.confirmCleanupStaleRuntime', { count: staleRuntimePodCount.value }), t('containers.cleanupStaleRuntime'), {
+      type: 'warning',
+      confirmButtonText: t('containers.cleanupStaleRuntime'),
+      cancelButtonText: t('common.cancel')
+    })
+  } catch {
+    return
+  }
+  const query = targetQuery()
+  try {
+    const result = await apiPost<{ taskId: string }>(`/containers/aifar/runtime/cleanup-stale?${query}`, { instanceId })
+    ElMessage.success(t('containers.runtimeActionAccepted'))
+    void router.push({ path: '/tasks', query: { taskId: result.taskId } })
+    void loadAifarRuntime()
+  } catch (err) {
+    ElMessage.error(err instanceof Error ? err.message : t('containers.runtimeActionFailed'))
+  }
+}
+
+async function uninstallAifarRuntimeAgent() {
+  const reason = runtimeAgentUninstallDisabledReason.value
+  if (reason) {
+    ElMessage.warning(reason)
+    return
+  }
+  const instanceId = selectedRuntimeInstance.value?.id
+  if (!instanceId) {
+    ElMessage.warning(t('containers.selectAifarInstance'))
+    return
+  }
+  try {
+    await ElMessageBox.confirm(t('containers.confirmUninstallAgent'), t('containers.uninstallAgent'), {
+      type: 'error',
+      confirmButtonText: t('containers.uninstallAgent'),
+      cancelButtonText: t('common.cancel')
+    })
+  } catch {
+    return
+  }
+  const query = targetQuery()
+  try {
+    const result = await apiPost<{ taskId: string }>(`/containers/aifar/runtime/uninstall-agent?${query}`, { instanceId })
+    ElMessage.success(t('containers.runtimeActionAccepted'))
+    void router.push({ path: '/tasks', query: { taskId: result.taskId } })
+    void loadAifarRuntime()
+  } catch (err) {
+    ElMessage.error(err instanceof Error ? err.message : t('containers.runtimeActionFailed'))
+  }
+}
+
+function openServiceInstallDialog() {
+  const reason = serviceInstallDisabledReason.value
+  if (reason) {
+    ElMessage.warning(reason)
+    return
+  }
+  serviceInstallSelection.value = []
+  serviceInstallVisible.value = true
+}
+
+async function submitAifarServiceInstall() {
+  const reason = serviceInstallDisabledReason.value
+  if (reason) {
+    ElMessage.warning(reason)
+    return
+  }
+  const instanceId = selectedRuntimeInstance.value?.id
+  if (!instanceId) {
+    ElMessage.warning(t('containers.selectAifarInstance'))
+    return
+  }
+  const services = [...serviceInstallSelection.value]
+  if (!services.length) {
+    ElMessage.warning(t('containers.selectServicesToInstall'))
+    return
+  }
+  try {
+    await ElMessageBox.confirm(t('containers.confirmInstallServices', { services: services.join(', ') }), t('containers.installServices'), {
+      type: 'warning',
+      confirmButtonText: t('containers.installServices'),
+      cancelButtonText: t('common.cancel')
+    })
+  } catch {
+    return
+  }
+  const query = targetQuery()
+  if (!query) {
+    ElMessage.warning(t('containers.selectDockerHost'))
+    return
+  }
+  serviceInstallSubmitting.value = true
+  try {
+    const result = await apiPost<{ taskId: string }>(`/containers/aifar/services/install?${query}`, {
+      instanceId,
+      services
+    })
+    serviceInstallVisible.value = false
+    serviceInstallSelection.value = []
+    ElMessage.success(t('containers.serviceInstallAccepted'))
+    void router.push({ path: '/tasks', query: { taskId: result.taskId } })
+    void loadAifarRuntime()
+  } catch (err) {
+    ElMessage.error(err instanceof Error ? err.message : t('containers.serviceInstallFailed'))
+  } finally {
+    serviceInstallSubmitting.value = false
+  }
+}
+
 async function scaleOutAifarService(service: string) {
   const reason = aifarRuntimeActionDisabledReason.value
   if (reason) {
@@ -1429,6 +1601,12 @@ async function scaleOutAifarService(service: string) {
     ElMessage.warning(t('containers.selectAifarInstance'))
     return
   }
+  await submitAifarScaleOut(service, instanceId, () => {
+    void loadAifarRuntime()
+  })
+}
+
+async function submitAifarScaleOut(service: string, instanceId: string, afterSubmitted?: () => void) {
   try {
     await ElMessageBox.confirm(t('containers.confirmScaleOut', { service }), t('containers.scaleOut'), {
       type: 'warning',
@@ -1439,10 +1617,15 @@ async function scaleOutAifarService(service: string) {
     return
   }
   const query = targetQuery()
+  if (!query) {
+    ElMessage.warning(t('containers.selectDockerHost'))
+    return
+  }
   try {
     const result = await apiPost<{ taskId: string }>(`/containers/aifar/services/${encodeURIComponent(service)}/scale-out?${query}`, { instanceId })
     ElMessage.success(t('containers.runtimeActionAccepted'))
     void router.push({ path: '/tasks', query: { taskId: result.taskId } })
+    afterSubmitted?.()
   } catch (err) {
     ElMessage.error(err instanceof Error ? err.message : t('containers.runtimeActionFailed'))
   }
@@ -1683,6 +1866,23 @@ onMounted(async () => {
 
 .runtime-config-table :deep(.el-input) {
   width: 100%;
+}
+
+.service-install-dialog {
+  display: grid;
+  gap: 16px;
+}
+
+.service-tag-list,
+.service-install-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.service-install-options :deep(.el-checkbox) {
+  margin-right: 0;
 }
 
 .settings-grid {

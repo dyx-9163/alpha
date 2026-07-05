@@ -23,7 +23,7 @@ import (
 	"aifar-deployment/backend/internal/store"
 )
 
-//go:embed templates/install.sh templates/uninstall.sh templates/update-artifact.sh templates/update-artifact-bundle.sh templates/autoscale-out.sh templates/runtime-config.sh
+//go:embed templates/install.sh templates/uninstall.sh templates/update-artifact.sh templates/update-artifact-bundle.sh templates/autoscale-out.sh templates/runtime-config.sh templates/service-install.sh templates/runtime-reconcile.sh
 var templateFS embed.FS
 
 type Logger = installerkit.Logger
@@ -51,6 +51,11 @@ type aifarOrchestrationStore interface {
 	ListAIFARPods(instanceID string) ([]store.AIFARPod, error)
 	ReplaceAIFARServiceEndpoints(instanceID, serviceName string, endpoints []store.AIFARServiceEndpoint) error
 	ListAIFARServiceEndpoints(instanceID string) ([]store.AIFARServiceEndpoint, error)
+}
+
+type aifarRuntimeCleanupStore interface {
+	PruneAIFARPodRecords(instanceID string, existingContainerNames []string) (int, error)
+	PruneAIFARServiceEndpointRecords(instanceID string, existingContainerNames []string) (int, error)
 }
 
 type taskLookupStore interface {
@@ -108,7 +113,32 @@ type ScaleOutRequest struct {
 	Reason      string
 }
 
+type InstallServicesRequest struct {
+	Instance store.AppInstance
+	Server   store.Server
+	Language string
+	Actor    string
+	Services []string
+	Reason   string
+}
+
 type RuntimeReconcileRequest struct {
+	Instance store.AppInstance
+	Server   store.Server
+	Language string
+	Actor    string
+	Reason   string
+}
+
+type RuntimeCleanupRequest struct {
+	Instance store.AppInstance
+	Server   store.Server
+	Language string
+	Actor    string
+	Reason   string
+}
+
+type RuntimeAgentUninstallRequest struct {
 	Instance store.AppInstance
 	Server   store.Server
 	Language string

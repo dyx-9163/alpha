@@ -1,12 +1,14 @@
 package httpapi
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 
+	"aifar-deployment/backend/internal/apps/registry"
 	"aifar-deployment/backend/internal/store"
 )
 
@@ -79,6 +81,35 @@ func TestAIFARRuntimeScaleOutRequiresAgent(t *testing.T) {
 	}
 }
 
+func TestAIFARRuntimeInstallServicesRequiresAgent(t *testing.T) {
+	api, db, secret := newAuthzTestAPI(t)
+	dockerAPI := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/containers/json" {
+			_ = json.NewEncoder(w).Encode([]map[string]any{})
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer dockerAPI.Close()
+	server, instance := seedAIFARRuntimeFixture(t, db, dockerAPI.URL)
+	token := issueTestToken(t, db, secret, "owner", "owner")
+
+	body := `{"instanceId":"` + instance.ID + `","services":["file"]}`
+	req := httptest.NewRequest(http.MethodPost, "/api/v2/containers/aifar/services/install?serverId="+server.ID, strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	api.Router().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("expected 409, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "AIFAR_AGENT_REQUIRED") {
+		t.Fatalf("expected agent-required error, got %s", rec.Body.String())
+	}
+}
+
 func TestAIFARRuntimeConfigRequiresAgent(t *testing.T) {
 	api, db, secret := newAuthzTestAPI(t)
 	dockerAPI := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -106,6 +137,94 @@ func TestAIFARRuntimeConfigRequiresAgent(t *testing.T) {
 	if !strings.Contains(rec.Body.String(), "AIFAR_AGENT_REQUIRED") {
 		t.Fatalf("expected agent-required error, got %s", rec.Body.String())
 	}
+}
+
+func TestAIFARRuntimeCleanupAndAgentUninstallStartTasksWithoutAgent(t *testing.T) {
+	api, db, secret := newAuthzTestAPI(t)
+	module := &fakeAIFARRuntimeActionModule{}
+	api.apps = registry.New(module)
+	dockerAPI := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/containers/json" {
+			_ = json.NewEncoder(w).Encode([]map[string]any{})
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer dockerAPI.Close()
+	server, instance := seedAIFARRuntimeFixture(t, db, dockerAPI.URL)
+	token := issueTestToken(t, db, secret, "owner", "owner")
+
+	for _, tc := range []struct {
+		name   string
+		path   string
+		action string
+	}{
+		{name: "cleanup", path: "/api/v2/containers/aifar/runtime/cleanup-stale", action: "aifar.runtime.cleanup"},
+		{name: "uninstall-agent", path: "/api/v2/containers/aifar/runtime/uninstall-agent", action: "aifar.agent.uninstall"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, tc.path+"?serverId="+server.ID, strings.NewReader(`{"instanceId":"`+instance.ID+`"}`))
+			req.Header.Set("Authorization", "Bearer "+token)
+			req.Header.Set("Content-Type", "application/json")
+			rec := httptest.NewRecorder()
+
+			api.Router().ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusAccepted {
+				t.Fatalf("expected 202, got %d body=%s", rec.Code, rec.Body.String())
+			}
+			var body map[string]any
+			if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+				t.Fatal(err)
+			}
+			taskID, _ := body["taskId"].(string)
+			if taskID == "" {
+				t.Fatalf("expected taskId in response: %+v", body)
+			}
+			waitForTaskStatus(t, db, taskID, "success")
+			assertAuditExists(t, db, tc.action, "running", "owner", instance.ID)
+		})
+	}
+	if module.cleanupCalls != 1 || module.uninstallCalls != 1 {
+		t.Fatalf("expected cleanup and uninstall module calls, got cleanup=%d uninstall=%d", module.cleanupCalls, module.uninstallCalls)
+	}
+}
+
+type fakeAIFARRuntimeActionModule struct {
+	cleanupCalls   int
+	uninstallCalls int
+}
+
+func (m *fakeAIFARRuntimeActionModule) Name() string { return "aifar" }
+
+func (m *fakeAIFARRuntimeActionModule) Manifest(lang string) registry.Manifest {
+	return registry.Manifest{Name: "aifar", BackendReady: true}
+}
+
+func (m *fakeAIFARRuntimeActionModule) PreflightInstall(ctx context.Context, req registry.InstallRequest, resources []store.Resource) (registry.PreflightResult, error) {
+	return registry.PreflightResult{}, nil
+}
+
+func (m *fakeAIFARRuntimeActionModule) PlanInstall(ctx context.Context, req registry.InstallRequest, resources []store.Resource) ([]registry.InstallStepPlan, error) {
+	return nil, nil
+}
+
+func (m *fakeAIFARRuntimeActionModule) ValidateInstall(ctx context.Context, req registry.InstallRequest, resources []store.Resource) error {
+	return nil
+}
+
+func (m *fakeAIFARRuntimeActionModule) Install(ctx context.Context, req registry.InstallRequest, run registry.RunContext) error {
+	return nil
+}
+
+func (m *fakeAIFARRuntimeActionModule) CleanupRuntimeStalePods(ctx context.Context, req registry.RuntimeCleanupRequest, run registry.RunContext) error {
+	m.cleanupCalls++
+	return nil
+}
+
+func (m *fakeAIFARRuntimeActionModule) UninstallRuntimeAgent(ctx context.Context, req registry.RuntimeAgentUninstallRequest, run registry.RunContext) error {
+	m.uninstallCalls++
+	return nil
 }
 
 func seedAIFARRuntimeFixture(t *testing.T, db *store.Store, dockerHost string) (store.Server, store.AppInstance) {

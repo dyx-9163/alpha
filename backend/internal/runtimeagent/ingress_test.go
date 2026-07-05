@@ -3,6 +3,7 @@ package runtimeagent
 import (
 	"context"
 	"net"
+	"net/http/httptest"
 	"strconv"
 	"strings"
 	"testing"
@@ -86,6 +87,38 @@ func TestManagerDiscoversReadyDockerPodEndpoints(t *testing.T) {
 		if !strings.Contains(calls, want) {
 			t.Fatalf("expected docker call containing %q, got:\n%s", want, calls)
 		}
+	}
+}
+
+func TestManagerKeepsFileUploadChunksOnSameEndpoint(t *testing.T) {
+	manager := NewManager(ManagerOptions{StateDir: t.TempDir(), Runner: &fakeRunner{}})
+	endpoints := []endpoint{
+		{Container: "aifar-pod-admin-file-b", Address: "172.20.0.12:38005"},
+		{Container: "aifar-pod-admin-file-a", Address: "172.20.0.11:38005"},
+	}
+	first := httptest.NewRequest("POST", "http://alpha-file/upload?identifier=upload-1&chunkNumber=1", nil)
+	second := httptest.NewRequest("POST", "http://alpha-file/upload?identifier=upload-1&chunkNumber=2", nil)
+	gotFirst := manager.selectEndpoint(first, "admin", "file", endpoints)
+	gotSecond := manager.selectEndpoint(second, "admin", "file", endpoints)
+	if gotFirst != gotSecond {
+		t.Fatalf("expected chunks with same upload identifier to use same file endpoint, got %#v and %#v", gotFirst, gotSecond)
+	}
+}
+
+func TestManagerUsesGatewayAffinityForSameClient(t *testing.T) {
+	manager := NewManager(ManagerOptions{StateDir: t.TempDir(), Runner: &fakeRunner{}})
+	endpoints := []endpoint{
+		{Container: "aifar-pod-admin-gateway-a", Address: "172.20.0.21:38000"},
+		{Container: "aifar-pod-admin-gateway-b", Address: "172.20.0.22:38000"},
+	}
+	first := httptest.NewRequest("GET", "http://aifar/api/users", nil)
+	first.Header.Set("Authorization", "Bearer user-token")
+	second := httptest.NewRequest("GET", "http://aifar/api/files", nil)
+	second.Header.Set("Authorization", "Bearer user-token")
+	gotFirst := manager.selectEndpoint(first, "admin", "gateway", endpoints)
+	gotSecond := manager.selectEndpoint(second, "admin", "gateway", endpoints)
+	if gotFirst != gotSecond {
+		t.Fatalf("expected same authenticated client to use same gateway endpoint, got %#v and %#v", gotFirst, gotSecond)
 	}
 }
 

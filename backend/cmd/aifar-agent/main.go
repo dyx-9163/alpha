@@ -38,7 +38,7 @@ func main() {
 			os.Exit(1)
 		}
 		fmt.Println(string(data))
-	case "reconcile-runtime", "reconcile":
+	case "reconcile-runtime", "reconcile-ingress", "reconcile":
 		cmd := flag.NewFlagSet(os.Args[1], flag.ExitOnError)
 		specPath := cmd.String("spec", "", "path to runtime spec json")
 		addr := cmd.String("addr", "127.0.0.1:18081", "agent API address")
@@ -67,6 +67,11 @@ func main() {
 			os.Exit(1)
 		}
 		fmt.Println(`{"status":"removed"}`)
+	case "register-nacos", "register-nacos-proxies", "deregister-nacos", "deregister-nacos-proxies":
+		if err := syncNacosProxiesCommand(os.Args[1], os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
 	case "serve":
 		cmd := flag.NewFlagSet("serve", flag.ExitOnError)
 		addr := cmd.String("addr", "127.0.0.1:18081", "agent listen address")
@@ -81,7 +86,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: aifar-agent health | status | reconcile-runtime --spec <file> | remove-instance [--instance admin] | serve [--addr 127.0.0.1:18081]")
+	fmt.Fprintln(os.Stderr, "usage: aifar-agent health | status | reconcile-runtime --spec <file> | reconcile-ingress --spec <file> | remove-instance [--instance admin] | register-nacos [--state-dir dir] | deregister-nacos [--state-dir dir] | serve [--addr 127.0.0.1:18081]")
 }
 
 func readSpec(path string) (runtimeagent.RuntimeSpec, error) {
@@ -108,9 +113,46 @@ func serve(addr string) error {
 	if err := manager.Load(context.Background()); err != nil {
 		return err
 	}
+	if err := runtimeagent.SyncNacosProxyRegistrations(context.Background(), runtimeagent.NacosProxySyncOptions{
+		StateDir: runtimeagent.DefaultStateDir,
+		Action:   runtimeagent.NacosProxyRegister,
+		Log:      os.Stdout,
+	}); err != nil {
+		log.Printf("sync AIFAR Nacos proxies on startup failed: %v", err)
+	}
 	server := &http.Server{Addr: addr, Handler: newAgentHandler(manager, health), ReadHeaderTimeout: 10 * time.Second}
 	log.Printf("aifar-agent listening on %s", addr)
 	return server.ListenAndServe()
+}
+
+func syncNacosProxiesCommand(name string, args []string) error {
+	cmd := flag.NewFlagSet(name, flag.ExitOnError)
+	stateDir := cmd.String("state-dir", runtimeagent.DefaultStateDir, "agent runtime state directory")
+	specPath := cmd.String("spec", "", "single runtime spec json")
+	agentIP := cmd.String("agent-ip", "", "agent IP address registered in Nacos")
+	_ = cmd.Parse(args)
+	action := runtimeagent.NacosProxyRegister
+	if strings.HasPrefix(name, "deregister-") {
+		action = runtimeagent.NacosProxyDeregister
+	}
+	options := runtimeagent.NacosProxySyncOptions{
+		StateDir: *stateDir,
+		Action:   action,
+		AgentIP:  *agentIP,
+		Log:      os.Stdout,
+	}
+	if strings.TrimSpace(*specPath) != "" {
+		spec, err := readSpec(*specPath)
+		if err != nil {
+			return err
+		}
+		options.Specs = []runtimeagent.RuntimeSpec{spec}
+	}
+	if err := runtimeagent.SyncNacosProxyRegistrations(context.Background(), options); err != nil {
+		return err
+	}
+	fmt.Printf("{\"status\":\"%s\"}\n", action)
+	return nil
 }
 
 func newAgentHandler(manager *runtimeagent.Manager, healthCheck func(context.Context) error) http.Handler {
@@ -241,6 +283,9 @@ func agentStatus() map[string]any {
 		"features": []string{
 			"health",
 			"host-proxy",
+			"nacos-proxy-deregister",
+			"nacos-proxy-register",
+			"reconcile-ingress",
 			"reconcile-runtime",
 			"remove-instance",
 			"status",

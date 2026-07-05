@@ -113,6 +113,57 @@ func TestAIFAROrchestrationCRUDAndInstanceCleanup(t *testing.T) {
 	if err != nil || len(endpoints) != 1 || endpoints[0].State != "active" {
 		t.Fatalf("unexpected endpoints: %+v err=%v", endpoints, err)
 	}
+	if _, err := db.SaveAIFARPod(AIFARPod{
+		InstanceID:    instance.ID,
+		ServiceName:   "permission",
+		Revision:      "rev-old",
+		PodID:         "permission-rev-old-r1",
+		ContainerName: "aifar-pod-admin-permission-rev-old-r1",
+		Port:          38010,
+		Status:        "ready",
+		Ready:         true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.ReplaceAIFARServiceEndpoints(instance.ID, "permission", []AIFARServiceEndpoint{{
+		InstanceID:    instance.ID,
+		ServiceName:   "permission",
+		PodID:         "permission-rev-1-r1",
+		ContainerName: "aifar-pod-admin-permission-rev-1-r1",
+		Revision:      "rev-1",
+		Port:          38010,
+		State:         "active",
+		Ready:         true,
+	}, {
+		InstanceID:    instance.ID,
+		ServiceName:   "permission",
+		PodID:         "permission-rev-old-r1",
+		ContainerName: "aifar-pod-admin-permission-rev-old-r1",
+		Revision:      "rev-old",
+		Port:          38010,
+		State:         "active",
+		Ready:         true,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	prunedPods, err := db.PruneAIFARPodRecords(instance.ID, []string{"aifar-pod-admin-permission-rev-1-r1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	prunedEndpoints, err := db.PruneAIFARServiceEndpointRecords(instance.ID, []string{"aifar-pod-admin-permission-rev-1-r1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if prunedPods != 1 || prunedEndpoints != 1 {
+		t.Fatalf("expected one stale pod and endpoint pruned, got pods=%d endpoints=%d", prunedPods, prunedEndpoints)
+	}
+	pods, err = db.ListAIFARPods(instance.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pods) != 1 || pods[0].ContainerName != "aifar-pod-admin-permission-rev-1-r1" {
+		t.Fatalf("unexpected pods after prune: %+v", pods)
+	}
 	if err := db.DeleteAppInstance(instance.ID); err != nil {
 		t.Fatal(err)
 	}

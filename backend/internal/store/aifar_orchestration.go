@@ -2,6 +2,7 @@ package store
 
 import (
 	"database/sql"
+	"strings"
 	"time"
 )
 
@@ -169,6 +170,55 @@ func (s *Store) ListAIFARServiceEndpoints(instanceID string) ([]AIFARServiceEndp
 		out = append(out, v)
 	}
 	return out, rows.Err()
+}
+
+func (s *Store) PruneAIFARPodRecords(instanceID string, existingContainerNames []string) (int, error) {
+	return s.pruneAIFARContainerRecords("aifar_pods", instanceID, existingContainerNames)
+}
+
+func (s *Store) PruneAIFARServiceEndpointRecords(instanceID string, existingContainerNames []string) (int, error) {
+	return s.pruneAIFARContainerRecords("aifar_service_endpoints", instanceID, existingContainerNames)
+}
+
+func (s *Store) pruneAIFARContainerRecords(table, instanceID string, existingContainerNames []string) (int, error) {
+	names := uniqueNonEmpty(existingContainerNames)
+	var (
+		result sql.Result
+		err    error
+	)
+	if len(names) == 0 {
+		result, err = s.db.Exec(`delete from `+table+` where instance_id=?`, instanceID)
+	} else {
+		placeholders := strings.TrimRight(strings.Repeat("?,", len(names)), ",")
+		args := make([]any, 0, len(names)+1)
+		args = append(args, instanceID)
+		for _, name := range names {
+			args = append(args, name)
+		}
+		result, err = s.db.Exec(`delete from `+table+` where instance_id=? and container_name not in (`+placeholders+`)`, args...)
+	}
+	if err != nil {
+		return 0, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	return int(affected), nil
+}
+
+func uniqueNonEmpty(values []string) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		out = append(out, value)
+	}
+	return out
 }
 
 func (s *Store) DeleteAIFAROrchestration(instanceID string) error {

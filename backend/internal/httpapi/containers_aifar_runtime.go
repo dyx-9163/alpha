@@ -112,6 +112,12 @@ type aifarRuntimeActionRequest struct {
 	Reason     string `json:"reason"`
 }
 
+type aifarRuntimeServiceInstallRequest struct {
+	InstanceID string   `json:"instanceId"`
+	Services   []string `json:"services"`
+	Reason     string   `json:"reason"`
+}
+
 type aifarRuntimeConfigApplyRequest struct {
 	InstanceID string                                  `json:"instanceId"`
 	Reason     string                                  `json:"reason"`
@@ -176,6 +182,110 @@ func (a *API) aifarRuntimeReconcile(w http.ResponseWriter, r *http.Request) {
 	})
 	if err == nil {
 		a.audit(r, "aifar.reconcile", instance.ID, "running", task.ID)
+	}
+	respondTask(w, task, err)
+}
+
+func (a *API) aifarRuntimeCleanupStale(w http.ResponseWriter, r *http.Request) {
+	lang := languageFromRequest(r)
+	req := aifarRuntimeActionRequest{}
+	if r.Body != nil && r.ContentLength != 0 {
+		if !decode(w, r, &req) {
+			return
+		}
+	}
+	_, instance, ok := a.resolveAIFARRuntimeActionTargetForInstanceWithAgent(w, r, req.InstanceID, false)
+	if !ok {
+		return
+	}
+	module, ok := a.apps.Get(instance.App)
+	if !ok {
+		writeError(w, http.StatusNotFound, "APP_BACKEND_MODULE_MISSING", i18n.Text(lang, "api.appBackendMissing"), map[string]any{"app": instance.App})
+		return
+	}
+	cleanup, ok := module.(registry.RuntimeCleanupModule)
+	if !ok {
+		writeError(w, http.StatusConflict, "AIFAR_RUNTIME_CLEANUP_UNSUPPORTED", "AIFAR runtime cleanup is not supported", map[string]any{"app": instance.App})
+		return
+	}
+	actor := currentUser(r).Username
+	task, err := a.tasks.StartWithLanguage("aifar.runtime.cleanup", instance.ID, actor, lang, func(ctx context.Context, log worker.Logger) error {
+		current, err := a.store.GetAppInstance(instance.ID)
+		if err != nil {
+			return err
+		}
+		server, err := a.store.GetServer(current.ServerID, true)
+		if err != nil {
+			return err
+		}
+		log.Info("cleaning stale AIFAR runtime Pod records for instance %s", current.ID)
+		return cleanup.CleanupRuntimeStalePods(ctx, registry.RuntimeCleanupRequest{
+			Instance: current,
+			Server:   server,
+			Language: lang,
+			Actor:    actor,
+			Reason:   strings.TrimSpace(req.Reason),
+		}, registry.RunContext{
+			Log: log,
+			TargetLog: func(target string) registry.Logger {
+				return log.Target(target)
+			},
+		})
+	})
+	if err == nil {
+		a.audit(r, "aifar.runtime.cleanup", instance.ID, "running", task.ID)
+	}
+	respondTask(w, task, err)
+}
+
+func (a *API) aifarRuntimeUninstallAgent(w http.ResponseWriter, r *http.Request) {
+	lang := languageFromRequest(r)
+	req := aifarRuntimeActionRequest{}
+	if r.Body != nil && r.ContentLength != 0 {
+		if !decode(w, r, &req) {
+			return
+		}
+	}
+	_, instance, ok := a.resolveAIFARRuntimeActionTargetForInstanceWithAgent(w, r, req.InstanceID, false)
+	if !ok {
+		return
+	}
+	module, ok := a.apps.Get(instance.App)
+	if !ok {
+		writeError(w, http.StatusNotFound, "APP_BACKEND_MODULE_MISSING", i18n.Text(lang, "api.appBackendMissing"), map[string]any{"app": instance.App})
+		return
+	}
+	uninstaller, ok := module.(registry.RuntimeAgentUninstallModule)
+	if !ok {
+		writeError(w, http.StatusConflict, "AIFAR_AGENT_UNINSTALL_UNSUPPORTED", "AIFAR agent uninstall is not supported", map[string]any{"app": instance.App})
+		return
+	}
+	actor := currentUser(r).Username
+	task, err := a.tasks.StartWithLanguage("aifar.agent.uninstall", instance.ID, actor, lang, func(ctx context.Context, log worker.Logger) error {
+		current, err := a.store.GetAppInstance(instance.ID)
+		if err != nil {
+			return err
+		}
+		server, err := a.store.GetServer(current.ServerID, true)
+		if err != nil {
+			return err
+		}
+		log.Info("uninstalling aifar-agent for instance %s", current.ID)
+		return uninstaller.UninstallRuntimeAgent(ctx, registry.RuntimeAgentUninstallRequest{
+			Instance: current,
+			Server:   server,
+			Language: lang,
+			Actor:    actor,
+			Reason:   strings.TrimSpace(req.Reason),
+		}, registry.RunContext{
+			Log: log,
+			TargetLog: func(target string) registry.Logger {
+				return log.Target(target)
+			},
+		})
+	})
+	if err == nil {
+		a.audit(r, "aifar.agent.uninstall", instance.ID, "running", task.ID)
 	}
 	respondTask(w, task, err)
 }
@@ -249,6 +359,63 @@ func (a *API) aifarRuntimeConfig(w http.ResponseWriter, r *http.Request) {
 	respondTask(w, task, err)
 }
 
+func (a *API) aifarRuntimeInstallServices(w http.ResponseWriter, r *http.Request) {
+	lang := languageFromRequest(r)
+	req := aifarRuntimeServiceInstallRequest{}
+	if !decode(w, r, &req) {
+		return
+	}
+	if len(req.Services) == 0 {
+		writeError(w, http.StatusBadRequest, "AIFAR_SERVICES_REQUIRED", "select at least one AIFAR service", nil)
+		return
+	}
+	_, instance, ok := a.resolveAIFARRuntimeActionTargetForInstance(w, r, req.InstanceID)
+	if !ok {
+		return
+	}
+	module, ok := a.apps.Get(instance.App)
+	if !ok {
+		writeError(w, http.StatusNotFound, "APP_BACKEND_MODULE_MISSING", i18n.Text(lang, "api.appBackendMissing"), map[string]any{"app": instance.App})
+		return
+	}
+	installer, ok := module.(registry.ServiceInstallModule)
+	if !ok {
+		writeError(w, http.StatusConflict, "AIFAR_SERVICE_INSTALL_UNSUPPORTED", "AIFAR service installation is not supported", map[string]any{"app": instance.App})
+		return
+	}
+	actor := currentUser(r).Username
+	services := append([]string(nil), req.Services...)
+	target := instance.ID + ":" + strings.Join(services, ",")
+	task, err := a.tasks.StartWithLanguage("aifar.services.install", target, actor, lang, func(ctx context.Context, log worker.Logger) error {
+		current, err := a.store.GetAppInstance(instance.ID)
+		if err != nil {
+			return err
+		}
+		server, err := a.store.GetServer(current.ServerID, true)
+		if err != nil {
+			return err
+		}
+		log.Info("installing AIFAR services %s for instance %s", strings.Join(services, ", "), current.ID)
+		return installer.InstallServices(ctx, registry.ServiceInstallRequest{
+			Instance: current,
+			Server:   server,
+			Language: lang,
+			Actor:    actor,
+			Services: services,
+			Reason:   strings.TrimSpace(req.Reason),
+		}, registry.RunContext{
+			Log: log,
+			TargetLog: func(target string) registry.Logger {
+				return log.Target(target)
+			},
+		})
+	})
+	if err == nil {
+		a.audit(r, "aifar.services.install", target, "running", task.ID)
+	}
+	respondTask(w, task, err)
+}
+
 func (a *API) aifarRuntimeScaleOut(w http.ResponseWriter, r *http.Request) {
 	lang := languageFromRequest(r)
 	service := strings.TrimSpace(chi.URLParam(r, "service"))
@@ -313,6 +480,10 @@ func (a *API) resolveAIFARRuntimeActionTarget(w http.ResponseWriter, r *http.Req
 }
 
 func (a *API) resolveAIFARRuntimeActionTargetForInstance(w http.ResponseWriter, r *http.Request, requestedID string) (store.Server, store.AppInstance, bool) {
+	return a.resolveAIFARRuntimeActionTargetForInstanceWithAgent(w, r, requestedID, true)
+}
+
+func (a *API) resolveAIFARRuntimeActionTargetForInstanceWithAgent(w http.ResponseWriter, r *http.Request, requestedID string, requireAgent bool) (store.Server, store.AppInstance, bool) {
 	lang := languageFromRequest(r)
 	server, useServer, err := a.dockerServerFromRequest(r)
 	if err != nil {
@@ -333,10 +504,12 @@ func (a *API) resolveAIFARRuntimeActionTargetForInstance(w http.ResponseWriter, 
 		writeError(w, http.StatusConflict, "AIFAR_LEGACY_RUNTIME", "legacy AIFAR orchestration model does not support this runtime action", map[string]any{"instanceId": instance.ID})
 		return store.Server{}, store.AppInstance{}, false
 	}
-	agent := a.collectAIFARAgentStatus(r.Context(), server)
-	if agent.Status != "running" {
-		writeError(w, http.StatusConflict, "AIFAR_AGENT_REQUIRED", "aifar-agent is required before running this runtime action", map[string]any{"status": agent.Status, "error": agent.Error})
-		return store.Server{}, store.AppInstance{}, false
+	if requireAgent {
+		agent := a.collectAIFARAgentStatus(r.Context(), server)
+		if agent.Status != "running" {
+			writeError(w, http.StatusConflict, "AIFAR_AGENT_REQUIRED", "aifar-agent is required before running this runtime action", map[string]any{"status": agent.Status, "error": agent.Error})
+			return store.Server{}, store.AppInstance{}, false
+		}
 	}
 	return server, instance, true
 }
