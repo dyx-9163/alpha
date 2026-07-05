@@ -791,3 +791,5 @@
 - 结论：当前 agent-only 模型中 Java Pod 自注册被禁用，Nacos 应由 `aifar-agent` 按 RuntimeSpec 注册 `alpha-oauth -> agentHost:38001`。代码映射和 skip 逻辑确认 OAuth 不会被设计性跳过；优先排查目标机运行的 agent/spec 是否为最新、spec 的 `services[]` 是否包含 `oauth/alpha-oauth`，以及 `aifar-agent reconcile-runtime` 或 Nacos 心跳日志是否注册失败。
 - 问题：用户提供 agent 日志显示 `alpha-oauth` Nacos 注册 POST/心跳 PUT 返回 400，Nacos 页面即使关闭“隐藏空服务”也看不到 `alpha-oauth`。
 - 结论：RuntimeSpec 已包含 `oauth/alpha-oauth/38001`，agent 也已尝试注册；根因是 Nacos 内部存在同名服务类型冲突或残留元数据，导致临时实例注册被拒绝。已让 `aifar-agent` 在注册代理实例遇到 Nacos ephemeral/persistent 类型冲突时自动删除同名 Nacos Service 并重试注册，覆盖页面不可见残留；`go test ./internal/runtimeagent ./cmd/aifar-agent`、`pnpm test`、`pnpm backend:build` 已通过。
+- 问题：用户询问是否把新构建的 `aifar-agent-linux-amd64` 拷贝到目标机 `/usr/local/bin` 并改名即可，且目标机 systemd 报 `status=203/EXEC`。
+- 结论：替换方式应为上传 Linux amd64 二进制后用 `install -m 0755` 安装为 `/usr/local/bin/aifar-agent`，并确认执行位、文件格式、架构、hash 和 SELinux context；`203/EXEC` 是 systemd 无法执行 ExecStart，常见于未 chmod、传错文件/架构、文件损坏或挂载 noexec。
