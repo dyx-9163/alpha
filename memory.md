@@ -799,3 +799,5 @@
 - 结论：Nacos 中 `DEFAULT_GROUP@@alpha-oauth`/`DEFAULT_GROUP@@alpha-permission` 的 Service 元数据删不掉或会恢复为 persistent，继续强制 ephemeral=true 无法成功。已改为在清理后仍遇到 persistent-service 冲突时自动按 `ephemeral=false` fallback 注册该服务代理，并在 heartbeat 中忽略该类 persistent 冲突避免日志风暴；新 `aifar-agent-linux-amd64` SHA256 为 `C8B405A317F5C8422D47417DDA643A465E36B8C33995ECEF2EF89A5C94F79CEF`，`go test ./internal/runtimeagent ./cmd/aifar-agent`、`pnpm test`、`pnpm backend:build` 通过。
 - 问题：用户询问 Java 代码里从未设置过 `ephemeral=true`，这个参数有什么作用。
 - 结论：`ephemeral` 是 Nacos 实例注册的生命周期类型，不是 AIFAR 业务 Java 代码参数；runtime-v2 已禁用 Java Pod 自注册，由 `aifar-agent` 通过 Nacos OpenAPI 注册 `alpha-* -> agentHost:port` 代理实例。`ephemeral=true` 表示临时实例，依赖心跳，agent 掉线后 Nacos 可自动剔除；`ephemeral=false` 是持久实例，适合兼容已被 Nacos 固定为 persistent 的历史 Service，但需要 agent 停止时主动摘除。
+- 问题：用户询问在哪里能看到服务被固定成 persistent service。
+- 结论：Nacos 控制台服务列表通常不直接展示服务级 ephemeral/persistent 类型；直接证据来自 Nacos OpenAPI 注册返回的错误 `Current service DEFAULT_GROUP@@alpha-oauth is persistent service, can't register ephemeral instance`。有实例时可通过 `/nacos/v1/ns/instance/list` 查看 `hosts[].ephemeral`，无实例或隐藏空服务时可通过临时注册探针或 Nacos naming 日志验证。
