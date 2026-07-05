@@ -121,10 +121,11 @@ type aifarRuntimeServiceInstallRequest struct {
 }
 
 type aifarRuntimeConfigApplyRequest struct {
-	InstanceID string                                  `json:"instanceId"`
-	Reason     string                                  `json:"reason"`
-	Global     registry.RuntimeConfigValues            `json:"global"`
-	Services   map[string]registry.RuntimeConfigValues `json:"services,omitempty"`
+	InstanceID     string                                  `json:"instanceId"`
+	Reason         string                                  `json:"reason"`
+	Global         registry.RuntimeConfigValues            `json:"global"`
+	Services       map[string]registry.RuntimeConfigValues `json:"services,omitempty"`
+	NacosEphemeral *bool                                   `json:"nacosEphemeral,omitempty"`
 }
 
 func (a *API) aifarRuntime(w http.ResponseWriter, r *http.Request) {
@@ -320,8 +321,9 @@ func (a *API) aifarRuntimeConfig(w http.ResponseWriter, r *http.Request) {
 		Actor:    actor,
 		Reason:   strings.TrimSpace(req.Reason),
 		Config: registry.RuntimeConfigPayload{
-			Global:   req.Global,
-			Services: req.Services,
+			Global:         req.Global,
+			Services:       req.Services,
+			NacosEphemeral: req.NacosEphemeral,
 		},
 	}
 	if err := configModule.ValidateRuntimeConfig(r.Context(), configReq); err != nil {
@@ -345,8 +347,9 @@ func (a *API) aifarRuntimeConfig(w http.ResponseWriter, r *http.Request) {
 			Actor:    actor,
 			Reason:   strings.TrimSpace(req.Reason),
 			Config: registry.RuntimeConfigPayload{
-				Global:   req.Global,
-				Services: req.Services,
+				Global:         req.Global,
+				Services:       req.Services,
+				NacosEphemeral: req.NacosEphemeral,
 			},
 		}, registry.RunContext{
 			Log: log,
@@ -467,6 +470,60 @@ func (a *API) aifarRuntimeScaleOut(w http.ResponseWriter, r *http.Request) {
 	})
 	if err == nil {
 		a.audit(r, "aifar.scale.out", target, "running", task.ID)
+	}
+	respondTask(w, task, err)
+}
+
+func (a *API) aifarRuntimeOfflineService(w http.ResponseWriter, r *http.Request) {
+	lang := languageFromRequest(r)
+	service := strings.TrimSpace(chi.URLParam(r, "service"))
+	if service == "" {
+		writeError(w, http.StatusBadRequest, "AIFAR_SERVICE_REQUIRED", "AIFAR service is required", nil)
+		return
+	}
+	_, instance, ok := a.resolveAIFARRuntimeActionTarget(w, r)
+	if !ok {
+		return
+	}
+	module, ok := a.apps.Get(instance.App)
+	if !ok {
+		writeError(w, http.StatusNotFound, "APP_BACKEND_MODULE_MISSING", i18n.Text(lang, "api.appBackendMissing"), map[string]any{"app": instance.App})
+		return
+	}
+	scaler, ok := module.(registry.ServiceScaleModule)
+	if !ok {
+		writeError(w, http.StatusConflict, "AIFAR_SCALE_UNSUPPORTED", "AIFAR service scale is not supported", map[string]any{"app": instance.App})
+		return
+	}
+	actor := currentUser(r).Username
+	target := instance.ID + ":" + service
+	task, err := a.tasks.StartWithLanguage("aifar.scale.offline", target, actor, lang, func(ctx context.Context, log worker.Logger) error {
+		current, err := a.store.GetAppInstance(instance.ID)
+		if err != nil {
+			return err
+		}
+		server, err := a.store.GetServer(current.ServerID, true)
+		if err != nil {
+			return err
+		}
+		log.Info("offlining AIFAR service %s for instance %s", service, current.ID)
+		return scaler.ScaleService(ctx, registry.ServiceScaleRequest{
+			Instance:    current,
+			Server:      server,
+			Language:    lang,
+			Actor:       actor,
+			ServiceName: service,
+			Replicas:    0,
+			Reason:      "manual container runtime service offline",
+		}, registry.RunContext{
+			Log: log,
+			TargetLog: func(target string) registry.Logger {
+				return log.Target(target)
+			},
+		})
+	})
+	if err == nil {
+		a.audit(r, "aifar.scale.offline", target, "running", task.ID)
 	}
 	respondTask(w, task, err)
 }
@@ -813,6 +870,9 @@ func runtimeServiceStatus(deployment store.AIFARDeployment, ready int) string {
 	if strings.EqualFold(deployment.Status, "failed") {
 		return "failed"
 	}
+	if deployment.DesiredReplicas == 0 || strings.EqualFold(deployment.Status, "offline") {
+		return "offline"
+	}
 	if strings.TrimSpace(deployment.UpdatingRevision) != "" {
 		return "rolling"
 	}
@@ -1061,12 +1121,20 @@ func runtimeInt(metadata map[string]any, key string, fallback int) int {
 
 func runtimeConfigFromRuntimeMetadata(metadata map[string]any) map[string]any {
 	if raw, ok := metadata["runtimeConfig"].(map[string]any); ok && len(raw) > 0 {
-		return raw
+		out := map[string]any{}
+		for key, value := range raw {
+			out[key] = value
+		}
+		if _, ok := out["nacosEphemeral"]; !ok {
+			out["nacosEphemeral"] = true
+		}
+		return out
 	}
 	return map[string]any{
 		"configVersion":   1,
 		"appliedVersion":  1,
 		"lastApplyStatus": "applied",
+		"nacosEphemeral":  true,
 		"global": map[string]any{
 			"appCPUs":                 runtimeString(metadata, "appCPUs", "2.0"),
 			"appMemoryLimit":          runtimeString(metadata, "appMemoryLimit", "2GB"),

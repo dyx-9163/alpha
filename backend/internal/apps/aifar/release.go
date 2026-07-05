@@ -174,8 +174,8 @@ func releaseEndpoint(service, releaseID string, replicaID, port int) map[string]
 }
 
 func releaseEndpointsForService(service, releaseID string, replicas, gatewayPort, webPort int) []map[string]any {
-	if replicas < 1 {
-		replicas = 1
+	if replicas < 0 {
+		replicas = 0
 	}
 	port := serviceDefaultPort(service, gatewayPort, webPort)
 	out := make([]map[string]any, 0, replicas)
@@ -219,8 +219,8 @@ func desiredReplicasFromMetadata(metadata map[string]any) map[string]int {
 	switch raw := metadata["desiredReplicas"].(type) {
 	case map[string]int:
 		for key, value := range raw {
-			if value < 1 {
-				value = 1
+			if value < 0 {
+				value = 0
 			}
 			out[key] = value
 		}
@@ -228,8 +228,8 @@ func desiredReplicasFromMetadata(metadata map[string]any) map[string]int {
 	case map[string]any:
 		for key, value := range raw {
 			n := intFromAny(value, 1)
-			if n < 1 {
-				n = 1
+			if n < 0 {
+				n = 0
 			}
 			out[key] = n
 		}

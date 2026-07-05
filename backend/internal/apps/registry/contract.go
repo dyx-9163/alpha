@@ -177,6 +177,16 @@ type ServiceScaleOutRequest struct {
 	Reason      string
 }
 
+type ServiceScaleRequest struct {
+	Instance    store.AppInstance
+	Server      store.Server
+	Language    string
+	Actor       string
+	ServiceName string
+	Replicas    int
+	Reason      string
+}
+
 type ServiceInstallRequest struct {
 	Instance store.AppInstance
 	Server   store.Server
@@ -202,8 +212,9 @@ type RuntimeConfigValues struct {
 }
 
 type RuntimeConfigPayload struct {
-	Global   RuntimeConfigValues            `json:"global"`
-	Services map[string]RuntimeConfigValues `json:"services,omitempty"`
+	Global         RuntimeConfigValues            `json:"global"`
+	Services       map[string]RuntimeConfigValues `json:"services,omitempty"`
+	NacosEphemeral *bool                          `json:"nacosEphemeral,omitempty"`
 }
 
 type RuntimeConfigRequest struct {
@@ -300,6 +311,10 @@ type ArtifactBundleUpdateModule interface {
 
 type ServiceScaleOutModule interface {
 	ScaleOutService(ctx context.Context, req ServiceScaleOutRequest, run RunContext) error
+}
+
+type ServiceScaleModule interface {
+	ScaleService(ctx context.Context, req ServiceScaleRequest, run RunContext) error
 }
 
 type ServiceInstallModule interface {

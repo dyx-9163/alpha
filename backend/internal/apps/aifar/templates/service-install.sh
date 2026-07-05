@@ -241,6 +241,16 @@ current_replicas_for_service() {
     --format '{{ "{{" }}.Names{{ "}}" }}' 2>/dev/null | wc -l | tr -d ' '
 }
 
+desired_replicas_from_env() {
+  wanted="$1"
+  for pair in $(read_env_value "$ENV_DIR/compose.env" AIFAR_DESIRED_REPLICAS ""); do
+    case "$pair" in
+      "$wanted="*) printf "%s" "${pair#*=}"; return 0 ;;
+    esac
+  done
+  return 1
+}
+
 desired_replicas_for_service() {
   service="$1"
   for new_service in $NEW_SERVICES; do
@@ -249,10 +259,43 @@ desired_replicas_for_service() {
       return
     fi
   done
+  if value="$(desired_replicas_from_env "$service")"; then
+    case "$value" in ""|*[!0-9]*) value=1 ;; esac
+    [ "$value" -ge 0 ] || value=0
+    printf "%s" "$value"
+    return
+  fi
   replicas="$(current_replicas_for_service "$service")"
   case "$replicas" in ""|*[!0-9]*) replicas=1 ;; esac
-  [ "$replicas" -ge 1 ] || replicas=1
+  [ "$replicas" -ge 0 ] || replicas=0
+  if [ "$replicas" -eq 0 ]; then
+    replicas=1
+  fi
   printf "%s" "$replicas"
+}
+
+nacos_ephemeral() {
+  value="$(read_env_value "$ENV_DIR/compose.env" AIFAR_NACOS_EPHEMERAL true)"
+  case "$(printf "%s" "$value" | tr '[:upper:]' '[:lower:]')" in
+    false|0|no|off) printf "false" ;;
+    *) printf "true" ;;
+  esac
+}
+
+write_desired_replicas_env() {
+  pairs=""
+  for service in $SERVICE_ORDER; do
+    [ -f "$ENV_DIR/$service.env" ] || continue
+    replicas="$(desired_replicas_for_service "$service")"
+    case "$replicas" in ""|*[!0-9]*) replicas=1 ;; esac
+    [ "$replicas" -ge 0 ] || replicas=0
+    if [ -z "$pairs" ]; then
+      pairs="$service=$replicas"
+    else
+      pairs="$pairs $service=$replicas"
+    fi
+  done
+  set_env AIFAR_DESIRED_REPLICAS "$pairs" "$ENV_DIR/compose.env"
 }
 
 write_runtime_spec() {
@@ -343,7 +386,7 @@ JSON
   "nacos": {
     "namespace": "${nacos_ns}",
     "group": "DEFAULT_GROUP",
-    "ephemeral": true,
+    "ephemeral": $(nacos_ephemeral),
     "agentIPStrategy": "auto"
   }
 }
@@ -353,6 +396,7 @@ JSON
 
 reconcile_runtime() {
   check_agent_dependency
+  write_desired_replicas_env
   spec="$(write_runtime_spec)"
   aifar-agent reconcile-runtime --spec "$spec"
 }

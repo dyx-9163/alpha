@@ -23,7 +23,7 @@ import (
 	"aifar-deployment/backend/internal/store"
 )
 
-//go:embed templates/install.sh templates/uninstall.sh templates/update-artifact.sh templates/update-artifact-bundle.sh templates/autoscale-out.sh templates/runtime-config.sh templates/service-install.sh templates/runtime-reconcile.sh
+//go:embed templates/install.sh templates/uninstall.sh templates/update-artifact.sh templates/update-artifact-bundle.sh templates/autoscale-out.sh templates/runtime-config.sh templates/service-install.sh templates/runtime-reconcile.sh templates/scale-service.sh
 var templateFS embed.FS
 
 type Logger = installerkit.Logger
@@ -110,6 +110,16 @@ type ScaleOutRequest struct {
 	Language    string
 	Actor       string
 	ServiceName string
+	Reason      string
+}
+
+type ScaleRequest struct {
+	Instance    store.AppInstance
+	Server      store.Server
+	Language    string
+	Actor       string
+	ServiceName string
+	Replicas    int
 	Reason      string
 }
 
@@ -514,8 +524,8 @@ func (s Service) saveInitialControlPlane(instanceID, revision, version, configHa
 }
 
 func (s Service) saveRolloutControlPlane(instanceID, version, revision, serviceName, artifactHash string, replicas, gatewayPort, webPort int, now time.Time) error {
-	if replicas < 1 {
-		replicas = 1
+	if replicas < 0 {
+		replicas = 0
 	}
 	if orch, ok := s.store.(aifarOrchestrationStore); ok {
 		return saveControlPlaneRevision(orch, instanceID, version, revision, artifactHash, map[string]int{serviceName: replicas}, gatewayPort, webPort, []string{serviceName}, now)
@@ -527,8 +537,8 @@ func saveControlPlaneRevision(orch aifarOrchestrationStore, instanceID, version,
 	strategy := `{"type":"RollingUpdate","maxSurge":1,"maxUnavailable":0,"drainSeconds":30}`
 	for _, service := range services {
 		replicas := desired[service]
-		if replicas < 1 {
-			replicas = 1
+		if replicas < 0 {
+			replicas = 0
 		}
 		port := serviceDefaultPort(service, gatewayPort, webPort)
 		if _, err := orch.SaveAIFARDeployment(store.AIFARDeployment{
@@ -678,8 +688,8 @@ func rolloutOrchestrationMetadata(current map[string]any, installRoot, revision,
 	}
 	for _, service := range changedServices {
 		replicas := desired[service]
-		if replicas < 1 {
-			replicas = 1
+		if replicas < 0 {
+			replicas = 0
 			desired[service] = replicas
 		}
 		activeEndpoints[service] = releaseEndpointsForService(service, revision, replicas, gatewayPort, webPort)
@@ -1537,6 +1547,14 @@ type autoscaleOutScriptData struct {
 	MaxReplicas    int
 }
 
+type scaleServiceScriptData struct {
+	InstallRoot    string
+	ServiceOrder   string
+	ServiceName    string
+	Replicas       int
+	IngressNetwork string
+}
+
 func renderInstallScript(data installScriptData) (string, error) {
 	content, err := templateFS.ReadFile("templates/install.sh")
 	if err != nil {
@@ -1587,6 +1605,16 @@ func renderAutoscaleOutScript(data autoscaleOutScriptData) (string, error) {
 	}, data)
 }
 
+func renderScaleServiceScript(data scaleServiceScriptData) (string, error) {
+	content, err := templateFS.ReadFile("templates/scale-service.sh")
+	if err != nil {
+		return "", err
+	}
+	return installerkit.RenderTemplate(AppName, "scale-service.sh", "aifar-scale-service", string(content), template.FuncMap{
+		"quote": shellQuoteAny,
+	}, data)
+}
+
 func renderRuntimeConfigScript(data runtimeConfigScriptData) (string, error) {
 	content, err := templateFS.ReadFile("templates/runtime-config.sh")
 	if err != nil {
@@ -1601,8 +1629,8 @@ func replicaAssignmentsForServices(desired map[string]int, services []string) st
 	selected := make(map[string]int, len(services))
 	for _, service := range services {
 		replicas := desired[service]
-		if replicas < 1 {
-			replicas = 1
+		if replicas < 0 {
+			replicas = 0
 		}
 		selected[service] = replicas
 	}
@@ -1619,8 +1647,8 @@ func replicaAssignments(desired map[string]int) string {
 		if !ok {
 			continue
 		}
-		if replicas < 1 {
-			replicas = 1
+		if replicas < 0 {
+			replicas = 0
 		}
 		parts = append(parts, fmt.Sprintf("%s=%d", service, replicas))
 	}

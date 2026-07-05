@@ -37,6 +37,7 @@ type RuntimeConfigState struct {
 	UpdatedBy       string                         `json:"updatedBy,omitempty"`
 	Global          RuntimeConfigValues            `json:"global"`
 	Services        map[string]RuntimeConfigValues `json:"services,omitempty"`
+	NacosEphemeral  bool                           `json:"nacosEphemeral"`
 	AppliedVersion  int                            `json:"appliedVersion,omitempty"`
 	LastAppliedAt   string                         `json:"lastAppliedAt,omitempty"`
 	LastApplyStatus string                         `json:"lastApplyStatus,omitempty"`
@@ -69,6 +70,7 @@ type runtimeConfigScriptData struct {
 	GlobalAppMemoryLimit          string
 	GlobalJVMInitialRAMPercentage string
 	GlobalJVMMaxRAMPercentage     string
+	NacosEphemeral                string
 	Services                      []runtimeConfigScriptService
 }
 
@@ -83,6 +85,7 @@ func runtimeConfigFromOptions(options InstallOptions, actor string, now time.Tim
 			JVMInitialRAMPercentage: options.JVMInitialRAMPercentage,
 			JVMMaxRAMPercentage:     options.JVMMaxRAMPercentage,
 		}, defaultRuntimeConfigValues()),
+		NacosEphemeral:  true,
 		Services:        map[string]RuntimeConfigValues{},
 		AppliedVersion:  1,
 		LastAppliedAt:   now.Format(time.RFC3339),
@@ -102,12 +105,20 @@ func defaultRuntimeConfigValues() RuntimeConfigValues {
 
 func runtimeConfigFromMetadata(metadata map[string]any) RuntimeConfigState {
 	state := RuntimeConfigState{
-		Global:   defaultRuntimeConfigValues(),
-		Services: map[string]RuntimeConfigValues{},
+		Global:         defaultRuntimeConfigValues(),
+		Services:       map[string]RuntimeConfigValues{},
+		NacosEphemeral: true,
 	}
 	if raw, ok := metadata["runtimeConfig"]; ok {
+		hasNacosEphemeral := false
+		if rawMap, ok := raw.(map[string]any); ok {
+			_, hasNacosEphemeral = rawMap["nacosEphemeral"]
+		}
 		data, _ := json.Marshal(raw)
 		_ = json.Unmarshal(data, &state)
+		if !hasNacosEphemeral {
+			state.NacosEphemeral = true
+		}
 	}
 	state.Global = normalizeRuntimeConfigValues(state.Global, defaultRuntimeConfigValues())
 	if state.Services == nil {
@@ -159,6 +170,9 @@ func normalizeRuntimeConfigPayload(payload RuntimeConfigPayload, base RuntimeCon
 	next := base
 	next.Global = global
 	next.Services = services
+	if payload.NacosEphemeral != nil {
+		next.NacosEphemeral = *payload.NacosEphemeral
+	}
 	return next, nil
 }
 
@@ -347,6 +361,7 @@ func runtimeConfigScriptDataFromState(installRoot string, previous, next Runtime
 		GlobalAppMemoryLimit:          global.AppMemoryLimit,
 		GlobalJVMInitialRAMPercentage: formatRuntimePercent(global.JVMInitialRAMPercentage),
 		GlobalJVMMaxRAMPercentage:     formatRuntimePercent(global.JVMMaxRAMPercentage),
+		NacosEphemeral:                strconv.FormatBool(next.NacosEphemeral),
 	}
 	for _, service := range serviceListOrDefault(services) {
 		values := effectiveRuntimeConfigForService(next, service)

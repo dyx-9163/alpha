@@ -164,8 +164,8 @@ func NormalizeSpec(spec RuntimeSpec) RuntimeSpec {
 				deployment.DeploymentName = serviceAppName(ServiceSpec{Name: deployment.ServiceName})
 			}
 		}
-		if deployment.Replicas < 1 {
-			deployment.Replicas = 1
+		if deployment.Replicas < 0 {
+			deployment.Replicas = 0
 		}
 		if len(deployment.Ports) == 0 {
 			if service, ok := serviceByName(spec, deployment.ServiceName); ok {

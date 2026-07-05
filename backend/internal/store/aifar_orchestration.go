@@ -16,8 +16,8 @@ func (s *Store) SaveAIFARDeployment(v AIFARDeployment) (AIFARDeployment, error) 
 		v.CreatedAt = now
 	}
 	v.UpdatedAt = now
-	if v.DesiredReplicas < 1 {
-		v.DesiredReplicas = 1
+	if v.DesiredReplicas < 0 {
+		v.DesiredReplicas = 0
 	}
 	_, err := s.db.Exec(`insert into aifar_deployments(id,instance_id,service_name,desired_replicas,current_revision,updating_revision,strategy_json,status,metadata_json,created_at,updated_at)
 		values(?,?,?,?,?,?,?,?,?,?,?)
@@ -56,8 +56,8 @@ func (s *Store) SaveAIFARReplicaSet(v AIFARReplicaSet) (AIFARReplicaSet, error) 
 		v.CreatedAt = now
 	}
 	v.UpdatedAt = now
-	if v.DesiredPods < 1 {
-		v.DesiredPods = 1
+	if v.DesiredPods < 0 {
+		v.DesiredPods = 0
 	}
 	_, err := s.db.Exec(`insert into aifar_replicasets(id,instance_id,service_name,revision,image,artifact_hash,desired_pods,ready_pods,status,metadata_json,created_at,updated_at)
 		values(?,?,?,?,?,?,?,?,?,?,?,?)

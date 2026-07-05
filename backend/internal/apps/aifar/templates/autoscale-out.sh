@@ -17,6 +17,17 @@ fail() {
   exit 1
 }
 
+set_env() {
+  key="$1"
+  value="$2"
+  file="$3"
+  tmp="${file}.tmp"
+  [ -f "$file" ] || touch "$file"
+  grep -v "^${key}=" "$file" > "$tmp" || true
+  printf "%s=%s\n" "$key" "$value" >> "$tmp"
+  mv "$tmp" "$file"
+}
+
 read_env_value() {
   file="$1"
   key="$2"
@@ -168,14 +179,57 @@ replicas_for_service() {
     printf "%s" "$REPLICA_ID"
     return
   fi
+  if value="$(desired_replicas_from_env "$service")"; then
+    case "$value" in ""|*[!0-9]*) value=1 ;; esac
+    [ "$value" -ge 0 ] || value=0
+    printf "%s" "$value"
+    return
+  fi
   replicas="$(docker ps --filter "label=aifar.app=aifar" \
     --filter "label=aifar.install-root=$INSTALL_ROOT" \
     --filter "label=aifar.component=pod" \
     --filter "label=aifar.service=$service" \
     --format '{{ "{{" }}.Names{{ "}}" }}' 2>/dev/null | wc -l | tr -d ' ')"
   case "$replicas" in ""|*[!0-9]*) replicas=1 ;; esac
-  [ "$replicas" -ge 1 ] || replicas=1
+  [ "$replicas" -ge 0 ] || replicas=0
+  if [ "$replicas" -eq 0 ]; then
+    replicas=1
+  fi
   printf "%s" "$replicas"
+}
+
+desired_replicas_from_env() {
+  wanted="$1"
+  for pair in $(read_env_value "$ENV_DIR/compose.env" AIFAR_DESIRED_REPLICAS ""); do
+    case "$pair" in
+      "$wanted="*) printf "%s" "${pair#*=}"; return 0 ;;
+    esac
+  done
+  return 1
+}
+
+write_desired_replicas_env() {
+  pairs=""
+  for service in $(service_order); do
+    [ -f "$ENV_DIR/$service.env" ] || continue
+    replicas="$(replicas_for_service "$service")"
+    case "$replicas" in ""|*[!0-9]*) replicas=1 ;; esac
+    [ "$replicas" -ge 0 ] || replicas=0
+    if [ -z "$pairs" ]; then
+      pairs="$service=$replicas"
+    else
+      pairs="$pairs $service=$replicas"
+    fi
+  done
+  set_env AIFAR_DESIRED_REPLICAS "$pairs" "$ENV_DIR/compose.env"
+}
+
+nacos_ephemeral() {
+  value="$(read_env_value "$ENV_DIR/compose.env" AIFAR_NACOS_EPHEMERAL true)"
+  case "$(printf "%s" "$value" | tr '[:upper:]' '[:lower:]')" in
+    false|0|no|off) printf "false" ;;
+    *) printf "true" ;;
+  esac
 }
 
 container_status() {
@@ -301,7 +355,7 @@ JSON
   "nacos": {
     "namespace": "${nacos_ns}",
     "group": "DEFAULT_GROUP",
-    "ephemeral": true,
+    "ephemeral": $(nacos_ephemeral),
     "agentIPStrategy": "auto"
   }
 }
@@ -312,6 +366,7 @@ JSON
 reconcile_runtime() {
   spec="$INSTALL_ROOT/runtime/agent/runtime-spec.json"
   check_agent_dependency
+  write_desired_replicas_env
   write_runtime_spec >/dev/null
   [ -f "$spec" ] || fail "AIFAR runtime spec is missing: $spec"
   aifar-agent reconcile-runtime --spec "$spec"

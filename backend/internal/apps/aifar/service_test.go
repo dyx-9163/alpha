@@ -444,6 +444,7 @@ type fakeRemote struct {
 	autoscaleScript         string
 	runtimeConfigScript     string
 	serviceInstallScript    string
+	scaleServiceScript      string
 	runtimeReconcileScript  string
 	runtimePodScanStdout    string
 	runtimeAgentUninstall   string
@@ -479,6 +480,9 @@ func (f *fakeRemote) Run(ctx context.Context, server store.Server, command strin
 	}
 	if strings.Contains(command, "AIFAR_SERVICE_INSTALL") {
 		f.serviceInstallScript = command
+	}
+	if strings.Contains(command, "AIFAR_SCALE_SERVICE") {
+		f.scaleServiceScript = command
 	}
 	if strings.Contains(command, "AIFAR_RUNTIME_RECONCILE") {
 		f.runtimeReconcileScript = command
@@ -730,7 +734,8 @@ func TestAutoscaleOutScriptUsesReplicaContainerAndEscapedDockerFormats(t *testin
 		`--format '{{.Names}}'`,
 		`"version": "runtime-v2"`,
 		`"mode": "web-nginx"`,
-		`"ephemeral": true`,
+		`nacos_ephemeral`,
+		`"ephemeral": $(nacos_ephemeral)`,
 		`replicas_for_service`,
 		`write_runtime_spec`,
 		`aifar-agent reconcile-runtime --spec "$spec"`,
@@ -801,6 +806,63 @@ func TestScaleOutCreatesReplicaAndUpdatesEndpointMetadata(t *testing.T) {
 	}
 	if _, locked := metadata["orchestrationLock"]; locked {
 		t.Fatalf("expected orchestration lock to be released, got %s", saved.Metadata)
+	}
+}
+
+func TestScaleServiceCanOfflineDeploymentAndClearEndpoints(t *testing.T) {
+	withFakeRuntimeAgentBinary(t)
+	instance := installedAIFARInstance(t)
+	s := &fakeStore{
+		servers: map[string]store.Server{"srv-1": {ID: "srv-1", Host: "10.0.0.10", DeployDir: "/aifar/apps"}},
+		instances: []store.AppInstance{
+			instance,
+		},
+	}
+	remote := &fakeRemote{autoscaleStatusStdouts: []string{
+		"endpoint=gateway|aifar-gateway-rel|rel|1|38000|true|healthy|10|2147483648\nhostMemoryAvailableBytes=8589934592\n",
+	}}
+	service := NewService(s, remote)
+	err := service.ScaleService(context.Background(), ScaleRequest{
+		Instance:    instance,
+		Server:      s.servers["srv-1"],
+		Actor:       "operator",
+		ServiceName: "permission",
+		Replicas:    0,
+		Reason:      "test offline",
+	}, fakeLogger{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(remote.scaleServiceScript, "AIFAR_SCALE_SERVICE") || !strings.Contains(remote.scaleServiceScript, `SERVICE_NAME='permission'`) || !strings.Contains(remote.scaleServiceScript, `REPLICAS=0`) {
+		t.Fatalf("expected scale-service script to set permission replicas to 0, got:\n%s", remote.scaleServiceScript)
+	}
+	saved, err := s.GetAppInstance(instance.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	metadata := metadataFromInstance(saved)
+	desired := desiredReplicasFromMetadata(metadata)
+	if desired["permission"] != 0 {
+		t.Fatalf("expected permission desired replicas 0, got %+v metadata=%s", desired, saved.Metadata)
+	}
+	endpoints := activeEndpointsFromMetadata(metadata)
+	if endpointCount(endpoints["permission"]) != 0 {
+		t.Fatalf("expected permission active endpoints to be cleared, got %+v metadata=%s", endpoints["permission"], saved.Metadata)
+	}
+	var deployment store.AIFARDeployment
+	for _, item := range s.deployments {
+		if item.ServiceName == "permission" {
+			deployment = item
+			break
+		}
+	}
+	if deployment.ServiceName == "" || deployment.DesiredReplicas != 0 || deployment.Status != "offline" {
+		t.Fatalf("expected offline deployment row, got %+v", deployment)
+	}
+	for _, endpoint := range s.endpoints {
+		if endpoint.ServiceName == "permission" {
+			t.Fatalf("expected permission endpoint rows to be removed, got %+v", s.endpoints)
+		}
 	}
 }
 
@@ -1066,7 +1128,9 @@ func TestServiceInstallsAIFARServiceFromRuntimeV2Bundle(t *testing.T) {
 		`"services": [`,
 		`"mode": "web-nginx"`,
 		`"gatewayService": "gateway"`,
-		`"ephemeral": true`,
+		`AIFAR_NACOS_EPHEMERAL true`,
+		`nacos_ephemeral`,
+		`"ephemeral": $(nacos_ephemeral)`,
 		`curl -sS --connect-timeout %s -o /dev/null %s://%s:%s/ || exit 1`,
 	} {
 		if !strings.Contains(remote.installScript, want) {

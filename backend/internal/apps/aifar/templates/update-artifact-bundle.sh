@@ -54,6 +54,14 @@ json_escape() {
   printf "%s" "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
 }
 
+nacos_ephemeral() {
+  value="$(read_env_value "$ENV_DIR/compose.env" AIFAR_NACOS_EPHEMERAL true)"
+  case "$(printf "%s" "$value" | tr '[:upper:]' '[:lower:]')" in
+    false|0|no|off) printf "false" ;;
+    *) printf "true" ;;
+  esac
+}
+
 check_agent_dependency() {
   command -v aifar-agent >/dev/null 2>&1 || fail "aifar-agent is required; install or upgrade Docker runtime first"
   aifar-agent status >/dev/null 2>&1 || fail "aifar-agent service is not reachable; install or upgrade Docker runtime first"
@@ -209,8 +217,18 @@ desired_replicas_for_service() {
     esac
   done
   case "$value" in ""|*[!0-9]*) value=1 ;; esac
-  [ "$value" -ge 1 ] || value=1
+  [ "$value" -ge 0 ] || value=0
   printf "%s" "$value"
+}
+
+desired_replicas_from_env() {
+  wanted="$1"
+  for pair in $(read_env_value "$ENV_DIR/compose.env" AIFAR_DESIRED_REPLICAS ""); do
+    case "$pair" in
+      "$wanted="*) printf "%s" "${pair#*=}"; return 0 ;;
+    esac
+  done
+  return 1
 }
 
 current_replicas_for_service() {
@@ -227,10 +245,35 @@ replicas_for_service() {
     desired_replicas_for_service "$service"
     return
   fi
+  if value="$(desired_replicas_from_env "$service")"; then
+    case "$value" in ""|*[!0-9]*) value=1 ;; esac
+    [ "$value" -ge 0 ] || value=0
+    printf "%s" "$value"
+    return
+  fi
   replicas="$(current_replicas_for_service "$service")"
   case "$replicas" in ""|*[!0-9]*) replicas=1 ;; esac
-  [ "$replicas" -ge 1 ] || replicas=1
+  [ "$replicas" -ge 0 ] || replicas=0
+  if [ "$replicas" -eq 0 ]; then
+    replicas=1
+  fi
   printf "%s" "$replicas"
+}
+
+write_desired_replicas_env() {
+  pairs=""
+  for service in $SERVICE_ORDER; do
+    [ -f "$ENV_DIR/$service.env" ] || continue
+    replicas="$(replicas_for_service "$service")"
+    case "$replicas" in ""|*[!0-9]*) replicas=1 ;; esac
+    [ "$replicas" -ge 0 ] || replicas=0
+    if [ -z "$pairs" ]; then
+      pairs="$service=$replicas"
+    else
+      pairs="$pairs $service=$replicas"
+    fi
+  done
+  set_env AIFAR_DESIRED_REPLICAS "$pairs" "$ENV_DIR/compose.env"
 }
 
 pod_name() {
@@ -387,7 +430,7 @@ JSON
   "nacos": {
     "namespace": "${nacos_ns}",
     "group": "DEFAULT_GROUP",
-    "ephemeral": true,
+    "ephemeral": $(nacos_ephemeral),
     "agentIPStrategy": "auto"
   }
 }
@@ -398,6 +441,7 @@ JSON
 reconcile_runtime() {
   spec="$INSTALL_ROOT/runtime/agent/runtime-spec.json"
   check_agent_dependency
+  write_desired_replicas_env
   write_runtime_spec >/dev/null
   [ -f "$spec" ] || fail "AIFAR runtime spec is missing: $spec"
   aifar-agent reconcile-runtime --spec "$spec"

@@ -83,6 +83,16 @@ func SyncNacosProxyRegistrations(ctx context.Context, options NacosProxySyncOpti
 			if appName == "" || service.Port <= 0 {
 				continue
 			}
+			if action == NacosProxyRegister {
+				if replicas, ok := serviceDesiredReplicas(spec, service.Name); ok && replicas == 0 {
+					if err := syncNacosProxy(ctx, client, env, NacosProxyDeregister, spec, appName, agentIP, service.Port, token, options.Log); err != nil {
+						errs = append(errs, fmt.Sprintf("%s/%s: deregister offline service: %v", spec.InstanceID, service.Name, err))
+						continue
+					}
+					logf(options.Log, "AIFAR Nacos proxy deregister offline: %s -> %s:%d\n", appName, agentIP, service.Port)
+					continue
+				}
+			}
 			if err := syncNacosProxy(ctx, client, env, action, spec, appName, agentIP, service.Port, token, options.Log); err != nil {
 				errs = append(errs, fmt.Sprintf("%s/%s: %v", spec.InstanceID, service.Name, err))
 				continue
@@ -154,6 +164,9 @@ func HeartbeatNacosProxyRegistrations(ctx context.Context, options NacosProxySyn
 		token := nacosAccessToken(ctx, client, env)
 		for _, service := range spec.Services {
 			if !serviceRegistersInNacos(spec, service) {
+				continue
+			}
+			if replicas, ok := serviceDesiredReplicas(spec, service.Name); ok && replicas == 0 {
 				continue
 			}
 			appName := serviceAppName(service)
@@ -310,6 +323,16 @@ func serviceRegistersInNacos(spec RuntimeSpec, service ServiceSpec) bool {
 		return false
 	}
 	return true
+}
+
+func serviceDesiredReplicas(spec RuntimeSpec, serviceName string) (int, bool) {
+	serviceName = strings.TrimSpace(serviceName)
+	for _, deployment := range spec.Deployments {
+		if strings.TrimSpace(deployment.ServiceName) == serviceName {
+			return deployment.Replicas, true
+		}
+	}
+	return 0, false
 }
 
 func nacosAccessToken(ctx context.Context, client *http.Client, env nacosRuntimeEnv) string {

@@ -326,6 +326,20 @@ func (m Module) ScaleOutService(ctx context.Context, req registry.ServiceScaleOu
 	})
 }
 
+func (m Module) ScaleService(ctx context.Context, req registry.ServiceScaleRequest, run registry.RunContext) error {
+	return m.service.ScaleService(ctx, ScaleRequest{
+		Instance:    req.Instance,
+		Server:      req.Server,
+		Language:    req.Language,
+		Actor:       req.Actor,
+		ServiceName: req.ServiceName,
+		Replicas:    req.Replicas,
+		Reason:      req.Reason,
+	}, run.Log, func(target string) Logger {
+		return run.LoggerForTarget(target)
+	})
+}
+
 func (m Module) InstallServices(ctx context.Context, req registry.ServiceInstallRequest, run registry.RunContext) error {
 	return m.service.InstallServices(ctx, InstallServicesRequest{
 		Instance: req.Instance,

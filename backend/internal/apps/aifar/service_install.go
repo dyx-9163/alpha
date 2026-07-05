@@ -291,8 +291,8 @@ func serviceInstallOrchestrationMetadata(current map[string]any, installRoot, re
 	containers := map[string]any{}
 	for _, service := range allServices {
 		replicas := desiredSource[service]
-		if replicas < 1 {
-			replicas = 1
+		if replicas < 0 {
+			replicas = 0
 		}
 		desired[service] = replicas
 		if value, ok := activeEndpointSource[service]; ok {

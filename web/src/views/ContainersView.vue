@@ -188,7 +188,7 @@
               <el-table-column :label="t('containers.memory')" width="100">
                 <template #default="{ row }">{{ percentText(row.memoryPercent) }}</template>
               </el-table-column>
-              <el-table-column :label="t('common.operation')" width="230" fixed="right">
+              <el-table-column :label="t('common.operation')" width="300" fixed="right">
                 <template #default="{ row }">
                   <div class="row-actions">
                     <el-tooltip :content="aifarRuntimeActionDisabledReason" :disabled="!aifarRuntimeActionDisabledReason" placement="top">
@@ -196,6 +196,9 @@
                     </el-tooltip>
                     <el-tooltip :content="aifarRuntimeActionDisabledReason" :disabled="!aifarRuntimeActionDisabledReason" placement="top">
                       <span><el-button size="small" :disabled="Boolean(aifarRuntimeActionDisabledReason)" @click="scaleOutAifarService(row.serviceName)">{{ t('containers.scaleOut') }}</el-button></span>
+                    </el-tooltip>
+                    <el-tooltip :content="aifarRuntimeOfflineDisabledReason(row)" :disabled="!aifarRuntimeOfflineDisabledReason(row)" placement="top">
+                      <span><el-button size="small" type="danger" plain :disabled="Boolean(aifarRuntimeOfflineDisabledReason(row))" @click="offlineAifarService(row)">{{ t('containers.offlineDeployment') }}</el-button></span>
                     </el-tooltip>
                   </div>
                 </template>
@@ -353,6 +356,9 @@
           <el-form-item :label="t('containers.jvmMaxRam')" required>
             <el-input-number v-model="runtimeConfigForm.jvmMaxRAMPercentage" :min="1" :max="90" :step="1" controls-position="right" />
           </el-form-item>
+          <el-form-item :label="t('containers.nacosEphemeral')">
+            <el-switch v-model="runtimeConfigForm.nacosEphemeral" inline-prompt active-text="true" inactive-text="false" />
+          </el-form-item>
         </el-form>
         <div class="runtime-config-section-title">{{ t('containers.runtimeConfigOverrides') }}</div>
         <el-table :data="runtimeConfigRows" max-height="300" row-key="serviceName" class="runtime-config-table">
@@ -454,10 +460,15 @@ type RuntimeConfigState = {
   updatedBy?: string
   global?: RuntimeConfigValues
   services?: Record<string, RuntimeConfigValues>
+  nacosEphemeral?: boolean
   appliedVersion?: number
   lastAppliedAt?: string
   lastApplyStatus?: string
   lastApplyError?: string
+}
+
+type RuntimeConfigFormValues = Required<RuntimeConfigValues> & {
+  nacosEphemeral: boolean
 }
 
 type RuntimeConfigServiceRow = {
@@ -562,11 +573,12 @@ const aifarRuntime = ref<AifarRuntimeResponse>({ runtimeStatus: 'unknown', agent
 const selectedRuntimeInstanceId = ref('')
 const runtimeConfigVisible = ref(false)
 const runtimeConfigSubmitting = ref(false)
-const runtimeConfigForm = ref<Required<RuntimeConfigValues>>({
+const runtimeConfigForm = ref<RuntimeConfigFormValues>({
   appCPUs: '2.0',
   appMemoryLimit: '2GB',
   jvmInitialRAMPercentage: 20,
-  jvmMaxRAMPercentage: 70
+  jvmMaxRAMPercentage: 70,
+  nacosEphemeral: true
 })
 const runtimeConfigRows = ref<RuntimeConfigServiceRow[]>([])
 const serviceInstallVisible = ref(false)
@@ -755,6 +767,7 @@ const runtimeSummaryItems = computed(() => {
     { label: t('containers.webRoute'), value: ingress?.webRoute || instance?.endpoint || '-' },
     { label: t('containers.gatewayRoute'), value: ingress?.gatewayRoute || instance?.gatewayEndpoint || '-' },
     { label: t('containers.runtimeConfigVersion'), value: `${config.configVersion ?? '-'} / ${config.appliedVersion ?? '-'}`, status: config.lastApplyStatus || 'unknown' },
+    { label: t('containers.nacosEphemeral'), value: config.nacosEphemeral === false ? 'false' : 'true' },
     { label: t('containers.ingress'), value: ingress?.container || '-', status: ingress?.status || 'unknown' },
     { label: t('containers.agent'), value: aifarRuntime.value.agent?.version || aifarRuntime.value.agent?.status || '-', status: aifarRuntime.value.agent?.status || 'unknown' }
   ]
@@ -1170,6 +1183,7 @@ function aifarRuntimeStatusKind(status?: string) {
     case 'degraded':
     case 'draining':
     case 'stale':
+    case 'offline':
       return 'degraded'
     case 'missing':
     case 'unsupported':
@@ -1213,6 +1227,7 @@ function defaultRuntimeConfigState(): RuntimeConfigState {
       jvmInitialRAMPercentage: 20,
       jvmMaxRAMPercentage: 70
     },
+    nacosEphemeral: true,
     services: {}
   }
 }
@@ -1247,7 +1262,7 @@ function openRuntimeConfigDialog() {
   }
   const state = selectedRuntimeConfig.value
   const global = normalizedRuntimeValues(state.global)
-  runtimeConfigForm.value = { ...global }
+  runtimeConfigForm.value = { ...global, nacosEphemeral: state.nacosEphemeral !== false }
   const overrides = state.services || {}
   const services = selectedRuntimeServices.value.length
     ? selectedRuntimeServices.value.map((item) => item.serviceName)
@@ -1517,7 +1532,8 @@ async function submitRuntimeConfig() {
     const result = await apiPut<{ taskId: string }>(`/containers/aifar/runtime/config?${query}`, {
       instanceId,
       global,
-      services
+      services,
+      nacosEphemeral: runtimeConfigForm.value.nacosEphemeral
     })
     runtimeConfigVisible.value = false
     ElMessage.success(t('containers.runtimeConfigApplyStarted'))
@@ -1697,6 +1713,28 @@ async function scaleOutAifarService(service: string) {
   })
 }
 
+function aifarRuntimeOfflineDisabledReason(row: AifarRuntimeService) {
+  if (aifarRuntimeActionDisabledReason.value) return aifarRuntimeActionDisabledReason.value
+  if (Number(row.desiredReplicas || 0) === 0) return t('containers.serviceAlreadyOffline')
+  return ''
+}
+
+async function offlineAifarService(row: AifarRuntimeService) {
+  const reason = aifarRuntimeOfflineDisabledReason(row)
+  if (reason) {
+    ElMessage.warning(reason)
+    return
+  }
+  const instanceId = selectedRuntimeInstance.value?.id
+  if (!instanceId) {
+    ElMessage.warning(t('containers.selectAifarInstance'))
+    return
+  }
+  await submitAifarOffline(row.serviceName, instanceId, () => {
+    void loadAifarRuntime(true)
+  })
+}
+
 async function submitAifarScaleOut(service: string, instanceId: string, afterSubmitted?: () => void) {
   try {
     await ElMessageBox.confirm(t('containers.confirmScaleOut', { service }), t('containers.scaleOut'), {
@@ -1714,6 +1752,31 @@ async function submitAifarScaleOut(service: string, instanceId: string, afterSub
   }
   try {
     const result = await apiPost<{ taskId: string }>(`/containers/aifar/services/${encodeURIComponent(service)}/scale-out?${query}`, { instanceId })
+    ElMessage.success(t('containers.runtimeActionAccepted'))
+    void router.push({ path: '/tasks', query: { taskId: result.taskId } })
+    afterSubmitted?.()
+  } catch (err) {
+    ElMessage.error(err instanceof Error ? err.message : t('containers.runtimeActionFailed'))
+  }
+}
+
+async function submitAifarOffline(service: string, instanceId: string, afterSubmitted?: () => void) {
+  try {
+    await ElMessageBox.confirm(t('containers.confirmOfflineDeployment', { service }), t('containers.offlineDeployment'), {
+      type: 'warning',
+      confirmButtonText: t('containers.offlineDeployment'),
+      cancelButtonText: t('common.cancel')
+    })
+  } catch {
+    return
+  }
+  const query = targetQuery()
+  if (!query) {
+    ElMessage.warning(t('containers.selectDockerHost'))
+    return
+  }
+  try {
+    const result = await apiPost<{ taskId: string }>(`/containers/aifar/services/${encodeURIComponent(service)}/offline?${query}`, { instanceId })
     ElMessage.success(t('containers.runtimeActionAccepted'))
     void router.push({ path: '/tasks', query: { taskId: result.taskId } })
     afterSubmitted?.()

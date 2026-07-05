@@ -730,7 +730,7 @@ func maxMemoryPercent(metrics []autoscaleMetric) float64 {
 }
 
 func nextReplicaID(metrics []autoscaleMetric, service string) int {
-	maxID := 1
+	maxID := 0
 	for _, metric := range metrics {
 		if metric.Service == service && metric.ReplicaID > maxID {
 			maxID = metric.ReplicaID
