@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 
 	"aifar-deployment/backend/internal/adapter"
 	"aifar-deployment/backend/internal/i18n"
@@ -25,27 +26,68 @@ func (a *API) containerSummary(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "DOCKER_TARGET_REQUIRED", i18n.Text(languageFromRequest(r), "api.dockerTargetRequired"), nil)
 		return
 	}
-	var (
-		summary adapter.DockerSummary
-		err     error
-		df      any
-	)
+	includeDisk := queryBool(r, "includeDisk", false)
+	var summary adapter.DockerSummary
+	var err error
+	var df any
 	if useServer {
-		var serverSummary adapter.DockerSummary
-		serverSummary, err = adapter.DockerSummaryForServer(r.Context(), server)
-		summary = serverSummary
-		df, _ = adapter.DockerSystemDFForServer(r.Context(), server)
+		summary, df, err = dockerSummaryResponseForServer(r.Context(), server, includeDisk)
 	} else {
-		var hostSummary adapter.DockerSummary
-		hostSummary, err = adapter.DockerSummaryForHost(r.Context(), host)
-		summary = hostSummary
-		df, _ = adapter.DockerSystemDF(r.Context(), host)
+		summary, df, err = dockerSummaryResponseForHost(r.Context(), host, includeDisk)
 	}
 	if err != nil {
 		writeJSON(w, http.StatusOK, map[string]any{"available": false, "error": err.Error(), "containers": 0, "images": 0, "networks": 0, "volumes": 0})
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"available": true, "summary": summary, "diskUsage": df})
+}
+
+func dockerSummaryResponseForServer(ctx context.Context, server store.Server, includeDisk bool) (adapter.DockerSummary, any, error) {
+	if !includeDisk {
+		summary, err := adapter.DockerSummaryForServer(ctx, server)
+		return summary, nil, err
+	}
+	var (
+		summary adapter.DockerSummary
+		df      []adapter.DockerDiskUsage
+		err     error
+		wg      sync.WaitGroup
+	)
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		summary, err = adapter.DockerSummaryForServer(ctx, server)
+	}()
+	go func() {
+		defer wg.Done()
+		df, _ = adapter.DockerSystemDFForServer(ctx, server)
+	}()
+	wg.Wait()
+	return summary, df, err
+}
+
+func dockerSummaryResponseForHost(ctx context.Context, host string, includeDisk bool) (adapter.DockerSummary, any, error) {
+	if !includeDisk {
+		summary, err := adapter.DockerSummaryForHost(ctx, host)
+		return summary, nil, err
+	}
+	var (
+		summary adapter.DockerSummary
+		df      []adapter.DockerDiskUsage
+		err     error
+		wg      sync.WaitGroup
+	)
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		summary, err = adapter.DockerSummaryForHost(ctx, host)
+	}()
+	go func() {
+		defer wg.Done()
+		df, _ = adapter.DockerSystemDF(ctx, host)
+	}()
+	wg.Wait()
+	return summary, df, err
 }
 
 func (a *API) containers(w http.ResponseWriter, r *http.Request) {

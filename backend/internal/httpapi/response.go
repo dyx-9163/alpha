@@ -93,6 +93,21 @@ func queryInt(r *http.Request, key string, fallback int) int {
 	return parsed
 }
 
+func queryBool(r *http.Request, key string, fallback bool) bool {
+	value := strings.TrimSpace(strings.ToLower(r.URL.Query().Get(key)))
+	if value == "" {
+		return fallback
+	}
+	switch value {
+	case "1", "true", "yes", "y", "on":
+		return true
+	case "0", "false", "no", "n", "off":
+		return false
+	default:
+		return fallback
+	}
+}
+
 func bearerToken(r *http.Request) string {
 	header := r.Header.Get("Authorization")
 	if strings.HasPrefix(header, "Bearer ") {

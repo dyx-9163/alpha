@@ -7,8 +7,8 @@
       </div>
       <div class="head-actions">
         <ServerSelector v-model="selectedServerId" :servers="dockerServers" :placeholder="t('containers.selectDockerHost')" class="toolbar-control" />
-        <el-button @click="load">{{ t('containers.checkHost') }}</el-button>
-        <el-button @click="loadActive">{{ t('common.refresh') }}</el-button>
+        <el-button :loading="loading" @click="load(true)">{{ t('containers.checkHost') }}</el-button>
+        <el-button :loading="loading" @click="loadActive(true)">{{ t('common.refresh') }}</el-button>
         <el-tooltip v-if="selectedDockerInstance" :content="deniedText" :disabled="canManageApps" placement="top">
           <span>
             <el-button type="danger" plain :disabled="!canManageApps" @click="openDockerUninstall">{{ t('common.uninstall') }}</el-button>
@@ -31,7 +31,7 @@
     <el-alert v-if="error" :title="errorTitle" :description="error" type="warning" :closable="false" show-icon />
     <div class="muted-strip" v-if="!summary.available">{{ t('containers.disabledHint') }}</div>
 
-    <div class="workspace-card containers-main">
+    <div class="workspace-card containers-main" v-loading="loading">
       <template v-if="tab === 'overview'">
         <MetricGrid :items="metrics" />
 
@@ -152,7 +152,7 @@
               <el-tooltip :content="runtimeAgentUninstallDisabledReason" :disabled="!runtimeAgentUninstallDisabledReason" placement="top">
                 <span><el-button size="small" type="danger" plain :disabled="Boolean(runtimeAgentUninstallDisabledReason)" @click="uninstallAifarRuntimeAgent">{{ t('containers.uninstallAgent') }}</el-button></span>
               </el-tooltip>
-              <el-button size="small" @click="loadAifarRuntime">{{ t('common.refresh') }}</el-button>
+              <el-button size="small" :loading="loading" @click="loadAifarRuntime(true)">{{ t('common.refresh') }}</el-button>
             </div>
           </div>
           <el-alert
@@ -538,6 +538,12 @@ const appInstances = ref<AppInstance[]>([])
 const appSettings = ref<{ maxRequestBodyBytes?: number }>({})
 const summary = ref<DockerSummaryResponse>({})
 const collection = ref<any[]>([])
+const loadingCount = ref(0)
+const loading = computed(() => loadingCount.value > 0)
+const pageReady = ref(false)
+const summaryCache = ref<Record<string, DockerSummaryResponse>>({})
+const collectionCache = ref<Record<string, any[]>>({})
+const runtimeCache = ref<Record<string, AifarRuntimeResponse>>({})
 const selectedContainerRows = ref<any[]>([])
 const error = ref('')
 const tab = ref('overview')
@@ -771,6 +777,31 @@ function targetQuery() {
   return ''
 }
 
+function cacheScope() {
+  return selectedServerId.value || 'none'
+}
+
+function summaryCacheKey(includeDisk: boolean) {
+  return `${cacheScope()}:summary:${includeDisk ? 'disk' : 'base'}`
+}
+
+function collectionCacheKey(kind = tab.value) {
+  return `${cacheScope()}:collection:${kind}`
+}
+
+function runtimeCacheKey() {
+  return `${cacheScope()}:aifar-runtime`
+}
+
+async function withLoading<T>(fn: () => Promise<T>) {
+  loadingCount.value += 1
+  try {
+    return await fn()
+  } finally {
+    loadingCount.value = Math.max(0, loadingCount.value - 1)
+  }
+}
+
 function serverLabel(server: any) {
   if (!server) {
     return ''
@@ -779,38 +810,72 @@ function serverLabel(server: any) {
 }
 
 async function loadServers() {
-  servers.value = asArray(await apiGet<any[] | null>('/servers').catch(() => []))
-  appInstances.value = asArray(await apiGet<AppInstance[] | null>('/apps/instances').catch(() => []))
-  appSettings.value = await apiGet<{ maxRequestBodyBytes?: number }>('/settings').catch(() => ({}))
+  const [serverRows, instanceRows, settings] = await Promise.all([
+    apiGet<any[] | null>('/servers').catch(() => []),
+    apiGet<AppInstance[] | null>('/apps/instances').catch(() => []),
+    apiGet<{ maxRequestBodyBytes?: number }>('/settings').catch(() => ({}))
+  ])
+  servers.value = asArray(serverRows)
+  appInstances.value = asArray(instanceRows)
+  appSettings.value = settings
   if (!selectedServerId.value || !dockerServers.value.some((server) => server.id === selectedServerId.value)) {
     selectedServerId.value = dockerServers.value[0]?.id ?? ''
   }
 }
 
-async function load() {
+async function load(force = false) {
+  return withLoading(async () => {
+    error.value = ''
+    const query = targetQuery()
+    if (!query) {
+      summary.value = { available: false }
+      collection.value = []
+      selectedContainerRows.value = []
+      return
+    }
+    const includeDisk = tab.value === 'overview'
+    if (includeDisk) {
+      await loadSummary(true, force)
+      return
+    }
+    await Promise.all([loadSummary(false, force), loadCollection(force)])
+  })
+}
+
+async function loadSummary(includeDisk = false, force = false) {
   error.value = ''
   const query = targetQuery()
   if (!query) {
     summary.value = { available: false }
-    collection.value = []
-    selectedContainerRows.value = []
     return
   }
-  summary.value = await apiGet<DockerSummaryResponse>(`/containers/summary?${query}`).catch((err) => {
+  const key = summaryCacheKey(includeDisk)
+  const diskKey = summaryCacheKey(true)
+  if (!force) {
+    const cached = summaryCache.value[key] ?? (!includeDisk ? summaryCache.value[diskKey] : undefined)
+    if (cached) {
+      summary.value = cached
+      return
+    }
+  }
+  const endpoint = `/containers/summary?${query}${includeDisk ? '&includeDisk=1' : ''}`
+  const next = await apiGet<DockerSummaryResponse>(endpoint).catch((err) => {
     error.value = err.message
     return { available: false, error: err.message }
   })
-  if (summary.value.available === false && summary.value.error) error.value = summary.value.error
-  if (tab.value !== 'overview') {
-    await loadCollection()
+  summary.value = next
+  summaryCache.value = { ...summaryCache.value, [key]: next }
+  if (includeDisk) {
+    summaryCache.value = { ...summaryCache.value, [summaryCacheKey(false)]: next }
   }
+  if (next.available === false && next.error) error.value = next.error
 }
 
-async function loadCollection() {
+async function loadCollection(force = false) {
   if (tab.value === 'aifar-runtime') {
     collection.value = []
     selectedContainerRows.value = []
-    await loadAifarRuntime()
+    await loadAifarRuntime(force)
     return
   }
   if (tab.value === 'overview' || tab.value === 'registry' || tab.value === 'settings') {
@@ -825,37 +890,55 @@ async function loadCollection() {
     return
   }
   selectedContainerRows.value = []
-  collection.value = asArray(await apiGet(`/containers?kind=${tab.value}&${query}`).catch((err) => {
+  const key = collectionCacheKey()
+  if (!force && collectionCache.value[key]) {
+    collection.value = collectionCache.value[key]
+    return
+  }
+  const next = asArray(await apiGet(`/containers?kind=${tab.value}&${query}`).catch((err) => {
     error.value = err.message
     return []
   }))
+  collection.value = next
+  collectionCache.value = { ...collectionCache.value, [key]: next }
 }
 
-async function loadAifarRuntime() {
-  const query = targetQuery()
-  if (!query) {
-    aifarRuntime.value = { runtimeStatus: 'unknown', agent: { status: 'unknown' }, instances: [], services: [], pods: [], ingress: [], warnings: [] }
-    selectedRuntimeInstanceId.value = ''
-    return
-  }
-  aifarRuntime.value = await apiGet<AifarRuntimeResponse>(`/containers/aifar/runtime?${query}`).catch((err) => {
-    error.value = err.message
-    return { runtimeStatus: 'degraded', agent: { status: 'missing', error: err.message }, instances: [], services: [], pods: [], ingress: [], warnings: [err.message] }
+async function loadAifarRuntime(force = false) {
+  return withLoading(async () => {
+    const query = targetQuery()
+    if (!query) {
+      aifarRuntime.value = { runtimeStatus: 'unknown', agent: { status: 'unknown' }, instances: [], services: [], pods: [], ingress: [], warnings: [] }
+      selectedRuntimeInstanceId.value = ''
+      return
+    }
+    const key = runtimeCacheKey()
+    if (!force && runtimeCache.value[key]) {
+      aifarRuntime.value = runtimeCache.value[key]
+      return
+    }
+    const next = await apiGet<AifarRuntimeResponse>(`/containers/aifar/runtime?${query}`).catch((err) => {
+      error.value = err.message
+      return { runtimeStatus: 'degraded', agent: { status: 'missing', error: err.message }, instances: [], services: [], pods: [], ingress: [], warnings: [err.message] }
+    })
+    aifarRuntime.value = next
+    runtimeCache.value = { ...runtimeCache.value, [key]: next }
+    const instances = asArray<AifarRuntimeInstance>(aifarRuntime.value.instances)
+    if (!instances.some((instance) => instance.id === selectedRuntimeInstanceId.value)) {
+      selectedRuntimeInstanceId.value = instances.find((instance) => !instance.legacy)?.id ?? instances[0]?.id ?? ''
+    }
   })
-  const instances = asArray<AifarRuntimeInstance>(aifarRuntime.value.instances)
-  if (!instances.some((instance) => instance.id === selectedRuntimeInstanceId.value)) {
-    selectedRuntimeInstanceId.value = instances.find((instance) => !instance.legacy)?.id ?? instances[0]?.id ?? ''
-  }
 }
 
-async function loadActive() {
-  if (tab.value === 'overview') {
-    await load()
-  } else if (tab.value === 'aifar-runtime') {
-    await loadAifarRuntime()
-  } else {
-    await loadCollection()
-  }
+async function loadActive(force = false) {
+  return withLoading(async () => {
+    if (tab.value === 'overview') {
+      await loadSummary(true, force)
+    } else if (tab.value === 'aifar-runtime') {
+      await loadAifarRuntime(force)
+    } else {
+      await loadCollection(force)
+    }
+  })
 }
 
 async function runContainerAction(id: string, action: string) {
@@ -877,7 +960,9 @@ async function runContainerAction(id: string, action: string) {
   try {
     await apiPost(`/containers/${encodeURIComponent(id)}/${action}?${query}`)
     ElMessage.success(t('containers.actionAccepted'))
-    setTimeout(loadCollection, 800)
+    setTimeout(() => {
+      void load(true)
+    }, 800)
   } catch (err) {
     ElMessage.error(err instanceof Error ? err.message : t('containers.actionFailed'))
   }
@@ -914,7 +999,9 @@ async function runContainerBatchAction(action: string, rows = selectedContainerR
     await apiPost(`/containers/actions?${query}`, { action, ids })
     ElMessage.success(t('containers.batchActionAccepted'))
     selectedContainerRows.value = []
-    setTimeout(loadCollection, 800)
+    setTimeout(() => {
+      void load(true)
+    }, 800)
   } catch (err) {
     ElMessage.error(err instanceof Error ? err.message : t('containers.actionFailed'))
   }
@@ -947,7 +1034,9 @@ async function deleteImage(row: any) {
   try {
     await apiPost(`/containers/images/remove?${query}`, { id })
     ElMessage.success(t('containers.imageRemoveAccepted'))
-    setTimeout(loadCollection, 800)
+    setTimeout(() => {
+      void load(true)
+    }, 800)
   } catch (err) {
     ElMessage.error(err instanceof Error ? err.message : t('containers.imageRemoveFailed'))
   }
@@ -1433,7 +1522,7 @@ async function submitRuntimeConfig() {
     runtimeConfigVisible.value = false
     ElMessage.success(t('containers.runtimeConfigApplyStarted'))
     void router.push({ path: '/tasks', query: { taskId: result.taskId } })
-    void loadAifarRuntime()
+    void loadAifarRuntime(true)
   } catch (err) {
     ElMessage.error(err instanceof Error ? err.message : t('containers.runtimeActionFailed'))
   } finally {
@@ -1466,6 +1555,7 @@ async function reconcileAifarRuntime() {
     const result = await apiPost<{ taskId: string }>(`/containers/aifar/runtime/reconcile?${query}`, { instanceId })
     ElMessage.success(t('containers.runtimeActionAccepted'))
     void router.push({ path: '/tasks', query: { taskId: result.taskId } })
+    void loadAifarRuntime(true)
   } catch (err) {
     ElMessage.error(err instanceof Error ? err.message : t('containers.runtimeActionFailed'))
   }
@@ -1496,7 +1586,7 @@ async function cleanupAifarRuntimeStale() {
     const result = await apiPost<{ taskId: string }>(`/containers/aifar/runtime/cleanup-stale?${query}`, { instanceId })
     ElMessage.success(t('containers.runtimeActionAccepted'))
     void router.push({ path: '/tasks', query: { taskId: result.taskId } })
-    void loadAifarRuntime()
+    void loadAifarRuntime(true)
   } catch (err) {
     ElMessage.error(err instanceof Error ? err.message : t('containers.runtimeActionFailed'))
   }
@@ -1527,7 +1617,7 @@ async function uninstallAifarRuntimeAgent() {
     const result = await apiPost<{ taskId: string }>(`/containers/aifar/runtime/uninstall-agent?${query}`, { instanceId })
     ElMessage.success(t('containers.runtimeActionAccepted'))
     void router.push({ path: '/tasks', query: { taskId: result.taskId } })
-    void loadAifarRuntime()
+    void loadAifarRuntime(true)
   } catch (err) {
     ElMessage.error(err instanceof Error ? err.message : t('containers.runtimeActionFailed'))
   }
@@ -1583,7 +1673,7 @@ async function submitAifarServiceInstall() {
     serviceInstallSelection.value = []
     ElMessage.success(t('containers.serviceInstallAccepted'))
     void router.push({ path: '/tasks', query: { taskId: result.taskId } })
-    void loadAifarRuntime()
+    void loadAifarRuntime(true)
   } catch (err) {
     ElMessage.error(err instanceof Error ? err.message : t('containers.serviceInstallFailed'))
   } finally {
@@ -1603,7 +1693,7 @@ async function scaleOutAifarService(service: string) {
     return
   }
   await submitAifarScaleOut(service, instanceId, () => {
-    void loadAifarRuntime()
+    void loadAifarRuntime(true)
   })
 }
 
@@ -1709,13 +1799,20 @@ async function confirmDockerUninstall(password: string) {
   }
 }
 
-watch(tab, loadActive)
+watch(tab, () => {
+  void loadActive(false)
+})
 watch([aifarUpdateService, aifarUpdateMode], () => {
   aifarArtifactFile.value = null
 })
-watch(selectedServerId, load)
+watch(selectedServerId, () => {
+  if (pageReady.value) {
+    void load(true)
+  }
+})
 onMounted(async () => {
   await loadServers()
+  pageReady.value = true
   await load()
 })
 </script>

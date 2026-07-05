@@ -781,3 +781,5 @@
 - 结论：除 agent 内部 `Apply`/`Resync`/`Remove` 串行化外，又补上操作链路缺口：`ScaleOut` 在执行 autoscale 脚本前会上传当前 `aifar-agent-linux-amd64`、安装到目标机 `/usr/local/bin/aifar-agent`、重启并等待 runtime-v2 特征可用，避免目标机继续运行旧 agent 导致扩容失败。
 - 问题：用户截图显示 file 服务行 Revision/Image 为 `<nil>`，下面出现 `aifar-pod-admin-file--nil--r1/r2` 残留。
 - 结论：原因是旧扩容/状态聚合链路把 metadata 或 Docker label 缺失值当成字符串 `<nil>`/`<no value>` 写入 revision，随后生成了 `--nil--` 控制面 Pod/Endpoint 记录；已清洗无效 revision，并让 Runtime 服务汇总优先使用真实 running Pod，残留只在 Pod 列表中标记为 stale。
+- 问题：用户反馈容器页几个页签加载很慢。
+- 结论：容器摘要接口默认不再执行较慢的 `docker system df`，仅概览请求 `includeDisk=1` 时查询磁盘并与 summary 并发；前端容器页按服务器和页签缓存列表/AIFAR Runtime，普通切页复用缓存，刷新、检查主机和变更操作才强制重拉，减少重复 Docker 查询。
