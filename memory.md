@@ -905,3 +905,5 @@
 - 结论：已从当前工作状态创建并切换到 `codex/aifar-runtime` 分支，后续 AIFAR Runtime 的设计和实现先集中在该分支推进。
 - 问题：用户询问之前分支未提交的代码去了哪里。
 - 结论：未提交改动没有丢失；它们属于 Git 工作区状态，不是某个分支上的提交。当前已切回 `codex/aifar-runtime`，这些未提交改动都保留在该分支工作区中；原 `codex/aifar-agent-runtime-v2` 分支和新分支目前指向同一个基准提交。
+- 问题：用户反馈服务下线后再扩容其他服务时，agent 误启动已下线的 file Pod，导致扩容失败。
+- 结论：根因是 autoscale-out 脚本在生成全量 RuntimeSpec 时，缺少控制面 desiredReplicas 快照，遇到下线服务会按 Docker 当前数量/默认 1 误恢复。已改为后端把完整 desiredReplicas 传给脚本，脚本优先使用控制面快照，扩容完成后也不会用残留 endpoint 反推已下线服务；补充测试覆盖 `file=0` 时扩容其他服务仍保持 0。
