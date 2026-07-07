@@ -3127,11 +3127,17 @@ onBeforeUnmount(() => {
 
 .runtime-workspace {
   display: flex;
-  flex: 1 1 0;
-  height: 100%;
+  flex: 1 1 auto;
+  height: auto;
   min-height: 0;
   flex-direction: column;
   gap: 10px;
+  overflow: visible;
+}
+
+.workspace-card.containers-main.is-runtime-logs .runtime-workspace {
+  flex: 1 1 0;
+  height: 100%;
   overflow: hidden;
 }
 
@@ -3156,11 +3162,16 @@ onBeforeUnmount(() => {
 }
 
 .runtime-resource-tabs {
-  flex: 1 1 0;
-  height: 100%;
+  flex: 1 1 auto;
+  height: auto;
   min-height: 0;
   display: flex;
   flex-direction: column;
+}
+
+.workspace-card.containers-main.is-runtime-logs .runtime-resource-tabs {
+  flex: 1 1 0;
+  height: 100%;
   overflow: hidden;
 }
 

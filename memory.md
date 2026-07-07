@@ -991,3 +991,5 @@
 - 结论：原因是此前只创建并挂载了 `/opt/aifar/logs`，但 Java 服务实际按镜像 WORKDIR 下的相对 `log/...` 写文件，web-vue3/Nginx 写 `/var/log/nginx`；已让 Runtime spec 同时把同一宿主机目录挂到 Java `WORKDIR/log` 和 web-vue3 `/var/log/nginx`，继续保留 `/opt/aifar/logs`，后续重建 Pod 后文件日志会落盘到该目录。
 - 问题：用户确认宿主机日志是否应该挂载到 `admin/runtime/logs` 下。
 - 结论：是的；AIFAR 实例安装根为 `/aifar/apps/admin` 时，模板中 `RUNTIME_DIR="$INSTALL_ROOT/runtime"`、`LOG_DIR="$RUNTIME_DIR/logs"`、`log_dir="$LOG_DIR/$service"`，所以宿主机 source 是 `/aifar/apps/admin/runtime/logs/<service>`；`/opt/aifar/logs` 等路径只是容器内 target。
+- 问题：用户反馈容器页切到 AIFAR Runtime 后内容区变成空白。
+- 结论：原因是日志页滚动修复把 `.runtime-workspace` 和 `.runtime-resource-tabs` 的 `flex: 1 1 0`、`height: 100%`、`overflow: hidden` 应用到了整个 AIFAR Runtime 页，普通页签在自适应高度父容器中被裁成 0 高度；已将这些高度锁定只限定到 `.containers-main.is-runtime-logs`，普通 AIFAR Runtime 页恢复自适应显示。
