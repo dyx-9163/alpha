@@ -943,3 +943,5 @@
 - 结论：已实现后端 `runtime-logs-snapshot`/`runtime-logs-batch` SSE、服务/Pod 多选过滤、Docker logs `--since/--timestamps` 增量采集和去重；前端日志页默认不加载全量日志，改为服务/Pod/级别/关键字选择集、暂停/自动滚动、有界缓冲和固定行高虚拟时间线；补充后端选择集与去重测试。
 - 问题：用户反馈日志清空后长时间没有新日志进入。
 - 结论：根因是清空只清前端 buffer，后端 SSE 仍沿用旧游标；同时后端首次增量去重基线来自整段 snapshot，重复内容日志可能被误判为旧日志。已改为清空时带 `since=当前时间` 重建日志 SSE，后端 snapshot 和 batch 均支持 since，并把去重基线限制在当前 overlap 时间窗口内。
+- 问题：用户要求在 AIFAR Runtime Deployments 列表增加缩容功能。
+- 结论：新增 `/api/v2/containers/aifar/services/{service}/scale-in`，后端按控制面当前 desiredReplicas 计算 `-1` 目标副本并复用 `ScaleService` 任务/审计链路；前端在 Deployment 操作列新增“缩容副本”，仅当期望副本数大于 1 时可用，缩到 0 仍要求使用“下线”。

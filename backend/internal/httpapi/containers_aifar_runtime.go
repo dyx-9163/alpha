@@ -791,6 +791,68 @@ func (a *API) aifarRuntimeScaleOut(w http.ResponseWriter, r *http.Request) {
 	respondTask(w, task, err)
 }
 
+func (a *API) aifarRuntimeScaleIn(w http.ResponseWriter, r *http.Request) {
+	lang := languageFromRequest(r)
+	service := strings.TrimSpace(chi.URLParam(r, "service"))
+	if service == "" {
+		writeError(w, http.StatusBadRequest, "AIFAR_SERVICE_REQUIRED", "AIFAR service is required", nil)
+		return
+	}
+	_, instance, ok := a.resolveAIFARRuntimeActionTarget(w, r)
+	if !ok {
+		return
+	}
+	module, ok := a.apps.Get(instance.App)
+	if !ok {
+		writeError(w, http.StatusNotFound, "APP_BACKEND_MODULE_MISSING", i18n.Text(lang, "api.appBackendMissing"), map[string]any{"app": instance.App})
+		return
+	}
+	scaler, ok := module.(registry.ServiceScaleModule)
+	if !ok {
+		writeError(w, http.StatusConflict, "AIFAR_SCALE_UNSUPPORTED", "AIFAR service scale is not supported", map[string]any{"app": instance.App})
+		return
+	}
+	actor := currentUser(r).Username
+	target := instance.ID + ":" + service
+	task, err := a.tasks.StartWithLanguage("aifar.scale.in", target, actor, lang, func(ctx context.Context, log worker.Logger) error {
+		current, err := a.store.GetAppInstance(instance.ID)
+		if err != nil {
+			return err
+		}
+		server, err := a.store.GetServer(current.ServerID, true)
+		if err != nil {
+			return err
+		}
+		currentDesired, err := a.currentAIFARServiceDesiredReplicas(current.ID, service)
+		if err != nil {
+			return err
+		}
+		if currentDesired <= 1 {
+			return fmt.Errorf("AIFAR service %s has %d desired replicas; use offline to scale to 0", service, currentDesired)
+		}
+		nextReplicas := currentDesired - 1
+		log.Info("scaling in AIFAR service %s for instance %s from %d to %d replicas", service, current.ID, currentDesired, nextReplicas)
+		return scaler.ScaleService(ctx, registry.ServiceScaleRequest{
+			Instance:    current,
+			Server:      server,
+			Language:    lang,
+			Actor:       actor,
+			ServiceName: service,
+			Replicas:    nextReplicas,
+			Reason:      "manual container runtime scale-in",
+		}, registry.RunContext{
+			Log: log,
+			TargetLog: func(target string) registry.Logger {
+				return log.Target(target)
+			},
+		})
+	})
+	if err == nil {
+		a.audit(r, "aifar.scale.in", target, "running", task.ID)
+	}
+	respondTask(w, task, err)
+}
+
 func (a *API) aifarRuntimeOfflineService(w http.ResponseWriter, r *http.Request) {
 	lang := languageFromRequest(r)
 	service := strings.TrimSpace(chi.URLParam(r, "service"))
@@ -843,6 +905,20 @@ func (a *API) aifarRuntimeOfflineService(w http.ResponseWriter, r *http.Request)
 		a.audit(r, "aifar.scale.offline", target, "running", task.ID)
 	}
 	respondTask(w, task, err)
+}
+
+func (a *API) currentAIFARServiceDesiredReplicas(instanceID, service string) (int, error) {
+	deployments, err := a.store.ListAIFARDeployments(instanceID)
+	if err != nil {
+		return 0, err
+	}
+	service = cleanRuntimeText(service)
+	for _, deployment := range deployments {
+		if deployment.ServiceName == service {
+			return deployment.DesiredReplicas, nil
+		}
+	}
+	return 0, fmt.Errorf("AIFAR service %s deployment was not found", service)
 }
 
 func (a *API) resolveAIFARRuntimeActionTarget(w http.ResponseWriter, r *http.Request) (store.Server, store.AppInstance, bool) {

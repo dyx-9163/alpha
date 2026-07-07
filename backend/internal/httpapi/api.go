@@ -121,6 +121,7 @@ func NewWithRealtime(cfg config.Config, s *store.Store, tasks *worker.Manager, e
 			r.Post("/containers/aifar/runtime/uninstall-agent", api.requirePermission(rbac.AppsManage, api.aifarRuntimeUninstallAgent))
 			r.Post("/containers/aifar/services/install", api.requirePermission(rbac.AppsManage, api.aifarRuntimeInstallServices))
 			r.Post("/containers/aifar/services/{service}/scale-out", api.requirePermission(rbac.AppsManage, api.aifarRuntimeScaleOut))
+			r.Post("/containers/aifar/services/{service}/scale-in", api.requirePermission(rbac.AppsManage, api.aifarRuntimeScaleIn))
 			r.Post("/containers/aifar/services/{service}/offline", api.requirePermission(rbac.AppsManage, api.aifarRuntimeOfflineService))
 			r.Post("/containers/actions", api.requirePermission(rbac.ContainersManage, api.containerBatchAction))
 			r.Post("/containers/images/remove", api.requirePermission(rbac.ContainersManage, api.containerImageRemove))

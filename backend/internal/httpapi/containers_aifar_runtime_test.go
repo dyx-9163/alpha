@@ -294,7 +294,7 @@ func TestRuntimeIngressStatusUsesAgentListeners(t *testing.T) {
 	}
 }
 
-func TestAIFARRuntimeScaleOutRequiresAgent(t *testing.T) {
+func TestAIFARRuntimeScaleActionsRequireAgent(t *testing.T) {
 	api, db, secret := newAuthzTestAPI(t)
 	dockerAPI := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/containers/json" {
@@ -307,18 +307,48 @@ func TestAIFARRuntimeScaleOutRequiresAgent(t *testing.T) {
 	server, instance := seedAIFARRuntimeFixture(t, db, dockerAPI.URL)
 	token := issueTestToken(t, db, secret, "owner", "owner")
 
-	req := httptest.NewRequest(http.MethodPost, "/api/v2/containers/aifar/services/permission/scale-out?serverId="+server.ID, strings.NewReader(`{"instanceId":"`+instance.ID+`"}`))
-	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("Content-Type", "application/json")
-	rec := httptest.NewRecorder()
+	for _, path := range []string{
+		"/api/v2/containers/aifar/services/permission/scale-out",
+		"/api/v2/containers/aifar/services/permission/scale-in",
+	} {
+		req := httptest.NewRequest(http.MethodPost, path+"?serverId="+server.ID, strings.NewReader(`{"instanceId":"`+instance.ID+`"}`))
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
 
-	api.Router().ServeHTTP(rec, req)
+		api.Router().ServeHTTP(rec, req)
 
-	if rec.Code != http.StatusConflict {
-		t.Fatalf("expected 409, got %d body=%s", rec.Code, rec.Body.String())
+		if rec.Code != http.StatusConflict {
+			t.Fatalf("%s: expected 409, got %d body=%s", path, rec.Code, rec.Body.String())
+		}
+		if !strings.Contains(rec.Body.String(), "AIFAR_AGENT_REQUIRED") {
+			t.Fatalf("%s: expected agent-required error, got %s", path, rec.Body.String())
+		}
 	}
-	if !strings.Contains(rec.Body.String(), "AIFAR_AGENT_REQUIRED") {
-		t.Fatalf("expected agent-required error, got %s", rec.Body.String())
+}
+
+func TestCurrentAIFARServiceDesiredReplicasReadsDeployment(t *testing.T) {
+	api, db, _ := newAuthzTestAPI(t)
+	_, instance := seedAIFARRuntimeFixture(t, db, "unix:///var/run/docker.sock")
+	if _, err := db.SaveAIFARDeployment(store.AIFARDeployment{
+		InstanceID:      instance.ID,
+		ServiceName:     "permission",
+		DesiredReplicas: 3,
+		CurrentRevision: "rev-1",
+		Status:          "ready",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := api.currentAIFARServiceDesiredReplicas(instance.ID, "permission")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != 3 {
+		t.Fatalf("expected desired replicas 3, got %d", got)
+	}
+	if _, err := api.currentAIFARServiceDesiredReplicas(instance.ID, "missing"); err == nil {
+		t.Fatal("expected missing deployment error")
 	}
 }
 

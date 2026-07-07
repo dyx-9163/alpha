@@ -192,7 +192,7 @@
                     </el-table-column>
                     <el-table-column prop="podRevision" :label="t('containers.revision')" min-width="180" show-overflow-tooltip />
                     <el-table-column prop="image" :label="t('containers.image')" min-width="240" show-overflow-tooltip />
-                    <el-table-column :label="t('common.operation')" width="300" fixed="right">
+                    <el-table-column :label="t('common.operation')" width="390" fixed="right">
                       <template #default="{ row }">
                         <div class="row-actions">
                           <el-tooltip :content="aifarRuntimeActionDisabledReason" :disabled="!aifarRuntimeActionDisabledReason" placement="top">
@@ -200,6 +200,9 @@
                           </el-tooltip>
                           <el-tooltip :content="aifarRuntimeActionDisabledReason" :disabled="!aifarRuntimeActionDisabledReason" placement="top">
                             <span><el-button size="small" :disabled="Boolean(aifarRuntimeActionDisabledReason)" @click="scaleOutAifarService(row.serviceName)">{{ t('containers.scaleOut') }}</el-button></span>
+                          </el-tooltip>
+                          <el-tooltip :content="aifarRuntimeScaleInDisabledReason(row)" :disabled="!aifarRuntimeScaleInDisabledReason(row)" placement="top">
+                            <span><el-button size="small" plain :disabled="Boolean(aifarRuntimeScaleInDisabledReason(row))" @click="scaleInAifarDeployment(row)">{{ t('containers.scaleIn') }}</el-button></span>
                           </el-tooltip>
                           <el-tooltip :content="aifarRuntimeOfflineDisabledReason(runtimeServiceForDeployment(row))" :disabled="!aifarRuntimeOfflineDisabledReason(runtimeServiceForDeployment(row))" placement="top">
                             <span><el-button size="small" type="danger" plain :disabled="Boolean(aifarRuntimeOfflineDisabledReason(runtimeServiceForDeployment(row)))" @click="offlineAifarService(runtimeServiceForDeployment(row))">{{ t('containers.offlineDeployment') }}</el-button></span>
@@ -2541,6 +2544,31 @@ async function scaleOutAifarService(service: string) {
   })
 }
 
+function aifarRuntimeScaleInDisabledReason(row: AifarRuntimeDeployment) {
+  if (aifarRuntimeActionDisabledReason.value) return aifarRuntimeActionDisabledReason.value
+  const desired = Number(row.desiredReplicas ?? 0)
+  if (!Number.isFinite(desired) || desired <= 0) return t('containers.serviceAlreadyOffline')
+  if (desired <= 1) return t('containers.serviceScaleInMinimum')
+  return ''
+}
+
+async function scaleInAifarDeployment(row: AifarRuntimeDeployment) {
+  const reason = aifarRuntimeScaleInDisabledReason(row)
+  if (reason) {
+    ElMessage.warning(reason)
+    return
+  }
+  const instanceId = selectedRuntimeInstance.value?.id
+  if (!instanceId) {
+    ElMessage.warning(t('containers.selectAifarInstance'))
+    return
+  }
+  const currentReplicas = Number(row.desiredReplicas ?? 0)
+  await submitAifarScaleIn(row.serviceName, instanceId, currentReplicas, currentReplicas - 1, () => {
+    void loadAifarRuntime(true)
+  })
+}
+
 function aifarRuntimeOfflineDisabledReason(row: AifarRuntimeService) {
   if (aifarRuntimeActionDisabledReason.value) return aifarRuntimeActionDisabledReason.value
   if (Number(row.desiredReplicas || 0) === 0) return t('containers.serviceAlreadyOffline')
@@ -2582,6 +2610,31 @@ async function submitAifarScaleOut(service: string, instanceId: string, afterSub
     const result = await apiPost<{ taskId: string }>(`/containers/aifar/services/${encodeURIComponent(service)}/scale-out?${query}`, { instanceId })
     ElMessage.success(t('containers.runtimeActionAccepted'))
     trackTask(result.taskId, `${t('containers.scaleOut')} ${service}`)
+    afterSubmitted?.()
+  } catch (err) {
+    ElMessage.error(err instanceof Error ? err.message : t('containers.runtimeActionFailed'))
+  }
+}
+
+async function submitAifarScaleIn(service: string, instanceId: string, currentReplicas: number, nextReplicas: number, afterSubmitted?: () => void) {
+  try {
+    await ElMessageBox.confirm(t('containers.confirmScaleIn', { service, current: currentReplicas, next: nextReplicas }), t('containers.scaleIn'), {
+      type: 'warning',
+      confirmButtonText: t('containers.scaleIn'),
+      cancelButtonText: t('common.cancel')
+    })
+  } catch {
+    return
+  }
+  const query = targetQuery()
+  if (!query) {
+    ElMessage.warning(t('containers.selectDockerHost'))
+    return
+  }
+  try {
+    const result = await apiPost<{ taskId: string }>(`/containers/aifar/services/${encodeURIComponent(service)}/scale-in?${query}`, { instanceId })
+    ElMessage.success(t('containers.runtimeActionAccepted'))
+    trackTask(result.taskId, `${t('containers.scaleIn')} ${service}`)
     afterSubmitted?.()
   } catch (err) {
     ElMessage.error(err instanceof Error ? err.message : t('containers.runtimeActionFailed'))
