@@ -921,3 +921,5 @@
 - 结论：已完成第一版企业级实时控制面骨架：后端新增 collector 定时采集服务器、Docker summary、AIFAR Runtime 控制面摘要并写入 `status_snapshots`/`collector_runs`，新增全局 realtime Hub、`/api/v2/events` SSE 和快照查询接口，任务状态也进入全局事件流；前端新增全局实时连接状态条和 realtime Pinia store，容器页可响应 Docker/AIFAR Runtime 事件自动刷新；`config/defaults.env` 新增采集间隔配置；`pnpm web:build`、`pnpm test`、`git diff --check` 通过。
 - 问题：用户要求把本轮实时采集改造代码提交到本地仓库。
 - 结论：已在 `codex/status-collector-realtime` 分支创建本地提交，提交内容包含后端 collector/realtime/status snapshot、前端实时状态条和事件驱动刷新，以及本轮配置与记忆更新；未推送远端。
+- 问题：用户强调后续代码必须提交到本地仓库，并询问多实例 Docker 容器日志缺少统一管理时应采用什么方案。
+- 结论：后续凡涉及代码、配置或文档落盘变更，完成验证后都要提交到当前本地分支；多实例日志建议建设独立 Logging Plane，容器统一打 AIFAR 标准 labels，由每台服务器的 Fluent Bit/Vector 采集 Docker json-file 日志并写入 Loki/OpenSearch，AIFAR 后端只做查询/尾随代理、权限过滤、任务/实例关联和元数据落库，不把完整日志写入 SQLite。
