@@ -999,3 +999,5 @@
 - 结论：AIFAR Pod 属于 agent 期望态管理，普通 Docker 容器页不再展示/更新 AIFAR Runtime 容器；AIFAR Runtime 的 Pods 页新增“启动/恢复 Pods”和 Pod 日志入口，顶部“重建入口”改为“同步运行时”。后端 agent reconcile 会校正已有 Pod restart policy，并在发现期望 Pod 存在但停止时执行 `docker start`、等待健康、刷新 endpoint；更新入口保留在 Runtime Deployment/批量包层，不再从普通容器行反推发布单元。
 - 问题：用户询问如何重新生成 `aifar-agent-linux-amd64`。
 - 结论：仓库脚本 `pnpm backend:build` 会调用 `scripts/build-backend.mjs` 同时生成 server 与 agent，默认输出到 `bin/aifar-agent-linux-amd64`；如果要发布包形态，运行 `pnpm package` 会输出到 `deploy/bin` 并暂存到 `deploy/deployment`。只打 agent 可在 `backend/` 下设置 `GOOS=linux`、`GOARCH=amd64` 后执行 `go build -buildvcs=false -o ..\bin\aifar-agent-linux-amd64 .\cmd\aifar-agent`。
+- 问题：用户反馈 IDE 推送 GitHub 时出现 `Recv failure: Connection was reset`，询问原因。
+- 结论：本地分支 `codex/status-collector-realtime` 工作区干净、比远端 ahead 6；远端为 GitHub HTTPS。该报错表示推送过程中 HTTPS/TCP 连接被重置，通常是网络、代理、VPN、防火墙或 GitHub 连接临时中断，不是代码、认证或分支权限错误。
