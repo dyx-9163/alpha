@@ -79,24 +79,33 @@ onMounted(() => {
 
 <style scoped>
 .global-task-progress {
-  flex: 0 0 auto;
+  position: fixed;
+  top: 12px;
+  right: 14px;
+  z-index: 2060;
   display: grid;
-  grid-template-columns: minmax(220px, auto) minmax(160px, 1fr) 32px 32px;
+  grid-template-columns: minmax(0, 1fr) 28px 28px;
   align-items: center;
-  gap: 10px;
-  width: 100%;
-  min-height: 42px;
-  padding: 7px 12px;
-  border-bottom: 1px solid var(--aifar-border);
-  background: rgba(255, 255, 255, .96);
+  gap: 8px;
+  width: min(440px, calc(100vw - var(--aifar-sidebar-width) - 28px));
+  min-height: 72px;
+  padding: 12px;
+  border: 1px solid rgba(217, 226, 239, .92);
+  border-radius: var(--aifar-radius-lg);
+  background: rgba(255, 255, 255, .98);
+  box-shadow: 0 14px 36px rgba(15, 35, 68, .18), 0 4px 12px rgba(15, 35, 68, .08);
   cursor: pointer;
+  backdrop-filter: blur(10px);
 }
 
 .global-task-progress:hover {
   background: #fff;
+  border-color: #b9d6ff;
+  box-shadow: 0 18px 40px rgba(15, 35, 68, .2), 0 4px 14px rgba(22, 119, 255, .12);
 }
 
 .task-main {
+  grid-column: 1;
   min-width: 0;
   display: flex;
   align-items: center;
@@ -130,6 +139,8 @@ onMounted(() => {
 }
 
 .task-progress {
+  grid-column: 1 / -1;
+  grid-row: 2;
   min-width: 0;
 }
 
@@ -147,17 +158,15 @@ onMounted(() => {
 .global-task-progress-enter-from,
 .global-task-progress-leave-to {
   opacity: 0;
-  transform: translateY(-6px);
+  transform: translateY(-6px) translateX(10px);
 }
 
 @media (max-width: 720px) {
   .global-task-progress {
-    grid-template-columns: minmax(0, 1fr) 28px 28px;
-  }
-
-  .task-progress {
-    grid-column: 1 / -1;
-    grid-row: 2;
+    top: 10px;
+    right: 10px;
+    left: 10px;
+    width: auto;
   }
 }
 </style>
