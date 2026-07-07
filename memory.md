@@ -927,3 +927,5 @@
 - 结论：已完成第一阶段统一日志入口：Runtime agent 创建 Pod 容器时新增 `aifar.deployment` 标准 label；后端新增 `GET /api/v2/containers/aifar/runtime/logs`，按 server/instance/service/pod 聚合读取 AIFAR Runtime Pod 的 Docker logs，返回 Pod 分组和局部采集错误；前端 AIFAR Runtime 新增“日志”资源页签，支持按服务筛选、tail 行数控制和 Pod 分组展示。`go test ./internal/httpapi ./internal/runtimeagent`、`pnpm web:build`、`pnpm test`、`git diff --check` 通过。
 - 问题：用户要求检查当前日志统一管理功能是否完成。
 - 结论：检查确认当前分支第一阶段功能已完成并通过验证：后端路由与聚合接口、agent 标准日志 label、前端 AIFAR Runtime 日志页签、中英文文案和关键单测均存在；本轮复跑 `pnpm test`、`pnpm web:build` 和 `git diff --check` 通过。外部日志平面如 Fluent Bit/Vector + Loki/OpenSearch 的持久化采集、保留策略和告警属于下一阶段，尚未实现。
+- 问题：用户询问现在是否需要完整的企业级日志平台。
+- 结论：当前不建议一次性建设完整 ELK/全量日志平台；更适合先保持现有 Runtime Docker logs 聚合入口，并预留标准 label、查询代理和权限过滤。若进入多服务器生产、需要跨实例检索、容器重启后追溯、日志保留合规或告警，再推进轻量 Logging Plane：Vector/Fluent Bit 采集到 Loki/OpenSearch，AIFAR 只做元数据关联和查询代理，不把完整日志写入 SQLite。
