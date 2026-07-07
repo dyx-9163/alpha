@@ -975,3 +975,5 @@
 - 结论：本次日志自动刷新修复只改面板后端 `aifar-server` 的 Docker 日志读取与 SSE 推送链路，不涉及 `aifar-agent`/Runtime agent 二进制；只需重建并重启面板后端。若目标机尚未部署此前 agent/runtime 相关功能变更，再另行更新 agent。
 - 问题：用户反馈 AIFAR Runtime 日志页动态刷新后仍使用外层页面滚动条，应该改为日志窗口内部滚动。
 - 结论：已把容器页 AIFAR Runtime 日志页签改为专用内部滚动布局：外层 workspace 在日志页隐藏溢出，Runtime tabs/content/panel 保持 flex 高度链路，日志虚拟列表固定 32px 行高并使用内部纵向/横向滚动；`pnpm web:build` 和 `git diff --check` 通过。
+- 问题：用户询问为什么 AIFAR Runtime 日志页只有 oauth 模块日志在变动，其他模块没有。
+- 结论：当前日志页是“选择集”模型，服务筛选只选中 `oauth` 时后端 SSE 只订阅 oauth 对应 Pod；同时级别筛选若为 `ERROR`，其他服务的 INFO/WARN 会被前端过滤。要看多服务日志需要在服务/POD 选择器中加入多个服务，或后续增加“全部运行服务/异常服务”快捷选择。
