@@ -971,3 +971,5 @@
 - 结论：已生成 `outputs/algeria-migration-plan-en.docx`，保留原计划结构和两张表，英文版明确当前 DNS 只做核验、MinIO 为双单节点 bucket replication；DOCX 结构检查通过，当前环境缺少 LibreOffice/soffice，无法执行页面渲染 QA。
 - 问题：用户反馈 AIFAR Runtime 日志页在本地开发环境仍没有自动刷新。
 - 结论：原 SSE 后端仍是周期性 `docker logs` 拉取，不是真正的后端增量流。已改为 Runtime 日志 SSE 启动多 Pod `docker logs --follow` 扇入流，覆盖 Docker API、SSH 和本机 CLI 通道，并保留 snapshot overlap 去重；`go test ./...` 和 `git diff --check` 通过。
+- 问题：用户询问本次 Runtime 日志实时修复是否需要重新构建并部署 `aifar-agent-linux-amd64` 到服务端。
+- 结论：本次日志自动刷新修复只改面板后端 `aifar-server` 的 Docker 日志读取与 SSE 推送链路，不涉及 `aifar-agent`/Runtime agent 二进制；只需重建并重启面板后端。若目标机尚未部署此前 agent/runtime 相关功能变更，再另行更新 agent。
