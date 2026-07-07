@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"time"
 
 	"aifar-deployment/backend/internal/store"
 )
@@ -75,6 +76,12 @@ type DockerDiskUsage struct {
 	Active      string `json:"active"`
 	Size        string `json:"size"`
 	Reclaimable string `json:"reclaimable"`
+}
+
+type DockerLogOptions struct {
+	Tail       int
+	Since      time.Time
+	Timestamps bool
 }
 
 func DockerPing(ctx context.Context, host string) error {
@@ -410,10 +417,18 @@ func DockerContainerLogs(ctx context.Context, host, id string, tail int) ([]stri
 	if tail <= 0 {
 		tail = 200
 	}
-	if dockerAPIHost(host) {
-		return dockerAPIContainerLogs(ctx, host, id, tail)
+	return DockerContainerLogsWithOptions(ctx, host, id, DockerLogOptions{Tail: tail})
+}
+
+func DockerContainerLogsWithOptions(ctx context.Context, host, id string, options DockerLogOptions) ([]string, error) {
+	if options.Tail < 0 {
+		options.Tail = 0
 	}
-	out, err := dockerCommand(ctx, host, "logs", "--tail", strconv.Itoa(tail), id).CombinedOutput()
+	if dockerAPIHost(host) {
+		return dockerAPIContainerLogs(ctx, host, id, options)
+	}
+	args := dockerLogArgs(id, options)
+	out, err := dockerCommand(ctx, host, args...).CombinedOutput()
 	lines := splitLines(string(out))
 	if err != nil {
 		return lines, err
@@ -425,15 +440,37 @@ func DockerContainerLogsForServer(ctx context.Context, server store.Server, id s
 	if tail <= 0 {
 		tail = 200
 	}
-	if dockerAPIHost(server.DockerHost) {
-		return DockerContainerLogs(ctx, server.DockerHost, id, tail)
+	return DockerContainerLogsForServerWithOptions(ctx, server, id, DockerLogOptions{Tail: tail})
+}
+
+func DockerContainerLogsForServerWithOptions(ctx context.Context, server store.Server, id string, options DockerLogOptions) ([]string, error) {
+	if options.Tail < 0 {
+		options.Tail = 0
 	}
-	out, err := dockerSSHCombinedOutput(ctx, server, "logs", "--tail", strconv.Itoa(tail), id)
+	if dockerAPIHost(server.DockerHost) {
+		return DockerContainerLogsWithOptions(ctx, server.DockerHost, id, options)
+	}
+	out, err := dockerSSHCombinedOutput(ctx, server, dockerLogArgs(id, options)...)
 	lines := splitLines(string(out))
 	if err != nil {
 		return lines, err
 	}
 	return lines, nil
+}
+
+func dockerLogArgs(id string, options DockerLogOptions) []string {
+	args := []string{"logs"}
+	if options.Timestamps {
+		args = append(args, "--timestamps")
+	}
+	if !options.Since.IsZero() {
+		args = append(args, "--since", strconv.FormatInt(options.Since.Unix(), 10))
+	}
+	if options.Tail > 0 {
+		args = append(args, "--tail", strconv.Itoa(options.Tail))
+	}
+	args = append(args, id)
+	return args
 }
 
 func DockerContainerStats(ctx context.Context, host string, ids []string) ([]DockerContainerStat, error) {

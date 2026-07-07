@@ -167,7 +167,11 @@ type aifarRuntimeLogsResponse struct {
 	ServerID   string               `json:"serverId"`
 	InstanceID string               `json:"instanceId"`
 	Service    string               `json:"service,omitempty"`
+	Services   []string             `json:"services,omitempty"`
+	PodsFilter []string             `json:"podsFilter,omitempty"`
 	Tail       int                  `json:"tail"`
+	BatchSize  int                  `json:"batchSize,omitempty"`
+	Mode       string               `json:"mode,omitempty"`
 	Pods       []aifarRuntimeLogPod `json:"pods"`
 	Warnings   []string             `json:"warnings,omitempty"`
 }
@@ -236,34 +240,87 @@ func (a *API) aifarRuntimeLogsEvents(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	pods, warnings, err := a.runtimeLogPods(instance.ID, query)
+	if err != nil {
+		respond(w, nil, err)
+		return
+	}
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("X-Accel-Buffering", "no")
 	flusher, _ := w.(http.Flusher)
-	lastPayload := ""
-	emitLogs := func(force bool) {
-		response, err := a.collectAIFARRuntimeLogs(r.Context(), server, instance, query)
-		if err != nil {
-			writeSSE(w, "runtime-logs-error", map[string]any{"message": err.Error()})
-			if flusher != nil {
-				flusher.Flush()
-			}
-			return
-		}
-		data, _ := json.Marshal(response)
-		current := string(data)
-		if !force && current == lastPayload {
-			return
-		}
-		lastPayload = current
-		writeSSE(w, "runtime-logs", response)
+	states := map[string]runtimeLogStreamState{}
+	emitError := func(err error) {
+		writeSSE(w, "runtime-logs-error", map[string]any{"message": err.Error()})
 		if flusher != nil {
 			flusher.Flush()
 		}
 	}
-	emitLogs(true)
-	ticker := time.NewTicker(3 * time.Second)
+	snapshot, err := a.collectAIFARRuntimeLogsForPods(r.Context(), server, instance, query, pods, adapter.DockerLogOptions{Tail: query.Tail, Timestamps: true}, "snapshot")
+	if err != nil {
+		emitError(err)
+	} else {
+		snapshot.Warnings = append(snapshot.Warnings, warnings...)
+		writeSSE(w, "runtime-logs-snapshot", snapshot)
+		if flusher != nil {
+			flusher.Flush()
+		}
+		for _, item := range snapshot.Pods {
+			states[item.ContainerName] = runtimeLogStreamState{
+				Since:           time.Now().Add(-3 * time.Second),
+				LastFetchCounts: runtimeLogLineCounts(item.Logs),
+			}
+		}
+	}
+	emitBatch := func() {
+		response := aifarRuntimeLogsResponse{
+			ServerID:   server.ID,
+			InstanceID: instance.ID,
+			Service:    firstRuntimeValue(query.Services),
+			Services:   query.Services,
+			PodsFilter: query.PodSelectors,
+			Tail:       query.Tail,
+			BatchSize:  query.BatchSize,
+			Mode:       "append",
+			Pods:       []aifarRuntimeLogPod{},
+			Warnings:   []string{},
+		}
+		hasContent := false
+		for _, pod := range pods {
+			state := states[pod.ContainerName]
+			if state.Since.IsZero() {
+				state.Since = time.Now().Add(-3 * time.Second)
+			}
+			logs, logErr := adapter.DockerContainerLogsForServerWithOptions(r.Context(), server, pod.ContainerName, adapter.DockerLogOptions{
+				Tail:       query.BatchSize,
+				Since:      state.Since,
+				Timestamps: true,
+			})
+			newLogs, counts := runtimeLogNewLines(logs, state.LastFetchCounts)
+			states[pod.ContainerName] = runtimeLogStreamState{
+				Since:           time.Now().Add(-3 * time.Second),
+				LastFetchCounts: counts,
+			}
+			if len(newLogs) == 0 && logErr == nil {
+				continue
+			}
+			item := runtimeLogPodResponse(pod, newLogs)
+			if logErr != nil {
+				item.CollectionError = logErr.Error()
+				response.Warnings = append(response.Warnings, pod.ContainerName+": "+logErr.Error())
+			}
+			response.Pods = append(response.Pods, item)
+			hasContent = true
+		}
+		if hasContent {
+			writeSSE(w, "runtime-logs-batch", response)
+			if flusher != nil {
+				flusher.Flush()
+			}
+		}
+	}
+	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 	heartbeat := time.NewTicker(25 * time.Second)
 	defer heartbeat.Stop()
@@ -272,7 +329,7 @@ func (a *API) aifarRuntimeLogsEvents(w http.ResponseWriter, r *http.Request) {
 		case <-r.Context().Done():
 			return
 		case <-ticker.C:
-			emitLogs(false)
+			emitBatch()
 		case <-heartbeat.C:
 			writeSSE(w, "heartbeat", map[string]any{"time": time.Now().UTC()})
 			if flusher != nil {
@@ -283,9 +340,15 @@ func (a *API) aifarRuntimeLogsEvents(w http.ResponseWriter, r *http.Request) {
 }
 
 type aifarRuntimeLogQuery struct {
-	Tail        int
-	Service     string
-	PodSelector string
+	Tail         int
+	BatchSize    int
+	Services     []string
+	PodSelectors []string
+}
+
+type runtimeLogStreamState struct {
+	Since           time.Time
+	LastFetchCounts map[string]int
 }
 
 func (a *API) resolveAIFARRuntimeLogQuery(w http.ResponseWriter, r *http.Request) (store.Server, store.AppInstance, aifarRuntimeLogQuery, bool) {
@@ -310,49 +373,61 @@ func (a *API) resolveAIFARRuntimeLogQuery(w http.ResponseWriter, r *http.Request
 		return store.Server{}, store.AppInstance{}, aifarRuntimeLogQuery{}, false
 	}
 	return server, instance, aifarRuntimeLogQuery{
-		Tail:        boundedRuntimeLogTail(queryInt(r, "tail", 200)),
-		Service:     cleanRuntimeText(r.URL.Query().Get("service")),
-		PodSelector: cleanRuntimeText(firstNonEmptyRuntimeQuery(r, "pod", "container", "containerName")),
+		Tail:         boundedRuntimeLogTail(queryInt(r, "tail", 200)),
+		BatchSize:    boundedRuntimeLogBatch(queryInt(r, "batch", 200)),
+		Services:     runtimeQueryValues(r, "service", "services"),
+		PodSelectors: runtimeQueryValues(r, "pod", "pods", "container", "containerName"),
 	}, true
 }
 
 func (a *API) collectAIFARRuntimeLogs(ctx context.Context, server store.Server, instance store.AppInstance, query aifarRuntimeLogQuery) (aifarRuntimeLogsResponse, error) {
-	pods, err := a.store.ListAIFARPods(instance.ID)
+	pods, warnings, err := a.runtimeLogPods(instance.ID, query)
 	if err != nil {
 		return aifarRuntimeLogsResponse{}, err
 	}
-	pods = filterRuntimeLogPods(pods, query.Service, query.PodSelector)
+	response, err := a.collectAIFARRuntimeLogsForPods(ctx, server, instance, query, pods, adapter.DockerLogOptions{Tail: query.Tail}, "")
+	if err != nil {
+		return response, err
+	}
+	response.Warnings = append(response.Warnings, warnings...)
+	return response, nil
+}
+
+func (a *API) runtimeLogPods(instanceID string, query aifarRuntimeLogQuery) ([]store.AIFARPod, []string, error) {
+	pods, err := a.store.ListAIFARPods(instanceID)
+	if err != nil {
+		return nil, nil, err
+	}
+	pods = filterRuntimeLogPods(pods, query.Services, query.PodSelectors)
 	sort.Slice(pods, func(i, j int) bool {
 		if pods[i].ServiceName == pods[j].ServiceName {
 			return pods[i].ContainerName < pods[j].ContainerName
 		}
 		return pods[i].ServiceName < pods[j].ServiceName
 	})
+	warnings := []string{}
+	if len(pods) > 32 {
+		warnings = append(warnings, "runtime log query matched more than 32 pods; showing the first 32")
+		pods = pods[:32]
+	}
+	return pods, warnings, nil
+}
 
+func (a *API) collectAIFARRuntimeLogsForPods(ctx context.Context, server store.Server, instance store.AppInstance, query aifarRuntimeLogQuery, pods []store.AIFARPod, options adapter.DockerLogOptions, mode string) (aifarRuntimeLogsResponse, error) {
 	response := aifarRuntimeLogsResponse{
 		ServerID:   server.ID,
 		InstanceID: instance.ID,
-		Service:    query.Service,
+		Service:    firstRuntimeValue(query.Services),
+		Services:   query.Services,
+		PodsFilter: query.PodSelectors,
 		Tail:       query.Tail,
+		BatchSize:  query.BatchSize,
+		Mode:       mode,
 		Pods:       []aifarRuntimeLogPod{},
 	}
-	if len(pods) > 64 {
-		response.Warnings = append(response.Warnings, "runtime log query matched more than 64 pods; showing the first 64")
-		pods = pods[:64]
-	}
 	for _, pod := range pods {
-		logs, logErr := adapter.DockerContainerLogsForServer(ctx, server, pod.ContainerName, query.Tail)
-		item := aifarRuntimeLogPod{
-			InstanceID:    pod.InstanceID,
-			ServiceName:   pod.ServiceName,
-			PodID:         pod.PodID,
-			ContainerName: pod.ContainerName,
-			Revision:      cleanRuntimeText(pod.Revision),
-			Status:        cleanRuntimeText(pod.Status),
-			Ready:         pod.Ready,
-			Logs:          logs,
-			LineCount:     len(logs),
-		}
+		logs, logErr := adapter.DockerContainerLogsForServerWithOptions(ctx, server, pod.ContainerName, options)
+		item := runtimeLogPodResponse(pod, logs)
 		if logErr != nil {
 			item.CollectionError = logErr.Error()
 			response.Warnings = append(response.Warnings, pod.ContainerName+": "+logErr.Error())
@@ -360,6 +435,20 @@ func (a *API) collectAIFARRuntimeLogs(ctx context.Context, server store.Server, 
 		response.Pods = append(response.Pods, item)
 	}
 	return response, nil
+}
+
+func runtimeLogPodResponse(pod store.AIFARPod, logs []string) aifarRuntimeLogPod {
+	return aifarRuntimeLogPod{
+		InstanceID:    pod.InstanceID,
+		ServiceName:   pod.ServiceName,
+		PodID:         pod.PodID,
+		ContainerName: pod.ContainerName,
+		Revision:      cleanRuntimeText(pod.Revision),
+		Status:        cleanRuntimeText(pod.Status),
+		Ready:         pod.Ready,
+		Logs:          logs,
+		LineCount:     len(logs),
+	}
 }
 
 func (a *API) aifarRuntimeReconcile(w http.ResponseWriter, r *http.Request) {
@@ -1469,32 +1558,92 @@ func boundedRuntimeLogTail(value int) int {
 	return value
 }
 
-func firstNonEmptyRuntimeQuery(r *http.Request, keys ...string) string {
+func boundedRuntimeLogBatch(value int) int {
+	if value <= 0 {
+		return 200
+	}
+	if value > 1000 {
+		return 1000
+	}
+	return value
+}
+
+func runtimeQueryValues(r *http.Request, keys ...string) []string {
+	seen := map[string]bool{}
+	out := []string{}
+	query := r.URL.Query()
 	for _, key := range keys {
-		if value := strings.TrimSpace(r.URL.Query().Get(key)); value != "" {
+		for _, raw := range query[key] {
+			for _, part := range strings.Split(raw, ",") {
+				value := cleanRuntimeText(part)
+				if value == "" || seen[value] {
+					continue
+				}
+				seen[value] = true
+				out = append(out, value)
+			}
+		}
+	}
+	return out
+}
+
+func firstRuntimeValue(values []string) string {
+	for _, value := range values {
+		if value = cleanRuntimeText(value); value != "" {
 			return value
 		}
 	}
 	return ""
 }
 
-func filterRuntimeLogPods(pods []store.AIFARPod, service, podSelector string) []store.AIFARPod {
-	service = cleanRuntimeText(service)
-	podSelector = cleanRuntimeText(podSelector)
+func filterRuntimeLogPods(pods []store.AIFARPod, services, podSelectors []string) []store.AIFARPod {
+	serviceSet := stringSet(services)
+	podSet := stringSet(podSelectors)
 	out := make([]store.AIFARPod, 0, len(pods))
 	for _, pod := range pods {
 		if strings.TrimSpace(pod.ContainerName) == "" {
 			continue
 		}
-		if service != "" && pod.ServiceName != service {
+		if len(serviceSet) > 0 && !serviceSet[pod.ServiceName] {
 			continue
 		}
-		if podSelector != "" && pod.PodID != podSelector && pod.ContainerName != podSelector {
+		if len(podSet) > 0 && !podSet[pod.PodID] && !podSet[pod.ContainerName] {
 			continue
 		}
 		out = append(out, pod)
 	}
 	return out
+}
+
+func stringSet(values []string) map[string]bool {
+	out := map[string]bool{}
+	for _, value := range values {
+		if value = cleanRuntimeText(value); value != "" {
+			out[value] = true
+		}
+	}
+	return out
+}
+
+func runtimeLogLineCounts(lines []string) map[string]int {
+	out := map[string]int{}
+	for _, line := range lines {
+		out[line]++
+	}
+	return out
+}
+
+func runtimeLogNewLines(lines []string, previous map[string]int) ([]string, map[string]int) {
+	current := map[string]int{}
+	out := []string{}
+	for _, line := range lines {
+		current[line]++
+		if current[line] <= previous[line] {
+			continue
+		}
+		out = append(out, line)
+	}
+	return out, current
 }
 
 func runtimeInt(metadata map[string]any, key string, fallback int) int {

@@ -271,13 +271,61 @@
                 <div class="runtime-resource-panel">
                   <div class="runtime-tab-toolbar">
                     <div class="runtime-log-filters">
-                      <el-select v-model="runtimeLogServiceFilter" size="small" clearable class="runtime-service-filter" :placeholder="t('containers.service')" @clear="clearRuntimeLogServiceFilter">
+                      <el-select
+                        v-model="runtimeLogServiceFilter"
+                        size="small"
+                        multiple
+                        collapse-tags
+                        collapse-tags-tooltip
+                        :max-collapse-tags="2"
+                        clearable
+                        class="runtime-service-filter"
+                        :placeholder="t('containers.logScopeServices')"
+                        @clear="clearRuntimeLogServiceFilter"
+                      >
                         <el-option v-for="service in installedRuntimeServiceNamesList" :key="service" :label="service" :value="service" />
                       </el-select>
+                      <el-select
+                        v-model="runtimeLogPodFilter"
+                        size="small"
+                        multiple
+                        collapse-tags
+                        collapse-tags-tooltip
+                        :max-collapse-tags="1"
+                        clearable
+                        class="runtime-pod-filter"
+                        :placeholder="t('containers.logScopePods')"
+                      >
+                        <el-option v-for="pod in runtimeLogPodOptions" :key="pod.value" :label="pod.label" :value="pod.value">
+                          <div class="runtime-log-pod-option">
+                            <span>{{ pod.label }}</span>
+                            <StatusTag :status="aifarRuntimeStatusKind(pod.status)" :label="aifarRuntimeStatusLabel(pod.status)" />
+                          </div>
+                        </el-option>
+                      </el-select>
+                      <el-select
+                        v-model="runtimeLogLevelFilter"
+                        size="small"
+                        multiple
+                        collapse-tags
+                        clearable
+                        class="runtime-level-filter"
+                        :placeholder="t('containers.logLevelFilter')"
+                      >
+                        <el-option v-for="level in runtimeLogLevelOptions" :key="level" :label="level" :value="level" />
+                      </el-select>
+                      <el-input v-model="runtimeLogKeyword" size="small" clearable class="runtime-log-keyword" :placeholder="t('containers.logKeyword')" />
                       <el-input-number v-model="runtimeLogTail" size="small" class="runtime-log-tail" :min="20" :max="1000" :step="20" controls-position="right" />
                     </div>
                     <div class="runtime-tab-actions">
-                      <el-button size="small" :loading="loading" @click="loadRuntimeLogs(true)">{{ t('common.refresh') }}</el-button>
+                      <el-button size="small" type="primary" plain :loading="loading" :disabled="!runtimeLogSelectionReady" @click="loadRuntimeLogs(true)">
+                        {{ runtimeLogsLoadedForCurrentScope ? t('containers.restartRuntimeLogStream') : t('containers.startRuntimeLogStream') }}
+                      </el-button>
+                      <el-button size="small" plain :disabled="!runtimeLogsLoadedForCurrentScope" @click="toggleRuntimeLogPaused">
+                        {{ runtimeLogPaused ? t('containers.resumeLogs') : t('containers.pauseLogs') }}
+                      </el-button>
+                      <el-button size="small" plain :disabled="!runtimeLogRows.length && !runtimeLogPendingCount" @click="clearRuntimeLogView">{{ t('containers.clearLogs') }}</el-button>
+                      <el-switch v-model="runtimeLogAutoScroll" size="small" :active-text="t('containers.autoScroll')" inline-prompt />
                     </div>
                   </div>
                   <el-alert
@@ -287,33 +335,39 @@
                     show-icon
                     :title="runtimeLogWarnings.join('；')"
                   />
-                  <div v-if="!runtimeLogsLoadedForCurrentScope" class="runtime-lazy-state">
-                    <el-button size="small" type="primary" plain :loading="loading" @click="loadRuntimeLogs(true)">{{ t('containers.loadRuntimeLogs') }}</el-button>
+                  <div v-if="!runtimeLogSelectionReady" class="runtime-lazy-state">
+                    <span>{{ t('containers.selectRuntimeLogScopeHint') }}</span>
                   </div>
-                  <div v-else class="runtime-log-timeline">
-                    <el-empty v-if="!runtimeLogRows.length" :description="t('containers.noRuntimeLogs')" />
-                    <template v-else>
-                      <div class="runtime-log-pod-strip">
-                        <div v-for="group in runtimeLogGroups" :key="group.containerName" class="runtime-log-pod-chip">
-                          <div>
-                            <strong>{{ group.serviceName }}</strong>
-                            <span>{{ group.containerName }}</span>
-                          </div>
-                          <el-tag size="small">{{ t('containers.logLines', { count: group.lineCount ?? 0 }) }}</el-tag>
+                  <div v-else-if="!runtimeLogsLoadedForCurrentScope" class="runtime-lazy-state">
+                    <el-button size="small" type="primary" plain :loading="loading" @click="loadRuntimeLogs(true)">{{ t('containers.startRuntimeLogStream') }}</el-button>
+                  </div>
+                  <div v-else class="runtime-log-workbench">
+                    <div class="runtime-log-pod-strip">
+                      <div v-for="group in runtimeLogGroups" :key="group.containerName" class="runtime-log-pod-chip">
+                        <div>
+                          <strong>{{ group.serviceName }}</strong>
+                          <span>{{ group.containerName }}</span>
                         </div>
+                        <el-tag size="small">{{ t('containers.logLines', { count: group.lineCount ?? 0 }) }}</el-tag>
                       </div>
-                      <el-table :data="runtimeLogRows" height="100%" row-key="id" class="runtime-log-table">
-                        <el-table-column prop="time" :label="t('common.time')" width="210" show-overflow-tooltip />
-                        <el-table-column prop="serviceName" :label="t('containers.service')" width="120" show-overflow-tooltip />
-                        <el-table-column prop="pod" :label="t('containers.pod')" min-width="250" show-overflow-tooltip />
-                        <el-table-column :label="t('containers.level')" width="92">
-                          <template #default="{ row }">
-                            <el-tag size="small" :type="runtimeLogLevelTag(row.level)">{{ row.level || '-' }}</el-tag>
-                          </template>
-                        </el-table-column>
-                        <el-table-column prop="message" :label="t('common.message')" min-width="620" show-overflow-tooltip />
-                      </el-table>
-                    </template>
+                    </div>
+                    <div class="runtime-log-stats">
+                      <span>{{ t('containers.visibleLogRows', { count: filteredRuntimeLogRows.length }) }}</span>
+                      <span v-if="runtimeLogDroppedRows">{{ t('containers.droppedLogRows', { count: runtimeLogDroppedRows }) }}</span>
+                      <span v-if="runtimeLogPendingCount">{{ t('containers.pendingLogRows', { count: runtimeLogPendingCount }) }}</span>
+                    </div>
+                    <el-empty v-if="!filteredRuntimeLogRows.length" :description="t('containers.noRuntimeLogs')" />
+                    <div v-else ref="runtimeLogViewport" class="runtime-log-virtual-list" @scroll="handleRuntimeLogScroll">
+                      <div :style="{ height: `${runtimeLogTopSpacer}px` }"></div>
+                      <div v-for="row in runtimeLogVirtualRows" :key="row.id" class="runtime-log-row">
+                        <span class="runtime-log-time">{{ row.time }}</span>
+                        <span class="runtime-log-service">{{ row.serviceName }}</span>
+                        <span class="runtime-log-pod">{{ row.pod }}</span>
+                        <span class="runtime-log-level" :class="`is-${runtimeLogLevelTag(row.level) || 'default'}`">{{ row.level || '-' }}</span>
+                        <span class="runtime-log-message">{{ row.message }}</span>
+                      </div>
+                      <div :style="{ height: `${runtimeLogBottomSpacer}px` }"></div>
+                    </div>
                   </div>
                 </div>
               </el-tab-pane>
@@ -557,7 +611,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import type { UploadFile } from 'element-plus'
 import { apiEventSourceUrl, apiGet, apiPost, apiPostForm, apiPut, asArray } from '../api/client'
@@ -725,7 +779,11 @@ type AifarRuntimeLogsResponse = {
   serverId?: string
   instanceId?: string
   service?: string
+  services?: string[]
+  podsFilter?: string[]
   tail?: number
+  batchSize?: number
+  mode?: string
   pods?: AifarRuntimeLogPod[]
   warnings?: string[]
 }
@@ -799,12 +857,27 @@ const runtimeResourceTab = ref<'deployments' | 'services' | 'pods' | 'logs' | 'i
 const runtimePodServiceFilter = ref('')
 const runtimePodsLoaded = ref<Record<string, boolean>>({})
 const runtimePodStatsLoaded = ref<Record<string, boolean>>({})
-const runtimeLogServiceFilter = ref('')
+const runtimeLogServiceFilter = ref<string[]>([])
+const runtimeLogPodFilter = ref<string[]>([])
+const runtimeLogLevelFilter = ref<string[]>([])
+const runtimeLogKeyword = ref('')
 const runtimeLogTail = ref(200)
 const runtimeLogs = ref<AifarRuntimeLogsResponse>({ pods: [], warnings: [], tail: 200 })
 const runtimeLogsLoaded = ref<Record<string, boolean>>({})
+const runtimeLogRows = ref<RuntimeLogRow[]>([])
+const runtimeLogPendingRows = ref<RuntimeLogRow[]>([])
+const runtimeLogPaused = ref(false)
+const runtimeLogAutoScroll = ref(true)
+const runtimeLogDroppedRows = ref(0)
+const runtimeLogScrollTop = ref(0)
+const runtimeLogViewport = ref<HTMLElement | null>(null)
 let runtimeLogSource: EventSource | null = null
 let runtimeLogStreamKey = ''
+let runtimeLogSequence = 0
+const runtimeLogMaxRows = 3000
+const runtimeLogRowHeight = 32
+const runtimeLogVisibleCount = 100
+const runtimeLogLevelOptions = ['ERROR', 'WARN', 'INFO', 'DEBUG', 'TRACE']
 const runtimeConfigVisible = ref(false)
 const runtimeConfigSubmitting = ref(false)
 const runtimeConfigForm = ref<RuntimeConfigFormValues>({
@@ -995,22 +1068,31 @@ const runtimePodsLoadedForCurrentScope = computed(() => Boolean(runtimePodsLoade
 const runtimePodStatsLoadedForCurrentScope = computed(() => Boolean(runtimePodStatsLoaded.value[runtimeCacheKey('pods')]))
 const runtimeLogsLoadedForCurrentScope = computed(() => Boolean(runtimeLogsLoaded.value[runtimeLogCacheKey()]))
 const runtimeLogGroups = computed(() => asArray<AifarRuntimeLogPod>(runtimeLogs.value.pods))
-const runtimeLogRows = computed<RuntimeLogRow[]>(() => {
-  const rows: RuntimeLogRow[] = []
-  let sequence = 0
-  for (const group of runtimeLogGroups.value) {
-    for (const line of asArray<string>(group.logs)) {
-      const parsed = parseRuntimeLogLine(line)
-      rows.push({
-        id: `${group.containerName}:${sequence}`,
-        sequence,
-        serviceName: group.serviceName || '-',
-        pod: group.containerName || group.podId || '-',
-        ...parsed
-      })
-      sequence += 1
+const runtimeLogPodOptions = computed(() => {
+  const services = new Set(runtimeLogServiceFilter.value)
+  return selectedRuntimePodsRaw.value
+    .filter((pod) => !services.size || services.has(pod.serviceName))
+    .map((pod) => ({
+      value: pod.containerName,
+      label: `${pod.serviceName} / ${pod.containerName}`,
+      serviceName: pod.serviceName,
+      status: pod.status || 'unknown'
+    }))
+})
+const runtimeLogSelectionReady = computed(() => runtimeLogServiceFilter.value.length > 0 || runtimeLogPodFilter.value.length > 0)
+const filteredRuntimeLogRows = computed<RuntimeLogRow[]>(() => {
+  const levels = new Set(runtimeLogLevelFilter.value.map((item) => item.toUpperCase()))
+  const keyword = runtimeLogKeyword.value.trim().toLowerCase()
+  const rows = runtimeLogRows.value.filter((row) => {
+    if (levels.size && !levels.has(String(row.level || '').toUpperCase())) {
+      return false
     }
-  }
+    if (keyword) {
+      const text = `${row.time} ${row.serviceName} ${row.pod} ${row.level} ${row.message}`.toLowerCase()
+      return text.includes(keyword)
+    }
+    return true
+  })
   return rows.sort((left, right) => {
     if (left.timestamp && right.timestamp && left.timestamp !== right.timestamp) {
       return left.timestamp - right.timestamp
@@ -1020,7 +1102,12 @@ const runtimeLogRows = computed<RuntimeLogRow[]>(() => {
     return left.sequence - right.sequence
   })
 })
+const runtimeLogVirtualStart = computed(() => Math.max(0, Math.floor(runtimeLogScrollTop.value / runtimeLogRowHeight) - 8))
+const runtimeLogVirtualRows = computed(() => filteredRuntimeLogRows.value.slice(runtimeLogVirtualStart.value, runtimeLogVirtualStart.value + runtimeLogVisibleCount))
+const runtimeLogTopSpacer = computed(() => runtimeLogVirtualStart.value * runtimeLogRowHeight)
+const runtimeLogBottomSpacer = computed(() => Math.max(0, (filteredRuntimeLogRows.value.length - runtimeLogVirtualStart.value - runtimeLogVirtualRows.value.length) * runtimeLogRowHeight))
 const runtimeLogWarnings = computed(() => asArray<string>(runtimeLogs.value.warnings))
+const runtimeLogPendingCount = computed(() => runtimeLogPendingRows.value.length)
 const installedRuntimeServiceNamesList = computed(() => aifarServiceOptions.map((item) => item.value).filter((service) => installedRuntimeServiceNames.value.has(service)))
 const missingRuntimeServiceOptions = computed(() => aifarServiceOptions.filter((item) => !installedRuntimeServiceNames.value.has(item.value)))
 const runtimeInstanceManageDisabledReason = computed(() => {
@@ -1128,7 +1215,7 @@ function runtimeCacheKey(scope: 'base' | 'pods' = 'base') {
 }
 
 function runtimeLogCacheKey() {
-  return `${cacheScope()}:aifar-runtime:logs:${selectedRuntimeInstance.value?.id || 'none'}:${String(runtimeLogServiceFilter.value || '').trim()}:${runtimeLogTail.value}`
+  return `${cacheScope()}:aifar-runtime:logs:${selectedRuntimeInstance.value?.id || 'none'}:${runtimeLogServiceFilter.value.join(',')}:${runtimeLogPodFilter.value.join(',')}:${runtimeLogTail.value}`
 }
 
 async function withLoading<T>(fn: () => Promise<T>) {
@@ -1326,6 +1413,12 @@ function loadRuntimeLogs(force = false) {
   if (!force && runtimeLogSource && runtimeLogStreamKey === key) {
     return
   }
+  if (!runtimeLogSelectionReady.value) {
+    if (force) {
+      ElMessage.warning(t('containers.selectRuntimeLogScope'))
+    }
+    return
+  }
   openRuntimeLogStream(force)
 }
 
@@ -1335,24 +1428,26 @@ function openRuntimeLogStream(force = false) {
   const instance = selectedRuntimeInstance.value
   const key = runtimeLogCacheKey()
   if (force) {
-    runtimeLogs.value = { pods: [], warnings: [], tail: runtimeLogTail.value }
+    resetRuntimeLogView()
     runtimeLogsLoaded.value = { ...runtimeLogsLoaded.value, [key]: false }
   }
-  if (tab.value !== 'aifar-runtime' || runtimeResourceTab.value !== 'logs' || !query || !instance?.id) {
-    runtimeLogs.value = { pods: [], warnings: [], tail: runtimeLogTail.value }
+  if (tab.value !== 'aifar-runtime' || runtimeResourceTab.value !== 'logs' || !query || !instance?.id || !runtimeLogSelectionReady.value) {
     return
   }
   const params = new URLSearchParams(query)
   params.set('instanceId', instance.id)
   params.set('tail', String(runtimeLogTail.value))
-  const service = String(runtimeLogServiceFilter.value || '').trim()
-  if (service) {
-    params.set('service', service)
+  params.set('batch', '200')
+  if (runtimeLogServiceFilter.value.length) {
+    params.set('services', runtimeLogServiceFilter.value.join(','))
+  }
+  if (runtimeLogPodFilter.value.length) {
+    params.set('pods', runtimeLogPodFilter.value.join(','))
   }
   const source = new EventSource(apiEventSourceUrl(`/containers/aifar/runtime/logs/events?${params.toString()}`))
   runtimeLogSource = source
   runtimeLogStreamKey = key
-  source.addEventListener('runtime-logs', (event) => {
+  const applySnapshot = (event: Event) => {
     if (runtimeLogSource !== source) {
       return
     }
@@ -1360,15 +1455,29 @@ function openRuntimeLogStream(force = false) {
     if (!next) {
       return
     }
-    runtimeLogs.value = next
+    applyRuntimeLogResponse(next, true)
     runtimeLogsLoaded.value = { ...runtimeLogsLoaded.value, [key]: true }
-  })
+  }
+  const applyBatch = (event: Event) => {
+    if (runtimeLogSource !== source) {
+      return
+    }
+    const next = parseRuntimeLogsEvent((event as MessageEvent).data)
+    if (!next) {
+      return
+    }
+    applyRuntimeLogResponse(next, false)
+    runtimeLogsLoaded.value = { ...runtimeLogsLoaded.value, [key]: true }
+  }
+  source.addEventListener('runtime-logs-snapshot', applySnapshot)
+  source.addEventListener('runtime-logs-batch', applyBatch)
+  source.addEventListener('runtime-logs', applySnapshot)
   source.addEventListener('runtime-logs-error', (event) => {
     if (runtimeLogSource !== source) {
       return
     }
     const message = parseRuntimeLogErrorEvent((event as MessageEvent).data)
-    runtimeLogs.value = { pods: [], warnings: message ? [message] : [], tail: runtimeLogTail.value }
+    runtimeLogs.value = { ...runtimeLogs.value, warnings: message ? [message] : [] }
     runtimeLogsLoaded.value = { ...runtimeLogsLoaded.value, [key]: true }
   })
 }
@@ -1398,8 +1507,124 @@ function parseRuntimeLogErrorEvent(raw: string) {
   }
 }
 
+function resetRuntimeLogView() {
+  runtimeLogs.value = { pods: [], warnings: [], tail: runtimeLogTail.value }
+  runtimeLogRows.value = []
+  runtimeLogPendingRows.value = []
+  runtimeLogPaused.value = false
+  runtimeLogDroppedRows.value = 0
+  runtimeLogSequence = 0
+  runtimeLogScrollTop.value = 0
+}
+
+function applyRuntimeLogResponse(next: AifarRuntimeLogsResponse, replace: boolean) {
+  runtimeLogs.value = replace ? next : mergeRuntimeLogGroups(runtimeLogs.value, next)
+  const rows = runtimeLogRowsFromResponse(next)
+  appendRuntimeLogRows(rows)
+}
+
+function mergeRuntimeLogGroups(current: AifarRuntimeLogsResponse, next: AifarRuntimeLogsResponse): AifarRuntimeLogsResponse {
+  const groups = new Map<string, AifarRuntimeLogPod>()
+  for (const pod of asArray<AifarRuntimeLogPod>(current.pods)) {
+    groups.set(pod.containerName, { ...pod, logs: [] })
+  }
+  for (const pod of asArray<AifarRuntimeLogPod>(next.pods)) {
+    const previous = groups.get(pod.containerName)
+    const previousCount = Number(previous?.lineCount ?? 0)
+    const nextCount = Number(pod.lineCount ?? asArray<string>(pod.logs).length)
+    groups.set(pod.containerName, {
+      ...(previous ?? {}),
+      ...pod,
+      logs: [],
+      lineCount: previous ? previousCount + nextCount : nextCount
+    })
+  }
+  return {
+    ...current,
+    ...next,
+    pods: Array.from(groups.values()),
+    warnings: uniqueValues([...asArray<string>(current.warnings), ...asArray<string>(next.warnings)])
+  }
+}
+
+function runtimeLogRowsFromResponse(next: AifarRuntimeLogsResponse) {
+  const rows: RuntimeLogRow[] = []
+  for (const pod of asArray<AifarRuntimeLogPod>(next.pods)) {
+    for (const line of asArray<string>(pod.logs)) {
+      const parsed = parseRuntimeLogLine(line)
+      const sequence = runtimeLogSequence++
+      rows.push({
+        id: `${pod.containerName}:${sequence}`,
+        time: parsed.time,
+        timestamp: parsed.timestamp,
+        sequence,
+        serviceName: pod.serviceName || '-',
+        pod: pod.containerName || pod.podId || '-',
+        level: parsed.level,
+        message: parsed.message
+      })
+    }
+  }
+  return rows
+}
+
+function appendRuntimeLogRows(rows: RuntimeLogRow[]) {
+  if (!rows.length) {
+    return
+  }
+  if (runtimeLogPaused.value) {
+    runtimeLogPendingRows.value = boundedRuntimeLogRows([...runtimeLogPendingRows.value, ...rows])
+    return
+  }
+  runtimeLogRows.value = boundedRuntimeLogRows([...runtimeLogRows.value, ...rows])
+  if (runtimeLogAutoScroll.value) {
+    void scrollRuntimeLogsToBottom()
+  }
+}
+
+function boundedRuntimeLogRows(rows: RuntimeLogRow[]) {
+  if (rows.length <= runtimeLogMaxRows) {
+    return rows
+  }
+  const dropped = rows.length - runtimeLogMaxRows
+  runtimeLogDroppedRows.value += dropped
+  return rows.slice(dropped)
+}
+
+function toggleRuntimeLogPaused() {
+  runtimeLogPaused.value = !runtimeLogPaused.value
+  if (!runtimeLogPaused.value && runtimeLogPendingRows.value.length) {
+    const pending = runtimeLogPendingRows.value
+    runtimeLogPendingRows.value = []
+    appendRuntimeLogRows(pending)
+  }
+}
+
+function clearRuntimeLogView() {
+  runtimeLogRows.value = []
+  runtimeLogPendingRows.value = []
+  runtimeLogs.value = {
+    ...runtimeLogs.value,
+    pods: runtimeLogGroups.value.map((pod) => ({ ...pod, logs: [], lineCount: 0 }))
+  }
+  runtimeLogDroppedRows.value = 0
+  runtimeLogScrollTop.value = 0
+}
+
+function handleRuntimeLogScroll(event: Event) {
+  runtimeLogScrollTop.value = (event.target as HTMLElement | null)?.scrollTop ?? 0
+}
+
+async function scrollRuntimeLogsToBottom() {
+  await nextTick()
+  const viewport = runtimeLogViewport.value
+  if (viewport) {
+    viewport.scrollTop = viewport.scrollHeight
+  }
+}
+
 function clearRuntimeLogServiceFilter() {
-  runtimeLogServiceFilter.value = ''
+  runtimeLogServiceFilter.value = []
 }
 
 async function loadActive(force = false) {
@@ -2499,28 +2724,39 @@ watch(runtimeResourceTab, (next) => {
   if (next === 'pods') {
     void ensureRuntimePodsLoaded(false)
   } else if (next === 'logs') {
-    void loadRuntimeLogs(false)
+    void ensureRuntimePodsLoaded(false)
+    if (runtimeLogSelectionReady.value) {
+      void loadRuntimeLogs(false)
+    }
   } else {
     closeRuntimeLogStream()
   }
 })
 watch(selectedRuntimeInstanceId, () => {
   runtimePodServiceFilter.value = ''
-  runtimeLogServiceFilter.value = ''
-  runtimeLogs.value = { pods: [], warnings: [], tail: runtimeLogTail.value }
+  runtimeLogServiceFilter.value = []
+  runtimeLogPodFilter.value = []
+  runtimeLogLevelFilter.value = []
+  runtimeLogKeyword.value = ''
+  resetRuntimeLogView()
   runtimeLogsLoaded.value = {}
+  closeRuntimeLogStream()
   if (runtimeResourceTab.value === 'logs') {
-    loadRuntimeLogs(true)
-  } else {
-    closeRuntimeLogStream()
+    void ensureRuntimePodsLoaded(false)
   }
 })
-watch([runtimeLogServiceFilter, runtimeLogTail], () => {
-  runtimeLogs.value = { pods: [], warnings: [], tail: runtimeLogTail.value }
-  if (runtimeResourceTab.value === 'logs') {
+watch(runtimeLogServiceFilter, () => {
+  const validPods = new Set(runtimeLogPodOptions.value.map((item) => item.value))
+  runtimeLogPodFilter.value = runtimeLogPodFilter.value.filter((pod) => validPods.has(pod))
+}, { deep: true })
+watch([runtimeLogServiceFilter, runtimeLogPodFilter, runtimeLogTail], () => {
+  resetRuntimeLogView()
+  runtimeLogsLoaded.value = {}
+  closeRuntimeLogStream()
+  if (runtimeResourceTab.value === 'logs' && runtimeLogSelectionReady.value) {
     loadRuntimeLogs(true)
   }
-})
+}, { deep: true })
 watch(() => realtime.revision, () => {
   const event = realtime.lastEvent
   if (!event?.resource) {
@@ -2552,7 +2788,11 @@ watch([aifarUpdateService, aifarUpdateMode], () => {
   aifarArtifactFile.value = null
 })
 watch(selectedServerId, () => {
-  runtimeLogs.value = { pods: [], warnings: [], tail: runtimeLogTail.value }
+  runtimeLogServiceFilter.value = []
+  runtimeLogPodFilter.value = []
+  runtimeLogLevelFilter.value = []
+  runtimeLogKeyword.value = ''
+  resetRuntimeLogView()
   runtimeLogsLoaded.value = {}
   closeRuntimeLogStream()
   if (pageReady.value) {
@@ -2748,11 +2988,37 @@ onBeforeUnmount(() => {
   width: 180px;
 }
 
+.runtime-pod-filter {
+  width: min(360px, 28vw);
+}
+
+.runtime-level-filter {
+  width: 150px;
+}
+
+.runtime-log-keyword {
+  width: min(260px, 20vw);
+}
+
 .runtime-log-tail {
   width: 128px;
 }
 
-.runtime-log-timeline {
+.runtime-log-pod-option {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.runtime-log-pod-option span:first-child {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.runtime-log-workbench {
   flex: 1 1 auto;
   min-height: 0;
   display: flex;
@@ -2801,19 +3067,93 @@ onBeforeUnmount(() => {
   white-space: nowrap;
 }
 
-.runtime-log-table {
+.runtime-log-stats {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-height: 24px;
+  color: var(--aifar-text-secondary);
+  font-size: 12px;
+}
+
+.runtime-log-virtual-list {
   flex: 1 1 auto;
   min-height: 0;
+  overflow: auto;
+  border: 1px solid #17243a;
+  border-radius: var(--aifar-radius);
+  background: #08111f;
 }
 
-.runtime-log-table :deep(.el-table__cell) {
+.runtime-log-row {
+  display: grid;
+  grid-template-columns: 190px 108px minmax(180px, 260px) 72px minmax(320px, 1fr);
+  gap: 8px;
+  align-items: start;
+  min-height: 32px;
+  padding: 6px 10px;
+  border-bottom: 1px solid rgba(148, 163, 184, 0.14);
+  color: #dbeafe;
   font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
   font-size: 12px;
-  line-height: 18px;
+  line-height: 20px;
 }
 
-.runtime-log-table :deep(.el-table__cell:nth-child(5)) {
+.runtime-log-time {
+  color: #93a4ba;
+  white-space: nowrap;
+}
+
+.runtime-log-service,
+.runtime-log-pod {
+  min-width: 0;
+  overflow: hidden;
+  color: #c7d2fe;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.runtime-log-pod {
+  color: #bfdbfe;
+}
+
+.runtime-log-level {
+  justify-self: start;
+  min-width: 52px;
+  padding: 0 6px;
+  border-radius: 4px;
+  background: rgba(148, 163, 184, 0.16);
+  color: #cbd5e1;
+  text-align: center;
+  font-weight: 700;
+  font-size: 11px;
+  line-height: 20px;
+}
+
+.runtime-log-level.is-danger {
+  background: rgba(239, 68, 68, 0.2);
+  color: #fecaca;
+}
+
+.runtime-log-level.is-warning {
+  background: rgba(245, 158, 11, 0.2);
+  color: #fde68a;
+}
+
+.runtime-log-level.is-success {
+  background: rgba(34, 197, 94, 0.18);
+  color: #bbf7d0;
+}
+
+.runtime-log-level.is-info {
+  background: rgba(59, 130, 246, 0.2);
+  color: #bfdbfe;
+}
+
+.runtime-log-message {
+  min-width: 0;
   word-break: break-all;
+  white-space: pre-wrap;
 }
 
 .runtime-entry-grid {
@@ -2969,6 +3309,23 @@ onBeforeUnmount(() => {
   .runtime-log-filters {
     width: 100%;
     flex-wrap: wrap;
+  }
+
+  .runtime-service-filter,
+  .runtime-pod-filter,
+  .runtime-level-filter,
+  .runtime-log-keyword,
+  .runtime-log-tail {
+    width: 100%;
+  }
+
+  .runtime-log-virtual-list {
+    min-height: 320px;
+  }
+
+  .runtime-log-row {
+    grid-template-columns: 160px 96px 220px 72px minmax(280px, 1fr);
+    min-width: 860px;
   }
 
   .runtime-log-pod-chip {

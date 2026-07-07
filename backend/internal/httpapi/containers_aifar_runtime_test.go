@@ -131,6 +131,39 @@ func TestAIFARRuntimeLogsAggregatesPodContainerLogs(t *testing.T) {
 	}
 }
 
+func TestAIFARRuntimeLogQuerySupportsSelectionSetsAndDedup(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/?service=file&services=oauth,permission&pods=pod-2,container-3&batch=5000", nil)
+	services := runtimeQueryValues(req, "service", "services")
+	pods := runtimeQueryValues(req, "pod", "pods", "container", "containerName")
+	if strings.Join(services, ",") != "file,oauth,permission" {
+		t.Fatalf("unexpected service values: %+v", services)
+	}
+	if strings.Join(pods, ",") != "pod-2,container-3" {
+		t.Fatalf("unexpected pod values: %+v", pods)
+	}
+	if got := boundedRuntimeLogBatch(queryInt(req, "batch", 200)); got != 1000 {
+		t.Fatalf("expected batch to be capped at 1000, got %d", got)
+	}
+
+	filtered := filterRuntimeLogPods([]store.AIFARPod{
+		{ServiceName: "file", PodID: "pod-1", ContainerName: "container-1"},
+		{ServiceName: "oauth", PodID: "pod-2", ContainerName: "container-2"},
+		{ServiceName: "permission", PodID: "pod-3", ContainerName: "container-3"},
+		{ServiceName: "meeting", PodID: "pod-4", ContainerName: "container-4"},
+	}, services, pods)
+	if len(filtered) != 2 || filtered[0].ContainerName != "container-2" || filtered[1].ContainerName != "container-3" {
+		t.Fatalf("unexpected filtered pods: %+v", filtered)
+	}
+
+	newLines, counts := runtimeLogNewLines([]string{"line-a", "line-b", "line-b", "line-c"}, map[string]int{"line-a": 1, "line-b": 1})
+	if strings.Join(newLines, "|") != "line-b|line-c" {
+		t.Fatalf("unexpected incremental lines: %+v", newLines)
+	}
+	if counts["line-a"] != 1 || counts["line-b"] != 2 || counts["line-c"] != 1 {
+		t.Fatalf("unexpected line counts: %+v", counts)
+	}
+}
+
 func TestAIFARRuntimeServiceSummaryIgnoresNilResidualRecords(t *testing.T) {
 	api, db, _ := newAuthzTestAPI(t)
 	instance, err := db.SaveAppInstance(store.AppInstance{

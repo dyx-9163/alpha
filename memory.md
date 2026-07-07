@@ -939,3 +939,5 @@
 - 结论：已取消数据库/Nacos 页前端 30 秒自动监测定时器，并将手动检测等待改为监听全局 `task.finished` SSE 事件；AIFAR Runtime 日志新增 `/containers/aifar/runtime/logs/events` 长连接，前端日志页改为 EventSource 订阅；collector 状态事件新增 snapshot payload，容器页收到 Docker summary 事件可直接应用 payload，不再事件后主动重拉；`pnpm test`、`pnpm web:build`、`git diff --check` 通过。
 - 问题：用户反馈日志页面数据太多可能打崩页面，且日志模块不能选择多个 Pod/服务合并展示，设计不合理。
 - 结论：建议把日志模块从“全量日志表格”升级为“选择集 + 服务端流式聚合 + 前端虚拟列表”：默认不加载全部 Pod，用户先选择服务/Pod/级别/时间窗口，再由后端按选中范围合并、限流、增量推送；前端只保留有界 ring buffer 和虚拟滚动，并支持保存常用组合。
+- 问题：用户要求直接实施第一阶段和后端增量流，把 AIFAR Runtime 日志页改成“选择集 + 虚拟时间线 + 增量 SSE”。
+- 结论：已实现后端 `runtime-logs-snapshot`/`runtime-logs-batch` SSE、服务/Pod 多选过滤、Docker logs `--since/--timestamps` 增量采集和去重；前端日志页默认不加载全量日志，改为服务/Pod/级别/关键字选择集、暂停/自动滚动、有界缓冲和固定行高虚拟时间线；补充后端选择集与去重测试。

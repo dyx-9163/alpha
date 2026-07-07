@@ -322,11 +322,17 @@ func dockerAPISystemDF(ctx context.Context, host string) ([]DockerDiskUsage, err
 	}, nil
 }
 
-func dockerAPIContainerLogs(ctx context.Context, host, id string, tail int) ([]string, error) {
+func dockerAPIContainerLogs(ctx context.Context, host, id string, options DockerLogOptions) ([]string, error) {
 	query := url.Values{
-		"stdout": []string{"1"},
-		"stderr": []string{"1"},
-		"tail":   []string{strconv.Itoa(tail)},
+		"stdout":     []string{"1"},
+		"stderr":     []string{"1"},
+		"timestamps": []string{boolQueryValue(options.Timestamps)},
+	}
+	if options.Tail > 0 {
+		query.Set("tail", strconv.Itoa(options.Tail))
+	}
+	if !options.Since.IsZero() {
+		query.Set("since", strconv.FormatInt(options.Since.Unix(), 10))
 	}
 	body, err := dockerAPIRaw(ctx, http.MethodGet, host, "/containers/"+url.PathEscape(id)+"/logs", query)
 	lines := decodeDockerLogBytes(body)
@@ -334,6 +340,13 @@ func dockerAPIContainerLogs(ctx context.Context, host, id string, tail int) ([]s
 		return lines, err
 	}
 	return lines, nil
+}
+
+func boolQueryValue(value bool) string {
+	if value {
+		return "1"
+	}
+	return "0"
 }
 
 func dockerAPIContainerAction(ctx context.Context, host, id, action string) error {
