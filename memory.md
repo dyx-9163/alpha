@@ -977,3 +977,5 @@
 - 结论：已把容器页 AIFAR Runtime 日志页签改为专用内部滚动布局：外层 workspace 在日志页隐藏溢出，Runtime tabs/content/panel 保持 flex 高度链路，日志虚拟列表固定 32px 行高并使用内部纵向/横向滚动；`pnpm web:build` 和 `git diff --check` 通过。
 - 问题：用户询问为什么 AIFAR Runtime 日志页只有 oauth 模块日志在变动，其他模块没有。
 - 结论：当前日志页是“选择集”模型，服务筛选只选中 `oauth` 时后端 SSE 只订阅 oauth 对应 Pod；同时级别筛选若为 `ERROR`，其他服务的 INFO/WARN 会被前端过滤。要看多服务日志需要在服务/POD 选择器中加入多个服务，或后续增加“全部运行服务/异常服务”快捷选择。
+- 问题：用户要求 AIFAR Runtime 日志页无日志和日志很多时都不要出现页面右侧滚动条，无日志也要展示黑色日志框，日志框只能占满当前页面剩余空间。
+- 结论：已将容器页日志模式提升到 section/workspace 级布局状态，关闭页面级 overflow；日志空态改为黑色日志框内部提示；日志虚拟列表隐藏滚动条并保持内部滚动，面板高度受当前页面 flex 链路约束；`pnpm web:build` 和 `git diff --check` 通过。

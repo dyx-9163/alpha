@@ -1,5 +1,5 @@
 <template>
-  <section>
+  <section class="containers-page" :class="{ 'is-runtime-logs-page': tab === 'aifar-runtime' && runtimeResourceTab === 'logs' }">
     <div class="page-head">
       <div>
         <h1 class="page-title">{{ t('containers.title') }}</h1>
@@ -361,17 +361,21 @@
                       <span v-if="runtimeLogDroppedRows">{{ t('containers.droppedLogRows', { count: runtimeLogDroppedRows }) }}</span>
                       <span v-if="runtimeLogPendingCount">{{ t('containers.pendingLogRows', { count: runtimeLogPendingCount }) }}</span>
                     </div>
-                    <el-empty v-if="!filteredRuntimeLogRows.length" :description="t('containers.noRuntimeLogs')" />
-                    <div v-else ref="runtimeLogViewport" class="runtime-log-virtual-list" @scroll="handleRuntimeLogScroll">
-                      <div :style="{ height: `${runtimeLogTopSpacer}px` }"></div>
-                      <div v-for="row in runtimeLogVirtualRows" :key="row.id" class="runtime-log-row">
-                        <span class="runtime-log-time">{{ row.time }}</span>
-                        <span class="runtime-log-service">{{ row.serviceName }}</span>
-                        <span class="runtime-log-pod">{{ row.pod }}</span>
-                        <span class="runtime-log-level" :class="`is-${runtimeLogLevelTag(row.level) || 'default'}`">{{ row.level || '-' }}</span>
-                        <span class="runtime-log-message">{{ row.message }}</span>
+                    <div ref="runtimeLogViewport" class="runtime-log-virtual-list" :class="{ 'is-empty': !filteredRuntimeLogRows.length }" @scroll="handleRuntimeLogScroll">
+                      <div v-if="!filteredRuntimeLogRows.length" class="runtime-log-empty-state">
+                        <span>{{ t('containers.noRuntimeLogs') }}</span>
                       </div>
-                      <div :style="{ height: `${runtimeLogBottomSpacer}px` }"></div>
+                      <template v-else>
+                        <div :style="{ height: `${runtimeLogTopSpacer}px` }"></div>
+                        <div v-for="row in runtimeLogVirtualRows" :key="row.id" class="runtime-log-row">
+                          <span class="runtime-log-time">{{ row.time }}</span>
+                          <span class="runtime-log-service">{{ row.serviceName }}</span>
+                          <span class="runtime-log-pod">{{ row.pod }}</span>
+                          <span class="runtime-log-level" :class="`is-${runtimeLogLevelTag(row.level) || 'default'}`">{{ row.level || '-' }}</span>
+                          <span class="runtime-log-message">{{ row.message }}</span>
+                        </div>
+                        <div :style="{ height: `${runtimeLogBottomSpacer}px` }"></div>
+                      </template>
                     </div>
                   </div>
                 </div>
@@ -2981,6 +2985,11 @@ onBeforeUnmount(() => {
 </script>
 
 <style scoped>
+.containers-page.is-runtime-logs-page {
+  overflow: hidden;
+  padding-right: 0;
+}
+
 .containers-main {
   display: flex;
   flex-direction: column;
@@ -2989,7 +2998,7 @@ onBeforeUnmount(() => {
   padding: 10px;
 }
 
-.containers-main.is-runtime-logs {
+.workspace-card.containers-main.is-runtime-logs {
   overflow: hidden;
 }
 
@@ -3129,6 +3138,7 @@ onBeforeUnmount(() => {
 .runtime-resource-tabs :deep(.el-tabs__content) {
   flex: 1 1 auto;
   min-height: 0;
+  height: 100%;
   overflow: hidden;
 }
 
@@ -3139,7 +3149,7 @@ onBeforeUnmount(() => {
 
 .runtime-resource-panel {
   height: 100%;
-  min-height: 360px;
+  min-height: 0;
   display: flex;
   flex-direction: column;
   gap: 8px;
@@ -3278,10 +3288,30 @@ onBeforeUnmount(() => {
   max-height: 100%;
   overflow: auto;
   overscroll-behavior: contain;
-  scrollbar-gutter: stable;
+  scrollbar-width: none;
   border: 1px solid #17243a;
   border-radius: var(--aifar-radius);
   background: #08111f;
+}
+
+.runtime-log-virtual-list::-webkit-scrollbar {
+  width: 0;
+  height: 0;
+  display: none;
+}
+
+.runtime-log-virtual-list.is-empty {
+  display: grid;
+  place-items: center;
+}
+
+.runtime-log-empty-state {
+  display: grid;
+  place-items: center;
+  min-height: 100%;
+  color: rgba(203, 213, 225, 0.62);
+  font-size: 13px;
+  line-height: 20px;
 }
 
 .runtime-log-row {
