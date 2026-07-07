@@ -985,3 +985,7 @@
 - 结论：已增强公共 `LogOutput` 挂载和内容变化后的自动贴底滚动，并给日志输出增加可见内部滚动条；AIFAR Runtime 虚拟日志改为双帧滚到底以等待虚拟列表重算完成，筛选/关键字变化时自动贴底，同时恢复纵向/横向内部滚动条；`pnpm web:build` 和 `git diff --check` 通过。
 - 问题：用户反馈 AIFAR Runtime 日志页黑色日志框仍没有内部滚动条，内容继续把页面向下撑开。
 - 结论：根因是日志模式仍有 auto-height/flex 链路，日志 viewport 会随内容扩高导致 overflow 不触发；已将 Runtime 日志模式的 workspace、tabs、workbench 改为固定剩余高度链路，workbench 使用 grid，黑色日志框强制内部纵向/横向滚动；`pnpm web:build` 和 `git diff --check` 通过。
+- 问题：用户询问容器日志 SSE 不动态输出是否因为本地时间和服务器时间不一致。
+- 结论：普通容器日志 SSE 当前是后端每 2 秒按 Docker 日志时间戳计算 `--since` 增量轮询，浏览器本地时间通常不是主因；若目标 Docker 主机时间本身异常、旧日志时间戳在未来、或使用 `since=now` 才可能导致游标落到未来而看不到新增。AIFAR Runtime 日志 SSE 已改为 `docker logs --follow`，更不依赖本地时间。
+- 问题：用户反馈 `/aifar/apps/admin/runtime/logs/<service>` 下的目录都是空的。
+- 结论：原因是此前只创建并挂载了 `/opt/aifar/logs`，但 Java 服务实际按镜像 WORKDIR 下的相对 `log/...` 写文件，web-vue3/Nginx 写 `/var/log/nginx`；已让 Runtime spec 同时把同一宿主机目录挂到 Java `WORKDIR/log` 和 web-vue3 `/var/log/nginx`，继续保留 `/opt/aifar/logs`，后续重建 Pod 后文件日志会落盘到该目录。

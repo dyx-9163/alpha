@@ -1013,6 +1013,8 @@ func TestRuntimeSpecTemplatesMountPerServiceLogVolume(t *testing.T) {
 				`log_dir="$LOG_DIR/$service"`,
 				`mkdir -p "$log_dir"`,
 				`"target":"/opt/aifar/logs"`,
+				`"target":"/var/log/nginx"`,
+				`"target":"/data/aifarsoft/javaApi/aifar-%s/log"`,
 				`"AIFAR_LOG_DIR":"/opt/aifar/logs"`,
 				`"LOG_DIR":"/opt/aifar/logs"`,
 			} {
