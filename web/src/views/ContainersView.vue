@@ -3026,6 +3026,9 @@ onBeforeUnmount(() => {
 }
 
 .workspace-card.containers-main.is-runtime-logs {
+  flex: 1 1 0;
+  height: 100%;
+  min-height: 0;
   overflow: hidden;
 }
 
@@ -3124,7 +3127,8 @@ onBeforeUnmount(() => {
 
 .runtime-workspace {
   display: flex;
-  flex: 1 1 auto;
+  flex: 1 1 0;
+  height: 100%;
   min-height: 0;
   flex-direction: column;
   gap: 10px;
@@ -3152,10 +3156,12 @@ onBeforeUnmount(() => {
 }
 
 .runtime-resource-tabs {
-  flex: 1 1 auto;
+  flex: 1 1 0;
+  height: 100%;
   min-height: 0;
   display: flex;
   flex-direction: column;
+  overflow: hidden;
 }
 
 .runtime-resource-tabs :deep(.el-tabs__header) {
@@ -3248,10 +3254,11 @@ onBeforeUnmount(() => {
 }
 
 .runtime-log-workbench {
-  flex: 1 1 auto;
+  flex: 1 1 0;
+  height: 100%;
   min-height: 0;
-  display: flex;
-  flex-direction: column;
+  display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr);
   gap: 8px;
   overflow: hidden;
 }
@@ -3309,11 +3316,11 @@ onBeforeUnmount(() => {
 }
 
 .runtime-log-virtual-list {
-  flex: 1 1 auto;
+  min-width: 0;
   min-height: 0;
-  height: 100%;
-  max-height: 100%;
-  overflow: auto;
+  height: auto;
+  overflow-x: auto;
+  overflow-y: scroll;
   overscroll-behavior: contain;
   scrollbar-gutter: stable;
   scrollbar-width: thin;

@@ -983,3 +983,5 @@
 - 结论：已将 `GlobalTaskProgress` 从内容流改为右上角 fixed 浮层通知卡片，保留点击进入任务详情和收起能力；主页面不再因任务条被向下挤压，实时连接状态条暂时保持原位置；`pnpm web:build` 和 `git diff --check` 通过。
 - 问题：用户反馈日志加载窗口应自动展示最新一条，不能卡在半截位置，并且日志窗口内部需要可见滚动条以便阅读全文。
 - 结论：已增强公共 `LogOutput` 挂载和内容变化后的自动贴底滚动，并给日志输出增加可见内部滚动条；AIFAR Runtime 虚拟日志改为双帧滚到底以等待虚拟列表重算完成，筛选/关键字变化时自动贴底，同时恢复纵向/横向内部滚动条；`pnpm web:build` 和 `git diff --check` 通过。
+- 问题：用户反馈 AIFAR Runtime 日志页黑色日志框仍没有内部滚动条，内容继续把页面向下撑开。
+- 结论：根因是日志模式仍有 auto-height/flex 链路，日志 viewport 会随内容扩高导致 overflow 不触发；已将 Runtime 日志模式的 workspace、tabs、workbench 改为固定剩余高度链路，workbench 使用 grid，黑色日志框强制内部纵向/横向滚动；`pnpm web:build` 和 `git diff --check` 通过。
