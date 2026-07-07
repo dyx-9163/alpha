@@ -945,3 +945,9 @@
 - 结论：根因是清空只清前端 buffer，后端 SSE 仍沿用旧游标；同时后端首次增量去重基线来自整段 snapshot，重复内容日志可能被误判为旧日志。已改为清空时带 `since=当前时间` 重建日志 SSE，后端 snapshot 和 batch 均支持 since，并把去重基线限制在当前 overlap 时间窗口内。
 - 问题：用户要求在 AIFAR Runtime Deployments 列表增加缩容功能。
 - 结论：新增 `/api/v2/containers/aifar/services/{service}/scale-in`，后端按控制面当前 desiredReplicas 计算 `-1` 目标副本并复用 `ScaleService` 任务/审计链路；前端在 Deployment 操作列新增“缩容副本”，仅当期望副本数大于 1 时可用，缩到 0 仍要求使用“下线”。
+
+## 2026-07-07
+- 问题：用户需要给阿尔及利亚项目客户提供迁移计划，覆盖时间、服务器资源、数据库和 MinIO 备份、新 HA 部署、数据还原和 DNS 切换。
+- 结论：迁移计划应按 T-7 准备、T-1 冻结/预备份、割接窗口停写备份、部署/验证新 HA、恢复数据库与 MinIO、DNS 灰度切换、回滚与验收来组织，并明确 HA 资源建议、备份校验、DNS TTL、回滚条件和客户配合项。
+- 问题：用户要求将阿尔及利亚项目迁移计划输出为 Markdown 文件。
+- 结论：已创建 `outputs/algeria-migration-plan.md`，内容包含迁移目标、时间计划、服务器资源、数据库/MinIO 备份与还原、新 HA 部署、DNS 切换、回滚、验收和迁移当天检查清单。
