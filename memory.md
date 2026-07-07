@@ -989,3 +989,5 @@
 - 结论：普通容器日志 SSE 当前是后端每 2 秒按 Docker 日志时间戳计算 `--since` 增量轮询，浏览器本地时间通常不是主因；若目标 Docker 主机时间本身异常、旧日志时间戳在未来、或使用 `since=now` 才可能导致游标落到未来而看不到新增。AIFAR Runtime 日志 SSE 已改为 `docker logs --follow`，更不依赖本地时间。
 - 问题：用户反馈 `/aifar/apps/admin/runtime/logs/<service>` 下的目录都是空的。
 - 结论：原因是此前只创建并挂载了 `/opt/aifar/logs`，但 Java 服务实际按镜像 WORKDIR 下的相对 `log/...` 写文件，web-vue3/Nginx 写 `/var/log/nginx`；已让 Runtime spec 同时把同一宿主机目录挂到 Java `WORKDIR/log` 和 web-vue3 `/var/log/nginx`，继续保留 `/opt/aifar/logs`，后续重建 Pod 后文件日志会落盘到该目录。
+- 问题：用户确认宿主机日志是否应该挂载到 `admin/runtime/logs` 下。
+- 结论：是的；AIFAR 实例安装根为 `/aifar/apps/admin` 时，模板中 `RUNTIME_DIR="$INSTALL_ROOT/runtime"`、`LOG_DIR="$RUNTIME_DIR/logs"`、`log_dir="$LOG_DIR/$service"`，所以宿主机 source 是 `/aifar/apps/admin/runtime/logs/<service>`；`/opt/aifar/logs` 等路径只是容器内 target。
