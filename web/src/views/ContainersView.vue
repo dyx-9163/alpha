@@ -1677,10 +1677,28 @@ function handleRuntimeLogScroll(event: Event) {
 
 async function scrollRuntimeLogsToBottom() {
   await nextTick()
+  await nextFrame()
   const viewport = runtimeLogViewport.value
   if (viewport) {
-    viewport.scrollTop = viewport.scrollHeight
+    setRuntimeLogScrollBottom(viewport)
   }
+  await nextTick()
+  await nextFrame()
+  if (runtimeLogViewport.value) {
+    setRuntimeLogScrollBottom(runtimeLogViewport.value)
+  }
+}
+
+function setRuntimeLogScrollBottom(viewport: HTMLElement) {
+  const maxScroll = Math.max(0, viewport.scrollHeight - viewport.clientHeight)
+  viewport.scrollTop = maxScroll
+  runtimeLogScrollTop.value = maxScroll
+}
+
+function nextFrame() {
+  return new Promise<void>((resolve) => {
+    window.requestAnimationFrame(() => resolve())
+  })
 }
 
 function clearRuntimeLogServiceFilter() {
@@ -2925,6 +2943,15 @@ watch([runtimeLogServiceFilter, runtimeLogPodFilter, runtimeLogTail], () => {
     loadRuntimeLogs(true)
   }
 }, { deep: true })
+watch(
+  () => [filteredRuntimeLogRows.value.length, runtimeLogLevelFilter.value.join(','), runtimeLogKeyword.value],
+  () => {
+    if (runtimeLogAutoScroll.value) {
+      void scrollRuntimeLogsToBottom()
+    }
+  },
+  { flush: 'post' }
+)
 watch(() => realtime.revision, () => {
   const event = realtime.lastEvent
   if (!event?.resource) {
@@ -3288,16 +3315,27 @@ onBeforeUnmount(() => {
   max-height: 100%;
   overflow: auto;
   overscroll-behavior: contain;
-  scrollbar-width: none;
+  scrollbar-gutter: stable;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(148, 163, 184, 0.55) rgba(15, 23, 42, 0.35);
   border: 1px solid #17243a;
   border-radius: var(--aifar-radius);
   background: #08111f;
 }
 
 .runtime-log-virtual-list::-webkit-scrollbar {
-  width: 0;
-  height: 0;
-  display: none;
+  width: 10px;
+  height: 10px;
+}
+
+.runtime-log-virtual-list::-webkit-scrollbar-thumb {
+  border: 2px solid #08111f;
+  border-radius: 999px;
+  background: rgba(148, 163, 184, 0.6);
+}
+
+.runtime-log-virtual-list::-webkit-scrollbar-track {
+  background: rgba(15, 23, 42, 0.35);
 }
 
 .runtime-log-virtual-list.is-empty {

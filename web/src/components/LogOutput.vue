@@ -13,7 +13,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, nextTick, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, ref, watch } from 'vue'
 
 type LogLine = {
   id?: string | number
@@ -44,17 +44,15 @@ const normalizedLines = computed(() => props.lines.map((line) => ({
 
 watch(
   () => [normalizedLines.value.length, displayText.value],
-  async () => {
-    if (!props.autoScroll) {
-      return
-    }
-    await nextTick()
-    if (root.value) {
-      root.value.scrollTop = root.value.scrollHeight
-    }
+  () => {
+    void scrollToBottom()
   },
   { flush: 'post' }
 )
+
+onMounted(() => {
+  void scrollToBottom()
+})
 
 function lineKey(line: LogLine) {
   return line.id ?? `${line.createdAt ?? ''}-${line.level ?? ''}-${line.message}`
@@ -70,6 +68,26 @@ function formatTime(value?: string) {
   }
   return date.toLocaleString()
 }
+
+async function scrollToBottom() {
+  if (!props.autoScroll) {
+    return
+  }
+  await nextTick()
+  await nextFrame()
+  const node = root.value
+  if (!node) {
+    return
+  }
+  node.scrollTop = Math.max(0, node.scrollHeight - node.clientHeight)
+  node.scrollLeft = 0
+}
+
+function nextFrame() {
+  return new Promise<void>((resolve) => {
+    window.requestAnimationFrame(() => resolve())
+  })
+}
 </script>
 
 <style scoped>
@@ -78,6 +96,10 @@ function formatTime(value?: string) {
   max-width: 100%;
   min-height: 0;
   overflow: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(148, 163, 184, .5) rgba(15, 23, 42, .25);
   background: var(--aifar-code-bg);
   color: #dbeafe;
   font-family: Consolas, "SFMono-Regular", monospace;
@@ -86,6 +108,21 @@ function formatTime(value?: string) {
   padding: 12px;
   white-space: pre-wrap;
   border-radius: var(--aifar-radius-lg);
+}
+
+.log-output::-webkit-scrollbar {
+  width: 9px;
+  height: 9px;
+}
+
+.log-output::-webkit-scrollbar-thumb {
+  border: 2px solid rgba(15, 23, 42, .9);
+  border-radius: 999px;
+  background: rgba(148, 163, 184, .58);
+}
+
+.log-output::-webkit-scrollbar-track {
+  background: rgba(15, 23, 42, .24);
 }
 
 .log-lines {
