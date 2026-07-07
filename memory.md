@@ -937,3 +937,5 @@
 - 结论：当前日志入口原本只聚合 `docker logs`，本轮已让 runtime Pod 统一使用 Docker `json-file` 日志驱动并启用 `max-size=50m`、`max-file=5` 自动轮转；安装/更新/补装/配置/扩缩容脚本都会为每个服务创建 `$RUNTIME_DIR/logs/<service>` 并挂载到容器 `/opt/aifar/logs`。前端日志页改为多 Pod 合并时间线表格，服务页移除 Nacos 列，`Ingress / Nacos` 收敛为“入口与发现”页签，只展示 Web/Gateway 入口和 Nacos 发现状态；`go test ./internal/runtimeagent ./internal/apps/aifar`、`pnpm test`、`pnpm web:build`、`git diff --check` 通过。
 - 问题：用户反馈页面仍在主动刷新，尤其日志和状态显得“很呆”，希望后端给结果，不要页面定时刷新。
 - 结论：已取消数据库/Nacos 页前端 30 秒自动监测定时器，并将手动检测等待改为监听全局 `task.finished` SSE 事件；AIFAR Runtime 日志新增 `/containers/aifar/runtime/logs/events` 长连接，前端日志页改为 EventSource 订阅；collector 状态事件新增 snapshot payload，容器页收到 Docker summary 事件可直接应用 payload，不再事件后主动重拉；`pnpm test`、`pnpm web:build`、`git diff --check` 通过。
+- 问题：用户反馈日志页面数据太多可能打崩页面，且日志模块不能选择多个 Pod/服务合并展示，设计不合理。
+- 结论：建议把日志模块从“全量日志表格”升级为“选择集 + 服务端流式聚合 + 前端虚拟列表”：默认不加载全部 Pod，用户先选择服务/Pod/级别/时间窗口，再由后端按选中范围合并、限流、增量推送；前端只保留有界 ring buffer 和虚拟滚动，并支持保存常用组合。
