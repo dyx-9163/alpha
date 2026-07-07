@@ -370,20 +370,16 @@ func (a *API) containerLogsEvents(w http.ResponseWriter, r *http.Request) {
 		flush()
 	}
 
-	stateSince := runtimeLogInitialSince(requestedSince)
+	stateSince := runtimeLogNextSince(logs, runtimeLogInitialSince(requestedSince), requestedSince)
 	stateCounts := runtimeLogLineCounts(runtimeLogLinesSince(logs, stateSince))
 	emitBatch := func() {
-		startedAt := time.Now()
 		lines, logErr := dockerContainerLogsForTarget(r.Context(), server, useServer, host, id, adapter.DockerLogOptions{
 			Tail:       batch,
 			Since:      stateSince,
 			Timestamps: true,
 		})
 		newLines, _ := runtimeLogNewLines(lines, stateCounts)
-		nextSince := startedAt.Add(-3 * time.Second)
-		if !requestedSince.IsZero() && nextSince.Before(requestedSince) {
-			nextSince = requestedSince
-		}
+		nextSince := runtimeLogNextSince(lines, stateSince, requestedSince)
 		stateSince = nextSince
 		stateCounts = runtimeLogLineCounts(runtimeLogLinesSince(lines, nextSince))
 		if len(newLines) == 0 && logErr == nil {

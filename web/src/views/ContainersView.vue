@@ -355,6 +355,8 @@
                       </div>
                     </div>
                     <div class="runtime-log-stats">
+                      <el-tag size="small" :type="runtimeLogStreamTagType">{{ runtimeLogStreamStatusLabel }}</el-tag>
+                      <span v-if="runtimeLogLastDataAt">{{ t('containers.logStreamLastEvent', { time: runtimeLogLastDataAt }) }}</span>
                       <span>{{ t('containers.visibleLogRows', { count: filteredRuntimeLogRows.length }) }}</span>
                       <span v-if="runtimeLogDroppedRows">{{ t('containers.droppedLogRows', { count: runtimeLogDroppedRows }) }}</span>
                       <span v-if="runtimeLogPendingCount">{{ t('containers.pendingLogRows', { count: runtimeLogPendingCount }) }}</span>
@@ -877,6 +879,8 @@ const runtimeLogAutoScroll = ref(true)
 const runtimeLogDroppedRows = ref(0)
 const runtimeLogScrollTop = ref(0)
 const runtimeLogViewport = ref<HTMLElement | null>(null)
+const runtimeLogStreamStatus = ref<'idle' | 'connecting' | 'connected' | 'reconnecting' | 'error'>('idle')
+const runtimeLogLastDataAt = ref('')
 let runtimeLogSource: EventSource | null = null
 let runtimeLogStreamKey = ''
 let runtimeLogSequence = 0
@@ -1114,6 +1118,20 @@ const runtimeLogTopSpacer = computed(() => runtimeLogVirtualStart.value * runtim
 const runtimeLogBottomSpacer = computed(() => Math.max(0, (filteredRuntimeLogRows.value.length - runtimeLogVirtualStart.value - runtimeLogVirtualRows.value.length) * runtimeLogRowHeight))
 const runtimeLogWarnings = computed(() => asArray<string>(runtimeLogs.value.warnings))
 const runtimeLogPendingCount = computed(() => runtimeLogPendingRows.value.length)
+const runtimeLogStreamStatusLabel = computed(() => t(`containers.logStream.${runtimeLogStreamStatus.value}`))
+const runtimeLogStreamTagType = computed(() => {
+  switch (runtimeLogStreamStatus.value) {
+    case 'connected':
+      return 'success'
+    case 'connecting':
+    case 'reconnecting':
+      return 'warning'
+    case 'error':
+      return 'danger'
+    default:
+      return 'info'
+  }
+})
 const installedRuntimeServiceNamesList = computed(() => aifarServiceOptions.map((item) => item.value).filter((service) => installedRuntimeServiceNames.value.has(service)))
 const missingRuntimeServiceOptions = computed(() => aifarServiceOptions.filter((item) => !installedRuntimeServiceNames.value.has(item.value)))
 const runtimeInstanceManageDisabledReason = computed(() => {
@@ -1446,6 +1464,8 @@ function openRuntimeLogStream(force = false) {
   params.set('batch', '200')
   if (runtimeLogSinceSeconds.value > 0) {
     params.set('since', String(runtimeLogSinceSeconds.value))
+  } else if (runtimeLogSinceSeconds.value < 0) {
+    params.set('fromEnd', '1')
   }
   if (runtimeLogServiceFilter.value.length) {
     params.set('services', runtimeLogServiceFilter.value.join(','))
@@ -1456,6 +1476,18 @@ function openRuntimeLogStream(force = false) {
   const source = new EventSource(apiEventSourceUrl(`/containers/aifar/runtime/logs/events?${params.toString()}`))
   runtimeLogSource = source
   runtimeLogStreamKey = key
+  runtimeLogStreamStatus.value = 'connecting'
+  runtimeLogsLoaded.value = { ...runtimeLogsLoaded.value, [key]: true }
+  source.onopen = () => {
+    if (runtimeLogSource === source) {
+      runtimeLogStreamStatus.value = 'connected'
+    }
+  }
+  source.onerror = () => {
+    if (runtimeLogSource === source) {
+      runtimeLogStreamStatus.value = 'reconnecting'
+    }
+  }
   const applySnapshot = (event: Event) => {
     if (runtimeLogSource !== source) {
       return
@@ -1464,6 +1496,7 @@ function openRuntimeLogStream(force = false) {
     if (!next) {
       return
     }
+    markRuntimeLogDataReceived()
     applyRuntimeLogResponse(next, true)
     runtimeLogsLoaded.value = { ...runtimeLogsLoaded.value, [key]: true }
   }
@@ -1475,6 +1508,7 @@ function openRuntimeLogStream(force = false) {
     if (!next) {
       return
     }
+    markRuntimeLogDataReceived()
     applyRuntimeLogResponse(next, false)
     runtimeLogsLoaded.value = { ...runtimeLogsLoaded.value, [key]: true }
   }
@@ -1486,6 +1520,7 @@ function openRuntimeLogStream(force = false) {
       return
     }
     const message = parseRuntimeLogErrorEvent((event as MessageEvent).data)
+    runtimeLogStreamStatus.value = 'error'
     runtimeLogs.value = { ...runtimeLogs.value, warnings: message ? [message] : [] }
     runtimeLogsLoaded.value = { ...runtimeLogsLoaded.value, [key]: true }
   })
@@ -1497,6 +1532,12 @@ function closeRuntimeLogStream() {
     runtimeLogSource = null
   }
   runtimeLogStreamKey = ''
+  runtimeLogStreamStatus.value = 'idle'
+}
+
+function markRuntimeLogDataReceived() {
+  runtimeLogStreamStatus.value = 'connected'
+  runtimeLogLastDataAt.value = new Date().toLocaleTimeString()
 }
 
 function parseRuntimeLogsEvent(raw: string) {
@@ -1524,6 +1565,7 @@ function resetRuntimeLogView() {
   runtimeLogDroppedRows.value = 0
   runtimeLogSequence = 0
   runtimeLogScrollTop.value = 0
+  runtimeLogLastDataAt.value = ''
 }
 
 function applyRuntimeLogResponse(next: AifarRuntimeLogsResponse, replace: boolean) {
@@ -1611,7 +1653,7 @@ function toggleRuntimeLogPaused() {
 
 function clearRuntimeLogView() {
   const shouldRestart = runtimeLogSelectionReady.value && (Boolean(runtimeLogSource) || runtimeLogsLoadedForCurrentScope.value)
-  runtimeLogSinceSeconds.value = Math.floor(Date.now() / 1000)
+  runtimeLogSinceSeconds.value = -1
   runtimeLogRows.value = []
   runtimeLogPendingRows.value = []
   runtimeLogs.value = {

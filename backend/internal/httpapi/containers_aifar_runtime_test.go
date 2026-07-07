@@ -177,6 +177,21 @@ func TestAIFARRuntimeLogQuerySupportsSelectionSetsAndDedup(t *testing.T) {
 	if strings.Join(recent, "|") != "2026-07-07T10:00:02Z repeated|2026-07-07T10:00:03Z repeated|line without timestamp" {
 		t.Fatalf("unexpected overlap lines: %+v", recent)
 	}
+
+	if !runtimeLogInitialSince(time.Time{}).IsZero() {
+		t.Fatal("expected empty log stream to start without local wall-clock since cursor")
+	}
+	nextSince := runtimeLogNextSince([]string{
+		"2026-07-07T10:00:01Z same message",
+		"2026-07-07T10:00:20Z same message",
+	}, time.Unix(100, 0), time.Time{})
+	if !nextSince.Equal(time.Date(2026, 7, 7, 10, 0, 17, 0, time.UTC)) {
+		t.Fatalf("unexpected next since cursor: %s", nextSince)
+	}
+	floored := runtimeLogNextSince([]string{"2026-07-07T10:00:20Z line"}, time.Time{}, time.Date(2026, 7, 7, 10, 0, 19, 0, time.UTC))
+	if !floored.Equal(time.Date(2026, 7, 7, 10, 0, 19, 0, time.UTC)) {
+		t.Fatalf("expected cursor floor to win, got %s", floored)
+	}
 }
 
 func TestAIFARRuntimeServiceSummaryIgnoresNilResidualRecords(t *testing.T) {

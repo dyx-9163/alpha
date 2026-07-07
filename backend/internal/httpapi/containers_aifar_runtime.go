@@ -258,17 +258,30 @@ func (a *API) aifarRuntimeLogsEvents(w http.ResponseWriter, r *http.Request) {
 			flusher.Flush()
 		}
 	}
-	snapshot, err := a.collectAIFARRuntimeLogsForPods(r.Context(), server, instance, query, pods, adapter.DockerLogOptions{Tail: query.Tail, Since: query.Since, Timestamps: true}, "snapshot")
+	snapshotOptions := adapter.DockerLogOptions{Tail: query.Tail, Since: query.Since, Timestamps: true}
+	if query.FromEnd {
+		snapshotOptions = adapter.DockerLogOptions{Tail: query.BatchSize, Timestamps: true}
+	}
+	seedSnapshot, err := a.collectAIFARRuntimeLogsForPods(r.Context(), server, instance, query, pods, snapshotOptions, "snapshot")
 	if err != nil {
 		emitError(err)
 	} else {
+		snapshot := seedSnapshot
+		if query.FromEnd {
+			snapshot.Pods = make([]aifarRuntimeLogPod, len(seedSnapshot.Pods))
+			for i := range snapshot.Pods {
+				snapshot.Pods[i] = seedSnapshot.Pods[i]
+				snapshot.Pods[i].Logs = nil
+				snapshot.Pods[i].LineCount = 0
+			}
+		}
 		snapshot.Warnings = append(snapshot.Warnings, warnings...)
 		writeSSE(w, "runtime-logs-snapshot", snapshot)
 		if flusher != nil {
 			flusher.Flush()
 		}
-		initialSince := runtimeLogInitialSince(query.Since)
-		for _, item := range snapshot.Pods {
+		for _, item := range seedSnapshot.Pods {
+			initialSince := runtimeLogNextSince(item.Logs, runtimeLogInitialSince(query.Since), query.Since)
 			states[item.ContainerName] = runtimeLogStreamState{
 				Since:           initialSince,
 				LastFetchCounts: runtimeLogLineCounts(runtimeLogLinesSince(item.Logs, initialSince)),
@@ -294,17 +307,13 @@ func (a *API) aifarRuntimeLogsEvents(w http.ResponseWriter, r *http.Request) {
 			if state.Since.IsZero() {
 				state.Since = runtimeLogInitialSince(query.Since)
 			}
-			startedAt := time.Now()
 			logs, logErr := adapter.DockerContainerLogsForServerWithOptions(r.Context(), server, pod.ContainerName, adapter.DockerLogOptions{
 				Tail:       query.BatchSize,
 				Since:      state.Since,
 				Timestamps: true,
 			})
 			newLogs, _ := runtimeLogNewLines(logs, state.LastFetchCounts)
-			nextSince := startedAt.Add(-3 * time.Second)
-			if !query.Since.IsZero() && nextSince.Before(query.Since) {
-				nextSince = query.Since
-			}
+			nextSince := runtimeLogNextSince(logs, state.Since, query.Since)
 			states[pod.ContainerName] = runtimeLogStreamState{
 				Since:           nextSince,
 				LastFetchCounts: runtimeLogLineCounts(runtimeLogLinesSince(logs, nextSince)),
@@ -352,6 +361,7 @@ type aifarRuntimeLogQuery struct {
 	Services     []string
 	PodSelectors []string
 	Since        time.Time
+	FromEnd      bool
 }
 
 type runtimeLogStreamState struct {
@@ -386,6 +396,7 @@ func (a *API) resolveAIFARRuntimeLogQuery(w http.ResponseWriter, r *http.Request
 		Services:     runtimeQueryValues(r, "service", "services"),
 		PodSelectors: runtimeQueryValues(r, "pod", "pods", "container", "containerName"),
 		Since:        runtimeLogSinceFromRequest(r),
+		FromEnd:      queryBool(r, "fromEnd", false),
 	}, true
 }
 
@@ -1677,7 +1688,7 @@ func runtimeLogInitialSince(requested time.Time) time.Time {
 	if !requested.IsZero() {
 		return requested
 	}
-	return time.Now().Add(-3 * time.Second)
+	return time.Time{}
 }
 
 func runtimeQueryValues(r *http.Request, keys ...string) []string {
@@ -1771,6 +1782,27 @@ func runtimeLogLineTime(line string) (time.Time, bool) {
 		return parsed, true
 	}
 	return time.Time{}, false
+}
+
+func runtimeLogNextSince(lines []string, fallback, floor time.Time) time.Time {
+	latest := time.Time{}
+	for _, line := range lines {
+		stamp, ok := runtimeLogLineTime(line)
+		if !ok {
+			continue
+		}
+		if latest.IsZero() || stamp.After(latest) {
+			latest = stamp
+		}
+	}
+	if latest.IsZero() {
+		return fallback
+	}
+	next := latest.Add(-3 * time.Second)
+	if !floor.IsZero() && next.Before(floor) {
+		return floor
+	}
+	return next
 }
 
 func runtimeLogNewLines(lines []string, previous map[string]int) ([]string, map[string]int) {
