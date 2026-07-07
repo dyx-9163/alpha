@@ -113,6 +113,7 @@ func NewWithRealtime(cfg config.Config, s *store.Store, tasks *worker.Manager, e
 			r.Get("/containers/summary", api.containerSummary)
 			r.Get("/containers", api.containers)
 			r.Get("/containers/aifar/runtime", api.aifarRuntime)
+			r.Get("/containers/aifar/runtime/logs", api.aifarRuntimeLogs)
 			r.Put("/containers/aifar/runtime/config", api.requirePermission(rbac.AppsManage, api.aifarRuntimeConfig))
 			r.Post("/containers/aifar/runtime/reconcile", api.requirePermission(rbac.AppsManage, api.aifarRuntimeReconcile))
 			r.Post("/containers/aifar/runtime/cleanup-stale", api.requirePermission(rbac.AppsManage, api.aifarRuntimeCleanupStale))

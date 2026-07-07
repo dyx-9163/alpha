@@ -274,6 +274,51 @@
                   </el-table>
                 </div>
               </el-tab-pane>
+              <el-tab-pane :label="t('containers.logs')" name="logs">
+                <div class="runtime-resource-panel">
+                  <div class="runtime-tab-toolbar">
+                    <div class="runtime-log-filters">
+                      <el-select v-model="runtimeLogServiceFilter" size="small" clearable class="runtime-service-filter" :placeholder="t('containers.service')" @clear="clearRuntimeLogServiceFilter">
+                        <el-option v-for="service in installedRuntimeServiceNamesList" :key="service" :label="service" :value="service" />
+                      </el-select>
+                      <el-input-number v-model="runtimeLogTail" size="small" class="runtime-log-tail" :min="20" :max="1000" :step="20" controls-position="right" />
+                    </div>
+                    <div class="runtime-tab-actions">
+                      <el-button size="small" :loading="loading" @click="loadRuntimeLogs(true)">{{ t('common.refresh') }}</el-button>
+                    </div>
+                  </div>
+                  <el-alert
+                    v-if="runtimeLogWarnings.length"
+                    type="warning"
+                    :closable="false"
+                    show-icon
+                    :title="runtimeLogWarnings.join('；')"
+                  />
+                  <div v-if="!runtimeLogsLoadedForCurrentScope" class="runtime-lazy-state">
+                    <el-button size="small" type="primary" plain :loading="loading" @click="loadRuntimeLogs(true)">{{ t('containers.loadRuntimeLogs') }}</el-button>
+                  </div>
+                  <div v-else class="runtime-log-groups">
+                    <el-empty v-if="!runtimeLogGroups.length" :description="t('containers.noRuntimeLogs')" />
+                    <template v-else>
+                      <div v-for="group in runtimeLogGroups" :key="group.containerName" class="runtime-log-group">
+                        <div class="runtime-log-group-head">
+                          <div>
+                            <strong>{{ group.serviceName }}</strong>
+                            <span>{{ group.containerName }}</span>
+                          </div>
+                          <div class="runtime-log-meta">
+                            <el-tag size="small">{{ group.revision || '-' }}</el-tag>
+                            <StatusTag :status="aifarRuntimeStatusKind(group.status)" :label="aifarRuntimeStatusLabel(group.status)" />
+                            <span>{{ t('containers.logLines', { count: group.lineCount ?? 0 }) }}</span>
+                          </div>
+                        </div>
+                        <el-alert v-if="group.collectionError" type="warning" :title="group.collectionError" :closable="false" />
+                        <LogOutput :text="runtimeLogText(group)" :empty-text="t('tasks.noLogs')" min-height="180px" />
+                      </div>
+                    </template>
+                  </div>
+                </div>
+              </el-tab-pane>
               <el-tab-pane :label="t('containers.ingressAndNacos')" name="ingress">
                 <div class="runtime-resource-panel">
                   <KeyValueGrid :items="runtimeIngressItems" />
@@ -508,6 +553,7 @@ import type { UploadFile } from 'element-plus'
 import { apiGet, apiPost, apiPostForm, apiPut, asArray } from '../api/client'
 import KeyValueGrid from '../components/KeyValueGrid.vue'
 import LogDrawer from '../components/LogDrawer.vue'
+import LogOutput from '../components/LogOutput.vue'
 import MetricGrid from '../components/MetricGrid.vue'
 import SecretConfirmPrompt from '../components/SecretConfirmPrompt.vue'
 import ServerSelector from '../components/ServerSelector.vue'
@@ -653,6 +699,28 @@ type AifarRuntimeIngress = {
   error?: string
 }
 
+type AifarRuntimeLogPod = {
+  instanceId: string
+  serviceName: string
+  podId?: string
+  containerName: string
+  revision?: string
+  status?: string
+  ready?: boolean
+  logs?: string[]
+  lineCount?: number
+  collectionError?: string
+}
+
+type AifarRuntimeLogsResponse = {
+  serverId?: string
+  instanceId?: string
+  service?: string
+  tail?: number
+  pods?: AifarRuntimeLogPod[]
+  warnings?: string[]
+}
+
 type AifarRuntimeResponse = {
   serverId?: string
   runtimeStatus?: string
@@ -700,10 +768,14 @@ const aifarArtifactFile = ref<File | null>(null)
 const showAifarRuntimeInfra = ref(false)
 const aifarRuntime = ref<AifarRuntimeResponse>({ runtimeStatus: 'unknown', agent: { status: 'unknown' }, instances: [], services: [], pods: [], ingress: [], warnings: [] })
 const selectedRuntimeInstanceId = ref('')
-const runtimeResourceTab = ref<'deployments' | 'services' | 'pods' | 'ingress'>('deployments')
+const runtimeResourceTab = ref<'deployments' | 'services' | 'pods' | 'logs' | 'ingress'>('deployments')
 const runtimePodServiceFilter = ref('')
 const runtimePodsLoaded = ref<Record<string, boolean>>({})
 const runtimePodStatsLoaded = ref<Record<string, boolean>>({})
+const runtimeLogServiceFilter = ref('')
+const runtimeLogTail = ref(200)
+const runtimeLogs = ref<AifarRuntimeLogsResponse>({ pods: [], warnings: [], tail: 200 })
+const runtimeLogsLoaded = ref<Record<string, boolean>>({})
 const runtimeConfigVisible = ref(false)
 const runtimeConfigSubmitting = ref(false)
 const runtimeConfigForm = ref<RuntimeConfigFormValues>({
@@ -892,6 +964,9 @@ const runtimeServiceMap = computed(() => {
 })
 const runtimePodsLoadedForCurrentScope = computed(() => Boolean(runtimePodsLoaded.value[runtimeCacheKey('pods')]))
 const runtimePodStatsLoadedForCurrentScope = computed(() => Boolean(runtimePodStatsLoaded.value[runtimeCacheKey('pods')]))
+const runtimeLogsLoadedForCurrentScope = computed(() => Boolean(runtimeLogsLoaded.value[runtimeLogCacheKey()]))
+const runtimeLogGroups = computed(() => asArray<AifarRuntimeLogPod>(runtimeLogs.value.pods))
+const runtimeLogWarnings = computed(() => asArray<string>(runtimeLogs.value.warnings))
 const installedRuntimeServiceNamesList = computed(() => aifarServiceOptions.map((item) => item.value).filter((service) => installedRuntimeServiceNames.value.has(service)))
 const missingRuntimeServiceOptions = computed(() => aifarServiceOptions.filter((item) => !installedRuntimeServiceNames.value.has(item.value)))
 const runtimeInstanceManageDisabledReason = computed(() => {
@@ -997,6 +1072,10 @@ function collectionCacheKey(kind = activeCollectionKind()) {
 
 function runtimeCacheKey(scope: 'base' | 'pods' = 'base') {
   return `${cacheScope()}:aifar-runtime:${scope}`
+}
+
+function runtimeLogCacheKey() {
+  return `${cacheScope()}:aifar-runtime:logs:${selectedRuntimeInstance.value?.id || 'none'}:${String(runtimeLogServiceFilter.value || '').trim()}:${runtimeLogTail.value}`
 }
 
 async function withLoading<T>(fn: () => Promise<T>) {
@@ -1160,12 +1239,48 @@ function clearRuntimePodServiceFilter() {
   runtimePodServiceFilter.value = ''
 }
 
+async function loadRuntimeLogs(force = false) {
+  return withLoading(async () => {
+    const query = targetQuery()
+    const instance = selectedRuntimeInstance.value
+    if (!query || !instance?.id) {
+      runtimeLogs.value = { pods: [], warnings: [], tail: runtimeLogTail.value }
+      return
+    }
+    const key = runtimeLogCacheKey()
+    if (!force && runtimeLogsLoaded.value[key]) {
+      return
+    }
+    const params = new URLSearchParams(query)
+    params.set('instanceId', instance.id)
+    params.set('tail', String(runtimeLogTail.value))
+    const service = String(runtimeLogServiceFilter.value || '').trim()
+    if (service) {
+      params.set('service', service)
+    }
+    const next = await apiGet<AifarRuntimeLogsResponse>(`/containers/aifar/runtime/logs?${params.toString()}`).catch((err) => {
+      error.value = err.message
+      return { pods: [], warnings: [err.message], tail: runtimeLogTail.value }
+    })
+    runtimeLogs.value = next
+    runtimeLogsLoaded.value = { ...runtimeLogsLoaded.value, [key]: true }
+  })
+}
+
+function clearRuntimeLogServiceFilter() {
+  runtimeLogServiceFilter.value = ''
+}
+
 async function loadActive(force = false) {
   return withLoading(async () => {
     if (tab.value === 'overview') {
       await loadSummary(true, force)
     } else if (tab.value === 'aifar-runtime') {
-      await loadAifarRuntime(force)
+      if (runtimeResourceTab.value === 'logs') {
+        await loadRuntimeLogs(force)
+      } else {
+        await loadAifarRuntime(force)
+      }
     } else {
       await loadCollection(force)
     }
@@ -1304,6 +1419,10 @@ async function openLogs(id: string) {
   const result = await apiGet<{ logs?: string[] }>(`/containers/${encodeURIComponent(id)}/logs?tail=300&${query}`)
   logsText.value = asArray<string>(result.logs).join('\n')
   logsVisible.value = true
+}
+
+function runtimeLogText(group: AifarRuntimeLogPod) {
+  return asArray<string>(group.logs).join('\n')
 }
 
 function onContainerSelectionChange(rows: any[]) {
@@ -2196,10 +2315,24 @@ watch(resourceTab, () => {
 watch(runtimeResourceTab, (next) => {
   if (next === 'pods') {
     void ensureRuntimePodsLoaded(false)
+  } else if (next === 'logs') {
+    void loadRuntimeLogs(false)
   }
 })
 watch(selectedRuntimeInstanceId, () => {
   runtimePodServiceFilter.value = ''
+  runtimeLogServiceFilter.value = ''
+  runtimeLogs.value = { pods: [], warnings: [], tail: runtimeLogTail.value }
+  runtimeLogsLoaded.value = {}
+  if (runtimeResourceTab.value === 'logs') {
+    void loadRuntimeLogs(true)
+  }
+})
+watch([runtimeLogServiceFilter, runtimeLogTail], () => {
+  runtimeLogs.value = { pods: [], warnings: [], tail: runtimeLogTail.value }
+  if (runtimeResourceTab.value === 'logs') {
+    void loadRuntimeLogs(true)
+  }
 })
 watch(() => realtime.revision, () => {
   const event = realtime.lastEvent
@@ -2220,7 +2353,11 @@ watch(() => realtime.revision, () => {
       return
     }
     runtimeCache.value = {}
+    runtimeLogsLoaded.value = {}
     void loadAifarRuntime(true, runtimeResourceTab.value === 'pods', false)
+    if (runtimeResourceTab.value === 'logs') {
+      void loadRuntimeLogs(true)
+    }
   }
 })
 watch(deletePromptVisible, (visible) => {
@@ -2232,6 +2369,8 @@ watch([aifarUpdateService, aifarUpdateMode], () => {
   aifarArtifactFile.value = null
 })
 watch(selectedServerId, () => {
+  runtimeLogs.value = { pods: [], warnings: [], tail: runtimeLogTail.value }
+  runtimeLogsLoaded.value = {}
   if (pageReady.value) {
     void load(true)
   }
@@ -2411,8 +2550,75 @@ onMounted(async () => {
   gap: 8px;
 }
 
+.runtime-log-filters {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
 .runtime-service-filter {
   width: 180px;
+}
+
+.runtime-log-tail {
+  width: 128px;
+}
+
+.runtime-log-groups {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  display: grid;
+  align-content: start;
+  gap: 12px;
+}
+
+.runtime-log-group {
+  display: grid;
+  gap: 8px;
+  padding: 12px;
+  border: 1px solid var(--aifar-border-soft);
+  border-radius: var(--aifar-radius-lg);
+  background: #fff;
+}
+
+.runtime-log-group-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+
+.runtime-log-group-head > div:first-child {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.runtime-log-group-head strong {
+  color: var(--aifar-ink);
+  font-size: 14px;
+  line-height: 20px;
+}
+
+.runtime-log-group-head span {
+  min-width: 0;
+  color: var(--aifar-text-secondary);
+  font-size: 12px;
+  line-height: 18px;
+  word-break: break-all;
+}
+
+.runtime-log-meta {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 6px;
+  color: var(--aifar-text-tertiary);
+  font-size: 12px;
 }
 
 .runtime-lazy-state {
@@ -2513,6 +2719,17 @@ onMounted(async () => {
   .runtime-toolbar {
     align-items: flex-start;
     flex-direction: column;
+  }
+
+  .runtime-tab-toolbar,
+  .runtime-log-group-head {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .runtime-log-filters {
+    width: 100%;
+    flex-wrap: wrap;
   }
 
   .runtime-instance-select {

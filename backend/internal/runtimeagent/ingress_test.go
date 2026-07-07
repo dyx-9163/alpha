@@ -108,6 +108,60 @@ func TestManagerDiscoversReadyDockerPodEndpoints(t *testing.T) {
 	}
 }
 
+func TestManagerRunContainerAddsLoggingLabels(t *testing.T) {
+	runner := &loggingLabelRunner{}
+	manager := NewManager(ManagerOptions{StateDir: t.TempDir(), Runner: runner})
+	spec := NormalizeSpec(RuntimeSpec{
+		InstanceID:  "admin",
+		InstallRoot: "/aifar/apps/admin",
+		Network:     "aifar-network",
+	})
+	deployment := DeploymentSpec{
+		ServiceName:    "oauth",
+		DeploymentName: "alpha-oauth",
+		Image:          "aifar-oauth:rev-1",
+		PodRevision:    "rev-1",
+		Ports:          []ContainerPort{{Name: "http", ContainerPort: 38001}},
+	}
+	if err := manager.runContainer(context.Background(), spec, deployment, 1, "aifar-pod-admin-oauth-rev-1-r1"); err != nil {
+		t.Fatal(err)
+	}
+	calls := runner.callsString()
+	for _, want := range []string{
+		"--label aifar.instance=admin",
+		"--label aifar.deployment=alpha-oauth",
+		"--label aifar.service=oauth",
+		"--label aifar.pod=aifar-pod-admin-oauth-rev-1-r1",
+		"--label aifar.replica=1",
+	} {
+		if !strings.Contains(calls, want) {
+			t.Fatalf("expected docker run label %q, got:\n%s", want, calls)
+		}
+	}
+}
+
+type loggingLabelRunner struct {
+	mu    sync.Mutex
+	calls []string
+}
+
+func (r *loggingLabelRunner) Run(ctx context.Context, name string, args ...string) (CommandResult, error) {
+	call := name + " " + strings.Join(args, " ")
+	r.mu.Lock()
+	r.calls = append(r.calls, call)
+	r.mu.Unlock()
+	if strings.Contains(call, "docker inspect -f {{.State.Running}}|") {
+		return CommandResult{Stdout: "true|healthy\n"}, nil
+	}
+	return CommandResult{Stdout: "ok\n"}, nil
+}
+
+func (r *loggingLabelRunner) callsString() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return strings.Join(r.calls, "\n")
+}
+
 func TestManagerResyncRefreshesEndpointCache(t *testing.T) {
 	gatewayPort := freePort(t)
 	webPort := freePort(t)

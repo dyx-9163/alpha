@@ -90,6 +90,47 @@ func TestAIFARRuntimeCanSkipPodsAndStats(t *testing.T) {
 	}
 }
 
+func TestAIFARRuntimeLogsAggregatesPodContainerLogs(t *testing.T) {
+	api, db, secret := newAuthzTestAPI(t)
+	dockerAPI := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/containers/aifar-pod-admin-permission-rev-1-r1/logs" {
+			http.NotFound(w, r)
+			return
+		}
+		if got := r.URL.Query().Get("tail"); got != "20" {
+			t.Fatalf("expected tail=20, got %q", got)
+		}
+		_, _ = w.Write([]byte("permission line 1\npermission line 2\n"))
+	}))
+	defer dockerAPI.Close()
+	server, instance := seedAIFARRuntimeFixture(t, db, dockerAPI.URL)
+	token := issueTestToken(t, db, secret, "owner", "owner")
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v2/containers/aifar/runtime/logs?serverId="+server.ID+"&instanceId="+instance.ID+"&service=permission&tail=20", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	rec := httptest.NewRecorder()
+
+	api.Router().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	var body aifarRuntimeLogsResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body.ServerID != server.ID || body.InstanceID != instance.ID || body.Service != "permission" || body.Tail != 20 {
+		t.Fatalf("unexpected runtime log response metadata: %+v", body)
+	}
+	if len(body.Pods) != 1 {
+		t.Fatalf("expected one pod log group, got %+v", body.Pods)
+	}
+	got := strings.Join(body.Pods[0].Logs, "\n")
+	if body.Pods[0].ServiceName != "permission" || body.Pods[0].ContainerName != "aifar-pod-admin-permission-rev-1-r1" || !strings.Contains(got, "permission line 2") {
+		t.Fatalf("unexpected pod logs: %+v", body.Pods[0])
+	}
+}
+
 func TestAIFARRuntimeServiceSummaryIgnoresNilResidualRecords(t *testing.T) {
 	api, db, _ := newAuthzTestAPI(t)
 	instance, err := db.SaveAppInstance(store.AppInstance{

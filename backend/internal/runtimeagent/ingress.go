@@ -665,6 +665,10 @@ func (m *Manager) containerNeedsRecreate(ctx context.Context, name string, deplo
 
 func (m *Manager) runContainer(ctx context.Context, spec RuntimeSpec, deployment DeploymentSpec, replica int, name string) error {
 	args := []string{"run", "-d", "--name", name, "--restart", "unless-stopped"}
+	deploymentName := strings.TrimSpace(deployment.DeploymentName)
+	if deploymentName == "" {
+		deploymentName = deployment.ServiceName
+	}
 	args = append(args,
 		"--label", "aifar.app=aifar",
 		"--label", "aifar.runtime-version=2",
@@ -672,6 +676,7 @@ func (m *Manager) runContainer(ctx context.Context, spec RuntimeSpec, deployment
 		"--label", "aifar.install-root="+spec.InstallRoot,
 		"--label", "aifar.component=pod",
 		"--label", "aifar.instance="+spec.InstanceID,
+		"--label", "aifar.deployment="+deploymentName,
 		"--label", "aifar.service="+deployment.ServiceName,
 		"--label", "aifar.revision="+deployment.PodRevision,
 		"--label", "aifar.release="+deployment.PodRevision,

@@ -162,6 +162,28 @@ type aifarRuntimeIngress struct {
 	Error        string `json:"error,omitempty"`
 }
 
+type aifarRuntimeLogsResponse struct {
+	ServerID   string               `json:"serverId"`
+	InstanceID string               `json:"instanceId"`
+	Service    string               `json:"service,omitempty"`
+	Tail       int                  `json:"tail"`
+	Pods       []aifarRuntimeLogPod `json:"pods"`
+	Warnings   []string             `json:"warnings,omitempty"`
+}
+
+type aifarRuntimeLogPod struct {
+	InstanceID      string   `json:"instanceId"`
+	ServiceName     string   `json:"serviceName"`
+	PodID           string   `json:"podId,omitempty"`
+	ContainerName   string   `json:"containerName"`
+	Revision        string   `json:"revision,omitempty"`
+	Status          string   `json:"status,omitempty"`
+	Ready           bool     `json:"ready"`
+	Logs            []string `json:"logs"`
+	LineCount       int      `json:"lineCount"`
+	CollectionError string   `json:"collectionError,omitempty"`
+}
+
 type aifarRuntimeActionRequest struct {
 	InstanceID string `json:"instanceId"`
 	Reason     string `json:"reason"`
@@ -197,6 +219,77 @@ func (a *API) aifarRuntime(w http.ResponseWriter, r *http.Request) {
 		IncludeStats: queryBool(r, "includeStats", true),
 	})
 	respond(w, response, err)
+}
+
+func (a *API) aifarRuntimeLogs(w http.ResponseWriter, r *http.Request) {
+	lang := languageFromRequest(r)
+	server, useServer, err := a.dockerServerFromRequest(r)
+	if err != nil {
+		respond(w, nil, err)
+		return
+	}
+	if !useServer {
+		writeError(w, http.StatusBadRequest, "DOCKER_TARGET_REQUIRED", i18n.Text(lang, "api.dockerTargetRequired"), nil)
+		return
+	}
+	instanceID := strings.TrimSpace(r.URL.Query().Get("instanceId"))
+	instance, err := a.findAIFARInstanceForRuntimeAction(server.ID, instanceID)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "AIFAR_INSTANCE_REQUIRED", err.Error(), nil)
+		return
+	}
+	if strings.TrimSpace(runtimeString(runtimeMetadata(instance.Metadata), "orchestrationModel", "")) != aifarK8sLikeModel {
+		writeError(w, http.StatusConflict, "AIFAR_RUNTIME_REINSTALL_REQUIRED", "legacy AIFAR orchestration model does not support runtime log aggregation; reinstall with agent-runtime-v2", map[string]any{"instanceId": instance.ID})
+		return
+	}
+
+	tail := boundedRuntimeLogTail(queryInt(r, "tail", 200))
+	service := cleanRuntimeText(r.URL.Query().Get("service"))
+	podSelector := cleanRuntimeText(firstNonEmptyRuntimeQuery(r, "pod", "container", "containerName"))
+	pods, err := a.store.ListAIFARPods(instance.ID)
+	if err != nil {
+		respond(w, nil, err)
+		return
+	}
+	pods = filterRuntimeLogPods(pods, service, podSelector)
+	sort.Slice(pods, func(i, j int) bool {
+		if pods[i].ServiceName == pods[j].ServiceName {
+			return pods[i].ContainerName < pods[j].ContainerName
+		}
+		return pods[i].ServiceName < pods[j].ServiceName
+	})
+
+	response := aifarRuntimeLogsResponse{
+		ServerID:   server.ID,
+		InstanceID: instance.ID,
+		Service:    service,
+		Tail:       tail,
+		Pods:       []aifarRuntimeLogPod{},
+	}
+	if len(pods) > 64 {
+		response.Warnings = append(response.Warnings, "runtime log query matched more than 64 pods; showing the first 64")
+		pods = pods[:64]
+	}
+	for _, pod := range pods {
+		logs, logErr := adapter.DockerContainerLogsForServer(r.Context(), server, pod.ContainerName, tail)
+		item := aifarRuntimeLogPod{
+			InstanceID:    pod.InstanceID,
+			ServiceName:   pod.ServiceName,
+			PodID:         pod.PodID,
+			ContainerName: pod.ContainerName,
+			Revision:      cleanRuntimeText(pod.Revision),
+			Status:        cleanRuntimeText(pod.Status),
+			Ready:         pod.Ready,
+			Logs:          logs,
+			LineCount:     len(logs),
+		}
+		if logErr != nil {
+			item.CollectionError = logErr.Error()
+			response.Warnings = append(response.Warnings, pod.ContainerName+": "+logErr.Error())
+		}
+		response.Pods = append(response.Pods, item)
+	}
+	writeJSON(w, http.StatusOK, response)
 }
 
 func (a *API) aifarRuntimeReconcile(w http.ResponseWriter, r *http.Request) {
@@ -1294,6 +1387,44 @@ func cleanRuntimeText(value string) string {
 	default:
 		return text
 	}
+}
+
+func boundedRuntimeLogTail(value int) int {
+	if value <= 0 {
+		return 200
+	}
+	if value > 1000 {
+		return 1000
+	}
+	return value
+}
+
+func firstNonEmptyRuntimeQuery(r *http.Request, keys ...string) string {
+	for _, key := range keys {
+		if value := strings.TrimSpace(r.URL.Query().Get(key)); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func filterRuntimeLogPods(pods []store.AIFARPod, service, podSelector string) []store.AIFARPod {
+	service = cleanRuntimeText(service)
+	podSelector = cleanRuntimeText(podSelector)
+	out := make([]store.AIFARPod, 0, len(pods))
+	for _, pod := range pods {
+		if strings.TrimSpace(pod.ContainerName) == "" {
+			continue
+		}
+		if service != "" && pod.ServiceName != service {
+			continue
+		}
+		if podSelector != "" && pod.PodID != podSelector && pod.ContainerName != podSelector {
+			continue
+		}
+		out = append(out, pod)
+	}
+	return out
 }
 
 func runtimeInt(metadata map[string]any, key string, fallback int) int {

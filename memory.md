@@ -923,3 +923,5 @@
 - 结论：已在 `codex/status-collector-realtime` 分支创建本地提交，提交内容包含后端 collector/realtime/status snapshot、前端实时状态条和事件驱动刷新，以及本轮配置与记忆更新；未推送远端。
 - 问题：用户强调后续代码必须提交到本地仓库，并询问多实例 Docker 容器日志缺少统一管理时应采用什么方案。
 - 结论：后续凡涉及代码、配置或文档落盘变更，完成验证后都要提交到当前本地分支；多实例日志建议建设独立 Logging Plane，容器统一打 AIFAR 标准 labels，由每台服务器的 Fluent Bit/Vector 采集 Docker json-file 日志并写入 Loki/OpenSearch，AIFAR 后端只做查询/尾随代理、权限过滤、任务/实例关联和元数据落库，不把完整日志写入 SQLite。
+- 问题：用户要求继续执行多实例容器日志统一管理方案。
+- 结论：已完成第一阶段统一日志入口：Runtime agent 创建 Pod 容器时新增 `aifar.deployment` 标准 label；后端新增 `GET /api/v2/containers/aifar/runtime/logs`，按 server/instance/service/pod 聚合读取 AIFAR Runtime Pod 的 Docker logs，返回 Pod 分组和局部采集错误；前端 AIFAR Runtime 新增“日志”资源页签，支持按服务筛选、tail 行数控制和 Pod 分组展示。`go test ./internal/httpapi ./internal/runtimeagent`、`pnpm web:build`、`pnpm test`、`git diff --check` 通过。
