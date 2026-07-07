@@ -443,7 +443,7 @@ async function runRealtimeCheck(manual: boolean) {
 }
 
 function isMonitorableInstance(instance: AppInstance) {
-  return ['mysql', 'redis', 'mysql-router'].includes(instance.app) && !isInstallFailedInstance(instance, metadataOf(instance))
+  return ['mysql', 'redis', 'mysql-router'].includes(instance.app)
 }
 
 async function waitForTasks(taskIds: string[]) {

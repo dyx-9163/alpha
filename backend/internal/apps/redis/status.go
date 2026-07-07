@@ -204,6 +204,7 @@ func (s Service) markRedisSentinelRuntimeStatus(instance store.AppInstance, role
 		clearRedisDiscoveredTopology(metadata)
 	}
 	applyRedisRuntimeMetadata(metadata, runtime, status, details)
+	clearRecoveredInstallFailure(metadata, status)
 	data, _ := json.Marshal(metadata)
 	instance.Metadata = string(data)
 	instance.Status = status
@@ -467,6 +468,7 @@ func (s Service) markRedisSentinelMaster(instance store.AppInstance, checkedRole
 			}
 			status := runtime.aggregateStatus()
 			applyRedisRuntimeMetadata(metadata, runtime, status, details)
+			clearRecoveredInstallFailure(metadata, status)
 			candidate.Status = status
 		}
 		data, _ := json.Marshal(metadata)
@@ -700,6 +702,7 @@ func (s Service) markRedisInstanceStatus(instance store.AppInstance, status, rol
 		"checkedAt": time.Now().UTC().Format(time.RFC3339),
 		"details":   details,
 	}
+	clearRecoveredInstallFailure(metadata, status)
 	data, _ := json.Marshal(metadata)
 	instance.Metadata = string(data)
 	instance.Status = status
@@ -725,4 +728,13 @@ func clearRedisDiscoveredTopology(metadata map[string]any) {
 	delete(metadata, "replicaEndpoints")
 	delete(metadata, "sentinelEndpoints")
 	delete(metadata, "masterDetectedAt")
+}
+
+func clearRecoveredInstallFailure(metadata map[string]any, status string) {
+	if !redisStatusHealthy(status) {
+		return
+	}
+	for _, key := range []string{"installFailed", "failedAt", "taskId", "error"} {
+		delete(metadata, key)
+	}
 }

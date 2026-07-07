@@ -929,3 +929,5 @@
 - 结论：检查确认当前分支第一阶段功能已完成并通过验证：后端路由与聚合接口、agent 标准日志 label、前端 AIFAR Runtime 日志页签、中英文文案和关键单测均存在；本轮复跑 `pnpm test`、`pnpm web:build` 和 `git diff --check` 通过。外部日志平面如 Fluent Bit/Vector + Loki/OpenSearch 的持久化采集、保留策略和告警属于下一阶段，尚未实现。
 - 问题：用户询问现在是否需要完整的企业级日志平台。
 - 结论：当前不建议一次性建设完整 ELK/全量日志平台；更适合先保持现有 Runtime Docker logs 聚合入口，并预留标准 label、查询代理和权限过滤。若进入多服务器生产、需要跨实例检索、容器重启后追溯、日志保留合规或告警，再推进轻量 Logging Plane：Vector/Fluent Bit 采集到 Loki/OpenSearch，AIFAR 只做元数据关联和查询代理，不把完整日志写入 SQLite。
+- 问题：用户反馈数据库服务已启动，但数据库页面 MySQL/Redis 仍显示服务不可用。
+- 结论：根因是安装失败保留实例带有 `status=failed`/`installFailed=true`，前端实时监测跳过这些实例，且后端 MySQL/Redis/MySQL Router 检测成功后未清理失败安装标记。已改为数据库监测覆盖失败安装记录；MySQL/Redis/MySQL Router 检测恢复为健康状态时会清除 `installFailed`、`failedAt`、`taskId`、`error` 并更新为 running；补充 MySQL/Redis 恢复单测，`go test ./internal/apps/mysql ./internal/apps/redis ./internal/apps/mysqlrouter`、`pnpm web:build`、`pnpm test`、`git diff --check` 通过。

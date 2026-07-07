@@ -803,6 +803,43 @@ func TestRedisSentinelEligibleParam(t *testing.T) {
 	}
 }
 
+func TestServiceCheckClearsRecoveredInstallFailure(t *testing.T) {
+	instance := store.AppInstance{
+		ID:       "app-1",
+		App:      "redis",
+		Version:  "7.2.14",
+		ServerID: "srv-1",
+		Status:   "failed",
+		Metadata: `{"port":6379,"installFailed":true,"failedAt":"2026-07-07T00:00:00Z","taskId":"tsk_failed","error":"partial install"}`,
+	}
+	s := &fakeStore{
+		servers:   map[string]store.Server{"srv-1": {ID: "srv-1", Name: "cache-1", Host: "10.0.0.1", DeployDir: "/aifar/apps"}},
+		instances: []store.AppInstance{instance},
+	}
+	service := NewService(s, &fakeRemote{})
+	if _, err := service.Check(context.Background(), CheckRequest{
+		Instance:        instance,
+		Server:          s.servers["srv-1"],
+		DefaultPassword: "Oversea.123",
+		Language:        "en",
+	}, fakeLogger{}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.instances[0].Status; got != "running" {
+		t.Fatalf("expected recovered redis instance to be running, got %q", got)
+	}
+	metadata := metadataForTest(t, s.instances[0])
+	for _, key := range []string{"installFailed", "failedAt", "taskId", "error"} {
+		if _, ok := metadata[key]; ok {
+			t.Fatalf("expected recovered redis metadata to clear %q: %+v", key, metadata)
+		}
+	}
+	lastCheck, _ := metadata["lastCheck"].(map[string]any)
+	if got := lastCheck["status"]; got != "running" {
+		t.Fatalf("expected lastCheck running, got %v", got)
+	}
+}
+
 func TestServiceDeletesRedisRemotelyBeforeRemovingInstance(t *testing.T) {
 	instance := store.AppInstance{ID: "app-1", App: "redis", Version: "7.2.14", ServerID: "srv-1", Status: "installed", Metadata: `{"port":6380}`}
 	s := &fakeStore{

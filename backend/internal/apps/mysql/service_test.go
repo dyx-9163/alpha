@@ -582,6 +582,46 @@ func TestMySQLPasswordFallsBackToDefaultPassword(t *testing.T) {
 	}
 }
 
+func TestServiceCheckClearsRecoveredInstallFailure(t *testing.T) {
+	instance := store.AppInstance{
+		ID:       "app-1",
+		App:      "mysql",
+		Version:  "8.0.36",
+		ServerID: "srv-1",
+		Status:   "failed",
+		Metadata: `{"port":3306,"installFailed":true,"failedAt":"2026-07-07T00:00:00Z","taskId":"tsk_failed","error":"partial install"}`,
+	}
+	s := &fakeStore{
+		servers:   map[string]store.Server{"srv-1": {ID: "srv-1", Name: "db-1", Host: "10.0.0.1", DeployDir: "/aifar/apps"}},
+		instances: []store.AppInstance{instance},
+	}
+	service := NewService(s, &fakeRemote{})
+	if _, err := service.Check(context.Background(), CheckRequest{
+		Instance:        instance,
+		Server:          s.servers["srv-1"],
+		DefaultPassword: "Oversea.123",
+		Language:        "en",
+	}, fakeLogger{}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.instances[0].Status; got != "running" {
+		t.Fatalf("expected recovered mysql instance to be running, got %q", got)
+	}
+	var metadata map[string]any
+	if err := json.Unmarshal([]byte(s.instances[0].Metadata), &metadata); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"installFailed", "failedAt", "taskId", "error"} {
+		if _, ok := metadata[key]; ok {
+			t.Fatalf("expected recovered mysql metadata to clear %q: %+v", key, metadata)
+		}
+	}
+	lastCheck, _ := metadata["lastCheck"].(map[string]any)
+	if got := lastCheck["status"]; got != "running" {
+		t.Fatalf("expected lastCheck running, got %v", got)
+	}
+}
+
 func TestServiceDeletesMySQLRemotelyBeforeRemovingInstance(t *testing.T) {
 	instance := store.AppInstance{ID: "app-1", App: "mysql", Version: "8.0.36", ServerID: "srv-1", Status: "installed", Metadata: `{"port":3307}`}
 	s := &fakeStore{

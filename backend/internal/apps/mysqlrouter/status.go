@@ -32,11 +32,23 @@ func (s Service) markInstanceStatus(instance store.AppInstance, status string, d
 		"checkedAt": time.Now().UTC().Format(time.RFC3339),
 		"details":   details,
 	}
+	clearRecoveredInstallFailure(metadata, status)
 	data, _ := json.Marshal(metadata)
 	instance.Metadata = string(data)
 	instance.Status = status
 	_, err := s.store.SaveAppInstance(instance)
 	return err
+}
+
+func clearRecoveredInstallFailure(metadata map[string]any, status string) {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "ok", "success", "running", "available":
+	default:
+		return
+	}
+	for _, key := range []string{"installFailed", "failedAt", "taskId", "error"} {
+		delete(metadata, key)
+	}
 }
 
 func innoDBClusters(instances []store.AppInstance) []clusterInfo {

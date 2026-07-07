@@ -181,6 +181,7 @@ func (s Service) markInnoDBClusterPrimary(instance store.AppInstance, primaryEnd
 				"checkedAt": detectedAt,
 				"details":   details,
 			}
+			clearRecoveredInstallFailure(metadata, "running")
 			candidate.Status = "running"
 		}
 		data, _ := json.Marshal(metadata)
@@ -225,6 +226,7 @@ func (s Service) markInnoDBClusterStarted(instance store.AppInstance, primaryEnd
 			"checkedAt": detectedAt,
 			"details":   details,
 		}
+		clearRecoveredInstallFailure(metadata, "running")
 		data, _ := json.Marshal(metadata)
 		candidate.Metadata = string(data)
 		candidate.Status = "running"
@@ -248,11 +250,21 @@ func (s Service) markInstanceStatus(instance store.AppInstance, status string, d
 		"checkedAt": time.Now().UTC().Format(time.RFC3339),
 		"details":   details,
 	}
+	clearRecoveredInstallFailure(metadata, status)
 	data, _ := json.Marshal(metadata)
 	instance.Metadata = string(data)
 	instance.Status = status
 	_, err := s.store.SaveAppInstance(instance)
 	return err
+}
+
+func clearRecoveredInstallFailure(metadata map[string]any, status string) {
+	if normalizeRuntimeProbeStatus(status) != "running" {
+		return
+	}
+	for _, key := range []string{"installFailed", "failedAt", "taskId", "error"} {
+		delete(metadata, key)
+	}
 }
 
 func instancePort(instance store.AppInstance) int {
