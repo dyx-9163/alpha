@@ -1,6 +1,7 @@
 package adapter
 
 import (
+	"bufio"
 	"context"
 	"encoding/binary"
 	"encoding/json"
@@ -15,6 +16,7 @@ import (
 )
 
 var dockerHTTPClient = &http.Client{Timeout: 20 * time.Second}
+var dockerHTTPStreamClient = &http.Client{}
 
 func dockerAPIHost(host string) bool {
 	_, ok := dockerAPIBase(host)
@@ -342,6 +344,45 @@ func dockerAPIContainerLogs(ctx context.Context, host, id string, options Docker
 	return lines, nil
 }
 
+func dockerAPIStreamContainerLogs(ctx context.Context, host, id string, options DockerLogOptions, onLine func(string)) error {
+	query := url.Values{
+		"stdout":     []string{"1"},
+		"stderr":     []string{"1"},
+		"timestamps": []string{boolQueryValue(options.Timestamps)},
+		"follow":     []string{"1"},
+	}
+	if options.Tail > 0 || options.Follow {
+		query.Set("tail", strconv.Itoa(options.Tail))
+	}
+	if !options.Since.IsZero() {
+		query.Set("since", strconv.FormatInt(options.Since.Unix(), 10))
+	}
+	target, err := dockerAPIURL(host, "/containers/"+url.PathEscape(id)+"/logs", query)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := dockerHTTPStreamClient.Do(req)
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil
+		}
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("docker API %s %s failed: %s", http.MethodGet, "/containers/"+id+"/logs", strings.TrimSpace(string(body)))
+	}
+	if err := streamDockerAPILogBody(ctx, resp.Body, onLine); err != nil && ctx.Err() == nil {
+		return err
+	}
+	return nil
+}
+
 func boolQueryValue(value bool) string {
 	if value {
 		return "1"
@@ -374,6 +415,73 @@ func decodeDockerLogBytes(raw []byte) []string {
 		return splitLines(string(payload))
 	}
 	return splitLines(string(raw))
+}
+
+func streamDockerAPILogBody(ctx context.Context, reader io.Reader, onLine func(string)) error {
+	buffered := bufio.NewReader(reader)
+	header, err := buffered.Peek(8)
+	if err != nil {
+		if ctx.Err() != nil || err == io.EOF {
+			return nil
+		}
+		return err
+	}
+	size := int(binary.BigEndian.Uint32(header[4:8]))
+	multiplexed := header[1] == 0 && header[2] == 0 && header[3] == 0 && size >= 0 && size <= 16*1024*1024
+	if !multiplexed {
+		scanDockerLogLines(buffered, onLine)
+		return nil
+	}
+	emitter := dockerLogLineEmitter{}
+	for {
+		header := make([]byte, 8)
+		if _, err := io.ReadFull(buffered, header); err != nil {
+			if ctx.Err() != nil || err == io.EOF || err == io.ErrUnexpectedEOF {
+				emitter.flush(onLine)
+				return nil
+			}
+			return err
+		}
+		size := int(binary.BigEndian.Uint32(header[4:8]))
+		if size <= 0 {
+			continue
+		}
+		if size > 16*1024*1024 {
+			return fmt.Errorf("docker log frame too large: %d bytes", size)
+		}
+		payload := make([]byte, size)
+		if _, err := io.ReadFull(buffered, payload); err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			return err
+		}
+		emitter.write(string(payload), onLine)
+	}
+}
+
+type dockerLogLineEmitter struct {
+	pending string
+}
+
+func (e *dockerLogLineEmitter) write(chunk string, onLine func(string)) {
+	chunk = strings.ReplaceAll(chunk, "\r\n", "\n")
+	chunk = strings.ReplaceAll(chunk, "\r", "\n")
+	parts := strings.Split(e.pending+chunk, "\n")
+	for _, line := range parts[:len(parts)-1] {
+		if strings.TrimSpace(line) != "" {
+			onLine(line)
+		}
+	}
+	e.pending = parts[len(parts)-1]
+}
+
+func (e *dockerLogLineEmitter) flush(onLine func(string)) {
+	line := e.pending
+	if strings.TrimSpace(line) != "" {
+		onLine(line)
+	}
+	e.pending = ""
 }
 
 func sortedKeys(values map[string]any) string {

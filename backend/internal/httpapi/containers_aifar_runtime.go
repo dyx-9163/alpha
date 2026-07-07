@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"aifar-deployment/backend/internal/adapter"
@@ -251,13 +252,13 @@ func (a *API) aifarRuntimeLogsEvents(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("X-Accel-Buffering", "no")
 	flusher, _ := w.(http.Flusher)
-	states := map[string]runtimeLogStreamState{}
 	emitError := func(err error) {
 		writeSSE(w, "runtime-logs-error", map[string]any{"message": err.Error()})
 		if flusher != nil {
 			flusher.Flush()
 		}
 	}
+	states := map[string]runtimeLogStreamState{}
 	snapshotOptions := adapter.DockerLogOptions{Tail: query.Tail, Since: query.Since, Timestamps: true}
 	if query.FromEnd {
 		snapshotOptions = adapter.DockerLogOptions{Tail: query.BatchSize, Timestamps: true}
@@ -288,7 +289,70 @@ func (a *API) aifarRuntimeLogsEvents(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	emitBatch := func() {
+	for _, pod := range pods {
+		if _, ok := states[pod.ContainerName]; ok {
+			continue
+		}
+		states[pod.ContainerName] = runtimeLogStreamState{
+			Since:           runtimeLogInitialSince(query.Since),
+			LastFetchCounts: map[string]int{},
+		}
+	}
+	bufferSize := len(pods) * query.BatchSize
+	if bufferSize < 128 {
+		bufferSize = 128
+	}
+	if bufferSize > 4096 {
+		bufferSize = 4096
+	}
+	events := make(chan runtimeLogStreamEvent, bufferSize)
+	streamCtx, cancelStreams := context.WithCancel(r.Context())
+	defer cancelStreams()
+	done := make(chan struct{})
+	if len(pods) > 0 {
+		var wg sync.WaitGroup
+		for _, pod := range pods {
+			pod := pod
+			state := states[pod.ContainerName]
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				err := adapter.StreamDockerContainerLogsForServerWithOptions(streamCtx, server, pod.ContainerName, adapter.DockerLogOptions{
+					Tail:       query.BatchSize,
+					Since:      state.Since,
+					Timestamps: true,
+				}, func(line string) {
+					select {
+					case events <- runtimeLogStreamEvent{Pod: pod, Line: line}:
+					case <-streamCtx.Done():
+					}
+				})
+				if err != nil && streamCtx.Err() == nil {
+					select {
+					case events <- runtimeLogStreamEvent{Pod: pod, Err: err}:
+					case <-streamCtx.Done():
+					}
+				}
+			}()
+		}
+		go func() {
+			wg.Wait()
+			close(done)
+		}()
+	} else {
+		done = nil
+	}
+	skipCounts := map[string]map[string]int{}
+	for name, state := range states {
+		skipCounts[name] = state.LastFetchCounts
+	}
+	pending := map[string][]string{}
+	pendingErrors := map[string]string{}
+	pendingTotal := 0
+	flushBatch := func() {
+		if pendingTotal == 0 && len(pendingErrors) == 0 {
+			return
+		}
 		response := aifarRuntimeLogsResponse{
 			ServerID:   server.ID,
 			InstanceID: instance.ID,
@@ -301,51 +365,58 @@ func (a *API) aifarRuntimeLogsEvents(w http.ResponseWriter, r *http.Request) {
 			Pods:       []aifarRuntimeLogPod{},
 			Warnings:   []string{},
 		}
-		hasContent := false
 		for _, pod := range pods {
-			state := states[pod.ContainerName]
-			if state.Since.IsZero() {
-				state.Since = runtimeLogInitialSince(query.Since)
-			}
-			logs, logErr := adapter.DockerContainerLogsForServerWithOptions(r.Context(), server, pod.ContainerName, adapter.DockerLogOptions{
-				Tail:       query.BatchSize,
-				Since:      state.Since,
-				Timestamps: true,
-			})
-			newLogs, _ := runtimeLogNewLines(logs, state.LastFetchCounts)
-			nextSince := runtimeLogNextSince(logs, state.Since, query.Since)
-			states[pod.ContainerName] = runtimeLogStreamState{
-				Since:           nextSince,
-				LastFetchCounts: runtimeLogLineCounts(runtimeLogLinesSince(logs, nextSince)),
-			}
-			if len(newLogs) == 0 && logErr == nil {
+			logs := pending[pod.ContainerName]
+			errText := pendingErrors[pod.ContainerName]
+			if len(logs) == 0 && errText == "" {
 				continue
 			}
-			item := runtimeLogPodResponse(pod, newLogs)
-			if logErr != nil {
-				item.CollectionError = logErr.Error()
-				response.Warnings = append(response.Warnings, pod.ContainerName+": "+logErr.Error())
+			item := runtimeLogPodResponse(pod, logs)
+			if errText != "" {
+				item.CollectionError = errText
+				response.Warnings = append(response.Warnings, pod.ContainerName+": "+errText)
 			}
 			response.Pods = append(response.Pods, item)
-			hasContent = true
 		}
-		if hasContent {
-			writeSSE(w, "runtime-logs-batch", response)
-			if flusher != nil {
-				flusher.Flush()
-			}
+		pending = map[string][]string{}
+		pendingErrors = map[string]string{}
+		pendingTotal = 0
+		writeSSE(w, "runtime-logs-batch", response)
+		if flusher != nil {
+			flusher.Flush()
 		}
 	}
-	ticker := time.NewTicker(2 * time.Second)
-	defer ticker.Stop()
+	flushTicker := time.NewTicker(500 * time.Millisecond)
+	defer flushTicker.Stop()
 	heartbeat := time.NewTicker(25 * time.Second)
 	defer heartbeat.Stop()
 	for {
 		select {
 		case <-r.Context().Done():
+			flushBatch()
 			return
-		case <-ticker.C:
-			emitBatch()
+		case event := <-events:
+			name := event.Pod.ContainerName
+			if event.Err != nil {
+				pendingErrors[name] = event.Err.Error()
+				flushBatch()
+				continue
+			}
+			counts := skipCounts[name]
+			if counts != nil && counts[event.Line] > 0 {
+				counts[event.Line]--
+				continue
+			}
+			pending[name] = append(pending[name], event.Line)
+			pendingTotal++
+			if pendingTotal >= query.BatchSize {
+				flushBatch()
+			}
+		case <-flushTicker.C:
+			flushBatch()
+		case <-done:
+			flushBatch()
+			return
 		case <-heartbeat.C:
 			writeSSE(w, "heartbeat", map[string]any{"time": time.Now().UTC()})
 			if flusher != nil {
@@ -367,6 +438,12 @@ type aifarRuntimeLogQuery struct {
 type runtimeLogStreamState struct {
 	Since           time.Time
 	LastFetchCounts map[string]int
+}
+
+type runtimeLogStreamEvent struct {
+	Pod  store.AIFARPod
+	Line string
+	Err  error
 }
 
 func (a *API) resolveAIFARRuntimeLogQuery(w http.ResponseWriter, r *http.Request) (store.Server, store.AppInstance, aifarRuntimeLogQuery, bool) {

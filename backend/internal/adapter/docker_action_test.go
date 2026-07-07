@@ -1,11 +1,14 @@
 package adapter
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestDockerContainerCommand(t *testing.T) {
@@ -139,5 +142,41 @@ func TestParseDockerContainersIncludesLabels(t *testing.T) {
 	}
 	if containers[0].Labels["aifar.app"] != "aifar" || containers[0].Labels["aifar.service"] != "oauth" || containers[0].Labels["aifar.install-root"] != "/aifar/apps/admin" {
 		t.Fatalf("expected AIFAR labels, got %+v", containers[0].Labels)
+	}
+}
+
+func TestDockerLogArgsFollowKeepsTailZero(t *testing.T) {
+	since := time.Unix(1710000000, 0)
+	args := strings.Join(dockerLogArgs("abc123", DockerLogOptions{
+		Tail:       0,
+		Since:      since,
+		Timestamps: true,
+		Follow:     true,
+	}), " ")
+	want := "logs --timestamps --follow --since 1710000000 --tail 0 abc123"
+	if args != want {
+		t.Fatalf("dockerLogArgs follow = %q, want %q", args, want)
+	}
+}
+
+func TestStreamDockerAPILogBodyDecodesMultiplexedFrames(t *testing.T) {
+	var raw bytes.Buffer
+	writeFrame := func(payload string) {
+		header := make([]byte, 8)
+		header[0] = 1
+		binary.BigEndian.PutUint32(header[4:8], uint32(len(payload)))
+		raw.Write(header)
+		raw.WriteString(payload)
+	}
+	writeFrame("line 1\npartial")
+	writeFrame(" line 2\n")
+	lines := []string{}
+	if err := streamDockerAPILogBody(context.Background(), &raw, func(line string) {
+		lines = append(lines, line)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(lines, "|") != "line 1|partial line 2" {
+		t.Fatalf("unexpected streamed lines: %+v", lines)
 	}
 }

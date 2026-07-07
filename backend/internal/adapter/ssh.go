@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"aifar-deployment/backend/internal/store"
@@ -65,6 +66,62 @@ func RunSSH(ctx context.Context, server store.Server, command string) (CommandRe
 		return result, err
 	}
 	return result, nil
+}
+
+func StreamSSHLines(ctx context.Context, server store.Server, command string, onLine func(string)) error {
+	client, err := dialSSH(ctx, server)
+	if err != nil {
+		return err
+	}
+	defer client.Close()
+	session, err := client.NewSession()
+	if err != nil {
+		return err
+	}
+	defer session.Close()
+	stdout, err := session.StdoutPipe()
+	if err != nil {
+		return err
+	}
+	stderr, err := session.StderrPipe()
+	if err != nil {
+		return err
+	}
+	if err := session.Start(command); err != nil {
+		return err
+	}
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		scanDockerLogLines(stdout, onLine)
+	}()
+	go func() {
+		defer wg.Done()
+		scanDockerLogLines(stderr, onLine)
+	}()
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- session.Wait()
+	}()
+	select {
+	case <-ctx.Done():
+		_ = session.Signal(ssh.SIGKILL)
+		_ = session.Close()
+		_ = client.Close()
+		select {
+		case <-errCh:
+		case <-time.After(2 * time.Second):
+		}
+		wg.Wait()
+		return nil
+	case err := <-errCh:
+		wg.Wait()
+		if ctx.Err() != nil {
+			return nil
+		}
+		return err
+	}
 }
 
 func UploadSSHFile(ctx context.Context, server store.Server, localPath, remotePath string, mode os.FileMode) error {

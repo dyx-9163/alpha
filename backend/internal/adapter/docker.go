@@ -1,9 +1,11 @@
 package adapter
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -82,6 +84,7 @@ type DockerLogOptions struct {
 	Tail       int
 	Since      time.Time
 	Timestamps bool
+	Follow     bool
 }
 
 func DockerPing(ctx context.Context, host string) error {
@@ -458,19 +461,96 @@ func DockerContainerLogsForServerWithOptions(ctx context.Context, server store.S
 	return lines, nil
 }
 
+func StreamDockerContainerLogsWithOptions(ctx context.Context, host, id string, options DockerLogOptions, onLine func(string)) error {
+	if options.Tail < 0 {
+		options.Tail = 0
+	}
+	options.Follow = true
+	if dockerAPIHost(host) {
+		return dockerAPIStreamContainerLogs(ctx, host, id, options, onLine)
+	}
+	args := dockerLogArgs(id, options)
+	cmd := dockerCommand(ctx, host, args...)
+	return streamDockerCommandLines(ctx, cmd, onLine)
+}
+
+func StreamDockerContainerLogsForServerWithOptions(ctx context.Context, server store.Server, id string, options DockerLogOptions, onLine func(string)) error {
+	if options.Tail < 0 {
+		options.Tail = 0
+	}
+	options.Follow = true
+	if dockerAPIHost(server.DockerHost) {
+		return StreamDockerContainerLogsWithOptions(ctx, server.DockerHost, id, options, onLine)
+	}
+	return StreamSSHLines(ctx, server, dockerShellCommand(dockerLogArgs(id, options)...), onLine)
+}
+
 func dockerLogArgs(id string, options DockerLogOptions) []string {
 	args := []string{"logs"}
 	if options.Timestamps {
 		args = append(args, "--timestamps")
 	}
+	if options.Follow {
+		args = append(args, "--follow")
+	}
 	if !options.Since.IsZero() {
 		args = append(args, "--since", strconv.FormatInt(options.Since.Unix(), 10))
 	}
-	if options.Tail > 0 {
+	if options.Tail > 0 || options.Follow {
 		args = append(args, "--tail", strconv.Itoa(options.Tail))
 	}
 	args = append(args, id)
 	return args
+}
+
+func streamDockerCommandLines(ctx context.Context, cmd *exec.Cmd, onLine func(string)) error {
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return err
+	}
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return err
+	}
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	errCh := make(chan error, 1)
+	done := make(chan struct{})
+	go scanDockerLogLines(stdout, onLine)
+	go scanDockerLogLines(stderr, onLine)
+	go func() {
+		errCh <- cmd.Wait()
+		close(done)
+	}()
+	select {
+	case <-ctx.Done():
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+		}
+		return nil
+	case err := <-errCh:
+		if ctx.Err() != nil {
+			return nil
+		}
+		return err
+	}
+}
+
+func scanDockerLogLines(reader io.Reader, onLine func(string)) {
+	scanner := bufio.NewScanner(reader)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	for scanner.Scan() {
+		line := strings.TrimRight(scanner.Text(), "\r")
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		onLine(line)
+	}
 }
 
 func DockerContainerStats(ctx context.Context, host string, ids []string) ([]DockerContainerStat, error) {
