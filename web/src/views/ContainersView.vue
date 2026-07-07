@@ -223,13 +223,6 @@
                     <el-table-column :label="t('containers.endpoint')" width="110">
                       <template #default="{ row }">{{ runtimeEndpointText(row) }}</template>
                     </el-table-column>
-                    <el-table-column label="Nacos" width="120">
-                      <template #default="{ row }">
-                        <el-tooltip :content="row.lastNacosError" :disabled="!row.lastNacosError" placement="top">
-                          <span><StatusTag :status="aifarRuntimeStatusKind(runtimeNacosStatus(row))" :label="aifarRuntimeStatusLabel(runtimeNacosStatus(row))" /></span>
-                        </el-tooltip>
-                      </template>
-                    </el-table-column>
                     <el-table-column prop="proxyName" :label="t('containers.proxy')" min-width="170" show-overflow-tooltip />
                     <el-table-column prop="image" :label="t('containers.image')" min-width="240" show-overflow-tooltip />
                     <el-table-column :label="t('containers.cpu')" width="90">
@@ -297,34 +290,51 @@
                   <div v-if="!runtimeLogsLoadedForCurrentScope" class="runtime-lazy-state">
                     <el-button size="small" type="primary" plain :loading="loading" @click="loadRuntimeLogs(true)">{{ t('containers.loadRuntimeLogs') }}</el-button>
                   </div>
-                  <div v-else class="runtime-log-groups">
-                    <el-empty v-if="!runtimeLogGroups.length" :description="t('containers.noRuntimeLogs')" />
+                  <div v-else class="runtime-log-timeline">
+                    <el-empty v-if="!runtimeLogRows.length" :description="t('containers.noRuntimeLogs')" />
                     <template v-else>
-                      <div v-for="group in runtimeLogGroups" :key="group.containerName" class="runtime-log-group">
-                        <div class="runtime-log-group-head">
+                      <div class="runtime-log-pod-strip">
+                        <div v-for="group in runtimeLogGroups" :key="group.containerName" class="runtime-log-pod-chip">
                           <div>
                             <strong>{{ group.serviceName }}</strong>
                             <span>{{ group.containerName }}</span>
                           </div>
-                          <div class="runtime-log-meta">
-                            <el-tag size="small">{{ group.revision || '-' }}</el-tag>
-                            <StatusTag :status="aifarRuntimeStatusKind(group.status)" :label="aifarRuntimeStatusLabel(group.status)" />
-                            <span>{{ t('containers.logLines', { count: group.lineCount ?? 0 }) }}</span>
-                          </div>
+                          <el-tag size="small">{{ t('containers.logLines', { count: group.lineCount ?? 0 }) }}</el-tag>
                         </div>
-                        <el-alert v-if="group.collectionError" type="warning" :title="group.collectionError" :closable="false" />
-                        <LogOutput :text="runtimeLogText(group)" :empty-text="t('tasks.noLogs')" min-height="180px" />
                       </div>
+                      <el-table :data="runtimeLogRows" height="100%" row-key="id" class="runtime-log-table">
+                        <el-table-column prop="time" :label="t('common.time')" width="210" show-overflow-tooltip />
+                        <el-table-column prop="serviceName" :label="t('containers.service')" width="120" show-overflow-tooltip />
+                        <el-table-column prop="pod" :label="t('containers.pod')" min-width="250" show-overflow-tooltip />
+                        <el-table-column :label="t('containers.level')" width="92">
+                          <template #default="{ row }">
+                            <el-tag size="small" :type="runtimeLogLevelTag(row.level)">{{ row.level || '-' }}</el-tag>
+                          </template>
+                        </el-table-column>
+                        <el-table-column prop="message" :label="t('common.message')" min-width="620" show-overflow-tooltip />
+                      </el-table>
                     </template>
                   </div>
                 </div>
               </el-tab-pane>
               <el-tab-pane :label="t('containers.ingressAndNacos')" name="ingress">
                 <div class="runtime-resource-panel">
-                  <KeyValueGrid :items="runtimeIngressItems" />
-                  <el-table :data="selectedRuntimeServices" height="calc(100% - 96px)" row-key="serviceName">
+                  <div class="runtime-entry-grid">
+                    <div v-for="route in runtimeEntryRoutes" :key="route.name" class="runtime-entry-card">
+                      <div class="runtime-entry-card-head">
+                        <strong>{{ route.name }}</strong>
+                        <StatusTag :status="aifarRuntimeStatusKind(route.status)" :label="aifarRuntimeStatusLabel(route.status)" />
+                      </div>
+                      <span>{{ route.route }}</span>
+                      <small>{{ route.port }}</small>
+                    </div>
+                  </div>
+                  <el-table :data="selectedRuntimeServices" height="calc(100% - 104px)" row-key="serviceName">
                     <el-table-column prop="serviceName" :label="t('containers.service')" min-width="130" />
                     <el-table-column prop="appName" :label="t('containers.appName')" min-width="170" show-overflow-tooltip />
+                    <el-table-column :label="t('containers.discoveryTarget')" min-width="180" show-overflow-tooltip>
+                      <template #default="{ row }">{{ runtimeDiscoveryTarget(row) }}</template>
+                    </el-table-column>
                     <el-table-column :label="t('containers.endpoint')" width="110">
                       <template #default="{ row }">{{ runtimeEndpointText(row) }}</template>
                     </el-table-column>
@@ -553,7 +563,6 @@ import type { UploadFile } from 'element-plus'
 import { apiGet, apiPost, apiPostForm, apiPut, asArray } from '../api/client'
 import KeyValueGrid from '../components/KeyValueGrid.vue'
 import LogDrawer from '../components/LogDrawer.vue'
-import LogOutput from '../components/LogOutput.vue'
 import MetricGrid from '../components/MetricGrid.vue'
 import SecretConfirmPrompt from '../components/SecretConfirmPrompt.vue'
 import ServerSelector from '../components/ServerSelector.vue'
@@ -719,6 +728,24 @@ type AifarRuntimeLogsResponse = {
   tail?: number
   pods?: AifarRuntimeLogPod[]
   warnings?: string[]
+}
+
+type RuntimeLogRow = {
+  id: string
+  time: string
+  timestamp: number
+  sequence: number
+  serviceName: string
+  pod: string
+  level: string
+  message: string
+}
+
+type RuntimeEntryRoute = {
+  name: string
+  route: string
+  port: string
+  status: string
 }
 
 type AifarRuntimeResponse = {
@@ -966,6 +993,31 @@ const runtimePodsLoadedForCurrentScope = computed(() => Boolean(runtimePodsLoade
 const runtimePodStatsLoadedForCurrentScope = computed(() => Boolean(runtimePodStatsLoaded.value[runtimeCacheKey('pods')]))
 const runtimeLogsLoadedForCurrentScope = computed(() => Boolean(runtimeLogsLoaded.value[runtimeLogCacheKey()]))
 const runtimeLogGroups = computed(() => asArray<AifarRuntimeLogPod>(runtimeLogs.value.pods))
+const runtimeLogRows = computed<RuntimeLogRow[]>(() => {
+  const rows: RuntimeLogRow[] = []
+  let sequence = 0
+  for (const group of runtimeLogGroups.value) {
+    for (const line of asArray<string>(group.logs)) {
+      const parsed = parseRuntimeLogLine(line)
+      rows.push({
+        id: `${group.containerName}:${sequence}`,
+        sequence,
+        serviceName: group.serviceName || '-',
+        pod: group.containerName || group.podId || '-',
+        ...parsed
+      })
+      sequence += 1
+    }
+  }
+  return rows.sort((left, right) => {
+    if (left.timestamp && right.timestamp && left.timestamp !== right.timestamp) {
+      return left.timestamp - right.timestamp
+    }
+    if (left.timestamp && !right.timestamp) return -1
+    if (!left.timestamp && right.timestamp) return 1
+    return left.sequence - right.sequence
+  })
+})
 const runtimeLogWarnings = computed(() => asArray<string>(runtimeLogs.value.warnings))
 const installedRuntimeServiceNamesList = computed(() => aifarServiceOptions.map((item) => item.value).filter((service) => installedRuntimeServiceNames.value.has(service)))
 const missingRuntimeServiceOptions = computed(() => aifarServiceOptions.filter((item) => !installedRuntimeServiceNames.value.has(item.value)))
@@ -999,31 +1051,30 @@ const serviceInstallDisabledReason = computed(() => {
 })
 const runtimeSummaryItems = computed(() => {
   const instance = selectedRuntimeInstance.value
-  const ingress = selectedRuntimeIngress.value
   const config = selectedRuntimeConfig.value
   return [
     { label: t('containers.aifarInstance'), value: instance ? runtimeInstanceLabel(instance) : '-' },
     { label: t('containers.installRoot'), value: instance?.installRoot || '-' },
-    { label: t('containers.webRoute'), value: ingress?.webRoute || instance?.endpoint || '-' },
-    { label: t('containers.gatewayRoute'), value: ingress?.gatewayRoute || instance?.gatewayEndpoint || '-' },
     { label: t('containers.runtimeConfigVersion'), value: `${config.configVersion ?? '-'} / ${config.appliedVersion ?? '-'}`, status: config.lastApplyStatus || 'unknown' },
-    { label: t('containers.nacosEphemeral'), value: config.nacosEphemeral === false ? 'false' : 'true' },
-    { label: t('containers.ingress'), value: ingress?.container || '-', status: ingress?.status || 'unknown' },
+    { label: t('containers.lastApplyStatus'), value: runtimeApplyStatusLabel(config.lastApplyStatus), status: config.lastApplyStatus || 'unknown' },
     { label: t('containers.agent'), value: aifarRuntime.value.agent?.version || aifarRuntime.value.agent?.status || '-', status: aifarRuntime.value.agent?.status || 'unknown' }
   ]
 })
-const runtimeIngressItems = computed(() => {
+const runtimeEntryRoutes = computed<RuntimeEntryRoute[]>(() => {
   const ingress = selectedRuntimeIngress.value
-  const config = selectedRuntimeConfig.value
   return [
-    { label: t('containers.ingress'), value: ingress?.container || '-', status: ingress?.status || 'unknown' },
-    { label: t('containers.webRoute'), value: ingress?.webRoute || selectedRuntimeInstance.value?.endpoint || '-' },
-    { label: t('containers.gatewayRoute'), value: ingress?.gatewayRoute || selectedRuntimeInstance.value?.gatewayEndpoint || '-' },
-    { label: t('containers.gatewayPort'), value: ingress?.gatewayPort || '-' },
-    { label: t('containers.webPort'), value: ingress?.webPort || '-' },
-    { label: t('containers.nacosEphemeral'), value: config.nacosEphemeral === false ? 'false' : 'true' },
-    { label: t('containers.agent'), value: aifarRuntime.value.agent?.version || aifarRuntime.value.agent?.status || '-', status: aifarRuntime.value.agent?.status || 'unknown' },
-    { label: t('containers.lastApplyStatus'), value: runtimeApplyStatusLabel(config.lastApplyStatus), status: config.lastApplyStatus || 'unknown' }
+    {
+      name: t('containers.webRoute'),
+      route: ingress?.webRoute || selectedRuntimeInstance.value?.endpoint || '-',
+      port: `${t('containers.webPort')}: ${ingress?.webPort || '-'}`,
+      status: ingress?.status || 'unknown'
+    },
+    {
+      name: t('containers.gatewayRoute'),
+      route: ingress?.gatewayRoute || selectedRuntimeInstance.value?.gatewayEndpoint || '-',
+      port: `${t('containers.gatewayPort')}: ${ingress?.gatewayPort || '-'}`,
+      status: ingress?.status || 'unknown'
+    }
   ]
 })
 const runtimeConfigMetaItems = computed(() => {
@@ -1421,8 +1472,57 @@ async function openLogs(id: string) {
   logsVisible.value = true
 }
 
-function runtimeLogText(group: AifarRuntimeLogPod) {
-  return asArray<string>(group.logs).join('\n')
+function parseRuntimeLogLine(line: string) {
+  const raw = String(line ?? '')
+  const match = raw.match(/^(\d{4}-\d{2}-\d{2}[T ][^\s]+)\s+(?:(TRACE|DEBUG|INFO|WARN|WARNING|ERROR|FATAL|SEVERE)\s+)?(.*)$/i)
+  if (!match) {
+    return {
+      time: '-',
+      timestamp: 0,
+      level: detectRuntimeLogLevel(raw),
+      message: raw
+    }
+  }
+  const time = match[1]
+  const parsedTime = Date.parse(time)
+  return {
+    time,
+    timestamp: Number.isFinite(parsedTime) ? parsedTime : 0,
+    level: (match[2] || detectRuntimeLogLevel(raw)).toUpperCase(),
+    message: (match[3] || raw).trim() || raw
+  }
+}
+
+function detectRuntimeLogLevel(line: string) {
+  const upper = String(line || '').toUpperCase()
+  if (/\b(FATAL|SEVERE|ERROR)\b/.test(upper)) return 'ERROR'
+  if (/\b(WARN|WARNING)\b/.test(upper)) return 'WARN'
+  if (/\bINFO\b/.test(upper)) return 'INFO'
+  if (/\b(DEBUG|TRACE)\b/.test(upper)) return 'DEBUG'
+  return ''
+}
+
+function runtimeLogLevelTag(level: string) {
+  switch (String(level || '').toUpperCase()) {
+    case 'ERROR':
+    case 'FATAL':
+    case 'SEVERE':
+      return 'danger'
+    case 'WARN':
+    case 'WARNING':
+      return 'warning'
+    case 'INFO':
+      return 'success'
+    case 'DEBUG':
+    case 'TRACE':
+      return 'info'
+    default:
+      return ''
+  }
+}
+
+function runtimeDiscoveryTarget(row: AifarRuntimeService) {
+  return row.proxyName || row.appName || row.serviceName || '-'
 }
 
 function onContainerSelectionChange(rows: any[]) {
@@ -2565,60 +2665,113 @@ onMounted(async () => {
   width: 128px;
 }
 
-.runtime-log-groups {
+.runtime-log-timeline {
   flex: 1 1 auto;
   min-height: 0;
-  overflow: auto;
-  display: grid;
-  align-content: start;
-  gap: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
 }
 
-.runtime-log-group {
-  display: grid;
+.runtime-log-pod-strip {
+  display: flex;
+  flex-wrap: wrap;
   gap: 8px;
-  padding: 12px;
+  max-height: 72px;
+  overflow: auto;
+}
+
+.runtime-log-pod-chip {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  max-width: 360px;
+  padding: 6px 8px;
   border: 1px solid var(--aifar-border-soft);
-  border-radius: var(--aifar-radius-lg);
+  border-radius: var(--aifar-radius);
   background: #fff;
 }
 
-.runtime-log-group-head {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  gap: 12px;
-  min-width: 0;
-}
-
-.runtime-log-group-head > div:first-child {
+.runtime-log-pod-chip > div {
   display: grid;
   min-width: 0;
-  gap: 2px;
 }
 
-.runtime-log-group-head strong {
+.runtime-log-pod-chip strong {
   color: var(--aifar-ink);
-  font-size: 14px;
-  line-height: 20px;
+  font-size: 12px;
+  line-height: 18px;
 }
 
-.runtime-log-group-head span {
+.runtime-log-pod-chip span {
   min-width: 0;
   color: var(--aifar-text-secondary);
   font-size: 12px;
   line-height: 18px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.runtime-log-table {
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+.runtime-log-table :deep(.el-table__cell) {
+  font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+  font-size: 12px;
+  line-height: 18px;
+}
+
+.runtime-log-table :deep(.el-table__cell:nth-child(5)) {
   word-break: break-all;
 }
 
-.runtime-log-meta {
-  display: flex;
-  flex-wrap: wrap;
-  justify-content: flex-end;
-  align-items: center;
+.runtime-entry-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.runtime-entry-card {
+  display: grid;
   gap: 6px;
+  min-width: 0;
+  padding: 10px 12px;
+  border: 1px solid var(--aifar-border-soft);
+  border-radius: var(--aifar-radius);
+  background: #fff;
+}
+
+.runtime-entry-card-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+}
+
+.runtime-entry-card strong {
+  color: var(--aifar-ink);
+  font-size: 13px;
+  line-height: 20px;
+}
+
+.runtime-entry-card span {
+  min-width: 0;
+  color: var(--aifar-text);
+  font-size: 13px;
+  line-height: 20px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.runtime-entry-card small {
   color: var(--aifar-text-tertiary);
   font-size: 12px;
+  line-height: 18px;
 }
 
 .runtime-lazy-state {
@@ -2721,8 +2874,7 @@ onMounted(async () => {
     flex-direction: column;
   }
 
-  .runtime-tab-toolbar,
-  .runtime-log-group-head {
+  .runtime-tab-toolbar {
     align-items: stretch;
     flex-direction: column;
   }
@@ -2730,6 +2882,15 @@ onMounted(async () => {
   .runtime-log-filters {
     width: 100%;
     flex-wrap: wrap;
+  }
+
+  .runtime-log-pod-chip {
+    max-width: 100%;
+    width: 100%;
+  }
+
+  .runtime-entry-grid {
+    grid-template-columns: 1fr;
   }
 
   .runtime-instance-select {

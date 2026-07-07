@@ -16,6 +16,7 @@ RUNTIME_DIR="$INSTALL_ROOT/runtime"
 APP_DIR="$RUNTIME_DIR/services"
 IMAGE_DIR="$RUNTIME_DIR/images"
 ENV_DIR="$RUNTIME_DIR/env"
+LOG_DIR="$RUNTIME_DIR/logs"
 AGENT_DIR="$RUNTIME_DIR/agent"
 AIFAR_DIR="$INSTALL_ROOT/.aifar"
 BUNDLE_DIR="$RUNTIME_DIR/bundle"
@@ -509,6 +510,8 @@ JSON
     health_cmd="$(health_cmd_for_service "$service")"
     app_cpus="$(resource_value "$service" APP_CPUS "$APP_CPUS")"
     app_memory_limit="$(resource_value "$service" APP_MEMORY_LIMIT "$APP_MEMORY_LIMIT")"
+    log_dir="$LOG_DIR/$service"
+    mkdir -p "$log_dir"
     if [ "$first_deployment" = "1" ]; then
       first_deployment=0
     else
@@ -523,13 +526,14 @@ JSON
     printf '      "ports": [{"name":"http","containerPort":%s}],\n' "$port" >> "$spec"
     if [ "$service" = "web-vue3" ]; then
       printf '      "envFiles": ["%s"],\n' "$(json_escape "$service_env")" >> "$spec"
-      printf '      "environment": {"APP_CONTAINER_NAME":"${containerName}","TZ":"%s"},\n' "$(json_escape "$TIMEZONE")" >> "$spec"
+      printf '      "volumes": [{"source":"%s","target":"/opt/aifar/logs","readOnly":false}],\n' "$(json_escape "$log_dir")" >> "$spec"
+      printf '      "environment": {"APP_CONTAINER_NAME":"${containerName}","AIFAR_LOG_DIR":"/opt/aifar/logs","LOG_DIR":"/opt/aifar/logs","TZ":"%s"},\n' "$(json_escape "$TIMEZONE")" >> "$spec"
     else
       printf '      "envFiles": ["%s","%s","%s"],\n' "$(json_escape "$ENV_DIR/java-common.env")" "$(json_escape "$ENV_DIR/java-secrets.env")" "$(json_escape "$service_env")" >> "$spec"
-      printf '      "volumes": [{"source":"%s","target":"/opt/aifar/runtime/env","readOnly":true}],\n' "$(json_escape "$ENV_DIR")" >> "$spec"
+      printf '      "volumes": [{"source":"%s","target":"/opt/aifar/runtime/env","readOnly":true},{"source":"%s","target":"/opt/aifar/logs","readOnly":false}],\n' "$(json_escape "$ENV_DIR")" "$(json_escape "$log_dir")" >> "$spec"
       printf '      "entrypoint": ["/bin/sh"],\n' >> "$spec"
       printf '      "command": ["/opt/aifar/runtime/env/java-entrypoint.sh"],\n' >> "$spec"
-      printf '      "environment": {"APP_CONTAINER_NAME":"${containerName}","AIFAR_SERVICE_NAME":"%s","TZ":"%s"},\n' "$service" "$(json_escape "$TIMEZONE")" >> "$spec"
+      printf '      "environment": {"APP_CONTAINER_NAME":"${containerName}","AIFAR_SERVICE_NAME":"%s","AIFAR_LOG_DIR":"/opt/aifar/logs","LOG_DIR":"/opt/aifar/logs","TZ":"%s"},\n' "$service" "$(json_escape "$TIMEZONE")" >> "$spec"
     fi
     printf '      "resources": {"cpus":"%s","memory":"%s"},\n' "$(json_escape "$app_cpus")" "$(json_escape "$app_memory_limit")" >> "$spec"
     printf '      "healthCheck": {"command":"%s","interval":"%s","timeout":"%s","retries":%s,"startPeriod":"%s"}\n' \
@@ -666,7 +670,7 @@ command -v tar >/dev/null 2>&1 || fail "tar command is required"
 [ -f "$ARCHIVE" ] || fail "bundle archive not found: $ARCHIVE"
 check_agent_dependency
 
-mkdir -p "$INSTALL_ROOT" "$WORK_DIR" "$RUNTIME_DIR" "$ENV_DIR" "$AGENT_DIR" "$AIFAR_DIR"
+mkdir -p "$INSTALL_ROOT" "$WORK_DIR" "$RUNTIME_DIR" "$ENV_DIR" "$LOG_DIR" "$AGENT_DIR" "$AIFAR_DIR"
 rm -rf "$TMP_DIR" "$APP_DIR" "$IMAGE_DIR"
 mkdir -p "$TMP_DIR"
 tar -xzf "$ARCHIVE" -C "$TMP_DIR"

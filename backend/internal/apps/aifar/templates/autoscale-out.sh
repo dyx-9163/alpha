@@ -12,6 +12,7 @@ CONTROL_PLANE_DESIRED_REPLICAS={{ quote .DesiredReplicas }}
 
 RUNTIME_DIR="$INSTALL_ROOT/runtime"
 ENV_DIR="$RUNTIME_DIR/env"
+LOG_DIR="$RUNTIME_DIR/logs"
 
 fail() {
   echo "$*" >&2
@@ -307,6 +308,8 @@ JSON
     app_cpus="$(resource_value "$service" APP_CPUS "$(read_env_value "$ENV_DIR/compose.env" APP_CPUS "")")"
     app_memory_limit="$(resource_value "$service" APP_MEMORY_LIMIT "$(read_env_value "$ENV_DIR/compose.env" APP_MEMORY_LIMIT "")")"
     deployment_name="$(alpha_service_name "$service")"
+    log_dir="$LOG_DIR/$service"
+    mkdir -p "$log_dir"
     if [ "$first_deployment" = "1" ]; then
       first_deployment=0
     else
@@ -321,13 +324,14 @@ JSON
     printf '      "ports": [{"name":"http","containerPort":%s}],\n' "$port" >> "$spec"
     if [ "$service" = "web-vue3" ]; then
       printf '      "envFiles": ["%s"],\n' "$(json_escape "$service_env")" >> "$spec"
-      printf '      "environment": {"APP_CONTAINER_NAME":"${containerName}","TZ":"%s"},\n' "$(json_escape "$tz_value")" >> "$spec"
+      printf '      "volumes": [{"source":"%s","target":"/opt/aifar/logs","readOnly":false}],\n' "$(json_escape "$log_dir")" >> "$spec"
+      printf '      "environment": {"APP_CONTAINER_NAME":"${containerName}","AIFAR_LOG_DIR":"/opt/aifar/logs","LOG_DIR":"/opt/aifar/logs","TZ":"%s"},\n' "$(json_escape "$tz_value")" >> "$spec"
     else
       printf '      "envFiles": ["%s","%s","%s"],\n' "$(json_escape "$ENV_DIR/java-common.env")" "$(json_escape "$ENV_DIR/java-secrets.env")" "$(json_escape "$service_env")" >> "$spec"
-      printf '      "volumes": [{"source":"%s","target":"/opt/aifar/runtime/env","readOnly":true}],\n' "$(json_escape "$ENV_DIR")" >> "$spec"
+      printf '      "volumes": [{"source":"%s","target":"/opt/aifar/runtime/env","readOnly":true},{"source":"%s","target":"/opt/aifar/logs","readOnly":false}],\n' "$(json_escape "$ENV_DIR")" "$(json_escape "$log_dir")" >> "$spec"
       printf '      "entrypoint": ["/bin/sh"],\n' >> "$spec"
       printf '      "command": ["/opt/aifar/runtime/env/java-entrypoint.sh"],\n' >> "$spec"
-      printf '      "environment": {"APP_CONTAINER_NAME":"${containerName}","AIFAR_SERVICE_NAME":"%s","TZ":"%s"},\n' "$service" "$(json_escape "$tz_value")" >> "$spec"
+      printf '      "environment": {"APP_CONTAINER_NAME":"${containerName}","AIFAR_SERVICE_NAME":"%s","AIFAR_LOG_DIR":"/opt/aifar/logs","LOG_DIR":"/opt/aifar/logs","TZ":"%s"},\n' "$service" "$(json_escape "$tz_value")" >> "$spec"
     fi
     printf '      "resources": {"cpus":"%s","memory":"%s"},\n' "$(json_escape "$app_cpus")" "$(json_escape "$app_memory_limit")" >> "$spec"
     printf '      "healthCheck": {"command":"%s","interval":"%s","timeout":"%s","retries":%s,"startPeriod":"%s"}\n' \

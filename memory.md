@@ -933,3 +933,5 @@
 - 结论：根因是安装失败保留实例带有 `status=failed`/`installFailed=true`，前端实时监测跳过这些实例，且后端 MySQL/Redis/MySQL Router 检测成功后未清理失败安装标记。已改为数据库监测覆盖失败安装记录；MySQL/Redis/MySQL Router 检测恢复为健康状态时会清除 `installFailed`、`failedAt`、`taskId`、`error` 并更新为 running；补充 MySQL/Redis 恢复单测，`go test ./internal/apps/mysql ./internal/apps/redis ./internal/apps/mysqlrouter`、`pnpm web:build`、`pnpm test`、`git diff --check` 通过。
 - 问题：用户要求整个系统不允许缓存密码。
 - 结论：已删除安装成功后自动把手输应用密码登记到凭据中心的逻辑；安装 API 要求 MySQL/Redis/MinIO/Nacos/AIFAR 密码必须本次输入或由已有凭据解析，不再静默使用默认密码；前端安装、登录、凭据、服务器、用户管理和存储密钥表单会在提交/关闭时清理敏感字段；安装表单移除默认密码预填；`aifar-admin reset-admin` 不再打印密码。`go test ./internal/httpapi`、`pnpm test`、`pnpm web:build`、`git diff --check` 通过。
+- 问题：用户询问 AIFAR Runtime 日志是否落盘、如何自动清理，多 Pod 日志如何对比，以及 Ingress/Nacos 页签是否和其他页签重复。
+- 结论：当前日志入口原本只聚合 `docker logs`，本轮已让 runtime Pod 统一使用 Docker `json-file` 日志驱动并启用 `max-size=50m`、`max-file=5` 自动轮转；安装/更新/补装/配置/扩缩容脚本都会为每个服务创建 `$RUNTIME_DIR/logs/<service>` 并挂载到容器 `/opt/aifar/logs`。前端日志页改为多 Pod 合并时间线表格，服务页移除 Nacos 列，`Ingress / Nacos` 收敛为“入口与发现”页签，只展示 Web/Gateway 入口和 Nacos 发现状态；`go test ./internal/runtimeagent ./internal/apps/aifar`、`pnpm test`、`pnpm web:build`、`git diff --check` 通过。

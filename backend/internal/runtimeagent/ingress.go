@@ -670,6 +670,9 @@ func (m *Manager) runContainer(ctx context.Context, spec RuntimeSpec, deployment
 		deploymentName = deployment.ServiceName
 	}
 	args = append(args,
+		"--log-driver", "json-file",
+		"--log-opt", "max-size=50m",
+		"--log-opt", "max-file=5",
 		"--label", "aifar.app=aifar",
 		"--label", "aifar.runtime-version=2",
 		"--label", "aifar.spec-hash="+deploymentSpecHash(deployment),

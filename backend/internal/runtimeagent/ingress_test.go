@@ -128,6 +128,9 @@ func TestManagerRunContainerAddsLoggingLabels(t *testing.T) {
 	}
 	calls := runner.callsString()
 	for _, want := range []string{
+		"--log-driver json-file",
+		"--log-opt max-size=50m",
+		"--log-opt max-file=5",
 		"--label aifar.instance=admin",
 		"--label aifar.deployment=alpha-oauth",
 		"--label aifar.service=oauth",

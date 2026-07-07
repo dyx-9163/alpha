@@ -992,6 +992,38 @@ func TestRuntimeConfigScriptRendersDynamicJavaApply(t *testing.T) {
 	}
 }
 
+func TestRuntimeSpecTemplatesMountPerServiceLogVolume(t *testing.T) {
+	for _, name := range []string{
+		"install.sh",
+		"update-artifact.sh",
+		"update-artifact-bundle.sh",
+		"service-install.sh",
+		"runtime-config.sh",
+		"scale-service.sh",
+		"autoscale-out.sh",
+	} {
+		t.Run(name, func(t *testing.T) {
+			content, err := templateFS.ReadFile("templates/" + name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			script := string(content)
+			for _, want := range []string{
+				`LOG_DIR="$RUNTIME_DIR/logs"`,
+				`log_dir="$LOG_DIR/$service"`,
+				`mkdir -p "$log_dir"`,
+				`"target":"/opt/aifar/logs"`,
+				`"AIFAR_LOG_DIR":"/opt/aifar/logs"`,
+				`"LOG_DIR":"/opt/aifar/logs"`,
+			} {
+				if !strings.Contains(script, want) {
+					t.Fatalf("runtime spec template %s should include log volume policy %q:\n%s", name, want, script)
+				}
+			}
+		})
+	}
+}
+
 func TestServiceAppliesRuntimeConfigAndRecordsVersion(t *testing.T) {
 	instance := installedAIFARInstance(t)
 	s := &fakeStore{
