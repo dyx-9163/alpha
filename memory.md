@@ -1001,3 +1001,5 @@
 - 结论：仓库脚本 `pnpm backend:build` 会调用 `scripts/build-backend.mjs` 同时生成 server 与 agent，默认输出到 `bin/aifar-agent-linux-amd64`；如果要发布包形态，运行 `pnpm package` 会输出到 `deploy/bin` 并暂存到 `deploy/deployment`。只打 agent 可在 `backend/` 下设置 `GOOS=linux`、`GOARCH=amd64` 后执行 `go build -buildvcs=false -o ..\bin\aifar-agent-linux-amd64 .\cmd\aifar-agent`。
 - 问题：用户反馈 IDE 推送 GitHub 时出现 `Recv failure: Connection was reset`，询问原因。
 - 结论：本地分支 `codex/status-collector-realtime` 工作区干净、比远端 ahead 6；远端为 GitHub HTTPS。该报错表示推送过程中 HTTPS/TCP 连接被重置，通常是网络、代理、VPN、防火墙或 GitHub 连接临时中断，不是代码、认证或分支权限错误。
+- 问题：用户指出容器页面内部“容器”子页签仍存在，进入后为空。
+- 结论：已删除 Containers 页面内部普通 Docker 容器子页签及其前端批量操作、日志抽屉等遗留入口；左侧主导航“容器”保留为 Docker/AIFAR Runtime 工作台，顶部页签收敛为概览、AIFAR 运行时、镜像。

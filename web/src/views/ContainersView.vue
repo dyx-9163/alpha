@@ -20,7 +20,6 @@
     <el-tabs v-model="tab" class="tab-strip">
       <el-tab-pane :label="t('containers.overview')" name="overview" />
       <el-tab-pane :label="t('containers.aifarRuntime')" name="aifar-runtime" />
-      <el-tab-pane :label="t('containers.title')" name="containers" />
       <el-tab-pane :label="t('containers.images')" name="images" />
     </el-tabs>
 
@@ -45,67 +44,6 @@
         <div class="sub-panel">
           <h2 class="section-title">{{ t('containers.configSummary') }}</h2>
           <KeyValueGrid :items="configSummaryItems" />
-        </div>
-      </template>
-
-      <template v-else-if="tab === 'containers'">
-        <div class="table-toolbar">
-          <span class="selection-summary">{{ t('containers.selectedCount', { count: selectedContainerRows.length }) }}</span>
-          <div class="toolbar-actions">
-            <el-tooltip :content="batchActionDisabledReason" :disabled="!batchActionDisabledReason" placement="top">
-              <span><el-button size="small" :disabled="batchActionDisabled" @click="runContainerBatchAction('start')">{{ t('containers.batchStart') }}</el-button></span>
-            </el-tooltip>
-            <el-tooltip :content="batchActionDisabledReason" :disabled="!batchActionDisabledReason" placement="top">
-              <span><el-button size="small" :disabled="batchActionDisabled" @click="runContainerBatchAction('stop')">{{ t('containers.batchStop') }}</el-button></span>
-            </el-tooltip>
-            <el-tooltip :content="batchActionDisabledReason" :disabled="!batchActionDisabledReason" placement="top">
-              <span><el-button size="small" :disabled="batchActionDisabled" @click="runContainerBatchAction('restart')">{{ t('containers.batchRestart') }}</el-button></span>
-            </el-tooltip>
-            <el-tooltip :content="batchRemoveDisabledReason" :disabled="!batchRemoveDisabledReason" placement="top">
-              <span><el-button size="small" type="danger" plain :disabled="batchRemoveDisabled" @click="runContainerBatchAction('remove')">{{ t('containers.batchUninstall') }}</el-button></span>
-            </el-tooltip>
-          </div>
-        </div>
-        <div class="container-table-body">
-          <el-table :data="containerTableRows" height="100%" row-key="id" @selection-change="onContainerSelectionChange">
-            <el-table-column type="selection" width="44" :selectable="containerRowSelectable" />
-            <el-table-column prop="name" :label="t('containers.name')" min-width="160" show-overflow-tooltip />
-            <el-table-column prop="image" :label="t('containers.image')" min-width="190" show-overflow-tooltip />
-            <el-table-column prop="state" :label="t('common.status')" width="130">
-              <template #default="{ row }">
-                <el-tooltip :content="containerStatusDetail(row)" :disabled="!containerStatusDetail(row)" placement="top">
-                  <span>
-                    <StatusTag :status="containerStatusKind(row)" :label="containerStatusLabel(row)" />
-                  </span>
-                </el-tooltip>
-              </template>
-            </el-table-column>
-            <el-table-column prop="ports" :label="t('containers.ports')" min-width="180" show-overflow-tooltip />
-            <el-table-column prop="networks" :label="t('containers.network')" min-width="140" show-overflow-tooltip />
-            <el-table-column prop="createdAt" :label="t('containers.created')" min-width="170" show-overflow-tooltip />
-            <el-table-column :label="t('common.operation')" width="430" fixed="right">
-              <template #default="{ row }">
-                <div class="row-actions">
-                  <template v-if="!isAifarRuntimeInfraContainer(row)">
-                    <el-tooltip :content="deniedText" :disabled="canManageContainers" placement="top">
-                      <span><el-button size="small" :disabled="!canManageContainers" @click="runContainerAction(row.id, 'start')">{{ t('containers.start') }}</el-button></span>
-                    </el-tooltip>
-                    <el-tooltip :content="deniedText" :disabled="canManageContainers" placement="top">
-                      <span><el-button size="small" :disabled="!canManageContainers" @click="runContainerAction(row.id, 'stop')">{{ t('containers.stop') }}</el-button></span>
-                    </el-tooltip>
-                    <el-tooltip :content="deniedText" :disabled="canManageContainers" placement="top">
-                      <span><el-button size="small" :disabled="!canManageContainers" @click="runContainerAction(row.id, 'restart')">{{ t('containers.restart') }}</el-button></span>
-                    </el-tooltip>
-                    <el-tooltip :content="containerRemoveDisabledReason(row)" :disabled="!containerRemoveDisabledReason(row)" placement="top">
-                      <span><el-button size="small" type="danger" plain :disabled="Boolean(containerRemoveDisabledReason(row))" @click="runContainerBatchAction('remove', [row])">{{ t('containers.uninstall') }}</el-button></span>
-                    </el-tooltip>
-                  </template>
-                  <el-tag v-else type="info" size="small">{{ t('containers.runtimeInfra') }}</el-tag>
-                  <el-button size="small" @click="openLogs(row.id)">{{ t('containers.logs') }}</el-button>
-                </div>
-              </template>
-            </el-table-column>
-          </el-table>
         </div>
       </template>
 
@@ -495,7 +433,6 @@
       </template>
     </div>
 
-    <LogDrawer v-model="logsVisible" :title="t('containers.logs')" :text="logsText" :empty-text="t('tasks.noLogs')" />
     <el-dialog v-model="aifarUpdateVisible" :title="t('apps.aifarUpdateTitle')" width="560px" destroy-on-close>
       <el-form label-width="112px" class="aifar-update-form">
         <el-form-item :label="t('containers.updateTarget')">
@@ -624,7 +561,6 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import type { UploadFile } from 'element-plus'
 import { apiEventSourceUrl, apiGet, apiPost, apiPostForm, apiPut, asArray } from '../api/client'
 import KeyValueGrid from '../components/KeyValueGrid.vue'
-import LogDrawer from '../components/LogDrawer.vue'
 import MetricGrid from '../components/MetricGrid.vue'
 import SecretConfirmPrompt from '../components/SecretConfirmPrompt.vue'
 import ServerSelector from '../components/ServerSelector.vue'
@@ -843,15 +779,10 @@ const pageReady = ref(false)
 const summaryCache = ref<Record<string, DockerSummaryResponse>>({})
 const collectionCache = ref<Record<string, any[]>>({})
 const runtimeCache = ref<Record<string, AifarRuntimeResponse>>({})
-const selectedContainerRows = ref<any[]>([])
 const selectedImageRows = ref<any[]>([])
 const error = ref('')
-const tab = ref<'overview' | 'aifar-runtime' | 'containers' | 'images'>('overview')
+const tab = ref<'overview' | 'aifar-runtime' | 'images'>('overview')
 const resourceTab = ref<'images' | 'networks' | 'volumes' | 'registry' | 'settings'>('images')
-const logsVisible = ref(false)
-const logsText = ref('')
-let containerLogSource: EventSource | null = null
-const containerLogMaxLines = 3000
 const aifarUpdateVisible = ref(false)
 const aifarUpdateSubmitting = ref(false)
 const aifarUpdateInstanceOverride = ref<AppInstance | null>(null)
@@ -940,48 +871,7 @@ const settingsItems = computed(() => [
   { label: t('containers.rootDir'), value: summaryData.value.rootDir || '-' },
   { label: t('common.provider'), value: t('common.real') }
 ])
-const selectedContainerIds = computed(() => selectedContainerRows.value.filter(containerRowSelectable).map((row) => String(row?.id ?? '').trim()).filter(Boolean))
-const selectedRunningContainers = computed(() => selectedContainerRows.value.filter((row) => containerRowSelectable(row) && isRunningContainer(row)))
 const selectedImageIds = computed(() => uniqueValues(selectedImageRows.value.map(imageReference).filter(Boolean)))
-const containerTableRows = computed(() => collection.value.filter((row) => !isAifarRuntimeInfraContainer(row)))
-const containerStateLabelKeys: Record<string, string> = {
-  created: 'containers.state.created',
-  restarting: 'containers.state.restarting',
-  running: 'containers.state.running',
-  removing: 'containers.state.removing',
-  paused: 'containers.state.paused',
-  exited: 'containers.state.exited',
-  dead: 'containers.state.dead'
-}
-const containerActionLabelKeys: Record<string, string> = {
-  start: 'containers.start',
-  stop: 'containers.stop',
-  restart: 'containers.restart',
-  remove: 'containers.uninstall'
-}
-const singleContainerConfirmKeys: Record<string, string> = {
-  start: 'containers.confirmStartContainer',
-  stop: 'containers.confirmStopContainer',
-  restart: 'containers.confirmRestartContainer'
-}
-const batchContainerConfirmKeys: Record<string, string> = {
-  start: 'containers.confirmBatchStart',
-  stop: 'containers.confirmBatchStop',
-  restart: 'containers.confirmBatchRestart',
-  remove: 'containers.confirmUninstallSelected'
-}
-const batchActionDisabledReason = computed(() => {
-  if (!canManageContainers.value) return deniedText.value
-  if (!selectedContainerIds.value.length) return t('containers.selectContainers')
-  return ''
-})
-const batchActionDisabled = computed(() => Boolean(batchActionDisabledReason.value))
-const batchRemoveDisabledReason = computed(() => {
-  if (batchActionDisabledReason.value) return batchActionDisabledReason.value
-  if (selectedRunningContainers.value.length) return t('containers.stopBeforeUninstall')
-  return ''
-})
-const batchRemoveDisabled = computed(() => Boolean(batchRemoveDisabledReason.value))
 const batchImageRemoveDisabledReason = computed(() => {
   if (!canManageContainers.value) return deniedText.value
   if (!selectedImageIds.value.length) return t('containers.selectImages')
@@ -1216,14 +1106,11 @@ function activeCollectionKind() {
   if (tab.value === 'images') {
     return resourceTab.value
   }
-  if (tab.value === 'containers') {
-    return 'containers'
-  }
   return ''
 }
 
 function collectionBackedKind(kind = activeCollectionKind()) {
-  return kind === 'containers' || kind === 'images' || kind === 'networks' || kind === 'volumes'
+  return kind === 'images' || kind === 'networks' || kind === 'volumes'
 }
 
 function collectionCacheKey(kind = activeCollectionKind()) {
@@ -1275,7 +1162,6 @@ async function load(force = false) {
     if (!query) {
       summary.value = { available: false }
       collection.value = []
-      selectedContainerRows.value = []
       return
     }
     const includeDisk = tab.value === 'overview'
@@ -1348,7 +1234,6 @@ function objectPayload(value: unknown) {
 async function loadCollection(force = false) {
   if (tab.value === 'aifar-runtime') {
     collection.value = []
-    selectedContainerRows.value = []
     selectedImageRows.value = []
     await loadAifarRuntime(force)
     return
@@ -1356,18 +1241,15 @@ async function loadCollection(force = false) {
   const kind = activeCollectionKind()
   if (!collectionBackedKind(kind)) {
     collection.value = []
-    selectedContainerRows.value = []
     selectedImageRows.value = []
     return
   }
   const query = targetQuery()
   if (!query) {
     collection.value = []
-    selectedContainerRows.value = []
     selectedImageRows.value = []
     return
   }
-  selectedContainerRows.value = []
   selectedImageRows.value = []
   const key = collectionCacheKey(kind)
   if (!force && collectionCache.value[key]) {
@@ -1719,74 +1601,6 @@ function trackTask(taskId?: string, label = '') {
   }
 }
 
-async function runContainerAction(id: string, action: string) {
-  if (!canManageContainers.value) {
-    ElMessage.warning(deniedText.value)
-    return
-  }
-  const query = targetQuery()
-  if (!query) {
-    ElMessage.warning(t('containers.selectDockerHost'))
-    return
-  }
-  const row = collection.value.find((item) => String(item?.id ?? '').trim() === id)
-  const confirmKey = singleContainerConfirmKeys[action]
-  if (confirmKey) {
-    const ok = await confirmContainerAction(action, t(confirmKey, { name: containerDisplayName(row) || id }))
-    if (!ok) return
-  }
-  try {
-    const result = await apiPost<{ taskId?: string }>(`/containers/${encodeURIComponent(id)}/${action}?${query}`)
-    trackTask(result.taskId, containerDisplayName(row) || id)
-    ElMessage.success(t('containers.actionAccepted'))
-    setTimeout(() => {
-      void load(true)
-    }, 800)
-  } catch (err) {
-    ElMessage.error(err instanceof Error ? err.message : t('containers.actionFailed'))
-  }
-}
-
-async function runContainerBatchAction(action: string, rows = selectedContainerRows.value) {
-  if (!canManageContainers.value) {
-    ElMessage.warning(deniedText.value)
-    return
-  }
-  const query = targetQuery()
-  if (!query) {
-    ElMessage.warning(t('containers.selectDockerHost'))
-    return
-  }
-  const selectedRows = rows.filter((row) => containerRowSelectable(row) && String(row?.id ?? '').trim())
-  const ids = selectedRows.map((row) => String(row.id).trim())
-  if (!ids.length) {
-    ElMessage.warning(t('containers.selectContainers'))
-    return
-  }
-  if (action === 'remove') {
-    if (selectedRows.some(isRunningContainer)) {
-      ElMessage.warning(t('containers.stopBeforeUninstall'))
-      return
-    }
-  }
-  const confirmKey = batchContainerConfirmKeys[action]
-  if (confirmKey) {
-    const ok = await confirmContainerAction(action, t(confirmKey, { count: ids.length }))
-    if (!ok) return
-  }
-  try {
-    const result = await apiPost<{ taskId?: string }>(`/containers/actions?${query}`, { action, ids })
-    trackTask(result.taskId, t('containers.batchActionAccepted'))
-    ElMessage.success(t('containers.batchActionAccepted'))
-    selectedContainerRows.value = []
-    setTimeout(() => {
-      void load(true)
-    }, 800)
-  } catch (err) {
-    ElMessage.error(err instanceof Error ? err.message : t('containers.actionFailed'))
-  }
-}
-
 async function deleteImage(row: any) {
   await removeImages([row], 'single')
 }
@@ -1834,73 +1648,6 @@ async function removeImages(rows: any[], mode: 'single' | 'batch') {
   } catch (err) {
     ElMessage.error(err instanceof Error ? err.message : t('containers.imageRemoveFailed'))
   }
-}
-
-function openLogs(id: string) {
-  const query = targetQuery()
-  if (!query) {
-    ElMessage.warning(t('containers.selectDockerHost'))
-    return
-  }
-  closeContainerLogStream()
-  logsText.value = ''
-  logsVisible.value = true
-  const params = new URLSearchParams(query)
-  params.set('tail', '300')
-  params.set('batch', '200')
-  const source = new EventSource(apiEventSourceUrl(`/containers/${encodeURIComponent(id)}/logs/events?${params.toString()}`))
-  containerLogSource = source
-  const applySnapshot = (event: Event) => {
-    if (containerLogSource !== source) return
-    const next = parseContainerLogsEvent((event as MessageEvent).data)
-    if (!next) return
-    setContainerLogLines(next.logs)
-  }
-  const applyBatch = (event: Event) => {
-    if (containerLogSource !== source) return
-    const next = parseContainerLogsEvent((event as MessageEvent).data)
-    if (!next) return
-    appendContainerLogLines(next.logs)
-    if (next.warnings?.length) {
-      appendContainerLogLines(next.warnings)
-    }
-  }
-  source.addEventListener('container-logs-snapshot', applySnapshot)
-  source.addEventListener('container-logs-batch', applyBatch)
-  source.addEventListener('container-logs-error', (event) => {
-    if (containerLogSource !== source) return
-    const message = parseRuntimeLogErrorEvent((event as MessageEvent).data)
-    if (message) {
-      appendContainerLogLines([message])
-    }
-  })
-}
-
-function closeContainerLogStream() {
-  if (containerLogSource) {
-    containerLogSource.close()
-    containerLogSource = null
-  }
-}
-
-function parseContainerLogsEvent(raw: string) {
-  try {
-    return JSON.parse(raw) as { logs?: string[]; warnings?: string[] }
-  } catch {
-    return null
-  }
-}
-
-function setContainerLogLines(lines?: string[]) {
-  const next = asArray<string>(lines)
-  logsText.value = next.slice(-containerLogMaxLines).join('\n')
-}
-
-function appendContainerLogLines(lines?: string[]) {
-  const next = asArray<string>(lines)
-  if (!next.length) return
-  const current = logsText.value ? logsText.value.split('\n') : []
-  logsText.value = current.concat(next).slice(-containerLogMaxLines).join('\n')
 }
 
 function parseRuntimeLogLine(line: string) {
@@ -1956,121 +1703,8 @@ function runtimeDiscoveryTarget(row: AifarRuntimeService) {
   return row.proxyName || row.appName || row.serviceName || '-'
 }
 
-function onContainerSelectionChange(rows: any[]) {
-  selectedContainerRows.value = rows.filter(containerRowSelectable)
-}
-
 function onImageSelectionChange(rows: any[]) {
   selectedImageRows.value = rows.filter((row) => imageReference(row))
-}
-
-function containerState(row: any) {
-  return String(row?.state ?? '').trim().toLowerCase()
-}
-
-function containerStatusDetail(row: any) {
-  return String(row?.status || row?.state || '').trim()
-}
-
-function containerStatusKind(row: any) {
-  const state = containerState(row)
-  const detail = containerStatusDetail(row).toLowerCase()
-  if (state === 'running' && detail.includes('(unhealthy)')) return 'failed'
-  if (state === 'running' && (detail.includes('(health: starting)') || detail.includes('(starting)'))) return 'pending'
-  switch (state) {
-    case 'running':
-      return 'running'
-    case 'exited':
-      return 'stopped'
-    case 'created':
-    case 'restarting':
-    case 'removing':
-      return 'pending'
-    case 'paused':
-      return 'degraded'
-    case 'dead':
-      return 'failed'
-    default:
-      return 'unknown'
-  }
-}
-
-function containerStatusLabel(row: any) {
-  const state = containerState(row)
-  const detail = containerStatusDetail(row).toLowerCase()
-  if (state === 'running' && detail.includes('(unhealthy)')) return t('containers.state.unhealthy')
-  if (state === 'running' && (detail.includes('(health: starting)') || detail.includes('(starting)'))) return t('containers.state.healthStarting')
-  const labelKey = containerStateLabelKeys[state]
-  return labelKey ? t(labelKey) : String(row?.state || '').trim() || t('common.unknown')
-}
-
-function isRunningContainer(row: any) {
-  return containerState(row) === 'running'
-}
-
-function containerDisplayName(row: any) {
-  return String(row?.name || row?.id || '').trim()
-}
-
-function normalizedContainerName(row: any) {
-  return containerDisplayName(row).replace(/^\/+/, '').toLowerCase()
-}
-
-function containerLabels(row: any): Record<string, string> {
-  const labels = row?.labels
-  if (!labels || typeof labels !== 'object' || Array.isArray(labels)) {
-    return {}
-  }
-  return labels as Record<string, string>
-}
-
-function isAifarRuntimeInfraContainer(row: any) {
-  const component = aifarComponentFromContainer(row)
-  if (component) {
-    return true
-  }
-  const name = normalizedContainerName(row)
-  return Boolean(aifarServiceFromContainer(row) && (name.startsWith('aifar-pod-admin-') || name.startsWith('aifar-svc-admin-') || name === 'aifar-admin-ingress'))
-}
-
-function containerRowSelectable(row: any) {
-  return !isAifarRuntimeInfraContainer(row)
-}
-
-function aifarServiceFromContainer(row: any) {
-  const labels = containerLabels(row)
-  const labelService = String(labels['aifar.service'] || '').trim()
-  if (aifarServiceOptions.some((item) => item.value === labelService)) {
-    return labelService
-  }
-  const name = normalizedContainerName(row)
-  const k8sMatch = aifarServiceOptions.find((item) =>
-    name.startsWith(`aifar-pod-admin-${item.value}-`) || name === `aifar-svc-admin-${item.value}`
-  )
-  if (k8sMatch) {
-    return k8sMatch.value
-  }
-  const match = aifarServiceOptions.find((item) => name.startsWith(`aifar-${item.value}-`))
-  return match?.value || ''
-}
-
-function aifarComponentFromContainer(row: any) {
-  const labels = containerLabels(row)
-  const component = String(labels['aifar.component'] || '').trim()
-  if (component) {
-    return component
-  }
-  const name = normalizedContainerName(row)
-  if (name.startsWith('aifar-pod-admin-')) {
-    return 'pod'
-  }
-  if (name.startsWith('aifar-svc-admin-')) {
-    return 'service-proxy'
-  }
-  if (name === 'aifar-admin-ingress') {
-    return 'ingress'
-  }
-  return ''
 }
 
 function aifarRuntimeStatusKind(status?: string) {
@@ -2750,21 +2384,6 @@ function formatBytes(value: number) {
   return `${size.toFixed(idx === 0 ? 0 : 1)} ${units[idx]}`
 }
 
-async function confirmContainerAction(action: string, message: string) {
-  const labelKey = containerActionLabelKeys[action]
-  const label = labelKey ? t(labelKey) : action
-  try {
-    await ElMessageBox.confirm(message, label, {
-      type: 'warning',
-      confirmButtonText: label,
-      cancelButtonText: t('common.cancel')
-    })
-    return true
-  } catch {
-    return false
-  }
-}
-
 function imageReference(row: any) {
   const repository = String(row?.repository ?? '').trim()
   const tag = String(row?.tag ?? '').trim()
@@ -2789,12 +2408,6 @@ function uniqueValues(values: string[]) {
     out.push(next)
   }
   return out
-}
-
-function containerRemoveDisabledReason(row: any) {
-  if (!canManageContainers.value) return deniedText.value
-  if (isRunningContainer(row)) return t('containers.stopBeforeUninstall')
-  return ''
 }
 
 function openDockerUninstall() {
@@ -2927,11 +2540,6 @@ watch(deletePromptVisible, (visible) => {
     deletePromptInstance.value = null
   }
 })
-watch(logsVisible, (visible) => {
-  if (!visible) {
-    closeContainerLogStream()
-  }
-})
 watch([aifarUpdateService, aifarUpdateMode], () => {
   aifarArtifactFile.value = null
 })
@@ -2954,7 +2562,6 @@ onMounted(async () => {
   await load()
 })
 onBeforeUnmount(() => {
-  closeContainerLogStream()
   closeRuntimeLogStream()
 })
 </script>
