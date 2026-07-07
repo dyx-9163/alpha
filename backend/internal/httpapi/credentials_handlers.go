@@ -1,7 +1,6 @@
 package httpapi
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"net/http"
@@ -11,7 +10,6 @@ import (
 	"aifar-deployment/backend/internal/i18n"
 	"aifar-deployment/backend/internal/rbac"
 	"aifar-deployment/backend/internal/store"
-	"aifar-deployment/backend/internal/worker"
 
 	"github.com/go-chi/chi/v5"
 )
@@ -124,73 +122,6 @@ func (a *API) resolveCredentialParameters(r *http.Request, parameters map[string
 	return out, nil
 }
 
-func (a *API) registerInstallCredentials(_ context.Context, app string, req registry.InstallRequest, actor string, log worker.Logger) {
-	a.bindInstallCredentialReferences(app, req)
-	switch app {
-	case "mysql":
-		a.registerPasswordCredential(credentialRegisterRequest{
-			App:                app,
-			Kind:               "mysql",
-			Purpose:            "admin",
-			Language:           req.Language,
-			Parameters:         req.Parameters,
-			User:               paramString(req.Parameters, "rootUser", "root"),
-			Password:           firstParamString(req.Parameters, []string{"rootPassword", "mysqlPassword", "password"}, a.cfg.DefaultPassword),
-			ServerIDs:          req.TargetServerIDs(),
-			Port:               paramInt(req.Parameters, "port", 3306),
-			EndpointScheme:     "",
-			NamePrefix:         "MySQL",
-			SkipIfCredentialID: "rootCredentialId",
-		}, actor, log)
-	case "redis":
-		a.registerPasswordCredential(credentialRegisterRequest{
-			App:                app,
-			Kind:               "redis",
-			Purpose:            "runtime",
-			Language:           req.Language,
-			Parameters:         req.Parameters,
-			User:               "default",
-			Password:           firstParamString(req.Parameters, []string{"redisPassword", "password"}, a.cfg.DefaultPassword),
-			ServerIDs:          req.TargetServerIDs(),
-			Port:               paramInt(req.Parameters, "port", 6379),
-			EndpointScheme:     "",
-			NamePrefix:         "Redis",
-			SkipIfCredentialID: "redisCredentialId",
-		}, actor, log)
-	case "minio":
-		a.registerPasswordCredential(credentialRegisterRequest{
-			App:                app,
-			Kind:               "minio",
-			Purpose:            "admin",
-			Language:           req.Language,
-			Parameters:         req.Parameters,
-			User:               paramString(req.Parameters, "rootUser", "admin"),
-			Password:           firstParamString(req.Parameters, []string{"rootPassword", "minioPassword", "password"}, a.cfg.DefaultPassword),
-			ServerIDs:          req.TargetServerIDs(),
-			Port:               paramInt(req.Parameters, "apiPort", 9000),
-			EndpointScheme:     "http",
-			NamePrefix:         "MinIO",
-			SkipIfCredentialID: "rootCredentialId",
-		}, actor, log)
-	case "nacos":
-		a.registerPasswordCredential(credentialRegisterRequest{
-			App:                app,
-			Kind:               "nacos",
-			Purpose:            "admin",
-			Language:           req.Language,
-			Parameters:         req.Parameters,
-			User:               paramString(req.Parameters, "nacosUser", "nacos"),
-			Password:           firstParamString(req.Parameters, []string{"nacosPassword", "password"}, "nacos"),
-			ServerIDs:          req.TargetServerIDs(),
-			Port:               paramInt(req.Parameters, "port", 8848),
-			EndpointScheme:     "http",
-			EndpointPath:       "nacos",
-			NamePrefix:         "Nacos",
-			SkipIfCredentialID: "nacosCredentialId",
-		}, actor, log)
-	}
-}
-
 func (a *API) bindInstallCredentialReferences(app string, req registry.InstallRequest) {
 	references := map[string]string{
 		"rootCredentialId":  "admin",
@@ -217,72 +148,6 @@ type credentialParameterMapping struct {
 	UserKeys           []string
 	PasswordKeys       []string
 	SecretKeyPreferred bool
-}
-
-type credentialRegisterRequest struct {
-	App                string
-	Kind               string
-	Purpose            string
-	Language           string
-	Parameters         map[string]any
-	User               string
-	Password           string
-	ServerIDs          []string
-	Port               int
-	EndpointScheme     string
-	EndpointPath       string
-	NamePrefix         string
-	SkipIfCredentialID string
-}
-
-func (a *API) registerPasswordCredential(req credentialRegisterRequest, actor string, log worker.Logger) {
-	if strings.TrimSpace(req.Password) == "" || hasCredentialReference(req.Parameters, req.SkipIfCredentialID) {
-		return
-	}
-	for _, serverID := range req.ServerIDs {
-		server, err := a.store.GetServer(serverID, false)
-		if err != nil {
-			log.Error("credential registration skipped for %s: %v", serverID, err)
-			continue
-		}
-		endpoint := endpointWithPath(netEndpoint(req.EndpointScheme, server.Host, req.Port), req.EndpointPath)
-		credential := store.Credential{
-			Name:     credentialName(req.NamePrefix, server),
-			Kind:     req.Kind,
-			Username: req.User,
-			Endpoint: endpoint,
-			Scope:    "app-instance",
-			Status:   "active",
-			App:      req.App,
-			ServerID: serverID,
-			Purpose:  req.Purpose,
-			Tags:     "auto",
-			Secret: map[string]string{
-				"password": req.Password,
-			},
-			CreatedBy: actor,
-		}
-		saved, err := a.store.SaveCredential(credential)
-		if err != nil {
-			log.Error("credential registration failed for %s: %v", serverID, err)
-			continue
-		}
-		a.bindCredentialToLatestInstance(saved.ID, req.App, serverID, req.Purpose, true)
-		log.Info(i18n.Text(req.Language, "api.credentialRegistered"), saved.Name)
-	}
-}
-
-func hasCredentialReference(params map[string]any, key string) bool {
-	key = strings.TrimSpace(key)
-	if key == "" {
-		return false
-	}
-	value, ok := params[key]
-	if !ok {
-		return false
-	}
-	text := strings.TrimSpace(fmt.Sprint(value))
-	return text != "" && text != "<nil>"
 }
 
 func credentialSecretFromRequest(req credentialSaveRequest) map[string]string {
@@ -378,17 +243,6 @@ func (a *API) bindCredentialToLatestInstance(credentialID, app, serverID, purpos
 	})
 }
 
-func credentialName(prefix string, server store.Server) string {
-	label := strings.TrimSpace(server.Name)
-	if label == "" {
-		label = strings.TrimSpace(server.Host)
-	}
-	if label == "" {
-		label = server.ID
-	}
-	return prefix + " / " + label
-}
-
 func netEndpoint(scheme, host string, port int) string {
 	host = strings.TrimSpace(host)
 	if host == "" || port <= 0 {
@@ -401,52 +255,10 @@ func netEndpoint(scheme, host string, port int) string {
 	return endpoint
 }
 
-func endpointWithPath(endpoint, path string) string {
-	endpoint = strings.TrimRight(strings.TrimSpace(endpoint), "/")
-	path = strings.Trim(strings.TrimSpace(path), "/")
-	if endpoint == "" || path == "" {
-		return endpoint
-	}
-	return endpoint + "/" + path
-}
-
 func paramString(params map[string]any, key, fallback string) string {
 	value := strings.TrimSpace(fmt.Sprint(params[key]))
 	if value == "" || value == "<nil>" {
 		return fallback
 	}
 	return value
-}
-
-func firstParamString(params map[string]any, keys []string, fallback string) string {
-	for _, key := range keys {
-		value := strings.TrimSpace(fmt.Sprint(params[key]))
-		if value != "" && value != "<nil>" {
-			return value
-		}
-	}
-	return fallback
-}
-
-func paramInt(params map[string]any, key string, fallback int) int {
-	switch v := params[key].(type) {
-	case int:
-		if v > 0 {
-			return v
-		}
-	case int64:
-		if v > 0 {
-			return int(v)
-		}
-	case float64:
-		if v > 0 {
-			return int(v)
-		}
-	case string:
-		var n int
-		if _, err := fmt.Sscanf(strings.TrimSpace(v), "%d", &n); err == nil && n > 0 {
-			return n
-		}
-	}
-	return fallback
 }

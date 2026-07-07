@@ -37,7 +37,7 @@ func main() {
 		if err := db.ResetUserPassword(username, password); err != nil {
 			log.Fatalf("reset admin: %v", err)
 		}
-		fmt.Printf("admin credential ready: username=%s password=%s\n", username, password)
+		fmt.Printf("admin credential ready: username=%s password=<not printed>\n", username)
 	default:
 		fmt.Fprintf(os.Stderr, "usage: aifar-admin [inspect|reset-admin [username password]]\n")
 		os.Exit(2)

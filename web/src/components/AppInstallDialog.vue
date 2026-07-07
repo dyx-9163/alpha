@@ -116,7 +116,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, ref, watch } from 'vue'
+import { computed, onUnmounted, ref, watch } from 'vue'
 import { apiGet } from '../api/client'
 import type { AppStoreItem } from '../apps/registry/catalog'
 import type { AppInstallDialogCopy, AppInstallField, AppInstallFieldOption, AppInstallFieldValues, AppInstallPayload, AppInstallValidationContext, ServerOption } from '../apps/registry/contract'
@@ -235,6 +235,14 @@ watch(
   },
   { immediate: true }
 )
+
+watch(() => props.modelValue, (isVisible) => {
+  if (!isVisible) {
+    clearSensitiveFieldValues()
+  }
+})
+
+onUnmounted(clearSensitiveFieldValues)
 
 watch(
   () => ({
@@ -472,17 +480,41 @@ function submit() {
   const extra = extraPayload()
   if (targetSelectorHidden.value) {
     if (hiddenTargetIds.value.length > 1) {
-      emit('submit', { version: selectedVersion.value, serverIds: hiddenTargetIds.value, ...extra })
+      emitSubmit({ version: selectedVersion.value, serverIds: hiddenTargetIds.value, ...extra })
       return
     }
-    emit('submit', { version: selectedVersion.value, serverId: hiddenTargetIds.value[0], ...extra })
+    emitSubmit({ version: selectedVersion.value, serverId: hiddenTargetIds.value[0], ...extra })
     return
   }
   if (effectiveTargetMode.value === 'multiple') {
-    emit('submit', { version: selectedVersion.value, serverIds: selectedServerIds.value, ...extra })
+    emitSubmit({ version: selectedVersion.value, serverIds: selectedServerIds.value, ...extra })
     return
   }
-  emit('submit', { version: selectedVersion.value, serverId: selectedServerId.value, ...extra })
+  emitSubmit({ version: selectedVersion.value, serverId: selectedServerId.value, ...extra })
+}
+
+function emitSubmit(payload: AppInstallPayload) {
+  emit('submit', payload)
+  clearSensitiveFieldValues()
+}
+
+function clearSensitiveFieldValues() {
+  const next = { ...fieldValues.value }
+  let changed = false
+  for (const field of allFields.value) {
+    if (!isSensitiveField(field) || next[field.name] === undefined) {
+      continue
+    }
+    next[field.name] = field.multiple ? [] : ''
+    changed = true
+  }
+  if (changed) {
+    fieldValues.value = next
+  }
+}
+
+function isSensitiveField(field: AppInstallField) {
+  return field.type === 'password' || /password|secret|token|privatekey/i.test(field.name)
 }
 </script>
 

@@ -46,6 +46,7 @@ async function submit() {
   } catch (err) {
     error.value = err instanceof Error ? err.message : t('login.failed')
   } finally {
+    password.value = ''
     loading.value = false
   }
 }

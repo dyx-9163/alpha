@@ -191,7 +191,7 @@ export function aifarInstallDialogProps(locale?: string, context?: AppInstallDia
         visibleWhen: (values) => !values.nacosCredentialId
       },
       {
-        ...requiredText('nacosPassword', copy.nacosPassword, 'oversea.nacos', copy),
+        ...requiredText('nacosPassword', copy.nacosPassword, '', copy),
         type: 'password',
         visibleWhen: (values) => !values.nacosCredentialId
       },

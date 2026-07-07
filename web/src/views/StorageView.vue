@@ -825,6 +825,12 @@ function instanceLabel(item: AppInstance) {
 watch([tab, selectedInstanceId], () => {
   void loadActive()
 })
+
+watch(itemDialogVisible, (visible) => {
+  if (!visible) {
+    itemForm.secretKey = ''
+  }
+})
 onMounted(load)
 </script>
 

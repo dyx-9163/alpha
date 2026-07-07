@@ -380,6 +380,10 @@ func (a *API) installAppName(w http.ResponseWriter, r *http.Request, app string)
 		writeError(w, http.StatusBadRequest, "MULTI_TARGET_UNSUPPORTED", i18n.Text(lang, "api.multiTargetUnsupported"), map[string]any{"app": def.Name})
 		return
 	}
+	if err := requireExplicitInstallPasswords(def.Name, lang, req.Parameters); err != nil {
+		writeError(w, http.StatusBadRequest, "INSTALL_PASSWORD_REQUIRED", err.Error(), map[string]any{"app": def.Name})
+		return
+	}
 	target := strings.Join(serverIDs, ",")
 	actor := currentUser(r).Username
 	resources, err := a.store.ListResources()
@@ -460,7 +464,7 @@ func (a *API) installAppName(w http.ResponseWriter, r *http.Request, app string)
 			}
 			return err
 		}
-		a.registerInstallCredentials(ctx, def.Name, moduleReq, actor, log)
+		a.bindInstallCredentialReferences(def.Name, moduleReq)
 		return nil
 	})
 	if err == nil {
@@ -566,4 +570,36 @@ func cleanStringIDs(values []string) []string {
 		out = append(out, value)
 	}
 	return out
+}
+
+func requireExplicitInstallPasswords(app, lang string, params map[string]any) error {
+	var missing []string
+	requireAny := func(field string, keys ...string) {
+		for _, key := range keys {
+			if strings.TrimSpace(stringFromRaw(params[key])) != "" {
+				return
+			}
+		}
+		missing = append(missing, field)
+	}
+	switch strings.ToLower(strings.TrimSpace(app)) {
+	case "mysql", "mysql-router":
+		requireAny("rootPassword", "rootPassword", "password", "mysqlPassword")
+	case "redis":
+		requireAny("password", "password", "redisPassword")
+	case "minio":
+		requireAny("rootPassword", "rootPassword", "password", "minioPassword")
+	case "nacos":
+		requireAny("nacosPassword", "nacosPassword")
+		dbSource := strings.TrimSpace(stringFromRaw(params["dbSource"]))
+		if dbSource != "" && !strings.EqualFold(dbSource, "local") && !strings.EqualFold(dbSource, "embedded") && !strings.EqualFold(dbSource, "none") {
+			requireAny("dbPassword", "dbPassword")
+		}
+	case "aifar":
+		requireAny("nacosPassword", "nacosPassword")
+	}
+	if len(missing) == 0 {
+		return nil
+	}
+	return fmt.Errorf("%s: %s", i18n.Text(lang, "api.installPasswordRequired"), strings.Join(missing, ", "))
 }

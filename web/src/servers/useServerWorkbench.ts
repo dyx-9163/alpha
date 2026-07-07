@@ -77,10 +77,15 @@ export function useServerWorkbench(t: (key: string, params?: Record<string, unkn
   }
 
   async function save() {
-    const saved = await saveServer(form)
-    selectedId.value = saved.id
-    drawer.value = false
-    await load()
+    try {
+      const saved = await saveServer(form)
+      selectedId.value = saved.id
+      drawer.value = false
+      await load()
+    } finally {
+      form.password = ''
+      form.privateKey = ''
+    }
   }
 
   async function remove(row: ServerRecord) {

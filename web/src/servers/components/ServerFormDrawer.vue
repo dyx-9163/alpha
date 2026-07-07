@@ -33,7 +33,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, watch } from 'vue'
 import { useI18n } from '../../i18n'
 import type { ServerFormModel } from '../types'
 
@@ -45,6 +45,13 @@ const props = withDefaults(defineProps<{ form: ServerFormModel; canSave?: boolea
 defineEmits<{ save: [] }>()
 const { t } = useI18n()
 const title = computed(() => props.form.id ? t('servers.editTitle') : t('servers.createTitle'))
+
+watch(visible, (isVisible) => {
+  if (!isVisible) {
+    props.form.password = ''
+    props.form.privateKey = ''
+  }
+})
 </script>
 
 <style scoped>

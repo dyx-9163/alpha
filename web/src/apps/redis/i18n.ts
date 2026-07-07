@@ -187,7 +187,7 @@ export function redisInstallDialogProps(locale?: string, context?: AppInstallDia
         name: 'password',
         label: copy.password,
         type: 'password',
-        defaultValue: 'Oversea.123',
+        defaultValue: '',
         placeholder: copy.passwordPlaceholder,
         required: true,
         visibleWhen: (values) => !values.redisCredentialId

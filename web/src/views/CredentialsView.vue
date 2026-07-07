@@ -164,7 +164,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import { apiDelete, apiGet, apiPost, apiPut, asArray } from '../api/client'
 import ConfirmAction from '../components/ConfirmAction.vue'
@@ -366,6 +366,12 @@ function statusTagType(status: string) {
   if (status === 'retired') return 'info'
   return 'warning'
 }
+
+watch(dialogVisible, (visible) => {
+  if (!visible) {
+    form.secret = ''
+  }
+})
 
 onMounted(load)
 </script>

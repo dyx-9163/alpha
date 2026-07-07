@@ -179,7 +179,7 @@ export function nacosInstallDialogProps(locale?: string, context?: AppInstallDia
         visibleWhen: (values) => !values.nacosCredentialId
       },
       {
-        ...requiredText('nacosPassword', copy.nacosPassword, 'nacos', copy),
+        ...requiredText('nacosPassword', copy.nacosPassword, '', copy),
         type: 'password',
         visibleWhen: (values) => !values.nacosCredentialId
       },

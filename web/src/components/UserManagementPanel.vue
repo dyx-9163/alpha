@@ -81,7 +81,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import { apiGet, apiPost, apiPut } from '../api/client'
 import { useI18n } from '../i18n'
@@ -213,6 +213,12 @@ function formatDate(value: unknown) {
   }
   return date.toLocaleString()
 }
+
+watch(dialogVisible, (visible) => {
+  if (!visible) {
+    userForm.password = ''
+  }
+})
 
 onMounted(refresh)
 defineExpose({ refresh })

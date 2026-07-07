@@ -53,7 +53,9 @@ watch(() => props.modelValue, (visible) => {
 })
 
 function confirm() {
-  emit('confirm', secret.value)
+  const value = secret.value
+  emit('confirm', value)
+  secret.value = ''
 }
 </script>
 

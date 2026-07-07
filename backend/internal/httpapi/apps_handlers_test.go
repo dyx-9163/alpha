@@ -94,3 +94,18 @@ func TestRecordFailedInstallInstancesSkipsInstancesRecordedDuringTask(t *testing
 		t.Fatalf("expected only the recorded installed instance, got %+v", instances)
 	}
 }
+
+func TestRequireExplicitInstallPasswordsRejectsDefaultFallback(t *testing.T) {
+	if err := requireExplicitInstallPasswords("mysql", "en", map[string]any{"rootUser": "root"}); err == nil {
+		t.Fatal("expected mysql install without password to be rejected")
+	}
+	if err := requireExplicitInstallPasswords("mysql", "en", map[string]any{"rootPassword": "manual"}); err != nil {
+		t.Fatalf("expected mysql explicit password to pass: %v", err)
+	}
+	if err := requireExplicitInstallPasswords("nacos", "en", map[string]any{"nacosPassword": "manual", "dbSource": "manual"}); err == nil {
+		t.Fatal("expected nacos manual database source without db password to be rejected")
+	}
+	if err := requireExplicitInstallPasswords("nacos", "en", map[string]any{"nacosPassword": "manual", "dbSource": "manual", "dbPassword": "db-manual"}); err != nil {
+		t.Fatalf("expected nacos explicit passwords to pass: %v", err)
+	}
+}
