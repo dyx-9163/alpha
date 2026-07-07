@@ -129,6 +129,7 @@ func NewWithRealtime(cfg config.Config, s *store.Store, tasks *worker.Manager, e
 			r.Post("/containers/{id}/stop", api.requirePermission(rbac.ContainersManage, api.containerAction("stop")))
 			r.Post("/containers/{id}/restart", api.requirePermission(rbac.ContainersManage, api.containerAction("restart")))
 			r.Post("/containers/{id}/remove", api.requirePermission(rbac.ContainersManage, api.containerAction("remove")))
+			r.Get("/containers/{id}/logs/events", api.containerLogsEvents)
 			r.Get("/containers/{id}/logs", api.containerLogs)
 			r.Get("/database/instances", api.databaseInstances)
 			r.Post("/database/mysql/install", api.requirePermission(rbac.DatabaseManage, api.installNamedApp("mysql")))

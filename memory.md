@@ -945,6 +945,8 @@
 - 结论：根因是清空只清前端 buffer，后端 SSE 仍沿用旧游标；同时后端首次增量去重基线来自整段 snapshot，重复内容日志可能被误判为旧日志。已改为清空时带 `since=当前时间` 重建日志 SSE，后端 snapshot 和 batch 均支持 since，并把去重基线限制在当前 overlap 时间窗口内。
 - 问题：用户要求在 AIFAR Runtime Deployments 列表增加缩容功能。
 - 结论：新增 `/api/v2/containers/aifar/services/{service}/scale-in`，后端按控制面当前 desiredReplicas 计算 `-1` 目标副本并复用 `ScaleService` 任务/审计链路；前端在 Deployment 操作列新增“缩容副本”，仅当期望副本数大于 1 时可用，缩到 0 仍要求使用“下线”。
+- 问题：用户反馈普通容器日志打开后没有实时刷新。
+- 结论：普通容器原本只调用一次性 `/containers/{id}/logs`；已新增 `/containers/{id}/logs/events` SSE，首次推送快照后每 2 秒按 since/timestamps 拉增量并去重，前端日志抽屉改为打开即订阅、关闭即断开，并限制最多保留 3000 行。
 
 ## 2026-07-07
 - 问题：用户需要给阿尔及利亚项目客户提供迁移计划，覆盖时间、服务器资源、数据库和 MinIO 备份、新 HA 部署、数据还原和 DNS 切换。

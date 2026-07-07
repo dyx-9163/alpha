@@ -845,6 +845,8 @@ const tab = ref<'overview' | 'aifar-runtime' | 'containers' | 'images'>('overvie
 const resourceTab = ref<'images' | 'networks' | 'volumes' | 'registry' | 'settings'>('images')
 const logsVisible = ref(false)
 const logsText = ref('')
+let containerLogSource: EventSource | null = null
+const containerLogMaxLines = 3000
 const aifarUpdateVisible = ref(false)
 const aifarUpdateSubmitting = ref(false)
 const aifarUpdateContainer = ref<any | null>(null)
@@ -1778,15 +1780,71 @@ async function removeImages(rows: any[], mode: 'single' | 'batch') {
   }
 }
 
-async function openLogs(id: string) {
+function openLogs(id: string) {
   const query = targetQuery()
   if (!query) {
     ElMessage.warning(t('containers.selectDockerHost'))
     return
   }
-  const result = await apiGet<{ logs?: string[] }>(`/containers/${encodeURIComponent(id)}/logs?tail=300&${query}`)
-  logsText.value = asArray<string>(result.logs).join('\n')
+  closeContainerLogStream()
+  logsText.value = ''
   logsVisible.value = true
+  const params = new URLSearchParams(query)
+  params.set('tail', '300')
+  params.set('batch', '200')
+  const source = new EventSource(apiEventSourceUrl(`/containers/${encodeURIComponent(id)}/logs/events?${params.toString()}`))
+  containerLogSource = source
+  const applySnapshot = (event: Event) => {
+    if (containerLogSource !== source) return
+    const next = parseContainerLogsEvent((event as MessageEvent).data)
+    if (!next) return
+    setContainerLogLines(next.logs)
+  }
+  const applyBatch = (event: Event) => {
+    if (containerLogSource !== source) return
+    const next = parseContainerLogsEvent((event as MessageEvent).data)
+    if (!next) return
+    appendContainerLogLines(next.logs)
+    if (next.warnings?.length) {
+      appendContainerLogLines(next.warnings)
+    }
+  }
+  source.addEventListener('container-logs-snapshot', applySnapshot)
+  source.addEventListener('container-logs-batch', applyBatch)
+  source.addEventListener('container-logs-error', (event) => {
+    if (containerLogSource !== source) return
+    const message = parseRuntimeLogErrorEvent((event as MessageEvent).data)
+    if (message) {
+      appendContainerLogLines([message])
+    }
+  })
+}
+
+function closeContainerLogStream() {
+  if (containerLogSource) {
+    containerLogSource.close()
+    containerLogSource = null
+  }
+}
+
+function parseContainerLogsEvent(raw: string) {
+  try {
+    return JSON.parse(raw) as { logs?: string[]; warnings?: string[] }
+  } catch {
+    return null
+  }
+}
+
+function setContainerLogLines(lines?: string[]) {
+  const next = asArray<string>(lines)
+  logsText.value = next.slice(-containerLogMaxLines).join('\n')
+}
+
+function appendContainerLogLines(lines?: string[]) {
+  const next = asArray<string>(lines)
+  if (!next.length) return
+  const current = logsText.value ? logsText.value.split('\n') : []
+  logsText.value = current.concat(next).slice(-containerLogMaxLines).join('\n')
 }
 
 function parseRuntimeLogLine(line: string) {
@@ -2848,6 +2906,11 @@ watch(deletePromptVisible, (visible) => {
     deletePromptInstance.value = null
   }
 })
+watch(logsVisible, (visible) => {
+  if (!visible) {
+    closeContainerLogStream()
+  }
+})
 watch([aifarUpdateService, aifarUpdateMode], () => {
   aifarArtifactFile.value = null
 })
@@ -2870,6 +2933,7 @@ onMounted(async () => {
   await load()
 })
 onBeforeUnmount(() => {
+  closeContainerLogStream()
   closeRuntimeLogStream()
 })
 </script>

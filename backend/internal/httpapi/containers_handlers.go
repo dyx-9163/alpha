@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 
 	"aifar-deployment/backend/internal/adapter"
 	"aifar-deployment/backend/internal/i18n"
@@ -306,6 +307,124 @@ func (a *API) containerLogs(w http.ResponseWriter, r *http.Request) {
 		logs, err = adapter.DockerContainerLogs(r.Context(), host, chi.URLParam(r, "id"), tail)
 	}
 	respond(w, map[string]any{"logs": logs}, err)
+}
+
+type containerLogsStreamResponse struct {
+	ID       string   `json:"id"`
+	Tail     int      `json:"tail"`
+	Batch    int      `json:"batch,omitempty"`
+	Mode     string   `json:"mode,omitempty"`
+	Logs     []string `json:"logs"`
+	Warnings []string `json:"warnings,omitempty"`
+}
+
+func (a *API) containerLogsEvents(w http.ResponseWriter, r *http.Request) {
+	host := dockerHostFromRequest(r)
+	server, useServer, serverErr := a.dockerServerFromRequest(r)
+	if serverErr != nil {
+		respond(w, nil, serverErr)
+		return
+	}
+	if !useServer && host == "" {
+		writeError(w, http.StatusBadRequest, "DOCKER_TARGET_REQUIRED", i18n.Text(languageFromRequest(r), "api.dockerTargetRequired"), nil)
+		return
+	}
+	id := strings.TrimSpace(chi.URLParam(r, "id"))
+	if id == "" {
+		writeError(w, http.StatusBadRequest, "IDS_REQUIRED", i18n.Text(languageFromRequest(r), "api.containerIDsRequired"), nil)
+		return
+	}
+	tail := boundedRuntimeLogTail(queryInt(r, "tail", 300))
+	batch := boundedRuntimeLogBatch(queryInt(r, "batch", 200))
+	requestedSince := runtimeLogSinceFromRequest(r)
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+	flusher, _ := w.(http.Flusher)
+	flush := func() {
+		if flusher != nil {
+			flusher.Flush()
+		}
+	}
+	emitError := func(err error) {
+		writeSSE(w, "container-logs-error", map[string]any{"message": err.Error()})
+		flush()
+	}
+
+	logs, err := dockerContainerLogsForTarget(r.Context(), server, useServer, host, id, adapter.DockerLogOptions{
+		Tail:       tail,
+		Since:      requestedSince,
+		Timestamps: true,
+	})
+	if err != nil {
+		emitError(err)
+	} else {
+		writeSSE(w, "container-logs-snapshot", containerLogsStreamResponse{
+			ID:   id,
+			Tail: tail,
+			Logs: logs,
+			Mode: "snapshot",
+		})
+		flush()
+	}
+
+	stateSince := runtimeLogInitialSince(requestedSince)
+	stateCounts := runtimeLogLineCounts(runtimeLogLinesSince(logs, stateSince))
+	emitBatch := func() {
+		startedAt := time.Now()
+		lines, logErr := dockerContainerLogsForTarget(r.Context(), server, useServer, host, id, adapter.DockerLogOptions{
+			Tail:       batch,
+			Since:      stateSince,
+			Timestamps: true,
+		})
+		newLines, _ := runtimeLogNewLines(lines, stateCounts)
+		nextSince := startedAt.Add(-3 * time.Second)
+		if !requestedSince.IsZero() && nextSince.Before(requestedSince) {
+			nextSince = requestedSince
+		}
+		stateSince = nextSince
+		stateCounts = runtimeLogLineCounts(runtimeLogLinesSince(lines, nextSince))
+		if len(newLines) == 0 && logErr == nil {
+			return
+		}
+		response := containerLogsStreamResponse{
+			ID:    id,
+			Tail:  tail,
+			Batch: batch,
+			Mode:  "append",
+			Logs:  newLines,
+		}
+		if logErr != nil {
+			response.Warnings = []string{logErr.Error()}
+		}
+		writeSSE(w, "container-logs-batch", response)
+		flush()
+	}
+
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+	heartbeat := time.NewTicker(25 * time.Second)
+	defer heartbeat.Stop()
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case <-ticker.C:
+			emitBatch()
+		case <-heartbeat.C:
+			writeSSE(w, "heartbeat", map[string]any{"time": time.Now().UTC()})
+			flush()
+		}
+	}
+}
+
+func dockerContainerLogsForTarget(ctx context.Context, server store.Server, useServer bool, host, id string, options adapter.DockerLogOptions) ([]string, error) {
+	if useServer {
+		return adapter.DockerContainerLogsForServerWithOptions(ctx, server, id, options)
+	}
+	return adapter.DockerContainerLogsWithOptions(ctx, host, id, options)
 }
 
 func (a *API) dockerServerFromRequest(r *http.Request) (store.Server, bool, error) {
