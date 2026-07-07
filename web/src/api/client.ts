@@ -117,14 +117,19 @@ export function terminalUrl(serverId: string) {
   return `${proto}://${window.location.host}${API_PREFIX}/servers/${serverId}/terminal/ws?${params.toString()}`
 }
 
-export function eventStreamUrl() {
+export function apiEventSourceUrl(path: string) {
   const params = new URLSearchParams()
   const token = localStorage.getItem('aifar-session-token')
   if (token) {
     params.set('token', token)
   }
   params.set('lang', getCurrentLocale())
-  return `${API_PREFIX}/events?${params.toString()}`
+  const separator = path.includes('?') ? '&' : '?'
+  return `${API_PREFIX}${path}${separator}${params.toString()}`
+}
+
+export function eventStreamUrl() {
+  return apiEventSourceUrl('/events')
 }
 
 export function terminalProtocols() {

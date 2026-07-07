@@ -239,9 +239,28 @@ func (m *Manager) saveSnapshot(ctx context.Context, snapshot store.StatusSnapsho
 			Status:      saved.Status,
 			Version:     saved.Version,
 			CollectedAt: saved.CollectedAt,
+			Payload:     snapshotEventPayload(saved),
 		})
 	}
 	return nil
+}
+
+func snapshotEventPayload(snapshot store.StatusSnapshot) map[string]any {
+	payload := map[string]any{}
+	if strings.TrimSpace(snapshot.Payload) != "" {
+		_ = json.Unmarshal([]byte(snapshot.Payload), &payload)
+	}
+	return map[string]any{
+		"scope":       snapshot.Scope,
+		"resourceId":  snapshot.ResourceID,
+		"serverId":    snapshot.ServerID,
+		"status":      snapshot.Status,
+		"payload":     payload,
+		"lastError":   snapshot.LastError,
+		"version":     snapshot.Version,
+		"collectedAt": snapshot.CollectedAt,
+		"updatedAt":   snapshot.UpdatedAt,
+	}
 }
 
 func marshalPayload(value any) string {

@@ -557,10 +557,10 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import type { UploadFile } from 'element-plus'
-import { apiGet, apiPost, apiPostForm, apiPut, asArray } from '../api/client'
+import { apiEventSourceUrl, apiGet, apiPost, apiPostForm, apiPut, asArray } from '../api/client'
 import KeyValueGrid from '../components/KeyValueGrid.vue'
 import LogDrawer from '../components/LogDrawer.vue'
 import MetricGrid from '../components/MetricGrid.vue'
@@ -803,6 +803,8 @@ const runtimeLogServiceFilter = ref('')
 const runtimeLogTail = ref(200)
 const runtimeLogs = ref<AifarRuntimeLogsResponse>({ pods: [], warnings: [], tail: 200 })
 const runtimeLogsLoaded = ref<Record<string, boolean>>({})
+let runtimeLogSource: EventSource | null = null
+let runtimeLogStreamKey = ''
 const runtimeConfigVisible = ref(false)
 const runtimeConfigSubmitting = ref(false)
 const runtimeConfigForm = ref<RuntimeConfigFormValues>({
@@ -1207,6 +1209,35 @@ async function loadSummary(includeDisk = false, force = false) {
   if (next.available === false && next.error) error.value = next.error
 }
 
+function applyDockerSummaryEvent(event: unknown) {
+  const envelope = realtimeSnapshotEnvelope(event)
+  const payload = objectPayload(envelope?.payload)
+  if (!payload) {
+    return false
+  }
+  const next: DockerSummaryResponse = {
+    ...summary.value,
+    available: payload.available === true,
+    error: typeof envelope?.lastError === 'string' ? envelope.lastError : summary.value.error,
+    summary: objectPayload(payload.summary) ?? summary.value.summary,
+    diskUsage: summary.value.diskUsage
+  }
+  summary.value = next
+  summaryCache.value = { ...summaryCache.value, [summaryCacheKey(false)]: next }
+  if (next.available === false && next.error) {
+    error.value = next.error
+  }
+  return true
+}
+
+function realtimeSnapshotEnvelope(event: unknown) {
+  return objectPayload((event as { payload?: unknown } | null)?.payload)
+}
+
+function objectPayload(value: unknown) {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, any> : null
+}
+
 async function loadCollection(force = false) {
   if (tab.value === 'aifar-runtime') {
     collection.value = []
@@ -1290,32 +1321,81 @@ function clearRuntimePodServiceFilter() {
   runtimePodServiceFilter.value = ''
 }
 
-async function loadRuntimeLogs(force = false) {
-  return withLoading(async () => {
-    const query = targetQuery()
-    const instance = selectedRuntimeInstance.value
-    if (!query || !instance?.id) {
-      runtimeLogs.value = { pods: [], warnings: [], tail: runtimeLogTail.value }
+function loadRuntimeLogs(force = false) {
+  const key = runtimeLogCacheKey()
+  if (!force && runtimeLogSource && runtimeLogStreamKey === key) {
+    return
+  }
+  openRuntimeLogStream(force)
+}
+
+function openRuntimeLogStream(force = false) {
+  closeRuntimeLogStream()
+  const query = targetQuery()
+  const instance = selectedRuntimeInstance.value
+  const key = runtimeLogCacheKey()
+  if (force) {
+    runtimeLogs.value = { pods: [], warnings: [], tail: runtimeLogTail.value }
+    runtimeLogsLoaded.value = { ...runtimeLogsLoaded.value, [key]: false }
+  }
+  if (tab.value !== 'aifar-runtime' || runtimeResourceTab.value !== 'logs' || !query || !instance?.id) {
+    runtimeLogs.value = { pods: [], warnings: [], tail: runtimeLogTail.value }
+    return
+  }
+  const params = new URLSearchParams(query)
+  params.set('instanceId', instance.id)
+  params.set('tail', String(runtimeLogTail.value))
+  const service = String(runtimeLogServiceFilter.value || '').trim()
+  if (service) {
+    params.set('service', service)
+  }
+  const source = new EventSource(apiEventSourceUrl(`/containers/aifar/runtime/logs/events?${params.toString()}`))
+  runtimeLogSource = source
+  runtimeLogStreamKey = key
+  source.addEventListener('runtime-logs', (event) => {
+    if (runtimeLogSource !== source) {
       return
     }
-    const key = runtimeLogCacheKey()
-    if (!force && runtimeLogsLoaded.value[key]) {
+    const next = parseRuntimeLogsEvent((event as MessageEvent).data)
+    if (!next) {
       return
     }
-    const params = new URLSearchParams(query)
-    params.set('instanceId', instance.id)
-    params.set('tail', String(runtimeLogTail.value))
-    const service = String(runtimeLogServiceFilter.value || '').trim()
-    if (service) {
-      params.set('service', service)
-    }
-    const next = await apiGet<AifarRuntimeLogsResponse>(`/containers/aifar/runtime/logs?${params.toString()}`).catch((err) => {
-      error.value = err.message
-      return { pods: [], warnings: [err.message], tail: runtimeLogTail.value }
-    })
     runtimeLogs.value = next
     runtimeLogsLoaded.value = { ...runtimeLogsLoaded.value, [key]: true }
   })
+  source.addEventListener('runtime-logs-error', (event) => {
+    if (runtimeLogSource !== source) {
+      return
+    }
+    const message = parseRuntimeLogErrorEvent((event as MessageEvent).data)
+    runtimeLogs.value = { pods: [], warnings: message ? [message] : [], tail: runtimeLogTail.value }
+    runtimeLogsLoaded.value = { ...runtimeLogsLoaded.value, [key]: true }
+  })
+}
+
+function closeRuntimeLogStream() {
+  if (runtimeLogSource) {
+    runtimeLogSource.close()
+    runtimeLogSource = null
+  }
+  runtimeLogStreamKey = ''
+}
+
+function parseRuntimeLogsEvent(raw: string) {
+  try {
+    return JSON.parse(raw) as AifarRuntimeLogsResponse
+  } catch {
+    return null
+  }
+}
+
+function parseRuntimeLogErrorEvent(raw: string) {
+  try {
+    const parsed = JSON.parse(raw) as { message?: string }
+    return String(parsed.message || '').trim()
+  } catch {
+    return ''
+  }
 }
 
 function clearRuntimeLogServiceFilter() {
@@ -1328,7 +1408,7 @@ async function loadActive(force = false) {
       await loadSummary(true, force)
     } else if (tab.value === 'aifar-runtime') {
       if (runtimeResourceTab.value === 'logs') {
-        await loadRuntimeLogs(force)
+        loadRuntimeLogs(force)
       } else {
         await loadAifarRuntime(force)
       }
@@ -2404,7 +2484,10 @@ async function confirmAppUninstall(password: string) {
   }
 }
 
-watch(tab, () => {
+watch(tab, (next) => {
+  if (next !== 'aifar-runtime') {
+    closeRuntimeLogStream()
+  }
   void loadActive(false)
 })
 watch(resourceTab, () => {
@@ -2417,6 +2500,8 @@ watch(runtimeResourceTab, (next) => {
     void ensureRuntimePodsLoaded(false)
   } else if (next === 'logs') {
     void loadRuntimeLogs(false)
+  } else {
+    closeRuntimeLogStream()
   }
 })
 watch(selectedRuntimeInstanceId, () => {
@@ -2425,13 +2510,15 @@ watch(selectedRuntimeInstanceId, () => {
   runtimeLogs.value = { pods: [], warnings: [], tail: runtimeLogTail.value }
   runtimeLogsLoaded.value = {}
   if (runtimeResourceTab.value === 'logs') {
-    void loadRuntimeLogs(true)
+    loadRuntimeLogs(true)
+  } else {
+    closeRuntimeLogStream()
   }
 })
 watch([runtimeLogServiceFilter, runtimeLogTail], () => {
   runtimeLogs.value = { pods: [], warnings: [], tail: runtimeLogTail.value }
   if (runtimeResourceTab.value === 'logs') {
-    void loadRuntimeLogs(true)
+    loadRuntimeLogs(true)
   }
 })
 watch(() => realtime.revision, () => {
@@ -2444,8 +2531,9 @@ watch(() => realtime.revision, () => {
     return
   }
   if (event.resource === 'docker.summary' && event.serverId === selectedServerId.value) {
-    summaryCache.value = {}
-    void loadSummary(tab.value === 'overview', true)
+    if (!applyDockerSummaryEvent(event)) {
+      summaryCache.value = {}
+    }
     return
   }
   if (event.resource === 'aifar.runtime' && tab.value === 'aifar-runtime') {
@@ -2453,11 +2541,6 @@ watch(() => realtime.revision, () => {
       return
     }
     runtimeCache.value = {}
-    runtimeLogsLoaded.value = {}
-    void loadAifarRuntime(true, runtimeResourceTab.value === 'pods', false)
-    if (runtimeResourceTab.value === 'logs') {
-      void loadRuntimeLogs(true)
-    }
   }
 })
 watch(deletePromptVisible, (visible) => {
@@ -2471,6 +2554,7 @@ watch([aifarUpdateService, aifarUpdateMode], () => {
 watch(selectedServerId, () => {
   runtimeLogs.value = { pods: [], warnings: [], tail: runtimeLogTail.value }
   runtimeLogsLoaded.value = {}
+  closeRuntimeLogStream()
   if (pageReady.value) {
     void load(true)
   }
@@ -2479,6 +2563,9 @@ onMounted(async () => {
   await loadServers()
   pageReady.value = true
   await load()
+})
+onBeforeUnmount(() => {
+  closeRuntimeLogStream()
 })
 </script>
 

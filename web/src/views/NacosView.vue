@@ -13,7 +13,7 @@
 
     <div class="aifar-panel status-line">
       <span class="subtle-note">{{ t('nacos.instanceCount', { count: instances.length }) }}</span>
-      <span class="status-pill" :class="{ success: monitoringEnabled }">{{ monitoringStatusLabel }}</span>
+      <span class="status-pill" :class="{ success: canManageApps }">{{ monitoringStatusLabel }}</span>
       <span v-if="lastMonitorAt" class="subtle-note">{{ t('nacos.lastMonitoredAt') }} {{ lastMonitorAt }}</span>
     </div>
 
@@ -34,7 +34,6 @@
             <span class="status-pill">{{ t('nacos.nodes') }} {{ nacosNodeCount }}</span>
           </div>
           <div class="monitor-actions">
-            <el-switch v-model="monitoringEnabled" :disabled="!canManageApps" :active-text="t('nacos.realtimeMonitor')" @change="handleMonitoringToggle" />
             <el-button size="small" :loading="monitoringRunning" :disabled="!canManageApps" @click="runRealtimeCheck(true)">{{ t('nacos.monitorNow') }}</el-button>
             <el-input v-model="search" :placeholder="t('nacos.search')" clearable class="toolbar-control is-sm" />
           </div>
@@ -289,7 +288,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import { useRouter } from 'vue-router'
 import { apiGet, apiPost, asArray } from '../api/client'
@@ -299,6 +298,7 @@ import StatusTag from '../components/StatusTag.vue'
 import { usePermissions } from '../composables/usePermissions'
 import { useI18n } from '../i18n'
 import { permissions } from '../rbac'
+import { useRealtimeStore } from '../stores/realtime'
 import { useTaskProgressStore } from '../stores/taskProgress'
 
 type AppInstance = {
@@ -409,6 +409,7 @@ type NacosState = {
 const { t } = useI18n()
 const { can, deniedText } = usePermissions()
 const router = useRouter()
+const realtime = useRealtimeStore()
 const taskProgress = useTaskProgressStore()
 const instances = ref<AppInstance[]>([])
 const servers = ref<any[]>([])
@@ -418,10 +419,10 @@ const databaseInstances = ref<AppInstance[]>([])
 const storageInstances = ref<AppInstance[]>([])
 const tab = ref('instances')
 const search = ref('')
-const monitoringEnabled = ref(true)
 const monitoringRunning = ref(false)
 const lastMonitorAt = ref('')
 const checkingInstanceIds = ref<Set<string>>(new Set())
+const pendingMonitorTaskIds = ref<Set<string>>(new Set())
 const configForm = ref<ConfigForm>({
   nacosInstanceId: '',
   nacosCredentialId: '',
@@ -455,9 +456,6 @@ const pendingDeleteGroup = ref<NacosGroup | null>(null)
 const deletePasswords = ref<Record<string, string>>({})
 const sameDeletePassword = ref(false)
 const deleteSharedPassword = ref('')
-let monitorTimer: ReturnType<typeof setInterval> | undefined
-
-const monitorIntervalMs = 30000
 const canManageApps = computed(() => can(permissions.appsManage))
 const nacosGroups = computed(() => buildNacosGroups(instances.value))
 const filteredGroups = computed(() => {
@@ -485,7 +483,7 @@ const configSummary = computed(() => configPreview.value?.summary?.length ? conf
 const monitoringStatusLabel = computed(() => {
   if (!canManageApps.value) return t('nacos.monitorPermissionRequired')
   if (monitoringRunning.value) return t('nacos.monitoring')
-  return monitoringEnabled.value ? t('nacos.realtimeMonitorOn') : t('nacos.realtimeMonitorOff')
+  return t('nacos.backendPushReady')
 })
 const settingsItems = computed(() => [
   { label: t('nacos.defaultPorts'), value: t('nacos.defaultPortsHint') },
@@ -725,28 +723,6 @@ async function rollbackNacosConfig(row: NacosConfigRevision) {
   }
 }
 
-function startMonitor() {
-  stopMonitor()
-  monitorTimer = setInterval(() => {
-    if (monitoringEnabled.value && tab.value === 'instances') {
-      void runRealtimeCheck(false)
-    }
-  }, monitorIntervalMs)
-}
-
-function stopMonitor() {
-  if (monitorTimer) {
-    clearInterval(monitorTimer)
-    monitorTimer = undefined
-  }
-}
-
-function handleMonitoringToggle() {
-  if (monitoringEnabled.value) {
-    void runRealtimeCheck(false)
-  }
-}
-
 async function runRealtimeCheck(manual: boolean) {
   if (!canManageApps.value) {
     if (manual) {
@@ -766,6 +742,7 @@ async function runRealtimeCheck(manual: boolean) {
   }
   monitoringRunning.value = true
   checkingInstanceIds.value = new Set(rows.map((item) => item.id))
+  let waitForRealtime = false
   try {
     const taskIds: string[] = []
     for (const instance of rows) {
@@ -781,33 +758,37 @@ async function runRealtimeCheck(manual: boolean) {
       }
     }
     if (taskIds.length) {
-      await waitForTasks(taskIds)
+      pendingMonitorTaskIds.value = new Set(taskIds)
+      void settleFinishedMonitorTasks()
+      waitForRealtime = true
+      return
     }
     lastMonitorAt.value = new Date().toLocaleTimeString()
     applyNacosState(await fetchNacosState())
   } finally {
-    monitoringRunning.value = false
-    checkingInstanceIds.value = new Set()
-  }
-}
-
-async function waitForTasks(taskIds: string[]) {
-  const pending = new Set(taskIds)
-  const deadline = Date.now() + 60000
-  while (pending.size && Date.now() < deadline) {
-    await delay(1000)
-    const latest = asArray<TaskRecord>(await apiGet<TaskRecord[] | null>('/tasks').catch(() => []))
-    tasks.value = latest
-    for (const task of latest) {
-      if (pending.has(task.id) && !['pending', 'running'].includes(task.status)) {
-        pending.delete(task.id)
-      }
+    if (!waitForRealtime) {
+      monitoringRunning.value = false
+      checkingInstanceIds.value = new Set()
     }
   }
 }
 
-function delay(ms: number) {
-  return new Promise((resolve) => setTimeout(resolve, ms))
+async function settleFinishedMonitorTasks() {
+  if (!pendingMonitorTaskIds.value.size) {
+    return
+  }
+  const latest = asArray<TaskRecord>(await apiGet<TaskRecord[] | null>('/tasks').catch(() => []))
+  tasks.value = latest
+  const pending = new Set(pendingMonitorTaskIds.value)
+  for (const task of latest) {
+    if (pending.has(task.id) && !['pending', 'running'].includes(task.status)) {
+      pending.delete(task.id)
+    }
+  }
+  pendingMonitorTaskIds.value = pending
+  if (pending.size === 0) {
+    void finishRealtimeCheck()
+  }
 }
 
 function buildNacosGroups(rows: AppInstance[]) {
@@ -1130,16 +1111,34 @@ watch(
   }
 )
 
-onMounted(async () => {
-  await load()
-  await loadConfigRevisions()
-  startMonitor()
-  if (monitoringEnabled.value && canManageApps.value) {
-    void runRealtimeCheck(false)
+async function finishRealtimeCheck() {
+  lastMonitorAt.value = new Date().toLocaleTimeString()
+  try {
+    applyNacosState(await fetchNacosState())
+  } finally {
+    pendingMonitorTaskIds.value = new Set()
+    monitoringRunning.value = false
+    checkingInstanceIds.value = new Set()
+  }
+}
+
+watch(() => realtime.revision, () => {
+  const event = realtime.lastEvent
+  if (event?.type !== 'task.finished' || !event.taskId || !pendingMonitorTaskIds.value.has(event.taskId)) {
+    return
+  }
+  const pending = new Set(pendingMonitorTaskIds.value)
+  pending.delete(event.taskId)
+  pendingMonitorTaskIds.value = pending
+  if (pending.size === 0) {
+    void finishRealtimeCheck()
   }
 })
 
-onUnmounted(stopMonitor)
+onMounted(async () => {
+  await load()
+  await loadConfigRevisions()
+})
 </script>
 
 <style scoped>

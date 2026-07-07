@@ -13,7 +13,7 @@
 
     <div class="aifar-panel status-line">
       <span class="subtle-note">{{ t('database.instanceCount', { count: instances.length }) }}</span>
-      <span class="status-pill" :class="{ success: monitoringEnabled }">{{ monitoringStatusLabel }}</span>
+      <span class="status-pill" :class="{ success: canManageApps }">{{ monitoringStatusLabel }}</span>
       <span v-if="lastMonitorAt" class="subtle-note">{{ t('database.lastMonitoredAt') }} {{ lastMonitorAt }}</span>
     </div>
 
@@ -35,7 +35,6 @@
             <span v-if="routerInstanceCount" class="status-pill">{{ t('database.mysqlRouter') }} {{ routerInstanceCount }}</span>
           </div>
           <div class="monitor-actions">
-            <el-switch v-model="monitoringEnabled" :disabled="!canManageApps" :active-text="t('database.realtimeMonitor')" @change="handleMonitoringToggle" />
             <el-button size="small" :loading="monitoringRunning" :disabled="!canManageApps" @click="runRealtimeCheck(true)">{{ t('database.monitorNow') }}</el-button>
             <el-input v-model="search" :placeholder="t('common.search')" clearable class="toolbar-control is-sm" />
           </div>
@@ -200,7 +199,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import { useRouter } from 'vue-router'
 import { apiGet, apiPost, asArray } from '../api/client'
@@ -210,6 +209,7 @@ import StatusTag from '../components/StatusTag.vue'
 import { usePermissions } from '../composables/usePermissions'
 import { useI18n } from '../i18n'
 import { permissions } from '../rbac'
+import { useRealtimeStore } from '../stores/realtime'
 import { useTaskProgressStore } from '../stores/taskProgress'
 
 type AppInstance = {
@@ -278,15 +278,16 @@ type DatabaseState = {
 const { t } = useI18n()
 const { can, deniedText } = usePermissions()
 const router = useRouter()
+const realtime = useRealtimeStore()
 const taskProgress = useTaskProgressStore()
 const instances = ref<AppInstance[]>([])
 const servers = ref<any[]>([])
 const tasks = ref<TaskRecord[]>([])
 const tab = ref('instances')
 const search = ref('')
-const monitoringEnabled = ref(true)
 const monitoringRunning = ref(false)
 const monitorStartedAt = ref(0)
+const pendingMonitorTaskIds = ref<Set<string>>(new Set())
 const lastMonitorAt = ref('')
 const deletePromptVisible = ref(false)
 const deleteSubmitting = ref(false)
@@ -295,8 +296,6 @@ const deletePasswords = ref<Record<string, string>>({})
 const sameDeletePassword = ref(false)
 const deleteSharedPassword = ref('')
 const startingClusterId = ref('')
-let monitorTimer: ReturnType<typeof setInterval> | undefined
-const monitorIntervalMs = 30000
 const mysqlGroupCount = computed(() => instanceGroups.value.filter((item) => item.app === 'mysql').length)
 const redisGroupCount = computed(() => instanceGroups.value.filter((item) => item.app === 'redis').length)
 const databaseNodeCount = computed(() => instanceGroups.value.reduce((total, group) => total + group.nodes.length, 0))
@@ -311,7 +310,7 @@ const monitoringStatusLabel = computed(() => {
   if (monitoringRunning.value) {
     return t('database.monitoring')
   }
-  return monitoringEnabled.value ? t('database.realtimeMonitorOn') : t('database.realtimeMonitorOff')
+  return t('database.backendPushReady')
 })
 const deletePromptMessage = computed(() => {
   return pendingDeleteScope.value?.message || ''
@@ -382,28 +381,6 @@ function applyDatabaseState(state: DatabaseState) {
   tasks.value = state.tasks
 }
 
-function startMonitor() {
-  stopMonitor()
-  monitorTimer = setInterval(() => {
-    if (monitoringEnabled.value && tab.value === 'instances') {
-      void runRealtimeCheck(false)
-    }
-  }, monitorIntervalMs)
-}
-
-function stopMonitor() {
-  if (monitorTimer) {
-    clearInterval(monitorTimer)
-    monitorTimer = undefined
-  }
-}
-
-function handleMonitoringToggle() {
-  if (monitoringEnabled.value) {
-    void runRealtimeCheck(false)
-  }
-}
-
 async function runRealtimeCheck(manual: boolean) {
   if (!canManageApps.value) {
     if (manual) {
@@ -416,6 +393,7 @@ async function runRealtimeCheck(manual: boolean) {
   }
   monitoringRunning.value = true
   monitorStartedAt.value = Date.now()
+  let waitForRealtime = false
   try {
     const state = await fetchDatabaseState()
     applyDatabaseState(state)
@@ -433,12 +411,17 @@ async function runRealtimeCheck(manual: boolean) {
       }
     }
     if (taskIds.length) {
-      await waitForTasks(taskIds)
+      pendingMonitorTaskIds.value = new Set(taskIds)
+      void settleFinishedMonitorTasks()
+      waitForRealtime = true
+      return
     }
     lastMonitorAt.value = new Date().toLocaleTimeString()
     applyDatabaseState(await fetchDatabaseState())
   } finally {
-    monitoringRunning.value = false
+    if (!waitForRealtime) {
+      monitoringRunning.value = false
+    }
   }
 }
 
@@ -446,23 +429,22 @@ function isMonitorableInstance(instance: AppInstance) {
   return ['mysql', 'redis', 'mysql-router'].includes(instance.app)
 }
 
-async function waitForTasks(taskIds: string[]) {
-  const pending = new Set(taskIds)
-  const deadline = Date.now() + 90000
-  while (pending.size && Date.now() < deadline) {
-    await delay(2000)
-    const latest = asArray<TaskRecord>(await apiGet<TaskRecord[] | null>('/tasks').catch(() => []))
-    tasks.value = latest
-    for (const task of latest) {
-      if (pending.has(task.id) && !['pending', 'running'].includes(task.status)) {
-        pending.delete(task.id)
-      }
+async function settleFinishedMonitorTasks() {
+  if (!pendingMonitorTaskIds.value.size) {
+    return
+  }
+  const latest = asArray<TaskRecord>(await apiGet<TaskRecord[] | null>('/tasks').catch(() => []))
+  tasks.value = latest
+  const pending = new Set(pendingMonitorTaskIds.value)
+  for (const task of latest) {
+    if (pending.has(task.id) && !['pending', 'running'].includes(task.status)) {
+      pending.delete(task.id)
     }
   }
-}
-
-function delay(ms: number) {
-  return new Promise((resolve) => setTimeout(resolve, ms))
+  pendingMonitorTaskIds.value = pending
+  if (pending.size === 0) {
+    void finishRealtimeCheck()
+  }
 }
 
 function metadataOf(item: AppInstance) {
@@ -1640,15 +1622,32 @@ function deleteErrorMessage(err: unknown) {
   return err.message
 }
 
-onMounted(async () => {
-  await load()
-  startMonitor()
-  if (monitoringEnabled.value && canManageApps.value) {
-    void runRealtimeCheck(false)
+async function finishRealtimeCheck() {
+  lastMonitorAt.value = new Date().toLocaleTimeString()
+  try {
+    applyDatabaseState(await fetchDatabaseState())
+  } finally {
+    pendingMonitorTaskIds.value = new Set()
+    monitoringRunning.value = false
+  }
+}
+
+watch(() => realtime.revision, () => {
+  const event = realtime.lastEvent
+  if (event?.type !== 'task.finished' || !event.taskId || !pendingMonitorTaskIds.value.has(event.taskId)) {
+    return
+  }
+  const pending = new Set(pendingMonitorTaskIds.value)
+  pending.delete(event.taskId)
+  pendingMonitorTaskIds.value = pending
+  if (pending.size === 0) {
+    void finishRealtimeCheck()
   }
 })
 
-onUnmounted(stopMonitor)
+onMounted(async () => {
+  await load()
+})
 </script>
 
 <style scoped>

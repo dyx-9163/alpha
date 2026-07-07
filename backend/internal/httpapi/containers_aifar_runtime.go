@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"time"
 
 	"aifar-deployment/backend/internal/adapter"
 	"aifar-deployment/backend/internal/apps/registry"
@@ -222,36 +223,105 @@ func (a *API) aifarRuntime(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) aifarRuntimeLogs(w http.ResponseWriter, r *http.Request) {
+	server, instance, query, ok := a.resolveAIFARRuntimeLogQuery(w, r)
+	if !ok {
+		return
+	}
+	response, err := a.collectAIFARRuntimeLogs(r.Context(), server, instance, query)
+	respond(w, response, err)
+}
+
+func (a *API) aifarRuntimeLogsEvents(w http.ResponseWriter, r *http.Request) {
+	server, instance, query, ok := a.resolveAIFARRuntimeLogQuery(w, r)
+	if !ok {
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+	flusher, _ := w.(http.Flusher)
+	lastPayload := ""
+	emitLogs := func(force bool) {
+		response, err := a.collectAIFARRuntimeLogs(r.Context(), server, instance, query)
+		if err != nil {
+			writeSSE(w, "runtime-logs-error", map[string]any{"message": err.Error()})
+			if flusher != nil {
+				flusher.Flush()
+			}
+			return
+		}
+		data, _ := json.Marshal(response)
+		current := string(data)
+		if !force && current == lastPayload {
+			return
+		}
+		lastPayload = current
+		writeSSE(w, "runtime-logs", response)
+		if flusher != nil {
+			flusher.Flush()
+		}
+	}
+	emitLogs(true)
+	ticker := time.NewTicker(3 * time.Second)
+	defer ticker.Stop()
+	heartbeat := time.NewTicker(25 * time.Second)
+	defer heartbeat.Stop()
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case <-ticker.C:
+			emitLogs(false)
+		case <-heartbeat.C:
+			writeSSE(w, "heartbeat", map[string]any{"time": time.Now().UTC()})
+			if flusher != nil {
+				flusher.Flush()
+			}
+		}
+	}
+}
+
+type aifarRuntimeLogQuery struct {
+	Tail        int
+	Service     string
+	PodSelector string
+}
+
+func (a *API) resolveAIFARRuntimeLogQuery(w http.ResponseWriter, r *http.Request) (store.Server, store.AppInstance, aifarRuntimeLogQuery, bool) {
 	lang := languageFromRequest(r)
 	server, useServer, err := a.dockerServerFromRequest(r)
 	if err != nil {
 		respond(w, nil, err)
-		return
+		return store.Server{}, store.AppInstance{}, aifarRuntimeLogQuery{}, false
 	}
 	if !useServer {
 		writeError(w, http.StatusBadRequest, "DOCKER_TARGET_REQUIRED", i18n.Text(lang, "api.dockerTargetRequired"), nil)
-		return
+		return store.Server{}, store.AppInstance{}, aifarRuntimeLogQuery{}, false
 	}
 	instanceID := strings.TrimSpace(r.URL.Query().Get("instanceId"))
 	instance, err := a.findAIFARInstanceForRuntimeAction(server.ID, instanceID)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "AIFAR_INSTANCE_REQUIRED", err.Error(), nil)
-		return
+		return store.Server{}, store.AppInstance{}, aifarRuntimeLogQuery{}, false
 	}
 	if strings.TrimSpace(runtimeString(runtimeMetadata(instance.Metadata), "orchestrationModel", "")) != aifarK8sLikeModel {
 		writeError(w, http.StatusConflict, "AIFAR_RUNTIME_REINSTALL_REQUIRED", "legacy AIFAR orchestration model does not support runtime log aggregation; reinstall with agent-runtime-v2", map[string]any{"instanceId": instance.ID})
-		return
+		return store.Server{}, store.AppInstance{}, aifarRuntimeLogQuery{}, false
 	}
+	return server, instance, aifarRuntimeLogQuery{
+		Tail:        boundedRuntimeLogTail(queryInt(r, "tail", 200)),
+		Service:     cleanRuntimeText(r.URL.Query().Get("service")),
+		PodSelector: cleanRuntimeText(firstNonEmptyRuntimeQuery(r, "pod", "container", "containerName")),
+	}, true
+}
 
-	tail := boundedRuntimeLogTail(queryInt(r, "tail", 200))
-	service := cleanRuntimeText(r.URL.Query().Get("service"))
-	podSelector := cleanRuntimeText(firstNonEmptyRuntimeQuery(r, "pod", "container", "containerName"))
+func (a *API) collectAIFARRuntimeLogs(ctx context.Context, server store.Server, instance store.AppInstance, query aifarRuntimeLogQuery) (aifarRuntimeLogsResponse, error) {
 	pods, err := a.store.ListAIFARPods(instance.ID)
 	if err != nil {
-		respond(w, nil, err)
-		return
+		return aifarRuntimeLogsResponse{}, err
 	}
-	pods = filterRuntimeLogPods(pods, service, podSelector)
+	pods = filterRuntimeLogPods(pods, query.Service, query.PodSelector)
 	sort.Slice(pods, func(i, j int) bool {
 		if pods[i].ServiceName == pods[j].ServiceName {
 			return pods[i].ContainerName < pods[j].ContainerName
@@ -262,8 +332,8 @@ func (a *API) aifarRuntimeLogs(w http.ResponseWriter, r *http.Request) {
 	response := aifarRuntimeLogsResponse{
 		ServerID:   server.ID,
 		InstanceID: instance.ID,
-		Service:    service,
-		Tail:       tail,
+		Service:    query.Service,
+		Tail:       query.Tail,
 		Pods:       []aifarRuntimeLogPod{},
 	}
 	if len(pods) > 64 {
@@ -271,7 +341,7 @@ func (a *API) aifarRuntimeLogs(w http.ResponseWriter, r *http.Request) {
 		pods = pods[:64]
 	}
 	for _, pod := range pods {
-		logs, logErr := adapter.DockerContainerLogsForServer(r.Context(), server, pod.ContainerName, tail)
+		logs, logErr := adapter.DockerContainerLogsForServer(ctx, server, pod.ContainerName, query.Tail)
 		item := aifarRuntimeLogPod{
 			InstanceID:    pod.InstanceID,
 			ServiceName:   pod.ServiceName,
@@ -289,7 +359,7 @@ func (a *API) aifarRuntimeLogs(w http.ResponseWriter, r *http.Request) {
 		}
 		response.Pods = append(response.Pods, item)
 	}
-	writeJSON(w, http.StatusOK, response)
+	return response, nil
 }
 
 func (a *API) aifarRuntimeReconcile(w http.ResponseWriter, r *http.Request) {
