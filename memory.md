@@ -967,3 +967,5 @@
 - 结论：已将 `outputs/algeria-migration-plan.md` 中“回滚方案”替换为“旧环境保留”，删除回滚触发条件和步骤，改为说明老环境在观察期内保留、异常时暂停迁移处理并保留现场状态，验收后再释放旧服务器资源。
 - 问题：用户要求将 `outputs/algeria-migration-plan.md` 转成 Word。
 - 结论：已基于当前 Markdown 生成 `outputs/algeria-migration-plan.docx`，采用 compact reference guide 风格，结构检查通过；由于当前环境缺少 LibreOffice/soffice，无法执行 DOCX 渲染 PNG 视觉 QA。
+- 问题：用户要求根据阿尔及利亚迁移计划 Word 提供英文版。
+- 结论：已生成 `outputs/algeria-migration-plan-en.docx`，保留原计划结构和两张表，英文版明确当前 DNS 只做核验、MinIO 为双单节点 bucket replication；DOCX 结构检查通过，当前环境缺少 LibreOffice/soffice，无法执行页面渲染 QA。
