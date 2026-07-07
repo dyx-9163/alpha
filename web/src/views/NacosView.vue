@@ -299,6 +299,7 @@ import StatusTag from '../components/StatusTag.vue'
 import { usePermissions } from '../composables/usePermissions'
 import { useI18n } from '../i18n'
 import { permissions } from '../rbac'
+import { useTaskProgressStore } from '../stores/taskProgress'
 
 type AppInstance = {
   id: string
@@ -408,6 +409,7 @@ type NacosState = {
 const { t } = useI18n()
 const { can, deniedText } = usePermissions()
 const router = useRouter()
+const taskProgress = useTaskProgressStore()
 const instances = ref<AppInstance[]>([])
 const servers = ref<any[]>([])
 const tasks = ref<TaskRecord[]>([])
@@ -675,7 +677,7 @@ async function publishNacosConfig() {
   try {
     const result = await apiPost<{ taskId: string }>('/nacos/configs/publish', configPayload())
     ElMessage.success(t('nacos.publishAccepted'))
-    void router.push({ path: '/tasks', query: { taskId: result.taskId } })
+    taskProgress.track(result.taskId, t('nacos.publishConfig'))
   } catch (err) {
     ElMessage.error(err instanceof Error ? err.message : t('nacos.publishFailed'))
   } finally {
@@ -715,7 +717,7 @@ async function rollbackNacosConfig(row: NacosConfigRevision) {
       nacosCredentialId: configForm.value.nacosCredentialId
     })
     ElMessage.success(t('nacos.rollbackAccepted'))
-    void router.push({ path: '/tasks', query: { taskId: result.taskId } })
+    taskProgress.track(result.taskId, t('nacos.rollbackConfig'))
   } catch (err) {
     ElMessage.error(err instanceof Error ? err.message : t('nacos.rollbackFailed'))
   } finally {
@@ -1112,7 +1114,7 @@ async function confirmDeleteScope() {
     sameDeletePassword.value = false
     deleteSharedPassword.value = ''
     ElMessage.success(t('nacos.uninstallTaskAccepted', { count: group.nodes.length }))
-    void router.push({ path: '/tasks', query: { taskId: result.taskId } })
+    taskProgress.track(result.taskId, t('apps.uninstallService'))
   } catch (err) {
     ElMessage.error(err instanceof Error ? err.message : t('apps.deleteServiceFailed'))
   } finally {

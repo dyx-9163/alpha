@@ -70,10 +70,7 @@ func SyncNacosProxyRegistrations(ctx context.Context, options NacosProxySyncOpti
 			}
 			continue
 		}
-		agentIP := strings.TrimSpace(options.AgentIP)
-		if agentIP == "" {
-			agentIP = localIPForNacos(env.HostPort)
-		}
+		agentIP := resolveNacosAgentIP(spec, env.HostPort, options.AgentIP)
 		if agentIP == "" {
 			errs = append(errs, fmt.Sprintf("%s: resolve agent host IP", spec.InstanceID))
 			continue
@@ -166,10 +163,7 @@ func HeartbeatNacosProxyRegistrations(ctx context.Context, options NacosProxySyn
 		if !ok {
 			continue
 		}
-		agentIP := strings.TrimSpace(options.AgentIP)
-		if agentIP == "" {
-			agentIP = localIPForNacos(env.HostPort)
-		}
+		agentIP := resolveNacosAgentIP(spec, env.HostPort, options.AgentIP)
 		if agentIP == "" {
 			errs = append(errs, fmt.Sprintf("%s: resolve agent host IP", spec.InstanceID))
 			continue
@@ -512,6 +506,89 @@ func nacosHeartbeatURL(env nacosRuntimeEnv, spec RuntimeSpec, appName, ip string
 func specNacosEphemeral(spec RuntimeSpec) bool {
 	spec = NormalizeSpec(spec)
 	return spec.Nacos.Ephemeral == nil || *spec.Nacos.Ephemeral
+}
+
+func resolveNacosAgentIP(spec RuntimeSpec, hostPort, override string) string {
+	if ip := normalizedNacosIP(override); ip != "" {
+		return ip
+	}
+	spec = NormalizeSpec(spec)
+	return agentIPFromStrategy(spec.Nacos.AgentIPStrategy, hostPort)
+}
+
+func agentIPFromStrategy(strategy, hostPort string) string {
+	strategy = strings.TrimSpace(strategy)
+	if strategy == "" || strings.EqualFold(strategy, "auto") {
+		return localIPForNacos(hostPort)
+	}
+	lower := strings.ToLower(strategy)
+	switch {
+	case lower == "env":
+		if ip := normalizedNacosIP(os.Getenv("AIFAR_AGENT_IP")); ip != "" {
+			return ip
+		}
+		return normalizedNacosIP(os.Getenv("AIFAR_NACOS_AGENT_IP"))
+	case strings.HasPrefix(lower, "env:"):
+		return normalizedNacosIP(os.Getenv(strings.TrimSpace(strategy[len("env:"):])))
+	case strings.HasPrefix(lower, "interface:"):
+		return localIPForInterface(strings.TrimSpace(strategy[len("interface:"):]))
+	case strings.HasPrefix(lower, "iface:"):
+		return localIPForInterface(strings.TrimSpace(strategy[len("iface:"):]))
+	case strings.HasPrefix(lower, "nic:"):
+		return localIPForInterface(strings.TrimSpace(strategy[len("nic:"):]))
+	case strings.HasPrefix(lower, "ip:"):
+		return normalizedNacosIP(strategy[len("ip:"):])
+	case strings.HasPrefix(lower, "static:"):
+		return normalizedNacosIP(strategy[len("static:"):])
+	default:
+		if ip := normalizedNacosIP(strategy); ip != "" {
+			return ip
+		}
+		return localIPForNacos(hostPort)
+	}
+}
+
+func normalizedNacosIP(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	ip := net.ParseIP(value)
+	if ip == nil {
+		return ""
+	}
+	return ip.String()
+}
+
+func localIPForInterface(name string) string {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return ""
+	}
+	iface, err := net.InterfaceByName(name)
+	if err != nil || iface.Flags&net.FlagUp == 0 {
+		return ""
+	}
+	addrs, err := iface.Addrs()
+	if err != nil {
+		return ""
+	}
+	for _, raw := range addrs {
+		var ip net.IP
+		switch addr := raw.(type) {
+		case *net.IPNet:
+			ip = addr.IP
+		case *net.IPAddr:
+			ip = addr.IP
+		}
+		if ip == nil || ip.IsLoopback() {
+			continue
+		}
+		if v4 := ip.To4(); v4 != nil {
+			return v4.String()
+		}
+	}
+	return ""
 }
 
 type nacosHTTPError struct {

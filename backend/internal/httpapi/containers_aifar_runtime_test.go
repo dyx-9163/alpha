@@ -180,6 +180,31 @@ func TestAIFARRuntimeServiceSummaryIgnoresNilResidualRecords(t *testing.T) {
 	}
 }
 
+func TestRuntimeIngressStatusUsesAgentListeners(t *testing.T) {
+	metadata := map[string]any{
+		"runtimeService":  "aifar-agent",
+		"endpoint":        "10.0.0.10:8080",
+		"gatewayEndpoint": "10.0.0.10:38000",
+		"gatewayPort":     float64(38000),
+		"webPort":         float64(8080),
+	}
+	row := runtimeIngressFromMetadata("inst-1", metadata, aifarRuntimeAgent{
+		Status:    "running",
+		Listeners: []int{8080},
+	})
+	if row.Status != "degraded" || !strings.Contains(row.Error, "38000") {
+		t.Fatalf("expected ingress to be degraded when gateway listener is missing, got %+v", row)
+	}
+
+	row = runtimeIngressFromMetadata("inst-1", metadata, aifarRuntimeAgent{
+		Status: "missing",
+		Error:  "ssh credential is not available",
+	})
+	if row.Status != "missing" || !strings.Contains(row.Error, "ssh credential") {
+		t.Fatalf("expected ingress to follow missing agent state, got %+v", row)
+	}
+}
+
 func TestAIFARRuntimeScaleOutRequiresAgent(t *testing.T) {
 	api, db, secret := newAuthzTestAPI(t)
 	dockerAPI := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

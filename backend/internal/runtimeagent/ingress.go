@@ -555,12 +555,15 @@ func (m *Manager) ensureDeployment(ctx context.Context, spec RuntimeSpec, deploy
 				return err
 			}
 			if recreate {
-				if _, err := m.runner.Run(ctx, "docker", "rm", "-f", name); err != nil {
-					err = fmt.Errorf("replace drifted AIFAR pod %s: %w", name, err)
+				if err := m.replaceDriftedContainer(ctx, spec, deployment, replica, name); err != nil {
 					m.setDeploymentStatusFromDocker(ctx, spec, deployment, "failed", err.Error())
 					return err
 				}
-				exists = false
+				if err := m.refreshServiceEndpoint(ctx, spec, deployment.ServiceName); err != nil {
+					m.setDeploymentStatusFromDocker(ctx, spec, deployment, "failed", err.Error())
+					return err
+				}
+				continue
 			}
 		}
 		if !exists {
@@ -591,6 +594,34 @@ func (m *Manager) ensureDeployment(ctx context.Context, spec RuntimeSpec, deploy
 	}
 	m.setDeploymentStatusFromDocker(ctx, spec, deployment, "ready", "")
 	return nil
+}
+
+func (m *Manager) replaceDriftedContainer(ctx context.Context, spec RuntimeSpec, deployment DeploymentSpec, replica int, name string) error {
+	suffix := shortNameHash(fmt.Sprintf("%s-%d", deploymentSpecHash(deployment), time.Now().UnixNano()))
+	replacement := sanitizeDockerName(name + "-next-" + suffix)
+	backup := sanitizeDockerName(name + "-old-" + suffix)
+	if err := m.runContainer(ctx, spec, deployment, replica, replacement); err != nil {
+		return err
+	}
+	if _, err := m.runner.Run(ctx, "docker", "rename", name, backup); err != nil {
+		_, _ = m.runner.Run(context.WithoutCancel(ctx), "docker", "rm", "-f", replacement)
+		return fmt.Errorf("backup drifted AIFAR pod %s: %w", name, err)
+	}
+	if _, err := m.runner.Run(ctx, "docker", "rename", replacement, name); err != nil {
+		_, _ = m.runner.Run(context.WithoutCancel(ctx), "docker", "rename", backup, name)
+		_, _ = m.runner.Run(context.WithoutCancel(ctx), "docker", "rm", "-f", replacement)
+		return fmt.Errorf("promote replacement AIFAR pod %s: %w", name, err)
+	}
+	if _, err := m.runner.Run(ctx, "docker", "rm", "-f", backup); err != nil {
+		return fmt.Errorf("remove replaced AIFAR pod %s: %w", backup, err)
+	}
+	logf(m.log, "AIFAR runtime pod replaced service=%s replica=%d container=%s\n", deployment.ServiceName, replica, name)
+	return nil
+}
+
+func shortNameHash(value string) string {
+	sum := sha256.Sum256([]byte(value))
+	return hex.EncodeToString(sum[:])[:10]
 }
 
 func deploymentRollbackOnFailure(deployment DeploymentSpec) bool {
@@ -626,7 +657,7 @@ func (m *Manager) containerExists(ctx context.Context, name string) (bool, error
 func (m *Manager) containerNeedsRecreate(ctx context.Context, name string, deployment DeploymentSpec) (bool, error) {
 	result, err := m.runner.Run(ctx, "docker", "inspect", "-f", `{{index .Config.Labels "aifar.spec-hash"}}`, name)
 	if err != nil {
-		return false, nil
+		return false, fmt.Errorf("inspect AIFAR pod spec hash %s: %w", name, err)
 	}
 	current := strings.TrimSpace(result.Stdout)
 	return current == "" || current != deploymentSpecHash(deployment), nil
@@ -793,16 +824,23 @@ func trimDiagnosticOutput(value string, max int) string {
 func (m *Manager) removeExtraReplicas(ctx context.Context, spec RuntimeSpec, deployment DeploymentSpec) error {
 	pods, err := m.listDeploymentPods(ctx, spec, deployment)
 	if err != nil {
-		return nil
+		return fmt.Errorf("list AIFAR pods for %s: %w", deployment.ServiceName, err)
 	}
 	desiredHash := deploymentSpecHash(deployment)
+	errs := []string{}
 	for _, pod := range pods {
 		revisionDrifted := strings.TrimSpace(deployment.PodRevision) != "" && pod.Revision != "" && pod.Revision != strings.TrimSpace(deployment.PodRevision)
 		specDrifted := pod.SpecHash != "" && pod.SpecHash != desiredHash && (pod.Revision == "" || pod.Revision == strings.TrimSpace(deployment.PodRevision))
 		if pod.Replica > deployment.Replicas || revisionDrifted || specDrifted {
-			_, _ = m.runner.Run(ctx, "docker", "rm", "-f", pod.Name)
+			if _, err := m.runner.Run(ctx, "docker", "rm", "-f", pod.Name); err != nil {
+				errs = append(errs, fmt.Sprintf("%s: %v", pod.Name, err))
+				continue
+			}
 			logf(m.log, "AIFAR runtime pod removed service=%s replica=%d container=%s\n", deployment.ServiceName, pod.Replica, pod.Name)
 		}
+	}
+	if len(errs) > 0 {
+		return fmt.Errorf("remove drifted AIFAR pods for %s: %s", deployment.ServiceName, strings.Join(errs, "; "))
 	}
 	return nil
 }

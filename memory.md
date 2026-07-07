@@ -907,3 +907,11 @@
 - 结论：未提交改动没有丢失；它们属于 Git 工作区状态，不是某个分支上的提交。当前已切回 `codex/aifar-runtime`，这些未提交改动都保留在该分支工作区中；原 `codex/aifar-agent-runtime-v2` 分支和新分支目前指向同一个基准提交。
 - 问题：用户反馈服务下线后再扩容其他服务时，agent 误启动已下线的 file Pod，导致扩容失败。
 - 结论：根因是 autoscale-out 脚本在生成全量 RuntimeSpec 时，缺少控制面 desiredReplicas 快照，遇到下线服务会按 Docker 当前数量/默认 1 误恢复。已改为后端把完整 desiredReplicas 传给脚本，脚本优先使用控制面快照，扩容完成后也不会用残留 endpoint 反推已下线服务；补充测试覆盖 `file=0` 时扩容其他服务仍保持 0。
+- 问题：用户要求查看当前 `codex/aifar-agent-runtime-v2` 分支代码还需要优化什么。
+- 结论：分支验证 `pnpm test`、`pnpm web:build` 和 `git diff --check` 均通过；建议后续优先优化 agent 删除旧 Pod 错误处理、Nacos 注册 IP 策略落地、Ingress 状态展示准确性、前端路由懒加载和 ContainersView 拆分减负。
+- 问题：用户要求执行上述优化，并要求所有安装应用动作提交后不要直接跳到任务页面，而是在整体顶部显示可点击穿透的任务进度。
+- 结论：已修复 runtime agent 同 revision 漂移先删后起、旧 Pod 删除错误吞掉、Nacos `agentIPStrategy` 未生效和 Ingress 状态硬编码问题；前端新增全局任务进度条与 Pinia 任务追踪，应用/容器 Runtime/数据库/对象存储/Nacos 的任务提交动作不再自动跳转，改为顶部进度条点击进入任务详情；路由改为懒加载；`go test ./internal/runtimeagent ./internal/httpapi`、`pnpm web:build`、`pnpm test`、`git diff --check` 均通过。
+- 问题：用户反馈 AIFAR 已安装应用缺少对应菜单里的卸载入口。
+- 结论：已在容器页 AIFAR Runtime 工具栏新增“卸载 AIFAR”，复用部署服务密码确认与 `/apps/instances/{id}/delete` 任务接口，提交后接入全局任务进度条；`pnpm web:build` 和 `git diff --check` 通过。
+- 问题：用户询问后端自动采集状态并落库、前端直接展示缓存数据的设计是否合理，以及和当前方案、市面运维工具相比如何。
+- 结论：该方向合理，适合把 AIFAR 从页面触发式部署面板升级为具备持续观测能力的控制面；建议采用轻量 collector + 最新状态快照 + 新鲜度/失败状态展示，不要直接做成完整 Prometheus/Zabbix。与当前方案相比可降低页面卡顿、减少重复远程采集、支持无人值守健康状态；与市面工具相比应定位为部署运维一体化控制面内置观测，而不是通用监控系统替代品。

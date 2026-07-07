@@ -112,6 +112,46 @@ func TestSyncNacosProxyRegistrationsRegistersByDeletingThenPosting(t *testing.T)
 	}
 }
 
+func TestSyncNacosProxyRegistrationsUsesAgentIPStrategy(t *testing.T) {
+	t.Setenv("AIFAR_AGENT_IP", "10.19.0.7")
+	requests := []string{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests = append(requests, r.Method+" "+r.URL.Path+"?"+r.URL.RawQuery)
+		if r.URL.Path == "/nacos/v1/auth/users/login" {
+			_, _ = w.Write([]byte(`{"accessToken":"token-1"}`))
+			return
+		}
+		_, _ = w.Write([]byte(`ok`))
+	}))
+	defer server.Close()
+
+	installRoot := t.TempDir()
+	envDir := filepath.Join(installRoot, "runtime", "env")
+	if err := os.MkdirAll(envDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(envDir, "java-common.env"), []byte("NACOS_HOST="+strings.TrimPrefix(server.URL, "http://")+"\nNACOS_NS=prod\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := SyncNacosProxyRegistrations(context.Background(), NacosProxySyncOptions{
+		Specs: []RuntimeSpec{{
+			InstanceID:  "admin",
+			InstallRoot: installRoot,
+			Services:    []ServiceSpec{{Name: "permission", AppName: "alpha-permission", Port: 38010}},
+			Nacos:       NacosSpec{AgentIPStrategy: "env"},
+		}},
+		Action: NacosProxyRegister,
+		Client: server.Client(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(requests, "\n")
+	if !strings.Contains(joined, "serviceName=alpha-permission") || !strings.Contains(joined, "ip=10.19.0.7") {
+		t.Fatalf("expected env strategy IP in Nacos request, got:\n%s", joined)
+	}
+}
+
 func TestSyncNacosProxyRegistrationsRepairsServiceTypeConflict(t *testing.T) {
 	requests := []string{}
 	instancePosts := 0

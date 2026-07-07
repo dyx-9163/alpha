@@ -352,6 +352,66 @@ func TestManagerRollsBackNewPodsWhenRollingUpdateFails(t *testing.T) {
 	}
 }
 
+func TestManagerReplacesSameRevisionDriftAfterReplacementIsReady(t *testing.T) {
+	deployment := DeploymentSpec{
+		ServiceName: "oauth",
+		Image:       "aifar-oauth:rev-1",
+		PodRevision: "rev-1",
+		Replicas:    1,
+		Ports:       []ContainerPort{{Name: "http", ContainerPort: 38001}},
+	}
+	runner := &sameRevisionReplaceRunner{hash: deploymentSpecHash(deployment)}
+	manager := NewManager(ManagerOptions{StateDir: t.TempDir(), Runner: runner})
+	spec := NormalizeSpec(RuntimeSpec{
+		InstanceID:  "admin",
+		InstallRoot: "/aifar/apps/admin",
+		Network:     "aifar-network",
+		Deployments: []DeploymentSpec{deployment},
+		Services:    []ServiceSpec{{Name: "oauth", AppName: "alpha-oauth", Port: 38001, TargetPort: 38001}},
+	})
+
+	if err := manager.ensureDeployment(context.Background(), spec, deployment); err != nil {
+		t.Fatal(err)
+	}
+	calls := runner.callsString()
+	runIndex := strings.Index(calls, "docker run -d")
+	backupIndex := strings.Index(calls, "docker rename aifar-pod-admin-oauth-rev-1-r1")
+	if runIndex < 0 || backupIndex < 0 || runIndex > backupIndex {
+		t.Fatalf("expected replacement container to be ready before old pod is renamed, got:\n%s", calls)
+	}
+	if strings.Contains(calls, "docker rm -f aifar-pod-admin-oauth-rev-1-r1\n") {
+		t.Fatalf("old stable pod name should not be removed before replacement promotion, got:\n%s", calls)
+	}
+}
+
+func TestManagerReturnsErrorWhenRemovingDriftedPodFails(t *testing.T) {
+	deployment := DeploymentSpec{
+		ServiceName: "oauth",
+		Image:       "aifar-oauth:rev-2",
+		PodRevision: "rev-2",
+		Replicas:    1,
+		Ports:       []ContainerPort{{Name: "http", ContainerPort: 38001}},
+	}
+	runner := &removeExtraFailureRunner{hash: deploymentSpecHash(deployment)}
+	manager := NewManager(ManagerOptions{StateDir: t.TempDir(), Runner: runner})
+	spec := NormalizeSpec(RuntimeSpec{
+		InstanceID:  "admin",
+		InstallRoot: "/aifar/apps/admin",
+		Network:     "aifar-network",
+		Deployments: []DeploymentSpec{deployment},
+		Services:    []ServiceSpec{{Name: "oauth", AppName: "alpha-oauth", Port: 38001, TargetPort: 38001}},
+	})
+
+	err := manager.removeExtraReplicas(context.Background(), spec, deployment)
+
+	if err == nil || !strings.Contains(err.Error(), "remove drifted AIFAR pods for oauth") {
+		t.Fatalf("expected drifted pod removal error, got %v", err)
+	}
+	if !runner.removed("aifar-pod-admin-oauth-rev-1-r1") {
+		t.Fatalf("expected old revision removal attempt, got:\n%s", strings.Join(runner.removals, "\n"))
+	}
+}
+
 func TestManagerContainerReadyDiagnosticsIncludesInspectAndLogs(t *testing.T) {
 	runner := &diagnosticRunner{}
 	manager := NewManager(ManagerOptions{StateDir: t.TempDir(), Runner: runner})
@@ -368,6 +428,79 @@ func TestManagerContainerReadyDiagnosticsIncludesInspectAndLogs(t *testing.T) {
 			t.Fatalf("expected diagnostics to contain %q, got:\n%s", want, got)
 		}
 	}
+}
+
+type sameRevisionReplaceRunner struct {
+	mu    sync.Mutex
+	hash  string
+	calls []string
+}
+
+func (r *sameRevisionReplaceRunner) Run(ctx context.Context, name string, args ...string) (CommandResult, error) {
+	call := name + " " + strings.Join(args, " ")
+	r.mu.Lock()
+	r.calls = append(r.calls, call)
+	r.mu.Unlock()
+	switch {
+	case strings.Contains(call, "docker inspect -f {{.Id}}"):
+		return CommandResult{Stdout: "container-id\n"}, nil
+	case strings.Contains(call, `{{index .Config.Labels "aifar.spec-hash"}}`):
+		return CommandResult{Stdout: "oldhash\n"}, nil
+	case strings.Contains(call, "docker run "):
+		return CommandResult{Stdout: "new-container\n"}, nil
+	case strings.Contains(call, "docker inspect -f {{.State.Running}}|") && strings.Contains(call, "NetworkSettings"):
+		return CommandResult{Stdout: "true|healthy|172.20.0.50\n"}, nil
+	case strings.Contains(call, "docker inspect -f {{.State.Running}}|"):
+		return CommandResult{Stdout: "true|healthy\n"}, nil
+	case strings.Contains(call, "docker ps -a") && strings.Contains(call, `{{.Label "aifar.replica"}}`):
+		return CommandResult{Stdout: "aifar-pod-admin-oauth-rev-1-r1|1|rev-1|" + r.hash + "\n"}, nil
+	case strings.Contains(call, "docker ps "):
+		return CommandResult{Stdout: "aifar-pod-admin-oauth-rev-1-r1\n"}, nil
+	case strings.Contains(call, "docker rename"):
+		return CommandResult{Stdout: "renamed\n"}, nil
+	case strings.Contains(call, "docker rm -f"):
+		return CommandResult{Stdout: "removed\n"}, nil
+	default:
+		return CommandResult{Stdout: "ok\n"}, nil
+	}
+}
+
+func (r *sameRevisionReplaceRunner) callsString() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return strings.Join(r.calls, "\n")
+}
+
+type removeExtraFailureRunner struct {
+	hash     string
+	removals []string
+}
+
+func (r *removeExtraFailureRunner) Run(ctx context.Context, name string, args ...string) (CommandResult, error) {
+	call := name + " " + strings.Join(args, " ")
+	switch {
+	case strings.Contains(call, "docker ps -a") && strings.Contains(call, `{{.Label "aifar.replica"}}`):
+		return CommandResult{Stdout: "aifar-pod-admin-oauth-rev-1-r1|1|rev-1|oldhash\naifar-pod-admin-oauth-rev-2-r1|1|rev-2|" + r.hash + "\n"}, nil
+	case strings.Contains(call, "docker inspect -f {{.State.Running}}|"):
+		return CommandResult{Stdout: "true|healthy\n"}, nil
+	case strings.Contains(call, "docker rm -f"):
+		r.removals = append(r.removals, call)
+		if strings.Contains(call, "rev-1") {
+			return CommandResult{Stderr: "permission denied\n"}, errors.New("permission denied")
+		}
+		return CommandResult{Stdout: "removed\n"}, nil
+	default:
+		return CommandResult{Stdout: "ok\n"}, nil
+	}
+}
+
+func (r *removeExtraFailureRunner) removed(container string) bool {
+	for _, call := range r.removals {
+		if strings.Contains(call, container) {
+			return true
+		}
+	}
+	return false
 }
 
 type concurrentDeploymentRunner struct {

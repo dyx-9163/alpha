@@ -23,6 +23,7 @@
         </div>
       </el-aside>
       <el-main class="content">
+        <GlobalTaskProgress />
         <div class="content-body">
           <router-view />
         </div>
@@ -37,6 +38,7 @@ import { Box, Coin, Connection, FolderOpened, Key, List, Monitor, Odometer, Oper
 import zhCn from 'element-plus/es/locale/lang/zh-cn'
 import en from 'element-plus/es/locale/lang/en'
 import { useRouter } from 'vue-router'
+import GlobalTaskProgress from './components/GlobalTaskProgress.vue'
 import { useSessionStore } from './stores/session'
 import { useI18n } from './i18n'
 import { permissions, type Permission } from './rbac'

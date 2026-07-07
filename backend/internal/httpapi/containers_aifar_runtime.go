@@ -41,6 +41,7 @@ type aifarRuntimeAgent struct {
 	Version   string                     `json:"version,omitempty"`
 	Mode      string                     `json:"mode,omitempty"`
 	Error     string                     `json:"error,omitempty"`
+	Listeners []int                      `json:"listeners,omitempty"`
 	Features  []string                   `json:"features,omitempty"`
 	Instances []aifarAgentInstanceStatus `json:"instances,omitempty"`
 }
@@ -828,7 +829,7 @@ func (a *API) appendAIFARInstanceRuntime(response *aifarRuntimeResponse, instanc
 		applyAgentStatusToRuntimeService(&serviceRow, agentServices[service], agentDeployments[service])
 		response.Services = append(response.Services, serviceRow)
 	}
-	response.Ingress = append(response.Ingress, runtimeIngressFromMetadata(instance.ID, metadata, containersByName))
+	response.Ingress = append(response.Ingress, runtimeIngressFromMetadata(instance.ID, metadata, response.Agent))
 }
 
 func (a *API) collectAIFARAgentStatus(ctx context.Context, server store.Server) aifarRuntimeAgent {
@@ -843,6 +844,7 @@ func (a *API) collectAIFARAgentStatus(ctx context.Context, server store.Server) 
 	var parsed struct {
 		Status    string                     `json:"status"`
 		Version   string                     `json:"version"`
+		Listeners []int                      `json:"listeners"`
 		Features  []string                   `json:"features"`
 		Instances []aifarAgentInstanceStatus `json:"instances"`
 	}
@@ -856,7 +858,7 @@ func (a *API) collectAIFARAgentStatus(ctx context.Context, server store.Server) 
 	if status == "" {
 		status = "running"
 	}
-	return aifarRuntimeAgent{Status: status, Version: parsed.Version, Mode: "systemd", Features: parsed.Features, Instances: parsed.Instances}
+	return aifarRuntimeAgent{Status: status, Version: parsed.Version, Mode: "systemd", Listeners: parsed.Listeners, Features: parsed.Features, Instances: parsed.Instances}
 }
 
 func (agent aifarRuntimeAgent) deploymentStatusByService(instanceID string) map[string]aifarAgentDeploymentStatus {
@@ -1011,19 +1013,51 @@ func aifarRuntimeAppName(service string) string {
 	}
 }
 
-func runtimeIngressFromMetadata(instanceID string, metadata map[string]any, containersByName map[string]adapter.DockerContainer) aifarRuntimeIngress {
-	_ = containersByName
+func runtimeIngressFromMetadata(instanceID string, metadata map[string]any, agent aifarRuntimeAgent) aifarRuntimeIngress {
 	container := runtimeString(metadata, "runtimeService", "aifar-agent")
-	status := "running"
+	gatewayPort := runtimeInt(metadata, "gatewayPort", 38000)
+	webPort := runtimeInt(metadata, "webPort", 8080)
+	status, ingressErr := runtimeIngressStatus(agent, gatewayPort, webPort)
 	return aifarRuntimeIngress{
 		InstanceID:   instanceID,
 		Container:    container,
 		Status:       status,
-		GatewayPort:  runtimeInt(metadata, "gatewayPort", 38000),
-		WebPort:      runtimeInt(metadata, "webPort", 8080),
+		GatewayPort:  gatewayPort,
+		WebPort:      webPort,
 		GatewayRoute: runtimeString(metadata, "gatewayEndpoint", ""),
 		WebRoute:     runtimeString(metadata, "endpoint", ""),
+		Error:        ingressErr,
 	}
+}
+
+func runtimeIngressStatus(agent aifarRuntimeAgent, gatewayPort, webPort int) (string, string) {
+	status := cleanRuntimeText(agent.Status)
+	if status == "" {
+		status = "unknown"
+	}
+	if status != "running" {
+		return status, cleanRuntimeText(agent.Error)
+	}
+	if len(agent.Listeners) == 0 {
+		return "running", ""
+	}
+	listeners := map[int]bool{}
+	for _, port := range agent.Listeners {
+		if port > 0 {
+			listeners[port] = true
+		}
+	}
+	missing := []string{}
+	if gatewayPort > 0 && !listeners[gatewayPort] {
+		missing = append(missing, fmt.Sprintf("%d", gatewayPort))
+	}
+	if webPort > 0 && webPort != gatewayPort && !listeners[webPort] {
+		missing = append(missing, fmt.Sprintf("%d", webPort))
+	}
+	if len(missing) > 0 {
+		return "degraded", "missing listener ports: " + strings.Join(missing, ", ")
+	}
+	return "running", ""
 }
 
 func runtimeServiceStatus(deployment store.AIFARDeployment, ready int) string {

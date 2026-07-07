@@ -1,19 +1,20 @@
 import { createRouter, createWebHistory } from 'vue-router'
-import LoginView from '../views/LoginView.vue'
-import DashboardView from '../views/DashboardView.vue'
-import AppsView from '../views/AppsView.vue'
-import ContainersView from '../views/ContainersView.vue'
-import ServersView from '../views/ServersView.vue'
-import DatabaseView from '../views/DatabaseView.vue'
-import NacosView from '../views/NacosView.vue'
-import StorageView from '../views/StorageView.vue'
-import CredentialsView from '../views/CredentialsView.vue'
-import TerminalView from '../views/TerminalView.vue'
-import TasksView from '../views/TasksView.vue'
-import ToolboxView from '../views/ToolboxView.vue'
-import AuditView from '../views/AuditView.vue'
-import SettingsView from '../views/SettingsView.vue'
 import { normalizePermissions, permissions } from '../rbac'
+
+const LoginView = () => import('../views/LoginView.vue')
+const DashboardView = () => import('../views/DashboardView.vue')
+const AppsView = () => import('../views/AppsView.vue')
+const ContainersView = () => import('../views/ContainersView.vue')
+const ServersView = () => import('../views/ServersView.vue')
+const DatabaseView = () => import('../views/DatabaseView.vue')
+const NacosView = () => import('../views/NacosView.vue')
+const StorageView = () => import('../views/StorageView.vue')
+const CredentialsView = () => import('../views/CredentialsView.vue')
+const TerminalView = () => import('../views/TerminalView.vue')
+const TasksView = () => import('../views/TasksView.vue')
+const ToolboxView = () => import('../views/ToolboxView.vue')
+const AuditView = () => import('../views/AuditView.vue')
+const SettingsView = () => import('../views/SettingsView.vue')
 
 const router = createRouter({
   history: createWebHistory(),

@@ -210,6 +210,7 @@ import StatusTag from '../components/StatusTag.vue'
 import { usePermissions } from '../composables/usePermissions'
 import { useI18n } from '../i18n'
 import { permissions } from '../rbac'
+import { useTaskProgressStore } from '../stores/taskProgress'
 
 type AppInstance = {
   id: string
@@ -277,6 +278,7 @@ type DatabaseState = {
 const { t } = useI18n()
 const { can, deniedText } = usePermissions()
 const router = useRouter()
+const taskProgress = useTaskProgressStore()
 const instances = ref<AppInstance[]>([])
 const servers = ref<any[]>([])
 const tasks = ref<TaskRecord[]>([])
@@ -1491,7 +1493,7 @@ async function startMysqlCluster(group: DatabaseGroup) {
   try {
     const result = await apiPost<{ taskId: string }>('/database/mysql/clusters/start', { instanceIds })
     ElMessage.success(t('database.startMysqlClusterAccepted'))
-    void router.push({ path: '/tasks', query: { taskId: result.taskId } })
+    taskProgress.track(result.taskId, t('database.startMysqlCluster'))
   } catch (err) {
     ElMessage.error(err instanceof Error ? err.message : t('database.startMysqlClusterFailed'))
   } finally {
@@ -1587,7 +1589,7 @@ async function confirmDeleteScope() {
     sameDeletePassword.value = false
     deleteSharedPassword.value = ''
     ElMessage.success(t('database.uninstallTaskAccepted', { count: scope.nodes.length }))
-    void router.push({ path: '/tasks', query: { taskId: result.taskId } })
+    taskProgress.track(result.taskId, deleteScopeTitle(scope.kind))
   } catch (err) {
     ElMessage.error(deleteErrorMessage(err))
   } finally {

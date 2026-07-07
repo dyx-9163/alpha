@@ -284,6 +284,7 @@ import StatusTag from '../components/StatusTag.vue'
 import { usePermissions } from '../composables/usePermissions'
 import { useI18n } from '../i18n'
 import { permissions } from '../rbac'
+import { useTaskProgressStore } from '../stores/taskProgress'
 
 type AppInstance = {
   id: string
@@ -332,6 +333,7 @@ type StorageKind = 'bucket' | 'object' | 'user' | 'accessKey' | 'replica'
 const { t } = useI18n()
 const { can, deniedText } = usePermissions()
 const router = useRouter()
+const taskProgress = useTaskProgressStore()
 const instances = ref<AppInstance[]>([])
 const servers = ref<any[]>([])
 const tasks = ref<any[]>([])
@@ -509,7 +511,7 @@ async function confirmDeleteInstance() {
     })
     deleteDialogVisible.value = false
     ElMessage.success(t('apps.uninstallServiceAccepted'))
-    void router.push({ path: '/tasks', query: { taskId: result.taskId } })
+    taskProgress.track(result.taskId, t('apps.uninstallService'))
   } catch (err) {
     ElMessage.error(err instanceof Error ? err.message : t('apps.deleteServiceFailed'))
   } finally {

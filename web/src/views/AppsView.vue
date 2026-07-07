@@ -123,7 +123,6 @@
 import { computed, onMounted, ref, shallowRef } from 'vue'
 import type { Component } from 'vue'
 import { ElMessage } from 'element-plus'
-import { useRouter } from 'vue-router'
 import { apiGet, apiPost, asArray } from '../api/client'
 import { pairedAppCatalog, type AppCatalogResponse, type AppStoreItem } from '../apps/registry/catalog'
 import { frontendModuleFor } from '../apps/registry/loader'
@@ -134,10 +133,11 @@ import PageShell from '../components/PageShell.vue'
 import { usePermissions } from '../composables/usePermissions'
 import { useI18n } from '../i18n'
 import { permissions } from '../rbac'
+import { useTaskProgressStore } from '../stores/taskProgress'
 
 const { t } = useI18n()
 const { can, deniedText } = usePermissions()
-const router = useRouter()
+const taskProgress = useTaskProgressStore()
 const backendCatalog = ref<AppCatalogResponse>({})
 const instances = ref<AppInstanceTableRecord[]>([])
 const servers = ref<ServerOption[]>([])
@@ -261,7 +261,8 @@ async function submitModuleInstall(payload: AppInstallPayload) {
       language: locale.value
     })
     moduleDialogVisible.value = false
-    openTaskCenter(result.taskId)
+    taskProgress.track(result.taskId, app.title)
+    ElMessage.success(t('apps.installTaskAccepted'))
   } finally {
     installSubmitting.value = false
   }
@@ -276,7 +277,7 @@ async function checkDeploymentService(row: AppInstanceTableRecord) {
     const result = await apiPost<{ taskId: string }>(`/apps/instances/${row.id}/check`, {
       language: locale.value
     })
-    openTaskCenter(result.taskId)
+    taskProgress.track(result.taskId, row.app)
     ElMessage.success(t('apps.checkServiceAccepted'))
   } catch (err) {
     ElMessage.error(err instanceof Error ? err.message : t('apps.checkServiceFailed'))
@@ -292,10 +293,6 @@ function serverLabel(serverId?: string) {
     return serverId
   }
   return server.name && server.host ? `${server.name} (${server.host})` : server.name || server.host || serverId
-}
-
-function openTaskCenter(taskId: string) {
-  void router.push({ path: '/tasks', query: { taskId } })
 }
 
 onMounted(load)
