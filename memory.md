@@ -917,3 +917,7 @@
 - 结论：该方向合理，适合把 AIFAR 从页面触发式部署面板升级为具备持续观测能力的控制面；建议采用轻量 collector + 最新状态快照 + 新鲜度/失败状态展示，不要直接做成完整 Prometheus/Zabbix。与当前方案相比可降低页面卡顿、减少重复远程采集、支持无人值守健康状态；与市面工具相比应定位为部署运维一体化控制面内置观测，而不是通用监控系统替代品。
 - 问题：用户要求提供自动采集落库与页面长连接推送的完整改造方案，并在 GitHub 上直接创建分支承载此次功能改造。
 - 结论：已创建并推送 GitHub 分支 `codex/status-collector-realtime`。改造方案建议分三层推进：后端 collector 定时采集并写最新状态快照，Event Hub/SSE 推送资源变更轻量事件，前端全局 realtime store 接收事件后按需刷新数据库快照；第一阶段先覆盖服务器、Docker summary、AIFAR Runtime 和任务事件。
+- 问题：用户要求在 `codex/status-collector-realtime` 分支直接开发自动采集落库和页面长连接推送，并呈现企业级效果。
+- 结论：已完成第一版企业级实时控制面骨架：后端新增 collector 定时采集服务器、Docker summary、AIFAR Runtime 控制面摘要并写入 `status_snapshots`/`collector_runs`，新增全局 realtime Hub、`/api/v2/events` SSE 和快照查询接口，任务状态也进入全局事件流；前端新增全局实时连接状态条和 realtime Pinia store，容器页可响应 Docker/AIFAR Runtime 事件自动刷新；`config/defaults.env` 新增采集间隔配置；`pnpm web:build`、`pnpm test`、`git diff --check` 通过。
+- 问题：用户要求把本轮实时采集改造代码提交到本地仓库。
+- 结论：已在 `codex/status-collector-realtime` 分支创建本地提交，提交内容包含后端 collector/realtime/status snapshot、前端实时状态条和事件驱动刷新，以及本轮配置与记忆更新；未推送远端。

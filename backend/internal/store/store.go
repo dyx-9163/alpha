@@ -215,6 +215,18 @@ func (s *Store) migrate() error {
 		`create table if not exists settings (
 			key text primary key, value text not null, updated_at datetime not null
 		)`,
+		`create table if not exists collector_runs (
+			name text primary key, target text, status text not null,
+			last_error text, started_at datetime, finished_at datetime,
+			duration_ms integer not null default 0, updated_at datetime not null
+		)`,
+		`create table if not exists status_snapshots (
+			scope text not null, resource_id text not null, server_id text,
+			status text not null, payload text not null, last_error text,
+			version integer not null default 1, collected_at datetime not null, updated_at datetime not null,
+			primary key(scope, resource_id)
+		)`,
+		`create index if not exists status_snapshots_scope_server on status_snapshots(scope, server_id)`,
 	}
 	for _, stmt := range schema {
 		if _, err := s.db.Exec(stmt); err != nil {
@@ -363,7 +375,7 @@ func (s *Store) ListUsers() ([]UserSummary, error) {
 
 func (s *Store) CountRows(table string) (int, error) {
 	switch table {
-	case "users", "servers", "tasks", "task_logs", "task_targets", "task_steps", "audit_logs", "resources", "app_instances", "app_releases", "nacos_config_revisions", "credentials", "credential_versions", "credential_bindings", "storage_items", "settings":
+	case "users", "servers", "tasks", "task_logs", "task_targets", "task_steps", "audit_logs", "resources", "app_instances", "app_releases", "nacos_config_revisions", "credentials", "credential_versions", "credential_bindings", "storage_items", "settings", "collector_runs", "status_snapshots":
 	default:
 		return 0, fmt.Errorf("unsupported table %q", table)
 	}

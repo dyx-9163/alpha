@@ -286,3 +286,26 @@ type StorageItem struct {
 	CreatedAt  time.Time `json:"createdAt"`
 	UpdatedAt  time.Time `json:"updatedAt"`
 }
+
+type CollectorRun struct {
+	Name       string    `json:"name"`
+	Target     string    `json:"target,omitempty"`
+	Status     string    `json:"status"`
+	LastError  string    `json:"lastError,omitempty"`
+	StartedAt  time.Time `json:"startedAt,omitempty"`
+	FinishedAt time.Time `json:"finishedAt,omitempty"`
+	DurationMS int64     `json:"durationMs"`
+	UpdatedAt  time.Time `json:"updatedAt"`
+}
+
+type StatusSnapshot struct {
+	Scope       string    `json:"scope"`
+	ResourceID  string    `json:"resourceId"`
+	ServerID    string    `json:"serverId,omitempty"`
+	Status      string    `json:"status"`
+	Payload     string    `json:"payload"`
+	LastError   string    `json:"lastError,omitempty"`
+	Version     int64     `json:"version"`
+	CollectedAt time.Time `json:"collectedAt"`
+	UpdatedAt   time.Time `json:"updatedAt"`
+}

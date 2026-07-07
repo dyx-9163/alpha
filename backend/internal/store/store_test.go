@@ -42,6 +42,54 @@ func TestBootstrapUserAndServerLifecycle(t *testing.T) {
 	}
 }
 
+func TestStatusSnapshotVersioning(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "aifar.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	first, changed, err := db.UpsertStatusSnapshot(StatusSnapshot{
+		Scope:      "docker.summary",
+		ResourceID: "srv-1",
+		ServerID:   "srv-1",
+		Status:     "available",
+		Payload:    `{"available":true}`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !changed || first.Version != 1 {
+		t.Fatalf("first snapshot changed=%v version=%d, want changed version 1", changed, first.Version)
+	}
+	second, changed, err := db.UpsertStatusSnapshot(StatusSnapshot{
+		Scope:      "docker.summary",
+		ResourceID: "srv-1",
+		ServerID:   "srv-1",
+		Status:     "available",
+		Payload:    `{"available":true}`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed || second.Version != 1 {
+		t.Fatalf("unchanged snapshot changed=%v version=%d, want unchanged version 1", changed, second.Version)
+	}
+	third, changed, err := db.UpsertStatusSnapshot(StatusSnapshot{
+		Scope:      "docker.summary",
+		ResourceID: "srv-1",
+		ServerID:   "srv-1",
+		Status:     "failed",
+		Payload:    `{"available":false}`,
+		LastError:  "connection refused",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !changed || third.Version != 2 {
+		t.Fatalf("changed snapshot changed=%v version=%d, want changed version 2", changed, third.Version)
+	}
+}
+
 func TestAIFAROrchestrationCRUDAndInstanceCleanup(t *testing.T) {
 	db, err := Open(filepath.Join(t.TempDir(), "aifar.db"))
 	if err != nil {

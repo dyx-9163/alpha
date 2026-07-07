@@ -13,6 +13,7 @@ import (
 	"aifar-deployment/backend/internal/config"
 	"aifar-deployment/backend/internal/i18n"
 	"aifar-deployment/backend/internal/rbac"
+	"aifar-deployment/backend/internal/realtime"
 	"aifar-deployment/backend/internal/security"
 	serverdomain "aifar-deployment/backend/internal/servers"
 	"aifar-deployment/backend/internal/store"
@@ -23,23 +24,32 @@ import (
 )
 
 type API struct {
-	cfg     config.Config
-	store   *store.Store
-	tasks   *worker.Manager
-	apps    *registry.Registry
-	servers serverdomain.Service
-	auth    *security.LoginGuard
-	router  chi.Router
+	cfg      config.Config
+	store    *store.Store
+	tasks    *worker.Manager
+	realtime *realtime.Hub
+	apps     *registry.Registry
+	servers  serverdomain.Service
+	auth     *security.LoginGuard
+	router   chi.Router
 }
 
 func New(cfg config.Config, s *store.Store, tasks *worker.Manager) *API {
+	return NewWithRealtime(cfg, s, tasks, realtime.NewHub())
+}
+
+func NewWithRealtime(cfg config.Config, s *store.Store, tasks *worker.Manager, events *realtime.Hub) *API {
+	if events == nil {
+		events = realtime.NewHub()
+	}
 	api := &API{
-		cfg:     cfg,
-		store:   s,
-		tasks:   tasks,
-		apps:    registry.NewFromRegistered(registry.Dependencies{Store: s, DefaultPassword: cfg.DefaultPassword}),
-		servers: serverdomain.NewService(s, serverdomain.SSHProber{}, cfg.DefaultDeployDir),
-		auth:    security.NewLoginGuard(cfg.AuthMaxFailures, time.Duration(cfg.AuthLockoutSeconds)*time.Second),
+		cfg:      cfg,
+		store:    s,
+		tasks:    tasks,
+		realtime: events,
+		apps:     registry.NewFromRegistered(registry.Dependencies{Store: s, DefaultPassword: cfg.DefaultPassword}),
+		servers:  serverdomain.NewService(s, serverdomain.SSHProber{}, cfg.DefaultDeployDir),
+		auth:     security.NewLoginGuard(cfg.AuthMaxFailures, time.Duration(cfg.AuthLockoutSeconds)*time.Second),
 	}
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID, middleware.RealIP, middleware.Recoverer, api.securityHeaders, api.limitRequestBody)
@@ -50,6 +60,9 @@ func New(cfg config.Config, s *store.Store, tasks *worker.Manager) *API {
 		r.Group(func(r chi.Router) {
 			r.Use(api.requireAuth)
 			r.Get("/health", api.healthDetail)
+			r.Get("/events", api.events)
+			r.Get("/collectors/runs", api.collectorRuns)
+			r.Get("/status/snapshots", api.statusSnapshots)
 			r.Get("/settings", api.getSettings)
 			r.Put("/settings", api.requirePermission(rbac.SettingsManage, api.putSettings))
 			r.Get("/users", api.requirePermission(rbac.UsersManage, api.listUsers))

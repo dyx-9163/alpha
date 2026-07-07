@@ -117,6 +117,16 @@ export function terminalUrl(serverId: string) {
   return `${proto}://${window.location.host}${API_PREFIX}/servers/${serverId}/terminal/ws?${params.toString()}`
 }
 
+export function eventStreamUrl() {
+  const params = new URLSearchParams()
+  const token = localStorage.getItem('aifar-session-token')
+  if (token) {
+    params.set('token', token)
+  }
+  params.set('lang', getCurrentLocale())
+  return `${API_PREFIX}/events?${params.toString()}`
+}
+
 export function terminalProtocols() {
   const token = localStorage.getItem('aifar-session-token') ?? ''
   const encoded = btoa(unescape(encodeURIComponent(token))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '')

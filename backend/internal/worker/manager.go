@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"aifar-deployment/backend/internal/i18n"
+	"aifar-deployment/backend/internal/realtime"
 	"aifar-deployment/backend/internal/store"
 )
 
@@ -60,9 +61,14 @@ func (l Logger) FinishStep(target, name, status, errText string) {
 
 type Job func(ctx context.Context, log Logger) error
 
+type EventPublisher interface {
+	Publish(realtime.Event)
+}
+
 type Manager struct {
 	store              *store.Store
 	defaultConcurrency int
+	events             EventPublisher
 	mu                 sync.Mutex
 	active             int
 	subscribers        map[string]map[chan store.TaskLog]struct{}
@@ -85,6 +91,12 @@ func NewManagerWithConcurrency(s *store.Store, defaultConcurrency int) *Manager 
 		cancels:            map[string]context.CancelFunc{},
 		languages:          map[string]string{},
 	}
+}
+
+func (m *Manager) SetEventPublisher(events EventPublisher) {
+	m.mu.Lock()
+	m.events = events
+	m.mu.Unlock()
 }
 
 func (m *Manager) Start(taskType, target, actor string, job Job) (store.Task, error) {
@@ -117,10 +129,12 @@ func (m *Manager) StartExistingWithLanguage(task store.Task, lang string, job Jo
 		}()
 		if !m.acquireSlot(ctx) {
 			_ = m.store.UpdateTaskStatus(task.ID, "cancelled", ctx.Err().Error())
+			m.publishTaskEvent(task.ID, "cancelled")
 			return
 		}
 		defer m.releaseSlot()
 		_ = m.store.UpdateTaskStatus(task.ID, "running", "")
+		m.publishTaskEvent(task.ID, "running")
 		m.AppendLog(task.ID, "info", i18n.Text(lang, "worker.taskStarted"))
 		if err := job(ctx, Logger{manager: m, taskID: task.ID}); err != nil {
 			status := "failed"
@@ -129,10 +143,12 @@ func (m *Manager) StartExistingWithLanguage(task store.Task, lang string, job Jo
 			}
 			m.AppendLog(task.ID, "error", err.Error())
 			_ = m.store.UpdateTaskStatus(task.ID, status, err.Error())
+			m.publishTaskEvent(task.ID, status)
 			return
 		}
 		m.AppendLog(task.ID, "info", i18n.Text(lang, "worker.taskCompleted"))
 		_ = m.store.UpdateTaskStatus(task.ID, "success", "")
+		m.publishTaskEvent(task.ID, "success")
 	}()
 	return task, nil
 }
@@ -214,4 +230,29 @@ func (m *Manager) Cancel(taskID string) bool {
 	cancel()
 	m.AppendLog(taskID, "warn", i18n.Text(lang, "worker.cancelRequested"))
 	return true
+}
+
+func (m *Manager) publishTaskEvent(taskID, status string) {
+	m.mu.Lock()
+	events := m.events
+	m.mu.Unlock()
+	if events == nil {
+		return
+	}
+	events.Publish(realtime.Event{
+		Type:     "task.updated",
+		Resource: "task",
+		TaskID:   taskID,
+		Status:   status,
+		Payload:  map[string]any{"taskId": taskID, "status": status},
+	})
+	if status == "success" || status == "failed" || status == "cancelled" || status == "timeout" {
+		events.Publish(realtime.Event{
+			Type:     "task.finished",
+			Resource: "task",
+			TaskID:   taskID,
+			Status:   status,
+			Payload:  map[string]any{"taskId": taskID, "status": status},
+		})
+	}
 }

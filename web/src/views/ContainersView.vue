@@ -515,6 +515,7 @@ import StatusTag from '../components/StatusTag.vue'
 import { usePermissions } from '../composables/usePermissions'
 import { getCurrentLocale, useI18n } from '../i18n'
 import { permissions } from '../rbac'
+import { useRealtimeStore } from '../stores/realtime'
 import { useTaskProgressStore } from '../stores/taskProgress'
 
 type DockerSummaryResponse = {
@@ -667,6 +668,7 @@ type AifarRuntimeResponse = {
 const { t } = useI18n()
 const { can, deniedText } = usePermissions()
 const taskProgress = useTaskProgressStore()
+const realtime = useRealtimeStore()
 const AIFAR_RUNTIME_MODEL = 'agent-runtime-v2'
 const selectedServerId = ref('')
 const servers = ref<any[]>([])
@@ -2198,6 +2200,28 @@ watch(runtimeResourceTab, (next) => {
 })
 watch(selectedRuntimeInstanceId, () => {
   runtimePodServiceFilter.value = ''
+})
+watch(() => realtime.revision, () => {
+  const event = realtime.lastEvent
+  if (!event?.resource) {
+    return
+  }
+  if (event.resource === 'server') {
+    void loadServers()
+    return
+  }
+  if (event.resource === 'docker.summary' && event.serverId === selectedServerId.value) {
+    summaryCache.value = {}
+    void loadSummary(tab.value === 'overview', true)
+    return
+  }
+  if (event.resource === 'aifar.runtime' && tab.value === 'aifar-runtime') {
+    if (event.serverId && event.serverId !== selectedServerId.value) {
+      return
+    }
+    runtimeCache.value = {}
+    void loadAifarRuntime(true, runtimeResourceTab.value === 'pods', false)
+  }
 })
 watch(deletePromptVisible, (visible) => {
   if (!visible && !deleteSubmitting.value) {
