@@ -961,3 +961,5 @@
 - 结论：已微调 `outputs/algeria-migration-plan.md`：时间计划拆成可执行节奏，资源表明确 460G 磁盘拆分和 3.06TB 合计，数据库备份补最终停写/增量同步和恢复校验，DNS 章节改为不切换仅核验，回滚改为“正式迁移后”，配合事项补“客户侧”。
 - 问题：用户认为阿尔及利亚迁移计划可以不用回滚方案，因为会保留老的一套环境。
 - 结论：已将 `outputs/algeria-migration-plan.md` 中“回滚方案”替换为“旧环境保留”，删除回滚触发条件和步骤，改为说明老环境在观察期内保留、异常时暂停迁移处理并保留现场状态，验收后再释放旧服务器资源。
+- 问题：用户要求将 `outputs/algeria-migration-plan.md` 转成 Word。
+- 结论：已基于当前 Markdown 生成 `outputs/algeria-migration-plan.docx`，采用 compact reference guide 风格，结构检查通过；由于当前环境缺少 LibreOffice/soffice，无法执行 DOCX 渲染 PNG 视觉 QA。
