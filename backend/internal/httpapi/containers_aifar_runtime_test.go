@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"aifar-deployment/backend/internal/adapter"
 	"aifar-deployment/backend/internal/apps/registry"
@@ -132,7 +133,7 @@ func TestAIFARRuntimeLogsAggregatesPodContainerLogs(t *testing.T) {
 }
 
 func TestAIFARRuntimeLogQuerySupportsSelectionSetsAndDedup(t *testing.T) {
-	req := httptest.NewRequest(http.MethodGet, "/?service=file&services=oauth,permission&pods=pod-2,container-3&batch=5000", nil)
+	req := httptest.NewRequest(http.MethodGet, "/?service=file&services=oauth,permission&pods=pod-2,container-3&batch=5000&since=1710000000", nil)
 	services := runtimeQueryValues(req, "service", "services")
 	pods := runtimeQueryValues(req, "pod", "pods", "container", "containerName")
 	if strings.Join(services, ",") != "file,oauth,permission" {
@@ -143,6 +144,9 @@ func TestAIFARRuntimeLogQuerySupportsSelectionSetsAndDedup(t *testing.T) {
 	}
 	if got := boundedRuntimeLogBatch(queryInt(req, "batch", 200)); got != 1000 {
 		t.Fatalf("expected batch to be capped at 1000, got %d", got)
+	}
+	if got := runtimeLogSinceFromRequest(req); !got.Equal(time.Unix(1710000000, 0)) {
+		t.Fatalf("unexpected since value: %s", got)
 	}
 
 	filtered := filterRuntimeLogPods([]store.AIFARPod{
@@ -161,6 +165,17 @@ func TestAIFARRuntimeLogQuerySupportsSelectionSetsAndDedup(t *testing.T) {
 	}
 	if counts["line-a"] != 1 || counts["line-b"] != 2 || counts["line-c"] != 1 {
 		t.Fatalf("unexpected line counts: %+v", counts)
+	}
+
+	overlapSince := time.Date(2026, 7, 7, 10, 0, 2, 0, time.UTC)
+	recent := runtimeLogLinesSince([]string{
+		"2026-07-07T10:00:01Z repeated",
+		"2026-07-07T10:00:02Z repeated",
+		"2026-07-07T10:00:03Z repeated",
+		"line without timestamp",
+	}, overlapSince)
+	if strings.Join(recent, "|") != "2026-07-07T10:00:02Z repeated|2026-07-07T10:00:03Z repeated|line without timestamp" {
+		t.Fatalf("unexpected overlap lines: %+v", recent)
 	}
 }
 

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -257,7 +258,7 @@ func (a *API) aifarRuntimeLogsEvents(w http.ResponseWriter, r *http.Request) {
 			flusher.Flush()
 		}
 	}
-	snapshot, err := a.collectAIFARRuntimeLogsForPods(r.Context(), server, instance, query, pods, adapter.DockerLogOptions{Tail: query.Tail, Timestamps: true}, "snapshot")
+	snapshot, err := a.collectAIFARRuntimeLogsForPods(r.Context(), server, instance, query, pods, adapter.DockerLogOptions{Tail: query.Tail, Since: query.Since, Timestamps: true}, "snapshot")
 	if err != nil {
 		emitError(err)
 	} else {
@@ -266,10 +267,11 @@ func (a *API) aifarRuntimeLogsEvents(w http.ResponseWriter, r *http.Request) {
 		if flusher != nil {
 			flusher.Flush()
 		}
+		initialSince := runtimeLogInitialSince(query.Since)
 		for _, item := range snapshot.Pods {
 			states[item.ContainerName] = runtimeLogStreamState{
-				Since:           time.Now().Add(-3 * time.Second),
-				LastFetchCounts: runtimeLogLineCounts(item.Logs),
+				Since:           initialSince,
+				LastFetchCounts: runtimeLogLineCounts(runtimeLogLinesSince(item.Logs, initialSince)),
 			}
 		}
 	}
@@ -290,17 +292,22 @@ func (a *API) aifarRuntimeLogsEvents(w http.ResponseWriter, r *http.Request) {
 		for _, pod := range pods {
 			state := states[pod.ContainerName]
 			if state.Since.IsZero() {
-				state.Since = time.Now().Add(-3 * time.Second)
+				state.Since = runtimeLogInitialSince(query.Since)
 			}
+			startedAt := time.Now()
 			logs, logErr := adapter.DockerContainerLogsForServerWithOptions(r.Context(), server, pod.ContainerName, adapter.DockerLogOptions{
 				Tail:       query.BatchSize,
 				Since:      state.Since,
 				Timestamps: true,
 			})
-			newLogs, counts := runtimeLogNewLines(logs, state.LastFetchCounts)
+			newLogs, _ := runtimeLogNewLines(logs, state.LastFetchCounts)
+			nextSince := startedAt.Add(-3 * time.Second)
+			if !query.Since.IsZero() && nextSince.Before(query.Since) {
+				nextSince = query.Since
+			}
 			states[pod.ContainerName] = runtimeLogStreamState{
-				Since:           time.Now().Add(-3 * time.Second),
-				LastFetchCounts: counts,
+				Since:           nextSince,
+				LastFetchCounts: runtimeLogLineCounts(runtimeLogLinesSince(logs, nextSince)),
 			}
 			if len(newLogs) == 0 && logErr == nil {
 				continue
@@ -344,6 +351,7 @@ type aifarRuntimeLogQuery struct {
 	BatchSize    int
 	Services     []string
 	PodSelectors []string
+	Since        time.Time
 }
 
 type runtimeLogStreamState struct {
@@ -377,6 +385,7 @@ func (a *API) resolveAIFARRuntimeLogQuery(w http.ResponseWriter, r *http.Request
 		BatchSize:    boundedRuntimeLogBatch(queryInt(r, "batch", 200)),
 		Services:     runtimeQueryValues(r, "service", "services"),
 		PodSelectors: runtimeQueryValues(r, "pod", "pods", "container", "containerName"),
+		Since:        runtimeLogSinceFromRequest(r),
 	}, true
 }
 
@@ -385,7 +394,7 @@ func (a *API) collectAIFARRuntimeLogs(ctx context.Context, server store.Server, 
 	if err != nil {
 		return aifarRuntimeLogsResponse{}, err
 	}
-	response, err := a.collectAIFARRuntimeLogsForPods(ctx, server, instance, query, pods, adapter.DockerLogOptions{Tail: query.Tail}, "")
+	response, err := a.collectAIFARRuntimeLogsForPods(ctx, server, instance, query, pods, adapter.DockerLogOptions{Tail: query.Tail, Since: query.Since}, "")
 	if err != nil {
 		return response, err
 	}
@@ -1568,6 +1577,33 @@ func boundedRuntimeLogBatch(value int) int {
 	return value
 }
 
+func runtimeLogSinceFromRequest(r *http.Request) time.Time {
+	raw := cleanRuntimeText(firstRuntimeValue(runtimeQueryValues(r, "since", "from")))
+	if raw == "" {
+		return time.Time{}
+	}
+	if strings.EqualFold(raw, "now") {
+		return time.Now()
+	}
+	if unix, err := strconv.ParseInt(raw, 10, 64); err == nil && unix > 0 {
+		return time.Unix(unix, 0)
+	}
+	if parsed, err := time.Parse(time.RFC3339Nano, raw); err == nil {
+		return parsed
+	}
+	if parsed, err := time.Parse(time.RFC3339, raw); err == nil {
+		return parsed
+	}
+	return time.Time{}
+}
+
+func runtimeLogInitialSince(requested time.Time) time.Time {
+	if !requested.IsZero() {
+		return requested
+	}
+	return time.Now().Add(-3 * time.Second)
+}
+
 func runtimeQueryValues(r *http.Request, keys ...string) []string {
 	seen := map[string]bool{}
 	out := []string{}
@@ -1631,6 +1667,34 @@ func runtimeLogLineCounts(lines []string) map[string]int {
 		out[line]++
 	}
 	return out
+}
+
+func runtimeLogLinesSince(lines []string, since time.Time) []string {
+	if since.IsZero() || len(lines) == 0 {
+		return lines
+	}
+	out := make([]string, 0, len(lines))
+	for _, line := range lines {
+		if stamp, ok := runtimeLogLineTime(line); !ok || !stamp.Before(since) {
+			out = append(out, line)
+		}
+	}
+	return out
+}
+
+func runtimeLogLineTime(line string) (time.Time, bool) {
+	fields := strings.Fields(line)
+	if len(fields) == 0 {
+		return time.Time{}, false
+	}
+	raw := strings.TrimSpace(fields[0])
+	if parsed, err := time.Parse(time.RFC3339Nano, raw); err == nil {
+		return parsed, true
+	}
+	if parsed, err := time.Parse(time.RFC3339, raw); err == nil {
+		return parsed, true
+	}
+	return time.Time{}, false
 }
 
 func runtimeLogNewLines(lines []string, previous map[string]int) ([]string, map[string]int) {

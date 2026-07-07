@@ -862,6 +862,7 @@ const runtimeLogPodFilter = ref<string[]>([])
 const runtimeLogLevelFilter = ref<string[]>([])
 const runtimeLogKeyword = ref('')
 const runtimeLogTail = ref(200)
+const runtimeLogSinceSeconds = ref(0)
 const runtimeLogs = ref<AifarRuntimeLogsResponse>({ pods: [], warnings: [], tail: 200 })
 const runtimeLogsLoaded = ref<Record<string, boolean>>({})
 const runtimeLogRows = ref<RuntimeLogRow[]>([])
@@ -1215,7 +1216,7 @@ function runtimeCacheKey(scope: 'base' | 'pods' = 'base') {
 }
 
 function runtimeLogCacheKey() {
-  return `${cacheScope()}:aifar-runtime:logs:${selectedRuntimeInstance.value?.id || 'none'}:${runtimeLogServiceFilter.value.join(',')}:${runtimeLogPodFilter.value.join(',')}:${runtimeLogTail.value}`
+  return `${cacheScope()}:aifar-runtime:logs:${selectedRuntimeInstance.value?.id || 'none'}:${runtimeLogServiceFilter.value.join(',')}:${runtimeLogPodFilter.value.join(',')}:${runtimeLogTail.value}:${runtimeLogSinceSeconds.value}`
 }
 
 async function withLoading<T>(fn: () => Promise<T>) {
@@ -1438,6 +1439,9 @@ function openRuntimeLogStream(force = false) {
   params.set('instanceId', instance.id)
   params.set('tail', String(runtimeLogTail.value))
   params.set('batch', '200')
+  if (runtimeLogSinceSeconds.value > 0) {
+    params.set('since', String(runtimeLogSinceSeconds.value))
+  }
   if (runtimeLogServiceFilter.value.length) {
     params.set('services', runtimeLogServiceFilter.value.join(','))
   }
@@ -1601,6 +1605,8 @@ function toggleRuntimeLogPaused() {
 }
 
 function clearRuntimeLogView() {
+  const shouldRestart = runtimeLogSelectionReady.value && (Boolean(runtimeLogSource) || runtimeLogsLoadedForCurrentScope.value)
+  runtimeLogSinceSeconds.value = Math.floor(Date.now() / 1000)
   runtimeLogRows.value = []
   runtimeLogPendingRows.value = []
   runtimeLogs.value = {
@@ -1609,6 +1615,9 @@ function clearRuntimeLogView() {
   }
   runtimeLogDroppedRows.value = 0
   runtimeLogScrollTop.value = 0
+  if (shouldRestart) {
+    openRuntimeLogStream(true)
+  }
 }
 
 function handleRuntimeLogScroll(event: Event) {
@@ -2738,6 +2747,7 @@ watch(selectedRuntimeInstanceId, () => {
   runtimeLogPodFilter.value = []
   runtimeLogLevelFilter.value = []
   runtimeLogKeyword.value = ''
+  runtimeLogSinceSeconds.value = 0
   resetRuntimeLogView()
   runtimeLogsLoaded.value = {}
   closeRuntimeLogStream()
@@ -2750,6 +2760,7 @@ watch(runtimeLogServiceFilter, () => {
   runtimeLogPodFilter.value = runtimeLogPodFilter.value.filter((pod) => validPods.has(pod))
 }, { deep: true })
 watch([runtimeLogServiceFilter, runtimeLogPodFilter, runtimeLogTail], () => {
+  runtimeLogSinceSeconds.value = 0
   resetRuntimeLogView()
   runtimeLogsLoaded.value = {}
   closeRuntimeLogStream()
@@ -2792,6 +2803,7 @@ watch(selectedServerId, () => {
   runtimeLogPodFilter.value = []
   runtimeLogLevelFilter.value = []
   runtimeLogKeyword.value = ''
+  runtimeLogSinceSeconds.value = 0
   resetRuntimeLogView()
   runtimeLogsLoaded.value = {}
   closeRuntimeLogStream()
