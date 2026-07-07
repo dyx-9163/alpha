@@ -915,3 +915,5 @@
 - 结论：已在容器页 AIFAR Runtime 工具栏新增“卸载 AIFAR”，复用部署服务密码确认与 `/apps/instances/{id}/delete` 任务接口，提交后接入全局任务进度条；`pnpm web:build` 和 `git diff --check` 通过。
 - 问题：用户询问后端自动采集状态并落库、前端直接展示缓存数据的设计是否合理，以及和当前方案、市面运维工具相比如何。
 - 结论：该方向合理，适合把 AIFAR 从页面触发式部署面板升级为具备持续观测能力的控制面；建议采用轻量 collector + 最新状态快照 + 新鲜度/失败状态展示，不要直接做成完整 Prometheus/Zabbix。与当前方案相比可降低页面卡顿、减少重复远程采集、支持无人值守健康状态；与市面工具相比应定位为部署运维一体化控制面内置观测，而不是通用监控系统替代品。
+- 问题：用户要求提供自动采集落库与页面长连接推送的完整改造方案，并在 GitHub 上直接创建分支承载此次功能改造。
+- 结论：已创建并推送 GitHub 分支 `codex/status-collector-realtime`。改造方案建议分三层推进：后端 collector 定时采集并写最新状态快照，Event Hub/SSE 推送资源变更轻量事件，前端全局 realtime store 接收事件后按需刷新数据库快照；第一阶段先覆盖服务器、Docker summary、AIFAR Runtime 和任务事件。
