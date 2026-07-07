@@ -229,6 +229,7 @@ type Copy struct {
 }
 
 type DeleteCopy struct {
+	RemoveAgent                  string
 	RemoveRemote                 string
 	VerifyRemoved                string
 	DeleteInstance               string
@@ -431,6 +432,7 @@ func updateCopyFor(lang string) UpdateCopy {
 func deleteCopyFor(lang string) DeleteCopy {
 	if normalizeLanguage(lang) == "en" {
 		return DeleteCopy{
+			RemoveAgent:                  "deregister Nacos proxies and remove aifar-agent",
 			RemoveRemote:                 "remove AIFAR runtime services and files",
 			VerifyRemoved:                "verify AIFAR service removal",
 			DeleteInstance:               "delete AIFAR service instance record",
@@ -444,6 +446,7 @@ func deleteCopyFor(lang string) DeleteCopy {
 		}
 	}
 	return DeleteCopy{
+		RemoveAgent:                  "卸载 aifar-agent 并注销 Nacos 代理",
 		RemoveRemote:                 "删除目标服务器上的 AIFAR runtime 服务和文件",
 		VerifyRemoved:                "校验 AIFAR 服务已删除",
 		DeleteInstance:               "删除 AIFAR 服务实例记录",

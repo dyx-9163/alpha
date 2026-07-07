@@ -100,6 +100,14 @@
         </el-form-item>
       </el-form>
 
+      <el-alert
+        v-if="targetValidationMessage"
+        type="warning"
+        show-icon
+        :closable="false"
+        :title="targetValidationMessage"
+      />
+
       <slot name="extra" :app="app" :servers="safeServers" :selected-server-ids="selectedServerIds" :selected-server-id="selectedServerId" />
 
       <div v-if="!safeServers.length" class="empty-server-hint">{{ dialogCopy.noServers }}</div>
@@ -138,6 +146,7 @@ const props = withDefaults(defineProps<{
   hideTargetSelectorResolver?: (values: AppInstallFieldValues) => boolean
   targetCountResolver?: (values: AppInstallFieldValues, context: AppInstallValidationContext) => number
   targetIdsResolver?: (values: AppInstallFieldValues, context: AppInstallValidationContext) => string[]
+  targetValidationResolver?: (values: AppInstallFieldValues, context: AppInstallValidationContext) => string | undefined | null
   copy?: Partial<AppInstallDialogCopy>
   fields?: AppInstallField[] | null
 }>(), {
@@ -188,25 +197,32 @@ const versions = computed(() => {
 })
 const effectiveTargetMode = computed(() => props.targetModeResolver?.(fieldValues.value) ?? props.targetMode)
 const targetSelectorHidden = computed(() => props.hideTargetSelectorResolver?.(fieldValues.value) ?? props.hideTargetSelector ?? false)
-const selectedTargetServers = computed(() => {
+const defaultSelectedTargetIds = computed(() => {
   if (effectiveTargetMode.value === 'multiple') {
-    const selected = new Set(selectedServerIds.value)
-    return safeServers.value.filter((server) => selected.has(server.id))
+    return uniqueStringValues(selectedServerIds.value)
   }
-  return safeServers.value.filter((server) => server.id === selectedServerId.value)
+  return selectedServerId.value ? [selectedServerId.value] : []
 })
+const targetResolverContext = computed<AppInstallValidationContext>(() => ({
+  servers: safeServers.value,
+  selectedServers: serversByIds(defaultSelectedTargetIds.value),
+  targetMode: effectiveTargetMode.value
+}))
+const hiddenTargetIds = computed(() => uniqueStringValues(props.targetIdsResolver?.(fieldValues.value, targetResolverContext.value) ?? []))
+const selectedTargetIds = computed(() => targetSelectorHidden.value ? hiddenTargetIds.value : defaultSelectedTargetIds.value)
+const selectedTargetServers = computed(() => serversByIds(selectedTargetIds.value))
 const validationContext = computed<AppInstallValidationContext>(() => ({
   servers: safeServers.value,
   selectedServers: selectedTargetServers.value,
   targetMode: effectiveTargetMode.value
 }))
-const hiddenTargetIds = computed(() => props.targetIdsResolver?.(fieldValues.value, validationContext.value) ?? [])
 const selectedTargetCount = computed(() => {
   if (targetSelectorHidden.value) {
-    return Math.max(0, props.targetCountResolver?.(fieldValues.value, validationContext.value) ?? hiddenTargetIds.value.length)
+    return Math.max(0, props.targetCountResolver?.(fieldValues.value, validationContext.value) ?? selectedTargetIds.value.length)
   }
-  return effectiveTargetMode.value === 'multiple' ? selectedServerIds.value.length : Number(Boolean(selectedServerId.value))
+  return selectedTargetIds.value.length
 })
+const targetValidationMessage = computed(() => props.targetValidationResolver?.(fieldValues.value, validationContext.value) || '')
 const fieldValidationMessages = computed(() => {
   return installFields.value.reduce<Record<string, string>>((messages, field) => {
     const message = field.validate?.(fieldValues.value[field.name], fieldValues.value, validationContext.value)
@@ -219,7 +235,7 @@ const fieldValidationMessages = computed(() => {
 const hasFieldValidationErrors = computed(() => Object.keys(fieldValidationMessages.value).length > 0)
 const requiredFieldsReady = computed(() => installFields.value.every((field) => !field.required || isFieldValueFilled(field, fieldValues.value[field.name])))
 const targetReady = computed(() => targetSelectorHidden.value ? (!props.targetIdsResolver || selectedTargetCount.value > 0) : selectedTargetCount.value > 0)
-const canSubmit = computed(() => Boolean(selectedVersion.value && targetReady.value && requiredFieldsReady.value && !hasFieldValidationErrors.value && !props.submitting))
+const canSubmit = computed(() => Boolean(selectedVersion.value && targetReady.value && requiredFieldsReady.value && !hasFieldValidationErrors.value && !targetValidationMessage.value && !props.submitting))
 
 watch(
   () => [props.modelValue, props.app?.name, props.app?.versions.join('|'), props.targetMode, allFields.value.map((field) => field.name).join('|')],
@@ -263,6 +279,25 @@ function resetFieldValues() {
     next[field.name] = normalizeFieldValue(field.defaultValue)
   }
   fieldValues.value = next
+}
+
+function uniqueStringValues(values: string[]) {
+  const seen = new Set<string>()
+  const out: string[] = []
+  for (const value of values) {
+    const next = String(value ?? '').trim()
+    if (!next || seen.has(next)) {
+      continue
+    }
+    seen.add(next)
+    out.push(next)
+  }
+  return out
+}
+
+function serversByIds(ids: string[]) {
+  const selected = new Set(ids)
+  return safeServers.value.filter((server) => selected.has(server.id))
 }
 
 function fieldOptions(field: AppInstallField) {

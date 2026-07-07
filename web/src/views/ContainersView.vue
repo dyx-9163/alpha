@@ -9,11 +9,6 @@
         <ServerSelector v-model="selectedServerId" :servers="dockerServers" :placeholder="t('containers.selectDockerHost')" class="toolbar-control" />
         <el-button :loading="loading" @click="load(true)">{{ t('containers.checkHost') }}</el-button>
         <el-button :loading="loading" @click="loadActive(true)">{{ t('common.refresh') }}</el-button>
-        <el-tooltip v-if="selectedDockerInstance" :content="deniedText" :disabled="canManageApps" placement="top">
-          <span>
-            <el-button type="danger" plain :disabled="!canManageApps" @click="openDockerUninstall">{{ t('common.uninstall') }}</el-button>
-          </span>
-        </el-tooltip>
       </div>
     </div>
 
@@ -73,12 +68,6 @@
               </el-tooltip>
               <el-tooltip :content="runtimeCleanupDisabledReason" :disabled="!runtimeCleanupDisabledReason" placement="top">
                 <span><el-button size="small" type="warning" plain :disabled="Boolean(runtimeCleanupDisabledReason)" @click="cleanupAifarRuntimeStale">{{ t('containers.cleanupStaleRuntime') }}</el-button></span>
-              </el-tooltip>
-              <el-tooltip :content="runtimeAgentUninstallDisabledReason" :disabled="!runtimeAgentUninstallDisabledReason" placement="top">
-                <span><el-button size="small" type="danger" plain :disabled="Boolean(runtimeAgentUninstallDisabledReason)" @click="uninstallAifarRuntimeAgent">{{ t('containers.uninstallAgent') }}</el-button></span>
-              </el-tooltip>
-              <el-tooltip :content="aifarAppUninstallDisabledReason" :disabled="!aifarAppUninstallDisabledReason" placement="top">
-                <span><el-button size="small" type="danger" plain :disabled="Boolean(aifarAppUninstallDisabledReason)" @click="openAifarAppUninstall">{{ t('containers.uninstallAifarApp') }}</el-button></span>
               </el-tooltip>
               <el-button size="small" :loading="loading" @click="loadAifarRuntime(true)">{{ t('common.refresh') }}</el-button>
             </div>
@@ -442,15 +431,11 @@
           <el-input :model-value="selectedAifarInstanceLabel" disabled />
         </el-form-item>
         <el-form-item :label="t('apps.aifarUpdateMode')" required>
-          <el-radio-group v-model="aifarUpdateMode">
-            <el-radio-button label="single">{{ t('apps.aifarUpdateSingleMode') }}</el-radio-button>
-            <el-radio-button label="bundle">{{ t('apps.aifarUpdateBundleMode') }}</el-radio-button>
-          </el-radio-group>
+          <el-input :model-value="aifarUpdateModeLabel" disabled />
         </el-form-item>
         <el-form-item v-if="aifarUpdateMode === 'single'" :label="t('apps.aifarUpdateService')" required>
-          <el-select v-model="aifarUpdateService" filterable>
-            <el-option v-for="service in aifarServiceOptions" :key="service.value" :label="service.label" :value="service.value" />
-          </el-select>
+          <el-input :model-value="aifarUpdateService" disabled />
+          <div class="artifact-hint">{{ t('apps.aifarUpdateLockedServiceHint') }}</div>
         </el-form-item>
         <el-form-item :label="t('apps.aifarUpdateArtifact')" required>
           <el-upload
@@ -542,16 +527,6 @@
         <el-button type="primary" :loading="runtimeConfigSubmitting" @click="submitRuntimeConfig">{{ t('containers.applyRuntimeConfig') }}</el-button>
       </template>
     </el-dialog>
-    <SecretConfirmPrompt
-      v-model="deletePromptVisible"
-      :title="deletePromptTitle"
-      :message="deletePromptMessage"
-      :placeholder="t('apps.deleteServicePasswordPlaceholder')"
-      :confirm-text="t('common.uninstall')"
-      :cancel-text="t('common.cancel')"
-      :loading="deleteSubmitting"
-      @confirm="confirmAppUninstall"
-    />
   </section>
 </template>
 
@@ -562,7 +537,6 @@ import type { UploadFile } from 'element-plus'
 import { apiEventSourceUrl, apiGet, apiPost, apiPostForm, apiPut, asArray } from '../api/client'
 import KeyValueGrid from '../components/KeyValueGrid.vue'
 import MetricGrid from '../components/MetricGrid.vue'
-import SecretConfirmPrompt from '../components/SecretConfirmPrompt.vue'
 import ServerSelector from '../components/ServerSelector.vue'
 import StatusTag from '../components/StatusTag.vue'
 import { usePermissions } from '../composables/usePermissions'
@@ -833,24 +807,14 @@ const runtimeConfigRows = ref<RuntimeConfigServiceRow[]>([])
 const serviceInstallVisible = ref(false)
 const serviceInstallSubmitting = ref(false)
 const serviceInstallSelection = ref<string[]>([])
-const deletePromptVisible = ref(false)
-const deleteSubmitting = ref(false)
-const deletePromptInstance = ref<AppInstance | null>(null)
 const canManageContainers = computed(() => can(permissions.containersManage))
 const canManageApps = computed(() => can(permissions.appsManage))
 
 const summaryData = computed(() => summary.value.summary ?? {})
 const selectedServer = computed(() => servers.value.find((server) => server.id === selectedServerId.value) ?? null)
-const selectedDockerInstance = computed(() => appInstances.value.find((item) => item.app === 'docker' && item.serverId === selectedServerId.value) ?? null)
 const dockerServers = computed(() => servers.value.filter((server) => String(server.dockerHost ?? '').trim() !== ''))
 const targetLabel = computed(() => selectedServer.value ? serverLabel(selectedServer.value) : t('containers.selectDockerHost'))
 const errorTitle = computed(() => summary.value.available === false ? t('containers.notAvailable') : t('containers.checkFailed'))
-const deletePromptTitle = computed(() => deletePromptInstance.value?.app === 'aifar' ? t('containers.uninstallAifarApp') : t('apps.uninstallService'))
-const deletePromptMessage = computed(() => {
-  const instance = deletePromptInstance.value
-  const server = servers.value.find((item) => item.id === instance?.serverId) ?? selectedServer.value
-  return server ? t('apps.deleteServicePasswordPrompt', { server: serverLabel(server) }) : ''
-})
 const metrics = computed(() => [
   { label: t('containers.title'), value: summaryData.value.containers ?? 0, note: t('containers.runningCount', { count: summaryData.value.running ?? 0 }) },
   { label: t('containers.images'), value: summaryData.value.images ?? 0, note: t('containers.localImages') },
@@ -902,6 +866,7 @@ const aifarServiceOptions = [
 ].map((name) => ({ value: name, label: name }))
 const selectedAifarUpdateInstance = computed(() => aifarUpdateInstanceOverride.value)
 const selectedAifarContainerLabel = computed(() => aifarUpdateTargetLabel.value || '-')
+const aifarUpdateModeLabel = computed(() => aifarUpdateMode.value === 'bundle' ? t('apps.aifarUpdateAllServices') : t('apps.aifarUpdateSingleMode'))
 const selectedAifarInstanceLabel = computed(() => {
   const instance = selectedAifarUpdateInstance.value
   if (!instance) {
@@ -1035,12 +1000,6 @@ const aifarRuntimeActionDisabledReason = computed(() => {
 const runtimeCleanupDisabledReason = computed(() => {
   if (runtimeInstanceManageDisabledReason.value) return runtimeInstanceManageDisabledReason.value
   if (!staleRuntimePodCount.value) return t('containers.noStaleRuntimePods')
-  return ''
-})
-const runtimeAgentUninstallDisabledReason = computed(() => runtimeInstanceManageDisabledReason.value)
-const aifarAppUninstallDisabledReason = computed(() => {
-  if (!canManageApps.value) return deniedText.value
-  if (!selectedRuntimeAppInstance.value) return t('containers.selectAifarInstance')
   return ''
 })
 const serviceInstallDisabledReason = computed(() => {
@@ -1946,7 +1905,7 @@ function openAifarRuntimeBundleUpdate() {
     return
   }
   aifarUpdateInstanceOverride.value = instance
-  aifarUpdateTargetLabel.value = t('containers.bundleUpdate')
+  aifarUpdateTargetLabel.value = t('apps.aifarUpdateAllServices')
   aifarUpdateMode.value = 'bundle'
   aifarArtifactFile.value = null
   aifarUpdateVisible.value = true
@@ -2137,37 +2096,6 @@ async function cleanupAifarRuntimeStale() {
     const result = await apiPost<{ taskId: string }>(`/containers/aifar/runtime/cleanup-stale?${query}`, { instanceId })
     ElMessage.success(t('containers.runtimeActionAccepted'))
     trackTask(result.taskId, t('containers.cleanupStaleRuntime'))
-    void loadAifarRuntime(true)
-  } catch (err) {
-    ElMessage.error(err instanceof Error ? err.message : t('containers.runtimeActionFailed'))
-  }
-}
-
-async function uninstallAifarRuntimeAgent() {
-  const reason = runtimeAgentUninstallDisabledReason.value
-  if (reason) {
-    ElMessage.warning(reason)
-    return
-  }
-  const instanceId = selectedRuntimeInstance.value?.id
-  if (!instanceId) {
-    ElMessage.warning(t('containers.selectAifarInstance'))
-    return
-  }
-  try {
-    await ElMessageBox.confirm(t('containers.confirmUninstallAgent'), t('containers.uninstallAgent'), {
-      type: 'error',
-      confirmButtonText: t('containers.uninstallAgent'),
-      cancelButtonText: t('common.cancel')
-    })
-  } catch {
-    return
-  }
-  const query = targetQuery()
-  try {
-    const result = await apiPost<{ taskId: string }>(`/containers/aifar/runtime/uninstall-agent?${query}`, { instanceId })
-    ElMessage.success(t('containers.runtimeActionAccepted'))
-    trackTask(result.taskId, t('containers.uninstallAgent'))
     void loadAifarRuntime(true)
   } catch (err) {
     ElMessage.error(err instanceof Error ? err.message : t('containers.runtimeActionFailed'))
@@ -2410,50 +2338,6 @@ function uniqueValues(values: string[]) {
   return out
 }
 
-function openDockerUninstall() {
-  if (!canManageApps.value) {
-    ElMessage.warning(deniedText.value)
-    return
-  }
-  deletePromptInstance.value = selectedDockerInstance.value
-  deletePromptVisible.value = true
-}
-
-function openAifarAppUninstall() {
-  const reason = aifarAppUninstallDisabledReason.value
-  if (reason) {
-    ElMessage.warning(reason)
-    return
-  }
-  deletePromptInstance.value = selectedRuntimeAppInstance.value
-  deletePromptVisible.value = true
-}
-
-async function confirmAppUninstall(password: string) {
-  const instance = deletePromptInstance.value
-  if (!instance) {
-    return
-  }
-  if (!password.trim()) {
-    ElMessage.warning(t('apps.deleteServicePasswordPlaceholder'))
-    return
-  }
-  deleteSubmitting.value = true
-  try {
-    const result = await apiPost<{ taskId: string }>(`/apps/instances/${instance.id}/delete`, {
-      serverPassword: password
-    })
-    deletePromptVisible.value = false
-    deletePromptInstance.value = null
-    ElMessage.success(t('apps.uninstallServiceAccepted'))
-    trackTask(result.taskId, instance.app === 'aifar' ? t('containers.uninstallAifarApp') : t('apps.uninstallService'))
-  } catch (err) {
-    ElMessage.error(err instanceof Error ? err.message : t('apps.deleteServiceFailed'))
-  } finally {
-    deleteSubmitting.value = false
-  }
-}
-
 watch(tab, (next) => {
   if (next !== 'aifar-runtime') {
     closeRuntimeLogStream()
@@ -2533,11 +2417,6 @@ watch(() => realtime.revision, () => {
       return
     }
     runtimeCache.value = {}
-  }
-})
-watch(deletePromptVisible, (visible) => {
-  if (!visible && !deleteSubmitting.value) {
-    deletePromptInstance.value = null
   }
 })
 watch([aifarUpdateService, aifarUpdateMode], () => {

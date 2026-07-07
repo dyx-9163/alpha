@@ -1879,6 +1879,38 @@ func TestServiceRejectsMismatchedArtifactBundleFileName(t *testing.T) {
 	}
 }
 
+func TestServiceDeleteUninstallsRuntimeAgentBeforeRemovingService(t *testing.T) {
+	instance := installedAIFARInstance(t)
+	s := &fakeStore{
+		servers: map[string]store.Server{
+			"srv-1": {ID: "srv-1", Name: "app-1", Host: "10.0.0.10", DeployDir: "/aifar/apps"},
+		},
+		instances: []store.AppInstance{instance},
+	}
+	remote := &fakeRemote{statusStdout: strings.Join([]string{
+		"status=missing",
+		"installRootExists=false",
+	}, "\n")}
+	service := NewService(s, remote)
+	err := service.Delete(context.Background(), DeleteRequest{
+		Instance: instance,
+		Server:   s.servers["srv-1"],
+		Language: "en",
+	}, fakeLogger{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	commands := remote.joinedCommands()
+	agentIndex := strings.Index(commands, "AIFAR_AGENT_UNINSTALL")
+	serviceIndex := strings.Index(commands, "AIFAR_SERVICE_UNINSTALL")
+	if agentIndex < 0 || serviceIndex < 0 || agentIndex > serviceIndex {
+		t.Fatalf("expected agent uninstall before service uninstall, commands:\n%s", commands)
+	}
+	if len(s.instances) != 0 {
+		t.Fatalf("expected instance record to be deleted, got %+v", s.instances)
+	}
+}
+
 func TestModulePlansArtifactBundleUpdateAsSinglePartialRelease(t *testing.T) {
 	bundlePath := writeAlphaJarBundle(t, []bundleTestArtifact{
 		{Service: "oauth", Module: "alpha-oauth", FileName: "alpha-oauth.jar", Content: "new oauth jar"},

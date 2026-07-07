@@ -116,11 +116,6 @@
                 <div class="storage-node-tags">
                   <el-tag size="small" type="info">{{ node.roleLabel }}</el-tag>
                   <StatusTag :status="node.status" />
-                  <el-tooltip :content="deniedText" :disabled="canManageApps" placement="top">
-                    <span>
-                      <el-button size="small" type="danger" plain :disabled="!canManageApps" @click="openDeleteInstance(node.instance)">{{ t('common.uninstall') }}</el-button>
-                    </span>
-                  </el-tooltip>
                 </div>
               </div>
             </div>
@@ -233,19 +228,6 @@
         <div v-else class="empty-state"><div><strong>{{ t('storage.noInstanceSelected') }}</strong><span>{{ t('storage.emptyDesc') }}</span></div></div>
       </template>
     </div>
-
-    <el-dialog v-model="deleteDialogVisible" :title="t('apps.uninstallService')" width="460px" destroy-on-close @closed="resetDeleteDialog">
-      <p class="secret-confirm-message">{{ deletePromptMessage }}</p>
-      <el-input v-model="deletePassword" type="password" :placeholder="t('apps.deleteServicePasswordPlaceholder')" show-password autofocus @keyup.enter="confirmDeleteInstance" />
-      <el-checkbox v-if="deleteInstanceUsesMountedDisks" v-model="deleteRemoveMountedDisks" class="delete-disk-option">
-        {{ t('storage.removeMountedDisks') }}
-      </el-checkbox>
-      <p v-if="deleteInstanceUsesMountedDisks" class="delete-disk-hint">{{ t('storage.removeMountedDisksHint') }}</p>
-      <template #footer>
-        <el-button :disabled="deleteSubmitting" @click="deleteDialogVisible = false">{{ t('common.cancel') }}</el-button>
-        <el-button type="danger" :loading="deleteSubmitting" @click="confirmDeleteInstance">{{ t('common.uninstall') }}</el-button>
-      </template>
-    </el-dialog>
 
     <el-dialog v-model="itemDialogVisible" :title="dialogTitle" width="520px">
       <el-form label-position="top">

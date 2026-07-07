@@ -121,6 +121,7 @@ export interface AppInstallDialogConfig {
   hideTargetSelectorResolver?: (values: AppInstallFieldValues) => boolean
   targetCountResolver?: (values: AppInstallFieldValues, context: AppInstallValidationContext) => number
   targetIdsResolver?: (values: AppInstallFieldValues, context: AppInstallValidationContext) => string[]
+  targetValidationResolver?: (values: AppInstallFieldValues, context: AppInstallValidationContext) => string | undefined | null
   copy?: Partial<AppInstallDialogCopy>
   fields?: AppInstallField[]
 }

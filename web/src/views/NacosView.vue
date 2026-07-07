@@ -49,11 +49,6 @@
               </div>
               <div class="nacos-head-actions">
                 <StatusTag :status="group.status" />
-                <el-tooltip :content="deniedText" :disabled="canManageApps" placement="top">
-                  <span>
-                    <el-button size="small" type="danger" plain :disabled="!canManageApps" @click="openDeleteGroup(group)">{{ t('nacos.uninstallGroup') }}</el-button>
-                  </span>
-                </el-tooltip>
               </div>
             </div>
 
@@ -268,22 +263,6 @@
       </template>
     </div>
 
-    <el-dialog v-model="deletePromptVisible" :title="t('nacos.uninstallGroup')" width="520px" destroy-on-close @closed="resetDeletePrompt">
-      <p v-if="deletePromptMessage" class="secret-confirm-message">{{ deletePromptMessage }}</p>
-      <el-form label-position="top" class="multi-secret-form">
-        <el-checkbox v-if="deleteServers.length > 1" v-model="sameDeletePassword" @change="handleSamePasswordToggle">{{ t('database.samePassword') }}</el-checkbox>
-        <el-form-item v-if="sameDeletePassword && deleteServers.length > 1" :label="t('database.samePasswordLabel')">
-          <el-input v-model="deleteSharedPassword" type="password" :placeholder="t('apps.deleteServicePasswordPlaceholder')" show-password @keyup.enter="confirmDeleteScope" />
-        </el-form-item>
-        <el-form-item v-for="server in visibleDeleteServers" v-else :key="server.id" :label="server.label">
-          <el-input v-model="deletePasswords[server.id]" type="password" :placeholder="t('apps.deleteServicePasswordPlaceholder')" show-password @keyup.enter="confirmDeleteScope" />
-        </el-form-item>
-      </el-form>
-      <template #footer>
-        <el-button :disabled="deleteSubmitting" @click="deletePromptVisible = false">{{ t('common.cancel') }}</el-button>
-        <el-button type="danger" :loading="deleteSubmitting" :disabled="!deleteServers.length" @click="confirmDeleteScope">{{ t('common.uninstall') }}</el-button>
-      </template>
-    </el-dialog>
   </section>
 </template>
 

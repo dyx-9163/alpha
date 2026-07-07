@@ -1353,8 +1353,19 @@ func (s Service) Delete(ctx context.Context, req DeleteRequest, log Logger, targ
 	metadata := metadataFromInstance(req.Instance)
 	networkName := stringFromMetadata(metadata, "networkName", defaultNetworkName)
 	installRoot := stringFromMetadata(metadata, "installRoot", installRootFromDeployDir(req.Server.DeployDir))
+	specPath := stringFromMetadata(metadata, "runtimeSpecPath", runtimeSpecPath(installRoot))
 
 	if err := step(1, func() error {
+		_, err := installerkit.Run(ctx, s.remote, req.Server, runtimeAgentUninstallCommand(installRoot, specPath), logForServer, copy.RemoteCommandFailed)
+		return err
+	}); err != nil {
+		msg := fmt.Sprintf(copy.DeleteFailed, err)
+		logForServer.Error("%s", msg)
+		finishTarget(recorder, target, "failed", msg)
+		return err
+	}
+
+	if err := step(2, func() error {
 		script, err := renderUninstallScript(uninstallScriptData{
 			InstallRoot:  installRoot,
 			NetworkName:  networkName,
@@ -1372,7 +1383,7 @@ func (s Service) Delete(ctx context.Context, req DeleteRequest, log Logger, targ
 		return err
 	}
 
-	if err := step(2, func() error {
+	if err := step(3, func() error {
 		status, err := NewInspector(s.remote).Check(ctx, req.Server, installRoot, logForServer)
 		if err != nil {
 			return err
@@ -1388,7 +1399,7 @@ func (s Service) Delete(ctx context.Context, req DeleteRequest, log Logger, targ
 		return err
 	}
 
-	if err := step(3, func() error {
+	if err := step(4, func() error {
 		return s.store.DeleteAppInstance(req.Instance.ID)
 	}); err != nil {
 		msg := fmt.Sprintf(copy.DeleteFailed, err)
@@ -1749,6 +1760,7 @@ func installSteps(copy Copy) []installStepDef {
 
 func deleteSteps(copy DeleteCopy) []installStepDef {
 	return []installStepDef{
+		{Name: "remove-agent-runtime", Title: copy.RemoveAgent},
 		{Name: "remove-remote", Title: copy.RemoveRemote},
 		{Name: "verify-removed", Title: copy.VerifyRemoved},
 		{Name: "delete-instance", Title: copy.DeleteInstance},

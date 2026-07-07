@@ -50,6 +50,9 @@ func (a *API) deleteAppInstance(w http.ResponseWriter, r *http.Request) {
 		respond(w, nil, err)
 		return
 	}
+	if !a.ensureCompleteDeleteSelection(w, lang, []store.AppInstance{instance}) {
+		return
+	}
 	if strings.TrimSpace(instance.ServerID) == "" {
 		writeError(w, http.StatusBadRequest, "INSTANCE_SERVER_REQUIRED", i18n.Text(lang, "api.instanceServerRequired"), map[string]any{"instanceId": id})
 		return
@@ -202,6 +205,13 @@ func (a *API) deleteAppInstances(w http.ResponseWriter, r *http.Request) {
 			seenTargets[server.ID] = true
 			targets = append(targets, server.ID)
 		}
+	}
+	selectedInstances := make([]store.AppInstance, 0, len(items))
+	for _, item := range items {
+		selectedInstances = append(selectedInstances, item.instance)
+	}
+	if !a.ensureCompleteDeleteSelection(w, lang, selectedInstances) {
+		return
 	}
 
 	actor := currentUser(r).Username
@@ -380,6 +390,13 @@ func (a *API) installAppName(w http.ResponseWriter, r *http.Request, app string)
 		writeError(w, http.StatusBadRequest, "MULTI_TARGET_UNSUPPORTED", i18n.Text(lang, "api.multiTargetUnsupported"), map[string]any{"app": def.Name})
 		return
 	}
+	if conflicts, err := a.installConflicts(def.Name, serverIDs); err != nil {
+		writeError(w, http.StatusInternalServerError, "APP_INSTANCE_LIST_FAILED", err.Error(), map[string]any{"app": def.Name})
+		return
+	} else if len(conflicts) > 0 {
+		writeError(w, http.StatusConflict, "APP_ALREADY_INSTALLED", i18n.Text(lang, "api.appAlreadyInstalled", def.Name, strings.Join(conflicts, ", ")), map[string]any{"app": def.Name, "servers": conflicts})
+		return
+	}
 	if err := requireExplicitInstallPasswords(def.Name, lang, req.Parameters); err != nil {
 		writeError(w, http.StatusBadRequest, "INSTALL_PASSWORD_REQUIRED", err.Error(), map[string]any{"app": def.Name})
 		return
@@ -502,6 +519,142 @@ func installTargetServerIDs(req installAppRequest) []string {
 		add(id)
 	}
 	return out
+}
+
+func (a *API) installConflicts(app string, serverIDs []string) ([]string, error) {
+	if len(serverIDs) == 0 {
+		return nil, nil
+	}
+	targets := map[string]bool{}
+	for _, id := range serverIDs {
+		id = strings.TrimSpace(id)
+		if id != "" {
+			targets[id] = true
+		}
+	}
+	if len(targets) == 0 {
+		return nil, nil
+	}
+	related := lifecycleRawAppNames(app)
+	instances, err := a.store.ListAppInstances()
+	if err != nil {
+		return nil, err
+	}
+	seen := map[string]bool{}
+	var out []string
+	for _, instance := range instances {
+		serverID := strings.TrimSpace(instance.ServerID)
+		if serverID == "" || !targets[serverID] || !related[strings.ToLower(strings.TrimSpace(instance.App))] {
+			continue
+		}
+		if !seen[serverID] {
+			seen[serverID] = true
+			out = append(out, serverID)
+		}
+	}
+	return out, nil
+}
+
+func (a *API) ensureCompleteDeleteSelection(w http.ResponseWriter, lang string, selected []store.AppInstance) bool {
+	if len(selected) == 0 {
+		return true
+	}
+	all, err := a.store.ListAppInstances()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "APP_INSTANCE_LIST_FAILED", err.Error(), nil)
+		return false
+	}
+	selectedIDs := map[string]bool{}
+	for _, instance := range selected {
+		selectedIDs[instance.ID] = true
+	}
+	groups := map[string][]store.AppInstance{}
+	for _, instance := range all {
+		if key := lifecycleDeleteGroupKey(instance); key != "" {
+			groups[key] = append(groups[key], instance)
+		}
+	}
+	for _, instance := range selected {
+		key := lifecycleDeleteGroupKey(instance)
+		if key == "" {
+			continue
+		}
+		members := groups[key]
+		if len(members) <= 1 {
+			continue
+		}
+		var missing []string
+		var required []string
+		for _, member := range members {
+			required = append(required, member.ID)
+			if !selectedIDs[member.ID] {
+				missing = append(missing, member.ID)
+			}
+		}
+		if len(missing) > 0 {
+			writeError(w, http.StatusConflict, "APP_CLUSTER_DELETE_REQUIRED", i18n.Text(lang, "api.appClusterDeleteRequired", lifecycleAppFamily(instance.App), len(members)), map[string]any{
+				"app":         lifecycleAppFamily(instance.App),
+				"group":       key,
+				"requiredIds": required,
+				"missingIds":  missing,
+			})
+			return false
+		}
+	}
+	return true
+}
+
+func lifecycleRawAppNames(app string) map[string]bool {
+	family := lifecycleAppFamily(app)
+	if family == "mysql" {
+		return map[string]bool{"mysql": true, "mysql-router": true}
+	}
+	return map[string]bool{family: true}
+}
+
+func lifecycleAppFamily(app string) string {
+	app = strings.ToLower(strings.TrimSpace(app))
+	if app == "mysql-router" {
+		return "mysql"
+	}
+	return app
+}
+
+func lifecycleDeleteGroupKey(instance store.AppInstance) string {
+	metadata := appInstanceMetadata(instance)
+	groupID := metadataString(metadata, "clusterId")
+	if groupID == "" {
+		groupID = metadataString(metadata, "replicationGroupId")
+	}
+	if groupID == "" {
+		groupID = metadataString(metadata, "replicaGroupId")
+	}
+	if groupID == "" {
+		return ""
+	}
+	family := lifecycleAppFamily(instance.App)
+	switch family {
+	case "mysql", "redis", "minio", "nacos":
+		return family + ":" + groupID
+	default:
+		return ""
+	}
+}
+
+func appInstanceMetadata(instance store.AppInstance) map[string]any {
+	var metadata map[string]any
+	if err := json.Unmarshal([]byte(instance.Metadata), &metadata); err != nil || metadata == nil {
+		return map[string]any{}
+	}
+	return metadata
+}
+
+func metadataString(metadata map[string]any, key string) string {
+	value, ok := metadata[key]
+	if !ok || value == nil {
+		return ""
+	}
+	return strings.TrimSpace(fmt.Sprint(value))
 }
 
 func decodeInstallAppRequest(r *http.Request) installAppRequest {

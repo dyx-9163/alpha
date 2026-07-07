@@ -67,15 +67,37 @@
     </div>
 
     <div v-else-if="activeTab === 'installed'" class="table-panel">
-      <AppInstanceTable
-        :instances="instances"
-        :servers="servers"
-        :show-time="false"
-        show-actions
-        :show-check="false"
-        :show-delete="false"
-        :disabled-reason="deniedText"
-      />
+      <el-table :data="installedGroups" row-key="id" class="installed-groups-table">
+        <el-table-column prop="appLabel" :label="t('table.app')" min-width="140" />
+        <el-table-column prop="version" :label="t('table.version')" min-width="150" show-overflow-tooltip />
+        <el-table-column :label="t('dashboard.topology')" min-width="150">
+          <template #default="{ row }">
+            <div class="topology-cell">
+              <span>{{ row.topologyLabel }}</span>
+              <el-tag size="small" effect="plain" :type="row.mode === 'cluster' ? 'warning' : 'info'">{{ row.modeLabel }}</el-tag>
+            </div>
+          </template>
+        </el-table-column>
+        <el-table-column :label="t('table.server')" min-width="260" show-overflow-tooltip>
+          <template #default="{ row }">
+            <span>{{ row.serverText }}</span>
+          </template>
+        </el-table-column>
+        <el-table-column :label="t('common.status')" width="120">
+          <template #default="{ row }">
+            <StatusTag :status="row.status" :label="row.statusLabel" />
+          </template>
+        </el-table-column>
+        <el-table-column :label="t('common.operation')" width="150" fixed="right">
+          <template #default="{ row }">
+            <el-tooltip :content="deniedText" :disabled="canManageApps" placement="top">
+              <span>
+                <el-button size="small" type="danger" plain :disabled="!canManageApps" @click="openUninstallGroup(row)">{{ t('common.uninstall') }}</el-button>
+              </span>
+            </el-tooltip>
+          </template>
+        </el-table-column>
+      </el-table>
     </div>
 
     <div v-else-if="activeTab === 'tasks'" class="deployment-records">
@@ -116,6 +138,50 @@
       @submit="submitModuleInstall"
     />
 
+    <el-dialog v-model="uninstallDialogVisible" :title="t('apps.uninstallService')" width="560px" destroy-on-close @closed="resetUninstallDialog">
+      <div v-if="pendingUninstallGroup" class="uninstall-dialog">
+        <el-alert
+          v-if="pendingUninstallGroup.mode === 'cluster'"
+          type="warning"
+          show-icon
+          :closable="false"
+          :title="t('apps.clusterUninstallOnly')"
+        />
+        <p class="secret-confirm-message">
+          {{ t('apps.uninstallGroupPasswordPrompt', { app: pendingUninstallGroup.appLabel, topology: pendingUninstallGroup.topologyLabel, count: uninstallServers.length }) }}
+        </p>
+        <el-form label-position="top" class="multi-secret-form">
+          <el-checkbox v-if="uninstallServers.length > 1" v-model="sameUninstallPassword" @change="handleSameUninstallPasswordToggle">{{ t('database.samePassword') }}</el-checkbox>
+          <el-form-item v-if="sameUninstallPassword && uninstallServers.length > 1" :label="t('database.samePasswordLabel')">
+            <el-input
+              v-model="uninstallSharedPassword"
+              type="password"
+              :placeholder="t('apps.deleteServicePasswordPlaceholder')"
+              show-password
+              @keyup.enter="confirmUninstallGroup"
+            />
+          </el-form-item>
+          <el-form-item v-for="server in visibleUninstallServers" v-else :key="server.id" :label="server.label">
+            <el-input
+              v-model="uninstallPasswords[server.id]"
+              type="password"
+              :placeholder="t('apps.deleteServicePasswordPlaceholder')"
+              show-password
+              @keyup.enter="confirmUninstallGroup"
+            />
+          </el-form-item>
+          <el-checkbox v-if="uninstallUsesMountedDisks" v-model="uninstallRemoveMountedDisks" class="delete-disk-option">
+            {{ t('storage.removeMountedDisks') }}
+          </el-checkbox>
+          <p v-if="uninstallUsesMountedDisks" class="delete-disk-hint">{{ t('storage.removeMountedDisksHint') }}</p>
+        </el-form>
+      </div>
+      <template #footer>
+        <el-button :disabled="uninstallSubmitting" @click="uninstallDialogVisible = false">{{ t('common.cancel') }}</el-button>
+        <el-button type="danger" :loading="uninstallSubmitting" :disabled="!uninstallServers.length" @click="confirmUninstallGroup">{{ t('common.uninstall') }}</el-button>
+      </template>
+    </el-dialog>
+
   </PageShell>
 </template>
 
@@ -127,9 +193,10 @@ import { apiGet, apiPost, asArray } from '../api/client'
 import { pairedAppCatalog, type AppCatalogResponse, type AppStoreItem } from '../apps/registry/catalog'
 import { frontendModuleFor } from '../apps/registry/loader'
 import { resolveAppLocale } from '../apps/registry/types'
-import type { AppFrontendModule, AppInstallDialogContext, AppInstallPayload, CredentialOption, ServerOption } from '../apps/registry/contract'
+import type { AppFrontendModule, AppInstallDialogContext, AppInstallFieldValues, AppInstallPayload, AppInstallValidationContext, CredentialOption, ServerOption } from '../apps/registry/contract'
 import AppInstanceTable from '../components/AppInstanceTable.vue'
 import PageShell from '../components/PageShell.vue'
+import StatusTag from '../components/StatusTag.vue'
 import { usePermissions } from '../composables/usePermissions'
 import { useI18n } from '../i18n'
 import { permissions } from '../rbac'
@@ -168,8 +235,13 @@ const moduleDialogServers = computed(() => {
   return filter ? servers.value.filter((server) => filter(server, installDialogContext.value)) : servers.value
 })
 const moduleDialogProps = computed(() => {
-  const { targetServerFilter, ...props } = moduleDialogConfig.value
-  return props
+  const { targetServerFilter, targetValidationResolver, ...props } = moduleDialogConfig.value
+  return {
+    ...props,
+    targetValidationResolver: (values: AppInstallFieldValues, context: AppInstallValidationContext) => {
+      return installTargetConflictReason(moduleDialogApp.value, context) || targetValidationResolver?.(values, context) || ''
+    }
+  }
 })
 type AppInstanceTableRecord = {
   id: string
@@ -180,6 +252,203 @@ type AppInstanceTableRecord = {
   topology?: string
   metadata?: string
   createdAt?: string
+}
+type InstanceMetadata = Record<string, unknown>
+type InstalledAppGroup = {
+  id: string
+  app: string
+  appLabel: string
+  version: string
+  topologyLabel: string
+  mode: 'standalone' | 'cluster'
+  modeLabel: string
+  serverText: string
+  status: string
+  statusLabel: string
+  members: AppInstanceTableRecord[]
+}
+type UninstallServer = {
+  id: string
+  label: string
+}
+
+const installedGroups = computed(() => buildInstalledGroups(instances.value))
+const uninstallDialogVisible = ref(false)
+const uninstallSubmitting = ref(false)
+const pendingUninstallGroup = ref<InstalledAppGroup | null>(null)
+const uninstallPasswords = ref<Record<string, string>>({})
+const uninstallSharedPassword = ref('')
+const sameUninstallPassword = ref(true)
+const uninstallRemoveMountedDisks = ref(false)
+const uninstallServers = computed<UninstallServer[]>(() => {
+  const group = pendingUninstallGroup.value
+  if (!group) {
+    return []
+  }
+  const seen = new Set<string>()
+  const out: UninstallServer[] = []
+  for (const member of group.members) {
+    const id = String(member.serverId || '').trim()
+    if (!id || seen.has(id)) {
+      continue
+    }
+    seen.add(id)
+    out.push({ id, label: serverLabel(id) })
+  }
+  return out
+})
+const visibleUninstallServers = computed(() => sameUninstallPassword.value && uninstallServers.value.length > 1 ? [] : uninstallServers.value)
+const uninstallUsesMountedDisks = computed(() => {
+  const group = pendingUninstallGroup.value
+  return Boolean(group?.members.some((member) => String(metadataOf(member).storageMode || '') === 'unmounted-disk'))
+})
+
+function buildInstalledGroups(rows: AppInstanceTableRecord[]) {
+  const groups = new Map<string, AppInstanceTableRecord[]>()
+  for (const row of rows) {
+    if (!isManagedAppInstance(row)) {
+      continue
+    }
+    const key = lifecycleGroupKey(row)
+    const members = groups.get(key) ?? []
+    members.push(row)
+    groups.set(key, members)
+  }
+  return Array.from(groups.entries()).map(([id, members]) => {
+    const first = members[0]
+    const app = lifecycleAppFamily(first.app)
+    const topology = groupTopology(members)
+    const mode = groupLifecycleMode(members)
+    const serverText = uniqueValues(members.map((member) => serverLabel(member.serverId)).filter((label) => label !== '-')).join(', ') || '-'
+    const status = groupInstalledStatus(members)
+    return {
+      id,
+      app,
+      appLabel: appLabel(app),
+      version: uniqueValues(members.map((member) => member.version || '-')).join(', '),
+      topologyLabel: topologyLabel(topology),
+      mode,
+      modeLabel: mode === 'cluster' ? t('apps.clusterMode') : t('apps.standaloneMode'),
+      serverText,
+      status,
+      statusLabel: status === 'installed' ? t('apps.installed') : '',
+      members
+    } satisfies InstalledAppGroup
+  }).sort((left, right) => left.appLabel.localeCompare(right.appLabel) || left.serverText.localeCompare(right.serverText))
+}
+
+function isManagedAppInstance(row: AppInstanceTableRecord) {
+  return ['aifar', 'docker', 'mysql', 'mysql-router', 'redis', 'minio', 'nacos'].includes(String(row.app || '').toLowerCase())
+}
+
+function lifecycleAppFamily(app: string) {
+  const normalized = String(app || '').toLowerCase()
+  return normalized === 'mysql-router' ? 'mysql' : normalized
+}
+
+function lifecycleRawAppNames(app: string) {
+  const family = lifecycleAppFamily(app)
+  if (family === 'mysql') {
+    return new Set(['mysql', 'mysql-router'])
+  }
+  return new Set([family])
+}
+
+function lifecycleGroupKey(row: AppInstanceTableRecord) {
+  const family = lifecycleAppFamily(row.app)
+  const metadata = metadataOf(row)
+  const sharedGroup = stringMeta(metadata, 'clusterId') || stringMeta(metadata, 'replicationGroupId') || stringMeta(metadata, 'replicaGroupId')
+  if (sharedGroup) {
+    return `${family}:group:${sharedGroup}`
+  }
+  return `${family}:single:${row.id}`
+}
+
+function groupLifecycleMode(members: AppInstanceTableRecord[]): 'standalone' | 'cluster' {
+  if (members.length > 1) {
+    return 'cluster'
+  }
+  const topology = groupTopology(members).toLowerCase()
+  return /cluster|sentinel|distributed|replication|router/.test(topology) ? 'cluster' : 'standalone'
+}
+
+function groupTopology(members: AppInstanceTableRecord[]) {
+  const topologies = uniqueValues(members.map((member) => String(member.topology || '').trim()).filter(Boolean))
+  return topologies[0] || '-'
+}
+
+function topologyLabel(value: string) {
+  const normalized = value.toLowerCase()
+  if (!value || value === '-') {
+    return '-'
+  }
+  if (normalized === 'standalone') {
+    return t('apps.standaloneMode')
+  }
+  return value
+}
+
+function groupInstalledStatus(members: AppInstanceTableRecord[]) {
+  if (members.some((member) => ['failed', 'install_failed', 'error', 'unavailable'].includes(String(member.status || '').toLowerCase()) || truthyValue(metadataOf(member).installFailed))) {
+    return 'failed'
+  }
+  return 'installed'
+}
+
+function appLabel(app: string) {
+  const item = apps.value.find((candidate) => candidate.name === app || candidate.installName === app)
+  return item?.title || app
+}
+
+function installTargetConflictReason(app: AppStoreItem | null, context: AppInstallValidationContext) {
+  if (!app || !context.selectedServers.length) {
+    return ''
+  }
+  const targetIds = new Set(context.selectedServers.map((server) => server.id))
+  const relatedApps = lifecycleRawAppNames(app.installName || app.name)
+  const conflicts = instances.value.filter((instance) => {
+    return targetIds.has(String(instance.serverId || '')) && relatedApps.has(String(instance.app || '').toLowerCase())
+  })
+  if (!conflicts.length) {
+    return ''
+  }
+  const conflictServers = uniqueValues(conflicts.map((instance) => serverLabel(instance.serverId)).filter((label) => label !== '-')).join(', ')
+  return t('apps.installTargetConflict', { app: app.title, servers: conflictServers })
+}
+
+function metadataOf(row: AppInstanceTableRecord): InstanceMetadata {
+  if (!row.metadata) {
+    return {}
+  }
+  try {
+    const parsed = JSON.parse(row.metadata)
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed as InstanceMetadata : {}
+  } catch {
+    return {}
+  }
+}
+
+function stringMeta(metadata: InstanceMetadata, key: string) {
+  const value = metadata[key]
+  return typeof value === 'string' ? value.trim() : ''
+}
+
+function truthyValue(value: unknown) {
+  return value === true || value === 1 || ['true', '1', 'yes', 'y'].includes(String(value ?? '').trim().toLowerCase())
+}
+
+function uniqueValues(values: string[]) {
+  const seen = new Set<string>()
+  const out: string[] = []
+  for (const value of values) {
+    const next = String(value ?? '').trim()
+    if (!next || seen.has(next)) {
+      continue
+    }
+    seen.add(next)
+    out.push(next)
+  }
+  return out
 }
 
 function displayVersion(app: AppStoreItem) {
@@ -281,6 +550,95 @@ async function checkDeploymentService(row: AppInstanceTableRecord) {
     ElMessage.success(t('apps.checkServiceAccepted'))
   } catch (err) {
     ElMessage.error(err instanceof Error ? err.message : t('apps.checkServiceFailed'))
+  }
+}
+
+function openUninstallGroup(group: InstalledAppGroup) {
+  if (!canManageApps.value) {
+    ElMessage.warning(deniedText.value)
+    return
+  }
+  pendingUninstallGroup.value = group
+  sameUninstallPassword.value = uninstallServers.value.length > 1
+  uninstallSharedPassword.value = ''
+  uninstallRemoveMountedDisks.value = false
+  uninstallPasswords.value = Object.fromEntries(uninstallServers.value.map((server) => [server.id, '']))
+  uninstallDialogVisible.value = true
+}
+
+function resetUninstallDialog() {
+  if (uninstallSubmitting.value) {
+    return
+  }
+  pendingUninstallGroup.value = null
+  uninstallSharedPassword.value = ''
+  uninstallPasswords.value = {}
+  uninstallRemoveMountedDisks.value = false
+  sameUninstallPassword.value = true
+}
+
+function handleSameUninstallPasswordToggle() {
+  if (sameUninstallPassword.value) {
+    uninstallSharedPassword.value = uninstallServers.value[0] ? uninstallPasswords.value[uninstallServers.value[0].id] || '' : ''
+    return
+  }
+  if (uninstallSharedPassword.value.trim()) {
+    uninstallPasswords.value = Object.fromEntries(uninstallServers.value.map((server) => [server.id, uninstallSharedPassword.value]))
+  }
+}
+
+function collectUninstallPasswords() {
+  const serversToConfirm = uninstallServers.value
+  if (!serversToConfirm.length) {
+    return null
+  }
+  if (sameUninstallPassword.value && serversToConfirm.length > 1) {
+    const password = uninstallSharedPassword.value.trim()
+    if (!password) {
+      return null
+    }
+    return Object.fromEntries(serversToConfirm.map((server) => [server.id, password]))
+  }
+  const out: Record<string, string> = {}
+  for (const server of serversToConfirm) {
+    const password = String(uninstallPasswords.value[server.id] || '').trim()
+    if (!password) {
+      return null
+    }
+    out[server.id] = password
+  }
+  return out
+}
+
+async function confirmUninstallGroup() {
+  const group = pendingUninstallGroup.value
+  if (!group) {
+    return
+  }
+  const passwords = collectUninstallPasswords()
+  if (!passwords) {
+    ElMessage.warning(t('database.deletePasswordsRequired'))
+    return
+  }
+  uninstallSubmitting.value = true
+  try {
+    const body: Record<string, unknown> = {
+      instanceIds: group.members.map((member) => member.id),
+      serverPasswords: passwords,
+      language: locale.value
+    }
+    if (uninstallUsesMountedDisks.value) {
+      body.removeMountedDisks = uninstallRemoveMountedDisks.value
+    }
+    const result = await apiPost<{ taskId: string }>('/apps/instances/batch-delete', body)
+    uninstallDialogVisible.value = false
+    ElMessage.success(t('apps.uninstallGroupAccepted', { count: group.members.length }))
+    taskProgress.track(result.taskId, `${t('apps.uninstallService')} ${group.appLabel}`)
+    await load()
+  } catch (err) {
+    ElMessage.error(err instanceof Error ? err.message : t('apps.deleteServiceFailed'))
+  } finally {
+    uninstallSubmitting.value = false
   }
 }
 
@@ -529,6 +887,38 @@ onMounted(load)
   margin: 3px 0 0;
   color: var(--aifar-text-secondary);
   font-size: 12px;
+}
+
+.installed-groups-table {
+  width: 100%;
+}
+
+.topology-cell {
+  min-width: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.uninstall-dialog {
+  display: grid;
+  gap: 12px;
+}
+
+.multi-secret-form {
+  display: grid;
+  gap: 4px;
+}
+
+.delete-disk-option {
+  margin-top: 4px;
+}
+
+.delete-disk-hint {
+  margin: 0;
+  color: var(--aifar-text-secondary);
+  font-size: 12px;
+  line-height: 18px;
 }
 
 .empty-panel {

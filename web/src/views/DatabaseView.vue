@@ -64,16 +64,6 @@
                     </el-button>
                   </span>
                 </el-tooltip>
-                <el-tooltip v-if="hasMysqlGroupDelete(group)" :content="deniedText" :disabled="canManageApps" placement="top">
-                  <span>
-                    <el-button size="small" type="danger" plain :disabled="!canManageApps" @click="openDeleteGroup(group, 'mysql-group')">{{ t('database.uninstallMysql') }}</el-button>
-                  </span>
-                </el-tooltip>
-                <el-tooltip v-if="hasRedisGroupDelete(group)" :content="deniedText" :disabled="canManageApps" placement="top">
-                  <span>
-                    <el-button size="small" type="danger" plain :disabled="!canManageApps" @click="openDeleteGroup(group, 'redis-group')">{{ t('database.uninstallRedisGroup') }}</el-button>
-                  </span>
-                </el-tooltip>
               </div>
             </div>
             <div class="db-grid">
@@ -106,11 +96,6 @@
                 <div class="node-tags">
                   <el-tag size="small" :type="roleTagType(node.role)" effect="plain">{{ node.roleLabel }}</el-tag>
                   <el-tag size="small" :type="nodeHealthType(node)">{{ nodeHealthLabel(node) }}</el-tag>
-                  <el-tooltip v-if="showNodeDeleteButton(group, node)" :content="deniedText" :disabled="canManageApps" placement="top">
-                    <span>
-                      <el-button size="small" type="danger" plain :disabled="!canManageApps" @click="openDeleteNodes([node], 'single')">{{ t('common.uninstall') }}</el-button>
-                    </span>
-                  </el-tooltip>
                 </div>
               </div>
             </div>
@@ -124,11 +109,6 @@
                 <div class="node-tags">
                   <el-tag size="small" :type="roleTagType(node.role)" effect="plain">{{ node.roleLabel }}</el-tag>
                   <el-tag size="small" :type="nodeHealthType(node)">{{ nodeHealthLabel(node) }}</el-tag>
-                  <el-tooltip v-if="showSentinelDeleteButton(group, node)" :content="deniedText" :disabled="canManageApps" placement="top">
-                    <span>
-                      <el-button size="small" type="danger" plain :disabled="!canManageApps" @click="openDeleteNodes([node], 'single')">{{ t('common.uninstall') }}</el-button>
-                    </span>
-                  </el-tooltip>
                 </div>
               </div>
             </div>
@@ -161,40 +141,6 @@
       </template>
     </div>
 
-    <el-dialog
-      v-model="deletePromptVisible"
-      :title="deletePromptTitle"
-      width="520px"
-      destroy-on-close
-      @closed="resetDeletePrompt"
-    >
-      <p v-if="deletePromptMessage" class="secret-confirm-message">{{ deletePromptMessage }}</p>
-      <el-form label-position="top" class="multi-secret-form">
-        <el-checkbox v-if="deleteServers.length > 1" v-model="sameDeletePassword" @change="handleSamePasswordToggle">{{ t('database.samePassword') }}</el-checkbox>
-        <el-form-item v-if="sameDeletePassword && deleteServers.length > 1" :label="t('database.samePasswordLabel')">
-          <el-input
-            v-model="deleteSharedPassword"
-            type="password"
-            :placeholder="t('apps.deleteServicePasswordPlaceholder')"
-            show-password
-            @keyup.enter="confirmDeleteScope"
-          />
-        </el-form-item>
-        <el-form-item v-for="server in visibleDeleteServers" v-else :key="server.id" :label="server.label">
-          <el-input
-            v-model="deletePasswords[server.id]"
-            type="password"
-            :placeholder="t('apps.deleteServicePasswordPlaceholder')"
-            show-password
-            @keyup.enter="confirmDeleteScope"
-          />
-        </el-form-item>
-      </el-form>
-      <template #footer>
-        <el-button :disabled="deleteSubmitting" @click="deletePromptVisible = false">{{ t('common.cancel') }}</el-button>
-        <el-button type="danger" :loading="deleteSubmitting" :disabled="!deleteServers.length" @click="confirmDeleteScope">{{ t('common.uninstall') }}</el-button>
-      </template>
-    </el-dialog>
   </section>
 </template>
 
