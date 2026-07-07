@@ -565,6 +565,10 @@ func (m *Manager) ensureDeployment(ctx context.Context, spec RuntimeSpec, deploy
 				}
 				continue
 			}
+			if err := m.ensureExistingContainerRunning(ctx, deployment, replica, name); err != nil {
+				m.setDeploymentStatusFromDocker(ctx, spec, deployment, "failed", err.Error())
+				return err
+			}
 		}
 		if !exists {
 			if err := m.runContainer(ctx, spec, deployment, replica, name); err != nil {
@@ -661,6 +665,39 @@ func (m *Manager) containerNeedsRecreate(ctx context.Context, name string, deplo
 	}
 	current := strings.TrimSpace(result.Stdout)
 	return current == "" || current != deploymentSpecHash(deployment), nil
+}
+
+func (m *Manager) ensureExistingContainerRunning(ctx context.Context, deployment DeploymentSpec, replica int, name string) error {
+	if _, err := m.runner.Run(ctx, "docker", "update", "--restart", "unless-stopped", name); err != nil {
+		logf(m.log, "AIFAR runtime pod restart policy update failed container=%s error=%v\n", name, err)
+	}
+	running, err := m.containerRunning(ctx, name)
+	if err != nil {
+		return err
+	}
+	if running {
+		return nil
+	}
+	if _, err := m.runner.Run(ctx, "docker", "start", name); err != nil {
+		return fmt.Errorf("start stopped AIFAR pod %s: %w", name, err)
+	}
+	if err := m.waitContainerReady(ctx, name); err != nil {
+		return err
+	}
+	logf(m.log, "AIFAR runtime pod recovered service=%s replica=%d container=%s\n", deployment.ServiceName, replica, name)
+	return nil
+}
+
+func (m *Manager) containerRunning(ctx context.Context, name string) (bool, error) {
+	result, err := m.runner.Run(ctx, "docker", "inspect", "-f", `{{.State.Running}}`, name)
+	if err != nil {
+		return false, fmt.Errorf("inspect AIFAR pod running state %s: %w", name, err)
+	}
+	state := strings.TrimSpace(result.Stdout)
+	if strings.Contains(state, "|") {
+		state = strings.TrimSpace(strings.SplitN(state, "|", 2)[0])
+	}
+	return strings.EqualFold(state, "true"), nil
 }
 
 func (m *Manager) runContainer(ctx context.Context, spec RuntimeSpec, deployment DeploymentSpec, replica int, name string) error {

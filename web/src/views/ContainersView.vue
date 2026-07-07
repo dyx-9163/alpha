@@ -52,12 +52,6 @@
         <div class="table-toolbar">
           <span class="selection-summary">{{ t('containers.selectedCount', { count: selectedContainerRows.length }) }}</span>
           <div class="toolbar-actions">
-            <el-switch
-              v-model="showAifarRuntimeInfra"
-              :active-text="t('containers.showRuntimeInfra')"
-              inline-prompt
-              class="runtime-infra-switch"
-            />
             <el-tooltip :content="batchActionDisabledReason" :disabled="!batchActionDisabledReason" placement="top">
               <span><el-button size="small" :disabled="batchActionDisabled" @click="runContainerBatchAction('start')">{{ t('containers.batchStart') }}</el-button></span>
             </el-tooltip>
@@ -104,9 +98,6 @@
                     </el-tooltip>
                     <el-tooltip :content="containerRemoveDisabledReason(row)" :disabled="!containerRemoveDisabledReason(row)" placement="top">
                       <span><el-button size="small" type="danger" plain :disabled="Boolean(containerRemoveDisabledReason(row))" @click="runContainerBatchAction('remove', [row])">{{ t('containers.uninstall') }}</el-button></span>
-                    </el-tooltip>
-                    <el-tooltip v-if="isAifarUpdatableContainer(row)" :content="aifarUpdateDisabledReason(row)" :disabled="!aifarUpdateDisabledReason(row)" placement="top">
-                      <span><el-button size="small" type="primary" plain :disabled="Boolean(aifarUpdateDisabledReason(row))" @click="openAifarUpdate(row)">{{ t('containers.updateService') }}</el-button></span>
                     </el-tooltip>
                   </template>
                   <el-tag v-else type="info" size="small">{{ t('containers.runtimeInfra') }}</el-tag>
@@ -244,6 +235,9 @@
                       <el-option v-for="service in installedRuntimeServiceNamesList" :key="service" :label="service" :value="service" />
                     </el-select>
                     <div class="runtime-tab-actions">
+                      <el-tooltip :content="aifarRuntimeActionDisabledReason" :disabled="!aifarRuntimeActionDisabledReason" placement="top">
+                        <span><el-button size="small" type="primary" plain :disabled="Boolean(aifarRuntimeActionDisabledReason)" @click="recoverAifarRuntimePods">{{ t('containers.recoverRuntimePods') }}</el-button></span>
+                      </el-tooltip>
                       <el-button size="small" :loading="loading" @click="ensureRuntimePodsLoaded(true)">{{ t('common.refresh') }}</el-button>
                       <el-button size="small" plain :loading="loading" @click="ensureRuntimePodsLoaded(true, true)">{{ t('containers.refreshPodStats') }}</el-button>
                     </div>
@@ -266,6 +260,11 @@
                     </el-table-column>
                     <el-table-column :label="t('containers.memory')" width="120">
                       <template #default="{ row }">{{ row.memoryUsage || percentText(row.memoryPercent) }}</template>
+                    </el-table-column>
+                    <el-table-column :label="t('common.operation')" width="90" fixed="right">
+                      <template #default="{ row }">
+                        <el-button size="small" @click="openRuntimePodLogs(row)">{{ t('containers.logs') }}</el-button>
+                      </template>
                     </el-table-column>
                   </el-table>
                 </div>
@@ -499,7 +498,7 @@
     <LogDrawer v-model="logsVisible" :title="t('containers.logs')" :text="logsText" :empty-text="t('tasks.noLogs')" />
     <el-dialog v-model="aifarUpdateVisible" :title="t('apps.aifarUpdateTitle')" width="560px" destroy-on-close>
       <el-form label-width="112px" class="aifar-update-form">
-        <el-form-item :label="t('containers.updateContainer')">
+        <el-form-item :label="t('containers.updateTarget')">
           <el-input :model-value="selectedAifarContainerLabel" disabled />
         </el-form-item>
         <el-form-item :label="t('apps.aifarUpdateInstance')">
@@ -855,13 +854,11 @@ let containerLogSource: EventSource | null = null
 const containerLogMaxLines = 3000
 const aifarUpdateVisible = ref(false)
 const aifarUpdateSubmitting = ref(false)
-const aifarUpdateContainer = ref<any | null>(null)
 const aifarUpdateInstanceOverride = ref<AppInstance | null>(null)
 const aifarUpdateTargetLabel = ref('')
 const aifarUpdateMode = ref<'single' | 'bundle'>('single')
 const aifarUpdateService = ref('oauth')
 const aifarArtifactFile = ref<File | null>(null)
-const showAifarRuntimeInfra = ref(false)
 const aifarRuntime = ref<AifarRuntimeResponse>({ runtimeStatus: 'unknown', agent: { status: 'unknown' }, instances: [], services: [], pods: [], ingress: [], warnings: [] })
 const selectedRuntimeInstanceId = ref('')
 const runtimeResourceTab = ref<'deployments' | 'services' | 'pods' | 'logs' | 'ingress'>('deployments')
@@ -946,12 +943,7 @@ const settingsItems = computed(() => [
 const selectedContainerIds = computed(() => selectedContainerRows.value.filter(containerRowSelectable).map((row) => String(row?.id ?? '').trim()).filter(Boolean))
 const selectedRunningContainers = computed(() => selectedContainerRows.value.filter((row) => containerRowSelectable(row) && isRunningContainer(row)))
 const selectedImageIds = computed(() => uniqueValues(selectedImageRows.value.map(imageReference).filter(Boolean)))
-const containerTableRows = computed(() => {
-  if (showAifarRuntimeInfra.value) {
-    return collection.value
-  }
-  return collection.value.filter((row) => !isAifarRuntimeInfraContainer(row))
-})
+const containerTableRows = computed(() => collection.value.filter((row) => !isAifarRuntimeInfraContainer(row)))
 const containerStateLabelKeys: Record<string, string> = {
   created: 'containers.state.created',
   restarting: 'containers.state.restarting',
@@ -1018,8 +1010,8 @@ const aifarServiceOptions = [
   'gateway',
   'web-vue3'
 ].map((name) => ({ value: name, label: name }))
-const selectedAifarUpdateInstance = computed(() => aifarUpdateInstanceOverride.value ?? aifarInstanceForContainer(aifarUpdateContainer.value))
-const selectedAifarContainerLabel = computed(() => aifarUpdateTargetLabel.value || containerDisplayName(aifarUpdateContainer.value) || '-')
+const selectedAifarUpdateInstance = computed(() => aifarUpdateInstanceOverride.value)
+const selectedAifarContainerLabel = computed(() => aifarUpdateTargetLabel.value || '-')
 const selectedAifarInstanceLabel = computed(() => {
   const instance = selectedAifarUpdateInstance.value
   if (!instance) {
@@ -2020,6 +2012,10 @@ function containerDisplayName(row: any) {
   return String(row?.name || row?.id || '').trim()
 }
 
+function normalizedContainerName(row: any) {
+  return containerDisplayName(row).replace(/^\/+/, '').toLowerCase()
+}
+
 function containerLabels(row: any): Record<string, string> {
   const labels = row?.labels
   if (!labels || typeof labels !== 'object' || Array.isArray(labels)) {
@@ -2030,7 +2026,11 @@ function containerLabels(row: any): Record<string, string> {
 
 function isAifarRuntimeInfraContainer(row: any) {
   const component = aifarComponentFromContainer(row)
-  return component === 'service-proxy' || component === 'ingress'
+  if (component) {
+    return true
+  }
+  const name = normalizedContainerName(row)
+  return Boolean(aifarServiceFromContainer(row) && (name.startsWith('aifar-pod-admin-') || name.startsWith('aifar-svc-admin-') || name === 'aifar-admin-ingress'))
 }
 
 function containerRowSelectable(row: any) {
@@ -2043,7 +2043,7 @@ function aifarServiceFromContainer(row: any) {
   if (aifarServiceOptions.some((item) => item.value === labelService)) {
     return labelService
   }
-  const name = containerDisplayName(row).toLowerCase()
+  const name = normalizedContainerName(row)
   const k8sMatch = aifarServiceOptions.find((item) =>
     name.startsWith(`aifar-pod-admin-${item.value}-`) || name === `aifar-svc-admin-${item.value}`
   )
@@ -2060,7 +2060,7 @@ function aifarComponentFromContainer(row: any) {
   if (component) {
     return component
   }
-  const name = containerDisplayName(row).toLowerCase()
+  const name = normalizedContainerName(row)
   if (name.startsWith('aifar-pod-admin-')) {
     return 'pod'
   }
@@ -2281,79 +2281,6 @@ function buildRuntimeServiceOverrides() {
   return services
 }
 
-function isAifarUpdatableContainer(row: any) {
-  const labels = containerLabels(row)
-  if (String(labels['aifar.app'] || '').trim() === 'aifar' && aifarComponentFromContainer(row) === 'pod' && aifarServiceFromContainer(row)) {
-    return true
-  }
-  const name = containerDisplayName(row).toLowerCase()
-  return Boolean(aifarComponentFromContainer(row) === 'pod' && aifarServiceFromContainer(row) && name.startsWith('aifar-pod-admin-'))
-}
-
-function metadataOf(instance: AppInstance): Record<string, any> {
-  if (!instance.metadata) {
-    return {}
-  }
-  try {
-    const parsed = JSON.parse(instance.metadata)
-    return parsed && typeof parsed === 'object' ? parsed : {}
-  } catch {
-    return {}
-  }
-}
-
-function aifarInstanceForContainer(row: any) {
-  if (!row) {
-    return null
-  }
-  const labels = containerLabels(row)
-  const installRoot = normalizeInstallRoot(String(labels['aifar.install-root'] || ''))
-  const candidates = appInstances.value.filter((item) => item.app === 'aifar' && item.serverId === selectedServerId.value)
-  if (installRoot) {
-    const exact = candidates.filter((item) => normalizeInstallRoot(String(metadataOf(item).installRoot || '')) === installRoot)
-    const matched = exact.find((item) => String(metadataOf(item).orchestrationModel || '').trim() === AIFAR_RUNTIME_MODEL) ?? exact[0]
-    if (matched) {
-      return matched
-    }
-    return null
-  }
-  const k8sCandidates = candidates.filter((item) => String(metadataOf(item).orchestrationModel || '').trim() === AIFAR_RUNTIME_MODEL)
-  if (k8sCandidates.length === 1) {
-    return k8sCandidates[0]
-  }
-  return candidates.length === 1 ? candidates[0] : null
-}
-
-function normalizeInstallRoot(value: string) {
-  let text = String(value || '').trim()
-  while (text.length > 1 && text.endsWith('/')) {
-    text = text.slice(0, -1)
-  }
-  return text
-}
-
-function aifarUpdateDisabledReason(row: any) {
-  if (!canManageApps.value) return deniedText.value
-  if (!aifarServiceFromContainer(row)) return t('containers.updateServiceUnknown')
-  if (!aifarInstanceForContainer(row)) return t('containers.updateServiceInstanceMissing')
-  return ''
-}
-
-function openAifarUpdate(row: any) {
-  const reason = aifarUpdateDisabledReason(row)
-  if (reason) {
-    ElMessage.warning(reason)
-    return
-  }
-  aifarUpdateContainer.value = row
-  aifarUpdateInstanceOverride.value = null
-  aifarUpdateTargetLabel.value = ''
-  aifarUpdateMode.value = 'single'
-  aifarUpdateService.value = aifarServiceFromContainer(row) || 'oauth'
-  aifarArtifactFile.value = null
-  aifarUpdateVisible.value = true
-}
-
 function openAifarRuntimeServiceUpdate(row: AifarRuntimeService) {
   const reason = aifarRuntimeActionDisabledReason.value
   if (reason) {
@@ -2365,7 +2292,6 @@ function openAifarRuntimeServiceUpdate(row: AifarRuntimeService) {
     ElMessage.warning(t('containers.updateServiceInstanceMissing'))
     return
   }
-  aifarUpdateContainer.value = null
   aifarUpdateInstanceOverride.value = instance
   aifarUpdateTargetLabel.value = row.serviceName
   aifarUpdateMode.value = 'single'
@@ -2385,7 +2311,6 @@ function openAifarRuntimeBundleUpdate() {
     ElMessage.warning(t('containers.updateServiceInstanceMissing'))
     return
   }
-  aifarUpdateContainer.value = null
   aifarUpdateInstanceOverride.value = instance
   aifarUpdateTargetLabel.value = t('containers.bundleUpdate')
   aifarUpdateMode.value = 'bundle'
@@ -2499,7 +2424,7 @@ async function submitRuntimeConfig() {
   }
 }
 
-async function reconcileAifarRuntime() {
+async function submitRuntimeReconcile(labelKey: string, confirmKey: string) {
   const reason = aifarRuntimeActionDisabledReason.value
   if (reason) {
     ElMessage.warning(reason)
@@ -2511,9 +2436,9 @@ async function reconcileAifarRuntime() {
     return
   }
   try {
-    await ElMessageBox.confirm(t('containers.confirmReconcileRuntime'), t('containers.reconcileRuntime'), {
+    await ElMessageBox.confirm(t(confirmKey), t(labelKey), {
       type: 'warning',
-      confirmButtonText: t('containers.reconcileRuntime'),
+      confirmButtonText: t(labelKey),
       cancelButtonText: t('common.cancel')
     })
   } catch {
@@ -2523,11 +2448,34 @@ async function reconcileAifarRuntime() {
   try {
     const result = await apiPost<{ taskId: string }>(`/containers/aifar/runtime/reconcile?${query}`, { instanceId })
     ElMessage.success(t('containers.runtimeActionAccepted'))
-    trackTask(result.taskId, t('containers.reconcileRuntime'))
+    trackTask(result.taskId, t(labelKey))
     void loadAifarRuntime(true)
   } catch (err) {
     ElMessage.error(err instanceof Error ? err.message : t('containers.runtimeActionFailed'))
   }
+}
+
+async function reconcileAifarRuntime() {
+  await submitRuntimeReconcile('containers.reconcileRuntime', 'containers.confirmReconcileRuntime')
+}
+
+async function recoverAifarRuntimePods() {
+  await submitRuntimeReconcile('containers.recoverRuntimePods', 'containers.confirmRecoverRuntimePods')
+}
+
+function openRuntimePodLogs(row: AifarRuntimePod) {
+  const service = String(row?.serviceName || '').trim()
+  const pod = String(row?.containerName || '').trim()
+  if (!service && !pod) {
+    ElMessage.warning(t('containers.selectRuntimeLogScope'))
+    return
+  }
+  runtimeResourceTab.value = 'logs'
+  runtimeLogServiceFilter.value = service ? [service] : []
+  runtimeLogPodFilter.value = pod ? [pod] : []
+  runtimeLogLevelFilter.value = []
+  runtimeLogKeyword.value = ''
+  void nextTick().then(() => loadRuntimeLogs(true))
 }
 
 async function cleanupAifarRuntimeStale() {
@@ -3090,10 +3038,6 @@ onBeforeUnmount(() => {
   flex-wrap: wrap;
   justify-content: flex-end;
   gap: 8px;
-}
-
-.runtime-infra-switch {
-  margin-right: 4px;
 }
 
 .container-table-body {

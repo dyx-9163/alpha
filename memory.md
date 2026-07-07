@@ -993,3 +993,7 @@
 - 结论：是的；AIFAR 实例安装根为 `/aifar/apps/admin` 时，模板中 `RUNTIME_DIR="$INSTALL_ROOT/runtime"`、`LOG_DIR="$RUNTIME_DIR/logs"`、`log_dir="$LOG_DIR/$service"`，所以宿主机 source 是 `/aifar/apps/admin/runtime/logs/<service>`；`/opt/aifar/logs` 等路径只是容器内 target。
 - 问题：用户反馈容器页切到 AIFAR Runtime 后内容区变成空白。
 - 结论：原因是日志页滚动修复把 `.runtime-workspace` 和 `.runtime-resource-tabs` 的 `flex: 1 1 0`、`height: 100%`、`overflow: hidden` 应用到了整个 AIFAR Runtime 页，普通页签在自适应高度父容器中被裁成 0 高度；已将这些高度锁定只限定到 `.containers-main.is-runtime-logs`，普通 AIFAR Runtime 页恢复自适应显示。
+
+## 2026-07-08
+- 问题：用户询问 AIFAR Pod 容器页签是否应归入 AIFAR Runtime，并要求服务器重启后容器自动启动、Pods 可一键启动，同时检查更新逻辑。
+- 结论：AIFAR Pod 属于 agent 期望态管理，普通 Docker 容器页不再展示/更新 AIFAR Runtime 容器；AIFAR Runtime 的 Pods 页新增“启动/恢复 Pods”和 Pod 日志入口，顶部“重建入口”改为“同步运行时”。后端 agent reconcile 会校正已有 Pod restart policy，并在发现期望 Pod 存在但停止时执行 `docker start`、等待健康、刷新 endpoint；更新入口保留在 Runtime Deployment/批量包层，不再从普通容器行反推发布单元。
