@@ -973,3 +973,5 @@
 - 结论：原 SSE 后端仍是周期性 `docker logs` 拉取，不是真正的后端增量流。已改为 Runtime 日志 SSE 启动多 Pod `docker logs --follow` 扇入流，覆盖 Docker API、SSH 和本机 CLI 通道，并保留 snapshot overlap 去重；`go test ./...` 和 `git diff --check` 通过。
 - 问题：用户询问本次 Runtime 日志实时修复是否需要重新构建并部署 `aifar-agent-linux-amd64` 到服务端。
 - 结论：本次日志自动刷新修复只改面板后端 `aifar-server` 的 Docker 日志读取与 SSE 推送链路，不涉及 `aifar-agent`/Runtime agent 二进制；只需重建并重启面板后端。若目标机尚未部署此前 agent/runtime 相关功能变更，再另行更新 agent。
+- 问题：用户反馈 AIFAR Runtime 日志页动态刷新后仍使用外层页面滚动条，应该改为日志窗口内部滚动。
+- 结论：已把容器页 AIFAR Runtime 日志页签改为专用内部滚动布局：外层 workspace 在日志页隐藏溢出，Runtime tabs/content/panel 保持 flex 高度链路，日志虚拟列表固定 32px 行高并使用内部纵向/横向滚动；`pnpm web:build` 和 `git diff --check` 通过。

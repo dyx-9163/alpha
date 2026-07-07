@@ -27,7 +27,7 @@
     <el-alert v-if="error" :title="errorTitle" :description="error" type="warning" :closable="false" show-icon />
     <div class="muted-strip" v-if="!summary.available">{{ t('containers.disabledHint') }}</div>
 
-    <div class="workspace-card containers-main" v-loading="loading">
+    <div class="workspace-card containers-main" :class="{ 'is-runtime-logs': tab === 'aifar-runtime' && runtimeResourceTab === 'logs' }" v-loading="loading">
       <template v-if="tab === 'overview'">
         <MetricGrid :items="metrics" />
 
@@ -271,7 +271,7 @@
                 </div>
               </el-tab-pane>
               <el-tab-pane :label="t('containers.logs')" name="logs">
-                <div class="runtime-resource-panel">
+                <div class="runtime-resource-panel runtime-log-panel">
                   <div class="runtime-tab-toolbar">
                     <div class="runtime-log-filters">
                       <el-select
@@ -2989,6 +2989,10 @@ onBeforeUnmount(() => {
   padding: 10px;
 }
 
+.containers-main.is-runtime-logs {
+  overflow: hidden;
+}
+
 .sub-panel {
   border: 1px solid var(--aifar-border-soft);
   border-radius: var(--aifar-radius-lg);
@@ -3088,6 +3092,7 @@ onBeforeUnmount(() => {
   min-height: 0;
   flex-direction: column;
   gap: 10px;
+  overflow: hidden;
 }
 
 .runtime-toolbar {
@@ -3117,13 +3122,19 @@ onBeforeUnmount(() => {
   flex-direction: column;
 }
 
+.runtime-resource-tabs :deep(.el-tabs__header) {
+  flex: 0 0 auto;
+}
+
 .runtime-resource-tabs :deep(.el-tabs__content) {
   flex: 1 1 auto;
   min-height: 0;
+  overflow: hidden;
 }
 
 .runtime-resource-tabs :deep(.el-tab-pane) {
   height: 100%;
+  min-height: 0;
 }
 
 .runtime-resource-panel {
@@ -3132,6 +3143,16 @@ onBeforeUnmount(() => {
   display: flex;
   flex-direction: column;
   gap: 8px;
+}
+
+.runtime-log-panel {
+  min-height: 0;
+  overflow: hidden;
+}
+
+.runtime-log-panel .runtime-tab-toolbar,
+.runtime-log-panel > .el-alert {
+  flex: 0 0 auto;
 }
 
 .runtime-tab-toolbar {
@@ -3195,9 +3216,11 @@ onBeforeUnmount(() => {
   display: flex;
   flex-direction: column;
   gap: 8px;
+  overflow: hidden;
 }
 
 .runtime-log-pod-strip {
+  flex: 0 0 auto;
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
@@ -3239,6 +3262,7 @@ onBeforeUnmount(() => {
 }
 
 .runtime-log-stats {
+  flex: 0 0 auto;
   display: flex;
   align-items: center;
   gap: 12px;
@@ -3250,7 +3274,11 @@ onBeforeUnmount(() => {
 .runtime-log-virtual-list {
   flex: 1 1 auto;
   min-height: 0;
+  height: 100%;
+  max-height: 100%;
   overflow: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
   border: 1px solid #17243a;
   border-radius: var(--aifar-radius);
   background: #08111f;
@@ -3258,10 +3286,14 @@ onBeforeUnmount(() => {
 
 .runtime-log-row {
   display: grid;
-  grid-template-columns: 190px 108px minmax(180px, 260px) 72px minmax(320px, 1fr);
+  grid-template-columns: 190px 108px 260px 72px max-content;
   gap: 8px;
-  align-items: start;
+  align-items: center;
+  width: max-content;
+  min-width: 100%;
+  height: 32px;
   min-height: 32px;
+  box-sizing: border-box;
   padding: 6px 10px;
   border-bottom: 1px solid rgba(148, 163, 184, 0.14);
   color: #dbeafe;
@@ -3322,9 +3354,10 @@ onBeforeUnmount(() => {
 }
 
 .runtime-log-message {
-  min-width: 0;
-  word-break: break-all;
-  white-space: pre-wrap;
+  min-width: 560px;
+  overflow: visible;
+  word-break: normal;
+  white-space: pre;
 }
 
 .runtime-entry-grid {
@@ -3495,8 +3528,12 @@ onBeforeUnmount(() => {
   }
 
   .runtime-log-row {
-    grid-template-columns: 160px 96px 220px 72px minmax(280px, 1fr);
-    min-width: 860px;
+    grid-template-columns: 160px 96px 220px 72px max-content;
+    min-width: 100%;
+  }
+
+  .runtime-log-message {
+    min-width: 420px;
   }
 
   .runtime-log-pod-chip {
