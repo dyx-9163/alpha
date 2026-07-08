@@ -35,7 +35,7 @@ func TestNacosOptionsDefaultDatabaseNameAndUser(t *testing.T) {
 	options := nacosOptions(map[string]any{
 		"dbHost":     "192.168.1.10",
 		"dbPassword": "Oversea.123",
-	}, "cluster")
+	}, "standalone")
 	if options.Database.Name != "aifar_nacos" {
 		t.Fatalf("expected default database name aifar_nacos, got %q", options.Database.Name)
 	}
@@ -47,6 +47,15 @@ func TestNacosOptionsDefaultDatabaseNameAndUser(t *testing.T) {
 	}
 	if err := options.Validate(); err != nil {
 		t.Fatalf("Validate returned error: %v", err)
+	}
+}
+
+func TestNacosOptionsRejectClusterLocalDatabase(t *testing.T) {
+	options := nacosOptions(map[string]any{
+		"dbSource": "local",
+	}, "cluster")
+	if err := options.Validate(); err == nil {
+		t.Fatalf("expected cluster local database validation error")
 	}
 }
 

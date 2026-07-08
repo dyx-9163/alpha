@@ -52,6 +52,10 @@ dump_nacos_diagnostics() {
   done
 }
 
+nacos_is_ready() {
+  curl -fsS --max-time 3 "http://127.0.0.1:$PORT/nacos/v1/console/health/readiness" >/dev/null 2>&1
+}
+
 nacos_access_token() {
   USERNAME="$1"
   PASSWORD="$2"
@@ -84,20 +88,13 @@ nacos_update_user() {
     --data-urlencode "newPassword=$NACOS_PASSWORD" >/dev/null 2>&1
 }
 
-configure_nacos_admin_user() {
-  [ -n "$NACOS_USER" ] || { echo "Nacos admin user is required"; exit 1; }
-  [ -n "$NACOS_PASSWORD" ] || { echo "Nacos admin password is required"; exit 1; }
-  command -v curl >/dev/null 2>&1 || { echo "curl is required to configure Nacos credentials"; exit 1; }
-
+nacos_try_configure_admin_user() {
   TOKEN="$(nacos_access_token "$NACOS_USER" "$NACOS_PASSWORD")"
   [ -n "$TOKEN" ] && return 0
 
   TOKEN="$(nacos_access_token nacos nacos)"
   if [ -z "$TOKEN" ]; then
-    if ! nacos_create_user ""; then
-      echo "unable to authenticate to Nacos for credential configuration"
-      exit 1
-    fi
+    nacos_create_user "" || return 1
   elif [ "$NACOS_USER" = "nacos" ]; then
     nacos_update_user "$TOKEN" || true
   else
@@ -105,12 +102,43 @@ configure_nacos_admin_user() {
   fi
 
   TOKEN="$(nacos_access_token "$NACOS_USER" "$NACOS_PASSWORD")"
-  [ -n "$TOKEN" ] || { echo "Nacos credential verification failed"; exit 1; }
+  [ -n "$TOKEN" ]
+}
+
+configure_nacos_admin_user() {
+  [ -n "$NACOS_USER" ] || { echo "Nacos admin user is required"; exit 1; }
+  [ -n "$NACOS_PASSWORD" ] || { echo "Nacos admin password is required"; exit 1; }
+  command -v curl >/dev/null 2>&1 || { echo "curl is required to configure Nacos credentials"; exit 1; }
+
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60; do
+    if nacos_try_configure_admin_user; then
+      return 0
+    fi
+    case "$i" in
+      1|10|20|30|40|50|60)
+        echo "waiting for Nacos auth API to accept credential configuration ($i/60)"
+        ;;
+    esac
+    sleep 2
+  done
+
+  if nacos_is_ready; then
+    echo "warning: unable to authenticate to Nacos for credential configuration after retries; Nacos readiness is OK, continuing"
+    return 0
+  fi
+
+  echo "unable to authenticate to Nacos for credential configuration"
+  exit 1
 }
 
 echo "checking Nacos install commands"
 command -v tar >/dev/null 2>&1 || { echo "tar is required"; exit 1; }
 command -v find >/dev/null 2>&1 || { echo "find is required"; exit 1; }
+command -v curl >/dev/null 2>&1 || { echo "curl is required"; exit 1; }
+if [ "$MODE" = "cluster" ] && [ "$DB_ENABLED" != "1" ]; then
+  echo "Nacos cluster mode requires MySQL database configuration"
+  exit 1
+fi
 
 echo "preparing Nacos install directories"
 $SUDO systemctl disable --now "$SERVICE_NAME" >/dev/null 2>&1 || true
@@ -184,6 +212,8 @@ if [ "$MODE" = "cluster" ]; then
 {{range .ClusterNodes}}{{.Host}}:{{.Port}}
 {{end}}CONF
   $SUDO install -m 0644 "$WORK_DIR/cluster.conf" "$NACOS_HOME/conf/cluster.conf"
+else
+  $SUDO rm -f "$NACOS_HOME/conf/cluster.conf"
 fi
 
 if [ "$DB_ENABLED" = "1" ] && [ "$INIT_DATABASE" = "1" ]; then
@@ -237,17 +267,21 @@ fi
 
 echo "waiting for Nacos readiness"
 READY=0
+PORT_LISTENING=0
 for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do
-  if command -v curl >/dev/null 2>&1 && curl -fsS --max-time 3 "http://127.0.0.1:$PORT/nacos/v1/console/health/readiness" >/dev/null 2>&1; then
+  if nacos_is_ready; then
     READY=1
     break
   fi
   if command -v ss >/dev/null 2>&1 && ss -lnt | awk '{print $4}' | grep -Eq "(:|\\.)$PORT$"; then
-    READY=1
-    break
+    PORT_LISTENING=1
   fi
   sleep 2
 done
+if [ "$READY" != "1" ] && [ "$PORT_LISTENING" = "1" ]; then
+  echo "Nacos readiness endpoint is not healthy yet, but port $PORT is listening; continuing to credential retries"
+  READY=1
+fi
 if [ "$READY" != "1" ]; then
   echo "Nacos is not reachable after installation"
   if [ "$START_FAILED" = "1" ]; then

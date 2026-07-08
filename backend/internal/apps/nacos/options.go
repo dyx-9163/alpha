@@ -73,6 +73,9 @@ func (o InstallOptions) Validate() error {
 	if o.Port <= 0 || o.Port > 65535 {
 		return fmt.Errorf("invalid Nacos port: %d", o.Port)
 	}
+	if o.Topology == "cluster" && !o.Database.Enabled {
+		return errors.New("Nacos cluster mode requires a MySQL database source; choose an existing or manual MySQL database")
+	}
 	for label, port := range map[string]int{"Nacos gRPC port": o.GRPCPort, "Nacos gRPC raft port": o.GRPCRaftPort, "Nacos raft port": o.RaftPort} {
 		if port <= 0 || port > 65535 {
 			return fmt.Errorf("invalid %s: %d", label, port)

@@ -25,6 +25,25 @@ if [ "$(id -u)" != "0" ]; then
   SUDO="sudo -n"
 fi
 
+dump_mysql_diagnostics() {
+  echo "MySQL systemd status"
+  $SUDO systemctl --no-pager --full status "$SERVICE_NAME" || true
+  $SUDO journalctl -u "$SERVICE_NAME" -n 120 --no-pager || true
+  if [ -f "$LOG_DIR/mysql-error.log" ]; then
+    echo "----- $LOG_DIR/mysql-error.log -----"
+    $SUDO tail -n 160 "$LOG_DIR/mysql-error.log" || true
+  fi
+  if command -v ss >/dev/null 2>&1; then
+    echo "----- listening TCP ports for MySQL -----"
+    ss -lnt | awk '{print $4}' | grep -E "(:|\\.)$PORT$" || true
+  fi
+  if [ -S "$SOCKET_FILE" ]; then
+    echo "MySQL socket exists: $SOCKET_FILE"
+  else
+    echo "MySQL socket missing: $SOCKET_FILE"
+  fi
+}
+
 {{ serviceAccessHelpers }}
 
 echo "checking MySQL binary install commands"
@@ -166,7 +185,6 @@ Group=$MYSQL_USER
 WorkingDirectory=$INSTALL_ROOT
 Environment=LD_LIBRARY_PATH=$MYSQL_BASE/lib
 ExecStart=$MYSQL_BASE/bin/mysqld --defaults-file=$CONFIG_FILE
-ExecStop=/bin/kill -TERM \$MAINPID
 Restart=always
 RestartSec=3
 LimitNOFILE=65536
@@ -180,36 +198,47 @@ echo "enabling and starting MySQL"
 $SUDO systemctl daemon-reload
 if ! $SUDO systemctl enable --now "$SERVICE_NAME"; then
   echo "MySQL service failed to start"
-  $SUDO systemctl --no-pager --full status "$SERVICE_NAME" || true
-  $SUDO journalctl -u "$SERVICE_NAME" -n 120 --no-pager || true
+  dump_mysql_diagnostics
   exit 1
 fi
 
 echo "waiting for MySQL service readiness"
-MYSQL_SOCKET_READY=0
-for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do
+MYSQL_BOOTSTRAP_READY=0
+MYSQL_BOOTSTRAP_PROTOCOL=""
+for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64 65 66 67 68 69 70 71 72 73 74 75 76 77 78 79 80 81 82 83 84 85 86 87 88 89 90 91 92 93 94 95 96 97 98 99 100 101 102 103 104 105 106 107 108 109 110 111 112 113 114 115 116 117 118 119 120; do
   if [ "$NEED_SECURE" = "1" ]; then
     if "$MYSQL_BASE/bin/mysqladmin" --protocol=socket --socket="$SOCKET_FILE" -uroot ping >/dev/null 2>&1; then
-      MYSQL_SOCKET_READY=1
+      MYSQL_BOOTSTRAP_READY=1
+      MYSQL_BOOTSTRAP_PROTOCOL="socket"
+      break
+    fi
+    if "$MYSQL_BASE/bin/mysqladmin" --protocol=tcp -h 127.0.0.1 -P "$PORT" -uroot ping >/dev/null 2>&1; then
+      MYSQL_BOOTSTRAP_READY=1
+      MYSQL_BOOTSTRAP_PROTOCOL="tcp"
       break
     fi
   else
     if MYSQL_PWD="$ROOT_PASSWORD" "$MYSQL_BASE/bin/mysqladmin" --protocol=tcp -h 127.0.0.1 -P "$PORT" -u "$ROOT_USER" ping >/dev/null 2>&1; then
-      MYSQL_SOCKET_READY=1
+      MYSQL_BOOTSTRAP_READY=1
+      MYSQL_BOOTSTRAP_PROTOCOL="tcp"
       break
     fi
   fi
+  case "$i" in
+    30|60|90)
+      echo "still waiting for MySQL readiness ($i/120)"
+      ;;
+  esac
   sleep 1
 done
-if [ "$MYSQL_SOCKET_READY" != "1" ]; then
+if [ "$MYSQL_BOOTSTRAP_READY" != "1" ]; then
   if [ "$NEED_SECURE" = "1" ]; then
-    echo "MySQL socket is not ready after installation"
+    echo "MySQL bootstrap connection is not ready after installation"
   else
     echo "Existing MySQL data directory is present, but configured administrator credentials could not connect"
     echo "Use the original administrator password, or uninstall/remove the existing MySQL data directory before reinstalling"
   fi
-  $SUDO systemctl --no-pager --full status "$SERVICE_NAME" || true
-  $SUDO journalctl -u "$SERVICE_NAME" -n 120 --no-pager || true
+  dump_mysql_diagnostics
   exit 1
 fi
 
@@ -227,13 +256,17 @@ GRANT ALL PRIVILEGES ON *.* TO '$SQL_USER'@'%' WITH GRANT OPTION;
 GRANT ALL PRIVILEGES ON *.* TO '$SQL_USER'@'127.0.0.1' WITH GRANT OPTION;
 FLUSH PRIVILEGES;
 SQL
-  "$MYSQL_BASE/bin/mysql" --protocol=socket --socket="$SOCKET_FILE" -uroot < "$WORK_DIR/secure-root.sql"
+  if [ "$MYSQL_BOOTSTRAP_PROTOCOL" = "tcp" ]; then
+    "$MYSQL_BASE/bin/mysql" --protocol=tcp -h 127.0.0.1 -P "$PORT" -uroot < "$WORK_DIR/secure-root.sql"
+  else
+    "$MYSQL_BASE/bin/mysql" --protocol=socket --socket="$SOCKET_FILE" -uroot < "$WORK_DIR/secure-root.sql"
+  fi
   rm -f "$WORK_DIR/secure-root.sql"
 fi
 
 echo "verifying MySQL service"
 MYSQL_READY=0
-for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60; do
   if MYSQL_PWD="$ROOT_PASSWORD" "$MYSQL_BASE/bin/mysqladmin" --protocol=tcp -h 127.0.0.1 -P "$PORT" -u "$ROOT_USER" ping >/dev/null 2>&1; then
     MYSQL_READY=1
     break
@@ -242,8 +275,7 @@ for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
 done
 if [ "$MYSQL_READY" != "1" ]; then
   echo "MySQL is not reachable with configured administrator credentials"
-  $SUDO systemctl --no-pager --full status "$SERVICE_NAME" || true
-  $SUDO journalctl -u "$SERVICE_NAME" -n 120 --no-pager || true
+  dump_mysql_diagnostics
   exit 1
 fi
 

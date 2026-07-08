@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"aifar-deployment/backend/internal/apps/registry"
@@ -122,7 +123,12 @@ func (a *API) resolveCredentialParameters(r *http.Request, parameters map[string
 	return out, nil
 }
 
-func (a *API) bindInstallCredentialReferences(app string, req registry.InstallRequest) {
+func (a *API) bindInstallCredentialReferences(app string, req registry.InstallRequest, log registry.Logger) {
+	a.bindSelectedInstallCredentialReferences(app, req)
+	a.registerGeneratedInstallCredentials(app, req, log)
+}
+
+func (a *API) bindSelectedInstallCredentialReferences(app string, req registry.InstallRequest) {
 	references := map[string]string{
 		"rootCredentialId":  "admin",
 		"dbCredentialId":    "database",
@@ -141,6 +147,193 @@ func (a *API) bindInstallCredentialReferences(app string, req registry.InstallRe
 			a.bindCredentialToLatestInstance(id, app, serverID, purpose, false)
 		}
 	}
+}
+
+type generatedInstallCredentialSpec struct {
+	Kind           string
+	Username       string
+	SecretKey      string
+	SecretValue    string
+	Purpose        string
+	EndpointScheme string
+	DefaultPort    int
+	NacosPath      bool
+}
+
+func (a *API) registerGeneratedInstallCredentials(app string, req registry.InstallRequest, log registry.Logger) {
+	spec, ok := generatedInstallCredentialSpecFor(app, req.Parameters)
+	if !ok {
+		return
+	}
+	for _, serverID := range req.TargetServerIDs() {
+		instance, ok := a.latestAppInstanceForServer(app, serverID)
+		if !ok {
+			continue
+		}
+		endpoint := a.credentialEndpointForInstance(instance, spec)
+		name := generatedCredentialName(spec, endpoint, serverID)
+		credential, err := a.store.SaveCredential(store.Credential{
+			Name:          name,
+			Kind:          spec.Kind,
+			Username:      spec.Username,
+			Endpoint:      endpoint,
+			Scope:         "app-instance",
+			Status:        "active",
+			App:           spec.Kind,
+			ServerID:      serverID,
+			AppInstanceID: instance.ID,
+			Purpose:       spec.Purpose,
+			Tags:          "generated,install",
+			Secret:        map[string]string{spec.SecretKey: spec.SecretValue},
+			CreatedBy:     req.Actor,
+		})
+		if err != nil {
+			if log != nil {
+				log.Error(i18n.Text(req.Language, "api.credentialAutoRegisterFailed"), spec.Kind, instance.ID, err)
+			}
+			continue
+		}
+		if _, err := a.store.BindCredential(store.CredentialBinding{
+			CredentialID:  credential.ID,
+			AppInstanceID: instance.ID,
+			Purpose:       spec.Purpose,
+			ServiceName:   spec.Kind,
+		}); err != nil {
+			if log != nil {
+				log.Error(i18n.Text(req.Language, "api.credentialAutoRegisterFailed"), spec.Kind, instance.ID, err)
+			}
+			continue
+		}
+		if log != nil {
+			log.Info(i18n.Text(req.Language, "api.credentialAutoRegistered"), spec.Kind, credential.Name)
+		}
+	}
+}
+
+func generatedInstallCredentialSpecFor(app string, params map[string]any) (generatedInstallCredentialSpec, bool) {
+	app = strings.ToLower(strings.TrimSpace(app))
+	switch app {
+	case "mysql":
+		if firstCredentialParam(params, "rootCredentialId", "mysqlCredentialId") != "" {
+			return generatedInstallCredentialSpec{}, false
+		}
+		password := firstCredentialParam(params, "rootPassword", "password", "mysqlPassword")
+		if password == "" {
+			return generatedInstallCredentialSpec{}, false
+		}
+		return generatedInstallCredentialSpec{
+			Kind:        "mysql",
+			Username:    paramString(params, "rootUser", "root"),
+			SecretKey:   "password",
+			SecretValue: password,
+			Purpose:     "admin",
+			DefaultPort: paramInt(params, "port", 3306),
+		}, true
+	case "redis":
+		if firstCredentialParam(params, "redisCredentialId") != "" {
+			return generatedInstallCredentialSpec{}, false
+		}
+		password := firstCredentialParam(params, "password", "redisPassword")
+		if password == "" {
+			return generatedInstallCredentialSpec{}, false
+		}
+		return generatedInstallCredentialSpec{
+			Kind:           "redis",
+			Username:       paramString(params, "redisUser", "default"),
+			SecretKey:      "password",
+			SecretValue:    password,
+			Purpose:        "redis",
+			EndpointScheme: "redis",
+			DefaultPort:    paramInt(params, "port", 6379),
+		}, true
+	case "minio":
+		if firstCredentialParam(params, "rootCredentialId", "minioCredentialId") != "" {
+			return generatedInstallCredentialSpec{}, false
+		}
+		password := firstCredentialParam(params, "rootPassword", "password", "minioPassword")
+		if password == "" {
+			return generatedInstallCredentialSpec{}, false
+		}
+		return generatedInstallCredentialSpec{
+			Kind:           "minio",
+			Username:       paramString(params, "rootUser", "admin"),
+			SecretKey:      "secretKey",
+			SecretValue:    password,
+			Purpose:        "minio",
+			EndpointScheme: "http",
+			DefaultPort:    paramInt(params, "apiPort", 9000),
+		}, true
+	case "nacos":
+		if firstCredentialParam(params, "nacosCredentialId") != "" {
+			return generatedInstallCredentialSpec{}, false
+		}
+		password := firstCredentialParam(params, "nacosPassword")
+		if password == "" {
+			return generatedInstallCredentialSpec{}, false
+		}
+		return generatedInstallCredentialSpec{
+			Kind:           "nacos",
+			Username:       paramString(params, "nacosUser", "nacos"),
+			SecretKey:      "password",
+			SecretValue:    password,
+			Purpose:        "nacos",
+			EndpointScheme: "http",
+			DefaultPort:    paramInt(params, "port", 8848),
+			NacosPath:      true,
+		}, true
+	default:
+		return generatedInstallCredentialSpec{}, false
+	}
+}
+
+func (a *API) latestAppInstanceForServer(app, serverID string) (store.AppInstance, bool) {
+	instances, err := a.store.ListAppInstances()
+	if err != nil {
+		return store.AppInstance{}, false
+	}
+	var selected store.AppInstance
+	for _, item := range instances {
+		if item.App != app || item.ServerID != serverID {
+			continue
+		}
+		if selected.ID == "" || item.UpdatedAt.After(selected.UpdatedAt) {
+			selected = item
+		}
+	}
+	return selected, selected.ID != ""
+}
+
+func (a *API) credentialEndpointForInstance(instance store.AppInstance, spec generatedInstallCredentialSpec) string {
+	metadata := appInstanceMetadata(instance)
+	if endpoint := metadataString(metadata, "endpoint"); endpoint != "" {
+		return endpoint
+	}
+	port := metadataInt(metadata, "port", spec.DefaultPort)
+	if spec.Kind == "minio" {
+		port = metadataInt(metadata, "apiPort", port)
+	}
+	server, err := a.store.GetServer(instance.ServerID, false)
+	host := instance.ServerID
+	if err == nil && strings.TrimSpace(server.Host) != "" {
+		host = server.Host
+	}
+	endpoint := netEndpoint(spec.EndpointScheme, host, port)
+	if spec.NacosPath && endpoint != "" && !strings.HasSuffix(endpoint, "/nacos") {
+		endpoint += "/nacos"
+	}
+	return endpoint
+}
+
+func generatedCredentialName(spec generatedInstallCredentialSpec, endpoint, fallback string) string {
+	label := strings.ToUpper(spec.Kind[:1]) + spec.Kind[1:]
+	target := strings.TrimSpace(endpoint)
+	if target == "" {
+		target = strings.TrimSpace(fallback)
+	}
+	if target == "" {
+		return fmt.Sprintf("%s %s", label, spec.Purpose)
+	}
+	return fmt.Sprintf("%s %s @ %s", label, spec.Username, target)
 }
 
 type credentialParameterMapping struct {
@@ -261,4 +454,41 @@ func paramString(params map[string]any, key, fallback string) string {
 		return fallback
 	}
 	return value
+}
+
+func firstCredentialParam(params map[string]any, keys ...string) string {
+	for _, key := range keys {
+		value := paramString(params, key, "")
+		if value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func paramInt(params map[string]any, key string, fallback int) int {
+	value, ok := params[key]
+	if !ok {
+		return fallback
+	}
+	switch typed := value.(type) {
+	case int:
+		return normalizeCredentialPort(typed, fallback)
+	case int64:
+		return normalizeCredentialPort(int(typed), fallback)
+	case float64:
+		return normalizeCredentialPort(int(typed), fallback)
+	case string:
+		n, _ := strconv.Atoi(strings.TrimSpace(typed))
+		return normalizeCredentialPort(n, fallback)
+	default:
+		return fallback
+	}
+}
+
+func normalizeCredentialPort(port, fallback int) int {
+	if port <= 0 || port > 65535 {
+		return fallback
+	}
+	return port
 }

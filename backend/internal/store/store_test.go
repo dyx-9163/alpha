@@ -2,6 +2,7 @@ package store
 
 import (
 	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -40,6 +41,51 @@ func TestBootstrapUserAndServerLifecycle(t *testing.T) {
 	}
 	if len(servers) != 1 {
 		t.Fatalf("expected one server, got %d", len(servers))
+	}
+}
+
+func TestOpenReadOnlyWithSecretDoesNotCreateDatabase(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "missing", "aifar.db")
+	db, err := OpenReadOnlyWithSecret(path, "secret")
+	if err == nil {
+		db.Close()
+		t.Fatal("expected missing read-only database to fail")
+	}
+	if _, statErr := os.Stat(path); !os.IsNotExist(statErr) {
+		t.Fatalf("read-only open created database path, stat err=%v", statErr)
+	}
+	if _, statErr := os.Stat(filepath.Dir(path)); !os.IsNotExist(statErr) {
+		t.Fatalf("read-only open created database directory, stat err=%v", statErr)
+	}
+}
+
+func TestOpenReadOnlyWithSecretCanReadButNotWrite(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "aifar.db")
+	db, err := OpenWithSecret(path, "secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.SaveServer(Server{Name: "node-1", Host: "127.0.0.1", Username: "root"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	ro, err := OpenReadOnlyWithSecret(path, "secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ro.Close()
+	servers, err := ro.ListServers()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(servers) != 1 {
+		t.Fatalf("servers=%d, want 1", len(servers))
+	}
+	if _, err := ro.SaveServer(Server{Name: "node-2", Host: "127.0.0.2", Username: "root"}); err == nil {
+		t.Fatal("expected write through read-only store to fail")
 	}
 }
 

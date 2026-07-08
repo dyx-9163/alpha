@@ -124,6 +124,15 @@ func TestInstallerUploadsBundleAndRunsMySQLScript(t *testing.T) {
 	if !strings.Contains(remote.installScript, `MYSQL_PWD="$ROOT_PASSWORD" "$MYSQL_BASE/bin/mysqladmin" --protocol=tcp`) {
 		t.Fatalf("installer should verify password login via mysqladmin:\n%s", remote.installScript)
 	}
+	if !strings.Contains(remote.installScript, "dump_mysql_diagnostics") ||
+		!strings.Contains(remote.installScript, "still waiting for MySQL readiness ($i/120)") ||
+		!strings.Contains(remote.installScript, "MYSQL_BOOTSTRAP_PROTOCOL=\"tcp\"") ||
+		!strings.Contains(remote.installScript, "MySQL bootstrap connection is not ready after installation") {
+		t.Fatalf("installer should wait longer and emit diagnostics for slow MySQL startup:\n%s", remote.installScript)
+	}
+	if strings.Contains(remote.installScript, `ExecStop=/bin/kill -TERM \$MAINPID`) {
+		t.Fatalf("systemd unit should rely on default stop handling instead of MAINPID ExecStop:\n%s", remote.installScript)
+	}
 	if !strings.Contains(remote.installScript, `open_firewall_ports "$PORT"`) ||
 		!strings.Contains(remote.installScript, `allow_selinux_ports mysqld_port_t "$PORT"`) {
 		t.Fatalf("installer should open firewall and SELinux rules for the MySQL port:\n%s", remote.installScript)

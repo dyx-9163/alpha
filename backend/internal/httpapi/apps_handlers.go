@@ -483,7 +483,7 @@ func (a *API) installAppName(w http.ResponseWriter, r *http.Request, app string)
 			}
 			return err
 		}
-		a.bindInstallCredentialReferences(def.Name, moduleReq)
+		a.bindInstallCredentialReferences(def.Name, moduleReq, log)
 		return nil
 	})
 	if err == nil {

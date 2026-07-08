@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -39,6 +40,27 @@ func OpenWithSecret(path, secret string) (*Store, error) {
 	db.SetMaxOpenConns(1)
 	s := &Store{db: db, secretKey: deriveSecretKey(secret)}
 	return s, s.migrate()
+}
+
+func OpenReadOnlyWithSecret(path, secret string) (*Store, error) {
+	dsn, err := sqliteReadOnlyDSN(path)
+	if err != nil {
+		return nil, err
+	}
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return nil, err
+	}
+	db.SetMaxOpenConns(1)
+	if _, err := db.Exec(`pragma query_only=ON`); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	if err := db.Ping(); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	return &Store{db: db, secretKey: deriveSecretKey(secret)}, nil
 }
 
 func (s *Store) Close() error { return s.db.Close() }
@@ -81,6 +103,22 @@ func NewID(prefix string) string {
 
 func sqliteString(value string) string {
 	return "'" + strings.ReplaceAll(value, "'", "''") + "'"
+}
+
+func sqliteReadOnlyDSN(path string) (string, error) {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	slashPath := filepath.ToSlash(abs)
+	if filepath.VolumeName(abs) != "" && !strings.HasPrefix(slashPath, "/") {
+		slashPath = "/" + slashPath
+	}
+	uri := url.URL{Scheme: "file", Path: slashPath}
+	query := uri.Query()
+	query.Set("mode", "ro")
+	uri.RawQuery = query.Encode()
+	return uri.String(), nil
 }
 
 func fileSHA256(path string) (string, error) {

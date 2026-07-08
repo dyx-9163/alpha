@@ -34,12 +34,18 @@ func TestInstallNacosScriptRendersClusterConfig(t *testing.T) {
 		"spring.sql.init.platform=mysql",
 		"allowPublicKeyRetrieval=true",
 		"configure_nacos_admin_user",
+		"nacos_try_configure_admin_user",
 		"nacos_create_user",
 		"nacos_update_user",
+		"waiting for Nacos auth API to accept credential configuration",
+		"warning: unable to authenticate to Nacos for credential configuration after retries",
+		"Nacos readiness is OK, continuing",
 		"Environment=\"CUSTOM_NACOS_MEMORY=-Xms$JVM_XMS -Xmx$JVM_XMX -Xmn$JVM_XMN\"",
 		"ExecStart=$NACOS_HOME/bin/startup.sh -m $MODE",
+		"Nacos cluster mode requires MySQL database configuration",
 		"systemctl restart \"$SERVICE_NAME\"",
 		"dump_nacos_diagnostics",
+		"Nacos readiness endpoint is not healthy yet, but port $PORT is listening; continuing to credential retries",
 	} {
 		if !strings.Contains(script, want) {
 			t.Fatalf("rendered script missing %q", want)
@@ -48,12 +54,15 @@ func TestInstallNacosScriptRendersClusterConfig(t *testing.T) {
 	if strings.Contains(script, `if [ "$NACOS_USER" = "nacos" ] && [ "$NACOS_PASSWORD" = "nacos" ]; then`) {
 		t.Fatalf("default Nacos credentials must still be verified after install")
 	}
+	if strings.Contains(script, "Nacos credential verification failed") {
+		t.Fatalf("credential verification must not fail an otherwise ready Nacos install")
+	}
 }
 
-func TestInstallNacosScriptAllowsLocalClusterStorage(t *testing.T) {
+func TestInstallNacosScriptAllowsLocalStandaloneStorage(t *testing.T) {
 	script, err := installNacosScript(InstallScriptRequest{
 		Version:       "2.4.3",
-		Mode:          "cluster",
+		Mode:          "standalone",
 		WorkDir:       "/aifar/apps/_work/nacos",
 		ArchivePath:   "/aifar/apps/_work/nacos/nacos-server-2.4.3.tar.gz",
 		JDKPath:       "/aifar/apps/_work/nacos/jdk.tar.gz",
@@ -74,12 +83,14 @@ func TestInstallNacosScriptAllowsLocalClusterStorage(t *testing.T) {
 		t.Fatalf("installNacosScript returned error: %v", err)
 	}
 	for _, expected := range []string{
+		"MODE='standalone'",
 		"DB_ENABLED=0",
 		"INIT_DATABASE=0",
 		`if [ "$DB_ENABLED" = "1" ]; then`,
+		`$SUDO rm -f "$NACOS_HOME/conf/cluster.conf"`,
 	} {
 		if !strings.Contains(script, expected) {
-			t.Fatalf("local storage script should contain %q", expected)
+			t.Fatalf("standalone local storage script should contain %q", expected)
 		}
 	}
 	if !strings.Contains(script, "NACOS_USER='ops'") || !strings.Contains(script, "NACOS_PASSWORD='Nacos.123'") {
