@@ -1021,3 +1021,9 @@
 - 结论：Dashboard 服务器行已按 telemetry 成功结果归一化为 `available` 并用该行状态统计可用数；Alert Center 已将 `nacos + unavailable` 的 app instance 提醒升级为 `critical`，并补充单测防止回归。
 - 问题：用户要求服务无法使用时都监听为严重提醒。
 - 结论：Alert Manager 已将不可用语义收敛为通用严重规则：`failed/error/unavailable/unhealthy/no-endpoints/down/offline` 均为 `critical`，覆盖 Docker summary、AIFAR Runtime、服务器和任意 app instance；`degraded` 仍保持 warning 表示降级但未必完全不可用。
+- 问题：用户反馈首页服务器运行指标连不起时仍显示“可用”。
+- 结论：Dashboard 服务器运行指标改为只有 telemetry 成功返回有效 `sampledAt` 才显示 `available`；telemetry 请求失败会写入 `unavailable` 展示，不再用服务器登记表里的历史 `available` 兜底。
+- 问题：用户要求连接不上时不要显示“失败”，运行态服务不可用就提示“服务不可用”，且安装成功后服务未启动不要提示安装残留清理。
+- 结论：Database/Storage/Nacos/Dashboard/Containers 的运行健康展示已将 `failed/error/missing/stopped/offline/unhealthy/down` 归一为 `unavailable`；安装失败清理提示只看 `install_failed` 或 `metadata.installFailed`，不再把运行健康失败当安装失败。
+- 问题：用户反馈容器页概览、AIFAR 运行时、镜像页签进入后一直整页转圈。
+- 结论：Containers 页面移除了主内容卡片的全局 `v-loading` 遮罩，页面会先渲染基础结构和已有/空数据，接口请求中只在按钮或懒加载局部显示 loading。

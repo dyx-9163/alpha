@@ -117,7 +117,7 @@ func (m *Manager) evaluateSnapshots(upsert func(store.Alert) error) error {
 			if status == "failed" {
 				message := snapshot.LastError
 				if strings.TrimSpace(message) == "" {
-					message = "Docker summary collection failed"
+					message = "Docker service is unavailable"
 				}
 				if err := upsert(store.Alert{
 					Fingerprint:        "docker.summary:" + snapshot.ResourceID + ":failed",
@@ -127,7 +127,7 @@ func (m *Manager) evaluateSnapshots(upsert func(store.Alert) error) error {
 					ServerID:           snapshot.ServerID,
 					App:                "docker",
 					Status:             "open",
-					Title:              "Docker summary collection failed",
+					Title:              "Docker service is unavailable",
 					Message:            message,
 					EvidenceJSON:       snapshotEvidence(snapshot),
 					RequiredPermission: string(rbac.ContainersManage),
@@ -151,7 +151,7 @@ func (m *Manager) evaluateSnapshots(upsert func(store.Alert) error) error {
 					App:                "aifar",
 					InstanceID:         snapshot.ResourceID,
 					Status:             "open",
-					Title:              "AIFAR Runtime is " + status,
+					Title:              "AIFAR Runtime is " + alertTitleStatus(status, false),
 					Message:            aifarRuntimeMessage(status, snapshot),
 					EvidenceJSON:       snapshotEvidence(snapshot),
 					RequiredPermission: string(rbac.AppsManage),
@@ -173,7 +173,7 @@ func (m *Manager) evaluateSnapshots(upsert func(store.Alert) error) error {
 					ResourceID:         snapshot.ResourceID,
 					ServerID:           snapshot.ServerID,
 					Status:             "open",
-					Title:              "Server is " + status,
+					Title:              "Server is " + alertTitleStatus(status, false),
 					Message:            message,
 					EvidenceJSON:       snapshotEvidence(snapshot),
 					RequiredPermission: string(rbac.ServersManage),
@@ -217,7 +217,7 @@ func (m *Manager) evaluateAppInstances(upsert func(store.Alert) error) error {
 			App:                app,
 			InstanceID:         instance.ID,
 			Status:             "open",
-			Title:              strings.ToUpper(app) + " instance is " + status,
+			Title:              strings.ToUpper(app) + " instance is " + alertTitleStatus(status, installFailed),
 			Message:            message,
 			EvidenceJSON:       evidenceJSON(map[string]any{"app": app, "version": instance.Version, "topology": instance.Topology, "metadata": metadata}),
 			RequiredPermission: string(permissionForApp(app)),
@@ -235,6 +235,20 @@ func instanceAlertSeverity(status string, installFailed bool) string {
 		return "critical"
 	}
 	return "warning"
+}
+
+func alertTitleStatus(status string, installFailed bool) string {
+	status = strings.ToLower(strings.TrimSpace(status))
+	if installFailed {
+		return "failed"
+	}
+	if isServiceUnavailableStatus(status) {
+		return "unavailable"
+	}
+	if status == "" {
+		return "unknown"
+	}
+	return status
 }
 
 func (m *Manager) evaluateTasks(upsert func(store.Alert) error) error {

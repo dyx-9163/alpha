@@ -866,7 +866,7 @@ function displayInstanceStatus(item: AppInstance) {
     return 'checking'
   }
   if (['running', 'failed', 'error', 'unavailable', 'stopped', 'missing'].includes(item.status)) {
-    return item.status
+    return displayHealthStatus(item.status)
   }
   return item.status === 'installed' ? 'checking' : item.status || 'unknown'
 }
@@ -876,7 +876,15 @@ function isInstallFailedGroup(group: NacosGroup) {
 }
 
 function isInstallFailedInstance(item: AppInstance, metadata: InstanceMetadata) {
-  return truthyValue(metadata.installFailed)
+  return String(item.status || '').trim().toLowerCase() === 'install_failed' || truthyValue(metadata.installFailed)
+}
+
+function displayHealthStatus(status: unknown) {
+  const normalized = stringValue(status).toLowerCase()
+  if (['failed', 'error', 'missing', 'stopped', 'offline', 'unavailable', 'unhealthy', 'down'].includes(normalized)) {
+    return 'unavailable'
+  }
+  return normalized || 'unknown'
 }
 
 function nacosDatabaseSummary(metadata: InstanceMetadata) {

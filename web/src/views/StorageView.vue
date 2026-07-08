@@ -720,12 +720,12 @@ function displayInstanceStatus(item: AppInstance) {
   const lastCheck = metadata.lastCheck as Record<string, any> | undefined
   const checkedStatus = String(lastCheck?.status || '').trim()
   if (checkedStatus) {
-    return checkedStatus
+    return displayHealthStatus(checkedStatus)
   }
   if (item.status === 'installed') {
     return 'checking'
   }
-  return item.status
+  return displayHealthStatus(item.status)
 }
 
 async function refreshMinioStatus(manual = false) {
@@ -797,7 +797,15 @@ function isInstallFailedGroup(group: StorageGroup) {
 }
 
 function isInstallFailedInstance(item: AppInstance, metadata: InstanceMetadata) {
-  return item.status === 'failed' || truthyValue(metadata.installFailed)
+  return String(item.status || '').trim().toLowerCase() === 'install_failed' || truthyValue(metadata.installFailed)
+}
+
+function displayHealthStatus(status: unknown) {
+  const normalized = stringValue(status).toLowerCase()
+  if (['failed', 'error', 'missing', 'stopped', 'offline', 'unavailable', 'unhealthy', 'down'].includes(normalized)) {
+    return 'unavailable'
+  }
+  return normalized || 'unknown'
 }
 
 function instanceLabel(item: AppInstance) {

@@ -21,7 +21,7 @@
     <el-alert v-if="error" :title="errorTitle" :description="error" type="warning" :closable="false" show-icon />
     <div class="muted-strip" v-if="!summary.available">{{ t('containers.disabledHint') }}</div>
 
-    <div class="workspace-card containers-main" :class="{ 'is-runtime-logs': tab === 'aifar-runtime' && runtimeResourceTab === 'logs' }" v-loading="loading">
+    <div class="workspace-card containers-main" :class="{ 'is-runtime-logs': tab === 'aifar-runtime' && runtimeResourceTab === 'logs' }">
       <template v-if="tab === 'overview'">
         <MetricGrid :items="metrics" />
 
@@ -827,7 +827,7 @@ const configSummaryItems = computed(() => [
   { label: t('containers.serverVersion'), value: summaryData.value.version || '-' },
   { label: t('containers.driver'), value: summaryData.value.driver || '-' },
   { label: t('containers.rootDir'), value: summaryData.value.rootDir || '-' },
-  { label: t('common.status'), status: summary.value.available ? 'available' : 'failed' }
+  { label: t('common.status'), status: summary.value.available ? 'available' : 'unavailable' }
 ])
 const settingsItems = computed(() => [
   { label: t('containers.dockerHost'), value: targetLabel.value },

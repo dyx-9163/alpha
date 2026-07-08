@@ -46,8 +46,7 @@
           <template #default="{ row }">
             <strong>{{ row.name }}</strong>
             <div class="subtle-note">{{ row.host }}</div>
-            <span class="status-pill success" v-if="row.status === 'available'">{{ t('common.available') }}</span>
-            <span class="status-pill warning" v-else>{{ row.status || t('common.unknown') }}</span>
+            <StatusTag :status="row.status" />
           </template>
         </el-table-column>
         <el-table-column label="CPU" width="160">
@@ -86,12 +85,12 @@
         <div class="filter-row">
           <span class="status-pill">{{ t('common.all') }} {{ dockerRows.length }}</span>
           <span class="status-pill success">{{ t('common.running') }} {{ runningDockerHosts }}</span>
-          <span class="status-pill">{{ t('common.stopped') }} {{ Math.max(dockerRows.length - runningDockerHosts, 0) }}</span>
+          <span class="status-pill">{{ t('common.unavailable') }} {{ Math.max(dockerRows.length - runningDockerHosts, 0) }}</span>
         </div>
         <el-table :data="dockerRows" :empty-text="t('dashboard.noDockerHosts')">
           <el-table-column prop="name" :label="t('dashboard.server')" />
           <el-table-column prop="host" :label="t('servers.host')" />
-          <el-table-column :label="t('common.status')"><template #default="{ row }"><StatusTag :status="row.available ? 'running' : 'failed'" /></template></el-table-column>
+          <el-table-column :label="t('common.status')"><template #default="{ row }"><StatusTag :status="row.available ? 'running' : 'unavailable'" /></template></el-table-column>
           <el-table-column prop="containers" :label="t('containers.title')" width="110" />
           <el-table-column prop="images" :label="t('containers.images')" width="110" />
           <el-table-column prop="dockerHost" :label="t('common.endpoint')" />
@@ -241,10 +240,13 @@ async function load() {
 
 async function loadTelemetry() {
   const entries = await Promise.all(servers.value.map(async (server) => {
-    const telemetry = await apiGet<any>(`/servers/${encodeURIComponent(server.id)}/telemetry`).catch(() => null)
+    const telemetry = await apiGet<any>(`/servers/${encodeURIComponent(server.id)}/telemetry`).catch((err) => ({
+      status: 'unavailable',
+      error: err?.message ?? String(err)
+    }))
     return [server.id, telemetry] as const
   }))
-  telemetryByServer.value = Object.fromEntries(entries.filter(([, telemetry]) => Boolean(telemetry)))
+  telemetryByServer.value = Object.fromEntries(entries)
 }
 
 async function loadDockerStatus() {
@@ -267,7 +269,7 @@ function applyAppInstanceSnapshots(instances: any[]) {
     const status = String(snapshot.status || payload.status || instance.status || '').trim()
     return {
       ...instance,
-      status: status || instance.status,
+      status: dashboardHealthStatus(status || instance.status),
       realtimeStatus: status || instance.status,
       lastError: snapshot.lastError || instance.lastError,
       lastCheckedAt: snapshot.collectedAt || payload.updatedAt
@@ -276,10 +278,32 @@ function applyAppInstanceSnapshots(instances: any[]) {
 }
 
 function dashboardServerStatus(status: unknown, telemetry: any) {
-  if (telemetry?.sampledAt) return 'available'
-  const normalized = String(status ?? '').trim().toLowerCase()
-  if (['available', 'running', 'success', 'ok'].includes(normalized)) return 'available'
+  if (hasValidSampleTime(telemetry?.sampledAt)) return 'available'
+  if (telemetry) return 'unavailable'
+  const normalized = normalizeStatus(status)
+  if (isUnavailableStatus(normalized)) return 'unavailable'
+  if (['probing', 'checking'].includes(normalized)) return normalized
+  if (['available', 'running', 'success', 'ok'].includes(normalized)) return 'unknown'
   return normalized || 'unknown'
+}
+
+function dashboardHealthStatus(status: unknown) {
+  const normalized = normalizeStatus(status)
+  if (isUnavailableStatus(normalized)) return 'unavailable'
+  return normalized || 'unknown'
+}
+
+function hasValidSampleTime(value: unknown) {
+  if (!value) return false
+  return !Number.isNaN(new Date(String(value)).getTime())
+}
+
+function normalizeStatus(status: unknown) {
+  return String(status ?? '').trim().toLowerCase()
+}
+
+function isUnavailableStatus(status: string) {
+  return ['failed', 'error', 'unavailable', 'unhealthy', 'no-endpoints', 'down', 'offline'].includes(status)
 }
 
 function isRunningStatus(status: unknown) {

@@ -1172,7 +1172,8 @@ function isInstallFailedGroup(group: DatabaseGroup) {
 }
 
 function isInstallFailedInstance(instance: AppInstance, metadata: InstanceMetadata) {
-  return instance.status === 'failed' || metadataBool(metadata, 'installFailed')
+  const status = String(instance.status || '').trim().toLowerCase()
+  return status === 'install_failed' || metadataBool(metadata, 'installFailed')
 }
 
 function databaseServiceUnavailableText(group: DatabaseGroup) {

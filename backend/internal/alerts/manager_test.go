@@ -3,6 +3,7 @@ package alerts
 import (
 	"context"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -159,7 +160,7 @@ func TestManagerTreatsUnavailableResourcesAsCritical(t *testing.T) {
 		App:      "minio",
 		Version:  "2025",
 		ServerID: "srv-2",
-		Status:   "unavailable",
+		Status:   "failed",
 		Metadata: `{"error":"readiness failed"}`,
 	}); err != nil {
 		t.Fatal(err)
@@ -178,6 +179,10 @@ func TestManagerTreatsUnavailableResourcesAsCritical(t *testing.T) {
 	for _, alert := range alerts {
 		if alert.Severity != "critical" {
 			t.Fatalf("expected unavailable alert to be critical, got %+v", alert)
+		}
+		title := strings.ToLower(alert.Title)
+		if !strings.Contains(title, "unavailable") || strings.Contains(title, "failed") {
+			t.Fatalf("expected unavailable title without failed wording, got %+v", alert)
 		}
 	}
 }
