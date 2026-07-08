@@ -130,18 +130,20 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { apiGet, asArray } from '../api/client'
 import MetricGrid from '../components/MetricGrid.vue'
 import StatusTag from '../components/StatusTag.vue'
 import { useI18n } from '../i18n'
 import { permissions } from '../rbac'
 import { useAlertsStore, type AlertItem } from '../stores/alerts'
+import { useRealtimeStore } from '../stores/realtime'
 import { useSessionStore } from '../stores/session'
 
 const { t } = useI18n()
 const session = useSessionStore()
 const alerts = useAlertsStore()
+const realtime = useRealtimeStore()
 const servers = ref<any[]>([])
 const tasks = ref<any[]>([])
 const databaseInstances = ref<any[]>([])
@@ -151,6 +153,7 @@ const dockerByServer = ref<Record<string, any>>({})
 const appInstanceSnapshots = ref<Record<string, any>>({})
 const loading = ref(false)
 const now = ref('')
+let dashboardRefreshTimer: ReturnType<typeof window.setTimeout> | null = null
 
 const serverRows = computed(() => servers.value.map((server) => {
   const telemetry = telemetryByServer.value[server.id]
@@ -261,6 +264,30 @@ async function loadDockerStatus() {
   dockerByServer.value = Object.fromEntries(entries)
 }
 
+function scheduleDashboardRefresh() {
+  if (dashboardRefreshTimer) return
+  dashboardRefreshTimer = window.setTimeout(() => {
+    dashboardRefreshTimer = null
+    if (loading.value) {
+      scheduleDashboardRefresh()
+      return
+    }
+    void load()
+  }, 400)
+}
+
+function shouldRefreshDashboard(event: any) {
+  const type = String(event?.type ?? '')
+  const resource = String(event?.resource ?? '')
+  if (!type && !resource) return false
+  if (type === 'collector.run.started') return false
+  if (type.startsWith('status.')) return true
+  if (type.startsWith('alert.')) return true
+  if (type.startsWith('collector.run.')) return true
+  if (type.startsWith('task.')) return true
+  return ['server', 'docker.summary', 'app.instance', 'aifar.runtime'].includes(resource)
+}
+
 function applyAppInstanceSnapshots(instances: any[]) {
   return instances.map((instance) => {
     const snapshot = appInstanceSnapshots.value[instance.id]
@@ -339,7 +366,19 @@ function alertScope(alert: AlertItem) {
   return alert.app || alert.scope || t('common.unknown')
 }
 
+watch(() => realtime.revision, () => {
+  if (shouldRefreshDashboard(realtime.lastEvent)) {
+    scheduleDashboardRefresh()
+  }
+})
+
 onMounted(load)
+onBeforeUnmount(() => {
+  if (dashboardRefreshTimer) {
+    window.clearTimeout(dashboardRefreshTimer)
+    dashboardRefreshTimer = null
+  }
+})
 </script>
 
 <style scoped>

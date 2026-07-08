@@ -1027,3 +1027,5 @@
 - 结论：Database/Storage/Nacos/Dashboard/Containers 的运行健康展示已将 `failed/error/missing/stopped/offline/unhealthy/down` 归一为 `unavailable`；安装失败清理提示只看 `install_failed` 或 `metadata.installFailed`，不再把运行健康失败当安装失败。
 - 问题：用户反馈容器页概览、AIFAR 运行时、镜像页签进入后一直整页转圈。
 - 结论：Containers 页面移除了主内容卡片的全局 `v-loading` 遮罩，页面会先渲染基础结构和已有/空数据，接口请求中只在按钮或懒加载局部显示 loading。
+- 问题：用户反馈 Dashboard 只有关键提醒会实时刷新，服务器/Docker/数据库/对象存储状态在服务恢复后不会自动变化。
+- 结论：Dashboard 已订阅全局 realtime revision，对 status、collector、task、alert 以及 server/docker/app/runtime 事件做去抖整页刷新，让采集落库后的状态自动回到 KPI 和各状态表。
