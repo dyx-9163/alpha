@@ -18,3 +18,5 @@
 - 结论：已调整 Nacos 安装脚本：readiness 检测独立成函数，账号配置改为最多 60 次重试；若 Nacos readiness 已 OK 但 auth/user API 仍不可认证，则记录 warning 并继续完成安装记录，避免把已成功启动的集群误判为安装失败。`pnpm test`、`pnpm backend:build` 通过。
 - 问题：用户截图显示安装后“凭据中心”为空，没有自动生成任何密钥。
 - 结论：根因是安装成功后只绑定“已选择的既有凭据”，手动输入的 MySQL/Redis/MinIO/Nacos 密码没有生成凭据记录。已扩展安装成功回调：若安装时使用手动密码，则自动创建并绑定 app-instance 级凭据；若选择已有凭据，则只绑定不复制。新增任务日志文案和测试覆盖四类应用生成规则。历史已安装实例无法从旧数据还原密码，需要手动补录或用新后端重新安装。`pnpm test`、`pnpm backend:build` 通过。
+- 问题：用户提供 MySQL 安装失败日志，服务已 active/running，但安装脚本在等待 socket readiness 后报失败。
+- 结论：MySQL 首次初始化可能超过原等待窗口，且不能只依赖 socket 检测。已增强 standalone 安装脚本：启动等待扩到最多 300 秒，支持 socket/TCP bootstrap 检测，最终密码验证最多 120 秒，失败时输出 systemd/journal/error log/端口/socket 诊断，并移除依赖未设置 `MAINPID` 的 ExecStop。`pnpm test`、`pnpm backend:build` 通过。

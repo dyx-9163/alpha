@@ -125,7 +125,7 @@ func TestInstallerUploadsBundleAndRunsMySQLScript(t *testing.T) {
 		t.Fatalf("installer should verify password login via mysqladmin:\n%s", remote.installScript)
 	}
 	if !strings.Contains(remote.installScript, "dump_mysql_diagnostics") ||
-		!strings.Contains(remote.installScript, "still waiting for MySQL readiness ($i/120)") ||
+		!strings.Contains(remote.installScript, "still waiting for MySQL readiness ($i/300)") ||
 		!strings.Contains(remote.installScript, "MYSQL_BOOTSTRAP_PROTOCOL=\"tcp\"") ||
 		!strings.Contains(remote.installScript, "MySQL bootstrap connection is not ready after installation") {
 		t.Fatalf("installer should wait longer and emit diagnostics for slow MySQL startup:\n%s", remote.installScript)
