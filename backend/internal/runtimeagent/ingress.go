@@ -17,6 +17,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
@@ -45,7 +46,7 @@ func (r Reconciler) ReconcileRuntime(ctx context.Context, spec RuntimeSpec) erro
 	}); err != nil {
 		logf(r.Log, "sync AIFAR Nacos proxies after runtime reconcile failed: %v\n", err)
 		r.Manager.MarkNacosProxyStatus([]RuntimeSpec{spec}, err)
-		return err
+		return nil
 	}
 	r.Manager.MarkNacosProxyStatus([]RuntimeSpec{spec}, nil)
 	logf(r.Log, "AIFAR agent reconciled runtime instance %s\n", spec.InstanceID)
@@ -320,6 +321,7 @@ func (m *Manager) Resync(ctx context.Context) error {
 }
 
 func (m *Manager) StartRuntimeResync(ctx context.Context, interval time.Duration, nacosOptions NacosProxySyncOptions) {
+	defer recoverRuntimeAgentPanic(m.log, "periodic resync")
 	if interval <= 0 {
 		interval = 30 * time.Second
 	}
@@ -352,6 +354,7 @@ func (m *Manager) StartRuntimeResync(ctx context.Context, interval time.Duration
 }
 
 func (m *Manager) StartDockerEventSync(ctx context.Context, debounce time.Duration) {
+	defer recoverRuntimeAgentPanic(m.log, "docker event sync")
 	if debounce <= 0 {
 		debounce = 2 * time.Second
 	}
@@ -508,23 +511,35 @@ func (m *Manager) reconcileDeployments(ctx context.Context, spec RuntimeSpec) er
 	var wg sync.WaitGroup
 	var errMu sync.Mutex
 	var firstErr error
+	recordErr := func(deployment DeploymentSpec, err error) {
+		if err == nil {
+			return
+		}
+		deploymentName := strings.TrimSpace(deployment.DeploymentName)
+		if deploymentName == "" {
+			deploymentName = deployment.ServiceName
+		}
+		err = fmt.Errorf("reconcile AIFAR deployment %s: %w", deploymentName, err)
+		errMu.Lock()
+		if firstErr == nil {
+			firstErr = err
+			cancel()
+		}
+		errMu.Unlock()
+	}
 	for _, deployment := range deployments {
 		deployment := deployment
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					logf(m.log, "AIFAR deployment reconcile panic service=%s: %v\n%s\n", deployment.ServiceName, recovered, debug.Stack())
+					recordErr(deployment, fmt.Errorf("panic: %v", recovered))
+				}
+			}()
 			if err := m.ensureDeployment(ctx, spec, deployment); err != nil {
-				deploymentName := strings.TrimSpace(deployment.DeploymentName)
-				if deploymentName == "" {
-					deploymentName = deployment.ServiceName
-				}
-				err = fmt.Errorf("reconcile AIFAR deployment %s: %w", deploymentName, err)
-				errMu.Lock()
-				if firstErr == nil {
-					firstErr = err
-					cancel()
-				}
-				errMu.Unlock()
+				recordErr(deployment, err)
 			}
 		}()
 	}
@@ -919,7 +934,7 @@ func (m *Manager) removeExtraReplicas(ctx context.Context, spec RuntimeSpec, dep
 	for _, pod := range pods {
 		revisionDrifted := strings.TrimSpace(deployment.PodRevision) != "" && pod.Revision != "" && pod.Revision != strings.TrimSpace(deployment.PodRevision)
 		specDrifted := pod.SpecHash != "" && pod.SpecHash != desiredHash && (pod.Revision == "" || pod.Revision == strings.TrimSpace(deployment.PodRevision))
-		if pod.Replica > deployment.Replicas || revisionDrifted || specDrifted {
+		if deployment.Replicas == 0 || pod.Replica > deployment.Replicas || revisionDrifted || specDrifted {
 			if _, err := m.runner.Run(ctx, "docker", "rm", "-f", pod.Name); err != nil {
 				errs = append(errs, fmt.Sprintf("%s: %v", pod.Name, err))
 				continue
@@ -1511,6 +1526,12 @@ func deploymentSpecHash(deployment DeploymentSpec) string {
 	})
 	sum := sha256.Sum256(data)
 	return hex.EncodeToString(sum[:])
+}
+
+func recoverRuntimeAgentPanic(log io.Writer, component string) {
+	if recovered := recover(); recovered != nil {
+		logf(log, "AIFAR runtime agent %s panic: %v\n%s\n", component, recovered, debug.Stack())
+	}
 }
 
 func serviceByName(spec RuntimeSpec, name string) (ServiceSpec, bool) {

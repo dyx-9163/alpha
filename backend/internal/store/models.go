@@ -206,6 +206,21 @@ type AIFARServiceEndpoint struct {
 	UpdatedAt     time.Time `json:"updatedAt"`
 }
 
+type AIFAROrchestrationLock struct {
+	ID          string    `json:"id"`
+	InstanceID  string    `json:"instanceId"`
+	ServiceName string    `json:"serviceName,omitempty"`
+	Operation   string    `json:"operation"`
+	Actor       string    `json:"actor,omitempty"`
+	TaskID      string    `json:"taskId,omitempty"`
+	Status      string    `json:"status"`
+	StartedAt   time.Time `json:"startedAt"`
+	ExpiresAt   time.Time `json:"expiresAt"`
+	ReleasedAt  time.Time `json:"releasedAt,omitempty"`
+	CreatedAt   time.Time `json:"createdAt"`
+	UpdatedAt   time.Time `json:"updatedAt"`
+}
+
 type NacosConfigRevision struct {
 	ID              string    `json:"id"`
 	NacosInstanceID string    `json:"nacosInstanceId"`

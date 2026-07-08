@@ -170,6 +170,8 @@ func (m Module) Delete(ctx context.Context, req registry.DeleteRequest, run regi
 		Instance: req.Instance,
 		Server:   req.Server,
 		Language: req.Language,
+		Actor:    req.Actor,
+		TaskID:   run.TaskID,
 	}, run.Log, func(target string) Logger {
 		return run.LoggerForTarget(target)
 	})
@@ -305,6 +307,7 @@ func (m Module) UpdateArtifactBundle(ctx context.Context, req registry.ArtifactB
 		Server:          req.Server,
 		Language:        req.Language,
 		Actor:           req.Actor,
+		TaskID:          run.TaskID,
 		BundleLocalPath: req.BundleLocalPath,
 		BundleFileName:  req.BundleFileName,
 		Concurrency:     run.Concurrency,
@@ -319,6 +322,7 @@ func (m Module) ScaleOutService(ctx context.Context, req registry.ServiceScaleOu
 		Server:      req.Server,
 		Language:    req.Language,
 		Actor:       req.Actor,
+		TaskID:      run.TaskID,
 		ServiceName: req.ServiceName,
 		Reason:      req.Reason,
 	}, run.Log, func(target string) Logger {
@@ -332,6 +336,7 @@ func (m Module) ScaleService(ctx context.Context, req registry.ServiceScaleReque
 		Server:      req.Server,
 		Language:    req.Language,
 		Actor:       req.Actor,
+		TaskID:      run.TaskID,
 		ServiceName: req.ServiceName,
 		Replicas:    req.Replicas,
 		Reason:      req.Reason,
@@ -346,6 +351,7 @@ func (m Module) InstallServices(ctx context.Context, req registry.ServiceInstall
 		Server:   req.Server,
 		Language: req.Language,
 		Actor:    req.Actor,
+		TaskID:   run.TaskID,
 		Services: req.Services,
 		Reason:   req.Reason,
 	}, run.Log, func(target string) Logger {
@@ -359,6 +365,7 @@ func (m Module) ReconcileRuntime(ctx context.Context, req registry.RuntimeReconc
 		Server:   req.Server,
 		Language: req.Language,
 		Actor:    req.Actor,
+		TaskID:   run.TaskID,
 		Reason:   req.Reason,
 	}, run.Log, func(target string) Logger {
 		return run.LoggerForTarget(target)
@@ -382,6 +389,7 @@ func (m Module) ApplyRuntimeConfig(ctx context.Context, req registry.RuntimeConf
 		Server:   req.Server,
 		Language: req.Language,
 		Actor:    req.Actor,
+		TaskID:   run.TaskID,
 		Reason:   req.Reason,
 		Config:   req.Config,
 	}, run.Log, func(target string) Logger {
@@ -395,6 +403,7 @@ func (m Module) CleanupRuntimeStalePods(ctx context.Context, req registry.Runtim
 		Server:   req.Server,
 		Language: req.Language,
 		Actor:    req.Actor,
+		TaskID:   run.TaskID,
 		Reason:   req.Reason,
 	}, run.Log, func(target string) Logger {
 		return run.LoggerForTarget(target)
@@ -407,6 +416,7 @@ func (m Module) UninstallRuntimeAgent(ctx context.Context, req registry.RuntimeA
 		Server:   req.Server,
 		Language: req.Language,
 		Actor:    req.Actor,
+		TaskID:   run.TaskID,
 		Reason:   req.Reason,
 	}, run.Log, func(target string) Logger {
 		return run.LoggerForTarget(target)

@@ -30,12 +30,12 @@ func (s Service) ScaleService(ctx context.Context, req ScaleRequest, log Logger,
 	}
 	step := newStepRunner(logForServer, recorder, target, scaleServiceSteps(), "AIFAR scale step %d/%d started: %s", "AIFAR scale step %d/%d completed: %s", "AIFAR scale step %d/%d failed: %s: %v")
 
-	current, err := s.acquireOrchestrationLock(req.Instance.ID, "scale-service", service, req.Actor)
+	current, err := s.acquireOrchestrationLock(req.Instance.ID, "scale-service", service, req.Actor, fallbackTaskID(req.TaskID, log))
 	if err != nil {
 		finishTarget(recorder, target, "failed", err.Error())
 		return err
 	}
-	defer s.releaseOrchestrationLock(req.Instance.ID, "scale-service")
+	defer s.releaseOrchestrationLock(req.Instance.ID, "scale-service", service)
 
 	var metadata map[string]any
 	var installRoot string

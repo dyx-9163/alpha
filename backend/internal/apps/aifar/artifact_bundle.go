@@ -87,14 +87,14 @@ func (s Service) UpdateArtifactBundle(ctx context.Context, req ArtifactBundleUpd
 		recorder.StartTarget(target)
 	}
 	step := newStepRunner(logForServer, recorder, target, updateSteps(copy), copy.StepStart, copy.StepDone, copy.StepFailed)
-	lockedInstance, err := s.acquireOrchestrationLock(req.Instance.ID, "update-artifact-bundle", "bundle", req.Actor)
+	lockedInstance, err := s.acquireOrchestrationLock(req.Instance.ID, "update-artifact-bundle", "", req.Actor, fallbackTaskID(req.TaskID, log))
 	if err != nil {
 		msg := fmt.Sprintf(copy.UpdateFailed, err)
 		logForServer.Error("%s", msg)
 		finishTarget(recorder, target, "failed", msg)
 		return err
 	}
-	defer s.releaseOrchestrationLock(req.Instance.ID, "update-artifact-bundle")
+	defer s.releaseOrchestrationLock(req.Instance.ID, "update-artifact-bundle", "")
 	req.Instance = lockedInstance
 	concurrency := store.NormalizeDeploymentConcurrency(fmt.Sprint(req.Concurrency), 1)
 	artifacts := make([]artifactInfo, 0, len(items))

@@ -2,11 +2,14 @@ import { spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import {
   chmodSync,
+  closeSync,
   copyFileSync,
   cpSync,
   existsSync,
   mkdirSync,
+  openSync,
   readdirSync,
+  readSync,
   readFileSync,
   rmSync,
   statSync,
@@ -23,6 +26,7 @@ const buildWebDistDir = path.join(rootDir, 'deploy', 'dist')
 const packageJson = JSON.parse(readFileSync(path.join(rootDir, 'package.json'), 'utf8'))
 const baseName = `${packageJson.name}-${packageJson.version}`
 const warnings = []
+const hashBuffer = Buffer.allocUnsafe(8 * 1024 * 1024)
 
 const commonEntries = [
   { kind: 'dir', source: 'deploy/dist', target: 'web/dist', required: true },
@@ -108,8 +112,17 @@ function walkFiles(root, dir = root) {
 
 function sha256(filePath) {
   const hash = createHash('sha256')
-  hash.update(readFileSync(filePath))
-  return hash.digest('hex')
+  const fd = openSync(filePath, 'r')
+  try {
+    let bytesRead = 0
+    do {
+      bytesRead = readSync(fd, hashBuffer, 0, hashBuffer.length, null)
+      if (bytesRead > 0) hash.update(hashBuffer.subarray(0, bytesRead))
+    } while (bytesRead > 0)
+    return hash.digest('hex')
+  } finally {
+    closeSync(fd)
+  }
 }
 
 function writeChecksums(packageDir) {
@@ -203,10 +216,6 @@ function buildPackage(target) {
   }
 }
 
-function psQuote(value) {
-  return `'${value.replaceAll("'", "''")}'`
-}
-
 function createArchive(target, packageName, packageDir, archivePath) {
   const packageParentDir = path.dirname(packageDir)
   if (target.archive === 'tar.gz') {
@@ -223,11 +232,7 @@ function createArchive(target, packageName, packageDir, archivePath) {
   }
 
   if (process.platform === 'win32') {
-    const command = [
-      "$ErrorActionPreference = 'Stop'",
-      `Compress-Archive -LiteralPath ${psQuote(packageDir)} -DestinationPath ${psQuote(archivePath)} -Force`
-    ].join('; ')
-    const result = spawnSync('powershell.exe', ['-NoProfile', '-Command', command], {
+    const result = spawnSync('tar', ['-a', '-cf', archivePath, '-C', packageParentDir, packageName], {
       cwd: rootDir,
       stdio: 'inherit'
     })

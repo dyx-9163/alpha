@@ -117,7 +117,8 @@ func (a *API) deleteAppInstance(w http.ResponseWriter, r *http.Request) {
 		}
 		log.Info(i18n.Text(lang, "api.deleteInstanceRequested"), instance.App, instance.ID)
 		if err := deleteModule.Delete(ctx, deleteReq, registry.RunContext{
-			Log: log,
+			TaskID: log.TaskID(),
+			Log:    log,
 			TargetLog: func(target string) registry.Logger {
 				return log.Target(target)
 			},
@@ -264,7 +265,8 @@ func (a *API) deleteAppInstances(w http.ResponseWriter, r *http.Request) {
 			}
 			log.Info(i18n.Text(lang, "api.deleteInstanceRequested"), item.instance.App, item.instance.ID)
 			if err := item.deleteModule.Delete(ctx, deleteReq, registry.RunContext{
-				Log: log,
+				TaskID: log.TaskID(),
+				Log:    log,
 				TargetLog: func(target string) registry.Logger {
 					return log.Target(target)
 				},

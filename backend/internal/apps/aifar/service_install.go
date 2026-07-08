@@ -68,7 +68,7 @@ func (s Service) InstallServices(ctx context.Context, req InstallServicesRequest
 		if err != nil {
 			return err
 		}
-		current, err = s.acquireOrchestrationLock(req.Instance.ID, "install-services", strings.Join(requested, ","), req.Actor)
+		current, err = s.acquireOrchestrationLock(req.Instance.ID, "install-services", "", req.Actor, fallbackTaskID(req.TaskID, log))
 		if err != nil {
 			return err
 		}
@@ -99,12 +99,12 @@ func (s Service) InstallServices(ctx context.Context, req InstallServicesRequest
 		return nil
 	}); err != nil {
 		if current.ID != "" {
-			s.releaseOrchestrationLock(current.ID, "install-services")
+			s.releaseOrchestrationLock(current.ID, "install-services", "")
 		}
 		finishTarget(recorder, target, "failed", err.Error())
 		return err
 	}
-	defer s.releaseOrchestrationLock(current.ID, "install-services")
+	defer s.releaseOrchestrationLock(current.ID, "install-services", "")
 
 	if err := step(2, func() error {
 		var err error

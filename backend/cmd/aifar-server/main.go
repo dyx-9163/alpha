@@ -45,6 +45,16 @@ func main() {
 	tasks := worker.NewManagerWithConcurrency(db, cfg.DeploymentConcurrency)
 	events := realtime.NewHub()
 	tasks.SetEventPublisher(events)
+	if recovered, err := tasks.RecoverInterruptedTasks(""); err != nil {
+		log.Printf("task recovery warning: %v", err)
+	} else if len(recovered) > 0 {
+		log.Printf("recovered %d interrupted task(s) from previous aifar-server process", len(recovered))
+	}
+	if recovered, err := aifar.RecoverInterruptedOrchestrationLocks(db); err != nil {
+		log.Printf("AIFAR orchestration lock recovery warning: %v", err)
+	} else if recovered > 0 {
+		log.Printf("recovered %d interrupted AIFAR orchestration lock(s)", recovered)
+	}
 	aifar.NewAutoscaler(db, tasks, adapter.SSHRemote{}).Start(context.Background())
 	alertManager := alerts.NewManager(db, events)
 	collectorManager := collector.NewManager(db, events, time.Duration(cfg.CollectorIntervalSecs)*time.Second)

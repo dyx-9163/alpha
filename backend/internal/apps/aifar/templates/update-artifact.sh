@@ -174,6 +174,23 @@ exec java $java_opts --add-opens=java.base/java.lang=ALL-UNNAMED --add-opens=jav
 EOF
 }
 
+health_cmd_for_service() {
+  service="$1"
+  port="$(service_port "$service")"
+  protocol="$(read_env_value "$ENV_DIR/compose.env" APP_HEALTH_PROTOCOL http)"
+  host="$(read_env_value "$ENV_DIR/compose.env" APP_HEALTH_HOST 127.0.0.1)"
+  path="$(read_env_value "$ENV_DIR/compose.env" APP_HEALTH_PATH "")"
+  timeout="$(read_env_value "$ENV_DIR/compose.env" APP_HEALTH_CONNECT_TIMEOUT 3)"
+  if [ "$service" = "web-vue3" ]; then
+    [ -n "$path" ] || path="/"
+    printf "wget -q -T %s -O /dev/null %s://%s:%s%s || exit 1" "$timeout" "$protocol" "$host" "$port" "$path"
+  elif [ -n "$path" ]; then
+    printf "curl -fsS --connect-timeout %s %s://%s:%s%s >/dev/null || exit 1" "$timeout" "$protocol" "$host" "$port" "$path"
+  else
+    printf "curl -sS --connect-timeout %s -o /dev/null %s://%s:%s/ || exit 1" "$timeout" "$protocol" "$host" "$port"
+  fi
+}
+
 desired_replicas_for_service() {
   value=""
   for pair in $DESIRED_REPLICAS; do
@@ -257,6 +274,20 @@ retag_image() {
   esac
 }
 
+install_java_artifact() {
+  service_dir="$1"
+  artifact_remote="$2"
+  artifact_file="$3"
+  artifact_name="$(basename "$artifact_file")"
+  mkdir -p "$service_dir" "$service_dir/target"
+  cp "$artifact_remote" "$service_dir/app.jar"
+  for old in "$service_dir"/target/*.jar; do
+    [ -e "$old" ] || continue
+    rm -f "$old"
+  done
+  cp "$artifact_remote" "$service_dir/target/$artifact_name"
+}
+
 apply_artifact() {
   service_dir="$APP_DIR/$SERVICE_NAME"
   [ -d "$service_dir" ] || fail "service directory is missing: $SERVICE_NAME"
@@ -280,8 +311,7 @@ apply_artifact() {
       fi
       ;;
     *)
-      mkdir -p "$service_dir"
-      cp "$ARTIFACT_REMOTE" "$service_dir/app.jar"
+      install_java_artifact "$service_dir" "$ARTIFACT_REMOTE" "$ARTIFACT_FILE"
       ;;
   esac
 }

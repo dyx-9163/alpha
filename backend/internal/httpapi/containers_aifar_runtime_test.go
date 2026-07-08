@@ -232,7 +232,7 @@ func TestAIFARRuntimeLogQuerySupportsSelectionSetsAndDedup(t *testing.T) {
 	}
 }
 
-func TestAIFARRuntimeServiceSummaryIgnoresNilResidualRecords(t *testing.T) {
+func TestAIFARRuntimeServiceSummaryPrunesResidualPodRecords(t *testing.T) {
 	api, db, _ := newAuthzTestAPI(t)
 	instance, err := db.SaveAppInstance(store.AppInstance{
 		App:      "aifar",
@@ -308,17 +308,214 @@ func TestAIFARRuntimeServiceSummaryIgnoresNilResidualRecords(t *testing.T) {
 	if service.AppName != "alpha-file" || service.Image != "aifar-file:rev-good" || service.ReadyReplicas != 2 || service.Status != "ready" {
 		t.Fatalf("expected service summary to use real ready pods, got %+v", service)
 	}
-	stale := 0
 	for _, pod := range response.Pods {
 		if strings.Contains(pod.ContainerName, "--nil--") {
-			stale++
-			if pod.Status != "stale" || pod.Revision != "" {
-				t.Fatalf("expected nil residual pod to be stale with empty revision, got %+v", pod)
-			}
+			t.Fatalf("expected nil residual pod to be pruned from response, got %+v in %+v", pod, response.Pods)
 		}
 	}
-	if stale != 2 {
-		t.Fatalf("expected two stale residual pods, got %d in %+v", stale, response.Pods)
+	if len(response.Pods) != 2 {
+		t.Fatalf("expected only real Docker pods in response, got %+v", response.Pods)
+	}
+	pods, err := db.ListAIFARPods(instance.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, pod := range pods {
+		if strings.Contains(pod.ContainerName, "--nil--") {
+			t.Fatalf("expected nil residual pod to be pruned from store, got %+v", pods)
+		}
+	}
+	endpoints, err := db.ListAIFARServiceEndpoints(instance.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, endpoint := range endpoints {
+		if strings.Contains(endpoint.ContainerName, "--nil--") {
+			t.Fatalf("expected nil residual endpoint to be pruned from store, got %+v", endpoints)
+		}
+	}
+}
+
+func TestAIFARRuntimeReconcilesDockerPodsIntoControlPlane(t *testing.T) {
+	api, db, _ := newAuthzTestAPI(t)
+	_, instance := seedAIFARRuntimeFixture(t, db, "unix:///var/run/docker.sock")
+	revision := "20260708t074706.683351600z-services-im"
+	containerName := "aifar-pod-admin-im-" + revision + "-r1"
+	if _, err := db.SaveAIFARDeployment(store.AIFARDeployment{
+		InstanceID:      instance.ID,
+		ServiceName:     "im",
+		DesiredReplicas: 0,
+		CurrentRevision: revision,
+		Status:          "offline",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	response := aifarRuntimeResponse{RuntimeStatus: "ready", Agent: aifarRuntimeAgent{Status: "running"}}
+	api.appendAIFARInstanceRuntime(&response, instance, map[string]adapter.DockerContainer{
+		containerName: {
+			Name:   containerName,
+			Image:  "aifar-im:" + revision,
+			State:  "running",
+			Status: "Up 1 minute (healthy)",
+			Labels: map[string]string{
+				"aifar.app":          "aifar",
+				"aifar.component":    "pod",
+				"aifar.install-root": "/aifar/apps/admin",
+				"aifar.service":      "im",
+				"aifar.revision":     revision,
+				"aifar.replica":      "1",
+			},
+		},
+	}, map[string]adapter.DockerContainerStat{}, aifarRuntimeBuildOptions{IncludePods: true})
+
+	var gotDeployment *aifarRuntimeDeployment
+	for i := range response.Deployments {
+		if response.Deployments[i].ServiceName == "im" {
+			gotDeployment = &response.Deployments[i]
+			break
+		}
+	}
+	if gotDeployment == nil || gotDeployment.DesiredReplicas != 1 || gotDeployment.ReadyReplicas != 1 || gotDeployment.Status != "ready" {
+		t.Fatalf("expected reconciled im deployment to be ready, got %+v in %+v", gotDeployment, response.Deployments)
+	}
+	var gotPod *aifarRuntimePod
+	for i := range response.Pods {
+		if response.Pods[i].ServiceName == "im" {
+			gotPod = &response.Pods[i]
+			break
+		}
+	}
+	if gotPod == nil || gotPod.ContainerName != containerName || !gotPod.Ready || gotPod.Status != "ready" {
+		t.Fatalf("expected reconciled im pod to be ready, got %+v in %+v", gotPod, response.Pods)
+	}
+	deployments, err := db.ListAIFARDeployments(instance.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var storedDeployment *store.AIFARDeployment
+	for i := range deployments {
+		if deployments[i].ServiceName == "im" {
+			storedDeployment = &deployments[i]
+			break
+		}
+	}
+	if storedDeployment == nil || storedDeployment.DesiredReplicas != 1 || storedDeployment.Status != "ready" {
+		t.Fatalf("expected im deployment to be persisted, got %+v in %+v", storedDeployment, deployments)
+	}
+	pods, err := db.ListAIFARPods(instance.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	foundPod := false
+	for _, pod := range pods {
+		if pod.ServiceName == "im" && pod.ContainerName == containerName && pod.Ready {
+			foundPod = true
+		}
+	}
+	if !foundPod {
+		t.Fatalf("expected im pod to be persisted, got %+v", pods)
+	}
+	endpoints, err := db.ListAIFARServiceEndpoints(instance.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	foundEndpoint := false
+	for _, endpoint := range endpoints {
+		if endpoint.ServiceName == "im" && endpoint.ContainerName == containerName && endpoint.Ready && endpoint.State == "active" {
+			foundEndpoint = true
+		}
+	}
+	if !foundEndpoint {
+		t.Fatalf("expected im endpoint to be persisted, got %+v", endpoints)
+	}
+	saved, err := db.GetAppInstance(instance.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	metadata := runtimeMetadata(saved.Metadata)
+	desired := runtimeDesiredReplicasFromMetadata(metadata)
+	if desired["im"] != 1 {
+		t.Fatalf("expected im desired replicas in metadata, got %+v metadata=%s", desired, saved.Metadata)
+	}
+	if !stringSet(runtimeServicesFromMetadata(metadata))["im"] {
+		t.Fatalf("expected im to be present in metadata services, got %s", saved.Metadata)
+	}
+}
+
+func TestAIFARRuntimeReconcileHonorsMetadataDesiredWhenDeploymentIsStale(t *testing.T) {
+	api, db, _ := newAuthzTestAPI(t)
+	_, instance := seedAIFARRuntimeFixture(t, db, "unix:///var/run/docker.sock")
+	metadata := runtimeMetadata(instance.Metadata)
+	metadata["desiredReplicas"] = map[string]any{"system": 1}
+	raw, err := json.Marshal(metadata)
+	if err != nil {
+		t.Fatal(err)
+	}
+	instance.Metadata = string(raw)
+	if _, err := db.SaveAppInstance(instance); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.SaveAIFARDeployment(store.AIFARDeployment{
+		InstanceID:      instance.ID,
+		ServiceName:     "system",
+		DesiredReplicas: 2,
+		CurrentRevision: "rev-1",
+		Status:          "degraded",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	containerName := "aifar-pod-admin-system-rev-1-r1"
+	response := aifarRuntimeResponse{RuntimeStatus: "ready", Agent: aifarRuntimeAgent{Status: "running"}}
+	api.appendAIFARInstanceRuntime(&response, instance, map[string]adapter.DockerContainer{
+		containerName: {
+			Name:   containerName,
+			Image:  "aifar-system:rev-1",
+			State:  "running",
+			Status: "Up 1 minute (healthy)",
+			Labels: map[string]string{
+				"aifar.app":          "aifar",
+				"aifar.component":    "pod",
+				"aifar.install-root": "/aifar/apps/admin",
+				"aifar.service":      "system",
+				"aifar.revision":     "rev-1",
+				"aifar.replica":      "1",
+			},
+		},
+	}, map[string]adapter.DockerContainerStat{}, aifarRuntimeBuildOptions{IncludePods: true})
+
+	var gotDeployment *aifarRuntimeDeployment
+	for i := range response.Deployments {
+		if response.Deployments[i].ServiceName == "system" {
+			gotDeployment = &response.Deployments[i]
+			break
+		}
+	}
+	if gotDeployment == nil || gotDeployment.DesiredReplicas != 1 || gotDeployment.ReadyReplicas != 1 || gotDeployment.Status != "ready" {
+		t.Fatalf("expected stale deployment desired replicas to be corrected, got %+v in %+v", gotDeployment, response.Deployments)
+	}
+	deployments, err := db.ListAIFARDeployments(instance.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, deployment := range deployments {
+		if deployment.ServiceName == "system" {
+			if deployment.DesiredReplicas != 1 || deployment.Status != "ready" {
+				t.Fatalf("expected stored system deployment to be corrected, got %+v", deployment)
+			}
+			return
+		}
+	}
+	t.Fatalf("expected system deployment row, got %+v", deployments)
+}
+
+func TestParseAIFARPodContainerNameSupportsRuntimeAgentNames(t *testing.T) {
+	instanceName, service, revision, replica, ok := parseAIFARPodContainerName("aifar-pod-admin-im-20260708t074706.683351600z-services-im-r1")
+	if !ok {
+		t.Fatal("expected runtime agent pod container name to parse")
+	}
+	if instanceName != "admin" || service != "im" || revision != "20260708t074706.683351600z-services-im" || replica != 1 {
+		t.Fatalf("unexpected parse result instance=%s service=%s revision=%s replica=%d", instanceName, service, revision, replica)
 	}
 }
 

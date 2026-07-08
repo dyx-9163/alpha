@@ -1,0 +1,5 @@
+name=aifar-deployment
+version=0.1.0
+platform=linux
+arch=amd64
+built_at=2026-07-08T15:31:07.754Z

@@ -537,6 +537,100 @@ func TestManagerReturnsErrorWhenRemovingDriftedPodFails(t *testing.T) {
 	}
 }
 
+func TestManagerOfflineDeploymentRemovesUnlabeledPods(t *testing.T) {
+	deployment := DeploymentSpec{
+		ServiceName: "oauth",
+		Image:       "aifar-oauth:rev-1",
+		PodRevision: "rev-1",
+		Replicas:    0,
+		Ports:       []ContainerPort{{Name: "http", ContainerPort: 38001}},
+	}
+	runner := &offlinePruneRunner{}
+	manager := NewManager(ManagerOptions{StateDir: t.TempDir(), Runner: runner})
+	spec := NormalizeSpec(RuntimeSpec{
+		InstanceID:  "admin",
+		InstallRoot: "/aifar/apps/admin",
+		Network:     "aifar-network",
+	})
+
+	if err := manager.removeExtraReplicas(context.Background(), spec, deployment); err != nil {
+		t.Fatal(err)
+	}
+	if !runner.removed("aifar-pod-admin-oauth-rev-1-legacy") {
+		t.Fatalf("expected offline reconcile to remove unlabeled pod, got:\n%s", strings.Join(runner.removals, "\n"))
+	}
+}
+
+func TestManagerConvertsDeploymentPanicToApplyError(t *testing.T) {
+	manager := NewManager(ManagerOptions{StateDir: t.TempDir(), Runner: panicDeploymentRunner{}})
+	spec := NormalizeSpec(RuntimeSpec{
+		InstanceID:  "admin",
+		InstallRoot: "/aifar/apps/admin",
+		Network:     "aifar-network",
+		Deployments: []DeploymentSpec{{
+			ServiceName: "oauth",
+			Image:       "aifar-oauth:rev-1",
+			PodRevision: "rev-1",
+			Replicas:    1,
+			Ports:       []ContainerPort{{Name: "http", ContainerPort: 38001}},
+		}},
+		Services: []ServiceSpec{{Name: "oauth", AppName: "alpha-oauth", Port: 38001, TargetPort: 38001}},
+		Ingress: IngressSpec{
+			GatewayPort: freePort(t),
+			WebPort:     freePort(t),
+		},
+	})
+
+	err := manager.Apply(context.Background(), spec)
+
+	if err == nil || !strings.Contains(err.Error(), "panic") {
+		t.Fatalf("expected panic to be returned as apply error, got %v", err)
+	}
+}
+
+func TestReconcileRuntimeKeepsRuntimeAppliedWhenNacosSyncFails(t *testing.T) {
+	gatewayPort := freePort(t)
+	webPort := freePort(t)
+	manager := NewManager(ManagerOptions{StateDir: t.TempDir(), Runner: &fakeRunner{}})
+	spec := RuntimeSpec{
+		InstanceID:  "admin",
+		InstallRoot: t.TempDir(),
+		Network:     "aifar-network",
+		Services: []ServiceSpec{
+			{Name: "gateway", AppName: "alpha-gateway", Port: gatewayPort, TargetPort: gatewayPort},
+			{Name: "web-vue3", AppName: "web-vue3", Port: webPort, TargetPort: webPort},
+		},
+		Ingress: IngressSpec{
+			GatewayService: "gateway",
+			WebService:     "web-vue3",
+			GatewayPort:    gatewayPort,
+			WebPort:        webPort,
+		},
+	}
+
+	err := (Reconciler{Manager: manager}).ReconcileRuntime(context.Background(), spec)
+
+	if err != nil {
+		t.Fatalf("expected Nacos sync failure to be non-fatal, got %v", err)
+	}
+	manager.mu.RLock()
+	statuses := manager.serviceStatusForInstanceLocked("admin")
+	manager.mu.RUnlock()
+	var gateway serviceRuntimeStatus
+	for _, status := range statuses {
+		if status.ServiceName == "gateway" {
+			gateway = status
+			break
+		}
+	}
+	if gateway.ServiceName == "" || gateway.LastNacosError == "" || gateway.NacosReady {
+		t.Fatalf("expected gateway Nacos status to record degraded sync, got %+v from %+v", gateway, statuses)
+	}
+	if err := manager.Remove(context.Background(), "admin"); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestManagerContainerReadyDiagnosticsIncludesInspectAndLogs(t *testing.T) {
 	runner := &diagnosticRunner{}
 	manager := NewManager(ManagerOptions{StateDir: t.TempDir(), Runner: runner})
@@ -727,6 +821,48 @@ func (r *removeExtraFailureRunner) removed(container string) bool {
 		}
 	}
 	return false
+}
+
+type offlinePruneRunner struct {
+	removals []string
+}
+
+func (r *offlinePruneRunner) Run(ctx context.Context, name string, args ...string) (CommandResult, error) {
+	call := name + " " + strings.Join(args, " ")
+	switch {
+	case strings.Contains(call, "docker ps -a") && strings.Contains(call, `{{.Label "aifar.replica"}}`):
+		return CommandResult{Stdout: "aifar-pod-admin-oauth-rev-1-legacy||rev-1|\n"}, nil
+	case strings.Contains(call, "docker inspect -f {{.State.Running}}|"):
+		return CommandResult{Stdout: "false|\n"}, nil
+	case strings.Contains(call, "docker rm -f"):
+		r.removals = append(r.removals, args[len(args)-1])
+		return CommandResult{Stdout: "removed\n"}, nil
+	default:
+		return CommandResult{Stdout: "ok\n"}, nil
+	}
+}
+
+func (r *offlinePruneRunner) removed(container string) bool {
+	for _, item := range r.removals {
+		if item == container {
+			return true
+		}
+	}
+	return false
+}
+
+type panicDeploymentRunner struct{}
+
+func (panicDeploymentRunner) Run(ctx context.Context, name string, args ...string) (CommandResult, error) {
+	call := name + " " + strings.Join(args, " ")
+	switch {
+	case strings.Contains(call, "docker ps -a"):
+		return CommandResult{}, nil
+	case strings.Contains(call, "docker inspect -f {{.Id}}"):
+		panic("docker inspect crashed")
+	default:
+		return CommandResult{Stdout: "ok\n"}, nil
+	}
 }
 
 type concurrentDeploymentRunner struct {

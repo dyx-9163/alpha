@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -448,6 +449,7 @@ type fakeRemote struct {
 	runtimeReconcileScript  string
 	runtimePodScanStdout    string
 	runtimeAgentUninstall   string
+	runtimeAgentCheckStdout string
 	statusStdout            string
 	autoscaleStatusStdouts  []string
 	autoscaleStatusFallback string
@@ -460,6 +462,9 @@ func (f *fakeRemote) Run(ctx context.Context, server store.Server, command strin
 	f.commands = append(f.commands, command)
 	if f.failCommandContains != "" && strings.Contains(command, f.failCommandContains) {
 		return adapter.CommandResult{}, errors.New("remote install failed")
+	}
+	if strings.Contains(command, "AIFAR_AGENT_CHECK") && f.runtimeAgentCheckStdout != "" {
+		return adapter.CommandResult{Stdout: f.runtimeAgentCheckStdout}, nil
 	}
 	if strings.Contains(command, "AIFAR_SERVICE_STATUS") && f.statusStdout != "" {
 		return adapter.CommandResult{Stdout: f.statusStdout}, nil
@@ -550,6 +555,74 @@ func withFakeRuntimeAgentBinary(t *testing.T) string {
 	}
 	t.Setenv("AIFAR_AGENT_BINARY", agent)
 	return agent
+}
+
+func runtimeAgentCheckOutput(t *testing.T, sha256Text string, features ...string) string {
+	t.Helper()
+	status, err := json.Marshal(map[string]any{
+		"status":   "running",
+		"version":  "runtime-v2",
+		"features": features,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return fmt.Sprintf("AIFAR_AGENT_CHECK\nagentFound=true\nagentPath=/usr/local/bin/aifar-agent\nstatus=%s\nsha256=%s\n", status, sha256Text)
+}
+
+func TestEnsureRuntimeAgentSkipsRestartWhenCurrent(t *testing.T) {
+	agent := withFakeRuntimeAgentBinary(t)
+	sum, _, err := fileSHA256(agent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	remote := &fakeRemote{runtimeAgentCheckStdout: runtimeAgentCheckOutput(t, sum, requiredRuntimeAgentFeatures...)}
+	service := NewService(nil, remote)
+	if err := service.ensureRuntimeAgent(context.Background(), store.Server{ID: "srv-1", DeployDir: "/aifar/apps"}, "/aifar/apps/_work/aifar-agent-runtime-v2-test", "", fakeLogger{}); err != nil {
+		t.Fatal(err)
+	}
+	if uploads := remote.joinedUploads(); uploads != "" {
+		t.Fatalf("current agent should not be uploaded again, uploads=%s", uploads)
+	}
+	commands := remote.joinedCommands()
+	if strings.Contains(commands, "AIFAR_AGENT_UPGRADE") || strings.Contains(commands, "systemctl restart aifar-agent") {
+		t.Fatalf("current agent should not be restarted, commands:\n%s", commands)
+	}
+}
+
+func TestEnsureRuntimeAgentUpgradesWhenChecksumChanges(t *testing.T) {
+	withFakeRuntimeAgentBinary(t)
+	remote := &fakeRemote{runtimeAgentCheckStdout: runtimeAgentCheckOutput(t, strings.Repeat("0", 64), requiredRuntimeAgentFeatures...)}
+	service := NewService(nil, remote)
+	if err := service.ensureRuntimeAgent(context.Background(), store.Server{ID: "srv-1", DeployDir: "/aifar/apps"}, "/aifar/apps/_work/aifar-agent-runtime-v2-test", "", fakeLogger{}); err != nil {
+		t.Fatal(err)
+	}
+	if uploads := remote.joinedUploads(); !strings.Contains(uploads, "aifar-agent-linux-amd64->/aifar/apps/_work/aifar-agent-runtime-v2-test/") {
+		t.Fatalf("changed agent should be uploaded, uploads=%s", uploads)
+	}
+	commands := remote.joinedCommands()
+	if !strings.Contains(commands, "AIFAR_AGENT_UPGRADE") || !strings.Contains(commands, "systemctl restart aifar-agent") {
+		t.Fatalf("changed agent should be installed and restarted, commands:\n%s", commands)
+	}
+}
+
+func TestEnsureRuntimeAgentUpgradesWhenFeatureMissing(t *testing.T) {
+	agent := withFakeRuntimeAgentBinary(t)
+	sum, _, err := fileSHA256(agent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	remote := &fakeRemote{runtimeAgentCheckStdout: runtimeAgentCheckOutput(t, sum, "reconcile-runtime", "endpoint-cache")}
+	service := NewService(nil, remote)
+	if err := service.ensureRuntimeAgent(context.Background(), store.Server{ID: "srv-1", DeployDir: "/aifar/apps"}, "/aifar/apps/_work/aifar-agent-runtime-v2-test", "", fakeLogger{}); err != nil {
+		t.Fatal(err)
+	}
+	if uploads := remote.joinedUploads(); !strings.Contains(uploads, "aifar-agent-linux-amd64->/aifar/apps/_work/aifar-agent-runtime-v2-test/") {
+		t.Fatalf("feature-incomplete agent should be uploaded, uploads=%s", uploads)
+	}
+	if commands := remote.joinedCommands(); !strings.Contains(commands, "systemctl restart aifar-agent") {
+		t.Fatalf("feature-incomplete agent should be restarted, commands:\n%s", commands)
+	}
 }
 
 type bundleTestArtifact struct {
@@ -740,6 +813,8 @@ func TestAutoscaleOutScriptUsesReplicaContainerAndEscapedDockerFormats(t *testin
 		`nacos_ephemeral`,
 		`"ephemeral": $(nacos_ephemeral)`,
 		`replicas_for_service`,
+		`service_pod_count "$service"`,
+		`if [ "$value" = "0" ]; then`,
 		`write_runtime_spec`,
 		`aifar-agent reconcile-runtime --spec "$spec"`,
 	} {
@@ -853,6 +928,14 @@ func TestScaleServiceCanOfflineDeploymentAndClearEndpoints(t *testing.T) {
 	if !strings.Contains(remote.scaleServiceScript, "AIFAR_SCALE_SERVICE") || !strings.Contains(remote.scaleServiceScript, `SERVICE_NAME='permission'`) || !strings.Contains(remote.scaleServiceScript, `REPLICAS=0`) {
 		t.Fatalf("expected scale-service script to set permission replicas to 0, got:\n%s", remote.scaleServiceScript)
 	}
+	for _, want := range []string{
+		`current_replicas_for_service "$service"`,
+		`if [ "$value" = "0" ]; then`,
+	} {
+		if !strings.Contains(remote.scaleServiceScript, want) {
+			t.Fatalf("expected scale-service script to normalize non-target desired replicas with %q, got:\n%s", want, remote.scaleServiceScript)
+		}
+	}
 	saved, err := s.GetAppInstance(instance.ID)
 	if err != nil {
 		t.Fatal(err)
@@ -880,6 +963,185 @@ func TestScaleServiceCanOfflineDeploymentAndClearEndpoints(t *testing.T) {
 		if endpoint.ServiceName == "permission" {
 			t.Fatalf("expected permission endpoint rows to be removed, got %+v", s.endpoints)
 		}
+	}
+}
+
+func TestServiceOrchestrationLocksAllowDifferentServices(t *testing.T) {
+	instance := installedAIFARInstance(t)
+	metadata := metadataFromInstance(instance)
+	metadata["orchestrationLocks"] = map[string]any{
+		"file": map[string]any{
+			"operation": "scale-service",
+			"service":   "file",
+			"actor":     "operator",
+			"startedAt": time.Now().UTC().Format(time.RFC3339),
+		},
+	}
+	instance.Metadata = mustMetadata(t, metadata)
+	s := &fakeStore{instances: []store.AppInstance{instance}}
+	service := NewService(s, &fakeRemote{})
+
+	if _, err := service.acquireOrchestrationLock(instance.ID, "scale-service", "permission", "operator", ""); err != nil {
+		t.Fatalf("expected different service orchestration lock to be allowed, got %v", err)
+	}
+	saved, err := s.GetAppInstance(instance.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	locks := serviceOrchestrationLocksFromMetadata(metadataFromInstance(saved))
+	if _, ok := locks["file"]; !ok {
+		t.Fatalf("expected existing file lock to be preserved, got %s", saved.Metadata)
+	}
+	if _, ok := locks["permission"]; !ok {
+		t.Fatalf("expected permission lock to be recorded, got %s", saved.Metadata)
+	}
+
+	service.releaseOrchestrationLock(instance.ID, "scale-service", "permission")
+	saved, err = s.GetAppInstance(instance.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	locks = serviceOrchestrationLocksFromMetadata(metadataFromInstance(saved))
+	if _, ok := locks["permission"]; ok {
+		t.Fatalf("expected released permission lock to be removed, got %s", saved.Metadata)
+	}
+	if _, ok := locks["file"]; !ok {
+		t.Fatalf("expected unrelated file lock to remain, got %s", saved.Metadata)
+	}
+}
+
+func TestServiceOrchestrationLocksBlockSameServiceAndGlobalOperations(t *testing.T) {
+	instance := installedAIFARInstance(t)
+	metadata := metadataFromInstance(instance)
+	metadata["orchestrationLocks"] = map[string]any{
+		"file": map[string]any{
+			"operation": "scale-service",
+			"service":   "file",
+			"actor":     "operator",
+			"startedAt": time.Now().UTC().Format(time.RFC3339),
+		},
+	}
+	instance.Metadata = mustMetadata(t, metadata)
+	s := &fakeStore{instances: []store.AppInstance{instance}}
+	service := NewService(s, &fakeRemote{})
+
+	if _, err := service.acquireOrchestrationLock(instance.ID, "scale-service", "file", "operator", ""); err == nil || !strings.Contains(err.Error(), "file") {
+		t.Fatalf("expected same service lock to block, got %v", err)
+	}
+	if _, err := service.acquireOrchestrationLock(instance.ID, "runtime-config", "", "operator", ""); err == nil || !strings.Contains(err.Error(), "instance orchestration is locked") {
+		t.Fatalf("expected global operation to wait for service lock, got %v", err)
+	}
+}
+
+func TestGlobalOrchestrationLockBlocksServiceOperations(t *testing.T) {
+	instance := installedAIFARInstance(t)
+	metadata := metadataFromInstance(instance)
+	metadata["orchestrationLock"] = map[string]any{
+		"operation": "runtime-config",
+		"actor":     "operator",
+		"startedAt": time.Now().UTC().Format(time.RFC3339),
+	}
+	instance.Metadata = mustMetadata(t, metadata)
+	s := &fakeStore{instances: []store.AppInstance{instance}}
+	service := NewService(s, &fakeRemote{})
+
+	if _, err := service.acquireOrchestrationLock(instance.ID, "scale-service", "permission", "operator", ""); err == nil || !strings.Contains(err.Error(), "instance orchestration is locked") {
+		t.Fatalf("expected global lock to block service operation, got %v", err)
+	}
+}
+
+func TestRecoverInterruptedOrchestrationLocksClearsAIFARLocks(t *testing.T) {
+	instance := installedAIFARInstance(t)
+	metadata := metadataFromInstance(instance)
+	metadata["orchestrationLock"] = map[string]any{
+		"operation": "runtime-config",
+		"actor":     "operator",
+		"startedAt": time.Now().UTC().Format(time.RFC3339),
+	}
+	metadata["orchestrationLocks"] = map[string]any{
+		"file": map[string]any{
+			"operation": "scale-service",
+			"service":   "file",
+			"actor":     "operator",
+			"startedAt": time.Now().UTC().Format(time.RFC3339),
+		},
+	}
+	instance.Metadata = mustMetadata(t, metadata)
+	other := store.AppInstance{ID: "mysql-1", App: "mysql", Version: "8.0.36", Status: "running", Metadata: `{"orchestrationLock":{"operation":"check"}}`}
+	s := &fakeStore{instances: []store.AppInstance{instance, other}}
+
+	recovered, err := RecoverInterruptedOrchestrationLocks(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recovered != 1 {
+		t.Fatalf("expected one recovered AIFAR instance, got %d", recovered)
+	}
+	saved, err := s.GetAppInstance(instance.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	next := metadataFromInstance(saved)
+	if _, ok := next["orchestrationLock"]; ok {
+		t.Fatalf("expected global lock to be cleared, got %s", saved.Metadata)
+	}
+	if locks := serviceOrchestrationLocksFromMetadata(next); len(locks) != 0 {
+		t.Fatalf("expected service locks to be cleared, got %s", saved.Metadata)
+	}
+	if _, ok := next["lastOrchestrationRecovery"]; !ok {
+		t.Fatalf("expected recovery marker, got %s", saved.Metadata)
+	}
+	savedOther, err := s.GetAppInstance(other.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(savedOther.Metadata, "orchestrationLock") {
+		t.Fatalf("expected non-AIFAR instance metadata to remain untouched, got %s", savedOther.Metadata)
+	}
+}
+
+func TestServiceMigratesMetadataOrchestrationLocksToStructuredStore(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "aifar.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	startedAt := time.Now().UTC().Add(-time.Minute).Format(time.RFC3339)
+	instance, err := db.SaveAppInstance(store.AppInstance{
+		App:      AppName,
+		Version:  "runtime-v2",
+		ServerID: "srv-1",
+		Status:   "installed",
+		Metadata: `{"orchestrationLocks":{"gateway":{"operation":"autoscale","service":"gateway","actor":"admin","taskId":"tsk-gateway","startedAt":"` + startedAt + `"}}}`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := NewService(db, &fakeRemote{})
+	if _, err := service.acquireOrchestrationLock(instance.ID, "delete", "", "admin", "tsk-delete"); err == nil || !strings.Contains(err.Error(), "instance orchestration is locked") {
+		locks, listErr := db.ListAIFAROrchestrationLocks(instance.ID, false)
+		t.Fatalf("expected migrated gateway lock to block global delete, got %v locks=%+v listErr=%v", err, locks, listErr)
+	}
+	saved, err := db.GetAppInstance(instance.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	metadata := metadataFromInstance(saved)
+	if _, ok := metadata["orchestrationLocks"]; ok {
+		t.Fatalf("expected legacy metadata locks to be removed, got %s", saved.Metadata)
+	}
+	locks, err := db.ListAIFAROrchestrationLocks(instance.ID, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(locks) != 1 || locks[0].ServiceName != "gateway" || locks[0].TaskID != "tsk-gateway" {
+		t.Fatalf("expected migrated gateway lock with task id, got %+v", locks)
+	}
+	if _, err := db.RecoverAIFAROrchestrationLocks(instance.ID, "test recovery"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.acquireOrchestrationLock(instance.ID, "delete", "", "admin", "tsk-delete"); err != nil {
+		t.Fatalf("expected global delete lock after recovery, got %v", err)
 	}
 }
 
@@ -1020,6 +1282,32 @@ func TestRuntimeSpecTemplatesMountPerServiceLogVolume(t *testing.T) {
 			} {
 				if !strings.Contains(script, want) {
 					t.Fatalf("runtime spec template %s should include log volume policy %q:\n%s", name, want, script)
+				}
+			}
+		})
+	}
+}
+
+func TestRolloutTemplatesRefreshDockerfileJarInputs(t *testing.T) {
+	for _, name := range []string{
+		"update-artifact.sh",
+		"update-artifact-bundle.sh",
+	} {
+		t.Run(name, func(t *testing.T) {
+			content, err := templateFS.ReadFile("templates/" + name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			script := string(content)
+			for _, want := range []string{
+				`health_cmd_for_service()`,
+				`install_java_artifact()`,
+				`cp "$artifact_remote" "$service_dir/app.jar"`,
+				`"$service_dir"/target/*.jar`,
+				`cp "$artifact_remote" "$service_dir/target/$artifact_name"`,
+			} {
+				if !strings.Contains(script, want) {
+					t.Fatalf("rollout template %s should refresh Java artifact input %q:\n%s", name, want, script)
 				}
 			}
 		})

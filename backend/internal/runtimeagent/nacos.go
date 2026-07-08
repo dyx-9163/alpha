@@ -117,6 +117,7 @@ func specHasNacosProxyServices(spec RuntimeSpec) bool {
 }
 
 func StartNacosProxyHeartbeat(ctx context.Context, options NacosProxySyncOptions) {
+	defer recoverRuntimeAgentPanic(options.Log, "nacos heartbeat")
 	interval := 5 * time.Second
 	if options.Client == nil {
 		options.Client = &http.Client{Timeout: 5 * time.Second}

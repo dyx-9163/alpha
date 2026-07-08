@@ -181,6 +181,14 @@ func (s *Store) migrate() error {
 			unique(instance_id, service_name, pod_id)
 		)`,
 		`create index if not exists aifar_service_endpoints_instance on aifar_service_endpoints(instance_id)`,
+		`create table if not exists aifar_orchestration_locks (
+			id text primary key, instance_id text not null, service_name text not null default '',
+			operation text not null, actor text, task_id text, status text not null,
+			started_at datetime not null, expires_at datetime not null, released_at datetime,
+			created_at datetime not null, updated_at datetime not null
+		)`,
+		`create index if not exists aifar_orchestration_locks_instance_status on aifar_orchestration_locks(instance_id, status, expires_at)`,
+		`create unique index if not exists aifar_orchestration_locks_active_scope on aifar_orchestration_locks(instance_id, service_name) where status='active'`,
 		`create table if not exists nacos_config_revisions (
 			id text primary key, nacos_instance_id text not null, namespace text not null, group_name text not null,
 			data_id text not null, content_cipher text not null, content_hash text not null, metadata text,
@@ -395,7 +403,7 @@ func (s *Store) ListUsers() ([]UserSummary, error) {
 
 func (s *Store) CountRows(table string) (int, error) {
 	switch table {
-	case "users", "servers", "tasks", "task_logs", "task_targets", "task_steps", "audit_logs", "resources", "app_instances", "app_releases", "nacos_config_revisions", "credentials", "credential_versions", "credential_bindings", "storage_items", "settings", "collector_runs", "status_snapshots", "alerts", "alert_events":
+	case "users", "servers", "tasks", "task_logs", "task_targets", "task_steps", "audit_logs", "resources", "app_instances", "app_releases", "aifar_orchestration_locks", "nacos_config_revisions", "credentials", "credential_versions", "credential_bindings", "storage_items", "settings", "collector_runs", "status_snapshots", "alerts", "alert_events":
 	default:
 		return 0, fmt.Errorf("unsupported table %q", table)
 	}
@@ -623,6 +631,67 @@ func (s *Store) UpdateTaskStatus(id, status, errText string) error {
 		_, err := s.db.Exec(`update tasks set status=?, error=? where id=?`, status, errText, id)
 		return err
 	}
+}
+
+func (s *Store) RecoverInterruptedTasks(errText string) ([]Task, error) {
+	now := time.Now()
+	errText = logmask.Mask(strings.TrimSpace(errText))
+	if errText == "" {
+		errText = "task interrupted by aifar-server restart"
+	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	rows, err := tx.Query(`select id,type,target,status,created_by,coalesce(error,''),created_at,started_at,finished_at from tasks where status in ('pending','running') order by created_at`)
+	if err != nil {
+		return nil, err
+	}
+	tasks := []Task{}
+	for rows.Next() {
+		var t Task
+		var startedAt, finishedAt sql.NullTime
+		if err := rows.Scan(&t.ID, &t.Type, &t.Target, &t.Status, &t.CreatedBy, &t.Error, &t.CreatedAt, &startedAt, &finishedAt); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		t.StartedAt = nullTime(startedAt)
+		t.FinishedAt = nullTime(finishedAt)
+		tasks = append(tasks, t)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+
+	for idx := range tasks {
+		taskID := tasks[idx].ID
+		if _, err := tx.Exec(`update tasks set status='failed', error=?, finished_at=? where id=?`, errText, now, taskID); err != nil {
+			return nil, err
+		}
+		if _, err := tx.Exec(`insert into task_logs(task_id,target,level,message,created_at) values(?,?,?,?,?)`, taskID, "", "error", errText, now); err != nil {
+			return nil, err
+		}
+		if _, err := tx.Exec(`update task_targets set status='failed', error=?, finished_at=? where task_id=? and status in ('pending','running')`, errText, now, taskID); err != nil {
+			return nil, err
+		}
+		if _, err := tx.Exec(`update task_steps set status='failed', error=?, finished_at=? where task_id=? and status in ('pending','running')`, errText, now, taskID); err != nil {
+			return nil, err
+		}
+		tasks[idx].Status = "failed"
+		tasks[idx].Error = errText
+		tasks[idx].FinishedAt = now
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return tasks, nil
 }
 
 func (s *Store) AddTaskLog(taskID, level, message string) (TaskLog, error) {

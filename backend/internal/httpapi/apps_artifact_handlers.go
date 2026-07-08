@@ -109,7 +109,8 @@ func (a *API) updateAppInstanceArtifact(w http.ResponseWriter, r *http.Request) 
 		defer os.Remove(artifactPath)
 		log.Info(i18n.Text(lang, "api.artifactUpdateRequested"), instance.App, instance.ID, serviceName)
 		if err := updateModule.UpdateArtifact(ctx, req, registry.RunContext{
-			Log: log,
+			TaskID: log.TaskID(),
+			Log:    log,
 			TargetLog: func(target string) registry.Logger {
 				return log.Target(target)
 			},
@@ -220,6 +221,7 @@ func (a *API) updateAppInstanceArtifactBundle(w http.ResponseWriter, r *http.Req
 		defer os.Remove(bundlePath)
 		log.Info(i18n.Text(lang, "api.artifactBundleUpdateRequested"), instance.App, instance.ID, header.Filename)
 		if err := updateModule.UpdateArtifactBundle(ctx, req, registry.RunContext{
+			TaskID:      log.TaskID(),
 			Log:         log,
 			Concurrency: a.store.DeploymentConcurrency(a.cfg.DeploymentConcurrency),
 			TargetLog: func(target string) registry.Logger {

@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"os"
+	"runtime/debug"
 	"strings"
 	"time"
 
@@ -213,7 +215,19 @@ func newAgentHandler(manager *runtimeagent.Manager, healthCheck func(context.Con
 		}
 		writeJSON(w, http.StatusOK, map[string]string{"status": "removed"})
 	})
-	return mux
+	return recoverAgentHandler(mux)
+}
+
+func recoverAgentHandler(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				log.Printf("aifar-agent handler panic path=%s: %v\n%s", r.URL.Path, recovered, debug.Stack())
+				http.Error(w, fmt.Sprintf("aifar-agent handler panic: %v", recovered), http.StatusInternalServerError)
+			}
+		}()
+		next.ServeHTTP(w, r)
+	})
 }
 
 func postRuntimeSpec(ctx context.Context, addr string, spec runtimeagent.RuntimeSpec) error {
@@ -222,21 +236,66 @@ func postRuntimeSpec(ctx context.Context, addr string, spec runtimeagent.Runtime
 		return err
 	}
 	url := "http://" + addr + "/runtime/reconcile"
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(data))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("aifar-agent service is not reachable on %s: %w", addr, err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 300 {
+	var lastErr error
+	for attempt := 1; attempt <= 5; attempt++ {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(data))
+		if err != nil {
+			return err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			lastErr = fmt.Errorf("aifar-agent service is not reachable on %s: %w", addr, err)
+			if !isTransientAgentRequestError(err) || attempt == 5 || !sleepAgentRetry(ctx, attempt) {
+				return lastErr
+			}
+			continue
+		}
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return fmt.Errorf("aifar-agent reconcile failed: %s: %s", resp.Status, strings.TrimSpace(string(body)))
+		_ = resp.Body.Close()
+		if resp.StatusCode >= 300 {
+			lastErr = fmt.Errorf("aifar-agent reconcile failed: %s: %s", resp.Status, strings.TrimSpace(string(body)))
+			if !isTransientAgentStatus(resp.StatusCode) || attempt == 5 || !sleepAgentRetry(ctx, attempt) {
+				return lastErr
+			}
+			continue
+		}
+		return nil
 	}
-	return nil
+	return lastErr
+}
+
+func isTransientAgentRequestError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	text := strings.ToLower(err.Error())
+	return strings.Contains(text, "eof") ||
+		strings.Contains(text, "connection reset") ||
+		strings.Contains(text, "connection refused") ||
+		strings.Contains(text, "server closed idle connection")
+}
+
+func isTransientAgentStatus(status int) bool {
+	return status == http.StatusBadGateway ||
+		status == http.StatusServiceUnavailable ||
+		status == http.StatusGatewayTimeout
+}
+
+func sleepAgentRetry(ctx context.Context, attempt int) bool {
+	delay := time.Duration(attempt) * time.Second
+	if delay > 5*time.Second {
+		delay = 5 * time.Second
+	}
+	select {
+	case <-ctx.Done():
+		return false
+	case <-time.After(delay):
+		return true
+	}
 }
 
 func deleteRuntimeInstance(ctx context.Context, addr, instance string) error {

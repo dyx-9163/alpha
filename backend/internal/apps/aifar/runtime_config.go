@@ -49,6 +49,7 @@ type RuntimeConfigRequest struct {
 	Server   store.Server
 	Language string
 	Actor    string
+	TaskID   string
 	Reason   string
 	Config   RuntimeConfigPayload
 }
@@ -255,12 +256,12 @@ func (s Service) ApplyRuntimeConfig(ctx context.Context, req RuntimeConfigReques
 	}
 	step := newStepRunner(logForServer, recorder, target, runtimeConfigSteps(), "AIFAR runtime config step %d/%d started: %s", "AIFAR runtime config step %d/%d completed: %s", "AIFAR runtime config step %d/%d failed: %s: %v")
 
-	current, err := s.acquireOrchestrationLock(req.Instance.ID, "runtime-config", "", req.Actor)
+	current, err := s.acquireOrchestrationLock(req.Instance.ID, "runtime-config", "", req.Actor, fallbackTaskID(req.TaskID, log))
 	if err != nil {
 		finishTarget(recorder, target, "failed", err.Error())
 		return err
 	}
-	defer s.releaseOrchestrationLock(req.Instance.ID, "runtime-config")
+	defer s.releaseOrchestrationLock(req.Instance.ID, "runtime-config", "")
 
 	var metadata map[string]any
 	var previous RuntimeConfigState

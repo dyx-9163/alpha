@@ -168,10 +168,11 @@ memory_to_bytes() {
 }
 
 service_pod_count() {
+  service="${1:-$SERVICE_NAME}"
   docker ps --filter "label=aifar.app=aifar" \
     --filter "label=aifar.install-root=$INSTALL_ROOT" \
     --filter "label=aifar.component=pod" \
-    --filter "label=aifar.service=$SERVICE_NAME" \
+    --filter "label=aifar.service=$service" \
     --format '{{ "{{" }}.Names{{ "}}" }}' 2>/dev/null | wc -l | tr -d ' '
 }
 
@@ -181,29 +182,30 @@ replicas_for_service() {
     printf "%s" "$REPLICA_ID"
     return
   fi
+  value=""
   if value="$(desired_replicas_from_pairs "$service" "$CONTROL_PLANE_DESIRED_REPLICAS")"; then
     case "$value" in ""|*[!0-9]*) value=1 ;; esac
     [ "$value" -ge 0 ] || value=0
-    printf "%s" "$value"
-    return
-  fi
-  if value="$(desired_replicas_from_env "$service")"; then
+  elif value="$(desired_replicas_from_env "$service")"; then
     case "$value" in ""|*[!0-9]*) value=1 ;; esac
     [ "$value" -ge 0 ] || value=0
-    printf "%s" "$value"
+  fi
+  if [ "$value" = "0" ]; then
+    printf "0"
     return
   fi
-  replicas="$(docker ps --filter "label=aifar.app=aifar" \
-    --filter "label=aifar.install-root=$INSTALL_ROOT" \
-    --filter "label=aifar.component=pod" \
-    --filter "label=aifar.service=$service" \
-    --format '{{ "{{" }}.Names{{ "}}" }}' 2>/dev/null | wc -l | tr -d ' ')"
+  replicas="$(service_pod_count "$service")"
   case "$replicas" in ""|*[!0-9]*) replicas=1 ;; esac
   [ "$replicas" -ge 0 ] || replicas=0
-  if [ "$replicas" -eq 0 ]; then
-    replicas=1
+  if [ "$replicas" -gt 0 ]; then
+    printf "%s" "$replicas"
+    return
   fi
-  printf "%s" "$replicas"
+  if [ -n "$value" ]; then
+    printf "%s" "$value"
+  else
+    printf "1"
+  fi
 }
 
 desired_replicas_from_pairs() {

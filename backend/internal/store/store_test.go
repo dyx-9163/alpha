@@ -1,6 +1,7 @@
 package store
 
 import (
+	"errors"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -224,6 +225,78 @@ func TestAIFAROrchestrationCRUDAndInstanceCleanup(t *testing.T) {
 	}
 }
 
+func TestAIFAROrchestrationLockLifecycle(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "aifar.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	instance, err := db.SaveAppInstance(AppInstance{App: "aifar", Version: "runtime-v2", ServerID: "srv-1", Status: "installed"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := time.Now().Add(-time.Minute)
+	if _, err := db.AcquireAIFAROrchestrationLock(AIFAROrchestrationLock{
+		InstanceID:  instance.ID,
+		ServiceName: "gateway",
+		Operation:   "scale-service",
+		Actor:       "admin",
+		TaskID:      "tsk-gateway",
+		StartedAt:   started,
+		ExpiresAt:   started.Add(time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.AcquireAIFAROrchestrationLock(AIFAROrchestrationLock{
+		InstanceID:  instance.ID,
+		ServiceName: "im",
+		Operation:   "scale-service",
+		Actor:       "admin",
+		TaskID:      "tsk-im",
+	}); err != nil {
+		t.Fatalf("different service locks should be allowed: %v", err)
+	}
+	if _, err := db.AcquireAIFAROrchestrationLock(AIFAROrchestrationLock{
+		InstanceID:  instance.ID,
+		ServiceName: "gateway",
+		Operation:   "autoscale",
+	}); err == nil {
+		t.Fatal("expected same service lock conflict")
+	} else {
+		var conflict AIFAROrchestrationLockConflict
+		if !errors.As(err, &conflict) || conflict.Lock.ServiceName != "gateway" {
+			t.Fatalf("expected gateway conflict, got %T %v", err, err)
+		}
+	}
+	if _, err := db.AcquireAIFAROrchestrationLock(AIFAROrchestrationLock{
+		InstanceID: instance.ID,
+		Operation:  "delete",
+	}); err == nil {
+		t.Fatal("expected global lock to wait for service locks")
+	}
+	released, err := db.ReleaseAIFAROrchestrationLock(instance.ID, "scale-service", "gateway")
+	if err != nil || !released {
+		t.Fatalf("expected gateway lock release, released=%v err=%v", released, err)
+	}
+	if _, err := db.AcquireAIFAROrchestrationLock(AIFAROrchestrationLock{
+		InstanceID:  instance.ID,
+		ServiceName: "gateway",
+		Operation:   "autoscale",
+	}); err != nil {
+		t.Fatalf("expected gateway lock after release, got %v", err)
+	}
+	if err := db.DeleteAppInstance(instance.ID); err != nil {
+		t.Fatal(err)
+	}
+	locks, err := db.ListAIFAROrchestrationLocks(instance.ID, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(locks) != 0 {
+		t.Fatalf("expected locks to be deleted with instance, got %+v", locks)
+	}
+}
+
 func TestUserTokenVersionChangesOnPasswordAndRoleUpdate(t *testing.T) {
 	db, err := Open(filepath.Join(t.TempDir(), "aifar.db"))
 	if err != nil {
@@ -426,6 +499,74 @@ func TestTaskLifecycle(t *testing.T) {
 	}
 	if _, _, err := db.GetTask(task.ID); !IsNotFound(err) {
 		t.Fatalf("expected deleted task to be missing, got %v", err)
+	}
+}
+
+func TestRecoverInterruptedTasks(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "aifar.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	pending, err := db.CreateTask(Task{Type: "aifar.scale.offline", Target: "aifar-1:file", Status: "pending", CreatedBy: "admin"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	running, err := db.CreateTask(Task{Type: "aifar.scale.in", Target: "aifar-1:oauth", Status: "running", CreatedBy: "admin", StartedAt: time.Now().Add(-time.Minute)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	finished, err := db.CreateTask(Task{Type: "aifar.scale.out", Target: "aifar-1:gateway", Status: "success", CreatedBy: "admin", FinishedAt: time.Now()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.UpsertTaskTarget(running.ID, "srv-1", "running", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.UpsertTaskStep(running.ID, "srv-1", "scale", "scale", 1, "running", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	recovered, err := db.RecoverInterruptedTasks("server restarted")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(recovered) != 2 {
+		t.Fatalf("expected two recovered tasks, got %+v", recovered)
+	}
+	for _, id := range []string{pending.ID, running.ID} {
+		task, logs, err := db.GetTask(id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if task.Status != "failed" || task.Error != "server restarted" || task.FinishedAt.IsZero() {
+			t.Fatalf("expected task %s to be failed after recovery, got %+v", id, task)
+		}
+		if len(logs) == 0 || logs[len(logs)-1].Message != "server restarted" {
+			t.Fatalf("expected recovery log for task %s, got %+v", id, logs)
+		}
+	}
+	targets, err := db.ListTaskTargets(running.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(targets) != 1 || targets[0].Status != "failed" || targets[0].Error != "server restarted" {
+		t.Fatalf("expected running target to be failed, got %+v", targets)
+	}
+	steps, err := db.ListTaskSteps(running.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(steps) != 1 || steps[0].Status != "failed" || steps[0].Error != "server restarted" {
+		t.Fatalf("expected running step to be failed, got %+v", steps)
+	}
+	task, _, err := db.GetTask(finished.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.Status != "success" {
+		t.Fatalf("expected finished task to remain success, got %+v", task)
 	}
 }
 

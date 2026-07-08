@@ -47,17 +47,28 @@ func (s *Store) DeleteAppInstance(id string) error {
 	if err := s.DeleteAIFAROrchestration(id); err != nil {
 		return err
 	}
-	if _, err := s.db.Exec(`delete from app_releases where instance_id=?`, id); err != nil {
+	tx, err := s.db.Begin()
+	if err != nil {
 		return err
 	}
-	res, err := s.db.Exec(`delete from app_instances where id=?`, id)
+	defer tx.Rollback()
+	if _, err := tx.Exec(`delete from app_releases where instance_id=?`, id); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`delete from credential_bindings where app_instance_id=?`, id); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`update credentials set app_instance_id='' where app_instance_id=?`, id); err != nil {
+		return err
+	}
+	res, err := tx.Exec(`delete from app_instances where id=?`, id)
 	if err != nil {
 		return err
 	}
 	if rows, _ := res.RowsAffected(); rows == 0 {
 		return sql.ErrNoRows
 	}
-	return nil
+	return tx.Commit()
 }
 
 func (s *Store) SaveAppRelease(v AppRelease) (AppRelease, error) {

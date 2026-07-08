@@ -58,6 +58,12 @@ type aifarRuntimeCleanupStore interface {
 	PruneAIFARServiceEndpointRecords(instanceID string, existingContainerNames []string) (int, error)
 }
 
+type aifarOrchestrationLockStore interface {
+	AcquireAIFAROrchestrationLock(store.AIFAROrchestrationLock) (store.AIFAROrchestrationLock, error)
+	ReleaseAIFAROrchestrationLock(instanceID, operation, serviceName string) (bool, error)
+	RecoverAIFAROrchestrationLocks(instanceID, reason string) (int, error)
+}
+
 type taskLookupStore interface {
 	GetTask(id string) (store.Task, []store.TaskLog, error)
 }
@@ -76,6 +82,8 @@ type DeleteRequest struct {
 	Instance store.AppInstance
 	Server   store.Server
 	Language string
+	Actor    string
+	TaskID   string
 }
 
 type CheckRequest struct {
@@ -89,6 +97,7 @@ type ArtifactUpdateRequest struct {
 	Server            store.Server
 	Language          string
 	Actor             string
+	TaskID            string
 	ServiceName       string
 	ArtifactLocalPath string
 	ArtifactFileName  string
@@ -99,6 +108,7 @@ type ArtifactBundleUpdateRequest struct {
 	Server          store.Server
 	Language        string
 	Actor           string
+	TaskID          string
 	BundleLocalPath string
 	BundleFileName  string
 	Concurrency     int
@@ -109,6 +119,7 @@ type ScaleOutRequest struct {
 	Server      store.Server
 	Language    string
 	Actor       string
+	TaskID      string
 	ServiceName string
 	Reason      string
 }
@@ -118,6 +129,7 @@ type ScaleRequest struct {
 	Server      store.Server
 	Language    string
 	Actor       string
+	TaskID      string
 	ServiceName string
 	Replicas    int
 	Reason      string
@@ -128,6 +140,7 @@ type InstallServicesRequest struct {
 	Server   store.Server
 	Language string
 	Actor    string
+	TaskID   string
 	Services []string
 	Reason   string
 }
@@ -137,6 +150,7 @@ type RuntimeReconcileRequest struct {
 	Server   store.Server
 	Language string
 	Actor    string
+	TaskID   string
 	Reason   string
 }
 
@@ -145,6 +159,7 @@ type RuntimeCleanupRequest struct {
 	Server   store.Server
 	Language string
 	Actor    string
+	TaskID   string
 	Reason   string
 }
 
@@ -153,6 +168,7 @@ type RuntimeAgentUninstallRequest struct {
 	Server   store.Server
 	Language string
 	Actor    string
+	TaskID   string
 	Reason   string
 }
 
@@ -181,8 +197,25 @@ type stepRecorder interface {
 	FinishStep(target, name, status, errText string)
 }
 
+type taskIDCarrier interface {
+	TaskID() string
+}
+
+var requiredRuntimeAgentFeatures = []string{"reconcile-runtime", "local-runtime-controller", "endpoint-cache"}
+
 func NewService(s Store, remote Remote) Service {
 	return Service{store: s, remote: remote}
+}
+
+func fallbackTaskID(taskID string, log Logger) string {
+	taskID = strings.TrimSpace(taskID)
+	if taskID != "" {
+		return taskID
+	}
+	if carrier, ok := log.(taskIDCarrier); ok {
+		return strings.TrimSpace(carrier.TaskID())
+	}
+	return ""
 }
 
 func (s Service) ensureRuntimeAgent(ctx context.Context, server store.Server, workDir, lang string, log Logger) error {
@@ -190,6 +223,22 @@ func (s Service) ensureRuntimeAgent(ctx context.Context, server store.Server, wo
 	agentLocal := agentdist.FindBinary()
 	if agentLocal == "" {
 		return errors.New("AIFAR runtime agent binary is missing; rebuild the backend or use a release package containing bin/aifar-agent-linux-amd64")
+	}
+	agentSHA256, _, err := fileSHA256(agentLocal)
+	if err != nil {
+		return fmt.Errorf("calculate AIFAR runtime agent checksum: %w", err)
+	}
+	inspection, err := s.inspectRuntimeAgent(ctx, server)
+	if err != nil {
+		return fmt.Errorf("inspect AIFAR runtime agent: %w", err)
+	}
+	if reason := inspection.upgradeReason(agentSHA256); reason == "" {
+		if log != nil {
+			log.Info("AIFAR runtime agent is already current; skip agent restart")
+		}
+		return nil
+	} else if log != nil {
+		log.Info("AIFAR runtime agent upgrade required: %s", reason)
 	}
 	workDir = strings.TrimRight(strings.TrimSpace(workDir), "/")
 	if workDir == "" {
@@ -230,8 +279,107 @@ func (s Service) ensureRuntimeAgent(ctx context.Context, server store.Server, wo
 		"echo \"aifar-agent service is not reachable after upgrade\" >&2",
 		"exit 1",
 	}, "\n")
-	_, err := installerkit.Run(ctx, s.remote, server, command, log, "AIFAR runtime agent upgrade failed")
+	_, err = installerkit.Run(ctx, s.remote, server, command, log, "AIFAR runtime agent upgrade failed")
 	return err
+}
+
+type runtimeAgentInspection struct {
+	Found    bool
+	Status   string
+	Version  string
+	SHA256   string
+	Features map[string]bool
+}
+
+func (s Service) inspectRuntimeAgent(ctx context.Context, server store.Server) (runtimeAgentInspection, error) {
+	result, err := s.remote.Run(ctx, server, runtimeAgentInspectionCommand())
+	if err != nil {
+		return runtimeAgentInspection{}, err
+	}
+	return parseRuntimeAgentInspection(result.Stdout), nil
+}
+
+func runtimeAgentInspectionCommand() string {
+	return strings.Join([]string{
+		"set +e",
+		"echo AIFAR_AGENT_CHECK",
+		"agent_path=\"$(command -v aifar-agent 2>/dev/null || true)\"",
+		"if [ -z \"$agent_path\" ]; then",
+		"  echo \"agentFound=false\"",
+		"  echo \"sha256=\"",
+		"  exit 0",
+		"fi",
+		"echo \"agentFound=true\"",
+		"echo \"agentPath=$agent_path\"",
+		"status_json=\"$(aifar-agent status 2>/dev/null)\"",
+		"status_rc=$?",
+		"if [ \"$status_rc\" -eq 0 ]; then",
+		"  printf 'status=%s\\n' \"$status_json\"",
+		"else",
+		"  echo \"statusError=$status_rc\"",
+		"fi",
+		"if [ -f \"$agent_path\" ] && command -v sha256sum >/dev/null 2>&1; then",
+		"  sha256sum \"$agent_path\" 2>/dev/null | awk '{print \"sha256=\" $1}'",
+		"else",
+		"  echo \"sha256=\"",
+		"fi",
+		"exit 0",
+	}, "\n")
+}
+
+func parseRuntimeAgentInspection(output string) runtimeAgentInspection {
+	inspection := runtimeAgentInspection{Features: map[string]bool{}}
+	for _, line := range strings.Split(output, "\n") {
+		key, value, ok := strings.Cut(strings.TrimSpace(line), "=")
+		if !ok {
+			continue
+		}
+		switch key {
+		case "agentFound":
+			inspection.Found = value == "true"
+		case "sha256":
+			inspection.SHA256 = strings.TrimSpace(value)
+		case "status":
+			var status struct {
+				Status   string   `json:"status"`
+				Version  string   `json:"version"`
+				Features []string `json:"features"`
+			}
+			if err := json.Unmarshal([]byte(value), &status); err != nil {
+				continue
+			}
+			inspection.Status = strings.TrimSpace(status.Status)
+			inspection.Version = strings.TrimSpace(status.Version)
+			for _, feature := range status.Features {
+				feature = strings.TrimSpace(feature)
+				if feature != "" {
+					inspection.Features[feature] = true
+				}
+			}
+		}
+	}
+	return inspection
+}
+
+func (i runtimeAgentInspection) upgradeReason(localSHA256 string) string {
+	if !i.Found {
+		return "aifar-agent is missing"
+	}
+	if i.Status != "running" {
+		return "aifar-agent is not running or status is unavailable"
+	}
+	for _, feature := range requiredRuntimeAgentFeatures {
+		if !i.Features[feature] {
+			return "aifar-agent is missing feature " + feature
+		}
+	}
+	if strings.TrimSpace(i.SHA256) == "" {
+		return "aifar-agent checksum is unavailable"
+	}
+	if !strings.EqualFold(strings.TrimSpace(i.SHA256), strings.TrimSpace(localSHA256)) {
+		return "aifar-agent binary checksum changed"
+	}
+	return ""
 }
 
 func (s Service) Install(ctx context.Context, req InstallRequest, resources []store.Resource, log Logger, targetLog targetLogger) error {
@@ -869,14 +1017,14 @@ func (s Service) UpdateArtifact(ctx context.Context, req ArtifactUpdateRequest, 
 		recorder.StartTarget(target)
 	}
 	step := newStepRunner(logForServer, recorder, target, updateSteps(copy), copy.StepStart, copy.StepDone, copy.StepFailed)
-	lockedInstance, err := s.acquireOrchestrationLock(req.Instance.ID, "update-artifact", strings.TrimSpace(req.ServiceName), req.Actor)
+	lockedInstance, err := s.acquireOrchestrationLock(req.Instance.ID, "update-artifact", strings.TrimSpace(req.ServiceName), req.Actor, fallbackTaskID(req.TaskID, log))
 	if err != nil {
 		msg := fmt.Sprintf(copy.UpdateFailed, err)
 		logForServer.Error("%s", msg)
 		finishTarget(recorder, target, "failed", msg)
 		return err
 	}
-	defer s.releaseOrchestrationLock(req.Instance.ID, "update-artifact")
+	defer s.releaseOrchestrationLock(req.Instance.ID, "update-artifact", strings.TrimSpace(req.ServiceName))
 	req.Instance = lockedInstance
 
 	var artifact artifactInfo
@@ -1341,14 +1489,14 @@ func (s Service) Delete(ctx context.Context, req DeleteRequest, log Logger, targ
 		recorder.StartTarget(target)
 	}
 	step := newStepRunner(logForServer, recorder, target, deleteSteps(copy), copy.StepStart, copy.StepDone, copy.StepFailed)
-	lockedInstance, err := s.acquireOrchestrationLock(req.Instance.ID, "delete", "", "")
+	lockedInstance, err := s.acquireOrchestrationLock(req.Instance.ID, "delete", "", req.Actor, fallbackTaskID(req.TaskID, log))
 	if err != nil {
 		msg := fmt.Sprintf(copy.DeleteFailed, err)
 		logForServer.Error("%s", msg)
 		finishTarget(recorder, target, "failed", msg)
 		return err
 	}
-	defer s.releaseOrchestrationLock(req.Instance.ID, "delete")
+	defer s.releaseOrchestrationLock(req.Instance.ID, "delete", "")
 	req.Instance = lockedInstance
 	metadata := metadataFromInstance(req.Instance)
 	networkName := stringFromMetadata(metadata, "networkName", defaultNetworkName)

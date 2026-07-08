@@ -145,7 +145,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import { useRouter } from 'vue-router'
 import { apiGet, apiPost, asArray } from '../api/client'
@@ -235,6 +235,7 @@ const monitoringRunning = ref(false)
 const monitorStartedAt = ref(0)
 const pendingMonitorTaskIds = ref<Set<string>>(new Set())
 const lastMonitorAt = ref('')
+let databaseRefreshTimer: ReturnType<typeof window.setTimeout> | null = null
 const deletePromptVisible = ref(false)
 const deleteSubmitting = ref(false)
 const pendingDeleteScope = ref<DeleteScope | null>(null)
@@ -391,6 +392,34 @@ async function settleFinishedMonitorTasks() {
   if (pending.size === 0) {
     void finishRealtimeCheck()
   }
+}
+
+function scheduleDatabaseRefresh() {
+  if (databaseRefreshTimer) return
+  databaseRefreshTimer = window.setTimeout(() => {
+    databaseRefreshTimer = null
+    void load()
+  }, 400)
+}
+
+function shouldRefreshDatabase(event: any) {
+  const type = String(event?.type ?? '')
+  const resource = String(event?.resource ?? '')
+  if (!type && !resource) return false
+  if (type === 'collector.run.started') return false
+  if (resource === 'app.instance' || type.startsWith('status.app.instance')) {
+    const app = realtimeEventApp(event)
+    return !app || ['mysql', 'redis', 'mysql-router'].includes(app)
+  }
+  if (resource === 'app.instances' && type.startsWith('collector.run.')) return true
+  if (type === 'task.finished') return true
+  return false
+}
+
+function realtimeEventApp(event: any) {
+  const payload = event?.payload ?? {}
+  const nested = payload?.payload ?? {}
+  return stringValue(nested?.app ?? payload?.app).toLowerCase()
 }
 
 function metadataOf(item: AppInstance) {
@@ -874,22 +903,26 @@ function baseNodeHealth(node: DatabaseNode) {
   if (serverStatusOffline(nodeServerStatus(node))) {
     return 'offline'
   }
-  if (['failed', 'error', 'missing', 'stopped', 'offline', 'unavailable'].includes(node.instance.status)) {
-    return 'offline'
-  }
   const lastCheckStatus = stringValue(node.metadata.lastCheck?.status)
-  const status = lastCheckStatus || node.instance.status
+  const instanceStatus = stringValue(node.instance.status).toLowerCase()
+  const status = lastCheckStatus || instanceStatus
   if (node.virtual && !serverStatusOnline(nodeServerStatus(node))) {
     return 'unknown'
   }
   if (monitoringRunning.value && !statusIsOffline(status) && isNodeCheckStaleForCurrentMonitor(node)) {
     return 'probing'
   }
-  if (statusIsOnline(status)) {
+  if (lastCheckStatus && statusIsOnline(lastCheckStatus)) {
     return 'online'
   }
-  if (statusIsOffline(status)) {
+  if (lastCheckStatus && statusIsOffline(lastCheckStatus)) {
     return 'offline'
+  }
+  if (statusIsOffline(instanceStatus)) {
+    return 'offline'
+  }
+  if (statusIsOnline(instanceStatus)) {
+    return 'online'
   }
   return 'unknown'
 }
@@ -931,11 +964,11 @@ function serverStatusOffline(status: string) {
 }
 
 function statusIsOnline(status: string) {
-  return ['ok', 'success', 'running', 'available'].includes(status)
+  return ['ok', 'success', 'running', 'available'].includes(String(status ?? '').trim().toLowerCase())
 }
 
 function statusIsOffline(status: string) {
-  return ['failed', 'error', 'missing', 'stopped', 'offline', 'unavailable'].includes(status)
+  return ['failed', 'error', 'missing', 'stopped', 'offline', 'unavailable', 'unhealthy', 'down', 'no-endpoints'].includes(String(status ?? '').trim().toLowerCase())
 }
 
 function nodeRunsSentinel(node: DatabaseNode) {
@@ -1581,19 +1614,30 @@ async function finishRealtimeCheck() {
 
 watch(() => realtime.revision, () => {
   const event = realtime.lastEvent
-  if (event?.type !== 'task.finished' || !event.taskId || !pendingMonitorTaskIds.value.has(event.taskId)) {
-    return
+  let handledMonitorTask = false
+  if (event?.type === 'task.finished' && event.taskId && pendingMonitorTaskIds.value.has(event.taskId)) {
+    handledMonitorTask = true
+    const pending = new Set(pendingMonitorTaskIds.value)
+    pending.delete(event.taskId)
+    pendingMonitorTaskIds.value = pending
+    if (pending.size === 0) {
+      void finishRealtimeCheck()
+    }
   }
-  const pending = new Set(pendingMonitorTaskIds.value)
-  pending.delete(event.taskId)
-  pendingMonitorTaskIds.value = pending
-  if (pending.size === 0) {
-    void finishRealtimeCheck()
+  if (!handledMonitorTask && shouldRefreshDatabase(event)) {
+    scheduleDatabaseRefresh()
   }
 })
 
 onMounted(async () => {
   await load()
+})
+
+onBeforeUnmount(() => {
+  if (databaseRefreshTimer) {
+    window.clearTimeout(databaseRefreshTimer)
+    databaseRefreshTimer = null
+  }
 })
 </script>
 

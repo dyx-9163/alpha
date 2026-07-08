@@ -1029,3 +1029,55 @@
 - 结论：Containers 页面移除了主内容卡片的全局 `v-loading` 遮罩，页面会先渲染基础结构和已有/空数据，接口请求中只在按钮或懒加载局部显示 loading。
 - 问题：用户反馈 Dashboard 只有关键提醒会实时刷新，服务器/Docker/数据库/对象存储状态在服务恢复后不会自动变化。
 - 结论：Dashboard 已订阅全局 realtime revision，对 status、collector、task、alert 以及 server/docker/app/runtime 事件做去抖整页刷新，让采集落库后的状态自动回到 KPI 和各状态表。
+- 问题：用户反馈数据库服务已启动后，数据库页仍显示 MySQL/Redis 服务不可用。
+- 结论：数据库页节点健康判断已改为优先使用最新 `metadata.lastCheck.status`，不再让旧的 `instance.status=unavailable` 压住恢复后的 running；同时订阅 app instance/collector/task 实时事件并去抖刷新页面数据。
+- 问题：用户询问 AIFAR Runtime 的 file 模块为何被自动扩容，要求查看记录和触发逻辑。
+- 结论：本地 `data/aifar.db` 记录显示 `file` 在 2026-07-08 15:28 和 15:40 由 `system` 触发两次 `aifar.scale.out`，原因分别为内存 92.9%/92.6% 超过 80% 并持续 5 分钟；默认策略为启用、阈值 80%、持续 300s、冷却 600s、最大副本 3，之后 15:46 由 admin 手动下线到 0 副本。
+- 问题：用户反馈手动扩缩容和上下线多个 AIFAR Deployment 时提示 `AIFAR instance orchestration is locked`。
+- 结论：根因是 AIFAR Runtime 所有编排动作共用实例级锁；已拆为全局锁与服务级锁，手动/自动扩缩容按服务互斥，不同服务可并行，全局配置、服务安装、批量制品、清理、删除等操作仍等待服务锁；补充锁语义单测并通过后端 `go test ./...`。
+- 问题：用户在下线副本过程中重启 aifar-server，导致任务中心任务一直运行中且 AIFAR 编排锁无法释放，后续上下线/扩缩容都被 `AIFAR instance orchestration is locked` 阻止。
+- 结论：已新增启动恢复机制：aifar-server 启动时会把上个进程遗留的 `pending/running` 任务标记为 `failed` 并写入恢复日志，同时清理 AIFAR 实例 metadata 中的全局/服务级 orchestration locks；恢复顺序在 autoscaler/collector 之前执行，补充 store 与 AIFAR 锁恢复测试，后端 `go test ./...` 通过。
+- 问题：用户反馈 Docker 中 AIFAR Pod 容器已启动成功，但 AIFAR Runtime 的 Deployment/Pod 仍显示下线或副本数不对，典型原因是 aifar-server 重启打断了最后的控制面落库。
+- 结论：已在 AIFAR Runtime 构建路径增加 Docker 到控制面的自修复：读取到真实运行的 AIFAR Pod 容器后，按 label 或容器名解析服务、revision 和副本，补齐/修正 aifar_deployments、aifar_replicasets、aifar_pods、aifar_service_endpoints 与实例 metadata；补充中断后 `im` 容器回写控制面的回归测试，后端 `go test ./...` 通过。
+- 问题：用户询问 `500/javax.script.ScriptException... status=502, body=dial tcp 172.19.0.5:38000: connect: cannot assign requested address` 的产生原因。
+- 结论：该错误外层 500 是脚本/业务包装，核心原因是调用 IM Presence User Status 下游服务时网关返回 502，TCP 连接到容器内网地址 `172.19.0.5:38000` 失败；`cannot assign requested address` 常见于源端临时端口/连接资源耗尽、容器网络/NAT/路由异常或上游地址已失效。
+- 问题：用户追问排查 `cannot assign requested address` 时应查看宿主机还是容器。
+- 结论：两边都要看，但优先查看发起连接的一侧；若调用发生在容器内，先查该容器的连接/TIME_WAIT/ulimit/DNS/路由，再查承载 Docker 网络的宿主机 ip_local_port_range、conntrack、Docker bridge/NAT 和目标容器 IP/端口。
+- 问题：用户在容器内执行 `dnf install -y ss` 失败，提示找不到 `ss` 包。
+- 结论：`ss` 是命令名不是包名；在 RHEL/CentOS/Rocky/Alma/Fedora 系中通常由 `iproute` 包提供，应安装 `dnf install -y iproute`，或用 `/proc/net/tcp*`、`netstat` 等方式临时替代。
+- 问题：用户要求排查宿主机和容器内系统参数对 `cannot assign requested address` 的影响。
+- 结论：建议按“调用方容器网络命名空间 + Docker 宿主机内核全局资源”两层采集：容器侧看 `ip_local_port_range`、`TIME_WAIT`、进程 `ulimit`、路由和目标连通性；宿主机侧看 `ip_local_port_range`、`ip_local_reserved_ports`、`nf_conntrack_count/max`、`fs.file-nr/file-max`、Docker 网络和目标容器 IP/监听端口，必要时用 `nsenter` 在宿主机进入容器网络命名空间排查。
+- 问题：用户截图显示报错发生时 `ss -s` 中 TCP `estab 7323`、`timewait 51642`。
+- 结论：该截图强烈指向短连接/TIME_WAIT 堆积导致源端口或连接资源接近耗尽；下一步应统计 TIME_WAIT/ESTAB 是否集中指向 `172.19.0.5:38000`，并在调用方容器网络命名空间和宿主机分别检查临时端口范围、保留端口、conntrack 与连接池复用情况。
+- 问题：用户反馈单独更新 gateway 显示 rollout 成功但没有生效，日志中 `COPY target/*.jar` 命中缓存且脚本报 `health_cmd_for_service: 未找到命令`。
+- 结论：根因是单服务/批量更新脚本只把 Java 制品复制到服务目录 `app.jar`，而 runtime-v2 旧 Dockerfile 仍使用 `COPY target/*.jar`，导致 Docker 构建输入未变化；同时 update 模板缺少 `health_cmd_for_service` 定义。已让更新脚本同时刷新 `app.jar` 和 `target/<artifact>.jar` 并补齐健康检查函数，新增模板回归测试；`go test ./internal/apps/aifar` 与 `pnpm test` 已通过。
+- 问题：用户截图显示 `docker ps` 中 gateway 2 个 Pod healthy，其它 oauth/permission/system/im/web Pod healthy，但 AIFAR Runtime Deployment 页显示 oauth/permission/system/im 为 `1/2` 降级。
+- 结论：从截图判断不是容器启动失败，而是 Deployment 控制面保存的 desired replicas 仍为 2，实际 Docker/agent 只发现 1 个 ready endpoint；Services 和 Pods 页按实际运行态显示 1/1、healthy。优先检查远端 `AIFAR_DESIRED_REPLICAS`、`runtime-spec.json` 和 `aifar-agent status` 是否仍声明这些服务 2 副本，必要时用缩容到 1 或同步运行时修正控制面期望态。
+- 问题：用户确认上述 `1/2` 降级是在点击 gateway 扩容后出现。
+- 结论：确认是扩容 gateway 生成全量 runtime spec 时，非目标服务优先沿用旧 `AIFAR_DESIRED_REPLICAS`/控制面 desired，导致 oauth/permission/system/im 残留 `=2` 被重新提交。已调整 autoscale-out 与 scale-service 脚本：目标服务按本次操作，非目标服务保留离线 0，否则按当前真实 Pod 数写 desired；Runtime 控制面自修复也允许 metadata 明确 desired 覆盖旧 Deployment desired，避免旧 2 顶回页面。`go test ./internal/apps/aifar ./internal/httpapi` 与 `pnpm test` 已通过。
+- 问题：用户删除服务器上 AIFAR 服务日志目录后，gateway 容器日志出现 `java.nio.file.NoSuchFileException: log/alpha-gateway/sentinel/sentinel-record.log...lck`。
+- 结论：这是 Alibaba Sentinel/JUL 日志轮转线程写 `log/alpha-gateway/sentinel` 下锁文件时发现父目录已被删除导致，不是业务启动失败；应重建对应日志目录并确保容器用户可写，必要时重启 gateway Pod 让 Sentinel 日志 handler 重新初始化。后续清日志不要删除正在运行容器挂载的日志目录本身，只清空目录内文件或使用按日期清理。
+- 问题：用户下线 gateway 后再扩容，任务立即失败并提示 `AIFAR service gateway orchestration is locked`，远端 target 无日志。
+- 结论：该失败发生在后端获取 gateway 服务级编排锁阶段，尚未进入远端脚本；原因不是下线服务不能扩容，而是 AIFAR 实例 metadata 中残留 `orchestrationLocks.gateway` 活跃锁，通常来自前一次 gateway 上下线/扩缩容/更新任务中断、旧版本未释放锁或 aifar-server 未重启应用锁恢复逻辑。当前源码已有启动清理残留 AIFAR 编排锁逻辑。
+- 问题：用户希望 AIFAR Runtime Pods 页里旧 revision 的 `残留` Pod 记录不要依赖手动点击“清理残留”，而是自动去掉。
+- 结论：已在 Runtime 控制面同步路径中加入自动裁剪：当 Docker 容器列表可用且构建 Pods 数据时，按当前真实 AIFAR Pod 容器名自动 prune `aifar_pods` 和 `aifar_service_endpoints` 中已不存在的记录；Docker 不可用时不会误删。补充单测验证旧 `<nil>`/旧 revision 残留 Pod 和 endpoint 会从响应与数据库中自动消失，`pnpm test` 通过。
+- 问题：用户反馈 AIFAR 服务下线后再上线/扩容容易失败，日志出现 `aifar-agent service is not reachable on 127.0.0.1:18081 ... EOF` 和 `AIFAR runtime reconcile failed for autoscaled endpoint`，要求全量扫描修复。
+- 结论：已扫描并修复 agent/reconcile 链路：`aifar-agent` HTTP handler 增加 panic recover，CLI 对 reconcile POST 的 EOF/连接重置/临时 502-504 自动重试；runtimeagent 的 deployment 并发 reconcile goroutine panic 会转成普通 apply 错误而不是打死 agent；后台 resync/docker event/Nacos heartbeat 增加 panic 保护；Nacos 代理同步失败不再让已完成的容器期望态 reconcile 判失败，而是写入 Nacos 降级状态并由后台心跳重放；下线 0 副本时会删除缺少 replica label 的旧 Pod。补充 EOF 重试、panic recover、Nacos 非致命、离线清理单测，`pnpm test` 通过。
+- 问题：用户询问 AIFAR Runtime 扩容/缩容是否会重启 `aifar-agent`。
+- 结论：当前源码会重启。手动扩容、缩容、下线以及自动扩容都会在执行 runtime spec reconcile 前调用 `ensureRuntimeAgent`，该函数会上传当前 `aifar-agent` 二进制到远端、安装到 `/usr/local/bin/aifar-agent` 并执行 `systemctl restart aifar-agent`；随后脚本才调用 `aifar-agent reconcile-runtime --spec ...` 调整业务 Pod。
+- 问题：用户要求扩缩容时只检查 `aifar-agent` 是否可用，只有 agent 缺失、能力不足或版本变化时才升级并重启，不要每次扩缩容都 restart。
+- 结论：已将 `ensureRuntimeAgent` 改为先远端执行 `AIFAR_AGENT_CHECK`，检查 agent 是否存在、`status` 是否 running、是否包含 `reconcile-runtime/local-runtime-controller/endpoint-cache` 能力，并比较远端 `aifar-agent` SHA256 与本地发布二进制；完全一致时跳过上传和 `systemctl restart aifar-agent`，仅在缺失、不可用、能力不足、指纹缺失或指纹变化时升级重启。新增当前版本跳过、checksum 变化升级、能力缺失升级测试；`go test ./internal/apps/aifar`、`pnpm test`、`git diff --check` 通过。
+- 问题：用户截图询问卸载 AIFAR 服务时报 `AIFAR instance orchestration is locked` 的原因。
+- 结论：本地库中该 AIFAR 实例仍残留 `orchestrationLocks.gateway` 与 `orchestrationLocks.im` 服务级锁，分别来自 2026-07-08 21:09 左右的 autoscale/scale-service 操作；卸载是全局编排操作，会等待任一服务级锁释放，因此在未清理锁或未触发启动恢复前会失败。
+- 问题：用户追问 AIFAR 编排锁多久会释放。
+- 结论：当前源码中 `orchestrationLockTTL` 为 1 小时；本次 gateway/im 残留锁分别会在 2026-07-08 22:09:43 和 22:09:46 +08:00 后过期，过期锁会在下一次获取编排锁时被清理，而不是后台定时即时清掉。
+- 问题：用户要求读取当前数据库确认是否还有锁定。
+- 结论：只读查询 `data/aifar.db` 显示 AIFAR 实例 `app_31dbbcc0dcd4f260166414fe` 仍有两个有效服务级锁：`gateway` 的 `autoscale` 和 `im` 的 `scale-service`，均会在 2026-07-08 22:09:4x +08:00 后过期；当前没有 `pending/running` 任务。
+- 问题：用户询问 AIFAR 编排锁应查看哪张表。
+- 结论：AIFAR 编排锁不在独立锁表中，而是在 `app_instances.metadata` JSON 字段里，键为 `orchestrationLock` 或 `orchestrationLocks`；任务是否仍运行可辅助查看 `tasks` 表的 `pending/running` 状态。
+- 问题：用户认为 AIFAR Runtime 把期望态、运行态、指标和编排锁都放在 `app_instances.metadata` 中容易造成服务端与数据库状态不一致，要求进行优化。
+- 结论：已优先将编排锁结构化：新增 `aifar_orchestration_locks` 表和 store 层 acquire/release/recover/list 方法，锁记录包含 instance/service/operation/actor/task_id/status/started/expires/released 时间；AIFAR acquire/release 真实 store 改走锁表，并会把旧 metadata 的 `orchestrationLock(s)` 迁移到锁表后清除；启动恢复会同时 recover 锁表 active 锁；autoscaler 会读取锁表避免重复创建失败任务；HTTP/模块层为删除、更新、运行时配置、同步、清理、扩缩容等编排动作传递 task id。`go test ./internal/store ./internal/apps/aifar`、`pnpm test`、`git diff --check` 已通过。
+- 问题：用户删除所有服务后仍无法删除凭据，提示“该凭据仍绑定应用实例，不能直接删除”。
+- 结论：本地库 `app_instances` 已为空，但 `credential_bindings` 仍有 34 条指向已删除实例的孤儿绑定，部分 `credentials.app_instance_id` 也指向不存在实例。已优化 store：删除应用实例时同步清凭据绑定和直连引用；删除凭据前清理孤儿绑定并只统计仍存在实例的绑定；列表/详情不再回显失效实例引用。补充凭据删除与实例删除回归测试，`go test ./internal/store`、`pnpm test`、`git diff --check` 已通过。
+- 问题：用户要求按最终闭环验收与部署调优计划落地，修复大离线资源打包失败、补充配置建议和 Docker 宿主机 sysctl 建议。
+- 结论：`scripts/package-release.mjs` 的 release checksum 已改为分块流式 SHA256，避免 `resources/aifar.zip` 超 2 GiB 时触发 Node Buffer 限制；Windows zip 归档改用 `tar -a` 避免 `Compress-Archive` 大文件限制。`README.md` 已补充生产配置、可继续抽取的配置项和 Docker 宿主机 sysctl 建议。`pnpm test`、`pnpm web:build`、`pnpm backend:build`、`pnpm package` 均通过，且 `resources/aifar.zip` 的发布包 checksum 与独立 `Get-FileHash` 校验一致。

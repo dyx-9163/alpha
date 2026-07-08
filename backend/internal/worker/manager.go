@@ -99,6 +99,17 @@ func (m *Manager) SetEventPublisher(events EventPublisher) {
 	m.mu.Unlock()
 }
 
+func (m *Manager) RecoverInterruptedTasks(lang string) ([]store.Task, error) {
+	tasks, err := m.store.RecoverInterruptedTasks(i18n.Text(lang, "worker.taskInterruptedByRestart"))
+	if err != nil {
+		return nil, err
+	}
+	for _, task := range tasks {
+		m.publishTaskEvent(task.ID, "failed")
+	}
+	return tasks, nil
+}
+
 func (m *Manager) Start(taskType, target, actor string, job Job) (store.Task, error) {
 	return m.StartWithLanguage(taskType, target, actor, "", job)
 }

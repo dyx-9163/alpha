@@ -105,7 +105,7 @@ func (a *Autoscaler) tick(ctx context.Context, now time.Time) {
 		if !policy.Enabled {
 			continue
 		}
-		if orchestrationLocked(metadata, now) {
+		if orchestrationLocked(metadata, now) || a.orchestrationLocked(instance.ID, "", now) {
 			continue
 		}
 		server, err := a.store.GetServer(instance.ServerID, true)
@@ -120,6 +120,9 @@ func (a *Autoscaler) tick(ctx context.Context, now time.Time) {
 		next, decision := evaluateAutoscale(instance, metadata, status, policy, now)
 		if decision.Service == "" {
 			_ = saveMetadata(a.store, instance, next)
+			continue
+		}
+		if serviceOrchestrationLocked(metadata, decision.Service, now) || a.orchestrationLocked(instance.ID, decision.Service, now) {
 			continue
 		}
 		task, err := a.tasks.StartWithLanguage(autoscaleTaskType, instance.ID+":"+decision.Service, autoscaleActor, "", func(taskCtx context.Context, log worker.Logger) error {
@@ -239,12 +242,12 @@ func (s Service) ScaleOut(ctx context.Context, req ScaleOutRequest, log Logger, 
 	if recorder != nil {
 		recorder.StartTarget(target)
 	}
-	current, err := s.acquireOrchestrationLock(req.Instance.ID, "autoscale", service, req.Actor)
+	current, err := s.acquireOrchestrationLock(req.Instance.ID, "autoscale", service, req.Actor, fallbackTaskID(req.TaskID, log))
 	if err != nil {
 		finishTarget(recorder, target, "failed", err.Error())
 		return err
 	}
-	defer s.releaseOrchestrationLock(req.Instance.ID, "autoscale")
+	defer s.releaseOrchestrationLock(req.Instance.ID, "autoscale", service)
 
 	metadata := metadataFromInstance(current)
 	if err := ensureK8sLikeMetadata(metadata, UpdateCopy{LegacyUpdateUnsupported: "legacy AIFAR orchestration model %s does not support autoscale; reinstall with k8s-like orchestration first"}); err != nil {
@@ -657,8 +660,7 @@ func copyMetadata(metadata map[string]any) map[string]any {
 	return out
 }
 
-func orchestrationLocked(metadata map[string]any, now time.Time) bool {
-	lock, _ := metadata["orchestrationLock"].(map[string]any)
+func activeOrchestrationLock(lock map[string]any, now time.Time) bool {
 	if len(lock) == 0 {
 		return false
 	}
@@ -673,20 +675,151 @@ func orchestrationLocked(metadata map[string]any, now time.Time) bool {
 	return now.Sub(t) < orchestrationLockTTL
 }
 
-func (s Service) acquireOrchestrationLock(instanceID, operation, serviceName, actor string) (store.AppInstance, error) {
+func orchestrationLocked(metadata map[string]any, now time.Time) bool {
+	lock, _ := metadata["orchestrationLock"].(map[string]any)
+	return activeOrchestrationLock(lock, now)
+}
+
+func serviceOrchestrationLocksFromMetadata(metadata map[string]any) map[string]map[string]any {
+	locks := map[string]map[string]any{}
+	if typed, ok := metadata["orchestrationLocks"].(map[string]map[string]any); ok {
+		for service, lock := range typed {
+			if strings.TrimSpace(service) != "" && len(lock) > 0 {
+				locks[service] = lock
+			}
+		}
+		return locks
+	}
+	raw, _ := metadata["orchestrationLocks"].(map[string]any)
+	for service, value := range raw {
+		if strings.TrimSpace(service) == "" {
+			continue
+		}
+		if lock, ok := value.(map[string]any); ok {
+			locks[service] = lock
+			continue
+		}
+		data, err := json.Marshal(value)
+		if err != nil {
+			continue
+		}
+		var lock map[string]any
+		if err := json.Unmarshal(data, &lock); err == nil && len(lock) > 0 {
+			locks[service] = lock
+		}
+	}
+	return locks
+}
+
+func serviceOrchestrationLocked(metadata map[string]any, service string, now time.Time) bool {
+	locks := serviceOrchestrationLocksFromMetadata(metadata)
+	return activeOrchestrationLock(locks[strings.TrimSpace(service)], now)
+}
+
+func pruneExpiredOrchestrationLocks(metadata map[string]any, now time.Time) {
+	lock, _ := metadata["orchestrationLock"].(map[string]any)
+	if len(lock) > 0 && !activeOrchestrationLock(lock, now) {
+		delete(metadata, "orchestrationLock")
+	}
+
+	locks := serviceOrchestrationLocksFromMetadata(metadata)
+	changed := false
+	for service, lock := range locks {
+		if !activeOrchestrationLock(lock, now) {
+			delete(locks, service)
+			changed = true
+		}
+	}
+	if !changed {
+		return
+	}
+	if len(locks) == 0 {
+		delete(metadata, "orchestrationLocks")
+		return
+	}
+	metadata["orchestrationLocks"] = locks
+}
+
+func anyServiceOrchestrationLocked(metadata map[string]any, now time.Time) bool {
+	for _, lock := range serviceOrchestrationLocksFromMetadata(metadata) {
+		if activeOrchestrationLock(lock, now) {
+			return true
+		}
+	}
+	return false
+}
+
+func (a *Autoscaler) orchestrationLocked(instanceID, serviceName string, now time.Time) bool {
+	locks, err := a.store.ListAIFAROrchestrationLocks(instanceID, true)
+	if err != nil {
+		return false
+	}
+	serviceName = strings.TrimSpace(serviceName)
+	for _, lock := range locks {
+		if !lock.ExpiresAt.IsZero() && !now.Before(lock.ExpiresAt) {
+			continue
+		}
+		if serviceName == "" || lock.ServiceName == "" || lock.ServiceName == serviceName {
+			return true
+		}
+	}
+	return false
+}
+
+func (s Service) acquireOrchestrationLock(instanceID, operation, serviceName, actor, taskID string) (store.AppInstance, error) {
 	instance, err := s.store.GetAppInstance(instanceID)
 	if err != nil {
 		return instance, err
 	}
 	metadata := metadataFromInstance(instance)
-	if orchestrationLocked(metadata, time.Now().UTC()) {
+	now := time.Now().UTC()
+	if lockStore, ok := s.store.(aifarOrchestrationLockStore); ok {
+		migrated, err := s.migrateLegacyOrchestrationLocks(lockStore, instance, metadata, now)
+		if err != nil {
+			return migrated, err
+		}
+		instance = migrated
+		lock := store.AIFAROrchestrationLock{
+			InstanceID:  instance.ID,
+			ServiceName: strings.TrimSpace(serviceName),
+			Operation:   strings.TrimSpace(operation),
+			Actor:       strings.TrimSpace(actor),
+			TaskID:      strings.TrimSpace(taskID),
+			StartedAt:   now,
+			ExpiresAt:   now.Add(orchestrationLockTTL),
+		}
+		if _, err := lockStore.AcquireAIFAROrchestrationLock(lock); err != nil {
+			var conflict store.AIFAROrchestrationLockConflict
+			if errors.As(err, &conflict) {
+				return instance, orchestrationConflictError(serviceName, conflict.Lock.ServiceName)
+			}
+			return instance, err
+		}
+		return instance, nil
+	}
+	pruneExpiredOrchestrationLocks(metadata, now)
+	if orchestrationLocked(metadata, now) {
 		return instance, fmt.Errorf("AIFAR instance orchestration is locked")
 	}
-	metadata["orchestrationLock"] = map[string]any{
+	lock := map[string]any{
 		"operation": operation,
 		"service":   serviceName,
 		"actor":     actor,
-		"startedAt": time.Now().UTC().Format(time.RFC3339),
+		"taskId":    taskID,
+		"startedAt": now.Format(time.RFC3339),
+	}
+	if strings.TrimSpace(serviceName) == "" {
+		if anyServiceOrchestrationLocked(metadata, now) {
+			return instance, fmt.Errorf("AIFAR instance orchestration is locked")
+		}
+		metadata["orchestrationLock"] = lock
+	} else {
+		locks := serviceOrchestrationLocksFromMetadata(metadata)
+		if activeOrchestrationLock(locks[serviceName], now) {
+			return instance, fmt.Errorf("AIFAR service %s orchestration is locked", serviceName)
+		}
+		locks[serviceName] = lock
+		metadata["orchestrationLocks"] = locks
 	}
 	if err := saveMetadata(s.store, instance, metadata); err != nil {
 		return instance, err
@@ -695,18 +828,124 @@ func (s Service) acquireOrchestrationLock(instanceID, operation, serviceName, ac
 	return instance, nil
 }
 
-func (s Service) releaseOrchestrationLock(instanceID, operation string) {
+func (s Service) releaseOrchestrationLock(instanceID, operation, serviceName string) {
+	if lockStore, ok := s.store.(aifarOrchestrationLockStore); ok {
+		if released, err := lockStore.ReleaseAIFAROrchestrationLock(instanceID, operation, serviceName); err == nil && released {
+			return
+		}
+	}
 	instance, err := s.store.GetAppInstance(instanceID)
 	if err != nil {
 		return
 	}
 	metadata := metadataFromInstance(instance)
+	if strings.TrimSpace(serviceName) != "" {
+		locks := serviceOrchestrationLocksFromMetadata(metadata)
+		lock := locks[serviceName]
+		if len(lock) > 0 {
+			if strings.TrimSpace(fmt.Sprint(lock["operation"])) != operation {
+				return
+			}
+			delete(locks, serviceName)
+			if len(locks) == 0 {
+				delete(metadata, "orchestrationLocks")
+			} else {
+				metadata["orchestrationLocks"] = locks
+			}
+			_ = saveMetadata(s.store, instance, metadata)
+			return
+		}
+
+		legacyLock, _ := metadata["orchestrationLock"].(map[string]any)
+		if strings.TrimSpace(fmt.Sprint(legacyLock["operation"])) != operation ||
+			strings.TrimSpace(fmt.Sprint(legacyLock["service"])) != serviceName {
+			return
+		}
+		delete(metadata, "orchestrationLock")
+		_ = saveMetadata(s.store, instance, metadata)
+		return
+	}
+
 	lock, _ := metadata["orchestrationLock"].(map[string]any)
 	if strings.TrimSpace(fmt.Sprint(lock["operation"])) != operation {
 		return
 	}
 	delete(metadata, "orchestrationLock")
 	_ = saveMetadata(s.store, instance, metadata)
+}
+
+func (s Service) migrateLegacyOrchestrationLocks(lockStore aifarOrchestrationLockStore, instance store.AppInstance, metadata map[string]any, now time.Time) (store.AppInstance, error) {
+	globalLock, hasGlobal := metadata["orchestrationLock"].(map[string]any)
+	serviceLocks := serviceOrchestrationLocksFromMetadata(metadata)
+	if !hasGlobal && len(serviceLocks) == 0 {
+		return instance, nil
+	}
+	legacy := make([]store.AIFAROrchestrationLock, 0, len(serviceLocks)+1)
+	if hasGlobal && activeOrchestrationLock(globalLock, now) {
+		legacy = append(legacy, legacyOrchestrationLock(instance.ID, "", globalLock, now))
+	}
+	for serviceName, lock := range serviceLocks {
+		if activeOrchestrationLock(lock, now) {
+			legacy = append(legacy, legacyOrchestrationLock(instance.ID, serviceName, lock, now))
+		}
+	}
+	for _, lock := range legacy {
+		if _, err := lockStore.AcquireAIFAROrchestrationLock(lock); err != nil {
+			var conflict store.AIFAROrchestrationLockConflict
+			if !errors.As(err, &conflict) {
+				return instance, err
+			}
+		}
+	}
+	delete(metadata, "orchestrationLock")
+	delete(metadata, "orchestrationLocks")
+	metadata["lastOrchestrationLockMigration"] = map[string]any{
+		"migratedAt": now.Format(time.RFC3339),
+		"count":      len(legacy),
+	}
+	if err := saveMetadata(s.store, instance, metadata); err != nil {
+		return instance, err
+	}
+	instance.Metadata = mustMarshalMetadata(metadata)
+	return instance, nil
+}
+
+func legacyOrchestrationLock(instanceID, serviceName string, lock map[string]any, now time.Time) store.AIFAROrchestrationLock {
+	startedAt := orchestrationLockStartedAt(lock, now)
+	operation := strings.TrimSpace(fmt.Sprint(lock["operation"]))
+	if operation == "" {
+		operation = "legacy"
+	}
+	return store.AIFAROrchestrationLock{
+		InstanceID:  instanceID,
+		ServiceName: strings.TrimSpace(serviceName),
+		Operation:   operation,
+		Actor:       strings.TrimSpace(fmt.Sprint(lock["actor"])),
+		TaskID:      strings.TrimSpace(fmt.Sprint(lock["taskId"])),
+		StartedAt:   startedAt,
+		ExpiresAt:   startedAt.Add(orchestrationLockTTL),
+	}
+}
+
+func orchestrationLockStartedAt(lock map[string]any, fallback time.Time) time.Time {
+	startedAt := strings.TrimSpace(fmt.Sprint(lock["startedAt"]))
+	if startedAt == "" {
+		return fallback
+	}
+	t, err := time.Parse(time.RFC3339, startedAt)
+	if err != nil {
+		return fallback
+	}
+	return t.UTC()
+}
+
+func orchestrationConflictError(requestService, conflictService string) error {
+	requestService = strings.TrimSpace(requestService)
+	conflictService = strings.TrimSpace(conflictService)
+	if requestService != "" && conflictService == requestService {
+		return fmt.Errorf("AIFAR service %s orchestration is locked", requestService)
+	}
+	return fmt.Errorf("AIFAR instance orchestration is locked")
 }
 
 func mustMarshalMetadata(metadata map[string]any) string {

@@ -22,6 +22,19 @@ import (
 
 const aifarK8sLikeModel = "agent-runtime-v2"
 
+var aifarRuntimeKnownServices = []string{
+	"oauth",
+	"permission",
+	"system",
+	"file",
+	"message",
+	"im",
+	"contacts",
+	"meeting",
+	"gateway",
+	"web-vue3",
+}
+
 type aifarRuntimeResponse struct {
 	ServerID      string                   `json:"serverId"`
 	RuntimeStatus string                   `json:"runtimeStatus"`
@@ -165,6 +178,18 @@ type aifarRuntimeIngress struct {
 	GatewayRoute string `json:"gatewayRoute,omitempty"`
 	WebRoute     string `json:"webRoute,omitempty"`
 	Error        string `json:"error,omitempty"`
+}
+
+type discoveredAIFARPod struct {
+	ServiceName   string
+	Revision      string
+	ReplicaID     int
+	PodID         string
+	ContainerName string
+	Image         string
+	Port          int
+	Status        string
+	Ready         bool
 }
 
 type aifarRuntimeLogsResponse struct {
@@ -584,7 +609,8 @@ func (a *API) aifarRuntimeReconcile(w http.ResponseWriter, r *http.Request) {
 			Actor:    actor,
 			Reason:   "manual container runtime reconcile",
 		}, registry.RunContext{
-			Log: log,
+			TaskID: log.TaskID(),
+			Log:    log,
 			TargetLog: func(target string) registry.Logger {
 				return log.Target(target)
 			},
@@ -636,7 +662,8 @@ func (a *API) aifarRuntimeCleanupStale(w http.ResponseWriter, r *http.Request) {
 			Actor:    actor,
 			Reason:   strings.TrimSpace(req.Reason),
 		}, registry.RunContext{
-			Log: log,
+			TaskID: log.TaskID(),
+			Log:    log,
 			TargetLog: func(target string) registry.Logger {
 				return log.Target(target)
 			},
@@ -688,7 +715,8 @@ func (a *API) aifarRuntimeUninstallAgent(w http.ResponseWriter, r *http.Request)
 			Actor:    actor,
 			Reason:   strings.TrimSpace(req.Reason),
 		}, registry.RunContext{
-			Log: log,
+			TaskID: log.TaskID(),
+			Log:    log,
 			TargetLog: func(target string) registry.Logger {
 				return log.Target(target)
 			},
@@ -759,7 +787,8 @@ func (a *API) aifarRuntimeConfig(w http.ResponseWriter, r *http.Request) {
 				NacosEphemeral: req.NacosEphemeral,
 			},
 		}, registry.RunContext{
-			Log: log,
+			TaskID: log.TaskID(),
+			Log:    log,
 			TargetLog: func(target string) registry.Logger {
 				return log.Target(target)
 			},
@@ -816,7 +845,8 @@ func (a *API) aifarRuntimeInstallServices(w http.ResponseWriter, r *http.Request
 			Services: services,
 			Reason:   strings.TrimSpace(req.Reason),
 		}, registry.RunContext{
-			Log: log,
+			TaskID: log.TaskID(),
+			Log:    log,
 			TargetLog: func(target string) registry.Logger {
 				return log.Target(target)
 			},
@@ -869,7 +899,8 @@ func (a *API) aifarRuntimeScaleOut(w http.ResponseWriter, r *http.Request) {
 			ServiceName: service,
 			Reason:      "manual container runtime scale-out",
 		}, registry.RunContext{
-			Log: log,
+			TaskID: log.TaskID(),
+			Log:    log,
 			TargetLog: func(target string) registry.Logger {
 				return log.Target(target)
 			},
@@ -931,7 +962,8 @@ func (a *API) aifarRuntimeScaleIn(w http.ResponseWriter, r *http.Request) {
 			Replicas:    nextReplicas,
 			Reason:      "manual container runtime scale-in",
 		}, registry.RunContext{
-			Log: log,
+			TaskID: log.TaskID(),
+			Log:    log,
 			TargetLog: func(target string) registry.Logger {
 				return log.Target(target)
 			},
@@ -985,7 +1017,8 @@ func (a *API) aifarRuntimeOfflineService(w http.ResponseWriter, r *http.Request)
 			Replicas:    0,
 			Reason:      "manual container runtime service offline",
 		}, registry.RunContext{
-			Log: log,
+			TaskID: log.TaskID(),
+			Log:    log,
 			TargetLog: func(target string) registry.Logger {
 				return log.Target(target)
 			},
@@ -1172,6 +1205,18 @@ func (a *API) appendAIFARInstanceRuntime(response *aifarRuntimeResponse, instanc
 	replicasets, _ := a.store.ListAIFARReplicaSets(instance.ID)
 	pods, _ := a.store.ListAIFARPods(instance.ID)
 	endpoints, _ := a.store.ListAIFARServiceEndpoints(instance.ID)
+	if options.IncludePods && !options.DockerUnavailable {
+		if a.reconcileAIFARRuntimeControlPlane(instance, metadata, deployments, pods, endpoints, containersByName) {
+			if saved, err := a.store.GetAppInstance(instance.ID); err == nil {
+				instance = saved
+				metadata = runtimeMetadata(instance.Metadata)
+			}
+			deployments, _ = a.store.ListAIFARDeployments(instance.ID)
+			replicasets, _ = a.store.ListAIFARReplicaSets(instance.ID)
+			pods, _ = a.store.ListAIFARPods(instance.ID)
+			endpoints, _ = a.store.ListAIFARServiceEndpoints(instance.ID)
+		}
+	}
 	replicaImage := latestReplicaImages(replicasets)
 	endpointReadyByService := readyEndpointCounts(endpoints)
 	agentDeployments := response.Agent.deploymentStatusByService(instance.ID)
@@ -1462,6 +1507,825 @@ func applyDockerUnavailableToRuntimeService(row *aifarRuntimeService, options ai
 	}
 }
 
+func (a *API) reconcileAIFARRuntimeControlPlane(instance store.AppInstance, metadata map[string]any, deployments []store.AIFARDeployment, pods []store.AIFARPod, endpoints []store.AIFARServiceEndpoint, containersByName map[string]adapter.DockerContainer) bool {
+	discovered := discoverAIFARPodsFromDocker(metadata, containersByName)
+	changed := a.pruneAIFARRuntimeResidualRecords(instance.ID, discovered)
+	if len(discovered) == 0 {
+		return changed
+	}
+	deploymentsByService := make(map[string]store.AIFARDeployment, len(deployments))
+	for _, deployment := range deployments {
+		deploymentsByService[deployment.ServiceName] = deployment
+	}
+	replicaSets, _ := a.store.ListAIFARReplicaSets(instance.ID)
+	replicaSetsByKey := make(map[string]store.AIFARReplicaSet, len(replicaSets))
+	for _, item := range replicaSets {
+		replicaSetsByKey[runtimeServiceRevisionKey(item.ServiceName, item.Revision)] = item
+	}
+	podsByKey := make(map[string]store.AIFARPod, len(pods))
+	for _, pod := range pods {
+		podsByKey[runtimeServicePodKey(pod.ServiceName, pod.PodID)] = pod
+	}
+	endpointsByService := map[string][]store.AIFARServiceEndpoint{}
+	for _, endpoint := range endpoints {
+		endpointsByService[endpoint.ServiceName] = append(endpointsByService[endpoint.ServiceName], endpoint)
+	}
+	explicitDesiredFromMetadata := runtimeDesiredReplicasFromMetadata(metadata)
+	desiredFromMetadata := make(map[string]int, len(explicitDesiredFromMetadata)+len(deployments))
+	for service, replicas := range explicitDesiredFromMetadata {
+		desiredFromMetadata[service] = replicas
+	}
+	for _, deployment := range deployments {
+		if _, ok := desiredFromMetadata[deployment.ServiceName]; !ok {
+			desiredFromMetadata[deployment.ServiceName] = deployment.DesiredReplicas
+		}
+	}
+	grouped := map[string][]discoveredAIFARPod{}
+	for _, pod := range discovered {
+		grouped[pod.ServiceName] = append(grouped[pod.ServiceName], pod)
+	}
+	services := runtimeMergeServices(runtimeServicesFromMetadata(metadata), runtimeDeploymentServiceNames(deployments), runtimeDiscoveredServiceNames(discovered))
+	gatewayPort := runtimeInt(metadata, "gatewayPort", 38000)
+	webPort := runtimeInt(metadata, "webPort", 8080)
+	nextMetadata := copyRuntimeMetadata(metadata)
+	metadataChanged := false
+	if !runtimeJSONEqual(runtimeDesiredReplicasFromMetadata(nextMetadata), desiredFromMetadata) {
+		nextMetadata["desiredReplicas"] = desiredFromMetadata
+		metadataChanged = true
+	}
+	for service, servicePods := range grouped {
+		sort.Slice(servicePods, func(i, j int) bool {
+			if servicePods[i].ReplicaID == servicePods[j].ReplicaID {
+				return servicePods[i].ContainerName < servicePods[j].ContainerName
+			}
+			return servicePods[i].ReplicaID < servicePods[j].ReplicaID
+		})
+		desired := runtimeDiscoveredDesiredReplicas(servicePods)
+		if explicit, ok := explicitDesiredFromMetadata[service]; ok {
+			desired = explicit
+		} else {
+			if existing := deploymentsByService[service]; existing.DesiredReplicas > desired {
+				desired = existing.DesiredReplicas
+			}
+			if existing := desiredFromMetadata[service]; existing > desired {
+				desired = existing
+			}
+		}
+		ready := runtimeDiscoveredReadyReplicas(servicePods)
+		revision := runtimeDiscoveredRevision(servicePods)
+		image := runtimeDiscoveredImage(servicePods)
+		status := runtimeDiscoveredServiceStatus(desired, ready)
+		existingDeployment, hasDeployment := deploymentsByService[service]
+		strategyJSON := cleanRuntimeText(existingDeployment.StrategyJSON)
+		if strategyJSON == "" {
+			strategyJSON = runtimeMarshalJSON(map[string]any{"type": "DockerReconcile", "source": "docker"})
+		}
+		deploymentMetadata := runtimeMarshalJSON(map[string]any{"operation": "docker-reconcile", "source": "docker"})
+		nextDeployment := store.AIFARDeployment{
+			ID:               existingDeployment.ID,
+			InstanceID:       instance.ID,
+			ServiceName:      service,
+			DesiredReplicas:  desired,
+			CurrentRevision:  revision,
+			UpdatingRevision: "",
+			StrategyJSON:     strategyJSON,
+			Status:           status,
+			MetadataJSON:     deploymentMetadata,
+			CreatedAt:        existingDeployment.CreatedAt,
+		}
+		if !hasDeployment || !runtimeDeploymentEqual(existingDeployment, nextDeployment) {
+			if _, err := a.store.SaveAIFARDeployment(nextDeployment); err == nil {
+				changed = true
+			}
+		}
+		if revision != "" {
+			existingReplicaSet := replicaSetsByKey[runtimeServiceRevisionKey(service, revision)]
+			artifactHash := cleanRuntimeText(existingReplicaSet.ArtifactHash)
+			if image == "" {
+				image = cleanRuntimeText(existingReplicaSet.Image)
+			}
+			nextReplicaSet := store.AIFARReplicaSet{
+				ID:           existingReplicaSet.ID,
+				InstanceID:   instance.ID,
+				ServiceName:  service,
+				Revision:     revision,
+				Image:        image,
+				ArtifactHash: artifactHash,
+				DesiredPods:  desired,
+				ReadyPods:    ready,
+				Status:       status,
+				MetadataJSON: runtimeMarshalJSON(map[string]any{"operation": "docker-reconcile", "source": "docker"}),
+				CreatedAt:    existingReplicaSet.CreatedAt,
+			}
+			if existingReplicaSet.ID == "" || !runtimeReplicaSetEqual(existingReplicaSet, nextReplicaSet) {
+				if _, err := a.store.SaveAIFARReplicaSet(nextReplicaSet); err == nil {
+					changed = true
+				}
+			}
+		}
+		nextEndpoints := make([]store.AIFARServiceEndpoint, 0, ready)
+		for _, pod := range servicePods {
+			port := pod.Port
+			if port <= 0 {
+				port = aifarRuntimeServiceDefaultPort(service, gatewayPort, webPort)
+			}
+			existingPod := podsByKey[runtimeServicePodKey(service, pod.PodID)]
+			nextPod := store.AIFARPod{
+				ID:            existingPod.ID,
+				InstanceID:    instance.ID,
+				ServiceName:   service,
+				Revision:      pod.Revision,
+				PodID:         pod.PodID,
+				ContainerName: pod.ContainerName,
+				Port:          port,
+				Status:        pod.Status,
+				Ready:         pod.Ready,
+				MetadataJSON:  runtimeMarshalJSON(aifarRuntimeEndpointMetadata(pod, port)),
+				CreatedAt:     existingPod.CreatedAt,
+			}
+			if existingPod.ID == "" || !runtimePodEqual(existingPod, nextPod) {
+				if _, err := a.store.SaveAIFARPod(nextPod); err == nil {
+					changed = true
+				}
+			}
+			if pod.Ready {
+				nextEndpoints = append(nextEndpoints, store.AIFARServiceEndpoint{
+					InstanceID:    instance.ID,
+					ServiceName:   service,
+					PodID:         pod.PodID,
+					ContainerName: pod.ContainerName,
+					Revision:      pod.Revision,
+					Port:          port,
+					State:         "active",
+					Ready:         true,
+					MetadataJSON:  runtimeMarshalJSON(aifarRuntimeEndpointMetadata(pod, port)),
+				})
+			}
+		}
+		if !runtimeEndpointsEqual(endpointsByService[service], nextEndpoints) {
+			if err := a.store.ReplaceAIFARServiceEndpoints(instance.ID, service, nextEndpoints); err == nil {
+				changed = true
+			}
+		}
+		if runtimeApplyDiscoveredServiceMetadata(nextMetadata, service, desired, servicePods, nextEndpoints, services) {
+			metadataChanged = true
+		}
+	}
+	if metadataChanged {
+		nextMetadata["lastDockerReconcileAt"] = time.Now().UTC().Format(time.RFC3339)
+		if raw, err := json.Marshal(nextMetadata); err == nil {
+			instance.Metadata = string(raw)
+			if _, err := a.store.SaveAppInstance(instance); err == nil {
+				changed = true
+			}
+		}
+	}
+	return changed
+}
+
+func (a *API) pruneAIFARRuntimeResidualRecords(instanceID string, discovered []discoveredAIFARPod) bool {
+	existingContainers := make([]string, 0, len(discovered))
+	for _, pod := range discovered {
+		if name := cleanRuntimeText(pod.ContainerName); name != "" {
+			existingContainers = append(existingContainers, name)
+		}
+	}
+	changed := false
+	if pruned, err := a.store.PruneAIFARPodRecords(instanceID, existingContainers); err == nil && pruned > 0 {
+		changed = true
+	}
+	if pruned, err := a.store.PruneAIFARServiceEndpointRecords(instanceID, existingContainers); err == nil && pruned > 0 {
+		changed = true
+	}
+	return changed
+}
+
+func discoverAIFARPodsFromDocker(metadata map[string]any, containersByName map[string]adapter.DockerContainer) []discoveredAIFARPod {
+	installRoot := normalizeRuntimeInstallRoot(runtimeString(metadata, "installRoot", ""))
+	gatewayPort := runtimeInt(metadata, "gatewayPort", 38000)
+	webPort := runtimeInt(metadata, "webPort", 8080)
+	out := make([]discoveredAIFARPod, 0, len(containersByName))
+	for _, row := range containersByName {
+		pod, ok := discoveredAIFARPodFromDocker(row, installRoot, gatewayPort, webPort)
+		if ok {
+			out = append(out, pod)
+		}
+	}
+	return out
+}
+
+func discoveredAIFARPodFromDocker(row adapter.DockerContainer, installRoot string, gatewayPort, webPort int) (discoveredAIFARPod, bool) {
+	labels := row.Labels
+	labelApp := cleanRuntimeText(labels["aifar.app"])
+	labelComponent := cleanRuntimeText(labels["aifar.component"])
+	if labelApp != "" || labelComponent != "" {
+		if labelApp != "aifar" || labelComponent != "pod" {
+			return discoveredAIFARPod{}, false
+		}
+	}
+	if labelRoot := normalizeRuntimeInstallRoot(labels["aifar.install-root"]); labelRoot != "" && installRoot != "" && labelRoot != installRoot {
+		return discoveredAIFARPod{}, false
+	}
+	parsedInstance, parsedService, parsedRevision, parsedReplica, parsedOK := parseAIFARPodContainerName(row.Name)
+	if !parsedOK && labelApp == "" && labelComponent == "" {
+		return discoveredAIFARPod{}, false
+	}
+	if parsedOK && labels["aifar.install-root"] == "" {
+		if base := runtimeInstallRootBase(installRoot); base != "" && parsedInstance != "" && parsedInstance != base {
+			return discoveredAIFARPod{}, false
+		}
+	}
+	service := cleanRuntimeText(labels["aifar.service"])
+	if service == "" {
+		service = parsedService
+	}
+	service = cleanRuntimeText(service)
+	if !aifarRuntimeKnownService(service) {
+		return discoveredAIFARPod{}, false
+	}
+	revision := cleanRuntimeText(labels["aifar.revision"])
+	if revision == "" {
+		revision = cleanRuntimeText(labels["aifar.release"])
+	}
+	if revision == "" {
+		revision = parsedRevision
+	}
+	if revision == "" {
+		revision = runtimeRevisionFromImage(row.Image)
+	}
+	replica := runtimePositiveInt(labels["aifar.replica"], 0)
+	if replica <= 0 {
+		replica = parsedReplica
+	}
+	if replica <= 0 {
+		replica = 1
+	}
+	status, ready := aifarRuntimeDockerPodStatus(row)
+	if status == "stale" {
+		return discoveredAIFARPod{}, false
+	}
+	podID := sanitizeRuntimeIdentifier(fmt.Sprintf("%s-%s-r%d", service, revision, replica))
+	return discoveredAIFARPod{
+		ServiceName:   service,
+		Revision:      revision,
+		ReplicaID:     replica,
+		PodID:         podID,
+		ContainerName: strings.TrimPrefix(cleanRuntimeText(row.Name), "/"),
+		Image:         cleanRuntimeText(row.Image),
+		Port:          aifarRuntimeServiceDefaultPort(service, gatewayPort, webPort),
+		Status:        status,
+		Ready:         ready,
+	}, true
+}
+
+func parseAIFARPodContainerName(name string) (string, string, string, int, bool) {
+	name = strings.TrimPrefix(cleanRuntimeText(name), "/")
+	if !strings.HasPrefix(name, "aifar-pod-") {
+		return "", "", "", 0, false
+	}
+	body := strings.TrimPrefix(name, "aifar-pod-")
+	replicaIndex := strings.LastIndex(body, "-r")
+	if replicaIndex <= 0 || replicaIndex+2 >= len(body) {
+		return "", "", "", 0, false
+	}
+	replica, err := strconv.Atoi(body[replicaIndex+2:])
+	if err != nil || replica <= 0 {
+		return "", "", "", 0, false
+	}
+	body = body[:replicaIndex]
+	bestIndex := -1
+	bestService := ""
+	for _, service := range aifarRuntimeKnownServices {
+		marker := "-" + service + "-"
+		index := strings.LastIndex(body, marker)
+		if index > bestIndex {
+			bestIndex = index
+			bestService = service
+		}
+	}
+	if bestIndex <= 0 || bestService == "" {
+		return "", "", "", 0, false
+	}
+	marker := "-" + bestService + "-"
+	instance := body[:bestIndex]
+	revision := body[bestIndex+len(marker):]
+	if instance == "" || revision == "" {
+		return "", "", "", 0, false
+	}
+	return instance, bestService, revision, replica, true
+}
+
+func aifarRuntimeDockerPodStatus(row adapter.DockerContainer) (string, bool) {
+	state := strings.ToLower(strings.TrimSpace(row.State))
+	detail := strings.ToLower(strings.TrimSpace(row.Status))
+	if detail == "" {
+		detail = state
+	}
+	switch {
+	case state == "running" && strings.Contains(detail, "unhealthy"):
+		return "unhealthy", false
+	case state == "running" && (strings.Contains(detail, "health: starting") || strings.Contains(detail, "starting")):
+		return "starting", false
+	case state == "running":
+		return "ready", true
+	case state == "restarting" || state == "created":
+		return "starting", false
+	default:
+		return "stale", false
+	}
+}
+
+func runtimeApplyDiscoveredServiceMetadata(metadata map[string]any, service string, desired int, pods []discoveredAIFARPod, endpoints []store.AIFARServiceEndpoint, services []string) bool {
+	changed := false
+	services = runtimeMergeServices(services, []string{service})
+	if !runtimeStringSliceEqual(runtimeServicesFromMetadata(metadata), services) {
+		metadata["services"] = services
+		changed = true
+	}
+	desiredMap := runtimeDesiredReplicasFromMetadata(metadata)
+	if desiredMap[service] != desired {
+		desiredMap[service] = desired
+		metadata["desiredReplicas"] = desiredMap
+		changed = true
+	}
+	endpointItems := runtimeEndpointMetadataFromStore(endpoints)
+	activeEndpoints := runtimeMapFromAny(metadata["activeEndpoints"])
+	if !runtimeJSONEqual(activeEndpoints[service], endpointItems) {
+		activeEndpoints[service] = endpointItems
+		metadata["activeEndpoints"] = activeEndpoints
+		changed = true
+	}
+	containers := runtimeMapFromAny(metadata["containers"])
+	if first := runtimeFirstDiscoveredContainer(pods); first != "" && cleanRuntimeText(fmt.Sprint(containers[service])) != first {
+		containers[service] = first
+		metadata["containers"] = containers
+		changed = true
+	}
+	revisions := runtimeMapFromAny(metadata["serviceRevisions"])
+	if revision := runtimeDiscoveredRevision(pods); revision != "" && cleanRuntimeText(fmt.Sprint(revisions[service])) != revision {
+		revisions[service] = revision
+		metadata["serviceRevisions"] = revisions
+		changed = true
+	}
+	activeServices := runtimeActiveServicesFromEndpointsForServices(desiredMap, activeEndpoints, services)
+	if !runtimeJSONEqual(metadata["activeServices"], activeServices) {
+		metadata["activeServices"] = activeServices
+		changed = true
+	}
+	return changed
+}
+
+func runtimeEndpointMetadataFromStore(endpoints []store.AIFARServiceEndpoint) []map[string]any {
+	out := make([]map[string]any, 0, len(endpoints))
+	for _, endpoint := range endpoints {
+		out = append(out, map[string]any{
+			"container": endpoint.ContainerName,
+			"releaseId": endpoint.Revision,
+			"revision":  endpoint.Revision,
+			"podId":     endpoint.PodID,
+			"replicaId": runtimeReplicaIDFromPodID(endpoint.PodID),
+			"port":      endpoint.Port,
+			"state":     endpoint.State,
+		})
+	}
+	return out
+}
+
+func aifarRuntimeEndpointMetadata(pod discoveredAIFARPod, port int) map[string]any {
+	return map[string]any{
+		"container": pod.ContainerName,
+		"releaseId": pod.Revision,
+		"revision":  pod.Revision,
+		"podId":     pod.PodID,
+		"replicaId": pod.ReplicaID,
+		"port":      port,
+		"state":     "active",
+	}
+}
+
+func runtimeActiveServicesFromEndpointsForServices(desired map[string]int, endpoints map[string]any, services []string) map[string]any {
+	services = runtimeMergeServices(services)
+	out := make(map[string]any, len(services))
+	for _, service := range services {
+		out[service] = map[string]any{
+			"desiredReplicas": desired[service],
+			"activeEndpoints": endpoints[service],
+		}
+	}
+	return out
+}
+
+func runtimeDiscoveredServiceStatus(desired, ready int) string {
+	if desired <= 0 {
+		return "offline"
+	}
+	if ready <= 0 {
+		return "no-endpoints"
+	}
+	if ready < desired {
+		return "degraded"
+	}
+	return "ready"
+}
+
+func runtimeDiscoveredDesiredReplicas(pods []discoveredAIFARPod) int {
+	desired := len(pods)
+	for _, pod := range pods {
+		if pod.ReplicaID > desired {
+			desired = pod.ReplicaID
+		}
+	}
+	return desired
+}
+
+func runtimeDiscoveredReadyReplicas(pods []discoveredAIFARPod) int {
+	ready := 0
+	for _, pod := range pods {
+		if pod.Ready {
+			ready++
+		}
+	}
+	return ready
+}
+
+func runtimeDiscoveredRevision(pods []discoveredAIFARPod) string {
+	for _, pod := range pods {
+		if pod.Ready {
+			if revision := cleanRuntimeText(pod.Revision); revision != "" {
+				return revision
+			}
+		}
+	}
+	for _, pod := range pods {
+		if revision := cleanRuntimeText(pod.Revision); revision != "" {
+			return revision
+		}
+	}
+	return ""
+}
+
+func runtimeDiscoveredImage(pods []discoveredAIFARPod) string {
+	for _, pod := range pods {
+		if pod.Ready {
+			if image := cleanRuntimeText(pod.Image); image != "" {
+				return image
+			}
+		}
+	}
+	for _, pod := range pods {
+		if image := cleanRuntimeText(pod.Image); image != "" {
+			return image
+		}
+	}
+	return ""
+}
+
+func runtimeFirstDiscoveredContainer(pods []discoveredAIFARPod) string {
+	for _, pod := range pods {
+		if pod.Ready {
+			if name := cleanRuntimeText(pod.ContainerName); name != "" {
+				return name
+			}
+		}
+	}
+	for _, pod := range pods {
+		if name := cleanRuntimeText(pod.ContainerName); name != "" {
+			return name
+		}
+	}
+	return ""
+}
+
+func runtimeServicesFromMetadata(metadata map[string]any) []string {
+	switch raw := metadata["services"].(type) {
+	case []string:
+		return runtimeMergeServices(raw)
+	case []any:
+		values := make([]string, 0, len(raw))
+		for _, item := range raw {
+			values = append(values, fmt.Sprint(item))
+		}
+		return runtimeMergeServices(values)
+	}
+	return nil
+}
+
+func runtimeDeploymentServiceNames(deployments []store.AIFARDeployment) []string {
+	out := make([]string, 0, len(deployments))
+	for _, deployment := range deployments {
+		out = append(out, deployment.ServiceName)
+	}
+	return out
+}
+
+func runtimeDiscoveredServiceNames(pods []discoveredAIFARPod) []string {
+	seen := map[string]bool{}
+	out := []string{}
+	for _, pod := range pods {
+		if pod.ServiceName == "" || seen[pod.ServiceName] {
+			continue
+		}
+		seen[pod.ServiceName] = true
+		out = append(out, pod.ServiceName)
+	}
+	return out
+}
+
+func runtimeMergeServices(groups ...[]string) []string {
+	seen := map[string]bool{}
+	for _, group := range groups {
+		for _, service := range group {
+			service = cleanRuntimeText(service)
+			if service != "" {
+				seen[service] = true
+			}
+		}
+	}
+	out := make([]string, 0, len(seen))
+	for _, service := range aifarRuntimeKnownServices {
+		if seen[service] {
+			out = append(out, service)
+			delete(seen, service)
+		}
+	}
+	extra := make([]string, 0, len(seen))
+	for service := range seen {
+		extra = append(extra, service)
+	}
+	sort.Strings(extra)
+	return append(out, extra...)
+}
+
+func runtimeDesiredReplicasFromMetadata(metadata map[string]any) map[string]int {
+	out := map[string]int{}
+	switch raw := metadata["desiredReplicas"].(type) {
+	case map[string]int:
+		for key, value := range raw {
+			if value < 0 {
+				value = 0
+			}
+			out[key] = value
+		}
+	case map[string]any:
+		for key, value := range raw {
+			n := runtimeIntFromAny(value, 0)
+			if n < 0 {
+				n = 0
+			}
+			out[key] = n
+		}
+	}
+	return out
+}
+
+func runtimeMapFromAny(value any) map[string]any {
+	out := map[string]any{}
+	if raw, ok := value.(map[string]any); ok {
+		for key, item := range raw {
+			out[key] = item
+		}
+	}
+	return out
+}
+
+func copyRuntimeMetadata(metadata map[string]any) map[string]any {
+	if len(metadata) == 0 {
+		return map[string]any{}
+	}
+	raw, err := json.Marshal(metadata)
+	if err != nil {
+		out := map[string]any{}
+		for key, value := range metadata {
+			out[key] = value
+		}
+		return out
+	}
+	out := map[string]any{}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return map[string]any{}
+	}
+	return out
+}
+
+func runtimeDeploymentEqual(a, b store.AIFARDeployment) bool {
+	return a.DesiredReplicas == b.DesiredReplicas &&
+		cleanRuntimeText(a.CurrentRevision) == cleanRuntimeText(b.CurrentRevision) &&
+		cleanRuntimeText(a.UpdatingRevision) == cleanRuntimeText(b.UpdatingRevision) &&
+		cleanRuntimeText(a.StrategyJSON) == cleanRuntimeText(b.StrategyJSON) &&
+		cleanRuntimeText(a.Status) == cleanRuntimeText(b.Status) &&
+		cleanRuntimeText(a.MetadataJSON) == cleanRuntimeText(b.MetadataJSON)
+}
+
+func runtimeReplicaSetEqual(a, b store.AIFARReplicaSet) bool {
+	return cleanRuntimeText(a.Image) == cleanRuntimeText(b.Image) &&
+		cleanRuntimeText(a.ArtifactHash) == cleanRuntimeText(b.ArtifactHash) &&
+		a.DesiredPods == b.DesiredPods &&
+		a.ReadyPods == b.ReadyPods &&
+		cleanRuntimeText(a.Status) == cleanRuntimeText(b.Status) &&
+		cleanRuntimeText(a.MetadataJSON) == cleanRuntimeText(b.MetadataJSON)
+}
+
+func runtimePodEqual(a, b store.AIFARPod) bool {
+	return cleanRuntimeText(a.Revision) == cleanRuntimeText(b.Revision) &&
+		cleanRuntimeText(a.ContainerName) == cleanRuntimeText(b.ContainerName) &&
+		a.Port == b.Port &&
+		cleanRuntimeText(a.Status) == cleanRuntimeText(b.Status) &&
+		a.Ready == b.Ready &&
+		cleanRuntimeText(a.MetadataJSON) == cleanRuntimeText(b.MetadataJSON)
+}
+
+func runtimeEndpointsEqual(a, b []store.AIFARServiceEndpoint) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	aByKey := map[string]store.AIFARServiceEndpoint{}
+	for _, item := range a {
+		aByKey[runtimeServicePodKey(item.ServiceName, item.PodID)] = item
+	}
+	for _, next := range b {
+		current, ok := aByKey[runtimeServicePodKey(next.ServiceName, next.PodID)]
+		if !ok {
+			return false
+		}
+		if cleanRuntimeText(current.ContainerName) != cleanRuntimeText(next.ContainerName) ||
+			cleanRuntimeText(current.Revision) != cleanRuntimeText(next.Revision) ||
+			current.Port != next.Port ||
+			cleanRuntimeText(current.State) != cleanRuntimeText(next.State) ||
+			current.Ready != next.Ready ||
+			cleanRuntimeText(current.MetadataJSON) != cleanRuntimeText(next.MetadataJSON) {
+			return false
+		}
+	}
+	return true
+}
+
+func runtimeServiceRevisionKey(service, revision string) string {
+	return service + "\x00" + revision
+}
+
+func runtimeServicePodKey(service, podID string) string {
+	return service + "\x00" + podID
+}
+
+func aifarRuntimeKnownService(service string) bool {
+	for _, candidate := range aifarRuntimeKnownServices {
+		if service == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+func aifarRuntimeServiceDefaultPort(service string, gatewayPort, webPort int) int {
+	switch service {
+	case "gateway":
+		return gatewayPort
+	case "web-vue3":
+		return webPort
+	case "oauth":
+		return 38001
+	case "permission":
+		return 38010
+	case "system":
+		return 38002
+	case "file":
+		return 38005
+	case "message":
+		return 38008
+	case "im":
+		return 38031
+	case "contacts":
+		return 38032
+	case "meeting":
+		return 38033
+	default:
+		return 0
+	}
+}
+
+func runtimeInstallRootBase(installRoot string) string {
+	installRoot = normalizeRuntimeInstallRoot(installRoot)
+	if installRoot == "" {
+		return ""
+	}
+	if index := strings.LastIndex(installRoot, "/"); index >= 0 {
+		return installRoot[index+1:]
+	}
+	return installRoot
+}
+
+func runtimeRevisionFromImage(image string) string {
+	image = cleanRuntimeText(image)
+	if image == "" {
+		return ""
+	}
+	if index := strings.LastIndex(image, "@"); index >= 0 {
+		return cleanRuntimeText(image[index+1:])
+	}
+	slash := strings.LastIndex(image, "/")
+	colon := strings.LastIndex(image, ":")
+	if colon > slash {
+		return cleanRuntimeText(image[colon+1:])
+	}
+	return ""
+}
+
+func runtimeReplicaIDFromPodID(podID string) int {
+	index := strings.LastIndex(podID, "-r")
+	if index < 0 || index+2 >= len(podID) {
+		return 0
+	}
+	n, _ := strconv.Atoi(podID[index+2:])
+	return n
+}
+
+func runtimePositiveInt(value string, fallback int) int {
+	n, err := strconv.Atoi(strings.TrimSpace(value))
+	if err != nil || n <= 0 {
+		return fallback
+	}
+	return n
+}
+
+func runtimeIntFromAny(value any, fallback int) int {
+	switch v := value.(type) {
+	case int:
+		return v
+	case int64:
+		return int(v)
+	case float64:
+		return int(v)
+	case json.Number:
+		n, err := v.Int64()
+		if err == nil {
+			return int(n)
+		}
+	case string:
+		n, err := strconv.Atoi(strings.TrimSpace(v))
+		if err == nil {
+			return n
+		}
+	}
+	return fallback
+}
+
+func runtimeMarshalJSON(value any) string {
+	raw, err := json.Marshal(value)
+	if err != nil {
+		return "{}"
+	}
+	return string(raw)
+}
+
+func runtimeJSONEqual(a, b any) bool {
+	left, err := json.Marshal(a)
+	if err != nil {
+		return false
+	}
+	right, err := json.Marshal(b)
+	if err != nil {
+		return false
+	}
+	return string(left) == string(right)
+}
+
+func runtimeStringSliceEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func sanitizeRuntimeIdentifier(value string) string {
+	value = strings.TrimSpace(strings.ToLower(value))
+	if value == "" {
+		return "aifar"
+	}
+	var b strings.Builder
+	for _, r := range value {
+		switch {
+		case r >= 'a' && r <= 'z':
+			b.WriteRune(r)
+		case r >= '0' && r <= '9':
+			b.WriteRune(r)
+		case r == '.', r == '-', r == '_':
+			b.WriteRune(r)
+		default:
+			b.WriteByte('-')
+		}
+	}
+	out := strings.Trim(b.String(), ".-_")
+	if out == "" {
+		return "aifar"
+	}
+	return out
+}
+
 func aifarRuntimeAppName(service string) string {
 	switch strings.TrimSpace(service) {
 	case "gateway":
@@ -1686,11 +2550,19 @@ func averagePodLoad(pods []aifarRuntimePod) (float64, float64) {
 func aifarPodContainerNames(containers []adapter.DockerContainer) []string {
 	out := []string{}
 	for _, row := range containers {
-		if row.Labels["aifar.app"] == "aifar" && row.Labels["aifar.component"] == "pod" {
+		if isAIFARRuntimePodContainer(row) {
 			out = append(out, row.Name)
 		}
 	}
 	return out
+}
+
+func isAIFARRuntimePodContainer(row adapter.DockerContainer) bool {
+	if row.Labels["aifar.app"] == "aifar" && row.Labels["aifar.component"] == "pod" {
+		return true
+	}
+	_, _, _, _, ok := parseAIFARPodContainerName(row.Name)
+	return ok
 }
 
 func mapContainersByName(containers []adapter.DockerContainer) map[string]adapter.DockerContainer {

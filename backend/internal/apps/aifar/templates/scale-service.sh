@@ -118,18 +118,27 @@ desired_replicas_for_service() {
     printf "%s" "$REPLICAS"
     return
   fi
+  value=""
   if value="$(desired_replicas_from_env "$service")"; then
     case "$value" in ""|*[!0-9]*) value=1 ;; esac
-    printf "%s" "$value"
+    [ "$value" -ge 0 ] || value=0
+  fi
+  if [ "$value" = "0" ]; then
+    printf "0"
     return
   fi
   replicas="$(current_replicas_for_service "$service")"
   case "$replicas" in ""|*[!0-9]*) replicas=1 ;; esac
   [ "$replicas" -ge 0 ] || replicas=0
-  if [ "$replicas" -eq 0 ]; then
-    replicas=1
+  if [ "$replicas" -gt 0 ]; then
+    printf "%s" "$replicas"
+    return
   fi
-  printf "%s" "$replicas"
+  if [ -n "$value" ]; then
+    printf "%s" "$value"
+  else
+    printf "1"
+  fi
 }
 
 write_desired_replicas_env() {
