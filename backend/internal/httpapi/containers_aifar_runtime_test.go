@@ -51,16 +51,18 @@ func TestAIFARRuntimeReturnsDegradedControlPlaneWhenAgentMissing(t *testing.T) {
 	if body.Instances[0].RuntimeConfig == nil || body.Instances[0].RuntimeConfig["global"] == nil {
 		t.Fatalf("expected runtime config in instance response: %+v", body.Instances[0])
 	}
-	if len(body.Services) != 1 || body.Services[0].ServiceName != "permission" || body.Services[0].AppName != "alpha-permission" || body.Services[0].Status != "ready" {
+	if len(body.Services) != 1 || body.Services[0].ServiceName != "permission" || body.Services[0].AppName != "alpha-permission" || body.Services[0].Status != "no-endpoints" {
 		t.Fatalf("unexpected services: %+v", body.Services)
 	}
 }
 
 func TestAIFARRuntimeCanSkipPodsAndStats(t *testing.T) {
 	api, db, secret := newAuthzTestAPI(t)
-	var dockerCalled atomic.Bool
+	var containerListCalled atomic.Bool
 	dockerAPI := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		dockerCalled.Store(true)
+		if r.URL.Path == "/containers/json" {
+			containerListCalled.Store(true)
+		}
 		http.NotFound(w, r)
 	}))
 	defer dockerAPI.Close()
@@ -76,7 +78,7 @@ func TestAIFARRuntimeCanSkipPodsAndStats(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d body=%s", rec.Code, rec.Body.String())
 	}
-	if dockerCalled.Load() {
+	if containerListCalled.Load() {
 		t.Fatal("expected runtime summary request to skip Docker container calls")
 	}
 	var body aifarRuntimeResponse
@@ -88,6 +90,42 @@ func TestAIFARRuntimeCanSkipPodsAndStats(t *testing.T) {
 	}
 	if len(body.Deployments) != 1 || len(body.Services) != 1 {
 		t.Fatalf("expected deployment and service summaries, got deployments=%+v services=%+v", body.Deployments, body.Services)
+	}
+}
+
+func TestAIFARRuntimeMarksRowsUnavailableWhenDockerHostStopped(t *testing.T) {
+	api, db, secret := newAuthzTestAPI(t)
+	dockerAPI := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.NotFound(w, r)
+	}))
+	server, _ := seedAIFARRuntimeFixture(t, db, dockerAPI.URL)
+	dockerAPI.Close()
+	token := issueTestToken(t, db, secret, "owner", "owner")
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v2/containers/aifar/runtime?serverId="+server.ID+"&includePods=1&includeStats=0", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	rec := httptest.NewRecorder()
+
+	api.Router().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	var body aifarRuntimeResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body.RuntimeStatus != "degraded" || len(body.Warnings) == 0 {
+		t.Fatalf("expected degraded runtime with warning, got status=%s warnings=%+v", body.RuntimeStatus, body.Warnings)
+	}
+	if len(body.Deployments) != 1 || body.Deployments[0].Status != "no-endpoints" || body.Deployments[0].ReadyReplicas != 0 {
+		t.Fatalf("expected deployment to lose ready replicas, got %+v", body.Deployments)
+	}
+	if len(body.Services) != 1 || body.Services[0].Status != "no-endpoints" || body.Services[0].ReadyEndpointCount != 0 || body.Services[0].ReadyReplicas != 0 {
+		t.Fatalf("expected service endpoints to be unavailable, got %+v", body.Services)
+	}
+	if len(body.Pods) != 1 || body.Pods[0].Status != "stale" || body.Pods[0].Ready {
+		t.Fatalf("expected stored pod to be stale when Docker is unavailable, got %+v", body.Pods)
 	}
 }
 

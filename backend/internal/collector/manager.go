@@ -208,6 +208,12 @@ func (m *Manager) collectAIFARRuntime(ctx context.Context) error {
 		pods, _ := m.store.ListAIFARPods(instance.ID)
 		endpoints, _ := m.store.ListAIFARServiceEndpoints(instance.ID)
 		status := summarizeAIFARStatus(instance.Status, deployments, pods, endpoints)
+		desiredReplicas := countDesiredReplicas(deployments)
+		if desiredReplicas > 0 {
+			if dockerSnapshot, err := m.store.GetStatusSnapshot("docker.summary", instance.ServerID); err == nil && strings.EqualFold(dockerSnapshot.Status, "failed") {
+				status = "no-endpoints"
+			}
+		}
 		payload := map[string]any{
 			"instanceId":      instance.ID,
 			"serverId":        instance.ServerID,
@@ -218,7 +224,7 @@ func (m *Manager) collectAIFARRuntime(ctx context.Context) error {
 			"pods":            len(pods),
 			"readyPods":       countReadyPods(pods),
 			"activeEndpoints": countActiveEndpoints(endpoints),
-			"desiredReplicas": countDesiredReplicas(deployments),
+			"desiredReplicas": desiredReplicas,
 			"updatedAt":       instance.UpdatedAt,
 		}
 		if err := m.saveSnapshot(ctx, store.StatusSnapshot{

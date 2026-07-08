@@ -35,8 +35,10 @@ type aifarRuntimeResponse struct {
 }
 
 type aifarRuntimeBuildOptions struct {
-	IncludePods  bool
-	IncludeStats bool
+	IncludePods             bool
+	IncludeStats            bool
+	DockerUnavailable       bool
+	DockerUnavailableReason string
 }
 
 type aifarRuntimeAgent struct {
@@ -1101,10 +1103,20 @@ func (a *API) buildAIFARRuntime(ctx context.Context, server store.Server, option
 		return response, err
 	}
 	containers := []adapter.DockerContainer{}
-	if options.IncludePods || options.IncludeStats {
+	if strings.TrimSpace(server.DockerHost) != "" {
+		if err := adapter.DockerPingForServer(ctx, server); err != nil {
+			options.DockerUnavailable = true
+			options.DockerUnavailableReason = err.Error()
+			response.RuntimeStatus = "degraded"
+			response.Warnings = append(response.Warnings, "Docker host is not available: "+err.Error())
+		}
+	}
+	if (options.IncludePods || options.IncludeStats) && !options.DockerUnavailable {
 		var err error
 		containers, err = adapter.DockerContainersForServer(ctx, server)
 		if err != nil {
+			options.DockerUnavailable = true
+			options.DockerUnavailableReason = err.Error()
 			response.RuntimeStatus = "degraded"
 			response.Warnings = append(response.Warnings, "failed to read Docker containers: "+err.Error())
 		}
@@ -1203,7 +1215,7 @@ func (a *API) appendAIFARInstanceRuntime(response *aifarRuntimeResponse, instanc
 	for _, deployment := range deployments {
 		seenServices[deployment.ServiceName] = true
 		ready := readyByService[deployment.ServiceName]
-		if ready == 0 && (len(podsByService[deployment.ServiceName]) == 0 || response.Agent.Status != "running") {
+		if ready == 0 && len(podsByService[deployment.ServiceName]) == 0 && !options.DockerUnavailable {
 			ready = endpointReadyByService[deployment.ServiceName]
 		}
 		image := replicaImage[deployment.ServiceName]
@@ -1225,16 +1237,33 @@ func (a *API) appendAIFARInstanceRuntime(response *aifarRuntimeResponse, instanc
 		if hasAgentDeployment && cleanRuntimeText(agentDeployment.LastError) != "" {
 			failureReason = cleanRuntimeText(agentDeployment.LastError)
 		}
+		if options.DockerUnavailable && failureReason == "" {
+			failureReason = options.DockerUnavailableReason
+		}
+		currentReplicas := agentDeployment.CurrentReplicas
+		updatedReplicas := agentDeployment.UpdatedReplicas
+		availableReplicas := agentDeployment.AvailableReplicas
+		if options.DockerUnavailable {
+			ready = 0
+			currentReplicas = 0
+			updatedReplicas = 0
+			availableReplicas = 0
+			if deployment.DesiredReplicas == 0 || strings.EqualFold(deployment.Status, "offline") {
+				status = "offline"
+			} else {
+				status = "no-endpoints"
+			}
+		}
 		response.Deployments = append(response.Deployments, aifarRuntimeDeployment{
 			InstanceID:          instance.ID,
 			DeploymentName:      appName,
 			ServiceName:         deployment.ServiceName,
 			AppName:             appName,
 			DesiredReplicas:     deployment.DesiredReplicas,
-			CurrentReplicas:     agentDeployment.CurrentReplicas,
+			CurrentReplicas:     currentReplicas,
 			ReadyReplicas:       ready,
-			UpdatedReplicas:     agentDeployment.UpdatedReplicas,
-			AvailableReplicas:   agentDeployment.AvailableReplicas,
+			UpdatedReplicas:     updatedReplicas,
+			AvailableReplicas:   availableReplicas,
 			PodRevision:         effectiveServiceRevision(deployment.CurrentRevision, podsByService[deployment.ServiceName]),
 			UpdatingPodRevision: cleanRuntimeText(deployment.UpdatingRevision),
 			Image:               image,
@@ -1244,6 +1273,7 @@ func (a *API) appendAIFARInstanceRuntime(response *aifarRuntimeResponse, instanc
 		})
 		serviceRow := runtimeServiceFromDeployment(instance.ID, deployment, podsByService[deployment.ServiceName], ready, image, status)
 		applyAgentStatusToRuntimeService(&serviceRow, agentServices[deployment.ServiceName], agentDeployment)
+		applyDockerUnavailableToRuntimeService(&serviceRow, options)
 		response.Services = append(response.Services, serviceRow)
 	}
 	for service, servicePods := range podsByService {
@@ -1252,6 +1282,7 @@ func (a *API) appendAIFARInstanceRuntime(response *aifarRuntimeResponse, instanc
 		}
 		serviceRow := runtimeServiceFromPods(instance.ID, service, servicePods, readyByService[service], replicaImage[service])
 		applyAgentStatusToRuntimeService(&serviceRow, agentServices[service], agentDeployments[service])
+		applyDockerUnavailableToRuntimeService(&serviceRow, options)
 		response.Services = append(response.Services, serviceRow)
 	}
 	response.Ingress = append(response.Ingress, runtimeIngressFromMetadata(instance.ID, metadata, response.Agent))
@@ -1408,6 +1439,26 @@ func applyAgentStatusToRuntimeService(row *aifarRuntimeService, serviceStatus ai
 	}
 	if row.LastNacosError != "" && row.Status == "ready" {
 		row.Status = "degraded"
+	}
+}
+
+func applyDockerUnavailableToRuntimeService(row *aifarRuntimeService, options aifarRuntimeBuildOptions) {
+	if row == nil || !options.DockerUnavailable {
+		return
+	}
+	row.ReadyReplicas = 0
+	row.ActiveEndpoints = 0
+	row.EndpointCount = 0
+	row.ReadyEndpointCount = 0
+	if row.DesiredReplicas == 0 || row.Status == "offline" {
+		return
+	}
+	row.Status = "no-endpoints"
+	if row.LastError == "" {
+		row.LastError = options.DockerUnavailableReason
+	}
+	if row.FailureReason == "" {
+		row.FailureReason = options.DockerUnavailableReason
 	}
 }
 
