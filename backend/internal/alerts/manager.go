@@ -121,7 +121,7 @@ func (m *Manager) evaluateSnapshots(upsert func(store.Alert) error) error {
 				}
 				if err := upsert(store.Alert{
 					Fingerprint:        "docker.summary:" + snapshot.ResourceID + ":failed",
-					Severity:           "warning",
+					Severity:           "critical",
 					Scope:              snapshot.Scope,
 					ResourceID:         snapshot.ResourceID,
 					ServerID:           snapshot.ServerID,
@@ -137,9 +137,9 @@ func (m *Manager) evaluateSnapshots(upsert func(store.Alert) error) error {
 				}
 			}
 		case "aifar.runtime":
-			if status == "degraded" || status == "no-endpoints" || status == "failed" {
+			if status == "degraded" || isServiceUnavailableStatus(status) {
 				severity := "warning"
-				if status == "failed" || status == "no-endpoints" {
+				if isServiceUnavailableStatus(status) {
 					severity = "critical"
 				}
 				if err := upsert(store.Alert{
@@ -161,14 +161,14 @@ func (m *Manager) evaluateSnapshots(upsert func(store.Alert) error) error {
 				}
 			}
 		case "server":
-			if status == "failed" || status == "unavailable" {
+			if isServiceUnavailableStatus(status) {
 				message := snapshot.LastError
 				if strings.TrimSpace(message) == "" {
 					message = "server status is " + status
 				}
 				if err := upsert(store.Alert{
 					Fingerprint:        "server:" + snapshot.ResourceID + ":" + status,
-					Severity:           "warning",
+					Severity:           "critical",
 					Scope:              snapshot.Scope,
 					ResourceID:         snapshot.ResourceID,
 					ServerID:           snapshot.ServerID,
@@ -207,7 +207,7 @@ func (m *Manager) evaluateAppInstances(upsert func(store.Alert) error) error {
 			message = "instance status is " + status
 		}
 		app := strings.ToLower(strings.TrimSpace(instance.App))
-		severity := instanceAlertSeverity(app, status, installFailed)
+		severity := instanceAlertSeverity(status, installFailed)
 		if err := upsert(store.Alert{
 			Fingerprint:        "app.instance:" + instance.ID + ":" + status,
 			Severity:           severity,
@@ -229,13 +229,9 @@ func (m *Manager) evaluateAppInstances(upsert func(store.Alert) error) error {
 	return nil
 }
 
-func instanceAlertSeverity(app, status string, installFailed bool) string {
+func instanceAlertSeverity(status string, installFailed bool) string {
 	status = strings.ToLower(strings.TrimSpace(status))
-	app = strings.ToLower(strings.TrimSpace(app))
-	if status == "failed" || status == "error" || installFailed {
-		return "critical"
-	}
-	if app == "nacos" && status == "unavailable" {
+	if isServiceUnavailableStatus(status) || installFailed {
 		return "critical"
 	}
 	return "warning"
@@ -306,7 +302,16 @@ func aifarRuntimeMessage(status string, snapshot store.StatusSnapshot) string {
 
 func alertableInstanceStatus(status string) bool {
 	switch status {
-	case "failed", "error", "unavailable", "degraded", "unhealthy":
+	case "failed", "error", "unavailable", "degraded", "unhealthy", "no-endpoints", "down", "offline":
+		return true
+	default:
+		return false
+	}
+}
+
+func isServiceUnavailableStatus(status string) bool {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "failed", "error", "unavailable", "unhealthy", "no-endpoints", "down", "offline":
 		return true
 	default:
 		return false

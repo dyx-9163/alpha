@@ -129,18 +129,36 @@ func TestManagerCreatesRuntimeAndInstanceAlerts(t *testing.T) {
 	}
 }
 
-func TestManagerTreatsNacosUnavailableAsCritical(t *testing.T) {
+func TestManagerTreatsUnavailableResourcesAsCritical(t *testing.T) {
 	db, err := store.Open(filepath.Join(t.TempDir(), "aifar.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer db.Close()
 	manager := NewManager(db, nil)
+	if _, _, err := db.UpsertStatusSnapshot(store.StatusSnapshot{
+		Scope:      "docker.summary",
+		ResourceID: "srv-docker",
+		ServerID:   "srv-docker",
+		Status:     "failed",
+		LastError:  "docker api unavailable",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := db.UpsertStatusSnapshot(store.StatusSnapshot{
+		Scope:      "server",
+		ResourceID: "srv-1",
+		ServerID:   "srv-1",
+		Status:     "unavailable",
+		LastError:  "ssh unavailable",
+	}); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := db.SaveAppInstance(store.AppInstance{
-		ID:       "nacos-1",
-		App:      "nacos",
-		Version:  "2.5",
-		ServerID: "srv-1",
+		ID:       "minio-1",
+		App:      "minio",
+		Version:  "2025",
+		ServerID: "srv-2",
 		Status:   "unavailable",
 		Metadata: `{"error":"readiness failed"}`,
 	}); err != nil {
@@ -154,10 +172,12 @@ func TestManagerTreatsNacosUnavailableAsCritical(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(alerts) != 1 {
-		t.Fatalf("expected one Nacos alert, got %+v", alerts)
+	if len(alerts) != 3 {
+		t.Fatalf("expected three critical alerts, got %+v", alerts)
 	}
-	if alerts[0].Severity != "critical" {
-		t.Fatalf("expected Nacos unavailable to be critical, got %+v", alerts[0])
+	for _, alert := range alerts {
+		if alert.Severity != "critical" {
+			t.Fatalf("expected unavailable alert to be critical, got %+v", alert)
+		}
 	}
 }
