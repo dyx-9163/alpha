@@ -2,10 +2,12 @@ package collector
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
 
+	"aifar-deployment/backend/internal/apps/registry"
 	"aifar-deployment/backend/internal/store"
 )
 
@@ -75,4 +77,72 @@ func TestAIFARRuntimeSnapshotFollowsDockerSummaryFailure(t *testing.T) {
 	if snapshot.Status != "no-endpoints" {
 		t.Fatalf("expected runtime snapshot to follow Docker failure, got %+v", snapshot)
 	}
+}
+
+func TestAppInstanceCollectorWritesFailedSnapshot(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "aifar.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	server, err := db.SaveServer(store.Server{Name: "node-1", Host: "10.0.0.10"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	instance, err := db.SaveAppInstance(store.AppInstance{App: "mysql", Version: "8.0.36", ServerID: server.ID, Status: "running", Topology: "standalone"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager := NewManager(db, nil, time.Minute)
+	manager.SetAppRegistry(registry.New(fakeCheckModule{
+		name:   "mysql",
+		status: registry.InstanceStatus{Status: "failed", Message: "service down"},
+		err:    errors.New("service down"),
+	}))
+
+	err = manager.collectAppInstances(context.Background())
+	if err == nil {
+		t.Fatal("expected collector to report failed app instance check")
+	}
+	snapshot, err := db.GetStatusSnapshot("app.instance", instance.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.Status != "failed" || snapshot.LastError != "service down" {
+		t.Fatalf("expected failed app instance snapshot, got %+v", snapshot)
+	}
+}
+
+type fakeCheckModule struct {
+	name   string
+	status registry.InstanceStatus
+	err    error
+}
+
+func (m fakeCheckModule) Name() string { return m.name }
+
+func (m fakeCheckModule) Manifest(string) registry.Manifest { return registry.Manifest{Name: m.name} }
+
+func (m fakeCheckModule) PreflightInstall(context.Context, registry.InstallRequest, []store.Resource) (registry.PreflightResult, error) {
+	return registry.PreflightResult{}, nil
+}
+
+func (m fakeCheckModule) PlanInstall(context.Context, registry.InstallRequest, []store.Resource) ([]registry.InstallStepPlan, error) {
+	return nil, nil
+}
+
+func (m fakeCheckModule) ValidateInstall(context.Context, registry.InstallRequest, []store.Resource) error {
+	return nil
+}
+
+func (m fakeCheckModule) Install(context.Context, registry.InstallRequest, registry.RunContext) error {
+	return nil
+}
+
+func (m fakeCheckModule) PlanCheck(context.Context, registry.CheckRequest) ([]registry.InstallStepPlan, error) {
+	return nil, nil
+}
+
+func (m fakeCheckModule) Check(context.Context, registry.CheckRequest, registry.RunContext) (registry.InstanceStatus, error) {
+	return m.status, m.err
 }

@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"aifar-deployment/backend/internal/adapter"
+	"aifar-deployment/backend/internal/apps/registry"
+	"aifar-deployment/backend/internal/logmask"
 	"aifar-deployment/backend/internal/realtime"
 	"aifar-deployment/backend/internal/store"
 )
@@ -24,6 +26,7 @@ type Manager struct {
 	store     *store.Store
 	events    Publisher
 	alerts    AlertEvaluator
+	apps      *registry.Registry
 	interval  time.Duration
 	timeout   time.Duration
 	startedCh chan struct{}
@@ -45,6 +48,12 @@ func NewManager(s *store.Store, events Publisher, interval time.Duration) *Manag
 func (m *Manager) SetAlertEvaluator(alerts AlertEvaluator) {
 	if m != nil {
 		m.alerts = alerts
+	}
+}
+
+func (m *Manager) SetAppRegistry(apps *registry.Registry) {
+	if m != nil {
+		m.apps = apps
 	}
 }
 
@@ -74,6 +83,7 @@ func (m *Manager) RunOnce(ctx context.Context) {
 	}
 	m.run(ctx, "servers", m.collectServers)
 	m.run(ctx, "docker.summary", m.collectDockerSummaries)
+	m.run(ctx, "app.instances", m.collectAppInstances)
 	m.run(ctx, "aifar.runtime", m.collectAIFARRuntime)
 	if m.alerts != nil {
 		_ = m.alerts.Evaluate(ctx)
@@ -195,6 +205,109 @@ func (m *Manager) collectDockerSummaries(ctx context.Context) error {
 	return nil
 }
 
+func (m *Manager) collectAppInstances(ctx context.Context) error {
+	if m.apps == nil {
+		return nil
+	}
+	instances, err := m.store.ListAppInstances()
+	if err != nil {
+		return err
+	}
+	var failures []string
+	for _, instance := range instances {
+		app := strings.ToLower(strings.TrimSpace(instance.App))
+		if !collectableAppInstance(app) || strings.TrimSpace(instance.ServerID) == "" {
+			continue
+		}
+		module, ok := m.apps.Get(app)
+		if !ok {
+			continue
+		}
+		checkModule, ok := module.(registry.CheckModule)
+		if !ok {
+			continue
+		}
+		server, err := m.store.GetServer(instance.ServerID, true)
+		if err != nil {
+			errText := logmask.Mask(err.Error())
+			failures = append(failures, instance.ID+": "+errText)
+			if saveErr := m.saveAppInstanceSnapshot(ctx, instance, registry.InstanceStatus{Status: "failed", Message: errText}, errText); saveErr != nil {
+				return saveErr
+			}
+			continue
+		}
+		child, cancel := context.WithTimeout(ctx, m.timeout)
+		status, checkErr := checkModule.Check(child, registry.CheckRequest{
+			Instance: instance,
+			Server:   server,
+			Language: "zh",
+			Actor:    "collector",
+		}, registry.RunContext{
+			Log:       silentLogger{},
+			TargetLog: func(string) registry.Logger { return silentLogger{} },
+		})
+		cancel()
+		errText := ""
+		if checkErr != nil {
+			errText = logmask.Mask(checkErr.Error())
+			failures = append(failures, instance.ID+": "+errText)
+		}
+		if strings.TrimSpace(status.Status) == "" {
+			if checkErr != nil {
+				status.Status = "failed"
+			} else {
+				status.Status = instance.Status
+			}
+		}
+		if strings.TrimSpace(status.Message) != "" {
+			status.Message = logmask.Mask(status.Message)
+		}
+		if err := m.saveAppInstanceSnapshot(ctx, instance, status, errText); err != nil {
+			return err
+		}
+	}
+	if len(failures) > 0 {
+		return errors.New(strings.Join(failures, "; "))
+	}
+	return nil
+}
+
+func (m *Manager) saveAppInstanceSnapshot(ctx context.Context, instance store.AppInstance, status registry.InstanceStatus, errText string) error {
+	snapshotStatus := strings.ToLower(strings.TrimSpace(status.Status))
+	if snapshotStatus == "" {
+		snapshotStatus = "unknown"
+	}
+	payload := map[string]any{
+		"app":        instance.App,
+		"instanceId": instance.ID,
+		"serverId":   instance.ServerID,
+		"version":    instance.Version,
+		"topology":   instance.Topology,
+		"status":     snapshotStatus,
+		"message":    strings.TrimSpace(status.Message),
+		"details":    status.Details,
+		"updatedAt":  time.Now().UTC().Format(time.RFC3339),
+	}
+	return m.saveSnapshot(ctx, store.StatusSnapshot{
+		Scope:       "app.instance",
+		ResourceID:  instance.ID,
+		ServerID:    instance.ServerID,
+		Status:      snapshotStatus,
+		LastError:   errText,
+		Payload:     marshalPayload(payload),
+		CollectedAt: time.Now(),
+	})
+}
+
+func collectableAppInstance(app string) bool {
+	switch strings.ToLower(strings.TrimSpace(app)) {
+	case "mysql", "redis", "mysql-router", "minio", "nacos":
+		return true
+	default:
+		return false
+	}
+}
+
 func (m *Manager) collectAIFARRuntime(ctx context.Context) error {
 	instances, err := m.store.ListAppInstances()
 	if err != nil {
@@ -240,6 +353,11 @@ func (m *Manager) collectAIFARRuntime(ctx context.Context) error {
 	}
 	return nil
 }
+
+type silentLogger struct{}
+
+func (silentLogger) Info(string, ...any)  {}
+func (silentLogger) Error(string, ...any) {}
 
 func (m *Manager) saveSnapshot(ctx context.Context, snapshot store.StatusSnapshot) error {
 	if ctx.Err() != nil {

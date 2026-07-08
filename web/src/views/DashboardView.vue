@@ -149,6 +149,7 @@ const databaseInstances = ref<any[]>([])
 const storageInstances = ref<any[]>([])
 const telemetryByServer = ref<Record<string, any>>({})
 const dockerByServer = ref<Record<string, any>>({})
+const appInstanceSnapshots = ref<Record<string, any>>({})
 const loading = ref(false)
 const now = ref('')
 
@@ -211,16 +212,19 @@ async function load() {
   loading.value = true
   now.value = new Date().toLocaleString()
   try {
-    const [serverList, taskList, databaseList, storageList] = await Promise.all([
+    const [serverList, taskList, databaseList, storageList, snapshotList] = await Promise.all([
       apiGet<any[] | null>('/servers').catch(() => []),
       apiGet<any[] | null>('/tasks').catch(() => []),
       apiGet<any[] | null>('/database/instances').catch(() => []),
-      apiGet<any[] | null>('/storage/instances').catch(() => [])
+      apiGet<any[] | null>('/storage/instances').catch(() => []),
+      apiGet<{ items?: any[] } | null>('/status/snapshots?scope=app.instance').catch(() => ({ items: [] }))
     ])
+    const snapshots = asArray(snapshotList?.items) as any[]
+    appInstanceSnapshots.value = Object.fromEntries(snapshots.map((snapshot) => [snapshot.resourceId, snapshot]))
     servers.value = asArray(serverList)
     tasks.value = asArray(taskList)
-    databaseInstances.value = asArray(databaseList)
-    storageInstances.value = asArray(storageList)
+    databaseInstances.value = applyAppInstanceSnapshots(asArray(databaseList))
+    storageInstances.value = applyAppInstanceSnapshots(asArray(storageList))
     await Promise.all([
       loadTelemetry(),
       loadDockerStatus(),
@@ -249,6 +253,22 @@ async function loadDockerStatus() {
     return [server.id, result] as const
   }))
   dockerByServer.value = Object.fromEntries(entries)
+}
+
+function applyAppInstanceSnapshots(instances: any[]) {
+  return instances.map((instance) => {
+    const snapshot = appInstanceSnapshots.value[instance.id]
+    if (!snapshot) return instance
+    const payload = snapshot.payload ?? {}
+    const status = String(snapshot.status || payload.status || instance.status || '').trim()
+    return {
+      ...instance,
+      status: status || instance.status,
+      realtimeStatus: status || instance.status,
+      lastError: snapshot.lastError || instance.lastError,
+      lastCheckedAt: snapshot.collectedAt || payload.updatedAt
+    }
+  })
 }
 
 function isRunningStatus(status: unknown) {

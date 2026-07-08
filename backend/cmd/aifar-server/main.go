@@ -9,6 +9,7 @@ import (
 	"aifar-deployment/backend/internal/adapter"
 	"aifar-deployment/backend/internal/alerts"
 	"aifar-deployment/backend/internal/apps/aifar"
+	"aifar-deployment/backend/internal/apps/registry"
 	"aifar-deployment/backend/internal/collector"
 	"aifar-deployment/backend/internal/config"
 	"aifar-deployment/backend/internal/httpapi"
@@ -47,6 +48,7 @@ func main() {
 	aifar.NewAutoscaler(db, tasks, adapter.SSHRemote{}).Start(context.Background())
 	alertManager := alerts.NewManager(db, events)
 	collectorManager := collector.NewManager(db, events, time.Duration(cfg.CollectorIntervalSecs)*time.Second)
+	collectorManager.SetAppRegistry(registry.NewFromRegistered(registry.Dependencies{Store: db, DefaultPassword: cfg.DefaultPassword}))
 	collectorManager.SetAlertEvaluator(alertManager)
 	collectorManager.Start(context.Background())
 	api := httpapi.NewWithRealtime(cfg, db, tasks, events)
