@@ -3,6 +3,8 @@ import { apiGet } from '../api/client'
 
 const STORAGE_KEY = 'aifar-tracked-tasks'
 const TERMINAL_STATUSES = new Set(['success', 'failed', 'cancelled'])
+const FLOATING_TASK_LIMIT = 4
+const STORAGE_TASK_LIMIT = 16
 
 export type TrackedTask = {
   id: string
@@ -41,12 +43,14 @@ export const useTaskProgressStore = defineStore('taskProgress', {
     items: loadStoredTasks()
   }),
   getters: {
+    visibleTasks(state): TrackedTask[] {
+      return orderedFloatingTasks(state.items).slice(0, FLOATING_TASK_LIMIT)
+    },
     activeTask(state): TrackedTask | undefined {
-      const sorted = [...state.items].sort((a, b) => b.updatedAt - a.updatedAt)
-      return sorted.find((item) => !isTerminalStatus(item.status)) ?? sorted[0]
+      return orderedFloatingTasks(state.items)[0]
     },
     runningCount(state): number {
-      return state.items.filter((item) => !isTerminalStatus(item.status)).length
+      return state.items.filter((item) => isFloatingTask(item) && !isTerminalStatus(item.status)).length
     }
   },
   actions: {
@@ -167,15 +171,24 @@ export const useTaskProgressStore = defineStore('taskProgress', {
     },
     persist() {
       try {
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(this.items.slice(0, 8)))
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(this.items.slice(0, STORAGE_TASK_LIMIT)))
       } catch {
         // Ignore storage quota and private-mode errors; task polling still works in memory.
       }
     },
     prune() {
-      this.items = [...this.items]
-        .sort((a, b) => b.updatedAt - a.updatedAt)
-        .slice(0, 8)
+      const sorted = [...this.items].sort((a, b) => b.updatedAt - a.updatedAt)
+      const keep = new Set<string>()
+      for (const item of sorted.filter(isFloatingTask).slice(0, STORAGE_TASK_LIMIT)) {
+        keep.add(item.id)
+      }
+      for (const item of sorted) {
+        if (keep.size >= STORAGE_TASK_LIMIT) {
+          break
+        }
+        keep.add(item.id)
+      }
+      this.items = sorted.filter((item) => keep.has(item.id))
     }
   }
 })
@@ -203,6 +216,30 @@ function isTerminalStatus(status?: string) {
   return TERMINAL_STATUSES.has(clean(status))
 }
 
+function orderedFloatingTasks(items: TrackedTask[]) {
+  return [...items]
+    .filter(isFloatingTask)
+    .sort((a, b) => {
+      const aFinished = isTerminalStatus(a.status) ? 1 : 0
+      const bFinished = isTerminalStatus(b.status) ? 1 : 0
+      return aFinished - bFinished || b.updatedAt - a.updatedAt
+    })
+}
+
+function isFloatingTask(item: Pick<TrackedTask, 'type'>) {
+  const type = clean(item.type).toLowerCase()
+  if (!type) {
+    return false
+  }
+  if (type === 'apps.delete.batch') {
+    return true
+  }
+  if (type.startsWith('apps.')) {
+    return type.endsWith('.install') || type.endsWith('.delete') || type.endsWith('.uninstall')
+  }
+  return type === 'aifar.services.install' || type === 'aifar.agent.uninstall'
+}
+
 function clean(value?: string) {
   return String(value ?? '').trim()
 }
@@ -225,7 +262,7 @@ function loadStoredTasks(): TrackedTask[] {
         updatedAt: Number.isFinite(Number(item?.updatedAt)) ? Number(item.updatedAt) : Date.now()
       }))
       .filter((item) => item.id)
-      .slice(0, 8)
+      .slice(0, STORAGE_TASK_LIMIT)
   } catch {
     return []
   }
