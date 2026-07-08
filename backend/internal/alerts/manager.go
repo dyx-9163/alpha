@@ -206,11 +206,8 @@ func (m *Manager) evaluateAppInstances(upsert func(store.Alert) error) error {
 		if message == "" {
 			message = "instance status is " + status
 		}
-		severity := "warning"
-		if status == "failed" || status == "error" || installFailed {
-			severity = "critical"
-		}
 		app := strings.ToLower(strings.TrimSpace(instance.App))
+		severity := instanceAlertSeverity(app, status, installFailed)
 		if err := upsert(store.Alert{
 			Fingerprint:        "app.instance:" + instance.ID + ":" + status,
 			Severity:           severity,
@@ -230,6 +227,18 @@ func (m *Manager) evaluateAppInstances(upsert func(store.Alert) error) error {
 		}
 	}
 	return nil
+}
+
+func instanceAlertSeverity(app, status string, installFailed bool) string {
+	status = strings.ToLower(strings.TrimSpace(status))
+	app = strings.ToLower(strings.TrimSpace(app))
+	if status == "failed" || status == "error" || installFailed {
+		return "critical"
+	}
+	if app == "nacos" && status == "unavailable" {
+		return "critical"
+	}
+	return "warning"
 }
 
 func (m *Manager) evaluateTasks(upsert func(store.Alert) error) error {

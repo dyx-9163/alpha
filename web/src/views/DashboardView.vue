@@ -153,17 +153,21 @@ const appInstanceSnapshots = ref<Record<string, any>>({})
 const loading = ref(false)
 const now = ref('')
 
-const serverRows = computed(() => servers.value.map((server) => ({
-  ...server,
-  cpu: telemetryByServer.value[server.id]?.cpu ?? 0,
-  cpuText: telemetryByServer.value[server.id]?.cpuText ?? '-',
-  memory: telemetryByServer.value[server.id]?.memory ?? 0,
-  memoryText: telemetryByServer.value[server.id]?.memoryText ?? '-',
-  disk: telemetryByServer.value[server.id]?.disk ?? 0,
-  diskText: telemetryByServer.value[server.id]?.diskText ?? '-',
-  diskPath: telemetryByServer.value[server.id]?.diskPath ?? server.deployDir ?? '-',
-  sampledAtText: formatTime(telemetryByServer.value[server.id]?.sampledAt)
-})))
+const serverRows = computed(() => servers.value.map((server) => {
+  const telemetry = telemetryByServer.value[server.id]
+  return {
+    ...server,
+    status: dashboardServerStatus(server.status, telemetry),
+    cpu: telemetry?.cpu ?? 0,
+    cpuText: telemetry?.cpuText ?? '-',
+    memory: telemetry?.memory ?? 0,
+    memoryText: telemetry?.memoryText ?? '-',
+    disk: telemetry?.disk ?? 0,
+    diskText: telemetry?.diskText ?? '-',
+    diskPath: telemetry?.diskPath ?? server.deployDir ?? '-',
+    sampledAtText: formatTime(telemetry?.sampledAt)
+  }
+}))
 const dockerRows = computed(() => servers.value
   .filter((server) => String(server.dockerHost ?? '').trim() !== '')
   .map((server) => {
@@ -177,7 +181,7 @@ const dockerRows = computed(() => servers.value
       dockerHost: summary.endpoint || server.dockerHost
     }
   }))
-const availableServers = computed(() => servers.value.filter((server) => server.status === 'available').length)
+const availableServers = computed(() => serverRows.value.filter((server) => server.status === 'available').length)
 const runningTasks = computed(() => tasks.value.filter((task) => task.status === 'running').length)
 const runningDockerHosts = computed(() => dockerRows.value.filter((row) => row.available).length)
 const runningDatabaseInstances = computed(() => databaseInstances.value.filter((instance) => isRunningStatus(instance.status)).length)
@@ -269,6 +273,13 @@ function applyAppInstanceSnapshots(instances: any[]) {
       lastCheckedAt: snapshot.collectedAt || payload.updatedAt
     }
   })
+}
+
+function dashboardServerStatus(status: unknown, telemetry: any) {
+  if (telemetry?.sampledAt) return 'available'
+  const normalized = String(status ?? '').trim().toLowerCase()
+  if (['available', 'running', 'success', 'ok'].includes(normalized)) return 'available'
+  return normalized || 'unknown'
 }
 
 function isRunningStatus(status: unknown) {

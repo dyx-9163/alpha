@@ -1017,3 +1017,5 @@
 - 结论：根因是 runtime agent reconcile 对已存在且 running 的 Pod 只看运行态，不看 Docker health，running 但 unhealthy 的 Pod 会被误判为正常。已在既有 Pod 校正路径增加 readiness 检查：healthy/无健康检查放行、starting 等待、unhealthy/异常状态执行 `docker restart` 并等待健康；补充单测覆盖 running unhealthy Pod 自动重启。
 - 问题：用户反馈所有服务都没启动时，首页仍显示数据库和对象存储运行中，首页探测口径不准。
 - 结论：根因是 Dashboard 的数据库/存储区域直接展示 `app_instances` 历史状态，而 collector 之前只采服务器、Docker 和 AIFAR Runtime。已新增后台 `app.instances` collector，静默复用 MySQL/Redis/MySQL Router/MinIO/Nacos 的 CheckModule 写入 `status_snapshots` 并更新实例状态；Dashboard 优先使用 `app.instance` 快照覆盖实例状态，避免把安装记录当实时健康。
+- 问题：用户反馈服务器运行指标恢复后首页仍不是“可用”标识，且 Nacos 不可用提醒只显示警告而不是严重。
+- 结论：Dashboard 服务器行已按 telemetry 成功结果归一化为 `available` 并用该行状态统计可用数；Alert Center 已将 `nacos + unavailable` 的 app instance 提醒升级为 `critical`，并补充单测防止回归。

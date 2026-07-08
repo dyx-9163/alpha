@@ -128,3 +128,36 @@ func TestManagerCreatesRuntimeAndInstanceAlerts(t *testing.T) {
 		t.Fatalf("unexpected required permissions: %+v", seen)
 	}
 }
+
+func TestManagerTreatsNacosUnavailableAsCritical(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "aifar.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	manager := NewManager(db, nil)
+	if _, err := db.SaveAppInstance(store.AppInstance{
+		ID:       "nacos-1",
+		App:      "nacos",
+		Version:  "2.5",
+		ServerID: "srv-1",
+		Status:   "unavailable",
+		Metadata: `{"error":"readiness failed"}`,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := manager.Evaluate(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	alerts, err := db.ListAlerts(store.AlertQuery{Status: "open"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(alerts) != 1 {
+		t.Fatalf("expected one Nacos alert, got %+v", alerts)
+	}
+	if alerts[0].Severity != "critical" {
+		t.Fatalf("expected Nacos unavailable to be critical, got %+v", alerts[0])
+	}
+}
