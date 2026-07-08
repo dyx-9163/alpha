@@ -309,3 +309,42 @@ type StatusSnapshot struct {
 	CollectedAt time.Time `json:"collectedAt"`
 	UpdatedAt   time.Time `json:"updatedAt"`
 }
+
+type Alert struct {
+	ID                 string    `json:"id"`
+	Fingerprint        string    `json:"fingerprint"`
+	Severity           string    `json:"severity"`
+	Scope              string    `json:"scope"`
+	ResourceID         string    `json:"resourceId,omitempty"`
+	ServerID           string    `json:"serverId,omitempty"`
+	App                string    `json:"app,omitempty"`
+	InstanceID         string    `json:"instanceId,omitempty"`
+	Status             string    `json:"status"`
+	Title              string    `json:"title"`
+	Message            string    `json:"message,omitempty"`
+	EvidenceJSON       string    `json:"evidenceJson,omitempty"`
+	RequiredPermission string    `json:"requiredPermission,omitempty"`
+	FirstSeenAt        time.Time `json:"firstSeenAt"`
+	LastSeenAt         time.Time `json:"lastSeenAt"`
+	ResolvedAt         time.Time `json:"resolvedAt,omitempty"`
+	MutedUntil         time.Time `json:"mutedUntil,omitempty"`
+	AcknowledgedBy     string    `json:"acknowledgedBy,omitempty"`
+	AcknowledgedAt     time.Time `json:"acknowledgedAt,omitempty"`
+	UpdatedAt          time.Time `json:"updatedAt"`
+}
+
+type AlertEvent struct {
+	ID          int64     `json:"id"`
+	AlertID     string    `json:"alertId"`
+	Fingerprint string    `json:"fingerprint"`
+	Event       string    `json:"event"`
+	Actor       string    `json:"actor,omitempty"`
+	Message     string    `json:"message,omitempty"`
+	CreatedAt   time.Time `json:"createdAt"`
+}
+
+type AlertQuery struct {
+	Status   string
+	Severity string
+	Scope    string
+}

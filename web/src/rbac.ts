@@ -10,6 +10,8 @@ export const permissions = {
   containersManage: 'containers.manage',
   databaseManage: 'database.manage',
   storageManage: 'storage.manage',
+  alertsView: 'alerts.view',
+  alertsManage: 'alerts.manage',
   credentialsUse: 'credentials.use',
   credentialsManage: 'credentials.manage'
 } as const
@@ -28,6 +30,7 @@ const rolePermissions: Record<string, Permission[]> = {
     permissions.containersManage,
     permissions.databaseManage,
     permissions.storageManage,
+    permissions.alertsView,
     permissions.credentialsUse
   ],
   viewer: [],

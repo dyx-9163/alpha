@@ -34,6 +34,9 @@ func (a *API) events(w http.ResponseWriter, r *http.Request) {
 		case <-r.Context().Done():
 			return
 		case event := <-ch:
+			if !a.canSendRealtimeEvent(r, event) {
+				continue
+			}
 			writeSSE(w, "aifar-event", event)
 			if flusher != nil {
 				flusher.Flush()
@@ -44,6 +47,49 @@ func (a *API) events(w http.ResponseWriter, r *http.Request) {
 				flusher.Flush()
 			}
 		}
+	}
+}
+
+func (a *API) canSendRealtimeEvent(r *http.Request, event realtime.Event) bool {
+	if !strings.HasPrefix(event.Type, "alert.") {
+		return true
+	}
+	alert, ok := realtimeAlertPayload(event)
+	return ok && a.canViewAlert(currentUser(r).Role, alert)
+}
+
+func realtimeAlertPayload(event realtime.Event) (store.Alert, bool) {
+	raw, ok := event.Payload["alert"]
+	if !ok || raw == nil {
+		return store.Alert{}, false
+	}
+	switch value := raw.(type) {
+	case store.Alert:
+		return value, true
+	case map[string]any:
+		return store.Alert{
+			ID:                 stringFromMap(value, "id"),
+			RequiredPermission: stringFromMap(value, "requiredPermission"),
+		}, true
+	default:
+		return store.Alert{}, false
+	}
+}
+
+func stringFromMap(value map[string]any, key string) string {
+	if raw, ok := value[key]; ok {
+		return strings.TrimSpace(strings.Trim(rawString(raw), `"`))
+	}
+	return ""
+}
+
+func rawString(value any) string {
+	switch v := value.(type) {
+	case string:
+		return v
+	default:
+		data, _ := json.Marshal(v)
+		return string(data)
 	}
 }
 

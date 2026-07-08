@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -13,6 +14,7 @@ import (
 
 	"aifar-deployment/backend/internal/auth"
 	"aifar-deployment/backend/internal/config"
+	"aifar-deployment/backend/internal/realtime"
 	"aifar-deployment/backend/internal/security"
 	"aifar-deployment/backend/internal/store"
 	"aifar-deployment/backend/internal/worker"
@@ -48,6 +50,117 @@ func TestOwnerCanMutateSettings(t *testing.T) {
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestAlertsAreFilteredAndManagedByPermission(t *testing.T) {
+	api, db, secret := newAuthzTestAPI(t)
+	databaseAlert, _, err := db.UpsertAlert(store.Alert{
+		Fingerprint:        "app.instance:mysql-1:failed",
+		Severity:           "critical",
+		Scope:              "app.instance",
+		ResourceID:         "mysql-1",
+		App:                "mysql",
+		Title:              "MySQL instance failed",
+		RequiredPermission: "database.manage",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	settingsAlert, _, err := db.UpsertAlert(store.Alert{
+		Fingerprint:        "collector:resources.scan:failed",
+		Severity:           "warning",
+		Scope:              "collector",
+		ResourceID:         "resources.scan",
+		Title:              "Resource scan failed",
+		RequiredPermission: "settings.manage",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	operatorToken := issueTestToken(t, db, secret, "operator", "operator")
+	viewerToken := issueTestToken(t, db, secret, "viewer", "viewer")
+	ownerToken := issueTestToken(t, db, secret, "owner", "owner")
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v2/alerts", nil)
+	req.Header.Set("Authorization", "Bearer "+operatorToken)
+	rec := httptest.NewRecorder()
+	api.Router().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected operator alerts 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	var body struct {
+		Items []struct {
+			ID                 string `json:"id"`
+			RequiredPermission string `json:"requiredPermission"`
+		} `json:"items"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if len(body.Items) != 1 || body.Items[0].ID != databaseAlert.ID || body.Items[0].RequiredPermission != "database.manage" {
+		t.Fatalf("expected operator to see only database alert, got %+v", body.Items)
+	}
+
+	viewerReq := httptest.NewRequest(http.MethodGet, "/api/v2/alerts", nil)
+	viewerReq.Header.Set("Authorization", "Bearer "+viewerToken)
+	viewerRec := httptest.NewRecorder()
+	api.Router().ServeHTTP(viewerRec, viewerReq)
+	if viewerRec.Code != http.StatusForbidden {
+		t.Fatalf("expected viewer alerts 403, got %d body=%s", viewerRec.Code, viewerRec.Body.String())
+	}
+
+	ackReq := httptest.NewRequest(http.MethodPost, "/api/v2/alerts/"+databaseAlert.ID+"/ack", strings.NewReader(`{}`))
+	ackReq.Header.Set("Authorization", "Bearer "+operatorToken)
+	ackReq.Header.Set("Content-Type", "application/json")
+	ackRec := httptest.NewRecorder()
+	api.Router().ServeHTTP(ackRec, ackReq)
+	if ackRec.Code != http.StatusOK {
+		t.Fatalf("expected operator ack 200, got %d body=%s", ackRec.Code, ackRec.Body.String())
+	}
+
+	resolveDeniedReq := httptest.NewRequest(http.MethodPost, "/api/v2/alerts/"+databaseAlert.ID+"/resolve", strings.NewReader(`{"message":"fixed"}`))
+	resolveDeniedReq.Header.Set("Authorization", "Bearer "+operatorToken)
+	resolveDeniedReq.Header.Set("Content-Type", "application/json")
+	resolveDeniedRec := httptest.NewRecorder()
+	api.Router().ServeHTTP(resolveDeniedRec, resolveDeniedReq)
+	if resolveDeniedRec.Code != http.StatusForbidden {
+		t.Fatalf("expected operator resolve 403, got %d body=%s", resolveDeniedRec.Code, resolveDeniedRec.Body.String())
+	}
+
+	resolveReq := httptest.NewRequest(http.MethodPost, "/api/v2/alerts/"+settingsAlert.ID+"/resolve", strings.NewReader(`{"message":"fixed"}`))
+	resolveReq.Header.Set("Authorization", "Bearer "+ownerToken)
+	resolveReq.Header.Set("Content-Type", "application/json")
+	resolveRec := httptest.NewRecorder()
+	api.Router().ServeHTTP(resolveRec, resolveReq)
+	if resolveRec.Code != http.StatusOK {
+		t.Fatalf("expected owner resolve 200, got %d body=%s", resolveRec.Code, resolveRec.Body.String())
+	}
+}
+
+func TestRealtimeAlertEventsArePermissionFiltered(t *testing.T) {
+	api, _, _ := newAuthzTestAPI(t)
+	baseReq := httptest.NewRequest(http.MethodGet, "/api/v2/events", nil)
+	operatorReq := baseReq.WithContext(context.WithValue(baseReq.Context(), ctxClaims{}, auth.Claims{Role: "operator"}))
+	viewerReq := baseReq.WithContext(context.WithValue(baseReq.Context(), ctxClaims{}, auth.Claims{Role: "viewer"}))
+	ownerReq := baseReq.WithContext(context.WithValue(baseReq.Context(), ctxClaims{}, auth.Claims{Role: "owner"}))
+
+	databaseAlert := realtime.Event{Type: "alert.created", Payload: map[string]any{"alert": store.Alert{RequiredPermission: "database.manage"}}}
+	settingsAlert := realtime.Event{Type: "alert.created", Payload: map[string]any{"alert": store.Alert{RequiredPermission: "settings.manage"}}}
+	if !api.canSendRealtimeEvent(operatorReq, databaseAlert) {
+		t.Fatal("expected operator to receive database alert event")
+	}
+	if api.canSendRealtimeEvent(operatorReq, settingsAlert) {
+		t.Fatal("expected operator not to receive settings alert event")
+	}
+	if api.canSendRealtimeEvent(viewerReq, databaseAlert) {
+		t.Fatal("expected viewer not to receive alert event")
+	}
+	if !api.canSendRealtimeEvent(ownerReq, settingsAlert) {
+		t.Fatal("expected owner to receive all alert events")
+	}
+	if !api.canSendRealtimeEvent(viewerReq, realtime.Event{Type: "task.updated"}) {
+		t.Fatal("expected non-alert realtime events to pass through")
 	}
 }
 

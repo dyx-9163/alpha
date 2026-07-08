@@ -1009,3 +1009,5 @@
 - 结论：全局任务浮层已改为最多 4 条纵向堆叠，只展示安装/卸载类任务类型；检查、备份、扫描、配置发布等任务仍在任务中心查看。整体提醒建议由 aifar-server 负责规则、聚合、落库、推送和 UI，aifar-agent 负责本机/模块健康探测与心跳上报。
 - 问题：用户确认整体提醒是否应由服务启动后自行采集日志/状态，用户登录有权限账号后即可看到。
 - 结论：方向正确；采集和告警判断应随 aifar-server/aifar-agent 后台启动，不依赖页面登录。登录后前端只按 RBAC 拉取当前未恢复提醒并订阅 SSE。提醒存状态摘要和证据引用，不应把完整日志写入提醒表。
+- 问题：用户要求按企业级方案落地轻量 Alert Center。
+- 结论：已新增后端 alerts 模块、alerts/alert_events 表、规则评估、权限过滤 API、SSE alert 事件和 collector 启动链路；第一阶段基于 aifar-server 已有 collector/status_snapshots/app_instances/tasks 自动生成和恢复提醒，不依赖 agent 上报。前端新增全局铃铛提醒抽屉、Dashboard 关键提醒摘要和 RBAC `alerts.view`/`alerts.manage`；完整日志仍保留在任务/容器/Runtime 日志入口。

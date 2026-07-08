@@ -1,8 +1,9 @@
 import { defineStore } from 'pinia'
 import { eventStreamUrl } from '../api/client'
+import { useAlertsStore } from './alerts'
 import { useTaskProgressStore } from './taskProgress'
 
-type RealtimeEvent = {
+export type RealtimeEvent = {
   id?: string
   type?: string
   resource?: string
@@ -99,6 +100,9 @@ export const useRealtimeStore = defineStore('realtime', {
       this.revision += 1
       if (event.taskId && (event.type === 'task.updated' || event.type === 'task.finished')) {
         void useTaskProgressStore().refreshTask(event.taskId)
+      }
+      if (event.type.startsWith('alert.')) {
+        useAlertsStore().applyRealtimeEvent(event)
       }
     }
   }

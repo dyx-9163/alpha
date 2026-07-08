@@ -16,9 +16,14 @@ type Publisher interface {
 	Publish(realtime.Event)
 }
 
+type AlertEvaluator interface {
+	Evaluate(context.Context) error
+}
+
 type Manager struct {
 	store     *store.Store
 	events    Publisher
+	alerts    AlertEvaluator
 	interval  time.Duration
 	timeout   time.Duration
 	startedCh chan struct{}
@@ -34,6 +39,12 @@ func NewManager(s *store.Store, events Publisher, interval time.Duration) *Manag
 		interval:  interval,
 		timeout:   8 * time.Second,
 		startedCh: make(chan struct{}),
+	}
+}
+
+func (m *Manager) SetAlertEvaluator(alerts AlertEvaluator) {
+	if m != nil {
+		m.alerts = alerts
 	}
 }
 
@@ -64,6 +75,9 @@ func (m *Manager) RunOnce(ctx context.Context) {
 	m.run(ctx, "servers", m.collectServers)
 	m.run(ctx, "docker.summary", m.collectDockerSummaries)
 	m.run(ctx, "aifar.runtime", m.collectAIFARRuntime)
+	if m.alerts != nil {
+		_ = m.alerts.Evaluate(ctx)
+	}
 }
 
 func (m *Manager) run(ctx context.Context, name string, fn func(context.Context) error) {

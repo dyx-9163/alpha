@@ -16,6 +16,8 @@ const (
 	ContainersManage  Permission = "containers.manage"
 	DatabaseManage    Permission = "database.manage"
 	StorageManage     Permission = "storage.manage"
+	AlertsView        Permission = "alerts.view"
+	AlertsManage      Permission = "alerts.manage"
 	CredentialsUse    Permission = "credentials.use"
 	CredentialsManage Permission = "credentials.manage"
 )
@@ -23,7 +25,7 @@ const (
 var rolePermissions = map[string]map[Permission]struct{}{
 	"owner":    allPermissions(),
 	"admin":    allPermissions(),
-	"operator": permissionSet(ResourcesScan, ServersManage, TerminalConnect, TasksManage, AppsManage, ContainersManage, DatabaseManage, StorageManage, CredentialsUse),
+	"operator": permissionSet(ResourcesScan, ServersManage, TerminalConnect, TasksManage, AppsManage, ContainersManage, DatabaseManage, StorageManage, AlertsView, CredentialsUse),
 	"viewer":   permissionSet(),
 	"auditor":  permissionSet(),
 }
@@ -78,6 +80,8 @@ func allPermissions() map[Permission]struct{} {
 		ContainersManage,
 		DatabaseManage,
 		StorageManage,
+		AlertsView,
+		AlertsManage,
 		CredentialsUse,
 		CredentialsManage,
 	)

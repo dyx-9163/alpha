@@ -24,6 +24,7 @@
       </el-aside>
       <el-main class="content">
         <GlobalTaskProgress />
+        <GlobalAlerts />
         <GlobalRealtimeStatus />
         <div class="content-body">
           <router-view />
@@ -40,7 +41,9 @@ import zhCn from 'element-plus/es/locale/lang/zh-cn'
 import en from 'element-plus/es/locale/lang/en'
 import { useRouter } from 'vue-router'
 import GlobalTaskProgress from './components/GlobalTaskProgress.vue'
+import GlobalAlerts from './components/GlobalAlerts.vue'
 import GlobalRealtimeStatus from './components/GlobalRealtimeStatus.vue'
+import { useAlertsStore } from './stores/alerts'
 import { useSessionStore } from './stores/session'
 import { useRealtimeStore } from './stores/realtime'
 import { useI18n } from './i18n'
@@ -49,6 +52,7 @@ import { permissions, type Permission } from './rbac'
 const router = useRouter()
 const session = useSessionStore()
 const realtime = useRealtimeStore()
+const alerts = useAlertsStore()
 const { locale, t } = useI18n()
 const elementLocale = computed(() => locale.value === 'en' ? en : zhCn)
 const navItems = computed(() => allNavItems.filter((item) => !item.permission || session.hasPermission(item.permission)))
@@ -69,6 +73,7 @@ const allNavItems: Array<{ path: string; labelKey: string; icon: Component; perm
 
 function logout() {
   realtime.disconnect()
+  alerts.clear()
   session.logout()
   router.push('/login')
 }
@@ -84,6 +89,7 @@ watch(() => session.isLoggedIn, (loggedIn) => {
     realtime.connect()
   } else {
     realtime.disconnect()
+    alerts.clear()
   }
 })
 

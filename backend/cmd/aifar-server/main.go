@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"aifar-deployment/backend/internal/adapter"
+	"aifar-deployment/backend/internal/alerts"
 	"aifar-deployment/backend/internal/apps/aifar"
 	"aifar-deployment/backend/internal/collector"
 	"aifar-deployment/backend/internal/config"
@@ -30,15 +31,24 @@ func main() {
 		log.Fatalf("bootstrap user: %v", err)
 	}
 
+	resourceScanStartedAt := time.Now()
 	if err := resource.ScanAndSave(db, cfg.ResourceDir); err != nil {
 		log.Printf("resource scan warning: %v", err)
+		now := time.Now()
+		_ = db.UpsertCollectorRun(store.CollectorRun{Name: "resources.scan", Target: cfg.ResourceDir, Status: "failed", LastError: err.Error(), StartedAt: resourceScanStartedAt, FinishedAt: now, DurationMS: now.Sub(resourceScanStartedAt).Milliseconds(), UpdatedAt: now})
+	} else {
+		now := time.Now()
+		_ = db.UpsertCollectorRun(store.CollectorRun{Name: "resources.scan", Target: cfg.ResourceDir, Status: "success", StartedAt: resourceScanStartedAt, FinishedAt: now, DurationMS: now.Sub(resourceScanStartedAt).Milliseconds(), UpdatedAt: now})
 	}
 
 	tasks := worker.NewManagerWithConcurrency(db, cfg.DeploymentConcurrency)
 	events := realtime.NewHub()
 	tasks.SetEventPublisher(events)
 	aifar.NewAutoscaler(db, tasks, adapter.SSHRemote{}).Start(context.Background())
-	collector.NewManager(db, events, time.Duration(cfg.CollectorIntervalSecs)*time.Second).Start(context.Background())
+	alertManager := alerts.NewManager(db, events)
+	collectorManager := collector.NewManager(db, events, time.Duration(cfg.CollectorIntervalSecs)*time.Second)
+	collectorManager.SetAlertEvaluator(alertManager)
+	collectorManager.Start(context.Background())
 	api := httpapi.NewWithRealtime(cfg, db, tasks, events)
 
 	log.Printf("AIFAR listening on %s", cfg.Addr)

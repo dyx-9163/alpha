@@ -15,6 +15,30 @@
 
     <MetricGrid :items="kpis" class="dashboard-kpis" />
 
+    <div v-if="canViewAlerts" class="workspace-card dashboard-alerts">
+      <div class="dashboard-alerts-head">
+        <div>
+          <h2 class="section-title">{{ t('dashboard.alertsTitle') }}</h2>
+          <p>{{ t('dashboard.alertsHint') }}</p>
+        </div>
+        <el-button text @click="openAlertCenter">{{ t('alerts.title') }}</el-button>
+      </div>
+      <div class="filter-row">
+        <span class="status-pill danger">{{ t('alerts.severity.critical') }} {{ alerts.criticalCount }}</span>
+        <span class="status-pill warning">{{ t('alerts.severity.warning') }} {{ alerts.warningCount }}</span>
+        <span class="status-pill">{{ t('common.all') }} {{ alerts.openCount }}</span>
+      </div>
+      <el-empty v-if="!dashboardAlerts.length" :description="t('dashboard.noAlerts')" />
+      <div v-else class="dashboard-alert-list">
+        <button v-for="alert in dashboardAlerts" :key="alert.id" class="dashboard-alert-row" @click="openAlertCenter">
+          <el-tag :type="alertSeverityType(alert.severity)" size="small" effect="light">{{ severityLabel(alert.severity) }}</el-tag>
+          <strong>{{ alert.title }}</strong>
+          <span>{{ alertScope(alert) }}</span>
+          <span>{{ formatTime(alert.lastSeenAt || alert.updatedAt) }}</span>
+        </button>
+      </div>
+    </div>
+
     <div class="workspace-card">
       <h2 class="section-title">{{ t('dashboard.serverMetrics') }}</h2>
       <el-table :data="serverRows" :empty-text="t('dashboard.noServers')">
@@ -112,8 +136,13 @@ import { apiGet, asArray } from '../api/client'
 import MetricGrid from '../components/MetricGrid.vue'
 import StatusTag from '../components/StatusTag.vue'
 import { useI18n } from '../i18n'
+import { permissions } from '../rbac'
+import { useAlertsStore, type AlertItem } from '../stores/alerts'
+import { useSessionStore } from '../stores/session'
 
 const { t } = useI18n()
+const session = useSessionStore()
+const alerts = useAlertsStore()
 const servers = ref<any[]>([])
 const tasks = ref<any[]>([])
 const databaseInstances = ref<any[]>([])
@@ -152,13 +181,25 @@ const runningTasks = computed(() => tasks.value.filter((task) => task.status ===
 const runningDockerHosts = computed(() => dockerRows.value.filter((row) => row.available).length)
 const runningDatabaseInstances = computed(() => databaseInstances.value.filter((instance) => isRunningStatus(instance.status)).length)
 const runningStorageInstances = computed(() => storageInstances.value.filter((instance) => isRunningStatus(instance.status)).length)
-const kpis = computed(() => [
-  { label: t('nav.servers'), value: servers.value.length, note: `${t('common.available')} ${availableServers.value}` },
-  { label: t('toolbox.tasks'), value: tasks.value.length, note: `${t('common.running')} ${runningTasks.value}` },
-  { label: 'Docker', value: dockerRows.value.length, note: `${t('common.running')} ${runningDockerHosts.value}` },
-  { label: t('nav.database'), value: databaseInstances.value.length, note: `${t('common.running')} ${runningDatabaseInstances.value}` },
-  { label: t('nav.storage'), value: storageInstances.value.length, note: `${t('common.running')} ${runningStorageInstances.value}` }
-])
+const canViewAlerts = computed(() => session.hasPermission(permissions.alertsView))
+const dashboardAlerts = computed(() => alerts.openAlerts.slice(0, 5))
+const kpis = computed(() => {
+  const items = [
+    { label: t('nav.servers'), value: servers.value.length, note: `${t('common.available')} ${availableServers.value}` },
+    { label: t('toolbox.tasks'), value: tasks.value.length, note: `${t('common.running')} ${runningTasks.value}` },
+    { label: 'Docker', value: dockerRows.value.length, note: `${t('common.running')} ${runningDockerHosts.value}` },
+    { label: t('nav.database'), value: databaseInstances.value.length, note: `${t('common.running')} ${runningDatabaseInstances.value}` },
+    { label: t('nav.storage'), value: storageInstances.value.length, note: `${t('common.running')} ${runningStorageInstances.value}` }
+  ]
+  if (canViewAlerts.value) {
+    items.splice(1, 0, {
+      label: t('alerts.title'),
+      value: alerts.openCount,
+      note: `${t('alerts.severity.critical')} ${alerts.criticalCount}`
+    })
+  }
+  return items
+})
 
 function metricWidth(value: unknown) {
   const n = Number(value)
@@ -180,7 +221,11 @@ async function load() {
     tasks.value = asArray(taskList)
     databaseInstances.value = asArray(databaseList)
     storageInstances.value = asArray(storageList)
-    await Promise.all([loadTelemetry(), loadDockerStatus()])
+    await Promise.all([
+      loadTelemetry(),
+      loadDockerStatus(),
+      canViewAlerts.value ? alerts.load().catch(() => undefined) : Promise.resolve()
+    ])
   } finally {
     loading.value = false
   }
@@ -221,6 +266,24 @@ function serverName(id: string) {
   return server ? `${server.name} (${server.host})` : id || '-'
 }
 
+function openAlertCenter() {
+  alerts.openDrawer()
+}
+
+function alertSeverityType(severity: string) {
+  if (severity === 'critical') return 'danger'
+  if (severity === 'warning') return 'warning'
+  return 'info'
+}
+
+function severityLabel(severity: string) {
+  return t(`alerts.severity.${severity}`)
+}
+
+function alertScope(alert: AlertItem) {
+  return alert.app || alert.scope || t('common.unknown')
+}
+
 onMounted(load)
 </script>
 
@@ -249,6 +312,63 @@ onMounted(load)
 
 .dashboard-kpis {
   margin-bottom: 0;
+}
+
+.dashboard-alerts {
+  display: grid;
+  gap: 10px;
+}
+
+.dashboard-alerts-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.dashboard-alerts-head p {
+  margin: 4px 0 0;
+  color: var(--aifar-text-secondary);
+  font-size: 12px;
+}
+
+.dashboard-alert-list {
+  display: grid;
+  gap: 8px;
+}
+
+.dashboard-alert-row {
+  display: grid;
+  grid-template-columns: 78px minmax(0, 1fr) 96px 150px;
+  align-items: center;
+  gap: 10px;
+  min-height: 42px;
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid var(--aifar-border);
+  border-radius: var(--aifar-radius-md);
+  background: #fff;
+  color: var(--aifar-text-secondary);
+  text-align: left;
+  cursor: pointer;
+}
+
+.dashboard-alert-row:hover {
+  border-color: #b9d6ff;
+  background: #f8fbff;
+}
+
+.dashboard-alert-row strong,
+.dashboard-alert-row span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.dashboard-alert-row strong {
+  color: var(--aifar-ink);
+  font-size: 13px;
 }
 
 .snapshot-bar {
@@ -292,6 +412,10 @@ onMounted(load)
 @media (max-width: 1200px) {
   .dashboard-split {
     grid-template-columns: 1fr;
+  }
+
+  .dashboard-alert-row {
+    grid-template-columns: 78px minmax(0, 1fr);
   }
 }
 </style>

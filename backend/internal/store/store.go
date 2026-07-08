@@ -227,6 +227,20 @@ func (s *Store) migrate() error {
 			primary key(scope, resource_id)
 		)`,
 		`create index if not exists status_snapshots_scope_server on status_snapshots(scope, server_id)`,
+		`create table if not exists alerts (
+			id text primary key, fingerprint text not null unique, severity text not null, scope text not null,
+			resource_id text, server_id text, app text, instance_id text, status text not null,
+			title text not null, message text, evidence_json text, required_permission text,
+			first_seen_at datetime not null, last_seen_at datetime not null, resolved_at datetime,
+			muted_until datetime, acknowledged_by text, acknowledged_at datetime, updated_at datetime not null
+		)`,
+		`create index if not exists alerts_status_severity_scope on alerts(status, severity, scope)`,
+		`create index if not exists alerts_server_app_instance on alerts(server_id, app, instance_id)`,
+		`create table if not exists alert_events (
+			id integer primary key autoincrement, alert_id text not null, fingerprint text not null,
+			event text not null, actor text, message text, created_at datetime not null
+		)`,
+		`create index if not exists alert_events_alert on alert_events(alert_id, created_at)`,
 	}
 	for _, stmt := range schema {
 		if _, err := s.db.Exec(stmt); err != nil {
@@ -243,6 +257,12 @@ func (s *Store) migrate() error {
 		return err
 	}
 	if err := s.ensureColumn("users", "token_version", `alter table users add column token_version integer not null default 1`); err != nil {
+		return err
+	}
+	if err := s.ensureColumn("alerts", "acknowledged_by", `alter table alerts add column acknowledged_by text`); err != nil {
+		return err
+	}
+	if err := s.ensureColumn("alerts", "acknowledged_at", `alter table alerts add column acknowledged_at datetime`); err != nil {
 		return err
 	}
 	return nil
@@ -375,7 +395,7 @@ func (s *Store) ListUsers() ([]UserSummary, error) {
 
 func (s *Store) CountRows(table string) (int, error) {
 	switch table {
-	case "users", "servers", "tasks", "task_logs", "task_targets", "task_steps", "audit_logs", "resources", "app_instances", "app_releases", "nacos_config_revisions", "credentials", "credential_versions", "credential_bindings", "storage_items", "settings", "collector_runs", "status_snapshots":
+	case "users", "servers", "tasks", "task_logs", "task_targets", "task_steps", "audit_logs", "resources", "app_instances", "app_releases", "nacos_config_revisions", "credentials", "credential_versions", "credential_bindings", "storage_items", "settings", "collector_runs", "status_snapshots", "alerts", "alert_events":
 	default:
 		return 0, fmt.Errorf("unsupported table %q", table)
 	}
