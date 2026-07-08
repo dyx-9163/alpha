@@ -476,6 +476,39 @@ func TestManagerStartsStoppedDesiredPod(t *testing.T) {
 	}
 }
 
+func TestManagerRestartsUnhealthyDesiredPod(t *testing.T) {
+	deployment := DeploymentSpec{
+		ServiceName: "oauth",
+		Image:       "aifar-oauth:rev-1",
+		PodRevision: "rev-1",
+		Replicas:    1,
+		Ports:       []ContainerPort{{Name: "http", ContainerPort: 38001}},
+	}
+	runner := &unhealthyDesiredPodRunner{hash: deploymentSpecHash(deployment)}
+	manager := NewManager(ManagerOptions{StateDir: t.TempDir(), Runner: runner})
+	spec := NormalizeSpec(RuntimeSpec{
+		InstanceID:  "admin",
+		InstallRoot: "/aifar/apps/admin",
+		Network:     "aifar-network",
+		Deployments: []DeploymentSpec{deployment},
+		Services:    []ServiceSpec{{Name: "oauth", AppName: "alpha-oauth", Port: 38001, TargetPort: 38001}},
+	})
+
+	if err := manager.ensureDeployment(context.Background(), spec, deployment); err != nil {
+		t.Fatal(err)
+	}
+	calls := runner.callsString()
+	if !strings.Contains(calls, "docker restart aifar-pod-admin-oauth-rev-1-r1") {
+		t.Fatalf("expected unhealthy existing pod to be restarted, got:\n%s", calls)
+	}
+	if strings.Contains(calls, "docker start aifar-pod-admin-oauth-rev-1-r1") {
+		t.Fatalf("expected running unhealthy pod to be restarted, not started:\n%s", calls)
+	}
+	if strings.Contains(calls, "docker run -d") {
+		t.Fatalf("expected existing unhealthy pod to be restarted, not recreated:\n%s", calls)
+	}
+}
+
 func TestManagerReturnsErrorWhenRemovingDriftedPodFails(t *testing.T) {
 	deployment := DeploymentSpec{
 		ServiceName: "oauth",
@@ -607,6 +640,58 @@ func (r *stoppedDesiredPodRunner) Run(ctx context.Context, name string, args ...
 }
 
 func (r *stoppedDesiredPodRunner) callsString() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return strings.Join(r.calls, "\n")
+}
+
+type unhealthyDesiredPodRunner struct {
+	mu        sync.Mutex
+	hash      string
+	restarted bool
+	calls     []string
+}
+
+func (r *unhealthyDesiredPodRunner) Run(ctx context.Context, name string, args ...string) (CommandResult, error) {
+	call := name + " " + strings.Join(args, " ")
+	r.mu.Lock()
+	r.calls = append(r.calls, call)
+	restarted := r.restarted
+	r.mu.Unlock()
+	switch {
+	case strings.Contains(call, "docker inspect -f {{.Id}}"):
+		return CommandResult{Stdout: "container-id\n"}, nil
+	case strings.Contains(call, `{{index .Config.Labels "aifar.spec-hash"}}`):
+		return CommandResult{Stdout: r.hash + "\n"}, nil
+	case strings.Contains(call, "docker update --restart"):
+		return CommandResult{Stdout: "updated\n"}, nil
+	case strings.Contains(call, "docker inspect -f {{.State.Running}} ") && !strings.Contains(call, "|"):
+		return CommandResult{Stdout: "true\n"}, nil
+	case strings.Contains(call, "docker restart"):
+		r.mu.Lock()
+		r.restarted = true
+		r.mu.Unlock()
+		return CommandResult{Stdout: "restarted\n"}, nil
+	case strings.Contains(call, "docker inspect -f {{.State.Running}}|") && strings.Contains(call, "NetworkSettings"):
+		if restarted {
+			return CommandResult{Stdout: "true|healthy|172.20.0.10\n"}, nil
+		}
+		return CommandResult{Stdout: "true|unhealthy|\n"}, nil
+	case strings.Contains(call, "docker inspect -f {{.State.Running}}|"):
+		if restarted {
+			return CommandResult{Stdout: "true|healthy\n"}, nil
+		}
+		return CommandResult{Stdout: "true|unhealthy\n"}, nil
+	case strings.Contains(call, "docker ps -a") && strings.Contains(call, `{{.Label "aifar.replica"}}`):
+		return CommandResult{Stdout: "aifar-pod-admin-oauth-rev-1-r1|1|rev-1|" + r.hash + "\n"}, nil
+	case strings.Contains(call, "docker ps "):
+		return CommandResult{Stdout: "aifar-pod-admin-oauth-rev-1-r1\n"}, nil
+	default:
+		return CommandResult{Stdout: "ok\n"}, nil
+	}
+}
+
+func (r *unhealthyDesiredPodRunner) callsString() string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return strings.Join(r.calls, "\n")

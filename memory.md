@@ -1013,3 +1013,5 @@
 - 结论：已新增后端 alerts 模块、alerts/alert_events 表、规则评估、权限过滤 API、SSE alert 事件和 collector 启动链路；第一阶段基于 aifar-server 已有 collector/status_snapshots/app_instances/tasks 自动生成和恢复提醒，不依赖 agent 上报。前端新增全局铃铛提醒抽屉、Dashboard 关键提醒摘要和 RBAC `alerts.view`/`alerts.manage`；完整日志仍保留在任务/容器/Runtime 日志入口。
 - 问题：用户停止 Docker 后，容器页顶部显示 Docker 不可用，但 AIFAR Runtime 的服务/Deployment 仍显示就绪和 1/1。
 - 结论：根因是 Runtime 聚合在 Docker/agent 不可用时仍用历史 endpoint 记录兜底 ready。已改为 Runtime 构建先 ping Docker，Docker 不可达或容器列表读取失败时不再信历史 endpoint，Deployment/服务 ready 和 endpoint 归零并显示 `no-endpoints`，Pods 显示 stale；collector 在 docker.summary 失败时也将 AIFAR Runtime snapshot 降为 `no-endpoints`。
+- 问题：用户反馈数据库或 Nacos 未启动时先启动 AIFAR Pod，依赖恢复后 oauth/permission/system 等 Pod 一直异常，无法自行恢复。
+- 结论：根因是 runtime agent reconcile 对已存在且 running 的 Pod 只看运行态，不看 Docker health，running 但 unhealthy 的 Pod 会被误判为正常。已在既有 Pod 校正路径增加 readiness 检查：healthy/无健康检查放行、starting 等待、unhealthy/异常状态执行 `docker restart` 并等待健康；补充单测覆盖 running unhealthy Pod 自动重启。

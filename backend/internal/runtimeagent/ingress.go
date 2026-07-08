@@ -676,6 +676,35 @@ func (m *Manager) ensureExistingContainerRunning(ctx context.Context, deployment
 		return err
 	}
 	if running {
+		readyRunning, health, err := m.containerReadiness(ctx, name)
+		if err != nil {
+			return err
+		}
+		if readyRunning {
+			switch strings.ToLower(strings.TrimSpace(health)) {
+			case "", "healthy":
+				return nil
+			case "starting":
+				if err := m.waitContainerReady(ctx, name); err != nil {
+					return err
+				}
+				return nil
+			default:
+				if _, err := m.runner.Run(ctx, "docker", "restart", name); err != nil {
+					return fmt.Errorf("restart unhealthy AIFAR pod %s: %w", name, err)
+				}
+				if err := m.waitContainerReady(ctx, name); err != nil {
+					return err
+				}
+				logf(m.log, "AIFAR runtime pod restarted unhealthy service=%s replica=%d container=%s health=%s\n", deployment.ServiceName, replica, name, health)
+				return nil
+			}
+		}
+		// The pod state changed between inspections. Fall through to the stopped
+		// recovery path so reconcile can still restore the desired replica.
+		running = false
+	}
+	if running {
 		return nil
 	}
 	if _, err := m.runner.Run(ctx, "docker", "start", name); err != nil {
@@ -698,6 +727,20 @@ func (m *Manager) containerRunning(ctx context.Context, name string) (bool, erro
 		state = strings.TrimSpace(strings.SplitN(state, "|", 2)[0])
 	}
 	return strings.EqualFold(state, "true"), nil
+}
+
+func (m *Manager) containerReadiness(ctx context.Context, name string) (bool, string, error) {
+	result, err := m.runner.Run(ctx, "docker", "inspect", "-f", `{{.State.Running}}|{{if .State.Health}}{{.State.Health.Status}}{{end}}`, name)
+	if err != nil {
+		return false, "", fmt.Errorf("inspect AIFAR pod readiness %s: %w", name, err)
+	}
+	parts := strings.SplitN(strings.TrimSpace(result.Stdout), "|", 2)
+	running := len(parts) > 0 && strings.EqualFold(strings.TrimSpace(parts[0]), "true")
+	health := ""
+	if len(parts) > 1 {
+		health = strings.TrimSpace(parts[1])
+	}
+	return running, health, nil
 }
 
 func (m *Manager) runContainer(ctx context.Context, spec RuntimeSpec, deployment DeploymentSpec, replica int, name string) error {
