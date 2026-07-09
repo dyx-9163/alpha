@@ -43,344 +43,8 @@
       </template>
 
       <template v-else-if="tab === 'aifar-runtime'">
-        <div class="runtime-workspace">
-          <div class="runtime-toolbar">
-            <div class="runtime-status">
-              <StatusTag :status="aifarRuntimeStatusKind(aifarRuntime.runtimeStatus)" :label="aifarRuntimeStatusLabel(aifarRuntime.runtimeStatus)" />
-              <span>{{ t('containers.agent') }}:</span>
-              <StatusTag :status="aifarRuntimeStatusKind(aifarRuntime.agent?.status)" :label="aifarRuntimeStatusLabel(aifarRuntime.agent?.status)" />
-            </div>
-            <div class="toolbar-actions">
-              <el-select v-model="selectedRuntimeInstanceId" size="small" class="runtime-instance-select" :placeholder="t('containers.selectAifarInstance')">
-                <el-option v-for="instance in aifarRuntimeInstances" :key="instance.id" :label="runtimeInstanceLabel(instance)" :value="instance.id" />
-              </el-select>
-              <el-tooltip :content="aifarRuntimeActionDisabledReason" :disabled="!aifarRuntimeActionDisabledReason" placement="top">
-                <span><el-button size="small" type="primary" :disabled="Boolean(aifarRuntimeActionDisabledReason)" @click="openRuntimeConfigDialog">{{ t('containers.runtimeConfig') }}</el-button></span>
-              </el-tooltip>
-              <el-tooltip :content="serviceInstallDisabledReason" :disabled="!serviceInstallDisabledReason" placement="top">
-                <span><el-button size="small" type="primary" plain :disabled="Boolean(serviceInstallDisabledReason)" @click="openServiceInstallDialog">{{ t('containers.installServices') }}</el-button></span>
-              </el-tooltip>
-              <el-tooltip :content="aifarRuntimeActionDisabledReason" :disabled="!aifarRuntimeActionDisabledReason" placement="top">
-                <span><el-button size="small" type="primary" plain :disabled="Boolean(aifarRuntimeActionDisabledReason)" @click="openAifarRuntimeBundleUpdate">{{ t('containers.bundleUpdate') }}</el-button></span>
-              </el-tooltip>
-              <el-tooltip :content="aifarRuntimeActionDisabledReason" :disabled="!aifarRuntimeActionDisabledReason" placement="top">
-                <span><el-button size="small" :disabled="Boolean(aifarRuntimeActionDisabledReason)" @click="reconcileAifarRuntime">{{ t('containers.reconcileRuntime') }}</el-button></span>
-              </el-tooltip>
-              <el-tooltip :content="runtimeCleanupDisabledReason" :disabled="!runtimeCleanupDisabledReason" placement="top">
-                <span><el-button size="small" type="warning" plain :disabled="Boolean(runtimeCleanupDisabledReason)" @click="cleanupAifarRuntimeStale">{{ t('containers.cleanupStaleRuntime') }}</el-button></span>
-              </el-tooltip>
-              <el-button size="small" :loading="loading" @click="loadAifarRuntime(true)">{{ t('common.refresh') }}</el-button>
-            </div>
-          </div>
-          <el-alert
-            v-if="aifarRuntimeWarnings.length"
-            type="warning"
-            :closable="false"
-            show-icon
-            :title="aifarRuntimeWarnings.join('；')"
-          />
-          <div v-if="!aifarRuntimeInstances.length" class="empty-state">
-            <div>
-              <strong>{{ t('containers.aifarRuntime') }}</strong>
-              <span>{{ t('containers.noAifarRuntime') }}</span>
-            </div>
-          </div>
-          <template v-else>
-            <KeyValueGrid :items="runtimeSummaryItems" />
-            <el-tabs v-model="runtimeResourceTab" class="runtime-resource-tabs">
-              <el-tab-pane :label="t('containers.deployments')" name="deployments">
-                <div class="runtime-resource-panel">
-                  <el-table :data="selectedRuntimeDeployments" height="100%" row-key="serviceName">
-                    <el-table-column prop="deploymentName" :label="t('containers.deployment')" min-width="170" show-overflow-tooltip />
-                    <el-table-column prop="serviceName" :label="t('containers.service')" width="130" show-overflow-tooltip />
-                    <el-table-column prop="status" :label="t('common.status')" width="120">
-                      <template #default="{ row }">
-                        <StatusTag :status="aifarRuntimeStatusKind(row.status)" :label="aifarRuntimeStatusLabel(row.status)" />
-                      </template>
-                    </el-table-column>
-                    <el-table-column :label="t('containers.replicas')" width="130">
-                      <template #default="{ row }">{{ runtimeDeploymentReplicaText(row) }}</template>
-                    </el-table-column>
-                    <el-table-column :label="t('containers.rollout')" width="120">
-                      <template #default="{ row }">
-                        <el-tooltip :content="row.failureReason" :disabled="!row.failureReason" placement="top">
-                          <span><StatusTag :status="aifarRuntimeStatusKind(row.status)" :label="aifarRuntimeStatusLabel(row.status)" /></span>
-                        </el-tooltip>
-                      </template>
-                    </el-table-column>
-                    <el-table-column prop="podRevision" :label="t('containers.revision')" min-width="180" show-overflow-tooltip />
-                    <el-table-column prop="image" :label="t('containers.image')" min-width="240" show-overflow-tooltip />
-                    <el-table-column :label="t('common.operation')" width="390" fixed="right">
-                      <template #default="{ row }">
-                        <div class="row-actions">
-                          <el-tooltip :content="aifarRuntimeActionDisabledReason" :disabled="!aifarRuntimeActionDisabledReason" placement="top">
-                            <span><el-button size="small" type="primary" plain :disabled="Boolean(aifarRuntimeActionDisabledReason)" @click="openAifarRuntimeServiceUpdate(runtimeServiceForDeployment(row))">{{ t('containers.updateService') }}</el-button></span>
-                          </el-tooltip>
-                          <el-tooltip :content="aifarRuntimeActionDisabledReason" :disabled="!aifarRuntimeActionDisabledReason" placement="top">
-                            <span><el-button size="small" :disabled="Boolean(aifarRuntimeActionDisabledReason)" @click="scaleOutAifarService(row.serviceName)">{{ t('containers.scaleOut') }}</el-button></span>
-                          </el-tooltip>
-                          <el-tooltip :content="aifarRuntimeScaleInDisabledReason(row)" :disabled="!aifarRuntimeScaleInDisabledReason(row)" placement="top">
-                            <span><el-button size="small" plain :disabled="Boolean(aifarRuntimeScaleInDisabledReason(row))" @click="scaleInAifarDeployment(row)">{{ t('containers.scaleIn') }}</el-button></span>
-                          </el-tooltip>
-                          <el-tooltip :content="aifarRuntimeOfflineDisabledReason(runtimeServiceForDeployment(row))" :disabled="!aifarRuntimeOfflineDisabledReason(runtimeServiceForDeployment(row))" placement="top">
-                            <span><el-button size="small" type="danger" plain :disabled="Boolean(aifarRuntimeOfflineDisabledReason(runtimeServiceForDeployment(row)))" @click="offlineAifarService(runtimeServiceForDeployment(row))">{{ t('containers.offlineDeployment') }}</el-button></span>
-                          </el-tooltip>
-                        </div>
-                      </template>
-                    </el-table-column>
-                  </el-table>
-                </div>
-              </el-tab-pane>
-              <el-tab-pane :label="t('containers.releases')" name="releases">
-                <div class="runtime-resource-panel">
-                  <div class="runtime-tab-toolbar">
-                    <span class="selection-summary">{{ t('containers.releaseCount', { count: aifarReleases.length }) }}</span>
-                    <div class="runtime-tab-actions">
-                      <el-button size="small" :loading="loading" @click="loadAifarReleases(true)">{{ t('common.refresh') }}</el-button>
-                    </div>
-                  </div>
-                  <el-table :data="aifarReleases" height="calc(100% - 44px)" row-key="releaseId">
-                    <el-table-column prop="releaseId" :label="t('containers.releaseId')" min-width="240" show-overflow-tooltip />
-                    <el-table-column :label="t('containers.releaseKind')" width="130">
-                      <template #default="{ row }">{{ releaseKindLabel(row.kind) }}</template>
-                    </el-table-column>
-                    <el-table-column :label="t('common.status')" width="120">
-                      <template #default="{ row }">
-                        <StatusTag :status="aifarRuntimeStatusKind(row.status)" :label="releaseStatusLabel(row.status)" />
-                      </template>
-                    </el-table-column>
-                    <el-table-column :label="t('containers.service')" min-width="150" show-overflow-tooltip>
-                      <template #default="{ row }">{{ releaseServicesText(row) }}</template>
-                    </el-table-column>
-                    <el-table-column prop="activatedAt" :label="t('containers.activatedAt')" min-width="170" show-overflow-tooltip>
-                      <template #default="{ row }">{{ formatDate(row.activatedAt || row.createdAt) }}</template>
-                    </el-table-column>
-                    <el-table-column :label="t('common.operation')" width="120" fixed="right">
-                      <template #default="{ row }">
-                        <el-tooltip :content="releaseRollbackDisabledReason(row)" :disabled="!releaseRollbackDisabledReason(row)" placement="top">
-                          <span>
-                            <el-button size="small" type="warning" plain :disabled="Boolean(releaseRollbackDisabledReason(row))" @click="rollbackAifarRelease(row)">
-                              {{ t('containers.rollbackRelease') }}
-                            </el-button>
-                          </span>
-                        </el-tooltip>
-                      </template>
-                    </el-table-column>
-                  </el-table>
-                </div>
-              </el-tab-pane>
-              <el-tab-pane :label="t('containers.services')" name="services">
-                <div class="runtime-resource-panel">
-                  <el-table :data="selectedRuntimeServices" height="100%" row-key="serviceName">
-                    <el-table-column prop="serviceName" :label="t('containers.service')" min-width="130" show-overflow-tooltip />
-                    <el-table-column prop="appName" :label="t('containers.appName')" min-width="170" show-overflow-tooltip />
-                    <el-table-column prop="status" :label="t('common.status')" width="120">
-                      <template #default="{ row }">
-                        <StatusTag :status="aifarRuntimeStatusKind(row.status)" :label="aifarRuntimeStatusLabel(row.status)" />
-                      </template>
-                    </el-table-column>
-                    <el-table-column :label="t('containers.endpoint')" width="110">
-                      <template #default="{ row }">{{ runtimeEndpointText(row) }}</template>
-                    </el-table-column>
-                    <el-table-column prop="proxyName" :label="t('containers.proxy')" min-width="170" show-overflow-tooltip />
-                    <el-table-column prop="image" :label="t('containers.image')" min-width="240" show-overflow-tooltip />
-                    <el-table-column :label="t('containers.cpu')" width="90">
-                      <template #default="{ row }">{{ percentText(row.cpuPercent) }}</template>
-                    </el-table-column>
-                    <el-table-column :label="t('containers.memory')" width="100">
-                      <template #default="{ row }">{{ percentText(row.memoryPercent) }}</template>
-                    </el-table-column>
-                  </el-table>
-                </div>
-              </el-tab-pane>
-              <el-tab-pane :label="t('containers.pods')" name="pods">
-                <div class="runtime-resource-panel">
-                  <div class="runtime-tab-toolbar">
-                    <el-select v-model="runtimePodServiceFilter" size="small" clearable class="runtime-service-filter" :placeholder="t('containers.service')" @clear="clearRuntimePodServiceFilter">
-                      <el-option v-for="service in installedRuntimeServiceNamesList" :key="service" :label="service" :value="service" />
-                    </el-select>
-                    <div class="runtime-tab-actions">
-                      <el-tooltip :content="aifarRuntimeActionDisabledReason" :disabled="!aifarRuntimeActionDisabledReason" placement="top">
-                        <span><el-button size="small" type="primary" plain :disabled="Boolean(aifarRuntimeActionDisabledReason)" @click="recoverAifarRuntimePods">{{ t('containers.recoverRuntimePods') }}</el-button></span>
-                      </el-tooltip>
-                      <el-button size="small" :loading="loading" @click="ensureRuntimePodsLoaded(true)">{{ t('common.refresh') }}</el-button>
-                      <el-button size="small" plain :loading="loading" @click="ensureRuntimePodsLoaded(true, true)">{{ t('containers.refreshPodStats') }}</el-button>
-                    </div>
-                  </div>
-                  <div v-if="!runtimePodsLoadedForCurrentScope" class="runtime-lazy-state">
-                    <el-button size="small" type="primary" plain :loading="loading" @click="ensureRuntimePodsLoaded(true)">{{ t('containers.loadPods') }}</el-button>
-                  </div>
-                  <el-table v-else :data="selectedRuntimePods" height="100%" row-key="containerName">
-                    <el-table-column prop="containerName" :label="t('containers.name')" min-width="260" show-overflow-tooltip />
-                    <el-table-column prop="serviceName" :label="t('containers.service')" width="120" show-overflow-tooltip />
-                    <el-table-column prop="status" :label="t('common.status')" width="120">
-                      <template #default="{ row }">
-                        <StatusTag :status="aifarRuntimeStatusKind(row.status)" :label="aifarRuntimeStatusLabel(row.status)" />
-                      </template>
-                    </el-table-column>
-                    <el-table-column prop="revision" :label="t('containers.revision')" min-width="180" show-overflow-tooltip />
-                    <el-table-column prop="image" :label="t('containers.image')" min-width="220" show-overflow-tooltip />
-                    <el-table-column :label="t('containers.cpu')" width="90">
-                      <template #default="{ row }">{{ percentText(row.cpuPercent) }}</template>
-                    </el-table-column>
-                    <el-table-column :label="t('containers.memory')" width="120">
-                      <template #default="{ row }">{{ row.memoryUsage || percentText(row.memoryPercent) }}</template>
-                    </el-table-column>
-                    <el-table-column :label="t('common.operation')" width="90" fixed="right">
-                      <template #default="{ row }">
-                        <el-button size="small" @click="openRuntimePodLogs(row)">{{ t('containers.logs') }}</el-button>
-                      </template>
-                    </el-table-column>
-                  </el-table>
-                </div>
-              </el-tab-pane>
-              <el-tab-pane :label="t('containers.logs')" name="logs">
-                <div class="runtime-resource-panel runtime-log-panel">
-                  <div class="runtime-tab-toolbar">
-                    <div class="runtime-log-filters">
-                      <el-select
-                        v-model="runtimeLogServiceFilter"
-                        size="small"
-                        multiple
-                        collapse-tags
-                        collapse-tags-tooltip
-                        :max-collapse-tags="2"
-                        clearable
-                        class="runtime-service-filter"
-                        :placeholder="t('containers.logScopeServices')"
-                        @clear="clearRuntimeLogServiceFilter"
-                      >
-                        <el-option v-for="service in installedRuntimeServiceNamesList" :key="service" :label="service" :value="service" />
-                      </el-select>
-                      <el-select
-                        v-model="runtimeLogPodFilter"
-                        size="small"
-                        multiple
-                        collapse-tags
-                        collapse-tags-tooltip
-                        :max-collapse-tags="1"
-                        clearable
-                        class="runtime-pod-filter"
-                        :placeholder="t('containers.logScopePods')"
-                      >
-                        <el-option v-for="pod in runtimeLogPodOptions" :key="pod.value" :label="pod.label" :value="pod.value">
-                          <div class="runtime-log-pod-option">
-                            <span>{{ pod.label }}</span>
-                            <StatusTag :status="aifarRuntimeStatusKind(pod.status)" :label="aifarRuntimeStatusLabel(pod.status)" />
-                          </div>
-                        </el-option>
-                      </el-select>
-                      <el-select
-                        v-model="runtimeLogLevelFilter"
-                        size="small"
-                        multiple
-                        collapse-tags
-                        clearable
-                        class="runtime-level-filter"
-                        :placeholder="t('containers.logLevelFilter')"
-                      >
-                        <el-option v-for="level in runtimeLogLevelOptions" :key="level" :label="level" :value="level" />
-                      </el-select>
-                      <el-input v-model="runtimeLogKeyword" size="small" clearable class="runtime-log-keyword" :placeholder="t('containers.logKeyword')" />
-                      <el-input-number v-model="runtimeLogTail" size="small" class="runtime-log-tail" :min="20" :max="1000" :step="20" controls-position="right" />
-                    </div>
-                    <div class="runtime-tab-actions">
-                      <el-button size="small" type="primary" plain :loading="loading" :disabled="!runtimeLogSelectionReady" @click="loadRuntimeLogs(true)">
-                        {{ runtimeLogsLoadedForCurrentScope ? t('containers.restartRuntimeLogStream') : t('containers.startRuntimeLogStream') }}
-                      </el-button>
-                      <el-button size="small" plain :disabled="!runtimeLogsLoadedForCurrentScope" @click="toggleRuntimeLogPaused">
-                        {{ runtimeLogPaused ? t('containers.resumeLogs') : t('containers.pauseLogs') }}
-                      </el-button>
-                      <el-button size="small" plain :disabled="!runtimeLogRows.length && !runtimeLogPendingCount" @click="clearRuntimeLogView">{{ t('containers.clearLogs') }}</el-button>
-                      <el-switch v-model="runtimeLogAutoScroll" size="small" :active-text="t('containers.autoScroll')" inline-prompt />
-                    </div>
-                  </div>
-                  <el-alert
-                    v-if="runtimeLogWarnings.length"
-                    type="warning"
-                    :closable="false"
-                    show-icon
-                    :title="runtimeLogWarnings.join('；')"
-                  />
-                  <div v-if="!runtimeLogSelectionReady" class="runtime-lazy-state">
-                    <span>{{ t('containers.selectRuntimeLogScopeHint') }}</span>
-                  </div>
-                  <div v-else-if="!runtimeLogsLoadedForCurrentScope" class="runtime-lazy-state">
-                    <el-button size="small" type="primary" plain :loading="loading" @click="loadRuntimeLogs(true)">{{ t('containers.startRuntimeLogStream') }}</el-button>
-                  </div>
-                  <div v-else class="runtime-log-workbench">
-                    <div class="runtime-log-pod-strip">
-                      <div v-for="group in runtimeLogGroups" :key="group.containerName" class="runtime-log-pod-chip">
-                        <div>
-                          <strong>{{ group.serviceName }}</strong>
-                          <span>{{ group.containerName }}</span>
-                        </div>
-                        <el-tag size="small">{{ t('containers.logLines', { count: group.lineCount ?? 0 }) }}</el-tag>
-                      </div>
-                    </div>
-                    <div class="runtime-log-stats">
-                      <el-tag size="small" :type="runtimeLogStreamTagType">{{ runtimeLogStreamStatusLabel }}</el-tag>
-                      <span v-if="runtimeLogLastDataAt">{{ t('containers.logStreamLastEvent', { time: runtimeLogLastDataAt }) }}</span>
-                      <span>{{ t('containers.visibleLogRows', { count: filteredRuntimeLogRows.length }) }}</span>
-                      <span v-if="runtimeLogDroppedRows">{{ t('containers.droppedLogRows', { count: runtimeLogDroppedRows }) }}</span>
-                      <span v-if="runtimeLogPendingCount">{{ t('containers.pendingLogRows', { count: runtimeLogPendingCount }) }}</span>
-                    </div>
-                    <div ref="runtimeLogViewport" class="runtime-log-virtual-list" :class="{ 'is-empty': !filteredRuntimeLogRows.length }" @scroll="handleRuntimeLogScroll">
-                      <div v-if="!filteredRuntimeLogRows.length" class="runtime-log-empty-state">
-                        <span>{{ t('containers.noRuntimeLogs') }}</span>
-                      </div>
-                      <template v-else>
-                        <div :style="{ height: `${runtimeLogTopSpacer}px` }"></div>
-                        <div v-for="row in runtimeLogVirtualRows" :key="row.id" class="runtime-log-row">
-                          <span class="runtime-log-time">{{ row.time }}</span>
-                          <span class="runtime-log-service">{{ row.serviceName }}</span>
-                          <span class="runtime-log-pod">{{ row.pod }}</span>
-                          <span class="runtime-log-level" :class="`is-${runtimeLogLevelTag(row.level) || 'default'}`">{{ row.level || '-' }}</span>
-                          <span class="runtime-log-message">{{ row.message }}</span>
-                        </div>
-                        <div :style="{ height: `${runtimeLogBottomSpacer}px` }"></div>
-                      </template>
-                    </div>
-                  </div>
-                </div>
-              </el-tab-pane>
-              <el-tab-pane :label="t('containers.ingressAndNacos')" name="ingress">
-                <div class="runtime-resource-panel">
-                  <div class="runtime-entry-grid">
-                    <div v-for="route in runtimeEntryRoutes" :key="route.name" class="runtime-entry-card">
-                      <div class="runtime-entry-card-head">
-                        <strong>{{ route.name }}</strong>
-                        <StatusTag :status="aifarRuntimeStatusKind(route.status)" :label="aifarRuntimeStatusLabel(route.status)" />
-                      </div>
-                      <span>{{ route.route }}</span>
-                      <small>{{ route.port }}</small>
-                    </div>
-                  </div>
-                  <el-table :data="selectedRuntimeServices" height="calc(100% - 104px)" row-key="serviceName">
-                    <el-table-column prop="serviceName" :label="t('containers.service')" min-width="130" />
-                    <el-table-column prop="appName" :label="t('containers.appName')" min-width="170" show-overflow-tooltip />
-                    <el-table-column :label="t('containers.discoveryTarget')" min-width="180" show-overflow-tooltip>
-                      <template #default="{ row }">{{ runtimeDiscoveryTarget(row) }}</template>
-                    </el-table-column>
-                    <el-table-column :label="t('containers.endpoint')" width="110">
-                      <template #default="{ row }">{{ runtimeEndpointText(row) }}</template>
-                    </el-table-column>
-                    <el-table-column label="Nacos" width="120">
-                      <template #default="{ row }">
-                        <el-tooltip :content="row.lastNacosError" :disabled="!row.lastNacosError" placement="top">
-                          <span><StatusTag :status="aifarRuntimeStatusKind(runtimeNacosStatus(row))" :label="aifarRuntimeStatusLabel(runtimeNacosStatus(row))" /></span>
-                        </el-tooltip>
-                      </template>
-                    </el-table-column>
-                    <el-table-column prop="lastNacosError" :label="t('containers.lastApplyError')" min-width="260" show-overflow-tooltip />
-                  </el-table>
-                </div>
-              </el-tab-pane>
-            </el-tabs>
-          </template>
-        </div>
+        <AifarRuntimeWorkspace />
       </template>
-
       <template v-else-if="tab === 'images'">
         <el-tabs v-model="resourceTab" class="resource-tabs">
           <el-tab-pane :label="t('containers.images')" name="images">
@@ -472,20 +136,18 @@ import { apiEventSourceUrl, apiGet, apiPost, apiPostForm, apiPut, asArray } from
 import KeyValueGrid from '../components/KeyValueGrid.vue'
 import MetricGrid from '../components/MetricGrid.vue'
 import ServerSelector from '../components/ServerSelector.vue'
-import StatusTag from '../components/StatusTag.vue'
 import { usePermissions } from '../composables/usePermissions'
 import { getCurrentLocale, useI18n } from '../i18n'
 import { permissions } from '../rbac'
 import { useRealtimeStore } from '../stores/realtime'
 import { useTaskProgressStore } from '../stores/taskProgress'
 import AifarRuntimeDialogs from '../containers/runtime/AifarRuntimeDialogs.vue'
-import { aifarRuntimeDialogContextKey } from '../containers/runtime/context'
+import AifarRuntimeWorkspace from '../containers/runtime/AifarRuntimeWorkspace.vue'
+import { aifarRuntimeContextKey } from '../containers/runtime/context'
 import {
   parseRuntimeLogErrorEvent,
   parseRuntimeLogLine,
   parseRuntimeLogsEvent,
-  runtimeLogLevelOptions,
-  runtimeLogLevelTag,
   runtimeLogMaxRows,
   runtimeLogRowHeight,
   runtimeLogVisibleCount
@@ -2162,8 +1824,86 @@ function uniqueValues(values: string[]) {
   return out
 }
 
-provide(aifarRuntimeDialogContextKey, {
+provide(aifarRuntimeContextKey, {
   t,
+  loading,
+  aifarRuntime,
+  aifarRuntimeStatusKind,
+  aifarRuntimeStatusLabel,
+  selectedRuntimeInstanceId,
+  aifarRuntimeInstances,
+  runtimeInstanceLabel,
+  aifarRuntimeActionDisabledReason,
+  openRuntimeConfigDialog,
+  serviceInstallDisabledReason,
+  openServiceInstallDialog,
+  openAifarRuntimeBundleUpdate,
+  reconcileAifarRuntime,
+  runtimeCleanupDisabledReason,
+  cleanupAifarRuntimeStale,
+  loadAifarRuntime,
+  aifarRuntimeWarnings,
+  runtimeSummaryItems,
+  runtimeResourceTab,
+  selectedRuntimeDeployments,
+  runtimeDeploymentReplicaText,
+  openAifarRuntimeServiceUpdate,
+  runtimeServiceForDeployment,
+  scaleOutAifarService,
+  aifarRuntimeScaleInDisabledReason,
+  scaleInAifarDeployment,
+  aifarRuntimeOfflineDisabledReason,
+  offlineAifarService,
+  aifarReleases,
+  loadAifarReleases,
+  releaseKindLabel,
+  releaseStatusLabel,
+  releaseServicesText,
+  formatDate,
+  releaseRollbackDisabledReason,
+  rollbackAifarRelease,
+  selectedRuntimeServices,
+  runtimeEndpointText,
+  percentText,
+  runtimePodServiceFilter,
+  clearRuntimePodServiceFilter,
+  installedRuntimeServiceNamesList,
+  recoverAifarRuntimePods,
+  ensureRuntimePodsLoaded,
+  runtimePodsLoadedForCurrentScope,
+  selectedRuntimePods,
+  openRuntimePodLogs,
+  runtimeLogServiceFilter,
+  clearRuntimeLogServiceFilter,
+  runtimeLogPodFilter,
+  runtimeLogPodOptions,
+  runtimeLogLevelFilter,
+  runtimeLogKeyword,
+  runtimeLogTail,
+  runtimeLogSelectionReady,
+  loadRuntimeLogs,
+  runtimeLogsLoadedForCurrentScope,
+  toggleRuntimeLogPaused,
+  runtimeLogPaused,
+  runtimeLogRows,
+  runtimeLogPendingCount,
+  clearRuntimeLogView,
+  runtimeLogAutoScroll,
+  runtimeLogWarnings,
+  runtimeLogGroups,
+  runtimeLogStreamTagType,
+  runtimeLogStreamStatusLabel,
+  runtimeLogLastDataAt,
+  filteredRuntimeLogRows,
+  runtimeLogDroppedRows,
+  runtimeLogViewport,
+  handleRuntimeLogScroll,
+  runtimeLogTopSpacer,
+  runtimeLogVirtualRows,
+  runtimeLogBottomSpacer,
+  runtimeEntryRoutes,
+  runtimeDiscoveryTarget,
+  runtimeNacosStatus,
   aifarUpdateVisible,
   selectedAifarContainerLabel,
   selectedAifarInstanceLabel,
@@ -2177,7 +1917,6 @@ provide(aifarRuntimeDialogContextKey, {
   aifarUpdateSubmitting,
   submitAifarUpdate,
   serviceInstallVisible,
-  installedRuntimeServiceNamesList,
   missingRuntimeServiceOptions,
   serviceInstallSelection,
   serviceInstallSubmitting,
@@ -2409,382 +2148,6 @@ onBeforeUnmount(() => {
   gap: 8px;
 }
 
-.runtime-workspace {
-  display: flex;
-  flex: 1 1 auto;
-  height: auto;
-  min-height: 0;
-  flex-direction: column;
-  gap: 10px;
-  overflow: visible;
-}
-
-.workspace-card.containers-main.is-runtime-logs .runtime-workspace {
-  flex: 1 1 0;
-  height: 100%;
-  overflow: hidden;
-}
-
-.runtime-toolbar {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  min-height: 40px;
-}
-
-.runtime-status {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  color: var(--aifar-text-secondary);
-  font-size: 13px;
-}
-
-.runtime-instance-select {
-  width: 280px;
-}
-
-.runtime-resource-tabs {
-  flex: 1 1 auto;
-  height: auto;
-  min-height: 0;
-  display: flex;
-  flex-direction: column;
-}
-
-.workspace-card.containers-main.is-runtime-logs .runtime-resource-tabs {
-  flex: 1 1 0;
-  height: 100%;
-  overflow: hidden;
-}
-
-.runtime-resource-tabs :deep(.el-tabs__header) {
-  flex: 0 0 auto;
-}
-
-.runtime-resource-tabs :deep(.el-tabs__content) {
-  flex: 1 1 auto;
-  min-height: 0;
-  height: 100%;
-  overflow: hidden;
-}
-
-.runtime-resource-tabs :deep(.el-tab-pane) {
-  height: 100%;
-  min-height: 0;
-}
-
-.runtime-resource-panel {
-  height: 100%;
-  min-height: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-
-.runtime-log-panel {
-  min-height: 0;
-  overflow: hidden;
-}
-
-.runtime-log-panel .runtime-tab-toolbar,
-.runtime-log-panel > .el-alert {
-  flex: 0 0 auto;
-}
-
-.runtime-tab-toolbar {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  gap: 8px;
-  min-height: 32px;
-}
-
-.runtime-tab-actions {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-
-.runtime-log-filters {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  min-width: 0;
-}
-
-.runtime-service-filter {
-  width: 180px;
-}
-
-.runtime-pod-filter {
-  width: min(360px, 28vw);
-}
-
-.runtime-level-filter {
-  width: 150px;
-}
-
-.runtime-log-keyword {
-  width: min(260px, 20vw);
-}
-
-.runtime-log-tail {
-  width: 128px;
-}
-
-.runtime-log-pod-option {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-}
-
-.runtime-log-pod-option span:first-child {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.runtime-log-workbench {
-  flex: 1 1 0;
-  height: 100%;
-  min-height: 0;
-  display: grid;
-  grid-template-rows: auto auto minmax(0, 1fr);
-  gap: 8px;
-  overflow: hidden;
-}
-
-.runtime-log-pod-strip {
-  flex: 0 0 auto;
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-  max-height: 72px;
-  overflow: auto;
-}
-
-.runtime-log-pod-chip {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  min-width: 0;
-  max-width: 360px;
-  padding: 6px 8px;
-  border: 1px solid var(--aifar-border-soft);
-  border-radius: var(--aifar-radius);
-  background: #fff;
-}
-
-.runtime-log-pod-chip > div {
-  display: grid;
-  min-width: 0;
-}
-
-.runtime-log-pod-chip strong {
-  color: var(--aifar-ink);
-  font-size: 12px;
-  line-height: 18px;
-}
-
-.runtime-log-pod-chip span {
-  min-width: 0;
-  color: var(--aifar-text-secondary);
-  font-size: 12px;
-  line-height: 18px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.runtime-log-stats {
-  flex: 0 0 auto;
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  min-height: 24px;
-  color: var(--aifar-text-secondary);
-  font-size: 12px;
-}
-
-.runtime-log-virtual-list {
-  min-width: 0;
-  min-height: 0;
-  height: auto;
-  overflow-x: auto;
-  overflow-y: scroll;
-  overscroll-behavior: contain;
-  scrollbar-gutter: stable;
-  scrollbar-width: thin;
-  scrollbar-color: rgba(148, 163, 184, 0.55) rgba(15, 23, 42, 0.35);
-  border: 1px solid #17243a;
-  border-radius: var(--aifar-radius);
-  background: #08111f;
-}
-
-.runtime-log-virtual-list::-webkit-scrollbar {
-  width: 10px;
-  height: 10px;
-}
-
-.runtime-log-virtual-list::-webkit-scrollbar-thumb {
-  border: 2px solid #08111f;
-  border-radius: 999px;
-  background: rgba(148, 163, 184, 0.6);
-}
-
-.runtime-log-virtual-list::-webkit-scrollbar-track {
-  background: rgba(15, 23, 42, 0.35);
-}
-
-.runtime-log-virtual-list.is-empty {
-  display: grid;
-  place-items: center;
-}
-
-.runtime-log-empty-state {
-  display: grid;
-  place-items: center;
-  min-height: 100%;
-  color: rgba(203, 213, 225, 0.62);
-  font-size: 13px;
-  line-height: 20px;
-}
-
-.runtime-log-row {
-  display: grid;
-  grid-template-columns: 190px 108px 260px 72px max-content;
-  gap: 8px;
-  align-items: center;
-  width: max-content;
-  min-width: 100%;
-  height: 32px;
-  min-height: 32px;
-  box-sizing: border-box;
-  padding: 6px 10px;
-  border-bottom: 1px solid rgba(148, 163, 184, 0.14);
-  color: #dbeafe;
-  font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
-  font-size: 12px;
-  line-height: 20px;
-}
-
-.runtime-log-time {
-  color: #93a4ba;
-  white-space: nowrap;
-}
-
-.runtime-log-service,
-.runtime-log-pod {
-  min-width: 0;
-  overflow: hidden;
-  color: #c7d2fe;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.runtime-log-pod {
-  color: #bfdbfe;
-}
-
-.runtime-log-level {
-  justify-self: start;
-  min-width: 52px;
-  padding: 0 6px;
-  border-radius: 4px;
-  background: rgba(148, 163, 184, 0.16);
-  color: #cbd5e1;
-  text-align: center;
-  font-weight: 700;
-  font-size: 11px;
-  line-height: 20px;
-}
-
-.runtime-log-level.is-danger {
-  background: rgba(239, 68, 68, 0.2);
-  color: #fecaca;
-}
-
-.runtime-log-level.is-warning {
-  background: rgba(245, 158, 11, 0.2);
-  color: #fde68a;
-}
-
-.runtime-log-level.is-success {
-  background: rgba(34, 197, 94, 0.18);
-  color: #bbf7d0;
-}
-
-.runtime-log-level.is-info {
-  background: rgba(59, 130, 246, 0.2);
-  color: #bfdbfe;
-}
-
-.runtime-log-message {
-  min-width: 560px;
-  overflow: visible;
-  word-break: normal;
-  white-space: pre;
-}
-
-.runtime-entry-grid {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 8px;
-}
-
-.runtime-entry-card {
-  display: grid;
-  gap: 6px;
-  min-width: 0;
-  padding: 10px 12px;
-  border: 1px solid var(--aifar-border-soft);
-  border-radius: var(--aifar-radius);
-  background: #fff;
-}
-
-.runtime-entry-card-head {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  gap: 8px;
-}
-
-.runtime-entry-card strong {
-  color: var(--aifar-ink);
-  font-size: 13px;
-  line-height: 20px;
-}
-
-.runtime-entry-card span {
-  min-width: 0;
-  color: var(--aifar-text);
-  font-size: 13px;
-  line-height: 20px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.runtime-entry-card small {
-  color: var(--aifar-text-tertiary);
-  font-size: 12px;
-  line-height: 18px;
-}
-
-.runtime-lazy-state {
-  flex: 1 1 auto;
-  min-height: 220px;
-  display: grid;
-  place-items: center;
-  border: 1px dashed var(--aifar-border-soft);
-  border-radius: var(--aifar-radius);
-  background: #f8fbff;
-}
-
 .settings-grid {
   display: grid;
   gap: 12px;
@@ -2809,55 +2172,5 @@ onBeforeUnmount(() => {
   .toolbar-actions {
     justify-content: flex-start;
   }
-
-  .runtime-toolbar {
-    align-items: flex-start;
-    flex-direction: column;
-  }
-
-  .runtime-tab-toolbar {
-    align-items: stretch;
-    flex-direction: column;
-  }
-
-  .runtime-log-filters {
-    width: 100%;
-    flex-wrap: wrap;
-  }
-
-  .runtime-service-filter,
-  .runtime-pod-filter,
-  .runtime-level-filter,
-  .runtime-log-keyword,
-  .runtime-log-tail {
-    width: 100%;
-  }
-
-  .runtime-log-virtual-list {
-    min-height: 320px;
-  }
-
-  .runtime-log-row {
-    grid-template-columns: 160px 96px 220px 72px max-content;
-    min-width: 100%;
-  }
-
-  .runtime-log-message {
-    min-width: 420px;
-  }
-
-  .runtime-log-pod-chip {
-    max-width: 100%;
-    width: 100%;
-  }
-
-  .runtime-entry-grid {
-    grid-template-columns: 1fr;
-  }
-
-  .runtime-instance-select {
-    width: 100%;
-  }
-
 }
 </style>

@@ -1,0 +1,445 @@
+.row-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.selection-summary {
+  color: var(--aifar-text-secondary);
+  font-size: 13px;
+  white-space: nowrap;
+}
+
+.toolbar-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.runtime-workspace {
+  display: flex;
+  flex: 1 1 auto;
+  height: auto;
+  min-height: 0;
+  flex-direction: column;
+  gap: 10px;
+  overflow: visible;
+}
+
+.workspace-card.containers-main.is-runtime-logs .runtime-workspace {
+  flex: 1 1 0;
+  height: 100%;
+  overflow: hidden;
+}
+
+.runtime-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 40px;
+}
+
+.runtime-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--aifar-text-secondary);
+  font-size: 13px;
+}
+
+.runtime-instance-select {
+  width: 280px;
+}
+
+.runtime-resource-tabs {
+  flex: 1 1 auto;
+  height: auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.workspace-card.containers-main.is-runtime-logs .runtime-resource-tabs {
+  flex: 1 1 0;
+  height: 100%;
+  overflow: hidden;
+}
+
+.runtime-resource-tabs .el-tabs__header {
+  flex: 0 0 auto;
+}
+
+.runtime-resource-tabs .el-tabs__content {
+  flex: 1 1 auto;
+  min-height: 0;
+  height: 100%;
+  overflow: hidden;
+}
+
+.runtime-resource-tabs .el-tab-pane {
+  height: 100%;
+  min-height: 0;
+}
+
+.runtime-resource-panel {
+  height: 100%;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.runtime-log-panel {
+  min-height: 0;
+  overflow: hidden;
+}
+
+.runtime-log-panel .runtime-tab-toolbar,
+.runtime-log-panel > .el-alert {
+  flex: 0 0 auto;
+}
+
+.runtime-tab-toolbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  min-height: 32px;
+}
+
+.runtime-tab-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.runtime-log-filters {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.runtime-service-filter {
+  width: 180px;
+}
+
+.runtime-pod-filter {
+  width: min(360px, 28vw);
+}
+
+.runtime-level-filter {
+  width: 150px;
+}
+
+.runtime-log-keyword {
+  width: min(260px, 20vw);
+}
+
+.runtime-log-tail {
+  width: 128px;
+}
+
+.runtime-log-pod-option {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.runtime-log-pod-option span:first-child {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.runtime-log-workbench {
+  flex: 1 1 0;
+  height: 100%;
+  min-height: 0;
+  display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr);
+  gap: 8px;
+  overflow: hidden;
+}
+
+.runtime-log-pod-strip {
+  flex: 0 0 auto;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  max-height: 72px;
+  overflow: auto;
+}
+
+.runtime-log-pod-chip {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  max-width: 360px;
+  padding: 6px 8px;
+  border: 1px solid var(--aifar-border-soft);
+  border-radius: var(--aifar-radius);
+  background: #fff;
+}
+
+.runtime-log-pod-chip > div {
+  display: grid;
+  min-width: 0;
+}
+
+.runtime-log-pod-chip strong {
+  color: var(--aifar-ink);
+  font-size: 12px;
+  line-height: 18px;
+}
+
+.runtime-log-pod-chip span {
+  min-width: 0;
+  color: var(--aifar-text-secondary);
+  font-size: 12px;
+  line-height: 18px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.runtime-log-stats {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-height: 24px;
+  color: var(--aifar-text-secondary);
+  font-size: 12px;
+}
+
+.runtime-log-virtual-list {
+  min-width: 0;
+  min-height: 0;
+  height: auto;
+  overflow-x: auto;
+  overflow-y: scroll;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(148, 163, 184, 0.55) rgba(15, 23, 42, 0.35);
+  border: 1px solid #17243a;
+  border-radius: var(--aifar-radius);
+  background: #08111f;
+}
+
+.runtime-log-virtual-list::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+.runtime-log-virtual-list::-webkit-scrollbar-thumb {
+  border: 2px solid #08111f;
+  border-radius: 999px;
+  background: rgba(148, 163, 184, 0.6);
+}
+
+.runtime-log-virtual-list::-webkit-scrollbar-track {
+  background: rgba(15, 23, 42, 0.35);
+}
+
+.runtime-log-virtual-list.is-empty {
+  display: grid;
+  place-items: center;
+}
+
+.runtime-log-empty-state {
+  display: grid;
+  place-items: center;
+  min-height: 100%;
+  color: rgba(203, 213, 225, 0.62);
+  font-size: 13px;
+  line-height: 20px;
+}
+
+.runtime-log-row {
+  display: grid;
+  grid-template-columns: 190px 108px 260px 72px max-content;
+  gap: 8px;
+  align-items: center;
+  width: max-content;
+  min-width: 100%;
+  height: 32px;
+  min-height: 32px;
+  box-sizing: border-box;
+  padding: 6px 10px;
+  border-bottom: 1px solid rgba(148, 163, 184, 0.14);
+  color: #dbeafe;
+  font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+  font-size: 12px;
+  line-height: 20px;
+}
+
+.runtime-log-time {
+  color: #93a4ba;
+  white-space: nowrap;
+}
+
+.runtime-log-service,
+.runtime-log-pod {
+  min-width: 0;
+  overflow: hidden;
+  color: #c7d2fe;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.runtime-log-pod {
+  color: #bfdbfe;
+}
+
+.runtime-log-level {
+  justify-self: start;
+  min-width: 52px;
+  padding: 0 6px;
+  border-radius: 4px;
+  background: rgba(148, 163, 184, 0.16);
+  color: #cbd5e1;
+  text-align: center;
+  font-weight: 700;
+  font-size: 11px;
+  line-height: 20px;
+}
+
+.runtime-log-level.is-danger {
+  background: rgba(239, 68, 68, 0.2);
+  color: #fecaca;
+}
+
+.runtime-log-level.is-warning {
+  background: rgba(245, 158, 11, 0.2);
+  color: #fde68a;
+}
+
+.runtime-log-level.is-success {
+  background: rgba(34, 197, 94, 0.18);
+  color: #bbf7d0;
+}
+
+.runtime-log-level.is-info {
+  background: rgba(59, 130, 246, 0.2);
+  color: #bfdbfe;
+}
+
+.runtime-log-message {
+  min-width: 560px;
+  overflow: visible;
+  word-break: normal;
+  white-space: pre;
+}
+
+.runtime-entry-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.runtime-entry-card {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+  padding: 10px 12px;
+  border: 1px solid var(--aifar-border-soft);
+  border-radius: var(--aifar-radius);
+  background: #fff;
+}
+
+.runtime-entry-card-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+}
+
+.runtime-entry-card strong {
+  color: var(--aifar-ink);
+  font-size: 13px;
+  line-height: 20px;
+}
+
+.runtime-entry-card span {
+  min-width: 0;
+  color: var(--aifar-text);
+  font-size: 13px;
+  line-height: 20px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.runtime-entry-card small {
+  color: var(--aifar-text-tertiary);
+  font-size: 12px;
+  line-height: 18px;
+}
+
+.runtime-lazy-state {
+  flex: 1 1 auto;
+  min-height: 220px;
+  display: grid;
+  place-items: center;
+  border: 1px dashed var(--aifar-border-soft);
+  border-radius: var(--aifar-radius);
+  background: #f8fbff;
+}
+
+@media (max-width: 640px) {
+  .runtime-toolbar {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .runtime-tab-toolbar {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .runtime-log-filters {
+    width: 100%;
+    flex-wrap: wrap;
+  }
+
+  .runtime-service-filter,
+  .runtime-pod-filter,
+  .runtime-level-filter,
+  .runtime-log-keyword,
+  .runtime-log-tail {
+    width: 100%;
+  }
+
+  .runtime-log-virtual-list {
+    min-height: 320px;
+  }
+
+  .runtime-log-row {
+    grid-template-columns: 160px 96px 220px 72px max-content;
+    min-width: 100%;
+  }
+
+  .runtime-log-message {
+    min-width: 420px;
+  }
+
+  .runtime-log-pod-chip {
+    max-width: 100%;
+    width: 100%;
+  }
+
+  .runtime-entry-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .runtime-instance-select {
+    width: 100%;
+  }
+}

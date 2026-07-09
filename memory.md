@@ -68,3 +68,5 @@
 - 结论：已把 P0/P1 基础表进一步接入业务流：安装成功后记录凭证引用并写入 app_clusters/app_cluster_members；AIFAR app_releases 保存时会从 manifest 展开 app_release_artifacts 和 app_release_snapshots；凭证中心新增删除前引用查询与前端提示，有引用时拦截删除；应用安装、删除、AIFAR 制品更新/批量更新/回滚、MySQL 集群启动接入任务级 operation_locks，worker 按 task id 心跳和释放锁，避免同一资源并发变更。`pnpm test` 与 `pnpm web:build` 通过。
 - 问题：用户要求拆分 AIFAR Runtime 后端控制域和 `ContainersView.vue`。
 - 结论：后端新增 `aifarRuntimeController`，AIFAR Runtime 路由由 controller 自行挂载，外部 API 路径保持兼容；前端新增 `web/src/containers/runtime` 模块，抽出 Runtime 类型、日志解析工具、弹窗上下文和 `AifarRuntimeDialogs.vue`，`ContainersView.vue` 不再承载 Runtime 升级/服务安装/配置弹窗模板。`pnpm test` 与 `pnpm web:build` 通过。
+- 问题：用户要求继续把 AIFAR Runtime 拆成 `AifarRuntimeWorkspace.vue` 和更细的 tabs 组件。
+- 结论：已将 Runtime 主工作区拆到 `web/src/containers/runtime/AifarRuntimeWorkspace.vue`，并按 deployments/releases/services/pods/logs/ingress 拆成 6 个 tab 组件；Runtime 样式迁入 `runtime.css`，context 升级为通用 `aifarRuntimeContextKey`，`ContainersView.vue` 仅保留 workspace 入口和状态编排。`pnpm web:build` 与 `pnpm test` 通过。

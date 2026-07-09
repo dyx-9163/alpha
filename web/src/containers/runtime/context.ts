@@ -1,13 +1,16 @@
 import { inject, type InjectionKey } from 'vue'
 
-export type AifarRuntimeDialogContext = Record<string, any>
+export type AifarRuntimeContext = Record<string, any>
 
-export const aifarRuntimeDialogContextKey: InjectionKey<AifarRuntimeDialogContext> = Symbol('AifarRuntimeDialogContext')
+export const aifarRuntimeContextKey: InjectionKey<AifarRuntimeContext> = Symbol('AifarRuntimeContext')
+export const aifarRuntimeDialogContextKey = aifarRuntimeContextKey
 
-export function useAifarRuntimeDialogContext() {
-  const context = inject(aifarRuntimeDialogContextKey)
+export function useAifarRuntimeContext() {
+  const context = inject(aifarRuntimeContextKey)
   if (!context) {
-    throw new Error('AIFAR runtime dialog context is not provided')
+    throw new Error('AIFAR runtime context is not provided')
   }
   return context
 }
+
+export const useAifarRuntimeDialogContext = useAifarRuntimeContext
