@@ -138,6 +138,12 @@ func (m *Manager) StartExistingWithLanguage(task store.Task, lang string, job Jo
 			delete(m.languages, task.ID)
 			m.mu.Unlock()
 		}()
+		defer func() {
+			_, _ = m.store.ReleaseOperationLocksByTaskID(task.ID)
+		}()
+		lockHeartbeatCtx, stopLockHeartbeat := context.WithCancel(ctx)
+		defer stopLockHeartbeat()
+		go m.heartbeatOperationLocks(lockHeartbeatCtx, task.ID)
 		if !m.acquireSlot(ctx) {
 			_ = m.store.UpdateTaskStatus(task.ID, "cancelled", ctx.Err().Error())
 			m.publishTaskEvent(task.ID, "cancelled")
@@ -162,6 +168,19 @@ func (m *Manager) StartExistingWithLanguage(task store.Task, lang string, job Jo
 		m.publishTaskEvent(task.ID, "success")
 	}()
 	return task, nil
+}
+
+func (m *Manager) heartbeatOperationLocks(ctx context.Context, taskID string) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for {
+		_, _ = m.store.HeartbeatOperationLocksByTaskID(taskID, time.Hour)
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
 }
 
 func (m *Manager) acquireSlot(ctx context.Context) bool {

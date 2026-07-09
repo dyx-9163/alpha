@@ -7,6 +7,7 @@ import (
 	"aifar-deployment/backend/internal/adapter"
 	"aifar-deployment/backend/internal/apps/registry"
 	"aifar-deployment/backend/internal/i18n"
+	"aifar-deployment/backend/internal/installflow"
 	"aifar-deployment/backend/internal/store"
 )
 
@@ -80,18 +81,7 @@ func (m Module) PlanInstall(ctx context.Context, req registry.InstallRequest, re
 	}
 	copy := CopyFor(req.Language)
 	steps := dockerInstallSteps(copy)
-	var plan []registry.InstallStepPlan
-	for _, target := range req.TargetServerIDs() {
-		for idx, step := range steps {
-			plan = append(plan, registry.InstallStepPlan{
-				Target: target,
-				Name:   step.Name,
-				Title:  step.Title,
-				Order:  idx + 1,
-			})
-		}
-	}
-	return plan, nil
+	return installflow.RegistryPlan(req.TargetServerIDs(), steps), nil
 }
 
 func (m Module) ValidateInstall(ctx context.Context, req registry.InstallRequest, resources []store.Resource) error {
@@ -131,16 +121,7 @@ func (m Module) PlanDelete(ctx context.Context, req registry.DeleteRequest) ([]r
 	if target == "" {
 		target = req.Server.ID
 	}
-	plan := make([]registry.InstallStepPlan, 0, len(steps))
-	for idx, step := range steps {
-		plan = append(plan, registry.InstallStepPlan{
-			Target: target,
-			Name:   step.Name,
-			Title:  step.Title,
-			Order:  idx + 1,
-		})
-	}
-	return plan, nil
+	return installflow.RegistryPlan([]string{target}, steps), nil
 }
 
 func (m Module) Delete(ctx context.Context, req registry.DeleteRequest, run registry.RunContext) error {
@@ -166,16 +147,7 @@ func (m Module) PlanCheck(ctx context.Context, req registry.CheckRequest) ([]reg
 	if target == "" {
 		target = req.Server.ID
 	}
-	plan := make([]registry.InstallStepPlan, 0, len(steps))
-	for idx, step := range steps {
-		plan = append(plan, registry.InstallStepPlan{
-			Target: target,
-			Name:   step.Name,
-			Title:  step.Title,
-			Order:  idx + 1,
-		})
-	}
-	return plan, nil
+	return installflow.RegistryPlan([]string{target}, steps), nil
 }
 
 func (m Module) Check(ctx context.Context, req registry.CheckRequest, run registry.RunContext) (registry.InstanceStatus, error) {

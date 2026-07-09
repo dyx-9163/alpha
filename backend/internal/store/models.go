@@ -40,15 +40,22 @@ type Server struct {
 }
 
 type Task struct {
-	ID         string    `json:"id"`
-	Type       string    `json:"type"`
-	Target     string    `json:"target"`
-	Status     string    `json:"status"`
-	CreatedBy  string    `json:"createdBy"`
-	Error      string    `json:"error,omitempty"`
-	CreatedAt  time.Time `json:"createdAt"`
-	StartedAt  time.Time `json:"startedAt,omitempty"`
-	FinishedAt time.Time `json:"finishedAt,omitempty"`
+	ID             string    `json:"id"`
+	Type           string    `json:"type"`
+	Category       string    `json:"category,omitempty"`
+	Trackable      bool      `json:"trackable"`
+	Target         string    `json:"target"`
+	Status         string    `json:"status"`
+	CreatedBy      string    `json:"createdBy"`
+	Error          string    `json:"error,omitempty"`
+	LeaseOwner     string    `json:"leaseOwner,omitempty"`
+	LeaseExpiresAt time.Time `json:"leaseExpiresAt,omitempty"`
+	Attempt        int       `json:"attempt,omitempty"`
+	IdempotencyKey string    `json:"idempotencyKey,omitempty"`
+	CorrelationID  string    `json:"correlationId,omitempty"`
+	CreatedAt      time.Time `json:"createdAt"`
+	StartedAt      time.Time `json:"startedAt,omitempty"`
+	FinishedAt     time.Time `json:"finishedAt,omitempty"`
 }
 
 type TaskLog struct {
@@ -145,6 +152,91 @@ type AppRelease struct {
 	ConfigHash   string    `json:"configHash"`
 	CreatedAt    time.Time `json:"createdAt"`
 	ActivatedAt  time.Time `json:"activatedAt,omitempty"`
+}
+
+type AppReleaseArtifact struct {
+	ID           string    `json:"id"`
+	InstanceID   string    `json:"instanceId"`
+	ReleaseID    string    `json:"releaseId"`
+	App          string    `json:"app"`
+	ServiceName  string    `json:"serviceName,omitempty"`
+	ArtifactType string    `json:"artifactType"`
+	Name         string    `json:"name"`
+	Version      string    `json:"version,omitempty"`
+	Checksum     string    `json:"checksum,omitempty"`
+	Size         int64     `json:"size"`
+	Path         string    `json:"path,omitempty"`
+	Metadata     string    `json:"metadata,omitempty"`
+	CreatedAt    time.Time `json:"createdAt"`
+}
+
+type AppReleaseSnapshot struct {
+	ID           string    `json:"id"`
+	InstanceID   string    `json:"instanceId"`
+	ReleaseID    string    `json:"releaseId"`
+	App          string    `json:"app"`
+	SnapshotKind string    `json:"snapshotKind"`
+	Status       string    `json:"status"`
+	PayloadJSON  string    `json:"payloadJson"`
+	Checksum     string    `json:"checksum,omitempty"`
+	Metadata     string    `json:"metadata,omitempty"`
+	CreatedAt    time.Time `json:"createdAt"`
+	RestoredAt   time.Time `json:"restoredAt,omitempty"`
+}
+
+type AppBackup struct {
+	ID          string    `json:"id"`
+	App         string    `json:"app"`
+	InstanceID  string    `json:"instanceId,omitempty"`
+	ServerID    string    `json:"serverId,omitempty"`
+	BackupType  string    `json:"backupType"`
+	Status      string    `json:"status"`
+	Path        string    `json:"path,omitempty"`
+	Checksum    string    `json:"checksum,omitempty"`
+	Size        int64     `json:"size"`
+	TaskID      string    `json:"taskId,omitempty"`
+	Metadata    string    `json:"metadata,omitempty"`
+	CreatedAt   time.Time `json:"createdAt"`
+	CompletedAt time.Time `json:"completedAt,omitempty"`
+}
+
+type AppCluster struct {
+	ID        string    `json:"id"`
+	App       string    `json:"app"`
+	Name      string    `json:"name"`
+	Topology  string    `json:"topology"`
+	Status    string    `json:"status"`
+	Metadata  string    `json:"metadata,omitempty"`
+	CreatedAt time.Time `json:"createdAt"`
+	UpdatedAt time.Time `json:"updatedAt"`
+}
+
+type AppClusterMember struct {
+	ID         string    `json:"id"`
+	ClusterID  string    `json:"clusterId"`
+	InstanceID string    `json:"instanceId"`
+	ServerID   string    `json:"serverId,omitempty"`
+	Role       string    `json:"role,omitempty"`
+	Status     string    `json:"status"`
+	Metadata   string    `json:"metadata,omitempty"`
+	CreatedAt  time.Time `json:"createdAt"`
+	UpdatedAt  time.Time `json:"updatedAt"`
+}
+
+type OperationLock struct {
+	ID          string    `json:"id"`
+	Scope       string    `json:"scope"`
+	ResourceID  string    `json:"resourceId"`
+	Operation   string    `json:"operation"`
+	OwnerTaskID string    `json:"ownerTaskId,omitempty"`
+	Owner       string    `json:"owner,omitempty"`
+	Status      string    `json:"status"`
+	ExpiresAt   time.Time `json:"expiresAt"`
+	HeartbeatAt time.Time `json:"heartbeatAt"`
+	ReleasedAt  time.Time `json:"releasedAt,omitempty"`
+	Metadata    string    `json:"metadata,omitempty"`
+	CreatedAt   time.Time `json:"createdAt"`
+	UpdatedAt   time.Time `json:"updatedAt"`
 }
 
 type AIFARDeployment struct {
@@ -283,6 +375,19 @@ type CredentialBinding struct {
 	CreatedAt     time.Time `json:"createdAt"`
 }
 
+type CredentialReference struct {
+	ID              string    `json:"id"`
+	CredentialID    string    `json:"credentialId"`
+	ResourceType    string    `json:"resourceType"`
+	ResourceID      string    `json:"resourceId"`
+	Purpose         string    `json:"purpose,omitempty"`
+	Generated       bool      `json:"generated"`
+	LifecyclePolicy string    `json:"lifecyclePolicy"`
+	Metadata        string    `json:"metadata,omitempty"`
+	CreatedAt       time.Time `json:"createdAt"`
+	UpdatedAt       time.Time `json:"updatedAt"`
+}
+
 type CredentialQuery struct {
 	Kind   string
 	Status string
@@ -323,6 +428,19 @@ type StatusSnapshot struct {
 	Version     int64     `json:"version"`
 	CollectedAt time.Time `json:"collectedAt"`
 	UpdatedAt   time.Time `json:"updatedAt"`
+}
+
+type StatusSnapshotHistory struct {
+	ID          int64     `json:"id"`
+	Scope       string    `json:"scope"`
+	ResourceID  string    `json:"resourceId"`
+	ServerID    string    `json:"serverId,omitempty"`
+	Status      string    `json:"status"`
+	Payload     string    `json:"payload"`
+	LastError   string    `json:"lastError,omitempty"`
+	Version     int64     `json:"version"`
+	CollectedAt time.Time `json:"collectedAt"`
+	CreatedAt   time.Time `json:"createdAt"`
 }
 
 type Alert struct {

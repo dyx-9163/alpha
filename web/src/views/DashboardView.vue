@@ -100,10 +100,10 @@
       <div class="workspace-card">
         <h2 class="section-title">{{ t('dashboard.databaseStatus') }}</h2>
         <div class="filter-row">
-          <span class="status-pill">{{ t('common.all') }} {{ databaseInstances.length }}</span>
+          <span class="status-pill">{{ t('common.all') }} {{ liveDatabaseInstances.length }}</span>
           <span class="status-pill success">{{ t('common.running') }} {{ runningDatabaseInstances }}</span>
         </div>
-        <el-table :data="databaseInstances" :empty-text="t('dashboard.noDatabaseInstances')">
+        <el-table :data="liveDatabaseInstances" :empty-text="t('dashboard.noDatabaseInstances')">
           <el-table-column prop="app" :label="t('dashboard.instance')" />
           <el-table-column prop="version" :label="t('common.version')" />
           <el-table-column prop="topology" :label="t('dashboard.topology')" />
@@ -114,10 +114,10 @@
       <div class="workspace-card">
         <h2 class="section-title">{{ t('dashboard.storageStatus') }}</h2>
         <div class="filter-row">
-          <span class="status-pill">{{ t('common.all') }} {{ storageInstances.length }}</span>
+          <span class="status-pill">{{ t('common.all') }} {{ liveStorageInstances.length }}</span>
           <span class="status-pill success">{{ t('common.running') }} {{ runningStorageInstances }}</span>
         </div>
-        <el-table :data="storageInstances" :empty-text="t('dashboard.noStorageInstances')">
+        <el-table :data="liveStorageInstances" :empty-text="t('dashboard.noStorageInstances')">
           <el-table-column prop="app" :label="t('dashboard.instance')" />
           <el-table-column :label="t('storage.server')" min-width="150"><template #default="{ row }">{{ serverName(row.serverId) }}</template></el-table-column>
           <el-table-column prop="version" :label="t('common.version')" />
@@ -130,14 +130,14 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { apiGet, asArray } from '../api/client'
 import MetricGrid from '../components/MetricGrid.vue'
 import StatusTag from '../components/StatusTag.vue'
 import { useI18n } from '../i18n'
 import { permissions } from '../rbac'
 import { useAlertsStore, type AlertItem } from '../stores/alerts'
-import { useRealtimeStore } from '../stores/realtime'
+import { applyRealtimeStatusToAppInstance, useRealtimeStore } from '../stores/realtime'
 import { useSessionStore } from '../stores/session'
 
 const { t } = useI18n()
@@ -149,11 +149,8 @@ const tasks = ref<any[]>([])
 const databaseInstances = ref<any[]>([])
 const storageInstances = ref<any[]>([])
 const telemetryByServer = ref<Record<string, any>>({})
-const dockerByServer = ref<Record<string, any>>({})
-const appInstanceSnapshots = ref<Record<string, any>>({})
 const loading = ref(false)
 const now = ref('')
-let dashboardRefreshTimer: ReturnType<typeof window.setTimeout> | null = null
 
 const serverRows = computed(() => servers.value.map((server) => {
   const telemetry = telemetryByServer.value[server.id]
@@ -173,21 +170,24 @@ const serverRows = computed(() => servers.value.map((server) => {
 const dockerRows = computed(() => servers.value
   .filter((server) => String(server.dockerHost ?? '').trim() !== '')
   .map((server) => {
-    const result = dockerByServer.value[server.id] ?? {}
-    const summary = result.summary ?? {}
+    const snapshot = realtime.dockerSummarySnapshot(server.id)
+    const result = snapshot?.payload ?? {}
+    const summary = objectRecord(result.summary)
     return {
       ...server,
-      available: Boolean(result.available),
+      available: Boolean(result.available) && snapshot?.status !== 'failed',
       containers: summary.containers ?? 0,
       images: summary.images ?? 0,
-      dockerHost: summary.endpoint || server.dockerHost
+      dockerHost: summary.endpoint || result.endpoint || server.dockerHost
     }
   }))
+const liveDatabaseInstances = computed(() => databaseInstances.value.map((instance) => applyRealtimeStatusToAppInstance(instance, realtime.appInstanceSnapshot(instance.id))))
+const liveStorageInstances = computed(() => storageInstances.value.map((instance) => applyRealtimeStatusToAppInstance(instance, realtime.appInstanceSnapshot(instance.id))))
 const availableServers = computed(() => serverRows.value.filter((server) => server.status === 'available').length)
 const runningTasks = computed(() => tasks.value.filter((task) => task.status === 'running').length)
 const runningDockerHosts = computed(() => dockerRows.value.filter((row) => row.available).length)
-const runningDatabaseInstances = computed(() => databaseInstances.value.filter((instance) => isRunningStatus(instance.status)).length)
-const runningStorageInstances = computed(() => storageInstances.value.filter((instance) => isRunningStatus(instance.status)).length)
+const runningDatabaseInstances = computed(() => liveDatabaseInstances.value.filter((instance) => isRunningStatus(instance.status)).length)
+const runningStorageInstances = computed(() => liveStorageInstances.value.filter((instance) => isRunningStatus(instance.status)).length)
 const canViewAlerts = computed(() => session.hasPermission(permissions.alertsView))
 const dashboardAlerts = computed(() => alerts.openAlerts.slice(0, 5))
 const kpis = computed(() => {
@@ -195,8 +195,8 @@ const kpis = computed(() => {
     { label: t('nav.servers'), value: servers.value.length, note: `${t('common.available')} ${availableServers.value}` },
     { label: t('toolbox.tasks'), value: tasks.value.length, note: `${t('common.running')} ${runningTasks.value}` },
     { label: 'Docker', value: dockerRows.value.length, note: `${t('common.running')} ${runningDockerHosts.value}` },
-    { label: t('nav.database'), value: databaseInstances.value.length, note: `${t('common.running')} ${runningDatabaseInstances.value}` },
-    { label: t('nav.storage'), value: storageInstances.value.length, note: `${t('common.running')} ${runningStorageInstances.value}` }
+    { label: t('nav.database'), value: liveDatabaseInstances.value.length, note: `${t('common.running')} ${runningDatabaseInstances.value}` },
+    { label: t('nav.storage'), value: liveStorageInstances.value.length, note: `${t('common.running')} ${runningStorageInstances.value}` }
   ]
   if (canViewAlerts.value) {
     items.splice(1, 0, {
@@ -218,22 +218,18 @@ async function load() {
   loading.value = true
   now.value = new Date().toLocaleString()
   try {
-    const [serverList, taskList, databaseList, storageList, snapshotList] = await Promise.all([
+    const [serverList, taskList, databaseList, storageList] = await Promise.all([
       apiGet<any[] | null>('/servers').catch(() => []),
       apiGet<any[] | null>('/tasks').catch(() => []),
       apiGet<any[] | null>('/database/instances').catch(() => []),
-      apiGet<any[] | null>('/storage/instances').catch(() => []),
-      apiGet<{ items?: any[] } | null>('/status/snapshots?scope=app.instance').catch(() => ({ items: [] }))
+      apiGet<any[] | null>('/storage/instances').catch(() => [])
     ])
-    const snapshots = asArray(snapshotList?.items) as any[]
-    appInstanceSnapshots.value = Object.fromEntries(snapshots.map((snapshot) => [snapshot.resourceId, snapshot]))
     servers.value = asArray(serverList)
     tasks.value = asArray(taskList)
-    databaseInstances.value = applyAppInstanceSnapshots(asArray(databaseList))
-    storageInstances.value = applyAppInstanceSnapshots(asArray(storageList))
+    databaseInstances.value = asArray(databaseList)
+    storageInstances.value = asArray(storageList)
     await Promise.all([
       loadTelemetry(),
-      loadDockerStatus(),
       canViewAlerts.value ? alerts.load().catch(() => undefined) : Promise.resolve()
     ])
   } finally {
@@ -252,58 +248,6 @@ async function loadTelemetry() {
   telemetryByServer.value = Object.fromEntries(entries)
 }
 
-async function loadDockerStatus() {
-  const dockerServers = servers.value.filter((server) => String(server.dockerHost ?? '').trim() !== '')
-  const entries = await Promise.all(dockerServers.map(async (server) => {
-    const result = await apiGet<any>(`/containers/summary?serverId=${encodeURIComponent(server.id)}`).catch((err) => ({
-      available: false,
-      error: err?.message ?? String(err)
-    }))
-    return [server.id, result] as const
-  }))
-  dockerByServer.value = Object.fromEntries(entries)
-}
-
-function scheduleDashboardRefresh() {
-  if (dashboardRefreshTimer) return
-  dashboardRefreshTimer = window.setTimeout(() => {
-    dashboardRefreshTimer = null
-    if (loading.value) {
-      scheduleDashboardRefresh()
-      return
-    }
-    void load()
-  }, 400)
-}
-
-function shouldRefreshDashboard(event: any) {
-  const type = String(event?.type ?? '')
-  const resource = String(event?.resource ?? '')
-  if (!type && !resource) return false
-  if (type === 'collector.run.started') return false
-  if (type.startsWith('status.')) return true
-  if (type.startsWith('alert.')) return true
-  if (type.startsWith('collector.run.')) return true
-  if (type.startsWith('task.')) return true
-  return ['server', 'docker.summary', 'app.instance', 'aifar.runtime'].includes(resource)
-}
-
-function applyAppInstanceSnapshots(instances: any[]) {
-  return instances.map((instance) => {
-    const snapshot = appInstanceSnapshots.value[instance.id]
-    if (!snapshot) return instance
-    const payload = snapshot.payload ?? {}
-    const status = String(snapshot.status || payload.status || instance.status || '').trim()
-    return {
-      ...instance,
-      status: dashboardHealthStatus(status || instance.status),
-      realtimeStatus: status || instance.status,
-      lastError: snapshot.lastError || instance.lastError,
-      lastCheckedAt: snapshot.collectedAt || payload.updatedAt
-    }
-  })
-}
-
 function dashboardServerStatus(status: unknown, telemetry: any) {
   if (hasValidSampleTime(telemetry?.sampledAt)) return 'available'
   if (telemetry) return 'unavailable'
@@ -311,12 +255,6 @@ function dashboardServerStatus(status: unknown, telemetry: any) {
   if (isUnavailableStatus(normalized)) return 'unavailable'
   if (['probing', 'checking'].includes(normalized)) return normalized
   if (['available', 'running', 'success', 'ok'].includes(normalized)) return 'unknown'
-  return normalized || 'unknown'
-}
-
-function dashboardHealthStatus(status: unknown) {
-  const normalized = normalizeStatus(status)
-  if (isUnavailableStatus(normalized)) return 'unavailable'
   return normalized || 'unknown'
 }
 
@@ -335,6 +273,10 @@ function isUnavailableStatus(status: string) {
 
 function isRunningStatus(status: unknown) {
   return ['running', 'available', 'success'].includes(String(status ?? '').toLowerCase())
+}
+
+function objectRecord(value: unknown): Record<string, any> {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, any> : {}
 }
 
 function formatTime(value: unknown) {
@@ -366,19 +308,7 @@ function alertScope(alert: AlertItem) {
   return alert.app || alert.scope || t('common.unknown')
 }
 
-watch(() => realtime.revision, () => {
-  if (shouldRefreshDashboard(realtime.lastEvent)) {
-    scheduleDashboardRefresh()
-  }
-})
-
 onMounted(load)
-onBeforeUnmount(() => {
-  if (dashboardRefreshTimer) {
-    window.clearTimeout(dashboardRefreshTimer)
-    dashboardRefreshTimer = null
-  }
-})
 </script>
 
 <style scoped>

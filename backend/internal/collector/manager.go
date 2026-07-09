@@ -216,7 +216,7 @@ func (m *Manager) collectAppInstances(ctx context.Context) error {
 	var failures []string
 	for _, instance := range instances {
 		app := strings.ToLower(strings.TrimSpace(instance.App))
-		if !collectableAppInstance(app) || strings.TrimSpace(instance.ServerID) == "" {
+		if app == "" || strings.TrimSpace(instance.ServerID) == "" {
 			continue
 		}
 		module, ok := m.apps.Get(app)
@@ -299,15 +299,6 @@ func (m *Manager) saveAppInstanceSnapshot(ctx context.Context, instance store.Ap
 	})
 }
 
-func collectableAppInstance(app string) bool {
-	switch strings.ToLower(strings.TrimSpace(app)) {
-	case "mysql", "redis", "mysql-router", "minio", "nacos":
-		return true
-	default:
-		return false
-	}
-}
-
 func (m *Manager) collectAIFARRuntime(ctx context.Context) error {
 	instances, err := m.store.ListAppInstances()
 	if err != nil {
@@ -367,7 +358,9 @@ func (m *Manager) saveSnapshot(ctx context.Context, snapshot store.StatusSnapsho
 	if err != nil {
 		return err
 	}
-	if changed && m.events != nil {
+	if m.events != nil {
+		payload := snapshotEventPayload(saved)
+		payload["changed"] = changed
 		m.events.Publish(realtime.Event{
 			Type:        "status." + saved.Scope + ".updated",
 			Resource:    saved.Scope,
@@ -377,7 +370,7 @@ func (m *Manager) saveSnapshot(ctx context.Context, snapshot store.StatusSnapsho
 			Status:      saved.Status,
 			Version:     saved.Version,
 			CollectedAt: saved.CollectedAt,
-			Payload:     snapshotEventPayload(saved),
+			Payload:     payload,
 		})
 	}
 	return nil
@@ -465,7 +458,7 @@ func countDesiredReplicas(deployments []store.AIFARDeployment) int {
 }
 
 func instanceIDForSnapshot(snapshot store.StatusSnapshot) string {
-	if snapshot.Scope == "aifar.runtime" {
+	if snapshot.Scope == "aifar.runtime" || snapshot.Scope == "app.instance" {
 		return snapshot.ResourceID
 	}
 	return ""

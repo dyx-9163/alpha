@@ -106,19 +106,26 @@ func (a *API) startMySQLCluster(w http.ResponseWriter, r *http.Request) {
 		Actor:           actor,
 		DefaultPassword: a.cfg.DefaultPassword,
 	}
-	task, err := a.tasks.StartWithLanguage("database.mysql.cluster.start", target, actor, lang, func(ctx context.Context, log worker.Logger) error {
-		plan, err := clusterModule.PlanClusterStart(ctx, clusterReq)
-		if err != nil {
-			return err
-		}
-		plannedTargets := map[string]bool{}
-		for _, step := range plan {
-			if step.Target != "" && !plannedTargets[step.Target] {
-				log.PlanTarget(step.Target)
-				plannedTargets[step.Target] = true
-			}
-			log.PlanStep(step.Target, step.Name, step.Title, step.Order)
-		}
+	plan, err := clusterModule.PlanClusterStart(r.Context(), clusterReq)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "MYSQL_CLUSTER_START_PLAN_FAILED", err.Error(), map[string]any{"instances": ids})
+		return
+	}
+	taskType := "database.mysql.cluster.start"
+	task, err := a.store.CreateTask(store.Task{Type: taskType, Target: target, Status: "pending", CreatedBy: actor})
+	if err != nil {
+		respondTask(w, task, err)
+		return
+	}
+	if err := a.storeInstallPlanOrDelete(task.ID, plan); err != nil {
+		writeError(w, http.StatusInternalServerError, "MYSQL_CLUSTER_START_PLAN_STORE_FAILED", err.Error(), map[string]any{"instances": ids})
+		return
+	}
+	locks, ok := a.acquireTaskOperationLocks(w, lang, task, appInstanceOperationLockSpecs("mysql-cluster-start", instances))
+	if !ok {
+		return
+	}
+	task, err = a.tasks.StartExistingWithLanguage(task, lang, func(ctx context.Context, log worker.Logger) error {
 		log.Info(i18n.Text(lang, "api.mysqlClusterStartRequested"), target)
 		if err := clusterModule.StartCluster(ctx, clusterReq, registry.RunContext{
 			Log:         log,
@@ -132,8 +139,11 @@ func (a *API) startMySQLCluster(w http.ResponseWriter, r *http.Request) {
 		log.Info(i18n.Text(lang, "api.mysqlClusterStartCompleted"), len(instances))
 		return nil
 	})
+	if err != nil {
+		a.releaseOperationLocks(locks)
+	}
 	if err == nil {
-		a.audit(r, "database.mysql.cluster.start", target, "running", task.ID)
+		a.audit(r, taskType, target, "running", task.ID)
 	}
 	respondTask(w, task, err)
 }

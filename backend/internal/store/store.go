@@ -311,7 +311,7 @@ func (s *Store) migrate() error {
 	if err := s.ensureColumn("alerts", "acknowledged_at", `alter table alerts add column acknowledged_at datetime`); err != nil {
 		return err
 	}
-	return nil
+	return runStoreMigrations(s.db)
 }
 
 func (s *Store) ensureColumn(table, column, stmt string) error {
@@ -441,7 +441,7 @@ func (s *Store) ListUsers() ([]UserSummary, error) {
 
 func (s *Store) CountRows(table string) (int, error) {
 	switch table {
-	case "users", "servers", "tasks", "task_logs", "task_targets", "task_steps", "audit_logs", "resources", "app_instances", "app_releases", "aifar_orchestration_locks", "nacos_config_revisions", "credentials", "credential_versions", "credential_bindings", "storage_items", "settings", "collector_runs", "status_snapshots", "alerts", "alert_events":
+	case "schema_migrations", "users", "servers", "tasks", "task_logs", "task_targets", "task_steps", "audit_logs", "resources", "app_instances", "app_releases", "app_release_artifacts", "app_release_snapshots", "app_backups", "app_clusters", "app_cluster_members", "operation_locks", "aifar_orchestration_locks", "nacos_config_revisions", "credentials", "credential_versions", "credential_bindings", "credential_references", "storage_items", "settings", "collector_runs", "status_snapshots", "status_snapshot_history", "alerts", "alert_events":
 	default:
 		return 0, fmt.Errorf("unsupported table %q", table)
 	}
@@ -650,8 +650,9 @@ func (s *Store) CreateTask(t Task) (Task, error) {
 	}
 	t.Target = logmask.Mask(t.Target)
 	t.Error = logmask.Mask(t.Error)
-	_, err := s.db.Exec(`insert into tasks(id,type,target,status,created_by,error,created_at,started_at,finished_at) values(?,?,?,?,?,?,?,?,?)`,
-		t.ID, t.Type, t.Target, t.Status, t.CreatedBy, t.Error, t.CreatedAt, nullableTime(t.StartedAt), nullableTime(t.FinishedAt))
+	_, err := s.db.Exec(`insert into tasks(id,type,target,status,created_by,error,lease_owner,lease_expires_at,attempt,idempotency_key,correlation_id,created_at,started_at,finished_at)
+		values(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		t.ID, t.Type, t.Target, t.Status, t.CreatedBy, t.Error, t.LeaseOwner, nullableTime(t.LeaseExpiresAt), t.Attempt, t.IdempotencyKey, t.CorrelationID, t.CreatedAt, nullableTime(t.StartedAt), nullableTime(t.FinishedAt))
 	return t, err
 }
 
@@ -663,7 +664,7 @@ func (s *Store) UpdateTaskStatus(id, status, errText string) error {
 		_, err := s.db.Exec(`update tasks set status=?, started_at=? where id=?`, status, now, id)
 		return err
 	case "success", "failed", "cancelled", "timeout":
-		_, err := s.db.Exec(`update tasks set status=?, error=?, finished_at=? where id=?`, status, errText, now, id)
+		_, err := s.db.Exec(`update tasks set status=?, error=?, lease_owner='', lease_expires_at=null, finished_at=? where id=?`, status, errText, now, id)
 		return err
 	default:
 		_, err := s.db.Exec(`update tasks set status=?, error=? where id=?`, status, errText, id)
@@ -684,18 +685,19 @@ func (s *Store) RecoverInterruptedTasks(errText string) ([]Task, error) {
 	}
 	defer tx.Rollback()
 
-	rows, err := tx.Query(`select id,type,target,status,created_by,coalesce(error,''),created_at,started_at,finished_at from tasks where status in ('pending','running') order by created_at`)
+	rows, err := tx.Query(`select id,type,target,status,created_by,coalesce(error,''),coalesce(lease_owner,''),lease_expires_at,coalesce(attempt,0),coalesce(idempotency_key,''),coalesce(correlation_id,''),created_at,started_at,finished_at from tasks where status in ('pending','running') order by created_at`)
 	if err != nil {
 		return nil, err
 	}
 	tasks := []Task{}
 	for rows.Next() {
 		var t Task
-		var startedAt, finishedAt sql.NullTime
-		if err := rows.Scan(&t.ID, &t.Type, &t.Target, &t.Status, &t.CreatedBy, &t.Error, &t.CreatedAt, &startedAt, &finishedAt); err != nil {
+		var leaseExpiresAt, startedAt, finishedAt sql.NullTime
+		if err := rows.Scan(&t.ID, &t.Type, &t.Target, &t.Status, &t.CreatedBy, &t.Error, &t.LeaseOwner, &leaseExpiresAt, &t.Attempt, &t.IdempotencyKey, &t.CorrelationID, &t.CreatedAt, &startedAt, &finishedAt); err != nil {
 			rows.Close()
 			return nil, err
 		}
+		t.LeaseExpiresAt = nullTime(leaseExpiresAt)
 		t.StartedAt = nullTime(startedAt)
 		t.FinishedAt = nullTime(finishedAt)
 		tasks = append(tasks, t)
@@ -710,7 +712,7 @@ func (s *Store) RecoverInterruptedTasks(errText string) ([]Task, error) {
 
 	for idx := range tasks {
 		taskID := tasks[idx].ID
-		if _, err := tx.Exec(`update tasks set status='failed', error=?, finished_at=? where id=?`, errText, now, taskID); err != nil {
+		if _, err := tx.Exec(`update tasks set status='failed', error=?, lease_owner='', lease_expires_at=null, finished_at=? where id=?`, errText, now, taskID); err != nil {
 			return nil, err
 		}
 		if _, err := tx.Exec(`insert into task_logs(task_id,target,level,message,created_at) values(?,?,?,?,?)`, taskID, "", "error", errText, now); err != nil {
@@ -796,11 +798,13 @@ func (s *Store) UpsertTaskStep(taskID, target, name, title string, order int, st
 func (s *Store) GetTask(id string) (Task, []TaskLog, error) {
 	var t Task
 	var startedAt, finishedAt sql.NullTime
-	err := s.db.QueryRow(`select id,type,target,status,created_by,error,created_at,started_at,finished_at from tasks where id=?`, id).
-		Scan(&t.ID, &t.Type, &t.Target, &t.Status, &t.CreatedBy, &t.Error, &t.CreatedAt, &startedAt, &finishedAt)
+	var leaseExpiresAt sql.NullTime
+	err := s.db.QueryRow(`select id,type,target,status,created_by,error,coalesce(lease_owner,''),lease_expires_at,coalesce(attempt,0),coalesce(idempotency_key,''),coalesce(correlation_id,''),created_at,started_at,finished_at from tasks where id=?`, id).
+		Scan(&t.ID, &t.Type, &t.Target, &t.Status, &t.CreatedBy, &t.Error, &t.LeaseOwner, &leaseExpiresAt, &t.Attempt, &t.IdempotencyKey, &t.CorrelationID, &t.CreatedAt, &startedAt, &finishedAt)
 	if err != nil {
 		return t, nil, err
 	}
+	t.LeaseExpiresAt = nullTime(leaseExpiresAt)
 	t.StartedAt = nullTime(startedAt)
 	t.FinishedAt = nullTime(finishedAt)
 	logs, err := s.TaskLogs(id)
@@ -848,7 +852,7 @@ func (s *Store) ListTaskSteps(taskID string) ([]TaskStep, error) {
 }
 
 func (s *Store) ListTasks() ([]Task, error) {
-	rows, err := s.db.Query(`select id,type,target,status,created_by,error,created_at,started_at,finished_at from tasks order by created_at desc limit 200`)
+	rows, err := s.db.Query(`select id,type,target,status,created_by,error,coalesce(lease_owner,''),lease_expires_at,coalesce(attempt,0),coalesce(idempotency_key,''),coalesce(correlation_id,''),created_at,started_at,finished_at from tasks order by created_at desc limit 200`)
 	if err != nil {
 		return nil, err
 	}
@@ -856,10 +860,11 @@ func (s *Store) ListTasks() ([]Task, error) {
 	out := []Task{}
 	for rows.Next() {
 		var t Task
-		var startedAt, finishedAt sql.NullTime
-		if err := rows.Scan(&t.ID, &t.Type, &t.Target, &t.Status, &t.CreatedBy, &t.Error, &t.CreatedAt, &startedAt, &finishedAt); err != nil {
+		var leaseExpiresAt, startedAt, finishedAt sql.NullTime
+		if err := rows.Scan(&t.ID, &t.Type, &t.Target, &t.Status, &t.CreatedBy, &t.Error, &t.LeaseOwner, &leaseExpiresAt, &t.Attempt, &t.IdempotencyKey, &t.CorrelationID, &t.CreatedAt, &startedAt, &finishedAt); err != nil {
 			return nil, err
 		}
+		t.LeaseExpiresAt = nullTime(leaseExpiresAt)
 		t.StartedAt = nullTime(startedAt)
 		t.FinishedAt = nullTime(finishedAt)
 		out = append(out, t)

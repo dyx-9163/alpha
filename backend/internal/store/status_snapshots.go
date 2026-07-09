@@ -87,6 +87,11 @@ func (s *Store) UpsertStatusSnapshot(snapshot StatusSnapshot) (StatusSnapshot, b
 		server_id=excluded.server_id,status=excluded.status,payload=excluded.payload,last_error=excluded.last_error,
 		version=excluded.version,collected_at=excluded.collected_at,updated_at=excluded.updated_at`,
 		snapshot.Scope, snapshot.ResourceID, snapshot.ServerID, snapshot.Status, snapshot.Payload, snapshot.LastError, snapshot.Version, snapshot.CollectedAt, snapshot.UpdatedAt)
+	if err == nil && changed {
+		_, err = s.db.Exec(`insert into status_snapshot_history(scope,resource_id,server_id,status,payload,last_error,version,collected_at,created_at)
+			values(?,?,?,?,?,?,?,?,?)`,
+			snapshot.Scope, snapshot.ResourceID, snapshot.ServerID, snapshot.Status, snapshot.Payload, snapshot.LastError, snapshot.Version, snapshot.CollectedAt, time.Now())
+	}
 	return snapshot, changed, err
 }
 
@@ -128,6 +133,44 @@ func (s *Store) ListStatusSnapshots(scope, serverID string) ([]StatusSnapshot, e
 			return nil, err
 		}
 		out = append(out, snapshot)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) ListStatusSnapshotHistory(scope, resourceID string, limit int) ([]StatusSnapshotHistory, error) {
+	scope = strings.TrimSpace(scope)
+	resourceID = strings.TrimSpace(resourceID)
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+	args := []any{}
+	query := `select id,scope,resource_id,coalesce(server_id,''),status,payload,coalesce(last_error,''),version,collected_at,created_at from status_snapshot_history`
+	where := []string{}
+	if scope != "" {
+		where = append(where, "scope=?")
+		args = append(args, scope)
+	}
+	if resourceID != "" {
+		where = append(where, "resource_id=?")
+		args = append(args, resourceID)
+	}
+	if len(where) > 0 {
+		query += " where " + strings.Join(where, " and ")
+	}
+	query += " order by created_at desc, id desc limit ?"
+	args = append(args, limit)
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []StatusSnapshotHistory{}
+	for rows.Next() {
+		var item StatusSnapshotHistory
+		if err := rows.Scan(&item.ID, &item.Scope, &item.ResourceID, &item.ServerID, &item.Status, &item.Payload, &item.LastError, &item.Version, &item.CollectedAt, &item.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, item)
 	}
 	return out, rows.Err()
 }

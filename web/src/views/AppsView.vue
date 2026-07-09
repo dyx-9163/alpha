@@ -110,14 +110,13 @@
           <el-button size="small" @click="load">{{ t('common.refresh') }}</el-button>
         </div>
         <AppInstanceTable
-          :instances="instances"
+          :instances="liveInstances"
           :servers="servers"
           show-actions
-          :can-check="canManageApps"
+          :show-check="false"
           :can-delete="false"
           :show-delete="false"
           :disabled-reason="deniedText"
-          @check="checkDeploymentService"
         />
       </section>
     </div>
@@ -200,11 +199,13 @@ import StatusTag from '../components/StatusTag.vue'
 import { usePermissions } from '../composables/usePermissions'
 import { useI18n } from '../i18n'
 import { permissions } from '../rbac'
+import { applyRealtimeStatusToAppInstance, useRealtimeStore } from '../stores/realtime'
 import { useTaskProgressStore } from '../stores/taskProgress'
 
 const { t } = useI18n()
 const { can, deniedText } = usePermissions()
 const taskProgress = useTaskProgressStore()
+const realtime = useRealtimeStore()
 const backendCatalog = ref<AppCatalogResponse>({})
 const instances = ref<AppInstanceTableRecord[]>([])
 const servers = ref<ServerOption[]>([])
@@ -219,13 +220,14 @@ const moduleDialogModule = shallowRef<AppFrontendModule | null>(null)
 const locale = computed(() => resolveAppLocale())
 const canManageApps = computed(() => can(permissions.appsManage))
 const canScanResources = computed(() => can(permissions.resourcesScan))
+const liveInstances = computed(() => instances.value.map((instance) => applyRealtimeStatusToAppInstance(instance, realtime.appInstanceSnapshot(instance.id))))
 
 const apps = computed(() => pairedAppCatalog(backendCatalog.value, locale.value))
 const filteredApps = computed(() => (category.value === 'all' ? apps.value : apps.value.filter((app) => app.category === category.value)))
 const moduleDialogComponent = computed<Component | null>(() => moduleDialogModule.value?.installDialog ?? null)
 const installDialogContext = computed<AppInstallDialogContext>(() => ({
   servers: servers.value,
-  instances: instances.value,
+  instances: liveInstances.value,
   credentials: credentials.value,
   defaultDeployDir: appSettings.value.defaultDeployDir || '/aifar/apps'
 }))
@@ -272,7 +274,7 @@ type UninstallServer = {
   label: string
 }
 
-const installedGroups = computed(() => buildInstalledGroups(instances.value))
+const installedGroups = computed(() => buildInstalledGroups(liveInstances.value))
 const uninstallDialogVisible = ref(false)
 const uninstallSubmitting = ref(false)
 const pendingUninstallGroup = ref<InstalledAppGroup | null>(null)
@@ -406,7 +408,7 @@ function installTargetConflictReason(app: AppStoreItem | null, context: AppInsta
   }
   const targetIds = new Set(context.selectedServers.map((server) => server.id))
   const relatedApps = lifecycleRawAppNames(app.installName || app.name)
-  const conflicts = instances.value.filter((instance) => {
+  const conflicts = liveInstances.value.filter((instance) => {
     return targetIds.has(String(instance.serverId || '')) && relatedApps.has(String(instance.app || '').toLowerCase())
   })
   if (!conflicts.length) {
@@ -534,22 +536,6 @@ async function submitModuleInstall(payload: AppInstallPayload) {
     ElMessage.success(t('apps.installTaskAccepted'))
   } finally {
     installSubmitting.value = false
-  }
-}
-
-async function checkDeploymentService(row: AppInstanceTableRecord) {
-  if (!canManageApps.value) {
-    ElMessage.warning(deniedText.value)
-    return
-  }
-  try {
-    const result = await apiPost<{ taskId: string }>(`/apps/instances/${row.id}/check`, {
-      language: locale.value
-    })
-    taskProgress.track(result.taskId, row.app)
-    ElMessage.success(t('apps.checkServiceAccepted'))
-  } catch (err) {
-    ElMessage.error(err instanceof Error ? err.message : t('apps.checkServiceFailed'))
   }
 }
 

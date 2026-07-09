@@ -43,7 +43,6 @@
           <el-tooltip :content="deniedText" :disabled="canManageStorage" placement="top">
             <span><el-button v-if="tab === 'replica'" type="primary" :disabled="!canManageStorage" @click="openItemDialog('replica')">{{ t('storage.addReplica') }}</el-button></span>
           </el-tooltip>
-          <el-button :loading="checkingInstances" @click="loadActive(true)">{{ t('storage.refreshStatus') }}</el-button>
         </div>
       </div>
 
@@ -266,6 +265,7 @@ import StatusTag from '../components/StatusTag.vue'
 import { usePermissions } from '../composables/usePermissions'
 import { useI18n } from '../i18n'
 import { permissions } from '../rbac'
+import { applyRealtimeStatusToAppInstance, useRealtimeStore } from '../stores/realtime'
 import { useTaskProgressStore } from '../stores/taskProgress'
 
 type AppInstance = {
@@ -315,6 +315,7 @@ type StorageKind = 'bucket' | 'object' | 'user' | 'accessKey' | 'replica'
 const { t } = useI18n()
 const { can, deniedText } = usePermissions()
 const router = useRouter()
+const realtime = useRealtimeStore()
 const taskProgress = useTaskProgressStore()
 const instances = ref<AppInstance[]>([])
 const servers = ref<any[]>([])
@@ -322,8 +323,6 @@ const tasks = ref<any[]>([])
 const selectedInstanceId = ref('')
 const tab = ref('instances')
 const search = ref('')
-const checkingInstances = ref(false)
-const checkingInstanceIds = ref<Set<string>>(new Set())
 const itemDialogVisible = ref(false)
 const deleteDialogVisible = ref(false)
 const deleteSubmitting = ref(false)
@@ -341,10 +340,11 @@ const collection = reactive<Record<string, any[]>>({
 })
 const canManageStorage = computed(() => can(permissions.storageManage))
 const canManageApps = computed(() => can(permissions.appsManage))
+const liveInstances = computed(() => instances.value.map((instance) => applyRealtimeStatusToAppInstance(instance, realtime.appInstanceSnapshot(instance.id))))
 
 const storageGroups = computed(() => {
   const q = search.value.trim().toLowerCase()
-  const groups = buildStorageGroups(instances.value.filter((item) => item.app === 'minio'))
+  const groups = buildStorageGroups(liveInstances.value.filter((item) => item.app === 'minio'))
   if (!q) return groups
   return groups.filter((group) => storageGroupSearchText(group).includes(q))
 })
@@ -400,9 +400,8 @@ async function reloadStorageState() {
   tasks.value = asArray(nextTasks)
 }
 
-async function loadActive(manual = false) {
+async function loadActive() {
   if (tab.value === 'instances') {
-    await refreshMinioStatus(manual)
     return
   }
   if (!selectedInstanceId.value) return
@@ -714,9 +713,6 @@ function displayInstanceStatus(item: AppInstance) {
   if (isInstallFailedInstance(item, metadata)) {
     return 'failed'
   }
-  if (checkingInstanceIds.value.has(item.id)) {
-    return 'checking'
-  }
   const lastCheck = metadata.lastCheck as Record<string, any> | undefined
   const checkedStatus = String(lastCheck?.status || '').trim()
   if (checkedStatus) {
@@ -726,65 +722,6 @@ function displayInstanceStatus(item: AppInstance) {
     return 'checking'
   }
   return displayHealthStatus(item.status)
-}
-
-async function refreshMinioStatus(manual = false) {
-  if (!canManageApps.value) {
-    if (manual) {
-      ElMessage.warning(deniedText.value)
-    }
-    return
-  }
-  if (checkingInstances.value) {
-    return
-  }
-  const rows = instances.value.filter((item) => item.app === 'minio' && !isInstallFailedInstance(item, metadataOf(item)))
-  if (!rows.length) {
-    return
-  }
-  checkingInstances.value = true
-  checkingInstanceIds.value = new Set(rows.map((item) => item.id))
-  try {
-    const taskIds: string[] = []
-    for (const item of rows) {
-      try {
-        const result = await apiPost<{ taskId: string }>(`/apps/instances/${item.id}/check`)
-        if (result.taskId) {
-          taskIds.push(result.taskId)
-        }
-      } catch (err) {
-        if (manual) {
-          ElMessage.warning(err instanceof Error ? err.message : t('apps.checkServiceFailed'))
-        }
-      }
-    }
-    if (taskIds.length) {
-      await waitForTasks(taskIds)
-    }
-    await reloadStorageState()
-  } finally {
-    checkingInstances.value = false
-    checkingInstanceIds.value = new Set()
-  }
-}
-
-async function waitForTasks(taskIds: string[]) {
-  const pending = new Set(taskIds)
-  const deadline = Date.now() + 30000
-  while (pending.size && Date.now() < deadline) {
-    await delay(500)
-    const latest = asArray<any>(await apiGet<any[] | null>('/tasks').catch(() => []))
-    tasks.value = latest
-    for (const task of latest) {
-      if (pending.has(task.id) && !['pending', 'running'].includes(task.status)) {
-        pending.delete(task.id)
-      }
-    }
-  }
-}
-
-function delay(ms: number) {
-  return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
 function serverName(id: string) {

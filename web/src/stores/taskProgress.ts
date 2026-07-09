@@ -10,6 +10,7 @@ export type TrackedTask = {
   id: string
   label: string
   type: string
+  trackable: boolean
   target: string
   status: string
   progress: number
@@ -20,6 +21,8 @@ export type TrackedTask = {
 type TaskSummary = {
   id: string
   type?: string
+  category?: string
+  trackable?: boolean
   target?: string
   status?: string
   error?: string
@@ -64,12 +67,14 @@ export const useTaskProgressStore = defineStore('taskProgress', {
         if (label.trim()) {
           existing.label = label.trim()
         }
+        existing.trackable = true
         existing.updatedAt = Date.now()
       } else {
         this.items.unshift({
           id,
           label: label.trim(),
           type: '',
+          trackable: true,
           target: '',
           status: 'pending',
           progress: 8,
@@ -118,6 +123,7 @@ export const useTaskProgressStore = defineStore('taskProgress', {
           id: task.id,
           label: '',
           type: '',
+          trackable: true,
           target: '',
           status: 'pending',
           progress: 8,
@@ -128,6 +134,7 @@ export const useTaskProgressStore = defineStore('taskProgress', {
       }
       item.id = task.id
       item.type = clean(task.type)
+      item.trackable = task.trackable === true
       item.target = clean(task.target)
       item.status = clean(task.status) || 'pending'
       item.error = clean(task.error)
@@ -226,18 +233,8 @@ function orderedFloatingTasks(items: TrackedTask[]) {
     })
 }
 
-function isFloatingTask(item: Pick<TrackedTask, 'type'>) {
-  const type = clean(item.type).toLowerCase()
-  if (!type) {
-    return false
-  }
-  if (type === 'apps.delete.batch') {
-    return true
-  }
-  if (type.startsWith('apps.')) {
-    return type.endsWith('.install') || type.endsWith('.delete') || type.endsWith('.uninstall')
-  }
-  return type === 'aifar.services.install' || type === 'aifar.agent.uninstall'
+function isFloatingTask(item: Pick<TrackedTask, 'trackable'>) {
+  return item.trackable === true
 }
 
 function clean(value?: string) {
@@ -255,6 +252,7 @@ function loadStoredTasks(): TrackedTask[] {
         id: clean(item?.id),
         label: clean(item?.label),
         type: clean(item?.type),
+        trackable: item?.trackable === true,
         target: clean(item?.target),
         status: clean(item?.status) || 'pending',
         progress: Number.isFinite(Number(item?.progress)) ? Number(item.progress) : 8,

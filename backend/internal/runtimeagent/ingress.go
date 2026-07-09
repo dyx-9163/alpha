@@ -323,7 +323,7 @@ func (m *Manager) Resync(ctx context.Context) error {
 func (m *Manager) StartRuntimeResync(ctx context.Context, interval time.Duration, nacosOptions NacosProxySyncOptions) {
 	defer recoverRuntimeAgentPanic(m.log, "periodic resync")
 	if interval <= 0 {
-		interval = 30 * time.Second
+		interval = 15 * time.Second
 	}
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()

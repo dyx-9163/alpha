@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"aifar-deployment/backend/internal/apps/registry"
+	"aifar-deployment/backend/internal/realtime"
 	"aifar-deployment/backend/internal/store"
 )
 
@@ -110,6 +111,52 @@ func TestAppInstanceCollectorWritesFailedSnapshot(t *testing.T) {
 	}
 	if snapshot.Status != "failed" || snapshot.LastError != "service down" {
 		t.Fatalf("expected failed app instance snapshot, got %+v", snapshot)
+	}
+}
+
+func TestSaveSnapshotPublishesEveryCollection(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "aifar.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	events := realtime.NewHub()
+	ch, unsubscribe := events.Subscribe()
+	defer unsubscribe()
+	manager := NewManager(db, events, time.Minute)
+	snapshot := store.StatusSnapshot{
+		Scope:       "app.instance",
+		ResourceID:  "app-1",
+		ServerID:    "srv-1",
+		Status:      "running",
+		Payload:     `{"app":"redis","status":"running"}`,
+		CollectedAt: time.Now(),
+	}
+
+	if err := manager.saveSnapshot(context.Background(), snapshot); err != nil {
+		t.Fatal(err)
+	}
+	first := nextEvent(t, ch)
+	if first.InstanceID != "app-1" || first.Payload["changed"] != true {
+		t.Fatalf("expected first snapshot event to be changed app instance, got %+v", first)
+	}
+	if err := manager.saveSnapshot(context.Background(), snapshot); err != nil {
+		t.Fatal(err)
+	}
+	second := nextEvent(t, ch)
+	if second.InstanceID != "app-1" || second.Payload["changed"] != false {
+		t.Fatalf("expected unchanged snapshot to still be published, got %+v", second)
+	}
+}
+
+func nextEvent(t *testing.T, ch <-chan realtime.Event) realtime.Event {
+	t.Helper()
+	select {
+	case event := <-ch:
+		return event
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for realtime event")
+		return realtime.Event{}
 	}
 }
 

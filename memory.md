@@ -52,3 +52,19 @@
 - 结论：已落地第一阶段闭环：AIFAR 单服务和 bundle 升级会写入 v2 release manifest、保存远端 release 制品和服务快照；新增 `app_releases` 发布历史查询 API、AIFAR artifact rollback API、受信 rollback shell 模板和前端发布历史/回滚入口。回滚会基于目标成功 release 的远端制品与 SHA256 执行，并作为新的 rollback release 记录；`pnpm test` 与 `pnpm web:build` 通过。
 - 问题：用户要求继续看全工程，给出架构层面的优化方向。
 - 结论：当前工程基础清晰，但随着 AIFAR Runtime、发布回滚、凭据、E2E 增加，主要架构优化点集中在：抽 `installflow` 标准安装/检查/删除流程；将 AIFAR Runtime 从 `httpapi` 和超大 `ContainersView.vue` 拆到独立 runtime 控制域；拆分 registry 通用应用生命周期和 AIFAR runtime 专属能力；引入版本化 migrations 和 typed metadata；增强 worker 为持久任务/lease/统一 task metadata；将 release/backup/credential 引用治理平台化。
+- 问题：用户要求一步一步进行架构优化，不保留老版本适配，并尽快完成改造。
+- 结论：已落地第一批架构改造：新增 `backend/internal/installflow` 统一应用 install/check/delete 步骤执行与计划生成，Docker/MySQL/Redis/MinIO/Nacos 接入；新增 `backend/internal/taskmeta`，后端统一输出任务 category/trackable，前端任务追踪改为以后端 trackable 为准；HTTP 层新增计划任务 helper，应用删除/检查、MySQL 集群启动、Nacos 配置发布/回滚、维护任务和 AIFAR Runtime 控制动作均改为任务创建前预存 target/step 计划；补充计划预存测试。`pnpm test` 与 `pnpm web:build` 通过。
+- 问题：用户要求将 `outputs/algeria-migration-plan.md` 转成 Word。
+- 结论：已生成 `outputs/algeria-migration-plan.docx`，使用 UTF-8 正确读取中文 Markdown，保留原内容并套用正式业务简报样式；DOCX 结构、标题、表格和可访问性审计通过。当前环境缺少 LibreOffice/soffice，未完成渲染 PNG 视觉 QA。
+- 问题：用户要求所有已安装应用状态改为后端统一推送，页面不再主动刷新；服务启动后自动监控所有安装应用状态，aifar-server 和 aifar-agent 每 15 秒统一获取并推送给已登录账号。
+- 结论：已改造为 collector/SSE 统一状态源：aifar-server 默认 15 秒采集，所有实现 CheckModule 且绑定服务器的 app_instances 都会被采集；状态快照每轮都会推送，payload 带 changed，app.instance/aifar.runtime 带 instanceId；aifar-agent runtime resync 改为 15 秒。前端 realtime store 维护全局 status snapshot 缓存，Apps/Database/Storage/Nacos/Dashboard 改为用实时快照覆盖状态，移除页面发起 check 任务和 realtime 触发整页刷新。`pnpm test` 与 `pnpm web:build` 通过。
+- 问题：用户询问当前架构层面还需要继续优化什么。
+- 结论：下一阶段优先级建议为：拆分 AIFAR Runtime 后端控制域和超大 `ContainersView.vue`；引入 typed metadata 读写层，减少散落 JSON 解析；把内嵌 Store migrate 升级为版本化 migrations；将 release/backup/credential 引用治理平台化；增强 worker 为可恢复 lease/重试/锁模型；最后再做 Docker Go client、真实 MinIO API 和前端模块化瘦身。
+- 问题：用户要求按现有功能边界罗列达到企业级架构需要改哪些代码和数据库。
+- 结论：建议不扩功能边界，围绕现有安装/检查/卸载、状态推送、AIFAR Runtime 升级回滚、凭据、任务、审计做企业化：拆出 AIFAR Runtime 后端 domain 和前端 runtime 模块；建立 typed app metadata 与 app cluster/member 模型；引入 schema_migrations；补 operation_locks/task leases/idempotency；完善 app_release_artifacts/app_release_snapshots/app_backups/credential_references；增加 status snapshot history 和索引；把真实 MinIO/Docker API 与页面瘦身排在后续。
+- 问题：用户要求把 P0-P2 放入任务记录，并先做 P0 + 一部分 P1。
+- 结论：已新增 `design/enterprise-architecture-optimization-tasks.md` 记录 P0-P2 和本轮执行项；后端新增 `appmeta` typed metadata 工具包；Store 引入 `schema_migrations` 版本化迁移，新增 operation_locks、credential_references、app_clusters/app_cluster_members、app_release_artifacts/app_release_snapshots/app_backups、status_snapshot_history，任务表补 lease/idempotency/correlation 字段；增加操作锁、任务租约、凭证引用、集群成员、发布制品/快照/备份、状态历史 Store 方法和测试。`pnpm test` 通过。
+- 问题：用户要求继续完成未完成的企业级架构改造部分。
+- 结论：已把 P0/P1 基础表进一步接入业务流：安装成功后记录凭证引用并写入 app_clusters/app_cluster_members；AIFAR app_releases 保存时会从 manifest 展开 app_release_artifacts 和 app_release_snapshots；凭证中心新增删除前引用查询与前端提示，有引用时拦截删除；应用安装、删除、AIFAR 制品更新/批量更新/回滚、MySQL 集群启动接入任务级 operation_locks，worker 按 task id 心跳和释放锁，避免同一资源并发变更。`pnpm test` 与 `pnpm web:build` 通过。
+- 问题：用户要求拆分 AIFAR Runtime 后端控制域和 `ContainersView.vue`。
+- 结论：后端新增 `aifarRuntimeController`，AIFAR Runtime 路由由 controller 自行挂载，外部 API 路径保持兼容；前端新增 `web/src/containers/runtime` 模块，抽出 Runtime 类型、日志解析工具、弹窗上下文和 `AifarRuntimeDialogs.vue`，`ContainersView.vue` 不再承载 Runtime 升级/服务安装/配置弹窗模板。`pnpm test` 与 `pnpm web:build` 通过。

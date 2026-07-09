@@ -1,12 +1,14 @@
 package httpapi
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
 
+	"aifar-deployment/backend/internal/appmeta"
 	"aifar-deployment/backend/internal/apps/registry"
 	"aifar-deployment/backend/internal/i18n"
 	"aifar-deployment/backend/internal/rbac"
@@ -27,6 +29,16 @@ func (a *API) listCredentials(w http.ResponseWriter, r *http.Request) {
 func (a *API) getCredential(w http.ResponseWriter, r *http.Request) {
 	item, err := a.store.GetCredential(chi.URLParam(r, "id"), false)
 	respond(w, item, err)
+}
+
+func (a *API) credentialReferences(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimSpace(chi.URLParam(r, "id"))
+	refs, err := a.store.ListCredentialReferences(id, "", "")
+	if err != nil {
+		respond(w, nil, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": refs})
 }
 
 func (a *API) saveCredential(w http.ResponseWriter, r *http.Request) {
@@ -83,7 +95,8 @@ func (a *API) deleteCredential(w http.ResponseWriter, r *http.Request) {
 		respond(w, nil, err)
 		return
 	}
-	writeError(w, http.StatusConflict, "CREDENTIAL_BOUND", i18n.Text(languageFromRequest(r), "api.credentialBound"), map[string]any{"error": err.Error()})
+	refs, _ := a.store.ListCredentialReferences(id, "", "")
+	writeError(w, http.StatusConflict, "CREDENTIAL_BOUND", i18n.Text(languageFromRequest(r), "api.credentialBound"), map[string]any{"error": err.Error(), "references": refs})
 }
 
 func (a *API) resolveCredentialParameters(r *http.Request, parameters map[string]any) (map[string]any, error) {
@@ -126,6 +139,7 @@ func (a *API) resolveCredentialParameters(r *http.Request, parameters map[string
 func (a *API) bindInstallCredentialReferences(app string, req registry.InstallRequest, log registry.Logger) {
 	a.bindSelectedInstallCredentialReferences(app, req)
 	a.registerGeneratedInstallCredentials(app, req, log)
+	a.recordInstallClusterMembership(app, req, log)
 }
 
 func (a *API) bindSelectedInstallCredentialReferences(app string, req registry.InstallRequest) {
@@ -204,6 +218,7 @@ func (a *API) registerGeneratedInstallCredentials(app string, req registry.Insta
 			}
 			continue
 		}
+		a.recordGeneratedCredentialReference(credential, instance, spec.Purpose)
 		if log != nil {
 			log.Info(i18n.Text(req.Language, "api.credentialAutoRegistered"), spec.Kind, credential.Name)
 		}
@@ -434,6 +449,99 @@ func (a *API) bindCredentialToLatestInstance(credentialID, app, serverID, purpos
 		Purpose:       purpose,
 		ServiceName:   app,
 	})
+	_, _ = a.store.SaveCredentialReference(store.CredentialReference{
+		CredentialID:    credentialID,
+		ResourceType:    "app-instance",
+		ResourceID:      selected.ID,
+		Purpose:         purpose,
+		Generated:       false,
+		LifecyclePolicy: "retain",
+		Metadata:        credentialReferenceMetadata(app, selected.ServerID),
+	})
+}
+
+func (a *API) recordGeneratedCredentialReference(credential store.Credential, instance store.AppInstance, purpose string) {
+	_, _ = a.store.SaveCredentialReference(store.CredentialReference{
+		CredentialID:    credential.ID,
+		ResourceType:    "app-instance",
+		ResourceID:      instance.ID,
+		Purpose:         purpose,
+		Generated:       true,
+		LifecyclePolicy: "delete-with-resource",
+		Metadata:        credentialReferenceMetadata(credential.Kind, instance.ServerID),
+	})
+}
+
+func credentialReferenceMetadata(app, serverID string) string {
+	raw, _ := json.Marshal(map[string]any{
+		"app":      strings.TrimSpace(app),
+		"serverId": strings.TrimSpace(serverID),
+	})
+	return string(raw)
+}
+
+func (a *API) recordInstallClusterMembership(app string, req registry.InstallRequest, log registry.Logger) {
+	for _, serverID := range req.TargetServerIDs() {
+		instance, ok := a.latestAppInstanceForServer(app, serverID)
+		if !ok {
+			continue
+		}
+		if err := a.recordAppClusterMember(instance, req.Topology); err != nil && log != nil {
+			log.Error("record app cluster membership failed: %v", err)
+		}
+	}
+}
+
+func (a *API) recordAppClusterMember(instance store.AppInstance, requestedTopology string) error {
+	metadata := appmeta.Parse(instance.Metadata)
+	name := appmeta.ClusterID(metadata)
+	if name == "" {
+		name = appmeta.String(metadata, "clusterName", "")
+	}
+	if name == "" {
+		name = instance.ID
+	}
+	topology := strings.TrimSpace(instance.Topology)
+	if topology == "" {
+		topology = strings.TrimSpace(requestedTopology)
+	}
+	if topology == "" {
+		topology = "standalone"
+	}
+	status := strings.TrimSpace(instance.Status)
+	if status == "" {
+		status = "installed"
+	}
+	cluster, err := a.store.SaveAppCluster(store.AppCluster{
+		App:      lifecycleAppFamily(instance.App),
+		Name:     name,
+		Topology: topology,
+		Status:   status,
+		Metadata: appmeta.Marshal(map[string]any{
+			"source":     "install",
+			"instanceId": instance.ID,
+			"app":        instance.App,
+		}),
+	})
+	if err != nil {
+		return err
+	}
+	role := appmeta.String(metadata, "role", "")
+	if role == "" {
+		role = appmeta.String(metadata, "nodeRole", "")
+	}
+	_, err = a.store.SaveAppClusterMember(store.AppClusterMember{
+		ClusterID:  cluster.ID,
+		InstanceID: instance.ID,
+		ServerID:   instance.ServerID,
+		Role:       role,
+		Status:     status,
+		Metadata: appmeta.Marshal(map[string]any{
+			"endpoint": appmeta.Endpoint(metadata),
+			"app":      instance.App,
+		}),
+	})
+	return err
 }
 
 func netEndpoint(scheme, host string, port int) string {

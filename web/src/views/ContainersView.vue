@@ -460,116 +460,12 @@
       </template>
     </div>
 
-    <el-dialog v-model="aifarUpdateVisible" :title="t('apps.aifarUpdateTitle')" width="560px" destroy-on-close>
-      <el-form label-width="112px" class="aifar-update-form">
-        <el-form-item :label="t('containers.updateTarget')">
-          <el-input :model-value="selectedAifarContainerLabel" disabled />
-        </el-form-item>
-        <el-form-item :label="t('apps.aifarUpdateInstance')">
-          <el-input :model-value="selectedAifarInstanceLabel" disabled />
-        </el-form-item>
-        <el-form-item :label="t('apps.aifarUpdateMode')" required>
-          <el-input :model-value="aifarUpdateModeLabel" disabled />
-        </el-form-item>
-        <el-form-item v-if="aifarUpdateMode === 'single'" :label="t('apps.aifarUpdateService')" required>
-          <el-input :model-value="aifarUpdateService" disabled />
-          <div class="artifact-hint">{{ t('apps.aifarUpdateLockedServiceHint') }}</div>
-        </el-form-item>
-        <el-form-item :label="t('apps.aifarUpdateArtifact')" required>
-          <el-upload
-            :key="`${aifarUpdateMode}-${aifarUpdateService}`"
-            :auto-upload="false"
-            :limit="1"
-            :accept="aifarArtifactAccept"
-            :on-change="handleAifarArtifactChange"
-            :on-remove="clearAifarArtifact"
-          >
-            <el-button>{{ t('apps.aifarUpdateChooseArtifact') }}</el-button>
-          </el-upload>
-          <div class="artifact-hint">{{ aifarArtifactHint }}</div>
-        </el-form-item>
-      </el-form>
-      <template #footer>
-        <el-button @click="aifarUpdateVisible = false">{{ t('common.cancel') }}</el-button>
-        <el-button type="primary" :loading="aifarUpdateSubmitting" @click="submitAifarUpdate">{{ t('apps.aifarUpdateSubmit') }}</el-button>
-      </template>
-    </el-dialog>
-    <el-dialog v-model="serviceInstallVisible" :title="t('containers.installServicesDialog')" width="560px" destroy-on-close>
-      <div class="service-install-dialog">
-        <div>
-          <div class="runtime-config-section-title">{{ t('containers.installedServices') }}</div>
-          <div class="service-tag-list">
-            <el-tag v-for="service in installedRuntimeServiceNamesList" :key="service" size="small">{{ service }}</el-tag>
-          </div>
-        </div>
-        <div>
-          <div class="runtime-config-section-title">{{ t('containers.installableServices') }}</div>
-          <el-empty v-if="!missingRuntimeServiceOptions.length" :description="t('containers.noMissingServices')" />
-          <el-checkbox-group v-else v-model="serviceInstallSelection" class="service-install-options">
-            <el-checkbox v-for="service in missingRuntimeServiceOptions" :key="service.value" :label="service.value">{{ service.label }}</el-checkbox>
-          </el-checkbox-group>
-        </div>
-      </div>
-      <template #footer>
-        <el-button @click="serviceInstallVisible = false">{{ t('common.cancel') }}</el-button>
-        <el-button type="primary" :loading="serviceInstallSubmitting" @click="submitAifarServiceInstall">{{ t('containers.installServices') }}</el-button>
-      </template>
-    </el-dialog>
-    <el-dialog v-model="runtimeConfigVisible" :title="t('containers.runtimeConfig')" width="780px" destroy-on-close>
-      <div class="runtime-config-dialog">
-        <KeyValueGrid :items="runtimeConfigMetaItems" />
-        <el-form label-width="148px" class="runtime-config-form">
-          <el-form-item :label="t('containers.runtimeConfigCpu')" required>
-            <el-input v-model="runtimeConfigForm.appCPUs" />
-          </el-form-item>
-          <el-form-item :label="t('containers.runtimeConfigMemory')" required>
-            <el-input v-model="runtimeConfigForm.appMemoryLimit" />
-          </el-form-item>
-          <el-form-item :label="t('containers.jvmInitialRam')" required>
-            <el-input-number v-model="runtimeConfigForm.jvmInitialRAMPercentage" :min="1" :max="90" :step="1" controls-position="right" />
-          </el-form-item>
-          <el-form-item :label="t('containers.jvmMaxRam')" required>
-            <el-input-number v-model="runtimeConfigForm.jvmMaxRAMPercentage" :min="1" :max="90" :step="1" controls-position="right" />
-          </el-form-item>
-          <el-form-item :label="t('containers.nacosEphemeral')">
-            <el-switch v-model="runtimeConfigForm.nacosEphemeral" inline-prompt active-text="true" inactive-text="false" />
-          </el-form-item>
-        </el-form>
-        <div class="runtime-config-section-title">{{ t('containers.runtimeConfigOverrides') }}</div>
-        <el-table :data="runtimeConfigRows" max-height="300" row-key="serviceName" class="runtime-config-table">
-          <el-table-column prop="serviceName" :label="t('containers.service')" width="120" />
-          <el-table-column :label="t('containers.runtimeConfigCpu')" min-width="130">
-            <template #default="{ row }">
-              <el-input v-model="row.appCPUs" :placeholder="t('containers.inheritGlobal')" />
-            </template>
-          </el-table-column>
-          <el-table-column :label="t('containers.runtimeConfigMemory')" min-width="140">
-            <template #default="{ row }">
-              <el-input v-model="row.appMemoryLimit" :placeholder="t('containers.inheritGlobal')" />
-            </template>
-          </el-table-column>
-          <el-table-column :label="t('containers.jvmInitialRam')" min-width="130">
-            <template #default="{ row }">
-              <el-input v-model="row.jvmInitialRAMPercentage" :disabled="row.serviceName === 'web-vue3'" :placeholder="t('containers.inheritGlobal')" />
-            </template>
-          </el-table-column>
-          <el-table-column :label="t('containers.jvmMaxRam')" min-width="130">
-            <template #default="{ row }">
-              <el-input v-model="row.jvmMaxRAMPercentage" :disabled="row.serviceName === 'web-vue3'" :placeholder="t('containers.inheritGlobal')" />
-            </template>
-          </el-table-column>
-        </el-table>
-      </div>
-      <template #footer>
-        <el-button @click="runtimeConfigVisible = false">{{ t('common.cancel') }}</el-button>
-        <el-button type="primary" :loading="runtimeConfigSubmitting" @click="submitRuntimeConfig">{{ t('containers.applyRuntimeConfig') }}</el-button>
-      </template>
-    </el-dialog>
+    <AifarRuntimeDialogs />
   </section>
 </template>
 
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, provide, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import type { UploadFile } from 'element-plus'
 import { apiEventSourceUrl, apiGet, apiPost, apiPostForm, apiPut, asArray } from '../api/client'
@@ -582,6 +478,36 @@ import { getCurrentLocale, useI18n } from '../i18n'
 import { permissions } from '../rbac'
 import { useRealtimeStore } from '../stores/realtime'
 import { useTaskProgressStore } from '../stores/taskProgress'
+import AifarRuntimeDialogs from '../containers/runtime/AifarRuntimeDialogs.vue'
+import { aifarRuntimeDialogContextKey } from '../containers/runtime/context'
+import {
+  parseRuntimeLogErrorEvent,
+  parseRuntimeLogLine,
+  parseRuntimeLogsEvent,
+  runtimeLogLevelOptions,
+  runtimeLogLevelTag,
+  runtimeLogMaxRows,
+  runtimeLogRowHeight,
+  runtimeLogVisibleCount
+} from '../containers/runtime/logs'
+import type {
+  AifarRelease,
+  AifarReleaseListResponse,
+  AifarRuntimeDeployment,
+  AifarRuntimeIngress,
+  AifarRuntimeInstance,
+  AifarRuntimeLogPod,
+  AifarRuntimeLogsResponse,
+  AifarRuntimePod,
+  AifarRuntimeResponse,
+  AifarRuntimeService,
+  RuntimeConfigFormValues,
+  RuntimeConfigServiceRow,
+  RuntimeConfigState,
+  RuntimeConfigValues,
+  RuntimeEntryRoute,
+  RuntimeLogRow
+} from '../containers/runtime/types'
 
 type DockerSummaryResponse = {
   available?: boolean
@@ -597,202 +523,6 @@ type AppInstance = {
   version?: string
   status: string
   metadata?: string
-}
-
-type AifarRuntimeInstance = {
-  id: string
-  version?: string
-  status?: string
-  orchestrationModel?: string
-  legacy?: boolean
-  installRoot?: string
-  endpoint?: string
-  gatewayEndpoint?: string
-  runtimeConfig?: RuntimeConfigState
-}
-
-type RuntimeConfigValues = {
-  appCPUs?: string
-  appMemoryLimit?: string
-  jvmInitialRAMPercentage?: number
-  jvmMaxRAMPercentage?: number
-}
-
-type RuntimeConfigState = {
-  configVersion?: number
-  updatedAt?: string
-  updatedBy?: string
-  global?: RuntimeConfigValues
-  services?: Record<string, RuntimeConfigValues>
-  nacosEphemeral?: boolean
-  appliedVersion?: number
-  lastAppliedAt?: string
-  lastApplyStatus?: string
-  lastApplyError?: string
-}
-
-type RuntimeConfigFormValues = Required<RuntimeConfigValues> & {
-  nacosEphemeral: boolean
-}
-
-type RuntimeConfigServiceRow = {
-  serviceName: string
-  appCPUs: string
-  appMemoryLimit: string
-  jvmInitialRAMPercentage: string
-  jvmMaxRAMPercentage: string
-}
-
-type AifarRuntimeAgent = {
-  status?: string
-  version?: string
-  mode?: string
-  error?: string
-  listeners?: number[]
-  features?: string[]
-}
-
-type AifarRuntimeService = {
-  instanceId: string
-  serviceName: string
-  appName?: string
-  proxyName?: string
-  desiredReplicas?: number
-  readyReplicas?: number
-  activeEndpoints?: number
-  endpointCount?: number
-  readyEndpointCount?: number
-  image?: string
-  status?: string
-  rolloutStatus?: string
-  nacosRegistered?: boolean
-  nacosReady?: boolean
-  lastNacosError?: string
-  lastError?: string
-  cpuPercent?: number
-  memoryPercent?: number
-  failureReason?: string
-}
-
-type AifarRuntimeDeployment = {
-  instanceId: string
-  deploymentName?: string
-  serviceName: string
-  appName?: string
-  desiredReplicas?: number
-  currentReplicas?: number
-  readyReplicas?: number
-  updatedReplicas?: number
-  availableReplicas?: number
-  podRevision?: string
-  updatingPodRevision?: string
-  image?: string
-  status?: string
-  updatedAt?: string
-  failureReason?: string
-}
-
-type AifarRuntimePod = {
-  instanceId: string
-  serviceName: string
-  podId?: string
-  containerName: string
-  revision?: string
-  image?: string
-  port?: number
-  status?: string
-  ready?: boolean
-  cpuPercent?: number
-  memoryPercent?: number
-  memoryUsage?: string
-}
-
-type AifarRuntimeIngress = {
-  instanceId: string
-  container?: string
-  status?: string
-  gatewayPort?: number
-  webPort?: number
-  gatewayRoute?: string
-  webRoute?: string
-  error?: string
-}
-
-type AifarRuntimeLogPod = {
-  instanceId: string
-  serviceName: string
-  podId?: string
-  containerName: string
-  revision?: string
-  status?: string
-  ready?: boolean
-  logs?: string[]
-  lineCount?: number
-  collectionError?: string
-}
-
-type AifarRuntimeLogsResponse = {
-  serverId?: string
-  instanceId?: string
-  service?: string
-  services?: string[]
-  podsFilter?: string[]
-  tail?: number
-  batchSize?: number
-  mode?: string
-  pods?: AifarRuntimeLogPod[]
-  warnings?: string[]
-}
-
-type RuntimeLogRow = {
-  id: string
-  time: string
-  timestamp: number
-  sequence: number
-  serviceName: string
-  pod: string
-  level: string
-  message: string
-}
-
-type RuntimeEntryRoute = {
-  name: string
-  route: string
-  port: string
-  status: string
-}
-
-type AifarRuntimeResponse = {
-  serverId?: string
-  runtimeStatus?: string
-  agent?: AifarRuntimeAgent
-  instances?: AifarRuntimeInstance[]
-  deployments?: AifarRuntimeDeployment[]
-  services?: AifarRuntimeService[]
-  pods?: AifarRuntimePod[]
-  ingress?: AifarRuntimeIngress[]
-  warnings?: string[]
-}
-
-type AifarRelease = {
-  id?: string
-  instanceId: string
-  releaseId: string
-  kind?: string
-  status?: string
-  manifestStatus?: string
-  version?: string
-  serverId?: string
-  configHash?: string
-  createdAt?: string
-  activatedAt?: string
-  changedServices?: string[]
-  rollbackAvailable?: boolean
-  manifest?: Record<string, any>
-}
-
-type AifarReleaseListResponse = {
-  items?: AifarRelease[]
 }
 
 const { t } = useI18n()
@@ -851,10 +581,6 @@ const runtimeLogLastDataAt = ref('')
 let runtimeLogSource: EventSource | null = null
 let runtimeLogStreamKey = ''
 let runtimeLogSequence = 0
-const runtimeLogMaxRows = 3000
-const runtimeLogRowHeight = 32
-const runtimeLogVisibleCount = 100
-const runtimeLogLevelOptions = ['ERROR', 'WARN', 'INFO', 'DEBUG', 'TRACE']
 const runtimeConfigVisible = ref(false)
 const runtimeConfigSubmitting = ref(false)
 const runtimeConfigForm = ref<RuntimeConfigFormValues>({
@@ -1460,23 +1186,6 @@ function markRuntimeLogDataReceived() {
   runtimeLogLastDataAt.value = new Date().toLocaleTimeString()
 }
 
-function parseRuntimeLogsEvent(raw: string) {
-  try {
-    return JSON.parse(raw) as AifarRuntimeLogsResponse
-  } catch {
-    return null
-  }
-}
-
-function parseRuntimeLogErrorEvent(raw: string) {
-  try {
-    const parsed = JSON.parse(raw) as { message?: string }
-    return String(parsed.message || '').trim()
-  } catch {
-    return ''
-  }
-}
-
 function resetRuntimeLogView() {
   runtimeLogs.value = { pods: [], warnings: [], tail: runtimeLogTail.value }
   runtimeLogRows.value = []
@@ -1691,55 +1400,6 @@ async function removeImages(rows: any[], mode: 'single' | 'batch') {
     }, 800)
   } catch (err) {
     ElMessage.error(err instanceof Error ? err.message : t('containers.imageRemoveFailed'))
-  }
-}
-
-function parseRuntimeLogLine(line: string) {
-  const raw = String(line ?? '')
-  const match = raw.match(/^(\d{4}-\d{2}-\d{2}[T ][^\s]+)\s+(?:(TRACE|DEBUG|INFO|WARN|WARNING|ERROR|FATAL|SEVERE)\s+)?(.*)$/i)
-  if (!match) {
-    return {
-      time: '-',
-      timestamp: 0,
-      level: detectRuntimeLogLevel(raw),
-      message: raw
-    }
-  }
-  const time = match[1]
-  const parsedTime = Date.parse(time)
-  return {
-    time,
-    timestamp: Number.isFinite(parsedTime) ? parsedTime : 0,
-    level: (match[2] || detectRuntimeLogLevel(raw)).toUpperCase(),
-    message: (match[3] || raw).trim() || raw
-  }
-}
-
-function detectRuntimeLogLevel(line: string) {
-  const upper = String(line || '').toUpperCase()
-  if (/\b(FATAL|SEVERE|ERROR)\b/.test(upper)) return 'ERROR'
-  if (/\b(WARN|WARNING)\b/.test(upper)) return 'WARN'
-  if (/\bINFO\b/.test(upper)) return 'INFO'
-  if (/\b(DEBUG|TRACE)\b/.test(upper)) return 'DEBUG'
-  return ''
-}
-
-function runtimeLogLevelTag(level: string) {
-  switch (String(level || '').toUpperCase()) {
-    case 'ERROR':
-    case 'FATAL':
-    case 'SEVERE':
-      return 'danger'
-    case 'WARN':
-    case 'WARNING':
-      return 'warning'
-    case 'INFO':
-      return 'success'
-    case 'DEBUG':
-    case 'TRACE':
-      return 'info'
-    default:
-      return ''
   }
 }
 
@@ -2502,6 +2162,34 @@ function uniqueValues(values: string[]) {
   return out
 }
 
+provide(aifarRuntimeDialogContextKey, {
+  t,
+  aifarUpdateVisible,
+  selectedAifarContainerLabel,
+  selectedAifarInstanceLabel,
+  aifarUpdateModeLabel,
+  aifarUpdateMode,
+  aifarUpdateService,
+  aifarArtifactAccept,
+  handleAifarArtifactChange,
+  clearAifarArtifact,
+  aifarArtifactHint,
+  aifarUpdateSubmitting,
+  submitAifarUpdate,
+  serviceInstallVisible,
+  installedRuntimeServiceNamesList,
+  missingRuntimeServiceOptions,
+  serviceInstallSelection,
+  serviceInstallSubmitting,
+  submitAifarServiceInstall,
+  runtimeConfigVisible,
+  runtimeConfigMetaItems,
+  runtimeConfigForm,
+  runtimeConfigRows,
+  runtimeConfigSubmitting,
+  submitRuntimeConfig
+})
+
 watch(tab, (next) => {
   if (next !== 'aifar-runtime') {
     closeRuntimeLogStream()
@@ -2570,10 +2258,6 @@ watch(
 watch(() => realtime.revision, () => {
   const event = realtime.lastEvent
   if (!event?.resource) {
-    return
-  }
-  if (event.resource === 'server') {
-    void loadServers()
     return
   }
   if (event.resource === 'docker.summary' && event.serverId === selectedServerId.value) {
@@ -3101,66 +2785,6 @@ onBeforeUnmount(() => {
   background: #f8fbff;
 }
 
-.aifar-update-form :deep(.el-select),
-.aifar-update-form :deep(.el-input) {
-  width: 100%;
-}
-
-.artifact-hint {
-  width: 100%;
-  margin-top: 6px;
-  color: var(--aifar-text-tertiary);
-  font-size: 12px;
-  line-height: 18px;
-}
-
-.runtime-config-dialog {
-  display: grid;
-  gap: 12px;
-}
-
-.runtime-config-form {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 0 12px;
-}
-
-.runtime-config-form :deep(.el-form-item) {
-  margin-bottom: 12px;
-}
-
-.runtime-config-form :deep(.el-input),
-.runtime-config-form :deep(.el-input-number) {
-  width: 100%;
-}
-
-.runtime-config-section-title {
-  color: var(--aifar-ink);
-  font-size: 14px;
-  font-weight: 600;
-}
-
-.runtime-config-table :deep(.el-input) {
-  width: 100%;
-}
-
-.service-install-dialog {
-  display: grid;
-  gap: 16px;
-}
-
-.service-tag-list,
-.service-install-options {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-  margin-top: 8px;
-}
-
-.service-install-options :deep(.el-checkbox) {
-  margin-right: 0;
-}
-
 .settings-grid {
   display: grid;
   gap: 12px;
@@ -3235,8 +2859,5 @@ onBeforeUnmount(() => {
     width: 100%;
   }
 
-  .runtime-config-form {
-    grid-template-columns: 1fr;
-  }
 }
 </style>

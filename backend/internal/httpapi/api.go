@@ -31,6 +31,7 @@ type API struct {
 	apps     *registry.Registry
 	servers  serverdomain.Service
 	auth     *security.LoginGuard
+	runtime  *aifarRuntimeController
 	router   chi.Router
 }
 
@@ -51,6 +52,7 @@ func NewWithRealtime(cfg config.Config, s *store.Store, tasks *worker.Manager, e
 		servers:  serverdomain.NewService(s, serverdomain.SSHProber{}, cfg.DefaultDeployDir),
 		auth:     security.NewLoginGuard(cfg.AuthMaxFailures, time.Duration(cfg.AuthLockoutSeconds)*time.Second),
 	}
+	api.runtime = newAIFARRuntimeController(api)
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID, middleware.RealIP, middleware.Recoverer, api.securityHeaders, api.limitRequestBody)
 	r.Route("/api/v2", func(r chi.Router) {
@@ -114,21 +116,12 @@ func NewWithRealtime(cfg config.Config, s *store.Store, tasks *worker.Manager, e
 			r.Get("/credentials", api.requirePermission(rbac.CredentialsUse, api.listCredentials))
 			r.Post("/credentials", api.requirePermission(rbac.CredentialsManage, api.saveCredential))
 			r.Get("/credentials/{id}", api.requirePermission(rbac.CredentialsUse, api.getCredential))
+			r.Get("/credentials/{id}/references", api.requirePermission(rbac.CredentialsUse, api.credentialReferences))
 			r.Put("/credentials/{id}", api.requirePermission(rbac.CredentialsManage, api.saveCredential))
 			r.Delete("/credentials/{id}", api.requirePermission(rbac.CredentialsManage, api.deleteCredential))
 			r.Get("/containers/summary", api.containerSummary)
 			r.Get("/containers", api.containers)
-			r.Get("/containers/aifar/runtime", api.aifarRuntime)
-			r.Get("/containers/aifar/runtime/logs", api.aifarRuntimeLogs)
-			r.Get("/containers/aifar/runtime/logs/events", api.aifarRuntimeLogsEvents)
-			r.Put("/containers/aifar/runtime/config", api.requirePermission(rbac.AppsManage, api.aifarRuntimeConfig))
-			r.Post("/containers/aifar/runtime/reconcile", api.requirePermission(rbac.AppsManage, api.aifarRuntimeReconcile))
-			r.Post("/containers/aifar/runtime/cleanup-stale", api.requirePermission(rbac.AppsManage, api.aifarRuntimeCleanupStale))
-			r.Post("/containers/aifar/runtime/uninstall-agent", api.requirePermission(rbac.AppsManage, api.aifarRuntimeUninstallAgent))
-			r.Post("/containers/aifar/services/install", api.requirePermission(rbac.AppsManage, api.aifarRuntimeInstallServices))
-			r.Post("/containers/aifar/services/{service}/scale-out", api.requirePermission(rbac.AppsManage, api.aifarRuntimeScaleOut))
-			r.Post("/containers/aifar/services/{service}/scale-in", api.requirePermission(rbac.AppsManage, api.aifarRuntimeScaleIn))
-			r.Post("/containers/aifar/services/{service}/offline", api.requirePermission(rbac.AppsManage, api.aifarRuntimeOfflineService))
+			api.runtime.mount(r)
 			r.Post("/containers/actions", api.requirePermission(rbac.ContainersManage, api.containerBatchAction))
 			r.Post("/containers/images/remove", api.requirePermission(rbac.ContainersManage, api.containerImageRemove))
 			r.Post("/containers/{id}/start", api.requirePermission(rbac.ContainersManage, api.containerAction("start")))

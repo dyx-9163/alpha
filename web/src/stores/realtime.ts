@@ -1,5 +1,5 @@
 import { defineStore } from 'pinia'
-import { eventStreamUrl } from '../api/client'
+import { apiGet, asArray, eventStreamUrl } from '../api/client'
 import { useAlertsStore } from './alerts'
 import { useTaskProgressStore } from './taskProgress'
 
@@ -18,6 +18,28 @@ export type RealtimeEvent = {
   payload?: Record<string, unknown>
 }
 
+export type StatusSnapshot = {
+  scope: string
+  resourceId: string
+  serverId?: string
+  status?: string
+  payload?: Record<string, unknown>
+  lastError?: string
+  version?: number
+  collectedAt?: string
+  updatedAt?: string
+}
+
+type AppInstanceLike = {
+  id: string
+  app?: string
+  version?: string
+  serverId?: string
+  status?: string
+  topology?: string
+  metadata?: string
+}
+
 let source: EventSource | null = null
 let reconnectTimer: number | undefined
 
@@ -29,11 +51,26 @@ export const useRealtimeStore = defineStore('realtime', {
     lastEventAt: 0,
     connectedAt: 0,
     reconnectAttempts: 0,
-    revision: 0
+    revision: 0,
+    statusRevision: 0,
+    snapshotsLoadedAt: 0,
+    statusSnapshotsByKey: {} as Record<string, StatusSnapshot>
   }),
   getters: {
     connected(state): boolean {
       return state.status === 'connected'
+    },
+    statusSnapshots(state): StatusSnapshot[] {
+      return Object.values(state.statusSnapshotsByKey)
+    },
+    appInstanceSnapshot(state): (instanceId: string) => StatusSnapshot | undefined {
+      return (instanceId: string) => state.statusSnapshotsByKey[snapshotKey('app.instance', instanceId)]
+    },
+    dockerSummarySnapshot(state): (serverId: string) => StatusSnapshot | undefined {
+      return (serverId: string) => state.statusSnapshotsByKey[snapshotKey('docker.summary', serverId)]
+    },
+    aifarRuntimeSnapshot(state): (instanceId: string) => StatusSnapshot | undefined {
+      return (instanceId: string) => state.statusSnapshotsByKey[snapshotKey('aifar.runtime', instanceId)]
     }
   },
   actions: {
@@ -54,6 +91,7 @@ export const useRealtimeStore = defineStore('realtime', {
         this.connectedAt = Date.now()
         this.reconnectAttempts = 0
         this.error = ''
+        void this.loadStatusSnapshots()
       })
       source.addEventListener('aifar-event', (event) => {
         this.applyEvent(parseRealtimeEvent((event as MessageEvent).data))
@@ -98,15 +136,73 @@ export const useRealtimeStore = defineStore('realtime', {
       this.lastEvent = event
       this.lastEventAt = Date.now()
       this.revision += 1
+      const snapshot = snapshotFromRealtimeEvent(event)
+      if (snapshot) {
+        this.applyStatusSnapshot(snapshot)
+      }
       if (event.taskId && (event.type === 'task.updated' || event.type === 'task.finished')) {
         void useTaskProgressStore().refreshTask(event.taskId)
       }
       if (event.type.startsWith('alert.')) {
         useAlertsStore().applyRealtimeEvent(event)
       }
+    },
+    async loadStatusSnapshots() {
+      const result = await apiGet<{ items?: StatusSnapshot[] } | null>('/status/snapshots').catch(() => ({ items: [] }))
+      const next: Record<string, StatusSnapshot> = {}
+      for (const snapshot of asArray<StatusSnapshot>(result?.items)) {
+        const key = snapshotKey(snapshot.scope, snapshot.resourceId)
+        if (key) {
+          next[key] = normalizeSnapshot(snapshot)
+        }
+      }
+      this.statusSnapshotsByKey = next
+      this.statusRevision += 1
+      this.snapshotsLoadedAt = Date.now()
+    },
+    applyStatusSnapshot(snapshot: StatusSnapshot) {
+      const normalized = normalizeSnapshot(snapshot)
+      const key = snapshotKey(normalized.scope, normalized.resourceId)
+      if (!key) {
+        return
+      }
+      this.statusSnapshotsByKey = {
+        ...this.statusSnapshotsByKey,
+        [key]: normalized
+      }
+      this.statusRevision += 1
     }
   }
 })
+
+export function applyRealtimeStatusToAppInstance<T extends AppInstanceLike>(instance: T, snapshot?: StatusSnapshot): T {
+  if (!snapshot || normalizeString(snapshot.scope) !== 'app.instance') {
+    return instance
+  }
+  const payload = objectRecord(snapshot.payload)
+  const status = normalizeString(snapshot.status || payload.status || instance.status) || instance.status || 'unknown'
+  const checkedAt = stringValue(snapshot.collectedAt || payload.updatedAt || snapshot.updatedAt)
+  const details = objectRecord(payload.details)
+  const metadata = parseMetadata(instance.metadata)
+  const lastCheck = {
+    ...objectRecord(metadata.lastCheck),
+    ...details,
+    status,
+    checkedAt,
+    message: stringValue(payload.message || snapshot.lastError),
+    details
+  }
+  const nextMetadata = {
+    ...metadata,
+    ...details,
+    lastCheck
+  }
+  return {
+    ...instance,
+    status,
+    metadata: JSON.stringify(nextMetadata)
+  }
+}
 
 function parseRealtimeEvent(raw: string) {
   try {
@@ -121,4 +217,70 @@ function clearReconnectTimer() {
     window.clearTimeout(reconnectTimer)
     reconnectTimer = undefined
   }
+}
+
+function snapshotFromRealtimeEvent(event: RealtimeEvent): StatusSnapshot | null {
+  const payload = objectRecord(event.payload)
+  const scope = normalizeString(payload.scope || event.resource)
+  const type = event.type || ''
+  if (!scope || !type.startsWith('status.')) {
+    return null
+  }
+  const resourceId = normalizeString(payload.resourceId || event.resourceId || event.instanceId)
+  if (!resourceId) {
+    return null
+  }
+  return normalizeSnapshot({
+    scope,
+    resourceId,
+    serverId: normalizeString(payload.serverId || event.serverId),
+    status: normalizeString(payload.status || event.status),
+    payload: objectRecord(payload.payload),
+    lastError: stringValue(payload.lastError),
+    version: Number(payload.version || event.version || 0),
+    collectedAt: stringValue(payload.collectedAt || event.collectedAt),
+    updatedAt: stringValue(payload.updatedAt)
+  })
+}
+
+function normalizeSnapshot(snapshot: StatusSnapshot): StatusSnapshot {
+  return {
+    ...snapshot,
+    scope: normalizeString(snapshot.scope),
+    resourceId: normalizeString(snapshot.resourceId),
+    serverId: normalizeString(snapshot.serverId),
+    status: normalizeString(snapshot.status),
+    payload: objectRecord(snapshot.payload),
+    lastError: stringValue(snapshot.lastError)
+  }
+}
+
+function snapshotKey(scope?: string, resourceId?: string) {
+  const normalizedScope = normalizeString(scope)
+  const normalizedResource = normalizeString(resourceId)
+  return normalizedScope && normalizedResource ? `${normalizedScope}:${normalizedResource}` : ''
+}
+
+function parseMetadata(raw?: string) {
+  if (!raw) {
+    return {} as Record<string, unknown>
+  }
+  try {
+    const parsed = JSON.parse(raw)
+    return objectRecord(parsed)
+  } catch {
+    return {} as Record<string, unknown>
+  }
+}
+
+function objectRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {}
+}
+
+function stringValue(value: unknown) {
+  return String(value ?? '').trim()
+}
+
+function normalizeString(value: unknown) {
+  return stringValue(value).toLowerCase() === '<nil>' ? '' : stringValue(value)
 }

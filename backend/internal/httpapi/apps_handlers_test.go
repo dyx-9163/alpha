@@ -4,6 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -108,4 +111,419 @@ func TestRequireExplicitInstallPasswordsRejectsDefaultFallback(t *testing.T) {
 	if err := requireExplicitInstallPasswords("nacos", "en", map[string]any{"nacosPassword": "manual", "dbSource": "manual", "dbPassword": "db-manual"}); err != nil {
 		t.Fatalf("expected nacos explicit passwords to pass: %v", err)
 	}
+}
+
+func TestDeleteAppInstanceStoresPlanBeforeTaskRuns(t *testing.T) {
+	api, db, secret := newAuthzTestAPI(t)
+	module := &fakePlannedLifecycleModule{name: "demo"}
+	api.apps = registry.New(module)
+	server, err := db.SaveServer(store.Server{Name: "demo-1", Host: "10.0.0.9", Username: "root", Password: "server-pass"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	instance, err := db.SaveAppInstance(store.AppInstance{App: "demo", Version: "1.0.0", ServerID: server.ID, Status: "installed"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := issueTestToken(t, db, secret, "owner", "owner")
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v2/apps/instances/"+instance.ID+"/delete", strings.NewReader(`{"serverPassword":"server-pass"}`))
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	api.Router().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	taskID := decodeTaskID(t, rec)
+	steps, err := db.ListTaskSteps(taskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(steps) != 1 || steps[0].Target != server.ID || steps[0].Name != "delete" || steps[0].Status != "pending" {
+		t.Fatalf("expected pre-stored delete plan step, got %+v", steps)
+	}
+	targets, err := db.ListTaskTargets(taskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(targets) != 1 || targets[0].Target != server.ID || targets[0].Status != "pending" {
+		t.Fatalf("expected pre-stored delete target, got %+v", targets)
+	}
+	waitForTaskStatus(t, db, taskID, "success")
+	if module.deleteCalls != 1 {
+		t.Fatalf("expected delete module call, got %d", module.deleteCalls)
+	}
+}
+
+func TestCheckAppInstanceStoresPlanBeforeTaskRuns(t *testing.T) {
+	api, db, secret := newAuthzTestAPI(t)
+	module := &fakePlannedLifecycleModule{name: "demo"}
+	api.apps = registry.New(module)
+	server, err := db.SaveServer(store.Server{Name: "demo-1", Host: "10.0.0.9", Username: "root"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	instance, err := db.SaveAppInstance(store.AppInstance{App: "demo", Version: "1.0.0", ServerID: server.ID, Status: "installed"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := issueTestToken(t, db, secret, "owner", "owner")
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v2/apps/instances/"+instance.ID+"/check", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	rec := httptest.NewRecorder()
+
+	api.Router().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	taskID := decodeTaskID(t, rec)
+	steps, err := db.ListTaskSteps(taskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(steps) != 1 || steps[0].Target != server.ID || steps[0].Name != "check" || steps[0].Status != "pending" {
+		t.Fatalf("expected pre-stored check plan step, got %+v", steps)
+	}
+	waitForTaskStatus(t, db, taskID, "success")
+	if module.checkCalls != 1 {
+		t.Fatalf("expected check module call, got %d", module.checkCalls)
+	}
+}
+
+func TestInstallAppRejectsConcurrentMutationLock(t *testing.T) {
+	api, db, secret := newAuthzTestAPI(t)
+	module := &fakePlannedLifecycleModule{
+		name:           "demo",
+		installStarted: make(chan struct{}, 1),
+		installRelease: make(chan struct{}),
+	}
+	api.apps = registry.New(module)
+	server, err := db.SaveServer(store.Server{Name: "demo-1", Host: "10.0.0.9", Username: "root"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.UpsertResource(store.Resource{App: "demo", Part: "backend", Version: "1.0.0", Path: "resources/demo/1.0.0"}); err != nil {
+		t.Fatal(err)
+	}
+	token := issueTestToken(t, db, secret, "owner", "owner")
+	body := `{"serverId":"` + server.ID + `","version":"1.0.0"}`
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v2/apps/demo/install", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	api.Router().ServeHTTP(rec, req)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("expected first install to be accepted, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	taskID := decodeTaskID(t, rec)
+	released := false
+	defer func() {
+		if !released {
+			close(module.installRelease)
+		}
+	}()
+
+	select {
+	case <-module.installStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for install task to start")
+	}
+	locks, err := db.ListOperationLocks("app-target", "demo:"+server.ID, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(locks) != 1 || locks[0].OwnerTaskID != taskID || locks[0].Operation != "mutate" {
+		t.Fatalf("expected active install mutation lock, got %+v", locks)
+	}
+
+	req2 := httptest.NewRequest(http.MethodPost, "/api/v2/apps/demo/install", strings.NewReader(body))
+	req2.Header.Set("Authorization", "Bearer "+token)
+	req2.Header.Set("Content-Type", "application/json")
+	rec2 := httptest.NewRecorder()
+	api.Router().ServeHTTP(rec2, req2)
+	if rec2.Code != http.StatusConflict {
+		t.Fatalf("expected concurrent install to be rejected, got %d body=%s", rec2.Code, rec2.Body.String())
+	}
+
+	close(module.installRelease)
+	released = true
+	waitForTaskStatus(t, db, taskID, "success")
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		active, err := db.ListOperationLocks("app-target", "demo:"+server.ID, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(active) == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("expected operation lock to be released, got %+v", active)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func TestStartMySQLClusterStoresPlanBeforeTaskRuns(t *testing.T) {
+	api, db, secret := newAuthzTestAPI(t)
+	module := &fakePlannedLifecycleModule{name: "mysql"}
+	api.apps = registry.New(module)
+	server1, err := db.SaveServer(store.Server{Name: "mysql-1", Host: "10.0.0.1", Username: "root"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server2, err := db.SaveServer(store.Server{Name: "mysql-2", Host: "10.0.0.2", Username: "root"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	instance1, err := db.SaveAppInstance(store.AppInstance{App: "mysql", Version: "8.0.36", ServerID: server1.ID, Status: "installed", Topology: "innodb-cluster", Metadata: `{"clusterId":"cluster-a"}`})
+	if err != nil {
+		t.Fatal(err)
+	}
+	instance2, err := db.SaveAppInstance(store.AppInstance{App: "mysql", Version: "8.0.36", ServerID: server2.ID, Status: "installed", Topology: "innodb-cluster", Metadata: `{"clusterId":"cluster-a"}`})
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := issueTestToken(t, db, secret, "owner", "owner")
+
+	body := `{"instanceIds":["` + instance1.ID + `","` + instance2.ID + `"]}`
+	req := httptest.NewRequest(http.MethodPost, "/api/v2/database/mysql/clusters/start", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	api.Router().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	taskID := decodeTaskID(t, rec)
+	steps, err := db.ListTaskSteps(taskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(steps) != 2 || steps[0].Name != "cluster-start" || steps[1].Name != "cluster-start" {
+		t.Fatalf("expected pre-stored cluster plan steps, got %+v", steps)
+	}
+	waitForTaskStatus(t, db, taskID, "success")
+	if module.clusterStartCalls != 1 {
+		t.Fatalf("expected cluster start module call, got %d", module.clusterStartCalls)
+	}
+}
+
+func TestInstallPostHookRecordsCredentialReferencesAndClusterMembers(t *testing.T) {
+	api, db, secret := newAuthzTestAPI(t)
+	server, err := db.SaveServer(store.Server{Name: "redis-1", Host: "10.0.0.8", Username: "root"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	instance, err := db.SaveAppInstance(store.AppInstance{
+		App:      "redis",
+		Version:  "7.2.14",
+		ServerID: server.ID,
+		Status:   "installed",
+		Topology: "sentinel",
+		Metadata: `{"replicationGroupId":"redis-prod","role":"master","endpoint":"10.0.0.8:6379"}`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	credential, err := db.SaveCredential(store.Credential{Name: "redis-admin", Kind: "redis", Secret: map[string]string{"password": "secret"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	api.bindInstallCredentialReferences("redis", registry.InstallRequest{
+		App:       "redis",
+		Version:   "7.2.14",
+		Topology:  "sentinel",
+		ServerIDs: []string{server.ID},
+		Actor:     "admin",
+		Parameters: map[string]any{
+			"redisCredentialId": credential.ID,
+		},
+	}, nil)
+
+	refs, err := db.ListCredentialReferences(credential.ID, "app-instance", instance.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(refs) != 1 || refs[0].Purpose != "redis" || refs[0].Generated {
+		t.Fatalf("expected selected credential reference, got %+v", refs)
+	}
+	clusters, err := db.ListAppClusters("redis")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(clusters) != 1 || clusters[0].Name != "redis-prod" || clusters[0].Topology != "sentinel" {
+		t.Fatalf("expected redis cluster record, got %+v", clusters)
+	}
+	members, err := db.ListAppClusterMembers(clusters[0].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(members) != 1 || members[0].InstanceID != instance.ID || members[0].Role != "master" {
+		t.Fatalf("expected redis cluster member, got %+v", members)
+	}
+
+	token := issueTestToken(t, db, secret, "owner", "owner")
+	req := httptest.NewRequest(http.MethodGet, "/api/v2/credentials/"+credential.ID+"/references", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	rec := httptest.NewRecorder()
+	api.Router().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected references response 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	var body struct {
+		Items []store.CredentialReference `json:"items"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if len(body.Items) != 1 || body.Items[0].ResourceID != instance.ID {
+		t.Fatalf("unexpected references body: %+v", body)
+	}
+}
+
+func TestInstallPostHookRecordsGeneratedCredentialReference(t *testing.T) {
+	api, db, _ := newAuthzTestAPI(t)
+	server, err := db.SaveServer(store.Server{Name: "minio-1", Host: "10.0.0.9", Username: "root"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	instance, err := db.SaveAppInstance(store.AppInstance{
+		App:      "minio",
+		Version:  "2025",
+		ServerID: server.ID,
+		Status:   "installed",
+		Topology: "standalone",
+		Metadata: `{"apiPort":9000,"endpoint":"http://10.0.0.9:9000"}`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	api.bindInstallCredentialReferences("minio", registry.InstallRequest{
+		App:       "minio",
+		Version:   "2025",
+		Topology:  "standalone",
+		ServerIDs: []string{server.ID},
+		Actor:     "admin",
+		Parameters: map[string]any{
+			"rootUser":     "admin",
+			"rootPassword": "manual-secret",
+			"apiPort":      9000,
+		},
+	}, nil)
+
+	credentials, err := db.ListCredentials(store.CredentialQuery{Kind: "minio"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(credentials) != 1 || credentials[0].AppInstanceID != instance.ID {
+		t.Fatalf("expected generated minio credential, got %+v", credentials)
+	}
+	refs, err := db.ListCredentialReferences(credentials[0].ID, "app-instance", instance.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(refs) != 1 || !refs[0].Generated || refs[0].LifecyclePolicy != "delete-with-resource" {
+		t.Fatalf("expected generated credential reference, got %+v", refs)
+	}
+}
+
+func decodeTaskID(t *testing.T, rec *httptest.ResponseRecorder) string {
+	t.Helper()
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	taskID, _ := body["taskId"].(string)
+	if taskID == "" {
+		t.Fatalf("expected taskId in response: %+v", body)
+	}
+	return taskID
+}
+
+type fakePlannedLifecycleModule struct {
+	name              string
+	deleteCalls       int
+	checkCalls        int
+	installCalls      int
+	clusterStartCalls int
+	installStarted    chan struct{}
+	installRelease    chan struct{}
+}
+
+func (m *fakePlannedLifecycleModule) Name() string { return m.name }
+
+func (m *fakePlannedLifecycleModule) Manifest(lang string) registry.Manifest {
+	return registry.Manifest{Name: m.name, BackendReady: true}
+}
+
+func (m *fakePlannedLifecycleModule) PreflightInstall(ctx context.Context, req registry.InstallRequest, resources []store.Resource) (registry.PreflightResult, error) {
+	return registry.PreflightResult{}, nil
+}
+
+func (m *fakePlannedLifecycleModule) PlanInstall(ctx context.Context, req registry.InstallRequest, resources []store.Resource) ([]registry.InstallStepPlan, error) {
+	return nil, nil
+}
+
+func (m *fakePlannedLifecycleModule) ValidateInstall(ctx context.Context, req registry.InstallRequest, resources []store.Resource) error {
+	return nil
+}
+
+func (m *fakePlannedLifecycleModule) Install(ctx context.Context, req registry.InstallRequest, run registry.RunContext) error {
+	m.installCalls++
+	if m.installStarted != nil {
+		select {
+		case m.installStarted <- struct{}{}:
+		default:
+		}
+	}
+	if m.installRelease != nil {
+		select {
+		case <-m.installRelease:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return nil
+}
+
+func (m *fakePlannedLifecycleModule) PlanDelete(ctx context.Context, req registry.DeleteRequest) ([]registry.InstallStepPlan, error) {
+	return []registry.InstallStepPlan{{Target: req.Server.ID, Name: "delete", Title: "Delete demo", Order: 1}}, nil
+}
+
+func (m *fakePlannedLifecycleModule) Delete(ctx context.Context, req registry.DeleteRequest, run registry.RunContext) error {
+	m.deleteCalls++
+	return nil
+}
+
+func (m *fakePlannedLifecycleModule) PlanCheck(ctx context.Context, req registry.CheckRequest) ([]registry.InstallStepPlan, error) {
+	return []registry.InstallStepPlan{{Target: req.Server.ID, Name: "check", Title: "Check demo", Order: 1}}, nil
+}
+
+func (m *fakePlannedLifecycleModule) Check(ctx context.Context, req registry.CheckRequest, run registry.RunContext) (registry.InstanceStatus, error) {
+	m.checkCalls++
+	return registry.InstanceStatus{Status: "healthy"}, nil
+}
+
+func (m *fakePlannedLifecycleModule) PlanClusterStart(ctx context.Context, req registry.ClusterStartRequest) ([]registry.InstallStepPlan, error) {
+	steps := make([]registry.InstallStepPlan, 0, len(req.Servers))
+	for index, server := range req.Servers {
+		steps = append(steps, registry.InstallStepPlan{Target: server.ID, Name: "cluster-start", Title: "Start cluster", Order: index + 1})
+	}
+	return steps, nil
+}
+
+func (m *fakePlannedLifecycleModule) StartCluster(ctx context.Context, req registry.ClusterStartRequest, run registry.RunContext) error {
+	m.clusterStartCalls++
+	return nil
 }

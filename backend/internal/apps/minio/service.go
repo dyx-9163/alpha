@@ -9,6 +9,7 @@ import (
 
 	"aifar-deployment/backend/internal/apps/deleteflow"
 	"aifar-deployment/backend/internal/installer/installerkit"
+	"aifar-deployment/backend/internal/installflow"
 	"aifar-deployment/backend/internal/store"
 	"aifar-deployment/backend/internal/taskrun"
 )
@@ -42,19 +43,11 @@ type Service struct {
 	remote Remote
 }
 
-type stepDef struct {
-	Name  string
-	Title string
-}
+type stepDef = installflow.Step
 
 type targetLogger func(target string) Logger
 
-type stepRecorder interface {
-	StartTarget(target string)
-	FinishTarget(target, status, errText string)
-	StartStep(target, name, title string, order int)
-	FinishStep(target, name, status, errText string)
-}
+type stepRecorder = installflow.Recorder
 
 func NewService(s Store, remote Remote) Service {
 	return Service{store: s, remote: remote}
@@ -94,9 +87,7 @@ func (s Service) Install(ctx context.Context, req InstallRequest, resources []st
 	target := targets[0]
 	logForServer := logForTarget(log, targetLog, target)
 	recorder, _ := log.(stepRecorder)
-	if recorder != nil {
-		recorder.StartTarget(target)
-	}
+	installflow.StartTarget(recorder, target)
 	step := newStepRunner(logForServer, recorder, target, copy)
 	var server store.Server
 	if err := step(1, "load-server", copy.LoadServer, func() error {
@@ -223,9 +214,7 @@ func (s Service) installDistributed(ctx context.Context, req InstallRequest, res
 	dataDirs := make([][]string, len(targets))
 	failures := taskrun.RunTargets(ctx, targets, req.Concurrency, func(target string) error {
 		logForServer := logForTarget(log, targetLog, target)
-		if recorder != nil {
-			recorder.StartTarget(target)
-		}
+		installflow.StartTarget(recorder, target)
 		step := newStepRunnerWithSteps(logForServer, recorder, target, copy, steps)
 		server := preloadedServers[target]
 		if err := step(1, "load-server", copy.LoadServer, func() error {
@@ -412,9 +401,7 @@ func (s Service) installBucketReplication(ctx context.Context, req InstallReques
 	dataDirs := make([][]string, len(targets))
 	failures := taskrun.RunTargets(ctx, targets, req.Concurrency, func(target string) error {
 		logForServer := logForTarget(log, targetLog, target)
-		if recorder != nil {
-			recorder.StartTarget(target)
-		}
+		installflow.StartTarget(recorder, target)
 		step := newStepRunnerWithSteps(logForServer, recorder, target, copy, steps)
 		server := preloadedServers[target]
 		if err := step(1, "load-server", copy.LoadServer, func() error {
@@ -667,23 +654,19 @@ func newStepRunner(log Logger, recorder stepRecorder, target string, copy Copy) 
 }
 
 func newStepRunnerWithSteps(log Logger, recorder stepRecorder, target string, copy Copy, steps []stepDef) func(stepIndex int, stepName, label string, fn func() error) error {
+	runner := installflow.Runner{
+		Log:      log,
+		Recorder: recorder,
+		Target:   target,
+		Steps:    steps,
+		Messages: installflow.Messages{
+			StepStart:  copy.StepStart,
+			StepDone:   copy.StepDone,
+			StepFailed: copy.StepFailed,
+		},
+	}
 	return func(stepIndex int, stepName, label string, fn func() error) error {
-		if recorder != nil {
-			recorder.StartStep(target, stepName, label, stepIndex)
-		}
-		log.Info(copy.StepStart, stepIndex, len(steps), label)
-		if err := fn(); err != nil {
-			log.Error(copy.StepFailed, stepIndex, len(steps), label, err)
-			if recorder != nil {
-				recorder.FinishStep(target, stepName, "failed", err.Error())
-			}
-			return err
-		}
-		log.Info(copy.StepDone, stepIndex, len(steps), label)
-		if recorder != nil {
-			recorder.FinishStep(target, stepName, "success", "")
-		}
-		return nil
+		return runner.Run(stepIndex, stepName, label, fn)
 	}
 }
 
@@ -698,10 +681,7 @@ func logForTarget(fallback Logger, targetLog targetLogger, target string) Logger
 }
 
 func finishTarget(recorder stepRecorder, target, status, errText string) {
-	if recorder == nil {
-		return
-	}
-	recorder.FinishTarget(target, status, errText)
+	installflow.FinishTarget(recorder, target, status, errText)
 }
 
 func firstString(values []string) string {

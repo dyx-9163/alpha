@@ -6,13 +6,14 @@ import (
 
 	"aifar-deployment/backend/internal/i18n"
 	"aifar-deployment/backend/internal/store"
+	"aifar-deployment/backend/internal/taskmeta"
 
 	"github.com/go-chi/chi/v5"
 )
 
 func (a *API) listTasks(w http.ResponseWriter, r *http.Request) {
 	out, err := a.store.ListTasks()
-	respond(w, out, err)
+	respond(w, decorateTasks(out), err)
 }
 
 func (a *API) getTask(w http.ResponseWriter, r *http.Request) {
@@ -31,7 +32,22 @@ func (a *API) getTask(w http.ResponseWriter, r *http.Request) {
 		respond(w, nil, stepsErr)
 		return
 	}
-	respond(w, map[string]any{"task": task, "logs": logs, "targets": targets, "steps": steps}, nil)
+	respond(w, map[string]any{"task": decorateTask(task), "logs": logs, "targets": targets, "steps": steps}, nil)
+}
+
+func decorateTasks(tasks []store.Task) []store.Task {
+	out := make([]store.Task, 0, len(tasks))
+	for _, task := range tasks {
+		out = append(out, decorateTask(task))
+	}
+	return out
+}
+
+func decorateTask(task store.Task) store.Task {
+	desc := taskmeta.Describe(task.Type)
+	task.Category = desc.Category
+	task.Trackable = desc.Trackable
+	return task
 }
 
 func (a *API) taskEvents(w http.ResponseWriter, r *http.Request) {

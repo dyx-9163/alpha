@@ -9,7 +9,6 @@ import (
 	"aifar-deployment/backend/internal/apps/registry"
 	"aifar-deployment/backend/internal/i18n"
 	"aifar-deployment/backend/internal/store"
-	"aifar-deployment/backend/internal/taskplan"
 	"aifar-deployment/backend/internal/worker"
 
 	"github.com/go-chi/chi/v5"
@@ -124,9 +123,12 @@ func (a *API) rollbackAIFARRelease(w http.ResponseWriter, r *http.Request) {
 		respondTask(w, task, err)
 		return
 	}
-	if err := taskplan.StorePlan(a.store, task.ID, installPlanSteps(plan)); err != nil {
-		_ = a.store.DeleteTask(task.ID)
+	if err := a.storeInstallPlanOrDelete(task.ID, plan); err != nil {
 		writeError(w, http.StatusInternalServerError, "ARTIFACT_ROLLBACK_PLAN_STORE_FAILED", err.Error(), map[string]any{"app": instance.App, "releaseId": req.TargetReleaseID})
+		return
+	}
+	locks, ok := a.acquireTaskOperationLocks(w, lang, task, appInstanceOperationLockSpecs("artifact-rollback", []store.AppInstance{instance}))
+	if !ok {
 		return
 	}
 	task, err = a.tasks.StartExistingWithLanguage(task, lang, func(ctx context.Context, log worker.Logger) error {
@@ -143,6 +145,9 @@ func (a *API) rollbackAIFARRelease(w http.ResponseWriter, r *http.Request) {
 		log.Info(i18n.Text(lang, "api.artifactRollbackCompleted"), instance.App, instance.ID, req.TargetReleaseID)
 		return nil
 	})
+	if err != nil {
+		a.releaseOperationLocks(locks)
+	}
 	if err == nil {
 		a.audit(r, taskType, target, "running", task.ID)
 	}

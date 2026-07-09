@@ -54,7 +54,7 @@ func Load() Config {
 		MaxRequestBodyBytes:   getenvInt64("AIFAR_MAX_REQUEST_BODY_BYTES", 4<<30),
 		AuditRetentionDays:    getenvInt("AIFAR_AUDIT_RETENTION_DAYS", 180),
 		TaskRetentionDays:     getenvInt("AIFAR_TASK_RETENTION_DAYS", 90),
-		CollectorIntervalSecs: getenvInt("AIFAR_COLLECTOR_INTERVAL_SECONDS", 30),
+		CollectorIntervalSecs: getenvInt("AIFAR_COLLECTOR_INTERVAL_SECONDS", 15),
 	}
 	return cfg
 }

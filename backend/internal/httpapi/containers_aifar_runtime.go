@@ -237,7 +237,50 @@ type aifarRuntimeConfigApplyRequest struct {
 	NacosEphemeral *bool                                   `json:"nacosEphemeral,omitempty"`
 }
 
-func (a *API) aifarRuntime(w http.ResponseWriter, r *http.Request) {
+func aifarRuntimeCleanupSteps() []simpleTaskStep {
+	return []simpleTaskStep{
+		{"validate-runtime-cleanup", "validate AIFAR runtime cleanup"},
+		{"scan-pod-containers", "scan existing AIFAR Pod containers"},
+		{"prune-control-plane", "prune stale AIFAR Pod control-plane records"},
+	}
+}
+
+func aifarRuntimeAgentUninstallSteps() []simpleTaskStep {
+	return []simpleTaskStep{
+		{"validate-agent-uninstall", "validate AIFAR agent uninstall"},
+		{"remove-agent-runtime", "deregister Nacos proxies and remove aifar-agent"},
+		{"record-agent-uninstall", "record AIFAR agent uninstall"},
+	}
+}
+
+func aifarRuntimeConfigSteps() []simpleTaskStep {
+	return []simpleTaskStep{
+		{"save-desired-config", "save desired runtime config"},
+		{"render-config", "render runtime config script"},
+		{"apply-runtime-config", "apply Docker resources and JVM options"},
+		{"record-applied-config", "record runtime config status"},
+	}
+}
+
+func aifarRuntimeServiceInstallSteps() []simpleTaskStep {
+	return []simpleTaskStep{
+		{"validate-service-install", "validate AIFAR service installation"},
+		{"render-service-install", "render AIFAR service install script"},
+		{"apply-service-install", "build and start missing AIFAR services"},
+		{"record-service-install", "record AIFAR service control plane"},
+	}
+}
+
+func aifarRuntimeScaleSteps() []simpleTaskStep {
+	return []simpleTaskStep{
+		{"validate-service", "validate AIFAR service scale request"},
+		{"render-scale-spec", "render AIFAR runtime scale script"},
+		{"apply-scale", "apply desired replicas through aifar-agent"},
+		{"record-scale", "record AIFAR scale result"},
+	}
+}
+
+func (a *aifarRuntimeController) runtime(w http.ResponseWriter, r *http.Request) {
 	lang := languageFromRequest(r)
 	server, useServer, err := a.dockerServerFromRequest(r)
 	if err != nil {
@@ -255,7 +298,7 @@ func (a *API) aifarRuntime(w http.ResponseWriter, r *http.Request) {
 	respond(w, response, err)
 }
 
-func (a *API) aifarRuntimeLogs(w http.ResponseWriter, r *http.Request) {
+func (a *aifarRuntimeController) logs(w http.ResponseWriter, r *http.Request) {
 	server, instance, query, ok := a.resolveAIFARRuntimeLogQuery(w, r)
 	if !ok {
 		return
@@ -264,7 +307,7 @@ func (a *API) aifarRuntimeLogs(w http.ResponseWriter, r *http.Request) {
 	respond(w, response, err)
 }
 
-func (a *API) aifarRuntimeLogsEvents(w http.ResponseWriter, r *http.Request) {
+func (a *aifarRuntimeController) logEvents(w http.ResponseWriter, r *http.Request) {
 	server, instance, query, ok := a.resolveAIFARRuntimeLogQuery(w, r)
 	if !ok {
 		return
@@ -575,9 +618,9 @@ func runtimeLogPodResponse(pod store.AIFARPod, logs []string) aifarRuntimeLogPod
 	}
 }
 
-func (a *API) aifarRuntimeReconcile(w http.ResponseWriter, r *http.Request) {
+func (a *aifarRuntimeController) reconcile(w http.ResponseWriter, r *http.Request) {
 	lang := languageFromRequest(r)
-	_, instance, ok := a.resolveAIFARRuntimeActionTarget(w, r)
+	server, instance, ok := a.resolveAIFARRuntimeActionTarget(w, r)
 	if !ok {
 		return
 	}
@@ -592,7 +635,7 @@ func (a *API) aifarRuntimeReconcile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	actor := currentUser(r).Username
-	task, err := a.tasks.StartWithLanguage("aifar.reconcile", instance.ID, actor, lang, func(ctx context.Context, log worker.Logger) error {
+	task, err, started := a.startSimplePlannedTask(w, "aifar.reconcile", instance.ID, actor, lang, server.ID, nil, func(ctx context.Context, log worker.Logger) error {
 		current, err := a.store.GetAppInstance(instance.ID)
 		if err != nil {
 			return err
@@ -616,13 +659,16 @@ func (a *API) aifarRuntimeReconcile(w http.ResponseWriter, r *http.Request) {
 			},
 		})
 	})
+	if !started {
+		return
+	}
 	if err == nil {
 		a.audit(r, "aifar.reconcile", instance.ID, "running", task.ID)
 	}
 	respondTask(w, task, err)
 }
 
-func (a *API) aifarRuntimeCleanupStale(w http.ResponseWriter, r *http.Request) {
+func (a *aifarRuntimeController) cleanupStale(w http.ResponseWriter, r *http.Request) {
 	lang := languageFromRequest(r)
 	req := aifarRuntimeActionRequest{}
 	if r.Body != nil && r.ContentLength != 0 {
@@ -630,7 +676,7 @@ func (a *API) aifarRuntimeCleanupStale(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	_, instance, ok := a.resolveAIFARRuntimeActionTargetForInstanceWithAgent(w, r, req.InstanceID, false)
+	server, instance, ok := a.resolveAIFARRuntimeActionTargetForInstanceWithAgent(w, r, req.InstanceID, false)
 	if !ok {
 		return
 	}
@@ -645,7 +691,7 @@ func (a *API) aifarRuntimeCleanupStale(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	actor := currentUser(r).Username
-	task, err := a.tasks.StartWithLanguage("aifar.runtime.cleanup", instance.ID, actor, lang, func(ctx context.Context, log worker.Logger) error {
+	task, err, started := a.startSimplePlannedTask(w, "aifar.runtime.cleanup", instance.ID, actor, lang, server.ID, aifarRuntimeCleanupSteps(), func(ctx context.Context, log worker.Logger) error {
 		current, err := a.store.GetAppInstance(instance.ID)
 		if err != nil {
 			return err
@@ -669,13 +715,16 @@ func (a *API) aifarRuntimeCleanupStale(w http.ResponseWriter, r *http.Request) {
 			},
 		})
 	})
+	if !started {
+		return
+	}
 	if err == nil {
 		a.audit(r, "aifar.runtime.cleanup", instance.ID, "running", task.ID)
 	}
 	respondTask(w, task, err)
 }
 
-func (a *API) aifarRuntimeUninstallAgent(w http.ResponseWriter, r *http.Request) {
+func (a *aifarRuntimeController) uninstallAgent(w http.ResponseWriter, r *http.Request) {
 	lang := languageFromRequest(r)
 	req := aifarRuntimeActionRequest{}
 	if r.Body != nil && r.ContentLength != 0 {
@@ -683,7 +732,7 @@ func (a *API) aifarRuntimeUninstallAgent(w http.ResponseWriter, r *http.Request)
 			return
 		}
 	}
-	_, instance, ok := a.resolveAIFARRuntimeActionTargetForInstanceWithAgent(w, r, req.InstanceID, false)
+	server, instance, ok := a.resolveAIFARRuntimeActionTargetForInstanceWithAgent(w, r, req.InstanceID, false)
 	if !ok {
 		return
 	}
@@ -698,7 +747,7 @@ func (a *API) aifarRuntimeUninstallAgent(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	actor := currentUser(r).Username
-	task, err := a.tasks.StartWithLanguage("aifar.agent.uninstall", instance.ID, actor, lang, func(ctx context.Context, log worker.Logger) error {
+	task, err, started := a.startSimplePlannedTask(w, "aifar.agent.uninstall", instance.ID, actor, lang, server.ID, aifarRuntimeAgentUninstallSteps(), func(ctx context.Context, log worker.Logger) error {
 		current, err := a.store.GetAppInstance(instance.ID)
 		if err != nil {
 			return err
@@ -722,13 +771,16 @@ func (a *API) aifarRuntimeUninstallAgent(w http.ResponseWriter, r *http.Request)
 			},
 		})
 	})
+	if !started {
+		return
+	}
 	if err == nil {
 		a.audit(r, "aifar.agent.uninstall", instance.ID, "running", task.ID)
 	}
 	respondTask(w, task, err)
 }
 
-func (a *API) aifarRuntimeConfig(w http.ResponseWriter, r *http.Request) {
+func (a *aifarRuntimeController) configure(w http.ResponseWriter, r *http.Request) {
 	lang := languageFromRequest(r)
 	req := aifarRuntimeConfigApplyRequest{}
 	if !decode(w, r, &req) {
@@ -765,7 +817,7 @@ func (a *API) aifarRuntimeConfig(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "AIFAR_RUNTIME_CONFIG_INVALID", err.Error(), nil)
 		return
 	}
-	task, err := a.tasks.StartWithLanguage("aifar.runtime.config", instance.ID, actor, lang, func(ctx context.Context, log worker.Logger) error {
+	task, err, started := a.startSimplePlannedTask(w, "aifar.runtime.config", instance.ID, actor, lang, server.ID, aifarRuntimeConfigSteps(), func(ctx context.Context, log worker.Logger) error {
 		current, err := a.store.GetAppInstance(instance.ID)
 		if err != nil {
 			return err
@@ -794,13 +846,16 @@ func (a *API) aifarRuntimeConfig(w http.ResponseWriter, r *http.Request) {
 			},
 		})
 	})
+	if !started {
+		return
+	}
 	if err == nil {
 		a.audit(r, "aifar.runtime.config", instance.ID, "running", task.ID)
 	}
 	respondTask(w, task, err)
 }
 
-func (a *API) aifarRuntimeInstallServices(w http.ResponseWriter, r *http.Request) {
+func (a *aifarRuntimeController) installServices(w http.ResponseWriter, r *http.Request) {
 	lang := languageFromRequest(r)
 	req := aifarRuntimeServiceInstallRequest{}
 	if !decode(w, r, &req) {
@@ -827,7 +882,12 @@ func (a *API) aifarRuntimeInstallServices(w http.ResponseWriter, r *http.Request
 	actor := currentUser(r).Username
 	services := append([]string(nil), req.Services...)
 	target := instance.ID + ":" + strings.Join(services, ",")
-	task, err := a.tasks.StartWithLanguage("aifar.services.install", target, actor, lang, func(ctx context.Context, log worker.Logger) error {
+	server, err := a.store.GetServer(instance.ServerID, true)
+	if err != nil {
+		respond(w, nil, err)
+		return
+	}
+	task, err, started := a.startSimplePlannedTask(w, "aifar.services.install", target, actor, lang, server.ID, aifarRuntimeServiceInstallSteps(), func(ctx context.Context, log worker.Logger) error {
 		current, err := a.store.GetAppInstance(instance.ID)
 		if err != nil {
 			return err
@@ -852,20 +912,23 @@ func (a *API) aifarRuntimeInstallServices(w http.ResponseWriter, r *http.Request
 			},
 		})
 	})
+	if !started {
+		return
+	}
 	if err == nil {
 		a.audit(r, "aifar.services.install", target, "running", task.ID)
 	}
 	respondTask(w, task, err)
 }
 
-func (a *API) aifarRuntimeScaleOut(w http.ResponseWriter, r *http.Request) {
+func (a *aifarRuntimeController) scaleOut(w http.ResponseWriter, r *http.Request) {
 	lang := languageFromRequest(r)
 	service := strings.TrimSpace(chi.URLParam(r, "service"))
 	if service == "" {
 		writeError(w, http.StatusBadRequest, "AIFAR_SERVICE_REQUIRED", "AIFAR service is required", nil)
 		return
 	}
-	_, instance, ok := a.resolveAIFARRuntimeActionTarget(w, r)
+	server, instance, ok := a.resolveAIFARRuntimeActionTarget(w, r)
 	if !ok {
 		return
 	}
@@ -881,7 +944,7 @@ func (a *API) aifarRuntimeScaleOut(w http.ResponseWriter, r *http.Request) {
 	}
 	actor := currentUser(r).Username
 	target := instance.ID + ":" + service
-	task, err := a.tasks.StartWithLanguage("aifar.scale.out", target, actor, lang, func(ctx context.Context, log worker.Logger) error {
+	task, err, started := a.startSimplePlannedTask(w, "aifar.scale.out", target, actor, lang, server.ID, aifarRuntimeScaleSteps(), func(ctx context.Context, log worker.Logger) error {
 		current, err := a.store.GetAppInstance(instance.ID)
 		if err != nil {
 			return err
@@ -906,20 +969,23 @@ func (a *API) aifarRuntimeScaleOut(w http.ResponseWriter, r *http.Request) {
 			},
 		})
 	})
+	if !started {
+		return
+	}
 	if err == nil {
 		a.audit(r, "aifar.scale.out", target, "running", task.ID)
 	}
 	respondTask(w, task, err)
 }
 
-func (a *API) aifarRuntimeScaleIn(w http.ResponseWriter, r *http.Request) {
+func (a *aifarRuntimeController) scaleIn(w http.ResponseWriter, r *http.Request) {
 	lang := languageFromRequest(r)
 	service := strings.TrimSpace(chi.URLParam(r, "service"))
 	if service == "" {
 		writeError(w, http.StatusBadRequest, "AIFAR_SERVICE_REQUIRED", "AIFAR service is required", nil)
 		return
 	}
-	_, instance, ok := a.resolveAIFARRuntimeActionTarget(w, r)
+	server, instance, ok := a.resolveAIFARRuntimeActionTarget(w, r)
 	if !ok {
 		return
 	}
@@ -935,7 +1001,7 @@ func (a *API) aifarRuntimeScaleIn(w http.ResponseWriter, r *http.Request) {
 	}
 	actor := currentUser(r).Username
 	target := instance.ID + ":" + service
-	task, err := a.tasks.StartWithLanguage("aifar.scale.in", target, actor, lang, func(ctx context.Context, log worker.Logger) error {
+	task, err, started := a.startSimplePlannedTask(w, "aifar.scale.in", target, actor, lang, server.ID, aifarRuntimeScaleSteps(), func(ctx context.Context, log worker.Logger) error {
 		current, err := a.store.GetAppInstance(instance.ID)
 		if err != nil {
 			return err
@@ -969,20 +1035,23 @@ func (a *API) aifarRuntimeScaleIn(w http.ResponseWriter, r *http.Request) {
 			},
 		})
 	})
+	if !started {
+		return
+	}
 	if err == nil {
 		a.audit(r, "aifar.scale.in", target, "running", task.ID)
 	}
 	respondTask(w, task, err)
 }
 
-func (a *API) aifarRuntimeOfflineService(w http.ResponseWriter, r *http.Request) {
+func (a *aifarRuntimeController) offlineService(w http.ResponseWriter, r *http.Request) {
 	lang := languageFromRequest(r)
 	service := strings.TrimSpace(chi.URLParam(r, "service"))
 	if service == "" {
 		writeError(w, http.StatusBadRequest, "AIFAR_SERVICE_REQUIRED", "AIFAR service is required", nil)
 		return
 	}
-	_, instance, ok := a.resolveAIFARRuntimeActionTarget(w, r)
+	server, instance, ok := a.resolveAIFARRuntimeActionTarget(w, r)
 	if !ok {
 		return
 	}
@@ -998,7 +1067,7 @@ func (a *API) aifarRuntimeOfflineService(w http.ResponseWriter, r *http.Request)
 	}
 	actor := currentUser(r).Username
 	target := instance.ID + ":" + service
-	task, err := a.tasks.StartWithLanguage("aifar.scale.offline", target, actor, lang, func(ctx context.Context, log worker.Logger) error {
+	task, err, started := a.startSimplePlannedTask(w, "aifar.scale.offline", target, actor, lang, server.ID, aifarRuntimeScaleSteps(), func(ctx context.Context, log worker.Logger) error {
 		current, err := a.store.GetAppInstance(instance.ID)
 		if err != nil {
 			return err
@@ -1024,6 +1093,9 @@ func (a *API) aifarRuntimeOfflineService(w http.ResponseWriter, r *http.Request)
 			},
 		})
 	})
+	if !started {
+		return
+	}
 	if err == nil {
 		a.audit(r, "aifar.scale.offline", target, "running", task.ID)
 	}

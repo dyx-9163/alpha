@@ -12,6 +12,7 @@ import (
 	"aifar-deployment/backend/internal/apps/deleteflow"
 	mysqlrouter "aifar-deployment/backend/internal/apps/mysqlrouter"
 	"aifar-deployment/backend/internal/installer/installerkit"
+	"aifar-deployment/backend/internal/installflow"
 	"aifar-deployment/backend/internal/store"
 	"aifar-deployment/backend/internal/taskrun"
 )
@@ -65,16 +66,11 @@ type Service struct {
 	remote Remote
 }
 
-type stepDef = taskrun.Step
+type stepDef = installflow.Step
 
 type targetLogger func(target string) Logger
 
-type stepRecorder interface {
-	StartTarget(target string)
-	FinishTarget(target, status, errText string)
-	StartStep(target, name, title string, order int)
-	FinishStep(target, name, status, errText string)
-}
+type stepRecorder = installflow.Recorder
 
 type clusterStartNode struct {
 	instance store.AppInstance
@@ -118,7 +114,7 @@ func (s Service) Install(ctx context.Context, req InstallRequest, resources []st
 	target := targets[0]
 	logForServer := logForTarget(log, targetLog, target)
 	recorder, _ := log.(stepRecorder)
-	taskrun.StartTarget(recorder, target)
+	installflow.StartTarget(recorder, target)
 	step := newStepRunner(logForServer, recorder, target, copy)
 	var server store.Server
 	if err := step(1, "load-server", copy.LoadServer, func() error {
@@ -318,7 +314,7 @@ func (s Service) installInnoDBClusterBase(ctx context.Context, targets []string,
 			}
 			defer func() { <-sem }()
 			logForServer := logForTarget(log, targetLog, target)
-			taskrun.StartTarget(recorder, target)
+			installflow.StartTarget(recorder, target)
 			step := newStepRunnerWithSteps(logForServer, recorder, target, copy, steps)
 			server := servers[target]
 			if err := step(1, "load-server", copy.LoadServer, func() error { return nil }); err != nil {
@@ -379,7 +375,7 @@ func (s Service) installIntegratedMySQLRouters(ctx context.Context, req InstallR
 	routerSteps := mysqlIntegratedRouterSteps(copy)
 	failures := taskrun.RunTargets(ctx, routerTargets, req.Concurrency, func(target string) error {
 		logForServer := logForTarget(log, targetLog, target)
-		taskrun.StartTarget(recorder, target)
+		installflow.StartTarget(recorder, target)
 		stepIndexOffset := 0
 		steps := routerSteps
 		if clusterTargetSet[target] {
@@ -476,7 +472,7 @@ func (s Service) StartInnoDBCluster(ctx context.Context, req StartClusterRequest
 	targets := clusterStartTargets(nodes)
 	recorder, _ := log.(stepRecorder)
 	for _, target := range targets {
-		taskrun.StartTarget(recorder, target)
+		installflow.StartTarget(recorder, target)
 	}
 
 	bootstrap := nodes[0]
@@ -582,7 +578,7 @@ func (s Service) Check(ctx context.Context, req CheckRequest, log Logger, target
 	}
 	logForServer := logForTarget(log, targetLog, target)
 	recorder, _ := log.(stepRecorder)
-	taskrun.StartTarget(recorder, target)
+	installflow.StartTarget(recorder, target)
 	topology := instanceTopology(req.Instance)
 	steps := mysqlCheckStepsFor(topology, copy)
 	step := newCheckStepRunnerWithSteps(logForServer, recorder, target, copy, steps)
@@ -878,12 +874,12 @@ func newStepRunner(log Logger, recorder stepRecorder, target string, copy Copy) 
 }
 
 func newStepRunnerWithSteps(log Logger, recorder stepRecorder, target string, copy Copy, steps []stepDef) func(stepIndex int, stepName, label string, fn func() error) error {
-	runner := taskrun.Runner{
+	runner := installflow.Runner{
 		Log:      log,
 		Recorder: recorder,
 		Target:   target,
 		Steps:    steps,
-		Messages: taskrun.Messages{
+		Messages: installflow.Messages{
 			StepStart:  copy.StepStart,
 			StepDone:   copy.StepDone,
 			StepFailed: copy.StepFailed,
@@ -895,12 +891,12 @@ func newStepRunnerWithSteps(log Logger, recorder stepRecorder, target string, co
 }
 
 func newCheckStepRunnerWithSteps(log Logger, recorder stepRecorder, target string, copy CheckCopy, steps []stepDef) func(stepIndex int, stepName, label string, fn func() error) error {
-	runner := taskrun.Runner{
+	runner := installflow.Runner{
 		Log:      log,
 		Recorder: recorder,
 		Target:   target,
 		Steps:    steps,
-		Messages: taskrun.Messages{
+		Messages: installflow.Messages{
 			StepStart:  copy.StepStart,
 			StepDone:   copy.StepDone,
 			StepFailed: copy.StepFailed,
@@ -912,12 +908,12 @@ func newCheckStepRunnerWithSteps(log Logger, recorder stepRecorder, target strin
 }
 
 func newClusterStartStepRunnerWithSteps(log Logger, recorder stepRecorder, target string, copy ClusterStartCopy, steps []stepDef) func(stepIndex int, stepName, label string, fn func() error) error {
-	runner := taskrun.Runner{
+	runner := installflow.Runner{
 		Log:      log,
 		Recorder: recorder,
 		Target:   target,
 		Steps:    steps,
-		Messages: taskrun.Messages{
+		Messages: installflow.Messages{
 			StepStart:  copy.StepStart,
 			StepDone:   copy.StepDone,
 			StepFailed: copy.StepFailed,
@@ -939,7 +935,7 @@ func logForTarget(fallback Logger, targetLog targetLogger, target string) Logger
 }
 
 func finishTarget(recorder stepRecorder, target, status, errText string) {
-	taskrun.FinishTarget(recorder, target, status, errText)
+	installflow.FinishTarget(recorder, target, status, errText)
 }
 
 func stringSet(values []string) map[string]bool {

@@ -1,6 +1,7 @@
 package docker
 
 import (
+	"aifar-deployment/backend/internal/installflow"
 	"aifar-deployment/backend/internal/store"
 	"aifar-deployment/backend/internal/taskrun"
 	"context"
@@ -49,19 +50,11 @@ type Service struct {
 	remote Remote
 }
 
-type installStepDef struct {
-	Name  string
-	Title string
-}
+type installStepDef = installflow.Step
 
 type targetLogger func(target string) Logger
 
-type stepRecorder interface {
-	StartTarget(target string)
-	FinishTarget(target, status, errText string)
-	StartStep(target, name, title string, order int)
-	FinishStep(target, name, status, errText string)
-}
+type stepRecorder = installflow.Recorder
 
 func NewService(s Store, remote Remote) Service {
 	return Service{store: s, remote: remote}
@@ -301,74 +294,56 @@ func dockerCheckSteps(copy CheckCopy) []installStepDef {
 
 func newStepRunner(log Logger, recorder stepRecorder, target string, copy Copy, targetIndex, targetTotal int) func(stepIndex int, label string, fn func() error) error {
 	steps := dockerInstallSteps(copy)
+	runner := installflow.Runner{
+		Log:      log,
+		Recorder: recorder,
+		Target:   target,
+		Steps:    steps,
+		Messages: installflow.Messages{
+			StepStart:  copy.StepStart,
+			StepDone:   copy.StepDone,
+			StepFailed: copy.StepFailed,
+		},
+		Formatter: installflow.BatchFormatter(targetIndex, targetTotal),
+	}
 	return func(stepIndex int, label string, fn func() error) error {
-		stepName := fmt.Sprintf("step-%d", stepIndex)
-		if stepIndex > 0 && stepIndex <= len(steps) {
-			stepName = steps[stepIndex-1].Name
-		}
-		stepTotal := len(steps)
-		if recorder != nil {
-			recorder.StartStep(target, stepName, label, stepIndex)
-		}
-		log.Info(copy.StepStart, targetIndex, targetTotal, stepIndex, stepTotal, label)
-		if err := fn(); err != nil {
-			log.Error(copy.StepFailed, targetIndex, targetTotal, stepIndex, stepTotal, label, err)
-			if recorder != nil {
-				recorder.FinishStep(target, stepName, "failed", err.Error())
-			}
-			return err
-		}
-		log.Info(copy.StepDone, targetIndex, targetTotal, stepIndex, stepTotal, label)
-		if recorder != nil {
-			recorder.FinishStep(target, stepName, "success", "")
-		}
-		return nil
+		return runner.Run(stepIndex, installflow.StepName(steps, stepIndex), label, fn)
 	}
 }
 
 func newDeleteStepRunner(log Logger, recorder stepRecorder, target string, copy DeleteCopy) func(stepIndex int, stepName, label string, fn func() error) error {
 	steps := dockerDeleteSteps(copy)
+	runner := installflow.Runner{
+		Log:      log,
+		Recorder: recorder,
+		Target:   target,
+		Steps:    steps,
+		Messages: installflow.Messages{
+			StepStart:  copy.StepStart,
+			StepDone:   copy.StepDone,
+			StepFailed: copy.StepFailed,
+		},
+	}
 	return func(stepIndex int, stepName, label string, fn func() error) error {
-		stepTotal := len(steps)
-		if recorder != nil {
-			recorder.StartStep(target, stepName, label, stepIndex)
-		}
-		log.Info(copy.StepStart, stepIndex, stepTotal, label)
-		if err := fn(); err != nil {
-			log.Error(copy.StepFailed, stepIndex, stepTotal, label, err)
-			if recorder != nil {
-				recorder.FinishStep(target, stepName, "failed", err.Error())
-			}
-			return err
-		}
-		log.Info(copy.StepDone, stepIndex, stepTotal, label)
-		if recorder != nil {
-			recorder.FinishStep(target, stepName, "success", "")
-		}
-		return nil
+		return runner.Run(stepIndex, stepName, label, fn)
 	}
 }
 
 func newCheckStepRunner(log Logger, recorder stepRecorder, target string, copy CheckCopy) func(stepIndex int, stepName, label string, fn func() error) error {
 	steps := dockerCheckSteps(copy)
+	runner := installflow.Runner{
+		Log:      log,
+		Recorder: recorder,
+		Target:   target,
+		Steps:    steps,
+		Messages: installflow.Messages{
+			StepStart:  copy.StepStart,
+			StepDone:   copy.StepDone,
+			StepFailed: copy.StepFailed,
+		},
+	}
 	return func(stepIndex int, stepName, label string, fn func() error) error {
-		stepTotal := len(steps)
-		if recorder != nil {
-			recorder.StartStep(target, stepName, label, stepIndex)
-		}
-		log.Info(copy.StepStart, stepIndex, stepTotal, label)
-		if err := fn(); err != nil {
-			log.Error(copy.StepFailed, stepIndex, stepTotal, label, err)
-			if recorder != nil {
-				recorder.FinishStep(target, stepName, "failed", err.Error())
-			}
-			return err
-		}
-		log.Info(copy.StepDone, stepIndex, stepTotal, label)
-		if recorder != nil {
-			recorder.FinishStep(target, stepName, "success", "")
-		}
-		return nil
+		return runner.Run(stepIndex, stepName, label, fn)
 	}
 }
 

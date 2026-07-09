@@ -167,7 +167,17 @@ func (a *API) publishNacosConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	actor := currentUser(r).Username
 	target := nacosConfigTarget(req)
-	task, err := a.tasks.StartWithLanguage("apps.nacos.config.publish", target, actor, lang, func(ctx context.Context, log worker.Logger) error {
+	taskType := "apps.nacos.config.publish"
+	task, err := a.store.CreateTask(store.Task{Type: taskType, Target: target, Status: "pending", CreatedBy: actor})
+	if err != nil {
+		respondTask(w, task, err)
+		return
+	}
+	if err := a.storeTaskPlanOrDelete(task.ID, simpleTaskPlan("", nacosConfigPublishSteps(lang))); err != nil {
+		writeError(w, http.StatusInternalServerError, "NACOS_CONFIG_PLAN_STORE_FAILED", err.Error(), map[string]any{"target": target})
+		return
+	}
+	task, err = a.tasks.StartExistingWithLanguage(task, lang, func(ctx context.Context, log worker.Logger) error {
 		return a.runNacosConfigPublish(ctx, lang, actor, req, "", log)
 	})
 	if err == nil {
@@ -193,7 +203,17 @@ func (a *API) rollbackNacosConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	actor := currentUser(r).Username
 	target := req.RevisionID
-	task, err := a.tasks.StartWithLanguage("apps.nacos.config.rollback", target, actor, lang, func(ctx context.Context, log worker.Logger) error {
+	taskType := "apps.nacos.config.rollback"
+	task, err := a.store.CreateTask(store.Task{Type: taskType, Target: target, Status: "pending", CreatedBy: actor})
+	if err != nil {
+		respondTask(w, task, err)
+		return
+	}
+	if err := a.storeTaskPlanOrDelete(task.ID, simpleTaskPlan("", nacosConfigRollbackSteps(lang))); err != nil {
+		writeError(w, http.StatusInternalServerError, "NACOS_CONFIG_PLAN_STORE_FAILED", err.Error(), map[string]any{"target": target})
+		return
+	}
+	task, err = a.tasks.StartExistingWithLanguage(task, lang, func(ctx context.Context, log worker.Logger) error {
 		return a.runNacosConfigRollback(ctx, lang, actor, req, log)
 	})
 	if err == nil {
@@ -202,19 +222,25 @@ func (a *API) rollbackNacosConfig(w http.ResponseWriter, r *http.Request) {
 	respondTask(w, task, err)
 }
 
-func (a *API) runNacosConfigPublish(ctx context.Context, lang, actor string, req nacosConfigRequest, rollbackFrom string, log worker.Logger) error {
-	steps := []struct {
-		name  string
-		title string
-	}{
+func nacosConfigPublishSteps(lang string) []simpleTaskStep {
+	return []simpleTaskStep{
 		{"build-config", i18n.Text(lang, "nacos.config.stepBuild")},
 		{"load-current", i18n.Text(lang, "nacos.config.stepLoadCurrent")},
 		{"publish-nacos", i18n.Text(lang, "nacos.config.stepPublish")},
 		{"record-revision", i18n.Text(lang, "nacos.config.stepRecord")},
 	}
-	for index, step := range steps {
-		log.PlanStep("", step.name, step.title, index+1)
+}
+
+func nacosConfigRollbackSteps(lang string) []simpleTaskStep {
+	return []simpleTaskStep{
+		{"load-revision", i18n.Text(lang, "nacos.config.stepLoadRevision")},
+		{"publish-nacos", i18n.Text(lang, "nacos.config.stepPublish")},
+		{"record-revision", i18n.Text(lang, "nacos.config.stepRecord")},
 	}
+}
+
+func (a *API) runNacosConfigPublish(ctx context.Context, lang, actor string, req nacosConfigRequest, rollbackFrom string, log worker.Logger) error {
+	steps := nacosConfigPublishSteps(lang)
 	log.StartStep("", steps[0].name, steps[0].title, 1)
 	doc, content, err := a.renderNacosConfig(ctx, req)
 	if err != nil {
@@ -279,17 +305,7 @@ func (a *API) runNacosConfigPublish(ctx context.Context, lang, actor string, req
 }
 
 func (a *API) runNacosConfigRollback(ctx context.Context, lang, actor string, req nacosConfigRollbackRequest, log worker.Logger) error {
-	steps := []struct {
-		name  string
-		title string
-	}{
-		{"load-revision", i18n.Text(lang, "nacos.config.stepLoadRevision")},
-		{"publish-nacos", i18n.Text(lang, "nacos.config.stepPublish")},
-		{"record-revision", i18n.Text(lang, "nacos.config.stepRecord")},
-	}
-	for index, step := range steps {
-		log.PlanStep("", step.name, step.title, index+1)
-	}
+	steps := nacosConfigRollbackSteps(lang)
 	log.StartStep("", steps[0].name, steps[0].title, 1)
 	revision, err := a.store.GetNacosConfigRevision(req.RevisionID, true)
 	if err != nil {

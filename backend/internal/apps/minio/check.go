@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"aifar-deployment/backend/internal/installer/installerkit"
+	"aifar-deployment/backend/internal/installflow"
 	"aifar-deployment/backend/internal/store"
 )
 
@@ -54,9 +55,7 @@ func (s Service) Check(ctx context.Context, req CheckRequest, log Logger, target
 	}
 	logForServer := logForTarget(log, targetLog, target)
 	recorder, _ := log.(stepRecorder)
-	if recorder != nil {
-		recorder.StartTarget(target)
-	}
+	installflow.StartTarget(recorder, target)
 	step := newCheckStepRunner(logForServer, recorder, target, copy)
 	details := map[string]any{
 		"checkedAt": time.Now().UTC().Format(time.RFC3339),
@@ -238,23 +237,19 @@ func minioCheckSteps(copy CheckCopy) []stepDef {
 
 func newCheckStepRunner(log Logger, recorder stepRecorder, target string, copy CheckCopy) func(stepIndex int, stepName, label string, fn func() error) error {
 	steps := minioCheckSteps(copy)
+	runner := installflow.Runner{
+		Log:      log,
+		Recorder: recorder,
+		Target:   target,
+		Steps:    steps,
+		Messages: installflow.Messages{
+			StepStart:  copy.StepStart,
+			StepDone:   copy.StepDone,
+			StepFailed: copy.StepFailed,
+		},
+	}
 	return func(stepIndex int, stepName, label string, fn func() error) error {
-		if recorder != nil {
-			recorder.StartStep(target, stepName, label, stepIndex)
-		}
-		log.Info(copy.StepStart, stepIndex, len(steps), label)
-		if err := fn(); err != nil {
-			log.Error(copy.StepFailed, stepIndex, len(steps), label, err)
-			if recorder != nil {
-				recorder.FinishStep(target, stepName, "failed", err.Error())
-			}
-			return err
-		}
-		log.Info(copy.StepDone, stepIndex, len(steps), label)
-		if recorder != nil {
-			recorder.FinishStep(target, stepName, "success", "")
-		}
-		return nil
+		return runner.Run(stepIndex, stepName, label, fn)
 	}
 }
 

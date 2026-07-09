@@ -94,6 +94,8 @@ import StatusTag from './StatusTag.vue'
 type TaskListItem = {
   id: string
   type: string
+  category?: string
+  trackable?: boolean
   target: string
   status: string
   createdAt: string
@@ -183,7 +185,7 @@ watch(filteredTasks, () => {
   }
 })
 
-const taskCategoryOrder = ['apps', 'servers', 'containers', 'database', 'storage', 'resources', 'terminal', 'audit', 'other']
+const taskCategoryOrder = ['apps', 'servers', 'containers', 'database', 'storage', 'resources', 'maintenance', 'terminal', 'audit', 'other']
 const taskStatusOrder = ['running', 'pending', 'success', 'failed', 'cancelled', 'timeout', 'error', 'unknown']
 
 function countBy<T>(items: T[], mapper: (item: T) => string) {
@@ -196,6 +198,9 @@ function countBy<T>(items: T[], mapper: (item: T) => string) {
 }
 
 function taskCategory(task: TaskListItem) {
+  if (task.category) {
+    return task.category
+  }
   const prefix = task.type?.split('.')?.[0] || 'other'
   if (prefix === 'database' || prefix === 'databases' || prefix === 'mysql' || prefix === 'redis') {
     return 'database'

@@ -12,7 +12,6 @@ import (
 	"aifar-deployment/backend/internal/apps/registry"
 	"aifar-deployment/backend/internal/i18n"
 	"aifar-deployment/backend/internal/store"
-	"aifar-deployment/backend/internal/taskplan"
 	"aifar-deployment/backend/internal/worker"
 
 	"github.com/go-chi/chi/v5"
@@ -99,9 +98,12 @@ func (a *API) updateAppInstanceArtifact(w http.ResponseWriter, r *http.Request) 
 		respondTask(w, task, err)
 		return
 	}
-	if err := taskplan.StorePlan(a.store, task.ID, installPlanSteps(plan)); err != nil {
-		_ = a.store.DeleteTask(task.ID)
+	if err := a.storeInstallPlanOrDelete(task.ID, plan); err != nil {
 		writeError(w, http.StatusInternalServerError, "ARTIFACT_UPDATE_PLAN_STORE_FAILED", err.Error(), map[string]any{"app": instance.App, "service": serviceName})
+		return
+	}
+	locks, ok := a.acquireTaskOperationLocks(w, lang, task, appInstanceOperationLockSpecs("artifact-update", []store.AppInstance{instance}))
+	if !ok {
 		return
 	}
 	removeArtifact = false
@@ -121,6 +123,7 @@ func (a *API) updateAppInstanceArtifact(w http.ResponseWriter, r *http.Request) 
 		return nil
 	})
 	if err != nil {
+		a.releaseOperationLocks(locks)
 		_ = os.Remove(artifactPath)
 	}
 	if err == nil {
@@ -211,9 +214,12 @@ func (a *API) updateAppInstanceArtifactBundle(w http.ResponseWriter, r *http.Req
 		respondTask(w, task, err)
 		return
 	}
-	if err := taskplan.StorePlan(a.store, task.ID, installPlanSteps(plan)); err != nil {
-		_ = a.store.DeleteTask(task.ID)
+	if err := a.storeInstallPlanOrDelete(task.ID, plan); err != nil {
 		writeError(w, http.StatusInternalServerError, "ARTIFACT_BUNDLE_UPDATE_PLAN_STORE_FAILED", err.Error(), map[string]any{"app": instance.App})
+		return
+	}
+	locks, ok := a.acquireTaskOperationLocks(w, lang, task, appInstanceOperationLockSpecs("artifact-bundle-update", []store.AppInstance{instance}))
+	if !ok {
 		return
 	}
 	removeBundle = false
@@ -234,6 +240,7 @@ func (a *API) updateAppInstanceArtifactBundle(w http.ResponseWriter, r *http.Req
 		return nil
 	})
 	if err != nil {
+		a.releaseOperationLocks(locks)
 		_ = os.Remove(bundlePath)
 	}
 	if err == nil {

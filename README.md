@@ -58,7 +58,7 @@ The server reads these environment variables:
 - `AIFAR_STATIC_DIR=web/dist`，生产包默认即可。
 - `AIFAR_DEFAULT_DEPLOY_DIR=/aifar/apps`，目标服务器上应用安装根目录，要求磁盘空间充足。
 - `AIFAR_DEPLOYMENT_CONCURRENCY=2` 起步；目标机、网络和磁盘稳定后可调到 `3` 或 `4`。
-- `AIFAR_COLLECTOR_INTERVAL_SECONDS=30` 常规使用；低配服务器或目标很多时可调到 `60`。
+- `AIFAR_COLLECTOR_INTERVAL_SECONDS=15` 常规使用；低配服务器或目标很多时可调到 `60`。
 - `AIFAR_MAX_REQUEST_BODY_BYTES=4294967296` 默认 4 GiB；如果上传 AIFAR 批量制品包可能超过 4 GiB，建议改为 `8589934592`。
 - `AIFAR_AUTH_MAX_FAILURES=5`、`AIFAR_AUTH_LOCKOUT_SECONDS=300` 用于登录失败锁定。
 - `AIFAR_AUDIT_RETENTION_DAYS=180`、`AIFAR_TASK_RETENTION_DAYS=90` 控制审计与已完成任务保留周期。

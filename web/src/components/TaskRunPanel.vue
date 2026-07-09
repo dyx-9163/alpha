@@ -57,6 +57,8 @@ import StatusTag from './StatusTag.vue'
 type Task = {
   id: string
   type: string
+  category?: string
+  trackable?: boolean
   target: string
   status: string
   createdAt: string

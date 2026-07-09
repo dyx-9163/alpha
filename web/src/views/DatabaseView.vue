@@ -35,7 +35,6 @@
             <span v-if="routerInstanceCount" class="status-pill">{{ t('database.mysqlRouter') }} {{ routerInstanceCount }}</span>
           </div>
           <div class="monitor-actions">
-            <el-button size="small" :loading="monitoringRunning" :disabled="!canManageApps" @click="runRealtimeCheck(true)">{{ t('database.monitorNow') }}</el-button>
             <el-input v-model="search" :placeholder="t('common.search')" clearable class="toolbar-control is-sm" />
           </div>
         </div>
@@ -145,7 +144,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { useRouter } from 'vue-router'
 import { apiGet, apiPost, asArray } from '../api/client'
@@ -155,7 +154,7 @@ import StatusTag from '../components/StatusTag.vue'
 import { usePermissions } from '../composables/usePermissions'
 import { useI18n } from '../i18n'
 import { permissions } from '../rbac'
-import { useRealtimeStore } from '../stores/realtime'
+import { applyRealtimeStatusToAppInstance, useRealtimeStore } from '../stores/realtime'
 import { useTaskProgressStore } from '../stores/taskProgress'
 
 type AppInstance = {
@@ -206,6 +205,8 @@ type DatabaseGroup = {
   sentinels: DatabaseNode[]
 }
 
+type DatabaseHealth = 'online' | 'offline' | 'unknown' | 'probing'
+
 type DeleteScopeKind = 'single' | 'mysql-group' | 'redis-group'
 
 type DeleteScope = {
@@ -231,11 +232,6 @@ const servers = ref<any[]>([])
 const tasks = ref<TaskRecord[]>([])
 const tab = ref('instances')
 const search = ref('')
-const monitoringRunning = ref(false)
-const monitorStartedAt = ref(0)
-const pendingMonitorTaskIds = ref<Set<string>>(new Set())
-const lastMonitorAt = ref('')
-let databaseRefreshTimer: ReturnType<typeof window.setTimeout> | null = null
 const deletePromptVisible = ref(false)
 const deleteSubmitting = ref(false)
 const pendingDeleteScope = ref<DeleteScope | null>(null)
@@ -247,15 +243,14 @@ const mysqlGroupCount = computed(() => instanceGroups.value.filter((item) => ite
 const redisGroupCount = computed(() => instanceGroups.value.filter((item) => item.app === 'redis').length)
 const databaseNodeCount = computed(() => instanceGroups.value.reduce((total, group) => total + group.nodes.length, 0))
 const sentinelNodeCount = computed(() => instanceGroups.value.reduce((total, group) => total + group.sentinels.length, 0))
-const routerInstanceCount = computed(() => instances.value.filter((item) => item.app === 'mysql-router').length)
+const liveInstances = computed(() => instances.value.map((instance) => applyRealtimeStatusToAppInstance(instance, realtime.appInstanceSnapshot(instance.id))))
+const routerInstanceCount = computed(() => liveInstances.value.filter((item) => item.app === 'mysql-router').length)
 const canManageApps = computed(() => can(permissions.appsManage))
 const canManageDatabase = computed(() => can(permissions.databaseManage))
+const lastMonitorAt = computed(() => latestSnapshotTime(liveInstances.value.map((instance) => realtime.appInstanceSnapshot(instance.id))))
 const monitoringStatusLabel = computed(() => {
   if (!canManageApps.value) {
     return t('database.monitorPermissionRequired')
-  }
-  if (monitoringRunning.value) {
-    return t('database.monitoring')
   }
   return t('database.backendPushReady')
 })
@@ -284,7 +279,7 @@ const visibleDeleteServers = computed(() => {
   }
   return deleteServers.value
 })
-const instanceGroups = computed(() => groupDatabaseInstances(instances.value))
+const instanceGroups = computed(() => groupDatabaseInstances(liveInstances.value))
 const filteredGroups = computed(() => {
   const q = search.value.trim().toLowerCase()
   if (!q) return instanceGroups.value
@@ -326,100 +321,6 @@ function applyDatabaseState(state: DatabaseState) {
   instances.value = state.instances
   servers.value = state.servers
   tasks.value = state.tasks
-}
-
-async function runRealtimeCheck(manual: boolean) {
-  if (!canManageApps.value) {
-    if (manual) {
-      ElMessage.warning(deniedText.value)
-    }
-    return
-  }
-  if (monitoringRunning.value) {
-    return
-  }
-  monitoringRunning.value = true
-  monitorStartedAt.value = Date.now()
-  let waitForRealtime = false
-  try {
-    const state = await fetchDatabaseState()
-    applyDatabaseState(state)
-    const taskIds: string[] = []
-    for (const instance of state.instances.filter(isMonitorableInstance)) {
-      try {
-        const result = await apiPost<{ taskId: string }>(`/apps/instances/${instance.id}/check`)
-        if (result.taskId) {
-          taskIds.push(result.taskId)
-        }
-      } catch (err) {
-        if (manual) {
-          ElMessage.warning((err as Error).message)
-        }
-      }
-    }
-    if (taskIds.length) {
-      pendingMonitorTaskIds.value = new Set(taskIds)
-      void settleFinishedMonitorTasks()
-      waitForRealtime = true
-      return
-    }
-    lastMonitorAt.value = new Date().toLocaleTimeString()
-    applyDatabaseState(await fetchDatabaseState())
-  } finally {
-    if (!waitForRealtime) {
-      monitoringRunning.value = false
-    }
-  }
-}
-
-function isMonitorableInstance(instance: AppInstance) {
-  return ['mysql', 'redis', 'mysql-router'].includes(instance.app)
-}
-
-async function settleFinishedMonitorTasks() {
-  if (!pendingMonitorTaskIds.value.size) {
-    return
-  }
-  const latest = asArray<TaskRecord>(await apiGet<TaskRecord[] | null>('/tasks').catch(() => []))
-  tasks.value = latest
-  const pending = new Set(pendingMonitorTaskIds.value)
-  for (const task of latest) {
-    if (pending.has(task.id) && !['pending', 'running'].includes(task.status)) {
-      pending.delete(task.id)
-    }
-  }
-  pendingMonitorTaskIds.value = pending
-  if (pending.size === 0) {
-    void finishRealtimeCheck()
-  }
-}
-
-function scheduleDatabaseRefresh() {
-  if (databaseRefreshTimer) return
-  databaseRefreshTimer = window.setTimeout(() => {
-    databaseRefreshTimer = null
-    void load()
-  }, 400)
-}
-
-function shouldRefreshDatabase(event: any) {
-  const type = String(event?.type ?? '')
-  const resource = String(event?.resource ?? '')
-  if (!type && !resource) return false
-  if (type === 'collector.run.started') return false
-  if (resource === 'app.instance' || type.startsWith('status.app.instance')) {
-    const app = realtimeEventApp(event)
-    return !app || ['mysql', 'redis', 'mysql-router'].includes(app)
-  }
-  if (resource === 'app.instances' && type.startsWith('collector.run.')) return true
-  if (type === 'task.finished') return true
-  return false
-}
-
-function realtimeEventApp(event: any) {
-  const payload = event?.payload ?? {}
-  const nested = payload?.payload ?? {}
-  return stringValue(nested?.app ?? payload?.app).toLowerCase()
 }
 
 function metadataOf(item: AppInstance) {
@@ -889,7 +790,7 @@ function nodeHealthType(node: DatabaseNode) {
   }
 }
 
-function nodeHealth(node: DatabaseNode) {
+function nodeHealth(node: DatabaseNode): DatabaseHealth {
   if (isMysqlInnoDBNode(node)) {
     const runtimeHealth = mysqlRuntimeHealth(node)
     if (runtimeHealth !== 'unknown') {
@@ -899,7 +800,7 @@ function nodeHealth(node: DatabaseNode) {
   return baseNodeHealth(node)
 }
 
-function baseNodeHealth(node: DatabaseNode) {
+function baseNodeHealth(node: DatabaseNode): DatabaseHealth {
   if (serverStatusOffline(nodeServerStatus(node))) {
     return 'offline'
   }
@@ -908,9 +809,6 @@ function baseNodeHealth(node: DatabaseNode) {
   const status = lastCheckStatus || instanceStatus
   if (node.virtual && !serverStatusOnline(nodeServerStatus(node))) {
     return 'unknown'
-  }
-  if (monitoringRunning.value && !statusIsOffline(status) && isNodeCheckStaleForCurrentMonitor(node)) {
-    return 'probing'
   }
   if (lastCheckStatus && statusIsOnline(lastCheckStatus)) {
     return 'online'
@@ -929,14 +827,6 @@ function baseNodeHealth(node: DatabaseNode) {
 
 function isMysqlInnoDBNode(node: DatabaseNode) {
   return node.instance.app === 'mysql' && normalizedTopology(node.instance, node.metadata) === 'innodb-cluster'
-}
-
-function isNodeCheckStaleForCurrentMonitor(node: DatabaseNode) {
-  if (!monitorStartedAt.value) {
-    return false
-  }
-  const checkedAt = nodeLastCheckedAt(node)
-  return checkedAt === 0 || checkedAt + 1000 < monitorStartedAt.value
 }
 
 function nodeLastCheckedAt(node: DatabaseNode) {
@@ -1288,6 +1178,15 @@ function stringValue(value: unknown) {
   return out === '<nil>' ? '' : out
 }
 
+function latestSnapshotTime(snapshots: Array<{ collectedAt?: string; updatedAt?: string } | undefined>) {
+  const latest = snapshots
+    .map((snapshot) => snapshot?.collectedAt || snapshot?.updatedAt || '')
+    .map((value) => new Date(value).getTime())
+    .filter((value) => Number.isFinite(value) && value > 0)
+    .sort((a, b) => b - a)[0]
+  return latest ? new Date(latest).toLocaleTimeString() : ''
+}
+
 function stringListValue(value: unknown): string[] {
   if (Array.isArray(value)) {
     return value.map((item) => stringValue(item)).filter(Boolean)
@@ -1350,14 +1249,11 @@ function isMysqlClusterIneffective(group: DatabaseGroup) {
   return ['unavailable', 'degraded', 'failed', 'error'].includes(group.nodeStatus)
 }
 
-function mysqlRuntimeHealth(node: DatabaseNode) {
+function mysqlRuntimeHealth(node: DatabaseNode): DatabaseHealth {
   if (serverStatusOffline(nodeServerStatus(node))) {
     return 'offline'
   }
   const runtimeStatus = mysqlRuntimeStatus(node)
-  if (monitoringRunning.value && !statusIsOffline(runtimeStatus) && isNodeCheckStaleForCurrentMonitor(node)) {
-    return 'probing'
-  }
   if (statusIsOnline(runtimeStatus)) {
     return 'online'
   }
@@ -1602,42 +1498,8 @@ function deleteErrorMessage(err: unknown) {
   return err.message
 }
 
-async function finishRealtimeCheck() {
-  lastMonitorAt.value = new Date().toLocaleTimeString()
-  try {
-    applyDatabaseState(await fetchDatabaseState())
-  } finally {
-    pendingMonitorTaskIds.value = new Set()
-    monitoringRunning.value = false
-  }
-}
-
-watch(() => realtime.revision, () => {
-  const event = realtime.lastEvent
-  let handledMonitorTask = false
-  if (event?.type === 'task.finished' && event.taskId && pendingMonitorTaskIds.value.has(event.taskId)) {
-    handledMonitorTask = true
-    const pending = new Set(pendingMonitorTaskIds.value)
-    pending.delete(event.taskId)
-    pendingMonitorTaskIds.value = pending
-    if (pending.size === 0) {
-      void finishRealtimeCheck()
-    }
-  }
-  if (!handledMonitorTask && shouldRefreshDatabase(event)) {
-    scheduleDatabaseRefresh()
-  }
-})
-
 onMounted(async () => {
   await load()
-})
-
-onBeforeUnmount(() => {
-  if (databaseRefreshTimer) {
-    window.clearTimeout(databaseRefreshTimer)
-    databaseRefreshTimer = null
-  }
 })
 </script>
 

@@ -12,6 +12,7 @@ import (
 
 	"aifar-deployment/backend/internal/i18n"
 	"aifar-deployment/backend/internal/maintenance"
+	"aifar-deployment/backend/internal/store"
 	"aifar-deployment/backend/internal/worker"
 
 	"github.com/go-chi/chi/v5"
@@ -68,11 +69,17 @@ func (a *API) verifyDatabaseBackup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	actor := currentUser(r).Username
-	task, err := a.tasks.StartWithLanguage("maintenance.database.backup.verify", name, actor, lang, func(ctx context.Context, log worker.Logger) error {
-		log.PlanTarget(name)
-		log.PlanStep(name, "locate-backup", i18n.Text(lang, "maintenance.locateBackupStep"), 1)
-		log.PlanStep(name, "integrity-check", i18n.Text(lang, "maintenance.integrityCheckStep"), 2)
-		log.PlanStep(name, "schema-check", i18n.Text(lang, "maintenance.schemaCheckStep"), 3)
+	taskType := "maintenance.database.backup.verify"
+	task, err := a.store.CreateTask(store.Task{Type: taskType, Target: name, Status: "pending", CreatedBy: actor})
+	if err != nil {
+		respondTask(w, task, err)
+		return
+	}
+	if err := a.storeTaskPlanOrDelete(task.ID, simpleTaskPlan(name, databaseBackupVerifySteps(lang))); err != nil {
+		writeError(w, http.StatusInternalServerError, "MAINTENANCE_PLAN_STORE_FAILED", err.Error(), map[string]any{"target": name})
+		return
+	}
+	task, err = a.tasks.StartExistingWithLanguage(task, lang, func(ctx context.Context, log worker.Logger) error {
 		log.StartTarget(name)
 
 		log.StartStep(name, "locate-backup", i18n.Text(lang, "maintenance.locateBackupStep"), 1)
@@ -121,7 +128,7 @@ func (a *API) verifyDatabaseBackup(w http.ResponseWriter, r *http.Request) {
 		return nil
 	})
 	if err == nil {
-		a.audit(r, "maintenance.database.backup.verify", name, "running", i18n.Text(lang, "api.databaseBackupVerifyStarted"))
+		a.audit(r, taskType, name, "running", i18n.Text(lang, "api.databaseBackupVerifyStarted"))
 	}
 	respondTask(w, task, err)
 }
@@ -153,11 +160,17 @@ func (a *API) runDatabaseBackup(w http.ResponseWriter, r *http.Request) {
 	target := "control-plane"
 	service := a.maintenanceService()
 	actor := currentUser(r).Username
-	task, err := a.tasks.StartWithLanguage("maintenance.database.backup", target, actor, lang, func(ctx context.Context, log worker.Logger) error {
-		log.PlanTarget(target)
-		log.PlanStep(target, "prepare-backup", i18n.Text(lang, "maintenance.prepareBackupStep"), 1)
-		log.PlanStep(target, "backup-database", i18n.Text(lang, "maintenance.backupDatabaseStep"), 2)
-		log.PlanStep(target, "verify-backup", i18n.Text(lang, "maintenance.verifyBackupStep"), 3)
+	taskType := "maintenance.database.backup"
+	task, err := a.store.CreateTask(store.Task{Type: taskType, Target: target, Status: "pending", CreatedBy: actor})
+	if err != nil {
+		respondTask(w, task, err)
+		return
+	}
+	if err := a.storeTaskPlanOrDelete(task.ID, simpleTaskPlan(target, databaseBackupSteps(lang))); err != nil {
+		writeError(w, http.StatusInternalServerError, "MAINTENANCE_PLAN_STORE_FAILED", err.Error(), map[string]any{"target": target})
+		return
+	}
+	task, err = a.tasks.StartExistingWithLanguage(task, lang, func(ctx context.Context, log worker.Logger) error {
 		log.StartTarget(target)
 
 		log.StartStep(target, "prepare-backup", i18n.Text(lang, "maintenance.prepareBackupStep"), 1)
@@ -186,7 +199,7 @@ func (a *API) runDatabaseBackup(w http.ResponseWriter, r *http.Request) {
 		return nil
 	})
 	if err == nil {
-		a.audit(r, "maintenance.database.backup", target, "running", i18n.Text(lang, "api.databaseBackupStarted"))
+		a.audit(r, taskType, target, "running", i18n.Text(lang, "api.databaseBackupStarted"))
 	}
 	respondTask(w, task, err)
 }
@@ -196,11 +209,18 @@ func (a *API) runRetentionCleanup(w http.ResponseWriter, r *http.Request) {
 	target := "control-plane"
 	service := a.maintenanceService()
 	actor := currentUser(r).Username
-	task, err := a.tasks.StartWithLanguage("maintenance.retention.run", target, actor, lang, func(ctx context.Context, log worker.Logger) error {
+	taskType := "maintenance.retention.run"
+	task, err := a.store.CreateTask(store.Task{Type: taskType, Target: target, Status: "pending", CreatedBy: actor})
+	if err != nil {
+		respondTask(w, task, err)
+		return
+	}
+	if err := a.storeTaskPlanOrDelete(task.ID, simpleTaskPlan(target, retentionCleanupSteps(lang))); err != nil {
+		writeError(w, http.StatusInternalServerError, "MAINTENANCE_PLAN_STORE_FAILED", err.Error(), map[string]any{"target": target})
+		return
+	}
+	task, err = a.tasks.StartExistingWithLanguage(task, lang, func(ctx context.Context, log worker.Logger) error {
 		plan := service.Plan(time.Now())
-		log.PlanTarget(target)
-		log.PlanStep(target, "cleanup-audit", i18n.Text(lang, "maintenance.cleanupAuditStep"), 1)
-		log.PlanStep(target, "cleanup-tasks", i18n.Text(lang, "maintenance.cleanupTasksStep"), 2)
 		log.StartTarget(target)
 
 		log.StartStep(target, "cleanup-audit", i18n.Text(lang, "maintenance.cleanupAuditStep"), 1)
@@ -236,9 +256,32 @@ func (a *API) runRetentionCleanup(w http.ResponseWriter, r *http.Request) {
 		return nil
 	})
 	if err == nil {
-		a.audit(r, "maintenance.retention.run", target, "running", i18n.Text(lang, "api.retentionCleanupStarted"))
+		a.audit(r, taskType, target, "running", i18n.Text(lang, "api.retentionCleanupStarted"))
 	}
 	respondTask(w, task, err)
+}
+
+func databaseBackupVerifySteps(lang string) []simpleTaskStep {
+	return []simpleTaskStep{
+		{"locate-backup", i18n.Text(lang, "maintenance.locateBackupStep")},
+		{"integrity-check", i18n.Text(lang, "maintenance.integrityCheckStep")},
+		{"schema-check", i18n.Text(lang, "maintenance.schemaCheckStep")},
+	}
+}
+
+func databaseBackupSteps(lang string) []simpleTaskStep {
+	return []simpleTaskStep{
+		{"prepare-backup", i18n.Text(lang, "maintenance.prepareBackupStep")},
+		{"backup-database", i18n.Text(lang, "maintenance.backupDatabaseStep")},
+		{"verify-backup", i18n.Text(lang, "maintenance.verifyBackupStep")},
+	}
+}
+
+func retentionCleanupSteps(lang string) []simpleTaskStep {
+	return []simpleTaskStep{
+		{"cleanup-audit", i18n.Text(lang, "maintenance.cleanupAuditStep")},
+		{"cleanup-tasks", i18n.Text(lang, "maintenance.cleanupTasksStep")},
+	}
 }
 
 func formatRetentionCutoff(cutoff time.Time) string {

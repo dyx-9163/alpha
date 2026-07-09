@@ -125,7 +125,7 @@ func serve(addr string) error {
 		log.Printf("sync AIFAR Nacos proxies on startup failed: %v", err)
 	}
 	go runtimeagent.StartNacosProxyHeartbeat(ctx, nacosOptions)
-	go manager.StartRuntimeResync(ctx, 30*time.Second, nacosOptions)
+	go manager.StartRuntimeResync(ctx, 15*time.Second, nacosOptions)
 	go manager.StartDockerEventSync(ctx, 2*time.Second)
 	server := &http.Server{Addr: addr, Handler: newAgentHandler(manager, health), ReadHeaderTimeout: 10 * time.Second}
 	log.Printf("aifar-agent listening on %s", addr)

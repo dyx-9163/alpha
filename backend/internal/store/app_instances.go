@@ -52,10 +52,25 @@ func (s *Store) DeleteAppInstance(id string) error {
 		return err
 	}
 	defer tx.Rollback()
+	if _, err := tx.Exec(`delete from operation_locks where scope='app-instance' and resource_id=?`, id); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`delete from app_release_artifacts where instance_id=?`, id); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`delete from app_release_snapshots where instance_id=?`, id); err != nil {
+		return err
+	}
 	if _, err := tx.Exec(`delete from app_releases where instance_id=?`, id); err != nil {
 		return err
 	}
+	if _, err := tx.Exec(`delete from app_cluster_members where instance_id=?`, id); err != nil {
+		return err
+	}
 	if _, err := tx.Exec(`delete from credential_bindings where app_instance_id=?`, id); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`delete from credential_references where resource_type='app-instance' and resource_id=?`, id); err != nil {
 		return err
 	}
 	if _, err := tx.Exec(`update credentials set app_instance_id='' where app_instance_id=?`, id); err != nil {
@@ -82,13 +97,23 @@ func (s *Store) SaveAppRelease(v AppRelease) (AppRelease, error) {
 	if v.ActivatedAt.IsZero() && v.Status == "success" {
 		v.ActivatedAt = now
 	}
-	_, err := s.db.Exec(`insert into app_releases(id,instance_id,app,version,release_id,server_id,status,manifest_json,config_hash,created_at,activated_at)
+	tx, err := s.db.Begin()
+	if err != nil {
+		return v, err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`insert into app_releases(id,instance_id,app,version,release_id,server_id,status,manifest_json,config_hash,created_at,activated_at)
 		values(?,?,?,?,?,?,?,?,?,?,?)
 		on conflict(instance_id, release_id) do update set
 		version=excluded.version,server_id=excluded.server_id,status=excluded.status,
 		manifest_json=excluded.manifest_json,config_hash=excluded.config_hash,activated_at=excluded.activated_at`,
-		v.ID, v.InstanceID, v.App, v.Version, v.ReleaseID, v.ServerID, v.Status, v.ManifestJSON, v.ConfigHash, v.CreatedAt, nullableTime(v.ActivatedAt))
-	return v, err
+		v.ID, v.InstanceID, v.App, v.Version, v.ReleaseID, v.ServerID, v.Status, v.ManifestJSON, v.ConfigHash, v.CreatedAt, nullableTime(v.ActivatedAt)); err != nil {
+		return v, err
+	}
+	if err := replaceAppReleaseAuxiliaryRecordsTx(tx, v); err != nil {
+		return v, err
+	}
+	return v, tx.Commit()
 }
 
 func (s *Store) ListAppReleases(instanceID string) ([]AppRelease, error) {
@@ -151,6 +176,12 @@ func (s *Store) DeleteOldAppReleases(instanceID string, keep int) (int, error) {
 	for _, row := range rowsData[keep:] {
 		if protected[row.release] {
 			continue
+		}
+		if _, err := s.db.Exec(`delete from app_release_artifacts where instance_id=? and release_id=?`, instanceID, row.release); err != nil {
+			return deleted, err
+		}
+		if _, err := s.db.Exec(`delete from app_release_snapshots where instance_id=? and release_id=?`, instanceID, row.release); err != nil {
+			return deleted, err
 		}
 		res, err := s.db.Exec(`delete from app_releases where id=?`, row.id)
 		if err != nil {

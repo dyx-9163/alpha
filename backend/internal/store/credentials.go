@@ -174,6 +174,13 @@ func (s *Store) DeleteCredential(id string) error {
 	if bindings > 0 {
 		return fmt.Errorf("credential is bound to %d app instance(s)", bindings)
 	}
+	var references int
+	if err := tx.QueryRow(`select count(*) from credential_references where credential_id=?`, id).Scan(&references); err != nil {
+		return err
+	}
+	if references > 0 {
+		return fmt.Errorf("credential is referenced by %d resource(s)", references)
+	}
 	if _, err := tx.Exec(`delete from credential_versions where credential_id=?`, id); err != nil {
 		return err
 	}
@@ -230,6 +237,11 @@ func (s *Store) CredentialBindings(credentialID string) ([]CredentialBinding, er
 func cleanupStaleCredentialReferencesTx(tx *sql.Tx) error {
 	if _, err := tx.Exec(`delete from credential_bindings
 		where not exists (select 1 from app_instances ai where ai.id=credential_bindings.app_instance_id)`); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`delete from credential_references
+		where resource_type='app-instance'
+		and not exists (select 1 from app_instances ai where ai.id=credential_references.resource_id)`); err != nil {
 		return err
 	}
 	if _, err := tx.Exec(`update credentials set app_instance_id=''

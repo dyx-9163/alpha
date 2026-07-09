@@ -67,24 +67,13 @@
                 </el-button>
               </span>
             </el-tooltip>
-            <ConfirmAction
-              :message="t('credentials.confirmDelete', { name: row.name })"
-              :title="t('common.delete')"
-              :confirm-text="t('common.delete')"
-              :cancel-text="t('common.cancel')"
-              :disabled="!canManageCredentials"
-              @confirm="deleteCredential(row)"
-            >
-              <template #default="{ confirm }">
-                <el-tooltip :content="deniedText" :disabled="canManageCredentials" placement="top">
-                  <span>
-                    <el-button size="small" type="danger" plain :disabled="!canManageCredentials" @click="confirm">
-                      {{ t('common.delete') }}
-                    </el-button>
-                  </span>
-                </el-tooltip>
-              </template>
-            </ConfirmAction>
+            <el-tooltip :content="deniedText" :disabled="canManageCredentials" placement="top">
+              <span>
+                <el-button size="small" type="danger" plain :disabled="!canManageCredentials" @click="openDeleteCredential(row)">
+                  {{ t('common.delete') }}
+                </el-button>
+              </span>
+            </el-tooltip>
           </template>
         </el-table-column>
       </el-table>
@@ -160,6 +149,53 @@
         </el-tooltip>
       </template>
     </el-dialog>
+
+    <el-dialog v-model="deleteDialogVisible" :title="t('credentials.deleteTitle')" width="min(760px, calc(100vw - 32px))" destroy-on-close>
+      <div v-loading="deleteChecking" class="credential-delete-check">
+        <p class="delete-target">
+          {{ t('credentials.confirmDelete', { name: deleteTarget?.name ?? '' }) }}
+        </p>
+        <el-alert
+          v-if="deleteReferences.length"
+          type="warning"
+          :title="t('credentials.deleteBlockedTitle')"
+          :description="t('credentials.deleteBlockedDesc')"
+          show-icon
+          :closable="false"
+        />
+        <el-alert
+          v-else
+          type="success"
+          :title="t('credentials.deleteNoReferences')"
+          show-icon
+          :closable="false"
+        />
+        <el-table v-if="deleteReferences.length" :data="deleteReferences" class="reference-table">
+          <el-table-column prop="resourceType" :label="t('credentials.deleteReferenceResource')" width="130" />
+          <el-table-column prop="resourceId" :label="t('credentials.appInstanceId')" min-width="190" show-overflow-tooltip />
+          <el-table-column prop="purpose" :label="t('credentials.deleteReferencePurpose')" min-width="120" show-overflow-tooltip />
+          <el-table-column prop="lifecyclePolicy" :label="t('credentials.deleteReferencePolicy')" width="120" />
+          <el-table-column :label="t('credentials.deleteReferenceGenerated')" width="110">
+            <template #default="{ row }">
+              <el-tag size="small" :type="row.generated ? 'success' : 'info'">
+                {{ row.generated ? t('credentials.generated') : t('credentials.manual') }}
+              </el-tag>
+            </template>
+          </el-table-column>
+        </el-table>
+      </div>
+      <template #footer>
+        <el-button @click="deleteDialogVisible = false">{{ t('common.cancel') }}</el-button>
+        <el-button
+          type="danger"
+          :loading="deleting"
+          :disabled="deleteChecking || deleting || Boolean(deleteReferences.length) || !deleteTarget"
+          @click="confirmDeleteCredential"
+        >
+          {{ t('common.delete') }}
+        </el-button>
+      </template>
+    </el-dialog>
   </PageShell>
 </template>
 
@@ -167,7 +203,6 @@
 import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import { apiDelete, apiGet, apiPost, apiPut, asArray } from '../api/client'
-import ConfirmAction from '../components/ConfirmAction.vue'
 import PageShell from '../components/PageShell.vue'
 import { usePermissions } from '../composables/usePermissions'
 import { useI18n } from '../i18n'
@@ -193,6 +228,19 @@ type Credential = {
   updatedAt?: string
 }
 
+type CredentialReference = {
+  id: string
+  credentialId: string
+  resourceType: string
+  resourceId: string
+  purpose?: string
+  generated: boolean
+  lifecyclePolicy: string
+  metadata?: string
+  createdAt?: string
+  updatedAt?: string
+}
+
 const { t } = useI18n()
 const { can, deniedText } = usePermissions()
 const items = ref<Credential[]>([])
@@ -202,6 +250,11 @@ const search = ref('')
 const kindFilter = ref('')
 const statusFilter = ref('active')
 const dialogVisible = ref(false)
+const deleteDialogVisible = ref(false)
+const deleteTarget = ref<Credential | null>(null)
+const deleteReferences = ref<CredentialReference[]>([])
+const deleteChecking = ref(false)
+const deleting = ref(false)
 const kindOptions = ['mysql', 'redis', 'minio', 'nacos', 'ssh', 'registry', 'generic']
 const form = reactive({
   id: '',
@@ -330,6 +383,40 @@ async function deleteCredential(row: Credential) {
   }
 }
 
+async function openDeleteCredential(row: Credential) {
+  if (!canManageCredentials.value) {
+    ElMessage.warning(deniedText.value)
+    return
+  }
+  deleteTarget.value = row
+  deleteReferences.value = []
+  deleteDialogVisible.value = true
+  deleteChecking.value = true
+  try {
+    const response = await apiGet<{ items?: CredentialReference[] }>(`/credentials/${encodeURIComponent(row.id)}/references`)
+    deleteReferences.value = asArray<CredentialReference>(response.items)
+  } catch (err) {
+    ElMessage.error(err instanceof Error ? err.message : t('credentials.deleteReferencesLoadFailed'))
+    deleteDialogVisible.value = false
+  } finally {
+    deleteChecking.value = false
+  }
+}
+
+async function confirmDeleteCredential() {
+  if (!deleteTarget.value || deleteReferences.value.length) {
+    return
+  }
+  deleting.value = true
+  try {
+    await deleteCredential(deleteTarget.value)
+    deleteDialogVisible.value = false
+    deleteTarget.value = null
+  } finally {
+    deleting.value = false
+  }
+}
+
 function resetForm() {
   Object.assign(form, {
     id: '',
@@ -370,6 +457,14 @@ function statusTagType(status: string) {
 watch(dialogVisible, (visible) => {
   if (!visible) {
     form.secret = ''
+  }
+})
+
+watch(deleteDialogVisible, (visible) => {
+  if (!visible) {
+    deleteTarget.value = null
+    deleteReferences.value = []
+    deleteChecking.value = false
   }
 })
 
@@ -426,6 +521,20 @@ onMounted(load)
 .credential-form :deep(.el-form-item__label) {
   font-weight: 800;
   color: var(--aifar-ink);
+}
+
+.credential-delete-check {
+  min-height: 120px;
+}
+
+.delete-target {
+  margin: 0 0 12px;
+  color: var(--aifar-text-secondary);
+  font-weight: 700;
+}
+
+.reference-table {
+  margin-top: 14px;
 }
 
 @media (max-width: 720px) {

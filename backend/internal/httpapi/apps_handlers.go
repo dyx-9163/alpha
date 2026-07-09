@@ -95,26 +95,33 @@ func (a *API) deleteAppInstance(w http.ResponseWriter, r *http.Request) {
 		parameters["removeMountedDisks"] = *req.RemoveMountedDisks
 	}
 	parameters[registry.DeleteParamConfirmedWithServerPassword] = true
-	task, err := a.tasks.StartWithLanguage("apps."+instance.App+".delete", target, actor, lang, func(ctx context.Context, log worker.Logger) error {
-		deleteReq := registry.DeleteRequest{
-			Instance:   instance,
-			Server:     server,
-			Language:   lang,
-			Actor:      actor,
-			Parameters: parameters,
-		}
-		plan, err := deleteModule.PlanDelete(ctx, deleteReq)
-		if err != nil {
-			return err
-		}
-		plannedTargets := map[string]bool{}
-		for _, step := range plan {
-			if step.Target != "" && !plannedTargets[step.Target] {
-				log.PlanTarget(step.Target)
-				plannedTargets[step.Target] = true
-			}
-			log.PlanStep(step.Target, step.Name, step.Title, step.Order)
-		}
+	deleteReq := registry.DeleteRequest{
+		Instance:   instance,
+		Server:     server,
+		Language:   lang,
+		Actor:      actor,
+		Parameters: parameters,
+	}
+	plan, err := deleteModule.PlanDelete(r.Context(), deleteReq)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "DELETE_PLAN_FAILED", err.Error(), map[string]any{"app": instance.App, "instanceId": instance.ID})
+		return
+	}
+	taskType := "apps." + instance.App + ".delete"
+	task, err := a.store.CreateTask(store.Task{Type: taskType, Target: target, Status: "pending", CreatedBy: actor})
+	if err != nil {
+		respondTask(w, task, err)
+		return
+	}
+	if err := a.storeInstallPlanOrDelete(task.ID, plan); err != nil {
+		writeError(w, http.StatusInternalServerError, "DELETE_PLAN_STORE_FAILED", err.Error(), map[string]any{"app": instance.App, "instanceId": instance.ID})
+		return
+	}
+	locks, ok := a.acquireTaskOperationLocks(w, lang, task, appInstanceOperationLockSpecs("delete", []store.AppInstance{instance}))
+	if !ok {
+		return
+	}
+	task, err = a.tasks.StartExistingWithLanguage(task, lang, func(ctx context.Context, log worker.Logger) error {
 		log.Info(i18n.Text(lang, "api.deleteInstanceRequested"), instance.App, instance.ID)
 		if err := deleteModule.Delete(ctx, deleteReq, registry.RunContext{
 			TaskID: log.TaskID(),
@@ -128,8 +135,11 @@ func (a *API) deleteAppInstance(w http.ResponseWriter, r *http.Request) {
 		log.Info(i18n.Text(lang, "api.deleteInstanceCompleted"), instance.App, instance.ID)
 		return nil
 	})
+	if err != nil {
+		a.releaseOperationLocks(locks)
+	}
 	if err == nil {
-		a.audit(r, "apps."+instance.App+".delete", target, "running", task.ID)
+		a.audit(r, taskType, target, "running", task.ID)
 	}
 	respondTask(w, task, err)
 }
@@ -138,6 +148,7 @@ type preparedDeleteInstance struct {
 	instance     store.AppInstance
 	server       store.Server
 	deleteModule registry.DeleteModule
+	plan         []registry.InstallStepPlan
 }
 
 func (a *API) deleteAppInstances(w http.ResponseWriter, r *http.Request) {
@@ -229,28 +240,37 @@ func (a *API) deleteAppInstances(w http.ResponseWriter, r *http.Request) {
 		parameters["removeMountedDisks"] = *req.RemoveMountedDisks
 	}
 	parameters[registry.DeleteParamConfirmedWithServerPassword] = true
-	task, err := a.tasks.StartWithLanguage(taskType, target, actor, lang, func(ctx context.Context, log worker.Logger) error {
-		plannedTargets := map[string]bool{}
-		for _, item := range items {
-			deleteReq := registry.DeleteRequest{
-				Instance:   item.instance,
-				Server:     item.server,
-				Language:   lang,
-				Actor:      actor,
-				Parameters: parameters,
-			}
-			plan, err := item.deleteModule.PlanDelete(ctx, deleteReq)
-			if err != nil {
-				return err
-			}
-			for _, step := range plan {
-				if step.Target != "" && !plannedTargets[step.Target] {
-					log.PlanTarget(step.Target)
-					plannedTargets[step.Target] = true
-				}
-				log.PlanStep(step.Target, step.Name, step.Title, step.Order)
-			}
+	var combinedPlan []registry.InstallStepPlan
+	for index := range items {
+		deleteReq := registry.DeleteRequest{
+			Instance:   items[index].instance,
+			Server:     items[index].server,
+			Language:   lang,
+			Actor:      actor,
+			Parameters: parameters,
 		}
+		plan, err := items[index].deleteModule.PlanDelete(r.Context(), deleteReq)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "DELETE_PLAN_FAILED", err.Error(), map[string]any{"app": items[index].instance.App, "instanceId": items[index].instance.ID})
+			return
+		}
+		items[index].plan = plan
+		combinedPlan = append(combinedPlan, plan...)
+	}
+	task, err := a.store.CreateTask(store.Task{Type: taskType, Target: target, Status: "pending", CreatedBy: actor})
+	if err != nil {
+		respondTask(w, task, err)
+		return
+	}
+	if err := a.storeInstallPlanOrDelete(task.ID, combinedPlan); err != nil {
+		writeError(w, http.StatusInternalServerError, "DELETE_PLAN_STORE_FAILED", err.Error(), map[string]any{"target": target})
+		return
+	}
+	locks, ok := a.acquireTaskOperationLocks(w, lang, task, appInstanceOperationLockSpecs("delete", selectedInstances))
+	if !ok {
+		return
+	}
+	task, err = a.tasks.StartExistingWithLanguage(task, lang, func(ctx context.Context, log worker.Logger) error {
 		log.Info(i18n.Text(lang, "api.deleteInstancesRequested"), len(items), target)
 		for _, item := range items {
 			if err := ctx.Err(); err != nil {
@@ -278,6 +298,9 @@ func (a *API) deleteAppInstances(w http.ResponseWriter, r *http.Request) {
 		log.Info(i18n.Text(lang, "api.deleteInstancesCompleted"), len(items))
 		return nil
 	})
+	if err != nil {
+		a.releaseOperationLocks(locks)
+	}
 	if err == nil {
 		a.audit(r, taskType, target, "running", task.ID)
 	}
@@ -313,25 +336,28 @@ func (a *API) checkAppInstance(w http.ResponseWriter, r *http.Request) {
 	}
 	actor := currentUser(r).Username
 	target := instance.ServerID
-	task, err := a.tasks.StartWithLanguage("apps."+instance.App+".check", target, actor, lang, func(ctx context.Context, log worker.Logger) error {
-		checkReq := registry.CheckRequest{
-			Instance: instance,
-			Server:   server,
-			Language: lang,
-			Actor:    actor,
-		}
-		plan, err := checkModule.PlanCheck(ctx, checkReq)
-		if err != nil {
-			return err
-		}
-		plannedTargets := map[string]bool{}
-		for _, step := range plan {
-			if step.Target != "" && !plannedTargets[step.Target] {
-				log.PlanTarget(step.Target)
-				plannedTargets[step.Target] = true
-			}
-			log.PlanStep(step.Target, step.Name, step.Title, step.Order)
-		}
+	checkReq := registry.CheckRequest{
+		Instance: instance,
+		Server:   server,
+		Language: lang,
+		Actor:    actor,
+	}
+	plan, err := checkModule.PlanCheck(r.Context(), checkReq)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "CHECK_PLAN_FAILED", err.Error(), map[string]any{"app": instance.App, "instanceId": instance.ID})
+		return
+	}
+	taskType := "apps." + instance.App + ".check"
+	task, err := a.store.CreateTask(store.Task{Type: taskType, Target: target, Status: "pending", CreatedBy: actor})
+	if err != nil {
+		respondTask(w, task, err)
+		return
+	}
+	if err := a.storeInstallPlanOrDelete(task.ID, plan); err != nil {
+		writeError(w, http.StatusInternalServerError, "CHECK_PLAN_STORE_FAILED", err.Error(), map[string]any{"app": instance.App, "instanceId": instance.ID})
+		return
+	}
+	task, err = a.tasks.StartExistingWithLanguage(task, lang, func(ctx context.Context, log worker.Logger) error {
 		log.Info(i18n.Text(lang, "api.checkInstanceRequested"), instance.App, instance.ID)
 		status, err := checkModule.Check(ctx, checkReq, registry.RunContext{
 			Log: log,
@@ -346,7 +372,7 @@ func (a *API) checkAppInstance(w http.ResponseWriter, r *http.Request) {
 		return nil
 	})
 	if err == nil {
-		a.audit(r, "apps."+instance.App+".check", target, "running", task.ID)
+		a.audit(r, taskType, target, "running", task.ID)
 	}
 	respondTask(w, task, err)
 }
@@ -448,9 +474,12 @@ func (a *API) installAppName(w http.ResponseWriter, r *http.Request, app string)
 		respondTask(w, task, err)
 		return
 	}
-	if err := taskplan.StorePlan(a.store, task.ID, installPlanSteps(plan)); err != nil {
-		_ = a.store.DeleteTask(task.ID)
+	if err := a.storeInstallPlanOrDelete(task.ID, plan); err != nil {
 		writeError(w, http.StatusInternalServerError, "INSTALL_PLAN_STORE_FAILED", err.Error(), map[string]any{"app": def.Name})
+		return
+	}
+	locks, ok := a.acquireTaskOperationLocks(w, lang, task, appInstallOperationLockSpecs(def.Name, serverIDs))
+	if !ok {
 		return
 	}
 	installStartedAt := task.CreatedAt
@@ -486,10 +515,25 @@ func (a *API) installAppName(w http.ResponseWriter, r *http.Request, app string)
 		a.bindInstallCredentialReferences(def.Name, moduleReq, log)
 		return nil
 	})
+	if err != nil {
+		a.releaseOperationLocks(locks)
+	}
 	if err == nil {
 		a.audit(r, "apps."+def.Name+".install", target, "running", task.ID)
 	}
 	respondTask(w, task, err)
+}
+
+func (a *API) storeInstallPlanOrDelete(taskID string, plan []registry.InstallStepPlan) error {
+	return a.storeTaskPlanOrDelete(taskID, installPlanSteps(plan))
+}
+
+func (a *API) storeTaskPlanOrDelete(taskID string, plan []taskplan.Step) error {
+	if err := taskplan.StorePlan(a.store, taskID, plan); err != nil {
+		_ = a.store.DeleteTask(taskID)
+		return err
+	}
+	return nil
 }
 
 func installPlanSteps(plan []registry.InstallStepPlan) []taskplan.Step {

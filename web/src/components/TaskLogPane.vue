@@ -91,6 +91,8 @@ import TaskRunPanel from './TaskRunPanel.vue'
 type Task = {
   id: string
   type: string
+  category?: string
+  trackable?: boolean
   target: string
   status: string
   error?: string
