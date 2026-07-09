@@ -46,9 +46,6 @@ export const minioMessages = {
     diskDevice: '磁盘设备',
     diskDevicePlaceholder: '请先选择目标服务器，再从检测到的未挂载磁盘中选择一块或多块',
     diskDeviceInvalid: '请为每台目标服务器至少选择一块未挂载磁盘',
-    rootCredential: '管理员凭据',
-    rootCredentialPlaceholder: '可选择凭据中心已有 MinIO 凭据',
-    rootCredentialManual: '手动输入管理员密码',
     rootUser: '管理员账号',
     rootUserPlaceholder: '请输入 MinIO 管理员账号',
     rootPassword: '管理员密码',
@@ -94,9 +91,6 @@ export const minioMessages = {
     diskDevice: 'Disk device',
     diskDevicePlaceholder: 'Select target servers first, then choose one or more detected unmounted disks',
     diskDeviceInvalid: 'Select at least one unmounted disk for each target server',
-    rootCredential: 'Root credential',
-    rootCredentialPlaceholder: 'Select a MinIO credential from the credential center',
-    rootCredentialManual: 'Enter root password manually',
     rootUser: 'Root user',
     rootUserPlaceholder: 'Enter MinIO root user',
     rootPassword: 'Root password',
@@ -238,21 +232,12 @@ export function minioInstallDialogProps(locale?: string, context?: AppInstallDia
         }
       },
       {
-        name: 'rootCredentialId',
-        label: copy.rootCredential,
-        type: 'select',
-        defaultValue: '',
-        placeholder: copy.rootCredentialPlaceholder,
-        options: credentialOptions(context, 'minio', copy.rootCredentialManual)
-      },
-      {
         name: 'rootUser',
         label: copy.rootUser,
         type: 'text',
         defaultValue: 'admin',
         placeholder: copy.rootUserPlaceholder,
-        required: true,
-        visibleWhen: (values) => !values.rootCredentialId
+        required: true
       },
       {
         name: 'rootPassword',
@@ -260,23 +245,10 @@ export function minioInstallDialogProps(locale?: string, context?: AppInstallDia
         type: 'password',
         defaultValue: '',
         placeholder: copy.rootPasswordPlaceholder,
-        required: true,
-        visibleWhen: (values) => !values.rootCredentialId
+        required: true
       }
     ]
   }
-}
-
-function credentialOptions(context: AppInstallDialogContext | undefined, kind: string, manualLabel: string) {
-  return [
-    { label: manualLabel, value: '' },
-    ...(context?.credentials ?? [])
-      .filter((credential) => credential.kind === kind && credential.status !== 'retired')
-      .map((credential) => ({
-        label: [credential.name, credential.username, credential.endpoint].filter(Boolean).join(' / '),
-        value: credential.id
-      }))
-  ]
 }
 
 function minioDefaultDataRoot(defaultDeployDir?: string) {

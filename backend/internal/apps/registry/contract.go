@@ -168,6 +168,17 @@ type ArtifactBundleUpdateRequest struct {
 	BundleFileName  string
 }
 
+type ArtifactRollbackRequest struct {
+	Instance        store.AppInstance
+	Server          store.Server
+	Language        string
+	Actor           string
+	TargetReleaseID string
+	Services        []string
+	Reason          string
+	Force           bool
+}
+
 type ServiceScaleOutRequest struct {
 	Instance    store.AppInstance
 	Server      store.Server
@@ -307,6 +318,12 @@ type ArtifactBundleUpdateModule interface {
 	PlanArtifactBundleUpdate(ctx context.Context, req ArtifactBundleUpdateRequest) ([]InstallStepPlan, error)
 	ValidateArtifactBundleUpdate(ctx context.Context, req ArtifactBundleUpdateRequest) error
 	UpdateArtifactBundle(ctx context.Context, req ArtifactBundleUpdateRequest, run RunContext) error
+}
+
+type ArtifactRollbackModule interface {
+	PlanArtifactRollback(ctx context.Context, req ArtifactRollbackRequest) ([]InstallStepPlan, error)
+	ValidateArtifactRollback(ctx context.Context, req ArtifactRollbackRequest) error
+	RollbackArtifact(ctx context.Context, req ArtifactRollbackRequest, run RunContext) error
 }
 
 type ServiceScaleOutModule interface {

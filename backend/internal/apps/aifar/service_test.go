@@ -127,6 +127,18 @@ func (f *fakeStore) SaveAppRelease(v store.AppRelease) (store.AppRelease, error)
 	return v, nil
 }
 
+func (f *fakeStore) ListAppReleases(instanceID string) ([]store.AppRelease, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := []store.AppRelease{}
+	for _, release := range f.releases {
+		if release.InstanceID == instanceID {
+			out = append(out, release)
+		}
+	}
+	return out, nil
+}
+
 func (f *fakeStore) DeleteOldAppReleases(instanceID string, keep int) (int, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -442,6 +454,7 @@ type fakeRemote struct {
 	installScript           string
 	updateScript            string
 	bundleScript            string
+	rollbackScript          string
 	autoscaleScript         string
 	runtimeConfigScript     string
 	serviceInstallScript    string
@@ -525,6 +538,13 @@ func (f *fakeRemote) UploadFile(ctx context.Context, server store.Server, localP
 			return err
 		}
 		f.bundleScript = string(content)
+	}
+	if strings.Contains(remotePath, "/rollback-") && strings.HasSuffix(remotePath, ".sh") {
+		content, err := os.ReadFile(localPath)
+		if err != nil {
+			return err
+		}
+		f.rollbackScript = string(content)
 	}
 	return nil
 }
@@ -2110,6 +2130,80 @@ func TestServiceUpdatesAIFARArtifactBundleAsSingleMultiServicePartialRelease(t *
 	lastUpdate, ok := metadata["lastRollout"].(map[string]any)
 	if !ok || lastUpdate["service"] != "bundle" || int(lastUpdate["deploymentConcurrency"].(float64)) != 3 {
 		t.Fatalf("expected final metadata to point at bundle update, got %s", s.instances[0].Metadata)
+	}
+}
+
+func TestServiceRollsBackAIFARServiceToReleaseArtifact(t *testing.T) {
+	instance := installedAIFARInstance(t)
+	targetReleaseID := "20260702T010203.000000000Z-rollout-oauth"
+	targetArtifact := "/aifar/apps/admin/releases/" + targetReleaseID + "/services/oauth/artifact/oauth.jar"
+	manifest, _ := json.Marshal(map[string]any{
+		"schema":          releaseManifestSchemaV2,
+		"kind":            "rollout",
+		"releaseId":       targetReleaseID,
+		"changedServices": []string{"oauth"},
+		"artifacts": map[string]any{
+			"oauth": map[string]any{
+				"file":       "oauth.jar",
+				"sha256":     strings.Repeat("a", 64),
+				"remotePath": targetArtifact,
+			},
+		},
+	})
+	s := &fakeStore{
+		servers: map[string]store.Server{
+			"srv-1": {ID: "srv-1", Name: "app-1", Host: "10.0.0.10", DeployDir: "/aifar/apps"},
+		},
+		instances: []store.AppInstance{instance},
+		releases: []store.AppRelease{{
+			InstanceID:   instance.ID,
+			App:          AppName,
+			Version:      appBundleVersion,
+			ReleaseID:    targetReleaseID,
+			ServerID:     "srv-1",
+			Status:       "success",
+			ManifestJSON: string(manifest),
+			CreatedAt:    time.Now().Add(-time.Hour),
+			ActivatedAt:  time.Now().Add(-time.Hour),
+		}},
+	}
+	remote := &fakeRemote{}
+	service := NewService(s, remote)
+	err := service.RollbackArtifact(context.Background(), ArtifactRollbackRequest{
+		Instance:        instance,
+		Server:          s.servers["srv-1"],
+		Language:        "en",
+		Actor:           "admin",
+		TargetReleaseID: targetReleaseID,
+		Services:        []string{"oauth"},
+		Reason:          "test rollback",
+	}, fakeLogger{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(remote.joinedUploads(), "rollback-oauth.sh") || !strings.Contains(remote.joinedCommands(), "rollback-oauth.sh") {
+		t.Fatalf("expected rollback script upload and run, uploads=%s commands=%s", remote.joinedUploads(), remote.joinedCommands())
+	}
+	for _, want := range []string{
+		`TARGET_REVISION='` + targetReleaseID + `'`,
+		`ARTIFACT_REMOTE='` + targetArtifact + `'`,
+		`restore_previous_runtime`,
+		`"kind": "rollback"`,
+	} {
+		if !strings.Contains(remote.rollbackScript, want) {
+			t.Fatalf("rollback script should contain %q:\n%s", want, remote.rollbackScript)
+		}
+	}
+	if len(s.releases) != 2 {
+		t.Fatalf("expected target and rollback release records, got %+v", s.releases)
+	}
+	rollback := s.releases[1]
+	if rollback.Status != "success" || !strings.Contains(rollback.ManifestJSON, `"kind":"rollback"`) || !strings.Contains(rollback.ManifestJSON, `"rollbackTo":"`+targetReleaseID+`"`) {
+		t.Fatalf("expected rollback release manifest, got %+v", rollback)
+	}
+	metadata := metadataFromInstance(s.instances[0])
+	if metadata["currentRevision"] != targetReleaseID {
+		t.Fatalf("expected metadata to point to target release, got %s", s.instances[0].Metadata)
 	}
 }
 

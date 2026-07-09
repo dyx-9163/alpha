@@ -2,7 +2,6 @@ import { resolveAppLocale, type AppLocale } from '../registry/types'
 import { targetModeResolver, topologySelectField } from '../registry/topology'
 import type {
   AppInstallDialogConfig,
-  AppInstallDialogContext,
   AppInstallDialogCopy,
   AppInstallFieldOption,
   AppInstallFieldValues,
@@ -44,9 +43,6 @@ export const mysqlMessages = {
     port: 'MySQL 端口',
     rootUser: '管理员账号',
     rootUserPlaceholder: '请输入 MySQL 管理员账号',
-    rootCredential: '管理员凭据',
-    rootCredentialPlaceholder: '可选择凭据中心已有 MySQL 凭据',
-    rootCredentialManual: '手动输入管理员密码',
     rootPassword: '管理员密码',
     rootPasswordPlaceholder: '请输入 MySQL 管理员密码'
   },
@@ -81,9 +77,6 @@ export const mysqlMessages = {
     port: 'MySQL port',
     rootUser: 'Admin user',
     rootUserPlaceholder: 'Enter MySQL admin user',
-    rootCredential: 'Admin credential',
-    rootCredentialPlaceholder: 'Select a MySQL credential from the credential center',
-    rootCredentialManual: 'Enter admin password manually',
     rootPassword: 'Admin password',
     rootPasswordPlaceholder: 'Enter MySQL admin password'
   }
@@ -105,7 +98,7 @@ export function mysqlTopologies(locale?: string): AppTopologyDefinition[] {
   ]
 }
 
-export function mysqlInstallDialogProps(locale?: string, context?: AppInstallDialogContext): AppInstallDialogConfig {
+export function mysqlInstallDialogProps(locale?: string): AppInstallDialogConfig {
   const copy = mysqlCopy(locale)
   const topologies = mysqlTopologies(locale)
   const dialogCopy: AppInstallDialogCopy = {
@@ -159,21 +152,12 @@ export function mysqlInstallDialogProps(locale?: string, context?: AppInstallDia
         validate: (value, values) => values.installRouter === false || stringArray(value).length > 0 ? undefined : copy.routerServersRequired
       },
       {
-        name: 'rootCredentialId',
-        label: copy.rootCredential,
-        type: 'select',
-        defaultValue: '',
-        placeholder: copy.rootCredentialPlaceholder,
-        options: credentialOptions(context, 'mysql', copy.rootCredentialManual)
-      },
-      {
         name: 'rootUser',
         label: copy.rootUser,
         type: 'text',
         defaultValue: 'root',
         placeholder: copy.rootUserPlaceholder,
-        required: true,
-        visibleWhen: (values) => !values.rootCredentialId
+        required: true
       },
       {
         name: 'rootPassword',
@@ -181,27 +165,10 @@ export function mysqlInstallDialogProps(locale?: string, context?: AppInstallDia
         type: 'password',
         defaultValue: '',
         placeholder: copy.rootPasswordPlaceholder,
-        required: true,
-        visibleWhen: (values) => !values.rootCredentialId
+        required: true
       }
     ]
   }
-}
-
-function credentialOptions(context: AppInstallDialogContext | undefined, kind: string, manualLabel: string): AppInstallFieldOption[] {
-  return [
-    { label: manualLabel, value: '' },
-    ...(context?.credentials ?? [])
-      .filter((credential) => credential.kind === kind && credential.status !== 'retired')
-      .map((credential) => ({
-        label: credentialLabel(credential),
-        value: credential.id
-      }))
-  ]
-}
-
-function credentialLabel(credential: { name: string; username?: string; endpoint?: string }) {
-  return [credential.name, credential.username, credential.endpoint].filter(Boolean).join(' / ')
 }
 
 function mysqlClusterTargetIds(values: AppInstallFieldValues) {

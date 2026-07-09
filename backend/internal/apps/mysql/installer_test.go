@@ -183,6 +183,27 @@ func TestMySQLStandaloneScriptsRenderTemplates(t *testing.T) {
 	if !strings.Contains(bootstrap, "clusterAdminPassword is not allowed") || !strings.Contains(bootstrap, "cluster admin account already exists") {
 		t.Fatalf("bootstrap script should retry existing cluster admin accounts:\n%s", bootstrap)
 	}
+	start, err := startInnoDBClusterScript(InnoDBClusterStartRequest{
+		ClusterName:  "aifarCluster",
+		InstallRoot:  "/aifar/apps/mysql",
+		RootUser:     "root",
+		RootPassword: "Oversea.123",
+		Nodes:        []InnoDBClusterNode{{Host: "10.0.0.1", Port: 3306}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"assertGroupReplicationTableKeys",
+		"information_schema.tables",
+		"PRIMARY KEY or a NOT NULL UNIQUE key",
+		"Group Replication table key validation failed",
+		"rebootClusterFromCompleteOutage",
+	} {
+		if !strings.Contains(start, want) {
+			t.Fatalf("start script should include Group Replication key diagnostics %q:\n%s", want, start)
+		}
+	}
 	uninstall, err := uninstallStandaloneScript("8.0.36", "/aifar/apps/mysql", "/aifar/apps/mysql/8.0.36", 3307)
 	if err != nil {
 		t.Fatal(err)

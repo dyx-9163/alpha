@@ -118,8 +118,10 @@ func (s Service) UpdateArtifactBundle(ctx context.Context, req ArtifactBundleUpd
 	var gatewayPort int
 	var webPort int
 	var workDir string
+	var releaseDir string
 	var scriptRemote string
 	var scriptArtifacts []bundleUpdateScriptArtifact
+	var serviceRevisionsBefore map[string]string
 
 	log.Info(copy.BundleUpdating, len(items))
 
@@ -137,6 +139,7 @@ func (s Service) UpdateArtifactBundle(ctx context.Context, req ArtifactBundleUpd
 			version = appBundleVersion
 		}
 		baseReleaseID = stringFromMetadata(metadata, "currentRevision", stringFromMetadata(metadata, "releaseId", ""))
+		serviceRevisionsBefore = serviceRevisionMapBefore(metadata, artifactServiceNames(artifacts))
 		releaseTime = time.Now().UTC()
 		releaseID = newReleaseID("rollout-bundle", releaseTime)
 		configHash = partialBundleUpdateConfigHash(stringFromMetadata(metadata, "configHash", ""), artifacts)
@@ -145,16 +148,38 @@ func (s Service) UpdateArtifactBundle(ctx context.Context, req ArtifactBundleUpd
 		webPort = intFromMetadata(metadata, "webPort", defaultWebPort)
 		deployDir := installerkit.RemoteDeployDir(req.Server.DeployDir)
 		workDir = installerkit.WorkDir(deployDir, AppName+"-bundle", version, releaseTime)
+		releaseDir = releaseDirPath(installRoot, releaseID)
 		scriptRemote = workDir + "/update-aifar-artifact-bundle.sh"
 		scriptArtifacts = make([]bundleUpdateScriptArtifact, 0, len(items))
 		for _, item := range items {
 			scriptArtifacts = append(scriptArtifacts, bundleUpdateScriptArtifact{
-				ServiceName:    item.ServiceName,
-				ArtifactRemote: workDir + "/" + item.ServiceName + "/" + installerkit.Sanitize(item.FileName),
-				ArtifactFile:   item.FileName,
-				ArtifactSHA256: item.SHA256,
-				ArtifactSize:   item.Size,
+				ServiceName:     item.ServiceName,
+				ArtifactRemote:  workDir + "/" + item.ServiceName + "/" + installerkit.Sanitize(item.FileName),
+				ReleaseArtifact: releaseServiceArtifactPath(installRoot, releaseID, item.ServiceName, item.FileName),
+				ArtifactFile:    item.FileName,
+				ArtifactSHA256:  item.SHA256,
+				ArtifactSize:    item.Size,
 			})
+		}
+		if releases, ok := s.store.(releaseStore); ok {
+			orchestration := rolloutOrchestrationMetadata(metadata, installRoot, releaseID, ingressNetwork, gatewayPort, webPort, artifactServiceNames(artifacts))
+			manifest := rolloutBundleReleaseManifest(version, releaseID, releaseTime, configHash, baseReleaseID, ingressNetwork, gatewayPort, webPort, artifacts, concurrency, orchestration, installRoot, req.Actor, fallbackTaskID(req.TaskID, log), serviceRevisionsBefore)
+			manifest["status"] = "pending"
+			manifest["phase"] = "pending"
+			raw, _ := json.Marshal(manifest)
+			if _, err := releases.SaveAppRelease(store.AppRelease{
+				InstanceID:   req.Instance.ID,
+				App:          AppName,
+				Version:      version,
+				ReleaseID:    releaseID,
+				ServerID:     target,
+				Status:       "pending",
+				ManifestJSON: string(raw),
+				ConfigHash:   configHash,
+				CreatedAt:    releaseTime,
+			}); err != nil {
+				return err
+			}
 		}
 		return nil
 	}); err != nil {
@@ -184,6 +209,7 @@ func (s Service) UpdateArtifactBundle(ctx context.Context, req ArtifactBundleUpd
 		script, err := renderBundleUpdateScript(bundleUpdateScriptData{
 			InstallRoot:     installRoot,
 			WorkDir:         workDir,
+			ReleaseDir:      releaseDir,
 			ServiceOrder:    serviceOrderText(),
 			ChangedServices: artifactServiceNamesText(artifacts),
 			Artifacts:       scriptArtifacts,
@@ -262,7 +288,7 @@ func (s Service) UpdateArtifactBundle(ctx context.Context, req ArtifactBundleUpd
 			}
 		}
 		if releases, ok := s.store.(releaseStore); ok {
-			manifest, _ := json.Marshal(rolloutBundleReleaseManifest(version, releaseID, releaseTime, configHash, baseReleaseID, ingressNetwork, gatewayPort, webPort, artifacts, concurrency, orchestration))
+			manifest, _ := json.Marshal(rolloutBundleReleaseManifest(version, releaseID, releaseTime, configHash, baseReleaseID, ingressNetwork, gatewayPort, webPort, artifacts, concurrency, orchestration, installRoot, req.Actor, fallbackTaskID(req.TaskID, log), serviceRevisionsBefore))
 			if _, err := releases.SaveAppRelease(store.AppRelease{
 				InstanceID:   saved.ID,
 				App:          AppName,

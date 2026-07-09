@@ -2,7 +2,6 @@ import { resolveAppLocale, type AppLocale } from '../registry/types'
 import { targetModeResolver, topologySelectField } from '../registry/topology'
 import type {
   AppInstallDialogConfig,
-  AppInstallDialogContext,
   AppInstallDialogCopy,
   AppInstallFieldOption,
   AppInstallFieldValues,
@@ -47,9 +46,6 @@ export const redisMessages = {
     port: 'Redis 端口',
     sentinelPort: 'Sentinel 端口',
     replicas: 'Cluster 副本数',
-    credential: 'Redis 凭据',
-    credentialPlaceholder: '可选择凭据中心已有 Redis 凭据',
-    credentialManual: '手动输入 Redis 密码',
     password: 'Redis 密码',
     passwordPlaceholder: '请输入 Redis 访问密码'
   },
@@ -87,9 +83,6 @@ export const redisMessages = {
     port: 'Redis port',
     sentinelPort: 'Sentinel port',
     replicas: 'Cluster replicas',
-    credential: 'Redis credential',
-    credentialPlaceholder: 'Select a Redis credential from the credential center',
-    credentialManual: 'Enter Redis password manually',
     password: 'Redis password',
     passwordPlaceholder: 'Enter Redis access password'
   }
@@ -112,7 +105,7 @@ export function redisTopologies(locale?: string): AppTopologyDefinition[] {
   ]
 }
 
-export function redisInstallDialogProps(locale?: string, context?: AppInstallDialogContext): AppInstallDialogConfig {
+export function redisInstallDialogProps(locale?: string): AppInstallDialogConfig {
   const copy = redisCopy(locale)
   const topologies = redisTopologies(locale)
   const dialogCopy: AppInstallDialogCopy = {
@@ -176,36 +169,15 @@ export function redisInstallDialogProps(locale?: string, context?: AppInstallDia
         visibleWhen: (values) => values.topology === 'cluster'
       },
       {
-        name: 'redisCredentialId',
-        label: copy.credential,
-        type: 'select',
-        defaultValue: '',
-        placeholder: copy.credentialPlaceholder,
-        options: credentialOptions(context, 'redis', copy.credentialManual)
-      },
-      {
         name: 'password',
         label: copy.password,
         type: 'password',
         defaultValue: '',
         placeholder: copy.passwordPlaceholder,
-        required: true,
-        visibleWhen: (values) => !values.redisCredentialId
+        required: true
       }
     ]
   }
-}
-
-function credentialOptions(context: AppInstallDialogContext | undefined, kind: string, manualLabel: string): AppInstallFieldOption[] {
-  return [
-    { label: manualLabel, value: '' },
-    ...(context?.credentials ?? [])
-      .filter((credential) => credential.kind === kind && credential.status !== 'retired')
-      .map((credential) => ({
-        label: [credential.name, credential.username, credential.endpoint].filter(Boolean).join(' / '),
-        value: credential.id
-      }))
-  ]
 }
 
 function validateSelectedMaster(value: unknown, values: AppInstallFieldValues, copy: ReturnType<typeof redisCopy>) {

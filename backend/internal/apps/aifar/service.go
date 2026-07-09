@@ -23,7 +23,7 @@ import (
 	"aifar-deployment/backend/internal/store"
 )
 
-//go:embed templates/install.sh templates/uninstall.sh templates/update-artifact.sh templates/update-artifact-bundle.sh templates/autoscale-out.sh templates/runtime-config.sh templates/service-install.sh templates/runtime-reconcile.sh templates/scale-service.sh
+//go:embed templates/install.sh templates/uninstall.sh templates/update-artifact.sh templates/update-artifact-bundle.sh templates/rollback-artifact.sh templates/autoscale-out.sh templates/runtime-config.sh templates/service-install.sh templates/runtime-reconcile.sh templates/scale-service.sh
 var templateFS embed.FS
 
 type Logger = installerkit.Logger
@@ -39,6 +39,7 @@ type Store interface {
 
 type releaseStore interface {
 	SaveAppRelease(v store.AppRelease) (store.AppRelease, error)
+	ListAppReleases(instanceID string) ([]store.AppRelease, error)
 	DeleteOldAppReleases(instanceID string, keep int) (int, error)
 }
 
@@ -112,6 +113,18 @@ type ArtifactBundleUpdateRequest struct {
 	BundleLocalPath string
 	BundleFileName  string
 	Concurrency     int
+}
+
+type ArtifactRollbackRequest struct {
+	Instance        store.AppInstance
+	Server          store.Server
+	Language        string
+	Actor           string
+	TaskID          string
+	TargetReleaseID string
+	Services        []string
+	Reason          string
+	Force           bool
 }
 
 type ScaleOutRequest struct {
@@ -926,28 +939,51 @@ func releaseManifest(version, releaseID string, releaseTime time.Time, configHas
 	return manifest
 }
 
-func rolloutReleaseManifest(version, releaseID string, releaseTime time.Time, configHash, baseReleaseID, ingressNetwork string, gatewayPort, webPort int, artifact artifactInfo, orchestration map[string]any) map[string]any {
+func rolloutReleaseManifest(version, releaseID string, releaseTime time.Time, configHash, baseReleaseID, ingressNetwork string, gatewayPort, webPort int, artifact artifactInfo, orchestration map[string]any, installRoot, actor, taskID string, before map[string]string) map[string]any {
+	services := servicesFromMetadata(orchestration)
+	changed := []string{artifact.ServiceName}
+	after := serviceRevisionMapAfter(releaseID, changed)
+	if before == nil {
+		before = map[string]string{}
+	}
+	artifactRemotePath := releaseServiceArtifactPath(installRoot, releaseID, artifact.ServiceName, artifact.FileName)
+	snapshotDir := releaseServiceSnapshotPath(installRoot, releaseID, artifact.ServiceName)
 	manifest := map[string]any{
-		"app":              AppName,
-		"version":          version,
-		"releaseId":        releaseID,
-		"kind":             "rollout",
-		"status":           "success",
-		"phase":            releasePhaseActive,
-		"configHash":       configHash,
-		"previousRevision": baseReleaseID,
-		"createdAt":        releaseTime.Format(time.RFC3339),
-		"services":         servicesFromMetadata(orchestration),
-		"changedServices":  []string{artifact.ServiceName},
+		"schema":                 releaseManifestSchemaV2,
+		"app":                    AppName,
+		"version":                version,
+		"releaseId":              releaseID,
+		"kind":                   "rollout",
+		"status":                 "success",
+		"phase":                  releasePhaseActive,
+		"configHash":             configHash,
+		"baseReleaseId":          baseReleaseID,
+		"previousRevision":       baseReleaseID,
+		"createdAt":              releaseTime.Format(time.RFC3339),
+		"actor":                  actor,
+		"taskId":                 taskID,
+		"releaseDir":             releaseDirPath(installRoot, releaseID),
+		"services":               services,
+		"changedServices":        changed,
+		"serviceRevisionsBefore": before,
+		"serviceRevisionsAfter":  after,
 		"artifacts": map[string]any{
 			artifact.ServiceName: map[string]any{
-				"file":   artifact.FileName,
-				"sha256": artifact.SHA256,
-				"size":   artifact.Size,
+				"type":       artifactTypeForService(artifact.ServiceName, artifact.FileName),
+				"file":       artifact.FileName,
+				"sha256":     artifact.SHA256,
+				"size":       artifact.Size,
+				"remotePath": artifactRemotePath,
+			},
+		},
+		"snapshots": map[string]any{
+			"runtimeSpecBefore": releaseDirPath(installRoot, releaseID) + "/snapshot/before-runtime-spec.json",
+			"envBefore": map[string]string{
+				artifact.ServiceName: snapshotDir + "/before.env",
 			},
 		},
 	}
-	for key, value := range releaseManifestFields(releaseID, ingressNetwork, gatewayPort, webPort, servicesFromMetadata(orchestration)) {
+	for key, value := range releaseManifestFields(releaseID, ingressNetwork, gatewayPort, webPort, services) {
 		manifest[key] = value
 	}
 	applyEffectiveReleaseFields(manifest, orchestration)
@@ -955,38 +991,68 @@ func rolloutReleaseManifest(version, releaseID string, releaseTime time.Time, co
 	return manifest
 }
 
-func rolloutBundleReleaseManifest(version, releaseID string, releaseTime time.Time, configHash, baseReleaseID, ingressNetwork string, gatewayPort, webPort int, artifacts []artifactInfo, concurrency int, orchestration map[string]any) map[string]any {
+func rolloutBundleReleaseManifest(version, releaseID string, releaseTime time.Time, configHash, baseReleaseID, ingressNetwork string, gatewayPort, webPort int, artifacts []artifactInfo, concurrency int, orchestration map[string]any, installRoot, actor, taskID string, before map[string]string) map[string]any {
 	changed := make([]string, 0, len(artifacts))
 	artifactMap := make(map[string]any, len(artifacts))
+	envBefore := make(map[string]string, len(artifacts))
 	for _, artifact := range artifacts {
 		changed = append(changed, artifact.ServiceName)
 		artifactMap[artifact.ServiceName] = map[string]any{
-			"file":   artifact.FileName,
-			"sha256": artifact.SHA256,
-			"size":   artifact.Size,
+			"type":       artifactTypeForService(artifact.ServiceName, artifact.FileName),
+			"file":       artifact.FileName,
+			"sha256":     artifact.SHA256,
+			"size":       artifact.Size,
+			"remotePath": releaseServiceArtifactPath(installRoot, releaseID, artifact.ServiceName, artifact.FileName),
 		}
+		envBefore[artifact.ServiceName] = releaseServiceSnapshotPath(installRoot, releaseID, artifact.ServiceName) + "/before.env"
 	}
+	if before == nil {
+		before = map[string]string{}
+	}
+	services := servicesFromMetadata(orchestration)
 	manifest := map[string]any{
-		"app":                   AppName,
-		"version":               version,
-		"releaseId":             releaseID,
-		"kind":                  "rollout-bundle",
-		"status":                "success",
-		"phase":                 releasePhaseActive,
-		"configHash":            configHash,
-		"previousRevision":      baseReleaseID,
-		"createdAt":             releaseTime.Format(time.RFC3339),
-		"services":              servicesFromMetadata(orchestration),
-		"changedServices":       changed,
-		"deploymentConcurrency": concurrency,
-		"artifacts":             artifactMap,
+		"schema":                 releaseManifestSchemaV2,
+		"app":                    AppName,
+		"version":                version,
+		"releaseId":              releaseID,
+		"kind":                   "rollout-bundle",
+		"status":                 "success",
+		"phase":                  releasePhaseActive,
+		"configHash":             configHash,
+		"baseReleaseId":          baseReleaseID,
+		"previousRevision":       baseReleaseID,
+		"createdAt":              releaseTime.Format(time.RFC3339),
+		"actor":                  actor,
+		"taskId":                 taskID,
+		"releaseDir":             releaseDirPath(installRoot, releaseID),
+		"services":               services,
+		"changedServices":        changed,
+		"serviceRevisionsBefore": before,
+		"serviceRevisionsAfter":  serviceRevisionMapAfter(releaseID, changed),
+		"deploymentConcurrency":  concurrency,
+		"artifacts":              artifactMap,
+		"snapshots": map[string]any{
+			"runtimeSpecBefore": releaseDirPath(installRoot, releaseID) + "/snapshot/before-runtime-spec.json",
+			"envBefore":         envBefore,
+		},
 	}
-	for key, value := range releaseManifestFields(releaseID, ingressNetwork, gatewayPort, webPort, servicesFromMetadata(orchestration)) {
+	for key, value := range releaseManifestFields(releaseID, ingressNetwork, gatewayPort, webPort, services) {
 		manifest[key] = value
 	}
 	applyEffectiveReleaseFields(manifest, orchestration)
 	applyEffectiveServiceFields(manifest, orchestration)
 	return manifest
+}
+
+func artifactTypeForService(service, fileName string) string {
+	if cleanAIFARServiceName(service) == "web-vue3" {
+		return "web"
+	}
+	ext := strings.ToLower(filepath.Ext(fileName))
+	if ext == ".zip" || ext == ".tar" || ext == ".tgz" || ext == ".gz" {
+		return "web"
+	}
+	return "java"
 }
 
 type artifactInfo struct {
@@ -1039,8 +1105,11 @@ func (s Service) UpdateArtifact(ctx context.Context, req ArtifactUpdateRequest, 
 	var gatewayPort int
 	var webPort int
 	var workDir string
+	var releaseDir string
 	var artifactRemote string
+	var releaseArtifact string
 	var scriptRemote string
+	var serviceRevisionsBefore map[string]string
 
 	if err := step(1, func() error {
 		var err error
@@ -1058,6 +1127,7 @@ func (s Service) UpdateArtifact(ctx context.Context, req ArtifactUpdateRequest, 
 			version = appBundleVersion
 		}
 		baseReleaseID = currentRevisionForService(metadata, artifact.ServiceName)
+		serviceRevisionsBefore = serviceRevisionMapBefore(metadata, []string{artifact.ServiceName})
 		releaseTime = time.Now().UTC()
 		releaseID = newReleaseID("rollout-"+artifact.ServiceName, releaseTime)
 		configHash = partialUpdateConfigHash(stringFromMetadata(metadata, "configHash", ""), artifact.ServiceName, artifact.FileName, artifact.SHA256)
@@ -1066,8 +1136,30 @@ func (s Service) UpdateArtifact(ctx context.Context, req ArtifactUpdateRequest, 
 		webPort = intFromMetadata(metadata, "webPort", defaultWebPort)
 		deployDir := installerkit.RemoteDeployDir(req.Server.DeployDir)
 		workDir = installerkit.WorkDir(deployDir, AppName+"-"+artifact.ServiceName, version, releaseTime)
+		releaseDir = releaseDirPath(installRoot, releaseID)
 		artifactRemote = workDir + "/" + installerkit.Sanitize(artifact.FileName)
+		releaseArtifact = releaseServiceArtifactPath(installRoot, releaseID, artifact.ServiceName, artifact.FileName)
 		scriptRemote = workDir + "/update-aifar-artifact.sh"
+		if releases, ok := s.store.(releaseStore); ok {
+			orchestration := rolloutOrchestrationMetadata(metadata, installRoot, releaseID, ingressNetwork, gatewayPort, webPort, []string{artifact.ServiceName})
+			manifest := rolloutReleaseManifest(version, releaseID, releaseTime, configHash, baseReleaseID, ingressNetwork, gatewayPort, webPort, artifact, orchestration, installRoot, req.Actor, fallbackTaskID(req.TaskID, log), serviceRevisionsBefore)
+			manifest["status"] = "pending"
+			manifest["phase"] = "pending"
+			raw, _ := json.Marshal(manifest)
+			if _, err := releases.SaveAppRelease(store.AppRelease{
+				InstanceID:   req.Instance.ID,
+				App:          AppName,
+				Version:      version,
+				ReleaseID:    releaseID,
+				ServerID:     target,
+				Status:       "pending",
+				ManifestJSON: string(raw),
+				ConfigHash:   configHash,
+				CreatedAt:    releaseTime,
+			}); err != nil {
+				return err
+			}
+		}
 		return nil
 	}); err != nil {
 		msg := fmt.Sprintf(copy.UpdateFailed, err)
@@ -1093,9 +1185,11 @@ func (s Service) UpdateArtifact(ctx context.Context, req ArtifactUpdateRequest, 
 		script, err := renderUpdateScript(updateScriptData{
 			InstallRoot:      installRoot,
 			WorkDir:          workDir,
+			ReleaseDir:       releaseDir,
 			ServiceOrder:     serviceOrderText(),
 			ServiceName:      artifact.ServiceName,
 			ArtifactRemote:   artifactRemote,
+			ReleaseArtifact:  releaseArtifact,
 			ArtifactFileName: artifact.FileName,
 			ArtifactSHA256:   artifact.SHA256,
 			ArtifactSize:     artifact.Size,
@@ -1171,7 +1265,7 @@ func (s Service) UpdateArtifact(ctx context.Context, req ArtifactUpdateRequest, 
 			return err
 		}
 		if releases, ok := s.store.(releaseStore); ok {
-			manifest, _ := json.Marshal(rolloutReleaseManifest(version, releaseID, releaseTime, configHash, baseReleaseID, ingressNetwork, gatewayPort, webPort, artifact, orchestration))
+			manifest, _ := json.Marshal(rolloutReleaseManifest(version, releaseID, releaseTime, configHash, baseReleaseID, ingressNetwork, gatewayPort, webPort, artifact, orchestration, installRoot, req.Actor, fallbackTaskID(req.TaskID, log), serviceRevisionsBefore))
 			if _, err := releases.SaveAppRelease(store.AppRelease{
 				InstanceID:   saved.ID,
 				App:          AppName,
@@ -1659,10 +1753,12 @@ type uninstallScriptData struct {
 type updateScriptData struct {
 	InstallRoot      string
 	WorkDir          string
+	ReleaseDir       string
 	ServiceOrder     string
 	ServiceName      string
 	DesiredReplicas  string
 	ArtifactRemote   string
+	ReleaseArtifact  string
 	ArtifactFileName string
 	ArtifactSHA256   string
 	ArtifactSize     int64
@@ -1674,16 +1770,18 @@ type updateScriptData struct {
 }
 
 type bundleUpdateScriptArtifact struct {
-	ServiceName    string
-	ArtifactRemote string
-	ArtifactFile   string
-	ArtifactSHA256 string
-	ArtifactSize   int64
+	ServiceName     string
+	ArtifactRemote  string
+	ReleaseArtifact string
+	ArtifactFile    string
+	ArtifactSHA256  string
+	ArtifactSize    int64
 }
 
 type bundleUpdateScriptData struct {
 	InstallRoot     string
 	WorkDir         string
+	ReleaseDir      string
 	ServiceOrder    string
 	ChangedServices string
 	DesiredReplicas string
@@ -1694,6 +1792,23 @@ type bundleUpdateScriptData struct {
 	ConfigHash      string
 	IngressNetwork  string
 	Concurrency     int
+}
+
+type rollbackScriptData struct {
+	InstallRoot      string
+	WorkDir          string
+	RollbackDir      string
+	ServiceOrder     string
+	ServiceName      string
+	DesiredReplicas  string
+	ArtifactRemote   string
+	ArtifactFileName string
+	ArtifactSHA256   string
+	TargetRevision   string
+	RollbackID       string
+	CreatedAt        string
+	ConfigHash       string
+	IngressNetwork   string
 }
 
 type autoscaleOutScriptData struct {
@@ -1751,6 +1866,16 @@ func renderBundleUpdateScript(data bundleUpdateScriptData) (string, error) {
 		return "", err
 	}
 	return installerkit.RenderTemplate(AppName, "update-artifact-bundle.sh", "aifar-update-bundle", string(content), template.FuncMap{
+		"quote": shellQuoteAny,
+	}, data)
+}
+
+func renderRollbackScript(data rollbackScriptData) (string, error) {
+	content, err := templateFS.ReadFile("templates/rollback-artifact.sh")
+	if err != nil {
+		return "", err
+	}
+	return installerkit.RenderTemplate(AppName, "rollback-artifact.sh", "aifar-rollback", string(content), template.FuncMap{
 		"quote": shellQuoteAny,
 	}, data)
 }

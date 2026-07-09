@@ -40,9 +40,6 @@ export const nacosMessages = {
     jvmXms: 'JVM Xms',
     jvmXmx: 'JVM Xmx',
     jvmXmn: 'JVM Xmn',
-    nacosCredential: 'Nacos 凭据',
-    nacosCredentialPlaceholder: '可选择凭据中心已有 Nacos 凭据',
-    nacosCredentialManual: '手动输入 Nacos 账号',
     nacosUser: 'Nacos 用户',
     nacosPassword: 'Nacos 密码',
     dbSource: '存储来源',
@@ -90,9 +87,6 @@ export const nacosMessages = {
     jvmXms: 'JVM Xms',
     jvmXmx: 'JVM Xmx',
     jvmXmn: 'JVM Xmn',
-    nacosCredential: 'Nacos credential',
-    nacosCredentialPlaceholder: 'Select a Nacos credential from the credential center',
-    nacosCredentialManual: 'Enter Nacos account manually',
     nacosUser: 'Nacos user',
     nacosPassword: 'Nacos password',
     dbSource: 'Storage source',
@@ -172,16 +166,11 @@ export function nacosInstallDialogProps(locale?: string, context?: AppInstallDia
         validate: (value) => stringArray(value).length === 3 ? undefined : copy.clusterServersRequired
       },
       {
-        ...selectField('nacosCredentialId', copy.nacosCredential, credentialOptions(context, 'nacos', copy.nacosCredentialManual), '', copy, copy.nacosCredentialPlaceholder, false)
-      },
-      {
-        ...requiredText('nacosUser', copy.nacosUser, 'nacos', copy),
-        visibleWhen: (values) => !values.nacosCredentialId
+        ...requiredText('nacosUser', copy.nacosUser, 'nacos', copy)
       },
       {
         ...requiredText('nacosPassword', copy.nacosPassword, '', copy),
-        type: 'password',
-        visibleWhen: (values) => !values.nacosCredentialId
+        type: 'password'
       },
       {
         ...selectField('dbSource', copy.dbSource, [

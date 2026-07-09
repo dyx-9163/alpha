@@ -131,6 +131,44 @@
                   </el-table>
                 </div>
               </el-tab-pane>
+              <el-tab-pane :label="t('containers.releases')" name="releases">
+                <div class="runtime-resource-panel">
+                  <div class="runtime-tab-toolbar">
+                    <span class="selection-summary">{{ t('containers.releaseCount', { count: aifarReleases.length }) }}</span>
+                    <div class="runtime-tab-actions">
+                      <el-button size="small" :loading="loading" @click="loadAifarReleases(true)">{{ t('common.refresh') }}</el-button>
+                    </div>
+                  </div>
+                  <el-table :data="aifarReleases" height="calc(100% - 44px)" row-key="releaseId">
+                    <el-table-column prop="releaseId" :label="t('containers.releaseId')" min-width="240" show-overflow-tooltip />
+                    <el-table-column :label="t('containers.releaseKind')" width="130">
+                      <template #default="{ row }">{{ releaseKindLabel(row.kind) }}</template>
+                    </el-table-column>
+                    <el-table-column :label="t('common.status')" width="120">
+                      <template #default="{ row }">
+                        <StatusTag :status="aifarRuntimeStatusKind(row.status)" :label="releaseStatusLabel(row.status)" />
+                      </template>
+                    </el-table-column>
+                    <el-table-column :label="t('containers.service')" min-width="150" show-overflow-tooltip>
+                      <template #default="{ row }">{{ releaseServicesText(row) }}</template>
+                    </el-table-column>
+                    <el-table-column prop="activatedAt" :label="t('containers.activatedAt')" min-width="170" show-overflow-tooltip>
+                      <template #default="{ row }">{{ formatDate(row.activatedAt || row.createdAt) }}</template>
+                    </el-table-column>
+                    <el-table-column :label="t('common.operation')" width="120" fixed="right">
+                      <template #default="{ row }">
+                        <el-tooltip :content="releaseRollbackDisabledReason(row)" :disabled="!releaseRollbackDisabledReason(row)" placement="top">
+                          <span>
+                            <el-button size="small" type="warning" plain :disabled="Boolean(releaseRollbackDisabledReason(row))" @click="rollbackAifarRelease(row)">
+                              {{ t('containers.rollbackRelease') }}
+                            </el-button>
+                          </span>
+                        </el-tooltip>
+                      </template>
+                    </el-table-column>
+                  </el-table>
+                </div>
+              </el-tab-pane>
               <el-tab-pane :label="t('containers.services')" name="services">
                 <div class="runtime-resource-panel">
                   <el-table :data="selectedRuntimeServices" height="100%" row-key="serviceName">
@@ -736,6 +774,27 @@ type AifarRuntimeResponse = {
   warnings?: string[]
 }
 
+type AifarRelease = {
+  id?: string
+  instanceId: string
+  releaseId: string
+  kind?: string
+  status?: string
+  manifestStatus?: string
+  version?: string
+  serverId?: string
+  configHash?: string
+  createdAt?: string
+  activatedAt?: string
+  changedServices?: string[]
+  rollbackAvailable?: boolean
+  manifest?: Record<string, any>
+}
+
+type AifarReleaseListResponse = {
+  items?: AifarRelease[]
+}
+
 const { t } = useI18n()
 const { can, deniedText } = usePermissions()
 const taskProgress = useTaskProgressStore()
@@ -753,6 +812,8 @@ const pageReady = ref(false)
 const summaryCache = ref<Record<string, DockerSummaryResponse>>({})
 const collectionCache = ref<Record<string, any[]>>({})
 const runtimeCache = ref<Record<string, AifarRuntimeResponse>>({})
+const aifarReleases = ref<AifarRelease[]>([])
+const aifarReleaseCache = ref<Record<string, AifarRelease[]>>({})
 const selectedImageRows = ref<any[]>([])
 const error = ref('')
 const tab = ref<'overview' | 'aifar-runtime' | 'images'>('overview')
@@ -766,7 +827,7 @@ const aifarUpdateService = ref('oauth')
 const aifarArtifactFile = ref<File | null>(null)
 const aifarRuntime = ref<AifarRuntimeResponse>({ runtimeStatus: 'unknown', agent: { status: 'unknown' }, instances: [], services: [], pods: [], ingress: [], warnings: [] })
 const selectedRuntimeInstanceId = ref('')
-const runtimeResourceTab = ref<'deployments' | 'services' | 'pods' | 'logs' | 'ingress'>('deployments')
+const runtimeResourceTab = ref<'deployments' | 'releases' | 'services' | 'pods' | 'logs' | 'ingress'>('deployments')
 const runtimePodServiceFilter = ref('')
 const runtimePodsLoaded = ref<Record<string, boolean>>({})
 const runtimePodStatsLoaded = ref<Record<string, boolean>>({})
@@ -968,6 +1029,7 @@ const runtimeLogVirtualRows = computed(() => filteredRuntimeLogRows.value.slice(
 const runtimeLogTopSpacer = computed(() => runtimeLogVirtualStart.value * runtimeLogRowHeight)
 const runtimeLogBottomSpacer = computed(() => Math.max(0, (filteredRuntimeLogRows.value.length - runtimeLogVirtualStart.value - runtimeLogVirtualRows.value.length) * runtimeLogRowHeight))
 const runtimeLogWarnings = computed(() => asArray<string>(runtimeLogs.value.warnings))
+const selectedRuntimeReleaseCacheKey = computed(() => selectedRuntimeInstance.value?.id ? `aifar-releases:${selectedRuntimeInstance.value.id}` : '')
 const runtimeLogPendingCount = computed(() => runtimeLogPendingRows.value.length)
 const runtimeLogStreamStatusLabel = computed(() => t(`containers.logStream.${runtimeLogStreamStatus.value}`))
 const runtimeLogStreamTagType = computed(() => {
@@ -1259,6 +1321,27 @@ async function loadAifarRuntime(force = false, includePods = runtimeResourceTab.
   })
 }
 
+async function loadAifarReleases(force = false) {
+  const instance = selectedRuntimeInstance.value
+  if (!instance?.id) {
+    aifarReleases.value = []
+    return
+  }
+  const key = selectedRuntimeReleaseCacheKey.value
+  if (!force && key && aifarReleaseCache.value[key]) {
+    aifarReleases.value = aifarReleaseCache.value[key]
+    return
+  }
+  return withLoading(async () => {
+    const result = await apiGet<AifarReleaseListResponse>(`/apps/instances/${instance.id}/aifar/releases`)
+    const items = asArray<AifarRelease>(result.items)
+    aifarReleases.value = items
+    if (key) {
+      aifarReleaseCache.value = { ...aifarReleaseCache.value, [key]: items }
+    }
+  })
+}
+
 async function ensureRuntimePodsLoaded(force = false, includeStats = false) {
   if (!targetQuery()) return
   if (!force && runtimePodsLoadedForCurrentScope.value && (!includeStats || runtimePodStatsLoadedForCurrentScope.value)) return
@@ -1545,6 +1628,8 @@ async function loadActive(force = false) {
     } else if (tab.value === 'aifar-runtime') {
       if (runtimeResourceTab.value === 'logs') {
         loadRuntimeLogs(force)
+      } else if (runtimeResourceTab.value === 'releases') {
+        await loadAifarReleases(force)
       } else {
         await loadAifarRuntime(force)
       }
@@ -1671,9 +1756,11 @@ function aifarRuntimeStatusKind(status?: string) {
     case 'ready':
     case 'running':
     case 'active':
+    case 'success':
       return 'running'
     case 'starting':
     case 'rolling':
+    case 'pending':
       return 'pending'
     case 'degraded':
     case 'draining':
@@ -1695,6 +1782,83 @@ function aifarRuntimeStatusLabel(status?: string) {
   const key = `containers.runtimeStatus.${String(status || 'unknown').trim() || 'unknown'}`
   const value = t(key)
   return value === key ? String(status || t('common.unknown')) : value
+}
+
+function releaseKindLabel(kind?: string) {
+  const key = `containers.releaseKind.${String(kind || 'unknown').trim() || 'unknown'}`
+  const value = t(key)
+  return value === key ? String(kind || t('common.unknown')) : value
+}
+
+function releaseStatusLabel(status?: string) {
+  const key = `containers.releaseStatus.${String(status || 'unknown').trim() || 'unknown'}`
+  const value = t(key)
+  return value === key ? String(status || t('common.unknown')) : value
+}
+
+function releaseServicesText(row: AifarRelease) {
+  return asArray<string>(row.changedServices).join(', ') || '-'
+}
+
+function formatDate(value?: string) {
+  if (!value) return '-'
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return value
+  return date.toLocaleString()
+}
+
+function releaseRollbackDisabledReason(row: AifarRelease) {
+  if (!canManageApps.value) return deniedText.value
+  if (!row.rollbackAvailable) return t('containers.releaseRollbackUnavailable')
+  if (!row.releaseId) return t('containers.releaseIdRequired')
+  return ''
+}
+
+async function rollbackAifarRelease(row: AifarRelease) {
+  const reason = releaseRollbackDisabledReason(row)
+  if (reason) {
+    ElMessage.warning(reason)
+    return
+  }
+  const instance = selectedRuntimeInstance.value
+  if (!instance?.id) {
+    ElMessage.warning(t('containers.selectAifarInstance'))
+    return
+  }
+  let input = ''
+  try {
+    const result = await ElMessageBox.prompt(
+      t('containers.rollbackReasonPrompt', { release: row.releaseId }),
+      t('containers.rollbackRelease'),
+      {
+        inputType: 'textarea',
+        inputPlaceholder: t('containers.rollbackReasonPlaceholder'),
+        confirmButtonText: t('containers.rollbackRelease'),
+        cancelButtonText: t('common.cancel'),
+        type: 'warning',
+        inputValidator: (value) => Boolean(String(value || '').trim()) || t('containers.rollbackReasonRequired')
+      }
+    )
+    input = String(result.value || '').trim()
+  } catch {
+    return
+  }
+  try {
+    const result = await apiPost<{ taskId: string }>(`/apps/instances/${instance.id}/aifar/rollback`, {
+      targetReleaseId: row.releaseId,
+      services: asArray<string>(row.changedServices),
+      reason: input
+    })
+    trackTask(result.taskId, t('containers.rollbackRelease'))
+    ElMessage.success(t('containers.rollbackAccepted'))
+    aifarReleaseCache.value = {}
+    setTimeout(() => {
+      void loadAifarRuntime(true)
+      void loadAifarReleases(true)
+    }, 800)
+  } catch (err) {
+    ElMessage.error(err instanceof Error ? err.message : t('containers.rollbackFailed'))
+  }
 }
 
 function runtimeEndpointText(row: AifarRuntimeService) {
@@ -2352,6 +2516,9 @@ watch(resourceTab, () => {
 watch(runtimeResourceTab, (next) => {
   if (next === 'pods') {
     void ensureRuntimePodsLoaded(false)
+  } else if (next === 'releases') {
+    closeRuntimeLogStream()
+    void loadAifarReleases(false)
   } else if (next === 'logs') {
     void ensureRuntimePodsLoaded(false)
     if (runtimeLogSelectionReady.value) {
@@ -2370,9 +2537,12 @@ watch(selectedRuntimeInstanceId, () => {
   runtimeLogSinceSeconds.value = 0
   resetRuntimeLogView()
   runtimeLogsLoaded.value = {}
+  aifarReleases.value = []
   closeRuntimeLogStream()
   if (runtimeResourceTab.value === 'logs') {
     void ensureRuntimePodsLoaded(false)
+  } else if (runtimeResourceTab.value === 'releases') {
+    void loadAifarReleases(false)
   }
 })
 watch(runtimeLogServiceFilter, () => {

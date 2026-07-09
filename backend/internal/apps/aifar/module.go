@@ -316,6 +316,55 @@ func (m Module) UpdateArtifactBundle(ctx context.Context, req registry.ArtifactB
 	})
 }
 
+func (m Module) PlanArtifactRollback(ctx context.Context, req registry.ArtifactRollbackRequest) ([]registry.InstallStepPlan, error) {
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	copy := updateCopyFor(req.Language)
+	target := req.Instance.ServerID
+	if target == "" {
+		target = req.Server.ID
+	}
+	steps := updateSteps(copy)
+	plan := make([]registry.InstallStepPlan, 0, len(steps))
+	for idx, step := range steps {
+		plan = append(plan, registry.InstallStepPlan{Target: target, Name: step.Name, Title: step.Title, Order: idx + 1})
+	}
+	return plan, nil
+}
+
+func (m Module) ValidateArtifactRollback(ctx context.Context, req registry.ArtifactRollbackRequest) error {
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	return m.service.ValidateArtifactRollback(ArtifactRollbackRequest{
+		Instance:        req.Instance,
+		Server:          req.Server,
+		Language:        req.Language,
+		Actor:           req.Actor,
+		TargetReleaseID: req.TargetReleaseID,
+		Services:        req.Services,
+		Reason:          req.Reason,
+		Force:           req.Force,
+	})
+}
+
+func (m Module) RollbackArtifact(ctx context.Context, req registry.ArtifactRollbackRequest, run registry.RunContext) error {
+	return m.service.RollbackArtifact(ctx, ArtifactRollbackRequest{
+		Instance:        req.Instance,
+		Server:          req.Server,
+		Language:        req.Language,
+		Actor:           req.Actor,
+		TaskID:          run.TaskID,
+		TargetReleaseID: req.TargetReleaseID,
+		Services:        req.Services,
+		Reason:          req.Reason,
+		Force:           req.Force,
+	}, run.Log, func(target string) Logger {
+		return run.LoggerForTarget(target)
+	})
+}
+
 func (m Module) ScaleOutService(ctx context.Context, req registry.ServiceScaleOutRequest, run registry.RunContext) error {
 	return m.service.ScaleOut(ctx, ScaleOutRequest{
 		Instance:    req.Instance,

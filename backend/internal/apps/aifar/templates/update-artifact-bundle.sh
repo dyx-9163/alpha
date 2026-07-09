@@ -3,6 +3,7 @@ set -eu
 
 INSTALL_ROOT={{ quote .InstallRoot }}
 WORK_DIR={{ quote .WorkDir }}
+RELEASE_DIR={{ quote .ReleaseDir }}
 SERVICE_ORDER={{ quote .ServiceOrder }}
 CHANGED_SERVICES={{ quote .ChangedServices }}
 DESIRED_REPLICAS={{ quote .DesiredReplicas }}
@@ -17,6 +18,7 @@ RUNTIME_DIR="$INSTALL_ROOT/runtime"
 APP_DIR="$RUNTIME_DIR/services"
 ENV_DIR="$RUNTIME_DIR/env"
 LOG_DIR="$RUNTIME_DIR/logs"
+SNAPSHOT_ROOT="$RELEASE_DIR/services"
 TMP_DIR="$INSTALL_ROOT/.rollout-bundle-$REVISION-$$"
 DRAIN_SECONDS="${DRAIN_SECONDS:-30}"
 ORCHESTRATION_MODEL="agent-runtime-v2"
@@ -199,6 +201,15 @@ artifact_remote_for_service() {
   esac
 }
 
+release_artifact_for_service() {
+  case "$1" in
+{{- range .Artifacts }}
+    {{ .ServiceName }}) printf "%s" {{ quote .ReleaseArtifact }} ;;
+{{- end }}
+    *) return 1 ;;
+  esac
+}
+
 artifact_file_for_service() {
   case "$1" in
 {{- range .Artifacts }}
@@ -324,9 +335,43 @@ install_java_artifact() {
   cp "$artifact_remote" "$service_dir/target/$artifact_name"
 }
 
-apply_artifact() {
+snapshot_service_state() {
+  service="$1"
+  snapshot_dir="$SNAPSHOT_ROOT/$service/snapshot"
+  mkdir -p "$snapshot_dir" "$RELEASE_DIR/snapshot"
+  service_env="$ENV_DIR/$service.env"
+  [ -f "$service_env" ] && cp "$service_env" "$snapshot_dir/before.env" || true
+  [ -f "$INSTALL_ROOT/runtime/agent/runtime-spec.json" ] && cp "$INSTALL_ROOT/runtime/agent/runtime-spec.json" "$RELEASE_DIR/snapshot/before-runtime-spec.json" || true
+  image="$(read_env_value "$service_env" APP_IMAGE "")"
+  revision="$(read_env_value "$service_env" AIFAR_REVISION "")"
+  printf "%s" "$image" > "$snapshot_dir/before-image.txt"
+  printf "%s" "$revision" > "$snapshot_dir/before-revision.txt"
+  case "$service" in
+    web-vue3)
+      if [ -d "$APP_DIR/$service/dist" ]; then
+        rm -rf "$snapshot_dir/dist"
+        cp -a "$APP_DIR/$service/dist" "$snapshot_dir/dist"
+      fi
+      ;;
+    *)
+      [ -f "$APP_DIR/$service/app.jar" ] && cp "$APP_DIR/$service/app.jar" "$snapshot_dir/app.jar" || true
+      ;;
+  esac
+}
+
+stage_release_artifact() {
   service="$1"
   artifact_remote="$(artifact_remote_for_service "$service")"
+  artifact_release="$(release_artifact_for_service "$service")"
+  artifact_sha="$(artifact_sha_for_service "$service")"
+  mkdir -p "$(dirname "$artifact_release")"
+  cp "$artifact_remote" "$artifact_release"
+  printf "%s  %s\n" "$artifact_sha" "$(basename "$artifact_release")" > "$(dirname "$artifact_release")/sha256"
+}
+
+apply_artifact() {
+  service="$1"
+  artifact_remote="$(release_artifact_for_service "$service")"
   artifact_file="$(artifact_file_for_service "$service")"
   artifact_sha="$(artifact_sha_for_service "$service")"
   service_dir="$APP_DIR/$service"
@@ -500,9 +545,23 @@ cleanup_failed_service() {
   [ -z "$pods" ] || docker rm -f $pods >/dev/null 2>&1 || true
 }
 
+restore_previous_runtime() {
+  for service in $CHANGED_SERVICES; do
+    snapshot_dir="$SNAPSHOT_ROOT/$service/snapshot"
+    service_env="$ENV_DIR/$service.env"
+    [ -f "$snapshot_dir/before.env" ] && cp "$snapshot_dir/before.env" "$service_env" || true
+  done
+  [ -f "$RELEASE_DIR/snapshot/before-runtime-spec.json" ] && cp "$RELEASE_DIR/snapshot/before-runtime-spec.json" "$INSTALL_ROOT/runtime/agent/runtime-spec.json" || true
+  if [ -f "$INSTALL_ROOT/runtime/agent/runtime-spec.json" ]; then
+    aifar-agent reconcile-runtime --spec "$INSTALL_ROOT/runtime/agent/runtime-spec.json" >/dev/null 2>&1 || true
+  fi
+}
+
 rollout_service() {
   service="$1"
   echo "AIFAR Deployment rollout started: $service -> $REVISION"
+  snapshot_service_state "$service"
+  stage_release_artifact "$service"
   apply_artifact "$service"
   ensure_service_runtime_env "$service"
   ensure_runtime_config_files_for_service "$service"
@@ -580,6 +639,7 @@ if ! reconcile_runtime; then
   for service in $CHANGED_SERVICES; do
     cleanup_failed_service "$service"
   done
+  restore_previous_runtime
   fail "AIFAR runtime reconcile failed for bundle rollout"
 fi
 write_model_manifest

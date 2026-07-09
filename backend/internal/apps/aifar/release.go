@@ -10,6 +10,7 @@ import (
 )
 
 const (
+	releaseManifestSchemaV2     = "aifar-release-v2"
 	releasePhaseActive          = "active"
 	orchestrationModelK8sLikeV1 = "agent-runtime-v2"
 	legacyOrchestrationModel    = "legacy-release-v1"
@@ -29,6 +30,26 @@ const (
 
 func runtimeSpecPath(installRoot string) string {
 	return strings.TrimRight(installRoot, "/") + "/runtime/" + runtimeSpecDirName + "/runtime-spec.json"
+}
+
+func releaseDirPath(installRoot, releaseID string) string {
+	return strings.TrimRight(installRoot, "/") + "/releases/" + sanitizeReleasePart(releaseID)
+}
+
+func releaseServiceDirPath(installRoot, releaseID, service string) string {
+	return releaseDirPath(installRoot, releaseID) + "/services/" + cleanAIFARServiceName(service)
+}
+
+func releaseServiceArtifactPath(installRoot, releaseID, service, fileName string) string {
+	fileName = sanitizeReleasePart(fileName)
+	if fileName == "" || fileName == "release" {
+		fileName = "artifact.bin"
+	}
+	return releaseServiceDirPath(installRoot, releaseID, service) + "/artifact/" + fileName
+}
+
+func releaseServiceSnapshotPath(installRoot, releaseID, service string) string {
+	return releaseServiceDirPath(installRoot, releaseID, service) + "/snapshot"
 }
 
 func newReleaseID(version string, t time.Time) string {
@@ -57,6 +78,30 @@ func sanitizeReleasePart(value string) string {
 	out := strings.Trim(b.String(), ".-_")
 	if out == "" {
 		return "release"
+	}
+	return out
+}
+
+func serviceRevisionMapBefore(metadata map[string]any, services []string) map[string]string {
+	out := make(map[string]string, len(services))
+	for _, service := range services {
+		service = cleanAIFARServiceName(service)
+		if service == "" {
+			continue
+		}
+		out[service] = currentRevisionForService(metadata, service)
+	}
+	return out
+}
+
+func serviceRevisionMapAfter(revision string, services []string) map[string]string {
+	out := make(map[string]string, len(services))
+	for _, service := range services {
+		service = cleanAIFARServiceName(service)
+		if service == "" {
+			continue
+		}
+		out[service] = revision
 	}
 	return out
 }
