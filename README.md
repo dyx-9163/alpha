@@ -49,7 +49,7 @@ The server reads these environment variables:
 
 ## 生产部署配置建议 / Production Configuration
 
-生产包会读取 `config/defaults.env`，也可以通过系统环境变量覆盖。上线前建议至少确认：
+生产包会读取 `config/defaults.env`，也可以通过系统环境变量覆盖。仓库中的密码和密钥默认留空；未显式配置强密码、JWT 密钥和凭据加密密钥时，服务会拒绝启动。上线前建议至少确认：
 
 - `AIFAR_ADDR=0.0.0.0:8080`，如前面有 Nginx/负载均衡，也可以只监听内网地址。
 - `AIFAR_DATABASE_PATH=/data/aifar/aifar.db`，不要放在临时目录；该路径需要随服务器备份。
@@ -62,8 +62,11 @@ The server reads these environment variables:
 - `AIFAR_MAX_REQUEST_BODY_BYTES=4294967296` 默认 4 GiB；如果上传 AIFAR 批量制品包可能超过 4 GiB，建议改为 `8589934592`。
 - `AIFAR_AUTH_MAX_FAILURES=5`、`AIFAR_AUTH_LOCKOUT_SECONDS=300` 用于登录失败锁定。
 - `AIFAR_AUDIT_RETENTION_DAYS=180`、`AIFAR_TASK_RETENTION_DAYS=90` 控制审计与已完成任务保留周期。
-- `AIFAR_JWT_SECRET` 和 `AIFAR_CREDENTIAL_SECRET` 必须改为稳定、高强度随机值；不要使用 `change-me-before-production`。
-- `AIFAR_DEFAULT_PASSWORD`、`AIFAR_BOOTSTRAP_PASSWORD` 上线前必须修改，且不要提交真实密码到仓库。
+- `AIFAR_JWT_SECRET` 和 `AIFAR_CREDENTIAL_SECRET` 必须分别显式设置为至少 32 字符的稳定、高强度随机值，且两者不能相同。
+- `AIFAR_DEFAULT_PASSWORD`、`AIFAR_BOOTSTRAP_PASSWORD` 必须设置为至少 12 字符，且不要提交真实密码到仓库。
+- `AIFAR_ALLOW_INSECURE_DEFAULTS=true` 只在 `AIFAR_ADDR` 的监听主机严格为 `127.0.0.1`、`localhost` 或 `::1` 时生效；`:8080`、`0.0.0.0`、`::` 和普通主机名都会拒绝启动，且不会做 DNS 解析。生产配置和发布包必须保持 `false`。
+
+`pnpm dev` 和 `pnpm backend:dev` 仅在上述 loopback 地址且进程环境中完全未设置 `AIFAR_ALLOW_INSECURE_DEFAULTS` 时自动启用开发放行；显式设置 `false` 会被保留。即使本地放行已启用，当前与 previous 凭据密钥相同等结构性密钥错误仍会拒绝启动。
 
 后续可以继续抽出的配置项：
 

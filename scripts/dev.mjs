@@ -1,8 +1,14 @@
 import { spawn } from 'node:child_process'
+import { developmentSecurityEnv, selectDevelopmentAddress } from './development-security.mjs'
 import { rootDir, withToolEnv } from './toolchain.mjs'
 
 const baseEnv = withToolEnv()
-const env = { ...baseEnv, AIFAR_ADDR: baseEnv.AIFAR_DEV_ADDR || '127.0.0.1:8080' }
+const backendAddr = selectDevelopmentAddress(process.env, baseEnv, 'AIFAR_DEV_ADDR')
+const env = {
+  ...baseEnv,
+  AIFAR_ADDR: backendAddr,
+  ...developmentSecurityEnv(backendAddr, process.env)
+}
 const children = []
 
 function localURL(addr) {
