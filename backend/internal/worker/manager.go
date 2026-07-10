@@ -73,6 +73,7 @@ type Manager struct {
 	active             int
 	subscribers        map[string]map[chan store.TaskLog]struct{}
 	cancels            map[string]context.CancelFunc
+	cancelRequested    map[string]bool
 	languages          map[string]string
 }
 
@@ -89,6 +90,7 @@ func NewManagerWithConcurrency(s *store.Store, defaultConcurrency int) *Manager 
 		defaultConcurrency: defaultConcurrency,
 		subscribers:        map[string]map[chan store.TaskLog]struct{}{},
 		cancels:            map[string]context.CancelFunc{},
+		cancelRequested:    map[string]bool{},
 		languages:          map[string]string{},
 	}
 }
@@ -126,15 +128,30 @@ func (m *Manager) StartExistingWithLanguage(task store.Task, lang string, job Jo
 	if task.ID == "" {
 		return task, errors.New("task id is required")
 	}
-	ctx, cancel := context.WithCancel(context.Background())
 	m.mu.Lock()
+	if _, active := m.languages[task.ID]; active {
+		m.mu.Unlock()
+		return task, errors.New(i18n.Text(lang, "worker.taskAlreadyStarted"))
+	}
+	persisted, _, err := m.store.GetTask(task.ID)
+	if err != nil {
+		m.mu.Unlock()
+		return task, err
+	}
+	if persisted.Status != "pending" {
+		m.mu.Unlock()
+		return task, errors.New(i18n.Text(lang, "worker.taskAlreadyStarted"))
+	}
+	ctx, cancel := context.WithCancel(context.Background())
 	m.cancels[task.ID] = cancel
 	m.languages[task.ID] = lang
 	m.mu.Unlock()
 	go func() {
 		defer func() {
+			cancel()
 			m.mu.Lock()
 			delete(m.cancels, task.ID)
+			delete(m.cancelRequested, task.ID)
 			delete(m.languages, task.ID)
 			m.mu.Unlock()
 		}()
@@ -145,29 +162,70 @@ func (m *Manager) StartExistingWithLanguage(task store.Task, lang string, job Jo
 		defer stopLockHeartbeat()
 		go m.heartbeatOperationLocks(lockHeartbeatCtx, task.ID)
 		if !m.acquireSlot(ctx) {
-			_ = m.store.UpdateTaskStatus(task.ID, "cancelled", ctx.Err().Error())
-			m.publishTaskEvent(task.ID, "cancelled")
+			m.finalizeTask(task.ID, "cancelled", ctx.Err().Error())
 			return
 		}
 		defer m.releaseSlot()
 		_ = m.store.UpdateTaskStatus(task.ID, "running", "")
 		m.publishTaskEvent(task.ID, "running")
 		m.AppendLog(task.ID, "info", i18n.Text(lang, "worker.taskStarted"))
-		if err := job(ctx, Logger{manager: m, taskID: task.ID}); err != nil {
-			status := "failed"
-			if ctx.Err() != nil {
-				status = "cancelled"
-			}
-			m.AppendLog(task.ID, "error", err.Error())
-			_ = m.store.UpdateTaskStatus(task.ID, status, err.Error())
-			m.publishTaskEvent(task.ID, status)
+		err, panicked := runJob(ctx, Logger{manager: m, taskID: task.ID}, lang, job)
+		status := m.claimJobOutcome(task.ID, ctx, err, panicked)
+		if status == "success" {
+			m.AppendLog(task.ID, "info", i18n.Text(lang, "worker.taskCompleted"))
+			m.finalizeTask(task.ID, status, "")
 			return
 		}
-		m.AppendLog(task.ID, "info", i18n.Text(lang, "worker.taskCompleted"))
-		_ = m.store.UpdateTaskStatus(task.ID, "success", "")
-		m.publishTaskEvent(task.ID, "success")
+		if err == nil {
+			err = ctx.Err()
+			if err == nil {
+				err = context.Canceled
+			}
+		}
+		m.AppendLog(task.ID, "error", err.Error())
+		m.finalizeTask(task.ID, status, err.Error())
 	}()
 	return task, nil
+}
+
+func runJob(ctx context.Context, log Logger, lang string, job Job) (err error, panicked bool) {
+	defer func() {
+		if recover() != nil {
+			panicked = true
+			err = errors.New(i18n.Text(lang, "worker.taskPanicked"))
+		}
+	}()
+	err = job(ctx, log)
+	return err, false
+}
+
+func (m *Manager) claimJobOutcome(taskID string, ctx context.Context, jobErr error, panicked bool) string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cancelRequested := m.cancelRequested[taskID]
+	switch {
+	case panicked:
+		delete(m.cancels, taskID)
+		delete(m.cancelRequested, taskID)
+		return "failed"
+	case cancelRequested || ctx.Err() != nil:
+		return "cancelled"
+	case jobErr != nil:
+		delete(m.cancels, taskID)
+		delete(m.cancelRequested, taskID)
+		return "failed"
+	default:
+		delete(m.cancels, taskID)
+		delete(m.cancelRequested, taskID)
+		return "success"
+	}
+}
+
+func (m *Manager) finalizeTask(taskID, status, errText string) {
+	if err := m.store.UpdateTaskStatus(taskID, status, errText); err != nil {
+		return
+	}
+	m.publishTaskEvent(taskID, status)
 }
 
 func (m *Manager) heartbeatOperationLocks(ctx context.Context, taskID string) {
@@ -189,6 +247,10 @@ func (m *Manager) acquireSlot(ctx context.Context) bool {
 	for {
 		limit := m.store.DeploymentConcurrency(m.defaultConcurrency)
 		m.mu.Lock()
+		if ctx.Err() != nil {
+			m.mu.Unlock()
+			return false
+		}
 		if m.active < limit {
 			m.active++
 			m.mu.Unlock()
@@ -253,11 +315,14 @@ func (m *Manager) Cancel(taskID string) bool {
 	m.mu.Lock()
 	cancel := m.cancels[taskID]
 	lang := m.languages[taskID]
+	if cancel != nil {
+		m.cancelRequested[taskID] = true
+		cancel()
+	}
 	m.mu.Unlock()
 	if cancel == nil {
 		return false
 	}
-	cancel()
 	m.AppendLog(taskID, "warn", i18n.Text(lang, "worker.cancelRequested"))
 	return true
 }
