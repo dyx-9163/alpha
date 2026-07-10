@@ -31,9 +31,14 @@ pnpm dev
 pnpm build
 pnpm package
 pnpm test
+pnpm test:web
+pnpm test:scripts
+pnpm test:local
 pnpm backend:dev
 pnpm web:dev
 ```
+
+`pnpm test:local` 是完整本地门禁：依次运行后端测试、前端 Vitest、脚本测试、前后端构建、一次 `pnpm package`，最后执行 `pnpm release:verify`。它会复制离线资源，可能处理数 GB 文件；日常快速验证优先使用 `pnpm test`、`pnpm test:web`、`pnpm test:scripts`、`pnpm web:build` 和 `pnpm backend:build`。
 
 服务端读取以下环境变量：
 
@@ -67,6 +72,8 @@ The server reads these environment variables:
 - `AIFAR_ALLOW_INSECURE_DEFAULTS=true` 只在 `AIFAR_ADDR` 的监听主机严格为 `127.0.0.1`、`localhost` 或 `::1` 时生效；`:8080`、`0.0.0.0`、`::` 和普通主机名都会拒绝启动，且不会做 DNS 解析。生产配置和发布包必须保持 `false`。
 
 `pnpm dev` 和 `pnpm backend:dev` 仅在上述 loopback 地址且进程环境中完全未设置 `AIFAR_ALLOW_INSECURE_DEFAULTS` 时自动启用开发放行；显式设置 `false` 会被保留。即使本地放行已启用，当前与 previous 凭据密钥相同等结构性密钥错误仍会拒绝启动。
+
+轮换 `AIFAR_CREDENTIAL_SECRET` 时，不要直接丢弃旧值。第一次使用新密钥启动时，同时通过环境变量设置 `AIFAR_PREVIOUS_CREDENTIAL_SECRET=<旧密钥>`；服务会在单个数据库事务中重加密服务器密码、凭据版本、存储密钥和 Nacos 配置。启动日志确认轮换成功后，立即移除 previous secret。轮换失败会回滚全部密文并拒绝启动。
 
 后续可以继续抽出的配置项：
 
@@ -180,6 +187,7 @@ You can also run:
 
 ```bash
 pnpm package
+pnpm release:verify
 ```
 
 发布包按平台生成：
@@ -189,6 +197,8 @@ Release packages are platform-specific:
 - `deploy/deployment/aifar-deployment-<version>-linux-amd64/` and `.tar.gz`
 - `deploy/deployment/aifar-deployment-<version>-windows-amd64/` and `.zip`
 
-每个包只包含运行时资产：`bin/`、`web/dist/`、存在时的 `resources/`、`config/`、启动脚本、`VERSION` 和 `checksums.txt`。源码、`node_modules/`、`data/`、日志、缓存和开发脚本不会包含在发布包中。
+每个包只包含运行时资产：`bin/`、`web/dist/`、`resources/`、`config/`、启动脚本、`VERSION` 和 `checksums.txt`。源码、`node_modules/`、`data/`、日志、缓存和开发脚本不会包含在发布包中。
 
-Each package contains only runtime assets: `bin/`, `web/dist/`, `resources/` when present, `config/`, startup scripts, `VERSION`, and `checksums.txt`. Source code, `node_modules/`, `data/`, logs, caches, and development scripts are not included.
+Each package contains only runtime assets: `bin/`, `web/dist/`, `resources/`, `config/`, startup scripts, `VERSION`, and `checksums.txt`. Source code, `node_modules/`, `data/`, logs, caches, and development scripts are not included.
+
+`pnpm release:verify` 只接受当前 `package.json` 版本对应的 Linux/Windows 两个平台目录和归档；缺失、旧版本、额外平台、损坏归档、归档内部 checksum 不一致、`config/defaults.env` 含弱密钥或敏感默认值都会失败。验证器会解压 `.tar.gz` 和 `.zip` 后复验内部文件全集与 `checksums.txt`。

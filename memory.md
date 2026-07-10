@@ -70,3 +70,27 @@
 - 结论：后端新增 `aifarRuntimeController`，AIFAR Runtime 路由由 controller 自行挂载，外部 API 路径保持兼容；前端新增 `web/src/containers/runtime` 模块，抽出 Runtime 类型、日志解析工具、弹窗上下文和 `AifarRuntimeDialogs.vue`，`ContainersView.vue` 不再承载 Runtime 升级/服务安装/配置弹窗模板。`pnpm test` 与 `pnpm web:build` 通过。
 - 问题：用户要求继续把 AIFAR Runtime 拆成 `AifarRuntimeWorkspace.vue` 和更细的 tabs 组件。
 - 结论：已将 Runtime 主工作区拆到 `web/src/containers/runtime/AifarRuntimeWorkspace.vue`，并按 deployments/releases/services/pods/logs/ingress 拆成 6 个 tab 组件；Runtime 样式迁入 `runtime.css`，context 升级为通用 `aifarRuntimeContextKey`，`ContainersView.vue` 仅保留 workspace 入口和状态编排。`pnpm web:build` 与 `pnpm test` 通过。
+- 问题：用户要求先抽 AIFAR Runtime composable + API service，再给 context 强类型。
+- 结论：已新增 `web/src/containers/runtime/api.ts` 集中 Runtime 查询、release、日志 SSE、制品更新、配置、reconcile、cleanup、服务安装和伸缩/下线 API；新增 `useAifarRuntimeProvider` 承接 context provide，新增 `useAifarRuntimeLogViewport` 抽出日志虚拟滚动状态机；`context.ts` 从 `Record<string, any>` 改为强类型 `AifarRuntimeContext`。`pnpm web:build` 与 `pnpm test` 通过。
+- 问题：用户要求持续优化 AIFAR Runtime 前端拆分。
+- 结论：已新增 `web/src/containers/runtime/format.ts`、`config.ts`、`selectors.ts`，把 Runtime 状态/日期/副本展示格式化、配置默认值与校验、service override 构建、服务清单、选中实例/服务/Pod/Ingress 选择器从 `ContainersView.vue` 抽出；`ContainersView.vue` 进一步降到约 1866 行，保留页面编排和动作闭包。`pnpm web:build` 通过。
+- 问题：用户要求给出最小优化标准，并按该方向继续优化。
+- 结论：已新增 `design/minimal-optimization-standard.md`，规定每轮只优化一个明确边界、默认行为不变、满足抽离条件才拆、类型明确、前后端文件体量线和验证线；并按“纯业务规则优先抽离”新增 `web/src/containers/runtime/artifacts.ts`，抽出 AIFAR 制品上传 accept/hint、FormData 构建、大小校验和字节格式化。`ContainersView.vue` 降到约 1843 行，`pnpm web:build` 通过。
+- 问题：用户要求循环执行优化。
+- 结论：按最小优化标准继续循环优化容器页：新增 `web/src/containers/dockerImages.ts` 抽出 Docker image 引用/行 key/去重；扩展 `runtime/selectors.ts` 抽出 runtime discovery target 和 deployment fallback service；新增 `web/src/containers/cacheKeys.ts` 抽出 summary/collection/runtime/log cache key；新增 `web/src/containers/dockerApi.ts` 集中容器页 bootstrap、Docker summary、collection、image remove API；新增 `web/src/containers/realtimeSummary.ts` 抽出 Docker summary 实时 payload 合并规则。`ContainersView.vue` 降到约 1802 行，`pnpm web:build` 通过。
+- 问题：用户询问如果要在今天内优化好当前工程，应优先从哪些方面入手。
+- 结论：当前 `pnpm test` 与 `pnpm web:build` 均通过，今天不宜继续无边界拆文件；优先修 worker 的 panic/取消终态竞态并补测试，其次修 realtime 快照旧数据覆盖和拉取失败清空问题并建立最小前端测试/CI 护栏，再做生产安全配置 fail-fast。Element Plus 全量加载导致主 JS 约 1.14MB、主 CSS 约 379KB，可作为有余量时的性能项；后端 Runtime 约 3000 行的领域拆分、task lease/idempotency 完整接线和大页面拆分放入后续批次。
+- 问题：用户要求继续，按上述今日优先级直接实施工程优化。
+- 结论：已完成 Worker panic 隔离和取消/成功原子终态，修复 realtime 快照失败清空及乱序覆盖并新增 6 个 Vitest；新增根级前端/脚本测试入口和 GitHub CI。生产安全改为默认拒绝弱密码、占位密钥、JWT/凭据密钥复用及重复配置键，通用发布包敏感值必须留空；开发脚本仅在本地地址显式放行。新增 `AIFAR_PREVIOUS_CREDENTIAL_SECRET` 与 Store 单事务密钥轮换，覆盖服务器、凭据/版本、存储和 Nacos 密文，失败全回滚。`pnpm test`、`pnpm backend:build`、`pnpm test:web`（6 项）、`pnpm test:scripts`（6 项）、`pnpm web:build` 和静态检查均通过；未运行会复制约 4.6GB 离线资源的完整 `pnpm test:local`，前端主包大于 500KB 的既有构建警告仍待性能批次处理。
+- 问题：用户要求使用 Superpowers 形成代码重构方案。
+- 结论：当前会话和仓库未安装 `superpowers` 技能包；已核对官方 `obra/superpowers` 流程，按 brainstorming 先单问明确范围，再比较 2-3 种方案并分段确认设计，批准后分别写入 `docs/superpowers/specs/` 和 `docs/superpowers/plans/`，本轮尚未修改业务代码或生成未经确认的实施计划。
+- 问题：用户已提供 Superpowers 技能并再次要求形成重构方案。
+- 结论：已按 brainstorming 对后端、前端和工程化做三路只读审计，并验证 `pnpm test`、`pnpm test:web`、`pnpm test:scripts`、`pnpm web:build` 均通过。主要候选边界是 AIFAR Runtime/Nacos HTTP 领域下沉、Worker 持久任务与进程生命周期、Store 迁移双事实源、前端大页面与重复 DTO/API 状态逻辑、前端测试护栏及发布可追溯性；当前工作树有大量未提交改动，正式设计前需先确认是收尾当前批次、重构核心运行链路，还是覆盖全工程。尚未修改业务代码或生成设计/实施文档。
+- 问题：用户询问三种重构范围分别需要多长时间。
+- 结论：按包含设计、编码、自动化测试、文档、迁移演练和一次受控回归的口径估算：当前批次收尾约 5-8 人日；核心运行链路约 32-45 人日；全工程重构约 70-105 人日。工期不包含 Docker Go client、真实 MinIO 控制面等新增功能，也不包含等待生产变更窗口的时间；多人并行受领域依赖限制，不能按人数线性缩短。
+- 问题：用户询问如果由 Codex 直接实施，三个方案分别需要多少投入。
+- 结论：按最多 4 个并发 agent、保留 TDD/审查/回归门禁估算：阶段 0/当前批次收尾约 10-16 agent-hours、1-2 个工作日；核心运行链路约 70-110 agent-hours、8-12 个工作日；全工程重构约 180-280 agent-hours、4-7 周。估算要求当前未提交改动可继续使用、需求边界不扩张、评审反馈及时；真实生产变更窗口和新增功能另计。
+- 问题：用户选择先执行方案 0，并明确要求使用 Superpowers。
+- 结论：已进入 brainstorming 的方案确认门禁；方案 0 只做当前批次冻结、审查、修复、验证、文档同步和可审查的提交拆分，不进入 Runtime/Nacos 领域重构、Worker 持久任务或数据库迁移重构。实施前仍需确认当前工作树中的安全配置/密钥轮换、Worker、realtime、Containers 前端拆分、CI/发布脚本改动是否全部作为保留基线；尚未修改业务代码。
+- 问题：用户要求按“方案 0：保留现状、分域收尾”完整实施。
+- 结论：已按域拆分提交 Worker 终态原子化、生产安全、Store 密钥轮换、服务启动密文校验、realtime last-known cache、Containers/Runtime 抽离测试、启动脚本解析、发布归档验收和 CI/文档同步；发布验证要求当前版本 Linux/Windows 目录与归档同时存在并解压复验内部 checksum。最终门禁中 `pnpm test`、`pnpm test:web`、`pnpm test:scripts`、`pnpm web:build`、`pnpm backend:build`、`git diff --check`、`pnpm test:local` 通过；本机 `go test -race` 因 `CGO_ENABLED=0` 不作为验收，Ubuntu CI 负责 Worker/Store race tests。当前本机需显式使用仓库内 `.cache/go-build` 避免继承的 `D:\tools\gocache` 权限问题。
