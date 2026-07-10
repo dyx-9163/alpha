@@ -37,8 +37,17 @@
 
 ## 本轮记录
 
-- [ ] P0：落地版本化迁移框架与新增结构迁移。
-- [ ] P0：落地通用 metadata 工具包。
-- [ ] P0：落地通用操作锁、应用集群/成员模型。
-- [ ] P0：为任务表补充 lease/idempotency/correlation 字段。
-- [ ] P1：落地凭证引用、发布制品/快照、备份记录、状态历史的数据库与 Store 底座。
+- [x] P0：落地版本化迁移框架与新增结构迁移。
+- [x] P0：落地通用 metadata 工具包。
+- [x] P0：落地通用操作锁、应用集群/成员模型。
+- [x] P0：为任务表补充 lease/idempotency/correlation 字段。
+- [x] P1：落地凭证引用、发布制品/快照、备份记录、状态历史的数据库与 Store 底座。
+
+## 方案 0 收尾记录
+
+- [x] Worker 终态原子化：panic、取消、普通失败、成功认领和事件发布补齐回归测试。
+- [x] 生产安全：弱默认值仅允许 loopback 开发放行，密钥轮换走 `AIFAR_PREVIOUS_CREDENTIAL_SECRET` 单事务重加密，服务监听前完成密文可解密校验。
+- [x] 前端 realtime：状态 snapshot 采用 last-known cache，按 `version -> collectedAt -> updatedAt` 接收同 key 更新，避免失败拉取或空列表清空旧快照。
+- [x] Containers/Runtime：当前保持 `ContainersView.vue` 页面编排边界，Runtime API、context、format/config/selectors/artifacts、日志虚拟窗口和 Docker helper 已有 Vitest 覆盖。
+- [x] 工具链与发布：Linux/PowerShell defaults 解析统一、启动脚本行尾固定，发布包缺失/损坏产物 fail-closed，`release:verify` 解压 Linux/Windows 归档并复验内部 checksum。
+- [x] CI 门禁：PR CI 覆盖后端、前端、脚本测试，前后端构建，以及 Ubuntu Worker/Store race tests；完整 `test:local` 留作收口前本地门禁。

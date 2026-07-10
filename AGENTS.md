@@ -29,10 +29,11 @@ AIFAR Deployment 是一个可离线部署的 Linux 运维面板：
 
 - `backend/cmd/aifar-server/main.go` 加载配置，打开 SQLite，初始化 bootstrap 用户，扫描离线资源，创建 worker manager，并启动 HTTP 服务。
 - `backend/cmd/aifar-admin/main.go` 支持 `inspect` 和 `reset-admin [username password]`。
-- 根目录 `package.json` 提供 `pnpm dev`、`pnpm build`、`pnpm package`、`pnpm test`、`pnpm backend:dev`、`pnpm web:dev` 等命令。
+- 根目录 `package.json` 提供 `pnpm dev`、`pnpm build`、`pnpm package`、`pnpm test`、`pnpm test:web`、`pnpm test:scripts`、`pnpm test:local`、`pnpm release:verify`、`pnpm backend:dev`、`pnpm web:dev` 等命令。
 - `scripts/toolchain.mjs` 优先使用 `D:\tools` 下 Node、Go、GOPATH、GOCACHE，并注入 AIFAR 默认环境变量。
 - `scripts/build-web.mjs` 执行 `vue-tsc --noEmit` 与 Vite build；`scripts/build-backend.mjs` 交叉编译 Linux/Windows amd64 服务端二进制。
-- `scripts/package-build.mjs` 将打包中间产物输出到 `deploy/bin` 和 `deploy/dist`；`scripts/package-release.mjs` 把运行时所需文件暂存到 `deploy/deployment`，并生成 checksums 与平台归档。
+- `scripts/package-build.mjs` 将打包中间产物输出到 `deploy/bin` 和 `deploy/dist`，再调用 `scripts/package-release.mjs` 暂存运行时包；`scripts/package-release.mjs` 会先验证源 `config/defaults.env`，要求 `resources/` 存在，归档或最终目录刷新失败时非零退出，并用 `finally` 清理 staging。
+- `scripts/verify-release-checksums.mjs` 只接受当前 `package.json` 版本的 Linux/Windows 两个平台目录和归档，会解压 `.tar.gz`/`.zip` 后复验内部文件全集、`checksums.txt` 和 release defaults 安全配置。
 - `scripts/test.mjs` 当前只运行后端 `go test ./...`。
 
 ### 后端配置
@@ -48,6 +49,8 @@ AIFAR Deployment 是一个可离线部署的 Linux 运维面板：
 - `AIFAR_BOOTSTRAP_PASSWORD`，默认使用默认密码
 - `AIFAR_JWT_SECRET`
 - `AIFAR_CREDENTIAL_SECRET`
+- `AIFAR_PREVIOUS_CREDENTIAL_SECRET`
+- `AIFAR_ALLOW_INSECURE_DEFAULTS`
 - `AIFAR_DEPLOYMENT_CONCURRENCY`
 - `AIFAR_DEFAULT_DEPLOY_DIR`，默认 `/aifar/apps`
 
@@ -74,6 +77,8 @@ AIFAR Deployment 是一个可离线部署的 Linux 运维面板：
 - 前端 token 存在 `localStorage` 的 `aifar-session-token`。
 - HTTP Bearer token 与 WebSocket 子协议 `aifar.auth.<base64url token>` 都可用于鉴权。
 - `backend/internal/store/crypto.go` 使用 AES-GCM 加密保存 SSH 密码、私钥、对象存储 secret 等敏感字段。
+- `AIFAR_ALLOW_INSECURE_DEFAULTS=true` 只允许在监听主机严格为 `127.0.0.1`、`localhost` 或 `::1` 时放行弱开发默认值；`:8080`、`0.0.0.0`、`::` 和普通主机名必须拒绝启动。开发脚本不得覆盖显式 `false`。
+- 轮换 `AIFAR_CREDENTIAL_SECRET` 时使用 `AIFAR_PREVIOUS_CREDENTIAL_SECRET`。服务启动前会扫描已知密文字段；当前密钥无法解密且未提供 previous secret 时拒绝启动。previous secret 轮换必须单事务完成，任一密文失败则全部回滚，成功后清除旧密钥引用。
 - 删除部署服务需要用户输入目标服务器已保存的 SSH 密码确认。
 
 ### SQLite Store
@@ -254,6 +259,9 @@ AIFAR Deployment 是一个可离线部署的 Linux 运维面板：
 
 - 后端变更运行 `pnpm test` 或在 `backend/` 下运行 `go test ./...`。
 - 前端类型或 UI 变更运行 `pnpm web:build`，必要时运行 `pnpm build`。
+- 前端逻辑测试运行 `pnpm test:web`，脚本/启动/发布配置测试运行 `pnpm test:scripts`。
+- 完整本地门禁为 `pnpm test:local`：后端测试、前端测试、脚本测试、前后端构建、一次 `pnpm package` 和 `pnpm release:verify`。该命令会复制离线资源，只在收口前运行。
+- CI 必须覆盖后端、前端、脚本测试，前后端构建，以及 Ubuntu 上 `go test -race ./internal/worker ./internal/store`；Windows/Linux 分别验证启动脚本语法、解析契约和行尾。
 - 应用安装器、资源扫描、store、server service、registry 变更必须补充或更新对应 Go 测试。
 - 涉及真实 SSH/Docker 的测试必须使用 fake remote/prober，不连接真实服务器。
 

@@ -40,6 +40,14 @@ function quotePowerShell(value) {
   return `'${String(value).replaceAll("'", "''")}'`
 }
 
+function fixtureEnv(overrides = {}) {
+  const env = { ...process.env }
+  for (const key of Object.keys(env)) {
+    if (key.startsWith('AIFAR_')) delete env[key]
+  }
+  return { ...env, ...overrides }
+}
+
 function runShellFixture(t, defaults, env = {}) {
   const root = tempRoot(t, 'aifar-start-sh-')
   mkdirSync(path.join(root, 'config'), { recursive: true })
@@ -56,7 +64,7 @@ printf 'STATIC=<%s>\\n' "\${AIFAR_STATIC_DIR-}"
   chmodSync(fakeBin, 0o755)
   const script = path.join(root, 'start.sh').replaceAll('\\', '/')
   return spawnSync(shell, [script, 'foreground'], {
-    env: { ...process.env, ...env },
+    env: fixtureEnv(env),
     encoding: 'utf8'
   })
 }

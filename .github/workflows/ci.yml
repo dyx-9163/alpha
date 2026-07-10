@@ -1,0 +1,78 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  script-contracts:
+    name: Script contracts (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install pnpm
+        run: npm install --global pnpm@11.7.0
+
+      - name: Verify startup and release scripts
+        run: pnpm test:scripts
+
+  ubuntu-gates:
+    name: Ubuntu tests, builds, and race checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: backend/go.mod
+
+      - name: Install pnpm
+        run: npm install --global pnpm@11.7.0
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Check whitespace
+        run: git diff --check
+
+      - name: Test backend
+        run: pnpm test
+
+      - name: Test web
+        run: pnpm test:web
+
+      - name: Test scripts
+        run: pnpm test:scripts
+
+      - name: Build web
+        run: pnpm web:build
+
+      - name: Build backend
+        run: pnpm backend:build
+
+      - name: Race-test worker and store
+        working-directory: backend
+        run: go test -race ./internal/worker ./internal/store
