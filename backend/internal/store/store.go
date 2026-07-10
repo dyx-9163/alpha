@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"aifar-deployment/backend/internal/logmask"
@@ -21,8 +22,10 @@ import (
 )
 
 type Store struct {
-	db        *sql.DB
-	secretKey []byte
+	db                *sql.DB
+	secretKey         []byte
+	previousSecretKey []byte
+	secretKeyMu       sync.RWMutex
 }
 
 func Open(path string) (*Store, error) {
@@ -30,6 +33,10 @@ func Open(path string) (*Store, error) {
 }
 
 func OpenWithSecret(path, secret string) (*Store, error) {
+	return OpenWithSecrets(path, secret, "")
+}
+
+func OpenWithSecrets(path, currentSecret, previousSecret string) (*Store, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return nil, err
 	}
@@ -38,11 +45,19 @@ func OpenWithSecret(path, secret string) (*Store, error) {
 		return nil, err
 	}
 	db.SetMaxOpenConns(1)
-	s := &Store{db: db, secretKey: deriveSecretKey(secret)}
+	s := &Store{
+		db:                db,
+		secretKey:         deriveSecretKey(currentSecret),
+		previousSecretKey: deriveOptionalSecretKey(previousSecret),
+	}
 	return s, s.migrate()
 }
 
 func OpenReadOnlyWithSecret(path, secret string) (*Store, error) {
+	return OpenReadOnlyWithSecrets(path, secret, "")
+}
+
+func OpenReadOnlyWithSecrets(path, currentSecret, previousSecret string) (*Store, error) {
 	dsn, err := sqliteReadOnlyDSN(path)
 	if err != nil {
 		return nil, err
@@ -60,10 +75,17 @@ func OpenReadOnlyWithSecret(path, secret string) (*Store, error) {
 		_ = db.Close()
 		return nil, err
 	}
-	return &Store{db: db, secretKey: deriveSecretKey(secret)}, nil
+	return &Store{
+		db:                db,
+		secretKey:         deriveSecretKey(currentSecret),
+		previousSecretKey: deriveOptionalSecretKey(previousSecret),
+	}, nil
 }
 
-func (s *Store) Close() error { return s.db.Close() }
+func (s *Store) Close() error {
+	defer s.clearSecretKeys()
+	return s.db.Close()
+}
 
 func (s *Store) Ping() error {
 	return s.db.Ping()

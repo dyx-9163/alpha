@@ -22,11 +22,27 @@ func deriveSecretKey(secret string) []byte {
 	return sum[:]
 }
 
+func deriveOptionalSecretKey(secret string) []byte {
+	if secret == "" {
+		return nil
+	}
+	return deriveSecretKey(secret)
+}
+
 func (s *Store) encryptSecret(value string) (string, error) {
 	if strings.TrimSpace(value) == "" || strings.HasPrefix(value, encryptedSecretPrefix) {
 		return value, nil
 	}
-	block, err := aes.NewCipher(s.secretKey)
+	current := s.currentSecretKey()
+	defer zeroSecretKey(current)
+	return encryptPlaintextSecret(value, current)
+}
+
+func encryptPlaintextSecret(value string, key []byte) (string, error) {
+	if strings.TrimSpace(value) == "" {
+		return value, nil
+	}
+	block, err := aes.NewCipher(key)
 	if err != nil {
 		return "", err
 	}
@@ -46,12 +62,37 @@ func (s *Store) decryptSecret(value string) (string, error) {
 	if strings.TrimSpace(value) == "" || !strings.HasPrefix(value, encryptedSecretPrefix) {
 		return value, nil
 	}
+	current, previous := s.secretKeys()
+	defer zeroSecretKey(current)
+	defer zeroSecretKey(previous)
+	return decryptSecretWithKeys(value, current, previous)
+}
+
+func decryptSecretWithKeys(value string, current, previous []byte) (string, error) {
+	if strings.TrimSpace(value) == "" || !strings.HasPrefix(value, encryptedSecretPrefix) {
+		return value, nil
+	}
+	plain, currentErr := decryptEncryptedSecret(value, current)
+	if currentErr == nil {
+		return plain, nil
+	}
+	if len(previous) == 0 {
+		return "", fmt.Errorf("decrypt secret with current credential key: %w", currentErr)
+	}
+	plain, previousErr := decryptEncryptedSecret(value, previous)
+	if previousErr == nil {
+		return plain, nil
+	}
+	return "", fmt.Errorf("decrypt secret with current or previous credential key: current: %v; previous: %v", currentErr, previousErr)
+}
+
+func decryptEncryptedSecret(value string, key []byte) (string, error) {
 	raw := strings.TrimPrefix(value, encryptedSecretPrefix)
 	payload, err := base64.RawURLEncoding.DecodeString(raw)
 	if err != nil {
 		return "", err
 	}
-	block, err := aes.NewCipher(s.secretKey)
+	block, err := aes.NewCipher(key)
 	if err != nil {
 		return "", err
 	}
@@ -69,4 +110,32 @@ func (s *Store) decryptSecret(value string) (string, error) {
 		return "", err
 	}
 	return string(plain), nil
+}
+
+func (s *Store) secretKeys() ([]byte, []byte) {
+	s.secretKeyMu.RLock()
+	defer s.secretKeyMu.RUnlock()
+	return append([]byte(nil), s.secretKey...), append([]byte(nil), s.previousSecretKey...)
+}
+
+func (s *Store) currentSecretKey() []byte {
+	s.secretKeyMu.RLock()
+	defer s.secretKeyMu.RUnlock()
+	return append([]byte(nil), s.secretKey...)
+}
+
+func (s *Store) clearPreviousSecretKey() {
+	s.secretKeyMu.Lock()
+	defer s.secretKeyMu.Unlock()
+	zeroSecretKey(s.previousSecretKey)
+	s.previousSecretKey = nil
+}
+
+func (s *Store) clearSecretKeys() {
+	s.secretKeyMu.Lock()
+	defer s.secretKeyMu.Unlock()
+	zeroSecretKey(s.secretKey)
+	zeroSecretKey(s.previousSecretKey)
+	s.secretKey = nil
+	s.previousSecretKey = nil
 }
