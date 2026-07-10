@@ -4,8 +4,12 @@ import path from 'node:path'
 import { backendDir, goCommand, rootDir, toolsDir, withToolEnv } from './toolchain.mjs'
 
 const env = withToolEnv()
-mkdirSync(env.GOCACHE, { recursive: true })
-mkdirSync(path.join(toolsDir, 'gopath'), { recursive: true })
+if (env.GOCACHE) {
+  mkdirSync(env.GOCACHE, { recursive: true })
+}
+if (existsSync(toolsDir)) {
+  mkdirSync(path.join(toolsDir, 'gopath'), { recursive: true })
+}
 
 if (!existsSync(backendDir)) {
   process.exit(0)

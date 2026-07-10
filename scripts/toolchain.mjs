@@ -1,65 +1,100 @@
 import { existsSync, readFileSync } from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { parseDefaultsEnv } from './runtime-security-config.mjs'
 
 export const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 export const backendDir = path.join(rootDir, 'backend')
 export const webDir = path.join(rootDir, 'web')
-export const toolsDir = process.env.AIFAR_TOOL_ROOT || 'D:\\tools'
+export const toolsDir = Object.hasOwn(process.env, 'AIFAR_TOOL_ROOT')
+  ? process.env.AIFAR_TOOL_ROOT
+  : 'D:\\tools'
 
-function loadDefaultsEnv() {
-  const file = path.join(rootDir, 'config', 'defaults.env')
+function loadDefaultsEnv(file = path.join(rootDir, 'config', 'defaults.env')) {
   if (!existsSync(file)) {
     return {}
   }
-  return readFileSync(file, 'utf8').split(/\r?\n/).reduce((env, line) => {
-    const trimmed = line.trim()
-    if (!trimmed || trimmed.startsWith('#')) {
-      return env
-    }
-    const index = trimmed.indexOf('=')
-    if (index <= 0) {
-      return env
-    }
-    env[trimmed.slice(0, index).trim()] = trimmed.slice(index + 1).trim()
-    return env
-  }, {})
+  return parseDefaultsEnv(readFileSync(file, 'utf8'))
 }
 
-export function withToolEnv(extra = {}) {
-  const defaults = loadDefaultsEnv()
-  const nodeDir = path.join(toolsDir, 'node')
-  const nodeGlobalDir = path.join(toolsDir, 'node-global')
-  const goDir = path.join(toolsDir, 'go')
-  const gopath = path.join(toolsDir, 'gopath')
-  const gocache = process.env.AIFAR_GO_CACHE || path.join(rootDir, '.cache', 'go-build')
-  const pathKey = process.platform === 'win32' ? 'Path' : 'PATH'
-  const currentPath = process.env[pathKey] || process.env.PATH || ''
-  const prefix = [nodeDir, nodeGlobalDir, path.join(goDir, 'bin'), path.join(gopath, 'bin')].join(path.delimiter)
-  const defaultPassword = process.env.AIFAR_DEFAULT_PASSWORD || defaults.AIFAR_DEFAULT_PASSWORD || 'Oversea.123'
-  const devAddr = process.env.AIFAR_DEV_ADDR || defaults.AIFAR_DEV_ADDR || '127.0.0.1:8080'
-  const viteHost = process.env.AIFAR_VITE_HOST || defaults.AIFAR_VITE_HOST || '127.0.0.1'
-  return {
-    ...process.env,
-    [pathKey]: `${prefix}${path.delimiter}${currentPath}`,
-    PATH: `${prefix}${path.delimiter}${currentPath}`,
-    GOROOT: goDir,
-    GOPATH: gopath,
+function configuredValue(processEnv, defaults, key, fallback) {
+  if (Object.hasOwn(processEnv, key)) return processEnv[key]
+  if (Object.hasOwn(defaults, key)) return defaults[key]
+  return fallback
+}
+
+function configuredPath(processEnv, defaults, key, fallback, baseDir) {
+  if (Object.hasOwn(processEnv, key)) return processEnv[key]
+  if (!Object.hasOwn(defaults, key)) return fallback
+  const value = defaults[key]
+  if (value === '' || path.isAbsolute(value)) return value
+  return path.resolve(baseDir, value)
+}
+
+export function withToolEnv(extra = {}, options = {}) {
+  const processEnv = options.processEnv ?? process.env
+  const platform = options.platform ?? process.platform
+  const effectiveRoot = options.rootPath ?? rootDir
+  const effectiveWebDir = path.join(effectiveRoot, 'web')
+  const effectiveToolsDir = options.toolRoot ?? (Object.hasOwn(processEnv, 'AIFAR_TOOL_ROOT')
+    ? processEnv.AIFAR_TOOL_ROOT
+    : toolsDir)
+  const defaults = options.defaults ?? loadDefaultsEnv(options.defaultsFile ?? path.join(effectiveRoot, 'config', 'defaults.env'))
+  const nodeDir = path.join(effectiveToolsDir, 'node')
+  const nodeGlobalDir = path.join(effectiveToolsDir, 'node-global')
+  const goDir = path.join(effectiveToolsDir, 'go')
+  const gopath = path.join(effectiveToolsDir, 'gopath')
+  const goBin = path.join(goDir, 'bin')
+  const goExecutable = path.join(goBin, platform === 'win32' ? 'go.exe' : 'go')
+  const bundledGo = effectiveToolsDir !== '' && existsSync(goExecutable)
+  const pathKey = platform === 'win32'
+    ? Object.keys(processEnv).find((key) => key.toLowerCase() === 'path') ?? 'Path'
+    : 'PATH'
+  const pathPresent = Object.hasOwn(processEnv, pathKey)
+  const currentPath = pathPresent ? processEnv[pathKey] : ''
+  const toolPaths = effectiveToolsDir === ''
+    ? []
+    : [nodeDir, nodeGlobalDir, goBin, path.join(gopath, 'bin')].filter(existsSync)
+  const managedPath = toolPaths.join(path.delimiter)
+  const effectivePath = toolPaths.length === 0 || (pathPresent && currentPath === '')
+    ? currentPath
+    : pathPresent
+      ? `${managedPath}${path.delimiter}${currentPath}`
+      : managedPath
+  const gocache = Object.hasOwn(processEnv, 'GOCACHE')
+    ? processEnv.GOCACHE
+    : configuredPath(processEnv, defaults, 'AIFAR_GO_CACHE', path.join(effectiveRoot, '.cache', 'go-build'), effectiveRoot)
+  const defaultPassword = configuredValue(processEnv, defaults, 'AIFAR_DEFAULT_PASSWORD', 'Oversea.123')
+  const devAddr = configuredValue(processEnv, defaults, 'AIFAR_DEV_ADDR', '127.0.0.1:8080')
+  const viteHost = configuredValue(processEnv, defaults, 'AIFAR_VITE_HOST', '127.0.0.1')
+  const env = {
+    ...processEnv,
     GOCACHE: gocache,
-    NPM_CONFIG_PREFIX: nodeGlobalDir,
-    AIFAR_ADDR: process.env.AIFAR_ADDR || defaults.AIFAR_ADDR || '0.0.0.0:8080',
+    AIFAR_ADDR: configuredValue(processEnv, defaults, 'AIFAR_ADDR', '0.0.0.0:8080'),
     AIFAR_DEV_ADDR: devAddr,
     AIFAR_VITE_HOST: viteHost,
-    AIFAR_STATIC_DIR: process.env.AIFAR_STATIC_DIR || path.join(webDir, 'dist'),
-    AIFAR_RESOURCE_DIR: process.env.AIFAR_RESOURCE_DIR || path.join(rootDir, 'resources'),
-    AIFAR_DATABASE_PATH: process.env.AIFAR_DATABASE_PATH || path.join(rootDir, 'data', 'aifar.db'),
+    AIFAR_STATIC_DIR: configuredPath(processEnv, defaults, 'AIFAR_STATIC_DIR', path.join(effectiveWebDir, 'dist'), effectiveRoot),
+    AIFAR_RESOURCE_DIR: configuredPath(processEnv, defaults, 'AIFAR_RESOURCE_DIR', path.join(effectiveRoot, 'resources'), effectiveRoot),
+    AIFAR_DATABASE_PATH: configuredPath(processEnv, defaults, 'AIFAR_DATABASE_PATH', path.join(effectiveRoot, 'data', 'aifar.db'), effectiveRoot),
     AIFAR_DEFAULT_PASSWORD: defaultPassword,
-    AIFAR_BOOTSTRAP_PASSWORD: process.env.AIFAR_BOOTSTRAP_PASSWORD || defaultPassword,
-    AIFAR_DEFAULT_DEPLOY_DIR: process.env.AIFAR_DEFAULT_DEPLOY_DIR || defaults.AIFAR_DEFAULT_DEPLOY_DIR || '/aifar/apps',
-    AIFAR_INSTALLER_TEMPLATE_DIR: process.env.AIFAR_INSTALLER_TEMPLATE_DIR || defaults.AIFAR_INSTALLER_TEMPLATE_DIR || path.join(rootDir, 'config', 'installers'),
-    AIFAR_MAX_REQUEST_BODY_BYTES: process.env.AIFAR_MAX_REQUEST_BODY_BYTES || defaults.AIFAR_MAX_REQUEST_BODY_BYTES || String(4 * 1024 * 1024 * 1024),
+    AIFAR_BOOTSTRAP_PASSWORD: configuredValue(processEnv, defaults, 'AIFAR_BOOTSTRAP_PASSWORD', defaultPassword),
+    AIFAR_DEFAULT_DEPLOY_DIR: configuredValue(processEnv, defaults, 'AIFAR_DEFAULT_DEPLOY_DIR', '/aifar/apps'),
+    AIFAR_INSTALLER_TEMPLATE_DIR: configuredPath(processEnv, defaults, 'AIFAR_INSTALLER_TEMPLATE_DIR', path.join(effectiveRoot, 'config', 'installers'), effectiveRoot),
+    AIFAR_MAX_REQUEST_BODY_BYTES: configuredValue(processEnv, defaults, 'AIFAR_MAX_REQUEST_BODY_BYTES', String(4 * 1024 * 1024 * 1024)),
     ...extra
   }
+  if (bundledGo) {
+    if (!Object.hasOwn(processEnv, 'GOROOT')) env.GOROOT = goDir
+    if (!Object.hasOwn(processEnv, 'GOPATH')) env.GOPATH = gopath
+  }
+  if (effectiveToolsDir !== '' && existsSync(nodeGlobalDir) && !Object.hasOwn(processEnv, 'NPM_CONFIG_PREFIX')) {
+    env.NPM_CONFIG_PREFIX = nodeGlobalDir
+  }
+  for (const key of Object.keys(env)) {
+    if (key.toLowerCase() === 'path') delete env[key]
+  }
+  env[pathKey] = effectivePath
+  return env
 }
 
 export function command(name) {
@@ -67,8 +102,11 @@ export function command(name) {
   return `${name}.cmd`
 }
 
-export function goCommand() {
-  const exe = process.platform === 'win32' ? 'go.exe' : 'go'
-  const fromTools = path.join(toolsDir, 'go', 'bin', exe)
+export function goCommand(options = {}) {
+  const platform = options.platform ?? process.platform
+  const effectiveToolsDir = options.toolRoot ?? toolsDir
+  const exe = platform === 'win32' ? 'go.exe' : 'go'
+  if (effectiveToolsDir === '') return exe
+  const fromTools = path.join(effectiveToolsDir, 'go', 'bin', exe)
   return existsSync(fromTools) ? fromTools : exe
 }

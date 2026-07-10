@@ -23,5 +23,13 @@ for (const target of targets) {
     env,
     stdio: 'inherit'
   })
+  if (result.error) {
+    if (result.error.code === 'ENOENT') {
+      console.error('[backend build] Go compiler was not found. Install Go in the configured tool root or make system Go available on PATH.')
+    } else {
+      console.error(`[backend build] unable to start Go compiler: ${result.error.message}`)
+    }
+    process.exit(1)
+  }
   if (result.status !== 0) process.exit(result.status ?? 1)
 }

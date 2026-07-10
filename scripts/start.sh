@@ -2,20 +2,66 @@
 set -eu
 ROOT="$(CDPATH= cd "$(dirname "$0")" && pwd)"
 if [ -f "$ROOT/config/defaults.env" ]; then
-  set -a
-  . "$ROOT/config/defaults.env"
-  set +a
+  seen_config_keys='|'
+  line_number=0
+  while IFS= read -r line || [ -n "$line" ]; do
+    line_number=$((line_number + 1))
+    trimmed=$(printf '%s' "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    case "$trimmed" in
+      ''|'#'*) continue ;;
+    esac
+    case "$trimmed" in
+      *=*) ;;
+      *)
+        echo "Malformed defaults.env line $line_number" >&2
+        exit 1
+        ;;
+    esac
+    key=${trimmed%%=*}
+    value=${trimmed#*=}
+    case "$key" in
+      AIFAR_?*) ;;
+      *)
+        echo "Malformed defaults.env line $line_number" >&2
+        exit 1
+        ;;
+    esac
+    case "$key" in
+      *[!A-Z0-9_]*)
+        echo "Malformed defaults.env line $line_number" >&2
+        exit 1
+        ;;
+    esac
+    case "$seen_config_keys" in
+      *"|$key|"*)
+        echo "Duplicate configuration key in defaults.env: $key" >&2
+        exit 1
+        ;;
+    esac
+    seen_config_keys="${seen_config_keys}${key}|"
+    eval "is_set=\${$key+x}"
+    if [ "$is_set" != "x" ]; then
+      value=$(printf '%s' "$value" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+      case "$value" in
+        \"*\") value=${value#\"}; value=${value%\"} ;;
+        \'*\') value=${value#\'}; value=${value%\'} ;;
+      esac
+      export "$key=$value"
+    fi
+  done < "$ROOT/config/defaults.env"
 fi
-if [ -z "${AIFAR_DEFAULT_PASSWORD:-}" ]; then
-  export AIFAR_DEFAULT_PASSWORD="Oversea.123"
+if [ "${AIFAR_DEFAULT_DEPLOY_DIR+x}" != "x" ]; then
+  export AIFAR_DEFAULT_DEPLOY_DIR="/aifar/apps"
 fi
-if [ -z "${AIFAR_BOOTSTRAP_PASSWORD:-}" ]; then
-  export AIFAR_BOOTSTRAP_PASSWORD="$AIFAR_DEFAULT_PASSWORD"
+if [ "${AIFAR_STATIC_DIR+x}" != "x" ]; then
+  export AIFAR_STATIC_DIR="$ROOT/web/dist"
 fi
-export AIFAR_DEFAULT_DEPLOY_DIR="${AIFAR_DEFAULT_DEPLOY_DIR:-/aifar/apps}"
-export AIFAR_STATIC_DIR="${AIFAR_STATIC_DIR:-$ROOT/web/dist}"
-export AIFAR_RESOURCE_DIR="${AIFAR_RESOURCE_DIR:-$ROOT/resources}"
-export AIFAR_ADDR="${AIFAR_ADDR:-0.0.0.0:8080}"
+if [ "${AIFAR_RESOURCE_DIR+x}" != "x" ]; then
+  export AIFAR_RESOURCE_DIR="$ROOT/resources"
+fi
+if [ "${AIFAR_ADDR+x}" != "x" ]; then
+  export AIFAR_ADDR="0.0.0.0:8080"
+fi
 BIN="$ROOT/bin/aifar-server-linux-amd64"
 RUN_DIR="$ROOT/run"
 LOG_DIR="$ROOT/logs"
