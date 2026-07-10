@@ -3,10 +3,11 @@ import { rootDir, withToolEnv } from './toolchain.mjs'
 
 const steps = [
   ['backend tests', process.execPath, ['scripts/test.mjs']],
+  ['web tests', process.execPath, ['scripts/test-web.mjs']],
+  ['script tests', process.execPath, ['scripts/test-scripts.mjs']],
   ['web build', process.execPath, ['scripts/build-web.mjs']],
   ['backend build', process.execPath, ['scripts/build-backend.mjs']],
   ['package', process.execPath, ['scripts/package-build.mjs']],
-  ['release', process.execPath, ['scripts/package-release.mjs']],
   ['verify release checksums', process.execPath, ['scripts/verify-release-checksums.mjs']]
 ]
 

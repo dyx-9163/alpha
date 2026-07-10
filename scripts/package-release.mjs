@@ -18,6 +18,8 @@ import {
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
+import { assertReleaseDefaultsFile } from './runtime-security-config.mjs'
+
 const scriptDir = path.dirname(fileURLToPath(import.meta.url))
 const rootDir = path.resolve(scriptDir, '..')
 const deploymentDir = path.join(rootDir, 'deploy', 'deployment')
@@ -30,7 +32,7 @@ const hashBuffer = Buffer.allocUnsafe(8 * 1024 * 1024)
 
 const commonEntries = [
   { kind: 'dir', source: 'deploy/dist', target: 'web/dist', required: true },
-  { kind: 'dir', source: 'resources', target: 'resources', required: false },
+  { kind: 'dir', source: 'resources', target: 'resources', required: true },
   { kind: 'dir', source: 'config', target: 'config', required: true },
   { kind: 'file', source: 'README.md', target: 'README.md', required: false }
 ]
@@ -163,6 +165,8 @@ function buildPackage(target) {
 
   for (const entry of commonEntries) copyEntry(entry, packageDir)
 
+  assertReleaseDefaultsFile(path.join(packageDir, 'config', 'defaults.env'))
+
   const binarySource = path.join(buildBinDir, target.binary)
   if (!existsSync(binarySource)) {
     throw new Error(`Missing backend binary: deploy/bin/${target.binary}. Run pnpm package first.`)
@@ -197,9 +201,7 @@ function buildPackage(target) {
       cpSync(packageDir, finalPackageDir, { dereference: true, force: true, recursive: true })
       finalPackageReady = true
     } catch (error) {
-      warnings.push(
-        `Could not refresh package directory ${path.relative(rootDir, finalPackageDir)}: ${error.message}`
-      )
+      throw new Error(`Could not refresh package directory ${path.relative(rootDir, finalPackageDir)}: ${error.message}`)
     }
   }
 
@@ -217,16 +219,23 @@ function buildPackage(target) {
 }
 
 function createArchive(target, packageName, packageDir, archivePath) {
+  const assertArchiveSuccess = (result, archiveLabel) => {
+    if (!result.error && result.status === 0 && !result.signal) return
+    const reason = result.error?.message ?? `exit ${result.status ?? result.signal}`
+    try {
+      if (existsSync(archivePath)) removePath(archivePath)
+    } catch (cleanupError) {
+      throw new Error(`Could not create ${archiveLabel} archive for ${packageName}: ${reason}; could not remove partial archive: ${cleanupError.message}`)
+    }
+    throw new Error(`Could not create ${archiveLabel} archive for ${packageName}: ${reason}`)
+  }
   const packageParentDir = path.dirname(packageDir)
   if (target.archive === 'tar.gz') {
     const result = spawnSync('tar', ['-czf', archivePath, '-C', packageParentDir, packageName], {
       cwd: rootDir,
       stdio: 'inherit'
     })
-    if (result.status !== 0) {
-      warnings.push(`Could not create tar archive for ${packageName}; release archive was skipped.`)
-      return false
-    }
+    assertArchiveSuccess(result, 'tar')
     console.log(`[package] archive ${path.relative(rootDir, archivePath)}`)
     return true
   }
@@ -236,10 +245,7 @@ function createArchive(target, packageName, packageDir, archivePath) {
       cwd: rootDir,
       stdio: 'inherit'
     })
-    if (result.status !== 0) {
-      warnings.push(`Could not create zip archive for ${packageName}; release archive was skipped.`)
-      return false
-    }
+    assertArchiveSuccess(result, 'zip')
     console.log(`[package] archive ${path.relative(rootDir, archivePath)}`)
     return true
   }
@@ -248,15 +254,13 @@ function createArchive(target, packageName, packageDir, archivePath) {
     cwd: packageParentDir,
     stdio: 'inherit'
   })
-  if (result.status !== 0) {
-    warnings.push(`Could not create zip archive for ${packageName}; release archive was skipped.`)
-    return false
-  }
+  assertArchiveSuccess(result, 'zip')
   console.log(`[package] archive ${path.relative(rootDir, archivePath)}`)
   return true
 }
 
 function ensureRequiredBuildOutputs() {
+  assertReleaseDefaultsFile(path.join(rootDir, 'config', 'defaults.env'))
   for (const entry of commonEntries.filter((item) => item.required)) {
     const sourcePath = path.join(rootDir, entry.source)
     if (!existsSync(sourcePath)) {
@@ -272,7 +276,12 @@ function ensureRequiredBuildOutputs() {
 
 ensureRequiredBuildOutputs()
 mkdirSync(deploymentDir, { recursive: true })
-for (const target of targets) buildPackage(target)
+try {
+  for (const target of targets) buildPackage(target)
+} finally {
+  const stagingRoot = path.join(rootDir, 'deploy', '.stage')
+  if (existsSync(stagingRoot)) rmSync(stagingRoot, { recursive: true, force: true })
+}
 
 if (warnings.length) {
   console.warn('\n[package] warnings:')

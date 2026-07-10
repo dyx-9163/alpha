@@ -28,6 +28,7 @@ const powershell = findExecutable([
   'powershell.exe',
   'pwsh'
 ], ['-NoProfile', '-Command', '$PSVersionTable.PSVersion.ToString()'])
+const powershellArgs = ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command']
 
 function tempRoot(t, prefix) {
   const directory = mkdtempSync(path.join(tmpdir(), prefix))
@@ -119,7 +120,7 @@ AIFAR_DEFAULT_DEPLOY_DIR=
 test('start.ps1 parses cleanly and exposes dot-sourceable environment functions', { skip: !powershell }, () => {
   const script = path.join(repositoryScriptsDir, 'start.ps1')
   const command = `$errors = $null; [System.Management.Automation.Language.Parser]::ParseFile(${quotePowerShell(script)}, [ref]$null, [ref]$errors) | Out-Null; if ($errors.Count -gt 0) { $errors | ForEach-Object { [Console]::Error.WriteLine($_.Message) }; exit 1 }; . ${quotePowerShell(script)}; if (-not (Get-Command Resolve-AifarEnvironment -ErrorAction SilentlyContinue)) { exit 2 }`
-  const result = spawnSync(powershell, ['-NoProfile', '-Command', command], { encoding: 'utf8' })
+  const result = spawnSync(powershell, [...powershellArgs, command], { encoding: 'utf8' })
   assert.equal(result.status, 0, result.stderr)
 })
 
@@ -135,18 +136,18 @@ test('PowerShell defaults parser rejects malformed and duplicate keys without ec
   const script = path.join(repositoryScriptsDir, 'start.ps1')
 
   const malformedCommand = `. ${quotePowerShell(script)}; Resolve-AifarEnvironment -Root ${quotePowerShell(root)} -DefaultsPath ${quotePowerShell(malformedPath)} -Environment @{}`
-  const malformed = spawnSync(powershell, ['-NoProfile', '-Command', malformedCommand], { encoding: 'utf8' })
+  const malformed = spawnSync(powershell, [...powershellArgs, malformedCommand], { encoding: 'utf8' })
   assert.notEqual(malformed.status, 0)
   assert.match(malformed.stderr, /Malformed defaults\.env line 2/)
   assert.doesNotMatch(malformed.stderr, new RegExp(secret))
 
   const duplicateCommand = `. ${quotePowerShell(script)}; Resolve-AifarEnvironment -Root ${quotePowerShell(root)} -DefaultsPath ${quotePowerShell(duplicatePath)} -Environment @{}`
-  const duplicate = spawnSync(powershell, ['-NoProfile', '-Command', duplicateCommand], { encoding: 'utf8' })
+  const duplicate = spawnSync(powershell, [...powershellArgs, duplicateCommand], { encoding: 'utf8' })
   assert.notEqual(duplicate.status, 0)
   assert.match(duplicate.stderr, /Duplicate configuration key.*AIFAR_ADDR/)
 
   const illegalKeyCommand = `. ${quotePowerShell(script)}; Resolve-AifarEnvironment -Root ${quotePowerShell(root)} -DefaultsPath ${quotePowerShell(illegalKeyPath)} -Environment @{}`
-  const illegalKey = spawnSync(powershell, ['-NoProfile', '-Command', illegalKeyCommand], { encoding: 'utf8' })
+  const illegalKey = spawnSync(powershell, [...powershellArgs, illegalKeyCommand], { encoding: 'utf8' })
   assert.notEqual(illegalKey.status, 0)
   assert.match(illegalKey.stderr, /Malformed defaults\.env line 1/)
 })
@@ -163,7 +164,7 @@ AIFAR_RESOURCE_DIR=
 `)
   const script = path.join(repositoryScriptsDir, 'start.ps1')
   const command = `. ${quotePowerShell(script)}; $resolved = Resolve-AifarEnvironment -Root ${quotePowerShell(root)} -DefaultsPath ${quotePowerShell(defaultsPath)} -Environment @{ AIFAR_ADDR = ''; AIFAR_STATIC_DIR = '' }; [ordered]@{ addr = $resolved['AIFAR_ADDR']; static = $resolved['AIFAR_STATIC_DIR']; deploy = $resolved['AIFAR_DEFAULT_DEPLOY_DIR']; resource = $resolved['AIFAR_RESOURCE_DIR'] } | ConvertTo-Json -Compress`
-  const result = spawnSync(powershell, ['-NoProfile', '-Command', command], { encoding: 'utf8' })
+  const result = spawnSync(powershell, [...powershellArgs, command], { encoding: 'utf8' })
   assert.equal(result.status, 0, result.stderr)
   assert.deepEqual(JSON.parse(result.stdout.trim()), {
     addr: '',
