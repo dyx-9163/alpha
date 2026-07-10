@@ -93,6 +93,32 @@ func TestValidateServerSecurityRejectsEqualRotationSecretsUnderOverride(t *testi
 	}
 }
 
+func TestValidateServerSecurityRejectsEqualWhitespaceRotationSecretsUnderOverride(t *testing.T) {
+	cfg := Config{
+		Addr:                     "127.0.0.1:8080",
+		CredentialSecret:         "   ",
+		PreviousCredentialSecret: "   ",
+		AllowInsecureDefaults:    true,
+	}
+	err := cfg.ValidateServerSecurity()
+	if err == nil || !strings.Contains(err.Error(), "AIFAR_PREVIOUS_CREDENTIAL_SECRET") {
+		t.Fatalf("ValidateServerSecurity() error = %v, want equal raw rotation secret error", err)
+	}
+}
+
+func TestValidateServerSecurityRejectsRotationSecretsThatDeriveTheSameKey(t *testing.T) {
+	cfg := Config{
+		Addr:                     "127.0.0.1:8080",
+		CredentialSecret:         "current-secret",
+		PreviousCredentialSecret: "  current-secret  ",
+		AllowInsecureDefaults:    true,
+	}
+	err := cfg.ValidateServerSecurity()
+	if err == nil || !strings.Contains(err.Error(), "AIFAR_PREVIOUS_CREDENTIAL_SECRET") {
+		t.Fatalf("ValidateServerSecurity() error = %v, want derived-key equivalence error", err)
+	}
+}
+
 func TestValidateServerSecurityRequiresExplicitDistinctCredentialSecret(t *testing.T) {
 	cfg := secureTestConfig()
 	cfg.CredentialSecretConfigured = false

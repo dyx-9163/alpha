@@ -21,7 +21,7 @@ func (c Config) ValidateServerSecurity() error {
 	if c.CredentialSecretConfigured && strings.TrimSpace(c.CredentialSecret) == strings.TrimSpace(c.JWTSecret) {
 		problems = append(problems, "AIFAR_CREDENTIAL_SECRET must be different from AIFAR_JWT_SECRET")
 	}
-	if strings.TrimSpace(c.PreviousCredentialSecret) != "" && strings.TrimSpace(c.PreviousCredentialSecret) == strings.TrimSpace(c.CredentialSecret) {
+	if c.PreviousCredentialSecret != "" && strings.TrimSpace(c.PreviousCredentialSecret) == strings.TrimSpace(c.CredentialSecret) {
 		problems = append(problems, "AIFAR_PREVIOUS_CREDENTIAL_SECRET must be different from AIFAR_CREDENTIAL_SECRET")
 	}
 	if c.AllowInsecureDefaults {

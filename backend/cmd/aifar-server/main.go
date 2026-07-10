@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"net/http"
 	"time"
@@ -19,14 +20,48 @@ import (
 	"aifar-deployment/backend/internal/worker"
 )
 
+type credentialSecretStore interface {
+	ValidateCredentialSecrets() error
+	RotateCredentialSecrets() (int, error)
+}
+
+func prepareCredentialSecrets(cfg *config.Config, db credentialSecretStore) (int, bool, error) {
+	if err := db.ValidateCredentialSecrets(); err != nil {
+		return 0, false, fmt.Errorf("validate credential secrets: %w", err)
+	}
+	if cfg.PreviousCredentialSecret == "" {
+		return 0, false, nil
+	}
+
+	rotated, err := db.RotateCredentialSecrets()
+	if err != nil {
+		return 0, false, fmt.Errorf("rotate credential secrets: %w", err)
+	}
+	cfg.PreviousCredentialSecret = ""
+	return rotated, true, nil
+}
+
 func main() {
 	cfg := config.Load()
+	if err := cfg.ValidateServerSecurity(); err != nil {
+		log.Fatalf("unsafe security configuration: %v; set strong values or use AIFAR_ALLOW_INSECURE_DEFAULTS=true only for local development", err)
+	}
+	if cfg.AllowInsecureDefaults {
+		log.Printf("WARNING: insecure development credentials are explicitly allowed; do not use this mode in production")
+	}
 
-	db, err := store.OpenWithSecret(cfg.DatabasePath, cfg.CredentialSecret)
+	db, err := store.OpenWithSecrets(cfg.DatabasePath, cfg.CredentialSecret, cfg.PreviousCredentialSecret)
 	if err != nil {
 		log.Fatalf("open database: %v", err)
 	}
 	defer db.Close()
+	rotated, didRotate, err := prepareCredentialSecrets(&cfg, db)
+	if err != nil {
+		log.Fatalf("prepare credential encryption: %v", err)
+	}
+	if didRotate {
+		log.Printf("rotated %d encrypted value(s) to AIFAR_CREDENTIAL_SECRET; remove AIFAR_PREVIOUS_CREDENTIAL_SECRET before the next start", rotated)
+	}
 
 	if err := db.BootstrapUser(cfg.BootstrapUsername, cfg.BootstrapPassword); err != nil {
 		log.Fatalf("bootstrap user: %v", err)
