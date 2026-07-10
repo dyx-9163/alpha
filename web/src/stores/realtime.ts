@@ -148,28 +148,26 @@ export const useRealtimeStore = defineStore('realtime', {
       }
     },
     async loadStatusSnapshots() {
-      const result = await apiGet<{ items?: StatusSnapshot[] } | null>('/status/snapshots').catch(() => ({ items: [] }))
-      const next: Record<string, StatusSnapshot> = {}
-      for (const snapshot of asArray<StatusSnapshot>(result?.items)) {
-        const key = snapshotKey(snapshot.scope, snapshot.resourceId)
-        if (key) {
-          next[key] = normalizeSnapshot(snapshot)
-        }
+      let result: { items?: StatusSnapshot[] } | null
+      try {
+        result = await apiGet<{ items?: StatusSnapshot[] } | null>('/status/snapshots')
+      } catch {
+        return false
       }
-      this.statusSnapshotsByKey = next
-      this.statusRevision += 1
+      const merged = mergeStatusSnapshots(this.statusSnapshotsByKey, asArray<StatusSnapshot>(result?.items))
+      if (merged.changed) {
+        this.statusSnapshotsByKey = merged.snapshotsByKey
+        this.statusRevision += 1
+      }
       this.snapshotsLoadedAt = Date.now()
+      return true
     },
     applyStatusSnapshot(snapshot: StatusSnapshot) {
-      const normalized = normalizeSnapshot(snapshot)
-      const key = snapshotKey(normalized.scope, normalized.resourceId)
-      if (!key) {
+      const merged = mergeStatusSnapshots(this.statusSnapshotsByKey, [snapshot])
+      if (!merged.changed) {
         return
       }
-      this.statusSnapshotsByKey = {
-        ...this.statusSnapshotsByKey,
-        [key]: normalized
-      }
+      this.statusSnapshotsByKey = merged.snapshotsByKey
       this.statusRevision += 1
     }
   }
@@ -253,6 +251,75 @@ function normalizeSnapshot(snapshot: StatusSnapshot): StatusSnapshot {
     payload: objectRecord(snapshot.payload),
     lastError: stringValue(snapshot.lastError)
   }
+}
+
+function mergeStatusSnapshots(
+  current: Record<string, StatusSnapshot>,
+  incoming: StatusSnapshot[]
+): { snapshotsByKey: Record<string, StatusSnapshot>; changed: boolean } {
+  let next = current
+  let changed = false
+  for (const snapshot of incoming) {
+    const normalized = normalizeSnapshot(snapshot)
+    const key = snapshotKey(normalized.scope, normalized.resourceId)
+    if (!key) {
+      continue
+    }
+    const existing = next[key]
+    if (existing && compareSnapshotFreshness(normalized, existing) <= 0) {
+      continue
+    }
+    if (!changed) {
+      next = { ...current }
+      changed = true
+    }
+    next[key] = normalized
+  }
+  return { snapshotsByKey: next, changed }
+}
+
+function compareSnapshotFreshness(candidate: StatusSnapshot, current: StatusSnapshot) {
+  const versionComparison = numericVersion(candidate.version) - numericVersion(current.version)
+  if (versionComparison !== 0) {
+    return Math.sign(versionComparison)
+  }
+  const candidateTimes = snapshotTimes(candidate)
+  const currentTimes = snapshotTimes(current)
+  const collectedComparison = compareOptionalNumbers(candidateTimes.collected, currentTimes.collected)
+  if (collectedComparison !== 0) {
+    return collectedComparison
+  }
+  return compareOptionalNumbers(candidateTimes.updated, currentTimes.updated)
+}
+
+function numericVersion(value: unknown) {
+  const version = Number(value)
+  return Number.isFinite(version) ? version : 0
+}
+
+function snapshotTimes(snapshot: StatusSnapshot) {
+  return {
+    collected: timestampValue(snapshot.collectedAt),
+    updated: timestampValue(snapshot.updatedAt)
+  }
+}
+
+function timestampValue(value: unknown) {
+  const timestamp = Date.parse(stringValue(value))
+  return Number.isFinite(timestamp) ? timestamp : null
+}
+
+function compareOptionalNumbers(candidate: number | null, current: number | null) {
+  if (candidate === current) {
+    return 0
+  }
+  if (candidate === null) {
+    return -1
+  }
+  if (current === null) {
+    return 1
+  }
+  return Math.sign(candidate - current)
 }
 
 function snapshotKey(scope?: string, resourceId?: string) {
