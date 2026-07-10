@@ -129,21 +129,81 @@
 </template>
 
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, provide, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import type { UploadFile } from 'element-plus'
-import { apiEventSourceUrl, apiGet, apiPost, apiPostForm, apiPut, asArray } from '../api/client'
+import { asArray } from '../api/client'
 import KeyValueGrid from '../components/KeyValueGrid.vue'
 import MetricGrid from '../components/MetricGrid.vue'
 import ServerSelector from '../components/ServerSelector.vue'
 import { usePermissions } from '../composables/usePermissions'
-import { getCurrentLocale, useI18n } from '../i18n'
+import { useI18n } from '../i18n'
 import { permissions } from '../rbac'
 import { useRealtimeStore } from '../stores/realtime'
 import { useTaskProgressStore } from '../stores/taskProgress'
+import {
+  activeCollectionKind as resolveActiveCollectionKind,
+  collectionBackedKind as isCollectionBackedKind,
+  collectionCacheKey as buildCollectionCacheKey,
+  containerCacheScope,
+  runtimeCacheKey as buildRuntimeCacheKey,
+  runtimeLogCacheKey as buildRuntimeLogCacheKey,
+  summaryCacheKey as buildSummaryCacheKey
+} from '../containers/cacheKeys'
+import {
+  fetchContainerPageBootstrap,
+  fetchDockerCollection,
+  fetchDockerSummary,
+  removeDockerImages,
+  type DockerSummaryResponse
+} from '../containers/dockerApi'
+import { imageReference, imageRowKey, uniqueValues } from '../containers/dockerImages'
+import { mergeDockerSummarySnapshot } from '../containers/realtimeSummary'
 import AifarRuntimeDialogs from '../containers/runtime/AifarRuntimeDialogs.vue'
 import AifarRuntimeWorkspace from '../containers/runtime/AifarRuntimeWorkspace.vue'
-import { aifarRuntimeContextKey } from '../containers/runtime/context'
+import {
+  aifarArtifactAccept as resolveAifarArtifactAccept,
+  aifarArtifactHintKey,
+  buildAifarArtifactForm,
+  formatBytes,
+  isAifarArtifactTooLarge
+} from '../containers/runtime/artifacts'
+import {
+  applyRuntimeConfig,
+  cleanupStaleRuntime,
+  createRuntimeLogEventSource,
+  fetchAifarReleases,
+  fetchAifarRuntime,
+  installRuntimeServices,
+  offlineRuntimeService,
+  reconcileRuntime,
+  rollbackAifarRelease as rollbackAifarReleaseRequest,
+  scaleInRuntimeService,
+  scaleOutRuntimeService,
+  updateAifarArtifact
+} from '../containers/runtime/api'
+import {
+  buildRuntimeServiceOverrides,
+  defaultRuntimeConfigState,
+  normalizedRuntimeValues,
+  runtimeConfigNumberText,
+  validateRuntimeConfigValues
+} from '../containers/runtime/config'
+import {
+  aifarRuntimeStatusKind,
+  aifarRuntimeStatusLabel as formatAifarRuntimeStatusLabel,
+  formatDate,
+  percentText,
+  releaseKindLabel as formatReleaseKindLabel,
+  releaseServicesText,
+  releaseStatusLabel as formatReleaseStatusLabel,
+  runtimeApplyStatusLabel as formatRuntimeApplyStatusLabel,
+  runtimeDeploymentReplicaText,
+  runtimeEndpointText,
+  runtimeInstanceLabel as formatRuntimeInstanceLabel,
+  runtimeNacosStatus
+} from '../containers/runtime/format'
+import { useAifarRuntimeProvider } from '../containers/runtime/useAifarRuntimeProvider'
 import {
   parseRuntimeLogErrorEvent,
   parseRuntimeLogLine,
@@ -152,9 +212,23 @@ import {
   runtimeLogRowHeight,
   runtimeLogVisibleCount
 } from '../containers/runtime/logs'
+import {
+  aifarServiceOptions,
+  buildRuntimeLogPodOptions,
+  buildRuntimeServiceMap,
+  filterRuntimeDeploymentsByInstance,
+  filterRuntimePodsByInstance,
+  filterRuntimeServicesByInstance,
+  findRuntimeIngressByInstance,
+  findSelectedRuntimeInstance,
+  resolveRuntimeAppInstance,
+  runtimeDiscoveryTarget,
+  runtimeServiceForDeployment as resolveRuntimeServiceForDeployment,
+  type RuntimeAppInstance
+} from '../containers/runtime/selectors'
+import { useAifarRuntimeLogViewport } from '../containers/runtime/useAifarRuntimeLogViewport'
 import type {
   AifarRelease,
-  AifarReleaseListResponse,
   AifarRuntimeDeployment,
   AifarRuntimeIngress,
   AifarRuntimeInstance,
@@ -165,27 +239,12 @@ import type {
   AifarRuntimeService,
   RuntimeConfigFormValues,
   RuntimeConfigServiceRow,
-  RuntimeConfigState,
   RuntimeConfigValues,
   RuntimeEntryRoute,
   RuntimeLogRow
 } from '../containers/runtime/types'
 
-type DockerSummaryResponse = {
-  available?: boolean
-  error?: string
-  summary?: Record<string, any>
-  diskUsage?: Array<Record<string, string>>
-}
-
-type AppInstance = {
-  id: string
-  app: string
-  serverId: string
-  version?: string
-  status: string
-  metadata?: string
-}
+type AppInstance = RuntimeAppInstance
 
 const { t } = useI18n()
 const { can, deniedText } = usePermissions()
@@ -236,8 +295,6 @@ const runtimeLogPendingRows = ref<RuntimeLogRow[]>([])
 const runtimeLogPaused = ref(false)
 const runtimeLogAutoScroll = ref(true)
 const runtimeLogDroppedRows = ref(0)
-const runtimeLogScrollTop = ref(0)
-const runtimeLogViewport = ref<HTMLElement | null>(null)
 const runtimeLogStreamStatus = ref<'idle' | 'connecting' | 'connected' | 'reconnecting' | 'error'>('idle')
 const runtimeLogLastDataAt = ref('')
 let runtimeLogSource: EventSource | null = null
@@ -301,18 +358,6 @@ const normalizedDiskUsage = computed(() => {
     { type: t('containers.buildCache'), size: '0 B', reclaimable: '-' }
   ]
 })
-const aifarServiceOptions = [
-  'oauth',
-  'permission',
-  'system',
-  'file',
-  'message',
-  'im',
-  'contacts',
-  'meeting',
-  'gateway',
-  'web-vue3'
-].map((name) => ({ value: name, label: name }))
 const selectedAifarUpdateInstance = computed(() => aifarUpdateInstanceOverride.value)
 const selectedAifarContainerLabel = computed(() => aifarUpdateTargetLabel.value || '-')
 const aifarUpdateModeLabel = computed(() => aifarUpdateMode.value === 'bundle' ? t('apps.aifarUpdateAllServices') : t('apps.aifarUpdateSingleMode'))
@@ -325,70 +370,30 @@ const selectedAifarInstanceLabel = computed(() => {
   const serverText = server ? serverLabel(server) : instance.serverId
   return `${instance.app} / ${instance.version || '-'} / ${serverText}`
 })
-const aifarArtifactAccept = computed(() => {
-  if (aifarUpdateMode.value === 'bundle') {
-    return '.zip'
-  }
-  return aifarUpdateService.value === 'web-vue3' ? '.zip,.tar,.tgz,.tar.gz' : '.jar'
-})
-const aifarArtifactHint = computed(() => {
-  if (aifarUpdateMode.value === 'bundle') {
-    return t('apps.aifarUpdateBundleHint')
-  }
-  return aifarUpdateService.value === 'web-vue3' ? t('apps.aifarUpdateFrontendHint') : t('apps.aifarUpdateJarHint')
-})
+const aifarArtifactAccept = computed(() => resolveAifarArtifactAccept(aifarUpdateMode.value, aifarUpdateService.value))
+const aifarArtifactHint = computed(() => t(aifarArtifactHintKey(aifarUpdateMode.value, aifarUpdateService.value)))
 const aifarRuntimeInstances = computed(() => asArray<AifarRuntimeInstance>(aifarRuntime.value.instances))
-const selectedRuntimeInstance = computed(() => {
-  const current = aifarRuntimeInstances.value.find((instance) => instance.id === selectedRuntimeInstanceId.value)
-  return current ?? aifarRuntimeInstances.value[0] ?? null
-})
+const selectedRuntimeInstance = computed(() => findSelectedRuntimeInstance(aifarRuntimeInstances.value, selectedRuntimeInstanceId.value))
 const selectedRuntimeConfig = computed(() => selectedRuntimeInstance.value?.runtimeConfig ?? defaultRuntimeConfigState())
-const selectedRuntimeAppInstance = computed(() => {
-  const runtimeInstance = selectedRuntimeInstance.value
-  if (!runtimeInstance) return null
-  return appInstances.value.find((instance) => instance.id === runtimeInstance.id) ?? {
-    id: runtimeInstance.id,
-    app: 'aifar',
-    serverId: selectedServerId.value,
-    version: runtimeInstance.version,
-    status: runtimeInstance.status || 'installed',
-    metadata: ''
-  }
-})
-const selectedRuntimeServices = computed(() => asArray<AifarRuntimeService>(aifarRuntime.value.services).filter((item) => item.instanceId === selectedRuntimeInstance.value?.id))
-const selectedRuntimeDeployments = computed(() => asArray<AifarRuntimeDeployment>(aifarRuntime.value.deployments).filter((item) => item.instanceId === selectedRuntimeInstance.value?.id))
-const selectedRuntimePodsRaw = computed(() => asArray<AifarRuntimePod>(aifarRuntime.value.pods).filter((item) => item.instanceId === selectedRuntimeInstance.value?.id))
+const selectedRuntimeAppInstance = computed(() => resolveRuntimeAppInstance(selectedRuntimeInstance.value, appInstances.value, selectedServerId.value))
+const selectedRuntimeServices = computed(() => filterRuntimeServicesByInstance(asArray<AifarRuntimeService>(aifarRuntime.value.services), selectedRuntimeInstance.value?.id))
+const selectedRuntimeDeployments = computed(() => filterRuntimeDeploymentsByInstance(asArray<AifarRuntimeDeployment>(aifarRuntime.value.deployments), selectedRuntimeInstance.value?.id))
+const selectedRuntimePodsRaw = computed(() => filterRuntimePodsByInstance(asArray<AifarRuntimePod>(aifarRuntime.value.pods), selectedRuntimeInstance.value?.id))
 const selectedRuntimePods = computed(() => {
   const service = String(runtimePodServiceFilter.value || '').trim()
   if (!service) return selectedRuntimePodsRaw.value
   return selectedRuntimePodsRaw.value.filter((item) => item.serviceName === service)
 })
 const staleRuntimePodCount = computed(() => selectedRuntimePodsRaw.value.filter((item) => String(item.status || '').trim() === 'stale').length)
-const selectedRuntimeIngress = computed(() => asArray<AifarRuntimeIngress>(aifarRuntime.value.ingress).find((item) => item.instanceId === selectedRuntimeInstance.value?.id) ?? null)
+const selectedRuntimeIngress = computed(() => findRuntimeIngressByInstance(asArray<AifarRuntimeIngress>(aifarRuntime.value.ingress), selectedRuntimeInstance.value?.id))
 const aifarRuntimeWarnings = computed(() => asArray<string>(aifarRuntime.value.warnings))
 const installedRuntimeServiceNames = computed(() => new Set(selectedRuntimeServices.value.map((item) => item.serviceName).filter(Boolean)))
-const runtimeServiceMap = computed(() => {
-  const out = new Map<string, AifarRuntimeService>()
-  for (const service of selectedRuntimeServices.value) {
-    if (service.serviceName) out.set(service.serviceName, service)
-  }
-  return out
-})
+const runtimeServiceMap = computed(() => buildRuntimeServiceMap(selectedRuntimeServices.value))
 const runtimePodsLoadedForCurrentScope = computed(() => Boolean(runtimePodsLoaded.value[runtimeCacheKey('pods')]))
 const runtimePodStatsLoadedForCurrentScope = computed(() => Boolean(runtimePodStatsLoaded.value[runtimeCacheKey('pods')]))
 const runtimeLogsLoadedForCurrentScope = computed(() => Boolean(runtimeLogsLoaded.value[runtimeLogCacheKey()]))
 const runtimeLogGroups = computed(() => asArray<AifarRuntimeLogPod>(runtimeLogs.value.pods))
-const runtimeLogPodOptions = computed(() => {
-  const services = new Set(runtimeLogServiceFilter.value)
-  return selectedRuntimePodsRaw.value
-    .filter((pod) => !services.size || services.has(pod.serviceName))
-    .map((pod) => ({
-      value: pod.containerName,
-      label: `${pod.serviceName} / ${pod.containerName}`,
-      serviceName: pod.serviceName,
-      status: pod.status || 'unknown'
-    }))
-})
+const runtimeLogPodOptions = computed(() => buildRuntimeLogPodOptions(selectedRuntimePodsRaw.value, runtimeLogServiceFilter.value))
 const runtimeLogSelectionReady = computed(() => runtimeLogServiceFilter.value.length > 0 || runtimeLogPodFilter.value.length > 0)
 const filteredRuntimeLogRows = computed<RuntimeLogRow[]>(() => {
   const levels = new Set(runtimeLogLevelFilter.value.map((item) => item.toUpperCase()))
@@ -412,10 +417,18 @@ const filteredRuntimeLogRows = computed<RuntimeLogRow[]>(() => {
     return left.sequence - right.sequence
   })
 })
-const runtimeLogVirtualStart = computed(() => Math.max(0, Math.floor(runtimeLogScrollTop.value / runtimeLogRowHeight) - 8))
-const runtimeLogVirtualRows = computed(() => filteredRuntimeLogRows.value.slice(runtimeLogVirtualStart.value, runtimeLogVirtualStart.value + runtimeLogVisibleCount))
-const runtimeLogTopSpacer = computed(() => runtimeLogVirtualStart.value * runtimeLogRowHeight)
-const runtimeLogBottomSpacer = computed(() => Math.max(0, (filteredRuntimeLogRows.value.length - runtimeLogVirtualStart.value - runtimeLogVirtualRows.value.length) * runtimeLogRowHeight))
+const {
+  runtimeLogScrollTop,
+  runtimeLogViewport,
+  runtimeLogVirtualRows,
+  runtimeLogTopSpacer,
+  runtimeLogBottomSpacer,
+  handleRuntimeLogScroll,
+  scrollRuntimeLogsToBottom
+} = useAifarRuntimeLogViewport(filteredRuntimeLogRows, {
+  rowHeight: runtimeLogRowHeight,
+  visibleCount: runtimeLogVisibleCount
+})
 const runtimeLogWarnings = computed(() => asArray<string>(runtimeLogs.value.warnings))
 const selectedRuntimeReleaseCacheKey = computed(() => selectedRuntimeInstance.value?.id ? `aifar-releases:${selectedRuntimeInstance.value.id}` : '')
 const runtimeLogPendingCount = computed(() => runtimeLogPendingRows.value.length)
@@ -504,34 +517,38 @@ function targetQuery() {
 }
 
 function cacheScope() {
-  return selectedServerId.value || 'none'
+  return containerCacheScope(selectedServerId.value)
 }
 
 function summaryCacheKey(includeDisk: boolean) {
-  return `${cacheScope()}:summary:${includeDisk ? 'disk' : 'base'}`
+  return buildSummaryCacheKey(cacheScope(), includeDisk)
 }
 
 function activeCollectionKind() {
-  if (tab.value === 'images') {
-    return resourceTab.value
-  }
-  return ''
+  return resolveActiveCollectionKind(tab.value, resourceTab.value)
 }
 
 function collectionBackedKind(kind = activeCollectionKind()) {
-  return kind === 'images' || kind === 'networks' || kind === 'volumes'
+  return isCollectionBackedKind(kind)
 }
 
 function collectionCacheKey(kind = activeCollectionKind()) {
-  return `${cacheScope()}:collection:${kind}`
+  return buildCollectionCacheKey(cacheScope(), kind)
 }
 
 function runtimeCacheKey(scope: 'base' | 'pods' = 'base') {
-  return `${cacheScope()}:aifar-runtime:${scope}`
+  return buildRuntimeCacheKey(cacheScope(), scope)
 }
 
 function runtimeLogCacheKey() {
-  return `${cacheScope()}:aifar-runtime:logs:${selectedRuntimeInstance.value?.id || 'none'}:${runtimeLogServiceFilter.value.join(',')}:${runtimeLogPodFilter.value.join(',')}:${runtimeLogTail.value}:${runtimeLogSinceSeconds.value}`
+  return buildRuntimeLogCacheKey(
+    cacheScope(),
+    selectedRuntimeInstance.value?.id,
+    runtimeLogServiceFilter.value,
+    runtimeLogPodFilter.value,
+    runtimeLogTail.value,
+    runtimeLogSinceSeconds.value
+  )
 }
 
 async function withLoading<T>(fn: () => Promise<T>) {
@@ -551,11 +568,7 @@ function serverLabel(server: any) {
 }
 
 async function loadServers() {
-  const [serverRows, instanceRows, settings] = await Promise.all([
-    apiGet<any[] | null>('/servers').catch(() => []),
-    apiGet<AppInstance[] | null>('/apps/instances').catch(() => []),
-    apiGet<{ maxRequestBodyBytes?: number }>('/settings').catch(() => ({}))
-  ])
+  const { servers: serverRows, appInstances: instanceRows, settings } = await fetchContainerPageBootstrap<AppInstance>()
   servers.value = asArray(serverRows)
   appInstances.value = asArray(instanceRows)
   appSettings.value = settings
@@ -598,8 +611,7 @@ async function loadSummary(includeDisk = false, force = false) {
       return
     }
   }
-  const endpoint = `/containers/summary?${query}${includeDisk ? '&includeDisk=1' : ''}`
-  const next = await apiGet<DockerSummaryResponse>(endpoint).catch((err) => {
+  const next = await fetchDockerSummary(query, includeDisk).catch((err) => {
     error.value = err.message
     return { available: false, error: err.message }
   })
@@ -612,17 +624,9 @@ async function loadSummary(includeDisk = false, force = false) {
 }
 
 function applyDockerSummaryEvent(event: unknown) {
-  const envelope = realtimeSnapshotEnvelope(event)
-  const payload = objectPayload(envelope?.payload)
-  if (!payload) {
+  const next = mergeDockerSummarySnapshot(summary.value, event)
+  if (!next) {
     return false
-  }
-  const next: DockerSummaryResponse = {
-    ...summary.value,
-    available: payload.available === true,
-    error: typeof envelope?.lastError === 'string' ? envelope.lastError : summary.value.error,
-    summary: objectPayload(payload.summary) ?? summary.value.summary,
-    diskUsage: summary.value.diskUsage
   }
   summary.value = next
   summaryCache.value = { ...summaryCache.value, [summaryCacheKey(false)]: next }
@@ -630,14 +634,6 @@ function applyDockerSummaryEvent(event: unknown) {
     error.value = next.error
   }
   return true
-}
-
-function realtimeSnapshotEnvelope(event: unknown) {
-  return objectPayload((event as { payload?: unknown } | null)?.payload)
-}
-
-function objectPayload(value: unknown) {
-  return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, any> : null
 }
 
 async function loadCollection(force = false) {
@@ -665,7 +661,7 @@ async function loadCollection(force = false) {
     collection.value = collectionCache.value[key]
     return
   }
-  const next = asArray(await apiGet(`/containers?kind=${kind}&${query}`).catch((err) => {
+  const next = asArray(await fetchDockerCollection(kind, query).catch((err) => {
     error.value = err.message
     return []
   }))
@@ -688,7 +684,7 @@ async function loadAifarRuntime(force = false, includePods = runtimeResourceTab.
       aifarRuntime.value = includePods ? runtimeCache.value[key] : { ...runtimeCache.value[key], pods: asArray<AifarRuntimePod>(aifarRuntime.value.pods) }
       return
     }
-    const next = await apiGet<AifarRuntimeResponse>(`/containers/aifar/runtime?${query}&includePods=${includePods ? 1 : 0}&includeStats=${includeStats ? 1 : 0}`).catch((err) => {
+    const next = await fetchAifarRuntime(query, { includePods, includeStats }).catch((err) => {
       error.value = err.message
       return { runtimeStatus: 'degraded', agent: { status: 'missing', error: err.message }, instances: [], services: [], pods: [], ingress: [], warnings: [err.message] }
     })
@@ -721,7 +717,7 @@ async function loadAifarReleases(force = false) {
     return
   }
   return withLoading(async () => {
-    const result = await apiGet<AifarReleaseListResponse>(`/apps/instances/${instance.id}/aifar/releases`)
+    const result = await fetchAifarReleases(instance.id)
     const items = asArray<AifarRelease>(result.items)
     aifarReleases.value = items
     if (key) {
@@ -781,7 +777,7 @@ function openRuntimeLogStream(force = false) {
   if (runtimeLogPodFilter.value.length) {
     params.set('pods', runtimeLogPodFilter.value.join(','))
   }
-  const source = new EventSource(apiEventSourceUrl(`/containers/aifar/runtime/logs/events?${params.toString()}`))
+  const source = createRuntimeLogEventSource(params)
   runtimeLogSource = source
   runtimeLogStreamKey = key
   runtimeLogStreamStatus.value = 'connecting'
@@ -958,36 +954,6 @@ function clearRuntimeLogView() {
   }
 }
 
-function handleRuntimeLogScroll(event: Event) {
-  runtimeLogScrollTop.value = (event.target as HTMLElement | null)?.scrollTop ?? 0
-}
-
-async function scrollRuntimeLogsToBottom() {
-  await nextTick()
-  await nextFrame()
-  const viewport = runtimeLogViewport.value
-  if (viewport) {
-    setRuntimeLogScrollBottom(viewport)
-  }
-  await nextTick()
-  await nextFrame()
-  if (runtimeLogViewport.value) {
-    setRuntimeLogScrollBottom(runtimeLogViewport.value)
-  }
-}
-
-function setRuntimeLogScrollBottom(viewport: HTMLElement) {
-  const maxScroll = Math.max(0, viewport.scrollHeight - viewport.clientHeight)
-  viewport.scrollTop = maxScroll
-  runtimeLogScrollTop.value = maxScroll
-}
-
-function nextFrame() {
-  return new Promise<void>((resolve) => {
-    window.requestAnimationFrame(() => resolve())
-  })
-}
-
 function clearRuntimeLogServiceFilter() {
   runtimeLogServiceFilter.value = []
 }
@@ -1053,7 +1019,7 @@ async function removeImages(rows: any[], mode: 'single' | 'batch') {
     return
   }
   try {
-    const result = await apiPost<{ taskId?: string }>(`/containers/images/remove?${query}`, mode === 'batch' ? { ids } : { id: ids[0] })
+    const result = await removeDockerImages(query, ids, mode)
     trackTask(result.taskId, mode === 'batch' ? t('containers.batchDeleteImages') : t('containers.deleteImage'))
     ElMessage.success(mode === 'batch' ? t('containers.imageBatchRemoveAccepted') : t('containers.imageRemoveAccepted'))
     selectedImageRows.value = []
@@ -1065,68 +1031,28 @@ async function removeImages(rows: any[], mode: 'single' | 'batch') {
   }
 }
 
-function runtimeDiscoveryTarget(row: AifarRuntimeService) {
-  return row.proxyName || row.appName || row.serviceName || '-'
-}
-
 function onImageSelectionChange(rows: any[]) {
   selectedImageRows.value = rows.filter((row) => imageReference(row))
 }
 
-function aifarRuntimeStatusKind(status?: string) {
-  switch (String(status || '').trim()) {
-    case 'ready':
-    case 'running':
-    case 'active':
-    case 'success':
-      return 'running'
-    case 'starting':
-    case 'rolling':
-    case 'pending':
-      return 'pending'
-    case 'degraded':
-    case 'draining':
-    case 'stale':
-    case 'offline':
-      return 'degraded'
-    case 'missing':
-    case 'unsupported':
-    case 'failed':
-    case 'unhealthy':
-    case 'no-endpoints':
-      return 'failed'
-    default:
-      return 'unknown'
-  }
-}
-
 function aifarRuntimeStatusLabel(status?: string) {
-  const key = `containers.runtimeStatus.${String(status || 'unknown').trim() || 'unknown'}`
-  const value = t(key)
-  return value === key ? String(status || t('common.unknown')) : value
+  return formatAifarRuntimeStatusLabel(status, t)
 }
 
 function releaseKindLabel(kind?: string) {
-  const key = `containers.releaseKind.${String(kind || 'unknown').trim() || 'unknown'}`
-  const value = t(key)
-  return value === key ? String(kind || t('common.unknown')) : value
+  return formatReleaseKindLabel(kind, t)
 }
 
 function releaseStatusLabel(status?: string) {
-  const key = `containers.releaseStatus.${String(status || 'unknown').trim() || 'unknown'}`
-  const value = t(key)
-  return value === key ? String(status || t('common.unknown')) : value
+  return formatReleaseStatusLabel(status, t)
 }
 
-function releaseServicesText(row: AifarRelease) {
-  return asArray<string>(row.changedServices).join(', ') || '-'
+function runtimeApplyStatusLabel(status?: string) {
+  return formatRuntimeApplyStatusLabel(status, t)
 }
 
-function formatDate(value?: string) {
-  if (!value) return '-'
-  const date = new Date(value)
-  if (Number.isNaN(date.getTime())) return value
-  return date.toLocaleString()
+function runtimeInstanceLabel(instance: AifarRuntimeInstance) {
+  return formatRuntimeInstanceLabel(instance, t)
 }
 
 function releaseRollbackDisabledReason(row: AifarRelease) {
@@ -1166,7 +1092,7 @@ async function rollbackAifarRelease(row: AifarRelease) {
     return
   }
   try {
-    const result = await apiPost<{ taskId: string }>(`/apps/instances/${instance.id}/aifar/rollback`, {
+    const result = await rollbackAifarReleaseRequest(instance.id, {
       targetReleaseId: row.releaseId,
       services: asArray<string>(row.changedServices),
       reason: input
@@ -1183,107 +1109,8 @@ async function rollbackAifarRelease(row: AifarRelease) {
   }
 }
 
-function runtimeEndpointText(row: AifarRuntimeService) {
-  const ready = Number(row.readyEndpointCount ?? row.activeEndpoints ?? row.readyReplicas ?? 0)
-  const total = Number(row.endpointCount ?? row.activeEndpoints ?? ready)
-  return `${Number.isFinite(ready) ? ready : 0} / ${Number.isFinite(total) ? total : 0}`
-}
-
-function runtimeDeploymentReplicaText(row: AifarRuntimeDeployment) {
-  const ready = Number(row.readyReplicas ?? row.availableReplicas ?? 0)
-  const desired = Number(row.desiredReplicas ?? 0)
-  const updated = Number(row.updatedReplicas ?? 0)
-  const base = `${Number.isFinite(ready) ? ready : 0} / ${Number.isFinite(desired) ? desired : 0}`
-  if (updated > 0 && updated !== ready) {
-    return `${base} (${updated})`
-  }
-  return base
-}
-
 function runtimeServiceForDeployment(row: AifarRuntimeDeployment): AifarRuntimeService {
-  const existing = runtimeServiceMap.value.get(row.serviceName)
-  if (existing) {
-    return existing
-  }
-  return {
-    instanceId: row.instanceId,
-    serviceName: row.serviceName,
-    appName: row.appName || row.deploymentName || row.serviceName,
-    desiredReplicas: row.desiredReplicas,
-    readyReplicas: row.readyReplicas,
-    image: row.image,
-    status: row.status,
-    rolloutStatus: row.status,
-    failureReason: row.failureReason
-  }
-}
-
-function runtimeNacosStatus(row: AifarRuntimeService) {
-  if (row.nacosReady) {
-    return 'ready'
-  }
-  if (row.lastNacosError) {
-    return 'failed'
-  }
-  if (row.nacosRegistered) {
-    return 'running'
-  }
-  if (row.status === 'offline') {
-    return 'offline'
-  }
-  return 'unknown'
-}
-
-function runtimeApplyStatusLabel(status?: string) {
-  const key = `containers.runtimeApplyStatus.${String(status || 'unknown').trim() || 'unknown'}`
-  const value = t(key)
-  return value === key ? String(status || t('common.unknown')) : value
-}
-
-function percentText(value?: number) {
-  const n = Number(value || 0)
-  if (!Number.isFinite(n) || n <= 0) {
-    return '-'
-  }
-  return `${n.toFixed(1)}%`
-}
-
-function defaultRuntimeConfigState(): RuntimeConfigState {
-  return {
-    configVersion: 1,
-    appliedVersion: 1,
-    lastApplyStatus: 'applied',
-    global: {
-      appCPUs: '2.0',
-      appMemoryLimit: '2GB',
-      jvmInitialRAMPercentage: 20,
-      jvmMaxRAMPercentage: 70
-    },
-    nacosEphemeral: true,
-    services: {}
-  }
-}
-
-function normalizedRuntimeValues(values?: RuntimeConfigValues): Required<RuntimeConfigValues> {
-  return {
-    appCPUs: String(values?.appCPUs || '2.0').trim(),
-    appMemoryLimit: String(values?.appMemoryLimit || '2GB').trim(),
-    jvmInitialRAMPercentage: Number(values?.jvmInitialRAMPercentage || 20),
-    jvmMaxRAMPercentage: Number(values?.jvmMaxRAMPercentage || 70)
-  }
-}
-
-function runtimeConfigNumberText(value?: number) {
-  if (value === undefined || value === null || Number(value) <= 0) {
-    return ''
-  }
-  return String(value)
-}
-
-function runtimeInstanceLabel(instance: AifarRuntimeInstance) {
-  const model = instance.orchestrationModel || t('common.unknown')
-  const root = instance.installRoot || instance.id
-  return `${instance.version || 'aifar'} / ${model} / ${root}`
+  return resolveRuntimeServiceForDeployment(row, runtimeServiceMap.value)
 }
 
 function openRuntimeConfigDialog() {
@@ -1310,54 +1137,6 @@ function openRuntimeConfigDialog() {
     }
   })
   runtimeConfigVisible.value = true
-}
-
-function validateRuntimeConfigValues(values: Required<RuntimeConfigValues>) {
-  const cpuPattern = /^[0-9]+(\.[0-9]+)?$/
-  const memoryPattern = /^[1-9][0-9]*(b|k|m|g|kb|mb|gb|kib|mib|gib)?$/i
-  if (!cpuPattern.test(values.appCPUs) || Number(values.appCPUs) <= 0) return t('containers.runtimeConfigCpuInvalid')
-  if (!memoryPattern.test(values.appMemoryLimit)) return t('containers.runtimeConfigMemoryInvalid')
-  if (!Number.isFinite(values.jvmInitialRAMPercentage) || !Number.isFinite(values.jvmMaxRAMPercentage)) return t('containers.runtimeConfigJvmInvalid')
-  if (values.jvmInitialRAMPercentage <= 0 || values.jvmMaxRAMPercentage <= 0 || values.jvmMaxRAMPercentage > 90) return t('containers.runtimeConfigJvmInvalid')
-  if (values.jvmInitialRAMPercentage > values.jvmMaxRAMPercentage) return t('containers.runtimeConfigJvmOrderInvalid')
-  return ''
-}
-
-function optionalRuntimeNumber(value: string) {
-  const text = String(value || '').trim()
-  if (!text) return undefined
-  const n = Number(text)
-  return Number.isFinite(n) ? n : Number.NaN
-}
-
-function buildRuntimeServiceOverrides() {
-  const services: Record<string, RuntimeConfigValues> = {}
-  for (const row of runtimeConfigRows.value) {
-    const values: RuntimeConfigValues = {}
-    if (row.appCPUs.trim()) values.appCPUs = row.appCPUs.trim()
-    if (row.appMemoryLimit.trim()) values.appMemoryLimit = row.appMemoryLimit.trim()
-    if (row.serviceName !== 'web-vue3') {
-      const initial = optionalRuntimeNumber(row.jvmInitialRAMPercentage)
-      const max = optionalRuntimeNumber(row.jvmMaxRAMPercentage)
-      if (initial !== undefined) {
-        if (!Number.isFinite(initial)) throw new Error(`${row.serviceName}: ${t('containers.runtimeConfigJvmInvalid')}`)
-        values.jvmInitialRAMPercentage = initial
-      }
-      if (max !== undefined) {
-        if (!Number.isFinite(max)) throw new Error(`${row.serviceName}: ${t('containers.runtimeConfigJvmInvalid')}`)
-        values.jvmMaxRAMPercentage = max
-      }
-    }
-    if (Object.keys(values).length) {
-      const effective = normalizedRuntimeValues({ ...runtimeConfigForm.value, ...values })
-      const err = validateRuntimeConfigValues(effective)
-      if (err) {
-        throw new Error(`${row.serviceName}: ${err}`)
-      }
-      services[row.serviceName] = values
-    }
-  }
-  return services
 }
 
 function openAifarRuntimeServiceUpdate(row: AifarRuntimeService) {
@@ -1416,27 +1195,17 @@ async function submitAifarUpdate() {
     return
   }
   const uploadLimit = Number(appSettings.value.maxRequestBodyBytes || 0)
-  if (uploadLimit > 0 && aifarArtifactFile.value.size > uploadLimit) {
+  if (isAifarArtifactTooLarge(aifarArtifactFile.value, uploadLimit)) {
     ElMessage.error(t('apps.aifarUpdateArtifactTooLarge', {
       size: formatBytes(aifarArtifactFile.value.size),
       limit: formatBytes(uploadLimit)
     }))
     return
   }
-  const form = new FormData()
-  form.append('language', getCurrentLocale())
-  if (aifarUpdateMode.value === 'bundle') {
-    form.append('bundle', aifarArtifactFile.value, aifarArtifactFile.value.name)
-  } else {
-    form.append('service', aifarUpdateService.value)
-    form.append('artifact', aifarArtifactFile.value, aifarArtifactFile.value.name)
-  }
+  const form = buildAifarArtifactForm(aifarUpdateMode.value, aifarUpdateService.value, aifarArtifactFile.value)
   aifarUpdateSubmitting.value = true
   try {
-    const endpoint = aifarUpdateMode.value === 'bundle'
-      ? `/apps/instances/${instance.id}/aifar/update-artifact-bundle`
-      : `/apps/instances/${instance.id}/aifar/update-artifact`
-    const result = await apiPostForm<{ taskId: string }>(endpoint, form)
+    const result = await updateAifarArtifact(instance.id, form, aifarUpdateMode.value)
     aifarUpdateVisible.value = false
     aifarArtifactFile.value = null
     aifarUpdateInstanceOverride.value = null
@@ -1462,14 +1231,14 @@ async function submitRuntimeConfig() {
     return
   }
   const global = normalizedRuntimeValues(runtimeConfigForm.value)
-  const validation = validateRuntimeConfigValues(global)
+  const validation = validateRuntimeConfigValues(global, t)
   if (validation) {
     ElMessage.warning(validation)
     return
   }
   let services: Record<string, RuntimeConfigValues>
   try {
-    services = buildRuntimeServiceOverrides()
+    services = buildRuntimeServiceOverrides(runtimeConfigRows.value, runtimeConfigForm.value, t)
   } catch (err) {
     ElMessage.warning(err instanceof Error ? err.message : t('containers.runtimeConfigInvalid'))
     return
@@ -1486,7 +1255,7 @@ async function submitRuntimeConfig() {
   const query = targetQuery()
   runtimeConfigSubmitting.value = true
   try {
-    const result = await apiPut<{ taskId: string }>(`/containers/aifar/runtime/config?${query}`, {
+    const result = await applyRuntimeConfig(query, {
       instanceId,
       global,
       services,
@@ -1525,7 +1294,7 @@ async function submitRuntimeReconcile(labelKey: string, confirmKey: string) {
   }
   const query = targetQuery()
   try {
-    const result = await apiPost<{ taskId: string }>(`/containers/aifar/runtime/reconcile?${query}`, { instanceId })
+    const result = await reconcileRuntime(query, instanceId)
     ElMessage.success(t('containers.runtimeActionAccepted'))
     trackTask(result.taskId, t(labelKey))
     void loadAifarRuntime(true)
@@ -1579,7 +1348,7 @@ async function cleanupAifarRuntimeStale() {
   }
   const query = targetQuery()
   try {
-    const result = await apiPost<{ taskId: string }>(`/containers/aifar/runtime/cleanup-stale?${query}`, { instanceId })
+    const result = await cleanupStaleRuntime(query, instanceId)
     ElMessage.success(t('containers.runtimeActionAccepted'))
     trackTask(result.taskId, t('containers.cleanupStaleRuntime'))
     void loadAifarRuntime(true)
@@ -1630,7 +1399,7 @@ async function submitAifarServiceInstall() {
   }
   serviceInstallSubmitting.value = true
   try {
-    const result = await apiPost<{ taskId: string }>(`/containers/aifar/services/install?${query}`, {
+    const result = await installRuntimeServices(query, {
       instanceId,
       services
     })
@@ -1725,7 +1494,7 @@ async function submitAifarScaleOut(service: string, instanceId: string, afterSub
     return
   }
   try {
-    const result = await apiPost<{ taskId: string }>(`/containers/aifar/services/${encodeURIComponent(service)}/scale-out?${query}`, { instanceId })
+    const result = await scaleOutRuntimeService(query, service, instanceId)
     ElMessage.success(t('containers.runtimeActionAccepted'))
     trackTask(result.taskId, `${t('containers.scaleOut')} ${service}`)
     afterSubmitted?.()
@@ -1750,7 +1519,7 @@ async function submitAifarScaleIn(service: string, instanceId: string, currentRe
     return
   }
   try {
-    const result = await apiPost<{ taskId: string }>(`/containers/aifar/services/${encodeURIComponent(service)}/scale-in?${query}`, { instanceId })
+    const result = await scaleInRuntimeService(query, service, instanceId)
     ElMessage.success(t('containers.runtimeActionAccepted'))
     trackTask(result.taskId, `${t('containers.scaleIn')} ${service}`)
     afterSubmitted?.()
@@ -1775,7 +1544,7 @@ async function submitAifarOffline(service: string, instanceId: string, afterSubm
     return
   }
   try {
-    const result = await apiPost<{ taskId: string }>(`/containers/aifar/services/${encodeURIComponent(service)}/offline?${query}`, { instanceId })
+    const result = await offlineRuntimeService(query, service, instanceId)
     ElMessage.success(t('containers.runtimeActionAccepted'))
     trackTask(result.taskId, `${t('containers.offlineDeployment')} ${service}`)
     afterSubmitted?.()
@@ -1784,47 +1553,7 @@ async function submitAifarOffline(service: string, instanceId: string, afterSubm
   }
 }
 
-function formatBytes(value: number) {
-  if (!Number.isFinite(value) || value <= 0) {
-    return '0 B'
-  }
-  const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB']
-  let size = value
-  let idx = 0
-  while (size >= 1024 && idx < units.length - 1) {
-    size /= 1024
-    idx++
-  }
-  return `${size.toFixed(idx === 0 ? 0 : 1)} ${units[idx]}`
-}
-
-function imageReference(row: any) {
-  const repository = String(row?.repository ?? '').trim()
-  const tag = String(row?.tag ?? '').trim()
-  const id = String(row?.id ?? '').trim()
-  if (repository && repository !== '<none>' && tag && tag !== '<none>') {
-    return `${repository}:${tag}`
-  }
-  return id
-}
-
-function imageRowKey(row: any) {
-  return imageReference(row) || `${String(row?.repository ?? '').trim()}:${String(row?.tag ?? '').trim()}:${String(row?.id ?? '').trim()}`
-}
-
-function uniqueValues(values: string[]) {
-  const seen = new Set<string>()
-  const out: string[] = []
-  for (const value of values) {
-    const next = value.trim()
-    if (!next || seen.has(next)) continue
-    seen.add(next)
-    out.push(next)
-  }
-  return out
-}
-
-provide(aifarRuntimeContextKey, {
+useAifarRuntimeProvider({
   t,
   loading,
   aifarRuntime,
