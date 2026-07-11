@@ -1,10 +1,9 @@
 [CmdletBinding()]
 param(
   [string]$SourceRoot = "D:\workspace\alpha\backend\alpha-java-cloud",
-  [string]$OutputRoot = "D:\workspace\alpha\dist\aifar-artifacts",
+  [string]$TargetRoot = "",
   [string[]]$Services = @(),
   [switch]$RequireAll,
-  [switch]$NoZip,
   [switch]$Clean
 )
 
@@ -101,12 +100,14 @@ function Find-ServiceJar {
   return $candidates[0]
 }
 
-function New-CleanDirectory {
+function Reset-ServiceTarget {
   param([Parameter(Mandatory = $true)][string]$Path)
   if ((Test-Path -LiteralPath $Path) -and $Clean) {
     Remove-Item -LiteralPath $Path -Recurse -Force
   }
   New-Item -ItemType Directory -Force -Path $Path | Out-Null
+  Get-ChildItem -LiteralPath $Path -File -Filter "*.jar" -ErrorAction SilentlyContinue |
+    Remove-Item -Force
 }
 
 if (-not (Test-Path -LiteralPath $SourceRoot -PathType Container)) {
@@ -114,6 +115,12 @@ if (-not (Test-Path -LiteralPath $SourceRoot -PathType Container)) {
 }
 
 $sourceFull = Resolve-FullPath $SourceRoot
+if ([string]::IsNullOrWhiteSpace($TargetRoot)) {
+  $scriptRoot = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
+  $TargetRoot = Join-Path (Split-Path -Parent $scriptRoot) "resources\aifar\runtime-v2\services"
+}
+$targetFull = [System.IO.Path]::GetFullPath($TargetRoot)
+New-Item -ItemType Directory -Force -Path $targetFull | Out-Null
 $rawServices = if ($Services.Count) { $Services } else { @($serviceModules.Keys) }
 $selectedServices = @()
 foreach ($value in $rawServices) {
@@ -135,16 +142,8 @@ foreach ($service in $selectedServices) {
   }
 }
 
-$timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
-$packageName = "aifar-alpha-jars-$timestamp"
-$packageDir = Join-Path $OutputRoot $packageName
-$artifactDir = Join-Path $packageDir "artifacts"
-
-New-CleanDirectory $packageDir
-New-CleanDirectory $artifactDir
-
-$manifestServices = @()
 $missing = @()
+$exported = @()
 
 foreach ($service in $selectedServices) {
   $moduleName = $serviceModules[$service]
@@ -155,64 +154,28 @@ foreach ($service in $selectedServices) {
     continue
   }
 
-  $serviceDir = Join-Path $artifactDir $service
-  New-Item -ItemType Directory -Force -Path $serviceDir | Out-Null
-
+  $serviceDir = Join-Path $targetFull $service
+  $targetDir = Join-Path $serviceDir "target"
+  Reset-ServiceTarget -Path $targetDir
   $targetName = "$moduleName.jar"
-  $targetPath = Join-Path $serviceDir $targetName
+  $targetPath = Join-Path $targetDir $targetName
   Copy-Item -LiteralPath $jar.FullName -Destination $targetPath -Force
 
-  $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $targetPath).Hash.ToLowerInvariant()
-  $relativeArtifact = Get-RelativePath -BasePath $packageDir -Path $targetPath
   $relativeSource = Get-RelativePath -BasePath $sourceFull -Path $jar.FullName
-
-  $manifestServices += [ordered]@{
-    service      = $service
-    module       = $moduleName
-    artifact     = $relativeArtifact.Replace('\', '/')
-    fileName     = $targetName
-    source       = $relativeSource.Replace('\', '/')
-    sha256       = $hash
-    size         = (Get-Item -LiteralPath $targetPath).Length
-    sourceMtime  = $jar.LastWriteTimeUtc.ToString("o")
-  }
-
-  Write-Host "Added $service <= $relativeSource"
+  $relativeTarget = Get-RelativePath -BasePath $targetFull -Path $targetPath
+  $exported += $service
+  Write-Host "Updated $service <= $relativeSource -> $relativeTarget"
 }
 
 if ($RequireAll -and $missing.Count) {
   throw "Missing required services: $($missing -join ', ')"
 }
 
-if (-not $manifestServices.Count) {
-  throw "No service jars were exported."
+if (-not $exported.Count) {
+  throw "No service jars were copied."
 }
 
-$manifest = [ordered]@{
-  schema      = "aifar-artifact-bundle-v1"
-  app         = "aifar"
-  kind        = "alpha-java-cloud-jars"
-  generatedAt = (Get-Date).ToUniversalTime().ToString("o")
-  sourceRoot  = $sourceFull
-  services    = $manifestServices
-}
-
-$manifestPath = Join-Path $packageDir "manifest.json"
-$manifestJson = $manifest | ConvertTo-Json -Depth 8
-$utf8NoBom = [System.Text.UTF8Encoding]::new($false)
-[System.IO.File]::WriteAllText($manifestPath, $manifestJson, $utf8NoBom)
-
-if (-not $NoZip) {
-  $zipPath = Join-Path $OutputRoot "$packageName.zip"
-  if (Test-Path -LiteralPath $zipPath) {
-    Remove-Item -LiteralPath $zipPath -Force
-  }
-  Compress-Archive -Path (Join-Path $packageDir "*") -DestinationPath $zipPath -Force
-  Write-Host "Package directory: $packageDir"
-  Write-Host "Package zip:       $zipPath"
-} else {
-  Write-Host "Package directory: $packageDir"
-}
+Write-Host "Runtime services target: $targetFull"
 
 if ($missing.Count) {
   Write-Warning "Skipped missing services: $($missing -join ', ')"

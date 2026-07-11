@@ -1334,6 +1334,30 @@ func TestRolloutTemplatesRefreshDockerfileJarInputs(t *testing.T) {
 	}
 }
 
+func TestRuntimeTemplatesUseReadinessForBackendHealthChecks(t *testing.T) {
+	for _, name := range []string{
+		"install.sh",
+		"update-artifact.sh",
+		"update-artifact-bundle.sh",
+		"rollback-artifact.sh",
+		"runtime-config.sh",
+		"service-install.sh",
+		"scale-service.sh",
+		"autoscale-out.sh",
+	} {
+		t.Run(name, func(t *testing.T) {
+			content, err := templateFS.ReadFile("templates/" + name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			script := string(content)
+			if !strings.Contains(script, `/actuator/health/readiness`) {
+				t.Fatalf("runtime template %s should use backend readiness health checks:\n%s", name, script)
+			}
+		})
+	}
+}
+
 func TestServiceAppliesRuntimeConfigAndRecordsVersion(t *testing.T) {
 	instance := installedAIFARInstance(t)
 	s := &fakeStore{
@@ -1490,7 +1514,8 @@ func TestServiceInstallsAIFARServiceFromRuntimeV2Bundle(t *testing.T) {
 		`AIFAR_NACOS_EPHEMERAL true`,
 		`nacos_ephemeral`,
 		`"ephemeral": $(nacos_ephemeral)`,
-		`curl -sS --connect-timeout %s -o /dev/null %s://%s:%s/ || exit 1`,
+		`APP_BACKEND_HEALTH_PATH /actuator/health/readiness`,
+		`curl -fsS --connect-timeout %s %s://%s:%s%s >/dev/null || exit 1`,
 	} {
 		if !strings.Contains(remote.installScript, want) {
 			t.Fatalf("AIFAR install script should include agent-runtime-v2 orchestration with %q:\n%s", want, remote.installScript)

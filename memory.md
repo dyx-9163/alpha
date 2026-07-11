@@ -94,3 +94,13 @@
 - 结论：已进入 brainstorming 的方案确认门禁；方案 0 只做当前批次冻结、审查、修复、验证、文档同步和可审查的提交拆分，不进入 Runtime/Nacos 领域重构、Worker 持久任务或数据库迁移重构。实施前仍需确认当前工作树中的安全配置/密钥轮换、Worker、realtime、Containers 前端拆分、CI/发布脚本改动是否全部作为保留基线；尚未修改业务代码。
 - 问题：用户要求按“方案 0：保留现状、分域收尾”完整实施。
 - 结论：已按域拆分提交 Worker 终态原子化、生产安全、Store 密钥轮换、服务启动密文校验、realtime last-known cache、Containers/Runtime 抽离测试、启动脚本解析、发布归档验收和 CI/文档同步；发布验证要求当前版本 Linux/Windows 目录与归档同时存在并解压复验内部 checksum。最终门禁中 `pnpm test`、`pnpm test:web`、`pnpm test:scripts`、`pnpm web:build`、`pnpm backend:build`、`git diff --check`、`pnpm test:local` 通过；本机 `go test -race` 因 `CGO_ENABLED=0` 不作为验收，Ubuntu CI 负责 Worker/Store race tests。当前本机需显式使用仓库内 `.cache/go-build` 避免继承的 `D:\tools\gocache` 权限问题。
+- 问题：用户反馈应用安装弹窗中选择集群/Sentinel/分布式等拓扑后，会被自动还原到单体。
+- 结论：根因是 `AppInstallDialog.vue` 的重置 watcher 返回新数组，父级因 realtime/context 重新计算等价 `fields` 时也会触发 `resetFieldValues()`，而拓扑默认值为 standalone。已改为稳定 reset key，仅在弹窗开关、应用/版本、targetMode 或字段名集合变化时重置，并补 `appInstallDialogState` Vitest 回归测试；`pnpm test:web`、`pnpm web:build`、`git diff --check` 通过。
+
+## 2026-07-11
+- 问题：用户询问之前从 `D:\workspace\alpha\backend\alpha-java-cloud` 拷贝 Alpha jar 包的逻辑在哪里。
+- 结论：本地导出逻辑在 `scripts/export-alpha-jars.ps1`，默认 SourceRoot 指向该目录，按服务映射查找 `target/` 或 `build/libs/` 下可运行 jar，拷贝到 `D:\workspace\alpha\dist\aifar-artifacts\aifar-alpha-jars-*/artifacts/<service>/`，生成 `manifest.json` 并压缩为 `aifar-alpha-jars-*.zip`；`scripts/export-alpha-jars.cmd` 是 PowerShell 包装入口。
+- 问题：用户要求把 `scripts/export-alpha-jars.ps1` 改成直接把 Alpha jar 拷贝到当前工程 `resources\aifar\runtime-v2\services\<service>\target`。
+- 结论：脚本默认目标改为仓库内 `resources\aifar\runtime-v2\services`，也支持 `-TargetRoot` 覆盖；每个服务会先清理对应 `target/*.jar`，再复制为固定名 `<module>.jar`，不再默认生成 `aifar-alpha-jars-*.zip` 和 manifest。已新增 `scripts/export-alpha-jars.test.mjs` 覆盖显式 TargetRoot 与默认仓库路径，`pnpm test:scripts` 通过。
+- 问题：用户要求按 `gateway-health-check-endpoints.md` 的“单服务 Readiness 探活接口”调整后端服务健康检查。
+- 结论：AIFAR runtime-v2 的安装、升级、批量升级、回滚、配置刷新、单服务安装、伸缩和扩容模板已将 Java 后端服务 healthcheck 默认改为 `/actuator/health/readiness`；`web-vue3` 继续使用 `/`。新增 `APP_BACKEND_HEALTH_PATH` 和 `APP_WEB_HEALTH_PATH` 默认配置，并保留服务级 `HEALTH_PATH` 覆盖。`go test ./internal/apps/aifar`、`pnpm test`、`pnpm backend:build` 通过。

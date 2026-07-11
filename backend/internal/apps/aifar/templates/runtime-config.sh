@@ -232,15 +232,15 @@ health_cmd_for_service() {
   port="$(service_port "$service")"
   protocol="$(read_env_value "$ENV_DIR/compose.env" APP_HEALTH_PROTOCOL http)"
   host="$(read_env_value "$ENV_DIR/compose.env" APP_HEALTH_HOST 127.0.0.1)"
-  path="$(read_env_value "$ENV_DIR/compose.env" APP_HEALTH_PATH "")"
   timeout="$(read_env_value "$ENV_DIR/compose.env" APP_HEALTH_CONNECT_TIMEOUT 3)"
   if [ "$service" = "web-vue3" ]; then
-    [ -n "$path" ] || path="/"
+    path="$(read_env_value "$ENV_DIR/compose.env" APP_WEB_HEALTH_PATH "/")"
     printf "wget -q -T %s -O /dev/null %s://%s:%s%s || exit 1" "$timeout" "$protocol" "$host" "$port" "$path"
-  elif [ -n "$path" ]; then
-    printf "curl -fsS --connect-timeout %s %s://%s:%s%s >/dev/null || exit 1" "$timeout" "$protocol" "$host" "$port" "$path"
   else
-    printf "curl -sS --connect-timeout %s -o /dev/null %s://%s:%s/ || exit 1" "$timeout" "$protocol" "$host" "$port"
+    path="$(read_env_value "$ENV_DIR/$service.env" HEALTH_PATH "")"
+    [ -n "$path" ] || path="$(read_env_value "$ENV_DIR/compose.env" APP_BACKEND_HEALTH_PATH "/actuator/health/readiness")"
+    [ -n "$path" ] || path="/actuator/health/readiness"
+    printf "curl -fsS --connect-timeout %s %s://%s:%s%s >/dev/null || exit 1" "$timeout" "$protocol" "$host" "$port" "$path"
   fi
 }
 

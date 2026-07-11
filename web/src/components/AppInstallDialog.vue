@@ -130,6 +130,7 @@ import type { AppStoreItem } from '../apps/registry/catalog'
 import type { AppInstallDialogCopy, AppInstallField, AppInstallFieldOption, AppInstallFieldValues, AppInstallPayload, AppInstallValidationContext, ServerOption } from '../apps/registry/contract'
 import type { AppTargetMode } from '../apps/registry/types'
 import { useI18n } from '../i18n'
+import { appInstallResetKey, latestInstallVersion } from './appInstallDialogState'
 import ServerSelector from './ServerSelector.vue'
 
 const { t } = useI18n()
@@ -236,14 +237,22 @@ const hasFieldValidationErrors = computed(() => Object.keys(fieldValidationMessa
 const requiredFieldsReady = computed(() => installFields.value.every((field) => !field.required || isFieldValueFilled(field, fieldValues.value[field.name])))
 const targetReady = computed(() => targetSelectorHidden.value ? (!props.targetIdsResolver || selectedTargetCount.value > 0) : selectedTargetCount.value > 0)
 const canSubmit = computed(() => Boolean(selectedVersion.value && targetReady.value && requiredFieldsReady.value && !hasFieldValidationErrors.value && !targetValidationMessage.value && !props.submitting))
+const resetTriggerKey = computed(() => appInstallResetKey({
+  visible: props.modelValue,
+  appName: props.app?.name,
+  versions: props.app?.versions ?? [],
+  fallbackVersion: props.app?.fallbackVersion,
+  targetMode: props.targetMode,
+  fields: allFields.value
+}))
 
 watch(
-  () => [props.modelValue, props.app?.name, props.app?.versions.join('|'), props.targetMode, allFields.value.map((field) => field.name).join('|')],
+  resetTriggerKey,
   () => {
     if (!props.modelValue || !props.app) {
       return
     }
-    selectedVersion.value = props.app.versions.at(-1) ?? props.app.fallbackVersion
+    selectedVersion.value = latestInstallVersion(props.app.versions, props.app.fallbackVersion)
     selectedServerId.value = ''
     selectedServerIds.value = []
     serverDiskStates.value = {}

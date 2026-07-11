@@ -122,10 +122,13 @@ health_cmd_for_service() {
   timeout="$(read_env_value "$ENV_DIR/compose.env" APP_HEALTH_TIMEOUT_SECONDS 3)"
   case "$service" in
     web-vue3)
-      printf "curl -fsS --connect-timeout %s http://127.0.0.1:%s/ >/dev/null || exit 1" "$timeout" "$port"
+      path="$(read_env_value "$ENV_DIR/compose.env" APP_WEB_HEALTH_PATH "/")"
+      printf "curl -fsS --connect-timeout %s http://127.0.0.1:%s%s >/dev/null || exit 1" "$timeout" "$port" "$path"
       ;;
     *)
-      path="$(read_env_value "$ENV_DIR/$service.env" HEALTH_PATH /actuator/health)"
+      path="$(read_env_value "$ENV_DIR/$service.env" HEALTH_PATH "")"
+      [ -n "$path" ] || path="$(read_env_value "$ENV_DIR/compose.env" APP_BACKEND_HEALTH_PATH "/actuator/health/readiness")"
+      [ -n "$path" ] || path="/actuator/health/readiness"
       printf "curl -fsS --connect-timeout %s http://127.0.0.1:%s%s >/dev/null || exit 1" "$timeout" "$port" "$path"
       ;;
   esac

@@ -297,15 +297,13 @@ JSON
     replicas="$(replicas_for_service "$service")"
     port="$(service_port "$service")"
     if [ "$service" = "web-vue3" ]; then
-      health_path="$(read_env_value "$ENV_DIR/compose.env" APP_HEALTH_PATH "/")"
+      health_path="$(read_env_value "$ENV_DIR/compose.env" APP_WEB_HEALTH_PATH "/")"
       health_cmd="wget -q -T $(read_env_value "$ENV_DIR/compose.env" APP_HEALTH_CONNECT_TIMEOUT 3) -O /dev/null $(read_env_value "$ENV_DIR/compose.env" APP_HEALTH_PROTOCOL http)://$(read_env_value "$ENV_DIR/compose.env" APP_HEALTH_HOST 127.0.0.1):${port}${health_path} || exit 1"
     else
-      health_path="$(read_env_value "$ENV_DIR/compose.env" APP_HEALTH_PATH "")"
-      if [ -n "$health_path" ]; then
-        health_cmd="curl -fsS --connect-timeout $(read_env_value "$ENV_DIR/compose.env" APP_HEALTH_CONNECT_TIMEOUT 3) $(read_env_value "$ENV_DIR/compose.env" APP_HEALTH_PROTOCOL http)://$(read_env_value "$ENV_DIR/compose.env" APP_HEALTH_HOST 127.0.0.1):${port}${health_path} >/dev/null || exit 1"
-      else
-        health_cmd="curl -sS --connect-timeout $(read_env_value "$ENV_DIR/compose.env" APP_HEALTH_CONNECT_TIMEOUT 3) -o /dev/null $(read_env_value "$ENV_DIR/compose.env" APP_HEALTH_PROTOCOL http)://$(read_env_value "$ENV_DIR/compose.env" APP_HEALTH_HOST 127.0.0.1):${port}/ || exit 1"
-      fi
+      health_path="$(read_env_value "$ENV_DIR/$service.env" HEALTH_PATH "")"
+      [ -n "$health_path" ] || health_path="$(read_env_value "$ENV_DIR/compose.env" APP_BACKEND_HEALTH_PATH "/actuator/health/readiness")"
+      [ -n "$health_path" ] || health_path="/actuator/health/readiness"
+      health_cmd="curl -fsS --connect-timeout $(read_env_value "$ENV_DIR/compose.env" APP_HEALTH_CONNECT_TIMEOUT 3) $(read_env_value "$ENV_DIR/compose.env" APP_HEALTH_PROTOCOL http)://$(read_env_value "$ENV_DIR/compose.env" APP_HEALTH_HOST 127.0.0.1):${port}${health_path} >/dev/null || exit 1"
     fi
     app_cpus="$(resource_value "$service" APP_CPUS "$(read_env_value "$ENV_DIR/compose.env" APP_CPUS "")")"
     app_memory_limit="$(resource_value "$service" APP_MEMORY_LIMIT "$(read_env_value "$ENV_DIR/compose.env" APP_MEMORY_LIMIT "")")"
