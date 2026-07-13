@@ -270,6 +270,7 @@ import { computed, onMounted, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import { useRouter } from 'vue-router'
 import { apiGet, apiPost, asArray } from '../api/client'
+import { keepPreviousArrayOnLoadFailure } from '../api/resilientLoad'
 import KeyValueGrid from '../components/KeyValueGrid.vue'
 import RunRecordTable from '../components/RunRecordTable.vue'
 import StatusTag from '../components/StatusTag.vue'
@@ -498,20 +499,20 @@ async function load() {
 
 async function fetchNacosState(): Promise<NacosState> {
   const [nextInstances, nextServers, nextTasks, nextCredentials, nextDatabaseInstances, nextStorageInstances] = await Promise.all([
-    apiGet<AppInstance[] | null>('/nacos/instances').catch(() => []),
-    apiGet<any[] | null>('/servers').catch(() => []),
-    apiGet<TaskRecord[] | null>('/tasks').catch(() => []),
-    apiGet<Credential[] | null>('/credentials').catch(() => []),
-    apiGet<AppInstance[] | null>('/database/instances').catch(() => []),
-    apiGet<AppInstance[] | null>('/storage/instances').catch(() => [])
+    keepPreviousArrayOnLoadFailure(apiGet<AppInstance[] | null>('/nacos/instances'), instances.value),
+    keepPreviousArrayOnLoadFailure(apiGet<any[] | null>('/servers'), servers.value),
+    keepPreviousArrayOnLoadFailure(apiGet<TaskRecord[] | null>('/tasks'), tasks.value),
+    keepPreviousArrayOnLoadFailure(apiGet<Credential[] | null>('/credentials'), credentials.value),
+    keepPreviousArrayOnLoadFailure(apiGet<AppInstance[] | null>('/database/instances'), databaseInstances.value),
+    keepPreviousArrayOnLoadFailure(apiGet<AppInstance[] | null>('/storage/instances'), storageInstances.value)
   ])
   return {
-    instances: asArray<AppInstance>(nextInstances).filter((item) => item.app === 'nacos'),
-    servers: asArray(nextServers),
-    tasks: asArray<TaskRecord>(nextTasks),
-    credentials: asArray<Credential>(nextCredentials),
-    databaseInstances: asArray<AppInstance>(nextDatabaseInstances),
-    storageInstances: asArray<AppInstance>(nextStorageInstances)
+    instances: nextInstances.filter((item) => item.app === 'nacos'),
+    servers: nextServers,
+    tasks: nextTasks,
+    credentials: nextCredentials,
+    databaseInstances: nextDatabaseInstances,
+    storageInstances: nextStorageInstances
   }
 }
 

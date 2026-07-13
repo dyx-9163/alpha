@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
+	"aifar-deployment/backend/internal/adapter"
 	"aifar-deployment/backend/internal/apps/registry"
 	"aifar-deployment/backend/internal/realtime"
 	"aifar-deployment/backend/internal/store"
@@ -114,6 +116,109 @@ func TestAppInstanceCollectorWritesFailedSnapshot(t *testing.T) {
 	}
 }
 
+func TestAppInstanceCollectorTimeoutDoesNotBlockOtherInstances(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "aifar.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	server, err := db.SaveServer(store.Server{Name: "node-1", Host: "10.0.0.10"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fastInstance, err := db.SaveAppInstance(store.AppInstance{App: "mysql", Version: "8.0.36", ServerID: server.ID, Status: "running", Topology: "standalone"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	slowInstance, err := db.SaveAppInstance(store.AppInstance{App: "mysql", Version: "8.0.36", ServerID: server.ID, Status: "running", Topology: "standalone"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager := NewManager(db, nil, time.Minute)
+	manager.timeout = 25 * time.Millisecond
+	manager.SetAppRegistry(registry.New(fakeCheckModule{
+		name: "mysql",
+		check: func(ctx context.Context, req registry.CheckRequest) (registry.InstanceStatus, error) {
+			if req.Instance.ID == slowInstance.ID {
+				time.Sleep(200 * time.Millisecond)
+			}
+			return registry.InstanceStatus{Status: "running", Message: "ok"}, nil
+		},
+	}))
+
+	startedAt := time.Now()
+	err = manager.collectAppInstances(context.Background())
+	elapsed := time.Since(startedAt)
+
+	if err == nil || !strings.Contains(err.Error(), slowInstance.ID) {
+		t.Fatalf("expected timeout error for slow instance, got %v", err)
+	}
+	if elapsed > 150*time.Millisecond {
+		t.Fatalf("slow instance blocked collection for %s", elapsed)
+	}
+	fastSnapshot, err := db.GetStatusSnapshot("app.instance", fastInstance.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fastSnapshot.Status != "running" {
+		t.Fatalf("expected fast instance snapshot to be running, got %+v", fastSnapshot)
+	}
+	slowSnapshot, err := db.GetStatusSnapshot("app.instance", slowInstance.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if slowSnapshot.Status != "unavailable" || !strings.Contains(slowSnapshot.LastError, "collector timeout") {
+		t.Fatalf("expected slow instance timeout snapshot, got %+v", slowSnapshot)
+	}
+}
+
+func TestDockerSummaryCollectorTimeoutDoesNotBlockOtherHosts(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "aifar.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	slowIDs := map[string]bool{}
+	for index := 0; index < 4; index++ {
+		server, err := db.SaveServer(store.Server{Name: "slow", Host: "10.0.0.10", DockerHost: "tcp://10.0.0.10:2375"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		slowIDs[server.ID] = true
+	}
+	fastServer, err := db.SaveServer(store.Server{Name: "fast", Host: "10.0.0.20", DockerHost: "tcp://10.0.0.20:2375"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager := NewManager(db, nil, time.Minute)
+	manager.timeout = 30 * time.Millisecond
+	manager.dockerSummaryForServer = func(ctx context.Context, server store.Server) (adapter.DockerSummary, error) {
+		if slowIDs[server.ID] {
+			<-ctx.Done()
+			return adapter.DockerSummary{}, ctx.Err()
+		}
+		return adapter.DockerSummary{Containers: 2, Images: 3, Endpoint: server.DockerHost}, nil
+	}
+
+	startedAt := time.Now()
+	err = manager.collectDockerSummaries(context.Background())
+	elapsed := time.Since(startedAt)
+
+	if err == nil || !strings.Contains(err.Error(), "context deadline exceeded") {
+		t.Fatalf("expected timeout failures for slow Docker hosts, got %v", err)
+	}
+	if elapsed > 90*time.Millisecond {
+		t.Fatalf("slow Docker hosts blocked summary collection for %s", elapsed)
+	}
+	fastSnapshot, err := db.GetStatusSnapshot("docker.summary", fastServer.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fastSnapshot.Status != "available" {
+		t.Fatalf("expected fast Docker host snapshot to be available, got %+v", fastSnapshot)
+	}
+}
+
 func TestSaveSnapshotPublishesEveryCollection(t *testing.T) {
 	db, err := store.Open(filepath.Join(t.TempDir(), "aifar.db"))
 	if err != nil {
@@ -164,6 +269,7 @@ type fakeCheckModule struct {
 	name   string
 	status registry.InstanceStatus
 	err    error
+	check  func(context.Context, registry.CheckRequest) (registry.InstanceStatus, error)
 }
 
 func (m fakeCheckModule) Name() string { return m.name }
@@ -190,6 +296,9 @@ func (m fakeCheckModule) PlanCheck(context.Context, registry.CheckRequest) ([]re
 	return nil, nil
 }
 
-func (m fakeCheckModule) Check(context.Context, registry.CheckRequest, registry.RunContext) (registry.InstanceStatus, error) {
+func (m fakeCheckModule) Check(ctx context.Context, req registry.CheckRequest, run registry.RunContext) (registry.InstanceStatus, error) {
+	if m.check != nil {
+		return m.check(ctx, req)
+	}
 	return m.status, m.err
 }

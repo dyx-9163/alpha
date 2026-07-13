@@ -104,3 +104,29 @@
 - 结论：脚本默认目标改为仓库内 `resources\aifar\runtime-v2\services`，也支持 `-TargetRoot` 覆盖；每个服务会先清理对应 `target/*.jar`，再复制为固定名 `<module>.jar`，不再默认生成 `aifar-alpha-jars-*.zip` 和 manifest。已新增 `scripts/export-alpha-jars.test.mjs` 覆盖显式 TargetRoot 与默认仓库路径，`pnpm test:scripts` 通过。
 - 问题：用户要求按 `gateway-health-check-endpoints.md` 的“单服务 Readiness 探活接口”调整后端服务健康检查。
 - 结论：AIFAR runtime-v2 的安装、升级、批量升级、回滚、配置刷新、单服务安装、伸缩和扩容模板已将 Java 后端服务 healthcheck 默认改为 `/actuator/health/readiness`；`web-vue3` 继续使用 `/`。新增 `APP_BACKEND_HEALTH_PATH` 和 `APP_WEB_HEALTH_PATH` 默认配置，并保留服务级 `HEALTH_PATH` 覆盖。`go test ./internal/apps/aifar`、`pnpm test`、`pnpm backend:build` 通过。
+
+## 2026-07-13
+- 问题：用户要求 MinIO 增加当前分配磁盘总量和按保留天数估算可清理容量的信息。
+- 结论：已扩展 MinIO 检查采集 `dataDir/dataDirs` 所在文件系统容量，新增只读 cleanup-estimate 接口按 `retentionDays` 通过 `mc find --older-than` 估算旧对象数量和字节数，Storage 页面新增保留天数选择、手动统计和容量/可清理展示；不执行删除。验证通过：`go test ./...`（仓库内 GOCACHE）、`pnpm test`、`pnpm test:web`、`pnpm web:build`、`pnpm backend:build`、`git diff --check`。
+- 问题：用户指出 MinIO 磁盘统计显示成了整体统计，实际要看安装的 MinIO 数据盘统计。
+- 结论：后端采集仍以 MinIO `dataDir/dataDirs` 挂载盘为准；前端复制组/多节点卡片不再把节点容量和清理估算简单相加，改为显示“单节点”口径并在节点明细展示每个已安装 MinIO 的已用/可用与分配磁盘；同时修正节点行把 `totalBytes` 误当作可用空间展示的问题。`pnpm test:web`、`pnpm web:build`、`git diff --check` 通过。
+- 问题：用户认为 `单节点 19 GiB x 2` 仍然误导，因为 2 个 MinIO 实际共有 4 块数据盘且每块盘作用未罗列。
+- 结论：MinIO 检查脚本新增 per-disk 明细输出，保存每个安装数据盘的路径、设备、挂载点、总量/已用/可用/使用率到 `lastCheck.details.minioStorageDisks`；Storage 页面摘要改为节点数/数据盘数/物理容量，并在每个 MinIO 节点下列出每块数据盘。`pnpm test`、`pnpm test:web`、`pnpm web:build`、`pnpm backend:build`、`git diff --check` 通过。
+- 问题：用户询问服务模块状态多久推送一次，以及数据库页面为何像十多分钟才更新。
+- 结论：当前 collector 默认 `AIFAR_COLLECTOR_INTERVAL_SECONDS=15` 秒，启动后立即跑一轮并通过 `/api/v2/events` SSE 推送快照；但 `RunOnce` 串行执行 servers、docker.summary、app.instances、aifar.runtime，且 `app.instances` 串行检查所有安装实例。当前库里 `app.instances` 仍在 running，数据库状态要等该轮跑到 Redis/MySQL/MySQL Router 实例并写入 `status_snapshots` 后才会推送；另外 SSH `RunSSH` 只把 context 用在拨号阶段，远程 `session.Run` 本身不会随 8 秒 collector timeout 主动取消，慢命令会拖长整轮。
+- 问题：用户要求应用服务每 15 秒一轮采集，单个服务 5 秒超时，采集不到就离线且不能阻塞其它服务。
+- 结论：已把 collector 默认应用检查超时改为 5 秒，`app.instances` 改为每个实例并发采集；任一实例超时会写 `app.instance` 快照 `status=unavailable` 和 timeout 错误并继续推送，其它实例不被阻塞。`RunSSH` 增加 context-aware session cancellation，超时会关闭 session/client。新增 collector timeout 和 SSH cancellation 回归测试；验证通过 `go test ./internal/collector ./internal/adapter`、`pnpm test`、`pnpm backend:build`、`git diff --check`。
+- 问题：用户反馈仪表盘只有关键提醒自动刷新，服务器、任务、Docker、数据库和对象存储等区域不随实时事件刷新。
+- 结论：Dashboard 原本只在挂载时完整 `load()`，告警靠 `alert.*` 实时事件单独 upsert。已新增 Dashboard 实时刷新调度器，收到 `status.*`、`task.updated`、`task.finished` 时合并触发整页数据刷新，连接建立后补一次刷新；`alert.*` 仍只更新告警 store，避免告警频繁导致整页重拉。新增 Vitest 覆盖事件过滤、突发合并和刷新中补偿刷新；`pnpm test:web`、`pnpm web:build`、`git diff --check` 通过。
+- 问题：用户要求在 AIFAR 上操作 MinIO 30/60/180 天自动清理策略，并可随时调整、随时生效。
+- 结论：已新增 `POST /api/v2/storage/{id}/cleanup-policy`，通过 worker task 和实例操作锁下发 MinIO ILM 生命周期规则；调整时移除 AIFAR 已记录的旧 rule id 后添加新的 `--expire-days` 规则，停用时只移除 AIFAR 管理的规则。策略写入 `storage_items(kind=cleanupPolicy)` 和 `app_instances.metadata.cleanupPolicy`；Storage 页面支持 bucket/prefix、30/60/180 快捷天数、应用/停用策略，复制组会对可见节点分别提交任务。验证通过 `pnpm test`、`pnpm test:web`、`pnpm web:build`、`pnpm backend:build`、`git diff --check`。
+- 问题：用户要求不做业务和架构改动，只读审计当前逻辑代码还有哪些可优化点。
+- 结论：本轮未改业务/架构代码；优先建议优化页面拉取失败不应清空既有状态、MinIO 清理策略 bucket/prefix 非法输入不应静默落到默认值、SSH 上传应继承 context cancellation、Docker summary 采集应避免串行阻塞整轮 collector，以及 aifar-server 后台 collector/autoscaler 应绑定可取消的服务生命周期上下文。
+- 问题：用户要求执行上一轮只读审计中的逻辑优化，但仍不做业务和架构改动。
+- 结论：已做小范围逻辑优化：前端 Dashboard/Database/Nacos/Storage/Containers 拉取失败时保留上一轮状态；MinIO cleanup policy 的非法 bucket/prefix 改为 400，不再静默回退默认 bucket；SSH Run/Upload 继承 context cancellation 并短暂等待 session/copy 退出；Docker summary 采集改为并发且保留当前 5 秒单实例超时语义。验证通过 `pnpm test`、`pnpm test:web`、`pnpm web:build`、显式仓库内 Go cache 的 `pnpm backend:build`、`git diff --check`。
+- 问题：Redis Sentinel 安装成功，但数据库页将三个 Redis 数据节点显示为离线、服务不可用，Sentinel 节点显示在线。
+- 结论：Redis 后台状态检测原先始终使用面板默认密码，未读取安装后为实例生成并绑定的 Redis 凭据；自定义安装密码会导致 `redis-cli PING` 认证失败并误报离线。已改为检测时优先解密实例的 `redis` 凭据，仅在实例没有绑定凭据时回退默认密码，并补充回归测试。
+- 问题：用户要求服务器探测任务不再显示在页面右上角的全局任务进度浮层。
+- 结论：已将 `servers.probe` 的任务元数据改为 `trackable=false`；探测仍正常执行并保留任务中心、步骤、日志和实时状态更新，只是不再进入右上角浮动任务列表。
+- 问题：用户询问 AIFAR Runtime v2 的“安装模块”是否写死，并建议按 `resources/aifar/runtime-v2/services` 安装目录定义，以便加入新模块。
+- 结论：当前模块集合确实在资源 manifest、Go `serviceOrder`/校验、Vue 安装字段与 Runtime selectors、多个 shell 模板中重复固定；仅新增 services 子目录不会自动出现在页面，也会被后端拒绝。建议收敛为“services 目录自动发现 + 每个模块目录的描述文件”作为唯一来源，描述端口、类型、应用名、健康检查、必选性和顺序，后端扫描校验后通过 API 下发，前端不再维护固定列表；gateway/web-vue3 的入口角色仍应显式声明而非仅靠目录名推断。

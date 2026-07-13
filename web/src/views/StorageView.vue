@@ -25,6 +25,21 @@
       <div class="table-toolbar">
         <el-input v-model="search" :placeholder="t('storage.search')" clearable class="toolbar-control" />
         <div class="head-actions">
+          <template v-if="tab === 'instances'">
+            <el-input v-model="cleanupPolicyBucket" :placeholder="t('storage.cleanupBucket')" size="small" class="cleanup-policy-control" />
+            <el-input v-model="cleanupPolicyPrefix" :placeholder="t('storage.cleanupPrefix')" size="small" class="cleanup-policy-control" clearable />
+            <el-button-group class="cleanup-day-presets">
+              <el-button v-for="days in cleanupRetentionOptions" :key="days" size="small" @click="cleanupRetentionDays = days">{{ days }}</el-button>
+            </el-button-group>
+            <el-input-number v-model="cleanupRetentionDays" :min="1" :max="3650" :step="1" size="small" class="cleanup-retention-control" />
+            <el-button :loading="cleanupEstimating" @click="estimateVisibleStorageCleanup">{{ t('storage.estimateCleanup') }}</el-button>
+            <el-tooltip :content="deniedText" :disabled="canManageStorage" placement="top">
+              <span><el-button type="primary" :loading="cleanupPolicyApplying" :disabled="!canManageStorage" @click="applyVisibleStorageCleanupPolicy">{{ t('storage.applyCleanupPolicy') }}</el-button></span>
+            </el-tooltip>
+            <el-tooltip :content="deniedText" :disabled="canManageStorage" placement="top">
+              <span><el-button :loading="cleanupPolicyApplying" :disabled="!canManageStorage" @click="disableVisibleStorageCleanupPolicy">{{ t('storage.disableCleanupPolicy') }}</el-button></span>
+            </el-tooltip>
+          </template>
           <el-select v-if="tab !== 'instances'" v-model="selectedInstanceId" :placeholder="t('storage.selectInstance')" class="toolbar-control">
             <el-option v-for="item in instances" :key="item.id" :label="instanceLabel(item)" :value="item.id" />
           </el-select>
@@ -77,6 +92,22 @@
                 <span>{{ t('storage.minioNodes') }}</span>
                 <strong>{{ group.nodes.length }}</strong>
               </div>
+              <div>
+                <span>{{ t('storage.assignedCapacity') }}</span>
+                <strong>{{ groupCapacityText(group) }}</strong>
+              </div>
+              <div>
+                <span>{{ t('storage.storageUsedAvailable') }}</span>
+                <strong>{{ groupUsedAvailableText(group) }}</strong>
+              </div>
+              <div>
+                <span>{{ t('storage.cleanupPolicy') }}</span>
+                <strong>{{ groupCleanupPolicyText(group) }}</strong>
+              </div>
+              <div>
+                <span>{{ t('storage.cleanupEstimate') }}</span>
+                <strong>{{ groupCleanupEstimateText(group) }}</strong>
+              </div>
               <div class="storage-info-wide">
                 <span>{{ t('storage.replicationBuckets') }}</span>
                 <strong>{{ displayBuckets(group) }}</strong>
@@ -111,6 +142,20 @@
                 <div class="storage-node-main">
                   <strong>{{ node.serverLabel }}</strong>
                   <span>{{ node.endpoint }}</span>
+                  <small>{{ nodeInsightText(node) }}</small>
+                  <div v-if="node.storageDisks.length" class="storage-disk-list">
+                    <div v-for="disk in node.storageDisks" :key="`${node.instance.id}:${disk.index}:${disk.path}`" class="storage-disk-row">
+                      <div>
+                        <strong>{{ diskLabel(disk) }}</strong>
+                        <span>{{ disk.device || '-' }}</span>
+                      </div>
+                      <div>
+                        <strong>{{ formatBytes(disk.totalBytes) }}</strong>
+                        <span>{{ diskUsageText(disk) }}</span>
+                      </div>
+                      <small>{{ disk.mountPoint || '-' }} · {{ disk.path }}</small>
+                    </div>
+                  </div>
                 </div>
                 <div class="storage-node-tags">
                   <el-tag size="small" type="info">{{ node.roleLabel }}</el-tag>
@@ -258,6 +303,7 @@ import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import { useRouter } from 'vue-router'
 import { apiDelete, apiGet, apiPost, asArray } from '../api/client'
+import { keepPreviousArrayOnLoadFailure } from '../api/resilientLoad'
 import ConfirmAction from '../components/ConfirmAction.vue'
 import KeyValueGrid from '../components/KeyValueGrid.vue'
 import RunRecordTable from '../components/RunRecordTable.vue'
@@ -265,6 +311,21 @@ import StatusTag from '../components/StatusTag.vue'
 import { usePermissions } from '../composables/usePermissions'
 import { useI18n } from '../i18n'
 import { permissions } from '../rbac'
+import {
+  applyMinioCleanupPolicy,
+  fetchMinioCleanupEstimate,
+  formatBytes,
+  formatMinioUsedAvailable,
+  summarizeMinioInstallDisks,
+  type MinioCleanupEstimate,
+  type MinioCleanupPolicy,
+  type MinioStorageDisk,
+  type MinioStorageInsight,
+  minioCleanupEstimateFromMetadata,
+  minioCleanupPolicyFromMetadata,
+  minioStorageDisksFromMetadata,
+  minioStorageInsightFromMetadata
+} from '../storage/minioInsights'
 import { applyRealtimeStatusToAppInstance, useRealtimeStore } from '../stores/realtime'
 import { useTaskProgressStore } from '../stores/taskProgress'
 
@@ -287,6 +348,10 @@ type StorageNode = {
   endpoint: string
   status: string
   roleLabel: string
+  storageInsight: MinioStorageInsight | null
+  storageDisks: MinioStorageDisk[]
+  cleanupEstimate: MinioCleanupEstimate | null
+  cleanupPolicy: MinioCleanupPolicy | null
 }
 
 type StorageGroup = {
@@ -326,11 +391,18 @@ const search = ref('')
 const itemDialogVisible = ref(false)
 const deleteDialogVisible = ref(false)
 const deleteSubmitting = ref(false)
+const cleanupRetentionDays = ref(30)
+const cleanupRetentionOptions = [30, 60, 180]
+const cleanupPolicyBucket = ref('aifar')
+const cleanupPolicyPrefix = ref('')
+const cleanupEstimating = ref(false)
+const cleanupPolicyApplying = ref(false)
 const deletePassword = ref('')
 const deleteRemoveMountedDisks = ref(false)
 const pendingDeleteInstance = ref<AppInstance | null>(null)
 const itemKind = ref<StorageKind>('bucket')
 const itemForm = reactive({ name: '', policy: '', accessKey: '', secretKey: '' })
+const cleanupEstimates = reactive<Record<string, MinioCleanupEstimate>>({})
 const collection = reactive<Record<string, any[]>>({
   buckets: [],
   objects: [],
@@ -391,13 +463,13 @@ async function load() {
 
 async function reloadStorageState() {
   const [nextInstances, nextServers, nextTasks] = await Promise.all([
-    apiGet<AppInstance[] | null>('/storage/instances').catch(() => []),
-    apiGet<any[] | null>('/servers').catch(() => []),
-    apiGet<any[] | null>('/tasks').catch(() => [])
+    keepPreviousArrayOnLoadFailure(apiGet<AppInstance[] | null>('/storage/instances'), instances.value),
+    keepPreviousArrayOnLoadFailure(apiGet<any[] | null>('/servers'), servers.value),
+    keepPreviousArrayOnLoadFailure(apiGet<any[] | null>('/tasks'), tasks.value)
   ])
-  instances.value = asArray(nextInstances)
-  servers.value = asArray(nextServers)
-  tasks.value = asArray(nextTasks)
+  instances.value = nextInstances
+  servers.value = nextServers
+  tasks.value = nextTasks
 }
 
 async function loadActive() {
@@ -416,8 +488,12 @@ async function loadActive() {
 
 async function loadCollection(kind: StorageKind) {
   const path = collectionPath(kind)
-  const result = await apiGet<{ items?: any[] }>(path).catch(() => ({ items: [] }))
-  collection[collectionKey(kind)] = asArray(result.items)
+  const key = collectionKey(kind)
+  const result = await keepPreviousArrayOnLoadFailure(
+    apiGet<{ items?: any[] }>(path).then((value) => value?.items ?? []),
+    collection[key]
+  )
+  collection[key] = result
 }
 
 function openItemDialog(kind: StorageKind) {
@@ -579,7 +655,11 @@ function createStorageNode(item: AppInstance, metadata: InstanceMetadata, topolo
     serverLabel: serverName(item.serverId),
     endpoint: stringValue(metadata.endpoint) || endpointFromServer(item, metadata),
     status: displayInstanceStatus(item),
-    roleLabel: storageNodeRole(topology, index)
+    roleLabel: storageNodeRole(topology, index),
+    storageInsight: minioStorageInsightFromMetadata(metadata),
+    storageDisks: minioStorageDisksFromMetadata(metadata),
+    cleanupEstimate: minioCleanupEstimateFromMetadata(metadata),
+    cleanupPolicy: minioCleanupPolicyFromMetadata(metadata)
   }
 }
 
@@ -659,6 +739,204 @@ function replicationProfileText(group: StorageGroup) {
   const largeWorkers = group.maxLargeWorkers || '-'
   const deleteMode = group.replicateDeletes ? t('storage.deleteSyncOn') : t('storage.deleteSyncOff')
   return `${t('storage.replicationPriority')} ${priority} | ${t('storage.replicationWorkers')} ${workers}/${largeWorkers} | ${deleteMode}`
+}
+
+async function estimateVisibleStorageCleanup() {
+  const nodes = uniqueStorageNodes(storageGroups.value.flatMap((group) => group.nodes))
+  if (!nodes.length) {
+    return
+  }
+  cleanupEstimating.value = true
+  const failures: string[] = []
+  try {
+    await Promise.all(nodes.map(async (node) => {
+      try {
+        cleanupEstimates[node.instance.id] = await fetchMinioCleanupEstimate(node.instance.id, cleanupRetentionDays.value)
+      } catch (err) {
+        failures.push(node.serverLabel)
+        cleanupEstimates[node.instance.id] = {
+          status: 'unavailable',
+          retentionDays: cleanupRetentionDays.value,
+          objectCount: 0,
+          bytes: 0,
+          source: 'api'
+        }
+      }
+    }))
+    if (failures.length) {
+      ElMessage.warning(`${t('storage.cleanupEstimateFailed')}: ${failures.join(', ')}`)
+    } else {
+      ElMessage.success(t('storage.cleanupEstimateUpdated'))
+    }
+  } finally {
+    cleanupEstimating.value = false
+  }
+}
+
+async function applyVisibleStorageCleanupPolicy() {
+  await submitVisibleStorageCleanupPolicy(true)
+}
+
+async function disableVisibleStorageCleanupPolicy() {
+  await submitVisibleStorageCleanupPolicy(false)
+}
+
+async function submitVisibleStorageCleanupPolicy(enabled: boolean) {
+  if (!canManageStorage.value) {
+    ElMessage.warning(deniedText.value)
+    return
+  }
+  const bucket = cleanupPolicyBucket.value.trim() || 'aifar'
+  const prefix = cleanupPolicyPrefix.value.trim().replace(/^\/+/, '')
+  const nodes = uniqueStorageNodes(storageGroups.value.flatMap((group) => group.nodes))
+  if (!nodes.length) {
+    return
+  }
+  cleanupPolicyApplying.value = true
+  const failures: string[] = []
+  try {
+    await Promise.all(nodes.map(async (node) => {
+      try {
+        const result = await applyMinioCleanupPolicy(node.instance.id, {
+          enabled,
+          bucket,
+          prefix,
+          retentionDays: cleanupRetentionDays.value
+        })
+        taskProgress.track(result.taskId, enabled ? t('storage.cleanupPolicyApplyTask') : t('storage.cleanupPolicyDisableTask'))
+      } catch (err) {
+        failures.push(node.serverLabel)
+      }
+    }))
+    if (failures.length) {
+      ElMessage.warning(`${t('storage.cleanupPolicyFailed')}: ${failures.join(', ')}`)
+    } else {
+      ElMessage.success(enabled ? t('storage.cleanupPolicyApplied') : t('storage.cleanupPolicyDisableSubmitted'))
+    }
+    await reloadStorageState()
+  } finally {
+    cleanupPolicyApplying.value = false
+  }
+}
+
+function groupCapacityText(group: StorageGroup) {
+  const summary = groupStorageSummary(group)
+  if (!summary) {
+    return '-'
+  }
+  const disks = `${summary.pathCount} ${t('storage.dataDisks')}`
+  if (summary.nodeCount === 1) {
+    return `${disks} / ${formatBytes(summary.aggregateTotalBytes)}`
+  }
+  return `${summary.nodeCount} ${t('storage.minioNodes')} / ${disks} / ${t('storage.physicalCapacity')} ${formatBytes(summary.aggregateTotalBytes)}`
+}
+
+function groupUsedAvailableText(group: StorageGroup) {
+  const summary = groupStorageSummary(group)
+  if (!summary) {
+    return '-'
+  }
+  return `${formatBytes(summary.aggregateUsedBytes)} / ${formatBytes(summary.aggregateAvailableBytes)} (${usagePercent(summary.aggregateUsedBytes, summary.aggregateTotalBytes)}%)`
+}
+
+function groupCleanupEstimateText(group: StorageGroup) {
+  const estimates = group.nodes.map(cleanupEstimateForNode).filter((item): item is MinioCleanupEstimate => Boolean(item))
+  const available = estimates.filter((item) => item.status === 'available')
+  if (!estimates.length || !available.length) {
+    return t('storage.cleanupNotEstimated')
+  }
+  if (available.length === 1) {
+    return cleanupEstimateDisplay(available[0])
+  }
+  const first = available[0]
+  const uniform = available.every((item) => item.bytes === first.bytes && item.objectCount === first.objectCount)
+  if (uniform) {
+    return `${t('storage.perNode')} ${cleanupEstimateDisplay(first)} x ${available.length}`
+  }
+  return t('storage.seeNodeDetails')
+}
+
+function groupCleanupPolicyText(group: StorageGroup) {
+  const policies = group.nodes.map((node) => node.cleanupPolicy).filter((item): item is MinioCleanupPolicy => Boolean(item))
+  const enabled = policies.filter((item) => item.enabled && item.status === 'enabled')
+  if (!enabled.length) {
+    return t('storage.cleanupPolicyDisabled')
+  }
+  const first = enabled[0]
+  const uniform = enabled.every((item) =>
+    item.bucket === first.bucket &&
+    item.prefix === first.prefix &&
+    item.retentionDays === first.retentionDays
+  )
+  if (!uniform) {
+    return t('storage.seeNodeDetails')
+  }
+  const suffix = group.nodes.length > 1 ? ` x ${enabled.length}` : ''
+  return `${cleanupPolicyDisplay(first)}${suffix}`
+}
+
+function nodeInsightText(node: StorageNode) {
+  const insight = node.storageInsight
+  const estimate = cleanupEstimateForNode(node)
+  const capacity = insight ? `${formatMinioUsedAvailable(insight)} | ${t('storage.assignedCapacity')}: ${formatBytes(insight.totalBytes)}` : '-'
+  const cleanup = estimate ? cleanupEstimateDisplay(estimate) : t('storage.cleanupNotEstimated')
+  const policy = node.cleanupPolicy ? cleanupPolicyDisplay(node.cleanupPolicy) : t('storage.cleanupPolicyDisabled')
+  return `${t('storage.storageUsedAvailable')}: ${capacity} | ${t('storage.cleanupEstimate')}: ${cleanup} | ${t('storage.cleanupPolicy')}: ${policy}`
+}
+
+function cleanupPolicyDisplay(policy: MinioCleanupPolicy) {
+  if (!policy.enabled || policy.status !== 'enabled') {
+    return t('storage.cleanupPolicyDisabled')
+  }
+  const scope = policy.prefix ? `${policy.bucket}/${policy.prefix}` : policy.bucket
+  return `${scope} / ${policy.retentionDays} ${t('storage.daysUnit')}`
+}
+
+function cleanupEstimateDisplay(estimate: MinioCleanupEstimate) {
+  if (estimate.status && estimate.status !== 'available') {
+    return t('storage.cleanupUnavailable')
+  }
+  return `${formatBytes(estimate.bytes)} / ${estimate.objectCount} ${t('storage.objects')}`
+}
+
+function cleanupEstimateForNode(node: StorageNode) {
+  const fresh = cleanupEstimates[node.instance.id]
+  if (fresh && fresh.retentionDays === cleanupRetentionDays.value) {
+    return fresh
+  }
+  if (node.cleanupEstimate && node.cleanupEstimate.retentionDays === cleanupRetentionDays.value) {
+    return node.cleanupEstimate
+  }
+  return null
+}
+
+function diskLabel(disk: MinioStorageDisk) {
+  return `${t('storage.disk')} ${disk.index}`
+}
+
+function diskUsageText(disk: MinioStorageDisk) {
+  return `${formatBytes(disk.usedBytes)} / ${formatBytes(disk.availableBytes)} (${disk.usagePercent}%)`
+}
+
+function groupStorageSummary(group: StorageGroup) {
+  return summarizeMinioInstallDisks(group.nodes.map((node) => node.storageInsight))
+}
+
+function usagePercent(usedBytes: number, totalBytes: number) {
+  return totalBytes > 0 ? Math.round((usedBytes * 100) / totalBytes) : 0
+}
+
+function uniqueStorageNodes(nodes: StorageNode[]) {
+  const seen = new Set<string>()
+  const out: StorageNode[] = []
+  for (const node of nodes) {
+    if (seen.has(node.instance.id)) {
+      continue
+    }
+    seen.add(node.instance.id)
+    out.push(node)
+  }
+  return out
 }
 
 function syncEndpointLabel(node: StorageNode | undefined, bucket: string) {
@@ -833,6 +1111,18 @@ onMounted(load)
   max-width: 240px;
 }
 
+.cleanup-retention-control {
+  width: 128px;
+}
+
+.cleanup-policy-control {
+  width: 132px;
+}
+
+.cleanup-day-presets {
+  flex: 0 0 auto;
+}
+
 .app-icon.small {
   width: 34px;
   height: 34px;
@@ -963,7 +1253,7 @@ onMounted(load)
 .storage-node-row {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
-  align-items: center;
+  align-items: flex-start;
   gap: 8px;
   border: 1px solid var(--aifar-border-soft);
   border-radius: var(--aifar-radius);
@@ -976,7 +1266,8 @@ onMounted(load)
 }
 
 .storage-node-main strong,
-.storage-node-main span {
+.storage-node-main span,
+.storage-node-main small {
   display: block;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -986,6 +1277,56 @@ onMounted(load)
 .storage-node-main span {
   color: var(--aifar-text-tertiary);
   font-size: 12px;
+}
+
+.storage-node-main small {
+  color: var(--aifar-text-secondary);
+  font-size: 11px;
+  line-height: 18px;
+}
+
+.storage-disk-list {
+  margin-top: 8px;
+  display: grid;
+  gap: 6px;
+}
+
+.storage-disk-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(86px, auto);
+  gap: 8px;
+  align-items: center;
+  border: 1px solid var(--aifar-border-soft);
+  border-radius: 6px;
+  padding: 6px 8px;
+  background: #f8fbff;
+}
+
+.storage-disk-row > div {
+  min-width: 0;
+}
+
+.storage-disk-row strong,
+.storage-disk-row span,
+.storage-disk-row small {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.storage-disk-row strong {
+  font-size: 12px;
+}
+
+.storage-disk-row span,
+.storage-disk-row small {
+  color: var(--aifar-text-tertiary);
+  font-size: 11px;
+}
+
+.storage-disk-row small {
+  grid-column: 1 / -1;
 }
 
 .storage-node-tags {

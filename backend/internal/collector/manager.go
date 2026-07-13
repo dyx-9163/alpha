@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"aifar-deployment/backend/internal/adapter"
@@ -23,13 +25,15 @@ type AlertEvaluator interface {
 }
 
 type Manager struct {
-	store     *store.Store
-	events    Publisher
-	alerts    AlertEvaluator
-	apps      *registry.Registry
-	interval  time.Duration
-	timeout   time.Duration
-	startedCh chan struct{}
+	store                  *store.Store
+	events                 Publisher
+	alerts                 AlertEvaluator
+	apps                   *registry.Registry
+	interval               time.Duration
+	timeout                time.Duration
+	dockerSummaryForServer func(context.Context, store.Server) (adapter.DockerSummary, error)
+	dockerSummaryWorkers   int
+	startedCh              chan struct{}
 }
 
 func NewManager(s *store.Store, events Publisher, interval time.Duration) *Manager {
@@ -37,11 +41,13 @@ func NewManager(s *store.Store, events Publisher, interval time.Duration) *Manag
 		interval = 30 * time.Second
 	}
 	return &Manager{
-		store:     s,
-		events:    events,
-		interval:  interval,
-		timeout:   8 * time.Second,
-		startedCh: make(chan struct{}),
+		store:                  s,
+		events:                 events,
+		interval:               interval,
+		timeout:                5 * time.Second,
+		dockerSummaryForServer: adapter.DockerSummaryForServer,
+		dockerSummaryWorkers:   8,
+		startedCh:              make(chan struct{}),
 	}
 }
 
@@ -160,49 +166,87 @@ func (m *Manager) collectDockerSummaries(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	var failures []string
+	targets := make([]store.Server, 0, len(servers))
 	for _, publicServer := range servers {
 		if strings.TrimSpace(publicServer.DockerHost) == "" {
 			continue
 		}
 		server, err := m.store.GetServer(publicServer.ID, true)
 		if err != nil {
-			failures = append(failures, publicServer.ID+": "+err.Error())
+			targets = append(targets, store.Server{ID: publicServer.ID, DockerHost: publicServer.DockerHost, LastError: err.Error()})
 			continue
 		}
-		child, cancel := context.WithTimeout(ctx, m.timeout)
-		summary, err := adapter.DockerSummaryForServer(child, server)
-		cancel()
-		status := "available"
-		errText := ""
-		payload := map[string]any{
-			"available": false,
-			"endpoint":  server.DockerHost,
-		}
-		if err != nil {
-			status = "failed"
-			errText = err.Error()
-			failures = append(failures, server.ID+": "+err.Error())
-		} else {
-			payload["available"] = true
-			payload["summary"] = summary
-		}
-		if saveErr := m.saveSnapshot(ctx, store.StatusSnapshot{
-			Scope:       "docker.summary",
-			ResourceID:  server.ID,
-			ServerID:    server.ID,
-			Status:      status,
-			LastError:   errText,
-			Payload:     marshalPayload(payload),
-			CollectedAt: time.Now(),
-		}); saveErr != nil {
-			return saveErr
+		targets = append(targets, server)
+	}
+	if len(targets) == 0 {
+		return nil
+	}
+	workers := m.dockerSummaryWorkers
+	if workers <= 0 {
+		workers = 1
+	}
+	sem := make(chan struct{}, workers)
+	results := make(chan string, len(targets))
+	var wg sync.WaitGroup
+	for _, server := range targets {
+		wg.Add(1)
+		go func(server store.Server) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			if strings.TrimSpace(server.LastError) != "" && strings.TrimSpace(server.Host) == "" {
+				results <- server.ID + ": " + server.LastError
+				return
+			}
+			results <- m.collectOneDockerSummary(ctx, server)
+		}(server)
+	}
+	wg.Wait()
+	close(results)
+	var failures []string
+	for failure := range results {
+		if failure != "" {
+			failures = append(failures, failure)
 		}
 	}
 	if len(failures) > 0 {
 		return errors.New(strings.Join(failures, "; "))
 	}
 	return nil
+}
+
+func (m *Manager) collectOneDockerSummary(ctx context.Context, server store.Server) string {
+	child, cancel := context.WithTimeout(ctx, m.timeout)
+	summary, err := m.dockerSummaryForServer(child, server)
+	cancel()
+	status := "available"
+	errText := ""
+	payload := map[string]any{
+		"available": false,
+		"endpoint":  server.DockerHost,
+	}
+	if err != nil {
+		status = "failed"
+		errText = err.Error()
+	} else {
+		payload["available"] = true
+		payload["summary"] = summary
+	}
+	if saveErr := m.saveSnapshot(ctx, store.StatusSnapshot{
+		Scope:       "docker.summary",
+		ResourceID:  server.ID,
+		ServerID:    server.ID,
+		Status:      status,
+		LastError:   errText,
+		Payload:     marshalPayload(payload),
+		CollectedAt: time.Now(),
+	}); saveErr != nil {
+		return server.ID + ": " + saveErr.Error()
+	}
+	if err != nil {
+		return server.ID + ": " + err.Error()
+	}
+	return ""
 }
 
 func (m *Manager) collectAppInstances(ctx context.Context) error {
@@ -213,7 +257,8 @@ func (m *Manager) collectAppInstances(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	var failures []string
+	errCh := make(chan string, len(instances))
+	var wg sync.WaitGroup
 	for _, instance := range instances {
 		app := strings.ToLower(strings.TrimSpace(instance.App))
 		if app == "" || strings.TrimSpace(instance.ServerID) == "" {
@@ -227,16 +272,44 @@ func (m *Manager) collectAppInstances(ctx context.Context) error {
 		if !ok {
 			continue
 		}
-		server, err := m.store.GetServer(instance.ServerID, true)
-		if err != nil {
-			errText := logmask.Mask(err.Error())
-			failures = append(failures, instance.ID+": "+errText)
-			if saveErr := m.saveAppInstanceSnapshot(ctx, instance, registry.InstanceStatus{Status: "failed", Message: errText}, errText); saveErr != nil {
-				return saveErr
+		wg.Add(1)
+		go func(instance store.AppInstance, checkModule registry.CheckModule) {
+			defer wg.Done()
+			if err := m.collectOneAppInstance(ctx, instance, checkModule); err != nil {
+				errCh <- err.Error()
 			}
-			continue
+		}(instance, checkModule)
+	}
+	wg.Wait()
+	close(errCh)
+	var failures []string
+	for failure := range errCh {
+		failures = append(failures, failure)
+	}
+	if len(failures) > 0 {
+		return errors.New(strings.Join(failures, "; "))
+	}
+	return nil
+}
+
+type appInstanceCheckResult struct {
+	status registry.InstanceStatus
+	err    error
+}
+
+func (m *Manager) collectOneAppInstance(ctx context.Context, instance store.AppInstance, checkModule registry.CheckModule) error {
+	server, err := m.store.GetServer(instance.ServerID, true)
+	if err != nil {
+		errText := logmask.Mask(err.Error())
+		if saveErr := m.saveAppInstanceSnapshot(ctx, instance, registry.InstanceStatus{Status: "failed", Message: errText}, errText); saveErr != nil {
+			return fmt.Errorf("%s: %s", instance.ID, saveErr.Error())
 		}
-		child, cancel := context.WithTimeout(ctx, m.timeout)
+		return fmt.Errorf("%s: %s", instance.ID, errText)
+	}
+	child, cancel := context.WithTimeout(ctx, m.timeout)
+	defer cancel()
+	resultCh := make(chan appInstanceCheckResult, 1)
+	go func() {
 		status, checkErr := checkModule.Check(child, registry.CheckRequest{
 			Instance: instance,
 			Server:   server,
@@ -246,30 +319,70 @@ func (m *Manager) collectAppInstances(ctx context.Context) error {
 			Log:       silentLogger{},
 			TargetLog: func(string) registry.Logger { return silentLogger{} },
 		})
-		cancel()
+		resultCh <- appInstanceCheckResult{status: status, err: checkErr}
+	}()
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-child.Done():
+		if errors.Is(child.Err(), context.DeadlineExceeded) {
+			return m.saveAppInstanceTimeoutSnapshot(ctx, instance)
+		}
+		return child.Err()
+	case result := <-resultCh:
+		if errors.Is(result.err, context.DeadlineExceeded) || errors.Is(child.Err(), context.DeadlineExceeded) {
+			return m.saveAppInstanceTimeoutSnapshot(ctx, instance)
+		}
 		errText := ""
-		if checkErr != nil {
-			errText = logmask.Mask(checkErr.Error())
-			failures = append(failures, instance.ID+": "+errText)
+		if result.err != nil {
+			errText = logmask.Mask(result.err.Error())
 		}
-		if strings.TrimSpace(status.Status) == "" {
-			if checkErr != nil {
-				status.Status = "failed"
-			} else {
-				status.Status = instance.Status
-			}
+		status := result.status
+		if errText != "" {
+			return m.saveAppInstanceCheckSnapshot(ctx, instance, status, errText)
 		}
-		if strings.TrimSpace(status.Message) != "" {
-			status.Message = logmask.Mask(status.Message)
-		}
-		if err := m.saveAppInstanceSnapshot(ctx, instance, status, errText); err != nil {
+		if err := m.saveAppInstanceCheckSnapshot(ctx, instance, status, ""); err != nil {
 			return err
 		}
+		return nil
 	}
-	if len(failures) > 0 {
-		return errors.New(strings.Join(failures, "; "))
+}
+
+func (m *Manager) saveAppInstanceCheckSnapshot(ctx context.Context, instance store.AppInstance, status registry.InstanceStatus, errText string) error {
+	if errText != "" {
+		if strings.TrimSpace(status.Status) == "" {
+			status.Status = "failed"
+		}
+	} else if strings.TrimSpace(status.Status) == "" {
+		status.Status = instance.Status
+	}
+	if strings.TrimSpace(status.Message) != "" {
+		status.Message = logmask.Mask(status.Message)
+	}
+	if err := m.saveAppInstanceSnapshot(ctx, instance, status, errText); err != nil {
+		return fmt.Errorf("%s: %s", instance.ID, err.Error())
+	}
+	if errText != "" {
+		return fmt.Errorf("%s: %s", instance.ID, errText)
 	}
 	return nil
+}
+
+func (m *Manager) saveAppInstanceTimeoutSnapshot(ctx context.Context, instance store.AppInstance) error {
+	errText := logmask.Mask("collector timeout after " + m.timeout.String())
+	status := registry.InstanceStatus{
+		Status:  "unavailable",
+		Message: errText,
+		Details: map[string]any{
+			"checkedAt": time.Now().UTC().Format(time.RFC3339),
+			"timeout":   m.timeout.String(),
+		},
+	}
+	if err := m.saveAppInstanceSnapshot(ctx, instance, status, errText); err != nil {
+		return fmt.Errorf("%s: %s", instance.ID, err.Error())
+	}
+	return fmt.Errorf("%s: %s", instance.ID, errText)
 }
 
 func (m *Manager) saveAppInstanceSnapshot(ctx context.Context, instance store.AppInstance, status registry.InstanceStatus, errText string) error {

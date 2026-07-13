@@ -67,6 +67,7 @@ func (f *fakeStore) DeleteAppInstance(id string) error {
 type fakeRemote struct {
 	mu             sync.Mutex
 	commands       []string
+	responses      []adapter.CommandResult
 	blockInstall   bool
 	installStarted chan string
 	releaseInstall chan struct{}
@@ -84,6 +85,11 @@ func (f *fakeRemote) Run(ctx context.Context, server store.Server, command strin
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.commands = append(f.commands, command)
+	if len(f.responses) > 0 {
+		result := f.responses[0]
+		f.responses = f.responses[1:]
+		return result, nil
+	}
 	return adapter.CommandResult{Stdout: "ok"}, nil
 }
 
@@ -456,5 +462,171 @@ func TestServiceChecksMinioHealthAndUpdatesInstanceStatus(t *testing.T) {
 	joinedCommands := remote.joinedCommands()
 	if !strings.Contains(joinedCommands, "/minio/health/live") || !strings.Contains(joinedCommands, "API_PORT=9002") {
 		t.Fatalf("expected health endpoint probe command: %s", joinedCommands)
+	}
+}
+
+func TestServiceCheckRecordsStorageCapacityAndCleanupEstimate(t *testing.T) {
+	instance := store.AppInstance{
+		ID:       "app-1",
+		App:      "minio",
+		Version:  "2025-10-15T17-29-55Z",
+		ServerID: "srv-1",
+		Status:   "installed",
+		Topology: "standalone",
+		Metadata: `{"apiPort":9002,"endpoint":"http://10.0.0.3:9002","serviceName":"aifar-minio","dataDirs":["/data/minio/disk1/minio","/data/minio/disk2/minio"]}`,
+	}
+	s := &fakeStore{
+		servers:   map[string]store.Server{"srv-1": {ID: "srv-1", Name: "s3-1", Host: "10.0.0.3", DeployDir: "/aifar/apps"}},
+		instances: []store.AppInstance{instance},
+	}
+	remote := &fakeRemote{responses: []adapter.CommandResult{{
+		Stdout: strings.Join([]string{
+			"runtimeStatus=available",
+			"minioHealthStatus=running",
+			"minioServiceStatus=running",
+			"minioPortStatus=listening",
+			"minioRuntimeSource=curl",
+			"minioStorageTotalBytes=3000",
+			"minioStorageUsedBytes=1200",
+			"minioStorageAvailableBytes=1800",
+			"minioStorageUsagePercent=40",
+			"minioStoragePathCount=2",
+			"minioStorageDiskCount=2",
+			"minioStorageDisk1Path=/data/minio/disk1/minio",
+			"minioStorageDisk1Device=/dev/nvme0n2",
+			"minioStorageDisk1MountPoint=/data/minio/disk1",
+			"minioStorageDisk1TotalBytes=1000",
+			"minioStorageDisk1UsedBytes=400",
+			"minioStorageDisk1AvailableBytes=600",
+			"minioStorageDisk1UsagePercent=40",
+			"minioStorageDisk2Path=/data/minio/disk2/minio",
+			"minioStorageDisk2Device=/dev/nvme0n3",
+			"minioStorageDisk2MountPoint=/data/minio/disk2",
+			"minioStorageDisk2TotalBytes=2000",
+			"minioStorageDisk2UsedBytes=800",
+			"minioStorageDisk2AvailableBytes=1200",
+			"minioStorageDisk2UsagePercent=40",
+			"cleanupEstimateStatus=available",
+			"cleanupEstimateRetentionDays=30",
+			"cleanupEstimateObjectCount=7",
+			"cleanupEstimateBytes=456",
+			"cleanupEstimateSource=mc",
+		}, "\n"),
+	}}}
+	service := NewService(s, remote)
+	result, err := service.Check(context.Background(), CheckRequest{Instance: instance, Server: s.servers["srv-1"], Language: "en"}, fakeLogger{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Details["minioStorageTotalBytes"] != int64(3000) || result.Details["cleanupEstimateBytes"] != int64(456) {
+		t.Fatalf("expected storage capacity and cleanup estimate details, got %+v", result.Details)
+	}
+	disks, ok := result.Details["minioStorageDisks"].([]map[string]any)
+	if !ok || len(disks) != 2 {
+		t.Fatalf("expected per-disk storage details, got %#v", result.Details["minioStorageDisks"])
+	}
+	if disks[0]["path"] != "/data/minio/disk1/minio" || disks[0]["device"] != "/dev/nvme0n2" || disks[0]["totalBytes"] != int64(1000) {
+		t.Fatalf("unexpected first disk detail: %#v", disks[0])
+	}
+	if disks[1]["path"] != "/data/minio/disk2/minio" || disks[1]["device"] != "/dev/nvme0n3" || disks[1]["totalBytes"] != int64(2000) {
+		t.Fatalf("unexpected second disk detail: %#v", disks[1])
+	}
+	if !strings.Contains(s.instances[0].Metadata, `"minioStorageTotalBytes":3000`) || !strings.Contains(s.instances[0].Metadata, `"cleanupEstimateObjectCount":7`) || !strings.Contains(s.instances[0].Metadata, `"device":"/dev/nvme0n2"`) {
+		t.Fatalf("expected storage details to be persisted in lastCheck metadata: %s", s.instances[0].Metadata)
+	}
+	joinedCommands := remote.joinedCommands()
+	if !strings.Contains(joinedCommands, "RETENTION_DAYS=30") || !strings.Contains(joinedCommands, "/data/minio/disk1/minio") || !strings.Contains(joinedCommands, "/data/minio/disk2/minio") {
+		t.Fatalf("expected probe command to include retention and data directories: %s", joinedCommands)
+	}
+}
+
+func TestServiceEstimatesCleanupWithRequestedRetentionDays(t *testing.T) {
+	instance := store.AppInstance{
+		ID:       "app-1",
+		App:      "minio",
+		Version:  "2025-10-15T17-29-55Z",
+		ServerID: "srv-1",
+		Status:   "installed",
+		Topology: "standalone",
+		Metadata: `{"apiPort":9002,"endpoint":"http://10.0.0.3:9002","serviceName":"aifar-minio","dataDir":"/data/minio"}`,
+	}
+	s := &fakeStore{
+		servers:   map[string]store.Server{"srv-1": {ID: "srv-1", Name: "s3-1", Host: "10.0.0.3", DeployDir: "/aifar/apps"}},
+		instances: []store.AppInstance{instance},
+	}
+	remote := &fakeRemote{responses: []adapter.CommandResult{{
+		Stdout: strings.Join([]string{
+			"runtimeStatus=available",
+			"cleanupEstimateStatus=available",
+			"cleanupEstimateRetentionDays=14",
+			"cleanupEstimateObjectCount=3",
+			"cleanupEstimateBytes=2048",
+			"cleanupEstimateSource=mc",
+		}, "\n"),
+	}}}
+	service := NewService(s, remote)
+	result, err := service.EstimateCleanup(context.Background(), CleanupEstimateRequest{
+		Instance:      instance,
+		Server:        s.servers["srv-1"],
+		RetentionDays: 14,
+	}, fakeLogger{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != "available" || result.RetentionDays != 14 || result.ObjectCount != 3 || result.Bytes != 2048 {
+		t.Fatalf("unexpected cleanup estimate: %+v", result)
+	}
+	if !strings.Contains(remote.joinedCommands(), "RETENTION_DAYS=14") {
+		t.Fatalf("expected requested retention days in command: %s", remote.joinedCommands())
+	}
+}
+
+func TestServiceAppliesCleanupPolicyWithILMRule(t *testing.T) {
+	instance := store.AppInstance{
+		ID:       "app-1",
+		App:      "minio",
+		Version:  "2025-10-15T17-29-55Z",
+		ServerID: "srv-1",
+		Status:   "installed",
+		Topology: "standalone",
+		Metadata: `{"apiPort":9002,"endpoint":"http://10.0.0.3:9002","serviceName":"aifar-minio"}`,
+	}
+	s := &fakeStore{
+		servers:   map[string]store.Server{"srv-1": {ID: "srv-1", Name: "s3-1", Host: "10.0.0.3", DeployDir: "/aifar/apps"}},
+		instances: []store.AppInstance{instance},
+	}
+	remote := &fakeRemote{responses: []adapter.CommandResult{{
+		Stdout: strings.Join([]string{
+			"cleanupPolicyStatus=enabled",
+			"cleanupPolicyBucket=aifar",
+			"cleanupPolicyPrefix=logs/",
+			"cleanupPolicyRetentionDays=60",
+			"cleanupPolicyRuleID=rule-60",
+			"cleanupPolicySource=mc-ilm",
+		}, "\n"),
+	}}}
+	service := NewService(s, remote)
+
+	result, err := service.ApplyCleanupPolicy(context.Background(), CleanupPolicyRequest{
+		Instance:       instance,
+		Server:         s.servers["srv-1"],
+		Bucket:         "aifar",
+		Prefix:         "logs/",
+		RetentionDays:  60,
+		Enabled:        true,
+		ExistingRuleID: "old-rule",
+	}, fakeLogger{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != "enabled" || result.Bucket != "aifar" || result.Prefix != "logs/" || result.RetentionDays != 60 || result.RuleID != "rule-60" {
+		t.Fatalf("unexpected cleanup policy result: %+v", result)
+	}
+	command := remote.joinedCommands()
+	if !strings.Contains(command, `BUCKET='aifar'`) || !strings.Contains(command, `PREFIX='logs/'`) || !strings.Contains(command, "RETENTION_DAYS=60") {
+		t.Fatalf("expected cleanup policy command to include bucket, prefix and retention: %s", command)
+	}
+	if !strings.Contains(command, `ilm rule rm --id "$PREVIOUS_RULE_ID"`) || !strings.Contains(command, `ilm rule add --prefix "$PREFIX" --expire-days "$RETENTION_DAYS" "$TARGET"`) {
+		t.Fatalf("expected cleanup policy command to replace old rule and add ILM expiration rule: %s", command)
 	}
 }

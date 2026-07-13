@@ -130,10 +130,12 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
-import { apiGet, asArray } from '../api/client'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { apiGet } from '../api/client'
+import { keepPreviousArrayOnLoadFailure } from '../api/resilientLoad'
 import MetricGrid from '../components/MetricGrid.vue'
 import StatusTag from '../components/StatusTag.vue'
+import { createDashboardRealtimeRefreshScheduler, shouldRefreshDashboardForRealtimeEvent } from '../dashboard/realtimeRefresh'
 import { useI18n } from '../i18n'
 import { permissions } from '../rbac'
 import { useAlertsStore, type AlertItem } from '../stores/alerts'
@@ -219,15 +221,15 @@ async function load() {
   now.value = new Date().toLocaleString()
   try {
     const [serverList, taskList, databaseList, storageList] = await Promise.all([
-      apiGet<any[] | null>('/servers').catch(() => []),
-      apiGet<any[] | null>('/tasks').catch(() => []),
-      apiGet<any[] | null>('/database/instances').catch(() => []),
-      apiGet<any[] | null>('/storage/instances').catch(() => [])
+      keepPreviousArrayOnLoadFailure(apiGet<any[] | null>('/servers'), servers.value),
+      keepPreviousArrayOnLoadFailure(apiGet<any[] | null>('/tasks'), tasks.value),
+      keepPreviousArrayOnLoadFailure(apiGet<any[] | null>('/database/instances'), databaseInstances.value),
+      keepPreviousArrayOnLoadFailure(apiGet<any[] | null>('/storage/instances'), storageInstances.value)
     ])
-    servers.value = asArray(serverList)
-    tasks.value = asArray(taskList)
-    databaseInstances.value = asArray(databaseList)
-    storageInstances.value = asArray(storageList)
+    servers.value = serverList
+    tasks.value = taskList
+    databaseInstances.value = databaseList
+    storageInstances.value = storageList
     await Promise.all([
       loadTelemetry(),
       canViewAlerts.value ? alerts.load().catch(() => undefined) : Promise.resolve()
@@ -247,6 +249,8 @@ async function loadTelemetry() {
   }))
   telemetryByServer.value = Object.fromEntries(entries)
 }
+
+const realtimeRefresh = createDashboardRealtimeRefreshScheduler(load)
 
 function dashboardServerStatus(status: unknown, telemetry: any) {
   if (hasValidSampleTime(telemetry?.sampledAt)) return 'available'
@@ -308,7 +312,22 @@ function alertScope(alert: AlertItem) {
   return alert.app || alert.scope || t('common.unknown')
 }
 
+watch(() => realtime.revision, () => {
+  if (shouldRefreshDashboardForRealtimeEvent(realtime.lastEvent)) {
+    realtimeRefresh.schedule()
+  }
+})
+
+watch(() => realtime.connectedAt, () => {
+  if (realtime.connected) {
+    realtimeRefresh.schedule()
+  }
+})
+
 onMounted(load)
+onBeforeUnmount(() => {
+  realtimeRefresh.dispose()
+})
 </script>
 
 <style scoped>

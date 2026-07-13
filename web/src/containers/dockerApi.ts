@@ -1,4 +1,5 @@
 import { apiGet, apiPost } from '../api/client'
+import { keepPreviousArrayOnLoadFailure, keepPreviousObjectOnLoadFailure } from '../api/resilientLoad'
 
 export type DockerSummaryResponse = {
   available?: boolean
@@ -13,11 +14,15 @@ export type ContainerPageSettings = {
   maxRequestBodyBytes?: number
 }
 
-export async function fetchContainerPageBootstrap<TAppInstance>() {
+export async function fetchContainerPageBootstrap<TAppInstance>(previous?: {
+  servers?: any[]
+  appInstances?: TAppInstance[]
+  settings?: ContainerPageSettings
+}) {
   const [servers, appInstances, settings] = await Promise.all([
-    apiGet<any[] | null>('/servers').catch(() => []),
-    apiGet<TAppInstance[] | null>('/apps/instances').catch(() => []),
-    apiGet<ContainerPageSettings>('/settings').catch(() => ({}))
+    keepPreviousArrayOnLoadFailure(apiGet<any[] | null>('/servers'), previous?.servers ?? []),
+    keepPreviousArrayOnLoadFailure(apiGet<TAppInstance[] | null>('/apps/instances'), previous?.appInstances ?? []),
+    keepPreviousObjectOnLoadFailure(apiGet<ContainerPageSettings>('/settings'), previous?.settings ?? {})
   ])
   return { servers, appInstances, settings }
 }

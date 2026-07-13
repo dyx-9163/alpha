@@ -24,7 +24,7 @@ func Describe(taskType string) Descriptor {
 	case strings.HasPrefix(normalized, "containers."):
 		return Descriptor{Category: "containers", Trackable: true}
 	case strings.HasPrefix(normalized, "servers."):
-		return Descriptor{Category: "servers", Trackable: normalized == "servers.probe"}
+		return Descriptor{Category: "servers"}
 	case strings.HasPrefix(normalized, "resources."), strings.HasPrefix(normalized, "resource."):
 		return Descriptor{Category: "resources", Trackable: true}
 	case strings.HasPrefix(normalized, "maintenance."):

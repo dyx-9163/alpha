@@ -60,12 +60,115 @@ func RunSSH(ctx context.Context, server store.Server, command string) (CommandRe
 	var stdout, stderr bytes.Buffer
 	session.Stdout = &stdout
 	session.Stderr = &stderr
-	err = session.Run(command)
+	err = runSSHCommandWithContext(ctx, func() {
+		_ = session.Signal(ssh.SIGKILL)
+		_ = session.Close()
+		_ = client.Close()
+	}, func() error {
+		return session.Run(command)
+	})
 	result := CommandResult{Stdout: stdout.String(), Stderr: stderr.String()}
 	if err != nil {
 		return result, err
 	}
 	return result, nil
+}
+
+const sshCancelDrainTimeout = 50 * time.Millisecond
+
+func runSSHCommandWithContext(ctx context.Context, cancelCommand func(), run func() error) error {
+	if err := ctx.Err(); err != nil {
+		if cancelCommand != nil {
+			cancelCommand()
+		}
+		return err
+	}
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- run()
+	}()
+	select {
+	case err := <-errCh:
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		return err
+	case <-ctx.Done():
+		if cancelCommand != nil {
+			cancelCommand()
+		}
+		select {
+		case <-errCh:
+		case <-time.After(sshCancelDrainTimeout):
+		}
+		return ctx.Err()
+	}
+}
+
+func runSSHUploadWithContext(ctx context.Context, cancelCommand func(), run func() error, copyInput func() error, stderr func() string) error {
+	if err := ctx.Err(); err != nil {
+		if cancelCommand != nil {
+			cancelCommand()
+		}
+		return err
+	}
+	runErrCh := make(chan error, 1)
+	copyErrCh := make(chan error, 1)
+	go func() {
+		runErrCh <- run()
+	}()
+	go func() {
+		copyErrCh <- copyInput()
+	}()
+
+	var runErr error
+	var copyErr error
+	runDone := false
+	copyDone := false
+	for !runDone || !copyDone {
+		select {
+		case err := <-runErrCh:
+			runErr = err
+			runDone = true
+		case err := <-copyErrCh:
+			copyErr = err
+			copyDone = true
+		case <-ctx.Done():
+			if cancelCommand != nil {
+				cancelCommand()
+			}
+			drainSSHUpload(runErrCh, copyErrCh, &runErr, &copyErr, &runDone, &copyDone)
+			return ctx.Err()
+		}
+		if (runDone && runErr != nil && !copyDone) || (copyDone && copyErr != nil && !runDone) {
+			if cancelCommand != nil {
+				cancelCommand()
+			}
+			drainSSHUpload(runErrCh, copyErrCh, &runErr, &copyErr, &runDone, &copyDone)
+			break
+		}
+	}
+	if copyErr != nil {
+		return uploadError(copyErr, stderr())
+	}
+	return uploadError(runErr, stderr())
+}
+
+func drainSSHUpload(runErrCh, copyErrCh <-chan error, runErr, copyErr *error, runDone, copyDone *bool) {
+	timer := time.NewTimer(sshCancelDrainTimeout)
+	defer timer.Stop()
+	for !*runDone || !*copyDone {
+		select {
+		case err := <-runErrCh:
+			*runErr = err
+			*runDone = true
+		case err := <-copyErrCh:
+			*copyErr = err
+			*copyDone = true
+		case <-timer.C:
+			return
+		}
+	}
 }
 
 func StreamSSHLines(ctx context.Context, server store.Server, command string, onLine func(string)) error {
@@ -155,20 +258,23 @@ func UploadSSHFile(ctx context.Context, server store.Server, localPath, remotePa
 		shellQuote(tmpPath),
 		shellQuote(remotePath),
 	)
-	errCh := make(chan error, 1)
-	go func() {
-		errCh <- session.Run(command)
-	}()
-	_, copyErr := io.Copy(stdin, file)
-	closeErr := stdin.Close()
-	runErr := <-errCh
-	if copyErr != nil {
-		return uploadError(copyErr, stderr.String())
-	}
-	if closeErr != nil {
-		return uploadError(closeErr, stderr.String())
-	}
-	return uploadError(runErr, stderr.String())
+	return runSSHUploadWithContext(ctx, func() {
+		_ = stdin.Close()
+		_ = session.Signal(ssh.SIGKILL)
+		_ = session.Close()
+		_ = client.Close()
+	}, func() error {
+		return session.Run(command)
+	}, func() error {
+		_, copyErr := io.Copy(stdin, file)
+		closeErr := stdin.Close()
+		if copyErr != nil {
+			return copyErr
+		}
+		return closeErr
+	}, func() string {
+		return stderr.String()
+	})
 }
 
 func dialSSH(ctx context.Context, server store.Server) (*ssh.Client, error) {

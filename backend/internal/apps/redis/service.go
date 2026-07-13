@@ -24,6 +24,11 @@ type Store interface {
 	DeleteAppInstance(id string) error
 }
 
+type credentialStore interface {
+	ListCredentialReferences(credentialID, resourceType, resourceID string) ([]store.CredentialReference, error)
+	GetCredential(id string, includeSecret bool) (store.Credential, error)
+}
+
 type InstallRequest struct {
 	Version         string
 	Topology        string
@@ -565,10 +570,14 @@ func (s Service) Check(ctx context.Context, req CheckRequest, log Logger, target
 		finishTarget(recorder, target, "failed", msg)
 		return CheckResult{Status: "failed", Message: msg, Details: details}, err
 	}
+	password, err := s.redisCheckPassword(req.Instance, req.DefaultPassword)
+	if err != nil {
+		return fail(err)
+	}
 
 	if err := step(1, "check-runtime", copyWithFallback(copy.CheckRuntime, "检查 Redis 运行状态"), func() error {
 		var runtimeErr error
-		runtimeStatus, runtimeErr = s.checkRedisRuntime(ctx, req.Server, req.Instance, req.DefaultPassword, logForServer)
+		runtimeStatus, runtimeErr = s.checkRedisRuntime(ctx, req.Server, req.Instance, password, logForServer)
 		runtimeStatus.applyDetails(details)
 		return runtimeErr
 	}); err != nil {
@@ -590,13 +599,13 @@ func (s Service) Check(ctx context.Context, req CheckRequest, log Logger, target
 		if err := step(nextStep, "detect-role", copyWithFallback(copy.DetectRole, "检测 Redis 当前角色"), func() error {
 			var detectErr error
 			if topology == "sentinel" && runtimeStatus.Sentinel.Checked && !redisStatusHealthy(runtimeStatus.Sentinel.Status) {
-				role, detectErr = s.detectRedisDataRole(ctx, req.Server, req.Instance, redisPassword(nil, req.DefaultPassword), logForServer)
+				role, detectErr = s.detectRedisDataRole(ctx, req.Server, req.Instance, password, logForServer)
 				if role == "" {
 					role = instanceRole(req.Instance)
 				}
 				return detectErr
 			}
-			role, sentinelTopology, detectErr = s.detectRedisRole(ctx, req.Server, req.Instance, req.DefaultPassword, logForServer)
+			role, sentinelTopology, detectErr = s.detectRedisRole(ctx, req.Server, req.Instance, password, logForServer)
 			return detectErr
 		}); err != nil {
 			return fail(err)
@@ -633,6 +642,32 @@ func (s Service) Check(ctx context.Context, req CheckRequest, log Logger, target
 	logForServer.Info("%s", msg)
 	finishTarget(recorder, target, "success", "")
 	return CheckResult{Status: status, Message: msg, Details: details}, nil
+}
+
+func (s Service) redisCheckPassword(instance store.AppInstance, fallback string) (string, error) {
+	credentials, ok := s.store.(credentialStore)
+	if !ok || strings.TrimSpace(instance.ID) == "" {
+		return redisPassword(nil, fallback), nil
+	}
+	references, err := credentials.ListCredentialReferences("", "app-instance", instance.ID)
+	if err != nil {
+		return "", fmt.Errorf("load Redis credential reference: %w", err)
+	}
+	for _, reference := range references {
+		if !strings.EqualFold(strings.TrimSpace(reference.Purpose), "redis") {
+			continue
+		}
+		credential, err := credentials.GetCredential(reference.CredentialID, true)
+		if err != nil {
+			return "", fmt.Errorf("load Redis instance credential: %w", err)
+		}
+		password := strings.TrimSpace(credential.Secret["password"])
+		if password == "" {
+			return "", errors.New("Redis instance credential does not contain a password")
+		}
+		return password, nil
+	}
+	return redisPassword(nil, fallback), nil
 }
 
 func instancePort(instance store.AppInstance) int {

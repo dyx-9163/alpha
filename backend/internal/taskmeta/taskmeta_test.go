@@ -15,7 +15,7 @@ func TestDescribeCategorizesAndMarksTrackableTasks(t *testing.T) {
 		{"aifar.scale.out", "apps", true},
 		{"database.mysql.cluster.start", "database", true},
 		{"containers.container.restart", "containers", true},
-		{"servers.probe", "servers", true},
+		{"servers.probe", "servers", false},
 		{"servers.telemetry", "servers", false},
 		{"maintenance.database.backup", "maintenance", true},
 		{"audit.delete", "audit", false},

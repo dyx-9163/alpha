@@ -195,6 +195,142 @@ func TestCheckAppInstanceStoresPlanBeforeTaskRuns(t *testing.T) {
 	}
 }
 
+func TestStorageCleanupEstimateUsesMinioModule(t *testing.T) {
+	api, db, secret := newAuthzTestAPI(t)
+	module := &fakePlannedLifecycleModule{name: "minio"}
+	api.apps = registry.New(module)
+	server, err := db.SaveServer(store.Server{Name: "minio-1", Host: "10.0.0.9", Username: "root"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	instance, err := db.SaveAppInstance(store.AppInstance{App: "minio", Version: "2025", ServerID: server.ID, Status: "installed", Topology: "standalone", Metadata: `{"apiPort":9000}`})
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := issueTestToken(t, db, secret, "owner", "owner")
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v2/storage/"+instance.ID+"/cleanup-estimate?retentionDays=14", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	rec := httptest.NewRecorder()
+
+	api.Router().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	var body registry.StorageCleanupEstimateResult
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if module.cleanupEstimateCalls != 1 || module.lastCleanupRetentionDays != 14 {
+		t.Fatalf("expected cleanup estimate module call with 14 days, calls=%d days=%d", module.cleanupEstimateCalls, module.lastCleanupRetentionDays)
+	}
+	if body.Status != "available" || body.RetentionDays != 14 || body.ObjectCount != 3 || body.Bytes != 2048 {
+		t.Fatalf("unexpected cleanup estimate response: %+v", body)
+	}
+}
+
+func TestStorageCleanupPolicyStartsTaskAndStoresPolicy(t *testing.T) {
+	api, db, secret := newAuthzTestAPI(t)
+	module := &fakePlannedLifecycleModule{name: "minio"}
+	api.apps = registry.New(module)
+	server, err := db.SaveServer(store.Server{Name: "minio-1", Host: "10.0.0.9", Username: "root"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	instance, err := db.SaveAppInstance(store.AppInstance{App: "minio", Version: "2025", ServerID: server.ID, Status: "installed", Topology: "standalone", Metadata: `{"apiPort":9000}`})
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := issueTestToken(t, db, secret, "owner", "owner")
+
+	body := `{"enabled":true,"bucket":"aifar","prefix":"logs/","retentionDays":60}`
+	req := httptest.NewRequest(http.MethodPost, "/api/v2/storage/"+instance.ID+"/cleanup-policy", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	api.Router().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	taskID := decodeTaskID(t, rec)
+	steps, err := db.ListTaskSteps(taskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(steps) != 2 || steps[0].Name != "apply-cleanup-policy" || steps[1].Name != "record-cleanup-policy" {
+		t.Fatalf("expected cleanup policy task plan, got %+v", steps)
+	}
+	waitForTaskStatus(t, db, taskID, "success")
+	if module.cleanupPolicyCalls != 1 || module.lastCleanupPolicyRetentionDays != 60 || module.lastCleanupPolicyBucket != "aifar" || module.lastCleanupPolicyPrefix != "logs/" {
+		t.Fatalf("expected cleanup policy module call, got calls=%d bucket=%s prefix=%s days=%d", module.cleanupPolicyCalls, module.lastCleanupPolicyBucket, module.lastCleanupPolicyPrefix, module.lastCleanupPolicyRetentionDays)
+	}
+	items, err := db.ListStorageItems(instance.ID, "cleanupPolicy")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 || items[0].Name != "aifar:logs/" || items[0].Policy != "enabled" {
+		t.Fatalf("expected stored cleanup policy item, got %+v", items)
+	}
+	current, err := db.GetAppInstance(instance.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(current.Metadata, `"cleanupPolicy"`) || !strings.Contains(current.Metadata, `"retentionDays":60`) || !strings.Contains(current.Metadata, `"ruleId":"rule-test"`) {
+		t.Fatalf("expected cleanup policy metadata to be recorded: %s", current.Metadata)
+	}
+}
+
+func TestStorageCleanupPolicyRejectsInvalidBucketAndPrefix(t *testing.T) {
+	api, db, secret := newAuthzTestAPI(t)
+	module := &fakePlannedLifecycleModule{name: "minio"}
+	api.apps = registry.New(module)
+	server, err := db.SaveServer(store.Server{Name: "minio-1", Host: "10.0.0.9", Username: "root"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	instance, err := db.SaveAppInstance(store.AppInstance{App: "minio", Version: "2025", ServerID: server.ID, Status: "installed", Topology: "standalone", Metadata: `{"apiPort":9000}`})
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := issueTestToken(t, db, secret, "owner", "owner")
+
+	tests := []struct {
+		name string
+		body string
+		code string
+	}{
+		{name: "bucket with whitespace", body: `{"enabled":true,"bucket":"aifar logs","retentionDays":60}`, code: "INVALID_STORAGE_CLEANUP_BUCKET"},
+		{name: "prefix with newline", body: "{\"enabled\":true,\"bucket\":\"aifar\",\"prefix\":\"logs\\n2026\",\"retentionDays\":60}", code: "INVALID_STORAGE_CLEANUP_PREFIX"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/api/v2/storage/"+instance.ID+"/cleanup-policy", strings.NewReader(tt.body))
+			req.Header.Set("Authorization", "Bearer "+token)
+			req.Header.Set("Content-Type", "application/json")
+			rec := httptest.NewRecorder()
+
+			api.Router().ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("expected 400, got %d body=%s", rec.Code, rec.Body.String())
+			}
+			var body map[string]any
+			if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+				t.Fatal(err)
+			}
+			if body["code"] != tt.code {
+				t.Fatalf("expected code %s, got %#v", tt.code, body)
+			}
+		})
+	}
+	if module.cleanupPolicyCalls != 0 {
+		t.Fatalf("invalid requests should not call cleanup policy module, got %d", module.cleanupPolicyCalls)
+	}
+}
+
 func TestInstallAppRejectsConcurrentMutationLock(t *testing.T) {
 	api, db, secret := newAuthzTestAPI(t)
 	module := &fakePlannedLifecycleModule{
@@ -452,13 +588,19 @@ func decodeTaskID(t *testing.T, rec *httptest.ResponseRecorder) string {
 }
 
 type fakePlannedLifecycleModule struct {
-	name              string
-	deleteCalls       int
-	checkCalls        int
-	installCalls      int
-	clusterStartCalls int
-	installStarted    chan struct{}
-	installRelease    chan struct{}
+	name                           string
+	deleteCalls                    int
+	checkCalls                     int
+	installCalls                   int
+	clusterStartCalls              int
+	cleanupEstimateCalls           int
+	lastCleanupRetentionDays       int
+	cleanupPolicyCalls             int
+	lastCleanupPolicyBucket        string
+	lastCleanupPolicyPrefix        string
+	lastCleanupPolicyRetentionDays int
+	installStarted                 chan struct{}
+	installRelease                 chan struct{}
 }
 
 func (m *fakePlannedLifecycleModule) Name() string { return m.name }
@@ -513,6 +655,33 @@ func (m *fakePlannedLifecycleModule) PlanCheck(ctx context.Context, req registry
 func (m *fakePlannedLifecycleModule) Check(ctx context.Context, req registry.CheckRequest, run registry.RunContext) (registry.InstanceStatus, error) {
 	m.checkCalls++
 	return registry.InstanceStatus{Status: "healthy"}, nil
+}
+
+func (m *fakePlannedLifecycleModule) EstimateStorageCleanup(ctx context.Context, req registry.StorageCleanupEstimateRequest, run registry.RunContext) (registry.StorageCleanupEstimateResult, error) {
+	m.cleanupEstimateCalls++
+	m.lastCleanupRetentionDays = req.RetentionDays
+	return registry.StorageCleanupEstimateResult{
+		Status:        "available",
+		RetentionDays: req.RetentionDays,
+		ObjectCount:   3,
+		Bytes:         2048,
+		Source:        "test",
+	}, nil
+}
+
+func (m *fakePlannedLifecycleModule) ApplyStorageCleanupPolicy(ctx context.Context, req registry.StorageCleanupPolicyRequest, run registry.RunContext) (registry.StorageCleanupPolicyResult, error) {
+	m.cleanupPolicyCalls++
+	m.lastCleanupPolicyBucket = req.Bucket
+	m.lastCleanupPolicyPrefix = req.Prefix
+	m.lastCleanupPolicyRetentionDays = req.RetentionDays
+	return registry.StorageCleanupPolicyResult{
+		Status:        "enabled",
+		Bucket:        req.Bucket,
+		Prefix:        req.Prefix,
+		RetentionDays: req.RetentionDays,
+		RuleID:        "rule-test",
+		Source:        "test",
+	}, nil
 }
 
 func (m *fakePlannedLifecycleModule) PlanClusterStart(ctx context.Context, req registry.ClusterStartRequest) ([]registry.InstallStepPlan, error) {

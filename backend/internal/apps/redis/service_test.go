@@ -16,9 +16,11 @@ import (
 )
 
 type fakeStore struct {
-	mu        sync.Mutex
-	servers   map[string]store.Server
-	instances []store.AppInstance
+	mu                   sync.Mutex
+	servers              map[string]store.Server
+	instances            []store.AppInstance
+	credentials          map[string]store.Credential
+	credentialReferences []store.CredentialReference
 }
 
 func (f *fakeStore) GetServer(id string, includeSecret bool) (store.Server, error) {
@@ -78,6 +80,38 @@ func (f *fakeStore) DeleteAppInstance(id string) error {
 	}
 	f.instances = next
 	return nil
+}
+
+func (f *fakeStore) ListCredentialReferences(credentialID, resourceType, resourceID string) ([]store.CredentialReference, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []store.CredentialReference
+	for _, reference := range f.credentialReferences {
+		if credentialID != "" && reference.CredentialID != credentialID {
+			continue
+		}
+		if resourceType != "" && reference.ResourceType != resourceType {
+			continue
+		}
+		if resourceID != "" && reference.ResourceID != resourceID {
+			continue
+		}
+		out = append(out, reference)
+	}
+	return out, nil
+}
+
+func (f *fakeStore) GetCredential(id string, includeSecret bool) (store.Credential, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	credential, ok := f.credentials[id]
+	if !ok {
+		return store.Credential{}, fmt.Errorf("credential %s not found", id)
+	}
+	if !includeSecret {
+		credential.Secret = nil
+	}
+	return credential, nil
 }
 
 type fakeRemote struct {
@@ -348,6 +382,57 @@ func TestRedisSentinelMasterNameDefaultsAndValidates(t *testing.T) {
 	}
 	if _, err := redisSentinelMasterName(map[string]any{"masterName": "bad name"}, "invalid"); err == nil {
 		t.Fatal("expected invalid sentinel master name to fail")
+	}
+}
+
+func TestServiceCheckUsesBoundRedisCredential(t *testing.T) {
+	instance := store.AppInstance{
+		ID:       "redis-1",
+		App:      "redis",
+		Version:  "7.2.14",
+		ServerID: "srv-1",
+		Status:   "installed",
+		Topology: "standalone",
+		Metadata: `{"port":6379,"role":"standalone"}`,
+	}
+	s := &fakeStore{
+		servers: map[string]store.Server{
+			"srv-1": {ID: "srv-1", Name: "redis-1", Host: "10.0.0.1", DeployDir: "/aifar/apps"},
+		},
+		instances: []store.AppInstance{instance},
+		credentials: map[string]store.Credential{
+			"cred-redis": {
+				ID:     "cred-redis",
+				Kind:   "redis",
+				Status: "active",
+				Secret: map[string]string{"password": "custom-redis-password"},
+			},
+		},
+		credentialReferences: []store.CredentialReference{
+			{
+				CredentialID: "cred-redis",
+				ResourceType: "app-instance",
+				ResourceID:   instance.ID,
+				Purpose:      "redis",
+			},
+		},
+	}
+	remote := &fakeRemote{}
+	service := NewService(s, remote)
+	if _, err := service.Check(context.Background(), CheckRequest{
+		Instance:        instance,
+		Server:          s.servers["srv-1"],
+		Language:        "en",
+		DefaultPassword: "panel-default-password",
+	}, fakeLogger{}, nil); err != nil {
+		t.Fatal(err)
+	}
+	commands := remote.joinedCommands()
+	if !strings.Contains(commands, "custom-redis-password") {
+		t.Fatalf("expected Redis check to use the instance credential: %s", commands)
+	}
+	if strings.Contains(commands, "panel-default-password") {
+		t.Fatalf("Redis check must not use the panel default password when an instance credential is bound: %s", commands)
 	}
 }
 

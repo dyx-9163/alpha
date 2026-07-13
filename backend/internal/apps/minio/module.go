@@ -209,3 +209,41 @@ func (m Module) Check(ctx context.Context, req registry.CheckRequest, run regist
 	})
 	return registry.InstanceStatus{Status: result.Status, Message: result.Message, Details: result.Details}, err
 }
+
+func (m Module) EstimateStorageCleanup(ctx context.Context, req registry.StorageCleanupEstimateRequest, run registry.RunContext) (registry.StorageCleanupEstimateResult, error) {
+	result, err := m.service.EstimateCleanup(ctx, CleanupEstimateRequest{
+		Instance:      req.Instance,
+		Server:        req.Server,
+		RetentionDays: req.RetentionDays,
+	}, run.Log)
+	return registry.StorageCleanupEstimateResult{
+		Status:        result.Status,
+		RetentionDays: result.RetentionDays,
+		ObjectCount:   result.ObjectCount,
+		Bytes:         result.Bytes,
+		Source:        result.Source,
+		Details:       result.Details,
+	}, err
+}
+
+func (m Module) ApplyStorageCleanupPolicy(ctx context.Context, req registry.StorageCleanupPolicyRequest, run registry.RunContext) (registry.StorageCleanupPolicyResult, error) {
+	result, err := m.service.ApplyCleanupPolicy(ctx, CleanupPolicyRequest{
+		Instance:       req.Instance,
+		Server:         req.Server,
+		Bucket:         req.Bucket,
+		Prefix:         req.Prefix,
+		RetentionDays:  req.RetentionDays,
+		Enabled:        req.Enabled,
+		ExistingRuleID: req.ExistingRuleID,
+	}, run.Log)
+	return registry.StorageCleanupPolicyResult{
+		Status:        result.Status,
+		Enabled:       result.Enabled,
+		Bucket:        result.Bucket,
+		Prefix:        result.Prefix,
+		RetentionDays: result.RetentionDays,
+		RuleID:        result.RuleID,
+		Source:        result.Source,
+		Details:       result.Details,
+	}, err
+}

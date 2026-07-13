@@ -58,6 +58,17 @@ describe('Docker API service', () => {
     await expect(fetchContainerPageBootstrap()).resolves.toEqual(expected)
   })
 
+  it('keeps previous bootstrap values when requests fail', async () => {
+    const previous = {
+      servers: [{ id: 'previous-server' }],
+      appInstances: [{ id: 'previous-instance' }],
+      settings: { maxRequestBodyBytes: 2048 }
+    }
+    apiGetMock.mockRejectedValue(new Error('unavailable'))
+
+    await expect(fetchContainerPageBootstrap(previous)).resolves.toEqual(previous)
+  })
+
   it('requests a base summary without disk usage', async () => {
     apiGetMock.mockResolvedValueOnce({ available: true })
 

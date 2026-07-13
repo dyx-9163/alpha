@@ -568,7 +568,11 @@ function serverLabel(server: any) {
 }
 
 async function loadServers() {
-  const { servers: serverRows, appInstances: instanceRows, settings } = await fetchContainerPageBootstrap<AppInstance>()
+  const { servers: serverRows, appInstances: instanceRows, settings } = await fetchContainerPageBootstrap<AppInstance>({
+    servers: servers.value,
+    appInstances: appInstances.value,
+    settings: appSettings.value
+  })
   servers.value = asArray(serverRows)
   appInstances.value = asArray(instanceRows)
   appSettings.value = settings

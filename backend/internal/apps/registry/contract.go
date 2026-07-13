@@ -149,6 +149,46 @@ type CheckRequest struct {
 	Actor    string
 }
 
+type StorageCleanupEstimateRequest struct {
+	Instance      store.AppInstance
+	Server        store.Server
+	Language      string
+	Actor         string
+	RetentionDays int
+}
+
+type StorageCleanupEstimateResult struct {
+	Status        string         `json:"status"`
+	RetentionDays int            `json:"retentionDays"`
+	ObjectCount   int64          `json:"objectCount"`
+	Bytes         int64          `json:"bytes"`
+	Source        string         `json:"source"`
+	Details       map[string]any `json:"details,omitempty"`
+}
+
+type StorageCleanupPolicyRequest struct {
+	Instance       store.AppInstance
+	Server         store.Server
+	Language       string
+	Actor          string
+	Enabled        bool
+	Bucket         string
+	Prefix         string
+	RetentionDays  int
+	ExistingRuleID string
+}
+
+type StorageCleanupPolicyResult struct {
+	Status        string         `json:"status"`
+	Enabled       bool           `json:"enabled"`
+	Bucket        string         `json:"bucket"`
+	Prefix        string         `json:"prefix,omitempty"`
+	RetentionDays int            `json:"retentionDays"`
+	RuleID        string         `json:"ruleId,omitempty"`
+	Source        string         `json:"source"`
+	Details       map[string]any `json:"details,omitempty"`
+}
+
 type ArtifactUpdateRequest struct {
 	Instance          store.AppInstance
 	Server            store.Server
@@ -306,6 +346,14 @@ type DeleteModule interface {
 type CheckModule interface {
 	PlanCheck(ctx context.Context, req CheckRequest) ([]InstallStepPlan, error)
 	Check(ctx context.Context, req CheckRequest, run RunContext) (InstanceStatus, error)
+}
+
+type StorageCleanupEstimateModule interface {
+	EstimateStorageCleanup(ctx context.Context, req StorageCleanupEstimateRequest, run RunContext) (StorageCleanupEstimateResult, error)
+}
+
+type StorageCleanupPolicyModule interface {
+	ApplyStorageCleanupPolicy(ctx context.Context, req StorageCleanupPolicyRequest, run RunContext) (StorageCleanupPolicyResult, error)
 }
 
 type ArtifactUpdateModule interface {
