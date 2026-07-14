@@ -36,8 +36,7 @@ import {
   runtimeNacosStatus
 } from './format'
 import {
-  aifarServiceNames,
-  aifarServiceOptions,
+  buildAifarServiceOptions,
   buildRuntimeLogPodOptions,
   buildRuntimeServiceMap,
   filterRuntimeDeploymentsByInstance,
@@ -396,11 +395,15 @@ describe('runtime selectors', () => {
     { instanceId: 'instance-2', status: 'failed' }
   ]
 
-  it('exports the frozen service selection order and matching options', () => {
-    expect(aifarServiceNames).toEqual([
-      'oauth', 'permission', 'system', 'file', 'message', 'im', 'contacts', 'meeting', 'gateway', 'web-vue3'
+  it('builds service options from backend-discovered modules and runtime fallbacks', () => {
+    expect(buildAifarServiceOptions(
+      [{ name: 'gateway', displayName: 'Gateway (required)' }, { name: 'custom' }],
+      ['gateway', 'runtime-only']
+    )).toEqual([
+      { value: 'gateway', label: 'Gateway (required)' },
+      { value: 'custom', label: 'custom' },
+      { value: 'runtime-only', label: 'runtime-only' }
     ])
-    expect(aifarServiceOptions).toEqual(aifarServiceNames.map((name) => ({ value: name, label: name })))
   })
 
   it('selects an instance by id and otherwise falls back to the first item', () => {

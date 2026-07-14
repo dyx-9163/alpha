@@ -130,3 +130,21 @@
 - 结论：已将 `servers.probe` 的任务元数据改为 `trackable=false`；探测仍正常执行并保留任务中心、步骤、日志和实时状态更新，只是不再进入右上角浮动任务列表。
 - 问题：用户询问 AIFAR Runtime v2 的“安装模块”是否写死，并建议按 `resources/aifar/runtime-v2/services` 安装目录定义，以便加入新模块。
 - 结论：当前模块集合确实在资源 manifest、Go `serviceOrder`/校验、Vue 安装字段与 Runtime selectors、多个 shell 模板中重复固定；仅新增 services 子目录不会自动出现在页面，也会被后端拒绝。建议收敛为“services 目录自动发现 + 每个模块目录的描述文件”作为唯一来源，描述端口、类型、应用名、健康检查、必选性和顺序，后端扫描校验后通过 API 下发，前端不再维护固定列表；gateway/web-vue3 的入口角色仍应显式声明而非仅靠目录名推断。
+- 问题：用户要求执行 AIFAR Runtime v2 安装模块目录驱动改造。
+- 结论：已新增 `aifar-runtime-service-v1` 的 `services/<module>/service.json` 模型和目录扫描校验，模块名、端口、role 唯一性、Dockerfile、类型、制品扩展名、健康检查、顺序和 affinity 均由描述文件定义；新增 `/api/v2/apps/{app}/install-modules`，应用安装弹窗与 Runtime 页面改为后端模块清单驱动。初始安装把 service catalog 写入实例 metadata；为已安装实例追加模块时，会从当前资源目录打包所选模块、上传并解压后再执行安装；升级、回滚、伸缩、reconcile 脚本优先从服务 env 读取动态端口、应用名与 affinity。`.gitignore` 仅放行 service.json 和说明文件，不纳入大体积离线资源。AIFAR/HTTP Go 测试、159 项前端测试、40 项脚本测试、前后端构建通过；全量 Go 测试仅现有 collector 100ms 计时断言在本机以约 110ms 失败，与本改动无关。
+- 问题：用户反馈 AIFAR 只安装所选部分服务且实际运行正常，但应用商店“已安装”记录显示失败。
+- 结论：根因是状态源分裂且 AIFAR 通用探测固定扫描全部默认服务；在 5 秒 Collector 超时下，部分安装仍执行多余 Docker 查询并可能被标记 unavailable。已按 TDD 改为从实例 metadata 读取实际 `services`/`desiredReplicas`，只检查正副本服务，0 副本和未选择服务不参与判断，并记录 expected/missing 容器数；新增 helper、命令生成和 Service.Check 接线回归，且通过临时撤掉接线验证测试确实会失败。用户修复目录驱动排序问题后，`go test ./internal/apps/aifar -count=1`、`pnpm test`、`pnpm backend:build`、`git diff --check` 全部通过。
+- 问题：目录驱动改造后，AIFAR 安装弹窗的安装模块下拉框显示“无数据”。
+- 结论：新增的 `contacts-2/service.json` 复制了 `contacts` 的 38032 端口，目录扫描因端口冲突返回 422，而 Apps 页把接口错误静默转为空数组。已将 `contacts-2` 调整为唯一端口 38034、顺序 75；Apps 页加载模块失败时保留上次成功数据并显示后端具体错误，不再伪装成“无数据”。11 个目录校验、AIFAR/HTTP Go 测试、159 项前端测试和前后端构建通过。
+- 问题：用户要求取消 AIFAR 模块描述中的排序序号，直接按照服务目录名排序，避免复制模块时维护顺序字段。
+- 结论：已从 `serviceDefinition`、安装模块 API、前端类型、实例 service catalog metadata 和全部 `service.json` 中移除 `order`；目录扫描和旧 metadata 读取均统一按模块目录名升序，README 与安装/追加模块测试同步更新。当前顺序为 contacts、contacts-2、file、gateway、im、meeting、message、oauth、permission、system、web-vue3；AIFAR/HTTP Go 测试、159 项前端测试及前后端构建通过。
+- 问题：AIFAR 历史安装只选了 5 个服务，应用商店“已安装”仍显示失败。
+- 结论：现场数据表明历史 metadata 的 `services` 为 5 个，但旧 `desiredReplicas` 残留全部 10 个，状态检查仍得出 expected=10/missing=5；同时 `app.instance` 每 15 秒因 5 秒采集超时写入 `unavailable`，前端又将其等同安装失败。已改为只要 `services` 存在便严格作为期望白名单，并让安装历史仅以 `failed`、`install_failed` 或 `installFailed` 判断安装失败，`error/unavailable` 不再改判安装结果。回归、完整 Go 测试、161 项前端测试及前后端构建通过；运行进程需重启后生效。
+- 问题：应用商店显示 AIFAR 已安装，但部署记录显示服务不可用，仪表盘同时产生 unavailable/degraded 提醒。
+- 结论：实例健康检查已经得到 running、5/5 健康，但随后同步执行可选的 autoscale 指标采集；该脚本逐容器调用 `docker stats --no-stream`，5 个容器约占满 Collector 的 5 秒期限，造成同一时刻实例写 running 而快照写 unavailable 的竞态。已将 registry 的 `Actor=collector` 透传到 AIFAR Service，Collector 健康检查跳过 autoscale 指标采集；手动检测和 Autoscaler 自身采集保持不变。新增回归测试先复现第二条 SSH 命令再修复，完整 Go 测试和后端构建通过；需重启服务后观察新快照恢复 running。
+- 问题：仪表盘同时出现一条 AIFAR Runtime unavailable 严重提醒和三条 degraded 警告，用户询问原因。
+- 结论：当前 AIFAR 实例 `app_555b...` 的 app.instance 与 aifar.runtime 快照均为 running；截图中的 4 条提醒分别来自 4 个已经不在 `app_instances` 中的旧实例，但其 `aifar.runtime` 快照仍残留。Alert Manager 无条件扫描全部 status_snapshots，导致这些提醒每次先被 ResolveMissingSystemAlerts 恢复，下一轮又被孤儿快照重新打开。no-endpoints 被映射为 critical/unavailable，degraded 被映射为 warning，因此页面同时显示严重和警告；应在实例删除时清理关联快照，并在提醒评估时忽略不存在实例的 aifar.runtime 快照。
+- 问题：用户要求删除 AIFAR 实例时清理状态快照、提醒评估忽略孤儿 runtime 快照，并自动恢复历史孤儿提醒。
+- 结论：`DeleteAppInstance` 事务现在同步删除该实例的 `app.instance`/`aifar.runtime` 当前快照及历史；Alert Manager 评估 runtime 快照前建立现存 app instance ID 集合，孤儿快照不进入 active fingerprint，已有提醒会由 `ResolveMissingSystemAlerts` 自动恢复。两条回归测试均先复现失败再修复；完整 Go 测试和后端构建通过。完整测试首轮仅既有 Collector 计时断言偶发 139.7ms 失败，单测复跑及完整门禁复跑均通过。运行进程早于新二进制，需重启后现场提醒才会在下一采集周期恢复。
+- 问题：用户询问 Pods 页签“启动/恢复 Pods”按钮的作用。
+- 结论：该按钮与上方“同步运行时”当前调用同一个 `/containers/aifar/runtime/reconcile` API 并创建 `aifar.reconcile` 任务；后端把实例保存的 runtime spec 交给 `aifar-agent reconcile-runtime`。Agent 按 Deployment 期望副本确保容器存在且健康：启动已停止容器、创建缺失副本、重启不健康容器、替换 spec 漂移容器、删除超额副本并刷新 Service/Endpoint/Nacos 代理状态；期望副本为 0 的已下线服务不会被拉起。该操作不重新安装 AIFAR，也不恢复数据备份，且要求 agent、runtime spec 和 env 目录仍存在。

@@ -30,11 +30,25 @@ export interface CredentialOption {
   purpose?: string
 }
 
+export interface AppInstallModuleOption {
+  name: string
+  displayName: string
+  kind: 'java' | 'web' | string
+  applicationName?: string
+  port: number
+  required: boolean
+  role?: string
+  artifactExtensions?: string[]
+  healthPath?: string
+  affinityPolicy?: string
+}
+
 export interface AppInstallDialogContext {
   servers: ServerOption[]
   instances: AppInstanceOption[]
   credentials?: CredentialOption[]
   defaultDeployDir?: string
+  installModules?: Record<string, AppInstallModuleOption[]>
 }
 
 export interface AppInstallPayload {

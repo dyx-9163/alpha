@@ -6,6 +6,13 @@ WORK_DIR={{ quote .WorkDir }}
 ARCHIVE={{ quote .ArchiveRemote }}
 AGENT_BINARY={{ quote .AgentBinaryRemote }}
 SERVICE_ORDER={{ quote .ServiceOrder }}
+SERVICE_APPLICATIONS={{ quote .ServiceApplications }}
+SERVICE_PORTS={{ quote .ServicePorts }}
+SERVICE_KINDS={{ quote .ServiceKinds }}
+SERVICE_HEALTH_PATHS={{ quote .ServiceHealthPaths }}
+SERVICE_AFFINITIES={{ quote .ServiceAffinities }}
+GATEWAY_SERVICE={{ quote .GatewayService }}
+WEB_SERVICE={{ quote .WebService }}
 VERSION={{ quote .Version }}
 REVISION={{ quote .ReleaseID }}
 CREATED_AT={{ quote .CreatedAt }}
@@ -92,45 +99,29 @@ pod_name() {
   printf "aifar-pod-admin-%s-%s-r%s" "$1" "$2" "$3" | tr '. _/' '----'
 }
 
-alpha_service_pairs() {
-  cat <<'EOF'
-gateway alpha-gateway
-oauth alpha-oauth
-permission alpha-permission
-system alpha-system
-file alpha-file
-message alpha-message
-im alpha-im
-contacts alpha-contacts
-meeting alpha-meeting
-EOF
+catalog_value() {
+  pairs="$1"
+  wanted="$2"
+  for pair in $pairs; do
+    case "$pair" in "$wanted="*) printf "%s" "${pair#*=}"; return 0 ;; esac
+  done
+  return 1
 }
 
 alpha_service_name() {
-  service="$1"
-  alpha_service_pairs | awk -v s="$service" '$1==s {print $2; exit}'
+  catalog_value "$SERVICE_APPLICATIONS" "$1" || true
 }
 
-service_port_var() {
-  case "$1" in
-    gateway) printf "GATEWAY_PORT" ;;
-    oauth) printf "OAUTH_PORT" ;;
-    permission) printf "PERMISSION_PORT" ;;
-    system) printf "SYSTEM_PORT" ;;
-    file) printf "FILE_PORT" ;;
-    message) printf "MESSAGE_PORT" ;;
-    im) printf "IM_PORT" ;;
-    contacts) printf "CONTACTS_PORT" ;;
-    meeting) printf "MEETING_PORT" ;;
-    web-vue3) printf "WEB_VUE3_PORT" ;;
-    *) printf "" ;;
-  esac
+service_kind() {
+  catalog_value "$SERVICE_KINDS" "$1" || printf "java"
 }
 
 service_port() {
-  port_var="$(service_port_var "$1")"
-  [ -n "$port_var" ] || { printf "0"; return; }
-  read_env_value "$ENV_DIR/compose.env" "$port_var" "0"
+  service="$1"
+  value="$(read_env_value "$ENV_DIR/$service.env" AIFAR_SERVICE_PORT "")"
+  [ -n "$value" ] || value="$(read_env_value "$ENV_DIR/$service.env" SERVER_PORT "")"
+  [ -n "$value" ] || value="$(catalog_value "$SERVICE_PORTS" "$service" || true)"
+  printf "%s" "${value:-0}"
 }
 
 {{ serviceAccessHelpers }}
@@ -401,7 +392,7 @@ write_runtime_resource_files() {
     set_env APP_CPUS "$APP_CPUS" "$resource_file"
     set_env APP_MEMORY_LIMIT "$APP_MEMORY_LIMIT" "$resource_file"
     chmod 0644 "$resource_file"
-    [ "$service" = "web-vue3" ] || write_jvm_options "$ENV_DIR/java-jvm.$service.options" "$JVM_INITIAL_RAM_PERCENTAGE" "$JVM_MAX_RAM_PERCENTAGE"
+    [ "$(service_kind "$service")" = "web" ] || write_jvm_options "$ENV_DIR/java-jvm.$service.options" "$JVM_INITIAL_RAM_PERCENTAGE" "$JVM_MAX_RAM_PERCENTAGE"
   done
 }
 
@@ -434,7 +425,7 @@ EOF
 }
 
 configure_web_nginx_runtime_routes() {
-  nginx_conf="$APP_DIR/web-vue3/nginx/default.conf"
+  nginx_conf="$APP_DIR/$WEB_SERVICE/nginx/default.conf"
   [ -f "$nginx_conf" ] || return 0
   upstream="host.docker.internal:${GATEWAY_PORT}"
   tmp="$nginx_conf.tmp"
@@ -452,14 +443,17 @@ write_service_envs() {
     set_env APP_CONTAINER_NAME "$(pod_name "$service" "$REVISION" 1)" "$service_env"
     set_env AIFAR_SERVICE_PROXY "aifar-agent" "$service_env"
     set_env AIFAR_REVISION "$REVISION" "$service_env"
+    set_env AIFAR_SERVICE_KIND "$(service_kind "$service")" "$service_env"
+    set_env AIFAR_AFFINITY_POLICY "$(catalog_value "$SERVICE_AFFINITIES" "$service" || printf round-robin)" "$service_env"
+    set_env HEALTH_PATH "$(catalog_value "$SERVICE_HEALTH_PATHS" "$service" || true)" "$service_env"
     app_name="$(alpha_service_name "$service")"
     if [ -n "$app_name" ]; then
       set_env SPRING_APPLICATION_NAME "$app_name" "$service_env"
     fi
-    port_var="$(service_port_var "$service")"
-    if [ "$service" != "web-vue3" ] && [ -n "$port_var" ]; then
-      port_value="$(read_env_value "$ENV_DIR/compose.env" "$port_var" "")"
-      [ -n "$port_value" ] && set_env SERVER_PORT "$port_value" "$service_env"
+    port_value="$(catalog_value "$SERVICE_PORTS" "$service" || true)"
+    [ -n "$port_value" ] && set_env AIFAR_SERVICE_PORT "$port_value" "$service_env"
+    if [ "$(service_kind "$service")" != "web" ] && [ -n "$port_value" ]; then
+      set_env SERVER_PORT "$port_value" "$service_env"
     fi
     chmod 0644 "$service_env"
   done
@@ -480,11 +474,13 @@ health_cmd_for_service() {
   protocol="$(read_env_value "$ENV_DIR/compose.env" APP_HEALTH_PROTOCOL http)"
   host="$(read_env_value "$ENV_DIR/compose.env" APP_HEALTH_HOST 127.0.0.1)"
   timeout="$(read_env_value "$ENV_DIR/compose.env" APP_HEALTH_CONNECT_TIMEOUT 3)"
-  if [ "$service" = "web-vue3" ]; then
-    path="$(read_env_value "$ENV_DIR/compose.env" APP_WEB_HEALTH_PATH "/")"
+  if [ "$(service_kind "$service")" = "web" ]; then
+    path="$(catalog_value "$SERVICE_HEALTH_PATHS" "$service" || true)"
+    [ -n "$path" ] || path="$(read_env_value "$ENV_DIR/compose.env" APP_WEB_HEALTH_PATH "/")"
     printf "wget -q -T %s -O /dev/null %s://%s:%s%s || exit 1" "$timeout" "$protocol" "$host" "$port" "$path"
   else
     path="$(read_env_value "$ENV_DIR/$service.env" HEALTH_PATH "")"
+    [ -n "$path" ] || path="$(catalog_value "$SERVICE_HEALTH_PATHS" "$service" || true)"
     [ -n "$path" ] || path="$(read_env_value "$ENV_DIR/compose.env" APP_BACKEND_HEALTH_PATH "/actuator/health/readiness")"
     [ -n "$path" ] || path="/actuator/health/readiness"
     printf "curl -fsS --connect-timeout %s %s://%s:%s%s >/dev/null || exit 1" "$timeout" "$protocol" "$host" "$port" "$path"
@@ -526,7 +522,7 @@ JSON
     printf '      "podRevision": "%s",\n' "$(json_escape "$REVISION")" >> "$spec"
     printf '      "replicas": 1,\n' >> "$spec"
     printf '      "ports": [{"name":"http","containerPort":%s}],\n' "$port" >> "$spec"
-    if [ "$service" = "web-vue3" ]; then
+    if [ "$(service_kind "$service")" = "web" ]; then
       printf '      "envFiles": ["%s"],\n' "$(json_escape "$service_env")" >> "$spec"
       printf '      "volumes": [{"source":"%s","target":"/opt/aifar/logs","readOnly":false},{"source":"%s","target":"/var/log/nginx","readOnly":false}],\n' "$(json_escape "$log_dir")" "$(json_escape "$log_dir")" >> "$spec"
       printf '      "environment": {"APP_CONTAINER_NAME":"${containerName}","AIFAR_LOG_DIR":"/opt/aifar/logs","LOG_DIR":"/opt/aifar/logs","TZ":"%s"},\n' "$(json_escape "$TIMEZONE")" >> "$spec"
@@ -560,19 +556,16 @@ JSON
     else
       printf ",\n" >> "$spec"
     fi
-    affinity=""
-    case "$service" in
-      gateway|file) affinity="stable" ;;
-      *) affinity="round-robin" ;;
-    esac
+    affinity="$(catalog_value "$SERVICE_AFFINITIES" "$service" || true)"
+    [ -n "$affinity" ] || affinity="round-robin"
     printf '    {"name":"%s","appName":"%s","listenPort":%s,"targetPort":%s,"affinityPolicy":"%s"}' "$service" "$app_name" "$port" "$port" "$affinity" >> "$spec"
   done
   cat >> "$spec" <<JSON
   ],
   "ingress": {
     "mode": "web-nginx",
-    "gatewayService": "gateway",
-    "webService": "web-vue3",
+    "gatewayService": "${GATEWAY_SERVICE}",
+    "webService": "${WEB_SERVICE}",
     "gatewayPort": ${GATEWAY_PORT},
     "webPort": ${WEB_VUE3_PORT}
   },

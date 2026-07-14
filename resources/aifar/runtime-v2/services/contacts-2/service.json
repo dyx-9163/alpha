@@ -1,0 +1,1 @@
+{"schema":"aifar-runtime-service-v1","name":"contacts-2","displayName":{"zh":"通讯录 contacts-2","en":"Contacts-2"},"kind":"java","applicationName":"alpha-contacts-2","port":38034,"required":false,"artifactExtensions":[".jar"],"healthPath":"/actuator/health/readiness","affinityPolicy":"round-robin"}

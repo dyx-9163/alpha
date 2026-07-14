@@ -42,6 +42,7 @@ type RuntimeConfigState struct {
 	LastAppliedAt   string                         `json:"lastAppliedAt,omitempty"`
 	LastApplyStatus string                         `json:"lastApplyStatus,omitempty"`
 	LastApplyError  string                         `json:"lastApplyError,omitempty"`
+	AllowedServices []string                       `json:"-"`
 }
 
 type RuntimeConfigRequest struct {
@@ -91,6 +92,7 @@ func runtimeConfigFromOptions(options InstallOptions, actor string, now time.Tim
 		AppliedVersion:  1,
 		LastAppliedAt:   now.Format(time.RFC3339),
 		LastApplyStatus: runtimeConfigStatusApplied,
+		AllowedServices: append([]string(nil), options.SelectedServices...),
 	}
 	return state
 }
@@ -106,9 +108,10 @@ func defaultRuntimeConfigValues() RuntimeConfigValues {
 
 func runtimeConfigFromMetadata(metadata map[string]any) RuntimeConfigState {
 	state := RuntimeConfigState{
-		Global:         defaultRuntimeConfigValues(),
-		Services:       map[string]RuntimeConfigValues{},
-		NacosEphemeral: true,
+		Global:          defaultRuntimeConfigValues(),
+		Services:        map[string]RuntimeConfigValues{},
+		NacosEphemeral:  true,
+		AllowedServices: servicesFromMetadata(metadata),
 	}
 	if raw, ok := metadata["runtimeConfig"]; ok {
 		hasNacosEphemeral := false
@@ -155,9 +158,18 @@ func normalizeRuntimeConfigPayload(payload RuntimeConfigPayload, base RuntimeCon
 		return RuntimeConfigState{}, err
 	}
 	services := map[string]RuntimeConfigValues{}
+	allowed := map[string]bool{}
+	for _, service := range base.AllowedServices {
+		allowed[service] = true
+	}
+	if len(allowed) == 0 {
+		for _, service := range serviceOrder {
+			allowed[service] = true
+		}
+	}
 	for name, values := range payload.Services {
 		service := cleanAIFARServiceName(name)
-		if !aifarServiceSupported(service) {
+		if !allowed[service] {
 			return RuntimeConfigState{}, fmt.Errorf("unsupported AIFAR service: %s", name)
 		}
 		values = normalizeRuntimeConfigValues(values, global)

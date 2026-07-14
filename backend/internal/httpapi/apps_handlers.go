@@ -26,6 +26,31 @@ func (a *API) appsCatalog(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, appcatalog.BuildWithModules(resources, a.apps.Modules(), languageFromRequest(r)))
 }
 
+func (a *API) appInstallModules(w http.ResponseWriter, r *http.Request) {
+	name := strings.ToLower(strings.TrimSpace(chi.URLParam(r, "app")))
+	module, ok := a.apps.Get(name)
+	if !ok {
+		writeError(w, http.StatusNotFound, "APP_BACKEND_MODULE_MISSING", i18n.Text(languageFromRequest(r), "api.appBackendMissing"), map[string]any{"app": name})
+		return
+	}
+	provider, ok := module.(registry.InstallModuleProvider)
+	if !ok {
+		writeJSON(w, http.StatusOK, []registry.InstallModuleDefinition{})
+		return
+	}
+	resources, err := a.store.ListResources()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "RESOURCE_LIST_FAILED", err.Error(), nil)
+		return
+	}
+	modules, err := provider.InstallModules(resources, r.URL.Query().Get("version"), languageFromRequest(r))
+	if err != nil {
+		writeError(w, http.StatusUnprocessableEntity, "INSTALL_MODULE_DISCOVERY_FAILED", err.Error(), nil)
+		return
+	}
+	writeJSON(w, http.StatusOK, modules)
+}
+
 func (a *API) appInstances(w http.ResponseWriter, r *http.Request) {
 	out, err := a.store.ListAppInstances()
 	respond(w, out, err)

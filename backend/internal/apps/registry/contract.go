@@ -58,6 +58,28 @@ type Manifest struct {
 	Topologies             []Topology
 }
 
+// InstallModuleDefinition describes one installable module discovered from an
+// application's offline resource bundle. The frontend consumes this contract
+// instead of maintaining a second hard-coded module list.
+type InstallModuleDefinition struct {
+	Name               string   `json:"name"`
+	DisplayName        string   `json:"displayName"`
+	Kind               string   `json:"kind"`
+	ApplicationName    string   `json:"applicationName,omitempty"`
+	Port               int      `json:"port"`
+	Required           bool     `json:"required"`
+	Role               string   `json:"role,omitempty"`
+	ArtifactExtensions []string `json:"artifactExtensions,omitempty"`
+	HealthPath         string   `json:"healthPath,omitempty"`
+	AffinityPolicy     string   `json:"affinityPolicy,omitempty"`
+}
+
+// InstallModuleProvider is optional. Modules implement it when their offline
+// bundle defines install choices dynamically.
+type InstallModuleProvider interface {
+	InstallModules(resources []store.Resource, version, language string) ([]InstallModuleDefinition, error)
+}
+
 func (m Manifest) SelectedTopology(name string) (Topology, bool) {
 	name = strings.TrimSpace(strings.ToLower(name))
 	if len(m.Topologies) == 0 {

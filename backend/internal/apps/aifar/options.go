@@ -282,20 +282,8 @@ func VerifyBundle(bundle Bundle) error {
 			return fmt.Errorf("AIFAR offline Docker image %s is required: %w", image, err)
 		}
 	}
-	requiredServices := manifest.Services
-	if len(requiredServices) == 0 {
-		requiredServices = serviceOrder
-	}
-	for _, service := range requiredServices {
-		service = cleanAIFARServiceName(service)
-		if !aifarServiceSupported(service) {
-			return fmt.Errorf("AIFAR service %s is not supported by runtime-v2", service)
-		}
-		if _, err := os.Stat(filepath.Join(bundle.AppDir, service, "Dockerfile")); err != nil {
-			return fmt.Errorf("AIFAR service %s Dockerfile is required: %w", service, err)
-		}
-	}
-	return nil
+	_, err = discoverBundleServices(bundle)
+	return err
 }
 
 func readRuntimeBundleManifest(pathValue string) (runtimeBundleManifest, error) {
@@ -377,6 +365,86 @@ func CreateBundleArchive(bundle Bundle) (string, error) {
 		}
 		return closeErr
 	}); err != nil {
+		_ = os.Remove(path)
+		return "", err
+	}
+	return path, nil
+}
+
+func CreateServiceModuleArchive(bundle Bundle, services []string) (string, error) {
+	selected := map[string]bool{}
+	for _, service := range services {
+		selected[cleanAIFARServiceName(service)] = true
+	}
+	file, err := os.CreateTemp("", "aifar-service-modules-*.tar.gz")
+	if err != nil {
+		return "", err
+	}
+	path := file.Name()
+	gz := gzip.NewWriter(file)
+	tw := tar.NewWriter(gz)
+	fail := func(err error) (string, error) {
+		_ = tw.Close()
+		_ = gz.Close()
+		_ = file.Close()
+		_ = os.Remove(path)
+		return "", err
+	}
+	for service := range selected {
+		root := filepath.Join(bundle.AppDir, service)
+		if err := filepath.WalkDir(root, func(pathValue string, entry fs.DirEntry, walkErr error) error {
+			if walkErr != nil {
+				return walkErr
+			}
+			rel, err := filepath.Rel(bundle.AppDir, pathValue)
+			if err != nil {
+				return err
+			}
+			info, err := entry.Info()
+			if err != nil {
+				return err
+			}
+			var link string
+			if info.Mode()&os.ModeSymlink != 0 {
+				link, _ = os.Readlink(pathValue)
+			}
+			header, err := tar.FileInfoHeader(info, link)
+			if err != nil {
+				return err
+			}
+			header.Name = filepath.ToSlash(rel)
+			if entry.IsDir() {
+				header.Name += "/"
+			}
+			if err := tw.WriteHeader(header); err != nil {
+				return err
+			}
+			if entry.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+				return nil
+			}
+			source, err := os.Open(pathValue)
+			if err != nil {
+				return err
+			}
+			_, copyErr := io.Copy(tw, source)
+			closeErr := source.Close()
+			if copyErr != nil {
+				return copyErr
+			}
+			return closeErr
+		}); err != nil {
+			return fail(err)
+		}
+	}
+	if err := tw.Close(); err != nil {
+		return fail(err)
+	}
+	if err := gz.Close(); err != nil {
+		_ = file.Close()
+		_ = os.Remove(path)
+		return "", err
+	}
+	if err := file.Close(); err != nil {
 		_ = os.Remove(path)
 		return "", err
 	}

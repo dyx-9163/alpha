@@ -1,0 +1,1 @@
+{"schema":"aifar-runtime-service-v1","name":"oauth","displayName":{"zh":"认证 oauth","en":"Auth oauth"},"kind":"java","applicationName":"alpha-oauth","port":38001,"required":false,"artifactExtensions":[".jar"],"healthPath":"/actuator/health/readiness","affinityPolicy":"round-robin"}

@@ -76,6 +76,12 @@ func (s *Store) DeleteAppInstance(id string) error {
 	if _, err := tx.Exec(`update credentials set app_instance_id='' where app_instance_id=?`, id); err != nil {
 		return err
 	}
+	if _, err := tx.Exec(`delete from status_snapshot_history where resource_id=? and scope in ('app.instance','aifar.runtime')`, id); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`delete from status_snapshots where resource_id=? and scope in ('app.instance','aifar.runtime')`, id); err != nil {
+		return err
+	}
 	res, err := tx.Exec(`delete from app_instances where id=?`, id)
 	if err != nil {
 		return err

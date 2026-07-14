@@ -103,6 +103,7 @@ func NewWithRealtime(cfg config.Config, s *store.Store, tasks *worker.Manager, e
 			r.Get("/audit", api.listAudit)
 			r.Delete("/audit", api.requirePermission(rbac.AuditManage, api.deleteAudit))
 			r.Get("/apps/catalog", api.appsCatalog)
+			r.Get("/apps/{app}/install-modules", api.appInstallModules)
 			r.Get("/apps/instances", api.appInstances)
 			r.Post("/apps/{app}/install", api.requirePermission(rbac.AppsManage, api.installApp))
 			r.Post("/apps/instances/batch-delete", api.requirePermission(rbac.AppsManage, api.deleteAppInstances))

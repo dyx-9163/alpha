@@ -110,6 +110,14 @@ func (m *Manager) evaluateSnapshots(upsert func(store.Alert) error) error {
 	if err != nil {
 		return err
 	}
+	instances, err := m.store.ListAppInstances()
+	if err != nil {
+		return err
+	}
+	activeInstances := make(map[string]struct{}, len(instances))
+	for _, instance := range instances {
+		activeInstances[instance.ID] = struct{}{}
+	}
 	for _, snapshot := range snapshots {
 		status := strings.ToLower(strings.TrimSpace(snapshot.Status))
 		switch snapshot.Scope {
@@ -137,6 +145,9 @@ func (m *Manager) evaluateSnapshots(upsert func(store.Alert) error) error {
 				}
 			}
 		case "aifar.runtime":
+			if _, exists := activeInstances[snapshot.ResourceID]; !exists {
+				continue
+			}
 			if status == "degraded" || isServiceUnavailableStatus(status) {
 				severity := "warning"
 				if isServiceUnavailableStatus(status) {

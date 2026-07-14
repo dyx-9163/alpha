@@ -1,0 +1,1 @@
+{"schema":"aifar-runtime-service-v1","name":"file","displayName":{"zh":"文件 file","en":"File"},"kind":"java","applicationName":"alpha-file","port":38005,"required":false,"artifactExtensions":[".jar"],"healthPath":"/actuator/health/readiness","affinityPolicy":"stable"}

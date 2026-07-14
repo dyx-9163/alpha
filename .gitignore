@@ -27,6 +27,18 @@ data/
 
 # Large offline resource bundles
 resources/
+!resources/
+resources/*
+!resources/aifar/
+resources/aifar/*
+!resources/aifar/runtime-v2/
+resources/aifar/runtime-v2/*
+!resources/aifar/runtime-v2/services/
+resources/aifar/runtime-v2/services/*
+!resources/aifar/runtime-v2/services/README.md
+!resources/aifar/runtime-v2/services/*/
+resources/aifar/runtime-v2/services/*/*
+!resources/aifar/runtime-v2/services/*/service.json
 aifar-deployment.zip
 *.tar
 *.tar.gz

@@ -36,7 +36,7 @@ export const aifarMessages = {
     appMemoryLimit: '内存限制',
     selectedServices: '安装模块',
     selectedServicesPlaceholder: '选择需要安装的 AIFAR 模块',
-    selectedServicesRequired: '至少需要 gateway 和 web-vue3',
+    selectedServicesRequired: '必须选择目录中声明为必选的模块',
     serviceOauth: '认证 oauth',
     servicePermission: '权限 permission',
     serviceSystem: '系统 system',
@@ -92,7 +92,7 @@ export const aifarMessages = {
     jvmMaxRAMPercentage: 'JVM max RAM %',
     selectedServices: 'Install modules',
     selectedServicesPlaceholder: 'Select AIFAR modules to install',
-    selectedServicesRequired: 'At least gateway and web-vue3 are required',
+    selectedServicesRequired: 'All modules marked as required by the bundle must be selected',
     serviceOauth: 'Auth oauth',
     servicePermission: 'Permission',
     serviceSystem: 'System',
@@ -168,7 +168,7 @@ export function aifarInstallDialogProps(locale?: string, context?: AppInstallDia
       portField('webPort', labelText(copy, 'webPort', 'Web entry port'), 8080, copy),
       percentageField('jvmInitialRAMPercentage', labelText(copy, 'jvmInitialRAMPercentage', 'JVM initial RAM %'), 20, copy),
       percentageField('jvmMaxRAMPercentage', labelText(copy, 'jvmMaxRAMPercentage', 'JVM max RAM %'), 70, copy),
-      selectedServicesField(copy),
+      selectedServicesField(copy, context),
       selectField('nacosSource', copy.nacosSource, [
         { label: copy.nacosSourceExisting, value: 'existing', disabled: nacosOptions.length === 0 },
         { label: copy.nacosSourceManual, value: 'manual' }
@@ -227,43 +227,21 @@ function networkField(copy: ReturnType<typeof aifarCopy>): AppInstallField {
   }
 }
 
-const defaultAifarServices = [
-  'oauth',
-  'permission',
-  'system',
-  'file',
-  'message',
-  'im',
-  'contacts',
-  'meeting',
-  'gateway',
-  'web-vue3'
-]
-
-function selectedServicesField(copy: ReturnType<typeof aifarCopy>): AppInstallField {
+function selectedServicesField(copy: ReturnType<typeof aifarCopy>, context?: AppInstallDialogContext): AppInstallField {
+  const modules = context?.installModules?.aifar ?? []
+  const required = new Set(modules.filter((module) => module.required).map((module) => module.name))
   return {
     name: 'selectedServices',
     label: copy.selectedServices,
     type: 'select',
     multiple: true,
     required: true,
-    defaultValue: defaultAifarServices,
+    defaultValue: modules.map((module) => module.name),
     placeholder: copy.selectedServicesPlaceholder,
-    options: [
-      { label: copy.serviceOauth, value: 'oauth' },
-      { label: copy.servicePermission, value: 'permission' },
-      { label: copy.serviceSystem, value: 'system' },
-      { label: copy.serviceFile, value: 'file' },
-      { label: copy.serviceMessage, value: 'message' },
-      { label: copy.serviceIm, value: 'im' },
-      { label: copy.serviceContacts, value: 'contacts' },
-      { label: copy.serviceMeeting, value: 'meeting' },
-      { label: copy.serviceGateway, value: 'gateway', disabled: true },
-      { label: copy.serviceWeb, value: 'web-vue3', disabled: true }
-    ],
+    options: modules.map((module) => ({ label: module.displayName || module.name, value: module.name, disabled: module.required })),
     validate: (value: unknown) => {
       const selected = new Set(stringArray(value))
-      return selected.has('gateway') && selected.has('web-vue3') ? undefined : copy.selectedServicesRequired
+      return modules.length > 0 && Array.from(required).every((name) => selected.has(name)) ? undefined : copy.selectedServicesRequired
     }
   }
 }

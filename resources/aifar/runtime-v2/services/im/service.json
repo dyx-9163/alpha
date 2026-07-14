@@ -1,0 +1,1 @@
+{"schema":"aifar-runtime-service-v1","name":"im","displayName":{"zh":"即时通讯 im","en":"IM"},"kind":"java","applicationName":"alpha-im","port":38031,"required":false,"artifactExtensions":[".jar"],"healthPath":"/actuator/health/readiness","affinityPolicy":"round-robin"}

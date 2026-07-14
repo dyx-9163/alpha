@@ -137,6 +137,45 @@ func TestStatusSnapshotVersioning(t *testing.T) {
 	}
 }
 
+func TestDeleteAppInstanceRemovesAssociatedStatusSnapshots(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "aifar.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	instance, err := db.SaveAppInstance(AppInstance{App: "aifar", Version: "runtime-v2", ServerID: "srv-1", Status: "running"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, scope := range []string{"app.instance", "aifar.runtime"} {
+		if _, _, err := db.UpsertStatusSnapshot(StatusSnapshot{Scope: scope, ResourceID: instance.ID, ServerID: "srv-1", Status: "running"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, _, err := db.UpsertStatusSnapshot(StatusSnapshot{Scope: "aifar.runtime", ResourceID: "app-other", ServerID: "srv-1", Status: "running"}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := db.DeleteAppInstance(instance.ID); err != nil {
+		t.Fatal(err)
+	}
+	for _, scope := range []string{"app.instance", "aifar.runtime"} {
+		if _, err := db.GetStatusSnapshot(scope, instance.ID); !IsNotFound(err) {
+			t.Fatalf("%s snapshot still exists after instance delete: %v", scope, err)
+		}
+		history, err := db.ListStatusSnapshotHistory(scope, instance.ID, 10)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(history) != 0 {
+			t.Fatalf("%s snapshot history still exists after instance delete: %+v", scope, history)
+		}
+	}
+	if _, err := db.GetStatusSnapshot("aifar.runtime", "app-other"); err != nil {
+		t.Fatalf("unrelated snapshot was removed: %v", err)
+	}
+}
+
 func TestAIFAROrchestrationCRUDAndInstanceCleanup(t *testing.T) {
 	db, err := Open(filepath.Join(t.TempDir(), "aifar.db"))
 	if err != nil {

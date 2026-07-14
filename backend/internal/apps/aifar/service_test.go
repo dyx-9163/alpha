@@ -14,6 +14,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -34,6 +35,15 @@ type fakeStore struct {
 	replicaSets []store.AIFARReplicaSet
 	pods        []store.AIFARPod
 	endpoints   []store.AIFARServiceEndpoint
+}
+
+type resourceFakeStore struct {
+	*fakeStore
+	resources []store.Resource
+}
+
+func (s *resourceFakeStore) ListResources() ([]store.Resource, error) {
+	return append([]store.Resource(nil), s.resources...), nil
 }
 
 func (f *fakeStore) GetServer(id string, includeSecret bool) (store.Server, error) {
@@ -1510,7 +1520,8 @@ func TestServiceInstallsAIFARServiceFromRuntimeV2Bundle(t *testing.T) {
 		`"podRevision": "`,
 		`"services": [`,
 		`"mode": "web-nginx"`,
-		`"gatewayService": "gateway"`,
+		`GATEWAY_SERVICE='gateway'`,
+		`"gatewayService": "${GATEWAY_SERVICE}"`,
 		`AIFAR_NACOS_EPHEMERAL true`,
 		`nacos_ephemeral`,
 		`"ephemeral": $(nacos_ephemeral)`,
@@ -1606,8 +1617,8 @@ func TestServiceInstallsAIFARServiceFromRuntimeV2Bundle(t *testing.T) {
 	}
 	for _, want := range []string{
 		"alpha_service_name",
-		"gateway alpha-gateway",
-		"permission alpha-permission",
+		"gateway=alpha-gateway",
+		"permission=alpha-permission",
 		`set_env SPRING_APPLICATION_NAME "$app_name" "$service_env"`,
 		`set_env SERVER_PORT "$port_value" "$service_env"`,
 	} {
@@ -1671,10 +1682,10 @@ func TestServiceInstallsSelectedAIFARModules(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(remote.installScript, `SERVICE_ORDER='oauth gateway web-vue3'`) {
+	if !strings.Contains(remote.installScript, `SERVICE_ORDER='gateway oauth web-vue3'`) {
 		t.Fatalf("install script should only iterate selected services, got:\n%s", remote.installScript)
 	}
-	if strings.Contains(remote.installScript, `SERVICE_ORDER='oauth permission system file message im contacts meeting gateway web-vue3'`) {
+	if strings.Contains(remote.installScript, `SERVICE_ORDER='contacts file gateway im meeting message oauth permission system web-vue3'`) {
 		t.Fatalf("install script should not use all services when selectedServices is provided:\n%s", remote.installScript)
 	}
 	if !strings.Contains(remote.installScript, `open_service_ports $SERVICE_ORDER`) {
@@ -1687,7 +1698,7 @@ func TestServiceInstallsSelectedAIFARModules(t *testing.T) {
 	if err := json.Unmarshal([]byte(s.instances[0].Metadata), &metadata); err != nil {
 		t.Fatal(err)
 	}
-	if got := stringSliceFromAny(metadata["services"]); strings.Join(got, " ") != "oauth gateway web-vue3" {
+	if got := stringSliceFromAny(metadata["services"]); strings.Join(got, " ") != "gateway oauth web-vue3" {
 		t.Fatalf("expected selected services in metadata, got %#v from %s", got, s.instances[0].Metadata)
 	}
 	containers := mapFromMetadataValue(metadata["containers"])
@@ -1704,7 +1715,7 @@ func TestServiceInstallsSelectedAIFARModules(t *testing.T) {
 	if err := json.Unmarshal([]byte(s.releases[0].ManifestJSON), &manifest); err != nil {
 		t.Fatal(err)
 	}
-	if got := stringSliceFromAny(manifest["services"]); strings.Join(got, " ") != "oauth gateway web-vue3" {
+	if got := stringSliceFromAny(manifest["services"]); strings.Join(got, " ") != "gateway oauth web-vue3" {
 		t.Fatalf("expected selected services in manifest, got %#v from %s", got, s.releases[0].ManifestJSON)
 	}
 	releaseContainers := mapFromMetadataValue(manifest["containers"])
@@ -1722,12 +1733,14 @@ func TestServiceInstallsMissingAIFARModulesAfterInitialInstall(t *testing.T) {
 	}
 	metadata["services"] = initialServices
 	instance.Metadata = mustMetadata(t, metadata)
-	s := &fakeStore{
+	baseStore := &fakeStore{
 		servers: map[string]store.Server{
 			"srv-1": {ID: "srv-1", Name: "app-1", Host: "10.0.0.10", DeployDir: "/aifar/apps"},
 		},
 		instances: []store.AppInstance{instance},
 	}
+	bundleParent := createAIFARBundle(t)
+	s := &resourceFakeStore{fakeStore: baseStore, resources: []store.Resource{{App: AppName, Part: "backend", Version: appBundleVersion, Path: filepath.Join(bundleParent, appBundleVersion, bundleManifestName)}}}
 	remote := &fakeRemote{}
 	service := NewService(s, remote)
 	err := service.InstallServices(context.Background(), InstallServicesRequest{
@@ -1743,8 +1756,8 @@ func TestServiceInstallsMissingAIFARModulesAfterInitialInstall(t *testing.T) {
 	}
 	for _, want := range []string{
 		`AIFAR_SERVICE_INSTALL`,
-		`NEW_SERVICES='system file'`,
-		`SERVICE_ORDER='system file gateway web-vue3'`,
+		`NEW_SERVICES='file system'`,
+		`SERVICE_ORDER='file gateway system web-vue3'`,
 		`docker build -t "$image" "$APP_DIR/$service"`,
 		`aifar-agent reconcile-runtime --spec "$spec"`,
 		`open_service_ports $NEW_SERVICES`,
@@ -1755,18 +1768,24 @@ func TestServiceInstallsMissingAIFARModulesAfterInitialInstall(t *testing.T) {
 			t.Fatalf("service install script should contain %q:\n%s", want, remote.serviceInstallScript)
 		}
 	}
+	if !strings.Contains(remote.joinedUploads(), "aifar-service-modules-") {
+		t.Fatalf("service install should upload modules from the current resource directory, uploads=%s", remote.joinedUploads())
+	}
+	if !strings.Contains(remote.joinedCommands(), "tar -xzf") {
+		t.Fatalf("service install should extract uploaded modules before rendering the runtime, commands=%s", remote.joinedCommands())
+	}
 	if len(s.instances) != 1 || s.instances[0].Status != "installed" {
 		t.Fatalf("expected installed instance, got %+v", s.instances)
 	}
 	next := metadataFromInstance(s.instances[0])
-	if got := strings.Join(servicesFromMetadata(next), " "); got != "system file gateway web-vue3" {
+	if got := strings.Join(servicesFromMetadata(next), " "); got != "file gateway system web-vue3" {
 		t.Fatalf("expected merged services in metadata, got %q from %s", got, s.instances[0].Metadata)
 	}
 	if _, ok := next["orchestrationLock"]; ok {
 		t.Fatalf("service install should clear orchestration lock: %s", s.instances[0].Metadata)
 	}
 	last, ok := next["lastServiceInstall"].(map[string]any)
-	if !ok || strings.Join(stringSliceFromAny(last["services"]), " ") != "system file" {
+	if !ok || strings.Join(stringSliceFromAny(last["services"]), " ") != "file system" {
 		t.Fatalf("expected lastServiceInstall metadata, got %s", s.instances[0].Metadata)
 	}
 	desired := mapFromMetadataValue(next["desiredReplicas"])
@@ -1781,7 +1800,7 @@ func TestServiceInstallsMissingAIFARModulesAfterInitialInstall(t *testing.T) {
 	if len(s.deployments) != 2 || len(s.replicaSets) != 2 || len(s.pods) != 2 || len(s.endpoints) != 2 {
 		t.Fatalf("expected control-plane rows for two newly installed services, deployments=%d replicaSets=%d pods=%d endpoints=%d", len(s.deployments), len(s.replicaSets), len(s.pods), len(s.endpoints))
 	}
-	if len(s.releases) != 1 || !strings.Contains(s.releases[0].ManifestJSON, `"kind":"service-install"`) || !strings.Contains(s.releases[0].ManifestJSON, `"installedServices":["system","file"]`) {
+	if len(s.releases) != 1 || !strings.Contains(s.releases[0].ManifestJSON, `"kind":"service-install"`) || !strings.Contains(s.releases[0].ManifestJSON, `"installedServices":["file","system"]`) {
 		t.Fatalf("expected service-install release manifest, got %+v", s.releases)
 	}
 }
@@ -1809,7 +1828,8 @@ func TestServiceRuntimeReconcileRepairsNacosProxyRegistration(t *testing.T) {
 	for _, want := range []string{
 		`AIFAR_RUNTIME_RECONCILE`,
 		`aifar-agent reconcile-runtime --spec "$SPEC_PATH"`,
-		`open_service_ports gateway oauth permission system file message im contacts meeting web-vue3`,
+		`AIFAR_DESIRED_REPLICAS`,
+		`open_service_ports $runtime_services`,
 		`allow_selinux_ports http_port_t $ports`,
 	} {
 		if !strings.Contains(remote.runtimeReconcileScript, want) {
@@ -2611,6 +2631,65 @@ func aifarModuleValidationParams() map[string]any {
 	}
 }
 
+func TestServiceExpectationsUseOnlyPositiveDesiredReplicas(t *testing.T) {
+	metadata := map[string]any{
+		"services": []any{"alpha-gateway", "alpha-oauth", "web-vue3", "alpha-unused"},
+		"desiredReplicas": map[string]any{
+			"alpha-gateway": 1,
+			"alpha-oauth":   2,
+			"web-vue3":      1,
+			"alpha-unused":  0,
+		},
+	}
+	got := serviceExpectations(metadata)
+	want := []serviceExpectation{
+		{Name: "alpha-gateway", Replicas: 1},
+		{Name: "alpha-oauth", Replicas: 2},
+		{Name: "web-vue3", Replicas: 1},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("expected selected positive replicas %#v, got %#v", want, got)
+	}
+}
+
+func TestServiceExpectationsIgnoreLegacyDesiredReplicasOutsideSelectedServices(t *testing.T) {
+	metadata := map[string]any{
+		"services": []any{"oauth", "permission", "system", "gateway", "web-vue3"},
+		"desiredReplicas": map[string]any{
+			"contacts": 1, "file": 1, "gateway": 1, "im": 1, "meeting": 1,
+			"message": 1, "oauth": 1, "permission": 1, "system": 1, "web-vue3": 1,
+		},
+	}
+	want := []serviceExpectation{
+		{Name: "oauth", Replicas: 1},
+		{Name: "permission", Replicas: 1},
+		{Name: "system", Replicas: 1},
+		{Name: "gateway", Replicas: 1},
+		{Name: "web-vue3", Replicas: 1},
+	}
+	if got := serviceExpectations(metadata); !reflect.DeepEqual(got, want) {
+		t.Fatalf("legacy replica entries outside selected services must be ignored: want %#v, got %#v", want, got)
+	}
+}
+
+func TestServiceExpectationsTreatExplicitEmptyDesiredReplicasAsOffline(t *testing.T) {
+	metadata := map[string]any{
+		"services":        []any{"alpha-gateway", "web-vue3"},
+		"desiredReplicas": map[string]any{},
+	}
+	if got := serviceExpectations(metadata); len(got) != 0 {
+		t.Fatalf("explicit empty desired replicas should be offline, got %#v", got)
+	}
+}
+
+func TestServiceExpectationsFallBackToSelectedServices(t *testing.T) {
+	metadata := map[string]any{"services": []any{"alpha-gateway", "web-vue3"}}
+	want := []serviceExpectation{{Name: "alpha-gateway", Replicas: 1}, {Name: "web-vue3", Replicas: 1}}
+	if got := serviceExpectations(metadata); !reflect.DeepEqual(got, want) {
+		t.Fatalf("expected selected-service fallback %#v, got %#v", want, got)
+	}
+}
+
 func TestServiceChecksAIFARServiceAndUpdatesStatus(t *testing.T) {
 	instance := store.AppInstance{
 		ID:       "app-1",
@@ -2645,6 +2724,79 @@ func TestServiceChecksAIFARServiceAndUpdatesStatus(t *testing.T) {
 	}
 }
 
+func TestServiceCheckPassesSelectedServiceExpectationsToInspector(t *testing.T) {
+	instance := store.AppInstance{
+		ID:       "app-selected",
+		App:      "aifar",
+		Version:  "runtime-v2",
+		ServerID: "srv-1",
+		Status:   "installed",
+		Metadata: `{"installRoot":"/aifar/apps/admin","services":["alpha-gateway","web-vue3","alpha-unused"],"desiredReplicas":{"alpha-gateway":1,"web-vue3":1,"alpha-unused":0}}`,
+	}
+	s := &fakeStore{
+		servers:   map[string]store.Server{"srv-1": {ID: "srv-1", Name: "app-1", Host: "10.0.0.10", DeployDir: "/aifar/apps"}},
+		instances: []store.AppInstance{instance},
+	}
+	remote := &fakeRemote{statusStdout: strings.Join([]string{
+		"status=running",
+		"installRootExists=true",
+		"expectedContainers=2",
+		"missingContainers=0",
+		"ingressRunning=true",
+	}, "\n")}
+	service := NewService(s, remote)
+	if _, err := service.Check(context.Background(), CheckRequest{Instance: instance, Server: s.servers["srv-1"], Language: "en"}, fakeLogger{}, nil); err != nil {
+		t.Fatal(err)
+	}
+	command := remote.joinedCommands()
+	if !strings.Contains(command, `EXPECTED_SERVICES='alpha-gateway=1 web-vue3=1'`) {
+		t.Fatalf("service check should pass only selected positive replicas to inspector:\n%s", command)
+	}
+	if strings.Contains(command, "alpha-unused=0") {
+		t.Fatalf("offline service should not be inspected:\n%s", command)
+	}
+}
+
+func TestModuleCollectorCheckSkipsAutoscaleMetricsCollection(t *testing.T) {
+	instance := store.AppInstance{
+		ID:       "app-collector",
+		App:      "aifar",
+		Version:  "runtime-v2",
+		ServerID: "srv-1",
+		Status:   "installed",
+		Metadata: `{"installRoot":"/aifar/apps/admin","services":["gateway","web-vue3"],"desiredReplicas":{"gateway":1,"web-vue3":1}}`,
+	}
+	server := store.Server{ID: "srv-1", Name: "app-1", Host: "10.0.0.10", DeployDir: "/aifar/apps"}
+	s := &fakeStore{
+		servers:   map[string]store.Server{"srv-1": server},
+		instances: []store.AppInstance{instance},
+	}
+	remote := &fakeRemote{statusStdout: strings.Join([]string{
+		"status=running",
+		"installRootExists=true",
+		"expectedContainers=2",
+		"missingContainers=0",
+		"ingressRunning=true",
+	}, "\n")}
+	module := NewModule(s, remote)
+
+	result, err := module.Check(context.Background(), registry.CheckRequest{
+		Instance: instance,
+		Server:   server,
+		Language: "en",
+		Actor:    "collector",
+	}, registry.RunContext{Log: fakeLogger{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != "running" {
+		t.Fatalf("expected running status, got %+v", result)
+	}
+	if strings.Contains(remote.joinedCommands(), "AIFAR_AUTOSCALE_STATUS") {
+		t.Fatalf("collector health check must not be blocked by optional autoscale metrics:\n%s", remote.joinedCommands())
+	}
+}
+
 func TestParseStatusOutputIncludesIngressAndStaleContainers(t *testing.T) {
 	status := parseStatusOutput(strings.Join([]string{
 		"status=running",
@@ -2665,8 +2817,35 @@ func TestParseStatusOutputIncludesIngressAndStaleContainers(t *testing.T) {
 	}
 }
 
+func TestStatusCommandChecksOnlyExpectedDynamicServices(t *testing.T) {
+	command := statusCommand("/aifar/apps/admin", []serviceExpectation{
+		{Name: "alpha-gateway", Replicas: 1},
+		{Name: "alpha-oauth", Replicas: 2},
+		{Name: "web-vue3", Replicas: 1},
+	})
+	for _, want := range []string{
+		`EXPECTED_SERVICES='alpha-gateway=1 alpha-oauth=2 web-vue3=1'`,
+		`MISSING=$((MISSING + desired - service_healthy))`,
+		`[ "$MISSING" -eq 0 ]`,
+	} {
+		if !strings.Contains(command, want) {
+			t.Fatalf("status command should contain %q:\n%s", want, command)
+		}
+	}
+	if strings.Contains(command, "permission=") || strings.Contains(command, "message=") {
+		t.Fatalf("status command should not inspect unselected services:\n%s", command)
+	}
+}
+
+func TestParseStatusOutputIncludesExpectedAndMissingContainers(t *testing.T) {
+	status := parseStatusOutput("status=degraded\nexpectedContainers=5\nmissingContainers=1\n")
+	if status.ExpectedContainers != 5 || status.MissingContainers != 1 {
+		t.Fatalf("expected replica diagnostics, got %+v", status)
+	}
+}
+
 func TestStatusCommandScansK8sLikePodsAndAgentRuntime(t *testing.T) {
-	command := statusCommand("/aifar/apps/admin")
+	command := statusCommand("/aifar/apps/admin", serviceExpectations(nil))
 	for _, want := range []string{
 		`MODEL_FILE="$INSTALL_ROOT/.aifar/model.json"`,
 		`[ "$MODEL" = "agent-runtime-v2" ]`,
@@ -2702,10 +2881,9 @@ func createAIFARBundle(t *testing.T) string {
 		t.Fatal(err)
 	}
 	manifest := map[string]any{
-		"schema":   appBundleSchema,
-		"version":  appBundleVersion,
-		"services": serviceOrder,
-		"images":   []string{"openjre-rocky-21.tar", "nginx-stable-alpine.tar"},
+		"schema":  appBundleSchema,
+		"version": appBundleVersion,
+		"images":  []string{"openjre-rocky-21.tar", "nginx-stable-alpine.tar"},
 		"layout": map[string]string{
 			"services": appBundleDir,
 			"images":   imageBundleDir,
@@ -2739,6 +2917,34 @@ func createAIFARBundle(t *testing.T) string {
 			t.Fatal(err)
 		}
 		if err := os.WriteFile(filepath.Join(dir, "Dockerfile"), []byte("FROM scratch\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		definition := serviceDefinition{
+			Schema: "aifar-runtime-service-v1", Name: service, Kind: "java",
+			ApplicationName: "alpha-" + service, Port: serviceDefaultPort(service, defaultGatewayPort, defaultWebPort),
+			ArtifactExtensions: []string{".jar"}, HealthPath: "/actuator/health/readiness", AffinityPolicy: "round-robin",
+		}
+		if service == "gateway" {
+			definition.Required = true
+			definition.Role = "gateway"
+			definition.AffinityPolicy = "stable"
+		}
+		if service == "file" {
+			definition.AffinityPolicy = "stable"
+		}
+		if service == "web-vue3" {
+			definition.Kind = "web"
+			definition.ApplicationName = ""
+			definition.Required = true
+			definition.Role = "web"
+			definition.ArtifactExtensions = []string{".zip"}
+			definition.HealthPath = "/"
+		}
+		definitionData, err := json.Marshal(definition)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, serviceDefinitionName), definitionData, 0o644); err != nil {
 			t.Fatal(err)
 		}
 	}

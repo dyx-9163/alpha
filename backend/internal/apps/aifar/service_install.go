@@ -7,24 +7,35 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
+	"sort"
 	"strings"
 	"text/template"
 	"time"
 
 	"aifar-deployment/backend/internal/installer/installerkit"
 	"aifar-deployment/backend/internal/installer/selinux"
+	"aifar-deployment/backend/internal/installer/uploadkit"
 	"aifar-deployment/backend/internal/store"
 )
 
 type serviceInstallScriptData struct {
-	InstallRoot    string
-	ServiceOrder   string
-	NewServices    string
-	Version        string
-	ReleaseID      string
-	CreatedAt      string
-	ConfigHash     string
-	IngressNetwork string
+	InstallRoot         string
+	ServiceOrder        string
+	NewServices         string
+	ServiceApplications string
+	ServicePorts        string
+	ServiceKinds        string
+	ServiceHealthPaths  string
+	ServiceAffinities   string
+	GatewayService      string
+	WebService          string
+	Version             string
+	ReleaseID           string
+	CreatedAt           string
+	ConfigHash          string
+	IngressNetwork      string
 }
 
 func (s Service) InstallServices(ctx context.Context, req InstallServicesRequest, log Logger, targetLog targetLogger) error {
@@ -61,18 +72,41 @@ func (s Service) InstallServices(ctx context.Context, req InstallServicesRequest
 	var gatewayPort int
 	var webPort int
 	var script string
+	var serviceDefinitions []serviceDefinition
+	var moduleArchiveLocal string
+	var moduleArchiveRemote string
+	var workDir string
 
 	if err := step(1, func() error {
 		var err error
-		requested, err = normalizeRequestedAIFARServices(req.Services)
-		if err != nil {
-			return err
-		}
 		current, err = s.acquireOrchestrationLock(req.Instance.ID, "install-services", "", req.Actor, fallbackTaskID(req.TaskID, log))
 		if err != nil {
 			return err
 		}
 		metadata = metadataFromInstance(current)
+		serviceDefinitions = serviceDefinitionsFromMetadata(metadata)
+		version = stringFromMetadata(metadata, "releaseVersion", current.Version)
+		if strings.TrimSpace(version) == "" {
+			version = appBundleVersion
+		}
+		if lister, ok := s.store.(resourceLister); ok {
+			resources, err := lister.ListResources()
+			if err != nil {
+				return err
+			}
+			bundle, err := SelectBundle(resources, version)
+			if err != nil {
+				return err
+			}
+			serviceDefinitions, err = discoverBundleServices(bundle)
+			if err != nil {
+				return err
+			}
+		}
+		requested, err = normalizeRequestedAIFARServices(req.Services, serviceDefinitions)
+		if err != nil {
+			return err
+		}
 		if err := ensureK8sLikeMetadata(metadata, UpdateCopy{LegacyUpdateUnsupported: "legacy AIFAR orchestration model %s does not support service installation; reinstall with k8s-like orchestration first"}); err != nil {
 			return err
 		}
@@ -81,14 +115,10 @@ func (s Service) InstallServices(ctx context.Context, req InstallServicesRequest
 		if len(missing) == 0 {
 			return errors.New("selected AIFAR services are already installed")
 		}
-		allServices = mergeServices(installed, missing)
+		allServices = mergeServices(installed, missing, serviceDefinitions)
 		installRoot = stringFromMetadata(metadata, "installRoot", installRootFromDeployDir(req.Server.DeployDir))
 		if strings.TrimSpace(installRoot) == "" {
 			return errors.New("AIFAR install root is missing")
-		}
-		version = stringFromMetadata(metadata, "releaseVersion", current.Version)
-		if strings.TrimSpace(version) == "" {
-			version = appBundleVersion
 		}
 		releaseTime = time.Now().UTC()
 		releaseID = newReleaseID("services-"+strings.Join(missing, "-"), releaseTime)
@@ -109,23 +139,63 @@ func (s Service) InstallServices(ctx context.Context, req InstallServicesRequest
 	if err := step(2, func() error {
 		var err error
 		script, err = renderServiceInstallScript(serviceInstallScriptData{
-			InstallRoot:    installRoot,
-			ServiceOrder:   strings.Join(allServices, " "),
-			NewServices:    strings.Join(missing, " "),
-			Version:        version,
-			ReleaseID:      releaseID,
-			CreatedAt:      releaseTime.Format(time.RFC3339),
-			ConfigHash:     configHash,
-			IngressNetwork: ingressNetwork,
+			InstallRoot:         installRoot,
+			ServiceOrder:        strings.Join(allServices, " "),
+			NewServices:         strings.Join(missing, " "),
+			ServiceApplications: serviceCatalogPairs(serviceDefinitions, allServices, func(definition serviceDefinition) string { return definition.ApplicationName }),
+			ServicePorts:        serviceCatalogPairs(serviceDefinitions, allServices, func(definition serviceDefinition) string { return fmt.Sprint(definition.Port) }),
+			ServiceKinds:        serviceCatalogPairs(serviceDefinitions, allServices, func(definition serviceDefinition) string { return definition.Kind }),
+			ServiceHealthPaths:  serviceCatalogPairs(serviceDefinitions, allServices, func(definition serviceDefinition) string { return definition.HealthPath }),
+			ServiceAffinities:   serviceCatalogPairs(serviceDefinitions, allServices, func(definition serviceDefinition) string { return definition.AffinityPolicy }),
+			GatewayService:      serviceNameForRole(serviceDefinitions, "gateway"),
+			WebService:          serviceNameForRole(serviceDefinitions, "web"),
+			Version:             version,
+			ReleaseID:           releaseID,
+			CreatedAt:           releaseTime.Format(time.RFC3339),
+			ConfigHash:          configHash,
+			IngressNetwork:      ingressNetwork,
 		})
-		return err
+		if err != nil {
+			return err
+		}
+		if lister, ok := s.store.(resourceLister); ok {
+			resources, err := lister.ListResources()
+			if err != nil {
+				return err
+			}
+			bundle, err := SelectBundle(resources, version)
+			if err != nil {
+				return err
+			}
+			moduleArchiveLocal, err = CreateServiceModuleArchive(bundle, missing)
+			if err != nil {
+				return err
+			}
+			workDir = installerkit.WorkDir(installerkit.RemoteDeployDir(req.Server.DeployDir), "aifar-services", version, releaseTime)
+			moduleArchiveRemote = workDir + "/" + filepath.Base(moduleArchiveLocal)
+		}
+		return nil
 	}); err != nil {
 		finishTarget(recorder, target, "failed", err.Error())
 		return err
 	}
+	if moduleArchiveLocal != "" {
+		defer os.Remove(moduleArchiveLocal)
+	}
 
 	if err := step(3, func() error {
 		logForServer.Info("installing AIFAR services: %s", strings.Join(missing, ", "))
+		if moduleArchiveLocal != "" {
+			if _, err := installerkit.Run(ctx, s.remote, req.Server, "mkdir -p "+installerkit.ShellQuote(workDir)+" "+installerkit.ShellQuote(installRoot+"/runtime/services"), logForServer, "prepare AIFAR service module upload failed"); err != nil {
+				return err
+			}
+			if err := uploadkit.Upload(ctx, s.remote, req.Server, uploadkit.File{LocalPath: moduleArchiveLocal, RemotePath: moduleArchiveRemote, LogMessage: "uploading AIFAR service modules", FailureMessage: "upload AIFAR service modules failed"}, logForServer); err != nil {
+				return err
+			}
+			if _, err := installerkit.Run(ctx, s.remote, req.Server, "tar -xzf "+installerkit.ShellQuote(moduleArchiveRemote)+" -C "+installerkit.ShellQuote(installRoot+"/runtime/services"), logForServer, "extract AIFAR service modules failed"); err != nil {
+				return err
+			}
+		}
 		_, runErr := installerkit.Run(ctx, s.remote, req.Server, "sh -s <<'AIFAR_SERVICE_INSTALL'\n"+script+"\nAIFAR_SERVICE_INSTALL", logForServer, "AIFAR service installation failed")
 		return runErr
 	}); err != nil {
@@ -140,6 +210,7 @@ func (s Service) InstallServices(ctx context.Context, req InstallServicesRequest
 		nextMetadata["releaseVersion"] = version
 		nextMetadata["releaseCreatedAt"] = releaseTime.Format(time.RFC3339)
 		nextMetadata["configHash"] = configHash
+		nextMetadata["serviceCatalog"] = serviceCatalogMetadataForInstall(serviceDefinitions, gatewayPort, webPort)
 		nextMetadata = serviceInstallOrchestrationMetadata(nextMetadata, installRoot, releaseID, ingressNetwork, gatewayPort, webPort, missing)
 		nextMetadata["lastServiceInstall"] = map[string]any{
 			"services":    missing,
@@ -155,7 +226,7 @@ func (s Service) InstallServices(ctx context.Context, req InstallServicesRequest
 			return err
 		}
 		if orch, ok := s.store.(aifarOrchestrationStore); ok {
-			if err := saveControlPlaneRevision(orch, current.ID, version, releaseID, configHash, desiredReplicasFromMetadata(nextMetadata), gatewayPort, webPort, missing, releaseTime); err != nil {
+			if err := saveControlPlaneRevision(orch, current.ID, version, releaseID, configHash, desiredReplicasFromMetadata(nextMetadata), gatewayPort, webPort, missing, releaseTime, servicePorts(serviceDefinitions)); err != nil {
 				return err
 			}
 		}
@@ -199,7 +270,7 @@ func serviceInstallSteps() []installStepDef {
 	}
 }
 
-func normalizeRequestedAIFARServices(values []string) ([]string, error) {
+func normalizeRequestedAIFARServices(values []string, definitions []serviceDefinition) ([]string, error) {
 	if len(values) == 0 {
 		return nil, errors.New("select at least one AIFAR service")
 	}
@@ -209,16 +280,25 @@ func normalizeRequestedAIFARServices(values []string) ([]string, error) {
 		if service == "" {
 			continue
 		}
-		if !aifarServiceSupported(service) {
+		if !serviceNamePattern.MatchString(service) {
 			return nil, fmt.Errorf("unsupported AIFAR service: %s", value)
 		}
 		selected[service] = true
 	}
 	out := make([]string, 0, len(selected))
-	for _, service := range serviceOrder {
+	for _, service := range serviceNames(definitions) {
 		if selected[service] {
 			out = append(out, service)
+			delete(selected, service)
 		}
+	}
+	if len(selected) > 0 {
+		unknown := make([]string, 0, len(selected))
+		for service := range selected {
+			unknown = append(unknown, service)
+		}
+		sort.Strings(unknown)
+		return nil, fmt.Errorf("unsupported AIFAR service: %s", strings.Join(unknown, ", "))
 	}
 	if len(out) == 0 {
 		return nil, errors.New("select at least one AIFAR service")
@@ -240,23 +320,34 @@ func missingServices(requested, installed []string) []string {
 	return out
 }
 
-func mergeServices(existing, additions []string) []string {
+func mergeServices(existing, additions []string, catalogs ...[]serviceDefinition) []string {
 	selected := make(map[string]bool, len(existing)+len(additions))
-	for _, service := range existing {
-		if aifarServiceSupported(service) {
-			selected[service] = true
+	for _, values := range [][]string{existing, additions} {
+		for _, service := range values {
+			service = cleanAIFARServiceName(service)
+			if aifarServiceSupported(service) {
+				selected[service] = true
+			}
 		}
 	}
-	for _, service := range additions {
-		if aifarServiceSupported(service) {
-			selected[service] = true
-		}
+	definitions := legacyServiceDefinitions()
+	if len(catalogs) > 0 && len(catalogs[0]) > 0 {
+		definitions = catalogs[0]
 	}
 	out := make([]string, 0, len(selected))
-	for _, service := range serviceOrder {
-		if selected[service] {
-			out = append(out, service)
+	for _, definition := range definitions {
+		if selected[definition.Name] {
+			out = append(out, definition.Name)
+			delete(selected, definition.Name)
 		}
+	}
+	if len(selected) > 0 {
+		remaining := make([]string, 0, len(selected))
+		for service := range selected {
+			remaining = append(remaining, service)
+		}
+		sort.Strings(remaining)
+		out = append(out, remaining...)
 	}
 	return out
 }

@@ -174,7 +174,7 @@ func (s Service) RollbackArtifact(ctx context.Context, req ArtifactRollbackReque
 				InstallRoot:      installRoot,
 				WorkDir:          workDir,
 				RollbackDir:      rollbackDir,
-				ServiceOrder:     serviceOrderText(),
+				ServiceOrder:     strings.Join(servicesFromMetadata(metadata), " "),
 				ServiceName:      artifact.ServiceName,
 				DesiredReplicas:  replicaAssignments(map[string]int{artifact.ServiceName: desiredReplicasFromMetadata(metadata)[artifact.ServiceName]}),
 				ArtifactRemote:   artifact.RemotePath,

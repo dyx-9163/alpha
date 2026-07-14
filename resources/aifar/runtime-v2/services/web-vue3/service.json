@@ -1,0 +1,1 @@
+{"schema":"aifar-runtime-service-v1","name":"web-vue3","displayName":{"zh":"前端 web-vue3（必选）","en":"Web Vue3 (required)"},"kind":"web","port":8080,"required":true,"role":"web","artifactExtensions":[".zip",".tar",".tgz",".tar.gz"],"healthPath":"/","affinityPolicy":"round-robin"}

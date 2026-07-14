@@ -29,6 +29,18 @@ func (m Module) Name() string {
 	return AppName
 }
 
+func (m Module) InstallModules(resources []store.Resource, version, language string) ([]registry.InstallModuleDefinition, error) {
+	bundle, err := SelectBundle(resources, version)
+	if err != nil {
+		return nil, err
+	}
+	definitions, err := discoverBundleServices(bundle)
+	if err != nil {
+		return nil, err
+	}
+	return installModuleDefinitions(definitions, language), nil
+}
+
 func (m Module) Manifest(lang string) registry.Manifest {
 	copy := copyFor(lang)
 	return registry.Manifest{
@@ -120,7 +132,16 @@ func (m Module) ValidateInstall(ctx context.Context, req registry.InstallRequest
 	if err := VerifyBundle(bundle); err != nil {
 		return err
 	}
+	definitions, err := discoverBundleServices(bundle)
+	if err != nil {
+		return err
+	}
+	selected := sliceParam(req.Parameters, "selectedServices", serviceNames(definitions))
+	if err := validateSelectedServicesForCatalog(selected, definitions); err != nil {
+		return err
+	}
 	opts := optionsFromParameters(req.Parameters)
+	opts.SelectedServices = normalizeSelectedServicesForCatalog(selected, definitions)
 	opts, err = m.service.resolveInstallOptions(opts)
 	if err != nil {
 		return err
@@ -199,6 +220,7 @@ func (m Module) Check(ctx context.Context, req registry.CheckRequest, run regist
 		Instance: req.Instance,
 		Server:   req.Server,
 		Language: req.Language,
+		Actor:    req.Actor,
 	}, run.Log, func(target string) Logger {
 		return run.LoggerForTarget(target)
 	})

@@ -130,6 +130,7 @@
 
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { apiGet } from '../api/client'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import type { UploadFile } from 'element-plus'
 import { asArray } from '../api/client'
@@ -213,7 +214,7 @@ import {
   runtimeLogVisibleCount
 } from '../containers/runtime/logs'
 import {
-  aifarServiceOptions,
+  buildAifarServiceOptions,
   buildRuntimeLogPodOptions,
   buildRuntimeServiceMap,
   filterRuntimeDeploymentsByInstance,
@@ -226,6 +227,7 @@ import {
   runtimeServiceForDeployment as resolveRuntimeServiceForDeployment,
   type RuntimeAppInstance
 } from '../containers/runtime/selectors'
+import type { AppInstallModuleOption } from '../apps/registry/contract'
 import { useAifarRuntimeLogViewport } from '../containers/runtime/useAifarRuntimeLogViewport'
 import type {
   AifarRelease,
@@ -264,6 +266,7 @@ const summaryCache = ref<Record<string, DockerSummaryResponse>>({})
 const collectionCache = ref<Record<string, any[]>>({})
 const runtimeCache = ref<Record<string, AifarRuntimeResponse>>({})
 const aifarReleases = ref<AifarRelease[]>([])
+const aifarInstallModules = ref<AppInstallModuleOption[]>([])
 const aifarReleaseCache = ref<Record<string, AifarRelease[]>>({})
 const selectedImageRows = ref<any[]>([])
 const error = ref('')
@@ -446,8 +449,9 @@ const runtimeLogStreamTagType = computed(() => {
       return 'info'
   }
 })
-const installedRuntimeServiceNamesList = computed(() => aifarServiceOptions.map((item) => item.value).filter((service) => installedRuntimeServiceNames.value.has(service)))
-const missingRuntimeServiceOptions = computed(() => aifarServiceOptions.filter((item) => !installedRuntimeServiceNames.value.has(item.value)))
+const aifarServiceOptions = computed(() => buildAifarServiceOptions(aifarInstallModules.value, Array.from(installedRuntimeServiceNames.value)))
+const installedRuntimeServiceNamesList = computed(() => aifarServiceOptions.value.map((item) => item.value).filter((service) => installedRuntimeServiceNames.value.has(service)))
+const missingRuntimeServiceOptions = computed(() => aifarServiceOptions.value.filter((item) => !installedRuntimeServiceNames.value.has(item.value)))
 const runtimeInstanceManageDisabledReason = computed(() => {
   if (!canManageApps.value) return deniedText.value
   if (!selectedRuntimeInstance.value) return t('containers.selectAifarInstance')
@@ -568,6 +572,7 @@ function serverLabel(server: any) {
 }
 
 async function loadServers() {
+  aifarInstallModules.value = await apiGet<AppInstallModuleOption[]>('/apps/aifar/install-modules?version=runtime-v2').catch(() => [])
   const { servers: serverRows, appInstances: instanceRows, settings } = await fetchContainerPageBootstrap<AppInstance>({
     servers: servers.value,
     appInstances: appInstances.value,
@@ -1129,7 +1134,7 @@ function openRuntimeConfigDialog() {
   const overrides = state.services || {}
   const services = selectedRuntimeServices.value.length
     ? selectedRuntimeServices.value.map((item) => item.serviceName)
-    : aifarServiceOptions.map((item) => item.value)
+    : aifarServiceOptions.value.map((item) => item.value)
   runtimeConfigRows.value = services.map((serviceName) => {
     const values = overrides[serviceName] || {}
     return {

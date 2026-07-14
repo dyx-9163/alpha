@@ -1,0 +1,1 @@
+{"schema":"aifar-runtime-service-v1","name":"message","displayName":{"zh":"消息 message","en":"Message"},"kind":"java","applicationName":"alpha-message","port":38008,"required":false,"artifactExtensions":[".jar"],"healthPath":"/actuator/health/readiness","affinityPolicy":"round-robin"}

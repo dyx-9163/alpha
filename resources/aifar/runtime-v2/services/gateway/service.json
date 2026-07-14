@@ -1,0 +1,1 @@
+{"schema":"aifar-runtime-service-v1","name":"gateway","displayName":{"zh":"入口 gateway（必选）","en":"Gateway (required)"},"kind":"java","applicationName":"alpha-gateway","port":38000,"required":true,"role":"gateway","artifactExtensions":[".jar"],"healthPath":"/actuator/health/readiness","affinityPolicy":"stable"}

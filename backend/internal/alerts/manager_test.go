@@ -91,6 +91,15 @@ func TestManagerCreatesRuntimeAndInstanceAlerts(t *testing.T) {
 	}
 	defer db.Close()
 	manager := NewManager(db, nil)
+	if _, err := db.SaveAppInstance(store.AppInstance{
+		ID:       "app-aifar",
+		App:      "aifar",
+		Version:  "runtime-v2",
+		ServerID: "srv-1",
+		Status:   "running",
+	}); err != nil {
+		t.Fatal(err)
+	}
 	if _, _, err := db.UpsertStatusSnapshot(store.StatusSnapshot{
 		Scope:      "aifar.runtime",
 		ResourceID: "app-aifar",
@@ -127,6 +136,49 @@ func TestManagerCreatesRuntimeAndInstanceAlerts(t *testing.T) {
 	}
 	if seen["aifar.runtime"] != "apps.manage" || seen["app.instance"] != "database.manage" {
 		t.Fatalf("unexpected required permissions: %+v", seen)
+	}
+}
+
+func TestManagerIgnoresOrphanAIFARRuntimeSnapshotAndResolvesExistingAlert(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "aifar.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	manager := NewManager(db, nil)
+	const resourceID = "app-orphan"
+	const fingerprint = "aifar.runtime:" + resourceID + ":degraded"
+	if _, _, err := db.UpsertStatusSnapshot(store.StatusSnapshot{
+		Scope:      "aifar.runtime",
+		ResourceID: resourceID,
+		ServerID:   "srv-1",
+		Status:     "degraded",
+		Payload:    `{"readyPods":1,"desiredReplicas":3}`,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := db.UpsertAlert(store.Alert{
+		Fingerprint: fingerprint,
+		Severity:    "warning",
+		Scope:       "aifar.runtime",
+		ResourceID:  resourceID,
+		App:         "aifar",
+		InstanceID:  resourceID,
+		Status:      "open",
+		Title:       "AIFAR Runtime is degraded",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := manager.Evaluate(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	alert, err := db.GetAlertByFingerprint(fingerprint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if alert.Status != "resolved" {
+		t.Fatalf("orphan runtime alert status = %q, want resolved", alert.Status)
 	}
 }
 

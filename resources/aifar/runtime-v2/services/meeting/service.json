@@ -1,0 +1,1 @@
+{"schema":"aifar-runtime-service-v1","name":"meeting","displayName":{"zh":"会议 meeting","en":"Meeting"},"kind":"java","applicationName":"alpha-meeting","port":38033,"required":false,"artifactExtensions":[".jar"],"healthPath":"/actuator/health/readiness","affinityPolicy":"round-robin"}

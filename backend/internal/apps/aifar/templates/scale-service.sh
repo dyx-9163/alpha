@@ -46,6 +46,8 @@ json_escape() {
 }
 
 alpha_service_name() {
+  configured="$(read_env_value "$ENV_DIR/$1.env" SPRING_APPLICATION_NAME "")"
+  [ -z "$configured" ] || { printf "%s" "$configured"; return; }
   case "$1" in
     gateway) printf "alpha-gateway" ;;
     oauth) printf "alpha-oauth" ;;
@@ -77,7 +79,11 @@ service_port_var() {
 }
 
 service_port() {
-  var="$(service_port_var "$1")"
+  service="$1"
+  value="$(read_env_value "$ENV_DIR/$service.env" AIFAR_SERVICE_PORT "")"
+  [ -n "$value" ] || value="$(read_env_value "$ENV_DIR/$service.env" SERVER_PORT "")"
+  [ -n "$value" ] && { printf "%s" "$value"; return; }
+  var="$(service_port_var "$service")"
   [ -n "$var" ] || fail "unsupported service port: $1"
   read_env_value "$ENV_DIR/compose.env" "$var" ""
 }
@@ -260,8 +266,7 @@ JSON
     else
       printf ",\n" >> "$spec"
     fi
-    affinity="round-robin"
-    case "$service" in gateway|file) affinity="stable" ;; esac
+    affinity="$(read_env_value "$service_env" AIFAR_AFFINITY_POLICY round-robin)"
     printf '    {"name":"%s","appName":"%s","listenPort":%s,"targetPort":%s,"affinityPolicy":"%s"}' "$service" "$app_name" "$port" "$port" "$affinity" >> "$spec"
   done
   cat >> "$spec" <<JSON

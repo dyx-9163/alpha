@@ -3,6 +3,7 @@ package aifar
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 
 	"aifar-deployment/backend/internal/installer/installerkit"
@@ -19,9 +20,77 @@ type StatusResult struct {
 	TotalContainers     int
 	RunningContainers   int
 	UnhealthyContainers int
+	ExpectedContainers  int
+	MissingContainers   int
 	StaleContainers     int
 	IngressRunning      bool
 	Containers          []string
+}
+
+type serviceExpectation struct {
+	Name     string
+	Replicas int
+}
+
+func serviceExpectations(metadata map[string]any) []serviceExpectation {
+	rawDesired, desiredDeclared := metadata["desiredReplicas"]
+	desiredReplicas := map[string]int{}
+	switch raw := rawDesired.(type) {
+	case map[string]int:
+		for name, replicas := range raw {
+			desiredReplicas[cleanAIFARServiceName(name)] = max(replicas, 0)
+		}
+	case map[string]any:
+		for name, value := range raw {
+			desiredReplicas[cleanAIFARServiceName(name)] = max(intFromAny(value, 0), 0)
+		}
+	}
+	selected := servicesFromMetadata(metadata)
+	if !desiredDeclared {
+		out := make([]serviceExpectation, 0, len(selected))
+		seen := map[string]struct{}{}
+		for _, name := range selected {
+			name = cleanAIFARServiceName(name)
+			if name == "" || !aifarServiceSupported(name) {
+				continue
+			}
+			if _, exists := seen[name]; exists {
+				continue
+			}
+			seen[name] = struct{}{}
+			out = append(out, serviceExpectation{Name: name, Replicas: 1})
+		}
+		return out
+	}
+
+	out := make([]serviceExpectation, 0, len(desiredReplicas))
+	seen := map[string]struct{}{}
+	appendExpected := func(name string) {
+		name = cleanAIFARServiceName(name)
+		replicas := desiredReplicas[name]
+		if name == "" || replicas <= 0 || !aifarServiceSupported(name) {
+			return
+		}
+		if _, exists := seen[name]; exists {
+			return
+		}
+		seen[name] = struct{}{}
+		out = append(out, serviceExpectation{Name: name, Replicas: replicas})
+	}
+	for _, name := range selected {
+		appendExpected(name)
+	}
+	if len(selected) == 0 {
+		extra := make([]string, 0, len(desiredReplicas))
+		for name := range desiredReplicas {
+			extra = append(extra, name)
+		}
+		sort.Strings(extra)
+		for _, name := range extra {
+			appendExpected(name)
+		}
+	}
+	return out
 }
 
 type Inspector struct {
@@ -32,12 +101,12 @@ func NewInspector(remote Remote) Inspector {
 	return Inspector{remote: remote}
 }
 
-func (i Inspector) Check(ctx context.Context, server store.Server, installRoot string, log Logger) (StatusResult, error) {
+func (i Inspector) Check(ctx context.Context, server store.Server, installRoot string, expectations []serviceExpectation, log Logger) (StatusResult, error) {
 	installRoot = strings.TrimSpace(installRoot)
 	if installRoot == "" {
 		installRoot = installRootFromDeployDir(server.DeployDir)
 	}
-	result, err := i.remote.Run(ctx, server, statusCommand(installRoot))
+	result, err := i.remote.Run(ctx, server, statusCommand(installRoot, expectations))
 	installerkit.LogCommandResult(result, err, log)
 	if err != nil {
 		return StatusResult{Status: "error", InstallRoot: installRoot, Message: err.Error()}, fmt.Errorf("AIFAR service status check failed: %w", err)
@@ -50,11 +119,20 @@ func (i Inspector) Check(ctx context.Context, server store.Server, installRoot s
 	return status, nil
 }
 
-func statusCommand(installRoot string) string {
+func statusCommand(installRoot string, expectations []serviceExpectation) string {
+	assignments := make([]string, 0, len(expectations))
+	for _, expectation := range expectations {
+		name := cleanAIFARServiceName(expectation.Name)
+		if name == "" || expectation.Replicas <= 0 || !aifarServiceSupported(name) {
+			continue
+		}
+		assignments = append(assignments, fmt.Sprintf("%s=%d", name, expectation.Replicas))
+	}
 	return "sh -s <<'AIFAR_SERVICE_STATUS'\n" + `#!/usr/bin/env sh
 set -u
 
 INSTALL_ROOT=` + installerkit.ShellQuote(installRoot) + `
+EXPECTED_SERVICES=` + installerkit.ShellQuote(strings.Join(assignments, " ")) + `
 MODEL_FILE="$INSTALL_ROOT/.aifar/model.json"
 MODEL=""
 RELEASE_ID=""
@@ -63,6 +141,8 @@ INSTALL_ROOT_EXISTS="false"
 TOTAL=0
 RUNNING=0
 UNHEALTHY=0
+EXPECTED=0
+MISSING=0
 STALE=0
 INGRESS_RUNNING="false"
 CONTAINERS=""
@@ -84,11 +164,19 @@ if [ -f "$MODEL_FILE" ]; then
   RELEASE_ID="$(manifest_json_value "$MODEL_FILE" revision || true)"
 fi
 
+if [ "$MODEL" = "` + orchestrationModelK8sLikeV1 + `" ] && [ -z "$EXPECTED_SERVICES" ]; then
+  STATUS="offline"
+fi
+
 if command -v docker >/dev/null 2>&1 && [ "$MODEL" = "` + orchestrationModelK8sLikeV1 + `" ]; then
   if command -v aifar-agent >/dev/null 2>&1 && aifar-agent status >/dev/null 2>&1; then
     INGRESS_RUNNING="true"
   fi
-  for service in ` + serviceOrderText() + `; do
+  for entry in $EXPECTED_SERVICES; do
+    service="${entry%%=*}"
+    desired="${entry#*=}"
+    EXPECTED=$((EXPECTED + desired))
+    service_healthy=0
     names="$(docker ps -a --filter "label=aifar.app=aifar" --filter "label=aifar.install-root=$INSTALL_ROOT" --filter "label=aifar.component=pod" --filter "label=aifar.service=$service" --format '{{.Names}}' 2>/dev/null || true)"
     for name in $names; do
       TOTAL=$((TOTAL + 1))
@@ -98,16 +186,26 @@ if command -v docker >/dev/null 2>&1 && [ "$MODEL" = "` + orchestrationModelK8sL
       CONTAINERS="${CONTAINERS}${service}:${name}:${revision}:${running}:${health},"
       if [ "$running" = "true" ]; then
         RUNNING=$((RUNNING + 1))
+        if [ "$health" != "unhealthy" ]; then
+          service_healthy=$((service_healthy + 1))
+        fi
       fi
       if [ "$health" = "unhealthy" ]; then
         UNHEALTHY=$((UNHEALTHY + 1))
       fi
     done
+    if [ "$service_healthy" -lt "$desired" ]; then
+      MISSING=$((MISSING + desired - service_healthy))
+    fi
   done
-  if [ "$TOTAL" -gt 0 ] && [ "$RUNNING" -eq "$TOTAL" ] && [ "$UNHEALTHY" -eq 0 ] && [ "$INGRESS_RUNNING" = "true" ]; then
+  if [ "$EXPECTED" -eq 0 ]; then
+    STATUS="offline"
+  elif [ "$MISSING" -eq 0 ] && [ "$UNHEALTHY" -eq 0 ] && [ "$INGRESS_RUNNING" = "true" ]; then
     STATUS="running"
   elif [ "$RUNNING" -gt 0 ]; then
     STATUS="degraded"
+  else
+    STATUS="stopped"
   fi
 fi
 
@@ -118,6 +216,8 @@ echo "releaseId=$RELEASE_ID"
 echo "totalContainers=$TOTAL"
 echo "runningContainers=$RUNNING"
 echo "unhealthyContainers=$UNHEALTHY"
+echo "expectedContainers=$EXPECTED"
+echo "missingContainers=$MISSING"
 echo "staleContainers=$STALE"
 echo "ingressRunning=$INGRESS_RUNNING"
 echo "containers=$CONTAINERS"
@@ -146,6 +246,10 @@ func parseStatusOutput(output string) StatusResult {
 			result.RunningContainers = atoi(value)
 		case "unhealthyContainers":
 			result.UnhealthyContainers = atoi(value)
+		case "expectedContainers":
+			result.ExpectedContainers = atoi(value)
+		case "missingContainers":
+			result.MissingContainers = atoi(value)
 		case "staleContainers":
 			result.StaleContainers = atoi(value)
 		case "ingressRunning":

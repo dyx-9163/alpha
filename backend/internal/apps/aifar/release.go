@@ -387,11 +387,7 @@ func serviceListOrDefault(services []string) []string {
 			continue
 		}
 		selected[service] = true
-	}
-	for _, service := range serviceOrder {
-		if selected[service] {
-			out = append(out, service)
-		}
+		out = append(out, service)
 	}
 	if len(out) == 0 {
 		return serviceOrder

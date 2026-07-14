@@ -1,0 +1,1 @@
+{"schema":"aifar-runtime-service-v1","name":"permission","displayName":{"zh":"权限 permission","en":"Permission"},"kind":"java","applicationName":"alpha-permission","port":38010,"required":false,"artifactExtensions":[".jar"],"healthPath":"/actuator/health/readiness","affinityPolicy":"round-robin"}

@@ -63,7 +63,11 @@ service_port_var() {
 }
 
 service_port() {
-  var="$(service_port_var "$1")"
+  service="$1"
+  value="$(read_env_value "$ENV_DIR/$service.env" AIFAR_SERVICE_PORT "")"
+  [ -n "$value" ] || value="$(read_env_value "$ENV_DIR/$service.env" SERVER_PORT "")"
+  [ -n "$value" ] && { printf "%s" "$value"; return; }
+  var="$(service_port_var "$service")"
   [ -n "$var" ] || return 0
   read_env_value "$ENV_DIR/compose.env" "$var" ""
 }
@@ -88,4 +92,9 @@ command -v aifar-agent >/dev/null 2>&1 || fail "aifar-agent is not installed"
 [ -d "$ENV_DIR" ] || fail "AIFAR runtime env directory is missing"
 
 aifar-agent reconcile-runtime --spec "$SPEC_PATH"
-open_service_ports gateway oauth permission system file message im contacts meeting web-vue3
+runtime_services=""
+for pair in $(read_env_value "$ENV_DIR/compose.env" AIFAR_DESIRED_REPLICAS ""); do
+  runtime_services="$runtime_services ${pair%%=*}"
+done
+# shellcheck disable=SC2086
+open_service_ports $runtime_services

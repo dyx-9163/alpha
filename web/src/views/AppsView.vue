@@ -190,9 +190,10 @@ import type { Component } from 'vue'
 import { ElMessage } from 'element-plus'
 import { apiGet, apiPost, asArray } from '../api/client'
 import { pairedAppCatalog, type AppCatalogResponse, type AppStoreItem } from '../apps/registry/catalog'
+import { installedGroupStatus } from '../apps/installedStatus'
 import { frontendModuleFor } from '../apps/registry/loader'
 import { resolveAppLocale } from '../apps/registry/types'
-import type { AppFrontendModule, AppInstallDialogContext, AppInstallFieldValues, AppInstallPayload, AppInstallValidationContext, CredentialOption, ServerOption } from '../apps/registry/contract'
+import type { AppFrontendModule, AppInstallDialogContext, AppInstallFieldValues, AppInstallModuleOption, AppInstallPayload, AppInstallValidationContext, CredentialOption, ServerOption } from '../apps/registry/contract'
 import AppInstanceTable from '../components/AppInstanceTable.vue'
 import PageShell from '../components/PageShell.vue'
 import StatusTag from '../components/StatusTag.vue'
@@ -211,6 +212,7 @@ const instances = ref<AppInstanceTableRecord[]>([])
 const servers = ref<ServerOption[]>([])
 const appSettings = ref<{ defaultDeployDir?: string; maxRequestBodyBytes?: number }>({})
 const credentials = ref<CredentialOption[]>([])
+const installModules = ref<Record<string, AppInstallModuleOption[]>>({})
 const activeTab = ref('all')
 const category = ref('all')
 const installSubmitting = ref(false)
@@ -229,7 +231,8 @@ const installDialogContext = computed<AppInstallDialogContext>(() => ({
   servers: servers.value,
   instances: liveInstances.value,
   credentials: credentials.value,
-  defaultDeployDir: appSettings.value.defaultDeployDir || '/aifar/apps'
+  defaultDeployDir: appSettings.value.defaultDeployDir || '/aifar/apps',
+  installModules: installModules.value
 }))
 const moduleDialogConfig = computed(() => moduleDialogModule.value?.installDialogProps?.(locale.value, installDialogContext.value) ?? {})
 const moduleDialogServers = computed(() => {
@@ -391,10 +394,7 @@ function topologyLabel(value: string) {
 }
 
 function groupInstalledStatus(members: AppInstanceTableRecord[]) {
-  if (members.some((member) => ['failed', 'install_failed', 'error', 'unavailable'].includes(String(member.status || '').toLowerCase()) || truthyValue(metadataOf(member).installFailed))) {
-    return 'failed'
-  }
-  return 'installed'
+  return installedGroupStatus(members)
 }
 
 function appLabel(app: string) {
@@ -433,10 +433,6 @@ function metadataOf(row: AppInstanceTableRecord): InstanceMetadata {
 function stringMeta(metadata: InstanceMetadata, key: string) {
   const value = metadata[key]
   return typeof value === 'string' ? value.trim() : ''
-}
-
-function truthyValue(value: unknown) {
-  return value === true || value === 1 || ['true', '1', 'yes', 'y'].includes(String(value ?? '').trim().toLowerCase())
 }
 
 function uniqueValues(values: string[]) {
@@ -501,6 +497,7 @@ function openInstallDialog(app: AppStoreItem) {
 
 async function load() {
   backendCatalog.value = await apiGet<AppCatalogResponse>(`/apps/catalog?lang=${locale.value}`).catch(() => ({}))
+  await loadInstallModules()
   instances.value = asArray(await apiGet<AppInstanceTableRecord[] | null>('/apps/instances').catch(() => []))
   servers.value = asArray(await apiGet<ServerOption[] | null>('/servers').catch(() => []))
   credentials.value = asArray(await apiGet<CredentialOption[] | null>('/credentials?status=active').catch(() => []))
@@ -514,6 +511,17 @@ async function rescan() {
   }
   await apiPost('/resources/rescan')
   backendCatalog.value = await apiGet<AppCatalogResponse>(`/apps/catalog?lang=${locale.value}`).catch(() => ({}))
+  await loadInstallModules()
+}
+
+async function loadInstallModules() {
+  try {
+    const modules = asArray<AppInstallModuleOption>(await apiGet<AppInstallModuleOption[]>(`/apps/aifar/install-modules?version=runtime-v2&lang=${locale.value}`))
+    installModules.value = { ...installModules.value, aifar: modules }
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err)
+    ElMessage.error(t('apps.installModulesLoadFailed', { message }))
+  }
 }
 
 async function submitModuleInstall(payload: AppInstallPayload) {

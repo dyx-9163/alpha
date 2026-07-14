@@ -1,0 +1,1 @@
+{"schema":"aifar-runtime-service-v1","name":"system","displayName":{"zh":"系统 system","en":"System"},"kind":"java","applicationName":"alpha-system","port":38002,"required":false,"artifactExtensions":[".jar"],"healthPath":"/actuator/health/readiness","affinityPolicy":"round-robin"}

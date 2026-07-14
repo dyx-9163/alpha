@@ -210,7 +210,7 @@ func (s Service) UpdateArtifactBundle(ctx context.Context, req ArtifactBundleUpd
 			InstallRoot:     installRoot,
 			WorkDir:         workDir,
 			ReleaseDir:      releaseDir,
-			ServiceOrder:    serviceOrderText(),
+			ServiceOrder:    strings.Join(servicesFromMetadata(metadata), " "),
 			ChangedServices: artifactServiceNamesText(artifacts),
 			Artifacts:       scriptArtifacts,
 			Version:         version,
@@ -443,7 +443,7 @@ func (s Service) artifactBundleItemsFromRequest(req ArtifactBundleUpdateRequest,
 		if fileName == "" {
 			return fail(errors.New(copy.ArtifactRequired))
 		}
-		if !artifactTypeAllowed(serviceName, fileName) {
+		if !artifactTypeAllowedForInstance(req.Instance, serviceName, fileName) {
 			return fail(fmt.Errorf(copy.ArtifactTypeInvalid, serviceName))
 		}
 		if !artifactFileMatchesService(serviceName, fileName) {

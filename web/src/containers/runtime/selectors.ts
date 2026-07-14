@@ -15,20 +15,26 @@ export type RuntimeAppInstance = {
   metadata?: string
 }
 
-export const aifarServiceNames = [
-  'oauth',
-  'permission',
-  'system',
-  'file',
-  'message',
-  'im',
-  'contacts',
-  'meeting',
-  'gateway',
-  'web-vue3'
-]
-
-export const aifarServiceOptions = aifarServiceNames.map((name) => ({ value: name, label: name }))
+export function buildAifarServiceOptions(
+  modules: Array<{ name: string; displayName?: string }> = [],
+  discoveredNames: string[] = []
+) {
+  const seen = new Set<string>()
+  const out: Array<{ value: string; label: string }> = []
+  for (const module of modules) {
+    const name = String(module.name || '').trim()
+    if (!name || seen.has(name)) continue
+    seen.add(name)
+    out.push({ value: name, label: String(module.displayName || name) })
+  }
+  for (const raw of discoveredNames) {
+    const name = String(raw || '').trim()
+    if (!name || seen.has(name)) continue
+    seen.add(name)
+    out.push({ value: name, label: name })
+  }
+  return out
+}
 
 export function findSelectedRuntimeInstance(instances: AifarRuntimeInstance[], selectedId: string) {
   const current = instances.find((instance) => instance.id === selectedId)

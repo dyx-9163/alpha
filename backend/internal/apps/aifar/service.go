@@ -37,6 +37,10 @@ type Store interface {
 	DeleteAppInstance(id string) error
 }
 
+type resourceLister interface {
+	ListResources() ([]store.Resource, error)
+}
+
 type releaseStore interface {
 	SaveAppRelease(v store.AppRelease) (store.AppRelease, error)
 	ListAppReleases(instanceID string) ([]store.AppRelease, error)
@@ -91,6 +95,7 @@ type CheckRequest struct {
 	Instance store.AppInstance
 	Server   store.Server
 	Language string
+	Actor    string
 }
 
 type ArtifactUpdateRequest struct {
@@ -421,14 +426,10 @@ func (s Service) Install(ctx context.Context, req InstallRequest, resources []st
 	}
 
 	var bundle Bundle
+	var serviceDefinitions []serviceDefinition
 	var archiveLocal string
 	options := optionsFromParameters(req.Parameters)
 	if err := step(2, func() error {
-		var resolveErr error
-		options, resolveErr = s.resolveInstallOptions(options)
-		if resolveErr != nil {
-			return resolveErr
-		}
 		var bundleErr error
 		bundle, bundleErr = SelectBundle(resources, req.Version)
 		if bundleErr != nil {
@@ -436,6 +437,20 @@ func (s Service) Install(ctx context.Context, req InstallRequest, resources []st
 		}
 		if err := VerifyBundle(bundle); err != nil {
 			return err
+		}
+		serviceDefinitions, bundleErr = discoverBundleServices(bundle)
+		if bundleErr != nil {
+			return bundleErr
+		}
+		selected := sliceParam(req.Parameters, "selectedServices", serviceNames(serviceDefinitions))
+		if err := validateSelectedServicesForCatalog(selected, serviceDefinitions); err != nil {
+			return err
+		}
+		options.SelectedServices = normalizeSelectedServicesForCatalog(selected, serviceDefinitions)
+		var resolveErr error
+		options, resolveErr = s.resolveInstallOptions(options)
+		if resolveErr != nil {
+			return resolveErr
 		}
 		if err := options.Validate(); err != nil {
 			return err
@@ -466,6 +481,7 @@ func (s Service) Install(ctx context.Context, req InstallRequest, resources []st
 	}
 	scriptRemote := workDir + "/install-aifar.sh"
 	metadata := installMetadata(server, installRoot, bundle.Version, releaseID, releaseTime, configHash, options, req.Actor)
+	metadata["serviceCatalog"] = serviceCatalogMetadataForInstall(serviceDefinitions, options.GatewayPort, options.WebPort)
 	metadata["installState"] = "installing"
 	if strings.TrimSpace(req.TaskID) != "" {
 		metadata["taskId"] = strings.TrimSpace(req.TaskID)
@@ -523,17 +539,32 @@ func (s Service) Install(ctx context.Context, req InstallRequest, resources []st
 			}
 		}
 		script, err := renderInstallScript(installScriptData{
-			InstallRoot:       installRoot,
-			WorkDir:           workDir,
-			ArchiveRemote:     archiveRemote,
-			AgentBinaryRemote: agentRemote,
-			ServiceOrder:      strings.Join(options.SelectedServices, " "),
-			Version:           bundle.Version,
-			ReleaseID:         releaseID,
-			CreatedAt:         releaseTime.Format(time.RFC3339),
-			ConfigHash:        configHash,
-			IngressNetwork:    ingressNetwork,
-			Options:           options,
+			InstallRoot:         installRoot,
+			WorkDir:             workDir,
+			ArchiveRemote:       archiveRemote,
+			AgentBinaryRemote:   agentRemote,
+			ServiceOrder:        strings.Join(options.SelectedServices, " "),
+			ServiceApplications: serviceCatalogPairs(serviceDefinitions, options.SelectedServices, func(definition serviceDefinition) string { return definition.ApplicationName }),
+			ServicePorts: serviceCatalogPairs(serviceDefinitions, options.SelectedServices, func(definition serviceDefinition) string {
+				if definition.Role == "gateway" {
+					return fmt.Sprint(options.GatewayPort)
+				}
+				if definition.Role == "web" {
+					return fmt.Sprint(options.WebPort)
+				}
+				return fmt.Sprint(definition.Port)
+			}),
+			ServiceKinds:       serviceCatalogPairs(serviceDefinitions, options.SelectedServices, func(definition serviceDefinition) string { return definition.Kind }),
+			ServiceHealthPaths: serviceCatalogPairs(serviceDefinitions, options.SelectedServices, func(definition serviceDefinition) string { return definition.HealthPath }),
+			ServiceAffinities:  serviceCatalogPairs(serviceDefinitions, options.SelectedServices, func(definition serviceDefinition) string { return definition.AffinityPolicy }),
+			GatewayService:     serviceNameForRole(serviceDefinitions, "gateway"),
+			WebService:         serviceNameForRole(serviceDefinitions, "web"),
+			Version:            bundle.Version,
+			ReleaseID:          releaseID,
+			CreatedAt:          releaseTime.Format(time.RFC3339),
+			ConfigHash:         configHash,
+			IngressNetwork:     ingressNetwork,
+			Options:            options,
 		})
 		if err != nil {
 			return err
@@ -590,7 +621,7 @@ func (s Service) Install(ctx context.Context, req InstallRequest, resources []st
 		if saveErr != nil {
 			return saveErr
 		}
-		if err := s.saveInitialControlPlane(instance.ID, releaseID, bundle.Version, configHash, options, releaseTime); err != nil {
+		if err := s.saveInitialControlPlane(instance.ID, releaseID, bundle.Version, configHash, options, serviceDefinitions, releaseTime); err != nil {
 			return err
 		}
 		if releases, ok := s.store.(releaseStore); ok {
@@ -677,9 +708,9 @@ func installMetadata(server store.Server, installRoot, version, releaseID string
 	return metadata
 }
 
-func (s Service) saveInitialControlPlane(instanceID, revision, version, configHash string, options InstallOptions, now time.Time) error {
+func (s Service) saveInitialControlPlane(instanceID, revision, version, configHash string, options InstallOptions, definitions []serviceDefinition, now time.Time) error {
 	if orch, ok := s.store.(aifarOrchestrationStore); ok {
-		return saveControlPlaneRevision(orch, instanceID, version, revision, configHash, desiredReplicasForServices(options.SelectedServices), options.GatewayPort, options.WebPort, options.SelectedServices, now)
+		return saveControlPlaneRevision(orch, instanceID, version, revision, configHash, desiredReplicasForServices(options.SelectedServices), options.GatewayPort, options.WebPort, options.SelectedServices, now, servicePorts(definitions))
 	}
 	return nil
 }
@@ -694,7 +725,7 @@ func (s Service) saveRolloutControlPlane(instanceID, version, revision, serviceN
 	return nil
 }
 
-func saveControlPlaneRevision(orch aifarOrchestrationStore, instanceID, version, revision, artifactHash string, desired map[string]int, gatewayPort, webPort int, services []string, now time.Time) error {
+func saveControlPlaneRevision(orch aifarOrchestrationStore, instanceID, version, revision, artifactHash string, desired map[string]int, gatewayPort, webPort int, services []string, now time.Time, portCatalog ...map[string]int) error {
 	strategy := `{"type":"RollingUpdate","maxSurge":1,"maxUnavailable":0,"drainSeconds":30}`
 	for _, service := range services {
 		replicas := desired[service]
@@ -702,6 +733,9 @@ func saveControlPlaneRevision(orch aifarOrchestrationStore, instanceID, version,
 			replicas = 0
 		}
 		port := serviceDefaultPort(service, gatewayPort, webPort)
+		if len(portCatalog) > 0 && portCatalog[0][service] > 0 {
+			port = portCatalog[0][service]
+		}
 		if _, err := orch.SaveAIFARDeployment(store.AIFARDeployment{
 			InstanceID:      instanceID,
 			ServiceName:     service,
@@ -1186,7 +1220,7 @@ func (s Service) UpdateArtifact(ctx context.Context, req ArtifactUpdateRequest, 
 			InstallRoot:      installRoot,
 			WorkDir:          workDir,
 			ReleaseDir:       releaseDir,
-			ServiceOrder:     serviceOrderText(),
+			ServiceOrder:     strings.Join(servicesFromMetadata(metadata), " "),
 			ServiceName:      artifact.ServiceName,
 			ArtifactRemote:   artifactRemote,
 			ReleaseArtifact:  releaseArtifact,
@@ -1327,7 +1361,7 @@ func artifactInfoFromRequest(req ArtifactUpdateRequest, copy UpdateCopy) (artifa
 	if fileName == "." || fileName == string(filepath.Separator) || strings.TrimSpace(fileName) == "" {
 		return artifactInfo{}, errors.New(copy.ArtifactRequired)
 	}
-	if !artifactTypeAllowed(serviceName, fileName) {
+	if !artifactTypeAllowedForInstance(req.Instance, serviceName, fileName) {
 		return artifactInfo{}, fmt.Errorf(copy.ArtifactTypeInvalid, serviceName)
 	}
 	if !artifactFileMatchesService(serviceName, fileName) {
@@ -1345,12 +1379,7 @@ func cleanAIFARServiceName(value string) string {
 }
 
 func aifarServiceSupported(serviceName string) bool {
-	for _, service := range serviceOrder {
-		if service == serviceName {
-			return true
-		}
-	}
-	return false
+	return serviceNamePattern.MatchString(cleanAIFARServiceName(serviceName))
 }
 
 func artifactTypeAllowed(serviceName, fileName string) bool {
@@ -1362,6 +1391,20 @@ func artifactTypeAllowed(serviceName, fileName string) bool {
 			strings.HasSuffix(name, ".tar.gz")
 	}
 	return strings.HasSuffix(name, ".jar")
+}
+
+func artifactTypeAllowedForInstance(instance store.AppInstance, serviceName, fileName string) bool {
+	definitions := serviceDefinitionsFromMetadata(metadataFromInstance(instance))
+	if definition, ok := catalogDefinition(definitions, serviceName); ok {
+		name := strings.ToLower(strings.TrimSpace(fileName))
+		for _, extension := range definition.ArtifactExtensions {
+			if strings.HasSuffix(name, strings.ToLower(strings.TrimSpace(extension))) {
+				return true
+			}
+		}
+		return false
+	}
+	return artifactTypeAllowed(serviceName, fileName)
 }
 
 func artifactFileMatchesService(serviceName, fileName string) bool {
@@ -1626,7 +1669,7 @@ func (s Service) Delete(ctx context.Context, req DeleteRequest, log Logger, targ
 	}
 
 	if err := step(3, func() error {
-		status, err := NewInspector(s.remote).Check(ctx, req.Server, installRoot, logForServer)
+		status, err := NewInspector(s.remote).Check(ctx, req.Server, installRoot, nil, logForServer)
 		if err != nil {
 			return err
 		}
@@ -1673,8 +1716,8 @@ func (s Service) Check(ctx context.Context, req CheckRequest, log Logger, target
 	var scaleStatusOK bool
 	if err := step(1, func() error {
 		var checkErr error
-		status, checkErr = NewInspector(s.remote).Check(ctx, req.Server, installRoot, logForServer)
-		if checkErr == nil {
+		status, checkErr = NewInspector(s.remote).Check(ctx, req.Server, installRoot, serviceExpectations(metadata), logForServer)
+		if checkErr == nil && !strings.EqualFold(strings.TrimSpace(req.Actor), "collector") {
 			if collected, collectErr := collectAutoscaleStatus(ctx, s.remote, req.Server, installRoot); collectErr == nil {
 				scaleStatus = collected
 				scaleStatusOK = true
@@ -1698,6 +1741,8 @@ func (s Service) Check(ctx context.Context, req CheckRequest, log Logger, target
 		"totalContainers":     status.TotalContainers,
 		"runningContainers":   status.RunningContainers,
 		"unhealthyContainers": status.UnhealthyContainers,
+		"expectedContainers":  status.ExpectedContainers,
+		"missingContainers":   status.MissingContainers,
 		"staleContainers":     status.StaleContainers,
 		"ingressRunning":      status.IngressRunning,
 		"containers":          status.Containers,
@@ -1731,17 +1776,24 @@ func (s Service) markInstanceStatus(instance store.AppInstance, status string, d
 }
 
 type installScriptData struct {
-	InstallRoot       string
-	WorkDir           string
-	ArchiveRemote     string
-	AgentBinaryRemote string
-	ServiceOrder      string
-	Version           string
-	ReleaseID         string
-	CreatedAt         string
-	ConfigHash        string
-	IngressNetwork    string
-	Options           InstallOptions
+	InstallRoot         string
+	WorkDir             string
+	ArchiveRemote       string
+	AgentBinaryRemote   string
+	ServiceOrder        string
+	ServiceApplications string
+	ServicePorts        string
+	ServiceKinds        string
+	ServiceHealthPaths  string
+	ServiceAffinities   string
+	GatewayService      string
+	WebService          string
+	Version             string
+	ReleaseID           string
+	CreatedAt           string
+	ConfigHash          string
+	IngressNetwork      string
+	Options             InstallOptions
 }
 
 type uninstallScriptData struct {
