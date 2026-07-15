@@ -148,3 +148,13 @@
 - 结论：`DeleteAppInstance` 事务现在同步删除该实例的 `app.instance`/`aifar.runtime` 当前快照及历史；Alert Manager 评估 runtime 快照前建立现存 app instance ID 集合，孤儿快照不进入 active fingerprint，已有提醒会由 `ResolveMissingSystemAlerts` 自动恢复。两条回归测试均先复现失败再修复；完整 Go 测试和后端构建通过。完整测试首轮仅既有 Collector 计时断言偶发 139.7ms 失败，单测复跑及完整门禁复跑均通过。运行进程早于新二进制，需重启后现场提醒才会在下一采集周期恢复。
 - 问题：用户询问 Pods 页签“启动/恢复 Pods”按钮的作用。
 - 结论：该按钮与上方“同步运行时”当前调用同一个 `/containers/aifar/runtime/reconcile` API 并创建 `aifar.reconcile` 任务；后端把实例保存的 runtime spec 交给 `aifar-agent reconcile-runtime`。Agent 按 Deployment 期望副本确保容器存在且健康：启动已停止容器、创建缺失副本、重启不健康容器、替换 spec 漂移容器、删除超额副本并刷新 Service/Endpoint/Nacos 代理状态；期望副本为 0 的已下线服务不会被拉起。该操作不重新安装 AIFAR，也不恢复数据备份，且要求 agent、runtime spec 和 env 目录仍存在。
+
+## 2026-07-15
+- 问题：用户运行 `pnpm package` 时大量出现 `compile: version "go1.25.11" does not match go tool version "go1.24.8"`。
+- 结论：根因是 `D:\tools\go` 曾被不同 Go 版本覆盖且共享的 `D:\tools\gocache` 保留了 Go 1.25.11 标准库缓存/包索引；已用 SHA256 与 Go 官方发布值一致的本地 `go1.24.8.windows-amd64.zip` 干净重装 GOROOT，并备份后重建 Go 缓存。以空的可写缓存运行 `pnpm package` 成功，生成 Linux/Windows 目录和归档；Go 目录与旧缓存备份分别保留为 `D:\tools\go.mixed-20260715`、`D:\tools\gocache.go1.25.11-stale-20260715`。
+- 问题：用户要求清空本轮不必要的本地缓存。
+- 结论：已删除旧 Go 目录备份、被污染的旧 Go 缓存、当前 Go 构建缓存，以及仓库根目录和 backend 下的 `.cache/.gocache`，合计约 6.47 GiB；重新创建空的 `D:\tools\gocache`，保留当前 Go 1.24.8、依赖、离线资源、数据库和 `deploy/deployment` 发布产物。
+- 问题：Redis Sentinel 服务正常，但数据库页将三个 Redis 数据节点显示为离线、服务不可用，Sentinel 显示在线。
+- 结论：现场三个 Redis 实例均绑定有效凭据，实例 `lastCheck` 与 `sentinelLastCheck` 都为 running；误报来自 `app.instance` 状态快照被 Collector 在单实例 5 秒期限处写为 `unavailable / collector timeout after 5s`。Sentinel 检测每实例串行执行数据与哨兵运行检查、服务访问规则、拓扑查询、端点探测和角色查询，多次 SSH 往返超过 5 秒；检测约在超时快照后 0.1 秒完成并把实例写回 running，但数据库页优先使用快照，因此仍显示离线。
+- 问题：用户要求修复 Redis Sentinel 服务正常但 Collector 超时误报离线的问题。
+- 结论：Redis 模块现已透传 `CheckRequest.Actor`；后台 Collector 使用单次只读 SSH 同时检查本地 Redis/Sentinel systemd、认证 PING 和本地数据角色，不再执行服务访问规则、完整 Sentinel 拓扑查询或逐端点探测，人工检测仍保留完整流程。TDD 先复现旧路径 8 次 SSH；Redis、Collector、Adapter、完整 Go 后端测试及双平台后端构建通过，构建需使用仓库内可写 GOCACHE。
