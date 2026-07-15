@@ -229,6 +229,7 @@ func (m Module) Check(ctx context.Context, req registry.CheckRequest, run regist
 		Server:          req.Server,
 		Language:        req.Language,
 		DefaultPassword: m.defaultPassword,
+		Actor:           req.Actor,
 	}, run.Log, func(target string) Logger {
 		return run.LoggerForTarget(target)
 	})

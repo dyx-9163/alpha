@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"aifar-deployment/backend/internal/adapter"
+	"aifar-deployment/backend/internal/apps/registry"
 	"aifar-deployment/backend/internal/store"
 )
 
@@ -433,6 +434,133 @@ func TestServiceCheckUsesBoundRedisCredential(t *testing.T) {
 	}
 	if strings.Contains(commands, "panel-default-password") {
 		t.Fatalf("Redis check must not use the panel default password when an instance credential is bound: %s", commands)
+	}
+}
+
+func TestModuleCollectorCheckUsesOneReadOnlyCommand(t *testing.T) {
+	instance := store.AppInstance{
+		ID:       "redis-collector-1",
+		App:      "redis",
+		Version:  "7.2.14",
+		ServerID: "srv-1",
+		Status:   "running",
+		Topology: "sentinel",
+		Metadata: `{"port":6379,"sentinel":true,"sentinelPort":26379,"masterName":"aifar-master","role":"master"}`,
+	}
+	s := &fakeStore{
+		servers: map[string]store.Server{
+			"srv-1": {ID: "srv-1", Name: "redis-1", Host: "10.0.0.1", DeployDir: "/aifar/apps"},
+		},
+		instances: []store.AppInstance{instance},
+		credentials: map[string]store.Credential{
+			"cred-redis": {
+				ID:     "cred-redis",
+				Kind:   "redis",
+				Status: "active",
+				Secret: map[string]string{"password": "custom-redis-password"},
+			},
+		},
+		credentialReferences: []store.CredentialReference{
+			{
+				CredentialID: "cred-redis",
+				ResourceType: "app-instance",
+				ResourceID:   instance.ID,
+				Purpose:      "redis",
+			},
+		},
+	}
+	remote := &fakeRemote{responses: map[string]adapter.CommandResult{
+		"AIFAR_REDIS_CHECK_V1": {Stdout: "AIFAR_REDIS_CHECK_V1\ndata=running\nsentinel=running\nrole=master\n"},
+	}}
+	module := NewModule(s, remote, "panel-default-password")
+	status, err := module.Check(context.Background(), registry.CheckRequest{
+		Instance: instance,
+		Server:   s.servers["srv-1"],
+		Language: "en",
+		Actor:    "collector",
+	}, registry.RunContext{Log: fakeLogger{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := len(remote.commands); got != 1 {
+		t.Fatalf("collector Redis check should use one remote command, got %d: %s", got, remote.joinedCommands())
+	}
+	command := remote.joinedCommands()
+	for _, forbidden := range []string{"open_firewall_ports", "SENTINEL replicas", "SENTINEL sentinels", "get-master-addr-by-name"} {
+		if strings.Contains(command, forbidden) {
+			t.Fatalf("collector command must remain lightweight and read-only; found %q in %s", forbidden, command)
+		}
+	}
+	if !strings.Contains(command, "custom-redis-password") || strings.Contains(command, "panel-default-password") {
+		t.Fatalf("collector command must use the bound Redis credential: %s", command)
+	}
+	if !strings.Contains(command, "printf '%s\\n' 'AIFAR_REDIS_CHECK_V1'") {
+		t.Fatalf("collector command must print the version marker on its own line: %s", command)
+	}
+	if status.Status != "running" {
+		t.Fatalf("expected running collector status, got %+v", status)
+	}
+}
+
+func TestParseRedisCollectorCheckOutput(t *testing.T) {
+	tests := []struct {
+		name            string
+		stdout          string
+		expectsData     bool
+		expectsSentinel bool
+		wantStatus      string
+		wantRole        string
+		wantErr         bool
+	}{
+		{
+			name:            "data and sentinel running",
+			stdout:          "AIFAR_REDIS_CHECK_V1\ndata=running\nsentinel=running\nrole=master\n",
+			expectsData:     true,
+			expectsSentinel: true,
+			wantStatus:      "running",
+			wantRole:        "master",
+		},
+		{
+			name:            "data failed and sentinel running",
+			stdout:          "AIFAR_REDIS_CHECK_V1\ndata=failed\nsentinel=running\nrole=replica\n",
+			expectsData:     true,
+			expectsSentinel: true,
+			wantStatus:      "degraded",
+			wantRole:        "replica",
+		},
+		{
+			name:        "missing version marker",
+			stdout:      "data=running\nrole=master\n",
+			expectsData: true,
+			wantErr:     true,
+		},
+		{
+			name:            "missing expected sentinel marker",
+			stdout:          "AIFAR_REDIS_CHECK_V1\ndata=running\nrole=master\n",
+			expectsData:     true,
+			expectsSentinel: true,
+			wantErr:         true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			runtime, role, err := parseRedisCollectorCheckOutput(tt.stdout, tt.expectsData, tt.expectsSentinel)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("expected parser error")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := runtime.aggregateStatus(); got != tt.wantStatus {
+				t.Fatalf("expected aggregate status %q, got %q", tt.wantStatus, got)
+			}
+			if role != tt.wantRole {
+				t.Fatalf("expected role %q, got %q", tt.wantRole, role)
+			}
+		})
 	}
 }
 

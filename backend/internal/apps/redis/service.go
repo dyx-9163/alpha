@@ -52,6 +52,7 @@ type CheckRequest struct {
 	Server          store.Server
 	Language        string
 	DefaultPassword string
+	Actor           string
 }
 
 type CheckResult struct {
@@ -573,6 +574,9 @@ func (s Service) Check(ctx context.Context, req CheckRequest, log Logger, target
 	password, err := s.redisCheckPassword(req.Instance, req.DefaultPassword)
 	if err != nil {
 		return fail(err)
+	}
+	if strings.EqualFold(strings.TrimSpace(req.Actor), "collector") {
+		return s.checkRedisCollector(ctx, req, password)
 	}
 
 	if err := step(1, "check-runtime", copyWithFallback(copy.CheckRuntime, "检查 Redis 运行状态"), func() error {
