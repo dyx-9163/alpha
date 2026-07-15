@@ -157,4 +157,30 @@
 - 问题：Redis Sentinel 服务正常，但数据库页将三个 Redis 数据节点显示为离线、服务不可用，Sentinel 显示在线。
 - 结论：现场三个 Redis 实例均绑定有效凭据，实例 `lastCheck` 与 `sentinelLastCheck` 都为 running；误报来自 `app.instance` 状态快照被 Collector 在单实例 5 秒期限处写为 `unavailable / collector timeout after 5s`。Sentinel 检测每实例串行执行数据与哨兵运行检查、服务访问规则、拓扑查询、端点探测和角色查询，多次 SSH 往返超过 5 秒；检测约在超时快照后 0.1 秒完成并把实例写回 running，但数据库页优先使用快照，因此仍显示离线。
 - 问题：用户要求修复 Redis Sentinel 服务正常但 Collector 超时误报离线的问题。
-- 结论：Redis 模块现已透传 `CheckRequest.Actor`；后台 Collector 使用单次只读 SSH 同时检查本地 Redis/Sentinel systemd、认证 PING 和本地数据角色，不再执行服务访问规则、完整 Sentinel 拓扑查询或逐端点探测，人工检测仍保留完整流程。TDD 先复现旧路径 8 次 SSH；Redis、Collector、Adapter、完整 Go 后端测试及双平台后端构建通过，构建需使用仓库内可写 GOCACHE。
+- 结论：Redis 模块现已透传 `CheckRequest.Actor`；后台 Collector 使用单次只读 SSH 同时检查本地 Redis/Sentinel systemd、认证 PING 和本地数据角色，不再执行服务访问规则、完整 Sentinel 拓扑查询或逐端点探测，人工检测仍保留完整流程。TDD 先复现旧路径 8 次 SSH；Redis 专项测试和双平台后端构建通过，完整 Go 后端测试曾通过，最终复跑仅既有 `TestDockerSummaryCollectorTimeoutDoesNotBlockOtherHosts` 的严格 100ms 计时断言在本机以 104-109ms 稳定失败，与本改动无关；构建需使用仓库内可写 GOCACHE。
+
+## 2026-07-16
+- 问题：用户询问如果要在 AIFAR 中添加新的 Java 服务，需要在哪些地方加东西。
+- 结论：当前 AIFAR Runtime v2 业务服务已改成目录驱动；新增普通 Java 微服务优先在 `resources/aifar/runtime-v2/services/<service>/` 增加 `service.json`、`Dockerfile` 和 `target/*.jar` 等 Dockerfile 引用文件，确保服务名、端口、applicationName、healthPath、affinityPolicy 合法唯一，然后在面板重新扫描资源即可。安装弹窗和 Runtime 页通过 `/api/v2/apps/aifar/install-modules` 读取后端发现结果，通常不需要改 Vue 固定列表；只有做成应用商店里的全新独立应用时，才需要新增 `backend/internal/apps/<app>`、autoload、前端 `web/src/apps/<app>`、资源包、i18n 和测试。
+- 问题：用户追问新增 Java 服务时 `resources/aifar/runtime-v2/runtime/defaults.env` 是否也要改。
+- 结论：普通新增业务 Java 服务通常不需要改 `defaults.env`；它是 runtime-v2 包级默认配置，安装脚本要求文件存在并读取通用健康检查、启动超时、重启策略等默认值。新服务自己的端口、健康路径、应用名和 affinity 已由 `services/<service>/service.json` 传入安装/追加服务脚本；只有需要调整全局默认健康检查路径、超时、重试、重启策略，或要保留旧式 `<SERVICE>_PORT` 兜底时才改 `defaults.env`。
+- 问题：用户询问 `defaults.env` 中 `OAUTH_PORT/PERMISSION_PORT/.../MEETING_PORT` 这些固定端口变量是否有用。
+- 结论：这些固定端口变量仍被安装脚本写入远端 `compose.env`，并被 reconcile、升级、回滚、伸缩等脚本作为旧固定服务名的端口兜底读取；但当前目录驱动的新服务端口优先来自 `service.json` 生成的 `SERVICE_PORTS` 和每服务 env 中的 `AIFAR_SERVICE_PORT`。新增普通服务不应再往 `defaults.env` 增加 `<SERVICE>_PORT`，除非专门要兼容旧脚本中的固定服务名映射。
+- 问题：用户询问 AIFAR Runtime v2 新增服务端口是否可以重复。
+- 结论：`services/<service>/service.json` 中的端口不能重复；后端目录扫描会用 `seenPorts` 校验全 bundle 端口唯一性，重复时 `/api/v2/apps/aifar/install-modules` 返回发现失败，安装弹窗也无法正常列出模块。当前本地服务端口唯一，且已有 `email` 使用 38030。安装表单中的 gateway/web 入口端口覆盖也应避免与业务服务端口冲突。
+- 问题：用户反馈新增 `email` 模块 agent 日志已有 Nacos proxy register，但 Runtime 页 Pods 中没有 email。
+- 结论：只读诊断显示 email 已在 metadata 中，`desiredReplicas.email=1`，存在 email deployment，且 `app.instance` 快照已经发现 `aifar-pod-admin-email-...` 容器为 healthy；但 `aifar_pods` 与 `aifar_service_endpoints` 对 email 均为 0 行。根因是 `backend/internal/httpapi/containers_aifar_runtime.go` 仍保留 `aifarRuntimeKnownServices` 和 `aifarRuntimeServiceDefaultPort` 的旧固定服务列表，Docker 容器发现时 `aifarRuntimeKnownService(email)` 返回 false，导致 Runtime 控制面同步丢弃 email 容器，不写 pod/endpoint。应改为按实例 metadata/serviceCatalog/服务名规则识别动态服务并从 serviceCatalog 取端口。
+- 问题：用户追问若要修复 email 不进入 Runtime Pods，需要调整哪些代码。
+- 结论：主要改 `backend/internal/httpapi/containers_aifar_runtime.go`，移除 Runtime 页 Docker discovery 对固定 `aifarRuntimeKnownServices`/`aifarRuntimeServiceDefaultPort` 的依赖，改为从实例 metadata/serviceCatalog/services/deployments 构建动态服务集合与端口映射；补 httpapi 回归测试。不要只把 email 加进白名单，必要时检查 `service_install.go` 是否持久化包含 email 的 serviceCatalog。
+- 问题：用户确认在当前分支执行修复 email 动态服务不进入 Runtime Pods。
+- 结论：已在 `containers_aifar_runtime.go` 新增 Runtime service catalog，Docker discovery 现在基于 legacy 服务、metadata `serviceCatalog/services/desiredReplicas` 和 DB deployments 识别服务，动态服务如 email 不再被固定白名单丢弃；端口优先取 serviceCatalog，缺失时尝试从 Docker Ports 解析。新增 email 动态服务回归测试，先复现 pod 为 nil，再修复转绿。验证通过：`go test ./internal/httpapi`、`go test ./internal/httpapi ./internal/apps/aifar`、`pnpm backend:build`、`pnpm test`、`git diff --check`。
+- 问题：用户询问 `aifarRuntimeKnownServices` 这段固定服务列表现在还有什么用。
+- 结论：该列表现在不应再作为新增服务准入白名单；动态服务准入已由 Runtime service catalog 从 metadata/serviceCatalog/services/desiredReplicas/deployments 判断。它仍用于 legacy 默认值和显示/解析兼容：为旧实例补默认 catalog/端口、`runtimeMergeServices` 保持老服务排序、无动态上下文时解析旧 pod 容器名。更准确的命名应是 legacy/default services，`aifarRuntimeKnownService` 函数已无业务调用，可后续清理或随手删除。
+- 问题：用户要求没用的话删除 `aifarRuntimeKnownServices` 相关旧代码。
+- 结论：没有删除仍有兼容职责的旧服务列表本体，而是改名为 `aifarRuntimeLegacyServices` 并加注释说明它不是动态服务白名单；删除了真正无调用的 `aifarRuntimeKnownService()`，同时把默认端口函数改名为 `aifarRuntimeLegacyServiceDefaultPort()`。验证通过：`go test ./internal/httpapi -count=1`、`git diff --check`。
+- 问题：用户询问旧服务是否也可以不兼容，全部走 `service.json` 逻辑。
+- 结论：当前资源目录中内置服务和 email 均已有 `service.json`，因此可以进一步删除 Runtime 页的 legacy 静态服务列表和默认端口表，让服务识别、端口和排序只来自由 `service.json` 写入的 `metadata.serviceCatalog` 以及实例自身 `services/desiredReplicas/deployments`。前提是接受没有 `serviceCatalog` 的历史实例不再兜底，需重装/补写 serviceCatalog/同步资源后才能被完整识别。
+- 问题：用户询问 `serviceCatalog` 是什么。
+- 结论：`serviceCatalog` 是写在 AIFAR app instance metadata 里的服务定义快照，来源于 `resources/aifar/runtime-v2/services/<service>/service.json`。它记录每个服务的 name、kind、applicationName、port、required、role、artifactExtensions、healthPath、affinityPolicy 等信息，用于 Runtime 页面、安装/追加服务、reconcile、端口识别和 pod/endpoint 同步，避免后端再写死服务列表。
+- 问题：用户确认不需要兼容旧 Runtime v2 实例，后续都会重新安装。
+- 结论：已进一步删除 Runtime 页的 legacy 静态服务列表、旧默认端口表和旧 appName 映射；Runtime discovery 现在要求服务存在于 `metadata.serviceCatalog`，容器名解析也只使用当前实例 catalog 服务名，`runtimeMergeServices` 改为纯字母排序。没有 `serviceCatalog` 的实例不再靠旧表识别 Docker pod；测试 fixture 改成新安装实例形态并补充无 catalog 不发现 pod 的回归。验证通过：`go test ./internal/httpapi`、`go test ./internal/httpapi ./internal/apps/aifar`、`pnpm backend:build`、`pnpm test`、`git diff --check`。

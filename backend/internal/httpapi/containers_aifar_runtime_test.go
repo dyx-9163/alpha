@@ -239,7 +239,7 @@ func TestAIFARRuntimeServiceSummaryPrunesResidualPodRecords(t *testing.T) {
 		Version:  "runtime-v2",
 		ServerID: "srv-1",
 		Status:   "installed",
-		Metadata: `{"orchestrationModel":"agent-runtime-v2","installRoot":"/aifar/apps/admin"}`,
+		Metadata: `{"orchestrationModel":"agent-runtime-v2","installRoot":"/aifar/apps/admin","serviceCatalog":[{"name":"file","kind":"java","applicationName":"alpha-file","port":38005,"artifactExtensions":[".jar"],"healthPath":"/actuator/health/readiness","affinityPolicy":"stable"}]}`,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -443,6 +443,141 @@ func TestAIFARRuntimeReconcilesDockerPodsIntoControlPlane(t *testing.T) {
 	}
 }
 
+func TestAIFARRuntimeReconcilesDynamicServicePodsIntoControlPlane(t *testing.T) {
+	api, db, _ := newAuthzTestAPI(t)
+	_, instance := seedAIFARRuntimeFixture(t, db, "unix:///var/run/docker.sock")
+	metadata := runtimeMetadata(instance.Metadata)
+	metadata["services"] = []string{"email"}
+	metadata["desiredReplicas"] = map[string]any{"email": 1}
+	metadata["serviceCatalog"] = []map[string]any{{
+		"name":            "email",
+		"kind":            "java",
+		"applicationName": "alpha-email",
+		"port":            38030,
+		"healthPath":      "/actuator/health/readiness",
+		"affinityPolicy":  "round-robin",
+	}}
+	raw, err := json.Marshal(metadata)
+	if err != nil {
+		t.Fatal(err)
+	}
+	instance.Metadata = string(raw)
+	if _, err := db.SaveAppInstance(instance); err != nil {
+		t.Fatal(err)
+	}
+
+	revision := "20260715t170859.998366100z-services-email"
+	containerName := "aifar-pod-admin-email-" + revision + "-r1"
+	if _, err := db.SaveAIFARDeployment(store.AIFARDeployment{
+		InstanceID:      instance.ID,
+		ServiceName:     "email",
+		DesiredReplicas: 1,
+		CurrentRevision: revision,
+		Status:          "degraded",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	response := aifarRuntimeResponse{RuntimeStatus: "ready", Agent: aifarRuntimeAgent{Status: "running"}}
+	api.appendAIFARInstanceRuntime(&response, instance, map[string]adapter.DockerContainer{
+		containerName: {
+			Name:   containerName,
+			Image:  "aifar-email:" + revision,
+			State:  "running",
+			Status: "Up 1 minute (healthy)",
+			Ports:  "38030/tcp",
+			Labels: map[string]string{
+				"aifar.app":          "aifar",
+				"aifar.component":    "pod",
+				"aifar.install-root": "/aifar/apps/admin",
+				"aifar.service":      "email",
+				"aifar.revision":     revision,
+				"aifar.replica":      "1",
+			},
+		},
+	}, map[string]adapter.DockerContainerStat{}, aifarRuntimeBuildOptions{IncludePods: true})
+
+	var gotPod *aifarRuntimePod
+	for i := range response.Pods {
+		if response.Pods[i].ServiceName == "email" {
+			gotPod = &response.Pods[i]
+			break
+		}
+	}
+	if gotPod == nil || gotPod.ContainerName != containerName || !gotPod.Ready || gotPod.Port != 38030 {
+		t.Fatalf("expected dynamic email pod to be reconciled with port 38030, got %+v in %+v", gotPod, response.Pods)
+	}
+	var gotService *aifarRuntimeService
+	for i := range response.Services {
+		if response.Services[i].ServiceName == "email" {
+			gotService = &response.Services[i]
+			break
+		}
+	}
+	if gotService == nil || gotService.AppName != "alpha-email" {
+		t.Fatalf("expected email service appName from serviceCatalog, got %+v in %+v", gotService, response.Services)
+	}
+
+	endpoints, err := db.ListAIFARServiceEndpoints(instance.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, endpoint := range endpoints {
+		if endpoint.ServiceName == "email" && endpoint.ContainerName == containerName && endpoint.Ready && endpoint.Port == 38030 {
+			return
+		}
+	}
+	t.Fatalf("expected dynamic email endpoint to be persisted with port 38030, got %+v", endpoints)
+}
+
+func TestAIFARRuntimeRequiresServiceCatalogForDockerDiscovery(t *testing.T) {
+	api, db, _ := newAuthzTestAPI(t)
+	server, err := db.SaveServer(store.Server{Name: "docker-1", Host: "10.0.0.10", DockerHost: "unix:///var/run/docker.sock", DeployDir: "/aifar/apps"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	instance, err := db.SaveAppInstance(store.AppInstance{
+		App:      "aifar",
+		Version:  "runtime-v2",
+		ServerID: server.ID,
+		Status:   "installed",
+		Metadata: `{"orchestrationModel":"agent-runtime-v2","installRoot":"/aifar/apps/admin","runtimeService":"aifar-agent"}`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	containerName := "aifar-pod-admin-permission-rev-1-r1"
+	response := aifarRuntimeResponse{RuntimeStatus: "ready", Agent: aifarRuntimeAgent{Status: "running"}}
+	api.appendAIFARInstanceRuntime(&response, instance, map[string]adapter.DockerContainer{
+		containerName: {
+			Name:   containerName,
+			Image:  "aifar-permission:rev-1",
+			State:  "running",
+			Status: "Up 1 minute (healthy)",
+			Labels: map[string]string{
+				"aifar.app":          "aifar",
+				"aifar.component":    "pod",
+				"aifar.install-root": "/aifar/apps/admin",
+				"aifar.service":      "permission",
+				"aifar.revision":     "rev-1",
+				"aifar.replica":      "1",
+			},
+		},
+	}, map[string]adapter.DockerContainerStat{}, aifarRuntimeBuildOptions{IncludePods: true})
+
+	if len(response.Pods) != 0 || len(response.Deployments) != 0 || len(response.Services) != 0 {
+		t.Fatalf("expected instance without serviceCatalog to skip docker discovery, got deployments=%+v pods=%+v services=%+v", response.Deployments, response.Pods, response.Services)
+	}
+	endpoints, err := db.ListAIFARServiceEndpoints(instance.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(endpoints) != 0 {
+		t.Fatalf("expected no endpoints without serviceCatalog, got %+v", endpoints)
+	}
+}
+
 func TestAIFARRuntimeReconcileHonorsMetadataDesiredWhenDeploymentIsStale(t *testing.T) {
 	api, db, _ := newAuthzTestAPI(t)
 	_, instance := seedAIFARRuntimeFixture(t, db, "unix:///var/run/docker.sock")
@@ -510,7 +645,7 @@ func TestAIFARRuntimeReconcileHonorsMetadataDesiredWhenDeploymentIsStale(t *test
 }
 
 func TestParseAIFARPodContainerNameSupportsRuntimeAgentNames(t *testing.T) {
-	instanceName, service, revision, replica, ok := parseAIFARPodContainerName("aifar-pod-admin-im-20260708t074706.683351600z-services-im-r1")
+	instanceName, service, revision, replica, ok := parseAIFARPodContainerNameWithServices("aifar-pod-admin-im-20260708t074706.683351600z-services-im-r1", []string{"im"})
 	if !ok {
 		t.Fatal("expected runtime agent pod container name to parse")
 	}
@@ -754,12 +889,29 @@ func seedAIFARRuntimeFixture(t *testing.T, db *store.Store, dockerHost string) (
 	if err != nil {
 		t.Fatal(err)
 	}
+	metadata, err := json.Marshal(map[string]any{
+		"orchestrationModel": "agent-runtime-v2",
+		"installRoot":        "/aifar/apps/admin",
+		"endpoint":           "10.0.0.10:8080",
+		"gatewayEndpoint":    "10.0.0.10:38000",
+		"gatewayPort":        38000,
+		"webPort":            8080,
+		"runtimeService":     "aifar-agent",
+		"serviceCatalog": []map[string]any{
+			{"name": "permission", "kind": "java", "applicationName": "alpha-permission", "port": 38010, "artifactExtensions": []string{".jar"}, "healthPath": "/actuator/health/readiness", "affinityPolicy": "round-robin"},
+			{"name": "im", "kind": "java", "applicationName": "alpha-im", "port": 38031, "artifactExtensions": []string{".jar"}, "healthPath": "/actuator/health/readiness", "affinityPolicy": "round-robin"},
+			{"name": "system", "kind": "java", "applicationName": "alpha-system", "port": 38002, "artifactExtensions": []string{".jar"}, "healthPath": "/actuator/health/readiness", "affinityPolicy": "round-robin"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	instance, err := db.SaveAppInstance(store.AppInstance{
 		App:      "aifar",
 		Version:  "runtime-v2",
 		ServerID: server.ID,
 		Status:   "installed",
-		Metadata: `{"orchestrationModel":"agent-runtime-v2","installRoot":"/aifar/apps/admin","endpoint":"10.0.0.10:8080","gatewayEndpoint":"10.0.0.10:38000","gatewayPort":38000,"webPort":8080,"runtimeService":"aifar-agent"}`,
+		Metadata: string(metadata),
 	})
 	if err != nil {
 		t.Fatal(err)
