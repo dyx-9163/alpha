@@ -184,3 +184,23 @@
 - 结论：`serviceCatalog` 是写在 AIFAR app instance metadata 里的服务定义快照，来源于 `resources/aifar/runtime-v2/services/<service>/service.json`。它记录每个服务的 name、kind、applicationName、port、required、role、artifactExtensions、healthPath、affinityPolicy 等信息，用于 Runtime 页面、安装/追加服务、reconcile、端口识别和 pod/endpoint 同步，避免后端再写死服务列表。
 - 问题：用户确认不需要兼容旧 Runtime v2 实例，后续都会重新安装。
 - 结论：已进一步删除 Runtime 页的 legacy 静态服务列表、旧默认端口表和旧 appName 映射；Runtime discovery 现在要求服务存在于 `metadata.serviceCatalog`，容器名解析也只使用当前实例 catalog 服务名，`runtimeMergeServices` 改为纯字母排序。没有 `serviceCatalog` 的实例不再靠旧表识别 Docker pod；测试 fixture 改成新安装实例形态并补充无 catalog 不发现 pod 的回归。验证通过：`go test ./internal/httpapi`、`go test ./internal/httpapi ./internal/apps/aifar`、`pnpm backend:build`、`pnpm test`、`git diff --check`。
+- 问题：用户截图反馈 `pnpm package` 末尾因 `deploy\.stage` 删除失败报 `EPERM, Permission denied`。
+- 结论：根因是 `scripts/package-release.mjs` 最外层 `finally` 直接删除 staging root，Windows 目录被 Explorer/终端/杀软等短暂占用时会让已生成产物的发布流程退出 1；已改为复用带重试的 best-effort 清理，失败只输出 warning。回归测试覆盖最终 staging 清理不能裸 `rmSync`；验证通过 `node --test scripts/release-pipeline.test.mjs --test-name-pattern "release final staging cleanup is best-effort"`、`pnpm test:scripts`、`git diff --check`，且 `node scripts/package-release.mjs` 在同样 EPERM 情况下以 0 退出并保留 warning。
+- 问题：用户追问新截图中 `package` 末尾仍有 Vite chunk size warning 和 `deploy\.stage` EPERM warning 是否有问题。
+- 结论：不是致命问题；`deploy/deployment` 下 Linux/Windows 目录与 `.tar.gz`/`.zip` 归档均已生成，脚本回到 PowerShell 提示符且无 `ELIFECYCLE`。Vite chunk size 是前端体积提示，EPERM 是 Windows 未释放临时 staging 目录导致的清理 warning，只会留下 `deploy\.stage\<id>` 残留，不影响发布包内容。
+- 问题：用户询问 AIFAR 面板上生产环境前有什么建议。
+- 结论：生产环境不要开启 `AIFAR_ALLOW_INSECURE_DEFAULTS`；必须在发布包本地配置或进程环境中设置强 `AIFAR_DEFAULT_PASSWORD`、`AIFAR_BOOTSTRAP_PASSWORD`、`AIFAR_JWT_SECRET`、`AIFAR_CREDENTIAL_SECRET`，其中密码至少 12 位，secret 至少 32 位且 JWT 与 credential secret 不同。上线前应固定并备份 credential secret、备份 `data/aifar.db`、限制面板端口访问、优先通过 HTTPS/反向代理暴露，并保存一份发布包和配置指纹用于回滚。
+- 问题：用户要求帮忙生成生产环境所需的 AIFAR 安全参数。
+- 结论：已用本机加密随机数生成一组适合直接写入 `defaults.env` 的生产参数；未将具体密码或 secret 记录到 memory，避免泄露。初次启动后应保存好 `AIFAR_CREDENTIAL_SECRET`，并按需修改管理员密码。
+- 问题：用户希望保留复杂安全校验逻辑，但能通过 env 显式允许 `Oversea.123` 这类弱/默认面板密码。
+- 结论：新增 `AIFAR_ALLOW_WEAK_PASSWORDS` 配置，默认 false；设为 true 时只跳过 `AIFAR_DEFAULT_PASSWORD` 和 `AIFAR_BOOTSTRAP_PASSWORD` 的弱密码/内置默认密码校验，JWT、credential secret、credential 与 JWT 不同、previous credential 不同、`AIFAR_ALLOW_INSECURE_DEFAULTS` loopback 限制仍保留。Go config 全量测试通过；脚本测试除当前本地 `config/defaults.env` 已含部署值导致的发布模板校验失败外，其余通过。
+- 问题：用户贴出一组生产 env，确认用 `Oversea.123` 加 `AIFAR_ALLOW_WEAK_PASSWORDS=true` 是否正确。
+- 结论：配置形态正确：`AIFAR_ALLOW_WEAK_PASSWORDS=true` 允许默认弱面板密码，`AIFAR_ALLOW_INSECURE_DEFAULTS=false` 保持生产安全模式，JWT 和 credential secret 仍强校验。未在 memory 记录用户贴出的具体 secret；需提醒已有数据库不会因 env 变化重置管理员密码，credential secret 首次使用后不要随意更换。
+- 问题：用户在 `pnpm package` 时遇到 `Unsafe release security configuration in config/defaults.env`。
+- 结论：这是发布包安全检查按设计拦截：仓库源 `config/defaults.env` 是可分发 release 模板，不能写入部署密码、JWT secret、credential secret，也不能设置 `AIFAR_ALLOW_INSECURE_DEFAULTS=true`。应先保持源码模板敏感项留空并打包，打包完成后再修改生成包目录里的 `config/defaults.env`，或由目标机器环境变量注入。
+- 问题：用户要求说明打包报错原因并修复。
+- 结论：已将仓库源 `config/defaults.env` 恢复为可分发模板：默认密码、bootstrap 密码、JWT secret、credential secret、previous secret 均留空，`AIFAR_ALLOW_INSECURE_DEFAULTS=false`，`AIFAR_ALLOW_WEAK_PASSWORDS=false`。验证通过 `node --test scripts/runtime-security-config.test.mjs`、`pnpm test:scripts` 和 `git diff --check`；部署用密码和 secret 应在打包后的生成目录或目标环境变量中设置。
+- 问题：用户再次打包时仍遇到 `AIFAR_ALLOW_WEAK_PASSWORDS must not be true in a release package` 以及密码/secret 必须留空的错误。
+- 结论：再次确认是仓库源 `config/defaults.env` 被写回部署值导致；已恢复敏感项留空、`AIFAR_ALLOW_INSECURE_DEFAULTS=false`、`AIFAR_ALLOW_WEAK_PASSWORDS=false`。验证通过 `node --test scripts/runtime-security-config.test.mjs`、`pnpm test:scripts`、`git diff --check`。弱密码生产配置只能写入打包后的生成包配置或目标环境变量，不能写入源码 release 模板。
+- 问题：用户截图显示 push 被 GitHub 拒绝，提示 `deploy/.stage/.../alpha-*.jar` 超过 100MB。
+- 结论：根因不是当前工作区仍跟踪大文件，而是本地 ahead 提交历史里曾包含 `deploy/.stage` 打包暂存目录；GitHub 会拒绝包含大 blob 的任意提交。已创建本地备份分支后，将当前分支相对远端的 3 个提交 soft-reset 并重新提交为一个干净提交，验证当前待推送范围不再包含 `deploy/.stage` 或 runtime target jar 路径；`.gitignore` 的 `deploy` 规则会继续忽略打包产物。

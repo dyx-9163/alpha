@@ -32,6 +32,9 @@ export function releaseDefaultsProblems(env) {
   if (parseBoolean(env.AIFAR_ALLOW_INSECURE_DEFAULTS)) {
     problems.push('AIFAR_ALLOW_INSECURE_DEFAULTS must not be true in a release package')
   }
+  if (parseBoolean(env.AIFAR_ALLOW_WEAK_PASSWORDS)) {
+    problems.push('AIFAR_ALLOW_WEAK_PASSWORDS must not be true in a release package')
+  }
   for (const key of sensitiveKeys) {
     const value = String(env[key] ?? '').trim()
     if (value) {

@@ -1,1 +1,0 @@
-{"schema":"aifar-runtime-service-v1","name":"email","displayName":{"zh":"邮件","en":"email"},"kind":"java","applicationName":"alpha-email","port":38030,"required":false,"artifactExtensions":[".jar"],"healthPath":"/actuator/health/readiness","affinityPolicy":"round-robin"}

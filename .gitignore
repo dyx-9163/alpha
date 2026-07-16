@@ -15,10 +15,7 @@ bin/
 web/dist/
 dist/
 outputs/
-deploy/bin/
-deploy/dist/
-deploy/deployment/*
-
+deploy
 # Runtime data
 data/
 *.db

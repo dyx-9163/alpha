@@ -24,8 +24,8 @@ function releaseFixture(t, { safeDefaults = true, buildOutputs = true, binaries 
   copyFileSync(path.join(scriptsDir, 'runtime-security-config.mjs'), path.join(root, 'scripts', 'runtime-security-config.mjs'))
   write(root, 'package.json', JSON.stringify({ name: 'aifar-fixture', version: '9.8.7' }))
   write(root, 'config/defaults.env', safeDefaults
-    ? `AIFAR_DEFAULT_PASSWORD=\nAIFAR_BOOTSTRAP_PASSWORD=\nAIFAR_JWT_SECRET=\nAIFAR_CREDENTIAL_SECRET=\nAIFAR_PREVIOUS_CREDENTIAL_SECRET=\nAIFAR_ALLOW_INSECURE_DEFAULTS=false\n`
-    : `AIFAR_JWT_SECRET=unsafe-secret-must-not-ship\nAIFAR_ALLOW_INSECURE_DEFAULTS=false\n`)
+    ? `AIFAR_DEFAULT_PASSWORD=\nAIFAR_BOOTSTRAP_PASSWORD=\nAIFAR_JWT_SECRET=\nAIFAR_CREDENTIAL_SECRET=\nAIFAR_PREVIOUS_CREDENTIAL_SECRET=\nAIFAR_ALLOW_INSECURE_DEFAULTS=false\nAIFAR_ALLOW_WEAK_PASSWORDS=false\n`
+    : `AIFAR_JWT_SECRET=unsafe-secret-must-not-ship\nAIFAR_ALLOW_INSECURE_DEFAULTS=false\nAIFAR_ALLOW_WEAK_PASSWORDS=false\n`)
   write(root, 'scripts/start.sh', '#!/usr/bin/env sh\n')
   write(root, 'scripts/stop.sh', '#!/usr/bin/env sh\n')
   write(root, 'scripts/start.ps1', '')
@@ -173,4 +173,10 @@ test('test:local uses the script test runner and does not release twice after pa
   assert.match(source, /scripts\/test-scripts\.mjs/)
   assert.equal((source.match(/scripts\/package-release\.mjs/g) ?? []).length, 0)
   assert.equal((source.match(/scripts\/package-build\.mjs/g) ?? []).length, 1)
+})
+
+test('release final staging cleanup is best-effort', () => {
+  const source = readFileSync(path.join(scriptsDir, 'package-release.mjs'), 'utf8')
+  assert.doesNotMatch(source, /finally\s*\{[\s\S]*rmSync\(stagingRoot/)
+  assert.match(source, /removePathBestEffort\(stagingRoot/)
 })

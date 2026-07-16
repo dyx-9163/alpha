@@ -20,6 +20,7 @@ type Config struct {
 	CredentialSecretConfigured bool   `json:"-"`
 	PreviousCredentialSecret   string `json:"-"`
 	AllowInsecureDefaults      bool   `json:"-"`
+	AllowWeakPasswords         bool   `json:"-"`
 	DeploymentConcurrency      int    `json:"deploymentConcurrency"`
 	DefaultDeployDir           string `json:"defaultDeployDir"`
 	InstallerTemplateDir       string `json:"installerTemplateDir"`
@@ -57,6 +58,7 @@ func Load() Config {
 		CredentialSecretConfigured: credentialSecretConfigured,
 		PreviousCredentialSecret:   getenv("AIFAR_PREVIOUS_CREDENTIAL_SECRET", ""),
 		AllowInsecureDefaults:      getenvBool("AIFAR_ALLOW_INSECURE_DEFAULTS", false),
+		AllowWeakPasswords:         getenvBool("AIFAR_ALLOW_WEAK_PASSWORDS", false),
 		DeploymentConcurrency:      getenvInt("AIFAR_DEPLOYMENT_CONCURRENCY", 2),
 		DefaultDeployDir:           getenv("AIFAR_DEFAULT_DEPLOY_DIR", "/aifar/apps"),
 		InstallerTemplateDir:       getenv("AIFAR_INSTALLER_TEMPLATE_DIR", filepath.Join("config", "installers")),

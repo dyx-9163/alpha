@@ -80,6 +80,41 @@ func TestValidateServerSecurityRejectsExplicitFalseWithWeakDefaults(t *testing.T
 	}
 }
 
+func TestValidateServerSecurityAllowsWeakPasswordsWhenExplicitlyEnabled(t *testing.T) {
+	cfg := secureTestConfig()
+	cfg.DefaultPassword = "Oversea.123"
+	cfg.BootstrapPassword = "Oversea.123"
+	cfg.AllowWeakPasswords = true
+
+	if err := cfg.ValidateServerSecurity(); err != nil {
+		t.Fatalf("ValidateServerSecurity() error = %v, want weak passwords allowed by explicit override", err)
+	}
+}
+
+func TestValidateServerSecurityKeepsSecretChecksWhenWeakPasswordsAllowed(t *testing.T) {
+	cfg := secureTestConfig()
+	cfg.DefaultPassword = "Oversea.123"
+	cfg.BootstrapPassword = "Oversea.123"
+	cfg.JWTSecret = "change-me-before-production"
+	cfg.CredentialSecret = cfg.JWTSecret
+	cfg.AllowWeakPasswords = true
+
+	err := cfg.ValidateServerSecurity()
+	if err == nil {
+		t.Fatal("ValidateServerSecurity() error = nil, want unsafe secret configuration error")
+	}
+	for _, key := range []string{"AIFAR_JWT_SECRET", "AIFAR_CREDENTIAL_SECRET"} {
+		if !strings.Contains(err.Error(), key) {
+			t.Fatalf("ValidateServerSecurity() error = %q, want %s", err, key)
+		}
+	}
+	for _, key := range []string{"AIFAR_DEFAULT_PASSWORD", "AIFAR_BOOTSTRAP_PASSWORD"} {
+		if strings.Contains(err.Error(), key) {
+			t.Fatalf("ValidateServerSecurity() error = %q, did not want password problem %s", err, key)
+		}
+	}
+}
+
 func TestValidateServerSecurityRejectsEqualRotationSecretsUnderOverride(t *testing.T) {
 	cfg := Config{
 		Addr:                     "127.0.0.1:8080",
@@ -161,6 +196,13 @@ func TestLoadReadsInsecureDefaultsOverride(t *testing.T) {
 	t.Setenv("AIFAR_ALLOW_INSECURE_DEFAULTS", "true")
 	if cfg := Load(); !cfg.AllowInsecureDefaults {
 		t.Fatal("Load().AllowInsecureDefaults = false, want true")
+	}
+}
+
+func TestLoadReadsWeakPasswordOverride(t *testing.T) {
+	t.Setenv("AIFAR_ALLOW_WEAK_PASSWORDS", "true")
+	if cfg := Load(); !cfg.AllowWeakPasswords {
+		t.Fatal("Load().AllowWeakPasswords = false, want true")
 	}
 }
 

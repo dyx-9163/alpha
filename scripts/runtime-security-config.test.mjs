@@ -14,6 +14,7 @@ test('blank release credentials are safe to distribute', () => {
     AIFAR_JWT_SECRET=
     AIFAR_CREDENTIAL_SECRET=
     AIFAR_ALLOW_INSECURE_DEFAULTS=false
+    AIFAR_ALLOW_WEAK_PASSWORDS=false
   `)
   assert.deepEqual(releaseDefaultsProblems(env), [])
 })
@@ -29,12 +30,14 @@ test('release credentials reject built-in and placeholder values', () => {
     AIFAR_JWT_SECRET=change-me-before-production
     AIFAR_CREDENTIAL_SECRET=short
     AIFAR_ALLOW_INSECURE_DEFAULTS=true
+    AIFAR_ALLOW_WEAK_PASSWORDS=true
   `)
   const problems = releaseDefaultsProblems(env).join('\n')
   assert.match(problems, /AIFAR_DEFAULT_PASSWORD/)
   assert.match(problems, /AIFAR_JWT_SECRET/)
   assert.match(problems, /AIFAR_CREDENTIAL_SECRET/)
   assert.match(problems, /AIFAR_ALLOW_INSECURE_DEFAULTS/)
+  assert.match(problems, /AIFAR_ALLOW_WEAK_PASSWORDS/)
 })
 
 test('release override parsing matches Go boolean shorthand', () => {

@@ -31,11 +31,13 @@ func (c Config) ValidateServerSecurity() error {
 		return securityProblems(problems)
 	}
 
-	if insecurePassword(c.DefaultPassword) {
-		problems = append(problems, fmt.Sprintf("AIFAR_DEFAULT_PASSWORD must be at least %d characters and must not use the built-in default", minimumPasswordLength))
-	}
-	if insecurePassword(c.BootstrapPassword) {
-		problems = append(problems, fmt.Sprintf("AIFAR_BOOTSTRAP_PASSWORD must be at least %d characters and must not use the built-in default", minimumPasswordLength))
+	if !c.AllowWeakPasswords {
+		if insecurePassword(c.DefaultPassword) {
+			problems = append(problems, fmt.Sprintf("AIFAR_DEFAULT_PASSWORD must be at least %d characters and must not use the built-in default", minimumPasswordLength))
+		}
+		if insecurePassword(c.BootstrapPassword) {
+			problems = append(problems, fmt.Sprintf("AIFAR_BOOTSTRAP_PASSWORD must be at least %d characters and must not use the built-in default", minimumPasswordLength))
+		}
 	}
 	if insecureSecret(c.JWTSecret) {
 		problems = append(problems, fmt.Sprintf("AIFAR_JWT_SECRET must be at least %d characters and must not be a placeholder", minimumSecretLength))

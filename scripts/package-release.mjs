@@ -73,6 +73,14 @@ function removePath(targetPath) {
   rmSync(targetPath, { force: true, maxRetries: 5, recursive: true, retryDelay: 500 })
 }
 
+function removePathBestEffort(targetPath, label = 'path') {
+  try {
+    removePath(targetPath)
+  } catch (error) {
+    warnings.push(`Could not remove ${label} ${path.relative(rootDir, targetPath)}: ${error.message}`)
+  }
+}
+
 function copyEntry(entry, packageDir) {
   const sourcePath = path.join(rootDir, entry.source)
   const targetPath = path.join(packageDir, entry.target)
@@ -205,11 +213,7 @@ function buildPackage(target) {
     }
   }
 
-  try {
-    removePath(stagingRoot)
-  } catch (error) {
-    warnings.push(`Could not remove staging directory ${path.relative(rootDir, stagingRoot)}: ${error.message}`)
-  }
+  removePathBestEffort(stagingRoot, 'staging directory')
 
   if (finalPackageReady) {
     console.log(`[package] ready ${path.relative(rootDir, finalPackageDir)}`)
@@ -280,7 +284,7 @@ try {
   for (const target of targets) buildPackage(target)
 } finally {
   const stagingRoot = path.join(rootDir, 'deploy', '.stage')
-  if (existsSync(stagingRoot)) rmSync(stagingRoot, { recursive: true, force: true })
+  if (existsSync(stagingRoot)) removePathBestEffort(stagingRoot, 'staging root')
 }
 
 if (warnings.length) {
