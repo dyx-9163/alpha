@@ -4,7 +4,7 @@
 
 **Goal:** Configure Keepalived 2.4.2 on `192.168.74.132` to manage VIP `192.168.74.130/24` on `ens160`, then enable and verify the service.
 
-**Architecture:** Keepalived runs as a single `MASTER` VRRP instance and tracks only `ens160`. A transactional remote shell script performs conflict checks, validates a staged configuration, installs it, starts the service, verifies the VIP, and restores the previous state on failure.
+**Architecture:** Keepalived runs as a single `MASTER` VRRP instance on `ens160`; Keepalived automatically tracks the VRRP instance's own interface. A transactional remote shell script performs conflict checks, validates a staged configuration, installs it, starts the service, verifies the VIP, and restores the previous state on failure.
 
 **Tech Stack:** openEuler 24.03 LTS SP3, Keepalived 2.4.2, systemd, iproute2, Bash, SSH
 
@@ -13,7 +13,7 @@
 - Install root remains `/aifar/apps/keepalived`.
 - Target server is `192.168.74.132`; target interface is `ens160`.
 - VIP is exactly `192.168.74.130/24`.
-- This phase tracks interface state only and does not add HTTP or TCP health checks.
+- This phase relies on Keepalived's automatic tracking of the VRRP interface and does not add HTTP or TCP health checks.
 - No second `BACKUP` node exists; this configuration cannot provide server-level failover.
 - Do not start Keepalived unless configuration validation succeeds.
 - On any failed activation or VIP verification, stop Keepalived and restore the previous configuration and enablement state.
@@ -75,10 +75,6 @@ vrrp_instance VI_AIFAR_130 {
     virtual_router_id 130
     priority 150
     advert_int 1
-
-    track_interface {
-        ens160
-    }
 
     virtual_ipaddress {
         192.168.74.130/24 dev ens160 label ens160:vip
