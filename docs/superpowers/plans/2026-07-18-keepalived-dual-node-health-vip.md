@@ -20,6 +20,10 @@
 - Do not replace the working 132 configuration unless both staged configurations pass syntax validation and the 133 local health endpoint passes.
 - Any persistent double-MASTER state or duplicate VIP is a failure requiring immediate rollback.
 
+## Approved Execution Exception
+
+The user explicitly approved continuing while the 133 health endpoint is unavailable. In this execution, 133 must remain FAULT without the VIP, 132 must remain healthy with the VIP, and failover/failback testing is deferred until `http://192.168.74.133:38000/health/aggregate` returns HTTP 2xx with JSON `up=true`. The health script and VRRP configuration are still installed now so 133 becomes eligible automatically after its business runtime recovers.
+
 ---
 
 ### Task 1: Authenticate and run two-node read-only preflight
