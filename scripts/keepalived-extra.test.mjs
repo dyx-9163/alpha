@@ -63,3 +63,48 @@ test('installer and SELinux scripts use LF endings', () => {
     assert.doesNotMatch(read(relativePath), /\r/)
   }
 })
+
+test('Keepalived module contains all release artifacts', () => {
+  for (const relativePath of [
+    'README.md',
+    archiveName,
+    'SHA256SUMS',
+    'install-keepalived-offline.sh',
+    'configure-selinux.sh',
+    'uninstall-keepalived.sh'
+  ]) {
+    assert.doesNotThrow(() => readFileSync(path.join(moduleDir, relativePath)))
+  }
+})
+
+test('Keepalived uninstaller uses LF endings', () => {
+  assert.doesNotMatch(read('uninstall-keepalived.sh'), /\r/)
+})
+
+test('uninstaller verifies a backup before service changes and exact-path deletion', () => {
+  const script = read('uninstall-keepalived.sh')
+  const backupVerify = indexOfOrFail(script, 'sha256sum --check BACKUP.sha256')
+  const serviceStop = indexOfOrFail(script, 'systemctl stop keepalived.service')
+  const installDelete = indexOfOrFail(script, 'rm -rf -- "$APP_ROOT"')
+  assert.ok(backupVerify < serviceStop)
+  assert.ok(serviceStop < installDelete)
+  assert.match(script, /readonly APP_ROOT="\/aifar\/apps\/keepalived"/)
+  assert.match(script, /readlink -f -- "\$APP_ROOT"/)
+  assert.match(script, /readonly BACKUP_ROOT="\/aifar\/backups"/)
+  assert.match(script, /BACKUP_DIR="\$BACKUP_ROOT\/keepalived-\$\(date -u/)
+  assert.doesNotMatch(
+    script,
+    /dnf\s+(?:remove|erase)|yum\s+(?:remove|erase)|firewall-cmd\s+--remove|rm -rf -- \/aifar\/backups/
+  )
+})
+
+test('README documents zero-argument lifecycle and retained state', () => {
+  const readme = read('README.md')
+  assert.match(readme, /bash install-keepalived-offline\.sh/)
+  assert.match(readme, /bash configure-selinux\.sh/)
+  assert.match(readme, /bash uninstall-keepalived\.sh/)
+  assert.match(readme, /\/aifar\/backups\/keepalived-/)
+  assert.match(readme, /不会自动启动/)
+  assert.match(readme, /不会删除.*RPM/)
+  assert.match(readme, /不会删除.*防火墙/)
+})
