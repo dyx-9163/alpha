@@ -49,6 +49,14 @@ const keepalivedEntry = {
   ]
 }
 
+const selinuxEntry = {
+  kind: 'dir',
+  source: 'extras/selinux',
+  target: 'extras/selinux',
+  required: true,
+  executables: ['configure-all-selinux.sh']
+}
+
 const targets = [
   {
     platform: 'linux',
@@ -56,7 +64,7 @@ const targets = [
     binary: 'aifar-server-linux-amd64',
     archive: 'tar.gz',
     extraBinaries: ['aifar-agent-linux-amd64'],
-    packageEntries: [keepalivedEntry],
+    packageEntries: [keepalivedEntry, selinuxEntry],
     runtimeFiles: [
       { source: 'scripts/start.sh', target: 'start.sh', executable: true },
       { source: 'scripts/stop.sh', target: 'stop.sh', executable: true }
