@@ -22,9 +22,45 @@ function indexOfOrFail(source, fragment) {
 }
 
 test('Keepalived module contains the verified installer artifacts', () => {
-  for (const relativePath of [archiveName, 'SHA256SUMS', 'install-keepalived-offline.sh']) {
+  for (const relativePath of [
+    archiveName,
+    'SHA256SUMS',
+    'install-keepalived-offline.sh',
+    'keepalived.env.example',
+    'keepalived.conf.tpl'
+  ]) {
     assert.doesNotThrow(() => readFileSync(path.join(moduleDir, relativePath)))
   }
+})
+
+test('generic node example exposes exactly the supported Keepalived keys', () => {
+  const example = read('keepalived.env.example')
+  const keys = [...example.matchAll(/^([A-Z][A-Z0-9_]*)=/gm)].map((match) => match[1])
+  assert.deepEqual(keys, [
+    'KEEPALIVED_LOCAL_IP',
+    'KEEPALIVED_PEER_IP',
+    'KEEPALIVED_VIP_CIDR',
+    'KEEPALIVED_INTERFACE',
+    'KEEPALIVED_PRIORITY',
+    'KEEPALIVED_VIRTUAL_ROUTER_ID',
+    'KEEPALIVED_HEALTH_URL'
+  ])
+})
+
+test('production template uses BACKUP unicast health-fault and preemption defaults', () => {
+  const template = read('keepalived.conf.tpl')
+  for (const placeholder of [
+    '@ROUTER_ID@', '@INTERFACE@', '@VIRTUAL_ROUTER_ID@', '@PRIORITY@',
+    '@LOCAL_IP@', '@PEER_IP@', '@VIP_CIDR@'
+  ]) assert.match(template, new RegExp(placeholder))
+  assert.match(template, /state BACKUP/)
+  assert.match(template, /interval 2/)
+  assert.match(template, /timeout 3/)
+  assert.match(template, /fall 3/)
+  assert.match(template, /rise 2/)
+  assert.match(template, /weight 0/)
+  assert.match(template, /unicast_src_ip @LOCAL_IP@/)
+  assert.doesNotMatch(template, /nopreempt/)
 })
 
 test('Keepalived source archive has the pinned size and digest', () => {
@@ -70,6 +106,8 @@ test('Keepalived module contains all release artifacts', () => {
     archiveName,
     'SHA256SUMS',
     'install-keepalived-offline.sh',
+    'keepalived.env.example',
+    'keepalived.conf.tpl',
     'configure-selinux.sh',
     'uninstall-keepalived.sh'
   ]) {
