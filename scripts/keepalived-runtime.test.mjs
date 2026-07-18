@@ -205,6 +205,23 @@ ${render ? 'render_keepalived_config "$CONFIG_TEMPLATE" "$RENDERED_CONFIG"' : ''
   }
 }
 
+function runSequentialParseHarness(t) {
+  const fixture = mkdtempSync(path.join(os.tmpdir(), 'aifar-keepalived-sequential-parse-test-'))
+  t.after(() => rmSync(fixture, { force: true, recursive: true }))
+  const harnessPath = path.join(fixture, 'harness.sh')
+  const validEnvPath = path.join(fixture, 'valid.env')
+  const missingEnvPath = path.join(fixture, 'missing.env')
+  writeFileSync(validEnvPath, validNodeConfig())
+  writeFileSync(missingEnvPath, validNodeConfig().replace(/^KEEPALIVED_HEALTH_URL=.*\n/m, ''))
+  writeFileSync(harnessPath, `#!/usr/bin/env bash
+set -Eeuo pipefail
+source '${toMsysPath(installerPath)}'
+parse_node_config '${toMsysPath(validEnvPath)}'
+parse_node_config '${toMsysPath(missingEnvPath)}'
+`)
+  return spawnSync(bashPath, [toMsysPath(harnessPath)], { encoding: 'utf8' })
+}
+
 test('aggregate health probe exposes its guarded public contract', () => {
   assert.equal(existsSync(healthScriptPath), true, 'missing extras/keepalived/check-aggregate-health.sh')
   const source = readFileSync(healthScriptPath, 'utf8')
@@ -293,6 +310,18 @@ const invalidNodeConfigs = [
   {
     name: 'malformed CIDR',
     config: validNodeConfig({ KEEPALIVED_VIP_CIDR: '192.168.74.130/24/extra' })
+  },
+  {
+    name: 'oversized CIDR prefix',
+    config: validNodeConfig({ KEEPALIVED_VIP_CIDR: '192.168.74.130/18446744073709551617' })
+  },
+  {
+    name: 'oversized priority',
+    config: validNodeConfig({ KEEPALIVED_PRIORITY: '18446744073709551617' })
+  },
+  {
+    name: 'oversized virtual router id',
+    config: validNodeConfig({ KEEPALIVED_VIRTUAL_ROUTER_ID: '18446744073709551617' })
   }
 ]
 
@@ -318,6 +347,12 @@ test('installer rejects command substitution syntax without evaluating node conf
   })
   assert.equal(result.status, 1, result.stderr)
   assert.equal(existsSync(markerPath), false, 'node configuration was evaluated')
+})
+
+test('installer does not reuse stale node globals when a later parse omits a required key', (t) => {
+  const result = runSequentialParseHarness(t)
+  assert.equal(result.status, 1, result.stderr)
+  assert.match(result.stderr, /KEEPALIVED_HEALTH_URL/)
 })
 
 test('installer rejects a missing configured interface', (t) => {

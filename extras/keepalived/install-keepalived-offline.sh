@@ -67,6 +67,13 @@ parse_node_config() {
     local file="$1" line="" key="" value=""
     local line_number=0
     declare -A seen=()
+    NODE_LOCAL_IP=""
+    NODE_PEER_IP=""
+    NODE_VIP_CIDR=""
+    NODE_INTERFACE=""
+    NODE_PRIORITY=""
+    NODE_VIRTUAL_ROUTER_ID=""
+    NODE_HEALTH_URL=""
     [[ -r "$file" ]] || die "缺少节点配置：$file；请复制 keepalived.env.example 后修改"
     while IFS= read -r line || [[ -n "$line" ]]; do
         line_number=$((line_number + 1))
@@ -83,10 +90,11 @@ parse_node_config() {
         seen[$key]=1
         printf -v "NODE_${key#KEEPALIVED_}" '%s' "$value"
     done <"$file"
-    local variable=""
+    local variable="" config_key=""
     for key in LOCAL_IP PEER_IP VIP_CIDR INTERFACE PRIORITY VIRTUAL_ROUTER_ID HEALTH_URL; do
         variable="NODE_$key"
-        [[ -n "${!variable}" ]] || die "节点配置缺少字段：KEEPALIVED_$key"
+        config_key="KEEPALIVED_$key"
+        [[ -n "${seen[$config_key]+x}" && -n "${!variable}" ]] || die "节点配置缺少字段：$config_key"
     done
 }
 
@@ -104,6 +112,7 @@ valid_ipv4() {
 validate_node_config() {
     local vip="${NODE_VIP_CIDR%/*}"
     local prefix="${NODE_VIP_CIDR##*/}"
+    local prefix_number=0 priority_number=0 virtual_router_id_number=0
     local authority="${NODE_HEALTH_URL#*://}"
     local host_port="${authority%%/*}"
     local host="${host_port%%:*}"
@@ -111,11 +120,17 @@ validate_node_config() {
     valid_ipv4 "$NODE_PEER_IP" || die "对端 IP 无效"
     [[ "$NODE_LOCAL_IP" != "$NODE_PEER_IP" ]] || die "本机 IP 与对端 IP 不能相同"
     [[ "$NODE_VIP_CIDR" == */* ]] && valid_ipv4 "$vip" || die "VIP/CIDR 无效"
-    [[ "$prefix" =~ ^[0-9]+$ ]] && ((prefix >= 1 && prefix <= 32)) || die "VIP 前缀必须为 1-32"
+    [[ "$prefix" =~ ^(0|[1-9][0-9]{0,1})$ ]] || die "VIP 前缀必须为 1-32"
+    prefix_number=$((10#$prefix))
+    ((prefix_number >= 1 && prefix_number <= 32)) || die "VIP 前缀必须为 1-32"
     [[ "$vip" != "$NODE_LOCAL_IP" && "$vip" != "$NODE_PEER_IP" ]] || die "VIP 不能等于节点 IP"
     [[ "$NODE_INTERFACE" =~ ^[A-Za-z0-9_.:-]{1,15}$ ]] || die "接口名称无效"
-    [[ "$NODE_PRIORITY" =~ ^[0-9]+$ ]] && ((NODE_PRIORITY >= 1 && NODE_PRIORITY <= 254)) || die "优先级必须为 1-254"
-    [[ "$NODE_VIRTUAL_ROUTER_ID" =~ ^[0-9]+$ ]] && ((NODE_VIRTUAL_ROUTER_ID >= 1 && NODE_VIRTUAL_ROUTER_ID <= 255)) || die "virtual router id 必须为 1-255"
+    [[ "$NODE_PRIORITY" =~ ^(0|[1-9][0-9]{0,2})$ ]] || die "优先级必须为 1-254"
+    priority_number=$((10#$NODE_PRIORITY))
+    ((priority_number >= 1 && priority_number <= 254)) || die "优先级必须为 1-254"
+    [[ "$NODE_VIRTUAL_ROUTER_ID" =~ ^(0|[1-9][0-9]{0,2})$ ]] || die "virtual router id 必须为 1-255"
+    virtual_router_id_number=$((10#$NODE_VIRTUAL_ROUTER_ID))
+    ((virtual_router_id_number >= 1 && virtual_router_id_number <= 255)) || die "virtual router id 必须为 1-255"
     validate_health_url_shape "$NODE_HEALTH_URL" || die "健康 URL 格式无效"
     [[ "$host" == "$NODE_LOCAL_IP" || "$host" == 127.0.0.1 || "$host" == localhost ]] || die "健康 URL 必须指向本机"
     ip link show dev "$NODE_INTERFACE" >/dev/null 2>&1 || die "接口不存在：$NODE_INTERFACE"
