@@ -37,6 +37,18 @@ const commonEntries = [
   { kind: 'file', source: 'README.md', target: 'README.md', required: false }
 ]
 
+const keepalivedEntry = {
+  kind: 'dir',
+  source: 'extras/keepalived',
+  target: 'extras/keepalived',
+  required: true,
+  executables: [
+    'install-keepalived-offline.sh',
+    'configure-selinux.sh',
+    'uninstall-keepalived.sh'
+  ]
+}
+
 const targets = [
   {
     platform: 'linux',
@@ -44,6 +56,7 @@ const targets = [
     binary: 'aifar-server-linux-amd64',
     archive: 'tar.gz',
     extraBinaries: ['aifar-agent-linux-amd64'],
+    packageEntries: [keepalivedEntry],
     runtimeFiles: [
       { source: 'scripts/start.sh', target: 'start.sh', executable: true },
       { source: 'scripts/stop.sh', target: 'stop.sh', executable: true }
@@ -54,6 +67,7 @@ const targets = [
     arch: 'amd64',
     binary: 'aifar-server-windows-amd64.exe',
     archive: 'zip',
+    packageEntries: [],
     runtimeFiles: [
       { source: 'scripts/start.ps1', target: 'start.ps1' },
       { source: 'scripts/start.bat', target: 'start.bat' }
@@ -93,6 +107,9 @@ function copyEntry(entry, packageDir) {
   mkdirSync(path.dirname(targetPath), { recursive: true })
   if (entry.kind === 'dir') {
     cpSync(sourcePath, targetPath, { dereference: true, force: true, recursive: true })
+    for (const relativePath of entry.executables || []) {
+      chmodBestEffort(path.join(targetPath, relativePath), 0o755)
+    }
     return
   }
   copyFileSync(sourcePath, targetPath)
@@ -172,6 +189,7 @@ function buildPackage(target) {
   mkdirSync(packageDir, { recursive: true })
 
   for (const entry of commonEntries) copyEntry(entry, packageDir)
+  for (const entry of target.packageEntries || []) copyEntry(entry, packageDir)
 
   assertReleaseDefaultsFile(path.join(packageDir, 'config', 'defaults.env'))
 
@@ -265,7 +283,11 @@ function createArchive(target, packageName, packageDir, archivePath) {
 
 function ensureRequiredBuildOutputs() {
   assertReleaseDefaultsFile(path.join(rootDir, 'config', 'defaults.env'))
-  for (const entry of commonEntries.filter((item) => item.required)) {
+  const requiredEntries = [
+    ...commonEntries,
+    ...targets.flatMap((target) => target.packageEntries || [])
+  ].filter((entry) => entry.required)
+  for (const entry of requiredEntries) {
     const sourcePath = path.join(rootDir, entry.source)
     if (!existsSync(sourcePath)) {
       throw new Error(`Missing required package input: ${entry.source}`)

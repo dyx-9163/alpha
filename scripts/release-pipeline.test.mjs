@@ -32,6 +32,12 @@ function releaseFixture(t, { safeDefaults = true, buildOutputs = true, binaries 
   write(root, 'scripts/start.bat', '')
   if (buildOutputs) write(root, 'deploy/dist/index.html', '<!doctype html>')
   write(root, 'resources/.keep', '')
+  write(root, 'extras/keepalived/README.md', 'keepalived tools\n')
+  write(root, 'extras/keepalived/keepalived-2.4.2.tar.gz', 'fixture archive')
+  write(root, 'extras/keepalived/SHA256SUMS', 'fixture checksum\n')
+  write(root, 'extras/keepalived/install-keepalived-offline.sh', '#!/usr/bin/env bash\n')
+  write(root, 'extras/keepalived/configure-selinux.sh', '#!/usr/bin/env bash\n')
+  write(root, 'extras/keepalived/uninstall-keepalived.sh', '#!/usr/bin/env bash\n')
   if (binaries) {
     write(root, 'deploy/bin/aifar-server-linux-amd64', 'linux-server')
     write(root, 'deploy/bin/aifar-agent-linux-amd64', 'linux-agent')
@@ -166,6 +172,22 @@ test('release verifier extracts archives and rechecks internal checksums', (t) =
   const verify = runVerify(root)
   assert.notEqual(verify.status, 0)
   assert.match(verify.stderr, /Checksum mismatch/)
+})
+
+test('release includes Keepalived tools only in Linux packages and checksums them', (t) => {
+  const root = releaseFixture(t)
+  const result = runRelease(root)
+  assert.equal(result.status, 0, result.stderr)
+
+  const deployment = path.join(root, 'deploy', 'deployment')
+  const linux = path.join(deployment, 'aifar-fixture-9.8.7-linux-amd64')
+  const windows = path.join(deployment, 'aifar-fixture-9.8.7-windows-amd64')
+  assert.equal(existsSync(path.join(linux, 'extras/keepalived/install-keepalived-offline.sh')), true)
+  assert.equal(existsSync(path.join(windows, 'extras/keepalived')), false)
+  assert.match(
+    readFileSync(path.join(linux, 'checksums.txt'), 'utf8'),
+    /extras\/keepalived\/keepalived-2\.4\.2\.tar\.gz/
+  )
 })
 
 test('test:local uses the script test runner and does not release twice after package', () => {
