@@ -220,6 +220,9 @@ function buildPackage(target) {
   writeVersionFile(packageDir, target)
   writeChecksums(packageDir)
   const archiveCreated = createArchive(target, packageName, packageDir, archivePath)
+  if (archiveCreated && target.archive === 'tar.gz' && process.platform === 'win32') {
+    normalizeTarModes(target, packageName, archivePath)
+  }
   let finalPackageReady = false
   if (archiveCreated) {
     try {
@@ -238,6 +241,28 @@ function buildPackage(target) {
   } else if (archiveCreated) {
     console.log(`[package] ready ${path.relative(rootDir, archivePath)}`)
   }
+}
+
+function normalizeTarModes(target, packageName, archivePath) {
+  const executableEntries = [
+    ...target.runtimeFiles
+      .filter((entry) => entry.executable)
+      .map((entry) => `${packageName}/${entry.target}`),
+    ...(target.packageEntries || []).flatMap((entry) =>
+      (entry.executables || []).map((relativePath) => `${packageName}/${entry.target}/${relativePath}`)
+    )
+  ]
+  if (executableEntries.length === 0) return
+
+  const result = spawnSync(
+    process.execPath,
+    [path.join(scriptDir, 'normalize-tar-modes.mjs'), archivePath, ...executableEntries],
+    { cwd: rootDir, encoding: 'utf8' }
+  )
+  if (!result.error && result.status === 0 && !result.signal) return
+  const reason = result.error?.message ?? result.stderr?.trim() ?? `exit ${result.status ?? result.signal}`
+  removePath(archivePath)
+  throw new Error(`Could not normalize executable modes in ${path.relative(rootDir, archivePath)}: ${reason}`)
 }
 
 function createArchive(target, packageName, packageDir, archivePath) {

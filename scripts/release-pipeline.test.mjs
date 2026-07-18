@@ -22,6 +22,7 @@ function releaseFixture(t, { safeDefaults = true, buildOutputs = true, binaries 
   copyFileSync(path.join(scriptsDir, 'verify-release-checksums.mjs'), path.join(root, 'scripts', 'verify-release-checksums.mjs'))
   copyFileSync(path.join(scriptsDir, 'toolchain.mjs'), path.join(root, 'scripts', 'toolchain.mjs'))
   copyFileSync(path.join(scriptsDir, 'runtime-security-config.mjs'), path.join(root, 'scripts', 'runtime-security-config.mjs'))
+  copyFileSync(path.join(scriptsDir, 'normalize-tar-modes.mjs'), path.join(root, 'scripts', 'normalize-tar-modes.mjs'))
   write(root, 'package.json', JSON.stringify({ name: 'aifar-fixture', version: '9.8.7' }))
   write(root, 'config/defaults.env', safeDefaults
     ? `AIFAR_DEFAULT_PASSWORD=\nAIFAR_BOOTSTRAP_PASSWORD=\nAIFAR_JWT_SECRET=\nAIFAR_CREDENTIAL_SECRET=\nAIFAR_PREVIOUS_CREDENTIAL_SECRET=\nAIFAR_ALLOW_INSECURE_DEFAULTS=false\nAIFAR_ALLOW_WEAK_PASSWORDS=false\n`
@@ -188,6 +189,17 @@ test('release includes Keepalived tools only in Linux packages and checksums the
     readFileSync(path.join(linux, 'checksums.txt'), 'utf8'),
     /extras\/keepalived\/keepalived-2\.4\.2\.tar\.gz/
   )
+
+  const archivePath = path.join(deployment, 'aifar-fixture-9.8.7-linux-amd64.tar.gz')
+  const listing = spawnSync('tar', ['-tvzf', archivePath], { encoding: 'utf8' })
+  assert.equal(listing.status, 0, listing.stderr)
+  for (const script of [
+    'install-keepalived-offline.sh',
+    'configure-selinux.sh',
+    'uninstall-keepalived.sh'
+  ]) {
+    assert.match(listing.stdout, new RegExp(`^-rwxr-xr-x.*extras/keepalived/${script}$`, 'm'))
+  }
 })
 
 test('test:local uses the script test runner and does not release twice after package', () => {
