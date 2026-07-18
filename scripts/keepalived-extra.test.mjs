@@ -44,3 +44,22 @@ test('installer verifies the archive before extraction and never activates Keepa
   assert.doesNotMatch(mainBody, /systemctl\s+(?:enable|start|restart)|systemctl\s+enable\s+--now/)
   assert.doesNotMatch(installer, /cp\s+.*keepalived\.conf\.sample.*keepalived\.conf/)
 })
+
+test('SELinux script preserves mode and manages persistent distribution-derived labels', () => {
+  const script = read('configure-selinux.sh')
+  assert.match(script, /getenforce/)
+  assert.match(script, /matchpathcon/)
+  assert.match(script, /semanage fcontext/)
+  assert.match(script, /restorecon/)
+  assert.match(script, /keepalived-selinux-fcontexts/)
+  assert.doesNotMatch(
+    script,
+    /setenforce|SELINUX\s*=\s*(?:disabled|permissive)|\/etc\/selinux\/config|audit2allow/i
+  )
+})
+
+test('installer and SELinux scripts use LF endings', () => {
+  for (const relativePath of ['install-keepalived-offline.sh', 'configure-selinux.sh']) {
+    assert.doesNotMatch(read(relativePath), /\r/)
+  }
+})
