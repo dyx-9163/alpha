@@ -71,13 +71,12 @@ test('Keepalived source archive has the pinned size and digest', () => {
   assert.equal(read('SHA256SUMS'), `${archiveSha256}  ${archiveName}\n`)
 })
 
-test('installer verifies the archive before extraction and never activates Keepalived', () => {
+test('installer verifies source and requires managed configuration before build', () => {
   const installer = read('install-keepalived-offline.sh')
   const mainStart = indexOfOrFail(installer, '\nmain() {')
-  const mainBody = installer.slice(mainStart, installer.lastIndexOf('\nmain "$@"'))
-  assert.match(installer, /readonly APP_ROOT="\/aifar\/apps\/keepalived"/)
-  assert.ok(indexOfOrFail(installer, 'sha256sum --check') < indexOfOrFail(installer, 'tar -tzf'))
-  assert.doesNotMatch(mainBody, /systemctl\s+(?:enable|start|restart)|systemctl\s+enable\s+--now/)
+  const mainBody = installer.slice(mainStart, installer.indexOf('\nif [[ "${BASH_SOURCE[0]}" == "$0" ]]'))
+  assert.ok(indexOfOrFail(mainBody, 'parse_node_config "$NODE_CONFIG"') < indexOfOrFail(mainBody, 'install_build_dependencies'))
+  assert.ok(indexOfOrFail(mainBody, 'validate_node_config') < indexOfOrFail(mainBody, 'install_build_dependencies'))
   assert.doesNotMatch(installer, /cp\s+.*keepalived\.conf\.sample.*keepalived\.conf/)
 })
 

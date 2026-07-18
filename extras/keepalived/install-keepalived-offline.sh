@@ -15,6 +15,20 @@ SCRIPT_PATH="$(readlink -f -- "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(dirname -- "$SCRIPT_PATH")"
 SOURCE_ARCHIVE="${SCRIPT_DIR}/${SOURCE_ARCHIVE_NAME}"
 SELINUX_SCRIPT="${SCRIPT_DIR}/${SELINUX_SCRIPT_NAME}"
+readonly NODE_CONFIG="${SCRIPT_DIR}/keepalived.env"
+readonly CONFIG_TEMPLATE="${SCRIPT_DIR}/keepalived.conf.tpl"
+readonly HEALTH_SCRIPT_SOURCE="${SCRIPT_DIR}/check-aggregate-health.sh"
+readonly FORMAL_CONFIG="${APP_ROOT}/etc/keepalived/keepalived.conf"
+readonly HEALTH_URL_FILE="${APP_ROOT}/etc/keepalived/keepalived-health-url"
+readonly FIREWALL_RECORD="${APP_ROOT}/var/lib/aifar/firewall-rule"
+readonly BACKUP_ROOT="/aifar/backups"
+NODE_LOCAL_IP=""
+NODE_PEER_IP=""
+NODE_VIP_CIDR=""
+NODE_INTERFACE=""
+NODE_PRIORITY=""
+NODE_VIRTUAL_ROUTER_ID=""
+NODE_HEALTH_URL=""
 WORK_DIR=""
 
 log() {
@@ -25,6 +39,10 @@ die() {
     printf '[keepalived-installer] ERROR: %s\n' "$*" >&2
     exit 1
 }
+
+[[ -f "$HEALTH_SCRIPT_SOURCE" ]] || die "缺少健康检查脚本：$HEALTH_SCRIPT_SOURCE"
+# shellcheck source=check-aggregate-health.sh
+source "$HEALTH_SCRIPT_SOURCE"
 
 cleanup() {
     local status=$?
@@ -43,6 +61,81 @@ trap 'exit 143' TERM
 
 require_command() {
     command -v "$1" >/dev/null 2>&1 || die "缺少必要命令：$1"
+}
+
+parse_node_config() {
+    local file="$1" line="" key="" value=""
+    local line_number=0
+    declare -A seen=()
+    [[ -r "$file" ]] || die "缺少节点配置：$file；请复制 keepalived.env.example 后修改"
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line_number=$((line_number + 1))
+        line="${line%$'\r'}"
+        [[ -z "$line" || "$line" == \#* ]] && continue
+        [[ "$line" =~ ^([A-Z][A-Z0-9_]*)=([^[:space:]]+)$ ]] || die "节点配置第 $line_number 行格式无效"
+        key="${BASH_REMATCH[1]}"
+        value="${BASH_REMATCH[2]}"
+        case "$key" in
+            KEEPALIVED_LOCAL_IP|KEEPALIVED_PEER_IP|KEEPALIVED_VIP_CIDR|KEEPALIVED_INTERFACE|KEEPALIVED_PRIORITY|KEEPALIVED_VIRTUAL_ROUTER_ID|KEEPALIVED_HEALTH_URL) ;;
+            *) die "节点配置包含未知字段：$key" ;;
+        esac
+        [[ -z "${seen[$key]+x}" ]] || die "节点配置字段重复：$key"
+        seen[$key]=1
+        printf -v "NODE_${key#KEEPALIVED_}" '%s' "$value"
+    done <"$file"
+    local variable=""
+    for key in LOCAL_IP PEER_IP VIP_CIDR INTERFACE PRIORITY VIRTUAL_ROUTER_ID HEALTH_URL; do
+        variable="NODE_$key"
+        [[ -n "${!variable}" ]] || die "节点配置缺少字段：KEEPALIVED_$key"
+    done
+}
+
+valid_ipv4() {
+    local address="$1" octet=""
+    local -a octets=()
+    [[ "$address" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+    IFS=. read -r -a octets <<<"$address"
+    for octet in "${octets[@]}"; do
+        [[ "$octet" =~ ^(0|[1-9][0-9]{0,2})$ ]] || return 1
+        ((10#$octet <= 255)) || return 1
+    done
+}
+
+validate_node_config() {
+    local vip="${NODE_VIP_CIDR%/*}"
+    local prefix="${NODE_VIP_CIDR##*/}"
+    local authority="${NODE_HEALTH_URL#*://}"
+    local host_port="${authority%%/*}"
+    local host="${host_port%%:*}"
+    valid_ipv4 "$NODE_LOCAL_IP" || die "本机 IP 无效"
+    valid_ipv4 "$NODE_PEER_IP" || die "对端 IP 无效"
+    [[ "$NODE_LOCAL_IP" != "$NODE_PEER_IP" ]] || die "本机 IP 与对端 IP 不能相同"
+    [[ "$NODE_VIP_CIDR" == */* ]] && valid_ipv4 "$vip" || die "VIP/CIDR 无效"
+    [[ "$prefix" =~ ^[0-9]+$ ]] && ((prefix >= 1 && prefix <= 32)) || die "VIP 前缀必须为 1-32"
+    [[ "$vip" != "$NODE_LOCAL_IP" && "$vip" != "$NODE_PEER_IP" ]] || die "VIP 不能等于节点 IP"
+    [[ "$NODE_INTERFACE" =~ ^[A-Za-z0-9_.:-]{1,15}$ ]] || die "接口名称无效"
+    [[ "$NODE_PRIORITY" =~ ^[0-9]+$ ]] && ((NODE_PRIORITY >= 1 && NODE_PRIORITY <= 254)) || die "优先级必须为 1-254"
+    [[ "$NODE_VIRTUAL_ROUTER_ID" =~ ^[0-9]+$ ]] && ((NODE_VIRTUAL_ROUTER_ID >= 1 && NODE_VIRTUAL_ROUTER_ID <= 255)) || die "virtual router id 必须为 1-255"
+    validate_health_url_shape "$NODE_HEALTH_URL" || die "健康 URL 格式无效"
+    [[ "$host" == "$NODE_LOCAL_IP" || "$host" == 127.0.0.1 || "$host" == localhost ]] || die "健康 URL 必须指向本机"
+    ip link show dev "$NODE_INTERFACE" >/dev/null 2>&1 || die "接口不存在：$NODE_INTERFACE"
+    ip -o -4 addr show dev "$NODE_INTERFACE" | awk -v expected="$NODE_LOCAL_IP" '{split($4,a,"/"); if (a[1]==expected) found=1} END{exit !found}' || die "接口未绑定本机 IP"
+    ip -4 route get "$vip" | awk -v expected="$NODE_INTERFACE" '{for(i=1;i<NF;i++) if($i=="dev" && $(i+1)==expected) found=1} END{exit !found}' || die "VIP 不通过指定接口路由"
+}
+
+render_keepalived_config() {
+    local template="$1" output="$2" content="" router_id=""
+    router_id="AIFAR_${NODE_LOCAL_IP//./_}"
+    content="$(<"$template")"
+    content="${content//@ROUTER_ID@/$router_id}"
+    content="${content//@INTERFACE@/$NODE_INTERFACE}"
+    content="${content//@VIRTUAL_ROUTER_ID@/$NODE_VIRTUAL_ROUTER_ID}"
+    content="${content//@PRIORITY@/$NODE_PRIORITY}"
+    content="${content//@LOCAL_IP@/$NODE_LOCAL_IP}"
+    content="${content//@PEER_IP@/$NODE_PEER_IP}"
+    content="${content//@VIP_CIDR@/$NODE_VIP_CIDR}"
+    [[ ! "$content" =~ @[A-Z_]+@ ]] || die "Keepalived 模板仍有未替换字段"
+    printf '%s\n' "$content" >"$output"
 }
 
 validate_platform() {
@@ -86,13 +179,15 @@ install_build_dependencies() {
         openssl-devel
         libnl3-devel
         systemd-devel
+        curl
+        python3
     )
 
     log "使用服务器当前启用的 DNF 仓库安装编译依赖"
     dnf --assumeyes --setopt=install_weak_deps=False --setopt=keepcache=False install "${packages[@]}"
 
     local command_name
-    for command_name in gcc make autoconf automake autoreconf aclocal pkg-config; do
+    for command_name in gcc make autoconf automake autoreconf aclocal pkg-config curl python3; do
         require_command "$command_name"
     done
 }
@@ -215,13 +310,15 @@ main() {
 
     validate_platform
 
-    for command_name in readlink grep tar dnf systemctl ldd sha256sum stat; do
+    for command_name in readlink grep tar dnf systemctl ldd sha256sum stat ip awk; do
         require_command "$command_name"
     done
 
     [[ -f "$SOURCE_ARCHIVE" ]] || die "请将 $SOURCE_ARCHIVE_NAME 放到脚本同一目录：$SCRIPT_DIR"
     WORK_DIR="$(mktemp -d /tmp/keepalived-offline.XXXXXX)"
     verify_source_archive
+    parse_node_config "$NODE_CONFIG"
+    validate_node_config
     install_build_dependencies
     build_and_install_keepalived
     register_systemd_unit
@@ -230,4 +327,6 @@ main() {
     print_next_steps
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi
