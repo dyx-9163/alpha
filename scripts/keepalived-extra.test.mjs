@@ -77,6 +77,31 @@ test('installer verifies source and requires managed configuration before build'
   const mainBody = installer.slice(mainStart, installer.indexOf('\nif [[ "${BASH_SOURCE[0]}" == "$0" ]]'))
   assert.ok(indexOfOrFail(mainBody, 'parse_node_config "$NODE_CONFIG"') < indexOfOrFail(mainBody, 'install_build_dependencies'))
   assert.ok(indexOfOrFail(mainBody, 'validate_node_config') < indexOfOrFail(mainBody, 'install_build_dependencies'))
+  assert.ok(indexOfOrFail(mainBody, 'create_install_backup') < indexOfOrFail(mainBody, 'build_and_install_keepalived'))
+  assert.ok(indexOfOrFail(mainBody, 'install_managed_configuration') < indexOfOrFail(mainBody, 'activate_keepalived'))
+  const transactionOrder = [
+    'render_keepalived_config',
+    'capture_service_state',
+    'create_install_backup',
+    'build_and_install_keepalived',
+    'register_systemd_unit',
+    'install_managed_configuration',
+    'configure_selinux_if_enabled',
+    'activate_keepalived',
+    'verify_installation',
+    'TRANSACTION_ACTIVE=0'
+  ].map((fragment) => indexOfOrFail(mainBody, fragment))
+  assert.deepEqual(transactionOrder, [...transactionOrder].sort((left, right) => left - right))
+  assert.match(installer, /systemctl enable keepalived\.service/)
+  assert.match(installer, /systemctl is-active --quiet keepalived\.service/)
+  assert.match(installer, /cp -a -- "\$APP_ROOT" "\$BACKUP_DIR\/installed-root"/)
+  assert.match(installer, /sha256sum --check BACKUP\.sha256/)
+  assert.match(installer, /mv -f -- "\$config_tmp" "\$FORMAL_CONFIG"/)
+  assert.match(installer, /readlink -f -- "\$APP_ROOT"/)
+  assert.match(installer, /mountpoint -q "\$APP_ROOT"/)
+  assert.match(installer, /rm -rf -- "\$APP_ROOT"/)
+  assert.match(installer, /ln -s -- "\$UNIT_LINK_TARGET" "\$UNIT_LINK"/)
+  assert.match(installer, /mountpoint -q "\$WORK_DIR"/)
   assert.doesNotMatch(installer, /cp\s+.*keepalived\.conf\.sample.*keepalived\.conf/)
 })
 

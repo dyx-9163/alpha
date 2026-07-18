@@ -22,6 +22,8 @@ readonly FORMAL_CONFIG="${APP_ROOT}/etc/keepalived/keepalived.conf"
 readonly HEALTH_URL_FILE="${APP_ROOT}/etc/keepalived/keepalived-health-url"
 readonly FIREWALL_RECORD="${APP_ROOT}/var/lib/aifar/firewall-rule"
 readonly BACKUP_ROOT="/aifar/backups"
+readonly UNIT_LINK="/etc/systemd/system/keepalived.service"
+readonly EXPECTED_UNIT="${APP_ROOT}/systemd/keepalived.service"
 NODE_LOCAL_IP=""
 NODE_PEER_IP=""
 NODE_VIP_CIDR=""
@@ -30,6 +32,13 @@ NODE_PRIORITY=""
 NODE_VIRTUAL_ROUTER_ID=""
 NODE_HEALTH_URL=""
 WORK_DIR=""
+TRANSACTION_ACTIVE=0
+APP_ROOT_EXISTED=0
+SERVICE_WAS_ACTIVE=0
+SERVICE_WAS_ENABLED=0
+UNIT_LINK_EXISTED=0
+UNIT_LINK_TARGET=''
+BACKUP_DIR=''
 
 log() {
     printf '[keepalived-installer] %s\n' "$*"
@@ -46,10 +55,30 @@ source "$HEALTH_SCRIPT_SOURCE"
 
 cleanup() {
     local status=$?
+    local rollback_status=0
+    local resolved_work_dir=""
     trap - EXIT
 
+    if [[ "$status" -ne 0 && "$TRANSACTION_ACTIVE" -eq 1 ]]; then
+        set +e
+        rollback_install_transaction
+        rollback_status=$?
+        if [[ "$rollback_status" -ne 0 ]]; then
+            printf '[keepalived-installer] ERROR: 安装失败后的回滚也未完整成功；请检查上方回滚日志。\n' >&2
+        fi
+    fi
+
     if [[ -n "$WORK_DIR" && "$WORK_DIR" == /tmp/keepalived-offline.* && -d "$WORK_DIR" ]]; then
-        rm -rf -- "$WORK_DIR"
+        resolved_work_dir="$(readlink -f -- "$WORK_DIR" 2>/dev/null || true)"
+        if [[ "$resolved_work_dir" == "$WORK_DIR" && "$resolved_work_dir" == /tmp/keepalived-offline.* ]]; then
+            if mountpoint -q "$WORK_DIR"; then
+                printf '[keepalived-installer] WARNING: 拒绝递归清理临时挂载点：%s\n' "$WORK_DIR" >&2
+            else
+                rm -rf -- "$WORK_DIR" || printf '[keepalived-installer] WARNING: 临时目录清理失败：%s\n' "$WORK_DIR" >&2
+            fi
+        else
+            printf '[keepalived-installer] WARNING: 拒绝清理非预期临时目录：%s\n' "$WORK_DIR" >&2
+        fi
     fi
 
     exit "$status"
@@ -61,6 +90,160 @@ trap 'exit 143' TERM
 
 require_command() {
     command -v "$1" >/dev/null 2>&1 || die "缺少必要命令：$1"
+}
+
+capture_service_state() {
+    SERVICE_WAS_ACTIVE=0
+    SERVICE_WAS_ENABLED=0
+    UNIT_LINK_EXISTED=0
+    UNIT_LINK_TARGET=''
+    systemctl is-active --quiet keepalived.service && SERVICE_WAS_ACTIVE=1 || SERVICE_WAS_ACTIVE=0
+    systemctl is-enabled --quiet keepalived.service && SERVICE_WAS_ENABLED=1 || SERVICE_WAS_ENABLED=0
+    if [[ -e "$UNIT_LINK" || -L "$UNIT_LINK" ]]; then
+        UNIT_LINK_EXISTED=1
+        UNIT_LINK_TARGET="$(readlink -f -- "$UNIT_LINK" 2>/dev/null || true)"
+    fi
+}
+
+validate_unit_ownership() {
+    local unit_target=""
+    local fragment=""
+    local fragment_target=""
+
+    if [[ -e "$UNIT_LINK" || -L "$UNIT_LINK" ]]; then
+        unit_target="$(readlink -f -- "$UNIT_LINK" 2>/dev/null || true)"
+        [[ -n "$unit_target" ]] || die "无法解析现有 keepalived.service unit：$UNIT_LINK"
+        [[ "$unit_target" == "$EXPECTED_UNIT" ]] || die "系统 keepalived.service 不属于此安装：$unit_target"
+    fi
+
+    fragment="$(systemctl show -p FragmentPath --value keepalived.service 2>/dev/null || true)"
+    if [[ -n "$fragment" ]]; then
+        fragment_target="$(readlink -f -- "$fragment" 2>/dev/null || true)"
+        [[ -n "$fragment_target" ]] || die "无法解析已加载的 keepalived.service unit：$fragment"
+        [[ "$fragment_target" == "$EXPECTED_UNIT" ]] || die "已加载的 keepalived.service 不属于此安装：$fragment_target"
+    fi
+}
+
+create_install_backup() {
+    local resolved_root=""
+
+    validate_unit_ownership
+    TRANSACTION_ACTIVE=0
+    APP_ROOT_EXISTED=0
+    if [[ -e "$APP_ROOT" || -L "$APP_ROOT" ]]; then
+        resolved_root="$(readlink -f -- "$APP_ROOT" 2>/dev/null || true)"
+        [[ "$resolved_root" == "/aifar/apps/keepalived" ]] || die "现有安装目录不是预期路径：$resolved_root"
+        [[ -d "$APP_ROOT" ]] || die "现有安装路径不是目录：$APP_ROOT"
+        mountpoint -q "$APP_ROOT" && die "现有安装目录是挂载点，无法保证事务回滚：$APP_ROOT"
+    fi
+    umask 077
+    install -d -o root -g root -m 700 "$BACKUP_ROOT"
+    BACKUP_DIR="$BACKUP_ROOT/keepalived-update-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+    install -d -o root -g root -m 700 "$BACKUP_DIR"
+    if [[ -d "$APP_ROOT" ]]; then
+        APP_ROOT_EXISTED=1
+        cp -a -- "$APP_ROOT" "$BACKUP_DIR/installed-root"
+    fi
+    printf 'app_root_existed=%s\nservice_was_active=%s\nservice_was_enabled=%s\nunit_link_existed=%s\nunit_link_target=%s\n' \
+        "$APP_ROOT_EXISTED" "$SERVICE_WAS_ACTIVE" "$SERVICE_WAS_ENABLED" "$UNIT_LINK_EXISTED" "$UNIT_LINK_TARGET" \
+        >"$BACKUP_DIR/install-state.txt"
+    (cd "$BACKUP_DIR" && find . -type f ! -name BACKUP.sha256 -print0 | sort -z | xargs -0 sha256sum >BACKUP.sha256 && sha256sum --check BACKUP.sha256)
+    TRANSACTION_ACTIVE=1
+}
+
+safe_remove_app_root() {
+    local resolved_root=""
+
+    resolved_root="$(readlink -f -- "$APP_ROOT" 2>/dev/null || true)"
+    if [[ "$resolved_root" != "/aifar/apps/keepalived" ]]; then
+        printf '[keepalived-installer] ERROR: 拒绝递归删除非预期安装路径：%s\n' "$resolved_root" >&2
+        return 1
+    fi
+    if mountpoint -q "$APP_ROOT"; then
+        printf '[keepalived-installer] ERROR: 拒绝递归删除挂载点：%s\n' "$APP_ROOT" >&2
+        return 1
+    fi
+    rm -rf -- "$APP_ROOT"
+}
+
+rollback_install_transaction() {
+    local rollback_status=0
+    local root_restore_allowed=1
+    local current_unit_target=""
+    local current_unit_value=""
+
+    log "安装事务失败，正在恢复安装前状态"
+    systemctl stop keepalived.service || {
+        printf '[keepalived-installer] ERROR: 回滚时停止 keepalived.service 失败\n' >&2
+        rollback_status=1
+    }
+
+    if [[ "$APP_ROOT_EXISTED" -eq 1 ]]; then
+        if [[ -z "$BACKUP_DIR" || "$BACKUP_DIR" != "$BACKUP_ROOT"/keepalived-update-* || ! -d "$BACKUP_DIR/installed-root" ]]; then
+            printf '[keepalived-installer] ERROR: 回滚备份目录无效，拒绝替换当前安装目录：%s\n' "$BACKUP_DIR" >&2
+            rollback_status=1
+            root_restore_allowed=0
+        elif ! (cd "$BACKUP_DIR" && sha256sum --check BACKUP.sha256); then
+            printf '[keepalived-installer] ERROR: 回滚备份校验失败，拒绝替换当前安装目录：%s\n' "$BACKUP_DIR" >&2
+            rollback_status=1
+            root_restore_allowed=0
+        fi
+    fi
+
+    if [[ "$root_restore_allowed" -eq 1 && ( -e "$APP_ROOT" || -L "$APP_ROOT" ) ]]; then
+        safe_remove_app_root || {
+            rollback_status=1
+            root_restore_allowed=0
+        }
+    fi
+    if [[ "$APP_ROOT_EXISTED" -eq 1 && "$root_restore_allowed" -eq 1 ]]; then
+        cp -a -- "$BACKUP_DIR/installed-root" "$APP_ROOT" || {
+            printf '[keepalived-installer] ERROR: 回滚时恢复原安装目录失败\n' >&2
+            rollback_status=1
+        }
+    fi
+
+    if [[ -e "$UNIT_LINK" || -L "$UNIT_LINK" ]]; then
+        current_unit_target="$(readlink -f -- "$UNIT_LINK" 2>/dev/null || true)"
+        current_unit_value="$(readlink -- "$UNIT_LINK" 2>/dev/null || true)"
+        if [[ "$current_unit_target" == "$EXPECTED_UNIT" || "$current_unit_value" == "$EXPECTED_UNIT" ]]; then
+            rm -f -- "$UNIT_LINK" || {
+                printf '[keepalived-installer] ERROR: 回滚时删除事务 unit 链接失败：%s\n' "$UNIT_LINK" >&2
+                rollback_status=1
+            }
+        else
+            printf '[keepalived-installer] ERROR: unit 链接已被外部修改，回滚拒绝覆盖：%s\n' "$UNIT_LINK" >&2
+            rollback_status=1
+        fi
+    fi
+    if [[ "$UNIT_LINK_EXISTED" -eq 1 && ! -e "$UNIT_LINK" && ! -L "$UNIT_LINK" ]]; then
+        if [[ -n "$UNIT_LINK_TARGET" && "$UNIT_LINK_TARGET" == "$EXPECTED_UNIT" ]]; then
+            ln -s -- "$UNIT_LINK_TARGET" "$UNIT_LINK" || {
+                printf '[keepalived-installer] ERROR: 回滚时恢复原 unit 链接失败：%s\n' "$UNIT_LINK" >&2
+                rollback_status=1
+            }
+        else
+            printf '[keepalived-installer] ERROR: 原 unit 链接记录无效，无法恢复：%s\n' "$UNIT_LINK_TARGET" >&2
+            rollback_status=1
+        fi
+    fi
+
+    systemctl daemon-reload || {
+        printf '[keepalived-installer] ERROR: 回滚时 systemd daemon-reload 失败\n' >&2
+        rollback_status=1
+    }
+    if [[ "$SERVICE_WAS_ENABLED" -eq 1 ]]; then
+        systemctl enable keepalived.service || rollback_status=1
+    else
+        systemctl disable keepalived.service || rollback_status=1
+    fi
+    if [[ "$SERVICE_WAS_ACTIVE" -eq 1 ]]; then
+        systemctl restart keepalived.service || rollback_status=1
+    else
+        systemctl stop keepalived.service || rollback_status=1
+    fi
+
+    return "$rollback_status"
 }
 
 parse_node_config() {
@@ -246,17 +429,16 @@ build_and_install_keepalived() {
 }
 
 register_systemd_unit() {
-    local unit_source="$APP_ROOT/systemd/keepalived.service"
-    local unit_link="/etc/systemd/system/keepalived.service"
+    local unit_source="$EXPECTED_UNIT"
     local existing_fragment=""
     local resolved_fragment=""
 
     [[ -f "$unit_source" ]] || die "未生成 systemd 单元：$unit_source"
 
-    if [[ -e "$unit_link" || -L "$unit_link" ]]; then
-        resolved_fragment="$(readlink -f -- "$unit_link" 2>/dev/null || true)"
+    if [[ -e "$UNIT_LINK" || -L "$UNIT_LINK" ]]; then
+        resolved_fragment="$(readlink -f -- "$UNIT_LINK" 2>/dev/null || true)"
         if [[ "$resolved_fragment" != "$unit_source" ]]; then
-            die "系统已存在其他 Keepalived unit：$unit_link；为避免覆盖，本次安装已停止"
+            die "系统已存在其他 Keepalived unit：$UNIT_LINK；为避免覆盖，本次安装已停止"
         fi
     else
         existing_fragment="$(systemctl show -p FragmentPath --value keepalived.service 2>/dev/null || true)"
@@ -272,10 +454,37 @@ register_systemd_unit() {
     systemctl daemon-reload
 }
 
+install_managed_configuration() {
+    local staged_config="$1"
+    local config_tmp="$FORMAL_CONFIG.tmp.$$"
+    install -d -o root -g root -m 750 "$APP_ROOT/etc/keepalived" "$APP_ROOT/libexec" "$APP_ROOT/var/lib/aifar"
+    install -o root -g root -m 750 "$HEALTH_SCRIPT_SOURCE" "$APP_ROOT/libexec/check-aggregate-health.sh"
+    printf '%s\n' "$NODE_HEALTH_URL" >"$WORK_DIR/keepalived-health-url"
+    install -o root -g root -m 640 "$WORK_DIR/keepalived-health-url" "$HEALTH_URL_FILE"
+    "$APP_ROOT/sbin/keepalived" -t -f "$staged_config"
+    install -o root -g root -m 640 "$staged_config" "$config_tmp"
+    mv -f -- "$config_tmp" "$FORMAL_CONFIG"
+    "$APP_ROOT/sbin/keepalived" -t -f "$FORMAL_CONFIG"
+}
+
 configure_selinux_if_enabled() {
     if command -v getenforce >/dev/null 2>&1 && [[ "$(getenforce)" != "Disabled" ]]; then
         [[ -f "$SELINUX_SCRIPT" ]] || die "SELinux 已启用，但缺少脚本：$SELINUX_SCRIPT"
         bash "$SELINUX_SCRIPT"
+    fi
+}
+
+activate_keepalived() {
+    systemctl daemon-reload
+    systemctl enable keepalived.service
+    if [[ "$SERVICE_WAS_ACTIVE" -eq 1 ]]; then
+        systemctl restart keepalived.service
+    else
+        systemctl start keepalived.service
+    fi
+    systemctl is-active --quiet keepalived.service || die "keepalived.service 鍚姩澶辫触"
+    if ! "$APP_ROOT/libexec/check-aggregate-health.sh"; then
+        log "WARNING: 鍋ュ悍鎺ュ彛褰撳墠涓嶅彲鐢紱鏈嶅姟淇濇寔 active锛孷RRP 瀹炰緥灏嗕繚鎸?FAULT"
     fi
 }
 
@@ -305,11 +514,9 @@ Keepalived ${KEEPALIVED_VERSION} 安装完成。
 配置示例：$APP_ROOT/etc/keepalived/keepalived.conf.sample
 正式配置：$APP_ROOT/etc/keepalived/keepalived.conf
 
-脚本没有自动复制示例配置，也没有启动服务，避免误绑定示例 VIP。
-完成主备配置后执行：
+脚本已安装托管配置，并启用和启动 keepalived.service。
+可执行以下命令确认运行状态：
 
-  $APP_ROOT/sbin/keepalived -t -f $APP_ROOT/etc/keepalived/keepalived.conf
-  systemctl enable --now keepalived
   systemctl status keepalived
 EOF
 }
@@ -325,7 +532,7 @@ main() {
 
     validate_platform
 
-    for command_name in readlink grep tar dnf systemctl ldd sha256sum stat ip awk; do
+    for command_name in awk cp date dnf find grep install ip ldd ln mountpoint mv readlink rm sha256sum sort stat systemctl tar xargs; do
         require_command "$command_name"
     done
 
@@ -334,11 +541,17 @@ main() {
     verify_source_archive
     parse_node_config "$NODE_CONFIG"
     validate_node_config
+    render_keepalived_config "$CONFIG_TEMPLATE" "$WORK_DIR/keepalived.conf"
     install_build_dependencies
+    capture_service_state
+    create_install_backup
     build_and_install_keepalived
     register_systemd_unit
+    install_managed_configuration "$WORK_DIR/keepalived.conf"
     configure_selinux_if_enabled
+    activate_keepalived
     verify_installation
+    TRANSACTION_ACTIVE=0
     print_next_steps
 }
 

@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import {
+  chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync
+} from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { spawnSync } from 'node:child_process'
@@ -222,6 +224,270 @@ parse_node_config '${toMsysPath(missingEnvPath)}'
   return spawnSync(bashPath, [toMsysPath(harnessPath)], { encoding: 'utf8' })
 }
 
+function writeInstallerFixture(fixture) {
+  const appRoot = path.join(fixture, 'aifar', 'apps', 'keepalived')
+  const backupRoot = path.join(fixture, 'aifar', 'backups')
+  const unitLink = path.join(fixture, 'etc', 'systemd', 'system', 'keepalived.service')
+  const fixtureInstallerPath = path.join(fixture, 'install-keepalived-offline.sh')
+  let installer = readFileSync(installerPath, 'utf8')
+  installer = installer
+    .replaceAll('/aifar/apps/keepalived', toMsysPath(appRoot))
+    .replaceAll('/aifar/backups', toMsysPath(backupRoot))
+    .replaceAll('/etc/systemd/system/keepalived.service', toMsysPath(unitLink))
+  writeFileSync(fixtureInstallerPath, installer)
+  writeFileSync(
+    path.join(fixture, 'check-aggregate-health.sh'),
+    readFileSync(healthScriptPath, 'utf8')
+  )
+  return { appRoot, backupRoot, fixtureInstallerPath, unitLink }
+}
+
+function fakeSystemctlFunction(callLogPath) {
+  return `systemctl() {
+    printf '%s\\n' "\$*" >>'${toMsysPath(callLogPath)}'
+    case "\$*" in
+        'is-active --quiet keepalived.service')
+            if [[ "\$FAKE_ACTIVATION_ATTEMPTED" -eq 1 && "\$FAKE_FINAL_ACTIVE_FAILURE" -eq 1 ]]; then
+                return 1
+            fi
+            [[ "\$FAKE_ACTIVE" -eq 1 ]]
+            ;;
+        'is-enabled --quiet keepalived.service') [[ "\$FAKE_ENABLED" -eq 1 ]] ;;
+        'enable keepalived.service') FAKE_ENABLED=1 ;;
+        'disable keepalived.service') FAKE_ENABLED=0 ;;
+        'start keepalived.service'|'restart keepalived.service')
+            FAKE_ACTIVE=1
+            FAKE_ACTIVATION_ATTEMPTED=1
+            ;;
+        'stop keepalived.service') FAKE_ACTIVE=0 ;;
+        'daemon-reload') ;;
+        'show -p FragmentPath --value keepalived.service') ;;
+        *) return 97 ;;
+    esac
+}`
+}
+
+function fakeInstallFunction() {
+  return `install() {
+    local directory_mode=0
+    local mode=''
+    while [[ "\$#" -gt 0 ]]; do
+        case "\$1" in
+            -d) directory_mode=1; shift ;;
+            -o|-g) shift 2 ;;
+            -m) mode="\$2"; shift 2 ;;
+            *) break ;;
+        esac
+    done
+    if [[ "\$directory_mode" -eq 1 ]]; then
+        mkdir -p -- "\$@"
+    else
+        cp -- "\$1" "\$2"
+        [[ -z "\$mode" ]] || chmod "\$mode" "\$2"
+    fi
+}`
+}
+
+function runServiceHarness(t, {
+  active,
+  enabled,
+  healthStatus = 0,
+  finalActiveFailure = false
+}) {
+  const fixture = mkdtempSync(path.join(os.tmpdir(), 'aifar-keepalived-service-test-'))
+  t.after(() => rmSync(fixture, { force: true, recursive: true }))
+  const { appRoot, fixtureInstallerPath } = writeInstallerFixture(fixture)
+  const harnessPath = path.join(fixture, 'harness.sh')
+  const callLogPath = path.join(fixture, 'systemctl-calls')
+  const installedHealthScript = path.join(appRoot, 'libexec', 'check-aggregate-health.sh')
+  mkdirSync(path.dirname(installedHealthScript), { recursive: true })
+  writeFileSync(installedHealthScript, `#!/usr/bin/env bash\nexit ${healthStatus}\n`)
+  chmodSync(installedHealthScript, 0o750)
+  writeFileSync(harnessPath, `#!/usr/bin/env bash
+set -Eeuo pipefail
+source '${toMsysPath(fixtureInstallerPath)}'
+FAKE_ACTIVE=${active ? 1 : 0}
+FAKE_ENABLED=${enabled ? 1 : 0}
+FAKE_ACTIVATION_ATTEMPTED=0
+FAKE_FINAL_ACTIVE_FAILURE=${finalActiveFailure ? 1 : 0}
+${fakeSystemctlFunction(callLogPath)}
+capture_service_state
+activate_keepalived
+`)
+  const result = spawnSync(bashPath, [toMsysPath(harnessPath)], { encoding: 'utf8' })
+  return {
+    ...result,
+    calls: existsSync(callLogPath) ? readFileSync(callLogPath, 'utf8').trimEnd().split('\n') : []
+  }
+}
+
+function runRollbackHarness(t, { active, enabled }) {
+  const fixture = mkdtempSync(path.join(os.tmpdir(), 'aifar-keepalived-rollback-test-'))
+  t.after(() => rmSync(fixture, { force: true, recursive: true }))
+  const { appRoot, fixtureInstallerPath } = writeInstallerFixture(fixture)
+  const harnessPath = path.join(fixture, 'harness.sh')
+  const callLogPath = path.join(fixture, 'systemctl-calls')
+  mkdirSync(appRoot, { recursive: true })
+  writeFileSync(path.join(appRoot, 'failed-install-marker'), 'failed')
+  writeFileSync(harnessPath, `#!/usr/bin/env bash
+set -Eeuo pipefail
+source '${toMsysPath(fixtureInstallerPath)}'
+FAKE_ACTIVE=1
+FAKE_ENABLED=1
+FAKE_ACTIVATION_ATTEMPTED=0
+FAKE_FINAL_ACTIVE_FAILURE=0
+${fakeSystemctlFunction(callLogPath)}
+mountpoint() { return 1; }
+APP_ROOT_EXISTED=0
+SERVICE_WAS_ACTIVE=${active ? 1 : 0}
+SERVICE_WAS_ENABLED=${enabled ? 1 : 0}
+UNIT_LINK_EXISTED=0
+rollback_install_transaction
+`)
+  const result = spawnSync(bashPath, [toMsysPath(harnessPath)], { encoding: 'utf8' })
+  return {
+    ...result,
+    appRootExists: existsSync(appRoot),
+    calls: existsSync(callLogPath) ? readFileSync(callLogPath, 'utf8').trimEnd().split('\n') : []
+  }
+}
+
+function runBackupHarness(t, { mountpointStatus = 1 } = {}) {
+  const fixture = mkdtempSync(path.join(rootDir, '.aifar-keepalived-backup-test-'))
+  t.after(() => rmSync(fixture, { force: true, recursive: true }))
+  const { appRoot, backupRoot, fixtureInstallerPath } = writeInstallerFixture(fixture)
+  const harnessPath = path.join(fixture, 'harness.sh')
+  const statePath = path.join(fixture, 'transaction-state')
+  mkdirSync(path.join(appRoot, 'nested'), { recursive: true })
+  writeFileSync(path.join(appRoot, 'nested', 'prior-state'), 'before-update')
+  writeFileSync(harnessPath, `#!/usr/bin/env bash
+set -Eeuo pipefail
+source '${toMsysPath(fixtureInstallerPath)}'
+${fakeInstallFunction()}
+systemctl() {
+    case "\$*" in
+        'is-active --quiet keepalived.service') return 0 ;;
+        'is-enabled --quiet keepalived.service') return 0 ;;
+        'show -p FragmentPath --value keepalived.service') return 0 ;;
+        *) return 97 ;;
+    esac
+}
+mountpoint() { return ${mountpointStatus}; }
+capture_service_state
+create_install_backup
+printf '%s|%s|%s|%s\n' "\$TRANSACTION_ACTIVE" "\$APP_ROOT_EXISTED" "\$SERVICE_WAS_ACTIVE" "\$SERVICE_WAS_ENABLED" >'${toMsysPath(statePath)}'
+`)
+  const result = spawnSync(bashPath, [toMsysPath(harnessPath)], { encoding: 'utf8' })
+  const backupDirectories = existsSync(backupRoot)
+    ? readdirSync(backupRoot).map((name) => path.join(backupRoot, name))
+    : []
+  return {
+    ...result,
+    backupDirectories,
+    state: existsSync(statePath) ? readFileSync(statePath, 'utf8').trim() : ''
+  }
+}
+
+function runCleanupRollbackFailureHarness(t) {
+  const fixture = mkdtempSync(path.join(os.tmpdir(), 'aifar-keepalived-cleanup-test-'))
+  t.after(() => rmSync(fixture, { force: true, recursive: true }))
+  const { fixtureInstallerPath } = writeInstallerFixture(fixture)
+  const harnessPath = path.join(fixture, 'harness.sh')
+  const rollbackMarkerPath = path.join(fixture, 'rollback-called')
+  writeFileSync(harnessPath, `#!/usr/bin/env bash
+set -Eeuo pipefail
+source '${toMsysPath(fixtureInstallerPath)}'
+rollback_install_transaction() {
+    printf 'called\n' >'${toMsysPath(rollbackMarkerPath)}'
+    return 1
+}
+TRANSACTION_ACTIVE=1
+exit 37
+`)
+  const result = spawnSync(bashPath, [toMsysPath(harnessPath)], { encoding: 'utf8' })
+  return { ...result, rollbackCalled: existsSync(rollbackMarkerPath) }
+}
+
+function runManagedConfigurationHarness(t, { stagedStatus = 0 } = {}) {
+  const fixture = mkdtempSync(path.join(rootDir, '.aifar-keepalived-config-test-'))
+  t.after(() => rmSync(fixture, { force: true, recursive: true }))
+  const { appRoot, fixtureInstallerPath } = writeInstallerFixture(fixture)
+  const harnessPath = path.join(fixture, 'harness.sh')
+  const workDir = path.join(fixture, 'work')
+  const stagedConfigPath = path.join(workDir, 'keepalived.conf')
+  const syntaxLogPath = path.join(fixture, 'syntax-calls')
+  const binaryPath = path.join(appRoot, 'sbin', 'keepalived')
+  const formalConfigPath = path.join(appRoot, 'etc', 'keepalived', 'keepalived.conf')
+  mkdirSync(path.dirname(binaryPath), { recursive: true })
+  mkdirSync(path.dirname(formalConfigPath), { recursive: true })
+  mkdirSync(workDir, { recursive: true })
+  writeFileSync(formalConfigPath, 'previous-config\n')
+  writeFileSync(stagedConfigPath, 'managed-config\n')
+  writeFileSync(binaryPath, `#!/usr/bin/env bash
+printf '%s\\n' "\$*" >>'${toMsysPath(syntaxLogPath)}'
+if [[ "\$*" == '-t -f ${toMsysPath(stagedConfigPath)}' ]]; then
+    exit ${stagedStatus}
+fi
+exit 0
+`)
+  chmodSync(binaryPath, 0o750)
+  writeFileSync(harnessPath, `#!/usr/bin/env bash
+set -Eeuo pipefail
+source '${toMsysPath(fixtureInstallerPath)}'
+${fakeInstallFunction()}
+WORK_DIR='${toMsysPath(workDir)}'
+NODE_HEALTH_URL='http://127.0.0.1:38000/health/aggregate'
+install_managed_configuration '${toMsysPath(stagedConfigPath)}'
+`)
+  const result = spawnSync(bashPath, [toMsysPath(harnessPath)], { encoding: 'utf8' })
+  return {
+    ...result,
+    formalConfig: readFileSync(formalConfigPath, 'utf8'),
+    healthUrl: existsSync(path.join(appRoot, 'etc', 'keepalived', 'keepalived-health-url'))
+      ? readFileSync(path.join(appRoot, 'etc', 'keepalived', 'keepalived-health-url'), 'utf8')
+      : '',
+    installedHealthScript: existsSync(path.join(appRoot, 'libexec', 'check-aggregate-health.sh')),
+    syntaxCalls: existsSync(syntaxLogPath)
+      ? readFileSync(syntaxLogPath, 'utf8').trimEnd().split('\n')
+      : []
+  }
+}
+
+function runExistingRootRollbackHarness(t) {
+  const fixture = mkdtempSync(path.join(rootDir, '.aifar-keepalived-root-rollback-test-'))
+  t.after(() => rmSync(fixture, { force: true, recursive: true }))
+  const { appRoot, fixtureInstallerPath } = writeInstallerFixture(fixture)
+  const harnessPath = path.join(fixture, 'harness.sh')
+  const callLogPath = path.join(fixture, 'systemctl-calls')
+  const priorStatePath = path.join(appRoot, 'nested', 'prior-state')
+  const failedStatePath = path.join(appRoot, 'failed-state')
+  mkdirSync(path.dirname(priorStatePath), { recursive: true })
+  writeFileSync(priorStatePath, 'before-update')
+  writeFileSync(harnessPath, `#!/usr/bin/env bash
+set -Eeuo pipefail
+source '${toMsysPath(fixtureInstallerPath)}'
+${fakeInstallFunction()}
+FAKE_ACTIVE=1
+FAKE_ENABLED=1
+FAKE_ACTIVATION_ATTEMPTED=0
+FAKE_FINAL_ACTIVE_FAILURE=0
+${fakeSystemctlFunction(callLogPath)}
+mountpoint() { return 1; }
+capture_service_state
+create_install_backup
+rm -f -- '${toMsysPath(priorStatePath)}'
+printf 'failed-update\n' >'${toMsysPath(failedStatePath)}'
+rollback_install_transaction
+`)
+  const result = spawnSync(bashPath, [toMsysPath(harnessPath)], { encoding: 'utf8' })
+  return {
+    ...result,
+    failedStateExists: existsSync(failedStatePath),
+    priorState: existsSync(priorStatePath) ? readFileSync(priorStatePath, 'utf8') : '',
+    calls: existsSync(callLogPath) ? readFileSync(callLogPath, 'utf8').trimEnd().split('\n') : []
+  }
+}
+
 test('aggregate health probe exposes its guarded public contract', () => {
   assert.equal(existsSync(healthScriptPath), true, 'missing extras/keepalived/check-aggregate-health.sh')
   const source = readFileSync(healthScriptPath, 'utf8')
@@ -353,6 +619,132 @@ test('installer does not reuse stale node globals when a later parse omits a req
   const result = runSequentialParseHarness(t)
   assert.equal(result.status, 1, result.stderr)
   assert.match(result.stderr, /KEEPALIVED_HEALTH_URL/)
+})
+
+test('installer restarts a service that was previously active and enabled', (t) => {
+  const result = runServiceHarness(t, { active: true, enabled: true })
+  assert.equal(result.status, 0, result.stderr)
+  assert.deepEqual(result.calls, [
+    'is-active --quiet keepalived.service',
+    'is-enabled --quiet keepalived.service',
+    'daemon-reload',
+    'enable keepalived.service',
+    'restart keepalived.service',
+    'is-active --quiet keepalived.service'
+  ])
+})
+
+test('installer enables and starts a service that was previously inactive and disabled', (t) => {
+  const result = runServiceHarness(t, { active: false, enabled: false })
+  assert.equal(result.status, 0, result.stderr)
+  assert.deepEqual(result.calls, [
+    'is-active --quiet keepalived.service',
+    'is-enabled --quiet keepalived.service',
+    'daemon-reload',
+    'enable keepalived.service',
+    'start keepalived.service',
+    'is-active --quiet keepalived.service'
+  ])
+})
+
+test('installer keeps an active service when the aggregate health command fails', (t) => {
+  const result = runServiceHarness(t, { active: false, enabled: false, healthStatus: 1 })
+  assert.equal(result.status, 0, result.stderr)
+  assert.match(result.stdout, /WARNING:/)
+  assert.ok(result.calls.includes('start keepalived.service'))
+})
+
+test('installer fails activation when the final active-state check fails', (t) => {
+  const result = runServiceHarness(t, {
+    active: false,
+    enabled: false,
+    finalActiveFailure: true
+  })
+  assert.equal(result.status, 1, result.stderr)
+  assert.match(result.stderr, /keepalived\.service/)
+  assert.equal(result.calls.at(-1), 'is-active --quiet keepalived.service')
+})
+
+test('rollback restores a previously active and enabled service', (t) => {
+  const result = runRollbackHarness(t, { active: true, enabled: true })
+  assert.equal(result.status, 0, result.stderr)
+  assert.equal(result.appRootExists, false)
+  assert.deepEqual(result.calls, [
+    'stop keepalived.service',
+    'daemon-reload',
+    'enable keepalived.service',
+    'restart keepalived.service'
+  ])
+})
+
+test('rollback restores a previously inactive and disabled service', (t) => {
+  const result = runRollbackHarness(t, { active: false, enabled: false })
+  assert.equal(result.status, 0, result.stderr)
+  assert.equal(result.appRootExists, false)
+  assert.deepEqual(result.calls, [
+    'stop keepalived.service',
+    'daemon-reload',
+    'disable keepalived.service',
+    'stop keepalived.service'
+  ])
+})
+
+test('installer verifies a full-root backup before activating the transaction', (t) => {
+  const result = runBackupHarness(t)
+  assert.equal(result.status, 0, result.stderr)
+  assert.equal(result.state, '1|1|1|1')
+  assert.equal(result.backupDirectories.length, 1)
+  const backupDirectory = result.backupDirectories[0]
+  assert.equal(
+    readFileSync(path.join(backupDirectory, 'installed-root', 'nested', 'prior-state'), 'utf8'),
+    'before-update'
+  )
+  assert.match(readFileSync(path.join(backupDirectory, 'install-state.txt'), 'utf8'), /app_root_existed=1/)
+  assert.match(readFileSync(path.join(backupDirectory, 'BACKUP.sha256'), 'utf8'), /installed-root\/nested\/prior-state/)
+})
+
+test('installer refuses a transaction whose existing app root is a mount point', (t) => {
+  const result = runBackupHarness(t, { mountpointStatus: 0 })
+  assert.equal(result.status, 1, result.stderr)
+  assert.equal(result.state, '')
+})
+
+test('cleanup preserves the original failure status when rollback also fails', (t) => {
+  const result = runCleanupRollbackFailureHarness(t)
+  assert.equal(result.status, 37, result.stderr)
+  assert.equal(result.rollbackCalled, true)
+  assert.match(result.stderr, /回滚也未完整成功/)
+})
+
+test('installer validates staged and atomically installed managed configuration', (t) => {
+  const result = runManagedConfigurationHarness(t)
+  assert.equal(result.status, 0, result.stderr)
+  assert.equal(result.formalConfig, 'managed-config\n')
+  assert.equal(result.healthUrl, 'http://127.0.0.1:38000/health/aggregate\n')
+  assert.equal(result.installedHealthScript, true)
+  assert.equal(result.syntaxCalls.length, 2)
+  assert.match(result.syntaxCalls[0], /-t -f .*\/work\/keepalived\.conf$/)
+  assert.match(result.syntaxCalls[1], /-t -f .*\/etc\/keepalived\/keepalived\.conf$/)
+})
+
+test('installer leaves the formal configuration unchanged when staged syntax is invalid', (t) => {
+  const result = runManagedConfigurationHarness(t, { stagedStatus: 1 })
+  assert.equal(result.status, 1, result.stderr)
+  assert.equal(result.formalConfig, 'previous-config\n')
+  assert.equal(result.syntaxCalls.length, 1)
+})
+
+test('rollback replaces a failed update with the verified full previous root', (t) => {
+  const result = runExistingRootRollbackHarness(t)
+  assert.equal(result.status, 0, result.stderr)
+  assert.equal(result.priorState, 'before-update')
+  assert.equal(result.failedStateExists, false)
+  assert.deepEqual(result.calls.slice(-4), [
+    'stop keepalived.service',
+    'daemon-reload',
+    'enable keepalived.service',
+    'restart keepalived.service'
+  ])
 })
 
 test('installer rejects a missing configured interface', (t) => {
