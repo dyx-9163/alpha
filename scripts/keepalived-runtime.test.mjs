@@ -10,17 +10,54 @@ const scriptsDir = path.dirname(fileURLToPath(import.meta.url))
 const rootDir = path.resolve(scriptsDir, '..')
 const healthScriptPath = path.join(rootDir, 'extras', 'keepalived', 'check-aggregate-health.sh')
 const bashPath = 'D:\\tools\\git\\bin\\bash.exe'
-const realPythonPath = 'D:\\tools\\Blender 5.1\\5.1\\python\\bin\\python.exe'
+const blenderPythonFallback = 'D:\\tools\\Blender 5.1\\5.1\\python\\bin\\python.exe'
 
 function toMsysPath(filePath) {
   const normalized = path.resolve(filePath).replaceAll('\\', '/')
   return normalized.replace(/^([A-Za-z]):/, (_, drive) => `/${drive.toLowerCase()}`)
 }
 
+function supportsPython3(candidate) {
+  const result = spawnSync(candidate.command, [
+    ...candidate.prefixArgs,
+    '-c',
+    'import sys; raise SystemExit(0 if sys.version_info.major == 3 else 1)'
+  ], { encoding: 'utf8' })
+  return result.status === 0
+}
+
+function discoverPython3() {
+  const candidates = [
+    ...(process.env.AIFAR_TEST_PYTHON3
+      ? [{ command: process.env.AIFAR_TEST_PYTHON3, prefixArgs: [] }]
+      : []),
+    { command: 'python3', prefixArgs: [] },
+    { command: 'python', prefixArgs: [] },
+    { command: 'py', prefixArgs: ['-3'] },
+    { command: blenderPythonFallback, prefixArgs: [] }
+  ]
+  const candidate = candidates.find(supportsPython3)
+  if (!candidate) {
+    throw new Error('No usable Python 3 interpreter found. Set AIFAR_TEST_PYTHON3 to a Python 3 executable.')
+  }
+  return candidate
+}
+
+const realPython = discoverPython3()
+
+function bashQuote(value) {
+  return `'${value.replaceAll("'", "'\\''")}'`
+}
+
+function bashCommand(command) {
+  return path.isAbsolute(command) ? toMsysPath(command) : command
+}
+
 function writeRealPythonShim(binPath, pythonArgsPath) {
   writeFileSync(path.join(binPath, 'python3'), `#!/usr/bin/env bash
+PATH="\${PATH#'${toMsysPath(binPath)}':}"
 printf '%s\\0' "\$@" >"\$PYTHON_ARGS_FILE"
-exec '${toMsysPath(realPythonPath)}' "\$@"
+exec ${bashQuote(bashCommand(realPython.command))} ${realPython.prefixArgs.map(bashQuote).join(' ')} "\$@"
 `)
 }
 
@@ -122,13 +159,20 @@ test('aggregate health probe exposes its guarded public contract', () => {
   assert.match(source, /if \[\[ "\$\{BASH_SOURCE\[0\]\}" == "\$0" \]\]; then/)
 })
 
+test('Python 3 interpreter selection is portable instead of requiring one workstation path', () => {
+  const source = readFileSync(fileURLToPath(import.meta.url), 'utf8')
+  assert.doesNotMatch(source, /^const realPythonPath = /m)
+  assert.ok(realPython.command)
+  assert.ok(Array.isArray(realPython.prefixArgs))
+  assert.equal(supportsPython3(realPython), true)
+})
+
 test('aggregate health main uses the fixed URL file for zero arguments and rejects arguments', (t) => {
   const result = runMainHarness(t)
   assert.equal(result.status, 0, result.stderr)
 })
 
 test('aggregate health invokes the embedded Python parser through a real Python 3 interpreter', (t) => {
-  assert.equal(existsSync(realPythonPath), true, `missing real Python 3 interpreter at ${realPythonPath}`)
   const result = runParserHarness(t, '{"status":{"up":true},"up":true}')
   assert.equal(result.status, 0, result.stderr)
   assert.deepEqual(result.pythonArgs.slice(0, 1), ['-c'])
