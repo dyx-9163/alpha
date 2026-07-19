@@ -170,7 +170,10 @@ owned_firewall_rule_exists() {
 remove_owned_firewall_rule() {
     local zone="" rule="" runtime_created=0 permanent_created=0
 
-    [[ -s "$FIREWALL_RECORD" ]] || return 0
+    if [[ ! -e "$FIREWALL_RECORD" && ! -L "$FIREWALL_RECORD" ]]; then
+        return 0
+    fi
+    [[ -f "$FIREWALL_RECORD" && ! -L "$FIREWALL_RECORD" ]] || die "防火墙所有权记录不是普通文件：$FIREWALL_RECORD"
     parse_firewall_record "$FIREWALL_RECORD"
     zone="$FIREWALL_RECORD_ZONE"
     rule="$FIREWALL_RECORD_RULE"
@@ -241,7 +244,7 @@ main() {
 
     create_and_verify_backup
 
-    if [[ -s "$FIREWALL_RECORD" ]]; then
+    if [[ -e "$FIREWALL_RECORD" || -L "$FIREWALL_RECORD" ]]; then
         [[ -f "$FIREWALL_RECORD" && ! -L "$FIREWALL_RECORD" ]] || die "防火墙所有权记录不是普通文件：$FIREWALL_RECORD"
         parse_firewall_record "$FIREWALL_RECORD"
         require_command firewall-cmd

@@ -390,7 +390,7 @@ rollback_firewall_journal
   return { ...result, calls: readFileSync(callLogPath, 'utf8').trimEnd().split('\n'), runtimeRules: readRules(runtimePath), permanentRules: readRules(permanentPath) }
 }
 
-function runUninstallFirewallHarness(t, { record, runtimeRules = [], permanentRules = [] }) {
+function runUninstallFirewallHarness(t, { record, recordSymlink = false, runtimeRules = [], permanentRules = [] }) {
   const fixture = mkdtempSync(path.join(rootDir, '.aifar-keepalived-uninstall-firewall-test-'))
   t.after(() => rmSync(fixture, { force: true, recursive: true }))
   const { appRoot, fixtureUninstallerPath } = writeUninstallerFixture(fixture)
@@ -399,20 +399,64 @@ function runUninstallFirewallHarness(t, { record, runtimeRules = [], permanentRu
   const runtimePath = path.join(fixture, 'runtime-rules')
   const permanentPath = path.join(fixture, 'permanent-rules')
   const recordPath = path.join(appRoot, 'var', 'lib', 'aifar', 'firewall-rule')
+  const recordTargetPath = path.join(fixture, 'external-firewall-record')
   writeFileSync(runtimePath, runtimeRules.join('\n') + (runtimeRules.length ? '\n' : ''))
   writeFileSync(permanentPath, permanentRules.join('\n') + (permanentRules.length ? '\n' : ''))
   mkdirSync(path.dirname(recordPath), { recursive: true })
-  if (typeof record === 'string') writeFileSync(recordPath, record)
-  else writeFirewallRecord(recordPath, record)
+  const initialRecordPath = recordSymlink ? recordTargetPath : recordPath
+  if (typeof record === 'string') writeFileSync(initialRecordPath, record)
+  else writeFirewallRecord(initialRecordPath, record)
   writeFileSync(harnessPath, `#!/usr/bin/env bash
 set -Eeuo pipefail
+${recordSymlink ? `ln -s -- '${toMsysPath(recordTargetPath)}' '${toMsysPath(recordPath)}'
+[[ -L '${toMsysPath(recordPath)}' ]] || exit 96` : ''}
 source '${toMsysPath(fixtureUninstallerPath)}'
 ${fakeFirewallFunction({ callLogPath, runtimePath, permanentPath })}
 remove_owned_firewall_rule
 `)
+  const result = spawnSync(bashPath, [toMsysPath(harnessPath)], {
+    encoding: 'utf8',
+    env: { ...process.env, MSYS: 'winsymlinks:sys' }
+  })
+  const readRules = (statePath) => readFileSync(statePath, 'utf8').split('\n').filter(Boolean)
+  return {
+    ...result,
+    calls: existsSync(callLogPath) ? readFileSync(callLogPath, 'utf8').trimEnd().split('\n') : [],
+    runtimeRules: readRules(runtimePath),
+    permanentRules: readRules(permanentPath),
+    appRootExists: existsSync(appRoot),
+    recordExists: existsSync(recordPath)
+  }
+}
+
+function runMutationJournalFailureHarness(t, { mutation, form }) {
+  const fixture = mkdtempSync(path.join(rootDir, '.aifar-keepalived-firewall-journal-failure-test-'))
+  t.after(() => rmSync(fixture, { force: true, recursive: true }))
+  const { fixtureInstallerPath } = writeInstallerFixture(fixture)
+  const harnessPath = path.join(fixture, 'harness.sh')
+  const workDir = path.join(fixture, 'work')
+  const callLogPath = path.join(fixture, 'firewall-calls')
+  const runtimePath = path.join(fixture, 'runtime-rules')
+  const permanentPath = path.join(fixture, 'permanent-rules')
+  const rule = peerRule('192.168.74.133')
+  mkdirSync(path.join(workDir, 'firewall-journal.tsv'), { recursive: true })
+  writeFileSync(runtimePath, mutation === 'remove' && form === 'runtime' ? `${rule}\n` : '')
+  writeFileSync(permanentPath, mutation === 'remove' && form === 'permanent' ? `${rule}\n` : '')
+  writeFileSync(harnessPath, `#!/usr/bin/env bash
+set -Eeuo pipefail
+source '${toMsysPath(fixtureInstallerPath)}'
+WORK_DIR='${toMsysPath(workDir)}'
+${fakeFirewallFunction({ callLogPath, runtimePath, permanentPath })}
+mutate_firewall_rule '${mutation}' '${form}' public '${rule}'
+`)
   const result = spawnSync(bashPath, [toMsysPath(harnessPath)], { encoding: 'utf8' })
   const readRules = (statePath) => readFileSync(statePath, 'utf8').split('\n').filter(Boolean)
-  return { ...result, calls: existsSync(callLogPath) ? readFileSync(callLogPath, 'utf8').trimEnd().split('\n') : [], runtimeRules: readRules(runtimePath), permanentRules: readRules(permanentPath) }
+  return {
+    ...result,
+    calls: existsSync(callLogPath) ? readFileSync(callLogPath, 'utf8').trimEnd().split('\n') : [],
+    runtimeRules: readRules(runtimePath),
+    permanentRules: readRules(permanentPath)
+  }
 }
 
 function fakeSystemctlFunction(callLogPath) {
@@ -1074,6 +1118,49 @@ test('uninstaller removes only exact firewall forms marked created', (t) => {
   assert.deepEqual(result.permanentRules, [rule])
   assert.equal(result.calls.some((call) => call.startsWith('--permanent')), false)
 })
+
+test('uninstaller rejects an empty firewall ownership record without mutating rules or installation state', (t) => {
+  const rule = peerRule('192.168.74.133')
+  const result = runUninstallFirewallHarness(t, {
+    record: '',
+    runtimeRules: [rule],
+    permanentRules: [rule]
+  })
+  assert.equal(result.status, 1, result.stderr)
+  assert.deepEqual(result.runtimeRules, [rule])
+  assert.deepEqual(result.permanentRules, [rule])
+  assert.equal(result.appRootExists, true)
+  assert.equal(result.recordExists, true)
+})
+
+test('uninstaller rejects a symlink firewall ownership record without mutating rules or installation state', (t) => {
+  const rule = peerRule('192.168.74.133')
+  const result = runUninstallFirewallHarness(t, {
+    record: { zone: 'public', rule, runtimeCreated: 1, permanentCreated: 1 },
+    recordSymlink: true,
+    runtimeRules: [rule],
+    permanentRules: [rule]
+  })
+  assert.equal(result.status, 1, result.stderr)
+  assert.notEqual(result.status, 96, 'test environment did not create an MSYS-recognized symlink')
+  assert.deepEqual(result.runtimeRules, [rule])
+  assert.deepEqual(result.permanentRules, [rule])
+  assert.equal(result.appRootExists, true)
+  assert.equal(result.recordExists, true)
+})
+
+for (const mutation of ['add', 'remove']) {
+  for (const form of ['runtime', 'permanent']) {
+    test(`firewall ${mutation} ${form} mutation is not attempted when write-ahead journal append fails`, (t) => {
+      const rule = peerRule('192.168.74.133')
+      const result = runMutationJournalFailureHarness(t, { mutation, form })
+      assert.equal(result.status, 1, result.stderr)
+      assert.equal(result.calls.some((call) => call.includes(`--${mutation}-rich-rule=`)), false)
+      assert.deepEqual(result.runtimeRules, mutation === 'remove' && form === 'runtime' ? [rule] : [])
+      assert.deepEqual(result.permanentRules, mutation === 'remove' && form === 'permanent' ? [rule] : [])
+    })
+  }
+}
 
 test('installer rejects a missing configured interface', (t) => {
   const result = runNodeConfigHarness(t, {

@@ -231,17 +231,36 @@ firewall_rule_exists() {
 mutate_firewall_rule() {
     local mutation="$1" form="$2" zone="$3" rule="$4"
     local command_option="--${mutation}-rich-rule=$rule"
+    local journal_action=""
+
+    if [[ "$mutation" == add ]]; then
+        journal_action=added
+    else
+        journal_action=removed
+    fi
+    append_firewall_journal "$journal_action" "$form" "$zone" "$rule"
 
     if [[ "$form" == permanent ]]; then
         firewall-cmd --permanent --zone="$zone" "$command_option" >/dev/null || die "更新 firewalld permanent 规则失败"
     else
         firewall-cmd --zone="$zone" "$command_option" >/dev/null || die "更新 firewalld runtime 规则失败"
     fi
-    if [[ "$mutation" == add ]]; then
-        printf 'added\t%s\t%s\t%s\n' "$form" "$zone" "$rule" >>"$WORK_DIR/firewall-journal.tsv"
-    else
-        printf 'removed\t%s\t%s\t%s\n' "$form" "$zone" "$rule" >>"$WORK_DIR/firewall-journal.tsv"
+}
+
+append_firewall_journal() {
+    local action="$1" form="$2" zone="$3" rule="$4"
+    local journal="$WORK_DIR/firewall-journal.tsv"
+    local row="${action}"$'\t'"${form}"$'\t'"${zone}"$'\t'"${rule}"
+    local -a before=() after=()
+
+    if [[ -e "$journal" || -L "$journal" ]]; then
+        [[ -f "$journal" && ! -L "$journal" ]] || die "防火墙事务日志不是普通文件：$journal"
+        mapfile -t before <"$journal" || die "无法读取防火墙事务日志：$journal"
     fi
+    printf '%s\n' "$row" >>"$journal" || die "无法预写防火墙事务日志：$journal"
+    mapfile -t after <"$journal" || die "无法验证防火墙事务日志：$journal"
+    [[ "${#after[@]}" -eq $((${#before[@]} + 1)) ]] || die "防火墙事务日志追加行数校验失败"
+    [[ "${after[-1]}" == "$row" ]] || die "防火墙事务日志追加内容校验失败"
 }
 
 rollback_firewall_journal() {
