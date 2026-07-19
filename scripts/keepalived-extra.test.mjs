@@ -157,9 +157,11 @@ test('uninstaller verifies a backup before service changes and exact-path deleti
   assert.match(script, /readlink -f -- "\$APP_ROOT"/)
   assert.match(script, /readonly BACKUP_ROOT="\/aifar\/backups"/)
   assert.match(script, /BACKUP_DIR="\$BACKUP_ROOT\/keepalived-\$\(date -u/)
+  assert.match(script, /firewall-cmd --zone="\$zone" --remove-rich-rule="\$rule"/)
+  assert.match(script, /firewall-cmd --permanent --zone="\$zone" --remove-rich-rule="\$rule"/)
   assert.doesNotMatch(
     script,
-    /dnf\s+(?:remove|erase)|yum\s+(?:remove|erase)|firewall-cmd\s+--remove|rm -rf -- \/aifar\/backups/
+    /dnf\s+(?:remove|erase)|yum\s+(?:remove|erase)|firewall-cmd\s+--remove-(?:service|port|protocol)|firewall-cmd\s+--remove-rich-rule(?:\s|$)|rm -rf -- \/aifar\/backups/
   )
 })
 

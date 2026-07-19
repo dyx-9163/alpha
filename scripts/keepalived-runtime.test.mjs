@@ -12,6 +12,7 @@ const scriptsDir = path.dirname(fileURLToPath(import.meta.url))
 const rootDir = path.resolve(scriptsDir, '..')
 const healthScriptPath = path.join(rootDir, 'extras', 'keepalived', 'check-aggregate-health.sh')
 const installerPath = path.join(rootDir, 'extras', 'keepalived', 'install-keepalived-offline.sh')
+const uninstallerPath = path.join(rootDir, 'extras', 'keepalived', 'uninstall-keepalived.sh')
 const bashPath = 'D:\\tools\\git\\bin\\bash.exe'
 const blenderPythonFallback = 'D:\\tools\\Blender 5.1\\5.1\\python\\bin\\python.exe'
 
@@ -240,6 +241,178 @@ function writeInstallerFixture(fixture) {
     readFileSync(healthScriptPath, 'utf8')
   )
   return { appRoot, backupRoot, fixtureInstallerPath, unitLink }
+}
+
+function writeUninstallerFixture(fixture) {
+  const appRoot = path.join(fixture, 'aifar', 'apps', 'keepalived')
+  const backupRoot = path.join(fixture, 'aifar', 'backups')
+  const unitLink = path.join(fixture, 'etc', 'systemd', 'system', 'keepalived.service')
+  const fixtureUninstallerPath = path.join(fixture, 'uninstall-keepalived.sh')
+  let uninstaller = readFileSync(uninstallerPath, 'utf8')
+  uninstaller = uninstaller
+    .replaceAll('/aifar/apps/keepalived', toMsysPath(appRoot))
+    .replaceAll('/aifar/backups', toMsysPath(backupRoot))
+    .replaceAll('/etc/systemd/system/keepalived.service', toMsysPath(unitLink))
+  writeFileSync(fixtureUninstallerPath, uninstaller)
+  return { appRoot, fixtureUninstallerPath }
+}
+
+const peerRule = (peer) => `rule family="ipv4" source address="${peer}/32" protocol value="112" accept`
+
+function fakeFirewallFunction({ callLogPath, runtimePath, permanentPath }) {
+  return `firewall-cmd() {
+    local form=runtime operation='' rule='' argument=''
+    printf '%s\\n' "\$*" >>'${toMsysPath(callLogPath)}'
+    for argument in "\$@"; do
+        case "\$argument" in
+            --permanent) form=permanent ;;
+            --query-rich-rule=*) operation=query; rule="\${argument#*=}" ;;
+            --add-rich-rule=*) operation=add; rule="\${argument#*=}" ;;
+            --remove-rich-rule=*) operation=remove; rule="\${argument#*=}" ;;
+            --get-zone-of-interface=*)
+                [[ "\${FAKE_INTERFACE_ZONE_STATUS:-0}" -eq 0 ]] || return "\$FAKE_INTERFACE_ZONE_STATUS"
+                printf '%s\\n' "\${FAKE_INTERFACE_ZONE:-}"
+                return 0
+                ;;
+            --get-default-zone)
+                printf '%s\\n' "\${FAKE_DEFAULT_ZONE:-public}"
+                return 0
+                ;;
+        esac
+    done
+    local state='${toMsysPath(runtimePath)}'
+    [[ "\$form" == permanent ]] && state='${toMsysPath(permanentPath)}'
+    case "\$operation" in
+        query) grep -Fqx -- "\$rule" "\$state" ;;
+        add)
+            [[ "\${FAKE_FAIL_ADD_FORM:-}" != "\$form" ]] || return 55
+            grep -Fqx -- "\$rule" "\$state" || printf '%s\\n' "\$rule" >>"\$state"
+            ;;
+        remove)
+            [[ "\${FAKE_FAIL_REMOVE_FORM:-}" != "\$form" ]] || return 56
+            grep -Fvx -- "\$rule" "\$state" >"\$state.tmp" || true
+            mv -f -- "\$state.tmp" "\$state"
+            ;;
+        *) return 97 ;;
+    esac
+}`
+}
+
+function writeFirewallRecord(recordPath, { zone = 'public', rule, runtimeCreated, permanentCreated }) {
+  mkdirSync(path.dirname(recordPath), { recursive: true })
+  writeFileSync(recordPath, `zone=${zone}\nrule=${rule}\nruntime_created=${runtimeCreated}\npermanent_created=${permanentCreated}\n`)
+}
+
+function runFirewallHarness(t, {
+  active = true,
+  interfaceZone = 'work',
+  interfaceZoneStatus = 0,
+  defaultZone = 'public',
+  peer = '192.168.74.133',
+  runtimeRules = [],
+  permanentRules = [],
+  oldRecord,
+  failAddForm = '',
+  rollbackOnFailure = false
+} = {}) {
+  const fixture = mkdtempSync(path.join(rootDir, '.aifar-keepalived-firewall-test-'))
+  t.after(() => rmSync(fixture, { force: true, recursive: true }))
+  const { appRoot, fixtureInstallerPath } = writeInstallerFixture(fixture)
+  const harnessPath = path.join(fixture, 'harness.sh')
+  const workDir = path.join(fixture, 'work')
+  const callLogPath = path.join(fixture, 'firewall-calls')
+  const runtimePath = path.join(fixture, 'runtime-rules')
+  const permanentPath = path.join(fixture, 'permanent-rules')
+  const recordPath = path.join(appRoot, 'var', 'lib', 'aifar', 'firewall-rule')
+  mkdirSync(workDir, { recursive: true })
+  writeFileSync(runtimePath, runtimeRules.join('\n') + (runtimeRules.length ? '\n' : ''))
+  writeFileSync(permanentPath, permanentRules.join('\n') + (permanentRules.length ? '\n' : ''))
+  if (oldRecord) writeFirewallRecord(recordPath, oldRecord)
+  writeFileSync(harnessPath, `#!/usr/bin/env bash
+set -Eeuo pipefail
+source '${toMsysPath(fixtureInstallerPath)}'
+${fakeInstallFunction()}
+WORK_DIR='${toMsysPath(workDir)}'
+NODE_INTERFACE=ens160
+NODE_PEER_IP='${peer}'
+FAKE_INTERFACE_ZONE='${interfaceZone}'
+FAKE_INTERFACE_ZONE_STATUS='${interfaceZoneStatus}'
+FAKE_DEFAULT_ZONE='${defaultZone}'
+FAKE_FAIL_ADD_FORM='${failAddForm}'
+systemctl() { [[ "\$*" == 'is-active --quiet firewalld.service' && '${active ? 1 : 0}' -eq 1 ]]; }
+command() { [[ "\$1" == '-v' && "\$2" == 'firewall-cmd' ]] && return 0; builtin command "\$@"; }
+${fakeFirewallFunction({ callLogPath, runtimePath, permanentPath })}
+${rollbackOnFailure ? `TRANSACTION_ACTIVE=1
+rollback_install_transaction() { rollback_firewall_journal; }
+reconcile_firewall_rule
+TRANSACTION_ACTIVE=0` : 'reconcile_firewall_rule'}
+`)
+  const result = spawnSync(bashPath, [toMsysPath(harnessPath)], { encoding: 'utf8' })
+  const readRules = (statePath) => readFileSync(statePath, 'utf8').split('\n').filter(Boolean)
+  return {
+    ...result,
+    calls: existsSync(callLogPath) ? readFileSync(callLogPath, 'utf8').trimEnd().split('\n') : [],
+    runtimeRules: readRules(runtimePath),
+    permanentRules: readRules(permanentPath),
+    record: existsSync(recordPath) ? readFileSync(recordPath, 'utf8') : ''
+  }
+}
+
+function runFirewallRollbackHarness(t) {
+  const fixture = mkdtempSync(path.join(rootDir, '.aifar-keepalived-firewall-rollback-test-'))
+  t.after(() => rmSync(fixture, { force: true, recursive: true }))
+  const { fixtureInstallerPath } = writeInstallerFixture(fixture)
+  const harnessPath = path.join(fixture, 'harness.sh')
+  const workDir = path.join(fixture, 'work')
+  const callLogPath = path.join(fixture, 'firewall-calls')
+  const runtimePath = path.join(fixture, 'runtime-rules')
+  const permanentPath = path.join(fixture, 'permanent-rules')
+  const oldRule = peerRule('192.168.74.140')
+  const newRule = peerRule('192.168.74.133')
+  mkdirSync(workDir)
+  writeFileSync(runtimePath, `${newRule}\n`)
+  writeFileSync(permanentPath, `${newRule}\n`)
+  writeFileSync(path.join(workDir, 'firewall-journal.tsv'), [
+    `removed\truntime\tpublic\t${oldRule}`,
+    `removed\tpermanent\tpublic\t${oldRule}`,
+    `added\truntime\tpublic\t${newRule}`,
+    `added\tpermanent\tpublic\t${newRule}`
+  ].join('\n') + '\n')
+  writeFileSync(harnessPath, `#!/usr/bin/env bash
+set -Eeuo pipefail
+source '${toMsysPath(fixtureInstallerPath)}'
+WORK_DIR='${toMsysPath(workDir)}'
+${fakeFirewallFunction({ callLogPath, runtimePath, permanentPath })}
+rollback_firewall_journal
+`)
+  const result = spawnSync(bashPath, [toMsysPath(harnessPath)], { encoding: 'utf8' })
+  const readRules = (statePath) => readFileSync(statePath, 'utf8').split('\n').filter(Boolean)
+  return { ...result, calls: readFileSync(callLogPath, 'utf8').trimEnd().split('\n'), runtimeRules: readRules(runtimePath), permanentRules: readRules(permanentPath) }
+}
+
+function runUninstallFirewallHarness(t, { record, runtimeRules = [], permanentRules = [] }) {
+  const fixture = mkdtempSync(path.join(rootDir, '.aifar-keepalived-uninstall-firewall-test-'))
+  t.after(() => rmSync(fixture, { force: true, recursive: true }))
+  const { appRoot, fixtureUninstallerPath } = writeUninstallerFixture(fixture)
+  const harnessPath = path.join(fixture, 'harness.sh')
+  const callLogPath = path.join(fixture, 'firewall-calls')
+  const runtimePath = path.join(fixture, 'runtime-rules')
+  const permanentPath = path.join(fixture, 'permanent-rules')
+  const recordPath = path.join(appRoot, 'var', 'lib', 'aifar', 'firewall-rule')
+  writeFileSync(runtimePath, runtimeRules.join('\n') + (runtimeRules.length ? '\n' : ''))
+  writeFileSync(permanentPath, permanentRules.join('\n') + (permanentRules.length ? '\n' : ''))
+  mkdirSync(path.dirname(recordPath), { recursive: true })
+  if (typeof record === 'string') writeFileSync(recordPath, record)
+  else writeFirewallRecord(recordPath, record)
+  writeFileSync(harnessPath, `#!/usr/bin/env bash
+set -Eeuo pipefail
+source '${toMsysPath(fixtureUninstallerPath)}'
+${fakeFirewallFunction({ callLogPath, runtimePath, permanentPath })}
+remove_owned_firewall_rule
+`)
+  const result = spawnSync(bashPath, [toMsysPath(harnessPath)], { encoding: 'utf8' })
+  const readRules = (statePath) => readFileSync(statePath, 'utf8').split('\n').filter(Boolean)
+  return { ...result, calls: existsSync(callLogPath) ? readFileSync(callLogPath, 'utf8').trimEnd().split('\n') : [], runtimeRules: readRules(runtimePath), permanentRules: readRules(permanentPath) }
 }
 
 function fakeSystemctlFunction(callLogPath) {
@@ -801,6 +974,105 @@ test('rollback replaces a failed update with the verified full previous root', (
     'restart keepalived.service',
     'daemon-reload'
   ])
+})
+
+test('active firewalld adds exact peer-scoped runtime and permanent rules in the interface zone', (t) => {
+  const rule = peerRule('192.168.74.133')
+  const result = runFirewallHarness(t)
+  assert.equal(result.status, 0, result.stderr)
+  assert.deepEqual(result.runtimeRules, [rule])
+  assert.deepEqual(result.permanentRules, [rule])
+  assert.equal(result.record, `zone=work\nrule=${rule}\nruntime_created=1\npermanent_created=1\n`)
+  assert.ok(result.calls.includes('--get-zone-of-interface=ens160'))
+  assert.equal(result.calls.includes('--get-default-zone'), false)
+  assert.equal(result.calls.some((call) => call === '--reload'), false)
+})
+
+test('firewall reconciliation falls back to the default zone only when the interface has no zone', (t) => {
+  const result = runFirewallHarness(t, { interfaceZone: 'no zone', defaultZone: 'trusted' })
+  assert.equal(result.status, 0, result.stderr)
+  assert.match(result.record, /^zone=trusted$/m)
+  assert.deepEqual(result.calls.slice(0, 2), ['--get-zone-of-interface=ens160', '--get-default-zone'])
+})
+
+test('firewall reconciliation does not hide an interface-zone lookup failure behind the default zone', (t) => {
+  const result = runFirewallHarness(t, { interfaceZoneStatus: 54 })
+  assert.equal(result.status, 1, result.stderr)
+  assert.equal(result.calls.includes('--get-default-zone'), false)
+  assert.equal(result.record, '')
+})
+
+test('exact pre-existing firewall rules are retained but not marked owned', (t) => {
+  const rule = peerRule('192.168.74.133')
+  const result = runFirewallHarness(t, { runtimeRules: [rule], permanentRules: [rule] })
+  assert.equal(result.status, 0, result.stderr)
+  assert.match(result.record, /runtime_created=0\npermanent_created=0\n$/)
+  assert.equal(result.calls.some((call) => call.includes('--add-rich-rule=')), false)
+})
+
+test('partial firewall add failure rolls back the runtime form added by this transaction', (t) => {
+  const result = runFirewallHarness(t, { failAddForm: 'permanent', rollbackOnFailure: true })
+  assert.equal(result.status, 1, result.stderr)
+  assert.deepEqual(result.runtimeRules, [])
+  assert.deepEqual(result.permanentRules, [])
+  assert.equal(result.record, '')
+  assert.ok(result.calls.some((call) => call.includes('--remove-rich-rule=')))
+})
+
+test('changing peer removes only the previously owned exact rule and records the new peer', (t) => {
+  const oldRule = peerRule('192.168.74.140')
+  const newRule = peerRule('192.168.74.133')
+  const unrelated = peerRule('192.168.74.141')
+  const result = runFirewallHarness(t, {
+    runtimeRules: [oldRule, unrelated],
+    permanentRules: [oldRule, unrelated],
+    oldRecord: { zone: 'work', rule: oldRule, runtimeCreated: 1, permanentCreated: 1 }
+  })
+  assert.equal(result.status, 0, result.stderr)
+  assert.deepEqual(result.runtimeRules, [unrelated, newRule])
+  assert.deepEqual(result.permanentRules, [unrelated, newRule])
+  assert.equal(result.record, `zone=work\nrule=${newRule}\nruntime_created=1\npermanent_created=1\n`)
+})
+
+test('firewall journal rollback reverses added and removed entries from last to first', (t) => {
+  const oldRule = peerRule('192.168.74.140')
+  const result = runFirewallRollbackHarness(t)
+  assert.equal(result.status, 0, result.stderr)
+  assert.deepEqual(result.runtimeRules, [oldRule])
+  assert.deepEqual(result.permanentRules, [oldRule])
+  const mutations = result.calls.filter((call) => /--(?:add|remove)-rich-rule=/.test(call))
+  assert.match(mutations[0], /^--permanent .*--remove-rich-rule=/)
+  assert.match(mutations[1], /^--zone=.*--remove-rich-rule=/)
+  assert.match(mutations[2], /^--permanent .*--add-rich-rule=/)
+  assert.match(mutations[3], /^--zone=.*--add-rich-rule=/)
+})
+
+test('inactive firewalld performs no firewall command and writes no ownership record', (t) => {
+  const result = runFirewallHarness(t, { active: false })
+  assert.equal(result.status, 0, result.stderr)
+  assert.deepEqual(result.calls, [])
+  assert.equal(result.record, '')
+})
+
+test('uninstaller rejects a malformed firewall ownership record', (t) => {
+  const result = runUninstallFirewallHarness(t, {
+    record: 'zone=public\nrule=rule family="ipv4" protocol value="112" accept\nruntime_created=1\npermanent_created=1\n'
+  })
+  assert.equal(result.status, 1, result.stderr)
+  assert.match(result.stderr, /防火墙.*记录|firewall/i)
+})
+
+test('uninstaller removes only exact firewall forms marked created', (t) => {
+  const rule = peerRule('192.168.74.133')
+  const result = runUninstallFirewallHarness(t, {
+    record: { zone: 'public', rule, runtimeCreated: 1, permanentCreated: 0 },
+    runtimeRules: [rule],
+    permanentRules: [rule]
+  })
+  assert.equal(result.status, 0, result.stderr)
+  assert.deepEqual(result.runtimeRules, [])
+  assert.deepEqual(result.permanentRules, [rule])
+  assert.equal(result.calls.some((call) => call.startsWith('--permanent')), false)
 })
 
 test('installer rejects a missing configured interface', (t) => {

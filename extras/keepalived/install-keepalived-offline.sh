@@ -166,6 +166,205 @@ safe_remove_app_root() {
     rm -rf -- "$APP_ROOT"
 }
 
+firewall_rule_for_peer() {
+    printf 'rule family="ipv4" source address="%s/32" protocol value="112" accept\n' "$1"
+}
+
+valid_firewall_zone() {
+    [[ "$1" =~ ^[A-Za-z0-9_.-]{1,64}$ ]]
+}
+
+valid_peer_firewall_rule() {
+    local rule="$1"
+    local peer=""
+
+    [[ "$rule" =~ ^rule\ family=\"ipv4\"\ source\ address=\"([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)/32\"\ protocol\ value=\"112\"\ accept$ ]] || return 1
+    peer="${BASH_REMATCH[1]}"
+    valid_ipv4 "$peer"
+}
+
+parse_firewall_record() {
+    local file="$1" line="" key="" value=""
+    declare -A seen=()
+    FIREWALL_RECORD_ZONE=""
+    FIREWALL_RECORD_RULE=""
+    FIREWALL_RECORD_RUNTIME_CREATED=""
+    FIREWALL_RECORD_PERMANENT_CREATED=""
+
+    [[ -r "$file" ]] || die "防火墙所有权记录不可读：$file"
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ "$line" =~ ^([a-z_]+)=(.*)$ ]] || die "防火墙所有权记录格式无效：$file"
+        key="${BASH_REMATCH[1]}"
+        value="${BASH_REMATCH[2]}"
+        case "$key" in
+            zone) FIREWALL_RECORD_ZONE="$value" ;;
+            rule) FIREWALL_RECORD_RULE="$value" ;;
+            runtime_created) FIREWALL_RECORD_RUNTIME_CREATED="$value" ;;
+            permanent_created) FIREWALL_RECORD_PERMANENT_CREATED="$value" ;;
+            *) die "防火墙所有权记录包含未知字段：$key" ;;
+        esac
+        [[ -z "${seen[$key]+x}" ]] || die "防火墙所有权记录字段重复：$key"
+        seen[$key]=1
+    done <"$file"
+    for key in zone rule runtime_created permanent_created; do
+        [[ -n "${seen[$key]+x}" ]] || die "防火墙所有权记录缺少字段：$key"
+    done
+    valid_firewall_zone "$FIREWALL_RECORD_ZONE" || die "防火墙所有权记录 zone 无效"
+    valid_peer_firewall_rule "$FIREWALL_RECORD_RULE" || die "防火墙所有权记录 rule 无效"
+    [[ "$FIREWALL_RECORD_RUNTIME_CREATED" =~ ^[01]$ ]] || die "防火墙所有权记录 runtime_created 无效"
+    [[ "$FIREWALL_RECORD_PERMANENT_CREATED" =~ ^[01]$ ]] || die "防火墙所有权记录 permanent_created 无效"
+}
+
+firewall_rule_exists() {
+    local form="$1" zone="$2" rule="$3" status=0
+
+    if [[ "$form" == permanent ]]; then
+        firewall-cmd --permanent --zone="$zone" --query-rich-rule="$rule" >/dev/null 2>&1 && return 0
+    else
+        firewall-cmd --zone="$zone" --query-rich-rule="$rule" >/dev/null 2>&1 && return 0
+    fi
+    status=$?
+    [[ "$status" -eq 1 ]] && return 1
+    die "查询 firewalld $form 规则失败（状态 $status）"
+}
+
+mutate_firewall_rule() {
+    local mutation="$1" form="$2" zone="$3" rule="$4"
+    local command_option="--${mutation}-rich-rule=$rule"
+
+    if [[ "$form" == permanent ]]; then
+        firewall-cmd --permanent --zone="$zone" "$command_option" >/dev/null || die "更新 firewalld permanent 规则失败"
+    else
+        firewall-cmd --zone="$zone" "$command_option" >/dev/null || die "更新 firewalld runtime 规则失败"
+    fi
+    if [[ "$mutation" == add ]]; then
+        printf 'added\t%s\t%s\t%s\n' "$form" "$zone" "$rule" >>"$WORK_DIR/firewall-journal.tsv"
+    else
+        printf 'removed\t%s\t%s\t%s\n' "$form" "$zone" "$rule" >>"$WORK_DIR/firewall-journal.tsv"
+    fi
+}
+
+rollback_firewall_journal() {
+    local journal="$WORK_DIR/firewall-journal.tsv"
+    local index=0 action="" form="" zone="" rule="" rollback_status=0 query_status=0
+    local -a rows=()
+
+    [[ -s "$journal" ]] || return 0
+    mapfile -t rows <"$journal"
+    for ((index=${#rows[@]} - 1; index >= 0; index--)); do
+        IFS=$'\t' read -r action form zone rule <<<"${rows[$index]}"
+        if ! valid_firewall_zone "$zone" || ! valid_peer_firewall_rule "$rule" || [[ "$form" != runtime && "$form" != permanent ]]; then
+            printf '[keepalived-installer] ERROR: 防火墙回滚日志记录无效\n' >&2
+            rollback_status=1
+            continue
+        fi
+        if [[ "$form" == permanent ]]; then
+            if firewall-cmd --permanent --zone="$zone" --query-rich-rule="$rule" >/dev/null 2>&1; then
+                query_status=0
+            else
+                query_status=$?
+            fi
+        else
+            if firewall-cmd --zone="$zone" --query-rich-rule="$rule" >/dev/null 2>&1; then
+                query_status=0
+            else
+                query_status=$?
+            fi
+        fi
+        if [[ "$query_status" -ne 0 && "$query_status" -ne 1 ]]; then
+            printf '[keepalived-installer] ERROR: 回滚时查询 firewalld %s 规则失败（状态 %s）\n' "$form" "$query_status" >&2
+            rollback_status=1
+            continue
+        fi
+        case "$action" in
+            added)
+                if [[ "$query_status" -eq 0 ]]; then
+                    if [[ "$form" == permanent ]]; then
+                        firewall-cmd --permanent --zone="$zone" --remove-rich-rule="$rule" >/dev/null || rollback_status=1
+                    else
+                        firewall-cmd --zone="$zone" --remove-rich-rule="$rule" >/dev/null || rollback_status=1
+                    fi
+                fi
+                ;;
+            removed)
+                if [[ "$query_status" -eq 1 ]]; then
+                    if [[ "$form" == permanent ]]; then
+                        firewall-cmd --permanent --zone="$zone" --add-rich-rule="$rule" >/dev/null || rollback_status=1
+                    else
+                        firewall-cmd --zone="$zone" --add-rich-rule="$rule" >/dev/null || rollback_status=1
+                    fi
+                fi
+                ;;
+            *)
+                printf '[keepalived-installer] ERROR: 防火墙回滚日志动作无效：%s\n' "$action" >&2
+                rollback_status=1
+                ;;
+        esac
+    done
+    return "$rollback_status"
+}
+
+reconcile_firewall_rule() {
+    local zone="" desired_rule="" record_tmp=""
+    local runtime_created=0 permanent_created=0
+    local old_record_exists=0 old_same=0
+
+    if ! systemctl is-active --quiet firewalld.service; then
+        log "firewalld 未运行，跳过 VRRP peer 防火墙规则"
+        return 0
+    fi
+    require_command firewall-cmd
+    if ! zone="$(firewall-cmd --get-zone-of-interface="$NODE_INTERFACE" 2>/dev/null)"; then
+        die "无法获取接口 $NODE_INTERFACE 的 firewalld zone"
+    fi
+    if [[ -z "$zone" || "$zone" == "no zone" ]]; then
+        zone="$(firewall-cmd --get-default-zone)" || die "无法获取 firewalld 默认 zone"
+    fi
+    valid_firewall_zone "$zone" || die "firewalld zone 无效：$zone"
+    desired_rule="$(firewall_rule_for_peer "$NODE_PEER_IP")"
+    : >"$WORK_DIR/firewall-journal.tsv"
+
+    if [[ -e "$FIREWALL_RECORD" || -L "$FIREWALL_RECORD" ]]; then
+        [[ -f "$FIREWALL_RECORD" && ! -L "$FIREWALL_RECORD" ]] || die "防火墙所有权记录不是普通文件：$FIREWALL_RECORD"
+        parse_firewall_record "$FIREWALL_RECORD"
+        old_record_exists=1
+        if [[ "$FIREWALL_RECORD_ZONE" == "$zone" && "$FIREWALL_RECORD_RULE" == "$desired_rule" ]]; then
+            old_same=1
+        else
+            if [[ "$FIREWALL_RECORD_RUNTIME_CREATED" -eq 1 ]] && firewall_rule_exists runtime "$FIREWALL_RECORD_ZONE" "$FIREWALL_RECORD_RULE"; then
+                mutate_firewall_rule remove runtime "$FIREWALL_RECORD_ZONE" "$FIREWALL_RECORD_RULE"
+            fi
+            if [[ "$FIREWALL_RECORD_PERMANENT_CREATED" -eq 1 ]] && firewall_rule_exists permanent "$FIREWALL_RECORD_ZONE" "$FIREWALL_RECORD_RULE"; then
+                mutate_firewall_rule remove permanent "$FIREWALL_RECORD_ZONE" "$FIREWALL_RECORD_RULE"
+            fi
+        fi
+    fi
+
+    if firewall_rule_exists runtime "$zone" "$desired_rule"; then
+        if [[ "$old_record_exists" -eq 1 && "$old_same" -eq 1 ]]; then
+            runtime_created="$FIREWALL_RECORD_RUNTIME_CREATED"
+        fi
+    else
+        mutate_firewall_rule add runtime "$zone" "$desired_rule"
+        runtime_created=1
+    fi
+    if firewall_rule_exists permanent "$zone" "$desired_rule"; then
+        if [[ "$old_record_exists" -eq 1 && "$old_same" -eq 1 ]]; then
+            permanent_created="$FIREWALL_RECORD_PERMANENT_CREATED"
+        fi
+    else
+        mutate_firewall_rule add permanent "$zone" "$desired_rule"
+        permanent_created=1
+    fi
+
+    install -d -o root -g root -m 750 "$(dirname -- "$FIREWALL_RECORD")"
+    record_tmp="$FIREWALL_RECORD.tmp.$$"
+    printf 'zone=%s\nrule=%s\nruntime_created=%s\npermanent_created=%s\n' \
+        "$zone" "$desired_rule" "$runtime_created" "$permanent_created" >"$WORK_DIR/firewall-rule"
+    install -o root -g root -m 600 "$WORK_DIR/firewall-rule" "$record_tmp"
+    mv -f -- "$record_tmp" "$FIREWALL_RECORD"
+}
+
 rollback_install_transaction() {
     local rollback_status=0
     local root_restore_allowed=1
@@ -173,6 +372,7 @@ rollback_install_transaction() {
     local current_unit_value=""
 
     log "安装事务失败，正在恢复安装前状态"
+    rollback_firewall_journal || rollback_status=1
     systemctl stop keepalived.service || {
         printf '[keepalived-installer] ERROR: 回滚时停止 keepalived.service 失败\n' >&2
         rollback_status=1
@@ -536,7 +736,7 @@ main() {
 
     validate_platform
 
-    for command_name in awk cp date dnf find grep install ip ldd ln mountpoint mv readlink rm sha256sum sort stat systemctl tar xargs; do
+    for command_name in awk cp date dirname dnf find grep install ip ldd ln mountpoint mv readlink rm sha256sum sort stat systemctl tar xargs; do
         require_command "$command_name"
     done
 
@@ -552,6 +752,7 @@ main() {
     build_and_install_keepalived
     register_systemd_unit
     install_managed_configuration "$WORK_DIR/keepalived.conf"
+    reconcile_firewall_rule
     configure_selinux_if_enabled
     activate_keepalived
     verify_installation

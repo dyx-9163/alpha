@@ -8,6 +8,7 @@ readonly BACKUP_ROOT="/aifar/backups"
 readonly UNIT_LINK="/etc/systemd/system/keepalived.service"
 readonly EXPECTED_UNIT="$APP_ROOT/systemd/keepalived.service"
 readonly SELINUX_RECORD="$APP_ROOT/var/lib/aifar/keepalived-selinux-fcontexts"
+readonly FIREWALL_RECORD="$APP_ROOT/var/lib/aifar/firewall-rule"
 BACKUP_DIR=""
 
 log() {
@@ -76,7 +77,7 @@ create_and_verify_backup() {
     [[ ! -e "$BACKUP_DIR" ]] || die "备份目录已存在：$BACKUP_DIR"
     install -d -o root -g root -m 700 "$BACKUP_DIR"
 
-    for relative in etc scripts systemd/keepalived.service var/lib/aifar/keepalived-selinux-fcontexts; do
+    for relative in etc scripts systemd/keepalived.service var/lib/aifar/keepalived-selinux-fcontexts var/lib/aifar/firewall-rule; do
         if [[ -e "$APP_ROOT/$relative" ]]; then
             install -d -o root -g root -m 700 "$BACKUP_DIR/$(dirname "$relative")"
             cp -a -- "$APP_ROOT/$relative" "$BACKUP_DIR/$relative"
@@ -95,6 +96,93 @@ EOF
         test -s uninstall-manifest.txt
         sha256sum --check BACKUP.sha256
     )
+}
+
+valid_ipv4() {
+    local address="$1" octet=""
+    local -a octets=()
+    [[ "$address" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+    IFS=. read -r -a octets <<<"$address"
+    for octet in "${octets[@]}"; do
+        [[ "$octet" =~ ^(0|[1-9][0-9]{0,2})$ ]] || return 1
+        ((10#$octet <= 255)) || return 1
+    done
+}
+
+valid_firewall_zone() {
+    [[ "$1" =~ ^[A-Za-z0-9_.-]{1,64}$ ]]
+}
+
+valid_peer_firewall_rule() {
+    local rule="$1"
+    local peer=""
+
+    [[ "$rule" =~ ^rule\ family=\"ipv4\"\ source\ address=\"([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)/32\"\ protocol\ value=\"112\"\ accept$ ]] || return 1
+    peer="${BASH_REMATCH[1]}"
+    valid_ipv4 "$peer"
+}
+
+parse_firewall_record() {
+    local file="$1" line="" key="" value=""
+    declare -A seen=()
+    FIREWALL_RECORD_ZONE=""
+    FIREWALL_RECORD_RULE=""
+    FIREWALL_RECORD_RUNTIME_CREATED=""
+    FIREWALL_RECORD_PERMANENT_CREATED=""
+
+    [[ -r "$file" ]] || die "防火墙所有权记录不可读：$file"
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ "$line" =~ ^([a-z_]+)=(.*)$ ]] || die "防火墙所有权记录格式无效：$file"
+        key="${BASH_REMATCH[1]}"
+        value="${BASH_REMATCH[2]}"
+        case "$key" in
+            zone) FIREWALL_RECORD_ZONE="$value" ;;
+            rule) FIREWALL_RECORD_RULE="$value" ;;
+            runtime_created) FIREWALL_RECORD_RUNTIME_CREATED="$value" ;;
+            permanent_created) FIREWALL_RECORD_PERMANENT_CREATED="$value" ;;
+            *) die "防火墙所有权记录包含未知字段：$key" ;;
+        esac
+        [[ -z "${seen[$key]+x}" ]] || die "防火墙所有权记录字段重复：$key"
+        seen[$key]=1
+    done <"$file"
+    for key in zone rule runtime_created permanent_created; do
+        [[ -n "${seen[$key]+x}" ]] || die "防火墙所有权记录缺少字段：$key"
+    done
+    valid_firewall_zone "$FIREWALL_RECORD_ZONE" || die "防火墙所有权记录 zone 无效"
+    valid_peer_firewall_rule "$FIREWALL_RECORD_RULE" || die "防火墙所有权记录 rule 无效"
+    [[ "$FIREWALL_RECORD_RUNTIME_CREATED" =~ ^[01]$ ]] || die "防火墙所有权记录 runtime_created 无效"
+    [[ "$FIREWALL_RECORD_PERMANENT_CREATED" =~ ^[01]$ ]] || die "防火墙所有权记录 permanent_created 无效"
+}
+
+owned_firewall_rule_exists() {
+    local form="$1" zone="$2" rule="$3" status=0
+
+    if [[ "$form" == permanent ]]; then
+        firewall-cmd --permanent --zone="$zone" --query-rich-rule="$rule" >/dev/null 2>&1 && return 0
+    else
+        firewall-cmd --zone="$zone" --query-rich-rule="$rule" >/dev/null 2>&1 && return 0
+    fi
+    status=$?
+    [[ "$status" -eq 1 ]] && return 1
+    die "查询 firewalld $form 规则失败（状态 $status），已停止卸载"
+}
+
+remove_owned_firewall_rule() {
+    local zone="" rule="" runtime_created=0 permanent_created=0
+
+    [[ -s "$FIREWALL_RECORD" ]] || return 0
+    parse_firewall_record "$FIREWALL_RECORD"
+    zone="$FIREWALL_RECORD_ZONE"
+    rule="$FIREWALL_RECORD_RULE"
+    runtime_created="$FIREWALL_RECORD_RUNTIME_CREATED"
+    permanent_created="$FIREWALL_RECORD_PERMANENT_CREATED"
+
+    if [[ "$runtime_created" == 1 ]] && owned_firewall_rule_exists runtime "$zone" "$rule"; then
+        firewall-cmd --zone="$zone" --remove-rich-rule="$rule" >/dev/null
+    fi
+    if [[ "$permanent_created" == 1 ]] && owned_firewall_rule_exists permanent "$zone" "$rule"; then
+        firewall-cmd --permanent --zone="$zone" --remove-rich-rule="$rule" >/dev/null
+    fi
 }
 
 restore_selinux_mappings() {
@@ -153,6 +241,13 @@ main() {
 
     create_and_verify_backup
 
+    if [[ -s "$FIREWALL_RECORD" ]]; then
+        [[ -f "$FIREWALL_RECORD" && ! -L "$FIREWALL_RECORD" ]] || die "防火墙所有权记录不是普通文件：$FIREWALL_RECORD"
+        parse_firewall_record "$FIREWALL_RECORD"
+        require_command firewall-cmd
+        systemctl is-active --quiet firewalld.service || die "存在防火墙所有权记录，但 firewalld 不可用；已停止卸载"
+    fi
+
     systemctl stop keepalived.service
     systemctl is-active --quiet keepalived.service && die "Keepalived 服务仍在运行，已停止卸载"
     systemctl disable keepalived.service || true
@@ -161,6 +256,7 @@ main() {
     fi
     systemctl daemon-reload
 
+    remove_owned_firewall_rule
     restore_selinux_mappings
 
     [[ "$(readlink -f -- "$APP_ROOT")" == "$APP_ROOT" ]] || die "删除前安装路径发生变化，已停止卸载"
@@ -174,4 +270,6 @@ main() {
     log "卸载完成，备份保留在：$BACKUP_DIR"
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi
