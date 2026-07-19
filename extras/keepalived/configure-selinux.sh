@@ -151,7 +151,7 @@ apply_mapping_mutation() {
 
 rollback_current_journal() {
     local -a rows=()
-    local index=0 action="" pattern="" previous_type="" applied_type=""
+    local index=0 action="" pattern="" previous_type="" applied_type="" rollback_status=0
 
     [[ -s "$CURRENT_JOURNAL" ]] || return 0
     mapfile -t rows <"$CURRENT_JOURNAL"
@@ -159,8 +159,9 @@ rollback_current_journal() {
         IFS='|' read -r action pattern previous_type applied_type <<<"${rows[$index]}"
         valid_mapping_row "$action" "$pattern" "$previous_type" "$applied_type" || continue
         [[ "$action" == created || "$action" == updated ]] || continue
-        reverse_mapping_mutation "$action" "$pattern" "$previous_type" "$applied_type" || return 1
+        reverse_mapping_mutation "$action" "$pattern" "$previous_type" "$applied_type" || rollback_status=1
     done
+    return "$rollback_status"
 }
 
 cleanup() {

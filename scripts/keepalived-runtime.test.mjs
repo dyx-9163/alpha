@@ -313,6 +313,15 @@ function fakeSelinuxFunction({ statePath, callLogPath }) {
     [[ -n "\$wanted_type" ]] && printf '%s|%s\\n' "\$wanted_pattern" "\$wanted_type" >>'${toMsysPath(statePath)}.tmp'
     mv -f -- '${toMsysPath(statePath)}.tmp' '${toMsysPath(statePath)}'
 }
+should_fail_selinux_mutation() {
+    local operation="\$1" pattern="\$2"
+    [[ "\${FAKE_FAIL_SEMANAGE:-}" == "\$operation" ]] || return 1
+    [[ -z "\${FAKE_FAIL_SEMANAGE_PATTERN:-}" || "\${FAKE_FAIL_SEMANAGE_PATTERN}" == "\$pattern" ]] || return 1
+    if [[ "\${FAKE_FAIL_SEMANAGE_ONCE:-0}" -eq 1 ]]; then
+        FAKE_FAIL_SEMANAGE=''
+    fi
+    return 0
+}
 semanage() {
     local pattern='' type=''
     if [[ "\${1:-}" == fcontext && "\${2:-}" == -l && "\${3:-}" == -C ]]; then
@@ -321,11 +330,11 @@ semanage() {
             done <'${toMsysPath(statePath)}'
     elif [[ "\${1:-}" == fcontext && "\${2:-}" == -a && "\${3:-}" == -t ]]; then
             type="\$4"; pattern="\$5"; printf 'add|%s|%s\\n' "\$pattern" "\$type" >>'${toMsysPath(callLogPath)}'
-            [[ "\${FAKE_FAIL_SEMANAGE:-}" != add ]] || return 51
+            ! should_fail_selinux_mutation add "\$pattern" || return 51
             set_selinux_mapping "\$pattern" "\$type"
     elif [[ "\${1:-}" == fcontext && "\${2:-}" == -m && "\${3:-}" == -t ]]; then
             type="\$4"; pattern="\$5"; printf 'update|%s|%s\\n' "\$pattern" "\$type" >>'${toMsysPath(callLogPath)}'
-            [[ "\${FAKE_FAIL_SEMANAGE:-}" != update ]] || return 52
+            ! should_fail_selinux_mutation update "\$pattern" || return 52
             set_selinux_mapping "\$pattern" "\$type"
     elif [[ "\${1:-}" == fcontext && "\${2:-}" == -d ]]; then
             pattern="\$3"; printf 'delete|%s\\n' "\$pattern" >>'${toMsysPath(callLogPath)}'
@@ -370,6 +379,44 @@ apply_new_mapping '${pattern}' '/usr/libexec/keepalived'
     ...result,
     calls: readSelinuxCalls(callLogPath),
     state: readSelinuxState(statePath)
+  }
+}
+
+function runSelinuxHelperRollbackHarness(t, {
+  journalRows,
+  stateRows,
+  failSemanage = '',
+  failPattern = '',
+  failOnce = false
+}) {
+  const fixture = mkdtempSync(path.join(rootDir, '.aifar-keepalived-selinux-helper-rollback-test-'))
+  t.after(() => rmSync(fixture, { force: true, recursive: true }))
+  const { appRoot, fixtureHelperPath } = writeSelinuxHelperFixture(fixture)
+  const harnessPath = path.join(fixture, 'harness.sh')
+  const statePath = path.join(fixture, 'selinux-state')
+  const callLogPath = path.join(fixture, 'semanage-calls')
+  const normalize = (value) => value.replaceAll('/aifar/apps/keepalived', toMsysPath(appRoot))
+  mkdirSync(path.join(appRoot, 'var', 'lib', 'aifar'), { recursive: true })
+  writeFileSync(statePath, stateRows.map(normalize).join('\n') + (stateRows.length ? '\n' : ''))
+  writeFileSync(harnessPath, `#!/usr/bin/env bash
+set -Eeuo pipefail
+source '${toMsysPath(fixtureHelperPath)}'
+trap - EXIT
+${fakeSelinuxFunction({ statePath, callLogPath })}
+cat >"\$CURRENT_JOURNAL" <<'JOURNAL'
+${journalRows.map(normalize).join('\n')}
+JOURNAL
+FAKE_FAIL_SEMANAGE='${failSemanage}'
+FAKE_FAIL_SEMANAGE_PATTERN='${normalize(failPattern)}'
+FAKE_FAIL_SEMANAGE_ONCE='${failOnce ? 1 : 0}'
+rollback_current_journal
+`)
+  const result = spawnSync(bashPath, [toMsysPath(harnessPath)], { encoding: 'utf8' })
+  const denormalize = (value) => value.replaceAll(toMsysPath(appRoot), '/aifar/apps/keepalived')
+  return {
+    ...result,
+    calls: readSelinuxCalls(callLogPath).map(denormalize),
+    state: readSelinuxState(statePath).map(denormalize)
   }
 }
 
@@ -1005,6 +1052,75 @@ test('SELinux journal failure immediately reverses and verifies a successful mut
     'delete|/aifar/apps/keepalived/libexec(/.*)?'
   ])
   assert.deepEqual(result.state, [])
+})
+
+const helperRollbackJournalRows = [
+  'created|/aifar/apps/keepalived/sbin/keepalived|-|keepalived_exec_t',
+  'updated|/aifar/apps/keepalived/etc(/.*)?|old_etc_t|keepalived_etc_t',
+  'updated|/aifar/apps/keepalived/libexec(/.*)?|old_exec_t|keepalived_exec_t'
+]
+
+test('helper SELinux rollback continues after the newest journal row was externally changed', (t) => {
+  const result = runSelinuxHelperRollbackHarness(t, {
+    journalRows: helperRollbackJournalRows,
+    stateRows: [
+      '/aifar/apps/keepalived/sbin/keepalived|keepalived_exec_t',
+      '/aifar/apps/keepalived/etc(/.*)?|keepalived_etc_t',
+      '/aifar/apps/keepalived/libexec(/.*)?|external_exec_t'
+    ]
+  })
+  assert.equal(result.status, 1, result.stderr)
+  assert.deepEqual(result.calls, [
+    'update|/aifar/apps/keepalived/etc(/.*)?|old_etc_t',
+    'delete|/aifar/apps/keepalived/sbin/keepalived'
+  ])
+  assert.deepEqual(result.state.sort(), [
+    '/aifar/apps/keepalived/etc(/.*)?|old_etc_t',
+    '/aifar/apps/keepalived/libexec(/.*)?|external_exec_t'
+  ].sort())
+})
+
+test('helper SELinux rollback continues when the oldest journal row is missing', (t) => {
+  const result = runSelinuxHelperRollbackHarness(t, {
+    journalRows: helperRollbackJournalRows,
+    stateRows: [
+      '/aifar/apps/keepalived/etc(/.*)?|keepalived_etc_t',
+      '/aifar/apps/keepalived/libexec(/.*)?|keepalived_exec_t'
+    ]
+  })
+  assert.equal(result.status, 1, result.stderr)
+  assert.deepEqual(result.calls, [
+    'update|/aifar/apps/keepalived/libexec(/.*)?|old_exec_t',
+    'update|/aifar/apps/keepalived/etc(/.*)?|old_etc_t'
+  ])
+  assert.deepEqual(result.state.sort(), [
+    '/aifar/apps/keepalived/etc(/.*)?|old_etc_t',
+    '/aifar/apps/keepalived/libexec(/.*)?|old_exec_t'
+  ].sort())
+})
+
+test('helper SELinux rollback continues after a transient semanage failure', (t) => {
+  const result = runSelinuxHelperRollbackHarness(t, {
+    journalRows: helperRollbackJournalRows,
+    stateRows: [
+      '/aifar/apps/keepalived/sbin/keepalived|keepalived_exec_t',
+      '/aifar/apps/keepalived/etc(/.*)?|keepalived_etc_t',
+      '/aifar/apps/keepalived/libexec(/.*)?|keepalived_exec_t'
+    ],
+    failSemanage: 'update',
+    failPattern: '/aifar/apps/keepalived/libexec(/.*)?',
+    failOnce: true
+  })
+  assert.equal(result.status, 1, result.stderr)
+  assert.deepEqual(result.calls, [
+    'update|/aifar/apps/keepalived/libexec(/.*)?|old_exec_t',
+    'update|/aifar/apps/keepalived/etc(/.*)?|old_etc_t',
+    'delete|/aifar/apps/keepalived/sbin/keepalived'
+  ])
+  assert.deepEqual(result.state.sort(), [
+    '/aifar/apps/keepalived/etc(/.*)?|old_etc_t',
+    '/aifar/apps/keepalived/libexec(/.*)?|keepalived_exec_t'
+  ].sort())
 })
 
 test('outer SELinux rollback reports a missing created mapping without mutating policy', (t) => {
