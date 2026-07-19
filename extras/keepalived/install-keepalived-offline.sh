@@ -32,6 +32,7 @@ NODE_INTERFACE=""
 NODE_PRIORITY=""
 NODE_VIRTUAL_ROUTER_ID=""
 NODE_HEALTH_URL=""
+HEALTH_CHECK_ENABLED=0
 WORK_DIR=""
 TRANSACTION_ACTIVE=0
 APP_ROOT_EXISTED=0
@@ -718,11 +719,13 @@ parse_node_config() {
     NODE_PRIORITY=""
     NODE_VIRTUAL_ROUTER_ID=""
     NODE_HEALTH_URL=""
+    HEALTH_CHECK_ENABLED=0
     [[ -r "$file" ]] || die "缺少节点配置：$file；请复制 keepalived.env.example 后修改"
     while IFS= read -r line || [[ -n "$line" ]]; do
         line_number=$((line_number + 1))
         line="${line%$'\r'}"
         [[ -z "$line" || "$line" == \#* ]] && continue
+        [[ "$line" != 'KEEPALIVED_HEALTH_URL=' ]] || die "健康 URL 不能为空"
         [[ "$line" =~ ^([A-Z][A-Z0-9_]*)=([^[:space:]]+)$ ]] || die "节点配置第 $line_number 行格式无效"
         key="${BASH_REMATCH[1]}"
         value="${BASH_REMATCH[2]}"
@@ -735,11 +738,14 @@ parse_node_config() {
         printf -v "NODE_${key#KEEPALIVED_}" '%s' "$value"
     done <"$file"
     local variable="" config_key=""
-    for key in LOCAL_IP PEER_IP VIP_CIDR INTERFACE PRIORITY VIRTUAL_ROUTER_ID HEALTH_URL; do
+    for key in LOCAL_IP PEER_IP VIP_CIDR INTERFACE PRIORITY VIRTUAL_ROUTER_ID; do
         variable="NODE_$key"
         config_key="KEEPALIVED_$key"
         [[ -n "${seen[$config_key]+x}" && -n "${!variable}" ]] || die "节点配置缺少字段：$config_key"
     done
+    if [[ -n "${seen[KEEPALIVED_HEALTH_URL]+x}" ]]; then
+        HEALTH_CHECK_ENABLED=1
+    fi
 }
 
 valid_ipv4() {
@@ -757,9 +763,7 @@ validate_node_config() {
     local vip="${NODE_VIP_CIDR%/*}"
     local prefix="${NODE_VIP_CIDR##*/}"
     local prefix_number=0 priority_number=0 virtual_router_id_number=0
-    local authority="${NODE_HEALTH_URL#*://}"
-    local host_port="${authority%%/*}"
-    local host="${host_port%%:*}"
+    local authority="" host_port="" host=""
     valid_ipv4 "$NODE_LOCAL_IP" || die "本机 IP 无效"
     valid_ipv4 "$NODE_PEER_IP" || die "对端 IP 无效"
     [[ "$NODE_LOCAL_IP" != "$NODE_PEER_IP" ]] || die "本机 IP 与对端 IP 不能相同"
@@ -775,8 +779,13 @@ validate_node_config() {
     [[ "$NODE_VIRTUAL_ROUTER_ID" =~ ^(0|[1-9][0-9]{0,2})$ ]] || die "virtual router id 必须为 1-255"
     virtual_router_id_number=$((10#$NODE_VIRTUAL_ROUTER_ID))
     ((virtual_router_id_number >= 1 && virtual_router_id_number <= 255)) || die "virtual router id 必须为 1-255"
-    validate_health_url_shape "$NODE_HEALTH_URL" || die "健康 URL 格式无效"
-    [[ "$host" == "$NODE_LOCAL_IP" || "$host" == 127.0.0.1 || "$host" == localhost ]] || die "健康 URL 必须指向本机"
+    if [[ "$HEALTH_CHECK_ENABLED" -eq 1 ]]; then
+        authority="${NODE_HEALTH_URL#*://}"
+        host_port="${authority%%/*}"
+        host="${host_port%%:*}"
+        validate_health_url_shape "$NODE_HEALTH_URL" || die "健康 URL 格式无效"
+        [[ "$host" == "$NODE_LOCAL_IP" || "$host" == 127.0.0.1 || "$host" == localhost ]] || die "健康 URL 必须指向本机"
+    fi
     ip link show dev "$NODE_INTERFACE" >/dev/null 2>&1 || die "接口不存在：$NODE_INTERFACE"
     ip -o -4 addr show dev "$NODE_INTERFACE" | awk -v expected="$NODE_LOCAL_IP" '{split($4,a,"/"); if (a[1]==expected) found=1} END{exit !found}' || die "接口未绑定本机 IP"
     ip -4 route get "$vip" | awk -v expected="$NODE_INTERFACE" '{for(i=1;i<NF;i++) if($i=="dev" && $(i+1)==expected) found=1} END{exit !found}' || die "VIP 不通过指定接口路由"
@@ -784,7 +793,13 @@ validate_node_config() {
 
 render_keepalived_config() {
     local template="$1" output="$2" content="" router_id=""
+    local script_security="" health_script="" track_script=""
     router_id="AIFAR_${NODE_LOCAL_IP//./_}"
+    if [[ "$HEALTH_CHECK_ENABLED" -eq 1 ]]; then
+        script_security=$'    script_user root\n    enable_script_security'
+        health_script=$'vrrp_script check_aifar_health {\n    script "/aifar/apps/keepalived/libexec/check-aggregate-health.sh"\n    interval 2\n    timeout 3\n    fall 3\n    rise 2\n    weight 0\n}\n'
+        track_script=$'    track_script {\n        check_aifar_health\n    }'
+    fi
     content="$(<"$template")"
     content="${content//@ROUTER_ID@/$router_id}"
     content="${content//@INTERFACE@/$NODE_INTERFACE}"
@@ -793,6 +808,9 @@ render_keepalived_config() {
     content="${content//@LOCAL_IP@/$NODE_LOCAL_IP}"
     content="${content//@PEER_IP@/$NODE_PEER_IP}"
     content="${content//@VIP_CIDR@/$NODE_VIP_CIDR}"
+    content="${content//@SCRIPT_SECURITY@/$script_security}"
+    content="${content//@HEALTH_SCRIPT@/$health_script}"
+    content="${content//@TRACK_SCRIPT@/$track_script}"
     [[ ! "$content" =~ @[A-Z_]+@ ]] || die "Keepalived 模板仍有未替换字段"
     printf '%s\n' "$content" >"$output"
 }

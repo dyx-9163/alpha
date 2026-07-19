@@ -193,6 +193,15 @@ function validNodeConfig(overrides = {}) {
   return Object.entries(values).map(([key, value]) => `${key}=${value}`).join('\n') + '\n'
 }
 
+function nodeConfigWithoutHealth({ commented = false } = {}) {
+  return validNodeConfig().replace(
+    /^KEEPALIVED_HEALTH_URL=.*\n/m,
+    commented
+      ? '# KEEPALIVED_HEALTH_URL=http://192.168.74.132:38000/health/aggregate\n'
+      : ''
+  )
+}
+
 const validIpFunction = `ip() {
     case "\$*" in
         'link show dev ens160') return 0 ;;
@@ -222,10 +231,12 @@ ${ipFunction}
 parse_node_config "\$NODE_ENV"
 validate_node_config
 ${render ? 'render_keepalived_config "$CONFIG_TEMPLATE" "$RENDERED_CONFIG"' : ''}
+printf '%s\n' "\$HEALTH_CHECK_ENABLED"
 `)
   const result = spawnSync(bashPath, [toMsysPath(harnessPath)], { encoding: 'utf8' })
   return {
     ...result,
+    healthCheckEnabled: result.stdout.trim(),
     renderedConfig: existsSync(renderedConfigPath) ? readFileSync(renderedConfigPath, 'utf8') : ''
   }
 }
@@ -242,7 +253,9 @@ function runSequentialParseHarness(t) {
 set -Eeuo pipefail
 source '${toMsysPath(installerPath)}'
 parse_node_config '${toMsysPath(validEnvPath)}'
+printf '%s\n' "\$HEALTH_CHECK_ENABLED"
 parse_node_config '${toMsysPath(missingEnvPath)}'
+printf '%s\n' "\$HEALTH_CHECK_ENABLED"
 `)
   return spawnSync(bashPath, [toMsysPath(harnessPath)], { encoding: 'utf8' })
 }
@@ -1618,6 +1631,7 @@ test('aggregate health main uses the fixed URL file for zero arguments and rejec
 test('installer parses validates and renders a valid managed node configuration', (t) => {
   const result = runNodeConfigHarness(t)
   assert.equal(result.status, 0, result.stderr)
+  assert.equal(result.healthCheckEnabled, '1')
   assert.doesNotMatch(result.renderedConfig, /@[A-Z_]+@/)
   assert.match(result.renderedConfig, /router_id AIFAR_192_168_74_132/)
   assert.match(result.renderedConfig, /interface ens160/)
@@ -1626,13 +1640,36 @@ test('installer parses validates and renders a valid managed node configuration'
   assert.match(result.renderedConfig, /unicast_src_ip 192\.168\.74\.132/)
   assert.match(result.renderedConfig, /\n        192\.168\.74\.133\n/)
   assert.match(result.renderedConfig, /192\.168\.74\.130\/24 dev ens160/)
+  assert.match(result.renderedConfig, /script_user root/)
+  assert.match(result.renderedConfig, /vrrp_script check_aifar_health/)
+  assert.match(result.renderedConfig, /track_script/)
+})
+
+for (const [name, config] of [
+  ['missing', nodeConfigWithoutHealth()],
+  ['commented', nodeConfigWithoutHealth({ commented: true })]
+]) {
+  test(`installer accepts ${name} health URL and renders VRRP without health blocks`, (t) => {
+    const result = runNodeConfigHarness(t, { config })
+    assert.equal(result.status, 0, result.stderr)
+    assert.equal(result.healthCheckEnabled, '0')
+    assert.match(result.renderedConfig, /vrrp_instance AIFAR_VI/)
+    assert.match(result.renderedConfig, /192\.168\.74\.130\/24 dev ens160/)
+    assert.doesNotMatch(result.renderedConfig, /script_user|enable_script_security/)
+    assert.doesNotMatch(result.renderedConfig, /vrrp_script|track_script|check_aifar_health/)
+  })
+}
+
+test('installer rejects an explicitly empty health URL', (t) => {
+  const result = runNodeConfigHarness(t, {
+    config: validNodeConfig().replace(/^KEEPALIVED_HEALTH_URL=.*$/m, 'KEEPALIVED_HEALTH_URL='),
+    render: false
+  })
+  assert.equal(result.status, 1, result.stderr)
+  assert.match(result.stderr, /健康 URL 不能为空/)
 })
 
 const invalidNodeConfigs = [
-  {
-    name: 'missing key',
-    config: validNodeConfig().replace(/^KEEPALIVED_HEALTH_URL=.*\n/m, '')
-  },
   {
     name: 'duplicate key',
     config: `${validNodeConfig()}KEEPALIVED_PRIORITY=140\n`
@@ -1723,10 +1760,10 @@ test('installer rejects command substitution syntax without evaluating node conf
   assert.equal(existsSync(markerPath), false, 'node configuration was evaluated')
 })
 
-test('installer does not reuse stale node globals when a later parse omits a required key', (t) => {
+test('installer resets health mode when a later parse omits the optional health URL', (t) => {
   const result = runSequentialParseHarness(t)
-  assert.equal(result.status, 1, result.stderr)
-  assert.match(result.stderr, /KEEPALIVED_HEALTH_URL/)
+  assert.equal(result.status, 0, result.stderr)
+  assert.deepEqual(result.stdout.trimEnd().split('\n'), ['1', '0'])
 })
 
 test('installer restarts a service that was previously active and enabled', (t) => {

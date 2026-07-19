@@ -34,7 +34,7 @@ test('Keepalived module contains the verified installer artifacts', () => {
   }
 })
 
-test('generic node example exposes exactly the supported Keepalived keys', () => {
+test('generic node example exposes required keys and comments the optional health URL', () => {
   const example = read('keepalived.env.example')
   const keys = [...example.matchAll(/^([A-Z][A-Z0-9_]*)=/gm)].map((match) => match[1])
   assert.deepEqual(keys, [
@@ -43,23 +43,26 @@ test('generic node example exposes exactly the supported Keepalived keys', () =>
     'KEEPALIVED_VIP_CIDR',
     'KEEPALIVED_INTERFACE',
     'KEEPALIVED_PRIORITY',
-    'KEEPALIVED_VIRTUAL_ROUTER_ID',
-    'KEEPALIVED_HEALTH_URL'
+    'KEEPALIVED_VIRTUAL_ROUTER_ID'
   ])
+  assert.match(example, /^# KEEPALIVED_HEALTH_URL=http:\/\//m)
 })
 
 test('production template uses BACKUP unicast health-fault and preemption defaults', () => {
   const template = read('keepalived.conf.tpl')
+  const installer = read('install-keepalived-offline.sh')
+  const healthContract = `${template}\n${installer}`
   for (const placeholder of [
     '@ROUTER_ID@', '@INTERFACE@', '@VIRTUAL_ROUTER_ID@', '@PRIORITY@',
-    '@LOCAL_IP@', '@PEER_IP@', '@VIP_CIDR@'
+    '@LOCAL_IP@', '@PEER_IP@', '@VIP_CIDR@', '@SCRIPT_SECURITY@',
+    '@HEALTH_SCRIPT@', '@TRACK_SCRIPT@'
   ]) assert.match(template, new RegExp(placeholder))
   assert.match(template, /state BACKUP/)
-  assert.match(template, /interval 2/)
-  assert.match(template, /timeout 3/)
-  assert.match(template, /fall 3/)
-  assert.match(template, /rise 2/)
-  assert.match(template, /weight 0/)
+  assert.match(healthContract, /interval 2/)
+  assert.match(healthContract, /timeout 3/)
+  assert.match(healthContract, /fall 3/)
+  assert.match(healthContract, /rise 2/)
+  assert.match(healthContract, /weight 0/)
   assert.match(template, /unicast_src_ip @LOCAL_IP@/)
   assert.doesNotMatch(template, /nopreempt/)
 })

@@ -1,18 +1,9 @@
 global_defs {
     router_id @ROUTER_ID@
-    script_user root
-    enable_script_security
+@SCRIPT_SECURITY@
 }
 
-vrrp_script check_aifar_health {
-    script "/aifar/apps/keepalived/libexec/check-aggregate-health.sh"
-    interval 2
-    timeout 3
-    fall 3
-    rise 2
-    weight 0
-}
-
+@HEALTH_SCRIPT@
 vrrp_instance AIFAR_VI {
     state BACKUP
     interface @INTERFACE@
@@ -26,7 +17,5 @@ vrrp_instance AIFAR_VI {
     virtual_ipaddress {
         @VIP_CIDR@ dev @INTERFACE@
     }
-    track_script {
-        check_aifar_health
-    }
+@TRACK_SCRIPT@
 }
