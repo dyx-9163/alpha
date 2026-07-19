@@ -160,6 +160,34 @@
 - 结论：Redis 模块现已透传 `CheckRequest.Actor`；后台 Collector 使用单次只读 SSH 同时检查本地 Redis/Sentinel systemd、认证 PING 和本地数据角色，不再执行服务访问规则、完整 Sentinel 拓扑查询或逐端点探测，人工检测仍保留完整流程。TDD 先复现旧路径 8 次 SSH；Redis 专项测试和双平台后端构建通过，完整 Go 后端测试曾通过，最终复跑仅既有 `TestDockerSummaryCollectorTimeoutDoesNotBlockOtherHosts` 的严格 100ms 计时断言在本机以 104-109ms 稳定失败，与本改动无关；构建需使用仓库内可写 GOCACHE。
 
 ## 2026-07-16
+- 问题：用户要求提供一份只针对 third 的英文文档。
+- 结论：已生成 `docs/third-network-port-matrix-en.docx`，仅包含 third（192.168.74.134）的英文入站端口矩阵、可选 Router 端口、来源限制和不需要开放的端口；表格几何和可访问性审计通过。当前环境缺少 LibreOffice，无法完成 PNG 视觉渲染检查，已执行 DOCX 包完整性和英文内容结构检查作为回退。
+- 问题：用户要求网络矩阵中的三台服务器名称改为 DC1、DC2、third。
+- 结论：服务器名称映射为 DC1=192.168.74.132、DC2=192.168.74.133、third=192.168.74.134，端口和通信方向不变。
+- 问题：用户询问当前第三台服务器需要开放哪些端口，并要求网络矩阵图。
+- 结论：控制面数据库显示第三台为 192.168.74.134，当前承载 MySQL InnoDB Cluster secondary、MySQL Router 6446-6449、Redis Sentinel replica 6379/26379、Nacos cluster 8848/9848/9849/7848；未承载 MinIO、Docker 或 AIFAR Runtime。最小入站应按来源限制：面板到 22，集群节点到 3306、6379、26379、8848、9848、9849、7848，Nacos/AIFAR 客户端到 8848/9848，实际数据库客户端到 Router 6446；6447-6449 仅在使用只读或 X Protocol 时开放。
+- 问题：用户在 AIFAR 服务器直接执行 `rm -rf /aifar/apps/docker`，只剩 `docker/exec/netns/default` 报 `Device or resource busy`。
+- 结论：`/aifar/apps/docker` 不是可删缓存，而是本项目 Docker 的实际 install root；其中 `data` 是 Docker data-root、`exec` 是 exec-root、`daemon/daemon.json` 是 systemd 启动所需配置。`exec/netns/default` 是 dockerd 正在持有的 network namespace mount，所以内核拒绝删除。直接 rm 很可能已删除其余 Docker 配置、镜像/容器元数据或层文件；不要强制 umount、不要继续删除或重启/reboot Docker，先只读检查 systemd/docker 状态、DockerRootDir、现存容器、daemon.json 和 mount，评估损失后再决定恢复或正式卸载。
+- 问题：用户回传 Docker 删除后的只读诊断结果。
+- 结论：docker、containerd、aifar-agent 均 inactive，`/usr/local/bin/docker`、docker.service、daemon.json、data-root 均已不存在，`findmnt -R /aifar/apps/docker` 无挂载输出，只剩空的 `exec/netns` 目录；说明 Docker 已实际卸载且原 data-root 已删除，无法从残留目录恢复镜像/容器。初始 busy 是卸载/停止时 netns mount 尚未释放；现在确认真实路径且无 mount 后可清理残留目录，若要继续使用则需从面板重新安装 Docker、重新导入 `nginx-stable-alpine` 镜像并重启 HTTPS ingress，上层 Docker 工作负载需要重新部署或重建。
+- 问题：用户按安全路径检查后再次删除，`exec/netns/default` 仍返回 busy。
+- 结论：先前 `findmnt -R` 对目录递归检查漏掉了该文件级 mount point，不能据此判定 netns 已释放；需改用 `findmnt -T /aifar/apps/docker/exec/netns/default`、`mountpoint`、`/proc/self/mountinfo` 精确确认，并检查残留 dockerd/containerd/containerd-shim/docker-proxy 进程与 network namespace。只有确认 Docker 已卸载且无残留容器进程后，才可普通 `umount` 该精确 mount point；暂不使用 lazy/force umount。
+- 问题：用户在服务器执行 HTTPS Ingress `install-systemd.sh` 后看到 service `active (exited)`，并有 `listen ... http2` deprecated warning。
+- 结论：安装和启动均成功：systemd unit 已 enable，ExecStart 状态 0，Nginx 配置检查 successful，入口容器已运行；`active (exited)` 是 `Type=oneshot + RemainAfterExit=yes` 的预期状态，不表示容器退出。唯一提示是新版 Nginx 将 `listen 443 ssl http2;` 标记为弃用，可改成 `listen 443 ssl;` 加独立 `http2 on;` 后 reload，不影响当前 HTTPS 工作。
+- 问题：用户确认用任意默认域名，并要求完成可复制运行的 Docker HTTPS Ingress 模块。
+- 结论：已新增 `extras/aifar-https-ingress`，默认域名 `aifar.local`，包含 self-signed 启动证书、Nginx 80/443 配置、Web 8080 与 Gateway 38000 分流、WebSocket、Docker host-network 启停/状态/reload 脚本、`unless-stopped` 和 systemd 安装卸载脚本；新增脚本契约测试和实施计划。证书 SAN/密钥匹配、全部 shell 语法及 47 项脚本测试通过；当前 Windows 工作区 Docker daemon 未运行，真实 Nginx 容器启动由目标服务器 `start.sh` 内置的 upstream 预检与 `nginx -t` 负责。默认私钥只用于自签名快速验证，生产必须替换。补跑完整 `pnpm test` 因本机 `D:\tools\go` 缺少 `testing`、`net/http/httptest` 标准库且 `D:\tools\gocache` 无权限而在 Go setup 阶段失败，与本次脚本模块无关。
+- 问题：用户要求在工程中生成可直接复制到服务器运行的 Docker HTTPS Ingress 服务模块，包含证书、Nginx 配置、启动停止和自启动。
+- 结论：模块计划采用独立目录、`nginx:stable-alpine`、host network、宿主机持久化配置/证书、start/stop/status/reload 与 systemd 安装卸载脚本；实现前需确认实际证书域名与证书来源。生产私钥不应写入仓库；若暂无正式证书，可首次启动按配置的域名/IP生成自签证书，但浏览器会提示不受信任。
+- 问题：用户询问是否可以用 Docker 运行方案 1 的 HTTPS 入口 Nginx。
+- 结论：可以在 AIFAR 目标 Linux 服务器运行独立 `nginx:stable-alpine` 容器，最快使用 `--network host`，只读挂载宿主机持久化的 Nginx 配置和证书目录，使容器直接反代 `127.0.0.1:8080`（Web）与 `127.0.0.1:38000`（API/WebSocket）。该入口容器应使用独立名称与 `--restart unless-stopped`，上线前检查 80/443 占用；证书更新后在容器内 `nginx -t` 并 reload，无需重启 AIFAR Runtime 容器。
+- 问题：用户要求给出方案 1（宿主机 Nginx TLS 入口）的具体实施步骤。
+- 结论：建议宿主机 Nginx 监听 443，普通 Web 请求转发 `127.0.0.1:8080`，`/api/` 与 `/im/ws` 直接转发 `127.0.0.1:38000`，并传递 Host、真实 IP、`X-Forwarded-Proto=https` 及 WebSocket Upgrade 头；上线前检查 DNS、证书、8080/38000 listener 和 80/443 端口占用，RHEL/SELinux 需允许 httpd 网络连接，最后 `nginx -t` 后 reload，不重启 AIFAR 容器。
+- 问题：用户确认采用宿主机入口 Nginx TLS 方案后，是否只需改 Nginx 配置并重启 web-vue3 容器。
+- 结论：方案 1 修改的是宿主机独立 Nginx，而不是 web-vue3 容器内 Nginx；配置和证书就位后执行 `nginx -t` 并 reload/restart 宿主机 Nginx 即可，现有 web-vue3 容器和 aifar-agent 通常不需要重启。宿主机 Nginx 将 443 转发到 `127.0.0.1:8080`，同时应开放 443、确认无端口占用并限制公网直连 8080。
+- 问题：用户询问已完整部署的 AIFAR Runtime v2 如何最快让 `web-vue3` 开放 HTTPS，并考虑由容器直接提供 SSL。
+- 结论：当前 `web-vue3` 容器只监听 HTTP 8080，业务容器不直接绑定宿主机端口；外部 8080 实际由 `aifar-agent` 的 HTTP listener 接入，再通过硬编码 `http` scheme 反代到容器。因此仅在 web-vue3 Nginx 打开 443/放入证书会导致现有 Agent 路由和健康检查失败，外部也无法直接到达容器 443。最快且影响最小的方案是在宿主机或现有入口 Nginx/Caddy 上终止 TLS，反代 `127.0.0.1:8080`；若坚持容器直出 HTTPS，需要扩展 runtime spec/Agent 的 TLS 或 host-port/证书只读挂载能力，并同步安装、升级、回滚、reconcile 和健康检查链路，不适合作为临时快速变更。
+- 问题：用户截图反馈 Docker 安装在 `install Docker Engine and Compose` 步骤立即失败，提示缺少 `bin/aifar-agent-linux-amd64`。
+- 结论：失败发生在面板本机预检阶段，Docker 离线包已找到且尚未进行 SSH 上传；Docker 安装器要求同时上传 Linux AIFAR Agent。当前 Linux 发布包包含该文件，但 Windows 发布包的 `bin` 只有服务端 exe，`package-release.mjs` 也只给 Linux target 配置了 `extraBinaries`，因此用 Windows 发布包运行面板会稳定触发此错误；也可能是手工部署时漏拷 Agent 或 `AIFAR_AGENT_BINARY` 指向不存在路径。
 - 问题：用户询问如果要在 AIFAR 中添加新的 Java 服务，需要在哪些地方加东西。
 - 结论：当前 AIFAR Runtime v2 业务服务已改成目录驱动；新增普通 Java 微服务优先在 `resources/aifar/runtime-v2/services/<service>/` 增加 `service.json`、`Dockerfile` 和 `target/*.jar` 等 Dockerfile 引用文件，确保服务名、端口、applicationName、healthPath、affinityPolicy 合法唯一，然后在面板重新扫描资源即可。安装弹窗和 Runtime 页通过 `/api/v2/apps/aifar/install-modules` 读取后端发现结果，通常不需要改 Vue 固定列表；只有做成应用商店里的全新独立应用时，才需要新增 `backend/internal/apps/<app>`、autoload、前端 `web/src/apps/<app>`、资源包、i18n 和测试。
 - 问题：用户追问新增 Java 服务时 `resources/aifar/runtime-v2/runtime/defaults.env` 是否也要改。
@@ -204,3 +232,159 @@
 - 结论：再次确认是仓库源 `config/defaults.env` 被写回部署值导致；已恢复敏感项留空、`AIFAR_ALLOW_INSECURE_DEFAULTS=false`、`AIFAR_ALLOW_WEAK_PASSWORDS=false`。验证通过 `node --test scripts/runtime-security-config.test.mjs`、`pnpm test:scripts`、`git diff --check`。弱密码生产配置只能写入打包后的生成包配置或目标环境变量，不能写入源码 release 模板。
 - 问题：用户截图显示 push 被 GitHub 拒绝，提示 `deploy/.stage/.../alpha-*.jar` 超过 100MB。
 - 结论：根因不是当前工作区仍跟踪大文件，而是本地 ahead 提交历史里曾包含 `deploy/.stage` 打包暂存目录；GitHub 会拒绝包含大 blob 的任意提交。已创建本地备份分支后，将当前分支相对远端的 3 个提交 soft-reset 并重新提交为一个干净提交，验证当前待推送范围不再包含 `deploy/.stage` 或 runtime target jar 路径；`.gitignore` 的 `deploy` 规则会继续忽略打包产物。
+- 问题：用户反馈 ACC 登录日志中的 IP 显示为网关 `192.168.74.1`，而不是预期的客户端地址。
+- 结论：这是 NAT/虚拟网络或反向代理让业务后端只看到上一跳网关地址的典型现象。AIFAR HTTPS ingress 已转发 `X-Real-IP` 和 `X-Forwarded-For`；若前置 NAT 已做 SNAT，需在 NAT 前保留真实 IP，若头已存在则需 ACC 后端仅对可信代理启用 forwarded-header 解析；不应无条件信任外部伪造的 IP 头。
+- 问题：用户追问是否只需修改 `web-vue3` 和 HTTPS ingress Nginx 就能记录真实 IP。
+- 结论：HTTPS ingress 下 `/api/` 直接转发到 runtime Gateway `38000`，不经过 `web-vue3` Nginx，因此单改 web-vue3 对登录日志无效。从 `alpha-system.jar` 检查到 ACC `IpUtil.getIpAddr` 优先取 `X-Real-IP`，再取 `X-Forwarded-For`；当前 ingress 把 `$remote_addr` 写入 `X-Real-IP`，所以日志为 `192.168.74.1` 说明 ingress 看到的上一跳就是该地址。若前面有可信 L7 代理，可在 ingress 用 realip 模块仅信任指定代理网段后恢复 `$remote_addr`；若是路由器/虚拟网络 hairpin SNAT 且没有携带原 IP，修改两个 Nginx 也无法恢复，需改访问路径或 NAT 配置。
+- 问题：用户倾向平台级 ingress 能力，询问由 `aifar-agent` 管理 ingress 是否需要修改 agent 代码。
+- 结论：若要让 agent 真正拥有 ingress 的 desired-state、启停、重载、状态和自恢复，必须修改 `aifar-agent`；当前 `reconcile-ingress` 只是 `reconcile-runtime` 的别名，`ReconcileIngress` 也直接调用 `ReconcileRuntime`，并不管理外部 Nginx。若只用现有 shell/systemd 脚本安装 Nginx，可不改 agent，但那只是外部运维模块，不是 agent-managed ingress。
+- 问题：用户询问平台 ingress 能否沿用 AIFAR JAR 应用的 agent 管理路径，或直接改造 `web-vue3`。
+- 结论：JAR 和 web-vue3 当前都是 `service.json -> Dockerfile/image -> runtime-spec deployments/services -> aifar-agent reconcile -> Docker pod/health/rolling/proxy` 路径，web-vue3 已经沿用该路径。Ingress 可复用 agent 的 Docker runner、labels、health、status 和自恢复机制，但不应当普通业务 pod：它是宿主机级单例，独占 80/443，证书持久化，且不能用 maxSurge 滚动启动第二个端口实例。推荐新增宿主机级 `IngressSpec`/独立 reconcile，内部复用现有 deployment 基础能力；不把 80/443、TLS 和全局路由塞进 web-vue3 业务容器。
+- 问题：用户询问 Kubernetes 的 Ingress 和 Service 使用什么，当前 AIFAR 是否已在使用。
+- 结论：Kubernetes Service 是 Kubernetes API 资源，由 kube-proxy/eBPF 等数据面将 ClusterIP/NodePort/LoadBalancer 路由到 Pods；Ingress 也是 API 资源，必须由 Nginx/Traefik/Envoy 等 Ingress Controller 实现。当前 AIFAR 没有 Kubernetes、client-go、kubectl、Helm 或真实 K8s manifests；Runtime v2 只是 Kubernetes-like，用 Docker containers 模拟 Pod/Deployment，aifar-agent 的 `net.Listen + ReverseProxy + Docker endpoint discovery` 实现类 Service/Ingress 路由。`design/single-node-k8s-runtime-resource-design.md` 中更通用的 Service/Ingress 资源仍是设计，非当前已实现功能。
+- 问题：用户指出当前 AIFAR Service 自身没有代理动作，实际是 `aifar-agent` 在执行。
+- 结论：判断正确；`ServiceSpec` 只是声明式资源/期望状态，定义 name、listenPort、targetPort 和 affinityPolicy。真正的数据面在 `aifar-agent` Manager：构建 route、`net.Listen`、从 Docker 发现 ready endpoints、选择 endpoint 并用 `httputil.ReverseProxy` 转发。这与 K8s Service 资源由 kube-proxy/eBPF 执行的职责分离一致；后续 Ingress 也应是 `IngressSpec` 声明规则，由 agent/controller 管理 Nginx 或自身代理数据面。
+- 问题：用户澄清前述“AIFAR Service”实指面板后端 `aifar-server`，询问 `aifar-agent` 是否直接执行 Service/Ingress。
+- 结论：`aifar-server` 是控制面，负责 API、任务、审计、SSH 安装/更新和触发 runtime spec reconcile，不代理 AIFAR 业务流量。`aifar-agent` 直接执行 Service 数据面：监听 ServiceSpec 端口、发现 Docker endpoints、负载均衡并反代。但当前默认 `IngressSpec.mode=web-nginx`时，agent 只建立 `8080 -> web-vue3` 和 `38000 -> gateway` 两个 Service 路由，`/api/` 与 `/im/ws` 的路径分流由 web-vue3 Nginx 完成；另外的 HTTPS ingress Nginx 才负责 80/443/TLS。因此 agent 已做完整 Service proxy 和部分 ingress 编排，但尚未做完整通用 Ingress Controller。
+- 问题：用户询问 AIFAR 应采用 Kubernetes 还是自建 Kubernetes-like runtime。
+- 结论：不建议把当前 agent 扩张成通用 Kubernetes 替代品。如果产品仍以单机/每台独立 runtime、离线安装和固定 AIFAR 服务为主，应保持当前有边界的 Docker + agent runtime，只补齐必要的 Service/Ingress/发布能力；如果需要跨多台物理机统一调度、节点故障自动迁移、持久卷和成熟生态，应优先采用可离线安装的 K3s/Kubernetes，而不是重新实现 scheduler、CNI、CSI、RBAC、controller 和升级兼容性。
+- 问题：用户表示目标也包括从底层理解容器编排，考虑亲手实现一个工具并在过程中同时使用 Kubernetes。
+- 结论：学习目标下，亲手实现有边界的单机 Kubernetes-like runtime 很有价值，并应用 K3s/Kubernetes 作为对照组和验收标准；建议依次实现 resource store/desired state、reconcile、Pod/Deployment、Service/endpoints/LB、Ingress/controller、Config/Secret/Volume，再考虑简化多节点 scheduler。学习 runtime 与 AIFAR 生产执行面应明确分层或隔离，不把未验证的通用编排实验直接变成生产 Kubernetes 替代品。
+- 问题：用户询问是否建议边学习边改造，最终让 AIFAR 达到生产能力。
+- 结论：建议以分阶段、可回退、证据门禁的方式边学习边演进，但生产目标应限定为 AIFAR 专用的单机/每主机 runtime，不承诺通用 Kubernetes 替代。应保留稳定执行路径和回滚开关，按 Service/Ingress 收口、desired-state 持久化和状态、发布/回滚/自愈、Secret/TLS/安全、故障注入与 soak 测试逐阶段放行。若生产目标包含跨物理机调度和节点故障自动迁移，应将 K3s/Kubernetes 作为生产执行面，AIFAR 保留控制面和 Runtime Driver 适配。
+- 问题：用户询问 Kubernetes 中哪些组件与 `aifar-agent` 类似。
+- 结论：`aifar-agent` 不是对应单一 K8s 组件，而是单机合并了多种职责：容器创建/检查/重启类似 kubelet，Service 端口和负载均衡类似 kube-proxy，副本/滚动/回滚 reconcile 类似 kube-controller-manager 中的 Deployment/ReplicaSet controller，路径分流与后续 Nginx 管理类似 Ingress Controller，Docker endpoint 发现类似 EndpointSlice/controller。它不等于 containerd/Docker 容器运行时，也没有完整 kube-scheduler、API Server/etcd、CNI、CSI 和多节点能力。
+- 问题：用户询问 Kubernetes 组件中哪些是服务器宿主机二进制/服务，哪些由 Kubernetes 内部部署。
+- 结论：每个 Node 必须先有宿主机级 kubelet 和 CRI runtime（containerd/CRI-O），CNI 还会安装宿主机插件二进制与网络配置。kubeadm 常将 kube-apiserver/controller-manager/scheduler/etcd 作为静态 Pod 由 kubelet 根据宿主机 manifests 直接启动，它们虽运行在容器中但不是普通 Scheduler 调度的 workload。CoreDNS、Ingress Controller、metrics-server、多数 CNI/CSI controller、kube-proxy 等通常以 Deployment/DaemonSet 在集群内运行；CNI/CSI node plugin 常为 DaemonSet 且需挂载宿主机目录。K3s 则将大量宿主机能力合并到 `k3s server/agent` 二进制与 systemd 服务中。
+
+## 2026-07-17
+- 问题：用户询问 K3s 能否承载小范围企业级生产，例如几万人使用的产品，并认为完整 Kubernetes 更适合几十万用户。
+- 结论：K3s 是完整兼容 Kubernetes 的轻量发行版，可用于中小规模企业生产；用户总数不是选择 K3s/K8s 的尺度，应以峰值并发、请求率、WebSocket/文件/音视频/AI 负载、Pod 和 Node 数、状态存储及容灾目标为准。生产起点应是 3 个 K3s server 组成 HA 控制面（embedded etcd 需奇数 quorum）、固定 API 入口、快速 SSD、备份/监控/告警，workload agent node 按实际容量扩展；AIFAR 初期可只将 JAR/web 无状态服务迁入 K3s，MySQL/Redis/MinIO 等状态服务保持现有成熟部署路径。
+- 问题：用户补充目标峰值负载为 1～3 万 QPS。
+- 结论：1～3 万 QPS 不会因 K3s 轻量化而成为调度层瓶颈，主要容量因素是这一 QPS 是外部 Gateway 请求还是内部微服务调用总和，以及平均/P99 延迟、响应大小、TLS、缓存命中率和数据库写入比例。以 30k QPS 估算，100ms 平均延迟约为 3000 个在途请求；10KB 平均响应约为 300MB/s（约 2.4Gbps）出站流量。应采用 3 server HA K3s、多 worker、多副本 Ingress/Gateway、反亲和与 HPA，并以真实请求混合做容量压测；当前单主机 `aifar-agent` Go ReverseProxy 链路不应在无压测情况下直接承诺 30k QPS。
+- 问题：用户询问在高并发生产中，K8s/K3s 服务与软件本身架构哪个更重要。
+- 结论：软件和数据架构是决定 10k～30k QPS 能否稳定的第一因素；K3s/K8s 解决的是部署、调度、自愈、滚动升级和扩缩容，无法自动消除本地 session/文件、数据库热点、慢 SQL、连接池耗尽、同步长链路、无界重试和缺少背压等问题。AIFAR 应先保证 Gateway 与 JAR 服务无状态、session/缓存共享、文件外置、数据库索引与连接池可控、超时/限流/熔断/幂等/异步化和全链路可观测，再用 K3s/K8s 安全地扩展这些已可水平扩展的单元。
+- 问题：用户尝试将选型简化为“几千用户用 aifar-agent，几万用户用 K3s”。
+- 结论：不应按用户总数划线；应按单机压测容量与余量、外部峰值 QPS/长连接/带宽、是否必须跨节点扩容、是否需节点故障自动迁移以及停机 SLO 决定。即使只有几百人，若为 7x24 关键系统也可应用 K3s；即使数万注册用户，若并发很低且单机有充足余量，aifar-agent 仍可用。但对已明确的 10k～30k 外部 QPS 目标，由于通常需多节点 Ingress/Gateway/业务副本和节点容灾，建议 K3s 作为生产执行面，而不是继续把单机 agent 扩张成多节点调度器。
+- 问题：用户询问是否建议亲自做一个简易版 Kubernetes，以及原因。
+- 结论：建议做“有严格边界的单机 Kubernetes-like AIFAR Runtime”，用于学习并承载单机专用编排；不建议做通用或多节点 Kubernetes 替代品。第一阶段只做 image 驱动的 desired state、reconcile、Deployment/Pod、Service、Ingress、Config/Secret、LocalPath Volume、状态与事件；明确不做多节点 scheduler、跨主机网络、CSI、K8s API/CRD/Helm 兼容。对既定 10k～30k QPS、多节点容灾的生产目标，应以 K3s 为执行面，AIFAR 保留面板控制面、任务、审计和 Runtime Driver 适配。
+- 问题：用户确认自研简易编排工具是否适合作为灾备，但不应发展成跨节点集群工具。
+- 结论：可以定位为单机应急恢复、离线运行或降级运行时，通过镜像、资源声明、配置、密钥引用和数据备份在备用服务器重建服务；它不等同于节点故障后的自动迁移和集群级容灾。生产主链路若使用 K3s，完整灾备仍应采用 K3s 集群备份/恢复或备用集群；自研 runtime 只宜承载经过演练的核心无状态服务和有限容量降级，MySQL/Redis/MinIO 等数据灾备由各自复制/备份机制负责。
+- 问题：用户追问为什么不推荐 Kubernetes。
+- 结论：澄清为推荐在多节点生产、自动故障迁移和 10k～30k QPS 场景使用 K3s/Kubernetes；不推荐的是自研简易 Kubernetes 去替代成熟集群。单机 AIFAR Runtime 与 K3s/Kubernetes 不是二选一：前者适合学习、离线单机和应急降级，后者适合正式多节点生产与集群级灾备。
+- 问题：用户确认是否可以根据 QPS 在自研工具、K3s 和 Kubernetes 之间选择。
+- 结论：三者可作为 AIFAR 的不同执行面，但不能只按 QPS 划线；至少同时评估单机压测余量、节点数、节点故障自动迁移、RTO/RPO、状态服务、网络/存储复杂度和运维团队能力。自研 runtime 适合单机/边缘/应急，K3s 适合多数中小型多节点生产，完整 Kubernetes 适合已有平台团队、复杂网络存储治理和大规模多集群场景；应用架构是否可水平扩展仍是前置条件。
+- 问题：用户询问客户没有两地三中心且服务器资源有限时如何做容灾。
+- 结论：需要先按客户实际可提供的服务器数量分层设计；资源受限时优先追求“可恢复”而非伪高可用，并将应用重建、K3s/控制面快照、数据库备份和备份介质隔离分别处理。待确认客户通常只有 1 台、2 台还是至少 3 台服务器后，再确定冷备、温备或同机房小型 HA 方案。
+- 问题：用户询问 `aifar-server` 不启动是否影响已经正常启动的服务使用。
+- 结论：仅 `aifar-server` 控制面停止时，已运行的业务容器、独立 systemd 服务和入口代理通常继续提供服务；`aifar-agent` 是独立 systemd 服务，会从本地 runtime spec 加载状态、每 15 秒 resync、监听 Docker events、维护 Service 代理和 Nacos proxy heartbeat，容器使用 `restart=unless-stopped`。受影响的是面板/API、任务、安装/更新/回滚/伸缩、状态采集、告警、审计和由 `aifar-server` 执行的 autoscale；正在执行的 worker 任务可能中断。前提是 Docker、`aifar-agent`、Nginx/Ingress、Nacos 和数据库等业务依赖仍正常，若整台宿主机停机则业务仍会中断。
+- 问题：用户询问本地 `keepalived-2.4.2.zip` 和 `keepalived-2.4.2.tar.gz` 源码包是否可直接应用到 Linux x86。
+- 结论：两个归档各有 476 个同名条目，都是 Keepalived 2.4.2 源码树，不含预编译 `keepalived` 二进制，也没有预生成的 `configure`；Linux x86_64 可在安装编译依赖后先运行 `./autogen.sh`，再执行 `./configure && make && make install`，不能把压缩包直接当安装包运行。32 位 i386/i686 需在实际目标系统单独编译验证。
+- 问题：用户追问 Keepalived 2.4.2 的 ZIP 包用途。
+- 结论：ZIP 与 tar.gz 是同一源码版本的两种下载格式，不是额外安装包；ZIP 主要方便 Windows 下载、浏览和解压，Linux 构建更推荐 tar.gz，因为更符合 Unix 工具链并能更可靠地保留权限等文件属性。二者无需同时保留或同时使用。
+- 问题：用户询问 Keepalived 是否只能在 Linux 上使用。
+- 结论：Keepalived 的原生运行平台是 Linux，依赖 Linux 内核的 netlink、IPVS、网络接口/VIP 和相关权限；Windows、macOS 不能原生运行。它可运行在 x86_64、ARM64 等 Linux 架构上，但 WSL、Docker Desktop 或普通容器因 VRRP 组播、VIP、raw socket 和 host network 限制，不宜直接作为生产高可用节点；非 Linux 平台应使用其原生 HA/NLB 方案或 Linux 虚拟机。
+- 问题：用户询问如何让 Keepalived 根据业务接口健康状态决定当前服务器是否绑定 VIP。
+- 结论：使用 `vrrp_script` 执行本地 HTTP 健康检查，并在 `vrrp_instance.track_script` 中无权重引用；Keepalived 2.4.2 默认 weight 0，连续 `fall` 次失败会使本节点进入 FAULT 并移除 VIP，连续 `rise` 次成功后恢复竞争。两台节点均需检查自身 `127.0.0.1` 或本机真实地址，不能检查 VIP；另用 `track_interface` 无权重跟踪承载 VIP 的网卡。主备应使用相同 virtual_router_id、VIP 和认证参数，不同本机/对端地址及 priority，并在目标 Linux 上先执行 `keepalived -t` 校验。
+- 问题：用户询问 Keepalived 2.4.2 能否自定义安装目录。
+- 结论：支持通过 Autoconf 标准参数 `--prefix`、`--sbindir`、`--sysconfdir`、`--localstatedir`、`--runstatedir` 自定义运行路径，并可用 `--with-systemdsystemunitdir` 指定 systemd 单元目录；生成的 unit 会引用配置阶段确定的 sbindir。生产更推荐把二进制放 `/opt/keepalived/<version>`，配置保留 `/etc/keepalived`、运行状态保留 `/run`、systemd unit 放系统标准目录。`DESTDIR` 只用于生成离线包的临时根目录，不会改变二进制编译进去的真实运行路径。
+- 问题：用户要求将 Keepalived 全部安装到 `/aifa/apps/keepalived/`。
+- 结论：可将 `--prefix`、`--sysconfdir`、`--localstatedir`、`--runstatedir`、samples 和 systemd unit 安装目录全部指向 `/aifa/apps/keepalived`，二进制默认位于 `sbin/keepalived`，配置位于 `etc/keepalived/keepalived.conf`。若仍需 systemctl 管理，必须在 systemd 搜索目录创建指向应用目录 unit 的软链接；若绝对不允许目录外产生文件，则只能直接启动 daemon，且系统动态库、内核能力和 journal 等外部依赖仍不能随 prefix 一并封装。需注意用户路径为 `/aifa` 而非仓库惯用的 `/aifar`。
+- 问题：用户要求提供可直接运行、将 Keepalived 安装到 `/aifa/apps/keepalived` 的 Bash 脚本。
+- 结论：脚本安全边界已确定为不使用上游示例配置自动启动服务，避免误绑定示例 VIP；待确认目标 Linux 是否能通过 apt/dnf/yum 在线安装编译依赖，之后再决定一键在线安装或离线依赖校验/本地包模式。
+- 问题：用户确认目标环境纯离线，但具备 Keepalived 编译依赖和离线操作系统 ISO。
+- 结论：安装脚本应采用 ISO 本地仓库模式，全程禁止访问公网；挂载 ISO、临时配置本地 RPM/DEB 软件源、安装编译依赖后再编译 Keepalived，且不得覆盖现有系统仓库配置。待确认目标 Linux 发行版与版本，以选择 RPM 或 DEB 实现。
+- 问题：用户确认目标 Linux 发行版为 openEuler。
+- 结论：脚本范围收敛为 openEuler 的 RPM/DNF 离线 ISO 仓库安装，不实现 Debian/Ubuntu 分支；仍需确认具体 openEuler LTS/SP 版本，以适配 ISO 仓库结构和实际可用的 devel 包名。
+- 问题：用户确认目标版本为 openEuler 24.03 LTS SP3。
+- 结论：离线安装脚本将仅支持 openEuler 24.03 LTS SP3/x86_64，并接受 ISO 文件或已挂载目录作为参数；通过扫描 `repodata/repomd.xml` 动态建立仅本次 DNF 命令可见的临时仓库，不写入或覆盖 `/etc/yum.repos.d`。安装 Keepalived 到 `/aifa/apps/keepalived`，保留现有活动配置，不使用上游 sample 启动服务，验证二进制和 unit 后再提示用户配置与启用。
+- 问题：用户进一步要求安装脚本零参数运行，只执行 `bash install-keepalived-offline.sh`。
+- 结论：已在仓库根目录新增 `install-keepalived-offline.sh`。脚本自动从同目录读取 `keepalived-2.4.2.tar.gz`，优先发现已挂载且包含 repodata 的 ISO，否则只读挂载同目录唯一 ISO；仅用 DNF `--disablerepo=*` 与 `--repofrompath` 安装依赖，安装到 `/aifa/apps/keepalived`，安全注册 systemd link，不覆盖已有其他 unit，不复制 sample 为活动配置且不自动启动服务。Bash 语法、零参数保护、离线/清理/路径契约、LF 与 diff 检查通过，`pnpm test:scripts` 47/47 通过；当前 Windows 环境未执行真实 openEuler 安装。
+- 问题：用户澄清 openEuler ISO 已挂载且可直接使用 DNF，并纠正安装目录为 `/aifar/apps/keepalived`。
+- 结论：脚本原有逻辑已经优先发现已挂载的 iso9660/repodata 仓库，因此服务器上无需再放 ISO 文件，只需脚本和 `keepalived-2.4.2.tar.gz` 同目录。已将唯一安装根变量从误写的 `/aifa/apps/keepalived` 修正为 `/aifar/apps/keepalived`，所有 prefix、配置、运行目录和 systemd unit 路径随之统一更新；路径回归、Bash 语法、diff 检查通过，`pnpm test:scripts` 47/47 通过。
+- 问题：用户授权连接 `192.168.74.132` 安装并测试 Keepalived。
+- 结论：SSH 只读预检确认目标为 openEuler 24.03 LTS SP3 x86_64、SELinux Permissive、根分区可用约 7.3GiB、未安装或运行 Keepalived，也没有冲突 unit；但服务器实际没有 iso9660 挂载、没有本地 ISO/repodata 或缓存依赖 RPM，`/etc/yum.repos.d/openEuler.repo` 的启用仓库全部指向公网 HTTPS。为遵守用户此前的纯离线约束，未执行 DNF 安装、上传或远端变更，待用户选择允许公网 DNF 或先真正挂载 ISO。SSH 密码未写入 memory，临时本地连接辅助文件已清理。
+- 问题：用户选择允许目标服务器使用现有公共 openEuler DNF 仓库，并要求继续安装测试 Keepalived。
+- 结论：已在 `192.168.74.132` 从源码编译并安装 Keepalived 2.4.2 到 `/aifar/apps/keepalived`；DNF 安装编译依赖时同时将 OpenSSL 和 systemd 相关 6 个系统包更新到当前 SP3 update 版本。独立验收确认版本、动态库、依赖、systemd unit 链接和临时配置解析正常；服务保持 inactive，未创建正式 `keepalived.conf`，因此未绑定 VIP。远端上传暂存目录和本地临时 SSH 辅助文件均已清理。
+- 问题：用户确认在 `192.168.74.132` 的 `ens160` 上使用 VIP `192.168.74.130/24`，先只监测网卡状态。
+- 结论：已形成并提交单节点 MASTER 配置设计 `docs/superpowers/specs/2026-07-17-keepalived-single-node-vip-design.md`；配置前检查 VIP 冲突，语法通过后才启动，失败则停止并恢复。单节点只能管理本机 VIP，服务器宕机时没有 BACKUP 节点接管。
+- 问题：用户批准单节点 VIP 设计并要求继续实施。
+- 结论：已形成并提交实施计划 `docs/superpowers/plans/2026-07-17-keepalived-single-node-vip.md`，包括 VIP 冲突预检、精确配置、语法门禁、启用启动、15 秒 VIP 验收、失败回滚和临时目录清理；待用户选择当前会话直接执行或使用子任务执行。
+- 问题：用户选择当前会话执行单节点 VIP 配置。
+- 结论：远端预检确认 `ens160` UP、VIP `192.168.74.130` 未绑定且 ARP 3 次探测 0 响应。首次暂存配置的语法检查因把 VRRP 自身接口 `ens160` 重复写入 `track_interface` 返回状态 5；Keepalived 会自动跟踪自身接口，该块应移除。事务脚本已回滚并复验：正式配置和 VIP 不存在，服务保持 inactive，unit 仍为 linked；待用户批准这一技术修正后继续。
+
+## 2026-07-18
+- 问题：用户要求无论如何在 `192.168.74.132` 启动 Keepalived，并使用 VIP `192.168.74.130`。
+- 结论：移除冗余的 `track_interface ens160` 后，配置语法检查通过；已创建 root:root/0600 的正式配置，启用并启动 Keepalived 2.4.2。独立验收确认服务 enabled/active、主子进程正常、`ens160` 唯一绑定 `192.168.74.130/24`、本机和当前 Windows 主机 ping 均 2/2 成功、日志显示实例进入 MASTER 并发送 gratuitous ARP；临时远端目录和本地 SSH 辅助文件已清理。单节点仍不具备服务器宕机后的 VIP 漂移能力。
+- 问题：用户询问如何在服务器上手动重启和关闭 Keepalived。
+- 结论：日常操作使用 `systemctl restart|stop|start|status keepalived`；`stop` 会移除 VIP，`start/restart` 后 VIP 会重新出现。修改配置后应先用自定义安装目录中的二进制执行 `-t -f` 语法检查。非标准目录 unit 不建议随意执行单独的 `systemctl disable`，因为可能移除 unit link。
+- 问题：用户希望根据 132/133 的 `/health/aggregate` 接口状态实现 VIP 漂移。
+- 结论：从当前 Windows 主机实测，132 接口返回 HTTP 200，JSON 为 `status=UP, up=true`；133 接口连接 5 秒超时。建议每台 Keepalived 只检查本机接口，并同时要求 HTTP 2xx 与 JSON `up=true`，避免接口返回 200 但聚合状态异常时继续持有 VIP；待用户确认健康判定规则后设计双节点配置。
+- 问题：用户明确要求在 132/133 部署 Keepalived；两端都健康时 132 持有 VIP，132 失败时漂移到 133，132 恢复后自动切回。
+- 结论：推荐双节点 unicast VRRP，每台只检查本机 `/health/aggregate`，同时要求 HTTP 2xx 和 JSON `up=true`；132/133 优先级分别 150/100，默认 preempt 保证 132 恢复后抢回 VIP。两端都失败时应无人持有 VIP。不要让两节点各自检查两个地址并自行仲裁，否则非对称网络故障可能导致判断不一致或双主。实施前需确认 133 的接口名和 SSH 凭据。
+- 问题：用户批准执行双节点健康检查与 VIP 漂移方案。
+- 结论：已形成并提交 `docs/superpowers/specs/2026-07-18-keepalived-dual-node-health-vip-design.md`，明确两端 BACKUP 启动、unicast VRRP、132/133 优先级 150/100、本机 HTTP 2xx + JSON `up=true` 检查、失败漂移、默认抢占回切、双端失败无 VIP、配置回滚及受控停止 132 Keepalived 的漂移验收。待用户审核书面设计后编写实施计划；实施仍需要 133 的 root SSH 凭据。
+- 问题：用户审核设计后要求继续。
+- 结论：已形成并提交 `docs/superpowers/plans/2026-07-18-keepalived-dual-node-health-vip.md`。计划先验证 133 本机健康和凭据，再按需安装 2.4.2；两端脚本/配置同时校验，使用 133 hold 标记避免切换时短暂双主，按 peer 限定 VRRP 防火墙规则，最后停止/恢复 132 Keepalived 验证漂移和自动回切，并在任何双主或失败时恢复 132 单节点配置。
+- 问题：用户选择当前会话直接执行双节点部署。
+- 结论：执行前仍缺少 133 的 root SSH 凭据确认，尚未连接或修改 133；不得猜测 132 密码可用于 133，待用户确认是否相同或提供 133 凭据。
+- 问题：用户确认 133 使用与 132 相同的 root 密码，并要求当前会话执行。
+- 结论：133 SSH 与主机密钥固定通过，openEuler 24.03 LTS-SP3/x86_64、`ens160=192.168.74.133/24` 正常；但从 133 本机访问 `127.0.0.1:38000` 和 `192.168.74.133:38000` 均立即 connection refused，`ss` 无 38000 监听，Docker 容器为空，`aifar-agent` 仅监听 127.0.0.1:18081 且 `/var/lib/aifar-agent` 无运行时文件。按双节点计划的健康门禁停止，尚未安装或修改 Keepalived；需要先部署 133 的业务运行时，或由用户明确接受先配置但 133 保持 FAULT、暂时不能接管 VIP。
+- 问题：用户选择在 133 健康接口尚不可用时仍先完成双节点 Keepalived 部署。
+- 结论：已在 133 安装 Keepalived 2.4.2 到 `/aifar/apps/keepalived`，DNF 同步升级 OpenSSL/systemd 相关系统包；132/133 已配置 unicast VRRP、本机 HTTP 2xx + JSON `up=true` 健康检查及仅允许对端的 VRRP 防火墙规则，优先级分别为 150/100。最终验收确认两端服务均 enabled/active、配置解析通过，132 健康并唯一持有 `192.168.74.130/24`，Windows ping 2/2 成功；133 因 38000 未监听而健康检查失败且不持有 VIP。实际漂移和自动回切测试按用户批准延期，需等 133 接口恢复后执行；132 原配置备份为 `/aifar/apps/keepalived/etc/keepalived/keepalived.conf.aifar-backup-20260718032758`，远端和本地临时执行文件均已清理。
+- 问题：用户要求把 Keepalived 安装脚本和 2.4.2 源码 tar.gz 纳入工程发布包，并新增卸载脚本和 SELinux 脚本。
+- 结论：现有发布流程只默认收录 `resources`、`config` 和平台启动文件；建议创建 Linux-only `extras/keepalived/` 模块并由 `package-release.mjs` 显式复制到 Linux 发布包，避免 Windows 包携带 Linux 工具。源码包已核验大小 6,350,291 bytes、SHA256 `76397ad758ae871dfa713b9fc6b4ead754db7964809a3969e40c2d288bc3460b`。实施前需确认 SELinux 脚本是安全地保留 Enforcing 并配置标签/策略，还是修改系统 SELinux 模式；推荐前者，禁止默认关闭 SELinux。
+- 问题：用户选择 SELinux 生产安全方案。
+- 结论：SELinux 脚本必须保持 `Enforcing`，仅为 `/aifar/apps/keepalived` 自定义安装树配置持久文件标签和必要策略，不得切换 Permissive 或关闭 SELinux。
+- 问题：用户选择 Keepalived 安全卸载策略。
+- 结论：卸载脚本必须先将配置、健康检查脚本和必要元数据备份到 `/aifar/backups/keepalived-<timestamp>/`，校验备份成功后再停止/禁用服务、移除属于该自定义安装的 unit link 和 `/aifar/apps/keepalived`；不得卸载共享 DNF 依赖，也不得删除无法确认归属的防火墙规则。
+- 问题：用户批准 Keepalived Linux-only 发布工具设计。
+- 结论：设计已固化并提交为 `docs/superpowers/specs/2026-07-18-keepalived-release-tools-design.md`（commit `63722d042`）：新增 `extras/keepalived/` 六项工件，仅进入 Linux 发布包；安装脚本固定校验 2.4.2 源码包，不自动启用服务；SELinux 脚本保持 Enforcing 并复用发行版策略标签；卸载先备份再精确删除，不移除共享 RPM、未知归属防火墙规则或备份。待用户审核书面设计后编写实施计划。
+- 问题：用户审核设计后要求继续。
+- 结论：已编写并提交 `docs/superpowers/plans/2026-07-18-keepalived-release-tools.md`（commit `69d0dc794`），分为固定源码与安装器、SELinux 适配、安全卸载与文档、Linux-only 发布集成、完整发布验收五个测试先行任务；待用户选择当前会话内联执行或显式授权子代理执行。
+- 问题：用户选择当前会话内联实现 Keepalived 发布工具。
+- 结论：已新增 `extras/keepalived/` 六项工件并完成提交：固定 Keepalived 2.4.2 源码包、`SHA256SUMS`、零参数安装脚本、保持 Enforcing 的 SELinux 标签脚本、先备份到 `/aifar/backups/keepalived-<UTC timestamp>/` 再精确卸载的脚本和 README；`package-release.mjs` 仅把该模块放入 Linux 包，Windows 排除。Windows bsdtar 不保留 `chmodSync` 执行位的问题已通过流式 tar 头部模式/校验和归一化修复，真实 Linux 归档内三脚本均为 0755。`pnpm test:scripts` 57/57、前端 161 项、后端测试、构建、两平台打包及 2969/2962 文件和归档校验全部通过；首次完整门禁因进程继承不可写 `D:\tools\gocache` 失败，改用工作区 `.cache/go-build` 后复验通过。源码包最终大小 6,350,291 bytes、SHA256 `76397ad758ae871dfa713b9fc6b4ead754db7964809a3969e40c2d288bc3460b`。
+- 问题：用户要求把工程所有安装服务的 SELinux 规则汇总为一个可直接执行的 shell 脚本。
+- 结论：源码盘点确认当前后端自注册安装模块为 AIFAR、Docker、MySQL、MySQL Router、Redis、MinIO、Nacos，另有 Linux-only Keepalived 和尚未纳入正式发布的 HTTPS ingress；现有公共 SELinux helper 已覆盖 Docker/MySQL/Router/Redis/MinIO/AIFAR 动态端口，但 Nacos 仅配置防火墙，Keepalived 使用独立持久标签脚本。实施前需确认汇总脚本是否包含尚未正式发布的 HTTPS ingress；推荐覆盖正式发布服务并跳过未安装项。
+- 问题：用户选择 SELinux 汇总脚本覆盖正式服务并包含 HTTPS ingress。
+- 结论：推荐采用混合探测方案：零参数执行时识别已安装 unit、配置和运行时端口，按服务白名单应用持久 `semanage port/fcontext` 与 `restorecon`；缺失服务跳过，配置存在但解析失败则明确失败，不使用 AVC 自动生成宽泛策略，不关闭或降级 SELinux。HTTPS ingress 的 Docker bind mount 需配置持久容器可读标签；规则变更必须记录，后续支持精确卸载或回滚。
+- 问题：用户确认所有服务 SELinux 汇总脚本的混合探测设计。
+- 结论：已编写、自检并单独提交 `docs/superpowers/specs/2026-07-18-aifar-all-services-selinux-design.md`（commit `f5d614dbd`）。设计固定零参数、Linux-only、正式服务加 HTTPS ingress、严格白名单探测、持久端口/文件标签、当前事务回滚、运行中 ingress 私有 MCS 标签保护、服务不重启以及逐服务汇总；待用户审核书面设计后再编写实施计划。
+- 问题：用户审核 SELinux 汇总脚本设计后要求继续。
+- 结论：已编写、自检并单独提交 `docs/superpowers/plans/2026-07-18-aifar-all-services-selinux.md`（commit `659307cc8`）。计划分为脚本契约/预检、事务与回滚核心、十组件白名单适配、Linux-only 文档与打包、完整本地发布门禁五个测试先行任务；目标服务器执行仍是单独的受控变更，需在最终脚本审核后明确授权。
+- 问题：用户选择在当前会话内联执行所有服务 SELinux 汇总脚本计划。
+- 结论：执行审查确认当前是普通检出而非 linked worktree，分支为 `codex/status-collector-realtime`，且存在用户未提交的 HTTPS ingress 参考文件；按隔离流程，实施前需用户选择原地继续或新建 worktree。本机 `bash.exe` 指向未安装 Linux 发行版的 WSL，因此不能声称已运行本地动态 Bash 测试，实施验收需区分 Node 静态/假状态测试、发布归档检查和后续经授权的真实 Linux 验证。
+- 问题：用户选择在当前分支原地完成所有安装服务的 SELinux 汇总脚本、文档、测试和 Linux 发布包集成。
+- 结论：已新增零参数 `extras/selinux/configure-all-selinux.sh` 与 README，覆盖 Docker/aifar-agent、AIFAR Runtime、MySQL/Router、Redis/Sentinel/Cluster、MinIO、Nacos、Keepalived 和可选 HTTPS ingress；脚本保持 SELinux 模式、不管理服务/防火墙、使用白名单探测和当前事务回滚，并保护运行中 ingress 的私有 MCS 标签。Linux 发布包包含脚本且 tar 权限为 0755，Windows 包排除；提交为 `93449a43`、`f3815f56`。Git Bash 语法检查、19 个专项测试、77 个脚本测试及完整 `pnpm test:local` 均通过，发布校验复验 Linux 2971/Windows 2962 个文件和两份归档；尚未在真实 openEuler 主机执行该新脚本。
+- 问题：用户询问尚未安装任何 AIFAR 应用时运行全服务 SELinux 脚本会产生什么效果。
+- 结论：若主机没有任何受识别目录、unit、AIFAR 容器或 agent，脚本只执行平台/root/SELinux 预检，按需通过现有 DNF 仓库安装 SELinux 管理工具，创建 `/var/lib/aifar-selinux/transactions/<timestamp-pid>/journal.tsv`，所有组件显示 `SKIPPED`，不新增端口或文件标签且不改变 SELinux 模式、服务和防火墙。当前 Docker 探测也接受通用 `docker.service/containerd.service`，Keepalived 探测接受通用 `keepalived.service`；因此系统预装 Docker 可能触发 Docker 端口处理，系统 Keepalived 可能因不属于 `/aifar/apps/keepalived` 而失败，不能把“没有 AIFAR 应用”等同于绝对无效果。
+- 问题：用户询问能否先临时 `setenforce 0` 安装全部应用，再运行 SELinux 汇总脚本并通过重启使规则生效。
+- 结论：可以在维护窗口临时 Permissive 安装，但汇总脚本会保留 Permissive，不会自动恢复 Enforcing；`semanage port/fcontext` 和 `restorecon` 在脚本成功时已立即且持久生效，不依赖重启。正确收口是脚本成功后先 `setenforce 1`，检查服务健康和 AVC，再逐服务重启或受控重启主机，使安装期间启动的进程按新可执行文件标签重新进入正确 SELinux 域；重启是最终验收，不是规则生效条件。Nacos 没有自动添加端口类型或自定义策略，切回 Enforcing 后尤其要检查 AVC，禁止直接用 `audit2allow` 生成宽泛策略。
+- 问题：用户手动安装 Keepalived 2.4.2 后询问是否需要创建正式配置，以及 132/133 双节点如何配置。
+- 结论：安装器故意不复制 sample 或启动服务；需在两端先创建 root:root 0750 的本机 HTTP 2xx + JSON `up=true` 健康脚本，再分别写 unicast VRRP 配置：两端均 BACKUP、virtual_router_id 130、132/133 优先级 150/100、VIP `192.168.74.130/24`、对端单播、track_script weight 0、默认抢占回切。两端配置均通过 `keepalived -t` 后，按 peer 精确放行 VRRP 协议 112，先启动 132 再启动 133。安装日志中的 awk `\.` warning 来自独立 Keepalived SELinux helper 用 `awk -v` 读取转义 fcontext 模式，首次运行已成功应用标签但旧脚本不宜反复执行；新增脚本后可直接 `restorecon`，后续应修正 helper 的字面量查询。
+- 问题：用户要求把健康检查脚本和正式 Keepalived 配置加入工程，并让安装流程启动服务。
+- 结论：现有模块测试和 README 明确禁止安装器生成配置或启动服务，因此这是已批准设计的行为变更；同一静态配置不能同时用于 132/133，建议工程保存节点配置并由安装器按本机 IP 精确选择，健康失败时服务可以 active 但 VRRP 实例保持 FAULT。实施前需确认该工程包是否继续固定当前 132/133/VIP 130/ens160 环境，还是改为参数化配置流程。
+- 问题：用户选择把 Keepalived 工程包改为通用配置，而不是固定 132/133/VIP 130 环境。
+- 结论：通用方案需要在生成正式配置前显式提供本机 IP、对端 IP、VIP/CIDR、接口、优先级、virtual router id 和健康 URL；当前待确认输入契约是继续保持零参数安装器并读取同目录配置文件，还是改用 CLI 参数，或同时支持两者。
+- 问题：用户选择通过安装器同目录的 `keepalived.env` 提供通用参数，并保持安装器零参数调用。
+- 结论：安装器将严格解析固定白名单键而不是直接 source 配置文件，校验 IP/CIDR、接口、本机地址、优先级和 virtual router id 后生成正式配置；下一项待确认是健康接口失败时安装器应仍启动 active/FAULT 并等待自动恢复，还是安装失败且保持服务停止。
+- 问题：用户选择 Keepalived 安装时即使健康接口失败也继续启动服务。
+- 结论：安装成功条件以 systemd 服务 active 和配置语法正确为准；健康失败时 VRRP 实例保持 FAULT、不绑定 VIP，接口恢复后自动重新参与选举。下一项待确认安装器是否自动管理 firewalld 中对端限定的 VRRP 协议 112 规则。
+- 问题：用户选择由 Keepalived 安装器自动管理 firewalld 的 VRRP 放行规则。
+- 结论：仅在 firewalld 运行时添加来源为对端 IP、协议为 VRRP/112 的精确规则，并持久记录规则归属；卸载或当前安装事务回滚时只删除本模块实际创建且仍匹配记录的规则，不碰用户或其他服务已有规则。
+- 问题：用户选择 Keepalived 安装器重复运行时自动更新已有配置。
+- 结论：更新前备份现有正式配置和模块管理状态，按当前 `keepalived.env` 重新生成并验证，成功后重启；任一步失败都恢复旧配置、防火墙规则和安装前服务状态，保证可重复执行且可回退。
+- 问题：用户选择 Keepalived 通用配置与启动功能的实现结构。
+- 结论：采用单一零参数安装入口：`install-keepalived-offline.sh` 直接读取同目录 `keepalived.env`，完成严格解析、配置生成、健康脚本安装、精确 firewalld 管理、配置校验、服务启动及事务回滚，不增加独立配置入口或 systemd 启动时动态生成。
+- 问题：用户确认 Keepalived 通用配置工程的文件结构。
+- 结论：工程新增 `keepalived.env.example`、`keepalived.conf.tpl` 和正式健康脚本；安装器生成服务器端正式配置与健康 URL 文件，卸载器精确清理自有防火墙规则，SELinux helper 同步修复 awk 转义警告，README、校验清单和 Linux 发布权限同步维护。
+- 问题：用户确认 Keepalived 通用配置字段和校验契约。
+- 结论：每节点必填本机 IP、对端 IP、VIP/CIDR、接口、优先级、VRID 和本机健康 URL；安装器使用白名单解析而非 source，严格校验字段及接口归属。两端均 BACKUP、默认抢占，健康参数固定为 interval 2、timeout 3、fall 3、rise 2、weight 0，健康 URL 仅允许指向本机或 loopback。
+- 问题：用户确认 Keepalived 安装、启动、防火墙所有权和事务回滚设计。
+- 结论：安装器预检和备份后生成并验证临时配置，应用 SELinux，按接口 zone 精确管理对端 `/32` 的 runtime/permanent VRRP 规则，再原子替换配置并 enable/start 服务；健康失败仅告警。任何失败恢复旧文件、规则和原 active/enabled 状态，卸载只删除有归属记录的规则。
+- 问题：用户批准 Keepalived 通用配置、健康检查和自动启动的完整设计。
+- 结论：设计已固化为 `docs/superpowers/specs/2026-07-19-keepalived-managed-config-start-design.md` 并单独提交（commit `d4c769dd`），覆盖零参数 `keepalived.env` 契约、模板渲染、本机 2xx/up=true 健康检查、BACKUP/默认抢占、对端限定 VRRP 防火墙所有权、重复安装事务回滚、SELinux awk 警告修复及测试验收；待用户审核书面设计后再编写实施计划。
+- 问题：用户审核 Keepalived 通用配置与自动启动设计后要求继续。
+- 结论：已编写、自检并单独提交 `docs/superpowers/plans/2026-07-19-keepalived-managed-config-start.md`（commit `7f0f2c72`）。计划分为通用配置契约与模板、严格健康检查、配置解析渲染、备份安全启动、精确 firewalld 所有权、SELinux/文档/发布收口六个测试先行任务，并包含完整本地发布门禁；真实 openEuler 双节点执行仍需在本地实现完成后单独明确授权。
+- 问题：用户选择用子代理分任务执行 Keepalived 通用配置与自动启动实施计划。
+- 结论：将按 SDD 流程为六个任务依次派发实现代理并执行逐任务规格/质量复核，禁止并行实现；当前检出是普通工作区而非 linked worktree，且有用户未提交文件，`.worktrees`/`worktrees` 均不存在也未配置忽略，实施前需用户确认是否创建隔离 worktree。
