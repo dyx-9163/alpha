@@ -96,13 +96,13 @@ sudo ./uninstall-systemd.sh
 
 ## 防火墙
 
-firewalld 环境：
+`install-systemd.sh` 默认会在 firewalld 中默认路由网卡所属的 zone（无法识别时使用默认 zone）同时、幂等地放行 HTTP/HTTPS（运行时和永久配置），且不会 reload、删除或覆盖已有规则。若自动识别结果不符合实际入口网卡，可在 `config.env` 中指定：
 
 ```bash
-sudo firewall-cmd --permanent --add-service=http
-sudo firewall-cmd --permanent --add-service=https
-sudo firewall-cmd --reload
+AIFAR_HTTPS_FIREWALL_ZONE=public
 ```
+
+若防火墙由外部系统统一管理，可设置 `AIFAR_HTTPS_CONFIGURE_FIREWALL=0` 关闭自动配置；此时需自行放行 TCP `80`、`443`。卸载脚本不会关闭 HTTP/HTTPS，避免误删安装前已有或其他服务共用的规则。
 
 建议在公网安全组或防火墙中禁止直接访问 `8080`、`38000`，只开放 `80`、`443`。
 

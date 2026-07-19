@@ -18,6 +18,7 @@ const requiredFiles = [
   'stop.sh',
   'reload.sh',
   'status.sh',
+  'configure-firewall.sh',
   'install-systemd.sh',
   'uninstall-systemd.sh',
   'aifar-https-ingress.service',
@@ -73,6 +74,29 @@ test('systemd scripts install an absolute-path oneshot service ordered after Doc
   assert.match(install, /systemctl enable --now "\$UNIT_NAME"/)
   assert.match(uninstall, /UNIT_NAME="aifar-https-ingress\.service"/)
   assert.match(uninstall, /systemctl disable --now "\$UNIT_NAME"/)
+})
+
+test('systemd installation opens HTTP and HTTPS without reloading or replacing firewall rules', () => {
+  const config = read('config.env')
+  const firewall = read('configure-firewall.sh')
+  const install = read('install-systemd.sh')
+
+  assert.match(config, /AIFAR_HTTPS_CONFIGURE_FIREWALL=1/)
+  assert.match(install, /"\$ROOT\/configure-firewall\.sh"/)
+  assert.match(firewall, /firewall-cmd --state/)
+  assert.match(firewall, /--add-service="?\$service"?/)
+  assert.match(firewall, /--permanent/)
+  assert.match(firewall, /for service in http https/)
+  assert.doesNotMatch(firewall, /--reload/)
+  assert.doesNotMatch(firewall, /--remove-/)
+})
+
+test('firewall configuration selects the zone attached to the default route interface', () => {
+  const firewall = read('configure-firewall.sh')
+
+  assert.match(firewall, /ip route show default/)
+  assert.match(firewall, /firewall-cmd --get-zone-of-interface="\$interface"/)
+  assert.doesNotMatch(firewall, /firewall-cmd --get-active-zones/)
 })
 
 test('bundled bootstrap certificate and private key match and cover aifar.local', () => {
