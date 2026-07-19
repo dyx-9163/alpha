@@ -844,6 +844,9 @@ verify_source_archive() {
         sha256sum --check "$checksum_file"
     ) || die "Keepalived 源码包 SHA256 校验失败"
     [[ "$(stat -c '%s' "$SOURCE_ARCHIVE")" == "6350291" ]] || die "Keepalived 源码包大小不匹配"
+}
+
+verify_source_archive_contents() {
     tar -tzf "$SOURCE_ARCHIVE" >/dev/null || die "源码包损坏或不是有效的 tar.gz：$SOURCE_ARCHIVE"
 }
 
@@ -860,13 +863,14 @@ install_build_dependencies() {
         systemd-devel
         curl
         python3
+        tar
     )
 
     log "使用服务器当前启用的 DNF 仓库安装编译依赖"
     dnf --assumeyes --setopt=install_weak_deps=False --setopt=keepcache=False install "${packages[@]}"
 
     local command_name
-    for command_name in gcc make autoconf automake autoreconf aclocal pkg-config curl python3; do
+    for command_name in gcc make autoconf automake autoreconf aclocal pkg-config curl python3 tar; do
         require_command "$command_name"
     done
 }
@@ -1043,7 +1047,7 @@ main() {
 
     validate_platform
 
-    for command_name in awk cp date dirname dnf find grep install ip ldd ln mountpoint mv readlink rm sha256sum sort stat systemctl tar xargs; do
+    for command_name in awk cp date dirname dnf find grep install ip ldd ln mountpoint mv readlink rm sha256sum sort stat systemctl xargs; do
         require_command "$command_name"
     done
 
@@ -1058,6 +1062,7 @@ main() {
     capture_service_state
     create_install_backup
     install_build_dependencies
+    verify_source_archive_contents
     build_and_install_keepalived
     register_systemd_unit
     install_managed_configuration "$WORK_DIR/keepalived.conf"

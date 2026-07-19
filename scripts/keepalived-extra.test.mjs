@@ -113,6 +113,24 @@ test('installer verifies source and requires managed configuration before build'
   assert.doesNotMatch(installer, /cp\s+.*keepalived\.conf\.sample.*keepalived\.conf/)
 })
 
+test('installer bootstraps tar from offline DNF after safe preflight validation', () => {
+  const installer = read('install-keepalived-offline.sh')
+  const mainStart = indexOfOrFail(installer, '\nmain() {')
+  const mainBody = installer.slice(mainStart, installer.indexOf('\nif [[ "${BASH_SOURCE[0]}" == "$0" ]]'))
+  const initialCommands = mainBody.match(/for command_name in ([^;]+); do/)?.[1] ?? ''
+  const dependencyStart = indexOfOrFail(installer, 'install_build_dependencies()')
+  const dependencyEnd = indexOfOrFail(installer.slice(dependencyStart), '\n}') + dependencyStart
+  const dependencyBody = installer.slice(dependencyStart, dependencyEnd)
+
+  assert.doesNotMatch(initialCommands, /(?:^|\s)tar(?:\s|$)/)
+  assert.match(dependencyBody, /local -a packages=\([\s\S]*\n\s+tar(?:\n|\s)/)
+  assert.match(dependencyBody, /for command_name in [^;]*\btar\b[^;]*; do/)
+  assert.ok(indexOfOrFail(mainBody, 'verify_source_archive') < indexOfOrFail(mainBody, 'parse_node_config "$NODE_CONFIG"'))
+  assert.ok(indexOfOrFail(mainBody, 'validate_node_config') < indexOfOrFail(mainBody, 'install_build_dependencies'))
+  assert.ok(indexOfOrFail(mainBody, 'install_build_dependencies') < indexOfOrFail(mainBody, 'verify_source_archive_contents'))
+  assert.ok(indexOfOrFail(mainBody, 'verify_source_archive_contents') < indexOfOrFail(mainBody, 'build_and_install_keepalived'))
+})
+
 test('SELinux script preserves mode and manages persistent distribution-derived labels', () => {
   const script = read('configure-selinux.sh')
   assert.match(script, /getenforce/)
