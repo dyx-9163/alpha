@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-readonly DEFAULT_HEALTH_URL_FILE="/aifar/apps/keepalived/etc/keepalived-health-url"
+readonly DEFAULT_HEALTH_URL_FILE="/aifar/apps/keepalived/etc/keepalived/keepalived-health-url"
 readonly MAX_HEALTH_RESPONSE_BYTES=65536
 
 validate_health_url_shape() {

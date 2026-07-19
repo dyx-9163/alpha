@@ -167,7 +167,7 @@ function runMainHarness(t) {
 set -Eeuo pipefail
 source '${toMsysPath(healthScriptPath)}'
 check_health() {
-    [[ "\$1" == '/aifar/apps/keepalived/etc/keepalived-health-url' ]]
+    [[ "\$1" == '/aifar/apps/keepalived/etc/keepalived/keepalived-health-url' ]]
 }
 main
 if main unexpected; then
