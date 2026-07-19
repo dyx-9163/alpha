@@ -83,6 +83,7 @@ test('installer verifies source and requires managed configuration before build'
     'render_keepalived_config',
     'capture_service_state',
     'create_install_backup',
+    'install_build_dependencies',
     'build_and_install_keepalived',
     'register_systemd_unit',
     'install_managed_configuration',
@@ -102,6 +103,8 @@ test('installer verifies source and requires managed configuration before build'
   assert.match(installer, /rm -rf -- "\$APP_ROOT"/)
   assert.match(installer, /ln -s -- "\$UNIT_LINK_TARGET" "\$UNIT_LINK"/)
   assert.match(installer, /mountpoint -q "\$WORK_DIR"/)
+  assert.match(installer, /die "keepalived\.service 启动失败"/)
+  assert.match(installer, /log "WARNING: 健康检查当前不可用；服务保持 active，VRRP 实例将保持 FAULT"/)
   assert.doesNotMatch(installer, /cp\s+.*keepalived\.conf\.sample.*keepalived\.conf/)
 })
 

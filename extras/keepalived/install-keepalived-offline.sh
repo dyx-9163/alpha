@@ -203,6 +203,21 @@ rollback_install_transaction() {
         }
     fi
 
+    systemctl daemon-reload || {
+        printf '[keepalived-installer] ERROR: 回滚时 systemd daemon-reload 失败\n' >&2
+        rollback_status=1
+    }
+    if [[ "$SERVICE_WAS_ENABLED" -eq 1 ]]; then
+        systemctl enable keepalived.service || rollback_status=1
+    else
+        systemctl disable keepalived.service || rollback_status=1
+    fi
+    if [[ "$SERVICE_WAS_ACTIVE" -eq 1 ]]; then
+        systemctl restart keepalived.service || rollback_status=1
+    else
+        systemctl stop keepalived.service || rollback_status=1
+    fi
+
     if [[ -e "$UNIT_LINK" || -L "$UNIT_LINK" ]]; then
         current_unit_target="$(readlink -f -- "$UNIT_LINK" 2>/dev/null || true)"
         current_unit_value="$(readlink -- "$UNIT_LINK" 2>/dev/null || true)"
@@ -227,21 +242,10 @@ rollback_install_transaction() {
             rollback_status=1
         fi
     fi
-
     systemctl daemon-reload || {
-        printf '[keepalived-installer] ERROR: 回滚时 systemd daemon-reload 失败\n' >&2
+        printf '[keepalived-installer] ERROR: 回滚恢复 unit 链接后 systemd daemon-reload 失败\n' >&2
         rollback_status=1
     }
-    if [[ "$SERVICE_WAS_ENABLED" -eq 1 ]]; then
-        systemctl enable keepalived.service || rollback_status=1
-    else
-        systemctl disable keepalived.service || rollback_status=1
-    fi
-    if [[ "$SERVICE_WAS_ACTIVE" -eq 1 ]]; then
-        systemctl restart keepalived.service || rollback_status=1
-    else
-        systemctl stop keepalived.service || rollback_status=1
-    fi
 
     return "$rollback_status"
 }
@@ -482,9 +486,9 @@ activate_keepalived() {
     else
         systemctl start keepalived.service
     fi
-    systemctl is-active --quiet keepalived.service || die "keepalived.service 鍚姩澶辫触"
+    systemctl is-active --quiet keepalived.service || die "keepalived.service 启动失败"
     if ! "$APP_ROOT/libexec/check-aggregate-health.sh"; then
-        log "WARNING: 鍋ュ悍鎺ュ彛褰撳墠涓嶅彲鐢紱鏈嶅姟淇濇寔 active锛孷RRP 瀹炰緥灏嗕繚鎸?FAULT"
+        log "WARNING: 健康检查当前不可用；服务保持 active，VRRP 实例将保持 FAULT"
     fi
 }
 
@@ -542,9 +546,9 @@ main() {
     parse_node_config "$NODE_CONFIG"
     validate_node_config
     render_keepalived_config "$CONFIG_TEMPLATE" "$WORK_DIR/keepalived.conf"
-    install_build_dependencies
     capture_service_state
     create_install_backup
+    install_build_dependencies
     build_and_install_keepalived
     register_systemd_unit
     install_managed_configuration "$WORK_DIR/keepalived.conf"
