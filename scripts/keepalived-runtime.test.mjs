@@ -894,6 +894,14 @@ function fakeSystemctlFunction(callLogPath) {
             fi
             [[ "\$FAKE_ACTIVE" -eq 1 ]]
             ;;
+        'is-active keepalived.service')
+            if [[ "\$FAKE_ACTIVE" -eq 1 ]]; then
+                printf 'active\n'
+                return 0
+            fi
+            printf 'inactive\n'
+            return 3
+            ;;
         'is-enabled --quiet keepalived.service') [[ "\$FAKE_ENABLED" -eq 1 ]] ;;
         'enable keepalived.service') FAKE_ENABLED=1 ;;
         'disable keepalived.service')
@@ -966,7 +974,12 @@ activate_keepalived
   }
 }
 
-function runRollbackHarness(t, { active, enabled, unitLinkExisted = false }) {
+function runRollbackHarness(t, {
+  active,
+  enabled,
+  unitLinkExisted = false,
+  stopNotFoundWhenDisabled = false
+}) {
   const fixture = mkdtempSync(path.join(os.tmpdir(), 'aifar-keepalived-rollback-test-'))
   t.after(() => rmSync(fixture, { force: true, recursive: true }))
   const { appRoot, fixtureInstallerPath, unitLink } = writeInstallerFixture(fixture)
@@ -986,6 +999,14 @@ FAKE_ENABLED=1
 FAKE_ACTIVATION_ATTEMPTED=0
 FAKE_FINAL_ACTIVE_FAILURE=0
 ${fakeSystemctlFunction(callLogPath)}
+${stopNotFoundWhenDisabled ? `eval "$(declare -f systemctl | sed '1s/systemctl/_base_systemctl/')"
+systemctl() {
+    if [[ "$*" == 'stop keepalived.service' && "$FAKE_ENABLED" -eq 0 ]]; then
+        printf '%s\n' "$*" >>'${toMsysPath(callLogPath)}'
+        return 5
+    fi
+    _base_systemctl "$@"
+}` : ''}
 mountpoint() { return 1; }
 ${unitLinkExisted ? `readlink() {
     if [[ "\$*" == "-f -- \$UNIT_LINK" || "\$*" == "-- \$UNIT_LINK" ]]; then
@@ -1088,6 +1109,7 @@ function runManagedConfigurationHarness(t, { stagedStatus = 0 } = {}) {
   const formalConfigPath = path.join(appRoot, 'etc', 'keepalived', 'keepalived.conf')
   const healthUrlPath = path.join(appRoot, 'etc', 'keepalived', 'keepalived-health-url')
   const installedHealthScriptPath = path.join(appRoot, 'libexec', 'check-aggregate-health.sh')
+  const managedConfig = `vrrp_script check_aifar_health {\n    script "${toMsysPath(installedHealthScriptPath)}"\n}\n`
   mkdirSync(path.dirname(binaryPath), { recursive: true })
   mkdirSync(path.dirname(formalConfigPath), { recursive: true })
   mkdirSync(path.dirname(installedHealthScriptPath), { recursive: true })
@@ -1095,10 +1117,10 @@ function runManagedConfigurationHarness(t, { stagedStatus = 0 } = {}) {
   writeFileSync(formalConfigPath, 'previous-config\n')
   writeFileSync(healthUrlPath, 'http://127.0.0.1:38000/previous\n')
   writeFileSync(installedHealthScriptPath, '#!/usr/bin/env bash\n# previous health script\n')
-  writeFileSync(stagedConfigPath, 'managed-config\n')
+  writeFileSync(stagedConfigPath, managedConfig)
   writeFileSync(binaryPath, `#!/usr/bin/env bash
 printf '%s\\n' "\$*" >>'${toMsysPath(syntaxLogPath)}'
-if [[ "\$*" == '-t -f ${toMsysPath(stagedConfigPath)}' ]]; then
+if [[ "\$*" == '-t -f ${toMsysPath(path.join(workDir, 'keepalived.validation.conf'))}' ]]; then
     exit ${stagedStatus}
 fi
 exit 0
@@ -1115,12 +1137,60 @@ install_managed_configuration '${toMsysPath(stagedConfigPath)}'
   const result = spawnSync(bashPath, [toMsysPath(harnessPath)], { encoding: 'utf8' })
   return {
     ...result,
+    managedConfig,
     formalConfig: readFileSync(formalConfigPath, 'utf8'),
     healthUrl: existsSync(path.join(appRoot, 'etc', 'keepalived', 'keepalived-health-url'))
       ? readFileSync(path.join(appRoot, 'etc', 'keepalived', 'keepalived-health-url'), 'utf8')
       : '',
     installedHealthScript: existsSync(installedHealthScriptPath),
     installedHealthScriptContents: readFileSync(installedHealthScriptPath, 'utf8'),
+    syntaxCalls: existsSync(syntaxLogPath)
+      ? readFileSync(syntaxLogPath, 'utf8').trimEnd().split('\n')
+      : []
+  }
+}
+
+function runManagedConfigurationHealthReferenceHarness(t) {
+  const fixture = mkdtempSync(path.join(rootDir, '.aifar-keepalived-config-health-reference-test-'))
+  t.after(() => rmSync(fixture, { force: true, recursive: true }))
+  const { appRoot, fixtureInstallerPath } = writeInstallerFixture(fixture)
+  const harnessPath = path.join(fixture, 'harness.sh')
+  const workDir = path.join(fixture, 'work')
+  const stagedConfigPath = path.join(workDir, 'keepalived.conf')
+  const syntaxLogPath = path.join(fixture, 'syntax-calls')
+  const binaryPath = path.join(appRoot, 'sbin', 'keepalived')
+  const finalHealthScriptPath = path.join(appRoot, 'libexec', 'check-aggregate-health.sh')
+  mkdirSync(path.dirname(binaryPath), { recursive: true })
+  mkdirSync(workDir, { recursive: true })
+  writeFileSync(stagedConfigPath, `vrrp_script check_aifar_health {
+    script "${toMsysPath(finalHealthScriptPath)}"
+}
+`)
+  writeFileSync(binaryPath, `#!/usr/bin/env bash
+config=''
+while [[ "$#" -gt 0 ]]; do
+    if [[ "$1" == '-f' ]]; then config="$2"; shift 2; else shift; fi
+done
+script_path="$(awk '$1 == "script" { gsub(/"/, "", $2); print $2; exit }' "$config")"
+if [[ -n "$script_path" && -x "$script_path" ]]; then
+    printf '%s|%s|present\n' "$config" "$script_path" >>'${toMsysPath(syntaxLogPath)}'
+    exit 0
+fi
+printf '%s|%s|missing\n' "$config" "$script_path" >>'${toMsysPath(syntaxLogPath)}'
+exit 42
+`)
+  chmodSync(binaryPath, 0o750)
+  writeFileSync(harnessPath, `#!/usr/bin/env bash
+set -Eeuo pipefail
+source '${toMsysPath(fixtureInstallerPath)}'
+${fakeInstallFunction()}
+WORK_DIR='${toMsysPath(workDir)}'
+NODE_HEALTH_URL='http://127.0.0.1:38000/health/aggregate'
+install_managed_configuration '${toMsysPath(stagedConfigPath)}'
+`)
+  const result = spawnSync(bashPath, [toMsysPath(harnessPath)], { encoding: 'utf8' })
+  return {
+    ...result,
     syntaxCalls: existsSync(syntaxLogPath)
       ? readFileSync(syntaxLogPath, 'utf8').trimEnd().split('\n')
       : []
@@ -1148,7 +1218,7 @@ function runManagedConfigurationCommitFailureHarness(t, failRename) {
   writeFileSync(configPath, 'old-config\n')
   writeFileSync(healthUrlPath, 'http://127.0.0.1:38000/old\n')
   writeFileSync(healthScriptPath, '#!/usr/bin/env bash\n# old-health\n')
-  writeFileSync(stagedConfigPath, 'new-config\n')
+  writeFileSync(stagedConfigPath, `vrrp_script check_aifar_health {\n    script "${toMsysPath(healthScriptPath)}"\n}\n`)
   writeFileSync(harnessPath, `#!/usr/bin/env bash
 set -Eeuo pipefail
 source '${toMsysPath(fixtureInstallerPath)}'
@@ -1711,6 +1781,7 @@ test('rollback restores a previously active and enabled service', (t) => {
   assert.equal(result.status, 0, result.stderr)
   assert.equal(result.appRootExists, false)
   assert.deepEqual(result.calls, [
+    'is-active keepalived.service',
     'stop keepalived.service',
     'daemon-reload',
     'enable keepalived.service',
@@ -1724,12 +1795,24 @@ test('rollback restores a previously inactive and disabled service', (t) => {
   assert.equal(result.status, 0, result.stderr)
   assert.equal(result.appRootExists, false)
   assert.deepEqual(result.calls, [
+    'is-active keepalived.service',
     'stop keepalived.service',
     'daemon-reload',
     'disable keepalived.service',
-    'stop keepalived.service',
+    'is-active keepalived.service',
     'daemon-reload'
   ])
+})
+
+test('rollback treats an already absent inactive service as restored', (t) => {
+  const result = runRollbackHarness(t, {
+    active: false,
+    enabled: false,
+    stopNotFoundWhenDisabled: true
+  })
+  assert.equal(result.status, 0, result.stderr)
+  assert.equal(result.appRootExists, false)
+  assert.equal(result.calls.filter((call) => call === 'stop keepalived.service').length, 1)
 })
 
 test('rollback restores a previously disabled inactive owned unit link after disable removes it', (t) => {
@@ -1786,12 +1869,20 @@ test('cleanup preserves the original failure status when rollback also fails', (
 test('installer validates staged and atomically installed managed configuration', (t) => {
   const result = runManagedConfigurationHarness(t)
   assert.equal(result.status, 0, result.stderr)
-  assert.equal(result.formalConfig, 'managed-config\n')
+  assert.equal(result.formalConfig, result.managedConfig)
   assert.equal(result.healthUrl, 'http://127.0.0.1:38000/health/aggregate\n')
   assert.equal(result.installedHealthScript, true)
   assert.equal(result.syntaxCalls.length, 2)
-  assert.match(result.syntaxCalls[0], /-t -f .*\/work\/keepalived\.conf$/)
+  assert.match(result.syntaxCalls[0], /-t -f .*\/work\/keepalived\.validation\.conf$/)
   assert.match(result.syntaxCalls[1], /-t -f .*\/etc\/keepalived\/keepalived\.conf$/)
+})
+
+test('installer validates staged configuration against an accessible temporary health script', (t) => {
+  const result = runManagedConfigurationHealthReferenceHarness(t)
+  assert.equal(result.status, 0, result.stderr)
+  assert.equal(result.syntaxCalls.length, 2)
+  assert.match(result.syntaxCalls[0], /check-aggregate-health\.sh\.tmp\.[^|]+\|present$/)
+  assert.match(result.syntaxCalls[1], /check-aggregate-health\.sh\|present$/)
 })
 
 test('installer leaves the formal configuration unchanged when staged syntax is invalid', (t) => {

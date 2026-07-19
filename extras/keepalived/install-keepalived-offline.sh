@@ -609,7 +609,7 @@ rollback_install_transaction() {
     log "安装事务失败，正在恢复安装前状态"
     rollback_firewall_journal || rollback_status=1
     rollback_selinux_journal || rollback_status=1
-    systemctl stop keepalived.service || {
+    ensure_keepalived_inactive || {
         printf '[keepalived-installer] ERROR: 回滚时停止 keepalived.service 失败\n' >&2
         rollback_status=1
     }
@@ -651,7 +651,7 @@ rollback_install_transaction() {
     if [[ "$SERVICE_WAS_ACTIVE" -eq 1 ]]; then
         systemctl restart keepalived.service || rollback_status=1
     else
-        systemctl stop keepalived.service || rollback_status=1
+        ensure_keepalived_inactive || rollback_status=1
     fi
 
     if [[ -e "$UNIT_LINK" || -L "$UNIT_LINK" ]]; then
@@ -684,6 +684,27 @@ rollback_install_transaction() {
     }
 
     return "$rollback_status"
+}
+
+ensure_keepalived_inactive() {
+    local service_state=''
+    local service_status=0
+
+    if service_state="$(systemctl is-active keepalived.service 2>/dev/null)"; then
+        systemctl stop keepalived.service
+        return
+    else
+        service_status=$?
+    fi
+
+    case "$service_status:$service_state" in
+        3:inactive|3:failed|4:unknown)
+            return 0
+            ;;
+        *)
+            return "$service_status"
+            ;;
+    esac
 }
 
 parse_node_config() {
@@ -896,16 +917,23 @@ register_systemd_unit() {
 
 install_managed_configuration() {
     local staged_config="$1"
+    local validation_config="$WORK_DIR/keepalived.validation.conf"
     local config_tmp="$FORMAL_CONFIG.tmp.$$"
     local health_url_tmp="$HEALTH_URL_FILE.tmp.$$"
     local health_script_target="$APP_ROOT/libexec/check-aggregate-health.sh"
     local health_script_tmp="$APP_ROOT/libexec/check-aggregate-health.sh.tmp.$$"
+    local line=''
 
     install -d -o root -g root -m 750 "$APP_ROOT/etc/keepalived" "$APP_ROOT/libexec" "$APP_ROOT/var/lib/aifar"
-    "$APP_ROOT/sbin/keepalived" -t -f "$staged_config"
+    install -o root -g root -m 750 "$HEALTH_SCRIPT_SOURCE" "$health_script_tmp"
+    : >"$validation_config"
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        printf '%s\n' "${line//$health_script_target/$health_script_tmp}" >>"$validation_config"
+    done <"$staged_config"
+    grep -Fq "$health_script_tmp" "$validation_config" || die "临时配置未引用待安装的健康检查脚本"
+    "$APP_ROOT/sbin/keepalived" -t -f "$validation_config"
 
     printf '%s\n' "$NODE_HEALTH_URL" >"$WORK_DIR/keepalived-health-url"
-    install -o root -g root -m 750 "$HEALTH_SCRIPT_SOURCE" "$health_script_tmp"
     install -o root -g root -m 640 "$WORK_DIR/keepalived-health-url" "$health_url_tmp"
     install -o root -g root -m 640 "$staged_config" "$config_tmp"
 
