@@ -37,6 +37,9 @@ function releaseFixture(t, { safeDefaults = true, buildOutputs = true, binaries 
   write(root, 'extras/keepalived/keepalived-2.4.2.tar.gz', 'fixture archive')
   write(root, 'extras/keepalived/SHA256SUMS', 'fixture checksum\n')
   write(root, 'extras/keepalived/install-keepalived-offline.sh', '#!/usr/bin/env bash\n')
+  write(root, 'extras/keepalived/check-aggregate-health.sh', '#!/usr/bin/env bash\n')
+  write(root, 'extras/keepalived/keepalived.env.example', 'KEEPALIVED_LOCAL_IP=192.0.2.10\n')
+  write(root, 'extras/keepalived/keepalived.conf.tpl', 'state BACKUP\n')
   write(root, 'extras/keepalived/configure-selinux.sh', '#!/usr/bin/env bash\n')
   write(root, 'extras/keepalived/uninstall-keepalived.sh', '#!/usr/bin/env bash\n')
   write(root, 'extras/selinux/README.md', 'aggregate SELinux tool\n')
@@ -185,18 +188,29 @@ test('release includes Keepalived tools only in Linux packages and checksums the
   const deployment = path.join(root, 'deploy', 'deployment')
   const linux = path.join(deployment, 'aifar-fixture-9.8.7-linux-amd64')
   const windows = path.join(deployment, 'aifar-fixture-9.8.7-windows-amd64')
-  assert.equal(existsSync(path.join(linux, 'extras/keepalived/install-keepalived-offline.sh')), true)
+  for (const relativePath of [
+    'install-keepalived-offline.sh',
+    'check-aggregate-health.sh',
+    'keepalived.env.example',
+    'keepalived.conf.tpl'
+  ]) {
+    assert.equal(existsSync(path.join(linux, 'extras/keepalived', relativePath)), true)
+  }
   assert.equal(existsSync(path.join(windows, 'extras/keepalived')), false)
-  assert.match(
-    readFileSync(path.join(linux, 'checksums.txt'), 'utf8'),
-    /extras\/keepalived\/keepalived-2\.4\.2\.tar\.gz/
-  )
+  const checksums = readFileSync(path.join(linux, 'checksums.txt'), 'utf8')
+  for (const relativePath of [
+    'keepalived-2.4.2.tar.gz',
+    'check-aggregate-health.sh',
+    'keepalived.env.example',
+    'keepalived.conf.tpl'
+  ]) assert.match(checksums, new RegExp(`extras/keepalived/${relativePath.replaceAll('.', '\\.')}`))
 
   const archivePath = path.join(deployment, 'aifar-fixture-9.8.7-linux-amd64.tar.gz')
   const listing = spawnSync('tar', ['-tvzf', archivePath], { encoding: 'utf8' })
   assert.equal(listing.status, 0, listing.stderr)
   for (const script of [
     'install-keepalived-offline.sh',
+    'check-aggregate-health.sh',
     'configure-selinux.sh',
     'uninstall-keepalived.sh'
   ]) {

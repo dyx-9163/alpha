@@ -26,6 +26,7 @@ test('Keepalived module contains the verified installer artifacts', () => {
     archiveName,
     'SHA256SUMS',
     'install-keepalived-offline.sh',
+    'check-aggregate-health.sh',
     'keepalived.env.example',
     'keepalived.conf.tpl'
   ]) {
@@ -115,6 +116,14 @@ test('SELinux script preserves mode and manages persistent distribution-derived 
   assert.match(script, /semanage fcontext/)
   assert.match(script, /restorecon/)
   assert.match(script, /keepalived-selinux-fcontexts/)
+  assert.match(script, /\/aifar\/apps\/keepalived\/libexec\(\/\.\*\)\?/)
+  assert.match(script, /KEEPALIVED_SELINUX_TRANSACTION_FILE/)
+  assert.match(read('install-keepalived-offline.sh'), /rollback_selinux_journal/)
+  for (const scriptName of ['configure-selinux.sh', 'uninstall-keepalived.sh']) {
+    const source = read(scriptName)
+    assert.match(source, /PATTERN="\$1" awk '\$1 == ENVIRON\["PATTERN"\] \{ print \$NF; exit \}'/)
+    assert.doesNotMatch(source, /awk -v pattern="\$1"/)
+  }
   assert.doesNotMatch(
     script,
     /setenforce|SELINUX\s*=\s*(?:disabled|permissive)|\/etc\/selinux\/config|audit2allow/i
@@ -133,6 +142,7 @@ test('Keepalived module contains all release artifacts', () => {
     archiveName,
     'SHA256SUMS',
     'install-keepalived-offline.sh',
+    'check-aggregate-health.sh',
     'keepalived.env.example',
     'keepalived.conf.tpl',
     'configure-selinux.sh',
@@ -171,11 +181,30 @@ test('uninstaller verifies a backup before service changes and exact-path deleti
 
 test('README documents zero-argument lifecycle and retained state', () => {
   const readme = read('README.md')
+  for (const key of [
+    'KEEPALIVED_LOCAL_IP',
+    'KEEPALIVED_PEER_IP',
+    'KEEPALIVED_VIP_CIDR',
+    'KEEPALIVED_INTERFACE',
+    'KEEPALIVED_PRIORITY',
+    'KEEPALIVED_VIRTUAL_ROUTER_ID',
+    'KEEPALIVED_HEALTH_URL'
+  ]) assert.match(readme, new RegExp(key))
+  assert.match(readme, /192\.168\.74\.132/)
+  assert.match(readme, /192\.168\.74\.133/)
+  assert.match(readme, /192\.168\.74\.130\/24/)
   assert.match(readme, /bash install-keepalived-offline\.sh/)
   assert.match(readme, /bash configure-selinux\.sh/)
   assert.match(readme, /bash uninstall-keepalived\.sh/)
+  assert.match(readme, /systemctl status keepalived/)
+  assert.match(readme, /systemctl restart keepalived/)
+  assert.match(readme, /systemctl stop keepalived/)
+  assert.match(readme, /systemctl start keepalived/)
+  assert.match(readme, /ip addr show dev ens160/)
+  assert.match(readme, /FAULT/)
+  assert.match(readme, /自动.*(?:抢占|切回).*132/)
+  assert.match(readme, /protocol 112|协议 112/)
   assert.match(readme, /\/aifar\/backups\/keepalived-/)
-  assert.match(readme, /不会自动启动/)
   assert.match(readme, /不会删除.*RPM/)
-  assert.match(readme, /不会删除.*防火墙/)
+  assert.match(readme, /不会删除.*(?:预存|非本安装|不属于).*防火墙/)
 })

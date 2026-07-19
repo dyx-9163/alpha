@@ -737,6 +737,33 @@ test('aggregate health probe exposes its guarded public contract', () => {
   assert.match(source, /if \[\[ "\$\{BASH_SOURCE\[0\]\}" == "\$0" \]\]; then/)
 })
 
+test('installer rolls back SELinux mutation journal in reverse order', (t) => {
+  const fixture = mkdtempSync(path.join(rootDir, '.aifar-keepalived-selinux-rollback-test-'))
+  t.after(() => rmSync(fixture, { force: true, recursive: true }))
+  const { fixtureInstallerPath } = writeInstallerFixture(fixture)
+  const harnessPath = path.join(fixture, 'harness.sh')
+  const workDir = path.join(fixture, 'work')
+  const callLogPath = path.join(fixture, 'semanage-calls')
+  mkdirSync(workDir)
+  writeFileSync(path.join(workDir, 'selinux-journal.tsv'), [
+    'updated|/aifar/apps/keepalived/etc(/.*)?|old_etc_t|keepalived_etc_t',
+    'created|/aifar/apps/keepalived/libexec(/.*)?|-|keepalived_exec_t'
+  ].join('\n') + '\n')
+  writeFileSync(harnessPath, `#!/usr/bin/env bash
+set -Eeuo pipefail
+source '${toMsysPath(fixtureInstallerPath)}'
+WORK_DIR='${toMsysPath(workDir)}'
+semanage() { printf '%s\\n' "\$*" >>'${toMsysPath(callLogPath)}'; }
+rollback_selinux_journal
+`)
+  const result = spawnSync(bashPath, [toMsysPath(harnessPath)], { encoding: 'utf8' })
+  assert.equal(result.status, 0, result.stderr)
+  assert.deepEqual(readFileSync(callLogPath, 'utf8').trimEnd().split('\n'), [
+    'fcontext -d /aifar/apps/keepalived/libexec(/.*)?',
+    'fcontext -m -t old_etc_t /aifar/apps/keepalived/etc(/.*)?'
+  ])
+})
+
 test('Python 3 interpreter selection is portable instead of requiring one workstation path', () => {
   const source = readFileSync(fileURLToPath(import.meta.url), 'utf8')
   assert.doesNotMatch(source, /^const realPythonPath = /m)

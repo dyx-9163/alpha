@@ -44,6 +44,7 @@ const keepalivedEntry = {
   required: true,
   executables: [
     'install-keepalived-offline.sh',
+    'check-aggregate-health.sh',
     'configure-selinux.sh',
     'uninstall-keepalived.sh'
   ]

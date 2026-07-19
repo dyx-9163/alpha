@@ -39,7 +39,7 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 mapping_context() {
-    semanage fcontext -l -C | awk -v pattern="$1" '$1 == pattern { print $NF; exit }'
+    semanage fcontext -l -C | PATTERN="$1" awk '$1 == ENVIRON["PATTERN"] { print $NF; exit }'
 }
 
 context_type() {
@@ -77,7 +77,7 @@ create_and_verify_backup() {
     [[ ! -e "$BACKUP_DIR" ]] || die "备份目录已存在：$BACKUP_DIR"
     install -d -o root -g root -m 700 "$BACKUP_DIR"
 
-    for relative in etc scripts systemd/keepalived.service var/lib/aifar/keepalived-selinux-fcontexts var/lib/aifar/firewall-rule; do
+    for relative in etc libexec scripts systemd/keepalived.service var/lib/aifar/keepalived-selinux-fcontexts var/lib/aifar/firewall-rule; do
         if [[ -e "$APP_ROOT/$relative" ]]; then
             install -d -o root -g root -m 700 "$BACKUP_DIR/$(dirname "$relative")"
             cp -a -- "$APP_ROOT/$relative" "$BACKUP_DIR/$relative"

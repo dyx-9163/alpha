@@ -323,6 +323,54 @@ rollback_firewall_journal() {
     return "$rollback_status"
 }
 
+rollback_selinux_journal() {
+    local journal="$WORK_DIR/selinux-journal.tsv"
+    local index=0 action="" pattern="" previous_type="" applied_type="" rollback_status=0
+    local -a rows=()
+
+    [[ -e "$journal" || -L "$journal" ]] || return 0
+    if [[ ! -f "$journal" || -L "$journal" ]]; then
+        printf '[keepalived-installer] ERROR: SELinux 回滚日志不是普通文件：%s\n' "$journal" >&2
+        return 1
+    fi
+    command -v semanage >/dev/null 2>&1 || {
+        printf '[keepalived-installer] ERROR: SELinux 回滚缺少 semanage 命令\n' >&2
+        return 1
+    }
+    mapfile -t rows <"$journal" || return 1
+    for ((index=${#rows[@]} - 1; index >= 0; index--)); do
+        IFS='|' read -r action pattern previous_type applied_type <<<"${rows[$index]}"
+        if [[ -z "$pattern" || "$pattern" == *'|'* || "$applied_type" != *_t ]]; then
+            printf '[keepalived-installer] ERROR: SELinux 回滚日志记录无效\n' >&2
+            rollback_status=1
+            continue
+        fi
+        case "$action" in
+            created)
+                if [[ "$previous_type" != '-' ]]; then
+                    printf '[keepalived-installer] ERROR: SELinux created 回滚记录无效：%s\n' "$pattern" >&2
+                    rollback_status=1
+                else
+                    semanage fcontext -d "$pattern" || rollback_status=1
+                fi
+                ;;
+            updated)
+                if [[ "$previous_type" != *_t ]]; then
+                    printf '[keepalived-installer] ERROR: SELinux updated 回滚记录无效：%s\n' "$pattern" >&2
+                    rollback_status=1
+                else
+                    semanage fcontext -m -t "$previous_type" "$pattern" || rollback_status=1
+                fi
+                ;;
+            *)
+                printf '[keepalived-installer] ERROR: SELinux 回滚日志动作无效：%s\n' "$action" >&2
+                rollback_status=1
+                ;;
+        esac
+    done
+    return "$rollback_status"
+}
+
 reconcile_firewall_rule() {
     local zone="" desired_rule="" record_tmp=""
     local runtime_created=0 permanent_created=0
@@ -392,6 +440,7 @@ rollback_install_transaction() {
 
     log "安装事务失败，正在恢复安装前状态"
     rollback_firewall_journal || rollback_status=1
+    rollback_selinux_journal || rollback_status=1
     systemctl stop keepalived.service || {
         printf '[keepalived-installer] ERROR: 回滚时停止 keepalived.service 失败\n' >&2
         rollback_status=1
@@ -693,7 +742,7 @@ install_managed_configuration() {
 configure_selinux_if_enabled() {
     if command -v getenforce >/dev/null 2>&1 && [[ "$(getenforce)" != "Disabled" ]]; then
         [[ -f "$SELINUX_SCRIPT" ]] || die "SELinux 已启用，但缺少脚本：$SELINUX_SCRIPT"
-        bash "$SELINUX_SCRIPT"
+        KEEPALIVED_SELINUX_TRANSACTION_FILE="$WORK_DIR/selinux-journal.tsv" bash "$SELINUX_SCRIPT"
     fi
 }
 
