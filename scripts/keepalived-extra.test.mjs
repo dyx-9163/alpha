@@ -82,6 +82,7 @@ test('installer verifies source and requires managed configuration before build'
   assert.ok(indexOfOrFail(mainBody, 'install_managed_configuration') < indexOfOrFail(mainBody, 'activate_keepalived'))
   const transactionOrder = [
     'render_keepalived_config',
+    'validate_selinux_record_file "$SELINUX_RECORD"',
     'capture_service_state',
     'create_install_backup',
     'install_build_dependencies',
@@ -119,6 +120,10 @@ test('SELinux script preserves mode and manages persistent distribution-derived 
   assert.match(script, /\/aifar\/apps\/keepalived\/libexec\(\/\.\*\)\?/)
   assert.match(script, /KEEPALIVED_SELINUX_TRANSACTION_FILE/)
   assert.match(read('install-keepalived-offline.sh'), /rollback_selinux_journal/)
+  assert.ok(
+    indexOfOrFail(script, 'validate_selinux_record_file "$RECORD_FILE"') <
+      indexOfOrFail(script, "apply_new_mapping '/aifar/apps/keepalived/sbin/keepalived'")
+  )
   for (const scriptName of ['configure-selinux.sh', 'uninstall-keepalived.sh']) {
     const source = read(scriptName)
     assert.match(source, /PATTERN="\$1" awk '\$1 == ENVIRON\["PATTERN"\] \{ print \$NF; exit \}'/)
@@ -160,8 +165,10 @@ test('uninstaller verifies a backup before service changes and exact-path deleti
   const script = read('uninstall-keepalived.sh')
   const backupVerify = indexOfOrFail(script, 'sha256sum --check BACKUP.sha256')
   const serviceStop = indexOfOrFail(script, 'systemctl stop keepalived.service')
+  const selinuxValidation = indexOfOrFail(script, 'validate_selinux_record_file "$SELINUX_RECORD"')
   const installDelete = indexOfOrFail(script, 'rm -rf -- "$APP_ROOT"')
   assert.ok(backupVerify < serviceStop)
+  assert.ok(selinuxValidation < serviceStop)
   assert.ok(serviceStop < installDelete)
   assert.match(script, /readonly APP_ROOT="\/aifar\/apps\/keepalived"/)
   assert.match(script, /readlink -f -- "\$APP_ROOT"/)

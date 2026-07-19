@@ -51,6 +51,50 @@ context_type() {
     printf '%s\n' "$type"
 }
 
+valid_selinux_record_row() {
+    local action="$1" pattern="$2" previous_type="$3" applied_type="$4"
+
+    case "$pattern" in
+        '/aifar/apps/keepalived/sbin/keepalived'|\
+        '/aifar/apps/keepalived/etc(/.*)?'|\
+        '/aifar/apps/keepalived/libexec(/.*)?'|\
+        '/aifar/apps/keepalived/var(/.*)?'|\
+        '/aifar/apps/keepalived/run(/.*)?'|\
+        '/aifar/apps/keepalived/systemd/keepalived\.service'|\
+        '/aifar/apps/keepalived/scripts(/.*)?') ;;
+        *) return 1 ;;
+    esac
+    [[ "$applied_type" =~ ^[A-Za-z0-9_]+_t$ ]] || return 1
+    case "$action" in
+        created) [[ "$previous_type" == '-' ]] ;;
+        updated)
+            [[ "$previous_type" =~ ^[A-Za-z0-9_]+_t$ && "$previous_type" != "$applied_type" ]]
+            ;;
+        unchanged) [[ "$previous_type" == "$applied_type" ]] ;;
+        *) return 1 ;;
+    esac
+}
+
+validate_selinux_record_file() {
+    local file="$1" line="" action="" pattern="" previous_type="" applied_type="" count=0
+    declare -A seen_patterns=()
+
+    [[ -e "$file" || -L "$file" ]] || return 0
+    [[ -f "$file" && ! -L "$file" && -s "$file" ]] || die "SELinux 映射记录必须是非空普通文件：$file"
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ "$line" =~ ^([^|]*)[|]([^|]*)[|]([^|]*)[|]([^|]*)$ ]] || die "SELinux 映射记录字段格式无效：$file"
+        action="${BASH_REMATCH[1]}"
+        pattern="${BASH_REMATCH[2]}"
+        previous_type="${BASH_REMATCH[3]}"
+        applied_type="${BASH_REMATCH[4]}"
+        valid_selinux_record_row "$action" "$pattern" "$previous_type" "$applied_type" || die "SELinux 映射记录语义无效：$pattern"
+        [[ -z "${seen_patterns[$pattern]+x}" ]] || die "SELinux 映射记录包含重复 pattern：$pattern"
+        seen_patterns[$pattern]=1
+        ((count += 1))
+    done <"$file"
+    ((count > 0)) || die "SELinux 映射记录为空：$file"
+}
+
 validate_unit_ownership() {
     local unit_target=""
     local fragment=""
@@ -238,7 +282,8 @@ main() {
     mountpoint -q "$APP_ROOT" && die "拒绝删除挂载点：$APP_ROOT"
     validate_unit_ownership
 
-    if [[ -s "$SELINUX_RECORD" ]]; then
+    validate_selinux_record_file "$SELINUX_RECORD"
+    if [[ -e "$SELINUX_RECORD" || -L "$SELINUX_RECORD" ]]; then
         require_command semanage
     fi
 

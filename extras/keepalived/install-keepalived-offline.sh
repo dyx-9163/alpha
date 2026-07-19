@@ -21,6 +21,7 @@ readonly HEALTH_SCRIPT_SOURCE="${SCRIPT_DIR}/check-aggregate-health.sh"
 readonly FORMAL_CONFIG="${APP_ROOT}/etc/keepalived/keepalived.conf"
 readonly HEALTH_URL_FILE="${APP_ROOT}/etc/keepalived/keepalived-health-url"
 readonly FIREWALL_RECORD="${APP_ROOT}/var/lib/aifar/firewall-rule"
+readonly SELINUX_RECORD="${APP_ROOT}/var/lib/aifar/keepalived-selinux-fcontexts"
 readonly BACKUP_ROOT="/aifar/backups"
 readonly UNIT_LINK="/etc/systemd/system/keepalived.service"
 readonly EXPECTED_UNIT="${APP_ROOT}/systemd/keepalived.service"
@@ -90,6 +91,62 @@ trap 'exit 143' TERM
 
 require_command() {
     command -v "$1" >/dev/null 2>&1 || die "缺少必要命令：$1"
+}
+
+valid_selinux_record_row() {
+    local action="$1" pattern="$2" previous_type="$3" applied_type="$4"
+
+    case "$pattern" in
+        '/aifar/apps/keepalived/sbin/keepalived'|\
+        '/aifar/apps/keepalived/etc(/.*)?'|\
+        '/aifar/apps/keepalived/libexec(/.*)?'|\
+        '/aifar/apps/keepalived/var(/.*)?'|\
+        '/aifar/apps/keepalived/run(/.*)?'|\
+        '/aifar/apps/keepalived/systemd/keepalived\.service'|\
+        '/aifar/apps/keepalived/scripts(/.*)?') ;;
+        *) return 1 ;;
+    esac
+    [[ "$applied_type" =~ ^[A-Za-z0-9_]+_t$ ]] || return 1
+    case "$action" in
+        created) [[ "$previous_type" == '-' ]] ;;
+        updated)
+            [[ "$previous_type" =~ ^[A-Za-z0-9_]+_t$ && "$previous_type" != "$applied_type" ]]
+            ;;
+        unchanged) [[ "$previous_type" == "$applied_type" ]] ;;
+        *) return 1 ;;
+    esac
+}
+
+validate_selinux_record_file() {
+    local file="$1" line="" action="" pattern="" previous_type="" applied_type="" count=0
+    declare -A seen_patterns=()
+
+    [[ -e "$file" || -L "$file" ]] || return 0
+    [[ -f "$file" && ! -L "$file" && -s "$file" ]] || die "SELinux 映射记录必须是非空普通文件：$file"
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ "$line" =~ ^([^|]*)[|]([^|]*)[|]([^|]*)[|]([^|]*)$ ]] || die "SELinux 映射记录字段格式无效：$file"
+        action="${BASH_REMATCH[1]}"
+        pattern="${BASH_REMATCH[2]}"
+        previous_type="${BASH_REMATCH[3]}"
+        applied_type="${BASH_REMATCH[4]}"
+        valid_selinux_record_row "$action" "$pattern" "$previous_type" "$applied_type" || die "SELinux 映射记录语义无效：$pattern"
+        [[ -z "${seen_patterns[$pattern]+x}" ]] || die "SELinux 映射记录包含重复 pattern：$pattern"
+        seen_patterns[$pattern]=1
+        ((count += 1))
+    done <"$file"
+    ((count > 0)) || die "SELinux 映射记录为空：$file"
+}
+
+mapping_context() {
+    semanage fcontext -l -C | PATTERN="$1" awk '$1 == ENVIRON["PATTERN"] { print $NF; exit }'
+}
+
+context_type() {
+    local context="$1" type=""
+
+    IFS=: read -r _ _ type _ <<<"$context"
+    [[ "$type" =~ ^[A-Za-z0-9_]+_t$ ]] || return 1
+    printf '%s\n' "$type"
 }
 
 capture_service_state() {
@@ -339,32 +396,57 @@ rollback_selinux_journal() {
     }
     mapfile -t rows <"$journal" || return 1
     for ((index=${#rows[@]} - 1; index >= 0; index--)); do
-        IFS='|' read -r action pattern previous_type applied_type <<<"${rows[$index]}"
-        if [[ -z "$pattern" || "$pattern" == *'|'* || "$applied_type" != *_t ]]; then
+        if [[ ! "${rows[$index]}" =~ ^([^|]*)[|]([^|]*)[|]([^|]*)[|]([^|]*)$ ]]; then
             printf '[keepalived-installer] ERROR: SELinux 回滚日志记录无效\n' >&2
+            rollback_status=1
+            continue
+        fi
+        action="${BASH_REMATCH[1]}"
+        pattern="${BASH_REMATCH[2]}"
+        previous_type="${BASH_REMATCH[3]}"
+        applied_type="${BASH_REMATCH[4]}"
+        if ! valid_selinux_record_row "$action" "$pattern" "$previous_type" "$applied_type" || [[ "$action" == unchanged ]]; then
+            printf '[keepalived-installer] ERROR: SELinux 回滚日志语义无效：%s\n' "$pattern" >&2
+            rollback_status=1
+            continue
+        fi
+        local current_context="" current_type="" restored_context="" restored_type=""
+        current_context="$(mapping_context "$pattern")"
+        if [[ -z "$current_context" ]]; then
+            printf '[keepalived-installer] ERROR: SELinux 回滚映射已缺失：%s\n' "$pattern" >&2
+            rollback_status=1
+            continue
+        fi
+        current_type="$(context_type "$current_context")" || {
+            printf '[keepalived-installer] ERROR: 无法解析 SELinux 回滚映射：%s\n' "$pattern" >&2
+            rollback_status=1
+            continue
+        }
+        if [[ "$current_type" != "$applied_type" ]]; then
+            printf '[keepalived-installer] ERROR: SELinux 映射已被外部修改，拒绝覆盖：%s\n' "$pattern" >&2
             rollback_status=1
             continue
         fi
         case "$action" in
             created)
-                if [[ "$previous_type" != '-' ]]; then
-                    printf '[keepalived-installer] ERROR: SELinux created 回滚记录无效：%s\n' "$pattern" >&2
+                if ! semanage fcontext -d "$pattern"; then
                     rollback_status=1
-                else
-                    semanage fcontext -d "$pattern" || rollback_status=1
+                elif [[ -n "$(mapping_context "$pattern")" ]]; then
+                    printf '[keepalived-installer] ERROR: SELinux created 映射回滚校验失败：%s\n' "$pattern" >&2
+                    rollback_status=1
                 fi
                 ;;
             updated)
-                if [[ "$previous_type" != *_t ]]; then
-                    printf '[keepalived-installer] ERROR: SELinux updated 回滚记录无效：%s\n' "$pattern" >&2
+                if ! semanage fcontext -m -t "$previous_type" "$pattern"; then
                     rollback_status=1
                 else
-                    semanage fcontext -m -t "$previous_type" "$pattern" || rollback_status=1
+                    restored_context="$(mapping_context "$pattern")"
+                    restored_type="$(context_type "$restored_context")" || restored_type=""
+                    if [[ "$restored_type" != "$previous_type" ]]; then
+                        printf '[keepalived-installer] ERROR: SELinux updated 映射回滚校验失败：%s\n' "$pattern" >&2
+                        rollback_status=1
+                    fi
                 fi
-                ;;
-            *)
-                printf '[keepalived-installer] ERROR: SELinux 回滚日志动作无效：%s\n' "$action" >&2
-                rollback_status=1
                 ;;
         esac
     done
@@ -814,6 +896,7 @@ main() {
     parse_node_config "$NODE_CONFIG"
     validate_node_config
     render_keepalived_config "$CONFIG_TEMPLATE" "$WORK_DIR/keepalived.conf"
+    validate_selinux_record_file "$SELINUX_RECORD"
     capture_service_state
     create_install_backup
     install_build_dependencies

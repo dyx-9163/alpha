@@ -49,23 +49,104 @@ reference_type() {
 valid_mapping_row() {
     local action="$1" pattern="$2" previous_type="$3" applied_type="$4"
 
-    [[ "$action" == created || "$action" == updated || "$action" == unchanged ]] || return 1
-    [[ -n "$pattern" && "$pattern" != *'|'* && "$applied_type" == *_t ]] || return 1
-    if [[ "$action" == created ]]; then
-        [[ "$previous_type" == '-' ]] || return 1
-    else
-        [[ "$previous_type" == *_t ]] || return 1
-    fi
+    case "$pattern" in
+        '/aifar/apps/keepalived/sbin/keepalived'|\
+        '/aifar/apps/keepalived/etc(/.*)?'|\
+        '/aifar/apps/keepalived/libexec(/.*)?'|\
+        '/aifar/apps/keepalived/var(/.*)?'|\
+        '/aifar/apps/keepalived/run(/.*)?'|\
+        '/aifar/apps/keepalived/systemd/keepalived\.service'|\
+        '/aifar/apps/keepalived/scripts(/.*)?') ;;
+        *) return 1 ;;
+    esac
+    [[ "$applied_type" =~ ^[A-Za-z0-9_]+_t$ ]] || return 1
+    case "$action" in
+        created) [[ "$previous_type" == '-' ]] ;;
+        updated)
+            [[ "$previous_type" =~ ^[A-Za-z0-9_]+_t$ && "$previous_type" != "$applied_type" ]]
+            ;;
+        unchanged) [[ "$previous_type" == "$applied_type" ]] ;;
+        *) return 1 ;;
+    esac
+}
+
+validate_selinux_record_file() {
+    local file="$1" line="" action="" pattern="" previous_type="" applied_type="" count=0
+    declare -A seen_patterns=()
+
+    [[ -e "$file" || -L "$file" ]] || return 0
+    [[ -f "$file" && ! -L "$file" && -s "$file" ]] || die "SELinux 映射记录必须是非空普通文件：$file"
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ "$line" =~ ^([^|]*)[|]([^|]*)[|]([^|]*)[|]([^|]*)$ ]] || die "SELinux 映射记录字段格式无效：$file"
+        action="${BASH_REMATCH[1]}"
+        pattern="${BASH_REMATCH[2]}"
+        previous_type="${BASH_REMATCH[3]}"
+        applied_type="${BASH_REMATCH[4]}"
+        valid_mapping_row "$action" "$pattern" "$previous_type" "$applied_type" || die "SELinux 映射记录语义无效：$pattern"
+        [[ -z "${seen_patterns[$pattern]+x}" ]] || die "SELinux 映射记录包含重复 pattern：$pattern"
+        seen_patterns[$pattern]=1
+        ((count += 1))
+    done <"$file"
+    ((count > 0)) || die "SELinux 映射记录为空：$file"
 }
 
 append_journal() {
     local action="$1" pattern="$2" previous_type="$3" applied_type="$4"
     local row="$action|$pattern|$previous_type|$applied_type"
-    local last=""
+    local last="" candidate="$CURRENT_JOURNAL.append.$$"
 
-    printf '%s\n' "$row" >>"$CURRENT_JOURNAL" || die "无法写入 SELinux 事务日志"
-    last="$(tail -n 1 "$CURRENT_JOURNAL")" || die "无法验证 SELinux 事务日志"
-    [[ "$last" == "$row" ]] || die "SELinux 事务日志校验失败"
+    rm -f -- "$candidate"
+    cp -- "$CURRENT_JOURNAL" "$candidate" || return 1
+    printf '%s\n' "$row" >>"$candidate" || { rm -f -- "$candidate"; return 1; }
+    last="$(tail -n 1 "$candidate")" || { rm -f -- "$candidate"; return 1; }
+    [[ "$last" == "$row" ]] || { rm -f -- "$candidate"; return 1; }
+    mv -f -- "$candidate" "$CURRENT_JOURNAL" || { rm -f -- "$candidate"; return 1; }
+}
+
+reverse_mapping_mutation() {
+    local action="$1" pattern="$2" previous_type="$3" applied_type="$4"
+    local current_context="" current_type="" restored_context="" restored_type=""
+
+    current_context="$(mapping_context "$pattern")"
+    [[ -n "$current_context" ]] || { printf '[keepalived-selinux] ERROR: 待回滚映射已缺失：%s\n' "$pattern" >&2; return 1; }
+    current_type="$(context_type "$current_context")" || return 1
+    [[ "$current_type" == "$applied_type" ]] || {
+        printf '[keepalived-selinux] ERROR: 映射已被外部修改，拒绝回滚：%s\n' "$pattern" >&2
+        return 1
+    }
+    case "$action" in
+        created)
+            semanage fcontext -d "$pattern" || return 1
+            [[ -z "$(mapping_context "$pattern")" ]] || return 1
+            ;;
+        updated)
+            semanage fcontext -m -t "$previous_type" "$pattern" || return 1
+            restored_context="$(mapping_context "$pattern")"
+            restored_type="$(context_type "$restored_context")" || return 1
+            [[ "$restored_type" == "$previous_type" ]] || return 1
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+apply_mapping_mutation() {
+    local action="$1" pattern="$2" previous_type="$3" applied_type="$4"
+
+    case "$action" in
+        created)
+            semanage fcontext -a -t "$applied_type" "$pattern" || die "创建 SELinux 映射失败：$pattern"
+            ;;
+        updated)
+            semanage fcontext -m -t "$applied_type" "$pattern" || die "更新 SELinux 映射失败：$pattern"
+            ;;
+        *) die "SELinux mutation 动作无效：$action" ;;
+    esac
+    if ! append_journal "$action" "$pattern" "$previous_type" "$applied_type"; then
+        if ! reverse_mapping_mutation "$action" "$pattern" "$previous_type" "$applied_type"; then
+            die "SELinux mutation 已成功但 journal 写入和即时撤销均失败：$pattern"
+        fi
+        die "SELinux mutation 已即时撤销，因为 journal 写入失败：$pattern"
+    fi
 }
 
 rollback_current_journal() {
@@ -77,10 +158,8 @@ rollback_current_journal() {
     for ((index=${#rows[@]} - 1; index >= 0; index--)); do
         IFS='|' read -r action pattern previous_type applied_type <<<"${rows[$index]}"
         valid_mapping_row "$action" "$pattern" "$previous_type" "$applied_type" || continue
-        case "$action" in
-            created) semanage fcontext -d "$pattern" >/dev/null 2>&1 || true ;;
-            updated) semanage fcontext -m -t "$previous_type" "$pattern" >/dev/null 2>&1 || true ;;
-        esac
+        [[ "$action" == created || "$action" == updated ]] || continue
+        reverse_mapping_mutation "$action" "$pattern" "$previous_type" "$applied_type" || return 1
     done
 }
 
@@ -89,7 +168,7 @@ cleanup() {
     trap - EXIT
 
     if [[ "$status" -ne 0 && "$MAPPINGS_COMMITTED" -eq 0 ]]; then
-        rollback_current_journal
+        rollback_current_journal || printf '[keepalived-selinux] ERROR: 本轮 SELinux journal 未完整回滚\n' >&2
         if [[ -n "$TRANSACTION_FILE" ]]; then
             rm -f -- "$TRANSACTION_FILE" "$TRANSACTION_FILE.tmp.$$"
         fi
@@ -126,16 +205,14 @@ apply_new_mapping() {
     current_context="$(mapping_context "$pattern")"
     if [[ -z "$current_context" ]]; then
         action=created
-        append_journal "$action" "$pattern" "$previous_type" "$type"
-        semanage fcontext -a -t "$type" "$pattern"
+        apply_mapping_mutation "$action" "$pattern" "$previous_type" "$type"
     else
         previous_type="$(context_type "$current_context")" || die "无法解析现有映射：$pattern"
         if [[ "$previous_type" == "$type" ]]; then
             action=unchanged
         else
             action=updated
-            append_journal "$action" "$pattern" "$previous_type" "$type"
-            semanage fcontext -m -t "$type" "$pattern"
+            apply_mapping_mutation "$action" "$pattern" "$previous_type" "$type"
         fi
     fi
     printf '%s|%s|%s|%s\n' "$action" "$pattern" "$previous_type" "$type" >>"$NEXT_RECORD"
@@ -148,13 +225,11 @@ reconcile_recorded_mapping() {
     valid_mapping_row "$action" "$pattern" "$previous_type" "$applied_type" || die "SELinux 映射记录损坏：$RECORD_FILE"
     current_context="$(mapping_context "$pattern")"
     if [[ -z "$current_context" ]]; then
-        append_journal created "$pattern" - "$applied_type"
-        semanage fcontext -a -t "$applied_type" "$pattern"
+        apply_mapping_mutation created "$pattern" - "$applied_type"
     else
         current_type="$(context_type "$current_context")" || die "无法解析现有映射：$pattern"
         if [[ "$current_type" != "$applied_type" ]]; then
-            append_journal updated "$pattern" "$current_type" "$applied_type"
-            semanage fcontext -m -t "$applied_type" "$pattern"
+            apply_mapping_mutation updated "$pattern" "$current_type" "$applied_type"
         fi
     fi
     printf '%s|%s|%s|%s\n' "$action" "$pattern" "$previous_type" "$applied_type" >>"$NEXT_RECORD"
@@ -164,10 +239,10 @@ build_next_record() {
     local action="" pattern="" previous_type="" applied_type=""
     declare -A recorded_patterns=()
 
+    validate_selinux_record_file "$RECORD_FILE"
     : >"$NEXT_RECORD"
     : >"$CURRENT_JOURNAL"
     if [[ -e "$RECORD_FILE" || -L "$RECORD_FILE" ]]; then
-        [[ -f "$RECORD_FILE" && ! -L "$RECORD_FILE" ]] || die "SELinux 映射记录不是普通文件：$RECORD_FILE"
         while IFS='|' read -r action pattern previous_type applied_type; do
             [[ -z "${recorded_patterns[$pattern]+x}" ]] || die "SELinux 映射记录包含重复 pattern：$pattern"
             recorded_patterns[$pattern]=1
@@ -231,7 +306,7 @@ main() {
             policycoreutils-python-utils \
             selinux-policy-targeted
     fi
-    for command_name in awk dirname install matchpathcon mv readlink restorecon semanage stat tail; do
+    for command_name in awk cp dirname install matchpathcon mv readlink restorecon rm semanage stat tail; do
         require_command "$command_name"
     done
 
