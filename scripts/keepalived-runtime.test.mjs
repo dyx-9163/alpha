@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import {
-  chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync
+  chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync
 } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -481,7 +481,11 @@ rollback_selinux_journal
   }
 }
 
-function runLegacySelinuxMigrationHarness(t, { failSemanage = '' } = {}) {
+function runLegacySelinuxMigrationHarness(t, {
+  failSemanage = '',
+  legacyAction = 'created',
+  legacyCurrentType = 'keepalived_exec_t'
+} = {}) {
   const fixture = mkdtempSync(path.join(rootDir, '.aifar-keepalived-selinux-legacy-migration-test-'))
   t.after(() => rmSync(fixture, { force: true, recursive: true }))
   const { appRoot, fixtureHelperPath } = writeSelinuxHelperFixture(fixture)
@@ -492,12 +496,19 @@ function runLegacySelinuxMigrationHarness(t, { failSemanage = '' } = {}) {
   const journalPath = path.join(fixture, 'journal')
   const normalize = (value) => value.replaceAll('/aifar/apps/keepalived', toMsysPath(appRoot))
   const recordPath = path.join(appRoot, 'var', 'lib', 'aifar', 'keepalived-selinux-fcontexts')
-  const legacyRows = legacySelinuxRecord().trimEnd().split('\n').map(normalize)
+  const legacyRows = legacySelinuxRecord().trimEnd().split('\n').map((row) => {
+    if (!row.includes('/scripts(')) return normalize(row)
+    const previousType = legacyAction === 'unchanged' ? 'keepalived_exec_t' : '-'
+    return normalize(`${legacyAction}|/aifar/apps/keepalived/scripts(/.*)?|${previousType}|keepalived_exec_t`)
+  })
   mkdirSync(path.dirname(recordPath), { recursive: true })
   writeFileSync(recordPath, legacyRows.join('\n') + '\n')
-  writeFileSync(statePath, legacyRows.map((row) => {
+  writeFileSync(statePath, legacyRows.flatMap((row) => {
     const [, pattern, , appliedType] = row.split('|')
-    return `${pattern}|${appliedType}`
+    if (row.includes('/scripts(')) {
+      return legacyCurrentType ? [`${pattern}|${legacyCurrentType}`] : []
+    }
+    return [`${pattern}|${appliedType}`]
   }).join('\n') + '\n')
   writeFileSync(harnessPath, `#!/usr/bin/env bash
 set -Eeuo pipefail
@@ -699,9 +710,13 @@ remove_owned_firewall_rule
 
 function runUninstallTransactionHarness(t, {
   externalSelinuxPattern = '',
+  missingSelinuxPattern = '',
+  failStop = false,
   failDisable = false,
   failFirewallForm = '',
-  failSelinuxPattern = ''
+  failSelinuxPattern = '',
+  failRootRemoval = false,
+  replaceUnitAfterDisableFailure = false
 } = {}) {
   const fixture = mkdtempSync(path.join(rootDir, '.aifar-keepalived-uninstall-transaction-test-'))
   t.after(() => rmSync(fixture, { force: true, recursive: true }))
@@ -720,20 +735,24 @@ function runUninstallTransactionHarness(t, {
   const firewallRecordPath = path.join(appRoot, 'var', 'lib', 'aifar', 'firewall-rule')
   const selinuxRecordPath = path.join(appRoot, 'var', 'lib', 'aifar', 'keepalived-selinux-fcontexts')
   const markerPath = path.join(appRoot, 'preserved-marker')
+  const foreignUnit = path.join(fixture, 'foreign', 'keepalived.service')
   const rule = peerRule('192.168.74.133')
   const normalize = (value) => value.replaceAll('/aifar/apps/keepalived', toMsysPath(appRoot))
   const selinuxRows = validSelinuxRecordRows().map(normalize)
   const normalizedFailSelinuxPattern = failSelinuxPattern
     ? selinuxRows.map((row) => row.split('|')[1]).find((pattern) => pattern.includes(failSelinuxPattern)) ?? ''
     : ''
-  const selinuxState = selinuxRows.map((row) => {
+  const selinuxState = selinuxRows.flatMap((row) => {
     const [, pattern, , appliedType] = row.split('|')
-    return `${pattern}|${externalSelinuxPattern && pattern.includes(externalSelinuxPattern) ? 'external_type_t' : appliedType}`
+    if (missingSelinuxPattern && pattern.includes(missingSelinuxPattern)) return []
+    return [`${pattern}|${externalSelinuxPattern && pattern.includes(externalSelinuxPattern) ? 'external_type_t' : appliedType}`]
   })
   mkdirSync(path.dirname(expectedUnit), { recursive: true })
   mkdirSync(path.dirname(unitLink), { recursive: true })
   mkdirSync(path.dirname(firewallRecordPath), { recursive: true })
   writeFileSync(expectedUnit, '[Unit]\nDescription=fixture\n')
+  mkdirSync(path.dirname(foreignUnit), { recursive: true })
+  writeFileSync(foreignUnit, '[Unit]\nDescription=foreign fixture\n')
   writeFileSync(markerPath, 'before-uninstall\n')
   writeFirewallRecord(firewallRecordPath, { zone: 'public', rule, runtimeCreated: 1, permanentCreated: 1 })
   writeFileSync(selinuxRecordPath, selinuxRows.join('\n') + '\n')
@@ -742,6 +761,8 @@ function runUninstallTransactionHarness(t, {
   writeFileSync(selinuxStatePath, selinuxState.join('\n') + '\n')
   writeFileSync(activePath, '1')
   writeFileSync(enabledPath, '1')
+  const rootStatBefore = lstatSync(appRoot)
+  const rootIdentityBefore = `${rootStatBefore.dev}:${rootStatBefore.ino}:${rootStatBefore.birthtimeMs}`
   writeFileSync(harnessPath, `#!/usr/bin/env bash
 set -Eeuo pipefail
 ln -s -- '${toMsysPath(expectedUnit)}' '${toMsysPath(unitLink)}'
@@ -755,9 +776,18 @@ systemctl() {
         'is-enabled --quiet keepalived.service') [[ "\$(cat '${toMsysPath(enabledPath)}')" == 1 ]] ;;
         'is-active --quiet firewalld.service') return 0 ;;
         'show -p FragmentPath --value keepalived.service') printf '%s\\n' '${toMsysPath(expectedUnit)}' ;;
-        'stop keepalived.service') printf 0 >'${toMsysPath(activePath)}' ;;
+        'stop keepalived.service')
+            [[ '${failStop ? 1 : 0}' -eq 0 ]] || return 60
+            printf 0 >'${toMsysPath(activePath)}'
+            ;;
         'disable keepalived.service')
-            [[ '${failDisable ? 1 : 0}' -eq 0 ]] || return 61
+            if [[ '${failDisable ? 1 : 0}' -eq 1 ]]; then
+                if [[ '${replaceUnitAfterDisableFailure ? 1 : 0}' -eq 1 ]]; then
+                    rm -f -- "\$UNIT_LINK"
+                    ln -s -- '${toMsysPath(foreignUnit)}' "\$UNIT_LINK"
+                fi
+                return 61
+            fi
             printf 0 >'${toMsysPath(enabledPath)}'
             rm -f -- "\$UNIT_LINK"
             ;;
@@ -776,6 +806,20 @@ FAKE_FAIL_SEMANAGE='${failSelinuxPattern ? 'delete' : ''}'
 FAKE_FAIL_SEMANAGE_PATTERN='${normalizedFailSelinuxPattern}'
 FAKE_FAIL_SEMANAGE_ONCE=1
 ${fakeSelinuxFunction({ statePath: selinuxStatePath, callLogPath: selinuxCallLogPath })}
+if [[ '${failRootRemoval ? 1 : 0}' -eq 1 ]]; then
+    ROOT_REMOVE_FAILURE_PENDING=1
+    rm() {
+        local argument=''
+        for argument in "\$@"; do
+            if [[ "\$argument" == "\$APP_ROOT" && "\$ROOT_REMOVE_FAILURE_PENDING" -eq 1 ]]; then
+                ROOT_REMOVE_FAILURE_PENDING=0
+                command rm -f -- "\$APP_ROOT/preserved-marker"
+                return 62
+            fi
+        done
+        command rm "\$@"
+    }
+fi
 execute_uninstall_transaction
 `)
   const result = spawnSync(bashPath, [toMsysPath(harnessPath)], {
@@ -783,13 +827,24 @@ execute_uninstall_transaction
     env: { ...process.env, MSYS: 'winsymlinks:sys' }
   })
   const readLines = (file) => existsSync(file) ? readFileSync(file, 'utf8').split('\n').filter(Boolean) : []
+  const rootStatAfter = existsSync(appRoot) ? lstatSync(appRoot) : null
+  const unitLinkTargetResult = existsSync(unitLink)
+    ? spawnSync(bashPath, ['-c', `readlink -- '${toMsysPath(unitLink)}'`], {
+        encoding: 'utf8',
+        env: { ...process.env, MSYS: 'winsymlinks:sys' }
+      })
+    : { stdout: '' }
   return {
     ...result,
     appRootExists: existsSync(appRoot),
     marker: existsSync(markerPath) ? readFileSync(markerPath, 'utf8') : '',
+    rootIdentityBefore,
+    rootIdentityAfter: rootStatAfter ? `${rootStatAfter.dev}:${rootStatAfter.ino}:${rootStatAfter.birthtimeMs}` : '',
     active: existsSync(activePath) ? readFileSync(activePath, 'utf8') : '',
     enabled: existsSync(enabledPath) ? readFileSync(enabledPath, 'utf8') : '',
     unitLinkExists: existsSync(unitLink),
+    unitLinkTarget: unitLinkTargetResult.stdout.trim(),
+    foreignUnitTarget: toMsysPath(foreignUnit),
     runtimeRules: readLines(runtimePath),
     permanentRules: readLines(permanentPath),
     selinuxState: readLines(selinuxStatePath).map((line) => line.replaceAll(toMsysPath(appRoot), '/aifar/apps/keepalived')),
@@ -1350,6 +1405,22 @@ test('failed legacy SELinux retirement preserves the old mapping through write-a
   assert.equal(result.state.some((row) => row.includes('/libexec(')), false)
 })
 
+for (const legacyCurrentType of ['external_scripts_t', '']) {
+  test(`SELinux helper ignores a ${legacyCurrentType ? 'changed' : 'missing'} unchanged legacy mapping`, (t) => {
+    const result = runLegacySelinuxMigrationHarness(t, {
+      legacyAction: 'unchanged',
+      legacyCurrentType
+    })
+    assert.equal(result.status, 0, result.stderr)
+    assert.equal(result.nextRecord.length, 6)
+    assert.equal(result.nextRecord.some((row) => row.includes('/scripts(')), false)
+    assert.deepEqual(result.calls, [
+      'add|/aifar/apps/keepalived/libexec(/.*)?|keepalived_exec_t'
+    ])
+    assert.equal(result.state.some((row) => row.includes('/scripts(')), Boolean(legacyCurrentType))
+  })
+}
+
 const helperRollbackJournalRows = [
   'created|/aifar/apps/keepalived/sbin/keepalived|-|keepalived_exec_t',
   'updated|/aifar/apps/keepalived/etc(/.*)?|old_etc_t|keepalived_etc_t',
@@ -1880,6 +1951,12 @@ function assertUninstallStateRestored(result) {
   }).sort())
 }
 
+function assertUninstallRootNotReplaced(result) {
+  assert.equal(result.appRootExists, true)
+  assert.equal(result.marker, 'before-uninstall\n')
+  assert.equal(result.rootIdentityAfter, result.rootIdentityBefore)
+}
+
 test('uninstaller preflight rejects an externally changed SELinux mapping before mutation', (t) => {
   const result = runUninstallTransactionHarness(t, { externalSelinuxPattern: '/run(' })
   assert.equal(result.status, 1, result.stderr)
@@ -1891,22 +1968,75 @@ test('uninstaller preflight rejects an externally changed SELinux mapping before
   assert.equal(result.enabled, '1')
 })
 
+test('uninstaller ignores an externally changed unchanged SELinux mapping', (t) => {
+  const result = runUninstallTransactionHarness(t, { externalSelinuxPattern: '/etc(' })
+  assert.equal(result.status, 0, result.stderr)
+  assert.equal(result.appRootExists, false)
+  assert.equal(result.selinuxCalls.some((call) => call.includes('/etc(')), false)
+  assert.deepEqual(result.selinuxState, [
+    '/aifar/apps/keepalived/etc(/.*)?|external_type_t'
+  ])
+})
+
+test('uninstaller ignores a missing unchanged SELinux mapping', (t) => {
+  const result = runUninstallTransactionHarness(t, { missingSelinuxPattern: '/etc(' })
+  assert.equal(result.status, 0, result.stderr)
+  assert.equal(result.appRootExists, false)
+  assert.equal(result.selinuxCalls.some((call) => call.includes('/etc(')), false)
+  assert.deepEqual(result.selinuxState, [])
+})
+
 test('uninstaller rolls back service state when disable fails', (t) => {
   const result = runUninstallTransactionHarness(t, { failDisable: true })
   assert.equal(result.status, 61, result.stderr)
   assertUninstallStateRestored(result)
+  assertUninstallRootNotReplaced(result)
+})
+
+test('uninstaller does not replace the application root when stop fails', (t) => {
+  const result = runUninstallTransactionHarness(t, { failStop: true })
+  assert.equal(result.status, 60, result.stderr)
+  assertUninstallStateRestored(result)
+  assertUninstallRootNotReplaced(result)
+})
+
+test('uninstaller rollback does not control a foreign unit installed after preflight', (t) => {
+  const result = runUninstallTransactionHarness(t, {
+    failDisable: true,
+    replaceUnitAfterDisableFailure: true
+  })
+  assert.equal(result.status, 61, result.stderr)
+  assertUninstallRootNotReplaced(result)
+  const serviceMutations = result.calls.filter((call) =>
+    /systemctl\|(stop|disable|enable|restart) keepalived\.service$/.test(call)
+  )
+  assert.deepEqual(serviceMutations, [
+    'systemctl|stop keepalived.service',
+    'systemctl|disable keepalived.service'
+  ])
+  assert.equal(result.calls.includes('systemctl|daemon-reload'), false)
+  assert.equal(result.unitLinkTarget, result.foreignUnitTarget)
 })
 
 test('uninstaller rolls back an earlier firewall removal when a later removal fails', (t) => {
   const result = runUninstallTransactionHarness(t, { failFirewallForm: 'permanent' })
   assert.equal(result.status, 56, result.stderr)
   assertUninstallStateRestored(result)
+  assertUninstallRootNotReplaced(result)
 })
 
 test('uninstaller rolls back firewall and SELinux mutations when semanage fails', (t) => {
   const result = runUninstallTransactionHarness(t, { failSelinuxPattern: '/var(/.*)?' })
   assert.equal(result.status, 53, result.stderr)
   assertUninstallStateRestored(result)
+  assertUninstallRootNotReplaced(result)
+})
+
+test('uninstaller restores the application root when deletion starts and then fails', (t) => {
+  const result = runUninstallTransactionHarness(t, { failRootRemoval: true })
+  assert.equal(result.status, 1, result.stderr)
+  assertUninstallStateRestored(result)
+  assert.notEqual(result.rootIdentityAfter, result.rootIdentityBefore)
 })
 
 test('successful transactional uninstall removes only managed state', (t) => {

@@ -299,15 +299,13 @@ retire_legacy_mapping() {
     local current_context="" current_type="" retired_action=""
 
     [[ "$pattern" == '/aifar/apps/keepalived/scripts(/.*)?' ]] || die "unexpected legacy SELinux pattern: $pattern"
+    [[ "$action" != unchanged ]] || return 0
     current_context="$(mapping_context "$pattern")"
     [[ -n "$current_context" ]] || die "legacy SELinux mapping is missing: $pattern"
     current_type="$(context_type "$current_context")" || die "cannot parse legacy SELinux mapping: $pattern"
     [[ "$current_type" == "$applied_type" ]] || die "legacy SELinux mapping was externally modified: $pattern"
 
     case "$action" in
-        unchanged)
-            return 0
-            ;;
         created)
             retired_action=retired_created
             append_journal "$retired_action" "$pattern" "$previous_type" "$applied_type" || die "cannot journal legacy SELinux mapping retirement: $pattern"

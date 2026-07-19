@@ -11,10 +11,12 @@ readonly SELINUX_RECORD="$APP_ROOT/var/lib/aifar/keepalived-selinux-fcontexts"
 readonly FIREWALL_RECORD="$APP_ROOT/var/lib/aifar/firewall-rule"
 BACKUP_DIR=""
 TRANSACTION_ACTIVE=0
+ROOT_MUTATION_STARTED=0
 SERVICE_WAS_ACTIVE=0
 SERVICE_WAS_ENABLED=0
 UNIT_LINK_EXISTED=0
 UNIT_LINK_TARGET=""
+UNIT_ROLLBACK_CONFLICT=0
 FIREWALL_RUNTIME_PRESENT=0
 FIREWALL_PERMANENT_PRESENT=0
 
@@ -305,6 +307,7 @@ preflight_selinux_state() {
     validate_selinux_record_file "$SELINUX_RECORD"
     require_command semanage
     while IFS='|' read -r action pattern previous_type applied_type; do
+        [[ "$action" != unchanged ]] || continue
         current_context="$(mapping_context "$pattern")"
         [[ -n "$current_context" ]] || die "SELinux mapping missing before uninstall: $pattern"
         current_type="$(context_type "$current_context")" || die "cannot parse SELinux mapping before uninstall: $pattern"
@@ -328,6 +331,7 @@ restore_selinux_mappings() {
 
     [[ -s "$SELINUX_RECORD" ]] || return 0
     while IFS='|' read -r action pattern previous_type applied_type; do
+        [[ "$action" != unchanged ]] || continue
         current_context="$(mapping_context "$pattern")"
         case "$action" in
             created)
@@ -344,8 +348,6 @@ restore_selinux_mappings() {
                 [[ "$previous_type" == *_t ]] || die "SELinux 原始类型记录无效：$pattern"
                 append_uninstall_selinux_journal "$action" "$pattern" "$previous_type" "$applied_type"
                 semanage fcontext -m -t "$previous_type" "$pattern"
-                ;;
-            unchanged)
                 ;;
             *)
                 die "未知 SELinux 映射记录：$action"
@@ -435,20 +437,39 @@ rollback_uninstall_firewall_journal() {
 }
 
 restore_uninstall_unit_and_service() {
-    local current_target="" rollback_status=0
+    local current_target="" fragment="" fragment_target="" rollback_status=0
 
+    UNIT_ROLLBACK_CONFLICT=0
     if [[ -e "$UNIT_LINK" || -L "$UNIT_LINK" ]]; then
         current_target="$(readlink -f -- "$UNIT_LINK" 2>/dev/null || true)"
         if [[ "$current_target" == "$EXPECTED_UNIT" ]]; then
             rm -f -- "$UNIT_LINK" || rollback_status=1
         else
-            rollback_status=1
+            UNIT_ROLLBACK_CONFLICT=1
+            return 1
         fi
     fi
     if [[ "$UNIT_LINK_EXISTED" -eq 1 ]]; then
         [[ "$UNIT_LINK_TARGET" == "$EXPECTED_UNIT" ]] && ln -s -- "$UNIT_LINK_TARGET" "$UNIT_LINK" || rollback_status=1
     fi
-    systemctl daemon-reload || rollback_status=1
+    if [[ "$rollback_status" -ne 0 ]]; then
+        UNIT_ROLLBACK_CONFLICT=1
+        return 1
+    fi
+    if [[ "$UNIT_LINK_EXISTED" -eq 1 ]]; then
+        current_target="$(readlink -f -- "$UNIT_LINK" 2>/dev/null || true)"
+        if [[ ! -L "$UNIT_LINK" || "$current_target" != "$EXPECTED_UNIT" ]]; then
+            UNIT_ROLLBACK_CONFLICT=1
+            return 1
+        fi
+    fi
+    systemctl daemon-reload || return 1
+    fragment="$(systemctl show -p FragmentPath --value keepalived.service 2>/dev/null || true)"
+    fragment_target="$(readlink -f -- "$fragment" 2>/dev/null || true)"
+    if [[ "$fragment_target" != "$EXPECTED_UNIT" ]]; then
+        UNIT_ROLLBACK_CONFLICT=1
+        return 1
+    fi
     if [[ "$SERVICE_WAS_ENABLED" -eq 1 ]]; then
         systemctl enable keepalived.service || rollback_status=1
     else
@@ -469,10 +490,12 @@ rollback_uninstall_transaction() {
        ! (cd "$BACKUP_DIR" && sha256sum --check BACKUP.sha256); then
         return 1
     fi
-    if [[ -e "$APP_ROOT" || -L "$APP_ROOT" ]]; then
-        safe_remove_uninstall_root || return 1
+    if [[ "$ROOT_MUTATION_STARTED" -eq 1 ]]; then
+        if [[ -e "$APP_ROOT" || -L "$APP_ROOT" ]]; then
+            safe_remove_uninstall_root || return 1
+        fi
+        cp -a -- "$BACKUP_DIR/installed-root" "$APP_ROOT" || return 1
     fi
-    cp -a -- "$BACKUP_DIR/installed-root" "$APP_ROOT" || return 1
     rollback_uninstall_selinux_journal || rollback_status=1
     rollback_uninstall_firewall_journal || rollback_status=1
     restore_uninstall_unit_and_service || rollback_status=1
@@ -499,6 +522,7 @@ perform_uninstall_mutations() {
     systemctl daemon-reload
     remove_owned_firewall_rule
     restore_selinux_mappings
+    ROOT_MUTATION_STARTED=1
     safe_remove_uninstall_root || die "failed to remove the managed Keepalived installation root"
     if command -v restorecon >/dev/null 2>&1 && [[ -d /aifar/apps ]]; then
         restorecon -F /aifar/apps
