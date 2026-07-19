@@ -79,33 +79,54 @@ function bashEnvironment(binPath, pythonArgsPath, overrides = {}) {
   }
 }
 
-function runHealthHarness(t, { body, status = 0, url = 'http://127.0.0.1:38000/health' }) {
+function runHealthHarness(t, {
+  body,
+  status = 0,
+  httpStatus = 200,
+  url = 'http://127.0.0.1:38000/health'
+}) {
   const fixture = mkdtempSync(path.join(os.tmpdir(), 'aifar-keepalived-health-test-'))
   t.after(() => rmSync(fixture, { force: true, recursive: true }))
   const harnessPath = path.join(fixture, 'harness.sh')
   const urlPath = path.join(fixture, 'keepalived-health-url')
   const binPath = path.join(fixture, 'bin')
   const curlArgsPath = path.join(fixture, 'curl-args')
+  const curlBodyPath = path.join(fixture, 'curl-body')
   const pythonArgsPath = path.join(fixture, 'python-args')
   mkdirSync(binPath)
   writeFileSync(urlPath, url)
+  writeFileSync(curlBodyPath, body)
   writeRealPythonShim(binPath, pythonArgsPath)
   writeFileSync(harnessPath, `#!/usr/bin/env bash
 set -Eeuo pipefail
 source '${toMsysPath(healthScriptPath)}'
 HEALTH_URL_FILE='${toMsysPath(urlPath)}'
 curl() {
+    local output_file='' argument=''
     printf '%s\\n' "\$@" >'${toMsysPath(curlArgsPath)}'
     [[ "\${FAKE_CURL_STATUS:-0}" -eq 0 ]] || return "\$FAKE_CURL_STATUS"
-    printf '%s' "\${FAKE_CURL_BODY:-}"
+    while [[ "\$#" -gt 0 ]]; do
+        argument="\$1"
+        shift
+        if [[ "\$argument" == '--output' ]]; then
+            output_file="\$1"
+            shift
+        fi
+    done
+    if [[ -n "\$output_file" ]]; then
+        cp -- '${toMsysPath(curlBodyPath)}' "\$output_file"
+        printf '%s' "\${FAKE_HTTP_STATUS:-200}"
+    else
+        cat -- '${toMsysPath(curlBodyPath)}'
+    fi
 }
 check_health "\$HEALTH_URL_FILE"
 `)
   const result = spawnSync(bashPath, [toMsysPath(harnessPath)], {
     encoding: 'utf8',
     env: bashEnvironment(binPath, pythonArgsPath, {
-      FAKE_CURL_BODY: body,
-      FAKE_CURL_STATUS: String(status)
+      FAKE_CURL_STATUS: String(status),
+      FAKE_HTTP_STATUS: String(httpStatus)
     })
   })
   return {
@@ -268,9 +289,20 @@ function writeSelinuxHelperFixture(fixture) {
   return { appRoot, fixtureHelperPath }
 }
 
-const validSelinuxRecord = () => [
+const validSelinuxRecordRows = () => [
   'created|/aifar/apps/keepalived/sbin/keepalived|-|keepalived_exec_t',
-  'unchanged|/aifar/apps/keepalived/etc(/.*)?|keepalived_etc_t|keepalived_etc_t'
+  'unchanged|/aifar/apps/keepalived/etc(/.*)?|keepalived_etc_t|keepalived_etc_t',
+  'created|/aifar/apps/keepalived/libexec(/.*)?|-|keepalived_exec_t',
+  'created|/aifar/apps/keepalived/var(/.*)?|-|keepalived_var_lib_t',
+  'created|/aifar/apps/keepalived/run(/.*)?|-|keepalived_var_run_t',
+  'created|/aifar/apps/keepalived/systemd/keepalived\\.service|-|keepalived_unit_file_t'
+]
+
+const validSelinuxRecord = () => validSelinuxRecordRows().join('\n') + '\n'
+
+const legacySelinuxRecord = () => [
+  ...validSelinuxRecordRows().filter((row) => !row.includes('/libexec(')),
+  'created|/aifar/apps/keepalived/scripts(/.*)?|-|keepalived_exec_t'
 ].join('\n') + '\n'
 
 function runSelinuxRecordValidationHarness(t, { scriptKind, contents, symlink = false }) {
@@ -338,6 +370,7 @@ semanage() {
             set_selinux_mapping "\$pattern" "\$type"
     elif [[ "\${1:-}" == fcontext && "\${2:-}" == -d ]]; then
             pattern="\$3"; printf 'delete|%s\\n' "\$pattern" >>'${toMsysPath(callLogPath)}'
+            ! should_fail_selinux_mutation delete "\$pattern" || return 53
             set_selinux_mapping "\$pattern" ''
     else
         return 97
@@ -423,14 +456,16 @@ rollback_current_journal
 function runInstallerSelinuxRollbackHarness(t, { row, stateRows = [] }) {
   const fixture = mkdtempSync(path.join(rootDir, '.aifar-keepalived-selinux-outer-rollback-test-'))
   t.after(() => rmSync(fixture, { force: true, recursive: true }))
-  const { fixtureInstallerPath } = writeInstallerFixture(fixture)
+  const { appRoot, fixtureInstallerPath } = writeInstallerFixture(fixture)
   const harnessPath = path.join(fixture, 'harness.sh')
   const workDir = path.join(fixture, 'work')
   const statePath = path.join(fixture, 'selinux-state')
   const callLogPath = path.join(fixture, 'semanage-calls')
+  const normalize = (value) => value.replaceAll('/aifar/apps/keepalived', toMsysPath(appRoot))
+  const denormalize = (value) => value.replaceAll(toMsysPath(appRoot), '/aifar/apps/keepalived')
   mkdirSync(workDir)
-  writeFileSync(path.join(workDir, 'selinux-journal.tsv'), `${row}\n`)
-  writeFileSync(statePath, stateRows.join('\n') + (stateRows.length ? '\n' : ''))
+  writeFileSync(path.join(workDir, 'selinux-journal.tsv'), `${normalize(row)}\n`)
+  writeFileSync(statePath, stateRows.map(normalize).join('\n') + (stateRows.length ? '\n' : ''))
   writeFileSync(harnessPath, `#!/usr/bin/env bash
 set -Eeuo pipefail
 source '${toMsysPath(fixtureInstallerPath)}'
@@ -441,8 +476,52 @@ rollback_selinux_journal
   const result = spawnSync(bashPath, [toMsysPath(harnessPath)], { encoding: 'utf8' })
   return {
     ...result,
-    calls: readSelinuxCalls(callLogPath),
-    state: readSelinuxState(statePath)
+    calls: readSelinuxCalls(callLogPath).map(denormalize),
+    state: readSelinuxState(statePath).map(denormalize)
+  }
+}
+
+function runLegacySelinuxMigrationHarness(t, { failSemanage = '' } = {}) {
+  const fixture = mkdtempSync(path.join(rootDir, '.aifar-keepalived-selinux-legacy-migration-test-'))
+  t.after(() => rmSync(fixture, { force: true, recursive: true }))
+  const { appRoot, fixtureHelperPath } = writeSelinuxHelperFixture(fixture)
+  const harnessPath = path.join(fixture, 'harness.sh')
+  const statePath = path.join(fixture, 'selinux-state')
+  const callLogPath = path.join(fixture, 'semanage-calls')
+  const nextRecordPath = path.join(fixture, 'next-record')
+  const journalPath = path.join(fixture, 'journal')
+  const normalize = (value) => value.replaceAll('/aifar/apps/keepalived', toMsysPath(appRoot))
+  const recordPath = path.join(appRoot, 'var', 'lib', 'aifar', 'keepalived-selinux-fcontexts')
+  const legacyRows = legacySelinuxRecord().trimEnd().split('\n').map(normalize)
+  mkdirSync(path.dirname(recordPath), { recursive: true })
+  writeFileSync(recordPath, legacyRows.join('\n') + '\n')
+  writeFileSync(statePath, legacyRows.map((row) => {
+    const [, pattern, , appliedType] = row.split('|')
+    return `${pattern}|${appliedType}`
+  }).join('\n') + '\n')
+  writeFileSync(harnessPath, `#!/usr/bin/env bash
+set -Eeuo pipefail
+source '${toMsysPath(fixtureHelperPath)}'
+${fakeSelinuxFunction({ statePath, callLogPath })}
+matchpathcon() { printf 'system_u:object_r:keepalived_exec_t:s0\\n'; }
+FAKE_FAIL_SEMANAGE='${failSemanage}'
+build_next_record
+cp -- "\$NEXT_RECORD" '${toMsysPath(nextRecordPath)}'
+cp -- "\$CURRENT_JOURNAL" '${toMsysPath(journalPath)}'
+trap - EXIT
+`)
+  const result = spawnSync(bashPath, [toMsysPath(harnessPath)], { encoding: 'utf8' })
+  const denormalize = (value) => value.replaceAll(toMsysPath(appRoot), '/aifar/apps/keepalived')
+  return {
+    ...result,
+    calls: readSelinuxCalls(callLogPath).map(denormalize),
+    state: readSelinuxState(statePath).map(denormalize),
+    nextRecord: existsSync(nextRecordPath)
+      ? readFileSync(nextRecordPath, 'utf8').split('\n').filter(Boolean).map(denormalize)
+      : [],
+    journal: existsSync(journalPath)
+      ? readFileSync(journalPath, 'utf8').split('\n').filter(Boolean).map(denormalize)
+      : []
   }
 }
 
@@ -615,6 +694,108 @@ remove_owned_firewall_rule
     permanentRules: readRules(permanentPath),
     appRootExists: existsSync(appRoot),
     recordExists: existsSync(recordPath)
+  }
+}
+
+function runUninstallTransactionHarness(t, {
+  externalSelinuxPattern = '',
+  failDisable = false,
+  failFirewallForm = '',
+  failSelinuxPattern = ''
+} = {}) {
+  const fixture = mkdtempSync(path.join(rootDir, '.aifar-keepalived-uninstall-transaction-test-'))
+  t.after(() => rmSync(fixture, { force: true, recursive: true }))
+  const { appRoot, fixtureUninstallerPath } = writeUninstallerFixture(fixture)
+  const harnessPath = path.join(fixture, 'harness.sh')
+  const callLogPath = path.join(fixture, 'uninstall-calls')
+  const firewallCallLogPath = path.join(fixture, 'firewall-calls')
+  const selinuxCallLogPath = path.join(fixture, 'selinux-calls')
+  const runtimePath = path.join(fixture, 'runtime-rules')
+  const permanentPath = path.join(fixture, 'permanent-rules')
+  const selinuxStatePath = path.join(fixture, 'selinux-state')
+  const activePath = path.join(fixture, 'service-active')
+  const enabledPath = path.join(fixture, 'service-enabled')
+  const unitLink = path.join(fixture, 'etc', 'systemd', 'system', 'keepalived.service')
+  const expectedUnit = path.join(appRoot, 'systemd', 'keepalived.service')
+  const firewallRecordPath = path.join(appRoot, 'var', 'lib', 'aifar', 'firewall-rule')
+  const selinuxRecordPath = path.join(appRoot, 'var', 'lib', 'aifar', 'keepalived-selinux-fcontexts')
+  const markerPath = path.join(appRoot, 'preserved-marker')
+  const rule = peerRule('192.168.74.133')
+  const normalize = (value) => value.replaceAll('/aifar/apps/keepalived', toMsysPath(appRoot))
+  const selinuxRows = validSelinuxRecordRows().map(normalize)
+  const normalizedFailSelinuxPattern = failSelinuxPattern
+    ? selinuxRows.map((row) => row.split('|')[1]).find((pattern) => pattern.includes(failSelinuxPattern)) ?? ''
+    : ''
+  const selinuxState = selinuxRows.map((row) => {
+    const [, pattern, , appliedType] = row.split('|')
+    return `${pattern}|${externalSelinuxPattern && pattern.includes(externalSelinuxPattern) ? 'external_type_t' : appliedType}`
+  })
+  mkdirSync(path.dirname(expectedUnit), { recursive: true })
+  mkdirSync(path.dirname(unitLink), { recursive: true })
+  mkdirSync(path.dirname(firewallRecordPath), { recursive: true })
+  writeFileSync(expectedUnit, '[Unit]\nDescription=fixture\n')
+  writeFileSync(markerPath, 'before-uninstall\n')
+  writeFirewallRecord(firewallRecordPath, { zone: 'public', rule, runtimeCreated: 1, permanentCreated: 1 })
+  writeFileSync(selinuxRecordPath, selinuxRows.join('\n') + '\n')
+  writeFileSync(runtimePath, `${rule}\n`)
+  writeFileSync(permanentPath, `${rule}\n`)
+  writeFileSync(selinuxStatePath, selinuxState.join('\n') + '\n')
+  writeFileSync(activePath, '1')
+  writeFileSync(enabledPath, '1')
+  writeFileSync(harnessPath, `#!/usr/bin/env bash
+set -Eeuo pipefail
+ln -s -- '${toMsysPath(expectedUnit)}' '${toMsysPath(unitLink)}'
+source '${toMsysPath(fixtureUninstallerPath)}'
+${fakeInstallFunction()}
+mountpoint() { return 1; }
+systemctl() {
+    printf 'systemctl|%s\\n' "\$*" >>'${toMsysPath(callLogPath)}'
+    case "\$*" in
+        'is-active --quiet keepalived.service') [[ "\$(cat '${toMsysPath(activePath)}')" == 1 ]] ;;
+        'is-enabled --quiet keepalived.service') [[ "\$(cat '${toMsysPath(enabledPath)}')" == 1 ]] ;;
+        'is-active --quiet firewalld.service') return 0 ;;
+        'show -p FragmentPath --value keepalived.service') printf '%s\\n' '${toMsysPath(expectedUnit)}' ;;
+        'stop keepalived.service') printf 0 >'${toMsysPath(activePath)}' ;;
+        'disable keepalived.service')
+            [[ '${failDisable ? 1 : 0}' -eq 0 ]] || return 61
+            printf 0 >'${toMsysPath(enabledPath)}'
+            rm -f -- "\$UNIT_LINK"
+            ;;
+        'enable keepalived.service')
+            printf 1 >'${toMsysPath(enabledPath)}'
+            [[ -e "\$UNIT_LINK" || -L "\$UNIT_LINK" ]] || ln -s -- "\$EXPECTED_UNIT" "\$UNIT_LINK"
+            ;;
+        'start keepalived.service'|'restart keepalived.service') printf 1 >'${toMsysPath(activePath)}' ;;
+        'daemon-reload') ;;
+        *) return 97 ;;
+    esac
+}
+FAKE_FAIL_REMOVE_FORM='${failFirewallForm}'
+${fakeFirewallFunction({ callLogPath: firewallCallLogPath, runtimePath, permanentPath })}
+FAKE_FAIL_SEMANAGE='${failSelinuxPattern ? 'delete' : ''}'
+FAKE_FAIL_SEMANAGE_PATTERN='${normalizedFailSelinuxPattern}'
+FAKE_FAIL_SEMANAGE_ONCE=1
+${fakeSelinuxFunction({ statePath: selinuxStatePath, callLogPath: selinuxCallLogPath })}
+execute_uninstall_transaction
+`)
+  const result = spawnSync(bashPath, [toMsysPath(harnessPath)], {
+    encoding: 'utf8',
+    env: { ...process.env, MSYS: 'winsymlinks:sys' }
+  })
+  const readLines = (file) => existsSync(file) ? readFileSync(file, 'utf8').split('\n').filter(Boolean) : []
+  return {
+    ...result,
+    appRootExists: existsSync(appRoot),
+    marker: existsSync(markerPath) ? readFileSync(markerPath, 'utf8') : '',
+    active: existsSync(activePath) ? readFileSync(activePath, 'utf8') : '',
+    enabled: existsSync(enabledPath) ? readFileSync(enabledPath, 'utf8') : '',
+    unitLinkExists: existsSync(unitLink),
+    runtimeRules: readLines(runtimePath),
+    permanentRules: readLines(permanentPath),
+    selinuxState: readLines(selinuxStatePath).map((line) => line.replaceAll(toMsysPath(appRoot), '/aifar/apps/keepalived')),
+    calls: readLines(callLogPath),
+    firewallCalls: readLines(firewallCallLogPath),
+    selinuxCalls: readLines(selinuxCallLogPath)
   }
 }
 
@@ -850,10 +1031,15 @@ function runManagedConfigurationHarness(t, { stagedStatus = 0 } = {}) {
   const syntaxLogPath = path.join(fixture, 'syntax-calls')
   const binaryPath = path.join(appRoot, 'sbin', 'keepalived')
   const formalConfigPath = path.join(appRoot, 'etc', 'keepalived', 'keepalived.conf')
+  const healthUrlPath = path.join(appRoot, 'etc', 'keepalived', 'keepalived-health-url')
+  const installedHealthScriptPath = path.join(appRoot, 'libexec', 'check-aggregate-health.sh')
   mkdirSync(path.dirname(binaryPath), { recursive: true })
   mkdirSync(path.dirname(formalConfigPath), { recursive: true })
+  mkdirSync(path.dirname(installedHealthScriptPath), { recursive: true })
   mkdirSync(workDir, { recursive: true })
   writeFileSync(formalConfigPath, 'previous-config\n')
+  writeFileSync(healthUrlPath, 'http://127.0.0.1:38000/previous\n')
+  writeFileSync(installedHealthScriptPath, '#!/usr/bin/env bash\n# previous health script\n')
   writeFileSync(stagedConfigPath, 'managed-config\n')
   writeFileSync(binaryPath, `#!/usr/bin/env bash
 printf '%s\\n' "\$*" >>'${toMsysPath(syntaxLogPath)}'
@@ -878,10 +1064,69 @@ install_managed_configuration '${toMsysPath(stagedConfigPath)}'
     healthUrl: existsSync(path.join(appRoot, 'etc', 'keepalived', 'keepalived-health-url'))
       ? readFileSync(path.join(appRoot, 'etc', 'keepalived', 'keepalived-health-url'), 'utf8')
       : '',
-    installedHealthScript: existsSync(path.join(appRoot, 'libexec', 'check-aggregate-health.sh')),
+    installedHealthScript: existsSync(installedHealthScriptPath),
+    installedHealthScriptContents: readFileSync(installedHealthScriptPath, 'utf8'),
     syntaxCalls: existsSync(syntaxLogPath)
       ? readFileSync(syntaxLogPath, 'utf8').trimEnd().split('\n')
       : []
+  }
+}
+
+function runManagedConfigurationCommitFailureHarness(t, failRename) {
+  const fixture = mkdtempSync(path.join(rootDir, '.aifar-keepalived-config-commit-test-'))
+  t.after(() => rmSync(fixture, { force: true, recursive: true }))
+  const { appRoot, fixtureInstallerPath } = writeInstallerFixture(fixture)
+  const harnessPath = path.join(fixture, 'harness.sh')
+  const workDir = path.join(fixture, 'work')
+  const stagedConfigPath = path.join(workDir, 'keepalived.conf')
+  const callLogPath = path.join(fixture, 'systemctl-calls')
+  const binaryPath = path.join(appRoot, 'sbin', 'keepalived')
+  const configPath = path.join(appRoot, 'etc', 'keepalived', 'keepalived.conf')
+  const healthUrlPath = path.join(appRoot, 'etc', 'keepalived', 'keepalived-health-url')
+  const healthScriptPath = path.join(appRoot, 'libexec', 'check-aggregate-health.sh')
+  mkdirSync(path.dirname(binaryPath), { recursive: true })
+  mkdirSync(path.dirname(configPath), { recursive: true })
+  mkdirSync(path.dirname(healthScriptPath), { recursive: true })
+  mkdirSync(workDir)
+  writeFileSync(binaryPath, '#!/usr/bin/env bash\nexit 0\n')
+  chmodSync(binaryPath, 0o750)
+  writeFileSync(configPath, 'old-config\n')
+  writeFileSync(healthUrlPath, 'http://127.0.0.1:38000/old\n')
+  writeFileSync(healthScriptPath, '#!/usr/bin/env bash\n# old-health\n')
+  writeFileSync(stagedConfigPath, 'new-config\n')
+  writeFileSync(harnessPath, `#!/usr/bin/env bash
+set -Eeuo pipefail
+source '${toMsysPath(fixtureInstallerPath)}'
+${fakeInstallFunction()}
+FAKE_ACTIVE=0
+FAKE_ENABLED=0
+FAKE_ACTIVATION_ATTEMPTED=0
+FAKE_FINAL_ACTIVE_FAILURE=0
+${fakeSystemctlFunction(callLogPath)}
+mountpoint() { return 1; }
+WORK_DIR='${toMsysPath(workDir)}'
+NODE_HEALTH_URL='http://127.0.0.1:38000/new'
+capture_service_state
+create_install_backup
+FAKE_MANAGED_RENAME_COUNT=0
+mv() {
+    case "\${*: -1}" in
+        "\$FORMAL_CONFIG"|"\$HEALTH_URL_FILE"|"\$APP_ROOT/libexec/check-aggregate-health.sh")
+            FAKE_MANAGED_RENAME_COUNT=\$((FAKE_MANAGED_RENAME_COUNT + 1))
+            [[ "\$FAKE_MANAGED_RENAME_COUNT" -ne ${failRename} ]] || return 71
+            ;;
+    esac
+    command mv "\$@"
+}
+install_managed_configuration '${toMsysPath(stagedConfigPath)}'
+TRANSACTION_ACTIVE=0
+`)
+  const result = spawnSync(bashPath, [toMsysPath(harnessPath)], { encoding: 'utf8' })
+  return {
+    ...result,
+    config: readFileSync(configPath, 'utf8'),
+    healthUrl: readFileSync(healthUrlPath, 'utf8'),
+    healthScript: readFileSync(healthScriptPath, 'utf8')
   }
 }
 
@@ -992,6 +1237,11 @@ const invalidSelinuxRecords = [
   {
     name: 'inconsistent updated types',
     contents: 'updated|/aifar/apps/keepalived/etc(/.*)?|keepalived_etc_t|keepalived_etc_t\n'
+  },
+  {
+    name: 'mixed current and legacy core patterns',
+    contents: validSelinuxRecord() +
+      'created|/aifar/apps/keepalived/scripts(/.*)?|-|keepalived_exec_t\n'
   }
 ]
 
@@ -1003,6 +1253,26 @@ for (const scriptKind of ['helper', 'installer', 'uninstaller']) {
     })
     assert.equal(result.status, 0, result.stderr)
   })
+
+  test(`${scriptKind} accepts the explicit pre-libexec legacy SELinux migration record`, (t) => {
+    const result = runSelinuxRecordValidationHarness(t, {
+      scriptKind,
+      contents: legacySelinuxRecord()
+    })
+    assert.equal(result.status, 0, result.stderr)
+  })
+
+  for (const missingPattern of [
+    '/sbin/keepalived', '/etc(', '/libexec(', '/var(', '/run(', '/systemd/keepalived'
+  ]) {
+    test(`${scriptKind} rejects a SELinux ownership record missing core pattern ${missingPattern}`, (t) => {
+      const contents = validSelinuxRecordRows()
+        .filter((row) => !row.includes(missingPattern))
+        .join('\n') + '\n'
+      const result = runSelinuxRecordValidationHarness(t, { scriptKind, contents })
+      assert.equal(result.status, 1, result.stderr)
+    })
+  }
 
   test(`${scriptKind} rejects a symlink SELinux ownership record`, (t) => {
     const result = runSelinuxRecordValidationHarness(t, {
@@ -1052,6 +1322,32 @@ test('SELinux journal failure immediately reverses and verifies a successful mut
     'delete|/aifar/apps/keepalived/libexec(/.*)?'
   ])
   assert.deepEqual(result.state, [])
+})
+
+test('SELinux helper migrates a legacy created scripts mapping to exactly six core mappings', (t) => {
+  const result = runLegacySelinuxMigrationHarness(t)
+  assert.equal(result.status, 0, result.stderr)
+  assert.equal(result.nextRecord.length, 6)
+  assert.equal(result.nextRecord.some((row) => row.includes('/scripts(')), false)
+  assert.equal(result.nextRecord.some((row) => row.includes('/libexec(')), true)
+  assert.deepEqual(result.calls, [
+    'delete|/aifar/apps/keepalived/scripts(/.*)?',
+    'add|/aifar/apps/keepalived/libexec(/.*)?|keepalived_exec_t'
+  ])
+  assert.deepEqual(result.journal, [
+    'retired_created|/aifar/apps/keepalived/scripts(/.*)?|-|keepalived_exec_t',
+    'created|/aifar/apps/keepalived/libexec(/.*)?|-|keepalived_exec_t'
+  ])
+  assert.equal(result.state.some((row) => row.includes('/scripts(')), false)
+  assert.equal(result.state.some((row) => row.includes('/libexec(')), true)
+})
+
+test('failed legacy SELinux retirement preserves the old mapping through write-ahead rollback', (t) => {
+  const result = runLegacySelinuxMigrationHarness(t, { failSemanage: 'delete' })
+  assert.equal(result.status, 1, result.stderr)
+  assert.deepEqual(result.calls, ['delete|/aifar/apps/keepalived/scripts(/.*)?'])
+  assert.equal(result.state.some((row) => row === '/aifar/apps/keepalived/scripts(/.*)?|keepalived_exec_t'), true)
+  assert.equal(result.state.some((row) => row.includes('/libexec(')), false)
 })
 
 const helperRollbackJournalRows = [
@@ -1141,6 +1437,28 @@ test('outer SELinux rollback does not overwrite an externally changed type', (t)
   assert.equal(result.status, 1, result.stderr)
   assert.deepEqual(result.calls, [])
   assert.deepEqual(result.state, [`${pattern}|external_etc_t`])
+})
+
+test('helper SELinux rollback restores a retired legacy created mapping', (t) => {
+  const pattern = '/aifar/apps/keepalived/scripts(/.*)?'
+  const result = runSelinuxHelperRollbackHarness(t, {
+    journalRows: [`retired_created|${pattern}|-|keepalived_exec_t`],
+    stateRows: []
+  })
+  assert.equal(result.status, 0, result.stderr)
+  assert.deepEqual(result.calls, [`add|${pattern}|keepalived_exec_t`])
+  assert.deepEqual(result.state, [`${pattern}|keepalived_exec_t`])
+})
+
+test('outer SELinux rollback restores a retired legacy updated mapping', (t) => {
+  const pattern = '/aifar/apps/keepalived/scripts(/.*)?'
+  const result = runInstallerSelinuxRollbackHarness(t, {
+    row: `retired_updated|${pattern}|legacy_scripts_t|keepalived_exec_t`,
+    stateRows: [`${pattern}|legacy_scripts_t`]
+  })
+  assert.equal(result.status, 0, result.stderr)
+  assert.deepEqual(result.calls, [`update|${pattern}|keepalived_exec_t`])
+  assert.deepEqual(result.state, [`${pattern}|keepalived_exec_t`])
 })
 
 test('Python 3 interpreter selection is portable instead of requiring one workstation path', () => {
@@ -1409,8 +1727,20 @@ test('installer leaves the formal configuration unchanged when staged syntax is 
   const result = runManagedConfigurationHarness(t, { stagedStatus: 1 })
   assert.equal(result.status, 1, result.stderr)
   assert.equal(result.formalConfig, 'previous-config\n')
+  assert.equal(result.healthUrl, 'http://127.0.0.1:38000/previous\n')
+  assert.equal(result.installedHealthScriptContents, '#!/usr/bin/env bash\n# previous health script\n')
   assert.equal(result.syntaxCalls.length, 1)
 })
+
+for (const failRename of [1, 2, 3]) {
+  test(`installer restores the full old root when managed rename ${failRename} fails`, (t) => {
+    const result = runManagedConfigurationCommitFailureHarness(t, failRename)
+    assert.equal(result.status, 71, result.stderr)
+    assert.equal(result.config, 'old-config\n')
+    assert.equal(result.healthUrl, 'http://127.0.0.1:38000/old\n')
+    assert.equal(result.healthScript, '#!/usr/bin/env bash\n# old-health\n')
+  })
+}
 
 test('rollback replaces a failed update with the verified full previous root', (t) => {
   const result = runExistingRootRollbackHarness(t)
@@ -1504,6 +1834,17 @@ test('inactive firewalld performs no firewall command and writes no ownership re
   assert.equal(result.record, '')
 })
 
+test('inactive firewalld rejects an existing owned record without firewall mutation', (t) => {
+  const rule = peerRule('192.168.74.140')
+  const result = runFirewallHarness(t, {
+    active: false,
+    oldRecord: { zone: 'public', rule, runtimeCreated: 1, permanentCreated: 1 }
+  })
+  assert.equal(result.status, 1, result.stderr)
+  assert.deepEqual(result.calls, [])
+  assert.equal(result.record, `zone=public\nrule=${rule}\nruntime_created=1\npermanent_created=1\n`)
+})
+
 test('uninstaller rejects a malformed firewall ownership record', (t) => {
   const result = runUninstallFirewallHarness(t, {
     record: 'zone=public\nrule=rule family="ipv4" protocol value="112" accept\nruntime_created=1\npermanent_created=1\n'
@@ -1523,6 +1864,63 @@ test('uninstaller removes only exact firewall forms marked created', (t) => {
   assert.deepEqual(result.runtimeRules, [])
   assert.deepEqual(result.permanentRules, [rule])
   assert.equal(result.calls.some((call) => call.startsWith('--permanent')), false)
+})
+
+function assertUninstallStateRestored(result) {
+  assert.equal(result.appRootExists, true)
+  assert.equal(result.marker, 'before-uninstall\n')
+  assert.equal(result.active, '1')
+  assert.equal(result.enabled, '1')
+  assert.equal(result.unitLinkExists, true)
+  assert.deepEqual(result.runtimeRules, [peerRule('192.168.74.133')])
+  assert.deepEqual(result.permanentRules, [peerRule('192.168.74.133')])
+  assert.deepEqual(result.selinuxState.sort(), validSelinuxRecordRows().map((row) => {
+    const [, pattern, , appliedType] = row.split('|')
+    return `${pattern}|${appliedType}`
+  }).sort())
+}
+
+test('uninstaller preflight rejects an externally changed SELinux mapping before mutation', (t) => {
+  const result = runUninstallTransactionHarness(t, { externalSelinuxPattern: '/run(' })
+  assert.equal(result.status, 1, result.stderr)
+  assert.equal(result.calls.some((call) => /systemctl\|(stop|disable)/.test(call)), false)
+  assert.equal(result.firewallCalls.some((call) => /--remove-rich-rule=/.test(call)), false)
+  assert.equal(result.selinuxCalls.length, 0)
+  assert.equal(result.appRootExists, true)
+  assert.equal(result.active, '1')
+  assert.equal(result.enabled, '1')
+})
+
+test('uninstaller rolls back service state when disable fails', (t) => {
+  const result = runUninstallTransactionHarness(t, { failDisable: true })
+  assert.equal(result.status, 61, result.stderr)
+  assertUninstallStateRestored(result)
+})
+
+test('uninstaller rolls back an earlier firewall removal when a later removal fails', (t) => {
+  const result = runUninstallTransactionHarness(t, { failFirewallForm: 'permanent' })
+  assert.equal(result.status, 56, result.stderr)
+  assertUninstallStateRestored(result)
+})
+
+test('uninstaller rolls back firewall and SELinux mutations when semanage fails', (t) => {
+  const result = runUninstallTransactionHarness(t, { failSelinuxPattern: '/var(/.*)?' })
+  assert.equal(result.status, 53, result.stderr)
+  assertUninstallStateRestored(result)
+})
+
+test('successful transactional uninstall removes only managed state', (t) => {
+  const result = runUninstallTransactionHarness(t)
+  assert.equal(result.status, 0, result.stderr)
+  assert.equal(result.appRootExists, false)
+  assert.equal(result.active, '0')
+  assert.equal(result.enabled, '0')
+  assert.equal(result.unitLinkExists, false)
+  assert.deepEqual(result.runtimeRules, [])
+  assert.deepEqual(result.permanentRules, [])
+  assert.deepEqual(result.selinuxState, [
+    '/aifar/apps/keepalived/etc(/.*)?|keepalived_etc_t'
+  ])
 })
 
 test('uninstaller rejects an empty firewall ownership record without mutating rules or installation state', (t) => {
@@ -1626,14 +2024,29 @@ for (const healthCase of healthCases) {
     const result = runHealthHarness(t, healthCase)
     assert.equal(result.status, healthCase.expected, result.stderr)
     if (healthCase.status === 0 && healthCase.expected === 0) {
-      assert.deepEqual(result.curlArgs, [
-        '--fail', '--silent', '--show-error', '--connect-timeout', '1', '--max-time', '2', '--',
-        'http://127.0.0.1:38000/health'
-      ])
+      assert.ok(result.curlArgs.includes('--max-redirs'))
+      assert.ok(result.curlArgs.includes('0'))
+      assert.ok(result.curlArgs.includes('--max-filesize'))
+      assert.ok(result.curlArgs.includes('65536'))
+      assert.ok(result.curlArgs.includes('--output'))
+      assert.ok(result.curlArgs.includes('--write-out'))
+      assert.ok(result.curlArgs.includes('%{http_code}'))
       assert.deepEqual(result.pythonArgs.slice(0, 1), ['-c'])
     }
   })
 }
+
+test('aggregate health rejects HTTP 302 even when the body reports up true', (t) => {
+  const result = runHealthHarness(t, { body: '{"up":true}', httpStatus: 302 })
+  assert.equal(result.status, 1, result.stderr)
+})
+
+test('aggregate health rejects a response body larger than 65536 bytes before JSON parsing', (t) => {
+  const body = `{"up":true,"padding":"${'x'.repeat(65537)}"}`
+  const result = runHealthHarness(t, { body, httpStatus: 200 })
+  assert.equal(result.status, 1, result.stderr)
+  assert.deepEqual(result.pythonArgs, [])
+})
 
 for (const invalidUrl of [
   'http://127.0.0.1:38000/health\nhttp://127.0.0.2:38000/health',

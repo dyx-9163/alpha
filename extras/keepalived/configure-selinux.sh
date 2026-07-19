@@ -70,8 +70,27 @@ valid_mapping_row() {
     esac
 }
 
+valid_journal_row() {
+    local action="$1" pattern="$2" previous_type="$3" applied_type="$4"
+
+    case "$action" in
+        retired_created)
+            [[ "$pattern" == '/aifar/apps/keepalived/scripts(/.*)?' &&
+               "$previous_type" == '-' &&
+               "$applied_type" =~ ^[A-Za-z0-9_]+_t$ ]]
+            ;;
+        retired_updated)
+            [[ "$pattern" == '/aifar/apps/keepalived/scripts(/.*)?' &&
+               "$previous_type" =~ ^[A-Za-z0-9_]+_t$ &&
+               "$applied_type" =~ ^[A-Za-z0-9_]+_t$ &&
+               "$previous_type" != "$applied_type" ]]
+            ;;
+        *) valid_mapping_row "$action" "$pattern" "$previous_type" "$applied_type" ;;
+    esac
+}
+
 validate_selinux_record_file() {
-    local file="$1" line="" action="" pattern="" previous_type="" applied_type="" count=0
+    local file="$1" line="" action="" pattern="" previous_type="" applied_type="" count=0 required_pattern=""
     declare -A seen_patterns=()
 
     [[ -e "$file" || -L "$file" ]] || return 0
@@ -87,7 +106,20 @@ validate_selinux_record_file() {
         seen_patterns[$pattern]=1
         ((count += 1))
     done <"$file"
-    ((count > 0)) || die "SELinux 映射记录为空：$file"
+    for required_pattern in \
+        '/aifar/apps/keepalived/sbin/keepalived' \
+        '/aifar/apps/keepalived/etc(/.*)?' \
+        '/aifar/apps/keepalived/var(/.*)?' \
+        '/aifar/apps/keepalived/run(/.*)?' \
+        '/aifar/apps/keepalived/systemd/keepalived\.service'; do
+        [[ -n "${seen_patterns[$required_pattern]+x}" ]] || die "SELinux ownership record missing core pattern: $required_pattern"
+    done
+    if [[ -z "${seen_patterns['/aifar/apps/keepalived/libexec(/.*)?']+x}" ]]; then
+        [[ -n "${seen_patterns['/aifar/apps/keepalived/scripts(/.*)?']+x}" ]] || die "SELinux ownership record missing libexec core pattern"
+    fi
+    [[ -z "${seen_patterns['/aifar/apps/keepalived/libexec(/.*)?']+x}" ||
+       -z "${seen_patterns['/aifar/apps/keepalived/scripts(/.*)?']+x}" ]] || die "SELinux ownership record mixes current and legacy core patterns"
+    ((count == 6)) || die "SELinux ownership record must contain exactly six core patterns"
 }
 
 append_journal() {
@@ -107,23 +139,49 @@ reverse_mapping_mutation() {
     local action="$1" pattern="$2" previous_type="$3" applied_type="$4"
     local current_context="" current_type="" restored_context="" restored_type=""
 
-    current_context="$(mapping_context "$pattern")"
-    [[ -n "$current_context" ]] || { printf '[keepalived-selinux] ERROR: 待回滚映射已缺失：%s\n' "$pattern" >&2; return 1; }
-    current_type="$(context_type "$current_context")" || return 1
-    [[ "$current_type" == "$applied_type" ]] || {
-        printf '[keepalived-selinux] ERROR: 映射已被外部修改，拒绝回滚：%s\n' "$pattern" >&2
-        return 1
-    }
     case "$action" in
         created)
+            current_context="$(mapping_context "$pattern")"
+            [[ -n "$current_context" ]] || return 1
+            current_type="$(context_type "$current_context")" || return 1
+            [[ "$current_type" == "$applied_type" ]] || return 1
             semanage fcontext -d "$pattern" || return 1
             [[ -z "$(mapping_context "$pattern")" ]] || return 1
             ;;
         updated)
+            current_context="$(mapping_context "$pattern")"
+            [[ -n "$current_context" ]] || return 1
+            current_type="$(context_type "$current_context")" || return 1
+            [[ "$current_type" == "$applied_type" ]] || return 1
             semanage fcontext -m -t "$previous_type" "$pattern" || return 1
             restored_context="$(mapping_context "$pattern")"
             restored_type="$(context_type "$restored_context")" || return 1
             [[ "$restored_type" == "$previous_type" ]] || return 1
+            ;;
+        retired_created)
+            current_context="$(mapping_context "$pattern")"
+            if [[ -n "$current_context" ]]; then
+                current_type="$(context_type "$current_context")" || return 1
+                [[ "$current_type" == "$applied_type" ]] || return 1
+                return 0
+            fi
+            semanage fcontext -a -t "$applied_type" "$pattern" || return 1
+            restored_context="$(mapping_context "$pattern")"
+            restored_type="$(context_type "$restored_context")" || return 1
+            [[ "$restored_type" == "$applied_type" ]] || return 1
+            ;;
+        retired_updated)
+            current_context="$(mapping_context "$pattern")"
+            [[ -n "$current_context" ]] || return 1
+            current_type="$(context_type "$current_context")" || return 1
+            if [[ "$current_type" == "$applied_type" ]]; then
+                return 0
+            fi
+            [[ "$current_type" == "$previous_type" ]] || return 1
+            semanage fcontext -m -t "$applied_type" "$pattern" || return 1
+            restored_context="$(mapping_context "$pattern")"
+            restored_type="$(context_type "$restored_context")" || return 1
+            [[ "$restored_type" == "$applied_type" ]] || return 1
             ;;
         *) return 1 ;;
     esac
@@ -157,8 +215,8 @@ rollback_current_journal() {
     mapfile -t rows <"$CURRENT_JOURNAL"
     for ((index=${#rows[@]} - 1; index >= 0; index--)); do
         IFS='|' read -r action pattern previous_type applied_type <<<"${rows[$index]}"
-        valid_mapping_row "$action" "$pattern" "$previous_type" "$applied_type" || continue
-        [[ "$action" == created || "$action" == updated ]] || continue
+        valid_journal_row "$action" "$pattern" "$previous_type" "$applied_type" || continue
+        [[ "$action" != unchanged ]] || continue
         reverse_mapping_mutation "$action" "$pattern" "$previous_type" "$applied_type" || rollback_status=1
     done
     return "$rollback_status"
@@ -236,6 +294,38 @@ reconcile_recorded_mapping() {
     printf '%s|%s|%s|%s\n' "$action" "$pattern" "$previous_type" "$applied_type" >>"$NEXT_RECORD"
 }
 
+retire_legacy_mapping() {
+    local action="$1" pattern="$2" previous_type="$3" applied_type="$4"
+    local current_context="" current_type="" retired_action=""
+
+    [[ "$pattern" == '/aifar/apps/keepalived/scripts(/.*)?' ]] || die "unexpected legacy SELinux pattern: $pattern"
+    current_context="$(mapping_context "$pattern")"
+    [[ -n "$current_context" ]] || die "legacy SELinux mapping is missing: $pattern"
+    current_type="$(context_type "$current_context")" || die "cannot parse legacy SELinux mapping: $pattern"
+    [[ "$current_type" == "$applied_type" ]] || die "legacy SELinux mapping was externally modified: $pattern"
+
+    case "$action" in
+        unchanged)
+            return 0
+            ;;
+        created)
+            retired_action=retired_created
+            append_journal "$retired_action" "$pattern" "$previous_type" "$applied_type" || die "cannot journal legacy SELinux mapping retirement: $pattern"
+            semanage fcontext -d "$pattern" || die "failed to retire legacy SELinux mapping: $pattern"
+            [[ -z "$(mapping_context "$pattern")" ]] || die "legacy SELinux mapping retirement verification failed: $pattern"
+            ;;
+        updated)
+            retired_action=retired_updated
+            append_journal "$retired_action" "$pattern" "$previous_type" "$applied_type" || die "cannot journal legacy SELinux mapping restore: $pattern"
+            semanage fcontext -m -t "$previous_type" "$pattern" || die "failed to restore legacy SELinux mapping: $pattern"
+            current_context="$(mapping_context "$pattern")"
+            current_type="$(context_type "$current_context")" || die "cannot verify restored legacy SELinux mapping: $pattern"
+            [[ "$current_type" == "$previous_type" ]] || die "legacy SELinux mapping restore verification failed: $pattern"
+            ;;
+        *) die "invalid legacy SELinux record action: $action" ;;
+    esac
+}
+
 build_next_record() {
     local action="" pattern="" previous_type="" applied_type=""
     declare -A recorded_patterns=()
@@ -247,7 +337,11 @@ build_next_record() {
         while IFS='|' read -r action pattern previous_type applied_type; do
             [[ -z "${recorded_patterns[$pattern]+x}" ]] || die "SELinux 映射记录包含重复 pattern：$pattern"
             recorded_patterns[$pattern]=1
-            reconcile_recorded_mapping "$action" "$pattern" "$previous_type" "$applied_type"
+            if [[ "$pattern" == '/aifar/apps/keepalived/scripts(/.*)?' ]]; then
+                retire_legacy_mapping "$action" "$pattern" "$previous_type" "$applied_type"
+            else
+                reconcile_recorded_mapping "$action" "$pattern" "$previous_type" "$applied_type"
+            fi
         done <"$RECORD_FILE"
     else
         apply_new_mapping '/aifar/apps/keepalived/sbin/keepalived' '/usr/sbin/keepalived'

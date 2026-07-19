@@ -163,13 +163,22 @@ test('Keepalived uninstaller uses LF endings', () => {
 
 test('uninstaller verifies a backup before service changes and exact-path deletion', () => {
   const script = read('uninstall-keepalived.sh')
-  const backupVerify = indexOfOrFail(script, 'sha256sum --check BACKUP.sha256')
-  const serviceStop = indexOfOrFail(script, 'systemctl stop keepalived.service')
-  const selinuxValidation = indexOfOrFail(script, 'validate_selinux_record_file "$SELINUX_RECORD"')
-  const installDelete = indexOfOrFail(script, 'rm -rf -- "$APP_ROOT"')
-  assert.ok(backupVerify < serviceStop)
-  assert.ok(selinuxValidation < serviceStop)
-  assert.ok(serviceStop < installDelete)
+  const transactionStart = indexOfOrFail(script, 'execute_uninstall_transaction()')
+  const transactionEnd = indexOfOrFail(script.slice(transactionStart), '\n}') + transactionStart
+  const transactionBody = script.slice(transactionStart, transactionEnd)
+  const preflight = indexOfOrFail(transactionBody, 'preflight_uninstall_state')
+  const backup = indexOfOrFail(transactionBody, 'create_and_verify_backup')
+  const transactionActive = indexOfOrFail(transactionBody, 'TRANSACTION_ACTIVE=1')
+  const mutations = indexOfOrFail(transactionBody, 'perform_uninstall_mutations')
+  assert.ok(preflight < backup)
+  assert.ok(backup < transactionActive)
+  assert.ok(transactionActive < mutations)
+  const mutationStart = indexOfOrFail(script, 'perform_uninstall_mutations()')
+  const mutationEnd = indexOfOrFail(script.slice(mutationStart), '\n}') + mutationStart
+  const mutationBody = script.slice(mutationStart, mutationEnd)
+  assert.ok(indexOfOrFail(mutationBody, 'systemctl stop keepalived.service') < indexOfOrFail(mutationBody, 'safe_remove_uninstall_root'))
+  assert.match(script, /preflight_selinux_state\(\)[\s\S]*validate_selinux_record_file "\$SELINUX_RECORD"/)
+  assert.match(script, /rollback_uninstall_transaction\(\)/)
   assert.match(script, /readonly APP_ROOT="\/aifar\/apps\/keepalived"/)
   assert.match(script, /readlink -f -- "\$APP_ROOT"/)
   assert.match(script, /readonly BACKUP_ROOT="\/aifar\/backups"/)
@@ -177,7 +186,6 @@ test('uninstaller verifies a backup before service changes and exact-path deleti
   assert.match(script, /firewall-cmd --zone="\$zone" --remove-rich-rule="\$rule"/)
   assert.match(script, /firewall-cmd --permanent --zone="\$zone" --remove-rich-rule="\$rule"/)
   assert.doesNotMatch(script, /\[\[ -s "\$FIREWALL_RECORD" \]\]/)
-  assert.equal((script.match(/\[\[ -e "\$FIREWALL_RECORD" \|\| -L "\$FIREWALL_RECORD" \]\]/g) ?? []).length, 1)
   assert.match(script, /\[\[ ! -e "\$FIREWALL_RECORD" && ! -L "\$FIREWALL_RECORD" \]\]/)
   assert.equal((script.match(/\[\[ -f "\$FIREWALL_RECORD" && ! -L "\$FIREWALL_RECORD" \]\]/g) ?? []).length, 2)
   assert.doesNotMatch(

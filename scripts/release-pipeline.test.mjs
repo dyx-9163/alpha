@@ -218,6 +218,20 @@ test('release includes Keepalived tools only in Linux packages and checksums the
   }
 })
 
+test('release fails closed when a node-specific keepalived.env is present', (t) => {
+  const root = releaseFixture(t)
+  write(root, 'extras/keepalived/keepalived.env', 'KEEPALIVED_LOCAL_IP=192.0.2.99\n')
+
+  const result = runRelease(root)
+
+  assert.notEqual(result.status, 0)
+  assert.match(result.stderr, /Unexpected Keepalived package input:.*keepalived\.env/)
+  assert.equal(existsSync(path.join(
+    root,
+    'deploy/deployment/aifar-fixture-9.8.7-linux-amd64/extras/keepalived/keepalived.env'
+  )), false)
+})
+
 test('release includes aggregate SELinux tool only in Linux packages with executable mode', (t) => {
   const root = releaseFixture(t)
   const result = runRelease(root)

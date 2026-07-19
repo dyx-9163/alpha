@@ -117,8 +117,27 @@ valid_selinux_record_row() {
     esac
 }
 
+valid_selinux_journal_row() {
+    local action="$1" pattern="$2" previous_type="$3" applied_type="$4"
+
+    case "$action" in
+        retired_created)
+            [[ "$pattern" == '/aifar/apps/keepalived/scripts(/.*)?' &&
+               "$previous_type" == '-' &&
+               "$applied_type" =~ ^[A-Za-z0-9_]+_t$ ]]
+            ;;
+        retired_updated)
+            [[ "$pattern" == '/aifar/apps/keepalived/scripts(/.*)?' &&
+               "$previous_type" =~ ^[A-Za-z0-9_]+_t$ &&
+               "$applied_type" =~ ^[A-Za-z0-9_]+_t$ &&
+               "$previous_type" != "$applied_type" ]]
+            ;;
+        *) valid_selinux_record_row "$action" "$pattern" "$previous_type" "$applied_type" ;;
+    esac
+}
+
 validate_selinux_record_file() {
-    local file="$1" line="" action="" pattern="" previous_type="" applied_type="" count=0
+    local file="$1" line="" action="" pattern="" previous_type="" applied_type="" count=0 required_pattern=""
     declare -A seen_patterns=()
 
     [[ -e "$file" || -L "$file" ]] || return 0
@@ -134,7 +153,20 @@ validate_selinux_record_file() {
         seen_patterns[$pattern]=1
         ((count += 1))
     done <"$file"
-    ((count > 0)) || die "SELinux 映射记录为空：$file"
+    for required_pattern in \
+        '/aifar/apps/keepalived/sbin/keepalived' \
+        '/aifar/apps/keepalived/etc(/.*)?' \
+        '/aifar/apps/keepalived/var(/.*)?' \
+        '/aifar/apps/keepalived/run(/.*)?' \
+        '/aifar/apps/keepalived/systemd/keepalived\.service'; do
+        [[ -n "${seen_patterns[$required_pattern]+x}" ]] || die "SELinux ownership record missing core pattern: $required_pattern"
+    done
+    if [[ -z "${seen_patterns['/aifar/apps/keepalived/libexec(/.*)?']+x}" ]]; then
+        [[ -n "${seen_patterns['/aifar/apps/keepalived/scripts(/.*)?']+x}" ]] || die "SELinux ownership record missing libexec core pattern"
+    fi
+    [[ -z "${seen_patterns['/aifar/apps/keepalived/libexec(/.*)?']+x}" ||
+       -z "${seen_patterns['/aifar/apps/keepalived/scripts(/.*)?']+x}" ]] || die "SELinux ownership record mixes current and legacy core patterns"
+    ((count == 6)) || die "SELinux ownership record must contain exactly six core patterns"
 }
 
 mapping_context() {
@@ -405,13 +437,51 @@ rollback_selinux_journal() {
         pattern="${BASH_REMATCH[2]}"
         previous_type="${BASH_REMATCH[3]}"
         applied_type="${BASH_REMATCH[4]}"
-        if ! valid_selinux_record_row "$action" "$pattern" "$previous_type" "$applied_type" || [[ "$action" == unchanged ]]; then
+        if ! valid_selinux_journal_row "$action" "$pattern" "$previous_type" "$applied_type" || [[ "$action" == unchanged ]]; then
             printf '[keepalived-installer] ERROR: SELinux 回滚日志语义无效：%s\n' "$pattern" >&2
             rollback_status=1
             continue
         fi
         local current_context="" current_type="" restored_context="" restored_type=""
         current_context="$(mapping_context "$pattern")"
+        if [[ "$action" == retired_created ]]; then
+            if [[ -n "$current_context" ]]; then
+                current_type="$(context_type "$current_context")" || current_type=""
+                if [[ "$current_type" != "$applied_type" ]]; then
+                    printf '[keepalived-installer] ERROR: retired SELinux mapping was externally modified: %s\n' "$pattern" >&2
+                    rollback_status=1
+                fi
+            elif ! semanage fcontext -a -t "$applied_type" "$pattern"; then
+                rollback_status=1
+            else
+                restored_context="$(mapping_context "$pattern")"
+                restored_type="$(context_type "$restored_context")" || restored_type=""
+                [[ "$restored_type" == "$applied_type" ]] || rollback_status=1
+            fi
+            continue
+        fi
+        if [[ "$action" == retired_updated ]]; then
+            if [[ -z "$current_context" ]]; then
+                printf '[keepalived-installer] ERROR: retired SELinux mapping is missing: %s\n' "$pattern" >&2
+                rollback_status=1
+                continue
+            fi
+            current_type="$(context_type "$current_context")" || current_type=""
+            if [[ "$current_type" == "$applied_type" ]]; then
+                continue
+            fi
+            if [[ "$current_type" != "$previous_type" ]]; then
+                printf '[keepalived-installer] ERROR: retired SELinux mapping was externally modified: %s\n' "$pattern" >&2
+                rollback_status=1
+            elif ! semanage fcontext -m -t "$applied_type" "$pattern"; then
+                rollback_status=1
+            else
+                restored_context="$(mapping_context "$pattern")"
+                restored_type="$(context_type "$restored_context")" || restored_type=""
+                [[ "$restored_type" == "$applied_type" ]] || rollback_status=1
+            fi
+            continue
+        fi
         if [[ -z "$current_context" ]]; then
             printf '[keepalived-installer] ERROR: SELinux 回滚映射已缺失：%s\n' "$pattern" >&2
             rollback_status=1
@@ -453,11 +523,27 @@ rollback_selinux_journal() {
     return "$rollback_status"
 }
 
+preflight_firewall_reconciliation() {
+    local record_exists=0
+
+    if [[ -e "$FIREWALL_RECORD" || -L "$FIREWALL_RECORD" ]]; then
+        [[ -f "$FIREWALL_RECORD" && ! -L "$FIREWALL_RECORD" ]] || die "firewall ownership record must be a regular non-symlink file: $FIREWALL_RECORD"
+        parse_firewall_record "$FIREWALL_RECORD"
+        record_exists=1
+    fi
+    if ! systemctl is-active --quiet firewalld.service; then
+        [[ "$record_exists" -eq 0 ]] || die "existing firewall ownership record requires active firewalld before reinstall"
+        return 0
+    fi
+    return 0
+}
+
 reconcile_firewall_rule() {
     local zone="" desired_rule="" record_tmp=""
     local runtime_created=0 permanent_created=0
     local old_record_exists=0 old_same=0
 
+    preflight_firewall_reconciliation
     if ! systemctl is-active --quiet firewalld.service; then
         log "firewalld 未运行，跳过 VRRP peer 防火墙规则"
         return 0
@@ -811,12 +897,20 @@ register_systemd_unit() {
 install_managed_configuration() {
     local staged_config="$1"
     local config_tmp="$FORMAL_CONFIG.tmp.$$"
+    local health_url_tmp="$HEALTH_URL_FILE.tmp.$$"
+    local health_script_target="$APP_ROOT/libexec/check-aggregate-health.sh"
+    local health_script_tmp="$APP_ROOT/libexec/check-aggregate-health.sh.tmp.$$"
+
     install -d -o root -g root -m 750 "$APP_ROOT/etc/keepalived" "$APP_ROOT/libexec" "$APP_ROOT/var/lib/aifar"
-    install -o root -g root -m 750 "$HEALTH_SCRIPT_SOURCE" "$APP_ROOT/libexec/check-aggregate-health.sh"
-    printf '%s\n' "$NODE_HEALTH_URL" >"$WORK_DIR/keepalived-health-url"
-    install -o root -g root -m 640 "$WORK_DIR/keepalived-health-url" "$HEALTH_URL_FILE"
     "$APP_ROOT/sbin/keepalived" -t -f "$staged_config"
+
+    printf '%s\n' "$NODE_HEALTH_URL" >"$WORK_DIR/keepalived-health-url"
+    install -o root -g root -m 750 "$HEALTH_SCRIPT_SOURCE" "$health_script_tmp"
+    install -o root -g root -m 640 "$WORK_DIR/keepalived-health-url" "$health_url_tmp"
     install -o root -g root -m 640 "$staged_config" "$config_tmp"
+
+    mv -f -- "$health_script_tmp" "$health_script_target"
+    mv -f -- "$health_url_tmp" "$HEALTH_URL_FILE"
     mv -f -- "$config_tmp" "$FORMAL_CONFIG"
     "$APP_ROOT/sbin/keepalived" -t -f "$FORMAL_CONFIG"
 }
@@ -897,6 +991,7 @@ main() {
     validate_node_config
     render_keepalived_config "$CONFIG_TEMPLATE" "$WORK_DIR/keepalived.conf"
     validate_selinux_record_file "$SELINUX_RECORD"
+    preflight_firewall_reconciliation
     capture_service_state
     create_install_backup
     install_build_dependencies

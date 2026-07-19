@@ -6,6 +6,7 @@ import {
   copyFileSync,
   cpSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   openSync,
   readdirSync,
@@ -38,10 +39,21 @@ const commonEntries = [
 ]
 
 const keepalivedEntry = {
-  kind: 'dir',
+  kind: 'files',
   source: 'extras/keepalived',
   target: 'extras/keepalived',
   required: true,
+  files: [
+    'README.md',
+    'SHA256SUMS',
+    'keepalived-2.4.2.tar.gz',
+    'install-keepalived-offline.sh',
+    'check-aggregate-health.sh',
+    'keepalived.env.example',
+    'keepalived.conf.tpl',
+    'configure-selinux.sh',
+    'uninstall-keepalived.sh'
+  ],
   executables: [
     'install-keepalived-offline.sh',
     'check-aggregate-health.sh',
@@ -114,6 +126,30 @@ function copyEntry(entry, packageDir) {
   }
 
   mkdirSync(path.dirname(targetPath), { recursive: true })
+  if (entry.kind === 'files') {
+    const sourceStat = lstatSync(sourcePath)
+    if (!sourceStat.isDirectory() || sourceStat.isSymbolicLink()) {
+      throw new Error(`Keepalived package input must be a real directory: ${entry.source}`)
+    }
+    const allowed = new Set(entry.files)
+    for (const name of readdirSync(sourcePath)) {
+      if (!allowed.has(name)) throw new Error(`Unexpected Keepalived package input: ${entry.source}/${name}`)
+    }
+    mkdirSync(targetPath, { recursive: true })
+    for (const relativePath of entry.files) {
+      const sourceFile = path.join(sourcePath, relativePath)
+      if (!existsSync(sourceFile)) throw new Error(`Missing required package input: ${entry.source}/${relativePath}`)
+      const sourceFileStat = lstatSync(sourceFile)
+      if (!sourceFileStat.isFile() || sourceFileStat.isSymbolicLink()) {
+        throw new Error(`Keepalived package input must be a regular non-symlink file: ${entry.source}/${relativePath}`)
+      }
+      copyFileSync(sourceFile, path.join(targetPath, relativePath))
+    }
+    for (const relativePath of entry.executables || []) {
+      chmodBestEffort(path.join(targetPath, relativePath), 0o755)
+    }
+    return
+  }
   if (entry.kind === 'dir') {
     cpSync(sourcePath, targetPath, { dereference: true, force: true, recursive: true })
     for (const relativePath of entry.executables || []) {
