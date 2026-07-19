@@ -788,7 +788,9 @@ validate_node_config() {
     fi
     ip link show dev "$NODE_INTERFACE" >/dev/null 2>&1 || die "接口不存在：$NODE_INTERFACE"
     ip -o -4 addr show dev "$NODE_INTERFACE" | awk -v expected="$NODE_LOCAL_IP" '{split($4,a,"/"); if (a[1]==expected) found=1} END{exit !found}' || die "接口未绑定本机 IP"
-    ip -4 route get "$vip" | awk -v expected="$NODE_INTERFACE" '{for(i=1;i<NF;i++) if($i=="dev" && $(i+1)==expected) found=1} END{exit !found}' || die "VIP 不通过指定接口路由"
+    if ! ip -o -4 addr show dev "$NODE_INTERFACE" | awk -v expected="$vip" '{split($4,a,"/"); if (a[1]==expected) found=1} END{exit !found}'; then
+        ip -4 route get "$vip" | awk -v expected="$NODE_INTERFACE" '{for(i=1;i<NF;i++) if($i=="dev" && $(i+1)==expected) found=1} END{exit !found}' || die "VIP 不通过指定接口路由"
+    fi
 }
 
 render_keepalived_config() {

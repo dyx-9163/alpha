@@ -2412,6 +2412,21 @@ test('installer rejects a VIP routed through the wrong interface', (t) => {
   assert.equal(result.status, 1, result.stderr)
 })
 
+test('installer accepts a VIP already bound to the configured interface', (t) => {
+  const result = runNodeConfigHarness(t, {
+    ipFunction: `ip() {
+    case "\$*" in
+        'link show dev ens160') return 0 ;;
+        '-o -4 addr show dev ens160') printf '2: ens160 inet 192.168.74.132/24 scope global ens160\\n2: ens160 inet 192.168.74.130/24 scope global secondary ens160\\n' ;;
+        '-4 route get 192.168.74.130') printf 'local 192.168.74.130 dev lo src 192.168.74.132 uid 0\\n' ;;
+        *) return 1 ;;
+    esac
+}`,
+    render: false
+  })
+  assert.equal(result.status, 0, result.stderr)
+})
+
 test('aggregate health invokes the embedded Python parser through a real Python 3 interpreter', (t) => {
   const result = runParserHarness(t, '{"status":{"up":true},"up":true}')
   assert.equal(result.status, 0, result.stderr)
