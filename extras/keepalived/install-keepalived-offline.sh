@@ -943,21 +943,29 @@ install_managed_configuration() {
     local line=''
 
     install -d -o root -g root -m 750 "$APP_ROOT/etc/keepalived" "$APP_ROOT/libexec" "$APP_ROOT/var/lib/aifar"
-    install -o root -g root -m 750 "$HEALTH_SCRIPT_SOURCE" "$health_script_tmp"
-    : >"$validation_config"
-    while IFS= read -r line || [[ -n "$line" ]]; do
-        printf '%s\n' "${line//$health_script_target/$health_script_tmp}" >>"$validation_config"
-    done <"$staged_config"
-    grep -Fq "$health_script_tmp" "$validation_config" || die "临时配置未引用待安装的健康检查脚本"
-    "$APP_ROOT/sbin/keepalived" -t -f "$validation_config"
-
-    printf '%s\n' "$NODE_HEALTH_URL" >"$WORK_DIR/keepalived-health-url"
-    install -o root -g root -m 640 "$WORK_DIR/keepalived-health-url" "$health_url_tmp"
-    install -o root -g root -m 640 "$staged_config" "$config_tmp"
-
-    mv -f -- "$health_script_tmp" "$health_script_target"
-    mv -f -- "$health_url_tmp" "$HEALTH_URL_FILE"
-    mv -f -- "$config_tmp" "$FORMAL_CONFIG"
+    if [[ "$HEALTH_CHECK_ENABLED" -eq 1 ]]; then
+        install -o root -g root -m 750 "$HEALTH_SCRIPT_SOURCE" "$health_script_tmp"
+        : >"$validation_config"
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            printf '%s\n' "${line//$health_script_target/$health_script_tmp}" >>"$validation_config"
+        done <"$staged_config"
+        grep -Fq "$health_script_tmp" "$validation_config" || die "临时配置未引用待安装的健康检查脚本"
+        "$APP_ROOT/sbin/keepalived" -t -f "$validation_config"
+        printf '%s\n' "$NODE_HEALTH_URL" >"$WORK_DIR/keepalived-health-url"
+        install -o root -g root -m 640 "$WORK_DIR/keepalived-health-url" "$health_url_tmp"
+        install -o root -g root -m 640 "$staged_config" "$config_tmp"
+        mv -f -- "$health_script_tmp" "$health_script_target"
+        mv -f -- "$health_url_tmp" "$HEALTH_URL_FILE"
+        mv -f -- "$config_tmp" "$FORMAL_CONFIG"
+    else
+        if grep -Eq '(^|[[:space:]])(vrrp_script|track_script)([[:space:]]|$)|check_aifar_health|check-aggregate-health\.sh' "$staged_config"; then
+            die "禁用健康检查时配置不得引用健康检查脚本"
+        fi
+        "$APP_ROOT/sbin/keepalived" -t -f "$staged_config"
+        install -o root -g root -m 640 "$staged_config" "$config_tmp"
+        mv -f -- "$config_tmp" "$FORMAL_CONFIG"
+        rm -f -- "$health_script_target" "$HEALTH_URL_FILE"
+    fi
     "$APP_ROOT/sbin/keepalived" -t -f "$FORMAL_CONFIG"
 }
 
@@ -977,7 +985,7 @@ activate_keepalived() {
         systemctl start keepalived.service
     fi
     systemctl is-active --quiet keepalived.service || die "keepalived.service 启动失败"
-    if ! "$APP_ROOT/libexec/check-aggregate-health.sh"; then
+    if [[ "$HEALTH_CHECK_ENABLED" -eq 1 ]] && ! "$APP_ROOT/libexec/check-aggregate-health.sh"; then
         log "WARNING: 健康检查当前不可用；服务保持 active，VRRP 实例将保持 FAULT"
     fi
 }
@@ -997,6 +1005,13 @@ verify_installation() {
     fi
 
     grep -Fq "ExecStart=$APP_ROOT/sbin/keepalived" "$unit_file" || die "systemd unit 未引用自定义安装目录"
+    if [[ "$HEALTH_CHECK_ENABLED" -eq 1 ]]; then
+        [[ -x "$APP_ROOT/libexec/check-aggregate-health.sh" ]] || die "健康检查脚本不存在或不可执行"
+        [[ -f "$HEALTH_URL_FILE" && ! -L "$HEALTH_URL_FILE" ]] || die "健康 URL 文件不存在或类型无效"
+    else
+        [[ ! -e "$APP_ROOT/libexec/check-aggregate-health.sh" && ! -L "$APP_ROOT/libexec/check-aggregate-health.sh" ]] || die "禁用健康检查时仍存在健康检查脚本"
+        [[ ! -e "$HEALTH_URL_FILE" && ! -L "$HEALTH_URL_FILE" ]] || die "禁用健康检查时仍存在健康 URL 文件"
+    fi
 }
 
 print_next_steps() {
