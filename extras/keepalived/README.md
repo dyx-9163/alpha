@@ -10,7 +10,7 @@
 cp keepalived.env.example keepalived.env
 ```
 
-`keepalived.env` 是纯数据文件，只允许以下七个键：
+`keepalived.env` 是纯数据文件，只允许以下六个必填键和一个可选键：
 
 - `KEEPALIVED_LOCAL_IP`：本节点 IPv4 地址；
 - `KEEPALIVED_PEER_IP`：对端节点 IPv4 地址；
@@ -18,7 +18,9 @@ cp keepalived.env.example keepalived.env
 - `KEEPALIVED_INTERFACE`：承载节点 IP 和 VIP 的接口；
 - `KEEPALIVED_PRIORITY`：本节点 VRRP 优先级，范围 1-254；
 - `KEEPALIVED_VIRTUAL_ROUTER_ID`：两节点相同的 VRID，范围 1-255；
-- `KEEPALIVED_HEALTH_URL`：本节点聚合健康接口，只接受 HTTP/HTTPS，并要求 HTTP 2xx 且顶层 JSON 字段 `up` 为布尔值 `true`。
+- `KEEPALIVED_HEALTH_URL`：可选的本节点聚合健康接口。启用时只接受 HTTP/HTTPS，并要求 HTTP 2xx 且顶层 JSON 字段 `up` 为布尔值 `true`。
+
+需要按业务接口状态漂移 VIP 时，取消该行注释并填写 URL。保持 `# KEEPALIVED_HEALTH_URL=...` 注释或完全不写此键时，安装器仍会生成 VRRP/VIP 配置并启用、启动 Keepalived，但不安装健康检查脚本，也不生成健康 URL 文件；正式配置中也不会出现 `vrrp_script` 或 `track_script`。不要写 `KEEPALIVED_HEALTH_URL=` 空值；显式空值属于配置错误，安装会在修改系统前停止。
 
 节点 192.168.74.132 的 `keepalived.env`：
 
@@ -46,6 +48,12 @@ KEEPALIVED_HEALTH_URL=http://192.168.74.133:38000/health/aggregate
 
 两节点必须使用相同的 VIP/CIDR 和 VRID，并互相填写对端 IP；优先级 150 的 132 节点是正常情况下的 VIP 所有者。
 
+如果暂时不需要接口健康检查，可在两个节点都注释健康 URL，例如：
+
+```dotenv
+# KEEPALIVED_HEALTH_URL=http://192.168.74.132:38000/health/aggregate
+```
+
 ## 2. 安装并自动启动
 
 在 132、133 两个节点的模块目录中各执行一次且只执行：
@@ -54,7 +62,7 @@ KEEPALIVED_HEALTH_URL=http://192.168.74.133:38000/health/aggregate
 bash install-keepalived-offline.sh
 ```
 
-普通用户运行时脚本会通过 `sudo` 重新执行。安装器会严格校验节点配置和固定源码包，生成正式配置，安装健康检查脚本，配置精确的 VRRP 防火墙规则和 SELinux 标签，然后启用并启动 `keepalived.service`。
+普通用户运行时脚本会通过 `sudo` 重新执行。安装器会严格校验节点配置和固定源码包，生成正式配置；仅在配置健康 URL 时安装健康检查脚本。随后配置精确的 VRRP 防火墙规则和 SELinux 标签，并启用、启动 `keepalived.service`。
 
 安装器只使用服务器当前已经配置好的离线 DNF 仓库，不添加或访问公网仓库。请先确认挂载的 openEuler ISO 仓库可被 `dnf` 直接使用。
 
@@ -71,11 +79,13 @@ firewall-cmd --list-rich-rules
 
 两端健康接口都正常时，`192.168.74.130/24` 只应出现在优先级更高的 132 节点。firewalld 运行时，安装器仅允许配置的对端 `/32` 访问 VRRP IP protocol 112（协议 112），不会开放整个网段。
 
-## 4. 健康故障、漂移和恢复
+## 4. 健康检查模式、漂移和恢复
 
-Keepalived 每 2 秒检查本节点的 `KEEPALIVED_HEALTH_URL`。连续 3 次失败后，本节点的 VRRP 实例进入 `FAULT`，但 `keepalived.service` 仍保持 active；132 不健康约 6 秒后，VIP 会漂移到健康的 133。
+配置 `KEEPALIVED_HEALTH_URL` 后，Keepalived 每 2 秒检查本节点接口。连续 3 次失败后，本节点的 VRRP 实例进入 `FAULT`，但 `keepalived.service` 仍保持 active；132 不健康约 6 秒后，VIP 会漂移到健康的 133。
 
 132 恢复后，连续 2 次成功探测（约 4 秒）解除 `FAULT`。配置使用默认抢占行为，因此 VIP 会自动抢占并切回优先级更高的 132，无需手工重启 Keepalived。
+
+未配置健康 URL 时，Keepalived 只根据 VRRP 通信、节点优先级和服务是否运行来选举 VIP，不会检查 38000 端口的业务状态。因此即使业务接口异常，只要 Keepalived 和 VRRP 正常，该节点仍可能持有 VIP。需要接口异常触发漂移时，两个节点都应配置各自的 `KEEPALIVED_HEALTH_URL`。
 
 ## 5. 手工服务操作
 
@@ -86,7 +96,7 @@ systemctl restart keepalived
 systemctl status keepalived
 ```
 
-停止当前 VIP 所有者的服务会触发漂移；启动后仍需等待健康检查达到 `rise 2` 才能参与 VRRP 选举。
+停止当前 VIP 所有者的服务会触发漂移。启用健康检查时，启动后还需等待检查达到 `rise 2` 才能参与 VRRP 选举；禁用健康检查时不需要等待该条件。
 
 ## 6. SELinux
 
@@ -103,6 +113,10 @@ bash configure-selinux.sh
 ## 7. 重复安装、备份和回滚
 
 重复执行安装器前，会把完整旧安装树和原服务状态保存到 `/aifar/backups/keepalived-update-<UTC时间戳>-<PID>/`，并校验 `BACKUP.sha256`。任何后续安装步骤失败时，安装器会恢复原文件、原 systemd active/enabled 状态、本轮 SELinux 映射和精确防火墙变更。
+
+重复安装可在启用和禁用健康检查两种模式之间切换，整个切换仍属于同一安装事务。切换到禁用模式时会删除旧健康脚本和 URL 文件；切换到启用模式时会重新安装它们。任一步骤失败都会恢复切换前的完整模式和文件。
+
+两种模式使用相同的防火墙、SELinux、systemd 服务命令、备份和卸载流程；差异仅限健康检查配置及其两个受管文件。
 
 成功或失败后备份都会保留，不会自动清理。请按运维保留策略人工归档或删除已经确认不再需要的旧备份。
 

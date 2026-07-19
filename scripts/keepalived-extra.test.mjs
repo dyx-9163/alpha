@@ -226,3 +226,12 @@ test('README documents zero-argument lifecycle and retained state', () => {
   assert.match(readme, /不会删除.*RPM/)
   assert.match(readme, /不会删除.*(?:预存|非本安装|不属于).*防火墙/)
 })
+
+test('README documents optional health mode and its VIP consequence', () => {
+  const readme = read('README.md')
+  assert.match(readme, /KEEPALIVED_HEALTH_URL.*可选/s)
+  assert.match(readme, /注释.*KEEPALIVED_HEALTH_URL.*不安装健康检查脚本/s)
+  assert.match(readme, /KEEPALIVED_HEALTH_URL=.*空值.*错误/s)
+  assert.match(readme, /业务接口异常.*仍可能持有 VIP/s)
+  assert.match(readme, /重复安装.*启用.*禁用.*事务/s)
+})
