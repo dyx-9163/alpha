@@ -388,3 +388,71 @@
 - 结论：已编写、自检并单独提交 `docs/superpowers/plans/2026-07-19-keepalived-managed-config-start.md`（commit `7f0f2c72`）。计划分为通用配置契约与模板、严格健康检查、配置解析渲染、备份安全启动、精确 firewalld 所有权、SELinux/文档/发布收口六个测试先行任务，并包含完整本地发布门禁；真实 openEuler 双节点执行仍需在本地实现完成后单独明确授权。
 - 问题：用户选择用子代理分任务执行 Keepalived 通用配置与自动启动实施计划。
 - 结论：将按 SDD 流程为六个任务依次派发实现代理并执行逐任务规格/质量复核，禁止并行实现；当前检出是普通工作区而非 linked worktree，且有用户未提交文件，`.worktrees`/`worktrees` 均不存在也未配置忽略，实施前需用户确认是否创建隔离 worktree。
+- 问题：用户运行 `configure-all-selinux.sh` 时 Docker 2375 端口设置 `docker_port_t` 报“必须是端口类型”，并授权上传到 `192.168.74.32` 实机验证。
+- 结论：根因是 container-selinux 中 `docker_port_t` 为兼容别名，openEuler 的 `semanage port` 只接受带 `port_type` 属性的规范名 `container_port_t`；已用失败测试复现并完成最小修正，19 个 SELinux 脚本测试、Bash 语法和差异检查通过。远端尚未改动：本机有 `192.168.74.0/24` 直连路由，但 `.32` 的 ICMP/SSH 均无响应，而既有节点 `.132` 当前可达，需用户确认目标地址是否应为 `192.168.74.132`。
+- 问题：用户确认在 `192.168.74.132` 直接应用并持续验证全部 AIFAR SELinux 规则和服务。
+- 结论：目标 openEuler 缺少 `container-selinux` 且本地介质未挂载；临时只读挂载 SP3 安装介质并安装官方策略包后已卸载。聚合脚本改用 `container_port_t`、自动补齐策略包、为 MySQL 私有共享库应用 `lib_t`、递归 `restorecon` 限定当前文件系统，并以 Keepalived 可执行文件或 systemd unit 作为已安装证据。最终脚本重复运行成功且幂等；SELinux 保持 Enforcing，端口与根路径标签校验通过，Docker/containerd/aifar-agent/MySQL/Redis/MinIO/Nacos 均 active，MinIO/Nacos/AIFAR 健康探针通过，10 个容器全部 healthy，近期无 AVC；未安装的 MySQL Router、Keepalived 和 HTTPS ingress 正确跳过。
+- 问题：用户询问 SELinux 事务目录中的 `journal.tsv` 用途。
+- 结论：它是 `configure-all-selinux.sh` 每次执行创建的当前事务变更日志，不是 systemd journal；按 TSV 记录新增端口类型、创建或修改的 fcontext 以及 restorecon 目标，脚本异常退出时据此逆序撤销本轮持久规则并重新应用标签。成功时事务标记关闭但文件保留作审计，后续执行不会读取旧日志，内容不包含密码等业务密钥。
+- 问题：用户看到 `/etc/passwd` 中创建了 `aifar-mysql`、`aifar-nacos`，但 `ss -lntp` 显示 `mysqld` 和 `java`，询问为何没有以服务账号执行。
+- 结论：`ss` 的 `users:((...))` 是占用监听 socket 的进程列表，不是 Linux 用户字段，括号内显示的是进程名。目标机只读核对确认 `aifar-mysql.service` 明确配置 `User/Group=aifar-mysql`，mysqld 为 UID/GID 994/990；`aifar-nacos.service` 明确配置 `User/Group=aifar-nacos`，启动脚本派生的 Java MainPID 为 UID/GID 993/989。两项服务均已按隔离账号执行，账号使用 nologin 是正常的系统服务账号安全配置。
+- 问题：用户询问 `configure-all-selinux.sh` 应在全部服务安装前还是安装后执行。
+- 结论：该脚本依赖已生成的应用目录、systemd unit 和配置来发现实际端口与路径，因此安装前运行只会将缺失组件标记为 SKIPPED，不能预配置后续文件；推荐每批服务安装完成后立即运行，全部安装结束再运行一次作为统一收口。脚本幂等且不启动或重启服务；若可执行文件标签发生变化，应在脚本成功后受控重启对应服务并验证健康与 AVC。长期应把同一规则应用步骤嵌入安装器，在文件/unit 落地后、首次启动前执行。
+- 问题：用户要求检查当前对象存储应用清理策略的逻辑、文件和命令。
+- 结论：当前实例 `app_73ddecb9b7cd38fc3c0d4e9c` 的控制面和真实 MinIO 一致：bucket `aifar`、空 prefix、1 天、enabled、Rule ID `d9eak4grru0db3vvmo90`，任务 `tsk_340f7eed564e99d7641335a6` 成功；bucket 未启用版本控制或对象锁，当前无超过 1 天对象。应用策略通过 worker SSH 临时加载 `/aifar/apps/minio/conf/minio.env`，使用 `/aifar/apps/minio/bin/mc` 删除已记录旧 rule 后执行 `mc ilm rule add`，再写 `storage_items(kind=cleanupPolicy)` 和 `app_instances.metadata.cleanupPolicy`。发现三项现有风险：估算命令扫描整个 alias 而非选择的 bucket/prefix；页面编辑天数固定初始化为 30，不跟随当前 1 天策略，因此截图估算实际是 30 天口径；停用忽略 rule 删除失败，替换策略先删旧 rule 再加新 rule 且无回滚，可能造成控制面与 MinIO 漂移。
+- 问题：用户询问当前清理策略具体存放在服务器哪里。
+- 结论：真实 ILM 规则由 MinIO 持久化在目标节点数据目录内部元数据 `/aifar/apps/minio/data/.minio.sys/buckets/aifar/.metadata.bin/xl.meta`，为 MinIO 内部二进制格式，只能用 `mc ilm rule ls/add/rm` 管理，不应直接编辑；AIFAR 另在面板服务器 `data/aifar.db` 的 `storage_items(kind=cleanupPolicy)` 和 `app_instances.metadata.cleanupPolicy` 保存 Rule ID 与展示状态。`/aifar/apps/minio/conf/minio.env` 只存运行参数和凭据，不保存生命周期规则，任务使用的临时 `MC_CONFIG_DIR` 执行后会删除。
+- 问题：用户要求把隔离 worktree 的 Keepalived 模块合入主工作区，并在 openEuler 24.03 LTS-SP3 节点完成真实安装和健康漂移验证。
+- 结论：Keepalived 模块已合入主分支；实机暴露并修复了临时配置校验时健康脚本尚不可访问、回滚误判不存在的 systemd unit、健康 URL 固定路径少一层目录三个问题。目标节点最终为 Keepalived 2.4.2、systemd active/enabled、SELinux Enforcing，健康接口成功时绑定 VIP；临时模拟健康失败后进入 FAULT 并移除 VIP，恢复后自动回到 MASTER 并重新绑定，精确 VRRP/112 防火墙规则和 SELinux 标签均已应用。
+- 问题：用户要求将 `KEEPALIVED_HEALTH_URL` 改为可选，整行注释时不安装健康检查设置。
+- 结论：用户选择无健康 URL 时仍生成并启动不含 `vrrp_script/track_script` 的 VRRP 配置，继续按优先级和对端 VRRP 状态绑定/漂移 VIP；仅关闭应用健康检查，不退化为只安装二进制和 unit。
+- 结论：可选健康检查设计已固化并提交为 `docs/superpowers/specs/2026-07-20-keepalived-optional-health-check-design.md`（commit `02f5a166`）。设计明确缺失或注释健康 URL 表示禁用、显式空值报错、单模板条件渲染、禁用模式不安装健康文件、双向模式切换使用完整根备份回滚，以及两种模式的自动化和真实 Linux 验收要求；待用户复核书面规格后再编写实施计划。
+- 结论：用户复核设计无误；实施计划已写入并提交为 `docs/superpowers/plans/2026-07-20-keepalived-optional-health-check.md`（commit `7ae2eec0`），按解析与条件模板、健康文件事务切换、运维文档与完整发布门禁三个测试先行任务拆分，真实 Linux 验收保留为需单独授权的操作。
+- 问题：实施 Keepalived 可选业务健康检查，并保持零参数离线安装和正常 VRRP/VIP 启动行为。
+- 结论：缺失或注释 `KEEPALIVED_HEALTH_URL` 时安装器现在生成不含健康块的正式配置、启用并启动服务，同时不安装或保留健康脚本和 URL 文件；显式空值仍报错。重复安装可事务化双向切换模式并完整回滚。专项测试 181 项、脚本测试 243 项、Bash 语法、后端测试、前端 161 项、构建打包及 Linux/Windows 目录和归档校验均通过；真实 Linux 两种模式仍须单独授权验收。
+- 问题：在两台 openEuler 节点实机安装并验收 Keepalived 可选健康检查、VIP 漂移和恢复。
+- 结论：实机发现并修复两个安装边界：VIP 已绑定时 `ip route get` 返回 local/lo 导致重复安装误拒绝；最小系统缺少 tar 时应由离线 DNF 与编译依赖一起安装。两节点最终均为 Keepalived 2.4.2 active/enabled、SELinux Enforcing、精确 VRRP 规则，无健康模式配置不含健康块且无健康文件，VIP 位于优先级 150 节点；服务停止漂移到低优先级节点并自动抢占恢复通过，启用健康模式的 fall/rise 漂移恢复也通过。离线 DVD 已以只读方式挂载，临时测试服务、仓库覆盖和上传目录均已清理；最终 `pnpm test:local` 发布门禁通过。
+- 问题：`192.168.74.132` 上 `aifar-https-ingress` 已启动但其他机器无法访问，并要求直接修复及同步调整本地部署文件。
+- 结论：systemd oneshot 的 `active (exited)`、Nginx 容器、80/443 监听和 8080/38000 上游均正常，根因是 firewalld 的入口 `public` zone 未放行 HTTP/HTTPS。实机已补齐运行时与永久规则，外部 80/443、HTTP 301 和 HTTPS 200 验证通过。本地新增幂等 `configure-firewall.sh`，安装 systemd 时按默认路由接口 zone（无默认路由时回退默认 zone）自动放行，可通过配置关闭或指定 zone，且不 reload、删除或覆盖已有规则；脚本测试 247 项通过。
+- 问题：用户确认 HTTPS ingress 当前可访问是否代表 `configure-all-selinux.sh` 的规则已经生效。
+- 结论：132 当前为 SELinux Enforcing，但没有 `/aifar/apps/aifar-https-ingress` 的持久 fcontext 或聚合脚本事务记录，目录仍为 `default_t`；Docker SecurityOptions 只有 seccomp、容器 ProcessLabel/MountLabel 为空，nginx 运行在 `spc_t`，说明当前可访问是因为 Docker 未启用 SELinux 容器隔离，不是 ingress 聚合规则已应用。80/443 已属于发行版 `http_port_t`。当前本地聚合脚本还要求 ingress 启动路径匹配 `*/extras/aifar-https-ingress/start.sh`，与实际 `/aifar/apps/aifar-https-ingress/start.sh` 不一致，后续应用前需修正并测试。
+- 问题：用户要求先盘点 132 的实际服务状态，再判断 HTTPS ingress 的 SELinux 情况。
+- 结论：132 重启后除 `aifar-https-ingress.service` 外，aifar-agent、Keepalived、Docker/containerd、MySQL、Redis、MinIO、Nacos 和 10 个业务容器均 active/healthy，无其他 failed unit、近期无 AVC。Ingress 容器由 Docker `unless-stopped` 拉起且 80/443 监听，但 systemd unit 以 `203/EXEC` 失败；`start.sh` 具备 0755、根文件系统无 `noexec`，但标签为 `default_t` 且没有持久 fcontext，符合 Enforcing 下 systemd 无法执行的原因。当前页面可访问不代表 unit 或聚合 SELinux 规则正常。
+- 问题：用户运行 `configure-all-selinux.sh` 时，正式 ingress 路径 `/aifar/apps/aifar-https-ingress/start.sh` 被误判为不受支持并触发事务回滚。
+- 结论：根因是发现逻辑只接受源码测试路径 `*/extras/aifar-https-ingress/start.sh`。已先用失败测试复现，再改为校验规范化后的正式受管根 `/aifar/apps/aifar-https-ingress`，同时保留精确事务测试夹具边界；SELinux 专项 24 项通过。本地与远端脚本比较确认仅该路径修正不同。远端应用需要短暂停止 ingress 后执行聚合脚本并恢复 systemd，因最新请求仅授权检查且该操作涉及中断与 SELinux 持久变更，尚待用户再次明确批准，132 未被修改。
+- 问题：用户明确批准在 132 应用 ingress SELinux 路径修正并短暂停止/恢复 HTTPS。
+- 结论：已备份并更新远端聚合脚本，停止 ingress 后零参数执行成功，Keepalived 与 https-ingress 为 APPLIED、SELinux 保持 Enforcing；随后 systemd ingress 为 enabled/active(exited)、Result=success，容器 running，conf.d/tls 为持久 `container_file_t`、start.sh 为 `shell_exec_t`、config.env 为 `etc_t`，无 failed unit 和近期 AVC，服务器本机及外部 HTTPS 均为 200。本地专项 24 项和脚本全集 248 项通过；远端备份为 `/aifar/apps/selinux/configure-all-selinux.sh.bak.20260720060902`。聚合执行仍输出三条非致命 awk escape warning，未影响事务成功。
+- 问题：用户重复执行聚合 SELinux 脚本后仍看到 `awk` 转义警告、已有 ingress fcontext 被 modifying，且 https-ingress 显示 APPLIED，询问是否正确。
+- 结论：事务结果和最终标签有效，但重复执行不符合幂等预期；正常第二次应无警告且 https-ingress 为 UNCHANGED。根因是 `local_fcontext_type()` 用 `awk -v want="$pattern"` 传入包含 `\.` 的 semanage 正则，openEuler awk 将反斜杠当转义解析并发出警告，导致精确规则查找失败，脚本误走新增/修改分支。该输出不是服务故障，但需要修正 fcontext 精确匹配后再做一次重复运行验收。
+- 问题：用户要求彻底修复聚合 SELinux 脚本的 awk 警告和重复执行非幂等行为。
+- 结论：已用包含 `start\.sh` 的失败测试复现 warning、重复 `semanage -a` 和状态重复 APPLIED；修正为通过 awk `ENVIRON` 原样传递 fcontext 正则，避免 `-v` 解析反斜杠。132 更新后连续执行两次均 stderr 为空、所有已安装组件 UNCHANGED、mysql-router SKIPPED、SELinux Enforcing unchanged、Result SUCCESS，无 already-defined/modifying。最终 ingress enabled/active、容器 running、HTTPS 200、failed unit 0、近期 AVC denial 0；本地脚本测试 249 项和差异检查通过，远端备份为 `/aifar/apps/selinux/configure-all-selinux.sh.bak.20260720061925`。
+- 问题：用户要求连接 133 修复 aifar-https-ingress，并认为 SELinux 未生效。
+- 结论：只读检查确认 133 的 SELinux 已为 Enforcing，ingress 的 start.sh/config.env/conf.d/tls 实际标签与持久 fcontext 均正确，聚合脚本也已包含正式路径和 awk 幂等修正，public zone 已放行 HTTP/HTTPS。Ingress 失败的直接原因是 `nginx:stable-alpine` 镜像不存在；更关键的是该节点 Docker 镜像/容器均为 0，8080/38000 无监听，只有管理 Agent 在 127.0.0.1:18081，且 MySQL/Redis/MinIO/Nacos 未安装。单独导入 Nginx 后也只会返回 502；若 133 要作为完整 HA 节点，需另行授权部署 AIFAR Runtime/业务上游，不能把该扩展隐含在 ingress 修复中。
+- 问题：用户认为 133 执行 ingress 安装脚本后没有自动创建 443 防火墙端口，因为 `firewall-cmd --list-port` 未显示 443。
+- 结论：脚本按 firewalld 推荐方式添加 `http`/`https` 服务而非显式端口，因此 `--list-ports` 只显示其他显式规则。实机确认 public zone 的 http/https 在运行时和永久配置均为 yes，服务定义分别映射 80/tcp 与 443/tcp；正确查看命令是 `firewall-cmd --zone=public --list-services`、`--query-service=https` 或 `--list-all`，无需重复添加 443/tcp。
+- 问题：用户在 41 上执行 `cluster.removeInstance()` 后，42 的 Group Replication 已停止，但重新 `addInstance()` 报 42 已属于另一个 InnoDB Cluster；42 上普通 `dropMetadataSchema()` 又因无 quorum 被拒绝。
+- 结论：这是成员移除后两端 metadata 不一致的典型状态；先以 41 的 `cluster.status({extended:2})` 确认其仍为有 quorum 的权威集群，必要时在 41 强制移除 MISSING 的 42，再仅在确认 42 可由 41 clone 覆盖后于 42 执行 `dba.dropMetadataSchema({force:true})` 清除本地旧身份，最后回到 41 用 `cluster.addInstance(..., {recoveryMethod:'clone'})` 重建。若 41 也无 quorum 或所有成员均离线，不得删 metadata，应按 quorum-loss 或 complete-outage 流程恢复。
+- 问题：50 加入 41 所在 InnoDB Cluster 时出现同类“属于另一个集群”问题，用户反馈强制删除也失败。
+- 结论：需先区分失败命令：41 上的 `cluster.removeInstance('root@50:3306', {force:true})` 只能清理 41 当前集群中已登记的 50，不能清除 50 所属另一个旧 cluster ID；若 50 本机 `dba.dropMetadataSchema({force:true})` 失败，则必须收集完整错误以及 50 的 Group Replication、`super_read_only` 和 metadata 状态，不能直接手工 DROP metadata schema。
+- 问题：MySQL Router 日志显示已连接 41 的 metadata server，但持续报无法取得任何 live Group Replication member、metadata 为空，并关闭 6446-6449；41 上 `dba.getCluster()` 仍能返回 `aifarCluster` 对象。
+- 结论：`dba.getCluster()` 成功只代表 41 仍有 InnoDB Cluster metadata，不代表 Group Replication 正常；Router 失败的直接边界是 41 当前没有可路由的在线 GR 成员。应暂停加入 42/50，先用 `cluster.status({extended:2})`、`performance_schema.replication_group_members` 和 complete-outage `dryRun` 区分 GR 全停与 quorum loss；全停走 `rebootClusterFromCompleteOutage`，仍有在线分区但无 quorum 才考虑在排除其它活动分区后 `forceQuorumUsingPartitionOf`。
+- 问题：用户要求重新执行 MySQL Router bootstrap。
+- 结论：当前 AIFAR Router 使用 `/aifar/apps/mysql-router/mysql-router/bin/mysqlrouter`，自包含目录为 `/aifar/apps/mysql-router/router`，systemd unit 为 `aifar-mysql-router`，bootstrap 参数为 41:3306、base port 6446、bind 0.0.0.0、系统用户 `aifar-router`。重建前必须确认 41 的 `aifarCluster` 至少有一个 ONLINE GR 成员；操作应先停止 unit、把整个 router 目录改名备份，再以 `--directory` 和 `--force` 重新 bootstrap，启动后验证 metadata cluster、6446-6449 和日志。
+- 问题：用户澄清 Router 异常之前已重新创建 InnoDB Cluster。
+- 结论：根因因此确定为 Router 仍持有旧集群的 cluster/Group Replication 标识、metadata 账号、keyring 与 state.json；即使新集群仍叫 `aifarCluster`，旧 Router 状态也不会自动转换。应在确认新集群 ONLINE 后完整备份并重建 `/aifar/apps/mysql-router/router`，对新集群重新 bootstrap，而不是只重启 Router 或只改 mysqlrouter.conf。
+- 问题：手工重新 bootstrap 时，目标 MySQL Router 报 `unknown option --conf-bind-address 0.0.0.0`。
+- 结论：错误发生在命令行参数解析，尚未完成 bootstrap；该参数可安全省略，因为 MySQL Router bootstrap 默认会为生成的路由配置使用 `bind_address=0.0.0.0`。当前仓库 `backend/internal/apps/mysqlrouter/templates/install.sh` 也固定传入 `--conf-bind-address`，与目标实际 Router 二进制存在兼容性风险，服务器恢复命令应先移除该参数并在生成后检查各 routing 段的 `bind_address`。
+- 问题：用户询问安装 MySQL Router 时实际使用了哪个用户。
+- 结论：安装链路涉及三类用户：AIFAR bootstrap 连接 MySQL 时使用安装参数 `rootUser`，默认/当前通常为 `root`；Linux 安装和 systemd 运行身份固定为系统账号 `aifar-router`；bootstrap 还会在新集群中自动创建专用的 MySQL metadata 账号，运行期 Router 使用该账号及本地 keyring，不会持续使用 root。
+- 问题：用户已创建 `/aifar/apps/mysql-router/router` 并设置 `aifar-router` 权限，但 Router bootstrap 仍报无法创建部署目录、No such file or directory。
+- 结论：截图证明目标目录对 root 存在，报错不等于该末级目录字面缺失；`--directory` 的语义是由 Router 创建自包含实例目录，恢复时应先备份旧目录并让目标路径保持不存在，同时用 `namei -l` 和 `sudo -u aifar-router` 写入测试确认 `aifar-router` 能遍历和写入所有父级。若新目录仍报 ENOENT，再以目标二进制版本和 `strace -e trace=file` 定位版本/实际失败路径，不应继续盲目 chmod。
+- 问题：用户询问 8 核 16G 的 MySQL 节点是否可把最大连接数设为 3000。
+- 结论：3000 可作为配置上限但不适合作为 3000 个同时活跃查询的容量目标；连接内存按需增长，且 8 核会先遇到调度和查询并发瓶颈。当前建议先设 800 到 1000，并把单节点所有应用连接池总量控制在约 300 到 600；依据业务高峰 `Max_used_connections`、`Threads_running`、连接拒绝、内存和 swap 指标压测后再提高，InnoDB Cluster 的每个成员需分别配置且主节点按 RW 峰值核算。
+- 问题：用户要求给出 8C16G 与 16C32G MySQL 节点的推荐最大连接数。
+- 结论：面向专用 MySQL 8/InnoDB Cluster 节点且连接大多空闲或为短查询时，建议基线分别设为 1000 和 2000；常规可调范围分别为 800 到 1200、1500 到 2500，超过 1500 或 3000 前必须压测。应用连接池总和应预留 20% 到 30% 的连接额度给运维、复制和故障恢复，真正活跃查询并发仍需根据 CPU、延迟和 `Threads_running` 控制。
+- 问题：用户询问启用 InnoDB Cluster 读写分离后是否能改善连接和负载问题。
+- 结论：读写分离能在读多写少时把普通查询经 Router 6447 分摊到两个 SECONDARY，明显降低 PRIMARY 的 CPU、连接和查询压力，但不能修复连接泄漏、慢 SQL或写入瓶颈，也不会由 Router 按 SQL 自动拆分；应用必须维护 RW/RO 两套数据源。写事务、写后立即读和强一致查询应走 6446，普通列表/报表可走 6447；Group Replication 默认存在最终一致性窗口，不能把所有 SELECT 无条件切到 SECONDARY。
+- 问题：AIFAR Runtime 页面显示 `failed to read Docker stats: exec: "docker": executable file not found in %PATH%`，但 Runtime Ready、Agent Running 且 Pod 列表可见。
+- 结论：根因是远端 DockerHost 为 TCP/HTTP API 时，容器列表走 Go Docker HTTP API，而 `DockerContainerStatsForServer` 又调用 `DockerContainerStats`，后者固定通过本机 `exec.Command("docker", "-H", ...)` 执行 CLI；面板后端运行在 Windows 且 PATH 中没有 docker.exe，故仅 stats 失败。远端 Docker 和 Agent 并未因此异常，当前影响限于 Pod CPU/内存统计；正确修复边界是为 stats 补 Docker Engine API 实现或改走 SSH/Agent，而不是在 Windows 面板机盲装 Docker CLI。
+- 问题：用户询问 Nacos 使用服务器地址注册与使用容器地址注册的具体区别。
+- 结论：当前 AIFAR Runtime 明确采用 agent-proxy：Java 容器设置 `SPRING_CLOUD_NACOS_DISCOVERY_REGISTER_ENABLED=false`，由 aifar-agent 向 Nacos 注册“宿主机可达 IP + 服务代理端口”，再把请求代理到同一 Docker 网络中的健康容器 IP；相比容器直接注册，该方式能屏蔽容器 IP 漂移、统一负载均衡和上下线，但增加 agent/宿主机代理这一跳和故障边界。容器直接注册更原生、少一跳，但消费者必须能路由到容器网段，并承受容器重建、跨主机网络、心跳和摘除管理复杂度。

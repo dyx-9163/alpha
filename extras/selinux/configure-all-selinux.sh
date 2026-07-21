@@ -63,6 +63,16 @@ ensure_selinux_tools() {
     done
 }
 
+ensure_container_selinux_policy() {
+    if rpm -q container-selinux >/dev/null 2>&1; then
+        return 0
+    fi
+    command -v dnf >/dev/null 2>&1 || die "Docker SELinux 策略缺失，且 dnf 不可用"
+    log "安装 Docker 所需的 container-selinux 策略包"
+    dnf -y install container-selinux
+    rpm -q container-selinux >/dev/null 2>&1 || die "container-selinux 安装后仍不可用"
+}
+
 validate_port() {
     local port="$1"
     [[ "$port" =~ ^[0-9]+$ ]] || return 1
@@ -167,7 +177,8 @@ ensure_port_type() {
 
 local_fcontext_type() {
     local pattern="$1" context
-    context="$(semanage fcontext -l -C 2>/dev/null | awk -v want="$pattern" '$1 == want {print $NF; exit}')"
+    context="$(semanage fcontext -l -C 2>/dev/null |
+        FCONTEXT_PATTERN="$pattern" awk '$1 == ENVIRON["FCONTEXT_PATTERN"] {print $NF; exit}')"
     if [[ -n "$context" ]]; then
         context_type "$context"
     fi
@@ -198,7 +209,7 @@ safe_restorecon() {
     resolved="$(canonical_managed_path "$root" "$target")" || die "$component 拒绝处理越界路径：$target"
     [[ -e "$resolved" ]] || return 0
     journal restore-target "$resolved" "" ""
-    restorecon -RF "$resolved"
+    restorecon -RF -x "$resolved"
 }
 
 verify_file_type() {
@@ -230,7 +241,7 @@ rollback_transaction() {
 
     while IFS=$'\t' read -r action key applied previous; do
         if [[ "$action" == "restore-target" && -e "$key" ]]; then
-            restorecon -RF "$key" >/dev/null 2>&1 || true
+            restorecon -RF -x "$key" >/dev/null 2>&1 || true
         fi
     done <"$JOURNAL_FILE"
     TRANSACTION_ACTIVE=0
@@ -298,8 +309,9 @@ discover_docker_port() {
 configure_docker() {
     local root="$MANAGED_BASE/docker" port
     component_installed "$root" docker.service containerd.service || return 10
+    ensure_container_selinux_policy
     port="$(discover_docker_port)"
-    ensure_port_type docker docker_port_t "$port"
+    ensure_port_type docker container_port_t "$port"
     apply_existing_path_mapping docker "$root" "$root/data" /var/lib/docker
     apply_existing_path_mapping docker "$root" "$root/exec" /run/docker
     apply_existing_path_mapping docker "$root" "$root/daemon" /etc/docker
@@ -405,6 +417,7 @@ configure_mysql() {
     port="${port:-3306}"
     ensure_port_type mysql mysqld_port_t "$port"
     apply_existing_path_mapping mysql "$root" "$root/mysql/bin/mysqld" /usr/sbin/mysqld
+    apply_existing_path_mapping mysql "$root" "$root/mysql/lib" /usr/lib64
     apply_existing_path_mapping mysql "$root" "$root/conf" /etc/mysql
     apply_existing_path_mapping mysql "$root" "$root/data" /var/lib/mysql
     apply_existing_path_mapping mysql "$root" "$root/logs" /var/log/mysqld.log
@@ -557,7 +570,9 @@ configure_nacos() {
 
 configure_keepalived() {
     local root="$MANAGED_BASE/keepalived" exec_start
-    component_installed "$root" keepalived.service || return 10
+    if [[ ! -x "$root/sbin/keepalived" && -z "$(unit_fragment keepalived.service)" ]]; then
+        return 10
+    fi
     exec_start="$(unit_exec_start keepalived.service)"
     if [[ -n "$exec_start" && "$exec_start" != *"$root/sbin/keepalived"* ]]; then
         die "keepalived.service 不属于 $root"
@@ -574,10 +589,12 @@ discover_https_ingress_root() {
     exec_start="$(unit_exec_start aifar-https-ingress.service)"
     start_script="$(grep -oE 'path=/[^ ;}]+' <<<"$exec_start" | sed 's/^path=//' | head -n 1 || true)"
     [[ -n "$start_script" ]] || die "无法从 aifar-https-ingress.service 解析启动脚本"
-    [[ "$start_script" == */extras/aifar-https-ingress/start.sh ]] ||
-        die "aifar-https-ingress.service 启动脚本不属于受支持的 ingress 模块：$start_script"
     root="$(readlink -m -- "$(dirname -- "$start_script")")" ||
         die "无法解析 HTTPS ingress 安装目录"
+    if [[ "$root" != "$MANAGED_BASE/aifar-https-ingress" &&
+          "$root" != "$TRANSACTION_DIR/extras/aifar-https-ingress" ]]; then
+        die "aifar-https-ingress.service 启动脚本不属于受支持的 ingress 模块：$start_script"
+    fi
     printf '%s\n' "$root"
 }
 

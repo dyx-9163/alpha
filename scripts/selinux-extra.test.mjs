@@ -68,12 +68,20 @@ semanage() {
       [[ -s "$STATE_FILE" ]] && cat "$STATE_FILE"
       ;;
     'port -a -t')
+      case "$4" in
+        container_port_t|http_port_t|mysqld_port_t|redis_port_t) ;;
+        *) return 1 ;;
+      esac
       if grep -Eq "^[^ ]+ tcp ([^,]*, ?)*$7(,|$)|^[^ ]+ tcp $7$" "$BASE_STATE_FILE"; then
         return 1
       fi
       printf '%s tcp %s\\n' "$4" "$7" >>"$STATE_FILE"
       ;;
     'port -m -t')
+      case "$4" in
+        container_port_t|http_port_t|mysqld_port_t|redis_port_t) ;;
+        *) return 1 ;;
+      esac
       printf '%s tcp %s\\n' "$4" "$7" >"$STATE_FILE"
       ;;
     'port -d -p')
@@ -152,6 +160,17 @@ test('aggregate SELinux script contains transaction and safe discovery boundarie
   }
 })
 
+test('Keepalived release artifacts alone are not treated as an installed service', () => {
+  const source = readFileSync(scriptPath, 'utf8')
+  const start = source.indexOf('configure_keepalived()')
+  const end = source.indexOf('discover_https_ingress_root()', start)
+  assert.notEqual(start, -1)
+  assert.notEqual(end, -1)
+  const body = source.slice(start, end)
+  assert.match(body, /! -x "\$root\/sbin\/keepalived"/)
+  assert.match(body, /unit_fragment keepalived\.service/)
+})
+
 test('new port rules are journaled and removed by current-transaction rollback', (t) => {
   const result = runBashHarness(t, `
 ensure_port_type mysql mysqld_port_t 3306
@@ -211,16 +230,68 @@ rollback_transaction
   assert.match(result.calls, /semanage fcontext -d \/aifar\/apps\/mysql\/data/)
 })
 
+test('matching escaped file-context rules are an idempotent no-op without awk warnings', (t) => {
+  const result = runBashHarness(t, `
+printf '%s\\n' '/aifar/apps/aifar-https-ingress/start\\.sh all files system_u:object_r:shell_exec_t:s0' >"$FCONTEXT_STATE_FILE"
+reference_type() { printf '%s\\n' shell_exec_t; }
+ensure_fcontext https-ingress '/aifar/apps/aifar-https-ingress/start\\.sh' /usr/bin/bash
+[[ "$MUTATION_COUNT" == 0 ]]
+`)
+  assert.equal(result.status, 0, JSON.stringify({ stderr: result.stderr, calls: result.calls, fcontextState: result.fcontextState }))
+  assert.doesNotMatch(result.stderr, /awk: warning/)
+  assert.doesNotMatch(result.calls, /semanage fcontext -(?:a|m|d)/)
+})
+
+test('missing container SELinux policy is installed before Docker port mapping', (t) => {
+  const result = runBashHarness(t, `
+PACKAGE_INSTALLED=0
+rpm() {
+  [[ "$1" == '-q' && "$2" == 'container-selinux' && "$PACKAGE_INSTALLED" == 1 ]]
+}
+dnf() {
+  printf 'dnf %s\\n' "$*" >>"$CALL_LOG"
+  [[ "$*" == '-y install container-selinux' ]]
+  PACKAGE_INSTALLED=1
+}
+ensure_container_selinux_policy
+[[ "$PACKAGE_INSTALLED" == 1 ]]
+`)
+  assert.equal(result.status, 0, JSON.stringify({ stderr: result.stderr, calls: result.calls }))
+  assert.match(result.calls, /dnf -y install container-selinux/)
+})
+
+test('MySQL bundled shared libraries use the distribution library type', (t) => {
+  const result = runBashHarness(t, `
+unit_fragment() { printf '%s\\n' /etc/systemd/system/aifar-mysql.service; }
+read_key_value() { printf '%s\\n' 3306; }
+ensure_port_type() { :; }
+apply_existing_path_mapping() { printf 'mapping %s\\n' "$*" >>"$CALL_LOG"; }
+configure_mysql
+`)
+  assert.equal(result.status, 0, JSON.stringify({ stderr: result.stderr, calls: result.calls }))
+  assert.match(result.calls, /mapping mysql \/aifar\/apps\/mysql \/aifar\/apps\/mysql\/mysql\/lib \/usr\/lib64/)
+})
+
+test('recursive restorecon stays on the managed filesystem', (t) => {
+  const result = runBashHarness(t, `
+restorecon() { printf 'restorecon %s\\n' "$*" >>"$CALL_LOG"; }
+safe_restorecon test "$TRANSACTION_DIR" "$TRANSACTION_DIR"
+`)
+  assert.equal(result.status, 0, JSON.stringify({ stderr: result.stderr, calls: result.calls }))
+  assert.match(result.calls, /restorecon -RF -x /)
+})
+
 const discoveredPortCases = [
   {
     name: 'Docker',
     body: `
 unit_fragment() { printf '%s\\n' /etc/systemd/system/docker.service; }
 unit_exec_start() { printf '%s\\n' '/usr/local/bin/dockerd -H tcp://0.0.0.0:2376'; }
+ensure_container_selinux_policy() { :; }
 apply_existing_path_mapping() { :; }
 configure_docker
 `,
-    expected: ['docker_port_t tcp 2376']
+    expected: ['container_port_t tcp 2376']
   },
   {
     name: 'MySQL',
@@ -357,4 +428,12 @@ configure_https_ingress
   assert.match(result.calls, /verify .*tls/)
   assert.doesNotMatch(result.calls, /restorecon .*conf\.d|restorecon .*tls/)
   assert.doesNotMatch(result.calls, /apply .*conf\.d|apply .*tls/)
+})
+
+test('HTTPS ingress discovery accepts the managed deployment root', (t) => {
+  const result = runBashHarness(t, `
+unit_exec_start() { printf '%s\\n' '{ path=/aifar/apps/aifar-https-ingress/start.sh ; }'; }
+[[ "$(discover_https_ingress_root)" == /aifar/apps/aifar-https-ingress ]]
+`)
+  assert.equal(result.status, 0, result.stderr)
 })

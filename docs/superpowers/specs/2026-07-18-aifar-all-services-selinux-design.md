@@ -47,12 +47,12 @@ The script does not scan arbitrary processes or every listening socket. Each com
 | --- | --- | --- | --- |
 | Docker and `aifar-agent` | `docker.service`, `containerd.service`, `aifar-agent.service`, or `/aifar/apps/docker` | Parsed Docker `ExecStart`; default `2375` only when the managed unit exists but has no explicit TCP port | Distribution references for Docker data/runtime paths; generic distribution references for the AIFAR agent binary, state, config, and log paths |
 | AIFAR Runtime | `/aifar/apps/admin/runtime` and its runtime specification or managed containers | Runtime specification plus published AIFAR container ports; managed defaults are fallback only after installation is proven | Exact bind-mount sources discovered from managed AIFAR containers/specification, labeled for container access |
-| MySQL | `aifar-mysql.service` or `/aifar/apps/mysql` | Managed configuration and unit; default `3306` only as installed fallback | Labels derived from distribution MySQL binary, configuration, data, log, and runtime reference paths |
+| MySQL | `aifar-mysql.service` or `/aifar/apps/mysql` | Managed configuration and unit; default `3306` only as installed fallback | Labels derived from distribution MySQL binary, shared-library, configuration, data, log, and runtime reference paths |
 | MySQL Router | `aifar-mysql-router.service` or `/aifar/apps/mysql-router` | Router configuration and unit; managed fallback `6446-6449` | Distribution MySQL executable/configuration references where available, otherwise generic executable/config/state references |
 | Redis | `aifar-redis.service`, `aifar-redis-sentinel.service`, or `/aifar/apps/redis` | Redis/Sentinel configuration; cluster bus port is the Redis port plus `10000` | Labels derived from distribution Redis binary, configuration, data, log, and runtime reference paths |
 | MinIO | `aifar-minio.service` or `/aifar/apps/minio` | Managed environment and unit; installed fallbacks `9000` and `9001` | Generic distribution executable/config/data/log/runtime references because openEuler does not provide an AIFAR-owned MinIO policy |
 | Nacos | `aifar-nacos.service` or `/aifar/apps/nacos` | Managed application properties and unit; installed fallbacks `8848`, `9848`, `9849`, and `7848` | Generic distribution executable/config/data/log/runtime references for the JDK and Nacos tree |
-| Keepalived | Managed `keepalived.service` targeting `/aifar/apps/keepalived` or the exact install root | No TCP port mapping; VRRP is IP protocol 112 and remains outside `semanage port` | Labels derived from distribution Keepalived binary, config, helper, state, runtime, and unit references |
+| Keepalived | Executable `/aifar/apps/keepalived/sbin/keepalived` or a managed `keepalived.service`; a release-artifact directory alone is not installed evidence | No TCP port mapping; VRRP is IP protocol 112 and remains outside `semanage port` | Labels derived from distribution Keepalived binary, config, helper, state, runtime, and unit references |
 | HTTPS ingress | `aifar-https-ingress.service` with a validated module directory | Host ports `80` and `443`, plus configured local upstream ports for verification | Docker-managed private bind-mount labels for `conf.d` and `tls`; module scripts use generic executable labels |
 
 All parsed values must pass strict validation. Ports must be decimal integers from 1 through 65535. Paths must be absolute, canonical, and confined to the exact approved roots for their component. A malformed or out-of-scope installed configuration fails that component instead of falling back silently.
@@ -61,7 +61,7 @@ All parsed values must pass strict validation. Ports must be decimal integers fr
 
 The script uses only policy types present on the target system. Its managed mappings are:
 
-- Docker remote API: `docker_port_t`.
+- Docker remote API: canonical `container_port_t` (`docker_port_t` is a compatibility alias that `semanage port` rejects on openEuler). When Docker is installed but the distribution policy is absent, the script installs the official `container-selinux` package before applying this mapping.
 - MySQL and MySQL Router: `mysqld_port_t`.
 - Redis, Sentinel, and Redis cluster bus: `redis_port_t`.
 - AIFAR HTTP services and MinIO HTTP endpoints: `http_port_t`.
@@ -74,6 +74,8 @@ For each selected port, the script first checks local and distribution mappings.
 ## File-Context Policy
 
 Persistent file labels use `semanage fcontext` followed by `restorecon`. The script does not use `chcon` as its durable mechanism.
+
+Recursive relabeling uses `restorecon -x` so a managed directory does not cross into active bind mounts or network namespaces on another filesystem.
 
 For services with distribution policies, the script resolves the type from known standard reference paths using `matchpathcon`. This avoids hard-coding types that may differ across openEuler policy package revisions. A required reference that cannot be resolved causes only that installed component to fail.
 
