@@ -53,7 +53,7 @@ func (s Service) ValidateArtifactRollback(req ArtifactRollbackRequest) error {
 	return nil
 }
 
-func (s Service) RollbackArtifact(ctx context.Context, req ArtifactRollbackRequest, log Logger, targetLog targetLogger) error {
+func (s Service) RollbackArtifact(ctx context.Context, req ArtifactRollbackRequest, log Logger, targetLog targetLogger) (resultErr error) {
 	copy := updateCopyFor(req.Language)
 	target := req.Instance.ServerID
 	if target == "" {
@@ -97,6 +97,15 @@ func (s Service) RollbackArtifact(ctx context.Context, req ArtifactRollbackReque
 	var artifacts []rollbackArtifactRef
 	var serviceNames []string
 	var revisionsBefore map[string]string
+	var pendingRelease *store.AppRelease
+	defer func() {
+		if resultErr == nil || pendingRelease == nil {
+			return
+		}
+		if err := s.markRecordedReleaseFailed(pendingRelease, resultErr); err != nil {
+			logForServer.Error("%s", fmt.Sprintf(copy.RecordFailed, err))
+		}
+	}()
 
 	if err := step(1, func() error {
 		var err error
@@ -141,7 +150,7 @@ func (s Service) RollbackArtifact(ctx context.Context, req ArtifactRollbackReque
 			manifest["status"] = "pending"
 			manifest["phase"] = "pending"
 			raw, _ := json.Marshal(manifest)
-			if _, err := releases.SaveAppRelease(store.AppRelease{
+			saved, err := releases.SaveAppRelease(store.AppRelease{
 				InstanceID:   req.Instance.ID,
 				App:          AppName,
 				Version:      version,
@@ -151,9 +160,11 @@ func (s Service) RollbackArtifact(ctx context.Context, req ArtifactRollbackReque
 				ManifestJSON: string(raw),
 				ConfigHash:   configHash,
 				CreatedAt:    rollbackTime,
-			}); err != nil {
+			})
+			if err != nil {
 				return err
 			}
+			pendingRelease = &saved
 		}
 		_ = targetRelease
 		return nil
@@ -285,6 +296,7 @@ func (s Service) RollbackArtifact(ctx context.Context, req ArtifactRollbackReque
 			}); err != nil {
 				return err
 			}
+			pendingRelease = nil
 			if _, err := releases.DeleteOldAppReleases(saved.ID, releaseKeepCount); err != nil {
 				return err
 			}

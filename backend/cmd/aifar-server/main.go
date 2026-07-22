@@ -85,6 +85,11 @@ func main() {
 	} else if len(recovered) > 0 {
 		log.Printf("recovered %d interrupted task(s) from previous aifar-server process", len(recovered))
 	}
+	if reconciled, err := db.ReconcilePendingAppReleases(); err != nil {
+		log.Printf("AIFAR release recovery warning: %v", err)
+	} else if reconciled > 0 {
+		log.Printf("reconciled %d pending AIFAR release(s) from terminal tasks", reconciled)
+	}
 	if recovered, err := aifar.RecoverInterruptedOrchestrationLocks(db); err != nil {
 		log.Printf("AIFAR orchestration lock recovery warning: %v", err)
 	} else if recovered > 0 {

@@ -26,6 +26,7 @@ import {
   aifarRuntimeStatusLabel,
   formatDate,
   percentText,
+  releaseActivatedAtText,
   releaseKindLabel,
   releaseServicesText,
   releaseStatusLabel,
@@ -325,6 +326,9 @@ describe('runtime format rules', () => {
     expect(formatDate()).toBe('-')
     expect(formatDate('not-a-date')).toBe('not-a-date')
     expect(formatDate('2026-07-10T12:00:00Z')).toBe(new Date('2026-07-10T12:00:00Z').toLocaleString())
+    expect(releaseActivatedAtText({ instanceId: 'instance-1', releaseId: 'release-failed', status: 'failed', activatedAt: '0001-01-01T00:00:00Z' })).toBe('-')
+    expect(releaseActivatedAtText({ instanceId: 'instance-1', releaseId: 'release-pending', status: 'pending', createdAt: '2026-07-10T12:00:00Z' })).toBe('-')
+    expect(releaseActivatedAtText({ instanceId: 'instance-1', releaseId: 'release-success', status: 'success', activatedAt: '2026-07-10T12:00:00Z' })).toBe(new Date('2026-07-10T12:00:00Z').toLocaleString())
   })
 
   it('formats ready and total service endpoints using the documented fallbacks', () => {

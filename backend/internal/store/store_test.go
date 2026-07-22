@@ -1,6 +1,7 @@
 package store
 
 import (
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -652,6 +653,78 @@ func TestRecoverInterruptedTasks(t *testing.T) {
 	}
 	if task.Status != "success" {
 		t.Fatalf("expected finished task to remain success, got %+v", task)
+	}
+}
+
+func TestReconcilePendingAppReleasesFromTerminalTasks(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "aifar.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	instance, err := db.SaveAppInstance(AppInstance{ID: "aifar-1", App: "aifar", Version: "runtime-v2", ServerID: "srv-1", Status: "installed"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, task := range []Task{
+		{ID: "task-failed", Type: "apps.aifar.update", Status: "failed", Error: "no space left on device"},
+		{ID: "task-cancelled", Type: "apps.aifar.update", Status: "cancelled", Error: "cancelled by operator"},
+		{ID: "task-running", Type: "apps.aifar.update", Status: "running"},
+	} {
+		if _, err := db.CreateTask(task); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, item := range []struct {
+		releaseID string
+		taskID    string
+	}{
+		{releaseID: "release-failed", taskID: "task-failed"},
+		{releaseID: "release-cancelled", taskID: "task-cancelled"},
+		{releaseID: "release-running", taskID: "task-running"},
+		{releaseID: "release-unlinked", taskID: ""},
+	} {
+		manifest, _ := json.Marshal(map[string]any{"releaseId": item.releaseID, "taskId": item.taskID, "status": "pending", "phase": "pending"})
+		if _, err := db.SaveAppRelease(AppRelease{
+			InstanceID: instance.ID, App: "aifar", Version: "runtime-v2", ReleaseID: item.releaseID,
+			ServerID: "srv-1", Status: "pending", ManifestJSON: string(manifest), CreatedAt: time.Now(),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	updated, err := db.ReconcilePendingAppReleases()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated != 2 {
+		t.Fatalf("expected two reconciled releases, got %d", updated)
+	}
+	releases, err := db.ListAppReleases(instance.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byID := map[string]AppRelease{}
+	for _, release := range releases {
+		byID[release.ReleaseID] = release
+	}
+	for _, releaseID := range []string{"release-failed", "release-cancelled"} {
+		release := byID[releaseID]
+		if release.Status != "failed" || !release.ActivatedAt.IsZero() {
+			t.Fatalf("expected %s to be failed without activation, got %+v", releaseID, release)
+		}
+		var manifest map[string]any
+		if err := json.Unmarshal([]byte(release.ManifestJSON), &manifest); err != nil {
+			t.Fatal(err)
+		}
+		if manifest["status"] != "failed" || manifest["phase"] != "failed" || strings.TrimSpace(manifest["failedAt"].(string)) == "" || strings.TrimSpace(manifest["error"].(string)) == "" {
+			t.Fatalf("expected reconciled failure manifest, got %s", release.ManifestJSON)
+		}
+	}
+	for _, releaseID := range []string{"release-running", "release-unlinked"} {
+		if release := byID[releaseID]; release.Status != "pending" {
+			t.Fatalf("expected %s to remain pending, got %+v", releaseID, release)
+		}
 	}
 }
 

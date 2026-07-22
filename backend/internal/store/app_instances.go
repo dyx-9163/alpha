@@ -3,6 +3,8 @@ package store
 import (
 	"database/sql"
 	"encoding/json"
+	"fmt"
+	"strings"
 	"time"
 )
 
@@ -140,6 +142,92 @@ func (s *Store) ListAppReleases(instanceID string) ([]AppRelease, error) {
 		out = append(out, v)
 	}
 	return out, rows.Err()
+}
+
+func (s *Store) ReconcilePendingAppReleases() (int, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+
+	rows, err := tx.Query(`select id,coalesce(manifest_json,'') from app_releases where app='aifar' and status='pending'`)
+	if err != nil {
+		return 0, err
+	}
+	type pendingRelease struct {
+		id       string
+		manifest string
+	}
+	pending := []pendingRelease{}
+	for rows.Next() {
+		var release pendingRelease
+		if err := rows.Scan(&release.id, &release.manifest); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		pending = append(pending, release)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return 0, err
+	}
+	if err := rows.Close(); err != nil {
+		return 0, err
+	}
+
+	updated := 0
+	for _, release := range pending {
+		manifest := map[string]any{}
+		if err := json.Unmarshal([]byte(release.manifest), &manifest); err != nil {
+			continue
+		}
+		taskID, _ := manifest["taskId"].(string)
+		taskID = strings.TrimSpace(taskID)
+		if taskID == "" {
+			continue
+		}
+		var taskStatus, taskError string
+		var finishedAt sql.NullTime
+		if err := tx.QueryRow(`select status,coalesce(error,''),finished_at from tasks where id=?`, taskID).Scan(&taskStatus, &taskError, &finishedAt); err != nil {
+			if err == sql.ErrNoRows {
+				continue
+			}
+			return updated, err
+		}
+		switch taskStatus {
+		case "failed", "cancelled", "timeout":
+		default:
+			continue
+		}
+		failedAt := time.Now().UTC()
+		if finishedAt.Valid {
+			failedAt = finishedAt.Time.UTC()
+		}
+		if strings.TrimSpace(taskError) == "" {
+			taskError = fmt.Sprintf("associated task ended with status %s", taskStatus)
+		}
+		manifest["status"] = "failed"
+		manifest["phase"] = "failed"
+		manifest["taskStatus"] = taskStatus
+		manifest["error"] = taskError
+		manifest["failedAt"] = failedAt.Format(time.RFC3339Nano)
+		raw, err := json.Marshal(manifest)
+		if err != nil {
+			return updated, err
+		}
+		result, err := tx.Exec(`update app_releases set status='failed',manifest_json=?,activated_at=null where id=? and status='pending'`, string(raw), release.id)
+		if err != nil {
+			return updated, err
+		}
+		if affected, _ := result.RowsAffected(); affected > 0 {
+			updated++
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return updated, err
+	}
+	return updated, nil
 }
 
 func (s *Store) DeleteOldAppReleases(instanceID string, keep int) (int, error) {

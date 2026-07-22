@@ -61,6 +61,11 @@ export function formatDate(value?: string) {
   return date.toLocaleString()
 }
 
+export function releaseActivatedAtText(row: AifarRelease) {
+  if (row.status !== 'success') return '-'
+  return formatDate(row.activatedAt)
+}
+
 export function runtimeEndpointText(row: AifarRuntimeService) {
   const ready = Number(row.readyEndpointCount ?? row.activeEndpoints ?? row.readyReplicas ?? 0)
   const total = Number(row.endpointCount ?? row.activeEndpoints ?? ready)

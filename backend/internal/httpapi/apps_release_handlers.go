@@ -43,26 +43,33 @@ func (a *API) listAIFARReleases(w http.ResponseWriter, r *http.Request) {
 		if strings.TrimSpace(release.ManifestJSON) != "" {
 			_ = json.Unmarshal([]byte(release.ManifestJSON), &manifest)
 		}
-		changed := stringsFromAny(manifest["changedServices"])
-		artifacts := mapFromAny(manifest["artifacts"])
-		items = append(items, map[string]any{
-			"id":                release.ID,
-			"instanceId":        release.InstanceID,
-			"releaseId":         release.ReleaseID,
-			"kind":              stringFromAny(manifest["kind"], ""),
-			"status":            release.Status,
-			"manifestStatus":    stringFromAny(manifest["status"], ""),
-			"version":           release.Version,
-			"serverId":          release.ServerID,
-			"configHash":        release.ConfigHash,
-			"createdAt":         release.CreatedAt,
-			"activatedAt":       release.ActivatedAt,
-			"changedServices":   changed,
-			"rollbackAvailable": release.Status == "success" && len(changed) > 0 && len(artifacts) > 0,
-			"manifest":          manifest,
-		})
+		items = append(items, aifarReleaseResponseItem(release, manifest))
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"items": items})
+}
+
+func aifarReleaseResponseItem(release store.AppRelease, manifest map[string]any) map[string]any {
+	changed := stringsFromAny(manifest["changedServices"])
+	artifacts := mapFromAny(manifest["artifacts"])
+	item := map[string]any{
+		"id":                release.ID,
+		"instanceId":        release.InstanceID,
+		"releaseId":         release.ReleaseID,
+		"kind":              stringFromAny(manifest["kind"], ""),
+		"status":            release.Status,
+		"manifestStatus":    stringFromAny(manifest["status"], ""),
+		"version":           release.Version,
+		"serverId":          release.ServerID,
+		"configHash":        release.ConfigHash,
+		"createdAt":         release.CreatedAt,
+		"changedServices":   changed,
+		"rollbackAvailable": release.Status == "success" && len(changed) > 0 && len(artifacts) > 0,
+		"manifest":          manifest,
+	}
+	if !release.ActivatedAt.IsZero() {
+		item["activatedAt"] = release.ActivatedAt
+	}
+	return item
 }
 
 func (a *API) rollbackAIFARRelease(w http.ResponseWriter, r *http.Request) {

@@ -59,6 +59,25 @@ func TestRecordFailedInstallInstancesCreatesCleanupInstance(t *testing.T) {
 	}
 }
 
+func TestAIFARReleaseResponseOmitsZeroActivationTime(t *testing.T) {
+	failed := aifarReleaseResponseItem(store.AppRelease{
+		ID: "rel-failed", InstanceID: "aifar-1", App: "aifar", Version: "runtime-v2",
+		ReleaseID: "release-failed", Status: "failed", CreatedAt: time.Now(),
+	}, map[string]any{"kind": "rollout", "changedServices": []any{"oauth"}})
+	if _, exists := failed["activatedAt"]; exists {
+		t.Fatalf("failed release must not expose a zero activation time: %+v", failed)
+	}
+
+	activatedAt := time.Now().UTC()
+	success := aifarReleaseResponseItem(store.AppRelease{
+		ID: "rel-success", InstanceID: "aifar-1", App: "aifar", Version: "runtime-v2",
+		ReleaseID: "release-success", Status: "success", CreatedAt: activatedAt, ActivatedAt: activatedAt,
+	}, map[string]any{"kind": "rollout", "changedServices": []any{"oauth"}, "artifacts": map[string]any{"oauth": map[string]any{"file": "oauth.jar"}}})
+	if got, exists := success["activatedAt"]; !exists || got != activatedAt {
+		t.Fatalf("successful release must expose activation time: %+v", success)
+	}
+}
+
 func TestRecordFailedInstallInstancesSkipsInstancesRecordedDuringTask(t *testing.T) {
 	api, db, _ := newAuthzTestAPI(t)
 	server, err := db.SaveServer(store.Server{Name: "redis-1", Host: "10.0.0.8", Username: "root"})

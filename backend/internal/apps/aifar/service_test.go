@@ -2099,6 +2099,34 @@ func TestServiceUpdatesAIFARServiceArtifactAsPartialRelease(t *testing.T) {
 	}
 }
 
+func TestServiceMarksFailedAIFARServiceArtifactRelease(t *testing.T) {
+	artifactPath := filepath.Join(t.TempDir(), "oauth.jar")
+	if err := os.WriteFile(artifactPath, []byte("new oauth jar"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	instance := installedAIFARInstance(t)
+	s := &fakeStore{
+		servers: map[string]store.Server{
+			"srv-1": {ID: "srv-1", Name: "app-1", Host: "10.0.0.10", DeployDir: "/aifar/apps"},
+		},
+		instances: []store.AppInstance{instance},
+	}
+	service := NewService(s, &fakeRemote{failCommandContains: "update-aifar-artifact.sh"})
+	err := service.UpdateArtifact(context.Background(), ArtifactUpdateRequest{
+		Instance:          instance,
+		Server:            s.servers["srv-1"],
+		Language:          "en",
+		TaskID:            "task-single-failed",
+		ServiceName:       "oauth",
+		ArtifactLocalPath: artifactPath,
+		ArtifactFileName:  "oauth.jar",
+	}, fakeLogger{}, nil)
+	if err == nil {
+		t.Fatal("expected artifact update to fail")
+	}
+	assertLatestFailedRelease(t, s.releases)
+}
+
 func TestServiceUpdatesAIFARArtifactBundleAsSingleMultiServicePartialRelease(t *testing.T) {
 	bundlePath := writeAlphaJarBundle(t, []bundleTestArtifact{
 		{Service: "oauth", Module: "alpha-oauth", FileName: "alpha-oauth.jar", Content: "new oauth jar"},
@@ -2178,6 +2206,33 @@ func TestServiceUpdatesAIFARArtifactBundleAsSingleMultiServicePartialRelease(t *
 	}
 }
 
+func TestServiceMarksFailedAIFARArtifactBundleRelease(t *testing.T) {
+	bundlePath := writeAlphaJarBundle(t, []bundleTestArtifact{
+		{Service: "oauth", Module: "alpha-oauth", FileName: "alpha-oauth.jar", Content: "new oauth jar"},
+		{Service: "gateway", Module: "alpha-gateway", FileName: "alpha-gateway.jar", Content: "new gateway jar"},
+	})
+	instance := installedAIFARInstance(t)
+	s := &fakeStore{
+		servers: map[string]store.Server{
+			"srv-1": {ID: "srv-1", Name: "app-1", Host: "10.0.0.10", DeployDir: "/aifar/apps"},
+		},
+		instances: []store.AppInstance{instance},
+	}
+	service := NewService(s, &fakeRemote{failCommandContains: "update-aifar-artifact-bundle.sh"})
+	err := service.UpdateArtifactBundle(context.Background(), ArtifactBundleUpdateRequest{
+		Instance:        instance,
+		Server:          s.servers["srv-1"],
+		Language:        "en",
+		TaskID:          "task-bundle-failed",
+		BundleLocalPath: bundlePath,
+		BundleFileName:  filepath.Base(bundlePath),
+	}, fakeLogger{}, nil)
+	if err == nil {
+		t.Fatal("expected artifact bundle update to fail")
+	}
+	assertLatestFailedRelease(t, s.releases)
+}
+
 func TestServiceRollsBackAIFARServiceToReleaseArtifact(t *testing.T) {
 	instance := installedAIFARInstance(t)
 	targetReleaseID := "20260702T010203.000000000Z-rollout-oauth"
@@ -2249,6 +2304,64 @@ func TestServiceRollsBackAIFARServiceToReleaseArtifact(t *testing.T) {
 	metadata := metadataFromInstance(s.instances[0])
 	if metadata["currentRevision"] != targetReleaseID {
 		t.Fatalf("expected metadata to point to target release, got %s", s.instances[0].Metadata)
+	}
+}
+
+func TestServiceMarksFailedAIFARArtifactRollbackRelease(t *testing.T) {
+	instance := installedAIFARInstance(t)
+	targetReleaseID := "20260702T010203.000000000Z-rollout-oauth"
+	targetArtifact := "/aifar/apps/admin/releases/" + targetReleaseID + "/services/oauth/artifact/oauth.jar"
+	manifest, _ := json.Marshal(map[string]any{
+		"schema":          releaseManifestSchemaV2,
+		"kind":            "rollout",
+		"releaseId":       targetReleaseID,
+		"changedServices": []string{"oauth"},
+		"artifacts": map[string]any{
+			"oauth": map[string]any{
+				"file":       "oauth.jar",
+				"sha256":     strings.Repeat("a", 64),
+				"remotePath": targetArtifact,
+			},
+		},
+	})
+	s := &fakeStore{
+		servers: map[string]store.Server{
+			"srv-1": {ID: "srv-1", Name: "app-1", Host: "10.0.0.10", DeployDir: "/aifar/apps"},
+		},
+		instances: []store.AppInstance{instance},
+		releases: []store.AppRelease{{
+			InstanceID: instance.ID, App: AppName, Version: appBundleVersion,
+			ReleaseID: targetReleaseID, ServerID: "srv-1", Status: "success",
+			ManifestJSON: string(manifest), CreatedAt: time.Now().Add(-time.Hour), ActivatedAt: time.Now().Add(-time.Hour),
+		}},
+	}
+	service := NewService(s, &fakeRemote{failCommandContains: "rollback-oauth.sh"})
+	err := service.RollbackArtifact(context.Background(), ArtifactRollbackRequest{
+		Instance: instance, Server: s.servers["srv-1"], Language: "en", Actor: "admin",
+		TaskID: "task-rollback-failed", TargetReleaseID: targetReleaseID,
+		Services: []string{"oauth"}, Reason: "test rollback failure",
+	}, fakeLogger{}, nil)
+	if err == nil {
+		t.Fatal("expected artifact rollback to fail")
+	}
+	assertLatestFailedRelease(t, s.releases)
+}
+
+func assertLatestFailedRelease(t *testing.T, releases []store.AppRelease) {
+	t.Helper()
+	if len(releases) == 0 {
+		t.Fatal("expected a release record")
+	}
+	release := releases[len(releases)-1]
+	if release.Status != "failed" {
+		t.Fatalf("expected failed release status, got %+v", release)
+	}
+	var manifest map[string]any
+	if err := json.Unmarshal([]byte(release.ManifestJSON), &manifest); err != nil {
+		t.Fatal(err)
+	}
+	if manifest["status"] != "failed" || manifest["phase"] != "failed" || strings.TrimSpace(fmt.Sprint(manifest["error"])) == "" || strings.TrimSpace(fmt.Sprint(manifest["failedAt"])) == "" {
+		t.Fatalf("expected failure details in release manifest, got %s", release.ManifestJSON)
 	}
 }
 

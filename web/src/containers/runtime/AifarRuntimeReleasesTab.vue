@@ -20,7 +20,7 @@
         <template #default="{ row }">{{ releaseServicesText(row) }}</template>
       </el-table-column>
       <el-table-column prop="activatedAt" :label="t('containers.activatedAt')" min-width="170" show-overflow-tooltip>
-        <template #default="{ row }">{{ formatDate(row.activatedAt || row.createdAt) }}</template>
+        <template #default="{ row }">{{ releaseActivatedAtText(row) }}</template>
       </el-table-column>
       <el-table-column :label="t('common.operation')" width="120" fixed="right">
         <template #default="{ row }">
@@ -40,6 +40,7 @@
 <script setup lang="ts">
 import StatusTag from '../../components/StatusTag.vue'
 import { useAifarRuntimeContext } from './context'
+import { releaseActivatedAtText } from './format'
 
 const {
   t,
@@ -50,7 +51,6 @@ const {
   aifarRuntimeStatusKind,
   releaseStatusLabel,
   releaseServicesText,
-  formatDate,
   releaseRollbackDisabledReason,
   rollbackAifarRelease
 } = useAifarRuntimeContext()

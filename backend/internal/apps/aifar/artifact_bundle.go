@@ -63,7 +63,7 @@ func (s Service) ValidateArtifactBundleUpdate(req ArtifactBundleUpdateRequest) e
 	return err
 }
 
-func (s Service) UpdateArtifactBundle(ctx context.Context, req ArtifactBundleUpdateRequest, log Logger, targetLog targetLogger) error {
+func (s Service) UpdateArtifactBundle(ctx context.Context, req ArtifactBundleUpdateRequest, log Logger, targetLog targetLogger) (resultErr error) {
 	copy := updateCopyFor(req.Language)
 	items, cleanup, err := s.artifactBundleItemsFromRequest(req, copy, true)
 	if cleanup != nil {
@@ -122,6 +122,15 @@ func (s Service) UpdateArtifactBundle(ctx context.Context, req ArtifactBundleUpd
 	var scriptRemote string
 	var scriptArtifacts []bundleUpdateScriptArtifact
 	var serviceRevisionsBefore map[string]string
+	var pendingRelease *store.AppRelease
+	defer func() {
+		if resultErr == nil || pendingRelease == nil {
+			return
+		}
+		if err := s.markRecordedReleaseFailed(pendingRelease, resultErr); err != nil {
+			logForServer.Error("%s", fmt.Sprintf(copy.RecordFailed, err))
+		}
+	}()
 
 	log.Info(copy.BundleUpdating, len(items))
 
@@ -167,7 +176,7 @@ func (s Service) UpdateArtifactBundle(ctx context.Context, req ArtifactBundleUpd
 			manifest["status"] = "pending"
 			manifest["phase"] = "pending"
 			raw, _ := json.Marshal(manifest)
-			if _, err := releases.SaveAppRelease(store.AppRelease{
+			saved, err := releases.SaveAppRelease(store.AppRelease{
 				InstanceID:   req.Instance.ID,
 				App:          AppName,
 				Version:      version,
@@ -177,9 +186,11 @@ func (s Service) UpdateArtifactBundle(ctx context.Context, req ArtifactBundleUpd
 				ManifestJSON: string(raw),
 				ConfigHash:   configHash,
 				CreatedAt:    releaseTime,
-			}); err != nil {
+			})
+			if err != nil {
 				return err
 			}
+			pendingRelease = &saved
 		}
 		return nil
 	}); err != nil {
@@ -303,6 +314,7 @@ func (s Service) UpdateArtifactBundle(ctx context.Context, req ArtifactBundleUpd
 			}); err != nil {
 				return err
 			}
+			pendingRelease = nil
 			if _, err := releases.DeleteOldAppReleases(saved.ID, releaseKeepCount); err != nil {
 				return err
 			}
