@@ -186,14 +186,19 @@ resource_value() {
 }
 
 java_start_command() {
-  cat <<'SH'
-set -eu
-service="${AIFAR_SERVICE_NAME:-}"
-[ -n "$service" ] || { echo "AIFAR_SERVICE_NAME is required" >&2; exit 1; }
-jar="/opt/aifar/app/app.jar"
-[ -f "$jar" ] || { echo "jar is missing: $jar" >&2; exit 1; }
-exec java ${JAVA_OPTS:-} -jar "$jar"
-SH
+  cat <<'EOF'
+opts_file="/opt/aifar/runtime/env/java-jvm.${AIFAR_SERVICE_NAME}.options"
+[ -f "$opts_file" ] || opts_file="/opt/aifar/runtime/env/java-jvm.options"
+java_opts=""
+[ -f "$opts_file" ] && java_opts="$(tr '\n' ' ' < "$opts_file")"
+jar="aifar-${AIFAR_SERVICE_NAME}.jar"
+[ -f app.jar ] && jar="app.jar"
+if [ ! -f "$jar" ]; then
+  jar="$(find . -maxdepth 1 -type f -name '*.jar' 2>/dev/null | head -n 1 | sed 's#^\./##')"
+fi
+[ -n "$jar" ] && [ -f "$jar" ] || { echo "AIFAR jar is missing for ${AIFAR_SERVICE_NAME}" >&2; exit 1; }
+exec java $java_opts --add-opens=java.base/java.lang=ALL-UNNAMED --add-opens=java.base/java.lang.reflect=ALL-UNNAMED --add-opens=java.base/java.lang.invoke=ALL-UNNAMED --add-opens=java.base/java.math=ALL-UNNAMED --add-opens=java.base/sun.net.util=ALL-UNNAMED --add-opens=java.base/java.io=ALL-UNNAMED --add-opens=java.base/java.net=ALL-UNNAMED --add-opens=java.base/java.nio=ALL-UNNAMED --add-opens=java.base/java.security=ALL-UNNAMED --add-opens=java.base/java.text=ALL-UNNAMED --add-opens=java.base/java.time=ALL-UNNAMED --add-opens=java.base/java.util=ALL-UNNAMED --add-opens=java.base/jdk.internal.module=ALL-UNNAMED --add-opens=java.base/sun.security.util=ALL-UNNAMED -Dfile.encoding=utf8 -Djava.security.egd=file:/dev/./urandom -jar "$jar"
+EOF
 }
 
 install_java_artifact() {

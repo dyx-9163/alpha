@@ -2307,6 +2307,25 @@ func TestServiceRollsBackAIFARServiceToReleaseArtifact(t *testing.T) {
 	}
 }
 
+func TestRollbackJavaEntrypointUsesImageWorkingDirectoryJar(t *testing.T) {
+	script, err := renderRollbackScript(rollbackScriptData{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(script, `jar="/opt/aifar/app/app.jar"`) {
+		t.Fatalf("rollback entrypoint must not require a path absent from service images:\n%s", script)
+	}
+	for _, want := range []string{
+		`jar="aifar-${AIFAR_SERVICE_NAME}.jar"`,
+		`[ -f app.jar ] && jar="app.jar"`,
+		`find . -maxdepth 1 -type f -name '*.jar'`,
+	} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("rollback entrypoint should contain %q:\n%s", want, script)
+		}
+	}
+}
+
 func TestServiceMarksFailedAIFARArtifactRollbackRelease(t *testing.T) {
 	instance := installedAIFARInstance(t)
 	targetReleaseID := "20260702T010203.000000000Z-rollout-oauth"
