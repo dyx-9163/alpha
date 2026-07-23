@@ -163,23 +163,41 @@ public static class BundlePackager
 
     private static PackagingContext Validate(BundleRequest request)
     {
-        RequireSelectedPath(request.JavaSourceRoot, "Java source root", nameof(request.JavaSourceRoot));
-        RequireSelectedPath(request.WebDistRoot, "Web dist root", nameof(request.WebDistRoot));
-        RequireSelectedPath(request.OutputPath, "Output path", nameof(request.OutputPath));
-
-        var javaSourceRoot = Path.GetFullPath(request.JavaSourceRoot);
-        var webDistRoot = Path.GetFullPath(request.WebDistRoot);
-        var outputPath = Path.GetFullPath(request.OutputPath);
         var services = ServiceCatalog.Select(request.Services);
+        var requiresJavaSource = services.Any(item => !item.IsWeb);
+        var requiresWebDist = services.Any(item => item.IsWeb);
 
-        if (!Directory.Exists(javaSourceRoot))
+        RequireSelectedPath(request.OutputPath, "Output path", nameof(request.OutputPath));
+        var outputPath = Path.GetFullPath(request.OutputPath);
+        var javaSourceRoot = string.Empty;
+        var webDistRoot = string.Empty;
+
+        if (requiresJavaSource)
         {
-            throw new DirectoryNotFoundException($"Java source root does not exist: {javaSourceRoot}");
+            RequireSelectedPath(
+                request.JavaSourceRoot,
+                "Java source root",
+                nameof(request.JavaSourceRoot));
+            javaSourceRoot = Path.GetFullPath(request.JavaSourceRoot);
+            if (!Directory.Exists(javaSourceRoot))
+            {
+                throw new DirectoryNotFoundException(
+                    $"Java source root does not exist: {javaSourceRoot}");
+            }
         }
 
-        if (!Directory.Exists(webDistRoot))
+        if (requiresWebDist)
         {
-            throw new DirectoryNotFoundException($"Web dist root does not exist: {webDistRoot}");
+            RequireSelectedPath(
+                request.WebDistRoot,
+                "Web dist root",
+                nameof(request.WebDistRoot));
+            webDistRoot = Path.GetFullPath(request.WebDistRoot);
+            if (!Directory.Exists(webDistRoot))
+            {
+                throw new DirectoryNotFoundException(
+                    $"Web dist root does not exist: {webDistRoot}");
+            }
         }
 
         if (!string.Equals(Path.GetExtension(outputPath), ".zip", StringComparison.OrdinalIgnoreCase))
@@ -192,7 +210,7 @@ public static class BundlePackager
             throw new ArgumentException($"Output path points to a directory: {outputPath}", nameof(request.OutputPath));
         }
 
-        if (services.Any(item => item.IsWeb))
+        if (requiresWebDist)
         {
             var outputDirectory = Path.GetDirectoryName(outputPath)!;
             if (IsSameOrDescendant(webDistRoot, outputDirectory))

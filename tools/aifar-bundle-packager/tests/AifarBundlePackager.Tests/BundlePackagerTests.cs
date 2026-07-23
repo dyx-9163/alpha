@@ -9,21 +9,65 @@ namespace AifarBundlePackager.Tests;
 public sealed class BundlePackagerTests
 {
     [Fact]
-    public void Package_RequiresAllThreePathsEvenForPartialSelection()
+    public void Package_RequiresOnlyPathsUsedBySelectedServices()
     {
         using var workspace = new TestWorkspace();
+        var javaRoot = workspace.CreateDirectory("java");
+        var webRoot = workspace.CreateDirectory("web");
         var output = workspace.Combine("output", "bundle.zip");
 
         var missingJava = Assert.Throws<ArgumentException>(() => BundlePackager.Package(
-            new BundleRequest("", workspace.Root, output, ["web-vue3"])));
+            new BundleRequest("", webRoot, output, ["gateway", "web-vue3"])));
         var missingWeb = Assert.Throws<ArgumentException>(() => BundlePackager.Package(
-            new BundleRequest(workspace.Root, "", output, ["gateway"])));
+            new BundleRequest(javaRoot, "", output, ["gateway", "web-vue3"])));
         var missingOutput = Assert.Throws<ArgumentException>(() => BundlePackager.Package(
-            new BundleRequest(workspace.Root, workspace.Root, "", ["gateway"])));
+            new BundleRequest(javaRoot, webRoot, "", ["gateway"])));
 
         Assert.Contains("Java", missingJava.Message, StringComparison.OrdinalIgnoreCase);
         Assert.Contains("Web", missingWeb.Message, StringComparison.OrdinalIgnoreCase);
         Assert.Contains("output", missingOutput.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void Package_WebOnlyIgnoresJavaPath()
+    {
+        using var workspace = new TestWorkspace();
+        var webRoot = workspace.CreateDirectory("web");
+        workspace.CreateFile("web/index.html", "<html>web</html>");
+        var output = workspace.Combine("output", "web-only.zip");
+
+        var result = BundlePackager.Package(new BundleRequest(
+            workspace.Combine("missing-java"),
+            webRoot,
+            output,
+            ["web-vue3"]));
+
+        Assert.Equal(["web-vue3"], result.Services);
+        using var archive = ZipFile.OpenRead(output);
+        Assert.NotNull(archive.GetEntry("artifacts/web-vue3/web-vue3.zip"));
+        Assert.Null(archive.GetEntry("artifacts/gateway/alpha-gateway.jar"));
+    }
+
+    [Fact]
+    public void Package_JavaOnlyIgnoresWebPath()
+    {
+        using var workspace = new TestWorkspace();
+        var javaRoot = workspace.CreateDirectory("java");
+        workspace.CreateBytes(
+            "java/alpha-gateway/target/alpha-gateway-1.0.jar",
+            [1, 2, 3]);
+        var output = workspace.Combine("output", "java-only.zip");
+
+        var result = BundlePackager.Package(new BundleRequest(
+            javaRoot,
+            workspace.Combine("missing-web"),
+            output,
+            ["gateway"]));
+
+        Assert.Equal(["gateway"], result.Services);
+        using var archive = ZipFile.OpenRead(output);
+        Assert.NotNull(archive.GetEntry("artifacts/gateway/alpha-gateway.jar"));
+        Assert.Null(archive.GetEntry("artifacts/web-vue3/web-vue3.zip"));
     }
 
     [Fact]
@@ -37,7 +81,7 @@ public sealed class BundlePackagerTests
         Assert.Throws<DirectoryNotFoundException>(() => BundlePackager.Package(
             new BundleRequest(missing, webRoot, workspace.Combine("bundle.zip"), ["gateway"])));
         Assert.Throws<DirectoryNotFoundException>(() => BundlePackager.Package(
-            new BundleRequest(javaRoot, missing, workspace.Combine("bundle.zip"), ["gateway"])));
+            new BundleRequest(javaRoot, missing, workspace.Combine("bundle.zip"), ["web-vue3"])));
         Assert.Throws<ArgumentException>(() => BundlePackager.Package(
             new BundleRequest(javaRoot, webRoot, workspace.Combine("bundle.tar"), ["gateway"])));
         Assert.Throws<ArgumentException>(() => BundlePackager.Package(
