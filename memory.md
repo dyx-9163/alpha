@@ -585,3 +585,5 @@
 - 结论：当前源码已覆盖服务目录、JAR 发现、事务打包、WinForms 交互、按服务类型条件要求 Java/Web 路径、自包含单 EXE 发布与 CI；本轮复验 .NET 36/36、工具 17/17、脚本 290/290 通过。本地 EXE 大小为 161,672,360 字节且未被 Git 跟踪；两份实施计划的 48 个复选框仍未回填，属于文档收口问题，不是功能缺口。
 - 问题：用户要求给出 Bundle Packager 发布与计划状态的修复计划，并确认采用 GitHub Release 方案。
 - 结论：设计采用 `aifar-bundle-packager-vX.Y.Z` 标签触发 Windows CI，重建带版本与 commit 的 EXE，生成 SHA256 和 release manifest，并创建只含三个资产的 Draft Release；人工完成下载校验、无 .NET Runtime 启动及 Java-only/Web-only/mixed 打包验收后再发布。旧计划用任务级证据矩阵收口，不伪造未持久化的历史 RED 日志。设计文档为 `docs/superpowers/specs/2026-07-24-aifar-bundle-packager-release-closeout-design.md`。
+- 问题：用户确认实施 Bundle Packager 的 GitHub Release 发布闭环和旧计划证据收口，并要求任务成功后关机。
+- 结论：已实现版本与 40 位提交 SHA 注入、事务生成 `AIFARBundlePackager.exe`/`.sha256`/`release-manifest.json`、`aifar-bundle-packager-vX.Y.Z` 标签校验及 Draft-only GitHub Actions，并为两份历史计划补充权威任务证据矩阵。提交依次为 `23f36000`、`3b8661f2`、`f54331ac`、`045de5ee`；最终本地验收 .NET 36/36、工具 25/25、脚本 290/290 通过，版本化 EXE 为 161672360 字节，三个资产、SHA256、manifest、EXE 不入 Git、无超过 100 MB 新 blob 和隐藏 GUI 启动均验证通过。未创建标签、GitHub Release 或 push。
