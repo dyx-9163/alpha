@@ -579,3 +579,5 @@
 - 结论：提交 `772ec430` 只合入安装器、卸载器和 README，遗漏完成分支上的两个测试文件，导致测试仍使用旧 `UNIT_LINK`、`EXPECTED_UNIT` 和 `register_systemd_unit` 契约。同步 `scripts/keepalived-extra.test.mjs` 与 `scripts/keepalived-runtime.test.mjs` 后，Keepalived 215/215、迁移前完整脚本门禁 306/306 通过；安装和卸载实现未修改。
 - 问题：用户要求整理当前分支的 `scripts/`，将不属于 AIFAR 生命周期、但为其他能力准备文件或产物的工具迁入 `tools/`。
 - 结论：Bundle Packager 构建入口和测试迁至 `tools/aifar-bundle-packager/`，PowerShell/CMD 更新包工具迁至其 `cli/`，Alpha JAR 导出迁至 `tools/alpha-jar-export/`；新增递归 `tools/test-tools.mjs` 和 `pnpm test:tools` 并接入本地门禁与 CI。`scripts/` 仅保留 AIFAR 开发、启动、构建、测试、发布和资源恢复边界；前端更新包提示改为 `AIFARBundlePackager.exe`。最终脚本 290/290、工具 17/17、前端 162/162、.NET 36/36 和单文件发布通过。无调用方且内嵌环境信息的 `scripts/build_openlab_inventory_docx.py` 未移动，仍是需单独授权处理的清理项。
+- 问题：当前分支推送时因历史大文件上传返回 HTTP 408。
+- 结论：提交 `9bb6ec60` 曾加入 449,485,052 字节的 `scripts/aifar-batch-update.zip`，后续删除不会清除 Git blob。已先创建本地备份分支，再仅从当前分支相对远端的 28 个提交中过滤该路径；改写前后最终 tree 完全一致，待推送范围无超过 100 MB 的 blob，随后已通过普通快进 push 更新远端分支。
