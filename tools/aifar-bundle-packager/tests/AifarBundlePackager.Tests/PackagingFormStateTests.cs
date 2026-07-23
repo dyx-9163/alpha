@@ -1,5 +1,4 @@
 using AifarBundlePackager.Core;
-using AifarBundlePackager.WinForms;
 using Xunit;
 
 namespace AifarBundlePackager.Tests;

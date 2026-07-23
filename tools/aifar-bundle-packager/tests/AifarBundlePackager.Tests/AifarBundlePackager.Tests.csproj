@@ -1,7 +1,7 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <TargetFramework>net8.0-windows</TargetFramework>
+    <TargetFramework>net8.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <IsPackable>false</IsPackable>
@@ -23,7 +23,6 @@
 
   <ItemGroup>
     <ProjectReference Include="..\..\src\AifarBundlePackager.Core\AifarBundlePackager.Core.csproj" />
-    <ProjectReference Include="..\..\src\AifarBundlePackager.WinForms\AifarBundlePackager.WinForms.csproj" />
   </ItemGroup>
 
 </Project>

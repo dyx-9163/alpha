@@ -83,20 +83,24 @@ try {
         throw "Single-file publish produced unexpected sidecar files: $($publishedFiles.Name -join ', ')"
     }
 
-    New-Item -ItemType Directory -Path $deliveryDirectory -Force | Out-Null
-    Copy-Item -LiteralPath $publishedExecutables[0].FullName -Destination $temporaryDelivery
-    Move-Item -LiteralPath $temporaryDelivery -Destination $deliveryPath -Force
-
-    $staleSidecars = @(
-        Get-ChildItem -LiteralPath $deliveryDirectory -File |
-            Where-Object {
-                $_.Name -like 'AIFARBundlePackager.*' -and
-                $_.Name -ne 'AIFARBundlePackager.exe'
-            }
-    )
+    $staleSidecars = if (Test-Path -LiteralPath $deliveryDirectory -PathType Container) {
+        @(
+            Get-ChildItem -LiteralPath $deliveryDirectory -File |
+                Where-Object {
+                    $_.Name -like 'AIFARBundlePackager.*' -and
+                    $_.Name -ne 'AIFARBundlePackager.exe'
+                }
+        )
+    } else {
+        @()
+    }
     if ($staleSidecars.Count -gt 0) {
         throw "Unexpected delivery sidecar files exist: $($staleSidecars.Name -join ', ')"
     }
+
+    New-Item -ItemType Directory -Path $deliveryDirectory -Force | Out-Null
+    Copy-Item -LiteralPath $publishedExecutables[0].FullName -Destination $temporaryDelivery
+    Move-Item -LiteralPath $temporaryDelivery -Destination $deliveryPath -Force
 
     $deliveryFile = Get-Item -LiteralPath $deliveryPath
     Write-Host "Created AIFAR Bundle Packager: $($deliveryFile.FullName)"

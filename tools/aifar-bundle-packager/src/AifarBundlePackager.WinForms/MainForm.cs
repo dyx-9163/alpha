@@ -179,10 +179,23 @@ public sealed partial class MainForm : Form
             return;
         }
 
-        Process.Start(new ProcessStartInfo(_lastOutputDirectory)
+        try
         {
-            UseShellExecute = true,
-        });
+            Process.Start(new ProcessStartInfo(_lastOutputDirectory)
+            {
+                UseShellExecute = true,
+            });
+        }
+        catch (Exception error)
+        {
+            AppendLog($"打开输出目录失败：{error.Message}");
+            MessageBox.Show(
+                this,
+                error.Message,
+                "无法打开输出目录",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Error);
+        }
     }
 
     private void MainForm_FormClosing(object? sender, FormClosingEventArgs eventArgs)

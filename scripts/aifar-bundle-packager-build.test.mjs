@@ -15,6 +15,7 @@ const projectPath = path.join(
   'AifarBundlePackager.WinForms.csproj'
 )
 const buildScriptPath = path.join(scriptsDir, 'build-aifar-bundle-packager.ps1')
+const workflowPath = path.join(repositoryRoot, '.github', 'workflows', 'ci.yml')
 
 test('WinForms project publishes a self-contained untrimmed win-x64 single file', () => {
   const project = readFileSync(projectPath, 'utf8')
@@ -41,4 +42,23 @@ test('build script tests before publish and delivers only AIFARBundlePackager.ex
   assert.match(script, /Get-ChildItem[\s\S]*-Filter '\*\.exe'/i)
   assert.match(script, /\.Count -ne 1/i)
   assert.match(script, /finally[\s\S]*Remove-Item[\s\S]*-Recurse/i)
+
+  const staleSidecarCheck = script.indexOf('$staleSidecars =')
+  const deliveryReplacement = script.indexOf('Move-Item -LiteralPath $temporaryDelivery')
+  assert.ok(staleSidecarCheck >= 0, 'missing stale sidecar validation')
+  assert.ok(deliveryReplacement >= 0, 'missing delivery replacement')
+  assert.ok(
+    staleSidecarCheck < deliveryReplacement,
+    'delivery sidecars must be validated before replacing the EXE'
+  )
+})
+
+test('Windows CI compiles, tests, and publishes the WinForms packager', () => {
+  const workflow = readFileSync(workflowPath, 'utf8')
+
+  assert.match(workflow, /uses:\s*actions\/setup-dotnet@v4/i)
+  assert.match(workflow, /dotnet-version:\s*['"]?8\.0\.x/i)
+  assert.match(workflow, /dotnet test tools\/aifar-bundle-packager\/AifarBundlePackager\.sln/i)
+  assert.match(workflow, /build-aifar-bundle-packager\.ps1/i)
+  assert.match(workflow, /runner\.os\s*==\s*'Windows'/i)
 })

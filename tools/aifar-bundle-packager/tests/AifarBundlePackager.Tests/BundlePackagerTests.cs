@@ -60,6 +60,30 @@ public sealed class BundlePackagerTests
     }
 
     [Fact]
+    public void Package_RejectsOutputInsideSelectedWebDist()
+    {
+        using var workspace = new TestWorkspace();
+        var javaRoot = workspace.CreateDirectory("java");
+        var webRoot = workspace.CreateDirectory("web");
+        workspace.CreateFile("web/index.html");
+        var output = workspace.Combine("web", "packages", "bundle.zip");
+
+        var error = Assert.Throws<ArgumentException>(() => BundlePackager.Package(
+            new BundleRequest(javaRoot, webRoot, output, ["web-vue3"])));
+
+        Assert.Contains("output", error.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("Web dist", error.Message, StringComparison.OrdinalIgnoreCase);
+
+        var sameDirectoryError = Assert.Throws<ArgumentException>(() => BundlePackager.Package(
+            new BundleRequest(
+                javaRoot,
+                webRoot,
+                workspace.Combine("web", "bundle.zip"),
+                ["web-vue3"])));
+        Assert.Contains("Web dist", sameDirectoryError.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
     public void Package_WritesProtocolCompatiblePartialBundle()
     {
         using var workspace = new TestWorkspace();
@@ -126,6 +150,47 @@ public sealed class BundlePackagerTests
         Assert.NotNull(webArchive.GetEntry("index.html"));
         Assert.NotNull(webArchive.GetEntry("assets/app.js"));
         Assert.DoesNotContain(webArchive.Entries, entry => entry.FullName.StartsWith("dist/", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void Package_WritesAllServicesInCatalogOrder()
+    {
+        using var workspace = new TestWorkspace();
+        var javaRoot = workspace.CreateDirectory("java");
+        foreach (var definition in ServiceCatalog.All.Where(item => !item.IsWeb))
+        {
+            var relativeTarget = string.Join('/', definition.TargetParts);
+            workspace.CreateBytes(
+                $"java/{relativeTarget}/{definition.Module}-1.0.jar",
+                [(byte)(definition.Service.Length + 1)]);
+        }
+
+        var webRoot = workspace.CreateDirectory("web");
+        workspace.CreateFile("web/index.html", "<html>all</html>");
+        var output = workspace.Combine("output", "all.zip");
+
+        var result = BundlePackager.Package(new BundleRequest(
+            javaRoot,
+            webRoot,
+            output,
+            ServiceCatalog.All.Select(item => item.Service).ToArray()));
+
+        Assert.Equal(
+            ServiceCatalog.All.Select(item => item.Service),
+            result.Services);
+        using var archive = ZipFile.OpenRead(output);
+        using var manifestDocument = ReadJson(archive.GetEntry("manifest.json")!);
+        Assert.Equal(
+            ServiceCatalog.All.Select(item => item.Service),
+            manifestDocument.RootElement
+                .GetProperty("services")
+                .EnumerateArray()
+                .Select(item => item.GetProperty("service").GetString()));
+        foreach (var definition in ServiceCatalog.All)
+        {
+            var fileName = definition.IsWeb ? "web-vue3.zip" : $"{definition.Module}.jar";
+            Assert.NotNull(archive.GetEntry($"artifacts/{definition.Service}/{fileName}"));
+        }
     }
 
     [Fact]

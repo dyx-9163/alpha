@@ -194,6 +194,14 @@ public static class BundlePackager
 
         if (services.Any(item => item.IsWeb))
         {
+            var outputDirectory = Path.GetDirectoryName(outputPath)!;
+            if (IsSameOrDescendant(webDistRoot, outputDirectory))
+            {
+                throw new ArgumentException(
+                    $"Output path must be outside the selected Web dist root: {webDistRoot}",
+                    nameof(request.OutputPath));
+            }
+
             var indexPath = Path.Combine(webDistRoot, "index.html");
             if (!File.Exists(indexPath))
             {
@@ -209,6 +217,20 @@ public static class BundlePackager
             outputPath,
             Path.GetDirectoryName(outputPath)!,
             services);
+    }
+
+    private static bool IsSameOrDescendant(string parentPath, string candidatePath)
+    {
+        var relativePath = Path.GetRelativePath(parentPath, candidatePath);
+        if (string.Equals(relativePath, ".", StringComparison.Ordinal))
+        {
+            return true;
+        }
+
+        return !Path.IsPathRooted(relativePath) &&
+            !string.Equals(relativePath, "..", StringComparison.Ordinal) &&
+            !relativePath.StartsWith($"..{Path.DirectorySeparatorChar}", StringComparison.Ordinal) &&
+            !relativePath.StartsWith($"..{Path.AltDirectorySeparatorChar}", StringComparison.Ordinal);
     }
 
     private static void RequireSelectedPath(string value, string label, string parameterName)

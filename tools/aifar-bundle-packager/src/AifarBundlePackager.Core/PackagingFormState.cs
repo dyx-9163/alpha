@@ -1,4 +1,4 @@
-namespace AifarBundlePackager.WinForms;
+namespace AifarBundlePackager.Core;
 
 public sealed class PackagingFormState
 {

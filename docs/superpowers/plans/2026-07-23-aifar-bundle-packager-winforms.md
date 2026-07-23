@@ -31,7 +31,7 @@
 - `tools/aifar-bundle-packager/src/AifarBundlePackager.Core/ZipUtilities.cs`: deterministic directory ZIP writing and bounded cleanup retries.
 - `tools/aifar-bundle-packager/src/AifarBundlePackager.WinForms/AifarBundlePackager.WinForms.csproj`: Windows GUI executable and single-file publish properties.
 - `tools/aifar-bundle-packager/src/AifarBundlePackager.WinForms/Program.cs`: WinForms entry point.
-- `tools/aifar-bundle-packager/src/AifarBundlePackager.WinForms/PackagingFormState.cs`: testable empty-path, selection, service, and busy-state rules.
+- `tools/aifar-bundle-packager/src/AifarBundlePackager.Core/PackagingFormState.cs`: platform-neutral, testable empty-path, selection, service, and busy-state rules.
 - `tools/aifar-bundle-packager/src/AifarBundlePackager.WinForms/MainForm.cs`: native dialogs, event handling, background package execution, progress, and error/success feedback.
 - `tools/aifar-bundle-packager/src/AifarBundlePackager.WinForms/MainForm.Layout.cs`: programmatic WinForms layout and control creation.
 - `tools/aifar-bundle-packager/tests/AifarBundlePackager.Tests/AifarBundlePackager.Tests.csproj`: xUnit test project.
@@ -235,7 +235,7 @@ Expected: catalog, locator, and bundle tests all PASS.
 **Files:**
 - Create: `tools/aifar-bundle-packager/src/AifarBundlePackager.WinForms/AifarBundlePackager.WinForms.csproj`
 - Create: `tools/aifar-bundle-packager/src/AifarBundlePackager.WinForms/Program.cs`
-- Create: `tools/aifar-bundle-packager/src/AifarBundlePackager.WinForms/PackagingFormState.cs`
+- Create: `tools/aifar-bundle-packager/src/AifarBundlePackager.Core/PackagingFormState.cs`
 - Create: `tools/aifar-bundle-packager/src/AifarBundlePackager.WinForms/MainForm.cs`
 - Create: `tools/aifar-bundle-packager/src/AifarBundlePackager.WinForms/MainForm.Layout.cs`
 - Create: `tools/aifar-bundle-packager/tests/AifarBundlePackager.Tests/PackagingFormStateTests.cs`
