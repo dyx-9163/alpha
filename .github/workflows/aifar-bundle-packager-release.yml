@@ -1,0 +1,162 @@
+name: AIFAR Bundle Packager Release
+
+on:
+  push:
+    tags:
+      - "aifar-bundle-packager-v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: aifar-bundle-packager-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Set up .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Install pnpm
+        run: npm install --global pnpm@11.7.0
+
+      - name: Validate release tag and source revision
+        shell: powershell
+        run: |
+          $tag = '${{ github.ref_name }}'
+          if ($tag -notmatch '^aifar-bundle-packager-v(\d+\.\d+\.\d+)$') {
+            throw "Invalid AIFAR Bundle Packager release tag: $tag"
+          }
+          $version = $Matches[1]
+          $tagCommit = (git rev-parse "$tag^{commit}").Trim().ToLowerInvariant()
+          $workflowCommit = '${{ github.sha }}'.ToLowerInvariant()
+          if ($tagCommit -ne $workflowCommit) {
+            throw "Release tag commit $tagCommit does not match github.sha $workflowCommit"
+          }
+          "PACKAGER_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Verify auxiliary tools
+        run: pnpm test:tools
+
+      - name: Verify repository scripts
+        run: pnpm test:scripts
+
+      - name: Test AIFAR Bundle Packager
+        run: dotnet test tools/aifar-bundle-packager/AifarBundlePackager.sln --configuration Release
+
+      - name: Reject tracked delivery EXE and oversized files
+        shell: powershell
+        run: |
+          $trackedExecutable = @(git ls-files -- deploy/bin/AIFARBundlePackager.exe)
+          if ($trackedExecutable.Count -ne 0) {
+            throw 'deploy/bin/AIFARBundlePackager.exe must not be tracked in Git.'
+          }
+          foreach ($relativePath in @(git ls-files)) {
+            if (-not (Test-Path -LiteralPath $relativePath -PathType Leaf)) {
+              continue
+            }
+            $size = (Get-Item -LiteralPath $relativePath).Length
+            if ($size -gt 100000000) {
+              throw "Tracked file exceeds 100000000 bytes: $relativePath ($size bytes)"
+            }
+          }
+
+      - name: Build versioned AIFAR Bundle Packager
+        shell: powershell
+        run: |
+          ./tools/aifar-bundle-packager/build.ps1 `
+            -DotNetPath (Get-Command dotnet).Source `
+            -Version $env:PACKAGER_VERSION `
+            -SourceRevisionId '${{ github.sha }}'
+
+      - name: Create release assets
+        shell: powershell
+        run: |
+          ./tools/aifar-bundle-packager/create-release-assets.ps1 `
+            -ExecutablePath deploy/bin/AIFARBundlePackager.exe `
+            -Version $env:PACKAGER_VERSION `
+            -SourceRevisionId '${{ github.sha }}' `
+            -OutputDirectory deploy/aifar-bundle-packager-release
+
+      - name: Independently verify release assets
+        shell: powershell
+        run: |
+          $releaseDirectory = 'deploy/aifar-bundle-packager-release'
+          $executablePath = Join-Path $releaseDirectory 'AIFARBundlePackager.exe'
+          $checksumPath = Join-Path $releaseDirectory 'AIFARBundlePackager.exe.sha256'
+          $manifestPath = Join-Path $releaseDirectory 'release-manifest.json'
+          $expectedNames = @(
+            'AIFARBundlePackager.exe',
+            'AIFARBundlePackager.exe.sha256',
+            'release-manifest.json'
+          ) | Sort-Object
+          $actualNames = @(Get-ChildItem -LiteralPath $releaseDirectory -File | Select-Object -ExpandProperty Name | Sort-Object)
+          if (($actualNames -join '|') -cne ($expectedNames -join '|')) {
+            throw "Unexpected release assets: $($actualNames -join ', ')"
+          }
+          $sha256 = (Get-FileHash -LiteralPath $executablePath -Algorithm SHA256).Hash.ToLowerInvariant()
+          $size = (Get-Item -LiteralPath $executablePath).Length
+          $checksum = [System.IO.File]::ReadAllText((Resolve-Path $checksumPath)).TrimEnd("`r", "`n")
+          if ($checksum -cne "$sha256  AIFARBundlePackager.exe") {
+            throw 'Release checksum file does not match the executable.'
+          }
+          $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+          if ($manifest.version -cne $env:PACKAGER_VERSION -or
+              $manifest.gitCommit -cne '${{ github.sha }}' -or
+              $manifest.runtimeIdentifier -cne 'win-x64' -or
+              [int64]$manifest.size -ne [int64]$size -or
+              $manifest.sha256 -cne $sha256) {
+            throw 'Release manifest does not match the independently verified executable.'
+          }
+          "PACKAGER_SHA256=$sha256" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "PACKAGER_SIZE=$size" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Write draft release notes
+        shell: powershell
+        run: |
+          $notesPath = Join-Path $env:RUNNER_TEMP 'aifar-bundle-packager-release-notes.md'
+          $notes = @"
+          ## AIFAR Bundle Packager v$env:PACKAGER_VERSION
+
+          - Git commit: `${{ github.sha }}`
+          - Runtime identifier: `win-x64`
+          - EXE size: `$env:PACKAGER_SIZE` bytes
+          - SHA256: `$env:PACKAGER_SHA256`
+
+          This is a Draft Release. Before publishing it, download all three assets, verify the checksum, launch the EXE on a clean Windows x64 machine without a preinstalled .NET Desktop Runtime, and generate Java-only, Web-only, and mixed bundles.
+          "@
+          [System.IO.File]::WriteAllText($notesPath, $notes, (New-Object System.Text.UTF8Encoding($false)))
+          "RELEASE_NOTES_PATH=$notesPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Create GitHub Draft Release
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $releaseDirectory = 'deploy/aifar-bundle-packager-release'
+          gh release create '${{ github.ref_name }}' `
+            (Join-Path $releaseDirectory 'AIFARBundlePackager.exe') `
+            (Join-Path $releaseDirectory 'AIFARBundlePackager.exe.sha256') `
+            (Join-Path $releaseDirectory 'release-manifest.json') `
+            --draft `
+            --verify-tag `
+            --title "AIFAR Bundle Packager v$env:PACKAGER_VERSION" `
+            --notes-file $env:RELEASE_NOTES_PATH
+          if ($LASTEXITCODE -ne 0) {
+            throw "gh release create failed with exit code $LASTEXITCODE"
+          }
