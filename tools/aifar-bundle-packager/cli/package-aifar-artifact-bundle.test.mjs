@@ -16,9 +16,9 @@ import { spawnSync } from 'node:child_process'
 import test from 'node:test'
 import { fileURLToPath } from 'node:url'
 
-const scriptsDir = path.dirname(fileURLToPath(import.meta.url))
-const cmdPath = path.join(scriptsDir, 'package-aifar-artifact-bundle.cmd')
-const ps1Path = path.join(scriptsDir, 'package-aifar-artifact-bundle.ps1')
+const cliDir = path.dirname(fileURLToPath(import.meta.url))
+const cmdPath = path.join(cliDir, 'package-aifar-artifact-bundle.cmd')
+const ps1Path = path.join(cliDir, 'package-aifar-artifact-bundle.ps1')
 
 const javaModules = {
   oauth: ['alpha-oauth', 'alpha-oauth-server'],

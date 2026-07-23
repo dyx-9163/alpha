@@ -47,7 +47,7 @@ jobs:
       - name: Publish AIFAR Bundle Packager
         if: runner.os == 'Windows'
         shell: powershell
-        run: ./scripts/build-aifar-bundle-packager.ps1 -DotNetPath (Get-Command dotnet).Source
+        run: ./tools/aifar-bundle-packager/build.ps1 -DotNetPath (Get-Command dotnet).Source
 
   ubuntu-gates:
     name: Ubuntu tests, builds, and race checks

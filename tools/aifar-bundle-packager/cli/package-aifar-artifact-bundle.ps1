@@ -1,3 +1,4 @@
+# Command-line implementation of the AIFAR artifact bundle protocol.
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]

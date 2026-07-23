@@ -1,20 +1,18 @@
 import assert from 'node:assert/strict'
-import { readFileSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import path from 'node:path'
 import test from 'node:test'
 import { fileURLToPath } from 'node:url'
 
-const scriptsDir = path.dirname(fileURLToPath(import.meta.url))
-const repositoryRoot = path.resolve(scriptsDir, '..')
+const toolDir = path.dirname(fileURLToPath(import.meta.url))
+const repositoryRoot = path.resolve(toolDir, '..', '..')
 const projectPath = path.join(
-  repositoryRoot,
-  'tools',
-  'aifar-bundle-packager',
+  toolDir,
   'src',
   'AifarBundlePackager.WinForms',
   'AifarBundlePackager.WinForms.csproj'
 )
-const buildScriptPath = path.join(scriptsDir, 'build-aifar-bundle-packager.ps1')
+const buildScriptPath = path.join(toolDir, 'build.ps1')
 const workflowPath = path.join(repositoryRoot, '.github', 'workflows', 'ci.yml')
 
 test('WinForms project publishes a self-contained untrimmed win-x64 single file', () => {
@@ -30,6 +28,7 @@ test('WinForms project publishes a self-contained untrimmed win-x64 single file'
 })
 
 test('build script tests before publish and delivers only AIFARBundlePackager.exe', () => {
+  assert.equal(existsSync(buildScriptPath), true, 'tool-local build.ps1 must exist')
   const script = readFileSync(buildScriptPath, 'utf8')
 
   assert.match(script, /param\([\s\S]*\$DotNetPath\s*=\s*'D:\\tools\\dotnet\\dotnet\.exe'/i)
@@ -59,6 +58,6 @@ test('Windows CI compiles, tests, and publishes the WinForms packager', () => {
   assert.match(workflow, /uses:\s*actions\/setup-dotnet@v4/i)
   assert.match(workflow, /dotnet-version:\s*['"]?8\.0\.x/i)
   assert.match(workflow, /dotnet test tools\/aifar-bundle-packager\/AifarBundlePackager\.sln/i)
-  assert.match(workflow, /build-aifar-bundle-packager\.ps1/i)
+  assert.match(workflow, /\.\/tools\/aifar-bundle-packager\/build\.ps1/i)
   assert.match(workflow, /runner\.os\s*==\s*'Windows'/i)
 })

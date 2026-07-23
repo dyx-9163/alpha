@@ -5,7 +5,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-$repositoryRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
+$repositoryRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..'))
 $solutionPath = Join-Path $repositoryRoot 'tools\aifar-bundle-packager\AifarBundlePackager.sln'
 $projectPath = Join-Path $repositoryRoot 'tools\aifar-bundle-packager\src\AifarBundlePackager.WinForms\AifarBundlePackager.WinForms.csproj'
 $deployRoot = [System.IO.Path]::GetFullPath((Join-Path $repositoryRoot 'deploy'))

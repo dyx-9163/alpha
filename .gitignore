@@ -51,15 +51,4 @@ aifar-deployment.zip
 # OS metadata
 Thumbs.db
 .DS_Store
-/scripts/.aifar-artifact-bundle-612f85fc87884a2294885ada19d5eb86.zip
-/scripts/.aifar-artifact-bundle-612f85fc87884a2294885ada19d5eb86/artifacts/contacts/alpha-contacts.jar
-/scripts/.aifar-artifact-bundle-612f85fc87884a2294885ada19d5eb86/artifacts/file/alpha-file.jar
-/scripts/.aifar-artifact-bundle-612f85fc87884a2294885ada19d5eb86/artifacts/gateway/alpha-gateway.jar
-/scripts/.aifar-artifact-bundle-612f85fc87884a2294885ada19d5eb86/artifacts/im/alpha-im.jar
-/scripts/.aifar-artifact-bundle-612f85fc87884a2294885ada19d5eb86/artifacts/meeting/alpha-meeting.jar
-/scripts/.aifar-artifact-bundle-612f85fc87884a2294885ada19d5eb86/artifacts/message/alpha-message.jar
-/scripts/.aifar-artifact-bundle-612f85fc87884a2294885ada19d5eb86/artifacts/oauth/alpha-oauth.jar
-/scripts/.aifar-artifact-bundle-612f85fc87884a2294885ada19d5eb86/artifacts/permission/alpha-permission.jar
-/scripts/.aifar-artifact-bundle-612f85fc87884a2294885ada19d5eb86/artifacts/system/alpha-system.jar
-/scripts/.aifar-artifact-bundle-612f85fc87884a2294885ada19d5eb86/manifest.json
-/scripts/.aifar-artifact-bundle-612f85fc87884a2294885ada19d5eb86/artifacts/web-vue3/web-vue3.zip
+.aifar-artifact-bundle-*

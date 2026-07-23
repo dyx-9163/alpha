@@ -1,11 +1,11 @@
 @echo off
 setlocal
 
-rem ===== Editable packaging configuration =====
+rem ===== Editable CLI packaging configuration =====
 set "JAVA_SOURCE_ROOT=D:\workspace\alpha\backend\alpha-java-cloud"
 set "WEB_DIST_ROOT=D:\workspace\alpha\fronted\alpha-web-vue3\dist"
 set "OUTPUT_PATH=%CD%\aifar-batch-update.zip"
-rem ============================================
+rem ================================================
 
 set "SERVICES=%*"
 if not defined SERVICES set "SERVICES=all"
