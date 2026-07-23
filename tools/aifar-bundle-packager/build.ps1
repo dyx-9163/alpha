@@ -1,9 +1,36 @@
 [CmdletBinding()]
 param(
-    [string]$DotNetPath = 'D:\tools\dotnet\dotnet.exe'
+    [string]$DotNetPath = 'D:\tools\dotnet\dotnet.exe',
+    [string]$Version = '',
+    [string]$SourceRevisionId = ''
 )
 
 $ErrorActionPreference = 'Stop'
+
+$hasVersion = -not [string]::IsNullOrWhiteSpace($Version)
+$hasRevision = -not [string]::IsNullOrWhiteSpace($SourceRevisionId)
+if ($hasVersion -ne $hasRevision) {
+    throw 'Version and SourceRevisionId must be supplied together.'
+}
+if ($hasVersion -and $Version -notmatch '^\d+\.\d+\.\d+$') {
+    throw "Version must use X.Y.Z numeric format: $Version"
+}
+if ($hasRevision -and $SourceRevisionId -notmatch '^[0-9a-fA-F]{40}$') {
+    throw 'SourceRevisionId must be a 40-character Git commit SHA.'
+}
+
+$releaseProperties = @()
+if ($hasVersion) {
+    $numericVersion = "$Version.0"
+    $normalizedRevision = $SourceRevisionId.ToLowerInvariant()
+    $releaseProperties = @(
+        "-p:Version=$Version",
+        "-p:FileVersion=$numericVersion",
+        "-p:AssemblyVersion=$numericVersion",
+        "-p:InformationalVersion=$Version+$normalizedRevision",
+        "-p:SourceRevisionId=$normalizedRevision"
+    )
+}
 
 $repositoryRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..'))
 $solutionPath = Join-Path $repositoryRoot 'tools\aifar-bundle-packager\AifarBundlePackager.sln'
@@ -56,7 +83,7 @@ try {
     )
 
     Write-Host '[AIFAR Bundle Packager] dotnet publish'
-    Invoke-DotNet -Arguments @(
+    $publishArguments = @(
         'publish',
         $projectPath,
         '--configuration', 'Release',
@@ -69,6 +96,8 @@ try {
         '-p:DebugType=None',
         '-p:DebugSymbols=false'
     )
+    $publishArguments += $releaseProperties
+    Invoke-DotNet -Arguments $publishArguments
 
     $publishedExecutables = @(Get-ChildItem -LiteralPath $publishDirectory -File -Filter '*.exe')
     if ($publishedExecutables.Count -ne 1) {

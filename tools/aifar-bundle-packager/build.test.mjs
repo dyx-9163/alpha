@@ -52,6 +52,23 @@ test('build script tests before publish and delivers only AIFARBundlePackager.ex
   )
 })
 
+test('build script validates paired release metadata and injects MSBuild versions', () => {
+  const script = readFileSync(buildScriptPath, 'utf8')
+
+  assert.match(script, /\[string\]\$Version/)
+  assert.match(script, /\[string\]\$SourceRevisionId/)
+  assert.match(script, /Version and SourceRevisionId must be supplied together/i)
+  assert.match(script, /Version must use X\.Y\.Z numeric format/i)
+  assert.match(script, /SourceRevisionId must be a 40-character Git commit SHA/i)
+  assert.match(script, /\^\\d\+\\\.\\d\+\\\.\\d\+\$/)
+  assert.match(script, /\^\[0-9a-fA-F\]\{40\}\$/)
+  assert.match(script, /-p:Version=/)
+  assert.match(script, /-p:FileVersion=/)
+  assert.match(script, /-p:AssemblyVersion=/)
+  assert.match(script, /-p:InformationalVersion=/)
+  assert.match(script, /-p:SourceRevisionId=/)
+})
+
 test('Windows CI compiles, tests, and publishes the WinForms packager', () => {
   const workflow = readFileSync(workflowPath, 'utf8')
 
