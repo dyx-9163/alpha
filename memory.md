@@ -575,3 +575,7 @@
 - 结论：条件路径已按测试先行落地并重新发布 EXE：表单和 Core 都按服务类别要求来源，未用路径即使为空或失效也不阻塞；界面提示会说明 Java-only/Web-only 的未使用路径。36 个 .NET 测试、263 个脚本测试、WinForms Release 构建、单文件发布和 GUI 启动烟测通过；提交为 `afc75603`、`5efaf1fb`、`bc5755dd`。
 - 问题：用户要求完成 Keepalived systemd unit 从 `/aifar/apps/keepalived` 软链接迁移为 `/etc/systemd/system/keepalived.service` 普通文件，避免重启后 unit 丢失或依赖人工 `daemon-reload`。
 - 结论：隔离分支 `codex/keepalived-direct-unit` 已完成直接 unit 的原子安装、旧 AIFAR 软链接事务迁移、卸载与失败回滚、第三方 unit/并发替换保护、`FragmentPath` 和 active/enabled 状态复验、单文件 SELinux 标签验证及 `RequiresMountsFor=/aifar/apps/keepalived`。Keepalived 215/215、脚本 303/303、发布打包与 Linux 74/Windows 62 文件及归档校验通过，最终代码审查无阻塞项；真实 openEuler 重启、VRRP/VIP 验收未执行，需单独授权。
+- 问题：当前分支引入 Keepalived 直接 systemd unit 实现后，`pnpm test:scripts` 出现 19 个 Keepalived 失败。
+- 结论：提交 `772ec430` 只合入安装器、卸载器和 README，遗漏完成分支上的两个测试文件，导致测试仍使用旧 `UNIT_LINK`、`EXPECTED_UNIT` 和 `register_systemd_unit` 契约。同步 `scripts/keepalived-extra.test.mjs` 与 `scripts/keepalived-runtime.test.mjs` 后，Keepalived 215/215、迁移前完整脚本门禁 306/306 通过；安装和卸载实现未修改。
+- 问题：用户要求整理当前分支的 `scripts/`，将不属于 AIFAR 生命周期、但为其他能力准备文件或产物的工具迁入 `tools/`。
+- 结论：Bundle Packager 构建入口和测试迁至 `tools/aifar-bundle-packager/`，PowerShell/CMD 更新包工具迁至其 `cli/`，Alpha JAR 导出迁至 `tools/alpha-jar-export/`；新增递归 `tools/test-tools.mjs` 和 `pnpm test:tools` 并接入本地门禁与 CI。`scripts/` 仅保留 AIFAR 开发、启动、构建、测试、发布和资源恢复边界；前端更新包提示改为 `AIFARBundlePackager.exe`。最终脚本 290/290、工具 17/17、前端 162/162、.NET 36/36 和单文件发布通过。无调用方且内嵌环境信息的 `scripts/build_openlab_inventory_docx.py` 未移动，仍是需单独授权处理的清理项。
