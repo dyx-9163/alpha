@@ -3,6 +3,25 @@
 
 本文件记录后续对话的精简问题与结论。每次开始先读，结束前追加。禁止写入密码、token、私钥、完整连接串和长日志。
 
+## 2026-07-22
+- 问题：用户截图显示单机 Redis 验证码读取正常，而 Sentinel 模式在读取 Navicat 列表第一条验证码时异常。
+- 结论：截图仅能确认验证码以随机 key 写在 `192.168.74.132:6379` 的 DB 1，TTL 约 5 分钟；Redis 不存在稳定的“第一行”，不能用 KEYS/SCAN/Navicat 排序后的首项定位验证码，必须用请求携带的精确验证码 key 查询。若代码已按精确 key 查询，则需在 Sentinel 当前 master 的 DB 1 对同一 key 执行 GET/TTL，并核对所有应用实例使用相同的 Sentinel masterName、26379 节点列表、database=1 和读写序列化器；现场输出不足以确认具体命中哪项。
+- 问题：用户询问如何查看当前 Redis Sentinel 集群中的主节点。
+- 结论：先在任一可达 Sentinel 的 26379 端口执行 `SENTINEL GET-MASTER-ADDR-BY-NAME <masterName>` 获取当前主节点 IP 和数据端口，再对返回的 6379 节点执行只读 `ROLE` 或 `INFO replication` 验证其角色为 master；若不知道 masterName，先执行 `SENTINEL MASTERS` 查看 name。
+- 问题：用户询问 Redis Sentinel 模式下连接 6379 与 26379 时为何查询结果不同。
+- 结论：6379 是 Redis 数据服务端口，读写业务 key；26379 是 Sentinel 控制面端口，只查询主从拓扑、仲裁和故障转移状态，两者结果不同属于正常现象。应用应通过 Sentinel 发现当前 master 后连接其 6379，不能把 26379 当作数据端口；若不同节点的 6379 数据也不同，则需只读检查 ROLE、INFO replication、master_link_status 和 Sentinel 当前 master 地址。
+- 问题：用户反馈服务器重启后 Keepalived 像是消失，无法通过 `systemctl status keepalived` 查看。
+- 结论：当前自定义安装把真实 unit 放在 `/aifar/apps/keepalived/systemd/keepalived.service`，由 `/etc/systemd/system/keepalived.service` 链接并启用；在取得现场输出前，应先只读区分 unit link 缺失或悬空、`/aifar` 未挂载，以及 unit 存在但启动失败，不能仅凭“重启后没了”判定 Keepalived 被卸载。
+- 问题：用户开始规划面向客户的 HA 验收测试场景，已举例整机断电和服务升级。
+- 结论：测试设计必须先确认验收范围是整套 AIFAR 端到端、核心数据组件，还是仅 AIFAR Runtime；后续场景需分别覆盖入口 VIP、业务服务、控制面、MySQL/Redis/Nacos/MinIO，以及故障切换、数据一致性、恢复回切和升级回滚，不能只验证进程重新启动。
+- 问题：用户确认采用整套 AIFAR 端到端 HA 验收，并补充系统还依赖融云服务。
+- 结论：当前仓库未发现融云模块、部署脚本或配置记录；正式场景设计前需确认融云是客户现场私有化部署、公有云 SaaS，还是混合部署，因为三者的故障注入范围和责任边界不同。
+- 结论：融云采用客户现场私有化部署，应纳入内部 HA 故障注入、节点切换、数据一致性和恢复验收范围；下一步需确认其实际节点与依赖拓扑。
+- 结论：融云为两节点容灾形态；正式 HA 场景还需确认当前是自动切换、人工切换还是仅做数据灾备，两节点不应在未确认故障检测与决策机制时直接表述为仲裁式自动 HA。
+- 结论：融云两节点容灾具备自动切换机制；下一步应把端到端故障恢复转成可量化的 RTO 与 RPO 验收指标，而不是只记录“已自动切换”。
+- 结论：客户 HA 验收的端到端 RTO 目标定为 60 秒以内，计时应覆盖从客户端首次失败到登录、消息收发、历史消息查询等核心业务链路恢复。
+- 结论：客户 HA 验收的 RPO 目标定为已确认成功的数据和消息零丢失；故障瞬间未确认的请求允许客户端重试，并应通过业务唯一标识检查重复与遗漏。
+
 ## 2026-07-09
 - 问题：用户询问当前 AIFAR Deployment 的服务升级是怎么做的。
 - 结论：当前代码中通用应用 Docker/MySQL/Redis/MinIO/Nacos 仍以 install/check/delete 为主，没有完整 Update/Rollback 生命周期；已落地的“服务升级”主要是 AIFAR Runtime v2 制品滚动发布，入口在 Containers 的 AIFAR Runtime 页，支持单服务上传 jar/web 包和批量 zip 包，后端走 `/apps/instances/{id}/aifar/update-artifact` 或 `/update-artifact-bundle`，创建 worker task、上传制品和脚本、远端执行 `aifar-agent reconcile-runtime`，再写入 app_instances metadata、aifar 控制面表和 app_releases 发布记录；目前有 release 记录和保留策略，但没有面向服务升级的自动备份/正式回滚 API。
@@ -402,6 +421,22 @@
 - 结论：当前实例 `app_73ddecb9b7cd38fc3c0d4e9c` 的控制面和真实 MinIO 一致：bucket `aifar`、空 prefix、1 天、enabled、Rule ID `d9eak4grru0db3vvmo90`，任务 `tsk_340f7eed564e99d7641335a6` 成功；bucket 未启用版本控制或对象锁，当前无超过 1 天对象。应用策略通过 worker SSH 临时加载 `/aifar/apps/minio/conf/minio.env`，使用 `/aifar/apps/minio/bin/mc` 删除已记录旧 rule 后执行 `mc ilm rule add`，再写 `storage_items(kind=cleanupPolicy)` 和 `app_instances.metadata.cleanupPolicy`。发现三项现有风险：估算命令扫描整个 alias 而非选择的 bucket/prefix；页面编辑天数固定初始化为 30，不跟随当前 1 天策略，因此截图估算实际是 30 天口径；停用忽略 rule 删除失败，替换策略先删旧 rule 再加新 rule 且无回滚，可能造成控制面与 MinIO 漂移。
 - 问题：用户询问当前清理策略具体存放在服务器哪里。
 - 结论：真实 ILM 规则由 MinIO 持久化在目标节点数据目录内部元数据 `/aifar/apps/minio/data/.minio.sys/buckets/aifar/.metadata.bin/xl.meta`，为 MinIO 内部二进制格式，只能用 `mc ilm rule ls/add/rm` 管理，不应直接编辑；AIFAR 另在面板服务器 `data/aifar.db` 的 `storage_items(kind=cleanupPolicy)` 和 `app_instances.metadata.cleanupPolicy` 保存 Rule ID 与展示状态。`/aifar/apps/minio/conf/minio.env` 只存运行参数和凭据，不保存生命周期规则，任务使用的临时 `MC_CONFIG_DIR` 执行后会删除。
+
+## 2026-07-21
+- 问题：用户在安装 `container-selinux` 后运行汇总脚本，运行中的 HTTPS ingress `conf.d` 仍为 `default_t`，要求单独命令修复。
+- 结论：Ingress 早于 container-selinux 策略启动，在线 `:Z` bind mount 未获得 `container_file_t`；汇总脚本按设计只校验运行中私有 MCS 标签，不用 restorecon 覆盖它。执行 `systemctl restart aifar-https-ingress.service` 会通过 unit 的 ExecStop/ExecStart 删除并重建容器，`start.sh` 的 `conf.d:ro,Z` 和 `tls:ro,Z` 由 Docker 自动分配正确的 container_file_t 与私有 MCS 类别，是比手工 chcon/restorecon 更安全的单命令修复。
+- 问题：用户反馈重启 HTTPS ingress 后挂载目录标签仍不正确。
+- 结论：该节点 Docker 的 `:Z` 未自动把既有目录从 `default_t` 改为 `container_file_t`，单纯重复重启无效；应先停止 unit 以解除在线私有挂载，再为 `conf.d(/.*)?`、`tls(/.*)?` 登记或更新持久 `container_file_t` fcontext，执行 `restorecon -RF -x`，最后重新启动并用 `stat -c %C` 校验。该顺序避免在运行中覆盖 MCS 标签。
+- 问题：用户改为要求一条只读命令定位 HTTPS ingress 挂载目录标签问题，不直接修复。
+- 结论：诊断命令应同时输出 SELinux/container-selinux 状态、Docker SecurityOptions、unit/container 状态、容器 ProcessLabel/MountLabel 与 Mounts、`conf.d`/`tls` 的实际及 matchpathcon 期望标签、本地 fcontext 规则、文件系统挂载参数和近期 AVC；禁止包含 semanage add/modify、chcon、restorecon、服务重启或容器重建。
+- 问题：用户需要可手工输入的简短只读诊断命令。
+- 结论：最小首查为 `docker info 2>/dev/null | grep -i selinux; ls -Zd /aifar/apps/aifar-https-ingress/conf.d /aifar/apps/aifar-https-ingress/tls`；前半段无输出说明 Docker SecurityOptions 未启用 SELinux，后半段直接显示两个 bind mount 源目录的当前类型和 MCS 范围。
+- 问题：用户回报 `docker info` 中没有 SELinux，且 `conf.d`、`tls` 均为 `unconfined_u:object_r:default_t:s0`。
+- 结论：证据确认该节点 Docker daemon 未启用 SELinux 集成，因此 `start.sh` 中的 `:Z` 没有给 bind mount 源自动分配 `container_file_t`/MCS 标签；下一步只读检查 `/etc/docker/daemon.json` 和 docker systemd ExecStart 中是否存在 `selinux-enabled`，尚不执行修改或重启。
+- 问题：用户询问能否卸载并重装 AIFAR HTTPS ingress。
+- 结论：可以使用模块自带 `uninstall-systemd.sh` 和 `install-systemd.sh`；卸载会停止并删除 ingress 容器、禁用并删除 systemd unit，但保留模块目录、Nginx 配置、证书和既有 firewalld 规则，期间 80/443 中断。当前 Docker SecurityOptions 未启用 SELinux，若不先解决该根因，重装仍会让 `:Z` 挂载保持 `default_t`，因此不能把重装当作当前标签问题的修复。
+- 问题：用户明确要求直接修改 HTTPS ingress 挂载目录标签，使汇总 SELinux 脚本能够完整执行。
+- 结论：汇总脚本连续校验 `conf.d` 与 `tls`，两者当前均为 `default_t`，因此必须同时处理；最简即时命令为 `chcon -Rt container_file_t /aifar/apps/aifar-https-ingress/conf.d /aifar/apps/aifar-https-ingress/tls`。该命令直接修改现有 xattr 标签、不会启用 Docker SELinux，也不是 semanage 持久规则；适用于用户明确要求先让当前脚本通过的场景。
 - 问题：用户要求把隔离 worktree 的 Keepalived 模块合入主工作区，并在 openEuler 24.03 LTS-SP3 节点完成真实安装和健康漂移验证。
 - 结论：Keepalived 模块已合入主分支；实机暴露并修复了临时配置校验时健康脚本尚不可访问、回滚误判不存在的 systemd unit、健康 URL 固定路径少一层目录三个问题。目标节点最终为 Keepalived 2.4.2、systemd active/enabled、SELinux Enforcing，健康接口成功时绑定 VIP；临时模拟健康失败后进入 FAULT 并移除 VIP，恢复后自动回到 MASTER 并重新绑定，精确 VRRP/112 防火墙规则和 SELinux 标签均已应用。
 - 问题：用户要求将 `KEEPALIVED_HEALTH_URL` 改为可选，整行注释时不安装健康检查设置。
@@ -456,3 +491,73 @@
 - 结论：根因是远端 DockerHost 为 TCP/HTTP API 时，容器列表走 Go Docker HTTP API，而 `DockerContainerStatsForServer` 又调用 `DockerContainerStats`，后者固定通过本机 `exec.Command("docker", "-H", ...)` 执行 CLI；面板后端运行在 Windows 且 PATH 中没有 docker.exe，故仅 stats 失败。远端 Docker 和 Agent 并未因此异常，当前影响限于 Pod CPU/内存统计；正确修复边界是为 stats 补 Docker Engine API 实现或改走 SSH/Agent，而不是在 Windows 面板机盲装 Docker CLI。
 - 问题：用户询问 Nacos 使用服务器地址注册与使用容器地址注册的具体区别。
 - 结论：当前 AIFAR Runtime 明确采用 agent-proxy：Java 容器设置 `SPRING_CLOUD_NACOS_DISCOVERY_REGISTER_ENABLED=false`，由 aifar-agent 向 Nacos 注册“宿主机可达 IP + 服务代理端口”，再把请求代理到同一 Docker 网络中的健康容器 IP；相比容器直接注册，该方式能屏蔽容器 IP 漂移、统一负载均衡和上下线，但增加 agent/宿主机代理这一跳和故障边界。容器直接注册更原生、少一跳，但消费者必须能路由到容器网段，并承受容器重建、跨主机网络、心跳和摘除管理复杂度。
+
+## 2026-07-21
+- 问题：用户询问 Java 服务注册到 Nacos 的动作能否主动关闭。
+- 结论：可以通过 Spring Cloud Nacos Discovery 的 `spring.cloud.nacos.discovery.register-enabled=false`（环境变量 `SPRING_CLOUD_NACOS_DISCOVERY_REGISTER_ENABLED=false`）关闭 Java 实例注册；当前 AIFAR 安装、增量安装、升级和回滚脚本均已设置该开关，由 aifar-agent 单独注册宿主机代理实例。该开关不关闭 Nacos 配置读取，也不自动关闭 agent-proxy 注册；运行中修改环境变量通常需重启 Java 容器生效。
+- 问题：用户希望三节点 MySQL InnoDB Cluster 中指定一个节点，只要健康在线就优先成为 PRIMARY。
+- 结论：可用每实例 `memberWeight` 提高该节点在下一次自动选举中的优先级，但该设置不触发抢占式回切；首选节点恢复 ONLINE 后，现任 PRIMARY 会继续任职。若要求“恢复即为主”，需由受控运维流程或外部控制器在确认节点追平、集群有 quorum 且状态稳定后调用 `cluster.setPrimaryInstance()`，并设置防抖以避免反复切主。当前 AIFAR bootstrap 未设置 `memberWeight`，也没有自动回切控制器。
+- 问题：用户确认已创建的 InnoDB Cluster 能否直接修改 PRIMARY 选举优先级。
+- 结论：可以通过 MySQL Shell 在在线集群上调用 `cluster.setInstanceOption(instance, 'memberWeight', value)`，无需重建、移除成员或重启；实例地址应使用 `cluster.status()` 中登记的 address。修改不触发立即切主，如需当前就切到首选节点，确认其 ONLINE 后另行调用 `cluster.setPrimaryInstance()`。
+- 问题：用户设置 `memberWeight` 后没有在集群信息中看到对应权重。
+- 结论：`cluster.status()` 主要展示拓扑、角色和健康状态，不是权重查看入口；应在 MySQL Shell JS 模式使用 `cluster.options({all:true})`，并分别连接每个成员查询 `@@GLOBAL.group_replication_member_weight` 作为运行时权威值。若配置输出与服务端变量不一致，需保留 `setInstanceOption()` 的完整返回或错误继续定位。
+- 问题：用户确认最高权重 MySQL 节点 down 后是否影响其余成员自动选举 PRIMARY。
+- 结论：权重只影响在线候选人的排序，不会阻止故障转移；三成员集群中最高权重节点 down 后，只要另外两个成员互通、均为 ONLINE 且仍构成 2/3 多数派，就会从它们中自动选出新 PRIMARY。若同时只剩一个成员，则失去 quorum，不会安全自动选主。
+- 问题：用户反馈 Redis Sentinel 模式在主节点 down 后没有自动切主。
+- 结论：当前模板默认 3 Sentinel 时 quorum=2、down-after=5 秒，理论上可自动切换，但安装验收只执行 `sentinel masters`，没有用 `SENTINEL CKQUORUM` 验证仲裁、多数派和副本可选性；另外数据节点与 Sentinel 节点分开选择时，仅 Sentinel 节点执行配置脚本，数据副本不会写入 `replicaof`，属于明确实现缺口。现场只读 SSH 到 132/133/134 均超时，尚不能确认本次故障具体命中哪一项。
+- 问题：用户询问如何提高 AIFAR 部署的 Redis 最大客户端连接数。
+- 结论：当前 Redis 安装模板未显式配置 `maxclients`，数据服务配置位于 `<deployDir>/redis/conf/redis.conf`，默认部署目录下即 `/aifar/apps/redis/conf/redis.conf`；systemd unit 的 `LimitNOFILE` 固定为 10032。运行中可用 `CONFIG SET maxclients <值>` 临时调整，并用 `CONFIG REWRITE` 写回配置；超过约 10000 时还需提高 `aifar-redis.service` 的 `LimitNOFILE`。Sentinel/Cluster 各数据节点必须分别调整。
+- 问题：用户确认 `LimitNOFILE` 与 Lettuce 连接池的关系，并说明有 18 个后端服务使用 `max-active=128`、`min-idle=16`、`max-idle=64`。
+- 结论：`LimitNOFILE` 是 Redis 进程可打开的文件描述符上限，不是连接池或 Redis 客户端数；Redis 服务端限制是 `maxclients`，Java 每个 JVM/Pod 的池上限是 Lettuce `max-active`。18 个单实例服务的池理论上限为 2304，若每个服务有 N 个副本则为 `18*N*128`；当前 Redis 约 10000 的上限对 18 个单实例通常足够。容量核算应按实际应用实例总数并预留 20% 到 30%，优先监控 `connected_clients`、`rejected_connections` 和连接池等待，不应仅因配置上限相加就扩大 Redis 上限；`max-wait=-1` 有无限等待风险。
+- 问题：用户反馈 Java 服务提示 Redis 连接池不足。
+- 结论：尚缺异常原文和 Redis 只读指标，不能直接认定应扩大池。需先区分 Java 侧池耗尽（如 pool exhausted/timeout waiting）、Redis 服务端 `maxclients` 拒绝、网络或 Sentinel 切换失败；当前生成配置为 `max-active=128` 且 `max-wait=-1`，若运行时仍报告等待超时，还应核实 Java 实例实际加载的 Nacos 配置。先收集 `INFO clients`、`INFO stats` 的 `rejected_connections` 以及完整 Java cause 链，再决定是扩池、修复连接未归还/阻塞调用，还是调整 Redis 服务端。
+- 问题：用户发现 Redis 主节点系统时间比 Java 服务端快约 5 分钟。
+- 结论：Redis `TIME` 来源于所在主机系统时钟，需先用 Unix epoch 区分真实约 300 秒偏差与仅时区显示不同，并检查各 Redis 数据节点、Sentinel 节点和 Java 宿主机的 chronyd/NTP 状态。该偏差通常不直接造成 Lettuce 连接池耗尽；若业务使用 `EXAT`、`PXAT` 或客户端计算的 `expireAt` 绝对过期时间，可能使约 5 分钟 TTL 的验证码立即或提前过期，使用相对 `EX/PEXPIRE` 时固定偏差本身通常不改变持续时长。未确认各节点同步状态前不要在活动主节点直接执行 `date -s` 或强制跳时。
+- 问题：用户要求实查当前 Redis 最大连接数并给出扩大连接数的设置。
+- 结论：2026-07-22 只读 SSH 实查 192.168.74.132：Redis 6379 为 master，运行时 `maxclients=10000`，`connected_clients=227`、`blocked_clients=0`、`rejected_connections=0`、累计接收连接245；redis.conf 未显式写 `maxclients`，aifar-redis 的 systemd 与进程 `LimitNOFILE` 软硬限制均为10032。当前仅使用约2.27%，Java连接池报错不是Redis服务端客户端上限耗尽。133、134 SSH 超时未能核验；Sentinel拓扑下如确需提高，必须在所有可提升为主的数据节点统一配置，不能只改132。
+
+## 2026-07-23
+- 问题：用户询问 AIFAR Runtime 一次更新多个服务时上传包应采用什么结构。
+- 结论：当前批量更新只接受 zip，根目录必须有 `manifest.json`，schema 为 `aifar-artifact-bundle-v1`；各服务制品可放在 `artifacts/<service>/` 并由 manifest 的 `artifact` 精确引用。Java 服务使用与服务名匹配的 `.jar`，`web-vue3` 使用 `.zip`/`.tar`/`.tgz`/`.tar.gz`；可只包含本次变更的服务，每个服务只能出现一次，建议始终填写 SHA256 和字节大小。
+- 问题：用户确认没有新增模块时，批量更新包能否只包含 `artifacts/` 下的制品文件。
+- 结论：不能省略 ZIP 根目录的 `manifest.json`，后端不会根据目录自动识别服务；没有新增模块只表示 `services` 清单可仅列出本次更新的既有服务。当前最小清单需要 schema 和非空 services，每项至少提供 service 与 artifact；fileName 可由 artifact 文件名推导，但生产包仍建议显式提供 fileName、SHA256 和 size。
+- 问题：用户询问为什么单独更新一个服务时可以直接上传制品，而批量更新必须提供 manifest。
+- 结论：单服务接口 `/update-artifact` 的 multipart 表单同时提交 `service` 和 `artifact`，服务归属由表单字段明确；批量接口 `/update-artifact-bundle` 只接收一个 `bundle` zip，必须通过根目录 manifest 把每个 artifact 路径映射到 service。实例 ID 只能定位 AIFAR 实例，不能区分其中的多个子服务。
+- 问题：用户确认批量更新 ZIP 的每个 Java 服务目录下是否必须包含 Maven `target/` 目录。
+- 结论：`target/` 不是更新包协议要求，只是 Maven 的本地构建输出目录；推荐只复制最终 jar 到 `artifacts/<service>/`。若保留 `target/` 也能被解析，但 manifest 的 artifact 必须精确写成包含 target 的实际路径，且无关构建产物会增加包体积和误传风险。
+- 问题：用户要求给出不保留 `target/` 的标准批量更新目录与完整 manifest 示例。
+- 结论：交付规范采用 ZIP 根目录 `manifest.json` 加 `artifacts/<service>/<artifact>`；本次示例包含 oauth、permission、gateway 的最终 jar 和 web-vue3 的前端 zip。manifest 使用 `aifar-artifact-bundle-v1`，显式填写 app、kind、service、module、artifact、fileName、sha256、size；打包前必须用实际文件的 64 位 SHA256 和字节大小替换示例占位值。
+- 问题：用户确认批量更新 manifest 中能否省略 sha256 和 size。
+- 结论：当前代码允许两者省略；只有 size 大于 0 或 sha256 非空时才与 manifest 预期值比较。即使省略，后端仍会读取制品并计算真实 SHA256 和大小，用于远端上传校验和发布记录；省略的代价只是无法在接收包时验证它是否等于发布方预先声明的制品。
+- 问题：用户询问 manifest 中的 SHA256 从哪里获得。
+- 结论：SHA256 是对最终上传制品文件本身的全部字节计算得到的 64 位十六进制摘要，不是 Git commit、版本号或文件名。打包方可用 PowerShell `Get-FileHash -Algorithm SHA256` 或 Linux `sha256sum` 预先生成；若 manifest 省略该字段，后端也会直接读取 ZIP 条目并自动计算。
+- 问题：用户要求提供可直接运行的 CMD，从可配置 services 源目录生成当前目录下的全量批量更新 ZIP 和完整 manifest。
+- 结论：默认源目录现有 9 个 Java 服务的 `target/alpha-*.jar`，以及 `web-vue3/dist/`；拟议打包器会自动只复制最终 jar 到输出 `artifacts/<service>/`、把前端 dist 内容压成内层 `artifacts/web-vue3/web-vue3.zip`，再生成含真实 SHA256/size 的根 manifest。实现前需确认前端内层 ZIP 的根目录采用 dist 内容而不是保留 dist 文件夹。
+- 结论：用户确认前端内层 `web-vue3.zip` 应直接以 dist 内容为根，解压后直接出现 `index.html`、`assets/` 等，不保留外层 dist 目录。实现建议沿用仓库现有模式：CMD 作为单一运行入口并转发参数，PowerShell helper 负责发现服务、校验制品、生成内层前端包、manifest、SHA256/size 和最终 ZIP。
+- 结论：用户将 Java 默认来源调整为 `D:\workspace\alpha\backend\alpha-java-cloud`。该目录包含大量 API/Biz/Controller 等非运行 JAR，打包器必须按运行模块精确选取 9 个最终服务 JAR并规范化为 `alpha-<service>.jar`，不能简单取最新 JAR；同一工作区发现前端候选目录 `D:\workspace\alpha\fronted\alpha-web-vue3\dist`，待用户确认作为默认 WebDist。
+- 结论：用户确认默认 WebDist 为 `D:\workspace\alpha\fronted\alpha-web-vue3\dist`，并要求 JavaSourceRoot、WebDistRoot、OutputPath 都作为 CMD 可独立覆盖的参数。已将最终设计写入 `docs/superpowers/specs/2026-07-23-aifar-artifact-bundle-packager-design.md` 并本地提交 `b254d675`，等待用户审阅后进入实现计划。
+- 结论：用户进一步要求路径不出现在运行参数中，而是放在 CMD 顶部配置区；运行时可传逗号分隔服务列表，如 `gateway,im,meeting,web-vue3`，不传或传 `all` 默认打全量。部分包只校验并写入所选服务，未知/空服务及 all 与具体服务混用会失败。设计已修订并本地提交 `203e7a62`。
+- 问题：用户要求开始实施可选服务的 AIFAR Runtime 批量更新包 CMD。
+- 结论：新增 `scripts/package-aifar-artifact-bundle.cmd`、PowerShell 实现及 Node 脚本测试；CMD 顶部配置 Java/Web/输出路径，无参数或 all 打 10 个服务，逗号列表打部分服务。实现精确发现 9 个运行 JAR、压缩 Web dist 根内容、生成真实 SHA256/size、统一 ZIP entry 为 `/`、失败不覆盖旧包，并对 Windows 瞬时文件锁重试清理。真实 Alpha 全量包验证为 10 项、2,477,886,745 字节，逐项哈希/大小、Web 根结构及 staging 清理均通过；`pnpm test:scripts` 260/260 通过。
+- 问题：用户询问如何使用 `mc` 手工清理当前 AIFAR 部署的 MinIO 数据。
+- 结论：当前安装默认使用 `/aifar/apps/minio/bin/mc`、`/aifar/apps/minio/conf/minio.env` 和 API 端口 9000；一次性清理应先用 `mc find` 或 `mc rm --dry-run` 验证范围，再执行带 bucket/prefix 的 `mc rm --recursive --force --older-than`。长期自动清理应优先使用 `mc ilm rule add` 或面板清理策略；版本桶需另外处理 non-current versions 和 delete markers，不能把普通删除等同于释放全部空间。
+- 问题：用户使用全量 artifact bundle 更新 AIFAR Runtime 时，步骤 3/4 在复制 release/runtime JAR 和 Docker build 写入 `/app.jar` 时报 `No space left on device`，页面中失败的 bundle release 仍显示等待中。
+- 结论：包已通过解析和上传，失败根因是目标机 `/aifar/apps` 与 Docker Root Dir 所在文件系统空间或 inode 耗尽，legacy builder deprecation 仅是警告。当前全量原始制品约 2.708GB，脚本还会保留 work 上传件、release artifact、旧 runtime snapshot、runtime 的 app.jar/target 副本及 Docker 镜像层，峰值空间显著放大；work/TMP 仅成功末尾清理，失败无全局 trap，`DeleteOldAppReleases` 只删数据库不删远端 release。失败路径也未把 pending app_release 回写 failed，因此 UI 显示等待中。现场应先只读核对 df/inode、DockerRootDir、work/releases 和 Docker 占用，证明失败 revision 未被 runtime/container 引用后再做精确清理，不能直接执行广泛 `docker system prune -a`。
+- 结论：后续日志显示多个服务的 legacy `docker build` 已进入 `COPY target/*.jar`，并分别在 `alpha-system.jar`、`aifar-permission.jar` 写入镜像层时报 ENOSPC，进一步确认 Docker daemon 存储空间不足；重复 deprecation 警告来自全量服务逐个/分组构建。仓库默认 deploymentConcurrency=2，因此同一时段最多两项 rollout 组任务并行，但整个全量过程仍会累计每个服务的新镜像层和失败构建残留；降低并发只能降低瞬时压力，不能替代释放/扩容空间及修复清理逻辑。
+- 问题：用户指出已经明确报错的批量升级在发布历史中仍显示“等待中”，激活时间显示 `1/1/1 08:05:43`。
+- 结论：这是持久化状态缺陷而非前端翻译错误：单服务升级、批量升级和回滚都会预写 pending app_release，但步骤失败分支只结束 task/target/step，不把 release upsert 为 failed；成功分支才覆盖为 success。历史接口直接返回 pending，前端因此正确映射为等待中；零值 time.Time 被序列化为非空的 0001 时间，前端 `activatedAt || createdAt` 又优先格式化它。修复需覆盖三条生命周期、保留失败原因/完成时间，并对已有 pending 记录按 manifest.taskId 对应的终态 task 做一次对账回填，不能仅改前端标签。
+- 问题：用户要求实施 AIFAR 发布历史中失败任务仍显示等待中的修复。
+- 结论：单服务升级、批量升级和回滚现在会在失败返回时把已创建的 release upsert 为 failed，并在 manifest 写入 error、failedAt、status/phase；服务启动在恢复中断任务后，会将 AIFAR 历史 pending release 按 manifest.taskId 对应的 failed/cancelled/timeout task 对账为 failed。API 不再输出零值 activatedAt，前端只为 success 发布显示激活时间。回归覆盖三条失败链路、历史对账和时间展示；`pnpm test`、`pnpm test:web`、`pnpm web:build` 均通过。
+- 问题：用户回滚 AIFAR Runtime 后，IM Pod 持续提示 `jar is missing: /opt/aifar/app/app.jar`。
+- 结论：根因是 rollback 模板生成的 `java-entrypoint.sh` 硬编码 `/opt/aifar/app/app.jar`，但现有 IM Dockerfile 将 `target/*.jar` 复制为镜像工作目录 `/data/aifarsoft/javaApi/aifar-im/aifar-im.jar`，runtime spec 也没有把宿主机 service 目录挂载到 `/opt/aifar/app`。回滚前的目标 artifact 路径和 SHA 已通过脚本校验，错误发生在新镜像启动阶段；install/update 模板使用工作目录下 `app.jar`、服务名 JAR和首个 JAR的兼容查找，rollback 模板应复用同一启动逻辑。
+- 问题：用户要求修复并测试回滚 Java Pod 找不到 `/opt/aifar/app/app.jar`，并补充只有本次回滚的 IM 失败。
+- 结论：rollback 模板已改为与 install/update 一致，从镜像工作目录按 `app.jar`、`aifar-${AIFAR_SERVICE_NAME}.jar`、首个 `*.jar` 顺序查找，并加载共享/服务 JVM options；其他 Java Pod 当时未重启所以暂未暴露同一问题。新增渲染回归测试先红后绿，覆盖禁止硬编码路径与三段查找逻辑；AIFAR 聚焦回滚测试、`pnpm test` 和 `pnpm backend:build` 通过。
+- 问题：用户询问能否把 AIFAR artifact bundle 的 CMD 与 PowerShell 打包器做成单个 EXE，并选择三个路径。
+- 结论：现有三个路径是 JavaSourceRoot、WebDistRoot、OutputPath，适合封装成单文件 Windows EXE；需先确认交互形态是带文件夹/保存对话框的图形界面，还是保留命令行参数的控制台程序。
+- 结论：用户确认采用 GUI，并接受自包含单文件 EXE 约 60–100 MB 的体积，目标机器无需预装 PowerShell 或 .NET 运行库。
+- 结论：GUI 技术路线确定为 C# WinForms + .NET 8，自包含单文件 Windows x64 EXE；不采用 WPF 或 PowerShell 转 EXE。
+- 结论：GUI 会记住 JavaSourceRoot、WebDistRoot、OutputPath，设置保存在 `%LocalAppData%\AIFAR\BundlePackager\settings.json`，不在 EXE 目录旁生成配置文件。
+- 问题：用户确认 AIFAR Bundle Packager WinForms GUI 完整设计。
+- 结论：设计文档落在 `docs/superpowers/specs/2026-07-23-aifar-bundle-packager-winforms-design.md`；Core 与 WinForms 分离，GUI 提供三个路径、10 服务复选、进度日志，打包协议与现有 PS1 等价，使用同目录 staging/临时 ZIP 保证失败不覆盖旧包，并以 .NET 8 win-x64 自包含单文件 EXE 交付。
+- 问题：用户要求取消打包工具三个路径的默认值，必须手动选择。
+- 结论：此要求覆盖此前的路径记忆方案；GUI 每次启动时 Java、Web 和输出路径均为空，只能通过选择对话框指定，任一未选时不能开始打包，且不创建或读取路径设置文件。
