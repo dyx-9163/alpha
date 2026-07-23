@@ -561,3 +561,17 @@
 - 结论：设计文档落在 `docs/superpowers/specs/2026-07-23-aifar-bundle-packager-winforms-design.md`；Core 与 WinForms 分离，GUI 提供三个路径、10 服务复选、进度日志，打包协议与现有 PS1 等价，使用同目录 staging/临时 ZIP 保证失败不覆盖旧包，并以 .NET 8 win-x64 自包含单文件 EXE 交付。
 - 问题：用户要求取消打包工具三个路径的默认值，必须手动选择。
 - 结论：此要求覆盖此前的路径记忆方案；GUI 每次启动时 Java、Web 和输出路径均为空，只能通过选择对话框指定，任一未选时不能开始打包，且不创建或读取路径设置文件。
+- 问题：用户确认在当前 worktree 开始实施 WinForms 打包器，随后要求暂停。
+- 结论：实施计划已提交为 `88f7e6e3`；仓库基线仅有 collector 时序测试一次抖动且单独复跑通过。已写入首组 ServiceCatalog 红灯测试但尚未运行或实现生产代码；.NET SDK 8.0.423 下载暂停在 `D:\tools\downloads\dotnet-sdk-8.0.423-win-x64.zip`，已保存约 256 MB，可继续断点续传。
+- 问题：用户要求 Keepalived 不再通过 `/etc/systemd/system/keepalived.service` 软链接到 `/aifar/apps/keepalived`，以避免服务器重启后 unit 发现异常并依赖人工 `daemon-reload`。
+- 结论：已确认改为 `/etc/systemd/system/keepalived.service` 普通文件，安装时原子写入、daemon-reload、enable，并增加 `/aifar/apps/keepalived` 挂载依赖；旧 AIFAR 软链接允许事务迁移，外部 unit 拒绝覆盖，安装/卸载失败需恢复原 unit 类型、内容和服务状态。设计已提交为 `679c7506`，待书面规格复核后进入测试先行实施。
+- 结论：用户复核 Keepalived 直接 unit 设计无误；实施计划已写入 `docs/superpowers/plans/2026-07-23-keepalived-direct-systemd-unit.md` 并提交为 `70666e91`，按直接 unit 安装/迁移/回滚、安全卸载恢复、文档与完整发布验证三个测试先行任务拆分。真实 openEuler 重启验收仍需实现完成后单独授权。
+- 问题：用户要求继续完成把 AIFAR artifact bundle CMD/PowerShell 打包器改造成三个路径必须手动选择的 WinForms 单文件 EXE。
+- 结论：已交付 `deploy/bin/AIFARBundlePackager.exe`，Java/Web/输出路径每次启动均为空且只能通过原生对话框选择，10 个服务默认全选；Core 生成与现有 `aifar-artifact-bundle-v1` 协议一致的 SHA256/size/manifest/双层 Web ZIP，并采用同目录 staging 保证失败不覆盖旧包。已禁止输出位于 Web dist 内，避免重复打包旧 ZIP；31 个 .NET 测试、263 个脚本测试、真实 gateway/im/meeting/web-vue3 包逐项校验、x64 单文件发布和 GUI 启动烟测通过，Windows CI 已接入测试与发布门禁。
+
+## 2026-07-24
+- 问题：用户要求 WinForms 打包器的 Java 源码与 Web dist 路径按所选服务类型独立可选，不打某一类时不要求对应路径。
+- 结论：设计确定为服务选择驱动路径要求：Web-only 只要求 Web 和输出，Java-only 只要求 Java 和输出，混合选择要求两类来源；未使用路径保留显示但完全忽略。规格已提交为 `0913075d`，待用户复核后进入测试先行实现。
+- 结论：条件路径已按测试先行落地并重新发布 EXE：表单和 Core 都按服务类别要求来源，未用路径即使为空或失效也不阻塞；界面提示会说明 Java-only/Web-only 的未使用路径。36 个 .NET 测试、263 个脚本测试、WinForms Release 构建、单文件发布和 GUI 启动烟测通过；提交为 `afc75603`、`5efaf1fb`、`bc5755dd`。
+- 问题：用户要求完成 Keepalived systemd unit 从 `/aifar/apps/keepalived` 软链接迁移为 `/etc/systemd/system/keepalived.service` 普通文件，避免重启后 unit 丢失或依赖人工 `daemon-reload`。
+- 结论：隔离分支 `codex/keepalived-direct-unit` 已完成直接 unit 的原子安装、旧 AIFAR 软链接事务迁移、卸载与失败回滚、第三方 unit/并发替换保护、`FragmentPath` 和 active/enabled 状态复验、单文件 SELinux 标签验证及 `RequiresMountsFor=/aifar/apps/keepalived`。Keepalived 215/215、脚本 303/303、发布打包与 Linux 74/Windows 62 文件及归档校验通过，最终代码审查无阻塞项；真实 openEuler 重启、VRRP/VIP 验收未执行，需单独授权。
