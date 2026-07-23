@@ -581,3 +581,7 @@
 - 结论：Bundle Packager 构建入口和测试迁至 `tools/aifar-bundle-packager/`，PowerShell/CMD 更新包工具迁至其 `cli/`，Alpha JAR 导出迁至 `tools/alpha-jar-export/`；新增递归 `tools/test-tools.mjs` 和 `pnpm test:tools` 并接入本地门禁与 CI。`scripts/` 仅保留 AIFAR 开发、启动、构建、测试、发布和资源恢复边界；前端更新包提示改为 `AIFARBundlePackager.exe`。最终脚本 290/290、工具 17/17、前端 162/162、.NET 36/36 和单文件发布通过。无调用方且内嵌环境信息的 `scripts/build_openlab_inventory_docx.py` 未移动，仍是需单独授权处理的清理项。
 - 问题：当前分支推送时因历史大文件上传返回 HTTP 408。
 - 结论：提交 `9bb6ec60` 曾加入 449,485,052 字节的 `scripts/aifar-batch-update.zip`，后续删除不会清除 Git blob。已先创建本地备份分支，再仅从当前分支相对远端的 28 个提交中过滤该路径；改写前后最终 tree 完全一致，待推送范围无超过 100 MB 的 blob，随后已通过普通快进 push 更新远端分支。
+- 问题：用户询问当前 `AIFARBundlePackager.exe` 是否已按计划完成功能开发。
+- 结论：当前源码已覆盖服务目录、JAR 发现、事务打包、WinForms 交互、按服务类型条件要求 Java/Web 路径、自包含单 EXE 发布与 CI；本轮复验 .NET 36/36、工具 17/17、脚本 290/290 通过。本地 EXE 大小为 161,672,360 字节且未被 Git 跟踪；两份实施计划的 48 个复选框仍未回填，属于文档收口问题，不是功能缺口。
+- 问题：用户要求给出 Bundle Packager 发布与计划状态的修复计划，并确认采用 GitHub Release 方案。
+- 结论：设计采用 `aifar-bundle-packager-vX.Y.Z` 标签触发 Windows CI，重建带版本与 commit 的 EXE，生成 SHA256 和 release manifest，并创建只含三个资产的 Draft Release；人工完成下载校验、无 .NET Runtime 启动及 Java-only/Web-only/mixed 打包验收后再发布。旧计划用任务级证据矩阵收口，不伪造未持久化的历史 RED 日志。设计文档为 `docs/superpowers/specs/2026-07-24-aifar-bundle-packager-release-closeout-design.md`。
