@@ -9,7 +9,7 @@ EXE 必须继续生成与当前后端协议兼容的 `aifar-artifact-bundle-v1` 
 ## 技术方案
 
 - UI：C# WinForms，目标框架 `net8.0-windows`。
-- 核心逻辑：独立 Core 项目，不引用 WinForms，负责路径校验、服务选择、JAR 发现、Web ZIP、manifest、最终 ZIP、原子替换和设置持久化。
+- 核心逻辑：独立 Core 项目，不引用 WinForms，负责路径校验、服务选择、JAR 发现、Web ZIP、manifest、最终 ZIP 和原子替换。
 - 测试：独立测试项目直接验证 Core；GUI 只保留薄事件层。
 - 发布：`win-x64`、`SelfContained=true`、`PublishSingleFile=true`、`PublishTrimmed=false`，避免 WinForms 裁剪兼容问题。
 - 现有 CMD/PowerShell 在迁移期保留作兼容和结果对照，但发布给使用者的运行文件只有 EXE，EXE 运行时不调用或读取这两个脚本。
@@ -30,9 +30,9 @@ tools/aifar-bundle-packager/
 
 主窗口包含：
 
-1. Java 源码根目录：文本框和文件夹选择按钮。
-2. Web `dist` 目录：文本框和文件夹选择按钮。
-3. 输出 ZIP：文本框和保存文件对话框按钮，过滤器只允许 `.zip`。
+1. Java 源码根目录：只读路径框和文件夹选择按钮。
+2. Web `dist` 目录：只读路径框和文件夹选择按钮。
+3. 输出 ZIP：只读路径框和保存文件对话框按钮，过滤器只允许 `.zip`。
 4. 服务复选框：`oauth`、`permission`、`system`、`file`、`message`、`im`、`contacts`、`meeting`、`gateway`、`web-vue3`。
 5. “全选”和“清空”操作；首次启动默认全选。
 6. “开始打包”主按钮、进度条、当前步骤文本和只读滚动日志。
@@ -40,25 +40,17 @@ tools/aifar-bundle-packager/
 
 打包期间路径、服务复选框和开始按钮禁用，防止重复提交；窗口仍保持响应。打包结束或失败后恢复操作。
 
-## 设置持久化
+## 路径选择与启动状态
 
-三个路径保存在：
+程序不提供、推导或持久化任何路径默认值。每次启动时，Java 源码根目录、Web `dist` 目录和输出 ZIP 三个路径均为空，也不读取上次使用记录。
 
-```text
-%LocalAppData%\AIFAR\BundlePackager\settings.json
-```
+用户必须通过对应的选择按钮手动指定全部三个路径；路径框仅展示选择结果，不允许直接输入。任一路径为空时，“开始打包”按钮保持禁用，并在界面中明确提示尚未选择的项目。取消选择对话框不会修改原有选择结果。
 
-首次启动使用当前脚本中的默认值：
-
-- Java：`D:\workspace\alpha\backend\alpha-java-cloud`
-- Web：`D:\workspace\alpha\fronted\alpha-web-vue3\dist`
-- 输出：当前工作目录下 `aifar-batch-update.zip`
-
-成功读取设置后使用上次值。设置缺失、损坏或字段无效时回退默认值，不阻止程序启动。用户开始打包时保存当前三个路径；服务选择不持久化，每次启动默认全选。
+程序不创建 `%LocalAppData%\AIFAR\BundlePackager\settings.json` 或其他路径配置文件。服务选择不持久化，每次启动默认全选。
 
 ## 打包数据流
 
-1. 标准化三个路径并确认至少选择一个服务。
+1. 确认三个路径均已由用户选择，标准化路径，并确认至少选择一个服务。
 2. 输出路径必须以 `.zip` 结尾，不能指向目录。
 3. 对每个所选 Java 服务，在固定模块 `target` 目录查找唯一可运行 JAR：名称匹配 `alpha-<service>-*.jar`，排除 `original-*`、sources、javadoc、test/tests 和 plain 包；零个或多个候选都失败。
 4. `web-vue3` 要求 `dist/index.html` 存在，并把 `dist` 内部内容压成 `artifacts/web-vue3/web-vue3.zip`，不保留外层 `dist/`。
@@ -99,7 +91,8 @@ Core 通过进度回调上报阶段和日志，WinForms 使用后台任务执行
 - ZIP entry 使用 `/` 且不存在 staging 路径泄漏。
 - 失败不覆盖已有输出，成功才替换。
 - staging 与临时 ZIP 清理。
-- 设置保存、恢复、损坏回退和默认值。
+- 三个路径启动时均为空，任一路径未选择时不能开始打包。
+- 三个路径只能通过选择对话框指定，取消对话框时保留原选择。
 - WinForms 项目可构建，`dotnet publish` 产物只有可直接运行的主 EXE 和明确允许的符号文件；交付目录只保留 EXE。
 
 真实验收使用当前 Alpha Java/Web 源目录分别生成全量包和 `gateway,im,meeting,web-vue3` 部分包，复验 ZIP 结构、manifest、逐项 SHA256/size，并与现有 PowerShell 结果保持协议等价。
