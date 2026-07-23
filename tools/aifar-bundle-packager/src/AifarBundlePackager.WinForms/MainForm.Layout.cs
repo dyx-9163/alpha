@@ -87,7 +87,7 @@ public sealed partial class MainForm
         };
         var description = new Label
         {
-            Text = "从已构建的 Java JAR 和 Web dist 生成带完整 manifest.json 的更新 ZIP。三个路径必须手动选择。",
+            Text = "从已构建的 Java JAR 和/或 Web dist 生成带完整 manifest.json 的更新 ZIP。来源路径按所选服务使用，输出 ZIP 必选。",
             AutoSize = true,
             ForeColor = Color.FromArgb(75, 85, 99),
             Padding = new(0, 0, 0, 12),

@@ -13,7 +13,7 @@
 - Target `net8.0` for Core and tests and `net8.0-windows` for WinForms; publish only `win-x64`.
 - Publish with `SelfContained=true`, `PublishSingleFile=true`, and `PublishTrimmed=false`.
 - Do not call or read `package-aifar-artifact-bundle.cmd` or `.ps1` at runtime.
-- Java, Web, and output path fields start empty on every launch and are populated only after an accepted native selection dialog.
+- Java, Web, and output path fields start empty on every launch and are populated only after an accepted native selection dialog; output is always required, while Java/Web sources are required only for selected service categories.
 - Do not persist, infer, or supply path defaults, and do not create a path settings file.
 - Keep the fixed service order `oauth`, `permission`, `system`, `file`, `message`, `im`, `contacts`, `meeting`, `gateway`, `web-vue3`.
 - Generate schema `aifar-artifact-bundle-v1` with lowercase SHA256, byte size, and `/` ZIP separators.
@@ -218,7 +218,7 @@ Expected: FAIL because `BundlePackager` and ZIP utilities do not exist.
 
 - [ ] **Step 6: Implement packaging and safe replacement**
 
-Validate all three paths even for a partial-service bundle. Create GUID staging and temporary ZIP paths in the output directory. Generate all artifacts and manifest, create the temporary outer ZIP, delete staging successfully, and only then call `File.Move(temporaryZip, outputPath, true)`. In `finally`, clean any remaining staging or temporary path and combine cleanup errors without hiding the primary error.
+Validate the output path and at least one service for every bundle, then validate only the Java/Web source categories used by the selected services. Create GUID staging and temporary ZIP paths in the output directory. Generate all artifacts and manifest, create the temporary outer ZIP, delete staging successfully, and only then call `File.Move(temporaryZip, outputPath, true)`. In `finally`, clean any remaining staging or temporary path and combine cleanup errors without hiding the primary error.
 
 - [ ] **Step 7: Run Core tests and commit**
 
@@ -365,7 +365,7 @@ Expected: all tests PASS, publish succeeds, and `git diff --check` prints no err
 
 - [ ] **Step 2: Launch and inspect mandatory manual selection**
 
-Start `deploy/bin/AIFARBundlePackager.exe`. Verify all three path fields are empty, read-only, and require dialog selection; 开始打包 is disabled until all three paths and at least one service are selected. Cancel each dialog once and verify the existing displayed value remains unchanged.
+Start `deploy/bin/AIFARBundlePackager.exe`. Verify all three path fields are empty and read-only. Confirm Web-only requires Web plus output, Java-only requires Java plus output, and mixed selection requires both sources plus output. Cancel each dialog once and verify the existing displayed value remains unchanged.
 
 - [ ] **Step 3: Generate a partial real bundle**
 

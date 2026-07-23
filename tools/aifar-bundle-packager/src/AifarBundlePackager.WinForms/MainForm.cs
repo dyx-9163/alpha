@@ -245,11 +245,11 @@ public sealed partial class MainForm : Form
         }
 
         var missing = new List<string>();
-        if (string.IsNullOrWhiteSpace(_state.JavaSourceRoot))
+        if (_state.RequiresJavaSource && string.IsNullOrWhiteSpace(_state.JavaSourceRoot))
         {
             missing.Add("Java 源码根目录");
         }
-        if (string.IsNullOrWhiteSpace(_state.WebDistRoot))
+        if (_state.RequiresWebDist && string.IsNullOrWhiteSpace(_state.WebDistRoot))
         {
             missing.Add("Web dist 目录");
         }
@@ -262,9 +262,17 @@ public sealed partial class MainForm : Form
             missing.Add("至少一个服务");
         }
 
+        var categoryMessage = _state.RequiresJavaSource && !_state.RequiresWebDist
+            ? "本次仅打包 Java 服务，Web dist 路径不使用。"
+            : !_state.RequiresJavaSource && _state.RequiresWebDist
+                ? "本次仅打包 web-vue3，Java 源码路径不使用。"
+                : string.Empty;
         _pathRequirementLabel.Text = missing.Count == 0
-            ? "路径和服务已选择，可以开始打包。"
-            : $"请手动选择：{string.Join("、", missing)}";
+            ? string.IsNullOrEmpty(categoryMessage)
+                ? "路径和服务已选择，可以开始打包。"
+                : categoryMessage
+            : $"请手动选择：{string.Join("、", missing)}" +
+                (string.IsNullOrEmpty(categoryMessage) ? string.Empty : $"；{categoryMessage}");
         _pathRequirementLabel.ForeColor = missing.Count == 0
             ? Color.FromArgb(56, 158, 13)
             : Color.FromArgb(217, 119, 6);
