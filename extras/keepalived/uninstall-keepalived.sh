@@ -5,8 +5,8 @@ export LC_ALL=C
 
 readonly APP_ROOT="/aifar/apps/keepalived"
 readonly BACKUP_ROOT="/aifar/backups"
-readonly UNIT_LINK="/etc/systemd/system/keepalived.service"
-readonly EXPECTED_UNIT="$APP_ROOT/systemd/keepalived.service"
+readonly UNIT_FILE="/etc/systemd/system/keepalived.service"
+readonly BUILT_UNIT="$APP_ROOT/systemd/keepalived.service"
 readonly SELINUX_RECORD="$APP_ROOT/var/lib/aifar/keepalived-selinux-fcontexts"
 readonly FIREWALL_RECORD="$APP_ROOT/var/lib/aifar/firewall-rule"
 BACKUP_DIR=""
@@ -14,8 +14,9 @@ TRANSACTION_ACTIVE=0
 ROOT_MUTATION_STARTED=0
 SERVICE_WAS_ACTIVE=0
 SERVICE_WAS_ENABLED=0
-UNIT_LINK_EXISTED=0
+UNIT_STATE='absent'
 UNIT_LINK_TARGET=""
+UNIT_FILE_SHA256=""
 UNIT_ROLLBACK_CONFLICT=0
 FIREWALL_RUNTIME_PRESENT=0
 FIREWALL_PERMANENT_PRESENT=0
@@ -126,35 +127,99 @@ validate_selinux_record_file() {
     ((count == 6)) || die "SELinux ownership record must contain exactly six core patterns"
 }
 
-validate_unit_ownership() {
-    local unit_target=""
-    local fragment=""
-    local fragment_target=""
+is_managed_unit_file() {
+    local file="$1"
+    [[ -f "$file" && ! -L "$file" ]] || return 1
+    awk -v executable="$APP_ROOT/sbin/keepalived" '
+        /^[[:space:]]*\[[^]]+\][[:space:]]*$/ {
+            section=$0
+            gsub(/^[[:space:]]*\[|\][[:space:]]*$/, "", section)
+            in_service=(section == "Service")
+            next
+        }
+        !in_service || /^[[:space:]]*[#;]/ { next }
+        /^[[:space:]]*ExecStart[[:space:]]*=/ {
+            line=$0
+            sub(/^[[:space:]]*ExecStart[[:space:]]*=[[:space:]]*/, "", line)
+            if (line ~ /^[[:space:]]*$/) next
+            split(line, fields, /[[:space:]]+/)
+            if (fields[1] != executable) invalid=1
+            else found=1
+        }
+        END { exit (found && !invalid ? 0 : 1) }
+    ' "$file"
+}
 
-    unit_target="$(readlink -f -- "$UNIT_LINK" 2>/dev/null || true)"
-    if [[ -n "$unit_target" && "$unit_target" != "$EXPECTED_UNIT" ]]; then
-        die "系统 keepalived.service 不属于此安装：$unit_target"
-    fi
+unit_fragment_matches_state() {
+    local expected_state="$1" fragment='' fragment_target=''
 
     fragment="$(systemctl show -p FragmentPath --value keepalived.service 2>/dev/null || true)"
-    fragment_target="$(readlink -f -- "$fragment" 2>/dev/null || true)"
-    if [[ -n "$fragment_target" && "$fragment_target" != "$EXPECTED_UNIT" ]]; then
-        die "已加载的 keepalived.service 不属于此安装：$fragment_target"
+    case "$expected_state" in
+        absent)
+            [[ -z "$fragment" ]]
+            ;;
+        legacy-link)
+            [[ -n "$fragment" ]] || return 1
+            fragment_target="$(readlink -f -- "$fragment" 2>/dev/null || true)"
+            [[ "$fragment_target" == "$BUILT_UNIT" ]]
+            ;;
+        managed-file)
+            [[ -n "$fragment" ]] || return 1
+            fragment_target="$(readlink -f -- "$fragment" 2>/dev/null || true)"
+            [[ "$fragment_target" == "$UNIT_FILE" ]]
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+capture_uninstall_unit_state() {
+    UNIT_STATE='absent'
+    UNIT_LINK_TARGET=''
+    UNIT_FILE_SHA256=''
+    if [[ -L "$UNIT_FILE" ]]; then
+        UNIT_LINK_TARGET="$(readlink -f -- "$UNIT_FILE" 2>/dev/null || true)"
+        [[ "$UNIT_LINK_TARGET" == "$BUILT_UNIT" ]] || die "系统 keepalived.service 不属于此安装：$UNIT_LINK_TARGET"
+        UNIT_STATE='legacy-link'
+    elif [[ -e "$UNIT_FILE" ]]; then
+        is_managed_unit_file "$UNIT_FILE" || die "系统 keepalived.service 不属于此安装：$UNIT_FILE"
+        UNIT_STATE='managed-file'
+        UNIT_FILE_SHA256="$(sha256sum "$UNIT_FILE" | awk '{print $1}')"
     fi
 }
 
 capture_uninstall_state() {
     SERVICE_WAS_ACTIVE=0
     SERVICE_WAS_ENABLED=0
-    UNIT_LINK_EXISTED=0
-    UNIT_LINK_TARGET=""
     systemctl is-active --quiet keepalived.service && SERVICE_WAS_ACTIVE=1 || SERVICE_WAS_ACTIVE=0
     systemctl is-enabled --quiet keepalived.service && SERVICE_WAS_ENABLED=1 || SERVICE_WAS_ENABLED=0
-    if [[ -e "$UNIT_LINK" || -L "$UNIT_LINK" ]]; then
-        UNIT_LINK_EXISTED=1
-        UNIT_LINK_TARGET="$(readlink -f -- "$UNIT_LINK" 2>/dev/null || true)"
-        [[ "$UNIT_LINK_TARGET" == "$EXPECTED_UNIT" ]] || die "keepalived.service unit link changed before uninstall"
-    fi
+}
+
+uninstall_unit_state_matches_capture() {
+    local current_sha=''
+
+    case "$UNIT_STATE" in
+        absent)
+            [[ ! -e "$UNIT_FILE" && ! -L "$UNIT_FILE" ]]
+            ;;
+        legacy-link)
+            [[ -L "$UNIT_FILE" ]] || return 1
+            [[ "$(readlink -f -- "$UNIT_FILE" 2>/dev/null || true)" == "$UNIT_LINK_TARGET" ]]
+            ;;
+        managed-file)
+            is_managed_unit_file "$UNIT_FILE" || return 1
+            current_sha="$(sha256sum "$UNIT_FILE" | awk '{print $1}')"
+            [[ "$current_sha" == "$UNIT_FILE_SHA256" ]]
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+require_uninstall_unit_state_unchanged() {
+    uninstall_service_control_gate || die "keepalived.service or FragmentPath changed before service mutation"
+}
+
+uninstall_service_control_gate() {
+    uninstall_unit_state_matches_capture && unit_fragment_matches_state "$UNIT_STATE"
 }
 
 create_and_verify_backup() {
@@ -165,15 +230,18 @@ create_and_verify_backup() {
     install -d -o root -g root -m 700 "$BACKUP_DIR"
 
     cp -a -- "$APP_ROOT" "$BACKUP_DIR/installed-root"
+    if [[ "$UNIT_STATE" == 'managed-file' ]]; then
+        cp -a -- "$UNIT_FILE" "$BACKUP_DIR/systemd-unit"
+    fi
 
     cat >"$BACKUP_DIR/uninstall-manifest.txt" <<EOF
 installed_root=$APP_ROOT
-unit_target=$(readlink -f -- "$UNIT_LINK" 2>/dev/null || printf 'none')
 created_at_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 service_was_active=$SERVICE_WAS_ACTIVE
 service_was_enabled=$SERVICE_WAS_ENABLED
-unit_link_existed=$UNIT_LINK_EXISTED
+unit_state=$UNIT_STATE
 unit_link_target=$UNIT_LINK_TARGET
+unit_file_sha256=$UNIT_FILE_SHA256
 EOF
 
     (
@@ -436,51 +504,121 @@ rollback_uninstall_firewall_journal() {
     return "$rollback_status"
 }
 
-restore_uninstall_unit_and_service() {
-    local current_target="" fragment="" fragment_target="" rollback_status=0
+restore_uninstall_disabled_legacy_link() {
+    local unit_tmp="$UNIT_FILE.rollback.$$"
 
-    UNIT_ROLLBACK_CONFLICT=0
-    if [[ -e "$UNIT_LINK" || -L "$UNIT_LINK" ]]; then
-        current_target="$(readlink -f -- "$UNIT_LINK" 2>/dev/null || true)"
-        if [[ "$current_target" == "$EXPECTED_UNIT" ]]; then
-            rm -f -- "$UNIT_LINK" || rollback_status=1
-        else
-            UNIT_ROLLBACK_CONFLICT=1
-            return 1
-        fi
-    fi
-    if [[ "$UNIT_LINK_EXISTED" -eq 1 ]]; then
-        [[ "$UNIT_LINK_TARGET" == "$EXPECTED_UNIT" ]] && ln -s -- "$UNIT_LINK_TARGET" "$UNIT_LINK" || rollback_status=1
-    fi
-    if [[ "$rollback_status" -ne 0 ]]; then
+    [[ "$UNIT_STATE" == 'legacy-link' ]] || return 0
+    uninstall_unit_state_matches_capture && return 0
+
+    if [[ -e "$UNIT_FILE" || -L "$UNIT_FILE" ]]; then
         UNIT_ROLLBACK_CONFLICT=1
         return 1
     fi
-    if [[ "$UNIT_LINK_EXISTED" -eq 1 ]]; then
-        current_target="$(readlink -f -- "$UNIT_LINK" 2>/dev/null || true)"
-        if [[ ! -L "$UNIT_LINK" || "$current_target" != "$EXPECTED_UNIT" ]]; then
-            UNIT_ROLLBACK_CONFLICT=1
-            return 1
-        fi
+    [[ "$UNIT_LINK_TARGET" == "$BUILT_UNIT" ]] || return 1
+    rm -f -- "$unit_tmp" || return 1
+    ln -sT -- "$UNIT_LINK_TARGET" "$unit_tmp" || return 1
+    if [[ -e "$UNIT_FILE" || -L "$UNIT_FILE" ]]; then
+        rm -f -- "$unit_tmp"
+        UNIT_ROLLBACK_CONFLICT=1
+        return 1
+    fi
+    mv -Tn -- "$unit_tmp" "$UNIT_FILE" || {
+        rm -f -- "$unit_tmp"
+        [[ ! -e "$UNIT_FILE" && ! -L "$UNIT_FILE" ]] || UNIT_ROLLBACK_CONFLICT=1
+        return 1
+    }
+    if [[ -e "$unit_tmp" || -L "$unit_tmp" ]]; then
+        rm -f -- "$unit_tmp"
+        UNIT_ROLLBACK_CONFLICT=1
+        return 1
     fi
     systemctl daemon-reload || return 1
-    fragment="$(systemctl show -p FragmentPath --value keepalived.service 2>/dev/null || true)"
-    fragment_target="$(readlink -f -- "$fragment" 2>/dev/null || true)"
-    if [[ "$fragment_target" != "$EXPECTED_UNIT" ]]; then
+    uninstall_unit_state_matches_capture || {
         UNIT_ROLLBACK_CONFLICT=1
         return 1
+    }
+    unit_fragment_matches_state legacy-link || { UNIT_ROLLBACK_CONFLICT=1; return 1; }
+}
+
+restore_uninstall_unit_and_service() {
+    local restored_sha='' rollback_status=0 unit_tmp="$UNIT_FILE.rollback.$$"
+    local unit_reused=0
+
+    UNIT_ROLLBACK_CONFLICT=0
+    case "$UNIT_STATE" in
+        absent)
+            if [[ -e "$UNIT_FILE" || -L "$UNIT_FILE" ]]; then
+                UNIT_ROLLBACK_CONFLICT=1
+                return 1
+            fi
+            ;;
+        legacy-link)
+            [[ "$UNIT_LINK_TARGET" == "$BUILT_UNIT" ]] || return 1
+            if uninstall_unit_state_matches_capture; then
+                unit_reused=1
+            elif [[ ! -e "$UNIT_FILE" && ! -L "$UNIT_FILE" ]]; then
+                rm -f -- "$unit_tmp" || return 1
+                ln -sT -- "$UNIT_LINK_TARGET" "$unit_tmp" || return 1
+                [[ ! -e "$UNIT_FILE" && ! -L "$UNIT_FILE" ]] || { rm -f -- "$unit_tmp"; UNIT_ROLLBACK_CONFLICT=1; return 1; }
+                mv -Tn -- "$unit_tmp" "$UNIT_FILE" || { rm -f -- "$unit_tmp"; return 1; }
+                [[ ! -e "$unit_tmp" && ! -L "$unit_tmp" ]] || { rm -f -- "$unit_tmp"; UNIT_ROLLBACK_CONFLICT=1; return 1; }
+            else
+                UNIT_ROLLBACK_CONFLICT=1
+                return 1
+            fi
+            ;;
+        managed-file)
+            if uninstall_unit_state_matches_capture; then
+                unit_reused=1
+            elif [[ ! -e "$UNIT_FILE" && ! -L "$UNIT_FILE" ]]; then
+                [[ -f "$BACKUP_DIR/systemd-unit" ]] || return 1
+                restored_sha="$(sha256sum "$BACKUP_DIR/systemd-unit" | awk '{print $1}')"
+                [[ "$restored_sha" == "$UNIT_FILE_SHA256" ]] || return 1
+                rm -f -- "$unit_tmp" || return 1
+                install -o root -g root -m 0644 "$BACKUP_DIR/systemd-unit" "$unit_tmp" || return 1
+                [[ ! -e "$UNIT_FILE" && ! -L "$UNIT_FILE" ]] || { rm -f -- "$unit_tmp"; UNIT_ROLLBACK_CONFLICT=1; return 1; }
+                mv -Tn -- "$unit_tmp" "$UNIT_FILE" || { rm -f -- "$unit_tmp"; return 1; }
+                [[ ! -e "$unit_tmp" && ! -L "$unit_tmp" ]] || { rm -f -- "$unit_tmp"; UNIT_ROLLBACK_CONFLICT=1; return 1; }
+            else
+                UNIT_ROLLBACK_CONFLICT=1
+                return 1
+            fi
+            ;;
+        *) return 1 ;;
+    esac
+    if [[ "$unit_reused" -eq 1 ]]; then
+        log "reusing unchanged captured systemd unit during rollback"
     fi
+    systemctl daemon-reload || return 1
+    uninstall_unit_state_matches_capture || { UNIT_ROLLBACK_CONFLICT=1; return 1; }
+    unit_fragment_matches_state "$UNIT_STATE" || { UNIT_ROLLBACK_CONFLICT=1; return 1; }
     if [[ "$SERVICE_WAS_ENABLED" -eq 1 ]]; then
+        uninstall_service_control_gate || { UNIT_ROLLBACK_CONFLICT=1; return 1; }
         systemctl enable keepalived.service || rollback_status=1
     else
+        uninstall_service_control_gate || { UNIT_ROLLBACK_CONFLICT=1; return 1; }
         systemctl disable keepalived.service || rollback_status=1
+        restore_uninstall_disabled_legacy_link || return 1
     fi
+    uninstall_unit_state_matches_capture || { UNIT_ROLLBACK_CONFLICT=1; return 1; }
+    unit_fragment_matches_state "$UNIT_STATE" || { UNIT_ROLLBACK_CONFLICT=1; return 1; }
     if [[ "$SERVICE_WAS_ACTIVE" -eq 1 ]]; then
+        uninstall_service_control_gate || { UNIT_ROLLBACK_CONFLICT=1; return 1; }
         systemctl restart keepalived.service || rollback_status=1
     else
+        uninstall_service_control_gate || { UNIT_ROLLBACK_CONFLICT=1; return 1; }
         systemctl stop keepalived.service || rollback_status=1
     fi
+    verify_uninstall_service_state_restored || rollback_status=1
     return "$rollback_status"
+}
+
+verify_uninstall_service_state_restored() {
+    local active_now=0 enabled_now=0
+
+    systemctl is-active --quiet keepalived.service && active_now=1 || active_now=0
+    systemctl is-enabled --quiet keepalived.service && enabled_now=1 || enabled_now=0
+    [[ "$active_now" -eq "$SERVICE_WAS_ACTIVE" && "$enabled_now" -eq "$SERVICE_WAS_ENABLED" ]]
 }
 
 rollback_uninstall_transaction() {
@@ -506,20 +644,37 @@ preflight_uninstall_state() {
     [[ -d "$APP_ROOT" ]] || die "Keepalived installation root not found: $APP_ROOT"
     [[ "$(readlink -f -- "$APP_ROOT")" == "$APP_ROOT" ]] || die "refusing unexpected Keepalived installation path"
     mountpoint -q "$APP_ROOT" && die "refusing to uninstall a mounted application root"
-    validate_unit_ownership
+    capture_uninstall_unit_state
+    unit_fragment_matches_state "$UNIT_STATE" || die "keepalived.service FragmentPath does not match captured unit state: $UNIT_STATE"
     capture_uninstall_state
     preflight_firewall_state
     preflight_selinux_state
 }
 
 perform_uninstall_mutations() {
+    require_uninstall_unit_state_unchanged
     systemctl stop keepalived.service
     systemctl is-active --quiet keepalived.service && die "keepalived.service remained active after stop"
+    require_uninstall_unit_state_unchanged
     systemctl disable keepalived.service
-    if [[ -L "$UNIT_LINK" && "$(readlink -f -- "$UNIT_LINK")" == "$EXPECTED_UNIT" ]]; then
-        rm -f -- "$UNIT_LINK"
+    case "$UNIT_STATE" in
+        managed-file)
+            is_managed_unit_file "$UNIT_FILE" || die "keepalived.service changed before removal"
+            [[ "$(sha256sum "$UNIT_FILE" | awk '{print $1}')" == "$UNIT_FILE_SHA256" ]] || die "keepalived.service changed before removal"
+            ;;
+        legacy-link)
+            if [[ -e "$UNIT_FILE" || -L "$UNIT_FILE" ]]; then
+                [[ -L "$UNIT_FILE" && "$(readlink -f -- "$UNIT_FILE")" == "$BUILT_UNIT" ]] || die "keepalived.service changed before removal"
+            fi
+            ;;
+        absent) ;;
+        *) die "invalid captured keepalived.service state" ;;
+    esac
+    if [[ "$UNIT_STATE" != 'absent' && ( -e "$UNIT_FILE" || -L "$UNIT_FILE" ) ]]; then
+        rm -f -- "$UNIT_FILE"
     fi
     systemctl daemon-reload
+    unit_fragment_matches_state absent || die "keepalived.service FragmentPath remained loaded after unit removal"
     remove_owned_firewall_rule
     restore_selinux_mappings
     ROOT_MUTATION_STARTED=1

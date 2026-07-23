@@ -23,8 +23,8 @@ readonly HEALTH_URL_FILE="${APP_ROOT}/etc/keepalived/keepalived-health-url"
 readonly FIREWALL_RECORD="${APP_ROOT}/var/lib/aifar/firewall-rule"
 readonly SELINUX_RECORD="${APP_ROOT}/var/lib/aifar/keepalived-selinux-fcontexts"
 readonly BACKUP_ROOT="/aifar/backups"
-readonly UNIT_LINK="/etc/systemd/system/keepalived.service"
-readonly EXPECTED_UNIT="${APP_ROOT}/systemd/keepalived.service"
+readonly UNIT_FILE="/etc/systemd/system/keepalived.service"
+readonly BUILT_UNIT="${APP_ROOT}/systemd/keepalived.service"
 NODE_LOCAL_IP=""
 NODE_PEER_IP=""
 NODE_VIP_CIDR=""
@@ -38,8 +38,13 @@ TRANSACTION_ACTIVE=0
 APP_ROOT_EXISTED=0
 SERVICE_WAS_ACTIVE=0
 SERVICE_WAS_ENABLED=0
-UNIT_LINK_EXISTED=0
+UNIT_STATE='absent'
 UNIT_LINK_TARGET=''
+UNIT_FILE_SHA256=''
+UNIT_INSTALLED_SHA256=''
+UNIT_MUTATION_STARTED=0
+UNIT_INSTALLED=0
+UNIT_RESTORE_COMPLETE=0
 BACKUP_DIR=''
 
 log() {
@@ -185,41 +190,132 @@ context_type() {
 capture_service_state() {
     SERVICE_WAS_ACTIVE=0
     SERVICE_WAS_ENABLED=0
-    UNIT_LINK_EXISTED=0
-    UNIT_LINK_TARGET=''
     systemctl is-active --quiet keepalived.service && SERVICE_WAS_ACTIVE=1 || SERVICE_WAS_ACTIVE=0
     systemctl is-enabled --quiet keepalived.service && SERVICE_WAS_ENABLED=1 || SERVICE_WAS_ENABLED=0
-    if [[ -e "$UNIT_LINK" || -L "$UNIT_LINK" ]]; then
-        UNIT_LINK_EXISTED=1
-        UNIT_LINK_TARGET="$(readlink -f -- "$UNIT_LINK" 2>/dev/null || true)"
+    classify_unit_state
+}
+
+is_managed_unit_file() {
+    local file="$1"
+    [[ -f "$file" && ! -L "$file" ]] || return 1
+    awk -v executable="$APP_ROOT/sbin/keepalived" '
+        /^[[:space:]]*\[[^]]+\][[:space:]]*$/ {
+            section=$0
+            gsub(/^[[:space:]]*\[|\][[:space:]]*$/, "", section)
+            in_service=(section == "Service")
+            next
+        }
+        !in_service || /^[[:space:]]*[#;]/ { next }
+        /^[[:space:]]*ExecStart[[:space:]]*=/ {
+            line=$0
+            sub(/^[[:space:]]*ExecStart[[:space:]]*=[[:space:]]*/, "", line)
+            if (line ~ /^[[:space:]]*$/) next
+            split(line, fields, /[[:space:]]+/)
+            if (fields[1] != executable) invalid=1
+            else found=1
+        }
+        END { exit (found && !invalid ? 0 : 1) }
+    ' "$file"
+}
+
+unit_fragment_matches_state() {
+    local expected_state="$1" fragment='' fragment_target=''
+
+    fragment="$(systemctl show -p FragmentPath --value keepalived.service 2>/dev/null || true)"
+    case "$expected_state" in
+        absent)
+            [[ -z "$fragment" ]]
+            ;;
+        legacy-link)
+            [[ -n "$fragment" ]] || return 1
+            fragment_target="$(readlink -f -- "$fragment" 2>/dev/null || true)"
+            [[ "$fragment_target" == "$BUILT_UNIT" ]]
+            ;;
+        managed-file)
+            [[ -n "$fragment" ]] || return 1
+            fragment_target="$(readlink -f -- "$fragment" 2>/dev/null || true)"
+            [[ "$fragment_target" == "$UNIT_FILE" ]]
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+classify_unit_state() {
+    UNIT_STATE='absent'
+    UNIT_LINK_TARGET=''
+    UNIT_FILE_SHA256=''
+    if [[ -L "$UNIT_FILE" ]]; then
+        UNIT_LINK_TARGET="$(readlink -f -- "$UNIT_FILE" 2>/dev/null || true)"
+        [[ "$UNIT_LINK_TARGET" == "$BUILT_UNIT" ]] || die "系统 keepalived.service 不属于此安装：$UNIT_LINK_TARGET"
+        UNIT_STATE='legacy-link'
+    elif [[ -e "$UNIT_FILE" ]]; then
+        is_managed_unit_file "$UNIT_FILE" || die "系统 keepalived.service 不属于此安装：$UNIT_FILE"
+        UNIT_STATE='managed-file'
+        UNIT_FILE_SHA256="$(sha256sum "$UNIT_FILE" | awk '{print $1}')"
+    fi
+
+    unit_fragment_matches_state "$UNIT_STATE" || die "已加载的 keepalived.service FragmentPath 与当前 unit 状态不一致：$UNIT_STATE"
+}
+
+unit_state_matches_capture() {
+    local current_sha=''
+    case "$UNIT_STATE" in
+        absent)
+            [[ ! -e "$UNIT_FILE" && ! -L "$UNIT_FILE" ]]
+            ;;
+        legacy-link)
+            [[ -L "$UNIT_FILE" ]] || return 1
+            [[ "$(readlink -f -- "$UNIT_FILE" 2>/dev/null || true)" == "$UNIT_LINK_TARGET" ]]
+            ;;
+        managed-file)
+            [[ -f "$UNIT_FILE" && ! -L "$UNIT_FILE" ]] || return 1
+            current_sha="$(sha256sum "$UNIT_FILE" | awk '{print $1}')"
+            [[ "$current_sha" == "$UNIT_FILE_SHA256" ]]
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+installed_unit_matches_transaction() {
+    local current_sha=''
+
+    [[ "$UNIT_MUTATION_STARTED" -eq 1 ]] || return 1
+    is_managed_unit_file "$UNIT_FILE" || return 1
+    current_sha="$(sha256sum "$UNIT_FILE" | awk '{print $1}')"
+    [[ -n "$UNIT_INSTALLED_SHA256" && "$current_sha" == "$UNIT_INSTALLED_SHA256" ]]
+}
+
+rollback_unit_state_matches_phase() {
+    if [[ "$UNIT_RESTORE_COMPLETE" -eq 1 || "$UNIT_MUTATION_STARTED" -eq 0 ]]; then
+        unit_state_matches_capture
+    else
+        unit_state_matches_capture || installed_unit_matches_transaction
     fi
 }
 
-validate_unit_ownership() {
-    local unit_target=""
-    local fragment=""
-    local fragment_target=""
-
-    if [[ -e "$UNIT_LINK" || -L "$UNIT_LINK" ]]; then
-        unit_target="$(readlink -f -- "$UNIT_LINK" 2>/dev/null || true)"
-        [[ -n "$unit_target" ]] || die "无法解析现有 keepalived.service unit：$UNIT_LINK"
-        [[ "$unit_target" == "$EXPECTED_UNIT" ]] || die "系统 keepalived.service 不属于此安装：$unit_target"
+rollback_fragment_matches_phase() {
+    if unit_state_matches_capture; then
+        unit_fragment_matches_state "$UNIT_STATE"
+    elif installed_unit_matches_transaction; then
+        unit_fragment_matches_state managed-file || unit_fragment_matches_state "$UNIT_STATE"
+    else
+        return 1
     fi
+}
 
-    fragment="$(systemctl show -p FragmentPath --value keepalived.service 2>/dev/null || true)"
-    if [[ -n "$fragment" ]]; then
-        fragment_target="$(readlink -f -- "$fragment" 2>/dev/null || true)"
-        [[ -n "$fragment_target" ]] || die "无法解析已加载的 keepalived.service unit：$fragment"
-        [[ "$fragment_target" == "$EXPECTED_UNIT" ]] || die "已加载的 keepalived.service 不属于此安装：$fragment_target"
-    fi
+rollback_unit_control_gate() {
+    rollback_unit_state_matches_phase && rollback_fragment_matches_phase
 }
 
 create_install_backup() {
     local resolved_root=""
 
-    validate_unit_ownership
     TRANSACTION_ACTIVE=0
     APP_ROOT_EXISTED=0
+    UNIT_MUTATION_STARTED=0
+    UNIT_INSTALLED=0
+    UNIT_RESTORE_COMPLETE=0
+    UNIT_INSTALLED_SHA256=''
     if [[ -e "$APP_ROOT" || -L "$APP_ROOT" ]]; then
         resolved_root="$(readlink -f -- "$APP_ROOT" 2>/dev/null || true)"
         [[ "$resolved_root" == "/aifar/apps/keepalived" ]] || die "现有安装目录不是预期路径：$resolved_root"
@@ -234,8 +330,12 @@ create_install_backup() {
         APP_ROOT_EXISTED=1
         cp -a -- "$APP_ROOT" "$BACKUP_DIR/installed-root"
     fi
-    printf 'app_root_existed=%s\nservice_was_active=%s\nservice_was_enabled=%s\nunit_link_existed=%s\nunit_link_target=%s\n' \
-        "$APP_ROOT_EXISTED" "$SERVICE_WAS_ACTIVE" "$SERVICE_WAS_ENABLED" "$UNIT_LINK_EXISTED" "$UNIT_LINK_TARGET" \
+    if [[ "$UNIT_STATE" == 'managed-file' ]]; then
+        cp -a -- "$UNIT_FILE" "$BACKUP_DIR/systemd-unit"
+    fi
+    printf 'app_root_existed=%s\nservice_was_active=%s\nservice_was_enabled=%s\nunit_state=%s\nunit_link_target=%s\nunit_file_sha256=%s\n' \
+        "$APP_ROOT_EXISTED" "$SERVICE_WAS_ACTIVE" "$SERVICE_WAS_ENABLED" \
+        "$UNIT_STATE" "$UNIT_LINK_TARGET" "$UNIT_FILE_SHA256" \
         >"$BACKUP_DIR/install-state.txt"
     (cd "$BACKUP_DIR" && find . -type f ! -name BACKUP.sha256 -print0 | sort -z | xargs -0 sha256sum >BACKUP.sha256 && sha256sum --check BACKUP.sha256)
     TRANSACTION_ACTIVE=1
@@ -601,19 +701,84 @@ reconcile_firewall_rule() {
     mv -f -- "$record_tmp" "$FIREWALL_RECORD"
 }
 
+restore_install_unit_state() {
+    local current_sha='' unit_tmp="$UNIT_FILE.rollback.$$"
+
+    if unit_state_matches_capture; then
+        systemctl daemon-reload || return 1
+        unit_fragment_matches_state "$UNIT_STATE" || return 1
+        UNIT_RESTORE_COMPLETE=1
+        return 0
+    fi
+
+    installed_unit_matches_transaction || {
+        printf '[keepalived-installer] ERROR: unit 已在安装后被外部修改，回滚拒绝覆盖：%s\n' "$UNIT_FILE" >&2
+        return 1
+    }
+    rm -f -- "$unit_tmp" || return 1
+    case "$UNIT_STATE" in
+        absent)
+            installed_unit_matches_transaction || return 1
+            rm -f -- "$UNIT_FILE" || return 1
+            ;;
+        legacy-link)
+            [[ "$UNIT_LINK_TARGET" == "$BUILT_UNIT" ]] || return 1
+            ln -sT -- "$UNIT_LINK_TARGET" "$unit_tmp" || return 1
+            installed_unit_matches_transaction || { rm -f -- "$unit_tmp"; return 1; }
+            mv -Tf -- "$unit_tmp" "$UNIT_FILE" || { rm -f -- "$unit_tmp"; return 1; }
+            ;;
+        managed-file)
+            [[ -f "$BACKUP_DIR/systemd-unit" ]] || return 1
+            current_sha="$(sha256sum "$BACKUP_DIR/systemd-unit" | awk '{print $1}')"
+            [[ "$current_sha" == "$UNIT_FILE_SHA256" ]] || return 1
+            install -o root -g root -m 0644 "$BACKUP_DIR/systemd-unit" "$unit_tmp" || return 1
+            installed_unit_matches_transaction || { rm -f -- "$unit_tmp"; return 1; }
+            mv -Tf -- "$unit_tmp" "$UNIT_FILE" || { rm -f -- "$unit_tmp"; return 1; }
+            ;;
+        *) return 1 ;;
+    esac
+    systemctl daemon-reload || return 1
+    unit_state_matches_capture || {
+        printf '[keepalived-installer] ERROR: 原 systemd unit 恢复后校验失败：%s\n' "$UNIT_FILE" >&2
+        return 1
+    }
+    unit_fragment_matches_state "$UNIT_STATE" || return 1
+    UNIT_RESTORE_COMPLETE=1
+}
+
+restore_install_disabled_legacy_link() {
+    [[ "$UNIT_STATE" == 'legacy-link' ]] || return 0
+    unit_state_matches_capture && return 0
+
+    if [[ -e "$UNIT_FILE" || -L "$UNIT_FILE" ]]; then
+        printf '[keepalived-installer] ERROR: disabled legacy unit link was replaced externally; rollback refuses to overwrite: %s\n' "$UNIT_FILE" >&2
+        return 1
+    fi
+    [[ "$UNIT_LINK_TARGET" == "$BUILT_UNIT" ]] || return 1
+    ln -sT -- "$UNIT_LINK_TARGET" "$UNIT_FILE" || return 1
+    systemctl daemon-reload || return 1
+    unit_state_matches_capture || {
+        printf '[keepalived-installer] ERROR: disabled legacy unit link failed exact rollback validation: %s\n' "$UNIT_FILE" >&2
+        return 1
+    }
+}
+
 rollback_install_transaction() {
     local rollback_status=0
     local root_restore_allowed=1
-    local current_unit_target=""
-    local current_unit_value=""
+    local unit_restore_allowed=1
 
     log "安装事务失败，正在恢复安装前状态"
     rollback_firewall_journal || rollback_status=1
     rollback_selinux_journal || rollback_status=1
-    ensure_keepalived_inactive || {
+    if ! rollback_unit_control_gate; then
+        printf '[keepalived-installer] ERROR: systemd unit 在回滚前被外部修改，拒绝控制或覆盖：%s\n' "$UNIT_FILE" >&2
+        rollback_status=1
+        unit_restore_allowed=0
+    elif ! ensure_keepalived_inactive; then
         printf '[keepalived-installer] ERROR: 回滚时停止 keepalived.service 失败\n' >&2
         rollback_status=1
-    }
+    fi
 
     if [[ "$APP_ROOT_EXISTED" -eq 1 ]]; then
         if [[ -z "$BACKUP_DIR" || "$BACKUP_DIR" != "$BACKUP_ROOT"/keepalived-update-* || ! -d "$BACKUP_DIR/installed-root" ]]; then
@@ -640,51 +805,53 @@ rollback_install_transaction() {
         }
     fi
 
-    systemctl daemon-reload || {
-        printf '[keepalived-installer] ERROR: 回滚时 systemd daemon-reload 失败\n' >&2
-        rollback_status=1
-    }
-    if [[ "$SERVICE_WAS_ENABLED" -eq 1 ]]; then
-        systemctl enable keepalived.service || rollback_status=1
-    else
-        systemctl disable keepalived.service || rollback_status=1
-    fi
-    if [[ "$SERVICE_WAS_ACTIVE" -eq 1 ]]; then
-        systemctl restart keepalived.service || rollback_status=1
-    else
-        ensure_keepalived_inactive || rollback_status=1
+    if [[ "$unit_restore_allowed" -eq 1 ]]; then
+        restore_install_unit_state || {
+            printf '[keepalived-installer] ERROR: 回滚时恢复原 systemd unit 失败\n' >&2
+            rollback_status=1
+            unit_restore_allowed=0
+        }
     fi
 
-    if [[ -e "$UNIT_LINK" || -L "$UNIT_LINK" ]]; then
-        current_unit_target="$(readlink -f -- "$UNIT_LINK" 2>/dev/null || true)"
-        current_unit_value="$(readlink -- "$UNIT_LINK" 2>/dev/null || true)"
-        if [[ "$current_unit_target" == "$EXPECTED_UNIT" || "$current_unit_value" == "$EXPECTED_UNIT" ]]; then
-            rm -f -- "$UNIT_LINK" || {
-                printf '[keepalived-installer] ERROR: 回滚时删除事务 unit 链接失败：%s\n' "$UNIT_LINK" >&2
-                rollback_status=1
-            }
-        else
-            printf '[keepalived-installer] ERROR: unit 链接已被外部修改，回滚拒绝覆盖：%s\n' "$UNIT_LINK" >&2
+    if [[ "$unit_restore_allowed" -eq 1 ]]; then
+        if ! rollback_unit_control_gate; then
+            printf '[keepalived-installer] ERROR: systemd unit 在服务状态恢复前被外部修改：%s\n' "$UNIT_FILE" >&2
             rollback_status=1
+            unit_restore_allowed=0
+        elif [[ "$SERVICE_WAS_ENABLED" -eq 1 ]]; then
+            systemctl enable keepalived.service || rollback_status=1
+        else
+            systemctl disable keepalived.service || rollback_status=1
+            restore_install_disabled_legacy_link || {
+                rollback_status=1
+                unit_restore_allowed=0
+            }
         fi
     fi
-    if [[ "$UNIT_LINK_EXISTED" -eq 1 && ! -e "$UNIT_LINK" && ! -L "$UNIT_LINK" ]]; then
-        if [[ -n "$UNIT_LINK_TARGET" && "$UNIT_LINK_TARGET" == "$EXPECTED_UNIT" ]]; then
-            ln -s -- "$UNIT_LINK_TARGET" "$UNIT_LINK" || {
-                printf '[keepalived-installer] ERROR: 回滚时恢复原 unit 链接失败：%s\n' "$UNIT_LINK" >&2
-                rollback_status=1
-            }
-        else
-            printf '[keepalived-installer] ERROR: 原 unit 链接记录无效，无法恢复：%s\n' "$UNIT_LINK_TARGET" >&2
+    if [[ "$unit_restore_allowed" -eq 1 ]]; then
+        if ! rollback_unit_control_gate; then
+            printf '[keepalived-installer] ERROR: systemd unit 在服务运行状态恢复前被外部修改：%s\n' "$UNIT_FILE" >&2
             rollback_status=1
+        elif [[ "$SERVICE_WAS_ACTIVE" -eq 1 ]]; then
+            systemctl restart keepalived.service || rollback_status=1
+        else
+            ensure_keepalived_inactive || rollback_status=1
         fi
     fi
-    systemctl daemon-reload || {
-        printf '[keepalived-installer] ERROR: 回滚恢复 unit 链接后 systemd daemon-reload 失败\n' >&2
-        rollback_status=1
-    }
+
+    if [[ "$unit_restore_allowed" -eq 1 ]]; then
+        verify_service_state_restored || rollback_status=1
+    fi
 
     return "$rollback_status"
+}
+
+verify_service_state_restored() {
+    local active_now=0 enabled_now=0
+
+    systemctl is-active --quiet keepalived.service && active_now=1 || active_now=0
+    systemctl is-enabled --quiet keepalived.service && enabled_now=1 || enabled_now=0
+    [[ "$active_now" -eq "$SERVICE_WAS_ACTIVE" && "$enabled_now" -eq "$SERVICE_WAS_ENABLED" ]]
 }
 
 ensure_keepalived_inactive() {
@@ -692,6 +859,10 @@ ensure_keepalived_inactive() {
     local service_status=0
 
     if service_state="$(systemctl is-active keepalived.service 2>/dev/null)"; then
+        rollback_unit_control_gate || {
+            printf '[keepalived-installer] ERROR: systemd unit 在停止服务前被外部修改：%s\n' "$UNIT_FILE" >&2
+            return 1
+        }
         systemctl stop keepalived.service
         return
     else
@@ -913,29 +1084,81 @@ build_and_install_keepalived() {
         "$APP_ROOT/var"
 }
 
-register_systemd_unit() {
-    local unit_source="$EXPECTED_UNIT"
-    local existing_fragment=""
-    local resolved_fragment=""
+render_systemd_unit() {
+    local source="$1" output="$2"
+    awk -v mount_path="$APP_ROOT" -v mount_line="RequiresMountsFor=$APP_ROOT" '
+        BEGIN { in_unit=0; saw_unit=0; emitted_mount=0 }
+        /^\[Unit\]$/ { saw_unit=1; in_unit=1; print; next }
+        in_unit && /^RequiresMountsFor=/ {
+            line=$0
+            sub(/^RequiresMountsFor=[[:space:]]*/, "", line)
+            count=split(line, paths, /[[:space:]]+/)
+            kept=""
+            for (i=1; i<=count; i++) {
+                if (paths[i] == "" || paths[i] == mount_path) continue
+                kept=(kept == "" ? paths[i] : kept " " paths[i])
+            }
+            if (kept != "") print "RequiresMountsFor=" kept
+            next
+        }
+        in_unit && /^\[/ {
+            if (!emitted_mount) { print mount_line; emitted_mount=1 }
+            in_unit=0
+        }
+        { print }
+        END {
+            if (in_unit && !emitted_mount) print mount_line
+            if (!saw_unit) exit 42
+        }
+    ' "$source" >"$output" || die "无法生成直接 systemd unit"
+}
 
-    [[ -f "$unit_source" ]] || die "未生成 systemd 单元：$unit_source"
+verify_systemd_unit_selinux_type() {
+    local mode=''
+    local expected_output='' expected_context='' expected_type=''
+    local actual_context='' actual_type=''
 
-    if [[ -e "$UNIT_LINK" || -L "$UNIT_LINK" ]]; then
-        resolved_fragment="$(readlink -f -- "$UNIT_LINK" 2>/dev/null || true)"
-        if [[ "$resolved_fragment" != "$unit_source" ]]; then
-            die "系统已存在其他 Keepalived unit：$UNIT_LINK；为避免覆盖，本次安装已停止"
-        fi
-    else
-        existing_fragment="$(systemctl show -p FragmentPath --value keepalived.service 2>/dev/null || true)"
-        if [[ -n "$existing_fragment" ]]; then
-            resolved_fragment="$(readlink -f -- "$existing_fragment" 2>/dev/null || true)"
-            if [[ "$resolved_fragment" != "$unit_source" ]]; then
-                die "系统已加载其他 Keepalived unit：$existing_fragment；为避免覆盖，本次安装已停止"
-            fi
-        fi
-        systemctl link "$unit_source"
+    command -v getenforce >/dev/null 2>&1 || return 0
+    mode="$(getenforce 2>/dev/null)" || die "无法读取 SELinux 状态"
+    [[ "$mode" != 'Disabled' ]] || return 0
+
+    require_command restorecon
+    require_command matchpathcon
+    restorecon -F "$UNIT_FILE"
+
+    expected_output="$(matchpathcon -n "$UNIT_FILE" 2>/dev/null)" || die "发行版 SELinux 策略没有 systemd unit 参考标签：$UNIT_FILE"
+    expected_output="${expected_output##*$'\n'}"
+    expected_context="${expected_output##* }"
+    expected_type="$(context_type "$expected_context")" || die "无法解析 systemd unit 参考 SELinux 类型：$UNIT_FILE"
+    actual_context="$(stat -c '%C' -- "$UNIT_FILE")" || die "无法读取 systemd unit SELinux 标签：$UNIT_FILE"
+    actual_type="$(context_type "$actual_context")" || die "无法解析 systemd unit SELinux 类型：$UNIT_FILE"
+    [[ "$actual_type" == "$expected_type" ]] || die "systemd unit SELinux type 不符合发行版策略：期望 $expected_type，实际 $actual_type"
+}
+
+install_systemd_unit() {
+    local rendered_unit="$WORK_DIR/keepalived.service"
+    local unit_tmp="$UNIT_FILE.tmp.$$"
+
+    is_managed_unit_file "$BUILT_UNIT" || die "生成的 systemd unit 未引用精确的自定义 Keepalived 可执行文件"
+    render_systemd_unit "$BUILT_UNIT" "$rendered_unit"
+    grep -Fxq "RequiresMountsFor=$APP_ROOT" "$rendered_unit" || die "systemd unit 缺少安装目录挂载依赖"
+    is_managed_unit_file "$rendered_unit" || die "渲染后的 systemd unit 未引用精确的自定义 Keepalived 可执行文件"
+    install -d -o root -g root -m 0755 "$(dirname -- "$UNIT_FILE")"
+    install -o root -g root -m 0644 "$rendered_unit" "$unit_tmp"
+    UNIT_INSTALLED_SHA256="$(sha256sum "$unit_tmp" | awk '{print $1}')"
+    if ! unit_state_matches_capture; then
+        rm -f -- "$unit_tmp"
+        die "keepalived.service 在安装期间被外部修改，拒绝覆盖"
     fi
-
+    UNIT_MUTATION_STARTED=1
+    mv -Tf -- "$unit_tmp" "$UNIT_FILE" || {
+        rm -f -- "$unit_tmp"
+        die "无法原子安装 keepalived.service"
+    }
+    UNIT_INSTALLED=1
+    [[ -f "$UNIT_FILE" && ! -L "$UNIT_FILE" ]] || die "keepalived.service 必须安装为普通文件：$UNIT_FILE"
+    [[ "$(sha256sum "$UNIT_FILE" | awk '{print $1}')" == "$UNIT_INSTALLED_SHA256" ]] || die "原子安装后的 keepalived.service 校验失败"
+    verify_systemd_unit_selinux_type
     systemctl daemon-reload
 }
 
@@ -984,12 +1207,16 @@ configure_selinux_if_enabled() {
 
 activate_keepalived() {
     systemctl daemon-reload
+    installed_unit_matches_transaction || die "keepalived.service 在激活前被外部修改"
+    unit_fragment_matches_state managed-file || die "keepalived.service FragmentPath 未加载直接 unit"
     systemctl enable keepalived.service
+    installed_unit_matches_transaction && unit_fragment_matches_state managed-file || die "keepalived.service 在启用后被外部修改"
     if [[ "$SERVICE_WAS_ACTIVE" -eq 1 ]]; then
         systemctl restart keepalived.service
     else
         systemctl start keepalived.service
     fi
+    installed_unit_matches_transaction && unit_fragment_matches_state managed-file || die "keepalived.service 在启动后被外部修改"
     systemctl is-active --quiet keepalived.service || die "keepalived.service 启动失败"
     if [[ "$HEALTH_CHECK_ENABLED" -eq 1 ]] && ! "$APP_ROOT/libexec/check-aggregate-health.sh"; then
         log "WARNING: 健康检查当前不可用；服务保持 active，VRRP 实例将保持 FAULT"
@@ -998,7 +1225,7 @@ activate_keepalived() {
 
 verify_installation() {
     local binary="$APP_ROOT/sbin/keepalived"
-    local unit_file="$APP_ROOT/systemd/keepalived.service"
+    local unit_file="$UNIT_FILE"
     local ldd_output
 
     [[ -x "$binary" ]] || die "Keepalived 二进制不存在或不可执行：$binary"
@@ -1010,7 +1237,9 @@ verify_installation() {
         die "Keepalived 存在未解析的动态库依赖"
     fi
 
-    grep -Fq "ExecStart=$APP_ROOT/sbin/keepalived" "$unit_file" || die "systemd unit 未引用自定义安装目录"
+    [[ -f "$unit_file" && ! -L "$unit_file" ]] || die "systemd unit 不是普通文件：$unit_file"
+    is_managed_unit_file "$unit_file" || die "systemd unit 未引用精确的自定义 Keepalived 可执行文件"
+    grep -Fxq "RequiresMountsFor=$APP_ROOT" "$unit_file" || die "systemd unit 缺少安装目录挂载依赖"
     if [[ "$HEALTH_CHECK_ENABLED" -eq 1 ]]; then
         [[ -x "$APP_ROOT/libexec/check-aggregate-health.sh" ]] || die "健康检查脚本不存在或不可执行"
         [[ -f "$HEALTH_URL_FILE" && ! -L "$HEALTH_URL_FILE" ]] || die "健康 URL 文件不存在或类型无效"
@@ -1064,7 +1293,7 @@ main() {
     install_build_dependencies
     verify_source_archive_contents
     build_and_install_keepalived
-    register_systemd_unit
+    install_systemd_unit
     install_managed_configuration "$WORK_DIR/keepalived.conf"
     reconcile_firewall_rule
     configure_selinux_if_enabled

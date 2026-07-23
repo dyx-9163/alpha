@@ -64,6 +64,10 @@ bash install-keepalived-offline.sh
 
 普通用户运行时脚本会通过 `sudo` 重新执行。安装器会严格校验节点配置和固定源码包，生成正式配置；仅在配置健康 URL 时安装健康检查脚本。随后配置精确的 VRRP 防火墙规则和 SELinux 标签，并启用、启动 `keepalived.service`。
 
+安装器仍将 Keepalived 本体安装到 `/aifar/apps/keepalived`，但 systemd 实际加载的 `/etc/systemd/system/keepalived.service` 是 `root:root`、`0644` 的普通文件，不是指向安装树的软链接。该 unit 包含 `RequiresMountsFor=/aifar/apps/keepalived`，因此安装树位于独立挂载时，systemd 会先等待挂载可用。安装和更新会执行 `systemctl daemon-reload` 后启用服务；正常服务器重启无需人工执行 `daemon-reload`。
+
+重复安装会将旧版 AIFAR unit 软链接迁移为普通文件。安装器不会覆盖第三方 Keepalived unit；若现有 unit 不属于本安装，会在变更前停止。
+
 安装器只使用服务器当前已经配置好的离线 DNF 仓库，不添加或访问公网仓库。请先确认挂载的 openEuler ISO 仓库可被 `dnf` 直接使用。
 
 ## 3. 检查状态和 VIP
@@ -75,6 +79,10 @@ systemctl status keepalived
 journalctl -u keepalived
 ip addr show dev ens160
 firewall-cmd --list-rich-rules
+test -f /etc/systemd/system/keepalived.service
+test ! -L /etc/systemd/system/keepalived.service
+systemctl show keepalived.service -p LoadState -p ActiveState -p UnitFileState -p FragmentPath --no-pager
+grep -E '^(RequiresMountsFor|ExecStart)=' /etc/systemd/system/keepalived.service
 ```
 
 两端健康接口都正常时，`192.168.74.130/24` 只应出现在优先级更高的 132 节点。firewalld 运行时，安装器仅允许配置的对端 `/32` 访问 VRRP IP protocol 112（协议 112），不会开放整个网段。
@@ -128,6 +136,6 @@ bash configure-selinux.sh
 bash uninstall-keepalived.sh
 ```
 
-卸载器先把配置、`libexec` 健康脚本、systemd unit、SELinux 所有权记录和防火墙所有权记录备份到 `/aifar/backups/keepalived-<UTC时间戳>/` 并复验校验和，之后才停止服务和删除安装目录。
+卸载器先把直接 unit 连同安装树、配置、`libexec` 健康脚本、SELinux 所有权记录和防火墙所有权记录备份到 `/aifar/backups/keepalived-<UTC时间戳>/` 并复验校验和，之后才停止、禁用并删除本模块拥有的 unit 和安装目录。卸载回滚会恢复原 unit 文件内容或旧版软链接。
 
 卸载只删除记录中由本安装创建且当前仍完全匹配的 peer `/32` 协议 112 规则，不会删除预存或不属于本安装的防火墙规则。它不会删除共享 RPM 依赖，也不会删除任何备份；无法证明归属或发现外部修改时会停止并保留恢复路径。
