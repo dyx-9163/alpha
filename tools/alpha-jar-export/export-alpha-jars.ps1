@@ -1,3 +1,4 @@
+# Copies Alpha runnable JARs into AIFAR Runtime resource targets.
 [CmdletBinding()]
 param(
   [string]$SourceRoot = "D:\workspace\alpha\backend\alpha-java-cloud",
@@ -117,7 +118,8 @@ if (-not (Test-Path -LiteralPath $SourceRoot -PathType Container)) {
 $sourceFull = Resolve-FullPath $SourceRoot
 if ([string]::IsNullOrWhiteSpace($TargetRoot)) {
   $scriptRoot = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
-  $TargetRoot = Join-Path (Split-Path -Parent $scriptRoot) "resources\aifar\runtime-v2\services"
+  $repositoryRoot = [System.IO.Path]::GetFullPath((Join-Path $scriptRoot '..\..'))
+  $TargetRoot = Join-Path $repositoryRoot "resources\aifar\runtime-v2\services"
 }
 $targetFull = [System.IO.Path]::GetFullPath($TargetRoot)
 New-Item -ItemType Directory -Force -Path $targetFull | Out-Null

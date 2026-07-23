@@ -6,6 +6,7 @@ vi.mock('../../i18n', () => ({
   getCurrentLocale: getCurrentLocaleMock
 }))
 
+import { messages } from '../../i18n/messages'
 import {
   aifarArtifactAccept,
   aifarArtifactHintKey,
@@ -64,6 +65,13 @@ describe('runtime artifact rules', () => {
   beforeEach(() => {
     getCurrentLocaleMock.mockReset()
     getCurrentLocaleMock.mockReturnValue('zh')
+  })
+
+  it('directs bundle uploads to the Bundle Packager output', () => {
+    expect(messages.zh['apps.aifarUpdateBundleHint']).toContain('AIFARBundlePackager.exe')
+    expect(messages.en['apps.aifarUpdateBundleHint']).toContain('AIFARBundlePackager.exe')
+    expect(String(messages.zh['apps.aifarUpdateBundleHint'])).not.toContain('export-alpha-jars')
+    expect(String(messages.en['apps.aifarUpdateBundleHint'])).not.toContain('export-alpha-jars')
   })
 
   it.each([
