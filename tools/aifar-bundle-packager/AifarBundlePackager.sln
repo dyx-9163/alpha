@@ -11,6 +11,8 @@ Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "tests", "tests", "{A5A604E3
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AifarBundlePackager.Tests", "tests\AifarBundlePackager.Tests\AifarBundlePackager.Tests.csproj", "{61239C9A-0F75-425A-83C6-CE1499A1BAB5}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AifarBundlePackager.WinForms", "src\AifarBundlePackager.WinForms\AifarBundlePackager.WinForms.csproj", "{EC15432D-DA45-4FC2-9054-596082777A2B}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -28,9 +30,14 @@ Global
 		{61239C9A-0F75-425A-83C6-CE1499A1BAB5}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{61239C9A-0F75-425A-83C6-CE1499A1BAB5}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{61239C9A-0F75-425A-83C6-CE1499A1BAB5}.Release|Any CPU.Build.0 = Release|Any CPU
+		{EC15432D-DA45-4FC2-9054-596082777A2B}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{EC15432D-DA45-4FC2-9054-596082777A2B}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{EC15432D-DA45-4FC2-9054-596082777A2B}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{EC15432D-DA45-4FC2-9054-596082777A2B}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(NestedProjects) = preSolution
 		{A76F41EF-7102-42D6-AD2E-58B1C2291A9C} = {8E0D9DEB-F226-4580-99FC-EE914028814F}
 		{61239C9A-0F75-425A-83C6-CE1499A1BAB5} = {A5A604E3-94C9-4AE9-858F-FB002D1B158E}
+		{EC15432D-DA45-4FC2-9054-596082777A2B} = {8E0D9DEB-F226-4580-99FC-EE914028814F}
 	EndGlobalSection
 EndGlobal
