@@ -33,3 +33,15 @@ tools\aifar-bundle-packager\cli\package-aifar-artifact-bundle.cmd gateway,im,mee
 pnpm test:tools
 D:\tools\dotnet\dotnet.exe test tools/aifar-bundle-packager/AifarBundlePackager.sln --configuration Release
 ```
+
+## GitHub Release
+
+推送形如 `aifar-bundle-packager-vX.Y.Z` 的已存在标签后，Windows CI 会从该标签对应的提交重新测试和构建，并创建 Draft Release。Draft 只包含以下三个资产：
+
+- `AIFARBundlePackager.exe`
+- `AIFARBundlePackager.exe.sha256`
+- `release-manifest.json`
+
+Draft Release 不是最终发布。发布前需下载并复核校验和与 manifest，并在未安装 .NET Runtime 的 Windows x64 环境完成启动、Java-only、Web-only 和 mixed 三类验收。
+
+生成的 EXE is not stored in Git；`deploy/bin/AIFARBundlePackager.exe` 仅用于本地构建和烟测，正式交付以通过人工验收后发布的 GitHub Release 资产为准。

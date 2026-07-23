@@ -8,6 +8,21 @@
 
 **Tech Stack:** C# 12, .NET 8, WinForms, `System.IO.Compression`, `System.Text.Json`, `System.Security.Cryptography`, xUnit.
 
+## Implementation Status and Evidence
+
+This section is the authoritative current status. The unchecked boxes below are the original execution script and are retained as historical intent; they do not mean the feature is unfinished. Historical RED output was not persisted independently, so this closeout records the committed test-first implementation and repeatable green verification without inventing missing logs.
+
+| Task | Status | Implementation commit | Current evidence |
+| --- | --- | --- | --- |
+| 1 | Complete | `f8f18ffc` | Core models, fixed service catalog, and catalog tests are present. |
+| 2 | Complete | `9633dae3` | Runnable-JAR discovery and exclusion/error tests are present. |
+| 3 | Complete | `c3499664` | Transactional bundle generation, protocol, hash, ZIP, replacement, and cleanup tests are present. |
+| 4 | Complete | `1c2e37b6` | WinForms state, native selectors, asynchronous progress, and UI-state tests are present. |
+| 5 | Complete | `a49316be` | `tools/aifar-bundle-packager/build.ps1` publishes one self-contained `win-x64` EXE. |
+| 6 | Complete | `17b8de49` | Protocol-parity fixtures, GUI smoke validation, and CI gates are present. |
+
+Current repeatable verification is `D:\tools\dotnet\dotnet.exe test tools/aifar-bundle-packager/AifarBundlePackager.sln --configuration Release` (36/36) plus `pnpm test:tools`. Release publication is governed separately by the 2026-07-24 release-closeout plan.
+
 ## Global Constraints
 
 - Target `net8.0` for Core and tests and `net8.0-windows` for WinForms; publish only `win-x64`.
@@ -40,7 +55,7 @@
 - `tools/aifar-bundle-packager/tests/AifarBundlePackager.Tests/JarLocatorTests.cs`: unique candidate and exclusion tests.
 - `tools/aifar-bundle-packager/tests/AifarBundlePackager.Tests/BundlePackagerTests.cs`: manifest, hashes, inner/outer ZIP, failure, replacement, and cleanup tests.
 - `tools/aifar-bundle-packager/tests/AifarBundlePackager.Tests/PackagingFormStateTests.cs`: mandatory manual-path and button-state tests.
-- `scripts/build-aifar-bundle-packager.ps1`: restore, test, publish, and copy exactly one deliverable EXE to `deploy/bin/AIFARBundlePackager.exe`.
+- `tools/aifar-bundle-packager/build.ps1`: restore, test, publish, and copy exactly one deliverable EXE to `deploy/bin/AIFARBundlePackager.exe`.
 
 ---
 
@@ -305,7 +320,7 @@ Expected: all tests PASS and all three projects build in Release.
 
 **Files:**
 - Modify: `tools/aifar-bundle-packager/src/AifarBundlePackager.WinForms/AifarBundlePackager.WinForms.csproj`
-- Create: `scripts/build-aifar-bundle-packager.ps1`
+- Create: `tools/aifar-bundle-packager/build.ps1`
 
 **Interfaces:**
 - Consumes: the solution and WinForms project.
@@ -331,7 +346,7 @@ The script accepts an optional `DotNetPath`, defaults to `D:\tools\dotnet\dotnet
 - [ ] **Step 3: Publish and verify the artifact shape**
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/build-aifar-bundle-packager.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File tools/aifar-bundle-packager/build.ps1
 Get-ChildItem deploy/bin/AIFARBundlePackager.exe | Select-Object FullName,Length
 ```
 
@@ -340,7 +355,7 @@ Expected: tests PASS, publish succeeds, the EXE exists and has non-zero length, 
 - [ ] **Step 4: Commit**
 
 ```powershell
-git add tools/aifar-bundle-packager/src/AifarBundlePackager.WinForms/AifarBundlePackager.WinForms.csproj scripts/build-aifar-bundle-packager.ps1
+git add tools/aifar-bundle-packager/src/AifarBundlePackager.WinForms/AifarBundlePackager.WinForms.csproj tools/aifar-bundle-packager/build.ps1
 git commit -m "build(packager): publish self-contained Windows executable"
 ```
 
@@ -357,7 +372,7 @@ git commit -m "build(packager): publish self-contained Windows executable"
 
 ```powershell
 D:\tools\dotnet\dotnet.exe test tools/aifar-bundle-packager/AifarBundlePackager.sln -c Release
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/build-aifar-bundle-packager.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File tools/aifar-bundle-packager/build.ps1
 git diff --check
 ```
 
@@ -378,7 +393,7 @@ Select all ten services and repeat manifest and archive validation. If local dis
 - [ ] **Step 5: Final commit if acceptance required fixes**
 
 ```powershell
-git add tools/aifar-bundle-packager scripts/build-aifar-bundle-packager.ps1
+git add tools/aifar-bundle-packager
 git commit -m "fix(packager): address acceptance findings"
 ```
 

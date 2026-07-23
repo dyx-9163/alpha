@@ -8,6 +8,18 @@
 
 **Tech Stack:** C# 12, .NET 8, WinForms, xUnit, PowerShell single-file publishing.
 
+## Implementation Status and Evidence
+
+This section is the authoritative current status. The unchecked boxes below are the original execution script and are retained as historical intent; they do not mean the feature is unfinished. Historical RED output was not persisted independently, so this closeout records the committed test-first implementation and repeatable green verification without inventing missing logs.
+
+| Task | Status | Implementation commit | Current evidence |
+| --- | --- | --- | --- |
+| 1 | Complete | `25414177` | `PackagingFormState` computes Java/Web requirements from the selected service categories, with Java-only, Web-only, mixed, and empty-selection tests. |
+| 2 | Complete | `8945d47f` | Core validation independently ignores unused source paths and rejects missing required sources. |
+| 3 | Complete | `a993bd40` | WinForms requirement hints and the self-contained EXE were rebuilt and smoke-tested. |
+
+Current repeatable verification is `D:\tools\dotnet\dotnet.exe test tools/aifar-bundle-packager/AifarBundlePackager.sln --configuration Release` (36/36) plus `pnpm test:tools`.
+
 ## Global Constraints
 
 - `web-vue3` is the only Web service; every other catalog entry is a Java service.
