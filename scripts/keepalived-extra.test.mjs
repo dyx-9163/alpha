@@ -90,7 +90,7 @@ test('installer verifies source and requires managed configuration before build'
     'create_install_backup',
     'install_build_dependencies',
     'build_and_install_keepalived',
-    'register_systemd_unit',
+    'install_systemd_unit',
     'install_managed_configuration',
     'configure_selinux_if_enabled',
     'activate_keepalived',
@@ -106,7 +106,35 @@ test('installer verifies source and requires managed configuration before build'
   assert.match(installer, /readlink -f -- "\$APP_ROOT"/)
   assert.match(installer, /mountpoint -q "\$APP_ROOT"/)
   assert.match(installer, /rm -rf -- "\$APP_ROOT"/)
-  assert.match(installer, /ln -s -- "\$UNIT_LINK_TARGET" "\$UNIT_LINK"/)
+  assert.match(installer, /readonly UNIT_FILE="\/etc\/systemd\/system\/keepalived\.service"/)
+  assert.match(installer, /readonly BUILT_UNIT="\$\{APP_ROOT\}\/systemd\/keepalived\.service"/)
+  assert.match(installer, /RequiresMountsFor=\$APP_ROOT/)
+  assert.match(installer, /install -o root -g root -m 0644 "\$rendered_unit" "\$unit_tmp"/)
+  assert.match(installer, /mv -Tf -- "\$unit_tmp" "\$UNIT_FILE"/)
+  assert.match(installer, /UNIT_MUTATION_STARTED.*unit_state_matches_capture.*installed_unit_matches_transaction/s)
+  assert.match(installer, /ln -sT -- "\$UNIT_LINK_TARGET" "\$unit_tmp"/)
+  assert.match(installer, /install -o root -g root -m 0644 "\$BACKUP_DIR\/systemd-unit" "\$unit_tmp"/)
+  assert.match(installer, /verify_service_state_restored/)
+  assert.match(installer, /\[\[ -f "\$UNIT_FILE" && ! -L "\$UNIT_FILE" \]\]/)
+  assert.match(installer, /restorecon -F "\$UNIT_FILE"/)
+  assert.match(installer, /matchpathcon -n "\$UNIT_FILE"/)
+  assert.match(installer, /stat -c '%C' -- "\$UNIT_FILE"/)
+  assert.doesNotMatch(installer, /restorecon\s+-[^\n]*R[^\n]*\/etc\/systemd\/system/)
+  assert.doesNotMatch(installer, /systemctl link/)
+  const installStart = indexOfOrFail(installer, 'install_systemd_unit()')
+  const installEnd = indexOfOrFail(installer.slice(installStart), '\n}') + installStart
+  const installBody = installer.slice(installStart, installEnd)
+  assert.doesNotMatch(installBody, /ln -s/)
+  assert.doesNotMatch(installBody, /rm -f -- "\$UNIT_FILE"/)
+  const stagedUnit = indexOfOrFail(installBody, 'install -o root -g root -m 0644 "$rendered_unit" "$unit_tmp"')
+  const revalidation = indexOfOrFail(installBody, 'if ! unit_state_matches_capture; then')
+  const mutationPhase = indexOfOrFail(installBody, 'UNIT_MUTATION_STARTED=1')
+  const atomicMove = indexOfOrFail(installBody, 'mv -Tf -- "$unit_tmp" "$UNIT_FILE"')
+  assert.ok(stagedUnit < revalidation)
+  assert.ok(revalidation < mutationPhase)
+  assert.ok(mutationPhase < atomicMove)
+  const initialCommands = mainBody.match(/for command_name in ([^;]+); do/)?.[1] ?? ''
+  assert.match(initialCommands, /(?:^|\s)ln(?:\s|$)/)
   assert.match(installer, /mountpoint -q "\$WORK_DIR"/)
   assert.match(installer, /die "keepalived\.service 启动失败"/)
   assert.match(installer, /log "WARNING: 健康检查当前不可用；服务保持 active，VRRP 实例将保持 FAULT"/)
@@ -200,6 +228,15 @@ test('uninstaller verifies a backup before service changes and exact-path deleti
   assert.ok(indexOfOrFail(mutationBody, 'systemctl stop keepalived.service') < indexOfOrFail(mutationBody, 'safe_remove_uninstall_root'))
   assert.match(script, /preflight_selinux_state\(\)[\s\S]*validate_selinux_record_file "\$SELINUX_RECORD"/)
   assert.match(script, /rollback_uninstall_transaction\(\)/)
+  assert.match(script, /unit_state=\$UNIT_STATE/)
+  assert.match(script, /cp -a -- "\$UNIT_FILE" "\$BACKUP_DIR\/systemd-unit"/)
+  assert.match(script, /is_managed_unit_file "\$UNIT_FILE"/)
+  assert.match(script, /rm -f -- "\$UNIT_FILE"/)
+  assert.match(script, /ln -sT -- "\$UNIT_LINK_TARGET" "\$unit_tmp"/)
+  assert.match(script, /install -o root -g root -m 0644 "\$BACKUP_DIR\/systemd-unit" "\$unit_tmp"/)
+  assert.match(script, /mv -Tn -- "\$unit_tmp" "\$UNIT_FILE"/)
+  assert.match(script, /verify_uninstall_service_state_restored/)
+  assert.doesNotMatch(script, /UNIT_LINK_EXISTED/)
   assert.match(script, /readonly APP_ROOT="\/aifar\/apps\/keepalived"/)
   assert.match(script, /readlink -f -- "\$APP_ROOT"/)
   assert.match(script, /readonly BACKUP_ROOT="\/aifar\/backups"/)
@@ -252,4 +289,14 @@ test('README documents optional health mode and its VIP consequence', () => {
   assert.match(readme, /KEEPALIVED_HEALTH_URL=.*空值.*错误/s)
   assert.match(readme, /业务接口异常.*仍可能持有 VIP/s)
   assert.match(readme, /重复安装.*启用.*禁用.*事务/s)
+})
+
+test('README documents the direct Keepalived systemd unit and reboot behavior', () => {
+  const readme = read('README.md')
+  assert.match(readme, /\/etc\/systemd\/system\/keepalived\.service.*普通文件/s)
+  assert.match(readme, /RequiresMountsFor=\/aifar\/apps\/keepalived/)
+  assert.match(readme, /重启.*无需.*daemon-reload/s)
+  assert.match(readme, /旧版.*软链接.*迁移/s)
+  assert.match(readme, /卸载.*备份.*unit/s)
+  assert.doesNotMatch(readme, /systemctl link/)
 })

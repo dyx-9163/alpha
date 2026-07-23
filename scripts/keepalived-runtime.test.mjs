@@ -263,19 +263,152 @@ printf '%s\n' "\$HEALTH_CHECK_ENABLED"
 function writeInstallerFixture(fixture) {
   const appRoot = path.join(fixture, 'aifar', 'apps', 'keepalived')
   const backupRoot = path.join(fixture, 'aifar', 'backups')
-  const unitLink = path.join(fixture, 'etc', 'systemd', 'system', 'keepalived.service')
+  const unitFile = path.join(fixture, 'etc', 'systemd', 'system', 'keepalived.service')
   const fixtureInstallerPath = path.join(fixture, 'install-keepalived-offline.sh')
   let installer = readFileSync(installerPath, 'utf8')
   installer = installer
     .replaceAll('/aifar/apps/keepalived', toMsysPath(appRoot))
     .replaceAll('/aifar/backups', toMsysPath(backupRoot))
-    .replaceAll('/etc/systemd/system/keepalived.service', toMsysPath(unitLink))
+    .replaceAll('/etc/systemd/system/keepalived.service', toMsysPath(unitFile))
   writeFileSync(fixtureInstallerPath, installer)
   writeFileSync(
     path.join(fixture, 'check-aggregate-health.sh'),
     readFileSync(healthScriptPath, 'utf8')
   )
-  return { appRoot, backupRoot, fixtureInstallerPath, unitLink }
+  return { appRoot, backupRoot, fixtureInstallerPath, unitFile, unitLink: unitFile }
+}
+
+function runDirectUnitHarness(t, {
+  originalState,
+  action,
+  selinuxMode = 'no-tools',
+  builtUnitContents: builtUnitContentsOverride = ''
+}) {
+  const fixture = mkdtempSync(path.join(rootDir, '.aifar-keepalived-direct-unit-test-'))
+  t.after(() => rmSync(fixture, { force: true, recursive: true }))
+  const { appRoot, fixtureInstallerPath, unitFile } = writeInstallerFixture(fixture)
+  const builtUnit = path.join(appRoot, 'systemd', 'keepalived.service')
+  const foreignUnit = path.join(fixture, 'foreign', 'keepalived.service')
+  const harnessPath = path.join(fixture, 'harness.sh')
+  const callsPath = path.join(fixture, 'systemctl-calls')
+  const selinuxCallsPath = path.join(fixture, 'selinux-calls')
+  const originalUnitContents = '[Unit]\nDescription=original managed unit\n[Service]\nExecStart=' + toMsysPath(path.join(appRoot, 'sbin', 'keepalived')) + ' --original\n'
+  const builtUnitContents = builtUnitContentsOverride
+    ? builtUnitContentsOverride.replaceAll('/aifar/apps/keepalived', toMsysPath(appRoot))
+    : '[Unit]\nDescription=fixture\n[Service]\nExecStart=' + toMsysPath(path.join(appRoot, 'sbin', 'keepalived')) + '\n'
+  const managedExecutable = toMsysPath(path.join(appRoot, 'sbin', 'keepalived'))
+  mkdirSync(path.dirname(builtUnit), { recursive: true })
+  mkdirSync(path.dirname(foreignUnit), { recursive: true })
+  writeFileSync(builtUnit, builtUnitContents)
+  writeFileSync(foreignUnit, '[Unit]\nDescription=foreign fixture\n')
+  const originalSetup = {
+    absent: '',
+    'legacy-link': `ln -s -- '${toMsysPath(builtUnit)}' '${toMsysPath(unitFile)}'`,
+    'foreign-link': `ln -s -- '${toMsysPath(foreignUnit)}' '${toMsysPath(unitFile)}'`,
+    'managed-file': `printf '%s' '${originalUnitContents.replaceAll("'", "'\\''")}' >'${toMsysPath(unitFile)}'`,
+    'foreign-file': `printf '%s\\n' '[Unit]' 'Description=foreign fixture' >'${toMsysPath(unitFile)}'`,
+    'comment-file': `printf '%s\\n' '[Service]' '# ExecStart=${managedExecutable}' >'${toMsysPath(unitFile)}'`,
+    'pre-file': `printf '%s\\n' '[Service]' 'ExecStartPre=${managedExecutable}' 'ExecStart=/usr/bin/true' >'${toMsysPath(unitFile)}'`,
+    'wrapper-file': `printf '%s\\n' '[Service]' 'ExecStart=${managedExecutable}-wrapper' >'${toMsysPath(unitFile)}'`,
+    'unit-section-file': `printf '%s\\n' '[Unit]' 'ExecStart=${managedExecutable}' '[Service]' 'ExecStart=/usr/bin/true' >'${toMsysPath(unitFile)}'`,
+    'mixed-file': `printf '%s\\n' '[Service]' 'ExecStart=${managedExecutable}' 'ExecStart=/usr/bin/true' >'${toMsysPath(unitFile)}'`
+  }[originalState]
+  const selinuxFunctions = {
+    'no-tools': '',
+    disabled: `
+getenforce() { printf 'Disabled\\n'; }
+restorecon() { printf 'restorecon|%s\\n' "\$*" >>'${toMsysPath(selinuxCallsPath)}'; return 86; }
+matchpathcon() { printf 'matchpathcon|%s\\n' "\$*" >>'${toMsysPath(selinuxCallsPath)}'; return 87; }
+`,
+    'enabled-valid': `
+getenforce() { printf 'Enforcing\\n'; }
+restorecon() { printf 'restorecon|%s\\n' "\$*" >>'${toMsysPath(selinuxCallsPath)}'; }
+matchpathcon() {
+    printf 'matchpathcon|%s\\n' "\$*" >>'${toMsysPath(selinuxCallsPath)}'
+    printf 'system_u:object_r:systemd_unit_file_t:s0\\n'
+}
+stat() {
+    if [[ "\$1" == '-c' && "\$2" == '%C' ]]; then
+        printf 'system_u:object_r:systemd_unit_file_t:s0\\n'
+        return 0
+    fi
+    command stat "\$@"
+}
+`,
+    'enabled-invalid': `
+getenforce() { printf 'Enforcing\\n'; }
+restorecon() { printf 'restorecon|%s\\n' "\$*" >>'${toMsysPath(selinuxCallsPath)}'; }
+matchpathcon() {
+    printf 'matchpathcon|%s\\n' "\$*" >>'${toMsysPath(selinuxCallsPath)}'
+    printf 'system_u:object_r:systemd_unit_file_t:s0\\n'
+}
+stat() {
+    if [[ "\$1" == '-c' && "\$2" == '%C' ]]; then
+        printf 'system_u:object_r:etc_t:s0\\n'
+        return 0
+    fi
+    command stat "\$@"
+}
+`
+  }[selinuxMode]
+  assert.notEqual(selinuxFunctions, undefined, `unknown SELinux mode: ${selinuxMode}`)
+  writeFileSync(harnessPath, `#!/usr/bin/env bash
+set -Eeuo pipefail
+mkdir -p -- '${toMsysPath(path.dirname(unitFile))}'
+${originalSetup}
+source '${toMsysPath(fixtureInstallerPath)}'
+WORK_DIR='${toMsysPath(path.join(fixture, 'work'))}'
+mkdir -p -- "\$WORK_DIR"
+systemctl() {
+    printf '%s\\n' "\$*" >>'${toMsysPath(callsPath)}'
+    case "\$*" in
+        'is-active --quiet keepalived.service'|'is-enabled --quiet keepalived.service') return 1 ;;
+        'show -p FragmentPath --value keepalived.service')
+            [[ -e "\$UNIT_FILE" || -L "\$UNIT_FILE" ]] && readlink -f -- "\$UNIT_FILE" 2>/dev/null || true
+            ;;
+        'daemon-reload') return 0 ;;
+        *) return 97 ;;
+    esac
+}
+${fakeInstallFunction()}
+${selinuxFunctions}
+mountpoint() { return 1; }
+capture_service_state
+case '${action}' in
+    install) install_systemd_unit ;;
+    capture) : ;;
+    rollback)
+        create_install_backup
+        install_systemd_unit
+        restore_install_unit_state
+        ;;
+esac
+`)
+  const result = spawnSync(bashPath, [toMsysPath(harnessPath)], {
+    encoding: 'utf8',
+    env: { ...process.env, MSYS: 'winsymlinks:sys' }
+  })
+  const linkCheck = spawnSync(bashPath, ['-c', `[[ -L ${bashQuote(toMsysPath(unitFile))} ]]`], {
+    encoding: 'utf8',
+    env: { ...process.env, MSYS: 'winsymlinks:sys' }
+  })
+  const unitKind = !existsSync(unitFile) ? 'absent' : linkCheck.status === 0 ? 'link' : 'file'
+  const unitTarget = unitKind === 'link'
+    ? spawnSync(bashPath, ['-c', `readlink -- ${bashQuote(toMsysPath(unitFile))}`], {
+        encoding: 'utf8',
+        env: { ...process.env, MSYS: 'winsymlinks:sys' }
+      }).stdout.trim()
+    : ''
+  const normalizeFixturePath = (value) => value.replaceAll(toMsysPath(appRoot), '/aifar/apps/keepalived')
+  return {
+    ...result,
+    unitKind,
+    unitContents: unitKind === 'file' ? normalizeFixturePath(readFileSync(unitFile, 'utf8')) : '',
+    unitTarget,
+    calls: existsSync(callsPath) ? readFileSync(callsPath, 'utf8').trimEnd().split('\n').filter(Boolean) : [],
+    selinuxCalls: existsSync(selinuxCallsPath) ? readFileSync(selinuxCallsPath, 'utf8').trimEnd().split('\n').filter(Boolean) : [],
+    originalUnitContents: normalizeFixturePath(originalUnitContents)
+  }
 }
 
 function writeUninstallerFixture(fixture) {
@@ -722,6 +855,7 @@ remove_owned_firewall_rule
 }
 
 function runUninstallTransactionHarness(t, {
+  unitState = 'managed-file',
   externalSelinuxPattern = '',
   missingSelinuxPattern = '',
   failStop = false,
@@ -729,7 +863,16 @@ function runUninstallTransactionHarness(t, {
   failFirewallForm = '',
   failSelinuxPattern = '',
   failRootRemoval = false,
-  replaceUnitAfterDisableFailure = false
+  replaceUnitBeforeStop = false,
+  replaceUnitBeforeDisable = false,
+  replaceUnitAfterDisableFailure = false,
+  replaceFragmentAfterDisableFailure = false,
+  disableRemovesLegacyLink = false,
+  fragmentMode = 'matching',
+  ignoreRollbackEnable = false,
+  ignoreRollbackRestart = false,
+  serviceActive = true,
+  serviceEnabled = true
 } = {}) {
   const fixture = mkdtempSync(path.join(rootDir, '.aifar-keepalived-uninstall-transaction-test-'))
   t.after(() => rmSync(fixture, { force: true, recursive: true }))
@@ -743,12 +886,15 @@ function runUninstallTransactionHarness(t, {
   const selinuxStatePath = path.join(fixture, 'selinux-state')
   const activePath = path.join(fixture, 'service-active')
   const enabledPath = path.join(fixture, 'service-enabled')
+  const fragmentOverridePath = path.join(fixture, 'fragment-override')
   const unitLink = path.join(fixture, 'etc', 'systemd', 'system', 'keepalived.service')
   const expectedUnit = path.join(appRoot, 'systemd', 'keepalived.service')
   const firewallRecordPath = path.join(appRoot, 'var', 'lib', 'aifar', 'firewall-rule')
   const selinuxRecordPath = path.join(appRoot, 'var', 'lib', 'aifar', 'keepalived-selinux-fcontexts')
   const markerPath = path.join(appRoot, 'preserved-marker')
   const foreignUnit = path.join(fixture, 'foreign', 'keepalived.service')
+  const originalUnitContents = '[Unit]\nDescription=managed fixture\n[Service]\nExecStart=/aifar/apps/keepalived/sbin/keepalived\n'
+  const managedExecutable = toMsysPath(path.join(appRoot, 'sbin', 'keepalived'))
   const rule = peerRule('192.168.74.133')
   const normalize = (value) => value.replaceAll('/aifar/apps/keepalived', toMsysPath(appRoot))
   const selinuxRows = validSelinuxRecordRows().map(normalize)
@@ -763,7 +909,7 @@ function runUninstallTransactionHarness(t, {
   mkdirSync(path.dirname(expectedUnit), { recursive: true })
   mkdirSync(path.dirname(unitLink), { recursive: true })
   mkdirSync(path.dirname(firewallRecordPath), { recursive: true })
-  writeFileSync(expectedUnit, '[Unit]\nDescription=fixture\n')
+  writeFileSync(expectedUnit, originalUnitContents.replaceAll('/aifar/apps/keepalived', toMsysPath(appRoot)))
   mkdirSync(path.dirname(foreignUnit), { recursive: true })
   writeFileSync(foreignUnit, '[Unit]\nDescription=foreign fixture\n')
   writeFileSync(markerPath, 'before-uninstall\n')
@@ -772,14 +918,27 @@ function runUninstallTransactionHarness(t, {
   writeFileSync(runtimePath, `${rule}\n`)
   writeFileSync(permanentPath, `${rule}\n`)
   writeFileSync(selinuxStatePath, selinuxState.join('\n') + '\n')
-  writeFileSync(activePath, '1')
-  writeFileSync(enabledPath, '1')
+  writeFileSync(activePath, serviceActive ? '1' : '0')
+  writeFileSync(enabledPath, serviceEnabled ? '1' : '0')
+  writeFileSync(fragmentOverridePath, '')
   const rootStatBefore = lstatSync(appRoot)
   const rootIdentityBefore = `${rootStatBefore.dev}:${rootStatBefore.ino}:${rootStatBefore.birthtimeMs}`
+  const unitSetup = {
+    'managed-file': `printf '%b' '${originalUnitContents.replaceAll("'", "'\\''").replaceAll('/aifar/apps/keepalived', toMsysPath(appRoot)).replaceAll('\n', '\\n')}' >'${toMsysPath(unitLink)}'`,
+    'legacy-link': `ln -s -- '${toMsysPath(expectedUnit)}' '${toMsysPath(unitLink)}'`,
+    'foreign-file': `printf '[Unit]\\nDescription=foreign fixture\\n' >'${toMsysPath(unitLink)}'`,
+    'foreign-link': `ln -s -- '${toMsysPath(foreignUnit)}' '${toMsysPath(unitLink)}'`,
+    'comment-file': `printf '%s\\n' '[Service]' '# ExecStart=${managedExecutable}' >'${toMsysPath(unitLink)}'`,
+    'pre-file': `printf '%s\\n' '[Service]' 'ExecStartPre=${managedExecutable}' 'ExecStart=/usr/bin/true' >'${toMsysPath(unitLink)}'`,
+    'wrapper-file': `printf '%s\\n' '[Service]' 'ExecStart=${managedExecutable}-wrapper' >'${toMsysPath(unitLink)}'`,
+    'unit-section-file': `printf '%s\\n' '[Unit]' 'ExecStart=${managedExecutable}' '[Service]' 'ExecStart=/usr/bin/true' >'${toMsysPath(unitLink)}'`,
+    'mixed-file': `printf '%s\\n' '[Service]' 'ExecStart=${managedExecutable}' 'ExecStart=/usr/bin/true' >'${toMsysPath(unitLink)}'`
+  }[unitState]
+  assert.ok(unitSetup, `unknown unit state: ${unitState}`)
   writeFileSync(harnessPath, `#!/usr/bin/env bash
 set -Eeuo pipefail
-ln -s -- '${toMsysPath(expectedUnit)}' '${toMsysPath(unitLink)}'
 source '${toMsysPath(fixtureUninstallerPath)}'
+${unitSetup}
 ${fakeInstallFunction()}
 mountpoint() { return 1; }
 systemctl() {
@@ -788,27 +947,44 @@ systemctl() {
         'is-active --quiet keepalived.service') [[ "\$(cat '${toMsysPath(activePath)}')" == 1 ]] ;;
         'is-enabled --quiet keepalived.service') [[ "\$(cat '${toMsysPath(enabledPath)}')" == 1 ]] ;;
         'is-active --quiet firewalld.service') return 0 ;;
-        'show -p FragmentPath --value keepalived.service') printf '%s\\n' '${toMsysPath(expectedUnit)}' ;;
+        'show -p FragmentPath --value keepalived.service')
+            if [[ '${fragmentMode}' == 'built-for-managed' ]]; then
+                printf '%s\\n' '${toMsysPath(expectedUnit)}'
+            elif [[ -s '${toMsysPath(fragmentOverridePath)}' ]]; then
+                cat '${toMsysPath(fragmentOverridePath)}'
+            else
+                [[ -e '${toMsysPath(unitLink)}' || -L '${toMsysPath(unitLink)}' ]] && readlink -f -- '${toMsysPath(unitLink)}' 2>/dev/null || true
+            fi
+            ;;
         'stop keepalived.service')
             [[ '${failStop ? 1 : 0}' -eq 0 ]] || return 60
             printf 0 >'${toMsysPath(activePath)}'
+            if [[ '${replaceUnitBeforeDisable ? 1 : 0}' -eq 1 ]]; then
+                rm -f -- '${toMsysPath(unitLink)}'
+                ln -s -- '${toMsysPath(foreignUnit)}' '${toMsysPath(unitLink)}'
+            fi
             ;;
         'disable keepalived.service')
             if [[ '${failDisable ? 1 : 0}' -eq 1 ]]; then
                 if [[ '${replaceUnitAfterDisableFailure ? 1 : 0}' -eq 1 ]]; then
-                    rm -f -- "\$UNIT_LINK"
-                    ln -s -- '${toMsysPath(foreignUnit)}' "\$UNIT_LINK"
+                    rm -f -- '${toMsysPath(unitLink)}'
+                    ln -s -- '${toMsysPath(foreignUnit)}' '${toMsysPath(unitLink)}'
+                fi
+                if [[ '${replaceFragmentAfterDisableFailure ? 1 : 0}' -eq 1 ]]; then
+                    printf '%s\\n' '${toMsysPath(foreignUnit)}' >'${toMsysPath(fragmentOverridePath)}'
                 fi
                 return 61
             fi
             printf 0 >'${toMsysPath(enabledPath)}'
-            rm -f -- "\$UNIT_LINK"
+            if [[ '${disableRemovesLegacyLink ? 1 : 0}' -eq 1 && '${unitState}' == 'legacy-link' ]]; then
+                rm -f -- '${toMsysPath(unitLink)}'
+            fi
             ;;
         'enable keepalived.service')
-            printf 1 >'${toMsysPath(enabledPath)}'
-            [[ -e "\$UNIT_LINK" || -L "\$UNIT_LINK" ]] || ln -s -- "\$EXPECTED_UNIT" "\$UNIT_LINK"
+            [[ '${ignoreRollbackEnable ? 1 : 0}' -eq 0 ]] && printf 1 >'${toMsysPath(enabledPath)}'
             ;;
-        'start keepalived.service'|'restart keepalived.service') printf 1 >'${toMsysPath(activePath)}' ;;
+        'start keepalived.service') printf 1 >'${toMsysPath(activePath)}' ;;
+        'restart keepalived.service') [[ '${ignoreRollbackRestart ? 1 : 0}' -eq 0 ]] && printf 1 >'${toMsysPath(activePath)}' ;;
         'daemon-reload') ;;
         *) return 97 ;;
     esac
@@ -819,6 +995,12 @@ FAKE_FAIL_SEMANAGE='${failSelinuxPattern ? 'delete' : ''}'
 FAKE_FAIL_SEMANAGE_PATTERN='${normalizedFailSelinuxPattern}'
 FAKE_FAIL_SEMANAGE_ONCE=1
 ${fakeSelinuxFunction({ statePath: selinuxStatePath, callLogPath: selinuxCallLogPath })}
+${replaceUnitBeforeStop ? `eval "$(declare -f perform_uninstall_mutations | sed '1s/perform_uninstall_mutations/_base_perform_uninstall_mutations/')"
+perform_uninstall_mutations() {
+    rm -f -- '${toMsysPath(unitLink)}'
+    ln -s -- '${toMsysPath(foreignUnit)}' '${toMsysPath(unitLink)}'
+    _base_perform_uninstall_mutations
+}` : ''}
 if [[ '${failRootRemoval ? 1 : 0}' -eq 1 ]]; then
     ROOT_REMOVE_FAILURE_PENDING=1
     rm() {
@@ -847,6 +1029,19 @@ execute_uninstall_transaction
         env: { ...process.env, MSYS: 'winsymlinks:sys' }
       })
     : { stdout: '' }
+  const unitLinkIsSymbolicLink = existsSync(unitLink) && spawnSync(
+    bashPath,
+    ['-c', `test -L '${toMsysPath(unitLink)}'`],
+    { env: { ...process.env, MSYS: 'winsymlinks:sys' } }
+  ).status === 0
+  const unitKind = !existsSync(unitLink)
+    ? 'absent'
+    : unitLinkIsSymbolicLink || lstatSync(unitLink).isSymbolicLink() ? 'link' : 'file'
+  const backupRoot = path.join(fixture, 'aifar', 'backups')
+  const backupDir = existsSync(backupRoot)
+    ? path.join(backupRoot, readdirSync(backupRoot)[0] ?? '')
+    : ''
+  const normalizeFixturePath = (value) => value.replaceAll(toMsysPath(appRoot), '/aifar/apps/keepalived')
   return {
     ...result,
     appRootExists: existsSync(appRoot),
@@ -857,6 +1052,15 @@ execute_uninstall_transaction
     enabled: existsSync(enabledPath) ? readFileSync(enabledPath, 'utf8') : '',
     unitLinkExists: existsSync(unitLink),
     unitLinkTarget: unitLinkTargetResult.stdout.trim(),
+    unitKind,
+    unitContents: unitKind === 'file' ? normalizeFixturePath(readFileSync(unitLink, 'utf8')) : '',
+    originalUnitContents,
+    backedUpUnitContents: backupDir && existsSync(path.join(backupDir, 'systemd-unit'))
+      ? normalizeFixturePath(readFileSync(path.join(backupDir, 'systemd-unit'), 'utf8'))
+      : '',
+    backupManifest: backupDir && existsSync(path.join(backupDir, 'uninstall-manifest.txt'))
+      ? readFileSync(path.join(backupDir, 'uninstall-manifest.txt'), 'utf8')
+      : '',
     foreignUnitTarget: toMsysPath(foreignUnit),
     runtimeRules: readLines(runtimePath),
     permanentRules: readLines(permanentPath),
@@ -919,7 +1123,9 @@ function fakeSystemctlFunction(callLogPath) {
         'enable keepalived.service') FAKE_ENABLED=1 ;;
         'disable keepalived.service')
             FAKE_ENABLED=0
-            rm -f -- "\$UNIT_LINK"
+            if [[ "\${FAKE_DISABLE_REMOVES_UNIT_LINK:-0}" -eq 1 ]]; then
+                rm -f -- "\${FAKE_UNIT_FILE:?}"
+            fi
             ;;
         'start keepalived.service'|'restart keepalived.service')
             FAKE_ACTIVE=1
@@ -927,7 +1133,13 @@ function fakeSystemctlFunction(callLogPath) {
             ;;
         'stop keepalived.service') FAKE_ACTIVE=0 ;;
         'daemon-reload') ;;
-        'show -p FragmentPath --value keepalived.service') ;;
+        'show -p FragmentPath --value keepalived.service')
+            if [[ -n "\${FAKE_FRAGMENT_PATH+x}" ]]; then
+                printf '%s\n' "\$FAKE_FRAGMENT_PATH"
+            elif [[ -n "\${FAKE_UNIT_FILE:-}" && ( -e "\$FAKE_UNIT_FILE" || -L "\$FAKE_UNIT_FILE" ) ]]; then
+                readlink -f -- "\$FAKE_UNIT_FILE" 2>/dev/null || true
+            fi
+            ;;
         *) return 97 ;;
     esac
 }`
@@ -959,11 +1171,12 @@ function runServiceHarness(t, {
   enabled,
   healthEnabled = true,
   healthStatus = 0,
-  finalActiveFailure = false
+  finalActiveFailure = false,
+  mismatchFragmentBeforeActivation = false
 }) {
   const fixture = mkdtempSync(path.join(os.tmpdir(), 'aifar-keepalived-service-test-'))
   t.after(() => rmSync(fixture, { force: true, recursive: true }))
-  const { appRoot, fixtureInstallerPath } = writeInstallerFixture(fixture)
+  const { appRoot, fixtureInstallerPath, unitFile } = writeInstallerFixture(fixture)
   const harnessPath = path.join(fixture, 'harness.sh')
   const callLogPath = path.join(fixture, 'systemctl-calls')
   const healthMarkerPath = path.join(fixture, 'health-executed')
@@ -971,6 +1184,8 @@ function runServiceHarness(t, {
   mkdirSync(path.dirname(installedHealthScript), { recursive: true })
   writeFileSync(installedHealthScript, `#!/usr/bin/env bash\nprintf 'executed\\n' >'${toMsysPath(healthMarkerPath)}'\nexit ${healthStatus}\n`)
   chmodSync(installedHealthScript, 0o750)
+  mkdirSync(path.dirname(unitFile), { recursive: true })
+  writeFileSync(unitFile, `[Unit]\n[Service]\nExecStart=${toMsysPath(path.join(appRoot, 'sbin', 'keepalived'))}\n`)
   writeFileSync(harnessPath, `#!/usr/bin/env bash
 set -Eeuo pipefail
 source '${toMsysPath(fixtureInstallerPath)}'
@@ -978,9 +1193,14 @@ FAKE_ACTIVE=${active ? 1 : 0}
 FAKE_ENABLED=${enabled ? 1 : 0}
 FAKE_ACTIVATION_ATTEMPTED=0
 FAKE_FINAL_ACTIVE_FAILURE=${finalActiveFailure ? 1 : 0}
+FAKE_UNIT_FILE="$UNIT_FILE"
 HEALTH_CHECK_ENABLED=${healthEnabled ? 1 : 0}
 ${fakeSystemctlFunction(callLogPath)}
 capture_service_state
+UNIT_MUTATION_STARTED=1
+UNIT_INSTALLED=1
+UNIT_INSTALLED_SHA256="\$(sha256sum "\$UNIT_FILE" | awk '{print \$1}')"
+${mismatchFragmentBeforeActivation ? `FAKE_FRAGMENT_PATH='${toMsysPath(path.join(fixture, 'foreign.service'))}'` : ''}
 activate_keepalived
 `)
   const result = spawnSync(bashPath, [toMsysPath(harnessPath)], { encoding: 'utf8' })
@@ -995,18 +1215,19 @@ function runRollbackHarness(t, {
   active,
   enabled,
   unitLinkExisted = false,
-  stopNotFoundWhenDisabled = false
+  stopNotFoundWhenDisabled = false,
+  disableRemovesLegacyLink = false
 }) {
-  const fixture = mkdtempSync(path.join(os.tmpdir(), 'aifar-keepalived-rollback-test-'))
+  const fixture = mkdtempSync(path.join(rootDir, '.aifar-keepalived-rollback-test-'))
   t.after(() => rmSync(fixture, { force: true, recursive: true }))
-  const { appRoot, fixtureInstallerPath, unitLink } = writeInstallerFixture(fixture)
+  const { appRoot, fixtureInstallerPath, unitFile } = writeInstallerFixture(fixture)
   const harnessPath = path.join(fixture, 'harness.sh')
   const callLogPath = path.join(fixture, 'systemctl-calls')
   mkdirSync(appRoot, { recursive: true })
   writeFileSync(path.join(appRoot, 'failed-install-marker'), 'failed')
   if (unitLinkExisted) {
-    mkdirSync(path.dirname(unitLink), { recursive: true })
-    writeFileSync(unitLink, 'owned-link')
+    mkdirSync(path.dirname(unitFile), { recursive: true })
+    writeFileSync(unitFile, 'owned-link')
   }
   writeFileSync(harnessPath, `#!/usr/bin/env bash
 set -Eeuo pipefail
@@ -1015,6 +1236,8 @@ FAKE_ACTIVE=1
 FAKE_ENABLED=1
 FAKE_ACTIVATION_ATTEMPTED=0
 FAKE_FINAL_ACTIVE_FAILURE=0
+FAKE_DISABLE_REMOVES_UNIT_LINK=${disableRemovesLegacyLink ? 1 : 0}
+FAKE_UNIT_FILE="$UNIT_FILE"
 ${fakeSystemctlFunction(callLogPath)}
 ${stopNotFoundWhenDisabled ? `eval "$(declare -f systemctl | sed '1s/systemctl/_base_systemctl/')"
 systemctl() {
@@ -1025,34 +1248,143 @@ systemctl() {
     _base_systemctl "$@"
 }` : ''}
 mountpoint() { return 1; }
-${unitLinkExisted ? `readlink() {
-    if [[ "\$*" == "-f -- \$UNIT_LINK" || "\$*" == "-- \$UNIT_LINK" ]]; then
-        printf '%s\\n' "\$EXPECTED_UNIT"
-    else
-        command readlink "\$@"
-    fi
-}
-ln() {
-    if [[ "\$1" == '-s' && "\$2" == '--' && "\$3" == "\$EXPECTED_UNIT" && "\$4" == "\$UNIT_LINK" ]]; then
-        printf '%s\\n' "\$3" >"\$4"
-    else
-        command ln "\$@"
-    fi
+${unitLinkExisted ? `ln() {
+    mkdir -p -- "$(dirname -- "$3")"
+    mkdir -p -- "$(dirname -- "$4")"
+    : >"$3"
+    command ln "$@"
 }` : ''}
+mkdir -p -- "\$(dirname -- \"\$BUILT_UNIT\")" "\$(dirname -- \"\$UNIT_FILE\")"
+printf '[Unit]\\n[Service]\\nExecStart=%s\\n' "\$APP_ROOT/sbin/keepalived" >"\$BUILT_UNIT"
+rm -f -- "\$UNIT_FILE"
+printf '[Unit]\\n[Service]\\nExecStart=%s\\n' "\$APP_ROOT/sbin/keepalived" >"\$UNIT_FILE"
 APP_ROOT_EXISTED=0
 SERVICE_WAS_ACTIVE=${active ? 1 : 0}
 SERVICE_WAS_ENABLED=${enabled ? 1 : 0}
-UNIT_LINK_EXISTED=${unitLinkExisted ? 1 : 0}
-UNIT_LINK_TARGET=${unitLinkExisted ? '"$EXPECTED_UNIT"' : "''"}
+UNIT_STATE=${unitLinkExisted ? "'legacy-link'" : "'absent'"}
+UNIT_LINK_TARGET=${unitLinkExisted ? '"$BUILT_UNIT"' : "''"}
+UNIT_INSTALLED_SHA256="\$(sha256sum "\$UNIT_FILE" | awk '{print \$1}')"
+UNIT_MUTATION_STARTED=1
+UNIT_INSTALLED=1
+mkdir -p -- "\$(dirname -- \"\$UNIT_FILE\")"
 rollback_install_transaction
 `)
-  const result = spawnSync(bashPath, [toMsysPath(harnessPath)], { encoding: 'utf8' })
+  const result = spawnSync(bashPath, [toMsysPath(harnessPath)], {
+    encoding: 'utf8',
+    env: { ...process.env, MSYS: 'winsymlinks:sys' }
+  })
+  const unitLinkTarget = existsSync(unitFile)
+    ? spawnSync(bashPath, ['-c', `readlink -- '${toMsysPath(unitFile)}'`], {
+        encoding: 'utf8',
+        env: { ...process.env, MSYS: 'winsymlinks:sys' }
+      }).stdout.trim()
+    : ''
   return {
     ...result,
     appRootExists: existsSync(appRoot),
-    unitLinkExists: existsSync(unitLink),
-    unitLinkTarget: existsSync(unitLink) ? readFileSync(unitLink, 'utf8').trim() : '',
+    unitLinkExists: existsSync(unitFile),
+    unitLinkTarget,
     calls: existsSync(callLogPath) ? readFileSync(callLogPath, 'utf8').trimEnd().split('\n') : []
+  }
+}
+
+function runInstallerRollbackBoundaryHarness(t, {
+  installUnitBeforeRollback = false,
+  replaceUnitBeforeRollback = false,
+  clearInstalledMarkerBeforeRollback = false,
+  mismatchFragmentBeforeRollback = false,
+  ignoreRollbackRestart = false
+} = {}) {
+  const fixture = mkdtempSync(path.join(rootDir, '.aifar-keepalived-installer-rollback-boundary-test-'))
+  t.after(() => rmSync(fixture, { force: true, recursive: true }))
+  const { appRoot, fixtureInstallerPath, unitFile } = writeInstallerFixture(fixture)
+  const builtUnit = path.join(appRoot, 'systemd', 'keepalived.service')
+  const foreignUnit = path.join(fixture, 'foreign', 'keepalived.service')
+  const harnessPath = path.join(fixture, 'harness.sh')
+  const callLogPath = path.join(fixture, 'systemctl-calls')
+  const activePath = path.join(fixture, 'service-active')
+  const enabledPath = path.join(fixture, 'service-enabled')
+  const fragmentPath = path.join(fixture, 'loaded-fragment')
+  const originalUnitContents = `[Unit]\nDescription=managed before mutation\n[Service]\nExecStart=${toMsysPath(path.join(appRoot, 'sbin', 'keepalived'))}\n`
+  mkdirSync(path.dirname(builtUnit), { recursive: true })
+  mkdirSync(path.dirname(unitFile), { recursive: true })
+  mkdirSync(path.dirname(foreignUnit), { recursive: true })
+  writeFileSync(builtUnit, originalUnitContents)
+  writeFileSync(unitFile, originalUnitContents)
+  const foreignUnitContents = '[Unit]\nDescription=foreign rollback replacement\n'
+  writeFileSync(foreignUnit, foreignUnitContents)
+  writeFileSync(activePath, '1')
+  writeFileSync(enabledPath, '1')
+  writeFileSync(fragmentPath, toMsysPath(unitFile))
+  const unitStatBefore = lstatSync(unitFile)
+  const unitIdentityBefore = `${unitStatBefore.dev}:${unitStatBefore.ino}:${unitStatBefore.birthtimeMs}`
+  writeFileSync(harnessPath, `#!/usr/bin/env bash
+set -Eeuo pipefail
+source '${toMsysPath(fixtureInstallerPath)}'
+${fakeInstallFunction()}
+mountpoint() { return 1; }
+systemctl() {
+    printf '%s\\n' "\$*" >>'${toMsysPath(callLogPath)}'
+    case "\$*" in
+        'is-active --quiet keepalived.service') [[ "\$(cat '${toMsysPath(activePath)}')" == 1 ]] ;;
+        'is-enabled --quiet keepalived.service') [[ "\$(cat '${toMsysPath(enabledPath)}')" == 1 ]] ;;
+        'show -p FragmentPath --value keepalived.service') cat '${toMsysPath(fragmentPath)}' ;;
+        'is-active keepalived.service')
+            if [[ "\$(cat '${toMsysPath(activePath)}')" == 1 ]]; then
+                printf 'active\\n'
+                return 0
+            fi
+            printf 'inactive\\n'
+            return 3
+            ;;
+        'stop keepalived.service') printf 0 >'${toMsysPath(activePath)}' ;;
+        'disable keepalived.service') printf 0 >'${toMsysPath(enabledPath)}' ;;
+        'enable keepalived.service') printf 1 >'${toMsysPath(enabledPath)}' ;;
+        'restart keepalived.service') [[ '${ignoreRollbackRestart ? 1 : 0}' -eq 0 ]] && printf 1 >'${toMsysPath(activePath)}' ;;
+        'daemon-reload') ;;
+        *) return 97 ;;
+    esac
+}
+capture_service_state
+create_install_backup
+${installUnitBeforeRollback ? `WORK_DIR='${toMsysPath(path.join(fixture, 'work'))}'
+mkdir -p -- "\$WORK_DIR"
+install_systemd_unit` : ''}
+${clearInstalledMarkerBeforeRollback ? 'UNIT_INSTALLED=0' : ''}
+${replaceUnitBeforeRollback ? `rm -f -- "\$UNIT_FILE"
+cp -- '${toMsysPath(foreignUnit)}' "\$UNIT_FILE"` : ''}
+${mismatchFragmentBeforeRollback ? `printf '%s' '${toMsysPath(foreignUnit)}' >'${toMsysPath(fragmentPath)}'` : ''}
+rollback_install_transaction
+`)
+  const result = spawnSync(bashPath, [toMsysPath(harnessPath)], {
+    encoding: 'utf8',
+    env: { ...process.env, MSYS: 'winsymlinks:sys' }
+  })
+  const unitKind = !existsSync(unitFile)
+    ? 'absent'
+    : lstatSync(unitFile).isSymbolicLink() ? 'link' : 'file'
+  const unitTarget = unitKind === 'link'
+    ? spawnSync(bashPath, ['-c', `readlink -- '${toMsysPath(unitFile)}'`], {
+        encoding: 'utf8',
+        env: { ...process.env, MSYS: 'winsymlinks:sys' }
+      }).stdout.trim()
+    : ''
+  const unitStatAfter = unitKind === 'file' ? lstatSync(unitFile) : null
+  return {
+    ...result,
+    active: readFileSync(activePath, 'utf8'),
+    enabled: readFileSync(enabledPath, 'utf8'),
+    calls: existsSync(callLogPath) ? readFileSync(callLogPath, 'utf8').trimEnd().split('\n').filter(Boolean) : [],
+    unitContents: unitKind === 'file'
+      ? readFileSync(unitFile, 'utf8').replaceAll(toMsysPath(appRoot), '/aifar/apps/keepalived')
+      : '',
+    originalUnitContents: originalUnitContents.replaceAll(toMsysPath(appRoot), '/aifar/apps/keepalived'),
+    unitIdentityBefore,
+    unitIdentityAfter: unitStatAfter ? `${unitStatAfter.dev}:${unitStatAfter.ino}:${unitStatAfter.birthtimeMs}` : '',
+    unitKind,
+    unitTarget,
+    foreignUnitTarget: toMsysPath(foreignUnit),
+    foreignUnitContents
   }
 }
 
@@ -1882,9 +2214,13 @@ test('installer restarts a service that was previously active and enabled', (t) 
   assert.deepEqual(result.calls, [
     'is-active --quiet keepalived.service',
     'is-enabled --quiet keepalived.service',
+    'show -p FragmentPath --value keepalived.service',
     'daemon-reload',
+    'show -p FragmentPath --value keepalived.service',
     'enable keepalived.service',
+    'show -p FragmentPath --value keepalived.service',
     'restart keepalived.service',
+    'show -p FragmentPath --value keepalived.service',
     'is-active --quiet keepalived.service'
   ])
 })
@@ -1895,9 +2231,13 @@ test('installer enables and starts a service that was previously inactive and di
   assert.deepEqual(result.calls, [
     'is-active --quiet keepalived.service',
     'is-enabled --quiet keepalived.service',
+    'show -p FragmentPath --value keepalived.service',
     'daemon-reload',
+    'show -p FragmentPath --value keepalived.service',
     'enable keepalived.service',
+    'show -p FragmentPath --value keepalived.service',
     'start keepalived.service',
+    'show -p FragmentPath --value keepalived.service',
     'is-active --quiet keepalived.service'
   ])
 })
@@ -1914,9 +2254,13 @@ test('disabled health mode starts the service without executing a health script'
   assert.deepEqual(result.calls, [
     'is-active --quiet keepalived.service',
     'is-enabled --quiet keepalived.service',
+    'show -p FragmentPath --value keepalived.service',
     'daemon-reload',
+    'show -p FragmentPath --value keepalived.service',
     'enable keepalived.service',
+    'show -p FragmentPath --value keepalived.service',
     'start keepalived.service',
+    'show -p FragmentPath --value keepalived.service',
     'is-active --quiet keepalived.service'
   ])
 })
@@ -1942,32 +2286,39 @@ test('installer fails activation when the final active-state check fails', (t) =
   assert.equal(result.calls.at(-1), 'is-active --quiet keepalived.service')
 })
 
+test('installer refuses normal service controls when the loaded FragmentPath changes', (t) => {
+  const result = runServiceHarness(t, {
+    active: false,
+    enabled: false,
+    mismatchFragmentBeforeActivation: true
+  })
+  assert.equal(result.status, 1, result.stderr)
+  assert.deepEqual(result.calls.filter((call) => /^(?:enable|start|restart) keepalived\.service$/.test(call)), [])
+})
+
 test('rollback restores a previously active and enabled service', (t) => {
   const result = runRollbackHarness(t, { active: true, enabled: true })
   assert.equal(result.status, 0, result.stderr)
   assert.equal(result.appRootExists, false)
-  assert.deepEqual(result.calls, [
-    'is-active keepalived.service',
+  assert.deepEqual(result.calls.filter((call) => /^(?:stop|enable|disable|restart) keepalived\.service$/.test(call)), [
     'stop keepalived.service',
-    'daemon-reload',
     'enable keepalived.service',
-    'restart keepalived.service',
-    'daemon-reload'
+    'restart keepalived.service'
   ])
+  assert.ok(result.calls.filter((call) => call === 'show -p FragmentPath --value keepalived.service').length >= 3)
+  assert.deepEqual(result.calls.slice(-2), ['is-active --quiet keepalived.service', 'is-enabled --quiet keepalived.service'])
 })
 
 test('rollback restores a previously inactive and disabled service', (t) => {
   const result = runRollbackHarness(t, { active: false, enabled: false })
   assert.equal(result.status, 0, result.stderr)
   assert.equal(result.appRootExists, false)
-  assert.deepEqual(result.calls, [
-    'is-active keepalived.service',
+  assert.deepEqual(result.calls.filter((call) => /^(?:stop|enable|disable|restart) keepalived\.service$/.test(call)), [
     'stop keepalived.service',
-    'daemon-reload',
-    'disable keepalived.service',
-    'is-active keepalived.service',
-    'daemon-reload'
+    'disable keepalived.service'
   ])
+  assert.ok(result.calls.filter((call) => call === 'show -p FragmentPath --value keepalived.service').length >= 3)
+  assert.deepEqual(result.calls.slice(-2), ['is-active --quiet keepalived.service', 'is-enabled --quiet keepalived.service'])
 })
 
 test('rollback treats an already absent inactive service as restored', (t) => {
@@ -1981,7 +2332,7 @@ test('rollback treats an already absent inactive service as restored', (t) => {
   assert.equal(result.calls.filter((call) => call === 'stop keepalived.service').length, 1)
 })
 
-test('rollback restores a previously disabled inactive owned unit link after disable removes it', (t) => {
+test('rollback restores a previously disabled inactive legacy unit link before service state', (t) => {
   const result = runRollbackHarness(t, {
     active: false,
     enabled: false,
@@ -1992,7 +2343,19 @@ test('rollback restores a previously disabled inactive owned unit link after dis
   assert.match(result.unitLinkTarget, /\/systemd\/keepalived\.service$/)
   const disableIndex = result.calls.indexOf('disable keepalived.service')
   assert.notEqual(disableIndex, -1)
-  assert.ok(disableIndex < result.calls.lastIndexOf('daemon-reload'))
+  assert.ok(result.calls.indexOf('daemon-reload') < disableIndex)
+})
+
+test('installer rollback restores a disabled legacy link after systemctl disable removes it', (t) => {
+  const result = runRollbackHarness(t, {
+    active: false,
+    enabled: false,
+    unitLinkExisted: true,
+    disableRemovesLegacyLink: true
+  })
+  assert.equal(result.status, 0, result.stderr)
+  assert.equal(result.unitLinkExists, true)
+  assert.match(result.unitLinkTarget, /\/systemd\/keepalived\.service$/)
 })
 
 test('installer verifies a full-root backup before activating the transaction', (t) => {
@@ -2007,6 +2370,155 @@ test('installer verifies a full-root backup before activating the transaction', 
   )
   assert.match(readFileSync(path.join(backupDirectory, 'install-state.txt'), 'utf8'), /app_root_existed=1/)
   assert.match(readFileSync(path.join(backupDirectory, 'BACKUP.sha256'), 'utf8'), /installed-root\/nested\/prior-state/)
+})
+
+test('installer renders and installs a direct systemd unit', (t) => {
+  const result = runDirectUnitHarness(t, { originalState: 'absent', action: 'install' })
+  assert.equal(result.status, 0, result.stderr)
+  assert.equal(result.unitKind, 'file')
+  assert.match(result.unitContents, /^RequiresMountsFor=\/aifar\/apps\/keepalived$/m)
+  assert.match(result.unitContents, /^ExecStart=\/aifar\/apps\/keepalived\/sbin\/keepalived/m)
+  assert.equal(result.calls.filter((call) => call === 'daemon-reload').length, 1)
+})
+
+test('installer migrates the legacy AIFAR unit link to a regular file', (t) => {
+  const result = runDirectUnitHarness(t, { originalState: 'legacy-link', action: 'install' })
+  assert.equal(result.status, 0, result.stderr)
+  assert.equal(result.unitKind, 'file')
+})
+
+test('installer preserves other RequiresMountsFor dependencies while deduplicating its own mount', (t) => {
+  const result = runDirectUnitHarness(t, {
+    originalState: 'absent',
+    action: 'install',
+    builtUnitContents: '[Unit]\nRequiresMountsFor=/srv/shared /aifar/apps/keepalived\nRequiresMountsFor=/var/lib/keepalived\nRequiresMountsFor=/aifar/apps/keepalived\n[Service]\nExecStart=/aifar/apps/keepalived/sbin/keepalived\n'
+  })
+  assert.equal(result.status, 0, result.stderr)
+  assert.match(result.unitContents, /^RequiresMountsFor=\/srv\/shared$/m)
+  assert.match(result.unitContents, /^RequiresMountsFor=\/var\/lib\/keepalived$/m)
+  assert.equal(result.unitContents.match(/^RequiresMountsFor=\/aifar\/apps\/keepalived$/gm)?.length, 1)
+})
+
+test('installer verifies the restored unit label against the distribution SELinux type', (t) => {
+  const result = runDirectUnitHarness(t, {
+    originalState: 'absent',
+    action: 'install',
+    selinuxMode: 'enabled-valid'
+  })
+  assert.equal(result.status, 0, result.stderr)
+  assert.equal(result.selinuxCalls.length, 2)
+  assert.match(result.selinuxCalls[0], /^restorecon\|-F .*\/keepalived\.service$/)
+  assert.match(result.selinuxCalls[1], /^matchpathcon\|-n .*\/keepalived\.service$/)
+  assert.equal(result.selinuxCalls.some((call) => /(?:^|\s)-R(?:\s|$)/.test(call)), false)
+})
+
+test('installer rejects a direct unit whose SELinux type differs from distribution policy', (t) => {
+  const result = runDirectUnitHarness(t, {
+    originalState: 'absent',
+    action: 'install',
+    selinuxMode: 'enabled-invalid'
+  })
+  assert.equal(result.status, 1, result.stderr)
+  assert.match(result.stderr, /SELinux.*systemd unit.*type|systemd unit.*SELinux/i)
+})
+
+test('installer skips unit label tools when SELinux is disabled', (t) => {
+  const result = runDirectUnitHarness(t, {
+    originalState: 'absent',
+    action: 'install',
+    selinuxMode: 'disabled'
+  })
+  assert.equal(result.status, 0, result.stderr)
+  assert.deepEqual(result.selinuxCalls, [])
+})
+
+test('installer skips unit label verification when SELinux tools are unavailable', (t) => {
+  const result = runDirectUnitHarness(t, {
+    originalState: 'absent',
+    action: 'install',
+    selinuxMode: 'no-tools'
+  })
+  assert.equal(result.status, 0, result.stderr)
+  assert.deepEqual(result.selinuxCalls, [])
+})
+
+for (const originalState of ['foreign-link', 'foreign-file']) {
+  test(`installer rejects ${originalState} before replacing it`, (t) => {
+    const result = runDirectUnitHarness(t, { originalState, action: 'capture' })
+    assert.equal(result.status, 1)
+    assert.match(result.stderr, /keepalived\.service.*不属于此安装|其他 Keepalived unit/)
+    assert.notEqual(result.unitKind, 'absent')
+  })
+}
+
+for (const originalState of ['comment-file', 'pre-file', 'wrapper-file', 'unit-section-file', 'mixed-file']) {
+  test(`installer ownership rejects ${originalState}`, (t) => {
+    const result = runDirectUnitHarness(t, { originalState, action: 'capture' })
+    assert.equal(result.status, 1)
+    assert.match(result.stderr, /keepalived\.service.*不属于此安装/)
+    assert.equal(result.calls.some((call) => /^(?:stop|disable|enable|restart) keepalived\.service$/.test(call)), false)
+  })
+}
+
+for (const originalState of ['absent', 'legacy-link', 'managed-file']) {
+  test(`installer rollback restores ${originalState} unit state`, (t) => {
+    const result = runDirectUnitHarness(t, { originalState, action: 'rollback' })
+    assert.equal(result.status, 0, result.stderr)
+    assert.equal(result.unitKind, originalState === 'legacy-link' ? 'link' : originalState === 'managed-file' ? 'file' : 'absent')
+    if (originalState === 'legacy-link') assert.match(result.unitTarget, /\/systemd\/keepalived\.service$/)
+    if (originalState === 'managed-file') assert.equal(result.unitContents, result.originalUnitContents)
+  })
+}
+
+test('installer rollback before unit mutation reuses the unchanged direct unit and restores service state', (t) => {
+  const result = runInstallerRollbackBoundaryHarness(t)
+  assert.equal(result.status, 0, result.stderr)
+  assert.equal(result.unitKind, 'file')
+  assert.equal(result.unitContents, result.originalUnitContents)
+  assert.equal(result.unitIdentityAfter, result.unitIdentityBefore)
+  assert.equal(result.enabled, '1')
+  assert.equal(result.active, '1')
+})
+
+test('installer rollback does not control or overwrite a foreign unit replacement', (t) => {
+  const result = runInstallerRollbackBoundaryHarness(t, {
+    installUnitBeforeRollback: true,
+    replaceUnitBeforeRollback: true
+  })
+  assert.equal(result.status, 1, result.stderr)
+  assert.equal(result.unitKind, 'file')
+  assert.equal(result.unitContents, result.foreignUnitContents)
+  const serviceMutations = result.calls.filter((call) =>
+    /^(?:stop|disable|enable|restart) keepalived\.service$/.test(call)
+  )
+  assert.deepEqual(serviceMutations, [])
+  assert.equal(result.active, '1')
+  assert.equal(result.enabled, '1')
+})
+
+test('installer rollback recognizes its unit in the signal window after rename and before the installed marker', (t) => {
+  const result = runInstallerRollbackBoundaryHarness(t, {
+    installUnitBeforeRollback: true,
+    clearInstalledMarkerBeforeRollback: true
+  })
+  assert.equal(result.status, 0, result.stderr)
+  assert.equal(result.unitContents, result.originalUnitContents)
+  assert.equal(result.enabled, '1')
+  assert.equal(result.active, '1')
+})
+
+test('installer rollback refuses service controls when FragmentPath no longer matches the captured unit', (t) => {
+  const result = runInstallerRollbackBoundaryHarness(t, { mismatchFragmentBeforeRollback: true })
+  assert.equal(result.status, 1, result.stderr)
+  assert.deepEqual(result.calls.filter((call) =>
+    /^(?:stop|disable|enable|restart) keepalived\.service$/.test(call)
+  ), [])
+})
+
+test('installer rollback verifies the final active state instead of trusting restart success', (t) => {
+  const result = runInstallerRollbackBoundaryHarness(t, { ignoreRollbackRestart: true })
+  assert.equal(result.status, 1, result.stderr)
+  assert.equal(result.active, '0')
 })
 
 test('installer refuses a transaction whose existing app root is a mount point', (t) => {
@@ -2087,13 +2599,12 @@ test('rollback replaces a failed update with the verified full previous root', (
   assert.equal(result.status, 0, result.stderr)
   assert.equal(result.priorState, 'before-update')
   assert.equal(result.failedStateExists, false)
-  assert.deepEqual(result.calls.slice(-5), [
+  assert.deepEqual(result.calls.filter((call) => /^(?:stop|enable|disable|restart) keepalived\.service$/.test(call)).slice(-3), [
     'stop keepalived.service',
-    'daemon-reload',
     'enable keepalived.service',
-    'restart keepalived.service',
-    'daemon-reload'
+    'restart keepalived.service'
   ])
+  assert.deepEqual(result.calls.slice(-2), ['is-active --quiet keepalived.service', 'is-enabled --quiet keepalived.service'])
 })
 
 for (const direction of ['enabled-to-disabled', 'disabled-to-enabled']) {
@@ -2221,7 +2732,7 @@ function assertUninstallStateRestored(result) {
   assert.equal(result.marker, 'before-uninstall\n')
   assert.equal(result.active, '1')
   assert.equal(result.enabled, '1')
-  assert.equal(result.unitLinkExists, true)
+  assert.notEqual(result.unitKind, 'absent')
   assert.deepEqual(result.runtimeRules, [peerRule('192.168.74.133')])
   assert.deepEqual(result.permanentRules, [peerRule('192.168.74.133')])
   assert.deepEqual(result.selinuxState.sort(), validSelinuxRecordRows().map((row) => {
@@ -2235,6 +2746,72 @@ function assertUninstallRootNotReplaced(result) {
   assert.equal(result.marker, 'before-uninstall\n')
   assert.equal(result.rootIdentityAfter, result.rootIdentityBefore)
 }
+
+for (const unitState of ['managed-file', 'legacy-link']) {
+  test(`uninstaller removes owned ${unitState} unit after verified backup`, (t) => {
+    const result = runUninstallTransactionHarness(t, { unitState })
+    assert.equal(result.status, 0, result.stderr)
+    assert.equal(result.unitKind, 'absent')
+    assert.match(result.backupManifest, new RegExp(`unit_state=${unitState}`))
+    if (unitState === 'managed-file') assert.equal(result.backedUpUnitContents, result.originalUnitContents)
+  })
+}
+
+test('uninstaller accepts systemctl disable removing the captured legacy unit link', (t) => {
+  const result = runUninstallTransactionHarness(t, {
+    unitState: 'legacy-link',
+    disableRemovesLegacyLink: true
+  })
+  assert.equal(result.status, 0, result.stderr)
+  assert.equal(result.unitKind, 'absent')
+  assert.equal(result.appRootExists, false)
+  assert.match(result.backupManifest, /unit_state=legacy-link/)
+})
+
+for (const unitState of ['foreign-file', 'foreign-link']) {
+  test(`uninstaller refuses ${unitState}`, (t) => {
+    const result = runUninstallTransactionHarness(t, { unitState })
+    assert.equal(result.status, 1)
+    assert.notEqual(result.unitKind, 'absent')
+    assert.equal(result.calls.some((call) => /systemctl\|(stop|disable)/.test(call)), false)
+  })
+}
+
+for (const unitState of ['comment-file', 'pre-file', 'wrapper-file', 'unit-section-file', 'mixed-file']) {
+  test(`uninstaller ownership rejects ${unitState}`, (t) => {
+    const result = runUninstallTransactionHarness(t, { unitState })
+    assert.equal(result.status, 1)
+    assert.notEqual(result.unitKind, 'absent')
+    assert.equal(result.calls.some((call) => /systemctl\|(stop|disable|enable|restart)/.test(call)), false)
+  })
+}
+
+test('uninstaller rollback restores the original direct unit bytes', (t) => {
+  const result = runUninstallTransactionHarness(t, { unitState: 'managed-file', failDisable: true })
+  assert.equal(result.status, 61, result.stderr)
+  assert.equal(result.unitKind, 'file')
+  assert.equal(result.unitContents, result.originalUnitContents)
+})
+
+test('uninstaller does not control a foreign unit swapped before the first mutation', (t) => {
+  const result = runUninstallTransactionHarness(t, { replaceUnitBeforeStop: true })
+  assert.equal(result.status, 1, result.stderr)
+  assert.equal(result.unitLinkTarget, result.foreignUnitTarget)
+  const serviceMutations = result.calls.filter((call) =>
+    /systemctl\|(stop|disable|enable|restart) keepalived\.service$/.test(call)
+  )
+  assert.deepEqual(serviceMutations, [])
+})
+
+test('uninstaller does not disable a foreign unit swapped after stop', (t) => {
+  const result = runUninstallTransactionHarness(t, { replaceUnitBeforeDisable: true })
+  assert.equal(result.status, 1, result.stderr)
+  assert.equal(result.unitLinkTarget, result.foreignUnitTarget)
+  const serviceMutations = result.calls.filter((call) =>
+    /systemctl\|(stop|disable|enable|restart) keepalived\.service$/.test(call)
+  )
+  assert.deepEqual(serviceMutations, ['systemctl|stop keepalived.service'])
+})
 
 test('uninstaller preflight rejects an externally changed SELinux mapping before mutation', (t) => {
   const result = runUninstallTransactionHarness(t, { externalSelinuxPattern: '/run(' })
@@ -2265,11 +2842,52 @@ test('uninstaller ignores a missing unchanged SELinux mapping', (t) => {
   assert.deepEqual(result.selinuxState, [])
 })
 
-test('uninstaller rolls back service state when disable fails', (t) => {
+test('uninstaller restores service state around the unchanged direct unit when disable fails', (t) => {
   const result = runUninstallTransactionHarness(t, { failDisable: true })
   assert.equal(result.status, 61, result.stderr)
-  assertUninstallStateRestored(result)
+  assert.equal(result.appRootExists, true)
+  assert.equal(result.marker, 'before-uninstall\n')
+  assert.equal(result.active, '1')
+  assert.equal(result.enabled, '1')
+  assert.equal(result.unitKind, 'file')
+  assert.equal(result.unitContents, result.originalUnitContents)
   assertUninstallRootNotReplaced(result)
+  assert.deepEqual(result.calls.filter((call) =>
+    /systemctl\|(stop|disable|enable|restart) keepalived\.service$/.test(call)
+  ), [
+    'systemctl|stop keepalived.service',
+    'systemctl|disable keepalived.service',
+    'systemctl|enable keepalived.service',
+    'systemctl|restart keepalived.service'
+  ])
+})
+
+test('uninstaller requires a managed-file FragmentPath before the first service mutation', (t) => {
+  const result = runUninstallTransactionHarness(t, { fragmentMode: 'built-for-managed' })
+  assert.equal(result.status, 1, result.stderr)
+  assert.deepEqual(result.calls.filter((call) =>
+    /systemctl\|(stop|disable|enable|restart) keepalived\.service$/.test(call)
+  ), [])
+})
+
+test('uninstaller rollback verifies enabled state instead of trusting enable success', (t) => {
+  const result = runUninstallTransactionHarness(t, {
+    failFirewallForm: 'permanent',
+    ignoreRollbackEnable: true
+  })
+  assert.equal(result.status, 56, result.stderr)
+  assert.equal(result.enabled, '0')
+  assert.match(result.stderr, /uninstall rollback incomplete/)
+})
+
+test('uninstaller rollback verifies active state instead of trusting restart success', (t) => {
+  const result = runUninstallTransactionHarness(t, {
+    failFirewallForm: 'permanent',
+    ignoreRollbackRestart: true
+  })
+  assert.equal(result.status, 56, result.stderr)
+  assert.equal(result.active, '0')
+  assert.match(result.stderr, /uninstall rollback incomplete/)
 })
 
 test('uninstaller does not replace the application root when stop fails', (t) => {
@@ -2297,10 +2915,38 @@ test('uninstaller rollback does not control a foreign unit installed after prefl
   assert.equal(result.unitLinkTarget, result.foreignUnitTarget)
 })
 
+test('uninstaller rollback does not restore service state through a foreign FragmentPath', (t) => {
+  const result = runUninstallTransactionHarness(t, {
+    failDisable: true,
+    replaceFragmentAfterDisableFailure: true
+  })
+  assert.equal(result.status, 61, result.stderr)
+  assert.deepEqual(result.calls.filter((call) =>
+    /systemctl\|(enable|restart) keepalived\.service$/.test(call)
+  ), [])
+  assert.match(result.stderr, /uninstall rollback incomplete/)
+})
+
 test('uninstaller rolls back an earlier firewall removal when a later removal fails', (t) => {
   const result = runUninstallTransactionHarness(t, { failFirewallForm: 'permanent' })
   assert.equal(result.status, 56, result.stderr)
   assertUninstallStateRestored(result)
+  assertUninstallRootNotReplaced(result)
+})
+
+test('uninstaller rollback restores a disabled legacy link after systemctl disable removes it', (t) => {
+  const result = runUninstallTransactionHarness(t, {
+    unitState: 'legacy-link',
+    disableRemovesLegacyLink: true,
+    serviceActive: false,
+    serviceEnabled: false,
+    failFirewallForm: 'permanent'
+  })
+  assert.equal(result.status, 56, result.stderr)
+  assert.equal(result.active, '0')
+  assert.equal(result.enabled, '0')
+  assert.equal(result.unitKind, 'link')
+  assert.match(result.unitLinkTarget, /\/systemd\/keepalived\.service$/)
   assertUninstallRootNotReplaced(result)
 })
 
