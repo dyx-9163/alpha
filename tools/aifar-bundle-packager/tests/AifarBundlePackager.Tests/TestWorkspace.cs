@@ -25,6 +25,14 @@ internal sealed class TestWorkspace : IDisposable
         return path;
     }
 
+    public string CreateBytes(string relativePath, byte[] content)
+    {
+        var path = Path.Combine(Root, relativePath.Replace('/', Path.DirectorySeparatorChar));
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        File.WriteAllBytes(path, content);
+        return path;
+    }
+
     public string Combine(params string[] parts) =>
         parts.Aggregate(Root, Path.Combine);
 
