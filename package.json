@@ -13,6 +13,7 @@
     "test": "node scripts/test.mjs",
     "test:web": "node scripts/test-web.mjs",
     "test:scripts": "node scripts/test-scripts.mjs",
+    "test:tools": "node tools/test-tools.mjs",
     "test:local": "node scripts/test-local.mjs",
     "test:server:readonly": "node scripts/test-server-readonly.mjs",
     "test:e2e:mutating": "node scripts/test-e2e-mutating.mjs",

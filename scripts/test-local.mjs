@@ -5,6 +5,7 @@ const steps = [
   ['backend tests', process.execPath, ['scripts/test.mjs']],
   ['web tests', process.execPath, ['scripts/test-web.mjs']],
   ['script tests', process.execPath, ['scripts/test-scripts.mjs']],
+  ['tool tests', process.execPath, ['tools/test-tools.mjs']],
   ['web build', process.execPath, ['scripts/build-web.mjs']],
   ['backend build', process.execPath, ['scripts/build-backend.mjs']],
   ['package', process.execPath, ['scripts/package-build.mjs']],

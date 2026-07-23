@@ -37,6 +37,9 @@ jobs:
       - name: Verify startup and release scripts
         run: pnpm test:scripts
 
+      - name: Verify auxiliary tools
+        run: pnpm test:tools
+
       - name: Test AIFAR Bundle Packager
         if: runner.os == 'Windows'
         run: dotnet test tools/aifar-bundle-packager/AifarBundlePackager.sln --configuration Release
@@ -81,6 +84,9 @@ jobs:
 
       - name: Test scripts
         run: pnpm test:scripts
+
+      - name: Test auxiliary tools
+        run: pnpm test:tools
 
       - name: Build web
         run: pnpm web:build
