@@ -32,12 +32,19 @@ public sealed class PackagingFormState
     public IReadOnlyList<string> SelectedServices =>
         _serviceOrder.Where(_selectedServices.Contains).ToArray();
 
+    public bool RequiresJavaSource =>
+        _selectedServices.Any(service =>
+            !string.Equals(service, "web-vue3", StringComparison.OrdinalIgnoreCase));
+
+    public bool RequiresWebDist =>
+        _selectedServices.Contains("web-vue3");
+
     public bool CanPackage =>
         !IsBusy &&
-        !string.IsNullOrWhiteSpace(JavaSourceRoot) &&
-        !string.IsNullOrWhiteSpace(WebDistRoot) &&
+        _selectedServices.Count > 0 &&
         !string.IsNullOrWhiteSpace(OutputPath) &&
-        _selectedServices.Count > 0;
+        (!RequiresJavaSource || !string.IsNullOrWhiteSpace(JavaSourceRoot)) &&
+        (!RequiresWebDist || !string.IsNullOrWhiteSpace(WebDistRoot));
 
     public bool TrySetJavaSourceRoot(string? selectedPath) =>
         TrySetPath(selectedPath, value => JavaSourceRoot = value);

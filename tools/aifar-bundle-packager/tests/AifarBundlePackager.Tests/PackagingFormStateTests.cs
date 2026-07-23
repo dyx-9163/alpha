@@ -18,17 +18,63 @@ public sealed class PackagingFormStateTests
     }
 
     [Fact]
-    public void CanPackage_RequiresEveryManualPathSelection()
+    public void CanPackage_WebOnlyRequiresWebAndOutputButNotJava()
     {
         var state = CreateState();
 
-        state.TrySetJavaSourceRoot(@"D:\java");
-        Assert.False(state.CanPackage);
+        state.ClearServices();
+        state.SetServiceSelected("web-vue3", selected: true);
         state.TrySetWebDistRoot(@"D:\web\dist");
-        Assert.False(state.CanPackage);
         state.TrySetOutputPath(@"D:\output\bundle.zip");
 
+        Assert.False(state.RequiresJavaSource);
+        Assert.True(state.RequiresWebDist);
         Assert.True(state.CanPackage);
+    }
+
+    [Fact]
+    public void CanPackage_JavaOnlyRequiresJavaAndOutputButNotWeb()
+    {
+        var state = CreateState();
+
+        state.ClearServices();
+        state.SetServiceSelected("gateway", selected: true);
+        state.TrySetJavaSourceRoot(@"D:\java");
+        state.TrySetOutputPath(@"D:\output\bundle.zip");
+
+        Assert.True(state.RequiresJavaSource);
+        Assert.False(state.RequiresWebDist);
+        Assert.True(state.CanPackage);
+    }
+
+    [Fact]
+    public void CanPackage_MixedSelectionRequiresBothSources()
+    {
+        var state = CreateState();
+
+        state.ClearServices();
+        state.SetServiceSelected("gateway", selected: true);
+        state.SetServiceSelected("web-vue3", selected: true);
+        state.TrySetJavaSourceRoot(@"D:\java");
+        state.TrySetOutputPath(@"D:\output\bundle.zip");
+
+        Assert.True(state.RequiresJavaSource);
+        Assert.True(state.RequiresWebDist);
+        Assert.False(state.CanPackage);
+        state.TrySetWebDistRoot(@"D:\web\dist");
+        Assert.True(state.CanPackage);
+    }
+
+    [Fact]
+    public void ChangingServiceCategory_PreservesUnusedPaths()
+    {
+        var state = CreateReadyState();
+
+        state.ClearServices();
+        state.SetServiceSelected("web-vue3", selected: true);
+
+        Assert.Equal(@"D:\java", state.JavaSourceRoot);
+        Assert.Equal(@"D:\web\dist", state.WebDistRoot);
     }
 
     [Fact]
