@@ -85,6 +85,7 @@ function connect() {
     fontFamily: '"Cascadia Mono", Consolas, "SFMono-Regular", monospace',
     fontSize: 13,
     lineHeight: 1.2,
+    scrollback: 10000
   })
   terminal.open(terminalEl.value)
   observeTerminalSize()
@@ -177,6 +178,7 @@ onBeforeUnmount(() => {
 <style scoped>
 .terminal-page {
   min-height: 0;
+  overflow: hidden;
 }
 
 .terminal-toolbar {
@@ -207,12 +209,13 @@ onBeforeUnmount(() => {
 }
 
 .terminal-panel {
+  flex: 1 1 auto;
   padding: 14px;
   display: grid;
   grid-template-rows: auto minmax(0, 1fr);
   gap: 12px;
-  min-height: 0;
-  height: clamp(520px, calc(100dvh - 176px), 820px);
+  min-height: 360px;
+  height: auto;
   overflow: hidden !important;
 }
 
@@ -263,6 +266,10 @@ onBeforeUnmount(() => {
 }
 
 @media (max-width: 760px) {
+  .terminal-page {
+    overflow: visible;
+  }
+
   .terminal-toolbar,
   .terminal-session-head {
     align-items: flex-start;
