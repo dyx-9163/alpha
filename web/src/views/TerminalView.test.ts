@@ -1,8 +1,6 @@
-import { readFileSync } from 'node:fs'
-import { fileURLToPath } from 'node:url'
 import { describe, expect, it } from 'vitest'
 
-const source = readFileSync(fileURLToPath(new URL('./TerminalView.vue', import.meta.url)), 'utf8')
+import source from './TerminalView.vue?raw'
 
 describe('terminal viewport contract', () => {
   it('uses remaining flex space instead of viewport subtraction', () => {
