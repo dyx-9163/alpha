@@ -49,6 +49,9 @@
         <el-input-number v-model="runtimeLogTail" size="small" class="runtime-log-tail" :min="20" :max="1000" :step="20" controls-position="right" />
       </div>
       <div class="runtime-tab-actions">
+        <el-button size="small" type="danger" plain :disabled="!runtimeLogErrorCount" @click="showRuntimeLogErrorsOnly">
+          {{ t('containers.errorsOnly') }}
+        </el-button>
         <el-button size="small" type="primary" plain :loading="loading" :disabled="!runtimeLogSelectionReady" @click="loadRuntimeLogs(true)">
           {{ runtimeLogsLoadedForCurrentScope ? t('containers.restartRuntimeLogStream') : t('containers.startRuntimeLogStream') }}
         </el-button>
@@ -86,6 +89,7 @@
         <el-tag size="small" :type="runtimeLogStreamTagType">{{ runtimeLogStreamStatusLabel }}</el-tag>
         <span v-if="runtimeLogLastDataAt">{{ t('containers.logStreamLastEvent', { time: runtimeLogLastDataAt }) }}</span>
         <span>{{ t('containers.visibleLogRows', { count: filteredRuntimeLogRows.length }) }}</span>
+        <span :class="{ 'runtime-log-error-count': runtimeLogErrorCount }">{{ t('containers.errorLogRows', { count: runtimeLogErrorCount }) }}</span>
         <span v-if="runtimeLogDroppedRows">{{ t('containers.droppedLogRows', { count: runtimeLogDroppedRows }) }}</span>
         <span v-if="runtimeLogPendingCount">{{ t('containers.pendingLogRows', { count: runtimeLogPendingCount }) }}</span>
       </div>
@@ -95,7 +99,7 @@
         </div>
         <template v-else>
           <div :style="{ height: `${runtimeLogTopSpacer}px` }"></div>
-          <div v-for="row in runtimeLogVirtualRows" :key="row.id" class="runtime-log-row">
+          <div v-for="row in runtimeLogVirtualRows" :key="row.id" class="runtime-log-row" :class="{ 'is-error': row.errorContext }">
             <span class="runtime-log-time">{{ row.time }}</span>
             <span class="runtime-log-service">{{ row.serviceName }}</span>
             <span class="runtime-log-pod">{{ row.pod }}</span>
@@ -133,6 +137,8 @@ const {
   toggleRuntimeLogPaused,
   runtimeLogPaused,
   runtimeLogRows,
+  runtimeLogErrorCount,
+  showRuntimeLogErrorsOnly,
   runtimeLogPendingCount,
   clearRuntimeLogView,
   runtimeLogAutoScroll,

@@ -280,6 +280,16 @@
   line-height: 20px;
 }
 
+.runtime-log-row.is-error {
+  background: rgba(239, 68, 68, 0.1);
+  box-shadow: inset 3px 0 0 rgba(248, 113, 113, 0.9);
+}
+
+.runtime-log-error-count {
+  color: #dc2626;
+  font-weight: 700;
+}
+
 .runtime-log-time {
   color: #93a4ba;
   white-space: nowrap;

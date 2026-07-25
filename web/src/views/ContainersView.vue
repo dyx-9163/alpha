@@ -207,11 +207,12 @@ import {
 import { useAifarRuntimeProvider } from '../containers/runtime/useAifarRuntimeProvider'
 import {
   parseRuntimeLogErrorEvent,
-  parseRuntimeLogLine,
+  parseRuntimeLogLines,
   parseRuntimeLogsEvent,
   runtimeLogMaxRows,
   runtimeLogRowHeight,
-  runtimeLogVisibleCount
+  runtimeLogVisibleCount,
+  type RuntimeLogParseContext
 } from '../containers/runtime/logs'
 import {
   createRuntimeStatusRefreshScheduler,
@@ -307,6 +308,7 @@ const runtimeLogLastDataAt = ref('')
 let runtimeLogSource: EventSource | null = null
 let runtimeLogStreamKey = ''
 let runtimeLogSequence = 0
+const runtimeLogParseContexts = new Map<string, RuntimeLogParseContext>()
 const runtimeConfigVisible = ref(false)
 const runtimeConfigSubmitting = ref(false)
 const runtimeConfigForm = ref<RuntimeConfigFormValues>({
@@ -410,6 +412,7 @@ const runtimeLogsLoadedForCurrentScope = computed(() => Boolean(runtimeLogsLoade
 const runtimeLogGroups = computed(() => asArray<AifarRuntimeLogPod>(runtimeLogs.value.pods))
 const runtimeLogPodOptions = computed(() => buildRuntimeLogPodOptions(selectedRuntimePodsRaw.value, runtimeLogServiceFilter.value))
 const runtimeLogSelectionReady = computed(() => runtimeLogServiceFilter.value.length > 0 || runtimeLogPodFilter.value.length > 0)
+const runtimeLogErrorCount = computed(() => runtimeLogRows.value.filter((row) => row.errorContext).length)
 const filteredRuntimeLogRows = computed<RuntimeLogRow[]>(() => {
   const levels = new Set(runtimeLogLevelFilter.value.map((item) => item.toUpperCase()))
   const keyword = runtimeLogKeyword.value.trim().toLowerCase()
@@ -873,11 +876,15 @@ function resetRuntimeLogView() {
   runtimeLogPaused.value = false
   runtimeLogDroppedRows.value = 0
   runtimeLogSequence = 0
+  runtimeLogParseContexts.clear()
   runtimeLogScrollTop.value = 0
   runtimeLogLastDataAt.value = ''
 }
 
 function applyRuntimeLogResponse(next: AifarRuntimeLogsResponse, replace: boolean) {
+  if (replace) {
+    runtimeLogParseContexts.clear()
+  }
   runtimeLogs.value = replace ? next : mergeRuntimeLogGroups(runtimeLogs.value, next)
   const rows = runtimeLogRowsFromResponse(next)
   appendRuntimeLogRows(rows)
@@ -910,18 +917,24 @@ function mergeRuntimeLogGroups(current: AifarRuntimeLogsResponse, next: AifarRun
 function runtimeLogRowsFromResponse(next: AifarRuntimeLogsResponse) {
   const rows: RuntimeLogRow[] = []
   for (const pod of asArray<AifarRuntimeLogPod>(next.pods)) {
-    for (const line of asArray<string>(pod.logs)) {
-      const parsed = parseRuntimeLogLine(line)
+    const containerName = pod.containerName || pod.podId || '-'
+    const parsedBatch = parseRuntimeLogLines(
+      asArray<string>(pod.logs),
+      runtimeLogParseContexts.get(containerName)
+    )
+    runtimeLogParseContexts.set(containerName, parsedBatch.context)
+    for (const parsed of parsedBatch.lines) {
       const sequence = runtimeLogSequence++
       rows.push({
-        id: `${pod.containerName}:${sequence}`,
+        id: `${containerName}:${sequence}`,
         time: parsed.time,
         timestamp: parsed.timestamp,
         sequence,
         serviceName: pod.serviceName || '-',
-        pod: pod.containerName || pod.podId || '-',
+        pod: containerName,
         level: parsed.level,
-        message: parsed.message
+        message: parsed.message,
+        errorContext: Boolean(parsed.errorContext)
       })
     }
   }
@@ -971,9 +984,14 @@ function clearRuntimeLogView() {
   }
   runtimeLogDroppedRows.value = 0
   runtimeLogScrollTop.value = 0
+  runtimeLogParseContexts.clear()
   if (shouldRestart) {
     openRuntimeLogStream(true)
   }
+}
+
+function showRuntimeLogErrorsOnly() {
+  runtimeLogLevelFilter.value = ['ERROR']
 }
 
 function clearRuntimeLogServiceFilter() {
@@ -1637,6 +1655,8 @@ useAifarRuntimeProvider({
   toggleRuntimeLogPaused,
   runtimeLogPaused,
   runtimeLogRows,
+  runtimeLogErrorCount,
+  showRuntimeLogErrorsOnly,
   runtimeLogPendingCount,
   clearRuntimeLogView,
   runtimeLogAutoScroll,

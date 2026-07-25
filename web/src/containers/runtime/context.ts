@@ -101,6 +101,8 @@ export type AifarRuntimeContext = {
   toggleRuntimeLogPaused: () => void
   runtimeLogPaused: Ref<boolean>
   runtimeLogRows: Ref<RuntimeLogRow[]>
+  runtimeLogErrorCount: ComputedRef<number>
+  showRuntimeLogErrorsOnly: () => void
   runtimeLogPendingCount: ComputedRef<number>
   clearRuntimeLogView: () => void
   runtimeLogAutoScroll: Ref<boolean>

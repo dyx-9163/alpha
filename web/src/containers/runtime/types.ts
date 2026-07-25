@@ -152,6 +152,7 @@ export type RuntimeLogRow = {
   pod: string
   level: string
   message: string
+  errorContext: boolean
 }
 
 export type RuntimeEntryRoute = {

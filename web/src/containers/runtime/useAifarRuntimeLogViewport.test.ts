@@ -107,6 +107,7 @@ function rows(count: number): RuntimeLogRow[] {
     serviceName: 'gateway',
     pod: 'gateway-1',
     level: 'INFO',
-    message: `message-${sequence}`
+    message: `message-${sequence}`,
+    errorContext: false
   }))
 }
