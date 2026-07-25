@@ -214,6 +214,10 @@ import {
   runtimeLogVisibleCount
 } from '../containers/runtime/logs'
 import {
+  createRuntimeStatusRefreshScheduler,
+  isRuntimeStatusEventForSelection
+} from '../containers/runtime/runtimeStatusRefresh'
+import {
   buildAifarServiceOptions,
   buildRuntimeLogPodOptions,
   buildRuntimeServiceMap,
@@ -394,6 +398,14 @@ const installedRuntimeServiceNames = computed(() => new Set(selectedRuntimeServi
 const runtimeServiceMap = computed(() => buildRuntimeServiceMap(selectedRuntimeServices.value))
 const runtimePodsLoadedForCurrentScope = computed(() => Boolean(runtimePodsLoaded.value[runtimeCacheKey('pods')]))
 const runtimePodStatsLoadedForCurrentScope = computed(() => Boolean(runtimePodStatsLoaded.value[runtimeCacheKey('pods')]))
+const runtimeStatusRefresh = createRuntimeStatusRefreshScheduler(
+  () => loadAifarRuntime(
+    true,
+    runtimeResourceTab.value === 'pods',
+    runtimeResourceTab.value === 'pods' && runtimePodStatsLoadedForCurrentScope.value,
+    true
+  )
+)
 const runtimeLogsLoadedForCurrentScope = computed(() => Boolean(runtimeLogsLoaded.value[runtimeLogCacheKey()]))
 const runtimeLogGroups = computed(() => asArray<AifarRuntimeLogPod>(runtimeLogs.value.pods))
 const runtimeLogPodOptions = computed(() => buildRuntimeLogPodOptions(selectedRuntimePodsRaw.value, runtimeLogServiceFilter.value))
@@ -678,8 +690,8 @@ async function loadCollection(force = false) {
   collectionCache.value = { ...collectionCache.value, [key]: next }
 }
 
-async function loadAifarRuntime(force = false, includePods = runtimeResourceTab.value === 'pods', includeStats = false) {
-  return withLoading(async () => {
+async function loadAifarRuntime(force = false, includePods = runtimeResourceTab.value === 'pods', includeStats = false, background = false) {
+  const execute = async () => {
     const query = targetQuery()
     if (!query) {
       aifarRuntime.value = { runtimeStatus: 'unknown', agent: { status: 'unknown' }, instances: [], services: [], pods: [], ingress: [], warnings: [] }
@@ -711,7 +723,8 @@ async function loadAifarRuntime(force = false, includePods = runtimeResourceTab.
     if (!instances.some((instance) => instance.id === selectedRuntimeInstanceId.value)) {
       selectedRuntimeInstanceId.value = instances.find((instance) => !instance.legacy)?.id ?? instances[0]?.id ?? ''
     }
-  })
+  }
+  return background ? execute() : withLoading(execute)
 }
 
 async function loadAifarReleases(force = false) {
@@ -1743,11 +1756,9 @@ watch(() => realtime.revision, () => {
     }
     return
   }
-  if (event.resource === 'aifar.runtime' && tab.value === 'aifar-runtime') {
-    if (event.serverId && event.serverId !== selectedServerId.value) {
-      return
-    }
+  if (isRuntimeStatusEventForSelection(event, selectedServerId.value, tab.value === 'aifar-runtime')) {
     runtimeCache.value = {}
+    runtimeStatusRefresh.request()
   }
 })
 watch([aifarUpdateService, aifarUpdateMode], () => {
@@ -1772,6 +1783,7 @@ onMounted(async () => {
   await load()
 })
 onBeforeUnmount(() => {
+  runtimeStatusRefresh.dispose()
   closeRuntimeLogStream()
 })
 </script>
