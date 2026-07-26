@@ -11,6 +11,12 @@
       </div>
     </div>
 
+    <div class="aifar-panel status-line">
+      <span class="subtle-note">{{ t('storage.instanceCount', { count: minioInstances.length }) }}</span>
+      <span class="status-pill" :class="{ success: canManageApps }">{{ monitoringStatusLabel }}</span>
+      <span v-if="lastMonitorAt" class="subtle-note">{{ t('storage.lastMonitoredAt') }} {{ lastMonitorAt }}</span>
+    </div>
+
     <el-tabs v-model="tab" class="tab-strip">
       <el-tab-pane v-for="tabName in visibleManagementTabs.storage" :key="tabName" :label="t('storage.instances')" :name="tabName" />
     </el-tabs>
@@ -314,6 +320,7 @@ import {
   minioStorageDisksFromMetadata,
   minioStorageInsightFromMetadata
 } from '../storage/minioInsights'
+import { filterMinioInstances, latestSnapshotTime } from '../storage/monitoringStatus'
 import { applyRealtimeStatusToAppInstance, useRealtimeStore } from '../stores/realtime'
 import { useTaskProgressStore } from '../stores/taskProgress'
 import { visibleManagementHeaderActions, visibleManagementTabs } from './managementEntries'
@@ -402,10 +409,18 @@ const collection = reactive<Record<string, any[]>>({
 const canManageStorage = computed(() => can(permissions.storageManage))
 const canManageApps = computed(() => can(permissions.appsManage))
 const liveInstances = computed(() => instances.value.map((instance) => applyRealtimeStatusToAppInstance(instance, realtime.appInstanceSnapshot(instance.id))))
+const minioInstances = computed(() => filterMinioInstances(liveInstances.value))
+const lastMonitorAt = computed(() => latestSnapshotTime(
+  minioInstances.value.map((instance) => realtime.appInstanceSnapshot(instance.id))
+))
+const monitoringStatusLabel = computed(() => {
+  if (!canManageApps.value) return t('storage.monitorPermissionRequired')
+  return t('storage.backendPushReady')
+})
 
 const storageGroups = computed(() => {
   const q = search.value.trim().toLowerCase()
-  const groups = buildStorageGroups(liveInstances.value.filter((item) => item.app === 'minio'))
+  const groups = buildStorageGroups(minioInstances.value)
   if (!q) return groups
   return groups.filter((group) => storageGroupSearchText(group).includes(q))
 })
@@ -1029,6 +1044,12 @@ onMounted(load)
 </script>
 
 <style scoped>
+.status-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
 .storage-main {
   display: flex;
   flex-direction: column;
