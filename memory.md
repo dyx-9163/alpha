@@ -684,3 +684,15 @@
 - 结论：终端多会话已实现并以合并提交 `24589042` 合入 `codex/status-collector-realtime`：同一服务器可建立多个独立 WebSocket/xterm 页签，后台会话保持挂载，最多 4 个窗格按 1/2/2×2 自适应显示，焦点会话可独立断开/重连，关闭活动连接需确认；`App.vue` 仅 KeepAlive 具名 `TerminalView`，切换菜单不断连，退出或真卸载会清理连接。合并后验证通过后端全部包测试、前端 193/193 和生产构建；临时 worktree 与已合并过程分支均已删除，未推送远端。
 - 问题：用户确认上线前基础服务凭据改密的最终设计，要求形成完整中文方案并明确集群处理、自动化与人工操作边界。
 - 结论：正式设计写入 `docs/superpowers/specs/2026-07-26-prelaunch-foundation-credential-rotation-design.md`，以提交 `5e0d1582` 单独保存。自动阶段集群感知地轮换 MySQL、Redis、MinIO、Nacos，更新凭据中心和所有 Runtime 节点的 Nacos 环境文件，并可下线 Java；业务 Nacos YAML 和 Java 恢复由人工完成，批次进入 `waiting_manual_config`，最后由面板执行只读验证闭环。
+- 问题：用户要求检查当前 Keepalived 是否仍会因 systemd unit 使用软链接而在服务器重启后无法自动启动。
+- 结论：当前分支安装器会把 `/etc/systemd/system/keepalived.service` 原子安装为 root:root、0644 的普通文件，并加入 `RequiresMountsFor=/aifar/apps/keepalived`，成功路径不使用 `systemctl link`；旧 AIFAR 软链接会在重复安装时迁移，脚本中的 `ln -sT` 仅用于安装或卸载失败时恢复原有旧状态。本轮 Keepalived 专项测试 215/215 和 3 个 Bash 语法检查通过；但现有服务器是否已完成迁移仍须在主机上只读检查 unit 类型、FragmentPath、enabled/active 及本次启动日志，自动化测试不替代真实重启验收。
+- 问题：用户询问多个 Keepalived 是否可以重复使用 `KEEPALIVED_VIRTUAL_ROUTER_ID=130`。
+- 结论：同一个 VRRP 高可用组的 MASTER/BACKUP 节点必须使用相同 VRID；同一二层网络或 VLAN 上彼此独立的 Keepalived 组应使用不同 VRID，即使 VIP 不同也不要重复，否则可能互相参与选举或拒收通告。完全隔离的二层网络可重复使用。当前安装器允许范围 1-255，130 有效；独立组建议统一规划唯一编号。
+- 问题：用户询问当前以服务器地址注册 Nacos 的方式，是否可作为 Java 多实例和集群扩展方案，并希望理解 Nacos 注册中心的作用。
+- 结论：当前 agent-proxy 模式可作为无状态 Java 服务横向扩展的服务发现入口：同机多副本共用一个“宿主机 IP + 服务代理端口”注册实例，由 agent 在本机健康容器间选路；未来跨服务器部署时，每台主机可向同一 namespace/group/serviceName 注册各自宿主机地址，形成 Nacos 多实例列表。Nacos 只负责实例目录、订阅与健康状态，不负责创建副本、跨机调度、数据一致性或状态型集群协议；当前 AIFAR 安装清单仍限制单目标，因此尚未形成完整跨服务器集群编排，且注册心跳目前不能代表代理后端一定存在 ready endpoint，跨机 HA 前需补健康联动、全局扩缩容和故障收敛验收。
+- 问题：用户认为后端服务通过 Spring Cloud 内部通信可能与 Nacos 无关，并追问 Nacos 在应用集群中的作用。
+- 结论：Spring Cloud 是服务调用与治理框架，Nacos Discovery 通常为它提供“服务名到可用实例地址列表”的发现数据；Nacos 不承载实际 HTTP/RPC 流量。使用 `@FeignClient(name=...)`、`lb://service` 或 DiscoveryClient 时通常依赖 Nacos，只有固定 URL/IP 调用才可与注册中心无关。当前 AIFAR 明确配置 Java 连接 Nacos但关闭 Java 自注册，由 agent 注册宿主机代理实例，符合“Java 作为消费者发现服务、agent 作为提供方注册代理地址”的模式；Nacos 集群本身解决注册中心高可用，业务多实例解决应用容量与容错，两者不可混为一谈。
+- 问题：用户确认后端服务之间实际使用 Feign 调用。
+- 结论：若业务代码使用 `@FeignClient(name/value="服务名")` 且未配置固定 `url`，Feign 会经 Spring Cloud LoadBalancer/DiscoveryClient 从 Nacos 获取同名服务实例，再直接请求选中的 agent-proxy 地址；因此当前 Nacos 是服务寻址和实例上下线来源，agent 是服务器级流量入口，Feign 承担客户端调用。当前部署仓库不包含业务 Java 源码，无法仅从本仓库确认每个 FeignClient 是否存在固定 URL 覆盖，需在业务源码或 Nacos YAML 中核对。
+- 问题：用户确认是否可以把 Nacos 作为业务集群负载方案。
+- 结论：可以把 Nacos 作为服务间集群负载体系的服务发现基础，但不能表述为 Nacos 自己转发或均衡流量；实际跨服务器实例选择由 Feign 配套的 Spring Cloud LoadBalancer 完成，服务器内部容器副本选择由 aifar-agent 完成。该方案适用于无状态后端服务，不替代浏览器外部入口负载均衡、跨节点部署编排、状态数据集群或端到端健康门禁。
