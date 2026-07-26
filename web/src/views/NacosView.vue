@@ -18,10 +18,7 @@
     </div>
 
     <el-tabs v-model="tab" class="tab-strip">
-      <el-tab-pane :label="t('nacos.instances')" name="instances" />
-      <el-tab-pane :label="t('nacos.configPublish')" name="configs" />
-      <el-tab-pane :label="t('nacos.runs')" name="runs" />
-      <el-tab-pane :label="t('nacos.settings')" name="settings" />
+      <el-tab-pane v-for="tabName in visibleManagementTabs.nacos" :key="tabName" :label="t('nacos.instances')" :name="tabName" />
     </el-tabs>
 
     <div class="workspace-card nacos-main">
@@ -279,6 +276,7 @@ import { useI18n } from '../i18n'
 import { permissions } from '../rbac'
 import { applyRealtimeStatusToAppInstance, useRealtimeStore } from '../stores/realtime'
 import { useTaskProgressStore } from '../stores/taskProgress'
+import { visibleManagementTabs } from './managementEntries'
 
 type AppInstance = {
   id: string

@@ -27,4 +27,3 @@
 - 添加一个小型页面入口清单模块，由三个页面使用并通过 Vitest 验证各页面只返回 `instances`。
 - 通过前端单元测试验证入口清单。
 - 运行 `pnpm test:web`、`pnpm web:build` 和 `git diff --check`。
-

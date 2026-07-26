@@ -31,7 +31,7 @@
 - Produces: `visibleManagementTabs: Readonly<Record<'database' | 'nacos' | 'storage', readonly ['instances']>>`
 - Consumes: Vue template iteration over `visibleManagementTabs.<page>` and existing page i18n keys.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```ts
 import { describe, expect, it } from 'vitest'
@@ -49,13 +49,13 @@ describe('visible management tabs', () => {
 })
 ```
 
-- [ ] **Step 2: Run the focused test and verify RED**
+- [x] **Step 2: Run the focused test and verify RED**
 
 Run: `pnpm exec vitest run src/views/managementEntries.test.ts` from `web/`.
 
 Expected: FAIL because `./managementEntries` does not exist.
 
-- [ ] **Step 3: Add the minimal policy and render tabs from it**
+- [x] **Step 3: Add the minimal policy and render tabs from it**
 
 Create the typed constant:
 
@@ -69,13 +69,13 @@ export const visibleManagementTabs = {
 
 Import it into each page and replace hard-coded secondary `el-tab-pane` nodes with a single `v-for` driven by the relevant list. Use the page's existing instance label key. In `StorageView.vue`, remove only the two tooltip/button nodes that call `applyVisibleStorageCleanupPolicy` and `disableVisibleStorageCleanupPolicy`.
 
-- [ ] **Step 4: Run the focused test and verify GREEN**
+- [x] **Step 4: Run the focused test and verify GREEN**
 
 Run: `pnpm exec vitest run src/views/managementEntries.test.ts` from `web/`.
 
 Expected: PASS with 1 test.
 
-- [ ] **Step 5: Run complete frontend verification**
+- [x] **Step 5: Run complete frontend verification**
 
 Run from repository root:
 
@@ -87,7 +87,6 @@ git diff --check
 
 Expected: all commands exit 0 with no failed tests or TypeScript/build errors.
 
-- [ ] **Step 6: Record the reusable conclusion**
+- [x] **Step 6: Record the reusable conclusion**
 
 Append a concise entry to `memory.md` stating which UI entries are hidden and that underlying APIs/data remain intact.
-

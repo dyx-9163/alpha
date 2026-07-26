@@ -12,13 +12,7 @@
     </div>
 
     <el-tabs v-model="tab" class="tab-strip">
-      <el-tab-pane :label="t('storage.instances')" name="instances" />
-      <el-tab-pane :label="t('storage.buckets')" name="buckets" />
-      <el-tab-pane :label="t('storage.objects')" name="objects" />
-      <el-tab-pane :label="t('storage.access')" name="access" />
-      <el-tab-pane :label="t('storage.replica')" name="replica" />
-      <el-tab-pane :label="t('storage.runs')" name="runs" />
-      <el-tab-pane :label="t('storage.settings')" name="settings" />
+      <el-tab-pane v-for="tabName in visibleManagementTabs.storage" :key="tabName" :label="t('storage.instances')" :name="tabName" />
     </el-tabs>
 
     <div class="workspace-card storage-main">
@@ -33,12 +27,6 @@
             </el-button-group>
             <el-input-number v-model="cleanupRetentionDays" :min="1" :max="3650" :step="1" size="small" class="cleanup-retention-control" />
             <el-button :loading="cleanupEstimating" @click="estimateVisibleStorageCleanup">{{ t('storage.estimateCleanup') }}</el-button>
-            <el-tooltip :content="deniedText" :disabled="canManageStorage" placement="top">
-              <span><el-button type="primary" :loading="cleanupPolicyApplying" :disabled="!canManageStorage" @click="applyVisibleStorageCleanupPolicy">{{ t('storage.applyCleanupPolicy') }}</el-button></span>
-            </el-tooltip>
-            <el-tooltip :content="deniedText" :disabled="canManageStorage" placement="top">
-              <span><el-button :loading="cleanupPolicyApplying" :disabled="!canManageStorage" @click="disableVisibleStorageCleanupPolicy">{{ t('storage.disableCleanupPolicy') }}</el-button></span>
-            </el-tooltip>
           </template>
           <el-select v-if="tab !== 'instances'" v-model="selectedInstanceId" :placeholder="t('storage.selectInstance')" class="toolbar-control">
             <el-option v-for="item in instances" :key="item.id" :label="instanceLabel(item)" :value="item.id" />
@@ -328,6 +316,7 @@ import {
 } from '../storage/minioInsights'
 import { applyRealtimeStatusToAppInstance, useRealtimeStore } from '../stores/realtime'
 import { useTaskProgressStore } from '../stores/taskProgress'
+import { visibleManagementTabs } from './managementEntries'
 
 type AppInstance = {
   id: string
