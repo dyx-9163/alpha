@@ -1,0 +1,93 @@
+# Hide Secondary Management Entries Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** Hide the requested secondary tabs and MinIO cleanup-policy mutation buttons while preserving all backend capabilities and stored data.
+
+**Architecture:** Add a tiny typed UI-entry policy module that exposes the visible tab list for Database, Nacos, and Storage. Render each page's tabs from that policy, and remove only the two requested Storage action buttons from the template; all dormant content branches and service calls remain unchanged.
+
+**Tech Stack:** Vue 3, TypeScript, Element Plus, Vitest
+
+## Global Constraints
+
+- Keep only the `instances` tab visible on Database, Nacos, and Storage.
+- Keep Storage cleanup estimation controls visible.
+- Hide Storage cleanup-policy apply and disable buttons.
+- Do not change APIs, persistence, permissions, tasks, or remote services.
+- Preserve dormant implementation so the entries can be restored later.
+
+---
+
+### Task 1: Visible management entry policy and page templates
+
+**Files:**
+- Create: `web/src/views/managementEntries.ts`
+- Test: `web/src/views/managementEntries.test.ts`
+- Modify: `web/src/views/DatabaseView.vue`
+- Modify: `web/src/views/NacosView.vue`
+- Modify: `web/src/views/StorageView.vue`
+
+**Interfaces:**
+- Produces: `visibleManagementTabs: Readonly<Record<'database' | 'nacos' | 'storage', readonly ['instances']>>`
+- Consumes: Vue template iteration over `visibleManagementTabs.<page>` and existing page i18n keys.
+
+- [ ] **Step 1: Write the failing test**
+
+```ts
+import { describe, expect, it } from 'vitest'
+
+import { visibleManagementTabs } from './managementEntries'
+
+describe('visible management tabs', () => {
+  it('exposes only instance tabs on database, Nacos, and storage pages', () => {
+    expect(visibleManagementTabs).toEqual({
+      database: ['instances'],
+      nacos: ['instances'],
+      storage: ['instances']
+    })
+  })
+})
+```
+
+- [ ] **Step 2: Run the focused test and verify RED**
+
+Run: `pnpm exec vitest run src/views/managementEntries.test.ts` from `web/`.
+
+Expected: FAIL because `./managementEntries` does not exist.
+
+- [ ] **Step 3: Add the minimal policy and render tabs from it**
+
+Create the typed constant:
+
+```ts
+export const visibleManagementTabs = {
+  database: ['instances'],
+  nacos: ['instances'],
+  storage: ['instances']
+} as const
+```
+
+Import it into each page and replace hard-coded secondary `el-tab-pane` nodes with a single `v-for` driven by the relevant list. Use the page's existing instance label key. In `StorageView.vue`, remove only the two tooltip/button nodes that call `applyVisibleStorageCleanupPolicy` and `disableVisibleStorageCleanupPolicy`.
+
+- [ ] **Step 4: Run the focused test and verify GREEN**
+
+Run: `pnpm exec vitest run src/views/managementEntries.test.ts` from `web/`.
+
+Expected: PASS with 1 test.
+
+- [ ] **Step 5: Run complete frontend verification**
+
+Run from repository root:
+
+```powershell
+pnpm test:web
+pnpm web:build
+git diff --check
+```
+
+Expected: all commands exit 0 with no failed tests or TypeScript/build errors.
+
+- [ ] **Step 6: Record the reusable conclusion**
+
+Append a concise entry to `memory.md` stating which UI entries are hidden and that underlying APIs/data remain intact.
+
