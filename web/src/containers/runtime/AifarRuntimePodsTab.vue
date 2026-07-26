@@ -5,9 +5,6 @@
         <el-option v-for="service in installedRuntimeServiceNamesList" :key="service" :label="service" :value="service" />
       </el-select>
       <div class="runtime-tab-actions">
-        <el-tooltip :content="aifarRuntimeActionDisabledReason" :disabled="!aifarRuntimeActionDisabledReason" placement="top">
-          <span><el-button size="small" type="primary" plain :disabled="Boolean(aifarRuntimeActionDisabledReason)" @click="recoverAifarRuntimePods">{{ t('containers.recoverRuntimePods') }}</el-button></span>
-        </el-tooltip>
         <el-button size="small" :loading="loading" @click="ensureRuntimePodsLoaded(true)">{{ t('common.refresh') }}</el-button>
         <el-button size="small" plain :loading="loading" @click="ensureRuntimePodsLoaded(true, true)">{{ t('containers.refreshPodStats') }}</el-button>
       </div>
@@ -50,8 +47,6 @@ const {
   runtimePodServiceFilter,
   clearRuntimePodServiceFilter,
   installedRuntimeServiceNamesList,
-  aifarRuntimeActionDisabledReason,
-  recoverAifarRuntimePods,
   ensureRuntimePodsLoaded,
   runtimePodsLoadedForCurrentScope,
   selectedRuntimePods,

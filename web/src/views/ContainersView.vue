@@ -1453,10 +1453,6 @@ async function restartAllAifarRuntime() {
   }
 }
 
-async function recoverAifarRuntimePods() {
-  await submitRuntimeReconcile('containers.recoverRuntimePods', 'containers.confirmRecoverRuntimePods')
-}
-
 function openRuntimePodLogs(row: AifarRuntimePod) {
   const service = String(row?.serviceName || '').trim()
   const pod = String(row?.containerName || '').trim()
@@ -1749,7 +1745,6 @@ useAifarRuntimeProvider({
   runtimePodServiceFilter,
   clearRuntimePodServiceFilter,
   installedRuntimeServiceNamesList,
-  recoverAifarRuntimePods,
   ensureRuntimePodsLoaded,
   runtimePodsLoadedForCurrentScope,
   selectedRuntimePods,
