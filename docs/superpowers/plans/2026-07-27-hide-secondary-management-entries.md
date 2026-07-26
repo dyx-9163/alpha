@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Hide the requested secondary tabs and MinIO cleanup-policy mutation buttons while preserving all backend capabilities and stored data.
+**Goal:** Hide the requested secondary tabs and MinIO cleanup-policy mutation buttons, and align Database and Nacos header actions with Storage while preserving all backend capabilities and stored data.
 
-**Architecture:** Add a tiny typed UI-entry policy module that exposes the visible tab list for Database, Nacos, and Storage. Render each page's tabs from that policy, and remove only the two requested Storage action buttons from the template; all dormant content branches and service calls remain unchanged.
+**Architecture:** Add a tiny typed UI-entry policy module that exposes the visible tab and header-action lists for Database, Nacos, and Storage. Render each page's tabs from that policy, align their headers on connected status plus refresh, and remove only the two requested Storage action buttons from the template; all dormant content branches and service calls remain unchanged.
 
 **Tech Stack:** Vue 3, TypeScript, Element Plus, Vitest
 
@@ -13,6 +13,8 @@
 - Keep only the `instances` tab visible on Database, Nacos, and Storage.
 - Keep Storage cleanup estimation controls visible.
 - Hide Storage cleanup-policy apply and disable buttons.
+- Show only connected status and refresh in all three page headers.
+- Remove the Database and Nacos application-store deployment shortcuts without deleting the route or deployment capability.
 - Do not change APIs, persistence, permissions, tasks, or remote services.
 - Preserve dormant implementation so the entries can be restored later.
 
@@ -90,3 +92,48 @@ Expected: all commands exit 0 with no failed tests or TypeScript/build errors.
 - [x] **Step 6: Record the reusable conclusion**
 
 Append a concise entry to `memory.md` stating which UI entries are hidden and that underlying APIs/data remain intact.
+
+### Task 2: Align Database and Nacos header actions with Storage
+
+**Files:**
+- Modify: `web/src/views/managementEntries.ts`
+- Test: `web/src/views/managementEntries.test.ts`
+- Modify: `web/src/views/DatabaseView.vue`
+- Modify: `web/src/views/NacosView.vue`
+
+**Interfaces:**
+- Produces: `visibleManagementHeaderActions: Readonly<Record<'database' | 'nacos' | 'storage', readonly ['connected', 'refresh']>>`
+- Consumes: Database and Nacos page headers render the existing `common.connected` label and refresh button from this policy.
+
+- [ ] **Step 1: Extend the failing policy test**
+
+```ts
+expect(visibleManagementHeaderActions).toEqual({
+  database: ['connected', 'refresh'],
+  nacos: ['connected', 'refresh'],
+  storage: ['connected', 'refresh']
+})
+```
+
+- [ ] **Step 2: Run the focused test and verify RED**
+
+Run: `node node_modules/vitest/vitest.mjs run src/views/managementEntries.test.ts` from `web/`.
+
+Expected: FAIL because `visibleManagementHeaderActions` is not exported.
+
+- [ ] **Step 3: Implement the minimal header policy and template changes**
+
+Export the action policy from `managementEntries.ts`. In `DatabaseView.vue` and `NacosView.vue`, replace the application-store deployment button with the same successful connection pill used by `StorageView.vue`, then keep the existing refresh button. Do not remove `useRouter`, because both pages still navigate to task details through the router.
+
+- [ ] **Step 4: Run focused and complete verification**
+
+Run from repository root:
+
+```powershell
+node web/node_modules/vitest/vitest.mjs run web/src/views/managementEntries.test.ts
+pnpm test:web
+pnpm web:build
+git diff --check
+```
+
+Expected: all commands exit 0; the focused file has 2 passing tests and the complete frontend suite has no failures.
