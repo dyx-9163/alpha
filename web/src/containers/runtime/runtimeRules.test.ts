@@ -75,6 +75,26 @@ describe('runtime artifact rules', () => {
     expect(String(messages.en['apps.aifarUpdateBundleHint'])).not.toContain('export-alpha-jars')
   })
 
+  it('warns that restart-all stops every pod before starting all desired replicas', () => {
+    const zhMessage = messages.zh['containers.confirmRestartAllRuntime']
+    const enMessage = messages.en['containers.confirmRestartAllRuntime']
+    if (typeof zhMessage !== 'function' || typeof enMessage !== 'function') {
+      throw new Error('restart-all confirmation must be parameterized')
+    }
+
+    const zh = zhMessage({ services: 10, replicas: 10 })
+    const en = enMessage({ services: 10, replicas: 10 })
+
+    for (const expected of ['10', '全部业务不可用', '继续启动其他服务', '不会自动回滚']) {
+      expect(zh).toContain(expected)
+    }
+    expect(zh).not.toContain('滚动')
+    for (const expected of ['10', 'all business services are unavailable', 'continue starting the remaining services', 'not automatically roll back']) {
+      expect(en).toContain(expected)
+    }
+    expect(en.toLowerCase()).not.toContain('rolling')
+  })
+
   it.each([
     ['bundle', 'gateway', '.zip', 'apps.aifarUpdateBundleHint'],
     ['single', 'web-vue3', '.zip,.tar,.tgz,.tar.gz', 'apps.aifarUpdateFrontendHint'],
