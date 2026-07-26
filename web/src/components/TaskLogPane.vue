@@ -8,6 +8,25 @@
       <div class="task-actions">
         <el-button size="small" @click="loadTasks">{{ t('common.refresh') }}</el-button>
         <ConfirmAction
+          :message="t('tasks.confirmStopTask')"
+          :title="t('tasks.stopTask')"
+          :confirm-text="t('tasks.stopTask')"
+          :cancel-text="t('common.cancel')"
+          type="warning"
+          :disabled="!canStopCurrentTask || stopBusy"
+          @confirm="stopCurrentTask"
+        >
+          <template #default="{ confirm }">
+            <el-tooltip :content="stopDisabledReason" :disabled="canStopCurrentTask || !stopDisabledReason" placement="top">
+              <span>
+                <el-button size="small" type="warning" plain :loading="stopBusy" :disabled="!canStopCurrentTask || stopBusy" @click="confirm">
+                  {{ t('tasks.stopTask') }}
+                </el-button>
+              </span>
+            </el-tooltip>
+          </template>
+        </ConfirmAction>
+        <ConfirmAction
           :message="t('tasks.confirmClearLogs')"
           :title="t('tasks.clearLogs')"
           :confirm-text="t('tasks.clearLogs')"
@@ -84,6 +103,7 @@ import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import { apiDelete, apiGet, asArray } from '../api/client'
 import { useI18n } from '../i18n'
+import { cancelTask, isTaskCancellable } from '../tasks/actions'
 import ConfirmAction from './ConfirmAction.vue'
 import TaskListPanel from './TaskListPanel.vue'
 import TaskRunPanel from './TaskRunPanel.vue'
@@ -155,6 +175,7 @@ const servers = ref<ServerSummary[]>([])
 const detail = ref<TaskDetail | null>(null)
 const selectedTaskId = ref('')
 const selectedTaskIds = ref<string[]>([])
+const stopBusy = ref(false)
 let source: EventSource | null = null
 let refreshTimer: number | null = null
 
@@ -168,6 +189,23 @@ const selectableTasks = computed(() => {
 
 const deleteConfirmText = computed(() => {
   return selectedTaskIds.value.length > 1 ? t('tasks.confirmDeleteTasks', { count: selectedTaskIds.value.length }) : t('tasks.confirmDeleteTask')
+})
+
+const canStopCurrentTask = computed(() => {
+  return Boolean(props.canManage && selectedTaskId.value && detail.value?.task.id === selectedTaskId.value && isTaskCancellable(detail.value?.task.status))
+})
+
+const stopDisabledReason = computed(() => {
+  if (!props.canManage) {
+    return props.disabledReason
+  }
+  if (!selectedTaskId.value) {
+    return t('tasks.selectTaskToStop')
+  }
+  if (!isTaskCancellable(detail.value?.task.status)) {
+    return t('tasks.taskCannotStop')
+  }
+  return ''
 })
 
 watch(
@@ -254,6 +292,31 @@ async function clearCurrentTaskLogs() {
     ElMessage.success(t('tasks.logsCleared'))
   } catch (err) {
     ElMessage.error(err instanceof Error ? err.message : String(err))
+  }
+}
+
+async function stopCurrentTask() {
+  if (!props.canManage) {
+    ElMessage.warning(props.disabledReason)
+    return
+  }
+  const taskId = selectedTaskId.value
+  if (!taskId || !isTaskCancellable(detail.value?.task.status)) {
+    return
+  }
+  stopBusy.value = true
+  try {
+    const result = await cancelTask(taskId)
+    await Promise.all([loadTaskDetail(taskId), loadTasks()])
+    if (result.cancelled) {
+      ElMessage.success(t('tasks.stopRequested'))
+    } else {
+      ElMessage.warning(t('tasks.stopNotAccepted'))
+    }
+  } catch (err) {
+    ElMessage.error(err instanceof Error ? err.message : String(err))
+  } finally {
+    stopBusy.value = false
   }
 }
 
