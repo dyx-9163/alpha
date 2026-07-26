@@ -1,11 +1,79 @@
 package adapter
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"io"
 	"testing"
 	"time"
 )
+
+type closedPipeWriter struct{}
+
+func (closedPipeWriter) Write([]byte) (int, error) {
+	return 0, io.ErrClosedPipe
+}
+
+func TestStreamSSHOutputCopiesBinaryBytes(t *testing.T) {
+	payload := []byte{0x00, 0x01, 0xff, '\n', 'A'}
+	var dst bytes.Buffer
+
+	copied, err := streamSSHOutputWithContext(context.Background(), &dst, bytes.NewReader(payload),
+		func() error { return nil }, func() {}, func() string { return "" })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if copied != int64(len(payload)) || !bytes.Equal(dst.Bytes(), payload) {
+		t.Fatalf("binary payload changed: %x", dst.Bytes())
+	}
+}
+
+func TestStreamSSHOutputCancelsSessionWhenWriterFails(t *testing.T) {
+	cancelled := make(chan struct{})
+	started := make(chan struct{})
+
+	copied, err := streamSSHOutputWithContext(context.Background(), closedPipeWriter{}, bytes.NewReader([]byte("data")),
+		func() error {
+			close(started)
+			<-cancelled
+			return errors.New("session closed")
+		},
+		func() { close(cancelled) },
+		func() string { return "" },
+	)
+	if !errors.Is(err, io.ErrClosedPipe) {
+		t.Fatalf("expected closed pipe error, got %v", err)
+	}
+	if copied != 0 {
+		t.Fatalf("copied = %d, want 0", copied)
+	}
+	select {
+	case <-started:
+	default:
+		t.Fatal("expected session wait to start")
+	}
+	select {
+	case <-cancelled:
+	default:
+		t.Fatal("expected cancel command to run")
+	}
+}
+
+func TestStreamSSHStderrKeepsWriteContractWhenTruncated(t *testing.T) {
+	stderr := newBoundedSSHStderr(2)
+
+	written, err := stderr.Write([]byte("abc"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if written != 3 {
+		t.Fatalf("written = %d, want 3", written)
+	}
+	if got := stderr.String(); got != "ab" {
+		t.Fatalf("stderr = %q, want %q", got, "ab")
+	}
+}
 
 func TestRunSSHCommandWithContextCancelsRunningSession(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
