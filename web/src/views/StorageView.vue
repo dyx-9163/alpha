@@ -6,8 +6,8 @@
         <p class="page-subtitle">{{ t('storage.subtitle') }}</p>
       </div>
       <div class="head-actions">
-        <span class="status-pill success">{{ t('common.connected') }}</span>
-        <el-button @click="load">{{ t('common.refresh') }}</el-button>
+        <span v-if="visibleManagementHeaderActions.storage.includes('connected')" class="status-pill success">{{ t('common.connected') }}</span>
+        <el-button v-if="visibleManagementHeaderActions.storage.includes('refresh')" @click="load">{{ t('common.refresh') }}</el-button>
       </div>
     </div>
 
@@ -316,7 +316,7 @@ import {
 } from '../storage/minioInsights'
 import { applyRealtimeStatusToAppInstance, useRealtimeStore } from '../stores/realtime'
 import { useTaskProgressStore } from '../stores/taskProgress'
-import { visibleManagementTabs } from './managementEntries'
+import { visibleManagementHeaderActions, visibleManagementTabs } from './managementEntries'
 
 type AppInstance = {
   id: string

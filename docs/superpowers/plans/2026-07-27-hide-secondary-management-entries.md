@@ -105,7 +105,7 @@ Append a concise entry to `memory.md` stating which UI entries are hidden and th
 - Produces: `visibleManagementHeaderActions: Readonly<Record<'database' | 'nacos' | 'storage', readonly ['connected', 'refresh']>>`
 - Consumes: Database and Nacos page headers render the existing `common.connected` label and refresh button from this policy.
 
-- [ ] **Step 1: Extend the failing policy test**
+- [x] **Step 1: Extend the failing policy test**
 
 ```ts
 expect(visibleManagementHeaderActions).toEqual({
@@ -115,17 +115,17 @@ expect(visibleManagementHeaderActions).toEqual({
 })
 ```
 
-- [ ] **Step 2: Run the focused test and verify RED**
+- [x] **Step 2: Run the focused test and verify RED**
 
 Run: `node node_modules/vitest/vitest.mjs run src/views/managementEntries.test.ts` from `web/`.
 
 Expected: FAIL because `visibleManagementHeaderActions` is not exported.
 
-- [ ] **Step 3: Implement the minimal header policy and template changes**
+- [x] **Step 3: Implement the minimal header policy and template changes**
 
 Export the action policy from `managementEntries.ts`. In `DatabaseView.vue` and `NacosView.vue`, replace the application-store deployment button with the same successful connection pill used by `StorageView.vue`, then keep the existing refresh button. Do not remove `useRouter`, because both pages still navigate to task details through the router.
 
-- [ ] **Step 4: Run focused and complete verification**
+- [x] **Step 4: Run focused and complete verification**
 
 Run from repository root:
 

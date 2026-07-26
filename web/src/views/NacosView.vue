@@ -6,8 +6,8 @@
         <p class="page-subtitle">{{ t('nacos.subtitle') }}</p>
       </div>
       <div class="head-actions">
-        <el-button @click="load">{{ t('common.refresh') }}</el-button>
-        <el-button type="primary" @click="router.push('/apps')">{{ t('nacos.deployFromApps') }}</el-button>
+        <span v-if="visibleManagementHeaderActions.nacos.includes('connected')" class="status-pill success">{{ t('common.connected') }}</span>
+        <el-button v-if="visibleManagementHeaderActions.nacos.includes('refresh')" @click="load">{{ t('common.refresh') }}</el-button>
       </div>
     </div>
 
@@ -276,7 +276,7 @@ import { useI18n } from '../i18n'
 import { permissions } from '../rbac'
 import { applyRealtimeStatusToAppInstance, useRealtimeStore } from '../stores/realtime'
 import { useTaskProgressStore } from '../stores/taskProgress'
-import { visibleManagementTabs } from './managementEntries'
+import { visibleManagementHeaderActions, visibleManagementTabs } from './managementEntries'
 
 type AppInstance = {
   id: string

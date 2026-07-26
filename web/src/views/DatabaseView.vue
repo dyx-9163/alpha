@@ -6,8 +6,8 @@
         <p class="page-subtitle">{{ t('database.subtitle') }}</p>
       </div>
       <div class="head-actions">
-        <el-button @click="load">{{ t('common.refresh') }}</el-button>
-        <el-button type="primary" @click="router.push('/apps')">{{ t('database.deployFromApps') }}</el-button>
+        <span v-if="visibleManagementHeaderActions.database.includes('connected')" class="status-pill success">{{ t('common.connected') }}</span>
+        <el-button v-if="visibleManagementHeaderActions.database.includes('refresh')" @click="load">{{ t('common.refresh') }}</el-button>
       </div>
     </div>
 
@@ -155,7 +155,7 @@ import { useI18n } from '../i18n'
 import { permissions } from '../rbac'
 import { applyRealtimeStatusToAppInstance, useRealtimeStore } from '../stores/realtime'
 import { useTaskProgressStore } from '../stores/taskProgress'
-import { visibleManagementTabs } from './managementEntries'
+import { visibleManagementHeaderActions, visibleManagementTabs } from './managementEntries'
 
 type AppInstance = {
   id: string
