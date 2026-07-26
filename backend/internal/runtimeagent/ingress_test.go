@@ -88,6 +88,60 @@ func TestManagerRestartAllCleansFailedReplacementAndStopsLaterWork(t *testing.T)
 	}
 }
 
+func TestManagerRestartAllPreflightsEveryEnabledReplicaBeforeMutation(t *testing.T) {
+	runner := &restartAllRunner{missingContainer: "contacts-rev-1-r2"}
+	manager := NewManager(ManagerOptions{StateDir: t.TempDir(), Runner: runner})
+
+	err := manager.RestartAll(context.Background(), restartAllSpec())
+	if err == nil || !strings.Contains(err.Error(), "does not exist") {
+		t.Fatalf("expected missing replica preflight failure, got %v", err)
+	}
+	if calls := runner.callsString(); strings.Contains(calls, "docker run ") || strings.Contains(calls, "docker rename ") {
+		t.Fatalf("preflight failure must happen before any replacement, got:\n%s", calls)
+	}
+}
+
+func TestManagerRestartAllKeepsLogicalContainerIdentityOnReplacement(t *testing.T) {
+	runner := &restartAllRunner{}
+	manager := NewManager(ManagerOptions{StateDir: t.TempDir(), Runner: runner})
+	spec := restartAllSpec()
+	spec.Deployments = spec.Deployments[:1]
+	spec.Deployments[0].Replicas = 1
+	spec.Deployments[0].Environment = map[string]string{"APP_CONTAINER_NAME": "${containerName}"}
+
+	if err := manager.RestartAll(context.Background(), spec); err != nil {
+		t.Fatal(err)
+	}
+	calls := runner.callsString()
+	logical := "aifar-pod-admin-contacts-rev-1-r1"
+	for _, want := range []string{"--label aifar.pod=" + logical + " ", "-e APP_CONTAINER_NAME=" + logical + " "} {
+		if !strings.Contains(calls, want) {
+			t.Fatalf("replacement must retain logical identity %q, got:\n%s", want, calls)
+		}
+	}
+}
+
+func TestManagerRestartAllRestoresBackupWhenEndpointPromotionFails(t *testing.T) {
+	runner := &restartAllRunner{failEndpointRefreshFor: "contacts"}
+	manager := NewManager(ManagerOptions{StateDir: t.TempDir(), Runner: runner})
+	spec := restartAllSpec()
+	spec.Deployments = spec.Deployments[:1]
+	spec.Deployments[0].Replicas = 1
+
+	err := manager.RestartAll(context.Background(), spec)
+	if err == nil || !strings.Contains(err.Error(), "refresh") {
+		t.Fatalf("expected endpoint promotion failure, got %v", err)
+	}
+	calls := runner.callsString()
+	logical := "aifar-pod-admin-contacts-rev-1-r1"
+	if !strings.Contains(calls, "docker rm -f "+logical+"\n") {
+		t.Fatalf("newly promoted container must be removed during rollback, got:\n%s", calls)
+	}
+	if !strings.Contains(calls, "docker rename "+logical+"-old-") || !strings.Contains(calls, " "+logical) {
+		t.Fatalf("backup must be restored to the logical name, got:\n%s", calls)
+	}
+}
+
 func TestManagerRestartAllCancellationKeepsPromotedWorkAndCleansPendingReplacement(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	runner := &restartAllRunner{cancelOnReadyFor: "contacts-rev-1-r2", cancel: cancel}
@@ -129,12 +183,15 @@ func restartAllSpec() RuntimeSpec {
 }
 
 type restartAllRunner struct {
-	mu               sync.Mutex
-	calls            []string
-	started          []string
-	failStartFor     string
-	cancelOnReadyFor string
-	cancel           context.CancelFunc
+	mu                     sync.Mutex
+	calls                  []string
+	started                []string
+	failStartFor           string
+	missingContainer       string
+	failEndpointRefreshFor string
+	promoted               bool
+	cancelOnReadyFor       string
+	cancel                 context.CancelFunc
 }
 
 func (r *restartAllRunner) Run(ctx context.Context, name string, args ...string) (CommandResult, error) {
@@ -144,6 +201,9 @@ func (r *restartAllRunner) Run(ctx context.Context, name string, args ...string)
 	r.mu.Unlock()
 	switch {
 	case strings.Contains(call, "docker inspect -f {{.Id}}"):
+		if r.missingContainer != "" && strings.Contains(call, r.missingContainer) {
+			return CommandResult{}, errors.New("not found")
+		}
 		return CommandResult{Stdout: "container-id\n"}, nil
 	case strings.Contains(call, "docker run "):
 		container := containerNameArg(args)
@@ -167,7 +227,18 @@ func (r *restartAllRunner) Run(ctx context.Context, name string, args ...string)
 			return CommandResult{Stdout: "true|healthy|172.20.0.10\n"}, nil
 		}
 		return CommandResult{Stdout: "true|healthy\n"}, nil
+	case strings.Contains(call, "docker rename") && strings.Contains(args[1], "-next-"):
+		r.mu.Lock()
+		r.promoted = true
+		r.mu.Unlock()
+		return CommandResult{Stdout: "renamed\n"}, nil
 	case strings.Contains(call, "docker ps"):
+		r.mu.Lock()
+		promoted := r.promoted
+		r.mu.Unlock()
+		if promoted && r.failEndpointRefreshFor != "" && strings.Contains(call, "label=aifar.service="+r.failEndpointRefreshFor) && !strings.Contains(call, "docker ps -a") {
+			return CommandResult{}, errors.New("endpoint refresh failed")
+		}
 		return CommandResult{}, nil
 	default:
 		return CommandResult{Stdout: "ok\n"}, nil
@@ -249,6 +320,50 @@ func TestManagerDiscoversReadyDockerPodEndpoints(t *testing.T) {
 			t.Fatalf("expected docker call containing %q, got:\n%s", want, calls)
 		}
 	}
+}
+
+func TestManagerDiscoverEndpointsExcludesRenamedReplacementArtifacts(t *testing.T) {
+	logical := "aifar-pod-admin-gateway-rev-1-r1"
+	runner := &replacementEndpointRunner{logical: logical}
+	manager := NewManager(ManagerOptions{StateDir: t.TempDir(), Runner: runner})
+	spec := NormalizeSpec(RuntimeSpec{
+		InstanceID:  "admin",
+		InstallRoot: "/aifar/apps/admin",
+		Network:     "aifar-network",
+		Services:    []ServiceSpec{{Name: "gateway", Port: 38000}},
+	})
+
+	endpoints, err := manager.discoverEndpoints(context.Background(), spec, "gateway")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(endpoints) != 1 || endpoints[0].Container != logical || endpoints[0].Address != "172.20.0.10:38000" {
+		t.Fatalf("expected only the promoted logical container endpoint, got %#v", endpoints)
+	}
+}
+
+type replacementEndpointRunner struct{ logical string }
+
+func (r *replacementEndpointRunner) Run(ctx context.Context, name string, args ...string) (CommandResult, error) {
+	call := name + " " + strings.Join(args, " ")
+	if strings.Contains(call, "docker ps ") {
+		return CommandResult{Stdout: strings.Join([]string{
+			r.logical + "|" + r.logical,
+			r.logical + "-old-deadbeef|" + r.logical,
+			r.logical + "-next-deadbeef|" + r.logical,
+		}, "\n") + "\n"}, nil
+	}
+	if strings.Contains(call, "docker inspect -f") {
+		container := args[len(args)-1]
+		ip := "172.20.0.10"
+		if strings.Contains(container, "-old-") {
+			ip = "172.20.0.11"
+		} else if strings.Contains(container, "-next-") {
+			ip = "172.20.0.12"
+		}
+		return CommandResult{Stdout: "true|healthy|" + ip + "\n"}, nil
+	}
+	return CommandResult{Stdout: "ok\n"}, nil
 }
 
 func TestManagerRunContainerAddsLoggingLabels(t *testing.T) {

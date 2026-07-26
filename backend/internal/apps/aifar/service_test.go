@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -481,6 +482,9 @@ type fakeRemote struct {
 }
 
 func (f *fakeRemote) Run(ctx context.Context, server store.Server, command string) (adapter.CommandResult, error) {
+	if err := ctx.Err(); err != nil {
+		return adapter.CommandResult{}, err
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.commands = append(f.commands, command)
@@ -579,6 +583,36 @@ type fakeLogger struct{}
 
 func (fakeLogger) Info(format string, args ...any)  {}
 func (fakeLogger) Error(format string, args ...any) {}
+
+type recordingStepLogger struct {
+	mu           sync.Mutex
+	steps        []string
+	targetStatus string
+}
+
+func (*recordingStepLogger) Info(format string, args ...any)  {}
+func (*recordingStepLogger) Error(format string, args ...any) {}
+func (*recordingStepLogger) StartTarget(target string)        {}
+func (l *recordingStepLogger) FinishTarget(target, status, errText string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.targetStatus = status
+}
+func (l *recordingStepLogger) StartStep(target, name, title string, order int) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.steps = append(l.steps, name+"=running")
+}
+func (l *recordingStepLogger) FinishStep(target, name, status, errText string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.steps = append(l.steps, name+"="+status)
+}
+func (l *recordingStepLogger) snapshot() ([]string, string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return append([]string(nil), l.steps...), l.targetStatus
+}
 
 func withFakeRuntimeAgentBinary(t *testing.T) string {
 	t.Helper()
@@ -1846,6 +1880,11 @@ func TestServiceRuntimeReconcileRepairsNacosProxyRegistration(t *testing.T) {
 }
 
 func TestModuleRestartRuntimeInvokesAgentWithPersistedSpecAndReleasesLock(t *testing.T) {
+	agent := withFakeRuntimeAgentBinary(t)
+	sum, _, err := fileSHA256(agent)
+	if err != nil {
+		t.Fatal(err)
+	}
 	instance := installedAIFARInstance(t)
 	s := &fakeStore{
 		servers: map[string]store.Server{
@@ -1853,15 +1892,16 @@ func TestModuleRestartRuntimeInvokesAgentWithPersistedSpecAndReleasesLock(t *tes
 		},
 		instances: []store.AppInstance{instance},
 	}
-	remote := &fakeRemote{}
+	remote := &fakeRemote{runtimeAgentCheckStdout: runtimeAgentCheckOutput(t, sum, append(requiredRuntimeAgentFeatures, "restart-runtime")...)}
 	module := NewModule(s, remote)
-	err := module.RestartRuntime(context.Background(), registry.RuntimeRestartRequest{
+	logger := &recordingStepLogger{}
+	err = module.RestartRuntime(context.Background(), registry.RuntimeRestartRequest{
 		Instance: instance,
 		Server:   s.servers["srv-1"],
 		Language: "en",
 		Actor:    "operator",
 		Reason:   "load edited env files",
-	}, registry.RunContext{TaskID: "task-restart", Log: fakeLogger{}})
+	}, registry.RunContext{TaskID: "task-restart", Log: logger})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1883,9 +1923,23 @@ func TestModuleRestartRuntimeInvokesAgentWithPersistedSpecAndReleasesLock(t *tes
 	if _, locked := metadataFromInstance(current)["orchestrationLock"]; locked {
 		t.Fatalf("runtime restart should release orchestration lock: %s", current.Metadata)
 	}
+	steps, targetStatus := logger.snapshot()
+	for _, want := range []string{"load-instance=success", "preflight-runtime=success", "rolling-restart=success", "verify-runtime=success"} {
+		if !slices.Contains(steps, want) {
+			t.Fatalf("expected completed restart step %q, got %#v", want, steps)
+		}
+	}
+	if targetStatus != "success" {
+		t.Fatalf("expected successful target, got %q", targetStatus)
+	}
 }
 
 func TestServiceRestartRuntimeReleasesLockWhenRemoteExecutionFails(t *testing.T) {
+	agent := withFakeRuntimeAgentBinary(t)
+	sum, _, hashErr := fileSHA256(agent)
+	if hashErr != nil {
+		t.Fatal(hashErr)
+	}
 	instance := installedAIFARInstance(t)
 	s := &fakeStore{
 		servers: map[string]store.Server{
@@ -1893,7 +1947,7 @@ func TestServiceRestartRuntimeReleasesLockWhenRemoteExecutionFails(t *testing.T)
 		},
 		instances: []store.AppInstance{instance},
 	}
-	remote := &fakeRemote{failCommandContains: "AIFAR_RUNTIME_RESTART"}
+	remote := &fakeRemote{failCommandContains: "AIFAR_RUNTIME_RESTART", runtimeAgentCheckStdout: runtimeAgentCheckOutput(t, sum, append(requiredRuntimeAgentFeatures, "restart-runtime")...)}
 	service := NewService(s, remote)
 	err := service.RestartRuntime(context.Background(), RuntimeRestartRequest{
 		Instance: instance,
@@ -1911,6 +1965,49 @@ func TestServiceRestartRuntimeReleasesLockWhenRemoteExecutionFails(t *testing.T)
 	}
 	if _, locked := metadataFromInstance(current)["orchestrationLock"]; locked {
 		t.Fatalf("failed runtime restart should release orchestration lock: %s", current.Metadata)
+	}
+}
+
+func TestServiceRestartRuntimeUpgradesAgentMissingRestartFeature(t *testing.T) {
+	agent := withFakeRuntimeAgentBinary(t)
+	sum, _, err := fileSHA256(agent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	instance := installedAIFARInstance(t)
+	s := &fakeStore{servers: map[string]store.Server{"srv-1": {ID: "srv-1", Name: "app-1", Host: "10.0.0.10", DeployDir: "/aifar/apps"}}, instances: []store.AppInstance{instance}}
+	remote := &fakeRemote{runtimeAgentCheckStdout: runtimeAgentCheckOutput(t, sum, "reconcile-runtime", "local-runtime-controller", "endpoint-cache")}
+
+	err = NewService(s, remote).RestartRuntime(context.Background(), RuntimeRestartRequest{Instance: instance, Server: s.servers["srv-1"], Actor: "operator", TaskID: "task-restart"}, fakeLogger{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if uploads := remote.joinedUploads(); !strings.Contains(uploads, "aifar-agent-linux-amd64") {
+		t.Fatalf("agent missing restart capability should be upgraded, uploads=%s", uploads)
+	}
+	if commands := remote.joinedCommands(); !strings.Contains(commands, "systemctl restart aifar-agent") || !strings.Contains(commands, "AIFAR_RUNTIME_RESTART") {
+		t.Fatalf("agent upgrade must precede runtime restart, commands:\n%s", commands)
+	}
+}
+
+func TestServiceRestartRuntimeMarksCancelledStepAndTarget(t *testing.T) {
+	withFakeRuntimeAgentBinary(t)
+	instance := installedAIFARInstance(t)
+	s := &fakeStore{servers: map[string]store.Server{"srv-1": {ID: "srv-1", DeployDir: "/aifar/apps"}}, instances: []store.AppInstance{instance}}
+	logger := &recordingStepLogger{}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err := NewService(s, &fakeRemote{}).RestartRuntime(ctx, RuntimeRestartRequest{Instance: instance, Server: s.servers["srv-1"], Actor: "operator", TaskID: "task-restart"}, logger, nil)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context cancellation, got %v", err)
+	}
+	steps, targetStatus := logger.snapshot()
+	if targetStatus != "cancelled" {
+		t.Fatalf("expected cancelled target, got %q steps=%#v", targetStatus, steps)
+	}
+	if !slices.Contains(steps, "preflight-runtime=cancelled") {
+		t.Fatalf("expected active preflight step to be cancelled, got %#v", steps)
 	}
 }
 

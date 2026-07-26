@@ -487,7 +487,6 @@ const aifarRuntimeActionDisabledReason = computed(() => {
 })
 const runtimeRestartDisabledReason = computed(() => {
   if (aifarRuntimeActionDisabledReason.value) return aifarRuntimeActionDisabledReason.value
-  if (!asArray<string>(aifarRuntime.value.agent?.features).includes('restart-runtime')) return t('containers.agentRestartUnsupported')
   if (!runtimeRestartScope.value.services) return t('containers.noEnabledRuntimeServices')
   return ''
 })

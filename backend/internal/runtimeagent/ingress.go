@@ -225,41 +225,50 @@ func (m *Manager) RestartAll(ctx context.Context, spec RuntimeSpec) error {
 	if err := validateRuntimeSpec(spec); err != nil {
 		return err
 	}
+	type restartReplica struct {
+		deployment DeploymentSpec
+		replica    int
+		name       string
+	}
+	plan := make([]restartReplica, 0)
 	for _, deployment := range spec.Deployments {
 		if deployment.Replicas <= 0 {
 			continue
 		}
 		deployment.Strategy = NormalizeDeploymentStrategy(deployment.Strategy)
+		for replica := 1; replica <= deployment.Replicas; replica++ {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			name := containerNameForDeployment(spec, deployment, replica)
+			exists, err := m.containerExists(ctx, name)
+			if err != nil {
+				return fmt.Errorf("preflight AIFAR deployment %s replica %d: %w", deployment.ServiceName, replica, err)
+			}
+			if !exists {
+				return fmt.Errorf("preflight AIFAR deployment %s replica %d: AIFAR pod %s does not exist", deployment.ServiceName, replica, name)
+			}
+			plan = append(plan, restartReplica{deployment: deployment, replica: replica, name: name})
+		}
+	}
+	for index := 0; index < len(plan); {
+		deployment := plan[index].deployment
 		deploymentCtx := ctx
 		cancel := func() {}
 		if deployment.Strategy.ProgressDeadlineSeconds > 0 {
 			deploymentCtx, cancel = context.WithTimeout(ctx, time.Duration(deployment.Strategy.ProgressDeadlineSeconds)*time.Second)
 		}
 		m.setDeploymentStatusFromDocker(deploymentCtx, spec, deployment, "rolling", "")
-		for replica := 1; replica <= deployment.Replicas; replica++ {
-			name := containerNameForDeployment(spec, deployment, replica)
-			exists, err := m.containerExists(deploymentCtx, name)
-			if err != nil {
+		for index < len(plan) && plan[index].deployment.ServiceName == deployment.ServiceName {
+			item := plan[index]
+			if err := m.replaceContainer(deploymentCtx, spec, deployment, item.replica, item.name, func(refreshCtx context.Context) error {
+				return m.refreshServiceEndpoint(refreshCtx, spec, deployment.ServiceName)
+			}); err != nil {
 				cancel()
 				m.setDeploymentStatusFromDocker(context.WithoutCancel(ctx), spec, deployment, "failed", err.Error())
-				return fmt.Errorf("restart AIFAR deployment %s replica %d: %w", deployment.ServiceName, replica, err)
+				return fmt.Errorf("restart AIFAR deployment %s replica %d: %w", deployment.ServiceName, item.replica, err)
 			}
-			if !exists {
-				cancel()
-				err := fmt.Errorf("AIFAR pod %s does not exist", name)
-				m.setDeploymentStatusFromDocker(context.WithoutCancel(ctx), spec, deployment, "failed", err.Error())
-				return fmt.Errorf("restart AIFAR deployment %s replica %d: %w", deployment.ServiceName, replica, err)
-			}
-			if err := m.replaceContainer(deploymentCtx, spec, deployment, replica, name); err != nil {
-				cancel()
-				m.setDeploymentStatusFromDocker(context.WithoutCancel(ctx), spec, deployment, "failed", err.Error())
-				return fmt.Errorf("restart AIFAR deployment %s replica %d: %w", deployment.ServiceName, replica, err)
-			}
-			if err := m.refreshServiceEndpoint(deploymentCtx, spec, deployment.ServiceName); err != nil {
-				cancel()
-				m.setDeploymentStatusFromDocker(context.WithoutCancel(ctx), spec, deployment, "failed", err.Error())
-				return fmt.Errorf("refresh AIFAR deployment %s endpoints: %w", deployment.ServiceName, err)
-			}
+			index++
 		}
 		cancel()
 		m.setDeploymentStatusFromDocker(ctx, spec, deployment, "ready", "")
@@ -623,11 +632,9 @@ func (m *Manager) ensureDeployment(ctx context.Context, spec RuntimeSpec, deploy
 				return err
 			}
 			if recreate {
-				if err := m.replaceContainer(ctx, spec, deployment, replica, name); err != nil {
-					m.setDeploymentStatusFromDocker(ctx, spec, deployment, "failed", err.Error())
-					return err
-				}
-				if err := m.refreshServiceEndpoint(ctx, spec, deployment.ServiceName); err != nil {
+				if err := m.replaceContainer(ctx, spec, deployment, replica, name, func(refreshCtx context.Context) error {
+					return m.refreshServiceEndpoint(refreshCtx, spec, deployment.ServiceName)
+				}); err != nil {
 					m.setDeploymentStatusFromDocker(ctx, spec, deployment, "failed", err.Error())
 					return err
 				}
@@ -668,20 +675,20 @@ func (m *Manager) ensureDeployment(ctx context.Context, spec RuntimeSpec, deploy
 	return nil
 }
 
-func (m *Manager) replaceContainer(ctx context.Context, spec RuntimeSpec, deployment DeploymentSpec, replica int, name string) error {
+func (m *Manager) replaceContainer(ctx context.Context, spec RuntimeSpec, deployment DeploymentSpec, replica int, name string, promote func(context.Context) error) error {
 	suffix := shortNameHash(fmt.Sprintf("%s-%d", deploymentSpecHash(deployment), time.Now().UnixNano()))
 	replacement := sanitizeDockerName(name + "-next-" + suffix)
 	backup := sanitizeDockerName(name + "-old-" + suffix)
-	promoted := false
+	committed := false
 	defer func() {
-		if promoted {
+		if committed {
 			return
 		}
 		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 		defer cancel()
 		_, _ = m.runner.Run(cleanupCtx, "docker", "rm", "-f", replacement)
 	}()
-	if err := m.runContainer(ctx, spec, deployment, replica, replacement); err != nil {
+	if err := m.runContainerNamed(ctx, spec, deployment, replica, replacement, name); err != nil {
 		return err
 	}
 	if _, err := m.runner.Run(ctx, "docker", "rename", name, backup); err != nil {
@@ -693,12 +700,24 @@ func (m *Manager) replaceContainer(ctx context.Context, spec RuntimeSpec, deploy
 		_, _ = m.runner.Run(cleanupCtx, "docker", "rename", backup, name)
 		return fmt.Errorf("promote replacement AIFAR pod %s: %w", name, err)
 	}
-	promoted = true
+	if promote != nil {
+		if err := promote(ctx); err != nil {
+			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+			defer cancel()
+			_, _ = m.runner.Run(cleanupCtx, "docker", "rm", "-f", name)
+			if _, restoreErr := m.runner.Run(cleanupCtx, "docker", "rename", backup, name); restoreErr != nil {
+				return fmt.Errorf("refresh endpoints after replacing AIFAR pod %s: %w (restore backup: %v)", name, err, restoreErr)
+			}
+			_ = m.refreshServiceEndpoint(cleanupCtx, spec, deployment.ServiceName)
+			return fmt.Errorf("refresh endpoints after replacing AIFAR pod %s: %w", name, err)
+		}
+	}
 	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 	defer cancel()
 	if _, err := m.runner.Run(cleanupCtx, "docker", "rm", "-f", backup); err != nil {
 		return fmt.Errorf("remove replaced AIFAR pod %s: %w", backup, err)
 	}
+	committed = true
 	logf(m.log, "AIFAR runtime pod replaced service=%s replica=%d container=%s\n", deployment.ServiceName, replica, name)
 	return nil
 }
@@ -824,6 +843,10 @@ func (m *Manager) containerReadiness(ctx context.Context, name string) (bool, st
 }
 
 func (m *Manager) runContainer(ctx context.Context, spec RuntimeSpec, deployment DeploymentSpec, replica int, name string) error {
+	return m.runContainerNamed(ctx, spec, deployment, replica, name, name)
+}
+
+func (m *Manager) runContainerNamed(ctx context.Context, spec RuntimeSpec, deployment DeploymentSpec, replica int, name, logicalName string) error {
 	args := []string{"run", "-d", "--name", name, "--restart", "unless-stopped"}
 	deploymentName := strings.TrimSpace(deployment.DeploymentName)
 	if deploymentName == "" {
@@ -843,7 +866,7 @@ func (m *Manager) runContainer(ctx context.Context, spec RuntimeSpec, deployment
 		"--label", "aifar.service="+deployment.ServiceName,
 		"--label", "aifar.revision="+deployment.PodRevision,
 		"--label", "aifar.release="+deployment.PodRevision,
-		"--label", fmt.Sprintf("aifar.pod=%s", name),
+		"--label", fmt.Sprintf("aifar.pod=%s", logicalName),
 		"--label", fmt.Sprintf("aifar.replica=%d", replica),
 		"--network", spec.Network,
 		"--add-host", "host.docker.internal:host-gateway",
@@ -881,7 +904,7 @@ func (m *Manager) runContainer(ctx context.Context, spec RuntimeSpec, deployment
 	}
 	for key, value := range deployment.Environment {
 		if strings.TrimSpace(key) != "" {
-			value = strings.ReplaceAll(value, "${containerName}", name)
+			value = strings.ReplaceAll(value, "${containerName}", logicalName)
 			args = append(args, "-e", key+"="+value)
 		}
 	}
@@ -1312,12 +1335,26 @@ func (m *Manager) discoverEndpoints(ctx context.Context, spec RuntimeSpec, servi
 		"--filter", "label=aifar.install-root="+spec.InstallRoot,
 		"--filter", "label=aifar.component=pod",
 		"--filter", "label=aifar.service="+service,
-		"--format", "{{.Names}}",
+		"--format", `{{.Names}}|{{.Label "aifar.pod"}}`,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("list AIFAR service pods: %w", err)
 	}
-	names := strings.Fields(result.Stdout)
+	names := make([]string, 0)
+	for _, line := range strings.Split(strings.TrimSpace(result.Stdout), "\n") {
+		parts := strings.SplitN(strings.TrimSpace(line), "|", 2)
+		name := strings.TrimSpace(parts[0])
+		if name == "" {
+			continue
+		}
+		if len(parts) == 2 {
+			logicalName := strings.TrimSpace(parts[1])
+			if logicalName != "" && logicalName != name {
+				continue
+			}
+		}
+		names = append(names, name)
+	}
 	endpoints := make([]endpoint, 0, len(names))
 	format := fmt.Sprintf(`{{.State.Running}}|{{if .State.Health}}{{.State.Health.Status}}{{end}}|{{with index .NetworkSettings.Networks %q}}{{.IPAddress}}{{else}}{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}{{end}}`, spec.Network)
 	for _, name := range names {

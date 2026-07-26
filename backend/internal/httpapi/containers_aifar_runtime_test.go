@@ -898,6 +898,22 @@ func TestAIFARRuntimeRestartAllCreatesPlannedTaskForSelectedInstance(t *testing.
 		t.Fatalf("restart must target only selected instance server: %+v", targets)
 	}
 	waitForTaskStatus(t, db, taskID, "success")
+	steps, err = db.ListTaskSteps(taskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, step := range steps {
+		if step.Status != "success" {
+			t.Fatalf("expected completed restart steps, got %+v", steps)
+		}
+	}
+	targets, err = db.ListTaskTargets(taskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(targets) != 1 || targets[0].Status != "success" {
+		t.Fatalf("expected successful restart target, got %+v", targets)
+	}
 	if module.restartCalls != 1 || module.restartRequest.Instance.ID != instance.ID || module.restartRequest.Reason != "load new env" {
 		t.Fatalf("unexpected restart module call: calls=%d request=%+v", module.restartCalls, module.restartRequest)
 	}
@@ -984,6 +1000,27 @@ func (m *fakeAIFARRuntimeActionModule) UninstallRuntimeAgent(ctx context.Context
 func (m *fakeAIFARRuntimeActionModule) RestartRuntime(ctx context.Context, req registry.RuntimeRestartRequest, run registry.RunContext) error {
 	m.restartCalls++
 	m.restartRequest = req
+	target := req.Server.ID
+	if recorder, ok := run.Log.(interface {
+		StartTarget(string)
+		FinishTarget(string, string, string)
+		StartStep(string, string, string, int)
+		FinishStep(string, string, string, string)
+	}); ok {
+		recorder.StartTarget(target)
+		steps := []string{"load-instance", "preflight-runtime", "rolling-restart", "verify-runtime"}
+		for index, name := range steps {
+			recorder.StartStep(target, name, name, index+1)
+			if m.restartErr != nil && name == "rolling-restart" {
+				recorder.FinishStep(target, name, "failed", m.restartErr.Error())
+				recorder.FinishTarget(target, "failed", m.restartErr.Error())
+				return m.restartErr
+			}
+			recorder.FinishStep(target, name, "success", "")
+		}
+		recorder.FinishTarget(target, "success", "")
+		return nil
+	}
 	return m.restartErr
 }
 

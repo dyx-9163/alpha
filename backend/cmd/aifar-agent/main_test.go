@@ -112,27 +112,24 @@ func TestPostRuntimeRestartUsesRestartAllEndpointAndPayload(t *testing.T) {
 	}
 }
 
-func TestPostRuntimeRestartRetriesEOF(t *testing.T) {
+func TestPostRuntimeRestartDoesNotRetryEOF(t *testing.T) {
 	var calls atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if calls.Add(1) == 1 {
-			hijacker := w.(http.Hijacker)
-			conn, _, err := hijacker.Hijack()
-			if err != nil {
-				t.Fatal(err)
-			}
-			_ = conn.Close()
-			return
+		calls.Add(1)
+		hijacker := w.(http.Hijacker)
+		conn, _, err := hijacker.Hijack()
+		if err != nil {
+			t.Fatal(err)
 		}
-		writeJSON(w, http.StatusOK, map[string]string{"status": "restarted"})
+		_ = conn.Close()
 	}))
 	defer server.Close()
 
-	if err := postRuntimeRestart(context.Background(), strings.TrimPrefix(server.URL, "http://"), runtimeagent.RuntimeSpec{InstanceID: "admin"}); err != nil {
-		t.Fatalf("expected retry to succeed, got %v", err)
+	if err := postRuntimeRestart(context.Background(), strings.TrimPrefix(server.URL, "http://"), runtimeagent.RuntimeSpec{InstanceID: "admin"}); err == nil {
+		t.Fatal("expected lost restart response to be returned without retry")
 	}
-	if calls.Load() != 2 {
-		t.Fatalf("expected exactly two attempts, got %d", calls.Load())
+	if calls.Load() != 1 {
+		t.Fatalf("expected exactly one attempt, got %d", calls.Load())
 	}
 }
 

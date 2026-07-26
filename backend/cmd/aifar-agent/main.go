@@ -271,7 +271,29 @@ func postRuntimeSpec(ctx context.Context, addr string, spec runtimeagent.Runtime
 }
 
 func postRuntimeRestart(ctx context.Context, addr string, spec runtimeagent.RuntimeSpec) error {
-	return postRuntimeRequest(ctx, addr, "/runtime/restart-all", "restart", spec)
+	return postRuntimeRequestOnce(ctx, addr, "/runtime/restart-all", "restart", spec)
+}
+
+func postRuntimeRequestOnce(ctx context.Context, addr, path, operation string, spec runtimeagent.RuntimeSpec) error {
+	data, err := json.Marshal(spec)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://"+addr+path, bytes.NewReader(data))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("aifar-agent service is not reachable on %s: %w", addr, err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	if resp.StatusCode >= 300 {
+		return fmt.Errorf("aifar-agent %s failed: %s: %s", operation, resp.Status, strings.TrimSpace(string(body)))
+	}
+	return nil
 }
 
 func postRuntimeRequest(ctx context.Context, addr, path, operation string, spec runtimeagent.RuntimeSpec) error {
