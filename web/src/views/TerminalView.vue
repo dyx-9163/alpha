@@ -46,6 +46,7 @@ import { apiGet, asArray, terminalProtocols, terminalUrl } from '../api/client'
 import { usePermissions } from '../composables/usePermissions'
 import { useI18n } from '../i18n'
 import { permissions } from '../rbac'
+import { calculateTerminalGrid } from '../terminal/grid'
 
 const { t } = useI18n()
 const { can, deniedText } = usePermissions()
@@ -157,11 +158,14 @@ function fitTerminal() {
   const measure = terminalEl.value.querySelector('.xterm-char-measure-element') as HTMLElement | null
   const rect = measure?.getBoundingClientRect()
   const measuredCellWidth = rect?.width ?? 0
-  const measuredCellHeight = rect?.height ?? 0
-  const cellWidth = measuredCellWidth >= 4 && measuredCellWidth <= 20 ? measuredCellWidth : 8
-  const cellHeight = measuredCellHeight >= 10 && measuredCellHeight <= 32 ? measuredCellHeight : 17
-  const cols = Math.max(20, Math.floor(width / cellWidth))
-  const rows = Math.max(8, Math.floor(height / cellHeight))
+  const measuredCharHeight = rect?.height ?? 0
+  const { cols, rows } = calculateTerminalGrid({
+    width,
+    height,
+    measuredCellWidth,
+    measuredCharHeight,
+    lineHeight: Number(terminal.options.lineHeight)
+  })
   if (cols !== terminal.cols || rows !== terminal.rows) {
     terminal.resize(cols, rows)
   }
