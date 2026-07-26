@@ -19,4 +19,13 @@ describe('MinIO monitoring status', () => {
     ])).toBe(new Date('2026-07-27T04:01:10Z').toLocaleTimeString())
     expect(latestSnapshotTime([undefined, { collectedAt: 'invalid' }])).toBe('')
   })
+
+  it('considers both collected and updated times from the same snapshot', () => {
+    expect(latestSnapshotTime([
+      { collectedAt: 'invalid', updatedAt: '2026-07-27T04:01:10Z' }
+    ])).toBe(new Date('2026-07-27T04:01:10Z').toLocaleTimeString())
+    expect(latestSnapshotTime([
+      { collectedAt: '2026-07-27T03:59:09Z', updatedAt: '2026-07-27T04:01:10Z' }
+    ])).toBe(new Date('2026-07-27T04:01:10Z').toLocaleTimeString())
+  })
 })
