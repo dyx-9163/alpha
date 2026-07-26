@@ -298,9 +298,20 @@ func StreamSSHFile(ctx context.Context, server store.Server, remotePath string, 
 	}, stderr.String)
 }
 
-type sshStreamCopyResult struct {
-	copied int64
-	err    error
+type sshStreamWriter struct {
+	dst io.Writer
+	err error
+}
+
+func (w *sshStreamWriter) Write(value []byte) (int, error) {
+	written, err := w.dst.Write(value)
+	if err == nil && written != len(value) {
+		err = io.ErrShortWrite
+	}
+	if err != nil && w.err == nil {
+		w.err = err
+	}
+	return written, err
 }
 
 func streamSSHOutputWithContext(ctx context.Context, dst io.Writer, stdout io.Reader, wait func() error, cancelCommand func(), stderr func() string) (int64, error) {
@@ -316,63 +327,39 @@ func streamSSHOutputWithContext(ctx context.Context, dst io.Writer, stdout io.Re
 	}
 
 	waitErrCh := make(chan error, 1)
-	copyResultCh := make(chan sshStreamCopyResult, 1)
 	go func() {
 		waitErrCh <- wait()
 	}()
+	stopWatchingContext := make(chan struct{})
+	contextWatcherDone := make(chan struct{})
 	go func() {
-		copied, err := io.Copy(dst, stdout)
-		copyResultCh <- sshStreamCopyResult{copied: copied, err: err}
-	}()
-
-	var copyResult sshStreamCopyResult
-	var waitErr error
-	copyDone := false
-	waitDone := false
-	for !copyDone || !waitDone {
+		defer close(contextWatcherDone)
 		select {
-		case result := <-copyResultCh:
-			copyResult = result
-			copyDone = true
-		case waitErr = <-waitErrCh:
-			waitDone = true
 		case <-ctx.Done():
 			cancel()
-			drainSSHStream(waitErrCh, copyResultCh, &waitErr, &copyResult, &waitDone, &copyDone)
-			return copyResult.copied, ctx.Err()
+		case <-stopWatchingContext:
 		}
-		if (copyDone && copyResult.err != nil && !waitDone) || (waitDone && waitErr != nil && !copyDone) {
-			cancel()
-			drainSSHStream(waitErrCh, copyResultCh, &waitErr, &copyResult, &waitDone, &copyDone)
-			break
-		}
+	}()
+
+	writer := &sshStreamWriter{dst: dst}
+	copied, copyErr := io.Copy(writer, stdout)
+	if writer.err != nil {
+		cancel()
+	}
+	close(stopWatchingContext)
+	<-contextWatcherDone
+	waitErr := <-waitErrCh
+
+	if writer.err != nil {
+		return copied, streamSSHError(writer.err, stderr())
 	}
 	if err := ctx.Err(); err != nil {
-		cancel()
-		return copyResult.copied, err
+		return copied, err
 	}
-	if copyResult.err != nil {
-		cancel()
-		return copyResult.copied, streamSSHError(copyResult.err, stderr())
+	if waitErr != nil {
+		return copied, streamSSHError(waitErr, stderr())
 	}
-	return copyResult.copied, streamSSHError(waitErr, stderr())
-}
-
-func drainSSHStream(waitErrCh <-chan error, copyResultCh <-chan sshStreamCopyResult, waitErr *error, copyResult *sshStreamCopyResult, waitDone, copyDone *bool) {
-	timer := time.NewTimer(sshCancelDrainTimeout)
-	defer timer.Stop()
-	for !*waitDone || !*copyDone {
-		select {
-		case err := <-waitErrCh:
-			*waitErr = err
-			*waitDone = true
-		case result := <-copyResultCh:
-			*copyResult = result
-			*copyDone = true
-		case <-timer.C:
-			return
-		}
-	}
+	return copied, streamSSHError(copyErr, stderr())
 }
 
 func UploadSSHFile(ctx context.Context, server store.Server, localPath, remotePath string, mode os.FileMode) error {

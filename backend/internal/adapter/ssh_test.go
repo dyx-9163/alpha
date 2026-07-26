@@ -15,6 +15,17 @@ func (closedPipeWriter) Write([]byte) (int, error) {
 	return 0, io.ErrClosedPipe
 }
 
+type blockingWriter struct {
+	started chan<- struct{}
+	release <-chan struct{}
+}
+
+func (w blockingWriter) Write(value []byte) (int, error) {
+	w.started <- struct{}{}
+	<-w.release
+	return len(value), nil
+}
+
 func TestStreamSSHOutputCopiesBinaryBytes(t *testing.T) {
 	payload := []byte{0x00, 0x01, 0xff, '\n', 'A'}
 	var dst bytes.Buffer
@@ -57,6 +68,128 @@ func TestStreamSSHOutputCancelsSessionWhenWriterFails(t *testing.T) {
 	case <-cancelled:
 	default:
 		t.Fatal("expected cancel command to run")
+	}
+}
+
+func TestStreamSSHOutputWaitsForBlockingWriterAfterContextCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	writerStarted := make(chan struct{}, 1)
+	releaseWriter := make(chan struct{})
+	cancelled := make(chan struct{})
+	waitExited := make(chan struct{})
+	streamReturned := make(chan struct{})
+	resultCh := make(chan struct {
+		copied int64
+		err    error
+	}, 1)
+
+	go func() {
+		copied, err := streamSSHOutputWithContext(ctx, blockingWriter{started: writerStarted, release: releaseWriter}, bytes.NewReader([]byte("data")),
+			func() error {
+				<-cancelled
+				close(waitExited)
+				return errors.New("session closed")
+			},
+			func() { close(cancelled) },
+			func() string { return "" },
+		)
+		close(streamReturned)
+		resultCh <- struct {
+			copied int64
+			err    error
+		}{copied: copied, err: err}
+	}()
+
+	select {
+	case <-writerStarted:
+	case <-time.After(time.Second):
+		t.Fatal("expected writer to block")
+	}
+	cancel()
+	select {
+	case <-waitExited:
+	case <-time.After(time.Second):
+		t.Fatal("expected context cancellation to close the session")
+	}
+	select {
+	case <-streamReturned:
+		t.Fatal("stream returned before writer unblocked")
+	case <-time.After(2 * sshCancelDrainTimeout):
+	}
+
+	close(releaseWriter)
+	select {
+	case result := <-resultCh:
+		if !errors.Is(result.err, context.Canceled) {
+			t.Fatalf("expected context canceled error, got %v", result.err)
+		}
+		if result.copied != 4 {
+			t.Fatalf("copied = %d, want 4", result.copied)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for stream to finish after writer unblocked")
+	}
+}
+
+func TestStreamSSHOutputPreservesWaitErrorUntilCopyCompletes(t *testing.T) {
+	remoteErr := errors.New("remote command failed")
+	writerStarted := make(chan struct{}, 1)
+	releaseWriter := make(chan struct{})
+	waitReturned := make(chan struct{})
+	cancelled := make(chan struct{}, 1)
+	resultCh := make(chan struct {
+		copied int64
+		err    error
+	}, 1)
+
+	go func() {
+		copied, err := streamSSHOutputWithContext(context.Background(), blockingWriter{started: writerStarted, release: releaseWriter}, bytes.NewReader([]byte("data")),
+			func() error {
+				close(waitReturned)
+				return remoteErr
+			},
+			func() { cancelled <- struct{}{} },
+			func() string { return "" },
+		)
+		resultCh <- struct {
+			copied int64
+			err    error
+		}{copied: copied, err: err}
+	}()
+
+	select {
+	case <-writerStarted:
+	case <-time.After(time.Second):
+		t.Fatal("expected writer to block")
+	}
+	select {
+	case <-waitReturned:
+	case <-time.After(time.Second):
+		t.Fatal("expected remote wait to return")
+	}
+	select {
+	case result := <-resultCh:
+		t.Fatalf("stream returned before copy completed: copied=%d err=%v", result.copied, result.err)
+	default:
+	}
+
+	close(releaseWriter)
+	select {
+	case result := <-resultCh:
+		if !errors.Is(result.err, remoteErr) {
+			t.Fatalf("expected original remote error, got %v", result.err)
+		}
+		if result.copied != 4 {
+			t.Fatalf("copied = %d, want 4", result.copied)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for copy to complete")
+	}
+	select {
+	case <-cancelled:
+		t.Fatal("remote wait error should not trigger a replacement cancellation error")
+	default:
 	}
 }
 
