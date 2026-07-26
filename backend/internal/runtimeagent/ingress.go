@@ -225,58 +225,228 @@ func (m *Manager) RestartAll(ctx context.Context, spec RuntimeSpec) error {
 	if err := validateRuntimeSpec(spec); err != nil {
 		return err
 	}
-	type restartReplica struct {
-		deployment DeploymentSpec
-		replica    int
-		name       string
+	plan, err := m.preflightRestartAll(ctx, spec)
+	if err != nil {
+		return err
 	}
-	plan := make([]restartReplica, 0)
+	if err := m.stopAllRuntimePods(ctx, spec); err != nil {
+		return err
+	}
+	if err := m.refreshInstanceEndpoints(ctx, spec); err != nil {
+		return fmt.Errorf("refresh AIFAR runtime endpoints after stop-all: %w", err)
+	}
+
+	started := make([]restartReplicaPlan, 0, len(plan))
+	restartErrs := make([]error, 0)
 	for _, deployment := range spec.Deployments {
+		status := "pending"
+		if deployment.Replicas <= 0 {
+			status = "offline"
+		}
+		m.setDeploymentRestartPhase(spec, deployment, status)
+	}
+	for _, item := range plan {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := m.runContainerDetached(ctx, spec, item.deployment, item.replica, item.name); err != nil {
+			restartErrs = append(restartErrs, fmt.Errorf("start AIFAR deployment %s replica %d: %w", item.deployment.ServiceName, item.replica, err))
+			continue
+		}
+		started = append(started, item)
+	}
+
+	restartErrs = append(restartErrs, m.verifyRestartedRuntime(ctx, spec, started)...)
+	if err := m.refreshInstanceEndpoints(context.WithoutCancel(ctx), spec); err != nil {
+		restartErrs = append(restartErrs, fmt.Errorf("refresh AIFAR runtime endpoints after restart-all: %w", err))
+	}
+	for _, deployment := range spec.Deployments {
+		lastError := ""
+		status := "ready"
+		if deployment.Replicas <= 0 {
+			status = "offline"
+		}
+		serviceErrs := make([]string, 0)
+		needle := "deployment " + deployment.ServiceName
+		for _, restartErr := range restartErrs {
+			if restartErr != nil && strings.Contains(restartErr.Error(), needle) {
+				serviceErrs = append(serviceErrs, restartErr.Error())
+			}
+		}
+		if len(serviceErrs) > 0 {
+			status = "failed"
+			lastError = strings.Join(serviceErrs, "; ")
+		}
+		m.setDeploymentStatusFromDocker(context.WithoutCancel(ctx), spec, deployment, status, lastError)
+	}
+	if len(restartErrs) > 0 {
+		return fmt.Errorf("restart all AIFAR runtime pods: %w", errors.Join(restartErrs...))
+	}
+	return nil
+}
+
+func (m *Manager) setDeploymentRestartPhase(spec RuntimeSpec, deployment DeploymentSpec, status string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	key := endpointKey(spec.InstanceID, deployment.ServiceName)
+	current := m.deployments[key]
+	current.InstanceID = spec.InstanceID
+	current.ServiceName = deployment.ServiceName
+	current.DeploymentName = deployment.DeploymentName
+	current.PodRevision = deployment.PodRevision
+	current.Image = deployment.Image
+	current.Strategy = NormalizeDeploymentStrategy(deployment.Strategy)
+	current.DesiredReplicas = deployment.Replicas
+	current.CurrentReplicas = 0
+	current.ReadyReplicas = 0
+	current.UpdatedReplicas = 0
+	current.AvailableReplicas = 0
+	current.Status = status
+	current.LastReconcileAt = time.Now().Format(time.RFC3339)
+	current.LastError = ""
+	m.deployments[key] = current
+}
+
+type restartReplicaPlan struct {
+	deployment DeploymentSpec
+	replica    int
+	name       string
+}
+
+func (m *Manager) preflightRestartAll(ctx context.Context, spec RuntimeSpec) ([]restartReplicaPlan, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if _, err := m.runner.Run(ctx, "docker", "network", "inspect", spec.Network); err != nil {
+		return nil, fmt.Errorf("preflight AIFAR runtime network %s: %w", spec.Network, err)
+	}
+	checkedImages := map[string]bool{}
+	plan := make([]restartReplicaPlan, 0)
+	for _, raw := range spec.Deployments {
+		deployment := raw
+		deployment.Strategy = NormalizeDeploymentStrategy(deployment.Strategy)
 		if deployment.Replicas <= 0 {
 			continue
 		}
-		deployment.Strategy = NormalizeDeploymentStrategy(deployment.Strategy)
+		if strings.TrimSpace(deployment.Image) == "" {
+			return nil, fmt.Errorf("preflight AIFAR deployment %s: image is required", deployment.ServiceName)
+		}
+		if !checkedImages[deployment.Image] {
+			if _, err := m.runner.Run(ctx, "docker", "image", "inspect", deployment.Image); err != nil {
+				return nil, fmt.Errorf("preflight AIFAR deployment %s image %s: %w", deployment.ServiceName, deployment.Image, err)
+			}
+			checkedImages[deployment.Image] = true
+		}
+		for _, path := range deployment.EnvFiles {
+			if path = strings.TrimSpace(path); path != "" {
+				if _, err := os.Stat(path); err != nil {
+					return nil, fmt.Errorf("preflight AIFAR deployment %s env file %s: %w", deployment.ServiceName, path, err)
+				}
+			}
+		}
+		for _, volume := range deployment.Volumes {
+			if source := strings.TrimSpace(volume.Source); source != "" {
+				if _, err := os.Stat(source); err != nil {
+					return nil, fmt.Errorf("preflight AIFAR deployment %s volume source %s: %w", deployment.ServiceName, source, err)
+				}
+			}
+		}
 		for replica := 1; replica <= deployment.Replicas; replica++ {
-			if err := ctx.Err(); err != nil {
-				return err
-			}
-			name := containerNameForDeployment(spec, deployment, replica)
-			exists, err := m.containerExists(ctx, name)
-			if err != nil {
-				return fmt.Errorf("preflight AIFAR deployment %s replica %d: %w", deployment.ServiceName, replica, err)
-			}
-			if !exists {
-				return fmt.Errorf("preflight AIFAR deployment %s replica %d: AIFAR pod %s does not exist", deployment.ServiceName, replica, name)
-			}
-			plan = append(plan, restartReplica{deployment: deployment, replica: replica, name: name})
+			plan = append(plan, restartReplicaPlan{
+				deployment: deployment,
+				replica:    replica,
+				name:       containerNameForDeployment(spec, deployment, replica),
+			})
 		}
 	}
-	for index := 0; index < len(plan); {
-		deployment := plan[index].deployment
-		deploymentCtx := ctx
-		cancel := func() {}
-		if deployment.Strategy.ProgressDeadlineSeconds > 0 {
-			deploymentCtx, cancel = context.WithTimeout(ctx, time.Duration(deployment.Strategy.ProgressDeadlineSeconds)*time.Second)
-		}
-		m.setDeploymentStatusFromDocker(deploymentCtx, spec, deployment, "rolling", "")
-		for index < len(plan) && plan[index].deployment.ServiceName == deployment.ServiceName {
-			item := plan[index]
-			if err := m.replaceContainer(deploymentCtx, spec, deployment, item.replica, item.name, func(refreshCtx context.Context) error {
-				return m.refreshServiceEndpoint(refreshCtx, spec, deployment.ServiceName)
-			}); err != nil {
-				cancel()
-				m.setDeploymentStatusFromDocker(context.WithoutCancel(ctx), spec, deployment, "failed", err.Error())
-				return fmt.Errorf("restart AIFAR deployment %s replica %d: %w", deployment.ServiceName, item.replica, err)
-			}
-			index++
-		}
-		cancel()
-		m.setDeploymentStatusFromDocker(ctx, spec, deployment, "ready", "")
+	return plan, nil
+}
+
+func (m *Manager) listInstanceRuntimePods(ctx context.Context, spec RuntimeSpec) ([]string, error) {
+	result, err := m.runner.Run(ctx, "docker",
+		"ps", "-a",
+		"--filter", "label=aifar.app=aifar",
+		"--filter", "label=aifar.install-root="+spec.InstallRoot,
+		"--filter", "label=aifar.component=pod",
+		"--format", `{{.Names}}`,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list AIFAR runtime pods for instance %s: %w", spec.InstanceID, err)
 	}
-	if err := m.refreshInstanceEndpoints(ctx, spec); err != nil {
+	names := make([]string, 0)
+	for _, line := range strings.Split(strings.TrimSpace(result.Stdout), "\n") {
+		if name := strings.TrimSpace(line); name != "" {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	return names, nil
+}
+
+func (m *Manager) stopAllRuntimePods(ctx context.Context, spec RuntimeSpec) error {
+	names, err := m.listInstanceRuntimePods(ctx, spec)
+	if err != nil {
 		return err
 	}
+	removeErrs := make([]error, 0)
+	for _, name := range names {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if _, err := m.runner.Run(ctx, "docker", "rm", "-f", name); err != nil {
+			removeErrs = append(removeErrs, fmt.Errorf("remove AIFAR runtime pod %s: %w", name, err))
+			continue
+		}
+		logf(m.log, "AIFAR runtime pod removed before restart-all container=%s\n", name)
+	}
+	remaining, listErr := m.listInstanceRuntimePods(context.WithoutCancel(ctx), spec)
+	if listErr != nil {
+		removeErrs = append(removeErrs, listErr)
+	} else if len(remaining) > 0 {
+		removeErrs = append(removeErrs, fmt.Errorf("AIFAR runtime pods remain after stop-all: %s", strings.Join(remaining, ", ")))
+	}
+	if len(removeErrs) > 0 {
+		return fmt.Errorf("stop all AIFAR runtime pods: %w", errors.Join(removeErrs...))
+	}
 	return nil
+}
+
+func (m *Manager) verifyRestartedRuntime(ctx context.Context, spec RuntimeSpec, started []restartReplicaPlan) []error {
+	errs := make([]error, 0)
+	for _, item := range started {
+		deploymentCtx := ctx
+		cancel := func() {}
+		if item.deployment.Strategy.ProgressDeadlineSeconds > 0 {
+			deploymentCtx, cancel = context.WithTimeout(ctx, time.Duration(item.deployment.Strategy.ProgressDeadlineSeconds)*time.Second)
+		}
+		if err := m.waitContainerReady(deploymentCtx, item.name); err != nil {
+			errs = append(errs, fmt.Errorf("verify AIFAR deployment %s replica %d: %w", item.deployment.ServiceName, item.replica, err))
+		}
+		cancel()
+	}
+	for _, deployment := range spec.Deployments {
+		pods, err := m.listDeploymentPods(context.WithoutCancel(ctx), spec, deployment)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("verify AIFAR deployment %s: %w", deployment.ServiceName, err))
+			continue
+		}
+		current := len(pods)
+		ready := 0
+		updated := 0
+		desiredHash := deploymentSpecHash(deployment)
+		for _, pod := range pods {
+			if pod.Healthy {
+				ready++
+			}
+			if pod.Replica > 0 && pod.Replica <= deployment.Replicas && (pod.SpecHash == "" || pod.SpecHash == desiredHash) {
+				updated++
+			}
+		}
+		if current != deployment.Replicas || ready != deployment.Replicas || updated != deployment.Replicas {
+			errs = append(errs, fmt.Errorf("verify AIFAR deployment %s replicas: desired=%d current=%d ready=%d updated=%d available=%d", deployment.ServiceName, deployment.Replicas, current, ready, updated, ready))
+		}
+	}
+	return errs
 }
 
 func (m *Manager) Remove(ctx context.Context, instanceID string) error {

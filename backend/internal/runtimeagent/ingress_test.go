@@ -3,8 +3,10 @@ package runtimeagent
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"net/http/httptest"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -43,123 +45,155 @@ func (f *fakeRunner) callsString() string {
 	return strings.Join(f.calls, "\n")
 }
 
-func TestManagerRestartAllReplacesEnabledReplicasInSpecOrder(t *testing.T) {
-	runner := &restartAllRunner{}
+func TestManagerRestartAllRestoresMissingDesiredPod(t *testing.T) {
+	runner := newStopAllRestartRunner("aifar-pod-admin-gateway-rev-1-r1")
 	manager := NewManager(ManagerOptions{StateDir: t.TempDir(), Runner: runner})
-	spec := restartAllSpec()
 
-	if err := manager.RestartAll(context.Background(), spec); err != nil {
+	if err := manager.RestartAll(context.Background(), restartAllSpec()); err != nil {
 		t.Fatal(err)
 	}
 
-	got := runner.startedContainers()
-	want := []string{
+	for _, name := range []string{
 		"aifar-pod-admin-contacts-rev-1-r1",
 		"aifar-pod-admin-contacts-rev-1-r2",
 		"aifar-pod-admin-gateway-rev-1-r1",
-	}
-	if strings.Join(got, "\n") != strings.Join(want, "\n") {
-		t.Fatalf("expected enabled replicas in spec order\nwant: %#v\n got: %#v", want, got)
-	}
-	for _, name := range got {
-		if strings.Contains(name, "message") {
-			t.Fatalf("zero-replica deployment must remain offline, started %q", name)
+	} {
+		if !runner.hasContainer(name) {
+			t.Fatalf("missing desired pod %s after restart-all: %#v", name, runner.containerNames())
 		}
 	}
 }
 
-func TestManagerRestartAllCleansFailedReplacementAndStopsLaterWork(t *testing.T) {
-	runner := &restartAllRunner{failStartFor: "contacts-rev-1-r2"}
+func TestManagerRestartAllLeavesZeroReplicaDeploymentOffline(t *testing.T) {
+	runner := newStopAllRestartRunner("aifar-pod-admin-message-rev-old-r1")
 	manager := NewManager(ManagerOptions{StateDir: t.TempDir(), Runner: runner})
 
-	err := manager.RestartAll(context.Background(), restartAllSpec())
-	if err == nil || !strings.Contains(err.Error(), "contacts") {
-		t.Fatalf("expected contacts replacement failure, got %v", err)
-	}
-	calls := runner.callsString()
-	if !strings.Contains(calls, "docker rm -f aifar-pod-admin-contacts-rev-1-r2-next-") {
-		t.Fatalf("expected failed temporary container cleanup, got:\n%s", calls)
-	}
-	if strings.Contains(calls, "docker rename aifar-pod-admin-contacts-rev-1-r2 ") {
-		t.Fatalf("original replica must remain named after failed replacement, got:\n%s", calls)
-	}
-	if strings.Contains(calls, "docker run") && strings.Contains(strings.Join(runner.startedContainers(), "\n"), "gateway") {
-		t.Fatalf("later deployments must not start after first failure, got:\n%s", calls)
-	}
-}
-
-func TestManagerRestartAllPreflightsEveryEnabledReplicaBeforeMutation(t *testing.T) {
-	runner := &restartAllRunner{missingContainer: "contacts-rev-1-r2"}
-	manager := NewManager(ManagerOptions{StateDir: t.TempDir(), Runner: runner})
-
-	err := manager.RestartAll(context.Background(), restartAllSpec())
-	if err == nil || !strings.Contains(err.Error(), "does not exist") {
-		t.Fatalf("expected missing replica preflight failure, got %v", err)
-	}
-	if calls := runner.callsString(); strings.Contains(calls, "docker run ") || strings.Contains(calls, "docker rename ") {
-		t.Fatalf("preflight failure must happen before any replacement, got:\n%s", calls)
-	}
-}
-
-func TestManagerRestartAllKeepsLogicalContainerIdentityOnReplacement(t *testing.T) {
-	runner := &restartAllRunner{}
-	manager := NewManager(ManagerOptions{StateDir: t.TempDir(), Runner: runner})
-	spec := restartAllSpec()
-	spec.Deployments = spec.Deployments[:1]
-	spec.Deployments[0].Replicas = 1
-	spec.Deployments[0].Environment = map[string]string{"APP_CONTAINER_NAME": "${containerName}"}
-
-	if err := manager.RestartAll(context.Background(), spec); err != nil {
+	if err := manager.RestartAll(context.Background(), restartAllSpec()); err != nil {
 		t.Fatal(err)
 	}
+	if runner.hasServiceContainer("message") {
+		t.Fatalf("zero-replica deployment must remain offline: %#v", runner.containerNames())
+	}
+}
+
+func TestManagerRestartAllStopsEveryPodBeforeStartingAnyPod(t *testing.T) {
+	runner := newStopAllRestartRunner(
+		"aifar-pod-admin-contacts-rev-1-r1",
+		"aifar-pod-admin-contacts-rev-1-r2",
+		"aifar-pod-admin-gateway-rev-1-r1",
+		"aifar-pod-admin-contacts-rev-old-r3",
+	)
+	manager := NewManager(ManagerOptions{StateDir: t.TempDir(), Runner: runner})
+
+	if err := manager.RestartAll(context.Background(), restartAllSpec()); err != nil {
+		t.Fatal(err)
+	}
+
 	calls := runner.callsString()
-	logical := "aifar-pod-admin-contacts-rev-1-r1"
-	for _, want := range []string{"--label aifar.pod=" + logical + " ", "-e APP_CONTAINER_NAME=" + logical + " "} {
-		if !strings.Contains(calls, want) {
-			t.Fatalf("replacement must retain logical identity %q, got:\n%s", want, calls)
+	lastRemove := strings.LastIndex(calls, "docker rm -f")
+	firstRun := strings.Index(calls, "docker run -d")
+	if lastRemove < 0 || firstRun < 0 || lastRemove > firstRun {
+		t.Fatalf("all old pods must be removed before any new pod starts:\n%s", calls)
+	}
+	lastRun := strings.LastIndex(calls, "docker run -d")
+	firstReadiness := strings.Index(calls, "docker inspect -f {{.State.Running}}|")
+	if firstReadiness < 0 || lastRun > firstReadiness {
+		t.Fatalf("all pod starts must be submitted before readiness inspection:\n%s", calls)
+	}
+	for _, forbidden := range []string{"docker rename ", "-next-"} {
+		if strings.Contains(calls, forbidden) {
+			t.Fatalf("stop-all restart must not use rolling artifact %q:\n%s", forbidden, calls)
 		}
 	}
 }
 
-func TestManagerRestartAllRestoresBackupWhenEndpointPromotionFails(t *testing.T) {
-	runner := &restartAllRunner{failEndpointRefreshFor: "contacts"}
+func TestManagerRestartAllContinuesStartingAfterOnePodFails(t *testing.T) {
+	runner := newStopAllRestartRunner("aifar-pod-admin-contacts-rev-1-r1")
+	runner.failStartFor = "contacts-rev-1-r2"
 	manager := NewManager(ManagerOptions{StateDir: t.TempDir(), Runner: runner})
-	spec := restartAllSpec()
-	spec.Deployments = spec.Deployments[:1]
-	spec.Deployments[0].Replicas = 1
 
-	err := manager.RestartAll(context.Background(), spec)
-	if err == nil || !strings.Contains(err.Error(), "refresh") {
-		t.Fatalf("expected endpoint promotion failure, got %v", err)
+	err := manager.RestartAll(context.Background(), restartAllSpec())
+	if err == nil || !strings.Contains(err.Error(), "contacts") || !strings.Contains(err.Error(), "replica 2") {
+		t.Fatalf("expected contacts replica 2 startup failure, got %v", err)
 	}
-	calls := runner.callsString()
-	logical := "aifar-pod-admin-contacts-rev-1-r1"
-	if !strings.Contains(calls, "docker rm -f "+logical+"\n") {
-		t.Fatalf("newly promoted container must be removed during rollback, got:\n%s", calls)
-	}
-	if !strings.Contains(calls, "docker rename "+logical+"-old-") || !strings.Contains(calls, " "+logical) {
-		t.Fatalf("backup must be restored to the logical name, got:\n%s", calls)
+	if !runner.hasContainer("aifar-pod-admin-gateway-rev-1-r1") {
+		t.Fatalf("later deployments must still start after one failure: %#v", runner.containerNames())
 	}
 }
 
-func TestManagerRestartAllCancellationKeepsPromotedWorkAndCleansPendingReplacement(t *testing.T) {
+func TestManagerRestartAllDoesNotStartWhenOldPodRemovalLeavesResidue(t *testing.T) {
+	runner := newStopAllRestartRunner("aifar-pod-admin-contacts-rev-old-r1")
+	runner.failRemoveFor = "contacts-rev-old-r1"
+	manager := NewManager(ManagerOptions{StateDir: t.TempDir(), Runner: runner})
+
+	err := manager.RestartAll(context.Background(), restartAllSpec())
+	if err == nil || !strings.Contains(err.Error(), "remain after stop-all") {
+		t.Fatalf("expected residual pod failure, got %v", err)
+	}
+	if strings.Contains(runner.callsString(), "docker run ") {
+		t.Fatalf("new pods must not start while old runtime pods remain:\n%s", runner.callsString())
+	}
+}
+
+func TestManagerRestartAllAggregatesHealthAndStartFailures(t *testing.T) {
+	runner := newStopAllRestartRunner()
+	runner.failStartFor = "contacts-rev-1-r2"
+	runner.unhealthyFor = "gateway-rev-1-r1"
+	manager := NewManager(ManagerOptions{StateDir: t.TempDir(), Runner: runner})
+	spec := restartAllSpec()
+	for index := range spec.Deployments {
+		spec.Deployments[index].Strategy.ProgressDeadlineSeconds = 1
+	}
+
+	err := manager.RestartAll(context.Background(), spec)
+	if err == nil || !strings.Contains(err.Error(), "contacts") || !strings.Contains(err.Error(), "gateway") {
+		t.Fatalf("expected aggregate contacts and gateway failures, got %v", err)
+	}
+	manager.mu.RLock()
+	contactsStatus := manager.deployments[endpointKey(spec.InstanceID, "contacts")]
+	gatewayStatus := manager.deployments[endpointKey(spec.InstanceID, "gateway")]
+	manager.mu.RUnlock()
+	for service, status := range map[string]deploymentRuntimeStatus{"contacts": contactsStatus, "gateway": gatewayStatus} {
+		if status.Status != "failed" || status.LastError == "" {
+			t.Fatalf("failed deployment %s must retain its restart error, got %#v", service, status)
+		}
+	}
+}
+
+func TestManagerRestartAllCancellationKeepsPartialResultWithoutRollback(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
-	runner := &restartAllRunner{cancelOnReadyFor: "contacts-rev-1-r2", cancel: cancel}
+	runner := newStopAllRestartRunner("aifar-pod-admin-contacts-rev-old-r1")
+	runner.cancelAfterStart = "contacts-rev-1-r1"
+	runner.cancel = cancel
 	manager := NewManager(ManagerOptions{StateDir: t.TempDir(), Runner: runner})
 
 	err := manager.RestartAll(ctx, restartAllSpec())
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("expected cancellation, got %v", err)
 	}
-	calls := runner.callsString()
-	if !strings.Contains(calls, "docker rm -f aifar-pod-admin-contacts-rev-1-r1-old-") {
-		t.Fatalf("first promoted replacement should stay promoted, got:\n%s", calls)
+	if !runner.hasContainer("aifar-pod-admin-contacts-rev-1-r1") {
+		t.Fatalf("submitted pod must remain after cancellation: %#v", runner.containerNames())
 	}
-	if !strings.Contains(calls, "docker rm -f aifar-pod-admin-contacts-rev-1-r2-next-") {
-		t.Fatalf("pending replacement should be removed after cancellation, got:\n%s", calls)
+	if runner.hasContainer("aifar-pod-admin-contacts-rev-old-r1") {
+		t.Fatalf("removed old pod must not be rolled back: %#v", runner.containerNames())
 	}
-	if strings.Contains(strings.Join(runner.startedContainers(), "\n"), "gateway") {
-		t.Fatalf("cancellation must stop future replacements, got:\n%s", calls)
+}
+
+func TestManagerRestartAllPreflightFailureKeepsExistingPods(t *testing.T) {
+	original := "aifar-pod-admin-contacts-rev-1-r1"
+	runner := newStopAllRestartRunner(original)
+	runner.failImageFor = "contacts:rev-1"
+	manager := NewManager(ManagerOptions{StateDir: t.TempDir(), Runner: runner})
+
+	err := manager.RestartAll(context.Background(), restartAllSpec())
+	if err == nil || !strings.Contains(err.Error(), "image") {
+		t.Fatalf("expected image preflight failure, got %v", err)
+	}
+	if !runner.hasContainer(original) {
+		t.Fatalf("preflight failure must keep existing pod: %#v", runner.containerNames())
+	}
+	if strings.Contains(runner.callsString(), "docker rm -f ") {
+		t.Fatalf("preflight failure must happen before mutation:\n%s", runner.callsString())
 	}
 }
 
@@ -182,79 +216,148 @@ func restartAllSpec() RuntimeSpec {
 	})
 }
 
-type restartAllRunner struct {
-	mu                     sync.Mutex
-	calls                  []string
-	started                []string
-	failStartFor           string
-	missingContainer       string
-	failEndpointRefreshFor string
-	promoted               bool
-	cancelOnReadyFor       string
-	cancel                 context.CancelFunc
+type stopAllRestartRunner struct {
+	mu               sync.Mutex
+	calls            []string
+	containers       map[string]bool
+	failImageFor     string
+	failStartFor     string
+	failRemoveFor    string
+	unhealthyFor     string
+	cancelAfterStart string
+	cancel           context.CancelFunc
 }
 
-func (r *restartAllRunner) Run(ctx context.Context, name string, args ...string) (CommandResult, error) {
+func newStopAllRestartRunner(names ...string) *stopAllRestartRunner {
+	runner := &stopAllRestartRunner{containers: map[string]bool{}}
+	for _, name := range names {
+		runner.containers[name] = true
+	}
+	return runner
+}
+
+func (r *stopAllRestartRunner) Run(ctx context.Context, name string, args ...string) (CommandResult, error) {
 	call := name + " " + strings.Join(args, " ")
 	r.mu.Lock()
+	defer r.mu.Unlock()
 	r.calls = append(r.calls, call)
-	r.mu.Unlock()
 	switch {
-	case strings.Contains(call, "docker inspect -f {{.Id}}"):
-		if r.missingContainer != "" && strings.Contains(call, r.missingContainer) {
-			return CommandResult{}, errors.New("not found")
+	case strings.Contains(call, "docker image inspect "):
+		if r.failImageFor != "" && strings.Contains(call, r.failImageFor) {
+			return CommandResult{}, errors.New("image unavailable")
 		}
-		return CommandResult{Stdout: "container-id\n"}, nil
+		return CommandResult{Stdout: "image-id\n"}, nil
+	case strings.Contains(call, "docker ps -a"):
+		names := make([]string, 0, len(r.containers))
+		for container := range r.containers {
+			if service := dockerServiceFilter(args); service != "" && !strings.Contains(container, "-"+service+"-") {
+				continue
+			}
+			names = append(names, container)
+		}
+		sort.Strings(names)
+		if strings.Contains(call, `aifar.replica`) {
+			for index, container := range names {
+				replica := 1
+				if marker := strings.LastIndex(container, "-r"); marker >= 0 {
+					replica, _ = strconv.Atoi(container[marker+2:])
+				}
+				names[index] = fmt.Sprintf("%s|%d|rev-1|", container, replica)
+			}
+		}
+		stdout := strings.Join(names, "\n")
+		if stdout != "" {
+			stdout += "\n"
+		}
+		return CommandResult{Stdout: stdout}, nil
+	case strings.Contains(call, "docker ps "):
+		service := dockerServiceFilter(args)
+		names := make([]string, 0)
+		for container := range r.containers {
+			if service == "" || strings.Contains(container, "-"+service+"-") {
+				names = append(names, container+"|"+container)
+			}
+		}
+		sort.Strings(names)
+		return CommandResult{Stdout: strings.Join(names, "\n")}, nil
 	case strings.Contains(call, "docker run "):
 		container := containerNameArg(args)
-		original := strings.SplitN(container, "-next-", 2)[0]
-		r.mu.Lock()
-		r.started = append(r.started, original)
-		r.mu.Unlock()
 		if r.failStartFor != "" && strings.Contains(container, r.failStartFor) {
 			return CommandResult{Stderr: "image start failed\n"}, errors.New("image start failed")
 		}
-		return CommandResult{Stdout: "new-container\n"}, nil
+		r.containers[container] = true
+		if r.cancelAfterStart != "" && strings.Contains(container, r.cancelAfterStart) && r.cancel != nil {
+			r.cancel()
+		}
+		return CommandResult{Stdout: "container-id\n"}, nil
+	case strings.Contains(call, "docker rm -f "):
+		container := args[len(args)-1]
+		if r.failRemoveFor != "" && strings.Contains(container, r.failRemoveFor) {
+			return CommandResult{}, errors.New("remove failed")
+		}
+		delete(r.containers, container)
+		return CommandResult{}, nil
+	case strings.Contains(call, "docker rename "):
+		oldName := args[len(args)-2]
+		newName := args[len(args)-1]
+		delete(r.containers, oldName)
+		r.containers[newName] = true
+		return CommandResult{}, nil
 	case strings.Contains(call, "docker inspect -f {{.State.Running}}|"):
 		container := args[len(args)-1]
-		if r.cancelOnReadyFor != "" && strings.Contains(container, r.cancelOnReadyFor) {
-			if r.cancel != nil {
-				r.cancel()
-			}
-			return CommandResult{Stdout: "true|starting\n"}, nil
+		if r.unhealthyFor != "" && strings.Contains(container, r.unhealthyFor) {
+			return CommandResult{Stdout: "true|unhealthy\n"}, nil
 		}
 		if strings.Contains(call, "NetworkSettings") {
 			return CommandResult{Stdout: "true|healthy|172.20.0.10\n"}, nil
 		}
 		return CommandResult{Stdout: "true|healthy\n"}, nil
-	case strings.Contains(call, "docker rename") && strings.Contains(args[1], "-next-"):
-		r.mu.Lock()
-		r.promoted = true
-		r.mu.Unlock()
-		return CommandResult{Stdout: "renamed\n"}, nil
-	case strings.Contains(call, "docker ps"):
-		r.mu.Lock()
-		promoted := r.promoted
-		r.mu.Unlock()
-		if promoted && r.failEndpointRefreshFor != "" && strings.Contains(call, "label=aifar.service="+r.failEndpointRefreshFor) && !strings.Contains(call, "docker ps -a") {
-			return CommandResult{}, errors.New("endpoint refresh failed")
-		}
-		return CommandResult{}, nil
 	default:
 		return CommandResult{Stdout: "ok\n"}, nil
 	}
 }
 
-func (r *restartAllRunner) startedContainers() []string {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return append([]string(nil), r.started...)
-}
-
-func (r *restartAllRunner) callsString() string {
+func (r *stopAllRestartRunner) callsString() string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return strings.Join(r.calls, "\n")
+}
+
+func (r *stopAllRestartRunner) hasContainer(name string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.containers[name]
+}
+
+func (r *stopAllRestartRunner) hasServiceContainer(service string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for name := range r.containers {
+		if strings.Contains(name, "-"+service+"-") {
+			return true
+		}
+	}
+	return false
+}
+
+func (r *stopAllRestartRunner) containerNames() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	names := make([]string, 0, len(r.containers))
+	for name := range r.containers {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+func dockerServiceFilter(args []string) string {
+	for _, arg := range args {
+		if strings.HasPrefix(arg, "label=aifar.service=") {
+			return strings.TrimPrefix(arg, "label=aifar.service=")
+		}
+	}
+	return ""
 }
 
 func TestManagerAppliesRuntimeSpecAsHostListeners(t *testing.T) {
