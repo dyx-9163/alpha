@@ -20,12 +20,15 @@ describe('MinIO monitoring status', () => {
     expect(latestSnapshotTime([undefined, { collectedAt: 'invalid' }])).toBe('')
   })
 
-  it('considers both collected and updated times from the same snapshot', () => {
-    expect(latestSnapshotTime([
-      { collectedAt: 'invalid', updatedAt: '2026-07-27T04:01:10Z' }
-    ])).toBe(new Date('2026-07-27T04:01:10Z').toLocaleTimeString())
+  it('prefers a valid collected time over a newer updated time from the same snapshot', () => {
     expect(latestSnapshotTime([
       { collectedAt: '2026-07-27T03:59:09Z', updatedAt: '2026-07-27T04:01:10Z' }
+    ])).toBe(new Date('2026-07-27T03:59:09Z').toLocaleTimeString())
+  })
+
+  it('falls back to a valid updated time when collected time is invalid', () => {
+    expect(latestSnapshotTime([
+      { collectedAt: 'invalid', updatedAt: '2026-07-27T04:01:10Z' }
     ])).toBe(new Date('2026-07-27T04:01:10Z').toLocaleTimeString())
   })
 })
