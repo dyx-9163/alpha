@@ -35,23 +35,27 @@ type runtimeDiagnosticEstimateScriptData struct {
 }
 
 type runtimeDiagnosticExportScriptData struct {
-	InstallRoot    string
-	ExportID       string
-	InstanceID     string
-	Services       string
-	Since          string
-	Until          string
-	ArchiveBase    string
-	RuntimeSummary string
-	Deployments    string
-	Pods           string
-	ReleaseSummary string
-	Readme         string
+	InstallRoot     string
+	ExportID        string
+	InstanceID      string
+	Services        string
+	Since           string
+	Until           string
+	ArchiveBase     string
+	RuntimeSummary  string
+	Deployments     string
+	Pods            string
+	ReleaseSummary  string
+	Readme          string
+	ProcRoot        string
+	FileLimitBlocks string
 }
 
 type runtimeDiagnosticCleanupScriptData struct {
 	InstallRoot string
 	ExportID    string
+	ProcRoot    string
+	KillCommand string
 }
 
 type diagnosticFileStreamer interface {
@@ -306,21 +310,7 @@ func (s Service) ExportRuntimeDiagnostics(ctx context.Context, req RuntimeDiagno
 	if !estimate.Allowed {
 		return fail(errors.New(i18n.Text(req.Language, "aifar.diag.estimateRejected")))
 	}
-	finishStep("success", "")
 
-	startStep(3)
-	if err := ctx.Err(); err != nil {
-		return fail(err)
-	}
-	finishStep("success", "")
-
-	startStep(4)
-	if err := ctx.Err(); err != nil {
-		return fail(err)
-	}
-	finishStep("success", "")
-
-	startStep(5)
 	runtimeSummaryJSON, deploymentsJSON, podsJSON, releaseSummaryJSON, err := buildRuntimeDiagnosticPayloads(diagnostics, current, exportRecord)
 	if err != nil {
 		return fail(errors.New(i18n.Text(req.Language, "aifar.diag.payloadFailed")))
@@ -347,15 +337,12 @@ func (s Service) ExportRuntimeDiagnostics(ctx context.Context, req RuntimeDiagno
 	if err != nil {
 		return fail(errors.New(i18n.Text(req.Language, "aifar.diag.exportFailed")))
 	}
-	finishStep("success", "")
-
-	startStep(6)
 	if err := ctx.Err(); err != nil {
 		return fail(err)
 	}
 	finishStep("success", "")
 
-	startStep(7)
+	startStep(3)
 	if logForServer != nil {
 		logForServer.Info("%s", i18n.Text(req.Language, "aifar.diag.exportStarted", current.ID))
 	}
@@ -371,6 +358,10 @@ func (s Service) ExportRuntimeDiagnostics(ctx context.Context, req RuntimeDiagno
 		return fail(errors.New(i18n.Text(req.Language, "aifar.diag.protocolInvalid")))
 	}
 	finishStep("success", "")
+	for index := 4; index <= 7; index++ {
+		startStep(index)
+		finishStep("success", "")
+	}
 
 	// Promotion and SHA validation have completed remotely. Do not observe cancellation
 	// inside this short record section; a ready file must always have a ready row.
@@ -430,8 +421,8 @@ func (s Service) StreamRuntimeDiagnosticExport(ctx context.Context, req RuntimeD
 	if n != exportRecord.ArchiveBytes {
 		return n, errors.New(i18n.Text(req.Language, "aifar.diag.streamSizeMismatch"))
 	}
-	exportRecord.DownloadedAt = time.Now().UTC()
-	if _, err := diagnostics.SaveDiagnosticExport(exportRecord); err != nil {
+	updated, err := diagnostics.MarkDiagnosticExportDownloaded(exportRecord.ID, time.Now().UTC())
+	if err != nil || !updated {
 		return n, errors.New(i18n.Text(req.Language, "aifar.diag.recordFailed"))
 	}
 	return n, nil
@@ -447,29 +438,22 @@ func (s Service) DeleteRuntimeDiagnosticExport(ctx context.Context, req RuntimeD
 		return err
 	}
 	attemptedAt := time.Now().UTC()
-	exportRecord.CleanupStatus = "pending"
-	exportRecord.CleanupError = ""
-	exportRecord.CleanupAttemptedAt = attemptedAt
-	if exportRecord, err = diagnostics.SaveDiagnosticExport(exportRecord); err != nil {
+	updated, updateErr := diagnostics.MarkDiagnosticExportCleanupPending(exportRecord.ID, attemptedAt)
+	if updateErr != nil || !updated {
 		return errors.New(i18n.Text(req.Language, "aifar.diag.recordFailed"))
 	}
 	if log != nil {
 		log.Info("%s", i18n.Text(req.Language, "aifar.diag.deleteStarted", exportRecord.ArchiveName))
 	}
 	if err := s.cleanupRuntimeDiagnosticExport(ctx, server, installRoot, exportRecord.ID); err != nil {
-		exportRecord.CleanupStatus = "failed"
-		exportRecord.CleanupError = i18n.Text(req.Language, "aifar.diag.cleanupFailed")
-		_, _ = diagnostics.SaveDiagnosticExport(exportRecord)
+		_, _ = diagnostics.MarkDiagnosticExportCleanupFailed(exportRecord.ID, i18n.Text(req.Language, "aifar.diag.cleanupFailed"))
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
 		return errors.New(i18n.Text(req.Language, "aifar.diag.deleteFailed"))
 	}
-	exportRecord.Status = "deleted"
-	exportRecord.DeletedAt = time.Now().UTC()
-	exportRecord.CleanupStatus = "complete"
-	exportRecord.CleanupError = ""
-	if _, err := diagnostics.SaveDiagnosticExport(exportRecord); err != nil {
+	updated, updateErr = diagnostics.MarkDiagnosticExportDeleted(exportRecord.ID, time.Now().UTC())
+	if updateErr != nil || !updated {
 		return errors.New(i18n.Text(req.Language, "aifar.diag.recordFailed"))
 	}
 	if log != nil {
@@ -547,13 +531,19 @@ func renderRuntimeDiagnosticEstimateScript(data runtimeDiagnosticEstimateScriptD
 	if err != nil {
 		return "", err
 	}
-	return installerkit.RenderTemplate(AppName, "runtime-diagnostics-estimate.sh", "aifar-runtime-diagnostics-estimate", string(content), nil, data)
+	return renderEmbeddedRuntimeDiagnosticScript("aifar-runtime-diagnostics-estimate", content, data)
 }
 
 func renderRuntimeDiagnosticExportScript(data runtimeDiagnosticExportScriptData) (string, error) {
 	content, err := templateFS.ReadFile("templates/runtime-diagnostics-export.sh")
 	if err != nil {
 		return "", err
+	}
+	if strings.TrimSpace(data.ProcRoot) == "" {
+		data.ProcRoot = installerkit.ShellQuote("/proc")
+	}
+	if strings.TrimSpace(data.FileLimitBlocks) == "" {
+		data.FileLimitBlocks = "1048576"
 	}
 	return renderEmbeddedRuntimeDiagnosticScript("aifar-runtime-diagnostics-export", content, data)
 }
@@ -562,6 +552,12 @@ func renderRuntimeDiagnosticCleanupScript(data runtimeDiagnosticCleanupScriptDat
 	content, err := templateFS.ReadFile("templates/runtime-diagnostics-cleanup.sh")
 	if err != nil {
 		return "", err
+	}
+	if strings.TrimSpace(data.ProcRoot) == "" {
+		data.ProcRoot = installerkit.ShellQuote("/proc")
+	}
+	if strings.TrimSpace(data.KillCommand) == "" {
+		data.KillCommand = installerkit.ShellQuote("/bin/kill")
 	}
 	return renderEmbeddedRuntimeDiagnosticScript("aifar-runtime-diagnostics-cleanup", content, data)
 }
@@ -626,19 +622,27 @@ func (s Service) loadRuntimeDiagnosticArtifact(exportID, requestInstanceID, requ
 	if installRoot == "." || installRoot == "/" || !path.IsAbs(installRoot) || containsRuntimeDiagnosticControl(installRoot) {
 		return store.DiagnosticExport{}, store.AppInstance{}, store.Server{}, "", errors.New(i18n.Text(lang, "aifar.diag.installRootMissing"))
 	}
-	if _, _, err := validateRuntimeDiagnosticRelativePath(exportRecord.ID, exportRecord.RemoteRelativePath, exportRecord.ArchiveName); err != nil ||
-		!runtimeDiagnosticSHA256Pattern.MatchString(exportRecord.SHA256) || exportRecord.ArchiveBytes < 0 || exportRecord.ArchiveBytes > runtimeDiagnosticMaxArchive {
-		return store.DiagnosticExport{}, store.AppInstance{}, store.Server{}, "", errors.New(i18n.Text(lang, "aifar.diag.pathInvalid"))
-	}
 	now := time.Now().UTC()
 	switch exportRecord.Status {
 	case "ready":
+		if _, _, err := validateRuntimeDiagnosticRelativePath(exportRecord.ID, exportRecord.RemoteRelativePath, exportRecord.ArchiveName); err != nil ||
+			!runtimeDiagnosticSHA256Pattern.MatchString(exportRecord.SHA256) || exportRecord.ArchiveBytes < 0 || exportRecord.ArchiveBytes > runtimeDiagnosticMaxArchive {
+			return store.DiagnosticExport{}, store.AppInstance{}, store.Server{}, "", errors.New(i18n.Text(lang, "aifar.diag.pathInvalid"))
+		}
 		if !allowExpired && !exportRecord.ExpiresAt.After(now) {
 			return store.DiagnosticExport{}, store.AppInstance{}, store.Server{}, "", errors.New(i18n.Text(lang, "aifar.diag.exportExpired"))
 		}
 	case "expired":
 		if !allowExpired {
 			return store.DiagnosticExport{}, store.AppInstance{}, store.Server{}, "", errors.New(i18n.Text(lang, "aifar.diag.exportExpired"))
+		}
+		if _, _, err := validateRuntimeDiagnosticRelativePath(exportRecord.ID, exportRecord.RemoteRelativePath, exportRecord.ArchiveName); err != nil ||
+			!runtimeDiagnosticSHA256Pattern.MatchString(exportRecord.SHA256) || exportRecord.ArchiveBytes < 0 || exportRecord.ArchiveBytes > runtimeDiagnosticMaxArchive {
+			return store.DiagnosticExport{}, store.AppInstance{}, store.Server{}, "", errors.New(i18n.Text(lang, "aifar.diag.pathInvalid"))
+		}
+	case "failed", "cancelled":
+		if !allowExpired || exportRecord.CleanupStatus == "complete" {
+			return store.DiagnosticExport{}, store.AppInstance{}, store.Server{}, "", errors.New(i18n.Text(lang, "aifar.diag.exportStateInvalid"))
 		}
 	default:
 		return store.DiagnosticExport{}, store.AppInstance{}, store.Server{}, "", errors.New(i18n.Text(lang, "aifar.diag.exportStateInvalid"))

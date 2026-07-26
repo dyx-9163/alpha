@@ -53,6 +53,46 @@ func (s *Store) GetDiagnosticExport(id string) (DiagnosticExport, error) {
 	return scanDiagnosticExport(row)
 }
 
+func (s *Store) MarkDiagnosticExportDownloaded(id string, downloadedAt time.Time) (bool, error) {
+	result, err := s.db.Exec(`update diagnostic_exports set downloaded_at=?
+		where id=? and status='ready' and deleted_at is null and expires_at > ?`, downloadedAt, strings.TrimSpace(id), downloadedAt)
+	return diagnosticExportWasUpdated(result, err)
+}
+
+func (s *Store) MarkDiagnosticExportCleanupPending(id string, attemptedAt time.Time) (bool, error) {
+	result, err := s.db.Exec(`update diagnostic_exports
+		set cleanup_status='pending',cleanup_error='',cleanup_attempted_at=?
+		where id=? and status in ('ready','expired','failed','cancelled')
+		and deleted_at is null and cleanup_status <> 'complete'`, attemptedAt, strings.TrimSpace(id))
+	return diagnosticExportWasUpdated(result, err)
+}
+
+func (s *Store) MarkDiagnosticExportCleanupFailed(id, cleanupError string) (bool, error) {
+	result, err := s.db.Exec(`update diagnostic_exports set cleanup_status='failed',cleanup_error=?
+		where id=? and status in ('ready','expired','failed','cancelled')
+		and deleted_at is null and cleanup_status='pending'`, strings.TrimSpace(cleanupError), strings.TrimSpace(id))
+	return diagnosticExportWasUpdated(result, err)
+}
+
+func (s *Store) MarkDiagnosticExportDeleted(id string, deletedAt time.Time) (bool, error) {
+	result, err := s.db.Exec(`update diagnostic_exports
+		set status='deleted',deleted_at=?,cleanup_status='complete',cleanup_error=''
+		where id=? and status in ('ready','expired','failed','cancelled')
+		and deleted_at is null and cleanup_status='pending'`, deletedAt, strings.TrimSpace(id))
+	return diagnosticExportWasUpdated(result, err)
+}
+
+func diagnosticExportWasUpdated(result sql.Result, err error) (bool, error) {
+	if err != nil {
+		return false, err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return rows == 1, nil
+}
+
 func (s *Store) ListDiagnosticExports(instanceID string, page, pageSize int) (DiagnosticExportPage, error) {
 	if page <= 0 {
 		page = 1

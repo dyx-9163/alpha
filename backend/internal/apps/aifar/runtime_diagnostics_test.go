@@ -16,13 +16,16 @@ import (
 	"time"
 
 	"aifar-deployment/backend/internal/adapter"
+	"aifar-deployment/backend/internal/installer/installerkit"
 	"aifar-deployment/backend/internal/store"
 )
 
 type runtimeDiagnosticStore struct {
 	*fakeStore
-	exports          map[string]store.DiagnosticExport
-	saveErrForStatus map[string]error
+	exports                  map[string]store.DiagnosticExport
+	saveErrForStatus         map[string]error
+	beforeMarkDownloaded     func()
+	beforeMarkCleanupPending func()
 }
 
 func (s *runtimeDiagnosticStore) SaveDiagnosticExport(v store.DiagnosticExport) (store.DiagnosticExport, error) {
@@ -44,18 +47,83 @@ func (s *runtimeDiagnosticStore) GetDiagnosticExport(id string) (store.Diagnosti
 	return v, nil
 }
 
+func (s *runtimeDiagnosticStore) MarkDiagnosticExportDownloaded(id string, downloadedAt time.Time) (bool, error) {
+	if s.beforeMarkDownloaded != nil {
+		s.beforeMarkDownloaded()
+	}
+	v, ok := s.exports[id]
+	if !ok || v.Status != "ready" || !v.DeletedAt.IsZero() || !v.ExpiresAt.After(downloadedAt) {
+		return false, nil
+	}
+	v.DownloadedAt = downloadedAt
+	s.exports[id] = v
+	return true, nil
+}
+
+func (s *runtimeDiagnosticStore) MarkDiagnosticExportCleanupPending(id string, attemptedAt time.Time) (bool, error) {
+	if s.beforeMarkCleanupPending != nil {
+		s.beforeMarkCleanupPending()
+	}
+	v, ok := s.exports[id]
+	if !ok || !runtimeDiagnosticCleanupEligible(v) || v.CleanupStatus == "complete" {
+		return false, nil
+	}
+	v.CleanupStatus = "pending"
+	v.CleanupError = ""
+	v.CleanupAttemptedAt = attemptedAt
+	s.exports[id] = v
+	return true, nil
+}
+
+func (s *runtimeDiagnosticStore) MarkDiagnosticExportCleanupFailed(id, cleanupError string) (bool, error) {
+	v, ok := s.exports[id]
+	if !ok || !runtimeDiagnosticCleanupEligible(v) || v.CleanupStatus != "pending" {
+		return false, nil
+	}
+	v.CleanupStatus = "failed"
+	v.CleanupError = cleanupError
+	s.exports[id] = v
+	return true, nil
+}
+
+func (s *runtimeDiagnosticStore) MarkDiagnosticExportDeleted(id string, deletedAt time.Time) (bool, error) {
+	v, ok := s.exports[id]
+	if !ok || !runtimeDiagnosticCleanupEligible(v) || v.CleanupStatus != "pending" {
+		return false, nil
+	}
+	v.Status = "deleted"
+	v.DeletedAt = deletedAt
+	v.CleanupStatus = "complete"
+	v.CleanupError = ""
+	s.exports[id] = v
+	return true, nil
+}
+
+func runtimeDiagnosticCleanupEligible(v store.DiagnosticExport) bool {
+	if !v.DeletedAt.IsZero() {
+		return false
+	}
+	switch v.Status {
+	case "ready", "expired", "failed", "cancelled":
+		return true
+	default:
+		return false
+	}
+}
+
 type runtimeDiagnosticRemote struct {
-	calls         int
-	command       string
-	commands      []string
-	stdout        string
-	stderr        string
-	err           error
-	run           func(context.Context, string) (adapter.CommandResult, error)
-	streamContent []byte
-	streamPath    string
-	streamCalls   int
-	streamErr     error
+	calls              int
+	command            string
+	commands           []string
+	stdout             string
+	stderr             string
+	err                error
+	run                func(context.Context, string) (adapter.CommandResult, error)
+	streamContent      []byte
+	streamPath         string
+	streamCalls        int
+	streamErr          error
+	beforeStreamReturn func()
 }
 
 func (r *runtimeDiagnosticRemote) Run(ctx context.Context, _ store.Server, command string) (adapter.CommandResult, error) {
@@ -79,6 +147,9 @@ func (r *runtimeDiagnosticRemote) StreamFile(_ context.Context, _ store.Server, 
 		return 0, r.streamErr
 	}
 	n, err := dst.Write(r.streamContent)
+	if r.beforeStreamReturn != nil {
+		r.beforeStreamReturn()
+	}
 	return int64(n), err
 }
 
@@ -362,8 +433,9 @@ func TestExportRuntimeDiagnosticsCancellationCleansOnlyOwnPartial(t *testing.T) 
 	cleanup := commandContaining(remote.commands, "AIFAR_RUNTIME_DIAGNOSTIC_CLEANUP")
 	for _, required := range []string{
 		"EXPORT_ID='" + export.ID + "'",
-		`case "$pid" in`,
-		`''|*[!0-9]*)`,
+		`case "$pid:$recorded_start:$recorded_pgid" in`,
+		`"$current_start" = "$recorded_start"`,
+		`"$KILL_COMMAND" -0 -- "-$recorded_pgid"`,
 		`PARTIAL_ROOT="$DIAGNOSTICS_ROOT/$EXPORT_ID.partial"`,
 		`FINAL_ROOT="$DIAGNOSTICS_ROOT/$EXPORT_ID"`,
 	} {
@@ -398,9 +470,9 @@ func TestRuntimeDiagnosticExportScriptSecurityContract(t *testing.T) {
 		"umask 077",
 		`PARTIAL_ROOT="$DIAGNOSTICS_ROOT/$EXPORT_ID.partial"`,
 		`FINAL_ROOT="$DIAGNOSTICS_ROOT/$EXPORT_ID"`,
-		`printf '%s\n' "$$" > "$PARTIAL_ROOT/.collector.pid"`,
+		`printf '%s\t%s\t%s\n' "$$" "$pid_start" "$pid_pgid" > "$PARTIAL_ROOT/.collector.pid"`,
 		`trap 'touch "$PARTIAL_ROOT/.cancelled" 2>/dev/null || true' INT TERM`,
-		`find "$LOG_ROOT/$service" -xdev -type f`,
+		`find "$service_root" -xdev -type f`,
 		`mkdir -p "$BUNDLE_ROOT/services/$service/file-logs" "$BUNDLE_ROOT/services/$service/container-logs"`,
 		`-print0 > "$CANDIDATE_LIST"`,
 		`xargs -0`,
@@ -412,12 +484,16 @@ func TestRuntimeDiagnosticExportScriptSecurityContract(t *testing.T) {
 		`docker logs --since "$SINCE" --until "$UNTIL" --timestamps "$container"`,
 		"3221225472",
 		"json_escape()",
-		`ulimit -f 2097152`,
+		`FILE_LIMIT_BLOCKS=1048576`,
+		"run_limited()",
 		`tar -czf "$ARCHIVE_PARTIAL"`,
 		`tar -tzf "$ARCHIVE_PARTIAL"`,
-		`sha256sum "$ARCHIVE_PARTIAL"`,
-		`rm -rf -- "$BUNDLE_ROOT"`,
-		`mv "$PARTIAL_ROOT" "$FINAL_ROOT"`,
+		`archive_sha=$(sha256_file "$ARCHIVE_PARTIAL") || exit 28`,
+		`BUNDLE_PARENT="$PARTIAL_ROOT/bundle"`,
+		`WORK_ROOT="$PARTIAL_ROOT/work"`,
+		`cp -P -- "$candidate" "$raw"`,
+		`mv -Tn -- "$PARTIAL_ROOT" "$FINAL_ROOT"`,
+		`[ ! -e "$PARTIAL_ROOT" ] && [ ! -L "$PARTIAL_ROOT" ] || exit 22`,
 		`printf 'AIFAR_DIAG_RESULT\t%s\t%s\t%s\t%s\t%s\t%s\n'`,
 		"stage_generated_redacted_file()",
 		`stage_generated_redacted_file "diagnostics/containers.txt"`,
@@ -434,8 +510,9 @@ func TestRuntimeDiagnosticExportScriptSecurityContract(t *testing.T) {
 		}
 	}
 	for _, forbidden := range []string{
-		"jq ", "python", "node ", `rm -rf -- "$LOG_ROOT`, `.env" "$BUNDLE_ROOT`, "runtimeSpec", "credential",
+		"jq ", "python", "node ", `rm -rf -- "$LOG_ROOT`, `.env" "$BUNDLE_ROOT`, "runtimeSpec",
 		`{{.Labels}}`, `s/([A-Za-z0-9+\/_=-]{80})[A-Za-z0-9+\/_=-]*/\1[REDACTED]/g`,
+		"2097152", "if ! (ulimit",
 	} {
 		if strings.Contains(script, forbidden) {
 			t.Fatalf("export script contains forbidden behavior %q:\n%s", forbidden, script)
@@ -491,8 +568,12 @@ func TestRuntimeDiagnosticExportRedactsStructuredAndMultilineSecrets(t *testing.
 	if err := os.WriteFile(filepath.FromSlash(inputPath), []byte(input), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	cmd := exec.Command(sh, "-c", helper+"\nredact_file \"$AIFAR_REDACT_INPUT\" \"$AIFAR_REDACT_OUTPUT\"")
-	cmd.Env = append(os.Environ(), "AIFAR_REDACT_INPUT="+inputPath, "AIFAR_REDACT_OUTPUT="+outputPath)
+	cmd := exec.Command(sh, "-c", helper+"\nredact_file \"$AIFAR_REDACT_INPUT\" \"$AIFAR_REDACT_OUTPUT\" \"$AIFAR_REDACT_SCRATCH\"")
+	cmd.Env = append(os.Environ(),
+		"AIFAR_REDACT_INPUT="+inputPath,
+		"AIFAR_REDACT_OUTPUT="+outputPath,
+		"AIFAR_REDACT_SCRATCH="+outputPath+".scratch",
+	)
 	if output, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("redact_file failed: %v: %s", err, output)
 	}
@@ -510,18 +591,22 @@ func TestRuntimeDiagnosticExportRedactsStructuredAndMultilineSecrets(t *testing.
 	}
 }
 
-func TestRuntimeDiagnosticExportAndCleanupScriptsCannotBeOverridden(t *testing.T) {
+func TestRuntimeDiagnosticScriptsCannotBeOverridden(t *testing.T) {
 	overrideRoot := t.TempDir()
 	overrideDir := filepath.Join(overrideRoot, AppName)
 	if err := os.MkdirAll(overrideDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	for _, name := range []string{"runtime-diagnostics-export.sh", "runtime-diagnostics-cleanup.sh"} {
+	for _, name := range []string{"runtime-diagnostics-estimate.sh", "runtime-diagnostics-export.sh", "runtime-diagnostics-cleanup.sh"} {
 		if err := os.WriteFile(filepath.Join(overrideDir, name), []byte("printf malicious-override\n"), 0o600); err != nil {
 			t.Fatal(err)
 		}
 	}
 	t.Setenv("AIFAR_INSTALLER_TEMPLATE_DIR", overrideRoot)
+	estimateScript, err := renderRuntimeDiagnosticEstimateScript(runtimeDiagnosticEstimateScriptData{})
+	if err != nil {
+		t.Fatal(err)
+	}
 	exportScript, err := renderRuntimeDiagnosticExportScript(runtimeDiagnosticExportScriptData{})
 	if err != nil {
 		t.Fatal(err)
@@ -530,10 +615,36 @@ func TestRuntimeDiagnosticExportAndCleanupScriptsCannotBeOverridden(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	for name, script := range map[string]string{"export": exportScript, "cleanup": cleanupScript} {
-		if strings.Contains(script, "malicious-override") || !strings.Contains(script, "umask 077") {
+	for name, script := range map[string]string{"estimate": estimateScript, "export": exportScript, "cleanup": cleanupScript} {
+		if strings.Contains(script, "malicious-override") || !strings.Contains(script, "set -eu") {
 			t.Fatalf("%s diagnostic script was not loaded exclusively from go:embed:\n%s", name, script)
 		}
+	}
+}
+
+func TestRuntimeDiagnosticExportRedactionFailsWhenIntermediateCommandFails(t *testing.T) {
+	sh := runtimeDiagnosticTestShell(t)
+	script, err := renderRuntimeDiagnosticExportScript(runtimeDiagnosticExportScriptData{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	helper := shellFunction(t, script, "redact_file")
+	root := t.TempDir()
+	inputNative := filepath.Join(root, "missing-input.log")
+	outputNative := filepath.Join(root, "output.log")
+	inputPath := runtimeDiagnosticShellPath(inputNative)
+	outputPath := runtimeDiagnosticShellPath(outputNative)
+	cmd := exec.Command(sh, "-c", helper+"\nredact_file \"$AIFAR_REDACT_INPUT\" \"$AIFAR_REDACT_OUTPUT\" \"$AIFAR_REDACT_SCRATCH\"")
+	cmd.Env = append(os.Environ(),
+		"AIFAR_REDACT_INPUT="+inputPath,
+		"AIFAR_REDACT_OUTPUT="+outputPath,
+		"AIFAR_REDACT_SCRATCH="+outputPath+".scratch",
+	)
+	if output, err := cmd.CombinedOutput(); err == nil {
+		t.Fatalf("redact_file hid an intermediate command failure: %s", output)
+	}
+	if _, err := os.Stat(outputNative); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("failed redaction left an output eligible for archiving: %v", err)
 	}
 }
 
@@ -571,6 +682,37 @@ func TestDiagnosticStreamUsesControlledRemotePath(t *testing.T) {
 	got, _ := db.GetDiagnosticExport(export.ID)
 	if got.DownloadedAt.IsZero() {
 		t.Fatal("successful stream must record downloadedAt")
+	}
+}
+
+func TestRuntimeDiagnosticStreamDoesNotResurrectDeletedRecord(t *testing.T) {
+	now := time.Now().UTC()
+	db, instance, server, export := runtimeDiagnosticFixture(now)
+	export.Status = "ready"
+	export.ArchiveName = "aifar-diagnostics-instance-1-20260727T080000Z.tar.gz"
+	export.RemoteRelativePath = export.ID + "/" + export.ArchiveName
+	export.ArchiveBytes = int64(len("archive"))
+	export.SHA256 = strings.Repeat("a", 64)
+	export.ReadyAt = now.Add(-time.Minute)
+	export.ExpiresAt = now.Add(time.Hour)
+	db.exports[export.ID] = export
+	remote := &runtimeDiagnosticRemote{streamContent: []byte("archive")}
+	remote.beforeStreamReturn = func() {
+		concurrent := db.exports[export.ID]
+		concurrent.Status = "deleted"
+		concurrent.DeletedAt = now
+		concurrent.CleanupStatus = "complete"
+		db.exports[export.ID] = concurrent
+	}
+	_, err := NewService(db, remote).StreamRuntimeDiagnosticExport(context.Background(), RuntimeDiagnosticStreamRequest{
+		Instance: instance, Server: server, Export: export, Language: "en",
+	}, io.Discard)
+	if err == nil {
+		t.Fatal("expected stale download completion to be rejected")
+	}
+	got, _ := db.GetDiagnosticExport(export.ID)
+	if got.Status != "deleted" || got.DeletedAt.IsZero() || !got.DownloadedAt.IsZero() {
+		t.Fatalf("stale stream completion resurrected or mutated deleted record: %+v", got)
 	}
 }
 
@@ -676,6 +818,100 @@ func TestDiagnosticDeleteDoesNotMarkDeletedWhenCleanupFails(t *testing.T) {
 	}
 }
 
+func TestRuntimeDiagnosticDeleteRejectsConcurrentDeletionBeforeCleanup(t *testing.T) {
+	now := time.Now().UTC()
+	db, instance, server, export := runtimeDiagnosticFixture(now)
+	export.Status = "ready"
+	export.ArchiveName = "aifar-diagnostics-instance-1-20260727T080000Z.tar.gz"
+	export.RemoteRelativePath = export.ID + "/" + export.ArchiveName
+	export.ArchiveBytes = 1024
+	export.SHA256 = strings.Repeat("a", 64)
+	export.ReadyAt = now.Add(-time.Minute)
+	export.ExpiresAt = now.Add(time.Hour)
+	db.exports[export.ID] = export
+	db.beforeMarkCleanupPending = func() {
+		concurrent := db.exports[export.ID]
+		concurrent.Status = "deleted"
+		concurrent.DeletedAt = now
+		concurrent.CleanupStatus = "complete"
+		db.exports[export.ID] = concurrent
+	}
+	remote := &runtimeDiagnosticRemote{}
+	err := NewService(db, remote).DeleteRuntimeDiagnosticExport(context.Background(), RuntimeDiagnosticDeleteRequest{
+		Instance: instance, Server: server, Export: export, Language: "en",
+	}, fakeLogger{})
+	if err == nil {
+		t.Fatal("expected stale cleanup transition to be rejected")
+	}
+	if remote.calls != 0 {
+		t.Fatalf("cleanup ran after a concurrent delete, calls=%d", remote.calls)
+	}
+	got, _ := db.GetDiagnosticExport(export.ID)
+	if got.Status != "deleted" || got.DeletedAt.IsZero() {
+		t.Fatalf("concurrent deleted state was overwritten: %+v", got)
+	}
+}
+
+func TestRuntimeDiagnosticDeleteRetriesFailedAndCancelledCleanup(t *testing.T) {
+	for _, status := range []string{"failed", "cancelled"} {
+		t.Run(status, func(t *testing.T) {
+			now := time.Now().UTC()
+			db, instance, server, export := runtimeDiagnosticFixture(now)
+			export.Status = status
+			export.CleanupStatus = "failed"
+			export.CleanupError = "previous cleanup failed"
+			export.RemoteRelativePath = ""
+			export.ArchiveName = ""
+			export.SHA256 = ""
+			db.exports[export.ID] = export
+			remote := &runtimeDiagnosticRemote{}
+			if err := NewService(db, remote).DeleteRuntimeDiagnosticExport(context.Background(), RuntimeDiagnosticDeleteRequest{
+				Instance: instance, Server: server, Export: export, Language: "en",
+			}, fakeLogger{}); err != nil {
+				t.Fatal(err)
+			}
+			got, _ := db.GetDiagnosticExport(export.ID)
+			if remote.calls != 1 || got.Status != "deleted" || got.CleanupStatus != "complete" {
+				t.Fatalf("cleanup retry did not complete: calls=%d export=%+v", remote.calls, got)
+			}
+		})
+	}
+}
+
+func TestExportRuntimeDiagnosticsDoesNotClaimUnexecutedRemoteSteps(t *testing.T) {
+	now := time.Now().UTC().Add(-time.Minute)
+	db, instance, _, export := runtimeDiagnosticFixture(now)
+	remote := &runtimeDiagnosticRemote{}
+	remote.run = func(_ context.Context, command string) (adapter.CommandResult, error) {
+		switch {
+		case strings.Contains(command, "AIFAR_RUNTIME_DIAGNOSTIC_ESTIMATE"):
+			return adapter.CommandResult{Stdout: runtimeDiagnosticEstimateOutput()}, nil
+		case strings.Contains(command, "AIFAR_RUNTIME_DIAGNOSTIC_EXPORT"):
+			return adapter.CommandResult{}, errors.New("collector failed before container logs")
+		case strings.Contains(command, "AIFAR_RUNTIME_DIAGNOSTIC_CLEANUP"):
+			return adapter.CommandResult{}, nil
+		default:
+			return adapter.CommandResult{}, errors.New("unexpected remote command")
+		}
+	}
+	log := &recordingStepLogger{}
+	err := NewService(db, remote).ExportRuntimeDiagnostics(context.Background(), RuntimeDiagnosticRequest{
+		ExportID: export.ID, Instance: instance, Language: "en", Actor: "owner",
+	}, log, nil)
+	if err == nil {
+		t.Fatal("expected collector failure")
+	}
+	steps, _ := log.snapshot()
+	if !containsString(steps, "estimate-size=success") || !containsString(steps, "collect-file-logs=failed") {
+		t.Fatalf("executed boundary was not recorded: %v", steps)
+	}
+	for _, step := range []string{"collect-container-logs", "collect-diagnostics", "redact-and-manifest", "create-archive"} {
+		if containsString(steps, step+"=success") {
+			t.Fatalf("unexecuted step %q was reported successful: %v", step, steps)
+		}
+	}
+}
+
 func containsString(values []string, want string) bool {
 	for _, value := range values {
 		if value == want {
@@ -722,6 +958,413 @@ func runtimeDiagnosticTestShell(t *testing.T) string {
 	}
 	t.Skip("sh is not available")
 	return ""
+}
+
+func runtimeDiagnosticShellPath(value string) string {
+	value = filepath.ToSlash(value)
+	if runtime.GOOS == "windows" && len(value) >= 3 && value[1] == ':' {
+		return "/" + strings.ToLower(value[:1]) + value[2:]
+	}
+	return value
+}
+
+type runtimeDiagnosticExportShellFixture struct {
+	t             *testing.T
+	sh            string
+	rootNative    string
+	installNative string
+	binNative     string
+	procNative    string
+	installShell  string
+	binShell      string
+	procShell     string
+	exportID      string
+	archiveBase   string
+}
+
+func newRuntimeDiagnosticExportShellFixture(t *testing.T) *runtimeDiagnosticExportShellFixture {
+	t.Helper()
+	workingDir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	root, err := os.MkdirTemp(workingDir, ".runtime-diagnostic-shell-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	install := filepath.Join(root, "install")
+	bin := filepath.Join(root, "bin")
+	procRoot := filepath.Join(root, "proc")
+	if err := os.MkdirAll(filepath.Join(install, "runtime", "logs", "gateway"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(bin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(procRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for name, body := range map[string]string{
+		"docker":    "exit 0",
+		"systemctl": "printf '%s\n' 'agent active'",
+		"uptime":    "printf '%s\n' 'up 1 hour'",
+		"free":      "printf '%s\n' 'memory ok'",
+		"setsid":    "exit 0",
+	} {
+		writeRuntimeDiagnosticShellCommand(t, bin, name, body)
+	}
+	return &runtimeDiagnosticExportShellFixture{
+		t: t, sh: runtimeDiagnosticTestShell(t), rootNative: root, installNative: install, binNative: bin, procNative: procRoot,
+		installShell: runtimeDiagnosticShellPath(install), binShell: runtimeDiagnosticShellPath(bin), procShell: runtimeDiagnosticShellPath(procRoot),
+		exportID: "diag_1234567890abcdef12345678", archiveBase: "aifar-diagnostics-instance-1-20260727T080000Z",
+	}
+}
+
+func (f *runtimeDiagnosticExportShellFixture) render() string {
+	f.t.Helper()
+	script, err := renderRuntimeDiagnosticExportScript(runtimeDiagnosticExportScriptData{
+		InstallRoot:     installerkit.ShellQuote(f.installShell),
+		ExportID:        installerkit.ShellQuote(f.exportID),
+		InstanceID:      installerkit.ShellQuote("instance-1"),
+		Services:        installerkit.ShellQuote("gateway"),
+		Since:           installerkit.ShellQuote("2020-01-01T00:00:00Z"),
+		Until:           installerkit.ShellQuote("2035-01-01T00:00:00Z"),
+		ArchiveBase:     installerkit.ShellQuote(f.archiveBase),
+		RuntimeSummary:  installerkit.ShellQuote(`{"instanceId":"instance-1"}`),
+		Deployments:     installerkit.ShellQuote(`[]`),
+		Pods:            installerkit.ShellQuote(`[]`),
+		ReleaseSummary:  installerkit.ShellQuote(`[]`),
+		Readme:          installerkit.ShellQuote("diagnostic readme"),
+		ProcRoot:        installerkit.ShellQuote(f.procShell),
+		FileLimitBlocks: installerkit.ShellQuote("unlimited"),
+	})
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	return script
+}
+
+func (f *runtimeDiagnosticExportShellFixture) run(extraEnv ...string) ([]byte, error) {
+	f.t.Helper()
+	command := strings.Join([]string{
+		`PATH="$AIFAR_FAKE_BIN:/usr/bin:/bin"; export PATH`,
+		`mkdir -p "$AIFAR_PROC_ROOT/$$"`,
+		`{ printf '%s (sh) S 1 %s' "$$" "$$"; field=6; while [ "$field" -le 21 ]; do printf ' 0'; field=$((field + 1)); done; printf ' 777\n'; } > "$AIFAR_PROC_ROOT/$$/stat"`,
+		strings.ReplaceAll(f.render(), "\r\n", "\n"),
+	}, "\n")
+	cmd := exec.Command(f.sh, "-s")
+	cmd.Stdin = strings.NewReader(command)
+	cmd.Env = append(os.Environ(), append([]string{
+		"AIFAR_FAKE_BIN=" + f.binShell,
+		"AIFAR_PROC_ROOT=" + f.procShell,
+	}, extraEnv...)...)
+	return cmd.CombinedOutput()
+}
+
+func (f *runtimeDiagnosticExportShellFixture) archiveNative() string {
+	return filepath.Join(f.installNative, "runtime", "diagnostics", f.exportID, f.archiveBase+".tar.gz")
+}
+
+func writeRuntimeDiagnosticShellCommand(t *testing.T, dir, name, body string) {
+	t.Helper()
+	content := "#!/bin/sh\nset -eu\n" + body + "\n"
+	if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o755); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func runtimeDiagnosticRealShellCommand(t *testing.T, sh, name string) string {
+	t.Helper()
+	cmd := exec.Command(sh, "-c", "PATH=/usr/bin:/bin; command -v \"$AIFAR_COMMAND\"")
+	cmd.Env = append(os.Environ(), "AIFAR_COMMAND="+name)
+	output, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("locate shell command %s: %v", name, err)
+	}
+	return strings.TrimSpace(string(output))
+}
+
+func runtimeDiagnosticArchiveList(t *testing.T, sh, archiveNative string) string {
+	t.Helper()
+	cmd := exec.Command(sh, "-c", "tar -tzf \"$AIFAR_ARCHIVE\"")
+	cmd.Env = append(os.Environ(), "AIFAR_ARCHIVE="+runtimeDiagnosticShellPath(archiveNative))
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("list diagnostic archive: %v: %s", err, output)
+	}
+	return string(output)
+}
+
+func runtimeDiagnosticArchiveFile(t *testing.T, sh, archiveNative, relative string) string {
+	t.Helper()
+	cmd := exec.Command(sh, "-c", "tar -xOzf \"$AIFAR_ARCHIVE\" \"$AIFAR_ENTRY\"")
+	cmd.Env = append(os.Environ(),
+		"AIFAR_ARCHIVE="+runtimeDiagnosticShellPath(archiveNative),
+		"AIFAR_ENTRY="+relative,
+	)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("read diagnostic archive entry %s: %v: %s", relative, err, output)
+	}
+	return string(output)
+}
+
+func TestRuntimeDiagnosticExportFailsClosedWhenFileLimitCannotBeSet(t *testing.T) {
+	sh := runtimeDiagnosticTestShell(t)
+	script, err := renderRuntimeDiagnosticExportScript(runtimeDiagnosticExportScriptData{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	helper := shellFunction(t, script, "run_limited")
+	root := t.TempDir()
+	markerNative := filepath.Join(root, "command-ran")
+	cmd := exec.Command(sh, "-c", helper+"\nrun_limited invalid sh -c 'touch \"$AIFAR_LIMIT_MARKER\"'")
+	cmd.Env = append(os.Environ(), "AIFAR_LIMIT_MARKER="+runtimeDiagnosticShellPath(markerNative))
+	if output, err := cmd.CombinedOutput(); err == nil {
+		t.Fatalf("invalid ulimit did not fail closed: %s", output)
+	}
+	if _, err := os.Stat(markerNative); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("command ran after ulimit failure: %v", err)
+	}
+}
+
+func TestRuntimeDiagnosticExportRejectsSymlinkDiagnosticsRoot(t *testing.T) {
+	fixture := newRuntimeDiagnosticExportShellFixture(t)
+	outside := filepath.Join(fixture.rootNative, "outside")
+	if err := os.MkdirAll(outside, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	diagnostics := filepath.Join(fixture.installNative, "runtime", "diagnostics")
+	if err := os.Symlink(outside, diagnostics); err != nil {
+		t.Skipf("symlink creation is unavailable: %v", err)
+	}
+	if output, err := fixture.run(); err == nil {
+		t.Fatalf("symlink diagnostics root was accepted: %s", output)
+	}
+	if _, err := os.Stat(filepath.Join(outside, fixture.exportID+".partial")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("export wrote through diagnostics symlink: %v", err)
+	}
+}
+
+func TestRuntimeDiagnosticExportRejectsFinalDirectoryCreatedDuringPromotion(t *testing.T) {
+	fixture := newRuntimeDiagnosticExportShellFixture(t)
+	realMV := runtimeDiagnosticRealShellCommand(t, fixture.sh, "mv")
+	writeRuntimeDiagnosticShellCommand(t, fixture.binNative, "mv", strings.Join([]string{
+		`last=""`,
+		`for value do last=$value; done`,
+		`if [ "$last" = "$AIFAR_FINAL_ROOT" ]; then mkdir -p "$AIFAR_FINAL_ROOT"; fi`,
+		`exec "$AIFAR_REAL_MV" "$@"`,
+	}, "\n"))
+	finalRoot := runtimeDiagnosticShellPath(filepath.Join(fixture.installNative, "runtime", "diagnostics", fixture.exportID))
+	if output, err := fixture.run("AIFAR_REAL_MV="+realMV, "AIFAR_FINAL_ROOT="+finalRoot); err == nil {
+		t.Fatalf("promotion nested into a concurrently-created final directory: %s", output)
+	}
+}
+
+func TestRuntimeDiagnosticExportRejectsSourceSwappedToSymlinkBeforeRead(t *testing.T) {
+	fixture := newRuntimeDiagnosticExportShellFixture(t)
+	logPath := filepath.Join(fixture.installNative, "runtime", "logs", "gateway", "swap.log")
+	secretPath := filepath.Join(fixture.rootNative, "outside-secret")
+	if err := os.WriteFile(logPath, []byte("safe log"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(secretPath, []byte("TOP_SECRET_PAYLOAD"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	realReadlink := runtimeDiagnosticRealShellCommand(t, fixture.sh, "readlink")
+	realCP := runtimeDiagnosticRealShellCommand(t, fixture.sh, "cp")
+	writeRuntimeDiagnosticShellCommand(t, fixture.binNative, "readlink", strings.Join([]string{
+		`last=""`,
+		`for value do last=$value; done`,
+		`result=$("$AIFAR_REAL_READLINK" "$@")`,
+		`case "$last" in`,
+		`  *swap.log)`,
+		`    count=0`,
+		`    [ ! -f "$AIFAR_READLINK_COUNT" ] || count=$(cat "$AIFAR_READLINK_COUNT")`,
+		`    count=$((count + 1))`,
+		`    printf '%s\n' "$count" > "$AIFAR_READLINK_COUNT"`,
+		`    if [ "$count" -eq 3 ]; then rm -f -- "$last"; ln -s "$AIFAR_SECRET_PATH" "$last"; fi`,
+		`    ;;`,
+		`esac`,
+		`printf '%s\n' "$result"`,
+	}, "\n"))
+	writeRuntimeDiagnosticShellCommand(t, fixture.binNative, "cp", strings.Join([]string{
+		`case "$3" in *swap.log) exit 75 ;; esac`,
+		`exec "$AIFAR_REAL_CP" "$@"`,
+	}, "\n"))
+	output, err := fixture.run(
+		"AIFAR_REAL_READLINK="+realReadlink,
+		"AIFAR_REAL_CP="+realCP,
+		"AIFAR_READLINK_COUNT="+runtimeDiagnosticShellPath(filepath.Join(fixture.rootNative, "readlink-count")),
+		"AIFAR_SECRET_PATH="+runtimeDiagnosticShellPath(secretPath),
+	)
+	if err != nil {
+		t.Fatalf("source-swap export should skip the changed source, not fail globally: %v: %s", err, output)
+	}
+	listing := runtimeDiagnosticArchiveList(t, fixture.sh, fixture.archiveNative())
+	if strings.Contains(listing, "swap.log") {
+		content := runtimeDiagnosticArchiveFile(t, fixture.sh, fixture.archiveNative(), fixture.archiveBase+"/services/gateway/file-logs/swap.log")
+		t.Fatalf("source swapped to symlink entered archive with %q", content)
+	}
+}
+
+func TestRuntimeDiagnosticExportFailsWhenSHA256CommandFails(t *testing.T) {
+	fixture := newRuntimeDiagnosticExportShellFixture(t)
+	writeRuntimeDiagnosticShellCommand(t, fixture.binNative, "sha256sum", "printf '%064d  %s\n' 0 \"$1\"\nexit 74")
+	if output, err := fixture.run(); err == nil {
+		t.Fatalf("sha256sum failure was hidden by a pipeline: %s", output)
+	}
+	if _, err := os.Stat(fixture.archiveNative()); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("archive was promoted after sha256sum failure: %v", err)
+	}
+}
+
+func TestRuntimeDiagnosticExportExcludesSensitiveNamesAndIntermediateFiles(t *testing.T) {
+	fixture := newRuntimeDiagnosticExportShellFixture(t)
+	logRoot := filepath.Join(fixture.installNative, "runtime", "logs", "gateway")
+	for name, content := range map[string]string{
+		"safe.log": "safe content", "dump.rdb": "redis secret", "table.IBD": "mysql secret", "access.PPK": "ssh secret",
+		filepath.Join("config", "credentials"): "credential secret",
+	} {
+		fullPath := filepath.Join(logRoot, name)
+		if err := os.MkdirAll(filepath.Dir(fullPath), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(fullPath, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	output, err := fixture.run()
+	if err != nil {
+		t.Fatalf("diagnostic export failed: %v: %s", err, output)
+	}
+	listing := runtimeDiagnosticArchiveList(t, fixture.sh, fixture.archiveNative())
+	for _, forbidden := range []string{"dump.rdb", "table.IBD", "access.PPK", "config/credentials", ".partial", ".raw", ".work"} {
+		if strings.Contains(listing, forbidden) {
+			t.Fatalf("archive contains forbidden entry %q:\n%s", forbidden, listing)
+		}
+	}
+	errorsText := runtimeDiagnosticArchiveFile(t, fixture.sh, fixture.archiveNative(), fixture.archiveBase+"/collection-errors.txt")
+	for _, sensitiveName := range []string{"dump.rdb", "table.IBD", "access.PPK", "config/credentials"} {
+		if strings.Contains(errorsText, sensitiveName) {
+			t.Fatalf("collection errors leaked rejected path %q: %s", sensitiveName, errorsText)
+		}
+	}
+}
+
+type runtimeDiagnosticCleanupShellFixture struct {
+	t             *testing.T
+	sh            string
+	installNative string
+	partialNative string
+	procNative    string
+	killNative    string
+	killLogNative string
+	exportID      string
+	groupAlive    bool
+}
+
+func newRuntimeDiagnosticCleanupShellFixture(t *testing.T, pidRecord string) *runtimeDiagnosticCleanupShellFixture {
+	t.Helper()
+	workingDir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	root, err := os.MkdirTemp(workingDir, ".runtime-diagnostic-cleanup-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	install := filepath.Join(root, "install")
+	exportID := "diag_1234567890abcdef12345678"
+	partial := filepath.Join(install, "runtime", "diagnostics", exportID+".partial")
+	procRoot := filepath.Join(root, "proc")
+	if err := os.MkdirAll(partial, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(procRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(partial, ".collector.pid"), []byte(pidRecord), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	killPath := filepath.Join(root, "kill")
+	killLog := filepath.Join(root, "kill.log")
+	writeRuntimeDiagnosticShellCommand(t, root, "kill", strings.Join([]string{
+		`printf '%s\n' "$*" >> "$AIFAR_KILL_LOG"`,
+		`if [ "$1" = "-0" ] && [ "$AIFAR_GROUP_ALIVE" = "1" ]; then exit 0; fi`,
+		`exit 1`,
+	}, "\n"))
+	return &runtimeDiagnosticCleanupShellFixture{
+		t: t, sh: runtimeDiagnosticTestShell(t), installNative: install, partialNative: partial,
+		procNative: procRoot, killNative: killPath, killLogNative: killLog, exportID: exportID,
+	}
+}
+
+func (f *runtimeDiagnosticCleanupShellFixture) writeProcStat(pid, starttime, pgid string) {
+	f.t.Helper()
+	dir := filepath.Join(f.procNative, pid)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		f.t.Fatal(err)
+	}
+	fields := []string{pid, "(sh)", "S", "1", pgid}
+	for len(fields) < 22 {
+		fields = append(fields, "0")
+	}
+	fields[21] = starttime
+	if err := os.WriteFile(filepath.Join(dir, "stat"), []byte(strings.Join(fields, " ")+"\n"), 0o600); err != nil {
+		f.t.Fatal(err)
+	}
+}
+
+func (f *runtimeDiagnosticCleanupShellFixture) run() ([]byte, error) {
+	f.t.Helper()
+	script, err := renderRuntimeDiagnosticCleanupScript(runtimeDiagnosticCleanupScriptData{
+		InstallRoot: installerkit.ShellQuote(runtimeDiagnosticShellPath(f.installNative)),
+		ExportID:    installerkit.ShellQuote(f.exportID),
+		ProcRoot:    installerkit.ShellQuote(runtimeDiagnosticShellPath(f.procNative)),
+		KillCommand: installerkit.ShellQuote(runtimeDiagnosticShellPath(f.killNative)),
+	})
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	cmd := exec.Command(f.sh, "-s")
+	cmd.Stdin = strings.NewReader(strings.ReplaceAll(script, "\r\n", "\n"))
+	alive := "0"
+	if f.groupAlive {
+		alive = "1"
+	}
+	cmd.Env = append(os.Environ(),
+		"AIFAR_KILL_LOG="+runtimeDiagnosticShellPath(f.killLogNative),
+		"AIFAR_GROUP_ALIVE="+alive,
+	)
+	return cmd.CombinedOutput()
+}
+
+func TestRuntimeDiagnosticCleanupRejectsPIDReuse(t *testing.T) {
+	fixture := newRuntimeDiagnosticCleanupShellFixture(t, "123\t111\t123\n")
+	fixture.writeProcStat("123", "222", "123")
+	if output, err := fixture.run(); err == nil {
+		t.Fatalf("cleanup accepted reused PID: %s", output)
+	}
+	if _, err := os.Stat(fixture.partialNative); err != nil {
+		t.Fatalf("cleanup removed partial directory for reused PID: %v", err)
+	}
+	if calls, _ := os.ReadFile(fixture.killLogNative); len(calls) != 0 {
+		t.Fatalf("cleanup signalled reused process: %s", calls)
+	}
+}
+
+func TestRuntimeDiagnosticCleanupKeepsPartialWhenLeaderExitedButGroupLives(t *testing.T) {
+	fixture := newRuntimeDiagnosticCleanupShellFixture(t, "123\t111\t123\n")
+	fixture.groupAlive = true
+	if output, err := fixture.run(); err == nil {
+		t.Fatalf("cleanup reported complete while process group lived: %s", output)
+	}
+	if _, err := os.Stat(fixture.partialNative); err != nil {
+		t.Fatalf("cleanup removed partial directory while child group lived: %v", err)
+	}
 }
 
 func TestEstimateRuntimeDiagnosticsRejectsDisabledAndUnknownServices(t *testing.T) {

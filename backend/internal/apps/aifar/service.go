@@ -81,6 +81,10 @@ type taskLookupStore interface {
 type runtimeDiagnosticsStore interface {
 	SaveDiagnosticExport(store.DiagnosticExport) (store.DiagnosticExport, error)
 	GetDiagnosticExport(id string) (store.DiagnosticExport, error)
+	MarkDiagnosticExportDownloaded(id string, downloadedAt time.Time) (bool, error)
+	MarkDiagnosticExportCleanupPending(id string, attemptedAt time.Time) (bool, error)
+	MarkDiagnosticExportCleanupFailed(id, cleanupError string) (bool, error)
+	MarkDiagnosticExportDeleted(id string, deletedAt time.Time) (bool, error)
 	ListAIFARDeployments(instanceID string) ([]store.AIFARDeployment, error)
 	ListAIFARPods(instanceID string) ([]store.AIFARPod, error)
 	ListAppReleases(instanceID string) ([]store.AppRelease, error)

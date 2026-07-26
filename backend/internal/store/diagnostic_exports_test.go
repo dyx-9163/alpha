@@ -155,3 +155,81 @@ func TestDiagnosticExportEmptyServicesRoundTripAsJSONArray(t *testing.T) {
 		})
 	}
 }
+
+func TestDiagnosticExportConditionalLifecycleUpdatesDoNotReviveTerminalRows(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "aifar.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	now := time.Date(2026, 7, 27, 8, 0, 0, 0, time.UTC)
+	export, err := db.SaveDiagnosticExport(DiagnosticExport{
+		ID: "diag-cas", InstanceID: "i1", ServerID: "s1", Status: "ready",
+		SinceAt: now.Add(-time.Hour), UntilAt: now, ExpiresAt: now.Add(time.Hour),
+		CleanupStatus: "none",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	updated, err := db.MarkDiagnosticExportDownloaded(export.ID, now.Add(time.Minute))
+	if err != nil || !updated {
+		t.Fatalf("ready download timestamp was not recorded: updated=%v err=%v", updated, err)
+	}
+	export, err = db.GetDiagnosticExport(export.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	export.Status = "deleted"
+	export.DeletedAt = now.Add(2 * time.Minute)
+	export.CleanupStatus = "complete"
+	if _, err := db.SaveDiagnosticExport(export); err != nil {
+		t.Fatal(err)
+	}
+	updated, err = db.MarkDiagnosticExportDownloaded(export.ID, now.Add(3*time.Minute))
+	if err != nil || updated {
+		t.Fatalf("deleted row accepted stale download update: updated=%v err=%v", updated, err)
+	}
+	got, err := db.GetDiagnosticExport(export.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != "deleted" || got.DeletedAt.IsZero() || !got.DownloadedAt.Equal(now.Add(time.Minute)) {
+		t.Fatalf("conditional download revived terminal row: %+v", got)
+	}
+}
+
+func TestDiagnosticExportConditionalCleanupTransitionsSupportRetry(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "aifar.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	now := time.Date(2026, 7, 27, 8, 0, 0, 0, time.UTC)
+	_, err = db.SaveDiagnosticExport(DiagnosticExport{
+		ID: "diag-cleanup-retry", InstanceID: "i1", ServerID: "s1", Status: "failed",
+		SinceAt: now.Add(-time.Hour), UntilAt: now, ExpiresAt: now.Add(time.Hour),
+		CleanupStatus: "failed", CleanupError: "first attempt failed",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated, err := db.MarkDiagnosticExportCleanupPending("diag-cleanup-retry", now); err != nil || !updated {
+		t.Fatalf("failed cleanup did not enter retry pending: updated=%v err=%v", updated, err)
+	}
+	if updated, err := db.MarkDiagnosticExportCleanupFailed("diag-cleanup-retry", "second attempt failed"); err != nil || !updated {
+		t.Fatalf("pending cleanup did not record retry failure: updated=%v err=%v", updated, err)
+	}
+	if updated, err := db.MarkDiagnosticExportCleanupPending("diag-cleanup-retry", now.Add(time.Minute)); err != nil || !updated {
+		t.Fatalf("cleanup failure was not retryable: updated=%v err=%v", updated, err)
+	}
+	if updated, err := db.MarkDiagnosticExportDeleted("diag-cleanup-retry", now.Add(2*time.Minute)); err != nil || !updated {
+		t.Fatalf("successful retry did not atomically delete: updated=%v err=%v", updated, err)
+	}
+	got, err := db.GetDiagnosticExport("diag-cleanup-retry")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != "deleted" || got.CleanupStatus != "complete" || got.DeletedAt.IsZero() {
+		t.Fatalf("unexpected cleanup retry result: %+v", got)
+	}
+}
