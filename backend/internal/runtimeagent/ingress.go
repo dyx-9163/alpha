@@ -847,6 +847,21 @@ func (m *Manager) runContainer(ctx context.Context, spec RuntimeSpec, deployment
 }
 
 func (m *Manager) runContainerNamed(ctx context.Context, spec RuntimeSpec, deployment DeploymentSpec, replica int, name, logicalName string) error {
+	if err := m.runContainerDetachedNamed(ctx, spec, deployment, replica, name, logicalName); err != nil {
+		return err
+	}
+	if err := m.waitContainerReady(ctx, name); err != nil {
+		return err
+	}
+	logf(m.log, "AIFAR runtime pod started service=%s replica=%d container=%s\n", deployment.ServiceName, replica, name)
+	return nil
+}
+
+func (m *Manager) runContainerDetached(ctx context.Context, spec RuntimeSpec, deployment DeploymentSpec, replica int, name string) error {
+	return m.runContainerDetachedNamed(ctx, spec, deployment, replica, name, name)
+}
+
+func (m *Manager) runContainerDetachedNamed(ctx context.Context, spec RuntimeSpec, deployment DeploymentSpec, replica int, name, logicalName string) error {
 	args := []string{"run", "-d", "--name", name, "--restart", "unless-stopped"}
 	deploymentName := strings.TrimSpace(deployment.DeploymentName)
 	if deploymentName == "" {
@@ -926,10 +941,7 @@ func (m *Manager) runContainerNamed(ctx context.Context, spec RuntimeSpec, deplo
 	if _, err := m.runner.Run(ctx, "docker", args...); err != nil {
 		return fmt.Errorf("start AIFAR pod %s: %w", name, err)
 	}
-	if err := m.waitContainerReady(ctx, name); err != nil {
-		return err
-	}
-	logf(m.log, "AIFAR runtime pod started service=%s replica=%d container=%s\n", deployment.ServiceName, replica, name)
+	logf(m.log, "AIFAR runtime pod start submitted service=%s replica=%d container=%s\n", deployment.ServiceName, replica, name)
 	return nil
 }
 

@@ -401,6 +401,43 @@ func TestManagerRunContainerAddsLoggingLabels(t *testing.T) {
 	}
 }
 
+func TestManagerRunContainerDetachedDoesNotWaitForHealth(t *testing.T) {
+	runner := &loggingLabelRunner{}
+	manager := NewManager(ManagerOptions{StateDir: t.TempDir(), Runner: runner})
+	spec := NormalizeSpec(RuntimeSpec{
+		InstanceID:  "admin",
+		InstallRoot: "/aifar/apps/admin",
+		Network:     "aifar-network",
+	})
+	deployment := DeploymentSpec{
+		ServiceName:    "oauth",
+		DeploymentName: "alpha-oauth",
+		Image:          "aifar-oauth:rev-1",
+		PodRevision:    "rev-1",
+		Ports:          []ContainerPort{{Name: "http", ContainerPort: 38001}},
+	}
+	name := "aifar-pod-admin-oauth-rev-1-r1"
+
+	if err := manager.runContainerDetached(context.Background(), spec, deployment, 1, name); err != nil {
+		t.Fatal(err)
+	}
+	calls := runner.callsString()
+	if strings.Contains(calls, ".State.Health") {
+		t.Fatalf("detached start must not wait for readiness:\n%s", calls)
+	}
+	for _, want := range []string{
+		"docker run -d",
+		"--label aifar.pod=" + name,
+		"--label aifar.replica=1",
+		"--network aifar-network",
+		"aifar-oauth:rev-1",
+	} {
+		if !strings.Contains(calls, want) {
+			t.Fatalf("detached start must preserve docker argument %q:\n%s", want, calls)
+		}
+	}
+}
+
 type loggingLabelRunner struct {
 	mu    sync.Mutex
 	calls []string
