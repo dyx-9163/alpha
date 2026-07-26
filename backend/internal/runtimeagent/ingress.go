@@ -218,6 +218,58 @@ func (m *Manager) Apply(ctx context.Context, spec RuntimeSpec) error {
 	}
 }
 
+func (m *Manager) RestartAll(ctx context.Context, spec RuntimeSpec) error {
+	m.reconcileMu.Lock()
+	defer m.reconcileMu.Unlock()
+	spec = NormalizeSpec(spec)
+	if err := validateRuntimeSpec(spec); err != nil {
+		return err
+	}
+	for _, deployment := range spec.Deployments {
+		if deployment.Replicas <= 0 {
+			continue
+		}
+		deployment.Strategy = NormalizeDeploymentStrategy(deployment.Strategy)
+		deploymentCtx := ctx
+		cancel := func() {}
+		if deployment.Strategy.ProgressDeadlineSeconds > 0 {
+			deploymentCtx, cancel = context.WithTimeout(ctx, time.Duration(deployment.Strategy.ProgressDeadlineSeconds)*time.Second)
+		}
+		m.setDeploymentStatusFromDocker(deploymentCtx, spec, deployment, "rolling", "")
+		for replica := 1; replica <= deployment.Replicas; replica++ {
+			name := containerNameForDeployment(spec, deployment, replica)
+			exists, err := m.containerExists(deploymentCtx, name)
+			if err != nil {
+				cancel()
+				m.setDeploymentStatusFromDocker(context.WithoutCancel(ctx), spec, deployment, "failed", err.Error())
+				return fmt.Errorf("restart AIFAR deployment %s replica %d: %w", deployment.ServiceName, replica, err)
+			}
+			if !exists {
+				cancel()
+				err := fmt.Errorf("AIFAR pod %s does not exist", name)
+				m.setDeploymentStatusFromDocker(context.WithoutCancel(ctx), spec, deployment, "failed", err.Error())
+				return fmt.Errorf("restart AIFAR deployment %s replica %d: %w", deployment.ServiceName, replica, err)
+			}
+			if err := m.replaceContainer(deploymentCtx, spec, deployment, replica, name); err != nil {
+				cancel()
+				m.setDeploymentStatusFromDocker(context.WithoutCancel(ctx), spec, deployment, "failed", err.Error())
+				return fmt.Errorf("restart AIFAR deployment %s replica %d: %w", deployment.ServiceName, replica, err)
+			}
+			if err := m.refreshServiceEndpoint(deploymentCtx, spec, deployment.ServiceName); err != nil {
+				cancel()
+				m.setDeploymentStatusFromDocker(context.WithoutCancel(ctx), spec, deployment, "failed", err.Error())
+				return fmt.Errorf("refresh AIFAR deployment %s endpoints: %w", deployment.ServiceName, err)
+			}
+		}
+		cancel()
+		m.setDeploymentStatusFromDocker(ctx, spec, deployment, "ready", "")
+	}
+	if err := m.refreshInstanceEndpoints(ctx, spec); err != nil {
+		return err
+	}
+	return nil
+}
+
 func (m *Manager) Remove(ctx context.Context, instanceID string) error {
 	m.reconcileMu.Lock()
 	defer m.reconcileMu.Unlock()
@@ -570,7 +622,7 @@ func (m *Manager) ensureDeployment(ctx context.Context, spec RuntimeSpec, deploy
 				return err
 			}
 			if recreate {
-				if err := m.replaceDriftedContainer(ctx, spec, deployment, replica, name); err != nil {
+				if err := m.replaceContainer(ctx, spec, deployment, replica, name); err != nil {
 					m.setDeploymentStatusFromDocker(ctx, spec, deployment, "failed", err.Error())
 					return err
 				}
@@ -615,23 +667,35 @@ func (m *Manager) ensureDeployment(ctx context.Context, spec RuntimeSpec, deploy
 	return nil
 }
 
-func (m *Manager) replaceDriftedContainer(ctx context.Context, spec RuntimeSpec, deployment DeploymentSpec, replica int, name string) error {
+func (m *Manager) replaceContainer(ctx context.Context, spec RuntimeSpec, deployment DeploymentSpec, replica int, name string) error {
 	suffix := shortNameHash(fmt.Sprintf("%s-%d", deploymentSpecHash(deployment), time.Now().UnixNano()))
 	replacement := sanitizeDockerName(name + "-next-" + suffix)
 	backup := sanitizeDockerName(name + "-old-" + suffix)
+	promoted := false
+	defer func() {
+		if promoted {
+			return
+		}
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		defer cancel()
+		_, _ = m.runner.Run(cleanupCtx, "docker", "rm", "-f", replacement)
+	}()
 	if err := m.runContainer(ctx, spec, deployment, replica, replacement); err != nil {
 		return err
 	}
 	if _, err := m.runner.Run(ctx, "docker", "rename", name, backup); err != nil {
-		_, _ = m.runner.Run(context.WithoutCancel(ctx), "docker", "rm", "-f", replacement)
 		return fmt.Errorf("backup drifted AIFAR pod %s: %w", name, err)
 	}
 	if _, err := m.runner.Run(ctx, "docker", "rename", replacement, name); err != nil {
-		_, _ = m.runner.Run(context.WithoutCancel(ctx), "docker", "rename", backup, name)
-		_, _ = m.runner.Run(context.WithoutCancel(ctx), "docker", "rm", "-f", replacement)
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		defer cancel()
+		_, _ = m.runner.Run(cleanupCtx, "docker", "rename", backup, name)
 		return fmt.Errorf("promote replacement AIFAR pod %s: %w", name, err)
 	}
-	if _, err := m.runner.Run(ctx, "docker", "rm", "-f", backup); err != nil {
+	promoted = true
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	defer cancel()
+	if _, err := m.runner.Run(cleanupCtx, "docker", "rm", "-f", backup); err != nil {
 		return fmt.Errorf("remove replaced AIFAR pod %s: %w", backup, err)
 	}
 	logf(m.log, "AIFAR runtime pod replaced service=%s replica=%d container=%s\n", deployment.ServiceName, replica, name)
