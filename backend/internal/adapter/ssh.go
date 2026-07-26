@@ -330,14 +330,14 @@ func streamSSHOutputWithContext(ctx context.Context, dst io.Writer, stdout io.Re
 	go func() {
 		waitErrCh <- wait()
 	}()
-	stopWatchingContext := make(chan struct{})
+	operationDone := make(chan struct{})
 	contextWatcherDone := make(chan struct{})
 	go func() {
 		defer close(contextWatcherDone)
 		select {
 		case <-ctx.Done():
 			cancel()
-		case <-stopWatchingContext:
+		case <-operationDone:
 		}
 	}()
 
@@ -346,9 +346,12 @@ func streamSSHOutputWithContext(ctx context.Context, dst io.Writer, stdout io.Re
 	if writer.err != nil {
 		cancel()
 	}
-	close(stopWatchingContext)
-	<-contextWatcherDone
 	waitErr := <-waitErrCh
+	if ctx.Err() != nil {
+		cancel()
+	}
+	close(operationDone)
+	<-contextWatcherDone
 
 	if writer.err != nil {
 		return copied, streamSSHError(writer.err, stderr())

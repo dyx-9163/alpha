@@ -26,6 +26,15 @@ func (w blockingWriter) Write(value []byte) (int, error) {
 	return len(value), nil
 }
 
+type cancelingWriter struct {
+	cancel func()
+}
+
+func (w cancelingWriter) Write(value []byte) (int, error) {
+	w.cancel()
+	return len(value), nil
+}
+
 func TestStreamSSHOutputCopiesBinaryBytes(t *testing.T) {
 	payload := []byte{0x00, 0x01, 0xff, '\n', 'A'}
 	var dst bytes.Buffer
@@ -129,6 +138,43 @@ func TestStreamSSHOutputWaitsForBlockingWriterAfterContextCancellation(t *testin
 		}
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for stream to finish after writer unblocked")
+	}
+}
+
+func TestStreamSSHOutputCancelsWhenCopyCompletesWithPendingContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cancelled := make(chan struct{})
+	resultCh := make(chan struct {
+		copied int64
+		err    error
+	}, 1)
+
+	go func() {
+		copied, err := streamSSHOutputWithContext(ctx, cancelingWriter{cancel: cancel}, bytes.NewReader([]byte("data")),
+			func() error {
+				<-cancelled
+				return errors.New("session closed")
+			},
+			func() { close(cancelled) },
+			func() string { return "" },
+		)
+		resultCh <- struct {
+			copied int64
+			err    error
+		}{copied: copied, err: err}
+	}()
+
+	select {
+	case result := <-resultCh:
+		if !errors.Is(result.err, context.Canceled) {
+			t.Fatalf("expected context canceled error, got %v", result.err)
+		}
+		if result.copied != 4 {
+			t.Fatalf("copied = %d, want 4", result.copied)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for pending context cancellation to close the session")
 	}
 }
 
