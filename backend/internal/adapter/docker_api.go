@@ -18,6 +18,29 @@ import (
 var dockerHTTPClient = &http.Client{Timeout: 20 * time.Second}
 var dockerHTTPStreamClient = &http.Client{}
 
+type dockerAPIContainerStatsPayload struct {
+	ID          string                       `json:"id"`
+	Name        string                       `json:"name"`
+	CPUStats    dockerAPIStatsCPU            `json:"cpu_stats"`
+	PreCPUStats dockerAPIStatsCPU            `json:"precpu_stats"`
+	MemoryStats dockerAPIStatsMemoryCounters `json:"memory_stats"`
+}
+
+type dockerAPIStatsCPU struct {
+	CPUUsage struct {
+		TotalUsage  uint64   `json:"total_usage"`
+		PercpuUsage []uint64 `json:"percpu_usage"`
+	} `json:"cpu_usage"`
+	SystemCPUUsage uint64 `json:"system_cpu_usage"`
+	OnlineCPUs     uint64 `json:"online_cpus"`
+}
+
+type dockerAPIStatsMemoryCounters struct {
+	Usage uint64            `json:"usage"`
+	Limit uint64            `json:"limit"`
+	Stats map[string]uint64 `json:"stats"`
+}
+
 func dockerAPIHost(host string) bool {
 	_, ok := dockerAPIBase(host)
 	return ok
@@ -180,6 +203,63 @@ func dockerAPIContainers(ctx context.Context, host string) ([]DockerContainer, e
 		})
 	}
 	return out, nil
+}
+
+func dockerAPIContainerStats(ctx context.Context, host, id string) (DockerContainerStat, error) {
+	var payload dockerAPIContainerStatsPayload
+	query := url.Values{"stream": []string{"false"}}
+	path := "/containers/" + url.PathEscape(id) + "/stats"
+	if err := dockerAPIJSON(ctx, http.MethodGet, host, path, query, &payload); err != nil {
+		return DockerContainerStat{}, err
+	}
+	cpu := dockerAPIStatsCPUPercent(payload)
+	usage, limit, memory := dockerAPIStatsMemory(payload)
+	name := strings.TrimPrefix(strings.TrimSpace(payload.Name), "/")
+	if name == "" {
+		name = id
+	}
+	return DockerContainerStat{
+		ID:            firstNonEmptyString(payload.ID, id),
+		Name:          name,
+		CPUPerc:       cpu,
+		MemPerc:       memory,
+		MemUsage:      formatBytes(int64(usage)) + " / " + formatBytes(int64(limit)),
+		RawCPUPerc:    fmt.Sprintf("%.2f%%", cpu),
+		RawMemPercent: fmt.Sprintf("%.2f%%", memory),
+	}, nil
+}
+
+func dockerAPIStatsCPUPercent(payload dockerAPIContainerStatsPayload) float64 {
+	current, previous := payload.CPUStats, payload.PreCPUStats
+	if current.CPUUsage.TotalUsage <= previous.CPUUsage.TotalUsage || current.SystemCPUUsage <= previous.SystemCPUUsage {
+		return 0
+	}
+	cpuCount := current.OnlineCPUs
+	if cpuCount == 0 {
+		cpuCount = uint64(len(current.CPUUsage.PercpuUsage))
+	}
+	if cpuCount == 0 {
+		return 0
+	}
+	return float64(current.CPUUsage.TotalUsage-previous.CPUUsage.TotalUsage) /
+		float64(current.SystemCPUUsage-previous.SystemCPUUsage) * float64(cpuCount) * 100
+}
+
+func dockerAPIStatsMemory(payload dockerAPIContainerStatsPayload) (uint64, uint64, float64) {
+	usage, limit := payload.MemoryStats.Usage, payload.MemoryStats.Limit
+	cache, ok := payload.MemoryStats.Stats["total_inactive_file"]
+	if !ok {
+		cache = payload.MemoryStats.Stats["inactive_file"]
+	}
+	if cache >= usage {
+		usage = 0
+	} else {
+		usage -= cache
+	}
+	if limit == 0 {
+		return usage, limit, 0
+	}
+	return usage, limit, float64(usage) / float64(limit) * 100
 }
 
 func cloneStringMap(in map[string]string) map[string]string {
