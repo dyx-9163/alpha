@@ -144,6 +144,30 @@ func (s *Store) ListAppReleases(instanceID string) ([]AppRelease, error) {
 	return out, rows.Err()
 }
 
+func (s *Store) DeleteAppRelease(instanceID, releaseID string) error {
+	instanceID = strings.TrimSpace(instanceID)
+	releaseID = strings.TrimSpace(releaseID)
+	if instanceID == "" || releaseID == "" {
+		return sql.ErrNoRows
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := deleteAppReleaseAuxiliaryRecordsTx(tx, instanceID, releaseID); err != nil {
+		return err
+	}
+	result, err := tx.Exec(`delete from app_releases where instance_id=? and release_id=?`, instanceID, releaseID)
+	if err != nil {
+		return err
+	}
+	if rows, _ := result.RowsAffected(); rows == 0 {
+		return sql.ErrNoRows
+	}
+	return tx.Commit()
+}
+
 func (s *Store) ReconcilePendingAppReleases() (int, error) {
 	tx, err := s.db.Begin()
 	if err != nil {

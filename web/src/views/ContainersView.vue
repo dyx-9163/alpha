@@ -173,6 +173,7 @@ import {
   applyRuntimeConfig,
   cleanupStaleRuntime,
   createRuntimeLogEventSource,
+  deleteAifarRelease as deleteAifarReleaseRequest,
   fetchAifarReleases,
   fetchAifarRuntime,
   installRuntimeServices,
@@ -275,6 +276,7 @@ const runtimeCache = ref<Record<string, AifarRuntimeResponse>>({})
 const aifarReleases = ref<AifarRelease[]>([])
 const aifarInstallModules = ref<AppInstallModuleOption[]>([])
 const aifarReleaseCache = ref<Record<string, AifarRelease[]>>({})
+const releaseDeletingId = ref('')
 const selectedImageRows = ref<any[]>([])
 const error = ref('')
 const tab = ref<'overview' | 'aifar-runtime' | 'images'>('overview')
@@ -1113,6 +1115,53 @@ function releaseRollbackDisabledReason(row: AifarRelease) {
   return ''
 }
 
+function releaseDeleteDisabledReason(row: AifarRelease) {
+  if (!canManageApps.value) return deniedText.value
+  if (!row.releaseId) return t('containers.releaseIdRequired')
+  if (row.status === 'pending' || row.status === 'running') return t('containers.releaseDeleteActiveUnavailable')
+  return ''
+}
+
+async function deleteAifarRelease(row: AifarRelease) {
+  const reason = releaseDeleteDisabledReason(row)
+  if (reason) {
+    ElMessage.warning(reason)
+    return
+  }
+  const instance = selectedRuntimeInstance.value
+  if (!instance?.id) {
+    ElMessage.warning(t('containers.selectAifarInstance'))
+    return
+  }
+  try {
+    await ElMessageBox.confirm(
+      t('containers.confirmDeleteRelease', { release: row.releaseId }),
+      t('containers.deleteRelease'),
+      {
+        confirmButtonText: t('common.delete'),
+        cancelButtonText: t('common.cancel'),
+        type: 'warning',
+        confirmButtonClass: 'el-button--danger'
+      }
+    )
+  } catch {
+    return
+  }
+  releaseDeletingId.value = row.releaseId
+  try {
+    await deleteAifarReleaseRequest(instance.id, row.releaseId)
+    aifarReleaseCache.value = {}
+    await loadAifarReleases(true)
+    ElMessage.success(t('containers.releaseDeleted'))
+  } catch (err) {
+    ElMessage.error(err instanceof Error ? err.message : t('containers.releaseDeleteFailed'))
+  } finally {
+    if (releaseDeletingId.value === row.releaseId) {
+      releaseDeletingId.value = ''
+    }
+  }
+}
+
 async function rollbackAifarRelease(row: AifarRelease) {
   const reason = releaseRollbackDisabledReason(row)
   if (reason) {
@@ -1691,6 +1740,9 @@ useAifarRuntimeProvider({
   formatDate,
   releaseRollbackDisabledReason,
   rollbackAifarRelease,
+  releaseDeletingId,
+  releaseDeleteDisabledReason,
+  deleteAifarRelease,
   selectedRuntimeServices,
   runtimeEndpointText,
   percentText,

@@ -45,6 +45,49 @@ func TestBootstrapUserAndServerLifecycle(t *testing.T) {
 	}
 }
 
+func TestDeleteAppReleaseRemovesOnlyRequestedReleaseAndAuxiliaryRecords(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "aifar.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	instance, err := db.SaveAppInstance(AppInstance{App: "aifar", Version: "runtime-v2", Status: "installed"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, releaseID := range []string{"release-old", "release-keep"} {
+		if _, err := db.SaveAppRelease(AppRelease{InstanceID: instance.ID, App: "aifar", Version: "runtime-v2", ReleaseID: releaseID, Status: "success"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := db.SaveAppReleaseArtifact(AppReleaseArtifact{InstanceID: instance.ID, ReleaseID: "release-old", App: "aifar", ServiceName: "gateway", ArtifactType: "jar", Name: "gateway.jar"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.SaveAppReleaseSnapshot(AppReleaseSnapshot{InstanceID: instance.ID, ReleaseID: "release-old", App: "aifar", SnapshotKind: "manifest", PayloadJSON: `{}`}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := db.DeleteAppRelease(instance.ID, "release-old"); err != nil {
+		t.Fatal(err)
+	}
+	releases, err := db.ListAppReleases(instance.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(releases) != 1 || releases[0].ReleaseID != "release-keep" {
+		t.Fatalf("expected only release-keep to remain, got %+v", releases)
+	}
+	artifacts, err := db.ListAppReleaseArtifacts(instance.ID, "release-old")
+	if err != nil || len(artifacts) != 0 {
+		t.Fatalf("expected release artifacts to be deleted, got %+v err=%v", artifacts, err)
+	}
+	snapshots, err := db.ListAppReleaseSnapshots(instance.ID, "release-old")
+	if err != nil || len(snapshots) != 0 {
+		t.Fatalf("expected release snapshots to be deleted, got %+v err=%v", snapshots, err)
+	}
+}
+
 func TestOpenReadOnlyWithSecretDoesNotCreateDatabase(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "missing", "aifar.db")
 	db, err := OpenReadOnlyWithSecret(path, "secret")

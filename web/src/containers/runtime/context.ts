@@ -80,6 +80,9 @@ export type AifarRuntimeContext = {
   formatDate: (value?: string) => string
   releaseRollbackDisabledReason: (row: AifarRelease) => string
   rollbackAifarRelease: (row: AifarRelease) => Promise<void>
+  releaseDeletingId: Ref<string>
+  releaseDeleteDisabledReason: (row: AifarRelease) => string
+  deleteAifarRelease: (row: AifarRelease) => Promise<void>
   selectedRuntimeServices: ComputedRef<AifarRuntimeService[]>
   runtimeEndpointText: (row: AifarRuntimeService) => string
   percentText: (value?: number) => string

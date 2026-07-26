@@ -111,6 +111,7 @@ func NewWithRealtime(cfg config.Config, s *store.Store, tasks *worker.Manager, e
 			r.Post("/apps/instances/batch-delete", api.requirePermission(rbac.AppsManage, api.deleteAppInstances))
 			r.Post("/apps/instances/{id}/check", api.requirePermission(rbac.AppsManage, api.checkAppInstance))
 			r.Get("/apps/instances/{id}/aifar/releases", api.listAIFARReleases)
+			r.Delete("/apps/instances/{id}/aifar/releases/{releaseId}", api.requirePermission(rbac.AppsManage, api.deleteAIFARRelease))
 			r.Post("/apps/instances/{id}/aifar/update-artifact", api.requirePermission(rbac.AppsManage, api.updateAppInstanceArtifact))
 			r.Post("/apps/instances/{id}/aifar/update-artifact-bundle", api.requirePermission(rbac.AppsManage, api.updateAppInstanceArtifactBundle))
 			r.Post("/apps/instances/{id}/aifar/rollback", api.requirePermission(rbac.AppsManage, api.rollbackAIFARRelease))

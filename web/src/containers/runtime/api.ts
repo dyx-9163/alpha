@@ -1,4 +1,4 @@
-import { apiEventSourceUrl, apiGet, apiPost, apiPostForm, apiPut } from '../../api/client'
+import { apiDelete, apiEventSourceUrl, apiGet, apiPost, apiPostForm, apiPut } from '../../api/client'
 import type { AifarReleaseListResponse, AifarRuntimeResponse, RuntimeConfigValues } from './types'
 
 export type RuntimeTaskResponse = {
@@ -36,6 +36,10 @@ export function fetchAifarRuntime(query: string, options: LoadRuntimeOptions = {
 
 export function fetchAifarReleases(instanceId: string) {
   return apiGet<AifarReleaseListResponse>(`/apps/instances/${instanceId}/aifar/releases`)
+}
+
+export function deleteAifarRelease(instanceId: string, releaseId: string) {
+  return apiDelete<{ releaseId: string }>(`/apps/instances/${encodeURIComponent(instanceId)}/aifar/releases/${encodeURIComponent(releaseId)}`)
 }
 
 export function createRuntimeLogEventSource(params: URLSearchParams) {

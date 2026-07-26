@@ -37,6 +37,12 @@ func Text(lang, key string, args ...any) string {
 
 var catalogs = map[Locale]map[string]string{
 	Zh: {
+		"api.aifarInstanceRequired":                    "需要选择 AIFAR 实例",
+		"api.aifarReleaseNotFound":                     "发布记录不存在",
+		"api.aifarReleaseDeleteFailed":                 "删除发布记录失败",
+		"api.aifarReleaseDeleteCurrent":                "当前正在使用的发布记录不能删除",
+		"api.aifarReleaseDeleteActive":                 "待处理或运行中的发布记录不能删除",
+		"api.aifarReleaseDeleteReferenced":             "该发布记录仍被其他发布记录引用，不能删除",
 		"worker.taskStarted":                           "任务已开始",
 		"worker.taskCompleted":                         "任务已完成",
 		"worker.cancelRequested":                       "已请求取消任务",
@@ -234,6 +240,12 @@ var catalogs = map[Locale]map[string]string{
 		"redis.sentinelUnsupported":                    "Redis Sentinel 拓扑尚未实现，本轮仅支持 standalone 单体部署",
 	},
 	En: {
+		"api.aifarInstanceRequired":                    "an AIFAR instance is required",
+		"api.aifarReleaseNotFound":                     "release record was not found",
+		"api.aifarReleaseDeleteFailed":                 "failed to delete release record",
+		"api.aifarReleaseDeleteCurrent":                "the current release record cannot be deleted",
+		"api.aifarReleaseDeleteActive":                 "pending or running release records cannot be deleted",
+		"api.aifarReleaseDeleteReferenced":             "this release record is still referenced by another release",
 		"worker.taskStarted":                           "task started",
 		"worker.taskCompleted":                         "task completed",
 		"worker.cancelRequested":                       "cancel requested",

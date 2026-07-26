@@ -51,23 +51,8 @@
     <template v-else>
       <KeyValueGrid :items="runtimeSummaryItems" />
       <el-tabs v-model="runtimeResourceTab" class="runtime-resource-tabs">
-        <el-tab-pane :label="t('containers.deployments')" name="deployments">
-          <AifarRuntimeDeploymentsTab />
-        </el-tab-pane>
-        <el-tab-pane :label="t('containers.releases')" name="releases">
-          <AifarRuntimeReleasesTab />
-        </el-tab-pane>
-        <el-tab-pane :label="t('containers.services')" name="services">
-          <AifarRuntimeServicesTab />
-        </el-tab-pane>
-        <el-tab-pane :label="t('containers.pods')" name="pods">
-          <AifarRuntimePodsTab />
-        </el-tab-pane>
-        <el-tab-pane :label="t('containers.logs')" name="logs">
-          <AifarRuntimeLogsTab />
-        </el-tab-pane>
-        <el-tab-pane :label="t('containers.ingressAndNacos')" name="ingress">
-          <AifarRuntimeIngressTab />
+        <el-tab-pane v-for="tabName in runtimeResourceTabOrder" :key="tabName" :label="t(runtimeResourceTabLabels[tabName])" :name="tabName">
+          <component :is="runtimeResourceTabComponents[tabName]" />
         </el-tab-pane>
       </el-tabs>
     </template>
@@ -75,6 +60,7 @@
 </template>
 
 <script setup lang="ts">
+import type { Component } from 'vue'
 import KeyValueGrid from '../../components/KeyValueGrid.vue'
 import StatusTag from '../../components/StatusTag.vue'
 import AifarRuntimeDeploymentsTab from './AifarRuntimeDeploymentsTab.vue'
@@ -83,8 +69,18 @@ import AifarRuntimeLogsTab from './AifarRuntimeLogsTab.vue'
 import AifarRuntimePodsTab from './AifarRuntimePodsTab.vue'
 import AifarRuntimeReleasesTab from './AifarRuntimeReleasesTab.vue'
 import AifarRuntimeServicesTab from './AifarRuntimeServicesTab.vue'
-import { useAifarRuntimeContext } from './context'
+import { useAifarRuntimeContext, type RuntimeResourceTab } from './context'
+import { runtimeResourceTabLabels, runtimeResourceTabOrder } from './surface'
 import './runtime.css'
+
+const runtimeResourceTabComponents: Record<RuntimeResourceTab, Component> = {
+  deployments: AifarRuntimeDeploymentsTab,
+  services: AifarRuntimeServicesTab,
+  pods: AifarRuntimePodsTab,
+  logs: AifarRuntimeLogsTab,
+  ingress: AifarRuntimeIngressTab,
+  releases: AifarRuntimeReleasesTab
+}
 
 const {
   t,

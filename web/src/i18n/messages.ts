@@ -4,6 +4,11 @@ export type I18nValue = string | ((params?: Record<string, unknown>) => string)
 
 export const messages: Record<LocaleCode, Record<string, I18nValue>> = {
   zh: {
+    'containers.deleteRelease': '删除发布记录',
+    'containers.confirmDeleteRelease': ({ release } = {}) => `确认删除发布记录 ${release ?? ''}？仅删除面板记录及关联索引，不删除远端制品、容器或运行状态。`,
+    'containers.releaseDeleted': '发布记录已删除',
+    'containers.releaseDeleteFailed': '删除发布记录失败',
+    'containers.releaseDeleteActiveUnavailable': '待处理或运行中的发布记录不能删除',
     'brand.subtitle': '私有化真实运维面板',
     'common.refresh': '刷新',
     'common.save': '保存',
@@ -917,6 +922,11 @@ export const messages: Record<LocaleCode, Record<string, I18nValue>> = {
     'table.version': '版本'
   },
   en: {
+    'containers.deleteRelease': 'Delete release record',
+    'containers.confirmDeleteRelease': ({ release } = {}) => `Delete release record ${release ?? ''}? This removes only panel records and related indexes; remote artifacts, containers, and runtime state are kept.`,
+    'containers.releaseDeleted': 'Release record deleted',
+    'containers.releaseDeleteFailed': 'Failed to delete release record',
+    'containers.releaseDeleteActiveUnavailable': 'Pending or running release records cannot be deleted',
     'brand.subtitle': 'Private real operations panel',
     'common.refresh': 'Refresh',
     'common.save': 'Save',

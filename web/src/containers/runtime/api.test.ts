@@ -1,12 +1,14 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 const {
+	apiDeleteMock,
   apiEventSourceUrlMock,
   apiGetMock,
   apiPostFormMock,
   apiPostMock,
   apiPutMock
 } = vi.hoisted(() => ({
+	apiDeleteMock: vi.fn(),
   apiEventSourceUrlMock: vi.fn(),
   apiGetMock: vi.fn(),
   apiPostFormMock: vi.fn(),
@@ -15,6 +17,7 @@ const {
 }))
 
 vi.mock('../../api/client', () => ({
+	apiDelete: apiDeleteMock,
   apiEventSourceUrl: apiEventSourceUrlMock,
   apiGet: apiGetMock,
   apiPost: apiPostMock,
@@ -26,6 +29,7 @@ import {
   applyRuntimeConfig,
   cleanupStaleRuntime,
   createRuntimeLogEventSource,
+	deleteAifarRelease,
   fetchAifarReleases,
   fetchAifarRuntime,
   installRuntimeServices,
@@ -50,6 +54,7 @@ class FakeEventSource {
 
 describe('AIFAR Runtime API service', () => {
   beforeEach(() => {
+		apiDeleteMock.mockReset()
     apiEventSourceUrlMock.mockReset()
     apiGetMock.mockReset()
     apiPostMock.mockReset()
@@ -83,6 +88,13 @@ describe('AIFAR Runtime API service', () => {
     await expect(fetchAifarReleases('instance-1')).resolves.toBe(response)
     expect(apiGetMock).toHaveBeenCalledWith('/apps/instances/instance-1/aifar/releases')
   })
+
+	it('deletes the selected release record with encoded path segments', async () => {
+		apiDeleteMock.mockResolvedValueOnce({ releaseId: 'release/old' })
+
+		await expect(deleteAifarRelease('instance/1', 'release/old')).resolves.toEqual({ releaseId: 'release/old' })
+		expect(apiDeleteMock).toHaveBeenCalledWith('/apps/instances/instance%2F1/aifar/releases/release%2Fold')
+	})
 
   it('builds the authenticated runtime log EventSource URL', () => {
     const params = new URLSearchParams({ serverId: 'server-1', services: 'gateway,oauth', tail: '200' })

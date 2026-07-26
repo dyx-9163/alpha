@@ -2,7 +2,9 @@ package httpapi
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strings"
 
@@ -19,6 +21,12 @@ type aifarReleaseRollbackRequest struct {
 	Services        []string `json:"services"`
 	Reason          string   `json:"reason"`
 	Force           bool     `json:"force"`
+}
+
+type aifarReleaseDeleteBlock struct {
+	Code       string
+	MessageKey string
+	Details    map[string]any
 }
 
 func (a *API) listAIFARReleases(w http.ResponseWriter, r *http.Request) {
@@ -70,6 +78,92 @@ func aifarReleaseResponseItem(release store.AppRelease, manifest map[string]any)
 		item["activatedAt"] = release.ActivatedAt
 	}
 	return item
+}
+
+func (a *API) deleteAIFARRelease(w http.ResponseWriter, r *http.Request) {
+	lang := languageFromRequest(r)
+	instanceID := strings.TrimSpace(chi.URLParam(r, "id"))
+	releaseID := strings.TrimSpace(chi.URLParam(r, "releaseId"))
+	instance, err := a.store.GetAppInstance(instanceID)
+	if err != nil {
+		respond(w, nil, err)
+		return
+	}
+	if !strings.EqualFold(instance.App, "aifar") {
+		writeError(w, http.StatusBadRequest, "AIFAR_INSTANCE_REQUIRED", i18n.Text(lang, "api.aifarInstanceRequired"), map[string]any{"instanceId": instanceID})
+		return
+	}
+	releases, err := a.store.ListAppReleases(instanceID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "AIFAR_RELEASE_LIST_FAILED", err.Error(), nil)
+		return
+	}
+	var target *store.AppRelease
+	for index := range releases {
+		if releases[index].ReleaseID == releaseID {
+			target = &releases[index]
+			break
+		}
+	}
+	if target == nil {
+		writeError(w, http.StatusNotFound, "AIFAR_RELEASE_NOT_FOUND", i18n.Text(lang, "api.aifarReleaseNotFound"), map[string]any{"instanceId": instanceID, "releaseId": releaseID})
+		return
+	}
+	if block := aifarReleaseDeleteBlockReason(instance, *target, releases); block != nil {
+		writeError(w, http.StatusConflict, block.Code, i18n.Text(lang, block.MessageKey), block.Details)
+		return
+	}
+	if err := a.store.DeleteAppRelease(instanceID, releaseID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(w, http.StatusNotFound, "AIFAR_RELEASE_NOT_FOUND", i18n.Text(lang, "api.aifarReleaseNotFound"), map[string]any{"instanceId": instanceID, "releaseId": releaseID})
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "AIFAR_RELEASE_DELETE_FAILED", i18n.Text(lang, "api.aifarReleaseDeleteFailed"), map[string]any{"instanceId": instanceID, "releaseId": releaseID})
+		return
+	}
+	a.audit(r, "aifar.release.delete", instanceID+":"+releaseID, "success", releaseID)
+	writeJSON(w, http.StatusOK, map[string]any{"releaseId": releaseID})
+}
+
+func aifarReleaseDeleteBlockReason(instance store.AppInstance, target store.AppRelease, releases []store.AppRelease) *aifarReleaseDeleteBlock {
+	metadata := map[string]any{}
+	if strings.TrimSpace(instance.Metadata) != "" {
+		_ = json.Unmarshal([]byte(instance.Metadata), &metadata)
+	}
+	currentReleaseID := stringFromAny(metadata["currentRevision"], stringFromAny(metadata["releaseId"], ""))
+	if currentReleaseID != "" && target.ReleaseID == currentReleaseID {
+		return &aifarReleaseDeleteBlock{
+			Code:       "AIFAR_RELEASE_DELETE_CURRENT",
+			MessageKey: "api.aifarReleaseDeleteCurrent",
+			Details:    map[string]any{"releaseId": target.ReleaseID},
+		}
+	}
+	if target.Status == "pending" || target.Status == "running" {
+		return &aifarReleaseDeleteBlock{
+			Code:       "AIFAR_RELEASE_DELETE_ACTIVE",
+			MessageKey: "api.aifarReleaseDeleteActive",
+			Details:    map[string]any{"releaseId": target.ReleaseID, "status": target.Status},
+		}
+	}
+	for _, release := range releases {
+		if release.ReleaseID == target.ReleaseID {
+			continue
+		}
+		manifest := map[string]any{}
+		if strings.TrimSpace(release.ManifestJSON) == "" || json.Unmarshal([]byte(release.ManifestJSON), &manifest) != nil {
+			continue
+		}
+		for _, field := range []string{"baseReleaseId", "rollbackTo"} {
+			if stringFromAny(manifest[field], "") == target.ReleaseID {
+				return &aifarReleaseDeleteBlock{
+					Code:       "AIFAR_RELEASE_DELETE_REFERENCED",
+					MessageKey: "api.aifarReleaseDeleteReferenced",
+					Details:    map[string]any{"releaseId": target.ReleaseID, "referencedBy": release.ReleaseID, "field": field},
+				}
+			}
+		}
+	}
+	return nil
 }
 
 func (a *API) rollbackAIFARRelease(w http.ResponseWriter, r *http.Request) {

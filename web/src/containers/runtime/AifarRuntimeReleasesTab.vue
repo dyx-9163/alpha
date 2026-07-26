@@ -22,12 +22,26 @@
       <el-table-column prop="activatedAt" :label="t('containers.activatedAt')" min-width="170" show-overflow-tooltip>
         <template #default="{ row }">{{ releaseActivatedAtText(row) }}</template>
       </el-table-column>
-      <el-table-column :label="t('common.operation')" width="120" fixed="right">
+      <el-table-column :label="t('common.operation')" width="205" fixed="right">
         <template #default="{ row }">
           <el-tooltip :content="releaseRollbackDisabledReason(row)" :disabled="!releaseRollbackDisabledReason(row)" placement="top">
             <span>
               <el-button size="small" type="warning" plain :disabled="Boolean(releaseRollbackDisabledReason(row))" @click="rollbackAifarRelease(row)">
                 {{ t('containers.rollbackRelease') }}
+              </el-button>
+            </span>
+          </el-tooltip>
+          <el-tooltip :content="releaseDeleteDisabledReason(row)" :disabled="!releaseDeleteDisabledReason(row)" placement="top">
+            <span>
+              <el-button
+                size="small"
+                type="danger"
+                plain
+                :loading="releaseDeletingId === row.releaseId"
+                :disabled="Boolean(releaseDeleteDisabledReason(row))"
+                @click="deleteAifarRelease(row)"
+              >
+                {{ t('common.delete') }}
               </el-button>
             </span>
           </el-tooltip>
@@ -52,6 +66,9 @@ const {
   releaseStatusLabel,
   releaseServicesText,
   releaseRollbackDisabledReason,
-  rollbackAifarRelease
+  rollbackAifarRelease,
+  releaseDeletingId,
+  releaseDeleteDisabledReason,
+  deleteAifarRelease
 } = useAifarRuntimeContext()
 </script>
