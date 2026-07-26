@@ -14,169 +14,250 @@
         <el-select v-model="serverId" :placeholder="t('terminal.server')" class="toolbar-control is-lg">
           <el-option v-for="server in servers" :key="server.id" :label="server.name" :value="server.id" />
         </el-select>
-        <span class="status-pill" :class="connected ? 'success' : ''">{{ connectionStatus }}</span>
       </div>
       <div class="head-actions terminal-toolbar-actions">
         <el-tooltip :content="deniedText" :disabled="canConnectTerminal" placement="top">
-          <span><el-button type="primary" :disabled="!canConnectTerminal || !serverId" @click="connect">{{ t('terminal.connect') }}</el-button></span>
+          <span>
+            <el-button
+              type="primary"
+              :disabled="!canConnectTerminal || !serverId"
+              @click="newConnection"
+            >
+              {{ t('terminal.newConnection') }}
+            </el-button>
+          </span>
         </el-tooltip>
-        <el-button :disabled="!connected" @click="disconnect">{{ t('terminal.disconnect') }}</el-button>
-        <el-button @click="newTab">{{ t('terminal.newTab') }}</el-button>
+        <el-button :disabled="!canDisconnectFocused" @click="disconnectFocused">
+          {{ t('terminal.disconnect') }}
+        </el-button>
+        <el-button :disabled="!canReconnectFocused" @click="reconnectFocused">
+          {{ t('terminal.reconnect') }}
+        </el-button>
       </div>
     </div>
 
     <div class="workspace-card terminal-panel">
-      <div class="terminal-session-head">
-        <div>
-          <strong>{{ currentServer?.name || t('terminal.notSelected') }}</strong>
-          <span>{{ currentServerMeta }}</span>
+      <nav v-if="workspace.sessions.length" class="terminal-tabs" :aria-label="t('terminal.sessions')">
+        <div
+          v-for="session in workspace.sessions"
+          :key="session.id"
+          class="terminal-tab"
+          :class="{ 'is-active': session.id === workspace.focusedId }"
+          role="tab"
+          :aria-selected="session.id === workspace.focusedId"
+          tabindex="0"
+          @click="selectSession(session.id)"
+          @keydown.enter="selectSession(session.id)"
+          @keydown.space.prevent="selectSession(session.id)"
+        >
+          <span class="terminal-status-dot" :class="statusClass(session.status)" />
+          <span class="terminal-tab-label">{{ session.label }}</span>
+          <button
+            class="terminal-tab-action"
+            type="button"
+            :disabled="workspace.visibleIds.includes(session.id) && workspace.visibleIds.length === 1"
+            :title="workspace.visibleIds.includes(session.id) ? t('terminal.removeFromSplit') : t('terminal.addToSplit')"
+            :aria-label="workspace.visibleIds.includes(session.id) ? t('terminal.removeFromSplit') : t('terminal.addToSplit')"
+            @click.stop="toggleSplit(session.id)"
+          >
+            {{ workspace.visibleIds.includes(session.id) ? '−' : '+' }}
+          </button>
+          <button
+            class="terminal-tab-action"
+            type="button"
+            :title="t('terminal.closeSession')"
+            :aria-label="t('terminal.closeSession')"
+            @click.stop="requestClose(session)"
+          >
+            ×
+          </button>
         </div>
-        <span class="status-pill" :class="connected ? 'success' : ''">{{ connectionStatus }}</span>
+      </nav>
+
+      <div
+        v-if="workspace.visibleIds.length"
+        class="terminal-grid"
+        :data-pane-count="workspace.visibleIds.length"
+      >
+        <TerminalSessionPane
+          v-for="session in workspace.sessions"
+          v-show="workspace.visibleIds.includes(session.id)"
+          :key="session.id"
+          :ref="(component) => setPaneRef(session.id, component)"
+          :session="session"
+          :server-name="serverName(session.serverId)"
+          :server-meta="serverMeta(session.serverId)"
+          :visible="workspace.visibleIds.includes(session.id)"
+          :focused="workspace.focusedId === session.id"
+          @status="updateStatus"
+          @focus="selectSession"
+        />
       </div>
-      <div ref="terminalEl" class="terminal-box">{{ fallback }}</div>
+      <div v-else class="terminal-empty">
+        {{ workspace.sessions.length ? t('terminal.selectTab') : t('terminal.fallback') }}
+      </div>
     </div>
   </section>
 </template>
 
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
-import { ElMessage } from 'element-plus'
-import { Terminal } from '@xterm/xterm'
-import { apiGet, asArray, terminalProtocols, terminalUrl } from '../api/client'
+import { computed, onMounted, ref } from 'vue'
+import { ElMessage, ElMessageBox } from 'element-plus'
+import { apiGet, asArray } from '../api/client'
 import { usePermissions } from '../composables/usePermissions'
 import { useI18n } from '../i18n'
 import { permissions } from '../rbac'
-import { calculateTerminalGrid } from '../terminal/grid'
+import TerminalSessionPane from '../terminal/TerminalSessionPane.vue'
+import {
+  addSession,
+  addToSplit,
+  closeSession,
+  emptyTerminalWorkspace,
+  focusSession,
+  nextSessionSequence,
+  removeFromSplit,
+  updateSessionStatus,
+  type TerminalConnectionState,
+  type TerminalSessionMeta
+} from '../terminal/sessions'
+
+defineOptions({ name: 'TerminalView' })
+
+interface ServerOption {
+  id: string
+  name: string
+  host?: string
+  port?: number
+}
+
+interface TerminalPaneHandle {
+  disconnect(): void
+  reconnect(): void
+  refit(): void
+}
 
 const { t } = useI18n()
 const { can, deniedText } = usePermissions()
-const servers = ref<any[]>([])
+const servers = ref<ServerOption[]>([])
 const serverId = ref('')
-const terminalEl = ref<HTMLElement>()
-const fallback = ref(t('terminal.fallback'))
-const connected = ref(false)
-let terminal: Terminal | null = null
-let socket: WebSocket | null = null
-let resizeObserver: ResizeObserver | null = null
-const currentServer = computed(() => servers.value.find((server) => server.id === serverId.value))
-const connectionStatus = computed(() => connected.value ? t('common.connected') : t('common.disconnected'))
-const currentServerMeta = computed(() => {
-  const server = currentServer.value
-  if (!server) return t('terminal.fallback')
-  const host = server.host || server.id
-  const port = server.port || 22
-  return `${host}:${port}`
-})
+const workspace = ref(emptyTerminalWorkspace())
+const paneRefs = new Map<string, TerminalPaneHandle>()
 const canConnectTerminal = computed(() => can(permissions.terminalConnect))
+const focusedSession = computed(() => (
+  workspace.value.sessions.find((session) => session.id === workspace.value.focusedId) ?? null
+))
+const canDisconnectFocused = computed(() => {
+  const status = focusedSession.value?.status
+  return canConnectTerminal.value && (status === 'connected' || status === 'connecting')
+})
+const canReconnectFocused = computed(() => {
+  const status = focusedSession.value?.status
+  return canConnectTerminal.value && !!status && status !== 'connected' && status !== 'connecting'
+})
 
 async function load() {
-  servers.value = asArray(await apiGet<any[] | null>('/servers').catch(() => []))
+  servers.value = asArray(await apiGet<ServerOption[] | null>('/servers').catch(() => []))
   if (!serverId.value && servers.value.length) serverId.value = servers.value[0].id
 }
-function connect() {
+
+function serverById(id: string) {
+  return servers.value.find((server) => server.id === id)
+}
+
+function serverName(id: string) {
+  return serverById(id)?.name || id
+}
+
+function serverMeta(id: string) {
+  const server = serverById(id)
+  if (!server) return id
+  return `${server.host || server.id}:${server.port || 22}`
+}
+
+function createSessionId() {
+  return typeof crypto !== 'undefined' && 'randomUUID' in crypto
+    ? crypto.randomUUID()
+    : `terminal-${Date.now()}-${Math.random().toString(36).slice(2)}`
+}
+
+function newConnection() {
   if (!canConnectTerminal.value) {
     ElMessage.warning(deniedText.value)
     return
   }
-  if (!terminalEl.value || !serverId.value) return
-  terminalEl.value.textContent = ''
-  terminal?.dispose()
-  terminal = new Terminal({
-    cursorBlink: true,
-    fontFamily: '"Cascadia Mono", Consolas, "SFMono-Regular", monospace',
-    fontSize: 13,
-    lineHeight: 1.2,
-    scrollback: 10000
+  const server = serverById(serverId.value)
+  if (!server) return
+  const sequence = nextSessionSequence(workspace.value.sessions, server.id)
+  workspace.value = addSession(workspace.value, {
+    id: createSessionId(),
+    serverId: server.id,
+    label: `${server.name} · ${sequence}`,
+    sequence,
+    status: 'connecting'
   })
-  terminal.open(terminalEl.value)
-  observeTerminalSize()
-  scheduleTerminalFit()
-  socket?.close()
-  socket = new WebSocket(terminalUrl(serverId.value), terminalProtocols())
-  socket.binaryType = 'arraybuffer'
-  socket.onopen = () => {
-    connected.value = true
-    fitTerminal()
-    terminal?.write(`${t('terminal.connecting', { target: currentServer.value?.name ?? serverId.value })}\r\n`)
+}
+
+function selectSession(id: string) {
+  workspace.value = focusSession(workspace.value, id)
+}
+
+function toggleSplit(id: string) {
+  if (workspace.value.visibleIds.includes(id)) {
+    if (workspace.value.visibleIds.length === 1) return
+    workspace.value = removeFromSplit(workspace.value, id)
+    return
   }
-  socket.onmessage = (event) => writeTerminalData(event.data)
-  socket.onerror = () => {
-    terminal?.write(`\r\n${t('terminal.connectionFailed')}\r\n`)
-    connected.value = false
-  }
-  socket.onclose = () => {
-    if (connected.value) {
-      terminal?.write(`\r\n${t('terminal.disconnectedMessage')}\r\n`)
+  const result = addToSplit(workspace.value, id)
+  workspace.value = result.state
+  if (result.limitReached) ElMessage.warning(t('terminal.splitLimit'))
+}
+
+async function requestClose(session: TerminalSessionMeta) {
+  if (session.status === 'connected' || session.status === 'connecting') {
+    try {
+      await ElMessageBox.confirm(
+        t('terminal.closeConfirm', { target: session.label }),
+        t('terminal.closeConfirmTitle'),
+        { type: 'warning' }
+      )
+    } catch {
+      return
     }
-    connected.value = false
   }
-  terminal.onData((data) => socket?.send(data))
-}
-function disconnect() {
-  socket?.close()
-  connected.value = false
-}
-function newTab() {
-  fallback.value = t('terminal.fallback')
-  disconnect()
-  terminal?.dispose()
-  terminal = null
-  if (terminalEl.value) terminalEl.value.textContent = fallback.value
-}
-function writeTerminalData(data: unknown) {
-  if (data instanceof ArrayBuffer) {
-    terminal?.write(new Uint8Array(data))
-    return
-  }
-  if (data instanceof Blob) {
-    void data.arrayBuffer().then((buffer) => terminal?.write(new Uint8Array(buffer)))
-    return
-  }
-  terminal?.write(String(data))
+  workspace.value = closeSession(workspace.value, session.id)
 }
 
-function observeTerminalSize() {
-  if (!terminalEl.value || resizeObserver) return
-  resizeObserver = new ResizeObserver(() => fitTerminal())
-  resizeObserver.observe(terminalEl.value)
+function setPaneRef(id: string, component: unknown) {
+  if (component) paneRefs.set(id, component as TerminalPaneHandle)
+  else paneRefs.delete(id)
 }
 
-function scheduleTerminalFit() {
-  void nextTick(() => {
-    fitTerminal()
-    window.requestAnimationFrame(fitTerminal)
-    window.setTimeout(fitTerminal, 50)
-    window.setTimeout(fitTerminal, 150)
-  })
+function focusedPane() {
+  const id = workspace.value.focusedId
+  return id ? paneRefs.get(id) : undefined
 }
 
-function fitTerminal() {
-  if (!terminal || !terminalEl.value) return
-  const style = window.getComputedStyle(terminalEl.value)
-  const width = terminalEl.value.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight)
-  const height = terminalEl.value.clientHeight - parseFloat(style.paddingTop) - parseFloat(style.paddingBottom)
-  const measure = terminalEl.value.querySelector('.xterm-char-measure-element') as HTMLElement | null
-  const rect = measure?.getBoundingClientRect()
-  const measuredCellWidth = rect?.width ?? 0
-  const measuredCharHeight = rect?.height ?? 0
-  const { cols, rows } = calculateTerminalGrid({
-    width,
-    height,
-    measuredCellWidth,
-    measuredCharHeight,
-    lineHeight: Number(terminal.options.lineHeight)
-  })
-  if (cols !== terminal.cols || rows !== terminal.rows) {
-    terminal.resize(cols, rows)
+function disconnectFocused() {
+  focusedPane()?.disconnect()
+}
+
+function reconnectFocused() {
+  focusedPane()?.reconnect()
+}
+
+function updateStatus(id: string, status: TerminalConnectionState) {
+  workspace.value = updateSessionStatus(workspace.value, id, status)
+}
+
+function statusClass(status: TerminalConnectionState) {
+  return {
+    'is-connected': status === 'connected',
+    'is-connecting': status === 'connecting',
+    'is-error': status === 'error'
   }
 }
 
 onMounted(load)
-onBeforeUnmount(() => {
-  socket?.close()
-  resizeObserver?.disconnect()
-  terminal?.dispose()
-})
 </script>
 
 <style scoped>
@@ -214,59 +295,130 @@ onBeforeUnmount(() => {
 
 .terminal-panel {
   flex: 1 1 auto;
-  padding: 14px;
+  min-height: 360px;
+  padding: 12px;
   display: grid;
   grid-template-rows: auto minmax(0, 1fr);
-  gap: 12px;
-  min-height: 360px;
-  height: auto;
+  gap: 10px;
   overflow: hidden !important;
 }
 
-.terminal-session-head {
+.terminal-tabs {
   display: flex;
-  justify-content: space-between;
+  gap: 6px;
+  min-width: 0;
+  padding-bottom: 2px;
+  overflow-x: auto;
+}
+
+.terminal-tab {
+  display: flex;
   align-items: center;
-  gap: 12px;
-  padding: 12px 14px;
+  gap: 7px;
+  min-width: 148px;
+  max-width: 260px;
+  padding: 8px 9px;
   border: 1px solid var(--aifar-border-soft);
-  border-radius: var(--aifar-radius-lg);
-  background: #fbfdff;
-}
-
-.terminal-session-head strong,
-.terminal-session-head span {
-  display: block;
-}
-
-.terminal-session-head span {
+  border-radius: var(--aifar-radius-md);
+  background: #f7faff;
   color: var(--aifar-text-secondary);
-  font-size: 12px;
+  cursor: pointer;
+  outline: none;
 }
 
-.terminal-box {
-  min-height: 0;
-  height: 100%;
-  box-sizing: border-box;
+.terminal-tab:hover,
+.terminal-tab:focus-visible {
+  border-color: color-mix(in srgb, var(--aifar-primary) 48%, var(--aifar-border-soft));
+}
+
+.terminal-tab.is-active {
+  border-color: var(--aifar-primary);
+  background: color-mix(in srgb, var(--aifar-primary) 8%, #fff);
+  color: var(--aifar-text-primary);
+}
+
+.terminal-status-dot {
+  width: 8px;
+  height: 8px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: #9ba9ba;
+}
+
+.terminal-status-dot.is-connected {
+  background: var(--el-color-success);
+}
+
+.terminal-status-dot.is-connecting {
+  background: var(--el-color-warning);
+}
+
+.terminal-status-dot.is-error {
+  background: var(--el-color-danger);
+}
+
+.terminal-tab-label {
+  min-width: 0;
+  flex: 1 1 auto;
   overflow: hidden;
-  border-radius: var(--aifar-radius-lg);
-  padding: 8px 10px;
-  background: var(--aifar-code-bg);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.terminal-tab-action {
+  display: grid;
+  place-items: center;
+  width: 22px;
+  height: 22px;
+  flex: 0 0 auto;
+  padding: 0;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+}
+
+.terminal-tab-action:hover:not(:disabled) {
+  background: rgba(46, 94, 151, .12);
+}
+
+.terminal-tab-action:disabled {
+  opacity: .35;
+  cursor: not-allowed;
+}
+
+.terminal-grid {
+  min-width: 0;
+  min-height: 0;
+  display: grid;
+  gap: 10px;
+  overflow: hidden;
+}
+
+.terminal-grid[data-pane-count='2'],
+.terminal-grid[data-pane-count='3'],
+.terminal-grid[data-pane-count='4'] {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.terminal-grid[data-pane-count='3'],
+.terminal-grid[data-pane-count='4'] {
+  grid-template-rows: repeat(2, minmax(0, 1fr));
+}
+
+.terminal-empty {
+  min-height: 0;
+  display: grid;
+  place-items: start;
+  padding: 12px 14px;
   border: 1px solid rgba(68, 112, 173, .35);
-}
-
-.terminal-box :deep(.xterm) {
-  height: 100%;
-  width: 100%;
-}
-
-.terminal-box :deep(.xterm-viewport) {
-  overflow-y: auto;
-}
-
-.terminal-box :deep(.xterm-screen) {
-  padding-top: 2px;
-  padding-left: 2px;
+  border-radius: var(--aifar-radius-lg);
+  background: var(--aifar-code-bg);
+  color: #c7d3e3;
+  font-family: "Cascadia Mono", Consolas, "SFMono-Regular", monospace;
 }
 
 @media (max-width: 760px) {
@@ -275,23 +427,26 @@ onBeforeUnmount(() => {
   }
 
   .terminal-toolbar,
-  .terminal-session-head {
-    align-items: flex-start;
-    flex-direction: column;
-  }
-
   .terminal-control-group {
     align-items: stretch;
     flex-direction: column;
-    width: 100%;
   }
 
+  .terminal-control-group,
   .terminal-toolbar-actions {
     width: 100%;
   }
 
   .terminal-panel {
-    height: 560px;
+    height: auto;
+    min-height: 640px;
+  }
+
+  .terminal-grid[data-pane-count] {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: none;
+    grid-auto-rows: minmax(360px, 55vh);
+    overflow: visible;
   }
 }
 </style>
