@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -12,11 +13,14 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
 var dockerHTTPClient = &http.Client{Timeout: 20 * time.Second}
 var dockerHTTPStreamClient = &http.Client{}
+
+const dockerStatsMaxConcurrency = 4
 
 type dockerAPIContainerStatsPayload struct {
 	ID          string                       `json:"id"`
@@ -227,6 +231,49 @@ func dockerAPIContainerStats(ctx context.Context, host, id string) (DockerContai
 		RawCPUPerc:    fmt.Sprintf("%.2f%%", cpu),
 		RawMemPercent: fmt.Sprintf("%.2f%%", memory),
 	}, nil
+}
+
+func dockerAPIContainerStatsBatch(ctx context.Context, host string, ids []string) ([]DockerContainerStat, error) {
+	ids = normalizeDockerArgs(ids)
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	type result struct {
+		stat DockerContainerStat
+		err  error
+	}
+	results := make([]result, len(ids))
+	jobs := make(chan int)
+	workers := min(dockerStatsMaxConcurrency, len(ids))
+	var wg sync.WaitGroup
+	for worker := 0; worker < workers; worker++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for index := range jobs {
+				stat, err := dockerAPIContainerStats(ctx, host, ids[index])
+				if err != nil {
+					err = fmt.Errorf("container %s: %w", ids[index], err)
+				}
+				results[index] = result{stat: stat, err: err}
+			}
+		}()
+	}
+	for index := range ids {
+		jobs <- index
+	}
+	close(jobs)
+	wg.Wait()
+	stats := make([]DockerContainerStat, 0, len(ids))
+	errs := make([]error, 0)
+	for _, item := range results {
+		if item.err != nil {
+			errs = append(errs, item.err)
+			continue
+		}
+		stats = append(stats, item.stat)
+	}
+	return stats, errors.Join(errs...)
 }
 
 func dockerAPIStatsCPUPercent(payload dockerAPIContainerStatsPayload) float64 {

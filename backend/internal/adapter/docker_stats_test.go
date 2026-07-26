@@ -2,11 +2,100 @@ package adapter
 
 import (
 	"context"
+	"fmt"
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
+
+	"aifar-deployment/backend/internal/store"
 )
+
+func TestDockerContainerStatsForServerUsesEngineAPIWithoutLocalCLI(t *testing.T) {
+	t.Setenv("PATH", t.TempDir())
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		_, _ = w.Write([]byte(`{
+			"id":"container-1","name":"/pod-1",
+			"cpu_stats":{"cpu_usage":{"total_usage":1200},"system_cpu_usage":5000,"online_cpus":1},
+			"precpu_stats":{"cpu_usage":{"total_usage":1000},"system_cpu_usage":4000},
+			"memory_stats":{"usage":500,"limit":1000,"stats":{}}
+		}`))
+	}))
+	defer server.Close()
+
+	stats, err := DockerContainerStatsForServer(context.Background(), store.Server{DockerHost: server.URL}, []string{"pod-1"})
+	if err != nil || len(stats) != 1 || calls.Load() != 1 {
+		t.Fatalf("stats=%+v calls=%d err=%v", stats, calls.Load(), err)
+	}
+}
+
+func TestDockerAPIContainerStatsBatchKeepsSuccessfulRows(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/missing/") {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = w.Write([]byte(`{
+			"id":"good-id","name":"/good",
+			"cpu_stats":{"cpu_usage":{"total_usage":2},"system_cpu_usage":2,"online_cpus":1},
+			"precpu_stats":{"cpu_usage":{"total_usage":1},"system_cpu_usage":1},
+			"memory_stats":{"usage":1,"limit":2,"stats":{}}
+		}`))
+	}))
+	defer server.Close()
+
+	stats, err := dockerAPIContainerStatsBatch(context.Background(), server.URL, []string{"", "good", "missing", "good"})
+	if len(stats) != 1 || stats[0].Name != "good" {
+		t.Fatalf("partial stats = %+v", stats)
+	}
+	if err == nil || !strings.Contains(err.Error(), "missing") {
+		t.Fatalf("partial error = %v", err)
+	}
+}
+
+func TestDockerAPIContainerStatsBatchLimitsConcurrencyToFour(t *testing.T) {
+	entered := make(chan struct{}, 5)
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		entered <- struct{}{}
+		<-release
+		id := strings.Split(strings.Trim(r.URL.Path, "/"), "/")[1]
+		_, _ = fmt.Fprintf(w, `{"id":%q,"name":%q,"memory_stats":{"usage":1,"limit":2,"stats":{}}}`, id, "/"+id)
+	}))
+	defer server.Close()
+
+	type batchResult struct {
+		stats []DockerContainerStat
+		err   error
+	}
+	done := make(chan batchResult, 1)
+	go func() {
+		stats, err := dockerAPIContainerStatsBatch(context.Background(), server.URL, []string{"p1", "p2", "p3", "p4", "p5"})
+		done <- batchResult{stats: stats, err: err}
+	}()
+	for index := 0; index < 4; index++ {
+		select {
+		case <-entered:
+		case <-time.After(time.Second):
+			t.Fatal("four workers did not enter")
+		}
+	}
+	select {
+	case <-entered:
+		t.Fatal("fifth request started before a worker was released")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(release)
+	result := <-done
+	if result.err != nil || len(result.stats) != 5 {
+		t.Fatalf("stats=%+v err=%v", result.stats, result.err)
+	}
+}
 
 func TestDockerAPIContainerStatsCalculatesCPUAndCgroupV1Memory(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

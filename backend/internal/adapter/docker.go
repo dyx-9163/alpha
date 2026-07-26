@@ -572,7 +572,7 @@ func DockerContainerStatsForServer(ctx context.Context, server store.Server, ids
 		return nil, nil
 	}
 	if dockerAPIHost(server.DockerHost) {
-		return DockerContainerStats(ctx, server.DockerHost, ids)
+		return dockerAPIContainerStatsBatch(ctx, server.DockerHost, ids)
 	}
 	args := append([]string{"stats", "--no-stream", "--format", "{{json .}}"}, ids...)
 	out, err := dockerSSHOutput(ctx, server, args...)
