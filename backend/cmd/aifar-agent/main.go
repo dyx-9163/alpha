@@ -59,6 +59,25 @@ func main() {
 			os.Exit(1)
 		}
 		fmt.Println(`{"status":"reconciled"}`)
+	case "restart-runtime":
+		cmd := flag.NewFlagSet("restart-runtime", flag.ExitOnError)
+		specPath := cmd.String("spec", "", "path to runtime spec json")
+		addr := cmd.String("addr", "127.0.0.1:18081", "agent API address")
+		_ = cmd.Parse(os.Args[2:])
+		if *specPath == "" {
+			fmt.Fprintln(os.Stderr, "--spec is required")
+			os.Exit(2)
+		}
+		spec, err := readSpec(*specPath)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		if err := postRuntimeRestart(context.Background(), *addr, spec); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		fmt.Println(`{"status":"restarted"}`)
 	case "remove-instance":
 		cmd := flag.NewFlagSet("remove-instance", flag.ExitOnError)
 		instance := cmd.String("instance", "admin", "runtime instance id")
@@ -88,7 +107,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: aifar-agent health | status | reconcile-runtime --spec <file> | reconcile-ingress --spec <file> | remove-instance [--instance admin] | register-nacos [--state-dir dir] | deregister-nacos [--state-dir dir] | serve [--addr 127.0.0.1:18081]")
+	fmt.Fprintln(os.Stderr, "usage: aifar-agent health | status | reconcile-runtime --spec <file> | restart-runtime --spec <file> | reconcile-ingress --spec <file> | remove-instance [--instance admin] | register-nacos [--state-dir dir] | deregister-nacos [--state-dir dir] | serve [--addr 127.0.0.1:18081]")
 }
 
 func readSpec(path string) (runtimeagent.RuntimeSpec, error) {
@@ -199,6 +218,23 @@ func newAgentHandler(manager *runtimeagent.Manager, healthCheck func(context.Con
 		}
 		writeJSON(w, http.StatusOK, map[string]string{"status": "reconciled"})
 	})
+	mux.HandleFunc("/runtime/restart-all", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		defer r.Body.Close()
+		var spec runtimeagent.RuntimeSpec
+		if err := json.NewDecoder(r.Body).Decode(&spec); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if err := manager.RestartAll(r.Context(), spec); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"status": "restarted"})
+	})
 	mux.HandleFunc("/runtime/instances/", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodDelete {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -231,11 +267,19 @@ func recoverAgentHandler(next http.Handler) http.Handler {
 }
 
 func postRuntimeSpec(ctx context.Context, addr string, spec runtimeagent.RuntimeSpec) error {
+	return postRuntimeRequest(ctx, addr, "/runtime/reconcile", "reconcile", spec)
+}
+
+func postRuntimeRestart(ctx context.Context, addr string, spec runtimeagent.RuntimeSpec) error {
+	return postRuntimeRequest(ctx, addr, "/runtime/restart-all", "restart", spec)
+}
+
+func postRuntimeRequest(ctx context.Context, addr, path, operation string, spec runtimeagent.RuntimeSpec) error {
 	data, err := json.Marshal(spec)
 	if err != nil {
 		return err
 	}
-	url := "http://" + addr + "/runtime/reconcile"
+	url := "http://" + addr + path
 	var lastErr error
 	for attempt := 1; attempt <= 5; attempt++ {
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(data))
@@ -254,7 +298,7 @@ func postRuntimeSpec(ctx context.Context, addr string, spec runtimeagent.Runtime
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		_ = resp.Body.Close()
 		if resp.StatusCode >= 300 {
-			lastErr = fmt.Errorf("aifar-agent reconcile failed: %s: %s", resp.Status, strings.TrimSpace(string(body)))
+			lastErr = fmt.Errorf("aifar-agent %s failed: %s: %s", operation, resp.Status, strings.TrimSpace(string(body)))
 			if !isTransientAgentStatus(resp.StatusCode) || attempt == 5 || !sleepAgentRetry(ctx, attempt) {
 				return lastErr
 			}
@@ -351,6 +395,7 @@ func agentStatus() map[string]any {
 			"nacos-proxy-register",
 			"reconcile-ingress",
 			"reconcile-runtime",
+			"restart-runtime",
 			"remove-instance",
 			"status",
 		},

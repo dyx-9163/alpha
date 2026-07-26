@@ -349,6 +349,7 @@ func (m *Manager) Status() map[string]any {
 			"docker-events",
 			"periodic-resync",
 			"reconcile-runtime",
+			"restart-runtime",
 			"rolling-update",
 			"nacos-ready-gate",
 			"service-affinity-policy",
