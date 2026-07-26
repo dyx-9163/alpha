@@ -129,6 +129,83 @@ func TestAIFARRuntimeMarksRowsUnavailableWhenDockerHostStopped(t *testing.T) {
 	}
 }
 
+func TestAIFARRuntimeStatsKeepsPartialMetricsWithoutDegradingRuntime(t *testing.T) {
+	api, db, secret := newAuthzTestAPI(t)
+	api.aifarAgentStatus = func(context.Context, store.Server) aifarRuntimeAgent {
+		return aifarRuntimeAgent{Status: "running"}
+	}
+	dockerAPI := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/_ping":
+			_, _ = w.Write([]byte("OK"))
+		case "/containers/json":
+			_ = json.NewEncoder(w).Encode([]map[string]any{
+				{"Id": "good-id", "Names": []string{"/aifar-pod-admin-permission-rev-1-r1"}, "Image": "aifar-permission:rev-1", "State": "running", "Status": "Up 1 minute (healthy)", "Labels": map[string]string{"aifar.app": "aifar", "aifar.component": "pod"}},
+				{"Id": "missing-id", "Names": []string{"/aifar-pod-admin-permission-rev-1-r2"}, "Image": "aifar-permission:rev-1", "State": "running", "Status": "Up 1 minute (healthy)", "Labels": map[string]string{"aifar.app": "aifar", "aifar.component": "pod"}},
+			})
+		case "/containers/aifar-pod-admin-permission-rev-1-r1/stats":
+			_, _ = w.Write([]byte(`{
+				"id":"good-id","name":"/aifar-pod-admin-permission-rev-1-r1",
+				"cpu_stats":{"cpu_usage":{"total_usage":1200},"system_cpu_usage":5000,"online_cpus":1},
+				"precpu_stats":{"cpu_usage":{"total_usage":1000},"system_cpu_usage":4000},
+				"memory_stats":{"usage":500,"limit":1000,"stats":{}}
+			}`))
+		case "/containers/aifar-pod-admin-permission-rev-1-r2/stats":
+			http.NotFound(w, r)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer dockerAPI.Close()
+	server, instance := seedAIFARRuntimeFixture(t, db, dockerAPI.URL)
+	if _, err := db.SaveAIFARPod(store.AIFARPod{
+		InstanceID: instance.ID, ServiceName: "permission", Revision: "rev-1",
+		PodID: "r2", ContainerName: "aifar-pod-admin-permission-rev-1-r2",
+		Port: 38010, Status: "running", Ready: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	token := issueTestToken(t, db, secret, "owner", "owner")
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v2/containers/aifar/runtime?serverId="+server.ID+"&includePods=1&includeStats=1", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	rec := httptest.NewRecorder()
+
+	api.Router().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	var body aifarRuntimeResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	pods := map[string]aifarRuntimePod{}
+	for _, pod := range body.Pods {
+		pods[pod.PodID] = pod
+	}
+	good, goodOK := pods["r1"]
+	missing, missingOK := pods["r2"]
+	if !goodOK || !missingOK || body.RuntimeStatus != "ready" {
+		t.Fatalf("runtime=%s pods=%+v warnings=%+v", body.RuntimeStatus, body.Pods, body.Warnings)
+	}
+	if good.CPUPercent <= 0 || good.MemoryPercent <= 0 || good.MemoryUsage == "" {
+		t.Fatalf("successful stats were discarded: %+v", good)
+	}
+	if missing.CPUPercent != 0 || missing.MemoryPercent != 0 || missing.MemoryUsage != "" {
+		t.Fatalf("failed pod should have empty metrics: %+v", missing)
+	}
+	warningFound := false
+	for _, warning := range body.Warnings {
+		if strings.Contains(warning, "failed to read Docker stats") && strings.Contains(warning, "r2") {
+			warningFound = true
+		}
+	}
+	if !warningFound {
+		t.Fatalf("missing partial stats warning: %+v", body.Warnings)
+	}
+}
+
 func TestAIFARRuntimeLogsAggregatesPodContainerLogs(t *testing.T) {
 	api, db, secret := newAuthzTestAPI(t)
 	dockerAPI := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

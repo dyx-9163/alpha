@@ -1300,10 +1300,10 @@ func (a *API) buildAIFARRuntime(ctx context.Context, server store.Server, option
 	if options.IncludeStats {
 		names := aifarPodContainerNames(containers)
 		if len(names) > 0 {
-			if stats, err := adapter.DockerContainerStatsForServer(ctx, server, names); err == nil {
-				statsByName = mapStatsByName(stats)
-			} else {
-				response.Warnings = append(response.Warnings, "failed to read Docker stats: "+err.Error())
+			stats, statsErr := adapter.DockerContainerStatsForServer(ctx, server, names)
+			statsByName = mapStatsByName(stats)
+			if statsErr != nil {
+				response.Warnings = append(response.Warnings, "failed to read Docker stats: "+statsErr.Error())
 			}
 		}
 	}
