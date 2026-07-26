@@ -166,8 +166,9 @@ func TestManagerRestartAllCancellationKeepsPartialResultWithoutRollback(t *testi
 	runner.cancelAfterStart = "contacts-rev-1-r1"
 	runner.cancel = cancel
 	manager := NewManager(ManagerOptions{StateDir: t.TempDir(), Runner: runner})
+	spec := restartAllSpec()
 
-	err := manager.RestartAll(ctx, restartAllSpec())
+	err := manager.RestartAll(ctx, spec)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("expected cancellation, got %v", err)
 	}
@@ -176,6 +177,15 @@ func TestManagerRestartAllCancellationKeepsPartialResultWithoutRollback(t *testi
 	}
 	if runner.hasContainer("aifar-pod-admin-contacts-rev-old-r1") {
 		t.Fatalf("removed old pod must not be rolled back: %#v", runner.containerNames())
+	}
+	if endpoints := manager.cachedEndpoints(spec.InstanceID, "contacts"); len(endpoints) != 1 {
+		t.Fatalf("cancellation must refresh endpoints for the submitted pod, got %#v", endpoints)
+	}
+	manager.mu.RLock()
+	status := manager.deployments[endpointKey(spec.InstanceID, "contacts")]
+	manager.mu.RUnlock()
+	if status.Status != "pending" || status.CurrentReplicas != 1 || status.ReadyReplicas != 1 {
+		t.Fatalf("cancellation must retain partial restart status, got %#v", status)
 	}
 }
 

@@ -247,6 +247,7 @@ func (m *Manager) RestartAll(ctx context.Context, spec RuntimeSpec) error {
 	}
 	for _, item := range plan {
 		if err := ctx.Err(); err != nil {
+			m.refreshRestartAllPartialState(spec)
 			return err
 		}
 		if err := m.runContainerDetached(ctx, spec, item.deployment, item.replica, item.name); err != nil {
@@ -283,6 +284,29 @@ func (m *Manager) RestartAll(ctx context.Context, spec RuntimeSpec) error {
 		return fmt.Errorf("restart all AIFAR runtime pods: %w", errors.Join(restartErrs...))
 	}
 	return nil
+}
+
+func (m *Manager) refreshRestartAllPartialState(spec RuntimeSpec) {
+	refreshCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := m.refreshInstanceEndpoints(refreshCtx, spec); err != nil {
+		logf(m.log, "AIFAR runtime partial restart endpoint refresh failed: %v\n", err)
+	}
+	for _, deployment := range spec.Deployments {
+		status := "pending"
+		if deployment.Replicas <= 0 {
+			status = "offline"
+		}
+		m.setDeploymentStatusFromDocker(refreshCtx, spec, deployment, status, "")
+		m.mu.Lock()
+		key := endpointKey(spec.InstanceID, deployment.ServiceName)
+		current := m.deployments[key]
+		if current.LastError == "" {
+			current.Status = status
+			m.deployments[key] = current
+		}
+		m.mu.Unlock()
+	}
 }
 
 func (m *Manager) setDeploymentRestartPhase(spec RuntimeSpec, deployment DeploymentSpec, status string) {
