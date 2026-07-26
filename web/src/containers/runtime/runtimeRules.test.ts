@@ -48,6 +48,7 @@ import {
   findSelectedRuntimeInstance,
   resolveRuntimeAppInstance,
   runtimeDiscoveryTarget,
+  summarizeRuntimeRestartScope,
   runtimeServiceForDeployment
 } from './selectors'
 import type {
@@ -444,6 +445,15 @@ describe('runtime selectors', () => {
     expect(filterRuntimePodsByInstance(pods, 'instance-1')).toEqual([pods[0], pods[1]])
     expect(findRuntimeIngressByInstance(ingress, 'instance-2')).toBe(ingress[1])
     expect(findRuntimeIngressByInstance(ingress, 'missing')).toBeNull()
+  })
+
+  it('summarizes only enabled deployments for restart all', () => {
+    expect(summarizeRuntimeRestartScope([
+      deployment({ serviceName: 'gateway', desiredReplicas: 2 }),
+      deployment({ serviceName: 'message', desiredReplicas: 0 }),
+      deployment({ serviceName: 'contacts', desiredReplicas: 3 }),
+      deployment({ serviceName: 'meeting', desiredReplicas: -1 })
+    ])).toEqual({ services: 2, replicas: 5 })
   })
 
   it('maps services by name using the last duplicate and resolves discovery targets', () => {

@@ -22,6 +22,13 @@
         <el-tooltip :content="aifarRuntimeActionDisabledReason" :disabled="!aifarRuntimeActionDisabledReason" placement="top">
           <span><el-button size="small" :disabled="Boolean(aifarRuntimeActionDisabledReason)" @click="reconcileAifarRuntime">{{ t('containers.reconcileRuntime') }}</el-button></span>
         </el-tooltip>
+        <el-tooltip :content="runtimeRestartDisabledReason" :disabled="!runtimeRestartDisabledReason" placement="top">
+          <span>
+            <el-button size="small" type="warning" plain :loading="runtimeRestartSubmitting" :disabled="Boolean(runtimeRestartDisabledReason)" @click="restartAllAifarRuntime">
+              {{ t('containers.restartAllRuntime') }}
+            </el-button>
+          </span>
+        </el-tooltip>
         <el-tooltip :content="runtimeCleanupDisabledReason" :disabled="!runtimeCleanupDisabledReason" placement="top">
           <span><el-button size="small" type="warning" plain :disabled="Boolean(runtimeCleanupDisabledReason)" @click="cleanupAifarRuntimeStale">{{ t('containers.cleanupStaleRuntime') }}</el-button></span>
         </el-tooltip>
@@ -94,6 +101,9 @@ const {
   openServiceInstallDialog,
   openAifarRuntimeBundleUpdate,
   reconcileAifarRuntime,
+  runtimeRestartDisabledReason,
+  runtimeRestartSubmitting,
+  restartAllAifarRuntime,
   runtimeCleanupDisabledReason,
   cleanupAifarRuntimeStale,
   loadAifarRuntime,

@@ -61,6 +61,15 @@ export function reconcileRuntime(query: string, instanceId: string) {
   return apiPost<RuntimeTaskResponse>(`/containers/aifar/runtime/reconcile?${query}`, { instanceId })
 }
 
+export function restartAllRuntime(query: string, instanceId: string, reason = '') {
+  const payload: { instanceId: string; reason?: string } = { instanceId }
+  const normalizedReason = reason.trim()
+  if (normalizedReason) {
+    payload.reason = normalizedReason
+  }
+  return apiPost<RuntimeTaskResponse>(`/containers/aifar/runtime/restart-all?${query}`, payload)
+}
+
 export function cleanupStaleRuntime(query: string, instanceId: string) {
   return apiPost<RuntimeTaskResponse>(`/containers/aifar/runtime/cleanup-stale?${query}`, { instanceId })
 }

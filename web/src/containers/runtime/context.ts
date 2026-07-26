@@ -54,6 +54,9 @@ export type AifarRuntimeContext = {
   openServiceInstallDialog: RuntimeAction
   openAifarRuntimeBundleUpdate: RuntimeAction
   reconcileAifarRuntime: RuntimeAction
+  runtimeRestartDisabledReason: ComputedRef<string>
+  runtimeRestartSubmitting: Ref<boolean>
+  restartAllAifarRuntime: RuntimeAction
   runtimeCleanupDisabledReason: ComputedRef<string>
   cleanupAifarRuntimeStale: RuntimeAction
   loadAifarRuntime: (force?: boolean, includePods?: boolean, includeStats?: boolean) => Promise<void>

@@ -65,6 +65,17 @@ export function filterRuntimeDeploymentsByInstance(deployments: AifarRuntimeDepl
   return deployments.filter((item) => item.instanceId === instanceId)
 }
 
+export function summarizeRuntimeRestartScope(deployments: AifarRuntimeDeployment[]) {
+  return deployments.reduce((scope, deployment) => {
+    const replicas = Math.max(0, Number(deployment.desiredReplicas) || 0)
+    if (replicas > 0) {
+      scope.services += 1
+      scope.replicas += replicas
+    }
+    return scope
+  }, { services: 0, replicas: 0 })
+}
+
 export function filterRuntimePodsByInstance(pods: AifarRuntimePod[], instanceId?: string) {
   return pods.filter((item) => item.instanceId === instanceId)
 }

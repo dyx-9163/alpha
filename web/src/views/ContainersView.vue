@@ -178,6 +178,7 @@ import {
   installRuntimeServices,
   offlineRuntimeService,
   reconcileRuntime,
+  restartAllRuntime,
   rollbackAifarRelease as rollbackAifarReleaseRequest,
   scaleInRuntimeService,
   scaleOutRuntimeService,
@@ -229,6 +230,7 @@ import {
   findSelectedRuntimeInstance,
   resolveRuntimeAppInstance,
   runtimeDiscoveryTarget,
+  summarizeRuntimeRestartScope,
   runtimeServiceForDeployment as resolveRuntimeServiceForDeployment,
   type RuntimeAppInstance
 } from '../containers/runtime/selectors'
@@ -311,6 +313,7 @@ let runtimeLogSequence = 0
 const runtimeLogParseContexts = new Map<string, RuntimeLogParseContext>()
 const runtimeConfigVisible = ref(false)
 const runtimeConfigSubmitting = ref(false)
+const runtimeRestartSubmitting = ref(false)
 const runtimeConfigForm = ref<RuntimeConfigFormValues>({
   appCPUs: '2.0',
   appMemoryLimit: '2GB',
@@ -387,6 +390,7 @@ const selectedRuntimeConfig = computed(() => selectedRuntimeInstance.value?.runt
 const selectedRuntimeAppInstance = computed(() => resolveRuntimeAppInstance(selectedRuntimeInstance.value, appInstances.value, selectedServerId.value))
 const selectedRuntimeServices = computed(() => filterRuntimeServicesByInstance(asArray<AifarRuntimeService>(aifarRuntime.value.services), selectedRuntimeInstance.value?.id))
 const selectedRuntimeDeployments = computed(() => filterRuntimeDeploymentsByInstance(asArray<AifarRuntimeDeployment>(aifarRuntime.value.deployments), selectedRuntimeInstance.value?.id))
+const runtimeRestartScope = computed(() => summarizeRuntimeRestartScope(selectedRuntimeDeployments.value))
 const selectedRuntimePodsRaw = computed(() => filterRuntimePodsByInstance(asArray<AifarRuntimePod>(aifarRuntime.value.pods), selectedRuntimeInstance.value?.id))
 const selectedRuntimePods = computed(() => {
   const service = String(runtimePodServiceFilter.value || '').trim()
@@ -473,10 +477,18 @@ const runtimeInstanceManageDisabledReason = computed(() => {
   if (selectedRuntimeInstance.value.legacy) return t('containers.legacyRuntimeDisabled')
   return ''
 })
+const runtimeMutationBusy = computed(() => runtimeRestartSubmitting.value || runtimeConfigSubmitting.value || serviceInstallSubmitting.value || aifarUpdateSubmitting.value)
 const aifarRuntimeActionDisabledReason = computed(() => {
   if (runtimeInstanceManageDisabledReason.value) return runtimeInstanceManageDisabledReason.value
+  if (runtimeMutationBusy.value) return t('containers.runtimeMutationInProgress')
   if (String(aifarRuntime.value.runtimeStatus || '').trim() !== 'ready') return t('containers.runtimeDegradedDisabled')
   if (String(aifarRuntime.value.agent?.status || '').trim() !== 'running') return t('containers.agentUnavailableDisabled')
+  return ''
+})
+const runtimeRestartDisabledReason = computed(() => {
+  if (aifarRuntimeActionDisabledReason.value) return aifarRuntimeActionDisabledReason.value
+  if (!asArray<string>(aifarRuntime.value.agent?.features).includes('restart-runtime')) return t('containers.agentRestartUnsupported')
+  if (!runtimeRestartScope.value.services) return t('containers.noEnabledRuntimeServices')
   return ''
 })
 const runtimeCleanupDisabledReason = computed(() => {
@@ -1347,6 +1359,52 @@ async function reconcileAifarRuntime() {
   await submitRuntimeReconcile('containers.reconcileRuntime', 'containers.confirmReconcileRuntime')
 }
 
+async function restartAllAifarRuntime() {
+  const disabledReason = runtimeRestartDisabledReason.value
+  if (disabledReason) {
+    ElMessage.warning(disabledReason)
+    return
+  }
+  const instanceId = selectedRuntimeInstance.value?.id
+  if (!instanceId) {
+    ElMessage.warning(t('containers.selectAifarInstance'))
+    return
+  }
+  try {
+    await ElMessageBox.confirm(
+      t('containers.confirmRestartAllRuntime', {
+        services: runtimeRestartScope.value.services,
+        replicas: runtimeRestartScope.value.replicas
+      }),
+      t('containers.restartAllRuntime'),
+      {
+        type: 'warning',
+        confirmButtonText: t('containers.restartAllRuntime'),
+        cancelButtonText: t('common.cancel')
+      }
+    )
+  } catch {
+    return
+  }
+  const query = targetQuery()
+  if (!query) {
+    ElMessage.warning(t('containers.selectDockerHost'))
+    return
+  }
+  runtimeRestartSubmitting.value = true
+  try {
+    const result = await restartAllRuntime(query, instanceId, t('containers.restartAllRuntimeReason'))
+    ElMessage.success(t('containers.restartAllRuntimeAccepted'))
+    trackTask(result.taskId, t('containers.restartAllRuntime'))
+    runtimeCache.value = {}
+    void loadAifarRuntime(true)
+  } catch (err) {
+    ElMessage.error(err instanceof Error ? err.message : t('containers.runtimeActionFailed'))
+  } finally {
+    runtimeRestartSubmitting.value = false
+  }
+}
+
 async function recoverAifarRuntimePods() {
   await submitRuntimeReconcile('containers.recoverRuntimePods', 'containers.confirmRecoverRuntimePods')
 }
@@ -1608,6 +1666,9 @@ useAifarRuntimeProvider({
   openServiceInstallDialog,
   openAifarRuntimeBundleUpdate,
   reconcileAifarRuntime,
+  runtimeRestartDisabledReason,
+  runtimeRestartSubmitting,
+  restartAllAifarRuntime,
   runtimeCleanupDisabledReason,
   cleanupAifarRuntimeStale,
   loadAifarRuntime,

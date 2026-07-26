@@ -31,6 +31,7 @@ import {
   installRuntimeServices,
   offlineRuntimeService,
   reconcileRuntime,
+  restartAllRuntime,
   rollbackAifarRelease,
   scaleInRuntimeService,
   scaleOutRuntimeService,
@@ -142,6 +143,16 @@ describe('AIFAR Runtime API service', () => {
 
     await expect(operation('serverId=server-1', 'instance-1')).resolves.toEqual({ taskId: 'task-runtime' })
     expect(apiPostMock).toHaveBeenCalledWith(endpoint, { instanceId: 'instance-1' })
+  })
+
+  it('posts restart all for only the selected runtime instance', async () => {
+    apiPostMock.mockResolvedValueOnce({ taskId: 'task-restart-all' })
+
+    await expect(restartAllRuntime('serverId=server-1', 'instance-1', ' load edited env ')).resolves.toEqual({ taskId: 'task-restart-all' })
+    expect(apiPostMock).toHaveBeenCalledWith('/containers/aifar/runtime/restart-all?serverId=server-1', {
+      instanceId: 'instance-1',
+      reason: 'load edited env'
+    })
   })
 
   it('installs the selected runtime services', async () => {
