@@ -23,7 +23,7 @@ import (
 	"aifar-deployment/backend/internal/store"
 )
 
-//go:embed templates/install.sh templates/uninstall.sh templates/update-artifact.sh templates/update-artifact-bundle.sh templates/rollback-artifact.sh templates/autoscale-out.sh templates/runtime-config.sh templates/service-install.sh templates/runtime-reconcile.sh templates/scale-service.sh
+//go:embed templates/install.sh templates/uninstall.sh templates/update-artifact.sh templates/update-artifact-bundle.sh templates/rollback-artifact.sh templates/autoscale-out.sh templates/runtime-config.sh templates/service-install.sh templates/runtime-reconcile.sh templates/runtime-restart.sh templates/scale-service.sh
 var templateFS embed.FS
 
 type Logger = installerkit.Logger
@@ -164,6 +164,15 @@ type InstallServicesRequest struct {
 }
 
 type RuntimeReconcileRequest struct {
+	Instance store.AppInstance
+	Server   store.Server
+	Language string
+	Actor    string
+	TaskID   string
+	Reason   string
+}
+
+type RuntimeRestartRequest struct {
 	Instance store.AppInstance
 	Server   store.Server
 	Language string

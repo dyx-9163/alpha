@@ -443,6 +443,19 @@ func (m Module) ReconcileRuntime(ctx context.Context, req registry.RuntimeReconc
 	})
 }
 
+func (m Module) RestartRuntime(ctx context.Context, req registry.RuntimeRestartRequest, run registry.RunContext) error {
+	return m.service.RestartRuntime(ctx, RuntimeRestartRequest{
+		Instance: req.Instance,
+		Server:   req.Server,
+		Language: req.Language,
+		Actor:    req.Actor,
+		TaskID:   run.TaskID,
+		Reason:   req.Reason,
+	}, run.Log, func(target string) Logger {
+		return run.LoggerForTarget(target)
+	})
+}
+
 func (m Module) ValidateRuntimeConfig(ctx context.Context, req registry.RuntimeConfigRequest) error {
 	return m.service.ValidateRuntimeConfig(ctx, RuntimeConfigRequest{
 		Instance: req.Instance,

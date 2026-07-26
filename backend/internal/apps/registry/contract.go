@@ -277,6 +277,14 @@ type RuntimeReconcileRequest struct {
 	Reason   string
 }
 
+type RuntimeRestartRequest struct {
+	Instance store.AppInstance
+	Server   store.Server
+	Language string
+	Actor    string
+	Reason   string
+}
+
 type RuntimeConfigValues struct {
 	AppCPUs                 string  `json:"appCPUs,omitempty"`
 	AppMemoryLimit          string  `json:"appMemoryLimit,omitempty"`
@@ -410,6 +418,10 @@ type ServiceInstallModule interface {
 
 type RuntimeReconcileModule interface {
 	ReconcileRuntime(ctx context.Context, req RuntimeReconcileRequest, run RunContext) error
+}
+
+type RuntimeRestartModule interface {
+	RestartRuntime(ctx context.Context, req RuntimeRestartRequest, run RunContext) error
 }
 
 type RuntimeConfigModule interface {

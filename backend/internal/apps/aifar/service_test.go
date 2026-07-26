@@ -470,6 +470,7 @@ type fakeRemote struct {
 	serviceInstallScript    string
 	scaleServiceScript      string
 	runtimeReconcileScript  string
+	runtimeRestartScript    string
 	runtimePodScanStdout    string
 	runtimeAgentUninstall   string
 	runtimeAgentCheckStdout string
@@ -514,6 +515,9 @@ func (f *fakeRemote) Run(ctx context.Context, server store.Server, command strin
 	}
 	if strings.Contains(command, "AIFAR_RUNTIME_RECONCILE") {
 		f.runtimeReconcileScript = command
+	}
+	if strings.Contains(command, "AIFAR_RUNTIME_RESTART") {
+		f.runtimeRestartScript = command
 	}
 	if strings.Contains(command, "AIFAR_RUNTIME_POD_SCAN") {
 		return adapter.CommandResult{Stdout: f.runtimePodScanStdout}, nil
@@ -1838,6 +1842,75 @@ func TestServiceRuntimeReconcileRepairsNacosProxyRegistration(t *testing.T) {
 	}
 	if strings.Contains(remote.runtimeReconcileScript, "register_nacos_proxy") || strings.Contains(remote.runtimeReconcileScript, "ephemeral=false") {
 		t.Fatalf("runtime reconcile script should leave Nacos registration to aifar-agent:\n%s", remote.runtimeReconcileScript)
+	}
+}
+
+func TestModuleRestartRuntimeInvokesAgentWithPersistedSpecAndReleasesLock(t *testing.T) {
+	instance := installedAIFARInstance(t)
+	s := &fakeStore{
+		servers: map[string]store.Server{
+			"srv-1": {ID: "srv-1", Name: "app-1", Host: "10.0.0.10", DeployDir: "/aifar/apps"},
+		},
+		instances: []store.AppInstance{instance},
+	}
+	remote := &fakeRemote{}
+	module := NewModule(s, remote)
+	err := module.RestartRuntime(context.Background(), registry.RuntimeRestartRequest{
+		Instance: instance,
+		Server:   s.servers["srv-1"],
+		Language: "en",
+		Actor:    "operator",
+		Reason:   "load edited env files",
+	}, registry.RunContext{TaskID: "task-restart", Log: fakeLogger{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		`AIFAR_RUNTIME_RESTART`,
+		`INSTALL_ROOT='/aifar/apps/admin'`,
+		`SPEC_PATH='/aifar/apps/admin/runtime/agent/runtime-spec.json'`,
+		`[ -d "$ENV_DIR" ]`,
+		`aifar-agent restart-runtime --spec "$SPEC_PATH"`,
+	} {
+		if !strings.Contains(remote.runtimeRestartScript, want) {
+			t.Fatalf("runtime restart script should contain %q:\n%s", want, remote.runtimeRestartScript)
+		}
+	}
+	current, err := s.GetAppInstance(instance.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, locked := metadataFromInstance(current)["orchestrationLock"]; locked {
+		t.Fatalf("runtime restart should release orchestration lock: %s", current.Metadata)
+	}
+}
+
+func TestServiceRestartRuntimeReleasesLockWhenRemoteExecutionFails(t *testing.T) {
+	instance := installedAIFARInstance(t)
+	s := &fakeStore{
+		servers: map[string]store.Server{
+			"srv-1": {ID: "srv-1", Name: "app-1", Host: "10.0.0.10", DeployDir: "/aifar/apps"},
+		},
+		instances: []store.AppInstance{instance},
+	}
+	remote := &fakeRemote{failCommandContains: "AIFAR_RUNTIME_RESTART"}
+	service := NewService(s, remote)
+	err := service.RestartRuntime(context.Background(), RuntimeRestartRequest{
+		Instance: instance,
+		Server:   s.servers["srv-1"],
+		Language: "en",
+		Actor:    "operator",
+		TaskID:   "task-restart",
+	}, fakeLogger{}, nil)
+	if err == nil {
+		t.Fatal("expected remote restart failure")
+	}
+	current, getErr := s.GetAppInstance(instance.ID)
+	if getErr != nil {
+		t.Fatal(getErr)
+	}
+	if _, locked := metadataFromInstance(current)["orchestrationLock"]; locked {
+		t.Fatalf("failed runtime restart should release orchestration lock: %s", current.Metadata)
 	}
 }
 
