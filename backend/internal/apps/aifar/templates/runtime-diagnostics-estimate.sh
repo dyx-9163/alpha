@@ -16,20 +16,37 @@ container_total=0
 for service in $SERVICES; do
   file_bytes=0
   if [ -d "$LOG_ROOT/$service" ]; then
-    for file_size in $(find "$LOG_ROOT/$service" -xdev -type f -newermt "@$SINCE_UNIX" ! -newermt "@$UNTIL_UNIX" -printf '%s\n'); do
+    if ! file_sizes=$(find "$LOG_ROOT/$service" -xdev -type f -newermt "@$SINCE_UNIX" ! -newermt "@$UNTIL_UNIX" -printf '%s\n'); then
+      exit 21
+    fi
+    for file_size in $file_sizes; do
+      case "$file_size" in
+        ''|*[!0-9]*) exit 21 ;;
+      esac
       file_bytes=$((file_bytes + file_size))
     done
   fi
 
   container_bytes=0
   conservative=0
-  for container_id in $(docker ps -aq --filter "label=aifar.instance=$INSTANCE_ID" --filter "label=aifar.service=$service"); do
-    log_path=$(docker inspect --format='{{"{{.LogPath}}"}}' "$container_id" 2>/dev/null || true)
-    if [ -n "$log_path" ] && [ -f "$log_path" ]; then
-      log_size=$(stat -c '%s' -- "$log_path")
-      container_bytes=$((container_bytes + log_size))
-      conservative=1
+  if ! container_ids=$(docker ps -aq --filter "label=aifar.instance=$INSTANCE_ID" --filter "label=aifar.service=$service"); then
+    exit 22
+  fi
+  for container_id in $container_ids; do
+    if ! log_path=$(docker inspect --format='{{"{{.LogPath}}"}}' "$container_id"); then
+      exit 23
     fi
+    if [ -z "$log_path" ] || [ ! -f "$log_path" ]; then
+      exit 23
+    fi
+    if ! log_size=$(stat -c '%s' -- "$log_path"); then
+      exit 24
+    fi
+    case "$log_size" in
+      ''|*[!0-9]*) exit 24 ;;
+    esac
+    container_bytes=$((container_bytes + log_size))
+    conservative=1
   done
 
   file_total=$((file_total + file_bytes))

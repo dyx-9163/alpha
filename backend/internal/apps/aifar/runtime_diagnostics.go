@@ -7,6 +7,7 @@ import (
 	"path"
 	"strings"
 	"time"
+	"unicode"
 
 	"aifar-deployment/backend/internal/apps/registry"
 	"aifar-deployment/backend/internal/i18n"
@@ -74,6 +75,9 @@ func validateRuntimeDiagnosticEstimateRequest(req RuntimeDiagnosticRequest, diag
 	if strings.TrimSpace(req.Instance.ID) == "" || strings.TrimSpace(req.Server.ID) == "" || req.Instance.ServerID != req.Server.ID {
 		return "", nil, errors.New(i18n.Text(req.Language, "aifar.diag.serverMismatch"))
 	}
+	if containsRuntimeDiagnosticControl(req.Instance.ID) {
+		return "", nil, errors.New(i18n.Text(req.Language, "aifar.diag.inputUnsafe"))
+	}
 	if req.SinceAt.IsZero() || req.UntilAt.IsZero() || !req.SinceAt.Before(req.UntilAt) {
 		return "", nil, errors.New(i18n.Text(req.Language, "aifar.diag.windowInvalid"))
 	}
@@ -90,6 +94,9 @@ func validateRuntimeDiagnosticEstimateRequest(req RuntimeDiagnosticRequest, diag
 	installRoot := stringFromMetadata(metadata, "installRoot", "")
 	if strings.TrimSpace(installRoot) == "" || !strings.HasPrefix(path.Clean(installRoot), "/") || path.Clean(installRoot) == "/" {
 		return "", nil, errors.New(i18n.Text(req.Language, "aifar.diag.installRootMissing"))
+	}
+	if containsRuntimeDiagnosticControl(installRoot) {
+		return "", nil, errors.New(i18n.Text(req.Language, "aifar.diag.inputUnsafe"))
 	}
 	deployments, err := diagnostics.ListAIFARDeployments(req.Instance.ID)
 	if err != nil {
@@ -114,6 +121,15 @@ func validateRuntimeDiagnosticEstimateRequest(req RuntimeDiagnosticRequest, diag
 		services = append(services, service)
 	}
 	return path.Clean(installRoot), services, nil
+}
+
+func containsRuntimeDiagnosticControl(value string) bool {
+	for _, r := range value {
+		if unicode.IsControl(r) {
+			return true
+		}
+	}
+	return false
 }
 
 func renderRuntimeDiagnosticEstimateScript(data runtimeDiagnosticEstimateScriptData) (string, error) {

@@ -107,12 +107,40 @@ func parseRuntimeDiagnosticEstimate(raw string, expectedSelections ...[]string) 
 	if fileSum != result.FileBytes || containerSum != result.ContainerBytes || result.TotalBytes != result.FileBytes+result.ContainerBytes {
 		return result, fmt.Errorf("runtime diagnostic estimate totals are inconsistent")
 	}
+	requiredBytes, err := runtimeDiagnosticRequiredBytes(result.TotalBytes)
+	if err != nil {
+		return result, err
+	}
+	if result.RequiredBytes != requiredBytes {
+		return result, fmt.Errorf("runtime diagnostic required bytes are inconsistent")
+	}
+	result.RequiredBytes = requiredBytes
 	for service := range expected {
 		if !seenServices[service] {
 			return result, fmt.Errorf("runtime diagnostic estimate is missing service %q", service)
 		}
 	}
 	return result, nil
+}
+
+func runtimeDiagnosticRequiredBytes(totalBytes int64) (int64, error) {
+	if totalBytes < 0 {
+		return 0, fmt.Errorf("runtime diagnostic total bytes must be non-negative")
+	}
+	bufferBytes := totalBytes / 5
+	if bufferBytes < 512*1024*1024 {
+		bufferBytes = 512 * 1024 * 1024
+	}
+	const maxInt64 = int64(^uint64(0) >> 1)
+	const baseBytes = int64(1024 * 1024 * 1024)
+	if totalBytes > maxInt64-baseBytes {
+		return 0, fmt.Errorf("runtime diagnostic required bytes overflow")
+	}
+	requiredBytes := totalBytes + baseBytes
+	if requiredBytes > maxInt64-bufferBytes {
+		return 0, fmt.Errorf("runtime diagnostic required bytes overflow")
+	}
+	return requiredBytes + bufferBytes, nil
 }
 
 func parseRuntimeDiagnosticBytes(value string) (int64, error) {

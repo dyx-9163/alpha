@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -98,7 +99,7 @@ func TestEstimateRuntimeDiagnosticsRendersTrustedSelectionAndComputesAllowed(t *
 	}}}
 	remote := &runtimeDiagnosticRemote{stdout: strings.Join([]string{
 		"AIFAR_DIAG_SERVICE\tgateway\t100\t200",
-		"AIFAR_DIAG_TOTAL\t100\t200\t300\t9000000000\t1073742524",
+		"AIFAR_DIAG_TOTAL\t100\t200\t300\t9000000000\t1610613036",
 		"AIFAR_DIAG_WARNING\tdocker-log-conservative\tgateway",
 	}, "\n")}
 
@@ -122,6 +123,78 @@ func TestEstimateRuntimeDiagnosticsRendersTrustedSelectionAndComputesAllowed(t *
 	} {
 		if !strings.Contains(remote.command, want) {
 			t.Fatalf("rendered estimate command must quote trusted field %q:\n%s", want, remote.command)
+		}
+	}
+}
+
+func TestRuntimeDiagnosticEstimateRejectsHeredocDelimiterInjectionBeforeRemoteRun(t *testing.T) {
+	now := time.Now().UTC()
+	base := store.AppInstance{
+		ID:       "instance-1",
+		App:      AppName,
+		ServerID: "server-1",
+		Metadata: `{"orchestrationModel":"agent-runtime-v2","installRoot":"/aifar/apps/admin"}`,
+	}
+	tests := map[string]func(*store.AppInstance){
+		"instance id": func(instance *store.AppInstance) {
+			instance.ID = "instance-1\nAIFAR_RUNTIME_DIAGNOSTIC_ESTIMATE\nprintf pwned"
+		},
+		"install root": func(instance *store.AppInstance) {
+			instance.Metadata = `{"orchestrationModel":"agent-runtime-v2","installRoot":"/aifar/apps/admin\nAIFAR_RUNTIME_DIAGNOSTIC_ESTIMATE\nprintf pwned"}`
+		},
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			instance := base
+			mutate(&instance)
+			db := &runtimeDiagnosticStore{fakeStore: &fakeStore{deployments: []store.AIFARDeployment{
+				{InstanceID: instance.ID, ServiceName: "gateway", DesiredReplicas: 1},
+			}}}
+			remote := &runtimeDiagnosticRemote{}
+			_, err := NewService(db, remote).EstimateRuntimeDiagnostics(context.Background(), RuntimeDiagnosticRequest{
+				Instance: instance,
+				Server:   store.Server{ID: "server-1"},
+				Services: []string{"gateway"},
+				SinceAt:  now.Add(-time.Hour),
+				UntilAt:  now.Add(-time.Minute),
+			}, nil)
+			if err == nil {
+				t.Fatal("expected control-character injection to be rejected")
+			}
+			if remote.calls != 0 {
+				t.Fatalf("unsafe heredoc input reached remote execution: calls=%d", remote.calls)
+			}
+		})
+	}
+}
+
+func TestRuntimeDiagnosticEstimateScriptFailsClosedOnCandidateDiscovery(t *testing.T) {
+	script, err := renderRuntimeDiagnosticEstimateScript(runtimeDiagnosticEstimateScriptData{
+		InstallRoot: "'/aifar/apps/admin'",
+		InstanceID:  "'instance-1'",
+		Services:    "'gateway'",
+		SinceUnix:   "'1'",
+		UntilUnix:   "'2'",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, forbidden := range []string{
+		"for file_size in $(find",
+		"for container_id in $(docker ps",
+		"docker inspect --format='{{.LogPath}}' \"$container_id\" 2>/dev/null || true",
+	} {
+		if strings.Contains(script, forbidden) {
+			t.Fatalf("estimate script must not swallow candidate discovery failure with %q:\n%s", forbidden, script)
+		}
+	}
+	for _, required := range []string{
+		"if ! file_sizes=$(find",
+		"if ! container_ids=$(docker ps",
+		"if ! log_path=$(docker inspect --format='{{.LogPath}}'",
+	} {
+		if !strings.Contains(script, required) {
+			t.Fatalf("estimate script must explicitly fail closed around %q:\n%s", required, script)
 		}
 	}
 }
@@ -184,7 +257,7 @@ func TestParseRuntimeDiagnosticEstimate(t *testing.T) {
 	raw := strings.Join([]string{
 		"AIFAR_DIAG_SERVICE\tgateway\t100\t200",
 		"AIFAR_DIAG_SERVICE\toauth\t50\t0",
-		"AIFAR_DIAG_TOTAL\t150\t200\t350\t9000000000\t1073742524",
+		"AIFAR_DIAG_TOTAL\t150\t200\t350\t9000000000\t1610613086",
 		"AIFAR_DIAG_WARNING\tdocker-log-conservative\tgateway",
 	}, "\n")
 	got, err := parseRuntimeDiagnosticEstimate(raw)
@@ -193,6 +266,27 @@ func TestParseRuntimeDiagnosticEstimate(t *testing.T) {
 	}
 	if got.TotalBytes != 350 || got.AvailableBytes != 9000000000 || len(got.Services) != 2 {
 		t.Fatalf("unexpected estimate: %+v", got)
+	}
+}
+
+func TestParseRuntimeDiagnosticEstimateRejectsRequiredBytesMismatchAndOverflow(t *testing.T) {
+	maxInt64 := strconv.FormatInt(1<<63-1, 10)
+	tests := map[string]string{
+		"required bytes mismatch": strings.Join([]string{
+			"AIFAR_DIAG_SERVICE\tgateway\t100\t200",
+			"AIFAR_DIAG_TOTAL\t100\t200\t300\t9000000000\t300",
+		}, "\n"),
+		"required bytes overflow": strings.Join([]string{
+			"AIFAR_DIAG_SERVICE\tgateway\t" + maxInt64 + "\t0",
+			"AIFAR_DIAG_TOTAL\t" + maxInt64 + "\t0\t" + maxInt64 + "\t" + maxInt64 + "\t" + maxInt64,
+		}, "\n"),
+	}
+	for name, raw := range tests {
+		t.Run(name, func(t *testing.T) {
+			if _, err := parseRuntimeDiagnosticEstimate(raw); err == nil {
+				t.Fatal("expected invalid required byte estimate to be rejected")
+			}
+		})
 	}
 }
 
