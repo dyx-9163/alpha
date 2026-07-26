@@ -846,9 +846,107 @@ func TestAIFARRuntimeCleanupAndAgentUninstallStartTasksWithoutAgent(t *testing.T
 	}
 }
 
+func TestAIFARRuntimeRestartAllCreatesPlannedTaskForSelectedInstance(t *testing.T) {
+	api, db, secret := newAuthzTestAPI(t)
+	module := &fakeAIFARRuntimeActionModule{}
+	api.apps = registry.New(module)
+	api.aifarAgentStatus = func(context.Context, store.Server) aifarRuntimeAgent {
+		return aifarRuntimeAgent{Status: "running", Features: []string{"restart-runtime"}}
+	}
+	dockerAPI := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer dockerAPI.Close()
+	server, instance := seedAIFARRuntimeFixture(t, db, dockerAPI.URL)
+	token := issueTestToken(t, db, secret, "owner", "owner")
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v2/containers/aifar/runtime/restart-all?serverId="+server.ID, strings.NewReader(`{"instanceId":"`+instance.ID+`","reason":"load new env"}`))
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	api.Router().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	taskID := decodeTaskID(t, rec)
+	task, _, err := db.GetTask(taskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.Type != "aifar.runtime.restart-all" || task.Target != instance.ID {
+		t.Fatalf("unexpected restart task: %+v", task)
+	}
+	steps, err := db.ListTaskSteps(taskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantSteps := []string{"load-instance", "preflight-runtime", "rolling-restart", "verify-runtime"}
+	if len(steps) != len(wantSteps) {
+		t.Fatalf("expected %d steps, got %+v", len(wantSteps), steps)
+	}
+	for index, want := range wantSteps {
+		if steps[index].Name != want || steps[index].Target != server.ID {
+			t.Fatalf("unexpected step %d: %+v", index, steps[index])
+		}
+	}
+	targets, err := db.ListTaskTargets(taskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(targets) != 1 || targets[0].Target != server.ID {
+		t.Fatalf("restart must target only selected instance server: %+v", targets)
+	}
+	waitForTaskStatus(t, db, taskID, "success")
+	if module.restartCalls != 1 || module.restartRequest.Instance.ID != instance.ID || module.restartRequest.Reason != "load new env" {
+		t.Fatalf("unexpected restart module call: calls=%d request=%+v", module.restartCalls, module.restartRequest)
+	}
+	assertAuditExists(t, db, "containers.aifar.runtime.restart-all", "running", "owner", instance.ID)
+}
+
+func TestAIFARRuntimeRestartAllRequiresRunningAgent(t *testing.T) {
+	api, db, secret := newAuthzTestAPI(t)
+	api.apps = registry.New(&fakeAIFARRuntimeActionModule{})
+	dockerAPI := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) }))
+	defer dockerAPI.Close()
+	server, instance := seedAIFARRuntimeFixture(t, db, dockerAPI.URL)
+	token := issueTestToken(t, db, secret, "owner", "owner")
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v2/containers/aifar/runtime/restart-all?serverId="+server.ID, strings.NewReader(`{"instanceId":"`+instance.ID+`"}`))
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	api.Router().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), "AIFAR_AGENT_REQUIRED") {
+		t.Fatalf("expected agent-required conflict, got %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestAIFARRuntimeRestartAllRequiresAppsManagePermission(t *testing.T) {
+	api, db, secret := newAuthzTestAPI(t)
+	dockerAPI := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) }))
+	defer dockerAPI.Close()
+	server, instance := seedAIFARRuntimeFixture(t, db, dockerAPI.URL)
+	token := issueTestToken(t, db, secret, "viewer", "viewer")
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v2/containers/aifar/runtime/restart-all?serverId="+server.ID, strings.NewReader(`{"instanceId":"`+instance.ID+`"}`))
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	api.Router().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
 type fakeAIFARRuntimeActionModule struct {
 	cleanupCalls   int
 	uninstallCalls int
+	restartCalls   int
+	restartRequest registry.RuntimeRestartRequest
+	restartErr     error
 }
 
 func (m *fakeAIFARRuntimeActionModule) Name() string { return "aifar" }
@@ -881,6 +979,12 @@ func (m *fakeAIFARRuntimeActionModule) CleanupRuntimeStalePods(ctx context.Conte
 func (m *fakeAIFARRuntimeActionModule) UninstallRuntimeAgent(ctx context.Context, req registry.RuntimeAgentUninstallRequest, run registry.RunContext) error {
 	m.uninstallCalls++
 	return nil
+}
+
+func (m *fakeAIFARRuntimeActionModule) RestartRuntime(ctx context.Context, req registry.RuntimeRestartRequest, run registry.RunContext) error {
+	m.restartCalls++
+	m.restartRequest = req
+	return m.restartErr
 }
 
 func seedAIFARRuntimeFixture(t *testing.T, db *store.Store, dockerHost string) (store.Server, store.AppInstance) {

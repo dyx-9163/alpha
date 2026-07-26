@@ -242,6 +242,15 @@ func aifarRuntimeCleanupSteps() []simpleTaskStep {
 	}
 }
 
+func aifarRuntimeRestartSteps(lang string) []simpleTaskStep {
+	return []simpleTaskStep{
+		{"load-instance", i18n.Text(lang, "aifar.runtimeRestart.stepLoadInstance")},
+		{"preflight-runtime", i18n.Text(lang, "aifar.runtimeRestart.stepPreflight")},
+		{"rolling-restart", i18n.Text(lang, "aifar.runtimeRestart.stepRollingRestart")},
+		{"verify-runtime", i18n.Text(lang, "aifar.runtimeRestart.stepVerify")},
+	}
+}
+
 func aifarRuntimeAgentUninstallSteps() []simpleTaskStep {
 	return []simpleTaskStep{
 		{"validate-agent-uninstall", "validate AIFAR agent uninstall"},
@@ -661,6 +670,68 @@ func (a *aifarRuntimeController) reconcile(w http.ResponseWriter, r *http.Reques
 	}
 	if err == nil {
 		a.audit(r, "aifar.reconcile", instance.ID, "running", task.ID)
+	}
+	respondTask(w, task, err)
+}
+
+func (a *aifarRuntimeController) restartAll(w http.ResponseWriter, r *http.Request) {
+	lang := languageFromRequest(r)
+	req := aifarRuntimeActionRequest{}
+	if r.Body != nil && r.ContentLength != 0 {
+		if !decode(w, r, &req) {
+			return
+		}
+	}
+	server, instance, ok := a.resolveAIFARRuntimeActionTargetForInstanceWithAgent(w, r, req.InstanceID, true)
+	if !ok {
+		return
+	}
+	module, ok := a.apps.Get(instance.App)
+	if !ok {
+		writeError(w, http.StatusNotFound, "APP_BACKEND_MODULE_MISSING", i18n.Text(lang, "api.appBackendMissing"), map[string]any{"app": instance.App})
+		return
+	}
+	restart, ok := module.(registry.RuntimeRestartModule)
+	if !ok {
+		writeError(w, http.StatusConflict, "AIFAR_RUNTIME_RESTART_UNSUPPORTED", i18n.Text(lang, "api.aifarRuntimeRestartUnsupported"), map[string]any{"app": instance.App})
+		return
+	}
+	actor := currentUser(r).Username
+	task, err, started := a.startSimplePlannedTask(w, "aifar.runtime.restart-all", instance.ID, actor, lang, server.ID, aifarRuntimeRestartSteps(lang), func(ctx context.Context, log worker.Logger) error {
+		current, err := a.store.GetAppInstance(instance.ID)
+		if err != nil {
+			return err
+		}
+		server, err := a.store.GetServer(current.ServerID, true)
+		if err != nil {
+			return err
+		}
+		log.Info(i18n.Text(lang, "aifar.runtimeRestart.started"), current.ID)
+		err = restart.RestartRuntime(ctx, registry.RuntimeRestartRequest{
+			Instance: current,
+			Server:   server,
+			Language: lang,
+			Actor:    actor,
+			Reason:   strings.TrimSpace(req.Reason),
+		}, registry.RunContext{
+			TaskID: log.TaskID(),
+			Log:    log,
+			TargetLog: func(target string) registry.Logger {
+				return log.Target(target)
+			},
+		})
+		if err != nil {
+			log.Error(i18n.Text(lang, "aifar.runtimeRestart.failed"), current.ID, err)
+			return err
+		}
+		log.Info(i18n.Text(lang, "aifar.runtimeRestart.completed"), current.ID)
+		return nil
+	})
+	if !started {
+		return
+	}
+	if err == nil {
+		a.audit(r, "containers.aifar.runtime.restart-all", instance.ID, "running", task.ID)
 	}
 	respondTask(w, task, err)
 }
@@ -1404,6 +1475,9 @@ func (a *API) appendAIFARInstanceRuntime(response *aifarRuntimeResponse, instanc
 }
 
 func (a *API) collectAIFARAgentStatus(ctx context.Context, server store.Server) aifarRuntimeAgent {
+	if a.aifarAgentStatus != nil {
+		return a.aifarAgentStatus(ctx, server)
+	}
 	if strings.TrimSpace(server.Username) == "" || (strings.TrimSpace(server.Password) == "" && strings.TrimSpace(server.PrivateKey) == "") {
 		return aifarRuntimeAgent{Status: "missing", Error: "ssh credential is not available"}
 	}

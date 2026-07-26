@@ -20,6 +20,7 @@ func (a *aifarRuntimeController) mount(r chi.Router) {
 	r.Get("/containers/aifar/runtime/logs/events", a.logEvents)
 	r.Put("/containers/aifar/runtime/config", a.requirePermission(rbac.AppsManage, a.configure))
 	r.Post("/containers/aifar/runtime/reconcile", a.requirePermission(rbac.AppsManage, a.reconcile))
+	r.Post("/containers/aifar/runtime/restart-all", a.requirePermission(rbac.AppsManage, a.restartAll))
 	r.Post("/containers/aifar/runtime/cleanup-stale", a.requirePermission(rbac.AppsManage, a.cleanupStale))
 	r.Post("/containers/aifar/runtime/uninstall-agent", a.requirePermission(rbac.AppsManage, a.uninstallAgent))
 	r.Post("/containers/aifar/services/install", a.requirePermission(rbac.AppsManage, a.installServices))

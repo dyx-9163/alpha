@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"context"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -24,15 +25,16 @@ import (
 )
 
 type API struct {
-	cfg      config.Config
-	store    *store.Store
-	tasks    *worker.Manager
-	realtime *realtime.Hub
-	apps     *registry.Registry
-	servers  serverdomain.Service
-	auth     *security.LoginGuard
-	runtime  *aifarRuntimeController
-	router   chi.Router
+	cfg              config.Config
+	store            *store.Store
+	tasks            *worker.Manager
+	realtime         *realtime.Hub
+	apps             *registry.Registry
+	servers          serverdomain.Service
+	auth             *security.LoginGuard
+	aifarAgentStatus func(context.Context, store.Server) aifarRuntimeAgent
+	runtime          *aifarRuntimeController
+	router           chi.Router
 }
 
 func New(cfg config.Config, s *store.Store, tasks *worker.Manager) *API {
