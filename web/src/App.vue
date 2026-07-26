@@ -27,7 +27,11 @@
         <GlobalAlerts />
         <GlobalRealtimeStatus />
         <div class="content-body">
-          <router-view />
+          <router-view v-slot="{ Component }">
+            <keep-alive include="TerminalView">
+              <component :is="Component" />
+            </keep-alive>
+          </router-view>
         </div>
       </el-main>
     </el-container>
