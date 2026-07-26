@@ -22,6 +22,19 @@
 - 结论：客户 HA 验收的端到端 RTO 目标定为 60 秒以内，计时应覆盖从客户端首次失败到登录、消息收发、历史消息查询等核心业务链路恢复。
 - 结论：客户 HA 验收的 RPO 目标定为已确认成功的数据和消息零丢失；故障瞬间未确认的请求允许客户端重试，并应通过业务唯一标识检查重复与遗漏。
 
+## 2026-07-26
+- 问题：用户询问统一修改 Redis、MySQL、MinIO、Nacos 密码后，如何同步到各配置模块，尤其是 Java 服务的 Nacos 环境变量和 Nacos 内保存的下游连接配置。
+- 结论：当前凭据中心更新只改面板数据库中的加密凭据，不会修改目标服务端密码，也不会自动发布 Nacos 配置；MySQL、Redis、MinIO 连接配置由 Nacos 配置发布链路生成，Java 的 Nacos 登录密码位于 `java-secrets.env`，变更后需要重建或重启相关 Java 容器。后续应采用依赖有序、任务化、可验证和可回滚的凭据轮换编排，避免把“保存新凭据”误当成“轮换已生效”。
+- 结论：用户选择建设“管理面板一键轮换并自动同步、验证、失败回滚”，后续设计应复用 worker/task、审计、凭据版本、Nacos 配置修订和 AIFAR Runtime 调和能力，并先明确允许的业务中断边界。
+- 结论：密码轮换的推荐可用性目标是允许 Java 实例逐个重建/重启、整体业务不中断，而不是要求所有进程零重启；环境变量和连接池对密码变更未必支持可靠热切换。多副本服务可健康门禁后滚动，单副本服务需临时扩为双副本或进入短维护窗口。
+- 结论：用户指出 MySQL、Redis、MinIO、Nacos 服务端密码同时变化仍会中断业务。当前安装模型确实不支持直接无损原地改密：Redis 使用单一 `requirepass/masterauth`，MinIO 使用 root 环境变量，Nacos 使用管理员账号，Nacos 外部库密码写入节点配置。推荐先做一次凭据模型迁移，让业务使用可并存的专用账号/ACL/access key，新旧凭据重叠后再切消费者并注销旧凭据；首次迁移可能需要维护窗口，后续轮换才可实现整体业务不中断。
+- 结论：若用户允许计划内业务中断，推荐首版采用全局维护模式下的原账号原地轮换：先锁定拓扑、验证旧凭据并保存加密快照，再下线全部 Java 服务，按 MySQL及Nacos外部库配置、Redis拓扑、MinIO节点、Nacos账号的依赖顺序改密和验证，随后发布新的 Nacos 配置、原子替换 Java Nacos 密钥文件、恢复 Runtime 并做业务 smoke，最后退出维护模式。失败时保持维护模式并按反向步骤补偿回滚，不能宣称跨服务原子事务。
+- 结论：用户明确密码变更只发生在正式上线前，因此不设业务中断时限。方案可收敛为上线前全栈停机式凭据初始化/重置，不需要为首版引入双账号蓝绿轮换；仍需全局操作锁、加密快照、依赖顺序、逐组件验证和失败补偿，确保最终状态一致后才能标记“可上线”。
+- 结论：用户确认全栈停机式方案，并要求完整中文设计、覆盖集群和明确面板入口。推荐唯一执行入口放在现有“凭据中心”顶部，命名为“上线前全栈改密”，采用向导完成拓扑预检、密码生成/录入、影响确认、任务进度和验收报告；各 MySQL/Redis/MinIO/Nacos 页面只展示凭据状态并跳转到该入口，不重复提供跨服务改密按钮。
+- 结论：用户补充 MySQL、Redis、MinIO连接配置是直接写死在 Nacos配置内容中，并非 Java环境变量。方案需修正为：Java环境变量只同步 Nacos连接凭据；下游三类密码必须读取实际 namespace/group/Data ID，按明确的 YAML/Properties键路径做结构化局部修改并保存整份旧内容快照，禁止用当前生成器覆盖整份配置或用正则盲替换。后续需确认三类配置位于一个共享 Data ID还是多个服务专属 Data ID。
+- 结论：用户确认三类连接配置分散在多个 Nacos YAML Data ID中。设计需支持一份凭据绑定多个配置引用，以及一个 YAML包含多个凭据引用；建议在 Nacos页面新增“凭据映射”维护入口，记录 namespace、group、Data ID、格式和结构化键选择器，凭据中心的全栈改密向导只在映射覆盖完整后允许执行。
+- 结论：由于多个 Nacos YAML的字段层级也不统一，用户倾向手工修改其中的 MySQL、Redis、MinIO配置，并手工重启 Java。推荐相应缩小自动化边界：面板仅集群感知地修改四类基础服务密码、更新凭据中心、将新 Nacos密码原子同步到所有 AIFAR节点的 `java-secrets.env`，可先自动下线并记录 Java原副本数，但不修改业务 Data ID、不自动恢复 Java；任务成功后进入 `waiting_manual_config`，由用户修改 Nacos YAML并手动恢复 Java，再执行只读验收确认。
+
 ## 2026-07-09
 - 问题：用户询问当前 AIFAR Deployment 的服务升级是怎么做的。
 - 结论：当前代码中通用应用 Docker/MySQL/Redis/MinIO/Nacos 仍以 install/check/delete 为主，没有完整 Update/Rollback 生命周期；已落地的“服务升级”主要是 AIFAR Runtime v2 制品滚动发布，入口在 Containers 的 AIFAR Runtime 页，支持单服务上传 jar/web 包和批量 zip 包，后端走 `/apps/instances/{id}/aifar/update-artifact` 或 `/update-artifact-bundle`，创建 worker task、上传制品和脚本、远端执行 `aifar-agent reconcile-runtime`，再写入 app_instances metadata、aifar 控制面表和 app_releases 发布记录；目前有 release 记录和保留策略，但没有面向服务升级的自动备份/正式回滚 API。
@@ -587,3 +600,87 @@
 - 结论：设计采用 `aifar-bundle-packager-vX.Y.Z` 标签触发 Windows CI，重建带版本与 commit 的 EXE，生成 SHA256 和 release manifest，并创建只含三个资产的 Draft Release；人工完成下载校验、无 .NET Runtime 启动及 Java-only/Web-only/mixed 打包验收后再发布。旧计划用任务级证据矩阵收口，不伪造未持久化的历史 RED 日志。设计文档为 `docs/superpowers/specs/2026-07-24-aifar-bundle-packager-release-closeout-design.md`。
 - 问题：用户确认实施 Bundle Packager 的 GitHub Release 发布闭环和旧计划证据收口，并要求任务成功后关机。
 - 结论：已实现版本与 40 位提交 SHA 注入、事务生成 `AIFARBundlePackager.exe`/`.sha256`/`release-manifest.json`、`aifar-bundle-packager-vX.Y.Z` 标签校验及 Draft-only GitHub Actions，并为两份历史计划补充权威任务证据矩阵。提交依次为 `23f36000`、`3b8661f2`、`f54331ac`、`045de5ee`；最终本地验收 .NET 36/36、工具 25/25、脚本 290/290 通过，版本化 EXE 为 161672360 字节，三个资产、SHA256、manifest、EXE 不入 Git、无超过 100 MB 新 blob 和隐藏 GUI 启动均验证通过。未创建标签、GitHub Release 或 push。
+
+## 2026-07-25
+- 问题：用户询问如何挂载本地镜像源。
+- 结论：当前 Containers 的 Registry 页面只是预留入口，尚不能从面板挂载 Registry；AIFAR 离线镜像通过 `resources/aifar/runtime-v2/images/*.tar` 随资源包上传并执行 `docker load`。若配置 Docker Registry mirror，应修改 AIFAR Docker 实际使用的 `/aifar/apps/docker/daemon/daemon.json`，保留现有 data-root、exec-root、bip 等字段后重启 Docker并验证。
+- 问题：用户澄清“本地镜像源”指 ISO 软件源，而不是 Docker 镜像源。
+- 结论：openEuler/RHEL 可将 ISO 以 loop、只读方式挂载到固定目录，并让 DNF 的 `baseurl=file:///...` 指向实际包含 `repodata/` 的目录；可先用 `--disablerepo='*' --repofrompath` 临时验证，再创建 `.repo` 持久化。当前 Keepalived 离线安装脚本使用服务器当前已启用的 DNF 仓库，不再自行发现或挂载 ISO。
+- 问题：用户询问 ISO 镜像源位于光驱设备时如何挂载。
+- 结论：设备通常是 `/dev/sr0`（不是 `/dev/rsv0`）；先用 `lsblk` 或 `/dev/cdrom` 链接确认介质，再以 `iso9660,ro` 挂载，不使用 loop，DNF baseurl 仍指向挂载后直接包含 `repodata/` 的目录。
+- 问题：用户询问 mount 的 loop 参数作用。
+- 结论：`loop` 将 ISO 等普通文件映射为虚拟块设备后再挂载；直接使用 `/dev/sr0`、分区等现成块设备时不需要 loop。
+- 问题：用户确认光驱设备与拷贝到服务器的离线镜像包是否分别需要 loop。
+- 结论：`/dev/sr0` 等块设备不需要 loop；拷贝到服务器且仍为 `.iso` 普通文件时需要 loop；若介质内容已解压为含 `repodata/` 的普通目录，则无需 mount 和 loop，DNF 可直接使用该目录的 `file://` baseurl。
+- 问题：用户询问什么是块设备。
+- 结论：块设备是内核按固定大小数据块进行随机读写的设备接口，典型如磁盘、分区、光驱和 loop 设备；Linux 通常以 `/dev/sda`、`/dev/nvme0n1`、`/dev/sr0`、`/dev/loop0` 表示，文件系统通常建立或承载在块设备之上。
+- 问题：用户确认能否解开 openEuler ISO，只上传仓库目录到服务器后直接配置本地源。
+- 结论：可以，且无需 loop/mount；必须完整保留每个仓库的 RPM、`repodata/repomd.xml`、相对路径及需要的 GPG key，DNF baseurl 指向直接包含 `repodata/` 的目录。若 ISO 内有多个 repodata 目录，应分别复制并配置多个 repo；仅复制 RPM 时才需重建元数据，不建议丢弃发行版原始元数据。
+- 问题：用户确认 `file://` 是否为文件服务的标准写法。
+- 结论：`file:` 是标准 URI scheme，用于引用本机文件系统而不是网络文件服务；Linux 绝对路径通常写成 `file:///opt/repo`，第三个斜杠属于绝对路径 `/opt/repo`，无需监听端口或启动服务。
+- 问题：用户询问本地 openEuler DNF repo 配置中各字段的含义。
+- 结论：方括号内是唯一 repo ID，name 是展示名，baseurl 指向直接包含 repodata 的仓库根，enabled 控制默认启用，gpgcheck 控制 RPM 包签名校验，metadata_expire 控制元数据缓存有效期；不可变 ISO 可用 `-1`，目录内容变更后需主动 clean/makecache，生产环境优先启用 gpgcheck 并配置实际 GPG key。
+- 问题：用户希望直接执行普通 dnf 命令时默认使用本地 ISO 仓库。
+- 结论：`enabled=1` 只表示本地仓库加入候选，不会自动排除其他仓库；要让普通 `dnf install` 默认且仅使用本地源，必须持久启用本地 repo、按实际 repo ID 禁用所有外部 repo，再清理缓存并用 `dnf repolist --enabled` 验证只剩本地源。不要用优先级代替离线隔离。
+- 问题：用户询问同时启用多个 DNF 镜像源时的行为和配置方式。
+- 结论：DNF 会加载所有 enabled 仓库并跨仓库解析依赖；候选冲突时较小的 priority 值优先，priority 相同时较小的 cost 值优先。严格离线应禁用外部源；本地优先、网络兜底可设置 priority/cost 和 skip_if_unavailable，但本地较高优先级可能压住网络源中的较新安全更新，需按更新策略决定。
+- 问题：用户确认只启用本地仓库时普通 dnf 是否默认使用它。
+- 结论：是；以 `dnf repolist --enabled` 只显示目标本地 repo 为准，普通 `dnf install/update` 将只从该源解析。仓库必须可读且包含有效 repodata，缺少的软件包或依赖不会自动从已禁用的源获取。
+- 问题：用户要求整理 `/dev/sr0` 与上传到服务器的 ISO 文件作为本地 DNF 源的对比。
+- 结论：两者挂载后的 DNF baseurl 配置一致；`/dev/sr0` 是现成块设备，不需 loop、不占服务器 ISO 文件空间，但依赖虚拟化/光驱持续连接；上传的 ISO 是普通文件，需要 loop，占用服务器磁盘，但路径和可用性由服务器自身控制，更适合长期固定源。若上传后完整解压为含 repodata 的目录，则无需 mount/loop，长期维护最直接。
+- 问题：用户询问 `mount -t iso9660 -o loop,ro ISO文件 挂载目录` 各参数含义。
+- 结论：sudo 提权，mount 执行挂载，`-t iso9660` 指定 ISO 9660 文件系统，`-o` 后为逗号分隔选项，loop 将普通 ISO 文件映射成虚拟块设备，ro 强制只读，随后依次为源 ISO 文件和已存在的目标挂载目录；行尾反斜杠仅用于 Shell 续行。
+- 问题：用户询问基础磁盘如何挂载。
+- 结论：先用 lsblk/blkid/findmnt 识别设备、分区、文件系统和现有挂载；已有文件系统的 `/dev/sdX1` 可直接 mount 到已创建目录，不需要 loop。持久化优先用 UUID 写 fstab 并以 mount -a 验证；新空盘的分区和 mkfs 会清除数据，必须确认目标无数据后单独执行。
+- 问题：用户截图要求把未分区的 50G `/dev/sdb` 挂载到 `/aifar`，直接 `mount /dev/sdb /aifar` 报文件系统/超级块错误，并出现 fstab 已修改未 daemon-reload 警告。
+- 结论：截图中 `/dev/sdb` 只有 disk、无子分区/FSTYPE，根因是原始磁盘尚无可挂载文件系统；systemd 提示是独立的 fstab 缓存警告。必须先只读确认 `/dev/sdb` 无旧签名且 `/aifar` 无需保留内容，再建立 GPT 分区 `/dev/sdb1`、格式化 XFS、挂载并用 UUID 写 fstab；已有 `/aifar` 数据或现有错误 fstab 行必须先处理，避免挂载遮蔽数据或重复配置。
+- 问题：用户确认 `/dev/sdb` 是空的 50G 磁盘，要求一步完成挂载到 `/aifar`。
+- 结论：可用带设备类型、45-55GiB 容量、未挂载及空挂载目录保护的一次性 root 脚本，创建 GPT 与 `/dev/sdb1`、格式化 XFS、挂载到 `/aifar`，备份并去重更新 fstab 为 UUID 配置，daemon-reload 后用 findmnt/df 验证；该流程会永久清除 `/dev/sdb`。
+- 问题：用户确认一步挂载脚本是否当前立即生效且重启后仍生效。
+- 结论：脚本中的 mount 使 `/dev/sdb1` 当前立即挂载到 `/aifar`，UUID 形式的 `/etc/fstab` 记录使其开机自动挂载；以当前 findmnt/df、fstab 行以及重启后的 findmnt 验证。当前配置未使用 nofail，磁盘缺失时系统可能进入挂载失败处理，避免 AIFAR 误写根盘目录。
+- 问题：用户要求逐段说明 50G 空盘一键挂载脚本做了什么以及每一步原因。
+- 结论：脚本在 root Bash 严格模式下先检查依赖、设备类型、45-55GiB 容量、未挂载状态和空 `/aifar`，再为 `/dev/sdb` 建 GPT 单分区、通知内核、格式化 XFS并立即挂载；随后取稳定 UUID、备份及去重更新 fstab、刷新 systemd并验证。保护项用于降低选错盘和遮蔽数据风险，但分区/mkfs 不可回滚，脚本中途失败后仍应按 lsblk/findmnt/fstab 检查实际阶段。
+- 问题：用户截图显示执行 `dnf clean metadata`、`dnf makecache`、`dnf install` 等均在初始化时报 `/var/log/dnf.log: Read-only file system`，执行 `setenforce 0` 后仍无变化。
+- 结论：故障发生在 DNF 写日志阶段，尚未进入仓库或包解析；SELinux permissive 与文件系统只读无关。当前仅能判断承载 `/var/log` 的根或独立 `/var` 文件系统可能以 ro 挂载，具体是手工/fstab只读还是内核因 XFS/EXT4/I/O 错误保护尚未确认；应先用 findmnt、lsblk、df、fstab 和当前启动内核日志只读取证，发现文件系统或 I/O 错误时不得直接 remount,rw。
+- 问题：用户反馈其中一台服务器的 `/aifar` 磁盘挂载在重启后丢失。
+- 结论：现场输出尚不足以确认根因；需先只读区分磁盘/分区启动时未出现、fstab UUID或语法错误、XFS挂载失败、systemd aifar.mount 失败以及 nofail 跳过。挂载恢复前必须确认当前 `/aifar` 底层目录是否已有服务新写数据，避免直接挂载后遮蔽；采集 lsblk/blkid、findmnt、fstab、aifar.mount 当前启动日志和内核磁盘/XFS日志后再给对应修复。
+- 问题：用户要求提供卸载还原命令，以便重新挂载 `/dev/sdb1` 到 `/aifar`。
+- 结论：应执行保数据的挂载配置重置而非重新分区/格式化：确认 `/dev/sdb1` 仍为 XFS且有 UUID，正常 umount（拒绝 force/lazy），确认未挂载后的 `/aifar` 底层目录为空，备份并去除旧 fstab 中 `/aifar` 行，按实际 UUID 写回 `defaults` 配置，daemon-reload/reset-failed 后通过 fstab 重新挂载并校验 UUID；任一保护失败时停止，避免遮蔽数据。
+- 问题：用户确认不重置磁盘是否会影响重新挂载。
+- 结论：不会；重新挂载应保留现有分区和 XFS，成功 umount 会正常刷新写入，后续 mount 继续读取原数据。分区、mkfs 或 wipe 才会破坏数据。挂载窗口会让依赖 `/aifar` 的 Docker/AIFAR 服务暂时不可用，且若存在文件系统损坏、重复 UUID、磁盘未出现或底层目录新写文件，脚本会失败或中止，不能靠格式化规避。
+- 问题：用户进一步反馈不只是 DNF，疑似整个服务器文件系统都变成只读。
+- 结论：问题已升级为根文件系统或底层系统盘故障诊断，暂停 `/aifar` 重挂载、dnf、删除、格式化和直接 remount,rw，也不应在保留现场前贸然重启。需先读取 `/` 与 `/var/log` 的 findmnt 选项、lsblk RO/FSTYPE、LVM属性、fstab、内核命令行及当前启动 dmesg/journal 的 I/O/XFS/EXT4错误。若是 XFS损坏，xfs_repair只能在未挂载设备上执行，先 `-n` 只读检查；`-L` 会丢失日志中的元数据更新，只能最后手段。
+- 问题：用户询问迁移到 `tools/alpha-jar-export/` 后，`export-alpha-jars.cmd` 将 AIFAR 应用安装 JAR 复制到哪里。
+- 结论：工具默认目标未因迁移改变，仍为仓库根目录 `resources/aifar/runtime-v2/services`；每个服务写入 `<service>/target/alpha-<service>.jar`，例如 `gateway/target/alpha-gateway.jar`。可通过 `-TargetRoot` 覆盖目标根目录；该工具只准备 Runtime 离线 JAR 资源，不生成可上传的更新 ZIP。
+- 问题：用户询问为何 Alpha JAR 没有复制到 `tools/resource`，而是复制到与 `tools` 同级的 `resources`。
+- 结论：脚本从 `tools/alpha-jar-export` 显式执行 `..\..` 定位仓库根目录，再拼接 `resources/aifar/runtime-v2/services`；这是为了写入 AIFAR 构建和部署消费的正式离线资源树。`tools` 只存放开发辅助工具，不承载运行资源。
+- 问题：用户将 gateway 的 `service.json` 中 `healthPath` 置空后，容器仍每 15 秒访问 `/actuator/health/readiness`。
+- 结论：当前 runtime-v2 将空 `healthPath` 解释为未配置而非禁用；Java 服务会依次回退到 `gateway.env` 的 `HEALTH_PATH`、`compose.env` 的 `APP_BACKEND_HEALTH_PATH`，最后硬编码 `/actuator/health/readiness`，生成 Docker `healthCheck.command` 并由 agent 传入 `--health-cmd`。默认间隔 15 秒。当前没有服务级“关闭探活”语义，需新增显式开关或让空值跳过 healthCheck 生成。
+- 问题：用户确认将 gateway 的 `healthPath` 配成 `/` 是否可避免 readiness 被拒绝。
+- 结论：配置 `/` 只会把 Docker 探活目标改为 gateway 根路径，并不会关闭探活；若 `/` 稳定返回 2xx，可避免 actuator 拒绝日志并保持 healthy，否则 4xx/5xx 仍会判定失败。真正关闭仍需显式禁用 healthCheck。
+- 问题：用户截图显示 AIFAR Runtime 安装在 `aifar-agent reconcile-runtime` 阶段报 `reconcile AIFAR deployment alpha-system: context deadline exceeded`，要求只说明原因。
+- 结论：镜像已构建成功，BuildKit deprecated 与 systemd symlink 输出都不是失败原因；直接原因是 `alpha-system` 的部署调和未在 runtime-agent 默认 300 秒 progress deadline 内完成。当前代码在容器启动后等待 Docker running/health 状态，超时上下文先到时只返回 `context deadline exceeded`，截图缺少容器 inspect、health log 和应用日志，不能继续唯一确认是进程启动失败、readiness 非 2xx、依赖未就绪或 Docker 操作阻塞；结合前序探活问题，readiness 长期不健康是高概率方向但尚未被现场证据确认。
+- 问题：用户追问为何判定为 alpha-system 模块问题。
+- 结论：错误归属依据是 agent 将每个 deployment 的错误包装为 `reconcile AIFAR deployment <deploymentName>: <error>`，截图中的 `<deploymentName>` 明确为 `alpha-system`；这只能证明超时发生在该部署的 reconcile 协程，不能证明 alpha-system 业务代码自身有缺陷，底层也可能是健康检查、依赖或 Docker 操作。
+- 问题：用户要求容器 Runtime 状态由后端事件自动更新、日志能识别完整错误堆栈，并修复 SSH 终端大量输出被底部遮挡。
+- 结论：Containers 页面收到当前服务器的 `aifar.runtime` SSE 事件后会合并触发后台详情刷新；Runtime 日志支持常见文本/JSON 级别及异常续行继承，并提供错误计数和一键只看错误；Terminal 改为剩余空间 flex 布局并保留 10000 行 scrollback。验证通过：前端 173/173、终端专项 2/2、collector/httpapi 后端测试和生产构建。
+- 问题：用户截图反馈 SSH 终端最后一行仍然显示不全。
+- 结论：根因是终端网格行数按原始字符高度计算，未计入 xterm 的 `lineHeight: 1.2`，导致可见行数被高估；现按实际行高计算并为 xterm screen 内边距预留空间。验证通过：前端 175/175、生产构建通过。
+- 问题：用户要求 SSH 终端支持多页签连接、切换菜单不断连，并可同时操作多个连接。
+- 结论：当前 `TerminalView.vue` 只维护一组 xterm/WebSocket，连接新服务器会销毁旧终端，路由卸载也会关闭连接；新方案需引入多会话模型并明确“同时操作”是后台保持多个页签还是同屏分屏操作，设计确认后再实施。
+- 结论：用户确认“同时操作多个连接”采用同一页面分屏显示多个 SSH 终端，而非仅在后台保持多个标签连接；后续设计需确定最大同屏数量和自适应布局规则。
+- 结论：用户选择连接页签数量不受 4 个限制，但同屏最多选择 4 个终端参与分屏，其余连接继续在后台保持。
+- 结论：终端会话只在当前浏览器登录生命周期内保持；切换侧边菜单不断连并恢复原页签/分屏，刷新页面、关闭浏览器或退出登录时全部断开清理。
+- 结论：允许同一台服务器创建多个独立 SSH 会话，用于分别查看日志和执行命令；每个页签拥有独立的 WebSocket、终端缓冲和连接状态。
+- 结论：已向用户展示三种多终端布局供选择：顶部页签加自动分屏、左侧连接列表加固定槽位、多工作区分组；当前推荐顶部页签加 1/2/2×2 自适应分屏。
+- 结论：用户选择顶部页签加自动分屏方案；所有连接显示为顶部页签，可选择最多 4 个进入同屏，布局按 1 个全屏、2 个左右分栏、3–4 个 2×2 自动调整。
+- 结论：用户确认采用 `KeepAlive + 独立终端会话组件` 的实现路径；TerminalView 负责会话编排，每个会话组件独立持有 xterm/WebSocket/尺寸监听，避免把不可序列化对象放入全局 Pinia。
+- 结论：用户确认多终端架构边界：App 仅缓存 TerminalView，TerminalView 管理页签/焦点/分屏选择，TerminalSessionPane 独立管理连接；后台会话组件保持挂载并继续接收输出，重新显示时重新适配尺寸。
+- 结论：用户确认多终端交互：新连接创建独立页签并可重复连接同一服务器；后台页签替换当前焦点槽位，分屏按钮最多加入 4 个；断开/重连只影响焦点会话，关闭已连接会话需确认，布局为 1 个全屏、2 个左右、3–4 个 2×2，窄屏纵向堆叠。
+- 结论：用户确认异常和测试设计：各页签独立状态，后台失败显示红色标记，断线保留历史并手动重连，迟到回调不得写入已销毁会话；退出/真卸载完整清理；不改后端协议，测试覆盖会话状态、组件生命周期、KeepAlive 路由和响应式分屏。完整设计写入 `docs/superpowers/specs/2026-07-26-terminal-multi-session-design.md`。
+- 结论：终端多会话设计已获用户书面确认，详细测试驱动实施计划写入 `docs/superpowers/plans/2026-07-26-terminal-multi-session.md`，拆分为纯会话状态、WebSocket 控制器、独立 Pane、页签/分屏工作区、KeepAlive 与最终验收 5 个提交任务。
+- 结论：用户选择在当前会话执行终端多会话实施计划；执行前检测到当前是普通检出目录上的 `codex/status-collector-realtime` 功能分支而非独立 worktree，需先确认是否创建隔离 worktree，再运行基线测试和进入 TDD。
+- 结论：隔离 worktree 的预期收口流程是从当前分支创建临时 `codex/terminal-multi-session`，实现与验证通过后合并回 `codex/status-collector-realtime`，再移除临时 worktree 并安全删除已合并的过程分支；当前工作区未提交的 `memory.md` 必须保留且不纳入功能提交。
+- 结论：终端多会话已实现并以合并提交 `24589042` 合入 `codex/status-collector-realtime`：同一服务器可建立多个独立 WebSocket/xterm 页签，后台会话保持挂载，最多 4 个窗格按 1/2/2×2 自适应显示，焦点会话可独立断开/重连，关闭活动连接需确认；`App.vue` 仅 KeepAlive 具名 `TerminalView`，切换菜单不断连，退出或真卸载会清理连接。合并后验证通过后端全部包测试、前端 193/193 和生产构建；临时 worktree 与已合并过程分支均已删除，未推送远端。
+- 问题：用户确认上线前基础服务凭据改密的最终设计，要求形成完整中文方案并明确集群处理、自动化与人工操作边界。
+- 结论：正式设计写入 `docs/superpowers/specs/2026-07-26-prelaunch-foundation-credential-rotation-design.md`，以提交 `5e0d1582` 单独保存。自动阶段集群感知地轮换 MySQL、Redis、MinIO、Nacos，更新凭据中心和所有 Runtime 节点的 Nacos 环境文件，并可下线 Java；业务 Nacos YAML 和 Java 恢复由人工完成，批次进入 `waiting_manual_config`，最后由面板执行只读验证闭环。
