@@ -196,7 +196,7 @@ func normalizeDiagnosticExport(v DiagnosticExport) (DiagnosticExport, error) {
 func decodeDiagnosticExportStrings(raw string) ([]string, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
-		return nil, nil
+		return []string{}, nil
 	}
 	var values []string
 	if err := json.Unmarshal([]byte(raw), &values); err != nil {
@@ -223,7 +223,7 @@ func normalizedDiagnosticExportStrings(values []string, sortValues bool) []strin
 		sort.Strings(result)
 	}
 	if len(result) == 0 {
-		return nil
+		return []string{}
 	}
 	return result
 }

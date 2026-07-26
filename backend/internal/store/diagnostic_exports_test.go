@@ -2,6 +2,7 @@ package store
 
 import (
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"path/filepath"
 	"strings"
@@ -107,5 +108,50 @@ func TestListDiagnosticExportsDueForCleanup(t *testing.T) {
 	}
 	if len(due) != 1 || due[0].ID != "expired" {
 		t.Fatalf("unexpected due exports: %+v", due)
+	}
+}
+
+func TestDiagnosticExportEmptyServicesRoundTripAsJSONArray(t *testing.T) {
+	now := time.Date(2026, 7, 27, 8, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name     string
+		services []string
+	}{
+		{name: "empty", services: []string{}},
+		{name: "whitespace", services: []string{" ", "\t"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db, err := Open(filepath.Join(t.TempDir(), "aifar.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+
+			saved, err := db.SaveDiagnosticExport(DiagnosticExport{
+				ID: "diag-empty-services", InstanceID: "i1", ServerID: "s1", Status: "pending",
+				Services: tc.services, SinceAt: now.Add(-time.Hour), UntilAt: now, ExpiresAt: now.Add(time.Hour),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if saved.Services == nil || saved.ServicesJSON != `[]` {
+				t.Fatalf("expected saved empty services array, got %#v (%s)", saved.Services, saved.ServicesJSON)
+			}
+
+			got, err := db.GetDiagnosticExport(saved.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.Services == nil || got.ServicesJSON != `[]` {
+				t.Fatalf("expected loaded empty services array, got %#v (%s)", got.Services, got.ServicesJSON)
+			}
+			body, err := json.Marshal(got)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(string(body), `"services":[]`) {
+				t.Fatalf("expected JSON array services field, got %s", body)
+			}
+		})
 	}
 }
