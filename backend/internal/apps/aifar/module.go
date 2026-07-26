@@ -507,6 +507,10 @@ func (m Module) UninstallRuntimeAgent(ctx context.Context, req registry.RuntimeA
 	})
 }
 
+func (m Module) EstimateRuntimeDiagnostics(ctx context.Context, req registry.RuntimeDiagnosticRequest, run registry.RunContext) (registry.RuntimeDiagnosticEstimateResult, error) {
+	return m.service.EstimateRuntimeDiagnostics(ctx, req, run.Log)
+}
+
 func firstTarget(req registry.InstallRequest) string {
 	targets := req.TargetServerIDs()
 	if len(targets) == 0 {

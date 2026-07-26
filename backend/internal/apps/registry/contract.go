@@ -2,7 +2,9 @@ package registry
 
 import (
 	"context"
+	"io"
 	"strings"
+	"time"
 
 	"aifar-deployment/backend/internal/store"
 )
@@ -323,6 +325,50 @@ type RuntimeAgentUninstallRequest struct {
 	Reason   string
 }
 
+type RuntimeDiagnosticRequest struct {
+	ExportID string
+	Instance store.AppInstance
+	Server   store.Server
+	Language string
+	Actor    string
+	Services []string
+	SinceAt  time.Time
+	UntilAt  time.Time
+}
+
+type RuntimeDiagnosticDeleteRequest struct {
+	Instance store.AppInstance
+	Server   store.Server
+	Export   store.DiagnosticExport
+	Language string
+	Actor    string
+}
+
+type RuntimeDiagnosticStreamRequest struct {
+	Instance store.AppInstance
+	Server   store.Server
+	Export   store.DiagnosticExport
+	Language string
+	Actor    string
+}
+
+type RuntimeDiagnosticEstimateResult struct {
+	Services       []RuntimeDiagnosticServiceEstimate `json:"services"`
+	FileBytes      int64                              `json:"fileBytes"`
+	ContainerBytes int64                              `json:"containerBytes"`
+	TotalBytes     int64                              `json:"totalBytes"`
+	RequiredBytes  int64                              `json:"requiredBytes"`
+	AvailableBytes int64                              `json:"availableBytes"`
+	Allowed        bool                               `json:"allowed"`
+	Warnings       []string                           `json:"warnings,omitempty"`
+}
+
+type RuntimeDiagnosticServiceEstimate struct {
+	Service        string `json:"service"`
+	FileBytes      int64  `json:"fileBytes"`
+	ContainerBytes int64  `json:"containerBytes"`
+}
+
 type ClusterStartRequest struct {
 	Instances       []store.AppInstance
 	Servers         []store.Server
@@ -435,6 +481,13 @@ type RuntimeCleanupModule interface {
 
 type RuntimeAgentUninstallModule interface {
 	UninstallRuntimeAgent(ctx context.Context, req RuntimeAgentUninstallRequest, run RunContext) error
+}
+
+type RuntimeDiagnosticsModule interface {
+	EstimateRuntimeDiagnostics(context.Context, RuntimeDiagnosticRequest, RunContext) (RuntimeDiagnosticEstimateResult, error)
+	ExportRuntimeDiagnostics(context.Context, RuntimeDiagnosticRequest, RunContext) error
+	DeleteRuntimeDiagnosticExport(context.Context, RuntimeDiagnosticDeleteRequest, RunContext) error
+	StreamRuntimeDiagnosticExport(context.Context, RuntimeDiagnosticStreamRequest, io.Writer) (int64, error)
 }
 
 type ClusterStartModule interface {

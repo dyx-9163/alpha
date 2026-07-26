@@ -17,17 +17,22 @@ import (
 	"unicode"
 
 	"aifar-deployment/backend/internal/agentdist"
+	"aifar-deployment/backend/internal/apps/registry"
 	"aifar-deployment/backend/internal/installer/installerkit"
 	"aifar-deployment/backend/internal/installer/selinux"
 	"aifar-deployment/backend/internal/installer/uploadkit"
 	"aifar-deployment/backend/internal/store"
 )
 
-//go:embed templates/install.sh templates/uninstall.sh templates/update-artifact.sh templates/update-artifact-bundle.sh templates/rollback-artifact.sh templates/autoscale-out.sh templates/runtime-config.sh templates/service-install.sh templates/runtime-reconcile.sh templates/runtime-restart.sh templates/scale-service.sh
+//go:embed templates/install.sh templates/uninstall.sh templates/update-artifact.sh templates/update-artifact-bundle.sh templates/rollback-artifact.sh templates/autoscale-out.sh templates/runtime-config.sh templates/runtime-diagnostics-estimate.sh templates/service-install.sh templates/runtime-reconcile.sh templates/runtime-restart.sh templates/scale-service.sh
 var templateFS embed.FS
 
 type Logger = installerkit.Logger
 type Remote = installerkit.Remote
+
+type RuntimeDiagnosticRequest = registry.RuntimeDiagnosticRequest
+type RuntimeDiagnosticDeleteRequest = registry.RuntimeDiagnosticDeleteRequest
+type RuntimeDiagnosticStreamRequest = registry.RuntimeDiagnosticStreamRequest
 
 type Store interface {
 	GetServer(id string, includeSecret bool) (store.Server, error)
@@ -71,6 +76,14 @@ type aifarOrchestrationLockStore interface {
 
 type taskLookupStore interface {
 	GetTask(id string) (store.Task, []store.TaskLog, error)
+}
+
+type runtimeDiagnosticsStore interface {
+	SaveDiagnosticExport(store.DiagnosticExport) (store.DiagnosticExport, error)
+	GetDiagnosticExport(id string) (store.DiagnosticExport, error)
+	ListAIFARDeployments(instanceID string) ([]store.AIFARDeployment, error)
+	ListAIFARPods(instanceID string) ([]store.AIFARPod, error)
+	ListAppReleases(instanceID string) ([]store.AppRelease, error)
 }
 
 type InstallRequest struct {
