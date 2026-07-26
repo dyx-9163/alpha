@@ -2,6 +2,7 @@ package aifar
 
 import (
 	"fmt"
+	"path"
 	"regexp"
 	"strconv"
 	"strings"
@@ -13,9 +14,80 @@ const (
 	runtimeDiagnosticServiceRecord = "AIFAR_DIAG_SERVICE"
 	runtimeDiagnosticTotalRecord   = "AIFAR_DIAG_TOTAL"
 	runtimeDiagnosticWarningRecord = "AIFAR_DIAG_WARNING"
+	runtimeDiagnosticResultRecord  = "AIFAR_DIAG_RESULT"
 )
 
 var runtimeDiagnosticNamePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9-]*$`)
+
+var (
+	runtimeDiagnosticExportIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
+	runtimeDiagnosticArchivePattern  = regexp.MustCompile(`^aifar-diagnostics-[A-Za-z0-9._-]+-[0-9]{8}T[0-9]{6}Z\.tar\.gz$`)
+	runtimeDiagnosticSHA256Pattern   = regexp.MustCompile(`^[a-f0-9]{64}$`)
+)
+
+type runtimeDiagnosticExportResult struct {
+	RemoteRelativePath string
+	ArchiveName        string
+	ArchiveBytes       int64
+	UncompressedBytes  int64
+	SHA256             string
+	WarningCount       int
+}
+
+func parseRuntimeDiagnosticExportResult(raw, exportID string) (runtimeDiagnosticExportResult, error) {
+	var result runtimeDiagnosticExportResult
+	line := strings.TrimSuffix(raw, "\n")
+	if line == "" || strings.ContainsAny(line, "\r\n") {
+		return result, fmt.Errorf("runtime diagnostic export result must be one LF-terminated record")
+	}
+	fields := strings.Split(line, "\t")
+	if len(fields) != 7 || fields[0] != runtimeDiagnosticResultRecord {
+		return result, fmt.Errorf("runtime diagnostic export result record is invalid")
+	}
+	if !runtimeDiagnosticExportIDPattern.MatchString(exportID) {
+		return result, fmt.Errorf("runtime diagnostic export id is invalid")
+	}
+	relativePath, archiveName, err := validateRuntimeDiagnosticRelativePath(exportID, fields[1], fields[2])
+	if err != nil {
+		return result, err
+	}
+	archiveBytes, err := parseRuntimeDiagnosticBytes(fields[3])
+	if err != nil || archiveBytes > runtimeDiagnosticMaxArchive {
+		return result, fmt.Errorf("runtime diagnostic archive bytes are invalid")
+	}
+	uncompressedBytes, err := parseRuntimeDiagnosticBytes(fields[4])
+	if err != nil || uncompressedBytes > runtimeDiagnosticMaxUncompressed {
+		return result, fmt.Errorf("runtime diagnostic uncompressed bytes are invalid")
+	}
+	if !runtimeDiagnosticSHA256Pattern.MatchString(fields[5]) {
+		return result, fmt.Errorf("runtime diagnostic archive checksum is invalid")
+	}
+	warningCount64, err := parseRuntimeDiagnosticBytes(fields[6])
+	if err != nil || warningCount64 > 100000 {
+		return result, fmt.Errorf("runtime diagnostic warning count is invalid")
+	}
+	return runtimeDiagnosticExportResult{
+		RemoteRelativePath: relativePath,
+		ArchiveName:        archiveName,
+		ArchiveBytes:       archiveBytes,
+		UncompressedBytes:  uncompressedBytes,
+		SHA256:             fields[5],
+		WarningCount:       int(warningCount64),
+	}, nil
+}
+
+func validateRuntimeDiagnosticRelativePath(exportID, relativePath, archiveName string) (string, string, error) {
+	if !runtimeDiagnosticExportIDPattern.MatchString(exportID) || !runtimeDiagnosticArchivePattern.MatchString(archiveName) {
+		return "", "", fmt.Errorf("runtime diagnostic archive identity is invalid")
+	}
+	if strings.ContainsAny(relativePath, "\\\r\n\t") || path.IsAbs(relativePath) || path.Clean(relativePath) != relativePath {
+		return "", "", fmt.Errorf("runtime diagnostic archive path is invalid")
+	}
+	if relativePath != exportID+"/"+archiveName || path.Base(relativePath) != archiveName {
+		return "", "", fmt.Errorf("runtime diagnostic archive path is outside its export root")
+	}
+	return relativePath, archiveName, nil
+}
 
 func parseRuntimeDiagnosticEstimate(raw string, expectedSelections ...[]string) (registry.RuntimeDiagnosticEstimateResult, error) {
 	var result registry.RuntimeDiagnosticEstimateResult
