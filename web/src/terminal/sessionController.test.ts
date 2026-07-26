@@ -38,7 +38,7 @@ describe('terminal session controller', () => {
     first.controller.connect()
     second.controller.connect()
 
-    firstSocket.onmessage?.({ data: 'first' })
+    firstSocket.onmessage?.({ data: 'first' } as MessageEvent)
 
     expect(first.write).toHaveBeenCalledWith('first')
     expect(second.write).not.toHaveBeenCalled()
@@ -49,8 +49,8 @@ describe('terminal session controller', () => {
     const { controller, write, onState } = controllerFor(socket)
     controller.connect()
 
-    socket.onerror?.({})
-    socket.onclose?.({})
+    socket.onerror?.({} as Event)
+    socket.onclose?.({} as CloseEvent)
 
     expect(write).toHaveBeenCalledWith('\r\nfailed\r\n')
     expect(onState).toHaveBeenLastCalledWith('error')
@@ -75,7 +75,7 @@ describe('terminal session controller', () => {
 
     const staleMessage = socket.onmessage
     controller.dispose()
-    staleMessage?.({ data: 'late' })
+    staleMessage?.({ data: 'late' } as MessageEvent)
 
     expect(write).not.toHaveBeenCalled()
     expect(socket.close).toHaveBeenCalledTimes(1)
@@ -91,7 +91,7 @@ describe('terminal session controller', () => {
     )
     controller.connect()
 
-    socket.onmessage?.({ data: payload })
+    socket.onmessage?.({ data: payload } as MessageEvent)
     controller.dispose()
     resolveBuffer(new ArrayBuffer(4))
     await Promise.resolve()
@@ -116,8 +116,8 @@ describe('terminal session controller', () => {
     const staleMessage = firstSocket.onmessage
 
     controller.connect()
-    staleMessage?.({ data: 'old' })
-    secondSocket.onmessage?.({ data: 'new' })
+    staleMessage?.({ data: 'old' } as MessageEvent)
+    secondSocket.onmessage?.({ data: 'new' } as MessageEvent)
 
     expect(firstSocket.close).toHaveBeenCalledTimes(1)
     expect(write).toHaveBeenCalledTimes(1)

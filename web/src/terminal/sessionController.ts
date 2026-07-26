@@ -2,13 +2,13 @@ import type { TerminalConnectionState } from './sessions'
 
 export interface TerminalSocketLike {
   binaryType: BinaryType
-  readyState: number
-  onopen: ((event: any) => void) | null
-  onmessage: ((event: { data: any }) => void) | null
-  onerror: ((event: any) => void) | null
-  onclose: ((event: any) => void) | null
-  send(data: string): void
-  close(): void
+  readonly readyState: number
+  onopen: ((event: Event) => any) | null
+  onmessage: ((event: MessageEvent) => any) | null
+  onerror: ((event: Event) => any) | null
+  onclose: ((event: CloseEvent) => any) | null
+  send(data: string | ArrayBufferLike | Blob | ArrayBufferView): void
+  close(code?: number, reason?: string): void
 }
 
 interface TerminalSessionControllerOptions {
