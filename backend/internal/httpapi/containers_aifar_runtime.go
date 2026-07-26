@@ -246,7 +246,8 @@ func aifarRuntimeRestartSteps(lang string) []simpleTaskStep {
 	return []simpleTaskStep{
 		{"load-instance", i18n.Text(lang, "aifar.runtimeRestart.stepLoadInstance")},
 		{"preflight-runtime", i18n.Text(lang, "aifar.runtimeRestart.stepPreflight")},
-		{"rolling-restart", i18n.Text(lang, "aifar.runtimeRestart.stepRollingRestart")},
+		{"stop-all-pods", i18n.Text(lang, "aifar.runtimeRestart.stepStopAll")},
+		{"start-all-pods", i18n.Text(lang, "aifar.runtimeRestart.stepStartAll")},
 		{"verify-runtime", i18n.Text(lang, "aifar.runtimeRestart.stepVerify")},
 	}
 }

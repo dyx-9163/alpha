@@ -881,7 +881,7 @@ func TestAIFARRuntimeRestartAllCreatesPlannedTaskForSelectedInstance(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantSteps := []string{"load-instance", "preflight-runtime", "rolling-restart", "verify-runtime"}
+	wantSteps := []string{"load-instance", "preflight-runtime", "stop-all-pods", "start-all-pods", "verify-runtime"}
 	if len(steps) != len(wantSteps) {
 		t.Fatalf("expected %d steps, got %+v", len(wantSteps), steps)
 	}
@@ -1008,10 +1008,10 @@ func (m *fakeAIFARRuntimeActionModule) RestartRuntime(ctx context.Context, req r
 		FinishStep(string, string, string, string)
 	}); ok {
 		recorder.StartTarget(target)
-		steps := []string{"load-instance", "preflight-runtime", "rolling-restart", "verify-runtime"}
+		steps := []string{"load-instance", "preflight-runtime", "stop-all-pods", "start-all-pods", "verify-runtime"}
 		for index, name := range steps {
 			recorder.StartStep(target, name, name, index+1)
-			if m.restartErr != nil && name == "rolling-restart" {
+			if m.restartErr != nil && name == "stop-all-pods" {
 				recorder.FinishStep(target, name, "failed", m.restartErr.Error())
 				recorder.FinishTarget(target, "failed", m.restartErr.Error())
 				return m.restartErr

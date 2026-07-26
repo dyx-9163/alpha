@@ -1924,7 +1924,7 @@ func TestModuleRestartRuntimeInvokesAgentWithPersistedSpecAndReleasesLock(t *tes
 		t.Fatalf("runtime restart should release orchestration lock: %s", current.Metadata)
 	}
 	steps, targetStatus := logger.snapshot()
-	for _, want := range []string{"load-instance=success", "preflight-runtime=success", "rolling-restart=success", "verify-runtime=success"} {
+	for _, want := range []string{"load-instance=success", "preflight-runtime=success", "stop-all-pods=success", "start-all-pods=success", "verify-runtime=success"} {
 		if !slices.Contains(steps, want) {
 			t.Fatalf("expected completed restart step %q, got %#v", want, steps)
 		}
