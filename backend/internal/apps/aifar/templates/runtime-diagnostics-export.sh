@@ -143,6 +143,7 @@ staged="$WORK_ROOT/staged/$destination_relative"
 summary="$WORK_ROOT/summaries/$service-${initial_inode}.tsv"
 warnings="$WORK_ROOT/warnings/$service-${initial_inode}.tsv"
 mkdir -p -- "$(dirname "$destination")" "$(dirname "$staged")" "$(dirname "$summary")" "$(dirname "$warnings")"
+: > "$warnings"
 
 redact_stream() {
   sed -E \
