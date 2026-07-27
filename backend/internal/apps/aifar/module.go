@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"time"
 
 	"aifar-deployment/backend/internal/adapter"
 	"aifar-deployment/backend/internal/apps/registry"
@@ -18,12 +19,22 @@ type Module struct {
 
 func init() {
 	registry.RegisterFactory(AppName, func(deps registry.Dependencies) registry.Module {
-		return NewModule(deps.Store, adapter.SSHRemote{})
+		archives := NewRuntimeDiagnosticArchiveStorage(
+			deps.DiagnosticExportDir,
+			deps.DiagnosticExportQuotaBytes,
+			time.Duration(deps.DiagnosticExportRetentionHours)*time.Hour,
+			deps.Store,
+		)
+		return NewModuleWithDiagnosticStorage(deps.Store, adapter.SSHRemote{}, archives)
 	})
 }
 
 func NewModule(s Store, remote Remote) Module {
 	return Module{service: NewService(s, remote)}
+}
+
+func NewModuleWithDiagnosticStorage(s Store, remote Remote, archives RuntimeDiagnosticArchiveStorage) Module {
+	return Module{service: NewServiceWithDiagnosticStorage(s, remote, archives)}
 }
 
 func (m Module) Name() string {

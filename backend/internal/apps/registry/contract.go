@@ -353,26 +353,39 @@ type RuntimeDiagnosticStreamRequest struct {
 }
 
 type RuntimeDiagnosticEstimateResult struct {
-	Services           []RuntimeDiagnosticServiceEstimate `json:"services"`
-	CandidateFiles     int                                `json:"candidateFiles,omitempty"`
-	CandidateScanBytes int64                              `json:"candidateScanBytes,omitempty"`
-	ServerTimezone     string                             `json:"serverTimezone,omitempty"`
-	BlockReason        string                             `json:"blockReason,omitempty"`
-	FileBytes          int64                              `json:"fileBytes"`
-	ContainerBytes     int64                              `json:"containerBytes"`
-	TotalBytes         int64                              `json:"totalBytes"`
-	RequiredBytes      int64                              `json:"requiredBytes"`
-	AvailableBytes     int64                              `json:"availableBytes"`
-	Allowed            bool                               `json:"allowed"`
-	Warnings           []string                           `json:"warnings,omitempty"`
+	Services            []RuntimeDiagnosticServiceEstimate `json:"services"`
+	LogSource           string                             `json:"logSource"`
+	CandidateFiles      int                                `json:"candidateFiles"`
+	CandidateScanBytes  int64                              `json:"candidateScanBytes"`
+	EstimatedSecondsMin int                                `json:"estimatedSecondsMin"`
+	EstimatedSecondsMax int                                `json:"estimatedSecondsMax"`
+	MaxFileScanBytes    int64                              `json:"maxFileScanBytes"`
+	MaxTotalScanBytes   int64                              `json:"maxTotalScanBytes"`
+	MaxFilteredBytes    int64                              `json:"maxFilteredBytes"`
+	MaxArchiveBytes     int64                              `json:"maxArchiveBytes"`
+	TimeoutSeconds      int                                `json:"timeoutSeconds"`
+	ServerTimezone      string                             `json:"serverTimezone"`
+	LocalAvailableBytes int64                              `json:"localAvailableBytes"`
+	LocalReadyBytes     int64                              `json:"localReadyBytes"`
+	LocalReservedBytes  int64                              `json:"localReservedBytes"`
+	LocalQuotaBytes     int64                              `json:"localQuotaBytes"`
+	ExpiresAt           time.Time                          `json:"expiresAt"`
+	Allowed             bool                               `json:"allowed"`
+	BlockReason         string                             `json:"blockReason,omitempty"`
+	Warnings            []string                           `json:"warnings,omitempty"`
+	FileBytes           int64                              `json:"-"`
+	ContainerBytes      int64                              `json:"-"`
+	TotalBytes          int64                              `json:"-"`
+	RequiredBytes       int64                              `json:"-"`
+	AvailableBytes      int64                              `json:"-"`
 }
 
 type RuntimeDiagnosticServiceEstimate struct {
 	Service            string `json:"service"`
-	CandidateFiles     int    `json:"candidateFiles,omitempty"`
-	CandidateScanBytes int64  `json:"candidateScanBytes,omitempty"`
-	FileBytes          int64  `json:"fileBytes"`
-	ContainerBytes     int64  `json:"containerBytes"`
+	CandidateFiles     int    `json:"candidateFiles"`
+	CandidateScanBytes int64  `json:"candidateScanBytes"`
+	FileBytes          int64  `json:"-"`
+	ContainerBytes     int64  `json:"-"`
 }
 
 type ClusterStartRequest struct {
@@ -405,8 +418,11 @@ func (r RunContext) LoggerForTarget(target string) Logger {
 }
 
 type Dependencies struct {
-	Store           *store.Store
-	DefaultPassword string
+	Store                          *store.Store
+	DefaultPassword                string
+	DiagnosticExportDir            string
+	DiagnosticExportRetentionHours int
+	DiagnosticExportQuotaBytes     int64
 }
 
 type Factory func(deps Dependencies) Module

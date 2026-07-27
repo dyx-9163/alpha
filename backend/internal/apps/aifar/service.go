@@ -81,6 +81,10 @@ type taskLookupStore interface {
 type runtimeDiagnosticsStore interface {
 	SaveDiagnosticExport(store.DiagnosticExport) (store.DiagnosticExport, error)
 	GetDiagnosticExport(id string) (store.DiagnosticExport, error)
+	ReserveDiagnosticExportBytes(id string, bytes, quota int64) (store.DiagnosticExportStorageUsage, error)
+	ReleaseDiagnosticExportReservation(id string) (bool, error)
+	CommitLocalDiagnosticExport(store.LocalDiagnosticExportCommit) (store.DiagnosticExport, error)
+	MarkDiagnosticExportFailed(id, errorText string, failedAt time.Time) (bool, error)
 	MarkDiagnosticExportDownloaded(id string, downloadedAt time.Time) (bool, error)
 	MarkDiagnosticExportCleanupPending(id string, attemptedAt time.Time) (bool, error)
 	MarkDiagnosticExportCleanupFailed(id, cleanupError string) (bool, error)
@@ -223,8 +227,9 @@ type CheckResult struct {
 }
 
 type Service struct {
-	store  Store
-	remote Remote
+	store    Store
+	remote   Remote
+	archives RuntimeDiagnosticArchiveStorage
 }
 
 type installStepDef struct {
@@ -249,6 +254,10 @@ var requiredRuntimeAgentFeatures = []string{"reconcile-runtime", "local-runtime-
 
 func NewService(s Store, remote Remote) Service {
 	return Service{store: s, remote: remote}
+}
+
+func NewServiceWithDiagnosticStorage(s Store, remote Remote, archives RuntimeDiagnosticArchiveStorage) Service {
+	return Service{store: s, remote: remote, archives: archives}
 }
 
 func fallbackTaskID(taskID string, log Logger) string {

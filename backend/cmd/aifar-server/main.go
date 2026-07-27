@@ -99,7 +99,11 @@ func main() {
 	aifar.NewRuntimeDiagnosticCleaner(db, tasks, adapter.SSHRemote{}).Start(context.Background())
 	alertManager := alerts.NewManager(db, events)
 	collectorManager := collector.NewManager(db, events, time.Duration(cfg.CollectorIntervalSecs)*time.Second)
-	collectorManager.SetAppRegistry(registry.NewFromRegistered(registry.Dependencies{Store: db, DefaultPassword: cfg.DefaultPassword}))
+	collectorManager.SetAppRegistry(registry.NewFromRegistered(registry.Dependencies{
+		Store: db, DefaultPassword: cfg.DefaultPassword,
+		DiagnosticExportDir: cfg.DiagnosticExportDir, DiagnosticExportRetentionHours: cfg.DiagnosticExportRetentionHours,
+		DiagnosticExportQuotaBytes: cfg.DiagnosticExportQuotaBytes,
+	}))
 	collectorManager.SetAlertEvaluator(alertManager)
 	collectorManager.Start(context.Background())
 	api := httpapi.NewWithRealtime(cfg, db, tasks, events)

@@ -50,9 +50,13 @@ func NewWithRealtime(cfg config.Config, s *store.Store, tasks *worker.Manager, e
 		store:    s,
 		tasks:    tasks,
 		realtime: events,
-		apps:     registry.NewFromRegistered(registry.Dependencies{Store: s, DefaultPassword: cfg.DefaultPassword}),
-		servers:  serverdomain.NewService(s, serverdomain.SSHProber{}, cfg.DefaultDeployDir),
-		auth:     security.NewLoginGuard(cfg.AuthMaxFailures, time.Duration(cfg.AuthLockoutSeconds)*time.Second),
+		apps: registry.NewFromRegistered(registry.Dependencies{
+			Store: s, DefaultPassword: cfg.DefaultPassword,
+			DiagnosticExportDir: cfg.DiagnosticExportDir, DiagnosticExportRetentionHours: cfg.DiagnosticExportRetentionHours,
+			DiagnosticExportQuotaBytes: cfg.DiagnosticExportQuotaBytes,
+		}),
+		servers: serverdomain.NewService(s, serverdomain.SSHProber{}, cfg.DefaultDeployDir),
+		auth:    security.NewLoginGuard(cfg.AuthMaxFailures, time.Duration(cfg.AuthLockoutSeconds)*time.Second),
 	}
 	api.runtime = newAIFARRuntimeController(api)
 	r := chi.NewRouter()

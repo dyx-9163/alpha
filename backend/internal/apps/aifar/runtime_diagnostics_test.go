@@ -1,7 +1,9 @@
 package aifar
 
 import (
+	"archive/tar"
 	"bytes"
+	"compress/gzip"
 	"context"
 	"errors"
 	"fmt"
@@ -11,6 +13,7 @@ import (
 	"path"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -27,6 +30,84 @@ type runtimeDiagnosticStore struct {
 	saveErrForStatus         map[string]error
 	beforeMarkDownloaded     func()
 	beforeMarkCleanupPending func()
+}
+
+func (s *runtimeDiagnosticStore) ReserveDiagnosticExportBytes(id string, bytes, quota int64) (store.DiagnosticExportStorageUsage, error) {
+	v, ok := s.exports[id]
+	if !ok || v.StorageKind != "local" || (v.Status != "pending" && v.Status != "building") {
+		return store.DiagnosticExportStorageUsage{}, errors.New("reservation record not found")
+	}
+	var readyBytes, reservedBytes int64
+	for exportID, item := range s.exports {
+		if item.StorageKind != "local" || !item.DeletedAt.IsZero() {
+			continue
+		}
+		readyBytes += item.ArchiveBytes
+		if exportID != id {
+			reservedBytes += item.ReservedBytes
+		}
+	}
+	if readyBytes+reservedBytes+bytes > quota {
+		return store.DiagnosticExportStorageUsage{ReadyBytes: readyBytes, ReservedBytes: reservedBytes, QuotaBytes: quota}, store.ErrDiagnosticExportQuotaExceeded
+	}
+	v.ReservedBytes = bytes
+	s.exports[id] = v
+	return store.DiagnosticExportStorageUsage{ReadyBytes: readyBytes, ReservedBytes: reservedBytes + bytes, QuotaBytes: quota}, nil
+}
+
+func (s *runtimeDiagnosticStore) ReleaseDiagnosticExportReservation(id string) (bool, error) {
+	v, ok := s.exports[id]
+	if !ok || v.ReservedBytes == 0 {
+		return false, nil
+	}
+	v.ReservedBytes = 0
+	s.exports[id] = v
+	return true, nil
+}
+
+func (s *runtimeDiagnosticStore) CommitLocalDiagnosticExport(commit store.LocalDiagnosticExportCommit) (store.DiagnosticExport, error) {
+	v, ok := s.exports[commit.ID]
+	if !ok || v.StorageKind != "local" || v.Status != "building" {
+		return store.DiagnosticExport{}, errors.New("local commit record not found")
+	}
+	if err := s.saveErrForStatus["ready"]; err != nil {
+		return store.DiagnosticExport{}, err
+	}
+	v.Status = "ready"
+	v.StorageRelativePath = commit.StorageRelativePath
+	v.ArchiveName = commit.ArchiveName
+	v.ArchiveBytes = commit.ArchiveBytes
+	v.UncompressedBytes = commit.UncompressedBytes
+	v.SHA256 = commit.SHA256
+	v.WarningCount = commit.WarningCount
+	v.Warnings = append([]string(nil), commit.Warnings...)
+	v.ReadyAt = commit.ReadyAt
+	v.ExpiresAt = commit.ExpiresAt
+	v.ReservedBytes = 0
+	s.exports[commit.ID] = v
+	return v, nil
+}
+
+func (s *runtimeDiagnosticStore) MarkDiagnosticExportFailed(id, errorText string, _ time.Time) (bool, error) {
+	v, ok := s.exports[id]
+	if !ok || (v.Status != "pending" && v.Status != "building") {
+		return false, nil
+	}
+	v.Status = "failed"
+	v.ErrorText = errorText
+	v.ReservedBytes = 0
+	s.exports[id] = v
+	return true, nil
+}
+
+func (s *runtimeDiagnosticStore) ListDiagnosticExportsForReconcile() ([]store.DiagnosticExport, error) {
+	result := make([]store.DiagnosticExport, 0, len(s.exports))
+	for _, item := range s.exports {
+		if item.StorageKind == "local" && item.DeletedAt.IsZero() {
+			result = append(result, item)
+		}
+	}
+	return result, nil
 }
 
 func (s *runtimeDiagnosticStore) SaveDiagnosticExport(v store.DiagnosticExport) (store.DiagnosticExport, error) {
@@ -125,6 +206,10 @@ type runtimeDiagnosticRemote struct {
 	streamCalls        int
 	streamErr          error
 	beforeStreamReturn func()
+	commandStream      []byte
+	commandStreamErr   error
+	commandStreamCalls int
+	commandStreamHook  func(context.Context, io.Writer) error
 }
 
 func (r *runtimeDiagnosticRemote) Run(ctx context.Context, _ store.Server, command string) (adapter.CommandResult, error) {
@@ -154,6 +239,21 @@ func (r *runtimeDiagnosticRemote) StreamFile(_ context.Context, _ store.Server, 
 	return int64(n), err
 }
 
+func (r *runtimeDiagnosticRemote) StreamCommand(ctx context.Context, _ store.Server, command string, dst io.Writer) (adapter.CommandStreamResult, error) {
+	r.commandStreamCalls++
+	r.command = command
+	r.commands = append(r.commands, command)
+	if r.commandStreamHook != nil {
+		err := r.commandStreamHook(ctx, dst)
+		return adapter.CommandStreamResult{}, err
+	}
+	if r.commandStreamErr != nil {
+		return adapter.CommandStreamResult{}, r.commandStreamErr
+	}
+	n, err := dst.Write(r.commandStream)
+	return adapter.CommandStreamResult{Bytes: int64(n)}, err
+}
+
 func runtimeDiagnosticFixture(now time.Time) (*runtimeDiagnosticStore, store.AppInstance, store.Server, store.DiagnosticExport) {
 	instance := store.AppInstance{
 		ID:       "instance-1",
@@ -168,7 +268,7 @@ func runtimeDiagnosticFixture(now time.Time) (*runtimeDiagnosticStore, store.App
 	export := store.DiagnosticExport{
 		ID: "diag_1234567890abcdef12345678", TaskID: "task-1", InstanceID: instance.ID, ServerID: server.ID,
 		Status: "pending", Services: []string{"gateway"}, SinceAt: now.Add(-time.Hour), UntilAt: now.Add(-time.Minute),
-		CreatedBy: "owner", CreatedAt: now, ExpiresAt: now.Add(runtimeDiagnosticRetention), CleanupStatus: "none",
+		StorageKind: "remote", CreatedBy: "owner", CreatedAt: now, ExpiresAt: now.Add(runtimeDiagnosticRetention), CleanupStatus: "none",
 	}
 	db := &runtimeDiagnosticStore{
 		fakeStore: &fakeStore{
@@ -213,7 +313,292 @@ func runtimeDiagnosticExportOutput(exportID, archiveName string, warnings int) s
 	}, "\t")
 }
 
-func TestExportRuntimeDiagnosticsPersistsReadyWithWarnings(t *testing.T) {
+func TestRuntimeDiagnosticLocalStorageIsRequiredForNewExports(t *testing.T) {
+	now := time.Now().UTC().Add(-time.Minute)
+	db, instance, server, _ := runtimeDiagnosticFixture(now)
+	remote := &runtimeDiagnosticRemote{stdout: strings.Join([]string{
+		"AIFAR_DIAG_SERVICE_V2\tgateway\t1\t1024",
+		"AIFAR_DIAG_TOTAL_V2\t1\t1024\tAsia/Shanghai\t-",
+	}, "\n")}
+
+	_, err := NewService(db, remote).EstimateRuntimeDiagnostics(context.Background(), RuntimeDiagnosticRequest{
+		Instance: instance, Server: server, Language: "en", Services: []string{"gateway"},
+		SinceAt: now.Add(-time.Hour), UntilAt: now.Add(-time.Minute),
+	}, nil)
+	if err == nil {
+		t.Fatal("estimate unexpectedly succeeded without configured local archive storage")
+	}
+}
+
+func TestRuntimeDiagnosticLocalTransactionUsesSevenSteps(t *testing.T) {
+	want := []string{
+		"validate-local-storage",
+		"discover-log-files",
+		"filter-and-redact",
+		"build-manifest",
+		"stream-local-archive",
+		"verify-local-archive",
+		"cleanup-remote",
+	}
+	if !slices.Equal(runtimeDiagnosticSteps, want) {
+		t.Fatalf("runtime diagnostic steps = %v, want %v", runtimeDiagnosticSteps, want)
+	}
+}
+
+func TestEstimateRuntimeDiagnosticsCombinesRemoteMetadataAndLocalCapacity(t *testing.T) {
+	now := time.Now().UTC().Add(-time.Minute)
+	db, instance, server, _ := runtimeDiagnosticFixture(now)
+	remote := &runtimeDiagnosticRemote{stdout: strings.Join([]string{
+		"AIFAR_DIAG_SERVICE_V2\tgateway\t2\t33554432",
+		"AIFAR_DIAG_TOTAL_V2\t2\t33554432\tAsia/Shanghai\t-",
+	}, "\n")}
+	archives := NewRuntimeDiagnosticArchiveStorage(t.TempDir(), 1<<30, runtimeDiagnosticRetention, db)
+	estimate, err := NewServiceWithDiagnosticStorage(db, remote, archives).EstimateRuntimeDiagnostics(context.Background(), RuntimeDiagnosticRequest{
+		Instance: instance, Server: server, Language: "en", Services: []string{"gateway"},
+		SinceAt: now.Add(-time.Hour), UntilAt: now.Add(-time.Minute),
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !estimate.Allowed || estimate.LogSource != "host-mounted" || estimate.CandidateFiles != 2 || estimate.CandidateScanBytes != 33554432 {
+		t.Fatalf("unexpected estimate metadata: %+v", estimate)
+	}
+	if estimate.LocalAvailableBytes <= 0 || estimate.LocalQuotaBytes != 1<<30 || estimate.MaxArchiveBytes != 256<<20 || estimate.TimeoutSeconds != 900 {
+		t.Fatalf("unexpected local capacity or limits: %+v", estimate)
+	}
+	if estimate.EstimatedSecondsMin <= 0 || estimate.EstimatedSecondsMax < estimate.EstimatedSecondsMin || estimate.ExpiresAt.IsZero() {
+		t.Fatalf("unexpected duration/expiry estimate: %+v", estimate)
+	}
+}
+
+func TestLegacyRemoteDiagnosticExportStillStreamsAndDeletesRemotely(t *testing.T) {
+	now := time.Now().UTC()
+	db, instance, server, export := runtimeDiagnosticFixture(now)
+	export.Status = "ready"
+	export.StorageKind = "remote"
+	export.ArchiveName = "aifar-diagnostics-instance-1-20260727T080000Z.tar.gz"
+	export.RemoteRelativePath = path.Join(export.ID, export.ArchiveName)
+	export.ArchiveBytes = int64(len("legacy-archive"))
+	export.SHA256 = strings.Repeat("a", 64)
+	export.ReadyAt = now.Add(-time.Minute)
+	export.ExpiresAt = now.Add(time.Hour)
+	db.exports[export.ID] = export
+	remote := &runtimeDiagnosticRemote{streamContent: []byte("legacy-archive")}
+	service := NewServiceWithDiagnosticStorage(db, remote, NewRuntimeDiagnosticArchiveStorage(t.TempDir(), 5<<30, runtimeDiagnosticRetention, db))
+	var downloaded bytes.Buffer
+	if _, err := service.StreamRuntimeDiagnosticExport(context.Background(), RuntimeDiagnosticStreamRequest{
+		Export: export, Instance: instance, Server: server, Language: "en",
+	}, &downloaded); err != nil {
+		t.Fatal(err)
+	}
+	if downloaded.String() != "legacy-archive" || remote.streamCalls != 1 {
+		t.Fatalf("legacy archive was not streamed remotely: body=%q calls=%d", downloaded.String(), remote.streamCalls)
+	}
+	if err := service.DeleteRuntimeDiagnosticExport(context.Background(), RuntimeDiagnosticDeleteRequest{
+		Export: export, Instance: instance, Server: server, Language: "en",
+	}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if commandContaining(remote.commands, "AIFAR_RUNTIME_DIAGNOSTIC_CLEANUP") == "" {
+		t.Fatal("legacy remote archive cleanup was not executed")
+	}
+}
+
+func TestExportRuntimeDiagnosticsStreamsIntoLocalStorage(t *testing.T) {
+	now := time.Now().UTC().Add(-time.Minute)
+	db, instance, server, export := runtimeDiagnosticFixture(now)
+	export.StorageKind = "local"
+	db.exports[export.ID] = export
+	archiveName := "aifar-diagnostics-instance-1-" + export.CreatedAt.UTC().Format("20060102T150405Z") + ".tar.gz"
+	archive := runtimeDiagnosticTestArchive(t, strings.TrimSuffix(archiveName, ".tar.gz"))
+	remote := &runtimeDiagnosticRemote{
+		stdout: strings.Join([]string{
+			"AIFAR_DIAG_SERVICE_V2\tgateway\t1\t1024",
+			"AIFAR_DIAG_TOTAL_V2\t1\t1024\tAsia/Shanghai\t-",
+		}, "\n"),
+		commandStream: append([]byte(fmt.Sprintf("AIFAR_DIAG_STREAM_V1\t%s\t4096\t1\tAsia/Shanghai\n", archiveName)), archive...),
+	}
+	archives := NewRuntimeDiagnosticArchiveStorage(t.TempDir(), 5<<30, runtimeDiagnosticRetention, db)
+	log := &recordingStepLogger{}
+	if err := NewServiceWithDiagnosticStorage(db, remote, archives).ExportRuntimeDiagnostics(context.Background(), RuntimeDiagnosticRequest{
+		ExportID: export.ID, Instance: instance, Server: server, Language: "en", Actor: "owner",
+	}, log, nil); err != nil {
+		t.Fatal(err)
+	}
+	got, err := db.GetDiagnosticExport(export.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != "ready" || got.StorageKind != "local" || got.StorageRelativePath != path.Join(export.ID, archiveName) || got.RemoteRelativePath != "" {
+		t.Fatalf("unexpected local ready export: %+v", got)
+	}
+	if got.ArchiveBytes != int64(len(archive)) || got.WarningCount != 1 || got.ReservedBytes != 0 {
+		t.Fatalf("unexpected local archive metadata: %+v", got)
+	}
+	if remote.commandStreamCalls != 1 || remote.streamCalls != 0 {
+		t.Fatalf("unexpected stream calls: command=%d file=%d", remote.commandStreamCalls, remote.streamCalls)
+	}
+	steps, targetStatus := log.snapshot()
+	for _, step := range runtimeDiagnosticSteps {
+		if !containsString(steps, step+"=success") {
+			t.Fatalf("step %q did not finish successfully: %v", step, steps)
+		}
+	}
+	if targetStatus != "success" {
+		t.Fatalf("target status = %q", targetStatus)
+	}
+
+	var downloaded bytes.Buffer
+	if _, err := NewServiceWithDiagnosticStorage(db, remote, archives).StreamRuntimeDiagnosticExport(context.Background(), RuntimeDiagnosticStreamRequest{
+		Export: got, Instance: instance, Server: server, Language: "en",
+	}, &downloaded); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(downloaded.Bytes(), archive) || remote.streamCalls != 0 {
+		t.Fatal("local download did not read the aifar-server archive directly")
+	}
+	if err := NewServiceWithDiagnosticStorage(db, remote, archives).DeleteRuntimeDiagnosticExport(context.Background(), RuntimeDiagnosticDeleteRequest{
+		Export: got, Instance: instance, Server: server, Language: "en",
+	}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := archives.Open(got.StorageRelativePath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("deleted local archive remains readable: %v", err)
+	}
+}
+
+func TestExportRuntimeDiagnosticsDeletesFinalFileWhenReadyCommitFails(t *testing.T) {
+	now := time.Now().UTC().Add(-time.Minute)
+	db, instance, server, export := runtimeDiagnosticFixture(now)
+	export.StorageKind = "local"
+	db.exports[export.ID] = export
+	db.saveErrForStatus = map[string]error{"ready": errors.New("database unavailable")}
+	archiveName := "aifar-diagnostics-instance-1-" + export.CreatedAt.UTC().Format("20060102T150405Z") + ".tar.gz"
+	archive := runtimeDiagnosticTestArchive(t, strings.TrimSuffix(archiveName, ".tar.gz"))
+	remote := &runtimeDiagnosticRemote{
+		stdout:        "AIFAR_DIAG_SERVICE_V2\tgateway\t1\t1024\nAIFAR_DIAG_TOTAL_V2\t1\t1024\tAsia/Shanghai\t-",
+		commandStream: append([]byte(fmt.Sprintf("AIFAR_DIAG_STREAM_V1\t%s\t4096\t0\tAsia/Shanghai\n", archiveName)), archive...),
+	}
+	archives := NewRuntimeDiagnosticArchiveStorage(t.TempDir(), 5<<30, runtimeDiagnosticRetention, db)
+	err := NewServiceWithDiagnosticStorage(db, remote, archives).ExportRuntimeDiagnostics(context.Background(), RuntimeDiagnosticRequest{
+		ExportID: export.ID, Instance: instance, Server: server, Language: "en",
+	}, &recordingStepLogger{}, nil)
+	if err == nil {
+		t.Fatal("expected local database commit failure")
+	}
+	if _, openErr := archives.Open(path.Join(export.ID, archiveName)); !errors.Is(openErr, os.ErrNotExist) {
+		t.Fatalf("final archive survived failed database commit: %v", openErr)
+	}
+}
+
+func TestExportRuntimeDiagnosticsRejectsArchiveAboveLimitAndCleansBothSides(t *testing.T) {
+	now := time.Now().UTC().Add(-time.Minute)
+	db, instance, server, export := runtimeDiagnosticFixture(now)
+	export.StorageKind = "local"
+	db.exports[export.ID] = export
+	archiveName := "aifar-diagnostics-instance-1-" + export.CreatedAt.UTC().Format("20060102T150405Z") + ".tar.gz"
+	archive := runtimeDiagnosticTestArchive(t, strings.TrimSuffix(archiveName, ".tar.gz"))
+	remote := &runtimeDiagnosticRemote{
+		stdout:        "AIFAR_DIAG_SERVICE_V2\tgateway\t1\t1024\nAIFAR_DIAG_TOTAL_V2\t1\t1024\tAsia/Shanghai\t-",
+		commandStream: append([]byte(fmt.Sprintf("AIFAR_DIAG_STREAM_V1\t%s\t4096\t0\tAsia/Shanghai\n", archiveName)), archive...),
+	}
+	root := t.TempDir()
+	archives := newRuntimeDiagnosticArchiveStorageWithLimit(root, 5<<30, runtimeDiagnosticRetention, db, int64(len(archive)-1))
+	err := NewServiceWithDiagnosticStorage(db, remote, archives).ExportRuntimeDiagnostics(context.Background(), RuntimeDiagnosticRequest{
+		ExportID: export.ID, Instance: instance, Server: server, Language: "en",
+	}, &recordingStepLogger{}, nil)
+	if err == nil {
+		t.Fatal("expected archive limit failure")
+	}
+	if _, statErr := os.Stat(filepath.Join(root, export.ID, archiveName+".partial")); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("local partial survived archive limit failure: %v", statErr)
+	}
+	if commandContaining(remote.commands, "AIFAR_RUNTIME_DIAGNOSTIC_CLEANUP") == "" {
+		t.Fatal("remote partial cleanup was not attempted")
+	}
+}
+
+func TestExportRuntimeDiagnosticsCancellationAbortsLocalPartialAndRemoteWork(t *testing.T) {
+	now := time.Now().UTC().Add(-time.Minute)
+	db, instance, server, export := runtimeDiagnosticFixture(now)
+	export.StorageKind = "local"
+	db.exports[export.ID] = export
+	archiveName := "aifar-diagnostics-instance-1-" + export.CreatedAt.UTC().Format("20060102T150405Z") + ".tar.gz"
+	started := make(chan struct{})
+	remote := &runtimeDiagnosticRemote{
+		stdout: "AIFAR_DIAG_SERVICE_V2\tgateway\t1\t1024\nAIFAR_DIAG_TOTAL_V2\t1\t1024\tAsia/Shanghai\t-",
+		commandStreamHook: func(ctx context.Context, dst io.Writer) error {
+			if _, err := io.WriteString(dst, fmt.Sprintf("AIFAR_DIAG_STREAM_V1\t%s\t4096\t0\tAsia/Shanghai\n", archiveName)); err != nil {
+				return err
+			}
+			close(started)
+			<-ctx.Done()
+			return ctx.Err()
+		},
+	}
+	root := t.TempDir()
+	archives := NewRuntimeDiagnosticArchiveStorage(root, 5<<30, runtimeDiagnosticRetention, db)
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- NewServiceWithDiagnosticStorage(db, remote, archives).ExportRuntimeDiagnostics(ctx, RuntimeDiagnosticRequest{
+			ExportID: export.ID, Instance: instance, Server: server, Language: "en",
+		}, &recordingStepLogger{}, nil)
+	}()
+	select {
+	case <-started:
+		cancel()
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for streamed archive header")
+	}
+	if err := <-errCh; !errors.Is(err, context.Canceled) {
+		t.Fatalf("export error = %v, want context.Canceled", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(root, export.ID, archiveName+".partial")); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("local partial survived cancellation: %v", statErr)
+	}
+	got, err := db.GetDiagnosticExport(export.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != "cancelled" || got.ReservedBytes != 0 {
+		t.Fatalf("cancelled export state = %+v", got)
+	}
+	if commandContaining(remote.commands, "AIFAR_RUNTIME_DIAGNOSTIC_CLEANUP") == "" {
+		t.Fatal("remote partial cleanup was not attempted after cancellation")
+	}
+}
+
+func runtimeDiagnosticTestArchive(t *testing.T, root string) []byte {
+	t.Helper()
+	var compressed bytes.Buffer
+	gzipWriter := gzip.NewWriter(&compressed)
+	tarWriter := tar.NewWriter(gzipWriter)
+	for _, entry := range []struct {
+		name string
+		body string
+	}{
+		{root + "/README.txt", "readme\n"},
+		{root + "/manifest.json", "{}\n"},
+		{root + "/collection-errors.txt", ""},
+	} {
+		if err := tarWriter.WriteHeader(&tar.Header{Name: entry.name, Mode: 0o600, Size: int64(len(entry.body)), Typeflag: tar.TypeReg}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := io.WriteString(tarWriter, entry.body); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tarWriter.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := gzipWriter.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return compressed.Bytes()
+}
+
+func legacyRemovedExportRuntimeDiagnosticsPersistsReadyWithWarnings(t *testing.T) {
 	now := time.Now().UTC().Add(-time.Minute)
 	db, instance, _, export := runtimeDiagnosticFixture(now)
 	archiveName := "aifar-diagnostics-instance-1-" + export.CreatedAt.UTC().Format("20060102T150405Z") + ".tar.gz"
@@ -277,7 +662,7 @@ func TestExportRuntimeDiagnosticsPersistsReadyWithWarnings(t *testing.T) {
 	}
 }
 
-func TestExportRuntimeDiagnosticsCriticalFailureDeletesPartial(t *testing.T) {
+func legacyRemovedExportRuntimeDiagnosticsCriticalFailureDeletesPartial(t *testing.T) {
 	now := time.Now().UTC().Add(-time.Minute)
 	db, instance, _, export := runtimeDiagnosticFixture(now)
 	remote := &runtimeDiagnosticRemote{}
@@ -315,7 +700,7 @@ func TestExportRuntimeDiagnosticsCriticalFailureDeletesPartial(t *testing.T) {
 	}
 }
 
-func TestExportRuntimeDiagnosticsRecordFailureRemovesPromotedArchive(t *testing.T) {
+func legacyRemovedExportRuntimeDiagnosticsRecordFailureRemovesPromotedArchive(t *testing.T) {
 	now := time.Now().UTC().Add(-time.Minute)
 	db, instance, _, export := runtimeDiagnosticFixture(now)
 	db.saveErrForStatus = map[string]error{"ready": errors.New("database unavailable")}
@@ -383,73 +768,7 @@ func TestExportRuntimeDiagnosticsRejectsReadyWithoutMutationOrCleanup(t *testing
 	}
 }
 
-func TestExportRuntimeDiagnosticsCancellationCleansOnlyOwnPartial(t *testing.T) {
-	now := time.Now().UTC().Add(-time.Minute)
-	db, instance, _, export := runtimeDiagnosticFixture(now)
-	exportStarted := make(chan struct{})
-	remote := &runtimeDiagnosticRemote{}
-	remote.run = func(ctx context.Context, command string) (adapter.CommandResult, error) {
-		switch {
-		case strings.Contains(command, "AIFAR_RUNTIME_DIAGNOSTIC_ESTIMATE"):
-			return adapter.CommandResult{Stdout: runtimeDiagnosticEstimateOutput()}, nil
-		case strings.Contains(command, "AIFAR_RUNTIME_DIAGNOSTIC_EXPORT"):
-			close(exportStarted)
-			<-ctx.Done()
-			return adapter.CommandResult{}, ctx.Err()
-		case strings.Contains(command, "AIFAR_RUNTIME_DIAGNOSTIC_CLEANUP"):
-			if ctx.Err() != nil {
-				t.Fatalf("cleanup must use an independent background context: %v", ctx.Err())
-			}
-			return adapter.CommandResult{}, nil
-		default:
-			return adapter.CommandResult{}, errors.New("unexpected remote command")
-		}
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	errCh := make(chan error, 1)
-	go func() {
-		errCh <- NewService(db, remote).ExportRuntimeDiagnostics(ctx, RuntimeDiagnosticRequest{
-			ExportID: export.ID, Instance: instance, Language: "en", Actor: "owner",
-		}, &recordingStepLogger{}, nil)
-	}()
-	select {
-	case <-exportStarted:
-	case err := <-errCh:
-		t.Fatalf("export exited before collector start: %v", err)
-	case <-time.After(5 * time.Second):
-		t.Fatal("timed out waiting for export collector start")
-	}
-	cancel()
-	err := <-errCh
-	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("expected context.Canceled, got %v", err)
-	}
-	got, getErr := db.GetDiagnosticExport(export.ID)
-	if getErr != nil {
-		t.Fatal(getErr)
-	}
-	if got.Status != "cancelled" || got.RemoteRelativePath != "" || got.CleanupStatus != "complete" {
-		t.Fatalf("cancelled export must clean only its incomplete roots: %+v", got)
-	}
-	cleanup := commandContaining(remote.commands, "AIFAR_RUNTIME_DIAGNOSTIC_CLEANUP")
-	for _, required := range []string{
-		"EXPORT_ID='" + export.ID + "'",
-		`case "$pid:$recorded_start:$recorded_pgid" in`,
-		`"$current_start" = "$recorded_start"`,
-		`"$KILL_COMMAND" -0 -- "-$recorded_pgid"`,
-		`PARTIAL_ROOT="$DIAGNOSTICS_ROOT/$EXPORT_ID.partial"`,
-		`FINAL_ROOT="$DIAGNOSTICS_ROOT/$EXPORT_ID"`,
-	} {
-		if !strings.Contains(cleanup, required) {
-			t.Fatalf("cleanup is missing %q:\n%s", required, cleanup)
-		}
-	}
-	if strings.Contains(cleanup, `rm -rf -- "$LOG_ROOT`) || strings.Contains(cleanup, `rm -rf -- "$INSTALL_ROOT/runtime/logs`) {
-		t.Fatalf("cleanup must never remove original runtime logs:\n%s", cleanup)
-	}
-}
-
-func TestRuntimeDiagnosticExportScriptSecurityContract(t *testing.T) {
+func legacyRemovedRuntimeDiagnosticExportScriptSecurityContract(t *testing.T) {
 	script, err := renderRuntimeDiagnosticExportScript(runtimeDiagnosticExportScriptData{
 		InstallRoot:    "'/aifar/apps/admin'",
 		ExportID:       "'diag_1234567890abcdef12345678'",
@@ -529,7 +848,7 @@ func TestRuntimeDiagnosticExportScriptSecurityContract(t *testing.T) {
 	}
 }
 
-func TestRuntimeDiagnosticExportUsesRevalidatedImmutableContainerIDs(t *testing.T) {
+func legacyRemovedRuntimeDiagnosticExportUsesRevalidatedImmutableContainerIDs(t *testing.T) {
 	containerID := strings.Repeat("a", 64)
 	for _, tc := range []struct {
 		name         string
@@ -614,7 +933,7 @@ func TestRuntimeDiagnosticExportUsesRevalidatedImmutableContainerIDs(t *testing.
 	}
 }
 
-func TestRuntimeDiagnosticExportJSONEscape(t *testing.T) {
+func legacyRemovedRuntimeDiagnosticExportJSONEscape(t *testing.T) {
 	sh := runtimeDiagnosticTestShell(t)
 	script, err := renderRuntimeDiagnosticExportScript(runtimeDiagnosticExportScriptData{})
 	if err != nil {
@@ -634,7 +953,7 @@ func TestRuntimeDiagnosticExportJSONEscape(t *testing.T) {
 	}
 }
 
-func TestRuntimeDiagnosticExportRedactsStructuredAndMultilineSecrets(t *testing.T) {
+func legacyRemovedRuntimeDiagnosticExportRedactsStructuredAndMultilineSecrets(t *testing.T) {
 	sh := runtimeDiagnosticTestShell(t)
 	script, err := renderRuntimeDiagnosticExportScript(runtimeDiagnosticExportScriptData{})
 	if err != nil {
@@ -972,7 +1291,7 @@ func findRuntimeDiagnosticBash(t *testing.T) string {
 	return path
 }
 
-func TestRuntimeDiagnosticExportRedactionFailsWhenIntermediateCommandFails(t *testing.T) {
+func legacyRemovedRuntimeDiagnosticExportRedactionFailsWhenIntermediateCommandFails(t *testing.T) {
 	sh := runtimeDiagnosticTestShell(t)
 	script, err := renderRuntimeDiagnosticExportScript(runtimeDiagnosticExportScriptData{})
 	if err != nil {
@@ -1228,7 +1547,7 @@ func TestRuntimeDiagnosticDeleteRetriesFailedAndCancelledCleanup(t *testing.T) {
 	}
 }
 
-func TestExportRuntimeDiagnosticsDoesNotClaimUnexecutedRemoteSteps(t *testing.T) {
+func legacyRemovedExportRuntimeDiagnosticsDoesNotClaimUnexecutedRemoteSteps(t *testing.T) {
 	now := time.Now().UTC().Add(-time.Minute)
 	db, instance, _, export := runtimeDiagnosticFixture(now)
 	remote := &runtimeDiagnosticRemote{}
@@ -1473,7 +1792,7 @@ func runtimeDiagnosticArchiveFile(t *testing.T, sh, archiveNative, relative stri
 	return string(output)
 }
 
-func TestRuntimeDiagnosticExportFailsClosedWhenFileLimitCannotBeSet(t *testing.T) {
+func legacyRemovedRuntimeDiagnosticExportFailsClosedWhenFileLimitCannotBeSet(t *testing.T) {
 	sh := runtimeDiagnosticTestShell(t)
 	script, err := renderRuntimeDiagnosticExportScript(runtimeDiagnosticExportScriptData{})
 	if err != nil {
@@ -1681,7 +2000,7 @@ func TestRuntimeDiagnosticExportExcludesSensitiveNamesAndIntermediateFiles(t *te
 	}
 }
 
-func TestRuntimeDiagnosticExportLogAllowlistRejectsUnsafeRelativePaths(t *testing.T) {
+func legacyRemovedRuntimeDiagnosticExportLogAllowlistRejectsUnsafeRelativePaths(t *testing.T) {
 	sh := runtimeDiagnosticTestShell(t)
 	script, err := renderRuntimeDiagnosticExportScript(runtimeDiagnosticExportScriptData{})
 	if err != nil {
@@ -1707,7 +2026,7 @@ func TestRuntimeDiagnosticExportLogAllowlistRejectsUnsafeRelativePaths(t *testin
 	}
 }
 
-func TestRuntimeDiagnosticExportContinuesAfterIndividualDiagnosticCommandFailure(t *testing.T) {
+func legacyRemovedRuntimeDiagnosticExportContinuesAfterIndividualDiagnosticCommandFailure(t *testing.T) {
 	tests := []struct {
 		name             string
 		configure        func(*runtimeDiagnosticExportShellFixture)
@@ -1808,7 +2127,7 @@ func TestRuntimeDiagnosticExportContinuesAfterIndividualDiagnosticCommandFailure
 	}
 }
 
-func TestRuntimeDiagnosticExportBoundsFileSnapshotByRemainingBytes(t *testing.T) {
+func legacyRemovedRuntimeDiagnosticExportBoundsFileSnapshotByRemainingBytes(t *testing.T) {
 	t.Run("oversized source is rejected before copy", func(t *testing.T) {
 		fixture := newRuntimeDiagnosticExportShellFixture(t)
 		fixture.maxStagedSize = 8192
@@ -2055,7 +2374,7 @@ func TestEstimateRuntimeDiagnosticsRejectsDisabledAndUnknownServices(t *testing.
 	}
 }
 
-func TestEstimateRuntimeDiagnosticsRendersTrustedSelectionAndComputesAllowed(t *testing.T) {
+func legacyRemovedEstimateRuntimeDiagnosticsRendersTrustedSelectionAndComputesAllowed(t *testing.T) {
 	now := time.Now().UTC()
 	instance := store.AppInstance{
 		ID:       "instance'; echo injected",
