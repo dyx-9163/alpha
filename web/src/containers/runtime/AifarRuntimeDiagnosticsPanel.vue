@@ -69,7 +69,6 @@
         </el-form-item>
         <div class="runtime-diagnostics-estimate-actions">
           <el-button :loading="estimating" @click="runEstimate">{{ estimating ? t('containers.diagnosticsEstimating') : t('containers.diagnosticsEstimate') }}</el-button>
-          <el-checkbox v-model="deleteAfterDownload">{{ t('containers.diagnosticsDeleteAfterDownload') }}</el-checkbox>
         </div>
       </el-form>
 
@@ -115,6 +114,8 @@ import {
 import {
   defaultRuntimeDiagnosticWindow,
   enabledRuntimeDiagnosticServices,
+  runtimeDiagnosticExportScopeFingerprint,
+  runtimeDiagnosticRequestFingerprint,
   runtimeDiagnosticStatusKey,
   runtimeDiagnosticSubmitDisabledReason,
   terminalDiagnosticTaskToRefresh
@@ -136,13 +137,16 @@ const selectedServices = ref<string[]>([])
 const sinceAt = ref<Date>()
 const untilAt = ref<Date>()
 const estimate = ref<RuntimeDiagnosticEstimate | null>(null)
+const estimateFingerprint = ref('')
 const exportsPage = ref<RuntimeDiagnosticExportPage>({ items: [], total: 0, page: 1, pageSize: 20 })
-const deleteAfterDownload = ref(false)
 const estimating = ref(false)
 const submitting = ref(false)
 const trackedTaskIds = new Set<string>()
 const refreshedTaskIds = new Set<string>()
 const threeGiB = 3 * 1024 * 1024 * 1024
+const objectUrlCleanupDelayMs = 30 * 1000
+let exportsRequestSequence = 0
+let estimateRequestSequence = 0
 
 const availableServices = computed(() => enabledRuntimeDiagnosticServices(props.deployments))
 const diagnosticRange = computed({
@@ -152,43 +156,58 @@ const diagnosticRange = computed({
     untilAt.value = value?.[1]
   }
 })
+const diagnosticRequestFingerprint = computed(() => {
+  const request = payload()
+  return request ? runtimeDiagnosticRequestFingerprint(props.targetQuery, request) : ''
+})
+const currentEstimate = computed(() => estimateFingerprint.value === diagnosticRequestFingerprint.value ? estimate.value : null)
 const submitDisabledReason = computed(() => runtimeDiagnosticSubmitDisabledReason({
   services: selectedServices.value,
-  estimate: estimate.value,
+  estimate: currentEstimate.value,
   estimating: estimating.value,
   submitting: submitting.value
 }))
 
-watch([mode, selectedServices, sinceAt, untilAt], () => {
-  if (mode.value === 'last2h') {
-    const window = defaultRuntimeDiagnosticWindow()
-    sinceAt.value = window.sinceAt
-    untilAt.value = window.untilAt
-  }
-  estimate.value = null
-}, { deep: true })
-watch(() => [props.instanceId, props.targetQuery], () => { void loadExports() }, { immediate: true })
+watch(mode, (next) => {
+  if (next === 'last2h') resetDiagnosticWindow()
+  invalidateEstimate()
+})
+watch([selectedServices, sinceAt, untilAt], invalidateEstimate, { deep: true })
+watch(() => [props.instanceId, props.targetQuery], () => {
+  invalidateEstimate()
+  void loadExports()
+}, { immediate: true })
 watch(() => taskProgress.items.map(({ id, status }) => ({ id, status })), (items) => {
-  const taskId = terminalDiagnosticTaskToRefresh(items, trackedTaskIds, refreshedTaskIds)
-  if (taskId) {
-    refreshedTaskIds.add(taskId)
+  const taskIds = terminalDiagnosticTaskToRefresh(items, trackedTaskIds, refreshedTaskIds)
+  if (taskIds.length) {
+    taskIds.forEach((taskId) => refreshedTaskIds.add(taskId))
     void loadExports()
   }
 }, { deep: true })
 
 function openDialog() {
-  const window = defaultRuntimeDiagnosticWindow()
   mode.value = 'last2h'
-  sinceAt.value = window.sinceAt
-  untilAt.value = window.untilAt
+  resetDiagnosticWindow()
   selectedServices.value = availableServices.value
-  estimate.value = null
-  deleteAfterDownload.value = false
+  invalidateEstimate()
   dialogVisible.value = true
 }
 
 function resetDialog() {
+  invalidateEstimate()
+}
+
+function resetDiagnosticWindow() {
+  const window = defaultRuntimeDiagnosticWindow()
+  sinceAt.value = window.sinceAt
+  untilAt.value = window.untilAt
+}
+
+function invalidateEstimate() {
+  estimateRequestSequence++
   estimate.value = null
+  estimateFingerprint.value = ''
+  estimating.value = false
 }
 
 function payload(): RuntimeDiagnosticRequest | null {
@@ -203,14 +222,22 @@ function payload(): RuntimeDiagnosticRequest | null {
 
 async function runEstimate() {
   const request = payload()
-  if (!request) return
+  const requestFingerprint = request ? runtimeDiagnosticRequestFingerprint(props.targetQuery, request) : ''
+  if (!request || !requestFingerprint) return
+  const requestSequence = ++estimateRequestSequence
+  estimate.value = null
+  estimateFingerprint.value = ''
   estimating.value = true
   try {
-    estimate.value = await estimateRuntimeDiagnostics(props.targetQuery, request)
+    const result = await estimateRuntimeDiagnostics(props.targetQuery, request)
+    if (requestSequence === estimateRequestSequence && requestFingerprint === diagnosticRequestFingerprint.value) {
+      estimate.value = result
+      estimateFingerprint.value = requestFingerprint
+    }
   } catch (err) {
-    ElMessage.error(errorMessage(err))
+    if (requestSequence === estimateRequestSequence) ElMessage.error(errorMessage(err))
   } finally {
-    estimating.value = false
+    if (requestSequence === estimateRequestSequence) estimating.value = false
   }
 }
 
@@ -231,20 +258,30 @@ async function submit() {
 }
 
 async function loadExports() {
+  const requestSequence = ++exportsRequestSequence
+  const requestScope = runtimeDiagnosticExportScopeFingerprint(props.targetQuery, props.instanceId)
   if (!props.instanceId || !props.targetQuery) {
-    exportsPage.value = { items: [], total: 0, page: 1, pageSize: 20 }
+    if (requestSequence === exportsRequestSequence) {
+      exportsPage.value = { items: [], total: 0, page: 1, pageSize: 20 }
+    }
     return
   }
   try {
-    exportsPage.value = await fetchRuntimeDiagnosticExports(props.targetQuery, props.instanceId)
+    const page = await fetchRuntimeDiagnosticExports(props.targetQuery, props.instanceId)
+    if (requestSequence === exportsRequestSequence && requestScope === currentExportScope()) {
+      exportsPage.value = page
+    }
   } catch (err) {
-    ElMessage.error(errorMessage(err))
+    if (requestSequence === exportsRequestSequence && requestScope === currentExportScope()) ElMessage.error(errorMessage(err))
   }
 }
 
 async function download(row: RuntimeDiagnosticExport) {
+  const deleteAfterDownload = await chooseDeleteAfterDownload()
+  if (deleteAfterDownload === null) return
   try {
-    const result = await downloadRuntimeDiagnosticExport(props.targetQuery, row.id, deleteAfterDownload.value)
+    const result = await downloadRuntimeDiagnosticExport(props.targetQuery, row.id, deleteAfterDownload)
+    if (deleteAfterDownload) await loadExports()
     if (row.sha256 && result.sha256 && row.sha256.toLowerCase() !== result.sha256.toLowerCase()) {
       ElMessage.error(t('containers.diagnosticsChecksumMismatch'))
       return
@@ -256,10 +293,25 @@ async function download(row: RuntimeDiagnosticExport) {
     document.body.append(anchor)
     anchor.click()
     anchor.remove()
-    window.setTimeout(() => URL.revokeObjectURL(url), 0)
+    window.setTimeout(() => URL.revokeObjectURL(url), objectUrlCleanupDelayMs)
     ElMessage.success(t('containers.diagnosticsDownloadStarted'))
   } catch (err) {
     ElMessage.error(errorMessage(err) || t('containers.diagnosticsDownloadFailed'))
+  }
+}
+
+async function chooseDeleteAfterDownload(): Promise<boolean | null> {
+  try {
+    await ElMessageBox.confirm(t('containers.diagnosticsDownloadDeleteChoice'), t('common.download'), {
+      type: 'warning',
+      confirmButtonText: t('containers.diagnosticsDeleteAfterDownload'),
+      cancelButtonText: t('common.download'),
+      distinguishCancelAndClose: true
+    })
+    return true
+  } catch (err) {
+    if (err === 'cancel') return false
+    return null
   }
 }
 
@@ -278,6 +330,10 @@ function trackTask(taskId: string, label: string) {
   if (!taskId) return
   trackedTaskIds.add(taskId)
   taskProgress.track(taskId, label)
+}
+
+function currentExportScope() {
+  return runtimeDiagnosticExportScopeFingerprint(props.targetQuery, props.instanceId)
 }
 
 function openTask(taskId: string) {

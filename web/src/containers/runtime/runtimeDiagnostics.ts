@@ -1,4 +1,4 @@
-import type { AifarRuntimeDeployment, RuntimeDiagnosticEstimate, RuntimeDiagnosticExport } from './types'
+import type { AifarRuntimeDeployment, RuntimeDiagnosticEstimate, RuntimeDiagnosticExport, RuntimeDiagnosticRequest } from './types'
 
 export type RuntimeDiagnosticSubmitState = {
   services: string[]
@@ -28,8 +28,24 @@ export function runtimeDiagnosticSubmitDisabledReason(input: RuntimeDiagnosticSu
   return input.estimate.allowed ? '' : 'estimate-blocked'
 }
 
+export function runtimeDiagnosticRequestFingerprint(query: string, request: RuntimeDiagnosticRequest) {
+  return JSON.stringify({
+    query,
+    instanceId: request.instanceId,
+    sinceAt: request.sinceAt,
+    untilAt: request.untilAt,
+    services: [...request.services].sort()
+  })
+}
+
+export function runtimeDiagnosticExportScopeFingerprint(query: string, instanceId: string) {
+  return `${query}\u0000${instanceId}`
+}
+
 export function terminalDiagnosticTaskToRefresh(items: Array<{ id: string; status: string }>, tracked: Set<string>, refreshed: Set<string>) {
-  return items.find((item) => tracked.has(item.id) && !refreshed.has(item.id) && ['success', 'failed', 'cancelled'].includes(item.status))?.id ?? ''
+  return items
+    .filter((item) => tracked.has(item.id) && !refreshed.has(item.id) && ['success', 'failed', 'cancelled'].includes(item.status))
+    .map((item) => item.id)
 }
 
 export function runtimeDiagnosticStatusKey(row: RuntimeDiagnosticExport) {

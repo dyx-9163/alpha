@@ -150,6 +150,10 @@
   margin-top: 12px;
 }
 
+.runtime-diagnostics-dialog {
+  max-width: calc(100vw - 32px);
+}
+
 .runtime-diagnostics-services {
   display: flex;
   flex-wrap: wrap;
