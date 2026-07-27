@@ -9,7 +9,7 @@
       <el-button size="small" type="primary" :disabled="!instanceId" @click="openDialog">{{ t('containers.diagnosticsExport') }}</el-button>
     </div>
 
-    <el-table :data="exportsPage.items" class="runtime-diagnostics-table">
+    <el-table :data="exportsPage.items" class="runtime-diagnostics-table" height="100%">
       <el-table-column :label="t('common.status')" width="176">
         <template #default="{ row }">
           <div class="runtime-diagnostics-status">

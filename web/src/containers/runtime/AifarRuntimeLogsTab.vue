@@ -132,16 +132,15 @@
 </template>
 
 <script setup lang="ts">
-import { ref, watch } from 'vue'
 import StatusTag from '../../components/StatusTag.vue'
 import AifarRuntimeDiagnosticsPanel from './AifarRuntimeDiagnosticsPanel.vue'
 import { runtimeLogLevelOptions, runtimeLogLevelTag } from './logs'
 import { useAifarRuntimeContext } from './context'
 import {
   runtimeLogWorkspaceTabLabels,
-  runtimeLogWorkspaceTabOrder,
-  type RuntimeLogWorkspaceTab
+  runtimeLogWorkspaceTabOrder
 } from './surface'
+import { useRuntimeLogWorkspaceTab } from './runtimeLogWorkspace'
 
 const {
   t,
@@ -184,10 +183,5 @@ const {
   runtimeLogBottomSpacer
 } = useAifarRuntimeContext()
 
-const runtimeLogWorkspaceTab = ref<RuntimeLogWorkspaceTab>('live')
-
-watch(
-  () => [selectedRuntimeInstanceId.value, runtimeTargetQuery()],
-  () => { runtimeLogWorkspaceTab.value = 'live' }
-)
+const runtimeLogWorkspaceTab = useRuntimeLogWorkspaceTab(selectedRuntimeInstanceId, runtimeTargetQuery)
 </script>

@@ -1,22 +1,31 @@
-// @ts-expect-error Vitest supplies the Node runtime module; the web build omits Node typings.
-import { readFileSync } from 'node:fs'
+import { nextTick, ref } from 'vue'
 import { describe, expect, it } from 'vitest'
-
-const source = readFileSync(new URL('./AifarRuntimeLogsTab.vue', import.meta.url), 'utf8')
-const diagnosticsSource = readFileSync(new URL('./AifarRuntimeDiagnosticsPanel.vue', import.meta.url), 'utf8')
+import { useRuntimeLogWorkspaceTab } from './runtimeLogWorkspace'
 
 describe('AIFAR Runtime focused logs workspace', () => {
-  it('separates realtime logs and diagnostic archives', () => {
-    expect(source).toContain('v-model="runtimeLogWorkspaceTab"')
-    expect(source).toContain('runtimeLogWorkspaceTabOrder')
-    expect(source).toContain(':name="tabName"')
-    expect(source).toContain("tabName === 'archives'")
-    expect(source).toContain('<AifarRuntimeDiagnosticsPanel')
+  it('defaults to live logs and resets after the Runtime instance changes', async () => {
+    const instanceId = ref('runtime-a')
+    const targetQuery = ref('server=server-a')
+    const runtimeLogWorkspaceTab = useRuntimeLogWorkspaceTab(instanceId, () => targetQuery.value)
+
+    expect(runtimeLogWorkspaceTab.value).toBe('live')
+
+    runtimeLogWorkspaceTab.value = 'archives'
+    instanceId.value = 'runtime-b'
+    await nextTick()
+
+    expect(runtimeLogWorkspaceTab.value).toBe('live')
   })
 
-  it('uses a compact six-column diagnostic table', () => {
-    expect(diagnosticsSource.match(/<el-table-column/g) ?? []).toHaveLength(6)
-    expect(diagnosticsSource).toContain('runtimeDiagnosticServicePreview')
-    expect(diagnosticsSource).not.toContain('max-height="280"')
+  it('resets to live logs after the server target changes', async () => {
+    const instanceId = ref('runtime-a')
+    const targetQuery = ref('server=server-a')
+    const runtimeLogWorkspaceTab = useRuntimeLogWorkspaceTab(instanceId, () => targetQuery.value)
+
+    runtimeLogWorkspaceTab.value = 'archives'
+    targetQuery.value = 'server=server-b'
+    await nextTick()
+
+    expect(runtimeLogWorkspaceTab.value).toBe('live')
   })
 })
