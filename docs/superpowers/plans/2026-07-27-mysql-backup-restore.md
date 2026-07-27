@@ -26,6 +26,7 @@
 - `AIFAR_MYSQL_BACKUP_KEEP_LAST` is the default retention count. A backup request may provide a positive `keepLast` override; the handler validates it and falls back to configuration when omitted. The repository directory is always server-owned and cannot be overridden by request JSON.
 - Synchronous backup deletion preserves the original creation `task_id`; deletion identity and actor belong in audit rather than replacing backup provenance.
 - The backup repository uses a trusted-single-writer threat model. Its root is owned exclusively by the panel service account (`0700` on Linux); every repository lifecycle operation holds an in-process mutex and an exclusive cross-process `.aifar-repository.lock` (`0600`). Failure to acquire the lock fails closed. API path escape, symlink, non-regular-file, checksum, and wrong-target protections remain required, but malicious `root` or same-UID writers that bypass the repository API are out of scope.
+- New logical and pre-restore backups emit manifest v2. Its verification expectations come only from a successfully completed MySQL Shell dump: normalized regular-file inventory plus `sha256-nul-records-v1`, the complete business schema/base-table set and counts, every base table's `rowsWritten`, and the first three primary-key base tables per schema in UTF-8 byte order. Missing or ambiguous dump metadata fails backup; live source queries never fill gaps. Legacy v1 manifests remain listable/verifiable/deletable but every destructive restore or rebuild rejects them with `MYSQL_RESTORE_MANIFEST_INVALID` before remote mutation.
 
 ## File and Responsibility Map
 
@@ -235,6 +236,7 @@ type RestoreModule interface {
 
 ```go
 type BackupManifest struct {
+    ManifestVersion  int                `json:"manifestVersion,omitempty"`
     BackupID         string             `json:"backupId"`
     App              string             `json:"app"`
     Topology         string             `json:"topology"`
@@ -249,6 +251,7 @@ type BackupManifest struct {
     ExcludedSchemas  []string           `json:"excludedSchemas"`
     Consistent       bool               `json:"consistent"`
     GTIDExecuted     string             `json:"gtidExecuted"`
+    Verification     *DumpVerification  `json:"verification,omitempty"`
     Members          []ClusterMemberRef `json:"members,omitempty"`
     Routers          []RouterRef        `json:"routers,omitempty"`
     CreatedAt        time.Time          `json:"createdAt"`
@@ -256,8 +259,12 @@ type BackupManifest struct {
 }
 ```
 
+- [ ] Treat absent `manifestVersion` or explicit `1` as legacy v1, reject every other unknown version, and require `manifestVersion=2` plus a non-nil, strictly normalized `verification` block for every newly created backup. Add v2 types for canonical dump file entries, schema/base-table entries, per-table `rowsWritten`/primary-key eligibility, deterministic sample entries, and their declared counts/algorithms; require top-level `schemas` to match verification schema names exactly.
+- [ ] Add fixture-driven tests using completed MySQL Shell 8.0.36 dump metadata. Require the completion marker, reject missing/malformed/ambiguous metadata and negative/overflow counts, and prove no live MySQL inspection is used to construct verification expectations.
+- [ ] Define the inventory as every regular file below the dump root, excluding repository manifest/checksum/archive files. Normalize relative UTF-8 POSIX paths, reject absolute/dot-dot/backslash/NUL/duplicate/symlink/special entries, sort by UTF-8 path bytes, hash every file, and implement `sha256-nul-records-v1` exactly as the design defines.
+- [ ] Persist the complete sorted business schema/base-table set and exact counts; views/triggers/routines/events are restored but excluded from this first-version table gate. Require `rowsWritten` for every base table; select at most three primary-key base tables per schema with `primary-key-lexicographic-first-3-v1`, and assert sampled expectations are exact copies of their table records.
 - [ ] Write manifest tests that require `app=mysql`, one allowed topology, exact version fields, non-empty business schemas, fixed system-schema exclusion, `consistent=true`, and no secret-shaped keys or values in recursive JSON.
-- [ ] Add compatibility tests: topology must match, MySQL full version must match in v1, backup type must be `logical-full` or `pre-restore`, and a cluster manifest requires cluster ID, source PRIMARY, three unique members, and all members `ONLINE`.
+- [ ] Add compatibility tests: topology must match, MySQL full version must match in the initial release, backup type must be `logical-full` or `pre-restore`, and a cluster manifest requires cluster ID, source PRIMARY, three unique members, and all members `ONLINE`.
 - [ ] Add snapshot tests for rendered backup script containing `consistent:true`, `users:false`, `showProgress:false`, zstd compression, explicit `mysql_innodb_cluster_metadata` exclusion, and no `rootPassword` interpolation.
 - [ ] Add snapshot tests for rendered restore script containing `loadUsers:false`, `ignoreExistingObjects:false`, `skipBinlog:false`, `showProgress:false`, and a secret context file read rather than a command-line password.
 - [ ] Run `cd backend; go test ./internal/apps/mysql -run 'Test(BackupManifest|RenderLogical)'` and confirm failure.
@@ -289,6 +296,7 @@ lock: app-instance/<instanceId>/mutate
 ```
 
 - [ ] Add MySQL service tests for the exact standalone step sequence from design section 8 and a successful flow: load bound admin credential, inspect version/schemas/space, create `app_backups` pending/running, dump once, package once, download to `.partial`, commit repository files, mark success, run retention, and clean remote workdir.
+- [ ] Build manifest v2 only after dump completion. Parse the completed dump artifacts, validate the inventory/schema/base-table/row-count/sample contract, and fail the backup before packaging/record success when expectations cannot be derived exactly; do not issue source `COUNT(*)` queries as a fallback.
 - [ ] Add failure tests for missing/inactive/ambiguous credential, absent `FileDownloader`, mysqlsh failure, system schema discovery, insufficient source/panel space, transfer cancellation, checksum mismatch, and cleanup failure. Assert no final archive and a retained failed record.
 - [ ] Run `cd backend; go test ./internal/apps/mysql -run 'TestBackupStandalone'` and confirm the tests fail.
 - [ ] Implement `PlanBackup` and `Backup` on `mysql.Module`; resolve credential at execution time, derive `/aifar/apps/mysql/_backup/<taskId>/`, create no command from request text, and avoid logging secret material.
@@ -363,12 +371,15 @@ lock: app-instance/<instanceId>/mutate
 ```
 
 - [ ] Add service tests for the exact section 9 plan, including repository verification before remote mutation, matching standalone/full version, mandatory pre-restore backup for readable targets, upload/extract, exact schema drop, `ignoreExistingObjects:false`, verification, and cleanup.
+- [ ] Add a pre-mutation compatibility test proving legacy v1 manifests return `MYSQL_RESTORE_MANIFEST_INVALID` before upload, `local_infile` changes, schema discovery/drop, or any other remote mutation. Only v2 manifests with a valid verification block can enter destructive restore.
+- [ ] Add final-gate tests proving restore success requires all four checks: MySQL ping; exact business schema/base-table names and declared counts; exact `COUNT(*)` for every deterministic sampled table against its dump `rowsWritten`; and a canonical manifest SHA-256 equal to the current task's immutable `restoreExpectedManifestSha256`. Extra/missing tables, one row mismatch, repository manifest replacement, task-ID mismatch, or a digest mismatch must persist `restore_incomplete` and return `MYSQL_RESTORE_INCOMPLETE`.
 - [ ] Add `local_infile` tests for original OFF/ON values across success, dump-load failure, cancellation, and verification failure. Every reachable path must restore the original value.
 - [ ] Add an unreachable-finally test proving the task returns `MYSQL_LOCAL_INFILE_RESTORE_FAILED`, writes exact non-secret `metadata.mysqlReconciliation={version:1,kind:"local_infile",originalValue:"ON|OFF",recordedAt:<UTC RFC3339>,taskId:<current task ID>}`, and does not report restore success. Unknown/malformed markers fail closed with `MYSQL_RECONCILIATION_REQUIRED`; successful reconciliation clears the whole marker only after verifying the recorded value. New restore work never emits the legacy alias `MYSQL_RESTORE_LOCAL_INFILE_RESTORE_FAILED`.
 - [ ] Add reconciliation tests proving backup/restore/check first reads the marker, reconnects, restores the recorded original value, clears the marker only after verification, and otherwise returns `MYSQL_RECONCILIATION_REQUIRED` before lifecycle work.
 - [ ] Run `cd backend; go test ./internal/apps/mysql -run 'Test(RestoreStandalone|LocalInfile|Reconcile)'` and confirm failure.
 - [ ] Implement a `localInfileGuard` with explicit `Capture`, `Enable`, and idempotent `Restore` methods. Ensure deferred restoration uses a cleanup context with a bounded timeout rather than the already-cancelled task context.
 - [ ] Implement restore state transitions in non-secret `app_backups.metadata`: `preflight`, `pre_restore_complete`, `schema_mutation_started`, `load_complete`, `verified`, or `restore_incomplete`. Do not auto-restore the pre-restore backup.
+- [ ] Before any remote mutation, reread and normalize the repository manifest, compute its canonical SHA-256, and persist `restoreTaskId` plus immutable `restoreExpectedManifestSha256` in non-secret `app_backups.metadata`. At final verification reread the repository copy and require both values to match the current task before writing `verified`.
 - [ ] Add handler tests for owner-only restore, missing maintenance confirmation, topology mismatch, task/plan/lock/audit creation, and rejection before mutation for a failed verification.
 - [ ] Mount the restore route under owner authorization by adding a small `requireOwner` middleware using `rbac.NormalizeRole(currentUser(r).Role) == "owner"`; keep backup/list/verify under their documented permissions.
 - [ ] Invoke reconciliation at the beginning of MySQL `Check`, `Backup`, and `Restore`. Add a focused regression test that existing check behavior remains unchanged when no marker exists.
@@ -511,6 +522,7 @@ export interface MySQLBackupRecord {
 - [ ] Run the complete local gate once at final convergence: `pnpm test:local`.
 - [ ] Inspect `git diff --check`, `git status --short`, and `git diff --stat`; confirm no credentials, generated archives, `.partial` files, database files, or unrelated user changes are staged.
 - [ ] Execute the manual acceptance matrix on one standalone and one disposable three-node MySQL 8.0.36 environment. Record task IDs, backup IDs, checksums, member states, Router 6446 read/write result, `local_infile` before/after values, RPO/RTO, and cleanup status without recording secrets.
+- [ ] In the standalone acceptance, retain the desensitized manifest v2 evidence: completion-derived inventory digest, exact schema/base-table counts, sampled table names/expected `rowsWritten`, post-restore exact counts, and matching task/manifest digest. Also demonstrate that a v1 fixture remains listable/verifiable but is rejected before destructive restore.
 - [ ] Append the reusable implementation result and verification status to `memory.md`; keep `memory.md` out of the feature commit unless repository policy for the executing session explicitly includes it.
 - [ ] Commit documentation only: `git add docs/mysql-backup-restore-runbook.md README.md && git commit -m "docs: add MySQL backup restore runbook"`.
 

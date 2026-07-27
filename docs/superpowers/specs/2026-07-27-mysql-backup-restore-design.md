@@ -86,10 +86,11 @@ data/mysql-backups/<backupId>/
 - `task_id`：创建该备份的 worker task
 - `metadata`：`clusterId`、版本、schema 摘要、来源 PRIMARY、成员快照等非敏感信息
 
-`backup-manifest.json` 至少包含：
+`backup-manifest.json` 使用显式版本。历史上没有 `manifestVersion` 的记录和显式值 `1` 都按 v1 解释；其它未知版本失败关闭。新备份只生成 v2。v2 结构固定为：
 
 ```json
 {
+  "manifestVersion": 2,
   "backupId": "backup_mysql_20260727_xxx",
   "app": "mysql",
   "topology": "standalone",
@@ -100,7 +101,7 @@ data/mysql-backups/<backupId>/
   "sourceServerUuid": "uuid",
   "mysqlVersion": "8.0.36",
   "mysqlShellVersion": "8.0.x",
-  "schemas": ["aifar_nacos", "aifar_business"],
+  "schemas": ["aifar_business"],
   "excludedSchemas": [
     "mysql",
     "sys",
@@ -110,12 +111,51 @@ data/mysql-backups/<backupId>/
   ],
   "consistent": true,
   "gtidExecuted": "...",
+  "verification": {
+    "source": "mysql-shell-dump",
+    "inventoryAlgorithm": "sha256-nul-records-v1",
+    "inventorySha256": "64-lowercase-hex",
+    "files": [
+      {"path": "@.json", "size": 1024, "sha256": "64-lowercase-hex"}
+    ],
+    "schemaCount": 1,
+    "tableCount": 2,
+    "schemas": [
+      {
+        "name": "aifar_business",
+        "tableCount": 2,
+        "tables": [
+          {"name": "orders", "rowsWritten": 1200, "hasPrimaryKey": true},
+          {"name": "settings", "rowsWritten": 8, "hasPrimaryKey": false}
+        ]
+      }
+    ],
+    "samplingAlgorithm": "primary-key-lexicographic-first-3-v1",
+    "sampleLimitPerSchema": 3,
+    "sampledTables": [
+      {"schema": "aifar_business", "table": "orders", "rowsWritten": 1200}
+    ]
+  },
   "createdAt": "2026-07-27T00:00:00Z",
   "taskId": "task_xxx"
 }
 ```
 
 集群备份还需记录 `clusterName`、备份时 PRIMARY、所有 MySQL 成员 endpoint/role/status 和 Router 摘要。manifest、metadata、日志和审计均不得包含密码、私钥、恢复账号或完整敏感连接串。
+
+### 5.1 manifest v2 校验数据来源与规范化
+
+`verification` 只能在 `util.dumpInstance()` 成功并产生 MySQL Shell 完成元数据后构建。所有 schema、table、`rowsWritten` 和主键资格都来自该次 dump 的完成元数据与逐表元数据；不得查询仍可能变化的在线源库来补齐或替代期望值。缺少完成标记、元数据文件缺失、JSON 畸形、字段类型错误、名称冲突、负数/溢出的 `rowsWritten` 或元数据之间不一致时，备份失败且不生成 success 记录。
+
+文件清单只覆盖待打包 dump 根目录下的普通文件，不包含仓库侧 `backup-manifest.json`、`checksums.txt` 或归档本身，避免自引用。每项记录相对 dump 根的 UTF-8 POSIX 路径、字节大小和文件内容 SHA-256；路径必须规范化、唯一、按 UTF-8 字节序升序，不得为绝对路径、包含 `.`/`..` 段、反斜杠、NUL、符号链接或其它特殊文件。`sha256-nul-records-v1` 对每个排序后的条目连续写入 `lowerHex(fileSha256) NUL decimalSize NUL path NUL` 的 UTF-8 字节并计算 SHA-256，结果作为 `inventorySha256` 小写十六进制值。打包前和面板仓库验证时都必须重算文件级摘要与清单摘要。
+
+`schemas` 和每个 schema 的 `tables` 保存 dump 中完整业务 schema 与 base table 集合，按名称 UTF-8 字节序升序且不重复；`schemaCount`、顶层 `tableCount` 和各 schema 的 `tableCount` 必须与数组精确一致。每张 base table 都保存 MySQL Shell 报告的 `rowsWritten` 和是否具有 PRIMARY KEY。view、trigger、routine 和 event 不计入这里的 table 集合或行数抽样；它们仍随 dump 恢复，但首版成功门禁只对 business schema、base table 和确定性样本作强校验。若实际 MySQL Shell 元数据无法无歧义地给出完整 base table 集合、每表 `rowsWritten` 或主键资格，备份失败，不退化为弱 manifest。
+
+顶层 `schemas` 必须与 `verification.schemas[].name` 的排序结果完全相同。`verification.source`、两个算法名和 `sampleLimitPerSchema=3` 都是 v2 固定常量；未知或缺失值不得兼容猜测。
+
+抽样规则由服务端固定为 `primary-key-lexicographic-first-3-v1`：对每个业务 schema，仅从具有 PRIMARY KEY 的 base table 中按 table 名字节序选择前 3 张；不足 3 张则全部选择，没有合格表则该 schema 不产生样本。`sampledTables` 是上述选择结果的扁平、按 schema/table 排序副本，期望行数必须与对应 table 的 `rowsWritten` 完全相同。首版不增加用户可配置抽样项。
+
+历史 v1 manifest 可继续列表、仓库完整性校验和受控删除，但任何会修改 MySQL 的 restore 或 disaster rebuild 必须在远端连接和 schema 变更前以 `MYSQL_RESTORE_MANIFEST_INVALID` 拒绝。v1 不允许通过在线查询补写成 v2。新建的普通备份和 pre-restore 备份均生成 v2。
 
 ## 6. Registry、API 与权限
 
@@ -263,7 +303,8 @@ release-lock
 - 健康可读的目标必须先创建 `pre-restore` 备份；目标不可读时，只能在灾难确认后跳过。
 - 不支持合并式恢复。根据 manifest 精确删除目标业务 schema 后重新导入，`ignoreExistingObjects` 固定为 false。
 - 删除范围严格来自已验证 manifest 中的业务 schema allowlist，永不删除系统 schema。
-- 校验至少包括 schema/table 数量、关键表抽样、MySQL ping 和 task manifest 摘要。
+- 仅 manifest v2 可进入还原。任务在任何远端 mutation 前计算 `SHA256(CanonicalBackupManifestJSON(manifest))`；把小写十六进制结果作为本次 restore 的不可变 `restoreExpectedManifestSha256`，连同 `restoreTaskId` 写入 `app_backups.metadata`。最终校验重新从受控仓库读取并规范化 manifest，任务 ID 或摘要不一致即失败。
+- 最终校验必须同时满足：MySQL ping 成功；业务 schema 与 base table 名称集合及各级数量和 manifest v2 完全一致；对 `sampledTables` 逐项执行精确 `COUNT(*)` 并等于 `rowsWritten`；重新计算的 canonical manifest SHA-256 等于当前任务记录的 `restoreExpectedManifestSha256`。任一条件失败都写入 `restore_incomplete` 并返回 `MYSQL_RESTORE_INCOMPLETE`，不得报告 restore success。
 
 ## 10. InnoDB Cluster 备份
 
@@ -294,6 +335,7 @@ cleanup-workdir
 - 直接连接 PRIMARY 3306，不经 Router。
 - 只执行一次一致性 `util.dumpInstance()`。
 - 首版要求三个 MySQL 成员全部 ONLINE；OFFLINE、RECOVERING、ERROR 或 metadata 不完整时拒绝备份并提示先修复集群。
+- 与 standalone 相同，集群新备份在 dump 完成后只从 PRIMARY 上该次 MySQL Shell dump 产物构建 manifest v2 verification 数据。
 
 ## 11. 健康 InnoDB Cluster 数据还原
 
@@ -329,6 +371,7 @@ record-restore
 - 禁止在三个成员上重复导入。
 - PRIMARY 在 drop/load 阶段发生切换或连接中断时，任务立即失败并保持维护状态；不得自动改连新 PRIMARY 继续写。
 - 成功门禁包括：三个成员 ONLINE、SECONDARY applier 队列归零、schema/table/抽样数据一致、Router 6446 真实读写成功。
+- 集群健康还原和 disaster rebuild 同样只接受 manifest v2，并复用第 9 节的 task/manifest 摘要、完整 schema/base table 集合和确定性样本精确行数门禁。
 
 ## 12. InnoDB Cluster 完整停机与灾难重建
 
@@ -403,6 +446,7 @@ record-restore
 
 - 备份失败：删除面板 `.partial`，保留失败 `app_backups` 记录；源节点临时归档可按短 TTL 保留用于重试。
 - checksum、manifest、路径或版本校验失败：还原在任何 schema 变更前终止。
+- v1 manifest 参与破坏性还原，或 v2 dump 元数据、文件清单、schema/base table 集合、计数、抽样规则、canonical manifest 摘要任一无效：还原在任何远端 mutation 前以 `MYSQL_RESTORE_MANIFEST_INVALID` 终止。
 - 删除 schema 后 load 失败：任务标记 `restore_incomplete`，保持维护模式，不自动恢复业务。
 - `local_infile` 恢复失败：任务必须失败并输出稳定错误码，即使数据导入已完成；目标不可达时保留待调和标记并阻止后续生命周期操作。
 - 健康集群 PRIMARY 切换：任务失败，不跨 PRIMARY 续写。
@@ -456,6 +500,7 @@ MYSQL_REBUILD_ROUTER_FAILED
 - Store：`app_backups` pending/running/success/failed、列表、保留策略和删除归属。
 - Adapter：SFTP Download 流式传输、partial、checksum、取消和路径错误。
 - MySQL module：standalone/cluster PlanBackup、PlanRestore、PRIMARY 选择、集群展开和锁冲突。
+- Manifest v2：只从已完成 MySQL Shell dump 元数据构建完整文件/schema/base table/行数期望；inventory 摘要、确定性主键表抽样、v1 只读兼容和 destructive restore 拒绝。
 - 脚本：dump/load 选项、账号排除、metadata 排除、`local_infile` finally 恢复、日志脱敏。
 - HTTP：权限、task id、audit、错误码、危险确认和非法 manifest。
 - 前端：按钮能力、备份列表、恢复确认、灾难向导、任务追踪和 zh/en。
@@ -463,7 +508,7 @@ MYSQL_REBUILD_ROUTER_FAILED
 
 ### 17.2 真实环境验收
 
-- standalone 在线备份、空目标恢复、关键数据一致。
+- standalone 在线备份、空目标恢复；验证完整 schema/table 集合、每 schema 最多 3 张确定性主键样本的精确行数、MySQL ping 和 task/manifest 摘要一致。
 - standalone checksum 损坏时在变更目标前拒绝。
 - 三节点集群从 PRIMARY 只生成一份备份。
 - 健康集群只在 PRIMARY 导入，三个成员最终一致。
