@@ -282,6 +282,61 @@ func TestWriteMySQLSecretContextRemovesFileWhenWriteFails(t *testing.T) {
 	}
 }
 
+func TestWriteMySQLSecretContextRetriesCloseAndRemovesFileWhenWriteFails(t *testing.T) {
+	// Production break caught: a write error followed by a transient Close error must not leave an open secret file behind.
+	secretPath := filepath.Join(t.TempDir(), "secret.cnf")
+	original := createMySQLSecretContextFile
+	var injected *writeFailCloseFailSecretContextFile
+	createMySQLSecretContextFile = func() (mysqlSecretContextFile, error) {
+		file, err := os.OpenFile(secretPath, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o600)
+		if err != nil {
+			return nil, err
+		}
+		injected = &writeFailCloseFailSecretContextFile{File: file}
+		return injected, nil
+	}
+	t.Cleanup(func() { createMySQLSecretContextFile = original })
+	name, err := writeMySQLSecretContext(store.Credential{Username: "root", Secret: map[string]string{"password": "secret"}}, 3306)
+	if err == nil || name != "" {
+		t.Fatalf("write result name=%q err=%v", name, err)
+	}
+	if injected == nil || injected.closeCalls != 2 {
+		t.Fatalf("Close calls = %v, want failure followed by one cleanup retry", injected)
+	}
+	if _, statErr := os.Lstat(secretPath); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("secret context survived write and initial Close failures: %v", statErr)
+	}
+}
+
+func TestWriteMySQLSecretContextRetriesCloseAndRemovesFileWhenChmodFails(t *testing.T) {
+	// Production break caught: a chmod error followed by a transient Close error must stop before writing and remove the secret file.
+	secretPath := filepath.Join(t.TempDir(), "secret.cnf")
+	original := createMySQLSecretContextFile
+	var injected *chmodFailCloseFailSecretContextFile
+	createMySQLSecretContextFile = func() (mysqlSecretContextFile, error) {
+		file, err := os.OpenFile(secretPath, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o600)
+		if err != nil {
+			return nil, err
+		}
+		injected = &chmodFailCloseFailSecretContextFile{File: file}
+		return injected, nil
+	}
+	t.Cleanup(func() { createMySQLSecretContextFile = original })
+	name, err := writeMySQLSecretContext(store.Credential{Username: "root", Secret: map[string]string{"password": "secret"}}, 3306)
+	if err == nil || name != "" {
+		t.Fatalf("write result name=%q err=%v", name, err)
+	}
+	if injected == nil || injected.writeCalls != 0 {
+		t.Fatalf("Write calls = %v, want chmod failure before secret contents are written", injected)
+	}
+	if injected.closeCalls != 2 {
+		t.Fatalf("Close calls = %d, want failure followed by one cleanup retry", injected.closeCalls)
+	}
+	if _, statErr := os.Lstat(secretPath); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("secret context survived chmod and initial Close failures: %v", statErr)
+	}
+}
+
 func TestBackupStandaloneJoinsSanitizedRemoteCleanupFailureWithPrimaryError(t *testing.T) {
 	// Production break caught: a cleanup failure after the primary error must remain visible without leaking remote stderr or secrets.
 	module, data, remote := newStandaloneBackupModule(t)
@@ -351,6 +406,46 @@ type writeFailSecretContextFile struct{ *os.File }
 
 func (writeFailSecretContextFile) Write([]byte) (int, error) {
 	return 0, errors.New("injected write failure")
+}
+
+type writeFailCloseFailSecretContextFile struct {
+	*os.File
+	closeCalls int
+}
+
+func (f *writeFailCloseFailSecretContextFile) Write([]byte) (int, error) {
+	return 0, errors.New("injected write failure")
+}
+
+func (f *writeFailCloseFailSecretContextFile) Close() error {
+	f.closeCalls++
+	if f.closeCalls == 1 {
+		return errors.New("injected close failure")
+	}
+	return f.File.Close()
+}
+
+type chmodFailCloseFailSecretContextFile struct {
+	*os.File
+	closeCalls int
+	writeCalls int
+}
+
+func (f *chmodFailCloseFailSecretContextFile) Chmod(os.FileMode) error {
+	return errors.New("injected chmod failure")
+}
+
+func (f *chmodFailCloseFailSecretContextFile) Write(contents []byte) (int, error) {
+	f.writeCalls++
+	return f.File.Write(contents)
+}
+
+func (f *chmodFailCloseFailSecretContextFile) Close() error {
+	f.closeCalls++
+	if f.closeCalls == 1 {
+		return errors.New("injected close failure")
+	}
+	return f.File.Close()
 }
 
 type backupFakeStore struct {

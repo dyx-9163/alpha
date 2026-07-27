@@ -576,30 +576,36 @@ func writeMySQLSecretContext(credential store.Credential, port int) (string, err
 		return "", err
 	}
 	name := file.Name()
-	closed := false
-	succeeded := false
-	defer func() {
-		if !closed {
-			_ = file.Close()
-		}
-		if !succeeded {
-			_ = os.Remove(name)
-		}
-	}()
-	if chmodErr := file.Chmod(0o600); chmodErr != nil && runtime.GOOS != "windows" {
-		return "", chmodErr
+	if chmodErr := file.Chmod(0o600); chmodErr != nil {
+		return "", errors.Join(chmodErr, cleanupMySQLSecretContext(file, name, false))
 	}
 	_, err = fmt.Fprintf(file, "[client]\nuser=%s\npassword=%s\nhost=127.0.0.1\nport=%d\n", userValue, passwordValue, port)
 	if err != nil {
-		return "", err
+		return "", errors.Join(err, cleanupMySQLSecretContext(file, name, false))
 	}
 	closeErr := file.Close()
-	closed = closeErr == nil
 	if closeErr != nil {
-		return "", closeErr
+		return "", errors.Join(closeErr, cleanupMySQLSecretContext(file, name, true))
 	}
-	succeeded = true
 	return name, nil
+}
+
+func cleanupMySQLSecretContext(file mysqlSecretContextFile, name string, closeAlreadyAttempted bool) error {
+	var cleanupErrors []error
+	if closeAlreadyAttempted {
+		if err := file.Close(); err != nil {
+			cleanupErrors = append(cleanupErrors, errors.New("failed to close MySQL secret context during cleanup"))
+		}
+	} else if err := file.Close(); err != nil {
+		cleanupErrors = append(cleanupErrors, errors.New("failed to close MySQL secret context during cleanup"))
+		if retryErr := file.Close(); retryErr != nil {
+			cleanupErrors = append(cleanupErrors, errors.New("failed to close MySQL secret context after cleanup retry"))
+		}
+	}
+	if err := os.Remove(name); err != nil && !errors.Is(err, os.ErrNotExist) {
+		cleanupErrors = append(cleanupErrors, errors.New("failed to remove MySQL secret context during cleanup"))
+	}
+	return errors.Join(cleanupErrors...)
 }
 
 func bootstrapBackupWorkCommand(work string) string {
