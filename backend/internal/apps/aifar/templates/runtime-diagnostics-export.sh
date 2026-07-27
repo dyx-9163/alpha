@@ -48,6 +48,7 @@ WORK_ROOT="$PARTIAL_ROOT/work"
 RAW_ROOT="$WORK_ROOT/raw"
 STAGE_ROOT="$WORK_ROOT/staged"
 SCRATCH_ROOT="$WORK_ROOT/redact"
+LIMIT_MARKER_ROOT="$WORK_ROOT/limit-markers"
 ARCHIVE_NAME="$ARCHIVE_BASE.tar.gz"
 ARCHIVE_PARTIAL="$WORK_ROOT/$ARCHIVE_NAME.partial"
 TOTAL_FILE="$WORK_ROOT/uncompressed-bytes"
@@ -86,7 +87,7 @@ mkdir -- "$PARTIAL_ROOT" || exit 22
 partial_canonical=$(readlink -f -- "$PARTIAL_ROOT") || exit 22
 [ "$partial_canonical" = "$DIAGNOSTICS_ROOT/$EXPORT_ID.partial" ] || exit 22
 PARTIAL_ROOT=$partial_canonical
-mkdir -p "$BUNDLE_ROOT/services" "$BUNDLE_ROOT/diagnostics" "$RAW_ROOT" "$STAGE_ROOT" "$SCRATCH_ROOT"
+mkdir -p "$BUNDLE_ROOT/services" "$BUNDLE_ROOT/diagnostics" "$RAW_ROOT" "$STAGE_ROOT" "$SCRATCH_ROOT" "$LIMIT_MARKER_ROOT"
 cd "$PARTIAL_ROOT"
 
 pid_stat="$PROC_ROOT/$$/stat"
@@ -104,15 +105,32 @@ printf '0\n' > "$TOTAL_FILE"
 : > "$ERROR_RECORDS"
 
 run_limited() {
+  LIMIT_SETUP_FAILED=0
   limit_blocks=$1
   shift
   case "$limit_blocks" in
-    unlimited|*[!0-9]*|'') [ "$limit_blocks" = "unlimited" ] || return 70 ;;
+    unlimited|*[!0-9]*|'')
+      if [ "$limit_blocks" != "unlimited" ]; then LIMIT_SETUP_FAILED=1; return 1; fi
+      ;;
   esac
-  (
-    ulimit -f "$limit_blocks" || exit 70
+  limit_marker="$LIMIT_MARKER_ROOT/limit-setup-$$"
+  rm -f -- "$limit_marker" || { LIMIT_SETUP_FAILED=1; return 1; }
+  : > "$limit_marker" || { LIMIT_SETUP_FAILED=1; return 1; }
+  if (
+    ulimit -f "$limit_blocks" &&
+    rm -f -- "$limit_marker" &&
     "$@"
-  )
+  ); then
+    command_status=0
+  else
+    command_status=$?
+  fi
+  if [ -e "$limit_marker" ]; then
+    LIMIT_SETUP_FAILED=1
+    rm -f -- "$limit_marker" || return 1
+    return 1
+  fi
+  return "$command_status"
 }
 
 json_escape() {
@@ -251,15 +269,32 @@ stage_generated_redacted_file() {
 cat > "$FILE_HELPER" <<'AIFAR_DIAGNOSTIC_FILE_HELPER'
 set -eu
 run_limited() {
+  LIMIT_SETUP_FAILED=0
   limit_blocks=$1
   shift
   case "$limit_blocks" in
-    unlimited|*[!0-9]*|'') [ "$limit_blocks" = "unlimited" ] || return 70 ;;
+    unlimited|*[!0-9]*|'')
+      if [ "$limit_blocks" != "unlimited" ]; then LIMIT_SETUP_FAILED=1; return 1; fi
+      ;;
   esac
-  (
-    ulimit -f "$limit_blocks" || exit 70
+  limit_marker="$LIMIT_MARKER_ROOT/limit-setup-$$"
+  rm -f -- "$limit_marker" || { LIMIT_SETUP_FAILED=1; return 1; }
+  : > "$limit_marker" || { LIMIT_SETUP_FAILED=1; return 1; }
+  if (
+    ulimit -f "$limit_blocks" &&
+    rm -f -- "$limit_marker" &&
     "$@"
-  )
+  ); then
+    command_status=0
+  else
+    command_status=$?
+  fi
+  if [ -e "$limit_marker" ]; then
+    LIMIT_SETUP_FAILED=1
+    rm -f -- "$limit_marker" || return 1
+    return 1
+  fi
+  return "$command_status"
 }
 redact_file() {
   source_file=$1
@@ -372,7 +407,7 @@ for candidate do
   else
     command_status=$?
     rm -f -- "$raw"
-    [ "$command_status" -ne 70 ] || exit 31
+    [ "${LIMIT_SETUP_FAILED:-0}" -eq 0 ] || exit 31
     add_error file-copy-limit "$service"
     continue
   fi
@@ -408,7 +443,7 @@ for candidate do
 done
 AIFAR_DIAGNOSTIC_FILE_HELPER
 
-export BUNDLE_ROOT RAW_ROOT STAGE_ROOT SCRATCH_ROOT TOTAL_FILE MANIFEST_RECORDS ERROR_RECORDS MAX_UNCOMPRESSED FILE_LIMIT_BLOCKS
+export BUNDLE_ROOT RAW_ROOT STAGE_ROOT SCRATCH_ROOT LIMIT_MARKER_ROOT TOTAL_FILE MANIFEST_RECORDS ERROR_RECORDS MAX_UNCOMPRESSED FILE_LIMIT_BLOCKS
 
 for service in $SERVICES; do
   case "$service" in ''|*[!a-z0-9-]*) exit 25 ;; esac
@@ -434,7 +469,7 @@ for service in $SERVICES; do
   else
     command_status=$?
     rm -f -- "$container_names"
-    [ "$command_status" -ne 70 ] || exit 32
+    [ "${LIMIT_SETUP_FAILED:-0}" -eq 0 ] || exit 32
     add_error container-list-failed "$service"
     containers=
   fi
@@ -453,7 +488,7 @@ for service in $SERVICES; do
     else
       command_status=$?
       rm -f -- "$raw"
-      [ "$command_status" -ne 70 ] || exit 32
+      [ "${LIMIT_SETUP_FAILED:-0}" -eq 0 ] || exit 32
       add_error container-log-failed "$service"
       continue
     fi
@@ -482,7 +517,7 @@ if run_limited "$FILE_LIMIT_BLOCKS" docker ps -a --filter "label=aifar.instance=
 else
   command_status=$?
   rm -f -- "$containers_file"
-  [ "$command_status" -ne 70 ] || exit 33
+  [ "${LIMIT_SETUP_FAILED:-0}" -eq 0 ] || exit 33
   add_error container-summary-failed -
 fi
 
@@ -496,7 +531,7 @@ for service in $SERVICES; do
   else
     command_status=$?
     rm -f -- "$container_names"
-    [ "$command_status" -ne 70 ] || exit 33
+    [ "${LIMIT_SETUP_FAILED:-0}" -eq 0 ] || exit 33
     add_error health-container-list-failed "$service"
     containers=
   fi
@@ -512,7 +547,7 @@ for service in $SERVICES; do
     else
       command_status=$?
       rm -f -- "$health_item"
-      [ "$command_status" -ne 70 ] || exit 33
+      [ "${LIMIT_SETUP_FAILED:-0}" -eq 0 ] || exit 33
       add_error container-health-failed "$service"
     fi
   done
@@ -525,7 +560,7 @@ if run_limited "$FILE_LIMIT_BLOCKS" systemctl status aifar-agent --no-pager > "$
 else
   command_status=$?
   rm -f -- "$agent_file"
-  [ "$command_status" -ne 70 ] || exit 33
+  [ "${LIMIT_SETUP_FAILED:-0}" -eq 0 ] || exit 33
   add_error agent-status-failed -
 fi
 
@@ -543,7 +578,7 @@ append_host_diagnostic() {
   else
     command_status=$?
     rm -f -- "$host_item"
-    [ "$command_status" -ne 70 ] || exit 33
+    [ "${LIMIT_SETUP_FAILED:-0}" -eq 0 ] || exit 33
     add_error "$error_code" -
   fi
 }

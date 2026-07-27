@@ -1129,12 +1129,36 @@ func TestRuntimeDiagnosticExportFailsClosedWhenFileLimitCannotBeSet(t *testing.T
 		t.Fatal(err)
 	}
 	helper := shellFunction(t, script, "run_limited")
-	root := t.TempDir()
+	workingDir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	root, err := os.MkdirTemp(workingDir, ".runtime-limit-setup-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
 	markerNative := filepath.Join(root, "command-ran")
-	cmd := exec.Command(sh, "-c", helper+"\nrun_limited invalid sh -c 'touch \"$AIFAR_LIMIT_MARKER\"'")
-	cmd.Env = append(os.Environ(), "AIFAR_LIMIT_MARKER="+runtimeDiagnosticShellPath(markerNative))
-	if output, err := cmd.CombinedOutput(); err == nil {
-		t.Fatalf("invalid ulimit did not fail closed: %s", output)
+	setupMarkerRoot := runtimeDiagnosticShellPath(filepath.Join(root, "limit-markers"))
+	cmd := exec.Command(sh, "-c", strings.Join([]string{
+		helper,
+		`ulimit() { return 99; }`,
+		`mkdir -p "$AIFAR_LIMIT_SETUP_ROOT"`,
+		`LIMIT_MARKER_ROOT=$AIFAR_LIMIT_SETUP_ROOT`,
+		`run_limited unlimited sh -c 'touch "$AIFAR_LIMIT_MARKER"'`,
+		`command_status=$?`,
+		`printf '%s:%s\n' "$command_status" "${LIMIT_SETUP_FAILED:-unset}"`,
+	}, "\n"))
+	cmd.Env = append(os.Environ(),
+		"AIFAR_LIMIT_MARKER="+runtimeDiagnosticShellPath(markerNative),
+		"AIFAR_LIMIT_SETUP_ROOT="+setupMarkerRoot,
+	)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("inspect deterministic ulimit setup failure: %v: %s", err, output)
+	}
+	if !strings.HasSuffix(strings.TrimSpace(string(output)), ":1") {
+		t.Fatalf("ulimit setup failure did not use an independent side channel: %s", output)
 	}
 	if _, err := os.Stat(markerNative); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("command ran after ulimit failure: %v", err)
@@ -1361,7 +1385,7 @@ func TestRuntimeDiagnosticExportContinuesAfterIndividualDiagnosticCommandFailure
 		{
 			name: "systemctl status",
 			configure: func(fixture *runtimeDiagnosticExportShellFixture) {
-				writeRuntimeDiagnosticShellCommand(t, fixture.binNative, "systemctl", "printf '%s\\n' 'SYSTEMCTL_FAILURE_SHOULD_NOT_ARCHIVE'\nexit 43")
+				writeRuntimeDiagnosticShellCommand(t, fixture.binNative, "systemctl", "printf '%s\\n' 'SYSTEMCTL_FAILURE_SHOULD_NOT_ARCHIVE'\nexit 70")
 			},
 			wantErrorCode: "agent-status-failed\t-\t-",
 			absentEntry:   "/diagnostics/agent-status.txt",
