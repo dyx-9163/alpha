@@ -263,7 +263,7 @@ type BackupManifest struct {
 - [ ] Run `cd backend; go test ./internal/apps/mysql -run 'Test(BackupManifest|RenderLogical)'` and confirm failure.
 - [ ] Implement strict schema-name validation and reject system schemas before any dump/drop work. Sort schemas and members for deterministic manifests.
 - [ ] Embed and render fixed templates. Accept only validated numeric threads/rate values and internally derived paths; do not render arbitrary strings into shell or JavaScript source.
-- [ ] Add stable Chinese/English messages and error codes for every code in design section 15, including credential, topology, PRIMARY, checksum, version, maintenance, local-infile, restore-incomplete, and disaster-rebuild failures.
+- [ ] Add stable Chinese/English messages and error codes for every code in design section 15, including `MYSQL_CREDENTIAL_UNAVAILABLE` for any backup or restore target that cannot resolve exactly one active bound `purpose=admin` credential with a usable decrypted secret, plus topology, PRIMARY, checksum, version, maintenance, local-infile, restore-incomplete, and disaster-rebuild failures. Keep the credential response generic for missing, inactive, ambiguous, missing-secret, and decryption failures.
 - [ ] Run `cd backend; go test ./internal/apps/mysql` and confirm all tests pass.
 - [ ] Commit: `git add backend/internal/apps/mysql/backup_types.go backend/internal/apps/mysql/backup_manifest.go backend/internal/apps/mysql/backup_manifest_test.go backend/internal/apps/mysql/backup_scripts.go backend/internal/apps/mysql/backup_scripts_test.go backend/internal/apps/mysql/templates/backup backend/internal/apps/mysql/i18n.go backend/internal/i18n/messages.go && git commit -m "feat: add MySQL backup manifest and scripts"`.
 

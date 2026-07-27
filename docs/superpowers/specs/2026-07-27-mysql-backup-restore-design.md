@@ -398,6 +398,7 @@ record-restore
 至少定义：
 
 ```text
+MYSQL_CREDENTIAL_UNAVAILABLE
 MYSQL_BACKUP_UNSUPPORTED_TOPOLOGY
 MYSQL_BACKUP_CLUSTER_UNHEALTHY
 MYSQL_BACKUP_PRIMARY_NOT_FOUND
@@ -414,6 +415,8 @@ MYSQL_RESTORE_INCOMPLETE
 MYSQL_REBUILD_CONFIRMATION_REQUIRED
 MYSQL_REBUILD_ROUTER_FAILED
 ```
+
+`MYSQL_CREDENTIAL_UNAVAILABLE` 同时用于备份和还原：目标无法解析出唯一、启用且绑定 `purpose=admin` 的 MySQL 凭据，或其密文不可用时返回该码。缺失、停用、重复绑定、缺少密文和解密失败共用这一公开错误码；消息和 details 不得暴露具体凭据记录或失败的秘密信息。
 
 错误响应保持 `{code,message,details}`，用户可见 message 和任务日志进入 backend i18n zh/en。
 
