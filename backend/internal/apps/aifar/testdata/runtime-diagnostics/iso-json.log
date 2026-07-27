@@ -1,0 +1,7 @@
+2026-07-27T08:00:00Z iso-z-boundary
+2026-07-27T16:01:00+08:00 iso-offset
+{"timestamp":"2026-07-27T08:02:00Z","message":"timestamp"}
+{"time":"2026-07-27T16:03:00+08:00","message":"time"}
+{"@timestamp":"2026-07-27T08:04:00Z","message":"at-timestamp"}
+{"ts":"2026-07-27T16:05:00+08:00","message":"ts"}
+2026-07-27T08:10:00Z iso-until-boundary

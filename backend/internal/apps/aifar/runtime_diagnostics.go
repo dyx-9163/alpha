@@ -49,6 +49,7 @@ type runtimeDiagnosticExportScriptData struct {
 	Readme          string
 	ProcRoot        string
 	FileLimitBlocks string
+	FilterProgram   string
 }
 
 type runtimeDiagnosticCleanupScriptData struct {
@@ -545,7 +546,22 @@ func renderRuntimeDiagnosticExportScript(data runtimeDiagnosticExportScriptData)
 	if strings.TrimSpace(data.FileLimitBlocks) == "" {
 		data.FileLimitBlocks = "1048576"
 	}
+	if strings.TrimSpace(data.FilterProgram) == "" {
+		filterProgram, err := renderRuntimeDiagnosticFilterProgram()
+		if err != nil {
+			return "", err
+		}
+		data.FilterProgram = filterProgram
+	}
 	return renderEmbeddedRuntimeDiagnosticScript("aifar-runtime-diagnostics-export", content, data)
+}
+
+func renderRuntimeDiagnosticFilterProgram() (string, error) {
+	content, err := templateFS.ReadFile("templates/runtime-diagnostics-filter.awk")
+	if err != nil {
+		return "", err
+	}
+	return string(content), nil
 }
 
 func renderRuntimeDiagnosticCleanupScript(data runtimeDiagnosticCleanupScriptData) (string, error) {

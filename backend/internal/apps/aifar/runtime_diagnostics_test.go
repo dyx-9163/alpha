@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -707,6 +708,268 @@ func TestRuntimeDiagnosticScriptsCannotBeOverridden(t *testing.T) {
 			t.Fatalf("%s diagnostic script was not loaded exclusively from go:embed:\n%s", name, script)
 		}
 	}
+}
+
+func TestRuntimeDiagnosticHostLogSourceSelectionNoDocker(t *testing.T) {
+	estimateScript, err := renderRuntimeDiagnosticEstimateScript(runtimeDiagnosticEstimateScriptData{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	exportScript, err := renderRuntimeDiagnosticExportScript(runtimeDiagnosticExportScriptData{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	combined := estimateScript + exportScript
+	for _, forbidden := range []string{"docker logs", ".LogPath", "container-logs", "docker-log-conservative"} {
+		if strings.Contains(combined, forbidden) {
+			t.Fatalf("rendered scripts contain forbidden source %q", forbidden)
+		}
+	}
+	for _, required := range []string{
+		`LOG_ROOT="$INSTALL_ROOT/runtime/logs"`,
+		"MAX_FILE_SCAN=1073741824",
+		"MAX_TOTAL_SCAN=2147483648",
+		"MAX_FILTERED=524288000",
+		"AIFAR_DIAG_STREAM_V1",
+	} {
+		if !strings.Contains(combined, required) {
+			t.Fatalf("rendered scripts missing %q", required)
+		}
+	}
+	for _, accepted := range []string{"app.log", "app.log.1", "app.log.2026-07-27.1"} {
+		if !runtimeDiagnosticLogFileAllowed(accepted) {
+			t.Fatalf("safe log rotation rejected: %q", accepted)
+		}
+	}
+	for _, rejected := range []string{"app.idx", ".hidden.log", "config.log", "database.log", "secret.log", "credentials.log", "app.env"} {
+		if runtimeDiagnosticLogFileAllowed(rejected) {
+			t.Fatalf("unsafe log name accepted: %q", rejected)
+		}
+	}
+}
+
+func TestRuntimeDiagnosticHostLogScriptsHaveValidBashSyntax(t *testing.T) {
+	bashPath := findRuntimeDiagnosticBash(t)
+	for name, render := range map[string]func() (string, error){
+		"estimate": func() (string, error) {
+			return renderRuntimeDiagnosticEstimateScript(runtimeDiagnosticEstimateScriptData{})
+		},
+		"export": func() (string, error) {
+			return renderRuntimeDiagnosticExportScript(runtimeDiagnosticExportScriptData{})
+		},
+		"cleanup": func() (string, error) {
+			return renderRuntimeDiagnosticCleanupScript(runtimeDiagnosticCleanupScriptData{})
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			script, err := render()
+			if err != nil {
+				t.Fatal(err)
+			}
+			command := exec.Command(bashPath, "-n")
+			command.Stdin = strings.NewReader(script)
+			if output, err := command.CombinedOutput(); err != nil {
+				t.Fatalf("rendered script syntax error: %v output=%s", err, output)
+			}
+		})
+	}
+}
+
+func TestRuntimeDiagnosticCleanupRemovesOnlyRemotePartial(t *testing.T) {
+	script, err := renderRuntimeDiagnosticCleanupScript(runtimeDiagnosticCleanupScriptData{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(script, "FINAL_ROOT") || strings.Contains(script, `rm -rf -- "$PARTIAL_ROOT" "$FINAL_ROOT"`) {
+		t.Fatal("cleanup script still targets a remote final archive")
+	}
+	if !strings.Contains(script, `rm -rf -- "$PARTIAL_ROOT"`) {
+		t.Fatal("cleanup script does not remove the controlled partial root")
+	}
+}
+
+func TestRuntimeDiagnosticEstimateV2Protocol(t *testing.T) {
+	raw := "AIFAR_DIAG_SERVICE_V2\tgateway\t2\t1024\n" +
+		"AIFAR_DIAG_SERVICE_V2\toauth\t1\t2048\n" +
+		"AIFAR_DIAG_TOTAL_V2\t3\t3072\tAsia/Shanghai\t-\n"
+	got, err := parseRuntimeDiagnosticEstimate(raw, []string{"gateway", "oauth"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.CandidateFiles != 3 || got.CandidateScanBytes != 3072 || got.ServerTimezone != "Asia/Shanghai" || got.BlockReason != "" {
+		t.Fatalf("unexpected V2 total: %+v", got)
+	}
+	if len(got.Services) != 2 || got.Services[0].CandidateFiles != 2 || got.Services[0].CandidateScanBytes != 1024 {
+		t.Fatalf("unexpected V2 services: %+v", got.Services)
+	}
+}
+
+func TestRuntimeDiagnosticStreamHeaderProtocol(t *testing.T) {
+	line := "AIFAR_DIAG_STREAM_V1\taifar-diagnostics-instance-1-20260727T080000Z.tar.gz\t4096\t2\tAsia/Shanghai\n"
+	got, err := parseRuntimeDiagnosticStreamHeader(line)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ArchiveName != "aifar-diagnostics-instance-1-20260727T080000Z.tar.gz" || got.UncompressedBytes != 4096 || got.WarningCount != 2 || got.ServerTimezone != "Asia/Shanghai" {
+		t.Fatalf("unexpected stream header: %+v", got)
+	}
+	for _, invalid := range []string{
+		strings.TrimSuffix(line, "\n"),
+		"AIFAR_DIAG_STREAM_V2\taifar-diagnostics-instance-1-20260727T080000Z.tar.gz\t4096\t2\tAsia/Shanghai\n",
+		"AIFAR_DIAG_STREAM_V1\t../archive.tar.gz\t4096\t2\tAsia/Shanghai\n",
+		"AIFAR_DIAG_STREAM_V1\taifar-diagnostics-instance-1-20260727T080000Z.tar.gz\t-1\t2\tAsia/Shanghai\n",
+		"AIFAR_DIAG_STREAM_V1\taifar-diagnostics-instance-1-20260727T080000Z.tar.gz\t4096\t-1\tAsia/Shanghai\n",
+		"AIFAR_DIAG_STREAM_V1\taifar-diagnostics-instance-1-20260727T080000Z.tar.gz\t4096\t2\t../../UTC\n",
+		"AIFAR_DIAG_STREAM_V1\taifar-diagnostics-instance-1-20260727T080000Z.tar.gz\t4096\t2\tAsia/Shanghai\textra\n",
+	} {
+		if _, err := parseRuntimeDiagnosticStreamHeader(invalid); err == nil {
+			t.Fatalf("invalid stream header accepted: %q", invalid)
+		}
+	}
+}
+
+func TestRuntimeDiagnosticTimestampFilterFixtures(t *testing.T) {
+	awkCommand := findRuntimeDiagnosticGNUAwk(t)
+	program, err := renderRuntimeDiagnosticFilterProgram()
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name                   string
+		fixture                string
+		want                   string
+		wantParser             string
+		wantRecords            int
+		wantWarnings           int
+		unterminatedActiveTail bool
+	}{
+		{
+			name: "spring", fixture: "spring.log", wantParser: "spring", wantRecords: 2,
+			want: "2026-07-27 16:00:00,000 ERROR start-boundary\n" +
+				"    at example.Main.run(Main.java:10)\n" +
+				"Caused by: java.lang.IllegalStateException: boom\n" +
+				"    Suppressed: java.lang.RuntimeException: suppressed\n" +
+				"    ... 1 more\n" +
+				"2026-07-27 16:09:59.999 INFO inside-window\n",
+		},
+		{
+			name: "iso-json", fixture: "iso-json.log", wantParser: "mixed", wantRecords: 6,
+			want: "2026-07-27T08:00:00Z iso-z-boundary\n" +
+				"2026-07-27T16:01:00+08:00 iso-offset\n" +
+				"{\"timestamp\":\"2026-07-27T08:02:00Z\",\"message\":\"timestamp\"}\n" +
+				"{\"time\":\"2026-07-27T16:03:00+08:00\",\"message\":\"time\"}\n" +
+				"{\"@timestamp\":\"2026-07-27T08:04:00Z\",\"message\":\"at-timestamp\"}\n" +
+				"{\"ts\":\"2026-07-27T16:05:00+08:00\",\"message\":\"ts\"}\n",
+		},
+		{
+			name: "nginx-access", fixture: "nginx-access.log", wantParser: "nginx-access", wantRecords: 2,
+			want: "127.0.0.1 - - [27/Jul/2026:16:00:00 +0800] \"GET /start HTTP/1.1\" 200 1\n" +
+				"127.0.0.1 - - [27/Jul/2026:16:09:59 +0800] \"GET /inside HTTP/1.1\" 200 1\n",
+		},
+		{
+			name: "nginx-error", fixture: "nginx-error.log", wantParser: "nginx-error", wantRecords: 2,
+			want: "2026/07/27 16:00:00 [error] start-boundary\n" +
+				"2026/07/27 16:09:59 [warn] inside-window\n",
+		},
+		{
+			name: "unknown", fixture: "unknown.log", wantParser: "spring", wantRecords: 1, wantWarnings: 4,
+			want: "2026-07-27 16:00:00,000 INFO retained-record\n", unterminatedActiveTail: true,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixturePath := filepath.Join("testdata", "runtime-diagnostics", test.fixture)
+			input, err := os.ReadFile(fixturePath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if test.unterminatedActiveTail {
+				input = bytes.TrimSuffix(input, []byte("\n"))
+			}
+			tempDir := t.TempDir()
+			programPath := filepath.Join(tempDir, "filter.awk")
+			inputPath := filepath.Join(tempDir, "input.log")
+			summaryPath := filepath.Join(tempDir, "summary.tsv")
+			if err := os.WriteFile(programPath, []byte(program), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(inputPath, input, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			endedNewline := "1"
+			if test.unterminatedActiveTail {
+				endedNewline = "0"
+			}
+			arguments := []string{
+				"-v", "since_epoch=1785139200",
+				"-v", "until_epoch=1785139800",
+				"-v", "server_tz=Asia/Shanghai",
+				"-v", "initial_ended_newline=" + endedNewline,
+				"-v", "summary_path=summary.tsv",
+				"-v", "warning_path=warnings.tsv",
+			}
+			if runtime.GOOS == "windows" {
+				arguments = append(arguments, "-v", "server_utc_offset_seconds=28800")
+			}
+			arguments = append(arguments, "-f", "filter.awk", "input.log")
+			command := exec.Command(awkCommand, arguments...)
+			command.Dir = tempDir
+			command.Env = append(os.Environ(), "TZ=Asia/Shanghai")
+			var stderr bytes.Buffer
+			command.Stderr = &stderr
+			filtered, err := command.Output()
+			if err != nil {
+				t.Fatalf("GNU awk filter failed: %v stderr=%s", err, stderr.String())
+			}
+			if stderr.Len() > 0 {
+				t.Fatalf("GNU awk filter wrote stderr: %s", stderr.String())
+			}
+			summary, err := os.ReadFile(summaryPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(filtered) != test.want {
+				t.Fatalf("filtered output mismatch:\ngot:  %q\nwant: %q\nsummary: %q", filtered, test.want, summary)
+			}
+			wantSummary := fmt.Sprintf("AIFAR_DIAG_FILTER_V1\t%s\t%d\t%d\t%d\t%d\n",
+				test.wantParser, len(input), len(test.want), test.wantRecords, test.wantWarnings)
+			if string(summary) != wantSummary {
+				t.Fatalf("summary=%q want=%q", summary, wantSummary)
+			}
+		})
+	}
+}
+
+func findRuntimeDiagnosticGNUAwk(t *testing.T) string {
+	t.Helper()
+	for _, name := range []string{"gawk", "awk"} {
+		path, err := exec.LookPath(name)
+		if err != nil {
+			continue
+		}
+		output, err := exec.Command(path, "--version").CombinedOutput()
+		if err == nil && strings.Contains(strings.ToLower(string(output)), "gnu awk") {
+			return path
+		}
+	}
+	t.Skip("GNU awk is not available")
+	return ""
+}
+
+func findRuntimeDiagnosticBash(t *testing.T) string {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		for _, candidate := range []string{`D:\tools\Git\bin\bash.exe`, `D:\tools\Git\usr\bin\bash.exe`} {
+			if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
+				return candidate
+			}
+		}
+	}
+	path, err := exec.LookPath("bash")
+	if err != nil {
+		t.Skip("bash is not available")
+	}
+	return path
 }
 
 func TestRuntimeDiagnosticExportRedactionFailsWhenIntermediateCommandFails(t *testing.T) {
@@ -1887,17 +2150,19 @@ func TestRuntimeDiagnosticEstimateScriptFailsClosedOnCandidateDiscovery(t *testi
 	}
 	for _, forbidden := range []string{
 		"for file_size in $(find",
-		"for container_id in $(docker ps",
-		"docker inspect --format='{{.LogPath}}' \"$container_id\" 2>/dev/null || true",
+		"sizes=$(find \"$service_root\" 2>/dev/null",
+		"docker ps",
+		"docker inspect",
 	} {
 		if strings.Contains(script, forbidden) {
 			t.Fatalf("estimate script must not swallow candidate discovery failure with %q:\n%s", forbidden, script)
 		}
 	}
 	for _, required := range []string{
-		"if ! file_sizes=$(find",
-		"if ! container_ids=$(docker ps",
-		"if ! log_path=$(docker inspect --format='{{.LogPath}}'",
+		"sizes=$(find \"$service_root\"",
+		"-printf '%s\\n') || exit 21",
+		"MAX_FILE_SCAN=1073741824",
+		"MAX_TOTAL_SCAN=2147483648",
 	} {
 		if !strings.Contains(script, required) {
 			t.Fatalf("estimate script must explicitly fail closed around %q:\n%s", required, script)

@@ -1,77 +1,70 @@
 set -eu
 
-for required in docker find tar gzip sha256sum df stat setsid; do
+umask 077
+
+for required in find readlink stat timedatectl; do
   command -v "$required" >/dev/null 2>&1 || exit 20
 done
 
 INSTALL_ROOT={{.InstallRoot}}
-INSTANCE_ID={{.InstanceID}}
 SERVICES={{.Services}}
-SINCE_UNIX={{.SinceUnix}}
-UNTIL_UNIX={{.UntilUnix}}
 LOG_ROOT="$INSTALL_ROOT/runtime/logs"
+MAX_FILE_SCAN=1073741824
+MAX_TOTAL_SCAN=2147483648
 
-file_total=0
-container_total=0
+case "$INSTALL_ROOT" in
+  /*) [ "$INSTALL_ROOT" != "/" ] || exit 21 ;;
+  *) exit 21 ;;
+esac
+[ -d "$INSTALL_ROOT" ] && [ ! -L "$INSTALL_ROOT" ] || exit 21
+install_canonical=$(readlink -f -- "$INSTALL_ROOT") || exit 21
+[ "$install_canonical" = "$INSTALL_ROOT" ] || exit 21
+
+server_timezone=$(timedatectl show -p Timezone --value 2>/dev/null || true)
+if [ -z "$server_timezone" ] && [ -L /etc/localtime ]; then
+  localtime_target=$(readlink -f /etc/localtime 2>/dev/null || true)
+  case "$localtime_target" in
+    /usr/share/zoneinfo/*) server_timezone=${localtime_target#/usr/share/zoneinfo/} ;;
+  esac
+fi
+case "$server_timezone" in
+  ''|/*|*..*|*[!A-Za-z0-9_+./-]*) exit 21 ;;
+esac
+
+total_files=0
+total_bytes=0
+block_code=-
 for service in $SERVICES; do
-  file_bytes=0
-  if [ -d "$LOG_ROOT/$service" ]; then
-    if ! file_sizes=$(find "$LOG_ROOT/$service" -xdev -type f -newermt "@$SINCE_UNIX" ! -newermt "@$UNTIL_UNIX" -printf '%s\n'); then
-      exit 21
-    fi
-    for file_size in $file_sizes; do
-      case "$file_size" in
-        ''|*[!0-9]*) exit 21 ;;
-      esac
-      file_bytes=$((file_bytes + file_size))
+  case "$service" in ''|*[!a-z0-9-]*) exit 21 ;; esac
+  service_root="$LOG_ROOT/$service"
+  service_files=0
+  service_bytes=0
+  if [ -e "$service_root" ] || [ -L "$service_root" ]; then
+    [ -d "$service_root" ] && [ ! -L "$service_root" ] || exit 21
+    service_canonical=$(readlink -f -- "$service_root") || exit 21
+    [ "$service_canonical" = "$service_root" ] || exit 21
+    sizes=$(find "$service_root" -xdev -type f \
+      \( -name '*.log' -o -name '*.log.*' \) \
+      ! -name '.*' \
+      ! -ipath '*/.*' \
+      ! -ipath '*config*' ! -ipath '*database*' ! -ipath '*credential*' \
+      ! -ipath '*secret*' ! -ipath '*password*' ! -ipath '*token*' \
+      -printf '%s\n') || exit 21
+    for file_size in $sizes; do
+      case "$file_size" in ''|*[!0-9]*) exit 21 ;; esac
+      service_files=$((service_files + 1))
+      service_bytes=$((service_bytes + file_size))
+      if [ "$file_size" -gt "$MAX_FILE_SCAN" ]; then
+        block_code=file-scan-limit-exceeded
+      fi
     done
   fi
-
-  container_bytes=0
-  conservative=0
-  if ! container_ids=$(docker ps -aq --filter "label=aifar.instance=$INSTANCE_ID" --filter "label=aifar.service=$service"); then
-    exit 22
-  fi
-  for container_id in $container_ids; do
-    if ! log_path=$(docker inspect --format='{{"{{.LogPath}}"}}' "$container_id"); then
-      exit 23
-    fi
-    if [ -z "$log_path" ] || [ ! -f "$log_path" ]; then
-      exit 23
-    fi
-    if ! log_size=$(stat -c '%s' -- "$log_path"); then
-      exit 24
-    fi
-    case "$log_size" in
-      ''|*[!0-9]*) exit 24 ;;
-    esac
-    container_bytes=$((container_bytes + log_size))
-    conservative=1
-  done
-
-  file_total=$((file_total + file_bytes))
-  container_total=$((container_total + container_bytes))
-  printf 'AIFAR_DIAG_SERVICE\t%s\t%s\t%s\n' "$service" "$file_bytes" "$container_bytes"
-  if [ "$conservative" -eq 1 ]; then
-    printf 'AIFAR_DIAG_WARNING\tdocker-log-conservative\t%s\n' "$service"
-  fi
+  total_files=$((total_files + service_files))
+  total_bytes=$((total_bytes + service_bytes))
+  printf 'AIFAR_DIAG_SERVICE_V2\t%s\t%s\t%s\n' "$service" "$service_files" "$service_bytes"
 done
 
-available_kib=0
-while read -r filesystem blocks used available capacity mounted; do
-  case "$available" in
-    ''|*[!0-9]*) continue ;;
-    *) available_kib=$available ;;
-  esac
-done <<AIFAR_DIAG_DF
-$(df -Pk "$INSTALL_ROOT")
-AIFAR_DIAG_DF
-available_bytes=$((available_kib * 1024))
-
-total_bytes=$((file_total + container_total))
-buffer_bytes=$((total_bytes / 5))
-if [ "$buffer_bytes" -lt 536870912 ]; then
-  buffer_bytes=536870912
+if [ "$total_bytes" -gt "$MAX_TOTAL_SCAN" ]; then
+  block_code=total-scan-limit-exceeded
 fi
-required_bytes=$((total_bytes + 1073741824 + buffer_bytes))
-printf 'AIFAR_DIAG_TOTAL\t%s\t%s\t%s\t%s\t%s\n' "$file_total" "$container_total" "$total_bytes" "$available_bytes" "$required_bytes"
+printf 'AIFAR_DIAG_TOTAL_V2\t%s\t%s\t%s\t%s\n' "$total_files" "$total_bytes" "$server_timezone" "$block_code"

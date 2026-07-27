@@ -353,20 +353,26 @@ type RuntimeDiagnosticStreamRequest struct {
 }
 
 type RuntimeDiagnosticEstimateResult struct {
-	Services       []RuntimeDiagnosticServiceEstimate `json:"services"`
-	FileBytes      int64                              `json:"fileBytes"`
-	ContainerBytes int64                              `json:"containerBytes"`
-	TotalBytes     int64                              `json:"totalBytes"`
-	RequiredBytes  int64                              `json:"requiredBytes"`
-	AvailableBytes int64                              `json:"availableBytes"`
-	Allowed        bool                               `json:"allowed"`
-	Warnings       []string                           `json:"warnings,omitempty"`
+	Services           []RuntimeDiagnosticServiceEstimate `json:"services"`
+	CandidateFiles     int                                `json:"candidateFiles,omitempty"`
+	CandidateScanBytes int64                              `json:"candidateScanBytes,omitempty"`
+	ServerTimezone     string                             `json:"serverTimezone,omitempty"`
+	BlockReason        string                             `json:"blockReason,omitempty"`
+	FileBytes          int64                              `json:"fileBytes"`
+	ContainerBytes     int64                              `json:"containerBytes"`
+	TotalBytes         int64                              `json:"totalBytes"`
+	RequiredBytes      int64                              `json:"requiredBytes"`
+	AvailableBytes     int64                              `json:"availableBytes"`
+	Allowed            bool                               `json:"allowed"`
+	Warnings           []string                           `json:"warnings,omitempty"`
 }
 
 type RuntimeDiagnosticServiceEstimate struct {
-	Service        string `json:"service"`
-	FileBytes      int64  `json:"fileBytes"`
-	ContainerBytes int64  `json:"containerBytes"`
+	Service            string `json:"service"`
+	CandidateFiles     int    `json:"candidateFiles,omitempty"`
+	CandidateScanBytes int64  `json:"candidateScanBytes,omitempty"`
+	FileBytes          int64  `json:"fileBytes"`
+	ContainerBytes     int64  `json:"containerBytes"`
 }
 
 type ClusterStartRequest struct {

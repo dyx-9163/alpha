@@ -11,13 +11,18 @@ import (
 )
 
 const (
-	runtimeDiagnosticServiceRecord = "AIFAR_DIAG_SERVICE"
-	runtimeDiagnosticTotalRecord   = "AIFAR_DIAG_TOTAL"
-	runtimeDiagnosticWarningRecord = "AIFAR_DIAG_WARNING"
-	runtimeDiagnosticResultRecord  = "AIFAR_DIAG_RESULT"
+	runtimeDiagnosticServiceRecord   = "AIFAR_DIAG_SERVICE"
+	runtimeDiagnosticTotalRecord     = "AIFAR_DIAG_TOTAL"
+	runtimeDiagnosticWarningRecord   = "AIFAR_DIAG_WARNING"
+	runtimeDiagnosticResultRecord    = "AIFAR_DIAG_RESULT"
+	runtimeDiagnosticServiceRecordV2 = "AIFAR_DIAG_SERVICE_V2"
+	runtimeDiagnosticTotalRecordV2   = "AIFAR_DIAG_TOTAL_V2"
+	runtimeDiagnosticStreamRecordV1  = "AIFAR_DIAG_STREAM_V1"
 )
 
 var runtimeDiagnosticNamePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9-]*$`)
+var runtimeDiagnosticTimezonePattern = regexp.MustCompile(`^[A-Za-z0-9_+.-]+(?:/[A-Za-z0-9_+.-]+)*$`)
+var runtimeDiagnosticLogFilePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*\.log(?:\.[A-Za-z0-9][A-Za-z0-9._-]*)*$`)
 
 var (
 	runtimeDiagnosticExportIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
@@ -32,6 +37,67 @@ type runtimeDiagnosticExportResult struct {
 	UncompressedBytes  int64
 	SHA256             string
 	WarningCount       int
+}
+
+type runtimeDiagnosticStreamHeader struct {
+	ArchiveName       string
+	UncompressedBytes int64
+	WarningCount      int
+	ServerTimezone    string
+}
+
+func parseRuntimeDiagnosticStreamHeader(line string) (runtimeDiagnosticStreamHeader, error) {
+	var result runtimeDiagnosticStreamHeader
+	if !strings.HasSuffix(line, "\n") || strings.Contains(line[:len(line)-1], "\n") || strings.Contains(line, "\r") {
+		return result, fmt.Errorf("runtime diagnostic stream header must be one LF-terminated record")
+	}
+	fields := strings.Split(strings.TrimSuffix(line, "\n"), "\t")
+	if len(fields) != 5 || fields[0] != runtimeDiagnosticStreamRecordV1 {
+		return result, fmt.Errorf("runtime diagnostic stream header is invalid")
+	}
+	if !runtimeDiagnosticArchivePattern.MatchString(fields[1]) {
+		return result, fmt.Errorf("runtime diagnostic stream archive name is invalid")
+	}
+	uncompressedBytes, err := parseRuntimeDiagnosticBytes(fields[2])
+	if err != nil || uncompressedBytes > 524288000 {
+		return result, fmt.Errorf("runtime diagnostic stream uncompressed bytes are invalid")
+	}
+	warningCount, err := parseRuntimeDiagnosticBytes(fields[3])
+	if err != nil || warningCount > 100000 {
+		return result, fmt.Errorf("runtime diagnostic stream warning count is invalid")
+	}
+	if !validRuntimeDiagnosticTimezone(fields[4]) {
+		return result, fmt.Errorf("runtime diagnostic stream timezone is invalid")
+	}
+	return runtimeDiagnosticStreamHeader{
+		ArchiveName: fields[1], UncompressedBytes: uncompressedBytes,
+		WarningCount: int(warningCount), ServerTimezone: fields[4],
+	}, nil
+}
+
+func validRuntimeDiagnosticTimezone(value string) bool {
+	if !runtimeDiagnosticTimezonePattern.MatchString(value) {
+		return false
+	}
+	for _, segment := range strings.Split(value, "/") {
+		if segment == "." || segment == ".." {
+			return false
+		}
+	}
+	return true
+}
+
+func runtimeDiagnosticLogFileAllowed(name string) bool {
+	if !runtimeDiagnosticLogFilePattern.MatchString(name) || strings.HasPrefix(name, ".") || strings.ContainsAny(name, `/\\`) {
+		return false
+	}
+	lower := strings.ToLower(name)
+	for _, forbidden := range []string{"config", "database", "credential", "secret", "password", "token", "private", "keystore", "truststore"} {
+		if strings.Contains(lower, forbidden) {
+			return false
+		}
+	}
+	return true
 }
 
 func parseRuntimeDiagnosticExportResult(raw, exportID string) (runtimeDiagnosticExportResult, error) {
@@ -99,6 +165,7 @@ func parseRuntimeDiagnosticEstimate(raw string, expectedSelections ...[]string) 
 		}
 	}
 	seenTotal := false
+	protocolVersion := 0
 	trimmed := strings.TrimSuffix(raw, "\n")
 	if trimmed == "" {
 		return result, fmt.Errorf("runtime diagnostic estimate output is empty")
@@ -107,7 +174,59 @@ func parseRuntimeDiagnosticEstimate(raw string, expectedSelections ...[]string) 
 		line = strings.TrimSuffix(line, "\r")
 		fields := strings.Split(line, "\t")
 		switch fields[0] {
+		case runtimeDiagnosticServiceRecordV2:
+			if protocolVersion == 1 || len(fields) != 4 {
+				return result, fmt.Errorf("invalid V2 service record at line %d", lineNumber+1)
+			}
+			protocolVersion = 2
+			service := fields[1]
+			if !runtimeDiagnosticNamePattern.MatchString(service) || seenServices[service] || (len(expected) > 0 && !expected[service]) {
+				return result, fmt.Errorf("invalid V2 service name at line %d", lineNumber+1)
+			}
+			candidateFiles64, err := parseRuntimeDiagnosticBytes(fields[2])
+			if err != nil || candidateFiles64 > int64(^uint(0)>>1) {
+				return result, fmt.Errorf("invalid V2 candidate file count at line %d", lineNumber+1)
+			}
+			candidateBytes, err := parseRuntimeDiagnosticBytes(fields[3])
+			if err != nil {
+				return result, fmt.Errorf("invalid V2 candidate bytes at line %d", lineNumber+1)
+			}
+			seenServices[service] = true
+			result.Services = append(result.Services, registry.RuntimeDiagnosticServiceEstimate{
+				Service: service, CandidateFiles: int(candidateFiles64), CandidateScanBytes: candidateBytes,
+			})
+		case runtimeDiagnosticTotalRecordV2:
+			if protocolVersion == 1 || len(fields) != 5 || seenTotal {
+				return result, fmt.Errorf("invalid V2 total record at line %d", lineNumber+1)
+			}
+			protocolVersion = 2
+			candidateFiles64, err := parseRuntimeDiagnosticBytes(fields[1])
+			if err != nil || candidateFiles64 > int64(^uint(0)>>1) {
+				return result, fmt.Errorf("invalid V2 total file count at line %d", lineNumber+1)
+			}
+			candidateBytes, err := parseRuntimeDiagnosticBytes(fields[2])
+			if err != nil {
+				return result, fmt.Errorf("invalid V2 total bytes at line %d", lineNumber+1)
+			}
+			if !validRuntimeDiagnosticTimezone(fields[3]) {
+				return result, fmt.Errorf("invalid V2 timezone at line %d", lineNumber+1)
+			}
+			blockReason := fields[4]
+			if blockReason == "-" {
+				blockReason = ""
+			} else if !runtimeDiagnosticNamePattern.MatchString(blockReason) {
+				return result, fmt.Errorf("invalid V2 block reason at line %d", lineNumber+1)
+			}
+			result.CandidateFiles = int(candidateFiles64)
+			result.CandidateScanBytes = candidateBytes
+			result.ServerTimezone = fields[3]
+			result.BlockReason = blockReason
+			seenTotal = true
 		case runtimeDiagnosticServiceRecord:
+			if protocolVersion == 2 {
+				return result, fmt.Errorf("mixed runtime diagnostic estimate protocols")
+			}
+			protocolVersion = 1
 			if len(fields) != 4 {
 				return result, fmt.Errorf("invalid service record at line %d", lineNumber+1)
 			}
@@ -134,6 +253,10 @@ func parseRuntimeDiagnosticEstimate(raw string, expectedSelections ...[]string) 
 				Service: service, FileBytes: fileBytes, ContainerBytes: containerBytes,
 			})
 		case runtimeDiagnosticTotalRecord:
+			if protocolVersion == 2 {
+				return result, fmt.Errorf("mixed runtime diagnostic estimate protocols")
+			}
+			protocolVersion = 1
 			if len(fields) != 6 {
 				return result, fmt.Errorf("invalid total record at line %d", lineNumber+1)
 			}
@@ -170,6 +293,23 @@ func parseRuntimeDiagnosticEstimate(raw string, expectedSelections ...[]string) 
 	}
 	if !seenTotal {
 		return result, fmt.Errorf("runtime diagnostic estimate total is missing")
+	}
+	if protocolVersion == 2 {
+		var candidateFiles int
+		var candidateBytes int64
+		for _, service := range result.Services {
+			candidateFiles += service.CandidateFiles
+			candidateBytes += service.CandidateScanBytes
+		}
+		if candidateFiles != result.CandidateFiles || candidateBytes != result.CandidateScanBytes {
+			return result, fmt.Errorf("runtime diagnostic V2 estimate totals are inconsistent")
+		}
+		for service := range expected {
+			if !seenServices[service] {
+				return result, fmt.Errorf("runtime diagnostic estimate is missing service %q", service)
+			}
+		}
+		return result, nil
 	}
 	var fileSum, containerSum int64
 	for _, service := range result.Services {

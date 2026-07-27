@@ -27,7 +27,6 @@ esac
 RUNTIME_ROOT="$INSTALL_ROOT/runtime"
 DIAGNOSTICS_ROOT="$RUNTIME_ROOT/diagnostics"
 PARTIAL_ROOT="$DIAGNOSTICS_ROOT/$EXPORT_ID.partial"
-FINAL_ROOT="$DIAGNOSTICS_ROOT/$EXPORT_ID"
 
 [ -d "$INSTALL_ROOT" ] && [ ! -L "$INSTALL_ROOT" ] || exit 40
 install_canonical=$(readlink -f -- "$INSTALL_ROOT") || exit 40
@@ -43,9 +42,8 @@ diagnostics_canonical=$(readlink -f -- "$DIAGNOSTICS_ROOT") || exit 40
 [ "$diagnostics_canonical" = "$RUNTIME_ROOT/diagnostics" ] || exit 40
 DIAGNOSTICS_ROOT=$diagnostics_canonical
 PARTIAL_ROOT="$DIAGNOSTICS_ROOT/$EXPORT_ID.partial"
-FINAL_ROOT="$DIAGNOSTICS_ROOT/$EXPORT_ID"
 
-for controlled_root in "$PARTIAL_ROOT" "$FINAL_ROOT"; do
+for controlled_root in "$PARTIAL_ROOT"; do
   [ ! -L "$controlled_root" ] || exit 40
   if [ -e "$controlled_root" ]; then
     [ -d "$controlled_root" ] || exit 40
@@ -95,6 +93,5 @@ if [ -e "$pid_file" ] || [ -L "$pid_file" ]; then
   fi
 fi
 
-rm -rf -- "$PARTIAL_ROOT" "$FINAL_ROOT"
+rm -rf -- "$PARTIAL_ROOT"
 [ ! -e "$PARTIAL_ROOT" ] && [ ! -L "$PARTIAL_ROOT" ]
-[ ! -e "$FINAL_ROOT" ] && [ ! -L "$FINAL_ROOT" ]
