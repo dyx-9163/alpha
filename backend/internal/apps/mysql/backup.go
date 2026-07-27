@@ -800,8 +800,8 @@ for schema_name in sorted(schema_names, key=lambda value: value.encode("utf-8"))
     catalog.add(key)
     table_output.append({"name": table_name})
   schemas.append({"name": schema_name, "tableCount": len(table_output), "tables": table_output})
-actual_metadata = {path for path in inventory_paths if path.endswith(".json") and not path.startswith("@")}
-if actual_metadata != metadata_paths: reject()
+actual_metadata = {path for path in inventory_paths if path.endswith(".json")}
+if actual_metadata != metadata_paths | {"@.json", "@.done.json"}: reject()
 declared_tables = set()
 for schema_name, table_values in table_bytes.items():
   if schema_name not in schema_names: reject()
