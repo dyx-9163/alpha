@@ -481,7 +481,9 @@ func TestRuntimeDiagnosticExportScriptSecurityContract(t *testing.T) {
 		`docker ps -a`,
 		`label=aifar.instance=$INSTANCE_ID`,
 		`label=aifar.service=$service`,
-		`docker logs --since "$SINCE" --until "$UNTIL" --timestamps "$container"`,
+		`docker logs --since "$SINCE" --until "$UNTIL" --timestamps "$container_id"`,
+		`docker ps -a --no-trunc`,
+		"revalidate_container_identity()",
 		"3221225472",
 		"json_escape()",
 		`FILE_LIMIT_BLOCKS=1048576`,
@@ -515,6 +517,7 @@ func TestRuntimeDiagnosticExportScriptSecurityContract(t *testing.T) {
 		"jq ", "python", "node ", `rm -rf -- "$LOG_ROOT`, `.env" "$BUNDLE_ROOT`, "runtimeSpec",
 		`{{.Labels}}`, `s/([A-Za-z0-9+\/_=-]{80})[A-Za-z0-9+\/_=-]*/\1[REDACTED]/g`,
 		"2097152", "remaining / 512", "if ! (ulimit",
+		`docker logs --since "$SINCE" --until "$UNTIL" --timestamps "$container"`,
 	} {
 		if strings.Contains(script, forbidden) {
 			t.Fatalf("export script contains forbidden behavior %q:\n%s", forbidden, script)
@@ -522,6 +525,91 @@ func TestRuntimeDiagnosticExportScriptSecurityContract(t *testing.T) {
 	}
 	if got := strings.Count(script, `"$service_root"/*)`); got < 3 {
 		t.Fatalf("file candidates must be prefix-revalidated before stat and staged reads, checks=%d:\n%s", got, script)
+	}
+}
+
+func TestRuntimeDiagnosticExportUsesRevalidatedImmutableContainerIDs(t *testing.T) {
+	containerID := strings.Repeat("a", 64)
+	for _, tc := range []struct {
+		name         string
+		identityMode string
+		wantLog      bool
+	}{
+		{name: "matching labels", identityMode: "match", wantLog: true},
+		{name: "mismatched labels", identityMode: "mismatch", wantLog: false},
+		{name: "vanished container", identityMode: "vanished", wantLog: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fixture := newRuntimeDiagnosticExportShellFixture(t)
+			callsPath := filepath.Join(fixture.rootNative, "docker-calls")
+			writeRuntimeDiagnosticShellCommand(t, fixture.binNative, "docker", strings.Join([]string{
+				`AIFAR_CONTAINER_ID=` + containerID,
+				`AIFAR_IDENTITY_MODE=` + tc.identityMode,
+				`printf '%s\n' "$*" >> "$AIFAR_DOCKER_CALLS"`,
+				`case "${1:-}" in`,
+				`  ps) printf '%s\n' "$AIFAR_CONTAINER_ID" ;;`,
+				`  logs)`,
+				`    last=""; for value do last=$value; done`,
+				`    if [ "$last" = "reused-name" ]; then printf '%s\n' 'RACE_LEAK'; else printf '%s\n' 'safe immutable log'; fi`,
+				`    ;;`,
+				`  inspect)`,
+				`    case "$*" in`,
+				`      *'.Config.Labels'*)`,
+				`        case "$AIFAR_IDENTITY_MODE" in`,
+				`          match) printf 'instance-1\tgateway\t/original-name\n' ;;`,
+				`          mismatch) printf 'other-instance\tgateway\t/reused-name\n' ;;`,
+				`          vanished) exit 1 ;;`,
+				`        esac`,
+				`        ;;`,
+				`      *) printf '%s\n' '{"Status":"healthy"}' ;;`,
+				`    esac`,
+				`    ;;`,
+				`esac`,
+			}, "\n"))
+
+			output, err := fixture.run(
+				"AIFAR_DOCKER_CALLS=" + runtimeDiagnosticShellPath(callsPath),
+			)
+			if err != nil {
+				t.Fatalf("diagnostic export failed: %v: %s", err, output)
+			}
+			calls, err := os.ReadFile(callsPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			callsText := string(calls)
+			if strings.Contains(callsText, "logs --since 2020-01-01T00:00:00Z --until 2035-01-01T00:00:00Z --timestamps reused-name") {
+				t.Fatalf("docker logs used a mutable container name:\n%s", callsText)
+			}
+			if !strings.Contains(callsText, "{{.ID}}") {
+				t.Fatalf("container enumeration did not use immutable IDs:\n%s", callsText)
+			}
+			for _, call := range strings.Split(callsText, "\n") {
+				if strings.Contains(call, "label=aifar.service=") && strings.Contains(call, "{{.Names}}") {
+					t.Fatalf("service container enumeration used mutable names:\n%s", callsText)
+				}
+			}
+
+			listing := runtimeDiagnosticArchiveList(t, fixture.sh, fixture.archiveNative())
+			entry := fixture.archiveBase + "/services/gateway/container-logs/original-name.log"
+			if tc.wantLog {
+				if !strings.Contains(listing, entry) {
+					t.Fatalf("revalidated container log missing from archive:\n%s\ndocker calls:\n%s", listing, callsText)
+				}
+				content := runtimeDiagnosticArchiveFile(t, fixture.sh, fixture.archiveNative(), entry)
+				if content != "safe immutable log\n" || !strings.Contains(callsText, "logs --since 2020-01-01T00:00:00Z --until 2035-01-01T00:00:00Z --timestamps "+containerID) {
+					t.Fatalf("container log did not come from immutable ID: content=%q calls=%s", content, callsText)
+				}
+			} else {
+				if strings.Contains(listing, "/services/gateway/container-logs/") && strings.Contains(listing, ".log") {
+					t.Fatalf("vanished or mismatched container log entered archive:\n%s", listing)
+				}
+				errorsText := runtimeDiagnosticArchiveFile(t, fixture.sh, fixture.archiveNative(), fixture.archiveBase+"/collection-errors.txt")
+				if !strings.Contains(errorsText, "container-identity-changed\tgateway\t-") {
+					t.Fatalf("fixed identity warning missing: %s\ndocker calls:\n%s", errorsText, callsText)
+				}
+			}
+		})
 	}
 }
 
@@ -1368,14 +1456,17 @@ func TestRuntimeDiagnosticExportContinuesAfterIndividualDiagnosticCommandFailure
 		{
 			name: "container log",
 			configure: func(fixture *runtimeDiagnosticExportShellFixture) {
+				containerID := strings.Repeat("b", 64)
 				writeRuntimeDiagnosticShellCommand(t, fixture.binNative, "docker", strings.Join([]string{
 					`case "${1:-}" in`,
 					`  ps)`,
-					`    for value do case "$value" in *Names*) printf '%s\n' 'container-1'; exit 0 ;; esac; done`,
+					`    for value do case "$value" in *ID*) printf '%s\n' '` + containerID + `'; exit 0 ;; esac; done`,
 					`    printf '%s\n' 'container table'`,
 					`    ;;`,
 					`  logs) printf '%s\n' 'CONTAINER_FAILURE_SHOULD_NOT_ARCHIVE'; exit 42 ;;`,
-					`  inspect) printf '%s\n' '{"Status":"healthy"}' ;;`,
+					`  inspect)`,
+					`    case "$*" in *'.Config.Labels'*) printf 'instance-1\tgateway\t/container-1\n' ;; *) printf '%s\n' '{"Status":"healthy"}' ;; esac`,
+					`    ;;`,
 					`esac`,
 				}, "\n"))
 			},
@@ -1393,14 +1484,17 @@ func TestRuntimeDiagnosticExportContinuesAfterIndividualDiagnosticCommandFailure
 		{
 			name: "container health inspect",
 			configure: func(fixture *runtimeDiagnosticExportShellFixture) {
+				containerID := strings.Repeat("c", 64)
 				writeRuntimeDiagnosticShellCommand(t, fixture.binNative, "docker", strings.Join([]string{
 					`case "${1:-}" in`,
 					`  ps)`,
-					`    for value do case "$value" in *Names*) printf '%s\n' 'container-1'; exit 0 ;; esac; done`,
+					`    for value do case "$value" in *ID*) printf '%s\n' '` + containerID + `'; exit 0 ;; esac; done`,
 					`    printf '%s\n' 'container table'`,
 					`    ;;`,
 					`  logs) printf '%s\n' 'safe container log' ;;`,
-					`  inspect) printf '%s\n' 'INSPECT_FAILURE_SHOULD_NOT_ARCHIVE'; exit 45 ;;`,
+					`  inspect)`,
+					`    case "$*" in *'.Config.Labels'*) printf 'instance-1\tgateway\t/container-1\n' ;; *) printf '%s\n' 'INSPECT_FAILURE_SHOULD_NOT_ARCHIVE'; exit 45 ;; esac`,
+					`    ;;`,
 					`esac`,
 				}, "\n"))
 			},

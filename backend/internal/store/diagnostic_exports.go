@@ -61,10 +61,17 @@ func (s *Store) MarkDiagnosticExportDownloaded(id string, downloadedAt time.Time
 
 func (s *Store) MarkDiagnosticExportCleanupPending(id string, attemptedAt time.Time) (bool, error) {
 	result, err := s.db.Exec(`update diagnostic_exports
-		set status=case when status='ready' then 'expired' else status end,
+		set status=case
+			when status='ready' then 'expired'
+			when status in ('pending','building') then 'failed'
+			else status end,
 			cleanup_status='pending',cleanup_error='',cleanup_attempted_at=?
-		where id=? and status in ('ready','expired','failed','cancelled')
-		and deleted_at is null and cleanup_status <> 'complete'`, attemptedAt, strings.TrimSpace(id))
+		where id=? and status in ('pending','building','ready','expired','failed','cancelled')
+		and deleted_at is null and cleanup_status <> 'complete'
+		and (trim(task_id)='' or not exists (
+			select 1 from tasks where tasks.id=diagnostic_exports.task_id
+			and tasks.status in ('pending','running')
+		))`, attemptedAt, strings.TrimSpace(id))
 	return diagnosticExportWasUpdated(result, err)
 }
 
@@ -137,16 +144,20 @@ func (s *Store) ListDiagnosticExportsDueForCleanupAfter(now, afterExpiresAt time
 	if limit <= 0 {
 		limit = 100
 	}
-	where := `(status='ready' and expires_at <= ?) or (status='expired' and cleanup_status <> 'complete')`
+	where := `e.cleanup_status <> 'complete'
+		and (trim(e.task_id)='' or t.id is null or t.status in ('success','failed','cancelled','timeout'))
+		and ((e.status='ready' and e.expires_at <= ?)
+			or e.status in ('expired','failed','cancelled','pending','building'))`
 	args := []any{now}
 	if !afterExpiresAt.IsZero() || strings.TrimSpace(afterID) != "" {
-		where = `(` + where + `) and (expires_at > ? or (expires_at = ? and id > ?))`
+		where = `(` + where + `) and (e.expires_at > ? or (e.expires_at = ? and e.id > ?))`
 		args = append(args, afterExpiresAt, afterExpiresAt, strings.TrimSpace(afterID))
 	}
 	args = append(args, limit)
-	rows, err := s.db.Query(`select `+diagnosticExportColumns+` from diagnostic_exports
+	rows, err := s.db.Query(`select `+diagnosticExportColumnsWithAlias("e")+` from diagnostic_exports e
+		left join tasks t on t.id=e.task_id
 		where `+where+`
-		order by expires_at asc, id asc limit ?`, args...)
+		order by e.expires_at asc, e.id asc limit ?`, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -160,6 +171,14 @@ func (s *Store) ListDiagnosticExportsDueForCleanupAfter(now, afterExpiresAt time
 		items = append(items, item)
 	}
 	return items, rows.Err()
+}
+
+func diagnosticExportColumnsWithAlias(alias string) string {
+	columns := strings.Split(strings.ReplaceAll(diagnosticExportColumns, "\n", ""), ",")
+	for index := range columns {
+		columns[index] = alias + "." + strings.TrimSpace(columns[index])
+	}
+	return strings.Join(columns, ",")
 }
 
 func scanDiagnosticExport(rows interface{ Scan(dest ...any) error }) (DiagnosticExport, error) {

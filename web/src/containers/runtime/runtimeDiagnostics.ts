@@ -1,4 +1,4 @@
-import type { AifarRuntimeDeployment, RuntimeDiagnosticEstimate, RuntimeDiagnosticExport, RuntimeDiagnosticRequest } from './types'
+import type { AifarRuntimeDeployment, RuntimeDiagnosticEstimate, RuntimeDiagnosticExport, RuntimeDiagnosticExportPage, RuntimeDiagnosticRequest } from './types'
 
 export type RuntimeDiagnosticSubmitState = {
   services: string[]
@@ -40,6 +40,18 @@ export function runtimeDiagnosticRequestFingerprint(query: string, request: Runt
 
 export function runtimeDiagnosticExportScopeFingerprint(query: string, instanceId: string) {
   return `${query}\u0000${instanceId}`
+}
+
+export function emptyRuntimeDiagnosticExportPage(): RuntimeDiagnosticExportPage {
+  return { items: [], total: 0, page: 1, pageSize: 20 }
+}
+
+export function trackRuntimeDiagnosticTask(
+  tracker: { track: (taskId: string, label?: string, options?: { polling?: boolean }) => void },
+  taskId: string,
+  label: string
+) {
+  tracker.track(taskId, label, { polling: false })
 }
 
 export function terminalDiagnosticTaskToRefresh(items: Array<{ id: string; status: string }>, tracked: Set<string>, refreshed: Set<string>) {

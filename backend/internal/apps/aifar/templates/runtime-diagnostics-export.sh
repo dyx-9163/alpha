@@ -443,6 +443,36 @@ for candidate do
 done
 AIFAR_DIAGNOSTIC_FILE_HELPER
 
+revalidate_container_identity() {
+  expected_service=$1
+  container_id=$2
+  identity_file=$3
+  case "$container_id" in ''|*[!A-Fa-f0-9]*) add_error container-identity-changed "$expected_service"; return 1 ;; esac
+  if run_limited "$FILE_LIMIT_BLOCKS" docker inspect --format '{{"{{index .Config.Labels \"aifar.instance\"}}\t{{index .Config.Labels \"aifar.service\"}}\t{{.Name}}"}}' "$container_id" > "$identity_file" 2>&1; then
+    identity=$(cat "$identity_file") || exit 32
+    rm -f -- "$identity_file" || exit 32
+  else
+    command_status=$?
+    rm -f -- "$identity_file"
+    [ "${LIMIT_SETUP_FAILED:-0}" -eq 0 ] || exit 32
+    add_error container-identity-changed "$expected_service"
+    return 1
+  fi
+  case "$identity" in *$'\t'*$'\t'*) ;; *) add_error container-identity-changed "$expected_service"; return 1 ;; esac
+  actual_instance=${identity%%$'\t'*}
+  identity_rest=${identity#*$'\t'}
+  actual_service=${identity_rest%%$'\t'*}
+  actual_name=${identity_rest#*$'\t'}
+  actual_name=${actual_name#/}
+  if [ "$actual_instance" != "$INSTANCE_ID" ] || [ "$actual_service" != "$expected_service" ]; then
+    add_error container-identity-changed "$expected_service"
+    return 1
+  fi
+  case "$actual_name" in ''|*[!A-Za-z0-9._-]*) add_error container-identity-changed "$expected_service"; return 1 ;; esac
+  REVALIDATED_CONTAINER_NAME=$actual_name
+  return 0
+}
+
 export BUNDLE_ROOT RAW_ROOT STAGE_ROOT SCRATCH_ROOT LIMIT_MARKER_ROOT TOTAL_FILE MANIFEST_RECORDS ERROR_RECORDS MAX_UNCOMPRESSED FILE_LIMIT_BLOCKS
 
 for service in $SERVICES; do
@@ -462,19 +492,25 @@ for service in $SERVICES; do
       fi
     fi
   fi
-  container_names="$RAW_ROOT/container-names-$service"
-  if run_limited "$FILE_LIMIT_BLOCKS" docker ps -a --filter "label=aifar.instance=$INSTANCE_ID" --filter "label=aifar.service=$service" --format '{{"{{.Names}}"}}' > "$container_names" 2>&1; then
-    containers=$(cat "$container_names") || exit 32
-    rm -f -- "$container_names" || exit 32
+  container_ids_file="$RAW_ROOT/container-ids-$service"
+  if run_limited "$FILE_LIMIT_BLOCKS" docker ps -a --no-trunc --filter "label=aifar.instance=$INSTANCE_ID" --filter "label=aifar.service=$service" --format '{{"{{.ID}}"}}' > "$container_ids_file" 2>&1; then
+    container_ids=$(cat "$container_ids_file") || exit 32
+    rm -f -- "$container_ids_file" || exit 32
   else
     command_status=$?
-    rm -f -- "$container_names"
+    rm -f -- "$container_ids_file"
     [ "${LIMIT_SETUP_FAILED:-0}" -eq 0 ] || exit 32
     add_error container-list-failed "$service"
-    containers=
+    container_ids=
   fi
-  for container in $containers; do
-    case "$container" in ''|*[!A-Za-z0-9._-]*) exit 32 ;; esac
+  container_counter=0
+  for container_id in $container_ids; do
+    container_counter=$((container_counter + 1))
+    identity_file="$RAW_ROOT/container-identity-$service-$container_counter"
+    if ! revalidate_container_identity "$service" "$container_id" "$identity_file"; then
+      continue
+    fi
+    container=$REVALIDATED_CONTAINER_NAME
     remaining=$(remaining_bytes)
     [ "$remaining" -gt 0 ] || exit 32
     raw="$RAW_ROOT/containers/$service/$container.raw"
@@ -483,7 +519,7 @@ for service in $SERVICES; do
     destination_relative="services/$service/container-logs/$container.log"
     destination="$BUNDLE_ROOT/$destination_relative"
     mkdir -p "$(dirname "$raw")" "$(dirname "$staged")" "$(dirname "$scratch")" "$(dirname "$destination")"
-    if run_limited "$FILE_LIMIT_BLOCKS" docker logs --since "$SINCE" --until "$UNTIL" --timestamps "$container" > "$raw" 2>&1; then
+    if run_limited "$FILE_LIMIT_BLOCKS" docker logs --since "$SINCE" --until "$UNTIL" --timestamps "$container_id" > "$raw" 2>&1; then
       :
     else
       command_status=$?
@@ -501,7 +537,7 @@ for service in $SERVICES; do
     [ "$staged_bytes" -le "$remaining" ] || exit 32
     commit_staged_file "$staged_bytes" || exit 32
     mv -T -- "$staged" "$destination" || exit 32
-    record_manifest_source "docker:$container" "$destination_relative" "$original_bytes"
+    record_manifest_source "docker:$container_id" "$destination_relative" "$original_bytes"
   done
 done
 
@@ -524,23 +560,27 @@ fi
 health_file="$RAW_ROOT/health-checks.txt"
 : > "$health_file"
 for service in $SERVICES; do
-  container_names="$RAW_ROOT/health-container-names-$service"
-  if run_limited "$FILE_LIMIT_BLOCKS" docker ps -a --filter "label=aifar.instance=$INSTANCE_ID" --filter "label=aifar.service=$service" --format '{{"{{.Names}}"}}' > "$container_names" 2>&1; then
-    containers=$(cat "$container_names") || exit 33
-    rm -f -- "$container_names" || exit 33
+  container_ids_file="$RAW_ROOT/health-container-ids-$service"
+  if run_limited "$FILE_LIMIT_BLOCKS" docker ps -a --no-trunc --filter "label=aifar.instance=$INSTANCE_ID" --filter "label=aifar.service=$service" --format '{{"{{.ID}}"}}' > "$container_ids_file" 2>&1; then
+    container_ids=$(cat "$container_ids_file") || exit 33
+    rm -f -- "$container_ids_file" || exit 33
   else
     command_status=$?
-    rm -f -- "$container_names"
+    rm -f -- "$container_ids_file"
     [ "${LIMIT_SETUP_FAILED:-0}" -eq 0 ] || exit 33
     add_error health-container-list-failed "$service"
-    containers=
+    container_ids=
   fi
   health_counter=0
-  for container in $containers; do
-    case "$container" in ''|*[!A-Za-z0-9._-]*) exit 33 ;; esac
+  for container_id in $container_ids; do
     health_counter=$((health_counter + 1))
+    identity_file="$RAW_ROOT/health-container-identity-$service-$health_counter"
+    if ! revalidate_container_identity "$service" "$container_id" "$identity_file"; then
+      continue
+    fi
+    container=$REVALIDATED_CONTAINER_NAME
     health_item="$RAW_ROOT/health-$service-$health_counter.raw"
-    if run_limited "$FILE_LIMIT_BLOCKS" docker inspect --format '{{"{{json .State.Health}}"}}' "$container" > "$health_item" 2>&1; then
+    if run_limited "$FILE_LIMIT_BLOCKS" docker inspect --format '{{"{{json .State.Health}}"}}' "$container_id" > "$health_item" 2>&1; then
       printf '%s\t' "$container" >> "$health_file"
       cat "$health_item" >> "$health_file" || exit 33
       rm -f -- "$health_item" || exit 33

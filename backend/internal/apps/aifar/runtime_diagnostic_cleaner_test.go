@@ -98,6 +98,95 @@ func TestRuntimeDiagnosticCleanerRetriesOfflineServer(t *testing.T) {
 	}
 }
 
+func TestRuntimeDiagnosticCleanerReclaimsTerminalAndMissingTaskOrphans(t *testing.T) {
+	db, tasks, remote, now := newRuntimeDiagnosticCleanerFixture(t)
+	terminalTask, err := db.CreateTask(store.Task{ID: "task-terminal-export", Type: "aifar.runtime.diagnostics.export", Target: "instance-1", Status: "failed", CreatedBy: "owner"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	terminalOrphan := saveRuntimeDiagnosticCleanerExportWithState(t, db, now, "diag-terminal-orphan", "pending", terminalTask.ID, "none")
+	missingOrphan := saveRuntimeDiagnosticCleanerExportWithState(t, db, now, "diag-missing-orphan", "building", "task-missing-export", "none")
+
+	cleaner := NewRuntimeDiagnosticCleaner(db, tasks, remote)
+	cleaner.tick(context.Background(), now)
+	waitForRuntimeDiagnosticCleanerTask(t, db)
+
+	for _, exportID := range []string{terminalOrphan.ID, missingOrphan.ID} {
+		got, err := db.GetDiagnosticExport(exportID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.Status != "deleted" || got.CleanupStatus != "complete" || got.DeletedAt.IsZero() {
+			t.Fatalf("orphan export %s was not reclaimed: %+v", exportID, got)
+		}
+	}
+	if remote.CallCount() != 2 {
+		t.Fatalf("cleanup remote calls=%d, want 2", remote.CallCount())
+	}
+	audits, err := db.ListAudit()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(audits) != 2 {
+		t.Fatalf("cleanup attempts must each be audited, got %+v", audits)
+	}
+}
+
+func TestRuntimeDiagnosticCleanerDoesNotRaceActiveExportTask(t *testing.T) {
+	db, tasks, remote, now := newRuntimeDiagnosticCleanerFixture(t)
+	activeTask, err := db.CreateTask(store.Task{ID: "task-active-export", Type: "aifar.runtime.diagnostics.export", Target: "instance-1", Status: "running", CreatedBy: "owner"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	export := saveRuntimeDiagnosticCleanerExportWithState(t, db, now, "diag-active-export", "building", activeTask.ID, "none")
+
+	cleaner := NewRuntimeDiagnosticCleaner(db, tasks, remote)
+	cleaner.tick(context.Background(), now)
+
+	got, err := db.GetDiagnosticExport(export.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != "building" || got.CleanupStatus != "none" || remote.CallCount() != 0 {
+		t.Fatalf("active export was raced by cleanup: %+v calls=%d", got, remote.CallCount())
+	}
+	allTasks, err := db.ListTasks()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(allTasks) != 1 || allTasks[0].ID != activeTask.ID {
+		t.Fatalf("cleaner created a task for an active export: %+v", allTasks)
+	}
+}
+
+func TestRuntimeDiagnosticCleanerRetriesFailedExportCleanup(t *testing.T) {
+	db, tasks, remote, now := newRuntimeDiagnosticCleanerFixture(t)
+	export := saveRuntimeDiagnosticCleanerExportWithState(t, db, now, "diag-failed-retry", "failed", "task-missing-export", "failed")
+	remote.SetError(errors.New("offline target"))
+	cleaner := NewRuntimeDiagnosticCleaner(db, tasks, remote)
+
+	cleaner.tick(context.Background(), now)
+	waitForRuntimeDiagnosticCleanerTask(t, db)
+	failed, err := db.GetDiagnosticExport(export.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if failed.Status != "failed" || failed.CleanupStatus != "failed" || failed.CleanupAttemptedAt.IsZero() {
+		t.Fatalf("failed export cleanup was not retained for retry: %+v", failed)
+	}
+
+	remote.SetError(nil)
+	cleaner.tick(context.Background(), now.Add(time.Hour))
+	waitForRuntimeDiagnosticCleanerTaskCount(t, db, 2)
+	retried, err := db.GetDiagnosticExport(export.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retried.Status != "deleted" || retried.CleanupStatus != "complete" {
+		t.Fatalf("failed export cleanup did not retry: %+v", retried)
+	}
+}
+
 func TestRuntimeDiagnosticCleanerCoalescesOverlappingTicks(t *testing.T) {
 	db, tasks, remote, now := newRuntimeDiagnosticCleanerFixture(t)
 	_ = saveRuntimeDiagnosticCleanerExport(t, db, now, "diag-overlap", now.Add(-time.Second))
@@ -189,6 +278,25 @@ func TestRuntimeDiagnosticCleanerProcessesAllDuePages(t *testing.T) {
 	waitForRuntimeDiagnosticCleanerTask(t, db)
 	if remote.CallCount() != 205 {
 		t.Fatalf("cleanup remote calls=%d, want 205", remote.CallCount())
+	}
+}
+
+func TestRuntimeDiagnosticCleanerProcessesMixedOrphansAcrossPages(t *testing.T) {
+	db, tasks, remote, now := newRuntimeDiagnosticCleanerFixture(t)
+	for i := 0; i < 205; i++ {
+		status := "failed"
+		cleanupStatus := "failed"
+		if i%2 == 0 {
+			status = "building"
+			cleanupStatus = "none"
+		}
+		saveRuntimeDiagnosticCleanerExportWithState(t, db, now, fmt.Sprintf("diag-orphan-page-%03d", i), status, "task-missing", cleanupStatus)
+	}
+	cleaner := NewRuntimeDiagnosticCleaner(db, tasks, remote)
+	cleaner.tick(context.Background(), now)
+	waitForRuntimeDiagnosticCleanerTask(t, db)
+	if remote.CallCount() != 205 {
+		t.Fatalf("mixed orphan cleanup remote calls=%d, want 205", remote.CallCount())
 	}
 }
 
@@ -321,6 +429,22 @@ func saveRuntimeDiagnosticCleanerExport(t *testing.T, db *store.Store, now time.
 		RemoteRelativePath: id + "/" + archiveName, ArchiveName: archiveName, ArchiveBytes: 1,
 		SHA256:    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
 		CreatedBy: "owner", CreatedAt: now.Add(-time.Hour), ReadyAt: now.Add(-time.Hour), ExpiresAt: expiresAt, CleanupStatus: "none",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return export
+}
+
+func saveRuntimeDiagnosticCleanerExportWithState(t *testing.T, db *store.Store, now time.Time, id, status, taskID, cleanupStatus string) store.DiagnosticExport {
+	t.Helper()
+	archiveName := "aifar-diagnostics-gateway-20260727T070000Z.tar.gz"
+	export, err := db.SaveDiagnosticExport(store.DiagnosticExport{
+		ID: id, TaskID: taskID, InstanceID: "instance-1", ServerID: "server-1", Status: status,
+		Services: []string{"gateway"}, SinceAt: now.Add(-time.Hour), UntilAt: now.Add(-time.Minute),
+		RemoteRelativePath: id + "/" + archiveName, ArchiveName: archiveName, ArchiveBytes: 1,
+		SHA256:    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+		CreatedBy: "owner", CreatedAt: now.Add(-time.Hour), ExpiresAt: now.Add(time.Hour), CleanupStatus: cleanupStatus,
 	})
 	if err != nil {
 		t.Fatal(err)

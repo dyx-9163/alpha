@@ -113,11 +113,13 @@ import {
 } from './api'
 import {
   defaultRuntimeDiagnosticWindow,
+  emptyRuntimeDiagnosticExportPage,
   enabledRuntimeDiagnosticServices,
   runtimeDiagnosticExportScopeFingerprint,
   runtimeDiagnosticRequestFingerprint,
   runtimeDiagnosticStatusKey,
   runtimeDiagnosticSubmitDisabledReason,
+  trackRuntimeDiagnosticTask,
   terminalDiagnosticTaskToRefresh
 } from './runtimeDiagnostics'
 import type { AifarRuntimeDeployment, RuntimeDiagnosticEstimate, RuntimeDiagnosticExport, RuntimeDiagnosticExportPage, RuntimeDiagnosticRequest } from './types'
@@ -138,7 +140,7 @@ const sinceAt = ref<Date>()
 const untilAt = ref<Date>()
 const estimate = ref<RuntimeDiagnosticEstimate | null>(null)
 const estimateFingerprint = ref('')
-const exportsPage = ref<RuntimeDiagnosticExportPage>({ items: [], total: 0, page: 1, pageSize: 20 })
+const exportsPage = ref<RuntimeDiagnosticExportPage>(emptyRuntimeDiagnosticExportPage())
 const estimating = ref(false)
 const submitting = ref(false)
 const trackedTaskIds = new Set<string>()
@@ -175,6 +177,7 @@ watch(mode, (next) => {
 watch([selectedServices, sinceAt, untilAt], invalidateEstimate, { deep: true })
 watch(() => [props.instanceId, props.targetQuery], () => {
   invalidateEstimate()
+  exportsPage.value = emptyRuntimeDiagnosticExportPage()
   void loadExports()
 }, { immediate: true })
 watch(() => taskProgress.items.map(({ id, status }) => ({ id, status })), (items) => {
@@ -262,7 +265,7 @@ async function loadExports() {
   const requestScope = runtimeDiagnosticExportScopeFingerprint(props.targetQuery, props.instanceId)
   if (!props.instanceId || !props.targetQuery) {
     if (requestSequence === exportsRequestSequence) {
-      exportsPage.value = { items: [], total: 0, page: 1, pageSize: 20 }
+      exportsPage.value = emptyRuntimeDiagnosticExportPage()
     }
     return
   }
@@ -329,7 +332,7 @@ async function remove(row: RuntimeDiagnosticExport) {
 function trackTask(taskId: string, label: string) {
   if (!taskId) return
   trackedTaskIds.add(taskId)
-  taskProgress.track(taskId, label)
+  trackRuntimeDiagnosticTask(taskProgress, taskId, label)
 }
 
 function currentExportScope() {

@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import {
   defaultRuntimeDiagnosticWindow,
+  emptyRuntimeDiagnosticExportPage,
   enabledRuntimeDiagnosticServices,
   runtimeDiagnosticRequestFingerprint,
   runtimeDiagnosticSubmitDisabledReason,
@@ -47,5 +48,12 @@ describe('runtime diagnostic interactions', () => {
     refreshed.add('task-1')
     refreshed.add('task-2')
     expect(terminalDiagnosticTaskToRefresh([{ id: 'task-1', status: 'success' }, { id: 'task-2', status: 'failed' }], tracked, refreshed)).toEqual([])
+  })
+
+  it('clears diagnostic rows immediately when the export scope changes', () => {
+    const cleared = emptyRuntimeDiagnosticExportPage()
+
+    expect(cleared).toEqual({ items: [], total: 0, page: 1, pageSize: 20 })
+    expect(cleared.items).toHaveLength(0)
   })
 })

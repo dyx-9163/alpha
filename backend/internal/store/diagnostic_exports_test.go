@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -106,7 +107,7 @@ func TestListDiagnosticExportsDueForCleanup(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(due) != 1 || due[0].ID != "expired" {
+	if len(due) != 2 || due[0].ID != "expired" || due[1].ID != "failed" {
 		t.Fatalf("unexpected due exports: %+v", due)
 	}
 }
@@ -231,5 +232,89 @@ func TestDiagnosticExportConditionalCleanupTransitionsSupportRetry(t *testing.T)
 	}
 	if got.Status != "deleted" || got.CleanupStatus != "complete" || got.DeletedAt.IsZero() {
 		t.Fatalf("unexpected cleanup retry result: %+v", got)
+	}
+}
+
+func TestListDiagnosticExportsDueForCleanupIncludesIncompleteTerminalAndOrphanRecords(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "aifar.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	now := time.Date(2026, 7, 27, 8, 0, 0, 0, time.UTC)
+
+	for _, task := range []Task{
+		{ID: "task-terminal", Type: "diagnostic", Target: "i1", Status: "failed"},
+		{ID: "task-pending", Type: "diagnostic", Target: "i1", Status: "pending"},
+		{ID: "task-running", Type: "diagnostic", Target: "i1", Status: "running"},
+	} {
+		if _, err := db.CreateTask(task); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	rows := []DiagnosticExport{
+		{ID: "failed-retry", TaskID: "task-terminal", InstanceID: "i1", ServerID: "s1", Status: "failed", SinceAt: now.Add(-time.Hour), UntilAt: now, CreatedAt: now.Add(-5 * time.Minute), ExpiresAt: now.Add(time.Hour), CleanupStatus: "failed"},
+		{ID: "cancelled-retry", InstanceID: "i1", ServerID: "s1", Status: "cancelled", SinceAt: now.Add(-time.Hour), UntilAt: now, CreatedAt: now.Add(-4 * time.Minute), ExpiresAt: now.Add(time.Hour), CleanupStatus: "none"},
+		{ID: "pending-terminal-task", TaskID: "task-terminal", InstanceID: "i1", ServerID: "s1", Status: "pending", SinceAt: now.Add(-time.Hour), UntilAt: now, CreatedAt: now.Add(-3 * time.Minute), ExpiresAt: now.Add(time.Hour), CleanupStatus: "none"},
+		{ID: "building-missing-task", TaskID: "task-missing", InstanceID: "i1", ServerID: "s1", Status: "building", SinceAt: now.Add(-time.Hour), UntilAt: now, CreatedAt: now.Add(-2 * time.Minute), ExpiresAt: now.Add(time.Hour), CleanupStatus: "none"},
+		{ID: "pending-active-task", TaskID: "task-pending", InstanceID: "i1", ServerID: "s1", Status: "pending", SinceAt: now.Add(-time.Hour), UntilAt: now, CreatedAt: now.Add(-time.Minute), ExpiresAt: now.Add(time.Hour), CleanupStatus: "none"},
+		{ID: "failed-active-task", TaskID: "task-running", InstanceID: "i1", ServerID: "s1", Status: "failed", SinceAt: now.Add(-time.Hour), UntilAt: now, CreatedAt: now, ExpiresAt: now.Add(time.Hour), CleanupStatus: "failed"},
+	}
+	for _, row := range rows {
+		if _, err := db.SaveDiagnosticExport(row); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	due, err := db.ListDiagnosticExportsDueForCleanup(now, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotIDs := make([]string, 0, len(due))
+	for _, row := range due {
+		gotIDs = append(gotIDs, row.ID)
+	}
+	wantIDs := []string{"building-missing-task", "cancelled-retry", "failed-retry", "pending-terminal-task"}
+	sort.Strings(gotIDs)
+	if strings.Join(gotIDs, ",") != strings.Join(wantIDs, ",") {
+		t.Fatalf("unexpected due records: got=%v want=%v", gotIDs, wantIDs)
+	}
+}
+
+func TestDiagnosticExportCleanupPendingTransitionsOnlyOrphanBuildsToFailed(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "aifar.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	now := time.Date(2026, 7, 27, 8, 0, 0, 0, time.UTC)
+	if _, err := db.CreateTask(Task{ID: "task-active", Type: "diagnostic", Target: "i1", Status: "running"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range []DiagnosticExport{
+		{ID: "orphan-building", TaskID: "task-missing", InstanceID: "i1", ServerID: "s1", Status: "building", SinceAt: now.Add(-time.Hour), UntilAt: now, ExpiresAt: now.Add(time.Hour)},
+		{ID: "active-building", TaskID: "task-active", InstanceID: "i1", ServerID: "s1", Status: "building", SinceAt: now.Add(-time.Hour), UntilAt: now, ExpiresAt: now.Add(time.Hour)},
+	} {
+		if _, err := db.SaveDiagnosticExport(row); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	updated, err := db.MarkDiagnosticExportCleanupPending("orphan-building", now)
+	if err != nil || !updated {
+		t.Fatalf("orphan building export did not enter cleanup: updated=%v err=%v", updated, err)
+	}
+	orphan, err := db.GetDiagnosticExport("orphan-building")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if orphan.Status != "failed" || orphan.CleanupStatus != "pending" || !orphan.CleanupAttemptedAt.Equal(now) {
+		t.Fatalf("unexpected orphan transition: %+v", orphan)
+	}
+
+	updated, err = db.MarkDiagnosticExportCleanupPending("active-building", now)
+	if err != nil || updated {
+		t.Fatalf("active building export entered cleanup: updated=%v err=%v", updated, err)
 	}
 }
