@@ -1,15 +1,17 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 const {
-	apiDeleteMock,
   apiEventSourceUrlMock,
+  apiDeleteMock,
+  apiDownloadMock,
   apiGetMock,
   apiPostFormMock,
   apiPostMock,
   apiPutMock
 } = vi.hoisted(() => ({
-	apiDeleteMock: vi.fn(),
   apiEventSourceUrlMock: vi.fn(),
+  apiDeleteMock: vi.fn(),
+  apiDownloadMock: vi.fn(),
   apiGetMock: vi.fn(),
   apiPostFormMock: vi.fn(),
   apiPostMock: vi.fn(),
@@ -17,20 +19,30 @@ const {
 }))
 
 vi.mock('../../api/client', () => ({
-	apiDelete: apiDeleteMock,
   apiEventSourceUrl: apiEventSourceUrlMock,
+  apiDelete: apiDeleteMock,
+  apiDownload: apiDownloadMock,
   apiGet: apiGetMock,
   apiPost: apiPostMock,
   apiPostForm: apiPostFormMock,
   apiPut: apiPutMock
 }))
 
+vi.mock('../../i18n', () => ({
+  getCurrentLocale: () => 'en'
+}))
+
 import {
   applyRuntimeConfig,
   cleanupStaleRuntime,
+  createRuntimeDiagnosticExport,
   createRuntimeLogEventSource,
-	deleteAifarRelease,
+  deleteAifarRelease,
+  deleteRuntimeDiagnosticExport,
+  downloadRuntimeDiagnosticExport,
+  estimateRuntimeDiagnostics,
   fetchAifarReleases,
+  fetchRuntimeDiagnosticExports,
   fetchAifarRuntime,
   installRuntimeServices,
   offlineRuntimeService,
@@ -54,8 +66,9 @@ class FakeEventSource {
 
 describe('AIFAR Runtime API service', () => {
   beforeEach(() => {
-		apiDeleteMock.mockReset()
     apiEventSourceUrlMock.mockReset()
+    apiDeleteMock.mockReset()
+    apiDownloadMock.mockReset()
     apiGetMock.mockReset()
     apiPostMock.mockReset()
     apiPostFormMock.mockReset()
@@ -89,12 +102,75 @@ describe('AIFAR Runtime API service', () => {
     expect(apiGetMock).toHaveBeenCalledWith('/apps/instances/instance-1/aifar/releases')
   })
 
-	it('deletes the selected release record with encoded path segments', async () => {
-		apiDeleteMock.mockResolvedValueOnce({ releaseId: 'release/old' })
+  it('deletes the selected release record with encoded path segments', async () => {
+    apiDeleteMock.mockResolvedValueOnce({ releaseId: 'release/old' })
 
-		await expect(deleteAifarRelease('instance/1', 'release/old')).resolves.toEqual({ releaseId: 'release/old' })
-		expect(apiDeleteMock).toHaveBeenCalledWith('/apps/instances/instance%2F1/aifar/releases/release%2Fold')
-	})
+    await expect(deleteAifarRelease('instance/1', 'release/old')).resolves.toEqual({ releaseId: 'release/old' })
+    expect(apiDeleteMock).toHaveBeenCalledWith('/apps/instances/instance%2F1/aifar/releases/release%2Fold')
+  })
+
+  it('estimates and creates a runtime diagnostic export', async () => {
+    const payload = {
+      instanceId: 'instance-1',
+      sinceAt: '2026-07-27T06:00:00Z',
+      untilAt: '2026-07-27T08:00:00Z',
+      services: ['gateway', 'oauth']
+    }
+    apiPostMock.mockResolvedValueOnce({ allowed: true })
+    apiPostMock.mockResolvedValueOnce({ taskId: 'task-1', exportId: 'diag-1', status: 'pending' })
+
+    await estimateRuntimeDiagnostics('serverId=server-1', payload)
+    expect(apiPostMock).toHaveBeenCalledWith('/containers/aifar/runtime/diagnostics/estimate?serverId=server-1', payload)
+    await createRuntimeDiagnosticExport('serverId=server-1', payload)
+    expect(apiPostMock).toHaveBeenLastCalledWith('/containers/aifar/runtime/diagnostics/exports?serverId=server-1', payload)
+  })
+
+  it('lists runtime diagnostic exports with paging parameters', async () => {
+    apiGetMock.mockResolvedValueOnce({ items: [], total: 0, page: 2, pageSize: 50 })
+
+    await fetchRuntimeDiagnosticExports('serverId=server-1', 'instance / 1', 2, 50)
+
+    expect(apiGetMock).toHaveBeenCalledWith(
+      '/containers/aifar/runtime/diagnostics/exports?serverId=server-1&instanceId=instance+%2F+1&page=2&pageSize=50'
+    )
+  })
+
+  it('downloads with delete-after-download disabled by default', async () => {
+    apiDownloadMock.mockResolvedValueOnce({ blob: new Blob(), filename: 'diagnostics.tar.gz', sha256: 'abc' })
+
+    await downloadRuntimeDiagnosticExport('serverId=server-1', 'diag/1')
+
+    expect(apiDownloadMock).toHaveBeenCalledWith(
+      '/containers/aifar/runtime/diagnostics/exports/diag%2F1/download?serverId=server-1&deleteAfterDownload=false'
+    )
+  })
+
+  it('deletes the selected runtime diagnostic export', async () => {
+    apiDeleteMock.mockResolvedValueOnce({ taskId: 'task-delete' })
+
+    await deleteRuntimeDiagnosticExport('serverId=server-1', 'diag/1')
+
+    expect(apiDeleteMock).toHaveBeenCalledWith(
+      '/containers/aifar/runtime/diagnostics/exports/diag%2F1?serverId=server-1'
+    )
+  })
+
+  it('reads the runtime diagnostic sha256 response header', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response('diagnostic archive', {
+      headers: { 'X-AIFAR-Diagnostic-SHA256': 'diagnostic-sha256' }
+    }))
+    vi.stubGlobal('localStorage', {
+      getItem: () => null,
+      setItem: () => undefined,
+      removeItem: () => undefined
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const { apiDownload } = await vi.importActual<typeof import('../../api/client')>('../../api/client')
+
+    await expect(apiDownload('/containers/aifar/runtime/diagnostics/exports/diag-1/download')).resolves.toMatchObject({
+      sha256: 'diagnostic-sha256'
+    })
+  })
 
   it('builds the authenticated runtime log EventSource URL', () => {
     const params = new URLSearchParams({ serverId: 'server-1', services: 'gateway,oauth', tail: '200' })

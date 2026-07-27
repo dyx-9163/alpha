@@ -200,6 +200,43 @@ type AppBackup struct {
 	CompletedAt time.Time `json:"completedAt,omitempty"`
 }
 
+type DiagnosticExport struct {
+	ID                 string    `json:"id"`
+	TaskID             string    `json:"taskId,omitempty"`
+	InstanceID         string    `json:"instanceId"`
+	ServerID           string    `json:"serverId"`
+	Status             string    `json:"status"`
+	ServicesJSON       string    `json:"-"`
+	Services           []string  `json:"services"`
+	SinceAt            time.Time `json:"sinceAt"`
+	UntilAt            time.Time `json:"untilAt"`
+	RemoteRelativePath string    `json:"-"`
+	ArchiveName        string    `json:"archiveName,omitempty"`
+	ArchiveBytes       int64     `json:"archiveBytes"`
+	UncompressedBytes  int64     `json:"uncompressedBytes"`
+	SHA256             string    `json:"sha256,omitempty"`
+	WarningCount       int       `json:"warningCount"`
+	WarningsJSON       string    `json:"-"`
+	Warnings           []string  `json:"warnings,omitempty"`
+	ErrorText          string    `json:"error,omitempty"`
+	CreatedBy          string    `json:"createdBy"`
+	CreatedAt          time.Time `json:"createdAt"`
+	ReadyAt            time.Time `json:"readyAt,omitempty"`
+	ExpiresAt          time.Time `json:"expiresAt"`
+	DownloadedAt       time.Time `json:"downloadedAt,omitempty"`
+	DeletedAt          time.Time `json:"deletedAt,omitempty"`
+	CleanupStatus      string    `json:"cleanupStatus"`
+	CleanupError       string    `json:"cleanupError,omitempty"`
+	CleanupAttemptedAt time.Time `json:"cleanupAttemptedAt,omitempty"`
+}
+
+type DiagnosticExportPage struct {
+	Items    []DiagnosticExport `json:"items"`
+	Total    int                `json:"total"`
+	Page     int                `json:"page"`
+	PageSize int                `json:"pageSize"`
+}
+
 type AppCluster struct {
 	ID        string    `json:"id"`
 	App       string    `json:"app"`

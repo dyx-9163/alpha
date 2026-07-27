@@ -191,6 +191,44 @@ var storeMigrations = []storeMigration{
 			)
 		},
 	},
+	{
+		Version: 2026072701,
+		Name:    "diagnostic exports",
+		Up: func(tx *sql.Tx) error {
+			return execMigrationStatements(tx,
+				`create table if not exists diagnostic_exports (
+					id text primary key,
+					task_id text not null default '',
+					instance_id text not null,
+					server_id text not null,
+					status text not null,
+					services_json text not null default '[]',
+					since_at datetime not null,
+					until_at datetime not null,
+					remote_relative_path text not null default '',
+					archive_name text not null default '',
+					archive_bytes integer not null default 0,
+					uncompressed_bytes integer not null default 0,
+					sha256 text not null default '',
+					warning_count integer not null default 0,
+					warnings_json text not null default '[]',
+					error_text text not null default '',
+					created_by text not null default '',
+					created_at datetime not null,
+					ready_at datetime,
+					expires_at datetime not null,
+					downloaded_at datetime,
+					deleted_at datetime,
+					cleanup_status text not null default 'none',
+					cleanup_error text not null default '',
+					cleanup_attempted_at datetime
+				)`,
+				`create index if not exists diagnostic_exports_instance_created on diagnostic_exports(instance_id, created_at)`,
+				`create index if not exists diagnostic_exports_status_expires on diagnostic_exports(status, expires_at)`,
+				`create index if not exists diagnostic_exports_task on diagnostic_exports(task_id)`,
+			)
+		},
+	},
 }
 
 func runStoreMigrations(db *sql.DB) error {

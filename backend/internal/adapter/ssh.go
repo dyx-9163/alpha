@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"aifar-deployment/backend/internal/logmask"
 	"aifar-deployment/backend/internal/store"
 
 	"golang.org/x/crypto/ssh"
@@ -31,6 +32,10 @@ func (SSHRemote) Run(ctx context.Context, server store.Server, command string) (
 
 func (SSHRemote) UploadFile(ctx context.Context, server store.Server, localPath, remotePath string, mode os.FileMode) error {
 	return UploadSSHFile(ctx, server, localPath, remotePath, mode)
+}
+
+func (SSHRemote) StreamFile(ctx context.Context, server store.Server, remotePath string, dst io.Writer) (int64, error) {
+	return StreamSSHFile(ctx, server, remotePath, dst)
 }
 
 func ProbeSSH(ctx context.Context, server store.Server) error {
@@ -75,6 +80,39 @@ func RunSSH(ctx context.Context, server store.Server, command string) (CommandRe
 }
 
 const sshCancelDrainTimeout = 50 * time.Millisecond
+
+const sshStreamStderrLimit = 8 * 1024
+
+type boundedSSHStderr struct {
+	mu        sync.Mutex
+	buf       bytes.Buffer
+	remaining int
+}
+
+func newBoundedSSHStderr(limit int) *boundedSSHStderr {
+	return &boundedSSHStderr{remaining: limit}
+}
+
+func (b *boundedSSHStderr) Write(value []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	written := len(value)
+	if b.remaining == 0 {
+		return written, nil
+	}
+	if len(value) > b.remaining {
+		value = value[:b.remaining]
+	}
+	_, _ = b.buf.Write(value)
+	b.remaining -= len(value)
+	return written, nil
+}
+
+func (b *boundedSSHStderr) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
 
 func runSSHCommandWithContext(ctx context.Context, cancelCommand func(), run func() error) error {
 	if err := ctx.Err(); err != nil {
@@ -227,6 +265,106 @@ func StreamSSHLines(ctx context.Context, server store.Server, command string, on
 	}
 }
 
+func StreamSSHFile(ctx context.Context, server store.Server, remotePath string, dst io.Writer) (int64, error) {
+	if strings.TrimSpace(remotePath) == "" {
+		return 0, fmt.Errorf("remote file path is required")
+	}
+	if dst == nil {
+		return 0, fmt.Errorf("destination writer is required")
+	}
+	client, err := dialSSH(ctx, server)
+	if err != nil {
+		return 0, err
+	}
+	defer client.Close()
+	session, err := client.NewSession()
+	if err != nil {
+		return 0, err
+	}
+	defer session.Close()
+	stdout, err := session.StdoutPipe()
+	if err != nil {
+		return 0, err
+	}
+	stderr := newBoundedSSHStderr(sshStreamStderrLimit)
+	session.Stderr = stderr
+	if err := session.Start("cat " + shellQuote(remotePath)); err != nil {
+		return 0, streamSSHError(err, stderr.String())
+	}
+	return streamSSHOutputWithContext(ctx, dst, stdout, session.Wait, func() {
+		_ = session.Signal(ssh.SIGKILL)
+		_ = session.Close()
+		_ = client.Close()
+	}, stderr.String)
+}
+
+type sshStreamWriter struct {
+	dst io.Writer
+	err error
+}
+
+func (w *sshStreamWriter) Write(value []byte) (int, error) {
+	written, err := w.dst.Write(value)
+	if err == nil && written != len(value) {
+		err = io.ErrShortWrite
+	}
+	if err != nil && w.err == nil {
+		w.err = err
+	}
+	return written, err
+}
+
+func streamSSHOutputWithContext(ctx context.Context, dst io.Writer, stdout io.Reader, wait func() error, cancelCommand func(), stderr func() string) (int64, error) {
+	var cancelOnce sync.Once
+	cancel := func() {
+		if cancelCommand != nil {
+			cancelOnce.Do(cancelCommand)
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		cancel()
+		return 0, err
+	}
+
+	waitErrCh := make(chan error, 1)
+	go func() {
+		waitErrCh <- wait()
+	}()
+	operationDone := make(chan struct{})
+	contextWatcherDone := make(chan struct{})
+	go func() {
+		defer close(contextWatcherDone)
+		select {
+		case <-ctx.Done():
+			cancel()
+		case <-operationDone:
+		}
+	}()
+
+	writer := &sshStreamWriter{dst: dst}
+	copied, copyErr := io.Copy(writer, stdout)
+	if writer.err != nil {
+		cancel()
+	}
+	waitErr := <-waitErrCh
+	if ctx.Err() != nil {
+		cancel()
+	}
+	close(operationDone)
+	<-contextWatcherDone
+
+	if writer.err != nil {
+		return copied, streamSSHError(writer.err, stderr())
+	}
+	if err := ctx.Err(); err != nil {
+		return copied, err
+	}
+	if waitErr != nil {
+		return copied, streamSSHError(waitErr, stderr())
+	}
+	return copied, streamSSHError(copyErr, stderr())
+}
+
 func UploadSSHFile(ctx context.Context, server store.Server, localPath, remotePath string, mode os.FileMode) error {
 	client, err := dialSSH(ctx, server)
 	if err != nil {
@@ -324,6 +462,17 @@ func uploadError(err error, stderr string) error {
 		return nil
 	}
 	stderr = strings.TrimSpace(stderr)
+	if stderr == "" {
+		return err
+	}
+	return fmt.Errorf("%w: %s", err, stderr)
+}
+
+func streamSSHError(err error, stderr string) error {
+	if err == nil {
+		return nil
+	}
+	stderr = strings.TrimSpace(logmask.Mask(stderr))
 	if stderr == "" {
 		return err
 	}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 
 	"aifar-deployment/backend/internal/adapter"
@@ -505,6 +506,24 @@ func (m Module) UninstallRuntimeAgent(ctx context.Context, req registry.RuntimeA
 	}, run.Log, func(target string) Logger {
 		return run.LoggerForTarget(target)
 	})
+}
+
+func (m Module) EstimateRuntimeDiagnostics(ctx context.Context, req registry.RuntimeDiagnosticRequest, run registry.RunContext) (registry.RuntimeDiagnosticEstimateResult, error) {
+	return m.service.EstimateRuntimeDiagnostics(ctx, req, run.Log)
+}
+
+func (m Module) ExportRuntimeDiagnostics(ctx context.Context, req registry.RuntimeDiagnosticRequest, run registry.RunContext) error {
+	return m.service.ExportRuntimeDiagnostics(ctx, req, run.Log, func(target string) Logger {
+		return run.LoggerForTarget(target)
+	})
+}
+
+func (m Module) DeleteRuntimeDiagnosticExport(ctx context.Context, req registry.RuntimeDiagnosticDeleteRequest, run registry.RunContext) error {
+	return m.service.DeleteRuntimeDiagnosticExport(ctx, req, run.Log)
+}
+
+func (m Module) StreamRuntimeDiagnosticExport(ctx context.Context, req registry.RuntimeDiagnosticStreamRequest, dst io.Writer) (int64, error) {
+	return m.service.StreamRuntimeDiagnosticExport(ctx, req, dst)
 }
 
 func firstTarget(req registry.InstallRequest) string {

@@ -15,7 +15,12 @@ export type TrackedTask = {
   status: string
   progress: number
   error: string
+  polling: boolean
   updatedAt: number
+}
+
+export type TaskTrackingOptions = {
+  polling?: boolean
 }
 
 type TaskSummary = {
@@ -57,17 +62,19 @@ export const useTaskProgressStore = defineStore('taskProgress', {
     }
   },
   actions: {
-    track(taskId: string, label = '') {
+    track(taskId: string, label = '', options: TaskTrackingOptions = {}) {
       const id = taskId.trim()
       if (!id) {
         return
       }
+      const polling = options.polling !== false
       const existing = this.items.find((item) => item.id === id)
       if (existing) {
         if (label.trim()) {
           existing.label = label.trim()
         }
         existing.trackable = true
+        existing.polling = polling
         existing.updatedAt = Date.now()
       } else {
         this.items.unshift({
@@ -79,19 +86,26 @@ export const useTaskProgressStore = defineStore('taskProgress', {
           status: 'pending',
           progress: 8,
           error: '',
+          polling,
           updatedAt: Date.now()
         })
       }
       this.prune()
       this.persist()
       void this.refreshTask(id)
-      this.startPolling(id)
+      if (polling) {
+        this.startPolling(id)
+      } else {
+        this.stopPolling(id)
+      }
     },
     resume() {
       for (const item of this.items) {
         if (!isTerminalStatus(item.status)) {
           void this.refreshTask(item.id)
-          this.startPolling(item.id)
+          if (item.polling) {
+            this.startPolling(item.id)
+          }
         }
       }
     },
@@ -128,6 +142,7 @@ export const useTaskProgressStore = defineStore('taskProgress', {
           status: 'pending',
           progress: 8,
           error: '',
+          polling: true,
           updatedAt: Date.now()
         }
         this.items.unshift(item)
@@ -257,6 +272,7 @@ function loadStoredTasks(): TrackedTask[] {
         status: clean(item?.status) || 'pending',
         progress: Number.isFinite(Number(item?.progress)) ? Number(item.progress) : 8,
         error: clean(item?.error),
+        polling: item?.polling !== false,
         updatedAt: Number.isFinite(Number(item?.updatedAt)) ? Number(item.updatedAt) : Date.now()
       }))
       .filter((item) => item.id)

@@ -67,7 +67,9 @@ export async function apiDownload(path: string) {
   return {
     blob: await response.blob(),
     filename: filenameFromDisposition(response.headers.get('Content-Disposition')),
-    sha256: response.headers.get('X-AIFAR-Backup-SHA256') ?? ''
+    sha256: response.headers.get('X-AIFAR-Diagnostic-SHA256')
+      ?? response.headers.get('X-AIFAR-Backup-SHA256')
+      ?? ''
   }
 }
 

@@ -194,3 +194,53 @@ export type AifarRelease = {
 export type AifarReleaseListResponse = {
   items?: AifarRelease[]
 }
+
+export type RuntimeDiagnosticRequest = {
+  instanceId: string
+  sinceAt: string
+  untilAt: string
+  services: string[]
+}
+
+export type RuntimeDiagnosticEstimate = {
+  services: Array<{ service: string; fileBytes: number; containerBytes: number }>
+  fileBytes: number
+  containerBytes: number
+  totalBytes: number
+  requiredBytes: number
+  availableBytes: number
+  allowed: boolean
+  warnings?: string[]
+}
+
+export type RuntimeDiagnosticExport = {
+  id: string
+  taskId?: string
+  instanceId: string
+  serverId: string
+  status: 'pending' | 'building' | 'ready' | 'failed' | 'cancelled' | 'expired' | 'deleted'
+  services: string[]
+  sinceAt: string
+  untilAt: string
+  archiveName?: string
+  archiveBytes: number
+  uncompressedBytes: number
+  sha256?: string
+  warningCount: number
+  warnings?: string[]
+  error?: string
+  createdAt: string
+  readyAt?: string
+  expiresAt: string
+  downloadedAt?: string
+  deletedAt?: string
+  cleanupStatus: 'none' | 'pending' | 'failed' | 'complete'
+  cleanupError?: string
+}
+
+export type RuntimeDiagnosticExportPage = {
+  items: RuntimeDiagnosticExport[]
+  total: number
+  page: number
+  pageSize: number
+}
