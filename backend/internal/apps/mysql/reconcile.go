@@ -101,7 +101,7 @@ func localInfileSQLCommand(work string, port int, query string) string {
 }
 
 func (s Service) reconcileMySQL(ctx context.Context, expected store.AppInstance, language string) error {
-	data, ok := s.store.(backupStore)
+	data, ok := s.store.(restoreStore)
 	if !ok {
 		_, _, present, err := parseMySQLReconciliationMarker(expected.Metadata)
 		if err != nil || present {
@@ -113,7 +113,7 @@ func (s Service) reconcileMySQL(ctx context.Context, expected store.AppInstance,
 	if err != nil {
 		return err
 	}
-	metadata, marker, present, err := parseMySQLReconciliationMarker(instance.Metadata)
+	_, marker, present, err := parseMySQLReconciliationMarker(instance.Metadata)
 	if err != nil {
 		return localizedMySQLOperationError(language, MySQLReconciliationRequired)
 	}
@@ -140,13 +140,7 @@ func (s Service) reconcileMySQL(ctx context.Context, expected store.AppInstance,
 	if err != nil || strings.ToUpper(strings.TrimSpace(value)) != marker.OriginalValue {
 		return localizedMySQLOperationError(language, MySQLReconciliationRequired)
 	}
-	delete(metadata, "mysqlReconciliation")
-	encoded, err := json.Marshal(metadata)
-	if err != nil {
-		return localizedMySQLOperationError(language, MySQLReconciliationRequired)
-	}
-	instance.Metadata = string(encoded)
-	if _, err := s.store.SaveAppInstance(instance); err != nil {
+	if err := clearMySQLReconciliationMarker(data, instance.ID, marker.OriginalValue, marker.TaskID); err != nil {
 		return localizedMySQLOperationError(language, MySQLReconciliationRequired)
 	}
 	return nil

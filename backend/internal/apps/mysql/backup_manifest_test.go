@@ -2,6 +2,8 @@ package mysql
 
 import (
 	"encoding/json"
+	"errors"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -440,7 +442,7 @@ func TestBackupManifestNormalizeRequiresHealthyDeterministicClusterMetadata(t *t
 
 func TestBackupManifestRestoreCompatibilityRejectsTopologyVersionAndBackupTypeMismatches(t *testing.T) {
 	// Production break caught: allowing cross-topology, cross-full-version, or unsupported backup types could overwrite an incompatible MySQL target.
-	manifest := validBackupManifest()
+	manifest := validManifestV2Literal()
 	if err := ValidateRestoreCompatibility(manifest, "logical-full", "standalone", "8.0.36"); err != nil {
 		t.Fatal(err)
 	}
@@ -481,4 +483,93 @@ func TestMySQLBackupErrorTextResolvesEveryStableCodeWithoutCredentialDetails(t *
 			}
 		}
 	}
+}
+
+func TestNormalizeBackupManifestV2RequiresExactInventoryCountsAndDeterministicSamples(t *testing.T) {
+	manifest := validManifestV2Literal()
+	normalized, err := NormalizeBackupManifest(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if normalized.ManifestVersion != 2 || normalized.Verification == nil || normalized.Verification.TableCount != 4 {
+		t.Fatalf("normalized v2 = %+v", normalized)
+	}
+	if got := normalized.Verification.Samples; !reflect.DeepEqual(got, []BackupTableSample{
+		{Schema: "aifar_business", Table: "alpha", RowsWritten: 11},
+		{Schema: "aifar_business", Table: "beta", RowsWritten: 12},
+		{Schema: "aifar_business", Table: "delta", RowsWritten: 14},
+	}) {
+		t.Fatalf("samples = %+v", got)
+	}
+
+	invalid := []BackupManifest{
+		func() BackupManifest { value := manifest; value.Verification = nil; return value }(),
+		func() BackupManifest {
+			value := manifest
+			value.Verification.InventoryAlgorithm = "sha256"
+			return value
+		}(),
+		func() BackupManifest { value := manifest; value.Verification.TableCount = 3; return value }(),
+		func() BackupManifest {
+			value := manifest
+			value.Verification.Samples = value.Verification.Samples[:2]
+			return value
+		}(),
+		func() BackupManifest {
+			value := manifest
+			value.Verification.Inventory[0].Path = "../escape"
+			return value
+		}(),
+		func() BackupManifest {
+			value := manifest
+			value.Verification.Inventory[0].SHA256 = strings.Repeat("A", 64)
+			return value
+		}(),
+	}
+	for index, value := range invalid {
+		if _, err := NormalizeBackupManifest(value); err == nil {
+			t.Fatalf("invalid v2 case %d accepted: %+v", index, value.Verification)
+		}
+	}
+}
+
+func TestValidateRestoreCompatibilityRejectsLegacyV1BeforeDestructiveRestore(t *testing.T) {
+	legacy := validBackupManifest()
+	legacy.ManifestVersion = 1
+	legacy.Verification = nil
+	if err := ValidateRestoreCompatibility(legacy, "logical-full", "standalone", "8.0.36"); err == nil {
+		t.Fatal("legacy v1 manifest entered destructive restore compatibility")
+	} else {
+		var stable interface{ StableCode() string }
+		if !errors.As(err, &stable) || stable.StableCode() != MySQLRestoreManifestInvalid {
+			t.Fatalf("legacy v1 error = %T %v", err, err)
+		}
+	}
+}
+
+func validManifestV2Literal() BackupManifest {
+	manifest := validBackupManifest()
+	manifest.ManifestVersion = 2
+	manifest.Schemas = []string{"aifar_business"}
+	manifest.Verification = &BackupVerification{
+		Source: "mysql-shell-dump", InventoryAlgorithm: "sha256-nul-records-v1",
+		InventorySHA256: "75033abd15ea32598b2c7f68d7059c0f5f79992ec65529c4a057c57d27be33fc",
+		Inventory: []BackupInventoryEntry{
+			{Path: "@.done.json", Size: 2, SHA256: "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"},
+		},
+		SchemaCount: 1, TableCount: 4,
+		Schemas: []BackupSchemaVerification{{Name: "aifar_business", TableCount: 4, Tables: []BackupTableVerification{
+			{Name: "alpha", RowsWritten: 11, PrimaryKey: true},
+			{Name: "beta", RowsWritten: 12, PrimaryKey: true},
+			{Name: "delta", RowsWritten: 14, PrimaryKey: true},
+			{Name: "gamma", RowsWritten: 13, PrimaryKey: true},
+		}}},
+		SamplingAlgorithm: "primary-key-lexicographic-first-3-v1", SampleLimitPerSchema: 3,
+		Samples: []BackupTableSample{
+			{Schema: "aifar_business", Table: "alpha", RowsWritten: 11},
+			{Schema: "aifar_business", Table: "beta", RowsWritten: 12},
+			{Schema: "aifar_business", Table: "delta", RowsWritten: 14},
+		},
+	}
+	return manifest
 }

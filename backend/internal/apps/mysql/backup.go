@@ -368,6 +368,7 @@ func (s Service) backupStandaloneCore(ctx context.Context, req registry.BackupRe
 
 	var credential store.Credential
 	var inspection mysqlBackupInspection
+	var verification *BackupVerification
 	var script string
 	if err := step(1, func() error {
 		if req.Instance.App != "mysql" || instanceTopology(req.Instance) != "standalone" {
@@ -483,14 +484,23 @@ func (s Service) backupStandaloneCore(ctx context.Context, req registry.BackupRe
 		return err
 	}
 	if err := step(9, func() error {
+		result, err := s.remote.Run(ctx, state.server, inspectDumpVerificationCommand(state.remoteWork))
+		if err != nil {
+			return err
+		}
+		verification, err = parseDumpVerification(result.Stdout, inspection.Schemas)
+		if err != nil {
+			return err
+		}
 		manifest := BackupManifest{
-			BackupID: backupID, App: "mysql", Topology: "standalone", InstanceID: req.Instance.ID,
+			ManifestVersion: 2,
+			BackupID:        backupID, App: "mysql", Topology: "standalone", InstanceID: req.Instance.ID,
 			SourceServerID: state.server.ID, SourceEndpoint: net.JoinHostPort(state.server.Host, strconv.Itoa(instancePort(req.Instance))),
 			SourceServerUUID: inspection.ServerUUID, MySQLVersion: inspection.MySQLVersion, MySQLShellVersion: inspection.MySQLShellVersion,
 			Schemas: inspection.Schemas, ExcludedSchemas: append([]string(nil), fixedSystemSchemas...), Consistent: true,
 			GTIDExecuted: inspection.GTIDExecuted, CreatedAt: state.record.CreatedAt, TaskID: run.TaskID,
+			Verification: verification,
 		}
-		var err error
 		state.manifest, err = CanonicalBackupManifestJSON(manifest)
 		return err
 	}); err != nil {
@@ -640,6 +650,94 @@ func (s Service) backupStandaloneCore(ctx context.Context, req registry.BackupRe
 
 	installflow.FinishTarget(recorder, req.Instance.ServerID, "success", "")
 	return nil
+}
+
+func parseDumpVerification(output string, schemas []string) (*BackupVerification, error) {
+	const prefix = "__AIFAR_VERIFICATION__"
+	var encoded string
+	for _, line := range strings.Split(output, "\n") {
+		if strings.HasPrefix(line, prefix) {
+			if encoded != "" {
+				return nil, mysqlOperationError(MySQLRestoreManifestInvalid)
+			}
+			encoded = strings.TrimPrefix(line, prefix)
+		}
+	}
+	if encoded == "" {
+		return nil, mysqlOperationError(MySQLRestoreManifestInvalid)
+	}
+	decoder := json.NewDecoder(strings.NewReader(encoded))
+	decoder.DisallowUnknownFields()
+	var verification BackupVerification
+	if err := decoder.Decode(&verification); err != nil {
+		return nil, mysqlOperationError(MySQLRestoreManifestInvalid)
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		return nil, mysqlOperationError(MySQLRestoreManifestInvalid)
+	}
+	normalized, err := normalizeBackupVerification(&verification, schemas)
+	if err != nil {
+		return nil, err
+	}
+	return normalized, nil
+}
+
+const dumpVerificationHelper = `
+import hashlib, json, os, pathlib, sys
+root = pathlib.Path(sys.argv[1]) / "dump"
+done = root / "@.done.json"
+if root.is_symlink() or not root.is_dir() or done.is_symlink() or not done.is_file(): raise SystemExit(1)
+with done.open("r", encoding="utf-8") as stream: completion = json.load(stream)
+if not isinstance(completion, dict): raise SystemExit(1)
+inventory = []
+table_records = {}
+for item in sorted(root.rglob("*"), key=lambda value: value.relative_to(root).as_posix().encode("utf-8")):
+  if item.is_symlink() or not item.is_file():
+    if item.is_dir() and not item.is_symlink(): continue
+    raise SystemExit(1)
+  relative = item.relative_to(root).as_posix()
+  digest = hashlib.sha256()
+  size = 0
+  with item.open("rb") as stream:
+    for block in iter(lambda: stream.read(1024 * 1024), b""):
+      size += len(block); digest.update(block)
+  inventory.append({"path": relative, "size": size, "sha256": digest.hexdigest()})
+  if relative.endswith(".json") and not relative.startswith("@"):
+    try:
+      with item.open("r", encoding="utf-8") as stream: metadata = json.load(stream)
+    except Exception: raise SystemExit(1)
+    if not isinstance(metadata, dict): continue
+    schema = metadata.get("schema") or metadata.get("schemaName")
+    table = metadata.get("table") or metadata.get("tableName")
+    rows = metadata.get("rowsWritten")
+    primary = metadata.get("primaryIndex")
+    if schema is None or table is None or rows is None: continue
+    key = (schema, table)
+    record = (rows, bool(primary))
+    if key in table_records and table_records[key] != record: raise SystemExit(1)
+    table_records[key] = record
+if not inventory or not table_records: raise SystemExit(1)
+inventory_hash = hashlib.sha256()
+for item in inventory:
+  inventory_hash.update(item["sha256"].encode("ascii") + b"\0" + str(item["size"]).encode("ascii") + b"\0" + item["path"].encode("utf-8") + b"\0")
+schemas = []
+samples = []
+for schema_name in sorted({key[0] for key in table_records}, key=lambda value: value.encode("utf-8")):
+  tables = []
+  for schema, table in sorted((key for key in table_records if key[0] == schema_name), key=lambda value: value[1].encode("utf-8")):
+    rows, primary = table_records[(schema, table)]
+    if not isinstance(rows, int) or isinstance(rows, bool) or rows < 0: raise SystemExit(1)
+    tables.append({"name": table, "rowsWritten": rows, "hasPrimaryKey": primary})
+  eligible = [item for item in tables if item["hasPrimaryKey"]][:3]
+  samples.extend({"schema": schema_name, "table": item["name"], "rowsWritten": item["rowsWritten"]} for item in eligible)
+  schemas.append({"name": schema_name, "tableCount": len(tables), "tables": tables})
+verification = {"source":"mysql-shell-dump","inventoryAlgorithm":"sha256-nul-records-v1","inventorySha256":inventory_hash.hexdigest(),"files":inventory,"schemaCount":len(schemas),"tableCount":sum(item["tableCount"] for item in schemas),"schemas":schemas,"samplingAlgorithm":"primary-key-lexicographic-first-3-v1","sampleLimitPerSchema":3,"sampledTables":samples}
+print("__AIFAR_VERIFICATION__" + json.dumps(verification, separators=(",", ":"), ensure_ascii=False))
+`
+
+func inspectDumpVerificationCommand(work string) string {
+	return "python3 -c " + installerkit.ShellQuote(dumpVerificationHelper) + " " + installerkit.ShellQuote(work)
 }
 
 func sameBackupRecord(left, right store.AppBackup) bool {

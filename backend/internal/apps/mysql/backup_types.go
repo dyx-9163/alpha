@@ -34,24 +34,63 @@ const (
 // backup. It is persisted alongside the archive and is intentionally limited
 // to provenance and compatibility data.
 type BackupManifest struct {
-	BackupID          string             `json:"backupId"`
-	App               string             `json:"app"`
-	Topology          string             `json:"topology"`
-	InstanceID        string             `json:"instanceId"`
-	ClusterID         string             `json:"clusterId,omitempty"`
-	SourceServerID    string             `json:"sourceServerId"`
-	SourceEndpoint    string             `json:"sourceEndpoint"`
-	SourceServerUUID  string             `json:"sourceServerUuid"`
-	MySQLVersion      string             `json:"mysqlVersion"`
-	MySQLShellVersion string             `json:"mysqlShellVersion"`
-	Schemas           []string           `json:"schemas"`
-	ExcludedSchemas   []string           `json:"excludedSchemas"`
-	Consistent        bool               `json:"consistent"`
-	GTIDExecuted      string             `json:"gtidExecuted"`
-	Members           []ClusterMemberRef `json:"members,omitempty"`
-	Routers           []RouterRef        `json:"routers,omitempty"`
-	CreatedAt         time.Time          `json:"createdAt"`
-	TaskID            string             `json:"taskId"`
+	ManifestVersion   int                 `json:"manifestVersion,omitempty"`
+	BackupID          string              `json:"backupId"`
+	App               string              `json:"app"`
+	Topology          string              `json:"topology"`
+	InstanceID        string              `json:"instanceId"`
+	ClusterID         string              `json:"clusterId,omitempty"`
+	SourceServerID    string              `json:"sourceServerId"`
+	SourceEndpoint    string              `json:"sourceEndpoint"`
+	SourceServerUUID  string              `json:"sourceServerUuid"`
+	MySQLVersion      string              `json:"mysqlVersion"`
+	MySQLShellVersion string              `json:"mysqlShellVersion"`
+	Schemas           []string            `json:"schemas"`
+	ExcludedSchemas   []string            `json:"excludedSchemas"`
+	Consistent        bool                `json:"consistent"`
+	GTIDExecuted      string              `json:"gtidExecuted"`
+	Members           []ClusterMemberRef  `json:"members,omitempty"`
+	Routers           []RouterRef         `json:"routers,omitempty"`
+	CreatedAt         time.Time           `json:"createdAt"`
+	TaskID            string              `json:"taskId"`
+	Verification      *BackupVerification `json:"verification,omitempty"`
+}
+
+type BackupVerification struct {
+	Source               string                     `json:"source"`
+	InventoryAlgorithm   string                     `json:"inventoryAlgorithm"`
+	InventorySHA256      string                     `json:"inventorySha256"`
+	Inventory            []BackupInventoryEntry     `json:"files"`
+	SchemaCount          int                        `json:"schemaCount"`
+	TableCount           int                        `json:"tableCount"`
+	Schemas              []BackupSchemaVerification `json:"schemas"`
+	SamplingAlgorithm    string                     `json:"samplingAlgorithm"`
+	SampleLimitPerSchema int                        `json:"sampleLimitPerSchema"`
+	Samples              []BackupTableSample        `json:"sampledTables"`
+}
+
+type BackupInventoryEntry struct {
+	Path   string `json:"path"`
+	Size   int64  `json:"size"`
+	SHA256 string `json:"sha256"`
+}
+
+type BackupSchemaVerification struct {
+	Name       string                    `json:"name"`
+	TableCount int                       `json:"tableCount"`
+	Tables     []BackupTableVerification `json:"tables"`
+}
+
+type BackupTableVerification struct {
+	Name        string `json:"name"`
+	RowsWritten int64  `json:"rowsWritten"`
+	PrimaryKey  bool   `json:"hasPrimaryKey"`
+}
+
+type BackupTableSample struct {
+	Schema      string `json:"schema"`
+	Table       string `json:"table"`
+	RowsWritten int64  `json:"rowsWritten"`
 }
 
 // ClusterMemberRef contains only the public cluster member data required to

@@ -1,8 +1,11 @@
 package backuprepo
 
 import (
+	"archive/tar"
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -741,6 +744,70 @@ func TestVerifyReturnsValidatedArtifact(t *testing.T) {
 	if !strings.Contains(string(verification.Manifest), `"backupId":"backup-verified"`) {
 		t.Fatalf("manifest = %q", verification.Manifest)
 	}
+}
+
+func TestVerifyManifestV2RecomputesEveryDumpFileAndInventoryDigest(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		archiveData []byte
+		wantError   bool
+	}{
+		{name: "matching inventory", archiveData: []byte("{}")},
+		{name: "outer archive valid but dump file differs", archiveData: []byte("{x}"), wantError: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			root := filepath.Join(t.TempDir(), "repository")
+			repo, err := New(root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			paths, err := repo.Prepare("backup-v2-inventory")
+			if err != nil {
+				t.Fatal(err)
+			}
+			archive := tarArchiveLiteral(t, "dump/@.done.json", test.archiveData)
+			if err := os.WriteFile(paths.PartialArchive, archive, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			manifest := map[string]any{
+				"manifestVersion": 2, "backupId": "backup-v2-inventory",
+				"verification": map[string]any{
+					"inventoryAlgorithm": "sha256-nul-records-v1",
+					"inventorySha256":    "75033abd15ea32598b2c7f68d7059c0f5f79992ec65529c4a057c57d27be33fc",
+					"files":              []map[string]any{{"path": "@.done.json", "size": 2, "sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"}},
+				},
+			}
+			manifestBytes, _ := json.Marshal(manifest)
+			digest := digestBytes(archive)
+			if err := repo.Commit(paths, manifestBytes, digest, int64(len(archive))); err != nil {
+				t.Fatal(err)
+			}
+			backup := store.AppBackup{ID: "backup-v2-inventory", App: "mysql", InstanceID: "app-1", ServerID: "srv-1", BackupType: "logical-full", Status: "success", Path: paths.Archive, Checksum: digest, Size: int64(len(archive))}
+			_, verifyErr := repo.Verify(backup)
+			if test.wantError && verifyErr == nil {
+				t.Fatal("v2 verification accepted mismatched dump inventory")
+			}
+			if !test.wantError && verifyErr != nil {
+				t.Fatal(verifyErr)
+			}
+		})
+	}
+}
+
+func tarArchiveLiteral(t *testing.T, name string, content []byte) []byte {
+	t.Helper()
+	var output bytes.Buffer
+	writer := tar.NewWriter(&output)
+	if err := writer.WriteHeader(&tar.Header{Name: name, Mode: 0o600, Size: int64(len(content)), Typeflag: tar.TypeReg}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writer.Write(content); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return output.Bytes()
 }
 
 func TestBackupVerifyRejectsMissingEscapedMismatchedOrAlteredArtifacts(t *testing.T) {

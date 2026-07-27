@@ -1,12 +1,17 @@
 package mysql
 
 import (
+	"crypto/sha256"
 	"encoding/json"
+	"fmt"
+	"hash"
 	"net"
+	"path"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 )
 
 var (
@@ -15,6 +20,7 @@ var (
 	storeRandomIDSuffix   = regexp.MustCompile(`^[0-9a-f]{24}$`)
 	storeFallbackIDSuffix = regexp.MustCompile(`^[1-9][0-9]{18}$`)
 	uuidPattern           = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
+	lowerSHA256Pattern    = regexp.MustCompile(`^[0-9a-f]{64}$`)
 	dnsLabelPattern       = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$`)
 )
 
@@ -80,6 +86,23 @@ func NormalizeBackupManifest(manifest BackupManifest) (BackupManifest, error) {
 		return BackupManifest{}, err
 	}
 	manifest.Routers = routers
+	if manifest.ManifestVersion == 0 {
+		manifest.ManifestVersion = 1
+	}
+	switch manifest.ManifestVersion {
+	case 1:
+		if manifest.Verification != nil {
+			return BackupManifest{}, mysqlOperationError(MySQLRestoreManifestInvalid)
+		}
+	case 2:
+		verification, err := normalizeBackupVerification(manifest.Verification, manifest.Schemas)
+		if err != nil {
+			return BackupManifest{}, err
+		}
+		manifest.Verification = verification
+	default:
+		return BackupManifest{}, mysqlOperationError(MySQLRestoreManifestInvalid)
+	}
 	return manifest, nil
 }
 
@@ -111,7 +134,99 @@ func ValidateRestoreCompatibility(manifest BackupManifest, backupType, targetTop
 	if !canonicalRequired(targetMySQLVersion) || targetMySQLVersion != normalized.MySQLVersion {
 		return mysqlOperationError(MySQLRestoreVersionIncompatible)
 	}
+	if normalized.ManifestVersion != 2 || normalized.Verification == nil {
+		return mysqlOperationError(MySQLRestoreManifestInvalid)
+	}
 	return nil
+}
+
+func normalizeBackupVerification(value *BackupVerification, manifestSchemas []string) (*BackupVerification, error) {
+	if value == nil || value.Source != "mysql-shell-dump" || value.InventoryAlgorithm != "sha256-nul-records-v1" ||
+		value.SamplingAlgorithm != "primary-key-lexicographic-first-3-v1" || value.SampleLimitPerSchema != 3 ||
+		!lowerSHA256Pattern.MatchString(value.InventorySHA256) || value.SchemaCount < 0 || value.TableCount < 0 {
+		return nil, mysqlOperationError(MySQLRestoreManifestInvalid)
+	}
+	result := *value
+	result.Inventory = append([]BackupInventoryEntry(nil), value.Inventory...)
+	if len(result.Inventory) == 0 {
+		return nil, mysqlOperationError(MySQLRestoreManifestInvalid)
+	}
+	hasher := sha256.New()
+	previousPath := ""
+	for index, entry := range result.Inventory {
+		if !validInventoryPath(entry.Path) || entry.Size < 0 || !lowerSHA256Pattern.MatchString(entry.SHA256) ||
+			(index > 0 && strings.Compare(previousPath, entry.Path) >= 0) {
+			return nil, mysqlOperationError(MySQLRestoreManifestInvalid)
+		}
+		writeInventoryRecord(hasher, entry)
+		previousPath = entry.Path
+	}
+	if fmt.Sprintf("%x", hasher.Sum(nil)) != result.InventorySHA256 {
+		return nil, mysqlOperationError(MySQLRestoreManifestInvalid)
+	}
+	if result.SchemaCount != len(result.Schemas) || len(result.Schemas) != len(manifestSchemas) {
+		return nil, mysqlOperationError(MySQLRestoreManifestInvalid)
+	}
+	result.Schemas = append([]BackupSchemaVerification(nil), value.Schemas...)
+	expectedSamples := make([]BackupTableSample, 0)
+	totalTables := 0
+	for schemaIndex := range result.Schemas {
+		schema := &result.Schemas[schemaIndex]
+		if schema.Name != manifestSchemas[schemaIndex] || !strictSchemaName.MatchString(schema.Name) || schema.TableCount < 0 || schema.TableCount != len(schema.Tables) {
+			return nil, mysqlOperationError(MySQLRestoreManifestInvalid)
+		}
+		if totalTables > int(^uint(0)>>1)-schema.TableCount {
+			return nil, mysqlOperationError(MySQLRestoreManifestInvalid)
+		}
+		totalTables += schema.TableCount
+		schema.Tables = append([]BackupTableVerification(nil), schema.Tables...)
+		eligible := make([]BackupTableSample, 0, schema.TableCount)
+		previousTable := ""
+		for tableIndex, table := range schema.Tables {
+			if !strictSchemaName.MatchString(table.Name) || table.RowsWritten < 0 || (tableIndex > 0 && strings.Compare(previousTable, table.Name) >= 0) {
+				return nil, mysqlOperationError(MySQLRestoreManifestInvalid)
+			}
+			if table.PrimaryKey {
+				eligible = append(eligible, BackupTableSample{Schema: schema.Name, Table: table.Name, RowsWritten: table.RowsWritten})
+			}
+			previousTable = table.Name
+		}
+		if len(eligible) > 3 {
+			eligible = eligible[:3]
+		}
+		expectedSamples = append(expectedSamples, eligible...)
+	}
+	if totalTables != result.TableCount || !equalBackupSamples(result.Samples, expectedSamples) {
+		return nil, mysqlOperationError(MySQLRestoreManifestInvalid)
+	}
+	result.Samples = append([]BackupTableSample(nil), expectedSamples...)
+	return &result, nil
+}
+
+func validInventoryPath(value string) bool {
+	return value != "" && utf8.ValidString(value) && !strings.ContainsAny(value, "\\\x00") && !strings.HasPrefix(value, "/") &&
+		value != "." && path.Clean(value) == value && !strings.HasPrefix(value, "../") && !strings.Contains(value, "/../")
+}
+
+func writeInventoryRecord(target hash.Hash, entry BackupInventoryEntry) {
+	_, _ = target.Write([]byte(entry.SHA256))
+	_, _ = target.Write([]byte{0})
+	_, _ = target.Write([]byte(strconv.FormatInt(entry.Size, 10)))
+	_, _ = target.Write([]byte{0})
+	_, _ = target.Write([]byte(entry.Path))
+	_, _ = target.Write([]byte{0})
+}
+
+func equalBackupSamples(left, right []BackupTableSample) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
 }
 
 func normalizeBusinessSchemas(schemas []string) ([]string, error) {

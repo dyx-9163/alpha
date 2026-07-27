@@ -1,18 +1,23 @@
 package backuprepo
 
 import (
+	"archive/tar"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
+	"path"
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
+	"unicode/utf8"
 
 	"aifar-deployment/backend/internal/store"
 )
@@ -466,6 +471,9 @@ func (r *Repository) verifyAnchored(backup store.AppBackup) (Verification, *stab
 	if err := requireManifestID(manifest, backup.ID); err != nil {
 		return fail(err)
 	}
+	if err := verifyManifestV2Inventory(archive.file, manifest); err != nil {
+		return fail(err)
+	}
 	checksumsObject, err := openStableRegularAt(boundaries.directory, checksumsName, os.O_RDONLY)
 	if err != nil {
 		return fail(err)
@@ -482,6 +490,105 @@ func (r *Repository) verifyAnchored(backup store.AppBackup) (Verification, *stab
 		return fail(err)
 	}
 	return Verification{Paths: paths, Manifest: manifest, SHA256: actualSHA, Size: actualSize}, boundaries, nil
+}
+
+type manifestV2Inventory struct {
+	ManifestVersion int `json:"manifestVersion"`
+	Verification    *struct {
+		InventoryAlgorithm string `json:"inventoryAlgorithm"`
+		InventorySHA256    string `json:"inventorySha256"`
+		Inventory          []struct {
+			Path   string `json:"path"`
+			Size   int64  `json:"size"`
+			SHA256 string `json:"sha256"`
+		} `json:"files"`
+	} `json:"verification"`
+}
+
+type actualInventoryEntry struct {
+	Path   string
+	Size   int64
+	SHA256 string
+}
+
+func verifyManifestV2Inventory(archive *os.File, manifest []byte) error {
+	var declared manifestV2Inventory
+	decoder := json.NewDecoder(strings.NewReader(string(manifest)))
+	if err := decoder.Decode(&declared); err != nil {
+		return err
+	}
+	if declared.ManifestVersion == 0 || declared.ManifestVersion == 1 {
+		return nil
+	}
+	if declared.ManifestVersion != 2 || declared.Verification == nil || declared.Verification.InventoryAlgorithm != "sha256-nul-records-v1" || len(declared.Verification.Inventory) == 0 {
+		return errors.New("invalid backup manifest v2 inventory")
+	}
+	if _, err := archive.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+	reader := tar.NewReader(archive)
+	actual := make([]actualInventoryEntry, 0, len(declared.Verification.Inventory))
+	for {
+		header, err := reader.Next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return err
+		}
+		name := strings.TrimPrefix(header.Name, "./")
+		if name == "dump" || name == "dump/" {
+			if header.Typeflag != tar.TypeDir {
+				return errors.New("invalid v2 dump archive root")
+			}
+			continue
+		}
+		if !strings.HasPrefix(name, "dump/") {
+			return errors.New("v2 dump archive contains an unmanaged member")
+		}
+		relative := strings.TrimPrefix(name, "dump/")
+		if relative == "" || !utf8.ValidString(relative) || strings.ContainsAny(relative, "\\\x00") || strings.HasPrefix(relative, "/") || path.Clean(relative) != relative || relative == "." || strings.HasPrefix(relative, "../") || strings.Contains(relative, "/../") {
+			return errors.New("invalid v2 dump inventory path")
+		}
+		if header.Typeflag == tar.TypeDir {
+			continue
+		}
+		if header.Typeflag != tar.TypeReg && header.Typeflag != tar.TypeRegA {
+			return errors.New("v2 dump archive contains a non-regular member")
+		}
+		hasher := sha256.New()
+		size, err := io.Copy(hasher, reader)
+		if err != nil || size != header.Size {
+			return errors.New("v2 dump archive member size mismatch")
+		}
+		actual = append(actual, actualInventoryEntry{Path: relative, Size: size, SHA256: fmt.Sprintf("%x", hasher.Sum(nil))})
+	}
+	sort.Slice(actual, func(left, right int) bool { return strings.Compare(actual[left].Path, actual[right].Path) < 0 })
+	for index := 1; index < len(actual); index++ {
+		if actual[index-1].Path == actual[index].Path {
+			return errors.New("v2 dump inventory contains a duplicate path")
+		}
+	}
+	if len(actual) != len(declared.Verification.Inventory) {
+		return errors.New("v2 dump inventory file count mismatch")
+	}
+	inventoryHasher := sha256.New()
+	for index, entry := range actual {
+		want := declared.Verification.Inventory[index]
+		if entry.Path != want.Path || entry.Size != want.Size || entry.SHA256 != want.SHA256 {
+			return errors.New("v2 dump inventory entry mismatch")
+		}
+		_, _ = inventoryHasher.Write([]byte(entry.SHA256))
+		_, _ = inventoryHasher.Write([]byte{0})
+		_, _ = inventoryHasher.Write([]byte(strconv.FormatInt(entry.Size, 10)))
+		_, _ = inventoryHasher.Write([]byte{0})
+		_, _ = inventoryHasher.Write([]byte(entry.Path))
+		_, _ = inventoryHasher.Write([]byte{0})
+	}
+	if fmt.Sprintf("%x", inventoryHasher.Sum(nil)) != declared.Verification.InventorySHA256 {
+		return errors.New("v2 dump inventory digest mismatch")
+	}
+	return nil
 }
 
 func (r *Repository) Delete(backup store.AppBackup) (retErr error) {

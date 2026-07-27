@@ -12,11 +12,13 @@ import (
 )
 
 type fakeLocalInfileSession struct {
-	value     string
-	setErr    error
-	setErrors map[string]error
-	readErr   error
-	setCalls  []string
+	value            string
+	setErr           error
+	setErrors        map[string]error
+	readErr          error
+	setCalls         []string
+	onSet            func(string)
+	applyBeforeError map[string]bool
 }
 
 func (s *fakeLocalInfileSession) ReadLocalInfile(context.Context) (string, error) {
@@ -28,6 +30,12 @@ func (s *fakeLocalInfileSession) ReadLocalInfile(context.Context) (string, error
 
 func (s *fakeLocalInfileSession) SetLocalInfile(_ context.Context, value string) error {
 	s.setCalls = append(s.setCalls, value)
+	if s.onSet != nil {
+		s.onSet(value)
+	}
+	if s.applyBeforeError[value] {
+		s.value = value
+	}
 	if err := s.setErrors[value]; err != nil {
 		return err
 	}
@@ -87,13 +95,36 @@ func TestLocalInfileGuardFailsClosedWhenRestoreCannotBeVerified(t *testing.T) {
 
 type restoreFakeStore struct {
 	*backupFakeStore
-	savedInstances []store.AppInstance
+	savedInstances        []store.AppInstance
+	instanceSaveFailures  int
+	instanceSaveCalls     int
+	instanceSaveFailCalls map[int]bool
+	backupSaveFailures    map[string]int
+	backupSaveCalls       int
 }
 
 func (s *restoreFakeStore) SaveAppInstance(value store.AppInstance) (store.AppInstance, error) {
+	s.instanceSaveCalls++
+	if s.instanceSaveFailCalls[s.instanceSaveCalls] {
+		return store.AppInstance{}, errors.New("injected instance save failure")
+	}
+	if s.instanceSaveFailures > 0 {
+		s.instanceSaveFailures--
+		return store.AppInstance{}, errors.New("injected instance save failure")
+	}
 	s.instance = value
 	s.savedInstances = append(s.savedInstances, value)
 	return value, nil
+}
+
+func (s *restoreFakeStore) SaveAppBackup(value store.AppBackup) (store.AppBackup, error) {
+	s.backupSaveCalls++
+	phase := restorePhase(value.Metadata)
+	if s.backupSaveFailures[phase] > 0 {
+		s.backupSaveFailures[phase]--
+		return store.AppBackup{}, errors.New("injected backup phase save failure")
+	}
+	return s.backupFakeStore.SaveAppBackup(value)
 }
 
 func TestReconcileRestoresRecordedLocalInfileAndOnlyThenClearsMarker(t *testing.T) {

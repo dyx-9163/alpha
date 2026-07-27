@@ -261,6 +261,48 @@ func TestCheckAppInstanceStoresPlanBeforeTaskRuns(t *testing.T) {
 	}
 }
 
+func TestCheckAppInstanceUsesMutationLockOnlyForMySQL(t *testing.T) {
+	for _, test := range []struct {
+		app        string
+		wantStatus int
+	}{
+		{app: "mysql", wantStatus: http.StatusConflict},
+		{app: "demo", wantStatus: http.StatusAccepted},
+	} {
+		t.Run(test.app, func(t *testing.T) {
+			api, db, secret := newAuthzTestAPI(t)
+			module := &fakePlannedLifecycleModule{name: test.app}
+			api.apps = registry.New(module)
+			server, err := db.SaveServer(store.Server{Name: test.app + "-1", Host: "10.0.0.9", Username: "root"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			instance, err := db.SaveAppInstance(store.AppInstance{App: test.app, Version: "8.0.36", ServerID: server.ID, Status: "installed", Topology: "standalone"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			ownerTask, err := db.CreateTask(store.Task{Type: "apps.mysql.restore", Target: instance.ID, Status: "running", CreatedBy: "owner"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.AcquireOperationLock(store.OperationLock{Scope: "app-instance", ResourceID: instance.ID, Operation: operationLockMutation, OwnerTaskID: ownerTask.ID, Owner: "owner", ExpiresAt: time.Now().Add(time.Hour)}); err != nil {
+				t.Fatal(err)
+			}
+			token := issueTestToken(t, db, secret, "owner", "owner")
+			req := httptest.NewRequest(http.MethodPost, "/api/v2/apps/instances/"+instance.ID+"/check", nil)
+			req.Header.Set("Authorization", "Bearer "+token)
+			rec := httptest.NewRecorder()
+			api.Router().ServeHTTP(rec, req)
+			if rec.Code != test.wantStatus {
+				t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+			}
+			if test.app == "mysql" && !strings.Contains(rec.Body.String(), `"code":"OPERATION_LOCKED"`) {
+				t.Fatalf("body=%s", rec.Body.String())
+			}
+		})
+	}
+}
+
 func TestStorageCleanupEstimateUsesMinioModule(t *testing.T) {
 	api, db, secret := newAuthzTestAPI(t)
 	module := &fakePlannedLifecycleModule{name: "minio"}

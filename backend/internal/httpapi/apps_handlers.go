@@ -393,10 +393,19 @@ func (a *API) checkAppInstance(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "CHECK_PLAN_STORE_FAILED", err.Error(), map[string]any{"app": instance.App, "instanceId": instance.ID})
 		return
 	}
+	var locks []store.OperationLock
+	if strings.EqualFold(strings.TrimSpace(instance.App), "mysql") {
+		var acquired bool
+		locks, acquired = a.acquireTaskOperationLocks(w, lang, task, appInstanceOperationLockSpecs("mysql-check", []store.AppInstance{instance}))
+		if !acquired {
+			return
+		}
+	}
 	task, err = a.tasks.StartExistingWithLanguage(task, lang, func(ctx context.Context, log worker.Logger) error {
 		log.Info(i18n.Text(lang, "api.checkInstanceRequested"), instance.App, instance.ID)
 		status, err := checkModule.Check(ctx, checkReq, registry.RunContext{
-			Log: log,
+			TaskID: task.ID,
+			Log:    log,
 			TargetLog: func(target string) registry.Logger {
 				return log.Target(target)
 			},
@@ -407,6 +416,9 @@ func (a *API) checkAppInstance(w http.ResponseWriter, r *http.Request) {
 		log.Info(i18n.Text(lang, "api.checkInstanceCompleted"), instance.App, instance.ID, status.Status)
 		return nil
 	})
+	if err != nil {
+		a.releaseOperationLocks(locks)
+	}
 	if err == nil {
 		a.audit(r, taskType, target, "running", task.ID)
 	}
