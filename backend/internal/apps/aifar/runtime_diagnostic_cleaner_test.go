@@ -3,6 +3,7 @@ package aifar
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -117,6 +118,96 @@ func TestRuntimeDiagnosticCleanerCoalescesOverlappingTicks(t *testing.T) {
 	waitForRuntimeDiagnosticCleanerTask(t, db)
 }
 
+func TestRuntimeDiagnosticCleanerReleasesRunningAfterQueuedTaskCancellation(t *testing.T) {
+	db, _, remote, now := newRuntimeDiagnosticCleanerFixture(t)
+	tasks := worker.NewManagerWithConcurrency(db, 1)
+	holderStarted := make(chan struct{})
+	holderRelease := make(chan struct{})
+	if _, err := tasks.Start("holder", "holder", "system", func(context.Context, worker.Logger) error {
+		close(holderStarted)
+		<-holderRelease
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	<-holderStarted
+	_ = saveRuntimeDiagnosticCleanerExport(t, db, now, "diag-queued", now.Add(-time.Second))
+	cleaner := NewRuntimeDiagnosticCleaner(db, tasks, remote)
+	cleaner.tick(context.Background(), now)
+	cleanupTask := findRuntimeDiagnosticCleanerTask(t, db)
+	if cleanupTask.Status != "pending" {
+		t.Fatalf("cleanup task should be queued, got %+v", cleanupTask)
+	}
+	if !tasks.Cancel(cleanupTask.ID) {
+		t.Fatal("expected queued cleanup task cancellation")
+	}
+	waitForRuntimeDiagnosticCleanerTaskStatus(t, db, cleanupTask.ID, "cancelled")
+	waitForRuntimeDiagnosticCleanerIdle(t, cleaner)
+	close(holderRelease)
+}
+
+func TestRuntimeDiagnosticCleanerSkipsDownloadDeleteLockConflict(t *testing.T) {
+	db, tasks, remote, now := newRuntimeDiagnosticCleanerFixture(t)
+	export := saveRuntimeDiagnosticCleanerExport(t, db, now, "diag-locked", now.Add(-time.Second))
+	if _, err := db.AcquireOperationLock(store.OperationLock{Scope: "runtime-diagnostics", ResourceID: export.ID, Operation: "delete", Owner: "download", ExpiresAt: now.Add(time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	cleaner := NewRuntimeDiagnosticCleaner(db, tasks, remote)
+	cleaner.tick(context.Background(), now)
+	waitForRuntimeDiagnosticCleanerTask(t, db)
+	got, err := db.GetDiagnosticExport(export.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != "ready" || got.CleanupStatus != "none" || remote.CallCount() != 0 {
+		t.Fatalf("lock conflict must skip archive safely: %+v calls=%d", got, remote.CallCount())
+	}
+}
+
+func TestRuntimeDiagnosticCleanerProcessesAllDuePages(t *testing.T) {
+	db, tasks, remote, now := newRuntimeDiagnosticCleanerFixture(t)
+	for i := 0; i < 205; i++ {
+		saveRuntimeDiagnosticCleanerExport(t, db, now, fmt.Sprintf("diag-page-%03d", i), now.Add(-time.Second))
+	}
+	cleaner := NewRuntimeDiagnosticCleaner(db, tasks, remote)
+	cleaner.tick(context.Background(), now)
+	waitForRuntimeDiagnosticCleanerTask(t, db)
+	if remote.CallCount() != 205 {
+		t.Fatalf("cleanup remote calls=%d, want 205", remote.CallCount())
+	}
+}
+
+func TestRuntimeDiagnosticCleanerAuditFailureLeavesArchiveRetryable(t *testing.T) {
+	db, tasks, remote, now := newRuntimeDiagnosticCleanerFixture(t)
+	export := saveRuntimeDiagnosticCleanerExport(t, db, now, "diag-audit", now.Add(-time.Second))
+	cleaner := NewRuntimeDiagnosticCleaner(db, tasks, remote)
+	cleaner.addAudit = func(string, string, string, string, string) error { return errors.New("audit unavailable") }
+	cleaner.tick(context.Background(), now)
+	waitForRuntimeDiagnosticCleanerTask(t, db)
+	got, err := db.GetDiagnosticExport(export.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != "expired" || got.CleanupStatus != "failed" {
+		t.Fatalf("audit failure must retain retryable archive: %+v", got)
+	}
+}
+
+func TestRuntimeDiagnosticCleanerStartFailureLeavesNoPendingTask(t *testing.T) {
+	db, tasks, remote, now := newRuntimeDiagnosticCleanerFixture(t)
+	_ = saveRuntimeDiagnosticCleanerExport(t, db, now, "diag-start-failure", now.Add(-time.Second))
+	cleaner := NewRuntimeDiagnosticCleaner(db, tasks, remote)
+	cleaner.startExisting = func(store.Task, worker.Job) (store.Task, error) { return store.Task{}, errors.New("start rejected") }
+	cleaner.tick(context.Background(), now)
+	tasksAfter, err := db.ListTasks()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tasksAfter) != 0 {
+		t.Fatalf("start failure retained task(s): %+v", tasksAfter)
+	}
+}
+
 type runtimeDiagnosticCleanerRemote struct {
 	mu      sync.Mutex
 	calls   int
@@ -229,7 +320,7 @@ func waitForRuntimeDiagnosticCleanerTask(t *testing.T, db *store.Store) store.Ta
 
 func waitForRuntimeDiagnosticCleanerTaskCount(t *testing.T, db *store.Store, count int) store.Task {
 	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
 		tasks, err := db.ListTasks()
 		if err != nil {
@@ -245,4 +336,51 @@ func waitForRuntimeDiagnosticCleanerTaskCount(t *testing.T, db *store.Store, cou
 	}
 	t.Fatal("timed out waiting for cleanup task")
 	return store.Task{}
+}
+
+func findRuntimeDiagnosticCleanerTask(t *testing.T, db *store.Store) store.Task {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		tasks, err := db.ListTasks()
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, task := range tasks {
+			if task.Type == runtimeDiagnosticCleanupTaskType {
+				return task
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("timed out waiting for cleanup task creation")
+	return store.Task{}
+}
+
+func waitForRuntimeDiagnosticCleanerTaskStatus(t *testing.T, db *store.Store, taskID, want string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		task, _, err := db.GetTask(taskID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if task.Status == want {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for task %s status %s", taskID, want)
+}
+
+func waitForRuntimeDiagnosticCleanerIdle(t *testing.T, cleaner *RuntimeDiagnosticCleaner) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if !cleaner.running.Load() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("timed out waiting for cleaner to become idle")
 }

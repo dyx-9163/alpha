@@ -130,12 +130,23 @@ func (s *Store) ListDiagnosticExports(instanceID string, page, pageSize int) (Di
 }
 
 func (s *Store) ListDiagnosticExportsDueForCleanup(now time.Time, limit int) ([]DiagnosticExport, error) {
+	return s.ListDiagnosticExportsDueForCleanupAfter(now, time.Time{}, "", limit)
+}
+
+func (s *Store) ListDiagnosticExportsDueForCleanupAfter(now, afterExpiresAt time.Time, afterID string, limit int) ([]DiagnosticExport, error) {
 	if limit <= 0 {
 		limit = 100
 	}
+	where := `(status='ready' and expires_at <= ?) or (status='expired' and cleanup_status <> 'complete')`
+	args := []any{now}
+	if !afterExpiresAt.IsZero() || strings.TrimSpace(afterID) != "" {
+		where = `(` + where + `) and (expires_at > ? or (expires_at = ? and id > ?))`
+		args = append(args, afterExpiresAt, afterExpiresAt, strings.TrimSpace(afterID))
+	}
+	args = append(args, limit)
 	rows, err := s.db.Query(`select `+diagnosticExportColumns+` from diagnostic_exports
-		where (status='ready' and expires_at <= ?) or (status='expired' and cleanup_status <> 'complete')
-		order by expires_at asc, created_at asc, id asc limit ?`, now, limit)
+		where `+where+`
+		order by expires_at asc, id asc limit ?`, args...)
 	if err != nil {
 		return nil, err
 	}
