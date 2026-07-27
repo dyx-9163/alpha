@@ -1533,6 +1533,62 @@ func runtimeDiagnosticArchiveFile(t *testing.T, sh, archiveNative, relative stri
 	return string(output)
 }
 
+func runtimeDiagnosticStreamArchiveEntries(t *testing.T, output []byte) []string {
+	t.Helper()
+	headerEnd := bytes.IndexByte(output, '\n')
+	if headerEnd < 0 || !bytes.HasPrefix(output[:headerEnd], []byte("AIFAR_DIAG_STREAM_V1\t")) {
+		t.Fatalf("diagnostic stream header is missing: %q", output)
+	}
+	compressed, err := gzip.NewReader(bytes.NewReader(output[headerEnd+1:]))
+	if err != nil {
+		t.Fatalf("open diagnostic stream archive: %v", err)
+	}
+	defer compressed.Close()
+	archive := tar.NewReader(compressed)
+	var entries []string
+	for {
+		header, err := archive.Next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			t.Fatalf("read diagnostic stream archive: %v", err)
+		}
+		entries = append(entries, header.Name)
+	}
+	return entries
+}
+
+func runtimeDiagnosticStreamArchiveFile(t *testing.T, output []byte, name string) string {
+	t.Helper()
+	headerEnd := bytes.IndexByte(output, '\n')
+	if headerEnd < 0 {
+		t.Fatalf("diagnostic stream header is missing: %q", output)
+	}
+	compressed, err := gzip.NewReader(bytes.NewReader(output[headerEnd+1:]))
+	if err != nil {
+		t.Fatalf("open diagnostic stream archive: %v", err)
+	}
+	defer compressed.Close()
+	archive := tar.NewReader(compressed)
+	for {
+		header, err := archive.Next()
+		if errors.Is(err, io.EOF) {
+			t.Fatalf("diagnostic stream archive entry %q is missing", name)
+		}
+		if err != nil {
+			t.Fatalf("read diagnostic stream archive: %v", err)
+		}
+		if header.Name == name {
+			content, err := io.ReadAll(archive)
+			if err != nil {
+				t.Fatalf("read diagnostic stream archive entry %q: %v", name, err)
+			}
+			return string(content)
+		}
+	}
+}
+
 func TestRuntimeDiagnosticExportRejectsSymlinkDiagnosticsRoot(t *testing.T) {
 	fixture := newRuntimeDiagnosticExportShellFixture(t)
 	outside := filepath.Join(fixture.rootNative, "outside")
@@ -1657,6 +1713,39 @@ func TestRuntimeDiagnosticExportSucceedsWhenMatchedLogProducesNoWarnings(t *test
 	}
 	if !bytes.HasPrefix(output, []byte("AIFAR_DIAG_STREAM_V1\t")) {
 		t.Fatalf("warning-free log export omitted stream header: %q", output)
+	}
+}
+
+func TestRuntimeDiagnosticExportOmitsDirectoriesForLogsOutsideWindow(t *testing.T) {
+	fixture := newRuntimeDiagnosticExportShellFixtureWithPrefix(t, "runtime-diagnostic-shell-")
+	writeRuntimeDiagnosticShellCommand(t, fixture.binNative, "timedatectl", "printf '%s\n' 'Asia/Shanghai'")
+	logRoot := filepath.Join(fixture.installNative, "runtime", "logs", "gateway")
+	outsideDir := filepath.Join(logRoot, "history", "2019-12-31")
+	if err := os.MkdirAll(outsideDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(outsideDir, "outside.log"), []byte("[2019-12-31 23:59:59.999] [INFO ] outside-window\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(logRoot, "current.log"), []byte("[2026-07-27 16:00:00.000] [INFO ] inside-window\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	output, err := fixture.run()
+	if err != nil {
+		t.Fatalf("diagnostic export failed: %v: %s", err, output)
+	}
+	listing := strings.Join(runtimeDiagnosticStreamArchiveEntries(t, output), "\n")
+	insideEntry := fixture.archiveBase + "/services/gateway/file-logs/current.log"
+	if !strings.Contains(listing, insideEntry) {
+		errorsText := runtimeDiagnosticStreamArchiveFile(t, output, fixture.archiveBase+"/collection-errors.txt")
+		manifest := runtimeDiagnosticStreamArchiveFile(t, output, fixture.archiveBase+"/manifest.json")
+		t.Fatalf("archive omitted in-window log %q:\n%s\nerrors:\n%s\nmanifest:\n%s", insideEntry, listing, errorsText, manifest)
+	}
+	for _, outsideEntry := range []string{"history/", "2019-12-31/", "outside.log"} {
+		if strings.Contains(listing, outsideEntry) {
+			t.Fatalf("archive contains out-of-window entry %q:\n%s", outsideEntry, listing)
+		}
 	}
 }
 

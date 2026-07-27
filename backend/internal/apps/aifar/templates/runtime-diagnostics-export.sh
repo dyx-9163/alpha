@@ -142,7 +142,7 @@ destination="$BUNDLE_ROOT/$destination_relative"
 staged="$WORK_ROOT/staged/$destination_relative"
 summary="$WORK_ROOT/summaries/$service-${initial_inode}.tsv"
 warnings="$WORK_ROOT/warnings/$service-${initial_inode}.tsv"
-mkdir -p -- "$(dirname "$destination")" "$(dirname "$staged")" "$(dirname "$summary")" "$(dirname "$warnings")"
+mkdir -p -- "$(dirname "$staged")" "$(dirname "$summary")" "$(dirname "$warnings")"
 : > "$warnings"
 
 redact_stream() {
@@ -192,6 +192,7 @@ if [ "$filtered_bytes" -gt 0 ]; then
   staged_sha=$(sha256sum -- "$staged") || exit 31
   staged_sha=${staged_sha%% *}
   case "$staged_sha" in ''|*[!a-f0-9]*) exit 31 ;; esac
+  mkdir -p -- "$(dirname "$destination")"
   mv -T -- "$staged" "$destination"
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
     "$service" "$relative" "$initial_device" "$initial_inode" "$initial_size" "$scanned_bytes" "$filtered_bytes" "$staged_sha" "${parser}:${warning_codes:--}" >> "$MANIFEST_RECORDS"
