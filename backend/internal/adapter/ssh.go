@@ -33,6 +33,10 @@ func (SSHRemote) UploadFile(ctx context.Context, server store.Server, localPath,
 	return UploadSSHFile(ctx, server, localPath, remotePath, mode)
 }
 
+func (SSHRemote) DownloadFile(ctx context.Context, server store.Server, remotePath, localPath string, mode os.FileMode) (DownloadResult, error) {
+	return DownloadSSHFile(ctx, server, remotePath, localPath, mode)
+}
+
 func ProbeSSH(ctx context.Context, server store.Server) error {
 	client, err := dialSSH(ctx, server)
 	if err != nil {
