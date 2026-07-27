@@ -4,9 +4,11 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -44,6 +46,375 @@ func TestDiagnosticExportLifecycle(t *testing.T) {
 	}
 	if got.Status != "ready" || got.ArchiveBytes != 1024 || got.ReadyAt.IsZero() {
 		t.Fatalf("unexpected export: %+v", got)
+	}
+}
+
+func TestDiagnosticExportLegacyMigrationDefaultsStorageToRemote(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "aifar.db")
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.Exec(`create table schema_migrations (
+		version integer primary key,
+		name text not null,
+		applied_at datetime not null
+	)`); err != nil {
+		raw.Close()
+		t.Fatal(err)
+	}
+	var legacyMigration *storeMigration
+	for index := range storeMigrations {
+		if storeMigrations[index].Version == 2026072701 {
+			legacyMigration = &storeMigrations[index]
+			break
+		}
+	}
+	if legacyMigration == nil {
+		raw.Close()
+		t.Fatal("missing diagnostic export legacy migration 2026072701")
+	}
+	tx, err := raw.Begin()
+	if err != nil {
+		raw.Close()
+		t.Fatal(err)
+	}
+	if err := legacyMigration.Up(tx); err != nil {
+		tx.Rollback()
+		raw.Close()
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(`insert into schema_migrations(version,name,applied_at) values(?,?,?)`,
+		legacyMigration.Version, legacyMigration.Name, time.Now().UTC()); err != nil {
+		tx.Rollback()
+		raw.Close()
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 7, 27, 8, 0, 0, 0, time.UTC)
+	if _, err := tx.Exec(`insert into diagnostic_exports(
+		id,instance_id,server_id,status,since_at,until_at,remote_relative_path,created_at,expires_at
+	) values(?,?,?,?,?,?,?,?,?)`,
+		"diag-legacy", "instance-1", "server-1", "ready", now.Add(-time.Hour), now,
+		"diag-legacy/archive.tar.gz", now, now.Add(24*time.Hour)); err != nil {
+		tx.Rollback()
+		raw.Close()
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		raw.Close()
+		t.Fatal(err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	got, err := db.GetDiagnosticExport("diag-legacy")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.StorageKind != "remote" || got.StorageRelativePath != "" || got.ReservedBytes != 0 || got.RemoteRelativePath != "diag-legacy/archive.tar.gz" {
+		t.Fatalf("legacy migration mismatch: %+v", got)
+	}
+}
+
+func TestDiagnosticExportLocalStorageRoundTrip(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "aifar.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	now := time.Date(2026, 7, 27, 8, 0, 0, 0, time.UTC)
+	saved, err := db.SaveDiagnosticExport(DiagnosticExport{
+		ID: "diag-local", InstanceID: "instance-1", ServerID: "server-1", Status: "building",
+		StorageKind: "local", StorageRelativePath: "diag-local/aifar-diagnostics-instance-1.tar.gz",
+		SinceAt: now.Add(-time.Hour), UntilAt: now, CreatedAt: now, ExpiresAt: now.Add(24 * time.Hour),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := db.GetDiagnosticExport(saved.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.StorageKind != "local" || got.StorageRelativePath != "diag-local/aifar-diagnostics-instance-1.tar.gz" || got.RemoteRelativePath != "" {
+		t.Fatalf("local storage round trip mismatch: %+v", got)
+	}
+}
+
+func TestSaveDiagnosticExportRejectsInvalidLocalStorageMetadata(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "aifar.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	now := time.Date(2026, 7, 27, 8, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name   string
+		mutate func(*DiagnosticExport)
+	}{
+		{name: "unsupported storage kind", mutate: func(v *DiagnosticExport) { v.StorageKind = "shared" }},
+		{name: "negative archive bytes", mutate: func(v *DiagnosticExport) { v.ArchiveBytes = -1 }},
+		{name: "negative uncompressed bytes", mutate: func(v *DiagnosticExport) { v.UncompressedBytes = -1 }},
+		{name: "negative reserved bytes", mutate: func(v *DiagnosticExport) { v.ReservedBytes = -1 }},
+		{name: "ready local path missing", mutate: func(v *DiagnosticExport) { v.Status = "ready" }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			value := DiagnosticExport{
+				ID:         "diag-invalid-" + strings.ReplaceAll(test.name, " ", "-"),
+				InstanceID: "instance-1", ServerID: "server-1", Status: "building", StorageKind: "local",
+				SinceAt: now.Add(-time.Hour), UntilAt: now, CreatedAt: now, ExpiresAt: now.Add(time.Hour),
+			}
+			test.mutate(&value)
+			if _, err := db.SaveDiagnosticExport(value); err == nil {
+				t.Fatal("expected invalid local storage metadata to be rejected")
+			}
+		})
+	}
+}
+
+func TestCommitLocalDiagnosticExportRejectsIncompleteMetadata(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "aifar.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	now := time.Date(2026, 7, 27, 8, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name   string
+		mutate func(*LocalDiagnosticExportCommit)
+	}{
+		{name: "storage path missing", mutate: func(v *LocalDiagnosticExportCommit) { v.StorageRelativePath = "" }},
+		{name: "archive name missing", mutate: func(v *LocalDiagnosticExportCommit) { v.ArchiveName = "" }},
+		{name: "sha missing", mutate: func(v *LocalDiagnosticExportCommit) { v.SHA256 = "" }},
+		{name: "negative archive bytes", mutate: func(v *LocalDiagnosticExportCommit) { v.ArchiveBytes = -1 }},
+		{name: "negative uncompressed bytes", mutate: func(v *LocalDiagnosticExportCommit) { v.UncompressedBytes = -1 }},
+		{name: "negative warning count", mutate: func(v *LocalDiagnosticExportCommit) { v.WarningCount = -1 }},
+		{name: "ready time missing", mutate: func(v *LocalDiagnosticExportCommit) { v.ReadyAt = time.Time{} }},
+		{name: "expiry time missing", mutate: func(v *LocalDiagnosticExportCommit) { v.ExpiresAt = time.Time{} }},
+	}
+	for index, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			id := fmt.Sprintf("diag-invalid-commit-%d", index)
+			if _, err := db.SaveDiagnosticExport(DiagnosticExport{
+				ID: id, InstanceID: "instance-1", ServerID: "server-1", Status: "building", StorageKind: "local",
+				SinceAt: now.Add(-time.Hour), UntilAt: now, CreatedAt: now, ExpiresAt: now.Add(time.Hour),
+			}); err != nil {
+				t.Fatal(err)
+			}
+			value := LocalDiagnosticExportCommit{
+				ID: id, StorageRelativePath: id + "/archive.tar.gz", ArchiveName: "archive.tar.gz",
+				ArchiveBytes: 1024, UncompressedBytes: 4096, SHA256: strings.Repeat("a", 64),
+				ReadyAt: now, ExpiresAt: now.Add(24 * time.Hour),
+			}
+			test.mutate(&value)
+			if _, err := db.CommitLocalDiagnosticExport(value); err == nil {
+				t.Fatal("expected incomplete local commit metadata to be rejected")
+			}
+		})
+	}
+}
+
+func TestDiagnosticExportReservationAndLocalCommit(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "aifar.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	now := time.Date(2026, 7, 27, 8, 0, 0, 0, time.UTC)
+	for _, id := range []string{"diag-1", "diag-2"} {
+		if _, err := db.SaveDiagnosticExport(DiagnosticExport{
+			ID: id, InstanceID: "instance-1", ServerID: "server-1", Status: "building", StorageKind: "local",
+			SinceAt: now.Add(-time.Hour), UntilAt: now, CreatedAt: now, ExpiresAt: now.Add(24 * time.Hour),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	usage, err := db.ReserveDiagnosticExportBytes("diag-1", 256<<20, 5<<30)
+	if err != nil || usage.ReadyBytes != 0 || usage.ReservedBytes != int64(256<<20) || usage.QuotaBytes != int64(5<<30) {
+		t.Fatalf("reserve: usage=%+v err=%v", usage, err)
+	}
+	if _, err := db.ReserveDiagnosticExportBytes("diag-2", 256<<20, 300<<20); !errors.Is(err, ErrDiagnosticExportQuotaExceeded) {
+		t.Fatalf("reserve over quota error=%v", err)
+	}
+
+	ready, err := db.CommitLocalDiagnosticExport(LocalDiagnosticExportCommit{
+		ID: "diag-1", StorageRelativePath: "diag-1/aifar-diagnostics-instance-1.tar.gz",
+		ArchiveName: "aifar-diagnostics-instance-1.tar.gz", ArchiveBytes: 1024,
+		UncompressedBytes: 4096, SHA256: strings.Repeat("a", 64),
+		WarningCount: 2, Warnings: []string{"timestamp-unrecognized"},
+		ReadyAt: now, ExpiresAt: now.Add(24 * time.Hour),
+	})
+	if err != nil || ready.ReservedBytes != 0 || ready.Status != "ready" {
+		t.Fatalf("commit local export: ready=%+v err=%v", ready, err)
+	}
+	if ready.StorageRelativePath != "diag-1/aifar-diagnostics-instance-1.tar.gz" || ready.ArchiveBytes != 1024 || ready.WarningCount != 2 {
+		t.Fatalf("local commit metadata mismatch: %+v", ready)
+	}
+}
+
+func TestDiagnosticExportConcurrentReservationsCannotExceedQuota(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "aifar.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	now := time.Date(2026, 7, 27, 8, 0, 0, 0, time.UTC)
+	for _, id := range []string{"diag-concurrent-1", "diag-concurrent-2"} {
+		if _, err := db.SaveDiagnosticExport(DiagnosticExport{
+			ID: id, InstanceID: "instance-1", ServerID: "server-1", Status: "building", StorageKind: "local",
+			SinceAt: now.Add(-time.Hour), UntilAt: now, CreatedAt: now, ExpiresAt: now.Add(24 * time.Hour),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	start := make(chan struct{})
+	errs := make(chan error, 2)
+	var wg sync.WaitGroup
+	for _, id := range []string{"diag-concurrent-1", "diag-concurrent-2"} {
+		wg.Add(1)
+		go func(id string) {
+			defer wg.Done()
+			<-start
+			_, err := db.ReserveDiagnosticExportBytes(id, 256<<20, 300<<20)
+			errs <- err
+		}(id)
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+
+	succeeded := 0
+	quotaRejected := 0
+	for err := range errs {
+		switch {
+		case err == nil:
+			succeeded++
+		case errors.Is(err, ErrDiagnosticExportQuotaExceeded):
+			quotaRejected++
+		default:
+			t.Fatalf("unexpected concurrent reservation error: %v", err)
+		}
+	}
+	if succeeded != 1 || quotaRejected != 1 {
+		t.Fatalf("concurrent reservation result: succeeded=%d quotaRejected=%d", succeeded, quotaRejected)
+	}
+}
+
+func TestDiagnosticExportTerminalTransitionsReleaseReservations(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "aifar.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	now := time.Date(2026, 7, 27, 8, 0, 0, 0, time.UTC)
+
+	if _, err := db.SaveDiagnosticExport(DiagnosticExport{
+		ID: "diag-failed", InstanceID: "instance-1", ServerID: "server-1", Status: "building", StorageKind: "local",
+		SinceAt: now.Add(-time.Hour), UntilAt: now, CreatedAt: now, ExpiresAt: now.Add(24 * time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ReserveDiagnosticExportBytes("diag-failed", 128<<20, 5<<30); err != nil {
+		t.Fatal(err)
+	}
+	if updated, err := db.MarkDiagnosticExportFailed("diag-failed", "stream interrupted", now); err != nil || !updated {
+		t.Fatalf("mark failed: updated=%v err=%v", updated, err)
+	}
+	failed, err := db.GetDiagnosticExport("diag-failed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if failed.Status != "failed" || failed.ReservedBytes != 0 || failed.ErrorText != "stream interrupted" {
+		t.Fatalf("failed transition mismatch: %+v", failed)
+	}
+
+	if _, err := db.SaveDiagnosticExport(DiagnosticExport{
+		ID: "diag-deleted", InstanceID: "instance-1", ServerID: "server-1", Status: "failed", StorageKind: "local",
+		ReservedBytes: 64 << 20, SinceAt: now.Add(-time.Hour), UntilAt: now, CreatedAt: now,
+		ExpiresAt: now.Add(24 * time.Hour), CleanupStatus: "pending",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if updated, err := db.MarkDiagnosticExportDeleted("diag-deleted", now); err != nil || !updated {
+		t.Fatalf("mark deleted: updated=%v err=%v", updated, err)
+	}
+	deleted, err := db.GetDiagnosticExport("diag-deleted")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deleted.Status != "deleted" || deleted.ReservedBytes != 0 {
+		t.Fatalf("deleted transition retained reservation: %+v", deleted)
+	}
+}
+
+func TestReleaseDiagnosticExportReservationClearsOnlyLocalReservation(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "aifar.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	now := time.Date(2026, 7, 27, 8, 0, 0, 0, time.UTC)
+	if _, err := db.SaveDiagnosticExport(DiagnosticExport{
+		ID: "diag-release", InstanceID: "instance-1", ServerID: "server-1", Status: "building", StorageKind: "local",
+		ReservedBytes: 64 << 20, SinceAt: now.Add(-time.Hour), UntilAt: now, CreatedAt: now, ExpiresAt: now.Add(time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	updated, err := db.ReleaseDiagnosticExportReservation("diag-release")
+	if err != nil || !updated {
+		t.Fatalf("release reservation: updated=%v err=%v", updated, err)
+	}
+	got, err := db.GetDiagnosticExport("diag-release")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ReservedBytes != 0 || got.Status != "building" {
+		t.Fatalf("reservation release changed unexpected fields: %+v", got)
+	}
+	updated, err = db.ReleaseDiagnosticExportReservation("diag-release")
+	if err != nil || updated {
+		t.Fatalf("second reservation release should be a no-op: updated=%v err=%v", updated, err)
+	}
+}
+
+func TestListDiagnosticExportsForReconcileReturnsOnlyLiveLocalRows(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "aifar.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	now := time.Date(2026, 7, 27, 8, 0, 0, 0, time.UTC)
+	rows := []DiagnosticExport{
+		{ID: "diag-local-building", InstanceID: "instance-1", ServerID: "server-1", Status: "building", StorageKind: "local", SinceAt: now.Add(-time.Hour), UntilAt: now, CreatedAt: now, ExpiresAt: now.Add(time.Hour)},
+		{ID: "diag-local-failed", InstanceID: "instance-1", ServerID: "server-1", Status: "failed", StorageKind: "local", SinceAt: now.Add(-time.Hour), UntilAt: now, CreatedAt: now.Add(time.Minute), ExpiresAt: now.Add(time.Hour)},
+		{ID: "diag-remote", InstanceID: "instance-1", ServerID: "server-1", Status: "ready", StorageKind: "remote", RemoteRelativePath: "diag-remote/archive.tar.gz", SinceAt: now.Add(-time.Hour), UntilAt: now, CreatedAt: now.Add(2 * time.Minute), ExpiresAt: now.Add(time.Hour)},
+		{ID: "diag-local-deleted", InstanceID: "instance-1", ServerID: "server-1", Status: "deleted", StorageKind: "local", SinceAt: now.Add(-time.Hour), UntilAt: now, CreatedAt: now.Add(3 * time.Minute), ExpiresAt: now.Add(time.Hour), DeletedAt: now.Add(4 * time.Minute), CleanupStatus: "complete"},
+	}
+	for _, row := range rows {
+		if _, err := db.SaveDiagnosticExport(row); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	got, err := db.ListDiagnosticExportsForReconcile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotIDs := make([]string, 0, len(got))
+	for _, row := range got {
+		gotIDs = append(gotIDs, row.ID)
+	}
+	if strings.Join(gotIDs, ",") != "diag-local-building,diag-local-failed" {
+		t.Fatalf("unexpected reconcile rows: %v", gotIDs)
 	}
 }
 

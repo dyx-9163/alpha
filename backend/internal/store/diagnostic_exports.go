@@ -3,14 +3,36 @@ package store
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
 	"time"
 )
 
+var ErrDiagnosticExportQuotaExceeded = errors.New("diagnostic export quota exceeded")
+
+type DiagnosticExportStorageUsage struct {
+	ReadyBytes    int64
+	ReservedBytes int64
+	QuotaBytes    int64
+}
+
+type LocalDiagnosticExportCommit struct {
+	ID                  string
+	StorageRelativePath string
+	ArchiveName         string
+	SHA256              string
+	ArchiveBytes        int64
+	UncompressedBytes   int64
+	WarningCount        int
+	Warnings            []string
+	ReadyAt             time.Time
+	ExpiresAt           time.Time
+}
+
 const diagnosticExportColumns = `id,task_id,instance_id,server_id,status,services_json,since_at,until_at,
-	remote_relative_path,archive_name,archive_bytes,uncompressed_bytes,sha256,warning_count,warnings_json,error_text,
+	storage_kind,storage_relative_path,reserved_bytes,remote_relative_path,archive_name,archive_bytes,uncompressed_bytes,sha256,warning_count,warnings_json,error_text,
 	created_by,created_at,ready_at,expires_at,downloaded_at,deleted_at,cleanup_status,cleanup_error,cleanup_attempted_at`
 
 func (s *Store) SaveDiagnosticExport(v DiagnosticExport) (DiagnosticExport, error) {
@@ -28,10 +50,11 @@ func (s *Store) SaveDiagnosticExport(v DiagnosticExport) (DiagnosticExport, erro
 		v.CreatedAt = time.Now()
 	}
 	_, err = s.db.Exec(`insert into diagnostic_exports(`+diagnosticExportColumns+`)
-		values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+		values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		on conflict(id) do update set
 		task_id=excluded.task_id,instance_id=excluded.instance_id,server_id=excluded.server_id,status=excluded.status,
 		services_json=excluded.services_json,since_at=excluded.since_at,until_at=excluded.until_at,
+		storage_kind=excluded.storage_kind,storage_relative_path=excluded.storage_relative_path,reserved_bytes=excluded.reserved_bytes,
 		remote_relative_path=excluded.remote_relative_path,archive_name=excluded.archive_name,archive_bytes=excluded.archive_bytes,
 		uncompressed_bytes=excluded.uncompressed_bytes,sha256=excluded.sha256,warning_count=excluded.warning_count,
 		warnings_json=excluded.warnings_json,error_text=excluded.error_text,created_by=excluded.created_by,
@@ -39,7 +62,7 @@ func (s *Store) SaveDiagnosticExport(v DiagnosticExport) (DiagnosticExport, erro
 		deleted_at=excluded.deleted_at,cleanup_status=excluded.cleanup_status,cleanup_error=excluded.cleanup_error,
 		cleanup_attempted_at=excluded.cleanup_attempted_at`,
 		v.ID, v.TaskID, v.InstanceID, v.ServerID, v.Status, v.ServicesJSON, v.SinceAt, v.UntilAt,
-		v.RemoteRelativePath, v.ArchiveName, v.ArchiveBytes, v.UncompressedBytes, v.SHA256, v.WarningCount, v.WarningsJSON,
+		v.StorageKind, v.StorageRelativePath, v.ReservedBytes, v.RemoteRelativePath, v.ArchiveName, v.ArchiveBytes, v.UncompressedBytes, v.SHA256, v.WarningCount, v.WarningsJSON,
 		v.ErrorText, v.CreatedBy, v.CreatedAt, nullableTime(v.ReadyAt), v.ExpiresAt, nullableTime(v.DownloadedAt), nullableTime(v.DeletedAt),
 		v.CleanupStatus, v.CleanupError, nullableTime(v.CleanupAttemptedAt))
 	if err != nil {
@@ -51,6 +74,115 @@ func (s *Store) SaveDiagnosticExport(v DiagnosticExport) (DiagnosticExport, erro
 func (s *Store) GetDiagnosticExport(id string) (DiagnosticExport, error) {
 	row := s.db.QueryRow(`select `+diagnosticExportColumns+` from diagnostic_exports where id=?`, strings.TrimSpace(id))
 	return scanDiagnosticExport(row)
+}
+
+func (s *Store) ReserveDiagnosticExportBytes(id string, bytes, quota int64) (DiagnosticExportStorageUsage, error) {
+	id = strings.TrimSpace(id)
+	if id == "" || bytes <= 0 || quota <= 0 {
+		return DiagnosticExportStorageUsage{}, fmt.Errorf("diagnostic export id, reservation bytes and quota are required")
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return DiagnosticExportStorageUsage{}, err
+	}
+	defer tx.Rollback()
+
+	var status, storageKind string
+	var currentReservation int64
+	if err := tx.QueryRow(`select status,storage_kind,reserved_bytes from diagnostic_exports where id=?`, id).
+		Scan(&status, &storageKind, &currentReservation); err != nil {
+		return DiagnosticExportStorageUsage{}, err
+	}
+	if storageKind != "local" || (status != "pending" && status != "building") {
+		return DiagnosticExportStorageUsage{}, sql.ErrNoRows
+	}
+
+	usage := DiagnosticExportStorageUsage{QuotaBytes: quota}
+	if err := tx.QueryRow(`select coalesce(sum(archive_bytes),0),coalesce(sum(reserved_bytes),0)
+		from diagnostic_exports where storage_kind='local' and deleted_at is null`).
+		Scan(&usage.ReadyBytes, &usage.ReservedBytes); err != nil {
+		return DiagnosticExportStorageUsage{}, err
+	}
+	reservedWithoutCurrent := usage.ReservedBytes - currentReservation
+	if usage.ReadyBytes > quota || reservedWithoutCurrent > quota-usage.ReadyBytes || bytes > quota-usage.ReadyBytes-reservedWithoutCurrent {
+		return usage, ErrDiagnosticExportQuotaExceeded
+	}
+	result, err := tx.Exec(`update diagnostic_exports set reserved_bytes=?
+		where id=? and storage_kind='local' and status in ('pending','building')`, bytes, id)
+	updated, err := diagnosticExportWasUpdated(result, err)
+	if err != nil {
+		return DiagnosticExportStorageUsage{}, err
+	}
+	if !updated {
+		return DiagnosticExportStorageUsage{}, sql.ErrNoRows
+	}
+	usage.ReservedBytes = reservedWithoutCurrent + bytes
+	if err := tx.Commit(); err != nil {
+		return DiagnosticExportStorageUsage{}, err
+	}
+	return usage, nil
+}
+
+func (s *Store) ReleaseDiagnosticExportReservation(id string) (bool, error) {
+	result, err := s.db.Exec(`update diagnostic_exports set reserved_bytes=0
+		where id=? and storage_kind='local' and reserved_bytes<>0`, strings.TrimSpace(id))
+	return diagnosticExportWasUpdated(result, err)
+}
+
+func (s *Store) CommitLocalDiagnosticExport(v LocalDiagnosticExportCommit) (DiagnosticExport, error) {
+	v.ID = strings.TrimSpace(v.ID)
+	v.StorageRelativePath = strings.TrimSpace(v.StorageRelativePath)
+	v.ArchiveName = strings.TrimSpace(v.ArchiveName)
+	v.SHA256 = strings.TrimSpace(v.SHA256)
+	if v.ID == "" || v.StorageRelativePath == "" || v.ArchiveName == "" || v.SHA256 == "" {
+		return DiagnosticExport{}, fmt.Errorf("local diagnostic export commit metadata is required")
+	}
+	if v.ArchiveBytes < 0 || v.UncompressedBytes < 0 || v.WarningCount < 0 {
+		return DiagnosticExport{}, fmt.Errorf("local diagnostic export commit sizes must not be negative")
+	}
+	if v.ReadyAt.IsZero() || v.ExpiresAt.IsZero() {
+		return DiagnosticExport{}, fmt.Errorf("local diagnostic export ready and expiry times are required")
+	}
+	warnings := normalizedDiagnosticExportStrings(v.Warnings, false)
+	warningsJSON, err := json.Marshal(warnings)
+	if err != nil {
+		return DiagnosticExport{}, err
+	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return DiagnosticExport{}, err
+	}
+	defer tx.Rollback()
+	result, err := tx.Exec(`update diagnostic_exports set
+		status='ready',storage_relative_path=?,archive_name=?,archive_bytes=?,uncompressed_bytes=?,sha256=?,
+		warning_count=?,warnings_json=?,error_text='',ready_at=?,expires_at=?,reserved_bytes=0,cleanup_status='none',cleanup_error=''
+		where id=? and storage_kind='local' and status='building' and deleted_at is null`,
+		v.StorageRelativePath, v.ArchiveName, v.ArchiveBytes, v.UncompressedBytes, v.SHA256,
+		v.WarningCount, string(warningsJSON), v.ReadyAt, v.ExpiresAt, v.ID)
+	updated, err := diagnosticExportWasUpdated(result, err)
+	if err != nil {
+		return DiagnosticExport{}, err
+	}
+	if !updated {
+		return DiagnosticExport{}, sql.ErrNoRows
+	}
+	ready, err := scanDiagnosticExport(tx.QueryRow(`select `+diagnosticExportColumns+` from diagnostic_exports where id=?`, v.ID))
+	if err != nil {
+		return DiagnosticExport{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return DiagnosticExport{}, err
+	}
+	return ready, nil
+}
+
+func (s *Store) MarkDiagnosticExportFailed(id, errorText string, failedAt time.Time) (bool, error) {
+	result, err := s.db.Exec(`update diagnostic_exports set status='failed',error_text=?,reserved_bytes=0,
+		expires_at=case when expires_at > ? then ? else expires_at end
+		where id=? and status in ('pending','building') and deleted_at is null`,
+		strings.TrimSpace(errorText), failedAt, failedAt, strings.TrimSpace(id))
+	return diagnosticExportWasUpdated(result, err)
 }
 
 func (s *Store) MarkDiagnosticExportDownloaded(id string, downloadedAt time.Time) (bool, error) {
@@ -84,10 +216,28 @@ func (s *Store) MarkDiagnosticExportCleanupFailed(id, cleanupError string) (bool
 
 func (s *Store) MarkDiagnosticExportDeleted(id string, deletedAt time.Time) (bool, error) {
 	result, err := s.db.Exec(`update diagnostic_exports
-		set status='deleted',deleted_at=?,cleanup_status='complete',cleanup_error=''
+		set status='deleted',deleted_at=?,cleanup_status='complete',cleanup_error='',reserved_bytes=0
 		where id=? and status in ('ready','expired','failed','cancelled')
 		and deleted_at is null and cleanup_status='pending'`, deletedAt, strings.TrimSpace(id))
 	return diagnosticExportWasUpdated(result, err)
+}
+
+func (s *Store) ListDiagnosticExportsForReconcile() ([]DiagnosticExport, error) {
+	rows, err := s.db.Query(`select ` + diagnosticExportColumns + ` from diagnostic_exports
+		where storage_kind='local' and deleted_at is null order by created_at asc,id asc`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []DiagnosticExport{}
+	for rows.Next() {
+		item, err := scanDiagnosticExport(rows)
+		if err != nil {
+			return nil, err
+		}
+		items = append(items, item)
+	}
+	return items, rows.Err()
 }
 
 func diagnosticExportWasUpdated(result sql.Result, err error) (bool, error) {
@@ -186,7 +336,7 @@ func scanDiagnosticExport(rows interface{ Scan(dest ...any) error }) (Diagnostic
 	var readyAt, downloadedAt, deletedAt, cleanupAttemptedAt sql.NullTime
 	if err := rows.Scan(
 		&v.ID, &v.TaskID, &v.InstanceID, &v.ServerID, &v.Status, &v.ServicesJSON, &v.SinceAt, &v.UntilAt,
-		&v.RemoteRelativePath, &v.ArchiveName, &v.ArchiveBytes, &v.UncompressedBytes, &v.SHA256, &v.WarningCount, &v.WarningsJSON,
+		&v.StorageKind, &v.StorageRelativePath, &v.ReservedBytes, &v.RemoteRelativePath, &v.ArchiveName, &v.ArchiveBytes, &v.UncompressedBytes, &v.SHA256, &v.WarningCount, &v.WarningsJSON,
 		&v.ErrorText, &v.CreatedBy, &v.CreatedAt, &readyAt, &v.ExpiresAt, &downloadedAt, &deletedAt,
 		&v.CleanupStatus, &v.CleanupError, &cleanupAttemptedAt,
 	); err != nil {
@@ -217,6 +367,14 @@ func normalizeDiagnosticExport(v DiagnosticExport) (DiagnosticExport, error) {
 	if !isDiagnosticExportStatus(v.Status) {
 		return DiagnosticExport{}, fmt.Errorf("unsupported diagnostic export status %q", v.Status)
 	}
+	v.StorageKind = strings.ToLower(strings.TrimSpace(v.StorageKind))
+	if v.StorageKind == "" {
+		v.StorageKind = "remote"
+	}
+	if v.StorageKind != "remote" && v.StorageKind != "local" {
+		return DiagnosticExport{}, fmt.Errorf("unsupported diagnostic export storage kind %q", v.StorageKind)
+	}
+	v.StorageRelativePath = strings.TrimSpace(v.StorageRelativePath)
 	v.RemoteRelativePath = strings.TrimSpace(v.RemoteRelativePath)
 	v.ArchiveName = strings.TrimSpace(v.ArchiveName)
 	v.SHA256 = strings.TrimSpace(v.SHA256)
@@ -230,7 +388,12 @@ func normalizeDiagnosticExport(v DiagnosticExport) (DiagnosticExport, error) {
 		return DiagnosticExport{}, fmt.Errorf("unsupported diagnostic export cleanup status %q", v.CleanupStatus)
 	}
 	v.CleanupError = strings.TrimSpace(v.CleanupError)
-
+	if v.ArchiveBytes < 0 || v.UncompressedBytes < 0 || v.ReservedBytes < 0 {
+		return DiagnosticExport{}, fmt.Errorf("diagnostic export byte sizes must not be negative")
+	}
+	if v.StorageKind == "local" && v.Status == "ready" && v.StorageRelativePath == "" {
+		return DiagnosticExport{}, fmt.Errorf("local ready diagnostic export storage path is required")
+	}
 	services := v.Services
 	if len(services) == 0 {
 		var err error

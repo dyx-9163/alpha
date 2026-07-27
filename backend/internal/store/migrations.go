@@ -229,6 +229,27 @@ var storeMigrations = []storeMigration{
 			)
 		},
 	},
+	{
+		Version: 2026072702,
+		Name:    "diagnostic export local storage",
+		Up: func(tx *sql.Tx) error {
+			for _, column := range []struct {
+				Name string
+				DDL  string
+			}{
+				{Name: "storage_kind", DDL: `alter table diagnostic_exports add column storage_kind text not null default 'remote'`},
+				{Name: "storage_relative_path", DDL: `alter table diagnostic_exports add column storage_relative_path text not null default ''`},
+				{Name: "reserved_bytes", DDL: `alter table diagnostic_exports add column reserved_bytes integer not null default 0`},
+			} {
+				if err := ensureColumnTx(tx, "diagnostic_exports", column.Name, column.DDL); err != nil {
+					return err
+				}
+			}
+			return execMigrationStatements(tx,
+				`create index if not exists diagnostic_exports_storage_kind_status on diagnostic_exports(storage_kind, status, expires_at)`,
+			)
+		},
+	},
 }
 
 func runStoreMigrations(db *sql.DB) error {
