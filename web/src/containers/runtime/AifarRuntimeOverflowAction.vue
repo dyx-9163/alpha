@@ -1,6 +1,6 @@
 <template>
   <el-dropdown-item :command="command" :disabled="isDisabled">
-    <el-tooltip :content="disabledReason" :disabled="!isDisabled" placement="right">
+    <el-tooltip :content="disabledReason" :disabled="!isDisabled" :trigger="['hover', 'focus']" placement="right">
       <span
         class="runtime-overflow-action-trigger"
         :class="{ 'is-disabled': isDisabled }"

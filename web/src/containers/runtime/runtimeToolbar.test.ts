@@ -31,11 +31,12 @@ describe('AIFAR Runtime overflow actions', () => {
       })
     })
     app.component('ElDropdownItem', passThroughComponent)
-    app.component('ElTooltip', passThroughComponent)
+    app.component('ElTooltip', tooltipComponent)
 
     const html = await renderToString(app)
 
     expect(html).toContain('disabled')
+    expect(html).toContain('data-trigger="hover focus"')
     expect(html).toContain('tabindex="0"')
     expect(html).toContain(`aria-describedby="${runtimeOverflowReasonId('reconcile')}"`)
     expect(html).toContain(`id="${runtimeOverflowReasonId('reconcile')}"`)
@@ -46,5 +47,13 @@ describe('AIFAR Runtime overflow actions', () => {
 const passThroughComponent = defineComponent({
   setup(_, { attrs, slots }) {
     return () => h('span', attrs, slots.default?.())
+  }
+})
+
+const tooltipComponent = defineComponent({
+  props: { trigger: [String, Array] },
+  setup(props, { attrs, slots }) {
+    const trigger = Array.isArray(props.trigger) ? props.trigger.join(' ') : props.trigger ?? ''
+    return () => h('span', { ...attrs, 'data-trigger': trigger }, slots.default?.())
   }
 })
