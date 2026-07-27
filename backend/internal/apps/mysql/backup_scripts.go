@@ -1,19 +1,22 @@
 package mysql
 
 import (
+	"bytes"
 	_ "embed"
 	"fmt"
 	"path"
 	"regexp"
 	"text/template"
-
-	"aifar-deployment/backend/internal/installer/installerkit"
 )
 
 const (
+	maxLogicalThreads  = 64
+	maxLogicalRateMBps = 10240
+)
+
+var (
 	mysqlBackupWorkRoot = "/aifar/apps/mysql/_backup"
-	maxLogicalThreads   = 64
-	maxLogicalRateMBps  = 10240
+	mysqlInstallRoot    = "/aifar/apps/mysql"
 )
 
 var logicalTaskID = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$`)
@@ -28,6 +31,7 @@ var logicalRestoreScriptTemplate string
 var inspectSQLTemplate string
 
 type logicalScriptTemplateData struct {
+	MySQLShell  string
 	WorkDir     string
 	DumpDir     string
 	Threads     int
@@ -39,6 +43,7 @@ func RenderLogicalBackupScript(options LogicalBackupScriptOptions) (string, erro
 		return "", err
 	}
 	return renderLogicalScript("logical-backup.sh", "mysql-logical-backup", logicalBackupScriptTemplate, logicalScriptTemplateData{
+		MySQLShell:  path.Join(mysqlInstallRoot, "mysql-shell", "bin", "mysqlsh"),
 		WorkDir:     mysqlBackupWorkDir(options.TaskID),
 		DumpDir:     path.Join(mysqlBackupWorkDir(options.TaskID), "dump"),
 		Threads:     options.Threads,
@@ -52,9 +57,10 @@ func RenderLogicalRestoreScript(options LogicalRestoreScriptOptions) (string, er
 	}
 	workDir := mysqlBackupWorkDir(options.TaskID)
 	return renderLogicalScript("logical-restore.sh", "mysql-logical-restore", logicalRestoreScriptTemplate, logicalScriptTemplateData{
-		WorkDir: workDir,
-		DumpDir: path.Join(workDir, "dump"),
-		Threads: options.Threads,
+		MySQLShell: path.Join(mysqlInstallRoot, "mysql-shell", "bin", "mysqlsh"),
+		WorkDir:    workDir,
+		DumpDir:    path.Join(workDir, "dump"),
+		Threads:    options.Threads,
 	})
 }
 
@@ -84,5 +90,13 @@ func mysqlBackupWorkDir(taskID string) string {
 }
 
 func renderLogicalScript(templatePath, name, embedded string, data logicalScriptTemplateData) (string, error) {
-	return installerkit.RenderTemplate("mysql", "backup/"+templatePath, name, embedded, template.FuncMap{}, data)
+	tpl, err := template.New(name).Parse(embedded)
+	if err != nil {
+		return "", fmt.Errorf("parse fixed MySQL backup template %s: %w", templatePath, err)
+	}
+	var output bytes.Buffer
+	if err := tpl.Execute(&output, data); err != nil {
+		return "", fmt.Errorf("render fixed MySQL backup template %s: %w", templatePath, err)
+	}
+	return output.String(), nil
 }

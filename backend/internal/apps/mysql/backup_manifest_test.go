@@ -30,7 +30,7 @@ func validBackupManifest() BackupManifest {
 func TestBackupManifestNormalizeRejectsUnsafeSchemasAndCanonicalizesBusinessSchemas(t *testing.T) {
 	// Production break caught: accepting a system/SQL-injection-shaped schema would let a later dump or drop escape the manifest allowlist.
 	manifest := validBackupManifest()
-	manifest.Schemas = []string{"zebra", "billing", "zebra"}
+	manifest.Schemas = []string{"zebra", "billing"}
 
 	normalized, err := NormalizeBackupManifest(manifest)
 	if err != nil {
@@ -43,12 +43,21 @@ func TestBackupManifestNormalizeRejectsUnsafeSchemasAndCanonicalizesBusinessSche
 		t.Fatalf("excluded schemas = %q, want %q", got, want)
 	}
 
-	for _, schema := range []string{"mysql", "orders;DROP", "two words", "../outside"} {
+	for _, schema := range []string{"mysql", "MYSQL", "Information_Schema", "mysql_innodb_CLUSTER_metadata", "orders;DROP", "two words", "../outside"} {
 		manifest := validBackupManifest()
 		manifest.Schemas = []string{schema}
 		if _, err := NormalizeBackupManifest(manifest); err == nil {
 			t.Fatalf("schema %q unexpectedly accepted", schema)
 		}
+	}
+}
+
+func TestBackupManifestNormalizeRejectsCaseFoldedBusinessSchemaDuplicates(t *testing.T) {
+	// Production break caught: treating Sales and sales as separate schemas would create an ambiguous dump/drop allowlist on case-insensitive MySQL deployments.
+	manifest := validBackupManifest()
+	manifest.Schemas = []string{"Sales", "sales"}
+	if _, err := NormalizeBackupManifest(manifest); err == nil {
+		t.Fatal("case-folded duplicate schemas unexpectedly accepted")
 	}
 }
 
@@ -94,6 +103,55 @@ func TestBackupManifestCanonicalJSONContainsNoSecretShapedKeysOrValues(t *testin
 	}
 }
 
+func TestContainsSecretShapeTraversesFutureJSONFields(t *testing.T) {
+	// Production break caught: a future serialized field with a password/credential/privateKey name or bare secret-shaped value would bypass the manifest secret gate.
+	type futureManifestField struct {
+		PrivateKey string `json:"privateKey"`
+	}
+	for _, value := range []any{
+		map[string]any{"password": "x"},
+		[]any{map[string]any{"credential": "x"}},
+		futureManifestField{PrivateKey: "x"},
+		map[string]any{"safe": "secret"},
+	} {
+		if !containsSecretShape(value) {
+			t.Fatalf("secret-shaped JSON value escaped traversal: %#v", value)
+		}
+	}
+}
+
+func TestBackupManifestRejectsNonCanonicalRequiredValues(t *testing.T) {
+	// Production break caught: trimming or alias-normalizing persisted manifest fields would make two textual identities validate as the same backup source.
+	cases := []struct {
+		name   string
+		mutate func(*BackupManifest)
+	}{
+		{"app whitespace", func(m *BackupManifest) { m.App = " mysql" }},
+		{"topology case alias", func(m *BackupManifest) { m.Topology = "Standalone" }},
+		{"backup id whitespace", func(m *BackupManifest) { m.BackupID = "backup-001 " }},
+		{"instance id whitespace", func(m *BackupManifest) { m.InstanceID = " mysql-001" }},
+		{"source server whitespace", func(m *BackupManifest) { m.SourceServerID = "server-001 " }},
+		{"mysql version whitespace", func(m *BackupManifest) { m.MySQLVersion = "8.0.36 " }},
+		{"mysql shell version whitespace", func(m *BackupManifest) { m.MySQLShellVersion = " 8.0.36" }},
+		{"task id whitespace", func(m *BackupManifest) { m.TaskID = "task-001 " }},
+		{"endpoint host case alias", func(m *BackupManifest) { m.SourceEndpoint = "LOCALHOST:3306" }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			manifest := validBackupManifest()
+			tc.mutate(&manifest)
+			if _, err := NormalizeBackupManifest(manifest); err == nil {
+				t.Fatal("non-canonical required value unexpectedly accepted")
+			}
+		})
+	}
+	for _, backupType := range []string{" logical-full", "logical-full ", "LOGICAL-FULL"} {
+		if err := ValidateRestoreCompatibility(validBackupManifest(), backupType, "standalone", "8.0.36"); err == nil {
+			t.Fatalf("non-canonical backup type %q unexpectedly accepted", backupType)
+		}
+	}
+}
+
 func TestBackupManifestNormalizeRequiresHealthyDeterministicClusterMetadata(t *testing.T) {
 	// Production break caught: accepting an incomplete or unhealthy cluster manifest would allow restore from an unknown source primary/topology.
 	manifest := validBackupManifest()
@@ -103,7 +161,7 @@ func TestBackupManifestNormalizeRequiresHealthyDeterministicClusterMetadata(t *t
 	manifest.SourceEndpoint = "10.0.0.1:3306"
 	manifest.Members = []ClusterMemberRef{
 		{InstanceID: "mysql-3", ServerID: "server-3", Endpoint: "10.0.0.3:3306", Role: "SECONDARY", Status: "ONLINE"},
-		{InstanceID: "mysql-1", ServerID: "server-1", Endpoint: "10.0.0.1:3306", Role: "primary", Status: "online"},
+		{InstanceID: "mysql-1", ServerID: "server-1", Endpoint: "10.0.0.1:3306", Role: "PRIMARY", Status: "ONLINE"},
 		{InstanceID: "mysql-2", ServerID: "server-2", Endpoint: "10.0.0.2:3306", Role: "SECONDARY", Status: "ONLINE"},
 	}
 
@@ -124,6 +182,14 @@ func TestBackupManifestNormalizeRequiresHealthyDeterministicClusterMetadata(t *t
 		func(m *BackupManifest) { m.Members[0].Status = "OFFLINE" },
 		func(m *BackupManifest) { m.Members[1].Role = "SECONDARY" },
 		func(m *BackupManifest) { m.Members = m.Members[:2] },
+		func(m *BackupManifest) {
+			m.Members = append(m.Members, ClusterMemberRef{InstanceID: "mysql-4", ServerID: "server-4", Endpoint: "10.0.0.4:3306", Role: "SECONDARY", Status: "ONLINE"})
+		},
+		func(m *BackupManifest) { m.Members[0].Role = "primary " },
+		func(m *BackupManifest) { m.Members[0].Status = "online" },
+		func(m *BackupManifest) { m.Members[1].Role = "ARBITER" },
+		func(m *BackupManifest) { m.Members[0].ServerID = "SERVER-3" },
+		func(m *BackupManifest) { m.Members[0].Endpoint = "10.0.0.3:3306 " },
 	} {
 		broken := manifest
 		broken.Members = append([]ClusterMemberRef(nil), manifest.Members...)

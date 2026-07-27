@@ -11,7 +11,7 @@ import (
 
 var (
 	strictSchemaName = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]{0,63}$`)
-	secretShape      = regexp.MustCompile(`(?i)(password|passwd|secret|token|private[ _-]?key|credential)\s*[:=]`)
+	secretAssignment = regexp.MustCompile(`(?i)(password|passwd|secret|token|private[ _-]?key|credential)\s*[:=]`)
 )
 
 var fixedSystemSchemas = []string{
@@ -25,21 +25,15 @@ var fixedSystemSchemas = []string{
 // NormalizeBackupManifest validates a portable backup manifest and returns a
 // deterministic copy. Callers must persist only the returned value.
 func NormalizeBackupManifest(manifest BackupManifest) (BackupManifest, error) {
-	if strings.TrimSpace(manifest.App) != "mysql" {
+	if manifest.App != "mysql" {
 		return BackupManifest{}, mysqlOperationError(MySQLRestoreManifestInvalid)
 	}
-	manifest.Topology = strings.ToLower(strings.TrimSpace(manifest.Topology))
 	if manifest.Topology != "standalone" && manifest.Topology != "innodb-cluster" {
 		return BackupManifest{}, mysqlOperationError(MySQLBackupUnsupportedTopology)
 	}
 	if !manifest.Consistent || manifest.CreatedAt.IsZero() ||
-		strings.TrimSpace(manifest.BackupID) == "" ||
-		strings.TrimSpace(manifest.InstanceID) == "" ||
-		strings.TrimSpace(manifest.SourceServerID) == "" ||
-		strings.TrimSpace(manifest.SourceServerUUID) == "" ||
-		strings.TrimSpace(manifest.MySQLVersion) == "" ||
-		strings.TrimSpace(manifest.MySQLShellVersion) == "" ||
-		strings.TrimSpace(manifest.TaskID) == "" ||
+		!canonicalRequired(manifest.BackupID, manifest.InstanceID, manifest.SourceServerUUID, manifest.MySQLVersion, manifest.MySQLShellVersion, manifest.TaskID) ||
+		!canonicalIdentity(manifest.SourceServerID) ||
 		!validEndpoint(manifest.SourceEndpoint) {
 		return BackupManifest{}, mysqlOperationError(MySQLRestoreManifestInvalid)
 	}
@@ -59,11 +53,11 @@ func NormalizeBackupManifest(manifest BackupManifest) (BackupManifest, error) {
 
 	switch manifest.Topology {
 	case "standalone":
-		if strings.TrimSpace(manifest.ClusterID) != "" || len(manifest.Members) != 0 {
+		if manifest.ClusterID != "" || len(manifest.Members) != 0 {
 			return BackupManifest{}, mysqlOperationError(MySQLRestoreManifestInvalid)
 		}
 	case "innodb-cluster":
-		if strings.TrimSpace(manifest.ClusterID) == "" {
+		if !canonicalRequired(manifest.ClusterID) {
 			return BackupManifest{}, mysqlOperationError(MySQLRestoreManifestInvalid)
 		}
 		members, err := normalizeClusterMembers(manifest.Members, manifest.SourceServerID, manifest.SourceEndpoint)
@@ -97,15 +91,15 @@ func ValidateRestoreCompatibility(manifest BackupManifest, backupType, targetTop
 	if err != nil {
 		return err
 	}
-	switch strings.TrimSpace(backupType) {
+	switch backupType {
 	case "logical-full", "pre-restore":
 	default:
 		return mysqlOperationError(MySQLRestoreManifestInvalid)
 	}
-	if strings.ToLower(strings.TrimSpace(targetTopology)) != normalized.Topology {
+	if targetTopology != normalized.Topology {
 		return mysqlOperationError(MySQLRestoreManifestInvalid)
 	}
-	if strings.TrimSpace(targetMySQLVersion) != normalized.MySQLVersion {
+	if !canonicalRequired(targetMySQLVersion) || targetMySQLVersion != normalized.MySQLVersion {
 		return mysqlOperationError(MySQLRestoreVersionIncompatible)
 	}
 	return nil
@@ -115,14 +109,15 @@ func normalizeBusinessSchemas(schemas []string) ([]string, error) {
 	seen := make(map[string]struct{}, len(schemas))
 	result := make([]string, 0, len(schemas))
 	for _, raw := range schemas {
-		schema := strings.TrimSpace(raw)
+		schema := raw
 		if !strictSchemaName.MatchString(schema) || isSystemSchema(schema) {
 			return nil, mysqlOperationError(MySQLRestoreManifestInvalid)
 		}
-		if _, ok := seen[schema]; ok {
-			continue
+		folded := strings.ToLower(schema)
+		if _, ok := seen[folded]; ok {
+			return nil, mysqlOperationError(MySQLRestoreManifestInvalid)
 		}
-		seen[schema] = struct{}{}
+		seen[folded] = struct{}{}
 		result = append(result, schema)
 	}
 	if len(result) == 0 {
@@ -134,7 +129,7 @@ func normalizeBusinessSchemas(schemas []string) ([]string, error) {
 
 func isSystemSchema(schema string) bool {
 	for _, systemSchema := range fixedSystemSchemas {
-		if schema == systemSchema {
+		if strings.EqualFold(schema, systemSchema) {
 			return true
 		}
 	}
@@ -147,7 +142,7 @@ func hasFixedSystemSchemaExclusions(schemas []string) bool {
 	}
 	seen := make(map[string]struct{}, len(schemas))
 	for _, schema := range schemas {
-		if _, ok := seen[schema]; ok || !isSystemSchema(schema) {
+		if _, ok := seen[schema]; ok || !isFixedSystemSchema(schema) {
 			return false
 		}
 		seen[schema] = struct{}{}
@@ -155,8 +150,17 @@ func hasFixedSystemSchemaExclusions(schemas []string) bool {
 	return len(seen) == len(fixedSystemSchemas)
 }
 
+func isFixedSystemSchema(schema string) bool {
+	for _, fixed := range fixedSystemSchemas {
+		if schema == fixed {
+			return true
+		}
+	}
+	return false
+}
+
 func normalizeClusterMembers(members []ClusterMemberRef, sourceServerID, sourceEndpoint string) ([]ClusterMemberRef, error) {
-	if len(members) < 3 {
+	if len(members) != 3 {
 		return nil, mysqlOperationError(MySQLBackupClusterUnhealthy)
 	}
 	instances := make(map[string]struct{}, len(members))
@@ -167,29 +171,32 @@ func normalizeClusterMembers(members []ClusterMemberRef, sourceServerID, sourceE
 	result := append([]ClusterMemberRef(nil), members...)
 	for index := range result {
 		member := &result[index]
-		member.Role = strings.ToUpper(strings.TrimSpace(member.Role))
-		member.Status = strings.ToUpper(strings.TrimSpace(member.Status))
-		if strings.TrimSpace(member.InstanceID) == "" || strings.TrimSpace(member.ServerID) == "" || !validEndpoint(member.Endpoint) {
+		if !canonicalIdentity(member.InstanceID, member.ServerID) || !validEndpoint(member.Endpoint) {
 			return nil, mysqlOperationError(MySQLBackupClusterUnhealthy)
 		}
-		if _, ok := instances[member.InstanceID]; ok {
+		instanceKey := strings.ToLower(member.InstanceID)
+		serverKey := strings.ToLower(member.ServerID)
+		endpointKey := strings.ToLower(member.Endpoint)
+		if _, ok := instances[instanceKey]; ok {
 			return nil, mysqlOperationError(MySQLBackupClusterUnhealthy)
 		}
-		if _, ok := servers[member.ServerID]; ok {
+		if _, ok := servers[serverKey]; ok {
 			return nil, mysqlOperationError(MySQLBackupClusterUnhealthy)
 		}
-		if _, ok := endpoints[member.Endpoint]; ok {
+		if _, ok := endpoints[endpointKey]; ok {
 			return nil, mysqlOperationError(MySQLBackupClusterUnhealthy)
 		}
-		instances[member.InstanceID] = struct{}{}
-		servers[member.ServerID] = struct{}{}
-		endpoints[member.Endpoint] = struct{}{}
+		instances[instanceKey] = struct{}{}
+		servers[serverKey] = struct{}{}
+		endpoints[endpointKey] = struct{}{}
 		if member.Status != "ONLINE" {
 			return nil, mysqlOperationError(MySQLBackupClusterUnhealthy)
 		}
 		if member.Role == "PRIMARY" {
 			primaryCount++
 			primary = *member
+		} else if member.Role != "SECONDARY" {
+			return nil, mysqlOperationError(MySQLBackupClusterUnhealthy)
 		}
 	}
 	if primaryCount != 1 {
@@ -211,13 +218,14 @@ func normalizeRouters(routers []RouterRef) ([]RouterRef, error) {
 	result := append([]RouterRef(nil), routers...)
 	seen := make(map[string]struct{}, len(result))
 	for _, router := range result {
-		if strings.TrimSpace(router.InstanceID) == "" || strings.TrimSpace(router.ServerID) == "" || !validEndpoint(router.Endpoint) {
+		if !canonicalIdentity(router.InstanceID, router.ServerID) || !canonicalRequired(router.Status) || !validEndpoint(router.Endpoint) {
 			return nil, mysqlOperationError(MySQLRestoreManifestInvalid)
 		}
-		if _, ok := seen[router.InstanceID]; ok {
+		key := strings.ToLower(router.InstanceID)
+		if _, ok := seen[key]; ok {
 			return nil, mysqlOperationError(MySQLRestoreManifestInvalid)
 		}
-		seen[router.InstanceID] = struct{}{}
+		seen[key] = struct{}{}
 	}
 	sort.Slice(result, func(i, j int) bool {
 		if result[i].InstanceID == result[j].InstanceID {
@@ -229,11 +237,11 @@ func normalizeRouters(routers []RouterRef) ([]RouterRef, error) {
 }
 
 func validEndpoint(endpoint string) bool {
-	if strings.TrimSpace(endpoint) != endpoint || strings.Contains(endpoint, "@") || secretShape.MatchString(endpoint) {
+	if !canonicalRequired(endpoint) || strings.Contains(endpoint, "@") || secretAssignment.MatchString(endpoint) {
 		return false
 	}
 	host, port, err := net.SplitHostPort(endpoint)
-	if err != nil || strings.TrimSpace(host) == "" {
+	if err != nil || host == "" || host != strings.ToLower(host) {
 		return false
 	}
 	parsedPort, err := strconv.Atoi(port)
@@ -241,45 +249,57 @@ func validEndpoint(endpoint string) bool {
 }
 
 func containsSecretShape(value any) bool {
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return true
+	}
+	var decoded any
+	if err := json.Unmarshal(encoded, &decoded); err != nil {
+		return true
+	}
+	return containsSecretJSONShape(decoded)
+}
+
+func containsSecretJSONShape(value any) bool {
 	switch typed := value.(type) {
 	case string:
-		return secretShape.MatchString(typed) || strings.Contains(typed, "://") && strings.Contains(typed, "@")
-	case BackupManifest:
-		return containsSecretShape(typed.BackupID) || containsSecretShape(typed.App) || containsSecretShape(typed.Topology) ||
-			containsSecretShape(typed.InstanceID) || containsSecretShape(typed.ClusterID) || containsSecretShape(typed.SourceServerID) ||
-			containsSecretShape(typed.SourceEndpoint) || containsSecretShape(typed.SourceServerUUID) || containsSecretShape(typed.MySQLVersion) ||
-			containsSecretShape(typed.MySQLShellVersion) || containsSecretShape(typed.Schemas) || containsSecretShape(typed.ExcludedSchemas) ||
-			containsSecretShape(typed.GTIDExecuted) || containsSecretShape(typed.Members) || containsSecretShape(typed.Routers) || containsSecretShape(typed.TaskID)
-	case []string:
+		value := strings.ToLower(strings.TrimSpace(typed))
+		return isSecretJSONName(value) || secretAssignment.MatchString(typed) || strings.Contains(typed, "://") && strings.Contains(typed, "@")
+	case []any:
 		for _, item := range typed {
-			if containsSecretShape(item) {
-				return true
-			}
-		}
-	case []ClusterMemberRef:
-		for _, item := range typed {
-			if containsSecretShape(item.InstanceID) || containsSecretShape(item.ServerID) || containsSecretShape(item.Endpoint) || containsSecretShape(item.Role) || containsSecretShape(item.Status) {
-				return true
-			}
-		}
-	case []RouterRef:
-		for _, item := range typed {
-			if containsSecretShape(item.InstanceID) || containsSecretShape(item.ServerID) || containsSecretShape(item.Endpoint) || containsSecretShape(item.Status) {
+			if containsSecretJSONShape(item) {
 				return true
 			}
 		}
 	case map[string]any:
 		for key, item := range typed {
-			if secretShape.MatchString(key) || containsSecretShape(item) {
-				return true
-			}
-		}
-	case []any:
-		for _, item := range typed {
-			if containsSecretShape(item) {
+			if isSecretJSONName(key) || containsSecretJSONShape(item) {
 				return true
 			}
 		}
 	}
 	return false
+}
+
+func isSecretJSONName(value string) bool {
+	normalized := strings.NewReplacer("_", "", "-", "", " ", "").Replace(strings.ToLower(strings.TrimSpace(value)))
+	return strings.Contains(normalized, "password") || strings.Contains(normalized, "passwd") || strings.Contains(normalized, "secret") || strings.Contains(normalized, "token") || strings.Contains(normalized, "privatekey") || strings.Contains(normalized, "credential")
+}
+
+func canonicalRequired(values ...string) bool {
+	for _, value := range values {
+		if value == "" || strings.TrimSpace(value) != value {
+			return false
+		}
+	}
+	return true
+}
+
+func canonicalIdentity(values ...string) bool {
+	for _, value := range values {
+		if !canonicalRequired(value) || value != strings.ToLower(value) {
+			return false
+		}
+	}
+	return true
 }

@@ -1,8 +1,12 @@
 package mysql
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+
+	"aifar-deployment/backend/internal/installer/installerkit"
 )
 
 func TestRenderLogicalBackupScriptUsesFixedSafeDumpOptions(t *testing.T) {
@@ -17,7 +21,8 @@ func TestRenderLogicalBackupScriptUsesFixedSafeDumpOptions(t *testing.T) {
 		"showProgress: false",
 		`compression: "zstd"`,
 		`"mysql_innodb_cluster_metadata"`,
-		`SECRET_CONTEXT="$WORK_DIR/secret-context.cnf"`,
+		`"secret-context.cnf"`,
+		`--defaults-file=/proc/self/fd/`,
 	} {
 		if !strings.Contains(script, want) {
 			t.Fatalf("backup script missing %q:\n%s", want, script)
@@ -39,7 +44,8 @@ func TestRenderLogicalRestoreScriptUsesFixedSafeLoadOptions(t *testing.T) {
 		"ignoreExistingObjects: false",
 		"skipBinlog: false",
 		"showProgress: false",
-		`SECRET_CONTEXT="$WORK_DIR/secret-context.cnf"`,
+		`"secret-context.cnf"`,
+		`--defaults-file=/proc/self/fd/`,
 	} {
 		if !strings.Contains(script, want) {
 			t.Fatalf("restore script missing %q:\n%s", want, script)
@@ -65,5 +71,25 @@ func TestRenderLogicalScriptsRejectUntrustedTaskAndNumericInputs(t *testing.T) {
 	}
 	if _, err := RenderLogicalRestoreScript(LogicalRestoreScriptOptions{TaskID: "task-001 $(id)", Threads: 4}); err == nil {
 		t.Fatal("unsafe restore task ID unexpectedly accepted")
+	}
+}
+
+func TestRenderLogicalScriptsIgnoreLocalInstallerOverrides(t *testing.T) {
+	// Production break caught: honoring config/installers overrides would let a local writable file replace fixed backup/restore behavior.
+	overrideRoot := t.TempDir()
+	overridePath := filepath.Join(overrideRoot, "mysql", "backup", "logical-backup.sh")
+	if err := os.MkdirAll(filepath.Dir(overridePath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(overridePath, []byte("echo attacker override\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(installerkit.TemplateDirEnv, overrideRoot)
+	script, err := RenderLogicalBackupScript(LogicalBackupScriptOptions{TaskID: "task-001", Threads: 4, MaxRateMBps: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(script, "attacker override") {
+		t.Fatal("logical backup renderer honored a local installer override")
 	}
 }
