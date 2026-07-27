@@ -187,6 +187,22 @@ util.loadDump(dumpDir, {
 
 `util.loadDump()` 使用 `LOAD DATA LOCAL INFILE`。任务必须读取并保存 `@@GLOBAL.local_infile` 原值，导入前临时设为 ON，并在所有仍可连接目标 MySQL 的成功、失败和取消路径恢复原值。若目标在 finally 阶段不可达，任务保持 failed，记录不含 secret 的待恢复标记；后续任何 backup/restore/check 必须先调和该标记并验证变量已回到原值。开启窗口只覆盖受控 restore 阶段。
 
+待恢复标记是 `app_instances.metadata` 中服务端管理的版本化对象，字段名和首版结构固定为：
+
+```json
+{
+  "mysqlReconciliation": {
+    "version": 1,
+    "kind": "local_infile",
+    "originalValue": "ON",
+    "recordedAt": "2026-07-28T00:00:00Z",
+    "taskId": "task_xxx"
+  }
+}
+```
+
+`originalValue` 只能是 `ON` 或 `OFF`，`recordedAt` 使用 UTC RFC3339，`taskId` 必须是当前受控 restore task ID。对象不得包含账号、密码、连接串或远端命令。调和成功后只有在重新读取并确认 `@@GLOBAL.local_infile` 等于记录原值时才能删除整个 `mysqlReconciliation` 字段；未知 `version`、未知 `kind`、畸形或不完整 marker 均失败关闭并返回 `MYSQL_RECONCILIATION_REQUIRED`。
+
 ## 8. Standalone 备份
 
 步骤：
@@ -410,13 +426,15 @@ MYSQL_RESTORE_VERSION_INCOMPATIBLE
 MYSQL_RESTORE_MANIFEST_INVALID
 MYSQL_RESTORE_TARGET_NOT_CLEAN
 MYSQL_RESTORE_PRIMARY_CHANGED
-MYSQL_RESTORE_LOCAL_INFILE_RESTORE_FAILED
+MYSQL_LOCAL_INFILE_RESTORE_FAILED
 MYSQL_RESTORE_INCOMPLETE
 MYSQL_REBUILD_CONFIRMATION_REQUIRED
 MYSQL_REBUILD_ROUTER_FAILED
 ```
 
 `MYSQL_CREDENTIAL_UNAVAILABLE` 同时用于备份和还原：目标无法解析出唯一、启用且绑定 `purpose=admin` 的 MySQL 凭据，或其密文不可用时返回该码。缺失、停用、重复绑定、缺少密文和解密失败共用这一公开错误码；消息和 details 不得暴露具体凭据记录或失败的秘密信息。
+
+新实现只产生 `MYSQL_LOCAL_INFILE_RESTORE_FAILED`。旧名称 `MYSQL_RESTORE_LOCAL_INFILE_RESTORE_FAILED` 仅作为兼容别名保留，用于识别历史任务、日志或调用方；其公开文案映射到同一安全消息，不得由新的 restore 流程返回。
 
 错误响应保持 `{code,message,details}`，用户可见 message 和任务日志进入 backend i18n zh/en。
 
