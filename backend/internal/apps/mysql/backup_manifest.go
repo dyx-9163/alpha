@@ -12,11 +12,14 @@ import (
 var (
 	strictSchemaName  = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]{0,63}$`)
 	secretAssignment  = regexp.MustCompile(`(?i)(password|passwd|secret|token|private[ _-]?key|credential)\s*[:=]`)
-	backupIDPattern   = regexp.MustCompile(`^backup-[a-z0-9][a-z0-9_-]{0,127}$`)
-	instanceIDPattern = regexp.MustCompile(`^mysql-[a-z0-9][a-z0-9_-]{0,127}$`)
-	clusterIDPattern  = regexp.MustCompile(`^cluster-[a-z0-9][a-z0-9_-]{0,127}$`)
-	taskIDPattern     = regexp.MustCompile(`^task-[a-z0-9][a-z0-9_-]{0,127}$`)
+	storeIDSuffix     = `(?:[0-9a-f]{24}|[0-9]+)`
+	backupIDPattern   = regexp.MustCompile(`^backup_` + storeIDSuffix + `$`)
+	instanceIDPattern = regexp.MustCompile(`^app_` + storeIDSuffix + `$`)
+	serverIDPattern   = regexp.MustCompile(`^srv_` + storeIDSuffix + `$`)
+	clusterIDPattern  = regexp.MustCompile(`^(?:mysql_cluster|cluster)_` + storeIDSuffix + `$`)
+	taskIDPattern     = regexp.MustCompile(`^tsk_` + storeIDSuffix + `$`)
 	uuidPattern       = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
+	dnsLabelPattern   = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$`)
 )
 
 var fixedSystemSchemas = []string{
@@ -39,13 +42,17 @@ func NormalizeBackupManifest(manifest BackupManifest) (BackupManifest, error) {
 	if !manifest.Consistent || manifest.CreatedAt.IsZero() ||
 		!backupIDPattern.MatchString(manifest.BackupID) || !instanceIDPattern.MatchString(manifest.InstanceID) || !uuidPattern.MatchString(manifest.SourceServerUUID) || !taskIDPattern.MatchString(manifest.TaskID) ||
 		!canonicalRequired(manifest.MySQLVersion, manifest.MySQLShellVersion) ||
-		!canonicalIdentity(manifest.SourceServerID) ||
-		!validEndpoint(manifest.SourceEndpoint) {
+		!serverIDPattern.MatchString(manifest.SourceServerID) {
 		return BackupManifest{}, mysqlOperationError(MySQLRestoreManifestInvalid)
 	}
 	if containsSecretShape(manifest) {
 		return BackupManifest{}, mysqlOperationError(MySQLRestoreManifestInvalid)
 	}
+	endpoint, ok := canonicalEndpoint(manifest.SourceEndpoint)
+	if !ok {
+		return BackupManifest{}, mysqlOperationError(MySQLRestoreManifestInvalid)
+	}
+	manifest.SourceEndpoint = endpoint
 
 	schemas, err := normalizeBusinessSchemas(manifest.Schemas)
 	if err != nil {
@@ -177,9 +184,14 @@ func normalizeClusterMembers(members []ClusterMemberRef, sourceServerID, sourceE
 	result := append([]ClusterMemberRef(nil), members...)
 	for index := range result {
 		member := &result[index]
-		if !canonicalIdentity(member.InstanceID, member.ServerID) || !validEndpoint(member.Endpoint) {
+		if !instanceIDPattern.MatchString(member.InstanceID) || !serverIDPattern.MatchString(member.ServerID) {
 			return nil, mysqlOperationError(MySQLBackupClusterUnhealthy)
 		}
+		endpoint, ok := canonicalEndpoint(member.Endpoint)
+		if !ok {
+			return nil, mysqlOperationError(MySQLBackupClusterUnhealthy)
+		}
+		member.Endpoint = endpoint
 		instanceKey := strings.ToLower(member.InstanceID)
 		serverKey := strings.ToLower(member.ServerID)
 		endpointKey := strings.ToLower(member.Endpoint)
@@ -223,10 +235,16 @@ func normalizeClusterMembers(members []ClusterMemberRef, sourceServerID, sourceE
 func normalizeRouters(routers []RouterRef) ([]RouterRef, error) {
 	result := append([]RouterRef(nil), routers...)
 	seen := make(map[string]struct{}, len(result))
-	for _, router := range result {
-		if !canonicalIdentity(router.InstanceID, router.ServerID) || !canonicalRequired(router.Status) || !validEndpoint(router.Endpoint) {
+	for index := range result {
+		router := result[index]
+		if !instanceIDPattern.MatchString(router.InstanceID) || !serverIDPattern.MatchString(router.ServerID) || !canonicalRequired(router.Status) {
 			return nil, mysqlOperationError(MySQLRestoreManifestInvalid)
 		}
+		endpoint, ok := canonicalEndpoint(router.Endpoint)
+		if !ok {
+			return nil, mysqlOperationError(MySQLRestoreManifestInvalid)
+		}
+		result[index].Endpoint = endpoint
 		key := strings.ToLower(router.InstanceID)
 		if _, ok := seen[key]; ok {
 			return nil, mysqlOperationError(MySQLRestoreManifestInvalid)
@@ -242,16 +260,35 @@ func normalizeRouters(routers []RouterRef) ([]RouterRef, error) {
 	return result, nil
 }
 
-func validEndpoint(endpoint string) bool {
+func canonicalEndpoint(endpoint string) (string, bool) {
 	if !canonicalRequired(endpoint) || strings.Contains(endpoint, "@") || secretAssignment.MatchString(endpoint) {
-		return false
+		return "", false
 	}
 	host, port, err := net.SplitHostPort(endpoint)
-	if err != nil || host == "" || host != strings.ToLower(host) {
-		return false
+	if err != nil || host == "" {
+		return "", false
 	}
 	parsedPort, err := strconv.Atoi(port)
-	return err == nil && parsedPort > 0 && parsedPort <= 65535 && port == strconv.Itoa(parsedPort)
+	if err != nil || parsedPort <= 0 || parsedPort > 65535 || port != strconv.Itoa(parsedPort) {
+		return "", false
+	}
+	if parsed := net.ParseIP(host); parsed != nil {
+		host = parsed.String()
+	} else {
+		host = strings.ToLower(host)
+		if strings.HasSuffix(host, ".") {
+			host = strings.TrimSuffix(host, ".")
+		}
+		if host == "" || len(host) > 253 || strings.HasSuffix(host, ".") {
+			return "", false
+		}
+		for _, label := range strings.Split(host, ".") {
+			if !dnsLabelPattern.MatchString(label) {
+				return "", false
+			}
+		}
+	}
+	return net.JoinHostPort(host, port), true
 }
 
 func containsSecretShape(value any) bool {

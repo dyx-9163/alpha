@@ -5,15 +5,17 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"aifar-deployment/backend/internal/store"
 )
 
 func validBackupManifest() BackupManifest {
 	return BackupManifest{
-		BackupID:          "backup-001",
+		BackupID:          "backup_0123456789abcdef01234567",
 		App:               "mysql",
 		Topology:          "standalone",
-		InstanceID:        "mysql-001",
-		SourceServerID:    "server-001",
+		InstanceID:        "app_0123456789abcdef01234567",
+		SourceServerID:    "srv_0123456789abcdef01234567",
 		SourceEndpoint:    "127.0.0.1:3306",
 		SourceServerUUID:  "11111111-1111-1111-1111-111111111111",
 		MySQLVersion:      "8.0.36",
@@ -23,7 +25,7 @@ func validBackupManifest() BackupManifest {
 		Consistent:        true,
 		GTIDExecuted:      "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa:1-7",
 		CreatedAt:         time.Date(2026, 7, 27, 0, 0, 0, 0, time.UTC),
-		TaskID:            "task-001",
+		TaskID:            "tsk_0123456789abcdef01234567",
 	}
 }
 
@@ -134,7 +136,6 @@ func TestBackupManifestRejectsNonCanonicalRequiredValues(t *testing.T) {
 		{"mysql version whitespace", func(m *BackupManifest) { m.MySQLVersion = "8.0.36 " }},
 		{"mysql shell version whitespace", func(m *BackupManifest) { m.MySQLShellVersion = " 8.0.36" }},
 		{"task id whitespace", func(m *BackupManifest) { m.TaskID = "task-001 " }},
-		{"endpoint host case alias", func(m *BackupManifest) { m.SourceEndpoint = "LOCALHOST:3306" }},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -181,24 +182,63 @@ func TestBackupManifestRejectsCaseAliasesForGeneratedIDsAndEndpointForms(t *test
 	}
 }
 
+func TestBackupManifestAcceptsCurrentStoreIDsAndCanonicalizesEndpointIdentity(t *testing.T) {
+	// Production break caught: rejecting Store.NewID output or an existing uppercase DNS host would make current MySQL instances impossible to back up or restore.
+	manifest := validBackupManifest()
+	manifest.BackupID = store.NewID("backup")
+	manifest.InstanceID = store.NewID("app")
+	manifest.SourceServerID = store.NewID("srv")
+	manifest.TaskID = store.NewID("tsk")
+	manifest.SourceEndpoint = "DB.EXAMPLE.COM.:3306"
+	normalized, err := NormalizeBackupManifest(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := normalized.SourceEndpoint, "db.example.com:3306"; got != want {
+		t.Fatalf("endpoint = %q, want %q", got, want)
+	}
+	manifest.SourceEndpoint = "[2001:0db8::1]:3306"
+	normalized, err = NormalizeBackupManifest(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := normalized.SourceEndpoint, "[2001:db8::1]:3306"; got != want {
+		t.Fatalf("IPv6 endpoint = %q, want %q", got, want)
+	}
+	for _, field := range []string{"BACKUP_0123456789abcdef01234567", "backup-0123456789abcdef01234567", " backup_0123456789abcdef01234567"} {
+		broken := validBackupManifest()
+		broken.BackupID = field
+		if _, err := NormalizeBackupManifest(broken); err == nil {
+			t.Fatalf("invalid backup ID %q accepted", field)
+		}
+	}
+	for _, endpoint := range []string{"db example.com:3306", "db_.example.com:3306", "-db.example.com:3306", "db..example.com:3306"} {
+		broken := validBackupManifest()
+		broken.SourceEndpoint = endpoint
+		if _, err := NormalizeBackupManifest(broken); err == nil {
+			t.Fatalf("invalid endpoint %q accepted", endpoint)
+		}
+	}
+}
+
 func TestBackupManifestNormalizeRequiresHealthyDeterministicClusterMetadata(t *testing.T) {
 	// Production break caught: accepting an incomplete or unhealthy cluster manifest would allow restore from an unknown source primary/topology.
 	manifest := validBackupManifest()
 	manifest.Topology = "innodb-cluster"
-	manifest.ClusterID = "cluster-001"
-	manifest.SourceServerID = "server-1"
+	manifest.ClusterID = "mysql_cluster_0123456789abcdef01234567"
+	manifest.SourceServerID = "srv_111111111111111111111111"
 	manifest.SourceEndpoint = "10.0.0.1:3306"
 	manifest.Members = []ClusterMemberRef{
-		{InstanceID: "mysql-3", ServerID: "server-3", Endpoint: "10.0.0.3:3306", Role: "SECONDARY", Status: "ONLINE"},
-		{InstanceID: "mysql-1", ServerID: "server-1", Endpoint: "10.0.0.1:3306", Role: "PRIMARY", Status: "ONLINE"},
-		{InstanceID: "mysql-2", ServerID: "server-2", Endpoint: "10.0.0.2:3306", Role: "SECONDARY", Status: "ONLINE"},
+		{InstanceID: "app_333333333333333333333333", ServerID: "srv_333333333333333333333333", Endpoint: "10.0.0.3:3306", Role: "SECONDARY", Status: "ONLINE"},
+		{InstanceID: "app_111111111111111111111111", ServerID: "srv_111111111111111111111111", Endpoint: "10.0.0.1:3306", Role: "PRIMARY", Status: "ONLINE"},
+		{InstanceID: "app_222222222222222222222222", ServerID: "srv_222222222222222222222222", Endpoint: "10.0.0.2:3306", Role: "SECONDARY", Status: "ONLINE"},
 	}
 
 	normalized, err := NormalizeBackupManifest(manifest)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, want := normalized.Members[0].InstanceID, "mysql-1"; got != want {
+	if got, want := normalized.Members[0].InstanceID, "app_111111111111111111111111"; got != want {
 		t.Fatalf("first member = %q, want %q", got, want)
 	}
 	if got, want := normalized.Members[0].Role, "PRIMARY"; got != want {
@@ -207,17 +247,17 @@ func TestBackupManifestNormalizeRequiresHealthyDeterministicClusterMetadata(t *t
 
 	for _, mutate := range []func(*BackupManifest){
 		func(m *BackupManifest) { m.ClusterID = "" },
-		func(m *BackupManifest) { m.Members[0].InstanceID = "mysql-1" },
+		func(m *BackupManifest) { m.Members[0].InstanceID = "app_111111111111111111111111" },
 		func(m *BackupManifest) { m.Members[0].Status = "OFFLINE" },
 		func(m *BackupManifest) { m.Members[1].Role = "SECONDARY" },
 		func(m *BackupManifest) { m.Members = m.Members[:2] },
 		func(m *BackupManifest) {
-			m.Members = append(m.Members, ClusterMemberRef{InstanceID: "mysql-4", ServerID: "server-4", Endpoint: "10.0.0.4:3306", Role: "SECONDARY", Status: "ONLINE"})
+			m.Members = append(m.Members, ClusterMemberRef{InstanceID: "app_444444444444444444444444", ServerID: "srv_444444444444444444444444", Endpoint: "10.0.0.4:3306", Role: "SECONDARY", Status: "ONLINE"})
 		},
 		func(m *BackupManifest) { m.Members[0].Role = "primary " },
 		func(m *BackupManifest) { m.Members[0].Status = "online" },
 		func(m *BackupManifest) { m.Members[1].Role = "ARBITER" },
-		func(m *BackupManifest) { m.Members[0].ServerID = "SERVER-3" },
+		func(m *BackupManifest) { m.Members[0].ServerID = "SRV_333333333333333333333333" },
 		func(m *BackupManifest) { m.Members[0].Endpoint = "10.0.0.3:3306 " },
 	} {
 		broken := manifest
