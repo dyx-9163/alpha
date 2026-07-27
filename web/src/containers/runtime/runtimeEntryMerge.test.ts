@@ -39,6 +39,7 @@ describe('AIFAR Runtime reconcile entries', () => {
     expect(renderedText).toContain('/aifar/apps/admin')
     expect(renderedText).not.toContain('启动/恢复 Pods')
     expect(renderedText).toContain('刷新')
+    expect(renderedText).toContain('aria-label="刷新"')
     expect(renderedText).toContain('刷新指标')
   })
 })

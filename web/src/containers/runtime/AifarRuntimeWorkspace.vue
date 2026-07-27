@@ -27,15 +27,9 @@
           <el-button size="small">{{ t('containers.moreRuntimeActions') }}</el-button>
           <template #dropdown>
             <el-dropdown-menu>
-              <el-dropdown-item command="install" :disabled="Boolean(serviceInstallDisabledReason)">
-                <span :title="serviceInstallDisabledReason || undefined">{{ t('containers.installServices') }}</span>
-              </el-dropdown-item>
-              <el-dropdown-item command="reconcile" :disabled="Boolean(aifarRuntimeActionDisabledReason)">
-                <span :title="aifarRuntimeActionDisabledReason || undefined">{{ t('containers.reconcileRuntime') }}</span>
-              </el-dropdown-item>
-              <el-dropdown-item command="cleanup" :disabled="Boolean(runtimeCleanupDisabledReason)">
-                <span :title="runtimeCleanupDisabledReason || undefined">{{ t('containers.cleanupStaleRuntime') }}</span>
-              </el-dropdown-item>
+              <AifarRuntimeOverflowAction command="install" :label="t('containers.installServices')" :disabled-reason="serviceInstallDisabledReason" />
+              <AifarRuntimeOverflowAction command="reconcile" :label="t('containers.reconcileRuntime')" :disabled-reason="aifarRuntimeActionDisabledReason" />
+              <AifarRuntimeOverflowAction command="cleanup" :label="t('containers.cleanupStaleRuntime')" :disabled-reason="runtimeCleanupDisabledReason" />
             </el-dropdown-menu>
           </template>
         </el-dropdown>
@@ -77,15 +71,15 @@ import StatusTag from '../../components/StatusTag.vue'
 import AifarRuntimeDeploymentsTab from './AifarRuntimeDeploymentsTab.vue'
 import AifarRuntimeIngressTab from './AifarRuntimeIngressTab.vue'
 import AifarRuntimeLogsTab from './AifarRuntimeLogsTab.vue'
+import AifarRuntimeOverflowAction from './AifarRuntimeOverflowAction.vue'
 import AifarRuntimePodsTab from './AifarRuntimePodsTab.vue'
 import AifarRuntimeReleasesTab from './AifarRuntimeReleasesTab.vue'
 import AifarRuntimeServicesTab from './AifarRuntimeServicesTab.vue'
 import AifarRuntimeSummary from './AifarRuntimeSummary.vue'
 import { useAifarRuntimeContext, type RuntimeResourceTab } from './context'
 import { runtimeResourceTabLabels, runtimeResourceTabOrder } from './surface'
+import { dispatchRuntimeOverflowCommand, type RuntimeOverflowCommand } from './runtimeToolbar'
 import './runtime.css'
-
-type RuntimeOverflowCommand = 'install' | 'reconcile' | 'cleanup'
 
 const runtimeResourceTabComponents: Record<RuntimeResourceTab, Component> = {
   deployments: AifarRuntimeDeploymentsTab,
@@ -123,8 +117,10 @@ const {
 } = useAifarRuntimeContext()
 
 function handleRuntimeOverflowCommand(command: RuntimeOverflowCommand) {
-  if (command === 'install') return openServiceInstallDialog()
-  if (command === 'reconcile') return reconcileAifarRuntime()
-  return cleanupAifarRuntimeStale()
+  return dispatchRuntimeOverflowCommand(command, {
+    install: openServiceInstallDialog,
+    reconcile: reconcileAifarRuntime,
+    cleanup: cleanupAifarRuntimeStale
+  })
 }
 </script>

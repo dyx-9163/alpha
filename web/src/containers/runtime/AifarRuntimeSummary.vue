@@ -3,8 +3,8 @@
     <div v-for="item in items" :key="item.key || item.label" class="runtime-summary-item">
       <dt>{{ item.label }}</dt>
       <dd :title="String(item.value ?? '-')">
-        <StatusTag v-if="item.status" :status="item.status" :label="String(item.value ?? '-')" />
-        <span v-else>{{ item.value ?? '-' }}</span>
+        <span class="runtime-summary-value">{{ item.value ?? '-' }}</span>
+        <StatusTag v-if="item.status" :status="item.status" />
       </dd>
     </div>
   </dl>
