@@ -83,6 +83,38 @@ func TestLogicalBackupScriptLinuxPropagatesMySQLShellFailure(t *testing.T) {
 	}
 }
 
+func TestLogicalRestoreScriptLinuxUsesDescriptorBoundInputsAndNoJSResidue(t *testing.T) {
+	// Production break caught: restore reopening controlled files or leaving a pathname-backed JS file would permit a replacement attack between validation and mysqlsh execution.
+	if runtime.GOOS != "linux" {
+		t.Skip("requires Linux /proc/self/fd semantics")
+	}
+	paths := setupLogicalBackupLinux(t)
+	script, err := RenderLogicalRestoreScript(LogicalRestoreScriptOptions{TaskID: "task-001", Threads: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(paths.script, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	result := runLogicalBackupLinux(t, paths, nil)
+	if result.err != nil {
+		t.Fatalf("restore script failed: %v: %s", result.err, result.output)
+	}
+	if !strings.Contains(result.args, "--defaults-file=/proc/self/fd/") || strings.Contains(result.args, "--password") {
+		t.Fatalf("restore mysqlsh argv is unsafe: %q", result.args)
+	}
+	for _, want := range []string{"loadUsers: false", "ignoreExistingObjects: false", "skipBinlog: false", "showProgress: false", "threads: 4"} {
+		if !strings.Contains(result.js, want) {
+			t.Fatalf("restore JS missing %q: %s", want, result.js)
+		}
+	}
+	for _, name := range []string{"logical-backup.js", "logical-restore.js"} {
+		if _, err := os.Lstat(filepath.Join(paths.taskDir, name)); !os.IsNotExist(err) {
+			t.Fatalf("persistent JS residue %q: %v", name, err)
+		}
+	}
+}
+
 type logicalBackupLinuxPaths struct{ root, taskDir, script, args, defaults, js string }
 type logicalBackupLinuxResult struct {
 	args, defaults, js, output string

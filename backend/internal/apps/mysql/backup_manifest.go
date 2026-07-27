@@ -10,8 +10,13 @@ import (
 )
 
 var (
-	strictSchemaName = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]{0,63}$`)
-	secretAssignment = regexp.MustCompile(`(?i)(password|passwd|secret|token|private[ _-]?key|credential)\s*[:=]`)
+	strictSchemaName  = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]{0,63}$`)
+	secretAssignment  = regexp.MustCompile(`(?i)(password|passwd|secret|token|private[ _-]?key|credential)\s*[:=]`)
+	backupIDPattern   = regexp.MustCompile(`^backup-[a-z0-9][a-z0-9_-]{0,127}$`)
+	instanceIDPattern = regexp.MustCompile(`^mysql-[a-z0-9][a-z0-9_-]{0,127}$`)
+	clusterIDPattern  = regexp.MustCompile(`^cluster-[a-z0-9][a-z0-9_-]{0,127}$`)
+	taskIDPattern     = regexp.MustCompile(`^task-[a-z0-9][a-z0-9_-]{0,127}$`)
+	uuidPattern       = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 )
 
 var fixedSystemSchemas = []string{
@@ -32,7 +37,8 @@ func NormalizeBackupManifest(manifest BackupManifest) (BackupManifest, error) {
 		return BackupManifest{}, mysqlOperationError(MySQLBackupUnsupportedTopology)
 	}
 	if !manifest.Consistent || manifest.CreatedAt.IsZero() ||
-		!canonicalRequired(manifest.BackupID, manifest.InstanceID, manifest.SourceServerUUID, manifest.MySQLVersion, manifest.MySQLShellVersion, manifest.TaskID) ||
+		!backupIDPattern.MatchString(manifest.BackupID) || !instanceIDPattern.MatchString(manifest.InstanceID) || !uuidPattern.MatchString(manifest.SourceServerUUID) || !taskIDPattern.MatchString(manifest.TaskID) ||
+		!canonicalRequired(manifest.MySQLVersion, manifest.MySQLShellVersion) ||
 		!canonicalIdentity(manifest.SourceServerID) ||
 		!validEndpoint(manifest.SourceEndpoint) {
 		return BackupManifest{}, mysqlOperationError(MySQLRestoreManifestInvalid)
@@ -57,7 +63,7 @@ func NormalizeBackupManifest(manifest BackupManifest) (BackupManifest, error) {
 			return BackupManifest{}, mysqlOperationError(MySQLRestoreManifestInvalid)
 		}
 	case "innodb-cluster":
-		if !canonicalRequired(manifest.ClusterID) {
+		if !clusterIDPattern.MatchString(manifest.ClusterID) {
 			return BackupManifest{}, mysqlOperationError(MySQLRestoreManifestInvalid)
 		}
 		members, err := normalizeClusterMembers(manifest.Members, manifest.SourceServerID, manifest.SourceEndpoint)
@@ -245,7 +251,7 @@ func validEndpoint(endpoint string) bool {
 		return false
 	}
 	parsedPort, err := strconv.Atoi(port)
-	return err == nil && parsedPort > 0 && parsedPort <= 65535
+	return err == nil && parsedPort > 0 && parsedPort <= 65535 && port == strconv.Itoa(parsedPort)
 }
 
 func containsSecretShape(value any) bool {

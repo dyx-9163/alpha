@@ -152,6 +152,35 @@ func TestBackupManifestRejectsNonCanonicalRequiredValues(t *testing.T) {
 	}
 }
 
+func TestBackupManifestRejectsCaseAliasesForGeneratedIDsAndEndpointForms(t *testing.T) {
+	// Production break caught: accepting an uppercase or alternate generated ID/endpoint representation would split one backup identity across manifest records.
+	cases := []func(*BackupManifest){
+		func(m *BackupManifest) { m.BackupID = "BACKUP-001" },
+		func(m *BackupManifest) { m.InstanceID = "MYSQL-001" },
+		func(m *BackupManifest) { m.SourceServerUUID = "AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA" },
+		func(m *BackupManifest) { m.TaskID = "TASK-001" },
+		func(m *BackupManifest) { m.SourceEndpoint = "127.0.0.1:03306" },
+	}
+	for _, mutate := range cases {
+		manifest := validBackupManifest()
+		mutate(&manifest)
+		if _, err := NormalizeBackupManifest(manifest); err == nil {
+			t.Fatal("noncanonical generated identity unexpectedly accepted")
+		}
+	}
+	cluster := validBackupManifest()
+	cluster.Topology, cluster.ClusterID = "innodb-cluster", "CLUSTER-001"
+	cluster.SourceServerID, cluster.SourceEndpoint = "server-1", "10.0.0.1:3306"
+	cluster.Members = []ClusterMemberRef{
+		{InstanceID: "mysql-1", ServerID: "server-1", Endpoint: "10.0.0.1:3306", Role: "PRIMARY", Status: "ONLINE"},
+		{InstanceID: "mysql-2", ServerID: "server-2", Endpoint: "10.0.0.2:3306", Role: "SECONDARY", Status: "ONLINE"},
+		{InstanceID: "mysql-3", ServerID: "server-3", Endpoint: "10.0.0.3:3306", Role: "SECONDARY", Status: "ONLINE"},
+	}
+	if _, err := NormalizeBackupManifest(cluster); err == nil {
+		t.Fatal("uppercase cluster ID unexpectedly accepted")
+	}
+}
+
 func TestBackupManifestNormalizeRequiresHealthyDeterministicClusterMetadata(t *testing.T) {
 	// Production break caught: accepting an incomplete or unhealthy cluster manifest would allow restore from an unknown source primary/topology.
 	manifest := validBackupManifest()

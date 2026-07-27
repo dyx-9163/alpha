@@ -32,8 +32,8 @@ var inspectSQLTemplate string
 
 type logicalScriptTemplateData struct {
 	MySQLShell  string
-	WorkDir     string
-	DumpDir     string
+	BackupRoot  string
+	TaskID      string
 	Threads     int
 	MaxRateMBps int
 }
@@ -44,8 +44,8 @@ func RenderLogicalBackupScript(options LogicalBackupScriptOptions) (string, erro
 	}
 	return renderLogicalScript("logical-backup.sh", "mysql-logical-backup", logicalBackupScriptTemplate, logicalScriptTemplateData{
 		MySQLShell:  path.Join(mysqlInstallRoot, "mysql-shell", "bin", "mysqlsh"),
-		WorkDir:     mysqlBackupWorkDir(options.TaskID),
-		DumpDir:     path.Join(mysqlBackupWorkDir(options.TaskID), "dump"),
+		BackupRoot:  mysqlBackupWorkRoot,
+		TaskID:      options.TaskID,
 		Threads:     options.Threads,
 		MaxRateMBps: options.MaxRateMBps,
 	})
@@ -55,11 +55,10 @@ func RenderLogicalRestoreScript(options LogicalRestoreScriptOptions) (string, er
 	if !validLogicalTaskID(options.TaskID) || !validLogicalThreads(options.Threads) {
 		return "", fmt.Errorf("invalid controlled logical restore script options")
 	}
-	workDir := mysqlBackupWorkDir(options.TaskID)
 	return renderLogicalScript("logical-restore.sh", "mysql-logical-restore", logicalRestoreScriptTemplate, logicalScriptTemplateData{
 		MySQLShell: path.Join(mysqlInstallRoot, "mysql-shell", "bin", "mysqlsh"),
-		WorkDir:    workDir,
-		DumpDir:    path.Join(workDir, "dump"),
+		BackupRoot: mysqlBackupWorkRoot,
+		TaskID:     options.TaskID,
 		Threads:    options.Threads,
 	})
 }
