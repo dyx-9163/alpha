@@ -1926,11 +1926,13 @@ type autoscaleOutScriptData struct {
 }
 
 type scaleServiceScriptData struct {
-	InstallRoot    string
-	ServiceOrder   string
-	ServiceName    string
-	Replicas       int
-	IngressNetwork string
+	InstallRoot     string
+	ServiceOrder    string
+	ServiceName     string
+	Replicas        int
+	IngressNetwork  string
+	TaskID          string
+	DesiredReplicas string
 }
 
 func renderInstallScript(data installScriptData) (string, error) {

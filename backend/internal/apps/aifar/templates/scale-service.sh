@@ -6,10 +6,24 @@ SERVICE_ORDER={{ quote .ServiceOrder }}
 SERVICE_NAME={{ quote .ServiceName }}
 REPLICAS={{ .Replicas }}
 INGRESS_NETWORK={{ quote .IngressNetwork }}
+TASK_ID={{ quote .TaskID }}
+CONTROL_PLANE_DESIRED_REPLICAS={{ quote .DesiredReplicas }}
 
 RUNTIME_DIR="$INSTALL_ROOT/runtime"
 ENV_DIR="$RUNTIME_DIR/env"
 LOG_DIR="$RUNTIME_DIR/logs"
+AGENT_DIR="$RUNTIME_DIR/agent"
+TASK_TOKEN="$(printf "%s" "${TASK_ID:-manual}" | tr -c 'A-Za-z0-9._-' '_')"
+CANONICAL_ENV="$ENV_DIR/compose.env"
+CANONICAL_SPEC="$AGENT_DIR/runtime-spec.json"
+STAGED_ENV="$CANONICAL_ENV.$TASK_TOKEN.staged"
+STAGED_SPEC="$CANONICAL_SPEC.$TASK_TOKEN.staged"
+ROLLBACK_ENV="$CANONICAL_ENV.$TASK_TOKEN.rollback"
+ROLLBACK_SPEC="$CANONICAL_SPEC.$TASK_TOKEN.rollback"
+COMPOSE_ENV="$STAGED_ENV"
+PROMOTING=0
+COMMITTED=0
+HAD_SPEC=0
 
 fail() {
   echo "ERROR: $*" >&2
@@ -85,7 +99,7 @@ service_port() {
   [ -n "$value" ] && { printf "%s" "$value"; return; }
   var="$(service_port_var "$service")"
   [ -n "$var" ] || fail "unsupported service port: $1"
-  read_env_value "$ENV_DIR/compose.env" "$var" ""
+  read_env_value "$COMPOSE_ENV" "$var" ""
 }
 
 resource_file_for_service() {
@@ -100,17 +114,9 @@ resource_value() {
   read_env_value "$file" "$key" "$fallback"
 }
 
-current_replicas_for_service() {
-  docker ps -a --filter "label=aifar.app=aifar" \
-    --filter "label=aifar.install-root=$INSTALL_ROOT" \
-    --filter "label=aifar.component=pod" \
-    --filter "label=aifar.service=$1" \
-    --format '{{ "{{" }}.Names{{ "}}" }}' 2>/dev/null | wc -l | tr -d ' '
-}
-
-desired_replicas_from_env() {
+desired_replicas_from_control_plane() {
   wanted="$1"
-  for pair in $(read_env_value "$ENV_DIR/compose.env" AIFAR_DESIRED_REPLICAS ""); do
+  for pair in $CONTROL_PLANE_DESIRED_REPLICAS; do
     case "$pair" in
       "$wanted="*) printf "%s" "${pair#*=}"; return 0 ;;
     esac
@@ -124,27 +130,10 @@ desired_replicas_for_service() {
     printf "%s" "$REPLICAS"
     return
   fi
-  value=""
-  if value="$(desired_replicas_from_env "$service")"; then
-    case "$value" in ""|*[!0-9]*) value=1 ;; esac
-    [ "$value" -ge 0 ] || value=0
-  fi
-  if [ "$value" = "0" ]; then
-    printf "0"
-    return
-  fi
-  replicas="$(current_replicas_for_service "$service")"
-  case "$replicas" in ""|*[!0-9]*) replicas=1 ;; esac
-  [ "$replicas" -ge 0 ] || replicas=0
-  if [ "$replicas" -gt 0 ]; then
-    printf "%s" "$replicas"
-    return
-  fi
-  if [ -n "$value" ]; then
-    printf "%s" "$value"
-  else
-    printf "1"
-  fi
+  value="$(desired_replicas_from_control_plane "$service" || true)"
+  case "$value" in ""|*[!0-9]*) value=1 ;; esac
+  [ "$value" -ge 0 ] || value=0
+  printf "%s" "$value"
 }
 
 write_desired_replicas_env() {
@@ -160,11 +149,11 @@ write_desired_replicas_env() {
       pairs="$pairs $service=$replicas"
     fi
   done
-  set_env AIFAR_DESIRED_REPLICAS "$pairs" "$ENV_DIR/compose.env"
+  set_env AIFAR_DESIRED_REPLICAS "$pairs" "$COMPOSE_ENV"
 }
 
 nacos_ephemeral() {
-  value="$(read_env_value "$ENV_DIR/compose.env" AIFAR_NACOS_EPHEMERAL true)"
+  value="$(read_env_value "$COMPOSE_ENV" AIFAR_NACOS_EPHEMERAL true)"
   case "$(printf "%s" "$value" | tr '[:upper:]' '[:lower:]')" in
     false|0|no|off) printf "false" ;;
     *) printf "true" ;;
@@ -174,28 +163,28 @@ nacos_ephemeral() {
 health_cmd_for_service() {
   service="$1"
   port="$(service_port "$service")"
-  protocol="$(read_env_value "$ENV_DIR/compose.env" APP_HEALTH_PROTOCOL http)"
-  host="$(read_env_value "$ENV_DIR/compose.env" APP_HEALTH_HOST 127.0.0.1)"
-  timeout="$(read_env_value "$ENV_DIR/compose.env" APP_HEALTH_CONNECT_TIMEOUT 3)"
+  protocol="$(read_env_value "$COMPOSE_ENV" APP_HEALTH_PROTOCOL http)"
+  host="$(read_env_value "$COMPOSE_ENV" APP_HEALTH_HOST 127.0.0.1)"
+  timeout="$(read_env_value "$COMPOSE_ENV" APP_HEALTH_CONNECT_TIMEOUT 3)"
   if [ "$service" = "web-vue3" ]; then
-    path="$(read_env_value "$ENV_DIR/compose.env" APP_WEB_HEALTH_PATH "/")"
+    path="$(read_env_value "$COMPOSE_ENV" APP_WEB_HEALTH_PATH "/")"
     printf "wget -q -T %s -O /dev/null %s://%s:%s%s || exit 1" "$timeout" "$protocol" "$host" "$port" "$path"
   else
     path="$(read_env_value "$ENV_DIR/$service.env" HEALTH_PATH "")"
-    [ -n "$path" ] || path="$(read_env_value "$ENV_DIR/compose.env" APP_BACKEND_HEALTH_PATH "/actuator/health/readiness")"
+    [ -n "$path" ] || path="$(read_env_value "$COMPOSE_ENV" APP_BACKEND_HEALTH_PATH "/actuator/health/readiness")"
     [ -n "$path" ] || path="/actuator/health/readiness"
     printf "curl -fsS --connect-timeout %s %s://%s:%s%s >/dev/null || exit 1" "$timeout" "$protocol" "$host" "$port" "$path"
   fi
 }
 
 write_runtime_spec() {
-  spec="$INSTALL_ROOT/runtime/agent/runtime-spec.json"
-  gateway_port="$(read_env_value "$ENV_DIR/compose.env" GATEWAY_PORT 38000)"
-  web_port="$(read_env_value "$ENV_DIR/compose.env" WEB_VUE3_PORT 8080)"
+  spec="$STAGED_SPEC"
+  gateway_port="$(read_env_value "$COMPOSE_ENV" GATEWAY_PORT 38000)"
+  web_port="$(read_env_value "$COMPOSE_ENV" WEB_VUE3_PORT 8080)"
   nacos_ns="$(read_env_value "$ENV_DIR/java-common.env" NACOS_NS prod)"
-  tz_value="$(read_env_value "$ENV_DIR/compose.env" TZ system)"
-  [ -n "$INGRESS_NETWORK" ] || INGRESS_NETWORK="$(read_env_value "$ENV_DIR/compose.env" AIFAR_NETWORK aifar-network)"
-  mkdir -p "$INSTALL_ROOT/runtime/agent"
+  tz_value="$(read_env_value "$COMPOSE_ENV" TZ system)"
+  [ -n "$INGRESS_NETWORK" ] || INGRESS_NETWORK="$(read_env_value "$COMPOSE_ENV" AIFAR_NETWORK aifar-network)"
+  mkdir -p "$AGENT_DIR"
   cat > "$spec" <<JSON
 {
   "version": "runtime-v2",
@@ -209,14 +198,14 @@ JSON
     service_env="$ENV_DIR/$service.env"
     [ -f "$service_env" ] || continue
     image="$(read_env_value "$service_env" APP_IMAGE "aifar-$service:latest")"
-    revision="$(read_env_value "$service_env" AIFAR_REVISION "$(read_env_value "$ENV_DIR/compose.env" AIFAR_REVISION current)")"
+    revision="$(read_env_value "$service_env" AIFAR_REVISION "$(read_env_value "$COMPOSE_ENV" AIFAR_REVISION current)")"
     replicas="$(desired_replicas_for_service "$service")"
     case "$replicas" in ""|*[!0-9]*) replicas=1 ;; esac
     [ "$replicas" -ge 0 ] || replicas=0
     port="$(service_port "$service")"
     health_cmd="$(health_cmd_for_service "$service")"
-    cpus="$(resource_value "$service" APP_CPUS "$(read_env_value "$ENV_DIR/compose.env" APP_CPUS "")")"
-    memory="$(resource_value "$service" APP_MEMORY_LIMIT "$(read_env_value "$ENV_DIR/compose.env" APP_MEMORY_LIMIT "")")"
+    cpus="$(resource_value "$service" APP_CPUS "$(read_env_value "$COMPOSE_ENV" APP_CPUS "")")"
+    memory="$(resource_value "$service" APP_MEMORY_LIMIT "$(read_env_value "$COMPOSE_ENV" APP_MEMORY_LIMIT "")")"
     deployment_name="$(alpha_service_name "$service")"
     log_dir="$LOG_DIR/$service"
     mkdir -p "$log_dir"
@@ -246,10 +235,10 @@ JSON
     printf '      "resources": {"cpus":"%s","memory":"%s"},\n' "$(json_escape "$cpus")" "$(json_escape "$memory")" >> "$spec"
     printf '      "healthCheck": {"command":"%s","interval":"%s","timeout":"%s","retries":%s,"startPeriod":"%s"}\n' \
       "$(json_escape "$health_cmd")" \
-      "$(json_escape "$(read_env_value "$ENV_DIR/compose.env" APP_HEALTH_INTERVAL 15s)")" \
-      "$(json_escape "$(read_env_value "$ENV_DIR/compose.env" APP_HEALTH_TIMEOUT 5s)")" \
-      "$(read_env_value "$ENV_DIR/compose.env" APP_HEALTH_RETRIES 3)" \
-      "$(json_escape "$(read_env_value "$ENV_DIR/compose.env" APP_HEALTH_START_PERIOD 30s)")" >> "$spec"
+      "$(json_escape "$(read_env_value "$COMPOSE_ENV" APP_HEALTH_INTERVAL 15s)")" \
+      "$(json_escape "$(read_env_value "$COMPOSE_ENV" APP_HEALTH_TIMEOUT 5s)")" \
+      "$(read_env_value "$COMPOSE_ENV" APP_HEALTH_RETRIES 3)" \
+      "$(json_escape "$(read_env_value "$COMPOSE_ENV" APP_HEALTH_START_PERIOD 30s)")" >> "$spec"
     printf '    }' >> "$spec"
   done
   cat >> "$spec" <<JSON
@@ -258,7 +247,8 @@ JSON
 JSON
   first_service=1
   for service in $SERVICE_ORDER; do
-    [ -f "$ENV_DIR/$service.env" ] || continue
+    service_env="$ENV_DIR/$service.env"
+    [ -f "$service_env" ] || continue
     port="$(service_port "$service")"
     app_name="$(alpha_service_name "$service")"
     if [ "$first_service" = "1" ]; then
@@ -296,8 +286,36 @@ docker info >/dev/null 2>&1 || fail "docker daemon is not available"
 command -v aifar-agent >/dev/null 2>&1 || fail "aifar-agent is required"
 [ -d "$ENV_DIR" ] || fail "AIFAR runtime env directory is missing"
 [ -f "$ENV_DIR/$SERVICE_NAME.env" ] || fail "AIFAR service env is missing: $SERVICE_NAME"
+[ -f "$CANONICAL_ENV" ] || fail "AIFAR runtime compose env is missing"
+
+cleanup() {
+  rc=$?
+  trap - EXIT HUP INT TERM
+  if [ "$PROMOTING" = "1" ] && [ "$COMMITTED" != "1" ]; then
+    cp "$ROLLBACK_ENV" "$CANONICAL_ENV" 2>/dev/null || true
+    if [ "$HAD_SPEC" = "1" ]; then
+      cp "$ROLLBACK_SPEC" "$CANONICAL_SPEC" 2>/dev/null || true
+    else
+      rm -f "$CANONICAL_SPEC"
+    fi
+  fi
+  rm -f "$STAGED_ENV" "$STAGED_ENV.tmp" "$STAGED_SPEC" "$ROLLBACK_ENV" "$ROLLBACK_SPEC"
+  exit "$rc"
+}
+trap cleanup EXIT HUP INT TERM
+
+cp "$CANONICAL_ENV" "$STAGED_ENV"
+cp "$CANONICAL_ENV" "$ROLLBACK_ENV"
+if [ -f "$CANONICAL_SPEC" ]; then
+  cp "$CANONICAL_SPEC" "$ROLLBACK_SPEC"
+  HAD_SPEC=1
+fi
 
 write_desired_replicas_env
 spec="$(write_runtime_spec)"
 aifar-agent reconcile-runtime --spec "$spec"
+PROMOTING=1
+mv "$STAGED_ENV" "$CANONICAL_ENV"
+mv "$STAGED_SPEC" "$CANONICAL_SPEC"
+COMMITTED=1
 echo "AIFAR service $SERVICE_NAME desired replicas set to $REPLICAS"

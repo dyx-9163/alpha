@@ -49,6 +49,15 @@ type autoscaleMetric struct {
 type autoscaleStatus struct {
 	Endpoints               []autoscaleMetric
 	HostMemoryAvailableByte int64
+	Deployments             map[string]autoscaleDeploymentStatus
+}
+
+type autoscaleDeploymentStatus struct {
+	ServiceName     string `json:"serviceName"`
+	DesiredReplicas int    `json:"desiredReplicas"`
+	CurrentReplicas int    `json:"currentReplicas"`
+	ReadyReplicas   int    `json:"readyReplicas"`
+	Status          string `json:"status"`
 }
 
 type autoscaleSignal struct {
@@ -401,6 +410,28 @@ func parseAutoscaleStatus(output string) autoscaleStatus {
 			})
 		case "hostMemoryAvailableBytes":
 			status.HostMemoryAvailableByte = int64(atoiDefault(value, 0))
+		case "agentStatus":
+			var payload struct {
+				Instances []struct {
+					DeploymentStatus []autoscaleDeploymentStatus `json:"deploymentStatus"`
+				} `json:"instances"`
+			}
+			if json.Unmarshal([]byte(value), &payload) != nil {
+				continue
+			}
+			if status.Deployments == nil {
+				status.Deployments = map[string]autoscaleDeploymentStatus{}
+			}
+			for _, instance := range payload.Instances {
+				for _, deployment := range instance.DeploymentStatus {
+					service := cleanAIFARServiceName(deployment.ServiceName)
+					if service == "" {
+						continue
+					}
+					deployment.ServiceName = service
+					status.Deployments[service] = deployment
+				}
+			}
 		}
 	}
 	return status
@@ -460,6 +491,10 @@ if command -v docker >/dev/null 2>&1 && [ -d "$ENV_DIR" ]; then
       printf "endpoint=%s|%s|%s|%s|%s|%s|%s|%s|%s\n" "$service" "$name" "$release" "$replica" "$port" "$running" "$health" "$mem" "$limit"
     done
   done
+fi
+if command -v aifar-agent >/dev/null 2>&1; then
+  agent_status="$(aifar-agent status 2>/dev/null | tr -d '\r\n' || true)"
+  [ -z "$agent_status" ] || printf "agentStatus=%s\n" "$agent_status"
 fi
 available="$(awk '/MemAvailable/ {print $2 * 1024}' /proc/meminfo 2>/dev/null | cut -d. -f1)"
 [ -n "$available" ] || available=0

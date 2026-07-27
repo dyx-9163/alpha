@@ -11,6 +11,8 @@ import (
 	"aifar-deployment/backend/internal/store"
 )
 
+const runtimeControlPlaneRepairCode = "AIFAR_RUNTIME_CONTROL_PLANE_REPAIR_REQUIRED"
+
 func (s Service) ScaleService(ctx context.Context, req ScaleRequest, log Logger, targetLog targetLogger) error {
 	service := strings.TrimSpace(req.ServiceName)
 	if service == "" || !isAIFARService(service) {
@@ -42,6 +44,14 @@ func (s Service) ScaleService(ctx context.Context, req ScaleRequest, log Logger,
 	var revision string
 	var script string
 	var status autoscaleStatus
+	remoteCommitted := false
+	commitCtx := ctx
+	var cancelCommit context.CancelFunc
+	defer func() {
+		if cancelCommit != nil {
+			cancelCommit()
+		}
+	}()
 	now := time.Now().UTC()
 
 	if err := step(1, func() error {
@@ -69,11 +79,13 @@ func (s Service) ScaleService(ctx context.Context, req ScaleRequest, log Logger,
 	if err := step(2, func() error {
 		var renderErr error
 		script, renderErr = renderScaleServiceScript(scaleServiceScriptData{
-			InstallRoot:    installRoot,
-			ServiceOrder:   strings.Join(servicesFromMetadata(metadata), " "),
-			ServiceName:    service,
-			Replicas:       req.Replicas,
-			IngressNetwork: stringFromMetadata(metadata, "ingressNetwork", stringFromMetadata(metadata, "networkName", defaultNetworkName)),
+			InstallRoot:     installRoot,
+			ServiceOrder:    strings.Join(servicesFromMetadata(metadata), " "),
+			ServiceName:     service,
+			Replicas:        req.Replicas,
+			IngressNetwork:  stringFromMetadata(metadata, "ingressNetwork", stringFromMetadata(metadata, "networkName", defaultNetworkName)),
+			TaskID:          fallbackTaskID(req.TaskID, log),
+			DesiredReplicas: replicaAssignments(desiredReplicasFromMetadata(metadata)),
 		})
 		return renderErr
 	}); err != nil {
@@ -86,23 +98,43 @@ func (s Service) ScaleService(ctx context.Context, req ScaleRequest, log Logger,
 		if err := s.ensureRuntimeAgent(ctx, req.Server, workDir, req.Language, logForServer); err != nil {
 			return err
 		}
+		if boundary, ok := logForServer.(interface{ TryEnterCommit() bool }); ok && !boundary.TryEnterCommit() {
+			return context.Canceled
+		}
+		commitCtx, cancelCommit = context.WithTimeout(context.WithoutCancel(ctx), 10*time.Minute)
 		if strings.TrimSpace(req.Reason) != "" {
 			logForServer.Info("scaling AIFAR service %s to %d replicas: %s", service, req.Replicas, req.Reason)
 		} else {
 			logForServer.Info("scaling AIFAR service %s to %d replicas", service, req.Replicas)
 		}
-		_, runErr := installerkit.Run(ctx, s.remote, req.Server, "sh -s <<'AIFAR_SCALE_SERVICE'\n"+script+"\nAIFAR_SCALE_SERVICE", logForServer, "AIFAR service scale failed")
-		return runErr
+		_, runErr := installerkit.Run(commitCtx, s.remote, req.Server, "sh -s <<'AIFAR_SCALE_SERVICE'\n"+script+"\nAIFAR_SCALE_SERVICE", logForServer, "AIFAR service scale failed")
+		if runErr == nil {
+			remoteCommitted = true
+			return nil
+		}
+		readback, readbackErr := collectAutoscaleStatus(commitCtx, s.remote, req.Server, installRoot)
+		if readbackErr != nil || !scaleCommitObserved(readback, service, req.Replicas) {
+			return runErr
+		}
+		if _, finalizeErr := installerkit.Run(commitCtx, s.remote, req.Server, scaleServiceFinalizeCommand(installRoot, fallbackTaskID(req.TaskID, log)), logForServer, "AIFAR service scale finalize failed"); finalizeErr != nil {
+			return fmt.Errorf("%s: %w", runtimeControlPlaneRepairCode, finalizeErr)
+		}
+		status = readback
+		remoteCommitted = true
+		logForServer.Info("AIFAR service %s commit confirmed from agent state after remote response loss", service)
+		return nil
 	}); err != nil {
 		finishTarget(recorder, target, "failed", err.Error())
 		return err
 	}
 
 	if err := step(4, func() error {
-		var collectErr error
-		status, collectErr = collectAutoscaleStatus(ctx, s.remote, req.Server, installRoot)
-		if collectErr != nil {
-			return collectErr
+		if status.Deployments == nil {
+			var collectErr error
+			status, collectErr = collectAutoscaleStatus(commitCtx, s.remote, req.Server, installRoot)
+			if collectErr != nil {
+				return collectErr
+			}
 		}
 		saved, err := s.store.GetAppInstance(current.ID)
 		if err != nil {
@@ -128,12 +160,48 @@ func (s Service) ScaleService(ctx context.Context, req ScaleRequest, log Logger,
 		return nil
 	}); err != nil {
 		finishTarget(recorder, target, "failed", err.Error())
+		if remoteCommitted && !strings.HasPrefix(err.Error(), runtimeControlPlaneRepairCode+":") {
+			return fmt.Errorf("%s: %w", runtimeControlPlaneRepairCode, err)
+		}
 		return err
 	}
 
 	logForServer.Info("AIFAR service %s desired replicas set to %d", service, req.Replicas)
 	finishTarget(recorder, target, "success", "")
 	return nil
+}
+
+func scaleCommitObserved(status autoscaleStatus, service string, replicas int) bool {
+	deployment, ok := status.Deployments[cleanAIFARServiceName(service)]
+	if !ok {
+		return false
+	}
+	if replicas < 0 {
+		replicas = 0
+	}
+	return deployment.DesiredReplicas == replicas && deployment.CurrentReplicas == replicas && deployment.ReadyReplicas == replicas
+}
+
+func scaleServiceFinalizeCommand(installRoot, taskID string) string {
+	return "sh -s <<'AIFAR_SCALE_FINALIZE'\n" + `#!/usr/bin/env sh
+set -eu
+INSTALL_ROOT=` + installerkit.ShellQuote(installRoot) + `
+TASK_ID=` + installerkit.ShellQuote(taskID) + `
+TASK_TOKEN="$(printf "%s" "${TASK_ID:-manual}" | tr -c 'A-Za-z0-9._-' '_')"
+CANONICAL_ENV="$INSTALL_ROOT/runtime/env/compose.env"
+CANONICAL_SPEC="$INSTALL_ROOT/runtime/agent/runtime-spec.json"
+STAGED_ENV="$CANONICAL_ENV.$TASK_TOKEN.staged"
+STAGED_SPEC="$CANONICAL_SPEC.$TASK_TOKEN.staged"
+echo AIFAR_SCALE_FINALIZE
+if [ -f "$STAGED_ENV" ] && [ -f "$STAGED_SPEC" ]; then
+  mv "$STAGED_ENV" "$CANONICAL_ENV"
+  mv "$STAGED_SPEC" "$CANONICAL_SPEC"
+elif [ -f "$STAGED_ENV" ] || [ -f "$STAGED_SPEC" ]; then
+  echo "incomplete AIFAR scale staging files" >&2
+  exit 1
+fi
+rm -f "$CANONICAL_ENV.$TASK_TOKEN.rollback" "$CANONICAL_SPEC.$TASK_TOKEN.rollback"
+` + "\nAIFAR_SCALE_FINALIZE"
 }
 
 func metadataAfterServiceScale(metadata map[string]any, status autoscaleStatus, service string, replicas int, now time.Time) map[string]any {
@@ -144,14 +212,6 @@ func metadataAfterServiceScale(metadata map[string]any, status autoscaleStatus, 
 	}
 	desired[service] = replicas
 	activeEndpoints := activeEndpointsFromMetrics(status.Endpoints)
-	for svc, endpoints := range activeEndpoints {
-		if svc == service {
-			continue
-		}
-		if count := endpointCount(endpoints); count > 0 {
-			desired[svc] = count
-		}
-	}
 	if replicas == 0 {
 		delete(activeEndpoints, service)
 	}

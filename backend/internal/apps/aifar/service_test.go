@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"slices"
@@ -36,6 +37,8 @@ type fakeStore struct {
 	replicaSets []store.AIFARReplicaSet
 	pods        []store.AIFARPod
 	endpoints   []store.AIFARServiceEndpoint
+	saveCalls   int
+	failSaveOn  int
 }
 
 type resourceFakeStore struct {
@@ -88,6 +91,10 @@ func (f *fakeStore) GetTask(id string) (store.Task, []store.TaskLog, error) {
 func (f *fakeStore) SaveAppInstance(v store.AppInstance) (store.AppInstance, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.saveCalls++
+	if f.failSaveOn > 0 && f.saveCalls == f.failSaveOn {
+		return store.AppInstance{}, errors.New("control-plane save failed")
+	}
 	now := time.Now()
 	if v.ID == "" {
 		v.ID = store.NewID("app")
@@ -479,6 +486,9 @@ type fakeRemote struct {
 	autoscaleStatusStdouts  []string
 	autoscaleStatusFallback string
 	failCommandContains     string
+	scaleServiceErr         error
+	scaleServiceRuns        int
+	scaleFinalizeScript     string
 }
 
 func (f *fakeRemote) Run(ctx context.Context, server store.Server, command string) (adapter.CommandResult, error) {
@@ -488,6 +498,16 @@ func (f *fakeRemote) Run(ctx context.Context, server store.Server, command strin
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.commands = append(f.commands, command)
+	if strings.Contains(command, "AIFAR_SCALE_SERVICE") {
+		f.scaleServiceScript = command
+		f.scaleServiceRuns++
+		if f.scaleServiceErr != nil {
+			return adapter.CommandResult{}, f.scaleServiceErr
+		}
+	}
+	if strings.Contains(command, "AIFAR_SCALE_FINALIZE") {
+		f.scaleFinalizeScript = command
+	}
 	if f.failCommandContains != "" && strings.Contains(command, f.failCommandContains) {
 		return adapter.CommandResult{}, errors.New("remote install failed")
 	}
@@ -513,9 +533,6 @@ func (f *fakeRemote) Run(ctx context.Context, server store.Server, command strin
 	}
 	if strings.Contains(command, "AIFAR_SERVICE_INSTALL") {
 		f.serviceInstallScript = command
-	}
-	if strings.Contains(command, "AIFAR_SCALE_SERVICE") {
-		f.scaleServiceScript = command
 	}
 	if strings.Contains(command, "AIFAR_RUNTIME_RECONCILE") {
 		f.runtimeReconcileScript = command
@@ -583,6 +600,10 @@ type fakeLogger struct{}
 
 func (fakeLogger) Info(format string, args ...any)  {}
 func (fakeLogger) Error(format string, args ...any) {}
+
+type rejectingCommitLogger struct{ fakeLogger }
+
+func (rejectingCommitLogger) TryEnterCommit() bool { return false }
 
 type recordingStepLogger struct {
 	mu           sync.Mutex
@@ -997,12 +1018,16 @@ func TestScaleServiceCanOfflineDeploymentAndClearEndpoints(t *testing.T) {
 		t.Fatalf("expected scale-service script to set permission replicas to 0, got:\n%s", remote.scaleServiceScript)
 	}
 	for _, want := range []string{
-		`current_replicas_for_service "$service"`,
-		`if [ "$value" = "0" ]; then`,
+		`CONTROL_PLANE_DESIRED_REPLICAS=`,
+		`desired_replicas_from_control_plane`,
+		`STAGED_SPEC=`,
 	} {
 		if !strings.Contains(remote.scaleServiceScript, want) {
-			t.Fatalf("expected scale-service script to normalize non-target desired replicas with %q, got:\n%s", want, remote.scaleServiceScript)
+			t.Fatalf("expected scale-service script to preserve transactional desired replicas with %q, got:\n%s", want, remote.scaleServiceScript)
 		}
+	}
+	if strings.Contains(remote.scaleServiceScript, `current_replicas_for_service`) {
+		t.Fatalf("scale-service script must not infer desired state from current containers:\n%s", remote.scaleServiceScript)
 	}
 	saved, err := s.GetAppInstance(instance.ID)
 	if err != nil {
@@ -1030,6 +1055,326 @@ func TestScaleServiceCanOfflineDeploymentAndClearEndpoints(t *testing.T) {
 	for _, endpoint := range s.endpoints {
 		if endpoint.ServiceName == "permission" {
 			t.Fatalf("expected permission endpoint rows to be removed, got %+v", s.endpoints)
+		}
+	}
+}
+
+func TestScaleServicePreservesAllNonTargetDesiredReplicas(t *testing.T) {
+	withFakeRuntimeAgentBinary(t)
+	instance := installedAIFARInstance(t)
+	metadata := metadataFromInstance(instance)
+	desired := desiredReplicasFromMetadata(metadata)
+	desired["file"] = 0
+	desired["permission"] = 3
+	metadata["desiredReplicas"] = desired
+	instance.Metadata = mustMetadata(t, metadata)
+	s := &fakeStore{
+		servers:   map[string]store.Server{"srv-1": {ID: "srv-1", Host: "10.0.0.10", DeployDir: "/aifar/apps"}},
+		instances: []store.AppInstance{instance},
+	}
+	remote := &fakeRemote{autoscaleStatusStdouts: []string{
+		"endpoint=permission|aifar-permission-rel|rel|1|38010|true|healthy|10|2147483648\nendpoint=gateway|aifar-gateway-rel|rel|1|38000|true|healthy|10|2147483648\nhostMemoryAvailableBytes=8589934592\n",
+	}}
+	service := NewService(s, remote)
+	if err := service.ScaleService(context.Background(), ScaleRequest{
+		Instance: instance, Server: s.servers["srv-1"], Actor: "operator", TaskID: "task-preserve",
+		ServiceName: "oauth", Replicas: 0, Reason: "preserve non-target desired state",
+	}, fakeLogger{}, nil); err != nil {
+		t.Fatal(err)
+	}
+	saved, err := s.GetAppInstance(instance.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := desiredReplicasFromMetadata(metadataFromInstance(saved))
+	if got["file"] != 0 || got["permission"] != 3 || got["oauth"] != 0 {
+		t.Fatalf("non-target desired replicas changed: got=%+v metadata=%s", got, saved.Metadata)
+	}
+}
+
+func TestScaleServiceDoesNotRunWhenCommitIsCancelled(t *testing.T) {
+	withFakeRuntimeAgentBinary(t)
+	instance := installedAIFARInstance(t)
+	s := &fakeStore{
+		servers:   map[string]store.Server{"srv-1": {ID: "srv-1", Host: "10.0.0.10", DeployDir: "/aifar/apps"}},
+		instances: []store.AppInstance{instance},
+	}
+	remote := &fakeRemote{}
+	service := NewService(s, remote)
+	err := service.ScaleService(context.Background(), ScaleRequest{
+		Instance: instance, Server: s.servers["srv-1"], Actor: "operator", TaskID: "task-cancelled",
+		ServiceName: "permission", Replicas: 0, Reason: "cancel before commit",
+	}, rejectingCommitLogger{}, nil)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected cancellation before remote commit, got %v", err)
+	}
+	if remote.scaleServiceScript != "" {
+		t.Fatalf("scale script ran after commit rejection:\n%s", remote.scaleServiceScript)
+	}
+}
+
+func TestScaleServiceScriptStagesCanonicalFiles(t *testing.T) {
+	fixture := newScaleServiceShellFixture(t)
+	if err := fixture.run(0); err != nil {
+		t.Fatal(err)
+	}
+	fixture.assertCanonicalWasUnchangedDuringAgent(t)
+	envData, err := os.ReadFile(fixture.canonicalEnv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(envData), "AIFAR_DESIRED_REPLICAS=permission=0 file=0") {
+		t.Fatalf("expected promoted desired replicas, got %s", envData)
+	}
+	specData, err := os.ReadFile(fixture.canonicalSpec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(specData), `"serviceName": "permission"`) || !strings.Contains(string(specData), `"replicas": 0`) {
+		t.Fatalf("expected promoted offline spec, got %s", specData)
+	}
+	fixture.assertNoStagedFiles(t)
+}
+
+func TestScaleServiceScriptFailureLeavesCanonicalFilesUntouched(t *testing.T) {
+	fixture := newScaleServiceShellFixture(t)
+	if err := fixture.run(23); err == nil {
+		t.Fatal("expected fake agent failure")
+	}
+	fixture.assertCanonicalWasUnchangedDuringAgent(t)
+	fixture.assertCanonicalFiles(t)
+	fixture.assertNoStagedFiles(t)
+}
+
+func TestParseAutoscaleStatusIncludesAgentDesiredReplicas(t *testing.T) {
+	status := parseAutoscaleStatus("agentStatus={\"instances\":[{\"instanceId\":\"admin\",\"deploymentStatus\":[{\"serviceName\":\"permission\",\"desiredReplicas\":0,\"currentReplicas\":0,\"readyReplicas\":0,\"status\":\"offline\"}]}]}\n")
+	got, ok := status.Deployments["permission"]
+	if !ok || got.DesiredReplicas != 0 || got.CurrentReplicas != 0 || got.ReadyReplicas != 0 || got.Status != "offline" {
+		t.Fatalf("unexpected parsed agent deployment status: %+v", status.Deployments)
+	}
+}
+
+func TestScaleServiceRecoversCommittedResultAfterSSHDisconnect(t *testing.T) {
+	withFakeRuntimeAgentBinary(t)
+	instance := installedAIFARInstance(t)
+	s := &fakeStore{servers: map[string]store.Server{"srv-1": {ID: "srv-1", Host: "10.0.0.10", DeployDir: "/aifar/apps"}}, instances: []store.AppInstance{instance}}
+	agentStatus := "agentStatus={\"instances\":[{\"instanceId\":\"admin\",\"deploymentStatus\":[{\"serviceName\":\"permission\",\"desiredReplicas\":0,\"currentReplicas\":0,\"readyReplicas\":0,\"status\":\"offline\"}]}]}\nhostMemoryAvailableBytes=8589934592\n"
+	remote := &fakeRemote{scaleServiceErr: errors.New("ssh connection reset"), autoscaleStatusFallback: agentStatus}
+	service := NewService(s, remote)
+	err := service.ScaleService(context.Background(), ScaleRequest{
+		Instance: instance, Server: s.servers["srv-1"], Actor: "operator", TaskID: "task-disconnect-committed",
+		ServiceName: "permission", Replicas: 0, Reason: "test ambiguous commit",
+	}, fakeLogger{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if remote.scaleFinalizeScript == "" {
+		t.Fatal("expected staged mirrors to be finalized after authoritative readback")
+	}
+	saved, err := s.GetAppInstance(instance.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := desiredReplicasFromMetadata(metadataFromInstance(saved))["permission"]; got != 0 {
+		t.Fatalf("expected committed offline state to be recorded, got %d metadata=%s", got, saved.Metadata)
+	}
+}
+
+func TestScaleServiceRejectsUncommittedResultAfterSSHDisconnect(t *testing.T) {
+	withFakeRuntimeAgentBinary(t)
+	instance := installedAIFARInstance(t)
+	s := &fakeStore{servers: map[string]store.Server{"srv-1": {ID: "srv-1", Host: "10.0.0.10", DeployDir: "/aifar/apps"}}, instances: []store.AppInstance{instance}}
+	agentStatus := "agentStatus={\"instances\":[{\"instanceId\":\"admin\",\"deploymentStatus\":[{\"serviceName\":\"permission\",\"desiredReplicas\":1,\"currentReplicas\":1,\"readyReplicas\":1,\"status\":\"ready\"}]}]}\nhostMemoryAvailableBytes=8589934592\n"
+	remote := &fakeRemote{scaleServiceErr: errors.New("ssh connection reset"), autoscaleStatusFallback: agentStatus}
+	service := NewService(s, remote)
+	err := service.ScaleService(context.Background(), ScaleRequest{
+		Instance: instance, Server: s.servers["srv-1"], Actor: "operator", TaskID: "task-disconnect-old",
+		ServiceName: "permission", Replicas: 0, Reason: "test ambiguous failure",
+	}, fakeLogger{}, nil)
+	if err == nil || !strings.Contains(err.Error(), "ssh connection reset") {
+		t.Fatalf("expected original SSH failure when agent did not commit, got %v", err)
+	}
+	if remote.scaleFinalizeScript != "" {
+		t.Fatalf("must not finalize uncommitted staged mirrors:\n%s", remote.scaleFinalizeScript)
+	}
+	saved, err := s.GetAppInstance(instance.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := desiredReplicasFromMetadata(metadataFromInstance(saved))["permission"]; got != 1 {
+		t.Fatalf("control plane changed after uncommitted failure: got=%d metadata=%s", got, saved.Metadata)
+	}
+}
+
+func TestScaleServiceMarksControlPlaneRepairWithoutCompensation(t *testing.T) {
+	withFakeRuntimeAgentBinary(t)
+	instance := installedAIFARInstance(t)
+	s := &fakeStore{
+		servers:    map[string]store.Server{"srv-1": {ID: "srv-1", Host: "10.0.0.10", DeployDir: "/aifar/apps"}},
+		instances:  []store.AppInstance{instance},
+		failSaveOn: 2,
+	}
+	agentStatus := "agentStatus={\"instances\":[{\"instanceId\":\"admin\",\"deploymentStatus\":[{\"serviceName\":\"permission\",\"desiredReplicas\":0,\"currentReplicas\":0,\"readyReplicas\":0,\"status\":\"offline\"}]}]}\nhostMemoryAvailableBytes=8589934592\n"
+	remote := &fakeRemote{autoscaleStatusFallback: agentStatus}
+	service := NewService(s, remote)
+	err := service.ScaleService(context.Background(), ScaleRequest{
+		Instance: instance, Server: s.servers["srv-1"], Actor: "operator", TaskID: "task-control-plane-fail",
+		ServiceName: "permission", Replicas: 0, Reason: "test control-plane repair marker",
+	}, fakeLogger{}, nil)
+	if err == nil || !strings.HasPrefix(err.Error(), "AIFAR_RUNTIME_CONTROL_PLANE_REPAIR_REQUIRED:") {
+		t.Fatalf("expected stable control-plane repair marker, got %v", err)
+	}
+	if remote.runtimeRestartScript != "" || remote.scaleServiceRuns != 1 {
+		t.Fatalf("control-plane failure must not compensate remotely: scaleRuns=%d restartScript=%q", remote.scaleServiceRuns, remote.runtimeRestartScript)
+	}
+}
+
+type scaleServiceShellFixture struct {
+	t              *testing.T
+	bash           string
+	rootNative     string
+	canonicalEnv   string
+	canonicalSpec  string
+	observedEnv    string
+	observedSpec   string
+	originalEnv    []byte
+	originalSpec   []byte
+	renderedScript string
+	fakeBinNative  string
+}
+
+func newScaleServiceShellFixture(t *testing.T) scaleServiceShellFixture {
+	t.Helper()
+	bash := findRuntimeDiagnosticBash(t)
+	rootNative := t.TempDir()
+	envDir := filepath.Join(rootNative, "runtime", "env")
+	agentDir := filepath.Join(rootNative, "runtime", "agent")
+	logDir := filepath.Join(rootNative, "runtime", "logs")
+	fakeBin := filepath.Join(rootNative, "fake-bin")
+	for _, dir := range []string{envDir, agentDir, logDir, fakeBin} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	originalEnv := []byte(strings.Join([]string{
+		"AIFAR_DESIRED_REPLICAS=file=0 permission=3",
+		"AIFAR_NETWORK=aifar-network",
+		"PERMISSION_PORT=38010",
+		"FILE_PORT=38005",
+		"GATEWAY_PORT=38000",
+		"WEB_VUE3_PORT=8080",
+		"TZ=UTC",
+	}, "\n") + "\n")
+	originalSpec := []byte("{\"version\":\"old\",\"instanceId\":\"admin\"}\n")
+	canonicalEnv := filepath.Join(envDir, "compose.env")
+	canonicalSpec := filepath.Join(agentDir, "runtime-spec.json")
+	if err := os.WriteFile(canonicalEnv, originalEnv, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(canonicalSpec, originalSpec, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(envDir, "java-common.env"), []byte("NACOS_NS=prod\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, service := range []string{"permission", "file"} {
+		content := fmt.Sprintf("APP_IMAGE=aifar-%s:rev-1\nAIFAR_REVISION=rev-1\nAIFAR_SERVICE_PORT=%d\n", service, serviceDefaultPort(service, defaultGatewayPort, defaultWebPort))
+		if err := os.WriteFile(filepath.Join(envDir, service+".env"), []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	dockerScript := "#!/usr/bin/env sh\nexit 0\n"
+	if err := os.WriteFile(filepath.Join(fakeBin, "docker"), []byte(dockerScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	agentScript := `#!/usr/bin/env sh
+cp "$AIFAR_CANONICAL_ENV" "$AIFAR_OBSERVED_ENV"
+cp "$AIFAR_CANONICAL_SPEC" "$AIFAR_OBSERVED_SPEC"
+exit "$AIFAR_AGENT_EXIT"
+`
+	if err := os.WriteFile(filepath.Join(fakeBin, "aifar-agent"), []byte(agentScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	rendered, err := renderScaleServiceScript(scaleServiceScriptData{
+		InstallRoot:     runtimeDiagnosticShellPath(rootNative),
+		ServiceOrder:    "permission file",
+		ServiceName:     "permission",
+		Replicas:        0,
+		IngressNetwork:  "aifar-network",
+		TaskID:          "task-script-fixture",
+		DesiredReplicas: "file=0 permission=3",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return scaleServiceShellFixture{
+		t:              t,
+		bash:           bash,
+		rootNative:     rootNative,
+		canonicalEnv:   canonicalEnv,
+		canonicalSpec:  canonicalSpec,
+		observedEnv:    filepath.Join(rootNative, "observed-compose.env"),
+		observedSpec:   filepath.Join(rootNative, "observed-runtime-spec.json"),
+		originalEnv:    originalEnv,
+		originalSpec:   originalSpec,
+		renderedScript: rendered,
+		fakeBinNative:  fakeBin,
+	}
+}
+
+func (f scaleServiceShellFixture) run(agentExit int) error {
+	cmd := exec.Command(f.bash, "-s")
+	cmd.Stdin = strings.NewReader(f.renderedScript)
+	cmd.Env = append(os.Environ(),
+		"PATH="+runtimeDiagnosticShellPath(f.fakeBinNative)+":/usr/bin:/bin",
+		"AIFAR_AGENT_EXIT="+fmt.Sprint(agentExit),
+		"AIFAR_CANONICAL_ENV="+runtimeDiagnosticShellPath(f.canonicalEnv),
+		"AIFAR_CANONICAL_SPEC="+runtimeDiagnosticShellPath(f.canonicalSpec),
+		"AIFAR_OBSERVED_ENV="+runtimeDiagnosticShellPath(f.observedEnv),
+		"AIFAR_OBSERVED_SPEC="+runtimeDiagnosticShellPath(f.observedSpec),
+	)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("scale script failed: %w: %s", err, strings.TrimSpace(string(output)))
+	}
+	return nil
+}
+
+func (f scaleServiceShellFixture) assertCanonicalWasUnchangedDuringAgent(t *testing.T) {
+	t.Helper()
+	for path, want := range map[string][]byte{f.observedEnv: f.originalEnv, f.observedSpec: f.originalSpec} {
+		got, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !slices.Equal(got, want) {
+			t.Fatalf("canonical file changed before agent commit: path=%s got=%s want=%s", path, got, want)
+		}
+	}
+}
+
+func (f scaleServiceShellFixture) assertCanonicalFiles(t *testing.T) {
+	t.Helper()
+	for path, want := range map[string][]byte{f.canonicalEnv: f.originalEnv, f.canonicalSpec: f.originalSpec} {
+		got, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !slices.Equal(got, want) {
+			t.Fatalf("canonical file changed after failed agent commit: path=%s got=%s want=%s", path, got, want)
+		}
+	}
+}
+
+func (f scaleServiceShellFixture) assertNoStagedFiles(t *testing.T) {
+	t.Helper()
+	for _, pattern := range []string{f.canonicalEnv + ".*.staged", f.canonicalSpec + ".*.staged"} {
+		matches, err := filepath.Glob(pattern)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(matches) != 0 {
+			t.Fatalf("staged files were not cleaned: %v", matches)
 		}
 	}
 }
