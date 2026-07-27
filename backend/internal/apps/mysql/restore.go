@@ -395,7 +395,7 @@ func (s Service) restoreStandalone(ctx context.Context, req registry.RestoreRequ
 		return err
 	}
 	if err := progress.step(16, func() error {
-		result, err := s.remote.Run(ctx, server, finalRestoreVerificationCommand(probeWork, instancePort(instance), manifest.Verification))
+		result, err := s.remote.Run(ctx, server, finalRestoreVerificationCommand(probeWork, instancePort(instance)))
 		if err != nil || !matchesFinalRestoreVerification(result.Stdout, manifest.Verification) {
 			return localizedMySQLOperationError(req.Language, MySQLRestoreIncomplete)
 		}
@@ -647,18 +647,11 @@ func verifyRestoreDataCommand(work string, port int, schemas []string) string {
 	return localInfileSQLCommand(work, port, query)
 }
 
-func finalRestoreVerificationCommand(work string, port int, verification *BackupVerification) string {
+func finalRestoreVerificationCommand(work string, port int) string {
 	statements := []string{
 		"SELECT '__AIFAR_VERIFY_PING__',1 /*__AIFAR_VERIFY_FINAL__*/",
 		"SELECT '__AIFAR_VERIFY_SCHEMA__',s.schema_name,(SELECT COUNT(*) FROM information_schema.tables t WHERE t.table_schema=s.schema_name AND t.table_type='BASE TABLE') FROM information_schema.schemata s WHERE s.schema_name NOT IN ('information_schema','mysql','mysql_innodb_cluster_metadata','performance_schema','sys') ORDER BY s.schema_name",
 		"SELECT '__AIFAR_VERIFY_TABLE__',table_schema,table_name FROM information_schema.tables WHERE table_type='BASE TABLE' AND table_schema NOT IN ('information_schema','mysql','mysql_innodb_cluster_metadata','performance_schema','sys') ORDER BY table_schema,table_name",
-	}
-	if verification != nil {
-		for _, sample := range verification.Samples {
-			if strictSchemaName.MatchString(sample.Schema) && strictSchemaName.MatchString(sample.Table) {
-				statements = append(statements, "SELECT '__AIFAR_VERIFY_SAMPLE__','"+sample.Schema+"','"+sample.Table+"',COUNT(*) FROM `"+sample.Schema+"`.`"+sample.Table+"`")
-			}
-		}
 	}
 	return localInfileSQLCommand(work, port, strings.Join(statements, "; "))
 }
@@ -670,7 +663,6 @@ func matchesFinalRestoreVerification(output string, expected *BackupVerification
 	ping := 0
 	schemaCounts := map[string]int{}
 	tables := make([]string, 0, expected.TableCount)
-	samples := map[string]int64{}
 	for _, line := range strings.Split(output, "\n") {
 		if strings.TrimSpace(line) == "" {
 			continue
@@ -690,21 +682,11 @@ func matchesFinalRestoreVerification(output string, expected *BackupVerification
 			schemaCounts[fields[1]] = count
 		case len(fields) == 3 && fields[0] == "__AIFAR_VERIFY_TABLE__" && strictSchemaName.MatchString(fields[1]) && strictSchemaName.MatchString(fields[2]):
 			tables = append(tables, fields[1]+"\x00"+fields[2])
-		case len(fields) == 4 && fields[0] == "__AIFAR_VERIFY_SAMPLE__" && strictSchemaName.MatchString(fields[1]) && strictSchemaName.MatchString(fields[2]):
-			count, err := strconv.ParseInt(fields[3], 10, 64)
-			key := fields[1] + "\x00" + fields[2]
-			if err != nil || count < 0 {
-				return false
-			}
-			if _, duplicate := samples[key]; duplicate {
-				return false
-			}
-			samples[key] = count
 		default:
 			return false
 		}
 	}
-	if ping != 1 || len(schemaCounts) != expected.SchemaCount || len(tables) != expected.TableCount || len(samples) != len(expected.Samples) {
+	if ping != 1 || len(schemaCounts) != expected.SchemaCount || len(tables) != expected.TableCount {
 		return false
 	}
 	wantTables := make([]string, 0, expected.TableCount)
@@ -720,11 +702,6 @@ func matchesFinalRestoreVerification(output string, expected *BackupVerification
 	sort.Strings(wantTables)
 	if strings.Join(tables, "\n") != strings.Join(wantTables, "\n") {
 		return false
-	}
-	for _, sample := range expected.Samples {
-		if samples[sample.Schema+"\x00"+sample.Table] != sample.RowsWritten {
-			return false
-		}
 	}
 	return true
 }

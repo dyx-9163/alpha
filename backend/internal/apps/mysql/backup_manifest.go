@@ -142,7 +142,6 @@ func ValidateRestoreCompatibility(manifest BackupManifest, backupType, targetTop
 
 func normalizeBackupVerification(value *BackupVerification, manifestSchemas []string) (*BackupVerification, error) {
 	if value == nil || value.Source != "mysql-shell-dump" || value.InventoryAlgorithm != "sha256-nul-records-v1" ||
-		value.SamplingAlgorithm != "primary-key-lexicographic-first-3-v1" || value.SampleLimitPerSchema != 3 ||
 		!lowerSHA256Pattern.MatchString(value.InventorySHA256) || value.SchemaCount < 0 || value.TableCount < 0 {
 		return nil, mysqlOperationError(MySQLRestoreManifestInvalid)
 	}
@@ -168,7 +167,6 @@ func normalizeBackupVerification(value *BackupVerification, manifestSchemas []st
 		return nil, mysqlOperationError(MySQLRestoreManifestInvalid)
 	}
 	result.Schemas = append([]BackupSchemaVerification(nil), value.Schemas...)
-	expectedSamples := make([]BackupTableSample, 0)
 	totalTables := 0
 	for schemaIndex := range result.Schemas {
 		schema := &result.Schemas[schemaIndex]
@@ -180,26 +178,17 @@ func normalizeBackupVerification(value *BackupVerification, manifestSchemas []st
 		}
 		totalTables += schema.TableCount
 		schema.Tables = append([]BackupTableVerification(nil), schema.Tables...)
-		eligible := make([]BackupTableSample, 0, schema.TableCount)
 		previousTable := ""
 		for tableIndex, table := range schema.Tables {
-			if !strictSchemaName.MatchString(table.Name) || table.RowsWritten < 0 || (tableIndex > 0 && strings.Compare(previousTable, table.Name) >= 0) {
+			if !strictSchemaName.MatchString(table.Name) || (tableIndex > 0 && strings.Compare(previousTable, table.Name) >= 0) {
 				return nil, mysqlOperationError(MySQLRestoreManifestInvalid)
-			}
-			if table.PrimaryKey {
-				eligible = append(eligible, BackupTableSample{Schema: schema.Name, Table: table.Name, RowsWritten: table.RowsWritten})
 			}
 			previousTable = table.Name
 		}
-		if len(eligible) > 3 {
-			eligible = eligible[:3]
-		}
-		expectedSamples = append(expectedSamples, eligible...)
 	}
-	if totalTables != result.TableCount || !equalBackupSamples(result.Samples, expectedSamples) {
+	if totalTables != result.TableCount {
 		return nil, mysqlOperationError(MySQLRestoreManifestInvalid)
 	}
-	result.Samples = append([]BackupTableSample(nil), expectedSamples...)
 	return &result, nil
 }
 
@@ -215,18 +204,6 @@ func writeInventoryRecord(target hash.Hash, entry BackupInventoryEntry) {
 	_, _ = target.Write([]byte{0})
 	_, _ = target.Write([]byte(entry.Path))
 	_, _ = target.Write([]byte{0})
-}
-
-func equalBackupSamples(left, right []BackupTableSample) bool {
-	if len(left) != len(right) {
-		return false
-	}
-	for index := range left {
-		if left[index] != right[index] {
-			return false
-		}
-	}
-	return true
 }
 
 func normalizeBusinessSchemas(schemas []string) ([]string, error) {

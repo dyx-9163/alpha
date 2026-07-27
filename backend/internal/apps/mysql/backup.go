@@ -684,55 +684,138 @@ func parseDumpVerification(output string, schemas []string) (*BackupVerification
 }
 
 const dumpVerificationHelper = `
-import hashlib, json, os, pathlib, sys
+import hashlib, json, pathlib, re, sys
 root = pathlib.Path(sys.argv[1]) / "dump"
-done = root / "@.done.json"
-if root.is_symlink() or not root.is_dir() or done.is_symlink() or not done.is_file(): raise SystemExit(1)
-with done.open("r", encoding="utf-8") as stream: completion = json.load(stream)
-if not isinstance(completion, dict): raise SystemExit(1)
+max_uint64 = 18446744073709551615
+name_pattern = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
+system_schemas = {"information_schema", "mysql", "mysql_innodb_cluster_metadata", "performance_schema", "sys"}
+def reject(): raise SystemExit(1)
+def unique_object(pairs):
+  value = {}
+  for key, item in pairs:
+    if key in value: reject()
+    value[key] = item
+  return value
+def load_object(path):
+  if path.is_symlink() or not path.is_file(): reject()
+  try:
+    text = path.read_text(encoding="utf-8")
+    start = len(text) - len(text.lstrip())
+    value, end = json.JSONDecoder(object_pairs_hook=unique_object).raw_decode(text, start)
+    if text[end:].strip() or type(value) is not dict: reject()
+    return value
+  except SystemExit: raise
+  except Exception: reject()
+def uint64(value):
+  if type(value) is not int or value < 0 or value > max_uint64: reject()
+  return value
+def safe_relative(value):
+  if type(value) is not str or not value or "\\" in value or "\0" in value or value.startswith("/"): reject()
+  parts = value.split("/")
+  if any(part in ("", ".", "..") for part in parts): reject()
+  try: value.encode("utf-8")
+  except Exception: reject()
+  return value
+def safe_basename(value):
+  safe_relative(value)
+  if "/" in value: reject()
+  return value
+def name_list(value):
+  if type(value) is not list or any(type(item) is not str or not name_pattern.fullmatch(item) for item in value): reject()
+  folded = [item.casefold() for item in value]
+  if len(set(folded)) != len(folded): reject()
+  return value
+def basename_map(value, expected):
+  if type(value) is not dict or set(value) != set(expected): reject()
+  basenames = []
+  for key in expected:
+    if type(key) is not str: reject()
+    basenames.append(safe_basename(value[key]))
+  if len(set(basenames)) != len(basenames): reject()
+  return value
+if root.is_symlink() or not root.is_dir(): reject()
 inventory = []
-table_records = {}
+inventory_paths = set()
 for item in sorted(root.rglob("*"), key=lambda value: value.relative_to(root).as_posix().encode("utf-8")):
   if item.is_symlink() or not item.is_file():
     if item.is_dir() and not item.is_symlink(): continue
-    raise SystemExit(1)
-  relative = item.relative_to(root).as_posix()
+    reject()
+  relative = safe_relative(item.relative_to(root).as_posix())
+  if relative in inventory_paths: reject()
+  inventory_paths.add(relative)
   digest = hashlib.sha256()
   size = 0
   with item.open("rb") as stream:
     for block in iter(lambda: stream.read(1024 * 1024), b""):
       size += len(block); digest.update(block)
   inventory.append({"path": relative, "size": size, "sha256": digest.hexdigest()})
-  if relative.endswith(".json") and not relative.startswith("@"):
-    try:
-      with item.open("r", encoding="utf-8") as stream: metadata = json.load(stream)
-    except Exception: raise SystemExit(1)
-    if not isinstance(metadata, dict): continue
-    schema = metadata.get("schema") or metadata.get("schemaName")
-    table = metadata.get("table") or metadata.get("tableName")
-    rows = metadata.get("rowsWritten")
-    primary = metadata.get("primaryIndex")
-    if schema is None or table is None or rows is None: continue
-    key = (schema, table)
-    record = (rows, bool(primary))
-    if key in table_records and table_records[key] != record: raise SystemExit(1)
-    table_records[key] = record
-if not inventory or not table_records: raise SystemExit(1)
+if not inventory: reject()
+completion = load_object(root / "@.done.json")
+if type(completion.get("end")) is not str or not completion["end"].strip(): reject()
+uint64(completion.get("dataBytes"))
+table_bytes = completion.get("tableDataBytes")
+chunk_bytes = completion.get("chunkFileBytes")
+if type(table_bytes) is not dict or type(chunk_bytes) is not dict: reject()
+for schema_name, table_values in table_bytes.items():
+  if type(schema_name) is not str or type(table_values) is not dict: reject()
+  for table_name, size in table_values.items():
+    if type(table_name) is not str: reject()
+    uint64(size)
+for filename, size in chunk_bytes.items():
+  safe_relative(filename); uint64(size)
+top = load_object(root / "@.json")
+if top.get("version") != "2.0.1" or top.get("origin") != "dumpInstance" or top.get("consistent") is not True: reject()
+schema_names = name_list(top.get("schemas"))
+if not schema_names or any(name.casefold() in system_schemas for name in schema_names): reject()
+schema_basenames = basename_map(top.get("basenames"), schema_names)
+catalog = set()
+metadata_paths = set()
+schemas = []
+def claim_metadata(relative):
+  safe_relative(relative)
+  if relative in metadata_paths or relative not in inventory_paths: reject()
+  metadata_paths.add(relative)
+for schema_name in sorted(schema_names, key=lambda value: value.encode("utf-8")):
+  schema_relative = schema_basenames[schema_name] + ".json"
+  claim_metadata(schema_relative)
+  schema_metadata = load_object(root / schema_relative)
+  if schema_metadata.get("schema") != schema_name or schema_metadata.get("includesDdl") is not True or schema_metadata.get("includesViewsDdl") is not True or schema_metadata.get("includesData") is not True: reject()
+  tables = name_list(schema_metadata.get("tables"))
+  views = name_list(schema_metadata.get("views"))
+  if {item.casefold() for item in tables} & {item.casefold() for item in views}: reject()
+  object_names = tables + views
+  object_basenames = basename_map(schema_metadata.get("basenames"), object_names)
+  table_output = []
+  for table_name in sorted(tables, key=lambda value: value.encode("utf-8")):
+    table_relative = object_basenames[table_name] + ".json"
+    claim_metadata(table_relative)
+    table_metadata = load_object(root / table_relative)
+    options = table_metadata.get("options")
+    if type(options) is not dict or options.get("schema") != schema_name or options.get("table") != table_name: reject()
+    if type(options.get("columns")) is not list or any(type(column) is not str for column in options["columns"]): reject()
+    if type(table_metadata.get("primaryIndex")) is not list or any(type(column) is not str for column in table_metadata["primaryIndex"]): reject()
+    if table_metadata.get("includesData") is not True or table_metadata.get("includesDdl") is not True or table_metadata.get("extension") != "tsv.zst" or table_metadata.get("compression") != "zstd": reject()
+    key = (schema_name, table_name)
+    if key in catalog: reject()
+    catalog.add(key)
+    table_output.append({"name": table_name})
+  schemas.append({"name": schema_name, "tableCount": len(table_output), "tables": table_output})
+actual_metadata = {path for path in inventory_paths if path.endswith(".json") and not path.startswith("@")}
+if actual_metadata != metadata_paths: reject()
+declared_tables = set()
+for schema_name, table_values in table_bytes.items():
+  if schema_name not in schema_names: reject()
+  for table_name in table_values:
+    key = (schema_name, table_name)
+    if key not in catalog or key in declared_tables: reject()
+    declared_tables.add(key)
+if declared_tables != catalog: reject()
+data_paths = {path for path in inventory_paths if path.endswith(".tsv.zst")}
+if set(chunk_bytes) != data_paths: reject()
 inventory_hash = hashlib.sha256()
 for item in inventory:
   inventory_hash.update(item["sha256"].encode("ascii") + b"\0" + str(item["size"]).encode("ascii") + b"\0" + item["path"].encode("utf-8") + b"\0")
-schemas = []
-samples = []
-for schema_name in sorted({key[0] for key in table_records}, key=lambda value: value.encode("utf-8")):
-  tables = []
-  for schema, table in sorted((key for key in table_records if key[0] == schema_name), key=lambda value: value[1].encode("utf-8")):
-    rows, primary = table_records[(schema, table)]
-    if not isinstance(rows, int) or isinstance(rows, bool) or rows < 0: raise SystemExit(1)
-    tables.append({"name": table, "rowsWritten": rows, "hasPrimaryKey": primary})
-  eligible = [item for item in tables if item["hasPrimaryKey"]][:3]
-  samples.extend({"schema": schema_name, "table": item["name"], "rowsWritten": item["rowsWritten"]} for item in eligible)
-  schemas.append({"name": schema_name, "tableCount": len(tables), "tables": tables})
-verification = {"source":"mysql-shell-dump","inventoryAlgorithm":"sha256-nul-records-v1","inventorySha256":inventory_hash.hexdigest(),"files":inventory,"schemaCount":len(schemas),"tableCount":sum(item["tableCount"] for item in schemas),"schemas":schemas,"samplingAlgorithm":"primary-key-lexicographic-first-3-v1","sampleLimitPerSchema":3,"sampledTables":samples}
+verification = {"source":"mysql-shell-dump","inventoryAlgorithm":"sha256-nul-records-v1","inventorySha256":inventory_hash.hexdigest(),"files":inventory,"schemaCount":len(schemas),"tableCount":sum(item["tableCount"] for item in schemas),"schemas":schemas}
 print("__AIFAR_VERIFICATION__" + json.dumps(verification, separators=(",", ":"), ensure_ascii=False))
 `
 

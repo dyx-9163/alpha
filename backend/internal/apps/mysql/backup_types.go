@@ -57,16 +57,13 @@ type BackupManifest struct {
 }
 
 type BackupVerification struct {
-	Source               string                     `json:"source"`
-	InventoryAlgorithm   string                     `json:"inventoryAlgorithm"`
-	InventorySHA256      string                     `json:"inventorySha256"`
-	Inventory            []BackupInventoryEntry     `json:"files"`
-	SchemaCount          int                        `json:"schemaCount"`
-	TableCount           int                        `json:"tableCount"`
-	Schemas              []BackupSchemaVerification `json:"schemas"`
-	SamplingAlgorithm    string                     `json:"samplingAlgorithm"`
-	SampleLimitPerSchema int                        `json:"sampleLimitPerSchema"`
-	Samples              []BackupTableSample        `json:"sampledTables"`
+	Source             string                     `json:"source"`
+	InventoryAlgorithm string                     `json:"inventoryAlgorithm"`
+	InventorySHA256    string                     `json:"inventorySha256"`
+	Inventory          []BackupInventoryEntry     `json:"files"`
+	SchemaCount        int                        `json:"schemaCount"`
+	TableCount         int                        `json:"tableCount"`
+	Schemas            []BackupSchemaVerification `json:"schemas"`
 }
 
 type BackupInventoryEntry struct {
@@ -82,15 +79,7 @@ type BackupSchemaVerification struct {
 }
 
 type BackupTableVerification struct {
-	Name        string `json:"name"`
-	RowsWritten int64  `json:"rowsWritten"`
-	PrimaryKey  bool   `json:"hasPrimaryKey"`
-}
-
-type BackupTableSample struct {
-	Schema      string `json:"schema"`
-	Table       string `json:"table"`
-	RowsWritten int64  `json:"rowsWritten"`
+	Name string `json:"name"`
 }
 
 // ClusterMemberRef contains only the public cluster member data required to

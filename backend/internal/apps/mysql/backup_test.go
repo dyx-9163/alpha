@@ -931,7 +931,7 @@ func newBackupFakeRemote() *backupFakeRemote {
 	return &backupFakeRemote{
 		archive: archive, archiveSHA: sum, downloadSHA: sum, sourceAvailable: 1 << 40,
 		inspectOutput:      "__AIFAR_INFO__\t8.0.36\t123e4567-e89b-12d3-a456-426614174000\tuuid:1-9\t8.0.36\t1048576\n__AIFAR_SCHEMA__\taifar_business\n",
-		verificationOutput: `__AIFAR_VERIFICATION__{"source":"mysql-shell-dump","inventoryAlgorithm":"sha256-nul-records-v1","inventorySha256":"75033abd15ea32598b2c7f68d7059c0f5f79992ec65529c4a057c57d27be33fc","files":[{"path":"@.done.json","size":2,"sha256":"44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"}],"schemaCount":1,"tableCount":1,"schemas":[{"name":"aifar_business","tableCount":1,"tables":[{"name":"orders","rowsWritten":7,"hasPrimaryKey":true}]}],"samplingAlgorithm":"primary-key-lexicographic-first-3-v1","sampleLimitPerSchema":3,"sampledTables":[{"schema":"aifar_business","table":"orders","rowsWritten":7}]}`,
+		verificationOutput: `__AIFAR_VERIFICATION__{"source":"mysql-shell-dump","inventoryAlgorithm":"sha256-nul-records-v1","inventorySha256":"75033abd15ea32598b2c7f68d7059c0f5f79992ec65529c4a057c57d27be33fc","files":[{"path":"@.done.json","size":2,"sha256":"44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"}],"schemaCount":1,"tableCount":1,"schemas":[{"name":"aifar_business","tableCount":1,"tables":[{"name":"orders"}]}]}`,
 	}
 }
 
@@ -988,16 +988,16 @@ func TestStandaloneBackupEmitsManifestV2FromCompletedDumpMetadata(t *testing.T) 
 	if err := json.Unmarshal(manifestBytes, &manifest); err != nil {
 		t.Fatal(err)
 	}
-	if manifest.ManifestVersion != 2 || manifest.Verification == nil || manifest.Verification.Source != "mysql-shell-dump" || manifest.Verification.Samples[0].RowsWritten != 7 {
+	if manifest.ManifestVersion != 2 || manifest.Verification == nil || manifest.Verification.Source != "mysql-shell-dump" || manifest.Verification.Schemas[0].Tables[0].Name != "orders" {
 		t.Fatalf("manifest v2 = %+v", manifest)
 	}
 	text := string(manifestBytes)
-	for _, field := range []string{`"files":`, `"hasPrimaryKey":`, `"sampledTables":`} {
+	for _, field := range []string{`"files":`, `"schemaCount":`, `"tableCount":`} {
 		if !strings.Contains(text, field) {
 			t.Fatalf("manifest missing canonical v2 field %s: %s", field, text)
 		}
 	}
-	for _, legacy := range []string{`"inventory":`, `"primaryKey":`, `"samples":`} {
+	for _, legacy := range []string{`"inventory":`, `"rowsWritten":`, `"hasPrimaryKey":`, `"samplingAlgorithm":`, `"sampleLimitPerSchema":`, `"sampledTables":`, `"samples":`} {
 		if strings.Contains(text, legacy) {
 			t.Fatalf("manifest emitted non-contract field %s: %s", legacy, text)
 		}

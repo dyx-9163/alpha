@@ -171,10 +171,16 @@ func finalRestoreVerificationLiteral() string {
 		"__AIFAR_VERIFY_TABLE__\taifar_business\tbeta",
 		"__AIFAR_VERIFY_TABLE__\taifar_business\tdelta",
 		"__AIFAR_VERIFY_TABLE__\taifar_business\tgamma",
-		"__AIFAR_VERIFY_SAMPLE__\taifar_business\talpha\t11",
-		"__AIFAR_VERIFY_SAMPLE__\taifar_business\tbeta\t12",
-		"__AIFAR_VERIFY_SAMPLE__\taifar_business\tdelta\t14",
 	}, "\n") + "\n"
+}
+
+func TestFinalRestoreVerificationDoesNotIssueSampleRowCounts(t *testing.T) {
+	command := finalRestoreVerificationCommand("/aifar/apps/mysql/restore/task_restore", 3306)
+	for _, forbidden := range []string{"__AIFAR_VERIFY_SAMPLE__", "COUNT(*) FROM `"} {
+		if strings.Contains(command, forbidden) {
+			t.Fatalf("final verification contains removed row-sampling query %q: %s", forbidden, command)
+		}
+	}
 }
 
 func TestRestoreStandaloneFinalGateRequiresExactManifestV2Expectations(t *testing.T) {
@@ -186,7 +192,7 @@ func TestRestoreStandaloneFinalGateRequiresExactManifestV2Expectations(t *testin
 		{name: "ping missing", output: strings.Replace(finalRestoreVerificationLiteral(), "__AIFAR_VERIFY_PING__\t1\n", "", 1)},
 		{name: "extra table", output: finalRestoreVerificationLiteral() + "__AIFAR_VERIFY_TABLE__\taifar_business\textra\n"},
 		{name: "missing table", output: strings.Replace(finalRestoreVerificationLiteral(), "__AIFAR_VERIFY_TABLE__\taifar_business\tgamma\n", "", 1)},
-		{name: "sample row mismatch", output: strings.Replace(finalRestoreVerificationLiteral(), "\tdelta\t14\n", "\tdelta\t15\n", 1)},
+		{name: "schema table count mismatch", output: strings.Replace(finalRestoreVerificationLiteral(), "\taifar_business\t4\n", "\taifar_business\t5\n", 1)},
 		{name: "task id mismatch", mutate: func(_ *testing.T, data *restoreFakeStore, _ store.AppBackup) {
 			metadata, _ := strictBackupMetadata(data.backups[0].Metadata)
 			metadata["restoreTaskId"], _ = json.Marshal("task_other_restore")

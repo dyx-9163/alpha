@@ -3,7 +3,6 @@ package mysql
 import (
 	"encoding/json"
 	"errors"
-	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -485,7 +484,7 @@ func TestMySQLBackupErrorTextResolvesEveryStableCodeWithoutCredentialDetails(t *
 	}
 }
 
-func TestNormalizeBackupManifestV2RequiresExactInventoryCountsAndDeterministicSamples(t *testing.T) {
+func TestNormalizeBackupManifestV2RequiresExactInventoryAndCatalogCounts(t *testing.T) {
 	manifest := validManifestV2Literal()
 	normalized, err := NormalizeBackupManifest(manifest)
 	if err != nil {
@@ -494,12 +493,14 @@ func TestNormalizeBackupManifestV2RequiresExactInventoryCountsAndDeterministicSa
 	if normalized.ManifestVersion != 2 || normalized.Verification == nil || normalized.Verification.TableCount != 4 {
 		t.Fatalf("normalized v2 = %+v", normalized)
 	}
-	if got := normalized.Verification.Samples; !reflect.DeepEqual(got, []BackupTableSample{
-		{Schema: "aifar_business", Table: "alpha", RowsWritten: 11},
-		{Schema: "aifar_business", Table: "beta", RowsWritten: 12},
-		{Schema: "aifar_business", Table: "delta", RowsWritten: 14},
-	}) {
-		t.Fatalf("samples = %+v", got)
+	encoded, err := CanonicalBackupManifestJSON(normalized)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, forbidden := range []string{"rowsWritten", "hasPrimaryKey", "samplingAlgorithm", "sampleLimitPerSchema", "sampledTables"} {
+		if strings.Contains(string(encoded), forbidden) {
+			t.Fatalf("manifest v2 contains removed row-sampling field %q: %s", forbidden, encoded)
+		}
 	}
 
 	invalid := []BackupManifest{
@@ -512,7 +513,7 @@ func TestNormalizeBackupManifestV2RequiresExactInventoryCountsAndDeterministicSa
 		func() BackupManifest { value := manifest; value.Verification.TableCount = 3; return value }(),
 		func() BackupManifest {
 			value := manifest
-			value.Verification.Samples = value.Verification.Samples[:2]
+			value.Verification.Schemas[0].Tables = value.Verification.Schemas[0].Tables[:3]
 			return value
 		}(),
 		func() BackupManifest {
@@ -559,17 +560,11 @@ func validManifestV2Literal() BackupManifest {
 		},
 		SchemaCount: 1, TableCount: 4,
 		Schemas: []BackupSchemaVerification{{Name: "aifar_business", TableCount: 4, Tables: []BackupTableVerification{
-			{Name: "alpha", RowsWritten: 11, PrimaryKey: true},
-			{Name: "beta", RowsWritten: 12, PrimaryKey: true},
-			{Name: "delta", RowsWritten: 14, PrimaryKey: true},
-			{Name: "gamma", RowsWritten: 13, PrimaryKey: true},
+			{Name: "alpha"},
+			{Name: "beta"},
+			{Name: "delta"},
+			{Name: "gamma"},
 		}}},
-		SamplingAlgorithm: "primary-key-lexicographic-first-3-v1", SampleLimitPerSchema: 3,
-		Samples: []BackupTableSample{
-			{Schema: "aifar_business", Table: "alpha", RowsWritten: 11},
-			{Schema: "aifar_business", Table: "beta", RowsWritten: 12},
-			{Schema: "aifar_business", Table: "delta", RowsWritten: 14},
-		},
 	}
 	return manifest
 }
