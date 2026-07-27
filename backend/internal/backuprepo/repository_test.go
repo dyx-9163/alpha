@@ -97,6 +97,39 @@ func TestPrepareRejectsSymlinkedBackupDirectory(t *testing.T) {
 	}
 }
 
+func TestPrepareRejectsPreExistingForeignDirectory(t *testing.T) {
+	for _, withFile := range []bool{false, true} {
+		name := "empty"
+		if withFile {
+			name = "non-empty"
+		}
+		t.Run(name, func(t *testing.T) {
+			root := t.TempDir()
+			repo, err := New(root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			foreign := filepath.Join(root, "backup-foreign")
+			if err := os.Mkdir(foreign, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if withFile {
+				if err := os.WriteFile(filepath.Join(foreign, "owner.txt"), []byte("foreign"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := repo.Prepare("backup-foreign"); err == nil {
+				t.Fatal("Prepare claimed a pre-existing foreign directory")
+			}
+			if withFile {
+				if content, err := os.ReadFile(filepath.Join(foreign, "owner.txt")); err != nil || string(content) != "foreign" {
+					t.Fatalf("foreign directory changed: content=%q err=%v", content, err)
+				}
+			}
+		})
+	}
+}
+
 func TestCommitPromotesVerifiedPartialToExactLayout(t *testing.T) {
 	repo, paths := prepareRepository(t, "backup-success")
 	content := []byte("mysql dump tar payload")
@@ -142,10 +175,11 @@ func TestCommitPromotesVerifiedPartialToExactLayout(t *testing.T) {
 func TestCommitRejectsInvalidPartialAndLeavesNoFinalArchive(t *testing.T) {
 	content := []byte("archive")
 	tests := []struct {
-		name         string
-		makePartial  func(t *testing.T, paths BackupPaths)
-		expectedHash string
-		expectedSize int64
+		name          string
+		makePartial   func(t *testing.T, paths BackupPaths)
+		expectedHash  string
+		expectedSize  int64
+		retainPartial bool
 	}{
 		{
 			name: "checksum mismatch",
@@ -169,6 +203,7 @@ func TestCommitRejectsInvalidPartialAndLeavesNoFinalArchive(t *testing.T) {
 				}
 			},
 			expectedHash: digestBytes(content), expectedSize: int64(len(content)),
+			retainPartial: true,
 		},
 	}
 	for _, tt := range tests {
@@ -182,8 +217,12 @@ func TestCommitRejectsInvalidPartialAndLeavesNoFinalArchive(t *testing.T) {
 			if _, err := os.Lstat(paths.Archive); !errors.Is(err, os.ErrNotExist) {
 				t.Fatalf("final archive exists after failed commit: %v", err)
 			}
-			if _, err := os.Lstat(paths.PartialArchive); !errors.Is(err, os.ErrNotExist) {
-				t.Fatalf("partial remains after failed commit: %v", err)
+			if tt.retainPartial {
+				if info, err := os.Lstat(paths.PartialArchive); err != nil || info.Mode().IsRegular() {
+					t.Fatalf("unbound non-regular partial changed: info=%v err=%v", info, err)
+				}
+			} else if _, err := os.Lstat(paths.PartialArchive); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("bound regular partial remains after failed commit: %v", err)
 			}
 		})
 	}
@@ -211,6 +250,197 @@ func TestCommitRejectsForgedPathsAndManifestID(t *testing.T) {
 			t.Fatalf("final archive exists after manifest rejection: %v", err)
 		}
 	})
+}
+
+func TestCommitRejectsManifestLargerThanVerificationLimit(t *testing.T) {
+	repo, paths := prepareRepository(t, "backup-large-manifest")
+	content := []byte("archive")
+	writePartial(t, paths, content)
+	prefix := `{"backupId":"backup-large-manifest","padding":"`
+	manifest := []byte(prefix + strings.Repeat("a", maxManifestSize-len(prefix)+1) + `"}`)
+	if err := repo.Commit(paths, manifest, digestBytes(content), int64(len(content))); err == nil {
+		t.Fatal("Commit accepted a manifest that Verify must reject")
+	}
+	if _, err := os.Lstat(paths.Archive); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("archive exists after oversized manifest rejection: %v", err)
+	}
+}
+
+func TestCommitRejectsPartialPathSwapAfterHashWithoutRemovingReplacement(t *testing.T) {
+	repo, paths := prepareRepository(t, "backup-partial-swap")
+	original := []byte("trusted archive")
+	replacement := []byte("foreign archiv")
+	writePartial(t, paths, original)
+	saved := paths.PartialArchive + ".saved"
+	installRepositoryHook(repo, "commit.after-partial-hash", func(_ string) error {
+		if err := os.Rename(paths.PartialArchive, saved); err != nil {
+			return err
+		}
+		return os.WriteFile(paths.PartialArchive, replacement, 0o600)
+	})
+
+	err := repo.Commit(paths, []byte(`{"backupId":"backup-partial-swap"}`), digestBytes(original), int64(len(original)))
+	if err == nil {
+		t.Fatal("Commit accepted a replacement partial after hashing")
+	}
+	assertFileContent(t, paths.PartialArchive, replacement)
+	assertFileContent(t, saved, original)
+	assertNotExist(t, paths.Archive)
+}
+
+func TestCommitRejectsSameInodeSameSizeMutationAfterHash(t *testing.T) {
+	repo, paths := prepareRepository(t, "backup-partial-mutation")
+	original := []byte("trusted archive")
+	mutated := []byte("mutated archive")
+	if len(original) != len(mutated) {
+		t.Fatal("test fixture sizes differ")
+	}
+	writePartial(t, paths, original)
+	installRepositoryHook(repo, "commit.after-partial-hash", func(_ string) error {
+		return os.WriteFile(paths.PartialArchive, mutated, 0o600)
+	})
+
+	if err := repo.Commit(paths, []byte(`{"backupId":"backup-partial-mutation"}`), digestBytes(original), int64(len(original))); err == nil {
+		t.Fatal("Commit accepted a same-inode, same-size mutation after hashing")
+	}
+	assertNotExist(t, paths.Archive)
+}
+
+func TestCommitNeverOverwritesRacingFinals(t *testing.T) {
+	tests := []struct {
+		name  string
+		point string
+		path  func(BackupPaths) string
+	}{
+		{name: "archive", point: "commit.before-archive-promote", path: func(paths BackupPaths) string { return paths.Archive }},
+		{name: "manifest", point: "commit.before-manifest-promote", path: func(paths BackupPaths) string { return paths.Manifest }},
+		{name: "checksums", point: "commit.before-checksums-promote", path: func(paths BackupPaths) string { return paths.Checksums }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			repo, paths := prepareRepository(t, "backup-racing-final-"+tt.name)
+			content := []byte("archive")
+			writePartial(t, paths, content)
+			foreign := []byte("foreign-" + tt.name)
+			destination := tt.path(paths)
+			installRepositoryHook(repo, tt.point, func(_ string) error {
+				return os.WriteFile(destination, foreign, 0o600)
+			})
+			manifest := []byte(`{"backupId":"backup-racing-final-` + tt.name + `"}`)
+			if err := repo.Commit(paths, manifest, digestBytes(content), int64(len(content))); err == nil {
+				t.Fatal("Commit overwrote a racing final")
+			}
+			assertFileContent(t, destination, foreign)
+		})
+	}
+}
+
+func TestCommitRollsBackArtifactWhenPostPromotionCheckFails(t *testing.T) {
+	tests := []struct {
+		name  string
+		point string
+		path  func(BackupPaths) string
+	}{
+		{name: "archive", point: "commit.after-archive-promote", path: func(paths BackupPaths) string { return paths.Archive }},
+		{name: "manifest", point: "commit.after-manifest-promote", path: func(paths BackupPaths) string { return paths.Manifest }},
+		{name: "checksums", point: "commit.after-checksums-promote", path: func(paths BackupPaths) string { return paths.Checksums }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			repo, paths := prepareRepository(t, "backup-post-promote-"+tt.name)
+			content := []byte("archive")
+			writePartial(t, paths, content)
+			installRepositoryHook(repo, tt.point, func(_ string) error {
+				return errors.New("injected post-promotion failure")
+			})
+			manifest := []byte(`{"backupId":"backup-post-promote-` + tt.name + `"}`)
+			if err := repo.Commit(paths, manifest, digestBytes(content), int64(len(content))); err == nil {
+				t.Fatal("Commit ignored post-promotion failure")
+			}
+			assertNotExist(t, tt.path(paths))
+		})
+	}
+}
+
+func TestCommitRejectsReplacedMetadataTempWithoutRemovingReplacement(t *testing.T) {
+	repo, paths := prepareRepository(t, "backup-temp-swap")
+	content := []byte("archive")
+	writePartial(t, paths, content)
+	var replacedTemp string
+	foreign := []byte("foreign-temp")
+	installRepositoryHook(repo, "commit.before-manifest-promote", func(tempPath string) error {
+		replacedTemp = tempPath
+		if err := os.Rename(tempPath, tempPath+".saved"); err != nil {
+			return err
+		}
+		return os.WriteFile(tempPath, foreign, 0o600)
+	})
+	if err := repo.Commit(paths, []byte(`{"backupId":"backup-temp-swap"}`), digestBytes(content), int64(len(content))); err == nil {
+		t.Fatal("Commit accepted a replaced metadata temp")
+	}
+	if replacedTemp == "" {
+		t.Fatal("metadata promotion hook did not run")
+	}
+	assertFileContent(t, replacedTemp, foreign)
+	assertNotExist(t, paths.Archive)
+}
+
+func TestCommitRollbackPreservesReplacementsAtPublishedPaths(t *testing.T) {
+	tests := []struct {
+		name string
+		path func(BackupPaths) string
+	}{
+		{name: "archive", path: func(paths BackupPaths) string { return paths.Archive }},
+		{name: "manifest", path: func(paths BackupPaths) string { return paths.Manifest }},
+		{name: "checksums", path: func(paths BackupPaths) string { return paths.Checksums }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			repo, paths := prepareRepository(t, "backup-rollback-"+tt.name)
+			content := []byte("archive")
+			writePartial(t, paths, content)
+			destination := tt.path(paths)
+			foreign := []byte("foreign-replacement-" + tt.name)
+			installRepositoryHook(repo, "commit.before-final-verify", func(_ string) error {
+				if err := os.Rename(destination, destination+".owned"); err != nil {
+					return err
+				}
+				return os.WriteFile(destination, foreign, 0o600)
+			})
+			manifest := []byte(`{"backupId":"backup-rollback-` + tt.name + `"}`)
+			if err := repo.Commit(paths, manifest, digestBytes(content), int64(len(content))); err == nil {
+				t.Fatal("Commit accepted a replacement before final verification")
+			}
+			assertFileContent(t, destination, foreign)
+		})
+	}
+}
+
+func TestCommitRejectsManagedDirectorySwap(t *testing.T) {
+	repo, paths := prepareRepository(t, "backup-directory-swap")
+	content := []byte("archive")
+	writePartial(t, paths, content)
+	originalDirectory := paths.Directory + ".original"
+	var swapErr error
+	installRepositoryHook(repo, "commit.after-partial-hash", func(_ string) error {
+		if err := os.Rename(paths.Directory, originalDirectory); err != nil {
+			swapErr = err
+			return err
+		}
+		if err := os.Mkdir(paths.Directory, 0o700); err != nil {
+			return err
+		}
+		return os.WriteFile(filepath.Join(paths.Directory, "foreign.txt"), []byte("foreign"), 0o600)
+	})
+	if err := repo.Commit(paths, []byte(`{"backupId":"backup-directory-swap"}`), digestBytes(content), int64(len(content))); err == nil {
+		t.Fatal("Commit accepted a replacement managed directory")
+	}
+	if swapErr != nil {
+		assertNotExist(t, paths.Archive)
+		return
+	}
+	assertFileContent(t, filepath.Join(paths.Directory, "foreign.txt"), []byte("foreign"))
+	assertFileContent(t, filepath.Join(originalDirectory, partialName), content)
 }
 
 func TestVerifyRequiresRecordManifestArchiveAndChecksumsAgreement(t *testing.T) {
@@ -312,6 +542,32 @@ func TestVerifyRejectsSymlinkedArchive(t *testing.T) {
 	}
 }
 
+func TestVerifyRejectsManagedDirectorySwapWhileArtifactsAreOpen(t *testing.T) {
+	repo, paths, backup := committedBackup(t, "backup-verify-directory-swap")
+	originalDirectory := paths.Directory + ".original"
+	var swapErr error
+	installRepositoryHook(repo, "verify.after-archive", func(_ string) error {
+		if err := os.Rename(paths.Directory, originalDirectory); err != nil {
+			swapErr = err
+			return err
+		}
+		if err := os.Mkdir(paths.Directory, 0o700); err != nil {
+			return err
+		}
+		return os.WriteFile(filepath.Join(paths.Directory, "foreign.txt"), []byte("foreign"), 0o600)
+	})
+	if _, err := repo.Verify(backup); err == nil {
+		t.Fatal("Verify accepted artifacts across a replaced managed directory")
+	}
+	if swapErr != nil {
+		if _, err := os.Stat(paths.Archive); err != nil {
+			t.Fatalf("verified archive changed after OS denied directory swap: %v", err)
+		}
+		return
+	}
+	assertFileContent(t, filepath.Join(paths.Directory, "foreign.txt"), []byte("foreign"))
+}
+
 func TestDeleteRemovesOnlyVerifiedManagedBackupDirectory(t *testing.T) {
 	repo, paths, backup := committedBackup(t, "backup-delete")
 	if err := repo.Delete(backup); err != nil {
@@ -347,6 +603,107 @@ func TestDeleteRejectsUnverifiedOrOutsideTargets(t *testing.T) {
 			t.Fatalf("repository root changed: %v", err)
 		}
 	})
+}
+
+func TestDeleteRejectsDirectorySwapAfterVerification(t *testing.T) {
+	repo, paths, backup := committedBackup(t, "backup-delete-directory-swap")
+	originalDirectory := paths.Directory + ".original"
+	installRepositoryHook(repo, "delete.after-verify", func(_ string) error {
+		if err := os.Rename(paths.Directory, originalDirectory); err != nil {
+			return err
+		}
+		if err := os.Mkdir(paths.Directory, 0o700); err != nil {
+			return err
+		}
+		return os.WriteFile(filepath.Join(paths.Directory, "foreign.txt"), []byte("foreign"), 0o600)
+	})
+	if err := repo.Delete(backup); err == nil {
+		t.Fatal("Delete removed a replacement directory")
+	}
+	assertFileContent(t, filepath.Join(paths.Directory, "foreign.txt"), []byte("foreign"))
+	if _, err := os.Stat(filepath.Join(originalDirectory, archiveName)); err != nil {
+		t.Fatalf("verified original was removed: %v", err)
+	}
+}
+
+func TestDeleteRejectsRootSwapAfterVerification(t *testing.T) {
+	repo, paths, backup := committedBackup(t, "backup-delete-root-swap")
+	originalRoot := repo.root + ".original"
+	var swapErr error
+	installRepositoryHook(repo, "delete.after-verify", func(_ string) error {
+		if err := os.Rename(repo.root, originalRoot); err != nil {
+			swapErr = err
+			return err
+		}
+		if err := os.Mkdir(repo.root, 0o700); err != nil {
+			return err
+		}
+		foreignDirectory := filepath.Join(repo.root, filepath.Base(paths.Directory))
+		if err := os.Mkdir(foreignDirectory, 0o700); err != nil {
+			return err
+		}
+		return os.WriteFile(filepath.Join(foreignDirectory, "foreign.txt"), []byte("foreign"), 0o600)
+	})
+	if err := repo.Delete(backup); err == nil {
+		t.Fatal("Delete proceeded through a replacement root")
+	}
+	if swapErr != nil {
+		if _, err := os.Stat(paths.Archive); err != nil {
+			t.Fatalf("verified archive changed after OS denied root swap: %v", err)
+		}
+		return
+	}
+	assertFileContent(t, filepath.Join(repo.root, backup.ID, "foreign.txt"), []byte("foreign"))
+	if _, err := os.Stat(filepath.Join(originalRoot, backup.ID, archiveName)); err != nil {
+		t.Fatalf("verified directory under original root was removed: %v", err)
+	}
+}
+
+func TestDeleteQuarantinePromotionIsNonClobbering(t *testing.T) {
+	repo, paths, backup := committedBackup(t, "backup-delete-quarantine-race")
+	var quarantine string
+	installRepositoryHook(repo, "delete.before-quarantine", func(path string) error {
+		quarantine = path
+		if err := os.Mkdir(path, 0o700); err != nil {
+			return err
+		}
+		return os.WriteFile(filepath.Join(path, "foreign.txt"), []byte("foreign"), 0o600)
+	})
+	if err := repo.Delete(backup); err == nil {
+		t.Fatal("Delete overwrote a racing quarantine target")
+	}
+	if quarantine == "" {
+		t.Fatal("quarantine hook did not run")
+	}
+	assertFileContent(t, filepath.Join(quarantine, "foreign.txt"), []byte("foreign"))
+	if _, err := os.Stat(paths.Archive); err != nil {
+		t.Fatalf("verified source was removed: %v", err)
+	}
+}
+
+func TestDeleteDoesNotRemoveQuarantineReplacement(t *testing.T) {
+	repo, paths, backup := committedBackup(t, "backup-delete-quarantine-swap")
+	var originalQuarantine string
+	installRepositoryHook(repo, "delete.after-quarantine", func(path string) error {
+		originalQuarantine = path + ".original"
+		if err := os.Rename(path, originalQuarantine); err != nil {
+			return err
+		}
+		if err := os.Mkdir(path, 0o700); err != nil {
+			return err
+		}
+		return os.WriteFile(filepath.Join(path, "foreign.txt"), []byte("foreign"), 0o600)
+	})
+	if err := repo.Delete(backup); err == nil {
+		t.Fatal("Delete removed a replacement quarantine directory")
+	}
+	if originalQuarantine == "" {
+		t.Fatal("quarantine replacement hook did not run")
+	}
+	assertFileContent(t, filepath.Join(paths.Directory, "foreign.txt"), []byte("foreign"))
+	if _, err := os.Stat(filepath.Join(originalQuarantine, archiveName)); err != nil {
+		t.Fatalf("verified quarantined directory was removed: %v", err)
+	}
 }
 
 func TestRetentionCandidatesKeepLatestSuccessfulBackup(t *testing.T) {
@@ -425,5 +782,32 @@ func requireSymlink(t *testing.T, oldname, newname string) {
 			t.Skipf("Windows denied symlink creation: %v", err)
 		}
 		t.Fatalf("create symlink: %v", err)
+	}
+}
+
+func installRepositoryHook(repo *Repository, point string, action func(path string) error) {
+	repo.hook = func(gotPoint, path string) error {
+		if gotPoint != point {
+			return nil
+		}
+		return action(path)
+	}
+}
+
+func assertFileContent(t *testing.T, path string, want []byte) {
+	t.Helper()
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %q: %v", path, err)
+	}
+	if string(got) != string(want) {
+		t.Fatalf("%q content = %q, want %q", path, got, want)
+	}
+}
+
+func assertNotExist(t *testing.T, path string) {
+	t.Helper()
+	if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("%q exists or cannot be checked: %v", path, err)
 	}
 }
