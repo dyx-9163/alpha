@@ -2051,4 +2051,18 @@ onBeforeUnmount(() => {
     justify-content: flex-start;
   }
 }
+
+@media (max-width: 900px), (max-height: 600px) {
+  .containers-page.is-runtime-logs-page {
+    overflow-x: hidden;
+    overflow-y: auto;
+    padding-right: 2px;
+  }
+
+  .workspace-card.containers-main.is-runtime-logs {
+    flex: 0 0 auto;
+    height: auto;
+    overflow: visible;
+  }
+}
 </style>

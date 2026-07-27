@@ -6,6 +6,7 @@ import {
   runtimeDiagnosticCapacityBlocked,
   runtimeDiagnosticLimitRows,
   runtimeDiagnosticRequestFingerprint,
+  runtimeDiagnosticServicePreview,
   runtimeDiagnosticSubmitDisabledReason,
   terminalDiagnosticTaskToRefresh
 } from './runtimeDiagnostics'
@@ -96,5 +97,18 @@ describe('runtime diagnostic interactions', () => {
     expect(runtimeDiagnosticCapacityBlocked({ ...estimate, allowed: false, blockReason: 'total-scan-limit-exceeded' })).toBe(true)
     expect(runtimeDiagnosticCapacityBlocked({ ...estimate, allowed: false, blockReason: 'time-range-too-large' })).toBe(false)
     expect(runtimeDiagnosticCapacityBlocked(estimate)).toBe(false)
+  })
+
+  it('builds a compact service preview without losing the full list', () => {
+    expect(runtimeDiagnosticServicePreview(['contacts', 'file', 'gateway', 'im'], 3)).toEqual({
+      visibleText: 'contacts, file, gateway',
+      hiddenCount: 1,
+      tooltip: 'contacts, file, gateway, im'
+    })
+    expect(runtimeDiagnosticServicePreview([], 3)).toEqual({
+      visibleText: '-',
+      hiddenCount: 0,
+      tooltip: '-'
+    })
   })
 })

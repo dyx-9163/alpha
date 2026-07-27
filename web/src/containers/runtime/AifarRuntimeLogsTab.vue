@@ -1,11 +1,21 @@
 <template>
   <div class="runtime-resource-panel runtime-log-panel">
-    <AifarRuntimeDiagnosticsPanel
-      :instance-id="selectedRuntimeInstanceId"
-      :deployments="selectedRuntimeDeployments"
-      :target-query="runtimeTargetQuery()"
-    />
-    <div class="runtime-tab-toolbar">
+    <el-tabs v-model="runtimeLogWorkspaceTab" class="runtime-log-workspace-tabs">
+      <el-tab-pane
+        v-for="tabName in runtimeLogWorkspaceTabOrder"
+        :key="tabName"
+        :name="tabName"
+        :label="t(runtimeLogWorkspaceTabLabels[tabName])"
+        :lazy="tabName === 'archives'"
+      >
+        <AifarRuntimeDiagnosticsPanel
+          v-if="tabName === 'archives'"
+          :instance-id="selectedRuntimeInstanceId"
+          :deployments="selectedRuntimeDeployments"
+          :target-query="runtimeTargetQuery()"
+        />
+        <div v-else class="runtime-log-live-surface">
+          <div class="runtime-tab-toolbar">
       <div class="runtime-log-filters">
         <el-select
           v-model="runtimeLogServiceFilter"
@@ -66,21 +76,21 @@
         <el-button size="small" plain :disabled="!runtimeLogRows.length && !runtimeLogPendingCount" @click="clearRuntimeLogView">{{ t('containers.clearLogs') }}</el-button>
         <el-switch v-model="runtimeLogAutoScroll" size="small" :active-text="t('containers.autoScroll')" inline-prompt />
       </div>
-    </div>
-    <el-alert
-      v-if="runtimeLogWarnings.length"
-      type="warning"
-      :closable="false"
-      show-icon
-      :title="runtimeLogWarnings.join('；')"
-    />
-    <div v-if="!runtimeLogSelectionReady" class="runtime-lazy-state">
-      <span>{{ t('containers.selectRuntimeLogScopeHint') }}</span>
-    </div>
-    <div v-else-if="!runtimeLogsLoadedForCurrentScope" class="runtime-lazy-state">
-      <el-button size="small" type="primary" plain :loading="loading" @click="loadRuntimeLogs(true)">{{ t('containers.startRuntimeLogStream') }}</el-button>
-    </div>
-    <div v-else class="runtime-log-workbench">
+          </div>
+          <el-alert
+            v-if="runtimeLogWarnings.length"
+            type="warning"
+            :closable="false"
+            show-icon
+            :title="runtimeLogWarnings.join('；')"
+          />
+          <div v-if="!runtimeLogSelectionReady" class="runtime-lazy-state">
+            <span>{{ t('containers.selectRuntimeLogScopeHint') }}</span>
+          </div>
+          <div v-else-if="!runtimeLogsLoadedForCurrentScope" class="runtime-lazy-state">
+            <el-button size="small" type="primary" plain :loading="loading" @click="loadRuntimeLogs(true)">{{ t('containers.startRuntimeLogStream') }}</el-button>
+          </div>
+          <div v-else class="runtime-log-workbench">
       <div class="runtime-log-pod-strip">
         <div v-for="group in runtimeLogGroups" :key="group.containerName" class="runtime-log-pod-chip">
           <div>
@@ -114,7 +124,10 @@
           <div :style="{ height: `${runtimeLogBottomSpacer}px` }"></div>
         </template>
       </div>
-    </div>
+          </div>
+        </div>
+      </el-tab-pane>
+    </el-tabs>
   </div>
 </template>
 
@@ -123,6 +136,11 @@ import StatusTag from '../../components/StatusTag.vue'
 import AifarRuntimeDiagnosticsPanel from './AifarRuntimeDiagnosticsPanel.vue'
 import { runtimeLogLevelOptions, runtimeLogLevelTag } from './logs'
 import { useAifarRuntimeContext } from './context'
+import {
+  runtimeLogWorkspaceTabLabels,
+  runtimeLogWorkspaceTabOrder
+} from './surface'
+import { useRuntimeLogWorkspaceTab } from './runtimeLogWorkspace'
 
 const {
   t,
@@ -164,4 +182,6 @@ const {
   runtimeLogVirtualRows,
   runtimeLogBottomSpacer
 } = useAifarRuntimeContext()
+
+const runtimeLogWorkspaceTab = useRuntimeLogWorkspaceTab(selectedRuntimeInstanceId, runtimeTargetQuery)
 </script>

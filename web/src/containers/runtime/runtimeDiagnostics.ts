@@ -21,6 +21,16 @@ export function enabledRuntimeDiagnosticServices(deployments: AifarRuntimeDeploy
     .filter(Boolean))]
 }
 
+export function runtimeDiagnosticServicePreview(services: string[], visibleLimit = 3) {
+  const normalized = services.map((service) => service.trim()).filter(Boolean)
+  const visible = normalized.slice(0, Math.max(1, visibleLimit))
+  return {
+    visibleText: visible.join(', ') || '-',
+    hiddenCount: Math.max(0, normalized.length - visible.length),
+    tooltip: normalized.join(', ') || '-'
+  }
+}
+
 export function runtimeDiagnosticSubmitDisabledReason(input: RuntimeDiagnosticSubmitState): '' | 'services-required' | 'estimate-required' | 'estimate-blocked' | 'busy' {
   if (input.estimating || input.submitting) return 'busy'
   if (!input.services.length) return 'services-required'
