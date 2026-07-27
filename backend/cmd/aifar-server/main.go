@@ -96,6 +96,7 @@ func main() {
 		log.Printf("recovered %d interrupted AIFAR orchestration lock(s)", recovered)
 	}
 	aifar.NewAutoscaler(db, tasks, adapter.SSHRemote{}).Start(context.Background())
+	aifar.NewRuntimeDiagnosticCleaner(db, tasks, adapter.SSHRemote{}).Start(context.Background())
 	alertManager := alerts.NewManager(db, events)
 	collectorManager := collector.NewManager(db, events, time.Duration(cfg.CollectorIntervalSecs)*time.Second)
 	collectorManager.SetAppRegistry(registry.NewFromRegistered(registry.Dependencies{Store: db, DefaultPassword: cfg.DefaultPassword}))

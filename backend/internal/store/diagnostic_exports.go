@@ -61,7 +61,8 @@ func (s *Store) MarkDiagnosticExportDownloaded(id string, downloadedAt time.Time
 
 func (s *Store) MarkDiagnosticExportCleanupPending(id string, attemptedAt time.Time) (bool, error) {
 	result, err := s.db.Exec(`update diagnostic_exports
-		set cleanup_status='pending',cleanup_error='',cleanup_attempted_at=?
+		set status=case when status='ready' then 'expired' else status end,
+			cleanup_status='pending',cleanup_error='',cleanup_attempted_at=?
 		where id=? and status in ('ready','expired','failed','cancelled')
 		and deleted_at is null and cleanup_status <> 'complete'`, attemptedAt, strings.TrimSpace(id))
 	return diagnosticExportWasUpdated(result, err)
