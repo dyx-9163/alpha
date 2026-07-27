@@ -25,14 +25,19 @@ type RuntimeDiagnosticCleaner struct {
 	store         *store.Store
 	tasks         *worker.Manager
 	remote        Remote
+	archives      RuntimeDiagnosticArchiveStorage
 	interval      time.Duration
 	running       atomic.Bool
 	addAudit      func(string, string, string, string, string) error
 	startExisting func(store.Task, worker.Job) (store.Task, error)
 }
 
-func NewRuntimeDiagnosticCleaner(s *store.Store, tasks *worker.Manager, remote Remote) *RuntimeDiagnosticCleaner {
-	c := &RuntimeDiagnosticCleaner{store: s, tasks: tasks, remote: remote, interval: runtimeDiagnosticCleanupInterval, addAudit: s.AddAudit}
+func NewRuntimeDiagnosticCleaner(s *store.Store, tasks *worker.Manager, remote Remote, archiveStorage ...RuntimeDiagnosticArchiveStorage) *RuntimeDiagnosticCleaner {
+	var archives RuntimeDiagnosticArchiveStorage
+	if len(archiveStorage) > 0 {
+		archives = archiveStorage[0]
+	}
+	c := &RuntimeDiagnosticCleaner{store: s, tasks: tasks, remote: remote, archives: archives, interval: runtimeDiagnosticCleanupInterval, addAudit: s.AddAudit}
 	c.startExisting = func(task store.Task, job worker.Job) (store.Task, error) {
 		return tasks.StartExistingWithLanguage(task, "", job)
 	}
@@ -40,7 +45,7 @@ func NewRuntimeDiagnosticCleaner(s *store.Store, tasks *worker.Manager, remote R
 }
 
 func (c *RuntimeDiagnosticCleaner) Start(ctx context.Context) {
-	if c == nil || c.store == nil || c.tasks == nil || c.remote == nil {
+	if c == nil || c.store == nil || c.tasks == nil || (c.remote == nil && c.archives == nil) {
 		return
 	}
 	go func() {
@@ -59,7 +64,7 @@ func (c *RuntimeDiagnosticCleaner) Start(ctx context.Context) {
 }
 
 func (c *RuntimeDiagnosticCleaner) tick(ctx context.Context, now time.Time) {
-	if c == nil || c.store == nil || c.tasks == nil || c.remote == nil || ctx.Err() != nil {
+	if c == nil || c.store == nil || c.tasks == nil || (c.remote == nil && c.archives == nil) || ctx.Err() != nil {
 		return
 	}
 	due, err := c.store.ListDiagnosticExportsDueForCleanup(now.UTC(), 1)
@@ -92,7 +97,7 @@ func (c *RuntimeDiagnosticCleaner) storeCleanupPlan(taskID string) error {
 	if err := c.store.UpsertTaskTarget(taskID, runtimeDiagnosticCleanupTarget, "pending", ""); err != nil {
 		return err
 	}
-	for index, step := range []struct{ name, title string }{{"mark-expired", i18n.Text("", "aifar.diag.clean.mark")}, {"delete-remote-artifacts", i18n.Text("", "aifar.diag.clean.delete")}, {"record-cleanup", i18n.Text("", "aifar.diag.clean.record")}} {
+	for index, step := range []struct{ name, title string }{{"mark-expired", i18n.Text("", "aifar.diag.clean.mark")}, {"delete-local-or-legacy-artifacts", i18n.Text("", "aifar.diag.clean.delete")}, {"record-cleanup", i18n.Text("", "aifar.diag.clean.record")}} {
 		if err := c.store.UpsertTaskStep(taskID, runtimeDiagnosticCleanupTarget, step.name, step.title, index+1, "pending", ""); err != nil {
 			return err
 		}
@@ -129,11 +134,11 @@ func (c *RuntimeDiagnosticCleaner) releaseWhenTaskFinishes(taskID string) {
 func (c *RuntimeDiagnosticCleaner) run(ctx context.Context, log worker.Logger, now time.Time, taskID string) error {
 	log.PlanTarget(runtimeDiagnosticCleanupTarget)
 	log.PlanStep(runtimeDiagnosticCleanupTarget, "mark-expired", i18n.Text("", "aifar.diag.clean.mark"), 1)
-	log.PlanStep(runtimeDiagnosticCleanupTarget, "delete-remote-artifacts", i18n.Text("", "aifar.diag.clean.delete"), 2)
+	log.PlanStep(runtimeDiagnosticCleanupTarget, "delete-local-or-legacy-artifacts", i18n.Text("", "aifar.diag.clean.delete"), 2)
 	log.PlanStep(runtimeDiagnosticCleanupTarget, "record-cleanup", i18n.Text("", "aifar.diag.clean.record"), 3)
 	log.StartTarget(runtimeDiagnosticCleanupTarget)
 	log.StartStep(runtimeDiagnosticCleanupTarget, "mark-expired", "", 0)
-	log.StartStep(runtimeDiagnosticCleanupTarget, "delete-remote-artifacts", "", 0)
+	log.StartStep(runtimeDiagnosticCleanupTarget, "delete-local-or-legacy-artifacts", "", 0)
 	log.StartStep(runtimeDiagnosticCleanupTarget, "record-cleanup", "", 0)
 	var afterExpiresAt time.Time
 	var afterID string
@@ -157,7 +162,7 @@ func (c *RuntimeDiagnosticCleaner) run(ctx context.Context, log worker.Logger, n
 		afterExpiresAt, afterID = last.ExpiresAt, last.ID
 	}
 	log.FinishStep(runtimeDiagnosticCleanupTarget, "mark-expired", "success", "")
-	log.FinishStep(runtimeDiagnosticCleanupTarget, "delete-remote-artifacts", "success", "")
+	log.FinishStep(runtimeDiagnosticCleanupTarget, "delete-local-or-legacy-artifacts", "success", "")
 	log.FinishStep(runtimeDiagnosticCleanupTarget, "record-cleanup", "success", "")
 	log.FinishTarget(runtimeDiagnosticCleanupTarget, "success", "")
 	return nil
@@ -177,12 +182,65 @@ func (c *RuntimeDiagnosticCleaner) cleanupOne(ctx context.Context, log worker.Lo
 	if err != nil || !updated {
 		return
 	}
-	service := NewService(c.store, c.remote)
-	current, _, server, installRoot, err := service.loadRuntimeDiagnosticArtifact(export.ID, "", "", "", true)
-	if err == nil {
-		err = service.cleanupRuntimeDiagnosticExport(ctx, server, installRoot, current.ID)
+	switch export.StorageKind {
+	case "local":
+		if c.archives == nil {
+			err = errors.New(i18n.Text("", "aifar.diag.storageMissing"))
+		} else if export.StorageRelativePath != "" {
+			err = c.archives.Remove(export.StorageRelativePath)
+		} else {
+			err = c.archives.RemovePartial(export.ID)
+		}
+	case "remote":
+		if c.remote == nil {
+			err = errors.New(i18n.Text("", "aifar.diag.cleanupFailed"))
+		} else {
+			service := NewService(c.store, c.remote)
+			var current store.DiagnosticExport
+			var server store.Server
+			var installRoot string
+			current, _, server, installRoot, err = service.loadRuntimeDiagnosticArtifact(export.ID, "", "", "", true)
+			if err == nil {
+				err = service.cleanupRuntimeDiagnosticExport(ctx, server, installRoot, current.ID)
+			}
+		}
+	default:
+		err = errors.New(i18n.Text("", "aifar.diag.storageKindInvalid"))
 	}
 	c.recordCleanupResult(log, export, err, now)
+}
+
+func (c *RuntimeDiagnosticCleaner) Reconcile(ctx context.Context, now time.Time) (RuntimeDiagnosticReconcileResult, error) {
+	if c == nil || c.store == nil || c.archives == nil {
+		return RuntimeDiagnosticReconcileResult{}, errors.New(i18n.Text("", "aifar.diag.storageMissing"))
+	}
+	result, err := c.archives.Reconcile(ctx, now)
+	if err != nil {
+		return result, err
+	}
+	for _, exportID := range result.MissingReadyIDs {
+		if updated, updateErr := c.store.MarkDiagnosticExportCleanupPending(exportID, now); updateErr == nil && updated {
+			_, _ = c.store.MarkDiagnosticExportCleanupFailed(exportID, i18n.Text("", "aifar.diag.localArchiveMissing"))
+		}
+	}
+	records, err := c.store.ListDiagnosticExportsForReconcile()
+	if err != nil {
+		return result, err
+	}
+	for _, export := range records {
+		if export.ReservedBytes == 0 || (export.Status != "pending" && export.Status != "building") {
+			continue
+		}
+		task, _, taskErr := c.store.GetTask(export.TaskID)
+		if taskErr == nil && (task.Status == "pending" || task.Status == "running") {
+			continue
+		}
+		if taskErr != nil && !errors.Is(taskErr, sql.ErrNoRows) {
+			continue
+		}
+		_, _ = c.store.MarkDiagnosticExportFailed(export.ID, i18n.Text("", "aifar.diag.interrupted"), now)
+	}
+	return result, nil
 }
 
 func (c *RuntimeDiagnosticCleaner) recordCleanupResult(log worker.Logger, export store.DiagnosticExport, remoteErr error, now time.Time) {

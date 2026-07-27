@@ -96,7 +96,20 @@ func main() {
 		log.Printf("recovered %d interrupted AIFAR orchestration lock(s)", recovered)
 	}
 	aifar.NewAutoscaler(db, tasks, adapter.SSHRemote{}).Start(context.Background())
-	aifar.NewRuntimeDiagnosticCleaner(db, tasks, adapter.SSHRemote{}).Start(context.Background())
+	diagnosticArchives := aifar.NewRuntimeDiagnosticArchiveStorage(
+		cfg.DiagnosticExportDir,
+		cfg.DiagnosticExportQuotaBytes,
+		time.Duration(cfg.DiagnosticExportRetentionHours)*time.Hour,
+		db,
+	)
+	diagnosticCleaner := aifar.NewRuntimeDiagnosticCleaner(db, tasks, adapter.SSHRemote{}, diagnosticArchives)
+	if reconciled, err := diagnosticCleaner.Reconcile(context.Background(), time.Now().UTC()); err != nil {
+		log.Printf("runtime diagnostic archive reconciliation warning")
+	} else if reconciled.RemovedPartials > 0 || reconciled.RemovedOrphans > 0 || len(reconciled.MissingReadyIDs) > 0 || len(reconciled.WarningCodes) > 0 {
+		log.Printf("reconciled runtime diagnostic archives: partials=%d orphans=%d missing=%d warnings=%d",
+			reconciled.RemovedPartials, reconciled.RemovedOrphans, len(reconciled.MissingReadyIDs), len(reconciled.WarningCodes))
+	}
+	diagnosticCleaner.Start(context.Background())
 	alertManager := alerts.NewManager(db, events)
 	collectorManager := collector.NewManager(db, events, time.Duration(cfg.CollectorIntervalSecs)*time.Second)
 	collectorManager.SetAppRegistry(registry.NewFromRegistered(registry.Dependencies{

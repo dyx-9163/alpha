@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -52,7 +54,7 @@ func TestRuntimeDiagnosticCleanerMarksExpiredAndDeletesReachableArchive(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(steps) != 3 || steps[0].Name != "mark-expired" || steps[1].Name != "delete-remote-artifacts" || steps[2].Name != "record-cleanup" {
+	if len(steps) != 3 || steps[0].Name != "mark-expired" || steps[1].Name != "delete-local-or-legacy-artifacts" || steps[2].Name != "record-cleanup" {
 		t.Fatalf("unexpected cleanup steps: %+v", steps)
 	}
 	audits, err := db.ListAudit()
@@ -61,6 +63,107 @@ func TestRuntimeDiagnosticCleanerMarksExpiredAndDeletesReachableArchive(t *testi
 	}
 	if len(audits) != 1 || audits[0].Actor != runtimeDiagnosticCleanupActor || audits[0].Action != runtimeDiagnosticCleanupAuditAction || audits[0].Status != "success" {
 		t.Fatalf("unexpected cleanup audit: %+v", audits)
+	}
+}
+
+func TestRuntimeDiagnosticCleanerDeletesExpiredLocalWithoutSSH(t *testing.T) {
+	db, tasks, remote, now := newRuntimeDiagnosticCleanerFixture(t)
+	root := t.TempDir()
+	archives := NewRuntimeDiagnosticArchiveStorage(root, 5<<30, runtimeDiagnosticRetention, db)
+	expired := saveLocalRuntimeDiagnosticCleanerExport(t, db, archives, now, "diag-local-expired", now.Add(-time.Second))
+	future := saveLocalRuntimeDiagnosticCleanerExport(t, db, archives, now, "diag-local-future", now.Add(time.Hour))
+
+	cleaner := NewRuntimeDiagnosticCleaner(db, tasks, remote, archives)
+	cleaner.tick(context.Background(), now)
+	waitForRuntimeDiagnosticCleanerTask(t, db)
+
+	gotExpired, err := db.GetDiagnosticExport(expired.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotExpired.Status != "deleted" || gotExpired.CleanupStatus != "complete" {
+		t.Fatalf("expired local archive was not deleted: %+v", gotExpired)
+	}
+	if _, err := archives.Open(expired.StorageRelativePath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expired local file still exists: %v", err)
+	}
+	gotFuture, err := db.GetDiagnosticExport(future.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotFuture.Status != "ready" || gotFuture.CleanupStatus != "none" {
+		t.Fatalf("unexpired local archive was removed: %+v", gotFuture)
+	}
+	if remote.CallCount() != 0 {
+		t.Fatalf("local cleanup used SSH %d time(s)", remote.CallCount())
+	}
+}
+
+func TestRuntimeDiagnosticCleanerReconcilesStalePartialsMissingFilesAndReservations(t *testing.T) {
+	db, tasks, remote, now := newRuntimeDiagnosticCleanerFixture(t)
+	root := t.TempDir()
+	archives := NewRuntimeDiagnosticArchiveStorage(root, 5<<30, runtimeDiagnosticRetention, db)
+	archiveName := "aifar-diagnostics-gateway-20260727T070000Z.tar.gz"
+	missing, err := db.SaveDiagnosticExport(store.DiagnosticExport{
+		ID: "diag-local-missing", TaskID: "task-missing-ready", InstanceID: "instance-1", ServerID: "server-1",
+		Status: "ready", StorageKind: "local", StorageRelativePath: path.Join("diag-local-missing", archiveName),
+		ArchiveName: archiveName, ArchiveBytes: 100, SHA256: strings.Repeat("a", 64), Services: []string{"gateway"},
+		SinceAt: now.Add(-time.Hour), UntilAt: now.Add(-time.Minute), CreatedAt: now.Add(-time.Hour), ReadyAt: now.Add(-time.Hour), ExpiresAt: now.Add(time.Hour),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	interrupted, err := db.SaveDiagnosticExport(store.DiagnosticExport{
+		ID: "diag-local-interrupted", TaskID: "task-no-longer-exists", InstanceID: "instance-1", ServerID: "server-1",
+		Status: "building", StorageKind: "local", ReservedBytes: 256 << 20, Services: []string{"gateway"},
+		SinceAt: now.Add(-time.Hour), UntilAt: now.Add(-time.Minute), CreatedAt: now.Add(-time.Hour), ExpiresAt: now.Add(time.Hour),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	activeTask, err := db.CreateTask(store.Task{ID: "task-active-local-export", Type: "aifar.runtime.diagnostics.export", Target: "instance-1", Status: "running", CreatedBy: "owner"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	active, err := db.SaveDiagnosticExport(store.DiagnosticExport{
+		ID: "diag-local-active", TaskID: activeTask.ID, InstanceID: "instance-1", ServerID: "server-1",
+		Status: "building", StorageKind: "local", ReservedBytes: 256 << 20, Services: []string{"gateway"},
+		SinceAt: now.Add(-time.Hour), UntilAt: now.Add(-time.Minute), CreatedAt: now.Add(-time.Hour), ExpiresAt: now.Add(time.Hour),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	partialDir := filepath.Join(root, "diag-stale-partial")
+	if err := os.MkdirAll(partialDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	partialPath := filepath.Join(partialDir, archiveName+".partial")
+	if err := os.WriteFile(partialPath, []byte("partial"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(partialPath, now.Add(-2*time.Hour), now.Add(-2*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+
+	cleaner := NewRuntimeDiagnosticCleaner(db, tasks, remote, archives)
+	result, err := cleaner.Reconcile(context.Background(), now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.RemovedPartials != 1 || !containsString(result.MissingReadyIDs, missing.ID) {
+		t.Fatalf("unexpected reconciliation result: %+v", result)
+	}
+	gotMissing, _ := db.GetDiagnosticExport(missing.ID)
+	if gotMissing.Status != "expired" || gotMissing.CleanupStatus != "failed" || gotMissing.CleanupError == "" {
+		t.Fatalf("missing ready archive was not made non-downloadable: %+v", gotMissing)
+	}
+	gotInterrupted, _ := db.GetDiagnosticExport(interrupted.ID)
+	if gotInterrupted.Status != "failed" || gotInterrupted.ReservedBytes != 0 {
+		t.Fatalf("interrupted reservation was not released: %+v", gotInterrupted)
+	}
+	gotActive, _ := db.GetDiagnosticExport(active.ID)
+	if gotActive.Status != "building" || gotActive.ReservedBytes == 0 {
+		t.Fatalf("active reservation was changed: %+v", gotActive)
 	}
 }
 
@@ -428,6 +531,33 @@ func saveRuntimeDiagnosticCleanerExport(t *testing.T, db *store.Store, now time.
 		Services: []string{"gateway"}, SinceAt: now.Add(-time.Hour), UntilAt: now.Add(-time.Minute),
 		RemoteRelativePath: id + "/" + archiveName, ArchiveName: archiveName, ArchiveBytes: 1,
 		SHA256:    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+		CreatedBy: "owner", CreatedAt: now.Add(-time.Hour), ReadyAt: now.Add(-time.Hour), ExpiresAt: expiresAt, CleanupStatus: "none",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return export
+}
+
+func saveLocalRuntimeDiagnosticCleanerExport(t *testing.T, db *store.Store, archives RuntimeDiagnosticArchiveStorage, now time.Time, id string, expiresAt time.Time) store.DiagnosticExport {
+	t.Helper()
+	archiveName := "aifar-diagnostics-gateway-20260727T070000Z.tar.gz"
+	sink, err := archives.Begin(id, archiveName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	archive := runtimeDiagnosticTestArchive(t, strings.TrimSuffix(archiveName, ".tar.gz"))
+	if _, err := sink.Write(archive); err != nil {
+		t.Fatal(err)
+	}
+	artifact, err := sink.Commit()
+	if err != nil {
+		t.Fatal(err)
+	}
+	export, err := db.SaveDiagnosticExport(store.DiagnosticExport{
+		ID: id, TaskID: "task-" + id, InstanceID: "instance-1", ServerID: "server-1", Status: "ready", StorageKind: "local",
+		Services: []string{"gateway"}, SinceAt: now.Add(-time.Hour), UntilAt: now.Add(-time.Minute),
+		StorageRelativePath: artifact.RelativePath, ArchiveName: artifact.ArchiveName, ArchiveBytes: artifact.Size, SHA256: artifact.SHA256,
 		CreatedBy: "owner", CreatedAt: now.Add(-time.Hour), ReadyAt: now.Add(-time.Hour), ExpiresAt: expiresAt, CleanupStatus: "none",
 	})
 	if err != nil {
