@@ -100,12 +100,12 @@
   display: block;
 }
 
-.runtime-overflow-action-trigger.is-disabled {
+.runtime-overflow-action-item.is-aria-disabled {
+  color: var(--el-text-color-placeholder);
   cursor: not-allowed;
-  pointer-events: auto;
 }
 
-.runtime-overflow-action-trigger.is-disabled:focus-visible {
+.runtime-overflow-action-item.is-aria-disabled:focus-visible {
   outline: 2px solid var(--el-color-primary);
   outline-offset: 2px;
 }
@@ -739,5 +739,43 @@
 
   .runtime-diagnostics-actions {
     flex-wrap: wrap;
+  }
+}
+
+@media (max-width: 900px), (max-height: 600px) {
+  .workspace-card.containers-main.is-runtime-logs .runtime-workspace {
+    flex: 0 0 auto;
+    height: auto;
+    overflow: visible;
+  }
+
+  .workspace-card.containers-main.is-runtime-logs .runtime-resource-tabs,
+  .runtime-resource-tabs .el-tabs__content,
+  .runtime-resource-tabs .el-tab-pane,
+  .runtime-resource-panel,
+  .runtime-log-workspace-tabs,
+  .runtime-log-workspace-tabs .el-tabs__content,
+  .runtime-log-workspace-tabs .el-tab-pane,
+  .runtime-log-live-surface,
+  .runtime-log-workbench {
+    height: auto;
+    overflow: visible;
+  }
+
+  .runtime-log-workspace-tabs,
+  .runtime-log-live-surface,
+  .runtime-log-workbench {
+    flex: 0 0 auto;
+  }
+
+  .runtime-log-virtual-list {
+    height: min(240px, 45vh);
+    min-height: min(240px, 45vh);
+    max-height: min(240px, 45vh);
+  }
+
+  .runtime-diagnostics-panel {
+    height: auto;
+    min-height: min(360px, 75vh);
   }
 }

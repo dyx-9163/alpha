@@ -19,4 +19,15 @@ describe('AIFAR Runtime summary responsive layout', () => {
     expect(css).toMatch(/@media \(max-width: 1440px\) \{(?:(?!@media)[\s\S])*?\.runtime-tab-toolbar\s*\{[^}]*flex-wrap:\s*wrap/)
     expect(css).toMatch(/@media \(max-width: 1440px\) \{(?:(?!@media)[\s\S])*?\.runtime-log-filters\s*\{[^}]*flex-wrap:\s*wrap/)
   })
+
+  it('provides a page scroll escape and relaxes the fixed-height chain at narrow or low viewports', async () => {
+    const runtimeCss = await readFile(new URL('./runtime.css', import.meta.url), 'utf8')
+    const containersView = await readFile(new URL('../../views/ContainersView.vue', import.meta.url), 'utf8')
+    const escapeMedia = /@media \(max-width: 900px\), \(max-height: 600px\) \{(?:(?!@media)[\s\S])*?/
+
+    expect(containersView).toMatch(new RegExp(`${escapeMedia.source}\\.containers-page\\.is-runtime-logs-page\\s*\\{[^}]*overflow-y:\\s*auto`))
+    expect(containersView).toMatch(new RegExp(`${escapeMedia.source}\\.workspace-card\\.containers-main\\.is-runtime-logs\\s*\\{[^}]*height:\\s*auto[^}]*overflow:\\s*visible`))
+    expect(runtimeCss).toMatch(new RegExp(`${escapeMedia.source}\\.workspace-card\\.containers-main\\.is-runtime-logs \\.runtime-workspace[^{]*\\{[^}]*height:\\s*auto[^}]*overflow:\\s*visible`))
+    expect(runtimeCss).toMatch(new RegExp(`${escapeMedia.source}\\.runtime-log-virtual-list\\s*\\{[^}]*min-height:\\s*min\\(240px, 45vh\\)`))
+  })
 })

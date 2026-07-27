@@ -1,13 +1,14 @@
 <template>
-  <el-dropdown-item :command="command" :disabled="isDisabled">
-    <el-tooltip :content="disabledReason" :disabled="!isDisabled" :trigger="['hover', 'focus']" placement="right">
-      <span
-        class="runtime-overflow-action-trigger"
-        :class="{ 'is-disabled': isDisabled }"
-        :tabindex="isDisabled ? 0 : undefined"
-        :aria-disabled="isDisabled || undefined"
-        :aria-describedby="isDisabled ? descriptionId : undefined"
-      >
+  <el-dropdown-item
+    :command="command"
+    class="runtime-overflow-action-item"
+    :class="{ 'is-aria-disabled': isDisabled }"
+    :aria-describedby="isDisabled ? descriptionId : undefined"
+    @focus="reasonTooltipVisible = isDisabled"
+    @blur="reasonTooltipVisible = false"
+  >
+    <el-tooltip v-model:visible="reasonTooltipVisible" :content="disabledReason" :disabled="!isDisabled" :trigger="['hover', 'focus']" placement="right">
+      <span ref="triggerRef" class="runtime-overflow-action-trigger">
         {{ label }}
       </span>
     </el-tooltip>
@@ -16,8 +17,12 @@
 </template>
 
 <script setup lang="ts">
-import { computed } from 'vue'
-import { runtimeOverflowReasonId, type RuntimeOverflowCommand } from './runtimeToolbar'
+import { computed, nextTick, onMounted, ref, watch } from 'vue'
+import {
+  runtimeOverflowReasonId,
+  syncRuntimeOverflowMenuItemState,
+  type RuntimeOverflowCommand
+} from './runtimeToolbar'
 
 const props = defineProps<{
   command: RuntimeOverflowCommand
@@ -27,4 +32,15 @@ const props = defineProps<{
 
 const isDisabled = computed(() => Boolean(props.disabledReason))
 const descriptionId = computed(() => runtimeOverflowReasonId(props.command))
+const triggerRef = ref<HTMLElement | null>(null)
+const reasonTooltipVisible = ref(false)
+
+function syncMenuItemState() {
+  syncRuntimeOverflowMenuItemState(triggerRef.value, isDisabled.value, descriptionId.value)
+}
+
+onMounted(syncMenuItemState)
+watch([isDisabled, descriptionId], () => {
+  void nextTick(syncMenuItemState)
+})
 </script>

@@ -121,6 +121,10 @@ function handleRuntimeOverflowCommand(command: RuntimeOverflowCommand) {
     install: openServiceInstallDialog,
     reconcile: reconcileAifarRuntime,
     cleanup: cleanupAifarRuntimeStale
+  }, {
+    install: serviceInstallDisabledReason.value,
+    reconcile: aifarRuntimeActionDisabledReason.value,
+    cleanup: runtimeCleanupDisabledReason.value
   })
 }
 </script>
