@@ -706,6 +706,130 @@ func TestManagerCompletesSuccessfulJob(t *testing.T) {
 	}
 }
 
+func TestManagerRejectsCancellationAfterCommitStarts(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "aifar.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	manager := NewManager(db)
+	committed := make(chan struct{})
+	finish := make(chan struct{})
+	task, err := manager.Start("test.commit-boundary", "srv-1", "tester", func(ctx context.Context, log Logger) error {
+		if !log.TryEnterCommit() {
+			return errors.New("commit boundary was rejected")
+		}
+		close(committed)
+		<-finish
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-committed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("task did not enter commit")
+	}
+	if manager.Cancel(task.ID) {
+		t.Fatal("cancellation must be rejected after commit starts")
+	}
+	close(finish)
+	waitForTaskStatus(t, db, task.ID, "success")
+	waitForManagerTaskCleanup(t, manager, task.ID)
+}
+
+func TestManagerCancellationWinsBeforeCommitStarts(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "aifar.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	manager := NewManager(db)
+	started := make(chan struct{})
+	tryCommit := make(chan struct{})
+	commitAccepted := make(chan bool, 1)
+	task, err := manager.Start("test.cancel-before-commit", "srv-1", "tester", func(ctx context.Context, log Logger) error {
+		close(started)
+		<-tryCommit
+		commitAccepted <- log.TryEnterCommit()
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("task did not start")
+	}
+	if !manager.Cancel(task.ID) {
+		t.Fatal("cancellation before commit must be accepted")
+	}
+	close(tryCommit)
+	if <-commitAccepted {
+		t.Fatal("commit must be rejected after cancellation wins")
+	}
+	waitForTaskStatus(t, db, task.ID, "cancelled")
+	waitForManagerTaskCleanup(t, manager, task.ID)
+}
+
+func TestManagerCommitAndCancellationRaceHasOneWinner(t *testing.T) {
+	for iteration := 0; iteration < 25; iteration++ {
+		db, err := store.Open(filepath.Join(t.TempDir(), "aifar.db"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		manager := NewManager(db)
+		started := make(chan struct{})
+		startRace := make(chan struct{})
+		finish := make(chan struct{})
+		commitAccepted := make(chan bool, 1)
+		task, err := manager.Start("test.commit-cancel-race", "srv-1", "tester", func(ctx context.Context, log Logger) error {
+			close(started)
+			<-startRace
+			commitAccepted <- log.TryEnterCommit()
+			<-finish
+			return nil
+		})
+		if err != nil {
+			db.Close()
+			t.Fatal(err)
+		}
+		select {
+		case <-started:
+		case <-time.After(2 * time.Second):
+			db.Close()
+			t.Fatalf("iteration %d: task did not start", iteration)
+		}
+		cancelAccepted := make(chan bool, 1)
+		go func() {
+			<-startRace
+			cancelAccepted <- manager.Cancel(task.ID)
+		}()
+		close(startRace)
+		commitWon := <-commitAccepted
+		cancelWon := <-cancelAccepted
+		if commitWon == cancelWon {
+			close(finish)
+			db.Close()
+			t.Fatalf("iteration %d: expected exactly one winner, commit=%v cancel=%v", iteration, commitWon, cancelWon)
+		}
+		close(finish)
+		want := "cancelled"
+		if commitWon {
+			want = "success"
+		}
+		waitForTaskStatus(t, db, task.ID, want)
+		waitForManagerTaskCleanup(t, manager, task.ID)
+		if err := db.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
 func TestManagerCancelAndSuccessClaimAreAtomic(t *testing.T) {
 	db, err := store.Open(filepath.Join(t.TempDir(), "aifar.db"))
 	if err != nil {
@@ -803,9 +927,10 @@ func waitForManagerTaskCleanup(t *testing.T, manager *Manager, taskID string) {
 		manager.mu.Lock()
 		_, hasCancel := manager.cancels[taskID]
 		_, hasCancelRequest := manager.cancelRequested[taskID]
+		_, hasCommit := manager.committing[taskID]
 		_, hasLanguage := manager.languages[taskID]
 		manager.mu.Unlock()
-		if !hasCancel && !hasCancelRequest && !hasLanguage {
+		if !hasCancel && !hasCancelRequest && !hasCommit && !hasLanguage {
 			return
 		}
 		time.Sleep(10 * time.Millisecond)

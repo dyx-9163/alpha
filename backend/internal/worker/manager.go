@@ -30,6 +30,17 @@ func (l Logger) TaskID() string {
 	return l.taskID
 }
 
+func (l Logger) TryEnterCommit() bool {
+	if !l.manager.tryEnterCommit(l.taskID) {
+		return false
+	}
+	l.manager.mu.Lock()
+	lang := l.manager.languages[l.taskID]
+	l.manager.mu.Unlock()
+	l.manager.AppendTargetLog(l.taskID, l.target, "info", i18n.Text(lang, "worker.taskCommitStarted"))
+	return true
+}
+
 func (l Logger) Target(target string) Logger {
 	l.target = target
 	return l
@@ -74,6 +85,7 @@ type Manager struct {
 	subscribers        map[string]map[chan store.TaskLog]struct{}
 	cancels            map[string]context.CancelFunc
 	cancelRequested    map[string]bool
+	committing         map[string]bool
 	languages          map[string]string
 }
 
@@ -91,6 +103,7 @@ func NewManagerWithConcurrency(s *store.Store, defaultConcurrency int) *Manager 
 		subscribers:        map[string]map[chan store.TaskLog]struct{}{},
 		cancels:            map[string]context.CancelFunc{},
 		cancelRequested:    map[string]bool{},
+		committing:         map[string]bool{},
 		languages:          map[string]string{},
 	}
 }
@@ -152,6 +165,7 @@ func (m *Manager) StartExistingWithLanguage(task store.Task, lang string, job Jo
 			m.mu.Lock()
 			delete(m.cancels, task.ID)
 			delete(m.cancelRequested, task.ID)
+			delete(m.committing, task.ID)
 			delete(m.languages, task.ID)
 			m.mu.Unlock()
 		}()
@@ -203,20 +217,32 @@ func (m *Manager) claimJobOutcome(taskID string, ctx context.Context, jobErr err
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	cancelRequested := m.cancelRequested[taskID]
+	committing := m.committing[taskID]
 	switch {
 	case panicked:
 		delete(m.cancels, taskID)
 		delete(m.cancelRequested, taskID)
+		delete(m.committing, taskID)
 		return "failed"
+	case committing && jobErr != nil:
+		delete(m.cancelRequested, taskID)
+		delete(m.committing, taskID)
+		return "failed"
+	case committing:
+		delete(m.cancelRequested, taskID)
+		delete(m.committing, taskID)
+		return "success"
 	case cancelRequested || ctx.Err() != nil:
 		return "cancelled"
 	case jobErr != nil:
 		delete(m.cancels, taskID)
 		delete(m.cancelRequested, taskID)
+		delete(m.committing, taskID)
 		return "failed"
 	default:
 		delete(m.cancels, taskID)
 		delete(m.cancelRequested, taskID)
+		delete(m.committing, taskID)
 		return "success"
 	}
 }
@@ -324,6 +350,17 @@ func (m *Manager) Cancel(taskID string) bool {
 		return false
 	}
 	m.AppendLog(taskID, "warn", i18n.Text(lang, "worker.cancelRequested"))
+	return true
+}
+
+func (m *Manager) tryEnterCommit(taskID string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.cancelRequested[taskID] || m.committing[taskID] || m.cancels[taskID] == nil {
+		return false
+	}
+	delete(m.cancels, taskID)
+	m.committing[taskID] = true
 	return true
 }
 
