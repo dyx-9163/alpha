@@ -843,6 +843,53 @@ func TestDeleteRemovesOnlyVerifiedManagedBackupDirectory(t *testing.T) {
 	}
 }
 
+func TestStagedDeleteCanRollbackVerifiedQuarantineBeforeRecordTransition(t *testing.T) {
+	// Production break caught: a failed control-plane transition must restore the exact verified directory instead of losing the only archive.
+	repo, paths, backup := committedBackup(t, "backup-delete-rollback")
+	deletion, err := repo.BeginDelete(backup)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(paths.Directory); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("managed directory was not isolated: %v", err)
+	}
+	if competing, err := acquireRepositoryFileLock(repo.root); err == nil {
+		_ = competing.release()
+		t.Fatal("staged deletion released the cross-process repository lock before the record transition")
+	}
+	if err := deletion.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	competing, err := acquireRepositoryFileLock(repo.root)
+	if err != nil {
+		t.Fatalf("rollback did not release repository lock: %v", err)
+	}
+	if err := competing.release(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.Verify(backup); err != nil {
+		t.Fatalf("rolled-back backup no longer verifies: %v", err)
+	}
+}
+
+func TestStagedDeleteFinalizesOnlyAfterCallerCommitsRecordTransition(t *testing.T) {
+	// Production break caught: final recursive removal must be an explicit second phase, not part of quarantine.
+	repo, paths, backup := committedBackup(t, "backup-delete-finalize")
+	deletion, err := repo.BeginDelete(backup)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := deletion.Finalize(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(paths.Directory); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("backup directory remains: %v", err)
+	}
+	if err := deletion.Rollback(); err == nil {
+		t.Fatal("completed deletion allowed a second terminal action")
+	}
+}
+
 func TestDeleteRejectsUnverifiedOrOutsideTargets(t *testing.T) {
 	t.Run("outside record path", func(t *testing.T) {
 		repo, paths, backup := committedBackup(t, "backup-delete-outside")

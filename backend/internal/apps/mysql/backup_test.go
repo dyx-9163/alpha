@@ -175,6 +175,76 @@ func TestBackupRetentionFailureWarnsWithoutFailingNewSuccessfulBackup(t *testing
 	}
 }
 
+func TestBackupRetentionRollsBackQuarantineWhenDeletedRecordCannotBeMarked(t *testing.T) {
+	// Production break caught: retention must restore an old verified archive if its database transition fails after quarantine.
+	module, data, _ := newStandaloneBackupModule(t)
+	request := standaloneBackupRequest(t)
+	repository, err := backuprepo.New(request.RepositoryDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	paths, err := repository.Prepare("backup_retention_rollback")
+	if err != nil {
+		t.Fatal(err)
+	}
+	archive := []byte("old rollback archive")
+	if err := os.WriteFile(paths.PartialArchive, archive, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	digest := fmt.Sprintf("%x", sha256.Sum256(archive))
+	if err := repository.Commit(paths, []byte(`{"backupId":"backup_retention_rollback","app":"mysql"}`), digest, int64(len(archive))); err != nil {
+		t.Fatal(err)
+	}
+	data.backups = append(data.backups, store.AppBackup{ID: "backup_retention_rollback", App: "mysql", InstanceID: request.Instance.ID, ServerID: request.Instance.ServerID, BackupType: "logical-full", Status: "success", Path: paths.Archive, Checksum: digest, Size: int64(len(archive)), Metadata: `{}`, CreatedAt: time.Now().UTC().Add(-time.Hour)})
+	data.markDeleteErr = errors.New("injected secret database detail")
+	request.KeepLast = 1
+	recorder := &backupRecorder{}
+	if err := module.Backup(context.Background(), request, registry.RunContext{TaskID: "tsk_1234567890abcdef12345678", Log: recorder}); err != nil {
+		t.Fatal(err)
+	}
+	old, err := data.GetAppBackup("backup_retention_rollback")
+	if err != nil || old.Status != "success" {
+		t.Fatalf("old record=%+v err=%v", old, err)
+	}
+	if _, err := repository.Verify(old); err != nil {
+		t.Fatalf("old archive was not restored: %v", err)
+	}
+	joined := strings.Join(recorder.messages, "\n")
+	if !strings.Contains(joined, "MySQL backup retention cleanup failed") || strings.Contains(joined, "secret database detail") {
+		t.Fatalf("retention warning=%q", joined)
+	}
+}
+
+func TestBackupRetentionDoesNotDeleteForeignOrNonStandaloneRecord(t *testing.T) {
+	// Production break caught: Task 7 retention must fail closed on a record not owned by the current standalone MySQL instance.
+	module, data, _ := newStandaloneBackupModule(t)
+	request := standaloneBackupRequest(t)
+	repository, err := backuprepo.New(request.RepositoryDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	paths, err := repository.Prepare("backup_foreign_retention")
+	if err != nil {
+		t.Fatal(err)
+	}
+	archive := []byte("foreign archive")
+	if err := os.WriteFile(paths.PartialArchive, archive, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	digest := fmt.Sprintf("%x", sha256.Sum256(archive))
+	if err := repository.Commit(paths, []byte(`{"backupId":"backup_foreign_retention","app":"mysql"}`), digest, int64(len(archive))); err != nil {
+		t.Fatal(err)
+	}
+	data.backups = append(data.backups, store.AppBackup{ID: "backup_foreign_retention", App: "redis", InstanceID: request.Instance.ID, ServerID: request.Instance.ServerID, BackupType: "logical-full", Status: "success", Path: paths.Archive, Checksum: digest, Size: int64(len(archive)), Metadata: `{}`, CreatedAt: time.Now().UTC().Add(-time.Hour)})
+	request.KeepLast = 1
+	if err := module.Backup(context.Background(), request, registry.RunContext{TaskID: "tsk_1234567890abcdef12345678", Log: &backupRecorder{}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(paths.Directory); err != nil {
+		t.Fatalf("foreign archive changed: %v", err)
+	}
+}
+
 func TestBackupVerifyServiceValidatesRepositoryBeforeMySQLContactAndPreservesArchiveIdentity(t *testing.T) {
 	// Production break caught: verification must use only the controlled repository, persist non-secret result metadata, and never inspect MySQL.
 	module, data, remote := newStandaloneBackupModule(t)
@@ -237,6 +307,57 @@ func TestBackupVerifyServiceRejectsInvalidRepositoryBeforeMySQLContact(t *testin
 	}
 	if !strings.Contains(failed.Metadata, `"verificationResult":"failed"`) {
 		t.Fatalf("failed verification metadata=%s", failed.Metadata)
+	}
+}
+
+func TestBackupVerifyServiceRejectsMalformedOrNonObjectMetadataWithoutWriting(t *testing.T) {
+	// Production break caught: verification must not replace malformed metadata with a new object and silently erase provenance fields.
+	for _, metadata := range []string{"{", "null", `{} {}`, `[]`} {
+		t.Run(metadata, func(t *testing.T) {
+			module, data, _ := newStandaloneBackupModule(t)
+			root := filepath.Join(t.TempDir(), "repository")
+			repository, err := backuprepo.New(root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			id := store.NewID("backup")
+			paths, err := repository.Prepare(id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			archive := []byte("strict metadata")
+			if err := os.WriteFile(paths.PartialArchive, archive, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			digest := fmt.Sprintf("%x", sha256.Sum256(archive))
+			if err := repository.Commit(paths, []byte(`{"backupId":"`+id+`","app":"mysql"}`), digest, int64(len(archive))); err != nil {
+				t.Fatal(err)
+			}
+			data.backups = []store.AppBackup{{ID: id, App: "mysql", InstanceID: data.instance.ID, ServerID: data.instance.ServerID, BackupType: "logical-full", Status: "success", Path: paths.Archive, Checksum: digest, Size: int64(len(archive)), Metadata: metadata}}
+			err = module.VerifyBackup(context.Background(), id, root, "en", registry.RunContext{TaskID: "tsk_verify_1234567890abcdef", Log: &backupRecorder{}})
+			if err == nil {
+				t.Fatalf("metadata %q was accepted", metadata)
+			}
+			if data.saveCalls != 0 || data.backups[0].Metadata != metadata {
+				t.Fatalf("metadata %q was rewritten: calls=%d record=%+v", metadata, data.saveCalls, data.backups[0])
+			}
+		})
+	}
+}
+
+func TestBackupVerifyServiceRejectsNonStandaloneOwnershipBeforeRepositoryContact(t *testing.T) {
+	// Production break caught: Task 7 cannot verify cluster-owned records under a standalone instance lifecycle.
+	module, data, _ := newStandaloneBackupModule(t)
+	data.instance.Topology = "innodb-cluster"
+	id := store.NewID("backup")
+	data.backups = []store.AppBackup{{ID: id, App: "mysql", InstanceID: data.instance.ID, ServerID: data.instance.ServerID, BackupType: "logical-full", Status: "success", Path: filepath.Join(t.TempDir(), "outside.tar"), Checksum: strings.Repeat("a", 64), Size: 1, Metadata: `{}`}}
+	err := module.VerifyBackup(context.Background(), id, filepath.Join(t.TempDir(), "missing-repository"), "en", registry.RunContext{TaskID: "tsk_verify_1234567890abcdef", Log: &backupRecorder{}})
+	var operationErr *MySQLOperationError
+	if !errors.As(err, &operationErr) || operationErr.Code != MySQLBackupStandaloneRequired {
+		t.Fatalf("error=%v, want %s", err, MySQLBackupStandaloneRequired)
+	}
+	if data.saveCalls != 0 {
+		t.Fatalf("non-standalone verification wrote %d records", data.saveCalls)
 	}
 }
 
@@ -614,6 +735,7 @@ func (f *chmodFailCloseFailSecretContextFile) Close() error {
 
 type backupFakeStore struct {
 	server                  store.Server
+	instance                store.AppInstance
 	credential              store.Credential
 	credentialErr           error
 	credentialLoads         int
@@ -624,19 +746,28 @@ type backupFakeStore struct {
 	saveErrUsed             bool
 	statusAtDelete          string
 	successSaveCalls        int
+	saveCalls               int
 	failRepeatedSuccessSave bool
+	markDeleteErr           error
 }
 
 func newBackupFakeStore(t *testing.T) *backupFakeStore {
 	t.Helper()
 	return &backupFakeStore{
 		server:     store.Server{ID: "srv_1234567890abcdef12345678", Name: "mysql", Host: "10.0.0.8", Username: "root"},
+		instance:   store.AppInstance{ID: "app_1234567890abcdef12345678", App: "mysql", ServerID: "srv_1234567890abcdef12345678", Version: "8.0.36", Status: "installed", Topology: "standalone", Metadata: `{"port":3306,"rootUser":"root","endpoint":"10.0.0.8:3306"}`},
 		credential: store.Credential{ID: "cred_1234567890abcdef12345678", Kind: "mysql", Username: "root", Status: "active", Purpose: "admin", Secret: map[string]string{"password": "top-secret"}},
 	}
 }
 
 func (s *backupFakeStore) GetServer(id string, includeSecret bool) (store.Server, error) {
 	return s.server, nil
+}
+func (s *backupFakeStore) GetAppInstance(id string) (store.AppInstance, error) {
+	if s.instance.ID != id {
+		return store.AppInstance{}, errors.New("instance not found")
+	}
+	return s.instance, nil
 }
 func (s *backupFakeStore) SaveAppInstance(v store.AppInstance) (store.AppInstance, error) {
 	return v, nil
@@ -651,6 +782,7 @@ func (s *backupFakeStore) GetBoundCredential(instanceID, purpose string, include
 	return s.credential, nil
 }
 func (s *backupFakeStore) SaveAppBackup(value store.AppBackup) (store.AppBackup, error) {
+	s.saveCalls++
 	if value.Status == "success" {
 		s.successSaveCalls++
 		if s.failRepeatedSuccessSave && s.successSaveCalls > 1 {
@@ -686,6 +818,9 @@ func (s *backupFakeStore) GetAppBackup(id string) (store.AppBackup, error) {
 	return store.AppBackup{}, errors.New("backup not found")
 }
 func (s *backupFakeStore) MarkAppBackupDeleted(id string, completedAt time.Time) (store.AppBackup, error) {
+	if s.markDeleteErr != nil {
+		return store.AppBackup{}, s.markDeleteErr
+	}
 	for index := range s.backups {
 		if s.backups[index].ID != id {
 			continue

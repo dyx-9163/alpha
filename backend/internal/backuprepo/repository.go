@@ -47,6 +47,18 @@ type Verification struct {
 	Size     int64
 }
 
+// DeleteTransaction keeps the repository's process and cross-process locks
+// across the control-plane record transition. Exactly one of Finalize or
+// Rollback may be called.
+type DeleteTransaction struct {
+	repository     *Repository
+	lease          *repositoryFileLease
+	quarantineName string
+	originalName   string
+	expected       os.FileInfo
+	active         bool
+}
+
 type backupManifestIdentity struct {
 	BackupID string `json:"backupId"`
 }
@@ -473,12 +485,38 @@ func (r *Repository) verifyAnchored(backup store.AppBackup) (Verification, *stab
 }
 
 func (r *Repository) Delete(backup store.AppBackup) (retErr error) {
-	return r.withRepositoryLock(func() error {
-		return r.deleteUnlocked(backup)
-	})
+	deletion, err := r.BeginDelete(backup)
+	if err != nil {
+		return err
+	}
+	return deletion.finalize(true)
 }
 
-func (r *Repository) deleteUnlocked(backup store.AppBackup) (retErr error) {
+// BeginDelete verifies and atomically isolates a managed backup directory
+// while retaining the repository locks for the caller's record transition.
+func (r *Repository) BeginDelete(backup store.AppBackup) (*DeleteTransaction, error) {
+	if r == nil || r.mutex == nil {
+		return nil, errors.New("backup repository lock is not initialized")
+	}
+	r.mutex.Lock()
+	lease, err := acquireRepositoryFileLock(r.root)
+	if err != nil {
+		r.mutex.Unlock()
+		return nil, fmt.Errorf("acquire backup repository lock: %w", err)
+	}
+	quarantineName, expected, err := r.quarantineUnlocked(backup)
+	if err != nil {
+		err = errors.Join(err, lease.release())
+		r.mutex.Unlock()
+		return nil, err
+	}
+	return &DeleteTransaction{
+		repository: r, lease: lease, quarantineName: quarantineName,
+		originalName: backup.ID, expected: expected, active: true,
+	}, nil
+}
+
+func (r *Repository) quarantineUnlocked(backup store.AppBackup) (quarantineName string, expected os.FileInfo, retErr error) {
 	verification, boundaries, err := r.verifyAnchored(backup)
 	defer func() {
 		if boundaries != nil {
@@ -486,95 +524,140 @@ func (r *Repository) deleteUnlocked(backup store.AppBackup) (retErr error) {
 		}
 	}()
 	if err != nil {
-		return err
+		return "", nil, err
 	}
 	paths := verification.Paths
 	if samePath(paths.Directory, r.root) || !samePath(filepath.Dir(paths.Directory), r.root) {
-		return errors.New("refusing to delete repository root or outside path")
+		return "", nil, errors.New("refusing to delete repository root or outside path")
 	}
 	if err := boundaries.recheck(); err != nil {
-		return err
+		return "", nil, err
 	}
 	boundaries.closeManagedDirectory()
 	if err := r.checkpoint("delete.after-verify", paths.Directory); err != nil {
-		return err
+		return "", nil, err
 	}
 	if err := recheckStableObject(boundaries.root); err != nil {
-		return err
+		return "", nil, err
 	}
 	managedNow, err := platformOpenDirectoryAt(boundaries.root.file, boundaries.root.path, backup.ID)
 	if err != nil {
-		return err
+		return "", nil, err
 	}
 	managedInfo, err := managedNow.Stat()
 	managedNow.Close()
 	if err != nil || !os.SameFile(boundaries.directory.info, managedInfo) {
-		return errors.New("managed backup directory changed after verification")
+		return "", nil, errors.New("managed backup directory changed after verification")
 	}
 	quarantine, err := uniqueSiblingPath(r.root, ".delete-"+backup.ID+"-")
 	if err != nil {
-		return err
+		return "", nil, err
 	}
 	if err := r.checkpoint("delete.before-quarantine", quarantine); err != nil {
-		return err
+		return "", nil, err
 	}
 	if err := recheckStableObject(boundaries.root); err != nil {
-		return err
+		return "", nil, err
 	}
 	managedNow, err = platformOpenDirectoryAt(boundaries.root.file, boundaries.root.path, backup.ID)
 	if err != nil {
-		return err
+		return "", nil, err
 	}
 	managedInfo, err = managedNow.Stat()
 	managedNow.Close()
 	if err != nil || !os.SameFile(boundaries.directory.info, managedInfo) {
-		return errors.New("managed backup directory changed before quarantine")
+		return "", nil, errors.New("managed backup directory changed before quarantine")
 	}
-	quarantineName := filepath.Base(quarantine)
-	if err := platformRenameNoReplaceAt(boundaries.root.file, boundaries.root.path, backup.ID, quarantineName); err != nil {
-		return fmt.Errorf("quarantine managed backup directory: %w", err)
+	stagedName := filepath.Base(quarantine)
+	if err := platformRenameNoReplaceAt(boundaries.root.file, boundaries.root.path, backup.ID, stagedName); err != nil {
+		return "", nil, fmt.Errorf("quarantine managed backup directory: %w", err)
 	}
 	quarantined := true
 	defer func() {
 		if retErr != nil && quarantined {
-			retErr = errors.Join(retErr, restoreQuarantined(boundaries.root, quarantineName, backup.ID, boundaries.directory.info))
+			retErr = errors.Join(retErr, restoreQuarantined(boundaries.root, stagedName, backup.ID, boundaries.directory.info))
 		}
 	}()
 	if err := r.checkpoint("delete.after-quarantine", quarantine); err != nil {
-		return err
+		return "", nil, err
 	}
-	quarantineHandle, err := platformOpenDirectoryAt(boundaries.root.file, boundaries.root.path, quarantineName)
+	quarantineHandle, err := platformOpenDirectoryAt(boundaries.root.file, boundaries.root.path, stagedName)
 	if err != nil {
-		return err
+		return "", nil, err
 	}
 	quarantineInfo, err := quarantineHandle.Stat()
 	quarantineHandle.Close()
 	if err != nil || !os.SameFile(boundaries.directory.info, quarantineInfo) {
-		return errors.New("quarantined backup directory changed identity")
+		return "", nil, errors.New("quarantined backup directory changed identity")
 	}
 	if err := recheckStableObject(boundaries.root); err != nil {
-		return err
+		return "", nil, err
 	}
+	quarantined = false
+	return stagedName, boundaries.directory.info, nil
+}
+
+func (deletion *DeleteTransaction) Finalize() (retErr error) {
+	return deletion.finalize(false)
+}
+
+func (deletion *DeleteTransaction) finalize(restoreOnFailure bool) (retErr error) {
+	if deletion == nil || !deletion.active {
+		return errors.New("backup deletion transaction is not active")
+	}
+	deletion.active = false
+	defer func() {
+		if retErr != nil && restoreOnFailure {
+			retErr = errors.Join(retErr, restoreQuarantined(deletion.lease.root, deletion.quarantineName, deletion.originalName, deletion.expected))
+		}
+		retErr = errors.Join(retErr, deletion.release())
+	}()
+	r := deletion.repository
+	quarantine := filepath.Join(r.root, deletion.quarantineName)
 	if err := r.checkpoint("delete.before-recursive-remove", quarantine); err != nil {
 		return err
 	}
-	quarantineHandle, err = platformOpenDirectoryAt(boundaries.root.file, boundaries.root.path, quarantineName)
+	if err := recheckStableObject(deletion.lease.root); err != nil {
+		return err
+	}
+	handle, err := platformOpenDirectoryAt(deletion.lease.root.file, deletion.lease.root.path, deletion.quarantineName)
 	if err != nil {
 		return err
 	}
-	quarantineInfo, err = quarantineHandle.Stat()
-	quarantineHandle.Close()
-	if err != nil || !os.SameFile(boundaries.directory.info, quarantineInfo) {
+	info, statErr := handle.Stat()
+	handle.Close()
+	if statErr != nil || !os.SameFile(deletion.expected, info) {
 		return errors.New("quarantine changed after final identity check")
 	}
-	if err := recheckStableObject(boundaries.root); err != nil {
-		return err
-	}
-	quarantined = false
-	if err := platformRemoveTreeAt(boundaries.root.file, boundaries.root.path, quarantineName, boundaries.directory.info); err != nil {
+	if err := platformRemoveTreeAt(deletion.lease.root.file, deletion.lease.root.path, deletion.quarantineName, deletion.expected); err != nil {
 		return fmt.Errorf("delete quarantined managed backup directory: %w", err)
 	}
 	return syncDirectory(r.root)
+}
+
+func (deletion *DeleteTransaction) Rollback() (retErr error) {
+	if deletion == nil || !deletion.active {
+		return errors.New("backup deletion transaction is not active")
+	}
+	deletion.active = false
+	defer func() { retErr = errors.Join(retErr, deletion.release()) }()
+	return restoreQuarantined(deletion.lease.root, deletion.quarantineName, deletion.originalName, deletion.expected)
+}
+
+func (deletion *DeleteTransaction) release() error {
+	if deletion == nil {
+		return nil
+	}
+	var err error
+	if deletion.lease != nil {
+		err = deletion.lease.release()
+		deletion.lease = nil
+	}
+	if deletion.repository != nil && deletion.repository.mutex != nil {
+		deletion.repository.mutex.Unlock()
+		deletion.repository = nil
+	}
+	return err
 }
 
 func restoreQuarantined(root stableObject, quarantineName, originalName string, expected os.FileInfo) error {
@@ -688,6 +771,12 @@ func validateBackupID(backupID string) error {
 		return fmt.Errorf("invalid backup ID %q", backupID)
 	}
 	return nil
+}
+
+// ValidBackupID reports whether an API identifier can map to exactly one
+// managed repository child. It performs no filesystem access.
+func ValidBackupID(backupID string) bool {
+	return validateBackupID(backupID) == nil
 }
 
 func ensureNoSymlinkBoundaries(path string) error {

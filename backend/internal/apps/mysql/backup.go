@@ -34,6 +34,7 @@ const (
 
 type backupStore interface {
 	GetBoundCredential(appInstanceID, purpose string, includeSecret bool) (store.Credential, error)
+	GetAppInstance(id string) (store.AppInstance, error)
 	GetAppBackup(id string) (store.AppBackup, error)
 	SaveAppBackup(store.AppBackup) (store.AppBackup, error)
 	ListAppBackupsForInstances(instanceIDs []string, includeDeleted bool) ([]store.AppBackup, error)
@@ -123,10 +124,9 @@ func (m Module) VerifyBackup(ctx context.Context, backupID, repositoryDir, langu
 		return errors.New("MySQL backup store is unavailable")
 	}
 	copy := BackupCopyFor(language)
-	titleKeys := []string{"load-instance", "build-manifest", "verify-checksum", "record-backup"}
 	steps := make([]installflow.Step, len(backupVerificationStepNames))
 	for index, name := range backupVerificationStepNames {
-		steps[index] = installflow.Step{Name: name, Title: copy.StepTitles[titleKeys[index]]}
+		steps[index] = installflow.Step{Name: name, Title: copy.StepTitles[name]}
 	}
 	recorder, _ := run.Log.(installflow.Recorder)
 	installflow.StartTarget(recorder, backupID)
@@ -148,10 +148,17 @@ func (m Module) VerifyBackup(ctx context.Context, backupID, repositoryDir, langu
 		var err error
 		backup, err = data.GetAppBackup(backupID)
 		if err != nil {
-			return err
+			return localizedMySQLOperationError(language, MySQLBackupVerifyNotAllowed)
 		}
 		if backup.App != "mysql" || backup.Status != "success" {
-			return errors.New("MySQL backup is not eligible for verification")
+			return localizedMySQLOperationError(language, MySQLBackupVerifyNotAllowed)
+		}
+		if _, err := strictBackupMetadata(backup.Metadata); err != nil {
+			return localizedMySQLOperationError(language, MySQLBackupVerifyFailed)
+		}
+		instance, err := data.GetAppInstance(backup.InstanceID)
+		if err != nil || instance.App != "mysql" || instanceTopology(instance) != "standalone" || instance.ID != backup.InstanceID || instance.ServerID != backup.ServerID || backup.BackupType != "logical-full" {
+			return localizedMySQLOperationError(language, MySQLBackupStandaloneRequired)
 		}
 		return nil
 	}); err != nil {
@@ -165,41 +172,43 @@ func (m Module) VerifyBackup(ctx context.Context, backupID, repositoryDir, langu
 			verification, err = repository.Verify(backup)
 		}
 		if err != nil {
-			return errors.Join(err, recordBackupVerification(data, backup, "failed"))
+			if recordErr := recordBackupVerification(data, backup, "failed"); recordErr != nil {
+				return errors.Join(localizedMySQLOperationError(language, MySQLBackupVerifyFailed), localizedMySQLOperationError(language, MySQLBackupVerificationRecordFailed))
+			}
+			return localizedMySQLOperationError(language, MySQLBackupVerifyFailed)
 		}
 		return nil
 	}); err != nil {
-		installflow.FinishTarget(recorder, backupID, "failed", "backup verification failed")
+		installflow.FinishTarget(recorder, backupID, "failed", copy.VerificationFailed)
 		return err
 	}
 	if err := step(3, func() error {
 		if verification.SHA256 != backup.Checksum || verification.Size != backup.Size || !sameBackupPath(verification.Paths.Archive, backup.Path) {
-			return errors.New("verified backup identity does not match its record")
+			return localizedMySQLOperationError(language, MySQLBackupVerifyFailed)
 		}
 		return ctx.Err()
 	}); err != nil {
 		_ = recordBackupVerification(data, backup, "failed")
-		installflow.FinishTarget(recorder, backupID, "failed", "backup verification failed")
+		installflow.FinishTarget(recorder, backupID, "failed", copy.VerificationFailed)
 		return err
 	}
 	if err := step(4, func() error { return recordBackupVerification(data, backup, "success") }); err != nil {
-		installflow.FinishTarget(recorder, backupID, "failed", "backup verification result could not be recorded")
-		return err
+		installflow.FinishTarget(recorder, backupID, "failed", copy.VerificationRecordFailed)
+		return localizedMySQLOperationError(language, MySQLBackupVerificationRecordFailed)
 	}
 	installflow.FinishTarget(recorder, backupID, "success", "")
 	return nil
 }
 
 func recordBackupVerification(data backupStore, backup store.AppBackup, result string) error {
-	metadata := map[string]any{}
-	if strings.TrimSpace(backup.Metadata) != "" {
-		_ = json.Unmarshal([]byte(backup.Metadata), &metadata)
+	metadata, err := strictBackupMetadata(backup.Metadata)
+	if err != nil {
+		return err
 	}
-	if metadata == nil {
-		metadata = map[string]any{}
-	}
-	metadata["verificationResult"] = result
-	metadata["verifiedAt"] = time.Now().UTC().Format(time.RFC3339Nano)
+	resultJSON, _ := json.Marshal(result)
+	verifiedAtJSON, _ := json.Marshal(time.Now().UTC().Format(time.RFC3339Nano))
+	metadata["verificationResult"] = resultJSON
+	metadata["verifiedAt"] = verifiedAtJSON
 	encoded, err := json.Marshal(metadata)
 	if err != nil {
 		return err
@@ -207,6 +216,24 @@ func recordBackupVerification(data backupStore, backup store.AppBackup, result s
 	backup.Metadata = string(encoded)
 	_, err = data.SaveAppBackup(backup)
 	return err
+}
+
+func strictBackupMetadata(value string) (map[string]json.RawMessage, error) {
+	decoder := json.NewDecoder(strings.NewReader(value))
+	decoder.UseNumber()
+	metadata := map[string]json.RawMessage{}
+	if err := decoder.Decode(&metadata); err != nil || metadata == nil {
+		return nil, errors.New("backup metadata must be one JSON object")
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		return nil, errors.New("backup metadata must contain one JSON object")
+	}
+	return metadata, nil
+}
+
+func localizedMySQLOperationError(language, code string) error {
+	return errors.Join(mysqlOperationError(code), errors.New(MySQLBackupErrorText(language, code)))
 }
 
 func sameBackupPath(left, right string) bool {
@@ -510,7 +537,7 @@ func (s Service) backupStandalone(ctx context.Context, req registry.BackupReques
 		items, err := data.ListAppBackupsForInstances([]string{req.Instance.ID}, false)
 		if err != nil {
 			if run.Log != nil {
-				run.Log.Error("MySQL backup retention cleanup warning")
+				run.Log.Error("%s", copy.RetentionCleanupFailed)
 			}
 			return nil
 		}
@@ -531,21 +558,35 @@ func (s Service) backupStandalone(ctx context.Context, req registry.BackupReques
 			run.Log.Info(copy.RetentionSelected, len(candidates))
 		}
 		for _, candidate := range candidates {
+			if candidate.App != "mysql" || candidate.InstanceID != req.Instance.ID || candidate.ServerID != req.Instance.ServerID || candidate.BackupType != "logical-full" || instanceTopology(req.Instance) != "standalone" {
+				if run.Log != nil {
+					run.Log.Error("%s", copy.RetentionCleanupFailed)
+				}
+				continue
+			}
 			fresh, freshErr := data.GetAppBackup(candidate.ID)
 			if freshErr != nil || !sameBackupRecord(candidate, fresh) {
 				if run.Log != nil {
-					run.Log.Error("MySQL backup retention cleanup warning for backup %s", candidate.ID)
+					run.Log.Error("%s", copy.RetentionCleanupFailed)
 				}
 				continue
 			}
-			if deleteErr := repository.Delete(fresh); deleteErr != nil {
+			deletion, deleteErr := repository.BeginDelete(fresh)
+			if deleteErr != nil {
 				if run.Log != nil {
-					run.Log.Error("MySQL backup retention cleanup warning for backup %s", candidate.ID)
+					run.Log.Error("%s", copy.RetentionCleanupFailed)
 				}
 				continue
 			}
-			if _, markErr := data.MarkAppBackupDeleted(fresh.ID, time.Now().UTC()); markErr != nil && run.Log != nil {
-				run.Log.Error("MySQL backup retention cleanup warning for backup %s", candidate.ID)
+			if _, markErr := data.MarkAppBackupDeleted(fresh.ID, time.Now().UTC()); markErr != nil {
+				_ = deletion.Rollback()
+				if run.Log != nil {
+					run.Log.Error("%s", copy.RetentionCleanupFailed)
+				}
+				continue
+			}
+			if finalizeErr := deletion.Finalize(); finalizeErr != nil && run.Log != nil {
+				run.Log.Error("%s", copy.RetentionCleanupFailed)
 			}
 		}
 		return nil

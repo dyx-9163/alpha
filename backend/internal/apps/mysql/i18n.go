@@ -13,12 +13,15 @@ func MySQLBackupErrorText(lang, code string) string {
 }
 
 type BackupCopy struct {
-	StepStart           string
-	StepDone            string
-	StepFailed          string
-	RemoteCleanupFailed string
-	RetentionSelected   string
-	StepTitles          map[string]string
+	StepStart                string
+	StepDone                 string
+	StepFailed               string
+	RemoteCleanupFailed      string
+	RetentionSelected        string
+	RetentionCleanupFailed   string
+	VerificationFailed       string
+	VerificationRecordFailed string
+	StepTitles               map[string]string
 }
 
 func BackupCopyFor(lang string) BackupCopy {
@@ -27,13 +30,19 @@ func BackupCopyFor(lang string) BackupCopy {
 	for _, name := range names {
 		titles[name] = globali18n.Text(lang, "mysql.backup.step."+name)
 	}
+	for _, name := range []string{"load-backup", "verify-manifest", "verify-checksum", "record-verification"} {
+		titles[name] = globali18n.Text(lang, "mysql.backup.verify.step."+name)
+	}
 	return BackupCopy{
-		StepStart:           globali18n.Text(lang, "mysql.backup.stepStart"),
-		StepDone:            globali18n.Text(lang, "mysql.backup.stepDone"),
-		StepFailed:          globali18n.Text(lang, "mysql.backup.stepFailed"),
-		RemoteCleanupFailed: globali18n.Text(lang, "mysql.backup.remoteCleanupFailed"),
-		RetentionSelected:   globali18n.Text(lang, "mysql.backup.retentionSelected"),
-		StepTitles:          titles,
+		StepStart:                globali18n.Text(lang, "mysql.backup.stepStart"),
+		StepDone:                 globali18n.Text(lang, "mysql.backup.stepDone"),
+		StepFailed:               globali18n.Text(lang, "mysql.backup.stepFailed"),
+		RemoteCleanupFailed:      globali18n.Text(lang, "mysql.backup.remoteCleanupFailed"),
+		RetentionSelected:        globali18n.Text(lang, "mysql.backup.retentionSelected"),
+		RetentionCleanupFailed:   globali18n.Text(lang, "mysql.backup.retentionCleanupFailed"),
+		VerificationFailed:       globali18n.Text(lang, "mysql.backup.verificationFailed"),
+		VerificationRecordFailed: globali18n.Text(lang, "mysql.backup.verificationRecordFailed"),
+		StepTitles:               titles,
 	}
 }
 
