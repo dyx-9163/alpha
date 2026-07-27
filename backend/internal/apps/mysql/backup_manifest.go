@@ -10,17 +10,12 @@ import (
 )
 
 var (
-	strictSchemaName  = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]{0,63}$`)
-	secretAssignment  = regexp.MustCompile(`(?i)(password|passwd|secret|token|private[ _-]?key|credential)\s*[:=]`)
-	storeIDSuffix     = `(?:[0-9a-f]{24}|[1-9][0-9]{18})`
-	backupIDPattern   = regexp.MustCompile(`^backup_` + storeIDSuffix + `$`)
-	instanceIDPattern = regexp.MustCompile(`^app_` + storeIDSuffix + `$`)
-	serverIDPattern   = regexp.MustCompile(`^srv_` + storeIDSuffix + `$`)
-	clusterIDPattern  = regexp.MustCompile(`^(?:mysql_cluster|cluster)_` + storeIDSuffix + `$`)
-	taskIDPattern     = regexp.MustCompile(`^tsk_` + storeIDSuffix + `$`)
-	uuidPattern       = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
-	dnsLabelPattern   = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$`)
-	numericIPv4Alias  = regexp.MustCompile(`(?i)^(?:0x[0-9a-f]+|[0-9]+)(?:\.(?:0x[0-9a-f]+|[0-9]+)){0,3}$`)
+	strictSchemaName      = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]{0,63}$`)
+	secretAssignment      = regexp.MustCompile(`(?i)(password|passwd|secret|token|private[ _-]?key|credential)\s*[:=]`)
+	storeRandomIDSuffix   = regexp.MustCompile(`^[0-9a-f]{24}$`)
+	storeFallbackIDSuffix = regexp.MustCompile(`^[1-9][0-9]{18}$`)
+	uuidPattern           = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
+	dnsLabelPattern       = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$`)
 )
 
 var fixedSystemSchemas = []string{
@@ -41,9 +36,9 @@ func NormalizeBackupManifest(manifest BackupManifest) (BackupManifest, error) {
 		return BackupManifest{}, mysqlOperationError(MySQLBackupUnsupportedTopology)
 	}
 	if !manifest.Consistent || manifest.CreatedAt.IsZero() ||
-		!backupIDPattern.MatchString(manifest.BackupID) || !instanceIDPattern.MatchString(manifest.InstanceID) || !uuidPattern.MatchString(manifest.SourceServerUUID) || !taskIDPattern.MatchString(manifest.TaskID) ||
+		!validManifestStoreID(manifest.BackupID, "backup_") || !validManifestStoreID(manifest.InstanceID, "app_") || !uuidPattern.MatchString(manifest.SourceServerUUID) || !validManifestStoreID(manifest.TaskID, "tsk_") ||
 		!canonicalRequired(manifest.MySQLVersion, manifest.MySQLShellVersion) ||
-		!serverIDPattern.MatchString(manifest.SourceServerID) {
+		!validManifestStoreID(manifest.SourceServerID, "srv_") {
 		return BackupManifest{}, mysqlOperationError(MySQLRestoreManifestInvalid)
 	}
 	if containsSecretShape(manifest) {
@@ -71,7 +66,7 @@ func NormalizeBackupManifest(manifest BackupManifest) (BackupManifest, error) {
 			return BackupManifest{}, mysqlOperationError(MySQLRestoreManifestInvalid)
 		}
 	case "innodb-cluster":
-		if !clusterIDPattern.MatchString(manifest.ClusterID) {
+		if !validManifestStoreID(manifest.ClusterID, "mysql_cluster_", "cluster_") {
 			return BackupManifest{}, mysqlOperationError(MySQLRestoreManifestInvalid)
 		}
 		members, err := normalizeClusterMembers(manifest.Members, manifest.SourceServerID, manifest.SourceEndpoint)
@@ -185,7 +180,7 @@ func normalizeClusterMembers(members []ClusterMemberRef, sourceServerID, sourceE
 	result := append([]ClusterMemberRef(nil), members...)
 	for index := range result {
 		member := &result[index]
-		if !instanceIDPattern.MatchString(member.InstanceID) || !serverIDPattern.MatchString(member.ServerID) {
+		if !validManifestStoreID(member.InstanceID, "app_") || !validManifestStoreID(member.ServerID, "srv_") {
 			return nil, mysqlOperationError(MySQLBackupClusterUnhealthy)
 		}
 		endpoint, ok := canonicalEndpoint(member.Endpoint)
@@ -238,7 +233,7 @@ func normalizeRouters(routers []RouterRef) ([]RouterRef, error) {
 	seen := make(map[string]struct{}, len(result))
 	for index := range result {
 		router := result[index]
-		if !instanceIDPattern.MatchString(router.InstanceID) || !serverIDPattern.MatchString(router.ServerID) || !canonicalRequired(router.Status) {
+		if !validManifestStoreID(router.InstanceID, "app_") || !validManifestStoreID(router.ServerID, "srv_") || !canonicalRequired(router.Status) {
 			return nil, mysqlOperationError(MySQLRestoreManifestInvalid)
 		}
 		endpoint, ok := canonicalEndpoint(router.Endpoint)
@@ -280,7 +275,7 @@ func canonicalEndpoint(endpoint string) (string, bool) {
 		if strings.HasSuffix(host, ".") {
 			host = strings.TrimSuffix(host, ".")
 		}
-		if host == "" || len(host) > 253 || strings.HasSuffix(host, ".") || numericIPv4Alias.MatchString(host) {
+		if host == "" || len(host) > 253 || strings.HasSuffix(host, ".") || legacyIPv4Representable(host) {
 			return "", false
 		}
 		for _, label := range strings.Split(host, ".") {
@@ -290,6 +285,72 @@ func canonicalEndpoint(endpoint string) (string, bool) {
 		}
 	}
 	return net.JoinHostPort(host, port), true
+}
+
+func validManifestStoreID(value string, prefixes ...string) bool {
+	for _, prefix := range prefixes {
+		if !strings.HasPrefix(value, prefix) {
+			continue
+		}
+		suffix := strings.TrimPrefix(value, prefix)
+		if storeRandomIDSuffix.MatchString(suffix) {
+			return true
+		}
+		if !storeFallbackIDSuffix.MatchString(suffix) {
+			return false
+		}
+		parsed, err := strconv.ParseInt(suffix, 10, 64)
+		return err == nil && parsed > 0 && strconv.FormatInt(parsed, 10) == suffix
+	}
+	return false
+}
+
+func legacyIPv4Representable(host string) bool {
+	parts := strings.Split(host, ".")
+	if len(parts) < 1 || len(parts) > 4 {
+		return false
+	}
+	values := make([]uint64, len(parts))
+	for index, part := range parts {
+		value, ok := parseLegacyIPv4Component(part)
+		if !ok {
+			return false
+		}
+		values[index] = value
+	}
+	switch len(values) {
+	case 1:
+		return values[0] <= 0xffffffff
+	case 2:
+		return values[0] <= 0xff && values[1] <= 0xffffff
+	case 3:
+		return values[0] <= 0xff && values[1] <= 0xff && values[2] <= 0xffff
+	case 4:
+		return values[0] <= 0xff && values[1] <= 0xff && values[2] <= 0xff && values[3] <= 0xff
+	default:
+		return false
+	}
+}
+
+func parseLegacyIPv4Component(component string) (uint64, bool) {
+	if component == "" {
+		return 0, false
+	}
+	base := 10
+	digits := component
+	if len(component) > 1 && component[0] == '0' {
+		base = 8
+		digits = component[1:]
+		if len(component) > 2 && (component[1] == 'x' || component[1] == 'X') {
+			base = 16
+			digits = component[2:]
+		}
+	}
+	if digits == "" {
+		return 0, false
+	}
+	value, err := strconv.ParseUint(digits, base, 64)
+	return value, err == nil
 }
 
 func containsSecretShape(value any) bool {

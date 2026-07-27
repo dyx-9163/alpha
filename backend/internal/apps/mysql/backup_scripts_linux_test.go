@@ -57,7 +57,7 @@ func TestLogicalBackupScriptLinuxUsesDistinctDescriptorBoundInputsAfterReplaceme
 		t.Fatalf("backup wrote through replacement dump pathname: %v", err)
 	}
 	assertLogicalSecretAbsent(t, result)
-	assertNoLogicalJSResidue(t, paths.root)
+	assertNoLogicalJSResidue(t, paths.taskDir)
 }
 
 func TestLogicalRestoreScriptLinuxUsesDistinctDescriptorBoundInputsAfterReplacement(t *testing.T) {
@@ -91,7 +91,7 @@ func TestLogicalRestoreScriptLinuxUsesDistinctDescriptorBoundInputsAfterReplacem
 		t.Fatalf("restore read through replacement dump pathname: %v", err)
 	}
 	assertLogicalSecretAbsent(t, result)
-	assertNoLogicalJSResidue(t, paths.root)
+	assertNoLogicalJSResidue(t, paths.taskDir)
 }
 
 func TestLogicalScriptsLinuxCaptureFreshExactArgvForEveryRun(t *testing.T) {
@@ -112,7 +112,51 @@ func TestLogicalScriptsLinuxCaptureFreshExactArgvForEveryRun(t *testing.T) {
 				assertLogicalInvocation(t, result, kind, wantJS)
 				assertLogicalSecretAbsent(t, result)
 			}
-			assertNoLogicalJSResidue(t, paths.root)
+			assertNoLogicalJSResidue(t, paths.taskDir)
+		})
+	}
+}
+
+func TestLogicalScriptsLinuxResidueScannerRejectsAnySuffixAndJSContent(t *testing.T) {
+	// Production break caught: a suffix-only scan misses the exact generated JavaScript when it is left under .tmp or a neutral file name.
+	requireLinuxDescriptors(t)
+	const childEnv = "AIFAR_LOGICAL_RESIDUE_CHILD"
+	if fixture := os.Getenv(childEnv); fixture != "" {
+		taskDir := t.TempDir()
+		dumpDir := filepath.Join(taskDir, "dump")
+		mustMkdirLogical(t, dumpDir, 0o700)
+		writeLogicalTestFile(t, filepath.Join(taskDir, "secret-context.cnf"), logicalSentinelSecret+"\n", 0o600)
+		writeLogicalTestFile(t, filepath.Join(dumpDir, "aifar-fake-marker"), "backup\n", 0o600)
+		switch fixture {
+		case "name":
+			writeLogicalTestFile(t, filepath.Join(taskDir, "logical-backup.tmp"), "temporary residue\n", 0o600)
+		case "content":
+			writeLogicalTestFile(t, filepath.Join(taskDir, "scratch.tmp"), `util.loadDump("/proc/self/fd/7", {
+  threads: 4,
+  loadUsers: false,
+  ignoreExistingObjects: false,
+  skipBinlog: false,
+  showProgress: false
+});
+`, 0o600)
+		default:
+			t.Fatalf("unknown residue fixture %q", fixture)
+		}
+		assertNoLogicalJSResidue(t, taskDir)
+		return
+	}
+
+	for _, fixture := range []string{"name", "content"} {
+		t.Run(fixture, func(t *testing.T) {
+			command := exec.Command(os.Args[0], "-test.run=^TestLogicalScriptsLinuxResidueScannerRejectsAnySuffixAndJSContent$", "-test.count=1")
+			command.Env = append(os.Environ(), childEnv+"="+fixture)
+			output, err := command.CombinedOutput()
+			if err == nil {
+				t.Fatalf("residue scanner accepted %s fixture: %s", fixture, output)
+			}
+			if !strings.Contains(string(output), "persistent JS residue") {
+				t.Fatalf("%s fixture failed for the wrong reason: %v: %s", fixture, err, output)
+			}
 		})
 	}
 }
@@ -155,7 +199,7 @@ func TestLogicalScriptsLinuxRejectUnsafeControlledObjectsBeforeMySQLShell(t *tes
 					t.Fatal("mysqlsh was reached for an unsafe controlled object")
 				}
 				assertLogicalSecretAbsent(t, result)
-				assertNoLogicalJSResidue(t, paths.root)
+				assertNoLogicalJSResidue(t, paths.taskDir)
 			})
 		}
 	}
@@ -210,7 +254,7 @@ func TestLogicalScriptsLinuxPropagateExactMySQLShellExitCodesWithoutSecrets(t *t
 			}
 			assertLogicalInvocation(t, result, test.kind, wantJS)
 			assertLogicalSecretAbsent(t, result)
-			assertNoLogicalJSResidue(t, paths.root)
+			assertNoLogicalJSResidue(t, paths.taskDir)
 		})
 	}
 }
@@ -231,6 +275,7 @@ type logicalDescriptorCapture struct {
 	Kind     string `json:"kind"`
 	Identity string `json:"identity"`
 	Mode     string `json:"mode"`
+	Target   string `json:"target"`
 }
 
 type logicalMySQLShellCapture struct {
@@ -367,6 +412,10 @@ func assertLogicalInvocation(t *testing.T, result logicalLinuxResult, kind logic
 		}
 		fdPaths[path] = name
 	}
+	wantJSTarget := "/memfd:aifar-logical-" + string(kind) + " (deleted)"
+	if got := result.capture.Descriptors["js"].Target; got != wantJSTarget {
+		t.Fatalf("%s JS descriptor target = %q, want anonymous deleted memfd %q", kind, got, wantJSTarget)
+	}
 	if got := result.capture.JS; got != wantJS {
 		t.Fatalf("%s JS differs from hand-derived exact program:\n--- got ---\n%s--- want ---\n%s", kind, got, wantJS)
 	}
@@ -417,13 +466,36 @@ func assertLogicalSecretAbsent(t *testing.T, result logicalLinuxResult) {
 	}
 }
 
-func assertNoLogicalJSResidue(t *testing.T, root string) {
+func assertNoLogicalJSResidue(t *testing.T, taskDir string) {
 	t.Helper()
-	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+	details, err := os.Stat(taskDir)
+	if err != nil || !details.IsDir() {
+		return
+	}
+	err = filepath.WalkDir(taskDir, func(path string, entry os.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
-		if !entry.IsDir() && strings.HasSuffix(strings.ToLower(entry.Name()), ".js") {
+		if entry.IsDir() {
+			return nil
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		if !info.Mode().IsRegular() {
+			return nil
+		}
+		name := strings.ToLower(entry.Name())
+		if strings.Contains(name, "logical-backup") || strings.Contains(name, "logical-restore") {
+			return fmt.Errorf("persistent JS residue at %s", path)
+		}
+		content, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		text := string(content)
+		if strings.Contains(text, `util.dumpInstance("/proc/self/fd/`) || strings.Contains(text, `util.loadDump("/proc/self/fd/`) {
 			return fmt.Errorf("persistent JS residue at %s", path)
 		}
 		return nil
@@ -555,6 +627,7 @@ for name, path in paths.items():
         "kind": kind,
         "identity": "%d:%d" % (details.st_dev, details.st_ino),
         "mode": "%04o" % stat.S_IMODE(details.st_mode),
+        "target": os.readlink(path),
     }
 
 capture = {

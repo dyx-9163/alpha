@@ -221,106 +221,158 @@ func TestBackupManifestAcceptsCurrentStoreIDsAndCanonicalizesEndpointIdentity(t 
 	}
 }
 
-func TestBackupManifestAcceptsCanonicalStoreFallbackIDsForEveryManifestPrefix(t *testing.T) {
-	// Production break caught: rejecting the exact positive 19-digit UnixNano fallback emitted by Store.NewID would make a low-entropy failure impossible to persist or restore.
-	const fallback = "1785160000000000000"
-	manifest := validBackupManifest()
-	manifest.BackupID = "backup_" + fallback
-	manifest.InstanceID = "app_" + fallback
-	manifest.SourceServerID = "srv_" + fallback
-	manifest.TaskID = "tsk_" + fallback
-	if _, err := NormalizeBackupManifest(manifest); err != nil {
-		t.Fatalf("canonical Store.NewID fallback rejected: %v", err)
+func TestBackupManifestValidatesStoreIDSuffixBoundariesForEveryManifestPrefix(t *testing.T) {
+	// Production break caught: a shape-only decimal check accepts values outside signed int64 even though Store.NewID can only format a positive UnixNano int64.
+	suffixes := []struct {
+		name  string
+		value string
+		valid bool
+	}{
+		{name: "random_lower_hex", value: "0123456789abcdef01234567", valid: true},
+		{name: "current_unix_nano", value: "1785160000000000000", valid: true},
+		{name: "minimum_19_digit", value: "1000000000000000000", valid: true},
+		{name: "max_int64", value: "9223372036854775807", valid: true},
+		{name: "max_int64_plus_one", value: "9223372036854775808", valid: false},
+		{name: "zero", value: "0", valid: false},
+		{name: "leading_zero", value: "0178516000000000000", valid: false},
+		{name: "18_digits", value: "999999999999999999", valid: false},
+		{name: "20_digits", value: "10000000000000000000", valid: false},
+		{name: "random_upper_hex", value: "0123456789ABCDEF01234567", valid: false},
 	}
-
-	cluster := validClusterBackupManifest()
-	for _, clusterID := range []string{"mysql_cluster_" + fallback, "cluster_" + fallback} {
-		cluster.ClusterID = clusterID
-		if _, err := NormalizeBackupManifest(cluster); err != nil {
-			t.Fatalf("canonical cluster fallback %q rejected: %v", clusterID, err)
-		}
+	targets := []struct {
+		name  string
+		build func(string) BackupManifest
+	}{
+		{name: "backup", build: func(suffix string) BackupManifest {
+			manifest := validBackupManifest()
+			manifest.BackupID = "backup_" + suffix
+			return manifest
+		}},
+		{name: "instance", build: func(suffix string) BackupManifest {
+			manifest := validBackupManifest()
+			manifest.InstanceID = "app_" + suffix
+			return manifest
+		}},
+		{name: "server", build: func(suffix string) BackupManifest {
+			manifest := validBackupManifest()
+			manifest.SourceServerID = "srv_" + suffix
+			return manifest
+		}},
+		{name: "task", build: func(suffix string) BackupManifest {
+			manifest := validBackupManifest()
+			manifest.TaskID = "tsk_" + suffix
+			return manifest
+		}},
+		{name: "mysql_cluster", build: func(suffix string) BackupManifest {
+			manifest := validClusterBackupManifest()
+			manifest.ClusterID = "mysql_cluster_" + suffix
+			return manifest
+		}},
+		{name: "legacy_cluster", build: func(suffix string) BackupManifest {
+			manifest := validClusterBackupManifest()
+			manifest.ClusterID = "cluster_" + suffix
+			return manifest
+		}},
 	}
-}
-
-func TestBackupManifestRejectsMalformedStoreFallbackIDs(t *testing.T) {
-	// Production break caught: accepting leading-zero, non-positive, or arbitrary-length decimal suffixes would admit IDs Store.NewID can never emit.
-	for _, suffix := range []string{"0", "01", "1", "123456789012345678", "12345678901234567890"} {
-		for name, mutate := range map[string]func(*BackupManifest){
-			"backup":   func(m *BackupManifest) { m.BackupID = "backup_" + suffix },
-			"instance": func(m *BackupManifest) { m.InstanceID = "app_" + suffix },
-			"server":   func(m *BackupManifest) { m.SourceServerID = "srv_" + suffix },
-			"task":     func(m *BackupManifest) { m.TaskID = "tsk_" + suffix },
-		} {
-			t.Run(name+"_"+suffix, func(t *testing.T) {
-				manifest := validBackupManifest()
-				mutate(&manifest)
-				if _, err := NormalizeBackupManifest(manifest); err == nil {
-					t.Fatalf("malformed Store.NewID fallback suffix %q accepted for %s", suffix, name)
+	for _, suffix := range suffixes {
+		for _, target := range targets {
+			t.Run(target.name+"/"+suffix.name, func(t *testing.T) {
+				_, err := NormalizeBackupManifest(target.build(suffix.value))
+				if suffix.valid && err != nil {
+					t.Fatalf("valid Store.NewID suffix %q rejected: %v", suffix.value, err)
+				}
+				if !suffix.valid && err == nil {
+					t.Fatalf("non-emittable Store.NewID suffix %q accepted", suffix.value)
 				}
 			})
 		}
 	}
+}
 
-	for _, clusterID := range []string{"mysql_cluster_01", "cluster_12345678901234567890"} {
-		manifest := validClusterBackupManifest()
-		manifest.ClusterID = clusterID
-		if _, err := NormalizeBackupManifest(manifest); err == nil {
-			t.Fatalf("malformed cluster fallback %q accepted", clusterID)
-		}
+func TestBackupManifestClassifiesLegacyInetAtonBoundaries(t *testing.T) {
+	// Production break caught: rejecting every numeric-looking DNS host blocks valid out-of-range DNS, while accepting representable legacy forms permits resolver-dependent IPv4 aliases.
+	cases := []struct {
+		name  string
+		host  string
+		want  string
+		valid bool
+	}{
+		{name: "canonical_ipv4", host: "127.0.0.1", want: "127.0.0.1", valid: true},
+		{name: "ordinary_dns", host: "DEADBEEF.EXAMPLE.", want: "deadbeef.example", valid: true},
+		{name: "invalid_octal_is_dns", host: "09", want: "09", valid: true},
+		{name: "one_decimal_max", host: "4294967295", valid: false},
+		{name: "one_decimal_over", host: "4294967296", want: "4294967296", valid: true},
+		{name: "one_octal_max", host: "037777777777", valid: false},
+		{name: "one_octal_over", host: "040000000000", want: "040000000000", valid: true},
+		{name: "one_hex_max", host: "0xffffffff", valid: false},
+		{name: "one_hex_over", host: "0x100000000", want: "0x100000000", valid: true},
+		{name: "two_max", host: "255.16777215", valid: false},
+		{name: "two_first_over", host: "256.1", want: "256.1", valid: true},
+		{name: "two_second_over", host: "255.16777216", want: "255.16777216", valid: true},
+		{name: "three_max", host: "255.255.65535", valid: false},
+		{name: "three_second_over", host: "255.256.1", want: "255.256.1", valid: true},
+		{name: "three_third_over", host: "255.255.65536", want: "255.255.65536", valid: true},
+		{name: "four_octal_max", host: "0377.0377.0377.0377", valid: false},
+		{name: "four_leading_zero", host: "127.000.000.001.", valid: false},
+		{name: "four_over", host: "999.999.999.999", want: "999.999.999.999", valid: true},
+		{name: "hex_components", host: "0x7f.0.0.1", valid: false},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			manifest := validBackupManifest()
+			manifest.SourceEndpoint = test.host + ":3306"
+			normalized, err := NormalizeBackupManifest(manifest)
+			if !test.valid {
+				if err == nil {
+					t.Fatalf("representable noncanonical inet_aton host %q accepted", test.host)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("DNS-valid non-alias host %q rejected: %v", test.host, err)
+			}
+			if got, want := normalized.SourceEndpoint, test.want+":3306"; got != want {
+				t.Fatalf("normalized endpoint = %q, want %q", got, want)
+			}
+		})
 	}
 }
 
-func TestBackupManifestRejectsAmbiguousNumericHostsButAllowsOrdinaryHexLikeDNS(t *testing.T) {
-	// Production break caught: passing resolver-specific inet_aton aliases through DNS validation can make the recorded source resolve to a different IPv4 identity.
-	manifest := validBackupManifest()
-	manifest.SourceEndpoint = "DEADBEEF.EXAMPLE.:3306"
-	normalized, err := NormalizeBackupManifest(manifest)
-	if err != nil {
-		t.Fatalf("ordinary hex-like DNS rejected: %v", err)
+func TestBackupManifestComparesCanonicalSourceAndPrimaryEndpointBoundaries(t *testing.T) {
+	// Production break caught: source/PRIMARY comparison must use canonical endpoint identity without allowing a representable legacy alias at either side.
+	cases := []struct {
+		name          string
+		source        string
+		primary       string
+		wantCanonical string
+		valid         bool
+	}{
+		{name: "dns_case_and_root_dot", source: "DB.EXAMPLE.COM.:3306", primary: "db.example.com:3306", wantCanonical: "db.example.com:3306", valid: true},
+		{name: "out_of_range_numeric_dns_root_dot", source: "4294967296.:3306", primary: "4294967296:3306", wantCanonical: "4294967296:3306", valid: true},
+		{name: "canonical_ipv4", source: "10.0.0.1:3306", primary: "10.0.0.1:3306", wantCanonical: "10.0.0.1:3306", valid: true},
+		{name: "primary_legacy_alias", source: "10.0.0.1:3306", primary: "0x0a.0.0.1:3306", valid: false},
+		{name: "source_legacy_alias", source: "012.0.0.1:3306", primary: "10.0.0.1:3306", valid: false},
+		{name: "different_canonical_hosts", source: "10.0.0.2:3306", primary: "10.0.0.1:3306", valid: false},
 	}
-	if got, want := normalized.SourceEndpoint, "deadbeef.example:3306"; got != want {
-		t.Fatalf("ordinary DNS endpoint = %q, want %q", got, want)
-	}
-
-	for _, host := range []string{
-		"127.000.000.001",
-		"127.000.000.001.",
-		"1.2.3",
-		"2130706433",
-		"0177.0.0.1",
-		"0x7f.0.0.1",
-		"0x7f.0.0.1.",
-		"0X7F000001",
-		"127.0.0.01",
-	} {
-		broken := validBackupManifest()
-		broken.SourceEndpoint = host + ":3306"
-		if _, err := NormalizeBackupManifest(broken); err == nil {
-			t.Fatalf("ambiguous numeric host %q accepted", host)
-		}
-	}
-}
-
-func TestBackupManifestComparesCanonicalSourceAndPrimaryEndpoints(t *testing.T) {
-	// Production break caught: comparing pre-canonical endpoint text would reject one DNS identity solely because source and PRIMARY use different valid case/root-dot spellings.
-	manifest := validClusterBackupManifest()
-	manifest.SourceEndpoint = "DB.EXAMPLE.COM.:3306"
-	manifest.Members[0].Endpoint = "db.example.com:3306"
-	normalized, err := NormalizeBackupManifest(manifest)
-	if err != nil {
-		t.Fatalf("canonically equal source and PRIMARY endpoints rejected: %v", err)
-	}
-	if got, want := normalized.SourceEndpoint, "db.example.com:3306"; got != want {
-		t.Fatalf("source endpoint = %q, want %q", got, want)
-	}
-	if got, want := normalized.Members[0].Endpoint, "db.example.com:3306"; got != want {
-		t.Fatalf("PRIMARY endpoint = %q, want %q", got, want)
-	}
-
-	broken := validClusterBackupManifest()
-	broken.Members[1].Endpoint = "127.000.000.001:3306"
-	if _, err := NormalizeBackupManifest(broken); err == nil {
-		t.Fatal("ambiguous numeric member endpoint accepted")
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			manifest := validClusterBackupManifest()
+			manifest.SourceEndpoint = test.source
+			manifest.Members[0].Endpoint = test.primary
+			normalized, err := NormalizeBackupManifest(manifest)
+			if !test.valid {
+				if err == nil {
+					t.Fatalf("invalid source/PRIMARY endpoints accepted: source=%q primary=%q", test.source, test.primary)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("canonically equal source/PRIMARY endpoints rejected: %v", err)
+			}
+			if normalized.SourceEndpoint != test.wantCanonical || normalized.Members[0].Endpoint != test.wantCanonical {
+				t.Fatalf("canonical comparison = source %q PRIMARY %q, want %q", normalized.SourceEndpoint, normalized.Members[0].Endpoint, test.wantCanonical)
+			}
+		})
 	}
 }
 
