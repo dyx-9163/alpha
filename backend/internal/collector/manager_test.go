@@ -5,6 +5,7 @@ import (
 	"errors"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -192,23 +193,26 @@ func TestDockerSummaryCollectorTimeoutDoesNotBlockOtherHosts(t *testing.T) {
 	}
 	manager := NewManager(db, nil, time.Minute)
 	manager.timeout = 30 * time.Millisecond
+	slowStarted := make(chan struct{})
+	var slowStartedOnce sync.Once
 	manager.dockerSummaryForServer = func(ctx context.Context, server store.Server) (adapter.DockerSummary, error) {
 		if slowIDs[server.ID] {
+			slowStartedOnce.Do(func() { close(slowStarted) })
 			<-ctx.Done()
+			return adapter.DockerSummary{}, ctx.Err()
+		}
+		select {
+		case <-slowStarted:
+		case <-ctx.Done():
 			return adapter.DockerSummary{}, ctx.Err()
 		}
 		return adapter.DockerSummary{Containers: 2, Images: 3, Endpoint: server.DockerHost}, nil
 	}
 
-	startedAt := time.Now()
 	err = manager.collectDockerSummaries(context.Background())
-	elapsed := time.Since(startedAt)
 
 	if err == nil || !strings.Contains(err.Error(), "context deadline exceeded") {
 		t.Fatalf("expected timeout failures for slow Docker hosts, got %v", err)
-	}
-	if elapsed > 90*time.Millisecond {
-		t.Fatalf("slow Docker hosts blocked summary collection for %s", elapsed)
 	}
 	fastSnapshot, err := db.GetStatusSnapshot("docker.summary", fastServer.ID)
 	if err != nil {
