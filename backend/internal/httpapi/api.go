@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -281,6 +282,44 @@ func (r *mysqlBackupRequest) UnmarshalJSON(data []byte) error {
 	}
 	*r = mysqlBackupRequest(decoded)
 	return nil
+}
+
+func decodeMySQLBackupRequest(w http.ResponseWriter, r *http.Request) (mysqlBackupRequest, bool) {
+	defer r.Body.Close()
+	decoder := json.NewDecoder(r.Body)
+	var raw json.RawMessage
+	if err := decoder.Decode(&raw); err != nil {
+		writeMySQLBackupDecodeError(w, r, err)
+		return mysqlBackupRequest{}, false
+	}
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || trimmed[0] != '{' {
+		writeMySQLBackupDecodeError(w, r, errors.New("request body must be a JSON object"))
+		return mysqlBackupRequest{}, false
+	}
+	var request mysqlBackupRequest
+	if err := json.Unmarshal(trimmed, &request); err != nil {
+		writeMySQLBackupDecodeError(w, r, err)
+		return mysqlBackupRequest{}, false
+	}
+	var extra json.RawMessage
+	if err := decoder.Decode(&extra); err != io.EOF {
+		if err == nil {
+			err = errors.New("request body must contain exactly one JSON object")
+		}
+		writeMySQLBackupDecodeError(w, r, err)
+		return mysqlBackupRequest{}, false
+	}
+	return request, true
+}
+
+func writeMySQLBackupDecodeError(w http.ResponseWriter, r *http.Request, err error) {
+	var maxBytesErr *http.MaxBytesError
+	if errors.As(err, &maxBytesErr) {
+		writeError(w, http.StatusRequestEntityTooLarge, "REQUEST_BODY_TOO_LARGE", i18n.Text(languageFromRequest(r), "api.requestBodyTooLarge"), map[string]any{"limit": maxBytesErr.Limit})
+		return
+	}
+	writeError(w, http.StatusBadRequest, "INVALID_JSON", i18n.Text(languageFromRequest(r), "api.invalidJSON"), map[string]any{"error": err.Error()})
 }
 
 type installAppRequest struct {

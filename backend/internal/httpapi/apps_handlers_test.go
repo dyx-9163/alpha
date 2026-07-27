@@ -17,8 +17,8 @@ import (
 func TestDecodeMySQLBackupRequestAcceptsOnlyPositiveKeepLastOverride(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/api/v2/apps/instances/instance-1/backup", strings.NewReader(`{"name":"nightly","threads":4,"maxRateMBps":64,"keepLast":8}`))
 	rec := httptest.NewRecorder()
-	var body mysqlBackupRequest
-	if !decode(rec, req, &body) {
+	body, ok := decodeMySQLBackupRequest(rec, req)
+	if !ok {
 		t.Fatalf("expected valid request, got status=%d body=%s", rec.Code, rec.Body.String())
 	}
 	if body.Name != "nightly" || body.Threads != 4 || body.MaxRateMBps != 64 || body.KeepLast == nil || *body.KeepLast != 8 {
@@ -27,8 +27,8 @@ func TestDecodeMySQLBackupRequestAcceptsOnlyPositiveKeepLastOverride(t *testing.
 
 	omittedReq := httptest.NewRequest(http.MethodPost, "/api/v2/apps/instances/instance-1/backup", strings.NewReader(`{"name":"default-policy"}`))
 	omittedRec := httptest.NewRecorder()
-	var omitted mysqlBackupRequest
-	if !decode(omittedRec, omittedReq, &omitted) {
+	omitted, ok := decodeMySQLBackupRequest(omittedRec, omittedReq)
+	if !ok {
 		t.Fatalf("expected omitted keepLast to be valid, got status=%d body=%s", omittedRec.Code, omittedRec.Body.String())
 	}
 	if omitted.KeepLast != nil {
@@ -41,13 +41,17 @@ func TestDecodeMySQLBackupRequestRejectsRepositoryDirAndNonPositiveKeepLast(t *t
 		`{"repositoryDir":"/tmp/user-controlled"}`,
 		`{"keepLast":0}`,
 		`{"keepLast":-1}`,
+		`{`,
+		`{"name":"first"}{"name":"second"}`,
+		`{"name":"first"}{"repositoryDir":"/tmp/user-controlled"}`,
+		`null`,
+		`{"unknown":true}`,
 	}
 	for _, body := range tests {
 		t.Run(body, func(t *testing.T) {
 			req := httptest.NewRequest(http.MethodPost, "/api/v2/apps/instances/instance-1/backup", strings.NewReader(body))
 			rec := httptest.NewRecorder()
-			var decoded mysqlBackupRequest
-			if decode(rec, req, &decoded) {
+			if _, ok := decodeMySQLBackupRequest(rec, req); ok {
 				t.Fatalf("expected request rejection for %s", body)
 			}
 			if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), `"code":"INVALID_JSON"`) {
