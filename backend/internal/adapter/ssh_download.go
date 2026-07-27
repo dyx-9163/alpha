@@ -24,6 +24,31 @@ const (
 	maxDownloadStderrBytes = 4 << 10
 )
 
+const remoteDownloadHelper = `import os
+import stat
+import sys
+
+archive_path = sys.argv[1]
+archive_fd = os.open(archive_path, os.O_RDONLY | os.O_NOFOLLOW)
+try:
+    archive_stat = os.fstat(archive_fd)
+    descriptor_path = os.path.realpath("/proc/self/fd/%d" % archive_fd)
+    if not stat.S_ISREG(archive_stat.st_mode) or descriptor_path != archive_path:
+        raise OSError("unsafe archive source")
+    while True:
+        chunk = os.read(archive_fd, 65536)
+        if not chunk:
+            break
+        pending = memoryview(chunk)
+        while pending:
+            written = os.write(1, pending)
+            if written <= 0:
+                raise OSError("archive stream write failed")
+            pending = pending[written:]
+finally:
+    os.close(archive_fd)
+`
+
 var mysqlBackupTaskIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$`)
 
 type DownloadResult struct {
@@ -247,8 +272,7 @@ func downloadCommand(remotePath string) (string, error) {
 	if components[6] != mysqlBackupArchiveName {
 		return "", errors.New("remote archive name is invalid")
 	}
-	quotedPath := "'" + remotePath + "'"
-	return "test ! -L " + quotedPath + " && test -f " + quotedPath + " && exec cat -- " + quotedPath, nil
+	return "python3 -c " + shellQuote(remoteDownloadHelper) + " " + shellQuote(remotePath), nil
 }
 
 func runSSHDownloadWithContext(ctx context.Context, cancelTransfer func(), waitRemote func() error, copyOutput func() error) error {
@@ -335,8 +359,11 @@ func downloadOperationError(serverID, operation string, cause error) error {
 	if !mysqlBackupTaskIDPattern.MatchString(id) {
 		id = "unknown"
 	}
-	if errors.Is(cause, context.Canceled) || errors.Is(cause, context.DeadlineExceeded) {
-		return fmt.Errorf("download file from server %s: %s: %w", id, operation, cause)
+	if errors.Is(cause, context.Canceled) {
+		return context.Canceled
+	}
+	if errors.Is(cause, context.DeadlineExceeded) {
+		return context.DeadlineExceeded
 	}
 	return fmt.Errorf("download file from server %s: %s failed", id, operation)
 }
