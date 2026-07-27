@@ -12,7 +12,7 @@ import (
 var (
 	strictSchemaName  = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]{0,63}$`)
 	secretAssignment  = regexp.MustCompile(`(?i)(password|passwd|secret|token|private[ _-]?key|credential)\s*[:=]`)
-	storeIDSuffix     = `(?:[0-9a-f]{24}|[0-9]+)`
+	storeIDSuffix     = `(?:[0-9a-f]{24}|[1-9][0-9]{18})`
 	backupIDPattern   = regexp.MustCompile(`^backup_` + storeIDSuffix + `$`)
 	instanceIDPattern = regexp.MustCompile(`^app_` + storeIDSuffix + `$`)
 	serverIDPattern   = regexp.MustCompile(`^srv_` + storeIDSuffix + `$`)
@@ -20,6 +20,7 @@ var (
 	taskIDPattern     = regexp.MustCompile(`^tsk_` + storeIDSuffix + `$`)
 	uuidPattern       = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 	dnsLabelPattern   = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$`)
+	numericIPv4Alias  = regexp.MustCompile(`(?i)^(?:0x[0-9a-f]+|[0-9]+)(?:\.(?:0x[0-9a-f]+|[0-9]+)){0,3}$`)
 )
 
 var fixedSystemSchemas = []string{
@@ -279,7 +280,7 @@ func canonicalEndpoint(endpoint string) (string, bool) {
 		if strings.HasSuffix(host, ".") {
 			host = strings.TrimSuffix(host, ".")
 		}
-		if host == "" || len(host) > 253 || strings.HasSuffix(host, ".") {
+		if host == "" || len(host) > 253 || strings.HasSuffix(host, ".") || numericIPv4Alias.MatchString(host) {
 			return "", false
 		}
 		for _, label := range strings.Split(host, ".") {
