@@ -1,5 +1,12 @@
-import { apiEventSourceUrl, apiGet, apiPost, apiPostForm, apiPut } from '../../api/client'
-import type { AifarReleaseListResponse, AifarRuntimeResponse, RuntimeConfigValues } from './types'
+import { apiDelete, apiDownload, apiEventSourceUrl, apiGet, apiPost, apiPostForm, apiPut } from '../../api/client'
+import type {
+  AifarReleaseListResponse,
+  AifarRuntimeResponse,
+  RuntimeConfigValues,
+  RuntimeDiagnosticEstimate,
+  RuntimeDiagnosticExportPage,
+  RuntimeDiagnosticRequest
+} from './types'
 
 export type RuntimeTaskResponse = {
   taskId: string
@@ -36,6 +43,45 @@ export function fetchAifarRuntime(query: string, options: LoadRuntimeOptions = {
 
 export function fetchAifarReleases(instanceId: string) {
   return apiGet<AifarReleaseListResponse>(`/apps/instances/${instanceId}/aifar/releases`)
+}
+
+export function estimateRuntimeDiagnostics(query: string, payload: RuntimeDiagnosticRequest): Promise<RuntimeDiagnosticEstimate> {
+  return apiPost<RuntimeDiagnosticEstimate>(`/containers/aifar/runtime/diagnostics/estimate?${runtimeDiagnosticQuery(query)}`, payload)
+}
+
+export function createRuntimeDiagnosticExport(query: string, payload: RuntimeDiagnosticRequest): Promise<{ taskId: string; exportId: string; status: string }> {
+  return apiPost<{ taskId: string; exportId: string; status: string }>(
+    `/containers/aifar/runtime/diagnostics/exports?${runtimeDiagnosticQuery(query)}`,
+    payload
+  )
+}
+
+export function fetchRuntimeDiagnosticExports(query: string, instanceId: string, page = 1, pageSize = 20): Promise<RuntimeDiagnosticExportPage> {
+  return apiGet<RuntimeDiagnosticExportPage>(`/containers/aifar/runtime/diagnostics/exports?${runtimeDiagnosticQuery(query, {
+    instanceId,
+    page: String(page),
+    pageSize: String(pageSize)
+  })}`)
+}
+
+export function downloadRuntimeDiagnosticExport(query: string, exportId: string, deleteAfterDownload = false): ReturnType<typeof apiDownload> {
+  return apiDownload(`/containers/aifar/runtime/diagnostics/exports/${encodeURIComponent(exportId)}/download?${runtimeDiagnosticQuery(query, {
+    deleteAfterDownload: String(deleteAfterDownload)
+  })}`)
+}
+
+export function deleteRuntimeDiagnosticExport(query: string, exportId: string): Promise<RuntimeTaskResponse> {
+  return apiDelete<RuntimeTaskResponse>(
+    `/containers/aifar/runtime/diagnostics/exports/${encodeURIComponent(exportId)}?${runtimeDiagnosticQuery(query)}`
+  )
+}
+
+function runtimeDiagnosticQuery(query: string, values: Record<string, string> = {}) {
+  const params = new URLSearchParams(query)
+  for (const [key, value] of Object.entries(values)) {
+    params.set(key, value)
+  }
+  return params.toString()
 }
 
 export function createRuntimeLogEventSource(params: URLSearchParams) {
