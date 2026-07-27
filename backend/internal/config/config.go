@@ -7,30 +7,33 @@ import (
 )
 
 type Config struct {
-	Addr                       string `json:"addr"`
-	StaticDir                  string `json:"staticDir"`
-	ResourceDir                string `json:"resourceDir"`
-	DatabasePath               string `json:"databasePath"`
-	DatabaseBackupDir          string `json:"databaseBackupDir"`
-	BootstrapUsername          string `json:"-"`
-	BootstrapPassword          string `json:"-"`
-	DefaultPassword            string `json:"-"`
-	JWTSecret                  string `json:"-"`
-	CredentialSecret           string `json:"-"`
-	CredentialSecretConfigured bool   `json:"-"`
-	PreviousCredentialSecret   string `json:"-"`
-	AllowInsecureDefaults      bool   `json:"-"`
-	AllowWeakPasswords         bool   `json:"-"`
-	DeploymentConcurrency      int    `json:"deploymentConcurrency"`
-	DefaultDeployDir           string `json:"defaultDeployDir"`
-	InstallerTemplateDir       string `json:"installerTemplateDir"`
-	ProviderMode               string `json:"providerMode"`
-	AuthMaxFailures            int    `json:"authMaxFailures"`
-	AuthLockoutSeconds         int    `json:"authLockoutSeconds"`
-	MaxRequestBodyBytes        int64  `json:"maxRequestBodyBytes"`
-	AuditRetentionDays         int    `json:"auditRetentionDays"`
-	TaskRetentionDays          int    `json:"taskRetentionDays"`
-	CollectorIntervalSecs      int    `json:"collectorIntervalSeconds"`
+	Addr                           string `json:"addr"`
+	StaticDir                      string `json:"staticDir"`
+	ResourceDir                    string `json:"resourceDir"`
+	DatabasePath                   string `json:"databasePath"`
+	DatabaseBackupDir              string `json:"databaseBackupDir"`
+	DiagnosticExportDir            string `json:"diagnosticExportDir"`
+	DiagnosticExportRetentionHours int    `json:"diagnosticExportRetentionHours"`
+	DiagnosticExportQuotaBytes     int64  `json:"diagnosticExportQuotaBytes"`
+	BootstrapUsername              string `json:"-"`
+	BootstrapPassword              string `json:"-"`
+	DefaultPassword                string `json:"-"`
+	JWTSecret                      string `json:"-"`
+	CredentialSecret               string `json:"-"`
+	CredentialSecretConfigured     bool   `json:"-"`
+	PreviousCredentialSecret       string `json:"-"`
+	AllowInsecureDefaults          bool   `json:"-"`
+	AllowWeakPasswords             bool   `json:"-"`
+	DeploymentConcurrency          int    `json:"deploymentConcurrency"`
+	DefaultDeployDir               string `json:"defaultDeployDir"`
+	InstallerTemplateDir           string `json:"installerTemplateDir"`
+	ProviderMode                   string `json:"providerMode"`
+	AuthMaxFailures                int    `json:"authMaxFailures"`
+	AuthLockoutSeconds             int    `json:"authLockoutSeconds"`
+	MaxRequestBodyBytes            int64  `json:"maxRequestBodyBytes"`
+	AuditRetentionDays             int    `json:"auditRetentionDays"`
+	TaskRetentionDays              int    `json:"taskRetentionDays"`
+	CollectorIntervalSecs          int    `json:"collectorIntervalSeconds"`
 }
 
 func Load() Config {
@@ -45,30 +48,33 @@ func Load() Config {
 	}
 	databasePath := getenv("AIFAR_DATABASE_PATH", filepath.Join(root, "data", "aifar.db"))
 	cfg := Config{
-		Addr:                       getenv("AIFAR_ADDR", "0.0.0.0:8080"),
-		StaticDir:                  getenv("AIFAR_STATIC_DIR", filepath.Join(root, "web", "dist")),
-		ResourceDir:                getenv("AIFAR_RESOURCE_DIR", filepath.Join(root, "resources")),
-		DatabasePath:               databasePath,
-		DatabaseBackupDir:          getenv("AIFAR_DATABASE_BACKUP_DIR", filepath.Join(filepath.Dir(databasePath), "backups")),
-		BootstrapUsername:          getenv("AIFAR_BOOTSTRAP_USERNAME", "admin"),
-		BootstrapPassword:          getenv("AIFAR_BOOTSTRAP_PASSWORD", defaultPassword),
-		DefaultPassword:            defaultPassword,
-		JWTSecret:                  jwtSecret,
-		CredentialSecret:           credentialSecret,
-		CredentialSecretConfigured: credentialSecretConfigured,
-		PreviousCredentialSecret:   getenv("AIFAR_PREVIOUS_CREDENTIAL_SECRET", ""),
-		AllowInsecureDefaults:      getenvBool("AIFAR_ALLOW_INSECURE_DEFAULTS", false),
-		AllowWeakPasswords:         getenvBool("AIFAR_ALLOW_WEAK_PASSWORDS", false),
-		DeploymentConcurrency:      getenvInt("AIFAR_DEPLOYMENT_CONCURRENCY", 2),
-		DefaultDeployDir:           getenv("AIFAR_DEFAULT_DEPLOY_DIR", "/aifar/apps"),
-		InstallerTemplateDir:       getenv("AIFAR_INSTALLER_TEMPLATE_DIR", filepath.Join("config", "installers")),
-		ProviderMode:               "real",
-		AuthMaxFailures:            getenvInt("AIFAR_AUTH_MAX_FAILURES", 5),
-		AuthLockoutSeconds:         getenvInt("AIFAR_AUTH_LOCKOUT_SECONDS", 300),
-		MaxRequestBodyBytes:        getenvInt64("AIFAR_MAX_REQUEST_BODY_BYTES", 4<<30),
-		AuditRetentionDays:         getenvInt("AIFAR_AUDIT_RETENTION_DAYS", 180),
-		TaskRetentionDays:          getenvInt("AIFAR_TASK_RETENTION_DAYS", 90),
-		CollectorIntervalSecs:      getenvInt("AIFAR_COLLECTOR_INTERVAL_SECONDS", 15),
+		Addr:                           getenv("AIFAR_ADDR", "0.0.0.0:8080"),
+		StaticDir:                      getenv("AIFAR_STATIC_DIR", filepath.Join(root, "web", "dist")),
+		ResourceDir:                    getenv("AIFAR_RESOURCE_DIR", filepath.Join(root, "resources")),
+		DatabasePath:                   databasePath,
+		DatabaseBackupDir:              getenv("AIFAR_DATABASE_BACKUP_DIR", filepath.Join(filepath.Dir(databasePath), "backups")),
+		DiagnosticExportDir:            getenv("AIFAR_DIAGNOSTIC_EXPORT_DIR", filepath.Join(filepath.Dir(databasePath), "diagnostic-exports")),
+		DiagnosticExportRetentionHours: getenvInt("AIFAR_DIAGNOSTIC_EXPORT_RETENTION_HOURS", 24),
+		DiagnosticExportQuotaBytes:     getenvInt64("AIFAR_DIAGNOSTIC_EXPORT_QUOTA_BYTES", 5*1024*1024*1024),
+		BootstrapUsername:              getenv("AIFAR_BOOTSTRAP_USERNAME", "admin"),
+		BootstrapPassword:              getenv("AIFAR_BOOTSTRAP_PASSWORD", defaultPassword),
+		DefaultPassword:                defaultPassword,
+		JWTSecret:                      jwtSecret,
+		CredentialSecret:               credentialSecret,
+		CredentialSecretConfigured:     credentialSecretConfigured,
+		PreviousCredentialSecret:       getenv("AIFAR_PREVIOUS_CREDENTIAL_SECRET", ""),
+		AllowInsecureDefaults:          getenvBool("AIFAR_ALLOW_INSECURE_DEFAULTS", false),
+		AllowWeakPasswords:             getenvBool("AIFAR_ALLOW_WEAK_PASSWORDS", false),
+		DeploymentConcurrency:          getenvInt("AIFAR_DEPLOYMENT_CONCURRENCY", 2),
+		DefaultDeployDir:               getenv("AIFAR_DEFAULT_DEPLOY_DIR", "/aifar/apps"),
+		InstallerTemplateDir:           getenv("AIFAR_INSTALLER_TEMPLATE_DIR", filepath.Join("config", "installers")),
+		ProviderMode:                   "real",
+		AuthMaxFailures:                getenvInt("AIFAR_AUTH_MAX_FAILURES", 5),
+		AuthLockoutSeconds:             getenvInt("AIFAR_AUTH_LOCKOUT_SECONDS", 300),
+		MaxRequestBodyBytes:            getenvInt64("AIFAR_MAX_REQUEST_BODY_BYTES", 4<<30),
+		AuditRetentionDays:             getenvInt("AIFAR_AUDIT_RETENTION_DAYS", 180),
+		TaskRetentionDays:              getenvInt("AIFAR_TASK_RETENTION_DAYS", 90),
+		CollectorIntervalSecs:          getenvInt("AIFAR_COLLECTOR_INTERVAL_SECONDS", 15),
 	}
 	return cfg
 }
