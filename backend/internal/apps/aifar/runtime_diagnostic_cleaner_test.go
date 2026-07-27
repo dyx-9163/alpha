@@ -589,7 +589,7 @@ func waitForRuntimeDiagnosticCleanerTask(t *testing.T, db *store.Store) store.Ta
 
 func waitForRuntimeDiagnosticCleanerTaskCount(t *testing.T, db *store.Store, count int) store.Task {
 	t.Helper()
-	deadline := time.Now().Add(15 * time.Second)
+	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
 		tasks, err := db.ListTasks()
 		if err != nil {

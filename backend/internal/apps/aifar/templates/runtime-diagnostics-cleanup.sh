@@ -27,6 +27,9 @@ esac
 RUNTIME_ROOT="$INSTALL_ROOT/runtime"
 DIAGNOSTICS_ROOT="$RUNTIME_ROOT/diagnostics"
 PARTIAL_ROOT="$DIAGNOSTICS_ROOT/$EXPORT_ID.partial"
+{{if .RemoveFinal}}
+FINAL_ROOT="$DIAGNOSTICS_ROOT/$EXPORT_ID"
+{{end}}
 
 [ -d "$INSTALL_ROOT" ] && [ ! -L "$INSTALL_ROOT" ] || exit 40
 install_canonical=$(readlink -f -- "$INSTALL_ROOT") || exit 40
@@ -42,8 +45,11 @@ diagnostics_canonical=$(readlink -f -- "$DIAGNOSTICS_ROOT") || exit 40
 [ "$diagnostics_canonical" = "$RUNTIME_ROOT/diagnostics" ] || exit 40
 DIAGNOSTICS_ROOT=$diagnostics_canonical
 PARTIAL_ROOT="$DIAGNOSTICS_ROOT/$EXPORT_ID.partial"
+{{if .RemoveFinal}}
+FINAL_ROOT="$DIAGNOSTICS_ROOT/$EXPORT_ID"
+{{end}}
 
-for controlled_root in "$PARTIAL_ROOT"; do
+for controlled_root in "$PARTIAL_ROOT"{{if .RemoveFinal}} "$FINAL_ROOT"{{end}}; do
   [ ! -L "$controlled_root" ] || exit 40
   if [ -e "$controlled_root" ]; then
     [ -d "$controlled_root" ] || exit 40
@@ -93,5 +99,8 @@ if [ -e "$pid_file" ] || [ -L "$pid_file" ]; then
   fi
 fi
 
-rm -rf -- "$PARTIAL_ROOT"
+rm -rf -- "$PARTIAL_ROOT"{{if .RemoveFinal}} "$FINAL_ROOT"{{end}}
 [ ! -e "$PARTIAL_ROOT" ] && [ ! -L "$PARTIAL_ROOT" ]
+{{if .RemoveFinal}}
+[ ! -e "$FINAL_ROOT" ] && [ ! -L "$FINAL_ROOT" ]
+{{end}}

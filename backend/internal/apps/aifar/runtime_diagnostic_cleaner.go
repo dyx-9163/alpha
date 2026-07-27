@@ -201,7 +201,7 @@ func (c *RuntimeDiagnosticCleaner) cleanupOne(ctx context.Context, log worker.Lo
 			var installRoot string
 			current, _, server, installRoot, err = service.loadRuntimeDiagnosticArtifact(export.ID, "", "", "", true)
 			if err == nil {
-				err = service.cleanupRuntimeDiagnosticExport(ctx, server, installRoot, current.ID)
+				err = service.cleanupLegacyRuntimeDiagnosticExport(ctx, server, installRoot, current.ID)
 			}
 		}
 	default:

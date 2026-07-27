@@ -69,6 +69,7 @@ type runtimeDiagnosticCleanupScriptData struct {
 	ExportID    string
 	ProcRoot    string
 	KillCommand string
+	RemoveFinal bool
 }
 
 type diagnosticFileStreamer interface {
@@ -611,7 +612,7 @@ func (s Service) DeleteRuntimeDiagnosticExport(ctx context.Context, req RuntimeD
 			cleanupErr = s.archives.RemovePartial(exportRecord.ID)
 		}
 	} else {
-		cleanupErr = s.cleanupRuntimeDiagnosticExport(ctx, server, installRoot, exportRecord.ID)
+		cleanupErr = s.cleanupLegacyRuntimeDiagnosticExport(ctx, server, installRoot, exportRecord.ID)
 	}
 	if cleanupErr != nil {
 		_, _ = diagnostics.MarkDiagnosticExportCleanupFailed(exportRecord.ID, i18n.Text(req.Language, "aifar.diag.cleanupFailed"))
@@ -770,12 +771,21 @@ func renderEmbeddedRuntimeDiagnosticScript(name string, content []byte, data any
 }
 
 func (s Service) cleanupRuntimeDiagnosticExport(ctx context.Context, server store.Server, installRoot, exportID string) error {
+	return s.cleanupRuntimeDiagnosticRemoteArtifacts(ctx, server, installRoot, exportID, false)
+}
+
+func (s Service) cleanupLegacyRuntimeDiagnosticExport(ctx context.Context, server store.Server, installRoot, exportID string) error {
+	return s.cleanupRuntimeDiagnosticRemoteArtifacts(ctx, server, installRoot, exportID, true)
+}
+
+func (s Service) cleanupRuntimeDiagnosticRemoteArtifacts(ctx context.Context, server store.Server, installRoot, exportID string, removeFinal bool) error {
 	if !runtimeDiagnosticExportIDPattern.MatchString(exportID) || strings.TrimSpace(installRoot) == "" || path.Clean(installRoot) == "/" || !path.IsAbs(path.Clean(installRoot)) || containsRuntimeDiagnosticControl(installRoot) {
 		return errors.New("runtime diagnostic cleanup identity is invalid")
 	}
 	script, err := renderRuntimeDiagnosticCleanupScript(runtimeDiagnosticCleanupScriptData{
 		InstallRoot: installerkit.ShellQuote(path.Clean(installRoot)),
 		ExportID:    installerkit.ShellQuote(exportID),
+		RemoveFinal: removeFinal,
 	})
 	if err != nil {
 		return err
