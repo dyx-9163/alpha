@@ -714,6 +714,24 @@ func TestEnsureRuntimeAgentUpgradesWhenFeatureMissing(t *testing.T) {
 	}
 }
 
+func TestEnsureRuntimeAgentUpgradesWhenInteractiveDeltaFeaturesMissing(t *testing.T) {
+	agent := withFakeRuntimeAgentBinary(t)
+	sum, _, err := fileSHA256(agent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	remote := &fakeRemote{runtimeAgentCheckStdout: runtimeAgentCheckOutput(t, sum,
+		"reconcile-runtime", "local-runtime-controller", "endpoint-cache", "restart-runtime",
+	)}
+	service := NewService(nil, remote)
+	if err := service.ensureRuntimeAgent(context.Background(), store.Server{ID: "srv-1", DeployDir: "/aifar/apps"}, "/aifar/apps/_work/aifar-agent-runtime-v2-test", "", fakeLogger{}); err != nil {
+		t.Fatal(err)
+	}
+	if uploads := remote.joinedUploads(); !strings.Contains(uploads, "aifar-agent-linux-amd64->/aifar/apps/_work/aifar-agent-runtime-v2-test/") {
+		t.Fatalf("agent without interactive delta features should be upgraded, uploads=%s", uploads)
+	}
+}
+
 type bundleTestArtifact struct {
 	Service  string
 	Module   string

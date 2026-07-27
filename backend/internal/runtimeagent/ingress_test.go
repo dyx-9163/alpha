@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"net/http/httptest"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -738,7 +739,8 @@ func TestManagerSerializesApplyAndResyncDuringScaleOut(t *testing.T) {
 			Replicas:    1,
 			Ports:       []ContainerPort{{Name: "http", ContainerPort: 38005}},
 		}},
-		Services: []ServiceSpec{{Name: "file", AppName: "alpha-file", Port: 38005, TargetPort: 38005}},
+		Services: []ServiceSpec{{Name: "file", AppName: "alpha-file", Port: freePort(t), TargetPort: 38005}},
+		Ingress:  IngressSpec{GatewayPort: freePort(t), WebPort: freePort(t)},
 	})
 	newSpec := oldSpec
 	newSpec.Deployments = []DeploymentSpec{deployment}
@@ -780,6 +782,186 @@ func TestManagerSerializesApplyAndResyncDuringScaleOut(t *testing.T) {
 	}
 	if runner.removedReplica2() {
 		t.Fatal("resync removed replica 2 while scale-out apply was in progress")
+	}
+}
+
+func TestManagerApplyPreemptsBackgroundResync(t *testing.T) {
+	runner := newPreemptibleResyncRunner()
+	defer runner.releaseBlockedCall()
+	manager := NewManager(ManagerOptions{StateDir: t.TempDir(), Runner: runner})
+	webServicePort := freePort(t)
+	fileServicePort := freePort(t)
+	oldSpec := NormalizeSpec(RuntimeSpec{
+		InstanceID: "admin", InstallRoot: "/aifar/apps/admin", Network: "aifar-network",
+		Deployments: []DeploymentSpec{{ServiceName: "web-vue3", Image: "web-vue3:rev-1", PodRevision: "rev-1", Replicas: 1, Ports: []ContainerPort{{Name: "http", ContainerPort: 8080}}}},
+		Services:    []ServiceSpec{{Name: "web-vue3", AppName: "web-vue3", Port: webServicePort, TargetPort: 8080}},
+		Ingress:     IngressSpec{GatewayPort: freePort(t), WebPort: freePort(t)},
+	})
+	manager.mu.Lock()
+	manager.specs[oldSpec.InstanceID] = oldSpec
+	manager.mu.Unlock()
+	resyncDone := make(chan error, 1)
+	go func() { resyncDone <- manager.Resync(context.Background()) }()
+	select {
+	case <-runner.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("background resync did not reach the blocked unrelated deployment")
+	}
+
+	newSpec := oldSpec
+	newSpec.Deployments = []DeploymentSpec{{ServiceName: "file", Image: "aifar-file:rev-1", PodRevision: "rev-1", Replicas: 0, Ports: []ContainerPort{{Name: "http", ContainerPort: 38005}}}}
+	newSpec.Services = []ServiceSpec{{Name: "file", AppName: "alpha-file", Port: fileServicePort, TargetPort: 38005}}
+	applyDone := make(chan error, 1)
+	go func() { applyDone <- manager.Apply(context.Background(), newSpec) }()
+	select {
+	case err := <-applyDone:
+		if err != nil {
+			t.Fatalf("interactive apply failed after preemption: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("interactive apply remained blocked behind background resync")
+	}
+	select {
+	case err := <-resyncDone:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("expected preempted resync cancellation, got %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("preempted resync did not exit")
+	}
+}
+
+func TestManagerApplySkipsUnchangedDeployment(t *testing.T) {
+	runner := &unchangedDeploymentFailureRunner{}
+	manager := NewManager(ManagerOptions{StateDir: t.TempDir(), Runner: runner})
+	webServicePort := freePort(t)
+	fileServicePort := freePort(t)
+	oldSpec := NormalizeSpec(RuntimeSpec{
+		InstanceID: "admin", InstallRoot: "/aifar/apps/admin", Network: "aifar-network",
+		Deployments: []DeploymentSpec{
+			{ServiceName: "web-vue3", Image: "web-vue3:rev-1", PodRevision: "rev-1", Replicas: 1, Ports: []ContainerPort{{Name: "http", ContainerPort: 8080}}},
+			{ServiceName: "file", Image: "aifar-file:rev-1", PodRevision: "rev-1", Replicas: 1, Ports: []ContainerPort{{Name: "http", ContainerPort: 38005}}},
+		},
+		Services: []ServiceSpec{
+			{Name: "web-vue3", AppName: "web-vue3", Port: webServicePort, TargetPort: 8080},
+			{Name: "file", AppName: "alpha-file", Port: fileServicePort, TargetPort: 38005},
+		},
+		Ingress: IngressSpec{GatewayPort: freePort(t), WebPort: freePort(t)},
+	})
+	manager.mu.Lock()
+	manager.specs[oldSpec.InstanceID] = oldSpec
+	manager.mu.Unlock()
+	newSpec := oldSpec
+	newSpec.Deployments = append([]DeploymentSpec(nil), oldSpec.Deployments...)
+	newSpec.Deployments[1].Replicas = 0
+
+	if err := manager.Apply(context.Background(), newSpec); err != nil {
+		t.Fatalf("unchanged unhealthy deployment blocked target offline: %v", err)
+	}
+	if runner.touchedUnchanged() {
+		t.Fatalf("interactive apply reconciled unchanged web deployment:\n%s", runner.callsString())
+	}
+}
+
+func TestChangedDeploymentsPrioritizesOfflineDeployment(t *testing.T) {
+	current := NormalizeSpec(RuntimeSpec{Deployments: []DeploymentSpec{
+		{ServiceName: "oauth", Image: "oauth:rev-1", PodRevision: "rev-1", Replicas: 0},
+		{ServiceName: "file", Image: "file:rev-1", PodRevision: "rev-1", Replicas: 1},
+	}})
+	next := current
+	next.Deployments = []DeploymentSpec{
+		{ServiceName: "oauth", Image: "oauth:rev-1", PodRevision: "rev-1", Replicas: 1},
+		{ServiceName: "file", Image: "file:rev-1", PodRevision: "rev-1", Replicas: 0},
+	}
+	changed := changedDeployments(current, next)
+	if len(changed) != 2 || changed[0].ServiceName != "file" || changed[0].Replicas != 0 || changed[1].ServiceName != "oauth" {
+		t.Fatalf("expected offline deployment first, got %+v", changed)
+	}
+}
+
+func TestManagerApplyPrioritizesOfflineDeployment(t *testing.T) {
+	runner := &orderedReconcileRunner{}
+	manager := NewManager(ManagerOptions{StateDir: t.TempDir(), Runner: runner})
+	current := NormalizeSpec(RuntimeSpec{
+		InstanceID: "admin", InstallRoot: "/aifar/apps/admin", Network: "aifar-network",
+		Deployments: []DeploymentSpec{
+			{ServiceName: "oauth", Image: "oauth:rev-1", PodRevision: "rev-1", Replicas: 0},
+			{ServiceName: "file", Image: "file:rev-1", PodRevision: "rev-1", Replicas: 1},
+		},
+		Services: []ServiceSpec{
+			{Name: "oauth", AppName: "alpha-oauth", Port: freePort(t), TargetPort: 8080},
+			{Name: "file", AppName: "alpha-file", Port: freePort(t), TargetPort: 38005},
+		},
+		Ingress: IngressSpec{GatewayPort: freePort(t), WebPort: freePort(t)},
+	})
+	next := current
+	next.Deployments = []DeploymentSpec{
+		{ServiceName: "oauth", Image: "oauth:rev-1", PodRevision: "rev-1", Replicas: 1},
+		{ServiceName: "file", Image: "file:rev-1", PodRevision: "rev-1", Replicas: 0},
+	}
+	if err := manager.reconcileDeploymentSet(context.Background(), next, changedDeployments(current, next)); err != nil {
+		t.Fatal(err)
+	}
+	calls := runner.callsString()
+	offlineIndex := strings.Index(calls, "aifar.service=file")
+	onlineIndex := strings.Index(calls, "aifar-pod-admin-oauth-rev-1-r1")
+	if offlineIndex < 0 || onlineIndex < 0 || offlineIndex > onlineIndex {
+		t.Fatalf("offline deployment must reconcile before online deployment:\n%s", calls)
+	}
+}
+
+func TestManagerSerializesInteractiveApplies(t *testing.T) {
+	runner := newPreemptibleResyncRunner()
+	defer runner.releaseBlockedCall()
+	manager := NewManager(ManagerOptions{StateDir: t.TempDir(), Runner: runner})
+	defer func() { _ = manager.Remove(context.Background(), "admin") }()
+	current := NormalizeSpec(RuntimeSpec{
+		InstanceID: "admin", InstallRoot: "/aifar/apps/admin", Network: "aifar-network",
+		Deployments: []DeploymentSpec{{ServiceName: "web-vue3", Image: "web:rev-1", PodRevision: "rev-1", Replicas: 0}},
+		Services:    []ServiceSpec{{Name: "web-vue3", AppName: "web-vue3", Port: freePort(t), TargetPort: 8080}},
+		Ingress:     IngressSpec{GatewayPort: freePort(t), WebPort: freePort(t)},
+	})
+	first := current
+	first.Deployments = []DeploymentSpec{{ServiceName: "web-vue3", Image: "web:rev-1", PodRevision: "rev-1", Replicas: 1}}
+	second := first
+	second.Deployments = []DeploymentSpec{{ServiceName: "web-vue3", Image: "web:rev-1", PodRevision: "rev-1", Replicas: 2}}
+	manager.mu.Lock()
+	manager.specs[current.InstanceID] = current
+	manager.mu.Unlock()
+
+	firstDone := make(chan error, 1)
+	go func() { firstDone <- manager.Apply(context.Background(), first) }()
+	select {
+	case <-runner.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first interactive apply did not start")
+	}
+	secondDone := make(chan error, 1)
+	go func() { secondDone <- manager.Apply(context.Background(), second) }()
+	select {
+	case err := <-firstDone:
+		t.Fatalf("first interactive apply was interrupted before release: %v", err)
+	case err := <-secondDone:
+		t.Fatalf("second interactive apply bypassed the first: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	runner.releaseBlockedCall()
+	if err := <-firstDone; err != nil {
+		t.Fatalf("first interactive apply failed: %v", err)
+	}
+	if err := <-secondDone; err != nil {
+		t.Fatalf("second interactive apply failed: %v", err)
+	}
+}
+
+func TestManagerStatusPublishesInteractiveDeltaFeatures(t *testing.T) {
+	manager := NewManager(ManagerOptions{StateDir: t.TempDir(), Runner: &fakeRunner{}})
+	status := manager.Status()
+	features, _ := status["features"].([]string)
+	for _, want := range []string{"interactive-reconcile-priority", "runtime-delta-apply"} {
+		if !slices.Contains(features, want) {
+			t.Fatalf("missing feature %q in %+v", want, features)
+		}
 	}
 }
 
@@ -1361,6 +1543,103 @@ type scaleOutRaceRunner struct {
 	runOnce    sync.Once
 	removed    []string
 	r2Started  bool
+}
+
+type preemptibleResyncRunner struct {
+	started     chan struct{}
+	release     chan struct{}
+	startedOnce sync.Once
+	releaseOnce sync.Once
+}
+
+func newPreemptibleResyncRunner() *preemptibleResyncRunner {
+	return &preemptibleResyncRunner{started: make(chan struct{}), release: make(chan struct{})}
+}
+
+func (r *preemptibleResyncRunner) Run(ctx context.Context, name string, args ...string) (CommandResult, error) {
+	if err := ctx.Err(); err != nil {
+		return CommandResult{}, err
+	}
+	call := name + " " + strings.Join(args, " ")
+	if strings.Contains(call, "docker inspect -f {{.Id}}") && strings.Contains(call, "web-vue3") {
+		r.startedOnce.Do(func() { close(r.started) })
+		select {
+		case <-ctx.Done():
+			return CommandResult{}, ctx.Err()
+		case <-r.release:
+			return CommandResult{}, errors.New("released blocked resync")
+		}
+	}
+	if strings.Contains(call, "docker inspect -f {{.State.Running}}|") {
+		return CommandResult{Stdout: "true|healthy\n"}, nil
+	}
+	if strings.Contains(call, "docker ps") {
+		return CommandResult{}, nil
+	}
+	return CommandResult{Stdout: "ok\n"}, nil
+}
+
+func (r *preemptibleResyncRunner) releaseBlockedCall() {
+	r.releaseOnce.Do(func() { close(r.release) })
+}
+
+type unchangedDeploymentFailureRunner struct {
+	mu    sync.Mutex
+	calls []string
+}
+
+func (r *unchangedDeploymentFailureRunner) Run(ctx context.Context, name string, args ...string) (CommandResult, error) {
+	call := name + " " + strings.Join(args, " ")
+	r.mu.Lock()
+	r.calls = append(r.calls, call)
+	r.mu.Unlock()
+	if strings.Contains(call, "docker inspect") && strings.Contains(call, "web-vue3") {
+		return CommandResult{}, errors.New("unchanged web deployment is unhealthy")
+	}
+	if strings.Contains(call, "docker ps") {
+		return CommandResult{}, nil
+	}
+	return CommandResult{Stdout: "ok\n"}, nil
+}
+
+type orderedReconcileRunner struct {
+	mu    sync.Mutex
+	calls []string
+}
+
+func (r *orderedReconcileRunner) Run(ctx context.Context, name string, args ...string) (CommandResult, error) {
+	call := name + " " + strings.Join(args, " ")
+	r.mu.Lock()
+	r.calls = append(r.calls, call)
+	r.mu.Unlock()
+	switch {
+	case strings.Contains(call, "docker inspect -f {{.Id}}"):
+		return CommandResult{}, errors.New("not found")
+	case strings.Contains(call, "docker inspect -f {{.State.Running}}|"):
+		return CommandResult{Stdout: "true|healthy\n"}, nil
+	case strings.Contains(call, "docker ps"):
+		return CommandResult{}, nil
+	case strings.Contains(call, "docker run "):
+		return CommandResult{Stdout: "container-id\n"}, nil
+	default:
+		return CommandResult{Stdout: "ok\n"}, nil
+	}
+}
+
+func (r *orderedReconcileRunner) callsString() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return strings.Join(r.calls, "\n")
+}
+
+func (r *unchangedDeploymentFailureRunner) touchedUnchanged() bool {
+	return strings.Contains(r.callsString(), "docker inspect") && strings.Contains(r.callsString(), "web-vue3")
+}
+
+func (r *unchangedDeploymentFailureRunner) callsString() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return strings.Join(r.calls, "\n")
 }
 
 func newScaleOutRaceRunner(hash string) *scaleOutRaceRunner {

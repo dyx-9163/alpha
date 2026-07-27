@@ -64,18 +64,21 @@ type ManagerOptions struct {
 }
 
 type Manager struct {
-	mu          sync.RWMutex
-	reconcileMu sync.Mutex
-	stateDir    string
-	runner      CommandRunner
-	log         io.Writer
-	specs       map[string]RuntimeSpec
-	routes      map[int]proxyRoute
-	servers     map[int]*http.Server
-	next        map[string]uint64
-	endpoints   map[string][]endpoint
-	deployments map[string]deploymentRuntimeStatus
-	services    map[string]serviceRuntimeStatus
+	mu                sync.RWMutex
+	reconcileMu       sync.Mutex
+	backgroundMu      sync.Mutex
+	backgroundNext    uint64
+	backgroundCancels map[uint64]context.CancelFunc
+	stateDir          string
+	runner            CommandRunner
+	log               io.Writer
+	specs             map[string]RuntimeSpec
+	routes            map[int]proxyRoute
+	servers           map[int]*http.Server
+	next              map[string]uint64
+	endpoints         map[string][]endpoint
+	deployments       map[string]deploymentRuntimeStatus
+	services          map[string]serviceRuntimeStatus
 }
 
 type proxyRoute struct {
@@ -139,16 +142,17 @@ func NewManager(options ManagerOptions) *Manager {
 		runner = ExecRunner{}
 	}
 	return &Manager{
-		stateDir:    stateDir,
-		runner:      runner,
-		log:         options.Log,
-		specs:       map[string]RuntimeSpec{},
-		routes:      map[int]proxyRoute{},
-		servers:     map[int]*http.Server{},
-		next:        map[string]uint64{},
-		endpoints:   map[string][]endpoint{},
-		deployments: map[string]deploymentRuntimeStatus{},
-		services:    map[string]serviceRuntimeStatus{},
+		stateDir:          stateDir,
+		runner:            runner,
+		log:               options.Log,
+		backgroundCancels: map[uint64]context.CancelFunc{},
+		specs:             map[string]RuntimeSpec{},
+		routes:            map[int]proxyRoute{},
+		servers:           map[int]*http.Server{},
+		next:              map[string]uint64{},
+		endpoints:         map[string][]endpoint{},
+		deployments:       map[string]deploymentRuntimeStatus{},
+		services:          map[string]serviceRuntimeStatus{},
 	}
 }
 
@@ -177,13 +181,21 @@ func (m *Manager) Load(ctx context.Context) error {
 }
 
 func (m *Manager) Apply(ctx context.Context, spec RuntimeSpec) error {
+	m.cancelBackgroundResyncs()
 	m.reconcileMu.Lock()
 	defer m.reconcileMu.Unlock()
 	spec = NormalizeSpec(spec)
 	if err := validateRuntimeSpec(spec); err != nil {
 		return err
 	}
-	if err := m.reconcileDeployments(ctx, spec); err != nil {
+	m.mu.RLock()
+	current, hasCurrent := m.specs[spec.InstanceID]
+	m.mu.RUnlock()
+	deployments := spec.Deployments
+	if hasCurrent {
+		deployments = changedDeployments(current, spec)
+	}
+	if err := m.reconcileDeploymentSet(ctx, spec, deployments); err != nil {
 		return err
 	}
 	if err := m.refreshInstanceEndpoints(ctx, spec); err != nil {
@@ -551,20 +563,27 @@ func (m *Manager) Status() map[string]any {
 			"endpoint-cache",
 			"docker-events",
 			"periodic-resync",
+			"interactive-reconcile-priority",
 			"reconcile-runtime",
 			"restart-runtime",
 			"rolling-update",
 			"nacos-ready-gate",
 			"service-affinity-policy",
 			"runtime-status-detail",
+			"runtime-delta-apply",
 			"status",
 		},
 	}
 }
 
 func (m *Manager) Resync(ctx context.Context) error {
+	ctx, finish := m.registerBackgroundResync(ctx)
+	defer finish()
 	m.reconcileMu.Lock()
 	defer m.reconcileMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	for _, spec := range m.snapshotSpecs() {
 		if err := m.reconcileDeployments(ctx, spec); err != nil {
 			return err
@@ -589,6 +608,9 @@ func (m *Manager) StartRuntimeResync(ctx context.Context, interval time.Duration
 			return
 		case <-ticker.C:
 			if err := m.Resync(ctx); err != nil {
+				if errors.Is(err, context.Canceled) && ctx.Err() == nil {
+					continue
+				}
 				logf(m.log, "AIFAR runtime periodic resync failed: %v\n", err)
 				continue
 			}
@@ -658,6 +680,9 @@ func (m *Manager) watchDockerEvents(ctx context.Context, debounce time.Duration)
 		case <-time.After(debounce):
 		}
 		if err := m.Resync(ctx); err != nil {
+			if errors.Is(err, context.Canceled) && ctx.Err() == nil {
+				continue
+			}
 			logf(m.log, "AIFAR runtime Docker event resync failed: %v\n", err)
 		}
 	}
@@ -752,13 +777,36 @@ func (m *Manager) resolveRoute(port int, path string) (RuntimeSpec, string, bool
 }
 
 func (m *Manager) reconcileDeployments(ctx context.Context, spec RuntimeSpec) error {
-	deployments := make([]DeploymentSpec, 0, len(spec.Deployments))
-	for _, deployment := range spec.Deployments {
+	return m.reconcileDeploymentSet(ctx, spec, spec.Deployments)
+}
+
+func (m *Manager) reconcileDeploymentSet(ctx context.Context, spec RuntimeSpec, selected []DeploymentSpec) error {
+	deployments := make([]DeploymentSpec, 0, len(selected))
+	for _, deployment := range selected {
 		if strings.TrimSpace(deployment.Image) == "" {
 			continue
 		}
 		deployments = append(deployments, deployment)
 	}
+	if len(deployments) == 0 {
+		return nil
+	}
+	offline := make([]DeploymentSpec, 0, len(deployments))
+	online := make([]DeploymentSpec, 0, len(deployments))
+	for _, deployment := range deployments {
+		if deployment.Replicas == 0 {
+			offline = append(offline, deployment)
+		} else {
+			online = append(online, deployment)
+		}
+	}
+	if err := m.reconcileDeploymentBatch(ctx, spec, offline); err != nil {
+		return err
+	}
+	return m.reconcileDeploymentBatch(ctx, spec, online)
+}
+
+func (m *Manager) reconcileDeploymentBatch(ctx context.Context, spec RuntimeSpec, deployments []DeploymentSpec) error {
 	if len(deployments) == 0 {
 		return nil
 	}
@@ -801,6 +849,57 @@ func (m *Manager) reconcileDeployments(ctx context.Context, spec RuntimeSpec) er
 	}
 	wg.Wait()
 	return firstErr
+}
+
+func changedDeployments(current RuntimeSpec, next RuntimeSpec) []DeploymentSpec {
+	current = NormalizeSpec(current)
+	next = NormalizeSpec(next)
+	byService := make(map[string]DeploymentSpec, len(current.Deployments))
+	for _, deployment := range current.Deployments {
+		byService[deployment.ServiceName] = deployment
+	}
+	changed := make([]DeploymentSpec, 0, len(next.Deployments))
+	for _, deployment := range next.Deployments {
+		before, ok := byService[deployment.ServiceName]
+		if ok && before.Replicas == deployment.Replicas && deploymentSpecHash(before) == deploymentSpecHash(deployment) {
+			continue
+		}
+		changed = append(changed, deployment)
+	}
+	sort.SliceStable(changed, func(i, j int) bool {
+		return changed[i].Replicas == 0 && changed[j].Replicas != 0
+	})
+	return changed
+}
+
+func (m *Manager) registerBackgroundResync(parent context.Context) (context.Context, func()) {
+	ctx, cancel := context.WithCancel(parent)
+	m.backgroundMu.Lock()
+	m.backgroundNext++
+	id := m.backgroundNext
+	if m.backgroundCancels == nil {
+		m.backgroundCancels = map[uint64]context.CancelFunc{}
+	}
+	m.backgroundCancels[id] = cancel
+	m.backgroundMu.Unlock()
+	return ctx, func() {
+		cancel()
+		m.backgroundMu.Lock()
+		delete(m.backgroundCancels, id)
+		m.backgroundMu.Unlock()
+	}
+}
+
+func (m *Manager) cancelBackgroundResyncs() {
+	m.backgroundMu.Lock()
+	cancels := make([]context.CancelFunc, 0, len(m.backgroundCancels))
+	for _, cancel := range m.backgroundCancels {
+		cancels = append(cancels, cancel)
+	}
+	m.backgroundMu.Unlock()
+	for _, cancel := range cancels {
+		cancel()
+	}
 }
 
 func (m *Manager) ensureDeployment(ctx context.Context, spec RuntimeSpec, deployment DeploymentSpec) error {

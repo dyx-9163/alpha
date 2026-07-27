@@ -254,7 +254,14 @@ type taskIDCarrier interface {
 	TaskID() string
 }
 
-var requiredRuntimeAgentFeatures = []string{"reconcile-runtime", "local-runtime-controller", "endpoint-cache", "restart-runtime"}
+var requiredRuntimeAgentFeatures = []string{
+	"reconcile-runtime",
+	"local-runtime-controller",
+	"endpoint-cache",
+	"restart-runtime",
+	"interactive-reconcile-priority",
+	"runtime-delta-apply",
+}
 
 func NewService(s Store, remote Remote) Service {
 	return Service{store: s, remote: remote}
@@ -328,7 +335,7 @@ func (s Service) ensureRuntimeAgent(ctx context.Context, server store.Server, wo
 		"  exit 1",
 		"fi",
 		"for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do",
-		"  if status=\"$(aifar-agent status 2>/dev/null)\" && printf \"%s\" \"$status\" | grep -q '\"reconcile-runtime\"' && printf \"%s\" \"$status\" | grep -q '\"local-runtime-controller\"' && printf \"%s\" \"$status\" | grep -q '\"endpoint-cache\"' && printf \"%s\" \"$status\" | grep -q '\"restart-runtime\"'; then",
+		"  if status=\"$(aifar-agent status 2>/dev/null)\" && printf \"%s\" \"$status\" | grep -q '\"reconcile-runtime\"' && printf \"%s\" \"$status\" | grep -q '\"local-runtime-controller\"' && printf \"%s\" \"$status\" | grep -q '\"endpoint-cache\"' && printf \"%s\" \"$status\" | grep -q '\"restart-runtime\"' && printf \"%s\" \"$status\" | grep -q '\"interactive-reconcile-priority\"' && printf \"%s\" \"$status\" | grep -q '\"runtime-delta-apply\"'; then",
 		"    exit 0",
 		"  fi",
 		"  sleep 1",
