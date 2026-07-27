@@ -696,3 +696,103 @@
 - 结论：若业务代码使用 `@FeignClient(name/value="服务名")` 且未配置固定 `url`，Feign 会经 Spring Cloud LoadBalancer/DiscoveryClient 从 Nacos 获取同名服务实例，再直接请求选中的 agent-proxy 地址；因此当前 Nacos 是服务寻址和实例上下线来源，agent 是服务器级流量入口，Feign 承担客户端调用。当前部署仓库不包含业务 Java 源码，无法仅从本仓库确认每个 FeignClient 是否存在固定 URL 覆盖，需在业务源码或 Nacos YAML 中核对。
 - 问题：用户确认是否可以把 Nacos 作为业务集群负载方案。
 - 结论：可以把 Nacos 作为服务间集群负载体系的服务发现基础，但不能表述为 Nacos 自己转发或均衡流量；实际跨服务器实例选择由 Feign 配套的 Spring Cloud LoadBalancer 完成，服务器内部容器副本选择由 aifar-agent 完成。该方案适用于无状态后端服务，不替代浏览器外部入口负载均衡、跨节点部署编排、状态数据集群或端到端健康门禁。
+- 问题：用户询问当前 Feign 在多个 Nacos 服务实例之间采用轮询还是其他负载逻辑。
+- 结论：已检查当前 Runtime 离线 JAR：后端服务包含 Spring Cloud OpenFeign 4.1.3、Spring Cloud LoadBalancer 4.1.4 和 Spring Cloud Alibaba Nacos Discovery 2023.0.1.2，未包含 Ribbon；业务服务自身 classes 未发现自定义 LoadBalancer，内置 YAML 也未启用 `spring.cloud.loadbalancer.nacos.enabled=true`，因此按仓库可见配置，Feign 默认使用 `RoundRobinLoadBalancer` 对 Nacos返回的服务器代理实例做按调用方进程独立计数的轮询。若现场 Nacos YAML 启用该开关，则改用 NacosLoadBalancer，先偏好同 clusterName 实例并按 Nacos weight 随机选择；网关 JAR另有自定义 MyLoadBalancer，不能据此推断普通后端 Feign。最终现场算法仍应核对实际发布的 Nacos配置和启动条件报告。
+- 问题：用户询问 Kubernetes 多服务器集群是否等同于当前 agent-proxy 思路，即把多台服务器的多个 ClusterIP 注册给 Nacos。
+- 结论：两者高层都用“稳定服务名映射动态后端”，但 Kubernetes 标准模型不是每节点一个 ClusterIP。一个多节点 Kubernetes 集群中，通常每个逻辑服务只有一个 Service DNS/ClusterIP，EndpointSlice 维护分布在各节点的 ready PodIP，kube-proxy或 CNI/eBPF 服务代理负责转发。若继续使用 Nacos，应选择单一清晰模型：最小迁移可让每个 Pod向 Nacos注册 PodIP:port，由 Feign/Nacos直接选 Pod；Kubernetes原生方案则让 Feign通过 Kubernetes Service/Discovery寻址，Nacos只保留配置中心。把单个 ClusterIP注册到 Nacos虽可连通，但 Nacos只能看到一个聚合实例，实际负载由 Kubernetes完成；把不同 Kubernetes集群的 ClusterIP注册到共享 Nacos通常不可行，因为 ClusterIP默认仅集群内可达且不同集群网段可能重叠，需跨集群网络、MCS/service mesh或每集群可路由网关地址。
+- 问题：用户询问同一台 Docker服务器运行多个 permission 副本时为何不会端口冲突，以及请求如何正常工作。
+- 结论：permission 的服务端口为 38010；每个容器拥有独立 Docker网络 IP，均可在自己的网络命名空间监听 38010，runtime-agent 启动容器时不发布 `-p` 宿主机端口，因此容器间不冲突。宿主机 38010 只由 aifar-agent 监听一次，并作为 `alpha-permission -> 宿主机IP:38010` 的单个 Nacos代理实例；agent按标签发现本实例所有 permission 容器，过滤 running 且 healthy 的 Docker IP:38010 endpoint，再按 round-robin逐请求转发。副本数为0时 agent注销 Nacos实例；若期望副本大于0但所有本地 endpoint失效，当前代理会返回503但仍可能保持 Nacos心跳，这是后续健康联动缺口。
+- 问题：用户确认 aifar-agent 是否类似 Kubernetes Service。
+- 结论：aifar-agent 的“固定宿主机代理端口 + 健康容器 endpoint集合 + 负载转发”数据面可类比 Kubernetes Service、EndpointSlice和 kube-proxy的组合，但 agent整体职责更宽：它还根据 desired replicas创建/停止容器、健康等待、滚动更新和周期调和，混合了承担部分 Deployment/ReplicaSet controller与 kubelet职责。该类比仅限单机；Kubernetes的 Service/EndpointSlice天然覆盖整个多节点集群，而当前每台 agent只发现和转发本机 Docker endpoint，跨主机依赖 Nacos先选节点。
+- 问题：用户询问 AIFAR Runtime 页面是否缺少 Docker 服务重启入口，以及手工修改 `runtime/env` 下配置后重启 Docker 能否生效。
+- 结论：当前 Runtime 的 Pod 行只有日志入口，Deployment 行只有更新、扩缩容和下线，未提供单服务重启或重建；通用容器 restart 后端接口仍存在，但现有 Runtime 页面未接入。`service.env`、`java-common.env`、`java-secrets.env` 是容器创建时通过 `docker run --env-file` 注入，执行 `docker restart`、`docker compose restart` 或重启 Docker daemon 都不会重新读取，必须重建受影响容器；`java-jvm.*.options` 因宿主机目录被挂载且启动脚本每次读取，容器进程重启可加载。当前 agent 的 spec hash 只包含 env 文件路径而不包含文件内容，因此只手改 env 文件再点 reconcile 也不会强制重建；正确产品入口应提供任务化、可审计、带健康门禁的服务级滚动重建。
+- 问题：用户要求增加“停止任务”动作，以及修改 Runtime 配置后对全部服务执行重启并重新读取配置的按钮。
+- 结论：当前后端和 worker 已支持 `POST /tasks/{id}/cancel` 及 pending/running 任务取消，但 `TaskLogPane` 前端未提供停止按钮；Runtime 的“下线”是把服务期望副本数设为 0，与取消 worker 任务不是同一语义。实施前需确认用户所说的“停止任务”是任务中心取消任务，随后再设计全实例滚动重建与配置内容变更感知。
+- 结论：用户已确认“停止任务”指任务中心取消当前 pending/running worker 任务；前端应只对可取消状态启用按钮，调用现有取消 API并等待任务进入终态，而不是把 Runtime 服务副本数归零。
+- 结论：用户确认“全部重启读取新配置”只作用于当前选中的 AIFAR Runtime 实例，处理期望副本数大于 0 的服务并保持已下线服务为 0；任一新容器健康检查失败时立即停止整批任务、保留该服务旧容器并不再处理后续服务。
+- 结论：用户确认任务停止仅支持当前单选任务；完整设计已写入 `docs/superpowers/specs/2026-07-26-runtime-task-cancel-and-restart-design.md` 并以提交 `d3a7baca` 保存。方案采用现有任务 cancel API加前端入口，以及 agent 原生逐服务逐副本滚动重建；用户取消时清理未切换临时容器、保留已完成服务，环境文件内容和敏感值不得写入日志或审计。
+- 问题：用户要求继续解释 aifar-agent 与 Kubernetes的对应关系及真正多节点集群所缺能力。
+- 结论：当前 RuntimeSpec 已包含 Deployment、Service、Ingress、Nacos、replicas、滚动策略和健康检查，agent在单机持续 reconcile期望副本并提供 Service代理，因此属于 Kubernetes-like 单节点执行面。它与真正 Kubernetes集群的核心差距不是容器副本或代理，而是缺少集群级 API/etcd期望状态、跨节点 Scheduler、统一 Controller、CNI Pod网络和全局 Service/EndpointSlice；当前主机故障时 Nacos可摘除流量但不会把丢失副本自动重建到其他主机。演进时应保留 aifar-server控制面并增加 Runtime Driver边界：Local Docker继续使用 agent-proxy，K3s/Kubernetes Driver生成 Deployment/Service等资源并由 Kubernetes完成调度恢复，Nacos在K8s模式优先仅保留配置中心。
+- 结论：任务中心已增加当前单选 pending/running 任务的“停止任务”入口；AIFAR Runtime 已增加当前选中实例的“全部重启（读取新配置）”任务入口，只按 spec 顺序重建期望副本数大于 0 的服务，保持已下线服务不启动。实现提交为 `c4e1a440` 至 `d2637e37`，审查加固提交为 `3d3b0e3b`，均仅保存在本地分支 `codex/status-collector-realtime`，未推送。
+- 结论：Runtime 重启会在任何变更前预检全部目标副本，逐副本启动健康的临时容器，保持逻辑容器名标签和环境变量，端点提升成功后才删除旧容器；提升失败恢复旧容器并停止后续工作，端点发现排除 `next/old` 临时容器。重启 Agent 请求不自动重试非幂等操作；旧 Agent 缺少 `restart-runtime` 能力时由任务先升级。四个计划步骤和 target 会正确记录 success/failed/cancelled。
+- 结论：最终验证通过完整 Go 后端测试、前端 20 个文件 204 项测试、脚本测试和前端生产构建，独立复审无剩余 Critical/Important；尚未在真实 openEuler/Docker 目标机执行滚动重建、取消时机和配置生效的现场验收。
+- 问题：用户询问微服务数量较多时，AIFAR Runtime 日志导出功能应如何设计；现场日志目录为 `/aifar/apps/admin/runtime/logs/<service>/`。
+- 结论：当前 Runtime 有两套互补日志来源：页面现有 SSE 聚合走 Docker `json-file` stdout/stderr（单容器配置 `max-size=50m`、`max-file=5`），宿主机持久日志则通过卷挂载写入 `runtime/logs/<service>`。正式导出不能简单把浏览器已加载行保存为文件，应先确认目标是故障诊断包、当前筛选结果还是全量历史归档，再确定服务/Pod/时间窗口、文件日志与容器日志组合、大小上限和脱敏规则。
+- 结论：用户选择首版日志导出定位为“一键故障诊断包”，后续设计应以服务器端任务采集和生成可下载归档为主，而不是仅导出浏览器当前可见日志；下一步确认默认时间窗口。
+- 结论：用户确认诊断包默认采集最近 2 小时，并支持自定义起止时间；后续需确认默认服务范围。
+- 结论：用户确认诊断包默认包含当前实例所有已启用服务，并允许手动取消部分服务；已下线服务默认不选中。
+- 结论：用户确认诊断包除服务日志外还应包含脱敏运行状态，包括服务/Pod、版本、容器健康、Agent、服务器资源摘要和采集清单；默认不包含配置文件正文。
+- 结论：用户确认诊断包压缩后硬上限为 1 GB、未压缩采集量上限为 3 GB；任务启动前应预估，超限时要求缩短时间或减少服务，而不是继续生成超大归档。
+- 结论：用户确认单个服务或 Pod 采集失败时继续生成部分诊断包，并在 `manifest.json` 与 `collection-errors.txt` 中记录失败原因和缺失内容，而不是让整个任务失败。
+- 结论：用户确认诊断包保留 24 小时后自动删除，并支持下载后立即删除；不做长期归档。
+- 结论：用户选择由 `aifar-agent` 在日志所在节点本机执行诊断采集、脱敏和压缩，`aifar-server` 负责 worker 任务、权限、审计、结果登记和下载；不采用面板拉取未压缩日志后再打包。
+- 结论：采用 Agent 本机采集方案意味着需要同步升级 `aifar-agent` 二进制和能力声明；不需要修改各 Java 微服务代码，现有节点可由面板在首次导出前按能力检查自动升级 Agent。
+
+## 2026-07-27
+- 问题：用户要求制作一份中文 AIFAR 培训手册，兼顾日常操作员和实施运维工程师，只讲登录后的功能，并采用真实界面截图。
+- 结论：图文手册已生成到 `docs/AIFAR登录后功能培训手册.docx`，按任务场景覆盖当前导航、服务器接入与探测、应用部署、任务核验、容器/Runtime、数据库、Nacos、对象存储、凭据、终端、审计、设置、风险边界、排障和培训验收；插入 9 张当前本地界面截图，排除含测试服务器地址或本地资源绝对路径的画面。结构校验通过 335 段、9 个一级章节、41 个二级章节、4 张表和 9 张内联图片；本机缺少 LibreOffice/Word，未完成逐页 PNG 视觉渲染。
+- 结论：用户改为要求不修改 `aifar-agent` 也能导出日志。修订方向为 `aifar-server worker + SSH 执行 go:embed 受信 Shell + 远端 tar.gz + SSH 二进制流下载`；只修改后端、前端和 SQLite，不向 API 暴露自由 Shell 或任意路径。
+- 结论：用户确认不修改 Agent 的修订架构：后端任务通过 SSH 执行内置受信脚本，在远端受控目录生成 `tar.gz`，后端以 exportId 查库并通过二进制安全 SSH 流下载；服务名、根路径和远端路径均由控制面限定。
+- 问题：确认无需修改 aifar-agent 的诊断包设计中，归档目录结构和九步采集任务流程。
+- 结论：已确认按服务归档文件日志与容器日志，并加入运行状态、健康检查、主机资源、版本摘要、manifest 和采集错误；任务采用 load-instance 到 record-export 九步流程，局部采集失败仍生成带告警的诊断包。
+- 结论：用户确认诊断包的安全、取消、下载和清理机制：客户端不传路径或 Shell，采集限定在受控目录且不跟随软链接；取消只清理本任务临时文件；下载经 SSH 二进制流转发，完整发送后才可按选项删除；24 小时后由可审计清理任务删除，离线节点进入待清理并重试。
+- 结论：用户确认诊断包页面交互、错误处理和验收标准；完整设计已写入 `docs/superpowers/specs/2026-07-27-aifar-runtime-diagnostic-export-design.md` 并以本地提交 `edfd424b` 保存。方案默认最近 2 小时、全部已启用服务，采用 SSH 内置受信脚本远端打包和二进制流下载，严格执行未压缩 3 GB、压缩 1 GB、24 小时保留、局部失败继续、权限审计和不修改 aifar-agent 的边界；尚未开始实现。
+- 结论：用户确认诊断包设计无误；详细实施计划已写入 `docs/superpowers/plans/2026-07-27-aifar-runtime-diagnostic-export.md` 并以本地提交 `6f7effcb` 保存。计划拆为持久化、SSH 二进制流、预估、远端归档、HTTP、过期清理、前端 API、页面和最终门禁九个 TDD 任务，明确不运行离线打包、`test:local` 或发布校验；尚未开始功能代码。
+- 结论：用户选择按子任务驱动方式执行诊断包实施计划；当前仓库是普通检出且存在其他未提交改动，项目内 `.worktrees` 目录已存在并被 Git 忽略，需经用户同意后在其中创建隔离工作树再开始实现。
+- 问题：用户要求暂时隐藏数据库、Nacos 和对象存储页面的部分二级管理入口。
+- 结论：三页标签条仅保留“实例”；对象存储另隐藏“应用清理策略”和“停用策略”，保留清理估算控件。相关模板分支、API、任务逻辑和已有数据均未删除，后续可恢复入口。
+- 问题：用户要求数据库和 Nacos 页头与对象存储一致，不再显示“前往应用商店部署”。
+- 结论：数据库、Nacos、对象存储页头统一为绿色“已连接”状态和“刷新”按钮；只移除数据库与 Nacos 的页头部署快捷入口，应用商店路由和部署能力继续保留。
+- 问题：用户要求将既有登录后功能培训手册精简重排为仅供客户方 IT 团队使用的运行监控与故障排查手册。
+- 结论：已确认新手册只保留只读运行监控、异常判断、证据采集和升级协同；删除部署、配置、管理及所有变更处置步骤，原培训手册保持不变。设计说明已写入 `docs/superpowers/specs/2026-07-27-aifar-customer-it-monitoring-troubleshooting-manual-design.md`，待用户确认书面范围后生成独立 Word 交付物。
+- 结论：客户 IT 精简版已生成到 `docs/AIFAR客户IT运行监控与故障排查手册.docx`，包含 8 个一级章节、34 个二级章节、10 张表和 3 张内联界面截图，仅覆盖只读监控、异常判断、任务/日志/审计取证与升级协同。专项结构与可访问性校验通过，原培训手册 SHA-256 保持 `6D31200417E695974D5915C4E790034E64D381021BFC74EF9080AF66DED54C65`；本机缺少 LibreOffice/Word，未完成逐页 PNG 视觉渲染。仓库全量测试另有与本文档无关的 `TestDockerSummaryCollectorTimeoutDoesNotBlockOtherHosts` 90 ms 时序门限失败，连续复跑 5 次耗时约 103 至 128 ms，未修改相关代码。
+- 问题：用户要求将客户 IT 运行监控与故障排查手册翻译为英文，并将文档截图替换为英文界面版本。
+- 结论：英文版已生成到 `docs/AIFAR-Customer-IT-Monitoring-and-Troubleshooting-Manual.docx`，逐段保留 8 个一级章节、34 个二级章节、10 张表和只读责任边界；重新切换 AIFAR 英文界面采集 Dashboard、Tasks、Log Audit 三张脱敏截图，截图后已恢复浏览器中文偏好。专项结构、英文残留、隐私和可访问性校验通过；本机仍缺少 LibreOffice/Word，未完成逐页 PNG 视觉渲染。
+- 问题：用户要求精简 AIFAR Runtime“入口与发现”表格、将发布历史移到最后，并为发布历史增加安全删除动作。
+- 结论：入口表格仅保留服务、应用名、发现地址和 Endpoint；发布历史成为最后一个资源标签。删除操作只清理 SQLite `app_releases` 及对应 artifact/snapshot 索引，当前发布、pending/running 发布和仍被其他发布引用的记录返回 409，远端制品、容器与运行状态不受影响；操作受 `apps.manage` 控制并写 `aifar.release.delete` 审计。
+- 问题：用户询问上线前如何统一修改 MySQL、Nacos、Redis、MinIO 集群默认密码，以及是否需要重新执行 mysqlsh 等集群动作。
+- 结论：应在全栈维护窗口按依赖顺序轮换并同步消费者。MySQL 管理账号改密不需要重建 InnoDB Cluster，mysqlsh 只用于新密码连接和 `cluster.status()` 验证；若 Nacos 外部库使用该账号，需同步所有 Nacos 节点的 `application.properties` 并重启。Nacos 管理员密码由共享数据库统一生效，无需逐节点改文件或重启，但需更新 AIFAR `java-secrets.env` 并重建 Java 容器。Redis 必须在全部数据节点同步 `requirepass/masterauth`，Sentinel 还要同步 `sentinel.conf` 的访问与节点间认证后按拓扑重启验证，不得重建 Cluster/Sentinel。MinIO 必须在所有节点同步 `minio.env` 后重启并验证。最后更新 Nacos 业务 Data ID、面板凭据中心和外部客户端；当前面板保存凭据本身不会改服务端。
+- 问题：用户在 AIFAR Runtime 执行“全部重启（读取新配置）”后，任务提示成功但 `alpha-contacts` 显示 `1/2` 且 Deployment/发布状态为降级。
+- 结论：当前 RestartAll 会让每个临时新容器先通过一次 Docker readiness，再提升为正式副本；但后端 `RestartRuntime` 的 `verify-runtime` 步骤只检查任务上下文是否取消，没有重新检查最终 Deployment 副本数和稳定健康状态，因此任务成功与随后 `1/2 degraded` 可以并存。截图能确认期望副本仍为 2、当前仅 1 个 ready，不能单凭截图区分第二副本是随后退出、不健康、OOM、配置错误或短暂状态；需在目标机只读检查 contacts 两个容器的状态、健康记录、退出码和日志后定因。
+- 问题：用户要求对象存储 MinIO 页面增加与 Nacos 一致的“等待后端推送”监测状态条。
+- 结论：状态条已本地快进合并到 `codex/status-collector-realtime`：位于页头与实例标签之间，只统计 MinIO 实例，展示权限相关推送状态和可选最新监测时间；每个快照优先使用有效 `collectedAt`，否则回退 `updatedAt`。合并结果前端测试 213/213、生产构建、diff 检查和本地浏览器验收通过；浏览器确认展示“已登记 1 个 MinIO 实例 / 等待后端推送 / 最近监测 <时间>”，现有搜索、清理估算和实例卡片保留，控制台无告警或错误。隔离工作区和功能分支已清理，未推送远端。
+- 结论：已在目标机现场确认 `contacts` 不是应用崩溃，而是期望状态源分裂：面板表格显示 2，但远端 `runtime/env/compose.env` 的 `AIFAR_DESIRED_REPLICAS` 和 `runtime/agent/runtime-spec.json` 都为 1，Agent 因此只保留 r1，“全部重启”也只重建 replica 1。已备份两个远端文件，将 contacts 同步为 2 并执行 `aifar-agent reconcile-runtime`；最终 r1/r2 均 running、healthy、restart=0、exit=0、非 OOM，Agent 有两个 endpoint，宿主机代理 readiness 连续 4 次返回 HTTP 200，最近 5 分钟无相关 Agent 失败日志。需后续修复控制面 Deployment、compose env、RuntimeSpec 三份副本状态可能分叉，以及 restart 的空 verify 步骤。
+- 问题：用户确认 MySQL InnoDB Cluster 数据库改密是否只需在集群上执行 SQL。
+- 结论：对 MySQL 集群本身，是：在当前 Primary 对实际使用的账号 Host 行执行 `ALTER USER` 并等待组复制，无需重启 MySQL 或重跑 mysqlsh 建群动作；但必须逐成员用新密码验证。集群外仍需同步所有消费者：若 Nacos 外部库使用该账号，更新每个 Nacos 节点的 `db.password.0` 并重启 Nacos；更新 Nacos 业务 Data ID、面板凭据和其他客户端。
+- 问题：用户询问 MySQL 修改密码是否会影响已建立连接。
+- 结论：普通 `ALTER USER ... IDENTIFIED BY ...` 不会踢掉或重新鉴权已建立的 MySQL 会话，它们可继续使用；新建、断线重连、连接池补充/换新的连接必须使用新密码。因此不能以“当前业务还正常”判定改密已完成；应先更新客户端配置并主动重建连接。若需无缝过渡，MySQL 8 可用 `RETAIN CURRENT PASSWORD` 临时保留旧密码，待所有消费者切换后再 `DISCARD OLD PASSWORD`。
+- 问题：用户再次确认 MySQL 改密后是否需要用 mysqlsh 重新调整集群。
+- 结论：不需要。普通管理/业务账号的 `ALTER USER` 不改变 InnoDB Cluster 拓扑、元数据、Group Replication 成员或内部 recovery 账号；mysqlsh 可选用新密码执行 `cluster.status()` 验证，不应重跑 `configureInstance/createCluster/addInstance/rejoinInstance`。只有专门轮换 InnoDB Cluster 内部 recovery 账号时，才是另一项 mysqlsh `cluster.resetRecoveryAccountsPassword()` 操作。
+- 问题：用户明确本次修改的是 AIFAR InnoDB Cluster 使用的 root 密码。
+- 结论：即使是 root，仍无需重新执行 mysqlsh 建群或调整拓扑；AIFAR 安装时将 root 作为 `clusterAdmin`，改密后只需确保 root 各 Host 账号在全部成员上密码一致，用新密码验证各节点和 `cluster.status()`。需同步 AIFAR 面板 MySQL 凭据，且若 Nacos 外部库或业务 Data ID 也使用 root，必须同步其密码并重建相关连接。
+- 问题：用户询问原始 AIFAR mysqlsh 建群连接是否未使用密码。
+- 结论：实际使用了 root 密码，只是 mysqlsh 命令行没有 `-p`；AIFAR 会生成临时 JS，将 `rootUser:rootPassword@host:port` 传给 `shell.connect()`、`dba.configureInstance()` 和后续 AdminAPI。集群建成后的 Group Replication 成员间通信使用 mysqlsh 自动生成的内部 recovery 账号，不持续使用 root；因此 root 改密不会中断现有集群，但以后 AIFAR 调用 mysqlsh 的启动/恢复/状态操作必须传入新 root 密码。当前启动链路仍从 `DefaultPassword` 取值，需改为解密实例绑定的 MySQL 凭据。
+- 问题：用户澄清 `alpha-contacts` 的正确期望副本数是 1，要求纠正此前按 2 副本处理的现场状态并查明页面为何显示 `1/2`。
+- 结论：此前将 contacts 临时调整为 2 的判断已纠正并回退；目标机 `compose.env`、RuntimeSpec、Agent DeploymentStatus、实际容器和 Endpoint 最终均为 1，r1 healthy，代理 readiness 连续 4 次 HTTP 200，r2 已由 Agent 删除。原始现场配置本来就是 1；页面 `1/2` 源于控制面合并时继续使用 SQLite Deployment 的旧 `desired_replicas=2`，同时用 Agent 实时状态覆盖 ready=1，形成同一行数据来源不一致，并非运行时真实存在两个期望副本。
+- 问题：用户要求“全部重启（读取新配置）”改为先下线实例全部业务 Pod，再直接启动全部期望 Pod，不再滚动替换。
+- 结论：用户确认采用 Agent 停机式五阶段方案：全量预检、全部下线、全部启动、统一健康校验和结果汇总；单个 Pod 启动失败后继续启动其余 Pod，最终汇总失败，成功 Pod 保留且不自动回滚。设计已写入 `docs/superpowers/specs/2026-07-27-aifar-runtime-stop-all-restart-design.md` 并提交为 `09f1f877`，待用户审阅书面规范后制定实施计划。
+- 问题：用户要求执行已确认的 AIFAR Runtime 停机式全部重启设计。
+- 结论：已在隔离分支 `codex/runtime-stop-all-restart` 完成实现：Agent 在任何删除前完成网络、镜像、env 文件和卷源预检，随后删除实例全部业务 Pod、确认无残留，再提交全部期望 Pod 启动并统一校验；单个启动失败继续后续服务，不自动回滚，取消时保留已启动 Pod并刷新部分状态。单服务发布仍沿用原滚动更新链路；面板任务改为五阶段，确认弹窗中英文明确全量停机。提交范围为 `4f1041d2` 至 `44a0fc5b`；后端全套测试、前端 214 项测试、前后端构建以及 RestartAll 10 次重复测试通过。最终 Linux Agent 位于隔离工作树 `bin/aifar-agent-linux-amd64`，SHA-256 为 `FB240393717FD5C385DABF0808379A928BD89E6E7BC87A2EBB23D6DF23D26927`；尚未部署或在真实目标机执行停机验收。
+- 结论：用户选择本地合并后，`codex/runtime-stop-all-restart` 已 fast-forward 合并到 `codex/status-collector-realtime` 的 `44a0fc5b`，合并结果重新通过后端全套测试、前端 214 项测试及前后端构建；功能分支和隔离工作树已清理。主工作区最终 Agent 为 `bin/aifar-agent-linux-amd64`，SHA-256 `F328C61C31EA75FE5E9E32E676AF5B473ED25DBBFB6B1FE16FB0793EA9B198A8`；既有 `memory.md` 修改和未跟踪文档未被覆盖，未推送远端、未部署目标机。
+- 问题：用户询问 AIFAR Runtime 顶部“同步运行时”和 Pods 页“启动/恢复 Pods”的区别及能否合并。
+- 结论：当前两者没有执行差异，前端都调用 `submitRuntimeReconcile`，提交同一个 `/containers/aifar/runtime/reconcile` API，最终执行 `aifar-agent reconcile-runtime --spec`；仅按钮位置、名称、确认文案和任务显示标签不同。“同步运行时”实际同时修复期望副本、缺失/停止 Pod、入口、Endpoint 和 Nacos 代理状态，语义覆盖“启动/恢复 Pods”。建议保留顶部“同步运行时”，移除 Pods 页重复按钮；若未来需要仅启动且不做完整 reconcile，必须新增独立后端和 Agent 能力。
+- 问题：用户确认合并 AIFAR Runtime 的两个重复同步入口。
+- 结论：已确认只保留顶部“同步运行时”，移除 Pods 页“启动/恢复 Pods”及其前端函数、context 字段和废弃中英文文案，后端、任务、审计、脚本和 Agent 均不修改；设计已写入 `docs/superpowers/specs/2026-07-27-aifar-runtime-reconcile-entry-merge-design.md` 并提交为 `f3905c71`，待用户完成书面规范确认后进入实施计划和 TDD 修改。
+- 结论：用户确认规范后，入口合并已在隔离分支 `codex/runtime-reconcile-entry-merge` 实现并提交为 `77ce10b2`：顶部“同步运行时”保持不变，Pods 页仅保留筛选、刷新和刷新指标，重复 action、context 字段及中英文文案已删除；后端和 Agent 无修改。真实 Vue SSR 组件测试先以重复按钮可见形成 RED，修改后前端 24 个文件 215 项测试、前端生产构建和后端全套测试通过；待用户选择本地合并、PR 或保留分支。
+- 问题：用户反馈英文监控与故障排查手册中的界面截图被截断，并要求删除 “Customer IT” 等内部受众标签，改为可直接面向客户交付的口吻。
+- 结论：修订版已生成到 `docs/AIFAR-Monitoring-and-Troubleshooting-Manual.docx`；Dashboard、Tasks、Log Audit 三张英文界面图均重新按 1280×720 完整视口采集并以 6.55 英寸整页宽度内联，未使用 Word 图片裁剪。标题、封面、页眉、正文、图注和元数据已统一为直接面向读者的中性/第二人称措辞，不含 “Customer IT”；结构校验和可访问性检查通过，本机缺少 LibreOffice，仍未完成逐页 PNG 渲染。
+- 问题：用户批准按子任务驱动方式实施无需修改 aifar-agent 的 Runtime 微服务诊断日志导出。
+- 结论：已在隔离分支 `codex/runtime-diagnostic-export` 完成并审查 Task 1–3，以及 Task 4 首版；持久化、二进制 SSH 流、请求校验/容量预估均已通过任务审查，核心归档实现提交为 `f2cd6624`。Task 4 独立审查发现计划写死的 `ulimit -f 2097152` 在目标 Bash 语义下约为 2 GiB，与全局 1 GiB 归档硬上限冲突；需用户确认以 1 GiB 安全目标为准后继续修复并执行 Tasks 5–9。未修改 aifar-agent、未离线打包、未推送或部署。
+- 结论：用户选择本地合并后，Runtime 重复入口合并提交 `77ce10b2` 已 fast-forward 到 `codex/status-collector-realtime`；合并结果重新通过前端 215 项测试、生产构建和后端全套测试。隔离工作树及功能分支已清理，主工作区既有未提交文件未被覆盖，未推送远端。
+- 问题：用户指出 AIFAR Runtime 的“刷新指标”依赖面板宿主机执行 `docker stats`，面板机未安装 Docker CLI 时会失败，询问替代方案。
+- 结论：根因是 Docker `tcp/http` host 的容器列表、探测等已走 Docker Engine HTTP API，但 `DockerContainerStatsForServer` 在该分支仍调用本机 `docker -H ... stats`。推荐补齐 Engine API `/containers/{id}/stats?stream=false` 的指标适配和有界并发，SSH host 保留远端 CLI fallback；该最小修复无需更新 aifar-agent。长期可让 Agent 从本机 Unix socket 采集并缓存指标，以关闭无认证 2375，但需要 Agent 协议和二进制升级。
+- 结论：用户确认选择补齐 Docker Engine Stats API 的方案；设计边界为 `tcp/http` Docker Host 直接读取每个容器的非流式 stats、后端计算 CPU/内存指标并有界并发采集，单容器失败降级为该行无指标，SSH host 保持远端 CLI fallback；前端接口和 aifar-agent 不变，待用户确认详细设计后写入规范并制定实施计划。
+- 结论：用户确认详细方案后，设计规范已写入 `docs/superpowers/specs/2026-07-27-docker-engine-stats-api-design.md` 并提交为 `e4988b14`；规范明确 Engine API stats 计算、最大并发 4、部分失败保留成功指标、不降级 Runtime 健康、SSH fallback 不变以及无需更新前端和 aifar-agent，待用户审阅书面规范后制定实施计划。
+- 结论：用户确认书面规范后，TDD 实施计划已写入 `docs/superpowers/plans/2026-07-27-docker-engine-stats-api.md` 并提交为 `6b68eacd`；计划分为单容器 stats 解码与计算、最大并发 4 的批量采集及无本机 CLI 路由、Runtime 部分指标保留、完整后端回归与范围核验四个任务，执行时需先创建隔离工作树。
+- 问题：用户选择按子任务驱动方式实施 Docker Engine Stats API，消除面板机对本地 Docker CLI 的依赖。
+- 结论：隔离分支 `codex/docker-engine-stats-api` 已完成实现和终审：`tcp/http/https` Docker Host 使用 `/containers/{id}/stats?stream=false`，批量采集最大并发固定为 4，部分失败保留成功指标并仅追加 warning，Runtime 健康不降级；SSH 仍用远端 `docker stats`，前端和 aifar-agent 未修改。提交范围为 `c2c2f455` 至 `94fcc27d`；新鲜 `pnpm test`、`pnpm backend:build`、diff 范围和终审均通过，尚未真实目标机验收、合并、推送或部署。
+- 结论：用户选择本地合并后，`codex/docker-engine-stats-api` 已 fast-forward 到 `codex/status-collector-realtime` 的 `94fcc27d`。合并后的 adapter/httpapi 测试和后端三目标构建通过；完整 `pnpm test` 两次均仅失败于既有 `TestDockerSummaryCollectorTimeoutDoesNotBlockOtherHosts` 严格时序门限，聚焦连续 5 次约 109–124 ms，未修改该无关 collector 代码。按收口规则暂时保留功能分支和隔离工作树，未推送或部署真实目标机。
+- 问题：用户询问 Git 历史中的 Docker Stats 提交是否就是本次功能，以及为何看不到操作记录。
+- 结论：本次功能由 `c2c2f455`、`3c840d1a`、`6310e0dc`、`94fcc27d` 四个实现/测试提交组成；所选 `3c840d1a` 负责 Engine API 批量采集和 API Host 路由，`6310e0dc` 负责 Runtime 部分失败 warning。刷新指标仍是只读 GET 查询，因此不会生成任务中心或审计记录，且前端按钮和 aifar-agent 均未修改。
+- 问题：用户要求检查当前分支中不应提交到仓库的内容并排除。
+- 结论：分支与远端同名分支提交一致；工作区中本机开发端口 `8099` 已从受版本控制的 `config/defaults.env` 恢复为仓库默认 `8080`，后续应通过进程环境变量覆盖。已精确忽略被新版替代的旧英文手册 `docs/AIFAR-Customer-IT-Monitoring-and-Troubleshooting-Manual.docx`，并清理根目录 0 字节误生成文件；其余三份用途不同的 DOCX、两份实施计划及项目 `memory.md` 保留为可提交内容。
