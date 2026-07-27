@@ -25,8 +25,8 @@ func TestBackupInnoDBClusterPlanTargetsAllRecordedMembers(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, want := planTargets(plan), []string{servers[0].ID, servers[1].ID, servers[2].ID}; !reflect.DeepEqual(got, want) {
-		t.Fatalf("backup targets = %v, want every recorded member %v", got, want)
+	if got, want := planTargets(plan), []string{"cluster_1234567890abcdef12345678"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("backup target = %v, want the single runtime-resolved cluster target %v", got, want)
 	}
 }
 
@@ -64,8 +64,8 @@ func TestRestoreHealthyClusterPlanTargetsAllRecordedMembers(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, want := planTargets(plan), []string{servers[0].ID, servers[1].ID, servers[2].ID}; !reflect.DeepEqual(got, want) {
-		t.Fatalf("restore targets = %v, want every recorded member %v", got, want)
+	if got, want := planTargets(plan), []string{"cluster_1234567890abcdef12345678"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("restore target = %v, want the single runtime-resolved cluster target %v", got, want)
 	}
 }
 

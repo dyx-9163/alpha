@@ -302,7 +302,7 @@ func (a *API) deleteAppInstances(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "DELETE_PLAN_STORE_FAILED", err.Error(), map[string]any{"target": target})
 		return
 	}
-	locks, ok := a.acquireTaskOperationLocks(w, lang, task, appInstanceOperationLockSpecs("delete", selectedInstances))
+	locks, ok := a.acquireTaskOperationLocks(w, lang, task, appMutationOperationLockSpecs("delete", selectedInstances))
 	if !ok {
 		return
 	}
@@ -396,7 +396,7 @@ func (a *API) checkAppInstance(w http.ResponseWriter, r *http.Request) {
 	var locks []store.OperationLock
 	if strings.EqualFold(strings.TrimSpace(instance.App), "mysql") {
 		var acquired bool
-		locks, acquired = a.acquireTaskOperationLocks(w, lang, task, appInstanceOperationLockSpecs("mysql-check", []store.AppInstance{instance}))
+		locks, acquired = a.acquireTaskOperationLocks(w, lang, task, mysqlClusterOperationLockSpecs("mysql-check", instance))
 		if !acquired {
 			return
 		}

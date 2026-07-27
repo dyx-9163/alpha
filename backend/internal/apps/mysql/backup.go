@@ -260,6 +260,7 @@ type standaloneBackupExecution struct {
 	members              []ClusterMemberRef
 	routers              []RouterRef
 	retentionInstanceIDs []string
+	progressTarget       string
 }
 
 func (s Service) backupStandalone(ctx context.Context, req registry.BackupRequest, run registry.RunContext) error {
@@ -302,6 +303,10 @@ func (s Service) backupStandaloneCore(ctx context.Context, req registry.BackupRe
 		},
 		repository: repository, backupStore: data, remote: s.remote,
 		remoteWork: mysqlBackupWorkDir(run.TaskID), log: run.Log,
+	}
+	progressTarget := execution.progressTarget
+	if progressTarget == "" {
+		progressTarget = req.Instance.ServerID
 	}
 	state.record, err = data.SaveAppBackup(state.record)
 	if err != nil {
@@ -356,15 +361,15 @@ func (s Service) backupStandaloneCore(ctx context.Context, req registry.BackupRe
 		state.record.Metadata = backupMetadataForExecution(parameters, "failed", mysqlBackupInspection{}, execution)
 		_, _ = data.SaveAppBackup(state.record)
 		if targetStarted {
-			installflow.FinishTarget(recorder, req.Instance.ServerID, "failed", backupDisplayError(req.Language, retErr).Error())
+			installflow.FinishTarget(recorder, progressTarget, "failed", backupDisplayError(req.Language, retErr).Error())
 		}
 	}()
 
-	installflow.StartTarget(recorder, req.Instance.ServerID)
+	installflow.StartTarget(recorder, progressTarget)
 	targetStarted = true
 	steps := standaloneBackupStepDefinitions(req.Language)
 	runner := installflow.Runner{
-		Log: run.Log, Recorder: recorder, Target: req.Instance.ServerID, Steps: steps,
+		Log: run.Log, Recorder: recorder, Target: progressTarget, Steps: steps,
 		Messages: installflow.Messages{
 			StepStart:  copy.StepStart,
 			StepDone:   copy.StepDone,
@@ -681,7 +686,7 @@ func (s Service) backupStandaloneCore(ctx context.Context, req registry.BackupRe
 		return err
 	}
 
-	installflow.FinishTarget(recorder, req.Instance.ServerID, "success", "")
+	installflow.FinishTarget(recorder, progressTarget, "success", "")
 	return nil
 }
 

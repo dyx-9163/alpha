@@ -289,8 +289,13 @@ func TestMySQLClusterBackupAndRestoreUseOneMutateLock(t *testing.T) {
 	instance := store.AppInstance{ID: "app_1234567890abcdef12345678", App: "mysql", ServerID: "srv_1234567890abcdef12345678", Topology: "innodb-cluster", Metadata: `{"clusterId":"cluster_1234567890abcdef12345678"}`}
 	backup := mysqlBackupOperationLockSpecs(instance)
 	restore := mysqlClusterOperationLockSpecs("mysql-restore", instance)
-	if len(backup) != 1 || len(restore) != 1 || backup[0].Scope != "app-cluster" || backup[0].ResourceID != "cluster_1234567890abcdef12345678" || backup[0].Operation != operationLockMutation || restore[0].Scope != backup[0].Scope || restore[0].ResourceID != backup[0].ResourceID || restore[0].Operation != backup[0].Operation {
-		t.Fatalf("cluster lock specs backup=%+v restore=%+v", backup, restore)
+	check := mysqlClusterOperationLockSpecs("mysql-check", instance)
+	delete := appMutationOperationLockSpecs("delete", []store.AppInstance{instance})
+	start := appMutationOperationLockSpecs("mysql-cluster-start", []store.AppInstance{instance, instance})
+	for action, specs := range map[string][]operationLockSpec{"backup": backup, "restore": restore, "check": check, "delete": delete, "start": start} {
+		if len(specs) != 1 || specs[0].Scope != "app-cluster" || specs[0].ResourceID != "cluster_1234567890abcdef12345678" || specs[0].Operation != operationLockMutation {
+			t.Fatalf("%s cluster lock specs = %+v", action, specs)
+		}
 	}
 }
 

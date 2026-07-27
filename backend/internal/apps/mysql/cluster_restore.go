@@ -8,7 +8,6 @@ import (
 	"net"
 	"os"
 	"path"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -74,13 +73,13 @@ func (m Module) planHealthyClusterRestore(ctx context.Context, req registry.Rest
 }
 
 func clusterBackupPlan(instances []store.AppInstance, names []string) []registry.InstallStepPlan {
-	ordered := append([]store.AppInstance(nil), instances...)
-	sort.Slice(ordered, func(i, j int) bool { return ordered[i].ServerID < ordered[j].ServerID })
-	plan := make([]registry.InstallStepPlan, 0, len(ordered)*len(names))
-	for _, instance := range ordered {
-		for index, name := range names {
-			plan = append(plan, registry.InstallStepPlan{Target: instance.ServerID, Name: name, Title: restoreStepTitle("en", name), Order: index + 1})
-		}
+	if len(instances) == 0 {
+		return nil
+	}
+	target := clusterIDFromInstance(instances[0])
+	plan := make([]registry.InstallStepPlan, 0, len(names))
+	for index, name := range names {
+		plan = append(plan, registry.InstallStepPlan{Target: target, Name: name, Title: restoreStepTitle("en", name), Order: index + 1})
 	}
 	return plan
 }
@@ -306,7 +305,7 @@ func (s Service) backupInnoDBCluster(ctx context.Context, req registry.BackupReq
 		ids = append(ids, member.instance.ID)
 	}
 	req.Instance, req.Instances, req.Servers = cluster.primary.instance, clusterInstances(cluster.members), clusterServers(cluster.members)
-	return s.backupStandaloneCore(ctx, req, run, standaloneBackupExecution{backupType: "logical-full", recordPlan: true, retention: true, topology: "innodb-cluster", clusterID: cluster.clusterID, members: members, routers: cluster.routers, retentionInstanceIDs: ids})
+	return s.backupStandaloneCore(ctx, req, run, standaloneBackupExecution{backupType: "logical-full", recordPlan: true, retention: true, topology: "innodb-cluster", clusterID: cluster.clusterID, members: members, routers: cluster.routers, retentionInstanceIDs: ids, progressTarget: cluster.clusterID})
 }
 
 func clusterInstances(members []clusterMemberNode) []store.AppInstance {
@@ -343,15 +342,57 @@ func (s Service) verifyClusterRecovered(ctx context.Context, cluster *resolvedIn
 	if len(cluster.routers) == 0 {
 		return nil
 	}
+	data, ok := s.store.(backupStore)
+	if !ok {
+		return errors.New("MySQL backup store is unavailable")
+	}
+	credential, err := data.GetBoundCredential(cluster.primary.instance.ID, "admin", true)
+	if err != nil || credential.Status != "active" || credential.Kind != "mysql" || strings.TrimSpace(credential.Secret["password"]) == "" {
+		return mysqlOperationError(MySQLCredentialUnavailable)
+	}
 	for _, router := range cluster.routers {
 		server, err := s.store.GetServer(router.ServerID, false)
 		if err != nil {
 			return err
 		}
-		result, err := s.remote.Run(ctx, server, "set -eu; mysqlrouter --version >/dev/null; printf '__AIFAR_ROUTER__\\tOK\\n'")
-		if err != nil || !strings.Contains(result.Stdout, "__AIFAR_ROUTER__\tOK") {
+		work := mysqlBackupWorkDir(taskID + "-router-" + router.InstanceID[len("app_"):])
+		if _, err := s.remote.Run(ctx, server, bootstrapBackupWorkCommand(work)); err != nil {
+			return mysqlOperationError(MySQLRestoreIncomplete)
+		}
+		secret, err := writeMySQLSecretContext(credential, routerPortForEndpoint(router.Endpoint))
+		if err != nil {
+			return mysqlOperationError(MySQLCredentialUnavailable)
+		}
+		if uploadErr := s.remote.UploadFile(ctx, server, secret, path.Join(work, "secret-context.cnf"), 0o600); uploadErr != nil {
+			_ = os.Remove(secret)
+			return mysqlOperationError(MySQLRestoreIncomplete)
+		}
+		_ = os.Remove(secret)
+		result, verifyErr := s.remote.Run(ctx, server, routerReadWriteVerificationCommand(work, routerPortForEndpoint(router.Endpoint)))
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		_, cleanupErr := s.remote.Run(cleanupCtx, server, cleanupBackupCommand(work))
+		cancel()
+		if verifyErr != nil || cleanupErr != nil || !strings.Contains(result.Stdout, "__AIFAR_ROUTER_WRITE__\t1") || !strings.Contains(result.Stdout, "__AIFAR_ROUTER_READ__\t1") {
 			return mysqlOperationError(MySQLRestoreIncomplete)
 		}
 	}
 	return nil
+}
+
+func routerPortForEndpoint(endpoint string) int {
+	_, port, err := net.SplitHostPort(endpoint)
+	if err != nil {
+		return 6446
+	}
+	value, err := strconv.Atoi(port)
+	if err != nil || value < 1 || value > 65535 {
+		return 6446
+	}
+	return value
+}
+
+func routerReadWriteVerificationCommand(work string, port int) string {
+	mysqlsh := path.Join(mysqlInstallRoot, "mysql-shell", "bin", "mysqlsh")
+	query := "CREATE TEMPORARY TABLE aifar_router_verify(v INT NOT NULL); INSERT INTO aifar_router_verify VALUES (1); SELECT '__AIFAR_ROUTER_WRITE__',COUNT(*) FROM aifar_router_verify; SELECT '__AIFAR_ROUTER_READ__',v FROM aifar_router_verify"
+	return "set -eu; test -x " + installerkit.ShellQuote(mysqlsh) + "; " + installerkit.ShellQuote(mysqlsh) + " --defaults-file=" + installerkit.ShellQuote(path.Join(work, "secret-context.cnf")) + " --sql --raw --skip-column-names --host=127.0.0.1 --port=" + strconv.Itoa(port) + " --execute " + installerkit.ShellQuote(query)
 }

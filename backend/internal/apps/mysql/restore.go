@@ -132,7 +132,11 @@ func (s Service) restoreStandalone(ctx context.Context, req registry.RestoreRequ
 }
 
 func (s Service) restoreLogical(ctx context.Context, req registry.RestoreRequest, run registry.RunContext, cluster *resolvedInnoDBCluster) (retErr error) {
-	progress := newStandaloneRestoreProgress(run, req.Instance.ServerID, req.Language)
+	progressTarget := req.Instance.ServerID
+	if cluster != nil {
+		progressTarget = cluster.clusterID
+	}
+	progress := newStandaloneRestoreProgress(run, progressTarget, req.Language)
 	defer progress.finish(&retErr, ctx)
 	data, ok := s.store.(restoreStore)
 	if !ok {
@@ -389,6 +393,18 @@ func (s Service) restoreLogical(ctx context.Context, req registry.RestoreRequest
 		return err
 	}
 	if err := progress.step(13, func() error {
+		// The pre-restore backup and staging may take long enough for a
+		// failover. Never begin schema mutation on a PRIMARY selected earlier.
+		if cluster != nil {
+			fresh, resolveErr := s.resolveHealthyInnoDBCluster(ctx, cluster.representative, run.TaskID)
+			if resolveErr != nil {
+				return resolveErr
+			}
+			if fresh.primary.instance.ID != instance.ID || fresh.primary.server.ID != server.ID {
+				return mysqlOperationError(MySQLRestorePrimaryChanged)
+			}
+			cluster = &fresh
+		}
 		if err := updateRestorePhase(data, &backup, "schema_mutation_started", run.TaskID, expectedManifestSHA); err != nil {
 			return err
 		}

@@ -122,7 +122,7 @@ func (a *API) startMySQLCluster(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "MYSQL_CLUSTER_START_PLAN_STORE_FAILED", err.Error(), map[string]any{"instances": ids})
 		return
 	}
-	locks, ok := a.acquireTaskOperationLocks(w, lang, task, appInstanceOperationLockSpecs("mysql-cluster-start", instances))
+	locks, ok := a.acquireTaskOperationLocks(w, lang, task, appMutationOperationLockSpecs("mysql-cluster-start", instances))
 	if !ok {
 		return
 	}

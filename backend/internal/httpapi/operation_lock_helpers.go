@@ -141,6 +141,26 @@ func mysqlClusterOperationLockSpecs(action string, instance store.AppInstance) [
 	return appInstanceOperationLockSpecs(action, []store.AppInstance{instance})
 }
 
+// appMutationOperationLockSpecs keeps every mutation for a MySQL cluster on
+// its one authoritative raw-cluster lock. Other applications and standalone
+// MySQL retain their existing per-instance serialization.
+func appMutationOperationLockSpecs(action string, instances []store.AppInstance) []operationLockSpec {
+	specs := make([]operationLockSpec, 0, len(instances))
+	seenClusters := map[string]bool{}
+	for _, instance := range instances {
+		if strings.EqualFold(strings.TrimSpace(instance.App), "mysql") && strings.EqualFold(strings.TrimSpace(instance.Topology), "innodb-cluster") {
+			clusterID := mysqlClusterID(instance)
+			if clusterID != "" && !seenClusters[clusterID] {
+				seenClusters[clusterID] = true
+				specs = append(specs, mysqlClusterOperationLockSpecs(action, instance)...)
+			}
+			continue
+		}
+		specs = append(specs, appInstanceOperationLockSpecs(action, []store.AppInstance{instance})...)
+	}
+	return specs
+}
+
 func operationLockMetadata(fields map[string]any) string {
 	data, err := json.Marshal(fields)
 	if err != nil {
