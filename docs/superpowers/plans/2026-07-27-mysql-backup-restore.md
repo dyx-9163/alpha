@@ -23,6 +23,8 @@
 - Disaster rebuild is explicit and owner-only: quarantine old data, restore a clean seed, call `dba.createCluster()`, clone remaining members, and re-bootstrap Router. No automatic destructive fallback is allowed.
 - User-visible backend and frontend text must exist in both Chinese and English.
 - All remote/MySQL tests use fakes. Real three-node acceptance is an opt-in/manual gate and must not run in ordinary CI.
+- `AIFAR_MYSQL_BACKUP_KEEP_LAST` is the default retention count. A backup request may provide a positive `keepLast` override; the handler validates it and falls back to configuration when omitted. The repository directory is always server-owned and cannot be overridden by request JSON.
+- Synchronous backup deletion preserves the original creation `task_id`; deletion identity and actor belong in audit rather than replacing backup provenance.
 
 ## File and Responsibility Map
 
@@ -66,7 +68,7 @@ type Config struct {
 
 func (s *Store) GetAppBackup(id string) (AppBackup, error)
 func (s *Store) ListAppBackupsForInstances(instanceIDs []string, includeDeleted bool) ([]AppBackup, error)
-func (s *Store) MarkAppBackupDeleted(id, taskID string, completedAt time.Time) (AppBackup, error)
+func (s *Store) MarkAppBackupDeleted(id string, completedAt time.Time) (AppBackup, error)
 func (s *Store) GetBoundCredential(appInstanceID, purpose string, includeSecret bool) (Credential, error)
 ```
 
@@ -205,7 +207,7 @@ type RestoreModule interface {
 - [ ] Add compile-time registry tests with a minimal fake module proving backup and restore remain optional and do not alter the required `Module` interface.
 - [ ] Add tests for request immutability and plan target/name/order preservation.
 - [ ] Run `cd backend; go test ./internal/apps/registry` and confirm the contract tests fail before adding the interfaces.
-- [ ] Add the request types and optional interfaces exactly as above. Keep repository configuration server-owned; the HTTP decoder must not accept `RepositoryDir` or `KeepLast` from JSON.
+- [ ] Add the request types and optional interfaces exactly as above. Keep `RepositoryDir` server-owned and reject it in request JSON. The decoder may accept a positive `keepLast` policy override; the handler validates it, falls back to `cfg.MySQLBackupKeepLast` when omitted, and only then assigns `BackupRequest.KeepLast`.
 - [ ] Wire `cfg.MySQLBackupDir` and `cfg.MySQLBackupKeepLast` into requests when handlers are implemented, not into user parameters.
 - [ ] Extend MySQL manifest capabilities with `apps.mysql.backup`, `apps.mysql.restore`, `apps.mysql.backup.verify`, and `apps.mysql.disaster-rebuild` only after its module implements the contracts.
 - [ ] Update MySQL fakes only as required by later dedicated backup dependencies; do not make install/check depend on backup repository availability.
