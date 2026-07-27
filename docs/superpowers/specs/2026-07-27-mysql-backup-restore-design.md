@@ -66,6 +66,10 @@ data/mysql-backups/<backupId>/
 
 生产环境应将 `AIFAR_MYSQL_BACKUP_DIR` 放在独立挂载盘或 NAS。备份不能只留在 MySQL 数据节点，否则节点级故障会同时丢失源数据和备份。
 
+备份仓库采用**受信单写者**威胁模型：仓库目录由面板服务账号独占，Linux 上目录权限固定为 `0700`，不得由其它面板进程、脚本或同 UID 工具直接读写。`Prepare`、`Commit`、`Verify`、`Delete` 等仓库生命周期操作必须持有同一仓库根的进程内互斥锁和根目录 `.aifar-repository.lock` 跨进程排他锁；锁文件权限为 `0600`。未取得锁时操作失败关闭，不继续读写文件。
+
+该边界继续防御 API 输入造成的路径逃逸、符号链接、非普通文件、校验和不一致和误删，但不承诺抵御 `root` 或能够以面板服务 UID 绕过仓库 API 的恶意并发进程。运维侧直接修改仓库文件属于不受支持操作；需要人工介入时必须先停止面板服务并完成离线校验。NAS 必须提供与本地 Linux 文件系统等价的排他锁和原子 rename 语义，否则不得作为此版本的仓库。
+
 现有 SSH adapter 只有本地到远端上传能力；实施时增加受控 SFTP Download，将数据库节点上的单一归档流式下载到面板 `.partial` 文件。SHA256 和大小复验通过后原子提升到最终路径，随后清理源节点临时目录。恢复时复用现有 Upload 将归档上传到目标 MySQL 节点。
 
 ## 5. 备份数据模型
@@ -422,6 +426,7 @@ MYSQL_REBUILD_ROUTER_FAILED
 - 不允许 API 接收自由 shell、自由远端路径或任意 schema drop SQL。
 - restore 的 schema 集合只能来自已验证 manifest 与服务端 allowlist 的交集。
 - backup、restore、delete、verify 和 disaster rebuild 全部写审计。
+- 面板备份仓库是服务账号独占的受信单写者目录；所有仓库生命周期操作必须持有进程内互斥锁和跨进程排他锁。`root` 或恶意同 UID 进程不在本版本威胁模型内。
 
 ## 17. 测试与验收
 

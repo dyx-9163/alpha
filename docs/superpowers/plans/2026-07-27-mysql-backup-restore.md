@@ -25,6 +25,7 @@
 - All remote/MySQL tests use fakes. Real three-node acceptance is an opt-in/manual gate and must not run in ordinary CI.
 - `AIFAR_MYSQL_BACKUP_KEEP_LAST` is the default retention count. A backup request may provide a positive `keepLast` override; the handler validates it and falls back to configuration when omitted. The repository directory is always server-owned and cannot be overridden by request JSON.
 - Synchronous backup deletion preserves the original creation `task_id`; deletion identity and actor belong in audit rather than replacing backup provenance.
+- The backup repository uses a trusted-single-writer threat model. Its root is owned exclusively by the panel service account (`0700` on Linux); every repository lifecycle operation holds an in-process mutex and an exclusive cross-process `.aifar-repository.lock` (`0600`). Failure to acquire the lock fails closed. API path escape, symlink, non-regular-file, checksum, and wrong-target protections remain required, but malicious `root` or same-UID writers that bypass the repository API are out of scope.
 
 ## File and Responsibility Map
 
@@ -118,6 +119,7 @@ func (r *Repository) RetentionCandidates(backups []store.AppBackup, keepLast int
 - [ ] Add success tests for the exact on-disk layout `root/<backupId>/{backup-manifest.json,dump.tar,checksums.txt}`, a `.partial` archive before commit, and atomic promotion only after size and SHA256 match.
 - [ ] Run `cd backend; go test ./internal/backuprepo` and confirm failure because the package is not implemented.
 - [ ] Implement root canonicalization, directory creation with owner-only permissions where supported, `Lstat` checks at every managed path boundary, streaming SHA256, `fsync`, and same-directory rename from `dump.tar.partial` to `dump.tar`.
+- [ ] Serialize `Prepare`, `Commit`, `Verify`, and `Delete` with a repository-root keyed in-process mutex plus an exclusive `.aifar-repository.lock` file. Reject insecure Linux root permissions/ownership and fail closed when the configured filesystem cannot provide the required lock and atomic rename semantics.
 - [ ] Implement manifest and checksums writes through same-directory temporary files followed by `fsync` and rename. Ensure a failed commit leaves no final archive and removes panel-side partial files.
 - [ ] Implement `Verify` so the record ID, record path, manifest backup ID, archive size, archive SHA256, and `checksums.txt` all agree before success.
 - [ ] Implement deletion so only the exact verified managed backup directory is removed; do not follow symlinks and do not allow deletion of the root itself.
