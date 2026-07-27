@@ -2,7 +2,7 @@ set -eu
 
 umask 077
 
-for required in docker find xargs readlink stat sed awk grep tr sha256sum tar gzip du df free uptime systemctl cp mv mkdir chmod rm sort wc; do
+for required in docker find xargs readlink stat sed awk grep tr sha256sum tar gzip du df free uptime systemctl cat cp mv mkdir chmod rm sort wc; do
   command -v "$required" >/dev/null 2>&1 || exit 20
 done
 
@@ -297,6 +297,35 @@ add_error() {
   case "$service" in -|*[!a-z0-9-]*) [ "$service" = "-" ] || exit 31 ;; esac
   printf '%s\t%s\t-\n' "$code" "$service" >> "$ERROR_RECORDS"
 }
+is_safe_log_relative() {
+  relative_name=$1
+  case "$relative_name" in
+    ''|/*|*//*|*[!A-Za-z0-9._/@+-]*) return 1 ;;
+  esac
+  previous_ifs=$IFS
+  IFS=/
+  set -- $relative_name
+  IFS=$previous_ifs
+  [ "$#" -gt 0 ] || return 1
+  last_component=
+  for component do
+    case "$component" in ''|.*) return 1 ;; esac
+    component_lower=$(printf '%s' "$component" | tr '[:upper:]' '[:lower:]') || return 1
+    case "$component_lower" in
+      config|configs|configuration|data|database|db|credential|credentials|secret|secrets|password|passwords|token|tokens|key|keys|cert|certs|certificate|certificates|private|.ssh|config.*|data.*|database.*|db.*|credential.*|credentials.*|secret.*|secrets.*|password.*|passwords.*|token.*|tokens.*|private.*|id_*) return 1 ;;
+    esac
+    last_component=$component_lower
+  done
+  case "$last_component" in
+    *.log) return 0 ;;
+    *.log.*)
+      rotation=${last_component##*.log.}
+      case "$rotation" in ''|*[!0-9]*) return 1 ;; esac
+      return 0
+      ;;
+    *) return 1 ;;
+  esac
+}
 service=$1
 service_root=$2
 shift 2
@@ -306,34 +335,63 @@ for candidate do
   resolved=$(readlink -f -- "$candidate") || { add_error file-resolve-failed "$service"; continue; }
   case "$resolved" in "$service_root"/*) ;; *) add_error file-prefix-rejected "$service"; continue ;; esac
   relative_name=${resolved#"$service_root"/}
-  if ! printf '%s' "$relative_name" | LC_ALL=C grep -Eq '^[A-Za-z0-9._/@+-]+$'; then
+  if ! is_safe_log_relative "$relative_name"; then
     add_error file-name-rejected "$service"
     continue
   fi
-  relative_lower=$(printf '%s' "$relative_name" | tr '[:upper:]' '[:lower:]')
-  case "$relative_lower" in
-    .env|*/.env|.env.*|*/.env.*|*.env|*.env.*|env|*/env|config|*/config|config/*|*/config/*|credentials|*/credentials|*/credentials/*|.ssh|*/.ssh|*/.ssh/*|id_rsa|*/id_rsa|id_ed25519|*/id_ed25519|authorized_keys|*/authorized_keys|dump.rdb|*/dump.rdb|*.rdb|*.ibd|*.ppk|*.conf|*.cnf|*.toml|*.xml|*.jks|*.p12|*.pfx|*.keystore|*.ini|*.properties|*.yaml|*.yml|*.json|*.db|*.db-*|*.sqlite|*.sqlite3|*.sql|*.dump|*.bak|*.mdb|*.accdb|*.pem|*.key|*.crt|*.gz|*.zip|*.xz|*.bz2|*.zst)
-      add_error sensitive-file-skipped "$service"
-      continue
-      ;;
-  esac
   stat_resolved=$(readlink -f -- "$candidate") || { add_error file-resolve-failed "$service"; continue; }
   case "$stat_resolved" in "$service_root"/*) ;; *) add_error file-prefix-rejected "$service"; continue ;; esac
   [ "$stat_resolved" = "$resolved" ] || { add_error file-path-changed "$service"; continue; }
   copy_source=$(readlink -f -- "$candidate") || { add_error file-resolve-failed "$service"; continue; }
   case "$copy_source" in "$service_root"/*) ;; *) add_error file-prefix-rejected "$service"; continue ;; esac
   [ "$copy_source" = "$resolved" ] || { add_error file-path-changed "$service"; continue; }
+  source_identity=$(stat -Lc '%d:%i:%s' -- "$candidate") || { add_error file-stat-failed "$service"; continue; }
+  source_device=${source_identity%%:*}
+  source_remainder=${source_identity#*:}
+  source_inode=${source_remainder%%:*}
+  source_bytes=${source_remainder#*:}
+  case "$source_device:$source_inode:$source_bytes" in *[!0-9:]*) add_error file-stat-failed "$service"; continue ;; esac
+  used=$(cat "$TOTAL_FILE") || exit 31
+  case "$used" in ''|*[!0-9]*) exit 31 ;; esac
+  [ "$used" -le "$MAX_UNCOMPRESSED" ] || exit 31
+  remaining=$((MAX_UNCOMPRESSED - used))
+  if [ "$source_bytes" -gt "$remaining" ]; then add_error uncompressed-limit "$service"; continue; fi
+  remaining_blocks=$((remaining / 1024))
+  [ "$remaining_blocks" -gt 0 ] || { add_error uncompressed-limit "$service"; continue; }
+  case "$FILE_LIMIT_BLOCKS" in
+    unlimited) snapshot_blocks=$remaining_blocks ;;
+    *)
+      snapshot_blocks=$FILE_LIMIT_BLOCKS
+      [ "$snapshot_blocks" -le "$remaining_blocks" ] || snapshot_blocks=$remaining_blocks
+      ;;
+  esac
   raw="$RAW_ROOT/files/$service/$counter.raw"
   mkdir -p "$(dirname "$raw")"
-  if ! cp -P -- "$candidate" "$raw"; then add_error file-copy-failed "$service"; continue; fi
+  if run_limited "$snapshot_blocks" cp -P -- "$candidate" "$raw"; then
+    :
+  else
+    command_status=$?
+    rm -f -- "$raw"
+    [ "$command_status" -ne 70 ] || exit 31
+    add_error file-copy-limit "$service"
+    continue
+  fi
   if [ -L "$raw" ] || [ ! -f "$raw" ]; then rm -f -- "$raw"; add_error file-path-changed "$service"; continue; fi
   raw_resolved=$(readlink -f -- "$raw") || exit 31
   case "$raw_resolved" in "$RAW_ROOT"/*) ;; *) exit 31 ;; esac
   original_bytes=$(stat -c '%s' -- "$raw") || exit 31
-  used=$(cat "$TOTAL_FILE") || exit 31
-  case "$original_bytes:$used" in *[!0-9:]*) exit 31 ;; esac
-  remaining=$((MAX_UNCOMPRESSED - used))
-  if [ "$original_bytes" -gt "$remaining" ]; then rm -f -- "$raw"; add_error uncompressed-limit "$service"; continue; fi
+  case "$original_bytes" in ''|*[!0-9]*) exit 31 ;; esac
+  if [ "$original_bytes" -ne "$source_bytes" ] || [ "$original_bytes" -gt "$remaining" ]; then
+    rm -f -- "$raw"
+    add_error file-source-changed "$service"
+    continue
+  fi
+  copied_source_identity=$(stat -Lc '%d:%i:%s' -- "$candidate") || { rm -f -- "$raw"; add_error file-source-changed "$service"; continue; }
+  if [ "$copied_source_identity" != "$source_identity" ]; then
+    rm -f -- "$raw"
+    add_error file-source-changed "$service"
+    continue
+  fi
   destination_relative="services/$service/file-logs/$relative_name"
   destination="$BUNDLE_ROOT/$destination_relative"
   staged="$STAGE_ROOT/$destination_relative"
@@ -369,7 +427,17 @@ for service in $SERVICES; do
       fi
     fi
   fi
-  containers=$(docker ps -a --filter "label=aifar.instance=$INSTANCE_ID" --filter "label=aifar.service=$service" --format '{{"{{.Names}}"}}') || exit 32
+  container_names="$RAW_ROOT/container-names-$service"
+  if run_limited "$FILE_LIMIT_BLOCKS" docker ps -a --filter "label=aifar.instance=$INSTANCE_ID" --filter "label=aifar.service=$service" --format '{{"{{.Names}}"}}' > "$container_names" 2>&1; then
+    containers=$(cat "$container_names") || exit 32
+    rm -f -- "$container_names" || exit 32
+  else
+    command_status=$?
+    rm -f -- "$container_names"
+    [ "$command_status" -ne 70 ] || exit 32
+    add_error container-list-failed "$service"
+    containers=
+  fi
   for container in $containers; do
     case "$container" in ''|*[!A-Za-z0-9._-]*) exit 32 ;; esac
     remaining=$(remaining_bytes)
@@ -380,7 +448,15 @@ for service in $SERVICES; do
     destination_relative="services/$service/container-logs/$container.log"
     destination="$BUNDLE_ROOT/$destination_relative"
     mkdir -p "$(dirname "$raw")" "$(dirname "$staged")" "$(dirname "$scratch")" "$(dirname "$destination")"
-    run_limited "$FILE_LIMIT_BLOCKS" docker logs --since "$SINCE" --until "$UNTIL" --timestamps "$container" > "$raw" 2>&1 || exit 32
+    if run_limited "$FILE_LIMIT_BLOCKS" docker logs --since "$SINCE" --until "$UNTIL" --timestamps "$container" > "$raw" 2>&1; then
+      :
+    else
+      command_status=$?
+      rm -f -- "$raw"
+      [ "$command_status" -ne 70 ] || exit 32
+      add_error container-log-failed "$service"
+      continue
+    fi
     [ -f "$raw" ] && [ ! -L "$raw" ] || exit 32
     original_bytes=$(stat -c '%s' -- "$raw") || exit 32
     [ "$original_bytes" -le "$remaining" ] || exit 32
@@ -401,35 +477,84 @@ stage_generated_text "diagnostics/release-summary.json" "store:release-summary" 
 stage_generated_text "README.txt" "generated:readme" "$README_TEXT"
 
 containers_file="$RAW_ROOT/containers.txt"
-docker ps -a --filter "label=aifar.instance=$INSTANCE_ID" --format 'table {{"{{.Names}}"}}\t{{"{{.Image}}"}}\t{{"{{.Status}}"}}' > "$containers_file" 2>&1 || exit 33
-stage_generated_redacted_file "diagnostics/containers.txt" "remote:docker-ps" "$containers_file"
+if run_limited "$FILE_LIMIT_BLOCKS" docker ps -a --filter "label=aifar.instance=$INSTANCE_ID" --format 'table {{"{{.Names}}"}}\t{{"{{.Image}}"}}\t{{"{{.Status}}"}}' > "$containers_file" 2>&1; then
+  stage_generated_redacted_file "diagnostics/containers.txt" "remote:docker-ps" "$containers_file"
+else
+  command_status=$?
+  rm -f -- "$containers_file"
+  [ "$command_status" -ne 70 ] || exit 33
+  add_error container-summary-failed -
+fi
 
 health_file="$RAW_ROOT/health-checks.txt"
 : > "$health_file"
 for service in $SERVICES; do
-  containers=$(docker ps -a --filter "label=aifar.instance=$INSTANCE_ID" --filter "label=aifar.service=$service" --format '{{"{{.Names}}"}}') || exit 33
+  container_names="$RAW_ROOT/health-container-names-$service"
+  if run_limited "$FILE_LIMIT_BLOCKS" docker ps -a --filter "label=aifar.instance=$INSTANCE_ID" --filter "label=aifar.service=$service" --format '{{"{{.Names}}"}}' > "$container_names" 2>&1; then
+    containers=$(cat "$container_names") || exit 33
+    rm -f -- "$container_names" || exit 33
+  else
+    command_status=$?
+    rm -f -- "$container_names"
+    [ "$command_status" -ne 70 ] || exit 33
+    add_error health-container-list-failed "$service"
+    containers=
+  fi
+  health_counter=0
   for container in $containers; do
     case "$container" in ''|*[!A-Za-z0-9._-]*) exit 33 ;; esac
-    printf '%s\t' "$container" >> "$health_file"
-    docker inspect --format '{{"{{json .State.Health}}"}}' "$container" >> "$health_file" 2>&1 || exit 33
+    health_counter=$((health_counter + 1))
+    health_item="$RAW_ROOT/health-$service-$health_counter.raw"
+    if run_limited "$FILE_LIMIT_BLOCKS" docker inspect --format '{{"{{json .State.Health}}"}}' "$container" > "$health_item" 2>&1; then
+      printf '%s\t' "$container" >> "$health_file"
+      cat "$health_item" >> "$health_file" || exit 33
+      rm -f -- "$health_item" || exit 33
+    else
+      command_status=$?
+      rm -f -- "$health_item"
+      [ "$command_status" -ne 70 ] || exit 33
+      add_error container-health-failed "$service"
+    fi
   done
 done
 stage_generated_redacted_file "diagnostics/health-checks.txt" "remote:docker-health" "$health_file"
 
 agent_file="$RAW_ROOT/agent-status.txt"
-systemctl status aifar-agent --no-pager > "$agent_file" 2>&1 || exit 33
-stage_generated_redacted_file "diagnostics/agent-status.txt" "remote:systemctl-aifar-agent" "$agent_file"
+if run_limited "$FILE_LIMIT_BLOCKS" systemctl status aifar-agent --no-pager > "$agent_file" 2>&1; then
+  stage_generated_redacted_file "diagnostics/agent-status.txt" "remote:systemctl-aifar-agent" "$agent_file"
+else
+  command_status=$?
+  rm -f -- "$agent_file"
+  [ "$command_status" -ne 70 ] || exit 33
+  add_error agent-status-failed -
+fi
 
 host_file="$RAW_ROOT/host-resources.txt"
-{
-  printf '%s\n' '== uptime =='
-  uptime
-  printf '%s\n' '== memory =='
-  free -m
-  printf '%s\n' '== filesystem =='
-  df -h "$INSTALL_ROOT"
-} > "$host_file" 2>&1 || exit 33
-stage_generated_redacted_file "diagnostics/host-resources.txt" "remote:host-resources" "$host_file"
+: > "$host_file"
+append_host_diagnostic() {
+  label=$1
+  error_code=$2
+  shift 2
+  host_item="$RAW_ROOT/host-$label.raw"
+  if run_limited "$FILE_LIMIT_BLOCKS" "$@" > "$host_item" 2>&1; then
+    printf '== %s ==\n' "$label" >> "$host_file"
+    cat "$host_item" >> "$host_file" || exit 33
+    rm -f -- "$host_item" || exit 33
+  else
+    command_status=$?
+    rm -f -- "$host_item"
+    [ "$command_status" -ne 70 ] || exit 33
+    add_error "$error_code" -
+  fi
+}
+append_host_diagnostic uptime host-uptime-failed uptime
+append_host_diagnostic memory host-memory-failed free -m
+append_host_diagnostic filesystem host-filesystem-failed df -h "$INSTALL_ROOT"
+if [ -s "$host_file" ]; then
+  stage_generated_redacted_file "diagnostics/host-resources.txt" "remote:host-resources" "$host_file"
+else
+  rm -f -- "$host_file"
+fi
 
 warning_count=$(awk 'END { print NR + 0 }' "$ERROR_RECORDS") || exit 29
 case "$warning_count" in ''|*[!0-9]*) exit 29 ;; esac

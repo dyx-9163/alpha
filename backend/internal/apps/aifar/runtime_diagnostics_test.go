@@ -485,7 +485,11 @@ func TestRuntimeDiagnosticExportScriptSecurityContract(t *testing.T) {
 		"3221225472",
 		"json_escape()",
 		`FILE_LIMIT_BLOCKS=1048576`,
+		`remaining_blocks=$((remaining / 1024))`,
+		`[ "$remaining_blocks" -gt 0 ]`,
+		`[ "$snapshot_blocks" -le "$remaining_blocks" ]`,
 		"run_limited()",
+		"is_safe_log_relative()",
 		`tar -czf "$ARCHIVE_PARTIAL"`,
 		`tar -tzf "$ARCHIVE_PARTIAL"`,
 		`archive_sha=$(sha256_file "$ARCHIVE_PARTIAL") || exit 28`,
@@ -501,9 +505,7 @@ func TestRuntimeDiagnosticExportScriptSecurityContract(t *testing.T) {
 		`stage_generated_redacted_file "diagnostics/agent-status.txt"`,
 		`stage_generated_redacted_file "diagnostics/host-resources.txt"`,
 		"in_private_key",
-		`relative_lower=$(printf '%s' "$relative_name" | tr '[:upper:]' '[:lower:]')`,
-		`.env.*|*/.env.*`,
-		`*.cnf|*.toml|*.xml|*.jks|*.p12|*.pfx|*.keystore`,
+		`case "$last_component" in`,
 	} {
 		if !strings.Contains(script, required) {
 			t.Fatalf("export script is missing required contract %q:\n%s", required, script)
@@ -512,7 +514,7 @@ func TestRuntimeDiagnosticExportScriptSecurityContract(t *testing.T) {
 	for _, forbidden := range []string{
 		"jq ", "python", "node ", `rm -rf -- "$LOG_ROOT`, `.env" "$BUNDLE_ROOT`, "runtimeSpec",
 		`{{.Labels}}`, `s/([A-Za-z0-9+\/_=-]{80})[A-Za-z0-9+\/_=-]*/\1[REDACTED]/g`,
-		"2097152", "if ! (ulimit",
+		"2097152", "remaining / 512", "if ! (ulimit",
 	} {
 		if strings.Contains(script, forbidden) {
 			t.Fatalf("export script contains forbidden behavior %q:\n%s", forbidden, script)
@@ -520,9 +522,6 @@ func TestRuntimeDiagnosticExportScriptSecurityContract(t *testing.T) {
 	}
 	if got := strings.Count(script, `"$service_root"/*)`); got < 3 {
 		t.Fatalf("file candidates must be prefix-revalidated before stat and staged reads, checks=%d:\n%s", got, script)
-	}
-	if !strings.Contains(script, "*.gz|*.zip|*.xz|*.bz2|*.zst") {
-		t.Fatalf("compressed file logs must be skipped because byte-level redaction cannot sanitize them:\n%s", script)
 	}
 }
 
@@ -980,6 +979,8 @@ type runtimeDiagnosticExportShellFixture struct {
 	procShell     string
 	exportID      string
 	archiveBase   string
+	fileLimit     string
+	maxStagedSize int64
 }
 
 func newRuntimeDiagnosticExportShellFixture(t *testing.T) *runtimeDiagnosticExportShellFixture {
@@ -1023,6 +1024,10 @@ func newRuntimeDiagnosticExportShellFixture(t *testing.T) *runtimeDiagnosticExpo
 
 func (f *runtimeDiagnosticExportShellFixture) render() string {
 	f.t.Helper()
+	fileLimit := f.fileLimit
+	if fileLimit == "" {
+		fileLimit = "unlimited"
+	}
 	script, err := renderRuntimeDiagnosticExportScript(runtimeDiagnosticExportScriptData{
 		InstallRoot:     installerkit.ShellQuote(f.installShell),
 		ExportID:        installerkit.ShellQuote(f.exportID),
@@ -1037,10 +1042,17 @@ func (f *runtimeDiagnosticExportShellFixture) render() string {
 		ReleaseSummary:  installerkit.ShellQuote(`[]`),
 		Readme:          installerkit.ShellQuote("diagnostic readme"),
 		ProcRoot:        installerkit.ShellQuote(f.procShell),
-		FileLimitBlocks: installerkit.ShellQuote("unlimited"),
+		FileLimitBlocks: installerkit.ShellQuote(fileLimit),
 	})
 	if err != nil {
 		f.t.Fatal(err)
+	}
+	if f.maxStagedSize > 0 {
+		const productionLimit = "MAX_UNCOMPRESSED=3221225472"
+		if strings.Count(script, productionLimit) != 1 {
+			f.t.Fatalf("rendered script no longer exposes one fixed staged-data limit")
+		}
+		script = strings.Replace(script, productionLimit, "MAX_UNCOMPRESSED="+strconv.FormatInt(f.maxStagedSize, 10), 1)
 	}
 	return script
 }
@@ -1163,6 +1175,9 @@ func TestRuntimeDiagnosticExportRejectsFinalDirectoryCreatedDuringPromotion(t *t
 }
 
 func TestRuntimeDiagnosticExportRejectsSourceSwappedToSymlinkBeforeRead(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Git for Windows sh cannot apply the numeric snapshot ulimit; exercised on Linux")
+	}
 	fixture := newRuntimeDiagnosticExportShellFixture(t)
 	logPath := filepath.Join(fixture.installNative, "runtime", "logs", "gateway", "swap.log")
 	secretPath := filepath.Join(fixture.rootNative, "outside-secret")
@@ -1221,17 +1236,41 @@ func TestRuntimeDiagnosticExportFailsWhenSHA256CommandFails(t *testing.T) {
 }
 
 func TestRuntimeDiagnosticExportExcludesSensitiveNamesAndIntermediateFiles(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Git for Windows sh cannot apply the numeric snapshot ulimit; exercised on Linux")
+	}
 	fixture := newRuntimeDiagnosticExportShellFixture(t)
 	logRoot := filepath.Join(fixture.installNative, "runtime", "logs", "gateway")
-	for name, content := range map[string]string{
-		"safe.log": "safe content", "dump.rdb": "redis secret", "table.IBD": "mysql secret", "access.PPK": "ssh secret",
-		filepath.Join("config", "credentials"): "credential secret",
-	} {
-		fullPath := filepath.Join(logRoot, name)
+	files := []struct {
+		name    string
+		content string
+	}{
+		{name: "app.log", content: "safe content"},
+		{name: "app.log.1", content: "safe rotated content"},
+		{name: "dump.rdb", content: "redis secret"},
+		{name: "table.IBD", content: "mysql secret"},
+		{name: "access.PPK", content: "ssh secret"},
+		{name: "credentials.txt", content: "credential secret"},
+		{name: "id_ecdsa", content: "private key"},
+		{name: "appendonly.aof", content: "redis data"},
+		{name: "ibdata1", content: "mysql data"},
+		{name: filepath.Join(".hidden", "app.log"), content: "hidden path"},
+		{name: filepath.Join("credentials", "app.log"), content: "sensitive path"},
+		{name: filepath.Join("data", "app.log"), content: "sensitive data path"},
+		{name: filepath.Join("config", "credentials"), content: "credential secret"},
+	}
+	if runtime.GOOS != "windows" {
+		files = append(files, struct {
+			name    string
+			content string
+		}{name: "app.log\nforged.log", content: "newline bypass"})
+	}
+	for _, file := range files {
+		fullPath := filepath.Join(logRoot, file.name)
 		if err := os.MkdirAll(filepath.Dir(fullPath), 0o755); err != nil {
 			t.Fatal(err)
 		}
-		if err := os.WriteFile(fullPath, []byte(content), 0o600); err != nil {
+		if err := os.WriteFile(fullPath, []byte(file.content), 0o600); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -1240,17 +1279,251 @@ func TestRuntimeDiagnosticExportExcludesSensitiveNamesAndIntermediateFiles(t *te
 		t.Fatalf("diagnostic export failed: %v: %s", err, output)
 	}
 	listing := runtimeDiagnosticArchiveList(t, fixture.sh, fixture.archiveNative())
-	for _, forbidden := range []string{"dump.rdb", "table.IBD", "access.PPK", "config/credentials", ".partial", ".raw", ".work"} {
+	for _, allowed := range []string{
+		fixture.archiveBase + "/services/gateway/file-logs/app.log",
+		fixture.archiveBase + "/services/gateway/file-logs/app.log.1",
+	} {
+		if !strings.Contains(listing, allowed) {
+			t.Fatalf("archive omitted allowlisted log %q:\n%s", allowed, listing)
+		}
+	}
+	for _, forbidden := range []string{
+		"dump.rdb", "table.IBD", "access.PPK", "credentials.txt", "id_ecdsa", "appendonly.aof", "ibdata1",
+		"forged.log", ".hidden/app.log", "credentials/app.log", "data/app.log", "config/credentials", ".partial", ".raw", ".work",
+	} {
 		if strings.Contains(listing, forbidden) {
 			t.Fatalf("archive contains forbidden entry %q:\n%s", forbidden, listing)
 		}
 	}
 	errorsText := runtimeDiagnosticArchiveFile(t, fixture.sh, fixture.archiveNative(), fixture.archiveBase+"/collection-errors.txt")
-	for _, sensitiveName := range []string{"dump.rdb", "table.IBD", "access.PPK", "config/credentials"} {
+	for _, sensitiveName := range []string{
+		"dump.rdb", "table.IBD", "access.PPK", "credentials.txt", "id_ecdsa", "appendonly.aof", "ibdata1",
+		"forged.log", ".hidden/app.log", "credentials/app.log", "data/app.log", "config/credentials",
+	} {
 		if strings.Contains(errorsText, sensitiveName) {
 			t.Fatalf("collection errors leaked rejected path %q: %s", sensitiveName, errorsText)
 		}
 	}
+}
+
+func TestRuntimeDiagnosticExportLogAllowlistRejectsUnsafeRelativePaths(t *testing.T) {
+	sh := runtimeDiagnosticTestShell(t)
+	script, err := renderRuntimeDiagnosticExportScript(runtimeDiagnosticExportScriptData{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	helper := shellFunction(t, script, "is_safe_log_relative")
+	for _, relative := range []string{
+		"credentials.txt", "id_ecdsa", "appendonly.aof", "ibdata1", "app.log\nforged.log",
+		".hidden/app.log", "nested/.hidden/app.log", "credentials/app.log", "config/app.log", "data/app.log", "key/app.log",
+	} {
+		cmd := exec.Command(sh, "-c", helper+"\nis_safe_log_relative \"$AIFAR_RELATIVE\"")
+		cmd.Env = append(os.Environ(), "AIFAR_RELATIVE="+relative)
+		if output, err := cmd.CombinedOutput(); err == nil {
+			t.Fatalf("unsafe relative log path %q was accepted: %s", relative, output)
+		}
+	}
+	for _, relative := range []string{"app.log", "app.log.1", "nested/app.log", "nested/app.log.42"} {
+		cmd := exec.Command(sh, "-c", helper+"\nis_safe_log_relative \"$AIFAR_RELATIVE\"")
+		cmd.Env = append(os.Environ(), "AIFAR_RELATIVE="+relative)
+		if output, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("allowlisted relative log path %q was rejected: %v: %s", relative, err, output)
+		}
+	}
+}
+
+func TestRuntimeDiagnosticExportContinuesAfterIndividualDiagnosticCommandFailure(t *testing.T) {
+	tests := []struct {
+		name             string
+		configure        func(*runtimeDiagnosticExportShellFixture)
+		wantErrorCode    string
+		absentEntry      string
+		inspectEntry     string
+		forbiddenContent string
+	}{
+		{
+			name: "container log",
+			configure: func(fixture *runtimeDiagnosticExportShellFixture) {
+				writeRuntimeDiagnosticShellCommand(t, fixture.binNative, "docker", strings.Join([]string{
+					`case "${1:-}" in`,
+					`  ps)`,
+					`    for value do case "$value" in *Names*) printf '%s\n' 'container-1'; exit 0 ;; esac; done`,
+					`    printf '%s\n' 'container table'`,
+					`    ;;`,
+					`  logs) printf '%s\n' 'CONTAINER_FAILURE_SHOULD_NOT_ARCHIVE'; exit 42 ;;`,
+					`  inspect) printf '%s\n' '{"Status":"healthy"}' ;;`,
+					`esac`,
+				}, "\n"))
+			},
+			wantErrorCode: "container-log-failed\tgateway\t-",
+			absentEntry:   "/services/gateway/container-logs/container-1.log",
+		},
+		{
+			name: "systemctl status",
+			configure: func(fixture *runtimeDiagnosticExportShellFixture) {
+				writeRuntimeDiagnosticShellCommand(t, fixture.binNative, "systemctl", "printf '%s\\n' 'SYSTEMCTL_FAILURE_SHOULD_NOT_ARCHIVE'\nexit 43")
+			},
+			wantErrorCode: "agent-status-failed\t-\t-",
+			absentEntry:   "/diagnostics/agent-status.txt",
+		},
+		{
+			name: "container health inspect",
+			configure: func(fixture *runtimeDiagnosticExportShellFixture) {
+				writeRuntimeDiagnosticShellCommand(t, fixture.binNative, "docker", strings.Join([]string{
+					`case "${1:-}" in`,
+					`  ps)`,
+					`    for value do case "$value" in *Names*) printf '%s\n' 'container-1'; exit 0 ;; esac; done`,
+					`    printf '%s\n' 'container table'`,
+					`    ;;`,
+					`  logs) printf '%s\n' 'safe container log' ;;`,
+					`  inspect) printf '%s\n' 'INSPECT_FAILURE_SHOULD_NOT_ARCHIVE'; exit 45 ;;`,
+					`esac`,
+				}, "\n"))
+			},
+			wantErrorCode:    "container-health-failed\tgateway\t-",
+			inspectEntry:     "/diagnostics/health-checks.txt",
+			forbiddenContent: "INSPECT_FAILURE_SHOULD_NOT_ARCHIVE",
+		},
+		{
+			name: "host uptime",
+			configure: func(fixture *runtimeDiagnosticExportShellFixture) {
+				writeRuntimeDiagnosticShellCommand(t, fixture.binNative, "uptime", "printf '%s\\n' 'HOST_FAILURE_SHOULD_NOT_ARCHIVE'\nexit 44")
+			},
+			wantErrorCode:    "host-uptime-failed\t-\t-",
+			inspectEntry:     "/diagnostics/host-resources.txt",
+			forbiddenContent: "HOST_FAILURE_SHOULD_NOT_ARCHIVE",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fixture := newRuntimeDiagnosticExportShellFixture(t)
+			tt.configure(fixture)
+			output, err := fixture.run()
+			if err != nil {
+				t.Fatalf("single diagnostic command failure aborted export: %v: %s", err, output)
+			}
+			result, err := parseRuntimeDiagnosticExportResult(string(output), fixture.exportID)
+			if err != nil {
+				t.Fatalf("successful export omitted RESULT: %v: %s", err, output)
+			}
+			if result.WarningCount < 1 {
+				t.Fatalf("single diagnostic command failure did not increment warnings: %+v", result)
+			}
+			errorsText := runtimeDiagnosticArchiveFile(t, fixture.sh, fixture.archiveNative(), fixture.archiveBase+"/collection-errors.txt")
+			if !strings.Contains(errorsText, tt.wantErrorCode) {
+				t.Fatalf("collection errors omitted stable code %q: %s", tt.wantErrorCode, errorsText)
+			}
+			listing := runtimeDiagnosticArchiveList(t, fixture.sh, fixture.archiveNative())
+			if tt.absentEntry != "" && strings.Contains(listing, fixture.archiveBase+tt.absentEntry) {
+				t.Fatalf("failed diagnostic output entered archive at %q:\n%s", tt.absentEntry, listing)
+			}
+			if tt.inspectEntry != "" {
+				content := runtimeDiagnosticArchiveFile(t, fixture.sh, fixture.archiveNative(), fixture.archiveBase+tt.inspectEntry)
+				if strings.Contains(content, tt.forbiddenContent) {
+					t.Fatalf("failed diagnostic output entered archive: %s", content)
+				}
+			}
+		})
+	}
+}
+
+func TestRuntimeDiagnosticExportBoundsFileSnapshotByRemainingBytes(t *testing.T) {
+	t.Run("oversized source is rejected before copy", func(t *testing.T) {
+		fixture := newRuntimeDiagnosticExportShellFixture(t)
+		fixture.maxStagedSize = 8192
+		logPath := filepath.Join(fixture.installNative, "runtime", "logs", "gateway", "oversized.log")
+		if err := os.WriteFile(logPath, []byte(strings.Repeat("O", 16384)), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		realCP := runtimeDiagnosticRealShellCommand(t, fixture.sh, "cp")
+		copyMarkerNative := filepath.Join(fixture.rootNative, "copy-invoked")
+		copyMarker := runtimeDiagnosticShellPath(copyMarkerNative)
+		writeRuntimeDiagnosticShellCommand(t, fixture.binNative, "cp", strings.Join([]string{
+			`: > "$AIFAR_COPY_MARKER"`,
+			`exec "$AIFAR_REAL_CP" "$@"`,
+		}, "\n"))
+		output, err := fixture.run("AIFAR_REAL_CP="+realCP, "AIFAR_COPY_MARKER="+copyMarker)
+		if err != nil {
+			t.Fatalf("oversized source should be skipped without aborting export: %v: %s", err, output)
+		}
+		if _, err := os.Stat(copyMarkerNative); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("oversized source was copied before conservative admission: %v", err)
+		}
+		listing := runtimeDiagnosticArchiveList(t, fixture.sh, fixture.archiveNative())
+		if strings.Contains(listing, "oversized.log") {
+			t.Fatalf("oversized source entered archive:\n%s", listing)
+		}
+	})
+
+	t.Run("growing source snapshot cannot exceed remaining bytes", func(t *testing.T) {
+		if runtime.GOOS == "windows" {
+			t.Skip("Git for Windows sh cannot apply a numeric ulimit -f; exercised on Linux")
+		}
+		fixture := newRuntimeDiagnosticExportShellFixture(t)
+		fixture.maxStagedSize = 8192
+		logPath := filepath.Join(fixture.installNative, "runtime", "logs", "gateway", "growing.log")
+		if err := os.WriteFile(logPath, []byte(strings.Repeat("G", 1024)), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		realStat := runtimeDiagnosticRealShellCommand(t, fixture.sh, "stat")
+		realCP := runtimeDiagnosticRealShellCommand(t, fixture.sh, "cp")
+		growthMarker := runtimeDiagnosticShellPath(filepath.Join(fixture.rootNative, "source-grew"))
+		observedSizeNative := filepath.Join(fixture.rootNative, "snapshot-size")
+		observedSize := runtimeDiagnosticShellPath(observedSizeNative)
+		writeRuntimeDiagnosticShellCommand(t, fixture.binNative, "stat", strings.Join([]string{
+			`last=""`,
+			`for value do last=$value; done`,
+			`result=$("$AIFAR_REAL_STAT" "$@")`,
+			`case "$last" in`,
+			`  "$AIFAR_GROW_SOURCE")`,
+			`    if [ ! -e "$AIFAR_GROWTH_MARKER" ]; then`,
+			`      printf '%016384d' 0 > "$last"`,
+			`      : > "$AIFAR_GROWTH_MARKER"`,
+			`    fi`,
+			`    ;;`,
+			`esac`,
+			`printf '%s\n' "$result"`,
+		}, "\n"))
+		writeRuntimeDiagnosticShellCommand(t, fixture.binNative, "cp", strings.Join([]string{
+			`last=""`,
+			`for value do last=$value; done`,
+			`set +e`,
+			`"$AIFAR_REAL_CP" "$@"`,
+			`status=$?`,
+			`set -e`,
+			`if [ -e "$last" ]; then "$AIFAR_REAL_STAT" -c '%s' "$last" > "$AIFAR_SNAPSHOT_SIZE"; fi`,
+			`exit "$status"`,
+		}, "\n"))
+		output, err := fixture.run(
+			"AIFAR_REAL_STAT="+realStat,
+			"AIFAR_REAL_CP="+realCP,
+			"AIFAR_GROW_SOURCE="+runtimeDiagnosticShellPath(logPath),
+			"AIFAR_GROWTH_MARKER="+growthMarker,
+			"AIFAR_SNAPSHOT_SIZE="+observedSize,
+		)
+		if err != nil {
+			t.Fatalf("growing source should be bounded and skipped without aborting export: %v: %s", err, output)
+		}
+		observed, err := os.ReadFile(observedSizeNative)
+		if err != nil {
+			t.Fatalf("read observed snapshot size: %v", err)
+		}
+		size, err := strconv.ParseInt(strings.TrimSpace(string(observed)), 10, 64)
+		if err != nil {
+			t.Fatalf("parse observed snapshot size %q: %v", observed, err)
+		}
+		if size > fixture.maxStagedSize {
+			t.Fatalf("snapshot wrote %d bytes with only %d bytes remaining", size, fixture.maxStagedSize)
+		}
+		listing := runtimeDiagnosticArchiveList(t, fixture.sh, fixture.archiveNative())
+		if strings.Contains(listing, "growing.log") {
+			t.Fatalf("growing source entered archive:\n%s", listing)
+		}
+		result, err := parseRuntimeDiagnosticExportResult(string(output), fixture.exportID)
+		if err != nil || result.WarningCount < 1 {
+			t.Fatalf("bounded growing source did not produce RESULT with warning: result=%+v err=%v output=%s", result, err, output)
+		}
+	})
 }
 
 type runtimeDiagnosticCleanupShellFixture struct {
