@@ -203,13 +203,25 @@ export type RuntimeDiagnosticRequest = {
 }
 
 export type RuntimeDiagnosticEstimate = {
-  services: Array<{ service: string; fileBytes: number; containerBytes: number }>
-  fileBytes: number
-  containerBytes: number
-  totalBytes: number
-  requiredBytes: number
-  availableBytes: number
+  services: Array<{ service: string; candidateFiles: number; candidateScanBytes: number }>
+  logSource: 'host-mounted'
+  candidateFiles: number
+  candidateScanBytes: number
+  estimatedSecondsMin: number
+  estimatedSecondsMax: number
+  maxFileScanBytes: number
+  maxTotalScanBytes: number
+  maxFilteredBytes: number
+  maxArchiveBytes: number
+  timeoutSeconds: number
+  serverTimezone: string
+  localAvailableBytes: number
+  localReadyBytes: number
+  localReservedBytes: number
+  localQuotaBytes: number
+  expiresAt: string
   allowed: boolean
+  blockReason?: string
   warnings?: string[]
 }
 
@@ -219,6 +231,7 @@ export type RuntimeDiagnosticExport = {
   instanceId: string
   serverId: string
   status: 'pending' | 'building' | 'ready' | 'failed' | 'cancelled' | 'expired' | 'deleted'
+  storageKind: 'local' | 'remote'
   services: string[]
   sinceAt: string
   untilAt: string

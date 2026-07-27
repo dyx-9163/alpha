@@ -3,7 +3,7 @@
     <div class="runtime-diagnostics-head">
       <div>
         <h3>{{ t('containers.diagnosticsRecords') }}</h3>
-        <p>{{ t('containers.diagnosticsConservativeHint') }}</p>
+        <p>{{ t('containers.diagnosticsLogSourceHost') }}</p>
       </div>
       <el-button size="small" type="primary" :disabled="!instanceId" @click="openDialog">{{ t('containers.diagnosticsExport') }}</el-button>
     </div>
@@ -19,6 +19,11 @@
       </el-table-column>
       <el-table-column :label="t('containers.diagnosticsServices')" min-width="160" show-overflow-tooltip>
         <template #default="{ row }">{{ row.services.join(', ') || '-' }}</template>
+      </el-table-column>
+      <el-table-column :label="t('containers.diagnosticsStorage')" width="118">
+        <template #default="{ row }">
+          <el-tag size="small" effect="plain">{{ storageKindLabel(row.storageKind) }}</el-tag>
+        </template>
       </el-table-column>
       <el-table-column :label="t('containers.size')" width="110">
         <template #default="{ row }">{{ formatBytes(row.archiveBytes) }}</template>
@@ -46,7 +51,7 @@
       <template #empty><span>{{ t('containers.diagnosticsNoRecords') }}</span></template>
     </el-table>
 
-    <el-dialog v-model="dialogVisible" :title="t('containers.diagnosticsExportTitle')" width="640px" class="runtime-diagnostics-dialog" @closed="resetDialog">
+    <el-dialog v-model="dialogVisible" :title="t('containers.diagnosticsExportTitle')" width="760px" class="runtime-diagnostics-dialog" @closed="resetDialog">
       <el-form label-position="top">
         <el-form-item :label="t('containers.diagnosticsTimeRange')">
           <el-radio-group v-model="mode">
@@ -73,18 +78,53 @@
       </el-form>
 
       <div v-if="estimate" class="runtime-diagnostics-estimate">
-        <div><span>{{ t('containers.diagnosticsFileBytes') }}</span><strong>{{ formatBytes(estimate.fileBytes) }}</strong></div>
-        <div><span>{{ t('containers.diagnosticsContainerBytes') }}</span><strong>{{ formatBytes(estimate.containerBytes) }}</strong></div>
-        <div><span>{{ t('containers.diagnosticsRequiredBytes') }}</span><strong>{{ formatBytes(estimate.requiredBytes) }}</strong></div>
-        <div><span>{{ t('containers.diagnosticsAvailableBytes') }}</span><strong>{{ formatBytes(estimate.availableBytes) }}</strong></div>
+        <div class="runtime-diagnostics-estimate-note">
+          <strong>{{ t('containers.diagnosticsLogSourceHost') }}</strong>
+          <span>{{ t('containers.diagnosticsEstimateHint') }}</span>
+        </div>
+        <div class="runtime-diagnostics-estimate-grid">
+          <div><span>{{ t('containers.diagnosticsCandidateFiles') }}</span><strong>{{ estimate.candidateFiles }}</strong></div>
+          <div><span>{{ t('containers.diagnosticsCandidateScanBytes') }}</span><strong>{{ formatBytes(estimate.candidateScanBytes) }}</strong></div>
+          <div><span>{{ t('containers.diagnosticsEstimatedDuration') }}</span><strong>{{ formatDurationRange(estimate) }}</strong></div>
+          <div><span>{{ t('containers.diagnosticsServerTimezone') }}</span><strong>{{ estimate.serverTimezone || '-' }}</strong></div>
+        </div>
+
+        <div class="runtime-diagnostics-estimate-section">
+          <h4>{{ t('containers.diagnosticsFastLimits') }}</h4>
+          <div class="runtime-diagnostics-estimate-grid">
+            <div v-for="row in limitRows" :key="row.key">
+              <span>{{ t(limitLabelKey(row.key)) }}</span><strong>{{ formatBytes(row.value) }}</strong>
+            </div>
+            <div><span>{{ t('containers.diagnosticsTimeout') }}</span><strong>{{ formatSeconds(estimate.timeoutSeconds) }}</strong></div>
+          </div>
+        </div>
+
+        <div class="runtime-diagnostics-estimate-section">
+          <h4>{{ t('containers.diagnosticsStorageLocal') }}</h4>
+          <div class="runtime-diagnostics-estimate-grid">
+            <div><span>{{ t('containers.diagnosticsLocalAvailable') }}</span><strong>{{ formatBytes(estimate.localAvailableBytes) }}</strong></div>
+            <div><span>{{ t('containers.diagnosticsLocalUsage') }}</span><strong>{{ formatBytes(estimate.localReadyBytes) }}</strong></div>
+            <div><span>{{ t('containers.diagnosticsLocalReserved') }}</span><strong>{{ formatBytes(estimate.localReservedBytes) }}</strong></div>
+            <div><span>{{ t('containers.diagnosticsLocalQuota') }}</span><strong>{{ formatBytes(estimate.localQuotaBytes) }}</strong></div>
+            <div><span>{{ t('containers.diagnosticsExpiresAt') }}</span><strong>{{ formatDate(estimate.expiresAt) }}</strong></div>
+          </div>
+        </div>
         <el-alert
           v-if="!estimate.allowed"
           type="error"
           :closable="false"
           show-icon
-          :title="estimate.requiredBytes > threeGiB ? t('containers.diagnosticsOverLimit') : t('containers.diagnosticsInsufficientSpace')"
+          :title="diagnosticBlockMessage(estimate)"
         />
-        <el-alert v-else type="info" :closable="false" show-icon :title="t('containers.diagnosticsConservativeHint')" />
+        <el-alert v-else type="info" :closable="false" show-icon :title="t('containers.diagnosticsEstimateHint')" />
+        <el-alert
+          v-for="warning in estimate.warnings || []"
+          :key="warning"
+          type="warning"
+          :closable="false"
+          show-icon
+          :title="warning"
+        />
       </div>
 
       <template #footer>
@@ -115,7 +155,9 @@ import {
   defaultRuntimeDiagnosticWindow,
   emptyRuntimeDiagnosticExportPage,
   enabledRuntimeDiagnosticServices,
+  runtimeDiagnosticCapacityBlocked,
   runtimeDiagnosticExportScopeFingerprint,
+  runtimeDiagnosticLimitRows,
   runtimeDiagnosticRequestFingerprint,
   runtimeDiagnosticStatusKey,
   runtimeDiagnosticSubmitDisabledReason,
@@ -145,7 +187,6 @@ const estimating = ref(false)
 const submitting = ref(false)
 const trackedTaskIds = new Set<string>()
 const refreshedTaskIds = new Set<string>()
-const threeGiB = 3 * 1024 * 1024 * 1024
 const objectUrlCleanupDelayMs = 30 * 1000
 let exportsRequestSequence = 0
 let estimateRequestSequence = 0
@@ -163,6 +204,7 @@ const diagnosticRequestFingerprint = computed(() => {
   return request ? runtimeDiagnosticRequestFingerprint(props.targetQuery, request) : ''
 })
 const currentEstimate = computed(() => estimateFingerprint.value === diagnosticRequestFingerprint.value ? estimate.value : null)
+const limitRows = computed(() => estimate.value ? runtimeDiagnosticLimitRows(estimate.value) : [])
 const submitDisabledReason = computed(() => runtimeDiagnosticSubmitDisabledReason({
   services: selectedServices.value,
   estimate: currentEstimate.value,
@@ -351,6 +393,34 @@ function formatDate(value?: string) {
 
 function formatRange(row: RuntimeDiagnosticExport) {
   return `${formatDate(row.sinceAt)} - ${formatDate(row.untilAt)}`
+}
+
+function formatDurationRange(value: RuntimeDiagnosticEstimate) {
+  return `${formatSeconds(value.estimatedSecondsMin)} - ${formatSeconds(value.estimatedSecondsMax)}`
+}
+
+function formatSeconds(value: number) {
+  if (value >= 60 && value % 60 === 0) return `${value / 60} min`
+  return `${value} s`
+}
+
+function limitLabelKey(key: 'file' | 'scan' | 'filtered' | 'archive') {
+  return {
+    file: 'containers.diagnosticsMaxFileScan',
+    scan: 'containers.diagnosticsMaxTotalScan',
+    filtered: 'containers.diagnosticsMaxFiltered',
+    archive: 'containers.diagnosticsMaxArchive'
+  }[key]
+}
+
+function storageKindLabel(kind: RuntimeDiagnosticExport['storageKind']) {
+  return t(kind === 'remote' ? 'containers.diagnosticsStorageLegacyRemote' : 'containers.diagnosticsStorageLocal')
+}
+
+function diagnosticBlockMessage(value: RuntimeDiagnosticEstimate) {
+  const reason = value.blockReason ? ` (${value.blockReason})` : ''
+  if (runtimeDiagnosticCapacityBlocked(value)) return `${t('containers.diagnosticsCapacityBlocked')}${reason}`
+  return `${t('containers.diagnosticsSplitSuggestion')}${reason}`
 }
 
 function diagnosticStatusType(row: RuntimeDiagnosticExport) {

@@ -3,10 +3,34 @@ import {
   defaultRuntimeDiagnosticWindow,
   emptyRuntimeDiagnosticExportPage,
   enabledRuntimeDiagnosticServices,
+  runtimeDiagnosticCapacityBlocked,
+  runtimeDiagnosticLimitRows,
   runtimeDiagnosticRequestFingerprint,
   runtimeDiagnosticSubmitDisabledReason,
   terminalDiagnosticTaskToRefresh
 } from './runtimeDiagnostics'
+import type { RuntimeDiagnosticEstimate } from './types'
+
+const estimate: RuntimeDiagnosticEstimate = {
+  services: [{ service: 'gateway', candidateFiles: 2, candidateScanBytes: 1024 }],
+  logSource: 'host-mounted',
+  candidateFiles: 2,
+  candidateScanBytes: 1024,
+  estimatedSecondsMin: 5,
+  estimatedSecondsMax: 20,
+  maxFileScanBytes: 1073741824,
+  maxTotalScanBytes: 2147483648,
+  maxFilteredBytes: 524288000,
+  maxArchiveBytes: 268435456,
+  timeoutSeconds: 900,
+  serverTimezone: 'Asia/Shanghai',
+  localAvailableBytes: 10_000_000_000,
+  localReadyBytes: 1024,
+  localReservedBytes: 0,
+  localQuotaBytes: 5368709120,
+  expiresAt: '2026-07-28T08:00:00Z',
+  allowed: true
+}
 
 describe('runtime diagnostic interactions', () => {
   it('defaults to the last two hours and all enabled deployments', () => {
@@ -55,5 +79,22 @@ describe('runtime diagnostic interactions', () => {
 
     expect(cleared).toEqual({ items: [], total: 0, page: 1, pageSize: 20 })
     expect(cleared.items).toHaveLength(0)
+  })
+
+  it('shows every enforced byte limit from the estimate contract', () => {
+    expect(runtimeDiagnosticLimitRows(estimate)).toEqual([
+      { key: 'file', value: 1073741824 },
+      { key: 'scan', value: 2147483648 },
+      { key: 'filtered', value: 524288000 },
+      { key: 'archive', value: 268435456 }
+    ])
+  })
+
+  it('recognizes local capacity and scan limit blocks', () => {
+    expect(runtimeDiagnosticCapacityBlocked({ ...estimate, allowed: false, blockReason: 'local-quota-exceeded' })).toBe(true)
+    expect(runtimeDiagnosticCapacityBlocked({ ...estimate, allowed: false, blockReason: 'local-disk-insufficient' })).toBe(true)
+    expect(runtimeDiagnosticCapacityBlocked({ ...estimate, allowed: false, blockReason: 'total-scan-limit-exceeded' })).toBe(true)
+    expect(runtimeDiagnosticCapacityBlocked({ ...estimate, allowed: false, blockReason: 'time-range-too-large' })).toBe(false)
+    expect(runtimeDiagnosticCapacityBlocked(estimate)).toBe(false)
   })
 })

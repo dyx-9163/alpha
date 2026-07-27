@@ -28,6 +28,25 @@ export function runtimeDiagnosticSubmitDisabledReason(input: RuntimeDiagnosticSu
   return input.estimate.allowed ? '' : 'estimate-blocked'
 }
 
+export function runtimeDiagnosticLimitRows(estimate: RuntimeDiagnosticEstimate) {
+  return [
+    { key: 'file' as const, value: estimate.maxFileScanBytes },
+    { key: 'scan' as const, value: estimate.maxTotalScanBytes },
+    { key: 'filtered' as const, value: estimate.maxFilteredBytes },
+    { key: 'archive' as const, value: estimate.maxArchiveBytes }
+  ]
+}
+
+export function runtimeDiagnosticCapacityBlocked(estimate: RuntimeDiagnosticEstimate) {
+  return !estimate.allowed && [
+    'local-quota-exceeded',
+    'local-disk-insufficient',
+    'scan-limit-exceeded',
+    'file-scan-limit-exceeded',
+    'total-scan-limit-exceeded'
+  ].includes(estimate.blockReason || '')
+}
+
 export function runtimeDiagnosticRequestFingerprint(query: string, request: RuntimeDiagnosticRequest) {
   return JSON.stringify({
     query,

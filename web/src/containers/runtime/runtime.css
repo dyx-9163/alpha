@@ -169,14 +169,42 @@
 
 .runtime-diagnostics-estimate {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 8px;
   padding: 12px;
   border-radius: var(--aifar-radius);
   background: #f8fbff;
 }
 
-.runtime-diagnostics-estimate > div {
+.runtime-diagnostics-estimate-note {
+  display: grid;
+  gap: 4px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--aifar-border-soft);
+  color: var(--aifar-text-secondary);
+  font-size: 12px;
+  line-height: 18px;
+}
+
+.runtime-diagnostics-estimate-note strong,
+.runtime-diagnostics-estimate-section h4 {
+  margin: 0;
+  color: var(--aifar-ink);
+  font-size: 13px;
+  line-height: 20px;
+}
+
+.runtime-diagnostics-estimate-section {
+  display: grid;
+  gap: 8px;
+}
+
+.runtime-diagnostics-estimate-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px 16px;
+}
+
+.runtime-diagnostics-estimate-grid > div {
   display: flex;
   justify-content: space-between;
   gap: 8px;
@@ -185,8 +213,9 @@
   line-height: 20px;
 }
 
-.runtime-diagnostics-estimate strong {
+.runtime-diagnostics-estimate-grid strong {
   color: var(--aifar-ink);
+  text-align: right;
 }
 
 .runtime-diagnostics-estimate .el-alert {
@@ -556,7 +585,7 @@
     width: 100%;
   }
 
-  .runtime-diagnostics-estimate {
+  .runtime-diagnostics-estimate-grid {
     grid-template-columns: 1fr;
   }
 
