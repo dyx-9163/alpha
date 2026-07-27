@@ -641,6 +641,20 @@
   .runtime-summary {
     grid-template-columns: repeat(3, minmax(0, 1fr));
   }
+
+  .runtime-tab-toolbar {
+    align-items: flex-start;
+    flex-wrap: wrap;
+  }
+
+  .runtime-log-filters {
+    flex: 1 1 100%;
+    flex-wrap: wrap;
+  }
+
+  .runtime-tab-actions {
+    flex-wrap: wrap;
+  }
 }
 
 @media (max-width: 900px) {

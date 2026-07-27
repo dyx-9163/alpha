@@ -12,4 +12,11 @@ describe('AIFAR Runtime summary responsive layout', () => {
     expect(css).toContain('grid-template-columns: 1fr')
     expect(css).toContain('flex-wrap: wrap')
   })
+
+  it('wraps log controls before the desktop workspace becomes cramped', async () => {
+    const css = await readFile(new URL('./runtime.css', import.meta.url), 'utf8')
+
+    expect(css).toMatch(/@media \(max-width: 1440px\) \{(?:(?!@media)[\s\S])*?\.runtime-tab-toolbar\s*\{[^}]*flex-wrap:\s*wrap/)
+    expect(css).toMatch(/@media \(max-width: 1440px\) \{(?:(?!@media)[\s\S])*?\.runtime-log-filters\s*\{[^}]*flex-wrap:\s*wrap/)
+  })
 })
