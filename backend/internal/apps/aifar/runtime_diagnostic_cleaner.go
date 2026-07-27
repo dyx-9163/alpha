@@ -2,6 +2,7 @@ package aifar
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"sync/atomic"
 	"time"
@@ -110,6 +111,10 @@ func (c *RuntimeDiagnosticCleaner) releaseWhenTaskFinishes(taskID string) {
 	defer ticker.Stop()
 	for range ticker.C {
 		task, _, err := c.store.GetTask(taskID)
+		if errors.Is(err, sql.ErrNoRows) {
+			c.running.Store(false)
+			return
+		}
 		if err != nil {
 			return
 		}

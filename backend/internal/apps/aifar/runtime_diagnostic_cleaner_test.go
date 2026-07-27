@@ -146,6 +146,21 @@ func TestRuntimeDiagnosticCleanerReleasesRunningAfterQueuedTaskCancellation(t *t
 	close(holderRelease)
 }
 
+func TestRuntimeDiagnosticCleanerReleasesRunningWhenQueuedTaskIsDeleted(t *testing.T) {
+	db, tasks, remote, _ := newRuntimeDiagnosticCleanerFixture(t)
+	cleaner := NewRuntimeDiagnosticCleaner(db, tasks, remote)
+	task, err := db.CreateTask(store.Task{Type: runtimeDiagnosticCleanupTaskType, Target: runtimeDiagnosticCleanupTarget, Status: "cancelled", CreatedBy: runtimeDiagnosticCleanupActor})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cleaner.running.Store(true)
+	go cleaner.releaseWhenTaskFinishes(task.ID)
+	if err := db.DeleteTask(task.ID); err != nil {
+		t.Fatal(err)
+	}
+	waitForRuntimeDiagnosticCleanerIdle(t, cleaner)
+}
+
 func TestRuntimeDiagnosticCleanerSkipsDownloadDeleteLockConflict(t *testing.T) {
 	db, tasks, remote, now := newRuntimeDiagnosticCleanerFixture(t)
 	export := saveRuntimeDiagnosticCleanerExport(t, db, now, "diag-locked", now.Add(-time.Second))
