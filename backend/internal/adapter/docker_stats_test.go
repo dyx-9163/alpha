@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -61,6 +62,13 @@ func TestDockerAPIContainerStatsBatchKeepsSuccessfulRows(t *testing.T) {
 func TestDockerAPIContainerStatsBatchLimitsConcurrencyToFour(t *testing.T) {
 	entered := make(chan struct{}, 5)
 	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseHandlers := func() {
+		releaseOnce.Do(func() {
+			close(release)
+		})
+	}
+	t.Cleanup(releaseHandlers)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		entered <- struct{}{}
 		<-release
@@ -68,6 +76,7 @@ func TestDockerAPIContainerStatsBatchLimitsConcurrencyToFour(t *testing.T) {
 		_, _ = fmt.Fprintf(w, `{"id":%q,"name":%q,"memory_stats":{"usage":1,"limit":2,"stats":{}}}`, id, "/"+id)
 	}))
 	defer server.Close()
+	defer releaseHandlers()
 
 	type batchResult struct {
 		stats []DockerContainerStat
@@ -90,7 +99,7 @@ func TestDockerAPIContainerStatsBatchLimitsConcurrencyToFour(t *testing.T) {
 		t.Fatal("fifth request started before a worker was released")
 	case <-time.After(50 * time.Millisecond):
 	}
-	close(release)
+	releaseHandlers()
 	result := <-done
 	if result.err != nil || len(result.stats) != 5 {
 		t.Fatalf("stats=%+v err=%v", result.stats, result.err)
