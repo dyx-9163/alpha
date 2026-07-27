@@ -48,13 +48,6 @@ var clusterBackupStepNames = []string{
 	"backup-primary", "build-manifest", "record-backup", "apply-retention", "cleanup-workdir",
 }
 
-var healthyClusterRestoreStepNames = []string{
-	"load-backup", "acquire-cluster-lock", "verify-maintenance-confirmation", "resolve-members", "inspect-cluster",
-	"create-pre-restore-backup", "stop-application-writes", "upload-backup", "extract-backup", "dry-run-load",
-	"capture-local-infile", "enable-local-infile", "drop-target-schemas", "load-primary", "restore-local-infile",
-	"verify-primary", "verify-members", "verify-routers", "record-restore", "cleanup-workdir", "release-lock",
-}
-
 func (m Module) planInnoDBClusterBackup(ctx context.Context, req registry.BackupRequest) ([]registry.InstallStepPlan, error) {
 	if err := validateClusterRequest(req.Instance, req.Instances, req.Servers); err != nil {
 		return nil, err
@@ -69,7 +62,11 @@ func (m Module) planHealthyClusterRestore(ctx context.Context, req registry.Rest
 	if req.Backup.App != "mysql" || req.Backup.BackupType != "logical-full" || req.Backup.Status != "success" || strings.TrimSpace(req.RepositoryDir) == "" || clusterIDFromBackup(req.Backup) != clusterIDFromInstance(req.Instance) {
 		return nil, mysqlOperationError(MySQLBackupClusterUnhealthy)
 	}
-	return clusterBackupPlan(req.Instances, healthyClusterRestoreStepNames), nil
+	// restoreLogical owns the concrete restore lifecycle and terminally records
+	// standaloneRestoreStepNames for both standalone and cluster targets. Keep
+	// the worker plan identical so the one cluster target has no unclosable
+	// synthetic steps.
+	return clusterBackupPlan(req.Instances, standaloneRestoreStepNames), nil
 }
 
 func clusterBackupPlan(instances []store.AppInstance, names []string) []registry.InstallStepPlan {

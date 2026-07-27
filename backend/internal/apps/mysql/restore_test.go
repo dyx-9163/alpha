@@ -66,14 +66,20 @@ func TestRestoreStandalonePlanMatchesApprovedSectionNine(t *testing.T) {
 
 type restoreProgressRecorder struct {
 	backupRecorder
-	targetStarts   int
-	targetFinishes []string
-	stepStatus     map[string]string
+	targetStarts    int
+	targets         []string
+	targetFinishes  []string
+	finishedTargets []string
+	stepStatus      map[string]string
 }
 
-func (r *restoreProgressRecorder) StartTarget(string) { r.targetStarts++ }
-func (r *restoreProgressRecorder) FinishTarget(_ string, status, _ string) {
+func (r *restoreProgressRecorder) StartTarget(target string) {
+	r.targetStarts++
+	r.targets = append(r.targets, target)
+}
+func (r *restoreProgressRecorder) FinishTarget(target, status, _ string) {
 	r.targetFinishes = append(r.targetFinishes, status)
+	r.finishedTargets = append(r.finishedTargets, target)
 }
 func (r *restoreProgressRecorder) FinishStep(_ string, name, status, _ string) {
 	if r.stepStatus == nil {

@@ -580,7 +580,8 @@ func recordMySQLReconciliationMarker(data restoreStore, instance store.AppInstan
 	var lastErr error
 	for attempt := 0; attempt < restorePersistenceAttempts; attempt++ {
 		fresh, err := data.GetAppInstance(instance.ID)
-		if err != nil || fresh.App != "mysql" || instanceTopology(fresh) != "standalone" || fresh.ServerID != instance.ServerID {
+		topology := instanceTopology(fresh)
+		if err != nil || fresh.App != "mysql" || (topology != "standalone" && topology != "innodb-cluster") || fresh.ServerID != instance.ServerID {
 			return errors.New("MySQL instance ownership changed before reconciliation marker persistence")
 		}
 		metadata, err := strictBackupMetadata(fresh.Metadata)
