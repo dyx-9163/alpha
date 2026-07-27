@@ -962,6 +962,13 @@ func TestRuntimeDiagnosticTimestampFilterFixtures(t *testing.T) {
 				"2026-07-27 16:09:59.999 INFO inside-window\n",
 		},
 		{
+			name: "spring-bracketed", fixture: "spring-bracketed.txt", wantParser: "spring", wantRecords: 2,
+			want: "[2026-07-27 16:00:00.000] [ERROR] start-boundary\n" +
+				"    at example.Main.run(Main.java:10)\n" +
+				"Caused by: java.lang.IllegalStateException: boom\n" +
+				"[2026-07-27 16:09:59.999] [INFO ] inside-window\n",
+		},
+		{
 			name: "iso-json", fixture: "iso-json.log", wantParser: "mixed", wantRecords: 6,
 			want: "2026-07-27T08:00:00Z iso-z-boundary\n" +
 				"2026-07-27T16:01:00+08:00 iso-offset\n" +

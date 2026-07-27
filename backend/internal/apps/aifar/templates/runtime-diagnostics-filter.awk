@@ -81,6 +81,10 @@ function parse_timestamp(line,    epoch_value, json, access, spring, nginx_error
     parsed_parser = "json"
     return epoch_value
   }
+  if (match(line, /^\[([0-9]{4})-([0-9]{2})-([0-9]{2})[[:space:]]([0-9]{2}):([0-9]{2}):([0-9]{2})[,.][0-9]+\]/, spring)) {
+    parsed_parser = "spring"
+    return local_epoch(spring[1], spring[2], spring[3], spring[4], spring[5], spring[6])
+  }
   if (match(line, /^([0-9]{4})-([0-9]{2})-([0-9]{2})[[:space:]]([0-9]{2}):([0-9]{2}):([0-9]{2})[,.][0-9]+/, spring)) {
     parsed_parser = "spring"
     return local_epoch(spring[1], spring[2], spring[3], spring[4], spring[5], spring[6])
