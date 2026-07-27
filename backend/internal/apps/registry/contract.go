@@ -388,6 +388,19 @@ type RuntimeDiagnosticServiceEstimate struct {
 	ContainerBytes     int64  `json:"-"`
 }
 
+type RuntimeDiagnosticError struct {
+	Code    string
+	Message string
+	Details map[string]any
+}
+
+func (e *RuntimeDiagnosticError) Error() string {
+	if e == nil {
+		return ""
+	}
+	return e.Message
+}
+
 type ClusterStartRequest struct {
 	Instances       []store.AppInstance
 	Servers         []store.Server

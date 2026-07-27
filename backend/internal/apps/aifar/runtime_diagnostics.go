@@ -137,7 +137,9 @@ func (s Service) EstimateRuntimeDiagnostics(ctx context.Context, req RuntimeDiag
 		return registry.RuntimeDiagnosticEstimateResult{}, err
 	}
 	if s.archives == nil {
-		return registry.RuntimeDiagnosticEstimateResult{}, errors.New(i18n.Text(req.Language, "aifar.diag.storageMissing"))
+		return registry.RuntimeDiagnosticEstimateResult{}, &registry.RuntimeDiagnosticError{
+			Code: "RUNTIME_DIAGNOSTIC_LOCAL_COMMIT_FAILED", Message: i18n.Text(req.Language, "aifar.diag.storageMissing"),
+		}
 	}
 	diagnostics, ok := s.store.(runtimeDiagnosticsStore)
 	if !ok {
@@ -172,7 +174,9 @@ func (s Service) EstimateRuntimeDiagnostics(ctx context.Context, req RuntimeDiag
 	}
 	stats, err := s.archives.Stats(ctx)
 	if err != nil {
-		return registry.RuntimeDiagnosticEstimateResult{}, errors.New(i18n.Text(req.Language, "aifar.diag.localDiskFailed"))
+		return registry.RuntimeDiagnosticEstimateResult{}, &registry.RuntimeDiagnosticError{
+			Code: "RUNTIME_DIAGNOSTIC_LOCAL_COMMIT_FAILED", Message: i18n.Text(req.Language, "aifar.diag.localDiskFailed"),
+		}
 	}
 	estimate.LogSource = "host-mounted"
 	estimate.EstimatedSecondsMin, estimate.EstimatedSecondsMax = runtimeDiagnosticDurationRange(estimate.CandidateScanBytes)

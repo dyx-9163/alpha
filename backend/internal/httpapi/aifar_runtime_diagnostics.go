@@ -22,10 +22,11 @@ import (
 )
 
 const (
-	runtimeDiagnosticEstimateTimeout = 30 * time.Second
-	runtimeDiagnosticRetention       = 24 * time.Hour
-	runtimeDiagnosticMaxArchiveBytes = int64(1 << 30)
-	runtimeDiagnosticLockHeartbeat   = 30 * time.Second
+	runtimeDiagnosticEstimateTimeout       = 30 * time.Second
+	runtimeDiagnosticRetention             = 24 * time.Hour
+	runtimeDiagnosticMaxArchiveBytes       = int64(256 << 20)
+	runtimeDiagnosticLegacyMaxArchiveBytes = int64(1 << 30)
+	runtimeDiagnosticLockHeartbeat         = 30 * time.Second
 
 	runtimeDiagnosticExportTaskType = "aifar.runtime.diagnostics.export"
 	runtimeDiagnosticDeleteTaskType = "aifar.runtime.diagnostics.delete"
@@ -62,20 +63,18 @@ type runtimeDiagnosticDeleteTaskResponse struct {
 }
 
 var runtimeDiagnosticExportStepNames = []string{
-	"load-instance",
-	"validate-request",
-	"estimate-size",
-	"collect-file-logs",
-	"collect-container-logs",
-	"collect-diagnostics",
-	"redact-and-manifest",
-	"create-archive",
-	"record-export",
+	"validate-local-storage",
+	"discover-log-files",
+	"filter-and-redact",
+	"build-manifest",
+	"stream-local-archive",
+	"verify-local-archive",
+	"cleanup-remote",
 }
 
 var runtimeDiagnosticDeleteStepNames = []string{
 	"validate-export",
-	"delete-remote-archive",
+	"delete-local-or-legacy-archive",
 	"record-deletion",
 }
 
@@ -104,7 +103,7 @@ func (a *aifarRuntimeController) estimateDiagnostics(w http.ResponseWriter, r *h
 		UntilAt:  untilAt,
 	})
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "RUNTIME_DIAGNOSTIC_ESTIMATE_FAILED", err.Error(), map[string]any{"instanceId": instance.ID})
+		writeRuntimeDiagnosticEstimateError(w, err, instance.ID)
 		return
 	}
 	writeJSON(w, http.StatusOK, estimate)
@@ -136,16 +135,19 @@ func (a *aifarRuntimeController) createDiagnosticExport(w http.ResponseWriter, r
 	}
 	estimate, err := estimateRuntimeDiagnosticsWithTimeout(r.Context(), diagnostics, diagnosticReq)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "RUNTIME_DIAGNOSTIC_ESTIMATE_FAILED", err.Error(), map[string]any{"instanceId": instance.ID})
+		writeRuntimeDiagnosticEstimateError(w, err, instance.ID)
 		return
 	}
 	if !estimate.Allowed {
-		writeError(w, http.StatusConflict, "RUNTIME_DIAGNOSTIC_ESTIMATE_REJECTED", i18n.Text(lang, "aifar.diag.estimateRejected"), map[string]any{
-			"instanceId":     instance.ID,
-			"totalBytes":     estimate.TotalBytes,
-			"requiredBytes":  estimate.RequiredBytes,
-			"availableBytes": estimate.AvailableBytes,
-		})
+		details := map[string]any{
+			"instanceId": instance.ID, "blockReason": estimate.BlockReason,
+			"candidateFiles": estimate.CandidateFiles, "candidateScanBytes": estimate.CandidateScanBytes,
+			"maxFileScanBytes": estimate.MaxFileScanBytes, "maxTotalScanBytes": estimate.MaxTotalScanBytes,
+			"maxFilteredBytes": estimate.MaxFilteredBytes, "maxArchiveBytes": estimate.MaxArchiveBytes,
+			"localAvailableBytes": estimate.LocalAvailableBytes, "localReadyBytes": estimate.LocalReadyBytes,
+			"localReservedBytes": estimate.LocalReservedBytes, "localQuotaBytes": estimate.LocalQuotaBytes,
+		}
+		writeError(w, http.StatusConflict, runtimeDiagnosticBlockCode(estimate.BlockReason), i18n.Text(lang, "aifar.diag.estimateRejected"), details)
 		return
 	}
 
@@ -204,6 +206,7 @@ func (a *aifarRuntimeController) createDiagnosticExport(w http.ResponseWriter, r
 		InstanceID:    instance.ID,
 		ServerID:      server.ID,
 		Status:        "pending",
+		StorageKind:   "local",
 		Services:      append([]string(nil), payload.Services...),
 		SinceAt:       sinceAt,
 		UntilAt:       untilAt,
@@ -514,13 +517,61 @@ func validateRuntimeDiagnosticDelete(w http.ResponseWriter, lang string, export 
 
 func validRuntimeDiagnosticArchiveMetadata(export store.DiagnosticExport) bool {
 	if !runtimeDiagnosticHTTPExportIDPattern.MatchString(export.ID) || !runtimeDiagnosticHTTPArchivePattern.MatchString(export.ArchiveName) ||
-		!runtimeDiagnosticHTTPSHA256Pattern.MatchString(export.SHA256) || export.ArchiveBytes <= 0 || export.ArchiveBytes > runtimeDiagnosticMaxArchiveBytes {
+		!runtimeDiagnosticHTTPSHA256Pattern.MatchString(export.SHA256) || export.ArchiveBytes <= 0 {
 		return false
 	}
-	if containsRuntimeDiagnosticHTTPControl(export.ArchiveName) || containsRuntimeDiagnosticHTTPControl(export.RemoteRelativePath) || strings.Contains(export.RemoteRelativePath, "\\") {
+	if containsRuntimeDiagnosticHTTPControl(export.ArchiveName) {
 		return false
 	}
-	return path.Clean(export.RemoteRelativePath) == path.Join(export.ID, export.ArchiveName)
+	switch export.StorageKind {
+	case "local":
+		if export.ArchiveBytes > runtimeDiagnosticMaxArchiveBytes || containsRuntimeDiagnosticHTTPControl(export.StorageRelativePath) || strings.Contains(export.StorageRelativePath, "\\") {
+			return false
+		}
+		return path.Clean(export.StorageRelativePath) == path.Join(export.ID, export.ArchiveName)
+	case "remote":
+		if export.ArchiveBytes > runtimeDiagnosticLegacyMaxArchiveBytes || containsRuntimeDiagnosticHTTPControl(export.RemoteRelativePath) || strings.Contains(export.RemoteRelativePath, "\\") {
+			return false
+		}
+		return path.Clean(export.RemoteRelativePath) == path.Join(export.ID, export.ArchiveName)
+	default:
+		return false
+	}
+}
+
+func runtimeDiagnosticBlockCode(reason string) string {
+	switch reason {
+	case "file-scan-limit-exceeded", "total-scan-limit-exceeded":
+		return "RUNTIME_DIAGNOSTIC_SCAN_LIMIT_EXCEEDED"
+	case "local-quota-exceeded":
+		return "RUNTIME_DIAGNOSTIC_LOCAL_QUOTA_EXCEEDED"
+	case "local-disk-insufficient":
+		return "RUNTIME_DIAGNOSTIC_LOCAL_DISK_INSUFFICIENT"
+	default:
+		return "RUNTIME_DIAGNOSTIC_ESTIMATE_REJECTED"
+	}
+}
+
+func writeRuntimeDiagnosticEstimateError(w http.ResponseWriter, err error, instanceID string) {
+	status := http.StatusBadRequest
+	code := "RUNTIME_DIAGNOSTIC_ESTIMATE_FAILED"
+	message := err.Error()
+	details := map[string]any{"instanceId": instanceID}
+	var diagnosticErr *registry.RuntimeDiagnosticError
+	if errors.As(err, &diagnosticErr) {
+		code = diagnosticErr.Code
+		message = diagnosticErr.Message
+		for key, value := range diagnosticErr.Details {
+			details[key] = value
+		}
+		switch code {
+		case "RUNTIME_DIAGNOSTIC_SCAN_LIMIT_EXCEEDED", "RUNTIME_DIAGNOSTIC_FILTERED_LIMIT_EXCEEDED", "RUNTIME_DIAGNOSTIC_ARCHIVE_LIMIT_EXCEEDED", "RUNTIME_DIAGNOSTIC_LOCAL_QUOTA_EXCEEDED", "RUNTIME_DIAGNOSTIC_LOCAL_DISK_INSUFFICIENT":
+			status = http.StatusConflict
+		case "RUNTIME_DIAGNOSTIC_LOCAL_COMMIT_FAILED", "RUNTIME_DIAGNOSTIC_STREAM_FAILED", "RUNTIME_DIAGNOSTIC_TIMEOUT":
+			status = http.StatusInternalServerError
+		}
+	}
+	writeError(w, status, code, message, details)
 }
 
 func containsRuntimeDiagnosticHTTPControl(value string) bool {

@@ -54,7 +54,7 @@ func TestRuntimeDiagnosticsCreateReturnsTaskAndExportIDs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if export.TaskID != response.TaskID || export.InstanceID != instance.ID || export.ServerID != server.ID || export.Status != "pending" || export.CreatedBy != "owner" {
+	if export.TaskID != response.TaskID || export.InstanceID != instance.ID || export.ServerID != server.ID || export.Status != "pending" || export.StorageKind != "local" || export.RemoteRelativePath != "" || export.CreatedBy != "owner" {
 		t.Fatalf("unexpected pending export: %+v", export)
 	}
 	if len(export.Services) != 1 || export.Services[0] != "permission" || !export.SinceAt.Equal(now.Add(-2*time.Hour)) || !export.UntilAt.Equal(now.Add(-time.Hour)) {
@@ -68,7 +68,7 @@ func TestRuntimeDiagnosticsCreateReturnsTaskAndExportIDs(t *testing.T) {
 	if task.Type != "aifar.runtime.diagnostics.export" || task.Target != instance.ID || task.CreatedBy != "owner" {
 		t.Fatalf("unexpected export task: %+v", task)
 	}
-	wantSteps := []string{"load-instance", "validate-request", "estimate-size", "collect-file-logs", "collect-container-logs", "collect-diagnostics", "redact-and-manifest", "create-archive", "record-export"}
+	wantSteps := []string{"validate-local-storage", "discover-log-files", "filter-and-redact", "build-manifest", "stream-local-archive", "verify-local-archive", "cleanup-remote"}
 	assertRuntimeDiagnosticTaskPlan(t, db, response.TaskID, server.ID, wantSteps)
 
 	locks, err := db.ListOperationLocks("runtime-diagnostics", instance.ID, true)
@@ -278,8 +278,11 @@ func TestRuntimeDiagnosticsCreatePlanFailureLeavesNoTaskExportOrLock(t *testing.
 func TestRuntimeDiagnosticsEstimateAndListUseSelectedInstance(t *testing.T) {
 	api, db, secret := newAuthzTestAPI(t)
 	module := &fakeRuntimeDiagnosticsModule{db: db, estimate: registry.RuntimeDiagnosticEstimateResult{
-		Services:  []registry.RuntimeDiagnosticServiceEstimate{{Service: "permission", FileBytes: 100, ContainerBytes: 200}},
-		FileBytes: 100, ContainerBytes: 200, TotalBytes: 300, RequiredBytes: 900, AvailableBytes: 4096, Allowed: true,
+		Services:  []registry.RuntimeDiagnosticServiceEstimate{{Service: "permission", CandidateFiles: 2, CandidateScanBytes: 1048576}},
+		LogSource: "host-mounted", CandidateFiles: 2, CandidateScanBytes: 1048576,
+		MaxFileScanBytes: 1073741824, MaxTotalScanBytes: 2147483648, MaxFilteredBytes: 524288000,
+		MaxArchiveBytes: 268435456, TimeoutSeconds: 900, ServerTimezone: "Asia/Shanghai",
+		LocalAvailableBytes: 10 << 30, LocalQuotaBytes: 5 << 30, Allowed: true,
 	}}
 	api.apps = registry.New(module)
 	server, instance := seedAIFARRuntimeFixture(t, db, "http://docker.invalid")
@@ -297,7 +300,10 @@ func TestRuntimeDiagnosticsEstimateAndListUseSelectedInstance(t *testing.T) {
 	if err := json.Unmarshal(estimateRec.Body.Bytes(), &estimate); err != nil {
 		t.Fatal(err)
 	}
-	if estimate.TotalBytes != 300 || !estimate.Allowed || module.estimateRequest.Instance.ID != instance.ID || module.estimateRequest.Server.ID != server.ID {
+	if estimate.LogSource != "host-mounted" || estimate.CandidateScanBytes != 1048576 || estimate.MaxFileScanBytes != 1073741824 ||
+		estimate.MaxTotalScanBytes != 2147483648 || estimate.MaxFilteredBytes != 524288000 || estimate.MaxArchiveBytes != 268435456 ||
+		estimate.TimeoutSeconds != 900 || estimate.LocalQuotaBytes != 5<<30 || !estimate.Allowed ||
+		module.estimateRequest.Instance.ID != instance.ID || module.estimateRequest.Server.ID != server.ID {
 		t.Fatalf("unexpected estimate: response=%+v request=%+v", estimate, module.estimateRequest)
 	}
 
@@ -322,6 +328,37 @@ func TestRuntimeDiagnosticsEstimateAndListUseSelectedInstance(t *testing.T) {
 	}
 	if page.Total != 1 || len(page.Items) != 1 || page.Items[0].ID != export.ID || page.PageSize != 10 {
 		t.Fatalf("unexpected diagnostic export page: %+v", page)
+	}
+}
+
+func TestRuntimeDiagnosticsCreateRejectsWithStructuredLocalCapacityDetails(t *testing.T) {
+	api, db, secret := newAuthzTestAPI(t)
+	module := &fakeRuntimeDiagnosticsModule{db: db, estimate: registry.RuntimeDiagnosticEstimateResult{
+		LogSource: "host-mounted", CandidateFiles: 3, CandidateScanBytes: 2147483648,
+		MaxFileScanBytes: 1073741824, MaxTotalScanBytes: 2147483648, MaxFilteredBytes: 524288000,
+		MaxArchiveBytes: 268435456, LocalAvailableBytes: 100, LocalReadyBytes: 200,
+		LocalReservedBytes: 300, LocalQuotaBytes: 5368709120, Allowed: false, BlockReason: "local-disk-insufficient",
+	}}
+	api.apps = registry.New(module)
+	server, instance := seedAIFARRuntimeFixture(t, db, "http://docker.invalid")
+	token := issueTestToken(t, db, secret, "owner", "owner")
+	now := time.Now().UTC().Truncate(time.Second)
+	req := runtimeDiagnosticRequest(t, http.MethodPost, "/api/v2/containers/aifar/runtime/diagnostics/exports?serverId="+server.ID, token,
+		instance.ID, now.Add(-2*time.Hour), now.Add(-time.Hour), []string{"permission"})
+	rec := httptest.NewRecorder()
+	api.Router().ServeHTTP(rec, req)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("expected 409, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	var response struct {
+		Code    string         `json:"code"`
+		Details map[string]any `json:"details"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Code != "RUNTIME_DIAGNOSTIC_LOCAL_DISK_INSUFFICIENT" || response.Details["blockReason"] != "local-disk-insufficient" || response.Details["maxArchiveBytes"] != float64(268435456) {
+		t.Fatalf("unexpected structured rejection: %+v", response)
 	}
 }
 
@@ -363,6 +400,12 @@ func TestRuntimeDiagnosticDownloadQueuesDeleteOnlyAfterFullCopy(t *testing.T) {
 	api.apps = registry.New(module)
 	server, instance := seedAIFARRuntimeFixture(t, db, "http://docker.invalid")
 	export := saveReadyRuntimeDiagnosticExport(t, db, server, instance, archive)
+	export.StorageKind = "local"
+	export.StorageRelativePath = export.ID + "/" + export.ArchiveName
+	export.RemoteRelativePath = ""
+	if _, err := db.SaveDiagnosticExport(export); err != nil {
+		t.Fatal(err)
+	}
 	token := issueTestToken(t, db, secret, "owner", "owner")
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v2/containers/aifar/runtime/diagnostics/exports/"+export.ID+"/download?serverId="+server.ID+"&deleteAfterDownload=true", nil)
@@ -396,7 +439,9 @@ func TestRuntimeDiagnosticDownloadRejectsInvalidMetadataBeforeHeaders(t *testing
 	api.apps = registry.New(module)
 	server, instance := seedAIFARRuntimeFixture(t, db, "http://docker.invalid")
 	export := saveReadyRuntimeDiagnosticExport(t, db, server, instance, []byte("archive"))
-	export.SHA256 = "not-a-sha256"
+	export.StorageKind = "local"
+	export.StorageRelativePath = "../outside.tar.gz"
+	export.RemoteRelativePath = ""
 	if _, err := db.SaveDiagnosticExport(export); err != nil {
 		t.Fatal(err)
 	}
@@ -575,6 +620,12 @@ func TestRuntimeDiagnosticManualDeleteCreatesAuditedWorker(t *testing.T) {
 	api.apps = registry.New(module)
 	server, instance := seedAIFARRuntimeFixture(t, db, "http://docker.invalid")
 	export := saveReadyRuntimeDiagnosticExport(t, db, server, instance, []byte("archive"))
+	export.StorageKind = "local"
+	export.StorageRelativePath = export.ID + "/" + export.ArchiveName
+	export.RemoteRelativePath = ""
+	if _, err := db.SaveDiagnosticExport(export); err != nil {
+		t.Fatal(err)
+	}
 	token := issueTestToken(t, db, secret, "owner", "owner")
 
 	req := httptest.NewRequest(http.MethodDelete, "/api/v2/containers/aifar/runtime/diagnostics/exports/"+export.ID+"?serverId="+server.ID, nil)
@@ -592,7 +643,7 @@ func TestRuntimeDiagnosticManualDeleteCreatesAuditedWorker(t *testing.T) {
 	if task.Type != "aifar.runtime.diagnostics.delete" || task.Target != instance.ID+":"+export.ID {
 		t.Fatalf("unexpected delete task: %+v", task)
 	}
-	assertRuntimeDiagnosticTaskPlan(t, db, task.ID, task.Target, []string{"validate-export", "delete-remote-archive", "record-deletion"})
+	assertRuntimeDiagnosticTaskPlan(t, db, task.ID, task.Target, []string{"validate-export", "delete-local-or-legacy-archive", "record-deletion"})
 	waitForTaskStatus(t, db, taskID, "success")
 	got, err := db.GetDiagnosticExport(export.ID)
 	if err != nil {
