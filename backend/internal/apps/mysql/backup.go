@@ -34,8 +34,10 @@ const (
 
 type backupStore interface {
 	GetBoundCredential(appInstanceID, purpose string, includeSecret bool) (store.Credential, error)
+	GetAppBackup(id string) (store.AppBackup, error)
 	SaveAppBackup(store.AppBackup) (store.AppBackup, error)
 	ListAppBackupsForInstances(instanceIDs []string, includeDeleted bool) ([]store.AppBackup, error)
+	MarkAppBackupDeleted(id string, completedAt time.Time) (store.AppBackup, error)
 }
 
 type backupParameters struct {
@@ -113,6 +115,106 @@ func (m Module) Backup(ctx context.Context, req registry.BackupRequest, run regi
 	return m.service.backupStandalone(ctx, req.Clone(), run)
 }
 
+var backupVerificationStepNames = []string{"load-backup", "verify-manifest", "verify-checksum", "record-verification"}
+
+func (m Module) VerifyBackup(ctx context.Context, backupID, repositoryDir, language string, run registry.RunContext) error {
+	data, ok := m.service.store.(backupStore)
+	if !ok {
+		return errors.New("MySQL backup store is unavailable")
+	}
+	copy := BackupCopyFor(language)
+	titleKeys := []string{"load-instance", "build-manifest", "verify-checksum", "record-backup"}
+	steps := make([]installflow.Step, len(backupVerificationStepNames))
+	for index, name := range backupVerificationStepNames {
+		steps[index] = installflow.Step{Name: name, Title: copy.StepTitles[titleKeys[index]]}
+	}
+	recorder, _ := run.Log.(installflow.Recorder)
+	installflow.StartTarget(recorder, backupID)
+	runner := installflow.Runner{
+		Log: run.Log, Recorder: recorder, Target: backupID, Steps: steps,
+		Messages: installflow.Messages{StepStart: copy.StepStart, StepDone: copy.StepDone, StepFailed: copy.StepFailed},
+	}
+	step := func(index int, fn func() error) error {
+		definition := steps[index-1]
+		return runner.Run(index, definition.Name, definition.Title, fn)
+	}
+	var backup store.AppBackup
+	var repository *backuprepo.Repository
+	var verification backuprepo.Verification
+	if err := step(1, func() error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		var err error
+		backup, err = data.GetAppBackup(backupID)
+		if err != nil {
+			return err
+		}
+		if backup.App != "mysql" || backup.Status != "success" {
+			return errors.New("MySQL backup is not eligible for verification")
+		}
+		return nil
+	}); err != nil {
+		installflow.FinishTarget(recorder, backupID, "failed", err.Error())
+		return err
+	}
+	if err := step(2, func() error {
+		var err error
+		repository, err = backuprepo.New(repositoryDir)
+		if err == nil {
+			verification, err = repository.Verify(backup)
+		}
+		if err != nil {
+			return errors.Join(err, recordBackupVerification(data, backup, "failed"))
+		}
+		return nil
+	}); err != nil {
+		installflow.FinishTarget(recorder, backupID, "failed", "backup verification failed")
+		return err
+	}
+	if err := step(3, func() error {
+		if verification.SHA256 != backup.Checksum || verification.Size != backup.Size || !sameBackupPath(verification.Paths.Archive, backup.Path) {
+			return errors.New("verified backup identity does not match its record")
+		}
+		return ctx.Err()
+	}); err != nil {
+		_ = recordBackupVerification(data, backup, "failed")
+		installflow.FinishTarget(recorder, backupID, "failed", "backup verification failed")
+		return err
+	}
+	if err := step(4, func() error { return recordBackupVerification(data, backup, "success") }); err != nil {
+		installflow.FinishTarget(recorder, backupID, "failed", "backup verification result could not be recorded")
+		return err
+	}
+	installflow.FinishTarget(recorder, backupID, "success", "")
+	return nil
+}
+
+func recordBackupVerification(data backupStore, backup store.AppBackup, result string) error {
+	metadata := map[string]any{}
+	if strings.TrimSpace(backup.Metadata) != "" {
+		_ = json.Unmarshal([]byte(backup.Metadata), &metadata)
+	}
+	if metadata == nil {
+		metadata = map[string]any{}
+	}
+	metadata["verificationResult"] = result
+	metadata["verifiedAt"] = time.Now().UTC().Format(time.RFC3339Nano)
+	encoded, err := json.Marshal(metadata)
+	if err != nil {
+		return err
+	}
+	backup.Metadata = string(encoded)
+	_, err = data.SaveAppBackup(backup)
+	return err
+}
+
+func sameBackupPath(left, right string) bool {
+	leftAbs, leftErr := filepath.Abs(left)
+	rightAbs, rightErr := filepath.Abs(right)
+	return leftErr == nil && rightErr == nil && filepath.Clean(leftAbs) == filepath.Clean(rightAbs)
+}
+
 func (s Service) backupStandalone(ctx context.Context, req registry.BackupRequest, run registry.RunContext) (retErr error) {
 	data, ok := s.store.(backupStore)
 	if !ok {
@@ -158,6 +260,9 @@ func (s Service) backupStandalone(ctx context.Context, req registry.BackupReques
 				safeCleanupErr := errors.New(copy.RemoteCleanupFailed)
 				if state.log != nil {
 					state.log.Error("%s", copy.RemoteCleanupFailed)
+				}
+				if state.record.Status == "success" {
+					return
 				}
 				if retErr == nil {
 					retErr = safeCleanupErr
@@ -394,13 +499,22 @@ func (s Service) backupStandalone(ctx context.Context, req registry.BackupReques
 		return err
 	}
 	if err := step(14, func() error {
-		items, err := data.ListAppBackupsForInstances([]string{req.Instance.ID}, false)
+		state.record.Status = "success"
+		state.record.CompletedAt = time.Now().UTC()
+		state.record.Metadata = backupMetadataWithInspection(parameters, "success", inspection)
+		saved, err := data.SaveAppBackup(state.record)
 		if err != nil {
 			return err
 		}
+		state.record = saved
+		items, err := data.ListAppBackupsForInstances([]string{req.Instance.ID}, false)
+		if err != nil {
+			if run.Log != nil {
+				run.Log.Error("MySQL backup retention cleanup warning")
+			}
+			return nil
+		}
 		current := state.record
-		current.Status = "success"
-		current.CompletedAt = time.Now().UTC()
 		foundCurrent := false
 		for index := range items {
 			if items[index].ID == current.ID {
@@ -416,6 +530,24 @@ func (s Service) backupStandalone(ctx context.Context, req registry.BackupReques
 		if len(candidates) > 0 && run.Log != nil {
 			run.Log.Info(copy.RetentionSelected, len(candidates))
 		}
+		for _, candidate := range candidates {
+			fresh, freshErr := data.GetAppBackup(candidate.ID)
+			if freshErr != nil || !sameBackupRecord(candidate, fresh) {
+				if run.Log != nil {
+					run.Log.Error("MySQL backup retention cleanup warning for backup %s", candidate.ID)
+				}
+				continue
+			}
+			if deleteErr := repository.Delete(fresh); deleteErr != nil {
+				if run.Log != nil {
+					run.Log.Error("MySQL backup retention cleanup warning for backup %s", candidate.ID)
+				}
+				continue
+			}
+			if _, markErr := data.MarkAppBackupDeleted(fresh.ID, time.Now().UTC()); markErr != nil && run.Log != nil {
+				run.Log.Error("MySQL backup retention cleanup warning for backup %s", candidate.ID)
+			}
+		}
 		return nil
 	}); err != nil {
 		return err
@@ -428,21 +560,22 @@ func (s Service) backupStandalone(ctx context.Context, req registry.BackupReques
 			state.remoteClean = true
 			return nil
 		}
-		return errors.New(copy.RemoteCleanupFailed)
+		if run.Log != nil {
+			run.Log.Error("%s", copy.RemoteCleanupFailed)
+		}
+		return nil
 	}); err != nil {
 		return err
 	}
 
-	state.record.Status = "success"
-	state.record.CompletedAt = time.Now().UTC()
-	state.record.Metadata = backupMetadataWithInspection(parameters, "success", inspection)
-	saved, err := data.SaveAppBackup(state.record)
-	if err != nil {
-		return err
-	}
-	state.record = saved
 	installflow.FinishTarget(recorder, req.Instance.ServerID, "success", "")
 	return nil
+}
+
+func sameBackupRecord(left, right store.AppBackup) bool {
+	return left.ID == right.ID && left.App == right.App && left.InstanceID == right.InstanceID && left.ServerID == right.ServerID &&
+		left.BackupType == right.BackupType && left.Status == "success" && right.Status == "success" && sameBackupPath(left.Path, right.Path) &&
+		left.Checksum == right.Checksum && left.Size == right.Size
 }
 
 func (s Service) retainUnavailableDownloaderFailure(req registry.BackupRequest, run registry.RunContext, data backupStore) error {

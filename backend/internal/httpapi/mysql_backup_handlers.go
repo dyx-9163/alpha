@@ -5,8 +5,11 @@ import (
 	"errors"
 	"net/http"
 	"strings"
+	"time"
 
+	mysqlapp "aifar-deployment/backend/internal/apps/mysql"
 	"aifar-deployment/backend/internal/apps/registry"
+	"aifar-deployment/backend/internal/backuprepo"
 	"aifar-deployment/backend/internal/i18n"
 	"aifar-deployment/backend/internal/store"
 	"aifar-deployment/backend/internal/worker"
@@ -14,7 +17,13 @@ import (
 	"github.com/go-chi/chi/v5"
 )
 
-const mysqlBackupTaskType = "apps.mysql.backup"
+const (
+	mysqlBackupTaskType       = "apps.mysql.backup"
+	mysqlBackupVerifyTaskType = "apps.mysql.backup.verify"
+	mysqlBackupDeleteAction   = "apps.mysql.backup.delete"
+)
+
+var mysqlBackupVerificationSteps = []string{"load-backup", "verify-manifest", "verify-checksum", "record-verification"}
 
 func (a *API) listMySQLBackups(w http.ResponseWriter, r *http.Request) {
 	lang := languageFromRequest(r)
@@ -156,4 +165,127 @@ func (a *API) startMySQLBackup(w http.ResponseWriter, r *http.Request) {
 		a.audit(r, mysqlBackupTaskType, instance.ID, "running", task.ID)
 	}
 	respondTask(w, task, err)
+}
+
+func (a *API) verifyMySQLBackup(w http.ResponseWriter, r *http.Request) {
+	lang := languageFromRequest(r)
+	backupID := strings.TrimSpace(chi.URLParam(r, "backupId"))
+	backup, err := a.store.GetAppBackup(backupID)
+	if err != nil {
+		respond(w, nil, err)
+		return
+	}
+	if backup.App != "mysql" || backup.Status != "success" {
+		writeError(w, http.StatusConflict, "MYSQL_BACKUP_VERIFY_NOT_ALLOWED", i18n.MySQLBackupErrorText(lang, mysqlapp.MySQLBackupChecksumMismatch), map[string]any{"backupId": backupID})
+		return
+	}
+	instance, err := a.store.GetAppInstance(backup.InstanceID)
+	if err != nil {
+		respond(w, nil, err)
+		return
+	}
+	actor := currentUser(r).Username
+	task, err := a.store.CreateTask(store.Task{Type: mysqlBackupVerifyTaskType, Target: backup.ID, Status: "pending", CreatedBy: actor})
+	if err != nil {
+		respondTask(w, task, err)
+		return
+	}
+	plan := make([]registry.InstallStepPlan, len(mysqlBackupVerificationSteps))
+	for index, name := range mysqlBackupVerificationSteps {
+		plan[index] = registry.InstallStepPlan{Target: backup.ServerID, Name: name, Title: name, Order: index + 1}
+	}
+	if err := a.storeInstallPlanOrDelete(task.ID, plan); err != nil {
+		writeError(w, http.StatusInternalServerError, "MYSQL_BACKUP_VERIFY_PLAN_STORE_FAILED", i18n.MySQLBackupErrorText(lang, mysqlapp.MySQLBackupChecksumMismatch), map[string]any{"backupId": backupID})
+		return
+	}
+	locks, acquired := a.acquireTaskOperationLocks(w, lang, task, appInstanceOperationLockSpecs("mysql-backup-verify", []store.AppInstance{instance}))
+	if !acquired {
+		return
+	}
+	module := mysqlapp.NewModule(a.store, nil)
+	task, err = a.tasks.StartExistingWithLanguage(task, lang, func(ctx context.Context, log worker.Logger) error {
+		return module.VerifyBackup(ctx, backup.ID, a.cfg.MySQLBackupDir, lang, registry.RunContext{TaskID: log.TaskID(), Log: log, TargetLog: func(target string) registry.Logger { return log.Target(target) }, Concurrency: a.store.DeploymentConcurrency(a.cfg.DeploymentConcurrency)})
+	})
+	if err != nil {
+		a.releaseOperationLocks(locks)
+	}
+	if err == nil {
+		a.audit(r, mysqlBackupVerifyTaskType, backup.ID, "running", task.ID)
+	}
+	respondTask(w, task, err)
+}
+
+func (a *API) deleteMySQLBackup(w http.ResponseWriter, r *http.Request) {
+	lang := languageFromRequest(r)
+	backupID := strings.TrimSpace(chi.URLParam(r, "backupId"))
+	backup, err := a.store.GetAppBackup(backupID)
+	if err != nil {
+		respond(w, nil, err)
+		return
+	}
+	fail := func(status int, code, message string) {
+		a.audit(r, mysqlBackupDeleteAction, backup.ID, "failed", code)
+		writeError(w, status, code, message, map[string]any{"backupId": backup.ID})
+	}
+	if backup.App != "mysql" || backup.Status == "pending" || backup.Status == "running" || backup.Status == "deleted" || backup.Status != "success" {
+		fail(http.StatusConflict, "MYSQL_BACKUP_DELETE_NOT_ALLOWED", i18n.MySQLBackupErrorText(lang, mysqlapp.MySQLBackupChecksumMismatch))
+		return
+	}
+	instance, err := a.store.GetAppInstance(backup.InstanceID)
+	if err != nil {
+		fail(http.StatusConflict, "MYSQL_BACKUP_DELETE_NOT_ALLOWED", i18n.MySQLBackupErrorText(lang, mysqlapp.MySQLBackupChecksumMismatch))
+		return
+	}
+	lock, err := a.store.AcquireOperationLock(store.OperationLock{
+		Scope: "app-instance", ResourceID: instance.ID, Operation: operationLockMutation,
+		Owner: currentUser(r).Username, ExpiresAt: time.Now().UTC().Add(operationLockTTL),
+		Metadata: operationLockMetadata(map[string]any{"action": "mysql-backup-delete", "backupId": backup.ID, "instanceId": instance.ID}),
+	})
+	if err != nil {
+		var conflict store.OperationLockConflict
+		if errors.As(err, &conflict) {
+			fail(http.StatusConflict, "OPERATION_LOCKED", i18n.Text(lang, "api.operationLocked", conflict.Lock.ResourceID))
+			return
+		}
+		fail(http.StatusInternalServerError, "OPERATION_LOCK_FAILED", i18n.MySQLBackupErrorText(lang, mysqlapp.MySQLBackupChecksumMismatch))
+		return
+	}
+	defer a.store.ReleaseOperationLock(lock.ID)
+	backups, err := a.store.ListAppBackupsForInstances([]string{backup.InstanceID}, false)
+	if err != nil {
+		fail(http.StatusInternalServerError, "MYSQL_BACKUP_DELETE_FAILED", i18n.MySQLBackupErrorText(lang, mysqlapp.MySQLBackupChecksumMismatch))
+		return
+	}
+	hasOtherSuccessful := false
+	for _, candidate := range backups {
+		if candidate.ID != backup.ID && candidate.Status == "success" {
+			hasOtherSuccessful = true
+			break
+		}
+	}
+	if !hasOtherSuccessful {
+		fail(http.StatusConflict, "MYSQL_BACKUP_LAST_SUCCESS_PROTECTED", i18n.MySQLBackupErrorText(lang, mysqlapp.MySQLBackupChecksumMismatch))
+		return
+	}
+	repository, err := backuprepo.New(a.cfg.MySQLBackupDir)
+	if err != nil {
+		fail(http.StatusConflict, "MYSQL_BACKUP_DELETE_FAILED", i18n.MySQLBackupErrorText(lang, mysqlapp.MySQLBackupChecksumMismatch))
+		return
+	}
+	fresh, err := a.store.GetAppBackup(backup.ID)
+	if err != nil || fresh.Status != "success" || fresh.Path != backup.Path || fresh.Checksum != backup.Checksum || fresh.Size != backup.Size {
+		fail(http.StatusConflict, "MYSQL_BACKUP_DELETE_FAILED", i18n.MySQLBackupErrorText(lang, mysqlapp.MySQLBackupChecksumMismatch))
+		return
+	}
+	if err := repository.Delete(fresh); err != nil {
+		fail(http.StatusConflict, "MYSQL_BACKUP_DELETE_FAILED", i18n.MySQLBackupErrorText(lang, mysqlapp.MySQLBackupChecksumMismatch))
+		return
+	}
+	deleted, err := a.store.MarkAppBackupDeleted(fresh.ID, time.Now().UTC())
+	if err != nil {
+		fail(http.StatusInternalServerError, "MYSQL_BACKUP_DELETE_RECORD_FAILED", i18n.MySQLBackupErrorText(lang, mysqlapp.MySQLBackupChecksumMismatch))
+		return
+	}
+	a.audit(r, mysqlBackupDeleteAction, backup.ID, "success", backup.ID)
+	writeJSON(w, http.StatusOK, map[string]any{"backup": deleted})
 }

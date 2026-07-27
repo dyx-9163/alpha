@@ -743,6 +743,52 @@ func TestVerifyReturnsValidatedArtifact(t *testing.T) {
 	}
 }
 
+func TestBackupVerifyRejectsMissingEscapedMismatchedOrAlteredArtifacts(t *testing.T) {
+	// Production break caught: verification must fail closed on every server-owned repository boundary before any caller can use the archive.
+	tests := []struct {
+		name   string
+		mutate func(*testing.T, BackupPaths, *store.AppBackup)
+	}{
+		{"missing archive", func(t *testing.T, paths BackupPaths, _ *store.AppBackup) {
+			t.Helper()
+			if err := os.Remove(paths.Archive); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"escaped record path", func(t *testing.T, _ BackupPaths, backup *store.AppBackup) {
+			t.Helper()
+			backup.Path = filepath.Join(t.TempDir(), archiveName)
+		}},
+		{"manifest mismatch", func(t *testing.T, paths BackupPaths, _ *store.AppBackup) {
+			t.Helper()
+			if err := os.WriteFile(paths.Manifest, []byte(`{"backupId":"backup_other"}`), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"altered archive", func(t *testing.T, paths BackupPaths, _ *store.AppBackup) {
+			t.Helper()
+			if err := os.WriteFile(paths.Archive, []byte("altered archive"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"altered checksums", func(t *testing.T, paths BackupPaths, _ *store.AppBackup) {
+			t.Helper()
+			if err := os.WriteFile(paths.Checksums, []byte(strings.Repeat("0", 64)+"  dump.tar\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			repo, paths, backup := committedBackup(t, "backup_verify_boundaries")
+			test.mutate(t, paths, &backup)
+			if _, err := repo.Verify(backup); err == nil {
+				t.Fatal("Verify accepted an untrusted backup artifact")
+			}
+		})
+	}
+}
+
 func TestVerifyRejectsSymlinkedArchive(t *testing.T) {
 	repo, paths, backup := committedBackup(t, "backup-symlink")
 	if err := os.Remove(paths.Archive); err != nil {

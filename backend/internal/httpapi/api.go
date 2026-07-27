@@ -114,6 +114,8 @@ func NewWithRealtime(cfg config.Config, s *store.Store, tasks *worker.Manager, e
 			r.Get("/apps/instances/{id}/backups", api.listMySQLBackups)
 			r.Post("/apps/{app}/install", api.requirePermission(rbac.AppsManage, api.installApp))
 			r.Post("/apps/instances/{id}/backup", api.requirePermission(rbac.AppsManage, api.startMySQLBackup))
+			r.Post("/apps/backups/{backupId}/verify", api.requirePermission(rbac.AppsManage, api.verifyMySQLBackup))
+			r.Delete("/apps/backups/{backupId}", api.requirePermission(rbac.AppsManage, api.deleteMySQLBackup))
 			r.Post("/apps/instances/batch-delete", api.requirePermission(rbac.AppsManage, api.deleteAppInstances))
 			r.Post("/apps/instances/{id}/check", api.requirePermission(rbac.AppsManage, api.checkAppInstance))
 			r.Get("/apps/instances/{id}/aifar/releases", api.listAIFARReleases)

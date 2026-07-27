@@ -2,10 +2,14 @@ package httpapi
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -13,6 +17,7 @@ import (
 
 	mysqlapp "aifar-deployment/backend/internal/apps/mysql"
 	"aifar-deployment/backend/internal/apps/registry"
+	"aifar-deployment/backend/internal/backuprepo"
 	"aifar-deployment/backend/internal/store"
 )
 
@@ -239,6 +244,209 @@ func TestMySQLBackupListExcludesDeletedAndExpandsClusterMembersOnce(t *testing.T
 	if len(clusterItems) != 1 || clusterItems[0].ID != clusterBackup.ID {
 		t.Fatalf("cluster items=%+v", clusterItems)
 	}
+}
+
+func TestMySQLBackupVerifyCreatesLockedAuditedWorkerWithExactSteps(t *testing.T) {
+	// Production break caught: verification without its worker plan, shared lifecycle lock, permission, or audit trail is neither observable nor serialized.
+	api, db, secret := newAuthzTestAPI(t)
+	_, instance := saveMySQLBackupTarget(t, db, "standalone", "")
+	api.cfg.MySQLBackupDir = filepath.Join(t.TempDir(), "mysql-backups")
+	backup, _ := saveCommittedMySQLBackup(t, db, api.cfg.MySQLBackupDir, instance, "verify")
+	operator := issueTestToken(t, db, secret, "operator", "operator")
+	req := httptest.NewRequest(http.MethodPost, "/api/v2/apps/backups/"+backup.ID+"/verify", nil)
+	req.Header.Set("Authorization", "Bearer "+operator)
+	rec := httptest.NewRecorder()
+	api.Router().ServeHTTP(rec, req)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("POST verify status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var body struct {
+		TaskID string `json:"taskId"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil || body.TaskID == "" {
+		t.Fatalf("verify response=%s err=%v", rec.Body.String(), err)
+	}
+	task, _, err := db.GetTask(body.TaskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.Type != "apps.mysql.backup.verify" || task.Target != backup.ID {
+		t.Fatalf("verify task=%+v", task)
+	}
+	steps, err := db.ListTaskSteps(task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := make([]string, len(steps))
+	for i := range steps {
+		got[i] = steps[i].Name
+	}
+	if !reflect.DeepEqual(got, []string{"load-backup", "verify-manifest", "verify-checksum", "record-verification"}) {
+		t.Fatalf("verify steps=%v", got)
+	}
+	locks, err := db.ListOperationLocks("app-instance", instance.ID, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(locks) != 1 || locks[0].Operation != operationLockMutation || locks[0].OwnerTaskID != task.ID {
+		t.Fatalf("verify lock=%+v", locks)
+	}
+	assertAuditExists(t, db, "apps.mysql.backup.verify", "running", "operator", backup.ID)
+	waitForTaskStatus(t, db, task.ID, "success")
+	verified, err := db.GetAppBackup(backup.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if verified.Path != backup.Path || verified.Checksum != backup.Checksum || verified.Size != backup.Size || !strings.Contains(verified.Metadata, `"verificationResult":"success"`) {
+		t.Fatalf("verified record=%+v", verified)
+	}
+
+	viewer := issueTestToken(t, db, secret, "viewer", "viewer")
+	deniedReq := httptest.NewRequest(http.MethodPost, "/api/v2/apps/backups/"+backup.ID+"/verify", nil)
+	deniedReq.Header.Set("Authorization", "Bearer "+viewer)
+	deniedRec := httptest.NewRecorder()
+	api.Router().ServeHTTP(deniedRec, deniedReq)
+	if deniedRec.Code != http.StatusForbidden {
+		t.Fatalf("viewer verify status=%d body=%s", deniedRec.Code, deniedRec.Body.String())
+	}
+}
+
+func TestMySQLBackupDeleteRemovesFilesBeforeMarkingDeletedAndAudits(t *testing.T) {
+	// Production break caught: marking first or deleting an unchecked path can lose the record of a live archive or remove arbitrary files.
+	api, db, secret := newAuthzTestAPI(t)
+	_, instance := saveMySQLBackupTarget(t, db, "standalone", "")
+	api.cfg.MySQLBackupDir = filepath.Join(t.TempDir(), "mysql-backups")
+	target, directory := saveCommittedMySQLBackup(t, db, api.cfg.MySQLBackupDir, instance, "delete-target")
+	_, _ = saveCommittedMySQLBackup(t, db, api.cfg.MySQLBackupDir, instance, "delete-survivor")
+	token := issueTestToken(t, db, secret, "operator", "operator")
+	req := httptest.NewRequest(http.MethodDelete, "/api/v2/apps/backups/"+target.ID, nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	rec := httptest.NewRecorder()
+	api.Router().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("DELETE status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	deleted, err := db.GetAppBackup(target.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deleted.Status != "deleted" {
+		t.Fatalf("deleted record=%+v", deleted)
+	}
+	if _, err := os.Stat(directory); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("managed directory remains: %v", err)
+	}
+	assertAuditExists(t, db, "apps.mysql.backup.delete", "success", "operator", target.ID)
+}
+
+func TestMySQLBackupDeleteRejectsActiveSoleOrLockedBackupWithoutChangingRecord(t *testing.T) {
+	// Production break caught: deletion must preserve in-flight, sole recovery-point, and operation-locked backups.
+	tests := []struct {
+		name, status         string
+		addSurvivor, addLock bool
+	}{
+		{"pending", "pending", true, false}, {"running", "running", true, false}, {"sole success", "success", false, false}, {"locked success", "success", true, true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			api, db, secret := newAuthzTestAPI(t)
+			_, instance := saveMySQLBackupTarget(t, db, "standalone", "")
+			api.cfg.MySQLBackupDir = filepath.Join(t.TempDir(), "mysql-backups")
+			backup, directory := saveManagedMySQLBackupWithStatus(t, db, api.cfg.MySQLBackupDir, instance, "protected", test.status)
+			if test.addSurvivor {
+				_, _ = saveCommittedMySQLBackup(t, db, api.cfg.MySQLBackupDir, instance, "survivor")
+			}
+			if test.addLock {
+				ownerTask, err := db.CreateTask(store.Task{Type: "apps.mysql.backup", Target: instance.ID, Status: "running", CreatedBy: "operator"})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := db.AcquireOperationLock(store.OperationLock{Scope: "app-instance", ResourceID: instance.ID, Operation: operationLockMutation, OwnerTaskID: ownerTask.ID, Owner: "operator", ExpiresAt: time.Now().Add(time.Hour)}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			token := issueTestToken(t, db, secret, "operator", "operator")
+			req := httptest.NewRequest(http.MethodDelete, "/api/v2/apps/backups/"+backup.ID, nil)
+			req.Header.Set("Authorization", "Bearer "+token)
+			rec := httptest.NewRecorder()
+			api.Router().ServeHTTP(rec, req)
+			if rec.Code != http.StatusConflict {
+				t.Fatalf("DELETE status=%d body=%s", rec.Code, rec.Body.String())
+			}
+			after, err := db.GetAppBackup(backup.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if after.Status != test.status {
+				t.Fatalf("record changed=%+v", after)
+			}
+			if _, err := os.Stat(directory); err != nil {
+				t.Fatalf("archive directory changed: %v", err)
+			}
+			assertAuditExists(t, db, "apps.mysql.backup.delete", "failed", "operator", backup.ID)
+		})
+	}
+}
+
+func TestMySQLBackupDeleteFileFailurePreservesOriginalStatus(t *testing.T) {
+	// Production break caught: a failed managed-file deletion must never advance the database row to deleted.
+	api, db, secret := newAuthzTestAPI(t)
+	_, instance := saveMySQLBackupTarget(t, db, "standalone", "")
+	api.cfg.MySQLBackupDir = filepath.Join(t.TempDir(), "mysql-backups")
+	backup, directory := saveCommittedMySQLBackup(t, db, api.cfg.MySQLBackupDir, instance, "tampered")
+	_, _ = saveCommittedMySQLBackup(t, db, api.cfg.MySQLBackupDir, instance, "survivor")
+	if err := os.WriteFile(filepath.Join(directory, "checksums.txt"), []byte(strings.Repeat("0", 64)+"  dump.tar\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	token := issueTestToken(t, db, secret, "operator", "operator")
+	req := httptest.NewRequest(http.MethodDelete, "/api/v2/apps/backups/"+backup.ID, nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	rec := httptest.NewRecorder()
+	api.Router().ServeHTTP(rec, req)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("DELETE status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	after, err := db.GetAppBackup(backup.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Status != "success" {
+		t.Fatalf("failed deletion changed status=%+v", after)
+	}
+	if _, err := os.Stat(directory); err != nil {
+		t.Fatalf("failed deletion removed directory: %v", err)
+	}
+	assertAuditExists(t, db, "apps.mysql.backup.delete", "failed", "operator", backup.ID)
+}
+
+func saveCommittedMySQLBackup(t *testing.T, db *store.Store, root string, instance store.AppInstance, label string) (store.AppBackup, string) {
+	return saveManagedMySQLBackupWithStatus(t, db, root, instance, label, "success")
+}
+
+func saveManagedMySQLBackupWithStatus(t *testing.T, db *store.Store, root string, instance store.AppInstance, label, status string) (store.AppBackup, string) {
+	t.Helper()
+	repository, err := backuprepo.New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := store.NewID("backup")
+	paths, err := repository.Prepare(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	archive := []byte("archive-" + label)
+	if err := os.WriteFile(paths.PartialArchive, archive, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	digest := fmt.Sprintf("%x", sha256.Sum256(archive))
+	if err := repository.Commit(paths, []byte(`{"backupId":"`+id+`","app":"mysql"}`), digest, int64(len(archive))); err != nil {
+		t.Fatal(err)
+	}
+	backup, err := db.SaveAppBackup(store.AppBackup{ID: id, App: "mysql", InstanceID: instance.ID, ServerID: instance.ServerID, BackupType: "logical-full", Status: status, Path: paths.Archive, Checksum: digest, Size: int64(len(archive)), Metadata: `{"phase":"` + status + `"}`, CreatedAt: time.Now().UTC()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return backup, paths.Directory
 }
 
 var mysqlBackupHandlerSteps = []string{"load-instance", "acquire-instance-lock", "resolve-credential", "inspect-mysql", "check-backup-space", "prepare-workdir", "dry-run-dump", "dump-instance", "build-manifest", "package-backup", "transfer-backup", "verify-checksum", "record-backup", "apply-retention", "cleanup-workdir"}

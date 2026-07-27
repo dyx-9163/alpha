@@ -15,6 +15,7 @@ import (
 
 	"aifar-deployment/backend/internal/adapter"
 	"aifar-deployment/backend/internal/apps/registry"
+	"aifar-deployment/backend/internal/backuprepo"
 	"aifar-deployment/backend/internal/store"
 )
 
@@ -108,6 +109,137 @@ func TestBackupStandaloneRetentionCountsTheNewCommittedBackup(t *testing.T) {
 	}
 }
 
+func TestBackupRetentionDeletesOwnedOldArchiveAfterNewRecordIsSuccessful(t *testing.T) {
+	// Production break caught: retention that only selects rows, deletes before the new success, or forgets the deleted state leaves storage unbounded or removes the recovery point.
+	module, data, _ := newStandaloneBackupModule(t)
+	request := standaloneBackupRequest(t)
+	repository, err := backuprepo.New(request.RepositoryDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	paths, err := repository.Prepare("backup_old_retention")
+	if err != nil {
+		t.Fatal(err)
+	}
+	archive := []byte("old archive")
+	if err := os.WriteFile(paths.PartialArchive, archive, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	digest := fmt.Sprintf("%x", sha256.Sum256(archive))
+	if err := repository.Commit(paths, []byte(`{"backupId":"backup_old_retention","app":"mysql"}`), digest, int64(len(archive))); err != nil {
+		t.Fatal(err)
+	}
+	data.backups = append(data.backups, store.AppBackup{ID: "backup_old_retention", App: "mysql", InstanceID: request.Instance.ID, ServerID: request.Instance.ServerID, BackupType: "logical-full", Status: "success", Path: paths.Archive, Checksum: digest, Size: int64(len(archive)), CreatedAt: time.Now().UTC().Add(-time.Hour)})
+	request.KeepLast = 1
+	if err := module.Backup(context.Background(), request, registry.RunContext{TaskID: "tsk_1234567890abcdef12345678", Log: &backupRecorder{}}); err != nil {
+		t.Fatal(err)
+	}
+	old, err := data.GetAppBackup("backup_old_retention")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if old.Status != "deleted" {
+		t.Fatalf("old backup status=%q, want deleted", old.Status)
+	}
+	if _, err := os.Stat(paths.Directory); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("old backup directory remains: %v", err)
+	}
+	if data.statusAtDelete != "success" {
+		t.Fatalf("new backup status at old deletion=%q, want success", data.statusAtDelete)
+	}
+}
+
+func TestBackupRetentionFailureWarnsWithoutFailingNewSuccessfulBackup(t *testing.T) {
+	// Production break caught: an old corrupt/missing candidate must not roll back a newly verified archive.
+	module, data, _ := newStandaloneBackupModule(t)
+	request := standaloneBackupRequest(t)
+	data.backups = append(data.backups, store.AppBackup{ID: "backup_missing_old", App: "mysql", InstanceID: request.Instance.ID, ServerID: request.Instance.ServerID, BackupType: "logical-full", Status: "success", Path: filepath.Join(request.RepositoryDir, "backup_missing_old", "dump.tar"), Checksum: strings.Repeat("a", 64), Size: 10, CreatedAt: time.Now().UTC().Add(-time.Hour)})
+	request.KeepLast = 1
+	recorder := &backupRecorder{}
+	if err := module.Backup(context.Background(), request, registry.RunContext{TaskID: "tsk_1234567890abcdef12345678", Log: recorder}); err != nil {
+		t.Fatal(err)
+	}
+	old, err := data.GetAppBackup("backup_missing_old")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if old.Status != "success" {
+		t.Fatalf("failed cleanup changed old record: %+v", old)
+	}
+	if !strings.Contains(strings.ToLower(strings.Join(recorder.messages, "\n")), "retention") {
+		t.Fatalf("missing sanitized retention warning: %v", recorder.messages)
+	}
+	newest := data.newestBackupExcept("backup_missing_old")
+	if newest.Status != "success" {
+		t.Fatalf("new backup not successful: %+v", newest)
+	}
+}
+
+func TestBackupVerifyServiceValidatesRepositoryBeforeMySQLContactAndPreservesArchiveIdentity(t *testing.T) {
+	// Production break caught: verification must use only the controlled repository, persist non-secret result metadata, and never inspect MySQL.
+	module, data, remote := newStandaloneBackupModule(t)
+	repositoryRoot := filepath.Join(t.TempDir(), "repository")
+	repository, err := backuprepo.New(repositoryRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	paths, err := repository.Prepare("backup_verify_service")
+	if err != nil {
+		t.Fatal(err)
+	}
+	archive := []byte("verify service archive")
+	if err := os.WriteFile(paths.PartialArchive, archive, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	digest := fmt.Sprintf("%x", sha256.Sum256(archive))
+	if err := repository.Commit(paths, []byte(`{"backupId":"backup_verify_service","app":"mysql"}`), digest, int64(len(archive))); err != nil {
+		t.Fatal(err)
+	}
+	original := store.AppBackup{ID: "backup_verify_service", App: "mysql", InstanceID: standaloneBackupRequest(t).Instance.ID, ServerID: standaloneBackupRequest(t).Instance.ServerID, BackupType: "logical-full", Status: "success", Path: paths.Archive, Checksum: digest, Size: int64(len(archive)), Metadata: `{"phase":"success","source":"primary"}`, CreatedAt: time.Now().UTC()}
+	data.backups = append(data.backups, original)
+	recorder := &backupRecorder{}
+	if err := module.VerifyBackup(context.Background(), original.ID, repositoryRoot, "en", registry.RunContext{TaskID: "tsk_verify_1234567890abcdef", Log: recorder}); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(recorder.startedSteps, []string{"load-backup", "verify-manifest", "verify-checksum", "record-verification"}) {
+		t.Fatalf("verify steps=%v", recorder.startedSteps)
+	}
+	verified, err := data.GetAppBackup(original.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if verified.Path != original.Path || verified.Checksum != original.Checksum || verified.Size != original.Size || verified.Status != original.Status {
+		t.Fatalf("archive identity changed: before=%+v after=%+v", original, verified)
+	}
+	if !strings.Contains(verified.Metadata, `"verificationResult":"success"`) || !strings.Contains(verified.Metadata, `"verifiedAt":`) || !strings.Contains(verified.Metadata, `"source":"primary"`) {
+		t.Fatalf("verification metadata=%s", verified.Metadata)
+	}
+	if data.credentialLoads != 0 || len(remote.commands) != 0 {
+		t.Fatalf("verification contacted MySQL: credentials=%d commands=%v", data.credentialLoads, remote.commands)
+	}
+}
+
+func TestBackupVerifyServiceRejectsInvalidRepositoryBeforeMySQLContact(t *testing.T) {
+	// Production break caught: a missing/escaped/tampered artifact must fail before credential resolution or remote execution.
+	module, data, remote := newStandaloneBackupModule(t)
+	record := store.AppBackup{ID: "backup_verify_missing", App: "mysql", InstanceID: standaloneBackupRequest(t).Instance.ID, ServerID: standaloneBackupRequest(t).Instance.ServerID, BackupType: "logical-full", Status: "success", Path: filepath.Join(t.TempDir(), "outside.tar"), Checksum: strings.Repeat("a", 64), Size: 1, Metadata: `{}`}
+	data.backups = append(data.backups, record)
+	err := module.VerifyBackup(context.Background(), record.ID, filepath.Join(t.TempDir(), "repository"), "en", registry.RunContext{TaskID: "tsk_verify_1234567890abcdef", Log: &backupRecorder{}})
+	if err == nil {
+		t.Fatal("VerifyBackup accepted an unmanaged backup")
+	}
+	if data.credentialLoads != 0 || len(remote.commands) != 0 {
+		t.Fatalf("verification contacted MySQL: credentials=%d commands=%v", data.credentialLoads, remote.commands)
+	}
+	failed, getErr := data.GetAppBackup(record.ID)
+	if getErr != nil {
+		t.Fatal(getErr)
+	}
+	if !strings.Contains(failed.Metadata, `"verificationResult":"failed"`) {
+		t.Fatalf("failed verification metadata=%s", failed.Metadata)
+	}
+}
+
 func TestBackupStandaloneRollsBackCommittedArchiveWhenRecordOrRetentionFails(t *testing.T) {
 	// Production break caught: a post-commit control-plane failure must not leave a published archive while the record is failed.
 	tests := []struct {
@@ -116,7 +248,6 @@ func TestBackupStandaloneRollsBackCommittedArchiveWhenRecordOrRetentionFails(t *
 	}{
 		{"record committed phase", func(data *backupFakeStore) { data.saveErrPhase = "committed" }},
 		{"record success phase", func(data *backupFakeStore) { data.saveErrPhase = "success" }},
-		{"retention lookup", func(data *backupFakeStore) { data.listErr = errors.New("retention lookup failed") }},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -151,7 +282,6 @@ func TestBackupStandaloneRetainsFailedRecordWithoutFinalArchive(t *testing.T) {
 		{"insufficient source space", func(_ *backupFakeStore, r *backupFakeRemote) { r.sourceAvailable = 1 }, MySQLBackupSpaceInsufficient},
 		{"transfer cancellation", func(_ *backupFakeStore, r *backupFakeRemote) { r.downloadErr = context.Canceled }, MySQLBackupTransferFailed},
 		{"checksum mismatch", func(_ *backupFakeStore, r *backupFakeRemote) { r.downloadSHA = strings.Repeat("0", 64) }, MySQLBackupChecksumMismatch},
-		{"cleanup failure", func(_ *backupFakeStore, r *backupFakeRemote) { r.cleanupErr = errors.New("cleanup failed") }, ""},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -174,6 +304,40 @@ func TestBackupStandaloneRetainsFailedRecordWithoutFinalArchive(t *testing.T) {
 				t.Fatalf("final archive exists after failure: %v", statErr)
 			}
 		})
+	}
+}
+
+func TestBackupStandaloneCleanupFailureAfterPublishedSuccessWarnsWithoutRemovingRecoveryPoint(t *testing.T) {
+	// Production break caught: retention can delete the previous backup only if a later workdir cleanup failure cannot roll back the newly successful recovery point.
+	module, data, remote := newStandaloneBackupModule(t)
+	remote.cleanupErr = errors.New("cleanup failed")
+	recorder := &backupRecorder{}
+	if err := module.Backup(context.Background(), standaloneBackupRequest(t), registry.RunContext{TaskID: "tsk_1234567890abcdef12345678", Log: recorder}); err != nil {
+		t.Fatalf("post-publication cleanup failure failed backup: %v", err)
+	}
+	if len(data.backups) != 1 || data.backups[0].Status != "success" {
+		t.Fatalf("published recovery point was not preserved: %+v", data.backups)
+	}
+	if _, err := os.Stat(data.backups[0].Path); err != nil {
+		t.Fatalf("published archive was removed: %v", err)
+	}
+	if !strings.Contains(strings.Join(recorder.messages, "\n"), BackupCopyFor("en").RemoteCleanupFailed) {
+		t.Fatalf("missing sanitized cleanup warning: %v", recorder.messages)
+	}
+}
+
+func TestBackupStandaloneDoesNotRepeatSuccessPersistenceAfterRetention(t *testing.T) {
+	// Production break caught: a redundant second success write can fail after retention and trigger rollback of the only remaining archive.
+	module, data, _ := newStandaloneBackupModule(t)
+	data.failRepeatedSuccessSave = true
+	if err := module.Backup(context.Background(), standaloneBackupRequest(t), registry.RunContext{TaskID: "tsk_1234567890abcdef12345678", Log: &backupRecorder{}}); err != nil {
+		t.Fatalf("redundant post-retention persistence failed backup: %v", err)
+	}
+	if data.successSaveCalls != 1 || len(data.backups) != 1 || data.backups[0].Status != "success" {
+		t.Fatalf("success persistence calls=%d backups=%+v", data.successSaveCalls, data.backups)
+	}
+	if _, err := os.Stat(data.backups[0].Path); err != nil {
+		t.Fatalf("published archive was removed: %v", err)
 	}
 }
 
@@ -449,15 +613,18 @@ func (f *chmodFailCloseFailSecretContextFile) Close() error {
 }
 
 type backupFakeStore struct {
-	server          store.Server
-	credential      store.Credential
-	credentialErr   error
-	credentialLoads int
-	backups         []store.AppBackup
-	listCalls       int
-	listErr         error
-	saveErrPhase    string
-	saveErrUsed     bool
+	server                  store.Server
+	credential              store.Credential
+	credentialErr           error
+	credentialLoads         int
+	backups                 []store.AppBackup
+	listCalls               int
+	listErr                 error
+	saveErrPhase            string
+	saveErrUsed             bool
+	statusAtDelete          string
+	successSaveCalls        int
+	failRepeatedSuccessSave bool
 }
 
 func newBackupFakeStore(t *testing.T) *backupFakeStore {
@@ -484,6 +651,12 @@ func (s *backupFakeStore) GetBoundCredential(instanceID, purpose string, include
 	return s.credential, nil
 }
 func (s *backupFakeStore) SaveAppBackup(value store.AppBackup) (store.AppBackup, error) {
+	if value.Status == "success" {
+		s.successSaveCalls++
+		if s.failRepeatedSuccessSave && s.successSaveCalls > 1 {
+			return store.AppBackup{}, errors.New("repeated success save failed")
+		}
+	}
 	if !s.saveErrUsed && s.saveErrPhase != "" && strings.Contains(value.Metadata, `"phase":"`+s.saveErrPhase+`"`) {
 		s.saveErrUsed = true
 		return store.AppBackup{}, errors.New("save backup failed")
@@ -503,6 +676,38 @@ func (s *backupFakeStore) ListAppBackupsForInstances(ids []string, includeDelete
 		return nil, s.listErr
 	}
 	return append([]store.AppBackup(nil), s.backups...), nil
+}
+func (s *backupFakeStore) GetAppBackup(id string) (store.AppBackup, error) {
+	for _, backup := range s.backups {
+		if backup.ID == id {
+			return backup, nil
+		}
+	}
+	return store.AppBackup{}, errors.New("backup not found")
+}
+func (s *backupFakeStore) MarkAppBackupDeleted(id string, completedAt time.Time) (store.AppBackup, error) {
+	for index := range s.backups {
+		if s.backups[index].ID != id {
+			continue
+		}
+		s.statusAtDelete = s.newestBackupExcept(id).Status
+		s.backups[index].Status = "deleted"
+		s.backups[index].CompletedAt = completedAt
+		return s.backups[index], nil
+	}
+	return store.AppBackup{}, errors.New("backup not found")
+}
+func (s *backupFakeStore) newestBackupExcept(id string) store.AppBackup {
+	var newest store.AppBackup
+	for _, backup := range s.backups {
+		if backup.ID == id || backup.Status == "deleted" {
+			continue
+		}
+		if newest.ID == "" || backup.CreatedAt.After(newest.CreatedAt) {
+			newest = backup
+		}
+	}
+	return newest
 }
 
 type backupFakeRemote struct {
