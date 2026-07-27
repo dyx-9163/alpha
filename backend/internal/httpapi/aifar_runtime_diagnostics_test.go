@@ -21,9 +21,10 @@ import (
 func TestRuntimeDiagnosticsCreateReturnsTaskAndExportIDs(t *testing.T) {
 	api, db, secret := newAuthzTestAPI(t)
 	release := make(chan struct{})
+	configuredExpiry := time.Now().UTC().Add(2 * time.Hour).Truncate(time.Second)
 	module := &fakeRuntimeDiagnosticsModule{
 		db: db, exportRelease: release,
-		estimate: registry.RuntimeDiagnosticEstimateResult{Allowed: true},
+		estimate: registry.RuntimeDiagnosticEstimateResult{Allowed: true, ExpiresAt: configuredExpiry},
 	}
 	api.apps = registry.New(module)
 	server, instance := seedAIFARRuntimeFixture(t, db, "http://docker.invalid")
@@ -59,6 +60,9 @@ func TestRuntimeDiagnosticsCreateReturnsTaskAndExportIDs(t *testing.T) {
 	}
 	if len(export.Services) != 1 || export.Services[0] != "permission" || !export.SinceAt.Equal(now.Add(-2*time.Hour)) || !export.UntilAt.Equal(now.Add(-time.Hour)) {
 		t.Fatalf("unexpected export selection: %+v", export)
+	}
+	if !export.ExpiresAt.Equal(configuredExpiry) {
+		t.Fatalf("pending export expiry = %s, want configured estimate expiry %s", export.ExpiresAt, configuredExpiry)
 	}
 
 	task, _, err := db.GetTask(response.TaskID)
@@ -782,7 +786,11 @@ func (m *fakeRuntimeDiagnosticsModule) EstimateRuntimeDiagnostics(_ context.Cont
 	m.mu.Lock()
 	m.estimateRequest = req
 	m.mu.Unlock()
-	return m.estimate, nil
+	result := m.estimate
+	if result.ExpiresAt.IsZero() {
+		result.ExpiresAt = time.Now().UTC().Add(24 * time.Hour)
+	}
+	return result, nil
 }
 func (m *fakeRuntimeDiagnosticsModule) ExportRuntimeDiagnostics(ctx context.Context, _ registry.RuntimeDiagnosticRequest, _ registry.RunContext) error {
 	if m.exportRelease != nil {

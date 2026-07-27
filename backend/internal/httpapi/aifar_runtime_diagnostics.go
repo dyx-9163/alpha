@@ -23,7 +23,6 @@ import (
 
 const (
 	runtimeDiagnosticEstimateTimeout       = 30 * time.Second
-	runtimeDiagnosticRetention             = 24 * time.Hour
 	runtimeDiagnosticMaxArchiveBytes       = int64(256 << 20)
 	runtimeDiagnosticLegacyMaxArchiveBytes = int64(1 << 30)
 	runtimeDiagnosticLockHeartbeat         = 30 * time.Second
@@ -152,6 +151,10 @@ func (a *aifarRuntimeController) createDiagnosticExport(w http.ResponseWriter, r
 	}
 
 	now := time.Now().UTC()
+	if !estimate.ExpiresAt.After(now) {
+		writeError(w, http.StatusInternalServerError, "RUNTIME_DIAGNOSTIC_ESTIMATE_FAILED", i18n.Text(lang, "aifar.diag.estimateFailed"), map[string]any{"instanceId": instance.ID})
+		return
+	}
 	exportID := store.NewID("diag")
 	task, err := a.store.CreateTask(store.Task{Type: runtimeDiagnosticExportTaskType, Target: instance.ID, Status: "pending", CreatedBy: actor})
 	if err != nil {
@@ -212,7 +215,7 @@ func (a *aifarRuntimeController) createDiagnosticExport(w http.ResponseWriter, r
 		UntilAt:       untilAt,
 		CreatedBy:     actor,
 		CreatedAt:     now,
-		ExpiresAt:     now.Add(runtimeDiagnosticRetention),
+		ExpiresAt:     estimate.ExpiresAt,
 		CleanupStatus: "none",
 	})
 	if err != nil {

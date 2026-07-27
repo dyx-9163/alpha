@@ -173,11 +173,6 @@ func (s Service) EstimateRuntimeDiagnostics(ctx context.Context, req RuntimeDiag
 	if err != nil {
 		return registry.RuntimeDiagnosticEstimateResult{}, errors.New(i18n.Text(req.Language, "aifar.diag.protocolInvalid"))
 	}
-	if err := s.cleanupExpiredLocalDiagnosticArchives(ctx, diagnostics, time.Now().UTC(), req.ExportID); err != nil {
-		return registry.RuntimeDiagnosticEstimateResult{}, &registry.RuntimeDiagnosticError{
-			Code: "RUNTIME_DIAGNOSTIC_LOCAL_COMMIT_FAILED", Message: i18n.Text(req.Language, "aifar.diag.localDiskFailed"),
-		}
-	}
 	stats, err := s.archives.Stats(ctx)
 	if err != nil {
 		return registry.RuntimeDiagnosticEstimateResult{}, &registry.RuntimeDiagnosticError{
@@ -196,8 +191,9 @@ func (s Service) EstimateRuntimeDiagnostics(ctx context.Context, req RuntimeDiag
 	estimate.LocalReservedBytes = stats.ReservedBytes
 	estimate.LocalQuotaBytes = stats.QuotaBytes
 	estimate.ExpiresAt = time.Now().UTC().Add(s.archives.Retention())
-	projectedQuota := stats.ReadyBytes + stats.ReservedBytes + runtimeDiagnosticMaxArchive
-	projectedHeadroom := stats.RootAvailableBytes - runtimeDiagnosticMaxArchive
+	projectedReadyBytes := stats.ReadyBytes - min(stats.ReadyBytes, stats.ExpiredReadyBytes)
+	projectedQuota := projectedReadyBytes + stats.ReservedBytes + runtimeDiagnosticMaxArchive
+	projectedHeadroom := stats.RootAvailableBytes + stats.ExpiredReadyBytes - runtimeDiagnosticMaxArchive
 	if estimate.BlockReason == "" && projectedQuota > stats.QuotaBytes {
 		estimate.BlockReason = "local-quota-exceeded"
 	}
@@ -417,6 +413,13 @@ func (s Service) ExportRuntimeDiagnostics(ctx context.Context, req RuntimeDiagno
 	}
 	if !estimate.Allowed {
 		return fail(runtimeDiagnosticEstimateBlockError(req.Language, estimate.BlockReason))
+	}
+	if err = s.cleanupExpiredLocalDiagnosticArchives(exportCtx, diagnostics, time.Now().UTC(), exportRecord.ID); err != nil {
+		return fail(errors.New(i18n.Text(req.Language, "aifar.diag.localDiskFailed")))
+	}
+	stats, statsErr = s.archives.Stats(exportCtx)
+	if statsErr != nil || stats.RootAvailableBytes < runtimeDiagnosticMaxArchive+runtimeDiagnosticFilesystemMargin {
+		return fail(errors.New(i18n.Text(req.Language, "aifar.diag.localDiskInsufficient")))
 	}
 	if _, err = diagnostics.ReserveDiagnosticExportBytes(exportRecord.ID, runtimeDiagnosticMaxArchive, stats.QuotaBytes); err != nil {
 		if errors.Is(err, store.ErrDiagnosticExportQuotaExceeded) {

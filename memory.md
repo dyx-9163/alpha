@@ -696,6 +696,8 @@
 - 结论：若业务代码使用 `@FeignClient(name/value="服务名")` 且未配置固定 `url`，Feign 会经 Spring Cloud LoadBalancer/DiscoveryClient 从 Nacos 获取同名服务实例，再直接请求选中的 agent-proxy 地址；因此当前 Nacos 是服务寻址和实例上下线来源，agent 是服务器级流量入口，Feign 承担客户端调用。当前部署仓库不包含业务 Java 源码，无法仅从本仓库确认每个 FeignClient 是否存在固定 URL 覆盖，需在业务源码或 Nacos YAML 中核对。
 - 问题：用户确认是否可以把 Nacos 作为业务集群负载方案。
 - 结论：可以把 Nacos 作为服务间集群负载体系的服务发现基础，但不能表述为 Nacos 自己转发或均衡流量；实际跨服务器实例选择由 Feign 配套的 Spring Cloud LoadBalancer 完成，服务器内部容器副本选择由 aifar-agent 完成。该方案适用于无状态后端服务，不替代浏览器外部入口负载均衡、跨节点部署编排、状态数据集群或端到端健康门禁。
+- 问题：用户要求在不修改 aifar-agent、且不执行离线打包的前提下，为 AIFAR Runtime 微服务实现可筛选、可估算、可下载和可清理的诊断日志导出。
+- 结论：隔离分支 `codex/runtime-diagnostic-export` 已完成 SQLite 生命周期、受控 Bash 归档、二进制 SSH 下载、鉴权 HTTP API、24 小时重启安全清理和 Runtime 日志页导出面板；最终加固会回收终态/缺失任务的中断归档，以完整容器 ID 复验标签后采集，并让诊断任务仅由现有实时事件刷新而不启动轮询。后端全测、前端 219 项测试、前后端构建和差异检查通过；未修改 aifar-agent、未打包、未推送、未做真实 openEuler 验收。Windows race 检测受 CGO 限制，脚本门禁仍有一个既有 Keepalived SHA256SUMS CRLF/LF 断言失败。
 - 问题：用户询问当前 Feign 在多个 Nacos 服务实例之间采用轮询还是其他负载逻辑。
 - 结论：已检查当前 Runtime 离线 JAR：后端服务包含 Spring Cloud OpenFeign 4.1.3、Spring Cloud LoadBalancer 4.1.4 和 Spring Cloud Alibaba Nacos Discovery 2023.0.1.2，未包含 Ribbon；业务服务自身 classes 未发现自定义 LoadBalancer，内置 YAML 也未启用 `spring.cloud.loadbalancer.nacos.enabled=true`，因此按仓库可见配置，Feign 默认使用 `RoundRobinLoadBalancer` 对 Nacos返回的服务器代理实例做按调用方进程独立计数的轮询。若现场 Nacos YAML 启用该开关，则改用 NacosLoadBalancer，先偏好同 clusterName 实例并按 Nacos weight 随机选择；网关 JAR另有自定义 MyLoadBalancer，不能据此推断普通后端 Feign。最终现场算法仍应核对实际发布的 Nacos配置和启动条件报告。
 - 问题：用户询问 Kubernetes 多服务器集群是否等同于当前 agent-proxy 思路，即把多台服务器的多个 ClusterIP 注册给 Nacos。
@@ -854,3 +856,72 @@
 - 结论：主导出脚本和文件日志 helper 的 `run_limited` 均改用 work 目录内受控 marker 传递限额建立失败，业务命令运行前删除 marker；只有 marker 存留才设置 `LIMIT_SETUP_FAILED=1` 并进入 critical，业务命令任意非零退出码均按对应 warning 继续。业务 exit 70 与模拟 ulimit 失败的确定性回归测试、focused、aifar 包、export 语法和差异检查通过。
 - 问题：用户要求删除没有推送到远端的本地分支。
 - 结论：刷新 origin 后删除了 9 个无同名远端引用的本地分支及其 5 个关联工作树：两个 status-collector 备份分支、docker-engine-stats-api、keepalived-direct-unit、keepalived-managed-startup、两个 latest 快照、prelaunch-credential-rotation、runtime-diagnostic-export。4 个脏工作树原有的独有 `memory.md` 记录已先并入主工作区；Windows 残留目录使用经精确根路径和内部 pnpm junction 目标校验的扩展路径逐层删除。删除后迟到生成且不属于原分支 tip 的诊断测试文件已按 blob `7cab5822` 保存在忽略目录 `.tmp/recovered-runtime-diagnostic-export-20260727-0844`，未丢弃。当前分支、main 和 3 个仍有 origin 同名引用的功能分支保留，未删除任何远端分支。
+- 问题：用户询问当前平台最简单的 MySQL 单体与 InnoDB Cluster 备份、还原方案。
+- 结论：当前已有 `app_backups`、`app_clusters`、`operation_locks` 和 worker/task/audit 底座，但 MySQL 模块尚无 backup/restore 生命周期；各 MySQL 节点已随安装包部署 mysqlsh。首版建议单体和集群统一使用 MySQL Shell 逻辑备份，单体从本机导出，集群先探测 ONLINE PRIMARY 并从 PRIMARY 导出；还原统一进入维护窗口、校验 manifest 后导入空目标，集群则先恢复一个种子节点再用 clone 重建其余成员。待确认用户是否接受还原期间停业务。
+- 问题：用户追问 InnoDB Cluster 的具体备份还原操作方式。
+- 结论：集群只生成一份 cluster-level 逻辑备份，首版从当前 ONLINE PRIMARY 执行一致性 dump。若集群健康且只恢复业务 schema，则先停业务写入，在 PRIMARY 删除或清空目标 schema 后执行 `util.loadDump`，保持 binlog 开启，让 Group Replication 将恢复事务同步到 SECONDARY，禁止在三个成员上重复导入。若整个集群需要灾难重建，则恢复一个干净种子节点、创建新的 InnoDB Cluster，再以 clone 方式覆盖并加入其余成员，最后校验三节点 ONLINE 和 Router 读写；`rebootClusterFromCompleteOutage` 仅适合成员数据仍在且可依据 GTID 选出最新节点的停机恢复，不替代从备份恢复。
+- 问题：用户要求给出可落到当前平台的 MySQL 单体与 InnoDB Cluster 具体备份还原方案。
+- 结论：推荐首版统一采用 mysqlsh 逻辑全量备份，在线备份、维护窗口还原，不做物理备份、增量或 PITR。数据库节点只作为临时 dump 执行点，产物打包校验后通过新增的 SFTP Download 流式保存到面板 `AIFAR_MYSQL_BACKUP_DIR`（生产建议外部挂载盘），恢复时复用现有 Upload 反向上传。显式排除系统 schema、`mysql_innodb_cluster_metadata` 和用户账号；单体直接一致性 dump/load，健康集群只在 PRIMARY dump/load 并保持 binlog，让 Group Replication 同步，灾难集群恢复一个干净 seed 后 createCluster、clone 其余成员并重新 bootstrap Router。恢复必须临时开启并最终恢复 `local_infile`，健康目标先强制创建 pre-restore 备份；失败后保持维护模式且不自动掩盖部分导入。
+- 问题：用户确认 MySQL 单体与 InnoDB Cluster 备份还原设计符合预期。
+- 结论：正式设计已写入 `docs/superpowers/specs/2026-07-27-mysql-backup-restore-design.md` 并以提交 `c8c3d426` 保存。自审补充了目标在 finally 阶段不可达时的 `local_infile` 待调和门禁，明确未调和前阻止后续生命周期操作；文档 487 行、代码围栏成对、无 TBD/TODO、源码引用路径和 `git diff --check` 均通过。尚未开始实施，下一步等待用户复核设计文档后编写实施计划。
+- 问题：用户确认书面设计无误，要求进入 MySQL 单体与 InnoDB Cluster 备份还原的实施准备。
+- 结论：逐任务实施计划已写入 `docs/superpowers/plans/2026-07-27-mysql-backup-restore.md`，按配置与 Store、受控仓库、SSH 下载、registry、MySQL 安全脚本、单体备份/还原、集群备份/健康恢复、灾难重建、前端与验收拆为 12 个任务和 124 个检查项；计划只复用现有 `app_backups`、凭据绑定、集群记录、operation lock、worker 与审计，不新增备份表，尚未修改业务代码或执行真实 MySQL 验收。
+- 问题：用户选择以子任务驱动方式执行 MySQL 备份还原实施计划。
+- 结论：当前位于普通仓库检出而非 linked worktree，分支为 `codex/status-collector-realtime`，仅 `memory.md` 有未提交变更；子任务驱动流程要求先取得用户同意创建隔离 worktree，尚未开始 Task 1 或修改业务代码。
+- 问题：用户允许为 MySQL 备份还原计划创建隔离 worktree。
+- 结论：已从 `5271a18a` 创建 `D:\workspace\aifar-deployment\.worktrees\mysql-backup-restore` 和分支 `codex/mysql-backup-restore`，并建立计划专属 SDD 账本。实施前扫描发现计划对请求级 `keepLast` 是否允许覆盖配置、以及同步删除是否改写备份创建 task ID 存在两处冲突，Task 1 尚未开始，等待一次性裁定。
+- 问题：用户确认 `keepLast` 允许覆盖默认值且同步删除保留创建 task ID，并启动子任务驱动实施。
+- 结论：已在隔离分支提交计划裁定 `ef0533a4`；Task 1 以 `9a29b568`、`f8869bc8` 完成配置、备份记录和绑定凭据查询并通过修复复审。Task 2 已提交 `afeeb25a`、`30ebfea9`、`1ea020ac`，完成受控仓库及两轮竞态加固，但审查把威胁模型扩展到恶意同 UID 并发写入者后出现 Linux 语义阻断：通用 VFS 无条件 inode-bound unlink/rmdir，也无法撤销既有可写 fd。Task 2 暂停等待选择专用 broker、受信单写者锁，或文件系统特定强制能力；Task 3 尚未开始。
+- 问题：复核 MySQL 备份还原 Task 1 第一轮修复的两项审查意见。
+- 结论：`SaveAppBackup` 已拒绝对终态记录执行通用 deleted 转换或改写，删除继续由 `MarkAppBackupDeleted` 保留来源字段；`GetBoundCredential` 已返回绑定行的 purpose。对应 store 回归测试与两条 focused/store 测试命令已在报告中记录为通过；未重跑测试。
+- 问题：用户要求把 Runtime 微服务诊断日志导出功能合并到当前 `codex/status-collector-realtime` 分支。
+- 结论：已以双亲合并提交 `46f5dc87` 合入 `codex/runtime-diagnostic-export`；手工解决后端 i18n、前端 Runtime API 及测试 3 处冲突，保留当前分支的发布记录删除/全部重启能力并加入诊断估算、导出、下载、删除能力。合并后后端全量测试、前端 26 文件/228 项测试、前后端构建和差异检查通过；一次采集器并发时序测试在高负载下偶发失败，单测连续 5 次及后端全集复跑通过。未推送、未离线打包，`memory.md` 保持未提交。
+- 问题：用户询问 Runtime 日志诊断导出是否依赖或需要升级 `aifar-agent`。
+- 结论：不需要升级 `aifar-agent`。诊断估算、归档生成、流式下载与删除由面板后端通过目标服务器既有 SSH 凭据直接执行受控脚本和读取文件；接口只限定实例为 `agent-runtime-v2`，但调用时不要求 agent 正在运行。归档会把 `systemctl status aifar-agent` 作为一项诊断信息收集，失败只记录 warning，不参与执行通道；合并提交未修改 `backend/cmd/aifar-agent`、`internal/runtimeagent` 或 `internal/agentdist`。
+- 问题：用户要求在目标 openEuler 服务器上现场验证 Runtime 日志诊断导出是否正确。
+- 结论：使用临时内存凭据完成真实 SSH 验收且未落盘。目标存在 10 个日志模块与 10 个健康容器，Runtime/agent 正常、磁盘余量约 9.1GB。近期窗口验证容器日志、归档、manifest、SHA256、流式下载和远端清理正常；历史窗口对 oauth/message 验证获得 7 个文件日志、2 个容器日志，归档约 230KB、解压约 13.6MB、19 条 manifest 文件记录，凭据未进入归档，测试归档全部删除。发现当前文件日志语义不完全符合精确时间窗口：活跃文件因 mtime 晚于 until 会被排除，且合法的日期轮转文件名被 allowlist 以 `file-name-rejected` 拒绝 14 次；Docker 日志仍按 since/until 精确采集。临时 live test 已删除，工作区仍仅 `memory.md` 未提交。
+- 问题：用户询问诊断导出读取 Docker 运行时日志还是宿主机挂载日志。
+- 结论：当前会同时采集两份来源：从 `$INSTALL_ROOT/runtime/logs/<service>` 读取宿主机挂载的文件日志并归入 `file-logs/`；另按 instance/service 标签定位容器，执行 `docker logs --since/--until --timestamps` 并归入 `container-logs/`。估算阶段读取 Docker `.LogPath` 仅用于保守估算容量，正式归档不直接复制 Docker JSON 日志文件。
+- 问题：用户指出诊断导出不应默认采集 Docker stdout/stderr，应以宿主机挂载日志为准。
+- 结论：当前 AIFAR Runtime 明确把每个服务宿主机日志目录同时挂载到 `/opt/aifar/logs`，Java 服务还挂载到其应用日志路径，因此宿主机 `$INSTALL_ROOT/runtime/logs/<service>` 是本部署架构的权威业务日志源；Docker logs 可能只含启动/控制台输出并与文件日志重复。建议默认只导出挂载日志，容器状态/inspect/health 仍作为诊断信息保留；是否彻底移除容器日志或改为默认关闭的高级选项，等待用户裁定。文件日志 mtime 时间窗与合法日期轮转名问题仍需同步修复。
+- 问题：用户明确裁定诊断导出只导出宿主机挂载日志。
+- 结论：设计范围确定为从导出和容量估算中完全移除 Docker stdout/stderr 日志及 `container-logs/`，不提供高级开关；容器列表、镜像、健康状态等非日志诊断继续保留。下一项待确认是宿主机文件日志应按日志行时间精确截取，还是按文件选择后整文件导出；当前 mtime 双边窗口会漏掉持续写入的活跃日志，不能原样保留。
+- 问题：用户确认宿主机挂载日志按每一行的日志时间精确截取。
+- 结论：精确截取应以“日志记录块”为单位而不是机械逐行：识别 Spring/ISO/JSON 等带时间戳的首行，后续无时间戳的异常堆栈和续行跟随所属首行一起保留或排除，防止堆栈断裂。仍需裁定完全无法识别时间戳的文件或孤立行是跳过并写 warning，还是整文件纳入；精确时间语义推荐前者。
+- 问题：用户确认无法识别时间戳的日志内容跳过并在归档中记录 warning。
+- 结论：时间过滤采用 fail-closed：无法识别首条记录时间、无前置记录可归属的孤立续行、或整文件无可解析时间戳时不进入归档，并记录不含原文和路径细节的稳定 warning；可识别时间戳记录的多行堆栈仍按记录块保留。下一项待确认无时区时间戳按目标实例配置时区解释；尝试刷新目标样本时 SSH 连接超时，未执行远端操作。
+- 问题：用户确认不带时区的宿主机日志时间戳按照目标服务器时区解析。
+- 结论：过滤时无偏移时间戳使用远端服务器时区，带 `Z` 或显式 offset 的时间戳按自身偏移换算后与 since/until 比较；服务器时区应在任务开始时固定读取并写入 manifest，避免执行期间时区变化造成歧义。实现方案进入比较阶段，推荐复用远端已有 awk 的流式记录块解析，不引入 agent 更新、额外常驻二进制或整文件回传。
+- 问题：用户选择远端 awk 流式解析方案，并要求明确最大导出量与大日志耗时。
+- 结论：当前硬限制为过滤脱敏后的未压缩归档内容最多 3 GiB、最终 `.tar.gz` 最多 1 GiB，估算接口 30 秒超时，导出 worker 无固定总超时但可取消；容量门禁还要求远端可用空间大于预计数据量 + 1 GiB + max(512 MiB, 20%)，3 GiB 上限场景约需 4.6 GiB 可用空间。目标机实测 13.6 MiB 未压缩内容完成解析、脱敏、压缩、SHA、下载校验与清理约 10 秒；设计应在 UI 展示保守时间区间而非单点承诺，暂定 100 MiB 约 1-3 分钟、500 MiB 约 5-12 分钟、1 GiB 约 10-25 分钟、3 GiB 约 30-75 分钟，并在实现后用目标机大样本重新校准。还应保留单文件 1 GiB 和总输出 3 GiB 的 fail-closed 门禁，避免超大活跃文件造成无界扫描。
+- 问题：用户认为大日志按现方案过慢，要求快速导出并把最终日志文件存储在 `aifar-server` 工具所在机器。
+- 结论：推荐改为远端单遍过滤与脱敏、SSH 流式输出、面板本地 `.partial` 写入并同步计算 SHA256、成功后原子改名并登记 SQLite；最终归档及下载均来自 `aifar-server` 本地受控目录（拟新增 `AIFAR_DIAGNOSTIC_EXPORT_DIR`，默认数据库同级 `diagnostic-exports`），目标机不保留最终归档。现有 SSH adapter 已有带取消、限界 stderr 和 `io.Copy` 的流式基础，只需增加受控命令 stdout 流接口。为兼顾速度与 tar 文件结构，建议目标机只暂存过滤后的安全内容，随即 `tar -czf -` 流到面板并在 finally 清理；若要求目标机完全零暂存，则需更复杂的安全分帧协议。
+- 问题：用户允许目标机在导出任务期间暂存已过滤、脱敏后的日志，以换取稳定性和速度。
+- 结论：最终架构允许目标机仅保存受控临时过滤目录，不保存原始副本或最终归档；过滤完成后由 `tar -czf -` 直接流向 `aifar-server`，无论成功、失败或取消都清理临时目录和 `.partial`。下一项待裁定快速模式的单次过滤后容量、压缩包容量和总执行超时；推荐 500 MiB 未压缩、256 MiB 压缩、15 分钟硬超时，超限时提示按服务或时间窗口拆分。
+- 问题：用户选择日志诊断导出的快速档限制。
+- 结论：单次任务固定为过滤脱敏后内容最多 500 MiB、最终 `.tar.gz` 最多 256 MiB、总执行硬超时 15 分钟；任一限制触发时终止流、删除目标临时目录和面板 `.partial`，记录稳定错误并提示按服务或时间窗口拆分，不提供均衡或大容量档。下一项待确认 `aifar-server` 本地归档保留期限和全局磁盘配额。
+- 问题：用户选择 `aifar-server` 本地日志归档保留策略。
+- 结论：最终归档保留 24 小时，全局硬配额 5 GiB；清理器只自动删除已到期归档和遗留 `.partial`，清理后仍不足则拒绝新导出，不静默删除未到期归档。配置将提供本地受控目录、24 小时 retention 和 5 GiB quota 默认值，完整设计进入逐段确认。
+- 问题：用户确认快速日志导出的数据流与存储设计。
+- 结论：已确认目标机只处理宿主机挂载日志，远端按服务器时区精确过滤并脱敏到临时目录，随后 `tar.gz` 经 SSH 流式写入 `aifar-server` 本地 `.partial`，同步校验大小和 SHA256 后原子提升；最终归档、列表、下载、删除和 24 小时清理均在面板侧完成，目标临时目录无论结果都清理，不依赖 agent 更新。下一段确认支持的时间戳格式、记录块边界和 warning/failure 语义。
+- 问题：用户确认精确过滤和异常处理设计。
+- 结论：支持 Spring/Java、ISO 8601、JSON 常见时间字段、Nginx access/error 时间戳，区间采用 `[since, until)`；异常堆栈等明确续行跟随首行，普通无时间戳行 fail-closed 跳过并按文件聚合 warning；允许常见日期轮转 `.log`，拒绝 `.idx`、隐藏/配置/数据库/敏感文件和软链接；活跃文件固定打开时 inode 与初始大小。无匹配日志可生成带 manifest/warning 的有效归档，只有 SSH、安全路径、容量/超时、流、SHA/大小/原子落盘等关键失败才使任务失败。下一段确认 UI/API、进度、面板磁盘门禁与兼容策略。
+- 问题：用户选择受信单写者威胁模型 B 后继续实施 MySQL 备份还原，并在 Task 4 开始后要求暂停。
+- 结论：Task 2 已按面板专属仓库、进程互斥和跨进程锁模型完成；Task 3 以提交 `8846c8c4`、`b13f5d65` 完成受控 SSH 下载，独立复审和主控测试通过，真实 openEuler SSH 验收待 Task 12。Task 4 已中断，仅留下未跟踪的 `backend/internal/apps/registry/registry_test.go` RED 测试，无生产实现和提交；恢复时从 Task 4 RED 阶段继续。
+- 问题：用户完成并确认 Runtime 宿主机日志快速导出全部设计章节，要求继续固化设计。
+- 结论：正式设计已写入 `docs/superpowers/specs/2026-07-27-aifar-runtime-fast-local-log-export-design.md` 并以提交 `72cf63fb` 独立提交；设计明确只采集宿主机挂载日志、按服务器时区和 `[since, until)` 逐记录过滤、未知时间戳跳过并写 warning、远端临时过滤后通过 SSH 直传到 `aifar-server` 本地存储，采用 1 GiB 单文件/2 GiB 总扫描/500 MiB 过滤内容/256 MiB 归档/15 分钟快速档，保留 24 小时和 5 GiB 全局配额，不更新 `aifar-agent`、不执行离线打包。下一步等待用户审阅设计后再编写实施计划。
+- 问题：用户恢复 MySQL 备份还原实施，Task 4 完成后 Task 5 遇到稳定凭据错误码缺失。
+- 结论：Task 4 以 `0220913f`、`d9bb49d8` 完成可选 registry backup/restore 契约和严格单对象 JSON 解码，独立复审及主控 `httpapi/registry/mysql` 测试通过，保留一个 Clone 仅深拷贝 JSON 形态的 deferred minor。Task 5 brief 要求凭据错误码，但设计第 15 节及现有 MySQL 包均未定义；实现尚未开始、无文件和提交，等待确定精确公开错误码及适用条件。
+- 问题：用户批准 Runtime 宿主机日志快速导出设计并要求继续进入实施准备。
+- 结论：实施计划已写入 `docs/superpowers/plans/2026-07-27-aifar-runtime-fast-local-log-export.md` 并以提交 `7bc5b490` 独立提交；计划拆为配置、Store 迁移与配额预留、本地安全归档仓库、SSH 命令流、宿主机日志时间过滤脚本、导出编排、清理兼容、HTTP、前端和验收 10 个 TDD 任务，共 70 个步骤。执行时禁止 Docker 运行时日志、aifar-agent 更新、离线打包和推送，并保留旧远端归档兼容。
+- 问题：用户同意新增 `MYSQL_CREDENTIAL_UNAVAILABLE` 后继续 MySQL 备份还原，并在 Task 5 第一轮安全修复中要求暂停。
+- 结论：错误码已写入设计/计划并提交 `94f14d8c`；Task 5 初始实现提交 `c7fe0d62` 后审查发现 1 Critical、6 Important。第一轮修复已完成 manifest canonical RED/GREEN 和恶意模板 override RED，当前保留 6 个已修改文件及未跟踪的 `backup_scripts_linux_test.go`，尚未完成 Linux 行为/full regression、修复报告、提交和复审；恢复时从 Task 5 fix round 1 的脚本描述符行为测试继续。
+
+## 2026-07-28
+- 问题：完成 AIFAR Runtime 宿主机挂载日志快速导出，并将最终归档保存在 `aifar-server` 本机。
+- 结论：功能已按设计落地：仅采集宿主机挂载日志，按服务器时区和 `[since, until)` 逐记录过滤，未知时间戳跳过并写 warning；目标机只保留任务期临时过滤目录，归档经 SSH 流式写入面板本机并受 256 MiB、15 分钟、24 小时和 5 GiB 配额控制。历史远端归档仍兼容下载/删除，容量估算不会在过期归档实际清理前提前回收配额；无需更新 `aifar-agent`。
+- 结论：后端全量测试、前端 230 项测试、脚本 291 项测试、Web 构建和 Linux/Windows 后端构建通过；Windows 本机缺少 CGO/GCC，`go test -race` 留给 Linux CI。未执行离线打包，未推送。
+- 问题：收口 Runtime 本地日志归档安全复审和生命周期一致性。
+- 结论：宿主机源日志打开后固定使用文件描述符读取，归档解压校验受 context、500 MiB 上限和协议字节数约束，本地下载精确复制声明字节；估算只投影可回收过期容量且不改状态，导出 worker 在预留前加锁清理并重新统计，所有 pending/failed/ready 记录沿用配置 retention。相关后端全集、前端 230 项、脚本 291 项及双端构建通过。
+- 问题：现场诊断 Runtime 宿主机日志导出在 stream-local-archive 阶段失败。
+- 结论：目标机磁盘、SSH、必需命令和估算正常；使用相同服务与时间窗口复现得到 xargs 123。根因是过滤器在正常文件没有 warning 时不创建 warning TSV，而 helper 无条件读取该文件并因 `No such file or directory` 退出。最小修复应在运行 gawk 前创建空 warning 文件，并增加无 warning 日志的 Linux 行为回归；本轮只读诊断未修改业务代码或服务。

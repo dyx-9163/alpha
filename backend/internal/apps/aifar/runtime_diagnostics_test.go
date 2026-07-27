@@ -412,7 +412,7 @@ func TestEstimateRuntimeDiagnosticsCombinesRemoteMetadataAndLocalCapacity(t *tes
 	}
 }
 
-func TestEstimateRuntimeDiagnosticsReclaimsExpiredArchiveOnlyAfterSuccessfulCleanup(t *testing.T) {
+func TestEstimateRuntimeDiagnosticsProjectsExpiredArchiveWithoutMutation(t *testing.T) {
 	now := time.Now().UTC()
 	db, instance, server, _ := runtimeDiagnosticFixture(now)
 	root := t.TempDir()
@@ -446,11 +446,11 @@ func TestEstimateRuntimeDiagnosticsReclaimsExpiredArchiveOnlyAfterSuccessfulClea
 	if !estimate.Allowed || estimate.BlockReason != "" {
 		t.Fatalf("successfully deleted expired archive was not reclaimed: %+v", estimate)
 	}
-	if got := db.exports["diag-expired-local"]; got.Status != "deleted" || got.CleanupStatus != "complete" {
-		t.Fatalf("expired archive cleanup was not recorded: %+v", got)
+	if got := db.exports["diag-expired-local"]; got.Status != "ready" || got.CleanupStatus != "" {
+		t.Fatalf("estimate mutated expired archive state: %+v", got)
 	}
-	if _, err := os.Stat(absolutePath); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("expired archive remained after successful cleanup: %v", err)
+	if _, err := os.Stat(absolutePath); err != nil {
+		t.Fatalf("estimate removed expired archive: %v", err)
 	}
 }
 
@@ -501,7 +501,22 @@ func TestExportRuntimeDiagnosticsStreamsIntoLocalStorage(t *testing.T) {
 		}, "\n"),
 		commandStream: append([]byte(fmt.Sprintf("AIFAR_DIAG_STREAM_V1\t%s\t10\t1\tAsia/Shanghai\n", archiveName)), archive...),
 	}
-	archives := NewRuntimeDiagnosticArchiveStorage(t.TempDir(), 5<<30, runtimeDiagnosticRetention, db)
+	root := t.TempDir()
+	expiredArchiveName := "aifar-diagnostics-expired-20260727T080000Z.tar.gz"
+	expiredRelativePath := path.Join("diag-expired-before-export", expiredArchiveName)
+	expiredAbsolutePath := filepath.Join(root, filepath.FromSlash(expiredRelativePath))
+	if err := os.MkdirAll(filepath.Dir(expiredAbsolutePath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(expiredAbsolutePath, []byte("expired"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	db.exports["diag-expired-before-export"] = store.DiagnosticExport{
+		ID: "diag-expired-before-export", InstanceID: instance.ID, ServerID: server.ID,
+		Status: "ready", StorageKind: "local", ArchiveBytes: 900 << 20,
+		StorageRelativePath: expiredRelativePath, ArchiveName: expiredArchiveName, ExpiresAt: now.Add(-time.Minute),
+	}
+	archives := NewRuntimeDiagnosticArchiveStorage(root, 1<<30, runtimeDiagnosticRetention, db)
 	log := &recordingStepLogger{}
 	if err := NewServiceWithDiagnosticStorage(db, remote, archives).ExportRuntimeDiagnostics(context.Background(), RuntimeDiagnosticRequest{
 		ExportID: export.ID, Instance: instance, Server: server, Language: "en", Actor: "owner",
@@ -517,6 +532,12 @@ func TestExportRuntimeDiagnosticsStreamsIntoLocalStorage(t *testing.T) {
 	}
 	if got.ArchiveBytes != int64(len(archive)) || got.WarningCount != 1 || got.ReservedBytes != 0 {
 		t.Fatalf("unexpected local archive metadata: %+v", got)
+	}
+	if expired := db.exports["diag-expired-before-export"]; expired.Status != "deleted" || expired.CleanupStatus != "complete" {
+		t.Fatalf("export did not record expired archive cleanup before reservation: %+v", expired)
+	}
+	if _, err := os.Stat(expiredAbsolutePath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("export did not remove expired archive before reservation: %v", err)
 	}
 	if remote.commandStreamCalls != 1 || remote.streamCalls != 0 {
 		t.Fatalf("unexpected stream calls: command=%d file=%d", remote.commandStreamCalls, remote.streamCalls)
@@ -1513,7 +1534,7 @@ func TestRuntimeDiagnosticExportRejectsFinalDirectoryCreatedDuringPromotion(t *t
 	}
 }
 
-func TestRuntimeDiagnosticExportRejectsSourceSwappedToSymlinkBeforeRead(t *testing.T) {
+func TestRuntimeDiagnosticExportRejectsSourceSwappedToSymlinkBeforeOpen(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("Git for Windows sh cannot apply the numeric snapshot ulimit; exercised on Linux")
 	}
@@ -1526,40 +1547,94 @@ func TestRuntimeDiagnosticExportRejectsSourceSwappedToSymlinkBeforeRead(t *testi
 	if err := os.WriteFile(secretPath, []byte("TOP_SECRET_PAYLOAD"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	realBash := runtimeDiagnosticRealShellCommand(t, fixture.sh, "bash")
+	writeRuntimeDiagnosticShellCommand(t, fixture.binNative, "bash", strings.Join([]string{
+		`if [ "$#" -ge 4 ]; then`,
+		`  case "$1:$4" in *filter-one-log.sh:*swap.log) rm -f -- "$4"; ln -s "$AIFAR_SECRET_PATH" "$4" ;; esac`,
+		`fi`,
+		`exec "$AIFAR_REAL_BASH" "$@"`,
+	}, "\n"))
+	output, err := fixture.run(
+		"AIFAR_REAL_BASH="+realBash,
+		"AIFAR_SECRET_PATH="+runtimeDiagnosticShellPath(secretPath),
+	)
+	if err == nil {
+		t.Fatalf("source swapped before descriptor open was accepted: %s", output)
+	}
+	if bytes.Contains(output, []byte("TOP_SECRET_PAYLOAD")) {
+		t.Fatalf("external symlink content leaked to output: %s", output)
+	}
+}
+
+func TestRuntimeDiagnosticExportUsesOpenedDescriptorAfterSourcePathSwap(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("descriptor path behavior is exercised on Linux")
+	}
+	fixture := newRuntimeDiagnosticExportShellFixture(t)
+	logPath := filepath.Join(fixture.installNative, "runtime", "logs", "gateway", "swap.log")
+	secretPath := filepath.Join(fixture.rootNative, "outside-secret")
+	if err := os.WriteFile(logPath, []byte("safe log\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(secretPath, []byte("TOP_SECRET_PAYLOAD\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	realReadlink := runtimeDiagnosticRealShellCommand(t, fixture.sh, "readlink")
-	realCP := runtimeDiagnosticRealShellCommand(t, fixture.sh, "cp")
 	writeRuntimeDiagnosticShellCommand(t, fixture.binNative, "readlink", strings.Join([]string{
 		`last=""`,
 		`for value do last=$value; done`,
-		`result=$("$AIFAR_REAL_READLINK" "$@")`,
 		`case "$last" in`,
-		`  *swap.log)`,
-		`    count=0`,
-		`    [ ! -f "$AIFAR_READLINK_COUNT" ] || count=$(cat "$AIFAR_READLINK_COUNT")`,
-		`    count=$((count + 1))`,
-		`    printf '%s\n' "$count" > "$AIFAR_READLINK_COUNT"`,
-		`    if [ "$count" -eq 3 ]; then rm -f -- "$last"; ln -s "$AIFAR_SECRET_PATH" "$last"; fi`,
+		`  /proc/self/fd/9|/dev/fd/9)`,
+		`    if [ ! -e "$AIFAR_SWAP_MARKER" ]; then`,
+		`      mv -- "$AIFAR_SWAP_PATH" "$AIFAR_SWAP_PATH.original"`,
+		`      ln -s "$AIFAR_SECRET_PATH" "$AIFAR_SWAP_PATH"`,
+		`      : > "$AIFAR_SWAP_MARKER"`,
+		`    fi`,
 		`    ;;`,
 		`esac`,
-		`printf '%s\n' "$result"`,
-	}, "\n"))
-	writeRuntimeDiagnosticShellCommand(t, fixture.binNative, "cp", strings.Join([]string{
-		`case "$3" in *swap.log) exit 75 ;; esac`,
-		`exec "$AIFAR_REAL_CP" "$@"`,
+		`exec "$AIFAR_REAL_READLINK" "$@"`,
 	}, "\n"))
 	output, err := fixture.run(
 		"AIFAR_REAL_READLINK="+realReadlink,
-		"AIFAR_REAL_CP="+realCP,
-		"AIFAR_READLINK_COUNT="+runtimeDiagnosticShellPath(filepath.Join(fixture.rootNative, "readlink-count")),
+		"AIFAR_SWAP_PATH="+runtimeDiagnosticShellPath(logPath),
 		"AIFAR_SECRET_PATH="+runtimeDiagnosticShellPath(secretPath),
+		"AIFAR_SWAP_MARKER="+runtimeDiagnosticShellPath(filepath.Join(fixture.rootNative, "swap-marker")),
 	)
 	if err != nil {
-		t.Fatalf("source-swap export should skip the changed source, not fail globally: %v: %s", err, output)
+		t.Fatalf("descriptor-bound source export failed after path swap: %v: %s", err, output)
 	}
-	listing := runtimeDiagnosticArchiveList(t, fixture.sh, fixture.archiveNative())
-	if strings.Contains(listing, "swap.log") {
-		content := runtimeDiagnosticArchiveFile(t, fixture.sh, fixture.archiveNative(), fixture.archiveBase+"/services/gateway/file-logs/swap.log")
-		t.Fatalf("source swapped to symlink entered archive with %q", content)
+	entry := fixture.archiveBase + "/services/gateway/file-logs/swap.log.original"
+	content := runtimeDiagnosticArchiveFile(t, fixture.sh, fixture.archiveNative(), entry)
+	if content != "safe log\n" || strings.Contains(content, "TOP_SECRET_PAYLOAD") {
+		t.Fatalf("descriptor snapshot content = %q", content)
+	}
+}
+
+func TestRuntimeDiagnosticExportSucceedsWhenLogHasNoWarnings(t *testing.T) {
+	fixture := newRuntimeDiagnosticExportShellFixture(t)
+	extraEnv := []string{}
+	if runtime.GOOS == "windows" {
+		realAWK := runtimeDiagnosticRealShellCommand(t, fixture.sh, "awk")
+		writeRuntimeDiagnosticShellCommand(t, fixture.binNative, "gawk", `exec "$AIFAR_REAL_AWK" "$@"`)
+		writeRuntimeDiagnosticShellCommand(t, fixture.binNative, "timedatectl", `printf '%s\n' 'Asia/Shanghai'`)
+		extraEnv = append(extraEnv, "AIFAR_REAL_AWK="+realAWK)
+	}
+	logPath := filepath.Join(fixture.installNative, "runtime", "logs", "gateway", "app.log")
+	if err := os.WriteFile(logPath, []byte("2026-07-27T16:00:00Z INFO healthy\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	output, err := fixture.run(extraEnv...)
+	if err != nil {
+		t.Fatalf("warning-free log export failed: %v: %s", err, output)
+	}
+	entry := fixture.archiveBase + "/services/gateway/file-logs/app.log"
+	content := runtimeDiagnosticArchiveFile(t, fixture.sh, fixture.archiveNative(), entry)
+	if content != "2026-07-27T16:00:00Z INFO healthy\n" {
+		t.Fatalf("warning-free log content = %q", content)
+	}
+	errorsText := runtimeDiagnosticArchiveFile(t, fixture.sh, fixture.archiveNative(), fixture.archiveBase+"/collection-errors.txt")
+	if strings.Contains(errorsText, "timestamp-") {
+		t.Fatalf("warning-free log unexpectedly recorded timestamp warning: %s", errorsText)
 	}
 }
 
