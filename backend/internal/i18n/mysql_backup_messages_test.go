@@ -24,6 +24,9 @@ func TestMySQLBackupCatalogContainsEveryTaskStepAndStableErrorMessageInBothLocal
 		"mysql.backup.verify.step.load-backup", "mysql.backup.verify.step.verify-manifest",
 		"mysql.backup.verify.step.verify-checksum", "mysql.backup.verify.step.record-verification",
 	}
+	for _, name := range []string{"load-backup", "acquire-instance-lock", "verify-maintenance-confirmation", "verify-manifest", "verify-checksum", "verify-version", "create-pre-restore-backup", "upload-backup", "extract-backup", "dry-run-load", "capture-local-infile", "enable-local-infile", "drop-target-schemas", "load-dump", "restore-local-infile", "verify-schemas", "verify-data", "record-restore", "cleanup-workdir", "release-lock"} {
+		keys = append(keys, "mysql.restore.step."+name)
+	}
 	stableCodes := []string{
 		"MYSQL_CREDENTIAL_UNAVAILABLE", "MYSQL_BACKUP_UNSUPPORTED_TOPOLOGY",
 		"MYSQL_BACKUP_CLUSTER_UNHEALTHY", "MYSQL_BACKUP_PRIMARY_NOT_FOUND",
@@ -39,7 +42,8 @@ func TestMySQLBackupCatalogContainsEveryTaskStepAndStableErrorMessageInBothLocal
 		"MYSQL_BACKUP_RETENTION_CLEANUP_FAILED",
 		"MYSQL_RESTORE_VERSION_INCOMPATIBLE", "MYSQL_RESTORE_MANIFEST_INVALID",
 		"MYSQL_RESTORE_TARGET_NOT_CLEAN", "MYSQL_RESTORE_PRIMARY_CHANGED",
-		"MYSQL_RESTORE_LOCAL_INFILE_RESTORE_FAILED", "MYSQL_RESTORE_INCOMPLETE",
+		"MYSQL_LOCAL_INFILE_RESTORE_FAILED", "MYSQL_RESTORE_LOCAL_INFILE_RESTORE_FAILED",
+		"MYSQL_RECONCILIATION_REQUIRED", "MYSQL_RESTORE_INCOMPLETE",
 		"MYSQL_REBUILD_CONFIRMATION_REQUIRED", "MYSQL_REBUILD_ROUTER_FAILED",
 	}
 	for _, locale := range []Locale{Zh, En} {

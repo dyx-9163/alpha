@@ -466,7 +466,8 @@ func TestMySQLBackupErrorTextResolvesEveryStableCodeWithoutCredentialDetails(t *
 		MySQLBackupPrimaryNotFound, MySQLBackupSpaceInsufficient, MySQLBackupTransferFailed,
 		MySQLBackupChecksumMismatch, MySQLRestoreMaintenanceRequired, MySQLRestoreVersionIncompatible,
 		MySQLRestoreManifestInvalid, MySQLRestoreTargetNotClean, MySQLRestorePrimaryChanged,
-		MySQLRestoreLocalInfileRestoreFailed, MySQLRestoreIncomplete, MySQLRebuildConfirmationRequired,
+		MySQLLocalInfileRestoreFailed, MySQLRestoreLocalInfileRestoreFailed, MySQLReconciliationRequired,
+		MySQLRestoreIncomplete, MySQLRebuildConfirmationRequired,
 		MySQLRebuildRouterFailed,
 	}
 	for _, code := range stableCodes {

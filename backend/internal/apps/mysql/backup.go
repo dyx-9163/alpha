@@ -242,7 +242,23 @@ func sameBackupPath(left, right string) bool {
 	return leftErr == nil && rightErr == nil && filepath.Clean(leftAbs) == filepath.Clean(rightAbs)
 }
 
-func (s Service) backupStandalone(ctx context.Context, req registry.BackupRequest, run registry.RunContext) (retErr error) {
+type standaloneBackupExecution struct {
+	backupType string
+	recordPlan bool
+	retention  bool
+}
+
+func (s Service) backupStandalone(ctx context.Context, req registry.BackupRequest, run registry.RunContext) error {
+	if err := s.reconcileMySQL(ctx, req.Instance, req.Language); err != nil {
+		return err
+	}
+	return s.backupStandaloneCore(ctx, req, run, standaloneBackupExecution{backupType: "logical-full", recordPlan: true, retention: true})
+}
+
+func (s Service) backupStandaloneCore(ctx context.Context, req registry.BackupRequest, run registry.RunContext, execution standaloneBackupExecution) (retErr error) {
+	if execution.backupType != "logical-full" && execution.backupType != "pre-restore" {
+		return mysqlOperationError(MySQLRestoreManifestInvalid)
+	}
 	data, ok := s.store.(backupStore)
 	if !ok {
 		return errors.New("MySQL backup store is unavailable")
@@ -263,7 +279,7 @@ func (s Service) backupStandalone(ctx context.Context, req registry.BackupReques
 	state := &standaloneBackupState{
 		record: store.AppBackup{
 			ID: backupID, App: "mysql", InstanceID: req.Instance.ID, ServerID: req.Instance.ServerID,
-			BackupType: "logical-full", Status: "pending", TaskID: run.TaskID,
+			BackupType: execution.backupType, Status: "pending", TaskID: run.TaskID,
 			Metadata: backupMetadata(parameters, "pending"), CreatedAt: time.Now().UTC(),
 		},
 		repository: repository, backupStore: data, remote: s.remote,
@@ -274,6 +290,9 @@ func (s Service) backupStandalone(ctx context.Context, req registry.BackupReques
 		return err
 	}
 	recorder, _ := run.Log.(installflow.Recorder)
+	if !execution.recordPlan {
+		recorder = nil
+	}
 	copy := BackupCopyFor(req.Language)
 	targetStarted := false
 	defer func() {
@@ -534,6 +553,9 @@ func (s Service) backupStandalone(ctx context.Context, req registry.BackupReques
 			return err
 		}
 		state.record = saved
+		if !execution.retention {
+			return nil
+		}
 		items, err := data.ListAppBackupsForInstances([]string{req.Instance.ID}, false)
 		if err != nil {
 			if run.Log != nil {

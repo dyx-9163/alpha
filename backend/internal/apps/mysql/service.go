@@ -11,6 +11,7 @@ import (
 
 	"aifar-deployment/backend/internal/apps/deleteflow"
 	mysqlrouter "aifar-deployment/backend/internal/apps/mysqlrouter"
+	"aifar-deployment/backend/internal/apps/registry"
 	"aifar-deployment/backend/internal/installer/installerkit"
 	"aifar-deployment/backend/internal/installflow"
 	"aifar-deployment/backend/internal/store"
@@ -62,8 +63,10 @@ type CheckResult struct {
 }
 
 type Service struct {
-	store  Store
-	remote Remote
+	store              Store
+	remote             Remote
+	localInfileSession localInfileSessionFactory
+	preRestoreBackup   func(context.Context, registry.BackupRequest, registry.RunContext) error
 }
 
 type stepDef = installflow.Step
@@ -81,7 +84,7 @@ type clusterStartNode struct {
 }
 
 func NewService(s Store, remote Remote) Service {
-	return Service{store: s, remote: remote}
+	return Service{store: s, remote: remote, localInfileSession: defaultLocalInfileSessionFactory(remote)}
 }
 
 func (s Service) Install(ctx context.Context, req InstallRequest, resources []store.Resource, log Logger, targetLog targetLogger) error {
@@ -571,6 +574,9 @@ func (s Service) Delete(ctx context.Context, req DeleteRequest, log Logger, targ
 }
 
 func (s Service) Check(ctx context.Context, req CheckRequest, log Logger, targetLog targetLogger) (CheckResult, error) {
+	if err := s.reconcileMySQL(ctx, req.Instance, req.Language); err != nil {
+		return CheckResult{Status: "failed", Message: err.Error()}, err
+	}
 	copy := CheckCopyFor(req.Language)
 	target := req.Instance.ServerID
 	if target == "" {

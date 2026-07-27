@@ -12,6 +12,10 @@ func MySQLBackupErrorText(lang, code string) string {
 	return globali18n.MySQLBackupErrorText(lang, code)
 }
 
+func restoreStepTitle(lang, name string) string {
+	return globali18n.Text(lang, "mysql.restore.step."+name)
+}
+
 type BackupCopy struct {
 	StepStart                string
 	StepDone                 string

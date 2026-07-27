@@ -21,8 +21,93 @@ import (
 const (
 	mysqlBackupTaskType       = "apps.mysql.backup"
 	mysqlBackupVerifyTaskType = "apps.mysql.backup.verify"
+	mysqlRestoreTaskType      = "apps.mysql.restore"
 	mysqlBackupDeleteAction   = "apps.mysql.backup.delete"
 )
+
+func (a *API) startMySQLRestore(w http.ResponseWriter, r *http.Request) {
+	lang := languageFromRequest(r)
+	payload, ok := decodeMySQLRestoreRequest(w, r)
+	if !ok {
+		return
+	}
+	instanceID := strings.TrimSpace(chi.URLParam(r, "id"))
+	instance, err := a.store.GetAppInstance(instanceID)
+	if err != nil {
+		respond(w, nil, err)
+		return
+	}
+	if instance.App != "mysql" || appInstanceTopology(instance) != "standalone" || strings.TrimSpace(instance.ServerID) == "" {
+		writeError(w, http.StatusBadRequest, mysqlapp.MySQLBackupStandaloneRequired, i18n.MySQLBackupErrorText(lang, mysqlapp.MySQLBackupStandaloneRequired), map[string]any{"instanceId": instanceID})
+		return
+	}
+	backup, err := a.store.GetAppBackup(payload.BackupID)
+	if err != nil || backup.App != "mysql" || backup.InstanceID != instance.ID || backup.ServerID != instance.ServerID || backup.BackupType != "logical-full" || backup.Status != "success" {
+		writeError(w, http.StatusConflict, mysqlapp.MySQLBackupVerifyNotAllowed, i18n.MySQLBackupErrorText(lang, mysqlapp.MySQLBackupVerifyNotAllowed), map[string]any{"backupId": payload.BackupID})
+		return
+	}
+	server, err := a.store.GetServer(instance.ServerID, false)
+	if err != nil {
+		respond(w, nil, err)
+		return
+	}
+	module, exists := a.apps.Get("mysql")
+	if !exists {
+		writeError(w, http.StatusNotFound, "APP_BACKEND_MODULE_MISSING", i18n.Text(lang, "api.appBackendMissing"), map[string]any{"app": "mysql"})
+		return
+	}
+	restoreModule, supportsRestore := module.(registry.RestoreModule)
+	if !supportsRestore {
+		writeError(w, http.StatusConflict, "MYSQL_RESTORE_UNSUPPORTED", i18n.MySQLBackupErrorText(lang, mysqlapp.MySQLRestoreIncomplete), map[string]any{"instanceId": instance.ID})
+		return
+	}
+	actor := currentUser(r).Username
+	restoreRequest := registry.RestoreRequest{
+		Instance: instance, Instances: []store.AppInstance{instance}, Servers: []store.Server{server}, Backup: backup,
+		Language: lang, Actor: actor, RepositoryDir: a.cfg.MySQLBackupDir,
+		Parameters: map[string]any{
+			"mode": payload.Mode, "maintenanceConfirmed": payload.MaintenanceConfirmed,
+			"createPreRestoreBackup": payload.CreatePreRestoreBackup, "disasterConfirmed": payload.DisasterConfirmed, "threads": payload.Threads,
+		},
+	}
+	plan, err := restoreModule.PlanRestore(r.Context(), restoreRequest)
+	if err != nil {
+		var stable interface{ StableCode() string }
+		if errors.As(err, &stable) && stable.StableCode() != "" {
+			code := stable.StableCode()
+			writeError(w, http.StatusBadRequest, code, i18n.MySQLBackupErrorText(lang, code), map[string]any{"instanceId": instance.ID, "backupId": backup.ID})
+			return
+		}
+		writeError(w, http.StatusBadRequest, "MYSQL_RESTORE_PLAN_FAILED", i18n.MySQLBackupErrorText(lang, mysqlapp.MySQLRestoreIncomplete), map[string]any{"instanceId": instance.ID})
+		return
+	}
+	task, err := a.store.CreateTask(store.Task{Type: mysqlRestoreTaskType, Target: instance.ID, Status: "pending", CreatedBy: actor})
+	if err != nil {
+		respondTask(w, task, err)
+		return
+	}
+	if err := a.storeInstallPlanOrDelete(task.ID, plan); err != nil {
+		writeError(w, http.StatusInternalServerError, "MYSQL_RESTORE_PLAN_STORE_FAILED", i18n.MySQLBackupErrorText(lang, mysqlapp.MySQLRestoreIncomplete), map[string]any{"instanceId": instance.ID})
+		return
+	}
+	locks, acquired := a.acquireTaskOperationLocks(w, lang, task, appInstanceOperationLockSpecs("mysql-restore", []store.AppInstance{instance}))
+	if !acquired {
+		return
+	}
+	task, err = a.tasks.StartExistingWithLanguage(task, lang, func(ctx context.Context, log worker.Logger) error {
+		return restoreModule.Restore(ctx, restoreRequest.Clone(), registry.RunContext{
+			TaskID: log.TaskID(), Log: log, TargetLog: func(target string) registry.Logger { return log.Target(target) },
+			Concurrency: a.store.DeploymentConcurrency(a.cfg.DeploymentConcurrency),
+		})
+	})
+	if err != nil {
+		a.releaseOperationLocks(locks)
+	}
+	if err == nil {
+		a.audit(r, mysqlRestoreTaskType, instance.ID, "running", task.ID)
+	}
+	respondTask(w, task, err)
+}
 
 var mysqlBackupVerificationSteps = []string{"load-backup", "verify-manifest", "verify-checksum", "record-verification"}
 

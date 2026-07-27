@@ -114,6 +114,124 @@ func TestMySQLBackupHandlerCreatesPlannedLockedAuditedSSETaskWithServerOwnedSett
 	waitForTaskStatus(t, db, task.ID, "success")
 }
 
+func TestMySQLRestoreHandlerIsOwnerOnlyAndCreatesExactPlannedLockedAuditedTask(t *testing.T) {
+	api, db, secret := newAuthzTestAPI(t)
+	server, instance := saveMySQLBackupTarget(t, db, "standalone", "")
+	backup, err := db.SaveAppBackup(store.AppBackup{
+		App: "mysql", InstanceID: instance.ID, ServerID: server.ID, BackupType: "logical-full", Status: "success",
+		Path: filepathForTestBackup("restore"), Checksum: strings.Repeat("a", 64), Size: 10, Metadata: `{}`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	module := newBackupHandlerModule()
+	api.apps = registry.New(module)
+	body := `{"backupId":"` + backup.ID + `","mode":"standalone","maintenanceConfirmed":true,"createPreRestoreBackup":true,"disasterConfirmed":false,"threads":4}`
+
+	operator := issueTestToken(t, db, secret, "operator", "operator")
+	denied := httptest.NewRequest(http.MethodPost, "/api/v2/apps/instances/"+instance.ID+"/restore", strings.NewReader(body))
+	denied.Header.Set("Authorization", "Bearer "+operator)
+	denied.Header.Set("Content-Type", "application/json")
+	deniedRec := httptest.NewRecorder()
+	api.Router().ServeHTTP(deniedRec, denied)
+	if deniedRec.Code != http.StatusForbidden {
+		t.Fatalf("operator restore status=%d body=%s", deniedRec.Code, deniedRec.Body.String())
+	}
+
+	owner := issueTestToken(t, db, secret, "owner", "owner")
+	req := httptest.NewRequest(http.MethodPost, "/api/v2/apps/instances/"+instance.ID+"/restore", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+owner)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	api.Router().ServeHTTP(rec, req)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("owner restore status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var response struct {
+		TaskID string `json:"taskId"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil || response.TaskID == "" {
+		t.Fatalf("task response=%s err=%v", rec.Body.String(), err)
+	}
+	var call restoreHandlerCall
+	select {
+	case call = <-module.restoreCalls:
+	case <-time.After(2 * time.Second):
+		t.Fatal("restore worker did not call module")
+	}
+	if call.request.RepositoryDir != api.cfg.MySQLBackupDir || call.request.Instance.ID != instance.ID || call.request.Backup.ID != backup.ID || call.request.Actor != "owner" {
+		t.Fatalf("restore request = %+v", call.request)
+	}
+	if call.run.TaskID != response.TaskID {
+		t.Fatalf("restore run = %+v", call.run)
+	}
+	steps, err := db.ListTaskSteps(response.TaskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := make([]string, len(steps))
+	for i := range steps {
+		got[i] = steps[i].Name
+	}
+	if !reflect.DeepEqual(got, mysqlRestoreHandlerSteps) {
+		t.Fatalf("restore steps=%v", got)
+	}
+	locks, err := db.ListOperationLocks("app-instance", instance.ID, false)
+	if err != nil || len(locks) != 1 || locks[0].Operation != operationLockMutation || locks[0].OwnerTaskID != response.TaskID {
+		t.Fatalf("restore lock=%+v err=%v", locks, err)
+	}
+	assertAuditExists(t, db, "apps.mysql.restore", "running", "owner", instance.ID)
+	close(module.restoreRelease)
+	waitForTaskStatus(t, db, response.TaskID, "success")
+}
+
+func TestMySQLRestoreHandlerRejectsUnsafeRequestsBeforeTaskOrMutation(t *testing.T) {
+	tests := []struct {
+		name     string
+		body     string
+		topology string
+		planErr  error
+	}{
+		{"maintenance missing", `{"backupId":"BACKUP","mode":"standalone","createPreRestoreBackup":true,"threads":4}`, "standalone", nil},
+		{"topology mismatch", `{"backupId":"BACKUP","mode":"standalone","maintenanceConfirmed":true,"createPreRestoreBackup":true,"threads":4}`, "innodb-cluster", nil},
+		{"failed verification", `{"backupId":"BACKUP","mode":"standalone","maintenanceConfirmed":true,"createPreRestoreBackup":true,"threads":4}`, "standalone", &mysqlapp.MySQLOperationError{Code: mysqlapp.MySQLBackupVerifyFailed}},
+		{"unknown field", `{"backupId":"BACKUP","mode":"standalone","maintenanceConfirmed":true,"createPreRestoreBackup":true,"threads":4,"path":"/tmp/free"}`, "standalone", nil},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			api, db, secret := newAuthzTestAPI(t)
+			server, instance := saveMySQLBackupTarget(t, db, test.topology, "")
+			backup, err := db.SaveAppBackup(store.AppBackup{App: "mysql", InstanceID: instance.ID, ServerID: server.ID, BackupType: "logical-full", Status: "success", Path: filepathForTestBackup("unsafe"), Checksum: strings.Repeat("b", 64), Size: 10, Metadata: `{}`})
+			if err != nil {
+				t.Fatal(err)
+			}
+			module := newBackupHandlerModule()
+			module.restorePlanErr = test.planErr
+			api.apps = registry.New(module)
+			body := strings.ReplaceAll(test.body, "BACKUP", backup.ID)
+			owner := issueTestToken(t, db, secret, "owner", "owner")
+			req := httptest.NewRequest(http.MethodPost, "/api/v2/apps/instances/"+instance.ID+"/restore", strings.NewReader(body))
+			req.Header.Set("Authorization", "Bearer "+owner)
+			req.Header.Set("Content-Type", "application/json")
+			rec := httptest.NewRecorder()
+			api.Router().ServeHTTP(rec, req)
+			if rec.Code == http.StatusAccepted {
+				t.Fatalf("unsafe restore accepted: %s", rec.Body.String())
+			}
+			tasks, err := db.ListTasks()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(tasks) != 0 {
+				t.Fatalf("unsafe restore created tasks: %+v", tasks)
+			}
+			if len(module.restoreCalls) != 0 {
+				t.Fatal("unsafe restore reached module mutation")
+			}
+		})
+	}
+}
+
 func TestMySQLBackupHandlerValidatesInstanceAppAndStandaloneTopology(t *testing.T) {
 	// Production break caught: dispatching a standalone task for a foreign app or cluster member would select the wrong safety model.
 	tests := []struct{ name, app, topology string }{{"foreign app", "redis", "standalone"}, {"cluster", "mysql", "innodb-cluster"}}
@@ -664,14 +782,21 @@ type backupHandlerCall struct {
 	request registry.BackupRequest
 	run     registry.RunContext
 }
+type restoreHandlerCall struct {
+	request registry.RestoreRequest
+	run     registry.RunContext
+}
 type backupHandlerModule struct {
-	calls   chan backupHandlerCall
-	release chan struct{}
-	planErr error
+	calls          chan backupHandlerCall
+	release        chan struct{}
+	planErr        error
+	restoreCalls   chan restoreHandlerCall
+	restoreRelease chan struct{}
+	restorePlanErr error
 }
 
 func newBackupHandlerModule() *backupHandlerModule {
-	return &backupHandlerModule{calls: make(chan backupHandlerCall, 1), release: make(chan struct{})}
+	return &backupHandlerModule{calls: make(chan backupHandlerCall, 1), release: make(chan struct{}), restoreCalls: make(chan restoreHandlerCall, 1), restoreRelease: make(chan struct{})}
 }
 func (m *backupHandlerModule) Name() string { return "mysql" }
 func (m *backupHandlerModule) Manifest(string) registry.Manifest {
@@ -703,6 +828,29 @@ func (m *backupHandlerModule) Backup(ctx context.Context, req registry.BackupReq
 	m.calls <- backupHandlerCall{request: req, run: run}
 	select {
 	case <-m.release:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+var mysqlRestoreHandlerSteps = []string{"load-backup", "acquire-instance-lock", "verify-maintenance-confirmation", "verify-manifest", "verify-checksum", "verify-version", "create-pre-restore-backup", "upload-backup", "extract-backup", "dry-run-load", "capture-local-infile", "enable-local-infile", "drop-target-schemas", "load-dump", "restore-local-infile", "verify-schemas", "verify-data", "record-restore", "cleanup-workdir", "release-lock"}
+
+func (m *backupHandlerModule) PlanRestore(_ context.Context, req registry.RestoreRequest) ([]registry.InstallStepPlan, error) {
+	if m.restorePlanErr != nil {
+		return nil, m.restorePlanErr
+	}
+	out := make([]registry.InstallStepPlan, len(mysqlRestoreHandlerSteps))
+	for i, name := range mysqlRestoreHandlerSteps {
+		out[i] = registry.InstallStepPlan{Target: req.Instance.ServerID, Name: name, Title: name, Order: i + 1}
+	}
+	return out, nil
+}
+
+func (m *backupHandlerModule) Restore(ctx context.Context, req registry.RestoreRequest, run registry.RunContext) error {
+	m.restoreCalls <- restoreHandlerCall{request: req, run: run}
+	select {
+	case <-m.restoreRelease:
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
@@ -747,3 +895,4 @@ func getBackupListItems(t *testing.T, api *API, token, instanceID string) []stor
 func filepathForTestBackup(name string) string { return "/managed/mysql-backups/" + name + "/dump.tar" }
 
 var _ registry.BackupModule = (*backupHandlerModule)(nil)
+var _ registry.RestoreModule = (*backupHandlerModule)(nil)

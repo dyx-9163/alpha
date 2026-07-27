@@ -13,6 +13,7 @@ import (
 	"time"
 
 	_ "aifar-deployment/backend/internal/apps/autoload"
+	mysqlapp "aifar-deployment/backend/internal/apps/mysql"
 	"aifar-deployment/backend/internal/apps/registry"
 	"aifar-deployment/backend/internal/auditkit"
 	"aifar-deployment/backend/internal/config"
@@ -114,6 +115,7 @@ func NewWithRealtime(cfg config.Config, s *store.Store, tasks *worker.Manager, e
 			r.Get("/apps/instances/{id}/backups", api.listMySQLBackups)
 			r.Post("/apps/{app}/install", api.requirePermission(rbac.AppsManage, api.installApp))
 			r.Post("/apps/instances/{id}/backup", api.requirePermission(rbac.AppsManage, api.startMySQLBackup))
+			r.Post("/apps/instances/{id}/restore", api.requireOwner(api.startMySQLRestore))
 			r.Post("/apps/backups/{backupId}/verify", api.requirePermission(rbac.AppsManage, api.verifyMySQLBackup))
 			r.Delete("/apps/backups/{backupId}", api.requirePermission(rbac.AppsManage, api.deleteMySQLBackup))
 			r.Post("/apps/instances/batch-delete", api.requirePermission(rbac.AppsManage, api.deleteAppInstances))
@@ -271,6 +273,41 @@ type mysqlBackupRequest struct {
 	Threads     int    `json:"threads"`
 	MaxRateMBps int    `json:"maxRateMBps"`
 	KeepLast    *int   `json:"keepLast"`
+}
+
+type mysqlRestoreRequest struct {
+	BackupID               string `json:"backupId"`
+	Mode                   string `json:"mode"`
+	MaintenanceConfirmed   bool   `json:"maintenanceConfirmed"`
+	CreatePreRestoreBackup bool   `json:"createPreRestoreBackup"`
+	DisasterConfirmed      bool   `json:"disasterConfirmed"`
+	Threads                int    `json:"threads"`
+}
+
+func decodeMySQLRestoreRequest(w http.ResponseWriter, r *http.Request) (mysqlRestoreRequest, bool) {
+	defer r.Body.Close()
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	var request mysqlRestoreRequest
+	if err := decoder.Decode(&request); err != nil {
+		writeMySQLBackupDecodeError(w, r, err)
+		return mysqlRestoreRequest{}, false
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		if err == nil {
+			err = errors.New("request body must contain exactly one JSON object")
+		}
+		writeMySQLBackupDecodeError(w, r, err)
+		return mysqlRestoreRequest{}, false
+	}
+	request.BackupID = strings.TrimSpace(request.BackupID)
+	request.Mode = strings.ToLower(strings.TrimSpace(request.Mode))
+	if request.BackupID == "" || request.Mode != "standalone" || !request.MaintenanceConfirmed || request.Threads < 1 || request.Threads > 64 {
+		writeError(w, http.StatusBadRequest, mysqlapp.MySQLRestoreMaintenanceRequired, i18n.MySQLBackupErrorText(languageFromRequest(r), mysqlapp.MySQLRestoreMaintenanceRequired), nil)
+		return mysqlRestoreRequest{}, false
+	}
+	return request, true
 }
 
 func (r *mysqlBackupRequest) UnmarshalJSON(data []byte) error {

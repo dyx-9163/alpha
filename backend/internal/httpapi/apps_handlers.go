@@ -10,12 +10,23 @@ import (
 	"aifar-deployment/backend/internal/appcatalog"
 	"aifar-deployment/backend/internal/apps/registry"
 	"aifar-deployment/backend/internal/i18n"
+	"aifar-deployment/backend/internal/rbac"
 	"aifar-deployment/backend/internal/store"
 	"aifar-deployment/backend/internal/taskplan"
 	"aifar-deployment/backend/internal/worker"
 
 	"github.com/go-chi/chi/v5"
 )
+
+func (a *API) requireOwner(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if rbac.NormalizeRole(currentUser(r).Role) != "owner" {
+			writeError(w, http.StatusForbidden, "FORBIDDEN", i18n.Text(languageFromRequest(r), "api.permissionDenied"), map[string]any{"role": rbac.NormalizeRole(currentUser(r).Role)})
+			return
+		}
+		next(w, r)
+	}
+}
 
 func (a *API) appsCatalog(w http.ResponseWriter, r *http.Request) {
 	resources, err := a.store.ListResources()
