@@ -1,7 +1,10 @@
 package httpapi
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -256,6 +259,28 @@ type credentialSaveRequest struct {
 type startMySQLClusterRequest struct {
 	InstanceIDs []string `json:"instanceIds"`
 	Language    string   `json:"language"`
+}
+
+type mysqlBackupRequest struct {
+	Name        string `json:"name"`
+	Threads     int    `json:"threads"`
+	MaxRateMBps int    `json:"maxRateMBps"`
+	KeepLast    *int   `json:"keepLast"`
+}
+
+func (r *mysqlBackupRequest) UnmarshalJSON(data []byte) error {
+	type request mysqlBackupRequest
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	var decoded request
+	if err := decoder.Decode(&decoded); err != nil {
+		return err
+	}
+	if decoded.KeepLast != nil && *decoded.KeepLast <= 0 {
+		return errors.New("keepLast must be positive")
+	}
+	*r = mysqlBackupRequest(decoded)
+	return nil
 }
 
 type installAppRequest struct {

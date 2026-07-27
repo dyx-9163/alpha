@@ -14,6 +14,49 @@ import (
 	"aifar-deployment/backend/internal/store"
 )
 
+func TestDecodeMySQLBackupRequestAcceptsOnlyPositiveKeepLastOverride(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/api/v2/apps/instances/instance-1/backup", strings.NewReader(`{"name":"nightly","threads":4,"maxRateMBps":64,"keepLast":8}`))
+	rec := httptest.NewRecorder()
+	var body mysqlBackupRequest
+	if !decode(rec, req, &body) {
+		t.Fatalf("expected valid request, got status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if body.Name != "nightly" || body.Threads != 4 || body.MaxRateMBps != 64 || body.KeepLast == nil || *body.KeepLast != 8 {
+		t.Fatalf("unexpected decoded request: %#v", body)
+	}
+
+	omittedReq := httptest.NewRequest(http.MethodPost, "/api/v2/apps/instances/instance-1/backup", strings.NewReader(`{"name":"default-policy"}`))
+	omittedRec := httptest.NewRecorder()
+	var omitted mysqlBackupRequest
+	if !decode(omittedRec, omittedReq, &omitted) {
+		t.Fatalf("expected omitted keepLast to be valid, got status=%d body=%s", omittedRec.Code, omittedRec.Body.String())
+	}
+	if omitted.KeepLast != nil {
+		t.Fatalf("omitted keepLast must remain nil for handler-level fallback, got %v", *omitted.KeepLast)
+	}
+}
+
+func TestDecodeMySQLBackupRequestRejectsRepositoryDirAndNonPositiveKeepLast(t *testing.T) {
+	tests := []string{
+		`{"repositoryDir":"/tmp/user-controlled"}`,
+		`{"keepLast":0}`,
+		`{"keepLast":-1}`,
+	}
+	for _, body := range tests {
+		t.Run(body, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/api/v2/apps/instances/instance-1/backup", strings.NewReader(body))
+			rec := httptest.NewRecorder()
+			var decoded mysqlBackupRequest
+			if decode(rec, req, &decoded) {
+				t.Fatalf("expected request rejection for %s", body)
+			}
+			if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), `"code":"INVALID_JSON"`) {
+				t.Fatalf("expected INVALID_JSON 400, got status=%d body=%s", rec.Code, rec.Body.String())
+			}
+		})
+	}
+}
+
 func TestRecordFailedInstallInstancesCreatesCleanupInstance(t *testing.T) {
 	api, db, _ := newAuthzTestAPI(t)
 	server, err := db.SaveServer(store.Server{Name: "minio-1", Host: "10.0.0.9", Username: "root"})
