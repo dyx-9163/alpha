@@ -24,6 +24,11 @@ type CommandResult struct {
 	ExitCode int
 }
 
+type CommandStreamResult struct {
+	Bytes  int64
+	Stderr string
+}
+
 type SSHRemote struct{}
 
 func (SSHRemote) Run(ctx context.Context, server store.Server, command string) (CommandResult, error) {
@@ -36,6 +41,10 @@ func (SSHRemote) UploadFile(ctx context.Context, server store.Server, localPath,
 
 func (SSHRemote) StreamFile(ctx context.Context, server store.Server, remotePath string, dst io.Writer) (int64, error) {
 	return StreamSSHFile(ctx, server, remotePath, dst)
+}
+
+func (SSHRemote) StreamCommand(ctx context.Context, server store.Server, command string, dst io.Writer) (CommandStreamResult, error) {
+	return StreamSSHCommand(ctx, server, command, dst)
 }
 
 func ProbeSSH(ctx context.Context, server store.Server) error {
@@ -296,6 +305,86 @@ func StreamSSHFile(ctx context.Context, server store.Server, remotePath string, 
 		_ = session.Close()
 		_ = client.Close()
 	}, stderr.String)
+}
+
+func StreamSSHCommand(ctx context.Context, server store.Server, command string, dst io.Writer) (CommandStreamResult, error) {
+	if err := validateSSHCommandStreamDestination(command, dst); err != nil {
+		return CommandStreamResult{}, err
+	}
+	client, err := dialSSH(ctx, server)
+	if err != nil {
+		return CommandStreamResult{}, err
+	}
+	defer client.Close()
+	session, err := client.NewSession()
+	if err != nil {
+		return CommandStreamResult{}, err
+	}
+	defer session.Close()
+	stdout, err := session.StdoutPipe()
+	if err != nil {
+		return CommandStreamResult{}, err
+	}
+	stderr := newBoundedSSHStderr(sshStreamStderrLimit)
+	session.Stderr = stderr
+	if err := session.Start(command); err != nil {
+		return commandStreamResult(0, stderr), streamSSHError(err, stderr.String())
+	}
+	return streamSSHCommandOutputWithContext(ctx, command, dst, stdout, session.Wait, func() {
+		_ = session.Signal(ssh.SIGKILL)
+		_ = session.Close()
+		_ = client.Close()
+	}, stderr)
+}
+
+func streamSSHCommandOutputWithContext(
+	ctx context.Context,
+	command string,
+	dst io.Writer,
+	stdout io.Reader,
+	wait func() error,
+	cancelCommand func(),
+	stderr *boundedSSHStderr,
+) (CommandStreamResult, error) {
+	if err := validateSSHCommandStreamInput(command, dst, stdout, wait); err != nil {
+		return CommandStreamResult{}, err
+	}
+	if stderr == nil {
+		stderr = newBoundedSSHStderr(sshStreamStderrLimit)
+	}
+	copied, err := streamSSHOutputWithContext(ctx, dst, stdout, wait, cancelCommand, stderr.String)
+	return commandStreamResult(copied, stderr), err
+}
+
+func validateSSHCommandStreamInput(command string, dst io.Writer, stdout io.Reader, wait func() error) error {
+	if err := validateSSHCommandStreamDestination(command, dst); err != nil {
+		return err
+	}
+	if stdout == nil {
+		return fmt.Errorf("SSH stdout reader is required")
+	}
+	if wait == nil {
+		return fmt.Errorf("SSH wait function is required")
+	}
+	return nil
+}
+
+func validateSSHCommandStreamDestination(command string, dst io.Writer) error {
+	if strings.TrimSpace(command) == "" {
+		return fmt.Errorf("SSH command is required")
+	}
+	if dst == nil {
+		return fmt.Errorf("destination writer is required")
+	}
+	return nil
+}
+
+func commandStreamResult(copied int64, stderr *boundedSSHStderr) CommandStreamResult {
+	stderrText := ""
+	if stderr != nil {
+		stderrText = strings.TrimSpace(logmask.Mask(stderr.String()))
+	}
+	return CommandStreamResult{Bytes: copied, Stderr: stderrText}
 }
 
 type sshStreamWriter struct {

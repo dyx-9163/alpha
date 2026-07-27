@@ -5,8 +5,12 @@ import (
 	"context"
 	"errors"
 	"io"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"aifar-deployment/backend/internal/store"
 )
 
 type closedPipeWriter struct{}
@@ -28,6 +32,156 @@ func (w blockingWriter) Write(value []byte) (int, error) {
 
 type cancelingWriter struct {
 	cancel func()
+}
+
+type failAfterWriter struct {
+	remaining int
+	err       error
+}
+
+func (w *failAfterWriter) Write(value []byte) (int, error) {
+	if w.remaining <= 0 {
+		return 0, w.err
+	}
+	if len(value) > w.remaining {
+		written := w.remaining
+		w.remaining = 0
+		return written, w.err
+	}
+	w.remaining -= len(value)
+	return len(value), nil
+}
+
+func TestStreamSSHCommandOutputCopiesBinaryAndReturnsBoundedStderr(t *testing.T) {
+	payload := make([]byte, 128<<10)
+	for index := range payload {
+		payload[index] = byte(index % 251)
+	}
+	stdoutReader, stdoutWriter := io.Pipe()
+	writeDone := make(chan error, 1)
+	go func() {
+		_, err := stdoutWriter.Write(payload)
+		if closeErr := stdoutWriter.Close(); err == nil {
+			err = closeErr
+		}
+		writeDone <- err
+	}()
+	stderr := newBoundedSSHStderr(sshStreamStderrLimit)
+	if _, err := stderr.Write(bytes.Repeat([]byte("e"), sshStreamStderrLimit+1024)); err != nil {
+		t.Fatal(err)
+	}
+	var dst bytes.Buffer
+	result, err := streamSSHCommandOutputWithContext(context.Background(), "internal-export-command", &dst, stdoutReader,
+		func() error { return nil }, func() {}, stderr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := <-writeDone; err != nil {
+		t.Fatal(err)
+	}
+	if result.Bytes != int64(len(payload)) || !bytes.Equal(dst.Bytes(), payload) {
+		t.Fatalf("binary command stream changed: bytes=%d payload=%d", result.Bytes, len(dst.Bytes()))
+	}
+	if len(result.Stderr) != sshStreamStderrLimit {
+		t.Fatalf("bounded stderr length=%d want=%d", len(result.Stderr), sshStreamStderrLimit)
+	}
+}
+
+func TestStreamSSHCommandOutputCancelsWaitAndWriter(t *testing.T) {
+	ctx, cancelContext := context.WithCancel(context.Background())
+	stdoutReader, stdoutWriter := io.Pipe()
+	waitCancelled := make(chan struct{})
+	var cancelCalls atomic.Int32
+	resultCh := make(chan error, 1)
+	go func() {
+		_, err := streamSSHCommandOutputWithContext(ctx, "internal-export-command", io.Discard, stdoutReader,
+			func() error {
+				<-waitCancelled
+				return errors.New("session closed")
+			},
+			func() {
+				cancelCalls.Add(1)
+				close(waitCancelled)
+				_ = stdoutWriter.CloseWithError(context.Canceled)
+			},
+			newBoundedSSHStderr(sshStreamStderrLimit),
+		)
+		resultCh <- err
+	}()
+	cancelContext()
+	select {
+	case err := <-resultCh:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("cancel error=%v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("command stream did not unblock after cancellation")
+	}
+	if got := cancelCalls.Load(); got != 1 {
+		t.Fatalf("cancel callback calls=%d want=1", got)
+	}
+}
+
+func TestStreamSSHCommandOutputPropagatesDestinationWriteFailure(t *testing.T) {
+	destinationErr := errors.New("destination failed")
+	cancelled := make(chan struct{})
+	var cancelCalls atomic.Int32
+	writer := &failAfterWriter{remaining: 17, err: destinationErr}
+	stderr := newBoundedSSHStderr(sshStreamStderrLimit)
+	_, _ = stderr.Write([]byte("password=do-not-expose"))
+	result, err := streamSSHCommandOutputWithContext(context.Background(), "secret-internal-command", writer, bytes.NewReader(bytes.Repeat([]byte("x"), 128)),
+		func() error {
+			<-cancelled
+			return errors.New("session closed")
+		},
+		func() {
+			cancelCalls.Add(1)
+			close(cancelled)
+		},
+		stderr,
+	)
+	if !errors.Is(err, destinationErr) {
+		t.Fatalf("destination error=%v", err)
+	}
+	if result.Bytes != 17 {
+		t.Fatalf("copied bytes=%d want=17", result.Bytes)
+	}
+	if got := cancelCalls.Load(); got != 1 {
+		t.Fatalf("cancel callback calls=%d want=1", got)
+	}
+	if strings.Contains(err.Error(), "secret-internal-command") || strings.Contains(err.Error(), "do-not-expose") {
+		t.Fatalf("stream error leaked command or stderr secret: %v", err)
+	}
+}
+
+func TestStreamSSHCommandOutputRejectsEmptyCommandOrNilWriter(t *testing.T) {
+	waitCalls := 0
+	wait := func() error {
+		waitCalls++
+		return nil
+	}
+	if _, err := streamSSHCommandOutputWithContext(context.Background(), " ", io.Discard, bytes.NewReader(nil), wait, func() {}, newBoundedSSHStderr(sshStreamStderrLimit)); err == nil {
+		t.Fatal("empty command was accepted")
+	}
+	if _, err := streamSSHCommandOutputWithContext(context.Background(), "internal-command", nil, bytes.NewReader(nil), wait, func() {}, newBoundedSSHStderr(sshStreamStderrLimit)); err == nil {
+		t.Fatal("nil destination writer was accepted")
+	}
+	if waitCalls != 0 {
+		t.Fatalf("validation invoked remote wait %d times", waitCalls)
+	}
+}
+
+func TestStreamSSHCommandRejectsInvalidInputBeforeDial(t *testing.T) {
+	server := store.Server{}
+	if _, err := StreamSSHCommand(context.Background(), server, " ", io.Discard); err == nil || !strings.Contains(err.Error(), "command") {
+		t.Fatalf("empty command error=%v", err)
+	}
+	if _, err := StreamSSHCommand(context.Background(), server, "internal-command", nil); err == nil || !strings.Contains(err.Error(), "writer") {
+		t.Fatalf("nil writer error=%v", err)
+	}
+	if _, err := (SSHRemote{}).StreamCommand(context.Background(), server, " ", io.Discard); err == nil || !strings.Contains(err.Error(), "command") {
+		t.Fatalf("SSHRemote empty command error=%v", err)
+	}
 }
 
 func (w cancelingWriter) Write(value []byte) (int, error) {
