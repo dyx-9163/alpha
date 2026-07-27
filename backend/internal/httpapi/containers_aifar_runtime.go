@@ -642,7 +642,7 @@ func (a *aifarRuntimeController) reconcile(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	actor := currentUser(r).Username
-	task, err, started := a.startSimplePlannedTask(w, "aifar.reconcile", instance.ID, actor, lang, server.ID, nil, func(ctx context.Context, log worker.Logger) error {
+	task, err, started := a.startSimplePlannedTaskWithLocks(w, "aifar.reconcile", instance.ID, actor, lang, server.ID, nil, []operationLockSpec{aifarRuntimeMutationLockSpec("reconcile", instance)}, func(ctx context.Context, log worker.Logger) error {
 		current, err := a.store.GetAppInstance(instance.ID)
 		if err != nil {
 			return err
@@ -698,7 +698,7 @@ func (a *aifarRuntimeController) restartAll(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	actor := currentUser(r).Username
-	task, err, started := a.startSimplePlannedTask(w, "aifar.runtime.restart-all", instance.ID, actor, lang, server.ID, aifarRuntimeRestartSteps(lang), func(ctx context.Context, log worker.Logger) error {
+	task, err, started := a.startSimplePlannedTaskWithLocks(w, "aifar.runtime.restart-all", instance.ID, actor, lang, server.ID, aifarRuntimeRestartSteps(lang), []operationLockSpec{aifarRuntimeMutationLockSpec("restart-all", instance)}, func(ctx context.Context, log worker.Logger) error {
 		current, err := a.store.GetAppInstance(instance.ID)
 		if err != nil {
 			return err
@@ -760,7 +760,7 @@ func (a *aifarRuntimeController) cleanupStale(w http.ResponseWriter, r *http.Req
 		return
 	}
 	actor := currentUser(r).Username
-	task, err, started := a.startSimplePlannedTask(w, "aifar.runtime.cleanup", instance.ID, actor, lang, server.ID, aifarRuntimeCleanupSteps(), func(ctx context.Context, log worker.Logger) error {
+	task, err, started := a.startSimplePlannedTaskWithLocks(w, "aifar.runtime.cleanup", instance.ID, actor, lang, server.ID, aifarRuntimeCleanupSteps(), []operationLockSpec{aifarRuntimeMutationLockSpec("cleanup-stale", instance)}, func(ctx context.Context, log worker.Logger) error {
 		current, err := a.store.GetAppInstance(instance.ID)
 		if err != nil {
 			return err
@@ -816,7 +816,7 @@ func (a *aifarRuntimeController) uninstallAgent(w http.ResponseWriter, r *http.R
 		return
 	}
 	actor := currentUser(r).Username
-	task, err, started := a.startSimplePlannedTask(w, "aifar.agent.uninstall", instance.ID, actor, lang, server.ID, aifarRuntimeAgentUninstallSteps(), func(ctx context.Context, log worker.Logger) error {
+	task, err, started := a.startSimplePlannedTaskWithLocks(w, "aifar.agent.uninstall", instance.ID, actor, lang, server.ID, aifarRuntimeAgentUninstallSteps(), []operationLockSpec{aifarRuntimeMutationLockSpec("uninstall-agent", instance)}, func(ctx context.Context, log worker.Logger) error {
 		current, err := a.store.GetAppInstance(instance.ID)
 		if err != nil {
 			return err
@@ -886,7 +886,7 @@ func (a *aifarRuntimeController) configure(w http.ResponseWriter, r *http.Reques
 		writeError(w, http.StatusBadRequest, "AIFAR_RUNTIME_CONFIG_INVALID", err.Error(), nil)
 		return
 	}
-	task, err, started := a.startSimplePlannedTask(w, "aifar.runtime.config", instance.ID, actor, lang, server.ID, aifarRuntimeConfigSteps(), func(ctx context.Context, log worker.Logger) error {
+	task, err, started := a.startSimplePlannedTaskWithLocks(w, "aifar.runtime.config", instance.ID, actor, lang, server.ID, aifarRuntimeConfigSteps(), []operationLockSpec{aifarRuntimeMutationLockSpec("runtime-config", instance)}, func(ctx context.Context, log worker.Logger) error {
 		current, err := a.store.GetAppInstance(instance.ID)
 		if err != nil {
 			return err
@@ -956,7 +956,7 @@ func (a *aifarRuntimeController) installServices(w http.ResponseWriter, r *http.
 		respond(w, nil, err)
 		return
 	}
-	task, err, started := a.startSimplePlannedTask(w, "aifar.services.install", target, actor, lang, server.ID, aifarRuntimeServiceInstallSteps(), func(ctx context.Context, log worker.Logger) error {
+	task, err, started := a.startSimplePlannedTaskWithLocks(w, "aifar.services.install", target, actor, lang, server.ID, aifarRuntimeServiceInstallSteps(), []operationLockSpec{aifarRuntimeMutationLockSpec("services-install", instance)}, func(ctx context.Context, log worker.Logger) error {
 		current, err := a.store.GetAppInstance(instance.ID)
 		if err != nil {
 			return err
@@ -1013,7 +1013,7 @@ func (a *aifarRuntimeController) scaleOut(w http.ResponseWriter, r *http.Request
 	}
 	actor := currentUser(r).Username
 	target := instance.ID + ":" + service
-	task, err, started := a.startSimplePlannedTask(w, "aifar.scale.out", target, actor, lang, server.ID, aifarRuntimeScaleSteps(), func(ctx context.Context, log worker.Logger) error {
+	task, err, started := a.startSimplePlannedTaskWithLocks(w, "aifar.scale.out", target, actor, lang, server.ID, aifarRuntimeScaleSteps(), []operationLockSpec{aifarRuntimeMutationLockSpec("scale-out", instance)}, func(ctx context.Context, log worker.Logger) error {
 		current, err := a.store.GetAppInstance(instance.ID)
 		if err != nil {
 			return err
@@ -1070,7 +1070,7 @@ func (a *aifarRuntimeController) scaleIn(w http.ResponseWriter, r *http.Request)
 	}
 	actor := currentUser(r).Username
 	target := instance.ID + ":" + service
-	task, err, started := a.startSimplePlannedTask(w, "aifar.scale.in", target, actor, lang, server.ID, aifarRuntimeScaleSteps(), func(ctx context.Context, log worker.Logger) error {
+	task, err, started := a.startSimplePlannedTaskWithLocks(w, "aifar.scale.in", target, actor, lang, server.ID, aifarRuntimeScaleSteps(), []operationLockSpec{aifarRuntimeMutationLockSpec("scale-in", instance)}, func(ctx context.Context, log worker.Logger) error {
 		current, err := a.store.GetAppInstance(instance.ID)
 		if err != nil {
 			return err
@@ -1136,7 +1136,7 @@ func (a *aifarRuntimeController) offlineService(w http.ResponseWriter, r *http.R
 	}
 	actor := currentUser(r).Username
 	target := instance.ID + ":" + service
-	task, err, started := a.startSimplePlannedTask(w, "aifar.scale.offline", target, actor, lang, server.ID, aifarRuntimeScaleSteps(), func(ctx context.Context, log worker.Logger) error {
+	task, err, started := a.startSimplePlannedTaskWithLocks(w, "aifar.scale.offline", target, actor, lang, server.ID, aifarRuntimeScaleSteps(), []operationLockSpec{aifarRuntimeMutationLockSpec("offline", instance)}, func(ctx context.Context, log worker.Logger) error {
 		current, err := a.store.GetAppInstance(instance.ID)
 		if err != nil {
 			return err

@@ -1034,7 +1034,7 @@ func TestScaleServiceCanOfflineDeploymentAndClearEndpoints(t *testing.T) {
 	}
 }
 
-func TestServiceOrchestrationLocksAllowDifferentServices(t *testing.T) {
+func TestServiceOrchestrationLocksBlockDifferentServices(t *testing.T) {
 	instance := installedAIFARInstance(t)
 	metadata := metadataFromInstance(instance)
 	metadata["orchestrationLocks"] = map[string]any{
@@ -1049,8 +1049,8 @@ func TestServiceOrchestrationLocksAllowDifferentServices(t *testing.T) {
 	s := &fakeStore{instances: []store.AppInstance{instance}}
 	service := NewService(s, &fakeRemote{})
 
-	if _, err := service.acquireOrchestrationLock(instance.ID, "scale-service", "permission", "operator", ""); err != nil {
-		t.Fatalf("expected different service orchestration lock to be allowed, got %v", err)
+	if _, err := service.acquireOrchestrationLock(instance.ID, "scale-service", "permission", "operator", ""); err == nil {
+		t.Fatal("expected file mutation to block permission mutation on the same instance")
 	}
 	saved, err := s.GetAppInstance(instance.ID)
 	if err != nil {
@@ -1060,21 +1060,36 @@ func TestServiceOrchestrationLocksAllowDifferentServices(t *testing.T) {
 	if _, ok := locks["file"]; !ok {
 		t.Fatalf("expected existing file lock to be preserved, got %s", saved.Metadata)
 	}
-	if _, ok := locks["permission"]; !ok {
-		t.Fatalf("expected permission lock to be recorded, got %s", saved.Metadata)
-	}
-
-	service.releaseOrchestrationLock(instance.ID, "scale-service", "permission")
-	saved, err = s.GetAppInstance(instance.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	locks = serviceOrchestrationLocksFromMetadata(metadataFromInstance(saved))
 	if _, ok := locks["permission"]; ok {
-		t.Fatalf("expected released permission lock to be removed, got %s", saved.Metadata)
+		t.Fatalf("blocked permission lock must not be recorded, got %s", saved.Metadata)
 	}
 	if _, ok := locks["file"]; !ok {
 		t.Fatalf("expected unrelated file lock to remain, got %s", saved.Metadata)
+	}
+}
+
+func TestAutoscalerTreatsAnyInstanceMutationAsLocked(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "aifar.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	instance, err := db.SaveAppInstance(store.AppInstance{App: AppName, Version: "runtime-v2", ServerID: "srv-1", Status: "installed"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.AcquireAIFAROrchestrationLock(store.AIFAROrchestrationLock{
+		InstanceID:  instance.ID,
+		ServiceName: "file",
+		Operation:   "scale-service",
+		TaskID:      "task-file",
+		ExpiresAt:   time.Now().UTC().Add(time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	autoscaler := &Autoscaler{store: db}
+	if !autoscaler.orchestrationLocked(instance.ID, "permission", time.Now().UTC()) {
+		t.Fatal("any active instance mutation must block autoscaling another service")
 	}
 }
 
@@ -1093,8 +1108,8 @@ func TestServiceOrchestrationLocksBlockSameServiceAndGlobalOperations(t *testing
 	s := &fakeStore{instances: []store.AppInstance{instance}}
 	service := NewService(s, &fakeRemote{})
 
-	if _, err := service.acquireOrchestrationLock(instance.ID, "scale-service", "file", "operator", ""); err == nil || !strings.Contains(err.Error(), "file") {
-		t.Fatalf("expected same service lock to block, got %v", err)
+	if _, err := service.acquireOrchestrationLock(instance.ID, "scale-service", "file", "operator", ""); err == nil || !strings.Contains(err.Error(), "instance orchestration is locked") {
+		t.Fatalf("expected instance mutation lock to block the same service, got %v", err)
 	}
 	if _, err := service.acquireOrchestrationLock(instance.ID, "runtime-config", "", "operator", ""); err == nil || !strings.Contains(err.Error(), "instance orchestration is locked") {
 		t.Fatalf("expected global operation to wait for service lock, got %v", err)

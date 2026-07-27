@@ -385,16 +385,12 @@ func expireAIFAROrchestrationLocks(tx *sql.Tx, now time.Time) error {
 	return err
 }
 
-func findAIFAROrchestrationLockConflict(tx *sql.Tx, instanceID, serviceName string) (AIFAROrchestrationLock, bool, error) {
+func findAIFAROrchestrationLockConflict(tx *sql.Tx, instanceID, _ string) (AIFAROrchestrationLock, bool, error) {
 	query := `select id,instance_id,service_name,operation,coalesce(actor,''),coalesce(task_id,''),status,started_at,expires_at,released_at,created_at,updated_at
 		from aifar_orchestration_locks
-		where instance_id=? and status='active'`
+		where instance_id=? and status='active'
+		order by started_at limit 1`
 	args := []any{instanceID}
-	if strings.TrimSpace(serviceName) != "" {
-		query += ` and (service_name='' or service_name=?)`
-		args = append(args, strings.TrimSpace(serviceName))
-	}
-	query += ` order by case when service_name='' then 0 else 1 end, started_at limit 1`
 	row := tx.QueryRow(query, args...)
 	lock, err := scanAIFAROrchestrationLock(row)
 	if err == sql.ErrNoRows {

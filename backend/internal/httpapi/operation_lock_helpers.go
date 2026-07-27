@@ -121,6 +121,19 @@ func appInstanceOperationLockSpecs(action string, instances []store.AppInstance)
 	return specs
 }
 
+func aifarRuntimeMutationLockSpec(action string, instance store.AppInstance) operationLockSpec {
+	return operationLockSpec{
+		Scope:      "aifar-runtime",
+		ResourceID: instance.ID,
+		Operation:  operationLockMutation,
+		Metadata: operationLockMetadata(map[string]any{
+			"action":     strings.TrimSpace(action),
+			"instanceId": instance.ID,
+			"serverId":   instance.ServerID,
+		}),
+	}
+}
+
 func operationLockMetadata(fields map[string]any) string {
 	data, err := json.Marshal(fields)
 	if err != nil {

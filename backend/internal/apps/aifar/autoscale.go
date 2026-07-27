@@ -105,7 +105,7 @@ func (a *Autoscaler) tick(ctx context.Context, now time.Time) {
 		if !policy.Enabled {
 			continue
 		}
-		if orchestrationLocked(metadata, now) || a.orchestrationLocked(instance.ID, "", now) {
+		if orchestrationLocked(metadata, now) || anyServiceOrchestrationLocked(metadata, now) || a.orchestrationLocked(instance.ID, "", now) {
 			continue
 		}
 		server, err := a.store.GetServer(instance.ServerID, true)
@@ -754,14 +754,11 @@ func (a *Autoscaler) orchestrationLocked(instanceID, serviceName string, now tim
 	if err != nil {
 		return false
 	}
-	serviceName = strings.TrimSpace(serviceName)
 	for _, lock := range locks {
 		if !lock.ExpiresAt.IsZero() && !now.Before(lock.ExpiresAt) {
 			continue
 		}
-		if serviceName == "" || lock.ServiceName == "" || lock.ServiceName == serviceName {
-			return true
-		}
+		return true
 	}
 	return false
 }
@@ -798,7 +795,7 @@ func (s Service) acquireOrchestrationLock(instanceID, operation, serviceName, ac
 		return instance, nil
 	}
 	pruneExpiredOrchestrationLocks(metadata, now)
-	if orchestrationLocked(metadata, now) {
+	if orchestrationLocked(metadata, now) || anyServiceOrchestrationLocked(metadata, now) {
 		return instance, fmt.Errorf("AIFAR instance orchestration is locked")
 	}
 	lock := map[string]any{
@@ -815,9 +812,6 @@ func (s Service) acquireOrchestrationLock(instanceID, operation, serviceName, ac
 		metadata["orchestrationLock"] = lock
 	} else {
 		locks := serviceOrchestrationLocksFromMetadata(metadata)
-		if activeOrchestrationLock(locks[serviceName], now) {
-			return instance, fmt.Errorf("AIFAR service %s orchestration is locked", serviceName)
-		}
 		locks[serviceName] = lock
 		metadata["orchestrationLocks"] = locks
 	}

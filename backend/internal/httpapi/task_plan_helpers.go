@@ -42,3 +42,25 @@ func (a *API) startSimplePlannedTask(w http.ResponseWriter, taskType, target, ac
 	task, err = a.tasks.StartExistingWithLanguage(task, lang, job)
 	return task, err, true
 }
+
+func (a *API) startSimplePlannedTaskWithLocks(w http.ResponseWriter, taskType, target, actor, lang, planTarget string, steps []simpleTaskStep, specs []operationLockSpec, job worker.Job) (store.Task, error, bool) {
+	task, err := a.store.CreateTask(store.Task{Type: taskType, Target: target, Status: "pending", CreatedBy: actor})
+	if err != nil {
+		respondTask(w, task, err)
+		return task, err, false
+	}
+	if err := a.storeTaskPlanOrDelete(task.ID, simpleTaskPlan(planTarget, steps)); err != nil {
+		writeError(w, http.StatusInternalServerError, "TASK_PLAN_STORE_FAILED", err.Error(), map[string]any{"taskType": taskType, "target": target})
+		return task, err, false
+	}
+	locks, ok := a.acquireTaskOperationLocks(w, lang, task, specs)
+	if !ok {
+		return task, nil, false
+	}
+	task, err = a.tasks.StartExistingWithLanguage(task, lang, job)
+	if err != nil {
+		a.releaseOperationLocks(locks)
+		_ = a.store.DeleteTask(task.ID)
+	}
+	return task, err, true
+}

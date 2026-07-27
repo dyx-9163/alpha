@@ -382,8 +382,13 @@ func TestAIFAROrchestrationLockLifecycle(t *testing.T) {
 		Operation:   "scale-service",
 		Actor:       "admin",
 		TaskID:      "tsk-im",
-	}); err != nil {
-		t.Fatalf("different service locks should be allowed: %v", err)
+	}); err == nil {
+		t.Fatal("expected different service mutation to conflict at instance scope")
+	} else {
+		var conflict AIFAROrchestrationLockConflict
+		if !errors.As(err, &conflict) || conflict.Lock.ServiceName != "gateway" {
+			t.Fatalf("expected active gateway mutation to own the instance conflict, got %T %v", err, err)
+		}
 	}
 	if _, err := db.AcquireAIFAROrchestrationLock(AIFAROrchestrationLock{
 		InstanceID:  instance.ID,

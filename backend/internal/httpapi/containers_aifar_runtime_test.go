@@ -997,6 +997,53 @@ func TestAIFARRuntimeRestartAllCreatesPlannedTaskForSelectedInstance(t *testing.
 	assertAuditExists(t, db, "containers.aifar.runtime.restart-all", "running", "owner", instance.ID)
 }
 
+func TestAIFARRuntimeMutationLockReturnsConflictBeforeStartingSecondTask(t *testing.T) {
+	api, db, secret := newAuthzTestAPI(t)
+	restartStarted := make(chan struct{})
+	restartRelease := make(chan struct{})
+	module := &fakeAIFARRuntimeActionModule{restartStarted: restartStarted, restartRelease: restartRelease}
+	api.apps = registry.New(module)
+	api.aifarAgentStatus = func(context.Context, store.Server) aifarRuntimeAgent {
+		return aifarRuntimeAgent{Status: "running", Features: []string{"restart-runtime"}}
+	}
+	dockerAPI := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) }))
+	defer dockerAPI.Close()
+	server, instance := seedAIFARRuntimeFixture(t, db, dockerAPI.URL)
+	token := issueTestToken(t, db, secret, "owner", "owner")
+
+	firstReq := httptest.NewRequest(http.MethodPost, "/api/v2/containers/aifar/runtime/restart-all?serverId="+server.ID, strings.NewReader(`{"instanceId":"`+instance.ID+`"}`))
+	firstReq.Header.Set("Authorization", "Bearer "+token)
+	firstReq.Header.Set("Content-Type", "application/json")
+	firstRec := httptest.NewRecorder()
+	api.Router().ServeHTTP(firstRec, firstReq)
+	if firstRec.Code != http.StatusAccepted {
+		t.Fatalf("expected first mutation to start, got %d body=%s", firstRec.Code, firstRec.Body.String())
+	}
+	firstTaskID := decodeTaskID(t, firstRec)
+	select {
+	case <-restartStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first runtime mutation did not start")
+	}
+
+	secondReq := httptest.NewRequest(http.MethodPost, "/api/v2/containers/aifar/runtime/cleanup-stale?serverId="+server.ID, strings.NewReader(`{"instanceId":"`+instance.ID+`"}`))
+	secondReq.Header.Set("Authorization", "Bearer "+token)
+	secondReq.Header.Set("Content-Type", "application/json")
+	secondRec := httptest.NewRecorder()
+	api.Router().ServeHTTP(secondRec, secondReq)
+
+	if secondRec.Code != http.StatusConflict {
+		close(restartRelease)
+		t.Fatalf("expected second mutation conflict, got %d body=%s", secondRec.Code, secondRec.Body.String())
+	}
+	if !strings.Contains(secondRec.Body.String(), "OPERATION_LOCKED") || !strings.Contains(secondRec.Body.String(), firstTaskID) {
+		close(restartRelease)
+		t.Fatalf("expected conflict to identify the active task, got %s", secondRec.Body.String())
+	}
+	close(restartRelease)
+	waitForTaskStatus(t, db, firstTaskID, "success")
+}
+
 func TestAIFARRuntimeRestartAllRequiresRunningAgent(t *testing.T) {
 	api, db, secret := newAuthzTestAPI(t)
 	api.apps = registry.New(&fakeAIFARRuntimeActionModule{})
@@ -1040,6 +1087,8 @@ type fakeAIFARRuntimeActionModule struct {
 	restartCalls   int
 	restartRequest registry.RuntimeRestartRequest
 	restartErr     error
+	restartStarted chan struct{}
+	restartRelease chan struct{}
 }
 
 func (m *fakeAIFARRuntimeActionModule) Name() string { return "aifar" }
@@ -1077,6 +1126,16 @@ func (m *fakeAIFARRuntimeActionModule) UninstallRuntimeAgent(ctx context.Context
 func (m *fakeAIFARRuntimeActionModule) RestartRuntime(ctx context.Context, req registry.RuntimeRestartRequest, run registry.RunContext) error {
 	m.restartCalls++
 	m.restartRequest = req
+	if m.restartStarted != nil {
+		close(m.restartStarted)
+	}
+	if m.restartRelease != nil {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-m.restartRelease:
+		}
+	}
 	target := req.Server.ID
 	if recorder, ok := run.Log.(interface {
 		StartTarget(string)
