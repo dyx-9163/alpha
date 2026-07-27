@@ -12,6 +12,8 @@ type Config struct {
 	ResourceDir                string `json:"resourceDir"`
 	DatabasePath               string `json:"databasePath"`
 	DatabaseBackupDir          string `json:"databaseBackupDir"`
+	MySQLBackupDir             string `json:"mysqlBackupDir"`
+	MySQLBackupKeepLast        int    `json:"mysqlBackupKeepLast"`
 	BootstrapUsername          string `json:"-"`
 	BootstrapPassword          string `json:"-"`
 	DefaultPassword            string `json:"-"`
@@ -50,6 +52,8 @@ func Load() Config {
 		ResourceDir:                getenv("AIFAR_RESOURCE_DIR", filepath.Join(root, "resources")),
 		DatabasePath:               databasePath,
 		DatabaseBackupDir:          getenv("AIFAR_DATABASE_BACKUP_DIR", filepath.Join(filepath.Dir(databasePath), "backups")),
+		MySQLBackupDir:             getenv("AIFAR_MYSQL_BACKUP_DIR", filepath.Join(root, "data", "mysql-backups")),
+		MySQLBackupKeepLast:        getenvInt("AIFAR_MYSQL_BACKUP_KEEP_LAST", 5),
 		BootstrapUsername:          getenv("AIFAR_BOOTSTRAP_USERNAME", "admin"),
 		BootstrapPassword:          getenv("AIFAR_BOOTSTRAP_PASSWORD", defaultPassword),
 		DefaultPassword:            defaultPassword,

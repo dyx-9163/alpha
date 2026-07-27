@@ -1,6 +1,7 @@
 package store
 
 import (
+	"errors"
 	"path/filepath"
 	"testing"
 )
@@ -224,4 +225,106 @@ func TestCredentialListFallsBackToBindingAppInstanceID(t *testing.T) {
 	if got.AppInstanceID != instance.ID {
 		t.Fatalf("expected get credential to expose binding app instance, got %+v", got)
 	}
+}
+
+func TestGetBoundCredentialReturnsOnlyActiveRequestedBinding(t *testing.T) {
+	s, err := OpenWithSecret(filepath.Join(t.TempDir(), "aifar.db"), "test-secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	instance, err := s.SaveAppInstance(AppInstance{App: "mysql", Version: "8.0.36", Status: "installed"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	admin, err := s.SaveCredential(Credential{Name: "mysql-admin", Kind: "mysql", Status: "active", Secret: map[string]string{"password": "admin-secret"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime, err := s.SaveCredential(Credential{Name: "mysql-runtime", Kind: "mysql", Status: "active", Secret: map[string]string{"password": "runtime-secret"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.BindCredential(CredentialBinding{CredentialID: admin.ID, AppInstanceID: instance.ID, Purpose: "admin"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.BindCredential(CredentialBinding{CredentialID: runtime.ID, AppInstanceID: instance.ID, Purpose: "runtime"}); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := s.GetBoundCredential(instance.ID, "admin", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ID != admin.ID || got.Secret["password"] != "admin-secret" {
+		t.Fatalf("GetBoundCredential returned %+v, want active admin credential with decrypted password", got)
+	}
+	withoutSecret, err := s.GetBoundCredential(instance.ID, "admin", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if withoutSecret.Secret != nil {
+		t.Fatalf("GetBoundCredential without secret returned plaintext: %+v", withoutSecret)
+	}
+	if _, err := s.GetBoundCredential(instance.ID, "replication", true); !errors.Is(err, ErrBoundCredentialNotFound) {
+		t.Fatalf("wrong-purpose error = %v, want ErrBoundCredentialNotFound", err)
+	}
+}
+
+func TestGetBoundCredentialRejectsInactiveMissingSecretAndAmbiguousBindings(t *testing.T) {
+	t.Run("inactive", func(t *testing.T) {
+		s, instance := newBoundCredentialStore(t)
+		inactive, err := s.SaveCredential(Credential{Name: "retired-admin", Kind: "mysql", Status: "retired", Secret: map[string]string{"password": "retired-secret"}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.BindCredential(CredentialBinding{CredentialID: inactive.ID, AppInstanceID: instance.ID, Purpose: "admin"}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.GetBoundCredential(instance.ID, "admin", true); !errors.Is(err, ErrBoundCredentialNotFound) {
+			t.Fatalf("inactive error = %v, want ErrBoundCredentialNotFound", err)
+		}
+	})
+	t.Run("missing secret", func(t *testing.T) {
+		s, instance := newBoundCredentialStore(t)
+		credential, err := s.SaveCredential(Credential{Name: "empty-admin", Kind: "mysql", Status: "active"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.BindCredential(CredentialBinding{CredentialID: credential.ID, AppInstanceID: instance.ID, Purpose: "admin"}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.GetBoundCredential(instance.ID, "admin", true); !errors.Is(err, ErrBoundCredentialSecretMissing) {
+			t.Fatalf("missing-secret error = %v, want ErrBoundCredentialSecretMissing", err)
+		}
+	})
+	t.Run("ambiguous", func(t *testing.T) {
+		s, instance := newBoundCredentialStore(t)
+		for _, name := range []string{"first-admin", "second-admin"} {
+			credential, err := s.SaveCredential(Credential{Name: name, Kind: "mysql", Status: "active", Secret: map[string]string{"password": name}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := s.BindCredential(CredentialBinding{CredentialID: credential.ID, AppInstanceID: instance.ID, Purpose: "admin"}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if _, err := s.GetBoundCredential(instance.ID, "admin", true); !errors.Is(err, ErrBoundCredentialAmbiguous) {
+			t.Fatalf("ambiguous error = %v, want ErrBoundCredentialAmbiguous", err)
+		}
+	})
+}
+
+func newBoundCredentialStore(t *testing.T) (*Store, AppInstance) {
+	t.Helper()
+	s, err := OpenWithSecret(filepath.Join(t.TempDir(), "aifar.db"), "test-secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	instance, err := s.SaveAppInstance(AppInstance{App: "mysql", Version: "8.0.36", Status: "installed"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return s, instance
 }

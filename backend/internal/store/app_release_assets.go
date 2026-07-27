@@ -94,12 +94,25 @@ func (s *Store) SaveAppBackup(backup AppBackup) (AppBackup, error) {
 	if backup.CreatedAt.IsZero() {
 		backup.CreatedAt = time.Now()
 	}
-	_, err := s.db.Exec(`insert into app_backups(id,app,instance_id,server_id,backup_type,status,path,checksum,size,task_id,metadata,created_at,completed_at)
+	result, err := s.db.Exec(`insert into app_backups(id,app,instance_id,server_id,backup_type,status,path,checksum,size,task_id,metadata,created_at,completed_at)
 		values(?,?,?,?,?,?,?,?,?,?,?,?,?)
 		on conflict(id) do update set
-		status=excluded.status,path=excluded.path,checksum=excluded.checksum,size=excluded.size,task_id=excluded.task_id,metadata=excluded.metadata,completed_at=excluded.completed_at`,
+		status=excluded.status,path=excluded.path,checksum=excluded.checksum,size=excluded.size,task_id=excluded.task_id,metadata=excluded.metadata,completed_at=excluded.completed_at
+		where lower(app_backups.status)=lower(excluded.status)
+			or (lower(app_backups.status)='pending' and lower(excluded.status) in ('running','success','failed'))
+			or (lower(app_backups.status)='running' and lower(excluded.status) in ('success','failed'))
+			or (lower(app_backups.status) in ('success','failed') and lower(excluded.status)='deleted')
+			or lower(app_backups.status) not in ('pending','running','success','failed','deleted')`,
 		backup.ID, backup.App, backup.InstanceID, backup.ServerID, backup.BackupType, backup.Status, backup.Path, backup.Checksum, backup.Size, backup.TaskID, backup.Metadata, backup.CreatedAt, nullableTime(backup.CompletedAt))
-	return backup, err
+	if err != nil {
+		return AppBackup{}, err
+	}
+	if rows, err := result.RowsAffected(); err != nil {
+		return AppBackup{}, err
+	} else if rows == 0 {
+		return s.GetAppBackup(backup.ID)
+	}
+	return s.GetAppBackup(backup.ID)
 }
 
 func (s *Store) ListAppBackups(instanceID string) ([]AppBackup, error) {
@@ -115,6 +128,69 @@ func (s *Store) ListAppBackups(instanceID string) ([]AppBackup, error) {
 		return nil, err
 	}
 	defer rows.Close()
+	return scanAppBackups(rows)
+}
+
+func (s *Store) GetAppBackup(id string) (AppBackup, error) {
+	var backup AppBackup
+	var completedAt sql.NullTime
+	err := s.db.QueryRow(`select id,app,coalesce(instance_id,''),coalesce(server_id,''),backup_type,status,coalesce(path,''),coalesce(checksum,''),size,coalesce(task_id,''),coalesce(metadata,'{}'),created_at,completed_at
+		from app_backups where id=?`, strings.TrimSpace(id)).
+		Scan(&backup.ID, &backup.App, &backup.InstanceID, &backup.ServerID, &backup.BackupType, &backup.Status, &backup.Path, &backup.Checksum, &backup.Size, &backup.TaskID, &backup.Metadata, &backup.CreatedAt, &completedAt)
+	if err != nil {
+		return AppBackup{}, err
+	}
+	backup.CompletedAt = nullTime(completedAt)
+	return backup, nil
+}
+
+func (s *Store) ListAppBackupsForInstances(instanceIDs []string, includeDeleted bool) ([]AppBackup, error) {
+	ids := normalizeAppBackupInstanceIDs(instanceIDs)
+	if len(ids) == 0 {
+		return []AppBackup{}, nil
+	}
+	placeholders := make([]string, len(ids))
+	args := make([]any, 0, len(ids)+1)
+	for index, id := range ids {
+		placeholders[index] = "?"
+		args = append(args, id)
+	}
+	query := `select id,app,coalesce(instance_id,''),coalesce(server_id,''),backup_type,status,coalesce(path,''),coalesce(checksum,''),size,coalesce(task_id,''),coalesce(metadata,'{}'),created_at,completed_at
+		from app_backups where instance_id in (` + strings.Join(placeholders, ",") + `)`
+	if !includeDeleted {
+		query += ` and status <> ?`
+		args = append(args, "deleted")
+	}
+	query += ` order by created_at desc, id desc`
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanAppBackups(rows)
+}
+
+func (s *Store) MarkAppBackupDeleted(id string, completedAt time.Time) (AppBackup, error) {
+	backup, err := s.GetAppBackup(id)
+	if err != nil {
+		return AppBackup{}, err
+	}
+	if backup.Status == "deleted" {
+		return backup, nil
+	}
+	if !appBackupStatusTransitionAllowed(backup.Status, "deleted") {
+		return AppBackup{}, fmt.Errorf("backup status %q cannot transition to deleted", backup.Status)
+	}
+	if completedAt.IsZero() {
+		completedAt = time.Now()
+	}
+	if _, err := s.db.Exec(`update app_backups set status='deleted', completed_at=? where id=?`, completedAt, backup.ID); err != nil {
+		return AppBackup{}, err
+	}
+	return s.GetAppBackup(backup.ID)
+}
+
+func scanAppBackups(rows *sql.Rows) ([]AppBackup, error) {
 	out := []AppBackup{}
 	for rows.Next() {
 		var backup AppBackup
@@ -126,6 +202,43 @@ func (s *Store) ListAppBackups(instanceID string) ([]AppBackup, error) {
 		out = append(out, backup)
 	}
 	return out, rows.Err()
+}
+
+func normalizeAppBackupInstanceIDs(instanceIDs []string) []string {
+	seen := map[string]struct{}{}
+	ids := make([]string, 0, len(instanceIDs))
+	for _, id := range instanceIDs {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		if _, exists := seen[id]; exists {
+			continue
+		}
+		seen[id] = struct{}{}
+		ids = append(ids, id)
+	}
+	return ids
+}
+
+func appBackupStatusTransitionAllowed(current, next string) bool {
+	current = strings.ToLower(strings.TrimSpace(current))
+	next = strings.ToLower(strings.TrimSpace(next))
+	if current == next {
+		return true
+	}
+	switch current {
+	case "pending":
+		return next == "running" || next == "success" || next == "failed"
+	case "running":
+		return next == "success" || next == "failed"
+	case "success", "failed":
+		return next == "deleted"
+	case "deleted":
+		return false
+	default:
+		return true
+	}
 }
 
 func deleteAppReleaseAuxiliaryRecordsTx(tx *sql.Tx, instanceID, releaseID string) error {

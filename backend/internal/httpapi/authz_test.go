@@ -420,6 +420,8 @@ func TestSettingsExposeSecurityLimits(t *testing.T) {
 	api.cfg.AuditRetentionDays = 120
 	api.cfg.TaskRetentionDays = 45
 	api.cfg.DatabaseBackupDir = filepath.Join(t.TempDir(), "control-plane-backups")
+	api.cfg.MySQLBackupDir = filepath.Join(t.TempDir(), "mysql-backups")
+	api.cfg.MySQLBackupKeepLast = 8
 	token := issueTestToken(t, db, secret, "owner", "owner")
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v2/settings", nil)
@@ -436,7 +438,8 @@ func TestSettingsExposeSecurityLimits(t *testing.T) {
 		t.Fatal(err)
 	}
 	if body["maxRequestBodyBytes"] != float64(2048) || body["authMaxFailures"] != float64(7) || body["authLockoutSeconds"] != float64(60) ||
-		body["auditRetentionDays"] != float64(120) || body["taskRetentionDays"] != float64(45) || body["databaseBackupDir"] != api.cfg.DatabaseBackupDir {
+		body["auditRetentionDays"] != float64(120) || body["taskRetentionDays"] != float64(45) || body["databaseBackupDir"] != api.cfg.DatabaseBackupDir ||
+		body["mysqlBackupDir"] != api.cfg.MySQLBackupDir || body["mysqlBackupKeepLast"] != float64(8) {
 		t.Fatalf("security limits missing from settings response: %+v", body)
 	}
 }
@@ -704,6 +707,8 @@ func newAuthzTestAPI(t *testing.T) (*API, *store.Store, string) {
 		StaticDir:             root,
 		DatabasePath:          filepath.Join(root, "aifar.db"),
 		DatabaseBackupDir:     filepath.Join(root, "backups"),
+		MySQLBackupDir:        filepath.Join(root, "mysql-backups"),
+		MySQLBackupKeepLast:   5,
 		DefaultDeployDir:      "/aifar/apps",
 		DeploymentConcurrency: 1,
 		ProviderMode:          "real",

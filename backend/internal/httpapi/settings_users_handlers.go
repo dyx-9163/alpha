@@ -20,6 +20,8 @@ func (a *API) getSettings(w http.ResponseWriter, r *http.Request) {
 		"providerMode":             a.cfg.ProviderMode,
 		"databasePath":             a.cfg.DatabasePath,
 		"databaseBackupDir":        a.cfg.DatabaseBackupDir,
+		"mysqlBackupDir":           a.cfg.MySQLBackupDir,
+		"mysqlBackupKeepLast":      a.cfg.MySQLBackupKeepLast,
 		"resourcePath":             a.cfg.ResourceDir,
 		"staticPath":               a.cfg.StaticDir,
 		"defaultDeployDir":         a.cfg.DefaultDeployDir,
