@@ -953,11 +953,7 @@ func runtimeDiagnosticWarningPlaceholders(count int) []string {
 	if count <= 0 {
 		return []string{}
 	}
-	warnings := make([]string, count)
-	for index := range warnings {
-		warnings[index] = fmt.Sprintf("collection-warning-%d", index+1)
-	}
-	return warnings
+	return []string{"collection-warning"}
 }
 
 func runtimeDiagnosticSafeSegment(value string) string {

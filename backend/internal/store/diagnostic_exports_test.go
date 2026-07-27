@@ -455,6 +455,34 @@ func TestSaveDiagnosticExportNormalizesCollectionsAndRejectsUnknownStatuses(t *t
 	}
 }
 
+func TestSaveDiagnosticExportPreservesAggregateWarningCount(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "aifar.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	now := time.Date(2026, 7, 28, 2, 0, 0, 0, time.UTC)
+	saved, err := db.SaveDiagnosticExport(DiagnosticExport{
+		ID: "diag-large-warning-count", InstanceID: "i1", ServerID: "s1", Status: "building",
+		Warnings: []string{"collection-warning"}, WarningCount: 100001,
+		SinceAt: now.Add(-time.Hour), UntilAt: now, ExpiresAt: now.Add(time.Hour),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if saved.WarningCount != 100001 || len(saved.Warnings) != 1 {
+		t.Fatalf("saved warnings = %d/%v, want aggregate count with one warning code", saved.WarningCount, saved.Warnings)
+	}
+	loaded, err := db.GetDiagnosticExport(saved.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.WarningCount != 100001 || len(loaded.Warnings) != 1 {
+		t.Fatalf("loaded warnings = %d/%v, want aggregate count with one warning code", loaded.WarningCount, loaded.Warnings)
+	}
+}
+
 func TestListDiagnosticExportsDueForCleanup(t *testing.T) {
 	db, err := Open(filepath.Join(t.TempDir(), "aifar.db"))
 	if err != nil {

@@ -916,6 +916,27 @@ func TestRuntimeDiagnosticStreamHeaderProtocol(t *testing.T) {
 	}
 }
 
+func TestRuntimeDiagnosticStreamHeaderAcceptsLargeWarningCount(t *testing.T) {
+	line := "AIFAR_DIAG_STREAM_V1\taifar-diagnostics-instance-1-20260727T080000Z.tar.gz\t4096\t100001\tAsia/Shanghai\n"
+	got, err := parseRuntimeDiagnosticStreamHeader(line)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.WarningCount != 100001 {
+		t.Fatalf("warning count = %d, want 100001", got.WarningCount)
+	}
+}
+
+func TestRuntimeDiagnosticWarningPlaceholdersStayBounded(t *testing.T) {
+	warnings := runtimeDiagnosticWarningPlaceholders(100001)
+	if len(warnings) != 1 {
+		t.Fatalf("warning code count = %d, want 1", len(warnings))
+	}
+	if warnings[0] != "collection-warning" {
+		t.Fatalf("warning code = %q, want collection-warning", warnings[0])
+	}
+}
+
 func TestRuntimeDiagnosticTimestampFilterFixtures(t *testing.T) {
 	awkCommand := findRuntimeDiagnosticGNUAwk(t)
 	program, err := renderRuntimeDiagnosticFilterProgram()

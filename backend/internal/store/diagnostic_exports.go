@@ -388,7 +388,7 @@ func normalizeDiagnosticExport(v DiagnosticExport) (DiagnosticExport, error) {
 		return DiagnosticExport{}, fmt.Errorf("unsupported diagnostic export cleanup status %q", v.CleanupStatus)
 	}
 	v.CleanupError = strings.TrimSpace(v.CleanupError)
-	if v.ArchiveBytes < 0 || v.UncompressedBytes < 0 || v.ReservedBytes < 0 {
+	if v.ArchiveBytes < 0 || v.UncompressedBytes < 0 || v.ReservedBytes < 0 || v.WarningCount < 0 {
 		return DiagnosticExport{}, fmt.Errorf("diagnostic export byte sizes must not be negative")
 	}
 	if v.StorageKind == "local" && v.Status == "ready" && v.StorageRelativePath == "" {
@@ -423,7 +423,9 @@ func normalizeDiagnosticExport(v DiagnosticExport) (DiagnosticExport, error) {
 		return DiagnosticExport{}, err
 	}
 	v.WarningsJSON = string(warningsJSON)
-	v.WarningCount = len(v.Warnings)
+	if v.WarningCount < len(v.Warnings) {
+		v.WarningCount = len(v.Warnings)
+	}
 	return v, nil
 }
 

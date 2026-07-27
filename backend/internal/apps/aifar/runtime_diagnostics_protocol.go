@@ -63,7 +63,7 @@ func parseRuntimeDiagnosticStreamHeader(line string) (runtimeDiagnosticStreamHea
 		return result, fmt.Errorf("runtime diagnostic stream uncompressed bytes are invalid")
 	}
 	warningCount, err := parseRuntimeDiagnosticBytes(fields[3])
-	if err != nil || warningCount > 100000 {
+	if err != nil || warningCount > runtimeDiagnosticMaxTotalScan {
 		return result, fmt.Errorf("runtime diagnostic stream warning count is invalid")
 	}
 	if !validRuntimeDiagnosticTimezone(fields[4]) {
