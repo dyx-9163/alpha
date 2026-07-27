@@ -402,6 +402,53 @@ func TestMySQLBackupDeleteRemovesFilesBeforeMarkingDeletedAndAudits(t *testing.T
 	assertAuditExists(t, db, "apps.mysql.backup.delete", "success", "operator", target.ID)
 }
 
+func TestMySQLBackupDeleteRevalidatesInstanceOwnershipAfterLock(t *testing.T) {
+	// Production break caught: a BEFORE INSERT trigger changes the authoritative instance exactly while the mutation lock is acquired, after preflight read it.
+	tests := []struct {
+		name       string
+		assignment func(store.Server) string
+		sensitive  func(store.Server) string
+	}{
+		{name: "app changed", assignment: func(store.Server) string { return `app='redis-private-detail'` }, sensitive: func(store.Server) string { return "redis-private-detail" }},
+		{name: "topology changed", assignment: func(store.Server) string { return `topology='cluster-private-detail'` }, sensitive: func(store.Server) string { return "cluster-private-detail" }},
+		{name: "server changed", assignment: func(server store.Server) string { return fmt.Sprintf("server_id=%q", server.ID) }, sensitive: func(server store.Server) string { return server.ID }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			api, db, secret := newAuthzTestAPI(t)
+			_, instance := saveMySQLBackupTarget(t, db, "standalone", "")
+			otherServer, err := db.SaveServer(store.Server{Name: "other", Host: "10.0.0.9", Username: "root"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			api.cfg.MySQLBackupDir = filepath.Join(t.TempDir(), "mysql-backups")
+			target, directory := saveCommittedMySQLBackup(t, db, api.cfg.MySQLBackupDir, instance, "stale-owner-target")
+			_, _ = saveCommittedMySQLBackup(t, db, api.cfg.MySQLBackupDir, instance, "stale-owner-survivor")
+			trigger := fmt.Sprintf(`create trigger mutate_mysql_backup_owner before insert on operation_locks when new.scope='app-instance' and new.resource_id=%q begin update app_instances set %s where id=%q; end`, instance.ID, test.assignment(otherServer), instance.ID)
+			if _, err := rawExecSQLite(api.cfg.DatabasePath, trigger); err != nil {
+				t.Fatal(err)
+			}
+			token := issueTestToken(t, db, secret, "operator", "operator")
+			req := httptest.NewRequest(http.MethodDelete, "/api/v2/apps/backups/"+target.ID, nil)
+			req.Header.Set("Authorization", "Bearer "+token)
+			req.Header.Set("X-AIFAR-Language", "en")
+			rec := httptest.NewRecorder()
+			api.Router().ServeHTTP(rec, req)
+			if rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), "MYSQL_BACKUP_DELETE_NOT_ALLOWED") || !strings.Contains(rec.Body.String(), "cannot be deleted") || strings.Contains(rec.Body.String(), test.sensitive(otherServer)) {
+				t.Fatalf("DELETE status=%d body=%s", rec.Code, rec.Body.String())
+			}
+			after, err := db.GetAppBackup(target.ID)
+			if err != nil || after.Status != "success" {
+				t.Fatalf("record=%+v err=%v", after, err)
+			}
+			if _, err := os.Stat(directory); err != nil {
+				t.Fatalf("archive directory changed: %v", err)
+			}
+			assertAuditExists(t, db, "apps.mysql.backup.delete", "failed", "operator", target.ID)
+		})
+	}
+}
+
 func TestMySQLBackupDeleteRejectsActiveSoleOrLockedBackupWithoutChangingRecord(t *testing.T) {
 	// Production break caught: deletion must preserve in-flight, sole recovery-point, and operation-locked backups.
 	tests := []struct {

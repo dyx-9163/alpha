@@ -149,6 +149,63 @@ func TestBackupRetentionDeletesOwnedOldArchiveAfterNewRecordIsSuccessful(t *test
 	}
 }
 
+func TestBackupRetentionRevalidatesInstanceOwnershipAfterLock(t *testing.T) {
+	// Production break caught: the request is the pre-lock snapshot; retention must reload the authoritative instance while the worker owns the instance lock.
+	tests := []struct {
+		name, sensitive string
+		mutate          func(*store.AppInstance)
+	}{
+		{name: "app changed", sensitive: "redis-private-detail", mutate: func(instance *store.AppInstance) { instance.App = "redis-private-detail" }},
+		{name: "topology changed", sensitive: "cluster-private-detail", mutate: func(instance *store.AppInstance) { instance.Topology = "cluster-private-detail" }},
+		{name: "server changed", sensitive: "server-private-detail", mutate: func(instance *store.AppInstance) { instance.ServerID = "server-private-detail" }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			module, data, _ := newStandaloneBackupModule(t)
+			request := standaloneBackupRequest(t)
+			repository, err := backuprepo.New(request.RepositoryDir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			paths, err := repository.Prepare("backup_stale_owner")
+			if err != nil {
+				t.Fatal(err)
+			}
+			archive := []byte("stale owner archive")
+			if err := os.WriteFile(paths.PartialArchive, archive, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			digest := fmt.Sprintf("%x", sha256.Sum256(archive))
+			if err := repository.Commit(paths, []byte(`{"backupId":"backup_stale_owner","app":"mysql"}`), digest, int64(len(archive))); err != nil {
+				t.Fatal(err)
+			}
+			data.backups = append(data.backups, store.AppBackup{ID: "backup_stale_owner", App: "mysql", InstanceID: request.Instance.ID, ServerID: request.Instance.ServerID, BackupType: "logical-full", Status: "success", Path: paths.Archive, Checksum: digest, Size: int64(len(archive)), CreatedAt: time.Now().UTC().Add(-time.Hour)})
+			// Simulate the instance changing after HTTP preflight captured request.Instance and before the worker acquired the mutation lock.
+			test.mutate(&data.instance)
+			request.KeepLast = 1
+			recorder := &backupRecorder{}
+			if err := module.Backup(context.Background(), request, registry.RunContext{TaskID: "tsk_1234567890abcdef12345678", Log: recorder}); err != nil {
+				t.Fatal(err)
+			}
+			old, err := data.GetAppBackup("backup_stale_owner")
+			if err != nil || old.Status != "success" {
+				t.Fatalf("old backup=%+v err=%v", old, err)
+			}
+			if _, err := repository.Verify(old); err != nil {
+				t.Fatalf("old archive changed: %v", err)
+			}
+			newest := data.newestBackupExcept(old.ID)
+			if newest.Status != "success" {
+				t.Fatalf("new backup did not succeed: %+v", newest)
+			}
+			warning := strings.Join(recorder.messages, "\n")
+			if !strings.Contains(warning, "MySQL backup retention cleanup failed") || strings.Contains(warning, test.sensitive) {
+				t.Fatalf("retention warning was not localized and sanitized: %q", warning)
+			}
+		})
+	}
+}
+
 func TestBackupRetentionFailureWarnsWithoutFailingNewSuccessfulBackup(t *testing.T) {
 	// Production break caught: an old corrupt/missing candidate must not roll back a newly verified archive.
 	module, data, _ := newStandaloneBackupModule(t)

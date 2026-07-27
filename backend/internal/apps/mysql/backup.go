@@ -564,6 +564,13 @@ func (s Service) backupStandalone(ctx context.Context, req registry.BackupReques
 				}
 				continue
 			}
+			freshInstance, instanceErr := data.GetAppInstance(req.Instance.ID)
+			if instanceErr != nil || !sameStandaloneBackupOwner(req.Instance, freshInstance, candidate) {
+				if run.Log != nil {
+					run.Log.Error("%s", copy.RetentionCleanupFailed)
+				}
+				continue
+			}
 			fresh, freshErr := data.GetAppBackup(candidate.ID)
 			if freshErr != nil || !sameBackupRecord(candidate, fresh) {
 				if run.Log != nil {
@@ -617,6 +624,11 @@ func sameBackupRecord(left, right store.AppBackup) bool {
 	return left.ID == right.ID && left.App == right.App && left.InstanceID == right.InstanceID && left.ServerID == right.ServerID &&
 		left.BackupType == right.BackupType && left.Status == "success" && right.Status == "success" && sameBackupPath(left.Path, right.Path) &&
 		left.Checksum == right.Checksum && left.Size == right.Size
+}
+
+func sameStandaloneBackupOwner(expected, current store.AppInstance, backup store.AppBackup) bool {
+	return current.ID == expected.ID && current.ID == backup.InstanceID && current.App == "mysql" && instanceTopology(current) == "standalone" &&
+		current.ServerID == expected.ServerID && current.ServerID == backup.ServerID
 }
 
 func (s Service) retainUnavailableDownloaderFailure(req registry.BackupRequest, run registry.RunContext, data backupStore) error {

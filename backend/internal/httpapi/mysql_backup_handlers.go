@@ -273,6 +273,11 @@ func (a *API) deleteMySQLBackup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer a.store.ReleaseOperationLock(lock.ID)
+	freshInstance, err := a.store.GetAppInstance(instance.ID)
+	if err != nil || !sameStandaloneMySQLBackupOwner(instance, freshInstance, backup) {
+		fail(http.StatusConflict, "MYSQL_BACKUP_DELETE_NOT_ALLOWED")
+		return
+	}
 	repository, err := backuprepo.New(a.cfg.MySQLBackupDir)
 	if err != nil {
 		fail(http.StatusConflict, "MYSQL_BACKUP_DELETE_FAILED")
@@ -330,4 +335,9 @@ func (a *API) deleteMySQLBackup(w http.ResponseWriter, r *http.Request) {
 
 func sameMySQLBackupRecord(left, right store.AppBackup) bool {
 	return left.ID == right.ID && left.App == right.App && left.InstanceID == right.InstanceID && left.ServerID == right.ServerID && left.BackupType == right.BackupType && left.Status == right.Status && left.Path == right.Path && left.Checksum == right.Checksum && left.Size == right.Size && left.TaskID == right.TaskID && left.Metadata == right.Metadata && left.CreatedAt.Equal(right.CreatedAt) && left.CompletedAt.Equal(right.CompletedAt)
+}
+
+func sameStandaloneMySQLBackupOwner(expected, current store.AppInstance, backup store.AppBackup) bool {
+	return current.ID == expected.ID && current.ID == backup.InstanceID && current.App == "mysql" &&
+		strings.ToLower(strings.TrimSpace(current.Topology)) == "standalone" && current.ServerID == expected.ServerID && current.ServerID == backup.ServerID
 }
