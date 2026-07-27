@@ -3,6 +3,8 @@
 package backuprepo
 
 import (
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"unsafe"
@@ -85,6 +87,75 @@ func platformCreateRegularAt(parent *os.File, parentPath, name string, mode os.F
 		return nil, err
 	}
 	return os.NewFile(uintptr(handle), path), nil
+}
+
+func platformOpenLockAt(parent *os.File, parentPath, name string, create bool) (*os.File, error) {
+	if err := validateSingleName(name); err != nil {
+		return nil, err
+	}
+	path := filepath.Join(parentPath, name)
+	pathName, err := windows.UTF16PtrFromString(path)
+	if err != nil {
+		return nil, err
+	}
+	disposition := uint32(windows.OPEN_EXISTING)
+	if create {
+		disposition = windows.CREATE_NEW
+	}
+	handle, err := windows.CreateFile(pathName, windows.GENERIC_READ|windows.GENERIC_WRITE,
+		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE, nil, disposition,
+		windows.FILE_ATTRIBUTE_NORMAL|windows.FILE_FLAG_OPEN_REPARSE_POINT, 0)
+	if err != nil {
+		return nil, err
+	}
+	var info windows.ByHandleFileInformation
+	if err := windows.GetFileInformationByHandle(handle, &info); err != nil {
+		windows.CloseHandle(handle)
+		return nil, err
+	}
+	if info.FileAttributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 || info.FileAttributes&windows.FILE_ATTRIBUTE_DIRECTORY != 0 {
+		windows.CloseHandle(handle)
+		return nil, errors.New("backup repository lock is not a regular file")
+	}
+	return os.NewFile(uintptr(handle), path), nil
+}
+
+func platformTryExclusiveLock(file *os.File) error {
+	var overlapped windows.Overlapped
+	if err := windows.LockFileEx(windows.Handle(file.Fd()), windows.LOCKFILE_EXCLUSIVE_LOCK|windows.LOCKFILE_FAIL_IMMEDIATELY, 0, 1, 0, &overlapped); err != nil {
+		return fmt.Errorf("lock backup repository: %w", err)
+	}
+	return nil
+}
+
+func platformUnlock(file *os.File) error {
+	var overlapped windows.Overlapped
+	return windows.UnlockFileEx(windows.Handle(file.Fd()), 0, 1, 0, &overlapped)
+}
+
+func platformValidateRootSecurity(info os.FileInfo) error {
+	if info == nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return errors.New("backup repository root is not a directory")
+	}
+	return nil
+}
+
+func platformValidateLockSecurity(info os.FileInfo) error {
+	if info == nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+		return errors.New("backup repository lock is not a regular file")
+	}
+	return nil
+}
+
+func platformRequireSingleLink(file *os.File) error {
+	var info windows.ByHandleFileInformation
+	if err := windows.GetFileInformationByHandle(windows.Handle(file.Fd()), &info); err != nil {
+		return err
+	}
+	if info.NumberOfLinks != 1 {
+		return fmt.Errorf("backup partial must have exactly one hard link, got %d", info.NumberOfLinks)
+	}
+	return nil
 }
 
 func platformRenameNoReplaceAt(parent *os.File, parentPath, oldName, newName string) error {

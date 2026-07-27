@@ -3,9 +3,11 @@
 package backuprepo
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"syscall"
 
 	"golang.org/x/sys/unix"
 )
@@ -55,6 +57,78 @@ func platformCreateRegularAt(parent *os.File, parentPath, name string, mode os.F
 	return os.NewFile(uintptr(fd), filepath.Join(parentPath, name)), nil
 }
 
+func platformOpenLockAt(parent *os.File, parentPath, name string, create bool) (*os.File, error) {
+	if err := validateSingleName(name); err != nil {
+		return nil, err
+	}
+	flags := unix.O_RDWR | unix.O_CLOEXEC | unix.O_NOFOLLOW | unix.O_NONBLOCK
+	if create {
+		flags |= unix.O_CREAT | unix.O_EXCL
+	}
+	fd, err := unix.Openat(int(parent.Fd()), name, flags, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	file := os.NewFile(uintptr(fd), filepath.Join(parentPath, name))
+	if create {
+		if err := unix.Fchmod(fd, 0o600); err != nil {
+			file.Close()
+			return nil, err
+		}
+	}
+	return file, nil
+}
+
+func platformTryExclusiveLock(file *os.File) error {
+	if err := unix.Flock(int(file.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
+		return fmt.Errorf("lock backup repository: %w", err)
+	}
+	return nil
+}
+
+func platformUnlock(file *os.File) error {
+	return unix.Flock(int(file.Fd()), unix.LOCK_UN)
+}
+
+func platformValidateRootSecurity(info os.FileInfo) error {
+	if info == nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return errors.New("backup repository root is not a directory")
+	}
+	if info.Mode().Perm() != 0o700 {
+		return fmt.Errorf("backup repository root must have mode 0700, got %04o", info.Mode().Perm())
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || stat.Uid != uint32(os.Geteuid()) {
+		return errors.New("backup repository root is not owned by the current user")
+	}
+	return nil
+}
+
+func platformValidateLockSecurity(info os.FileInfo) error {
+	if info == nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+		return errors.New("backup repository lock is not a regular file")
+	}
+	if info.Mode().Perm() != 0o600 {
+		return fmt.Errorf("backup repository lock must have mode 0600, got %04o", info.Mode().Perm())
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || stat.Uid != uint32(os.Geteuid()) {
+		return errors.New("backup repository lock is not owned by the current user")
+	}
+	return nil
+}
+
+func platformRequireSingleLink(file *os.File) error {
+	var stat unix.Stat_t
+	if err := unix.Fstat(int(file.Fd()), &stat); err != nil {
+		return err
+	}
+	if stat.Nlink != 1 {
+		return fmt.Errorf("backup partial must have exactly one hard link, got %d", stat.Nlink)
+	}
+	return nil
+}
+
 func platformRenameNoReplaceAt(parent *os.File, parentPath, oldName, newName string) error {
 	if err := validateSingleName(oldName); err != nil {
 		return err
@@ -89,9 +163,6 @@ func platformUnlinkOwnedAt(parent *os.File, parentPath, name string, expected os
 }
 
 func platformSealRegular(file *os.File) error {
-	if err := unix.Fchmod(int(file.Fd()), 0o400); err != nil {
-		return err
-	}
 	if err := unix.Flock(int(file.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
 		return fmt.Errorf("lock promoted backup archive: %w", err)
 	}

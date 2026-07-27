@@ -17,6 +17,24 @@ func platformOpenRegularAt(parent *os.File, parentPath, name string, flag int) (
 func platformCreateRegularAt(parent *os.File, parentPath, name string, mode os.FileMode) (*os.File, error) {
 	return nil, fmt.Errorf("anchored regular-file creation is unsupported on this platform")
 }
+func platformOpenLockAt(parent *os.File, parentPath, name string, create bool) (*os.File, error) {
+	return nil, fmt.Errorf("anchored repository locking is unsupported on this platform")
+}
+func platformTryExclusiveLock(file *os.File) error {
+	return fmt.Errorf("repository locking is unsupported on this platform")
+}
+func platformUnlock(file *os.File) error {
+	return fmt.Errorf("repository unlocking is unsupported on this platform")
+}
+func platformValidateRootSecurity(info os.FileInfo) error {
+	return fmt.Errorf("repository root security validation is unsupported on this platform")
+}
+func platformValidateLockSecurity(info os.FileInfo) error {
+	return fmt.Errorf("repository lock security validation is unsupported on this platform")
+}
+func platformRequireSingleLink(file *os.File) error {
+	return fmt.Errorf("hard-link validation is unsupported on this platform")
+}
 func platformRenameNoReplaceAt(parent *os.File, parentPath, oldName, newName string) error {
 	return fmt.Errorf("anchored atomic non-clobber rename is unsupported on this platform")
 }

@@ -12,6 +12,7 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"sync"
 
 	"aifar-deployment/backend/internal/store"
 )
@@ -26,8 +27,9 @@ const (
 )
 
 type Repository struct {
-	root string
-	hook func(point, path string) error
+	root  string
+	mutex *sync.Mutex
+	hook  func(point, path string) error
 }
 
 type BackupPaths struct {
@@ -111,19 +113,51 @@ func New(root string) (*Repository, error) {
 	if err := ensureNoSymlinkBoundaries(abs); err != nil {
 		return nil, err
 	}
-	if err := os.MkdirAll(abs, 0o700); err != nil {
-		return nil, fmt.Errorf("create backup repository root: %w", err)
+	_, statErr := os.Lstat(abs)
+	created := errors.Is(statErr, os.ErrNotExist)
+	if statErr != nil && !created {
+		return nil, fmt.Errorf("inspect backup repository root: %w", statErr)
+	}
+	if created {
+		if err := os.MkdirAll(abs, 0o700); err != nil {
+			return nil, fmt.Errorf("create backup repository root: %w", err)
+		}
+		if err := os.Chmod(abs, 0o700); err != nil && runtime.GOOS != "windows" {
+			return nil, fmt.Errorf("secure backup repository root: %w", err)
+		}
 	}
 	if err := requireDirectory(abs); err != nil {
 		return nil, err
 	}
-	if err := os.Chmod(abs, 0o700); err != nil && runtime.GOOS != "windows" {
-		return nil, fmt.Errorf("secure backup repository root: %w", err)
+	rootFile, err := platformOpenRoot(abs)
+	if err != nil {
+		return nil, fmt.Errorf("open backup repository root: %w", err)
 	}
-	return &Repository{root: abs}, nil
+	rootInfo, err := rootFile.Stat()
+	rootFile.Close()
+	if err != nil {
+		return nil, fmt.Errorf("inspect backup repository root: %w", err)
+	}
+	if err := platformValidateRootSecurity(rootInfo); err != nil {
+		return nil, err
+	}
+	return &Repository{root: abs, mutex: mutexForRepositoryRoot(abs)}, nil
 }
 
 func (r *Repository) Prepare(backupID string) (BackupPaths, error) {
+	var paths BackupPaths
+	err := r.withRepositoryLock(func() error {
+		if err := r.checkpoint("prepare.locked", r.root); err != nil {
+			return err
+		}
+		var err error
+		paths, err = r.prepareUnlocked(backupID)
+		return err
+	})
+	return paths, err
+}
+
+func (r *Repository) prepareUnlocked(backupID string) (BackupPaths, error) {
 	if r == nil {
 		return BackupPaths{}, errors.New("backup repository is nil")
 	}
@@ -150,6 +184,12 @@ func (r *Repository) Prepare(backupID string) (BackupPaths, error) {
 }
 
 func (r *Repository) Commit(paths BackupPaths, manifest []byte, expectedSHA256 string, expectedSize int64) (retErr error) {
+	return r.withRepositoryLock(func() error {
+		return r.commitUnlocked(paths, manifest, expectedSHA256, expectedSize)
+	})
+}
+
+func (r *Repository) commitUnlocked(paths BackupPaths, manifest []byte, expectedSHA256 string, expectedSize int64) (retErr error) {
 	backupID, err := r.validatePaths(paths)
 	if err != nil {
 		return err
@@ -175,6 +215,11 @@ func (r *Repository) Commit(paths BackupPaths, manifest []byte, expectedSHA256 s
 	defer boundaries.close()
 	partial, err := openStableRegularAt(boundaries.directory, partialName, os.O_RDWR)
 	if err != nil {
+		return err
+	}
+	if err := platformRequireSingleLink(partial.file); err != nil {
+		partial.file.Close()
+		partial.file = nil
 		return err
 	}
 	partialBound := true
@@ -344,12 +389,16 @@ func (r *Repository) Commit(paths BackupPaths, manifest []byte, expectedSHA256 s
 }
 
 func (r *Repository) Verify(backup store.AppBackup) (Verification, error) {
-	verification, boundaries, err := r.verifyAnchored(backup)
-	defer func() {
+	var verification Verification
+	err := r.withRepositoryLock(func() error {
+		var boundaries *stableBoundaries
+		var err error
+		verification, boundaries, err = r.verifyAnchored(backup)
 		if boundaries != nil {
-			boundaries.close()
+			defer boundaries.close()
 		}
-	}()
+		return err
+	})
 	return verification, err
 }
 
@@ -424,6 +473,12 @@ func (r *Repository) verifyAnchored(backup store.AppBackup) (Verification, *stab
 }
 
 func (r *Repository) Delete(backup store.AppBackup) (retErr error) {
+	return r.withRepositoryLock(func() error {
+		return r.deleteUnlocked(backup)
+	})
+}
+
+func (r *Repository) deleteUnlocked(backup store.AppBackup) (retErr error) {
 	verification, boundaries, err := r.verifyAnchored(backup)
 	defer func() {
 		if boundaries != nil {
@@ -583,7 +638,16 @@ func (r *Repository) validateRoot() error {
 	if err := ensureNoSymlinkBoundaries(r.root); err != nil {
 		return err
 	}
-	return requireDirectory(r.root)
+	root, err := platformOpenRoot(r.root)
+	if err != nil {
+		return err
+	}
+	defer root.Close()
+	info, err := root.Stat()
+	if err != nil {
+		return err
+	}
+	return platformValidateRootSecurity(info)
 }
 
 func (r *Repository) validatePaths(paths BackupPaths) (string, error) {

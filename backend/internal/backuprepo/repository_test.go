@@ -38,6 +38,141 @@ func TestNewRejectsSymlinkedRootBoundary(t *testing.T) {
 	}
 }
 
+func TestRepositoryInstancesSerializeLifecycleOperationsByCanonicalRoot(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "mysql-backups")
+	first, err := New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	first.hook = func(point, path string) error {
+		if point == "prepare.locked" {
+			close(entered)
+			<-release
+		}
+		return nil
+	}
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := first.Prepare("backup-first-lock")
+		firstDone <- err
+	}()
+	<-entered
+	secondDone := make(chan error, 1)
+	go func() {
+		_, err := second.Prepare("backup-second-lock")
+		secondDone <- err
+	}()
+	select {
+	case err := <-secondDone:
+		t.Fatalf("second Repository bypassed root mutex: %v", err)
+	case <-time.After(150 * time.Millisecond):
+	}
+	close(release)
+	if err := <-firstDone; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-secondDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRepositoryFailsClosedDuringExternalLockContention(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "mysql-backups")
+	repo, err := New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := acquireRepositoryFileLock(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lease.release()
+	if _, err := repo.Prepare("backup-lock-contended"); err == nil {
+		t.Fatal("Prepare proceeded without the exclusive cross-process lock")
+	}
+	if _, err := os.Lstat(filepath.Join(root, "backup-lock-contended")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("contended operation changed repository: %v", err)
+	}
+}
+
+func TestRepositoryReleasesFileLockAfterSuccessAndError(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "mysql-backups")
+	repo, err := New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.Prepare("backup-lock-success"); err != nil {
+		t.Fatal(err)
+	}
+	assertRepositoryLockAvailable(t, root)
+	if _, err := repo.Prepare("../invalid"); err == nil {
+		t.Fatal("Prepare accepted invalid ID")
+	}
+	assertRepositoryLockAvailable(t, root)
+}
+
+func TestRepositoryLockFileIsContainedRegularAndOwnerOnly(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "mysql-backups")
+	repo, err := New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.Prepare("backup-lock-file"); err != nil {
+		t.Fatal(err)
+	}
+	lockPath := filepath.Join(root, repositoryLockName)
+	info, err := os.Lstat(lockPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+		t.Fatalf("lock file mode = %v, want regular non-symlink", info.Mode())
+	}
+	if runtime.GOOS != "windows" && info.Mode().Perm() != 0o600 {
+		t.Fatalf("lock file permissions = %o, want 0600", info.Mode().Perm())
+	}
+	if !samePath(filepath.Dir(lockPath), repo.root) {
+		t.Fatalf("lock file escaped root: %q", lockPath)
+	}
+}
+
+func TestRepositoryRejectsNonRegularLockFile(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "mysql-backups")
+	repo, err := New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(root, repositoryLockName), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.Prepare("backup-invalid-lock"); err == nil {
+		t.Fatal("Prepare accepted a non-regular lock file")
+	}
+	assertNotExist(t, filepath.Join(root, "backup-invalid-lock"))
+}
+
+func TestNewRejectsInsecureLinuxRootMode(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("Linux ownership and mode enforcement")
+	}
+	root := filepath.Join(t.TempDir(), "mysql-backups")
+	if err := os.Mkdir(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := New(root); err == nil {
+		t.Fatal("New accepted Linux repository root without exact 0700 mode")
+	}
+}
+
 func TestPrepareRejectsUnmanagedBackupIDs(t *testing.T) {
 	repo, err := New(t.TempDir())
 	if err != nil {
@@ -264,6 +399,32 @@ func TestCommitRejectsManifestLargerThanVerificationLimit(t *testing.T) {
 	if _, err := os.Lstat(paths.Archive); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("archive exists after oversized manifest rejection: %v", err)
 	}
+}
+
+func TestCommitRejectsMultiLinkPartialWithoutChangingExternalLink(t *testing.T) {
+	repo, paths := prepareRepository(t, "backup-hard-link")
+	content := []byte("hard-linked archive")
+	writePartial(t, paths, content)
+	external := filepath.Join(t.TempDir(), "external.tar")
+	if err := os.Link(paths.PartialArchive, external); err != nil {
+		t.Skipf("hard links unavailable on test filesystem: %v", err)
+	}
+	before, err := os.Lstat(external)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.Commit(paths, []byte(`{"backupId":"backup-hard-link"}`), digestBytes(content), int64(len(content))); err == nil {
+		t.Fatal("Commit accepted a partial with multiple hard links")
+	}
+	after, err := os.Lstat(external)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Mode().Perm() != before.Mode().Perm() {
+		t.Fatalf("external hard-link permissions changed from %o to %o", before.Mode().Perm(), after.Mode().Perm())
+	}
+	assertFileContent(t, external, content)
+	assertNotExist(t, paths.Archive)
 }
 
 func TestCommitRejectsPartialPathSwapAfterHashWithoutRemovingReplacement(t *testing.T) {
@@ -892,5 +1053,16 @@ func assertNotExist(t *testing.T, path string) {
 	t.Helper()
 	if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("%q exists or cannot be checked: %v", path, err)
+	}
+}
+
+func assertRepositoryLockAvailable(t *testing.T, root string) {
+	t.Helper()
+	lease, err := acquireRepositoryFileLock(root)
+	if err != nil {
+		t.Fatalf("repository lock was not released: %v", err)
+	}
+	if err := lease.release(); err != nil {
+		t.Fatalf("release repository lock: %v", err)
 	}
 }
