@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"strings"
 
@@ -74,7 +75,7 @@ func (a *API) startMySQLBackup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if appInstanceTopology(instance) != "standalone" {
-		writeError(w, http.StatusBadRequest, "MYSQL_BACKUP_UNSUPPORTED_TOPOLOGY", mysqlBackupHandlerText(lang, "unsupported"), map[string]any{"instanceId": instanceID})
+		writeError(w, http.StatusBadRequest, "MYSQL_BACKUP_UNSUPPORTED_TOPOLOGY", i18n.MySQLBackupErrorText(lang, "MYSQL_BACKUP_UNSUPPORTED_TOPOLOGY"), map[string]any{"instanceId": instanceID})
 		return
 	}
 	if strings.TrimSpace(instance.ServerID) == "" {
@@ -93,7 +94,7 @@ func (a *API) startMySQLBackup(w http.ResponseWriter, r *http.Request) {
 	}
 	backupModule, supportsBackup := module.(registry.BackupModule)
 	if !supportsBackup {
-		writeError(w, http.StatusConflict, "MYSQL_BACKUP_UNSUPPORTED", mysqlBackupHandlerText(lang, "unsupported"), map[string]any{"instanceId": instanceID})
+		writeError(w, http.StatusConflict, "MYSQL_BACKUP_UNSUPPORTED", i18n.MySQLBackupErrorText(lang, "MYSQL_BACKUP_UNSUPPORTED_TOPOLOGY"), map[string]any{"instanceId": instanceID})
 		return
 	}
 	keepLast := a.cfg.MySQLBackupKeepLast
@@ -113,7 +114,13 @@ func (a *API) startMySQLBackup(w http.ResponseWriter, r *http.Request) {
 	}
 	plan, err := backupModule.PlanBackup(r.Context(), backupRequest)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "MYSQL_BACKUP_PLAN_FAILED", err.Error(), map[string]any{"instanceId": instanceID})
+		var stable interface{ StableCode() string }
+		if errors.As(err, &stable) && stable.StableCode() != "" {
+			code := stable.StableCode()
+			writeError(w, http.StatusBadRequest, code, i18n.MySQLBackupErrorText(lang, code), map[string]any{"instanceId": instanceID})
+			return
+		}
+		writeError(w, http.StatusBadRequest, "MYSQL_BACKUP_PLAN_FAILED", i18n.Text(lang, "mysql.backup.planFailed"), map[string]any{"instanceId": instanceID})
 		return
 	}
 	task, err := a.store.CreateTask(store.Task{Type: mysqlBackupTaskType, Target: instance.ID, Status: "pending", CreatedBy: actor})
@@ -122,7 +129,7 @@ func (a *API) startMySQLBackup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := a.storeInstallPlanOrDelete(task.ID, plan); err != nil {
-		writeError(w, http.StatusInternalServerError, "MYSQL_BACKUP_PLAN_STORE_FAILED", err.Error(), map[string]any{"instanceId": instanceID})
+		writeError(w, http.StatusInternalServerError, "MYSQL_BACKUP_PLAN_STORE_FAILED", i18n.Text(lang, "mysql.backup.planStoreFailed"), map[string]any{"instanceId": instanceID})
 		return
 	}
 	locks, acquired := a.acquireTaskOperationLocks(w, lang, task, mysqlBackupOperationLockSpecs(instance))
@@ -130,7 +137,7 @@ func (a *API) startMySQLBackup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	task, err = a.tasks.StartExistingWithLanguage(task, lang, func(ctx context.Context, log worker.Logger) error {
-		log.Info("%s", mysqlBackupHandlerText(lang, "started"))
+		log.Info("%s", i18n.Text(lang, "mysql.backup.taskStarted"))
 		if err := backupModule.Backup(ctx, backupRequest.Clone(), registry.RunContext{
 			TaskID:      log.TaskID(),
 			Log:         log,
@@ -139,7 +146,7 @@ func (a *API) startMySQLBackup(w http.ResponseWriter, r *http.Request) {
 		}); err != nil {
 			return err
 		}
-		log.Info("%s", mysqlBackupHandlerText(lang, "completed"))
+		log.Info("%s", i18n.Text(lang, "mysql.backup.taskCompleted"))
 		return nil
 	})
 	if err != nil {
@@ -149,25 +156,4 @@ func (a *API) startMySQLBackup(w http.ResponseWriter, r *http.Request) {
 		a.audit(r, mysqlBackupTaskType, instance.ID, "running", task.ID)
 	}
 	respondTask(w, task, err)
-}
-
-func mysqlBackupHandlerText(lang, kind string) string {
-	english := strings.HasPrefix(strings.ToLower(strings.TrimSpace(lang)), "en")
-	switch kind {
-	case "started":
-		if english {
-			return "MySQL backup task started"
-		}
-		return "MySQL 备份任务已启动"
-	case "completed":
-		if english {
-			return "MySQL backup task completed"
-		}
-		return "MySQL 备份任务已完成"
-	default:
-		if english {
-			return "MySQL backup topology is unsupported"
-		}
-		return "不支持该 MySQL 备份拓扑"
-	}
 }

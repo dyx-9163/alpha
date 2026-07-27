@@ -6,33 +6,35 @@ import (
 	globali18n "aifar-deployment/backend/internal/i18n"
 )
 
-var mysqlBackupErrorMessageKeys = map[string]string{
-	MySQLCredentialUnavailable:           "mysql.backup.credentialUnavailable",
-	MySQLBackupUnsupportedTopology:       "mysql.backup.unsupportedTopology",
-	MySQLBackupClusterUnhealthy:          "mysql.backup.clusterUnhealthy",
-	MySQLBackupPrimaryNotFound:           "mysql.backup.primaryNotFound",
-	MySQLBackupSpaceInsufficient:         "mysql.backup.spaceInsufficient",
-	MySQLBackupTransferFailed:            "mysql.backup.transferFailed",
-	MySQLBackupChecksumMismatch:          "mysql.backup.checksumMismatch",
-	MySQLRestoreMaintenanceRequired:      "mysql.restore.maintenanceRequired",
-	MySQLRestoreVersionIncompatible:      "mysql.restore.versionIncompatible",
-	MySQLRestoreManifestInvalid:          "mysql.restore.manifestInvalid",
-	MySQLRestoreTargetNotClean:           "mysql.restore.targetNotClean",
-	MySQLRestorePrimaryChanged:           "mysql.restore.primaryChanged",
-	MySQLRestoreLocalInfileRestoreFailed: "mysql.restore.localInfileRestoreFailed",
-	MySQLRestoreIncomplete:               "mysql.restore.incomplete",
-	MySQLRebuildConfirmationRequired:     "mysql.rebuild.confirmationRequired",
-	MySQLRebuildRouterFailed:             "mysql.rebuild.routerFailed",
-}
-
 // MySQLBackupErrorText turns an approved stable error code into a localized,
 // non-secret user message. Unknown codes intentionally fall back to the code.
 func MySQLBackupErrorText(lang, code string) string {
-	key, ok := mysqlBackupErrorMessageKeys[code]
-	if !ok {
-		return code
+	return globali18n.MySQLBackupErrorText(lang, code)
+}
+
+type BackupCopy struct {
+	StepStart           string
+	StepDone            string
+	StepFailed          string
+	RemoteCleanupFailed string
+	RetentionSelected   string
+	StepTitles          map[string]string
+}
+
+func BackupCopyFor(lang string) BackupCopy {
+	names := []string{"load-instance", "acquire-instance-lock", "resolve-credential", "inspect-mysql", "check-backup-space", "prepare-workdir", "dry-run-dump", "dump-instance", "build-manifest", "package-backup", "transfer-backup", "verify-checksum", "record-backup", "apply-retention", "cleanup-workdir"}
+	titles := make(map[string]string, len(names))
+	for _, name := range names {
+		titles[name] = globali18n.Text(lang, "mysql.backup.step."+name)
 	}
-	return globali18n.Text(lang, key)
+	return BackupCopy{
+		StepStart:           globali18n.Text(lang, "mysql.backup.stepStart"),
+		StepDone:            globali18n.Text(lang, "mysql.backup.stepDone"),
+		StepFailed:          globali18n.Text(lang, "mysql.backup.stepFailed"),
+		RemoteCleanupFailed: globali18n.Text(lang, "mysql.backup.remoteCleanupFailed"),
+		RetentionSelected:   globali18n.Text(lang, "mysql.backup.retentionSelected"),
+		StepTitles:          titles,
+	}
 }
 
 type Copy struct {

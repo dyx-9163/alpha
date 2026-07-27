@@ -3,6 +3,7 @@ package httpapi
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -10,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	mysqlapp "aifar-deployment/backend/internal/apps/mysql"
 	"aifar-deployment/backend/internal/apps/registry"
 	"aifar-deployment/backend/internal/store"
 )
@@ -157,6 +159,55 @@ func TestMySQLBackupHandlerReturnsConflictForExistingMutationLock(t *testing.T) 
 	}
 }
 
+func TestMySQLBackupHandlerPreservesAndLocalizesStablePlanError(t *testing.T) {
+	// Production break caught: wrapping a stable module error in a generic handler code/raw message breaks clients and can expose sensitive internals.
+	tests := []struct {
+		language string
+		message  string
+	}{
+		{"en", "insufficient space for MySQL backup"},
+		{"zh-CN", "MySQL 备份空间不足"},
+	}
+	for _, test := range tests {
+		t.Run(test.language, func(t *testing.T) {
+			api, db, secret := newAuthzTestAPI(t)
+			_, instance := saveMySQLBackupTarget(t, db, "standalone", "")
+			module := newBackupHandlerModule()
+			module.planErr = &mysqlapp.MySQLOperationError{Code: mysqlapp.MySQLBackupSpaceInsufficient}
+			api.apps = registry.New(module)
+			token := issueTestToken(t, db, secret, "operator", "operator")
+			req := httptest.NewRequest(http.MethodPost, "/api/v2/apps/instances/"+instance.ID+"/backup", strings.NewReader(`{}`))
+			req.Header.Set("Authorization", "Bearer "+token)
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("X-AIFAR-Language", test.language)
+			rec := httptest.NewRecorder()
+			api.Router().ServeHTTP(rec, req)
+			if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), `"code":"MYSQL_BACKUP_SPACE_INSUFFICIENT"`) || !strings.Contains(rec.Body.String(), test.message) {
+				t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+			}
+		})
+	}
+}
+
+func TestMySQLBackupHandlerDoesNotExposeGenericPlanErrorDetails(t *testing.T) {
+	// Production break caught: generic planning failures must use catalog text rather than reflecting arbitrary error strings to API users.
+	api, db, secret := newAuthzTestAPI(t)
+	_, instance := saveMySQLBackupTarget(t, db, "standalone", "")
+	module := newBackupHandlerModule()
+	module.planErr = errors.New("raw internal detail top-secret")
+	api.apps = registry.New(module)
+	token := issueTestToken(t, db, secret, "operator", "operator")
+	req := httptest.NewRequest(http.MethodPost, "/api/v2/apps/instances/"+instance.ID+"/backup", strings.NewReader(`{}`))
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-AIFAR-Language", "en")
+	rec := httptest.NewRecorder()
+	api.Router().ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), `"code":"MYSQL_BACKUP_PLAN_FAILED"`) || !strings.Contains(rec.Body.String(), "Unable to plan MySQL backup") || strings.Contains(rec.Body.String(), "top-secret") {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
 func TestMySQLBackupListExcludesDeletedAndExpandsClusterMembersOnce(t *testing.T) {
 	// Production break caught: listing only the clicked cluster member or including deleted rows would hide/duplicate cluster-level history.
 	api, db, secret := newAuthzTestAPI(t)
@@ -199,6 +250,7 @@ type backupHandlerCall struct {
 type backupHandlerModule struct {
 	calls   chan backupHandlerCall
 	release chan struct{}
+	planErr error
 }
 
 func newBackupHandlerModule() *backupHandlerModule {
@@ -221,6 +273,9 @@ func (m *backupHandlerModule) Install(context.Context, registry.InstallRequest, 
 	return nil
 }
 func (m *backupHandlerModule) PlanBackup(_ context.Context, req registry.BackupRequest) ([]registry.InstallStepPlan, error) {
+	if m.planErr != nil {
+		return nil, m.planErr
+	}
 	out := make([]registry.InstallStepPlan, len(mysqlBackupHandlerSteps))
 	for index, name := range mysqlBackupHandlerSteps {
 		out[index] = registry.InstallStepPlan{Target: req.Instance.ServerID, Name: name, Title: name, Order: index + 1}

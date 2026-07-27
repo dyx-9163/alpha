@@ -89,6 +89,13 @@ func (e *MySQLOperationError) Error() string {
 	return e.Code
 }
 
+func (e *MySQLOperationError) StableCode() string {
+	if e == nil {
+		return ""
+	}
+	return e.Code
+}
+
 func mysqlOperationError(code string) error {
 	return &MySQLOperationError{Code: code}
 }

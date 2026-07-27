@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"net"
 	"os"
@@ -71,6 +72,21 @@ type standaloneBackupState struct {
 
 var panelBackupAvailableBytes = panelFilesystemAvailableBytes
 
+type mysqlSecretContextFile interface {
+	io.Writer
+	Name() string
+	Chmod(os.FileMode) error
+	Close() error
+}
+
+var createMySQLSecretContextFile = func() (mysqlSecretContextFile, error) {
+	return os.CreateTemp("", "aifar-mysql-secret-*.cnf")
+}
+
+var panelDFOutput = func(target string) ([]byte, error) {
+	return exec.Command("df", "-Pk", target).Output()
+}
+
 func (m Module) PlanBackup(ctx context.Context, req registry.BackupRequest) ([]registry.InstallStepPlan, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -129,14 +145,25 @@ func (s Service) backupStandalone(ctx context.Context, req registry.BackupReques
 		return err
 	}
 	recorder, _ := run.Log.(installflow.Recorder)
+	copy := BackupCopyFor(req.Language)
 	targetStarted := false
 	defer func() {
 		if !state.remoteClean && state.server.ID != "" {
 			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 			_, cleanupErr := s.remote.Run(cleanupCtx, state.server, cleanupBackupCommand(state.remoteWork))
 			cancel()
-			if cleanupErr != nil && retErr == nil {
-				retErr = cleanupErr
+			if cleanupErr == nil {
+				state.remoteClean = true
+			} else {
+				safeCleanupErr := errors.New(copy.RemoteCleanupFailed)
+				if state.log != nil {
+					state.log.Error("%s", copy.RemoteCleanupFailed)
+				}
+				if retErr == nil {
+					retErr = safeCleanupErr
+				} else {
+					retErr = errors.Join(retErr, safeCleanupErr)
+				}
 			}
 		}
 		if retErr == nil {
@@ -160,7 +187,7 @@ func (s Service) backupStandalone(ctx context.Context, req registry.BackupReques
 		state.record.Metadata = backupMetadata(parameters, "failed")
 		_, _ = data.SaveAppBackup(state.record)
 		if targetStarted {
-			installflow.FinishTarget(recorder, req.Instance.ServerID, "failed", retErr.Error())
+			installflow.FinishTarget(recorder, req.Instance.ServerID, "failed", backupDisplayError(req.Language, retErr).Error())
 		}
 	}()
 
@@ -170,14 +197,22 @@ func (s Service) backupStandalone(ctx context.Context, req registry.BackupReques
 	runner := installflow.Runner{
 		Log: run.Log, Recorder: recorder, Target: req.Instance.ServerID, Steps: steps,
 		Messages: installflow.Messages{
-			StepStart:  "MySQL backup step %d/%d started: %s",
-			StepDone:   "MySQL backup step %d/%d completed: %s",
-			StepFailed: "MySQL backup step %d/%d failed: %s: %v",
+			StepStart:  copy.StepStart,
+			StepDone:   copy.StepDone,
+			StepFailed: copy.StepFailed,
 		},
 	}
 	step := func(index int, fn func() error) error {
 		definition := steps[index-1]
-		return runner.Run(index, definition.Name, definition.Title, fn)
+		var operationErr error
+		runnerErr := runner.Run(index, definition.Name, definition.Title, func() error {
+			operationErr = fn()
+			return backupDisplayError(req.Language, operationErr)
+		})
+		if operationErr != nil {
+			return operationErr
+		}
+		return runnerErr
 	}
 
 	var credential store.Credential
@@ -349,9 +384,12 @@ func (s Service) backupStandalone(ctx context.Context, req registry.BackupReques
 		state.record.Checksum = state.archiveSHA
 		state.record.Size = state.archiveSize
 		state.record.Metadata = backupMetadataWithInspection(parameters, "committed", inspection)
-		var err error
-		state.record, err = data.SaveAppBackup(state.record)
-		return err
+		saved, err := data.SaveAppBackup(state.record)
+		if err != nil {
+			return err
+		}
+		state.record = saved
+		return nil
 	}); err != nil {
 		return err
 	}
@@ -360,9 +398,23 @@ func (s Service) backupStandalone(ctx context.Context, req registry.BackupReques
 		if err != nil {
 			return err
 		}
+		current := state.record
+		current.Status = "success"
+		current.CompletedAt = time.Now().UTC()
+		foundCurrent := false
+		for index := range items {
+			if items[index].ID == current.ID {
+				items[index] = current
+				foundCurrent = true
+				break
+			}
+		}
+		if !foundCurrent {
+			items = append(items, current)
+		}
 		candidates := repository.RetentionCandidates(items, parameters.KeepLast)
 		if len(candidates) > 0 && run.Log != nil {
-			run.Log.Info("MySQL backup retention selected %d older backup(s)", len(candidates))
+			run.Log.Info(copy.RetentionSelected, len(candidates))
 		}
 		return nil
 	}); err != nil {
@@ -374,8 +426,9 @@ func (s Service) backupStandalone(ctx context.Context, req registry.BackupReques
 		_, err := s.remote.Run(cleanupCtx, state.server, cleanupBackupCommand(state.remoteWork))
 		if err == nil {
 			state.remoteClean = true
+			return nil
 		}
-		return err
+		return errors.New(copy.RemoteCleanupFailed)
 	}); err != nil {
 		return err
 	}
@@ -383,10 +436,11 @@ func (s Service) backupStandalone(ctx context.Context, req registry.BackupReques
 	state.record.Status = "success"
 	state.record.CompletedAt = time.Now().UTC()
 	state.record.Metadata = backupMetadataWithInspection(parameters, "success", inspection)
-	state.record, err = data.SaveAppBackup(state.record)
+	saved, err := data.SaveAppBackup(state.record)
 	if err != nil {
 		return err
 	}
+	state.record = saved
 	installflow.FinishTarget(recorder, req.Instance.ServerID, "success", "")
 	return nil
 }
@@ -398,16 +452,36 @@ func (s Service) retainUnavailableDownloaderFailure(req registry.BackupRequest, 
 }
 
 func standaloneBackupStepDefinitions(lang string) []installflow.Step {
-	titles := []string{"load MySQL instance", "confirm instance operation lock", "resolve bound administrator credential", "inspect MySQL source", "check backup space", "prepare controlled work directories", "validate logical dump plan", "dump MySQL instance", "build backup manifest", "package backup archive", "transfer archive to panel repository", "verify archive checksum", "record committed backup", "apply backup retention", "clean remote backup work directory"}
-	if normalizeLanguage(lang) != "en" {
-		titles = []string{"读取 MySQL 实例", "确认实例操作锁", "解析绑定的管理员凭据", "检查 MySQL 源实例", "检查备份空间", "准备受控工作目录", "校验逻辑备份计划", "导出 MySQL 实例", "生成备份清单", "打包备份归档", "传输归档到面板仓库", "校验归档校验和", "记录已提交备份", "执行备份保留策略", "清理远端备份工作目录"}
-	}
 	names := []string{"load-instance", "acquire-instance-lock", "resolve-credential", "inspect-mysql", "check-backup-space", "prepare-workdir", "dry-run-dump", "dump-instance", "build-manifest", "package-backup", "transfer-backup", "verify-checksum", "record-backup", "apply-retention", "cleanup-workdir"}
+	copy := BackupCopyFor(lang)
 	out := make([]installflow.Step, len(names))
 	for index := range names {
-		out[index] = installflow.Step{Name: names[index], Title: titles[index]}
+		out[index] = installflow.Step{Name: names[index], Title: copy.StepTitles[names[index]]}
 	}
 	return out
+}
+
+func backupDisplayError(lang string, err error) error {
+	if err == nil {
+		return nil
+	}
+	type joinedErrors interface{ Unwrap() []error }
+	if joined, ok := err.(joinedErrors); ok {
+		parts := make([]string, 0, len(joined.Unwrap()))
+		for _, cause := range joined.Unwrap() {
+			if display := backupDisplayError(lang, cause); display != nil && strings.TrimSpace(display.Error()) != "" {
+				parts = append(parts, display.Error())
+			}
+		}
+		if len(parts) > 0 {
+			return errors.New(strings.Join(parts, "\n"))
+		}
+	}
+	var stable interface{ StableCode() string }
+	if errors.As(err, &stable) && stable.StableCode() != "" {
+		return errors.New(MySQLBackupErrorText(lang, stable.StableCode()))
+	}
+	return err
 }
 
 func normalizeStandaloneBackupParameters(req registry.BackupRequest) backupParameters {
@@ -497,28 +571,34 @@ func writeMySQLSecretContext(credential store.Credential, port int) (string, err
 	if err != nil || password == "" {
 		return "", errors.New("missing MySQL password")
 	}
-	file, err := os.CreateTemp("", "aifar-mysql-secret-*.cnf")
+	file, err := createMySQLSecretContextFile()
 	if err != nil {
 		return "", err
 	}
 	name := file.Name()
+	closed := false
+	succeeded := false
 	defer func() {
-		if err != nil {
+		if !closed {
+			_ = file.Close()
+		}
+		if !succeeded {
 			_ = os.Remove(name)
 		}
 	}()
 	if chmodErr := file.Chmod(0o600); chmodErr != nil && runtime.GOOS != "windows" {
-		file.Close()
 		return "", chmodErr
 	}
 	_, err = fmt.Fprintf(file, "[client]\nuser=%s\npassword=%s\nhost=127.0.0.1\nport=%d\n", userValue, passwordValue, port)
-	closeErr := file.Close()
 	if err != nil {
 		return "", err
 	}
+	closeErr := file.Close()
+	closed = closeErr == nil
 	if closeErr != nil {
 		return "", closeErr
 	}
+	succeeded = true
 	return name, nil
 }
 
@@ -655,7 +735,23 @@ func panelFilesystemAvailableBytes(target string) (int64, error) {
 		}
 		return strconv.ParseInt(strings.TrimSpace(string(output)), 10, 64)
 	}
-	output, err := exec.Command("df", "-Pk", filepath.Dir(abs)).Output()
+	return panelFilesystemAvailableBytesLinux(abs)
+}
+
+func panelFilesystemAvailableBytesLinux(target string) (int64, error) {
+	abs, err := filepath.Abs(target)
+	if err != nil {
+		return 0, err
+	}
+	abs = filepath.Clean(abs)
+	info, err := os.Lstat(abs)
+	if err != nil {
+		return 0, err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return 0, errors.New("panel backup repository is not a controlled directory")
+	}
+	output, err := panelDFOutput(abs)
 	if err != nil {
 		return 0, err
 	}

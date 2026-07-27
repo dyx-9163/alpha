@@ -461,7 +461,15 @@ func TestBackupManifestRestoreCompatibilityRejectsTopologyVersionAndBackupTypeMi
 
 func TestMySQLBackupErrorTextResolvesEveryStableCodeWithoutCredentialDetails(t *testing.T) {
 	// Production break caught: losing a zh/en message for a stable backup/restore code would expose an opaque code or leak credential diagnostics to an operator.
-	for code := range mysqlBackupErrorMessageKeys {
+	stableCodes := []string{
+		MySQLCredentialUnavailable, MySQLBackupUnsupportedTopology, MySQLBackupClusterUnhealthy,
+		MySQLBackupPrimaryNotFound, MySQLBackupSpaceInsufficient, MySQLBackupTransferFailed,
+		MySQLBackupChecksumMismatch, MySQLRestoreMaintenanceRequired, MySQLRestoreVersionIncompatible,
+		MySQLRestoreManifestInvalid, MySQLRestoreTargetNotClean, MySQLRestorePrimaryChanged,
+		MySQLRestoreLocalInfileRestoreFailed, MySQLRestoreIncomplete, MySQLRebuildConfirmationRequired,
+		MySQLRebuildRouterFailed,
+	}
+	for _, code := range stableCodes {
 		for _, language := range []string{"zh", "en"} {
 			message := MySQLBackupErrorText(language, code)
 			if message == "" || message == code {

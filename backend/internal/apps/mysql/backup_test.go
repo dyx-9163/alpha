@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -88,6 +89,53 @@ func TestBackupStandaloneCompletesOneDumpTransferCommitRetentionAndCleanup(t *te
 	}
 }
 
+func TestBackupStandaloneRetentionCountsTheNewCommittedBackup(t *testing.T) {
+	// Production break caught: treating the current committed archive as still running makes keepLast=1 retain an older success too.
+	module, data, _ := newStandaloneBackupModule(t)
+	old := store.AppBackup{
+		ID: "backup_aaaaaaaaaaaaaaaaaaaaaaaa", App: "mysql", InstanceID: standaloneBackupRequest(t).Instance.ID,
+		Status: "success", CreatedAt: time.Now().UTC().Add(-time.Hour),
+	}
+	data.backups = append(data.backups, old)
+	recorder := &backupRecorder{}
+	request := standaloneBackupRequest(t)
+	request.KeepLast = 1
+	if err := module.Backup(context.Background(), request, registry.RunContext{TaskID: "tsk_1234567890abcdef12345678", Log: recorder}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(strings.Join(recorder.messages, "\n"), "retention selected 1 older backup") {
+		t.Fatalf("retention log did not select the old success after counting the current backup: %v", recorder.messages)
+	}
+}
+
+func TestBackupStandaloneRollsBackCommittedArchiveWhenRecordOrRetentionFails(t *testing.T) {
+	// Production break caught: a post-commit control-plane failure must not leave a published archive while the record is failed.
+	tests := []struct {
+		name   string
+		mutate func(*backupFakeStore)
+	}{
+		{"record committed phase", func(data *backupFakeStore) { data.saveErrPhase = "committed" }},
+		{"record success phase", func(data *backupFakeStore) { data.saveErrPhase = "success" }},
+		{"retention lookup", func(data *backupFakeStore) { data.listErr = errors.New("retention lookup failed") }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			module, data, _ := newStandaloneBackupModule(t)
+			test.mutate(data)
+			err := module.Backup(context.Background(), standaloneBackupRequest(t), registry.RunContext{TaskID: "tsk_1234567890abcdef12345678", Log: &backupRecorder{}})
+			if err == nil {
+				t.Fatal("expected post-commit failure")
+			}
+			if len(data.backups) != 1 || data.backups[0].Status != "failed" {
+				t.Fatalf("failed backup record not retained: %+v", data.backups)
+			}
+			if _, statErr := os.Stat(data.backups[0].Path); !errors.Is(statErr, os.ErrNotExist) {
+				t.Fatalf("committed archive still exists: %v", statErr)
+			}
+		})
+	}
+}
+
 func TestBackupStandaloneRetainsFailedRecordWithoutFinalArchive(t *testing.T) {
 	// Production break caught: a failed safety phase must not publish an archive or erase the forensic backup record.
 	tests := []struct {
@@ -159,6 +207,152 @@ func TestBackupStandaloneFailsWhenPanelRepositorySpaceIsInsufficient(t *testing.
 	}
 }
 
+func TestPanelFilesystemAvailableBytesLinuxChecksNormalizedRepositoryRootItself(t *testing.T) {
+	// Production break caught: asking df about the parent misses a repository root that is itself a dedicated mount or NAS.
+	root := filepath.Join(t.TempDir(), "repo")
+	if err := os.Mkdir(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	input := filepath.Join(root, ".", "child", "..")
+	want, err := filepath.Abs(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	original := panelDFOutput
+	var got string
+	panelDFOutput = func(target string) ([]byte, error) {
+		got = target
+		return []byte("Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/test 100 1 99 1% /repo\n"), nil
+	}
+	t.Cleanup(func() { panelDFOutput = original })
+	available, err := panelFilesystemAvailableBytesLinux(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != want || available != 99*1024 {
+		t.Fatalf("df target/available = %q/%d, want %q/%d", got, available, want, 99*1024)
+	}
+}
+
+func TestWriteMySQLSecretContextRemovesFileWhenCloseFails(t *testing.T) {
+	// Production break caught: returning a path after Close failed can upload incomplete credentials and leave the local secret behind.
+	root := t.TempDir()
+	secretPath := filepath.Join(root, "secret.cnf")
+	original := createMySQLSecretContextFile
+	var injected *closeFailSecretContextFile
+	createMySQLSecretContextFile = func() (mysqlSecretContextFile, error) {
+		file, err := os.OpenFile(secretPath, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o600)
+		if err != nil {
+			return nil, err
+		}
+		injected = &closeFailSecretContextFile{File: file}
+		return injected, nil
+	}
+	t.Cleanup(func() { createMySQLSecretContextFile = original })
+	name, err := writeMySQLSecretContext(store.Credential{Username: "root", Secret: map[string]string{"password": "secret"}}, 3306)
+	if err == nil || name != "" {
+		t.Fatalf("write result name=%q err=%v", name, err)
+	}
+	if _, statErr := os.Lstat(secretPath); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("secret context survived Close failure: %v", statErr)
+	}
+	if injected == nil || injected.closeCalls != 2 {
+		t.Fatalf("Close calls = %v, want failure followed by cleanup retry", injected)
+	}
+}
+
+func TestWriteMySQLSecretContextRemovesFileWhenWriteFails(t *testing.T) {
+	// Production break caught: an incomplete option file must never survive a local write failure or be returned for upload.
+	secretPath := filepath.Join(t.TempDir(), "secret.cnf")
+	original := createMySQLSecretContextFile
+	createMySQLSecretContextFile = func() (mysqlSecretContextFile, error) {
+		file, err := os.OpenFile(secretPath, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o600)
+		if err != nil {
+			return nil, err
+		}
+		return writeFailSecretContextFile{File: file}, nil
+	}
+	t.Cleanup(func() { createMySQLSecretContextFile = original })
+	name, err := writeMySQLSecretContext(store.Credential{Username: "root", Secret: map[string]string{"password": "secret"}}, 3306)
+	if err == nil || name != "" {
+		t.Fatalf("write result name=%q err=%v", name, err)
+	}
+	if _, statErr := os.Lstat(secretPath); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("secret context survived write failure: %v", statErr)
+	}
+}
+
+func TestBackupStandaloneJoinsSanitizedRemoteCleanupFailureWithPrimaryError(t *testing.T) {
+	// Production break caught: a cleanup failure after the primary error must remain visible without leaking remote stderr or secrets.
+	module, data, remote := newStandaloneBackupModule(t)
+	remote.inspectErr = errors.New("mysqlsh inspection failed")
+	remote.cleanupErr = errors.New("raw stderr contains top-secret")
+	recorder := &backupRecorder{}
+	err := module.Backup(context.Background(), standaloneBackupRequest(t), registry.RunContext{TaskID: "tsk_1234567890abcdef12345678", Log: recorder})
+	if err == nil || !strings.Contains(err.Error(), "mysqlsh inspection failed") || !strings.Contains(err.Error(), "MySQL remote backup cleanup failed") {
+		t.Fatalf("joined error evidence missing: %v", err)
+	}
+	if strings.Contains(err.Error(), "top-secret") || strings.Contains(strings.Join(recorder.messages, "\n"), "top-secret") || strings.Contains(recorder.targetError, "top-secret") {
+		t.Fatalf("cleanup stderr leaked: err=%v logs=%v target=%q", err, recorder.messages, recorder.targetError)
+	}
+	if len(data.backups) != 1 || data.backups[0].Status != "failed" {
+		t.Fatalf("failed record missing: %+v", data.backups)
+	}
+}
+
+func TestBackupStandaloneUsesLocalizedStepAndFailureMessages(t *testing.T) {
+	// Production break caught: request language propagation must cover worker step messages, not only step titles.
+	module, _, remote := newStandaloneBackupModule(t)
+	remote.inspectErr = errors.New("inspection failed")
+	recorder := &backupRecorder{}
+	request := standaloneBackupRequest(t)
+	request.Language = "zh-CN"
+	_ = module.Backup(context.Background(), request, registry.RunContext{TaskID: "tsk_1234567890abcdef12345678", Log: recorder})
+	joined := strings.Join(recorder.messages, "\n")
+	if !strings.Contains(joined, "MySQL 备份步骤") || !strings.Contains(joined, "失败") || strings.Contains(joined, "backup step") {
+		t.Fatalf("worker messages were not localized: %v", recorder.messages)
+	}
+}
+
+func TestBackupStandaloneLocalizesStableOperationErrorInTaskEvidence(t *testing.T) {
+	// Production break caught: task logs and target evidence must show localized operator text while the returned error keeps its stable code.
+	module, data, _ := newStandaloneBackupModule(t)
+	data.credentialErr = store.ErrBoundCredentialNotFound
+	recorder := &backupRecorder{}
+	request := standaloneBackupRequest(t)
+	request.Language = "zh-CN"
+	err := module.Backup(context.Background(), request, registry.RunContext{TaskID: "tsk_1234567890abcdef12345678", Log: recorder})
+	var operationErr *MySQLOperationError
+	if !errors.As(err, &operationErr) || operationErr.Code != MySQLCredentialUnavailable {
+		t.Fatalf("returned error = %v", err)
+	}
+	joined := strings.Join(recorder.messages, "\n") + "\n" + recorder.targetError
+	if !strings.Contains(joined, "MySQL 管理员凭据不可用") || strings.Contains(joined, MySQLCredentialUnavailable) {
+		t.Fatalf("task evidence was not localized: %s", joined)
+	}
+}
+
+type closeFailSecretContextFile struct {
+	*os.File
+	closeCalls int
+}
+
+func (f *closeFailSecretContextFile) Close() error {
+	f.closeCalls++
+	if f.closeCalls == 1 {
+		return errors.New("injected close failure")
+	}
+	return f.File.Close()
+}
+
+var _ io.Writer = (*closeFailSecretContextFile)(nil)
+
+type writeFailSecretContextFile struct{ *os.File }
+
+func (writeFailSecretContextFile) Write([]byte) (int, error) {
+	return 0, errors.New("injected write failure")
+}
+
 type backupFakeStore struct {
 	server          store.Server
 	credential      store.Credential
@@ -166,6 +360,9 @@ type backupFakeStore struct {
 	credentialLoads int
 	backups         []store.AppBackup
 	listCalls       int
+	listErr         error
+	saveErrPhase    string
+	saveErrUsed     bool
 }
 
 func newBackupFakeStore(t *testing.T) *backupFakeStore {
@@ -192,6 +389,10 @@ func (s *backupFakeStore) GetBoundCredential(instanceID, purpose string, include
 	return s.credential, nil
 }
 func (s *backupFakeStore) SaveAppBackup(value store.AppBackup) (store.AppBackup, error) {
+	if !s.saveErrUsed && s.saveErrPhase != "" && strings.Contains(value.Metadata, `"phase":"`+s.saveErrPhase+`"`) {
+		s.saveErrUsed = true
+		return store.AppBackup{}, errors.New("save backup failed")
+	}
 	for index := range s.backups {
 		if s.backups[index].ID == value.ID {
 			s.backups[index] = value
@@ -203,6 +404,9 @@ func (s *backupFakeStore) SaveAppBackup(value store.AppBackup) (store.AppBackup,
 }
 func (s *backupFakeStore) ListAppBackupsForInstances(ids []string, includeDeleted bool) ([]store.AppBackup, error) {
 	s.listCalls++
+	if s.listErr != nil {
+		return nil, s.listErr
+	}
 	return append([]store.AppBackup(nil), s.backups...), nil
 }
 
@@ -292,7 +496,10 @@ func (backupRemoteWithoutDownloader) UploadFile(context.Context, store.Server, s
 	return nil
 }
 
-type backupRecorder struct{ startedSteps, messages []string }
+type backupRecorder struct {
+	startedSteps, messages []string
+	targetError            string
+}
 
 func (r *backupRecorder) Info(format string, args ...any) {
 	r.messages = append(r.messages, fmt.Sprintf(format, args...))
@@ -300,8 +507,8 @@ func (r *backupRecorder) Info(format string, args ...any) {
 func (r *backupRecorder) Error(format string, args ...any) {
 	r.messages = append(r.messages, fmt.Sprintf(format, args...))
 }
-func (r *backupRecorder) StartTarget(string)                  {}
-func (r *backupRecorder) FinishTarget(string, string, string) {}
+func (r *backupRecorder) StartTarget(string)                              {}
+func (r *backupRecorder) FinishTarget(_ string, _ string, errText string) { r.targetError = errText }
 func (r *backupRecorder) StartStep(_ string, name, _ string, _ int) {
 	r.startedSteps = append(r.startedSteps, name)
 }
