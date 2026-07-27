@@ -97,7 +97,13 @@ func (m Module) PlanRestore(ctx context.Context, req registry.RestoreRequest) ([
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if req.Instance.App != "mysql" || instanceTopology(req.Instance) != "standalone" ||
+	if req.Instance.App != "mysql" {
+		return nil, mysqlOperationError(MySQLBackupStandaloneRequired)
+	}
+	if instanceTopology(req.Instance) == "innodb-cluster" {
+		return m.planHealthyClusterRestore(ctx, req)
+	}
+	if instanceTopology(req.Instance) != "standalone" ||
 		strings.TrimSpace(req.Instance.ID) == "" || strings.TrimSpace(req.Instance.ServerID) == "" ||
 		req.Backup.App != "mysql" || req.Backup.InstanceID != req.Instance.ID ||
 		req.Backup.ServerID != req.Instance.ServerID || req.Backup.BackupType != "logical-full" ||
@@ -115,26 +121,43 @@ func (m Module) Restore(ctx context.Context, req registry.RestoreRequest, run re
 	if _, err := m.PlanRestore(ctx, req); err != nil {
 		return err
 	}
+	if instanceTopology(req.Instance) == "innodb-cluster" {
+		return m.restoreHealthyInnoDBCluster(ctx, req.Clone(), run)
+	}
 	return m.service.restoreStandalone(ctx, req.Clone(), run)
 }
 
 func (s Service) restoreStandalone(ctx context.Context, req registry.RestoreRequest, run registry.RunContext) (retErr error) {
+	return s.restoreLogical(ctx, req, run, nil)
+}
+
+func (s Service) restoreLogical(ctx context.Context, req registry.RestoreRequest, run registry.RunContext, cluster *resolvedInnoDBCluster) (retErr error) {
 	progress := newStandaloneRestoreProgress(run, req.Instance.ServerID, req.Language)
 	defer progress.finish(&retErr, ctx)
 	data, ok := s.store.(restoreStore)
 	if !ok {
 		return errors.New("MySQL restore store is unavailable")
 	}
+	topology := "standalone"
+	if cluster != nil {
+		topology = "innodb-cluster"
+	}
 	var instance store.AppInstance
 	var backup store.AppBackup
 	if err := progress.step(1, func() error {
 		var err error
 		instance, err = data.GetAppInstance(req.Instance.ID)
-		if err != nil || instance.App != "mysql" || instanceTopology(instance) != "standalone" || instance.ServerID != req.Instance.ServerID {
+		if err != nil || instance.App != "mysql" || instanceTopology(instance) != topology || instance.ServerID != req.Instance.ServerID {
 			return localizedMySQLOperationError(req.Language, MySQLBackupStandaloneRequired)
 		}
 		backup, err = data.GetAppBackup(req.Backup.ID)
-		if err != nil || !sameStandaloneBackupOwner(instance, instance, backup) || backup.Status != "success" || backup.BackupType != "logical-full" {
+		owned := err == nil && backup.Status == "success" && backup.BackupType == "logical-full"
+		if topology == "standalone" {
+			owned = owned && sameStandaloneBackupOwner(instance, instance, backup)
+		} else {
+			owned = owned && clusterIDFromBackup(backup) == cluster.clusterID
+		}
+		if !owned {
 			return localizedMySQLOperationError(req.Language, MySQLBackupStandaloneRequired)
 		}
 		return nil
@@ -145,7 +168,7 @@ func (s Service) restoreStandalone(ctx context.Context, req registry.RestoreRequ
 		return err
 	}
 	if err := progress.step(3, func() error {
-		if !validLogicalTaskID(run.TaskID) || !boolParameter(req.Parameters, "maintenanceConfirmed") || strings.TrimSpace(fmt.Sprint(req.Parameters["mode"])) != "standalone" {
+		if !validLogicalTaskID(run.TaskID) || !boolParameter(req.Parameters, "maintenanceConfirmed") || strings.TrimSpace(fmt.Sprint(req.Parameters["mode"])) != topology {
 			return localizedMySQLOperationError(req.Language, MySQLRestoreMaintenanceRequired)
 		}
 		return nil
@@ -165,7 +188,7 @@ func (s Service) restoreStandalone(ctx context.Context, req registry.RestoreRequ
 			return localizedMySQLOperationError(req.Language, MySQLBackupVerifyFailed)
 		}
 		manifest, err = decodeRestoreManifest(verification.Manifest)
-		if err != nil || manifest.BackupID != backup.ID || manifest.InstanceID != backup.InstanceID || manifest.SourceServerID != backup.ServerID || manifest.ManifestVersion != 2 || manifest.Verification == nil {
+		if err != nil || manifest.BackupID != backup.ID || manifest.SourceServerID != backup.ServerID || manifest.ManifestVersion != 2 || manifest.Verification == nil || (topology == "innodb-cluster" && manifest.ClusterID != cluster.clusterID) {
 			return localizedMySQLOperationError(req.Language, MySQLRestoreManifestInvalid)
 		}
 		return nil
@@ -271,6 +294,14 @@ func (s Service) restoreStandalone(ctx context.Context, req registry.RestoreRequ
 			}
 			if s.preRestoreBackup != nil {
 				err = s.preRestoreBackup(ctx, preRequest, run)
+			} else if cluster != nil {
+				members := make([]ClusterMemberRef, 0, len(cluster.members))
+				ids := make([]string, 0, len(cluster.members))
+				for _, member := range cluster.members {
+					members = append(members, ClusterMemberRef{InstanceID: member.instance.ID, ServerID: member.server.ID, Endpoint: member.endpoint, Role: member.role, Status: member.status})
+					ids = append(ids, member.instance.ID)
+				}
+				err = s.backupStandaloneCore(ctx, preRequest, run, standaloneBackupExecution{backupType: "pre-restore", recordPlan: false, retention: false, topology: "innodb-cluster", clusterID: cluster.clusterID, members: members, routers: cluster.routers, retentionInstanceIDs: ids})
 			} else {
 				err = s.backupStandaloneCore(ctx, preRequest, run, standaloneBackupExecution{backupType: "pre-restore", recordPlan: false, retention: false})
 			}
@@ -404,7 +435,13 @@ func (s Service) restoreStandalone(ctx context.Context, req registry.RestoreRequ
 		return localizedMySQLOperationError(req.Language, MySQLRestoreIncomplete)
 	}
 	if err := progress.step(17, func() error {
-		return verifyRestoreExpectation(data, repository, backup.ID, run.TaskID, expectedManifestSHA)
+		if err := verifyRestoreExpectation(data, repository, backup.ID, run.TaskID, expectedManifestSHA); err != nil {
+			return err
+		}
+		if cluster != nil {
+			return s.verifyClusterRecovered(ctx, cluster, run.TaskID)
+		}
+		return nil
 	}); err != nil {
 		return localizedMySQLOperationError(req.Language, MySQLRestoreIncomplete)
 	}

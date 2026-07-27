@@ -122,7 +122,23 @@ func appInstanceOperationLockSpecs(action string, instances []store.AppInstance)
 }
 
 func mysqlBackupOperationLockSpecs(instance store.AppInstance) []operationLockSpec {
+	if clusterID := mysqlClusterID(instance); clusterID != "" && strings.EqualFold(strings.TrimSpace(instance.Topology), "innodb-cluster") {
+		return []operationLockSpec{{
+			Scope: "app-cluster", ResourceID: clusterID, Operation: operationLockMutation,
+			Metadata: operationLockMetadata(map[string]any{"action": "mysql-backup", "app": "mysql", "clusterId": clusterID}),
+		}}
+	}
 	return appInstanceOperationLockSpecs("mysql-backup", []store.AppInstance{instance})
+}
+
+func mysqlClusterOperationLockSpecs(action string, instance store.AppInstance) []operationLockSpec {
+	if clusterID := mysqlClusterID(instance); clusterID != "" && strings.EqualFold(strings.TrimSpace(instance.Topology), "innodb-cluster") {
+		return []operationLockSpec{{
+			Scope: "app-cluster", ResourceID: clusterID, Operation: operationLockMutation,
+			Metadata: operationLockMetadata(map[string]any{"action": action, "app": "mysql", "clusterId": clusterID}),
+		}}
+	}
+	return appInstanceOperationLockSpecs(action, []store.AppInstance{instance})
 }
 
 func operationLockMetadata(fields map[string]any) string {

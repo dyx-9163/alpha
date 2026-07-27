@@ -3,6 +3,7 @@ package httpapi
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"strings"
@@ -25,6 +26,52 @@ const (
 	mysqlBackupDeleteAction   = "apps.mysql.backup.delete"
 )
 
+// mysqlBackupTargets gives the worker a complete stable snapshot for planning;
+// the MySQL module re-reads app_clusters and runtime membership before it ever
+// chooses a PRIMARY.
+func (a *API) mysqlBackupTargets(instance store.AppInstance) ([]store.AppInstance, []store.Server, error) {
+	if appInstanceTopology(instance) != "innodb-cluster" {
+		server, err := a.store.GetServer(instance.ServerID, false)
+		return []store.AppInstance{instance}, []store.Server{server}, err
+	}
+	clusterID := mysqlClusterID(instance)
+	if clusterID == "" {
+		return nil, nil, sql.ErrNoRows
+	}
+	members, err := a.store.ListAppClusterMembers(clusterID)
+	if err != nil || len(members) != 3 {
+		return nil, nil, sql.ErrNoRows
+	}
+	instances := make([]store.AppInstance, 0, len(members))
+	servers := make([]store.Server, 0, len(members))
+	for _, member := range members {
+		candidate, getErr := a.store.GetAppInstance(member.InstanceID)
+		if getErr != nil || candidate.App != "mysql" || appInstanceTopology(candidate) != "innodb-cluster" || mysqlClusterID(candidate) != clusterID || candidate.ServerID != member.ServerID {
+			return nil, nil, sql.ErrNoRows
+		}
+		server, getErr := a.store.GetServer(candidate.ServerID, false)
+		if getErr != nil {
+			return nil, nil, getErr
+		}
+		instances, servers = append(instances, candidate), append(servers, server)
+	}
+	return instances, servers, nil
+}
+
+func mysqlClusterIDFromBackup(backup store.AppBackup) string {
+	metadata := map[string]json.RawMessage{}
+	if json.Unmarshal([]byte(backup.Metadata), &metadata) != nil {
+		return ""
+	}
+	var clusterID string
+	_ = json.Unmarshal(metadata["clusterId"], &clusterID)
+	return strings.TrimSpace(clusterID)
+}
+
+func mysqlClusterID(instance store.AppInstance) string {
+	return strings.TrimSpace(appInstanceMetadataValue(instance, "clusterId"))
+}
+
 func (a *API) startMySQLRestore(w http.ResponseWriter, r *http.Request) {
 	lang := languageFromRequest(r)
 	payload, ok := decodeMySQLRestoreRequest(w, r)
@@ -37,16 +84,17 @@ func (a *API) startMySQLRestore(w http.ResponseWriter, r *http.Request) {
 		respond(w, nil, err)
 		return
 	}
-	if instance.App != "mysql" || appInstanceTopology(instance) != "standalone" || strings.TrimSpace(instance.ServerID) == "" {
+	topology := appInstanceTopology(instance)
+	if instance.App != "mysql" || (topology != "standalone" && topology != "innodb-cluster") || strings.TrimSpace(instance.ServerID) == "" {
 		writeError(w, http.StatusBadRequest, mysqlapp.MySQLBackupStandaloneRequired, i18n.MySQLBackupErrorText(lang, mysqlapp.MySQLBackupStandaloneRequired), map[string]any{"instanceId": instanceID})
 		return
 	}
 	backup, err := a.store.GetAppBackup(payload.BackupID)
-	if err != nil || backup.App != "mysql" || backup.InstanceID != instance.ID || backup.ServerID != instance.ServerID || backup.BackupType != "logical-full" || backup.Status != "success" {
+	if err != nil || backup.App != "mysql" || backup.BackupType != "logical-full" || backup.Status != "success" || (topology == "standalone" && (backup.InstanceID != instance.ID || backup.ServerID != instance.ServerID)) || (topology == "innodb-cluster" && mysqlClusterIDFromBackup(backup) != mysqlClusterID(instance)) {
 		writeError(w, http.StatusConflict, mysqlapp.MySQLBackupVerifyNotAllowed, i18n.MySQLBackupErrorText(lang, mysqlapp.MySQLBackupVerifyNotAllowed), map[string]any{"backupId": payload.BackupID})
 		return
 	}
-	server, err := a.store.GetServer(instance.ServerID, false)
+	instances, servers, err := a.mysqlBackupTargets(instance)
 	if err != nil {
 		respond(w, nil, err)
 		return
@@ -63,7 +111,7 @@ func (a *API) startMySQLRestore(w http.ResponseWriter, r *http.Request) {
 	}
 	actor := currentUser(r).Username
 	restoreRequest := registry.RestoreRequest{
-		Instance: instance, Instances: []store.AppInstance{instance}, Servers: []store.Server{server}, Backup: backup,
+		Instance: instance, Instances: instances, Servers: servers, Backup: backup,
 		Language: lang, Actor: actor, RepositoryDir: a.cfg.MySQLBackupDir,
 		Parameters: map[string]any{
 			"mode": payload.Mode, "maintenanceConfirmed": payload.MaintenanceConfirmed,
@@ -90,7 +138,7 @@ func (a *API) startMySQLRestore(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "MYSQL_RESTORE_PLAN_STORE_FAILED", i18n.MySQLBackupErrorText(lang, mysqlapp.MySQLRestoreIncomplete), map[string]any{"instanceId": instance.ID})
 		return
 	}
-	locks, acquired := a.acquireTaskOperationLocks(w, lang, task, appInstanceOperationLockSpecs("mysql-restore", []store.AppInstance{instance}))
+	locks, acquired := a.acquireTaskOperationLocks(w, lang, task, mysqlClusterOperationLockSpecs("mysql-restore", instance))
 	if !acquired {
 		return
 	}
@@ -146,9 +194,17 @@ func (a *API) listMySQLBackups(w http.ResponseWriter, r *http.Request) {
 		respond(w, nil, err)
 		return
 	}
+	unique := make([]store.AppBackup, 0, len(backups))
+	seenBackupIDs := map[string]bool{}
+	for _, backup := range backups {
+		if !seenBackupIDs[backup.ID] {
+			seenBackupIDs[backup.ID] = true
+			unique = append(unique, backup)
+		}
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"instanceId": instance.ID,
-		"items":      backups,
+		"items":      unique,
 		"defaults":   map[string]any{"threads": 4, "maxRateMBps": 0, "keepLast": a.cfg.MySQLBackupKeepLast},
 	})
 }
@@ -169,7 +225,7 @@ func (a *API) startMySQLBackup(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "MYSQL_INSTANCE_REQUIRED", i18n.Text(lang, "api.mysqlClusterRequired"), map[string]any{"instanceId": instanceID})
 		return
 	}
-	if appInstanceTopology(instance) != "standalone" {
+	if appInstanceTopology(instance) != "standalone" && appInstanceTopology(instance) != "innodb-cluster" {
 		writeError(w, http.StatusBadRequest, "MYSQL_BACKUP_UNSUPPORTED_TOPOLOGY", i18n.MySQLBackupErrorText(lang, "MYSQL_BACKUP_UNSUPPORTED_TOPOLOGY"), map[string]any{"instanceId": instanceID})
 		return
 	}
@@ -177,7 +233,7 @@ func (a *API) startMySQLBackup(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "INSTANCE_SERVER_REQUIRED", i18n.Text(lang, "api.instanceServerRequired"), map[string]any{"instanceId": instanceID})
 		return
 	}
-	server, err := a.store.GetServer(instance.ServerID, false)
+	instances, servers, err := a.mysqlBackupTargets(instance)
 	if err != nil {
 		respond(w, nil, err)
 		return
@@ -199,8 +255,8 @@ func (a *API) startMySQLBackup(w http.ResponseWriter, r *http.Request) {
 	actor := currentUser(r).Username
 	backupRequest := registry.BackupRequest{
 		Instance:      instance,
-		Instances:     []store.AppInstance{instance},
-		Servers:       []store.Server{server},
+		Instances:     instances,
+		Servers:       servers,
 		Language:      lang,
 		Actor:         actor,
 		RepositoryDir: a.cfg.MySQLBackupDir,

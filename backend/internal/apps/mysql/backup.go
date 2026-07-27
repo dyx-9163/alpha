@@ -94,7 +94,13 @@ func (m Module) PlanBackup(ctx context.Context, req registry.BackupRequest) ([]r
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if req.Instance.App != "mysql" || instanceTopology(req.Instance) != "standalone" {
+	if req.Instance.App != "mysql" {
+		return nil, mysqlOperationError(MySQLBackupUnsupportedTopology)
+	}
+	if instanceTopology(req.Instance) == "innodb-cluster" {
+		return m.planInnoDBClusterBackup(ctx, req)
+	}
+	if instanceTopology(req.Instance) != "standalone" {
 		return nil, mysqlOperationError(MySQLBackupUnsupportedTopology)
 	}
 	if strings.TrimSpace(req.Instance.ID) == "" || strings.TrimSpace(req.Instance.ServerID) == "" || strings.TrimSpace(req.RepositoryDir) == "" {
@@ -112,6 +118,9 @@ func (m Module) PlanBackup(ctx context.Context, req registry.BackupRequest) ([]r
 func (m Module) Backup(ctx context.Context, req registry.BackupRequest, run registry.RunContext) error {
 	if _, err := m.PlanBackup(ctx, req); err != nil {
 		return err
+	}
+	if instanceTopology(req.Instance) == "innodb-cluster" {
+		return m.service.backupInnoDBCluster(ctx, req.Clone(), run)
 	}
 	return m.service.backupStandalone(ctx, req.Clone(), run)
 }
@@ -243,9 +252,14 @@ func sameBackupPath(left, right string) bool {
 }
 
 type standaloneBackupExecution struct {
-	backupType string
-	recordPlan bool
-	retention  bool
+	backupType           string
+	recordPlan           bool
+	retention            bool
+	topology             string
+	clusterID            string
+	members              []ClusterMemberRef
+	routers              []RouterRef
+	retentionInstanceIDs []string
 }
 
 func (s Service) backupStandalone(ctx context.Context, req registry.BackupRequest, run registry.RunContext) error {
@@ -258,6 +272,10 @@ func (s Service) backupStandalone(ctx context.Context, req registry.BackupReques
 func (s Service) backupStandaloneCore(ctx context.Context, req registry.BackupRequest, run registry.RunContext, execution standaloneBackupExecution) (retErr error) {
 	if execution.backupType != "logical-full" && execution.backupType != "pre-restore" {
 		return mysqlOperationError(MySQLRestoreManifestInvalid)
+	}
+	topology := execution.topology
+	if topology == "" {
+		topology = "standalone"
 	}
 	data, ok := s.store.(backupStore)
 	if !ok {
@@ -280,7 +298,7 @@ func (s Service) backupStandaloneCore(ctx context.Context, req registry.BackupRe
 		record: store.AppBackup{
 			ID: backupID, App: "mysql", InstanceID: req.Instance.ID, ServerID: req.Instance.ServerID,
 			BackupType: execution.backupType, Status: "pending", TaskID: run.TaskID,
-			Metadata: backupMetadata(parameters, "pending"), CreatedAt: time.Now().UTC(),
+			Metadata: backupMetadataForExecution(parameters, "pending", mysqlBackupInspection{}, execution), CreatedAt: time.Now().UTC(),
 		},
 		repository: repository, backupStore: data, remote: s.remote,
 		remoteWork: mysqlBackupWorkDir(run.TaskID), log: run.Log,
@@ -335,7 +353,7 @@ func (s Service) backupStandaloneCore(ctx context.Context, req registry.BackupRe
 		state.record.Status = "failed"
 		state.record.Path = state.paths.Archive
 		state.record.CompletedAt = time.Now().UTC()
-		state.record.Metadata = backupMetadata(parameters, "failed")
+		state.record.Metadata = backupMetadataForExecution(parameters, "failed", mysqlBackupInspection{}, execution)
 		_, _ = data.SaveAppBackup(state.record)
 		if targetStarted {
 			installflow.FinishTarget(recorder, req.Instance.ServerID, "failed", backupDisplayError(req.Language, retErr).Error())
@@ -371,7 +389,7 @@ func (s Service) backupStandaloneCore(ctx context.Context, req registry.BackupRe
 	var verification *BackupVerification
 	var script string
 	if err := step(1, func() error {
-		if req.Instance.App != "mysql" || instanceTopology(req.Instance) != "standalone" {
+		if req.Instance.App != "mysql" || instanceTopology(req.Instance) != topology {
 			return mysqlOperationError(MySQLBackupUnsupportedTopology)
 		}
 		server, err := s.store.GetServer(req.Instance.ServerID, true)
@@ -380,7 +398,7 @@ func (s Service) backupStandaloneCore(ctx context.Context, req registry.BackupRe
 		}
 		state.server = server
 		state.record.Status = "running"
-		state.record.Metadata = backupMetadata(parameters, "running")
+		state.record.Metadata = backupMetadataForExecution(parameters, "running", mysqlBackupInspection{}, execution)
 		state.record, err = data.SaveAppBackup(state.record)
 		return err
 	}); err != nil {
@@ -494,12 +512,12 @@ func (s Service) backupStandaloneCore(ctx context.Context, req registry.BackupRe
 		}
 		manifest := BackupManifest{
 			ManifestVersion: 2,
-			BackupID:        backupID, App: "mysql", Topology: "standalone", InstanceID: req.Instance.ID,
+			BackupID:        backupID, App: "mysql", Topology: topology, InstanceID: req.Instance.ID, ClusterID: execution.clusterID,
 			SourceServerID: state.server.ID, SourceEndpoint: net.JoinHostPort(state.server.Host, strconv.Itoa(instancePort(req.Instance))),
 			SourceServerUUID: inspection.ServerUUID, MySQLVersion: inspection.MySQLVersion, MySQLShellVersion: inspection.MySQLShellVersion,
 			Schemas: inspection.Schemas, ExcludedSchemas: append([]string(nil), fixedSystemSchemas...), Consistent: true,
 			GTIDExecuted: inspection.GTIDExecuted, CreatedAt: state.record.CreatedAt, TaskID: run.TaskID,
-			Verification: verification,
+			Verification: verification, Members: execution.members, Routers: execution.routers,
 		}
 		state.manifest, err = CanonicalBackupManifestJSON(manifest)
 		return err
@@ -544,7 +562,7 @@ func (s Service) backupStandaloneCore(ctx context.Context, req registry.BackupRe
 		state.record.Path = state.paths.Archive
 		state.record.Checksum = state.archiveSHA
 		state.record.Size = state.archiveSize
-		state.record.Metadata = backupMetadataWithInspection(parameters, "committed", inspection)
+		state.record.Metadata = backupMetadataForExecution(parameters, "committed", inspection, execution)
 		saved, err := data.SaveAppBackup(state.record)
 		if err != nil {
 			return err
@@ -557,7 +575,7 @@ func (s Service) backupStandaloneCore(ctx context.Context, req registry.BackupRe
 	if err := step(14, func() error {
 		state.record.Status = "success"
 		state.record.CompletedAt = time.Now().UTC()
-		state.record.Metadata = backupMetadataWithInspection(parameters, "success", inspection)
+		state.record.Metadata = backupMetadataForExecution(parameters, "success", inspection, execution)
 		saved, err := data.SaveAppBackup(state.record)
 		if err != nil {
 			return err
@@ -566,7 +584,11 @@ func (s Service) backupStandaloneCore(ctx context.Context, req registry.BackupRe
 		if !execution.retention {
 			return nil
 		}
-		items, err := data.ListAppBackupsForInstances([]string{req.Instance.ID}, false)
+		instanceIDs := execution.retentionInstanceIDs
+		if len(instanceIDs) == 0 {
+			instanceIDs = []string{req.Instance.ID}
+		}
+		items, err := data.ListAppBackupsForInstances(instanceIDs, false)
 		if err != nil {
 			if run.Log != nil {
 				run.Log.Error("%s", copy.RetentionCleanupFailed)
@@ -589,15 +611,26 @@ func (s Service) backupStandaloneCore(ctx context.Context, req registry.BackupRe
 		if len(candidates) > 0 && run.Log != nil {
 			run.Log.Info(copy.RetentionSelected, len(candidates))
 		}
+		seenCandidates := map[string]bool{}
 		for _, candidate := range candidates {
-			if candidate.App != "mysql" || candidate.InstanceID != req.Instance.ID || candidate.ServerID != req.Instance.ServerID || candidate.BackupType != "logical-full" || instanceTopology(req.Instance) != "standalone" {
+			if seenCandidates[candidate.ID] {
+				continue
+			}
+			seenCandidates[candidate.ID] = true
+			if candidate.App != "mysql" || candidate.BackupType != "logical-full" || (topology == "standalone" && (candidate.InstanceID != req.Instance.ID || candidate.ServerID != req.Instance.ServerID)) {
 				if run.Log != nil {
 					run.Log.Error("%s", copy.RetentionCleanupFailed)
 				}
 				continue
 			}
-			freshInstance, instanceErr := data.GetAppInstance(req.Instance.ID)
-			if instanceErr != nil || !sameStandaloneBackupOwner(req.Instance, freshInstance, candidate) {
+			freshInstance, instanceErr := data.GetAppInstance(candidate.InstanceID)
+			owned := instanceErr == nil
+			if topology == "standalone" {
+				owned = owned && sameStandaloneBackupOwner(req.Instance, freshInstance, candidate)
+			} else {
+				owned = owned && instanceTopology(freshInstance) == "innodb-cluster" && clusterIDFromInstance(freshInstance) == execution.clusterID && candidate.ServerID == freshInstance.ServerID
+			}
+			if !owned {
 				if run.Log != nil {
 					run.Log.Error("%s", copy.RetentionCleanupFailed)
 				}
@@ -937,6 +970,18 @@ func backupMetadata(parameters backupParameters, phase string) string {
 func backupMetadataWithInspection(parameters backupParameters, phase string, inspection mysqlBackupInspection) string {
 	data, _ := json.Marshal(map[string]any{"name": parameters.Name, "threads": parameters.Threads, "maxRateMBps": parameters.MaxRateMBps, "keepLast": parameters.KeepLast, "phase": phase, "mysqlVersion": inspection.MySQLVersion, "mysqlShellVersion": inspection.MySQLShellVersion, "schemas": inspection.Schemas})
 	return string(data)
+}
+
+func backupMetadataForExecution(parameters backupParameters, phase string, inspection mysqlBackupInspection, execution standaloneBackupExecution) string {
+	metadata := map[string]any{"name": parameters.Name, "threads": parameters.Threads, "maxRateMBps": parameters.MaxRateMBps, "keepLast": parameters.KeepLast, "phase": phase}
+	if inspection.MySQLVersion != "" {
+		metadata["mysqlVersion"], metadata["mysqlShellVersion"], metadata["schemas"] = inspection.MySQLVersion, inspection.MySQLShellVersion, inspection.Schemas
+	}
+	if execution.clusterID != "" {
+		metadata["clusterId"] = execution.clusterID
+	}
+	encoded, _ := json.Marshal(metadata)
+	return string(encoded)
 }
 
 func writeMySQLSecretContext(credential store.Credential, port int) (string, error) {

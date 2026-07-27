@@ -283,6 +283,47 @@ func TestMySQLBackupHandlerReturnsConflictForExistingMutationLock(t *testing.T) 
 	}
 }
 
+// Production break caught: using action-specific instance locks would permit a
+// backup and restore for different members of one cluster to overlap.
+func TestMySQLClusterBackupAndRestoreUseOneMutateLock(t *testing.T) {
+	instance := store.AppInstance{ID: "app_1234567890abcdef12345678", App: "mysql", ServerID: "srv_1234567890abcdef12345678", Topology: "innodb-cluster", Metadata: `{"clusterId":"cluster_1234567890abcdef12345678"}`}
+	backup := mysqlBackupOperationLockSpecs(instance)
+	restore := mysqlClusterOperationLockSpecs("mysql-restore", instance)
+	if len(backup) != 1 || len(restore) != 1 || backup[0].Scope != "app-cluster" || backup[0].ResourceID != "cluster_1234567890abcdef12345678" || backup[0].Operation != operationLockMutation || restore[0].Scope != backup[0].Scope || restore[0].ResourceID != backup[0].ResourceID || restore[0].Operation != backup[0].Operation {
+		t.Fatalf("cluster lock specs backup=%+v restore=%+v", backup, restore)
+	}
+}
+
+// Production break caught: treating the UI grouping key (id:<clusterId>) as a
+// store key would make valid cluster backup/restore requests fail before task
+// planning or lock the wrong resource.
+func TestMySQLClusterBackupTargetsUseRawStoredClusterID(t *testing.T) {
+	api, db, _ := newAuthzTestAPI(t)
+	clusterID := "cluster_1234567890abcdef12345678"
+	if _, err := db.SaveAppCluster(store.AppCluster{ID: clusterID, App: "mysql", Name: "production", Topology: "innodb-cluster", Status: "active"}); err != nil {
+		t.Fatal(err)
+	}
+	var instances []store.AppInstance
+	for index := 0; index < 3; index++ {
+		server, err := db.SaveServer(store.Server{Name: fmt.Sprintf("mysql-%d", index), Host: fmt.Sprintf("10.0.0.%d", index+11), Username: "root"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		instance, err := db.SaveAppInstance(store.AppInstance{App: "mysql", Version: "8.0.36", ServerID: server.ID, Status: "installed", Topology: "innodb-cluster", Metadata: `{"clusterId":"` + clusterID + `","port":3306}`})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.SaveAppClusterMember(store.AppClusterMember{ClusterID: clusterID, InstanceID: instance.ID, ServerID: server.ID, Role: "SECONDARY", Status: "active"}); err != nil {
+			t.Fatal(err)
+		}
+		instances = append(instances, instance)
+	}
+	targets, servers, err := api.mysqlBackupTargets(instances[1])
+	if err != nil || len(targets) != 3 || len(servers) != 3 || mysqlClusterID(targets[0]) != clusterID {
+		t.Fatalf("cluster targets=%+v servers=%+v err=%v", targets, servers, err)
+	}
+}
+
 func TestMySQLBackupHandlerPreservesAndLocalizesStablePlanError(t *testing.T) {
 	// Production break caught: wrapping a stable module error in a generic handler code/raw message breaks clients and can expose sensitive internals.
 	tests := []struct {
