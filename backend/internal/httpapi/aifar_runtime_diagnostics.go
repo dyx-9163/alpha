@@ -25,9 +25,11 @@ const (
 	runtimeDiagnosticEstimateTimeout = 30 * time.Second
 	runtimeDiagnosticRetention       = 24 * time.Hour
 	runtimeDiagnosticMaxArchiveBytes = int64(1 << 30)
+	runtimeDiagnosticLockHeartbeat   = 30 * time.Second
 
 	runtimeDiagnosticExportTaskType = "aifar.runtime.diagnostics.export"
 	runtimeDiagnosticDeleteTaskType = "aifar.runtime.diagnostics.delete"
+	runtimeDiagnosticTransferLockOp = "delete"
 
 	runtimeDiagnosticExportAuditAction   = "containers.aifar.runtime.diagnostics.export"
 	runtimeDiagnosticDownloadAuditAction = "containers.aifar.runtime.diagnostics.download"
@@ -38,6 +40,7 @@ var (
 	runtimeDiagnosticHTTPExportIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
 	runtimeDiagnosticHTTPArchivePattern  = regexp.MustCompile(`^aifar-diagnostics-[A-Za-z0-9._-]+-[0-9]{8}T[0-9]{6}Z\.tar\.gz$`)
 	runtimeDiagnosticHTTPSHA256Pattern   = regexp.MustCompile(`^[a-fA-F0-9]{64}$`)
+	errRuntimeDiagnosticTaskCleanup      = errors.New("runtime diagnostic task cleanup failed")
 )
 
 type runtimeDiagnosticRequestPayload struct {
@@ -153,24 +156,48 @@ func (a *aifarRuntimeController) createDiagnosticExport(w http.ResponseWriter, r
 		writeError(w, http.StatusInternalServerError, "RUNTIME_DIAGNOSTIC_TASK_CREATE_FAILED", i18n.Text(lang, "api.runtimeDiagnosticTaskCreateFailed"), map[string]any{"instanceId": instance.ID})
 		return
 	}
-	if err := a.storeDiagnosticPlanOrDelete(task.ID, server.ID, runtimeDiagnosticExportSteps(lang)); err != nil {
+	if err := a.storeDiagnosticPlan(task.ID, server.ID, runtimeDiagnosticExportSteps(lang)); err != nil {
+		if _, cleanupErr := a.cleanupUnstartedRuntimeDiagnosticTask(task.ID, i18n.Text(lang, "api.runtimeDiagnosticTaskPlanFailed")); cleanupErr != nil {
+			a.respondRuntimeDiagnosticTaskCleanupFailure(w, r, lang, runtimeDiagnosticExportAuditAction, instance.ID, task.ID, "plan")
+			return
+		}
 		writeError(w, http.StatusInternalServerError, "RUNTIME_DIAGNOSTIC_TASK_PLAN_FAILED", i18n.Text(lang, "api.runtimeDiagnosticTaskPlanFailed"), map[string]any{"instanceId": instance.ID})
 		return
 	}
-	locks, ok := a.acquireTaskOperationLocks(w, lang, task, []operationLockSpec{{
-		Scope:      "runtime-diagnostics",
-		ResourceID: instance.ID,
-		Operation:  "export",
+	lock, err := a.store.AcquireOperationLock(store.OperationLock{
+		Scope:       "runtime-diagnostics",
+		ResourceID:  instance.ID,
+		Operation:   "export",
+		OwnerTaskID: task.ID,
+		Owner:       actor,
+		ExpiresAt:   time.Now().UTC().Add(operationLockTTL),
 		Metadata: operationLockMetadata(map[string]any{
 			"action":     "export",
 			"instanceId": instance.ID,
 			"serverId":   server.ID,
 			"exportId":   exportID,
 		}),
-	}})
-	if !ok {
+	})
+	if err != nil {
+		if _, cleanupErr := a.cleanupUnstartedRuntimeDiagnosticTask(task.ID, i18n.Text(lang, "api.runtimeDiagnosticTaskStartFailed")); cleanupErr != nil {
+			a.respondRuntimeDiagnosticTaskCleanupFailure(w, r, lang, runtimeDiagnosticExportAuditAction, instance.ID, task.ID, "lock")
+			return
+		}
+		var conflict store.OperationLockConflict
+		if errors.As(err, &conflict) {
+			writeError(w, http.StatusConflict, "OPERATION_LOCKED", i18n.Text(lang, "api.operationLocked", conflict.Lock.ResourceID), map[string]any{
+				"scope":       conflict.Lock.Scope,
+				"resourceId":  conflict.Lock.ResourceID,
+				"operation":   conflict.Lock.Operation,
+				"ownerTaskId": conflict.Lock.OwnerTaskID,
+				"expiresAt":   conflict.Lock.ExpiresAt,
+			})
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "OPERATION_LOCK_FAILED", i18n.Text(lang, "api.runtimeDiagnosticTaskStartFailed"), map[string]any{"instanceId": instance.ID})
 		return
 	}
+	locks := []store.OperationLock{lock}
 	export, err := a.store.SaveDiagnosticExport(store.DiagnosticExport{
 		ID:            exportID,
 		TaskID:        task.ID,
@@ -187,7 +214,10 @@ func (a *aifarRuntimeController) createDiagnosticExport(w http.ResponseWriter, r
 	})
 	if err != nil {
 		a.releaseOperationLocks(locks)
-		_ = a.store.DeleteTask(task.ID)
+		if _, cleanupErr := a.cleanupUnstartedRuntimeDiagnosticTask(task.ID, i18n.Text(lang, "aifar.diag.recordFailed")); cleanupErr != nil {
+			a.respondRuntimeDiagnosticTaskCleanupFailure(w, r, lang, runtimeDiagnosticExportAuditAction, instance.ID, task.ID, "record")
+			return
+		}
 		writeError(w, http.StatusInternalServerError, "RUNTIME_DIAGNOSTIC_RECORD_FAILED", i18n.Text(lang, "aifar.diag.recordFailed"), map[string]any{"instanceId": instance.ID})
 		return
 	}
@@ -222,9 +252,23 @@ func (a *aifarRuntimeController) createDiagnosticExport(w http.ResponseWriter, r
 		export.ErrorText = i18n.Text(lang, "api.runtimeDiagnosticTaskStartFailed")
 		export.CleanupStatus = "complete"
 		if _, saveErr := a.store.SaveDiagnosticExport(export); saveErr != nil {
-			_ = a.store.UpdateTaskStatus(task.ID, "failed", i18n.Text(lang, "api.runtimeDiagnosticTaskStartFailed"))
-		} else {
-			_ = a.store.DeleteTask(task.ID)
+			if terminalizeErr := a.terminalizeDiagnosticTaskByID(task.ID, "failed", i18n.Text(lang, "api.runtimeDiagnosticTaskStartFailed")); terminalizeErr != nil {
+				a.respondRuntimeDiagnosticTaskCleanupFailure(w, r, lang, runtimeDiagnosticExportAuditAction, instance.ID, task.ID, "start")
+				return
+			}
+			writeError(w, http.StatusInternalServerError, "RUNTIME_DIAGNOSTIC_TASK_START_FAILED", i18n.Text(lang, "api.runtimeDiagnosticTaskStartFailed"), map[string]any{"exportId": export.ID})
+			return
+		}
+		deleted, cleanupErr := a.cleanupUnstartedRuntimeDiagnosticTask(task.ID, i18n.Text(lang, "api.runtimeDiagnosticTaskStartFailed"))
+		if !deleted {
+			export.TaskID = task.ID
+			if _, linkErr := a.store.SaveDiagnosticExport(export); linkErr != nil {
+				cleanupErr = errRuntimeDiagnosticTaskCleanup
+			}
+		}
+		if cleanupErr != nil {
+			a.respondRuntimeDiagnosticTaskCleanupFailure(w, r, lang, runtimeDiagnosticExportAuditAction, instance.ID, task.ID, "start")
+			return
 		}
 		writeError(w, http.StatusInternalServerError, "RUNTIME_DIAGNOSTIC_TASK_START_FAILED", i18n.Text(lang, "api.runtimeDiagnosticTaskStartFailed"), map[string]any{"exportId": export.ID})
 		return
@@ -261,20 +305,55 @@ func (a *aifarRuntimeController) downloadDiagnosticExport(w http.ResponseWriter,
 	if !validateRuntimeDiagnosticDownload(w, lang, export, server, instance, time.Now().UTC()) {
 		return
 	}
-
-	w.Header().Set("Content-Type", "application/gzip")
-	w.Header().Set("Content-Disposition", contentDispositionAttachment(export.ArchiveName))
-	w.Header().Set("Content-Length", strconv.FormatInt(export.ArchiveBytes, 10))
-	w.Header().Set("X-AIFAR-Diagnostic-SHA256", export.SHA256)
-	w.WriteHeader(http.StatusOK)
 	actor := currentUser(r).Username
-	copied, streamErr := diagnostics.StreamRuntimeDiagnosticExport(r.Context(), registry.RuntimeDiagnosticStreamRequest{
-		Instance: instance,
-		Server:   server,
-		Export:   export,
-		Language: lang,
-		Actor:    actor,
-	}, w)
+	_, releaseTransferLock, err := a.acquireRuntimeDiagnosticTransferLock(export, actor)
+	if err != nil {
+		var conflict store.OperationLockConflict
+		if errors.As(err, &conflict) {
+			writeError(w, http.StatusConflict, "OPERATION_LOCKED", i18n.Text(lang, "api.operationLocked", conflict.Lock.ResourceID), map[string]any{
+				"scope":       conflict.Lock.Scope,
+				"resourceId":  conflict.Lock.ResourceID,
+				"operation":   conflict.Lock.Operation,
+				"ownerTaskId": conflict.Lock.OwnerTaskID,
+				"expiresAt":   conflict.Lock.ExpiresAt,
+			})
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "OPERATION_LOCK_FAILED", i18n.Text(lang, "api.runtimeDiagnosticDownloadFailed"), map[string]any{"exportId": export.ID})
+		return
+	}
+
+	var copied int64
+	var streamErr error
+	streamStarted := func() bool {
+		defer releaseTransferLock()
+		currentExport, getErr := a.store.GetDiagnosticExport(export.ID)
+		if getErr != nil {
+			writeError(w, http.StatusInternalServerError, "RUNTIME_DIAGNOSTIC_RECORD_FAILED", i18n.Text(lang, "aifar.diag.recordFailed"), map[string]any{"exportId": export.ID})
+			return false
+		}
+		export = currentExport
+		if !validateRuntimeDiagnosticDownload(w, lang, export, server, instance, time.Now().UTC()) {
+			return false
+		}
+
+		w.Header().Set("Content-Type", "application/gzip")
+		w.Header().Set("Content-Disposition", contentDispositionAttachment(export.ArchiveName))
+		w.Header().Set("Content-Length", strconv.FormatInt(export.ArchiveBytes, 10))
+		w.Header().Set("X-AIFAR-Diagnostic-SHA256", export.SHA256)
+		w.WriteHeader(http.StatusOK)
+		copied, streamErr = diagnostics.StreamRuntimeDiagnosticExport(r.Context(), registry.RuntimeDiagnosticStreamRequest{
+			Instance: instance,
+			Server:   server,
+			Export:   export,
+			Language: lang,
+			Actor:    actor,
+		}, w)
+		return true
+	}()
+	if !streamStarted {
+		return
+	}
 	if streamErr != nil || copied != export.ArchiveBytes {
 		a.audit(r, runtimeDiagnosticDownloadAuditAction, export.ID, "failed", fmt.Sprintf("%s: copied=%d expected=%d", i18n.Text(lang, "api.runtimeDiagnosticDownloadFailed"), copied, export.ArchiveBytes))
 		return
@@ -284,8 +363,10 @@ func (a *aifarRuntimeController) downloadDiagnosticExport(w http.ResponseWriter,
 		return
 	}
 	if _, err := a.enqueueRuntimeDiagnosticDelete(r, diagnostics, export, server, instance, lang, actor); err != nil {
-		target := runtimeDiagnosticDeleteTarget(instance.ID, export.ID)
-		a.audit(r, runtimeDiagnosticDeleteAuditAction, target, "failed", i18n.Text(lang, "api.runtimeDiagnosticDeleteQueueFailed"))
+		if !errors.Is(err, errRuntimeDiagnosticTaskCleanup) {
+			target := runtimeDiagnosticDeleteTarget(instance.ID, export.ID)
+			a.audit(r, runtimeDiagnosticDeleteAuditAction, target, "failed", i18n.Text(lang, "api.runtimeDiagnosticDeleteQueueFailed"))
+		}
 	}
 }
 
@@ -304,6 +385,10 @@ func (a *aifarRuntimeController) deleteDiagnosticExport(w http.ResponseWriter, r
 	}
 	task, err := a.enqueueRuntimeDiagnosticDelete(r, diagnostics, export, server, instance, lang, currentUser(r).Username)
 	if err != nil {
+		if errors.Is(err, errRuntimeDiagnosticTaskCleanup) {
+			writeRuntimeDiagnosticTaskCleanupError(w, lang, task.ID, "delete")
+			return
+		}
 		var conflict store.OperationLockConflict
 		if errors.As(err, &conflict) {
 			writeError(w, http.StatusConflict, "OPERATION_LOCKED", i18n.Text(lang, "api.operationLocked", conflict.Lock.ResourceID), map[string]any{
@@ -397,6 +482,10 @@ func validateRuntimeDiagnosticDownload(w http.ResponseWriter, lang string, expor
 		writeError(w, http.StatusConflict, "RUNTIME_DIAGNOSTIC_EXPORT_NOT_READY", i18n.Text(lang, "aifar.diag.exportStateInvalid"), map[string]any{"exportId": export.ID, "status": export.Status})
 		return false
 	}
+	if export.CleanupStatus == "pending" || export.CleanupStatus == "complete" {
+		writeError(w, http.StatusConflict, "RUNTIME_DIAGNOSTIC_EXPORT_NOT_READY", i18n.Text(lang, "aifar.diag.exportStateInvalid"), map[string]any{"exportId": export.ID, "status": export.Status, "cleanupStatus": export.CleanupStatus})
+		return false
+	}
 	if !validRuntimeDiagnosticArchiveMetadata(export) {
 		writeError(w, http.StatusConflict, "RUNTIME_DIAGNOSTIC_ARCHIVE_INVALID", i18n.Text(lang, "aifar.diag.pathInvalid"), map[string]any{"exportId": export.ID})
 		return false
@@ -477,19 +566,92 @@ func runtimeDiagnosticDeleteTarget(instanceID, exportID string) string {
 	return strings.TrimSpace(instanceID) + ":" + strings.TrimSpace(exportID)
 }
 
+func (a *aifarRuntimeController) cleanupUnstartedRuntimeDiagnosticTask(taskID, errText string) (bool, error) {
+	if err := a.deleteDiagnosticTaskByID(taskID); err == nil {
+		return true, nil
+	}
+	if err := a.terminalizeDiagnosticTaskByID(taskID, "failed", errText); err == nil {
+		return false, nil
+	}
+	return false, errRuntimeDiagnosticTaskCleanup
+}
+
+func (a *aifarRuntimeController) respondRuntimeDiagnosticTaskCleanupFailure(w http.ResponseWriter, r *http.Request, lang, action, target, taskID, phase string) {
+	message := i18n.Text(lang, "api.runtimeDiagnosticTaskCleanupFailed")
+	a.audit(r, action, target, "failed", fmt.Sprintf("%s: taskId=%s phase=%s", message, taskID, phase))
+	writeRuntimeDiagnosticTaskCleanupError(w, lang, taskID, phase)
+}
+
+func writeRuntimeDiagnosticTaskCleanupError(w http.ResponseWriter, lang, taskID, phase string) {
+	writeError(w, http.StatusInternalServerError, "RUNTIME_DIAGNOSTIC_TASK_CLEANUP_FAILED", i18n.Text(lang, "api.runtimeDiagnosticTaskCleanupFailed"), map[string]any{
+		"taskId": taskID,
+		"phase":  phase,
+	})
+}
+
+func (a *aifarRuntimeController) auditRuntimeDiagnosticTaskCleanupFailure(r *http.Request, lang, action, target, taskID, phase string) {
+	message := i18n.Text(lang, "api.runtimeDiagnosticTaskCleanupFailed")
+	a.audit(r, action, target, "failed", fmt.Sprintf("%s: taskId=%s phase=%s", message, taskID, phase))
+}
+
+func (a *aifarRuntimeController) acquireRuntimeDiagnosticTransferLock(export store.DiagnosticExport, actor string) (store.OperationLock, func(), error) {
+	lock, err := a.store.AcquireOperationLock(store.OperationLock{
+		Scope:      "runtime-diagnostics",
+		ResourceID: export.ID,
+		Operation:  runtimeDiagnosticTransferLockOp,
+		Owner:      actor,
+		ExpiresAt:  time.Now().UTC().Add(operationLockTTL),
+		Metadata: operationLockMetadata(map[string]any{
+			"action":     "download",
+			"instanceId": export.InstanceID,
+			"serverId":   export.ServerID,
+			"exportId":   export.ID,
+		}),
+	})
+	if err != nil {
+		return store.OperationLock{}, nil, err
+	}
+
+	heartbeatCtx, stopHeartbeat := context.WithCancel(context.Background())
+	heartbeatDone := make(chan struct{})
+	go func() {
+		defer close(heartbeatDone)
+		ticker := time.NewTicker(runtimeDiagnosticLockHeartbeat)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-heartbeatCtx.Done():
+				return
+			case <-ticker.C:
+				_, _ = a.store.HeartbeatOperationLock(lock.ID, operationLockTTL)
+			}
+		}
+	}()
+	release := func() {
+		stopHeartbeat()
+		<-heartbeatDone
+		_, _ = a.store.ReleaseOperationLock(lock.ID)
+	}
+	return lock, release, nil
+}
+
 func (a *aifarRuntimeController) enqueueRuntimeDiagnosticDelete(r *http.Request, diagnostics registry.RuntimeDiagnosticsModule, export store.DiagnosticExport, server store.Server, instance store.AppInstance, lang, actor string) (store.Task, error) {
 	target := runtimeDiagnosticDeleteTarget(instance.ID, export.ID)
 	task, err := a.store.CreateTask(store.Task{Type: runtimeDiagnosticDeleteTaskType, Target: target, Status: "pending", CreatedBy: actor})
 	if err != nil {
 		return task, err
 	}
-	if err := a.storeDiagnosticPlanOrDelete(task.ID, target, runtimeDiagnosticDeleteSteps(lang)); err != nil {
+	if err := a.storeDiagnosticPlan(task.ID, target, runtimeDiagnosticDeleteSteps(lang)); err != nil {
+		if _, cleanupErr := a.cleanupUnstartedRuntimeDiagnosticTask(task.ID, i18n.Text(lang, "api.runtimeDiagnosticDeleteQueueFailed")); cleanupErr != nil {
+			a.auditRuntimeDiagnosticTaskCleanupFailure(r, lang, runtimeDiagnosticDeleteAuditAction, target, task.ID, "plan")
+			return task, errRuntimeDiagnosticTaskCleanup
+		}
 		return task, err
 	}
 	lock, err := a.store.AcquireOperationLock(store.OperationLock{
 		Scope:       "runtime-diagnostics",
 		ResourceID:  export.ID,
-		Operation:   "delete",
+		Operation:   runtimeDiagnosticTransferLockOp,
 		OwnerTaskID: task.ID,
 		Owner:       actor,
 		ExpiresAt:   time.Now().UTC().Add(operationLockTTL),
@@ -501,7 +663,10 @@ func (a *aifarRuntimeController) enqueueRuntimeDiagnosticDelete(r *http.Request,
 		}),
 	})
 	if err != nil {
-		_ = a.store.DeleteTask(task.ID)
+		if _, cleanupErr := a.cleanupUnstartedRuntimeDiagnosticTask(task.ID, i18n.Text(lang, "api.runtimeDiagnosticDeleteQueueFailed")); cleanupErr != nil {
+			a.auditRuntimeDiagnosticTaskCleanupFailure(r, lang, runtimeDiagnosticDeleteAuditAction, target, task.ID, "lock")
+			return task, errRuntimeDiagnosticTaskCleanup
+		}
 		return task, err
 	}
 	task, err = a.startExistingWithLanguage(task, lang, func(ctx context.Context, log worker.Logger) error {
@@ -567,7 +732,10 @@ func (a *aifarRuntimeController) enqueueRuntimeDiagnosticDelete(r *http.Request,
 	})
 	if err != nil {
 		_, _ = a.store.ReleaseOperationLock(lock.ID)
-		_ = a.store.DeleteTask(task.ID)
+		if _, cleanupErr := a.cleanupUnstartedRuntimeDiagnosticTask(task.ID, i18n.Text(lang, "api.runtimeDiagnosticDeleteQueueFailed")); cleanupErr != nil {
+			a.auditRuntimeDiagnosticTaskCleanupFailure(r, lang, runtimeDiagnosticDeleteAuditAction, target, task.ID, "start")
+			return task, errRuntimeDiagnosticTaskCleanup
+		}
 		return task, err
 	}
 	a.audit(r, runtimeDiagnosticDeleteAuditAction, target, "running", task.ID)

@@ -150,6 +150,90 @@ func TestRuntimeDiagnosticsCreateStartFailureReleasesLockAndDeletesUnusedTask(t 
 	}
 }
 
+func TestRuntimeDiagnosticsCreateStartFailureTerminalizesTaskWhenDeleteFails(t *testing.T) {
+	api, db, secret := newAuthzTestAPI(t)
+	api.apps = registry.New(&fakeRuntimeDiagnosticsModule{db: db, estimate: registry.RuntimeDiagnosticEstimateResult{Allowed: true}})
+	api.runtime.startExistingTask = func(task store.Task, _ string, _ worker.Job) (store.Task, error) {
+		return task, errors.New("injected task start failure")
+	}
+	api.runtime.deleteDiagnosticTask = func(string) error {
+		return errors.New("injected task delete failure")
+	}
+	server, instance := seedAIFARRuntimeFixture(t, db, "http://docker.invalid")
+	token := issueTestToken(t, db, secret, "owner", "owner")
+	now := time.Now().UTC().Truncate(time.Second)
+
+	req := runtimeDiagnosticRequest(t, http.MethodPost, "/api/v2/containers/aifar/runtime/diagnostics/exports?serverId="+server.ID, token,
+		instance.ID, now.Add(-2*time.Hour), now.Add(-time.Hour), []string{"permission"})
+	rec := httptest.NewRecorder()
+	api.Router().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	assertRuntimeDiagnosticAPIErrorCode(t, rec, "RUNTIME_DIAGNOSTIC_TASK_START_FAILED")
+	tasks, err := db.ListTasks()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tasks) != 1 || tasks[0].Status != "failed" || tasks[0].FinishedAt.IsZero() {
+		t.Fatalf("delete failure must retain one terminal failed task, got %+v", tasks)
+	}
+	page, err := db.ListDiagnosticExports(instance.ID, 1, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Items) != 1 || page.Items[0].Status != "failed" || page.Items[0].CleanupStatus != "complete" || page.Items[0].TaskID != tasks[0].ID {
+		t.Fatalf("terminalized task must remain linked to the failed export, tasks=%+v exports=%+v", tasks, page.Items)
+	}
+}
+
+func TestRuntimeDiagnosticsCreateStartFailureReportsCleanupFailureWhenTaskCannotTerminalize(t *testing.T) {
+	api, db, secret := newAuthzTestAPI(t)
+	api.apps = registry.New(&fakeRuntimeDiagnosticsModule{db: db, estimate: registry.RuntimeDiagnosticEstimateResult{Allowed: true}})
+	api.runtime.startExistingTask = func(task store.Task, _ string, _ worker.Job) (store.Task, error) {
+		return task, errors.New("injected task start failure")
+	}
+	api.runtime.deleteDiagnosticTask = func(string) error {
+		return errors.New("secret delete failure")
+	}
+	api.runtime.terminalizeDiagnosticTask = func(string, string, string) error {
+		return errors.New("secret terminalize failure")
+	}
+	server, instance := seedAIFARRuntimeFixture(t, db, "http://docker.invalid")
+	token := issueTestToken(t, db, secret, "owner", "owner")
+	now := time.Now().UTC().Truncate(time.Second)
+
+	req := runtimeDiagnosticRequest(t, http.MethodPost, "/api/v2/containers/aifar/runtime/diagnostics/exports?serverId="+server.ID, token,
+		instance.ID, now.Add(-2*time.Hour), now.Add(-time.Hour), []string{"permission"})
+	rec := httptest.NewRecorder()
+	api.Router().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	assertRuntimeDiagnosticAPIErrorCode(t, rec, "RUNTIME_DIAGNOSTIC_TASK_CLEANUP_FAILED")
+	if strings.Contains(rec.Body.String(), "secret delete failure") || strings.Contains(rec.Body.String(), "secret terminalize failure") {
+		t.Fatalf("cleanup response leaked an internal error: %s", rec.Body.String())
+	}
+	tasks, err := db.ListTasks()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tasks) != 1 || tasks[0].Status != "pending" {
+		t.Fatalf("double cleanup failure must leave the original task visible, got %+v", tasks)
+	}
+	page, err := db.ListDiagnosticExports(instance.ID, 1, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Items) != 1 || page.Items[0].TaskID != tasks[0].ID || page.Items[0].Status != "failed" {
+		t.Fatalf("double cleanup failure must preserve the export-task association, tasks=%+v exports=%+v", tasks, page.Items)
+	}
+	assertAuditExists(t, db, runtimeDiagnosticExportAuditAction, "failed", "owner", instance.ID)
+	assertRuntimeDiagnosticAuditDoesNotContain(t, db, "secret delete failure", "secret terminalize failure")
+}
+
 func TestRuntimeDiagnosticsCreatePlanFailureLeavesNoTaskExportOrLock(t *testing.T) {
 	api, db, secret := newAuthzTestAPI(t)
 	api.apps = registry.New(&fakeRuntimeDiagnosticsModule{db: db, estimate: registry.RuntimeDiagnosticEstimateResult{Allowed: true}})
@@ -330,6 +414,161 @@ func TestRuntimeDiagnosticDownloadRejectsInvalidMetadataBeforeHeaders(t *testing
 	}
 }
 
+func TestRuntimeDiagnosticDownloadHoldsExportLockUntilStreamCompletes(t *testing.T) {
+	api, db, secret := newAuthzTestAPI(t)
+	streamStarted := make(chan struct{}, 1)
+	streamRelease := make(chan struct{}, 1)
+	defer func() {
+		select {
+		case streamRelease <- struct{}{}:
+		default:
+		}
+	}()
+	archive := []byte("blocked-download")
+	module := &fakeRuntimeDiagnosticsModule{
+		db:            db,
+		streamData:    archive,
+		streamStarted: streamStarted,
+		streamRelease: streamRelease,
+	}
+	api.apps = registry.New(module)
+	server, instance := seedAIFARRuntimeFixture(t, db, "http://docker.invalid")
+	export := saveReadyRuntimeDiagnosticExport(t, db, server, instance, archive)
+	token := issueTestToken(t, db, secret, "owner", "owner")
+
+	downloadDone := make(chan *httptest.ResponseRecorder, 1)
+	downloadReq := httptest.NewRequest(http.MethodGet, "/api/v2/containers/aifar/runtime/diagnostics/exports/"+export.ID+"/download?serverId="+server.ID, nil)
+	downloadReq.Header.Set("Authorization", "Bearer "+token)
+	go func() {
+		rec := httptest.NewRecorder()
+		api.Router().ServeHTTP(rec, downloadReq)
+		downloadDone <- rec
+	}()
+	select {
+	case <-streamStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("download did not enter the stream")
+	}
+
+	deleteReq := httptest.NewRequest(http.MethodDelete, "/api/v2/containers/aifar/runtime/diagnostics/exports/"+export.ID+"?serverId="+server.ID, nil)
+	deleteReq.Header.Set("Authorization", "Bearer "+token)
+	deleteRec := httptest.NewRecorder()
+	api.Router().ServeHTTP(deleteRec, deleteReq)
+	if deleteRec.Code != http.StatusConflict {
+		t.Fatalf("delete must conflict while download owns the export lock, got %d body=%s", deleteRec.Code, deleteRec.Body.String())
+	}
+	assertRuntimeDiagnosticAPIError(t, deleteRec)
+	assertNoRuntimeDiagnosticDeleteTask(t, db)
+	if module.deleteCalls != 0 {
+		t.Fatalf("conflicting delete must not remove the archive, got %d calls", module.deleteCalls)
+	}
+
+	streamRelease <- struct{}{}
+	select {
+	case rec := <-downloadDone:
+		if rec.Code != http.StatusOK || rec.Body.String() != string(archive) {
+			t.Fatalf("unexpected completed download: code=%d body=%q", rec.Code, rec.Body.String())
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("download did not complete after release")
+	}
+	locks, err := db.ListOperationLocks("runtime-diagnostics", export.ID, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(locks) != 0 {
+		t.Fatalf("download lock must be released after the stream, got %+v", locks)
+	}
+}
+
+func TestRuntimeDiagnosticDeleteLockRejectsDownloadBeforeHeaders(t *testing.T) {
+	api, db, secret := newAuthzTestAPI(t)
+	deleteStarted := make(chan struct{}, 1)
+	deleteRelease := make(chan struct{}, 1)
+	defer func() {
+		select {
+		case deleteRelease <- struct{}{}:
+		default:
+		}
+	}()
+	archive := []byte("archive-being-deleted")
+	module := &fakeRuntimeDiagnosticsModule{
+		db:            db,
+		streamData:    archive,
+		deleteStarted: deleteStarted,
+		deleteRelease: deleteRelease,
+	}
+	api.apps = registry.New(module)
+	server, instance := seedAIFARRuntimeFixture(t, db, "http://docker.invalid")
+	export := saveReadyRuntimeDiagnosticExport(t, db, server, instance, archive)
+	token := issueTestToken(t, db, secret, "owner", "owner")
+
+	deleteReq := httptest.NewRequest(http.MethodDelete, "/api/v2/containers/aifar/runtime/diagnostics/exports/"+export.ID+"?serverId="+server.ID, nil)
+	deleteReq.Header.Set("Authorization", "Bearer "+token)
+	deleteRec := httptest.NewRecorder()
+	api.Router().ServeHTTP(deleteRec, deleteReq)
+	if deleteRec.Code != http.StatusAccepted {
+		t.Fatalf("expected delete 202, got %d body=%s", deleteRec.Code, deleteRec.Body.String())
+	}
+	deleteTaskID := decodeTaskID(t, deleteRec)
+	select {
+	case <-deleteStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("delete worker did not enter the module")
+	}
+
+	downloadReq := httptest.NewRequest(http.MethodGet, "/api/v2/containers/aifar/runtime/diagnostics/exports/"+export.ID+"/download?serverId="+server.ID, nil)
+	downloadReq.Header.Set("Authorization", "Bearer "+token)
+	downloadRec := httptest.NewRecorder()
+	api.Router().ServeHTTP(downloadRec, downloadReq)
+	if downloadRec.Code != http.StatusConflict {
+		t.Fatalf("download must conflict while delete owns the export lock, got %d body=%s", downloadRec.Code, downloadRec.Body.String())
+	}
+	assertRuntimeDiagnosticAPIError(t, downloadRec)
+	if downloadRec.Header().Get("Content-Disposition") != "" || module.streamCalls != 0 {
+		t.Fatalf("locked download must be rejected before archive headers and streaming: headers=%v calls=%d", downloadRec.Header(), module.streamCalls)
+	}
+
+	deleteRelease <- struct{}{}
+	waitForTaskStatus(t, db, deleteTaskID, "success")
+	locks, err := db.ListOperationLocks("runtime-diagnostics", export.ID, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(locks) != 0 {
+		t.Fatalf("delete lock must be released after the worker, got %+v", locks)
+	}
+}
+
+func TestRuntimeDiagnosticDownloadRejectsCleanupInProgressOrCompleteBeforeHeaders(t *testing.T) {
+	for _, cleanupStatus := range []string{"pending", "complete"} {
+		t.Run(cleanupStatus, func(t *testing.T) {
+			api, db, secret := newAuthzTestAPI(t)
+			module := &fakeRuntimeDiagnosticsModule{db: db, streamData: []byte("archive")}
+			api.apps = registry.New(module)
+			server, instance := seedAIFARRuntimeFixture(t, db, "http://docker.invalid")
+			export := saveReadyRuntimeDiagnosticExport(t, db, server, instance, []byte("archive"))
+			export.CleanupStatus = cleanupStatus
+			if _, err := db.SaveDiagnosticExport(export); err != nil {
+				t.Fatal(err)
+			}
+			token := issueTestToken(t, db, secret, "owner", "owner")
+
+			req := httptest.NewRequest(http.MethodGet, "/api/v2/containers/aifar/runtime/diagnostics/exports/"+export.ID+"/download?serverId="+server.ID, nil)
+			req.Header.Set("Authorization", "Bearer "+token)
+			rec := httptest.NewRecorder()
+			api.Router().ServeHTTP(rec, req)
+			if rec.Code != http.StatusConflict {
+				t.Fatalf("cleanup %s must reject download before headers, got %d body=%s", cleanupStatus, rec.Code, rec.Body.String())
+			}
+			assertRuntimeDiagnosticAPIError(t, rec)
+			if rec.Header().Get("Content-Disposition") != "" || module.streamCalls != 0 {
+				t.Fatalf("cleanup %s must not emit archive headers or stream: headers=%v calls=%d", cleanupStatus, rec.Header(), module.streamCalls)
+			}
+		})
+	}
+}
+
 func TestRuntimeDiagnosticManualDeleteCreatesAuditedWorker(t *testing.T) {
 	api, db, secret := newAuthzTestAPI(t)
 	module := &fakeRuntimeDiagnosticsModule{db: db}
@@ -365,6 +604,93 @@ func TestRuntimeDiagnosticManualDeleteCreatesAuditedWorker(t *testing.T) {
 	assertAuditExists(t, db, "containers.aifar.runtime.diagnostics.delete", "running", "owner", task.Target)
 }
 
+func TestRuntimeDiagnosticDeleteStartFailureTerminalizesTaskWhenDeleteFails(t *testing.T) {
+	api, db, secret := newAuthzTestAPI(t)
+	module := &fakeRuntimeDiagnosticsModule{db: db}
+	api.apps = registry.New(module)
+	api.runtime.startExistingTask = func(task store.Task, _ string, _ worker.Job) (store.Task, error) {
+		return task, errors.New("injected task start failure")
+	}
+	api.runtime.deleteDiagnosticTask = func(string) error {
+		return errors.New("injected task delete failure")
+	}
+	server, instance := seedAIFARRuntimeFixture(t, db, "http://docker.invalid")
+	export := saveReadyRuntimeDiagnosticExport(t, db, server, instance, []byte("archive"))
+	token := issueTestToken(t, db, secret, "owner", "owner")
+
+	req := httptest.NewRequest(http.MethodDelete, "/api/v2/containers/aifar/runtime/diagnostics/exports/"+export.ID+"?serverId="+server.ID, nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	rec := httptest.NewRecorder()
+	api.Router().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	assertRuntimeDiagnosticAPIErrorCode(t, rec, "RUNTIME_DIAGNOSTIC_DELETE_QUEUE_FAILED")
+	tasks, err := db.ListTasks()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tasks) != 1 || tasks[0].Type != runtimeDiagnosticDeleteTaskType || tasks[0].Target != runtimeDiagnosticDeleteTarget(instance.ID, export.ID) || tasks[0].Status != "failed" {
+		t.Fatalf("delete start failure must retain one traceable failed task, got %+v", tasks)
+	}
+	locks, err := db.ListOperationLocks("runtime-diagnostics", export.ID, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(locks) != 0 {
+		t.Fatalf("delete start failure must release the export lock, got %+v", locks)
+	}
+}
+
+func TestRuntimeDiagnosticDeleteStartFailureReportsCleanupFailureWhenTaskCannotTerminalize(t *testing.T) {
+	api, db, secret := newAuthzTestAPI(t)
+	module := &fakeRuntimeDiagnosticsModule{db: db}
+	api.apps = registry.New(module)
+	api.runtime.startExistingTask = func(task store.Task, _ string, _ worker.Job) (store.Task, error) {
+		return task, errors.New("injected task start failure")
+	}
+	api.runtime.deleteDiagnosticTask = func(string) error {
+		return errors.New("secret delete failure")
+	}
+	api.runtime.terminalizeDiagnosticTask = func(string, string, string) error {
+		return errors.New("secret terminalize failure")
+	}
+	server, instance := seedAIFARRuntimeFixture(t, db, "http://docker.invalid")
+	export := saveReadyRuntimeDiagnosticExport(t, db, server, instance, []byte("archive"))
+	token := issueTestToken(t, db, secret, "owner", "owner")
+	target := runtimeDiagnosticDeleteTarget(instance.ID, export.ID)
+
+	req := httptest.NewRequest(http.MethodDelete, "/api/v2/containers/aifar/runtime/diagnostics/exports/"+export.ID+"?serverId="+server.ID, nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	rec := httptest.NewRecorder()
+	api.Router().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	assertRuntimeDiagnosticAPIErrorCode(t, rec, "RUNTIME_DIAGNOSTIC_TASK_CLEANUP_FAILED")
+	if strings.Contains(rec.Body.String(), "secret delete failure") || strings.Contains(rec.Body.String(), "secret terminalize failure") {
+		t.Fatalf("cleanup response leaked an internal error: %s", rec.Body.String())
+	}
+	tasks, err := db.ListTasks()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tasks) != 1 || tasks[0].Type != runtimeDiagnosticDeleteTaskType || tasks[0].Target != target || tasks[0].Status != "pending" {
+		t.Fatalf("double cleanup failure must retain the pending delete task, got %+v", tasks)
+	}
+	locks, err := db.ListOperationLocks("runtime-diagnostics", export.ID, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(locks) != 0 {
+		t.Fatalf("double cleanup failure must still release the export lock, got %+v", locks)
+	}
+	assertAuditExists(t, db, runtimeDiagnosticDeleteAuditAction, "failed", "owner", target)
+	assertRuntimeDiagnosticAuditDoesNotContain(t, db, "secret delete failure", "secret terminalize failure")
+}
+
 type fakeRuntimeDiagnosticsModule struct {
 	db *store.Store
 
@@ -376,7 +702,11 @@ type fakeRuntimeDiagnosticsModule struct {
 	streamData      []byte
 	streamLimit     int
 	streamErr       error
+	streamStarted   chan<- struct{}
+	streamRelease   <-chan struct{}
 	streamCalls     int
+	deleteStarted   chan<- struct{}
+	deleteRelease   <-chan struct{}
 	deleteCalls     int
 	deleteErr       error
 }
@@ -418,6 +748,19 @@ func (m *fakeRuntimeDiagnosticsModule) DeleteRuntimeDiagnosticExport(ctx context
 	m.deleteCalls++
 	err := m.deleteErr
 	m.mu.Unlock()
+	if m.deleteStarted != nil {
+		select {
+		case m.deleteStarted <- struct{}{}:
+		default:
+		}
+	}
+	if m.deleteRelease != nil {
+		select {
+		case <-m.deleteRelease:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 	if err != nil || m.db == nil {
 		return err
 	}
@@ -440,6 +783,15 @@ func (m *fakeRuntimeDiagnosticsModule) StreamRuntimeDiagnosticExport(_ context.C
 	m.streamCalls++
 	data, limit, streamErr := append([]byte(nil), m.streamData...), m.streamLimit, m.streamErr
 	m.mu.Unlock()
+	if m.streamStarted != nil {
+		select {
+		case m.streamStarted <- struct{}{}:
+		default:
+		}
+	}
+	if m.streamRelease != nil {
+		<-m.streamRelease
+	}
 	if limit > 0 && limit < len(data) {
 		data = data[:limit]
 	}
@@ -535,6 +887,32 @@ func assertRuntimeDiagnosticAPIError(t *testing.T, rec *httptest.ResponseRecorde
 	}
 	if body["code"] == "" || body["message"] == "" {
 		t.Fatalf("unexpected error body: %+v", body)
+	}
+}
+
+func assertRuntimeDiagnosticAPIErrorCode(t *testing.T, rec *httptest.ResponseRecorder, want string) {
+	t.Helper()
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("expected JSON error, got %q: %v", rec.Body.String(), err)
+	}
+	if body["code"] != want || body["message"] == "" {
+		t.Fatalf("expected error code %q, got %+v", want, body)
+	}
+}
+
+func assertRuntimeDiagnosticAuditDoesNotContain(t *testing.T, db *store.Store, values ...string) {
+	t.Helper()
+	items, err := db.ListAudit()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, item := range items {
+		for _, value := range values {
+			if strings.Contains(item.Message, value) {
+				t.Fatalf("audit leaked internal cleanup error %q: %+v", value, item)
+			}
+		}
 	}
 }
 

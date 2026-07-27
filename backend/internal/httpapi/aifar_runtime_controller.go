@@ -3,6 +3,7 @@ package httpapi
 import (
 	"aifar-deployment/backend/internal/rbac"
 	"aifar-deployment/backend/internal/store"
+	"aifar-deployment/backend/internal/taskplan"
 	"aifar-deployment/backend/internal/worker"
 
 	"github.com/go-chi/chi/v5"
@@ -10,8 +11,10 @@ import (
 
 type aifarRuntimeController struct {
 	*API
-	startExistingTask       func(store.Task, string, worker.Job) (store.Task, error)
-	storeDiagnosticTaskPlan func(string, string, []simpleTaskStep) error
+	startExistingTask         func(store.Task, string, worker.Job) (store.Task, error)
+	storeDiagnosticTaskPlan   func(string, string, []simpleTaskStep) error
+	deleteDiagnosticTask      func(string) error
+	terminalizeDiagnosticTask func(string, string, string) error
 }
 
 func newAIFARRuntimeController(api *API) *aifarRuntimeController {
@@ -25,15 +28,25 @@ func (a *aifarRuntimeController) startExistingWithLanguage(task store.Task, lang
 	return a.tasks.StartExistingWithLanguage(task, lang, job)
 }
 
-func (a *aifarRuntimeController) storeDiagnosticPlanOrDelete(taskID, target string, steps []simpleTaskStep) error {
+func (a *aifarRuntimeController) storeDiagnosticPlan(taskID, target string, steps []simpleTaskStep) error {
 	if a.storeDiagnosticTaskPlan != nil {
-		if err := a.storeDiagnosticTaskPlan(taskID, target, steps); err != nil {
-			_ = a.store.DeleteTask(taskID)
-			return err
-		}
-		return nil
+		return a.storeDiagnosticTaskPlan(taskID, target, steps)
 	}
-	return a.storeTaskPlanOrDelete(taskID, simpleTaskPlan(target, steps))
+	return taskplan.StorePlan(a.store, taskID, simpleTaskPlan(target, steps))
+}
+
+func (a *aifarRuntimeController) deleteDiagnosticTaskByID(taskID string) error {
+	if a.deleteDiagnosticTask != nil {
+		return a.deleteDiagnosticTask(taskID)
+	}
+	return a.store.DeleteTask(taskID)
+}
+
+func (a *aifarRuntimeController) terminalizeDiagnosticTaskByID(taskID, status, errText string) error {
+	if a.terminalizeDiagnosticTask != nil {
+		return a.terminalizeDiagnosticTask(taskID, status, errText)
+	}
+	return a.store.UpdateTaskStatus(taskID, status, errText)
 }
 
 func (a *aifarRuntimeController) mount(r chi.Router) {
