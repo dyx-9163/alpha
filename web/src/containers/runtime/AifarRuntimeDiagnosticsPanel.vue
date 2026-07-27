@@ -2,42 +2,45 @@
   <section class="runtime-diagnostics-panel">
     <div class="runtime-diagnostics-head">
       <div>
-        <h3>{{ t('containers.diagnosticsRecords') }}</h3>
+        <h3>{{ t('containers.diagnosticArchives') }}</h3>
         <p>{{ t('containers.diagnosticsLogSourceHost') }}</p>
+        <span>{{ t('containers.diagnosticArchiveCount', { count: exportsPage.total }) }}</span>
       </div>
       <el-button size="small" type="primary" :disabled="!instanceId" @click="openDialog">{{ t('containers.diagnosticsExport') }}</el-button>
     </div>
 
-    <el-table :data="exportsPage.items" class="runtime-diagnostics-table" max-height="280">
-      <el-table-column :label="t('common.status')" width="152">
+    <el-table :data="exportsPage.items" class="runtime-diagnostics-table">
+      <el-table-column :label="t('common.status')" width="176">
         <template #default="{ row }">
-          <el-tag size="small" :type="diagnosticStatusType(row)">{{ t(runtimeDiagnosticStatusKey(row)) }}</el-tag>
+          <div class="runtime-diagnostics-status">
+            <el-tag size="small" :type="diagnosticStatusType(row)">{{ t(runtimeDiagnosticStatusKey(row)) }}</el-tag>
+            <el-tooltip v-if="row.warnings?.length" :content="row.warnings.join('；')" placement="top">
+              <span class="runtime-diagnostics-warning">{{ t('containers.diagnosticWarnings', { count: row.warningCount }) }}</span>
+            </el-tooltip>
+          </div>
         </template>
       </el-table-column>
       <el-table-column :label="t('containers.diagnosticsTimeRange')" min-width="210">
-        <template #default="{ row }">{{ formatRange(row) }}</template>
-      </el-table-column>
-      <el-table-column :label="t('containers.diagnosticsServices')" min-width="160" show-overflow-tooltip>
-        <template #default="{ row }">{{ row.services.join(', ') || '-' }}</template>
-      </el-table-column>
-      <el-table-column :label="t('containers.diagnosticsStorage')" width="118">
         <template #default="{ row }">
-          <el-tag size="small" effect="plain">{{ storageKindLabel(row.storageKind) }}</el-tag>
+          <div class="runtime-diagnostics-stacked"><span>{{ formatDate(row.sinceAt) }}</span><span>{{ formatDate(row.untilAt) }}</span></div>
         </template>
       </el-table-column>
-      <el-table-column :label="t('containers.size')" width="110">
-        <template #default="{ row }">{{ formatBytes(row.archiveBytes) }}</template>
-      </el-table-column>
-      <el-table-column :label="t('common.message')" min-width="130" show-overflow-tooltip>
+      <el-table-column :label="t('containers.diagnosticsServices')" min-width="190">
         <template #default="{ row }">
-          <el-tooltip v-if="row.warnings?.length" :content="row.warnings.join('；')" placement="top">
-            <el-tag size="small" type="warning">{{ row.warningCount }}</el-tag>
+          <el-tooltip :content="servicePreview(row).tooltip" placement="top">
+            <span>{{ servicePreview(row).visibleText }}<template v-if="servicePreview(row).hiddenCount"> +{{ servicePreview(row).hiddenCount }}</template></span>
           </el-tooltip>
-          <span v-else>{{ row.warningCount || '-' }}</span>
         </template>
       </el-table-column>
-      <el-table-column :label="t('common.time')" min-width="170">
-        <template #default="{ row }">{{ formatDate(row.createdAt) }} / {{ formatDate(row.expiresAt) }}</template>
+      <el-table-column :label="t('containers.diagnosticArchive')" width="160">
+        <template #default="{ row }">
+          <div class="runtime-diagnostics-stacked"><span>{{ storageKindLabel(row.storageKind) }}</span><strong>{{ formatBytes(row.archiveBytes) }}</strong></div>
+        </template>
+      </el-table-column>
+      <el-table-column :label="t('containers.diagnosticLifecycle')" min-width="180">
+        <template #default="{ row }">
+          <div class="runtime-diagnostics-stacked"><span>{{ formatDate(row.createdAt) }}</span><span>{{ formatDate(row.expiresAt) }}</span></div>
+        </template>
       </el-table-column>
       <el-table-column :label="t('common.operation')" width="192" fixed="right">
         <template #default="{ row }">
@@ -159,6 +162,7 @@ import {
   runtimeDiagnosticExportScopeFingerprint,
   runtimeDiagnosticLimitRows,
   runtimeDiagnosticRequestFingerprint,
+  runtimeDiagnosticServicePreview,
   runtimeDiagnosticStatusKey,
   runtimeDiagnosticSubmitDisabledReason,
   trackRuntimeDiagnosticTask,
@@ -391,8 +395,8 @@ function formatDate(value?: string) {
   return Number.isNaN(date.getTime()) ? value : date.toLocaleString()
 }
 
-function formatRange(row: RuntimeDiagnosticExport) {
-  return `${formatDate(row.sinceAt)} - ${formatDate(row.untilAt)}`
+function servicePreview(row: RuntimeDiagnosticExport) {
+  return runtimeDiagnosticServicePreview(row.services, 3)
 }
 
 function formatDurationRange(value: RuntimeDiagnosticEstimate) {
