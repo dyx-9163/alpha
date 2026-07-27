@@ -237,7 +237,7 @@ aifar-diagnostics-<instance>-<timestamp>/
   README.txt
   manifest.json
   collection-errors.txt
-  services/<service>/file-logs/<relative-log-path>
+  services/<service>/<relative-log-path>
   diagnostics/runtime-summary.json
   diagnostics/deployments.json
   diagnostics/pods.json

@@ -1691,7 +1691,7 @@ func TestRuntimeDiagnosticExportUsesOpenedDescriptorAfterSourcePathSwap(t *testi
 	if err != nil {
 		t.Fatalf("descriptor-bound source export failed after path swap: %v: %s", err, output)
 	}
-	entry := fixture.archiveBase + "/services/gateway/file-logs/swap.log.original"
+	entry := fixture.archiveBase + "/services/gateway/swap.log.original"
 	content := runtimeDiagnosticArchiveFile(t, fixture.sh, fixture.archiveNative(), entry)
 	if content != "safe log\n" || strings.Contains(content, "TOP_SECRET_PAYLOAD") {
 		t.Fatalf("descriptor snapshot content = %q", content)
@@ -1736,7 +1736,7 @@ func TestRuntimeDiagnosticExportOmitsDirectoriesForLogsOutsideWindow(t *testing.
 		t.Fatalf("diagnostic export failed: %v: %s", err, output)
 	}
 	listing := strings.Join(runtimeDiagnosticStreamArchiveEntries(t, output), "\n")
-	insideEntry := fixture.archiveBase + "/services/gateway/file-logs/current.log"
+	insideEntry := fixture.archiveBase + "/services/gateway/current.log"
 	if !strings.Contains(listing, insideEntry) {
 		errorsText := runtimeDiagnosticStreamArchiveFile(t, output, fixture.archiveBase+"/collection-errors.txt")
 		manifest := runtimeDiagnosticStreamArchiveFile(t, output, fixture.archiveBase+"/manifest.json")
@@ -1746,6 +1746,32 @@ func TestRuntimeDiagnosticExportOmitsDirectoriesForLogsOutsideWindow(t *testing.
 		if strings.Contains(listing, outsideEntry) {
 			t.Fatalf("archive contains out-of-window entry %q:\n%s", outsideEntry, listing)
 		}
+	}
+}
+
+func TestRuntimeDiagnosticExportPreservesServerRelativeLogPaths(t *testing.T) {
+	fixture := newRuntimeDiagnosticExportShellFixtureWithPrefix(t, "runtime-diagnostic-shell-")
+	writeRuntimeDiagnosticShellCommand(t, fixture.binNative, "timedatectl", "printf '%s\n' 'Asia/Shanghai'")
+	serverRelative := filepath.Join("alpha-gateway", "info", "2026-07-27", "app.log")
+	logPath := filepath.Join(fixture.installNative, "runtime", "logs", "gateway", serverRelative)
+	if err := os.MkdirAll(filepath.Dir(logPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(logPath, []byte("[2026-07-27 16:00:00.000] [INFO ] inside-window\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	output, err := fixture.run()
+	if err != nil {
+		t.Fatalf("diagnostic export failed: %v: %s", err, output)
+	}
+	listing := strings.Join(runtimeDiagnosticStreamArchiveEntries(t, output), "\n")
+	want := fixture.archiveBase + "/services/gateway/alpha-gateway/info/2026-07-27/app.log"
+	if !strings.Contains(listing, want) {
+		t.Fatalf("archive did not preserve server-relative path %q:\n%s", want, listing)
+	}
+	if strings.Contains(listing, "/file-logs/") {
+		t.Fatalf("archive inserted synthetic file-logs directory:\n%s", listing)
 	}
 }
 
@@ -1805,8 +1831,8 @@ func TestRuntimeDiagnosticExportExcludesSensitiveNamesAndIntermediateFiles(t *te
 	}
 	listing := runtimeDiagnosticArchiveList(t, fixture.sh, fixture.archiveNative())
 	for _, allowed := range []string{
-		fixture.archiveBase + "/services/gateway/file-logs/app.log",
-		fixture.archiveBase + "/services/gateway/file-logs/app.log.1",
+		fixture.archiveBase + "/services/gateway/app.log",
+		fixture.archiveBase + "/services/gateway/app.log.1",
 	} {
 		if !strings.Contains(listing, allowed) {
 			t.Fatalf("archive omitted allowlisted log %q:\n%s", allowed, listing)

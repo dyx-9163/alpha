@@ -137,7 +137,7 @@ if [ "$initial_size" -gt 0 ]; then
   [ "$last_hex" = "0a" ] || initial_ended_newline=0
 fi
 
-destination_relative="services/$service/file-logs/$relative"
+destination_relative="services/$service/$relative"
 destination="$BUNDLE_ROOT/$destination_relative"
 staged="$WORK_ROOT/staged/$destination_relative"
 summary="$WORK_ROOT/summaries/$service-${initial_inode}.tsv"

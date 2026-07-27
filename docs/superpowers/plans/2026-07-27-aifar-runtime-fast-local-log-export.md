@@ -613,7 +613,7 @@ The export script must:
 3. Capture device, inode and initial size before reading; enforce 1 GiB per file and 2 GiB total.
 4. Feed exactly the first initial-size bytes into the awk filter without persisting a raw copy.
 5. Recheck device/inode after reading and record a warning if the source changed.
-6. Pipe awk output directly through the redactor into `services/<service>/file-logs/<relative-path>` so no unredacted filtered log is persisted.
+6. Pipe awk output directly through the redactor into `services/<service>/<relative-path>` so the server-relative log tree is preserved without a synthetic directory and no unredacted filtered log is persisted.
 7. Enforce a cumulative 500 MiB filtered-content limit as a fatal error.
 8. Preserve the non-log diagnostic files from the approved archive layout.
 9. Build `manifest.json`, `README.txt` and `collection-errors.txt` without absolute paths or raw skipped content. A time window with zero matching log records is successful and still produces these three files plus available non-log diagnostics.
@@ -634,7 +634,7 @@ aifar-diagnostics-<instance>-<timestamp>/
   README.txt
   manifest.json
   collection-errors.txt
-  services/<service>/file-logs/<relative-log-path>
+  services/<service>/<relative-log-path>
   diagnostics/runtime-summary.json
   diagnostics/deployments.json
   diagnostics/pods.json
@@ -1268,7 +1268,7 @@ On the authorized openEuler target, use transient in-memory credentials and veri
 2. A boundary fixture or known log interval proves `since` is included and `until` is excluded.
 3. Spring, ISO/JSON and Nginx records are included correctly; multiline Java exceptions remain intact.
 4. Unknown-timestamp lines are absent and warning codes/counts appear in `manifest.json` and `collection-errors.txt`.
-5. The archive contains `services/<service>/file-logs` and the approved diagnostics, with no `container-logs/`.
+5. The archive preserves each selected service's server-relative paths directly below `services/<service>/`, with no synthetic `file-logs/` or `container-logs/` directory.
 6. The final archive exists only under the configured `aifar-server` directory; the target has no final archive.
 7. SHA256 and byte size match the database/download headers.
 8. Cancellation and forced stream failure leave no target `.partial`, local `.partial` or quota reservation.
