@@ -1657,6 +1657,7 @@ useAifarRuntimeProvider({
   aifarRuntimeStatusKind,
   aifarRuntimeStatusLabel,
   selectedRuntimeInstanceId,
+  runtimeTargetQuery: targetQuery,
   aifarRuntimeInstances,
   runtimeInstanceLabel,
   aifarRuntimeActionDisabledReason,

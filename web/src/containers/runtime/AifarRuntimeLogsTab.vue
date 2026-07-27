@@ -1,5 +1,10 @@
 <template>
   <div class="runtime-resource-panel runtime-log-panel">
+    <AifarRuntimeDiagnosticsPanel
+      :instance-id="selectedRuntimeInstanceId"
+      :deployments="selectedRuntimeDeployments"
+      :target-query="runtimeTargetQuery()"
+    />
     <div class="runtime-tab-toolbar">
       <div class="runtime-log-filters">
         <el-select
@@ -115,6 +120,7 @@
 
 <script setup lang="ts">
 import StatusTag from '../../components/StatusTag.vue'
+import AifarRuntimeDiagnosticsPanel from './AifarRuntimeDiagnosticsPanel.vue'
 import { runtimeLogLevelOptions, runtimeLogLevelTag } from './logs'
 import { useAifarRuntimeContext } from './context'
 
@@ -128,6 +134,9 @@ const {
   runtimeLogPodOptions,
   aifarRuntimeStatusKind,
   aifarRuntimeStatusLabel,
+  selectedRuntimeInstanceId,
+  selectedRuntimeDeployments,
+  runtimeTargetQuery,
   runtimeLogLevelFilter,
   runtimeLogKeyword,
   runtimeLogTail,

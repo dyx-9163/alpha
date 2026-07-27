@@ -97,8 +97,96 @@
 }
 
 .runtime-log-panel .runtime-tab-toolbar,
-.runtime-log-panel > .el-alert {
+.runtime-log-panel > .el-alert,
+.runtime-log-panel > .runtime-diagnostics-panel {
   flex: 0 0 auto;
+}
+
+.runtime-diagnostics-panel {
+  display: grid;
+  gap: 8px;
+  padding: 12px;
+  border: 1px solid var(--aifar-border-soft);
+  border-radius: var(--aifar-radius-lg);
+  background: #fff;
+}
+
+.runtime-diagnostics-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.runtime-diagnostics-head h3,
+.runtime-diagnostics-head p {
+  margin: 0;
+}
+
+.runtime-diagnostics-head h3 {
+  color: var(--aifar-ink);
+  font-size: 14px;
+  line-height: 20px;
+}
+
+.runtime-diagnostics-head p {
+  margin-top: 4px;
+  color: var(--aifar-text-secondary);
+  font-size: 12px;
+  line-height: 18px;
+}
+
+.runtime-diagnostics-table {
+  width: 100%;
+}
+
+.runtime-diagnostics-actions {
+  gap: 4px;
+  flex-wrap: nowrap;
+}
+
+.runtime-diagnostics-range {
+  width: 100%;
+  margin-top: 12px;
+}
+
+.runtime-diagnostics-services {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+}
+
+.runtime-diagnostics-estimate-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.runtime-diagnostics-estimate {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  padding: 12px;
+  border-radius: var(--aifar-radius);
+  background: #f8fbff;
+}
+
+.runtime-diagnostics-estimate > div {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  color: var(--aifar-text-secondary);
+  font-size: 13px;
+  line-height: 20px;
+}
+
+.runtime-diagnostics-estimate strong {
+  color: var(--aifar-ink);
+}
+
+.runtime-diagnostics-estimate .el-alert {
+  grid-column: 1 / -1;
 }
 
 .runtime-tab-toolbar {
@@ -451,5 +539,24 @@
 
   .runtime-instance-select {
     width: 100%;
+  }
+
+  .runtime-diagnostics-head,
+  .runtime-diagnostics-estimate-actions {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .runtime-diagnostics-head .el-button,
+  .runtime-diagnostics-estimate-actions .el-button {
+    width: 100%;
+  }
+
+  .runtime-diagnostics-estimate {
+    grid-template-columns: 1fr;
+  }
+
+  .runtime-diagnostics-actions {
+    flex-wrap: wrap;
   }
 }
