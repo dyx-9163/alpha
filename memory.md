@@ -796,3 +796,61 @@
 - 结论：本次功能由 `c2c2f455`、`3c840d1a`、`6310e0dc`、`94fcc27d` 四个实现/测试提交组成；所选 `3c840d1a` 负责 Engine API 批量采集和 API Host 路由，`6310e0dc` 负责 Runtime 部分失败 warning。刷新指标仍是只读 GET 查询，因此不会生成任务中心或审计记录，且前端按钮和 aifar-agent 均未修改。
 - 问题：用户要求检查当前分支中不应提交到仓库的内容并排除。
 - 结论：分支与远端同名分支提交一致；工作区中本机开发端口 `8099` 已从受版本控制的 `config/defaults.env` 恢复为仓库默认 `8080`，后续应通过进程环境变量覆盖。已精确忽略被新版替代的旧英文手册 `docs/AIFAR-Customer-IT-Monitoring-and-Troubleshooting-Manual.docx`，并清理根目录 0 字节误生成文件；其余三份用途不同的 DOCX、两份实施计划及项目 `memory.md` 保留为可提交内容。
+- 问题：Keepalived 离线安装后依赖 `/etc/systemd/system/keepalived.service` 指向安装目录的软链接，重启或挂载异常时难以可靠加载。
+- 结论：安装器现在将渲染后的 unit 原子写入 `/etc/systemd/system/keepalived.service`，写入 `RequiresMountsFor=/aifar/apps/keepalived`；仅迁移指向本安装目录的旧链接，拒绝外部 unit，并在失败回滚时精确还原 absent、legacy-link 或受管 regular-file 的原始状态。
+- 问题：Keepalived 改为直接 systemd unit 后，卸载及失败回滚需兼容旧软链接并拒绝外部 unit。
+- 结论：卸载器会捕获 absent、legacy-link 或 managed-file，验证直接 unit 的 AIFAR ExecStart，备份 regular-file 的字节和 SHA256；成功仅删除已验证的受管 unit，失败时只在路径仍为空时按原类型恢复，出现并发替换则不接管服务。
+- 问题：Keepalived 卸载预检后若 unit 被外部替换，原逻辑仍可能 stop 或 disable 外部服务。
+- 结论：每次 stop 和 disable 前均重新比较捕获的 unit 状态；任何 absent/link/file 状态或 SHA256 变化均在服务控制前失败，回滚也不会覆盖或控制外部 replacement。
+- 问题：Keepalived 直接 systemd unit 的运维文档和静态契约需要覆盖重启、迁移、卸载及 SELinux 标签范围。
+- 结论：README 现说明 `/etc/systemd/system/keepalived.service` 为 root:root 0644 普通文件、`RequiresMountsFor`、无需手工 daemon-reload、旧链接迁移和卸载备份/回滚；静态测试禁止递归 relabel `/etc/systemd/system` 并要求仅对最终 unit 执行 `restorecon -F`。本地脚本与 Keepalived 测试通过；package 因共享 Go cache access denied 未完成，未复制离线资源。
+- 问题：Keepalived 直接 unit 的最终审查发现 legacy-link disable 语义、安装/卸载早期回滚、原子替换、unit 所有权和 SELinux 标签校验仍有边界缺口。
+- 结论：安装器现以同目录 `mv -Tf` 原子替换 unit，并用显式 mutation/installed/restore phase、精确 SHA256 和每次服务控制前重验保护回滚；安装器和卸载器仅接受 executable token 精确为 `/aifar/apps/keepalived/sbin/keepalived` 的真实 `ExecStart=`。卸载允许 `systemctl disable` 删除已捕获的 legacy link，并可复用未变化的 direct unit 恢复原服务状态；启用 SELinux 时最终 unit 经单文件 `restorecon` 后必须匹配发行版 `matchpathcon` 类型。
+- 问题：原本 disabled 的 Keepalived legacy unit 软链在安装或卸载回滚中恢复后，再次执行真实 `systemctl disable` 会被 systemd 删除，导致精确状态回滚失败。
+- 结论：安装和卸载回滚会在 disable 后仅针对已捕获 legacy-link 且 unit 路径仍为空的情况用 `ln -sT` 恢复原链接，执行 daemon-reload 并精确复验；路径出现任何外部对象时拒绝覆盖。回归测试模拟 disable 删除软链并覆盖两条事务路径。
+- 问题：Keepalived direct unit 事务复审要求继续收紧所有权解析、FragmentPath 门禁、信号窗口及原类型恢复。
+- 结论：安装和卸载仅接受 `[Service]` 内所有非空 `ExecStart=` 都精确指向 AIFAR Keepalived；服务控制前同时校验 unit 对象与对应 FragmentPath，回滚最终复验 enabled/active。安装回滚能识别 `mv` 成功但标记未写入的 SHA256，regular-file 使用同目录临时文件原子恢复，缺失目标使用 non-clobber rename 拒绝并发对象；`RequiresMountsFor` 保留其他依赖并仅去重 AIFAR 路径。
+- 问题：为离线 Keepalived 模块添加通用节点配置契约及 VRRP 模板。
+- 结论：新增七个显式环境键的示例文件和使用 BACKUP、unicast、健康检查降权、默认抢占的模板；脚本测试断言文件清单、键集合和关键模板语义。`node --test scripts/keepalived-extra.test.mjs` 与 `pnpm test:scripts` 均通过。
+- 问题：为 Keepalived 离线安装器增加节点配置的安全解析、主机网络校验和确定性模板渲染。
+- 结论：`keepalived.env` 仅按七字段 allowlist 解析，绝不 source/eval；安装器复用校验后的同目录健康脚本 URL validator，并在构建前校验 IP、VIP/CIDR、接口绑定、VIP 路由、优先级、VRID 和本机健康 URL。模板渲染会拒绝残留占位符；聚焦 42 项和完整脚本 104 项测试均通过。
+- 问题：修复 Keepalived 节点数字配置的 Bash 算术溢出和同进程重复解析的陈旧全局状态。
+- 结论：CIDR 前缀、优先级和 VRID 现在先通过有限位 canonical 十进制语法，再用 `10#` 转换并校验原范围；每次解析先清空七个 `NODE_*`，且必填项必须出现在本轮 `seen` map。超大数字与 valid-then-missing-field 回归已覆盖，聚焦 46 项和完整脚本 108 项测试通过。
+- 问题：为 Keepalived 离线安装器增加备份安全的托管配置安装、服务激活和失败回滚。
+- 结论：安装前捕获 service/unit 状态并校验完整安装根备份，托管配置经 staged/final 两次语法检查后原子替换；激活按原 active 状态选择 start/restart，健康失败仅告警，最终非 active 触发 trap 回滚。回滚仅在精确且非挂载的安装根上递归删除，恢复完整旧根、owned unit link 与原 enabled/active 状态，并保留原失败码；聚焦 58 项、完整脚本 120 项和 Bash 语法检查通过。
+- 问题：为 Keepalived 托管安装和卸载增加精确的对端 VRRP firewalld 规则所有权生命周期。
+- 结论：仅在 firewalld active 时按接口 zone（仅空或 no zone 时回退默认 zone）管理 peer `/32`、IP protocol 112 的 runtime/permanent rich rule；安装事务用逆序 journal 回滚本轮增删，所有权记录区分预存与本轮创建规则，peer 变化只移除旧 owned 精确规则；卸载在验证备份后校验记录并只删除 `created=1` 的现存精确形式。
+- 问题：修复 Keepalived firewalld 审查发现的空/符号链接所有权记录绕过和 mutation 先于 journal 的事务窗口。
+- 结论：卸载器现在只把真正不存在的 ownership path 当缺失，任何存在对象必须是非符号链接普通文件并无条件解析；firewalld 的四种增删形式均先追加并回读校验 write-ahead journal，再执行命令，journal 写失败不会发生规则变更，命令失败时逆序回滚按实际规则状态安全处理。
+- 问题：完成 Keepalived SELinux 映射迁移、安装事务回滚、双机运维文档和 Linux 发布包权限收口。
+- 结论：SELinux fcontext 查询改用 ENVIRON literal 比较，helper 将完整 ownership record 与本轮 journal 分离，保留旧记录并新增 libexec 映射；安装失败会在恢复应用树前逆序撤销本轮 SELinux 变更。README 覆盖 132/133 双机配置、FAULT 漂移和默认抢占；health probe 在 Linux tar 中为 0755，Windows 继续排除模块。聚焦测试 87/87、脚本测试 139/139、`pnpm test:local` 和双平台归档校验通过。
+- 问题：修复 Keepalived Task 6 审查发现的 SELinux ownership record 信任边界和 mutation journal 竞争问题。
+- 结论：helper、重装 installer 和 uninstaller 现在在任何 semanage/service 变更前执行等价严格校验，仅接受非空普通非 symlink 文件、当前六个精确 pattern 加 legacy scripts pattern、唯一四字段记录及一致动作/type 语义。helper 只记录成功 mutation，journal 写失败会即时精确撤销并复验；外层回滚仅在 current type 仍等于 applied type 时逆操作，缺失或外部变化会保留并报告不完整。SELinux 聚焦 36/36、完整聚焦 122/122、脚本 174/174 和 `pnpm test:local` 均通过。
+- 问题：修复 Keepalived SELinux helper 在单条 journal 逆操作失败后提前停止、遗漏其余安全映射回滚的问题。
+- 结论：`rollback_current_journal` 现在累积失败状态并始终逆序处理全部 journal 行，最终非零返回；缺失或外部修改行保持不变，其余 current type 仍匹配 applied type 的安全行继续精确逆转。三行 journal 回归覆盖最新行外部变化、最早行缺失和临时 semanage 失败；聚焦 125/125、脚本 177/177、`pnpm test:local`、四个 Bash 语法检查和双平台发布核验均通过。
+- 问题：收口 Keepalived 健康探测、重装配置切换、firewalld 预检、卸载事务、SELinux legacy 迁移和发布输入边界。
+- 结论：健康探测仅接受 2xx、禁用重定向并在 JSON 解析前限制 65536 字节；重装在任何正式文件替换前校验 staged 配置，三文件同目录临时写入并由完整安装根备份覆盖失败回滚；旧 firewall ownership 在 inactive firewalld 下 fail closed；卸载先只读预检并以完整根、service/unit、firewall、SELinux journal 事务回滚。legacy `scripts` SELinux 记录迁移后严格收敛为六项核心记录且 retirement 支持双层回滚；发布仅复制显式 Keepalived allowlist，节点 `keepalived.env` 或符号链接输入均拒绝。最终 `pnpm test:scripts` 217/217、后端测试、前端 161 项、Bash 语法、`git diff --check` 和 `pnpm test:local` 双平台打包/归档校验全部通过。
+- 问题：修复 Keepalived 最终复审发现的卸载早期失败根目录替换、foreign unit 回滚控制和 SELinux unchanged 所有权语义。
+- 结论：卸载事务在即将删除 APP_ROOT 前设置 `ROOT_MUTATION_STARTED`，只有该写前标志已设置才会在回滚中重建完整根；stop、disable、firewall 或 SELinux 早期失败保持原根 inode 和 marker 不变，删除已开始后的失败仍从校验备份恢复。unit link 在预检后被外部替换时立即标记冲突并跳过 daemon-reload 及全部后续 service 控制；正常恢复 link 后必须再次验证 symlink 和 FragmentPath 归属。SELinux `unchanged` 明确表示非模块所有，helper legacy 迁移和卸载 preflight/restore 均忽略其缺失或外部变化且不执行 mutation。最终 Keepalived/release focused 172/172、`pnpm test:scripts` 224/224、四脚本 Bash 语法、`pnpm test:local`、双平台 checksum 和归档内容校验全部通过。
+- 问题：用户批准上线前基础服务凭据改密设计，要求编写实施计划并在另一分支操作。
+- 结论：已从 `8d4873f6` 创建隔离分支 `codex/prelaunch-credential-rotation` 和 worktree `.worktrees/prelaunch-credential-rotation`；依赖安装使用本地缓存，基线 `pnpm test` 通过。详细 TDD 实施计划写入 `docs/superpowers/plans/2026-07-26-prelaunch-foundation-credential-rotation.md`，拆分为存储与密钥、共享/独占锁、拓扑预检、五类模块、编排回滚、owner-only API、前端向导及真实集群验收 14 个任务，并以提交 `7d3ae0a7` 保存，未推送远端。
+- 问题：用户选择子代理驱动方式执行上线前基础服务凭据改密实施计划，并在 Task 2 开始时要求暂停。
+- 结论：Task 1 Store 底座已以 `eaab17ef` 实现，审查发现混合 expected 状态可绕过生命周期 CAS，随后以 `a952782b` 修复并通过 scoped re-review；Store 聚焦、完整包及后端全量测试均通过。Task 2 尚未产生代码或报告，断点基线为 `a952782b`，恢复时从 Registry 协议与敏感脚本执行器继续，未推送远端。
+- 问题：恢复凭据轮换实施后，Task 2 审查发现实施计划要求可 JSON 序列化的任意 `Details map[string]any` 与“秘密绝不进入响应/metadata”的全局安全约束冲突。
+- 结论：Task 2 已以 `3a2a2caf` 提交但尚未通过任务门禁；除需修复状态日志前缀注入、清理失败吞错和原始 CommandResult 返回外，`Details` 的接口取舍必须由用户裁定。当前推荐保留内部 map 但标记 `json:"-"`，后续仅由编排器显式白名单转换可持久化/公开字段；未推送远端。
+- 问题：用户确认凭据轮换安全优先后继续实施，随后在 Task 4 开始时决定暂时停止整个任务。
+- 结论：安全优先裁定已落实：Task 2 以 `31b502d1` 修复 JSON/日志/返回值泄密和敏感文件清理并通过复审；Task 3 以 `b0f3caff` 建立 shared/exclusive 门禁，经过 `4dbfe908`、`26d4fea6` 两轮修复消除 autoscaler 采集前绕锁与 stale metadata TOCTOU，并通过复审。Task 4 在任何代码、报告或提交产生前被中断；当前断点 HEAD 为 `26d4fea6`，仅 `memory.md` 未提交，分支/worktree 保留，Tasks 4-14 未执行且未推送远端。
+- 问题：为 AIFAR Runtime 诊断导出实现 SQLite 持久化生命周期基础。
+- 结论：新增 `diagnostic_exports` 版本化迁移和模型，支持状态及清理状态的固定集合校验、服务/告警集合规范化、分页查询、到期清理查询与可空时间字段扫描；定向 store 测试和 `go test ./...` 通过。
+- 问题：诊断导出空服务集合在 JSON 中被编码为 `null`，与数组契约不一致。
+- 结论：空服务或告警集合必须保持非 nil 空切片，使 SQLite JSON 与 API JSON 都编码为 `[]`；已增加 save/get/JSON 回归测试。
+- 问题：为 AIFAR Runtime 实现受控诊断归档生成、取消清理、流式下载和删除。
+- 结论：诊断导出按固定九步 worker 编排，使用 go:embed 固定脚本在每个 export ID 隔离目录收集并分阶段脱敏日志与诊断，生成 manifest/errors，执行 3 GiB 暂存和 1 GiB 归档限制后原子提升；取消或失败只清理该 export，下载与删除会重读归属、状态、过期时间及受控路径，ready 记录临界区避免数据库与文件不一致。聚焦、包级和后端全量测试通过；真实 SSH、Docker 与 openEuler 归档执行未验证。
+- 问题：修复 Runtime 诊断归档首轮审查中的脚本替换、资源限制、脱敏中间态、路径竞态、生命周期竞态和进程组清理风险。
+- 结论：估算与导出均固定使用 go:embed 脚本；导出以有效 1 GiB 文件限制失败关闭，所有原始/暂存/脱敏中间文件均在最终 bundle 外，敏感文件名拒绝且错误信息脱敏，校验和显式验错；诊断根目录与 partial/final 路径拒绝符号链接和竞态覆盖，源文件复制前后复核；下载/删除改为 SQLite 条件状态迁移，失败或取消清理可重试；清理验证 PID starttime 和进程组并等待整组退出，远程阶段完成后才更新任务步骤。定向应用与 store 测试、两份脚本语法和差异检查通过；Windows 无符号链接权限时对应 Linux 行为测试跳过，真实 openEuler 未验收。
+- 问题：修复 Runtime 诊断归档复审剩余的日志文件准入遗漏、单项诊断失败中断全包和复制前无剩余额度限制。
+- 结论：文件日志改为 fail-closed allowlist，仅允许无控制字符、无隐藏/敏感路径组件的 `.log` 与 `.log.N`；Docker logs/inspect、systemctl 和 host 单项失败只记录稳定 warning，失败输出删除后继续，其余安全与归档失败仍为 critical；源文件先按 device/inode/size 和累计剩余额度准入，no-follow 复制按目标 Bash 的 1024-byte `ulimit -f` 单位使用 `min(1048576,floor(remaining/1024))`，复制后再次核对身份和大小。聚焦测试、aifar 包、脚本语法和差异检查通过；Git for Windows 不支持数字文件限制，相关增长/复制集成场景在 Windows 跳过并保留 Linux 执行路径。
+- 问题：修复诊断命令自身退出 70 与 `ulimit` 建立失败共用退出码而误判为 critical 的冲突。
+- 结论：主导出脚本和文件日志 helper 的 `run_limited` 均改用 work 目录内受控 marker 传递限额建立失败，业务命令运行前删除 marker；只有 marker 存留才设置 `LIMIT_SETUP_FAILED=1` 并进入 critical，业务命令任意非零退出码均按对应 warning 继续。业务 exit 70 与模拟 ulimit 失败的确定性回归测试、focused、aifar 包、export 语法和差异检查通过。
+- 问题：用户要求删除没有推送到远端的本地分支。
+- 结论：刷新 origin 后删除了 9 个无同名远端引用的本地分支及其 5 个关联工作树：两个 status-collector 备份分支、docker-engine-stats-api、keepalived-direct-unit、keepalived-managed-startup、两个 latest 快照、prelaunch-credential-rotation、runtime-diagnostic-export。4 个脏工作树原有的独有 `memory.md` 记录已先并入主工作区；Windows 残留目录使用经精确根路径和内部 pnpm junction 目标校验的扩展路径逐层删除。删除后迟到生成且不属于原分支 tip 的诊断测试文件已按 blob `7cab5822` 保存在忽略目录 `.tmp/recovered-runtime-diagnostic-export-20260727-0844`，未丢弃。当前分支、main 和 3 个仍有 origin 同名引用的功能分支保留，未删除任何远端分支。
