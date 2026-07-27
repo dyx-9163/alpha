@@ -1,6 +1,39 @@
 package mysql
 
-import "strings"
+import (
+	"strings"
+
+	globali18n "aifar-deployment/backend/internal/i18n"
+)
+
+var mysqlBackupErrorMessageKeys = map[string]string{
+	MySQLCredentialUnavailable:           "mysql.backup.credentialUnavailable",
+	MySQLBackupUnsupportedTopology:       "mysql.backup.unsupportedTopology",
+	MySQLBackupClusterUnhealthy:          "mysql.backup.clusterUnhealthy",
+	MySQLBackupPrimaryNotFound:           "mysql.backup.primaryNotFound",
+	MySQLBackupSpaceInsufficient:         "mysql.backup.spaceInsufficient",
+	MySQLBackupTransferFailed:            "mysql.backup.transferFailed",
+	MySQLBackupChecksumMismatch:          "mysql.backup.checksumMismatch",
+	MySQLRestoreMaintenanceRequired:      "mysql.restore.maintenanceRequired",
+	MySQLRestoreVersionIncompatible:      "mysql.restore.versionIncompatible",
+	MySQLRestoreManifestInvalid:          "mysql.restore.manifestInvalid",
+	MySQLRestoreTargetNotClean:           "mysql.restore.targetNotClean",
+	MySQLRestorePrimaryChanged:           "mysql.restore.primaryChanged",
+	MySQLRestoreLocalInfileRestoreFailed: "mysql.restore.localInfileRestoreFailed",
+	MySQLRestoreIncomplete:               "mysql.restore.incomplete",
+	MySQLRebuildConfirmationRequired:     "mysql.rebuild.confirmationRequired",
+	MySQLRebuildRouterFailed:             "mysql.rebuild.routerFailed",
+}
+
+// MySQLBackupErrorText turns an approved stable error code into a localized,
+// non-secret user message. Unknown codes intentionally fall back to the code.
+func MySQLBackupErrorText(lang, code string) string {
+	key, ok := mysqlBackupErrorMessageKeys[code]
+	if !ok {
+		return code
+	}
+	return globali18n.Text(lang, key)
+}
 
 type Copy struct {
 	CategoryLabel         string

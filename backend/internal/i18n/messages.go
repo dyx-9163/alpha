@@ -24,7 +24,13 @@ func Text(lang, key string, args ...any) string {
 	locale := Resolve(lang)
 	template := catalogs[locale][key]
 	if template == "" {
+		template = mysqlBackupCatalogs[locale][key]
+	}
+	if template == "" {
 		template = catalogs[Zh][key]
+	}
+	if template == "" {
+		template = mysqlBackupCatalogs[Zh][key]
 	}
 	if template == "" {
 		return key
@@ -33,6 +39,47 @@ func Text(lang, key string, args ...any) string {
 		return template
 	}
 	return fmt.Sprintf(template, args...)
+}
+
+// mysqlBackupCatalogs keeps the first-class MySQL backup/restore messages
+// together without changing the existing broad API catalog layout.
+var mysqlBackupCatalogs = map[Locale]map[string]string{
+	Zh: {
+		"mysql.backup.credentialUnavailable":     "MySQL 管理员凭据不可用",
+		"mysql.backup.unsupportedTopology":       "不支持该 MySQL 备份拓扑",
+		"mysql.backup.clusterUnhealthy":          "MySQL InnoDB Cluster 不健康，不能备份",
+		"mysql.backup.primaryNotFound":           "未找到 MySQL InnoDB Cluster PRIMARY 节点",
+		"mysql.backup.spaceInsufficient":         "MySQL 备份空间不足",
+		"mysql.backup.transferFailed":            "MySQL 备份传输失败",
+		"mysql.backup.checksumMismatch":          "MySQL 备份校验和不匹配",
+		"mysql.restore.maintenanceRequired":      "MySQL 还原需要先进入维护窗口",
+		"mysql.restore.versionIncompatible":      "MySQL 还原目标版本不兼容",
+		"mysql.restore.manifestInvalid":          "MySQL 备份清单无效",
+		"mysql.restore.targetNotClean":           "MySQL 还原目标不满足干净状态要求",
+		"mysql.restore.primaryChanged":           "MySQL InnoDB Cluster PRIMARY 已变化，已停止还原",
+		"mysql.restore.localInfileRestoreFailed": "MySQL local_infile 恢复失败",
+		"mysql.restore.incomplete":               "MySQL 还原未完成，需要人工调和",
+		"mysql.rebuild.confirmationRequired":     "MySQL 灾难重建需要明确确认",
+		"mysql.rebuild.routerFailed":             "MySQL Router 重建失败",
+	},
+	En: {
+		"mysql.backup.credentialUnavailable":     "MySQL administrator credential is unavailable",
+		"mysql.backup.unsupportedTopology":       "MySQL backup topology is unsupported",
+		"mysql.backup.clusterUnhealthy":          "MySQL InnoDB Cluster is unhealthy and cannot be backed up",
+		"mysql.backup.primaryNotFound":           "MySQL InnoDB Cluster PRIMARY was not found",
+		"mysql.backup.spaceInsufficient":         "insufficient space for MySQL backup",
+		"mysql.backup.transferFailed":            "MySQL backup transfer failed",
+		"mysql.backup.checksumMismatch":          "MySQL backup checksum mismatch",
+		"mysql.restore.maintenanceRequired":      "MySQL restore requires a maintenance window",
+		"mysql.restore.versionIncompatible":      "MySQL restore target version is incompatible",
+		"mysql.restore.manifestInvalid":          "MySQL backup manifest is invalid",
+		"mysql.restore.targetNotClean":           "MySQL restore target is not clean",
+		"mysql.restore.primaryChanged":           "MySQL InnoDB Cluster PRIMARY changed; restore stopped",
+		"mysql.restore.localInfileRestoreFailed": "MySQL local_infile restore failed",
+		"mysql.restore.incomplete":               "MySQL restore is incomplete and requires reconciliation",
+		"mysql.rebuild.confirmationRequired":     "MySQL disaster rebuild requires explicit confirmation",
+		"mysql.rebuild.routerFailed":             "MySQL Router rebuild failed",
+	},
 }
 
 var catalogs = map[Locale]map[string]string{
