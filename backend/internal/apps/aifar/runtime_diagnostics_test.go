@@ -110,6 +110,21 @@ func (s *runtimeDiagnosticStore) ListDiagnosticExportsForReconcile() ([]store.Di
 	return result, nil
 }
 
+func (s *runtimeDiagnosticStore) AcquireOperationLock(lock store.OperationLock) (store.OperationLock, error) {
+	if strings.TrimSpace(lock.ID) == "" {
+		lock.ID = "lock-" + lock.ResourceID
+	}
+	return lock, nil
+}
+
+func (s *runtimeDiagnosticStore) ReleaseOperationLock(string) (bool, error) {
+	return true, nil
+}
+
+func (s *runtimeDiagnosticStore) AddAudit(string, string, string, string, string) error {
+	return nil
+}
+
 func (s *runtimeDiagnosticStore) SaveDiagnosticExport(v store.DiagnosticExport) (store.DiagnosticExport, error) {
 	if err := s.saveErrForStatus[v.Status]; err != nil {
 		return store.DiagnosticExport{}, err
@@ -220,6 +235,32 @@ func (r *runtimeDiagnosticRemote) Run(ctx context.Context, _ store.Server, comma
 		return r.run(ctx, command)
 	}
 	return adapter.CommandResult{Stdout: r.stdout, Stderr: r.stderr}, r.err
+}
+
+func TestCopyExactRuntimeDiagnosticArchive(t *testing.T) {
+	tests := []struct {
+		name      string
+		content   string
+		expected  int64
+		want      string
+		wantError bool
+	}{
+		{name: "exact", content: "archive", expected: 7, want: "archive"},
+		{name: "short", content: "short", expected: 7, want: "short", wantError: true},
+		{name: "extended", content: "archive-extra", expected: 7, want: "archive", wantError: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var dst bytes.Buffer
+			n, err := copyExactRuntimeDiagnosticArchive(context.Background(), &dst, strings.NewReader(tt.content), tt.expected)
+			if (err != nil) != tt.wantError {
+				t.Fatalf("copy error = %v, wantError %v", err, tt.wantError)
+			}
+			if n != int64(len(tt.want)) || dst.String() != tt.want {
+				t.Fatalf("copy result = (%d, %q), want (%d, %q)", n, dst.String(), len(tt.want), tt.want)
+			}
+		})
+	}
 }
 
 func (*runtimeDiagnosticRemote) UploadFile(context.Context, store.Server, string, string, os.FileMode) error {
@@ -371,19 +412,29 @@ func TestEstimateRuntimeDiagnosticsCombinesRemoteMetadataAndLocalCapacity(t *tes
 	}
 }
 
-func TestEstimateRuntimeDiagnosticsDoesNotReclaimExpiredArchiveBeforeCleanup(t *testing.T) {
+func TestEstimateRuntimeDiagnosticsReclaimsExpiredArchiveOnlyAfterSuccessfulCleanup(t *testing.T) {
 	now := time.Now().UTC()
 	db, instance, server, _ := runtimeDiagnosticFixture(now)
+	root := t.TempDir()
+	archiveName := "aifar-diagnostics-expired-20260727T080000Z.tar.gz"
+	relativePath := path.Join("diag-expired-local", archiveName)
+	absolutePath := filepath.Join(root, filepath.FromSlash(relativePath))
+	if err := os.MkdirAll(filepath.Dir(absolutePath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(absolutePath, []byte("expired"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	db.exports["diag-expired-local"] = store.DiagnosticExport{
 		ID: "diag-expired-local", InstanceID: instance.ID, ServerID: server.ID,
 		Status: "ready", StorageKind: "local", ArchiveBytes: 900 << 20,
-		ExpiresAt: now.Add(-time.Minute),
+		StorageRelativePath: relativePath, ArchiveName: archiveName, ExpiresAt: now.Add(-time.Minute),
 	}
 	remote := &runtimeDiagnosticRemote{stdout: strings.Join([]string{
 		"AIFAR_DIAG_SERVICE_V2\tgateway\t1\t1024",
 		"AIFAR_DIAG_TOTAL_V2\t1\t1024\tAsia/Shanghai\t-",
 	}, "\n")}
-	archives := NewRuntimeDiagnosticArchiveStorage(t.TempDir(), 1<<30, runtimeDiagnosticRetention, db)
+	archives := NewRuntimeDiagnosticArchiveStorage(root, 1<<30, runtimeDiagnosticRetention, db)
 
 	estimate, err := NewServiceWithDiagnosticStorage(db, remote, archives).EstimateRuntimeDiagnostics(context.Background(), RuntimeDiagnosticRequest{
 		Instance: instance, Server: server, Language: "en", Services: []string{"gateway"},
@@ -392,8 +443,14 @@ func TestEstimateRuntimeDiagnosticsDoesNotReclaimExpiredArchiveBeforeCleanup(t *
 	if err != nil {
 		t.Fatal(err)
 	}
-	if estimate.Allowed || estimate.BlockReason != "local-quota-exceeded" {
-		t.Fatalf("expired archive was reclaimed before successful cleanup: %+v", estimate)
+	if !estimate.Allowed || estimate.BlockReason != "" {
+		t.Fatalf("successfully deleted expired archive was not reclaimed: %+v", estimate)
+	}
+	if got := db.exports["diag-expired-local"]; got.Status != "deleted" || got.CleanupStatus != "complete" {
+		t.Fatalf("expired archive cleanup was not recorded: %+v", got)
+	}
+	if _, err := os.Stat(absolutePath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expired archive remained after successful cleanup: %v", err)
 	}
 }
 
@@ -442,7 +499,7 @@ func TestExportRuntimeDiagnosticsStreamsIntoLocalStorage(t *testing.T) {
 			"AIFAR_DIAG_SERVICE_V2\tgateway\t1\t1024",
 			"AIFAR_DIAG_TOTAL_V2\t1\t1024\tAsia/Shanghai\t-",
 		}, "\n"),
-		commandStream: append([]byte(fmt.Sprintf("AIFAR_DIAG_STREAM_V1\t%s\t4096\t1\tAsia/Shanghai\n", archiveName)), archive...),
+		commandStream: append([]byte(fmt.Sprintf("AIFAR_DIAG_STREAM_V1\t%s\t10\t1\tAsia/Shanghai\n", archiveName)), archive...),
 	}
 	archives := NewRuntimeDiagnosticArchiveStorage(t.TempDir(), 5<<30, runtimeDiagnosticRetention, db)
 	log := &recordingStepLogger{}
@@ -721,6 +778,40 @@ func TestRuntimeDiagnosticHostLogSourceSelectionNoDocker(t *testing.T) {
 		if runtimeDiagnosticLogFileAllowed(rejected) {
 			t.Fatalf("unsafe log name accepted: %q", rejected)
 		}
+	}
+	for _, required := range []string{
+		`exec 9< "$source_file"`,
+		`source_descriptor=/proc/self/fd/9`,
+		`head -c "$initial_size" -- "$source_descriptor"`,
+	} {
+		if !strings.Contains(exportScript, required) {
+			t.Fatalf("host log source is not read through one validated descriptor; missing %q", required)
+		}
+	}
+	if strings.Contains(exportScript, `head -c "$initial_size" -- "$source_canonical"`) {
+		t.Fatal("validated host log source is reopened by pathname")
+	}
+}
+
+func TestEstimateRuntimeDiagnosticsUsesConfiguredRetention(t *testing.T) {
+	now := time.Now().UTC().Add(-time.Minute)
+	db, instance, server, _ := runtimeDiagnosticFixture(now)
+	remote := &runtimeDiagnosticRemote{stdout: strings.Join([]string{
+		"AIFAR_DIAG_SERVICE_V2\tgateway\t1\t1024",
+		"AIFAR_DIAG_TOTAL_V2\t1\t1024\tAsia/Shanghai\t-",
+	}, "\n")}
+	archives := NewRuntimeDiagnosticArchiveStorage(t.TempDir(), 1<<30, 2*time.Hour, db)
+
+	estimate, err := NewServiceWithDiagnosticStorage(db, remote, archives).EstimateRuntimeDiagnostics(context.Background(), RuntimeDiagnosticRequest{
+		Instance: instance, Server: server, Language: "en", Services: []string{"gateway"},
+		SinceAt: now.Add(-time.Hour), UntilAt: now,
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	remaining := time.Until(estimate.ExpiresAt)
+	if remaining < 119*time.Minute || remaining > 121*time.Minute {
+		t.Fatalf("estimate expiry ignored configured retention: %s", remaining)
 	}
 }
 

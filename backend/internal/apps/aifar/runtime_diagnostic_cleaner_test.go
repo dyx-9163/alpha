@@ -550,7 +550,7 @@ func saveLocalRuntimeDiagnosticCleanerExport(t *testing.T, db *store.Store, arch
 	if _, err := sink.Write(archive); err != nil {
 		t.Fatal(err)
 	}
-	artifact, err := sink.Commit()
+	artifact, err := sink.Commit(context.Background(), 10)
 	if err != nil {
 		t.Fatal(err)
 	}

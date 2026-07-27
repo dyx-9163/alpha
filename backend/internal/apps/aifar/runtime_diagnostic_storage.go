@@ -27,6 +27,7 @@ const (
 
 type RuntimeDiagnosticArchiveStorage interface {
 	Stats(context.Context) (RuntimeDiagnosticStorageStats, error)
+	Retention() time.Duration
 	Begin(exportID, archiveName string) (RuntimeDiagnosticArchiveSink, error)
 	Open(relativePath string) (*os.File, error)
 	Remove(relativePath string) error
@@ -36,7 +37,7 @@ type RuntimeDiagnosticArchiveStorage interface {
 
 type RuntimeDiagnosticArchiveSink interface {
 	io.Writer
-	Commit() (RuntimeDiagnosticLocalArtifact, error)
+	Commit(context.Context, int64) (RuntimeDiagnosticLocalArtifact, error)
 	Abort() error
 }
 
@@ -68,12 +69,13 @@ type runtimeDiagnosticRecordLister interface {
 }
 
 type localRuntimeDiagnosticArchiveStorage struct {
-	root            string
-	quotaBytes      int64
-	retention       time.Duration
-	records         runtimeDiagnosticRecordLister
-	maxArchiveBytes int64
-	availableBytes  func(string) (int64, error)
+	root                 string
+	quotaBytes           int64
+	retention            time.Duration
+	records              runtimeDiagnosticRecordLister
+	maxArchiveBytes      int64
+	maxUncompressedBytes int64
+	availableBytes       func(string) (int64, error)
 }
 
 type localRuntimeDiagnosticArchiveSink struct {
@@ -99,8 +101,15 @@ func newRuntimeDiagnosticArchiveStorageWithLimit(root string, quotaBytes int64, 
 	}
 	return &localRuntimeDiagnosticArchiveStorage{
 		root: filepath.Clean(root), quotaBytes: quotaBytes, retention: retention, records: records, maxArchiveBytes: maxArchiveBytes,
-		availableBytes: runtimeDiagnosticAvailableBytes,
+		maxUncompressedBytes: runtimeDiagnosticMaxFiltered, availableBytes: runtimeDiagnosticAvailableBytes,
 	}
+}
+
+func (s *localRuntimeDiagnosticArchiveStorage) Retention() time.Duration {
+	if s == nil || s.retention <= 0 {
+		return runtimeDiagnosticRetention
+	}
+	return s.retention
 }
 
 func (s *localRuntimeDiagnosticArchiveStorage) Stats(ctx context.Context) (RuntimeDiagnosticStorageStats, error) {
@@ -132,7 +141,7 @@ func (s *localRuntimeDiagnosticArchiveStorage) Stats(ctx context.Context) (Runti
 			continue
 		}
 		result.ReservedBytes += record.ReservedBytes
-		if record.Status == "ready" {
+		if record.ArchiveBytes > 0 {
 			result.ReadyBytes += record.ArchiveBytes
 			if !record.ExpiresAt.IsZero() && !record.ExpiresAt.After(now) {
 				result.ExpiredReadyBytes += record.ArchiveBytes
@@ -427,7 +436,7 @@ func (s *localRuntimeDiagnosticArchiveStorage) Reconcile(ctx context.Context, no
 			if _, exists := referenced[relativePath]; exists || info.ModTime().After(orphanCutoff) {
 				continue
 			}
-			if err := validateRuntimeDiagnosticTarGzip(entryPath, strings.TrimSuffix(name, ".tar.gz")); err != nil {
+			if err := validateRuntimeDiagnosticTarGzip(ctx, entryPath, strings.TrimSuffix(name, ".tar.gz"), -1, s.maxUncompressedBytes); err != nil {
 				warnings["diagnostic-storage-orphan-invalid"] = struct{}{}
 				continue
 			}
@@ -556,7 +565,7 @@ func (s *localRuntimeDiagnosticArchiveSink) Write(payload []byte) (int, error) {
 	return written, err
 }
 
-func (s *localRuntimeDiagnosticArchiveSink) Commit() (RuntimeDiagnosticLocalArtifact, error) {
+func (s *localRuntimeDiagnosticArchiveSink) Commit(ctx context.Context, expectedUncompressedBytes int64) (RuntimeDiagnosticLocalArtifact, error) {
 	if s.committed {
 		return RuntimeDiagnosticLocalArtifact{}, fmt.Errorf("diagnostic archive sink is already committed")
 	}
@@ -573,7 +582,7 @@ func (s *localRuntimeDiagnosticArchiveSink) Commit() (RuntimeDiagnosticLocalArti
 		return RuntimeDiagnosticLocalArtifact{}, err
 	}
 	s.closed = true
-	if err := validateRuntimeDiagnosticTarGzip(s.partialPath, strings.TrimSuffix(s.archiveName, ".tar.gz")); err != nil {
+	if err := validateRuntimeDiagnosticTarGzip(ctx, s.partialPath, strings.TrimSuffix(s.archiveName, ".tar.gz"), expectedUncompressedBytes, s.storage.maxUncompressedBytes); err != nil {
 		s.Abort()
 		return RuntimeDiagnosticLocalArtifact{}, err
 	}
@@ -620,9 +629,18 @@ func (s *localRuntimeDiagnosticArchiveSink) Abort() error {
 	return errors.Join(closeErr, removeErr, directoryErr)
 }
 
-func validateRuntimeDiagnosticTarGzip(archivePath, expectedTop string) error {
+func validateRuntimeDiagnosticTarGzip(ctx context.Context, archivePath, expectedTop string, expectedUncompressedBytes, maxUncompressedBytes int64) error {
 	if !validRuntimeDiagnosticStorageComponent(expectedTop) {
 		return fmt.Errorf("invalid diagnostic archive root")
+	}
+	if ctx == nil {
+		return fmt.Errorf("diagnostic archive validation context is required")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if maxUncompressedBytes <= 0 || expectedUncompressedBytes < -1 || expectedUncompressedBytes > maxUncompressedBytes {
+		return fmt.Errorf("invalid diagnostic archive uncompressed size")
 	}
 	file, err := os.Open(archivePath)
 	if err != nil {
@@ -640,7 +658,11 @@ func validateRuntimeDiagnosticTarGzip(archivePath, expectedTop string) error {
 		path.Join(expectedTop, "manifest.json"):         false,
 		path.Join(expectedTop, "collection-errors.txt"): false,
 	}
+	var regularBytes int64
 	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		header, err := tarReader.Next()
 		if errors.Is(err, io.EOF) {
 			break
@@ -659,6 +681,10 @@ func validateRuntimeDiagnosticTarGzip(archivePath, expectedTop string) error {
 		}
 		switch header.Typeflag {
 		case tar.TypeReg, tar.TypeRegA:
+			if header.Size < 0 || header.Size > maxUncompressedBytes-regularBytes {
+				return fmt.Errorf("diagnostic tar exceeds uncompressed size limit")
+			}
+			regularBytes += header.Size
 			if _, ok := required[clean]; ok {
 				required[clean] = true
 			}
@@ -666,9 +692,12 @@ func validateRuntimeDiagnosticTarGzip(archivePath, expectedTop string) error {
 		default:
 			return fmt.Errorf("diagnostic tar contains unsupported entry type")
 		}
-		if _, err := io.Copy(io.Discard, tarReader); err != nil {
+		if _, err := io.Copy(io.Discard, &runtimeDiagnosticContextReader{ctx: ctx, reader: tarReader}); err != nil {
 			return fmt.Errorf("read diagnostic tar entry: %w", err)
 		}
+	}
+	if expectedUncompressedBytes >= 0 && regularBytes != expectedUncompressedBytes {
+		return fmt.Errorf("diagnostic tar uncompressed size mismatch")
 	}
 	for name, present := range required {
 		if !present {

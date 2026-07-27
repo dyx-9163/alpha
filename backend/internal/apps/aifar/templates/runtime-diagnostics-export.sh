@@ -2,7 +2,7 @@ set -eu
 
 umask 077
 
-for required in awk bash cp date dirname docker find gawk grep head mkdir mv od readlink rm sed sha256sum stat systemctl tail tar timedatectl tr xargs du df free uptime; do
+for required in awk bash cp date dirname docker find gawk grep head mkdir mv od readlink rm sed sha256sum stat systemctl tail tar timedatectl tr xargs df free uptime; do
   command -v "$required" >/dev/null 2>&1 || exit 20
 done
 
@@ -105,7 +105,11 @@ source_file=$3
 
 case "$service" in ''|*[!a-z0-9-]*) exit 31 ;; esac
 [[ -f "$source_file" && ! -L "$source_file" ]] || exit 31
-source_canonical=$(readlink -f -- "$source_file") || exit 31
+exec 9< "$source_file" || exit 31
+source_descriptor=/proc/self/fd/9
+[ -e "$source_descriptor" ] || source_descriptor=/dev/fd/9
+[ -e "$source_descriptor" ] || exit 31
+source_canonical=$(readlink -f -- "$source_descriptor") || exit 31
 case "$source_canonical" in "$service_root"/*) ;; *) exit 31 ;; esac
 relative=${source_canonical#"$service_root"/}
 [[ "$relative" =~ ^[A-Za-z0-9._/-]+$ ]] || exit 31
@@ -118,7 +122,7 @@ done
 base_name=${path_parts[${#path_parts[@]}-1]}
 case "$base_name" in *.log|*.log.[A-Za-z0-9]*) ;; *) exit 31 ;; esac
 
-read -r initial_device initial_inode initial_size < <(stat -Lc '%d %i %s' -- "$source_canonical") || exit 31
+read -r initial_device initial_inode initial_size < <(stat -Lc '%d %i %s' -- "$source_descriptor") || exit 31
 case "$initial_device:$initial_inode:$initial_size" in *[!0-9:]*) exit 31 ;; esac
 [ "$initial_size" -le "$MAX_FILE_SCAN" ] || exit 41
 total_scan=$(cat "$TOTAL_SCAN_FILE")
@@ -129,7 +133,7 @@ printf '%s\n' "$next_scan" > "$TOTAL_SCAN_FILE"
 
 initial_ended_newline=1
 if [ "$initial_size" -gt 0 ]; then
-  last_hex=$(tail -c 1 -- "$source_canonical" | od -An -t x1 | tr -d '[:space:]')
+  last_hex=$(tail -c 1 -- "$source_descriptor" | od -An -t x1 | tr -d '[:space:]')
   [ "$last_hex" = "0a" ] || initial_ended_newline=0
 fi
 
@@ -155,7 +159,7 @@ redact_stream() {
   | sed -E 's/[A-Za-z0-9+\/_=-]{64,}/[REDACTED]/g'
 }
 
-head -c "$initial_size" -- "$source_canonical" \
+head -c "$initial_size" -- "$source_descriptor" \
   | TZ="$server_timezone" gawk -v since_epoch="$since_epoch" -v until_epoch="$until_epoch" -v server_tz="$server_timezone" \
       -v initial_ended_newline="$initial_ended_newline" -v summary_path="$summary" -v warning_path="$warnings" \
       -f "$FILTER_PROGRAM_FILE" \
@@ -181,11 +185,7 @@ while IFS="$tab" read -r warning_code warning_occurrences extra; do
   if [ -z "$warning_codes" ]; then warning_codes=$warning_code; else warning_codes="$warning_codes,$warning_code"; fi
 done < "$warnings"
 
-read -r final_device final_inode < <(stat -Lc '%d %i' -- "$source_canonical") || exit 31
-if [ "$final_device:$final_inode" != "$initial_device:$initial_inode" ]; then
-  printf 'source-identity-changed\t%s\t%s\t1\n' "$service" "$relative" >> "$ERROR_RECORDS"
-  if [ -z "$warning_codes" ]; then warning_codes=source-identity-changed; else warning_codes="$warning_codes,source-identity-changed"; fi
-fi
+exec 9<&-
 
 if [ "$filtered_bytes" -gt 0 ]; then
   staged_sha=$(sha256sum -- "$staged") || exit 31
@@ -277,8 +277,7 @@ if grep -R -I -E -q -- '-----BEGIN .*PRIVATE KEY-----|Authorization:[[:space:]]*
   exit 44
 fi
 
-uncompressed_line=$(du -sb -- "$BUNDLE_ROOT") || exit 45
-uncompressed_bytes=${uncompressed_line%%[[:space:]]*}
+uncompressed_bytes=$(find "$BUNDLE_ROOT" -xdev -type f -printf '%s\n' | awk '{ total += $1 } END { printf "%.0f\n", total }') || exit 45
 case "$uncompressed_bytes" in ''|*[!0-9]*) exit 45 ;; esac
 [ "$uncompressed_bytes" -le "$MAX_FILTERED" ] || exit 43
 

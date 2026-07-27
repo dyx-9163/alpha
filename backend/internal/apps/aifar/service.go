@@ -89,6 +89,10 @@ type runtimeDiagnosticsStore interface {
 	MarkDiagnosticExportCleanupPending(id string, attemptedAt time.Time) (bool, error)
 	MarkDiagnosticExportCleanupFailed(id, cleanupError string) (bool, error)
 	MarkDiagnosticExportDeleted(id string, deletedAt time.Time) (bool, error)
+	ListDiagnosticExportsForReconcile() ([]store.DiagnosticExport, error)
+	AcquireOperationLock(store.OperationLock) (store.OperationLock, error)
+	ReleaseOperationLock(id string) (bool, error)
+	AddAudit(actor, action, target, status, detail string) error
 	ListAIFARDeployments(instanceID string) ([]store.AIFARDeployment, error)
 	ListAIFARPods(instanceID string) ([]store.AIFARPod, error)
 	ListAppReleases(instanceID string) ([]store.AppRelease, error)

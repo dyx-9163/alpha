@@ -173,6 +173,11 @@ func (s Service) EstimateRuntimeDiagnostics(ctx context.Context, req RuntimeDiag
 	if err != nil {
 		return registry.RuntimeDiagnosticEstimateResult{}, errors.New(i18n.Text(req.Language, "aifar.diag.protocolInvalid"))
 	}
+	if err := s.cleanupExpiredLocalDiagnosticArchives(ctx, diagnostics, time.Now().UTC(), req.ExportID); err != nil {
+		return registry.RuntimeDiagnosticEstimateResult{}, &registry.RuntimeDiagnosticError{
+			Code: "RUNTIME_DIAGNOSTIC_LOCAL_COMMIT_FAILED", Message: i18n.Text(req.Language, "aifar.diag.localDiskFailed"),
+		}
+	}
 	stats, err := s.archives.Stats(ctx)
 	if err != nil {
 		return registry.RuntimeDiagnosticEstimateResult{}, &registry.RuntimeDiagnosticError{
@@ -190,7 +195,7 @@ func (s Service) EstimateRuntimeDiagnostics(ctx context.Context, req RuntimeDiag
 	estimate.LocalReadyBytes = stats.ReadyBytes
 	estimate.LocalReservedBytes = stats.ReservedBytes
 	estimate.LocalQuotaBytes = stats.QuotaBytes
-	estimate.ExpiresAt = time.Now().UTC().Add(runtimeDiagnosticRetention)
+	estimate.ExpiresAt = time.Now().UTC().Add(s.archives.Retention())
 	projectedQuota := stats.ReadyBytes + stats.ReservedBytes + runtimeDiagnosticMaxArchive
 	projectedHeadroom := stats.RootAvailableBytes - runtimeDiagnosticMaxArchive
 	if estimate.BlockReason == "" && projectedQuota > stats.QuotaBytes {
@@ -204,6 +209,51 @@ func (s Service) EstimateRuntimeDiagnostics(ctx context.Context, req RuntimeDiag
 		log.Info("%s", i18n.Text(req.Language, "aifar.diag.estimateCompleted", estimate.CandidateScanBytes))
 	}
 	return estimate, nil
+}
+
+func (s Service) cleanupExpiredLocalDiagnosticArchives(ctx context.Context, diagnostics runtimeDiagnosticsStore, now time.Time, ownerTaskID string) error {
+	records, err := diagnostics.ListDiagnosticExportsForReconcile()
+	if err != nil {
+		return err
+	}
+	for _, record := range records {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if record.StorageKind != "local" || (record.Status != "ready" && record.Status != "expired") || record.ExpiresAt.IsZero() || record.ExpiresAt.After(now) || record.StorageRelativePath == "" {
+			continue
+		}
+		lock, lockErr := diagnostics.AcquireOperationLock(store.OperationLock{
+			Scope: "runtime-diagnostics", ResourceID: record.ID, Operation: "delete",
+			OwnerTaskID: strings.TrimSpace(ownerTaskID), Owner: runtimeDiagnosticCleanupActor, ExpiresAt: now.Add(time.Hour),
+		})
+		if lockErr != nil {
+			var conflict store.OperationLockConflict
+			if errors.As(lockErr, &conflict) {
+				continue
+			}
+			return lockErr
+		}
+		func() {
+			defer diagnostics.ReleaseOperationLock(lock.ID)
+			updated, updateErr := diagnostics.MarkDiagnosticExportCleanupPending(record.ID, now)
+			if updateErr != nil || !updated {
+				return
+			}
+			if removeErr := s.archives.Remove(record.StorageRelativePath); removeErr != nil {
+				_, _ = diagnostics.MarkDiagnosticExportCleanupFailed(record.ID, i18n.Text("", "aifar.diag.cleanupFailed"))
+				return
+			}
+			if auditErr := diagnostics.AddAudit(runtimeDiagnosticCleanupActor, runtimeDiagnosticCleanupAuditAction, record.ID, "success", i18n.Text("", "aifar.diag.deleteCompleted", record.ArchiveName)); auditErr != nil {
+				_, _ = diagnostics.MarkDiagnosticExportCleanupFailed(record.ID, i18n.Text("", "aifar.diag.cleanupFailed"))
+				return
+			}
+			if updated, deleteErr := diagnostics.MarkDiagnosticExportDeleted(record.ID, now); deleteErr != nil || !updated {
+				_, _ = diagnostics.MarkDiagnosticExportCleanupFailed(record.ID, i18n.Text("", "aifar.diag.cleanupFailed"))
+			}
+		}()
+	}
+	return nil
 }
 
 func runtimeDiagnosticDurationRange(candidateBytes int64) (int, int) {
@@ -420,7 +470,7 @@ func (s Service) ExportRuntimeDiagnostics(ctx context.Context, req RuntimeDiagno
 	finishStep("success", "")
 
 	startStep(5)
-	finalArtifact, err = sink.Commit()
+	finalArtifact, err = sink.Commit(exportCtx, header.UncompressedBytes)
 	if err != nil {
 		return fail(errors.New(i18n.Text(req.Language, "aifar.diag.localCommitFailed")))
 	}
@@ -439,7 +489,7 @@ func (s Service) ExportRuntimeDiagnostics(ctx context.Context, req RuntimeDiagno
 		ID: exportRecord.ID, StorageRelativePath: finalArtifact.RelativePath, ArchiveName: finalArtifact.ArchiveName,
 		SHA256: finalArtifact.SHA256, ArchiveBytes: finalArtifact.Size, UncompressedBytes: header.UncompressedBytes,
 		WarningCount: header.WarningCount, Warnings: runtimeDiagnosticWarningPlaceholders(header.WarningCount),
-		ReadyAt: readyAt, ExpiresAt: readyAt.Add(runtimeDiagnosticRetention),
+		ReadyAt: readyAt, ExpiresAt: readyAt.Add(s.archives.Retention()),
 	})
 	if err != nil {
 		return fail(errors.New(i18n.Text(req.Language, "aifar.diag.localCommitFailed")))
@@ -554,10 +604,7 @@ func (s Service) StreamRuntimeDiagnosticExport(ctx context.Context, req RuntimeD
 			return 0, errors.New(i18n.Text(req.Language, "aifar.diag.streamSizeMismatch"))
 		}
 		hasher := sha256.New()
-		n, err = io.Copy(io.MultiWriter(dst, hasher), &runtimeDiagnosticContextReader{ctx: ctx, reader: file})
-		if err == nil && n != exportRecord.ArchiveBytes {
-			err = errors.New("archive size mismatch")
-		}
+		n, err = copyExactRuntimeDiagnosticArchive(ctx, io.MultiWriter(dst, hasher), file, exportRecord.ArchiveBytes)
 		if err == nil && fmt.Sprintf("%x", hasher.Sum(nil)) != exportRecord.SHA256 {
 			return n, errors.New(i18n.Text(req.Language, "aifar.diag.localChecksumFailed"))
 		}
@@ -634,6 +681,26 @@ func (s Service) DeleteRuntimeDiagnosticExport(ctx context.Context, req RuntimeD
 type runtimeDiagnosticContextReader struct {
 	ctx    context.Context
 	reader io.Reader
+}
+
+func copyExactRuntimeDiagnosticArchive(ctx context.Context, dst io.Writer, src io.Reader, expectedBytes int64) (int64, error) {
+	if expectedBytes < 0 {
+		return 0, errors.New("archive size mismatch")
+	}
+	reader := &runtimeDiagnosticContextReader{ctx: ctx, reader: src}
+	n, err := io.CopyN(dst, reader, expectedBytes)
+	if err != nil {
+		return n, err
+	}
+	var extra [1]byte
+	extraBytes, readErr := reader.Read(extra[:])
+	if extraBytes != 0 || readErr != io.EOF {
+		if readErr != nil && !errors.Is(readErr, io.EOF) {
+			return n, readErr
+		}
+		return n, errors.New("archive size mismatch")
+	}
+	return n, nil
 }
 
 func (r *runtimeDiagnosticContextReader) Read(p []byte) (int, error) {

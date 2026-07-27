@@ -115,7 +115,7 @@ func TestLocalDiagnosticSinkCommitsByAtomicRenameAndSHA256(t *testing.T) {
 	if _, err := os.Stat(finalPath); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("final archive existed before commit: %v", err)
 	}
-	artifact, err := sink.Commit()
+	artifact, err := sink.Commit(context.Background(), diagnosticArchiveRegularBytes(diagnosticArchiveControlEntries("archive")))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -132,6 +132,43 @@ func TestLocalDiagnosticSinkCommitsByAtomicRenameAndSHA256(t *testing.T) {
 	}
 	if _, err := os.Stat(finalPath + ".partial"); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("partial remained after commit: %v", err)
+	}
+}
+
+func TestLocalDiagnosticSinkRejectsUncompressedLimitMismatchAndCancellation(t *testing.T) {
+	entries := append(diagnosticArchiveControlEntries("archive"), diagnosticArchiveEntry{Name: "archive/services/gateway/file-logs/app.log", Body: strings.Repeat("x", 2048)})
+	payload := buildDiagnosticArchive(t, "archive", entries)
+	regularBytes := diagnosticArchiveRegularBytes(entries)
+
+	for name, test := range map[string]struct {
+		expected  int64
+		limit     int64
+		cancelled bool
+	}{
+		"over limit": {expected: regularBytes, limit: regularBytes - 1},
+		"mismatch":   {expected: regularBytes + 1, limit: regularBytes + 1},
+		"cancelled":  {expected: regularBytes, limit: regularBytes, cancelled: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			storage := newRuntimeDiagnosticArchiveStorageWithLimit(t.TempDir(), 1<<30, time.Hour, nil, 1<<20)
+			storage.maxUncompressedBytes = test.limit
+			sink, err := storage.Begin("diag-validation", "archive.tar.gz")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := sink.Write(payload); err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			if test.cancelled {
+				cancel()
+			} else {
+				defer cancel()
+			}
+			if _, err := sink.Commit(ctx, test.expected); err == nil {
+				t.Fatal("unsafe archive validation succeeded")
+			}
+		})
 	}
 }
 
@@ -263,7 +300,7 @@ func TestLocalDiagnosticSinkRejectsInvalidOrUnsafeTarGzip(t *testing.T) {
 			if _, err := sink.Write(test.payload(t)); err != nil {
 				t.Fatal(err)
 			}
-			if _, err := sink.Commit(); err == nil {
+			if _, err := sink.Commit(context.Background(), 0); err == nil {
 				t.Fatal("unsafe archive committed")
 			}
 			for _, name := range []string{"archive.tar.gz.partial", "archive.tar.gz"} {
@@ -425,6 +462,16 @@ func diagnosticArchiveControlEntries(top string) []diagnosticArchiveEntry {
 	}
 }
 
+func diagnosticArchiveRegularBytes(entries []diagnosticArchiveEntry) int64 {
+	var total int64
+	for _, entry := range entries {
+		if entry.Typeflag == 0 || entry.Typeflag == tar.TypeReg || entry.Typeflag == tar.TypeRegA {
+			total += int64(len(entry.Body))
+		}
+	}
+	return total
+}
+
 func buildDiagnosticArchive(t *testing.T, _ string, entries []diagnosticArchiveEntry) []byte {
 	t.Helper()
 	var compressed bytes.Buffer
@@ -471,7 +518,7 @@ func commitDiagnosticArchiveForTest(t *testing.T, storage RuntimeDiagnosticArchi
 		sink.Abort()
 		t.Fatal(err)
 	}
-	artifact, err := sink.Commit()
+	artifact, err := sink.Commit(context.Background(), diagnosticArchiveRegularBytes(diagnosticArchiveControlEntries(top)))
 	if err != nil {
 		t.Fatal(err)
 	}
