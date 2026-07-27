@@ -306,6 +306,29 @@ func TestCommitRejectsSameInodeSameSizeMutationAfterHash(t *testing.T) {
 	assertNotExist(t, paths.Archive)
 }
 
+func TestCommitRejectsSameInodeMutationAfterFinalHash(t *testing.T) {
+	repo, paths := prepareRepository(t, "backup-final-hash-mutation")
+	original := []byte("trusted archive")
+	mutated := []byte("mutated archive")
+	if len(original) != len(mutated) {
+		t.Fatal("test fixture sizes differ")
+	}
+	writePartial(t, paths, original)
+	hookRan := false
+	installRepositoryHook(repo, "commit.after-final-hash", func(_ string) error {
+		hookRan = true
+		return os.WriteFile(paths.Archive, mutated, 0o600)
+	})
+	if err := repo.Commit(paths, []byte(`{"backupId":"backup-final-hash-mutation"}`), digestBytes(original), int64(len(original))); err == nil {
+		t.Fatal("Commit accepted a same-inode mutation after its final hash")
+	}
+	if !hookRan {
+		t.Fatal("final-hash mutation hook did not run")
+	}
+	assertNotExist(t, paths.Manifest)
+	assertNotExist(t, paths.Checksums)
+}
+
 func TestCommitNeverOverwritesRacingFinals(t *testing.T) {
 	tests := []struct {
 		name  string
@@ -360,6 +383,38 @@ func TestCommitRollsBackArtifactWhenPostPromotionCheckFails(t *testing.T) {
 			assertNotExist(t, tt.path(paths))
 		})
 	}
+}
+
+func TestCommitCleanupNeverUnlinksReplacementAfterIdentityCheck(t *testing.T) {
+	repo, paths := prepareRepository(t, "backup-cleanup-final-window")
+	content := []byte("archive")
+	writePartial(t, paths, content)
+	installRepositoryHook(repo, "commit.after-archive-promote", func(_ string) error {
+		return errors.New("force archive rollback")
+	})
+	foreign := []byte("foreign-cleanup-object")
+	var owned string
+	cleanupHookRan := false
+	previous := repo.hook
+	repo.hook = func(point, path string) error {
+		if point == "cleanup.after-identity" && !cleanupHookRan {
+			cleanupHookRan = true
+			owned = path + ".owned"
+			if err := os.Rename(path, owned); err != nil {
+				return err
+			}
+			return os.WriteFile(path, foreign, 0o600)
+		}
+		return previous(point, path)
+	}
+	if err := repo.Commit(paths, []byte(`{"backupId":"backup-cleanup-final-window"}`), digestBytes(content), int64(len(content))); err == nil {
+		t.Fatal("Commit ignored forced rollback failure")
+	}
+	if !cleanupHookRan {
+		t.Fatal("post-identity cleanup hook did not run")
+	}
+	assertFileContent(t, paths.Archive, foreign)
+	assertFileContent(t, owned, content)
 }
 
 func TestCommitRejectsReplacedMetadataTempWithoutRemovingReplacement(t *testing.T) {
@@ -703,6 +758,34 @@ func TestDeleteDoesNotRemoveQuarantineReplacement(t *testing.T) {
 	assertFileContent(t, filepath.Join(paths.Directory, "foreign.txt"), []byte("foreign"))
 	if _, err := os.Stat(filepath.Join(originalQuarantine, archiveName)); err != nil {
 		t.Fatalf("verified quarantined directory was removed: %v", err)
+	}
+}
+
+func TestDeleteNeverRecursivelyRemovesReplacementAfterQuarantineIdentityCheck(t *testing.T) {
+	repo, paths, backup := committedBackup(t, "backup-delete-final-window")
+	foreign := []byte("foreign-directory")
+	var owned string
+	hookRan := false
+	installRepositoryHook(repo, "delete.before-recursive-remove", func(path string) error {
+		hookRan = true
+		owned = path + ".owned"
+		if err := os.Rename(path, owned); err != nil {
+			return err
+		}
+		if err := os.Mkdir(path, 0o700); err != nil {
+			return err
+		}
+		return os.WriteFile(filepath.Join(path, "foreign.txt"), foreign, 0o600)
+	})
+	if err := repo.Delete(backup); err == nil {
+		t.Fatal("Delete accepted a replacement after quarantine identity check")
+	}
+	if !hookRan {
+		t.Fatal("pre-recursive-remove hook did not run")
+	}
+	assertFileContent(t, filepath.Join(paths.Directory, "foreign.txt"), foreign)
+	if _, err := os.Stat(filepath.Join(owned, archiveName)); err != nil {
+		t.Fatalf("verified quarantine was removed: %v", err)
 	}
 }
 

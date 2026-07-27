@@ -76,15 +76,19 @@ func (boundaries *stableBoundaries) close() {
 }
 
 func (boundaries *stableBoundaries) closeManagedDirectory() {
+	boundaries.closeArtifacts()
+	if boundaries.directory.file != nil {
+		boundaries.directory.file.Close()
+		boundaries.directory.file = nil
+	}
+}
+
+func (boundaries *stableBoundaries) closeArtifacts() {
 	for index := range boundaries.artifacts {
 		if boundaries.artifacts[index].file != nil {
 			boundaries.artifacts[index].file.Close()
 			boundaries.artifacts[index].file = nil
 		}
-	}
-	if boundaries.directory.file != nil {
-		boundaries.directory.file.Close()
-		boundaries.directory.file = nil
 	}
 }
 
@@ -169,14 +173,14 @@ func (r *Repository) Commit(paths BackupPaths, manifest []byte, expectedSHA256 s
 		return err
 	}
 	defer boundaries.close()
-	partial, err := openStableRegular(paths.PartialArchive, os.O_RDWR)
+	partial, err := openStableRegularAt(boundaries.directory, partialName, os.O_RDWR)
 	if err != nil {
 		return err
 	}
 	partialBound := true
 	defer func() {
 		if retErr != nil && partialBound {
-			retErr = errors.Join(retErr, r.removeOwned(paths.PartialArchive, partial.info, "commit.rollback-partial"))
+			retErr = errors.Join(retErr, r.removeOwned(boundaries.directory, paths.PartialArchive, partial.info, "commit.rollback-partial"))
 		}
 	}()
 	defer func() {
@@ -212,7 +216,7 @@ func (r *Repository) Commit(paths BackupPaths, manifest []byte, expectedSHA256 s
 	if err := boundaries.recheck(); err != nil {
 		return err
 	}
-	partialAfter, err := openStableRegular(paths.PartialArchive, os.O_RDWR)
+	partialAfter, err := openStableRegularAt(boundaries.directory, partialName, os.O_RDWR)
 	if err != nil {
 		return err
 	}
@@ -231,20 +235,20 @@ func (r *Repository) Commit(paths BackupPaths, manifest []byte, expectedSHA256 s
 		return err
 	}
 
-	manifestTemp, err := writeSyncedTemp(paths.Directory, ".backup-manifest-", manifest)
+	manifestTemp, err := writeSyncedTempAt(boundaries.directory, ".backup-manifest-", manifest)
 	if err != nil {
 		return err
 	}
 	checksums := []byte(normalizedSHA + "  " + archiveName + "\n")
-	checksumsTemp, err := writeSyncedTemp(paths.Directory, ".checksums-", checksums)
+	checksumsTemp, err := writeSyncedTempAt(boundaries.directory, ".checksums-", checksums)
 	if err != nil {
-		_ = r.removeOwned(manifestTemp.path, manifestTemp.info, "commit.rollback-manifest-temp")
+		_ = r.removeOwned(boundaries.directory, manifestTemp.path, manifestTemp.info, "commit.rollback-manifest-temp")
 		return err
 	}
 	defer func() {
 		if retErr != nil {
-			retErr = errors.Join(retErr, r.removeOwned(checksumsTemp.path, checksumsTemp.info, "commit.rollback-checksums-temp"))
-			retErr = errors.Join(retErr, r.removeOwned(manifestTemp.path, manifestTemp.info, "commit.rollback-manifest-temp"))
+			retErr = errors.Join(retErr, r.removeOwned(boundaries.directory, checksumsTemp.path, checksumsTemp.info, "commit.rollback-checksums-temp"))
+			retErr = errors.Join(retErr, r.removeOwned(boundaries.directory, manifestTemp.path, manifestTemp.info, "commit.rollback-manifest-temp"))
 		}
 	}()
 
@@ -253,8 +257,9 @@ func (r *Repository) Commit(paths BackupPaths, manifest []byte, expectedSHA256 s
 		if retErr == nil {
 			return
 		}
+		boundaries.closeArtifacts()
 		for index := len(promoted) - 1; index >= 0; index-- {
-			retErr = errors.Join(retErr, r.removeOwned(promoted[index].path, promoted[index].info, "commit.rollback-final"))
+			retErr = errors.Join(retErr, r.removeOwned(boundaries.directory, promoted[index].path, promoted[index].info, "commit.rollback-final"))
 		}
 	}()
 	archive, err := r.promote(boundaries, partial, paths.Archive, "archive")
@@ -265,7 +270,19 @@ func (r *Repository) Commit(paths BackupPaths, manifest []byte, expectedSHA256 s
 		return err
 	}
 	partialBound = false
-	archiveSHA, archiveSize, err := fileSHA256(paths.Archive)
+	archiveHandle, err := openStableRegularAt(boundaries.directory, archiveName, os.O_RDWR)
+	if err != nil {
+		return err
+	}
+	if !os.SameFile(archive.info, archiveHandle.info) {
+		archiveHandle.file.Close()
+		return errors.New("promoted archive does not match verified partial identity")
+	}
+	boundaries.artifacts = append(boundaries.artifacts, archiveHandle)
+	if err := platformSealRegular(archiveHandle.file); err != nil {
+		return err
+	}
+	archiveSHA, archiveSize, err := hashStableFile(archiveHandle)
 	if err != nil || archiveSHA != normalizedSHA || archiveSize != expectedSize {
 		if err != nil {
 			return err
@@ -300,12 +317,25 @@ func (r *Repository) Commit(paths BackupPaths, manifest []byte, expectedSHA256 s
 			return err
 		}
 	}
-	archiveSHA, archiveSize, err = fileSHA256(paths.Archive)
+	archiveSHA, archiveSize, err = hashStableFile(archiveHandle)
 	if err != nil || archiveSHA != normalizedSHA || archiveSize != expectedSize {
 		if err != nil {
 			return err
 		}
 		return errors.New("published backup archive failed final verification")
+	}
+	if err := r.checkpoint("commit.after-final-hash", paths.Archive); err != nil {
+		return err
+	}
+	if err := boundaries.recheck(); err != nil {
+		return err
+	}
+	archiveSHA, archiveSize, err = hashStableFile(archiveHandle)
+	if err != nil || archiveSHA != normalizedSHA || archiveSize != expectedSize {
+		if err != nil {
+			return err
+		}
+		return errors.New("sealed backup archive changed after final hash")
 	}
 	if err := syncDirectory(paths.Directory); err != nil {
 		return err
@@ -341,7 +371,7 @@ func (r *Repository) verifyAnchored(backup store.AppBackup) (Verification, *stab
 	fail := func(err error) (Verification, *stableBoundaries, error) {
 		return Verification{}, boundaries, err
 	}
-	archive, err := openStableRegular(paths.Archive, os.O_RDONLY)
+	archive, err := openStableRegularAt(boundaries.directory, archiveName, os.O_RDONLY)
 	if err != nil {
 		return fail(err)
 	}
@@ -363,7 +393,7 @@ func (r *Repository) verifyAnchored(backup store.AppBackup) (Verification, *stab
 	if actualSize != backup.Size || actualSHA != recordSHA {
 		return fail(errors.New("backup archive does not match record size and SHA256"))
 	}
-	manifestObject, err := openStableRegular(paths.Manifest, os.O_RDONLY)
+	manifestObject, err := openStableRegularAt(boundaries.directory, manifestName, os.O_RDONLY)
 	if err != nil {
 		return fail(err)
 	}
@@ -375,7 +405,7 @@ func (r *Repository) verifyAnchored(backup store.AppBackup) (Verification, *stab
 	if err := requireManifestID(manifest, backup.ID); err != nil {
 		return fail(err)
 	}
-	checksumsObject, err := openStableRegular(paths.Checksums, os.O_RDONLY)
+	checksumsObject, err := openStableRegularAt(boundaries.directory, checksumsName, os.O_RDONLY)
 	if err != nil {
 		return fail(err)
 	}
@@ -417,8 +447,14 @@ func (r *Repository) Delete(backup store.AppBackup) (retErr error) {
 	if err := recheckStableObject(boundaries.root); err != nil {
 		return err
 	}
-	if err := recheckPathAsIdentity(paths.Directory, boundaries.directory.info); err != nil {
+	managedNow, err := platformOpenDirectoryAt(boundaries.root.file, boundaries.root.path, backup.ID)
+	if err != nil {
 		return err
+	}
+	managedInfo, err := managedNow.Stat()
+	managedNow.Close()
+	if err != nil || !os.SameFile(boundaries.directory.info, managedInfo) {
+		return errors.New("managed backup directory changed after verification")
 	}
 	quarantine, err := uniqueSiblingPath(r.root, ".delete-"+backup.ID+"-")
 	if err != nil {
@@ -430,46 +466,77 @@ func (r *Repository) Delete(backup store.AppBackup) (retErr error) {
 	if err := recheckStableObject(boundaries.root); err != nil {
 		return err
 	}
-	if err := recheckPathAsIdentity(paths.Directory, boundaries.directory.info); err != nil {
+	managedNow, err = platformOpenDirectoryAt(boundaries.root.file, boundaries.root.path, backup.ID)
+	if err != nil {
 		return err
 	}
-	if err := atomicRenameNoReplace(paths.Directory, quarantine); err != nil {
+	managedInfo, err = managedNow.Stat()
+	managedNow.Close()
+	if err != nil || !os.SameFile(boundaries.directory.info, managedInfo) {
+		return errors.New("managed backup directory changed before quarantine")
+	}
+	quarantineName := filepath.Base(quarantine)
+	if err := platformRenameNoReplaceAt(boundaries.root.file, boundaries.root.path, backup.ID, quarantineName); err != nil {
 		return fmt.Errorf("quarantine managed backup directory: %w", err)
 	}
 	quarantined := true
 	defer func() {
 		if retErr != nil && quarantined {
-			retErr = errors.Join(retErr, restoreQuarantined(quarantine, paths.Directory, boundaries.directory.info))
+			retErr = errors.Join(retErr, restoreQuarantined(boundaries.root, quarantineName, backup.ID, boundaries.directory.info))
 		}
 	}()
 	if err := r.checkpoint("delete.after-quarantine", quarantine); err != nil {
 		return err
 	}
-	if err := recheckPathAsIdentity(quarantine, boundaries.directory.info); err != nil {
+	quarantineHandle, err := platformOpenDirectoryAt(boundaries.root.file, boundaries.root.path, quarantineName)
+	if err != nil {
 		return err
+	}
+	quarantineInfo, err := quarantineHandle.Stat()
+	quarantineHandle.Close()
+	if err != nil || !os.SameFile(boundaries.directory.info, quarantineInfo) {
+		return errors.New("quarantined backup directory changed identity")
 	}
 	if err := recheckStableObject(boundaries.root); err != nil {
 		return err
 	}
-	boundaries.close()
-	boundaries = nil
+	if err := r.checkpoint("delete.before-recursive-remove", quarantine); err != nil {
+		return err
+	}
+	quarantineHandle, err = platformOpenDirectoryAt(boundaries.root.file, boundaries.root.path, quarantineName)
+	if err != nil {
+		return err
+	}
+	quarantineInfo, err = quarantineHandle.Stat()
+	quarantineHandle.Close()
+	if err != nil || !os.SameFile(boundaries.directory.info, quarantineInfo) {
+		return errors.New("quarantine changed after final identity check")
+	}
+	if err := recheckStableObject(boundaries.root); err != nil {
+		return err
+	}
 	quarantined = false
-	if err := os.RemoveAll(quarantine); err != nil {
+	if err := platformRemoveTreeAt(boundaries.root.file, boundaries.root.path, quarantineName, boundaries.directory.info); err != nil {
 		return fmt.Errorf("delete quarantined managed backup directory: %w", err)
 	}
 	return syncDirectory(r.root)
 }
 
-func restoreQuarantined(quarantine, original string, expected os.FileInfo) error {
-	current, err := os.Lstat(quarantine)
+func restoreQuarantined(root stableObject, quarantineName, originalName string, expected os.FileInfo) error {
+	current, err := platformOpenDirectoryAt(root.file, root.path, quarantineName)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
 	if err != nil {
 		return err
 	}
-	owned := os.SameFile(expected, current) && current.Mode()&os.ModeSymlink == 0 && current.IsDir()
-	if err := atomicRenameNoReplace(quarantine, original); err != nil {
+	currentInfo, statErr := current.Stat()
+	current.Close()
+	if statErr != nil {
+		return statErr
+	}
+	owned := os.SameFile(expected, currentInfo)
+	if err := platformRenameNoReplaceAt(root.file, root.path, quarantineName, originalName); err != nil {
 		if owned {
 			return fmt.Errorf("restore verified backup directory from quarantine: %w", err)
 		}
@@ -650,12 +717,24 @@ func normalizeSHA256(value string) (string, error) {
 }
 
 func (r *Repository) openBoundaries(directory string) (*stableBoundaries, error) {
-	root, err := openStableDirectory(r.root)
+	rootFile, err := platformOpenRoot(r.root)
 	if err != nil {
 		return nil, err
 	}
-	managed, err := openStableDirectory(directory)
+	root, err := stableDirectoryFromFile(r.root, rootFile)
 	if err != nil {
+		rootFile.Close()
+		return nil, err
+	}
+	backupID := filepath.Base(directory)
+	managedFile, err := platformOpenDirectoryAt(root.file, r.root, backupID)
+	if err != nil {
+		root.file.Close()
+		return nil, err
+	}
+	managed, err := stableDirectoryFromFile(directory, managedFile)
+	if err != nil {
+		managedFile.Close()
 		root.file.Close()
 		return nil, err
 	}
@@ -667,55 +746,35 @@ func (r *Repository) openBoundaries(directory string) (*stableBoundaries, error)
 	return boundaries, nil
 }
 
-func openStableDirectory(path string) (stableObject, error) {
-	before, err := os.Lstat(path)
-	if err != nil {
-		return stableObject{}, err
-	}
-	if before.Mode()&os.ModeSymlink != 0 || !before.IsDir() {
-		return stableObject{}, fmt.Errorf("managed backup path %q is not a real directory", path)
-	}
-	file, err := os.Open(path)
-	if err != nil {
-		return stableObject{}, err
-	}
+func stableDirectoryFromFile(path string, file *os.File) (stableObject, error) {
 	opened, err := file.Stat()
 	if err != nil {
-		file.Close()
 		return stableObject{}, err
 	}
-	if !opened.IsDir() || !os.SameFile(before, opened) {
-		file.Close()
-		return stableObject{}, fmt.Errorf("managed backup directory %q changed while opening", path)
+	if !opened.IsDir() {
+		return stableObject{}, fmt.Errorf("managed backup path %q is not a directory", path)
 	}
 	object := stableObject{path: path, info: opened, file: file}
 	if err := recheckPathIdentity(object); err != nil {
-		file.Close()
 		return stableObject{}, err
 	}
 	return object, nil
 }
 
-func openStableRegular(path string, flag int) (stableObject, error) {
-	before, err := os.Lstat(path)
+func openStableRegularAt(parent stableObject, name string, flag int) (stableObject, error) {
+	file, err := platformOpenRegularAt(parent.file, parent.path, name, flag)
 	if err != nil {
 		return stableObject{}, err
 	}
-	if before.Mode()&os.ModeSymlink != 0 || !before.Mode().IsRegular() {
-		return stableObject{}, fmt.Errorf("managed backup path %q is not a regular file", path)
-	}
-	file, err := os.OpenFile(path, flag, 0)
-	if err != nil {
-		return stableObject{}, err
-	}
+	path := filepath.Join(parent.path, name)
 	opened, err := file.Stat()
 	if err != nil {
 		file.Close()
 		return stableObject{}, err
 	}
-	if !opened.Mode().IsRegular() || !os.SameFile(before, opened) {
+	if !opened.Mode().IsRegular() {
 		file.Close()
-		return stableObject{}, fmt.Errorf("managed backup file %q changed while opening", path)
+		return stableObject{}, fmt.Errorf("managed backup path %q is not a regular file", path)
 	}
 	object := stableObject{path: path, info: opened, file: file}
 	if err := recheckPathIdentity(object); err != nil {
@@ -781,12 +840,27 @@ func requireAbsent(path string) error {
 	return nil
 }
 
-func writeSyncedTemp(directory, pattern string, content []byte) (object stableObject, retErr error) {
-	file, err := os.CreateTemp(directory, pattern)
-	if err != nil {
-		return stableObject{}, err
+func writeSyncedTempAt(directory stableObject, pattern string, content []byte) (object stableObject, retErr error) {
+	var file *os.File
+	var name string
+	var err error
+	for attempt := 0; attempt < 16; attempt++ {
+		name, err = randomManagedName(pattern)
+		if err != nil {
+			return stableObject{}, err
+		}
+		file, err = platformCreateRegularAt(directory.file, directory.path, name, 0o600)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, os.ErrExist) {
+			return stableObject{}, err
+		}
 	}
-	path := file.Name()
+	if file == nil {
+		return stableObject{}, errors.New("could not create unique managed metadata temp")
+	}
+	path := filepath.Join(directory.path, name)
 	created, err := file.Stat()
 	if err != nil {
 		file.Close()
@@ -795,7 +869,7 @@ func writeSyncedTemp(directory, pattern string, content []byte) (object stableOb
 	defer func() {
 		if retErr != nil {
 			file.Close()
-			retErr = errors.Join(retErr, removeOwnedPath(path, created))
+			retErr = errors.Join(retErr, removeOwnedAt(nil, directory, path, created))
 		}
 	}()
 	if err := file.Chmod(0o600); err != nil && runtime.GOOS != "windows" {
@@ -848,21 +922,27 @@ func (r *Repository) promote(boundaries *stableBoundaries, source stableObject, 
 	if err := boundaries.recheck(); err != nil {
 		return stableObject{}, err
 	}
-	if err := recheckPathAsIdentity(source.path, source.info); err != nil {
-		return stableObject{}, err
-	}
-	if err := atomicRenameNoReplace(source.path, destination); err != nil {
-		return stableObject{}, fmt.Errorf("promote backup %s without replacement: %w", kind, err)
-	}
-	current, err := os.Lstat(destination)
+	sourceNow, err := openStableRegularAt(boundaries.directory, filepath.Base(source.path), os.O_RDONLY)
 	if err != nil {
 		return stableObject{}, err
 	}
-	if !current.Mode().IsRegular() || !os.SameFile(source.info, current) {
-		restoreErr := atomicRenameNoReplace(destination, source.path)
+	sourceNow.file.Close()
+	if !os.SameFile(source.info, sourceNow.info) {
+		return stableObject{}, fmt.Errorf("backup %s source changed identity", kind)
+	}
+	if err := platformRenameNoReplaceAt(boundaries.directory.file, boundaries.directory.path, filepath.Base(source.path), filepath.Base(destination)); err != nil {
+		return stableObject{}, fmt.Errorf("promote backup %s without replacement: %w", kind, err)
+	}
+	destinationNow, err := openStableRegularAt(boundaries.directory, filepath.Base(destination), os.O_RDONLY)
+	if err != nil {
+		return stableObject{}, err
+	}
+	destinationNow.file.Close()
+	if !os.SameFile(source.info, destinationNow.info) {
+		restoreErr := platformRenameNoReplaceAt(boundaries.directory.file, boundaries.directory.path, filepath.Base(destination), filepath.Base(source.path))
 		return stableObject{}, errors.Join(fmt.Errorf("promoted backup %s changed source identity", kind), restoreErr)
 	}
-	promoted := stableObject{path: destination, info: current}
+	promoted := stableObject{path: destination, info: destinationNow.info}
 	if err := r.checkpoint("commit.after-"+kind+"-promote", destination); err != nil {
 		return promoted, err
 	}
@@ -875,52 +955,68 @@ func (r *Repository) promote(boundaries *stableBoundaries, source stableObject, 
 	return promoted, nil
 }
 
-func (r *Repository) removeOwned(path string, expected os.FileInfo, point string) error {
+func (r *Repository) removeOwned(parent stableObject, path string, expected os.FileInfo, point string) error {
 	if err := r.checkpoint(point, path); err != nil {
 		return err
 	}
-	return removeOwnedPath(path, expected)
+	return removeOwnedAt(r, parent, path, expected)
 }
 
-func removeOwnedPath(path string, expected os.FileInfo) error {
-	current, err := os.Lstat(path)
+func removeOwnedAt(repository *Repository, parent stableObject, path string, expected os.FileInfo) error {
+	name := filepath.Base(path)
+	current, err := openStableRegularAt(parent, name, os.O_RDONLY)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
 	if err != nil {
 		return err
 	}
-	quarantine, err := uniqueSiblingPath(filepath.Dir(path), ".cleanup-")
+	current.file.Close()
+	if !os.SameFile(expected, current.info) {
+		return fmt.Errorf("refusing to clean replacement at %q", path)
+	}
+	quarantine, err := uniqueSiblingPath(parent.path, ".cleanup-")
 	if err != nil {
 		return err
 	}
-	if err := atomicRenameNoReplace(path, quarantine); err != nil {
+	quarantineName := filepath.Base(quarantine)
+	if err := platformRenameNoReplaceAt(parent.file, parent.path, name, quarantineName); err != nil {
 		return err
 	}
-	quarantined, err := os.Lstat(quarantine)
+	quarantined, err := openStableRegularAt(parent, quarantineName, os.O_RDONLY)
 	if err != nil {
 		return err
 	}
-	if !os.SameFile(expected, quarantined) {
-		restoreErr := atomicRenameNoReplace(quarantine, path)
+	quarantined.file.Close()
+	if !os.SameFile(expected, quarantined.info) {
+		restoreErr := platformRenameNoReplaceAt(parent.file, parent.path, quarantineName, name)
 		return errors.Join(fmt.Errorf("refusing to remove replacement at %q", path), restoreErr)
 	}
-	if current.Mode()&os.ModeSymlink != 0 {
-		return fmt.Errorf("managed cleanup target %q became a symlink", path)
+	if repository != nil {
+		if err := repository.checkpoint("cleanup.after-identity", quarantine); err != nil {
+			restoreErr := platformRenameNoReplaceAt(parent.file, parent.path, quarantineName, name)
+			return errors.Join(err, restoreErr)
+		}
 	}
-	if quarantined.IsDir() {
-		return os.RemoveAll(quarantine)
+	afterHook, err := openStableRegularAt(parent, quarantineName, os.O_RDONLY)
+	if err != nil {
+		return err
 	}
-	return os.Remove(quarantine)
+	afterHook.file.Close()
+	if !os.SameFile(expected, afterHook.info) {
+		restoreErr := platformRenameNoReplaceAt(parent.file, parent.path, quarantineName, name)
+		return errors.Join(fmt.Errorf("cleanup quarantine %q changed identity", quarantine), restoreErr)
+	}
+	return platformUnlinkOwnedAt(parent.file, parent.path, quarantineName, afterHook.info)
 }
 
 func uniqueSiblingPath(directory, prefix string) (string, error) {
 	for attempt := 0; attempt < 16; attempt++ {
-		bytes := make([]byte, 16)
-		if _, err := rand.Read(bytes); err != nil {
+		name, err := randomManagedName(prefix)
+		if err != nil {
 			return "", err
 		}
-		path := filepath.Join(directory, prefix+hex.EncodeToString(bytes))
+		path := filepath.Join(directory, name)
 		if _, err := os.Lstat(path); errors.Is(err, os.ErrNotExist) {
 			return path, nil
 		} else if err != nil {
@@ -928,6 +1024,21 @@ func uniqueSiblingPath(directory, prefix string) (string, error) {
 		}
 	}
 	return "", errors.New("could not allocate unique managed quarantine path")
+}
+
+func randomManagedName(prefix string) (string, error) {
+	bytes := make([]byte, 16)
+	if _, err := rand.Read(bytes); err != nil {
+		return "", err
+	}
+	return prefix + hex.EncodeToString(bytes), nil
+}
+
+func validateSingleName(name string) error {
+	if name == "" || name == "." || name == ".." || filepath.Base(name) != name || strings.ContainsAny(name, `/\`) {
+		return fmt.Errorf("invalid managed path component %q", name)
+	}
+	return nil
 }
 
 func syncDirectory(path string) error {
