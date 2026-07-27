@@ -1,6 +1,11 @@
 import { describe, expect, it } from 'vitest'
 
-import { runtimeIngressColumns, runtimeResourceTabOrder } from './surface'
+import {
+  runtimeIngressColumns,
+  runtimeLogWorkspaceTabLabels,
+  runtimeLogWorkspaceTabOrder,
+  runtimeResourceTabOrder
+} from './surface'
 
 describe('AIFAR Runtime surface policy', () => {
   it('places release history after every operational resource tab', () => {
@@ -9,5 +14,13 @@ describe('AIFAR Runtime surface policy', () => {
 
   it('keeps only operational routing columns in ingress discovery', () => {
     expect(runtimeIngressColumns).toEqual(['service', 'app', 'discoveryTarget', 'endpoint'])
+  })
+
+  it('keeps realtime logs and diagnostic archives as focused sub-tabs', () => {
+    expect(runtimeLogWorkspaceTabOrder).toEqual(['live', 'archives'])
+    expect(runtimeLogWorkspaceTabLabels).toEqual({
+      live: 'containers.realtimeLogs',
+      archives: 'containers.diagnosticArchives'
+    })
   })
 })

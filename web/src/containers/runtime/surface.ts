@@ -1,5 +1,14 @@
 import type { RuntimeResourceTab } from './context'
 
+export type RuntimeLogWorkspaceTab = 'live' | 'archives'
+
+export const runtimeLogWorkspaceTabOrder = ['live', 'archives'] as const satisfies readonly RuntimeLogWorkspaceTab[]
+
+export const runtimeLogWorkspaceTabLabels: Record<RuntimeLogWorkspaceTab, string> = {
+  live: 'containers.realtimeLogs',
+  archives: 'containers.diagnosticArchives'
+}
+
 export const runtimeResourceTabOrder = [
   'deployments',
   'services',
