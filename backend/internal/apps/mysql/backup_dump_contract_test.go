@@ -32,6 +32,7 @@ func TestDumpVerificationHelperRequiresCompleteMySQLShell8036Catalog(t *testing.
 		{name: "duplicate top level schema", fixture: mutateDumpFixture(validMySQLShell8036DumpFixture(), "@.json", `{"version":"2.0.1","origin":"dumpInstance","consistent":true,"schemas":["aifar_business","aifar_business"],"basenames":{"aifar_business":"aifar_business"}}`)},
 		{name: "ambiguous top level basenames", fixture: mutateDumpFixture(validMySQLShell8036DumpFixture(), "@.json", `{"version":"2.0.1","origin":"dumpInstance","consistent":true,"schemas":["aifar_business","billing"],"basenames":{"aifar_business":"shared","billing":"shared"}}`)},
 		{name: "system schema is not a business schema", fixture: mutateDumpFixture(validMySQLShell8036DumpFixture(), "@.json", `{"version":"2.0.1","origin":"dumpInstance","consistent":true,"schemas":["mysql"],"basenames":{"mysql":"mysql"}}`)},
+		{name: "schema basename collides with reserved control metadata", fixture: schemaBasenameCollisionFixture()},
 		{name: "missing table metadata", fixture: deleteDumpFixture(validMySQLShell8036DumpFixture(), "aifar_business@orders.json")},
 		{name: "extra table metadata", fixture: addExtraTableMetadata(validMySQLShell8036DumpFixture())},
 		{name: "extra malformed root control metadata", fixture: mutateDumpFixture(validMySQLShell8036DumpFixture(), "@junk.json", `null trailing`)},
@@ -40,6 +41,7 @@ func TestDumpVerificationHelperRequiresCompleteMySQLShell8036Catalog(t *testing.
 		{name: "schema metadata back reference mismatch", fixture: mutateDumpFixture(validMySQLShell8036DumpFixture(), "aifar_business.json", `{"schema":"other","includesDdl":true,"includesViewsDdl":true,"includesData":true,"tables":["orders"],"views":["orders_view"],"basenames":{"orders":"aifar_business@orders","orders_view":"aifar_business@orders_view"}}`)},
 		{name: "schema metadata incomplete", fixture: mutateDumpFixture(validMySQLShell8036DumpFixture(), "aifar_business.json", `{"schema":"aifar_business","includesDdl":true,"includesViewsDdl":false,"includesData":true,"tables":["orders"],"views":["orders_view"],"basenames":{"orders":"aifar_business@orders","orders_view":"aifar_business@orders_view"}}`)},
 		{name: "ambiguous table basenames", fixture: ambiguousTableBasenamesFixture()},
+		{name: "table basename collides with reserved control metadata", fixture: tableBasenameCollisionFixture()},
 		{name: "table metadata back reference mismatch", fixture: mutateDumpFixture(validMySQLShell8036DumpFixture(), "aifar_business@orders.json", `{"options":{"schema":"aifar_business","table":"other","columns":["id"]},"includesData":true,"includesDdl":true,"extension":"tsv.zst","compression":"zstd","primaryIndex":["id"]}`)},
 		{name: "table metadata columns are not strings", fixture: mutateDumpFixture(validMySQLShell8036DumpFixture(), "aifar_business@orders.json", `{"options":{"schema":"aifar_business","table":"orders","columns":[1]},"includesData":true,"includesDdl":true,"extension":"tsv.zst","compression":"zstd","primaryIndex":["id"]}`)},
 		{name: "table metadata primary index is not an array", fixture: mutateDumpFixture(validMySQLShell8036DumpFixture(), "aifar_business@orders.json", `{"options":{"schema":"aifar_business","table":"orders","columns":["id"]},"includesData":true,"includesDdl":true,"extension":"tsv.zst","compression":"zstd","primaryIndex":"id"}`)},
@@ -118,6 +120,21 @@ func ambiguousTableBasenamesFixture() map[string]string {
 	fixture := validMySQLShell8036DumpFixture()
 	fixture["aifar_business.json"] = `{"schema":"aifar_business","includesDdl":true,"includesViewsDdl":true,"includesData":true,"tables":["orders","customers"],"views":[],"basenames":{"orders":"aifar_business@shared","customers":"aifar_business@shared"}}`
 	fixture["aifar_business@shared.json"] = `{"options":{"schema":"aifar_business","table":"orders","columns":["id"]},"includesData":true,"includesDdl":true,"extension":"tsv.zst","compression":"zstd","primaryIndex":["id"]}`
+	delete(fixture, "aifar_business@orders.json")
+	return fixture
+}
+
+func schemaBasenameCollisionFixture() map[string]string {
+	return map[string]string{
+		"@.json":      `{"version":"2.0.1","origin":"dumpInstance","consistent":true,"schemas":["aifar_business"],"basenames":{"aifar_business":"@"},"schema":"aifar_business","includesDdl":true,"includesViewsDdl":true,"includesData":true,"tables":[],"views":["aifar_business"]}`,
+		"@.done.json": `{"end":"2026-07-28 10:00:00","dataBytes":0,"tableDataBytes":{},"chunkFileBytes":{}}`,
+	}
+}
+
+func tableBasenameCollisionFixture() map[string]string {
+	fixture := validMySQLShell8036DumpFixture()
+	fixture["@.done.json"] = `{"end":"2026-07-28 10:00:00","dataBytes":0,"tableDataBytes":{"aifar_business":{"orders":0}},"chunkFileBytes":{"aifar_business@orders.tsv.zst":0},"options":{"schema":"aifar_business","table":"orders","columns":["id"]},"includesData":true,"includesDdl":true,"extension":"tsv.zst","compression":"zstd","primaryIndex":["id"]}`
+	fixture["aifar_business.json"] = `{"schema":"aifar_business","includesDdl":true,"includesViewsDdl":true,"includesData":true,"tables":["orders"],"views":["orders_view"],"basenames":{"orders":"@.done","orders_view":"aifar_business@orders_view"}}`
 	delete(fixture, "aifar_business@orders.json")
 	return fixture
 }

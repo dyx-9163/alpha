@@ -770,10 +770,11 @@ if not schema_names or any(name.casefold() in system_schemas for name in schema_
 schema_basenames = basename_map(top.get("basenames"), schema_names)
 catalog = set()
 metadata_paths = set()
+control_paths = {"@.json", "@.done.json"}
 schemas = []
 def claim_metadata(relative):
   safe_relative(relative)
-  if relative in metadata_paths or relative not in inventory_paths: reject()
+  if relative in control_paths or relative in metadata_paths or relative not in inventory_paths: reject()
   metadata_paths.add(relative)
 for schema_name in sorted(schema_names, key=lambda value: value.encode("utf-8")):
   schema_relative = schema_basenames[schema_name] + ".json"
@@ -801,7 +802,7 @@ for schema_name in sorted(schema_names, key=lambda value: value.encode("utf-8"))
     table_output.append({"name": table_name})
   schemas.append({"name": schema_name, "tableCount": len(table_output), "tables": table_output})
 actual_metadata = {path for path in inventory_paths if path.endswith(".json")}
-if actual_metadata != metadata_paths | {"@.json", "@.done.json"}: reject()
+if actual_metadata != metadata_paths | control_paths: reject()
 declared_tables = set()
 for schema_name, table_values in table_bytes.items():
   if schema_name not in schema_names: reject()
