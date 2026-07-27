@@ -121,6 +121,10 @@ func appInstanceOperationLockSpecs(action string, instances []store.AppInstance)
 	return specs
 }
 
+func mysqlBackupOperationLockSpecs(instance store.AppInstance) []operationLockSpec {
+	return appInstanceOperationLockSpecs("mysql-backup", []store.AppInstance{instance})
+}
+
 func operationLockMetadata(fields map[string]any) string {
 	data, err := json.Marshal(fields)
 	if err != nil {

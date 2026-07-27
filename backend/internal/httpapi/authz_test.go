@@ -37,6 +37,21 @@ func TestViewerCannotMutateSettings(t *testing.T) {
 	assertAuditExists(t, db, "auth.permission.denied", "failed", "viewer", "settings.manage")
 }
 
+func TestViewerCannotStartMySQLBackup(t *testing.T) {
+	api, db, secret := newAuthzTestAPI(t)
+	_, instance := saveMySQLBackupTarget(t, db, "standalone", "")
+	token := issueTestToken(t, db, secret, "viewer", "viewer")
+	req := httptest.NewRequest(http.MethodPost, "/api/v2/apps/instances/"+instance.ID+"/backup", strings.NewReader(`{}`))
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	api.Router().ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	assertAuditExists(t, db, "auth.permission.denied", "failed", "viewer", "apps.manage")
+}
+
 func TestOwnerCanMutateSettings(t *testing.T) {
 	api, db, secret := newAuthzTestAPI(t)
 	token := issueTestToken(t, db, secret, "owner", "owner")
