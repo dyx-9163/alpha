@@ -191,8 +191,8 @@ func (s Service) EstimateRuntimeDiagnostics(ctx context.Context, req RuntimeDiag
 	estimate.LocalReservedBytes = stats.ReservedBytes
 	estimate.LocalQuotaBytes = stats.QuotaBytes
 	estimate.ExpiresAt = time.Now().UTC().Add(runtimeDiagnosticRetention)
-	projectedQuota := stats.ReadyBytes - stats.ExpiredReadyBytes + stats.ReservedBytes + runtimeDiagnosticMaxArchive
-	projectedHeadroom := stats.RootAvailableBytes + stats.ExpiredReadyBytes - runtimeDiagnosticMaxArchive
+	projectedQuota := stats.ReadyBytes + stats.ReservedBytes + runtimeDiagnosticMaxArchive
+	projectedHeadroom := stats.RootAvailableBytes - runtimeDiagnosticMaxArchive
 	if estimate.BlockReason == "" && projectedQuota > stats.QuotaBytes {
 		estimate.BlockReason = "local-quota-exceeded"
 	}

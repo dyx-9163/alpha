@@ -371,6 +371,32 @@ func TestEstimateRuntimeDiagnosticsCombinesRemoteMetadataAndLocalCapacity(t *tes
 	}
 }
 
+func TestEstimateRuntimeDiagnosticsDoesNotReclaimExpiredArchiveBeforeCleanup(t *testing.T) {
+	now := time.Now().UTC()
+	db, instance, server, _ := runtimeDiagnosticFixture(now)
+	db.exports["diag-expired-local"] = store.DiagnosticExport{
+		ID: "diag-expired-local", InstanceID: instance.ID, ServerID: server.ID,
+		Status: "ready", StorageKind: "local", ArchiveBytes: 900 << 20,
+		ExpiresAt: now.Add(-time.Minute),
+	}
+	remote := &runtimeDiagnosticRemote{stdout: strings.Join([]string{
+		"AIFAR_DIAG_SERVICE_V2\tgateway\t1\t1024",
+		"AIFAR_DIAG_TOTAL_V2\t1\t1024\tAsia/Shanghai\t-",
+	}, "\n")}
+	archives := NewRuntimeDiagnosticArchiveStorage(t.TempDir(), 1<<30, runtimeDiagnosticRetention, db)
+
+	estimate, err := NewServiceWithDiagnosticStorage(db, remote, archives).EstimateRuntimeDiagnostics(context.Background(), RuntimeDiagnosticRequest{
+		Instance: instance, Server: server, Language: "en", Services: []string{"gateway"},
+		SinceAt: now.Add(-time.Hour), UntilAt: now.Add(-time.Minute),
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if estimate.Allowed || estimate.BlockReason != "local-quota-exceeded" {
+		t.Fatalf("expired archive was reclaimed before successful cleanup: %+v", estimate)
+	}
+}
+
 func TestLegacyRemoteDiagnosticExportStillStreamsAndDeletesRemotely(t *testing.T) {
 	now := time.Now().UTC()
 	db, instance, server, export := runtimeDiagnosticFixture(now)
