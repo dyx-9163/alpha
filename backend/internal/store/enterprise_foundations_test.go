@@ -311,13 +311,37 @@ func TestAppBackupStatusIsMonotonicAndDeletePreservesAuditMetadata(t *testing.T)
 	if finished.Status != "success" || finished.Path != "/backups/archive.tar" {
 		t.Fatalf("stale update must not regress a successful backup: %+v", finished)
 	}
+	directDelete := finished
+	directDelete.Status = "deleted"
+	directDelete.TaskID = "task-delete"
+	directDelete.Path = "/backups/replaced.tar"
+	directDelete.Checksum = "replaced"
+	directDelete.Size = 999
+	directDelete.Metadata = `{"deletedBy":"generic-save"}`
+	directDelete, err = db.SaveAppBackup(directDelete)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if directDelete.Status != "success" || directDelete.TaskID != "task-create" || directDelete.Path != "/backups/archive.tar" || directDelete.Checksum != "checksum" || directDelete.Size != 0 || directDelete.Metadata != `{"source":"primary"}` {
+		t.Fatalf("generic save must not perform deletion or replace provenance: %+v", directDelete)
+	}
 	completedAt := createdAt.Add(time.Hour)
 	deleted, err := db.MarkAppBackupDeleted(backup.ID, completedAt)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if deleted.Status != "deleted" || deleted.TaskID != "task-create" || deleted.Path != "/backups/archive.tar" || deleted.Checksum != "checksum" || !deleted.CompletedAt.Equal(completedAt) {
+	if deleted.Status != "deleted" || deleted.TaskID != "task-create" || deleted.Path != "/backups/archive.tar" || deleted.Checksum != "checksum" || deleted.Size != 0 || deleted.Metadata != `{"source":"primary"}` || !deleted.CompletedAt.Equal(completedAt) {
 		t.Fatalf("deleted backup lost audit metadata: %+v", deleted)
+	}
+	afterDelete := deleted
+	afterDelete.TaskID = "task-rewrite"
+	afterDelete.Path = "/backups/rewrite.tar"
+	afterDelete, err = db.SaveAppBackup(afterDelete)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterDelete.TaskID != "task-create" || afterDelete.Path != "/backups/archive.tar" || !afterDelete.CompletedAt.Equal(completedAt) {
+		t.Fatalf("generic save must not rewrite a deleted backup: %+v", afterDelete)
 	}
 }
 

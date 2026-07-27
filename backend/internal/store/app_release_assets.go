@@ -98,10 +98,9 @@ func (s *Store) SaveAppBackup(backup AppBackup) (AppBackup, error) {
 		values(?,?,?,?,?,?,?,?,?,?,?,?,?)
 		on conflict(id) do update set
 		status=excluded.status,path=excluded.path,checksum=excluded.checksum,size=excluded.size,task_id=excluded.task_id,metadata=excluded.metadata,completed_at=excluded.completed_at
-		where lower(app_backups.status)=lower(excluded.status)
+		where (lower(app_backups.status)=lower(excluded.status) and lower(app_backups.status)<>'deleted')
 			or (lower(app_backups.status)='pending' and lower(excluded.status) in ('running','success','failed'))
 			or (lower(app_backups.status)='running' and lower(excluded.status) in ('success','failed'))
-			or (lower(app_backups.status) in ('success','failed') and lower(excluded.status)='deleted')
 			or lower(app_backups.status) not in ('pending','running','success','failed','deleted')`,
 		backup.ID, backup.App, backup.InstanceID, backup.ServerID, backup.BackupType, backup.Status, backup.Path, backup.Checksum, backup.Size, backup.TaskID, backup.Metadata, backup.CreatedAt, nullableTime(backup.CompletedAt))
 	if err != nil {

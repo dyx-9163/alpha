@@ -88,7 +88,7 @@ func (s *Store) GetCredential(id string, includeSecret bool) (Credential, error)
 
 func (s *Store) GetBoundCredential(appInstanceID, purpose string, includeSecret bool) (Credential, error) {
 	rows, err := s.db.Query(`select c.id,c.name,c.kind,coalesce(c.username,''),coalesce(c.endpoint,''),c.scope,c.status,
-		coalesce(c.app,''),coalesce(c.server_id,''),cb.app_instance_id,coalesce(c.purpose,''),coalesce(c.tags,''),
+		coalesce(c.app,''),coalesce(c.server_id,''),cb.app_instance_id,cb.purpose,coalesce(c.tags,''),
 		coalesce(c.secret_cipher,''),c.current_version,coalesce(c.created_by,''),c.created_at,c.updated_at
 		from credential_bindings cb join credentials c on c.id=cb.credential_id
 		where cb.app_instance_id=? and cb.purpose=? and c.status='active'

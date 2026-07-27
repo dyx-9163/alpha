@@ -237,7 +237,7 @@ func TestGetBoundCredentialReturnsOnlyActiveRequestedBinding(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	admin, err := s.SaveCredential(Credential{Name: "mysql-admin", Kind: "mysql", Status: "active", Secret: map[string]string{"password": "admin-secret"}})
+	admin, err := s.SaveCredential(Credential{Name: "mysql-admin", Kind: "mysql", Purpose: "runtime", Status: "active", Secret: map[string]string{"password": "admin-secret"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -256,7 +256,7 @@ func TestGetBoundCredentialReturnsOnlyActiveRequestedBinding(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.ID != admin.ID || got.Secret["password"] != "admin-secret" {
+	if got.ID != admin.ID || got.Purpose != "admin" || got.Secret["password"] != "admin-secret" {
 		t.Fatalf("GetBoundCredential returned %+v, want active admin credential with decrypted password", got)
 	}
 	withoutSecret, err := s.GetBoundCredential(instance.ID, "admin", false)
