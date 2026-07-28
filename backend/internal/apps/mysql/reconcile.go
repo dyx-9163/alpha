@@ -120,7 +120,7 @@ func (s Service) reconcileMySQL(ctx context.Context, expected store.AppInstance,
 	if !present {
 		return nil
 	}
-	server, err := s.store.GetServer(instance.ServerID, false)
+	server, err := s.store.GetServer(instance.ServerID, true)
 	if err != nil {
 		return localizedMySQLOperationError(language, MySQLReconciliationRequired)
 	}

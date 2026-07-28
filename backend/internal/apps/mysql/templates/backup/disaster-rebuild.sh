@@ -36,7 +36,23 @@ validate_paths() {
 
 case "$ACTION" in
   stop-gr)
-    "$INSTALL_ROOT/mysql-shell/bin/mysqlsh" --defaults-file="$WORK_DIR/secret-context.cnf" --sql --host=127.0.0.1 --port="$PORT" --execute "STOP GROUP_REPLICATION"
+    if ! $SUDO systemctl is-active --quiet "$SERVICE_NAME"; then
+      printf '__AIFAR_STOP_GR__\tmysqld-offline\n'
+      exit 0
+    fi
+    if ! "$INSTALL_ROOT/mysql/bin/mysqladmin" --defaults-file="$WORK_DIR/secret-context.cnf" --protocol=tcp --host=127.0.0.1 --port="$PORT" ping >/dev/null 2>&1; then
+      printf '__AIFAR_STOP_GR__\tmysqld-offline\n'
+      exit 0
+    fi
+    member_count="$("$INSTALL_ROOT/mysql-shell/bin/mysqlsh" --defaults-file="$WORK_DIR/secret-context.cnf" --sql --raw --skip-column-names --host=127.0.0.1 --port="$PORT" --execute "SELECT COUNT(*) FROM performance_schema.replication_group_members")"
+    case "$member_count" in
+      0) printf '__AIFAR_STOP_GR__\talready-stopped\n' ;;
+      *[!0-9]*|'') exit 65 ;;
+      *)
+        "$INSTALL_ROOT/mysql-shell/bin/mysqlsh" --defaults-file="$WORK_DIR/secret-context.cnf" --sql --host=127.0.0.1 --port="$PORT" --execute "STOP GROUP_REPLICATION"
+        printf '__AIFAR_STOP_GR__\tstopped\n'
+        ;;
+    esac
     ;;
   quarantine)
     validate_paths
@@ -45,6 +61,19 @@ case "$ACTION" in
     mv -- "$DATA_DIR" "$QUARANTINE_DIR"
     $SUDO mkdir -p "$DATA_DIR"
     $SUDO chown "$MYSQL_USER:$MYSQL_USER" "$DATA_DIR"
+    ;;
+  inspect-quarantine)
+    validate_paths
+    if [ -e "$QUARANTINE_DIR" ]; then
+      test -d "$QUARANTINE_DIR"
+      test ! -L "$QUARANTINE_DIR"
+      test "$(readlink -f "$QUARANTINE_DIR")" = "$QUARANTINE_DIR"
+      test "$(stat -c %d "$QUARANTINE_DIR")" = "$(stat -c %d "$INSTALL_ROOT")"
+      printf '__AIFAR_QUARANTINE__\tpresent\n'
+    else
+      test ! -L "$QUARANTINE_DIR"
+      printf '__AIFAR_QUARANTINE__\tabsent\n'
+    fi
     ;;
   initialize)
     test -d "$QUARANTINE_DIR"
@@ -67,6 +96,19 @@ case "$ACTION" in
     test ! -L "$WORK_DIR/admin-init.sql"
     "$INSTALL_ROOT/mysql/bin/mysql" --protocol=socket --socket="$INSTALL_ROOT/run/mysql.sock" -uroot < "$WORK_DIR/admin-init.sql"
     rm -f -- "$WORK_DIR/admin-init.sql"
+    ;;
+  inspect-initialized)
+    test -d "$QUARANTINE_DIR"
+    test ! -L "$QUARANTINE_DIR"
+    test -d "$DATA_DIR"
+    test ! -L "$DATA_DIR"
+    if [ -z "$(find "$DATA_DIR" -mindepth 1 -maxdepth 1 -print -quit)" ]; then
+      printf '__AIFAR_INITIALIZED__\tabsent\n'
+      exit 0
+    fi
+    $SUDO systemctl is-active --quiet "$SERVICE_NAME"
+    "$INSTALL_ROOT/mysql/bin/mysql" --defaults-file="$WORK_DIR/secret-context.cnf" --protocol=tcp --host=127.0.0.1 --port="$PORT" --batch --skip-column-names --execute "SELECT 1" >/dev/null
+    printf '__AIFAR_INITIALIZED__\tpresent\n'
     ;;
   verify-quarantine)
     validate_paths

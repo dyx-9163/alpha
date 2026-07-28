@@ -117,6 +117,7 @@ type disasterRebuildProgress struct {
 	TaskID            string            `json:"taskId"`
 	SourceBackupID    string            `json:"sourceBackupId"`
 	ClusterID         string            `json:"clusterId"`
+	ManifestSHA256    string            `json:"manifestSha256"`
 	RestoreGeneration int               `json:"restoreGeneration"`
 	QuarantinePaths   map[string]string `json:"quarantinePaths"`
 	SeedStage         string            `json:"seedStage"`
@@ -181,11 +182,14 @@ func (m Module) restoreDisasterRebuild(ctx context.Context, req registry.Restore
 	}()
 
 	if err := runner.step(1, func() error {
+		if state.progress.RouterStage != "" {
+			return nil
+		}
 		for _, router := range state.routers {
-			if state.progress.RouterStages[router.InstanceID] == "stopped" {
+			if state.progress.RouterStages[router.InstanceID] != "" {
 				continue
 			}
-			server, getErr := m.service.store.GetServer(router.ServerID, false)
+			server, getErr := m.service.store.GetServer(router.ServerID, true)
 			if getErr != nil {
 				return localizedMySQLOperationError(req.Language, MySQLRebuildRouterFailed)
 			}
@@ -203,8 +207,11 @@ func (m Module) restoreDisasterRebuild(ctx context.Context, req registry.Restore
 		return err
 	}
 	if err := runner.step(2, func() error {
+		if len(state.progress.QuarantinePaths) > 0 || state.progress.SeedStage != "" || len(state.progress.MemberStages) > 0 {
+			return nil
+		}
 		for _, member := range state.members {
-			if _, runErr := m.service.remote.Run(ctx, member.server, "sh "+installerkit.ShellQuote(scripts[member.instance.ID])+" stop-gr"); runErr != nil {
+			if runErr := m.service.stopDisasterGroupReplication(ctx, member.server, scripts[member.instance.ID]); runErr != nil {
 				return localizedMySQLOperationError(req.Language, MySQLRestoreIncomplete)
 			}
 		}
@@ -224,7 +231,22 @@ func (m Module) restoreDisasterRebuild(ctx context.Context, req registry.Restore
 				}
 				continue
 			}
+			present, inspectErr := m.service.inspectDisasterScriptEffect(ctx, member.server, scripts[member.instance.ID], "inspect-quarantine", "__AIFAR_QUARANTINE__")
+			if inspectErr != nil {
+				return localizedMySQLOperationError(req.Language, MySQLMaintenanceStateInvalid)
+			}
+			if present {
+				quarantined = true
+				state.progress.QuarantinePaths[member.server.ID] = expected
+				if saveDisasterProgress(state.data, &state.backup, state.progress) != nil {
+					return localizedMySQLOperationError(req.Language, MySQLRestoreIncomplete)
+				}
+				continue
+			}
 			if _, runErr := m.service.remote.Run(ctx, member.server, "sh "+installerkit.ShellQuote(scripts[member.instance.ID])+" quarantine"); runErr != nil {
+				return localizedMySQLOperationError(req.Language, MySQLRestoreIncomplete)
+			}
+			if _, runErr := m.service.remote.Run(ctx, member.server, "sh "+installerkit.ShellQuote(scripts[member.instance.ID])+" verify-quarantine"); runErr != nil {
 				return localizedMySQLOperationError(req.Language, MySQLRestoreIncomplete)
 			}
 			quarantined = true
@@ -241,8 +263,17 @@ func (m Module) restoreDisasterRebuild(ctx context.Context, req registry.Restore
 		if state.progress.SeedStage != "" {
 			return nil
 		}
-		if _, runErr := m.service.remote.Run(ctx, state.seed.server, "sh "+installerkit.ShellQuote(scripts[state.seed.instance.ID])+" initialize"); runErr != nil {
+		present, inspectErr := m.service.inspectDisasterScriptEffect(ctx, state.seed.server, scripts[state.seed.instance.ID], "inspect-initialized", "__AIFAR_INITIALIZED__")
+		if inspectErr != nil {
 			return localizedMySQLOperationError(req.Language, MySQLRestoreIncomplete)
+		}
+		if !present {
+			if _, runErr := m.service.remote.Run(ctx, state.seed.server, "sh "+installerkit.ShellQuote(scripts[state.seed.instance.ID])+" initialize"); runErr != nil {
+				return localizedMySQLOperationError(req.Language, MySQLRestoreIncomplete)
+			}
+			if present, inspectErr = m.service.inspectDisasterScriptEffect(ctx, state.seed.server, scripts[state.seed.instance.ID], "inspect-initialized", "__AIFAR_INITIALIZED__"); inspectErr != nil || !present {
+				return localizedMySQLOperationError(req.Language, MySQLRestoreIncomplete)
+			}
 		}
 		state.progress.SeedStage = "initialized"
 		return saveDisasterProgress(state.data, &state.backup, state.progress)
@@ -250,6 +281,7 @@ func (m Module) restoreDisasterRebuild(ctx context.Context, req registry.Restore
 		return err
 	}
 	seedWork := mysqlBackupWorkDir(run.TaskID + "-disaster-seed")
+	seedAccessWork := path.Dir(scripts[state.seed.instance.ID])
 	seedWorkServer := state.seed.server
 	seedCleaned := false
 	cleanupSeed := func(strict bool) error {
@@ -295,7 +327,7 @@ func (m Module) restoreDisasterRebuild(ctx context.Context, req registry.Restore
 		if state.progress.MemberStages[state.seed.instance.ID] == "cluster-created" || state.progress.MemberStages[state.seed.instance.ID] == "ONLINE" {
 			return nil
 		}
-		command, commandErr := disasterCreateClusterCommand(seedWork, state.seed, clusterNameFromInstance(state.seed.instance))
+		command, commandErr := disasterCreateClusterCommand(seedAccessWork, state.seed, clusterNameFromInstance(state.seed.instance))
 		if commandErr != nil {
 			return localizedMySQLOperationError(req.Language, MySQLRestoreIncomplete)
 		}
@@ -313,15 +345,41 @@ func (m Module) restoreDisasterRebuild(ctx context.Context, req registry.Restore
 				continue
 			}
 			if state.progress.MemberStages[member.instance.ID] == "" {
-				if _, runErr := m.service.remote.Run(ctx, member.server, "sh "+installerkit.ShellQuote(scripts[member.instance.ID])+" initialize"); runErr != nil {
+				present, inspectErr := m.service.inspectDisasterScriptEffect(ctx, member.server, scripts[member.instance.ID], "inspect-initialized", "__AIFAR_INITIALIZED__")
+				if inspectErr != nil {
 					return localizedMySQLOperationError(req.Language, MySQLRestoreIncomplete)
+				}
+				if !present {
+					if _, runErr := m.service.remote.Run(ctx, member.server, "sh "+installerkit.ShellQuote(scripts[member.instance.ID])+" initialize"); runErr != nil {
+						return localizedMySQLOperationError(req.Language, MySQLRestoreIncomplete)
+					}
+					if present, inspectErr = m.service.inspectDisasterScriptEffect(ctx, member.server, scripts[member.instance.ID], "inspect-initialized", "__AIFAR_INITIALIZED__"); inspectErr != nil || !present {
+						return localizedMySQLOperationError(req.Language, MySQLRestoreIncomplete)
+					}
 				}
 				state.progress.MemberStages[member.instance.ID] = "initialized"
 				if saveDisasterProgress(state.data, &state.backup, state.progress) != nil {
 					return localizedMySQLOperationError(req.Language, MySQLRestoreIncomplete)
 				}
 			}
-			command, commandErr := disasterCloneMemberCommand(seedWork, state.seed, member)
+			if state.progress.MemberStages[member.instance.ID] == "initialized" {
+				state.progress.MemberStages[member.instance.ID] = "clone-intent"
+				if saveDisasterProgress(state.data, &state.backup, state.progress) != nil {
+					return localizedMySQLOperationError(req.Language, MySQLRestoreIncomplete)
+				}
+			}
+			adopted, reconcileErr := m.service.reconcileDisasterCloneEffect(ctx, &state, seedAccessWork, member)
+			if reconcileErr != nil {
+				return localizedMySQLOperationError(req.Language, MySQLRestoreIncomplete)
+			}
+			if adopted {
+				state.progress.MemberStages[member.instance.ID] = "cloned"
+				if saveDisasterProgress(state.data, &state.backup, state.progress) != nil {
+					return localizedMySQLOperationError(req.Language, MySQLRestoreIncomplete)
+				}
+				continue
+			}
+			command, commandErr := disasterCloneMemberCommand(seedAccessWork, state.seed, member)
 			if commandErr != nil {
 				return localizedMySQLOperationError(req.Language, MySQLRestoreIncomplete)
 			}
@@ -339,7 +397,7 @@ func (m Module) restoreDisasterRebuild(ctx context.Context, req registry.Restore
 	}
 	roles := map[string]string{}
 	if err := runner.step(9, func() error {
-		result, runErr := m.service.remote.Run(ctx, state.seed.server, "# __AIFAR_WAIT_ONLINE__\n"+inspectClusterMembersCommand(seedWork, instancePort(state.seed.instance)))
+		result, runErr := m.service.remote.Run(ctx, state.seed.server, "# __AIFAR_WAIT_ONLINE__\n"+inspectClusterMembersCommand(seedAccessWork, instancePort(state.seed.instance)))
 		if runErr != nil {
 			return localizedMySQLOperationError(req.Language, MySQLRestoreIncomplete)
 		}
@@ -376,7 +434,7 @@ func (m Module) restoreDisasterRebuild(ctx context.Context, req registry.Restore
 			if state.progress.RouterStages[router.InstanceID] == "bootstrapped" || state.progress.RouterStages[router.InstanceID] == "verified" {
 				continue
 			}
-			server, getErr := m.service.store.GetServer(router.ServerID, false)
+			server, getErr := m.service.store.GetServer(router.ServerID, true)
 			if getErr != nil {
 				return localizedMySQLOperationError(req.Language, MySQLRebuildRouterFailed)
 			}
@@ -428,7 +486,13 @@ func (m Module) restoreDisasterRebuild(ctx context.Context, req registry.Restore
 		for _, member := range state.members {
 			ids = append(ids, member.instance.ID)
 		}
-		completion := store.MySQLDisasterRebuildCompletion{ClusterID: state.progress.ClusterID, SourceBackupID: state.backup.ID, TaskID: run.TaskID, Generation: state.progress.RestoreGeneration, Roles: roles, CompletedAt: time.Now().UTC()}
+		completion := store.MySQLDisasterRebuildCompletion{
+			ClusterID: state.progress.ClusterID, SourceBackupID: state.backup.ID, TaskID: run.TaskID,
+			ManifestSHA256: state.progress.ManifestSHA256, Generation: state.progress.RestoreGeneration,
+			Roles: roles, QuarantinePaths: cloneDisasterProgressMap(state.progress.QuarantinePaths),
+			MemberStages: cloneDisasterProgressMap(state.progress.MemberStages), RouterStages: cloneDisasterProgressMap(state.progress.RouterStages),
+			CompletedAt: time.Now().UTC(),
+		}
 		if completeErr := state.data.CompleteMySQLDisasterRebuild(ids, state.marker, completion); completeErr != nil {
 			return localizedMySQLOperationError(req.Language, MySQLMaintenanceStatePersistFailed)
 		}
@@ -437,6 +501,60 @@ func (m Module) restoreDisasterRebuild(ctx context.Context, req registry.Restore
 		return err
 	}
 	return nil
+}
+
+func (s Service) stopDisasterGroupReplication(ctx context.Context, server store.Server, script string) error {
+	result, err := s.remote.Run(ctx, server, "sh "+installerkit.ShellQuote(script)+" stop-gr")
+	if err != nil {
+		return err
+	}
+	switch strings.TrimSpace(result.Stdout) {
+	case "__AIFAR_STOP_GR__\tstopped", "__AIFAR_STOP_GR__\talready-stopped", "__AIFAR_STOP_GR__\tmysqld-offline":
+		return nil
+	default:
+		return errors.New("invalid controlled Group Replication stop result")
+	}
+}
+
+func (s Service) inspectDisasterScriptEffect(ctx context.Context, server store.Server, script, action, marker string) (bool, error) {
+	result, err := s.remote.Run(ctx, server, "sh "+installerkit.ShellQuote(script)+" "+action)
+	if err != nil {
+		return false, err
+	}
+	switch strings.TrimSpace(result.Stdout) {
+	case marker + "\tpresent":
+		return true, nil
+	case marker + "\tabsent":
+		return false, nil
+	default:
+		return false, errors.New("invalid controlled disaster effect inspection")
+	}
+}
+
+func (s Service) reconcileDisasterCloneEffect(ctx context.Context, state *disasterExecutionState, work string, candidate clusterMemberNode) (bool, error) {
+	result, err := s.remote.Run(ctx, state.seed.server, "# __AIFAR_RECONCILE_CLONE__ "+candidate.instance.ID+"\n"+inspectClusterMembersCommand(work, instancePort(state.seed.instance)))
+	if err != nil {
+		return false, err
+	}
+	observed, err := parseInnoDBClusterRuntime(result.Stdout)
+	if err != nil {
+		return false, err
+	}
+	expected := map[string]clusterMemberNode{}
+	for _, member := range state.members {
+		expected[normalizeEndpoint(member.endpoint)] = member
+	}
+	foundCandidate := false
+	for _, item := range observed {
+		member, present := expected[normalizeEndpoint(item.endpoint)]
+		if !present || item.status != "ONLINE" || (item.role != "PRIMARY" && item.role != "SECONDARY") {
+			return false, errors.New("unexpected member while reconciling clone")
+		}
+		if member.instance.ID == candidate.instance.ID {
+			foundCandidate = true
+		}
+	}
+	return foundCandidate, nil
 }
 
 func (s Service) prepareDisasterRebuild(ctx context.Context, req registry.RestoreRequest, taskID string) (disasterExecutionState, error) {
@@ -466,7 +584,7 @@ func (s Service) prepareDisasterRebuild(ctx context.Context, req registry.Restor
 			return disasterExecutionState{}, localizedMySQLOperationError(req.Language, MySQLMaintenanceStateInvalid)
 		}
 		state.marker = marker
-		server, getErr := s.store.GetServer(instance.ServerID, false)
+		server, getErr := s.store.GetServer(instance.ServerID, true)
 		if getErr != nil || strings.TrimSpace(server.Host) == "" {
 			return disasterExecutionState{}, localizedMySQLOperationError(req.Language, MySQLRebuildConfirmationRequired)
 		}
@@ -514,7 +632,7 @@ func (s Service) prepareDisasterRebuild(ctx context.Context, req registry.Restor
 	}
 	for _, instance := range all {
 		if instance.App == "mysql-router" && clusterIDFromInstance(instance) == state.marker.ClusterID {
-			server, getErr := s.store.GetServer(instance.ServerID, false)
+			server, getErr := s.store.GetServer(instance.ServerID, true)
 			if getErr != nil {
 				return disasterExecutionState{}, localizedMySQLOperationError(req.Language, MySQLRebuildRouterFailed)
 			}
@@ -537,12 +655,33 @@ func (s Service) prepareDisasterRebuild(ctx context.Context, req registry.Restor
 	if generationErr != nil {
 		return disasterExecutionState{}, localizedMySQLOperationError(req.Language, MySQLMaintenanceStateInvalid)
 	}
-	state.progress, err = loadOrCreateDisasterProgress(state.backup, state.marker.ClusterID, taskID, generation)
+	state.progress, err = loadOrCreateDisasterProgress(state.backup, state.marker.ClusterID, taskID, state.digest, generation)
 	if err != nil {
 		return disasterExecutionState{}, localizedMySQLOperationError(req.Language, MySQLMaintenanceStateInvalid)
 	}
 	if err := validateDisasterProgressTopology(state, taskID); err != nil {
 		return disasterExecutionState{}, localizedMySQLOperationError(req.Language, MySQLMaintenanceStateInvalid)
+	}
+	freshSeed, seedErr := data.GetAppInstance(state.seed.instance.ID)
+	if seedErr != nil {
+		return disasterExecutionState{}, localizedMySQLOperationError(req.Language, MySQLReconciliationRequired)
+	}
+	_, reconciliation, reconcilePresent, reconcileErr := parseMySQLReconciliationMarker(freshSeed.Metadata)
+	if reconcileErr != nil || (reconcilePresent && reconciliation.TaskID != taskID) {
+		return disasterExecutionState{}, localizedMySQLOperationError(req.Language, MySQLReconciliationRequired)
+	}
+	if reconcilePresent {
+		if err := s.reconcileMySQL(ctx, freshSeed, req.Language); err != nil {
+			return disasterExecutionState{}, err
+		}
+		if state.progress.SeedStage == "load-effect-complete" {
+			state.progress.SeedStage = "loaded"
+			if err := updateRestorePhase(data, &state.backup, "load_complete", taskID, state.digest); err != nil {
+				return disasterExecutionState{}, localizedMySQLOperationError(req.Language, MySQLRestoreIncomplete)
+			}
+		}
+	} else if state.progress.SeedStage == "load-effect-complete" {
+		return disasterExecutionState{}, localizedMySQLOperationError(req.Language, MySQLReconciliationRequired)
 	}
 	if err := saveDisasterProgress(data, &state.backup, state.progress); err != nil {
 		return disasterExecutionState{}, localizedMySQLOperationError(req.Language, MySQLRestoreIncomplete)
@@ -569,7 +708,7 @@ func nextDisasterRestoreGeneration(raw string) (int, error) {
 	return previous.Generation + 1, nil
 }
 
-func loadOrCreateDisasterProgress(backup store.AppBackup, clusterID, taskID string, generation int) (disasterRebuildProgress, error) {
+func loadOrCreateDisasterProgress(backup store.AppBackup, clusterID, taskID, manifestSHA256 string, generation int) (disasterRebuildProgress, error) {
 	metadata, err := strictBackupMetadata(backup.Metadata)
 	if err != nil {
 		return disasterRebuildProgress{}, err
@@ -577,7 +716,7 @@ func loadOrCreateDisasterProgress(backup store.AppBackup, clusterID, taskID stri
 	raw, present := metadata["disasterRebuild"]
 	if !present {
 		return disasterRebuildProgress{
-			Version: 1, TaskID: taskID, SourceBackupID: backup.ID, ClusterID: clusterID, RestoreGeneration: generation,
+			Version: 1, TaskID: taskID, SourceBackupID: backup.ID, ClusterID: clusterID, ManifestSHA256: manifestSHA256, RestoreGeneration: generation,
 			QuarantinePaths: map[string]string{}, MemberStages: map[string]string{}, RouterStages: map[string]string{},
 		}, nil
 	}
@@ -591,10 +730,18 @@ func loadOrCreateDisasterProgress(backup store.AppBackup, clusterID, taskID stri
 	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
 		return disasterRebuildProgress{}, errors.New("disaster rebuild progress must be one object")
 	}
-	if progress.Version != 1 || progress.TaskID != taskID || progress.SourceBackupID != backup.ID || progress.ClusterID != clusterID || progress.RestoreGeneration != generation || progress.QuarantinePaths == nil || progress.MemberStages == nil || progress.RouterStages == nil || progress.CompletionStage != "" {
+	if progress.Version != 1 || progress.TaskID != taskID || progress.SourceBackupID != backup.ID || progress.ClusterID != clusterID || progress.ManifestSHA256 != manifestSHA256 || progress.RestoreGeneration != generation || progress.QuarantinePaths == nil || progress.MemberStages == nil || progress.RouterStages == nil || progress.CompletionStage != "" {
 		return disasterRebuildProgress{}, errors.New("disaster rebuild progress identity changed")
 	}
 	return progress, nil
+}
+
+func cloneDisasterProgressMap(source map[string]string) map[string]string {
+	cloned := make(map[string]string, len(source))
+	for key, value := range source {
+		cloned[key] = value
+	}
+	return cloned
 }
 
 func validateDisasterProgressTopology(state disasterExecutionState, taskID string) error {
@@ -619,11 +766,11 @@ func validateDisasterProgressTopology(state disasterExecutionState, taskID strin
 			if stage != "cluster-created" && stage != "ONLINE" {
 				return errors.New("invalid disaster rebuild seed member stage")
 			}
-		} else if stage != "initialized" && stage != "cloned" && stage != "ONLINE" {
+		} else if stage != "initialized" && stage != "clone-intent" && stage != "cloned" && stage != "ONLINE" {
 			return errors.New("invalid disaster rebuild member stage")
 		}
 	}
-	if state.progress.SeedStage != "" && state.progress.SeedStage != "initialized" && state.progress.SeedStage != "loaded" && state.progress.SeedStage != "verified" {
+	if state.progress.SeedStage != "" && state.progress.SeedStage != "initialized" && state.progress.SeedStage != "load-effect-complete" && state.progress.SeedStage != "loaded" && state.progress.SeedStage != "verified" {
 		return errors.New("invalid disaster rebuild seed stage")
 	}
 	routers := make(map[string]bool, len(state.routers))
@@ -835,16 +982,34 @@ func (s Service) loadDisasterSeed(ctx context.Context, state *disasterExecutionS
 	if err := guard.Capture(ctx); err != nil {
 		return err
 	}
+	markerRecorded := false
+	restored := false
+	defer func() {
+		if !markerRecorded {
+			return
+		}
+		restoreCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		defer cancel()
+		if !restored {
+			if restoreErr := guard.Restore(restoreCtx); restoreErr != nil {
+				retErr = errors.Join(retErr, localizedMySQLOperationError(language, MySQLLocalInfileRestoreFailed))
+				return
+			}
+			restored = true
+		}
+		if state.progress.SeedStage != "load-effect-complete" {
+			if clearErr := clearMySQLReconciliationMarker(state.data, state.seed.instance.ID, guard.original, taskID); clearErr != nil {
+				retErr = errors.Join(retErr, localizedMySQLOperationError(language, MySQLReconciliationRequired))
+			}
+		}
+	}()
+	if err := recordMySQLReconciliationMarker(state.data, state.seed.instance, guard.original, taskID); err != nil {
+		return localizedMySQLOperationError(language, MySQLReconciliationRequired)
+	}
+	markerRecorded = true
 	if err := guard.Enable(ctx); err != nil {
 		return err
 	}
-	defer func() {
-		restoreCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
-		defer cancel()
-		if err := guard.Restore(restoreCtx); err != nil {
-			retErr = errors.Join(retErr, localizedMySQLOperationError(language, MySQLLocalInfileRestoreFailed))
-		}
-	}()
 	if err := updateRestorePhase(state.data, &state.backup, "schema_mutation_started", taskID, state.digest); err != nil {
 		return localizedMySQLOperationError(language, MySQLRestoreIncomplete)
 	}
@@ -864,11 +1029,31 @@ func (s Service) loadDisasterSeed(ctx context.Context, state *disasterExecutionS
 	if _, err := s.remote.Run(ctx, state.seed.server, "sh "+installerkit.ShellQuote(remoteScript)); err != nil {
 		return localizedMySQLOperationError(language, MySQLRestoreIncomplete)
 	}
-	state.progress.SeedStage = "loaded"
-	if err := updateRestorePhase(state.data, &state.backup, "load_complete", taskID, state.digest); err != nil {
+	state.progress.SeedStage = "load-effect-complete"
+	if err := saveDisasterProgress(state.data, &state.backup, state.progress); err != nil {
 		return localizedMySQLOperationError(language, MySQLRestoreIncomplete)
 	}
-	return saveDisasterProgress(state.data, &state.backup, state.progress)
+	restoreCtx, restoreCancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	if err := guard.Restore(restoreCtx); err != nil {
+		restoreCancel()
+		return localizedMySQLOperationError(language, MySQLLocalInfileRestoreFailed)
+	}
+	restoreCancel()
+	restored = true
+	state.progress.SeedStage = "loaded"
+	if err := updateRestorePhase(state.data, &state.backup, "load_complete", taskID, state.digest); err != nil {
+		state.progress.SeedStage = "load-effect-complete"
+		return localizedMySQLOperationError(language, MySQLRestoreIncomplete)
+	}
+	if err := saveDisasterProgress(state.data, &state.backup, state.progress); err != nil {
+		state.progress.SeedStage = "load-effect-complete"
+		return localizedMySQLOperationError(language, MySQLRestoreIncomplete)
+	}
+	if err := clearMySQLReconciliationMarker(state.data, state.seed.instance.ID, guard.original, taskID); err != nil {
+		return localizedMySQLOperationError(language, MySQLReconciliationRequired)
+	}
+	markerRecorded = false
+	return nil
 }
 
 func (state *disasterExecutionState) repositoryPath(backup store.AppBackup) string {

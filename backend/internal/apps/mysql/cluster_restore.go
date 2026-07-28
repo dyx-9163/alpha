@@ -350,7 +350,7 @@ func (s Service) verifyClusterRecovered(ctx context.Context, cluster *resolvedIn
 		return mysqlOperationError(MySQLCredentialUnavailable)
 	}
 	for _, router := range cluster.routers {
-		server, err := s.store.GetServer(router.ServerID, false)
+		server, err := s.store.GetServer(router.ServerID, true)
 		if err != nil {
 			return err
 		}

@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -93,6 +95,20 @@ func TestDisasterRebuildQuarantineScriptUsesAtomicTaskScopedRename(t *testing.T)
 	}
 }
 
+func TestDisasterRebuildInitializedInspectionVerifiesBoundCredential(t *testing.T) {
+	script, err := renderDisasterRebuildScript(DisasterRebuildScriptOptions{
+		TaskID: "tsk_1234567890abcdef12345678", InstallRoot: "/aifar/apps/mysql", WorkDir: "/aifar/apps/mysql/_disaster/tsk_1234567890abcdef12345678", DataDir: "/aifar/apps/mysql/data",
+		QuarantineDir: "/aifar/apps/mysql/data.quarantine-tsk_1234567890abcdef12345678", Port: 3306,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `"$INSTALL_ROOT/mysql/bin/mysql" --defaults-file="$WORK_DIR/secret-context.cnf" --protocol=tcp --host=127.0.0.1 --port="$PORT" --batch --skip-column-names --execute "SELECT 1"`
+	if !strings.Contains(script, want) {
+		t.Fatalf("initialized-state inspection does not verify the bound credential with a SQL query:\n%s", script)
+	}
+}
+
 func TestDisasterRebuildSuccessfulLifecycleClearsAllMaintenanceMarkers(t *testing.T) {
 	fixture := newDisasterRebuildFixture(t, "")
 	recorder := &restoreProgressRecorder{}
@@ -126,6 +142,25 @@ func TestDisasterRebuildSuccessfulLifecycleClearsAllMaintenanceMarkers(t *testin
 	}
 	if got := recorder.targetFinishes; !reflect.DeepEqual(got, []string{"success"}) {
 		t.Fatalf("disaster target status=%v steps=%v", got, recorder.stepStatus)
+	}
+}
+
+func TestDisasterRebuildUsesSecretBearingSSHServersWithoutPersistingSecrets(t *testing.T) {
+	fixture := newDisasterRebuildFixture(t, "")
+	fixture.remote.requireSSHCredential = true
+	if err := fixture.module.Restore(context.Background(), fixture.request, registry.RunContext{TaskID: fixture.taskID, Log: &restoreProgressRecorder{}}); err != nil {
+		t.Fatalf("disaster rebuild did not receive production SSH credentials: %v", err)
+	}
+	if len(fixture.remote.credentialServerIDs) != 4 {
+		t.Fatalf("credential-bearing remote targets=%v, want three members plus Router", fixture.remote.credentialServerIDs)
+	}
+	joined := strings.Join(fixture.remote.commands, "\n")
+	backup, err := fixture.db.GetAppBackup(fixture.backup.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(joined, "ssh-fixture-secret") || strings.Contains(backup.Metadata, "ssh-fixture-secret") {
+		t.Fatalf("SSH credential leaked to command/progress: commands=%s metadata=%s", joined, backup.Metadata)
 	}
 }
 
@@ -264,6 +299,346 @@ func TestDisasterRebuildRetryDoesNotReloadVerifiedSeed(t *testing.T) {
 	}
 }
 
+func TestDisasterRebuildRetryRecreatesFresh0600MySQLContext(t *testing.T) {
+	fixture := newDisasterRebuildFixture(t, "__AIFAR_CLONE_MEMBER__")
+	fixture.remote.enforceRemoteFiles = true
+	if err := fixture.module.Restore(context.Background(), fixture.request, registry.RunContext{TaskID: fixture.taskID, Log: &restoreProgressRecorder{}}); err == nil {
+		t.Fatal("first clone failure unexpectedly succeeded")
+	}
+	fixture.remote.failAt = ""
+	fixture.remote.failed = false
+	if err := fixture.module.Restore(context.Background(), fixture.request, registry.RunContext{TaskID: fixture.taskID, Log: &restoreProgressRecorder{}}); err != nil {
+		t.Fatalf("retry referenced a cleaned MySQL context: %v", err)
+	}
+	seedID := fixture.backup.InstanceID
+	needle := "-" + seedID + "/secret-context.cnf"
+	uploads := 0
+	for _, event := range fixture.remote.uploadEvents {
+		if strings.HasSuffix(event.path, needle) {
+			uploads++
+			if event.mode != 0o600 {
+				t.Fatalf("seed MySQL context mode=%#o path=%s", event.mode, event.path)
+			}
+		}
+	}
+	if uploads != 2 {
+		t.Fatalf("fresh seed MySQL contexts=%d, want one per attempt; events=%v", uploads, fixture.remote.uploadEvents)
+	}
+}
+
+func TestDisasterRebuildRetryNeverStopsRebuiltMembers(t *testing.T) {
+	for _, boundary := range []string{"clone", "router", "final-publication"} {
+		t.Run(boundary, func(t *testing.T) {
+			failAt := map[string]string{"clone": "__AIFAR_CLONE_MEMBER__", "router": "__AIFAR_ROUTER_BOOTSTRAP__"}[boundary]
+			fixture := newDisasterRebuildFixture(t, failAt)
+			if boundary == "final-publication" {
+				failing := &disasterCompletionFailOnceStore{Store: fixture.db, failures: 1}
+				fixture.module = NewModule(failing, fixture.remote)
+				fixture.module.service.localInfileSession = func(context.Context, store.AppInstance, store.Server, store.Credential) (localInfileSession, func(), error) {
+					return &fakeLocalInfileSession{value: "OFF"}, func() {}, nil
+				}
+			}
+			if err := fixture.module.Restore(context.Background(), fixture.request, registry.RunContext{TaskID: fixture.taskID, Log: &restoreProgressRecorder{}}); err == nil {
+				t.Fatalf("%s failure unexpectedly succeeded", boundary)
+			}
+			commandsBefore := len(fixture.remote.commands)
+			fixture.remote.failAt = ""
+			fixture.remote.failed = false
+			if err := fixture.module.Restore(context.Background(), fixture.request, registry.RunContext{TaskID: fixture.taskID, Log: &restoreProgressRecorder{}}); err != nil {
+				t.Fatalf("%s retry failed: %v", boundary, err)
+			}
+			retryCommands := strings.Join(fixture.remote.commands[commandsBefore:], "\n")
+			if strings.Contains(retryCommands, " stop-gr") {
+				t.Fatalf("%s retry stopped rebuilt members: %s", boundary, retryCommands)
+			}
+		})
+	}
+}
+
+func TestDisasterRebuildStopGroupReplicationAcceptsOnlyControlledOfflineOutcomes(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		mode      string
+		wantError bool
+	}{
+		{name: "running Group Replication", mode: "stopped"},
+		{name: "already stopped", mode: "already-stopped"},
+		{name: "mysqld unavailable or lost data", mode: "mysqld-offline"},
+		{name: "authentication or command failure", mode: "real-failure", wantError: true},
+		{name: "missing controlled result", mode: "missing-marker", wantError: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newDisasterRebuildFixture(t, "")
+			fixture.remote.stopGRMode = test.mode
+			err := fixture.module.Restore(context.Background(), fixture.request, registry.RunContext{TaskID: fixture.taskID, Log: &restoreProgressRecorder{}})
+			if test.wantError && err == nil {
+				t.Fatalf("stop-gr mode %q unexpectedly continued into quarantine", test.mode)
+			}
+			if !test.wantError && err != nil {
+				t.Fatalf("controlled stop-gr mode %q failed: %v", test.mode, err)
+			}
+		})
+	}
+}
+
+func TestDisasterRebuildRetryReconcilesLocalInfileBeforeContinuing(t *testing.T) {
+	fixture := newDisasterRebuildFixture(t, "")
+	local := &fakeLocalInfileSession{value: "OFF", setErrors: map[string]error{"OFF": errors.New("target unavailable during local_infile restore")}}
+	fixture.module.service.localInfileSession = func(context.Context, store.AppInstance, store.Server, store.Credential) (localInfileSession, func(), error) {
+		return local, func() {}, nil
+	}
+	if err := fixture.module.Restore(context.Background(), fixture.request, registry.RunContext{TaskID: fixture.taskID, Log: &restoreProgressRecorder{}}); err == nil {
+		t.Fatal("failed local_infile restoration unexpectedly reported success")
+	}
+	seed, err := fixture.db.GetAppInstance(fixture.backup.InstanceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, marker, present, parseErr := parseMySQLReconciliationMarker(seed.Metadata)
+	if parseErr != nil || !present || marker.OriginalValue != "OFF" || marker.TaskID != fixture.taskID {
+		t.Fatalf("local_infile reconciliation marker=%+v present=%v err=%v metadata=%s", marker, present, parseErr, seed.Metadata)
+	}
+	backup, err := fixture.db.GetAppBackup(fixture.backup.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	progress := mustDisasterProgress(t, backup.Metadata)
+	if progress.SeedStage == "loaded" || progress.SeedStage == "verified" {
+		t.Fatalf("failed local_infile restoration published seed stage %q", progress.SeedStage)
+	}
+	loadsBefore := fixture.remote.count("logical-restore.sh")
+	commandsBefore := len(fixture.remote.commands)
+	if err := fixture.module.Restore(context.Background(), fixture.request, registry.RunContext{TaskID: fixture.taskID, Log: &restoreProgressRecorder{}}); err == nil {
+		t.Fatal("retry bypassed unresolved local_infile reconciliation")
+	}
+	if len(fixture.remote.commands) != commandsBefore || fixture.remote.count("logical-restore.sh") != loadsBefore {
+		t.Fatalf("unreconciled retry performed remote rebuild work: before=%d after=%d", commandsBefore, len(fixture.remote.commands))
+	}
+	delete(local.setErrors, "OFF")
+	if err := fixture.module.Restore(context.Background(), fixture.request, registry.RunContext{TaskID: fixture.taskID, Log: &restoreProgressRecorder{}}); err != nil {
+		t.Fatalf("reconciled retry failed: %v", err)
+	}
+	if fixture.remote.count("logical-restore.sh") != loadsBefore {
+		t.Fatalf("reconciled retry reloaded seed: before=%d after=%d", loadsBefore, fixture.remote.count("logical-restore.sh"))
+	}
+	seed, err = fixture.db.GetAppInstance(fixture.backup.InstanceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, present, parseErr := parseMySQLReconciliationMarker(seed.Metadata); parseErr != nil || present {
+		t.Fatalf("reconciled retry left marker present=%v err=%v metadata=%s", present, parseErr, seed.Metadata)
+	}
+}
+
+func TestDisasterRebuildRetryAdoptsRemoteEffectsAfterProgressPersistenceFailure(t *testing.T) {
+	for _, stage := range []string{"quarantine", "initialize", "clone"} {
+		t.Run(stage, func(t *testing.T) {
+			fixture := newDisasterRebuildFixture(t, "")
+			fixture.remote.statefulEffects = true
+			failing := &disasterProgressFailStore{Store: fixture.db, stage: stage, failures: restorePersistenceAttempts}
+			fixture.module = NewModule(failing, fixture.remote)
+			fixture.module.service.localInfileSession = func(context.Context, store.AppInstance, store.Server, store.Credential) (localInfileSession, func(), error) {
+				return &fakeLocalInfileSession{value: "OFF"}, func() {}, nil
+			}
+			if err := fixture.module.Restore(context.Background(), fixture.request, registry.RunContext{TaskID: fixture.taskID, Log: &restoreProgressRecorder{}}); err == nil {
+				t.Fatalf("%s progress persistence failure unexpectedly succeeded", stage)
+			}
+			if err := fixture.module.Restore(context.Background(), fixture.request, registry.RunContext{TaskID: fixture.taskID, Log: &restoreProgressRecorder{}}); err != nil {
+				t.Fatalf("%s retry did not adopt matching remote effect: %v", stage, err)
+			}
+			if fixture.remote.effectCounts["quarantine"] != 3 || fixture.remote.effectCounts["initialize"] != 3 || fixture.remote.effectCounts["clone"] != 2 {
+				t.Fatalf("%s retry repeated or omitted remote effect: counts=%v", stage, fixture.remote.effectCounts)
+			}
+		})
+	}
+}
+
+func TestDisasterRebuildCompletionRejectsDivergentFullProgress(t *testing.T) {
+	for _, mutate := range []struct {
+		name  string
+		apply func(*disasterRebuildProgress, *store.MySQLDisasterRebuildCompletion)
+	}{
+		{name: "canonical manifest digest", apply: func(_ *disasterRebuildProgress, completion *store.MySQLDisasterRebuildCompletion) {
+			completion.ManifestSHA256 = strings.Repeat("0", 64)
+		}},
+		{name: "member stages", apply: func(progress *disasterRebuildProgress, _ *store.MySQLDisasterRebuildCompletion) {
+			for id := range progress.MemberStages {
+				progress.MemberStages[id] = "cloned"
+				break
+			}
+		}},
+		{name: "Router stages", apply: func(progress *disasterRebuildProgress, _ *store.MySQLDisasterRebuildCompletion) {
+			for id := range progress.RouterStages {
+				delete(progress.RouterStages, id)
+				break
+			}
+		}},
+		{name: "quarantine identities", apply: func(progress *disasterRebuildProgress, _ *store.MySQLDisasterRebuildCompletion) {
+			for id := range progress.QuarantinePaths {
+				delete(progress.QuarantinePaths, id)
+				break
+			}
+		}},
+	} {
+		t.Run(mutate.name, func(t *testing.T) {
+			fixture, marker, completion := readyDisasterCompletionFixture(t)
+			backup, err := fixture.db.GetAppBackup(fixture.backup.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			progress := mustDisasterProgress(t, backup.Metadata)
+			mutate.apply(&progress, &completion)
+			metadata, _ := strictBackupMetadata(backup.Metadata)
+			metadata["disasterRebuild"], _ = json.Marshal(progress)
+			encoded, _ := json.Marshal(metadata)
+			backup.Metadata = string(encoded)
+			if _, err := fixture.db.SaveAppBackup(backup); err != nil {
+				t.Fatal(err)
+			}
+			ids := []string{fixture.instances[0].ID, fixture.instances[1].ID, fixture.instances[2].ID}
+			if err := fixture.db.CompleteMySQLDisasterRebuild(ids, marker, completion); err == nil {
+				t.Fatalf("completion accepted divergent %s", mutate.name)
+			}
+			for _, instance := range fixture.instances {
+				fresh, _ := fixture.db.GetAppInstance(instance.ID)
+				if _, present, _ := store.ParseMySQLMaintenanceMarker(fresh.Metadata); !present {
+					t.Fatalf("divergent %s cleared maintenance for %s", mutate.name, instance.ID)
+				}
+			}
+		})
+	}
+}
+
+func TestDisasterRebuildSQLiteFailureRollsBackEveryPublishedState(t *testing.T) {
+	fixture, marker, completion := readyDisasterCompletionFixture(t)
+	beforeBackup, _ := fixture.db.GetAppBackup(fixture.backup.ID)
+	beforeCluster, _ := fixture.db.GetAppCluster(clusterIDFromInstance(fixture.instances[0]))
+	beforeMembers, _ := fixture.db.ListAppClusterMembers(beforeCluster.ID)
+	beforeInstances, _ := fixture.db.ListAppInstances()
+	rawMaintenanceExec(t, fixture.dbPath, `create trigger fail_disaster_router_publication before update on app_instances when old.app='mysql-router' and new.metadata like '%mysqlDisasterRestore%' begin select raise(abort,'injected Router publication failure'); end`)
+	ids := []string{fixture.instances[0].ID, fixture.instances[1].ID, fixture.instances[2].ID}
+	if err := fixture.db.CompleteMySQLDisasterRebuild(ids, marker, completion); err == nil {
+		t.Fatal("real SQLite trigger failure unexpectedly committed")
+	} else if !strings.Contains(err.Error(), "injected Router publication failure") {
+		t.Fatalf("completion failed before reaching the real SQLite trigger: %v", err)
+	}
+	afterBackup, _ := fixture.db.GetAppBackup(fixture.backup.ID)
+	afterCluster, _ := fixture.db.GetAppCluster(beforeCluster.ID)
+	afterMembers, _ := fixture.db.ListAppClusterMembers(beforeCluster.ID)
+	afterInstances, _ := fixture.db.ListAppInstances()
+	if beforeBackup.Metadata != afterBackup.Metadata || !reflect.DeepEqual(beforeCluster, afterCluster) || !reflect.DeepEqual(beforeMembers, afterMembers) || !reflect.DeepEqual(beforeInstances, afterInstances) {
+		t.Fatalf("SQLite rollback diverged:\nbackup before=%s after=%s\ncluster before=%+v after=%+v\nmembers before=%+v after=%+v\ninstances before=%+v after=%+v", beforeBackup.Metadata, afterBackup.Metadata, beforeCluster, afterCluster, beforeMembers, afterMembers, beforeInstances, afterInstances)
+	}
+}
+
+func readyDisasterCompletionFixture(t *testing.T) (disasterRebuildFixture, store.MySQLMaintenanceMarker, store.MySQLDisasterRebuildCompletion) {
+	t.Helper()
+	fixture := newDisasterRebuildFixture(t, "")
+	failing := &disasterCompletionFailOnceStore{Store: fixture.db, failures: 1}
+	fixture.module = NewModule(failing, fixture.remote)
+	fixture.module.service.localInfileSession = func(context.Context, store.AppInstance, store.Server, store.Credential) (localInfileSession, func(), error) {
+		return &fakeLocalInfileSession{value: "OFF"}, func() {}, nil
+	}
+	if err := fixture.module.Restore(context.Background(), fixture.request, registry.RunContext{TaskID: fixture.taskID, Log: &restoreProgressRecorder{}}); err == nil {
+		t.Fatal("completion setup unexpectedly succeeded")
+	}
+	backup, err := fixture.db.GetAppBackup(fixture.backup.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	progress := mustDisasterProgress(t, backup.Metadata)
+	fresh, _ := fixture.db.GetAppInstance(fixture.instances[0].ID)
+	marker, present, err := store.ParseMySQLMaintenanceMarker(fresh.Metadata)
+	if err != nil || !present {
+		t.Fatalf("maintenance marker present=%v err=%v", present, err)
+	}
+	roles := map[string]string{}
+	for index, server := range fixture.remote.servers {
+		role := "SECONDARY"
+		if index == 0 {
+			role = "PRIMARY"
+		}
+		roles[fixture.remote.memberByServer[server.ID]] = role
+	}
+	completion := store.MySQLDisasterRebuildCompletion{
+		ClusterID: progress.ClusterID, SourceBackupID: backup.ID, TaskID: fixture.taskID,
+		Generation: progress.RestoreGeneration, Roles: roles, CompletedAt: time.Now().UTC(),
+		ManifestSHA256: progress.ManifestSHA256, QuarantinePaths: cloneDisasterStringMap(progress.QuarantinePaths),
+		MemberStages: cloneDisasterStringMap(progress.MemberStages), RouterStages: cloneDisasterStringMap(progress.RouterStages),
+	}
+	return fixture, marker, completion
+}
+
+func cloneDisasterStringMap(source map[string]string) map[string]string {
+	cloned := make(map[string]string, len(source))
+	for key, value := range source {
+		cloned[key] = value
+	}
+	return cloned
+}
+
+type disasterProgressFailStore struct {
+	*store.Store
+	stage    string
+	failures int
+}
+
+func (s *disasterProgressFailStore) SaveAppBackup(backup store.AppBackup) (store.AppBackup, error) {
+	if s.failures > 0 {
+		progress := mustDisasterProgressValue(backup.Metadata)
+		matches := (s.stage == "quarantine" && len(progress.QuarantinePaths) == 1) ||
+			(s.stage == "initialize" && progress.SeedStage == "initialized") ||
+			(s.stage == "clone" && containsDisasterStage(progress.MemberStages, "cloned"))
+		if matches {
+			s.failures--
+			return store.AppBackup{}, errors.New("injected disaster progress persistence failure")
+		}
+	}
+	return s.Store.SaveAppBackup(backup)
+}
+
+func mustDisasterProgressValue(raw string) disasterRebuildProgress {
+	metadata, _ := strictBackupMetadata(raw)
+	var progress disasterRebuildProgress
+	_ = json.Unmarshal(metadata["disasterRebuild"], &progress)
+	return progress
+}
+
+func containsDisasterStage(stages map[string]string, expected string) bool {
+	for _, stage := range stages {
+		if stage == expected {
+			return true
+		}
+	}
+	return false
+}
+
+func mustDisasterProgress(t *testing.T, raw string) disasterRebuildProgress {
+	t.Helper()
+	metadata, err := strictBackupMetadata(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var progress disasterRebuildProgress
+	if err := json.Unmarshal(metadata["disasterRebuild"], &progress); err != nil {
+		t.Fatal(err)
+	}
+	return progress
+}
+
+type disasterCompletionFailOnceStore struct {
+	*store.Store
+	failures int
+}
+
+func (s *disasterCompletionFailOnceStore) CompleteMySQLDisasterRebuild(ids []string, marker store.MySQLMaintenanceMarker, completion store.MySQLDisasterRebuildCompletion) error {
+	if s.failures > 0 {
+		s.failures--
+		return errors.New("injected one-time completion failure")
+	}
+	return s.Store.CompleteMySQLDisasterRebuild(ids, marker, completion)
+}
+
 func TestDisasterRebuildRetryRevalidatesExistingQuarantineIdentity(t *testing.T) {
 	fixture := newDisasterRebuildFixture(t, "__AIFAR_CLONE_MEMBER__")
 	if err := fixture.module.Restore(context.Background(), fixture.request, registry.RunContext{TaskID: fixture.taskID, Log: &restoreProgressRecorder{}}); err == nil {
@@ -319,6 +694,7 @@ func TestDisasterRebuildRetryRejectsProgressForUnknownTopologyMember(t *testing.
 
 type disasterRebuildFixture struct {
 	db        *store.Store
+	dbPath    string
 	module    Module
 	remote    *disasterRebuildRemote
 	request   registry.RestoreRequest
@@ -330,6 +706,16 @@ type disasterRebuildFixture struct {
 func newDisasterRebuildFixture(t *testing.T, failAt string) disasterRebuildFixture {
 	t.Helper()
 	maintenance := newMaintenanceClusterFixture(t)
+	storedServers, err := maintenance.db.ListServers()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, server := range storedServers {
+		server.Password = "ssh-fixture-secret"
+		if _, err := maintenance.db.SaveServer(server); err != nil {
+			t.Fatal(err)
+		}
+	}
 	serverByID := map[string]store.Server{}
 	for _, server := range maintenance.orderedServers {
 		serverByID[server.ID] = server
@@ -383,14 +769,18 @@ func newDisasterRebuildFixture(t *testing.T, failAt string) disasterRebuildFixtu
 		instances = append(instances, fresh)
 		mapping[fresh.ID] = fresh.ServerID
 	}
-	remote := &disasterRebuildRemote{restoreFakeRemote: &restoreFakeRemote{inspect: standaloneInspection("aifar_business")}, servers: manifestServers, failAt: failAt}
+	memberByServer := map[string]string{}
+	for _, instance := range instances {
+		memberByServer[instance.ServerID] = instance.ID
+	}
+	remote := &disasterRebuildRemote{restoreFakeRemote: &restoreFakeRemote{inspect: standaloneInspection("aifar_business")}, servers: manifestServers, failAt: failAt, memberByServer: memberByServer}
 	module := NewModule(maintenance.db, remote)
 	module.service.localInfileSession = func(context.Context, store.AppInstance, store.Server, store.Credential) (localInfileSession, func(), error) {
 		return &fakeLocalInfileSession{value: "OFF"}, func() {}, nil
 	}
 	taskID := "tsk_bbbbbbbbbbbbbbbbbbbbbbbb"
 	return disasterRebuildFixture{
-		db: maintenance.db, module: module, remote: remote, instances: instances, backup: backup, taskID: taskID,
+		db: maintenance.db, dbPath: maintenance.path, module: module, remote: remote, instances: instances, backup: backup, taskID: taskID,
 		request: registry.RestoreRequest{
 			Instance: instances[0], Instances: instances, Servers: manifestServers, Backup: backup,
 			RepositoryDir: repositoryDir, Language: "en", Actor: "owner",
@@ -401,20 +791,152 @@ func newDisasterRebuildFixture(t *testing.T, failAt string) disasterRebuildFixtu
 
 type disasterRebuildRemote struct {
 	*restoreFakeRemote
-	servers     []store.Server
-	failAt      string
-	failed      bool
-	uploadModes map[string]os.FileMode
+	servers              []store.Server
+	failAt               string
+	failed               bool
+	uploadModes          map[string]os.FileMode
+	requireSSHCredential bool
+	credentialServerIDs  map[string]bool
+	enforceRemoteFiles   bool
+	activeFiles          map[string]os.FileMode
+	uploadEvents         []disasterUploadEvent
+	stopGRMode           string
+	statefulEffects      bool
+	quarantinedServers   map[string]bool
+	initializedMembers   map[string]bool
+	onlineMembers        map[string]bool
+	memberByServer       map[string]string
+	effectCounts         map[string]int
 }
 
+type disasterUploadEvent struct {
+	serverID string
+	path     string
+	mode     os.FileMode
+}
+
+var disasterQuotedPath = regexp.MustCompile(`'([^']+)'`)
+var disasterScriptMemberID = regexp.MustCompile(`-(app_[0-9a-f]{24})/disaster-rebuild[.]sh`)
+var disasterCloneMemberID = regexp.MustCompile(`__AIFAR_CLONE_MEMBER__ (app_[0-9a-f]{24})`)
+
+func disasterRemoteFileKey(serverID, remotePath string) string { return serverID + "\x00" + remotePath }
+
 func (r *disasterRebuildRemote) Run(ctx context.Context, server store.Server, command string) (adapter.CommandResult, error) {
+	if r.requireSSHCredential {
+		if server.Password == "" && server.PrivateKey == "" {
+			return adapter.CommandResult{}, errors.New("production remote target has no SSH credential")
+		}
+		if r.credentialServerIDs == nil {
+			r.credentialServerIDs = map[string]bool{}
+		}
+		r.credentialServerIDs[server.ID] = true
+	}
+	if r.enforceRemoteFiles {
+		if r.activeFiles == nil {
+			r.activeFiles = map[string]os.FileMode{}
+		}
+		if strings.Contains(command, "rm -rf --") || strings.Contains(command, "rm -f --") {
+			for _, match := range disasterQuotedPath.FindAllStringSubmatch(command, -1) {
+				for key := range r.activeFiles {
+					prefix := disasterRemoteFileKey(server.ID, match[1])
+					if key == prefix || (strings.Contains(command, "rm -rf --") && strings.HasPrefix(key, prefix+"/")) {
+						delete(r.activeFiles, key)
+					}
+				}
+			}
+		}
+		for _, match := range regexp.MustCompile(`--defaults-file='([^']+)'`).FindAllStringSubmatch(command, -1) {
+			if _, present := r.activeFiles[disasterRemoteFileKey(server.ID, match[1])]; !present {
+				return adapter.CommandResult{}, errors.New("referenced MySQL context was cleaned")
+			}
+		}
+	}
 	if r.failAt != "" && !r.failed && strings.Contains(command, r.failAt) {
 		r.failed = true
 		r.commands = append(r.commands, command)
 		return adapter.CommandResult{}, errors.New("injected disaster boundary")
 	}
+	if strings.HasSuffix(command, " stop-gr") {
+		mode := r.stopGRMode
+		if mode == "" {
+			mode = "stopped"
+		}
+		if mode == "real-failure" {
+			r.commands = append(r.commands, command)
+			return adapter.CommandResult{}, errors.New("injected stop-gr authentication failure")
+		}
+		r.commands = append(r.commands, command)
+		if mode == "missing-marker" {
+			return adapter.CommandResult{}, nil
+		}
+		return adapter.CommandResult{Stdout: "__AIFAR_STOP_GR__\t" + mode + "\n"}, nil
+	}
+	if r.quarantinedServers == nil {
+		r.quarantinedServers = map[string]bool{}
+		r.initializedMembers = map[string]bool{}
+		r.onlineMembers = map[string]bool{}
+		r.effectCounts = map[string]int{}
+	}
+	{
+		memberID := ""
+		if match := disasterScriptMemberID.FindStringSubmatch(command); len(match) == 2 {
+			memberID = match[1]
+		}
+		switch {
+		case strings.HasSuffix(command, " inspect-quarantine"):
+			state := "absent"
+			if r.quarantinedServers[server.ID] {
+				state = "present"
+			}
+			r.commands = append(r.commands, command)
+			return adapter.CommandResult{Stdout: "__AIFAR_QUARANTINE__\t" + state + "\n"}, nil
+		case strings.HasSuffix(command, " quarantine"):
+			if r.quarantinedServers[server.ID] {
+				return adapter.CommandResult{}, errors.New("quarantine destination already exists")
+			}
+			r.quarantinedServers[server.ID] = true
+			r.effectCounts["quarantine"]++
+		case strings.HasSuffix(command, " verify-quarantine"):
+			if !r.quarantinedServers[server.ID] {
+				return adapter.CommandResult{}, errors.New("quarantine is absent")
+			}
+		case strings.HasSuffix(command, " inspect-initialized"):
+			state := "absent"
+			if r.initializedMembers[memberID] {
+				state = "present"
+			}
+			r.commands = append(r.commands, command)
+			return adapter.CommandResult{Stdout: "__AIFAR_INITIALIZED__\t" + state + "\n"}, nil
+		case strings.HasSuffix(command, " initialize"):
+			if r.initializedMembers[memberID] {
+				return adapter.CommandResult{}, errors.New("member data directory is already initialized")
+			}
+			r.initializedMembers[memberID] = true
+			r.effectCounts["initialize"]++
+		case strings.Contains(command, "__AIFAR_CREATE_CLUSTER__"):
+			if r.statefulEffects {
+				r.onlineMembers[r.memberByServer[server.ID]] = true
+			}
+		case strings.Contains(command, "__AIFAR_CLONE_MEMBER__"):
+			if r.statefulEffects {
+				match := disasterCloneMemberID.FindStringSubmatch(command)
+				if len(match) != 2 || r.onlineMembers[match[1]] {
+					return adapter.CommandResult{}, errors.New("clone target is already ONLINE")
+				}
+				r.onlineMembers[match[1]] = true
+				r.effectCounts["clone"]++
+			}
+		}
+	}
 	if strings.Contains(command, "__AIFAR_CLUSTER__") || strings.Contains(command, "__AIFAR_WAIT_ONLINE__") {
 		r.commands = append(r.commands, command)
+		if r.statefulEffects {
+			return adapter.CommandResult{Stdout: r.statefulClusterRuntime()}, nil
+		}
+		if strings.Contains(command, "__AIFAR_RECONCILE_CLONE__") {
+			server := r.servers[0]
+			return adapter.CommandResult{Stdout: "__AIFAR_CLUSTER__\t" + server.Host + "\t3306\tPRIMARY\tONLINE\t123e4567-e89b-12d3-a456-426614174000\n"}, nil
+		}
 		return adapter.CommandResult{Stdout: healthyClusterRuntime(r.servers)}, nil
 	}
 	if strings.Contains(command, "__AIFAR_ROUTER_WRITE__") {
@@ -422,6 +944,22 @@ func (r *disasterRebuildRemote) Run(ctx context.Context, server store.Server, co
 		return adapter.CommandResult{Stdout: "__AIFAR_ROUTER_WRITE__\t1\n__AIFAR_ROUTER_READ__\t1\n"}, nil
 	}
 	return r.restoreFakeRemote.Run(ctx, server, command)
+}
+
+func (r *disasterRebuildRemote) statefulClusterRuntime() string {
+	var output strings.Builder
+	for index, server := range r.servers {
+		instanceID := r.memberByServer[server.ID]
+		if !r.onlineMembers[instanceID] {
+			continue
+		}
+		role := "SECONDARY"
+		if index == 0 {
+			role = "PRIMARY"
+		}
+		fmt.Fprintf(&output, "__AIFAR_CLUSTER__\t%s\t3306\t%s\tONLINE\t%d23e4567-e89b-12d3-a456-426614174000\n", server.Host, role, index+1)
+	}
+	return output.String()
 }
 
 func (r *disasterRebuildRemote) count(fragment string) int {
@@ -435,6 +973,22 @@ func (r *disasterRebuildRemote) count(fragment string) int {
 }
 
 func (r *disasterRebuildRemote) UploadFile(ctx context.Context, server store.Server, localPath, remotePath string, mode os.FileMode) error {
+	if r.requireSSHCredential {
+		if server.Password == "" && server.PrivateKey == "" {
+			return errors.New("production upload target has no SSH credential")
+		}
+		if r.credentialServerIDs == nil {
+			r.credentialServerIDs = map[string]bool{}
+		}
+		r.credentialServerIDs[server.ID] = true
+	}
+	if r.enforceRemoteFiles {
+		if r.activeFiles == nil {
+			r.activeFiles = map[string]os.FileMode{}
+		}
+		r.activeFiles[disasterRemoteFileKey(server.ID, remotePath)] = mode.Perm()
+		r.uploadEvents = append(r.uploadEvents, disasterUploadEvent{serverID: server.ID, path: remotePath, mode: mode.Perm()})
+	}
 	if r.uploadModes == nil {
 		r.uploadModes = map[string]os.FileMode{}
 	}
