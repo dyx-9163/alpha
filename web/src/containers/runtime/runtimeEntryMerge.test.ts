@@ -7,6 +7,7 @@ vi.mock('../../i18n', () => ({
 }))
 
 import AifarRuntimePodsTab from './AifarRuntimePodsTab.vue'
+import AifarRuntimeServicesTab from './AifarRuntimeServicesTab.vue'
 import AifarRuntimeWorkspace from './AifarRuntimeWorkspace.vue'
 import {
   aifarRuntimeContextKey,
@@ -19,14 +20,15 @@ describe('AIFAR Runtime reconcile entries', () => {
     const Root = defineComponent({
       setup() {
         provide(aifarRuntimeContextKey, runtimeContext())
-        return () => h('div', [h(AifarRuntimeWorkspace), h(AifarRuntimePodsTab)])
+        return () => h('div', [h(AifarRuntimeWorkspace), h(AifarRuntimePodsTab), h(AifarRuntimeServicesTab)])
       }
     })
     const app = createSSRApp(Root)
-    for (const name of ['ElAlert', 'ElButton', 'ElDropdownItem', 'ElDropdownMenu', 'ElIcon', 'ElOption', 'ElSelect', 'ElTableColumn', 'ElTabs', 'ElTag', 'ElTooltip']) {
+    for (const name of ['ElAlert', 'ElButton', 'ElDropdownItem', 'ElDropdownMenu', 'ElIcon', 'ElOption', 'ElSelect', 'ElTabs', 'ElTag', 'ElTooltip']) {
       app.component(name, passThroughComponent)
     }
-    app.component('ElTable', emptyComponent)
+    app.component('ElTable', passThroughComponent)
+    app.component('ElTableColumn', tableColumnComponent)
     app.component('ElTabPane', activeTabPaneComponent)
     app.component('ElDropdown', dropdownComponent)
 
@@ -41,6 +43,12 @@ describe('AIFAR Runtime reconcile entries', () => {
     expect(renderedText).toContain('刷新')
     expect(renderedText).toContain('aria-label="刷新"')
     expect(renderedText).toContain('刷新指标')
+    expect(renderedText).toContain('服务')
+    expect(renderedText).toContain('Endpoint')
+    expect(renderedText).toContain('代理')
+    expect(renderedText).toContain('镜像')
+    expect(renderedText).not.toContain('CPU')
+    expect(renderedText).not.toContain('内存')
   })
 })
 
@@ -50,9 +58,10 @@ const passThroughComponent = defineComponent({
   }
 })
 
-const emptyComponent = defineComponent({
-  setup() {
-    return () => h('span')
+const tableColumnComponent = defineComponent({
+  props: { label: String },
+  setup(props, { slots }) {
+    return () => h('span', [props.label, slots.default?.({ row: {} })])
   }
 })
 
@@ -80,7 +89,13 @@ function runtimeContext(): AifarRuntimeContext {
     'containers.reconcileRuntime': '同步运行时',
     'containers.cleanupStaleRuntime': '清理残留',
     'containers.runtimeSummary': '运行时实例摘要',
-    'containers.refreshPodStats': '刷新指标'
+    'containers.refreshPodStats': '刷新指标',
+    'containers.service': '服务',
+    'containers.endpoint': 'Endpoint',
+    'containers.proxy': '代理',
+    'containers.image': '镜像',
+    'containers.cpu': 'CPU',
+    'containers.memory': '内存'
   }
   return {
     t: (key: string) => labels[key] ?? key,
@@ -115,6 +130,8 @@ function runtimeContext(): AifarRuntimeContext {
     ensureRuntimePodsLoaded: async () => {},
     runtimePodsLoadedForCurrentScope: computed(() => false),
     selectedRuntimePods: computed(() => []),
+    selectedRuntimeServices: computed(() => []),
+    runtimeEndpointText: () => '-',
     percentText: () => '-',
     openRuntimePodLogs: () => {}
   } as unknown as AifarRuntimeContext

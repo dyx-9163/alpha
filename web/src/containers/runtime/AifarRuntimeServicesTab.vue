@@ -13,12 +13,6 @@
       </el-table-column>
       <el-table-column prop="proxyName" :label="t('containers.proxy')" min-width="170" show-overflow-tooltip />
       <el-table-column prop="image" :label="t('containers.image')" min-width="240" show-overflow-tooltip />
-      <el-table-column :label="t('containers.cpu')" width="90">
-        <template #default="{ row }">{{ percentText(row.cpuPercent) }}</template>
-      </el-table-column>
-      <el-table-column :label="t('containers.memory')" width="100">
-        <template #default="{ row }">{{ percentText(row.memoryPercent) }}</template>
-      </el-table-column>
     </el-table>
   </div>
 </template>
@@ -32,7 +26,6 @@ const {
   selectedRuntimeServices,
   aifarRuntimeStatusKind,
   aifarRuntimeStatusLabel,
-  runtimeEndpointText,
-  percentText
+  runtimeEndpointText
 } = useAifarRuntimeContext()
 </script>
