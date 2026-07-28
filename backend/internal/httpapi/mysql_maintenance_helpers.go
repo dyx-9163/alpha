@@ -19,15 +19,29 @@ func (a *API) mysqlMaintenanceGate(instance store.AppInstance) string {
 		if clusterID == "" {
 			return mysql.MySQLMaintenanceStateInvalid
 		}
+		cluster, err := a.store.GetAppCluster(clusterID)
+		if err != nil || cluster.App != "mysql" || !strings.EqualFold(strings.TrimSpace(cluster.Topology), "innodb-cluster") {
+			return mysql.MySQLMaintenanceStateInvalid
+		}
+		authoritative, err := a.store.ListAppClusterMembers(clusterID)
+		if err != nil || len(authoritative) != 3 {
+			return mysql.MySQLMaintenanceStateInvalid
+		}
 		all, err := a.store.ListAppInstances()
 		if err != nil {
 			return mysql.MySQLMaintenanceStateInvalid
 		}
-		instances = instances[:0]
+		byID := map[string]store.AppInstance{}
 		for _, candidate := range all {
-			if candidate.App == "mysql" && strings.EqualFold(strings.TrimSpace(candidate.Topology), "innodb-cluster") && mysqlClusterID(candidate) == clusterID {
-				instances = append(instances, candidate)
+			byID[candidate.ID] = candidate
+		}
+		instances = instances[:0]
+		for _, member := range authoritative {
+			candidate, found := byID[member.InstanceID]
+			if !found || candidate.App != "mysql" || !strings.EqualFold(strings.TrimSpace(candidate.Topology), "innodb-cluster") || mysqlClusterID(candidate) != clusterID || candidate.ServerID != member.ServerID {
+				return mysql.MySQLMaintenanceStateInvalid
 			}
+			instances = append(instances, candidate)
 		}
 		if len(instances) != 3 {
 			return mysql.MySQLMaintenanceStateInvalid

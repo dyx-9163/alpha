@@ -395,6 +395,10 @@ func (s Service) verifyMaintenanceClusterHealth(ctx context.Context, cluster *re
 	if err != nil || credential.Status != "active" || credential.Kind != "mysql" || strings.TrimSpace(credential.Secret["password"]) == "" {
 		return mysqlOperationError(MySQLCredentialUnavailable)
 	}
+	schema, err := s.maintenanceRouterVerificationSchema(ctx, cluster.primary, credential, taskID)
+	if err != nil {
+		return mysqlOperationError(MySQLBackupClusterUnhealthy)
+	}
 	for _, router := range cluster.routers {
 		server, err := s.store.GetServer(router.ServerID, false)
 		if err != nil {
@@ -413,7 +417,7 @@ func (s Service) verifyMaintenanceClusterHealth(ctx context.Context, cluster *re
 			return mysqlOperationError(MySQLBackupClusterUnhealthy)
 		}
 		_ = os.Remove(secret)
-		result, verifyErr := s.remote.Run(ctx, server, routerMaintenanceHealthCommand(work, routerPortForEndpoint(router.Endpoint)))
+		result, verifyErr := s.remote.Run(ctx, server, routerReadWriteVerificationCommand(work, routerPortForEndpoint(router.Endpoint), schema))
 		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 		_, cleanupErr := s.remote.Run(cleanupCtx, server, cleanupBackupCommand(work))
 		cancel()
@@ -422,6 +426,40 @@ func (s Service) verifyMaintenanceClusterHealth(ctx context.Context, cluster *re
 		}
 	}
 	return nil
+}
+
+func (s Service) maintenanceRouterVerificationSchema(ctx context.Context, primary clusterMemberNode, credential store.Credential, taskID string) (string, error) {
+	work := mysqlBackupWorkDir(taskID + "-maintenance-schema")
+	if _, err := s.remote.Run(ctx, primary.server, bootstrapBackupWorkCommand(work)); err != nil {
+		return "", err
+	}
+	defer func() {
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		defer cancel()
+		_, _ = s.remote.Run(cleanupCtx, primary.server, cleanupBackupCommand(work))
+	}()
+	secret, err := writeMySQLSecretContext(credential, instancePort(primary.instance))
+	if err != nil {
+		return "", err
+	}
+	defer os.Remove(secret)
+	if err := s.remote.UploadFile(ctx, primary.server, secret, path.Join(work, "secret-context.cnf"), 0o600); err != nil {
+		return "", err
+	}
+	result, err := s.remote.Run(ctx, primary.server, inspectBackupCommand(work, instancePort(primary.instance)))
+	if err != nil {
+		return "", err
+	}
+	inspection, err := parseMySQLBackupInspection(result.Stdout)
+	if err != nil {
+		return "", err
+	}
+	for _, schema := range inspection.Schemas {
+		if strictSchemaName.MatchString(schema) && !isSystemSchema(schema) {
+			return schema, nil
+		}
+	}
+	return "", errors.New("no business schema for router maintenance verification")
 }
 
 func routerPortForEndpoint(endpoint string) int {
@@ -447,12 +485,6 @@ func routerVerificationSchema(schemas []string) (string, bool) {
 
 func routerReadWriteVerificationCommand(work string, port int, schema string) string {
 	mysqlsh := path.Join(mysqlInstallRoot, "mysql-shell", "bin", "mysqlsh")
-	query := "USE `" + schema + "`; CREATE TEMPORARY TABLE aifar_router_verify(v INT NOT NULL); INSERT INTO aifar_router_verify VALUES (1); SELECT '__AIFAR_ROUTER_WRITE__',COUNT(*) FROM aifar_router_verify; SELECT '__AIFAR_ROUTER_READ__',v FROM aifar_router_verify"
-	return "set -eu; test -x " + installerkit.ShellQuote(mysqlsh) + "; " + installerkit.ShellQuote(mysqlsh) + " --defaults-file=" + installerkit.ShellQuote(path.Join(work, "secret-context.cnf")) + " --sql --raw --skip-column-names --host=127.0.0.1 --port=" + strconv.Itoa(port) + " --execute " + installerkit.ShellQuote(query)
-}
-
-func routerMaintenanceHealthCommand(work string, port int) string {
-	mysqlsh := path.Join(mysqlInstallRoot, "mysql-shell", "bin", "mysqlsh")
-	query := "START TRANSACTION READ WRITE; SELECT '__AIFAR_ROUTER_WRITE__',1; COMMIT; SELECT '__AIFAR_ROUTER_READ__',1"
+	query := "USE `" + schema + "`; START TRANSACTION READ WRITE; CREATE TEMPORARY TABLE aifar_router_verify(v INT NOT NULL); INSERT INTO aifar_router_verify VALUES (1); SELECT '__AIFAR_ROUTER_WRITE__',COUNT(*) FROM aifar_router_verify; SELECT '__AIFAR_ROUTER_READ__',v FROM aifar_router_verify; ROLLBACK"
 	return "set -eu; test -x " + installerkit.ShellQuote(mysqlsh) + "; " + installerkit.ShellQuote(mysqlsh) + " --defaults-file=" + installerkit.ShellQuote(path.Join(work, "secret-context.cnf")) + " --sql --raw --skip-column-names --host=127.0.0.1 --port=" + strconv.Itoa(port) + " --execute " + installerkit.ShellQuote(query)
 }

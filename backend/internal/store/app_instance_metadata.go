@@ -1,6 +1,7 @@
 package store
 
 import (
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -25,7 +26,12 @@ type MySQLMaintenanceMarker struct {
 	RecordedAt   time.Time `json:"recordedAt"`
 }
 
-var controlledMaintenanceID = regexp.MustCompile(`^(?:app|backup|tsk|cluster)_[0-9a-f]{24}$`)
+var (
+	controlledMaintenanceInstanceID = regexp.MustCompile(`^app_[0-9a-f]{24}$`)
+	controlledMaintenanceBackupID   = regexp.MustCompile(`^backup_[0-9a-f]{24}$`)
+	controlledMaintenanceTaskID     = regexp.MustCompile(`^tsk_[0-9a-f]{24}$`)
+	controlledMaintenanceClusterID  = regexp.MustCompile(`^cluster_[0-9a-f]{24}$`)
+)
 
 // ParseMySQLMaintenanceMarker validates only the nested marker. Other
 // metadata belongs to the instance and intentionally remains forward-compatible.
@@ -57,13 +63,13 @@ func ParseMySQLMaintenanceMarker(raw string) (MySQLMaintenanceMarker, bool, erro
 func validateMySQLMaintenanceMarker(marker MySQLMaintenanceMarker) error {
 	if marker.Version != 1 || marker.State != "required" || marker.Reason != "restore_incomplete" ||
 		(marker.Scope != "standalone" && marker.Scope != "cluster") ||
-		!controlledMaintenanceID.MatchString(marker.BackupID) || !controlledMaintenanceID.MatchString(marker.TaskID) ||
+		!controlledMaintenanceBackupID.MatchString(marker.BackupID) || !controlledMaintenanceTaskID.MatchString(marker.TaskID) ||
 		(marker.RestorePhase != "schema_mutation_started" && marker.RestorePhase != "load_complete") ||
 		marker.RecordedAt.IsZero() || marker.RecordedAt.Location() != time.UTC {
 		return errors.New("invalid MySQL maintenance marker")
 	}
 	if marker.Scope == "cluster" {
-		if !controlledMaintenanceID.MatchString(marker.ClusterID) {
+		if !controlledMaintenanceClusterID.MatchString(marker.ClusterID) {
 			return errors.New("invalid MySQL maintenance cluster marker")
 		}
 	} else if marker.ClusterID != "" {
@@ -101,7 +107,7 @@ func (s *Store) mutateMySQLMaintenance(instanceIDs []string, marker MySQLMainten
 		return errors.New("MySQL maintenance instances are required")
 	}
 	for i, id := range ids {
-		if !controlledMaintenanceID.MatchString(id) || (i > 0 && ids[i-1] == id) {
+		if !controlledMaintenanceInstanceID.MatchString(id) || (i > 0 && ids[i-1] == id) {
 			return errors.New("invalid MySQL maintenance instance ID")
 		}
 	}
@@ -127,6 +133,11 @@ func (s *Store) mutateMySQLMaintenance(instanceIDs []string, marker MySQLMainten
 	if marker.Scope == "cluster" && len(instances) != 3 {
 		return errors.New("MySQL maintenance cluster must have exactly three instances")
 	}
+	if marker.Scope == "cluster" {
+		if err := validateAuthoritativeMySQLMaintenanceClusterTx(tx, ids, instances, marker.ClusterID); err != nil {
+			return err
+		}
+	}
 	if marker.Scope == "standalone" && len(instances) != 1 {
 		return errors.New("MySQL maintenance standalone must have one instance")
 	}
@@ -146,7 +157,7 @@ func (s *Store) mutateMySQLMaintenance(instanceIDs []string, marker MySQLMainten
 			}
 			metadata["mysqlMaintenance"], _ = json.Marshal(marker)
 		case "advance":
-			if !present || !sameMySQLMaintenanceOwner(existing, marker) {
+			if !present || !sameMySQLMaintenanceMarker(existing, marker) {
 				return errors.New("MySQL maintenance marker ownership changed")
 			}
 			existing.RestorePhase = phase
@@ -168,6 +179,42 @@ func (s *Store) mutateMySQLMaintenance(instanceIDs []string, marker MySQLMainten
 		}
 	}
 	return tx.Commit()
+}
+
+func validateAuthoritativeMySQLMaintenanceClusterTx(tx *sql.Tx, ids []string, instances []AppInstance, clusterID string) error {
+	var app, topology string
+	if err := tx.QueryRow(`select app,topology from app_clusters where id=?`, clusterID).Scan(&app, &topology); err != nil || app != "mysql" || strings.TrimSpace(topology) != "innodb-cluster" {
+		return errors.New("MySQL maintenance authoritative cluster changed")
+	}
+	rows, err := tx.Query(`select instance_id,coalesce(server_id,'') from app_cluster_members where cluster_id=? order by instance_id`, clusterID)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	members := map[string]string{}
+	for rows.Next() {
+		var instanceID, serverID string
+		if err := rows.Scan(&instanceID, &serverID); err != nil {
+			return err
+		}
+		if _, duplicate := members[instanceID]; duplicate {
+			return errors.New("MySQL maintenance authoritative member duplicate")
+		}
+		members[instanceID] = serverID
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if len(members) != 3 || len(ids) != 3 {
+		return errors.New("MySQL maintenance authoritative member count changed")
+	}
+	for _, instance := range instances {
+		serverID, present := members[instance.ID]
+		if !present || serverID != instance.ServerID {
+			return errors.New("MySQL maintenance authoritative member ownership changed")
+		}
+	}
+	return nil
 }
 
 func validateMaintenanceTopology(instance AppInstance, marker MySQLMaintenanceMarker) error {

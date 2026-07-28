@@ -15,6 +15,7 @@ func TestMySQLMaintenanceMarkerLifecycleIsAtomic(t *testing.T) {
 	first := saveMaintenanceInstance(t, db, `{"clusterId":"cluster_1234567890abcdef12345678"}`)
 	second := saveMaintenanceInstance(t, db, `{"clusterId":"cluster_1234567890abcdef12345678"}`)
 	third := saveMaintenanceInstance(t, db, `{"clusterId":"cluster_1234567890abcdef12345678"}`)
+	saveAuthoritativeMaintenanceCluster(t, db, "cluster_1234567890abcdef12345678", first, second, third)
 	marker := MySQLMaintenanceMarker{Version: 1, State: "required", Reason: "restore_incomplete", Scope: "cluster", ClusterID: "cluster_1234567890abcdef12345678", BackupID: "backup_1234567890abcdef12345678", TaskID: "tsk_1234567890abcdef12345678", RestorePhase: "schema_mutation_started", RecordedAt: time.Now().UTC()}
 	if err := db.SetMySQLMaintenance([]string{first.ID, second.ID, third.ID}, marker); err != nil {
 		t.Fatalf("set: %v", err)
@@ -64,6 +65,53 @@ func TestMySQLMaintenanceRejectsMalformedAndDivergentMetadataWithoutPartialWrite
 	}
 }
 
+func TestMySQLMaintenanceClusterRequiresAuthoritativeThreeMembers(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "aifar.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	first := saveMaintenanceInstance(t, db, `{"clusterId":"cluster_1234567890abcdef12345678"}`)
+	second := saveMaintenanceInstance(t, db, `{"clusterId":"cluster_1234567890abcdef12345678"}`)
+	third := saveMaintenanceInstance(t, db, `{"clusterId":"cluster_1234567890abcdef12345678"}`)
+	if err := db.SetMySQLMaintenance([]string{first.ID, second.ID, third.ID}, validClusterMaintenanceMarker()); err == nil {
+		t.Fatal("expected missing authoritative app_cluster_members to reject marker write")
+	}
+	for _, id := range []string{first.ID, second.ID, third.ID} {
+		instance, getErr := db.GetAppInstance(id)
+		if getErr != nil {
+			t.Fatal(getErr)
+		}
+		if _, present, _ := ParseMySQLMaintenanceMarker(instance.Metadata); present {
+			t.Fatalf("partial marker persisted on %s", id)
+		}
+	}
+}
+
+func TestMySQLMaintenanceRejectsWrongFieldPrefixesAndAdvanceIdentityChanges(t *testing.T) {
+	badID := `{"mysqlMaintenance":{"version":1,"state":"required","reason":"restore_incomplete","scope":"standalone","backupId":"app_1234567890abcdef12345678","taskId":"backup_1234567890abcdef12345678","restorePhase":"schema_mutation_started","recordedAt":"2026-07-28T00:00:00Z"}}`
+	if _, _, err := ParseMySQLMaintenanceMarker(badID); err == nil {
+		t.Fatal("expected field-specific backup/task ID rejection")
+	}
+	db, err := Open(filepath.Join(t.TempDir(), "aifar.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	instance, err := db.SaveAppInstance(AppInstance{App: "mysql", Version: "8.0.36", ServerID: NewID("srv"), Status: "running", Topology: "standalone", Metadata: `{}`})
+	if err != nil {
+		t.Fatal(err)
+	}
+	marker := MySQLMaintenanceMarker{Version: 1, State: "required", Reason: "restore_incomplete", Scope: "standalone", BackupID: "backup_1234567890abcdef12345678", TaskID: "tsk_1234567890abcdef12345678", RestorePhase: "schema_mutation_started", RecordedAt: time.Date(2026, 7, 28, 0, 0, 0, 0, time.UTC)}
+	if err := db.SetMySQLMaintenance([]string{instance.ID}, marker); err != nil {
+		t.Fatal(err)
+	}
+	marker.RecordedAt = marker.RecordedAt.Add(time.Second)
+	if err := db.AdvanceMySQLMaintenance([]string{instance.ID}, marker, "load_complete"); err == nil {
+		t.Fatal("expected advance to reject changed marker timestamp")
+	}
+}
+
 func saveMaintenanceInstance(t *testing.T, db *Store, metadata string) AppInstance {
 	t.Helper()
 	instance, err := db.SaveAppInstance(AppInstance{App: "mysql", Version: "8.0.36", ServerID: NewID("srv"), Status: "running", Topology: "innodb-cluster", Metadata: metadata})
@@ -75,4 +123,17 @@ func saveMaintenanceInstance(t *testing.T, db *Store, metadata string) AppInstan
 
 func validClusterMaintenanceMarker() MySQLMaintenanceMarker {
 	return MySQLMaintenanceMarker{Version: 1, State: "required", Reason: "restore_incomplete", Scope: "cluster", ClusterID: "cluster_1234567890abcdef12345678", BackupID: "backup_1234567890abcdef12345678", TaskID: "tsk_1234567890abcdef12345678", RestorePhase: "schema_mutation_started", RecordedAt: time.Date(2026, 7, 28, 0, 0, 0, 0, time.UTC)}
+}
+
+func saveAuthoritativeMaintenanceCluster(t *testing.T, db *Store, clusterID string, instances ...AppInstance) {
+	t.Helper()
+	cluster, err := db.SaveAppCluster(AppCluster{ID: clusterID, App: "mysql", Name: "maintenance", Topology: "innodb-cluster", Status: "active"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, instance := range instances {
+		if _, err := db.SaveAppClusterMember(AppClusterMember{ClusterID: cluster.ID, InstanceID: instance.ID, ServerID: instance.ServerID, Role: "SECONDARY", Status: "ONLINE"}); err != nil {
+			t.Fatal(err)
+		}
+	}
 }

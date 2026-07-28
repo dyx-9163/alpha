@@ -70,6 +70,10 @@ func (a *API) startMySQLCluster(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "MYSQL_CLUSTER_REQUIRED", i18n.Text(lang, "api.mysqlClusterRequired"), map[string]any{"instanceId": id})
 			return
 		}
+		if code := a.mysqlMaintenanceGate(instance); code != "" {
+			writeError(w, http.StatusConflict, code, i18n.MySQLBackupErrorText(lang, code), map[string]any{"instanceId": instance.ID})
+			return
+		}
 		key := mysqlClusterKey(instance)
 		if clusterKey == "" {
 			clusterKey = key
@@ -122,7 +126,13 @@ func (a *API) startMySQLCluster(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "MYSQL_CLUSTER_START_PLAN_STORE_FAILED", err.Error(), map[string]any{"instances": ids})
 		return
 	}
-	locks, ok := a.acquireTaskOperationLocks(w, lang, task, appMutationOperationLockSpecs("mysql-cluster-start", instances))
+	lockSpecs, lockErr := validatedAppMutationOperationLockSpecs("mysql-cluster-start", instances)
+	if lockErr != nil {
+		_ = a.store.DeleteTask(task.ID)
+		writeError(w, http.StatusConflict, "MYSQL_BACKUP_CLUSTER_UNHEALTHY", i18n.MySQLBackupErrorText(lang, "MYSQL_BACKUP_CLUSTER_UNHEALTHY"), nil)
+		return
+	}
+	locks, ok := a.acquireTaskOperationLocks(w, lang, task, lockSpecs)
 	if !ok {
 		return
 	}

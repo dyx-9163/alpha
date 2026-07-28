@@ -14,6 +14,8 @@ import (
 type maintenanceStore interface {
 	GetAppInstance(string) (store.AppInstance, error)
 	ListAppInstances() ([]store.AppInstance, error)
+	GetAppCluster(string) (store.AppCluster, error)
+	ListAppClusterMembers(string) ([]store.AppClusterMember, error)
 	SetMySQLMaintenance([]string, store.MySQLMaintenanceMarker) error
 	AdvanceMySQLMaintenance([]string, store.MySQLMaintenanceMarker, string) error
 	ClearMySQLMaintenance([]string, store.MySQLMaintenanceMarker) error
@@ -68,15 +70,31 @@ func maintenanceInstances(data maintenanceStore, representative store.AppInstanc
 	if clusterID == "" {
 		return nil, errors.New("missing MySQL maintenance cluster ID")
 	}
+	cluster, err := data.GetAppCluster(clusterID)
+	if err != nil || cluster.App != "mysql" || instanceTopology(store.AppInstance{Topology: cluster.Topology}) != "innodb-cluster" {
+		return nil, errors.New("invalid authoritative MySQL maintenance cluster")
+	}
+	authoritative, err := data.ListAppClusterMembers(clusterID)
+	if err != nil || len(authoritative) != 3 {
+		return nil, errors.New("invalid authoritative MySQL maintenance cluster members")
+	}
 	all, err := data.ListAppInstances()
 	if err != nil {
 		return nil, err
 	}
-	members := make([]store.AppInstance, 0, 3)
+	byID := map[string]store.AppInstance{}
 	for _, candidate := range all {
-		if candidate.App == "mysql" && instanceTopology(candidate) == "innodb-cluster" && clusterIDFromInstance(candidate) == clusterID {
-			members = append(members, candidate)
+		byID[candidate.ID] = candidate
+	}
+	members := make([]store.AppInstance, 0, 3)
+	seenServers := map[string]bool{}
+	for _, member := range authoritative {
+		candidate, found := byID[member.InstanceID]
+		if !found || candidate.App != "mysql" || instanceTopology(candidate) != "innodb-cluster" || clusterIDFromInstance(candidate) != clusterID || candidate.ServerID != member.ServerID || seenServers[candidate.ServerID] {
+			return nil, errors.New("invalid authoritative MySQL maintenance member ownership")
 		}
+		seenServers[candidate.ServerID] = true
+		members = append(members, candidate)
 	}
 	if len(members) != 3 {
 		return nil, errors.New("invalid MySQL maintenance cluster membership")
@@ -246,7 +264,15 @@ func (m Module) ClearMaintenance(ctx context.Context, instance store.AppInstance
 		if getErr != nil {
 			return localizedMySQLOperationError(language, MySQLMaintenanceStateInvalid)
 		}
-		probe, probeErr := m.service.probeMySQLRuntime(ctx, server, fresh, m.defaultPassword, log)
+		credentials, available := m.service.store.(backupStore)
+		if !available {
+			return localizedMySQLOperationError(language, MySQLMaintenanceStateInvalid)
+		}
+		credential, credentialErr := credentials.GetBoundCredential(fresh.ID, "admin", true)
+		if credentialErr != nil || credential.Status != "active" || credential.Kind != "mysql" || strings.TrimSpace(credential.Secret["password"]) == "" {
+			return localizedMySQLOperationError(language, MySQLMaintenanceStateInvalid)
+		}
+		probe, probeErr := m.service.probeMySQLRuntime(ctx, server, fresh, credential.Secret["password"], log)
 		if probeErr != nil || !probe.pingRunning() {
 			return localizedMySQLOperationError(language, MySQLMaintenanceStateInvalid)
 		}

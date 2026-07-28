@@ -229,6 +229,10 @@ func (a *API) deleteAppInstances(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "INSTANCE_SERVER_REQUIRED", i18n.Text(lang, "api.instanceServerRequired"), map[string]any{"instanceId": id})
 			return
 		}
+		if code := a.mysqlMaintenanceGate(instance); code != "" {
+			writeError(w, http.StatusConflict, code, i18n.MySQLBackupErrorText(lang, code), map[string]any{"instanceId": instance.ID})
+			return
+		}
 		server, err := a.store.GetServer(instance.ServerID, true)
 		if err != nil {
 			respond(w, nil, err)
@@ -312,7 +316,13 @@ func (a *API) deleteAppInstances(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "DELETE_PLAN_STORE_FAILED", err.Error(), map[string]any{"target": target})
 		return
 	}
-	locks, ok := a.acquireTaskOperationLocks(w, lang, task, appMutationOperationLockSpecs("delete", selectedInstances))
+	lockSpecs, lockErr := validatedAppMutationOperationLockSpecs("delete", selectedInstances)
+	if lockErr != nil {
+		_ = a.store.DeleteTask(task.ID)
+		writeError(w, http.StatusConflict, mysqlapp.MySQLBackupClusterUnhealthy, i18n.MySQLBackupErrorText(lang, mysqlapp.MySQLBackupClusterUnhealthy), nil)
+		return
+	}
+	locks, ok := a.acquireTaskOperationLocks(w, lang, task, lockSpecs)
 	if !ok {
 		return
 	}
