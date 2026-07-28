@@ -47,6 +47,26 @@ describe('AIFAR Runtime log viewport', () => {
     expect(viewport.runtimeLogBottomSpacer.value).toBe(0)
   })
 
+  it.each([
+    { scrollTop: Number.NaN, sequences: [0, 1, 2] },
+    { scrollTop: Number.POSITIVE_INFINITY, sequences: [0, 1, 2] },
+    { scrollTop: -20, sequences: [0, 1, 2] },
+    { scrollTop: 1_000_000, sequences: [17, 18, 19] }
+  ])('keeps a finite visible window for invalid scroll offset $scrollTop', ({ scrollTop, sequences }) => {
+    const viewport = useAifarRuntimeLogViewport(computed(() => rows(20)), {
+      rowHeight: 10,
+      visibleCount: 3
+    })
+
+    viewport.handleRuntimeLogScroll({ target: { scrollTop } } as unknown as Event)
+
+    expect(viewport.runtimeLogVirtualRows.value.map((row) => row.sequence)).toEqual(sequences)
+    expect(Number.isFinite(viewport.runtimeLogTopSpacer.value)).toBe(true)
+    expect(Number.isFinite(viewport.runtimeLogBottomSpacer.value)).toBe(true)
+    expect(viewport.runtimeLogTopSpacer.value).toBeGreaterThanOrEqual(0)
+    expect(viewport.runtimeLogBottomSpacer.value).toBeGreaterThanOrEqual(0)
+  })
+
   it('resets the tracked scroll offset when the event target is absent', () => {
     const viewport = useAifarRuntimeLogViewport(computed(() => rows(3)), {
       rowHeight: 10,
@@ -95,6 +115,30 @@ describe('AIFAR Runtime log viewport', () => {
     expect(frames).toBe(2)
     expect(scrollTop).toBe(600)
     expect(viewport.runtimeLogBottomSpacer.value).toBe(0)
+  })
+
+  it('resets both tracked and mounted viewport scroll positions', () => {
+    let scrollTop = 80
+    const element = {
+      get scrollTop() {
+        return scrollTop
+      },
+      set scrollTop(value: number) {
+        scrollTop = value
+      }
+    } as unknown as HTMLElement
+    const viewport = useAifarRuntimeLogViewport(computed(() => rows(20)), {
+      rowHeight: 10,
+      visibleCount: 3
+    })
+    viewport.runtimeLogViewport.value = element
+    viewport.handleRuntimeLogScroll({ target: element } as unknown as Event)
+
+    viewport.resetRuntimeLogViewport()
+
+    expect(viewport.runtimeLogScrollTop.value).toBe(0)
+    expect(scrollTop).toBe(0)
+    expect(viewport.runtimeLogVirtualRows.value.map((row) => row.sequence)).toEqual([0, 1, 2])
   })
 })
 

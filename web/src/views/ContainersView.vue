@@ -442,12 +442,12 @@ const filteredRuntimeLogRows = computed<RuntimeLogRow[]>(() => {
   })
 })
 const {
-  runtimeLogScrollTop,
   runtimeLogViewport,
   runtimeLogVirtualRows,
   runtimeLogTopSpacer,
   runtimeLogBottomSpacer,
   handleRuntimeLogScroll,
+  resetRuntimeLogViewport,
   scrollRuntimeLogsToBottom
 } = useAifarRuntimeLogViewport(filteredRuntimeLogRows, {
   rowHeight: runtimeLogRowHeight,
@@ -890,7 +890,7 @@ function resetRuntimeLogView() {
   runtimeLogDroppedRows.value = 0
   runtimeLogSequence = 0
   runtimeLogParseContexts.clear()
-  runtimeLogScrollTop.value = 0
+  resetRuntimeLogViewport()
   runtimeLogLastDataAt.value = ''
 }
 
@@ -996,7 +996,7 @@ function clearRuntimeLogView() {
     pods: runtimeLogGroups.value.map((pod) => ({ ...pod, logs: [], lineCount: 0 }))
   }
   runtimeLogDroppedRows.value = 0
-  runtimeLogScrollTop.value = 0
+  resetRuntimeLogViewport()
   runtimeLogParseContexts.clear()
   if (shouldRestart) {
     openRuntimeLogStream(true)
