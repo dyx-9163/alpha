@@ -638,37 +638,81 @@ func TestMySQLBackupVerifyCreatesLockedAuditedWorkerWithExactSteps(t *testing.T)
 	}
 }
 
-func TestMySQLBackupVerifyAndDeleteRejectClusterRecordsBeforeTakingInstanceLock(t *testing.T) {
-	// Production break caught: Task 7 must fail closed for cluster records instead of serializing them with a standalone instance lock.
-	for _, method := range []string{http.MethodPost, http.MethodDelete} {
-		t.Run(method, func(t *testing.T) {
-			api, db, secret := newAuthzTestAPI(t)
-			_, instance := saveMySQLBackupTarget(t, db, "innodb-cluster", "mysql_cluster_1234567890abcdef12345678")
-			api.cfg.MySQLBackupDir = filepath.Join(t.TempDir(), "mysql-backups")
-			backup, _ := saveCommittedMySQLBackup(t, db, api.cfg.MySQLBackupDir, instance, "cluster")
-			if method == http.MethodDelete {
-				_, _ = saveCommittedMySQLBackup(t, db, api.cfg.MySQLBackupDir, instance, "cluster-survivor")
-			}
-			token := issueTestToken(t, db, secret, "operator", "operator")
-			url := "/api/v2/apps/backups/" + backup.ID
-			if method == http.MethodPost {
-				url += "/verify"
-			}
-			req := httptest.NewRequest(method, url, nil)
-			req.Header.Set("Authorization", "Bearer "+token)
-			rec := httptest.NewRecorder()
-			api.Router().ServeHTTP(rec, req)
-			if rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), "MYSQL_BACKUP_STANDALONE_REQUIRED") {
-				t.Fatalf("%s cluster backup status=%d body=%s", method, rec.Code, rec.Body.String())
-			}
-			locks, err := db.ListOperationLocks("app-instance", instance.ID, false)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if len(locks) != 0 {
-				t.Fatalf("%s acquired wrong instance lock: %+v", method, locks)
-			}
-		})
+func TestMySQLBackupDeleteRejectsClusterRecordsBeforeTakingInstanceLock(t *testing.T) {
+	api, db, secret := newAuthzTestAPI(t)
+	_, instance := saveMySQLBackupTarget(t, db, "innodb-cluster", "mysql_cluster_1234567890abcdef12345678")
+	api.cfg.MySQLBackupDir = filepath.Join(t.TempDir(), "mysql-backups")
+	backup, _ := saveCommittedMySQLBackup(t, db, api.cfg.MySQLBackupDir, instance, "cluster")
+	_, _ = saveCommittedMySQLBackup(t, db, api.cfg.MySQLBackupDir, instance, "cluster-survivor")
+	token := issueTestToken(t, db, secret, "operator", "operator")
+	req := httptest.NewRequest(http.MethodDelete, "/api/v2/apps/backups/"+backup.ID, nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	rec := httptest.NewRecorder()
+	api.Router().ServeHTTP(rec, req)
+	if rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), "MYSQL_BACKUP_STANDALONE_REQUIRED") {
+		t.Fatalf("cluster backup delete status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	locks, err := db.ListOperationLocks("app-instance", instance.ID, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(locks) != 0 {
+		t.Fatalf("delete acquired wrong instance lock: %+v", locks)
+	}
+}
+
+func TestMySQLClusterBackupVerifyUsesAuthoritativeClusterLockAndPublishesEligibility(t *testing.T) {
+	api, db, secret := newAuthzTestAPI(t)
+	clusterID := "cluster_verify_1234567890abcdef12345678"
+	if _, err := db.SaveAppCluster(store.AppCluster{ID: clusterID, App: "mysql", Name: "verify-cluster", Topology: "innodb-cluster", Status: "active"}); err != nil {
+		t.Fatal(err)
+	}
+	instances := make([]store.AppInstance, 0, 3)
+	for index := 0; index < 3; index++ {
+		server, err := db.SaveServer(store.Server{Name: fmt.Sprintf("mysql-%d", index+1), Host: fmt.Sprintf("10.0.0.%d", index+21), Username: "root"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		instance, err := db.SaveAppInstance(store.AppInstance{App: "mysql", Version: "8.0.36", ServerID: server.ID, Status: "installed", Topology: "innodb-cluster", Metadata: `{"clusterId":"` + clusterID + `","port":3306}`})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.SaveAppClusterMember(store.AppClusterMember{ClusterID: clusterID, InstanceID: instance.ID, ServerID: server.ID, Role: "SECONDARY", Status: "active"}); err != nil {
+			t.Fatal(err)
+		}
+		instances = append(instances, instance)
+	}
+	api.cfg.MySQLBackupDir = filepath.Join(t.TempDir(), "mysql-backups")
+	backup, _ := saveCommittedMySQLBackup(t, db, api.cfg.MySQLBackupDir, instances[0], "cluster-verify")
+	backup.Metadata = `{"phase":"success","topology":"innodb-cluster","clusterId":"` + clusterID + `","manifestVersion":2}`
+	if _, err := db.SaveAppBackup(backup); err != nil {
+		t.Fatal(err)
+	}
+	token := issueTestToken(t, db, secret, "operator", "operator")
+	req := httptest.NewRequest(http.MethodPost, "/api/v2/apps/backups/"+backup.ID+"/verify", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	rec := httptest.NewRecorder()
+	api.Router().ServeHTTP(rec, req)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("cluster verify status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var body struct {
+		TaskID string `json:"taskId"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil || body.TaskID == "" {
+		t.Fatalf("cluster verify response=%s err=%v", rec.Body.String(), err)
+	}
+	locks, err := db.ListOperationLocks("app-cluster", clusterID, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(locks) != 1 || locks[0].OwnerTaskID != body.TaskID || locks[0].Operation != operationLockMutation {
+		t.Fatalf("cluster verify lock=%+v", locks)
+	}
+	waitForTaskStatus(t, db, body.TaskID, "success")
+	verified, err := db.GetAppBackup(backup.ID)
+	if err != nil || !strings.Contains(verified.Metadata, `"verificationResult":"success"`) {
+		t.Fatalf("cluster verification did not publish eligibility: backup=%+v err=%v", verified, err)
 	}
 }
 

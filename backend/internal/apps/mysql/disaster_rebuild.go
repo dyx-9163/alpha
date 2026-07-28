@@ -925,13 +925,7 @@ func (s Service) prepareDisasterScripts(ctx context.Context, state *disasterExec
 			_ = cleanup(false)
 			return nil, cleanup, err
 		}
-		secret, err := writeMySQLSecretContext(state.credentials[member.instance.ID], instancePort(member.instance))
-		if err == nil {
-			err = s.remote.UploadFile(ctx, member.server, secret, path.Join(work, "secret-context.cnf"), 0o600)
-		}
-		if secret != "" {
-			_ = os.Remove(secret)
-		}
+		err = uploadMySQLCredentialContext(ctx, s.remote, member.server, state.credentials[member.instance.ID], instancePort(member.instance), path.Join(work, "secret-context.cnf"))
 		if err != nil {
 			_ = cleanup(false)
 			return nil, cleanup, err
@@ -941,7 +935,7 @@ func (s Service) prepareDisasterScripts(ctx context.Context, state *disasterExec
 			err = s.remote.UploadFile(ctx, member.server, adminInit, path.Join(work, "admin-init.sql"), 0o600)
 		}
 		if adminInit != "" {
-			_ = os.Remove(adminInit)
+			err = errors.Join(err, removeMySQLCredentialContext(adminInit))
 		}
 		if err != nil {
 			_ = cleanup(false)
@@ -990,12 +984,7 @@ func (s Service) loadDisasterSeed(ctx context.Context, state *disasterExecutionS
 	if _, err := s.remote.Run(ctx, state.seed.server, bootstrapBackupWorkCommand(work)); err != nil {
 		return localizedMySQLOperationError(language, MySQLRestoreIncomplete)
 	}
-	secret, err := writeMySQLSecretContext(state.credentials[state.seed.instance.ID], instancePort(state.seed.instance))
-	if err != nil {
-		return localizedMySQLOperationError(language, MySQLCredentialUnavailable)
-	}
-	defer os.Remove(secret)
-	if err := s.remote.UploadFile(ctx, state.seed.server, secret, path.Join(work, "secret-context.cnf"), 0o600); err != nil {
+	if err := uploadMySQLCredentialContext(ctx, s.remote, state.seed.server, state.credentials[state.seed.instance.ID], instancePort(state.seed.instance), path.Join(work, "secret-context.cnf")); err != nil {
 		return localizedMySQLOperationError(language, MySQLCredentialUnavailable)
 	}
 	if err := s.remote.UploadFile(ctx, state.seed.server, state.repositoryPath(state.backup), path.Join(work, "dump.tar"), 0o600); err != nil {

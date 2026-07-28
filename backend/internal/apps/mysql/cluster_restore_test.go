@@ -101,6 +101,20 @@ func TestBackupInnoDBClusterUsesRuntimeOnlinePrimaryAndRecordsMembership(t *test
 	}
 }
 
+func TestBackupInnoDBClusterCredentialWorkCleanupFailureStopsBeforeDump(t *testing.T) {
+	instances, servers := healthyClusterRequestFixtures()
+	data := newClusterBackupFixture(t, instances, servers)
+	remote := &clusterBackupRemote{backupFakeRemote: newBackupFakeRemote(), runtime: healthyClusterRuntime(servers), cleanupFailAt: 1}
+	module := NewModule(data, remote)
+	request := registry.BackupRequest{Instance: instances[1], Instances: instances, Servers: servers, RepositoryDir: t.TempDir(), KeepLast: 2, Parameters: map[string]any{"threads": 4}}
+	if err := module.Backup(context.Background(), request, registry.RunContext{TaskID: "tsk_dddddddddddddddddddddddd", Log: &backupRecorder{}}); err == nil {
+		t.Fatal("cluster credential work cleanup failure published backup success")
+	}
+	if remote.dumpRuns != 0 || remote.cleanupCalls != 1 {
+		t.Fatalf("cleanup failure did not stop before dump: dumps=%d cleanupCalls=%d", remote.dumpRuns, remote.cleanupCalls)
+	}
+}
+
 // Production break caught: accepting any non-ONLINE, split, incomplete, or
 // duplicate-UUID runtime topology can dump a divergent member.
 func TestBackupInnoDBClusterRejectsUnhealthyRuntimeBeforeDump(t *testing.T) {
@@ -301,6 +315,38 @@ func TestClusterRestoreSuccessfulLifecycleCreatesOneClusterPreRestoreBackup(t *t
 		if status := recorder.stepStatus[step]; status != "success" {
 			t.Fatalf("step %s terminal status=%q", step, status)
 		}
+	}
+}
+
+func TestClusterRestoreRejectsSuccessWhenNoAuthoritativeRouterIsRecorded(t *testing.T) {
+	instances, servers := healthyClusterRequestFixtures()
+	data, request := newClusterRestoreFixture(t, instances, servers)
+	data.instances = data.instances[:len(data.instances)-1]
+	remote := &clusterRestoreRemote{
+		restoreFakeRemote: &restoreFakeRemote{inspect: standaloneInspection("aifar_business")},
+		runtimes:          []string{healthyClusterRuntime(servers), healthyClusterRuntime(servers), healthyClusterRuntime(servers)},
+	}
+	module := configuredClusterRestoreModule(data, remote)
+	recorder := &restoreProgressRecorder{}
+	err := module.Restore(context.Background(), request, registry.RunContext{TaskID: "tsk_eeeeeeeeeeeeeeeeeeeeeeee", Log: recorder})
+	assertClusterRestoreFailure(t, err, MySQLRestoreIncomplete, data, remote, recorder)
+	assertOneLogicalLoadWithBinlogEnabled(t, remote)
+}
+
+func TestClusterRestoreRouterCredentialCleanupFailureRetainsMaintenance(t *testing.T) {
+	instances, servers := healthyClusterRequestFixtures()
+	data, request := newClusterRestoreFixture(t, instances, servers)
+	remote := &clusterRestoreRemote{
+		restoreFakeRemote: &restoreFakeRemote{inspect: standaloneInspection("aifar_business")},
+		runtimes:          []string{healthyClusterRuntime(servers), healthyClusterRuntime(servers), healthyClusterRuntime(servers)},
+		cleanupFailAt:     4,
+	}
+	module := configuredClusterRestoreModule(data, remote)
+	recorder := &restoreProgressRecorder{}
+	err := module.Restore(context.Background(), request, registry.RunContext{TaskID: "tsk_ffffffffffffffffffffffff", Log: recorder})
+	assertClusterRestoreFailure(t, err, MySQLRestoreIncomplete, data, remote, recorder)
+	if remote.cleanupCalls < 4 {
+		t.Fatalf("router credential cleanup failure was not reached: calls=%d", remote.cleanupCalls)
 	}
 }
 
@@ -635,12 +681,20 @@ func (s *clusterBackupFixture) ListAppClusterMembers(id string) ([]store.AppClus
 
 type clusterBackupRemote struct {
 	*backupFakeRemote
-	runtime string
+	runtime       string
+	cleanupCalls  int
+	cleanupFailAt int
 }
 
 func (r *clusterBackupRemote) Run(ctx context.Context, server store.Server, command string) (adapter.CommandResult, error) {
 	if strings.Contains(command, "__AIFAR_CLUSTER__") {
 		return adapter.CommandResult{Stdout: r.runtime}, nil
+	}
+	if strings.Contains(command, "rm -rf --") {
+		r.cleanupCalls++
+		if r.cleanupCalls == r.cleanupFailAt {
+			return adapter.CommandResult{}, errors.New("injected credential work cleanup failure")
+		}
 	}
 	return r.backupFakeRemote.Run(ctx, server, command)
 }
@@ -653,9 +707,17 @@ type clusterRestoreRemote struct {
 	routerErr             error
 	routerOutput          string
 	logicalRestoreServers []string
+	cleanupCalls          int
+	cleanupFailAt         int
 }
 
 func (r *clusterRestoreRemote) Run(ctx context.Context, server store.Server, command string) (adapter.CommandResult, error) {
+	if strings.Contains(command, "rm -rf --") {
+		r.cleanupCalls++
+		if r.cleanupCalls == r.cleanupFailAt {
+			return adapter.CommandResult{}, errors.New("injected credential work cleanup failure")
+		}
+	}
 	if strings.Contains(command, "__AIFAR_CLUSTER__") {
 		r.commands = append(r.commands, command)
 		index := r.runtimeCalls

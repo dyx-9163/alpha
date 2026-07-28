@@ -15,6 +15,31 @@ import (
 
 const credentialTransportSentinel = `S3cr'et"$\:@{}[]!`
 
+func TestUploadMySQLCredentialContextFailsClosedWhenLocalRemovalFails(t *testing.T) {
+	remote := &fakeRemote{}
+	server := store.Server{ID: "srv-1", Host: "10.0.0.1"}
+	credential := store.Credential{Kind: "mysql", Status: "active", Username: "root", Secret: map[string]string{"password": credentialTransportSentinel}}
+	originalRemove := removeMySQLCredentialContextFile
+	var retained string
+	removeMySQLCredentialContextFile = func(name string) error {
+		retained = name
+		return errors.New("injected local removal failure " + credentialTransportSentinel)
+	}
+	defer func() {
+		removeMySQLCredentialContextFile = originalRemove
+		if retained != "" {
+			_ = originalRemove(retained)
+		}
+	}()
+	err := uploadMySQLCredentialContext(context.Background(), remote, server, credential, 3306, "/aifar/apps/mysql/_backup/task/secret-context.cnf")
+	if err == nil || strings.Contains(err.Error(), credentialTransportSentinel) {
+		t.Fatalf("local credential cleanup failure was not generic and fatal: %v", err)
+	}
+	if retained == "" {
+		t.Fatal("local credential context cleanup was not attempted")
+	}
+}
+
 func TestInstallerTransportsCredentialOnlyIn0600Context(t *testing.T) {
 	root := t.TempDir()
 	archive := filepath.Join(root, "mysql-aifar-8.0.36-official-bundle.tar")

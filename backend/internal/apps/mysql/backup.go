@@ -71,6 +71,7 @@ type standaloneBackupState struct {
 	archiveSize int64
 	remoteClean bool
 	committed   bool
+	published   bool
 	repository  *backuprepo.Repository
 	backupStore backupStore
 	remote      Remote
@@ -172,8 +173,18 @@ func (m Module) VerifyBackup(ctx context.Context, backupID, repositoryDir, langu
 			return localizedMySQLOperationError(language, MySQLBackupVerifyFailed)
 		}
 		instance, err := data.GetAppInstance(backup.InstanceID)
-		if err != nil || instance.App != "mysql" || instanceTopology(instance) != "standalone" || instance.ID != backup.InstanceID || instance.ServerID != backup.ServerID || backup.BackupType != "logical-full" {
-			return localizedMySQLOperationError(language, MySQLBackupStandaloneRequired)
+		if err != nil || instance.App != "mysql" || instance.ID != backup.InstanceID || instance.ServerID != backup.ServerID || backup.BackupType != "logical-full" {
+			return localizedMySQLOperationError(language, MySQLBackupVerifyNotAllowed)
+		}
+		switch instanceTopology(instance) {
+		case "standalone":
+		case "innodb-cluster":
+			clusterID := clusterIDFromInstance(instance)
+			if clusterID == "" || clusterIDFromBackup(backup) != clusterID {
+				return localizedMySQLOperationError(language, MySQLBackupClusterUnhealthy)
+			}
+		default:
+			return localizedMySQLOperationError(language, MySQLBackupVerifyNotAllowed)
 		}
 		return nil
 	}); err != nil {
@@ -349,7 +360,7 @@ func (s Service) backupStandaloneCore(ctx context.Context, req registry.BackupRe
 				}
 			}
 		}
-		if retErr == nil {
+		if retErr == nil || state.published {
 			return
 		}
 		if state.committed {
@@ -435,13 +446,8 @@ func (s Service) backupStandaloneCore(ctx context.Context, req registry.BackupRe
 		if _, err := s.remote.Run(ctx, state.server, bootstrapBackupWorkCommand(state.remoteWork)); err != nil {
 			return err
 		}
-		secretPath, err := writeMySQLSecretContext(credential, instancePort(req.Instance))
-		if err != nil {
+		if err := uploadMySQLCredentialContext(ctx, s.remote, state.server, credential, instancePort(req.Instance), path.Join(state.remoteWork, "secret-context.cnf")); err != nil {
 			return mysqlOperationError(MySQLCredentialUnavailable)
-		}
-		defer os.Remove(secretPath)
-		if err := s.remote.UploadFile(ctx, state.server, secretPath, path.Join(state.remoteWork, "secret-context.cnf"), 0o600); err != nil {
-			return err
 		}
 		result, err := s.remote.Run(ctx, state.server, inspectBackupCommand(state.remoteWork, instancePort(req.Instance)))
 		if err != nil {
@@ -603,6 +609,7 @@ func (s Service) backupStandaloneCore(ctx context.Context, req registry.BackupRe
 			return err
 		}
 		state.record = saved
+		state.published = true
 		if !execution.retention {
 			return nil
 		}
@@ -698,7 +705,7 @@ func (s Service) backupStandaloneCore(ctx context.Context, req registry.BackupRe
 		if run.Log != nil {
 			run.Log.Error("%s", copy.RemoteCleanupFailed)
 		}
-		return nil
+		return errors.New(copy.RemoteCleanupFailed)
 	}); err != nil {
 		return err
 	}

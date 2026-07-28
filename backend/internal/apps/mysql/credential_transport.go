@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path"
 	"strings"
 	"time"
 
@@ -151,4 +152,34 @@ func mysqlCredentialWorkCleanupCommand(work string) string {
 func mysqlRemoteCredentialValidationCommand(secretPath string) string {
 	quoted := installerkit.ShellQuote(secretPath)
 	return "set -eu; test -f " + quoted + "; test ! -L " + quoted + "; test \"$(stat -c '%u' " + quoted + ")\" = \"$(id -u)\"; test \"$(stat -c '%a' " + quoted + ")\" = 600"
+}
+
+func uploadMySQLCredentialContext(ctx context.Context, remote Remote, server store.Server, credential store.Credential, port int, remotePath string) error {
+	localPath, err := writeMySQLSecretContext(credential, port)
+	if err != nil {
+		return errors.New("unable to create MySQL credential context")
+	}
+	uploadErr := remote.UploadFile(ctx, server, localPath, remotePath, 0o600)
+	cleanupErr := removeMySQLCredentialContext(localPath)
+	if uploadErr != nil || cleanupErr != nil {
+		return errors.New("unable to transfer MySQL credential context")
+	}
+	return nil
+}
+
+func (s Service) withMySQLCredentialWork(ctx context.Context, server store.Server, work string, credential store.Credential, port int, run func() error) (retErr error) {
+	if _, err := s.remote.Run(ctx, server, bootstrapBackupWorkCommand(work)); err != nil {
+		return err
+	}
+	defer func() {
+		cleanupCtx, cancel := mysqlCredentialCleanupContext(ctx)
+		defer cancel()
+		if _, err := s.remote.Run(cleanupCtx, server, cleanupBackupCommand(work)); err != nil {
+			retErr = errors.Join(retErr, errors.New("unable to clean remote MySQL credential context"))
+		}
+	}()
+	if err := uploadMySQLCredentialContext(ctx, s.remote, server, credential, port, path.Join(work, "secret-context.cnf")); err != nil {
+		return err
+	}
+	return run()
 }

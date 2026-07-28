@@ -420,9 +420,20 @@ func (a *API) verifyMySQLBackup(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, mysqlapp.MySQLBackupStandaloneRequired, i18n.MySQLBackupErrorText(lang, mysqlapp.MySQLBackupStandaloneRequired), map[string]any{"backupId": backupID})
 		return
 	}
-	if instance.App != "mysql" || strings.ToLower(strings.TrimSpace(instance.Topology)) != "standalone" || instance.ID != backup.InstanceID || instance.ServerID != backup.ServerID || backup.BackupType != "logical-full" {
-		writeError(w, http.StatusConflict, mysqlapp.MySQLBackupStandaloneRequired, i18n.MySQLBackupErrorText(lang, mysqlapp.MySQLBackupStandaloneRequired), map[string]any{"backupId": backupID})
+	topology := appInstanceTopology(instance)
+	if instance.App != "mysql" || instance.ID != backup.InstanceID || instance.ServerID != backup.ServerID || backup.BackupType != "logical-full" || (topology != "standalone" && topology != "innodb-cluster") {
+		writeError(w, http.StatusConflict, mysqlapp.MySQLBackupVerifyNotAllowed, i18n.MySQLBackupErrorText(lang, mysqlapp.MySQLBackupVerifyNotAllowed), map[string]any{"backupId": backupID})
 		return
+	}
+	lockSpecs := appInstanceOperationLockSpecs("mysql-backup-verify", []store.AppInstance{instance})
+	if topology == "innodb-cluster" {
+		clusterID := mysqlClusterID(instance)
+		instances, _, targetErr := a.mysqlBackupTargets(instance)
+		if targetErr != nil || len(instances) != 3 || clusterID == "" || mysqlClusterIDFromBackup(backup) != clusterID {
+			writeError(w, http.StatusConflict, mysqlapp.MySQLBackupClusterUnhealthy, i18n.MySQLBackupErrorText(lang, mysqlapp.MySQLBackupClusterUnhealthy), map[string]any{"backupId": backupID})
+			return
+		}
+		lockSpecs = mysqlClusterOperationLockSpecs("mysql-backup-verify", instance)
 	}
 	actor := currentUser(r).Username
 	task, err := a.store.CreateTask(store.Task{Type: mysqlBackupVerifyTaskType, Target: backup.ID, Status: "pending", CreatedBy: actor})
@@ -438,7 +449,7 @@ func (a *API) verifyMySQLBackup(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "MYSQL_BACKUP_VERIFY_PLAN_STORE_FAILED", i18n.MySQLBackupErrorText(lang, "MYSQL_BACKUP_VERIFY_PLAN_STORE_FAILED"), map[string]any{"backupId": backupID})
 		return
 	}
-	locks, acquired := a.acquireTaskOperationLocks(w, lang, task, appInstanceOperationLockSpecs("mysql-backup-verify", []store.AppInstance{instance}))
+	locks, acquired := a.acquireTaskOperationLocks(w, lang, task, lockSpecs)
 	if !acquired {
 		return
 	}

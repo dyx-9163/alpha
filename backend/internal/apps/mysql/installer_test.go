@@ -200,11 +200,18 @@ func TestMySQLStandaloneScriptsRenderTemplates(t *testing.T) {
 		"information_schema.tables",
 		"PRIMARY KEY or a NOT NULL UNIQUE key",
 		"Group Replication table key validation failed",
+		"@@GLOBAL.gtid_executed",
+		"GTID_SUBSET(?, ?)",
+		"candidates.length !== 1",
+		"{dryRun: true}",
 		"rebootClusterFromCompleteOutage",
 	} {
 		if !strings.Contains(start, want) {
 			t.Fatalf("start script should include Group Replication key diagnostics %q:\n%s", want, start)
 		}
+	}
+	if strings.Contains(start, "force: true") || strings.Index(start, "{dryRun: true}") > strings.LastIndex(start, "rebootClusterFromCompleteOutage") {
+		t.Fatalf("start script must dry-run before mutation and must never force recovery:\n%s", start)
 	}
 	uninstall, err := uninstallStandaloneScript("8.0.36", "/aifar/apps/mysql", "/aifar/apps/mysql/8.0.36", 3307)
 	if err != nil {

@@ -415,19 +415,50 @@ func TestBackupVerifyServiceRejectsMalformedOrNonObjectMetadataWithoutWriting(t 
 	}
 }
 
-func TestBackupVerifyServiceRejectsNonStandaloneOwnershipBeforeRepositoryContact(t *testing.T) {
-	// Production break caught: Task 7 cannot verify cluster-owned records under a standalone instance lifecycle.
+func TestBackupVerifyServiceAcceptsMatchingClusterOwnershipWithoutMySQLContact(t *testing.T) {
 	module, data, _ := newStandaloneBackupModule(t)
 	data.instance.Topology = "innodb-cluster"
+	data.instance.Metadata = `{"clusterId":"cluster_verify_1234567890abcdef","port":3306}`
+	root := filepath.Join(t.TempDir(), "repository")
+	repository, err := backuprepo.New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
 	id := store.NewID("backup")
-	data.backups = []store.AppBackup{{ID: id, App: "mysql", InstanceID: data.instance.ID, ServerID: data.instance.ServerID, BackupType: "logical-full", Status: "success", Path: filepath.Join(t.TempDir(), "outside.tar"), Checksum: strings.Repeat("a", 64), Size: 1, Metadata: `{}`}}
+	paths, err := repository.Prepare(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	archive := []byte("cluster archive")
+	if err := os.WriteFile(paths.PartialArchive, archive, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	digest := fmt.Sprintf("%x", sha256.Sum256(archive))
+	if err := repository.Commit(paths, []byte(`{"backupId":"`+id+`","app":"mysql"}`), digest, int64(len(archive))); err != nil {
+		t.Fatal(err)
+	}
+	data.backups = []store.AppBackup{{ID: id, App: "mysql", InstanceID: data.instance.ID, ServerID: data.instance.ServerID, BackupType: "logical-full", Status: "success", Path: paths.Archive, Checksum: digest, Size: int64(len(archive)), Metadata: `{"phase":"success","topology":"innodb-cluster","clusterId":"cluster_verify_1234567890abcdef"}`}}
+	if err := module.VerifyBackup(context.Background(), id, root, "en", registry.RunContext{TaskID: "tsk_verify_1234567890abcdef", Log: &backupRecorder{}}); err != nil {
+		t.Fatal(err)
+	}
+	if data.credentialLoads != 0 {
+		t.Fatalf("cluster repository verification contacted MySQL %d time(s)", data.credentialLoads)
+	}
+}
+
+func TestBackupVerifyServiceRejectsClusterIdentityMismatchBeforeRepositoryContact(t *testing.T) {
+	module, data, _ := newStandaloneBackupModule(t)
+	data.instance.Topology = "innodb-cluster"
+	data.instance.Metadata = `{"clusterId":"cluster_current_1234567890abcdef"}`
+	id := store.NewID("backup")
+	data.backups = []store.AppBackup{{ID: id, App: "mysql", InstanceID: data.instance.ID, ServerID: data.instance.ServerID, BackupType: "logical-full", Status: "success", Path: filepath.Join(t.TempDir(), "outside.tar"), Checksum: strings.Repeat("a", 64), Size: 1, Metadata: `{"clusterId":"cluster_other_1234567890abcdef"}`}}
 	err := module.VerifyBackup(context.Background(), id, filepath.Join(t.TempDir(), "missing-repository"), "en", registry.RunContext{TaskID: "tsk_verify_1234567890abcdef", Log: &backupRecorder{}})
 	var operationErr *MySQLOperationError
-	if !errors.As(err, &operationErr) || operationErr.Code != MySQLBackupStandaloneRequired {
-		t.Fatalf("error=%v, want %s", err, MySQLBackupStandaloneRequired)
+	if !errors.As(err, &operationErr) || operationErr.Code != MySQLBackupClusterUnhealthy {
+		t.Fatalf("error=%v, want %s", err, MySQLBackupClusterUnhealthy)
 	}
 	if data.saveCalls != 0 {
-		t.Fatalf("non-standalone verification wrote %d records", data.saveCalls)
+		t.Fatalf("mismatched cluster verification wrote %d records", data.saveCalls)
 	}
 }
 
@@ -498,13 +529,13 @@ func TestBackupStandaloneRetainsFailedRecordWithoutFinalArchive(t *testing.T) {
 	}
 }
 
-func TestBackupStandaloneCleanupFailureAfterPublishedSuccessWarnsWithoutRemovingRecoveryPoint(t *testing.T) {
-	// Production break caught: retention can delete the previous backup only if a later workdir cleanup failure cannot roll back the newly successful recovery point.
+func TestBackupStandaloneCleanupFailureAfterPublishedSuccessFailsTaskWithoutRemovingRecoveryPoint(t *testing.T) {
+	// Production break caught: a published recovery point remains usable, but a credential-bearing workdir cleanup failure must not publish a successful task.
 	module, data, remote := newStandaloneBackupModule(t)
 	remote.cleanupErr = errors.New("cleanup failed")
 	recorder := &backupRecorder{}
-	if err := module.Backup(context.Background(), standaloneBackupRequest(t), registry.RunContext{TaskID: "tsk_1234567890abcdef12345678", Log: recorder}); err != nil {
-		t.Fatalf("post-publication cleanup failure failed backup: %v", err)
+	if err := module.Backup(context.Background(), standaloneBackupRequest(t), registry.RunContext{TaskID: "tsk_1234567890abcdef12345678", Log: recorder}); err == nil {
+		t.Fatal("post-publication credential cleanup failure published a successful task")
 	}
 	if len(data.backups) != 1 || data.backups[0].Status != "success" {
 		t.Fatalf("published recovery point was not preserved: %+v", data.backups)

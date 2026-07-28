@@ -6,11 +6,9 @@ import (
 	"encoding/json"
 	"errors"
 	"net"
-	"os"
 	"path"
 	"strconv"
 	"strings"
-	"time"
 
 	"aifar-deployment/backend/internal/apps/registry"
 	"aifar-deployment/backend/internal/installer/installerkit"
@@ -194,27 +192,15 @@ func (s Service) inspectInnoDBClusterRuntime(ctx context.Context, result *resolv
 		return mysqlOperationError(MySQLCredentialUnavailable)
 	}
 	work := mysqlBackupWorkDir(taskID + "-cluster")
-	if _, err := s.remote.Run(ctx, probe.server, bootstrapBackupWorkCommand(work)); err != nil {
+	var output string
+	if err := s.withMySQLCredentialWork(ctx, probe.server, work, credential, instancePort(probe.instance), func() error {
+		result, runErr := s.remote.Run(ctx, probe.server, inspectClusterMembersCommand(work, instancePort(probe.instance)))
+		output = result.Stdout
+		return runErr
+	}); err != nil {
 		return err
 	}
-	defer func() {
-		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
-		defer cancel()
-		_, _ = s.remote.Run(cleanupCtx, probe.server, cleanupBackupCommand(work))
-	}()
-	secret, err := writeMySQLSecretContext(credential, instancePort(probe.instance))
-	if err != nil {
-		return mysqlOperationError(MySQLCredentialUnavailable)
-	}
-	defer os.Remove(secret)
-	if err := s.remote.UploadFile(ctx, probe.server, secret, path.Join(work, "secret-context.cnf"), 0o600); err != nil {
-		return err
-	}
-	output, err := s.remote.Run(ctx, probe.server, inspectClusterMembersCommand(work, instancePort(probe.instance)))
-	if err != nil {
-		return err
-	}
-	runtime, err := parseInnoDBClusterRuntime(output.Stdout)
+	runtime, err := parseInnoDBClusterRuntime(output)
 	if err != nil {
 		return mysqlOperationError(MySQLBackupClusterUnhealthy)
 	}
@@ -344,7 +330,7 @@ func (s Service) verifyClusterRecovered(ctx context.Context, cluster *resolvedIn
 		return err
 	}
 	if len(cluster.routers) == 0 {
-		return nil
+		return mysqlOperationError(MySQLRestoreIncomplete)
 	}
 	schema, ok := routerVerificationSchema(schemas)
 	if !ok {
@@ -364,23 +350,13 @@ func (s Service) verifyClusterRecovered(ctx context.Context, cluster *resolvedIn
 			return err
 		}
 		work := mysqlBackupWorkDir(taskID + "-router-" + router.InstanceID[len("app_"):])
-		if _, err := s.remote.Run(ctx, server, bootstrapBackupWorkCommand(work)); err != nil {
-			return mysqlOperationError(MySQLRestoreIncomplete)
-		}
-		secret, err := writeMySQLSecretContext(credential, routerPortForEndpoint(router.Endpoint))
-		if err != nil {
-			return mysqlOperationError(MySQLCredentialUnavailable)
-		}
-		if uploadErr := s.remote.UploadFile(ctx, server, secret, path.Join(work, "secret-context.cnf"), 0o600); uploadErr != nil {
-			_ = os.Remove(secret)
-			return mysqlOperationError(MySQLRestoreIncomplete)
-		}
-		_ = os.Remove(secret)
-		result, verifyErr := s.remote.Run(ctx, server, routerReadWriteVerificationCommand(work, routerPortForEndpoint(router.Endpoint), schema))
-		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
-		_, cleanupErr := s.remote.Run(cleanupCtx, server, cleanupBackupCommand(work))
-		cancel()
-		if verifyErr != nil || cleanupErr != nil || !strings.Contains(result.Stdout, "__AIFAR_ROUTER_WRITE__\t1") || !strings.Contains(result.Stdout, "__AIFAR_ROUTER_READ__\t1") {
+		var output string
+		verifyErr := s.withMySQLCredentialWork(ctx, server, work, credential, routerPortForEndpoint(router.Endpoint), func() error {
+			result, runErr := s.remote.Run(ctx, server, routerReadWriteVerificationCommand(work, routerPortForEndpoint(router.Endpoint), schema))
+			output = result.Stdout
+			return runErr
+		})
+		if verifyErr != nil || !strings.Contains(output, "__AIFAR_ROUTER_WRITE__\t1") || !strings.Contains(output, "__AIFAR_ROUTER_READ__\t1") {
 			return mysqlOperationError(MySQLRestoreIncomplete)
 		}
 	}
@@ -414,61 +390,39 @@ func (s Service) verifyMaintenanceClusterHealth(ctx context.Context, cluster *re
 			return err
 		}
 		work := mysqlBackupWorkDir(taskID + "-maintenance-router-" + router.InstanceID[len("app_"):])
-		if _, err := s.remote.Run(ctx, server, bootstrapBackupWorkCommand(work)); err != nil {
-			return mysqlOperationError(MySQLBackupClusterUnhealthy)
-		}
-		secret, err := writeMySQLSecretContext(credential, routerPortForEndpoint(router.Endpoint))
-		if err != nil {
-			return mysqlOperationError(MySQLCredentialUnavailable)
-		}
-		if uploadErr := s.remote.UploadFile(ctx, server, secret, path.Join(work, "secret-context.cnf"), 0o600); uploadErr != nil {
-			_ = os.Remove(secret)
-			return mysqlOperationError(MySQLBackupClusterUnhealthy)
-		}
-		_ = os.Remove(secret)
-		result, verifyErr := s.remote.Run(ctx, server, routerReadWriteVerificationCommand(work, routerPortForEndpoint(router.Endpoint), schema))
-		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
-		_, cleanupErr := s.remote.Run(cleanupCtx, server, cleanupBackupCommand(work))
-		cancel()
-		if verifyErr != nil || cleanupErr != nil || !strings.Contains(result.Stdout, "__AIFAR_ROUTER_WRITE__\t1") || !strings.Contains(result.Stdout, "__AIFAR_ROUTER_READ__\t1") {
+		var output string
+		verifyErr := s.withMySQLCredentialWork(ctx, server, work, credential, routerPortForEndpoint(router.Endpoint), func() error {
+			result, runErr := s.remote.Run(ctx, server, routerReadWriteVerificationCommand(work, routerPortForEndpoint(router.Endpoint), schema))
+			output = result.Stdout
+			return runErr
+		})
+		if verifyErr != nil || !strings.Contains(output, "__AIFAR_ROUTER_WRITE__\t1") || !strings.Contains(output, "__AIFAR_ROUTER_READ__\t1") {
 			return mysqlOperationError(MySQLBackupClusterUnhealthy)
 		}
 	}
 	return nil
 }
 
-func (s Service) maintenanceRouterVerificationSchema(ctx context.Context, primary clusterMemberNode, credential store.Credential, taskID string) (string, error) {
+func (s Service) maintenanceRouterVerificationSchema(ctx context.Context, primary clusterMemberNode, credential store.Credential, taskID string) (schema string, retErr error) {
 	work := mysqlBackupWorkDir(taskID + "-maintenance-schema")
-	if _, err := s.remote.Run(ctx, primary.server, bootstrapBackupWorkCommand(work)); err != nil {
-		return "", err
-	}
-	defer func() {
-		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
-		defer cancel()
-		_, _ = s.remote.Run(cleanupCtx, primary.server, cleanupBackupCommand(work))
-	}()
-	secret, err := writeMySQLSecretContext(credential, instancePort(primary.instance))
-	if err != nil {
-		return "", err
-	}
-	defer os.Remove(secret)
-	if err := s.remote.UploadFile(ctx, primary.server, secret, path.Join(work, "secret-context.cnf"), 0o600); err != nil {
-		return "", err
-	}
-	result, err := s.remote.Run(ctx, primary.server, inspectBackupCommand(work, instancePort(primary.instance)))
-	if err != nil {
-		return "", err
-	}
-	inspection, err := parseMySQLBackupInspection(result.Stdout)
-	if err != nil {
-		return "", err
-	}
-	for _, schema := range inspection.Schemas {
-		if strictSchemaName.MatchString(schema) && !isSystemSchema(schema) {
-			return schema, nil
+	retErr = s.withMySQLCredentialWork(ctx, primary.server, work, credential, instancePort(primary.instance), func() error {
+		result, err := s.remote.Run(ctx, primary.server, inspectBackupCommand(work, instancePort(primary.instance)))
+		if err != nil {
+			return err
 		}
-	}
-	return "", errors.New("no business schema for router maintenance verification")
+		inspection, err := parseMySQLBackupInspection(result.Stdout)
+		if err != nil {
+			return err
+		}
+		for _, candidate := range inspection.Schemas {
+			if strictSchemaName.MatchString(candidate) && !isSystemSchema(candidate) {
+				schema = candidate
+				return nil
+			}
+		}
+		return errors.New("no business schema for router maintenance verification")
+	})
+	return schema, retErr
 }
 
 func routerPortForEndpoint(endpoint string) int {

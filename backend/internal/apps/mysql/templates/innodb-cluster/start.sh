@@ -78,17 +78,45 @@ function isAlreadyReady(message) {
     value.indexOf('current instance') >= 0;
 }
 
-shell.connect(connection(nodes[0]));
-
-function fetchFirstColumn(sql) {
+function fetchFirstColumn(sql, args) {
   const rows = [];
-  const result = session.runSql(sql);
+  const result = session.runSql(sql, args || []);
   let row;
   while ((row = result.fetchOne())) {
     rows.push(String(row[0]));
   }
   return rows;
 }
+
+const gtidSnapshots = nodes.map((node) => {
+  shell.connect(connection(node));
+  const rows = fetchFirstColumn('SELECT @@GLOBAL.gtid_executed');
+  if (rows.length !== 1 || !rows[0]) {
+    throw new Error('unable to read a non-empty GTID set from every cluster member');
+  }
+  return {node: node, gtid: rows[0]};
+});
+
+const candidates = [];
+for (const candidate of gtidSnapshots) {
+  shell.connect(connection(candidate.node));
+  let coversEveryMember = true;
+  for (const observed of gtidSnapshots) {
+    const subset = fetchFirstColumn('SELECT GTID_SUBSET(?, ?)', [observed.gtid, candidate.gtid]);
+    if (subset.length !== 1 || subset[0] !== '1') {
+      coversEveryMember = false;
+      break;
+    }
+  }
+  if (coversEveryMember) {
+    candidates.push(candidate);
+  }
+}
+if (candidates.length !== 1) {
+  throw new Error('complete-outage recovery requires one unique GTID-superset member');
+}
+const seed = candidates[0].node;
+shell.connect(connection(seed));
 
 function assertGroupReplicationTableKeys() {
   const missingKeys = fetchFirstColumn(`
@@ -133,21 +161,11 @@ ORDER BY t.table_schema, t.table_name`);
 
 assertGroupReplicationTableKeys();
 
-let cluster;
-try {
-  print('attempting InnoDB Cluster reboot from complete outage: ' + clusterName);
-  cluster = dba.rebootClusterFromCompleteOutage(clusterName);
-  print('InnoDB Cluster complete-outage reboot completed: ' + clusterName);
-} catch (e) {
-  const rebootMessage = messageOf(e);
-  print('complete-outage reboot was not applied: ' + rebootMessage);
-  try {
-    cluster = dba.getCluster(clusterName);
-    print('existing InnoDB Cluster metadata loaded: ' + clusterName);
-  } catch (inner) {
-    throw e;
-  }
-}
+print('validating InnoDB Cluster complete-outage reboot without mutation: ' + clusterName);
+dba.rebootClusterFromCompleteOutage(clusterName, {dryRun: true});
+print('attempting InnoDB Cluster reboot from the unique GTID-superset member: ' + clusterName);
+const cluster = dba.rebootClusterFromCompleteOutage(clusterName);
+print('InnoDB Cluster complete-outage reboot completed: ' + clusterName);
 
 const failures = [];
 for (const node of nodes) {
