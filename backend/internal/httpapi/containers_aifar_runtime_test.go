@@ -789,6 +789,101 @@ func TestAIFARRuntimeScaleActionsRequireAgent(t *testing.T) {
 	}
 }
 
+func TestBatchOfflineCreatesOneTaskForNormalizedServices(t *testing.T) {
+	api, db, secret := newAuthzTestAPI(t)
+	module := &fakeAIFARRuntimeActionModule{}
+	api.apps = registry.New(module)
+	api.aifarAgentStatus = func(context.Context, store.Server) aifarRuntimeAgent {
+		return aifarRuntimeAgent{Status: "running"}
+	}
+	server, instance := seedAIFARRuntimeFixture(t, db, "unix:///var/run/docker.sock")
+	if _, err := db.SaveAIFARDeployment(store.AIFARDeployment{
+		InstanceID: instance.ID, ServiceName: "im", DesiredReplicas: 1,
+		CurrentRevision: "rev-1", Status: "ready",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	token := issueTestToken(t, db, secret, "owner", "owner")
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v2/containers/aifar/services/batch-offline?serverId="+server.ID, strings.NewReader(`{"instanceId":"`+instance.ID+`","services":[" permission ","permission","im"]}`))
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	api.Router().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	taskID, _ := body["taskId"].(string)
+	if taskID == "" {
+		t.Fatalf("expected taskId in response: %+v", body)
+	}
+	waitForTaskStatus(t, db, taskID, "success")
+	if module.batchScaleCalls != 1 {
+		t.Fatalf("expected one batch scale call, got %d", module.batchScaleCalls)
+	}
+	if len(module.batchScaleRequest.DesiredReplicas) != 2 || module.batchScaleRequest.DesiredReplicas["permission"] != 0 || module.batchScaleRequest.DesiredReplicas["im"] != 0 {
+		t.Fatalf("unexpected normalized batch request: %+v", module.batchScaleRequest)
+	}
+	task, _, err := db.GetTask(taskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.Type != "aifar.scale.batch-offline" || task.Target != instance.ID {
+		t.Fatalf("unexpected batch task: %+v", task)
+	}
+	steps, err := db.ListTaskSteps(taskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(steps) != 4 {
+		t.Fatalf("expected four batch offline steps, got %+v", steps)
+	}
+	targets, err := db.ListTaskTargets(taskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(targets) != 1 || targets[0].Target != server.ID {
+		t.Fatalf("expected one server target, got %+v", targets)
+	}
+	assertAuditExists(t, db, "aifar.scale.batch-offline", "running", "owner", instance.ID)
+}
+
+func TestBatchOfflineRejectsEmptyAndUnknownServices(t *testing.T) {
+	api, db, secret := newAuthzTestAPI(t)
+	module := &fakeAIFARRuntimeActionModule{}
+	api.apps = registry.New(module)
+	api.aifarAgentStatus = func(context.Context, store.Server) aifarRuntimeAgent {
+		return aifarRuntimeAgent{Status: "running"}
+	}
+	server, instance := seedAIFARRuntimeFixture(t, db, "unix:///var/run/docker.sock")
+	token := issueTestToken(t, db, secret, "owner", "owner")
+
+	for _, body := range []string{
+		`{"instanceId":"` + instance.ID + `","services":[]}`,
+		`{"instanceId":"` + instance.ID + `","services":["missing"]}`,
+	} {
+		req := httptest.NewRequest(http.MethodPost, "/api/v2/containers/aifar/services/batch-offline?serverId="+server.ID, strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+
+		api.Router().ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("expected 400, got %d body=%s", rec.Code, rec.Body.String())
+		}
+	}
+	if module.batchScaleCalls != 0 {
+		t.Fatalf("invalid requests must not reach module, got %d calls", module.batchScaleCalls)
+	}
+}
+
 func TestCurrentAIFARServiceDesiredReplicasReadsDeployment(t *testing.T) {
 	api, db, _ := newAuthzTestAPI(t)
 	_, instance := seedAIFARRuntimeFixture(t, db, "unix:///var/run/docker.sock")
@@ -1082,13 +1177,15 @@ func TestAIFARRuntimeRestartAllRequiresAppsManagePermission(t *testing.T) {
 }
 
 type fakeAIFARRuntimeActionModule struct {
-	cleanupCalls   int
-	uninstallCalls int
-	restartCalls   int
-	restartRequest registry.RuntimeRestartRequest
-	restartErr     error
-	restartStarted chan struct{}
-	restartRelease chan struct{}
+	cleanupCalls      int
+	uninstallCalls    int
+	restartCalls      int
+	batchScaleCalls   int
+	batchScaleRequest registry.ServiceBatchScaleRequest
+	restartRequest    registry.RuntimeRestartRequest
+	restartErr        error
+	restartStarted    chan struct{}
+	restartRelease    chan struct{}
 }
 
 func (m *fakeAIFARRuntimeActionModule) Name() string { return "aifar" }
@@ -1120,6 +1217,26 @@ func (m *fakeAIFARRuntimeActionModule) CleanupRuntimeStalePods(ctx context.Conte
 
 func (m *fakeAIFARRuntimeActionModule) UninstallRuntimeAgent(ctx context.Context, req registry.RuntimeAgentUninstallRequest, run registry.RunContext) error {
 	m.uninstallCalls++
+	return nil
+}
+
+func (m *fakeAIFARRuntimeActionModule) ScaleServices(ctx context.Context, req registry.ServiceBatchScaleRequest, run registry.RunContext) error {
+	m.batchScaleCalls++
+	m.batchScaleRequest = req
+	target := req.Server.ID
+	if recorder, ok := run.Log.(interface {
+		StartTarget(string)
+		FinishTarget(string, string, string)
+		StartStep(string, string, string, int)
+		FinishStep(string, string, string, string)
+	}); ok {
+		recorder.StartTarget(target)
+		for index, name := range []string{"load-runtime", "validate-services", "apply-batch-offline", "record-runtime-state"} {
+			recorder.StartStep(target, name, name, index+1)
+			recorder.FinishStep(target, name, "success", "")
+		}
+		recorder.FinishTarget(target, "success", "")
+	}
 	return nil
 }
 

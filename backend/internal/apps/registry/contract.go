@@ -262,6 +262,15 @@ type ServiceScaleRequest struct {
 	Reason      string
 }
 
+type ServiceBatchScaleRequest struct {
+	Instance        store.AppInstance
+	Server          store.Server
+	Language        string
+	Actor           string
+	DesiredReplicas map[string]int
+	Reason          string
+}
+
 type ServiceInstallRequest struct {
 	Instance store.AppInstance
 	Server   store.Server
@@ -558,6 +567,10 @@ type ServiceScaleOutModule interface {
 
 type ServiceScaleModule interface {
 	ScaleService(ctx context.Context, req ServiceScaleRequest, run RunContext) error
+}
+
+type ServiceBatchScaleModule interface {
+	ScaleServices(ctx context.Context, req ServiceBatchScaleRequest, run RunContext) error
 }
 
 type ServiceInstallModule interface {

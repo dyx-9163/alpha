@@ -226,6 +226,12 @@ type aifarRuntimeServiceInstallRequest struct {
 	Reason     string   `json:"reason"`
 }
 
+type aifarRuntimeBatchOfflineRequest struct {
+	InstanceID string   `json:"instanceId"`
+	Services   []string `json:"services"`
+	Reason     string   `json:"reason"`
+}
+
 type aifarRuntimeConfigApplyRequest struct {
 	InstanceID     string                                  `json:"instanceId"`
 	Reason         string                                  `json:"reason"`
@@ -284,6 +290,15 @@ func aifarRuntimeScaleSteps() []simpleTaskStep {
 		{"render-scale-spec", "render AIFAR runtime scale script"},
 		{"apply-scale", "apply desired replicas through aifar-agent"},
 		{"record-scale", "record AIFAR scale result"},
+	}
+}
+
+func aifarRuntimeBatchOfflineSteps(lang string) []simpleTaskStep {
+	return []simpleTaskStep{
+		{"load-runtime", i18n.Text(lang, "aifar.batchOffline.stepLoadRuntime")},
+		{"validate-services", i18n.Text(lang, "aifar.batchOffline.stepValidateServices")},
+		{"apply-batch-offline", i18n.Text(lang, "aifar.batchOffline.stepApply")},
+		{"record-runtime-state", i18n.Text(lang, "aifar.batchOffline.stepRecord")},
 	}
 }
 
@@ -1167,6 +1182,81 @@ func (a *aifarRuntimeController) offlineService(w http.ResponseWriter, r *http.R
 	}
 	if err == nil {
 		a.audit(r, "aifar.scale.offline", target, "running", task.ID)
+	}
+	respondTask(w, task, err)
+}
+
+func (a *aifarRuntimeController) batchOfflineServices(w http.ResponseWriter, r *http.Request) {
+	lang := languageFromRequest(r)
+	req := aifarRuntimeBatchOfflineRequest{}
+	if !decode(w, r, &req) {
+		return
+	}
+	services := runtimeMergeServices(req.Services)
+	if len(services) == 0 {
+		writeError(w, http.StatusBadRequest, "AIFAR_SERVICES_REQUIRED", i18n.Text(lang, "api.aifarBatchOfflineServicesRequired"), nil)
+		return
+	}
+	server, instance, ok := a.resolveAIFARRuntimeActionTargetForInstance(w, r, req.InstanceID)
+	if !ok {
+		return
+	}
+	for _, service := range services {
+		replicas, err := a.currentAIFARServiceDesiredReplicas(instance.ID, service)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "AIFAR_SERVICE_INVALID", i18n.Text(lang, "api.aifarBatchOfflineServiceInvalid", service), nil)
+			return
+		}
+		if replicas <= 0 {
+			writeError(w, http.StatusBadRequest, "AIFAR_SERVICE_ALREADY_OFFLINE", i18n.Text(lang, "api.aifarBatchOfflineServiceAlreadyOffline", service), nil)
+			return
+		}
+	}
+	module, ok := a.apps.Get(instance.App)
+	if !ok {
+		writeError(w, http.StatusNotFound, "APP_BACKEND_MODULE_MISSING", i18n.Text(lang, "api.appBackendMissing"), map[string]any{"app": instance.App})
+		return
+	}
+	scaler, ok := module.(registry.ServiceBatchScaleModule)
+	if !ok {
+		writeError(w, http.StatusConflict, "AIFAR_BATCH_SCALE_UNSUPPORTED", i18n.Text(lang, "api.aifarBatchOfflineUnsupported"), map[string]any{"app": instance.App})
+		return
+	}
+	actor := currentUser(r).Username
+	desired := make(map[string]int, len(services))
+	for _, service := range services {
+		desired[service] = 0
+	}
+	task, err, started := a.startSimplePlannedTaskWithLocks(w, "aifar.scale.batch-offline", instance.ID, actor, lang, server.ID, aifarRuntimeBatchOfflineSteps(lang), []operationLockSpec{aifarRuntimeMutationLockSpec("batch-offline", instance)}, func(ctx context.Context, log worker.Logger) error {
+		current, err := a.store.GetAppInstance(instance.ID)
+		if err != nil {
+			return err
+		}
+		server, err := a.store.GetServer(current.ServerID, true)
+		if err != nil {
+			return err
+		}
+		log.Info("%s", i18n.Text(lang, "aifar.batchOffline.started", strings.Join(services, ", "), current.ID))
+		return scaler.ScaleServices(ctx, registry.ServiceBatchScaleRequest{
+			Instance:        current,
+			Server:          server,
+			Language:        lang,
+			Actor:           actor,
+			DesiredReplicas: desired,
+			Reason:          strings.TrimSpace(req.Reason),
+		}, registry.RunContext{
+			TaskID: log.TaskID(),
+			Log:    log,
+			TargetLog: func(target string) registry.Logger {
+				return log.Target(target)
+			},
+		})
+	})
+	if !started {
+		return
+	}
+	if err == nil {
+		a.audit(r, "aifar.scale.batch-offline", instance.ID, "running", task.ID)
 	}
 	respondTask(w, task, err)
 }

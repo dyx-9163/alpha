@@ -1077,6 +1077,62 @@ func TestScaleServiceCanOfflineDeploymentAndClearEndpoints(t *testing.T) {
 	}
 }
 
+func TestScaleServicesCanOfflineMultipleDeploymentsWithOneCommit(t *testing.T) {
+	withFakeRuntimeAgentBinary(t)
+	instance := installedAIFARInstance(t)
+	s := &fakeStore{
+		servers:   map[string]store.Server{"srv-1": {ID: "srv-1", Host: "10.0.0.10", DeployDir: "/aifar/apps"}},
+		instances: []store.AppInstance{instance},
+	}
+	remote := &fakeRemote{autoscaleStatusStdouts: []string{
+		"endpoint=gateway|aifar-gateway-rel|rel|1|38000|true|healthy|10|2147483648\nhostMemoryAvailableBytes=8589934592\n",
+	}}
+	service := NewService(s, remote)
+	err := service.ScaleServices(context.Background(), ScaleServicesRequest{
+		Instance: instance,
+		Server:   s.servers["srv-1"],
+		Actor:    "operator",
+		TaskID:   "task-batch-offline",
+		DesiredReplicas: map[string]int{
+			"file":       0,
+			"permission": 0,
+		},
+		Reason: "test batch offline",
+	}, fakeLogger{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if remote.scaleServiceRuns != 1 {
+		t.Fatalf("expected one remote scale commit, got %d", remote.scaleServiceRuns)
+	}
+	for _, want := range []string{`TARGET_DESIRED_REPLICAS=`, `permission=0`, `file=0`} {
+		if !strings.Contains(remote.scaleServiceScript, want) {
+			t.Fatalf("expected batch scale script to contain %q, got:\n%s", want, remote.scaleServiceScript)
+		}
+	}
+	saved, err := s.GetAppInstance(instance.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	desired := desiredReplicasFromMetadata(metadataFromInstance(saved))
+	if desired["file"] != 0 || desired["permission"] != 0 || desired["gateway"] != 1 {
+		t.Fatalf("unexpected desired replicas after batch offline: %+v", desired)
+	}
+	if locks := serviceOrchestrationLocksFromMetadata(metadataFromInstance(saved)); len(locks) != 0 {
+		t.Fatalf("expected batch scale orchestration lock to be released, got %+v", locks)
+	}
+	states := map[string]store.AIFARDeployment{}
+	for _, deployment := range s.deployments {
+		states[deployment.ServiceName] = deployment
+	}
+	for _, serviceName := range []string{"file", "permission"} {
+		deployment := states[serviceName]
+		if deployment.DesiredReplicas != 0 || deployment.Status != "offline" {
+			t.Fatalf("expected %s offline deployment, got %+v", serviceName, deployment)
+		}
+	}
+}
+
 func TestScaleServicePreservesAllNonTargetDesiredReplicas(t *testing.T) {
 	withFakeRuntimeAgentBinary(t)
 	instance := installedAIFARInstance(t)

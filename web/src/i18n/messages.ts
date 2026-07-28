@@ -4,6 +4,11 @@ export type I18nValue = string | ((params?: Record<string, unknown>) => string)
 
 export const messages: Record<LocaleCode, Record<string, I18nValue>> = {
   zh: {
+    'containers.batchOfflineDeployments': '批量下线',
+    'containers.selectedDeploymentCount': ({ count } = {}) => `已选择 ${count ?? 0} 个服务`,
+    'containers.selectDeploymentsToOffline': '请选择要下线的服务',
+    'containers.confirmBatchOfflineDeployments': ({ count, services } = {}) => `确认一次性下线 ${count ?? 0} 个服务（${services ?? ''}）？该操作会在同一个任务中把所选服务的期望副本数置为 0，并更新入口与发现状态。`,
+    'containers.batchOfflineAccepted': '批量下线任务已提交',
     'containers.diagnosticsRawExportTitle': '按服务器日期导出原始日志',
     'containers.diagnosticsLocalDate': '服务器本地日期',
     'containers.diagnosticsRawLogSource': '日志来源：服务器宿主机原始文件',
@@ -1095,6 +1100,11 @@ export const messages: Record<LocaleCode, Record<string, I18nValue>> = {
     'table.version': '版本'
   },
   en: {
+    'containers.batchOfflineDeployments': 'Batch offline',
+    'containers.selectedDeploymentCount': ({ count } = {}) => `${count ?? 0} service(s) selected`,
+    'containers.selectDeploymentsToOffline': 'Select services to offline',
+    'containers.confirmBatchOfflineDeployments': ({ count, services } = {}) => `Offline ${count ?? 0} service(s) in one task (${services ?? ''})? This sets their desired replicas to 0 and updates entry and discovery state.`,
+    'containers.batchOfflineAccepted': 'Batch offline task submitted',
     'containers.diagnosticsRawExportTitle': 'Export raw logs by server date',
     'containers.diagnosticsLocalDate': 'Server-local date',
     'containers.diagnosticsRawLogSource': 'Log source: raw host files on the server',

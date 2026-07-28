@@ -178,6 +178,16 @@ type ScaleRequest struct {
 	Reason      string
 }
 
+type ScaleServicesRequest struct {
+	Instance        store.AppInstance
+	Server          store.Server
+	Language        string
+	Actor           string
+	TaskID          string
+	DesiredReplicas map[string]int
+	Reason          string
+}
+
 type InstallServicesRequest struct {
 	Instance store.AppInstance
 	Server   store.Server
@@ -1933,13 +1943,14 @@ type autoscaleOutScriptData struct {
 }
 
 type scaleServiceScriptData struct {
-	InstallRoot     string
-	ServiceOrder    string
-	ServiceName     string
-	Replicas        int
-	IngressNetwork  string
-	TaskID          string
-	DesiredReplicas string
+	InstallRoot           string
+	ServiceOrder          string
+	ServiceName           string
+	Replicas              int
+	IngressNetwork        string
+	TaskID                string
+	DesiredReplicas       string
+	TargetDesiredReplicas string
 }
 
 func renderInstallScript(data installScriptData) (string, error) {

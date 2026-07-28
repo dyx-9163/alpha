@@ -45,6 +45,7 @@ import {
   fetchRuntimeDiagnosticExports,
   fetchAifarRuntime,
   installRuntimeServices,
+  offlineRuntimeServices,
   offlineRuntimeService,
   reconcileRuntime,
   restartAllRuntime,
@@ -262,6 +263,17 @@ describe('AIFAR Runtime API service', () => {
     expect(apiPostMock).toHaveBeenCalledWith(
       `/containers/aifar/services/web%20vue%2F3/${action}?serverId=server-1`,
       { instanceId: 'instance-1' }
+    )
+  })
+
+  it('offlines multiple runtime services with one fixed-route request', async () => {
+    apiPostMock.mockResolvedValueOnce({ taskId: 'task-batch-offline' })
+
+    await expect(offlineRuntimeServices('serverId=server-1', 'instance-1', ['gateway', 'oauth']))
+      .resolves.toEqual({ taskId: 'task-batch-offline' })
+    expect(apiPostMock).toHaveBeenCalledWith(
+      '/containers/aifar/services/batch-offline?serverId=server-1',
+      { instanceId: 'instance-1', services: ['gateway', 'oauth'] }
     )
   })
 })

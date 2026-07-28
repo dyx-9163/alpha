@@ -1,6 +1,25 @@
 <template>
   <div class="runtime-resource-panel">
-    <el-table :data="selectedRuntimeDeployments" height="100%" row-key="serviceName">
+    <div class="runtime-tab-toolbar">
+      <span class="selection-summary">{{ t('containers.selectedDeploymentCount', { count: selectedDeployments.length }) }}</span>
+      <div class="runtime-tab-actions">
+        <el-button
+          size="small"
+          type="danger"
+          plain
+          :disabled="selectedDeployments.length === 0"
+          @click="batchOfflineDeployments"
+        >{{ t('containers.batchOfflineDeployments') }}</el-button>
+      </div>
+    </div>
+    <el-table
+      ref="deploymentTable"
+      :data="selectedRuntimeDeployments"
+      height="100%"
+      row-key="serviceName"
+      @selection-change="handleDeploymentSelection"
+    >
+      <el-table-column type="selection" width="44" :selectable="deploymentSelectable" reserve-selection />
       <el-table-column prop="deploymentName" :label="t('containers.deployment')" min-width="170" show-overflow-tooltip />
       <el-table-column prop="serviceName" :label="t('containers.service')" width="130" show-overflow-tooltip />
       <el-table-column prop="status" :label="t('common.status')" width="120">
@@ -43,8 +62,11 @@
 </template>
 
 <script setup lang="ts">
+import { ref, watch } from 'vue'
 import StatusTag from '../../components/StatusTag.vue'
 import { useAifarRuntimeContext } from './context'
+import { normalizeBatchOfflineDeployments } from './runtimeDeploymentSelection'
+import type { AifarRuntimeDeployment, AifarRuntimeService } from './types'
 
 const {
   t,
@@ -59,6 +81,36 @@ const {
   aifarRuntimeScaleInDisabledReason,
   scaleInAifarDeployment,
   aifarRuntimeOfflineDisabledReason,
-  offlineAifarService
+  offlineAifarService,
+  offlineAifarServices,
+  selectedRuntimeInstanceId
 } = useAifarRuntimeContext()
+
+const deploymentTable = ref<{ clearSelection: () => void } | null>(null)
+const selectedDeployments = ref<AifarRuntimeService[]>([])
+
+function deploymentSelectable(row: AifarRuntimeDeployment) {
+  return !aifarRuntimeOfflineDisabledReason(runtimeServiceForDeployment(row))
+}
+
+function handleDeploymentSelection(rows: AifarRuntimeDeployment[]) {
+  selectedDeployments.value = normalizeBatchOfflineDeployments(
+    rows,
+    runtimeServiceForDeployment,
+    aifarRuntimeOfflineDisabledReason
+  )
+}
+
+function clearDeploymentSelection() {
+  selectedDeployments.value = []
+  deploymentTable.value?.clearSelection()
+}
+
+async function batchOfflineDeployments() {
+  const rows = [...selectedDeployments.value]
+  if (!rows.length) return
+  if (await offlineAifarServices(rows)) clearDeploymentSelection()
+}
+
+watch(selectedRuntimeInstanceId, clearDeploymentSelection)
 </script>
