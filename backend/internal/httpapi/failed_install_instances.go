@@ -26,7 +26,7 @@ func (a *API) recordFailedInstallInstances(ctx context.Context, req registry.Ins
 		if ctx.Err() != nil {
 			continue
 		}
-		if failedInstallInstanceExists(existing, req.App, serverID, taskID) {
+		if installInstanceRecordedAfter(existing, req.App, serverID, startedAt) || failedInstallInstanceExists(existing, req.App, serverID, taskID) {
 			continue
 		}
 		metadata, err := a.failedInstallMetadata(req, serverID, taskID, installErr)
@@ -37,29 +37,10 @@ func (a *API) recordFailedInstallInstances(ctx context.Context, req registry.Ins
 		if err != nil {
 			return count, err
 		}
-		recorded, found := installInstanceRecordedAfter(existing, req.App, serverID, startedAt)
-		if found {
-			currentMetadata := map[string]any{}
-			_ = json.Unmarshal([]byte(recorded.Metadata), &currentMetadata)
-			for key, value := range metadata {
-				if key == "clusterId" && strings.TrimSpace(installMetadataString(currentMetadata, key)) != "" {
-					continue
-				}
-				currentMetadata[key] = value
-			}
-			raw, err = json.Marshal(currentMetadata)
-			if err != nil {
-				return count, err
-			}
-			recorded.Status = failedInstallStatus(req.App)
-			recorded.Metadata = string(raw)
-			_, err = a.store.SaveAppInstance(recorded)
-		} else {
-			_, err = a.store.SaveAppInstance(store.AppInstance{
-				App: req.App, Version: req.Version, ServerID: serverID, Status: failedInstallStatus(req.App),
-				Topology: normalizedInstallTopology(req.Topology), Metadata: string(raw),
-			})
-		}
+		_, err = a.store.SaveAppInstance(store.AppInstance{
+			App: req.App, Version: req.Version, ServerID: serverID, Status: failedInstallStatus(req.App),
+			Topology: normalizedInstallTopology(req.Topology), Metadata: string(raw),
+		})
 		if err != nil {
 			return count, err
 		}
@@ -68,20 +49,77 @@ func (a *API) recordFailedInstallInstances(ctx context.Context, req registry.Ins
 	return count, nil
 }
 
-func installInstanceRecordedAfter(instances []store.AppInstance, app, serverID string, startedAt time.Time) (store.AppInstance, bool) {
+func installInstanceRecordedAfter(instances []store.AppInstance, app, serverID string, startedAt time.Time) bool {
 	if startedAt.IsZero() {
-		return store.AppInstance{}, false
+		return false
 	}
-	var selected store.AppInstance
 	for _, item := range instances {
 		if item.App != app || item.ServerID != serverID {
 			continue
 		}
 		if !item.CreatedAt.Before(startedAt) || !item.UpdatedAt.Before(startedAt) {
-			if selected.ID == "" || item.UpdatedAt.After(selected.UpdatedAt) {
-				selected = item
-			}
+			return true
 		}
+	}
+	return false
+}
+
+// markRecordedInstallInstancesFailed mutates only rows provably created by
+// this install window. It is reserved for post-install finalization failures;
+// the general failure recorder above keeps its historical non-mutating rule.
+func (a *API) markRecordedInstallInstancesFailed(req registry.InstallRequest, startedAt time.Time, taskID string, installErr error) (int, error) {
+	instances, err := a.store.ListAppInstances()
+	if err != nil {
+		return 0, err
+	}
+	updates := make([]store.AppInstance, 0, len(req.TargetServerIDs()))
+	for _, serverID := range req.TargetServerIDs() {
+		instance, found := uniqueInstallInstanceCreatedAfter(instances, req.App, req.Version, serverID, startedAt)
+		if !found {
+			continue
+		}
+		metadata, err := a.failedInstallMetadata(req, serverID, taskID, installErr)
+		if err != nil {
+			return 0, err
+		}
+		current := map[string]any{}
+		_ = json.Unmarshal([]byte(instance.Metadata), &current)
+		for key, value := range metadata {
+			if key == "clusterId" && strings.TrimSpace(installMetadataString(current, key)) != "" {
+				continue
+			}
+			current[key] = value
+		}
+		raw, err := json.Marshal(current)
+		if err != nil {
+			return 0, err
+		}
+		instance.Status = failedInstallStatus(req.App)
+		instance.Metadata = string(raw)
+		updates = append(updates, instance)
+	}
+	if len(updates) == 0 {
+		return 0, nil
+	}
+	if err := a.store.MarkMySQLInstallInstancesFailed(updates); err != nil {
+		return 0, err
+	}
+	return len(updates), nil
+}
+
+func uniqueInstallInstanceCreatedAfter(instances []store.AppInstance, app, version, serverID string, startedAt time.Time) (store.AppInstance, bool) {
+	if startedAt.IsZero() {
+		return store.AppInstance{}, false
+	}
+	var selected store.AppInstance
+	for _, item := range instances {
+		if item.App != app || item.Version != version || item.ServerID != serverID || item.CreatedAt.Before(startedAt) {
+			continue
+		}
+		if selected.ID != "" {
+			return store.AppInstance{}, false
+		}
+		selected = item
 	}
 	return selected, selected.ID != ""
 }

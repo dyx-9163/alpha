@@ -52,6 +52,7 @@ func TestMySQLInstallCredentialPersistenceFailureRollsBackAndMarksEveryNewInstan
 					}
 					existingCredentialID = credential.ID
 					parameters["rootCredentialId"] = credential.ID
+					parameters[mysqlRootCredentialVersionParameter] = credential.CurrentVersion
 				}
 				failedInstance := instances[0]
 				if memberCount == 3 {
@@ -66,12 +67,15 @@ func TestMySQLInstallCredentialPersistenceFailureRollsBackAndMarksEveryNewInstan
 					Language: "en", Actor: "owner", ServerIDs: serverIDs, Parameters: parameters,
 				}
 				log := &installCredentialTestLogger{}
-				bindingErr := api.bindInstallCredentialReferences("mysql", req, log)
+				bindingErr := api.bindInstallCredentialReferences("mysql", req, log, startedAt)
 				if bindingErr == nil {
 					t.Fatal("credential persistence failure was swallowed")
 				}
 				if strings.Contains(bindingErr.Error(), installCredentialFailureSentinel) || strings.Contains(bindingErr.Error(), "injected") {
 					t.Fatalf("credential persistence error leaked private detail: %v", bindingErr)
+				}
+				if _, err := api.markRecordedInstallInstancesFailed(req, startedAt, "tsk-install-credential-failed", bindingErr); err != nil {
+					t.Fatal(err)
 				}
 				_, _ = api.recordFailedInstallInstances(context.Background(), req, startedAt, "tsk-install-credential-failed", bindingErr)
 
@@ -124,6 +128,7 @@ func TestMySQLInstallCredentialPersistenceCreatesOneCompleteAdminBindingPerNewIn
 		for _, memberCount := range []int{1, 3} {
 			t.Run(fmt.Sprintf("%s/%d-member", source, memberCount), func(t *testing.T) {
 				api, db, _ := newAuthzTestAPI(t)
+				startedAt := time.Now().Add(-time.Second)
 				serverIDs := make([]string, 0, memberCount)
 				instances := make([]store.AppInstance, 0, memberCount)
 				for index := 0; index < memberCount; index++ {
@@ -148,10 +153,11 @@ func TestMySQLInstallCredentialPersistenceCreatesOneCompleteAdminBindingPerNewIn
 					}
 					selectedID = credential.ID
 					parameters["rootCredentialId"] = credential.ID
+					parameters[mysqlRootCredentialVersionParameter] = credential.CurrentVersion
 				}
 				req := registry.InstallRequest{App: "mysql", Version: "8.0.36", Topology: instances[0].Topology, Language: "en", Actor: "owner", ServerIDs: serverIDs, Parameters: parameters}
 				log := &installCredentialTestLogger{}
-				if err := api.bindInstallCredentialReferences("mysql", req, log); err != nil {
+				if err := api.bindInstallCredentialReferences("mysql", req, log, startedAt); err != nil {
 					t.Fatal(err)
 				}
 				credentialIDs := map[string]bool{}
@@ -173,6 +179,119 @@ func TestMySQLInstallCredentialPersistenceCreatesOneCompleteAdminBindingPerNewIn
 				}
 			})
 		}
+	}
+}
+
+func TestMySQLInstallCredentialFailureDoesNotMutatePreexistingUpdatedInstance(t *testing.T) {
+	api, db, _ := newAuthzTestAPI(t)
+	serverID := "srv-existing"
+	preexisting, err := db.SaveAppInstance(store.AppInstance{
+		App: "mysql", Version: "8.0.35", ServerID: serverID, Status: "installed", Topology: "standalone", Metadata: `{"port":3306,"owner":"preexisting"}`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	startedAt := preexisting.CreatedAt.Add(time.Nanosecond)
+	preexisting.Metadata = `{"port":3306,"owner":"preexisting-updated-during-task"}`
+	if preexisting, err = db.SaveAppInstance(preexisting); err != nil {
+		t.Fatal(err)
+	}
+	created, err := db.SaveAppInstance(store.AppInstance{
+		App: "mysql", Version: "8.0.36", ServerID: serverID, Status: "installed", Topology: "standalone", Metadata: `{"port":3307,"owner":"current-task"}`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	trigger := fmt.Sprintf(`create trigger fail_owned_mysql_install_binding before insert on credential_bindings when new.app_instance_id=%q begin select raise(abort,'injected'); end`, created.ID)
+	if _, err := rawExecSQLite(api.cfg.DatabasePath, trigger); err != nil {
+		t.Fatal(err)
+	}
+	req := registry.InstallRequest{
+		App: "mysql", Version: "8.0.36", Topology: "standalone", Language: "en", Actor: "owner", ServerIDs: []string{serverID},
+		Parameters: map[string]any{"rootUser": "root", "rootPassword": installCredentialFailureSentinel},
+	}
+	bindingErr := api.bindInstallCredentialReferences("mysql", req, &installCredentialTestLogger{}, startedAt)
+	if bindingErr == nil {
+		t.Fatal("injected binding failure was swallowed")
+	}
+	if _, err := api.markRecordedInstallInstancesFailed(req, startedAt, "tsk-owned-failure", bindingErr); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := api.recordFailedInstallInstances(context.Background(), req, startedAt, "tsk-owned-failure", bindingErr); err != nil {
+		t.Fatal(err)
+	}
+	oldRow, err := db.GetAppInstance(preexisting.ID)
+	if err != nil || oldRow.Status != "installed" || !strings.Contains(oldRow.Metadata, "preexisting-updated-during-task") || strings.Contains(oldRow.Metadata, "installFailed") {
+		t.Fatalf("preexisting instance was corrupted: row=%+v err=%v", oldRow, err)
+	}
+	newRow, err := db.GetAppInstance(created.ID)
+	if err != nil || newRow.Status != "failed" || !strings.Contains(newRow.Metadata, `"installFailed":true`) || !strings.Contains(newRow.Metadata, "tsk-owned-failure") {
+		t.Fatalf("current-task instance was not marked failed: row=%+v err=%v", newRow, err)
+	}
+}
+
+func TestMySQLInstallCredentialFailureMarkingIsAtomicAndCancellationIndependent(t *testing.T) {
+	api, db, _ := newAuthzTestAPI(t)
+	startedAt := time.Now().Add(-time.Second)
+	serverIDs := []string{"srv-1", "srv-2", "srv-3"}
+	instances := make([]store.AppInstance, 0, len(serverIDs))
+	for _, serverID := range serverIDs {
+		instance, err := db.SaveAppInstance(store.AppInstance{App: "mysql", Version: "8.0.36", ServerID: serverID, Status: "installed", Topology: "innodb-cluster", Metadata: `{"clusterId":"cluster_1234567890abcdef12345678"}`})
+		if err != nil {
+			t.Fatal(err)
+		}
+		instances = append(instances, instance)
+	}
+	req := registry.InstallRequest{App: "mysql", Version: "8.0.36", Topology: "innodb-cluster", ServerIDs: serverIDs}
+	trigger := fmt.Sprintf(`create trigger fail_atomic_mysql_install_status before update of status on app_instances when new.id=%q and new.status='failed' begin select raise(abort,'injected'); end`, instances[1].ID)
+	if _, err := rawExecSQLite(api.cfg.DatabasePath, trigger); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if !errors.Is(ctx.Err(), context.Canceled) {
+		t.Fatal("cancellation seam was not established")
+	}
+	// The atomic failure marker intentionally has no cancellable context.
+	if _, err := api.markRecordedInstallInstancesFailed(req, startedAt, "tsk-atomic-failure", errors.New("binding failed")); err == nil {
+		t.Fatal("injected all-member status failure unexpectedly committed")
+	}
+	for _, instance := range instances {
+		current, err := db.GetAppInstance(instance.ID)
+		if err != nil || current.Status != "installed" || strings.Contains(current.Metadata, "installFailed") {
+			t.Fatalf("atomic rollback failed for %s: row=%+v err=%v", instance.ID, current, err)
+		}
+	}
+}
+
+func TestMySQLSelectedInstallCredentialVersionDriftFailsBeforeBinding(t *testing.T) {
+	api, db, _ := newAuthzTestAPI(t)
+	credential, err := db.SaveCredential(store.Credential{
+		Name: "selected-admin", Kind: "mysql", Username: "root", Status: "active", Scope: "global", Purpose: "admin",
+		Secret: map[string]string{"password": "original-secret"}, CreatedBy: "owner",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	parameters := map[string]any{
+		"rootCredentialId": credential.ID, "rootUser": credential.Username, "rootPassword": "original-secret",
+		mysqlRootCredentialVersionParameter: credential.CurrentVersion,
+	}
+	startedAt := time.Now().Add(-time.Second)
+	instance, err := db.SaveAppInstance(store.AppInstance{App: "mysql", Version: "8.0.36", ServerID: "srv-1", Status: "installed", Topology: "standalone", Metadata: `{"port":3306}`})
+	if err != nil {
+		t.Fatal(err)
+	}
+	credential.Secret = map[string]string{"password": "rotated-secret"}
+	if _, err := db.SaveCredential(credential); err != nil {
+		t.Fatal(err)
+	}
+	req := registry.InstallRequest{App: "mysql", Version: "8.0.36", Topology: "standalone", ServerIDs: []string{"srv-1"}, Parameters: parameters}
+	if err := api.bindInstallCredentialReferences("mysql", req, &installCredentialTestLogger{}, startedAt); err == nil {
+		t.Fatal("rotated selected credential was bound to an install that used the previous version")
+	}
+	if _, err := db.GetBoundCredential(instance.ID, "admin", true); !errors.Is(err, store.ErrBoundCredentialNotFound) {
+		t.Fatalf("credential drift retained a binding: %v", err)
 	}
 }
 
@@ -234,6 +353,48 @@ func TestMySQLAdminCredentialRotationIsRejectedWhileClusterStartSnapshotLockIsHe
 	active, err := db.GetOperationLock(lock.ID)
 	if err != nil || active.Status != "active" {
 		t.Fatalf("cluster-start lock ownership was changed: lock=%+v err=%v", active, err)
+	}
+}
+
+func TestUnboundSelectedMySQLCredentialMutationIsRejectedWhileInstallLockIsHeld(t *testing.T) {
+	api, db, jwtSecret := newAuthzTestAPI(t)
+	credential, err := db.SaveCredential(store.Credential{
+		Name: "global-mysql-admin", Kind: "mysql", Username: "root", Scope: "global", Status: "active", Purpose: "admin",
+		Secret: map[string]string{"password": "install-snapshot-secret"}, CreatedBy: "owner",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lock, err := db.AcquireOperationLock(store.OperationLock{
+		Scope: "credential", ResourceID: credential.ID, Operation: operationLockMutation, OwnerTaskID: "tsk-mysql-install",
+		Owner: "owner", ExpiresAt: time.Now().Add(time.Hour), Metadata: `{"action":"mysql-install"}`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.ReleaseOperationLock(lock.ID)
+	token := issueTestToken(t, db, jwtSecret, "owner", "owner")
+	body, _ := json.Marshal(map[string]any{
+		"name": credential.Name, "kind": "mysql", "username": "root", "scope": "global", "status": "active", "purpose": "admin", "password": "rotated",
+	})
+	update := httptest.NewRequest(http.MethodPut, "/api/v2/credentials/"+credential.ID, strings.NewReader(string(body)))
+	update.Header.Set("Authorization", "Bearer "+token)
+	update.Header.Set("Content-Type", "application/json")
+	updateRec := httptest.NewRecorder()
+	api.Router().ServeHTTP(updateRec, update)
+	if updateRec.Code != http.StatusConflict || !strings.Contains(updateRec.Body.String(), `"code":"OPERATION_LOCKED"`) {
+		t.Fatalf("selected credential update bypassed install lock: status=%d body=%s", updateRec.Code, updateRec.Body.String())
+	}
+	deleteReq := httptest.NewRequest(http.MethodDelete, "/api/v2/credentials/"+credential.ID, nil)
+	deleteReq.Header.Set("Authorization", "Bearer "+token)
+	deleteRec := httptest.NewRecorder()
+	api.Router().ServeHTTP(deleteRec, deleteReq)
+	if deleteRec.Code != http.StatusConflict || !strings.Contains(deleteRec.Body.String(), `"code":"OPERATION_LOCKED"`) {
+		t.Fatalf("selected credential delete bypassed install lock: status=%d body=%s", deleteRec.Code, deleteRec.Body.String())
+	}
+	current, err := db.GetCredential(credential.ID, true)
+	if err != nil || current.CurrentVersion != credential.CurrentVersion || current.Secret["password"] != "install-snapshot-secret" {
+		t.Fatalf("install-locked credential changed: current=%+v err=%v", current, err)
 	}
 }
 

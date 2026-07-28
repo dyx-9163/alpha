@@ -102,6 +102,17 @@ func appInstallOperationLockSpecs(app string, serverIDs []string) []operationLoc
 	return specs
 }
 
+func credentialOperationLockSpecs(action, credentialID string) []operationLockSpec {
+	credentialID = strings.TrimSpace(credentialID)
+	if credentialID == "" {
+		return nil
+	}
+	return []operationLockSpec{{
+		Scope: "credential", ResourceID: credentialID, Operation: operationLockMutation,
+		Metadata: operationLockMetadata(map[string]any{"action": action, "credentialId": credentialID}),
+	}}
+}
+
 func appInstanceOperationLockSpecs(action string, instances []store.AppInstance) []operationLockSpec {
 	specs := make([]operationLockSpec, 0, len(instances))
 	for _, instance := range instances {

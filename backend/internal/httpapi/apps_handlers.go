@@ -550,7 +550,11 @@ func (a *API) installAppName(w http.ResponseWriter, r *http.Request, app string)
 		writeError(w, http.StatusInternalServerError, "INSTALL_PLAN_STORE_FAILED", err.Error(), map[string]any{"app": def.Name})
 		return
 	}
-	locks, ok := a.acquireTaskOperationLocks(w, lang, task, appInstallOperationLockSpecs(def.Name, serverIDs))
+	lockSpecs := appInstallOperationLockSpecs(def.Name, serverIDs)
+	if strings.EqualFold(def.Name, "mysql") {
+		lockSpecs = append(lockSpecs, credentialOperationLockSpecs("mysql-install", paramString(moduleReq.Parameters, "rootCredentialId", ""))...)
+	}
+	locks, ok := a.acquireTaskOperationLocks(w, lang, task, lockSpecs)
 	if !ok {
 		return
 	}
@@ -584,11 +588,15 @@ func (a *API) installAppName(w http.ResponseWriter, r *http.Request, app string)
 			}
 			return err
 		}
-		if err := a.bindInstallCredentialReferences(def.Name, moduleReq, log); err != nil {
+		if err := a.bindInstallCredentialReferences(def.Name, moduleReq, log, installStartedAt); err != nil {
+			marked, markErr := a.markRecordedInstallInstancesFailed(moduleReq, installStartedAt, task.ID, err)
+			if markErr != nil {
+				log.Error(i18n.Text(lang, "api.installFailedInstanceRecordFailed"), markErr)
+			}
 			if count, recordErr := a.recordFailedInstallInstances(ctx, moduleReq, installStartedAt, task.ID, err); recordErr != nil {
 				log.Error(i18n.Text(lang, "api.installFailedInstanceRecordFailed"), recordErr)
-			} else if count > 0 {
-				log.Info(i18n.Text(lang, "api.installFailedInstanceRecorded"), count)
+			} else if count+marked > 0 {
+				log.Info(i18n.Text(lang, "api.installFailedInstanceRecorded"), count+marked)
 			}
 			return err
 		}
