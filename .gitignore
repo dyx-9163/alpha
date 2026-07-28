@@ -25,6 +25,7 @@ data/
 *.db-wal
 /tmp/
 /.codex-cache/
+/backend/.codex-cache/
 /deliverables/
 
 # Large offline resource bundles

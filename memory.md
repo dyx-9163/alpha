@@ -968,3 +968,68 @@
 - 结论：过去日期只纳入该日期的闭合轮转文件；今天额外纳入最外层普通活动日志，并采用固定长度字节快照：打开文件后记录设备、inode 和初始大小，只读取该长度，允许同一文件继续追加但新增字节不进入本次归档，若截断、替换或轮转则任务失败。清单记录快照时间、捕获长度和源/归档 SHA256，因此一致性指任务快照时刻已捕获前缀与归档逐字节一致，而不是与任务结束后仍增长的文件一致。
 - 问题：用户要求 Runtime 支持多选下线、移除服务表 CPU/内存、Pod 自动获取指标、修复实时日志空白，并防止坏更新包导致模块持续重启或阻塞后续更新。
 - 结论：只读现场复现确认实时日志后端已推送且页面统计为 200 行，但虚拟列表行窗口为空、上下占位高度无效，空白发生在前端虚拟滚动；Pods 首次进入只请求列表而未请求 stats，因此 CPU/内存显示 `-`。当前 agent 的新容器使用 `unless-stopped`，首次 readiness 失败后可能遗留容器，周期调和又会重启同一失败规范；实例变更已有 300 秒进度截止、交互优先和 409 互斥，旧的无限串行阻塞已被收敛，但坏规范的失败处置仍需明确自动回滚或隔离策略。本轮未修改业务代码或现场服务。
+- 问题：用户要求本轮先不处理坏更新包、健康检查失败和自动回滚，因为现有回滚逻辑需要后续单独评估。
+- 结论：本轮实施范围缩小为 Runtime 多选批量下线、服务页移除 CPU/内存列、Pods 自动加载指标和实时日志虚拟列表空白修复；制品更新、健康检查、回滚、失败隔离与持续重启明确不改。设计文档为 `docs/superpowers/specs/2026-07-28-aifar-runtime-batch-offline-metrics-log-rendering-design.md`，已独立提交，待用户复核后再编写实施计划。
+- 问题：用户询问将新版 `aifar-server` 更新到客户环境时，现有 SQLite 数据库会被覆盖还是自动新增表。
+- 结论：只替换服务端二进制并保持 `AIFAR_DATABASE_PATH`、工作目录及凭据密钥不变时，服务会打开原数据库，在启动阶段通过 `create table if not exists`、缺列检测和带版本记录的事务迁移自动新增表、索引和字段，不会主动覆盖已有业务数据；迁移失败会导致服务拒绝启动。正式发布包不包含 `data/`，但部署操作仍必须先停止服务并备份数据库，禁止删除或覆盖现有 `data/aifar.db`，也不要覆盖客户生产配置或改变相对路径所依赖的工作目录。
+- 问题：用户追问升级新版 `aifar-server` 时 `aifar-agent` 的更新和状态保留行为。
+- 结论：`aifar-agent` 不使用 SQLite、没有表迁移；其持久期望状态默认位于目标机 `/var/lib/aifar-agent/instances/<instance>/runtime-spec.json`。仅升级并重启面板不会立即遍历节点更新 agent；扩缩容、自动扩缩容和 Runtime 全部重启路径会比较目标 agent 的校验值与能力，按需覆盖 `/usr/local/bin/aifar-agent`、只重启 agent 服务，再从原 JSON 状态加载和调和，正常不会删除状态或主动重启所有业务容器，但会修正与期望状态不一致的容器。当前自动升级实现没有旧 agent 备份和失败自动回滚，客户更新应采用临时上传、校验、备份、原子替换、重启验证和失败回滚流程。
+
+## 2026-07-28
+- 问题：Task 5 第四轮修复要求收紧 MySQL 备份 manifest 的数字主机别名与 Store ID fallback，并补齐 Linux 描述符脚本行为证据。
+- 结论：manifest 仅接受 24 位小写十六进制或当前 19 位正数 UnixNano fallback，拒绝 legacy decimal/octal/0x IPv4 别名且保留普通 DNS；备份/恢复 WSL 测试已覆盖独立 argv、四类不同描述符、精确 JS、路径替换、不安全对象矩阵、精确退出码、secret 不泄露和无 JS 残留。真实 openEuler/mysqlsh/SSH 仍属于 Task 12 验收。
+
+- 问题：实现 MySQL 单体与 InnoDB Cluster 备份还原的安全清单、固定逻辑脚本和 Linux 文件边界。
+- 结论：Task 5 已完成并通过最终独立复审；清单严格校验受控 ID、拓扑和 endpoint，legacy IPv4 仅拒绝真实可表示别名；backup/restore 使用匿名已删除 memfd 承载脚本并扫描任务树任意后缀残留。MySQL 包测试及 Ubuntu WSL 逻辑/所有权边界验证通过；真实 openEuler、打包 MySQL Shell、SSH、挂载与 SELinux 留待 Task 12 验收。
+- 问题：接通单体 MySQL 备份的 worker、API、审计、锁、列表、保留候选和中英文错误路径。
+- 结论：Task 6 已完成并通过两轮修复复审；15 步任务在执行时解析唯一 admin 凭据，固定脚本通过匿名 memfd 执行，归档只经 partial/checksum/受控仓库提交，后续记录、retention 或 cleanup 失败会撤销归档并保留 failed 记录。仓库空间按实际挂载根检查，secret context 所有失败组合均关闭删除，远端清理失败以脱敏证据合并；handler 保留稳定错误码且任务/错误文案集中 zh/en catalog。MySQL、HTTP API、i18n 新鲜全包测试通过；真实 openEuler/NAS/SSH/MySQL 留待 Task 12。
+- 问题：为 MySQL 备份补充受控校验、同步删除和保留策略实际清理，并消除文件与数据库状态不一致风险。
+- 结论：Task 7 已完成并通过两轮修复复审；verify 以单一 backup target 的四步 worker 执行，只严格合并非敏感校验 metadata。删除保护要求存在同实例且完整 Verify 成功的替代恢复点；repository 用持有进程/跨进程锁的 staged delete 原子隔离目录，DB 标记失败非覆盖回滚，retention 同样使用事务且失败仅脱敏告警。DELETE 与 retention 在实例锁内重读并复核 authoritative standalone 归属，阻断 app/topology/server TOCTOU。backuprepo、MySQL、HTTP API、i18n 新鲜全包测试通过；真实 openEuler/NAS 原子性、crash 与 SELinux 留待 Task 12。
+- 问题：Task 8 单体还原实施前发现 local_infile 调和 marker 与错误码的持久化契约未定稿。
+- 结论：实现已暂停且未创建 Task 8 测试、生产文件或提交。需先确定 app_instances.metadata 中 marker 的字段名、版本和非敏感字段，以及 `MYSQL_LOCAL_INFILE_RESTORE_FAILED` 与既有 `MYSQL_RESTORE_LOCAL_INFILE_RESTORE_FAILED` 的兼容策略；建议采用版本化 `mysqlReconciliation` 对象，并新增正确错误码、保留旧码只作兼容映射。
+- 问题：Task 8 首轮复审要求最终还原校验比较可信的 table 数量、关键表样本与摘要，但 v1 manifest 未保存这些期望值。
+- 结论：Fix1 已暂停且未创建修复代码、测试或提交。需要先确定验证期望来自扩展后的备份 manifest、用户配置的关键表，还是仅做结构校验；推荐为新备份引入 manifest v2，从实际 dump 完成产物生成结构统计和 AIFAR digest，并对显式配置的关键表保存可验证摘要，旧 v1 备份仅允许降级结构校验且必须显式提示，不能伪装成完整数据校验。
+- 问题：实现 MySQL standalone 备份的 worker、API、锁、审计与列表闭环。
+- 结论：Task 6 已通过 MySQL 与 HTTP 包测试；备份使用执行时绑定管理员凭据、受控仓库 partial/commit、共享 mutate 锁和精确 15 步任务，失败保留记录且不发布最终归档。真实 openEuler、MySQL Shell、SSH、挂载与 SELinux 仍留待 Task 12 验收。
+- 问题：修复 MySQL 备份 DELETE 与 retention 在实例 mutate 锁前验证后继续使用陈旧实例快照的 TOCTOU。
+- 结论：DELETE 获锁后、retention 每个候选删除前均重新读取权威实例，并要求 ID、MySQL app、standalone 拓扑及 ServerID 同时匹配锁前快照和备份归属；不一致时 DELETE 返回稳定本地化错误且保留文件/记录并审计失败，retention 仅写脱敏本地化告警并保留新备份成功。
+- 问题：Task 8 还原成功门禁缺少可信 table 数量、确定性样本与 manifest/task 摘要期望。
+- 结论：用户确认采用 manifest v2：新普通备份和 pre-restore 备份只从已完成的 MySQL Shell dump 产物生成规范化文件清单摘要、完整业务 schema/base table 集合、每表 rowsWritten/主键资格及每 schema 最多 3 张主键表确定性样本；旧 v1 仅允许列表、校验和删除，破坏性还原或重建在任何远端 mutation 前以 MYSQL_RESTORE_MANIFEST_INVALID 拒绝。规格修订提交为 8b848d50，Task 8 Fix1 待书面规格复核确认后继续。
+- 问题：Task 8 Fix2 核对真实 MySQL Shell 8.0.36 元数据后发现 manifest v2 的逐表 rowsWritten 来源不可用。
+- 结论：官方 8.0.36 源码、单测 fixture 与当前离线包二进制均表明 @.done.json 只有 end、dataBytes、tableDataBytes、chunkFileBytes；schema/table metadata 可提供完整表目录和 primaryIndex，但没有逐表 tableRows/rowsWritten，该字段在后续版本才加入。Fix2 在无代码/测试/提交时暂停，需人工选择升级 mysqlsh、解析全部 dump 数据文件计算行数，或把成功门禁降为完整表目录与文件清单校验。
+- 问题：用户为 MySQL Shell 8.0.36 的 manifest v2 验证来源选择方案 3。
+- 结论：保留 MySQL Shell 8.0.36；v2 严格验证完成标记、闭合 schema/base-table metadata 目录和全文件清单，不保存逐表行数、不执行抽样 COUNT。还原成功门禁为持久化 load_complete、MySQL ping、业务 schema/base-table 目录精确一致及当前 task/canonical manifest 摘要一致，并明确不宣称逐表行数一致。设计与计划修订提交为 56e4e942，Fix2 在书面规格确认前保持暂停。
+- 问题：Task 8 Fix4 发现 JSON 元数据集合取并集会掩盖 `@.json`/`@.done.json` 与 schema/table catalog 路径重叠，使一个控制文档可同时满足两个图角色。
+- 结论：dump helper 在 claim schema/table metadata 时先拒绝两个保留控制路径，再执行完整 JSON 集合相等校验；独立 schema/table basename 冲突 fixture、完整 helper fixture 和 MySQL 包测试均通过。实现仅修改 `backup.go` 与 `backup_dump_contract_test.go`，真实 openEuler/MySQL Shell 验收仍属于 Task 12。
+- 问题：实现 InnoDB Cluster 的 MySQL 逻辑备份与健康 PRIMARY 还原。
+- 结论：Cluster backup/restore 在 worker 执行时以 app_clusters/app_cluster_members 的原始 clusterId 解析三成员目录，再以 performance_schema.replication_group_members 强制三个 ONLINE 成员、唯一 PRIMARY、端点和 UUID 一一对应；只对运行时 PRIMARY dump/load。manifest/metadata 记录非敏感 clusterId、成员角色/状态和 Router 摘要；cluster backup/restore 共享 app-cluster/raw-clusterId/mutate 锁，列表/retention 跨成员按 backup ID 去重。还原复用 v2 清单、pre-restore backup、local_infile guard，load 后复检成员与 Router，失败标为 restore_incomplete 且不自动回载 pre-restore backup。MySQL/HTTP 包测试通过；真实 SSH/MySQL Shell/Router/openEuler 验收仍留 Task 12。
+- 问题：Task 9 Fix round 1 修复 MySQL cluster 变更锁和 restore failover 窗口。
+- 结论：MySQL cluster check、bulk delete、cluster start、backup 和 restore 统一使用 raw clusterId 的 app-cluster/mutate 锁；单体及非 MySQL 继续实例锁。restore 在 schema mutation 前重新解析运行时 PRIMARY/ONLINE 成员，PRIMARY 改变或拓扑不健康会在破坏性命令前失败。Router 6446 以临时表插入/读取验证并使用受控 secret context；cluster 计划与进度使用单个 cluster target，避免预先虚构成员执行步骤。
+- 问题：补齐 Task 9 cluster runtime 拒绝与 manifest 覆盖矩阵。
+- 结论：模块级 fixture 覆盖 RECOVERING/OFFLINE/ERROR、缺失或双 PRIMARY、运行时/持久成员不全、UUID 重复和代表实例不在 cluster；所有拒绝均在 dump 前发生。成功备份持久化三个运行时成员角色/状态和非敏感 Router 摘要；cluster plan 只有一个执行 target，Router 6446 验证固定为临时表写后读并不经命令行暴露凭据。
+- 问题：补齐 Task 9 Fix round 1 的 PRIMARY 切换、load 后成员异常和 Router 事务失败恢复生命周期用例。
+- 结论：新增三个 cluster restore lifecycle fixtures，验证切换在 schema mutation 前以 MYSQL_RESTORE_PRIMARY_CHANGED 失败；load 后成员/Router 异常以 MYSQL_RESTORE_INCOMPLETE、restore_incomplete 和保留维护确认失败，不会自动回载 pre-restore 备份，且逻辑恢复保持 skipBinlog:false。测试首先揭示 reconciliation marker 仅允许 standalone、使 cluster restore 在 mutation 前错误中止；最小修复允许 innodb-cluster 并保持 MySQL/server 归属校验。cluster restore plan 与实际 terminal lifecycle names 对齐，防止单 cluster target 留下未关闭计划步骤。MySQL 与 HTTP 包测试通过；真实 SSH/MySQL Shell/Router/openEuler 仍留 Task 12 验收。
+- 问题：Task 9 Fix round 2 补齐 Cluster 单实例删除锁、Router 选库、backup plan/runtime identity 与真实预还原备份成功闭环。
+- 结论：单实例 Cluster delete 先要求 metadata.clusterId 为非空 JSON string，再取得 app-cluster/raw clusterId/mutate 锁；缺失或非字符串值以 MYSQL_BACKUP_CLUSTER_UNHEALTHY 在建 task 前拒绝。Router 6446 事务从已规范化 manifest 选择业务 schema 并先 USE 安全标识符；cluster backup plan 和运行 recorder 共享同一 ordered step names。成功 fixture 覆盖真实 cluster pre-restore backup、current PRIMARY load、Router/member 验证、skipBinlog:false、verified phase 和 terminal success。没有持久化“维护中”状态：maintenanceConfirmed 仅请求参数，backup metadata 只有 restore phase/task/digest，local_infile marker 成功恢复后会清除；是否持久化 retained-maintenance marker 需产品/存储契约决定，未擅自实现。
+- 问题：用户选择 MySQL 还原失败后的实例/集群控制面维护标记方案。
+- 结论：拟采用 `app_instances.metadata.mysqlMaintenance` 版本化非敏感标记：standalone 写单实例，InnoDB Cluster 在同一 SQLite 事务中写三个权威成员；schema mutation 开始后的未完成还原才设置。正常 check/start/delete/backup/restore 在 handler 与锁内 service 双层失败关闭，owner-only 维护清除任务在健康/Router/local_infile 预检和明确风险确认后原子清除；该标记只保证面板控制面维护锁定，不宣称自动停止外部业务写入。字段、清除 API 和允许的灾难恢复例外待书面设计确认。
+- 问题：复核 Task 12 显式 MySQL reconciliation Fix Round 1 是否关闭 C1/C2/I1/I2，并核对凭据传输加固交叉影响。
+- 结论：C1、I1、I2 和重复确认键拒绝已关闭；C2 仅在显式 owner worker 关闭，灾难重建重试仍通过旧 `defaultLocalInfileSessionFactory` 吞掉本地/远端 secret cleanup 失败后清除 reconciliation marker，属于 Critical。另有 Important：reconciliation 的 mysqlsh 命令未调用 `mysqlRemoteCredentialValidationCommand`，缺少读取前普通文件、非符号链接、owner、0600 校验。复核仅审代码，未重跑宽泛测试。
+- 问题：复核 MySQL 安装凭据闭包对四节点集群和事务内 clusterId 漂移的修复。
+- 结论：提交 de50ea92 已关闭上轮 I1；凭据绑定与失败补偿支持三台及以上完整目标集合，Store 在事务内复核拓扑、共同非空 clusterId 和实例身份。四节点成功、注入失败及中间成员 clusterId 漂移原子拒绝的聚焦测试通过，独立复审 PASS。
+- 问题：完成 MySQL 单体与 InnoDB Cluster 备份、校验、受控还原、完整停机启动和灾难重建功能的最终安全收口。
+- 结论：实现已在 `codex/mysql-backup-restore` 本地分支完成并通过凭据、恢复安全和运行手册独立复审；还原在远端工作目录及 task-scoped 凭据清理成功后才发布 verified 并解除 maintenance，普通 Verify/Restore 仅接受 successful logical-full。`pnpm test`、前端 270 项、脚本 290 项、工具 25 项、前端构建和 `pnpm test:local` 双平台打包/归档复验通过。真实 openEuler、MySQL 8.0.36、三节点 InnoDB Cluster、Router、NAS、SSH 与登录浏览器验收因未提供目标环境均标记 NOT EXECUTED，分支未推送。
+- 问题：将 MySQL 单体与 InnoDB Cluster 备份还原功能合并到当前 `codex/status-collector-realtime` 分支并验证。
+- 结论：本地 merge commit 为 `dee0fd32`，冲突解析同时保留 Runtime 诊断/流式 SSH/实例锁与 MySQL 备份配置/受控下载/集群锁；在该提交的独立干净工作树中 `pnpm test:local` 通过，覆盖后端全包、前端 309 项、脚本 291 项、工具 25 项、双平台构建、打包及归档校验。当前工作区原有未提交 Runtime 改动未进入 merge commit，未推送远端。
+- 问题：合并完成后检查当前含未提交 Runtime 改动的主工作区是否可直接启动测试。
+- 结论：干净 merge commit 验证通过，但当前未提交的 `backend/internal/apps/aifar/scale.go:50` 引用了未定义的 `service`，`go test ./internal/apps/aifar` 编译失败；该错误属于合并前后持续变化的 Runtime 在途改动，未擅自修改，直接启动后端前需先完成或暂存这组改动。
+- 问题：用户确认“脏工作区”是否指 `status-collector-realtime`。
+- 结论：当前检出分支确为 `codex/status-collector-realtime`；“脏工作区”仅指该 checkout 存在未提交的 Runtime 文件修改及未跟踪缓存目录，不代表 `dee0fd32` MySQL 合并提交不干净或验证失败。
+- 问题：实施 Runtime 按单个服务器本地日期导出宿主机历史/当天原始日志，保证归档日志字节与任务快照一致且不使用 `docker logs`。
+- 结论：API/UI/Store 已改为单个 `localDate`；历史日期仅选择路径或文件名含该日期的轮转日志，当天额外选择服务日志根目录顶层 `*.log` 活动文件并按打开时长度读取。导出不再解析时间戳、过滤或脱敏，使用 descriptor、device/inode、长度和前缀 SHA256 校验；本地 tar 提交前严格复验 RAW manifest 与每个 `services/` 条目的大小、SHA256 和一一覆盖，旧 V2 manifest 保持兼容。500 MiB 只限制原始日志快照，3 GiB 限制总解压内容；独立复审无剩余 Critical/Important。隔离副本 AIFAR 全包和聚焦边界测试、当前前端 309 项及 Web 构建通过；未部署现场服务器、未更新 agent、未离线打包。
+- 问题：修复 Runtime Deployments 多选下线、Services 指标列、Pods 指标自动加载和实时日志空白；坏更新包/回滚问题延期。
+- 结论：在 `codex/runtime-batch-offline` 隔离分支实现单任务/单 Agent 提交/一次元数据持久化的多服务批量下线，前端仅允许选择在线 deployment 并接入确认与任务跟踪；Services 不再显示 CPU/内存，Pods 进入、作用域变化和状态事件时自动取指标，日志虚拟列表会把非法滚动状态归零。前端 256 项、Web 构建、第二次完整后端测试及后端三目标构建通过；第五点回滚逻辑未修改，原 `codex/status-collector-realtime` 工作区未合并或清理。
+- 问题：用户选择把 `codex/runtime-batch-offline` 本地合并回 `codex/status-collector-realtime`。
+- 结论：已创建本地 merge commit `402c69f9`，并在合并中保留当前分支的 MySQL registry 契约、Runtime 锁释放断言和原未提交文件。聚焦 AIFAR/HTTP API 与前端 311 项通过；纯 merge commit 的完整后端套件仅有两个既有诊断清理分页测试因固定 30 秒等待在并发负载下超时，两个用例单独分别 29.00 秒和 20.41 秒通过，工作区已有未提交修订将等待上限增至 60 秒。该修订未擅自提交，两个 stash、功能分支和隔离工作树暂时保留，待决定后再完成全量复验与清理。
+- 问题：用户要求启动当前 `codex/status-collector-realtime` 工作区，发现问题后直接修复。
+- 结论：修复批量扩缩容重构遗留的未定义 `service` 编译错误，锁释放改为复用与加锁完全一致的规范化组合键并补释放断言；该修复随后随 Runtime 合并进入 `402c69f9`。完整门禁首次暴露两个诊断清理条件等待在 Windows 多包并发负载下超时，隔离连续 5 轮均通过，测试安全上限从 2/30 秒调整为 10/60 秒后 `pnpm test:local` 通过：前端 311 项、脚本 291 项、工具 25 项、双平台构建/打包及 2974/2962 文件和归档复验全部通过。另将误写为 `backend*`、`/backend/*`、`/deliverables*` 的宽泛忽略规则收紧为仅忽略 `backend/.codex-cache/` 和既有精确目录；最终 HEAD 实际启动后 live、ready 和前端均返回 200，临时监听进程已精确回收。

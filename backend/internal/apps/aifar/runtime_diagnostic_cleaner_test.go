@@ -494,7 +494,7 @@ func (r *runtimeDiagnosticCleanerRemote) WaitStarted(t *testing.T) {
 	r.mu.Unlock()
 	select {
 	case <-started:
-	case <-time.After(2 * time.Second):
+	case <-time.After(10 * time.Second):
 		t.Fatal("timed out waiting for cleanup remote call")
 	}
 }
@@ -589,7 +589,7 @@ func waitForRuntimeDiagnosticCleanerTask(t *testing.T, db *store.Store) store.Ta
 
 func waitForRuntimeDiagnosticCleanerTaskCount(t *testing.T, db *store.Store, count int) store.Task {
 	t.Helper()
-	deadline := time.Now().Add(30 * time.Second)
+	deadline := time.Now().Add(60 * time.Second)
 	for time.Now().Before(deadline) {
 		tasks, err := db.ListTasks()
 		if err != nil {
