@@ -31,7 +31,8 @@ describe('AIFAR Runtime diagnostic archives', () => {
       })
     })
     app.component('ElTable', tableStub)
-    for (const name of ['ElAlert', 'ElButton', 'ElCheckbox', 'ElCheckboxGroup', 'ElDatePicker', 'ElDialog', 'ElForm', 'ElFormItem', 'ElRadioButton', 'ElRadioGroup', 'ElTableColumn', 'ElTag', 'ElTooltip']) {
+    app.component('ElDatePicker', datePickerStub)
+    for (const name of ['ElAlert', 'ElButton', 'ElCheckbox', 'ElCheckboxGroup', 'ElDialog', 'ElForm', 'ElFormItem', 'ElRadioButton', 'ElRadioGroup', 'ElTableColumn', 'ElTag', 'ElTooltip']) {
       app.component(name, passThroughComponent)
     }
 
@@ -39,12 +40,42 @@ describe('AIFAR Runtime diagnostic archives', () => {
 
     expect(html).toContain('data-table-height="100%"')
   })
+
+  it('renders one server-local calendar date picker', async () => {
+    const app = createSSRApp({
+      render: () => h(AifarRuntimeDiagnosticsPanel, {
+        instanceId: '',
+        deployments: [],
+        targetQuery: ''
+      })
+    })
+    app.component('ElTable', tableStub)
+    app.component('ElDatePicker', datePickerStub)
+    for (const name of ['ElAlert', 'ElButton', 'ElCheckbox', 'ElCheckboxGroup', 'ElDialog', 'ElForm', 'ElFormItem', 'ElRadioButton', 'ElRadioGroup', 'ElTableColumn', 'ElTag', 'ElTooltip']) {
+      app.component(name, passThroughComponent)
+    }
+
+    const html = await renderToString(app)
+
+    expect(html).toContain('data-picker-type="date"')
+    expect(html).toContain('data-value-format="YYYY-MM-DD"')
+  })
 })
 
 const tableStub = defineComponent({
   inheritAttrs: false,
   setup(_, { attrs }) {
     return () => h('div', { 'data-table-height': attrs.height })
+  }
+})
+
+const datePickerStub = defineComponent({
+  inheritAttrs: false,
+  setup(_, { attrs }) {
+    return () => h('span', {
+      'data-picker-type': attrs.type,
+      'data-value-format': attrs['value-format']
+    })
   }
 })
 

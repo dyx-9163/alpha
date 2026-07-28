@@ -24,7 +24,7 @@ import (
 	"aifar-deployment/backend/internal/store"
 )
 
-//go:embed templates/install.sh templates/uninstall.sh templates/update-artifact.sh templates/update-artifact-bundle.sh templates/rollback-artifact.sh templates/autoscale-out.sh templates/runtime-config.sh templates/runtime-diagnostics-estimate.sh templates/runtime-diagnostics-export.sh templates/runtime-diagnostics-filter.awk templates/runtime-diagnostics-cleanup.sh templates/service-install.sh templates/runtime-reconcile.sh templates/runtime-restart.sh templates/scale-service.sh
+//go:embed templates/install.sh templates/uninstall.sh templates/update-artifact.sh templates/update-artifact-bundle.sh templates/rollback-artifact.sh templates/autoscale-out.sh templates/runtime-config.sh templates/runtime-diagnostics-estimate.sh templates/runtime-diagnostics-export.sh templates/runtime-diagnostics-cleanup.sh templates/service-install.sh templates/runtime-reconcile.sh templates/runtime-restart.sh templates/scale-service.sh
 var templateFS embed.FS
 
 type Logger = installerkit.Logger

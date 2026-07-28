@@ -3,7 +3,7 @@
     <div class="runtime-diagnostics-head">
       <div>
         <h3>{{ t('containers.diagnosticArchives') }}</h3>
-        <p>{{ t('containers.diagnosticsLogSourceHost') }}</p>
+        <p>{{ t('containers.diagnosticsRawLogSource') }}</p>
         <span>{{ t('containers.diagnosticArchiveCount', { count: exportsPage.total }) }}</span>
       </div>
       <el-button size="small" type="primary" :disabled="!instanceId" @click="openDialog">{{ t('containers.diagnosticsExport') }}</el-button>
@@ -20,9 +20,12 @@
           </div>
         </template>
       </el-table-column>
-      <el-table-column :label="t('containers.diagnosticsTimeRange')" min-width="210">
+      <el-table-column :label="t('containers.diagnosticsLocalDate')" min-width="210">
         <template #default="{ row }">
-          <div class="runtime-diagnostics-stacked"><span>{{ formatDate(row.sinceAt) }}</span><span>{{ formatDate(row.untilAt) }}</span></div>
+          <div class="runtime-diagnostics-stacked">
+            <strong>{{ row.localDate || '-' }}</strong>
+            <span v-if="!row.localDate">{{ formatDate(row.sinceAt) }} - {{ formatDate(row.untilAt) }}</span>
+          </div>
         </template>
       </el-table-column>
       <el-table-column :label="t('containers.diagnosticsServices')" min-width="190">
@@ -54,20 +57,15 @@
       <template #empty><span>{{ t('containers.diagnosticsNoRecords') }}</span></template>
     </el-table>
 
-    <el-dialog v-model="dialogVisible" :title="t('containers.diagnosticsExportTitle')" width="760px" class="runtime-diagnostics-dialog" @closed="resetDialog">
+    <el-dialog v-model="dialogVisible" :title="t('containers.diagnosticsRawExportTitle')" width="760px" class="runtime-diagnostics-dialog" @closed="resetDialog">
       <el-form label-position="top">
-        <el-form-item :label="t('containers.diagnosticsTimeRange')">
-          <el-radio-group v-model="mode">
-            <el-radio-button value="last2h">{{ t('containers.diagnosticsLast2Hours') }}</el-radio-button>
-            <el-radio-button value="custom">{{ t('containers.diagnosticsCustomRange') }}</el-radio-button>
-          </el-radio-group>
+        <el-form-item :label="t('containers.diagnosticsLocalDate')">
           <el-date-picker
-            v-if="mode === 'custom'"
-            v-model="diagnosticRange"
+            v-model="localDate"
             class="runtime-diagnostics-range"
-            type="datetimerange"
-            :start-placeholder="t('containers.diagnosticsTimeRange')"
-            :end-placeholder="t('common.time')"
+            type="date"
+            value-format="YYYY-MM-DD"
+            :placeholder="t('containers.diagnosticsLocalDate')"
           />
         </el-form-item>
         <el-form-item :label="t('containers.diagnosticsServices')">
@@ -80,16 +78,19 @@
         </div>
       </el-form>
 
+      <el-alert type="warning" :closable="false" show-icon :title="t('containers.diagnosticsRawWarning')" />
+
       <div v-if="estimate" class="runtime-diagnostics-estimate">
         <div class="runtime-diagnostics-estimate-note">
-          <strong>{{ t('containers.diagnosticsLogSourceHost') }}</strong>
-          <span>{{ t('containers.diagnosticsEstimateHint') }}</span>
+          <strong>{{ t('containers.diagnosticsRawLogSource') }}</strong>
+          <span>{{ t('containers.diagnosticsRawHistoryHint') }}</span>
         </div>
         <div class="runtime-diagnostics-estimate-grid">
           <div><span>{{ t('containers.diagnosticsCandidateFiles') }}</span><strong>{{ estimate.candidateFiles }}</strong></div>
           <div><span>{{ t('containers.diagnosticsCandidateScanBytes') }}</span><strong>{{ formatBytes(estimate.candidateScanBytes) }}</strong></div>
           <div><span>{{ t('containers.diagnosticsEstimatedDuration') }}</span><strong>{{ formatDurationRange(estimate) }}</strong></div>
           <div><span>{{ t('containers.diagnosticsServerTimezone') }}</span><strong>{{ estimate.serverTimezone || '-' }}</strong></div>
+          <div><span>{{ t('containers.diagnosticsLocalDate') }}</span><strong>{{ estimate.localDate || localDate }}</strong></div>
         </div>
 
         <div class="runtime-diagnostics-estimate-section">
@@ -119,7 +120,7 @@
           show-icon
           :title="diagnosticBlockMessage(estimate)"
         />
-        <el-alert v-else type="info" :closable="false" show-icon :title="t('containers.diagnosticsEstimateHint')" />
+        <el-alert v-else type="info" :closable="false" show-icon :title="estimate.currentDate ? t('containers.diagnosticsTodaySnapshotHint') : t('containers.diagnosticsRawHistoryHint')" />
         <el-alert
           v-for="warning in estimate.warnings || []"
           :key="warning"
@@ -155,7 +156,7 @@ import {
   fetchRuntimeDiagnosticExports
 } from './api'
 import {
-  defaultRuntimeDiagnosticWindow,
+  defaultRuntimeDiagnosticDate,
   emptyRuntimeDiagnosticExportPage,
   enabledRuntimeDiagnosticServices,
   runtimeDiagnosticCapacityBlocked,
@@ -180,10 +181,8 @@ const { t } = useI18n()
 const router = useRouter()
 const taskProgress = useTaskProgressStore()
 const dialogVisible = ref(false)
-const mode = ref<'last2h' | 'custom'>('last2h')
 const selectedServices = ref<string[]>([])
-const sinceAt = ref<Date>()
-const untilAt = ref<Date>()
+const localDate = ref(defaultRuntimeDiagnosticDate())
 const estimate = ref<RuntimeDiagnosticEstimate | null>(null)
 const estimateFingerprint = ref('')
 const exportsPage = ref<RuntimeDiagnosticExportPage>(emptyRuntimeDiagnosticExportPage())
@@ -196,13 +195,6 @@ let exportsRequestSequence = 0
 let estimateRequestSequence = 0
 
 const availableServices = computed(() => enabledRuntimeDiagnosticServices(props.deployments))
-const diagnosticRange = computed({
-  get: (): [Date, Date] | undefined => sinceAt.value && untilAt.value ? [sinceAt.value, untilAt.value] : undefined,
-  set: (value: [Date, Date] | undefined) => {
-    sinceAt.value = value?.[0]
-    untilAt.value = value?.[1]
-  }
-})
 const diagnosticRequestFingerprint = computed(() => {
   const request = payload()
   return request ? runtimeDiagnosticRequestFingerprint(props.targetQuery, request) : ''
@@ -216,11 +208,7 @@ const submitDisabledReason = computed(() => runtimeDiagnosticSubmitDisabledReaso
   submitting: submitting.value
 }))
 
-watch(mode, (next) => {
-  if (next === 'last2h') resetDiagnosticWindow()
-  invalidateEstimate()
-})
-watch([selectedServices, sinceAt, untilAt], invalidateEstimate, { deep: true })
+watch([selectedServices, localDate], invalidateEstimate, { deep: true })
 watch(() => [props.instanceId, props.targetQuery], () => {
   invalidateEstimate()
   exportsPage.value = emptyRuntimeDiagnosticExportPage()
@@ -235,8 +223,7 @@ watch(() => taskProgress.items.map(({ id, status }) => ({ id, status })), (items
 }, { deep: true })
 
 function openDialog() {
-  mode.value = 'last2h'
-  resetDiagnosticWindow()
+  localDate.value = defaultRuntimeDiagnosticDate()
   selectedServices.value = availableServices.value
   invalidateEstimate()
   dialogVisible.value = true
@@ -244,12 +231,6 @@ function openDialog() {
 
 function resetDialog() {
   invalidateEstimate()
-}
-
-function resetDiagnosticWindow() {
-  const window = defaultRuntimeDiagnosticWindow()
-  sinceAt.value = window.sinceAt
-  untilAt.value = window.untilAt
 }
 
 function invalidateEstimate() {
@@ -260,11 +241,10 @@ function invalidateEstimate() {
 }
 
 function payload(): RuntimeDiagnosticRequest | null {
-  if (!props.instanceId || !sinceAt.value || !untilAt.value) return null
+  if (!props.instanceId || !localDate.value) return null
   return {
     instanceId: props.instanceId,
-    sinceAt: sinceAt.value.toISOString(),
-    untilAt: untilAt.value.toISOString(),
+    localDate: localDate.value,
     services: selectedServices.value
   }
 }
@@ -412,7 +392,7 @@ function limitLabelKey(key: 'file' | 'scan' | 'filtered' | 'archive') {
   return {
     file: 'containers.diagnosticsMaxFileScan',
     scan: 'containers.diagnosticsMaxTotalScan',
-    filtered: 'containers.diagnosticsMaxFiltered',
+    filtered: 'containers.diagnosticsRawSnapshotLimit',
     archive: 'containers.diagnosticsMaxArchive'
   }[key]
 }
@@ -423,8 +403,8 @@ function storageKindLabel(kind: RuntimeDiagnosticExport['storageKind']) {
 
 function diagnosticBlockMessage(value: RuntimeDiagnosticEstimate) {
   const reason = value.blockReason ? ` (${value.blockReason})` : ''
-  if (runtimeDiagnosticCapacityBlocked(value)) return `${t('containers.diagnosticsCapacityBlocked')}${reason}`
-  return `${t('containers.diagnosticsSplitSuggestion')}${reason}`
+  if (runtimeDiagnosticCapacityBlocked(value)) return `${t('containers.diagnosticsDailyCapacityBlocked')}${reason}`
+  return `${t('containers.diagnosticsDailySplitSuggestion')}${reason}`
 }
 
 function diagnosticStatusType(row: RuntimeDiagnosticExport) {

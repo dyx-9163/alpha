@@ -45,8 +45,7 @@ var (
 
 type runtimeDiagnosticRequestPayload struct {
 	InstanceID string   `json:"instanceId"`
-	SinceAt    string   `json:"sinceAt"`
-	UntilAt    string   `json:"untilAt"`
+	LocalDate  string   `json:"localDate"`
 	Services   []string `json:"services"`
 }
 
@@ -64,7 +63,7 @@ type runtimeDiagnosticDeleteTaskResponse struct {
 var runtimeDiagnosticExportStepNames = []string{
 	"validate-local-storage",
 	"discover-log-files",
-	"filter-and-redact",
+	"snapshot-raw-log-files",
 	"build-manifest",
 	"stream-local-archive",
 	"verify-local-archive",
@@ -79,7 +78,7 @@ var runtimeDiagnosticDeleteStepNames = []string{
 
 func (a *aifarRuntimeController) estimateDiagnostics(w http.ResponseWriter, r *http.Request) {
 	lang := languageFromRequest(r)
-	payload, sinceAt, untilAt, ok := decodeRuntimeDiagnosticPayload(w, r)
+	payload, ok := decodeRuntimeDiagnosticPayload(w, r)
 	if !ok {
 		return
 	}
@@ -93,13 +92,12 @@ func (a *aifarRuntimeController) estimateDiagnostics(w http.ResponseWriter, r *h
 	}
 	actor := currentUser(r).Username
 	estimate, err := estimateRuntimeDiagnosticsWithTimeout(r.Context(), diagnostics, registry.RuntimeDiagnosticRequest{
-		Instance: instance,
-		Server:   server,
-		Language: lang,
-		Actor:    actor,
-		Services: append([]string(nil), payload.Services...),
-		SinceAt:  sinceAt,
-		UntilAt:  untilAt,
+		Instance:  instance,
+		Server:    server,
+		Language:  lang,
+		Actor:     actor,
+		Services:  append([]string(nil), payload.Services...),
+		LocalDate: payload.LocalDate,
 	})
 	if err != nil {
 		writeRuntimeDiagnosticEstimateError(w, err, instance.ID)
@@ -110,7 +108,7 @@ func (a *aifarRuntimeController) estimateDiagnostics(w http.ResponseWriter, r *h
 
 func (a *aifarRuntimeController) createDiagnosticExport(w http.ResponseWriter, r *http.Request) {
 	lang := languageFromRequest(r)
-	payload, sinceAt, untilAt, ok := decodeRuntimeDiagnosticPayload(w, r)
+	payload, ok := decodeRuntimeDiagnosticPayload(w, r)
 	if !ok {
 		return
 	}
@@ -124,13 +122,12 @@ func (a *aifarRuntimeController) createDiagnosticExport(w http.ResponseWriter, r
 	}
 	actor := currentUser(r).Username
 	diagnosticReq := registry.RuntimeDiagnosticRequest{
-		Instance: instance,
-		Server:   server,
-		Language: lang,
-		Actor:    actor,
-		Services: append([]string(nil), payload.Services...),
-		SinceAt:  sinceAt,
-		UntilAt:  untilAt,
+		Instance:  instance,
+		Server:    server,
+		Language:  lang,
+		Actor:     actor,
+		Services:  append([]string(nil), payload.Services...),
+		LocalDate: payload.LocalDate,
 	}
 	estimate, err := estimateRuntimeDiagnosticsWithTimeout(r.Context(), diagnostics, diagnosticReq)
 	if err != nil {
@@ -147,6 +144,10 @@ func (a *aifarRuntimeController) createDiagnosticExport(w http.ResponseWriter, r
 			"localReservedBytes": estimate.LocalReservedBytes, "localQuotaBytes": estimate.LocalQuotaBytes,
 		}
 		writeError(w, http.StatusConflict, runtimeDiagnosticBlockCode(estimate.BlockReason), i18n.Text(lang, "aifar.diag.estimateRejected"), details)
+		return
+	}
+	if estimate.LocalDate != payload.LocalDate || estimate.DayStartAt.IsZero() || estimate.DayEndAt.IsZero() || !estimate.DayStartAt.Before(estimate.DayEndAt) {
+		writeError(w, http.StatusInternalServerError, "RUNTIME_DIAGNOSTIC_ESTIMATE_FAILED", i18n.Text(lang, "aifar.diag.estimateFailed"), map[string]any{"instanceId": instance.ID})
 		return
 	}
 
@@ -211,8 +212,9 @@ func (a *aifarRuntimeController) createDiagnosticExport(w http.ResponseWriter, r
 		Status:        "pending",
 		StorageKind:   "local",
 		Services:      append([]string(nil), payload.Services...),
-		SinceAt:       sinceAt,
-		UntilAt:       untilAt,
+		LocalDate:     estimate.LocalDate,
+		SinceAt:       estimate.DayStartAt,
+		UntilAt:       estimate.DayEndAt,
 		CreatedBy:     actor,
 		CreatedAt:     now,
 		ExpiresAt:     estimate.ExpiresAt,
@@ -241,14 +243,15 @@ func (a *aifarRuntimeController) createDiagnosticExport(w http.ResponseWriter, r
 			return getErr
 		}
 		return diagnostics.ExportRuntimeDiagnostics(ctx, registry.RuntimeDiagnosticRequest{
-			ExportID: currentExport.ID,
-			Instance: currentInstance,
-			Server:   currentServer,
-			Language: lang,
-			Actor:    actor,
-			Services: append([]string(nil), currentExport.Services...),
-			SinceAt:  currentExport.SinceAt,
-			UntilAt:  currentExport.UntilAt,
+			ExportID:  currentExport.ID,
+			Instance:  currentInstance,
+			Server:    currentServer,
+			Language:  lang,
+			Actor:     actor,
+			Services:  append([]string(nil), currentExport.Services...),
+			LocalDate: currentExport.LocalDate,
+			SinceAt:   currentExport.SinceAt,
+			UntilAt:   currentExport.UntilAt,
 		}, runtimeDiagnosticRunContext(log))
 	})
 	if err != nil {
@@ -426,20 +429,20 @@ func (a *aifarRuntimeController) runtimeDiagnosticsModule(w http.ResponseWriter,
 	return diagnostics, true
 }
 
-func decodeRuntimeDiagnosticPayload(w http.ResponseWriter, r *http.Request) (runtimeDiagnosticRequestPayload, time.Time, time.Time, bool) {
+func decodeRuntimeDiagnosticPayload(w http.ResponseWriter, r *http.Request) (runtimeDiagnosticRequestPayload, bool) {
 	lang := languageFromRequest(r)
 	var payload runtimeDiagnosticRequestPayload
 	if !decode(w, r, &payload) {
-		return payload, time.Time{}, time.Time{}, false
+		return payload, false
 	}
 	payload.InstanceID = strings.TrimSpace(payload.InstanceID)
-	sinceAt, sinceErr := time.Parse(time.RFC3339, strings.TrimSpace(payload.SinceAt))
-	untilAt, untilErr := time.Parse(time.RFC3339, strings.TrimSpace(payload.UntilAt))
-	if payload.InstanceID == "" || sinceErr != nil || untilErr != nil || !sinceAt.Before(untilAt) {
+	payload.LocalDate = strings.TrimSpace(payload.LocalDate)
+	localDate, dateErr := time.Parse("2006-01-02", payload.LocalDate)
+	if payload.InstanceID == "" || dateErr != nil || localDate.Format("2006-01-02") != payload.LocalDate {
 		writeError(w, http.StatusBadRequest, "RUNTIME_DIAGNOSTIC_REQUEST_INVALID", i18n.Text(lang, "aifar.diag.windowInvalid"), map[string]any{"instanceId": payload.InstanceID})
-		return payload, time.Time{}, time.Time{}, false
+		return payload, false
 	}
-	return payload, sinceAt.UTC(), untilAt.UTC(), true
+	return payload, true
 }
 
 func estimateRuntimeDiagnosticsWithTimeout(parent context.Context, diagnostics registry.RuntimeDiagnosticsModule, req registry.RuntimeDiagnosticRequest) (registry.RuntimeDiagnosticEstimateResult, error) {

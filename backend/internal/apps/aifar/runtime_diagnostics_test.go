@@ -5,6 +5,8 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -308,7 +310,7 @@ func runtimeDiagnosticFixture(now time.Time) (*runtimeDiagnosticStore, store.App
 	server := store.Server{ID: "server-1", Name: "server", DeployDir: "/aifar/apps"}
 	export := store.DiagnosticExport{
 		ID: "diag_1234567890abcdef12345678", TaskID: "task-1", InstanceID: instance.ID, ServerID: server.ID,
-		Status: "pending", Services: []string{"gateway"}, SinceAt: now.Add(-time.Hour), UntilAt: now.Add(-time.Minute),
+		Status: "pending", Services: []string{"gateway"}, LocalDate: now.Format("2006-01-02"), SinceAt: now.Add(-time.Hour), UntilAt: now.Add(-time.Minute),
 		StorageKind: "remote", CreatedBy: "owner", CreatedAt: now, ExpiresAt: now.Add(runtimeDiagnosticRetention), CleanupStatus: "none",
 	}
 	db := &runtimeDiagnosticStore{
@@ -375,7 +377,7 @@ func TestRuntimeDiagnosticLocalTransactionUsesSevenSteps(t *testing.T) {
 	want := []string{
 		"validate-local-storage",
 		"discover-log-files",
-		"filter-and-redact",
+		"snapshot-raw-log-files",
 		"build-manifest",
 		"stream-local-archive",
 		"verify-local-archive",
@@ -783,7 +785,7 @@ func TestRuntimeDiagnosticHostLogSourceSelectionNoDocker(t *testing.T) {
 		`LOG_ROOT="$INSTALL_ROOT/runtime/logs"`,
 		"MAX_FILE_SCAN=1073741824",
 		"MAX_TOTAL_SCAN=2147483648",
-		"MAX_FILTERED=524288000",
+		"MAX_SNAPSHOT=524288000",
 		"AIFAR_DIAG_STREAM_V1",
 	} {
 		if !strings.Contains(combined, required) {
@@ -892,6 +894,29 @@ func TestRuntimeDiagnosticEstimateV2Protocol(t *testing.T) {
 	}
 }
 
+func TestRuntimeDiagnosticEstimateV3ProtocolCarriesServerLocalDay(t *testing.T) {
+	raw := "AIFAR_DIAG_SERVICE_V3\tgateway\t2\t1024\n" +
+		"AIFAR_DIAG_SERVICE_V3\toauth\t1\t2048\n" +
+		"AIFAR_DIAG_TOTAL_V3\t3\t3072\tAsia/Shanghai\t2026-07-28\t1785168000\t1785254400\t1\t-\n"
+	got, err := parseRuntimeDiagnosticEstimate(raw, []string{"gateway", "oauth"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.CandidateFiles != 3 || got.CandidateScanBytes != 3072 || got.ServerTimezone != "Asia/Shanghai" || got.LocalDate != "2026-07-28" ||
+		!got.DayStartAt.Equal(time.Unix(1785168000, 0).UTC()) || !got.DayEndAt.Equal(time.Unix(1785254400, 0).UTC()) || !got.CurrentDate || got.BlockReason != "" {
+		t.Fatalf("unexpected V3 total: %+v", got)
+	}
+	for _, invalid := range []string{
+		"AIFAR_DIAG_SERVICE_V3\tgateway\t1\t1\nAIFAR_DIAG_TOTAL_V3\t1\t1\tAsia/Shanghai\t2026-7-28\t1785168000\t1785254400\t1\t-\n",
+		"AIFAR_DIAG_SERVICE_V3\tgateway\t1\t1\nAIFAR_DIAG_TOTAL_V3\t1\t1\tAsia/Shanghai\t2026-07-28\t1785254400\t1785168000\t1\t-\n",
+		"AIFAR_DIAG_SERVICE_V3\tgateway\t1\t1\nAIFAR_DIAG_TOTAL_V3\t1\t1\tAsia/Shanghai\t2026-07-28\t1785168000\t1785254400\t2\t-\n",
+	} {
+		if _, err := parseRuntimeDiagnosticEstimate(invalid, []string{"gateway"}); err == nil {
+			t.Fatalf("invalid V3 estimate accepted: %q", invalid)
+		}
+	}
+}
+
 func TestRuntimeDiagnosticStreamHeaderProtocol(t *testing.T) {
 	line := "AIFAR_DIAG_STREAM_V1\taifar-diagnostics-instance-1-20260727T080000Z.tar.gz\t4096\t2\tAsia/Shanghai\n"
 	got, err := parseRuntimeDiagnosticStreamHeader(line)
@@ -935,141 +960,6 @@ func TestRuntimeDiagnosticWarningPlaceholdersStayBounded(t *testing.T) {
 	if warnings[0] != "collection-warning" {
 		t.Fatalf("warning code = %q, want collection-warning", warnings[0])
 	}
-}
-
-func TestRuntimeDiagnosticTimestampFilterFixtures(t *testing.T) {
-	awkCommand := findRuntimeDiagnosticGNUAwk(t)
-	program, err := renderRuntimeDiagnosticFilterProgram()
-	if err != nil {
-		t.Fatal(err)
-	}
-	tests := []struct {
-		name                   string
-		fixture                string
-		want                   string
-		wantParser             string
-		wantRecords            int
-		wantWarnings           int
-		unterminatedActiveTail bool
-	}{
-		{
-			name: "spring", fixture: "spring.log", wantParser: "spring", wantRecords: 2,
-			want: "2026-07-27 16:00:00,000 ERROR start-boundary\n" +
-				"    at example.Main.run(Main.java:10)\n" +
-				"Caused by: java.lang.IllegalStateException: boom\n" +
-				"    Suppressed: java.lang.RuntimeException: suppressed\n" +
-				"    ... 1 more\n" +
-				"2026-07-27 16:09:59.999 INFO inside-window\n",
-		},
-		{
-			name: "spring-bracketed", fixture: "spring-bracketed.txt", wantParser: "spring", wantRecords: 2,
-			want: "[2026-07-27 16:00:00.000] [ERROR] start-boundary\n" +
-				"    at example.Main.run(Main.java:10)\n" +
-				"Caused by: java.lang.IllegalStateException: boom\n" +
-				"[2026-07-27 16:09:59.999] [INFO ] inside-window\n",
-		},
-		{
-			name: "iso-json", fixture: "iso-json.log", wantParser: "mixed", wantRecords: 6,
-			want: "2026-07-27T08:00:00Z iso-z-boundary\n" +
-				"2026-07-27T16:01:00+08:00 iso-offset\n" +
-				"{\"timestamp\":\"2026-07-27T08:02:00Z\",\"message\":\"timestamp\"}\n" +
-				"{\"time\":\"2026-07-27T16:03:00+08:00\",\"message\":\"time\"}\n" +
-				"{\"@timestamp\":\"2026-07-27T08:04:00Z\",\"message\":\"at-timestamp\"}\n" +
-				"{\"ts\":\"2026-07-27T16:05:00+08:00\",\"message\":\"ts\"}\n",
-		},
-		{
-			name: "nginx-access", fixture: "nginx-access.log", wantParser: "nginx-access", wantRecords: 2,
-			want: "127.0.0.1 - - [27/Jul/2026:16:00:00 +0800] \"GET /start HTTP/1.1\" 200 1\n" +
-				"127.0.0.1 - - [27/Jul/2026:16:09:59 +0800] \"GET /inside HTTP/1.1\" 200 1\n",
-		},
-		{
-			name: "nginx-error", fixture: "nginx-error.log", wantParser: "nginx-error", wantRecords: 2,
-			want: "2026/07/27 16:00:00 [error] start-boundary\n" +
-				"2026/07/27 16:09:59 [warn] inside-window\n",
-		},
-		{
-			name: "unknown", fixture: "unknown.log", wantParser: "spring", wantRecords: 1, wantWarnings: 4,
-			want: "2026-07-27 16:00:00,000 INFO retained-record\n", unterminatedActiveTail: true,
-		},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			fixturePath := filepath.Join("testdata", "runtime-diagnostics", test.fixture)
-			input, err := os.ReadFile(fixturePath)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if test.unterminatedActiveTail {
-				input = bytes.TrimSuffix(input, []byte("\n"))
-			}
-			tempDir := t.TempDir()
-			programPath := filepath.Join(tempDir, "filter.awk")
-			inputPath := filepath.Join(tempDir, "input.log")
-			summaryPath := filepath.Join(tempDir, "summary.tsv")
-			if err := os.WriteFile(programPath, []byte(program), 0o600); err != nil {
-				t.Fatal(err)
-			}
-			if err := os.WriteFile(inputPath, input, 0o600); err != nil {
-				t.Fatal(err)
-			}
-			endedNewline := "1"
-			if test.unterminatedActiveTail {
-				endedNewline = "0"
-			}
-			arguments := []string{
-				"-v", "since_epoch=1785139200",
-				"-v", "until_epoch=1785139800",
-				"-v", "server_tz=Asia/Shanghai",
-				"-v", "initial_ended_newline=" + endedNewline,
-				"-v", "summary_path=summary.tsv",
-				"-v", "warning_path=warnings.tsv",
-			}
-			if runtime.GOOS == "windows" {
-				arguments = append(arguments, "-v", "server_utc_offset_seconds=28800")
-			}
-			arguments = append(arguments, "-f", "filter.awk", "input.log")
-			command := exec.Command(awkCommand, arguments...)
-			command.Dir = tempDir
-			command.Env = append(os.Environ(), "TZ=Asia/Shanghai")
-			var stderr bytes.Buffer
-			command.Stderr = &stderr
-			filtered, err := command.Output()
-			if err != nil {
-				t.Fatalf("GNU awk filter failed: %v stderr=%s", err, stderr.String())
-			}
-			if stderr.Len() > 0 {
-				t.Fatalf("GNU awk filter wrote stderr: %s", stderr.String())
-			}
-			summary, err := os.ReadFile(summaryPath)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if string(filtered) != test.want {
-				t.Fatalf("filtered output mismatch:\ngot:  %q\nwant: %q\nsummary: %q", filtered, test.want, summary)
-			}
-			wantSummary := fmt.Sprintf("AIFAR_DIAG_FILTER_V1\t%s\t%d\t%d\t%d\t%d\n",
-				test.wantParser, len(input), len(test.want), test.wantRecords, test.wantWarnings)
-			if string(summary) != wantSummary {
-				t.Fatalf("summary=%q want=%q", summary, wantSummary)
-			}
-		})
-	}
-}
-
-func findRuntimeDiagnosticGNUAwk(t *testing.T) string {
-	t.Helper()
-	for _, name := range []string{"gawk", "awk"} {
-		path, err := exec.LookPath(name)
-		if err != nil {
-			continue
-		}
-		output, err := exec.Command(path, "--version").CombinedOutput()
-		if err == nil && strings.Contains(strings.ToLower(string(output)), "gnu awk") {
-			return path
-		}
-	}
-	t.Skip("GNU awk is not available")
-	return ""
 }
 
 func findRuntimeDiagnosticBash(t *testing.T) string {
@@ -1386,6 +1276,7 @@ type runtimeDiagnosticExportShellFixture struct {
 	procShell     string
 	exportID      string
 	archiveBase   string
+	localDate     string
 	fileLimit     string
 	maxStagedSize int64
 }
@@ -1418,11 +1309,13 @@ func newRuntimeDiagnosticExportShellFixtureWithPrefix(t *testing.T, prefix strin
 		t.Fatal(err)
 	}
 	for name, body := range map[string]string{
-		"docker":    "exit 0",
-		"systemctl": "printf '%s\n' 'agent active'",
-		"uptime":    "printf '%s\n' 'up 1 hour'",
-		"free":      "printf '%s\n' 'memory ok'",
-		"setsid":    "exit 0",
+		"docker":      "exit 0",
+		"date":        `case "$*" in "+%F") printf '%s\n' "${AIFAR_SERVER_TODAY:-2026-07-28}" ;; "-u +%Y-%m-%dT%H:%M:%SZ") printf '%s\n' '2026-07-28T10:00:00Z' ;; *) exec /usr/bin/date "$@" ;; esac`,
+		"systemctl":   "printf '%s\n' 'agent active'",
+		"timedatectl": "printf '%s\n' 'Asia/Shanghai'",
+		"uptime":      "printf '%s\n' 'up 1 hour'",
+		"free":        "printf '%s\n' 'memory ok'",
+		"setsid":      "exit 0",
 	} {
 		writeRuntimeDiagnosticShellCommand(t, bin, name, body)
 	}
@@ -1430,6 +1323,7 @@ func newRuntimeDiagnosticExportShellFixtureWithPrefix(t *testing.T, prefix strin
 		t: t, sh: runtimeDiagnosticTestShell(t), rootNative: root, installNative: install, binNative: bin, procNative: procRoot,
 		installShell: runtimeDiagnosticShellPath(install), binShell: runtimeDiagnosticShellPath(bin), procShell: runtimeDiagnosticShellPath(procRoot),
 		exportID: "diag_1234567890abcdef12345678", archiveBase: "aifar-diagnostics-instance-1-20260727T080000Z",
+		localDate: "2026-07-28",
 	}
 }
 
@@ -1444,6 +1338,7 @@ func (f *runtimeDiagnosticExportShellFixture) render() string {
 		ExportID:        installerkit.ShellQuote(f.exportID),
 		InstanceID:      installerkit.ShellQuote("instance-1"),
 		Services:        installerkit.ShellQuote("gateway"),
+		LocalDate:       installerkit.ShellQuote(f.localDate),
 		Since:           installerkit.ShellQuote("2020-01-01T00:00:00Z"),
 		Until:           installerkit.ShellQuote("2035-01-01T00:00:00Z"),
 		ArchiveBase:     installerkit.ShellQuote(f.archiveBase),
@@ -1466,6 +1361,165 @@ func (f *runtimeDiagnosticExportShellFixture) render() string {
 		script = strings.Replace(script, productionLimit, "MAX_UNCOMPRESSED="+strconv.FormatInt(f.maxStagedSize, 10), 1)
 	}
 	return script
+}
+
+func TestRuntimeDiagnosticExportRawSnapshotUsesOneServerLocalDate(t *testing.T) {
+	fixture := newRuntimeDiagnosticExportShellFixture(t)
+	active := []byte("unparsed active line\npassword=VisibleSecret\n")
+	today := []byte("today rotated bytes\x00remain raw\n")
+	yesterday := []byte("yesterday bytes\n")
+	paths := map[string][]byte{
+		"active.log":                active,
+		"2026-07-28/log_info.0.log": today,
+		"2026-07-27/log_info.0.log": yesterday,
+	}
+	for relative, content := range paths {
+		absolute := filepath.Join(fixture.installNative, "runtime", "logs", "gateway", filepath.FromSlash(relative))
+		if err := os.MkdirAll(filepath.Dir(absolute), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(absolute, content, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	output, err := fixture.run("AIFAR_SERVER_TODAY=2026-07-28")
+	if err != nil {
+		t.Fatalf("run current-day raw snapshot: %v: %s", err, output)
+	}
+	root := fixture.archiveBase + "/services/gateway/"
+	entries := runtimeDiagnosticStreamArchiveEntries(t, output)
+	if !slices.Contains(entries, root+"active.log") || !slices.Contains(entries, root+"2026-07-28/log_info.0.log") || slices.Contains(entries, root+"2026-07-27/log_info.0.log") {
+		t.Fatalf("unexpected current-day archive entries: %v", entries)
+	}
+	if got := []byte(runtimeDiagnosticStreamArchiveFile(t, output, root+"active.log")); !bytes.Equal(got, active) {
+		t.Fatalf("active log bytes changed: got=%q want=%q", got, active)
+	}
+	if got := []byte(runtimeDiagnosticStreamArchiveFile(t, output, root+"2026-07-28/log_info.0.log")); !bytes.Equal(got, today) {
+		t.Fatalf("dated log bytes changed: got=%q want=%q", got, today)
+	}
+	activeSHA := sha256.Sum256(active)
+	manifest := runtimeDiagnosticStreamArchiveFile(t, output, fixture.archiveBase+"/manifest.json")
+	if !strings.Contains(manifest, `"localDate":"2026-07-28"`) || !strings.Contains(manifest, hex.EncodeToString(activeSHA[:])) || !strings.Contains(manifest, `"activeSnapshot":1`) {
+		t.Fatalf("raw snapshot manifest is incomplete: %s", manifest)
+	}
+	if strings.Contains(manifest, "redactionRuleVersion") || !bytes.Contains(active, []byte("VisibleSecret")) {
+		t.Fatalf("raw snapshot was redacted or retained the redaction contract: %s", manifest)
+	}
+}
+
+func TestRuntimeDiagnosticExportHistoricalDateExcludesTopLevelActiveLog(t *testing.T) {
+	fixture := newRuntimeDiagnosticExportShellFixture(t)
+	fixture.localDate = "2026-07-27"
+	for relative, content := range map[string]string{
+		"active.log":                "active bytes\n",
+		"2026-07-27/log_info.0.log": "history bytes\n",
+		"2026-07-28/log_info.0.log": "today bytes\n",
+	} {
+		absolute := filepath.Join(fixture.installNative, "runtime", "logs", "gateway", filepath.FromSlash(relative))
+		if err := os.MkdirAll(filepath.Dir(absolute), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(absolute, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	output, err := fixture.run("AIFAR_SERVER_TODAY=2026-07-28")
+	if err != nil {
+		t.Fatalf("run historical raw snapshot: %v: %s", err, output)
+	}
+	root := fixture.archiveBase + "/services/gateway/"
+	entries := runtimeDiagnosticStreamArchiveEntries(t, output)
+	if !slices.Contains(entries, root+"2026-07-27/log_info.0.log") || slices.Contains(entries, root+"active.log") || slices.Contains(entries, root+"2026-07-28/log_info.0.log") {
+		t.Fatalf("unexpected historical archive entries: %v", entries)
+	}
+}
+
+func TestRuntimeDiagnosticExportCurrentDateAllowsAppendAfterFixedLengthSnapshot(t *testing.T) {
+	fixture := newRuntimeDiagnosticExportShellFixture(t)
+	logPath := filepath.Join(fixture.installNative, "runtime", "logs", "gateway", "active.log")
+	initial := "captured before append\n"
+	if err := os.WriteFile(logPath, []byte(initial), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	realHead := runtimeDiagnosticRealShellCommand(t, fixture.sh, "head")
+	writeRuntimeDiagnosticShellCommand(t, fixture.binNative, "head", strings.Join([]string{
+		`"$AIFAR_REAL_HEAD" "$@"`,
+		`if [ ! -e "$AIFAR_APPEND_MARKER" ]; then printf '%s' 'appended after snapshot' >> "$AIFAR_APPEND_PATH"; : > "$AIFAR_APPEND_MARKER"; fi`,
+	}, "\n"))
+	output, err := fixture.run(
+		"AIFAR_REAL_HEAD="+realHead,
+		"AIFAR_APPEND_PATH="+runtimeDiagnosticShellPath(logPath),
+		"AIFAR_APPEND_MARKER="+runtimeDiagnosticShellPath(filepath.Join(fixture.rootNative, "append-marker")),
+	)
+	if err != nil {
+		t.Fatalf("current-day append rejected: %v: %s", err, output)
+	}
+	entry := fixture.archiveBase + "/services/gateway/active.log"
+	if got := runtimeDiagnosticStreamArchiveFile(t, output, entry); got != initial {
+		t.Fatalf("fixed-length snapshot included appended bytes: %q", got)
+	}
+	source, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(source) != initial+"appended after snapshot" {
+		t.Fatalf("test did not append to the active source: %q", source)
+	}
+}
+
+func TestRuntimeDiagnosticEstimateSelectsExactlyOneServerLocalDate(t *testing.T) {
+	fixture := newRuntimeDiagnosticExportShellFixture(t)
+	for relative, content := range map[string]string{
+		"active.log":                "active bytes\n",
+		"2026-07-27/log_info.0.log": "history bytes\n",
+		"2026-07-28/log_info.0.log": "today bytes\n",
+		"2026-07-28/index.log.lck":  "lock bytes\n",
+	} {
+		absolute := filepath.Join(fixture.installNative, "runtime", "logs", "gateway", filepath.FromSlash(relative))
+		if err := os.MkdirAll(filepath.Dir(absolute), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(absolute, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	for _, test := range []struct {
+		localDate string
+		wantFiles int
+		wantBytes int64
+		current   bool
+	}{
+		{localDate: "2026-07-28", wantFiles: 2, wantBytes: int64(len("active bytes\n") + len("today bytes\n")), current: true},
+		{localDate: "2026-07-27", wantFiles: 1, wantBytes: int64(len("history bytes\n"))},
+	} {
+		t.Run(test.localDate, func(t *testing.T) {
+			script, err := renderRuntimeDiagnosticEstimateScript(runtimeDiagnosticEstimateScriptData{
+				InstallRoot: installerkit.ShellQuote(fixture.installShell),
+				InstanceID:  installerkit.ShellQuote("instance-1"),
+				Services:    installerkit.ShellQuote("gateway"),
+				LocalDate:   installerkit.ShellQuote(test.localDate),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			cmd := exec.Command(fixture.sh, "-s")
+			cmd.Stdin = strings.NewReader(`PATH="$AIFAR_FAKE_BIN:/usr/bin:/bin"; export PATH` + "\n" + strings.ReplaceAll(script, "\r\n", "\n"))
+			cmd.Env = append(os.Environ(), "AIFAR_FAKE_BIN="+fixture.binShell, "AIFAR_SERVER_TODAY=2026-07-28")
+			output, err := cmd.CombinedOutput()
+			if err != nil {
+				t.Fatalf("run estimate: %v: %s", err, output)
+			}
+			got, err := parseRuntimeDiagnosticEstimate(string(output), []string{"gateway"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.LocalDate != test.localDate || got.CandidateFiles != test.wantFiles || got.CandidateScanBytes != test.wantBytes || got.CurrentDate != test.current || got.BlockReason != "" {
+				t.Fatalf("unexpected estimate: %+v", got)
+			}
+		})
+	}
 }
 
 func (f *runtimeDiagnosticExportShellFixture) run(extraEnv ...string) ([]byte, error) {
@@ -1638,7 +1692,7 @@ func TestRuntimeDiagnosticExportRejectsSourceSwappedToSymlinkBeforeOpen(t *testi
 	realBash := runtimeDiagnosticRealShellCommand(t, fixture.sh, "bash")
 	writeRuntimeDiagnosticShellCommand(t, fixture.binNative, "bash", strings.Join([]string{
 		`if [ "$#" -ge 4 ]; then`,
-		`  case "$1:$4" in *filter-one-log.sh:*swap.log) rm -f -- "$4"; ln -s "$AIFAR_SECRET_PATH" "$4" ;; esac`,
+		`  case "$1:$4" in *snapshot-one-log.sh:*swap.log) rm -f -- "$4"; ln -s "$AIFAR_SECRET_PATH" "$4" ;; esac`,
 		`fi`,
 		`exec "$AIFAR_REAL_BASH" "$@"`,
 	}, "\n"))
@@ -1654,7 +1708,7 @@ func TestRuntimeDiagnosticExportRejectsSourceSwappedToSymlinkBeforeOpen(t *testi
 	}
 }
 
-func TestRuntimeDiagnosticExportUsesOpenedDescriptorAfterSourcePathSwap(t *testing.T) {
+func TestRuntimeDiagnosticExportRejectsSourcePathSwapAfterOpen(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("descriptor path behavior is exercised on Linux")
 	}
@@ -1688,17 +1742,15 @@ func TestRuntimeDiagnosticExportUsesOpenedDescriptorAfterSourcePathSwap(t *testi
 		"AIFAR_SECRET_PATH="+runtimeDiagnosticShellPath(secretPath),
 		"AIFAR_SWAP_MARKER="+runtimeDiagnosticShellPath(filepath.Join(fixture.rootNative, "swap-marker")),
 	)
-	if err != nil {
-		t.Fatalf("descriptor-bound source export failed after path swap: %v: %s", err, output)
+	if err == nil {
+		t.Fatalf("source path swap after open was accepted: %s", output)
 	}
-	entry := fixture.archiveBase + "/services/gateway/swap.log.original"
-	content := runtimeDiagnosticArchiveFile(t, fixture.sh, fixture.archiveNative(), entry)
-	if content != "safe log\n" || strings.Contains(content, "TOP_SECRET_PAYLOAD") {
-		t.Fatalf("descriptor snapshot content = %q", content)
+	if bytes.Contains(output, []byte("TOP_SECRET_PAYLOAD")) {
+		t.Fatalf("source path swap leaked replacement content: %s", output)
 	}
 }
 
-func TestRuntimeDiagnosticExportSucceedsWhenMatchedLogProducesNoWarnings(t *testing.T) {
+func TestRuntimeDiagnosticExportExcludesLockFilesAndRejectsEmptySelection(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("warning-free shell export behavior is exercised on Linux")
 	}
@@ -1708,11 +1760,8 @@ func TestRuntimeDiagnosticExportSucceedsWhenMatchedLogProducesNoWarnings(t *test
 		t.Fatal(err)
 	}
 	output, err := fixture.run()
-	if err != nil {
-		t.Fatalf("warning-free log export failed: %v: %s", err, output)
-	}
-	if !bytes.HasPrefix(output, []byte("AIFAR_DIAG_STREAM_V1\t")) {
-		t.Fatalf("warning-free log export omitted stream header: %q", output)
+	if err == nil {
+		t.Fatalf("lock-only log selection unexpectedly produced an archive: %s", output)
 	}
 }
 
@@ -1751,6 +1800,7 @@ func TestRuntimeDiagnosticExportOmitsDirectoriesForLogsOutsideWindow(t *testing.
 
 func TestRuntimeDiagnosticExportPreservesServerRelativeLogPaths(t *testing.T) {
 	fixture := newRuntimeDiagnosticExportShellFixtureWithPrefix(t, "runtime-diagnostic-shell-")
+	fixture.localDate = "2026-07-27"
 	writeRuntimeDiagnosticShellCommand(t, fixture.binNative, "timedatectl", "printf '%s\n' 'Asia/Shanghai'")
 	serverRelative := filepath.Join("alpha-gateway", "info", "2026-07-27", "app.log")
 	logPath := filepath.Join(fixture.installNative, "runtime", "logs", "gateway", serverRelative)
@@ -2051,6 +2101,7 @@ func TestRuntimeDiagnosticEstimateScriptFailsClosedOnCandidateDiscovery(t *testi
 		InstallRoot: "'/aifar/apps/admin'",
 		InstanceID:  "'instance-1'",
 		Services:    "'gateway'",
+		LocalDate:   "'2026-07-28'",
 		SinceUnix:   "'1'",
 		UntilUnix:   "'2'",
 	})
@@ -2068,8 +2119,8 @@ func TestRuntimeDiagnosticEstimateScriptFailsClosedOnCandidateDiscovery(t *testi
 		}
 	}
 	for _, required := range []string{
-		"sizes=$(find \"$service_root\"",
-		"-printf '%s\\n') || exit 21",
+		"candidate_file=$(mktemp) || exit 21",
+		"-printf '%P\\t%s\\n' > \"$candidate_file\" || { rm -f -- \"$candidate_file\"; exit 21; }",
 		"MAX_FILE_SCAN=1073741824",
 		"MAX_TOTAL_SCAN=2147483648",
 	} {

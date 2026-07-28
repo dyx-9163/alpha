@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -22,17 +23,16 @@ func TestRuntimeDiagnosticsCreateReturnsTaskAndExportIDs(t *testing.T) {
 	api, db, secret := newAuthzTestAPI(t)
 	release := make(chan struct{})
 	configuredExpiry := time.Now().UTC().Add(2 * time.Hour).Truncate(time.Second)
+	dayStart := time.Date(2026, 7, 27, 16, 0, 0, 0, time.UTC)
 	module := &fakeRuntimeDiagnosticsModule{
 		db: db, exportRelease: release,
-		estimate: registry.RuntimeDiagnosticEstimateResult{Allowed: true, ExpiresAt: configuredExpiry},
+		estimate: registry.RuntimeDiagnosticEstimateResult{Allowed: true, ExpiresAt: configuredExpiry, LocalDate: "2026-07-28", DayStartAt: dayStart, DayEndAt: dayStart.Add(24 * time.Hour), CurrentDate: true},
 	}
 	api.apps = registry.New(module)
 	server, instance := seedAIFARRuntimeFixture(t, db, "http://docker.invalid")
 	token := issueTestToken(t, db, secret, "owner", "owner")
-	now := time.Now().UTC().Truncate(time.Second)
-
-	req := runtimeDiagnosticRequest(t, http.MethodPost, "/api/v2/containers/aifar/runtime/diagnostics/exports?serverId="+server.ID, token,
-		instance.ID, now.Add(-2*time.Hour), now.Add(-time.Hour), []string{"permission"})
+	req := runtimeDiagnosticDateRequest(t, http.MethodPost, "/api/v2/containers/aifar/runtime/diagnostics/exports?serverId="+server.ID, token,
+		instance.ID, "2026-07-28", []string{"permission"})
 	rec := httptest.NewRecorder()
 	api.Router().ServeHTTP(rec, req)
 
@@ -58,7 +58,7 @@ func TestRuntimeDiagnosticsCreateReturnsTaskAndExportIDs(t *testing.T) {
 	if export.TaskID != response.TaskID || export.InstanceID != instance.ID || export.ServerID != server.ID || export.Status != "pending" || export.StorageKind != "local" || export.RemoteRelativePath != "" || export.CreatedBy != "owner" {
 		t.Fatalf("unexpected pending export: %+v", export)
 	}
-	if len(export.Services) != 1 || export.Services[0] != "permission" || !export.SinceAt.Equal(now.Add(-2*time.Hour)) || !export.UntilAt.Equal(now.Add(-time.Hour)) {
+	if export.LocalDate != "2026-07-28" || len(export.Services) != 1 || export.Services[0] != "permission" || !export.SinceAt.Equal(dayStart) || !export.UntilAt.Equal(dayStart.Add(24*time.Hour)) {
 		t.Fatalf("unexpected export selection: %+v", export)
 	}
 	if !export.ExpiresAt.Equal(configuredExpiry) {
@@ -72,7 +72,7 @@ func TestRuntimeDiagnosticsCreateReturnsTaskAndExportIDs(t *testing.T) {
 	if task.Type != "aifar.runtime.diagnostics.export" || task.Target != instance.ID || task.CreatedBy != "owner" {
 		t.Fatalf("unexpected export task: %+v", task)
 	}
-	wantSteps := []string{"validate-local-storage", "discover-log-files", "filter-and-redact", "build-manifest", "stream-local-archive", "verify-local-archive", "cleanup-remote"}
+	wantSteps := []string{"validate-local-storage", "discover-log-files", "snapshot-raw-log-files", "build-manifest", "stream-local-archive", "verify-local-archive", "cleanup-remote"}
 	assertRuntimeDiagnosticTaskPlan(t, db, response.TaskID, server.ID, wantSteps)
 
 	locks, err := db.ListOperationLocks("runtime-diagnostics", instance.ID, true)
@@ -109,6 +109,28 @@ func TestRuntimeDiagnosticsRoutesRequireAppsManage(t *testing.T) {
 			t.Fatalf("%s %s: expected 403, got %d body=%s", tc.method, tc.path, rec.Code, rec.Body.String())
 		}
 		assertRuntimeDiagnosticAPIError(t, rec)
+	}
+}
+
+func TestRuntimeDiagnosticsRejectsMissingOrMalformedServerLocalDate(t *testing.T) {
+	api, db, secret := newAuthzTestAPI(t)
+	api.apps = registry.New(&fakeRuntimeDiagnosticsModule{db: db})
+	server, instance := seedAIFARRuntimeFixture(t, db, "http://docker.invalid")
+	token := issueTestToken(t, db, secret, "owner", "owner")
+	for _, localDate := range []any{nil, "", "2026-7-28", "2026-02-30", "2026-07-28T00:00:00Z"} {
+		body, err := json.Marshal(map[string]any{"instanceId": instance.ID, "localDate": localDate, "services": []string{"permission"}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		req := httptest.NewRequest(http.MethodPost, "/api/v2/containers/aifar/runtime/diagnostics/estimate?serverId="+server.ID, bytes.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		api.Router().ServeHTTP(rec, req)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("localDate=%v: expected 400, got %d body=%s", localDate, rec.Code, rec.Body.String())
+		}
+		assertRuntimeDiagnosticAPIErrorCode(t, rec, "RUNTIME_DIAGNOSTIC_REQUEST_INVALID")
 	}
 }
 
@@ -787,6 +809,15 @@ func (m *fakeRuntimeDiagnosticsModule) EstimateRuntimeDiagnostics(_ context.Cont
 	m.estimateRequest = req
 	m.mu.Unlock()
 	result := m.estimate
+	if result.LocalDate == "" {
+		result.LocalDate = req.LocalDate
+	}
+	if result.DayStartAt.IsZero() {
+		result.DayStartAt, _ = time.Parse("2006-01-02", result.LocalDate)
+	}
+	if result.DayEndAt.IsZero() {
+		result.DayEndAt = result.DayStartAt.Add(24 * time.Hour)
+	}
 	if result.ExpiresAt.IsZero() {
 		result.ExpiresAt = time.Now().UTC().Add(24 * time.Hour)
 	}
@@ -872,7 +903,19 @@ func (m *fakeRuntimeDiagnosticsModule) StreamRuntimeDiagnosticExport(_ context.C
 
 func runtimeDiagnosticRequest(t *testing.T, method, path, token, instanceID string, sinceAt, untilAt time.Time, services []string) *http.Request {
 	t.Helper()
-	body, err := json.Marshal(map[string]any{"instanceId": instanceID, "sinceAt": sinceAt.Format(time.RFC3339), "untilAt": untilAt.Format(time.RFC3339), "services": services})
+	body, err := json.Marshal(map[string]any{"instanceId": instanceID, "localDate": sinceAt.Format("2006-01-02"), "services": services})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(method, path, strings.NewReader(string(body)))
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	return req
+}
+
+func runtimeDiagnosticDateRequest(t *testing.T, method, path, token, instanceID, localDate string, services []string) *http.Request {
+	t.Helper()
+	body, err := json.Marshal(map[string]any{"instanceId": instanceID, "localDate": localDate, "services": services})
 	if err != nil {
 		t.Fatal(err)
 	}

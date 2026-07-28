@@ -112,8 +112,7 @@ describe('AIFAR Runtime API service', () => {
   it('estimates and creates a runtime diagnostic export', async () => {
     const payload = {
       instanceId: 'instance-1',
-      sinceAt: '2026-07-27T06:00:00Z',
-      untilAt: '2026-07-27T08:00:00Z',
+      localDate: '2026-07-27',
       services: ['gateway', 'oauth']
     }
     apiPostMock.mockResolvedValueOnce({ allowed: true })

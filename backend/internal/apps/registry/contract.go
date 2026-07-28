@@ -326,14 +326,15 @@ type RuntimeAgentUninstallRequest struct {
 }
 
 type RuntimeDiagnosticRequest struct {
-	ExportID string
-	Instance store.AppInstance
-	Server   store.Server
-	Language string
-	Actor    string
-	Services []string
-	SinceAt  time.Time
-	UntilAt  time.Time
+	ExportID  string
+	Instance  store.AppInstance
+	Server    store.Server
+	Language  string
+	Actor     string
+	Services  []string
+	LocalDate string
+	SinceAt   time.Time
+	UntilAt   time.Time
 }
 
 type RuntimeDiagnosticDeleteRequest struct {
@@ -365,6 +366,10 @@ type RuntimeDiagnosticEstimateResult struct {
 	MaxArchiveBytes     int64                              `json:"maxArchiveBytes"`
 	TimeoutSeconds      int                                `json:"timeoutSeconds"`
 	ServerTimezone      string                             `json:"serverTimezone"`
+	LocalDate           string                             `json:"localDate"`
+	DayStartAt          time.Time                          `json:"dayStartAt"`
+	DayEndAt            time.Time                          `json:"dayEndAt"`
+	CurrentDate         bool                               `json:"currentDate"`
 	LocalAvailableBytes int64                              `json:"localAvailableBytes"`
 	LocalReadyBytes     int64                              `json:"localReadyBytes"`
 	LocalReservedBytes  int64                              `json:"localReservedBytes"`

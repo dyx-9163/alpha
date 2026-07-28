@@ -6,6 +6,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"aifar-deployment/backend/internal/apps/registry"
 )
@@ -17,6 +18,8 @@ const (
 	runtimeDiagnosticResultRecord    = "AIFAR_DIAG_RESULT"
 	runtimeDiagnosticServiceRecordV2 = "AIFAR_DIAG_SERVICE_V2"
 	runtimeDiagnosticTotalRecordV2   = "AIFAR_DIAG_TOTAL_V2"
+	runtimeDiagnosticServiceRecordV3 = "AIFAR_DIAG_SERVICE_V3"
+	runtimeDiagnosticTotalRecordV3   = "AIFAR_DIAG_TOTAL_V3"
 	runtimeDiagnosticStreamRecordV1  = "AIFAR_DIAG_STREAM_V1"
 )
 
@@ -92,6 +95,9 @@ func runtimeDiagnosticLogFileAllowed(name string) bool {
 		return false
 	}
 	lower := strings.ToLower(name)
+	if strings.HasSuffix(lower, ".lck") || strings.HasSuffix(lower, ".idx") {
+		return false
+	}
 	for _, forbidden := range []string{"config", "database", "credential", "secret", "password", "token", "private", "keystore", "truststore"} {
 		if strings.Contains(lower, forbidden) {
 			return false
@@ -174,8 +180,68 @@ func parseRuntimeDiagnosticEstimate(raw string, expectedSelections ...[]string) 
 		line = strings.TrimSuffix(line, "\r")
 		fields := strings.Split(line, "\t")
 		switch fields[0] {
+		case runtimeDiagnosticServiceRecordV3:
+			if (protocolVersion != 0 && protocolVersion != 3) || len(fields) != 4 {
+				return result, fmt.Errorf("invalid V3 service record at line %d", lineNumber+1)
+			}
+			protocolVersion = 3
+			service := fields[1]
+			if !runtimeDiagnosticNamePattern.MatchString(service) || seenServices[service] || (len(expected) > 0 && !expected[service]) {
+				return result, fmt.Errorf("invalid V3 service name at line %d", lineNumber+1)
+			}
+			candidateFiles64, err := parseRuntimeDiagnosticBytes(fields[2])
+			if err != nil || candidateFiles64 > int64(^uint(0)>>1) {
+				return result, fmt.Errorf("invalid V3 candidate file count at line %d", lineNumber+1)
+			}
+			candidateBytes, err := parseRuntimeDiagnosticBytes(fields[3])
+			if err != nil {
+				return result, fmt.Errorf("invalid V3 candidate bytes at line %d", lineNumber+1)
+			}
+			seenServices[service] = true
+			result.Services = append(result.Services, registry.RuntimeDiagnosticServiceEstimate{
+				Service: service, CandidateFiles: int(candidateFiles64), CandidateScanBytes: candidateBytes,
+			})
+		case runtimeDiagnosticTotalRecordV3:
+			if (protocolVersion != 0 && protocolVersion != 3) || len(fields) != 9 || seenTotal {
+				return result, fmt.Errorf("invalid V3 total record at line %d", lineNumber+1)
+			}
+			protocolVersion = 3
+			candidateFiles64, err := parseRuntimeDiagnosticBytes(fields[1])
+			if err != nil || candidateFiles64 > int64(^uint(0)>>1) {
+				return result, fmt.Errorf("invalid V3 total file count at line %d", lineNumber+1)
+			}
+			candidateBytes, err := parseRuntimeDiagnosticBytes(fields[2])
+			if err != nil {
+				return result, fmt.Errorf("invalid V3 total bytes at line %d", lineNumber+1)
+			}
+			if !validRuntimeDiagnosticTimezone(fields[3]) || !validRuntimeDiagnosticLocalDate(fields[4]) {
+				return result, fmt.Errorf("invalid V3 date metadata at line %d", lineNumber+1)
+			}
+			dayStartUnix, startErr := parseRuntimeDiagnosticBytes(fields[5])
+			dayEndUnix, endErr := parseRuntimeDiagnosticBytes(fields[6])
+			if startErr != nil || endErr != nil || dayEndUnix <= dayStartUnix || dayEndUnix-dayStartUnix < 23*60*60 || dayEndUnix-dayStartUnix > 25*60*60 {
+				return result, fmt.Errorf("invalid V3 day boundary at line %d", lineNumber+1)
+			}
+			if fields[7] != "0" && fields[7] != "1" {
+				return result, fmt.Errorf("invalid V3 current-date flag at line %d", lineNumber+1)
+			}
+			blockReason := fields[8]
+			if blockReason == "-" {
+				blockReason = ""
+			} else if !runtimeDiagnosticNamePattern.MatchString(blockReason) {
+				return result, fmt.Errorf("invalid V3 block reason at line %d", lineNumber+1)
+			}
+			result.CandidateFiles = int(candidateFiles64)
+			result.CandidateScanBytes = candidateBytes
+			result.ServerTimezone = fields[3]
+			result.LocalDate = fields[4]
+			result.DayStartAt = time.Unix(dayStartUnix, 0).UTC()
+			result.DayEndAt = time.Unix(dayEndUnix, 0).UTC()
+			result.CurrentDate = fields[7] == "1"
+			result.BlockReason = blockReason
+			seenTotal = true
 		case runtimeDiagnosticServiceRecordV2:
-			if protocolVersion == 1 || len(fields) != 4 {
+			if (protocolVersion != 0 && protocolVersion != 2) || len(fields) != 4 {
 				return result, fmt.Errorf("invalid V2 service record at line %d", lineNumber+1)
 			}
 			protocolVersion = 2
@@ -196,7 +262,7 @@ func parseRuntimeDiagnosticEstimate(raw string, expectedSelections ...[]string) 
 				Service: service, CandidateFiles: int(candidateFiles64), CandidateScanBytes: candidateBytes,
 			})
 		case runtimeDiagnosticTotalRecordV2:
-			if protocolVersion == 1 || len(fields) != 5 || seenTotal {
+			if (protocolVersion != 0 && protocolVersion != 2) || len(fields) != 5 || seenTotal {
 				return result, fmt.Errorf("invalid V2 total record at line %d", lineNumber+1)
 			}
 			protocolVersion = 2
@@ -294,7 +360,7 @@ func parseRuntimeDiagnosticEstimate(raw string, expectedSelections ...[]string) 
 	if !seenTotal {
 		return result, fmt.Errorf("runtime diagnostic estimate total is missing")
 	}
-	if protocolVersion == 2 {
+	if protocolVersion == 2 || protocolVersion == 3 {
 		var candidateFiles int
 		var candidateBytes int64
 		for _, service := range result.Services {
@@ -333,6 +399,11 @@ func parseRuntimeDiagnosticEstimate(raw string, expectedSelections ...[]string) 
 		}
 	}
 	return result, nil
+}
+
+func validRuntimeDiagnosticLocalDate(value string) bool {
+	parsed, err := time.Parse("2006-01-02", value)
+	return err == nil && parsed.Format("2006-01-02") == value
 }
 
 func runtimeDiagnosticRequiredBytes(totalBytes int64) (int64, error) {

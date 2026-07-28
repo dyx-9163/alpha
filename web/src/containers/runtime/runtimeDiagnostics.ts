@@ -7,11 +7,11 @@ export type RuntimeDiagnosticSubmitState = {
   submitting: boolean
 }
 
-export function defaultRuntimeDiagnosticWindow(now = new Date()) {
-  return {
-    sinceAt: new Date(now.getTime() - 2 * 60 * 60 * 1000),
-    untilAt: now
-  }
+export function defaultRuntimeDiagnosticDate(now = new Date()) {
+  const year = now.getFullYear()
+  const month = String(now.getMonth() + 1).padStart(2, '0')
+  const day = String(now.getDate()).padStart(2, '0')
+  return `${year}-${month}-${day}`
 }
 
 export function enabledRuntimeDiagnosticServices(deployments: AifarRuntimeDeployment[]) {
@@ -61,8 +61,7 @@ export function runtimeDiagnosticRequestFingerprint(query: string, request: Runt
   return JSON.stringify({
     query,
     instanceId: request.instanceId,
-    sinceAt: request.sinceAt,
-    untilAt: request.untilAt,
+    localDate: request.localDate,
     services: [...request.services].sort()
   })
 }

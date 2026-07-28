@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import {
-  defaultRuntimeDiagnosticWindow,
+	defaultRuntimeDiagnosticDate,
   emptyRuntimeDiagnosticExportPage,
   enabledRuntimeDiagnosticServices,
   runtimeDiagnosticCapacityBlocked,
@@ -34,13 +34,10 @@ const estimate: RuntimeDiagnosticEstimate = {
 }
 
 describe('runtime diagnostic interactions', () => {
-  it('defaults to the last two hours and all enabled deployments', () => {
-    const now = new Date('2026-07-27T08:00:00Z')
+	it('defaults to one local calendar date and all enabled deployments', () => {
+		const now = new Date(2026, 6, 28, 8, 0, 0)
 
-    expect(defaultRuntimeDiagnosticWindow(now)).toEqual({
-      sinceAt: new Date('2026-07-27T06:00:00Z'),
-      untilAt: now
-    })
+		expect(defaultRuntimeDiagnosticDate(now)).toBe('2026-07-28')
     expect(enabledRuntimeDiagnosticServices([
       { instanceId: 'instance-1', serviceName: 'gateway', desiredReplicas: 1 },
       { instanceId: 'instance-1', serviceName: 'oauth', desiredReplicas: 0 }
@@ -53,15 +50,15 @@ describe('runtime diagnostic interactions', () => {
   })
 
   it('requires an exact scope fingerprint for an estimate response', () => {
-    const request = {
-      instanceId: 'instance-1',
-      sinceAt: '2026-07-27T06:00:00Z',
-      untilAt: '2026-07-27T08:00:00Z',
-      services: ['gateway']
-    }
+		const request = {
+			instanceId: 'instance-1',
+			localDate: '2026-07-27',
+			services: ['gateway']
+		}
 
     expect(runtimeDiagnosticRequestFingerprint('serverId=server-1', request)).not.toBe(runtimeDiagnosticRequestFingerprint('serverId=server-2', request))
-    expect(runtimeDiagnosticRequestFingerprint('serverId=server-1', request)).not.toBe(runtimeDiagnosticRequestFingerprint('serverId=server-1', { ...request, services: ['oauth'] }))
+		expect(runtimeDiagnosticRequestFingerprint('serverId=server-1', request)).not.toBe(runtimeDiagnosticRequestFingerprint('serverId=server-1', { ...request, services: ['oauth'] }))
+		expect(runtimeDiagnosticRequestFingerprint('serverId=server-1', request)).not.toBe(runtimeDiagnosticRequestFingerprint('serverId=server-1', { ...request, localDate: '2026-07-28' }))
   })
 
   it('refreshes every tracked export task exactly once at terminal state', () => {

@@ -250,6 +250,13 @@ var storeMigrations = []storeMigration{
 			)
 		},
 	},
+	{
+		Version: 2026072801,
+		Name:    "diagnostic export local date",
+		Up: func(tx *sql.Tx) error {
+			return ensureColumnTx(tx, "diagnostic_exports", "local_date", `alter table diagnostic_exports add column local_date text not null default ''`)
+		},
+	},
 }
 
 func runStoreMigrations(db *sql.DB) error {

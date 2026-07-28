@@ -4,6 +4,15 @@ export type I18nValue = string | ((params?: Record<string, unknown>) => string)
 
 export const messages: Record<LocaleCode, Record<string, I18nValue>> = {
   zh: {
+    'containers.diagnosticsRawExportTitle': '按服务器日期导出原始日志',
+    'containers.diagnosticsLocalDate': '服务器本地日期',
+    'containers.diagnosticsRawLogSource': '日志来源：服务器宿主机原始文件',
+    'containers.diagnosticsRawWarning': '原始日志不会脱敏，可能包含密码、令牌或业务敏感数据，请仅在受控渠道中保存和传输。',
+    'containers.diagnosticsTodaySnapshotHint': '选择服务器今天时，将导出最外层活动日志和今天日期日志；活动文件只包含任务打开文件时已有的固定长度字节。',
+    'containers.diagnosticsRawHistoryHint': '历史日期只导出路径或文件名包含该日期的日志原文件，并逐文件校验捕获字节与归档 SHA256。',
+    'containers.diagnosticsRawSnapshotLimit': '原始日志快照上限',
+    'containers.diagnosticsDailySplitSuggestion': '所选日期不可导出：该日期没有候选日志、日期晚于服务器今天，或文件超过限制。',
+    'containers.diagnosticsDailyCapacityBlocked': 'AIFAR Server 本地空间或配额不足，请删除旧诊断包或减少所选服务。',
     'containers.deleteRelease': '删除发布记录',
     'containers.confirmDeleteRelease': ({ release } = {}) => `确认删除发布记录 ${release ?? ''}？仅删除面板记录及关联索引，不删除远端制品、容器或运行状态。`,
     'containers.releaseDeleted': '发布记录已删除',
@@ -980,6 +989,15 @@ export const messages: Record<LocaleCode, Record<string, I18nValue>> = {
     'table.version': '版本'
   },
   en: {
+    'containers.diagnosticsRawExportTitle': 'Export raw logs by server date',
+    'containers.diagnosticsLocalDate': 'Server-local date',
+    'containers.diagnosticsRawLogSource': 'Log source: raw host files on the server',
+    'containers.diagnosticsRawWarning': 'Raw logs are not redacted and may contain passwords, tokens, or sensitive business data. Store and transmit them only through controlled channels.',
+    'containers.diagnosticsTodaySnapshotHint': 'For the server current date, the export includes top-level active logs and date-tagged logs. Active files contain only the fixed number of bytes present when the task opened each file.',
+    'containers.diagnosticsRawHistoryHint': 'Historical dates export only original log files whose path or name contains that date, with per-file SHA256 verification between captured bytes and archive entries.',
+    'containers.diagnosticsRawSnapshotLimit': 'Raw-log snapshot limit',
+    'containers.diagnosticsDailySplitSuggestion': 'The selected date cannot be exported because it has no candidate logs, is later than the server current date, or exceeds a file limit.',
+    'containers.diagnosticsDailyCapacityBlocked': 'The local AIFAR Server lacks space or quota. Delete older diagnostics or select fewer services.',
     'containers.deleteRelease': 'Delete release record',
     'containers.confirmDeleteRelease': ({ release } = {}) => `Delete release record ${release ?? ''}? This removes only panel records and related indexes; remote artifacts, containers, and runtime state are kept.`,
     'containers.releaseDeleted': 'Release record deleted',

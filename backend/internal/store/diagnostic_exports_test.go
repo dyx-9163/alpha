@@ -23,7 +23,7 @@ func TestDiagnosticExportLifecycle(t *testing.T) {
 	now := time.Date(2026, 7, 27, 8, 0, 0, 0, time.UTC)
 	saved, err := db.SaveDiagnosticExport(DiagnosticExport{
 		ID: "diag-1", TaskID: "task-1", InstanceID: "instance-1", ServerID: "server-1",
-		Status: "pending", ServicesJSON: `["gateway","oauth"]`, SinceAt: now.Add(-2 * time.Hour),
+		Status: "pending", ServicesJSON: `["gateway","oauth"]`, LocalDate: "2026-07-27", SinceAt: now.Add(-2 * time.Hour),
 		UntilAt: now, CreatedBy: "owner", CreatedAt: now, ExpiresAt: now.Add(24 * time.Hour),
 		CleanupStatus: "none",
 	})
@@ -44,7 +44,7 @@ func TestDiagnosticExportLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Status != "ready" || got.ArchiveBytes != 1024 || got.ReadyAt.IsZero() {
+	if got.Status != "ready" || got.LocalDate != "2026-07-27" || got.ArchiveBytes != 1024 || got.ReadyAt.IsZero() {
 		t.Fatalf("unexpected export: %+v", got)
 	}
 }
@@ -117,8 +117,27 @@ func TestDiagnosticExportLegacyMigrationDefaultsStorageToRemote(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.StorageKind != "remote" || got.StorageRelativePath != "" || got.ReservedBytes != 0 || got.RemoteRelativePath != "diag-legacy/archive.tar.gz" {
+	if got.LocalDate != "" || got.StorageKind != "remote" || got.StorageRelativePath != "" || got.ReservedBytes != 0 || got.RemoteRelativePath != "diag-legacy/archive.tar.gz" {
 		t.Fatalf("legacy migration mismatch: %+v", got)
+	}
+}
+
+func TestSaveDiagnosticExportRejectsMalformedLocalDate(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "aifar.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	now := time.Date(2026, 7, 28, 0, 0, 0, 0, time.UTC)
+	for _, localDate := range []string{"2026-7-28", "2026-02-30", "2026-07-28T00:00:00Z"} {
+		_, err := db.SaveDiagnosticExport(DiagnosticExport{
+			ID:         "diag-invalid-date-" + strings.NewReplacer("-", "", ":", "", "T", "").Replace(localDate),
+			InstanceID: "instance-1", ServerID: "server-1", Status: "pending", LocalDate: localDate,
+			SinceAt: now, UntilAt: now.Add(24 * time.Hour), CreatedAt: now, ExpiresAt: now.Add(24 * time.Hour),
+		})
+		if err == nil {
+			t.Fatalf("expected malformed local date %q to be rejected", localDate)
+		}
 	}
 }
 

@@ -208,6 +208,7 @@ type DiagnosticExport struct {
 	Status              string    `json:"status"`
 	ServicesJSON        string    `json:"-"`
 	Services            []string  `json:"services"`
+	LocalDate           string    `json:"localDate,omitempty"`
 	SinceAt             time.Time `json:"sinceAt"`
 	UntilAt             time.Time `json:"untilAt"`
 	StorageKind         string    `json:"storageKind"`

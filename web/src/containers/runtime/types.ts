@@ -197,8 +197,7 @@ export type AifarReleaseListResponse = {
 
 export type RuntimeDiagnosticRequest = {
   instanceId: string
-  sinceAt: string
-  untilAt: string
+  localDate: string
   services: string[]
 }
 
@@ -215,6 +214,10 @@ export type RuntimeDiagnosticEstimate = {
   maxArchiveBytes: number
   timeoutSeconds: number
   serverTimezone: string
+  localDate?: string
+  dayStartAt?: string
+  dayEndAt?: string
+  currentDate?: boolean
   localAvailableBytes: number
   localReadyBytes: number
   localReservedBytes: number
@@ -233,6 +236,7 @@ export type RuntimeDiagnosticExport = {
   status: 'pending' | 'building' | 'ready' | 'failed' | 'cancelled' | 'expired' | 'deleted'
   storageKind: 'local' | 'remote'
   services: string[]
+  localDate?: string
   sinceAt: string
   untilAt: string
   archiveName?: string

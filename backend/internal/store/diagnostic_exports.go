@@ -31,7 +31,7 @@ type LocalDiagnosticExportCommit struct {
 	ExpiresAt           time.Time
 }
 
-const diagnosticExportColumns = `id,task_id,instance_id,server_id,status,services_json,since_at,until_at,
+const diagnosticExportColumns = `id,task_id,instance_id,server_id,status,services_json,local_date,since_at,until_at,
 	storage_kind,storage_relative_path,reserved_bytes,remote_relative_path,archive_name,archive_bytes,uncompressed_bytes,sha256,warning_count,warnings_json,error_text,
 	created_by,created_at,ready_at,expires_at,downloaded_at,deleted_at,cleanup_status,cleanup_error,cleanup_attempted_at`
 
@@ -50,10 +50,10 @@ func (s *Store) SaveDiagnosticExport(v DiagnosticExport) (DiagnosticExport, erro
 		v.CreatedAt = time.Now()
 	}
 	_, err = s.db.Exec(`insert into diagnostic_exports(`+diagnosticExportColumns+`)
-		values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+		values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		on conflict(id) do update set
 		task_id=excluded.task_id,instance_id=excluded.instance_id,server_id=excluded.server_id,status=excluded.status,
-		services_json=excluded.services_json,since_at=excluded.since_at,until_at=excluded.until_at,
+		services_json=excluded.services_json,local_date=excluded.local_date,since_at=excluded.since_at,until_at=excluded.until_at,
 		storage_kind=excluded.storage_kind,storage_relative_path=excluded.storage_relative_path,reserved_bytes=excluded.reserved_bytes,
 		remote_relative_path=excluded.remote_relative_path,archive_name=excluded.archive_name,archive_bytes=excluded.archive_bytes,
 		uncompressed_bytes=excluded.uncompressed_bytes,sha256=excluded.sha256,warning_count=excluded.warning_count,
@@ -61,7 +61,7 @@ func (s *Store) SaveDiagnosticExport(v DiagnosticExport) (DiagnosticExport, erro
 		ready_at=excluded.ready_at,expires_at=excluded.expires_at,downloaded_at=excluded.downloaded_at,
 		deleted_at=excluded.deleted_at,cleanup_status=excluded.cleanup_status,cleanup_error=excluded.cleanup_error,
 		cleanup_attempted_at=excluded.cleanup_attempted_at`,
-		v.ID, v.TaskID, v.InstanceID, v.ServerID, v.Status, v.ServicesJSON, v.SinceAt, v.UntilAt,
+		v.ID, v.TaskID, v.InstanceID, v.ServerID, v.Status, v.ServicesJSON, v.LocalDate, v.SinceAt, v.UntilAt,
 		v.StorageKind, v.StorageRelativePath, v.ReservedBytes, v.RemoteRelativePath, v.ArchiveName, v.ArchiveBytes, v.UncompressedBytes, v.SHA256, v.WarningCount, v.WarningsJSON,
 		v.ErrorText, v.CreatedBy, v.CreatedAt, nullableTime(v.ReadyAt), v.ExpiresAt, nullableTime(v.DownloadedAt), nullableTime(v.DeletedAt),
 		v.CleanupStatus, v.CleanupError, nullableTime(v.CleanupAttemptedAt))
@@ -335,7 +335,7 @@ func scanDiagnosticExport(rows interface{ Scan(dest ...any) error }) (Diagnostic
 	var v DiagnosticExport
 	var readyAt, downloadedAt, deletedAt, cleanupAttemptedAt sql.NullTime
 	if err := rows.Scan(
-		&v.ID, &v.TaskID, &v.InstanceID, &v.ServerID, &v.Status, &v.ServicesJSON, &v.SinceAt, &v.UntilAt,
+		&v.ID, &v.TaskID, &v.InstanceID, &v.ServerID, &v.Status, &v.ServicesJSON, &v.LocalDate, &v.SinceAt, &v.UntilAt,
 		&v.StorageKind, &v.StorageRelativePath, &v.ReservedBytes, &v.RemoteRelativePath, &v.ArchiveName, &v.ArchiveBytes, &v.UncompressedBytes, &v.SHA256, &v.WarningCount, &v.WarningsJSON,
 		&v.ErrorText, &v.CreatedBy, &v.CreatedAt, &readyAt, &v.ExpiresAt, &downloadedAt, &deletedAt,
 		&v.CleanupStatus, &v.CleanupError, &cleanupAttemptedAt,
@@ -366,6 +366,13 @@ func normalizeDiagnosticExport(v DiagnosticExport) (DiagnosticExport, error) {
 	v.Status = strings.ToLower(strings.TrimSpace(v.Status))
 	if !isDiagnosticExportStatus(v.Status) {
 		return DiagnosticExport{}, fmt.Errorf("unsupported diagnostic export status %q", v.Status)
+	}
+	v.LocalDate = strings.TrimSpace(v.LocalDate)
+	if v.LocalDate != "" {
+		parsed, err := time.Parse("2006-01-02", v.LocalDate)
+		if err != nil || parsed.Format("2006-01-02") != v.LocalDate {
+			return DiagnosticExport{}, fmt.Errorf("invalid diagnostic export local date %q", v.LocalDate)
+		}
 	}
 	v.StorageKind = strings.ToLower(strings.TrimSpace(v.StorageKind))
 	if v.StorageKind == "" {

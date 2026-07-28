@@ -42,6 +42,7 @@ type runtimeDiagnosticEstimateScriptData struct {
 	InstallRoot string
 	InstanceID  string
 	Services    string
+	LocalDate   string
 	SinceUnix   string
 	UntilUnix   string
 }
@@ -51,6 +52,7 @@ type runtimeDiagnosticExportScriptData struct {
 	ExportID        string
 	InstanceID      string
 	Services        string
+	LocalDate       string
 	Since           string
 	Until           string
 	ArchiveBase     string
@@ -61,7 +63,6 @@ type runtimeDiagnosticExportScriptData struct {
 	Readme          string
 	ProcRoot        string
 	FileLimitBlocks string
-	FilterProgram   string
 }
 
 type runtimeDiagnosticCleanupScriptData struct {
@@ -88,6 +89,7 @@ type runtimeDiagnosticSummaryPayload struct {
 	Topology   string    `json:"topology"`
 	Status     string    `json:"status"`
 	Services   []string  `json:"services"`
+	LocalDate  string    `json:"localDate"`
 	SinceAt    time.Time `json:"sinceAt"`
 	UntilAt    time.Time `json:"untilAt"`
 }
@@ -126,7 +128,7 @@ type runtimeDiagnosticReleasePayload struct {
 var runtimeDiagnosticSteps = []string{
 	"validate-local-storage",
 	"discover-log-files",
-	"filter-and-redact",
+	"snapshot-raw-log-files",
 	"build-manifest",
 	"stream-local-archive",
 	"verify-local-archive",
@@ -142,11 +144,14 @@ func (s Service) EstimateRuntimeDiagnostics(ctx context.Context, req RuntimeDiag
 			Code: "RUNTIME_DIAGNOSTIC_LOCAL_COMMIT_FAILED", Message: i18n.Text(req.Language, "aifar.diag.storageMissing"),
 		}
 	}
+	if req.LocalDate == "" && !req.SinceAt.IsZero() {
+		req.LocalDate = req.SinceAt.UTC().Format("2006-01-02")
+	}
 	diagnostics, ok := s.store.(runtimeDiagnosticsStore)
 	if !ok {
 		return registry.RuntimeDiagnosticEstimateResult{}, errors.New(i18n.Text(req.Language, "aifar.diag.storeMissing"))
 	}
-	installRoot, services, err := validateRuntimeDiagnosticEstimateRequest(req, diagnostics, time.Now().UTC())
+	installRoot, services, err := validateRuntimeDiagnosticEstimateRequest(req, diagnostics)
 	if err != nil {
 		return registry.RuntimeDiagnosticEstimateResult{}, err
 	}
@@ -154,6 +159,7 @@ func (s Service) EstimateRuntimeDiagnostics(ctx context.Context, req RuntimeDiag
 		InstallRoot: installerkit.ShellQuote(installRoot),
 		InstanceID:  installerkit.ShellQuote(req.Instance.ID),
 		Services:    installerkit.ShellQuote(strings.Join(services, " ")),
+		LocalDate:   installerkit.ShellQuote(req.LocalDate),
 		SinceUnix:   installerkit.ShellQuote(fmt.Sprint(req.SinceAt.Unix())),
 		UntilUnix:   installerkit.ShellQuote(fmt.Sprint(req.UntilAt.Unix())),
 	})
@@ -165,7 +171,7 @@ func (s Service) EstimateRuntimeDiagnostics(ctx context.Context, req RuntimeDiag
 	}
 	estimateCtx, cancel := context.WithTimeout(ctx, runtimeDiagnosticEstimateTimeout)
 	defer cancel()
-	result, runErr := s.remote.Run(estimateCtx, req.Server, "sh -s <<'AIFAR_RUNTIME_DIAGNOSTIC_ESTIMATE'\n"+script+"\nAIFAR_RUNTIME_DIAGNOSTIC_ESTIMATE")
+	result, runErr := s.remote.Run(estimateCtx, req.Server, "bash -s <<'AIFAR_RUNTIME_DIAGNOSTIC_ESTIMATE'\n"+script+"\nAIFAR_RUNTIME_DIAGNOSTIC_ESTIMATE")
 	if runErr != nil {
 		return registry.RuntimeDiagnosticEstimateResult{}, errors.New(i18n.Text(req.Language, "aifar.diag.estimateFailed"))
 	}
@@ -386,9 +392,10 @@ func (s Service) ExportRuntimeDiagnostics(ctx context.Context, req RuntimeDiagno
 	normalizedRequest := RuntimeDiagnosticRequest{
 		ExportID: exportRecord.ID, Instance: current, Server: server, Language: req.Language,
 		Actor: exportRecord.CreatedBy, Services: append([]string(nil), exportRecord.Services...),
-		SinceAt: exportRecord.SinceAt, UntilAt: exportRecord.UntilAt,
+		LocalDate: exportRecord.LocalDate,
+		SinceAt:   exportRecord.SinceAt, UntilAt: exportRecord.UntilAt,
 	}
-	installRoot, normalizedRequest.Services, err = validateRuntimeDiagnosticEstimateRequest(normalizedRequest, diagnostics, time.Now().UTC())
+	installRoot, normalizedRequest.Services, err = validateRuntimeDiagnosticEstimateRequest(normalizedRequest, diagnostics)
 	if err != nil {
 		return fail(err)
 	}
@@ -443,7 +450,8 @@ func (s Service) ExportRuntimeDiagnostics(ctx context.Context, req RuntimeDiagno
 	script, renderErr := renderRuntimeDiagnosticExportScript(runtimeDiagnosticExportScriptData{
 		InstallRoot: installerkit.ShellQuote(installRoot), ExportID: installerkit.ShellQuote(exportRecord.ID),
 		InstanceID: installerkit.ShellQuote(current.ID), Services: installerkit.ShellQuote(strings.Join(normalizedRequest.Services, " ")),
-		Since: installerkit.ShellQuote(exportRecord.SinceAt.UTC().Format(time.RFC3339)), Until: installerkit.ShellQuote(exportRecord.UntilAt.UTC().Format(time.RFC3339)),
+		LocalDate: installerkit.ShellQuote(exportRecord.LocalDate),
+		Since:     installerkit.ShellQuote(exportRecord.SinceAt.UTC().Format(time.RFC3339)), Until: installerkit.ShellQuote(exportRecord.UntilAt.UTC().Format(time.RFC3339)),
 		ArchiveBase: installerkit.ShellQuote(archiveBase), RuntimeSummary: installerkit.ShellQuote(runtimeSummaryJSON),
 		Deployments: installerkit.ShellQuote(deploymentsJSON), Pods: installerkit.ShellQuote(podsJSON),
 		ReleaseSummary: installerkit.ShellQuote(releaseSummaryJSON), Readme: installerkit.ShellQuote(i18n.Text(req.Language, "aifar.diag.readme")),
@@ -713,7 +721,7 @@ func (r *runtimeDiagnosticContextReader) Read(p []byte) (int, error) {
 	return r.reader.Read(p)
 }
 
-func validateRuntimeDiagnosticEstimateRequest(req RuntimeDiagnosticRequest, diagnostics runtimeDiagnosticsStore, now time.Time) (string, []string, error) {
+func validateRuntimeDiagnosticEstimateRequest(req RuntimeDiagnosticRequest, diagnostics runtimeDiagnosticsStore) (string, []string, error) {
 	if req.Instance.App != AppName || stringFromMetadata(metadataFromInstance(req.Instance), "orchestrationModel", "") != orchestrationModelK8sLikeV1 {
 		return "", nil, errors.New(i18n.Text(req.Language, "aifar.diag.instanceUnsupported"))
 	}
@@ -723,14 +731,8 @@ func validateRuntimeDiagnosticEstimateRequest(req RuntimeDiagnosticRequest, diag
 	if containsRuntimeDiagnosticControl(req.Instance.ID) {
 		return "", nil, errors.New(i18n.Text(req.Language, "aifar.diag.inputUnsafe"))
 	}
-	if req.SinceAt.IsZero() || req.UntilAt.IsZero() || !req.SinceAt.Before(req.UntilAt) {
+	if !validRuntimeDiagnosticLocalDate(req.LocalDate) {
 		return "", nil, errors.New(i18n.Text(req.Language, "aifar.diag.windowInvalid"))
-	}
-	if req.UntilAt.After(now) {
-		return "", nil, errors.New(i18n.Text(req.Language, "aifar.diag.windowFuture"))
-	}
-	if req.UntilAt.Sub(req.SinceAt) > runtimeDiagnosticRetention {
-		return "", nil, errors.New(i18n.Text(req.Language, "aifar.diag.windowTooLarge"))
 	}
 	if len(req.Services) == 0 {
 		return "", nil, errors.New(i18n.Text(req.Language, "aifar.diag.servicesRequired"))
@@ -796,22 +798,7 @@ func renderRuntimeDiagnosticExportScript(data runtimeDiagnosticExportScriptData)
 	if strings.TrimSpace(data.FileLimitBlocks) == "" {
 		data.FileLimitBlocks = "1048576"
 	}
-	if strings.TrimSpace(data.FilterProgram) == "" {
-		filterProgram, err := renderRuntimeDiagnosticFilterProgram()
-		if err != nil {
-			return "", err
-		}
-		data.FilterProgram = filterProgram
-	}
 	return renderEmbeddedRuntimeDiagnosticScript("aifar-runtime-diagnostics-export", content, data)
-}
-
-func renderRuntimeDiagnosticFilterProgram() (string, error) {
-	content, err := templateFS.ReadFile("templates/runtime-diagnostics-filter.awk")
-	if err != nil {
-		return "", err
-	}
-	return string(content), nil
 }
 
 func renderRuntimeDiagnosticCleanupScript(data runtimeDiagnosticCleanupScriptData) (string, error) {
@@ -988,6 +975,7 @@ func buildRuntimeDiagnosticPayloads(diagnostics runtimeDiagnosticsStore, instanc
 		Topology:   instance.Topology,
 		Status:     instance.Status,
 		Services:   services,
+		LocalDate:  exportRecord.LocalDate,
 		SinceAt:    exportRecord.SinceAt.UTC(),
 		UntilAt:    exportRecord.UntilAt.UTC(),
 	}
