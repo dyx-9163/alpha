@@ -232,9 +232,10 @@ func TestMySQLRestoreHandlerRejectsUnsafeRequestsBeforeTaskOrMutation(t *testing
 	}
 }
 
-func TestMySQLBackupHandlerValidatesInstanceAppAndStandaloneTopology(t *testing.T) {
-	// Production break caught: dispatching a standalone task for a foreign app or cluster member would select the wrong safety model.
-	tests := []struct{ name, app, topology string }{{"foreign app", "redis", "standalone"}, {"cluster", "mysql", "innodb-cluster"}}
+func TestMySQLBackupHandlerValidatesInstanceAppAndSupportedTopology(t *testing.T) {
+	// Production break caught: dispatching a MySQL backup task for a foreign app
+	// or unsupported topology would select the wrong safety model.
+	tests := []struct{ name, app, topology string }{{"foreign app", "redis", "standalone"}, {"unsupported topology", "mysql", "replica"}}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			api, db, secret := newAuthzTestAPI(t)

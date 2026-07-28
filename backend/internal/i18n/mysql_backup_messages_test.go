@@ -67,3 +67,19 @@ func TestMySQLBackupCatalogContainsEveryTaskStepAndStableErrorMessageInBothLocal
 		}
 	}
 }
+
+func TestMySQLMaintenanceClearStepHasExactPublicTitleInBothLocales(t *testing.T) {
+	// Production break caught: a hard-coded runtime title ignores the request
+	// language and leaves stored task plans inconsistent with task events.
+	for _, test := range []struct {
+		language string
+		want     string
+	}{
+		{language: "zh-CN", want: "清除 MySQL 维护状态"},
+		{language: "en", want: "clear MySQL maintenance state"},
+	} {
+		if got := Text(test.language, "mysql.maintenance.clearStep"); got != test.want {
+			t.Fatalf("Text(%q, mysql.maintenance.clearStep)=%q want %q", test.language, got, test.want)
+		}
+	}
+}

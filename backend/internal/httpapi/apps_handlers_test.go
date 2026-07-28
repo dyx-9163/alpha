@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -224,27 +225,28 @@ func TestDeleteAppInstanceStoresPlanBeforeTaskRuns(t *testing.T) {
 	}
 }
 
-// Production break caught: using the single-instance app lock lets a delete
+// Production break caught: using per-instance app locks lets a batch delete
 // overlap a cluster backup/restore held on the authoritative cluster lock.
-func TestDeleteMySQLClusterInstanceUsesRawClusterMutationLock(t *testing.T) {
+func TestDeleteMySQLClusterInstancesUseRawClusterMutationLock(t *testing.T) {
 	api, db, secret := newAuthzTestAPI(t)
 	api.apps = registry.New(&fakePlannedLifecycleModule{name: "mysql"})
-	server, err := db.SaveServer(store.Server{Name: "mysql-1", Host: "10.0.0.9", Username: "root", Password: "server-pass"})
+	clusterID := "cluster_1234567890abcdef12345678"
+	servers, instances := saveHTTPTestMySQLCluster(t, db, clusterID, "server-pass")
+	ownerTask, err := db.CreateTask(store.Task{Type: "apps.mysql.backup", Target: instances[0].ID, Status: "running", CreatedBy: "owner"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	instance, err := db.SaveAppInstance(store.AppInstance{App: "mysql", Version: "8.0.36", ServerID: server.ID, Status: "installed", Topology: "innodb-cluster", Metadata: `{"clusterId":"cluster_1234567890abcdef12345678"}`})
-	if err != nil {
+	if _, err := db.AcquireOperationLock(store.OperationLock{Scope: "app-cluster", ResourceID: clusterID, Operation: operationLockMutation, OwnerTaskID: ownerTask.ID, Owner: "owner", ExpiresAt: time.Now().Add(time.Hour)}); err != nil {
 		t.Fatal(err)
 	}
-	ownerTask, err := db.CreateTask(store.Task{Type: "apps.mysql.backup", Target: instance.ID, Status: "running", CreatedBy: "owner"})
-	if err != nil {
-		t.Fatal(err)
+	passwords := map[string]string{}
+	ids := make([]string, 0, len(instances))
+	for index := range instances {
+		ids = append(ids, instances[index].ID)
+		passwords[servers[index].ID] = "server-pass"
 	}
-	if _, err := db.AcquireOperationLock(store.OperationLock{Scope: "app-cluster", ResourceID: "cluster_1234567890abcdef12345678", Operation: operationLockMutation, OwnerTaskID: ownerTask.ID, Owner: "owner", ExpiresAt: time.Now().Add(time.Hour)}); err != nil {
-		t.Fatal(err)
-	}
-	req := httptest.NewRequest(http.MethodPost, "/api/v2/apps/instances/"+instance.ID+"/delete", strings.NewReader(`{"serverPassword":"server-pass"}`))
+	body, _ := json.Marshal(map[string]any{"instanceIds": ids, "serverPasswords": passwords})
+	req := httptest.NewRequest(http.MethodPost, "/api/v2/apps/instances/batch-delete", strings.NewReader(string(body)))
 	req.Header.Set("Authorization", "Bearer "+issueTestToken(t, db, secret, "owner", "owner"))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
@@ -335,7 +337,7 @@ func TestCheckAppInstanceUsesMutationLockOnlyForMySQL(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			instance, err := db.SaveAppInstance(store.AppInstance{App: test.app, Version: "8.0.36", ServerID: server.ID, Status: "installed", Topology: "standalone"})
+			instance, err := db.SaveAppInstance(store.AppInstance{App: test.app, Version: "8.0.36", ServerID: server.ID, Status: "installed", Topology: "standalone", Metadata: `{}`})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -576,25 +578,10 @@ func TestStartMySQLClusterStoresPlanBeforeTaskRuns(t *testing.T) {
 	api, db, secret := newAuthzTestAPI(t)
 	module := &fakePlannedLifecycleModule{name: "mysql"}
 	api.apps = registry.New(module)
-	server1, err := db.SaveServer(store.Server{Name: "mysql-1", Host: "10.0.0.1", Username: "root"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	server2, err := db.SaveServer(store.Server{Name: "mysql-2", Host: "10.0.0.2", Username: "root"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	instance1, err := db.SaveAppInstance(store.AppInstance{App: "mysql", Version: "8.0.36", ServerID: server1.ID, Status: "installed", Topology: "innodb-cluster", Metadata: `{"clusterId":"cluster-a"}`})
-	if err != nil {
-		t.Fatal(err)
-	}
-	instance2, err := db.SaveAppInstance(store.AppInstance{App: "mysql", Version: "8.0.36", ServerID: server2.ID, Status: "installed", Topology: "innodb-cluster", Metadata: `{"clusterId":"cluster-a"}`})
-	if err != nil {
-		t.Fatal(err)
-	}
+	_, instances := saveHTTPTestMySQLCluster(t, db, "cluster_1234567890abcdef12345678", "")
 	token := issueTestToken(t, db, secret, "owner", "owner")
 
-	body := `{"instanceIds":["` + instance1.ID + `","` + instance2.ID + `"]}`
+	body := `{"instanceIds":["` + instances[0].ID + `","` + instances[1].ID + `","` + instances[2].ID + `"]}`
 	req := httptest.NewRequest(http.MethodPost, "/api/v2/database/mysql/clusters/start", strings.NewReader(body))
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", "application/json")
@@ -610,13 +597,41 @@ func TestStartMySQLClusterStoresPlanBeforeTaskRuns(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(steps) != 2 || steps[0].Name != "cluster-start" || steps[1].Name != "cluster-start" {
+	if len(steps) != 3 || steps[0].Name != "cluster-start" || steps[1].Name != "cluster-start" || steps[2].Name != "cluster-start" {
 		t.Fatalf("expected pre-stored cluster plan steps, got %+v", steps)
 	}
 	waitForTaskStatus(t, db, taskID, "success")
 	if module.clusterStartCalls != 1 {
 		t.Fatalf("expected cluster start module call, got %d", module.clusterStartCalls)
 	}
+}
+
+func saveHTTPTestMySQLCluster(t *testing.T, db *store.Store, clusterID, password string) ([]store.Server, []store.AppInstance) {
+	t.Helper()
+	if _, err := db.SaveAppCluster(store.AppCluster{ID: clusterID, App: "mysql", Name: "test", Topology: "innodb-cluster", Status: "active"}); err != nil {
+		t.Fatal(err)
+	}
+	servers := make([]store.Server, 0, 3)
+	instances := make([]store.AppInstance, 0, 3)
+	for index := 0; index < 3; index++ {
+		server, err := db.SaveServer(store.Server{Name: fmt.Sprintf("mysql-%d", index+1), Host: fmt.Sprintf("10.0.0.%d", index+1), Username: "root", Password: password})
+		if err != nil {
+			t.Fatal(err)
+		}
+		instance, err := db.SaveAppInstance(store.AppInstance{
+			App: "mysql", Version: "8.0.36", ServerID: server.ID, Status: "installed", Topology: "innodb-cluster",
+			Metadata: `{"clusterId":"` + clusterID + `"}`,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.SaveAppClusterMember(store.AppClusterMember{ClusterID: clusterID, InstanceID: instance.ID, ServerID: server.ID, Role: "SECONDARY", Status: "ONLINE"}); err != nil {
+			t.Fatal(err)
+		}
+		servers = append(servers, server)
+		instances = append(instances, instance)
+	}
+	return servers, instances
 }
 
 func TestInstallPostHookRecordsCredentialReferencesAndClusterMembers(t *testing.T) {

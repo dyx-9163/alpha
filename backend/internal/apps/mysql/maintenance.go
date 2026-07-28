@@ -4,10 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"os"
+	"path"
 	"sort"
 	"strings"
 	"time"
 
+	"aifar-deployment/backend/internal/installer/installerkit"
 	"aifar-deployment/backend/internal/store"
 )
 
@@ -269,11 +273,11 @@ func (m Module) ClearMaintenance(ctx context.Context, instance store.AppInstance
 			return localizedMySQLOperationError(language, MySQLMaintenanceStateInvalid)
 		}
 		credential, credentialErr := credentials.GetBoundCredential(fresh.ID, "admin", true)
-		if credentialErr != nil || credential.Status != "active" || credential.Kind != "mysql" || strings.TrimSpace(credential.Secret["password"]) == "" {
+		if credentialErr != nil || credential.Status != "active" || credential.Kind != "mysql" ||
+			strings.TrimSpace(credential.Username) == "" || strings.TrimSpace(credential.Secret["password"]) == "" {
 			return localizedMySQLOperationError(language, MySQLMaintenanceStateInvalid)
 		}
-		probe, probeErr := m.service.probeMySQLRuntime(ctx, server, fresh, credential.Secret["password"], log)
-		if probeErr != nil || !probe.pingRunning() {
+		if probeErr := m.service.probeMySQLMaintenanceCredential(ctx, server, fresh, credential, taskID, log); probeErr != nil {
 			return localizedMySQLOperationError(language, MySQLMaintenanceStateInvalid)
 		}
 	} else {
@@ -284,6 +288,53 @@ func (m Module) ClearMaintenance(ctx context.Context, instance store.AppInstance
 		// Runtime resolver verifies exactly three ONLINE members and one PRIMARY.
 	}
 	return m.service.clearMySQLMaintenance(ids, marker, language)
+}
+
+func (s Service) probeMySQLMaintenanceCredential(ctx context.Context, server store.Server, instance store.AppInstance, credential store.Credential, taskID string, log Logger) (retErr error) {
+	if strings.TrimSpace(credential.Username) == "" || strings.TrimSpace(credential.Secret["password"]) == "" {
+		return errors.New("complete MySQL maintenance credential is required")
+	}
+	work := mysqlBackupWorkDir(taskID + "-maintenance-ping")
+	if _, err := s.remote.Run(ctx, server, bootstrapBackupWorkCommand(work)); err != nil {
+		return errors.New("unable to prepare MySQL maintenance health check")
+	}
+	defer func() {
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		defer cancel()
+		if _, err := s.remote.Run(cleanupCtx, server, cleanupBackupCommand(work)); err != nil {
+			retErr = errors.Join(retErr, errors.New("unable to clean MySQL maintenance health check"))
+		}
+	}()
+	secret, err := writeMySQLSecretContext(credential, instancePort(instance))
+	if err != nil {
+		return errors.New("unable to create MySQL maintenance credential context")
+	}
+	defer os.Remove(secret)
+	if err := s.remote.UploadFile(ctx, server, secret, path.Join(work, "secret-context.cnf"), 0o600); err != nil {
+		return errors.New("unable to upload MySQL maintenance credential context")
+	}
+	result, err := s.remote.Run(ctx, server, mysqlMaintenancePingCommand(work, server, instance))
+	installerkit.LogCommandResult(result, err, log)
+	if err != nil || !strings.Contains(result.Stdout, "__AIFAR_MYSQL_PING__\t1") {
+		return errors.New("MySQL maintenance health check failed")
+	}
+	return nil
+}
+
+func mysqlMaintenancePingCommand(work string, server store.Server, instance store.AppInstance) string {
+	installRoot := remoteInstallRoot(server, "mysql", instance.Version)
+	legacyInstallRoot := remoteLegacyInstallRoot(server, "mysql", instance.Version)
+	return fmt.Sprintf(`set -eu
+INSTALL_ROOT=%s
+LEGACY_ROOT=%s
+if [ ! -x "$INSTALL_ROOT/mysql/bin/mysqladmin" ] && [ -x "$LEGACY_ROOT/mysql/bin/mysqladmin" ]; then INSTALL_ROOT="$LEGACY_ROOT"; fi
+test -x "$INSTALL_ROOT/mysql/bin/mysqladmin"
+"$INSTALL_ROOT/mysql/bin/mysqladmin" --defaults-file=%s --protocol=tcp ping >/dev/null
+printf '__AIFAR_MYSQL_PING__\t1\n'`,
+		installerkit.ShellQuote(installRoot),
+		installerkit.ShellQuote(legacyInstallRoot),
+		installerkit.ShellQuote(path.Join(work, "secret-context.cnf")),
+	)
 }
 
 func sameMaintenanceMarker(left, right store.MySQLMaintenanceMarker) bool {

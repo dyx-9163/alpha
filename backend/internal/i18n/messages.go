@@ -168,6 +168,7 @@ var mysqlBackupCatalogs = map[Locale]map[string]string{
 		"mysql.maintenance.required":           "MySQL 处于维护恢复状态，常规操作已被阻止",
 		"mysql.maintenance.stateInvalid":       "MySQL 维护状态无效，常规操作已被阻止",
 		"mysql.maintenance.statePersistFailed": "无法持久化 MySQL 维护状态，已停止操作",
+		"mysql.maintenance.clearStep":          "清除 MySQL 维护状态",
 	},
 	En: {
 		"mysql.backup.standaloneRequired":              "this operation currently supports only standalone MySQL backups",
@@ -244,6 +245,7 @@ var mysqlBackupCatalogs = map[Locale]map[string]string{
 		"mysql.maintenance.required":           "MySQL is in maintenance recovery state; ordinary operations are blocked",
 		"mysql.maintenance.stateInvalid":       "MySQL maintenance state is invalid; ordinary operations are blocked",
 		"mysql.maintenance.statePersistFailed": "unable to persist MySQL maintenance state; operation stopped",
+		"mysql.maintenance.clearStep":          "clear MySQL maintenance state",
 	},
 }
 

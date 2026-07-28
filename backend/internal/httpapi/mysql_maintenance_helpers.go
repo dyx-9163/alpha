@@ -1,11 +1,18 @@
 package httpapi
 
 import (
+	"regexp"
 	"strings"
 
 	"aifar-deployment/backend/internal/apps/mysql"
 	"aifar-deployment/backend/internal/store"
 )
+
+var controlledMySQLMaintenanceClusterID = regexp.MustCompile(`^cluster_[0-9a-f]{24}$`)
+
+func validMySQLMaintenanceClusterID(value string) bool {
+	return controlledMySQLMaintenanceClusterID.MatchString(strings.TrimSpace(value))
+}
 
 // mysqlMaintenanceGate is the handler-side half of the fail-closed guard.
 // Module services repeat it after the worker has acquired the raw lock.
@@ -13,10 +20,20 @@ func (a *API) mysqlMaintenanceGate(instance store.AppInstance) string {
 	if !strings.EqualFold(strings.TrimSpace(instance.App), "mysql") {
 		return ""
 	}
+	_, representativePresent, representativeErr := store.ParseMySQLMaintenanceMarker(instance.Metadata)
+	if representativeErr != nil {
+		return mysql.MySQLMaintenanceStateInvalid
+	}
 	instances := []store.AppInstance{instance}
 	if strings.EqualFold(strings.TrimSpace(instance.Topology), "innodb-cluster") {
 		clusterID := mysqlClusterID(instance)
 		if clusterID == "" {
+			if !representativePresent {
+				// This is not a maintenance-state decision. Leave the malformed
+				// raw cluster identity to the lifecycle action's validator so
+				// it preserves its established cluster-health error contract.
+				return ""
+			}
 			return mysql.MySQLMaintenanceStateInvalid
 		}
 		cluster, err := a.store.GetAppCluster(clusterID)
