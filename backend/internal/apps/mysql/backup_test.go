@@ -160,8 +160,9 @@ func TestBackupRetentionDeletesOwnedOldArchiveAfterNewRecordIsSuccessful(t *test
 	}
 }
 
-func TestBackupRetentionRevalidatesInstanceOwnershipAfterLock(t *testing.T) {
-	// Production break caught: the request is the pre-lock snapshot; retention must reload the authoritative instance while the worker owns the instance lock.
+func TestBackupRejectsInstanceOwnershipDriftBeforeRemoteWork(t *testing.T) {
+	// Production break caught: the request is the pre-lock snapshot. A changed
+	// authoritative owner must fail closed before either dump or retention work.
 	tests := []struct {
 		name, sensitive string
 		mutate          func(*store.AppInstance)
@@ -195,8 +196,10 @@ func TestBackupRetentionRevalidatesInstanceOwnershipAfterLock(t *testing.T) {
 			test.mutate(&data.instance)
 			request.KeepLast = 1
 			recorder := &backupRecorder{}
-			if err := module.Backup(context.Background(), request, registry.RunContext{TaskID: "tsk_1234567890abcdef12345678", Log: recorder}); err != nil {
-				t.Fatal(err)
+			err = module.Backup(context.Background(), request, registry.RunContext{TaskID: "tsk_1234567890abcdef12345678", Log: recorder})
+			var operation *MySQLOperationError
+			if !errors.As(err, &operation) || operation.Code != MySQLReconciliationRequired {
+				t.Fatalf("ownership drift error=%v code=%v", err, operation)
 			}
 			old, err := data.GetAppBackup("backup_stale_owner")
 			if err != nil || old.Status != "success" {
@@ -205,13 +208,12 @@ func TestBackupRetentionRevalidatesInstanceOwnershipAfterLock(t *testing.T) {
 			if _, err := repository.Verify(old); err != nil {
 				t.Fatalf("old archive changed: %v", err)
 			}
-			newest := data.newestBackupExcept(old.ID)
-			if newest.Status != "success" {
-				t.Fatalf("new backup did not succeed: %+v", newest)
+			if newest := data.newestBackupExcept(old.ID); newest.ID != "" {
+				t.Fatalf("ownership drift created a backup: %+v", newest)
 			}
 			warning := strings.Join(recorder.messages, "\n")
-			if !strings.Contains(warning, "MySQL backup retention cleanup failed") || strings.Contains(warning, test.sensitive) {
-				t.Fatalf("retention warning was not localized and sanitized: %q", warning)
+			if warning != "" || strings.Contains(warning, test.sensitive) {
+				t.Fatalf("ownership drift reached remote/log lifecycle: %q", warning)
 			}
 		})
 	}

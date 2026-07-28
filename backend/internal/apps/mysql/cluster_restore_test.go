@@ -202,7 +202,7 @@ func TestClusterRestoreRejectsPrimaryFailoverBeforeSchemaMutation(t *testing.T) 
 	}}
 	module := configuredClusterRestoreModule(data, remote)
 	recorder := &restoreProgressRecorder{}
-	err := module.Restore(context.Background(), request, registry.RunContext{TaskID: "task_cluster_failover", Log: recorder})
+	err := module.Restore(context.Background(), request, registry.RunContext{TaskID: "tsk_aaaaaaaaaaaaaaaaaaaaaaaa", Log: recorder})
 	assertClusterRestoreFailure(t, err, MySQLRestorePrimaryChanged, data, remote, recorder)
 	if containsRestoreCommand(remote.commands, "DROP DATABASE") || containsRestoreCommand(remote.commands, "logical-restore.sh") {
 		t.Fatalf("failover reached destructive restore commands: %v", remote.commands)
@@ -220,7 +220,7 @@ func TestClusterRestoreMarksIncompleteWhenMemberLeavesOnlineAfterLoad(t *testing
 	}}
 	module := configuredClusterRestoreModule(data, remote)
 	recorder := &restoreProgressRecorder{}
-	err := module.Restore(context.Background(), request, registry.RunContext{TaskID: "task_cluster_member_failed", Log: recorder})
+	err := module.Restore(context.Background(), request, registry.RunContext{TaskID: "tsk_bbbbbbbbbbbbbbbbbbbbbbbb", Log: recorder})
 	assertClusterRestoreFailure(t, err, MySQLRestoreIncomplete, data, remote, recorder)
 	assertOneLogicalLoadWithBinlogEnabled(t, remote)
 }
@@ -237,7 +237,7 @@ func TestClusterRestoreMarksIncompleteWhenRouterTransactionFails(t *testing.T) {
 	}
 	module := configuredClusterRestoreModule(data, remote)
 	recorder := &restoreProgressRecorder{}
-	err := module.Restore(context.Background(), request, registry.RunContext{TaskID: "task_cluster_router_failed", Log: recorder})
+	err := module.Restore(context.Background(), request, registry.RunContext{TaskID: "tsk_cccccccccccccccccccccccc", Log: recorder})
 	assertClusterRestoreFailure(t, err, MySQLRestoreIncomplete, data, remote, recorder)
 	assertOneLogicalLoadWithBinlogEnabled(t, remote)
 }
@@ -408,6 +408,15 @@ type clusterRestoreFixture struct {
 	members   []store.AppClusterMember
 }
 
+func clusterFixtureInstance(instances []store.AppInstance, id string) (store.AppInstance, int, error) {
+	for index, instance := range instances {
+		if instance.ID == id {
+			return instance, index, nil
+		}
+	}
+	return store.AppInstance{}, -1, errors.New("instance not found")
+}
+
 func newClusterRestoreFixture(t *testing.T, instances []store.AppInstance, servers []store.Server) (*clusterRestoreFixture, registry.RestoreRequest) {
 	t.Helper()
 	base := &restoreFakeStore{backupFakeStore: newBackupFakeStore(t)}
@@ -442,6 +451,23 @@ func (s *clusterRestoreFixture) GetServer(id string, _ bool) (store.Server, erro
 	return server, nil
 }
 
+func (s *clusterRestoreFixture) GetAppInstance(id string) (store.AppInstance, error) {
+	instance, _, err := clusterFixtureInstance(s.instances, id)
+	return instance, err
+}
+
+func (s *clusterRestoreFixture) SaveAppInstance(value store.AppInstance) (store.AppInstance, error) {
+	_, index, err := clusterFixtureInstance(s.instances, value.ID)
+	if err != nil {
+		return store.AppInstance{}, err
+	}
+	if _, err = s.restoreFakeStore.SaveAppInstance(value); err != nil {
+		return store.AppInstance{}, err
+	}
+	s.instances[index] = value
+	return value, nil
+}
+
 func (s *clusterRestoreFixture) ListAppInstances() ([]store.AppInstance, error) {
 	return append([]store.AppInstance(nil), s.instances...), nil
 }
@@ -458,6 +484,66 @@ func (s *clusterRestoreFixture) ListAppClusterMembers(id string) ([]store.AppClu
 		return nil, fmt.Errorf("members not found")
 	}
 	return append([]store.AppClusterMember(nil), s.members...), nil
+}
+
+func (s *clusterRestoreFixture) SetMySQLMaintenance(ids []string, marker store.MySQLMaintenanceMarker) error {
+	return s.updateMaintenance(ids, func(metadata map[string]json.RawMessage, _ store.MySQLMaintenanceMarker, present bool) error {
+		if present {
+			return errors.New("maintenance already present")
+		}
+		metadata["mysqlMaintenance"], _ = json.Marshal(marker)
+		return nil
+	})
+}
+
+func (s *clusterRestoreFixture) AdvanceMySQLMaintenance(ids []string, marker store.MySQLMaintenanceMarker, phase string) error {
+	return s.updateMaintenance(ids, func(metadata map[string]json.RawMessage, current store.MySQLMaintenanceMarker, present bool) error {
+		if !present || !sameMaintenanceMarker(current, marker) {
+			return errors.New("maintenance ownership changed")
+		}
+		current.RestorePhase = phase
+		metadata["mysqlMaintenance"], _ = json.Marshal(current)
+		return nil
+	})
+}
+
+func (s *clusterRestoreFixture) ClearMySQLMaintenance(ids []string, marker store.MySQLMaintenanceMarker) error {
+	return s.updateMaintenance(ids, func(metadata map[string]json.RawMessage, current store.MySQLMaintenanceMarker, present bool) error {
+		if !present || !sameMaintenanceMarker(current, marker) {
+			return errors.New("maintenance ownership changed")
+		}
+		delete(metadata, "mysqlMaintenance")
+		return nil
+	})
+}
+
+func (s *clusterRestoreFixture) updateMaintenance(ids []string, update func(map[string]json.RawMessage, store.MySQLMaintenanceMarker, bool) error) error {
+	next := append([]store.AppInstance(nil), s.instances...)
+	for _, id := range ids {
+		instance, index, err := clusterFixtureInstance(next, id)
+		if err != nil {
+			return err
+		}
+		metadata, err := strictBackupMetadata(instance.Metadata)
+		if err != nil {
+			return err
+		}
+		marker, present, err := store.ParseMySQLMaintenanceMarker(instance.Metadata)
+		if err != nil {
+			return fmt.Errorf("parse maintenance for %s: %w", id, err)
+		}
+		if err := update(metadata, marker, present); err != nil {
+			return fmt.Errorf("update maintenance for %s present=%t marker=%+v: %w", id, present, marker, err)
+		}
+		encoded, err := json.Marshal(metadata)
+		if err != nil {
+			return err
+		}
+		instance.Metadata = string(encoded)
+		next[index] = instance
+	}
+	s.instances = next
+	return nil
 }
 
 func createClusterRestoreBackup(t *testing.T, instances []store.AppInstance, servers []store.Server) (string, store.AppBackup) {
@@ -526,6 +612,10 @@ func (s *clusterBackupFixture) GetServer(id string, _ bool) (store.Server, error
 		return store.Server{}, fmt.Errorf("server %s not found", id)
 	}
 	return server, nil
+}
+func (s *clusterBackupFixture) GetAppInstance(id string) (store.AppInstance, error) {
+	instance, _, err := clusterFixtureInstance(s.instances, id)
+	return instance, err
 }
 func (s *clusterBackupFixture) ListAppInstances() ([]store.AppInstance, error) {
 	return append([]store.AppInstance(nil), s.instances...), nil

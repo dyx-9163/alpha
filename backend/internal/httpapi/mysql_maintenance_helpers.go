@@ -105,6 +105,13 @@ func (a *API) mysqlReconciliationGate(instance store.AppInstance) string {
 	if topology == "innodb-cluster" {
 		clusterID := mysqlClusterID(instance)
 		if !validMySQLMaintenanceClusterID(clusterID) {
+			present, err := mysql.ReconciliationMarkerState(instance.Metadata)
+			if err == nil && !present {
+				// A missing or malformed cluster identity is not itself evidence of
+				// unfinished reconciliation. Let the lifecycle validator preserve
+				// its established cluster-health error contract.
+				return ""
+			}
 			return mysql.MySQLReconciliationRequired
 		}
 		cluster, err := a.store.GetAppCluster(clusterID)
