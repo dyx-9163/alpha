@@ -34,8 +34,17 @@ validate_paths() {
   test "$available_kb" -gt "$required_kb"
 }
 
+validate_secret_file() {
+  secret_file="$1"
+  test -f "$secret_file"
+  test ! -L "$secret_file"
+  test "$(stat -c '%u' "$secret_file")" = "$(id -u)"
+  test "$(stat -c '%a' "$secret_file")" = "600"
+}
+
 case "$ACTION" in
   stop-gr)
+    validate_secret_file "$WORK_DIR/secret-context.cnf"
     load_state="$($SUDO systemctl show "$SERVICE_NAME" --property=LoadState --value)"
     case "$load_state" in
       not-found)
@@ -103,12 +112,12 @@ case "$ACTION" in
       sleep 1
     done
     test "$ready" = "1"
-    test -f "$WORK_DIR/admin-init.sql"
-    test ! -L "$WORK_DIR/admin-init.sql"
+    validate_secret_file "$WORK_DIR/admin-init.sql"
     "$INSTALL_ROOT/mysql/bin/mysql" --protocol=socket --socket="$INSTALL_ROOT/run/mysql.sock" -uroot < "$WORK_DIR/admin-init.sql"
     rm -f -- "$WORK_DIR/admin-init.sql"
     ;;
   inspect-initialized)
+    validate_secret_file "$WORK_DIR/secret-context.cnf"
     test -d "$QUARANTINE_DIR"
     test ! -L "$QUARANTINE_DIR"
     test -d "$DATA_DIR"

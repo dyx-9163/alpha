@@ -417,8 +417,20 @@ func TestBackupVerifyServiceRejectsMalformedOrNonObjectMetadataWithoutWriting(t 
 
 func TestBackupVerifyServiceAcceptsMatchingClusterOwnershipWithoutMySQLContact(t *testing.T) {
 	module, data, _ := newStandaloneBackupModule(t)
+	clusterID := "cluster_verify_1234567890abcdef"
 	data.instance.Topology = "innodb-cluster"
-	data.instance.Metadata = `{"clusterId":"cluster_verify_1234567890abcdef","port":3306}`
+	data.instance.Metadata = `{"clusterId":"` + clusterID + `","port":3306}`
+	data.cluster = store.AppCluster{ID: clusterID, App: "mysql", Topology: "innodb-cluster"}
+	data.instances = []store.AppInstance{
+		data.instance,
+		{ID: "app_cluster_verify_member_2", App: "mysql", ServerID: "srv_cluster_verify_member_2", Topology: "innodb-cluster", Metadata: `{"clusterId":"` + clusterID + `"}`},
+		{ID: "app_cluster_verify_member_3", App: "mysql", ServerID: "srv_cluster_verify_member_3", Topology: "innodb-cluster", Metadata: `{"clusterId":"` + clusterID + `"}`},
+	}
+	data.members = []store.AppClusterMember{
+		{ID: "member_cluster_verify_1", ClusterID: clusterID, InstanceID: data.instances[0].ID, ServerID: data.instances[0].ServerID},
+		{ID: "member_cluster_verify_2", ClusterID: clusterID, InstanceID: data.instances[1].ID, ServerID: data.instances[1].ServerID},
+		{ID: "member_cluster_verify_3", ClusterID: clusterID, InstanceID: data.instances[2].ID, ServerID: data.instances[2].ServerID},
+	}
 	root := filepath.Join(t.TempDir(), "repository")
 	repository, err := backuprepo.New(root)
 	if err != nil {
@@ -437,12 +449,41 @@ func TestBackupVerifyServiceAcceptsMatchingClusterOwnershipWithoutMySQLContact(t
 	if err := repository.Commit(paths, []byte(`{"backupId":"`+id+`","app":"mysql"}`), digest, int64(len(archive))); err != nil {
 		t.Fatal(err)
 	}
-	data.backups = []store.AppBackup{{ID: id, App: "mysql", InstanceID: data.instance.ID, ServerID: data.instance.ServerID, BackupType: "logical-full", Status: "success", Path: paths.Archive, Checksum: digest, Size: int64(len(archive)), Metadata: `{"phase":"success","topology":"innodb-cluster","clusterId":"cluster_verify_1234567890abcdef"}`}}
+	data.backups = []store.AppBackup{{ID: id, App: "mysql", InstanceID: data.instance.ID, ServerID: data.instance.ServerID, BackupType: "logical-full", Status: "success", Path: paths.Archive, Checksum: digest, Size: int64(len(archive)), Metadata: `{"phase":"success","topology":"innodb-cluster","clusterId":"` + clusterID + `"}`}}
 	if err := module.VerifyBackup(context.Background(), id, root, "en", registry.RunContext{TaskID: "tsk_verify_1234567890abcdef", Log: &backupRecorder{}}); err != nil {
 		t.Fatal(err)
 	}
 	if data.credentialLoads != 0 {
 		t.Fatalf("cluster repository verification contacted MySQL %d time(s)", data.credentialLoads)
+	}
+}
+
+func TestBackupVerifyServiceRejectsClusterMembershipDriftUnderLock(t *testing.T) {
+	module, data, _ := newStandaloneBackupModule(t)
+	clusterID := "cluster_verify_drift_1234567890abcdef"
+	data.instance.Topology = "innodb-cluster"
+	data.instance.Metadata = `{"clusterId":"` + clusterID + `"}`
+	data.cluster = store.AppCluster{ID: clusterID, App: "mysql", Topology: "innodb-cluster"}
+	data.instances = []store.AppInstance{
+		data.instance,
+		{ID: "app_cluster_drift_member_2", App: "mysql", ServerID: "srv_cluster_drift_member_2", Topology: "innodb-cluster", Metadata: `{"clusterId":"` + clusterID + `"}`},
+		{ID: "app_cluster_drift_member_3", App: "mysql", ServerID: "srv_cluster_drift_member_3", Topology: "innodb-cluster", Metadata: `{"clusterId":"` + clusterID + `"}`},
+	}
+	data.members = []store.AppClusterMember{
+		{ID: "member_cluster_drift_1", ClusterID: clusterID, InstanceID: data.instances[0].ID, ServerID: data.instances[0].ServerID},
+		{ID: "member_cluster_drift_2", ClusterID: clusterID, InstanceID: data.instances[1].ID, ServerID: data.instances[1].ServerID},
+		{ID: "member_cluster_drift_3", ClusterID: clusterID, InstanceID: data.instances[2].ID, ServerID: "srv_drifted_after_lock"},
+	}
+	id := store.NewID("backup")
+	data.backups = []store.AppBackup{{ID: id, App: "mysql", InstanceID: data.instance.ID, ServerID: data.instance.ServerID, BackupType: "logical-full", Status: "success", Path: filepath.Join(t.TempDir(), "outside.tar"), Checksum: strings.Repeat("a", 64), Size: 1, Metadata: `{"clusterId":"` + clusterID + `"}`}}
+
+	err := module.VerifyBackup(context.Background(), id, filepath.Join(t.TempDir(), "missing-repository"), "en", registry.RunContext{TaskID: "tsk_verify_1234567890abcdef", Log: &backupRecorder{}})
+	var operationErr *MySQLOperationError
+	if !errors.As(err, &operationErr) || operationErr.Code != MySQLBackupClusterUnhealthy {
+		t.Fatalf("error=%v, want %s", err, MySQLBackupClusterUnhealthy)
+	}
+	if data.saveCalls != 0 {
+		t.Fatalf("membership drift verification wrote %d records", data.saveCalls)
 	}
 }
 
@@ -837,6 +878,9 @@ func (f *chmodFailCloseFailSecretContextFile) Close() error {
 type backupFakeStore struct {
 	server                  store.Server
 	instance                store.AppInstance
+	instances               []store.AppInstance
+	cluster                 store.AppCluster
+	members                 []store.AppClusterMember
 	credential              store.Credential
 	credentialErr           error
 	credentialLoads         int
@@ -873,8 +917,25 @@ func (s *backupFakeStore) GetAppInstance(id string) (store.AppInstance, error) {
 func (s *backupFakeStore) SaveAppInstance(v store.AppInstance) (store.AppInstance, error) {
 	return v, nil
 }
-func (s *backupFakeStore) ListAppInstances() ([]store.AppInstance, error) { return nil, nil }
-func (s *backupFakeStore) DeleteAppInstance(string) error                 { return nil }
+func (s *backupFakeStore) ListAppInstances() ([]store.AppInstance, error) {
+	if s.instances != nil {
+		return append([]store.AppInstance(nil), s.instances...), nil
+	}
+	return []store.AppInstance{s.instance}, nil
+}
+func (s *backupFakeStore) GetAppCluster(id string) (store.AppCluster, error) {
+	if s.cluster.ID != id {
+		return store.AppCluster{}, errors.New("cluster not found")
+	}
+	return s.cluster, nil
+}
+func (s *backupFakeStore) ListAppClusterMembers(id string) ([]store.AppClusterMember, error) {
+	if s.cluster.ID != id {
+		return nil, errors.New("cluster members not found")
+	}
+	return append([]store.AppClusterMember(nil), s.members...), nil
+}
+func (s *backupFakeStore) DeleteAppInstance(string) error { return nil }
 func (s *backupFakeStore) GetBoundCredential(instanceID, purpose string, includeSecret bool) (store.Credential, error) {
 	s.credentialLoads++
 	if s.credentialErr != nil {

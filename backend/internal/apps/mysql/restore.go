@@ -297,7 +297,11 @@ func (s Service) restoreLogical(ctx context.Context, req registry.RestoreRequest
 	}); err != nil {
 		return err
 	}
-	defer os.Remove(secretPath)
+	defer func() {
+		if secretPath != "" {
+			retErr = errors.Join(retErr, removeMySQLCredentialContext(secretPath))
+		}
+	}()
 	if err := progress.step(7, func() error {
 		if readable {
 			preRequest := registry.BackupRequest{
@@ -336,7 +340,14 @@ func (s Service) restoreLogical(ctx context.Context, req registry.RestoreRequest
 		if err := s.remote.UploadFile(ctx, server, secretPath, path.Join(probeWork, "secret-context.cnf"), 0o600); err != nil {
 			return err
 		}
-		return s.remote.UploadFile(ctx, server, verification.Paths.Archive, path.Join(probeWork, "dump.tar"), 0o600)
+		if err := s.remote.UploadFile(ctx, server, verification.Paths.Archive, path.Join(probeWork, "dump.tar"), 0o600); err != nil {
+			return err
+		}
+		if err := removeMySQLCredentialContext(secretPath); err != nil {
+			return err
+		}
+		secretPath = ""
+		return nil
 	}); err != nil {
 		return err
 	}
@@ -366,7 +377,12 @@ func (s Service) restoreLogical(ctx context.Context, req registry.RestoreRequest
 	}); err != nil {
 		return err
 	}
-	defer sessionCleanup()
+	defer func() {
+		sessionCleanup()
+		if reporter, ok := session.(credentialCleanupReporter); ok {
+			retErr = errors.Join(retErr, reporter.CredentialCleanupError())
+		}
+	}()
 	localInfileMayBeEnabled := false
 	var maintenanceMarker store.MySQLMaintenanceMarker
 	var maintenanceInstanceIDs []string

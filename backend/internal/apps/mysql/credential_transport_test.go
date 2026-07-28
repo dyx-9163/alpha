@@ -40,6 +40,25 @@ func TestUploadMySQLCredentialContextFailsClosedWhenLocalRemovalFails(t *testing
 	}
 }
 
+func TestMySQLCredentialConsumersValidateRemoteContextBeforeEveryRead(t *testing.T) {
+	commands := map[string]string{
+		"backup inspection":    inspectBackupCommand("/aifar/apps/mysql/_backup/task", 3306),
+		"cluster inspection":   inspectClusterMembersCommand("/aifar/apps/mysql/_backup/task", 3306),
+		"router verification":  routerReadWriteVerificationCommand("/aifar/apps/mysql/_backup/task", 6446, "aifar_business"),
+		"maintenance ping":     mysqlMaintenancePingCommand("/aifar/apps/mysql/_backup/task", store.Server{DeployDir: "/aifar/apps"}, store.AppInstance{Version: "8.0.36"}),
+		"disaster MySQL Shell": mysqlShellJSCommand("/aifar/apps/mysql/_backup/task", 3306, "print('ok')"),
+	}
+	for name, command := range commands {
+		t.Run(name, func(t *testing.T) {
+			for _, boundary := range []string{"test -f", "test ! -L", "stat -c '%u'", "id -u", "stat -c '%a'", "= 600"} {
+				if !strings.Contains(command, boundary) {
+					t.Fatalf("credential read is missing %q validation: %s", boundary, command)
+				}
+			}
+		})
+	}
+}
+
 func TestInstallerTransportsCredentialOnlyIn0600Context(t *testing.T) {
 	root := t.TempDir()
 	archive := filepath.Join(root, "mysql-aifar-8.0.36-official-bundle.tar")

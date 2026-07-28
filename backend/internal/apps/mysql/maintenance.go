@@ -331,7 +331,8 @@ func (s Service) probeMySQLMaintenanceCredential(ctx context.Context, server sto
 func mysqlMaintenancePingCommand(work string, server store.Server, instance store.AppInstance) string {
 	installRoot := remoteInstallRoot(server, "mysql", instance.Version)
 	legacyInstallRoot := remoteLegacyInstallRoot(server, "mysql", instance.Version)
-	return fmt.Sprintf(`set -eu
+	secretPath := path.Join(work, "secret-context.cnf")
+	return mysqlRemoteCredentialValidationCommand(secretPath) + "; " + fmt.Sprintf(`set -eu
 INSTALL_ROOT=%s
 LEGACY_ROOT=%s
 if [ ! -x "$INSTALL_ROOT/mysql/bin/mysqladmin" ] && [ -x "$LEGACY_ROOT/mysql/bin/mysqladmin" ]; then INSTALL_ROOT="$LEGACY_ROOT"; fi
@@ -340,7 +341,7 @@ test -x "$INSTALL_ROOT/mysql/bin/mysqladmin"
 printf '__AIFAR_MYSQL_PING__\t1\n'`,
 		installerkit.ShellQuote(installRoot),
 		installerkit.ShellQuote(legacyInstallRoot),
-		installerkit.ShellQuote(path.Join(work, "secret-context.cnf")),
+		installerkit.ShellQuote(secretPath),
 	)
 }
 

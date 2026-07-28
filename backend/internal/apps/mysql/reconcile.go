@@ -73,22 +73,38 @@ func defaultLocalInfileSessionFactory(remote Remote) localInfileSessionFactory {
 		if _, err := remote.Run(ctx, server, bootstrapBackupWorkCommand(work)); err != nil {
 			return nil, func() {}, err
 		}
-		cleanup := func() {
+		var session *remoteLocalInfileSession
+		var secretPath string
+		cleanupNow := func() error {
+			var cleanupErrors []error
+			if secretPath != "" {
+				if err := removeMySQLCredentialContext(secretPath); err != nil {
+					cleanupErrors = append(cleanupErrors, err)
+				}
+			}
 			cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
-			_, _ = remote.Run(cleanupCtx, server, cleanupBackupCommand(work))
+			if _, err := remote.Run(cleanupCtx, server, cleanupBackupCommand(work)); err != nil {
+				cleanupErrors = append(cleanupErrors, errors.New("unable to clean remote MySQL credential context"))
+			}
+			return errors.Join(cleanupErrors...)
 		}
-		secretPath, err := writeMySQLSecretContext(credential, instancePort(instance))
+		cleanup := func() {
+			cleanupErr := cleanupNow()
+			if session != nil {
+				session.credentialCleanupErr = cleanupErr
+			}
+		}
+		var err error
+		secretPath, err = writeMySQLSecretContext(credential, instancePort(instance))
 		if err != nil {
-			cleanup()
-			return nil, func() {}, mysqlOperationError(MySQLCredentialUnavailable)
+			return nil, func() {}, errors.Join(mysqlOperationError(MySQLCredentialUnavailable), cleanupNow())
 		}
-		defer os.Remove(secretPath)
 		if err := remote.UploadFile(ctx, server, secretPath, path.Join(work, "secret-context.cnf"), 0o600); err != nil {
-			cleanup()
-			return nil, func() {}, err
+			return nil, func() {}, errors.Join(err, cleanupNow())
 		}
-		return &remoteLocalInfileSession{remote: remote, server: server, work: work, port: instancePort(instance)}, cleanup, nil
+		session = &remoteLocalInfileSession{remote: remote, server: server, work: work, port: instancePort(instance)}
+		return session, cleanup, nil
 	}
 }
 
@@ -168,10 +184,17 @@ type reconciliationStore interface {
 }
 
 type remoteLocalInfileSession struct {
-	remote Remote
-	server store.Server
-	work   string
-	port   int
+	remote               Remote
+	server               store.Server
+	work                 string
+	port                 int
+	credentialCleanupErr error
+}
+
+func (s *remoteLocalInfileSession) CredentialCleanupError() error { return s.credentialCleanupErr }
+
+type credentialCleanupReporter interface {
+	CredentialCleanupError() error
 }
 
 func (s *remoteLocalInfileSession) ReadLocalInfile(ctx context.Context) (string, error) {

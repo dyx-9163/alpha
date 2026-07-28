@@ -112,6 +112,40 @@ func TestDisasterRebuildInitializedInspectionVerifiesBoundCredential(t *testing.
 	}
 }
 
+func TestDisasterRebuildScriptValidatesCredentialFilesBeforeEveryRead(t *testing.T) {
+	script, err := renderDisasterRebuildScript(DisasterRebuildScriptOptions{
+		TaskID: "tsk_1234567890abcdef12345678", InstallRoot: "/aifar/apps/mysql", WorkDir: "/aifar/apps/mysql/_disaster/tsk_1234567890abcdef12345678", DataDir: "/aifar/apps/mysql/data",
+		QuarantineDir: "/aifar/apps/mysql/data.quarantine-tsk_1234567890abcdef12345678", Port: 3306,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`test -f "$secret_file"`, `test ! -L "$secret_file"`, `stat -c '%u'`, `id -u`, `stat -c '%a'`, `= "600"`} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("credential validation missing %q:\n%s", want, script)
+		}
+	}
+	for _, action := range []struct {
+		name string
+		use  string
+	}{
+		{name: "stop-gr", use: `"$INSTALL_ROOT/mysql/bin/mysqladmin" --defaults-file="$WORK_DIR/secret-context.cnf"`},
+		{name: "initialize", use: `-uroot < "$WORK_DIR/admin-init.sql"`},
+		{name: "inspect-initialized", use: `"$INSTALL_ROOT/mysql/bin/mysql" --defaults-file="$WORK_DIR/secret-context.cnf"`},
+	} {
+		start := strings.Index(script, "  "+action.name+")")
+		if start < 0 {
+			t.Fatalf("missing %s action", action.name)
+		}
+		section := script[start:]
+		validation := strings.Index(section, "validate_secret_file")
+		read := strings.Index(section, action.use)
+		if validation < 0 || read < 0 || validation > read {
+			t.Fatalf("%s reads a credential before validation", action.name)
+		}
+	}
+}
+
 func TestDisasterRebuildSuccessfulLifecycleClearsAllMaintenanceMarkers(t *testing.T) {
 	fixture := newDisasterRebuildFixture(t, "")
 	recorder := &restoreProgressRecorder{}
@@ -210,6 +244,30 @@ func TestDisasterRebuildAdvancesPersistedRestoreGeneration(t *testing.T) {
 	}
 	if !strings.Contains(fresh.Metadata, `"generation":5`) {
 		t.Fatalf("restore generation did not advance: %s", fresh.Metadata)
+	}
+}
+
+func TestBootstrapDisasterRouterLocalCredentialCleanupFailureAlsoCleansRemoteAndFails(t *testing.T) {
+	remote := newBackupFakeRemote()
+	service := NewService(newBackupFakeStore(t), remote)
+	originalRemove := removeMySQLCredentialContextFile
+	removeMySQLCredentialContextFile = func(name string) error {
+		_ = os.Remove(name)
+		return errors.New("private router cleanup failure")
+	}
+	t.Cleanup(func() { removeMySQLCredentialContextFile = originalRemove })
+	server := store.Server{ID: "srv_router_cleanup", Host: "10.0.0.9", DeployDir: "/aifar/apps"}
+	seed := clusterMemberNode{instance: store.AppInstance{ID: "app_router_seed_1234567890", Version: "8.0.36", Metadata: `{"port":3306}`}, server: store.Server{Host: "10.0.0.8"}}
+	router := RouterRef{InstanceID: "app_router_cleanup_1234567890", ServerID: server.ID, Endpoint: "10.0.0.9:6446"}
+	credential := store.Credential{Username: "root", Secret: map[string]string{"password": "router-cleanup-test-secret"}}
+
+	err := service.bootstrapDisasterRouter(context.Background(), server, router, seed, credential, "tsk_router_cleanup_123456")
+	if err == nil || strings.Contains(err.Error(), "private") || strings.Contains(err.Error(), "router-cleanup-test-secret") {
+		t.Fatalf("local cleanup failure was not fatal and sanitized: %v", err)
+	}
+	joined := strings.Join(remote.commands, "\n")
+	if !strings.Contains(joined, "rm -f --") || !strings.Contains(joined, "router-password") || strings.Contains(joined, "router-cleanup-test-secret") {
+		t.Fatalf("remote router credential was not cleaned safely: %s", joined)
 	}
 }
 
@@ -392,6 +450,9 @@ func TestDisasterRebuildStopGroupReplicationAcceptsOnlyControlledOfflineOutcomes
 }
 
 func TestDisasterRebuildStopGroupReplicationScriptClassifiesOnlyVerifiedOutcomes(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the Git for Windows POSIX layer reports ACL-derived mode 0644 for an os.Chmod(0600) fixture; execute this permission boundary on Linux")
+	}
 	for _, test := range []struct {
 		name          string
 		environment   map[string]string
@@ -447,7 +508,10 @@ func runDisasterStopGRScript(t *testing.T, environment map[string]string, missin
 			t.Fatal(err)
 		}
 	}
-	writeDisasterShellFake(t, filepath.Join(fakeBin, "id"), `if [ "${1:-}" = "-u" ]; then printf '%s\n' "${FAKE_UID:-0}"; else exit 64; fi`)
+	if err := os.WriteFile(filepath.Join(workDir, "secret-context.cnf"), []byte("[client]\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writeDisasterShellFake(t, filepath.Join(fakeBin, "id"), `if [ "${1:-}" != "-u" ]; then exit 64; fi; if [ -n "${FAKE_UID:-}" ]; then printf '%s\n' "$FAKE_UID"; else /usr/bin/id -u; fi`)
 	writeDisasterShellFake(t, filepath.Join(fakeBin, "sudo"), `if [ "${FAKE_SUDO_FAIL:-0}" = "1" ]; then exit 70; fi; if [ "${1:-}" = "-n" ]; then shift; fi; exec "$@"`)
 	writeDisasterShellFake(t, filepath.Join(fakeBin, "systemctl"), `
 case "${1:-}" in

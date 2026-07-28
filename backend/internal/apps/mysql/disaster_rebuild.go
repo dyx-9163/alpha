@@ -1000,7 +1000,12 @@ func (s Service) loadDisasterSeed(ctx context.Context, state *disasterExecutionS
 	if err != nil {
 		return err
 	}
-	defer sessionCleanup()
+	defer func() {
+		sessionCleanup()
+		if reporter, ok := session.(credentialCleanupReporter); ok {
+			retErr = errors.Join(retErr, reporter.CredentialCleanupError())
+		}
+	}()
 	guard := newLocalInfileGuard(session)
 	if err := guard.Capture(ctx); err != nil {
 		return err
@@ -1108,7 +1113,8 @@ func disasterCloneMemberCommand(work string, seed, member clusterMemberNode) (st
 
 func mysqlShellJSCommand(work string, port int, js string) string {
 	mysqlsh := path.Join(mysqlInstallRoot, "mysql-shell", "bin", "mysqlsh")
-	return "set -eu; test -x " + installerkit.ShellQuote(mysqlsh) + "; " + installerkit.ShellQuote(mysqlsh) + " --defaults-file=" + installerkit.ShellQuote(path.Join(work, "secret-context.cnf")) + " --js --host=127.0.0.1 --port=" + fmt.Sprint(port) + " --execute " + installerkit.ShellQuote(js)
+	secretPath := path.Join(work, "secret-context.cnf")
+	return mysqlRemoteCredentialValidationCommand(secretPath) + "; test -x " + installerkit.ShellQuote(mysqlsh) + "; " + installerkit.ShellQuote(mysqlsh) + " --defaults-file=" + installerkit.ShellQuote(secretPath) + " --js --host=127.0.0.1 --port=" + fmt.Sprint(port) + " --execute " + installerkit.ShellQuote(js)
 }
 
 func (s Service) bootstrapDisasterRouter(ctx context.Context, server store.Server, router RouterRef, seed clusterMemberNode, credential store.Credential, taskID string) (retErr error) {
@@ -1121,7 +1127,11 @@ func (s Service) bootstrapDisasterRouter(ctx context.Context, server store.Serve
 		return err
 	}
 	passwordPath := passwordFile.Name()
-	defer os.Remove(passwordPath)
+	defer func() {
+		if passwordPath != "" {
+			retErr = errors.Join(retErr, removeMySQLCredentialContext(passwordPath))
+		}
+	}()
 	if err = passwordFile.Chmod(0o600); err == nil {
 		_, err = passwordFile.WriteString(credential.Secret["password"])
 	}
@@ -1137,12 +1147,16 @@ func (s Service) bootstrapDisasterRouter(ctx context.Context, server store.Serve
 		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 		defer cancel()
 		if _, cleanupErr := s.remote.Run(cleanupCtx, server, "rm -f -- "+installerkit.ShellQuote(remotePassword)); cleanupErr != nil {
-			retErr = errors.Join(retErr, cleanupErr)
+			retErr = errors.Join(retErr, errors.New("unable to clean remote MySQL router credential context"))
 		}
 	}()
+	if err := removeMySQLCredentialContext(passwordPath); err != nil {
+		return err
+	}
+	passwordPath = ""
 	installRoot := remoteInstallRoot(server, "mysql", seed.instance.Version)
 	bootstrapURI := strings.TrimSpace(credential.Username) + "@" + seed.server.Host + ":" + fmt.Sprint(instancePort(seed.instance))
-	command := "set -eu; echo __AIFAR_ROUTER_BOOTSTRAP__ >/dev/null; cat " + installerkit.ShellQuote(remotePassword) + " | " + installerkit.ShellQuote(path.Join(installRoot, "mysql-router", "bin", "mysqlrouter")) + " --bootstrap " + installerkit.ShellQuote(bootstrapURI) + " --directory " + installerkit.ShellQuote(path.Join(installRoot, "router")) + " --conf-base-port " + fmt.Sprint(routerPortForEndpoint(router.Endpoint)) + " --force --user aifar-router; systemctl start aifar-mysql-router"
+	command := mysqlRemoteCredentialValidationCommand(remotePassword) + "; echo __AIFAR_ROUTER_BOOTSTRAP__ >/dev/null; cat " + installerkit.ShellQuote(remotePassword) + " | " + installerkit.ShellQuote(path.Join(installRoot, "mysql-router", "bin", "mysqlrouter")) + " --bootstrap " + installerkit.ShellQuote(bootstrapURI) + " --directory " + installerkit.ShellQuote(path.Join(installRoot, "router")) + " --conf-base-port " + fmt.Sprint(routerPortForEndpoint(router.Endpoint)) + " --force --user aifar-router; systemctl start aifar-mysql-router"
 	_, retErr = s.remote.Run(ctx, server, command)
 	return retErr
 }

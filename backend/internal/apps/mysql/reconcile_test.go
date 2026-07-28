@@ -30,6 +30,33 @@ type reconciliationValidationRemote struct {
 	mysqlshRuns     int
 }
 
+func TestDefaultLocalInfileSessionReportsLocalAndRemoteCredentialCleanupFailures(t *testing.T) {
+	remote := newBackupFakeRemote()
+	remote.cleanupErr = errors.New("private remote cleanup failure")
+	originalRemove := removeMySQLCredentialContextFile
+	removeMySQLCredentialContextFile = func(name string) error {
+		_ = os.Remove(name)
+		return errors.New("private local cleanup failure")
+	}
+	t.Cleanup(func() { removeMySQLCredentialContextFile = originalRemove })
+	instance := store.AppInstance{ID: "app_cleanup_reporter", App: "mysql", Version: "8.0.36", Metadata: `{"port":3306}`}
+	server := store.Server{ID: "srv_cleanup_reporter"}
+	credential := store.Credential{Kind: "mysql", Status: "active", Username: "root", Secret: map[string]string{"password": "cleanup-test-secret"}}
+
+	session, cleanup, err := defaultLocalInfileSessionFactory(remote)(context.Background(), instance, server, credential)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cleanup()
+	reporter, ok := session.(credentialCleanupReporter)
+	if !ok || reporter.CredentialCleanupError() == nil {
+		t.Fatal("credential cleanup failure was swallowed")
+	}
+	if remote.cleanupRuns != 1 || strings.Contains(reporter.CredentialCleanupError().Error(), "private") || strings.Contains(reporter.CredentialCleanupError().Error(), "cleanup-test-secret") {
+		t.Fatalf("cleanup result was not attempted and sanitized: runs=%d err=%v", remote.cleanupRuns, reporter.CredentialCleanupError())
+	}
+}
+
 func (r *reconciliationValidationRemote) Run(_ context.Context, server store.Server, command string) (adapter.CommandResult, error) {
 	if server.Password != r.password && strings.TrimSpace(server.PrivateKey) == "" {
 		return adapter.CommandResult{}, errors.New("saved SSH credential missing")

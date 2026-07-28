@@ -47,6 +47,13 @@ type backupStore interface {
 	MarkAppBackupDeleted(id string, completedAt time.Time) (store.AppBackup, error)
 }
 
+type clusterBackupVerificationStore interface {
+	backupStore
+	GetAppCluster(id string) (store.AppCluster, error)
+	ListAppClusterMembers(clusterID string) ([]store.AppClusterMember, error)
+	ListAppInstances() ([]store.AppInstance, error)
+}
+
 type backupParameters struct {
 	Name        string
 	Threads     int
@@ -183,6 +190,10 @@ func (m Module) VerifyBackup(ctx context.Context, backupID, repositoryDir, langu
 			if clusterID == "" || clusterIDFromBackup(backup) != clusterID {
 				return localizedMySQLOperationError(language, MySQLBackupClusterUnhealthy)
 			}
+			clusterData, ok := m.service.store.(clusterBackupVerificationStore)
+			if !ok || validateClusterBackupVerificationOwner(clusterData, backup, instance) != nil {
+				return localizedMySQLOperationError(language, MySQLBackupClusterUnhealthy)
+			}
 		default:
 			return localizedMySQLOperationError(language, MySQLBackupVerifyNotAllowed)
 		}
@@ -223,6 +234,53 @@ func (m Module) VerifyBackup(ctx context.Context, backupID, repositoryDir, langu
 		return localizedMySQLOperationError(language, MySQLBackupVerificationRecordFailed)
 	}
 	installflow.FinishTarget(recorder, backupID, "success", "")
+	return nil
+}
+
+func validateClusterBackupVerificationOwner(data clusterBackupVerificationStore, backup store.AppBackup, representative store.AppInstance) error {
+	clusterID := clusterIDFromInstance(representative)
+	cluster, err := data.GetAppCluster(clusterID)
+	if err != nil || cluster.ID != clusterID || cluster.App != "mysql" || cluster.Topology != "innodb-cluster" {
+		return errors.New("invalid authoritative MySQL cluster")
+	}
+	members, err := data.ListAppClusterMembers(clusterID)
+	if err != nil || len(members) != 3 {
+		return errors.New("invalid authoritative MySQL cluster membership")
+	}
+	instances, err := data.ListAppInstances()
+	if err != nil {
+		return err
+	}
+	byID := make(map[string]store.AppInstance, len(instances))
+	for _, instance := range instances {
+		byID[instance.ID] = instance
+	}
+	seenInstances := make(map[string]struct{}, len(members))
+	seenServers := make(map[string]struct{}, len(members))
+	representativeFound := false
+	for _, member := range members {
+		if member.ClusterID != clusterID || member.InstanceID == "" || member.ServerID == "" {
+			return errors.New("invalid authoritative MySQL cluster member")
+		}
+		if _, duplicate := seenInstances[member.InstanceID]; duplicate {
+			return errors.New("duplicate authoritative MySQL cluster instance")
+		}
+		if _, duplicate := seenServers[member.ServerID]; duplicate {
+			return errors.New("duplicate authoritative MySQL cluster server")
+		}
+		instance, ok := byID[member.InstanceID]
+		if !ok || instance.App != "mysql" || instance.ServerID != member.ServerID || instanceTopology(instance) != "innodb-cluster" || clusterIDFromInstance(instance) != clusterID {
+			return errors.New("authoritative MySQL cluster member drifted")
+		}
+		seenInstances[member.InstanceID] = struct{}{}
+		seenServers[member.ServerID] = struct{}{}
+		if member.InstanceID == representative.ID && member.ServerID == backup.ServerID {
+			representativeFound = true
+		}
+	}
+	if !representativeFound {
+		return errors.New("backup owner is outside authoritative MySQL cluster")
+	}
 	return nil
 }
 
@@ -1099,8 +1157,9 @@ func bootstrapBackupWorkCommand(work string) string {
 
 func inspectBackupCommand(work string, port int) string {
 	mysqlsh := path.Join(mysqlInstallRoot, "mysql-shell", "bin", "mysqlsh")
+	secretPath := path.Join(work, "secret-context.cnf")
 	query := "SELECT '__AIFAR_INFO__',@@version,@@server_uuid,@@GLOBAL.gtid_executed,COALESCE((SELECT SUM(data_length+index_length) FROM information_schema.tables WHERE table_schema NOT IN ('information_schema','mysql','mysql_innodb_cluster_metadata','performance_schema','sys')),0); SELECT '__AIFAR_SCHEMA__',schema_name FROM information_schema.schemata WHERE schema_name NOT IN ('information_schema','mysql','mysql_innodb_cluster_metadata','performance_schema','sys') ORDER BY schema_name;"
-	return "set -eu; test -x " + installerkit.ShellQuote(mysqlsh) + "; printf '__AIFAR_SHELL__\\t'; " + installerkit.ShellQuote(mysqlsh) + " --version | awk '{print $NF}'; " + installerkit.ShellQuote(mysqlsh) + " --defaults-file=" + installerkit.ShellQuote(path.Join(work, "secret-context.cnf")) + " --sql --raw --skip-column-names --host=127.0.0.1 --port=" + strconv.Itoa(port) + " --execute " + installerkit.ShellQuote(query)
+	return mysqlRemoteCredentialValidationCommand(secretPath) + "; test -x " + installerkit.ShellQuote(mysqlsh) + "; printf '__AIFAR_SHELL__\\t'; " + installerkit.ShellQuote(mysqlsh) + " --version | awk '{print $NF}'; " + installerkit.ShellQuote(mysqlsh) + " --defaults-file=" + installerkit.ShellQuote(secretPath) + " --sql --raw --skip-column-names --host=127.0.0.1 --port=" + strconv.Itoa(port) + " --execute " + installerkit.ShellQuote(query)
 }
 
 func parseMySQLBackupInspection(output string) (mysqlBackupInspection, error) {
