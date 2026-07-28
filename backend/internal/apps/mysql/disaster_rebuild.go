@@ -110,21 +110,23 @@ type disasterRebuildStore interface {
 	restoreStore
 	maintenanceStore
 	CompleteMySQLDisasterRebuild([]string, store.MySQLMaintenanceMarker, store.MySQLDisasterRebuildCompletion) error
+	CompleteMySQLDisasterReconciliation(instanceID, backupID, originalValue, taskID, manifestSHA256 string) error
 }
 
 type disasterRebuildProgress struct {
-	Version           int               `json:"version"`
-	TaskID            string            `json:"taskId"`
-	SourceBackupID    string            `json:"sourceBackupId"`
-	ClusterID         string            `json:"clusterId"`
-	ManifestSHA256    string            `json:"manifestSha256"`
-	RestoreGeneration int               `json:"restoreGeneration"`
-	QuarantinePaths   map[string]string `json:"quarantinePaths"`
-	SeedStage         string            `json:"seedStage"`
-	MemberStages      map[string]string `json:"memberStages"`
-	RouterStage       string            `json:"routerStage"`
-	RouterStages      map[string]string `json:"routerStages"`
-	CompletionStage   string            `json:"completionStage,omitempty"`
+	Version           int                                          `json:"version"`
+	TaskID            string                                       `json:"taskId"`
+	SourceBackupID    string                                       `json:"sourceBackupId"`
+	ClusterID         string                                       `json:"clusterId"`
+	ManifestSHA256    string                                       `json:"manifestSha256"`
+	RestoreGeneration int                                          `json:"restoreGeneration"`
+	QuarantinePaths   map[string]string                            `json:"quarantinePaths"`
+	SeedStage         string                                       `json:"seedStage"`
+	MemberStages      map[string]string                            `json:"memberStages"`
+	RouterStage       string                                       `json:"routerStage"`
+	RouterStages      map[string]string                            `json:"routerStages"`
+	RouterIdentities  map[string]store.MySQLDisasterRouterIdentity `json:"routerIdentities"`
+	CompletionStage   string                                       `json:"completionStage,omitempty"`
 }
 
 type disasterExecutionState struct {
@@ -458,6 +460,7 @@ func (m Module) restoreDisasterRebuild(ctx context.Context, req registry.Restore
 		}
 		for _, router := range state.routers {
 			state.progress.RouterStages[router.InstanceID] = "verified"
+			state.progress.RouterIdentities[router.InstanceID] = store.MySQLDisasterRouterIdentity{ServerID: router.ServerID, Endpoint: normalizeEndpoint(router.Endpoint)}
 		}
 		state.progress.RouterStage = "verified"
 		return saveDisasterProgress(state.data, &state.backup, state.progress)
@@ -491,7 +494,8 @@ func (m Module) restoreDisasterRebuild(ctx context.Context, req registry.Restore
 			ManifestSHA256: state.progress.ManifestSHA256, Generation: state.progress.RestoreGeneration,
 			Roles: roles, QuarantinePaths: cloneDisasterProgressMap(state.progress.QuarantinePaths),
 			MemberStages: cloneDisasterProgressMap(state.progress.MemberStages), RouterStages: cloneDisasterProgressMap(state.progress.RouterStages),
-			CompletedAt: time.Now().UTC(),
+			RouterIdentities: cloneDisasterRouterProgress(state.progress.RouterIdentities),
+			CompletedAt:      time.Now().UTC(),
 		}
 		if completeErr := state.data.CompleteMySQLDisasterRebuild(ids, state.marker, completion); completeErr != nil {
 			return localizedMySQLOperationError(req.Language, MySQLMaintenanceStatePersistFailed)
@@ -671,14 +675,24 @@ func (s Service) prepareDisasterRebuild(ctx context.Context, req registry.Restor
 		return disasterExecutionState{}, localizedMySQLOperationError(req.Language, MySQLReconciliationRequired)
 	}
 	if reconcilePresent {
-		if err := s.reconcileMySQL(ctx, freshSeed, req.Language); err != nil {
-			return disasterExecutionState{}, err
+		restoredMarker, restored, restoreErr := s.restoreMySQLReconciliation(ctx, freshSeed, req.Language)
+		if restoreErr != nil || !restored || restoredMarker.OriginalValue != reconciliation.OriginalValue || restoredMarker.TaskID != reconciliation.TaskID {
+			if restoreErr != nil {
+				return disasterExecutionState{}, restoreErr
+			}
+			return disasterExecutionState{}, localizedMySQLOperationError(req.Language, MySQLReconciliationRequired)
 		}
 		if state.progress.SeedStage == "load-effect-complete" {
-			state.progress.SeedStage = "loaded"
-			if err := updateRestorePhase(data, &state.backup, "load_complete", taskID, state.digest); err != nil {
+			if err := data.CompleteMySQLDisasterReconciliation(state.seed.instance.ID, state.backup.ID, reconciliation.OriginalValue, taskID, state.digest); err != nil {
 				return disasterExecutionState{}, localizedMySQLOperationError(req.Language, MySQLRestoreIncomplete)
 			}
+			state.progress.SeedStage = "loaded"
+			state.backup, err = data.GetAppBackup(state.backup.ID)
+			if err != nil {
+				return disasterExecutionState{}, localizedMySQLOperationError(req.Language, MySQLRestoreIncomplete)
+			}
+		} else if err := clearMySQLReconciliationMarker(data, state.seed.instance.ID, reconciliation.OriginalValue, taskID); err != nil {
+			return disasterExecutionState{}, err
 		}
 	} else if state.progress.SeedStage == "load-effect-complete" {
 		return disasterExecutionState{}, localizedMySQLOperationError(req.Language, MySQLReconciliationRequired)
@@ -717,7 +731,7 @@ func loadOrCreateDisasterProgress(backup store.AppBackup, clusterID, taskID, man
 	if !present {
 		return disasterRebuildProgress{
 			Version: 1, TaskID: taskID, SourceBackupID: backup.ID, ClusterID: clusterID, ManifestSHA256: manifestSHA256, RestoreGeneration: generation,
-			QuarantinePaths: map[string]string{}, MemberStages: map[string]string{}, RouterStages: map[string]string{},
+			QuarantinePaths: map[string]string{}, MemberStages: map[string]string{}, RouterStages: map[string]string{}, RouterIdentities: map[string]store.MySQLDisasterRouterIdentity{},
 		}, nil
 	}
 	decoder := json.NewDecoder(strings.NewReader(string(raw)))
@@ -730,7 +744,7 @@ func loadOrCreateDisasterProgress(backup store.AppBackup, clusterID, taskID, man
 	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
 		return disasterRebuildProgress{}, errors.New("disaster rebuild progress must be one object")
 	}
-	if progress.Version != 1 || progress.TaskID != taskID || progress.SourceBackupID != backup.ID || progress.ClusterID != clusterID || progress.ManifestSHA256 != manifestSHA256 || progress.RestoreGeneration != generation || progress.QuarantinePaths == nil || progress.MemberStages == nil || progress.RouterStages == nil || progress.CompletionStage != "" {
+	if progress.Version != 1 || progress.TaskID != taskID || progress.SourceBackupID != backup.ID || progress.ClusterID != clusterID || progress.ManifestSHA256 != manifestSHA256 || progress.RestoreGeneration != generation || progress.QuarantinePaths == nil || progress.MemberStages == nil || progress.RouterStages == nil || progress.RouterIdentities == nil || progress.CompletionStage != "" {
 		return disasterRebuildProgress{}, errors.New("disaster rebuild progress identity changed")
 	}
 	return progress, nil
@@ -738,6 +752,14 @@ func loadOrCreateDisasterProgress(backup store.AppBackup, clusterID, taskID, man
 
 func cloneDisasterProgressMap(source map[string]string) map[string]string {
 	cloned := make(map[string]string, len(source))
+	for key, value := range source {
+		cloned[key] = value
+	}
+	return cloned
+}
+
+func cloneDisasterRouterProgress(source map[string]store.MySQLDisasterRouterIdentity) map[string]store.MySQLDisasterRouterIdentity {
+	cloned := make(map[string]store.MySQLDisasterRouterIdentity, len(source))
 	for key, value := range source {
 		cloned[key] = value
 	}
@@ -780,6 +802,18 @@ func validateDisasterProgressTopology(state disasterExecutionState, taskID strin
 	for instanceID, stage := range state.progress.RouterStages {
 		if !routers[instanceID] || (stage != "stopped" && stage != "bootstrapped" && stage != "verified") {
 			return errors.New("invalid disaster rebuild Router progress")
+		}
+	}
+	for instanceID, identity := range state.progress.RouterIdentities {
+		matched := false
+		for _, router := range state.routers {
+			if router.InstanceID == instanceID && identity.ServerID == router.ServerID && normalizeEndpoint(identity.Endpoint) == normalizeEndpoint(router.Endpoint) {
+				matched = true
+				break
+			}
+		}
+		if !matched || state.progress.RouterStages[instanceID] != "verified" {
+			return errors.New("invalid disaster rebuild Router identity")
 		}
 	}
 	if state.progress.RouterStage != "" && state.progress.RouterStage != "stopped" && state.progress.RouterStage != "bootstrapped" && state.progress.RouterStage != "verified" {

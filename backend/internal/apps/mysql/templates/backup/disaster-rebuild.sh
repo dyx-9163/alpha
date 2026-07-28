@@ -36,14 +36,25 @@ validate_paths() {
 
 case "$ACTION" in
   stop-gr)
-    if ! $SUDO systemctl is-active --quiet "$SERVICE_NAME"; then
-      printf '__AIFAR_STOP_GR__\tmysqld-offline\n'
-      exit 0
-    fi
-    if ! "$INSTALL_ROOT/mysql/bin/mysqladmin" --defaults-file="$WORK_DIR/secret-context.cnf" --protocol=tcp --host=127.0.0.1 --port="$PORT" ping >/dev/null 2>&1; then
-      printf '__AIFAR_STOP_GR__\tmysqld-offline\n'
-      exit 0
-    fi
+    load_state="$($SUDO systemctl show "$SERVICE_NAME" --property=LoadState --value)"
+    case "$load_state" in
+      not-found)
+        printf '__AIFAR_STOP_GR__\tmysqld-offline\n'
+        exit 0
+        ;;
+      loaded) ;;
+      *) exit 65 ;;
+    esac
+    active_state="$($SUDO systemctl show "$SERVICE_NAME" --property=ActiveState --value)"
+    case "$active_state" in
+      inactive)
+        printf '__AIFAR_STOP_GR__\tmysqld-offline\n'
+        exit 0
+        ;;
+      active) ;;
+      *) exit 65 ;;
+    esac
+    "$INSTALL_ROOT/mysql/bin/mysqladmin" --defaults-file="$WORK_DIR/secret-context.cnf" --protocol=tcp --host=127.0.0.1 --port="$PORT" ping >/dev/null 2>&1
     member_count="$("$INSTALL_ROOT/mysql-shell/bin/mysqlsh" --defaults-file="$WORK_DIR/secret-context.cnf" --sql --raw --skip-column-names --host=127.0.0.1 --port="$PORT" --execute "SELECT COUNT(*) FROM performance_schema.replication_group_members")"
     case "$member_count" in
       0) printf '__AIFAR_STOP_GR__\talready-stopped\n' ;;

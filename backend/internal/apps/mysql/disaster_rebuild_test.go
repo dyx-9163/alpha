@@ -1,14 +1,17 @@
 package mysql
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"regexp"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -331,6 +334,7 @@ func TestDisasterRebuildRetryNeverStopsRebuiltMembers(t *testing.T) {
 		t.Run(boundary, func(t *testing.T) {
 			failAt := map[string]string{"clone": "__AIFAR_CLONE_MEMBER__", "router": "__AIFAR_ROUTER_BOOTSTRAP__"}[boundary]
 			fixture := newDisasterRebuildFixture(t, failAt)
+			fixture.remote.statefulEffects = true
 			if boundary == "final-publication" {
 				failing := &disasterCompletionFailOnceStore{Store: fixture.db, failures: 1}
 				fixture.module = NewModule(failing, fixture.remote)
@@ -350,6 +354,12 @@ func TestDisasterRebuildRetryNeverStopsRebuiltMembers(t *testing.T) {
 			retryCommands := strings.Join(fixture.remote.commands[commandsBefore:], "\n")
 			if strings.Contains(retryCommands, " stop-gr") {
 				t.Fatalf("%s retry stopped rebuilt members: %s", boundary, retryCommands)
+			}
+			if len(fixture.remote.onlineMembers) != 3 || !fixture.remote.routerRunning {
+				t.Fatalf("%s retry did not rebuild the modeled service state: ONLINE=%v RouterRunning=%v", boundary, fixture.remote.onlineMembers, fixture.remote.routerRunning)
+			}
+			if fixture.remote.effectCounts["clone"] != 2 || fixture.remote.effectCounts["router-bootstrap"] != 1 {
+				t.Fatalf("%s retry repeated or skipped a required modeled effect: %v", boundary, fixture.remote.effectCounts)
 			}
 		})
 	}
@@ -378,6 +388,156 @@ func TestDisasterRebuildStopGroupReplicationAcceptsOnlyControlledOfflineOutcomes
 				t.Fatalf("controlled stop-gr mode %q failed: %v", test.mode, err)
 			}
 		})
+	}
+}
+
+func TestDisasterRebuildStopGroupReplicationScriptClassifiesOnlyVerifiedOutcomes(t *testing.T) {
+	for _, test := range []struct {
+		name          string
+		environment   map[string]string
+		missingBinary string
+		wantOutput    string
+		wantSuccess   bool
+	}{
+		{name: "running Group Replication", environment: map[string]string{"FAKE_LOAD_STATE": "loaded", "FAKE_ACTIVE_STATE": "active", "FAKE_MYSQLSH": "count1"}, wantOutput: "__AIFAR_STOP_GR__\tstopped\n", wantSuccess: true},
+		{name: "authenticated already stopped", environment: map[string]string{"FAKE_LOAD_STATE": "loaded", "FAKE_ACTIVE_STATE": "active", "FAKE_MYSQLSH": "count0"}, wantOutput: "__AIFAR_STOP_GR__\talready-stopped\n", wantSuccess: true},
+		{name: "verified inactive mysqld", environment: map[string]string{"FAKE_LOAD_STATE": "loaded", "FAKE_ACTIVE_STATE": "inactive"}, wantOutput: "__AIFAR_STOP_GR__\tmysqld-offline\n", wantSuccess: true},
+		{name: "verified missing service", environment: map[string]string{"FAKE_LOAD_STATE": "not-found", "FAKE_ACTIVE_STATE": "inactive"}, wantOutput: "__AIFAR_STOP_GR__\tmysqld-offline\n", wantSuccess: true},
+		{name: "failed service state", environment: map[string]string{"FAKE_LOAD_STATE": "loaded", "FAKE_ACTIVE_STATE": "failed"}},
+		{name: "missing systemctl", environment: map[string]string{"FAKE_LOAD_STATE": "loaded", "FAKE_ACTIVE_STATE": "active", "FAKE_MYSQLSH": "count1"}, missingBinary: "systemctl"},
+		{name: "missing mysqladmin", environment: map[string]string{"FAKE_LOAD_STATE": "loaded", "FAKE_ACTIVE_STATE": "active", "FAKE_MYSQLSH": "count1"}, missingBinary: "mysqladmin"},
+		{name: "missing mysqlsh", environment: map[string]string{"FAKE_LOAD_STATE": "loaded", "FAKE_ACTIVE_STATE": "active", "FAKE_MYSQLSH": "count1"}, missingBinary: "mysqlsh"},
+		{name: "sudo failure", environment: map[string]string{"FAKE_UID": "1000", "FAKE_SUDO_FAIL": "1", "FAKE_LOAD_STATE": "loaded", "FAKE_ACTIVE_STATE": "active", "FAKE_MYSQLSH": "count1"}},
+		{name: "authentication failure", environment: map[string]string{"FAKE_LOAD_STATE": "loaded", "FAKE_ACTIVE_STATE": "active", "FAKE_MYSQLSH": "auth-failure"}},
+		{name: "malformed member count", environment: map[string]string{"FAKE_LOAD_STATE": "loaded", "FAKE_ACTIVE_STATE": "active", "FAKE_MYSQLSH": "malformed"}},
+		{name: "STOP command failure", environment: map[string]string{"FAKE_LOAD_STATE": "loaded", "FAKE_ACTIVE_STATE": "active", "FAKE_MYSQLSH": "stop-failure"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			result := runDisasterStopGRScript(t, test.environment, test.missingBinary)
+			if test.wantSuccess {
+				if result.err != nil || result.stdout != test.wantOutput || result.stderr != "" {
+					t.Fatalf("controlled outcome err=%v stdout=%q stderr=%q, want stdout=%q", result.err, result.stdout, result.stderr, test.wantOutput)
+				}
+				return
+			}
+			if result.err == nil || strings.Contains(result.stdout, "__AIFAR_STOP_GR__") {
+				t.Fatalf("uncontrolled failure was classified as safe: err=%v stdout=%q stderr=%q", result.err, result.stdout, result.stderr)
+			}
+		})
+	}
+}
+
+type disasterStopGRResult struct {
+	stdout string
+	stderr string
+	err    error
+}
+
+func runDisasterStopGRScript(t *testing.T, environment map[string]string, missingBinary string) disasterStopGRResult {
+	t.Helper()
+	shell := disasterTestShell(t)
+	root := t.TempDir()
+	installRoot := filepath.Join(root, "mysql")
+	workDir := filepath.Join(installRoot, "_disaster", "tsk_1234567890abcdef12345678")
+	dataDir := filepath.Join(installRoot, "data")
+	quarantineDir := dataDir + ".quarantine-tsk_1234567890abcdef12345678"
+	fakeBin := filepath.Join(root, "fake-bin")
+	for _, directory := range []string{workDir, dataDir, filepath.Join(installRoot, "mysql", "bin"), filepath.Join(installRoot, "mysql-shell", "bin"), fakeBin} {
+		if err := os.MkdirAll(directory, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeDisasterShellFake(t, filepath.Join(fakeBin, "id"), `if [ "${1:-}" = "-u" ]; then printf '%s\n' "${FAKE_UID:-0}"; else exit 64; fi`)
+	writeDisasterShellFake(t, filepath.Join(fakeBin, "sudo"), `if [ "${FAKE_SUDO_FAIL:-0}" = "1" ]; then exit 70; fi; if [ "${1:-}" = "-n" ]; then shift; fi; exec "$@"`)
+	writeDisasterShellFake(t, filepath.Join(fakeBin, "systemctl"), `
+case "${1:-}" in
+  show)
+    case "$*" in
+      *LoadState*) printf '%s\n' "${FAKE_LOAD_STATE:-loaded}" ;;
+      *ActiveState*) printf '%s\n' "${FAKE_ACTIVE_STATE:-active}" ;;
+      *) exit 64 ;;
+    esac
+    ;;
+  is-active)
+    [ "${FAKE_LOAD_STATE:-loaded}" = "loaded" ] && [ "${FAKE_ACTIVE_STATE:-active}" = "active" ]
+    ;;
+  *) exit 64 ;;
+esac`)
+	writeDisasterShellFake(t, filepath.Join(installRoot, "mysql", "bin", "mysqladmin"), `exit "${FAKE_MYSQLADMIN_EXIT:-0}"`)
+	writeDisasterShellFake(t, filepath.Join(installRoot, "mysql-shell", "bin", "mysqlsh"), `
+case "${FAKE_MYSQLSH:-count1}" in
+  auth-failure) exit 75 ;;
+  malformed) printf 'not-a-count\n'; exit 0 ;;
+  count0) printf '0\n'; exit 0 ;;
+  stop-failure)
+    case "$*" in *STOP*GROUP_REPLICATION*) exit 76 ;; *) printf '1\n'; exit 0 ;; esac
+    ;;
+  *)
+    case "$*" in *STOP*GROUP_REPLICATION*) exit 0 ;; *) printf '1\n'; exit 0 ;; esac
+    ;;
+esac`)
+	if missingBinary != "" {
+		binary := filepath.Join(fakeBin, missingBinary)
+		if missingBinary == "mysqladmin" {
+			binary = filepath.Join(installRoot, "mysql", "bin", "mysqladmin")
+		}
+		if missingBinary == "mysqlsh" {
+			binary = filepath.Join(installRoot, "mysql-shell", "bin", "mysqlsh")
+		}
+		if err := os.Remove(binary); err != nil {
+			t.Fatal(err)
+		}
+	}
+	script, err := renderDisasterRebuildScript(DisasterRebuildScriptOptions{
+		TaskID: "tsk_1234567890abcdef12345678", InstallRoot: disasterShellPath(installRoot), WorkDir: disasterShellPath(workDir),
+		DataDir: disasterShellPath(dataDir), QuarantineDir: disasterShellPath(quarantineDir), Port: 3306,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	scriptPath := filepath.Join(root, "disaster-rebuild.sh")
+	if err := os.WriteFile(scriptPath, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command(shell, disasterShellPath(scriptPath), "stop-gr")
+	command.Env = append(os.Environ(), "PATH="+disasterShellPath(fakeBin)+":/usr/bin:/bin")
+	for key, value := range environment {
+		command.Env = append(command.Env, key+"="+value)
+	}
+	var stdout, stderr bytes.Buffer
+	command.Stdout, command.Stderr = &stdout, &stderr
+	err = command.Run()
+	return disasterStopGRResult{stdout: stdout.String(), stderr: stderr.String(), err: err}
+}
+
+func disasterTestShell(t *testing.T) string {
+	t.Helper()
+	if runtime.GOOS != "windows" {
+		return "/bin/sh"
+	}
+	for _, candidate := range []string{`D:\tools\git\bin\sh.exe`, `D:\tools\git\usr\bin\bash.exe`} {
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate
+		}
+	}
+	t.Skip("POSIX shell is unavailable")
+	return ""
+}
+
+func disasterShellPath(value string) string {
+	value = filepath.Clean(value)
+	if runtime.GOOS != "windows" {
+		return filepath.ToSlash(value)
+	}
+	volume := filepath.VolumeName(value)
+	drive := strings.ToLower(strings.TrimSuffix(volume, ":"))
+	return "/" + drive + filepath.ToSlash(strings.TrimPrefix(value, volume))
+}
+
+func writeDisasterShellFake(t *testing.T, name, body string) {
+	t.Helper()
+	if err := os.WriteFile(name, []byte("#!/bin/sh\nset -eu\n"+body+"\n"), 0o700); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -427,6 +587,51 @@ func TestDisasterRebuildRetryReconcilesLocalInfileBeforeContinuing(t *testing.T)
 	}
 	if _, _, present, parseErr := parseMySQLReconciliationMarker(seed.Metadata); parseErr != nil || present {
 		t.Fatalf("reconciled retry left marker present=%v err=%v metadata=%s", present, parseErr, seed.Metadata)
+	}
+}
+
+func TestDisasterRebuildRetryResumesWhenReconciliationProgressTransactionFails(t *testing.T) {
+	fixture := newDisasterRebuildFixture(t, "")
+	local := &fakeLocalInfileSession{value: "OFF", setErrors: map[string]error{"OFF": errors.New("target unavailable during initial local_infile restore")}}
+	fixture.module.service.localInfileSession = func(context.Context, store.AppInstance, store.Server, store.Credential) (localInfileSession, func(), error) {
+		return local, func() {}, nil
+	}
+	if err := fixture.module.Restore(context.Background(), fixture.request, registry.RunContext{TaskID: fixture.taskID, Log: &restoreProgressRecorder{}}); err == nil {
+		t.Fatal("initial local_infile restoration failure unexpectedly succeeded")
+	}
+	delete(local.setErrors, "OFF")
+	rawMaintenanceExec(t, fixture.dbPath, fmt.Sprintf(`create trigger fail_disaster_reconciliation_progress before update on app_backups when old.id='%s' and new.metadata like '%%"seedStage":"loaded"%%' begin select raise(abort,'injected reconciliation progress failure'); end`, fixture.backup.ID))
+	loadsBefore := fixture.remote.count("logical-restore.sh")
+	if err := fixture.module.Restore(context.Background(), fixture.request, registry.RunContext{TaskID: fixture.taskID, Log: &restoreProgressRecorder{}}); err == nil {
+		t.Fatal("reconciliation progress persistence failure unexpectedly succeeded")
+	}
+	if local.value != "OFF" {
+		t.Fatalf("successful remote reconciliation left local_infile=%s", local.value)
+	}
+	seed, err := fixture.db.GetAppInstance(fixture.backup.InstanceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, marker, present, parseErr := parseMySQLReconciliationMarker(seed.Metadata); parseErr != nil || !present || marker.TaskID != fixture.taskID {
+		t.Fatalf("failed reconciliation-progress transaction did not retain its marker: marker=%+v present=%v err=%v metadata=%s", marker, present, parseErr, seed.Metadata)
+	}
+	backup, err := fixture.db.GetAppBackup(fixture.backup.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if progress := mustDisasterProgress(t, backup.Metadata); progress.SeedStage != "load-effect-complete" {
+		t.Fatalf("failed reconciliation-progress transaction published seed stage %q", progress.SeedStage)
+	}
+	rawMaintenanceExec(t, fixture.dbPath, `drop trigger fail_disaster_reconciliation_progress`)
+	if err := fixture.module.Restore(context.Background(), fixture.request, registry.RunContext{TaskID: fixture.taskID, Log: &restoreProgressRecorder{}}); err != nil {
+		t.Fatalf("retry after reconciliation-progress transaction failure did not resume: %v", err)
+	}
+	if fixture.remote.count("logical-restore.sh") != loadsBefore {
+		t.Fatalf("retry reloaded seed after successful reconciliation: before=%d after=%d", loadsBefore, fixture.remote.count("logical-restore.sh"))
+	}
+	seed, _ = fixture.db.GetAppInstance(fixture.backup.InstanceID)
+	if _, _, present, parseErr := parseMySQLReconciliationMarker(seed.Metadata); parseErr != nil || present {
+		t.Fatalf("successful retry left reconciliation marker present=%v err=%v", present, parseErr)
 	}
 }
 
@@ -509,6 +714,75 @@ func TestDisasterRebuildCompletionRejectsDivergentFullProgress(t *testing.T) {
 	}
 }
 
+func TestDisasterRebuildCompletionRejectsRouterServerOrEndpointDrift(t *testing.T) {
+	for _, mutate := range []struct {
+		name  string
+		apply func(*testing.T, disasterRebuildFixture, store.AppInstance)
+	}{
+		{name: "Router server", apply: func(t *testing.T, fixture disasterRebuildFixture, router store.AppInstance) {
+			router.ServerID = fixture.instances[0].ServerID
+			if _, err := fixture.db.SaveAppInstance(router); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "Router host endpoint", apply: func(t *testing.T, fixture disasterRebuildFixture, router store.AppInstance) {
+			server, err := fixture.db.GetServer(router.ServerID, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			server.Host = "10.99.0.21"
+			if _, err := fixture.db.SaveServer(server); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "Router port endpoint", apply: func(t *testing.T, fixture disasterRebuildFixture, router store.AppInstance) {
+			metadata, err := strictBackupMetadata(router.Metadata)
+			if err != nil {
+				t.Fatal(err)
+			}
+			metadata["readWritePort"], _ = json.Marshal(7446)
+			encoded, _ := json.Marshal(metadata)
+			router.Metadata = string(encoded)
+			if _, err := fixture.db.SaveAppInstance(router); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	} {
+		t.Run(mutate.name, func(t *testing.T) {
+			fixture, marker, completion := readyDisasterCompletionFixture(t)
+			var router store.AppInstance
+			instances, err := fixture.db.ListAppInstances()
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, candidate := range instances {
+				if candidate.App == "mysql-router" && clusterIDFromInstance(candidate) == completion.ClusterID {
+					router = candidate
+					break
+				}
+			}
+			if router.ID == "" {
+				t.Fatal("Router fixture missing")
+			}
+			identity := completion.RouterIdentities[router.ID]
+			if identity.ServerID != router.ServerID || identity.Endpoint != "10.0.0.21:6446" {
+				t.Fatalf("pre-drift Router identity=%+v", identity)
+			}
+			mutate.apply(t, fixture, router)
+			ids := []string{fixture.instances[0].ID, fixture.instances[1].ID, fixture.instances[2].ID}
+			if err := fixture.db.CompleteMySQLDisasterRebuild(ids, marker, completion); err == nil {
+				t.Fatalf("completion accepted %s drift", mutate.name)
+			}
+			for _, instance := range fixture.instances {
+				fresh, _ := fixture.db.GetAppInstance(instance.ID)
+				if _, present, _ := store.ParseMySQLMaintenanceMarker(fresh.Metadata); !present {
+					t.Fatalf("%s drift cleared maintenance for %s", mutate.name, instance.ID)
+				}
+			}
+		})
+	}
+}
+
 func TestDisasterRebuildSQLiteFailureRollsBackEveryPublishedState(t *testing.T) {
 	fixture, marker, completion := readyDisasterCompletionFixture(t)
 	beforeBackup, _ := fixture.db.GetAppBackup(fixture.backup.ID)
@@ -565,8 +839,17 @@ func readyDisasterCompletionFixture(t *testing.T) (disasterRebuildFixture, store
 		Generation: progress.RestoreGeneration, Roles: roles, CompletedAt: time.Now().UTC(),
 		ManifestSHA256: progress.ManifestSHA256, QuarantinePaths: cloneDisasterStringMap(progress.QuarantinePaths),
 		MemberStages: cloneDisasterStringMap(progress.MemberStages), RouterStages: cloneDisasterStringMap(progress.RouterStages),
+		RouterIdentities: cloneDisasterRouterIdentities(progress.RouterIdentities),
 	}
 	return fixture, marker, completion
+}
+
+func cloneDisasterRouterIdentities(source map[string]store.MySQLDisasterRouterIdentity) map[string]store.MySQLDisasterRouterIdentity {
+	cloned := make(map[string]store.MySQLDisasterRouterIdentity, len(source))
+	for key, value := range source {
+		cloned[key] = value
+	}
+	return cloned
 }
 
 func cloneDisasterStringMap(source map[string]string) map[string]string {
@@ -807,6 +1090,7 @@ type disasterRebuildRemote struct {
 	onlineMembers        map[string]bool
 	memberByServer       map[string]string
 	effectCounts         map[string]int
+	routerRunning        bool
 }
 
 type disasterUploadEvent struct {
@@ -857,6 +1141,10 @@ func (r *disasterRebuildRemote) Run(ctx context.Context, server store.Server, co
 		return adapter.CommandResult{}, errors.New("injected disaster boundary")
 	}
 	if strings.HasSuffix(command, " stop-gr") {
+		if r.statefulEffects && len(r.onlineMembers) > 0 {
+			r.commands = append(r.commands, command)
+			return adapter.CommandResult{}, errors.New("cannot stop Group Replication after rebuilt members are ONLINE")
+		}
 		mode := r.stopGRMode
 		if mode == "" {
 			mode = "stopped"
@@ -915,12 +1203,15 @@ func (r *disasterRebuildRemote) Run(ctx context.Context, server store.Server, co
 			r.effectCounts["initialize"]++
 		case strings.Contains(command, "__AIFAR_CREATE_CLUSTER__"):
 			if r.statefulEffects {
+				if !r.initializedMembers[r.memberByServer[server.ID]] {
+					return adapter.CommandResult{}, errors.New("seed was not initialized before cluster creation")
+				}
 				r.onlineMembers[r.memberByServer[server.ID]] = true
 			}
 		case strings.Contains(command, "__AIFAR_CLONE_MEMBER__"):
 			if r.statefulEffects {
 				match := disasterCloneMemberID.FindStringSubmatch(command)
-				if len(match) != 2 || r.onlineMembers[match[1]] {
+				if len(match) != 2 || !r.onlineMembers[r.memberByServer[r.servers[0].ID]] || !r.initializedMembers[match[1]] || r.onlineMembers[match[1]] {
 					return adapter.CommandResult{}, errors.New("clone target is already ONLINE")
 				}
 				r.onlineMembers[match[1]] = true
@@ -941,7 +1232,25 @@ func (r *disasterRebuildRemote) Run(ctx context.Context, server store.Server, co
 	}
 	if strings.Contains(command, "__AIFAR_ROUTER_WRITE__") {
 		r.commands = append(r.commands, command)
+		if r.statefulEffects && (!r.routerRunning || len(r.onlineMembers) != 3) {
+			return adapter.CommandResult{}, errors.New("Router DML requires a bootstrapped Router and three ONLINE members")
+		}
 		return adapter.CommandResult{Stdout: "__AIFAR_ROUTER_WRITE__\t1\n__AIFAR_ROUTER_READ__\t1\n"}, nil
+	}
+	if strings.Contains(command, "systemctl stop aifar-mysql-router") {
+		if r.statefulEffects && r.routerRunning {
+			return adapter.CommandResult{}, errors.New("cannot stop Router after it has been rebuilt")
+		}
+		r.routerRunning = false
+	}
+	if strings.Contains(command, "__AIFAR_ROUTER_BOOTSTRAP__") {
+		if r.statefulEffects {
+			if len(r.onlineMembers) != 3 || r.routerRunning {
+				return adapter.CommandResult{}, errors.New("invalid Router bootstrap state")
+			}
+			r.routerRunning = true
+			r.effectCounts["router-bootstrap"]++
+		}
 	}
 	return r.restoreFakeRemote.Run(ctx, server, command)
 }

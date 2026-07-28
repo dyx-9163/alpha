@@ -101,49 +101,61 @@ func localInfileSQLCommand(work string, port int, query string) string {
 }
 
 func (s Service) reconcileMySQL(ctx context.Context, expected store.AppInstance, language string) error {
+	marker, present, err := s.restoreMySQLReconciliation(ctx, expected, language)
+	if err != nil || !present {
+		return err
+	}
+	data, ok := s.store.(restoreStore)
+	if !ok {
+		return localizedMySQLOperationError(language, MySQLReconciliationRequired)
+	}
+	if err := clearMySQLReconciliationMarker(data, expected.ID, marker.OriginalValue, marker.TaskID); err != nil {
+		return localizedMySQLOperationError(language, MySQLReconciliationRequired)
+	}
+	return nil
+}
+
+func (s Service) restoreMySQLReconciliation(ctx context.Context, expected store.AppInstance, language string) (mysqlReconciliationMarker, bool, error) {
 	data, ok := s.store.(restoreStore)
 	if !ok {
 		_, _, present, err := parseMySQLReconciliationMarker(expected.Metadata)
 		if err != nil || present {
-			return localizedMySQLOperationError(language, MySQLReconciliationRequired)
+			return mysqlReconciliationMarker{}, present, localizedMySQLOperationError(language, MySQLReconciliationRequired)
 		}
-		return nil
+		return mysqlReconciliationMarker{}, false, nil
 	}
 	instance, err := data.GetAppInstance(expected.ID)
 	if err != nil {
-		return err
+		return mysqlReconciliationMarker{}, false, err
 	}
 	_, marker, present, err := parseMySQLReconciliationMarker(instance.Metadata)
 	if err != nil {
-		return localizedMySQLOperationError(language, MySQLReconciliationRequired)
+		return mysqlReconciliationMarker{}, present, localizedMySQLOperationError(language, MySQLReconciliationRequired)
 	}
 	if !present {
-		return nil
+		return mysqlReconciliationMarker{}, false, nil
 	}
 	server, err := s.store.GetServer(instance.ServerID, true)
 	if err != nil {
-		return localizedMySQLOperationError(language, MySQLReconciliationRequired)
+		return mysqlReconciliationMarker{}, true, localizedMySQLOperationError(language, MySQLReconciliationRequired)
 	}
 	credential, err := data.GetBoundCredential(instance.ID, "admin", true)
 	if err != nil || credential.Status != "active" || credential.Kind != "mysql" || strings.TrimSpace(credential.Secret["password"]) == "" {
-		return localizedMySQLOperationError(language, MySQLReconciliationRequired)
+		return mysqlReconciliationMarker{}, true, localizedMySQLOperationError(language, MySQLReconciliationRequired)
 	}
 	session, cleanup, err := s.localInfileSession(ctx, instance, server, credential)
 	if err != nil {
-		return localizedMySQLOperationError(language, MySQLReconciliationRequired)
+		return mysqlReconciliationMarker{}, true, localizedMySQLOperationError(language, MySQLReconciliationRequired)
 	}
 	defer cleanup()
 	if err := session.SetLocalInfile(ctx, marker.OriginalValue); err != nil {
-		return localizedMySQLOperationError(language, MySQLReconciliationRequired)
+		return mysqlReconciliationMarker{}, true, localizedMySQLOperationError(language, MySQLReconciliationRequired)
 	}
 	value, err := session.ReadLocalInfile(ctx)
 	if err != nil || strings.ToUpper(strings.TrimSpace(value)) != marker.OriginalValue {
-		return localizedMySQLOperationError(language, MySQLReconciliationRequired)
+		return mysqlReconciliationMarker{}, true, localizedMySQLOperationError(language, MySQLReconciliationRequired)
 	}
-	if err := clearMySQLReconciliationMarker(data, instance.ID, marker.OriginalValue, marker.TaskID); err != nil {
-		return localizedMySQLOperationError(language, MySQLReconciliationRequired)
-	}
-	return nil
+	return marker, true, nil
 }
 
 func parseMySQLReconciliationMarker(raw string) (map[string]json.RawMessage, mysqlReconciliationMarker, bool, error) {

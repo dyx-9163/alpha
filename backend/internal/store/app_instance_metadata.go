@@ -30,31 +30,39 @@ type MySQLMaintenanceMarker struct {
 // MySQLDisasterRebuildCompletion is the controlled, non-secret payload used
 // to atomically publish a rebuilt cluster and clear its maintenance markers.
 type MySQLDisasterRebuildCompletion struct {
-	ClusterID       string            `json:"clusterId"`
-	SourceBackupID  string            `json:"sourceBackupId"`
-	TaskID          string            `json:"taskId"`
-	ManifestSHA256  string            `json:"manifestSha256"`
-	Generation      int               `json:"generation"`
-	Roles           map[string]string `json:"roles"`
-	QuarantinePaths map[string]string `json:"quarantinePaths"`
-	MemberStages    map[string]string `json:"memberStages"`
-	RouterStages    map[string]string `json:"routerStages"`
-	CompletedAt     time.Time         `json:"completedAt"`
+	ClusterID        string                                 `json:"clusterId"`
+	SourceBackupID   string                                 `json:"sourceBackupId"`
+	TaskID           string                                 `json:"taskId"`
+	ManifestSHA256   string                                 `json:"manifestSha256"`
+	Generation       int                                    `json:"generation"`
+	Roles            map[string]string                      `json:"roles"`
+	QuarantinePaths  map[string]string                      `json:"quarantinePaths"`
+	MemberStages     map[string]string                      `json:"memberStages"`
+	RouterStages     map[string]string                      `json:"routerStages"`
+	RouterIdentities map[string]MySQLDisasterRouterIdentity `json:"routerIdentities"`
+	CompletedAt      time.Time                              `json:"completedAt"`
+}
+
+// MySQLDisasterRouterIdentity binds completion to the verified Router target.
+type MySQLDisasterRouterIdentity struct {
+	ServerID string `json:"serverId"`
+	Endpoint string `json:"endpoint"`
 }
 
 type mysqlDisasterRebuildProgress struct {
-	Version           int               `json:"version"`
-	TaskID            string            `json:"taskId"`
-	SourceBackupID    string            `json:"sourceBackupId"`
-	ClusterID         string            `json:"clusterId"`
-	ManifestSHA256    string            `json:"manifestSha256"`
-	RestoreGeneration int               `json:"restoreGeneration"`
-	QuarantinePaths   map[string]string `json:"quarantinePaths"`
-	SeedStage         string            `json:"seedStage"`
-	MemberStages      map[string]string `json:"memberStages"`
-	RouterStage       string            `json:"routerStage"`
-	RouterStages      map[string]string `json:"routerStages"`
-	CompletionStage   string            `json:"completionStage,omitempty"`
+	Version           int                                    `json:"version"`
+	TaskID            string                                 `json:"taskId"`
+	SourceBackupID    string                                 `json:"sourceBackupId"`
+	ClusterID         string                                 `json:"clusterId"`
+	ManifestSHA256    string                                 `json:"manifestSha256"`
+	RestoreGeneration int                                    `json:"restoreGeneration"`
+	QuarantinePaths   map[string]string                      `json:"quarantinePaths"`
+	SeedStage         string                                 `json:"seedStage"`
+	MemberStages      map[string]string                      `json:"memberStages"`
+	RouterStage       string                                 `json:"routerStage"`
+	RouterStages      map[string]string                      `json:"routerStages"`
+	RouterIdentities  map[string]MySQLDisasterRouterIdentity `json:"routerIdentities"`
+	CompletionStage   string                                 `json:"completionStage,omitempty"`
 }
 
 var (
@@ -142,7 +150,7 @@ func (s *Store) CompleteMySQLDisasterRebuild(instanceIDs []string, marker MySQLM
 	ids := append([]string(nil), instanceIDs...)
 	sort.Strings(ids)
 	if len(ids) != 3 || len(completion.Roles) != 3 || len(completion.QuarantinePaths) != 3 ||
-		len(completion.MemberStages) != 3 || len(completion.RouterStages) == 0 {
+		len(completion.MemberStages) != 3 || len(completion.RouterStages) == 0 || len(completion.RouterIdentities) != len(completion.RouterStages) {
 		return errors.New("MySQL disaster rebuild requires exactly three members")
 	}
 	tx, err := s.db.Begin()
@@ -194,6 +202,13 @@ func (s *Store) CompleteMySQLDisasterRebuild(instanceIDs []string, marker MySQLM
 	}
 	if !sameControlledStringMap(completion.RouterStages, verifiedDisasterStages(routers)) {
 		return errors.New("MySQL disaster rebuild Router progress changed")
+	}
+	identities, err := disasterRouterIdentitiesTx(tx, routers)
+	if err != nil {
+		return err
+	}
+	if !sameDisasterRouterIdentities(completion.RouterIdentities, identities) {
+		return errors.New("MySQL disaster rebuild Router identity changed")
 	}
 	backupMetadata, err := completedMySQLDisasterBackupMetadataTx(tx, completion)
 	if err != nil {
@@ -269,6 +284,124 @@ func (s *Store) CompleteMySQLDisasterRebuild(instanceIDs []string, marker MySQLM
 	return tx.Commit()
 }
 
+// CompleteMySQLDisasterReconciliation atomically clears the owned local_infile
+// marker and advances the bound disaster backup from load-effect-complete to
+// loaded. A failed write leaves both records retryable.
+func (s *Store) CompleteMySQLDisasterReconciliation(instanceID, backupID, originalValue, taskID, manifestSHA256 string) error {
+	if !controlledMaintenanceInstanceID.MatchString(instanceID) || !controlledMaintenanceBackupID.MatchString(backupID) ||
+		!controlledMaintenanceTaskID.MatchString(taskID) || !controlledManifestSHA256.MatchString(manifestSHA256) ||
+		(originalValue != "ON" && originalValue != "OFF") {
+		return errors.New("invalid MySQL disaster reconciliation completion")
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var app, instanceMetadata string
+	if err := tx.QueryRow(`select app,metadata from app_instances where id=?`, instanceID).Scan(&app, &instanceMetadata); err != nil {
+		return err
+	}
+	if app != "mysql" {
+		return errors.New("MySQL disaster reconciliation instance ownership changed")
+	}
+	metadata, err := appInstanceMetadata(instanceMetadata)
+	if err != nil {
+		return err
+	}
+	rawMarker, present := metadata["mysqlReconciliation"]
+	if !present {
+		return errors.New("MySQL disaster reconciliation marker missing")
+	}
+	var marker struct {
+		Version       int    `json:"version"`
+		Kind          string `json:"kind"`
+		OriginalValue string `json:"originalValue"`
+		RecordedAt    string `json:"recordedAt"`
+		TaskID        string `json:"taskId"`
+	}
+	decoder := json.NewDecoder(strings.NewReader(string(rawMarker)))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&marker); err != nil {
+		return err
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		return errors.New("MySQL disaster reconciliation marker must be one object")
+	}
+	recordedAt, recordedErr := time.Parse(time.RFC3339, marker.RecordedAt)
+	if marker.Version != 1 || marker.Kind != "local_infile" || marker.OriginalValue != originalValue || marker.TaskID != taskID ||
+		recordedErr != nil || recordedAt.Location() != time.UTC {
+		return errors.New("MySQL disaster reconciliation marker ownership changed")
+	}
+
+	var backupApp, backupType, status, backupMetadata string
+	if err := tx.QueryRow(`select app,backup_type,status,coalesce(metadata,'{}') from app_backups where id=?`, backupID).Scan(&backupApp, &backupType, &status, &backupMetadata); err != nil {
+		return err
+	}
+	if backupApp != "mysql" || backupType != "logical-full" || status != "success" {
+		return errors.New("MySQL disaster reconciliation backup ownership changed")
+	}
+	backupValues, err := appInstanceMetadata(backupMetadata)
+	if err != nil {
+		return err
+	}
+	var restoreTaskID, expectedManifestSHA256 string
+	if raw, ok := backupValues["restoreTaskId"]; !ok || json.Unmarshal(raw, &restoreTaskID) != nil || restoreTaskID != taskID {
+		return errors.New("MySQL disaster reconciliation backup task changed")
+	}
+	if raw, ok := backupValues["restoreExpectedManifestSha256"]; !ok || json.Unmarshal(raw, &expectedManifestSHA256) != nil || expectedManifestSHA256 != manifestSHA256 {
+		return errors.New("MySQL disaster reconciliation manifest changed")
+	}
+	rawProgress, present := backupValues["disasterRebuild"]
+	if !present {
+		return errors.New("MySQL disaster reconciliation progress missing")
+	}
+	decoder = json.NewDecoder(strings.NewReader(string(rawProgress)))
+	decoder.DisallowUnknownFields()
+	var progress mysqlDisasterRebuildProgress
+	if err := decoder.Decode(&progress); err != nil {
+		return err
+	}
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		return errors.New("MySQL disaster reconciliation progress must be one object")
+	}
+	if progress.Version != 1 || progress.TaskID != taskID || progress.SourceBackupID != backupID ||
+		progress.ManifestSHA256 != manifestSHA256 || progress.SeedStage != "load-effect-complete" || progress.CompletionStage != "" {
+		return errors.New("MySQL disaster reconciliation progress changed")
+	}
+	progress.SeedStage = "loaded"
+	backupValues["restorePhase"], _ = json.Marshal("load_complete")
+	backupValues["disasterRebuild"], err = json.Marshal(progress)
+	if err != nil {
+		return err
+	}
+	encodedBackup, err := json.Marshal(backupValues)
+	if err != nil {
+		return err
+	}
+	delete(metadata, "mysqlReconciliation")
+	encodedInstance, err := json.Marshal(metadata)
+	if err != nil {
+		return err
+	}
+	result, err := tx.Exec(`update app_instances set metadata=?,updated_at=? where id=? and app='mysql'`, string(encodedInstance), time.Now().UTC(), instanceID)
+	if err != nil {
+		return err
+	}
+	if updated, rowsErr := result.RowsAffected(); rowsErr != nil || updated != 1 {
+		return errors.New("MySQL disaster reconciliation instance changed")
+	}
+	result, err = tx.Exec(`update app_backups set metadata=? where id=? and status='success'`, string(encodedBackup), backupID)
+	if err != nil {
+		return err
+	}
+	if updated, rowsErr := result.RowsAffected(); rowsErr != nil || updated != 1 {
+		return errors.New("MySQL disaster reconciliation backup changed")
+	}
+	return tx.Commit()
+}
+
 func completedMySQLDisasterBackupMetadataTx(tx *sql.Tx, completion MySQLDisasterRebuildCompletion) (string, error) {
 	var app, backupType, status, raw string
 	if err := tx.QueryRow(`select app,backup_type,status,coalesce(metadata,'{}') from app_backups where id=?`, completion.SourceBackupID).Scan(&app, &backupType, &status, &raw); err != nil {
@@ -309,7 +442,8 @@ func completedMySQLDisasterBackupMetadataTx(tx *sql.Tx, completion MySQLDisaster
 		progress.RouterStage != "verified" || progress.CompletionStage != "" ||
 		!sameControlledStringMap(progress.QuarantinePaths, completion.QuarantinePaths) ||
 		!sameControlledStringMap(progress.MemberStages, completion.MemberStages) ||
-		!sameControlledStringMap(progress.RouterStages, completion.RouterStages) {
+		!sameControlledStringMap(progress.RouterStages, completion.RouterStages) ||
+		!sameDisasterRouterIdentities(progress.RouterIdentities, completion.RouterIdentities) {
 		return "", errors.New("MySQL disaster rebuild progress is not ready for completion")
 	}
 	progress.CompletionStage = "completed"
@@ -419,6 +553,59 @@ func verifiedDisasterStages(instances []AppInstance) map[string]string {
 		stages[instance.ID] = "verified"
 	}
 	return stages
+}
+
+func disasterRouterIdentitiesTx(tx *sql.Tx, routers []AppInstance) (map[string]MySQLDisasterRouterIdentity, error) {
+	identities := make(map[string]MySQLDisasterRouterIdentity, len(routers))
+	for _, router := range routers {
+		var host string
+		if err := tx.QueryRow(`select coalesce(host,'') from servers where id=?`, router.ServerID).Scan(&host); err != nil {
+			return nil, err
+		}
+		metadata, err := appInstanceMetadata(router.Metadata)
+		if err != nil {
+			return nil, err
+		}
+		endpoint := ""
+		if rawEndpoint, present := metadata["endpoint"]; present {
+			if json.Unmarshal(rawEndpoint, &endpoint) != nil {
+				return nil, errors.New("invalid MySQL Router endpoint")
+			}
+		}
+		if strings.TrimSpace(endpoint) == "" {
+			port := 6446
+			if rawPort, present := metadata["readWritePort"]; present {
+				if json.Unmarshal(rawPort, &port) != nil || port < 1 || port > 65535 {
+					return nil, errors.New("invalid MySQL Router port")
+				}
+			}
+			if strings.TrimSpace(host) == "" {
+				return nil, errors.New("invalid MySQL Router host")
+			}
+			endpoint = fmt.Sprintf("%s:%d", strings.TrimSpace(host), port)
+		}
+		identities[router.ID] = MySQLDisasterRouterIdentity{ServerID: router.ServerID, Endpoint: normalizeStoredRouterEndpoint(endpoint)}
+	}
+	return identities, nil
+}
+
+func normalizeStoredRouterEndpoint(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	value = strings.TrimPrefix(value, "tcp://")
+	return strings.TrimPrefix(value, "mysql://")
+}
+
+func sameDisasterRouterIdentities(left, right map[string]MySQLDisasterRouterIdentity) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for instanceID, identity := range left {
+		other, present := right[instanceID]
+		if !present || identity.ServerID != other.ServerID || normalizeStoredRouterEndpoint(identity.Endpoint) != other.Endpoint || other.ServerID == "" || other.Endpoint == "" {
+			return false
+		}
+	}
+	return true
 }
 
 func sameControlledStringMap(left, right map[string]string) bool {
