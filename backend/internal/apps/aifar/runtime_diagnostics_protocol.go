@@ -62,7 +62,7 @@ func parseRuntimeDiagnosticStreamHeader(line string) (runtimeDiagnosticStreamHea
 		return result, fmt.Errorf("runtime diagnostic stream archive name is invalid")
 	}
 	uncompressedBytes, err := parseRuntimeDiagnosticBytes(fields[2])
-	if err != nil || uncompressedBytes > 524288000 {
+	if err != nil || uncompressedBytes > runtimeDiagnosticMaxUncompressed {
 		return result, fmt.Errorf("runtime diagnostic stream uncompressed bytes are invalid")
 	}
 	warningCount, err := parseRuntimeDiagnosticBytes(fields[3])

@@ -12,6 +12,7 @@ LOCAL_DATE={{.LocalDate}}
 LOG_ROOT="$INSTALL_ROOT/runtime/logs"
 MAX_FILE_SCAN=1073741824
 MAX_TOTAL_SCAN=2147483648
+MAX_SNAPSHOT=524288000
 
 case "$INSTALL_ROOT" in /*) [ "$INSTALL_ROOT" != "/" ] || exit 21 ;; *) exit 21 ;; esac
 case "$LOCAL_DATE" in [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]) ;; *) exit 23 ;; esac
@@ -59,7 +60,7 @@ for service in $SERVICES; do
       case "${relative##*/}" in *.lck|*.idx) continue ;; *.log|*.log.[A-Za-z0-9]*) ;; *) continue ;; esac
       selected=0
       case "$relative" in *"$LOCAL_DATE"*) selected=1 ;; esac
-      if [ "$is_current" -eq 1 ]; then case "$relative" in */*) ;; *) selected=1 ;; esac; fi
+      if [ "$is_current" -eq 1 ]; then case "$relative" in */*) ;; *.log) selected=1 ;; esac; fi
       [ "$selected" -eq 1 ] || continue
       case "$file_size" in ''|*[!0-9]*) exit 21 ;; esac
       service_files=$((service_files + 1))
@@ -74,6 +75,7 @@ for service in $SERVICES; do
 done
 
 [ "$total_bytes" -le "$MAX_TOTAL_SCAN" ] || block_code=total-scan-limit-exceeded
+[ "$total_bytes" -le "$MAX_SNAPSHOT" ] || block_code=snapshot-limit-exceeded
 if [ "$block_code" = "-" ] && [ "$total_files" -eq 0 ]; then block_code=no-candidate-files; fi
 printf 'AIFAR_DIAG_TOTAL_V3\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
   "$total_files" "$total_bytes" "$server_timezone" "$LOCAL_DATE" "$day_start" "$day_end" "$is_current" "$block_code"

@@ -2,10 +2,12 @@ package aifar
 
 import (
 	"archive/tar"
+	"bytes"
 	"compress/gzip"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"hash"
@@ -23,7 +25,35 @@ import (
 const (
 	runtimeDiagnosticLocalMaxArchiveBytes = int64(256 << 20)
 	runtimeDiagnosticFilesystemMargin     = int64(64 << 20)
+	runtimeDiagnosticManifestMaxBytes     = int64(16 << 20)
 )
+
+type runtimeDiagnosticRawManifest struct {
+	FormatVersion     string                               `json:"formatVersion"`
+	LocalDate         string                               `json:"localDate"`
+	Since             string                               `json:"since"`
+	Until             string                               `json:"until"`
+	ServerTimezone    string                               `json:"serverTimezone"`
+	SelectedServices  string                               `json:"selectedServices"`
+	SnapshotStartedAt string                               `json:"snapshotStartedAt"`
+	Sources           []runtimeDiagnosticRawManifestSource `json:"sources"`
+}
+
+type runtimeDiagnosticRawManifestSource struct {
+	Service              string `json:"service"`
+	SourcePath           string `json:"sourcePath"`
+	Device               string `json:"device"`
+	Inode                string `json:"inode"`
+	CapturedBytes        int64  `json:"capturedBytes"`
+	SourceSnapshotSHA256 string `json:"sourceSnapshotSha256"`
+	ArchiveEntrySHA256   string `json:"archiveEntrySha256"`
+	ActiveSnapshot       int    `json:"activeSnapshot"`
+}
+
+type runtimeDiagnosticArchiveEntryDigest struct {
+	Size   int64
+	SHA256 string
+}
 
 type RuntimeDiagnosticArchiveStorage interface {
 	Stats(context.Context) (RuntimeDiagnosticStorageStats, error)
@@ -101,7 +131,7 @@ func newRuntimeDiagnosticArchiveStorageWithLimit(root string, quotaBytes int64, 
 	}
 	return &localRuntimeDiagnosticArchiveStorage{
 		root: filepath.Clean(root), quotaBytes: quotaBytes, retention: retention, records: records, maxArchiveBytes: maxArchiveBytes,
-		maxUncompressedBytes: runtimeDiagnosticMaxFiltered, availableBytes: runtimeDiagnosticAvailableBytes,
+		maxUncompressedBytes: runtimeDiagnosticMaxUncompressed, availableBytes: runtimeDiagnosticAvailableBytes,
 	}
 }
 
@@ -658,6 +688,11 @@ func validateRuntimeDiagnosticTarGzip(ctx context.Context, archivePath, expected
 		path.Join(expectedTop, "manifest.json"):         false,
 		path.Join(expectedTop, "collection-errors.txt"): false,
 	}
+	manifestName := path.Join(expectedTop, "manifest.json")
+	servicesPrefix := path.Join(expectedTop, "services") + "/"
+	seenEntries := make(map[string]struct{})
+	serviceEntries := make(map[string]runtimeDiagnosticArchiveEntryDigest)
+	var manifestContent bytes.Buffer
 	var regularBytes int64
 	for {
 		if err := ctx.Err(); err != nil {
@@ -679,6 +714,10 @@ func validateRuntimeDiagnosticTarGzip(ctx context.Context, archivePath, expected
 		if len(parts) == 0 || parts[0] != expectedTop {
 			return fmt.Errorf("diagnostic tar has unexpected top-level directory")
 		}
+		if _, exists := seenEntries[clean]; exists {
+			return fmt.Errorf("diagnostic tar contains duplicate entry")
+		}
+		seenEntries[clean] = struct{}{}
 		switch header.Typeflag {
 		case tar.TypeReg, tar.TypeRegA:
 			if header.Size < 0 || header.Size > maxUncompressedBytes-regularBytes {
@@ -688,12 +727,34 @@ func validateRuntimeDiagnosticTarGzip(ctx context.Context, archivePath, expected
 			if _, ok := required[clean]; ok {
 				required[clean] = true
 			}
+			entryReader := &runtimeDiagnosticContextReader{ctx: ctx, reader: tarReader}
+			switch {
+			case clean == manifestName:
+				if header.Size > runtimeDiagnosticManifestMaxBytes {
+					return fmt.Errorf("diagnostic manifest exceeds size limit")
+				}
+				if _, err := io.Copy(&manifestContent, entryReader); err != nil {
+					return fmt.Errorf("read diagnostic manifest: %w", err)
+				}
+			case strings.HasPrefix(clean, servicesPrefix):
+				hasher := sha256.New()
+				if _, err := io.Copy(hasher, entryReader); err != nil {
+					return fmt.Errorf("read diagnostic service entry: %w", err)
+				}
+				serviceEntries[clean] = runtimeDiagnosticArchiveEntryDigest{Size: header.Size, SHA256: hex.EncodeToString(hasher.Sum(nil))}
+			default:
+				if _, err := io.Copy(io.Discard, entryReader); err != nil {
+					return fmt.Errorf("read diagnostic tar entry: %w", err)
+				}
+			}
 		case tar.TypeDir:
 		default:
 			return fmt.Errorf("diagnostic tar contains unsupported entry type")
 		}
-		if _, err := io.Copy(io.Discard, &runtimeDiagnosticContextReader{ctx: ctx, reader: tarReader}); err != nil {
-			return fmt.Errorf("read diagnostic tar entry: %w", err)
+		if header.Typeflag == tar.TypeDir {
+			if _, err := io.Copy(io.Discard, &runtimeDiagnosticContextReader{ctx: ctx, reader: tarReader}); err != nil {
+				return fmt.Errorf("read diagnostic tar entry: %w", err)
+			}
 		}
 	}
 	if expectedUncompressedBytes >= 0 && regularBytes != expectedUncompressedBytes {
@@ -704,7 +765,58 @@ func validateRuntimeDiagnosticTarGzip(ctx context.Context, archivePath, expected
 			return fmt.Errorf("diagnostic tar is missing required entry %s", path.Base(name))
 		}
 	}
+	if err := validateRuntimeDiagnosticRawManifest(expectedTop, manifestContent.Bytes(), serviceEntries); err != nil {
+		return err
+	}
 	return nil
+}
+
+func validateRuntimeDiagnosticRawManifest(expectedTop string, content []byte, serviceEntries map[string]runtimeDiagnosticArchiveEntryDigest) error {
+	var envelope struct {
+		FormatVersion string `json:"formatVersion"`
+	}
+	if err := json.Unmarshal(content, &envelope); err != nil {
+		return fmt.Errorf("invalid diagnostic manifest: %w", err)
+	}
+	if envelope.FormatVersion != "AIFAR_DIAGNOSTIC_RAW_SNAPSHOT_V1" {
+		return nil
+	}
+	var manifest runtimeDiagnosticRawManifest
+	decoder := json.NewDecoder(bytes.NewReader(content))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&manifest); err != nil {
+		return fmt.Errorf("invalid diagnostic manifest: %w", err)
+	}
+	if decoder.Decode(&struct{}{}) != io.EOF {
+		return fmt.Errorf("invalid diagnostic manifest trailing data")
+	}
+	matched := make(map[string]struct{}, len(manifest.Sources))
+	for _, source := range manifest.Sources {
+		if !runtimeDiagnosticNamePattern.MatchString(source.Service) || source.SourcePath == "" || path.IsAbs(source.SourcePath) || strings.Contains(source.SourcePath, `\`) || path.Clean(source.SourcePath) != source.SourcePath || strings.HasPrefix(source.SourcePath, "../") {
+			return fmt.Errorf("invalid diagnostic raw manifest source path")
+		}
+		entryName := path.Join(expectedTop, "services", source.Service, source.SourcePath)
+		if _, duplicate := matched[entryName]; duplicate {
+			return fmt.Errorf("duplicate diagnostic raw manifest source")
+		}
+		matched[entryName] = struct{}{}
+		entry, ok := serviceEntries[entryName]
+		if !ok {
+			return fmt.Errorf("diagnostic raw manifest source is missing from archive")
+		}
+		if source.CapturedBytes < 0 || source.CapturedBytes != entry.Size || source.ActiveSnapshot < 0 || source.ActiveSnapshot > 1 || !validRuntimeDiagnosticSHA256(source.SourceSnapshotSHA256) || !validRuntimeDiagnosticSHA256(source.ArchiveEntrySHA256) || source.SourceSnapshotSHA256 != entry.SHA256 || source.ArchiveEntrySHA256 != entry.SHA256 {
+			return fmt.Errorf("diagnostic raw manifest source integrity mismatch")
+		}
+	}
+	if len(matched) != len(serviceEntries) {
+		return fmt.Errorf("diagnostic raw manifest does not cover service entries")
+	}
+	return nil
+}
+
+func validRuntimeDiagnosticSHA256(value string) bool {
+	decoded, err := hex.DecodeString(value)
+	return err == nil && len(decoded) == sha256.Size && value == strings.ToLower(value)
 }
 
 func isRuntimeDiagnosticDirectoryNotEmpty(err error) bool {

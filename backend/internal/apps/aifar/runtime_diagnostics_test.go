@@ -952,6 +952,21 @@ func TestRuntimeDiagnosticStreamHeaderAcceptsLargeWarningCount(t *testing.T) {
 	}
 }
 
+func TestRuntimeDiagnosticStreamHeaderUsesUncompressedArchiveLimit(t *testing.T) {
+	line := "AIFAR_DIAG_STREAM_V1\taifar-diagnostics-instance-1-20260727T080000Z.tar.gz\t524288001\t0\tAsia/Shanghai\n"
+	got, err := parseRuntimeDiagnosticStreamHeader(line)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.UncompressedBytes != 524288001 {
+		t.Fatalf("uncompressed bytes = %d, want 524288001", got.UncompressedBytes)
+	}
+	tooLarge := fmt.Sprintf("AIFAR_DIAG_STREAM_V1\taifar-diagnostics-instance-1-20260727T080000Z.tar.gz\t%d\t0\tAsia/Shanghai\n", runtimeDiagnosticMaxUncompressed+1)
+	if _, err := parseRuntimeDiagnosticStreamHeader(tooLarge); err == nil {
+		t.Fatal("stream header above the uncompressed archive limit was accepted")
+	}
+}
+
 func TestRuntimeDiagnosticWarningPlaceholdersStayBounded(t *testing.T) {
 	warnings := runtimeDiagnosticWarningPlaceholders(100001)
 	if len(warnings) != 1 {
@@ -1370,6 +1385,7 @@ func TestRuntimeDiagnosticExportRawSnapshotUsesOneServerLocalDate(t *testing.T) 
 	yesterday := []byte("yesterday bytes\n")
 	paths := map[string][]byte{
 		"active.log":                active,
+		"active.log.2026-07-27":     yesterday,
 		"2026-07-28/log_info.0.log": today,
 		"2026-07-27/log_info.0.log": yesterday,
 	}
@@ -1389,7 +1405,7 @@ func TestRuntimeDiagnosticExportRawSnapshotUsesOneServerLocalDate(t *testing.T) 
 	}
 	root := fixture.archiveBase + "/services/gateway/"
 	entries := runtimeDiagnosticStreamArchiveEntries(t, output)
-	if !slices.Contains(entries, root+"active.log") || !slices.Contains(entries, root+"2026-07-28/log_info.0.log") || slices.Contains(entries, root+"2026-07-27/log_info.0.log") {
+	if !slices.Contains(entries, root+"active.log") || !slices.Contains(entries, root+"2026-07-28/log_info.0.log") || slices.Contains(entries, root+"active.log.2026-07-27") || slices.Contains(entries, root+"2026-07-27/log_info.0.log") {
 		t.Fatalf("unexpected current-day archive entries: %v", entries)
 	}
 	if got := []byte(runtimeDiagnosticStreamArchiveFile(t, output, root+"active.log")); !bytes.Equal(got, active) {
@@ -1413,6 +1429,7 @@ func TestRuntimeDiagnosticExportHistoricalDateExcludesTopLevelActiveLog(t *testi
 	fixture.localDate = "2026-07-27"
 	for relative, content := range map[string]string{
 		"active.log":                "active bytes\n",
+		"active.log.2026-07-27":     "old top-level rotation\n",
 		"2026-07-27/log_info.0.log": "history bytes\n",
 		"2026-07-28/log_info.0.log": "today bytes\n",
 	} {
@@ -1432,6 +1449,45 @@ func TestRuntimeDiagnosticExportHistoricalDateExcludesTopLevelActiveLog(t *testi
 	entries := runtimeDiagnosticStreamArchiveEntries(t, output)
 	if !slices.Contains(entries, root+"2026-07-27/log_info.0.log") || slices.Contains(entries, root+"active.log") || slices.Contains(entries, root+"2026-07-28/log_info.0.log") {
 		t.Fatalf("unexpected historical archive entries: %v", entries)
+	}
+}
+
+func TestRuntimeDiagnosticEstimateRejectsRawSnapshotAboveLimit(t *testing.T) {
+	fixture := newRuntimeDiagnosticExportShellFixture(t)
+	logPath := filepath.Join(fixture.installNative, "runtime", "logs", "gateway", "active.log")
+	file, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Truncate(runtimeDiagnosticMaxFiltered + 1); err != nil {
+		file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	script, err := renderRuntimeDiagnosticEstimateScript(runtimeDiagnosticEstimateScriptData{
+		InstallRoot: installerkit.ShellQuote(fixture.installShell),
+		InstanceID:  installerkit.ShellQuote("instance-1"),
+		Services:    installerkit.ShellQuote("gateway"),
+		LocalDate:   installerkit.ShellQuote("2026-07-28"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(fixture.sh, "-s")
+	cmd.Stdin = strings.NewReader(`PATH="$AIFAR_FAKE_BIN:/usr/bin:/bin"; export PATH` + "\n" + strings.ReplaceAll(script, "\r\n", "\n"))
+	cmd.Env = append(os.Environ(), "AIFAR_FAKE_BIN="+fixture.binShell, "AIFAR_SERVER_TODAY=2026-07-28")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("run estimate: %v: %s", err, output)
+	}
+	got, err := parseRuntimeDiagnosticEstimate(string(output), []string{"gateway"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Allowed || got.BlockReason != "snapshot-limit-exceeded" {
+		t.Fatalf("oversized raw snapshot estimate = %+v", got)
 	}
 }
 

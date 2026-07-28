@@ -35,6 +35,7 @@ ARCHIVE_NAME="$ARCHIVE_BASE.tar.gz"
 MAX_FILE_SCAN=1073741824
 MAX_TOTAL_SCAN=2147483648
 MAX_SNAPSHOT=524288000
+MAX_UNCOMPRESSED=3221225472
 MAX_ARCHIVE=268435456
 
 case "$INSTALL_ROOT" in /*) [ "$INSTALL_ROOT" != "/" ] || exit 21 ;; *) exit 21 ;; esac
@@ -115,7 +116,7 @@ case "$base_name" in *.lck|*.idx) exit 0 ;; *.log|*.log.[A-Za-z0-9]*) ;; *) exit
 
 selected=0
 case "$relative" in *"$LOCAL_DATE"*) selected=1 ;; esac
-if [ "$IS_CURRENT_DATE" -eq 1 ]; then case "$relative" in */*) ;; *) selected=1 ;; esac; fi
+if [ "$IS_CURRENT_DATE" -eq 1 ]; then case "$relative" in */*) ;; *.log) selected=1 ;; esac; fi
 [ "$selected" -eq 1 ] || exit 0
 
 read -r initial_device initial_inode initial_size < <(stat -Lc '%d %i %s' -- "$source_descriptor") || exit 31
@@ -223,7 +224,7 @@ mv -T -- "$manifest_tmp" "$BUNDLE_ROOT/manifest.json"
 
 uncompressed_bytes=$(find "$BUNDLE_ROOT" -xdev -type f -printf '%s\n' | awk '{ total += $1 } END { printf "%.0f\n", total }') || exit 45
 case "$uncompressed_bytes" in ''|*[!0-9]*) exit 45 ;; esac
-[ "$uncompressed_bytes" -le "$MAX_SNAPSHOT" ] || exit 43
+[ "$uncompressed_bytes" -le "$MAX_UNCOMPRESSED" ] || exit 43
 warning_count=$(awk -F '\t' '{ total += $4 } END { print total + 0 }' "$ERROR_RECORDS") || exit 35
 printf 'AIFAR_DIAG_STREAM_V1\t%s\t%s\t%s\t%s\n' "$ARCHIVE_NAME" "$uncompressed_bytes" "$warning_count" "$server_timezone"
 tar -czf - -C "$BUNDLE_PARENT" "$ARCHIVE_BASE"

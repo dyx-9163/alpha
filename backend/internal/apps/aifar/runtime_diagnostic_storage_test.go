@@ -287,6 +287,23 @@ func TestLocalDiagnosticSinkRejectsInvalidOrUnsafeTarGzip(t *testing.T) {
 		{name: "missing collection errors", payload: func(t *testing.T) []byte {
 			return buildDiagnosticArchive(t, "archive", []diagnosticArchiveEntry{{Name: "archive/README.txt"}, {Name: "archive/manifest.json", Body: "{}"}})
 		}},
+		{name: "raw manifest hash mismatch", payload: func(t *testing.T) []byte {
+			entries := diagnosticArchiveControlEntries("archive")
+			entries[1].Body = `{"formatVersion":"AIFAR_DIAGNOSTIC_RAW_SNAPSHOT_V1","sources":[{"service":"gateway","sourcePath":"active.log","capturedBytes":3,"sourceSnapshotSha256":"0000000000000000000000000000000000000000000000000000000000000000","archiveEntrySha256":"0000000000000000000000000000000000000000000000000000000000000000"}]}`
+			return buildDiagnosticArchive(t, "archive", append(entries, diagnosticArchiveEntry{Name: "archive/services/gateway/active.log", Body: "raw"}))
+		}},
+		{name: "raw manifest omits service entry", payload: func(t *testing.T) []byte {
+			entries := diagnosticArchiveControlEntries("archive")
+			entries[1].Body = `{"formatVersion":"AIFAR_DIAGNOSTIC_RAW_SNAPSHOT_V1","sources":[]}`
+			return buildDiagnosticArchive(t, "archive", append(entries, diagnosticArchiveEntry{Name: "archive/services/gateway/active.log", Body: "raw"}))
+		}},
+		{name: "raw manifest source is missing from archive", payload: func(t *testing.T) []byte {
+			sha := sha256.Sum256([]byte("raw"))
+			digest := fmt.Sprintf("%x", sha[:])
+			entries := diagnosticArchiveControlEntries("archive")
+			entries[1].Body = fmt.Sprintf(`{"formatVersion":"AIFAR_DIAGNOSTIC_RAW_SNAPSHOT_V1","sources":[{"service":"gateway","sourcePath":"active.log","capturedBytes":3,"sourceSnapshotSha256":"%s","archiveEntrySha256":"%s"}]}`, digest, digest)
+			return buildDiagnosticArchive(t, "archive", entries)
+		}},
 	}
 	for index, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -300,7 +317,7 @@ func TestLocalDiagnosticSinkRejectsInvalidOrUnsafeTarGzip(t *testing.T) {
 			if _, err := sink.Write(test.payload(t)); err != nil {
 				t.Fatal(err)
 			}
-			if _, err := sink.Commit(context.Background(), 0); err == nil {
+			if _, err := sink.Commit(context.Background(), -1); err == nil {
 				t.Fatal("unsafe archive committed")
 			}
 			for _, name := range []string{"archive.tar.gz.partial", "archive.tar.gz"} {
@@ -309,6 +326,52 @@ func TestLocalDiagnosticSinkRejectsInvalidOrUnsafeTarGzip(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestLocalDiagnosticSinkAcceptsMatchingRawSnapshotManifest(t *testing.T) {
+	root := t.TempDir()
+	storage := newRuntimeDiagnosticArchiveStorageWithLimit(root, 1<<30, 24*time.Hour, nil, 1<<20)
+	body := "raw bytes\x00stay unchanged\n"
+	digestBytes := sha256.Sum256([]byte(body))
+	digest := fmt.Sprintf("%x", digestBytes[:])
+	manifest := fmt.Sprintf(`{"formatVersion":"AIFAR_DIAGNOSTIC_RAW_SNAPSHOT_V1","localDate":"2026-07-28","since":"2026-07-27T16:00:00Z","until":"2026-07-28T16:00:00Z","serverTimezone":"Asia/Shanghai","selectedServices":"gateway","snapshotStartedAt":"2026-07-28T08:00:00Z","sources":[{"service":"gateway","sourcePath":"active.log","device":"1","inode":"2","capturedBytes":%d,"sourceSnapshotSha256":"%s","archiveEntrySha256":"%s","activeSnapshot":1}]}`, len(body), digest, digest)
+	entries := diagnosticArchiveControlEntries("archive")
+	entries[1].Body = manifest
+	entries = append(entries, diagnosticArchiveEntry{Name: "archive/services/gateway/active.log", Body: body})
+	payload := buildDiagnosticArchive(t, "archive", entries)
+	sink, err := storage.Begin("diag-raw-valid", "archive.tar.gz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sink.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+	artifact, err := sink.Commit(context.Background(), diagnosticArchiveRegularBytes(entries))
+	if err != nil {
+		t.Fatalf("matching raw snapshot manifest was rejected: %v", err)
+	}
+	if artifact.Size != int64(len(payload)) {
+		t.Fatalf("committed archive size = %d, want %d", artifact.Size, len(payload))
+	}
+}
+
+func TestLocalDiagnosticSinkKeepsLegacyManifestCompatibility(t *testing.T) {
+	root := t.TempDir()
+	storage := newRuntimeDiagnosticArchiveStorageWithLimit(root, 1<<30, 24*time.Hour, nil, 1<<20)
+	entries := diagnosticArchiveControlEntries("archive")
+	entries[1].Body = `{"formatVersion":"AIFAR_DIAGNOSTIC_V2","redactionRuleVersion":"v1","sources":[{"legacyField":"retained"}]}`
+	entries = append(entries, diagnosticArchiveEntry{Name: "archive/services/gateway/legacy.log", Body: "legacy filtered bytes\n"})
+	payload := buildDiagnosticArchive(t, "archive", entries)
+	sink, err := storage.Begin("diag-legacy-valid", "archive.tar.gz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sink.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sink.Commit(context.Background(), diagnosticArchiveRegularBytes(entries)); err != nil {
+		t.Fatalf("legacy diagnostic manifest was rejected: %v", err)
 	}
 }
 
