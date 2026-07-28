@@ -23,10 +23,10 @@ data/
 *.db
 *.db-shm
 *.db-wal
-/tmp
-.codex*
-deliverables
-backend
+/tmp/
+/.codex-cache*
+/deliverables*
+/backend*
 
 # Large offline resource bundles
 resources/
