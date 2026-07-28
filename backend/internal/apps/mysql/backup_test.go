@@ -426,6 +426,11 @@ func TestBackupVerifyServiceAcceptsMatchingClusterOwnershipWithoutMySQLContact(t
 		{ID: "app_cluster_verify_member_2", App: "mysql", ServerID: "srv_cluster_verify_member_2", Topology: "innodb-cluster", Metadata: `{"clusterId":"` + clusterID + `"}`},
 		{ID: "app_cluster_verify_member_3", App: "mysql", ServerID: "srv_cluster_verify_member_3", Topology: "innodb-cluster", Metadata: `{"clusterId":"` + clusterID + `"}`},
 	}
+	data.servers = map[string]store.Server{
+		data.instances[0].ServerID: {ID: data.instances[0].ServerID, Host: "10.0.0.8"},
+		data.instances[1].ServerID: {ID: data.instances[1].ServerID, Host: "10.0.0.9"},
+		data.instances[2].ServerID: {ID: data.instances[2].ServerID, Host: "10.0.0.10"},
+	}
 	data.members = []store.AppClusterMember{
 		{ID: "member_cluster_verify_1", ClusterID: clusterID, InstanceID: data.instances[0].ID, ServerID: data.instances[0].ServerID},
 		{ID: "member_cluster_verify_2", ClusterID: clusterID, InstanceID: data.instances[1].ID, ServerID: data.instances[1].ServerID},
@@ -458,7 +463,7 @@ func TestBackupVerifyServiceAcceptsMatchingClusterOwnershipWithoutMySQLContact(t
 	}
 }
 
-func TestBackupVerifyServiceRejectsClusterMembershipDriftUnderLock(t *testing.T) {
+func TestBackupVerifyServiceRejectsClusterServerRowDriftUnderLock(t *testing.T) {
 	module, data, _ := newStandaloneBackupModule(t)
 	clusterID := "cluster_verify_drift_1234567890abcdef"
 	data.instance.Topology = "innodb-cluster"
@@ -472,7 +477,12 @@ func TestBackupVerifyServiceRejectsClusterMembershipDriftUnderLock(t *testing.T)
 	data.members = []store.AppClusterMember{
 		{ID: "member_cluster_drift_1", ClusterID: clusterID, InstanceID: data.instances[0].ID, ServerID: data.instances[0].ServerID},
 		{ID: "member_cluster_drift_2", ClusterID: clusterID, InstanceID: data.instances[1].ID, ServerID: data.instances[1].ServerID},
-		{ID: "member_cluster_drift_3", ClusterID: clusterID, InstanceID: data.instances[2].ID, ServerID: "srv_drifted_after_lock"},
+		{ID: "member_cluster_drift_3", ClusterID: clusterID, InstanceID: data.instances[2].ID, ServerID: data.instances[2].ServerID},
+	}
+	data.servers = map[string]store.Server{
+		data.instances[0].ServerID: {ID: data.instances[0].ServerID, Host: "10.0.0.8"},
+		data.instances[1].ServerID: {ID: data.instances[1].ServerID, Host: "10.0.0.9"},
+		// The third server row disappeared after the handler's lock-free admission snapshot.
 	}
 	id := store.NewID("backup")
 	data.backups = []store.AppBackup{{ID: id, App: "mysql", InstanceID: data.instance.ID, ServerID: data.instance.ServerID, BackupType: "logical-full", Status: "success", Path: filepath.Join(t.TempDir(), "outside.tar"), Checksum: strings.Repeat("a", 64), Size: 1, Metadata: `{"clusterId":"` + clusterID + `"}`}}
@@ -483,7 +493,7 @@ func TestBackupVerifyServiceRejectsClusterMembershipDriftUnderLock(t *testing.T)
 		t.Fatalf("error=%v, want %s", err, MySQLBackupClusterUnhealthy)
 	}
 	if data.saveCalls != 0 {
-		t.Fatalf("membership drift verification wrote %d records", data.saveCalls)
+		t.Fatalf("server drift verification wrote %d records", data.saveCalls)
 	}
 }
 
@@ -877,6 +887,7 @@ func (f *chmodFailCloseFailSecretContextFile) Close() error {
 
 type backupFakeStore struct {
 	server                  store.Server
+	servers                 map[string]store.Server
 	instance                store.AppInstance
 	instances               []store.AppInstance
 	cluster                 store.AppCluster
@@ -906,6 +917,16 @@ func newBackupFakeStore(t *testing.T) *backupFakeStore {
 }
 
 func (s *backupFakeStore) GetServer(id string, includeSecret bool) (store.Server, error) {
+	if s.servers != nil {
+		server, ok := s.servers[id]
+		if !ok {
+			return store.Server{}, errors.New("server not found")
+		}
+		return server, nil
+	}
+	if s.server.ID != id {
+		return store.Server{}, errors.New("server not found")
+	}
 	return s.server, nil
 }
 func (s *backupFakeStore) GetAppInstance(id string) (store.AppInstance, error) {

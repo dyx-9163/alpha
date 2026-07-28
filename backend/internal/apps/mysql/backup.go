@@ -49,6 +49,7 @@ type backupStore interface {
 
 type clusterBackupVerificationStore interface {
 	backupStore
+	GetServer(id string, includeSecret bool) (store.Server, error)
 	GetAppCluster(id string) (store.AppCluster, error)
 	ListAppClusterMembers(clusterID string) ([]store.AppClusterMember, error)
 	ListAppInstances() ([]store.AppInstance, error)
@@ -271,6 +272,10 @@ func validateClusterBackupVerificationOwner(data clusterBackupVerificationStore,
 		instance, ok := byID[member.InstanceID]
 		if !ok || instance.App != "mysql" || instance.ServerID != member.ServerID || instanceTopology(instance) != "innodb-cluster" || clusterIDFromInstance(instance) != clusterID {
 			return errors.New("authoritative MySQL cluster member drifted")
+		}
+		server, err := data.GetServer(member.ServerID, false)
+		if err != nil || server.ID != member.ServerID || strings.TrimSpace(server.Host) == "" {
+			return errors.New("authoritative MySQL cluster server drifted")
 		}
 		seenInstances[member.InstanceID] = struct{}{}
 		seenServers[member.ServerID] = struct{}{}
