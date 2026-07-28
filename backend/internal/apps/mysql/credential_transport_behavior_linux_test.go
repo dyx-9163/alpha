@@ -124,7 +124,7 @@ func TestCredentialTransportLinuxClusterScriptsCleanSuccessFailureAndCancellatio
 					t.Fatal("cluster executable output leaked the credential")
 				}
 				capture, err := os.ReadFile(fixture.capturePath)
-				if outcome != "cancel" && (err != nil || !bytes.Contains(capture, []byte(credentialTransportSentinel))) {
+				if outcome != "cancel" && (err != nil || !clusterCaptureHasCredential(capture, credentialTransportSentinel)) {
 					t.Fatalf("mysqlsh harness did not consume special credential context: capture=%q err=%v", capture, err)
 				}
 			})
@@ -134,7 +134,7 @@ func TestCredentialTransportLinuxClusterScriptsCleanSuccessFailureAndCancellatio
 
 func TestCredentialTransportLinuxStatusAndPrimaryExecuteContextAndLeaveNoResidue(t *testing.T) {
 	root := t.TempDir()
-	remote := &localCredentialRemote{root: root}
+	remote := &localCredentialRemote{root: root, reachedPath: filepath.Join(root, "client.reached")}
 	server := store.Server{ID: "srv-1", DeployDir: filepath.Join(root, "apps")}
 	instance := store.AppInstance{ID: "app-1", App: "mysql", Version: "8.0.36", ServerID: server.ID, Metadata: `{"port":3306}`}
 	credential := store.Credential{Kind: "mysql", Status: "active", Username: "root", Secret: map[string]string{"password": credentialTransportSentinel}}
@@ -152,6 +152,10 @@ func TestCredentialTransportLinuxStatusAndPrimaryExecuteContextAndLeaveNoResidue
 	}
 	if strings.Contains(strings.Join(remote.commands, "\n"), credentialTransportSentinel) {
 		t.Fatal("status/PRIMARY command leaked the credential")
+	}
+	reached, err := os.ReadFile(remote.reachedPath)
+	if err != nil || !strings.Contains(string(reached), `password="S3cr'et\"$\\:@{}[]!"`) {
+		t.Fatalf("status/PRIMARY client did not consume the escaped credential context: reached=%q err=%v commands=%v", reached, err, remote.commands)
 	}
 	entries, err := os.ReadDir(remote.backupRoot())
 	if err != nil || len(entries) != 0 {
@@ -381,10 +385,21 @@ set -eu
 defaults=""
 for arg in "$@"; do case "$arg" in --defaults-file=*) defaults="${arg#*=}";; esac; done
 [ -f "$defaults" ] && [ ! -L "$defaults" ] && [ "$(stat -c '%%a' "$defaults")" = 600 ]
-grep -F "$EXPECTED_SECRET" "$defaults" >/dev/null
-[ -z "${REACHED:-}" ] || : > "$REACHED"
+[ -z "${REACHED:-}" ] || cp "$defaults" "$REACHED"
 printf '%%b' %s
 `, shellQuoteForTest(output))
+}
+
+func clusterCaptureHasCredential(capture []byte, password string) bool {
+	line, _, found := bytes.Cut(capture, []byte("\n"))
+	if !found {
+		return false
+	}
+	var context mysqlJSONCredentialContext
+	if err := json.Unmarshal(line, &context); err != nil || len(context.Connections) != 1 {
+		return false
+	}
+	return context.Connections[0].Password == password
 }
 
 func shellQuoteForTest(value string) string {
