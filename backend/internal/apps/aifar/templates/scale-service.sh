@@ -8,6 +8,8 @@ REPLICAS={{ .Replicas }}
 INGRESS_NETWORK={{ quote .IngressNetwork }}
 TASK_ID={{ quote .TaskID }}
 CONTROL_PLANE_DESIRED_REPLICAS={{ quote .DesiredReplicas }}
+TARGET_DESIRED_REPLICAS={{ quote .TargetDesiredReplicas }}
+[ -n "$TARGET_DESIRED_REPLICAS" ] || TARGET_DESIRED_REPLICAS="$SERVICE_NAME=$REPLICAS"
 
 RUNTIME_DIR="$INSTALL_ROOT/runtime"
 ENV_DIR="$RUNTIME_DIR/env"
@@ -124,10 +126,21 @@ desired_replicas_from_control_plane() {
   return 1
 }
 
+desired_replicas_from_targets() {
+  wanted="$1"
+  for pair in $TARGET_DESIRED_REPLICAS; do
+    case "$pair" in
+      "$wanted="*) printf "%s" "${pair#*=}"; return 0 ;;
+    esac
+  done
+  return 1
+}
+
 desired_replicas_for_service() {
   service="$1"
-  if [ "$service" = "$SERVICE_NAME" ]; then
-    printf "%s" "$REPLICAS"
+  value="$(desired_replicas_from_targets "$service" || true)"
+  if [ -n "$value" ]; then
+    printf "%s" "$value"
     return
   fi
   value="$(desired_replicas_from_control_plane "$service" || true)"
@@ -281,6 +294,13 @@ JSON
 
 case "$REPLICAS" in ""|*[!0-9]*) fail "replicas must be a non-negative integer" ;; esac
 [ "$REPLICAS" -ge 0 ] || fail "replicas must be a non-negative integer"
+for pair in $TARGET_DESIRED_REPLICAS; do
+  target_service="${pair%%=*}"
+  target_replicas="${pair#*=}"
+  [ -n "$target_service" ] || fail "scale target service is required"
+  case "$target_replicas" in ""|*[!0-9]*) fail "replicas must be a non-negative integer" ;; esac
+  [ -f "$ENV_DIR/$target_service.env" ] || fail "AIFAR service env is missing: $target_service"
+done
 command -v docker >/dev/null 2>&1 || fail "docker command is required"
 docker info >/dev/null 2>&1 || fail "docker daemon is not available"
 command -v aifar-agent >/dev/null 2>&1 || fail "aifar-agent is required"
@@ -318,4 +338,4 @@ PROMOTING=1
 mv "$STAGED_ENV" "$CANONICAL_ENV"
 mv "$STAGED_SPEC" "$CANONICAL_SPEC"
 COMMITTED=1
-echo "AIFAR service $SERVICE_NAME desired replicas set to $REPLICAS"
+echo "AIFAR services desired replicas set: $TARGET_DESIRED_REPLICAS"

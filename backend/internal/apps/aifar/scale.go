@@ -14,13 +14,23 @@ import (
 const runtimeControlPlaneRepairCode = "AIFAR_RUNTIME_CONTROL_PLANE_REPAIR_REQUIRED"
 
 func (s Service) ScaleService(ctx context.Context, req ScaleRequest, log Logger, targetLog targetLogger) error {
-	service := strings.TrimSpace(req.ServiceName)
-	if service == "" || !isAIFARService(service) {
-		return fmt.Errorf("unsupported AIFAR service for scale: %s", service)
+	return s.ScaleServices(ctx, ScaleServicesRequest{
+		Instance:        req.Instance,
+		Server:          req.Server,
+		Language:        req.Language,
+		Actor:           req.Actor,
+		TaskID:          req.TaskID,
+		DesiredReplicas: map[string]int{req.ServiceName: req.Replicas},
+		Reason:          req.Reason,
+	}, log, targetLog)
+}
+
+func (s Service) ScaleServices(ctx context.Context, req ScaleServicesRequest, log Logger, targetLog targetLogger) error {
+	desiredTargets, services, err := normalizeScaleTargets(req.DesiredReplicas)
+	if err != nil {
+		return err
 	}
-	if req.Replicas < 0 {
-		return errors.New("AIFAR service replicas must be greater than or equal to 0")
-	}
+	primaryService := services[0]
 	target := req.Instance.ServerID
 	if target == "" {
 		target = req.Server.ID
@@ -32,16 +42,16 @@ func (s Service) ScaleService(ctx context.Context, req ScaleRequest, log Logger,
 	}
 	step := newStepRunner(logForServer, recorder, target, scaleServiceSteps(), "AIFAR scale step %d/%d started: %s", "AIFAR scale step %d/%d completed: %s", "AIFAR scale step %d/%d failed: %s: %v")
 
-	current, err := s.acquireOrchestrationLock(req.Instance.ID, "scale-service", service, req.Actor, fallbackTaskID(req.TaskID, log))
+	current, err := s.acquireOrchestrationLock(req.Instance.ID, "scale-service", strings.Join(services, ","), req.Actor, fallbackTaskID(req.TaskID, log))
 	if err != nil {
 		finishTarget(recorder, target, "failed", err.Error())
 		return err
 	}
-	defer s.releaseOrchestrationLock(req.Instance.ID, "scale-service", service)
+	defer s.releaseOrchestrationLock(req.Instance.ID, "scale-service", strings.Join(services, ","))
 
 	var metadata map[string]any
 	var installRoot string
-	var revision string
+	revisions := make(map[string]string, len(services))
 	var script string
 	var status autoscaleStatus
 	remoteCommitted := false
@@ -59,16 +69,22 @@ func (s Service) ScaleService(ctx context.Context, req ScaleRequest, log Logger,
 		if err := ensureK8sLikeMetadata(metadata, UpdateCopy{LegacyUpdateUnsupported: "legacy AIFAR orchestration model %s does not support service scale; reinstall with k8s-like orchestration first"}); err != nil {
 			return err
 		}
-		if !serviceInList(service, servicesFromMetadata(metadata)) {
-			return fmt.Errorf("AIFAR service %s is not installed", service)
+		installed := servicesFromMetadata(metadata)
+		for _, service := range services {
+			if !serviceInList(service, installed) {
+				return fmt.Errorf("AIFAR service %s is not installed", service)
+			}
 		}
 		installRoot = stringFromMetadata(metadata, "installRoot", installRootFromDeployDir(req.Server.DeployDir))
 		if strings.TrimSpace(installRoot) == "" {
 			return errors.New("AIFAR install root is missing")
 		}
-		revision = currentRevisionForService(metadata, service)
-		if revision == "" {
-			return fmt.Errorf("AIFAR service %s revision is missing", service)
+		for _, service := range services {
+			revision := currentRevisionForService(metadata, service)
+			if revision == "" {
+				return fmt.Errorf("AIFAR service %s revision is missing", service)
+			}
+			revisions[service] = revision
 		}
 		return nil
 	}); err != nil {
@@ -79,13 +95,14 @@ func (s Service) ScaleService(ctx context.Context, req ScaleRequest, log Logger,
 	if err := step(2, func() error {
 		var renderErr error
 		script, renderErr = renderScaleServiceScript(scaleServiceScriptData{
-			InstallRoot:     installRoot,
-			ServiceOrder:    strings.Join(servicesFromMetadata(metadata), " "),
-			ServiceName:     service,
-			Replicas:        req.Replicas,
-			IngressNetwork:  stringFromMetadata(metadata, "ingressNetwork", stringFromMetadata(metadata, "networkName", defaultNetworkName)),
-			TaskID:          fallbackTaskID(req.TaskID, log),
-			DesiredReplicas: replicaAssignments(desiredReplicasFromMetadata(metadata)),
+			InstallRoot:           installRoot,
+			ServiceOrder:          strings.Join(servicesFromMetadata(metadata), " "),
+			ServiceName:           primaryService,
+			Replicas:              desiredTargets[primaryService],
+			IngressNetwork:        stringFromMetadata(metadata, "ingressNetwork", stringFromMetadata(metadata, "networkName", defaultNetworkName)),
+			TaskID:                fallbackTaskID(req.TaskID, log),
+			DesiredReplicas:       replicaAssignments(desiredReplicasFromMetadata(metadata)),
+			TargetDesiredReplicas: replicaAssignments(desiredTargets),
 		})
 		return renderErr
 	}); err != nil {
@@ -103,9 +120,9 @@ func (s Service) ScaleService(ctx context.Context, req ScaleRequest, log Logger,
 		}
 		commitCtx, cancelCommit = context.WithTimeout(context.WithoutCancel(ctx), 10*time.Minute)
 		if strings.TrimSpace(req.Reason) != "" {
-			logForServer.Info("scaling AIFAR service %s to %d replicas: %s", service, req.Replicas, req.Reason)
+			logForServer.Info("scaling AIFAR services %s: %s", replicaAssignments(desiredTargets), req.Reason)
 		} else {
-			logForServer.Info("scaling AIFAR service %s to %d replicas", service, req.Replicas)
+			logForServer.Info("scaling AIFAR services %s", replicaAssignments(desiredTargets))
 		}
 		_, runErr := installerkit.Run(commitCtx, s.remote, req.Server, "sh -s <<'AIFAR_SCALE_SERVICE'\n"+script+"\nAIFAR_SCALE_SERVICE", logForServer, "AIFAR service scale failed")
 		if runErr == nil {
@@ -113,7 +130,7 @@ func (s Service) ScaleService(ctx context.Context, req ScaleRequest, log Logger,
 			return nil
 		}
 		readback, readbackErr := collectAutoscaleStatus(commitCtx, s.remote, req.Server, installRoot)
-		if readbackErr != nil || !scaleCommitObserved(readback, service, req.Replicas) {
+		if readbackErr != nil || !scaleCommitObservedAll(readback, desiredTargets) {
 			return runErr
 		}
 		if _, finalizeErr := installerkit.Run(commitCtx, s.remote, req.Server, scaleServiceFinalizeCommand(installRoot, fallbackTaskID(req.TaskID, log)), logForServer, "AIFAR service scale finalize failed"); finalizeErr != nil {
@@ -121,7 +138,7 @@ func (s Service) ScaleService(ctx context.Context, req ScaleRequest, log Logger,
 		}
 		status = readback
 		remoteCommitted = true
-		logForServer.Info("AIFAR service %s commit confirmed from agent state after remote response loss", service)
+		logForServer.Info("AIFAR services %s commit confirmed from agent state after remote response loss", strings.Join(services, ","))
 		return nil
 	}); err != nil {
 		finishTarget(recorder, target, "failed", err.Error())
@@ -140,13 +157,18 @@ func (s Service) ScaleService(ctx context.Context, req ScaleRequest, log Logger,
 		if err != nil {
 			return err
 		}
-		nextMetadata := metadataAfterServiceScale(metadataFromInstance(saved), status, service, req.Replicas, now)
+		nextMetadata := metadataFromInstance(saved)
+		for _, service := range services {
+			nextMetadata = metadataAfterServiceScale(nextMetadata, status, service, desiredTargets[service], now)
+		}
 		delete(nextMetadata, "orchestrationLock")
 		if err := saveMetadata(s.store, saved, nextMetadata); err != nil {
 			return err
 		}
-		if err := s.saveServiceScaleControlPlane(saved.ID, saved.Version, revision, service, req.Replicas, intFromMetadata(nextMetadata, "gatewayPort", defaultGatewayPort), intFromMetadata(nextMetadata, "webPort", defaultWebPort), status, now); err != nil {
-			return err
+		for _, service := range services {
+			if err := s.saveServiceScaleControlPlane(saved.ID, saved.Version, revisions[service], service, desiredTargets[service], intFromMetadata(nextMetadata, "gatewayPort", defaultGatewayPort), intFromMetadata(nextMetadata, "webPort", defaultWebPort), status, now); err != nil {
+				return err
+			}
 		}
 		if cleanup, ok := s.store.(aifarRuntimeCleanupStore); ok {
 			names := containerNamesFromAutoscaleStatus(status)
@@ -166,9 +188,36 @@ func (s Service) ScaleService(ctx context.Context, req ScaleRequest, log Logger,
 		return err
 	}
 
-	logForServer.Info("AIFAR service %s desired replicas set to %d", service, req.Replicas)
+	logForServer.Info("AIFAR services desired replicas set: %s", replicaAssignments(desiredTargets))
 	finishTarget(recorder, target, "success", "")
 	return nil
+}
+
+func normalizeScaleTargets(requested map[string]int) (map[string]int, []string, error) {
+	if len(requested) == 0 {
+		return nil, nil, errors.New("at least one AIFAR service scale target is required")
+	}
+	desired := make(map[string]int, len(requested))
+	for rawService, replicas := range requested {
+		service := cleanAIFARServiceName(rawService)
+		if service == "" || !isAIFARService(service) {
+			return nil, nil, fmt.Errorf("unsupported AIFAR service for scale: %s", strings.TrimSpace(rawService))
+		}
+		if replicas < 0 {
+			return nil, nil, errors.New("AIFAR service replicas must be greater than or equal to 0")
+		}
+		desired[service] = replicas
+	}
+	services := make([]string, 0, len(desired))
+	for _, service := range serviceOrder {
+		if _, ok := desired[service]; ok {
+			services = append(services, service)
+		}
+	}
+	if len(services) != len(desired) {
+		return nil, nil, errors.New("unsupported AIFAR service scale target")
+	}
+	return desired, services, nil
 }
 
 func scaleCommitObserved(status autoscaleStatus, service string, replicas int) bool {
@@ -180,6 +229,15 @@ func scaleCommitObserved(status autoscaleStatus, service string, replicas int) b
 		replicas = 0
 	}
 	return deployment.DesiredReplicas == replicas && deployment.CurrentReplicas == replicas && deployment.ReadyReplicas == replicas
+}
+
+func scaleCommitObservedAll(status autoscaleStatus, desired map[string]int) bool {
+	for service, replicas := range desired {
+		if !scaleCommitObserved(status, service, replicas) {
+			return false
+		}
+	}
+	return true
 }
 
 func scaleServiceFinalizeCommand(installRoot, taskID string) string {

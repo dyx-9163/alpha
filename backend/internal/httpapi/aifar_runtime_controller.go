@@ -64,6 +64,7 @@ func (a *aifarRuntimeController) mount(r chi.Router) {
 	r.Get("/containers/aifar/runtime/diagnostics/exports/{id}/download", a.requirePermission(rbac.AppsManage, a.downloadDiagnosticExport))
 	r.Delete("/containers/aifar/runtime/diagnostics/exports/{id}", a.requirePermission(rbac.AppsManage, a.deleteDiagnosticExport))
 	r.Post("/containers/aifar/services/install", a.requirePermission(rbac.AppsManage, a.installServices))
+	r.Post("/containers/aifar/services/batch-offline", a.requirePermission(rbac.AppsManage, a.batchOfflineServices))
 	r.Post("/containers/aifar/services/{service}/scale-out", a.requirePermission(rbac.AppsManage, a.scaleOut))
 	r.Post("/containers/aifar/services/{service}/scale-in", a.requirePermission(rbac.AppsManage, a.scaleIn))
 	r.Post("/containers/aifar/services/{service}/offline", a.requirePermission(rbac.AppsManage, a.offlineService))
