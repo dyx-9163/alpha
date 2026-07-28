@@ -224,6 +224,64 @@ func TestDeleteAppInstanceStoresPlanBeforeTaskRuns(t *testing.T) {
 	}
 }
 
+// Production break caught: using the single-instance app lock lets a delete
+// overlap a cluster backup/restore held on the authoritative cluster lock.
+func TestDeleteMySQLClusterInstanceUsesRawClusterMutationLock(t *testing.T) {
+	api, db, secret := newAuthzTestAPI(t)
+	api.apps = registry.New(&fakePlannedLifecycleModule{name: "mysql"})
+	server, err := db.SaveServer(store.Server{Name: "mysql-1", Host: "10.0.0.9", Username: "root", Password: "server-pass"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	instance, err := db.SaveAppInstance(store.AppInstance{App: "mysql", Version: "8.0.36", ServerID: server.ID, Status: "installed", Topology: "innodb-cluster", Metadata: `{"clusterId":"cluster_1234567890abcdef12345678"}`})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ownerTask, err := db.CreateTask(store.Task{Type: "apps.mysql.backup", Target: instance.ID, Status: "running", CreatedBy: "owner"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.AcquireOperationLock(store.OperationLock{Scope: "app-cluster", ResourceID: "cluster_1234567890abcdef12345678", Operation: operationLockMutation, OwnerTaskID: ownerTask.ID, Owner: "owner", ExpiresAt: time.Now().Add(time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/v2/apps/instances/"+instance.ID+"/delete", strings.NewReader(`{"serverPassword":"server-pass"}`))
+	req.Header.Set("Authorization", "Bearer "+issueTestToken(t, db, secret, "owner", "owner"))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	api.Router().ServeHTTP(rec, req)
+	if rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), `"code":"OPERATION_LOCKED"`) {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+// Production break caught: a cluster instance without a raw clusterId must
+// not fall back to an unlocked single-instance deletion.
+func TestDeleteMySQLClusterInstanceRejectsMissingRawClusterIDBeforeTask(t *testing.T) {
+	api, db, secret := newAuthzTestAPI(t)
+	module := &fakePlannedLifecycleModule{name: "mysql"}
+	api.apps = registry.New(module)
+	server, err := db.SaveServer(store.Server{Name: "mysql-1", Host: "10.0.0.9", Username: "root", Password: "server-pass"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	instance, err := db.SaveAppInstance(store.AppInstance{App: "mysql", Version: "8.0.36", ServerID: server.ID, Status: "installed", Topology: "innodb-cluster", Metadata: `{}`})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/v2/apps/instances/"+instance.ID+"/delete", strings.NewReader(`{"serverPassword":"server-pass"}`))
+	req.Header.Set("Authorization", "Bearer "+issueTestToken(t, db, secret, "owner", "owner"))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	api.Router().ServeHTTP(rec, req)
+	if rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), `"code":"MYSQL_BACKUP_CLUSTER_UNHEALTHY"`) {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	tasks, err := db.ListTasks()
+	if err != nil || len(tasks) != 0 || module.deleteCalls != 0 {
+		t.Fatalf("invalid cluster deletion created work: tasks=%+v deleteCalls=%d err=%v", tasks, module.deleteCalls, err)
+	}
+}
+
 func TestCheckAppInstanceStoresPlanBeforeTaskRuns(t *testing.T) {
 	api, db, secret := newAuthzTestAPI(t)
 	module := &fakePlannedLifecycleModule{name: "demo"}

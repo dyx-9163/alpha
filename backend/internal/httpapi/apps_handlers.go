@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"aifar-deployment/backend/internal/appcatalog"
+	mysqlapp "aifar-deployment/backend/internal/apps/mysql"
 	"aifar-deployment/backend/internal/apps/registry"
 	"aifar-deployment/backend/internal/i18n"
 	"aifar-deployment/backend/internal/rbac"
@@ -86,6 +87,11 @@ func (a *API) deleteAppInstance(w http.ResponseWriter, r *http.Request) {
 		respond(w, nil, err)
 		return
 	}
+	lockSpecs, lockSpecErr := validatedAppMutationOperationLockSpecs("delete", []store.AppInstance{instance})
+	if lockSpecErr != nil {
+		writeError(w, http.StatusConflict, mysqlapp.MySQLBackupClusterUnhealthy, i18n.MySQLBackupErrorText(lang, mysqlapp.MySQLBackupClusterUnhealthy), map[string]any{"instanceId": instance.ID})
+		return
+	}
 	if !a.ensureCompleteDeleteSelection(w, lang, []store.AppInstance{instance}) {
 		return
 	}
@@ -153,7 +159,7 @@ func (a *API) deleteAppInstance(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "DELETE_PLAN_STORE_FAILED", err.Error(), map[string]any{"app": instance.App, "instanceId": instance.ID})
 		return
 	}
-	locks, ok := a.acquireTaskOperationLocks(w, lang, task, appInstanceOperationLockSpecs("delete", []store.AppInstance{instance}))
+	locks, ok := a.acquireTaskOperationLocks(w, lang, task, lockSpecs)
 	if !ok {
 		return
 	}

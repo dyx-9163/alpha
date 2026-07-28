@@ -69,7 +69,15 @@ func mysqlClusterIDFromBackup(backup store.AppBackup) string {
 }
 
 func mysqlClusterID(instance store.AppInstance) string {
-	return strings.TrimSpace(appInstanceMetadataValue(instance, "clusterId"))
+	metadata := map[string]json.RawMessage{}
+	if json.Unmarshal([]byte(instance.Metadata), &metadata) != nil {
+		return ""
+	}
+	var clusterID string
+	if json.Unmarshal(metadata["clusterId"], &clusterID) != nil {
+		return ""
+	}
+	return strings.TrimSpace(clusterID)
 }
 
 func (a *API) startMySQLRestore(w http.ResponseWriter, r *http.Request) {

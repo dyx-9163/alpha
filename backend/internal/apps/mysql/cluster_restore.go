@@ -43,16 +43,11 @@ type clusterMemberNode struct {
 	uuid     string
 }
 
-var clusterBackupStepNames = []string{
-	"load-cluster", "acquire-cluster-lock", "resolve-members", "inspect-cluster", "resolve-primary",
-	"backup-primary", "build-manifest", "record-backup", "apply-retention", "cleanup-workdir",
-}
-
 func (m Module) planInnoDBClusterBackup(ctx context.Context, req registry.BackupRequest) ([]registry.InstallStepPlan, error) {
 	if err := validateClusterRequest(req.Instance, req.Instances, req.Servers); err != nil {
 		return nil, err
 	}
-	return clusterBackupPlan(req.Instances, clusterBackupStepNames), nil
+	return clusterBackupPlan(req.Instances, standaloneBackupStepNames), nil
 }
 
 func (m Module) planHealthyClusterRestore(ctx context.Context, req registry.RestoreRequest) ([]registry.InstallStepPlan, error) {
@@ -332,12 +327,16 @@ func (m Module) restoreHealthyInnoDBCluster(ctx context.Context, req registry.Re
 	return m.service.restoreLogical(ctx, req, run, &cluster)
 }
 
-func (s Service) verifyClusterRecovered(ctx context.Context, cluster *resolvedInnoDBCluster, taskID string) error {
+func (s Service) verifyClusterRecovered(ctx context.Context, cluster *resolvedInnoDBCluster, schemas []string, taskID string) error {
 	if err := s.inspectInnoDBClusterRuntime(ctx, cluster, taskID); err != nil {
 		return err
 	}
 	if len(cluster.routers) == 0 {
 		return nil
+	}
+	schema, ok := routerVerificationSchema(schemas)
+	if !ok {
+		return mysqlOperationError(MySQLRestoreIncomplete)
 	}
 	data, ok := s.store.(backupStore)
 	if !ok {
@@ -365,7 +364,7 @@ func (s Service) verifyClusterRecovered(ctx context.Context, cluster *resolvedIn
 			return mysqlOperationError(MySQLRestoreIncomplete)
 		}
 		_ = os.Remove(secret)
-		result, verifyErr := s.remote.Run(ctx, server, routerReadWriteVerificationCommand(work, routerPortForEndpoint(router.Endpoint)))
+		result, verifyErr := s.remote.Run(ctx, server, routerReadWriteVerificationCommand(work, routerPortForEndpoint(router.Endpoint), schema))
 		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 		_, cleanupErr := s.remote.Run(cleanupCtx, server, cleanupBackupCommand(work))
 		cancel()
@@ -388,8 +387,17 @@ func routerPortForEndpoint(endpoint string) int {
 	return value
 }
 
-func routerReadWriteVerificationCommand(work string, port int) string {
+func routerVerificationSchema(schemas []string) (string, bool) {
+	for _, schema := range schemas {
+		if strictSchemaName.MatchString(schema) && !isSystemSchema(schema) {
+			return schema, true
+		}
+	}
+	return "", false
+}
+
+func routerReadWriteVerificationCommand(work string, port int, schema string) string {
 	mysqlsh := path.Join(mysqlInstallRoot, "mysql-shell", "bin", "mysqlsh")
-	query := "CREATE TEMPORARY TABLE aifar_router_verify(v INT NOT NULL); INSERT INTO aifar_router_verify VALUES (1); SELECT '__AIFAR_ROUTER_WRITE__',COUNT(*) FROM aifar_router_verify; SELECT '__AIFAR_ROUTER_READ__',v FROM aifar_router_verify"
+	query := "USE `" + schema + "`; CREATE TEMPORARY TABLE aifar_router_verify(v INT NOT NULL); INSERT INTO aifar_router_verify VALUES (1); SELECT '__AIFAR_ROUTER_WRITE__',COUNT(*) FROM aifar_router_verify; SELECT '__AIFAR_ROUTER_READ__',v FROM aifar_router_verify"
 	return "set -eu; test -x " + installerkit.ShellQuote(mysqlsh) + "; " + installerkit.ShellQuote(mysqlsh) + " --defaults-file=" + installerkit.ShellQuote(path.Join(work, "secret-context.cnf")) + " --sql --raw --skip-column-names --host=127.0.0.1 --port=" + strconv.Itoa(port) + " --execute " + installerkit.ShellQuote(query)
 }

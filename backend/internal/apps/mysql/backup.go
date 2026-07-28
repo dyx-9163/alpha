@@ -32,6 +32,12 @@ const (
 	maxBackupRetentionCount = 1000
 )
 
+var standaloneBackupStepNames = []string{
+	"load-instance", "acquire-instance-lock", "resolve-credential", "inspect-mysql", "check-backup-space",
+	"prepare-workdir", "dry-run-dump", "dump-instance", "build-manifest", "package-backup", "transfer-backup",
+	"verify-checksum", "record-backup", "apply-retention", "cleanup-workdir",
+}
+
 type backupStore interface {
 	GetBoundCredential(appInstanceID, purpose string, includeSecret bool) (store.Credential, error)
 	GetAppInstance(id string) (store.AppInstance, error)
@@ -880,11 +886,10 @@ func (s Service) retainUnavailableDownloaderFailure(req registry.BackupRequest, 
 }
 
 func standaloneBackupStepDefinitions(lang string) []installflow.Step {
-	names := []string{"load-instance", "acquire-instance-lock", "resolve-credential", "inspect-mysql", "check-backup-space", "prepare-workdir", "dry-run-dump", "dump-instance", "build-manifest", "package-backup", "transfer-backup", "verify-checksum", "record-backup", "apply-retention", "cleanup-workdir"}
 	copy := BackupCopyFor(lang)
-	out := make([]installflow.Step, len(names))
-	for index := range names {
-		out[index] = installflow.Step{Name: names[index], Title: copy.StepTitles[names[index]]}
+	out := make([]installflow.Step, len(standaloneBackupStepNames))
+	for index := range standaloneBackupStepNames {
+		out[index] = installflow.Step{Name: standaloneBackupStepNames[index], Title: copy.StepTitles[standaloneBackupStepNames[index]]}
 	}
 	return out
 }

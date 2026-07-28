@@ -23,6 +23,8 @@ type operationLockSpec struct {
 	Metadata   string
 }
 
+var errMySQLClusterLockIdentity = errors.New("MySQL cluster mutation requires a raw clusterId")
+
 func (a *API) acquireTaskOperationLocks(w http.ResponseWriter, lang string, task store.Task, specs []operationLockSpec) ([]store.OperationLock, bool) {
 	locks := make([]store.OperationLock, 0, len(specs))
 	seen := map[string]bool{}
@@ -159,6 +161,19 @@ func appMutationOperationLockSpecs(action string, instances []store.AppInstance)
 		specs = append(specs, appInstanceOperationLockSpecs(action, []store.AppInstance{instance})...)
 	}
 	return specs
+}
+
+// validatedAppMutationOperationLockSpecs refuses an InnoDB Cluster mutation
+// when the persisted instance metadata does not contain one raw string
+// clusterId. Falling back to an instance lock would break cross-member lock
+// closure for destructive operations.
+func validatedAppMutationOperationLockSpecs(action string, instances []store.AppInstance) ([]operationLockSpec, error) {
+	for _, instance := range instances {
+		if strings.EqualFold(strings.TrimSpace(instance.App), "mysql") && strings.EqualFold(strings.TrimSpace(instance.Topology), "innodb-cluster") && mysqlClusterID(instance) == "" {
+			return nil, errMySQLClusterLockIdentity
+		}
+	}
+	return appMutationOperationLockSpecs(action, instances), nil
 }
 
 func operationLockMetadata(fields map[string]any) string {

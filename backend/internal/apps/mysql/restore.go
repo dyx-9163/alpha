@@ -455,7 +455,7 @@ func (s Service) restoreLogical(ctx context.Context, req registry.RestoreRequest
 			return err
 		}
 		if cluster != nil {
-			return s.verifyClusterRecovered(ctx, cluster, run.TaskID)
+			return s.verifyClusterRecovered(ctx, cluster, manifest.Schemas, run.TaskID)
 		}
 		return nil
 	}); err != nil {

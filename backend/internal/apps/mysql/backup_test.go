@@ -1041,6 +1041,9 @@ func (backupRemoteWithoutDownloader) UploadFile(context.Context, store.Server, s
 type backupRecorder struct {
 	startedSteps, messages []string
 	targetError            string
+	targetStarts           []string
+	targetFinishes         []string
+	stepStatus             map[string]string
 }
 
 func (r *backupRecorder) Info(format string, args ...any) {
@@ -1049,12 +1052,20 @@ func (r *backupRecorder) Info(format string, args ...any) {
 func (r *backupRecorder) Error(format string, args ...any) {
 	r.messages = append(r.messages, fmt.Sprintf(format, args...))
 }
-func (r *backupRecorder) StartTarget(string)                              {}
-func (r *backupRecorder) FinishTarget(_ string, _ string, errText string) { r.targetError = errText }
+func (r *backupRecorder) StartTarget(target string) { r.targetStarts = append(r.targetStarts, target) }
+func (r *backupRecorder) FinishTarget(_ string, status, errText string) {
+	r.targetError = errText
+	r.targetFinishes = append(r.targetFinishes, status)
+}
 func (r *backupRecorder) StartStep(_ string, name, _ string, _ int) {
 	r.startedSteps = append(r.startedSteps, name)
 }
-func (r *backupRecorder) FinishStep(string, string, string, string) {}
+func (r *backupRecorder) FinishStep(_ string, name, status, _ string) {
+	if r.stepStatus == nil {
+		r.stepStatus = map[string]string{}
+	}
+	r.stepStatus[name] = status
+}
 
 func newStandaloneBackupModule(t *testing.T) (Module, *backupFakeStore, *backupFakeRemote) {
 	t.Helper()

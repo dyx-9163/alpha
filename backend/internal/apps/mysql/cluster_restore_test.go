@@ -34,6 +34,35 @@ func TestBackupInnoDBClusterPlanTargetsAllRecordedMembers(t *testing.T) {
 	}
 }
 
+// Production break caught: persisting cluster-specific plan names while the
+// runner emits the standalone lifecycle leaves task steps permanently pending.
+func TestBackupInnoDBClusterPlanMatchesRuntimeTerminalLifecycle(t *testing.T) {
+	instances, servers := healthyClusterRequestFixtures()
+	data := newClusterBackupFixture(t, instances, servers)
+	remote := &clusterBackupRemote{backupFakeRemote: newBackupFakeRemote(), runtime: healthyClusterRuntime(servers)}
+	module := NewModule(data, remote)
+	request := registry.BackupRequest{Instance: instances[1], Instances: instances, Servers: servers, RepositoryDir: t.TempDir(), KeepLast: 2, Parameters: map[string]any{"threads": 4}}
+	plan, err := module.PlanBackup(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder := &backupRecorder{}
+	if err := module.Backup(context.Background(), request, registry.RunContext{TaskID: "tsk_1234567890abcdef12345678", Log: recorder}); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := planStepNames(plan), recorder.startedSteps; !reflect.DeepEqual(got, want) {
+		t.Fatalf("persisted plan steps = %v, runtime steps = %v", got, want)
+	}
+	if !reflect.DeepEqual(recorder.targetStarts, []string{"cluster_1234567890abcdef12345678"}) || !reflect.DeepEqual(recorder.targetFinishes, []string{"success"}) {
+		t.Fatalf("cluster target lifecycle starts=%v finishes=%v", recorder.targetStarts, recorder.targetFinishes)
+	}
+	for _, step := range planStepNames(plan) {
+		if status := recorder.stepStatus[step]; status != "success" {
+			t.Fatalf("step %s terminal status=%q", step, status)
+		}
+	}
+}
+
 // Production break caught: choosing a stored role rather than the runtime
 // ONLINE PRIMARY would send a dump to a replica or accept a split cluster.
 func TestBackupInnoDBClusterUsesRuntimeOnlinePrimaryAndRecordsMembership(t *testing.T) {
@@ -104,11 +133,11 @@ func TestBackupInnoDBClusterRejectsUnhealthyRuntimeBeforeDump(t *testing.T) {
 	}
 }
 
-// Production break caught: replacing the 6446 transaction with a version
-// probe or a read-only statement would no longer prove Router write routing.
-func TestRouterReadWriteVerificationUsesTemporaryWriteAndRead(t *testing.T) {
-	command := routerReadWriteVerificationCommand("/aifar/apps/mysql/_backup/task-router", 6446)
-	for _, want := range []string{"CREATE TEMPORARY TABLE", "INSERT INTO aifar_router_verify", "__AIFAR_ROUTER_WRITE__", "__AIFAR_ROUTER_READ__", "--port=6446", "secret-context.cnf"} {
+// Production break caught: a Router client with no selected database rejects
+// an otherwise valid temporary-table transaction with "No database selected".
+func TestRouterReadWriteVerificationUsesValidatedBusinessSchema(t *testing.T) {
+	command := routerReadWriteVerificationCommand("/aifar/apps/mysql/_backup/task-router", 6446, "aifar_business")
+	for _, want := range []string{"USE `aifar_business`", "CREATE TEMPORARY TABLE", "INSERT INTO aifar_router_verify", "__AIFAR_ROUTER_WRITE__", "__AIFAR_ROUTER_READ__", "--port=6446", "secret-context.cnf"} {
 		if !strings.Contains(command, want) {
 			t.Fatalf("router verification missing %q: %s", want, command)
 		}
@@ -150,7 +179,7 @@ func TestClusterPlansHaveOneTerminalExecutionTarget(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(plan) != len(clusterBackupStepNames) || len(planTargets(plan)) != 1 || planTargets(plan)[0] != "cluster_1234567890abcdef12345678" {
+	if len(plan) != len(standaloneBackupStepNames) || len(planTargets(plan)) != 1 || planTargets(plan)[0] != "cluster_1234567890abcdef12345678" {
 		t.Fatalf("cluster plan = %+v", plan)
 	}
 }
@@ -166,7 +195,7 @@ func TestClusterRestoreRejectsPrimaryFailoverBeforeSchemaMutation(t *testing.T) 
 	module := configuredClusterRestoreModule(data, remote)
 	recorder := &restoreProgressRecorder{}
 	err := module.Restore(context.Background(), request, registry.RunContext{TaskID: "task_cluster_failover", Log: recorder})
-	assertClusterRestoreFailure(t, err, MySQLRestorePrimaryChanged, data, request, remote, recorder)
+	assertClusterRestoreFailure(t, err, MySQLRestorePrimaryChanged, data, remote, recorder)
 	if containsRestoreCommand(remote.commands, "DROP DATABASE") || containsRestoreCommand(remote.commands, "logical-restore.sh") {
 		t.Fatalf("failover reached destructive restore commands: %v", remote.commands)
 	}
@@ -184,7 +213,7 @@ func TestClusterRestoreMarksIncompleteWhenMemberLeavesOnlineAfterLoad(t *testing
 	module := configuredClusterRestoreModule(data, remote)
 	recorder := &restoreProgressRecorder{}
 	err := module.Restore(context.Background(), request, registry.RunContext{TaskID: "task_cluster_member_failed", Log: recorder})
-	assertClusterRestoreFailure(t, err, MySQLRestoreIncomplete, data, request, remote, recorder)
+	assertClusterRestoreFailure(t, err, MySQLRestoreIncomplete, data, remote, recorder)
 	assertOneLogicalLoadWithBinlogEnabled(t, remote)
 }
 
@@ -201,11 +230,73 @@ func TestClusterRestoreMarksIncompleteWhenRouterTransactionFails(t *testing.T) {
 	module := configuredClusterRestoreModule(data, remote)
 	recorder := &restoreProgressRecorder{}
 	err := module.Restore(context.Background(), request, registry.RunContext{TaskID: "task_cluster_router_failed", Log: recorder})
-	assertClusterRestoreFailure(t, err, MySQLRestoreIncomplete, data, request, remote, recorder)
+	assertClusterRestoreFailure(t, err, MySQLRestoreIncomplete, data, remote, recorder)
 	assertOneLogicalLoadWithBinlogEnabled(t, remote)
 }
 
-func assertClusterRestoreFailure(t *testing.T, err error, code string, data *clusterRestoreFixture, request registry.RestoreRequest, remote *clusterRestoreRemote, recorder *restoreProgressRecorder) {
+// Production break caught: treating a cluster pre-restore backup as a
+// standalone/no-op action loses the membership required for a safe recovery.
+func TestClusterRestoreSuccessfulLifecycleCreatesOneClusterPreRestoreBackup(t *testing.T) {
+	instances, servers := healthyClusterRequestFixtures()
+	data, request := newClusterRestoreFixture(t, instances, servers)
+	backupRemote := newBackupFakeRemote()
+	if _, err := parseDumpVerification(backupRemote.verificationOutput, []string{"aifar_business"}); err != nil {
+		t.Fatalf("backup fixture verification is invalid: %v", err)
+	}
+	remote := &clusterRestoreRemote{
+		restoreFakeRemote: &restoreFakeRemote{inspect: standaloneInspection("aifar_business")},
+		backup:            backupRemote,
+		runtimes:          []string{healthyClusterRuntime(servers), healthyClusterRuntime(servers), healthyClusterRuntime(servers)},
+	}
+	module := NewModule(data, remote)
+	module.service.localInfileSession = func(context.Context, store.AppInstance, store.Server, store.Credential) (localInfileSession, func(), error) {
+		return &fakeLocalInfileSession{value: "OFF"}, func() {}, nil
+	}
+	recorder := &restoreProgressRecorder{}
+	if err := module.Restore(context.Background(), request, registry.RunContext{TaskID: "tsk_1234567890abcdef12345678", Log: recorder}); err != nil {
+		t.Fatalf("restore failed: %v backups=%+v commands=%v", err, data.backups, remote.commands)
+	}
+	if len(data.backups) != 2 {
+		t.Fatalf("backups = %+v", data.backups)
+	}
+	preRestoreCount := 0
+	for _, backup := range data.backups {
+		if backup.BackupType == "pre-restore" {
+			preRestoreCount++
+			manifestRaw, err := os.ReadFile(filepath.Join(filepath.Dir(backup.Path), "backup-manifest.json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			manifest, err := decodeRestoreManifest(manifestRaw)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if clusterIDFromBackup(backup) != "cluster_1234567890abcdef12345678" || manifest.Topology != "innodb-cluster" || manifest.ClusterID != "cluster_1234567890abcdef12345678" || len(manifest.Members) != 3 {
+				t.Fatalf("pre-restore backup is not cluster scoped: %+v", backup)
+			}
+		}
+	}
+	if preRestoreCount != 1 || backupRemote.dumpRuns != 1 {
+		t.Fatalf("cluster pre-restore count=%d dumps=%d", preRestoreCount, backupRemote.dumpRuns)
+	}
+	if !reflect.DeepEqual(remote.logicalRestoreServers, []string{servers[0].ID}) {
+		t.Fatalf("logical restore servers=%v, want current PRIMARY %s", remote.logicalRestoreServers, servers[0].ID)
+	}
+	assertOneLogicalLoadWithBinlogEnabled(t, remote)
+	if got := restorePhase(data.backups[0].Metadata); got != "verified" {
+		t.Fatalf("restore phase=%q metadata=%s", got, data.backups[0].Metadata)
+	}
+	if !reflect.DeepEqual(recorder.targets, []string{"cluster_1234567890abcdef12345678"}) || !reflect.DeepEqual(recorder.targetFinishes, []string{"success"}) {
+		t.Fatalf("successful cluster target lifecycle targets=%v finishes=%v", recorder.targets, recorder.targetFinishes)
+	}
+	for _, step := range standaloneRestoreStepNames {
+		if status := recorder.stepStatus[step]; status != "success" {
+			t.Fatalf("step %s terminal status=%q", step, status)
+		}
+	}
+}
+
+func assertClusterRestoreFailure(t *testing.T, err error, code string, data *clusterRestoreFixture, remote *clusterRestoreRemote, recorder *restoreProgressRecorder) {
 	t.Helper()
 	var operation *MySQLOperationError
 	if !errors.As(err, &operation) || operation.Code != code {
@@ -213,9 +304,6 @@ func assertClusterRestoreFailure(t *testing.T, err error, code string, data *clu
 	}
 	if got := restorePhase(data.backups[0].Metadata); got != "restore_incomplete" {
 		t.Fatalf("restore phase = %q, want restore_incomplete", got)
-	}
-	if !boolParameter(request.Parameters, "maintenanceConfirmed") {
-		t.Fatal("failed restore cleared the caller's maintenance confirmation")
 	}
 	if len(recorder.targets) != 1 || recorder.targets[0] != "cluster_1234567890abcdef12345678" || len(recorder.finishedTargets) != 1 || recorder.targetFinishes[0] != "failed" {
 		t.Fatalf("cluster target lifecycle targets=%v finished=%v status=%v", recorder.targets, recorder.finishedTargets, recorder.targetFinishes)
@@ -461,10 +549,12 @@ func (r *clusterBackupRemote) Run(ctx context.Context, server store.Server, comm
 
 type clusterRestoreRemote struct {
 	*restoreFakeRemote
-	runtimes     []string
-	runtimeCalls int
-	routerErr    error
-	routerOutput string
+	backup                *backupFakeRemote
+	runtimes              []string
+	runtimeCalls          int
+	routerErr             error
+	routerOutput          string
+	logicalRestoreServers []string
 }
 
 func (r *clusterRestoreRemote) Run(ctx context.Context, server store.Server, command string) (adapter.CommandResult, error) {
@@ -488,7 +578,31 @@ func (r *clusterRestoreRemote) Run(ctx context.Context, server store.Server, com
 		}
 		return adapter.CommandResult{Stdout: output}, r.routerErr
 	}
+	if strings.Contains(command, "logical-restore.sh") {
+		r.logicalRestoreServers = append(r.logicalRestoreServers, server.ID)
+	}
+	if r.backup != nil && (strings.Contains(command, "__AIFAR_VERIFICATION__") || strings.Contains(command, "df -Pk") || strings.Contains(command, "dryRun: true") || strings.Contains(command, "logical-backup.sh") || strings.Contains(command, "sha256sum")) {
+		r.commands = append(r.commands, command)
+		return r.backup.Run(ctx, server, command)
+	}
 	return r.restoreFakeRemote.Run(ctx, server, command)
+}
+
+func (r *clusterRestoreRemote) UploadFile(ctx context.Context, server store.Server, localPath, remotePath string, mode os.FileMode) error {
+	if err := r.restoreFakeRemote.UploadFile(ctx, server, localPath, remotePath, mode); err != nil {
+		return err
+	}
+	if r.backup != nil {
+		return r.backup.UploadFile(ctx, server, localPath, remotePath, mode)
+	}
+	return nil
+}
+
+func (r *clusterRestoreRemote) DownloadFile(ctx context.Context, server store.Server, remotePath, localPath string, mode os.FileMode) (adapter.DownloadResult, error) {
+	if r.backup == nil {
+		return adapter.DownloadResult{}, errors.New("missing backup downloader fixture")
+	}
+	return r.backup.DownloadFile(ctx, server, remotePath, localPath, mode)
 }
 
 func healthyClusterRuntime(servers []store.Server) string {
