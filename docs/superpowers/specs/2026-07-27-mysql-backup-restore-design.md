@@ -554,7 +554,9 @@ MYSQL_REBUILD_ROUTER_FAILED
 - 所有远端路径必须位于计算得到的 MySQL workdir、backup workdir 或 restore workdir 中，并拒绝符号链接和路径逃逸。
 - 归档解包前验证成员路径、数量、总大小和文件类型，拒绝绝对路径、`..`、符号链接、设备文件和超额展开。
 - manifest 和 checksums 必须在受控归档内且互相一致。
-- 密码只来自加密凭据；secret context 为 0600，使用后尽力安全清理。
+- 密码只来自安装请求的瞬时输入或加密凭据；任何非测试 MySQL 安装、集群 bootstrap/start、状态检查、PRIMARY 检测、backup、restore、maintenance 和 reconciliation 路径都不得把密码值渲染进生成脚本、远程命令字符串、进程 argv、任务日志、错误/details、audit、manifest 或 instance metadata。安装后 check/start 必须解析唯一、启用、绑定 `purpose=admin` 且用户名/密码完整的凭据，不得回退 `AIFAR_DEFAULT_PASSWORD`。
+- secret context 在本地和远端均固定为 0600 普通文件，远端位于任务专属受控 workdir，调用脚本只接收受控文件路径并在读取前验证非符号链接、owner 和 mode。安装阶段尚无绑定凭据时，由瞬时请求创建独立 context；集群 start 必须在锁内为三个权威成员分别解析绑定凭据。MySQL Shell 固定 JS 只从 context 读取连接数据，不把 secret 写入 JS、shell template 或 URI 文本。
+- 本地 context、远端 context、安装期 `secure-root.sql` 和临时 JS 必须在成功、失败和取消路径独立清理；清理使用不继承已取消 task context 的有界 context。任何 state-changing 操作的 secret 清理失败都使任务失败并返回通用脱敏错误，不能报告成功。日志层对已知 secret 继续做防御性脱敏，但不能以脱敏替代安全传递。
 - 不允许 API 接收自由 shell、自由远端路径或任意 schema drop SQL。
 - restore 的 schema 集合只能来自已验证 manifest 与服务端 allowlist 的交集。
 - backup、restore、delete、verify 和 disaster rebuild 全部写审计。
@@ -568,10 +570,10 @@ MYSQL_REBUILD_ROUTER_FAILED
 - Adapter：SFTP Download 流式传输、partial、checksum、取消和路径错误。
 - MySQL module：standalone/cluster PlanBackup、PlanRestore、PRIMARY 选择、集群展开和锁冲突；marker 严格解析、preflight 失败不设置、第一条 mutation 前设置、失败保留、验证成功后清除、普通生命周期两层门禁、owner 调和和 owner 清除健康检查。
 - Manifest v2：使用真实 MySQL Shell 8.0.36 完成标记和 metadata 目录图构建完整文件/schema/base table 期望；覆盖 inventory 摘要、缺失/悬空/重复 metadata、v1 只读兼容和 destructive restore 拒绝。
-- 脚本：dump/load 选项、账号排除、metadata 排除、`local_infile` finally 恢复、日志脱敏。
+- 脚本：dump/load 选项、账号排除、metadata 排除、`local_infile` finally 恢复；安装/bootstrap/start/status/PRIMARY 命令和渲染脚本不含 secret；0600 context 与 `secure-root.sql`/JS 成功、失败、取消、cleanup-error residue 覆盖；日志/错误脱敏。
 - HTTP：权限、task id、target、step、audit、错误码、危险确认、非法 manifest、维护门禁创建前拒绝、owner-only reconciliation task 和 owner-only clear task。
 - 前端：按钮能力、备份列表、恢复确认、灾难向导、调和动作、任务追踪和 zh/en。
-- 安全：归档 traversal、symlink、超额展开、checksum 篡改、secret 泄露扫描。
+- 安全：归档 traversal、symlink、超额展开、checksum 篡改；sentinel 密码不得出现在 command/script/log/error/audit/metadata；安装后不得使用默认密码；本地和远端 context 权限、owner、symlink、清理失败与无残留测试。
 
 ### 17.2 真实环境验收
 
@@ -586,6 +588,7 @@ MYSQL_REBUILD_ROUTER_FAILED
 - Router 6446 恢复真实读写。
 - 目标仍可达的成功、失败和取消场景恢复 `local_infile` 原值；不可达场景产生门禁标记，并在目标恢复后通过独立 owner 调和任务完成恢复与复验。若维护 marker 同时存在，证明调和只清自己的 marker，随后才允许另行执行维护清除。
 - task、step、target、log、audit、`app_backups` 完整且无 secret。
+- 安装、集群 bootstrap/start、状态检查和 PRIMARY 检测使用受控 0600 context；采集远端 argv、脚本/临时目录、task log 和错误证据，确认无密码值且任务结束无 secret、SQL 或 JS 残留。验证凭据轮换后只使用当前绑定 admin，不使用默认密码。
 
 ### 17.3 本地门禁
 

@@ -544,6 +544,15 @@ export interface MySQLBackupRecord {
 - [ ] Add RED then GREEN frontend tests and controls: show valid marker details, submit the exact owner-only action for the affected instance, track the returned task, keep maintenance clear disabled until a fresh state read confirms reconciliation disappeared, and state that reconciliation neither validates data nor clears maintenance.
 - [ ] Run focused backend tests, `pnpm test:web -- mysqlBackup`, and `pnpm web:build`; commit the remediation separately before final documentation and full gates.
 
+**Credential transport hardening before documentation convergence:**
+
+- [ ] Add RED install/bootstrap/start/status/PRIMARY tests with a unique sentinel password proving the value appears in none of: rendered executable scripts, remote command strings/argv, task logs, returned errors/details, audit, instance metadata, or retained workdir files. Cover special characters without weakening existing password validation.
+- [ ] Add RED tests proving standalone install uploads a task-scoped 0600 credential context rather than a secret-bearing executable script; the fixed installer validates path ownership/type/mode, unlinks or trap-cleans the context, creates `secure-root.sql` as 0600, and removes context/SQL on success, failure, cancellation, and independent cleanup failures. Local and remote cleanup must both be attempted and raw errors/paths remain redacted.
+- [ ] Add RED cluster bootstrap/start tests proving fixed shell/JS templates contain no password value or password-bearing URI. Bootstrap reads only the install request's 0600 context. Post-install start resolves complete active bound `purpose=admin` credentials for all three authoritative members under the raw cluster mutate lock, writes a task-scoped 0600 per-node context, and fails closed on missing, duplicate, disabled, incomplete, or drifted bindings without falling back to `AIFAR_DEFAULT_PASSWORD`.
+- [ ] Add RED check/PRIMARY tests proving status probes resolve the current bound admin credential, use a 0600 client option context by path, never place `MYSQL_PWD` or a password literal in the remote command, and independently clean local/remote context with generic failure reporting. Preserve non-secret systemd/port observation only where it does not create a false authenticated-health result.
+- [ ] Implement shared bounded credential-context creation/upload/verification/cleanup and defense-in-depth known-secret redaction. Do not log raw MySQL Shell/AdminAPI output until it has been sanitized. A state-changing operation with context/SQL/JS cleanup failure must fail and must not publish success.
+- [ ] Run focused MySQL installer/service/security tests plus `pnpm test`; rerun the exact final secret scan and inspect every remaining match. Commit this hardening separately as `fix: protect MySQL credential transport` before final documentation and release gates.
+
 **Runbook contents:**
 
 - Configuration and mount ownership for `AIFAR_MYSQL_BACKUP_DIR`.
