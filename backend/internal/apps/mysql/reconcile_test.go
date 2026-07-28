@@ -4,14 +4,223 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"aifar-deployment/backend/internal/adapter"
+	"aifar-deployment/backend/internal/apps/registry"
 	"aifar-deployment/backend/internal/store"
 )
+
+type credentialRequiredReconcileRemote struct {
+	password   string
+	cleanupErr error
+	commands   []string
+	uploads    int
+}
+
+func (r *credentialRequiredReconcileRemote) Run(_ context.Context, server store.Server, command string) (adapter.CommandResult, error) {
+	r.commands = append(r.commands, command)
+	if server.Password != r.password && strings.TrimSpace(server.PrivateKey) == "" {
+		return adapter.CommandResult{}, errors.New("saved SSH credential missing")
+	}
+	if strings.Contains(command, r.password) {
+		return adapter.CommandResult{}, errors.New("SSH credential leaked into command")
+	}
+	if strings.Contains(command, "rm -rf") && r.cleanupErr != nil {
+		return adapter.CommandResult{}, r.cleanupErr
+	}
+	if strings.Contains(command, "SELECT @@GLOBAL.local_infile") {
+		return adapter.CommandResult{Stdout: "OFF\n"}, nil
+	}
+	return adapter.CommandResult{}, nil
+}
+
+func (r *credentialRequiredReconcileRemote) UploadFile(_ context.Context, server store.Server, _ string, _ string, _ os.FileMode) error {
+	if server.Password != r.password && strings.TrimSpace(server.PrivateKey) == "" {
+		return errors.New("saved SSH credential missing")
+	}
+	r.uploads++
+	return nil
+}
+
+func TestExplicitReconciliationUsesSavedSSHCredentialWithoutLeakingIt(t *testing.T) {
+	db, instance := newStandaloneReconciliationStore(t, "ssh-test-only-secret")
+	remote := &credentialRequiredReconcileRemote{password: "ssh-test-only-secret"}
+	module := NewModule(db, remote)
+	err := module.Reconcile(context.Background(), mustReconciliationPlan(t, db, instance), "en", store.NewID("tsk"), fakeLogger{})
+	if err != nil {
+		t.Fatalf("reconciliation could not use the saved SSH credential: %v", err)
+	}
+	fresh, getErr := db.GetAppInstance(instance.ID)
+	if getErr != nil {
+		t.Fatal(getErr)
+	}
+	if _, _, present, parseErr := parseMySQLReconciliationMarker(fresh.Metadata); parseErr != nil || present {
+		t.Fatalf("successful reconciliation retained marker: present=%v err=%v", present, parseErr)
+	}
+	joined := strings.Join(remote.commands, "\n") + errString(err) + fresh.Metadata
+	if strings.Contains(joined, remote.password) || remote.uploads != 1 {
+		t.Fatalf("SSH credential leaked or was not used: uploads=%d evidence=%q", remote.uploads, joined)
+	}
+}
+
+func TestExplicitReconciliationRetainsMarkerWhenRemoteSecretCleanupFails(t *testing.T) {
+	db, instance := newStandaloneReconciliationStore(t, "ssh-test-only-secret")
+	remote := &credentialRequiredReconcileRemote{password: "ssh-test-only-secret", cleanupErr: errors.New("private-path cleanup failed")}
+	module := NewModule(db, remote)
+	err := module.Reconcile(context.Background(), mustReconciliationPlan(t, db, instance), "en", store.NewID("tsk"), fakeLogger{})
+	var stable interface{ StableCode() string }
+	if !errors.As(err, &stable) || stable.StableCode() != MySQLReconciliationRequired || strings.Contains(errString(err), "private-path") {
+		t.Fatalf("cleanup failure was not sanitized: %T %v", err, err)
+	}
+	fresh, getErr := db.GetAppInstance(instance.ID)
+	if getErr != nil {
+		t.Fatal(getErr)
+	}
+	if _, _, present, parseErr := parseMySQLReconciliationMarker(fresh.Metadata); parseErr != nil || !present {
+		t.Fatalf("cleanup failure cleared marker: present=%v err=%v metadata=%s", present, parseErr, fresh.Metadata)
+	}
+}
+
+func TestExplicitReconciliationCompletesCleanupBeforeMarkerCASAcrossFailureMatrix(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		cancel     bool
+		primaryErr error
+		cleanupErr error
+		wantOK     bool
+	}{
+		{name: "success", wantOK: true},
+		{name: "primary failure", primaryErr: errors.New("primary private-value failure")},
+		{name: "cancellation", cancel: true},
+		{name: "local cleanup failure", cleanupErr: errors.New("local private-path cleanup failure")},
+		{name: "remote cleanup failure", cleanupErr: errors.New("remote private-path cleanup failure")},
+		{name: "primary and both cleanup failures", primaryErr: errors.New("primary private-value failure"), cleanupErr: errors.Join(errors.New("local private-path cleanup failure"), errors.New("remote private-path cleanup failure"))},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			db, instance := newStandaloneReconciliationStore(t, "ssh-test-only-secret")
+			plan := mustReconciliationPlan(t, db, instance)
+			module := NewModule(db, newBackupFakeRemote())
+			cleanupCalls := 0
+			markerPresentDuringCleanup := false
+			module.reconciliationSession = func(context.Context, store.AppInstance, store.Server, store.Credential) (localInfileSession, func() error, error) {
+				session := &fakeLocalInfileSession{value: "ON", setErr: test.primaryErr}
+				return session, func() error {
+					cleanupCalls++
+					fresh, err := db.GetAppInstance(instance.ID)
+					if err == nil {
+						_, _, markerPresentDuringCleanup, _ = parseMySQLReconciliationMarker(fresh.Metadata)
+					}
+					return test.cleanupErr
+				}, nil
+			}
+			ctx := context.Background()
+			if test.cancel {
+				cancelled, cancel := context.WithCancel(ctx)
+				cancel()
+				ctx = cancelled
+				module.reconciliationSession = func(context.Context, store.AppInstance, store.Server, store.Credential) (localInfileSession, func() error, error) {
+					return cancelledReconciliationSession{}, func() error {
+						cleanupCalls++
+						fresh, _ := db.GetAppInstance(instance.ID)
+						_, _, markerPresentDuringCleanup, _ = parseMySQLReconciliationMarker(fresh.Metadata)
+						return nil
+					}, nil
+				}
+			}
+			err := module.Reconcile(ctx, plan, "en", store.NewID("tsk"), fakeLogger{})
+			if (err == nil) != test.wantOK || cleanupCalls != 1 || !markerPresentDuringCleanup {
+				t.Fatalf("result err=%v cleanupCalls=%d markerDuringCleanup=%v", err, cleanupCalls, markerPresentDuringCleanup)
+			}
+			fresh, getErr := db.GetAppInstance(instance.ID)
+			if getErr != nil {
+				t.Fatal(getErr)
+			}
+			_, _, present, parseErr := parseMySQLReconciliationMarker(fresh.Metadata)
+			if parseErr != nil || present == test.wantOK {
+				t.Fatalf("marker state present=%v want=%v err=%v", present, !test.wantOK, parseErr)
+			}
+			if err != nil && (strings.Contains(err.Error(), "private-value") || strings.Contains(err.Error(), "private-path")) {
+				t.Fatalf("unsanitized failure: %v", err)
+			}
+		})
+	}
+}
+
+type cancelledReconciliationSession struct{}
+
+func (cancelledReconciliationSession) SetLocalInfile(ctx context.Context, _ string) error {
+	return ctx.Err()
+}
+func (cancelledReconciliationSession) ReadLocalInfile(ctx context.Context) (string, error) {
+	return "", ctx.Err()
+}
+
+func TestReconciliationSessionCleanupAttemptsLocalAndRemoteIndependentlyAndSanitizesEvidence(t *testing.T) {
+	remote := &credentialRequiredReconcileRemote{password: "ssh-test-only-secret", cleanupErr: errors.New("remote private-path failure")}
+	localCalls := 0
+	factory := reconciliationSessionFactoryWithRemove(remote, func(string) error {
+		localCalls++
+		return errors.New("local private-path failure")
+	})
+	instance := store.AppInstance{ID: store.NewID("app"), App: "mysql", ServerID: store.NewID("srv"), Topology: "standalone", Metadata: `{"port":3306}`}
+	server := store.Server{ID: instance.ServerID, Password: remote.password}
+	credential := store.Credential{Kind: "mysql", Username: "root", Secret: map[string]string{"password": "mysql-private-value"}}
+	_, cleanup, err := factory(context.Background(), instance, server, credential)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = cleanup()
+	joined := errString(err) + strings.Join(remote.commands, "\n")
+	if localCalls != 1 || err == nil || !strings.Contains(joined, "local reconciliation secret cleanup failed") || !strings.Contains(joined, "remote reconciliation secret cleanup failed") || strings.Contains(joined, "private-path") || strings.Contains(joined, "mysql-private-value") {
+		t.Fatalf("cleanup was not independent and sanitized: local=%d evidence=%q", localCalls, joined)
+	}
+}
+
+func newStandaloneReconciliationStore(t *testing.T, sshPassword string) (*store.Store, store.AppInstance) {
+	t.Helper()
+	db, err := store.OpenWithSecret(filepath.Join(t.TempDir(), "aifar.db"), "reconciliation-test-secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	server, err := db.SaveServer(store.Server{Name: "mysql", Host: "10.0.0.8", Username: "root", Password: sshPassword})
+	if err != nil {
+		t.Fatal(err)
+	}
+	instance, err := db.SaveAppInstance(store.AppInstance{App: "mysql", Version: "8.0.36", ServerID: server.ID, Status: "running", Topology: "standalone", Metadata: `{"port":3306,"mysqlReconciliation":{"version":1,"kind":"local_infile","originalValue":"OFF","recordedAt":"2026-07-28T00:00:00Z","taskId":"tsk_abcdef1234567890abcdef12"}}`})
+	if err != nil {
+		t.Fatal(err)
+	}
+	credential, err := db.SaveCredential(store.Credential{Name: "mysql-admin", Kind: "mysql", Username: "root", Scope: "app-instance", Status: "active", Secret: map[string]string{"password": "mysql-test-only-secret"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.BindCredential(store.CredentialBinding{CredentialID: credential.ID, AppInstanceID: instance.ID, Purpose: "admin"}); err != nil {
+		t.Fatal(err)
+	}
+	return db, instance
+}
+
+func errString(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
+}
+
+func mustReconciliationPlan(t *testing.T, data maintenanceReader, instance store.AppInstance) ReconciliationPlan {
+	t.Helper()
+	plan, err := BuildReconciliationPlan(data, instance)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return plan
+}
 
 type fakeLocalInfileSession struct {
 	value            string
@@ -157,13 +366,13 @@ func TestExplicitReconciliationRestoresExactValueAndPreservesMaintenance(t *test
 			data.instance.Metadata = `{"port":3306,"keep":"value","mysqlMaintenance":{"version":1,"state":"required","reason":"restore_incomplete","scope":"standalone","backupId":"backup_1234567890abcdef12345678","taskId":"tsk_1234567890abcdef12345678","restorePhase":"load_complete","recordedAt":"2026-07-28T00:00:00Z"},"mysqlReconciliation":{"version":1,"kind":"local_infile","originalValue":"` + original + `","recordedAt":"2026-07-28T00:00:00Z","taskId":"tsk_abcdef1234567890abcdef12"}}`
 			session := &fakeLocalInfileSession{value: map[string]string{"OFF": "ON", "ON": "OFF"}[original]}
 			module := NewModule(data, newBackupFakeRemote())
-			module.service.localInfileSession = func(_ context.Context, instance store.AppInstance, _ store.Server, credential store.Credential) (localInfileSession, func(), error) {
+			module.reconciliationSession = func(_ context.Context, instance store.AppInstance, _ store.Server, credential store.Credential) (localInfileSession, func() error, error) {
 				if instance.ID != data.instance.ID || credential.Username != "root" || credential.Secret["password"] == "" {
 					t.Fatalf("incomplete authoritative inputs: instance=%+v credential=%+v", instance, credential)
 				}
-				return session, func() {}, nil
+				return session, func() error { return nil }, nil
 			}
-			if err := module.Reconcile(context.Background(), data.instance, "en", "tsk_999999999999999999999999", fakeLogger{}); err != nil {
+			if err := module.Reconcile(context.Background(), mustReconciliationPlan(t, data, data.instance), "en", "tsk_999999999999999999999999", fakeLogger{}); err != nil {
 				t.Fatal(err)
 			}
 			if session.value != original || len(session.setCalls) != 1 || session.setCalls[0] != original {
@@ -196,13 +405,14 @@ func TestExplicitReconciliationFailsClosedForCredentialMarkerAndVerificationFail
 			data := &restoreFakeStore{backupFakeStore: newBackupFakeStore(t)}
 			data.instance.Metadata = `{"port":3306,"mysqlMaintenance":{"version":1,"state":"required","reason":"restore_incomplete","scope":"standalone","backupId":"backup_1234567890abcdef12345678","taskId":"tsk_1234567890abcdef12345678","restorePhase":"load_complete","recordedAt":"2026-07-28T00:00:00Z"},"mysqlReconciliation":{"version":1,"kind":"local_infile","originalValue":"OFF","recordedAt":"2026-07-28T00:00:00Z","taskId":"tsk_abcdef1234567890abcdef12"}}`
 			expected := data.instance
+			plan := mustReconciliationPlan(t, data, expected)
 			session := &fakeLocalInfileSession{value: "ON"}
 			test.mutate(data, session)
 			module := NewModule(data, newBackupFakeRemote())
-			module.service.localInfileSession = func(context.Context, store.AppInstance, store.Server, store.Credential) (localInfileSession, func(), error) {
-				return session, func() {}, nil
+			module.reconciliationSession = func(context.Context, store.AppInstance, store.Server, store.Credential) (localInfileSession, func() error, error) {
+				return session, func() error { return nil }, nil
 			}
-			err := module.Reconcile(context.Background(), expected, "en", "tsk_999999999999999999999999", fakeLogger{})
+			err := module.Reconcile(context.Background(), plan, "en", "tsk_999999999999999999999999", fakeLogger{})
 			var stable interface{ StableCode() string }
 			if !errors.As(err, &stable) || stable.StableCode() != MySQLReconciliationRequired {
 				t.Fatalf("error=%T %v", err, err)
@@ -227,13 +437,13 @@ func TestExplicitReconciliationSanitizesConnectionAndCASFailures(t *testing.T) {
 			data := &restoreFakeStore{backupFakeStore: newBackupFakeStore(t), clearReconciliationErr: test.clearErr}
 			data.instance.Metadata = `{"port":3306,"mysqlMaintenance":{"version":1,"state":"required","reason":"restore_incomplete","scope":"standalone","backupId":"backup_1234567890abcdef12345678","taskId":"tsk_1234567890abcdef12345678","restorePhase":"load_complete","recordedAt":"2026-07-28T00:00:00Z"},"mysqlReconciliation":{"version":1,"kind":"local_infile","originalValue":"OFF","recordedAt":"2026-07-28T00:00:00Z","taskId":"tsk_abcdef1234567890abcdef12"}}`
 			module := NewModule(data, newBackupFakeRemote())
-			module.service.localInfileSession = func(context.Context, store.AppInstance, store.Server, store.Credential) (localInfileSession, func(), error) {
+			module.reconciliationSession = func(context.Context, store.AppInstance, store.Server, store.Credential) (localInfileSession, func() error, error) {
 				if test.connectErr != nil {
-					return nil, func() {}, test.connectErr
+					return nil, func() error { return nil }, test.connectErr
 				}
-				return &fakeLocalInfileSession{value: "ON"}, func() {}, nil
+				return &fakeLocalInfileSession{value: "ON"}, func() error { return nil }, nil
 			}
-			err := module.Reconcile(context.Background(), data.instance, "en", store.NewID("tsk"), fakeLogger{})
+			err := module.Reconcile(context.Background(), mustReconciliationPlan(t, data, data.instance), "en", store.NewID("tsk"), fakeLogger{})
 			var stable interface{ StableCode() string }
 			if !errors.As(err, &stable) || stable.StableCode() != MySQLReconciliationRequired || strings.Contains(err.Error(), "private-value") {
 				t.Fatalf("unsafe error=%T %v", err, err)
@@ -263,6 +473,98 @@ func TestOrdinaryCheckDoesNotRepairOrClearReconciliationMarker(t *testing.T) {
 	}
 }
 
+func TestOrdinaryCheckRejectsSecondaryClusterReconciliationAndMembershipDriftBeforeRemoteCall(t *testing.T) {
+	for _, drift := range []bool{false, true} {
+		name := "secondary marker"
+		if drift {
+			name = "member server drift"
+		}
+		t.Run(name, func(t *testing.T) {
+			db, instances, clusterID := newOrdinaryReconciliationCluster(t)
+			if drift {
+				members, err := db.ListAppClusterMembers(clusterID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				members[1].ServerID = instances[0].ServerID
+				if _, err := db.SaveAppClusterMember(members[1]); err != nil {
+					t.Fatal(err)
+				}
+			}
+			remote := newBackupFakeRemote()
+			service := NewService(db, remote)
+			_, err := service.Check(context.Background(), CheckRequest{Instance: instances[0], Language: "en"}, fakeLogger{}, nil)
+			var stable interface{ StableCode() string }
+			if !errors.As(err, &stable) || (stable.StableCode() != MySQLReconciliationRequired && (!drift || stable.StableCode() != MySQLMaintenanceStateInvalid)) {
+				t.Fatalf("error=%T %v", err, err)
+			}
+			if len(remote.commands) != 0 {
+				t.Fatalf("ordinary check reached remote target: %v", remote.commands)
+			}
+		})
+	}
+}
+
+func TestOrdinaryClusterMutationServicesRejectSecondaryReconciliationBeforeRemoteCall(t *testing.T) {
+	for _, operation := range []string{"backup", "restore", "start", "delete"} {
+		t.Run(operation, func(t *testing.T) {
+			db, instances, _ := newOrdinaryReconciliationCluster(t)
+			remote := newBackupFakeRemote()
+			module := NewModule(db, remote)
+			var err error
+			if operation == "backup" {
+				err = module.service.backupInnoDBCluster(context.Background(), registry.BackupRequest{Instance: instances[0], Language: "en"}, registry.RunContext{})
+			} else if operation == "restore" {
+				err = module.restoreHealthyInnoDBCluster(context.Background(), registry.RestoreRequest{Instance: instances[0], Language: "en"}, registry.RunContext{})
+			} else if operation == "start" {
+				err = module.service.StartInnoDBCluster(context.Background(), StartClusterRequest{Instances: instances, Language: "en"}, fakeLogger{}, nil)
+			} else {
+				err = module.service.Delete(context.Background(), DeleteRequest{Instance: instances[0], Language: "en"}, fakeLogger{}, nil)
+			}
+			var stable interface{ StableCode() string }
+			if !errors.As(err, &stable) || stable.StableCode() != MySQLReconciliationRequired {
+				t.Fatalf("error=%T %v", err, err)
+			}
+			if len(remote.commands) != 0 {
+				t.Fatalf("%s reached remote target: %v", operation, remote.commands)
+			}
+		})
+	}
+}
+
+func newOrdinaryReconciliationCluster(t *testing.T) (*store.Store, []store.AppInstance, string) {
+	t.Helper()
+	db, err := store.OpenWithSecret(filepath.Join(t.TempDir(), "aifar.db"), "reconciliation-test-secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	clusterID := "cluster_1234567890abcdef12345678"
+	if _, err := db.SaveAppCluster(store.AppCluster{ID: clusterID, App: "mysql", Name: "ordinary-gate", Topology: "innodb-cluster", Status: "active"}); err != nil {
+		t.Fatal(err)
+	}
+	instances := make([]store.AppInstance, 0, 3)
+	for index := 0; index < 3; index++ {
+		server, err := db.SaveServer(store.Server{Name: "mysql", Host: "10.0.0." + string(rune('1'+index)), Username: "root"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		metadata := `{"clusterId":"` + clusterID + `"}`
+		if index == 1 {
+			metadata = `{"clusterId":"` + clusterID + `","mysqlReconciliation":{"version":1,"kind":"local_infile","originalValue":"OFF","recordedAt":"2026-07-28T00:00:00Z","taskId":"tsk_abcdef1234567890abcdef12"}}`
+		}
+		instance, err := db.SaveAppInstance(store.AppInstance{App: "mysql", Version: "8.0.36", ServerID: server.ID, Status: "running", Topology: "innodb-cluster", Metadata: metadata})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.SaveAppClusterMember(store.AppClusterMember{ClusterID: clusterID, InstanceID: instance.ID, ServerID: server.ID, Role: "SECONDARY", Status: "ONLINE"}); err != nil {
+			t.Fatal(err)
+		}
+		instances = append(instances, instance)
+	}
+	return db, instances, clusterID
+}
+
 func TestExplicitClusterReconciliationUsesAuthoritativeTopologyAndFailsOnDrift(t *testing.T) {
 	for _, drift := range []bool{false, true} {
 		name := "success"
@@ -280,10 +582,10 @@ func TestExplicitClusterReconciliationUsesAuthoritativeTopologyAndFailsOnDrift(t
 					}
 				}
 			}
-			module.service.localInfileSession = func(context.Context, store.AppInstance, store.Server, store.Credential) (localInfileSession, func(), error) {
-				return session, func() {}, nil
+			module.reconciliationSession = func(context.Context, store.AppInstance, store.Server, store.Credential) (localInfileSession, func() error, error) {
+				return session, func() error { return nil }, nil
 			}
-			err := module.Reconcile(context.Background(), affected, "en", store.NewID("tsk"), fakeLogger{})
+			err := module.Reconcile(context.Background(), mustReconciliationPlan(t, db, affected), "en", store.NewID("tsk"), fakeLogger{})
 			if drift {
 				var stable interface{ StableCode() string }
 				if !errors.As(err, &stable) || stable.StableCode() != MySQLReconciliationRequired {
@@ -302,6 +604,76 @@ func TestExplicitClusterReconciliationUsesAuthoritativeTopologyAndFailsOnDrift(t
 			}
 			if _, maintenancePresent, maintenanceErr := store.ParseMySQLMaintenanceMarker(fresh.Metadata); maintenanceErr != nil || !maintenancePresent {
 				t.Fatalf("maintenance changed: present=%v err=%v metadata=%s", maintenancePresent, maintenanceErr, fresh.Metadata)
+			}
+		})
+	}
+}
+
+func TestExplicitClusterReconciliationRejectsPlanToWorkerIdentityDriftBeforeRemoteCall(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*testing.T, *store.Store, store.AppInstance, string)
+	}{
+		{name: "raw cluster id", mutate: func(t *testing.T, db *store.Store, affected store.AppInstance, clusterID string) {
+			affected.Metadata = strings.Replace(affected.Metadata, clusterID, "cluster_000000000000000000000000", 1)
+			if _, err := db.SaveAppInstance(affected); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "cluster row", mutate: func(t *testing.T, db *store.Store, _ store.AppInstance, clusterID string) {
+			cluster, err := db.GetAppCluster(clusterID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			cluster.Status = "maintenance"
+			if _, err := db.SaveAppCluster(cluster); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "member instance", mutate: func(t *testing.T, db *store.Store, _ store.AppInstance, clusterID string) {
+			server, err := db.SaveServer(store.Server{Name: "new-member", Host: "10.0.0.99", Username: "root"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			instance, err := db.SaveAppInstance(store.AppInstance{App: "mysql", Version: "8.0.36", ServerID: server.ID, Status: "running", Topology: "innodb-cluster", Metadata: `{"clusterId":"` + clusterID + `"}`})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.SaveAppClusterMember(store.AppClusterMember{ClusterID: clusterID, InstanceID: instance.ID, ServerID: server.ID, Role: "SECONDARY", Status: "ONLINE"}); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "member server", mutate: func(t *testing.T, db *store.Store, affected store.AppInstance, clusterID string) {
+			members, err := db.ListAppClusterMembers(clusterID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, member := range members {
+				if member.InstanceID != affected.ID {
+					member.ServerID = affected.ServerID
+					if _, err := db.SaveAppClusterMember(member); err != nil {
+						t.Fatal(err)
+					}
+					return
+				}
+			}
+			t.Fatal("secondary cluster member not found")
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			db, affected, clusterID := newReconciliationCluster(t)
+			plan := mustReconciliationPlan(t, db, affected)
+			test.mutate(t, db, affected, clusterID)
+			remoteCalls := 0
+			module := NewModule(db, newBackupFakeRemote())
+			module.reconciliationSession = func(context.Context, store.AppInstance, store.Server, store.Credential) (localInfileSession, func() error, error) {
+				remoteCalls++
+				return &fakeLocalInfileSession{value: "ON"}, func() error { return nil }, nil
+			}
+			err := module.Reconcile(context.Background(), plan, "en", store.NewID("tsk"), fakeLogger{})
+			var stable interface{ StableCode() string }
+			if !errors.As(err, &stable) || stable.StableCode() != MySQLReconciliationRequired || remoteCalls != 0 {
+				t.Fatalf("drift reached remote path: calls=%d error=%T %v", remoteCalls, err, err)
 			}
 		})
 	}
@@ -392,10 +764,10 @@ func TestReconcileRestoresRecordedLocalInfileAndOnlyThenClearsMarker(t *testing.
 	data.instance.Metadata = `{"port":3306,"keep":"value","mysqlReconciliation":{"version":1,"kind":"local_infile","originalValue":"OFF","recordedAt":"2026-07-28T00:00:00Z","taskId":"tsk_abcdef1234567890abcdef12"}}`
 	session := &fakeLocalInfileSession{value: "ON"}
 	module := NewModule(data, newBackupFakeRemote())
-	module.service.localInfileSession = func(context.Context, store.AppInstance, store.Server, store.Credential) (localInfileSession, func(), error) {
-		return session, func() {}, nil
+	module.reconciliationSession = func(context.Context, store.AppInstance, store.Server, store.Credential) (localInfileSession, func() error, error) {
+		return session, func() error { return nil }, nil
 	}
-	if err := module.Reconcile(context.Background(), data.instance, "en", "tsk_999999999999999999999999", fakeLogger{}); err != nil {
+	if err := module.Reconcile(context.Background(), mustReconciliationPlan(t, data, data.instance), "en", "tsk_999999999999999999999999", fakeLogger{}); err != nil {
 		t.Fatal(err)
 	}
 	if session.value != "OFF" || len(session.setCalls) != 1 {
@@ -423,7 +795,7 @@ func TestReconcileMalformedMarkerFailsClosedBeforeConnecting(t *testing.T) {
 		return nil, func() {}, errors.New("must not connect")
 	}
 	module := Module{service: service}
-	err := module.Reconcile(context.Background(), data.instance, "en", "tsk_999999999999999999999999", fakeLogger{})
+	err := module.Reconcile(context.Background(), mustReconciliationPlan(t, data, data.instance), "en", "tsk_999999999999999999999999", fakeLogger{})
 	var stable interface{ StableCode() string }
 	if !errors.As(err, &stable) || stable.StableCode() != "MYSQL_RECONCILIATION_REQUIRED" {
 		t.Fatalf("error = %T %v", err, err)

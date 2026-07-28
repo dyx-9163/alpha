@@ -21,17 +21,7 @@ const mysqlReconciliationTaskType = "apps.mysql.reconciliation.run"
 
 func (a *API) runMySQLReconciliation(w http.ResponseWriter, r *http.Request) {
 	lang := languageFromRequest(r)
-	var payload struct {
-		ReconciliationConfirmed bool `json:"reconciliationConfirmed"`
-	}
-	decoder := json.NewDecoder(r.Body)
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&payload); err != nil || !payload.ReconciliationConfirmed {
-		writeError(w, http.StatusBadRequest, mysqlapp.MySQLReconciliationConfirmationRequired, i18n.MySQLBackupErrorText(lang, mysqlapp.MySQLReconciliationConfirmationRequired), nil)
-		return
-	}
-	var trailing any
-	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+	if err := decodeExactReconciliationConfirmation(r); err != nil {
 		writeError(w, http.StatusBadRequest, mysqlapp.MySQLReconciliationConfirmationRequired, i18n.MySQLBackupErrorText(lang, mysqlapp.MySQLReconciliationConfirmationRequired), nil)
 		return
 	}
@@ -44,6 +34,12 @@ func (a *API) runMySQLReconciliation(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "MYSQL_INSTANCE_REQUIRED", i18n.Text(lang, "api.mysqlClusterRequired"), nil)
 		return
 	}
+	plan, planErr := mysqlapp.BuildReconciliationPlan(a.store, instance)
+	if planErr != nil {
+		writeError(w, http.StatusConflict, mysqlapp.MySQLReconciliationRequired, i18n.MySQLBackupErrorText(lang, mysqlapp.MySQLReconciliationRequired), nil)
+		return
+	}
+	instance = plan.Instance
 	if strings.EqualFold(strings.TrimSpace(instance.Topology), "innodb-cluster") && !validMySQLMaintenanceClusterID(mysqlClusterID(instance)) {
 		writeError(w, http.StatusConflict, mysqlapp.MySQLReconciliationRequired, i18n.MySQLBackupErrorText(lang, mysqlapp.MySQLReconciliationRequired), nil)
 		return
@@ -63,7 +59,7 @@ func (a *API) runMySQLReconciliation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	reconciler, ok := module.(interface {
-		Reconcile(context.Context, store.AppInstance, string, string, mysqlapp.Logger) error
+		Reconcile(context.Context, mysqlapp.ReconciliationPlan, string, string, mysqlapp.Logger) error
 	})
 	if !ok {
 		writeError(w, http.StatusConflict, mysqlapp.MySQLReconciliationRequired, i18n.MySQLBackupErrorText(lang, mysqlapp.MySQLReconciliationRequired), nil)
@@ -80,8 +76,8 @@ func (a *API) runMySQLReconciliation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	stepTitle := i18n.Text(lang, "mysql.reconciliation.step")
-	plan := []registry.InstallStepPlan{{Target: target, Name: "reconcile-local-infile", Title: stepTitle, Order: 1}}
-	if err := a.storeInstallPlanOrDelete(task.ID, plan); err != nil {
+	taskPlan := []registry.InstallStepPlan{{Target: target, Name: "reconcile-local-infile", Title: stepTitle, Order: 1}}
+	if err := a.storeInstallPlanOrDelete(task.ID, taskPlan); err != nil {
 		writeError(w, http.StatusInternalServerError, "MYSQL_RECONCILIATION_PLAN_STORE_FAILED", i18n.MySQLBackupErrorText(lang, mysqlapp.MySQLReconciliationRequired), nil)
 		return
 	}
@@ -93,7 +89,7 @@ func (a *API) runMySQLReconciliation(w http.ResponseWriter, r *http.Request) {
 		log.StartTarget(target)
 		log.StartStep(target, "reconcile-local-infile", stepTitle, 1)
 		log.Info("%s", i18n.Text(lang, "mysql.reconciliation.started"))
-		runErr := reconciler.Reconcile(ctx, instance, lang, log.TaskID(), log)
+		runErr := reconciler.Reconcile(ctx, plan, lang, log.TaskID(), log)
 		if runErr != nil {
 			log.FinishStep(target, "reconcile-local-infile", "failed", runErr.Error())
 			log.FinishTarget(target, "failed", runErr.Error())
@@ -110,4 +106,33 @@ func (a *API) runMySQLReconciliation(w http.ResponseWriter, r *http.Request) {
 		a.audit(r, mysqlReconciliationTaskType, instance.ID, "running", task.ID)
 	}
 	respondTask(w, task, err)
+}
+
+func decodeExactReconciliationConfirmation(r *http.Request) error {
+	decoder := json.NewDecoder(r.Body)
+	token, err := decoder.Token()
+	if err != nil || token != json.Delim('{') {
+		return errors.New("invalid reconciliation confirmation")
+	}
+	seen := false
+	confirmed := false
+	for decoder.More() {
+		keyToken, keyErr := decoder.Token()
+		key, ok := keyToken.(string)
+		if keyErr != nil || !ok || key != "reconciliationConfirmed" || seen {
+			return errors.New("invalid reconciliation confirmation")
+		}
+		seen = true
+		if err := decoder.Decode(&confirmed); err != nil {
+			return errors.New("invalid reconciliation confirmation")
+		}
+	}
+	if token, err = decoder.Token(); err != nil || token != json.Delim('}') || !seen || !confirmed {
+		return errors.New("invalid reconciliation confirmation")
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		return errors.New("invalid reconciliation confirmation")
+	}
+	return nil
 }

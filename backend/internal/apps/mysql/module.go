@@ -13,8 +13,9 @@ import (
 )
 
 type Module struct {
-	service         Service
-	defaultPassword string
+	service               Service
+	reconciliationSession reconciliationSessionFactory
+	defaultPassword       string
 }
 
 func init() {
@@ -28,7 +29,11 @@ func NewModule(s Store, remote Remote, defaultPassword ...string) Module {
 	if len(defaultPassword) > 0 {
 		password = defaultPassword[0]
 	}
-	return Module{service: NewService(s, remote), defaultPassword: password}
+	return Module{
+		service:               NewService(s, remote),
+		reconciliationSession: defaultReconciliationSessionFactory(remote),
+		defaultPassword:       password,
+	}
 }
 
 func (m Module) Name() string {

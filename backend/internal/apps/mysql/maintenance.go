@@ -14,11 +14,15 @@ import (
 	"aifar-deployment/backend/internal/store"
 )
 
-type maintenanceStore interface {
+type maintenanceReader interface {
 	GetAppInstance(string) (store.AppInstance, error)
 	ListAppInstances() ([]store.AppInstance, error)
 	GetAppCluster(string) (store.AppCluster, error)
 	ListAppClusterMembers(string) ([]store.AppClusterMember, error)
+}
+
+type maintenanceStore interface {
+	maintenanceReader
 	SetMySQLMaintenance([]string, store.MySQLMaintenanceMarker) error
 	AdvanceMySQLMaintenance([]string, store.MySQLMaintenanceMarker, string) error
 	ClearMySQLMaintenance([]string, store.MySQLMaintenanceMarker) error
@@ -61,7 +65,7 @@ func (s Service) requireNoMySQLMaintenance(expected store.AppInstance, language 
 	return localizedMySQLOperationError(language, MySQLMaintenanceRequired)
 }
 
-func maintenanceInstances(data maintenanceStore, representative store.AppInstance) ([]store.AppInstance, error) {
+func maintenanceInstances(data maintenanceReader, representative store.AppInstance) ([]store.AppInstance, error) {
 	topology := instanceTopology(representative)
 	if topology == "standalone" {
 		return []store.AppInstance{representative}, nil

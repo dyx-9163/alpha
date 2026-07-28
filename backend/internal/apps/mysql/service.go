@@ -475,6 +475,9 @@ func (s Service) StartInnoDBCluster(ctx context.Context, req StartClusterRequest
 		if err := s.requireNoMySQLMaintenance(req.Instances[0], req.Language); err != nil {
 			return err
 		}
+		if err := s.requireNoMySQLReconciliation(req.Instances[0], req.Language); err != nil {
+			return err
+		}
 	}
 	copy := ClusterStartCopyFor(req.Language)
 	nodes, err := s.authoritativeClusterStartNodes(req, copy)
@@ -562,6 +565,9 @@ func recordClusterBaseFailure(mu *sync.Mutex, failedTargets map[string]bool, fai
 
 func (s Service) Delete(ctx context.Context, req DeleteRequest, log Logger, targetLog targetLogger) error {
 	if err := s.requireNoMySQLMaintenance(req.Instance, req.Language); err != nil {
+		return err
+	}
+	if err := s.requireNoMySQLReconciliation(req.Instance, req.Language); err != nil {
 		return err
 	}
 	copy := DeleteCopyFor(req.Language)

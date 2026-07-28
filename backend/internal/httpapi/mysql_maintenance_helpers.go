@@ -90,15 +90,65 @@ func (a *API) mysqlMaintenanceGate(instance store.AppInstance) string {
 }
 
 func (a *API) mysqlOrdinaryLifecycleGate(instance store.AppInstance) string {
-	if code := a.mysqlMaintenanceGate(instance); code != "" {
+	if code := a.mysqlReconciliationGate(instance); code != "" {
 		return code
 	}
+	return a.mysqlMaintenanceGate(instance)
+}
+
+func (a *API) mysqlReconciliationGate(instance store.AppInstance) string {
 	if !strings.EqualFold(strings.TrimSpace(instance.App), "mysql") {
 		return ""
 	}
-	present, err := mysql.ReconciliationMarkerState(instance.Metadata)
-	if err != nil || present {
+	instances := []store.AppInstance{instance}
+	topology := strings.ToLower(strings.TrimSpace(instance.Topology))
+	if topology == "innodb-cluster" {
+		clusterID := mysqlClusterID(instance)
+		if !validMySQLMaintenanceClusterID(clusterID) {
+			return mysql.MySQLReconciliationRequired
+		}
+		cluster, err := a.store.GetAppCluster(clusterID)
+		if err != nil || cluster.App != "mysql" || !strings.EqualFold(strings.TrimSpace(cluster.Topology), "innodb-cluster") {
+			return mysql.MySQLReconciliationRequired
+		}
+		authoritative, err := a.store.ListAppClusterMembers(clusterID)
+		if err != nil || len(authoritative) != 3 {
+			return mysql.MySQLReconciliationRequired
+		}
+		all, err := a.store.ListAppInstances()
+		if err != nil {
+			return mysql.MySQLReconciliationRequired
+		}
+		byID := make(map[string]store.AppInstance, len(all))
+		for _, candidate := range all {
+			byID[candidate.ID] = candidate
+		}
+		instances = instances[:0]
+		seenInstances := map[string]bool{}
+		seenServers := map[string]bool{}
+		requestedFound := false
+		for _, member := range authoritative {
+			candidate, found := byID[member.InstanceID]
+			if !found || seenInstances[candidate.ID] || seenServers[member.ServerID] || candidate.App != "mysql" ||
+				!strings.EqualFold(strings.TrimSpace(candidate.Topology), "innodb-cluster") || mysqlClusterID(candidate) != clusterID ||
+				candidate.ServerID != member.ServerID || strings.TrimSpace(member.ServerID) == "" {
+				return mysql.MySQLReconciliationRequired
+			}
+			seenInstances[candidate.ID], seenServers[member.ServerID] = true, true
+			requestedFound = requestedFound || candidate.ID == instance.ID
+			instances = append(instances, candidate)
+		}
+		if len(instances) != 3 || !requestedFound {
+			return mysql.MySQLReconciliationRequired
+		}
+	} else if topology != "standalone" {
 		return mysql.MySQLReconciliationRequired
+	}
+	for _, candidate := range instances {
+		present, err := mysql.ReconciliationMarkerState(candidate.Metadata)
+		if err != nil || present {
+			return mysql.MySQLReconciliationRequired
+		}
 	}
 	return ""
 }

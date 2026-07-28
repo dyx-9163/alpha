@@ -289,6 +289,9 @@ func (s Service) backupInnoDBCluster(ctx context.Context, req registry.BackupReq
 	if err := s.requireNoMySQLMaintenance(req.Instance, req.Language); err != nil {
 		return err
 	}
+	if err := s.requireNoMySQLReconciliation(req.Instance, req.Language); err != nil {
+		return err
+	}
 	cluster, err := s.resolveHealthyInnoDBCluster(ctx, req.Instance, run.TaskID)
 	if err != nil {
 		return err
@@ -319,6 +322,12 @@ func clusterServers(members []clusterMemberNode) []store.Server {
 }
 
 func (m Module) restoreHealthyInnoDBCluster(ctx context.Context, req registry.RestoreRequest, run registry.RunContext) error {
+	if err := m.service.requireNoMySQLMaintenance(req.Instance, req.Language); err != nil {
+		return err
+	}
+	if err := m.service.requireNoMySQLReconciliation(req.Instance, req.Language); err != nil {
+		return err
+	}
 	cluster, err := m.service.resolveHealthyInnoDBCluster(ctx, req.Instance, run.TaskID)
 	if err != nil {
 		return err

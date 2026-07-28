@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -16,6 +17,52 @@ import (
 )
 
 type localInfileSessionFactory func(context.Context, store.AppInstance, store.Server, store.Credential) (localInfileSession, func(), error)
+
+type reconciliationSessionFactory func(context.Context, store.AppInstance, store.Server, store.Credential) (localInfileSession, func() error, error)
+
+func defaultReconciliationSessionFactory(remote Remote) reconciliationSessionFactory {
+	return reconciliationSessionFactoryWithRemove(remote, os.Remove)
+}
+
+func reconciliationSessionFactoryWithRemove(remote Remote, removeSecret func(string) error) reconciliationSessionFactory {
+	return func(ctx context.Context, instance store.AppInstance, server store.Server, credential store.Credential) (localInfileSession, func() error, error) {
+		if remote == nil {
+			return nil, func() error { return nil }, errors.New("reconciliation session is unavailable")
+		}
+		work := mysqlBackupWorkDir(store.NewID("reconcile"))
+		secretPath := ""
+		cleanup := func() error {
+			var cleanupErrors []error
+			if secretPath != "" {
+				if err := removeSecret(secretPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+					cleanupErrors = append(cleanupErrors, errors.New("local reconciliation secret cleanup failed"))
+				}
+			}
+			cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			if _, err := remote.Run(cleanupCtx, server, cleanupBackupCommand(work)); err != nil {
+				cleanupErrors = append(cleanupErrors, errors.New("remote reconciliation secret cleanup failed"))
+			}
+			return errors.Join(cleanupErrors...)
+		}
+		failSetup := func() (localInfileSession, func() error, error) {
+			cleanupErr := cleanup()
+			return nil, func() error { return nil }, errors.Join(errors.New("reconciliation session setup failed"), cleanupErr)
+		}
+		if _, err := remote.Run(ctx, server, bootstrapBackupWorkCommand(work)); err != nil {
+			return failSetup()
+		}
+		var err error
+		secretPath, err = writeMySQLSecretContext(credential, instancePort(instance))
+		if err != nil {
+			return failSetup()
+		}
+		if err := remote.UploadFile(ctx, server, secretPath, path.Join(work, "secret-context.cnf"), 0o600); err != nil {
+			return failSetup()
+		}
+		return &remoteLocalInfileSession{remote: remote, server: server, work: work, port: instancePort(instance)}, cleanup, nil
+	}
+}
 
 func defaultLocalInfileSessionFactory(remote Remote) localInfileSessionFactory {
 	return func(ctx context.Context, instance store.AppInstance, server store.Server, credential store.Credential) (localInfileSession, func(), error) {
@@ -51,6 +98,68 @@ type mysqlReconciliationMarker struct {
 	OriginalValue string `json:"originalValue"`
 	RecordedAt    string `json:"recordedAt"`
 	TaskID        string `json:"taskId"`
+}
+
+// ReconciliationMemberIdentity is an immutable plan-time binding between an
+// authoritative cluster-member row, app instance, and server.
+type ReconciliationMemberIdentity struct {
+	MemberID   string
+	InstanceID string
+	ServerID   string
+}
+
+// ReconciliationPlan is built from persisted control-plane state before task
+// creation and revalidated after the raw mutation lock is acquired.
+type ReconciliationPlan struct {
+	Instance store.AppInstance
+	Cluster  store.AppCluster
+	Members  []ReconciliationMemberIdentity
+}
+
+func BuildReconciliationPlan(data maintenanceReader, expected store.AppInstance) (ReconciliationPlan, error) {
+	fresh, err := data.GetAppInstance(expected.ID)
+	if err != nil || fresh.App != "mysql" || fresh.ServerID != expected.ServerID || instanceTopology(fresh) != instanceTopology(expected) || clusterIDFromInstance(fresh) != clusterIDFromInstance(expected) {
+		return ReconciliationPlan{}, errors.New("invalid reconciliation plan instance")
+	}
+	instances, err := maintenanceInstances(data, fresh)
+	if err != nil || !containsInstance(instances, fresh.ID) {
+		return ReconciliationPlan{}, errors.New("invalid reconciliation plan topology")
+	}
+	plan := ReconciliationPlan{Instance: fresh}
+	if instanceTopology(fresh) == "standalone" {
+		plan.Members = []ReconciliationMemberIdentity{{InstanceID: fresh.ID, ServerID: fresh.ServerID}}
+		return plan, nil
+	}
+	clusterID := clusterIDFromInstance(fresh)
+	plan.Cluster, err = data.GetAppCluster(clusterID)
+	if err != nil {
+		return ReconciliationPlan{}, errors.New("invalid reconciliation plan cluster")
+	}
+	members, err := data.ListAppClusterMembers(clusterID)
+	if err != nil || len(members) != 3 {
+		return ReconciliationPlan{}, errors.New("invalid reconciliation plan members")
+	}
+	plan.Members = make([]ReconciliationMemberIdentity, 0, len(members))
+	for _, member := range members {
+		plan.Members = append(plan.Members, ReconciliationMemberIdentity{MemberID: member.ID, InstanceID: member.InstanceID, ServerID: member.ServerID})
+	}
+	sort.Slice(plan.Members, func(i, j int) bool { return plan.Members[i].InstanceID < plan.Members[j].InstanceID })
+	return plan, nil
+}
+
+func sameReconciliationPlan(planned, current ReconciliationPlan) bool {
+	if planned.Instance.ID != current.Instance.ID || planned.Instance.ServerID != current.Instance.ServerID ||
+		instanceTopology(planned.Instance) != instanceTopology(current.Instance) ||
+		clusterIDFromInstance(planned.Instance) != clusterIDFromInstance(current.Instance) || planned.Cluster != current.Cluster ||
+		len(planned.Members) != len(current.Members) {
+		return false
+	}
+	for index := range planned.Members {
+		if planned.Members[index] != current.Members[index] {
+			return false
+		}
+	}
+	return true
 }
 
 type reconciliationStore interface {
@@ -106,17 +215,36 @@ func localInfileSQLCommand(work string, port int, query string) string {
 }
 
 func (s Service) requireNoMySQLReconciliation(expected store.AppInstance, language string) error {
-	instance := expected
-	if data, ok := s.store.(backupStore); ok {
-		fresh, err := data.GetAppInstance(expected.ID)
-		if err != nil {
+	data, ok := s.store.(backupStore)
+	if !ok {
+		_, _, present, err := parseMySQLReconciliationMarker(expected.Metadata)
+		if err != nil || present {
 			return localizedMySQLOperationError(language, MySQLReconciliationRequired)
 		}
-		instance = fresh
+		return nil
 	}
-	_, _, present, err := parseMySQLReconciliationMarker(instance.Metadata)
-	if err != nil || present {
+	fresh, err := data.GetAppInstance(expected.ID)
+	if err != nil || fresh.App != "mysql" || fresh.ServerID != expected.ServerID || instanceTopology(fresh) != instanceTopology(expected) || clusterIDFromInstance(fresh) != clusterIDFromInstance(expected) {
 		return localizedMySQLOperationError(language, MySQLReconciliationRequired)
+	}
+	instances := []store.AppInstance{fresh}
+	if instanceTopology(fresh) == "innodb-cluster" {
+		topology, supported := s.store.(maintenanceStore)
+		if !supported {
+			return localizedMySQLOperationError(language, MySQLReconciliationRequired)
+		}
+		instances, err = maintenanceInstances(topology, fresh)
+		if err != nil || !containsInstance(instances, fresh.ID) {
+			return localizedMySQLOperationError(language, MySQLReconciliationRequired)
+		}
+	} else if instanceTopology(fresh) != "standalone" {
+		return localizedMySQLOperationError(language, MySQLReconciliationRequired)
+	}
+	for _, instance := range instances {
+		_, _, present, parseErr := parseMySQLReconciliationMarker(instance.Metadata)
+		if parseErr != nil || present {
+			return localizedMySQLOperationError(language, MySQLReconciliationRequired)
+		}
 	}
 	return nil
 }
@@ -130,7 +258,7 @@ func ReconciliationMarkerState(metadata string) (bool, error) {
 
 // Reconcile is the only public lifecycle entry allowed to mutate a persisted
 // local_infile reconciliation marker.
-func (m Module) Reconcile(ctx context.Context, expected store.AppInstance, language, _ string, _ Logger) error {
+func (m Module) Reconcile(ctx context.Context, plan ReconciliationPlan, language, _ string, _ Logger) error {
 	data, ok := m.service.store.(interface {
 		reconciliationStore
 		maintenanceStore
@@ -138,10 +266,11 @@ func (m Module) Reconcile(ctx context.Context, expected store.AppInstance, langu
 	if !ok {
 		return localizedMySQLOperationError(language, MySQLReconciliationRequired)
 	}
-	fresh, err := data.GetAppInstance(expected.ID)
-	if err != nil || fresh.App != "mysql" || fresh.ServerID != expected.ServerID || instanceTopology(fresh) != instanceTopology(expected) {
+	currentPlan, err := BuildReconciliationPlan(data, plan.Instance)
+	if err != nil || !sameReconciliationPlan(plan, currentPlan) {
 		return localizedMySQLOperationError(language, MySQLReconciliationRequired)
 	}
+	fresh := currentPlan.Instance
 	initialMembers, err := maintenanceInstances(data, fresh)
 	if err != nil || !containsInstance(initialMembers, fresh.ID) || !validOptionalMaintenanceState(initialMembers) {
 		return localizedMySQLOperationError(language, MySQLReconciliationRequired)
@@ -153,11 +282,11 @@ func (m Module) Reconcile(ctx context.Context, expected store.AppInstance, langu
 	if !present {
 		return localizedMySQLOperationError(language, MySQLReconciliationNotRequired)
 	}
-	_, expectedMarker, expectedPresent, expectedErr := parseMySQLReconciliationMarker(expected.Metadata)
+	_, expectedMarker, expectedPresent, expectedErr := parseMySQLReconciliationMarker(plan.Instance.Metadata)
 	if expectedErr != nil || !expectedPresent || expectedMarker != marker {
 		return localizedMySQLOperationError(language, MySQLReconciliationRequired)
 	}
-	server, err := m.service.store.GetServer(fresh.ServerID, false)
+	server, err := m.service.store.GetServer(fresh.ServerID, true)
 	if err != nil {
 		return localizedMySQLOperationError(language, MySQLReconciliationRequired)
 	}
@@ -166,28 +295,45 @@ func (m Module) Reconcile(ctx context.Context, expected store.AppInstance, langu
 		strings.TrimSpace(credential.Username) == "" || strings.TrimSpace(credential.Secret["password"]) == "" {
 		return localizedMySQLOperationError(language, MySQLReconciliationRequired)
 	}
-	session, cleanup, err := m.service.localInfileSession(ctx, fresh, server, credential)
+	factory := m.reconciliationSession
+	if factory == nil {
+		factory = defaultReconciliationSessionFactory(m.service.remote)
+	}
+	session, cleanup, err := factory(ctx, fresh, server, credential)
 	if err != nil {
 		return localizedMySQLOperationError(language, MySQLReconciliationRequired)
 	}
-	defer cleanup()
+	var primaryErr error
 	if err := session.SetLocalInfile(ctx, marker.OriginalValue); err != nil {
-		return localizedMySQLOperationError(language, MySQLReconciliationRequired)
+		primaryErr = errors.New("reconciliation mutation failed")
 	}
-	value, err := session.ReadLocalInfile(ctx)
-	if err != nil || strings.ToUpper(strings.TrimSpace(value)) != marker.OriginalValue {
-		return localizedMySQLOperationError(language, MySQLReconciliationRequired)
+	if primaryErr == nil {
+		value, readErr := session.ReadLocalInfile(ctx)
+		if readErr != nil || strings.ToUpper(strings.TrimSpace(value)) != marker.OriginalValue {
+			primaryErr = errors.New("reconciliation readback failed")
+		}
 	}
-	latest, err := data.GetAppInstance(fresh.ID)
-	if err != nil || latest.App != "mysql" || latest.ServerID != fresh.ServerID || instanceTopology(latest) != instanceTopology(fresh) || clusterIDFromInstance(latest) != clusterIDFromInstance(fresh) {
-		return localizedMySQLOperationError(language, MySQLReconciliationRequired)
+	var latest store.AppInstance
+	if primaryErr == nil {
+		latest, err = data.GetAppInstance(fresh.ID)
+		if err != nil || latest.App != "mysql" || latest.ServerID != fresh.ServerID || instanceTopology(latest) != instanceTopology(fresh) || clusterIDFromInstance(latest) != clusterIDFromInstance(fresh) {
+			primaryErr = errors.New("reconciliation topology changed")
+		}
 	}
-	latestMembers, err := maintenanceInstances(data, latest)
-	if err != nil || !sameInstanceIDs(initialMembers, latestMembers) {
-		return localizedMySQLOperationError(language, MySQLReconciliationRequired)
+	if primaryErr == nil {
+		latestMembers, membersErr := maintenanceInstances(data, latest)
+		if membersErr != nil || !sameInstanceIDs(initialMembers, latestMembers) {
+			primaryErr = errors.New("reconciliation membership changed")
+		}
 	}
-	_, latestMarker, latestPresent, err := parseMySQLReconciliationMarker(latest.Metadata)
-	if err != nil || !latestPresent || latestMarker != marker {
+	if primaryErr == nil {
+		_, latestMarker, latestPresent, markerErr := parseMySQLReconciliationMarker(latest.Metadata)
+		if markerErr != nil || !latestPresent || latestMarker != marker {
+			primaryErr = errors.New("reconciliation marker changed")
+		}
+	}
+	cleanupErr := cleanup()
+	if primaryErr != nil || cleanupErr != nil {
 		return localizedMySQLOperationError(language, MySQLReconciliationRequired)
 	}
 	if err := data.ClearMySQLReconciliation(latest.ID, marker.OriginalValue, marker.RecordedAt, marker.TaskID); err != nil {
