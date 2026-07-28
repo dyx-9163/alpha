@@ -26,7 +26,7 @@ func (a *API) recordFailedInstallInstances(ctx context.Context, req registry.Ins
 		if ctx.Err() != nil {
 			continue
 		}
-		if installInstanceRecordedAfter(existing, req.App, serverID, startedAt) || failedInstallInstanceExists(existing, req.App, serverID, taskID) {
+		if failedInstallInstanceExists(existing, req.App, serverID, taskID) {
 			continue
 		}
 		metadata, err := a.failedInstallMetadata(req, serverID, taskID, installErr)
@@ -37,14 +37,29 @@ func (a *API) recordFailedInstallInstances(ctx context.Context, req registry.Ins
 		if err != nil {
 			return count, err
 		}
-		_, err = a.store.SaveAppInstance(store.AppInstance{
-			App:      req.App,
-			Version:  req.Version,
-			ServerID: serverID,
-			Status:   failedInstallStatus(req.App),
-			Topology: normalizedInstallTopology(req.Topology),
-			Metadata: string(raw),
-		})
+		recorded, found := installInstanceRecordedAfter(existing, req.App, serverID, startedAt)
+		if found {
+			currentMetadata := map[string]any{}
+			_ = json.Unmarshal([]byte(recorded.Metadata), &currentMetadata)
+			for key, value := range metadata {
+				if key == "clusterId" && strings.TrimSpace(installMetadataString(currentMetadata, key)) != "" {
+					continue
+				}
+				currentMetadata[key] = value
+			}
+			raw, err = json.Marshal(currentMetadata)
+			if err != nil {
+				return count, err
+			}
+			recorded.Status = failedInstallStatus(req.App)
+			recorded.Metadata = string(raw)
+			_, err = a.store.SaveAppInstance(recorded)
+		} else {
+			_, err = a.store.SaveAppInstance(store.AppInstance{
+				App: req.App, Version: req.Version, ServerID: serverID, Status: failedInstallStatus(req.App),
+				Topology: normalizedInstallTopology(req.Topology), Metadata: string(raw),
+			})
+		}
 		if err != nil {
 			return count, err
 		}
@@ -53,19 +68,22 @@ func (a *API) recordFailedInstallInstances(ctx context.Context, req registry.Ins
 	return count, nil
 }
 
-func installInstanceRecordedAfter(instances []store.AppInstance, app, serverID string, startedAt time.Time) bool {
+func installInstanceRecordedAfter(instances []store.AppInstance, app, serverID string, startedAt time.Time) (store.AppInstance, bool) {
 	if startedAt.IsZero() {
-		return false
+		return store.AppInstance{}, false
 	}
+	var selected store.AppInstance
 	for _, item := range instances {
 		if item.App != app || item.ServerID != serverID {
 			continue
 		}
 		if !item.CreatedAt.Before(startedAt) || !item.UpdatedAt.Before(startedAt) {
-			return true
+			if selected.ID == "" || item.UpdatedAt.After(selected.UpdatedAt) {
+				selected = item
+			}
 		}
 	}
-	return false
+	return selected, selected.ID != ""
 }
 
 func failedInstallInstanceExists(instances []store.AppInstance, app, serverID, taskID string) bool {

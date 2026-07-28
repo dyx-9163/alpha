@@ -215,10 +215,69 @@ func (a *API) resolveCredentialParameters(r *http.Request, parameters map[string
 	return out, nil
 }
 
-func (a *API) bindInstallCredentialReferences(app string, req registry.InstallRequest, log registry.Logger) {
+func (a *API) bindInstallCredentialReferences(app string, req registry.InstallRequest, log registry.Logger) error {
+	if strings.EqualFold(strings.TrimSpace(app), "mysql") {
+		if err := a.bindMySQLInstallAdminCredentials(req); err != nil {
+			return errors.New(i18n.Text(req.Language, "api.mysqlInstallCredentialBindingFailed"))
+		}
+		a.recordInstallClusterMembership(app, req, log)
+		return nil
+	}
 	a.bindSelectedInstallCredentialReferences(app, req)
 	a.registerGeneratedInstallCredentials(app, req, log)
 	a.recordInstallClusterMembership(app, req, log)
+	return nil
+}
+
+func (a *API) bindMySQLInstallAdminCredentials(req registry.InstallRequest) error {
+	targets := mysqlInstallCredentialTargetServerIDs(req)
+	if len(targets) == 0 {
+		return store.ErrMySQLInstallAdminCredentialBinding
+	}
+	selectedID := strings.TrimSpace(paramString(req.Parameters, "rootCredentialId", ""))
+	spec, generated := generatedInstallCredentialSpecFor("mysql", req.Parameters)
+	if selectedID == "" && !generated {
+		return store.ErrMySQLInstallAdminCredentialBinding
+	}
+	items := make([]store.MySQLInstallAdminCredential, 0, len(targets))
+	seenInstances := map[string]bool{}
+	for _, serverID := range targets {
+		instance, ok := a.latestAppInstanceForServer("mysql", serverID)
+		if !ok || seenInstances[instance.ID] {
+			return store.ErrMySQLInstallAdminCredentialBinding
+		}
+		seenInstances[instance.ID] = true
+		item := store.MySQLInstallAdminCredential{Instance: instance, Generated: generated}
+		if generated {
+			endpoint := a.credentialEndpointForInstance(instance, spec)
+			item.Credential = store.Credential{
+				Name: generatedCredentialName(spec, endpoint, serverID), Kind: "mysql", Username: spec.Username, Endpoint: endpoint,
+				ServerID: serverID, Tags: "generated,install", Secret: map[string]string{"password": spec.SecretValue}, CreatedBy: req.Actor,
+			}
+		} else {
+			item.Credential = store.Credential{ID: selectedID}
+		}
+		items = append(items, item)
+	}
+	if err := a.store.SaveMySQLInstallAdminCredentials(items); err != nil {
+		return store.ErrMySQLInstallAdminCredentialBinding
+	}
+	for _, item := range items {
+		credential, err := a.store.GetBoundCredential(item.Instance.ID, "admin", true)
+		if err != nil || credential.Kind != "mysql" || credential.Status != "active" || strings.TrimSpace(credential.Username) == "" || strings.TrimSpace(credential.Secret["password"]) == "" {
+			return store.ErrMySQLInstallAdminCredentialBinding
+		}
+	}
+	return nil
+}
+
+func mysqlInstallCredentialTargetServerIDs(req registry.InstallRequest) []string {
+	for _, key := range []string{"mysqlServerIds", "mysqlDataServerIds", "clusterServerIds"} {
+		if targets := cleanStringIDs(stringSliceFromRaw(req.Parameters[key])); len(targets) > 0 {
+			return targets
+		}
+	}
+	return cleanStringIDs(req.TargetServerIDs())
 }
 
 func (a *API) bindSelectedInstallCredentialReferences(app string, req registry.InstallRequest) {

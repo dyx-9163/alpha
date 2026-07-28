@@ -1,7 +1,10 @@
 package httpapi
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -12,6 +15,166 @@ import (
 	"aifar-deployment/backend/internal/i18n"
 	"aifar-deployment/backend/internal/store"
 )
+
+const installCredentialFailureSentinel = `InstallS3cr'et"$\:@{}[]!`
+
+func TestMySQLInstallCredentialPersistenceFailureRollsBackAndMarksEveryNewInstanceFailed(t *testing.T) {
+	for _, source := range []string{"manual", "selected"} {
+		for _, memberCount := range []int{1, 3} {
+			name := fmt.Sprintf("%s/%d-member", source, memberCount)
+			t.Run(name, func(t *testing.T) {
+				api, db, _ := newAuthzTestAPI(t)
+				startedAt := time.Now().Add(-time.Second)
+				serverIDs := make([]string, 0, memberCount)
+				instances := make([]store.AppInstance, 0, memberCount)
+				for index := 0; index < memberCount; index++ {
+					serverID := fmt.Sprintf("srv-%d", index+1)
+					serverIDs = append(serverIDs, serverID)
+					instance, err := db.SaveAppInstance(store.AppInstance{
+						App: "mysql", Version: "8.0.36", ServerID: serverID, Status: "installed",
+						Topology: map[bool]string{true: "innodb-cluster", false: "standalone"}[memberCount == 3],
+						Metadata: fmt.Sprintf(`{"port":3306,"endpoint":"10.0.0.%d:3306"}`, index+1),
+					})
+					if err != nil {
+						t.Fatal(err)
+					}
+					instances = append(instances, instance)
+				}
+				parameters := map[string]any{"rootUser": "root", "rootPassword": installCredentialFailureSentinel}
+				existingCredentialID := ""
+				if source == "selected" {
+					credential, err := db.SaveCredential(store.Credential{
+						Name: "selected-mysql-admin", Kind: "mysql", Username: "root", Status: "active", Scope: "global",
+						Purpose: "admin", Secret: map[string]string{"password": installCredentialFailureSentinel}, CreatedBy: "owner",
+					})
+					if err != nil {
+						t.Fatal(err)
+					}
+					existingCredentialID = credential.ID
+					parameters["rootCredentialId"] = credential.ID
+				}
+				failedInstance := instances[0]
+				if memberCount == 3 {
+					failedInstance = instances[1]
+				}
+				trigger := fmt.Sprintf(`create trigger fail_mysql_install_admin_binding before insert on credential_bindings when new.app_instance_id=%q and new.purpose='admin' begin select raise(abort,'injected credential persistence failure'); end`, failedInstance.ID)
+				if _, err := rawExecSQLite(api.cfg.DatabasePath, trigger); err != nil {
+					t.Fatal(err)
+				}
+				req := registry.InstallRequest{
+					App: "mysql", Version: "8.0.36", Topology: map[bool]string{true: "innodb-cluster", false: "standalone"}[memberCount == 3],
+					Language: "en", Actor: "owner", ServerIDs: serverIDs, Parameters: parameters,
+				}
+				log := &installCredentialTestLogger{}
+				bindingErr := api.bindInstallCredentialReferences("mysql", req, log)
+				if bindingErr == nil {
+					t.Fatal("credential persistence failure was swallowed")
+				}
+				if strings.Contains(bindingErr.Error(), installCredentialFailureSentinel) || strings.Contains(bindingErr.Error(), "injected") {
+					t.Fatalf("credential persistence error leaked private detail: %v", bindingErr)
+				}
+				_, _ = api.recordFailedInstallInstances(context.Background(), req, startedAt, "tsk-install-credential-failed", bindingErr)
+
+				var problems []string
+				for _, instance := range instances {
+					current, err := db.GetAppInstance(instance.ID)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if current.Status != "failed" || !strings.Contains(current.Metadata, `"installFailed":true`) || !strings.Contains(current.Metadata, "tsk-install-credential-failed") {
+						problems = append(problems, fmt.Sprintf("instance %s remained %s", instance.ID, current.Status))
+					}
+					if _, err := db.GetBoundCredential(instance.ID, "admin", true); !errors.Is(err, store.ErrBoundCredentialNotFound) {
+						problems = append(problems, fmt.Sprintf("instance %s retained admin binding: %v", instance.ID, err))
+					}
+				}
+				credentials, err := db.ListCredentials(store.CredentialQuery{Kind: "mysql"})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if source == "manual" && len(credentials) != 0 {
+					problems = append(problems, fmt.Sprintf("manual failure retained %d generated credential(s)", len(credentials)))
+				}
+				if source == "selected" && (len(credentials) != 1 || credentials[0].ID != existingCredentialID) {
+					problems = append(problems, fmt.Sprintf("selected credential set changed: %+v", credentials))
+				}
+				if strings.Contains(log.joined(), installCredentialFailureSentinel) {
+					problems = append(problems, "log leaked install secret")
+				}
+				if len(problems) > 0 {
+					t.Fatal(strings.Join(problems, "; "))
+				}
+			})
+		}
+	}
+}
+
+type installCredentialTestLogger struct{ lines []string }
+
+func (l *installCredentialTestLogger) Info(format string, args ...any) {
+	l.lines = append(l.lines, fmt.Sprintf(format, args...))
+}
+func (l *installCredentialTestLogger) Error(format string, args ...any) {
+	l.lines = append(l.lines, fmt.Sprintf(format, args...))
+}
+func (l *installCredentialTestLogger) joined() string { return strings.Join(l.lines, "\n") }
+
+func TestMySQLInstallCredentialPersistenceCreatesOneCompleteAdminBindingPerNewInstance(t *testing.T) {
+	for _, source := range []string{"manual", "selected"} {
+		for _, memberCount := range []int{1, 3} {
+			t.Run(fmt.Sprintf("%s/%d-member", source, memberCount), func(t *testing.T) {
+				api, db, _ := newAuthzTestAPI(t)
+				serverIDs := make([]string, 0, memberCount)
+				instances := make([]store.AppInstance, 0, memberCount)
+				for index := 0; index < memberCount; index++ {
+					serverID := fmt.Sprintf("srv-%d", index+1)
+					serverIDs = append(serverIDs, serverID)
+					instance, err := db.SaveAppInstance(store.AppInstance{
+						App: "mysql", Version: "8.0.36", ServerID: serverID, Status: "installed",
+						Topology: map[bool]string{true: "innodb-cluster", false: "standalone"}[memberCount == 3],
+						Metadata: fmt.Sprintf(`{"port":3306,"endpoint":"10.0.0.%d:3306"}`, index+1),
+					})
+					if err != nil {
+						t.Fatal(err)
+					}
+					instances = append(instances, instance)
+				}
+				parameters := map[string]any{"rootUser": "root", "rootPassword": installCredentialFailureSentinel}
+				selectedID := ""
+				if source == "selected" {
+					credential, err := db.SaveCredential(store.Credential{Name: "selected-admin", Kind: "mysql", Username: "selected-root", Status: "active", Secret: map[string]string{"password": installCredentialFailureSentinel}})
+					if err != nil {
+						t.Fatal(err)
+					}
+					selectedID = credential.ID
+					parameters["rootCredentialId"] = credential.ID
+				}
+				req := registry.InstallRequest{App: "mysql", Version: "8.0.36", Topology: instances[0].Topology, Language: "en", Actor: "owner", ServerIDs: serverIDs, Parameters: parameters}
+				log := &installCredentialTestLogger{}
+				if err := api.bindInstallCredentialReferences("mysql", req, log); err != nil {
+					t.Fatal(err)
+				}
+				credentialIDs := map[string]bool{}
+				for _, instance := range instances {
+					credential, err := db.GetBoundCredential(instance.ID, "admin", true)
+					if err != nil || credential.Kind != "mysql" || credential.Status != "active" || credential.Username == "" || credential.Secret["password"] != installCredentialFailureSentinel {
+						t.Fatalf("instance %s admin binding incomplete: credential=%+v err=%v", instance.ID, credential, err)
+					}
+					credentialIDs[credential.ID] = true
+				}
+				if source == "selected" && (len(credentialIDs) != 1 || !credentialIDs[selectedID]) {
+					t.Fatalf("selected credential was not shared exactly across members: %+v", credentialIDs)
+				}
+				if source == "manual" && len(credentialIDs) != memberCount {
+					t.Fatalf("manual install did not create one credential per member: %+v", credentialIDs)
+				}
+				if strings.Contains(log.joined(), installCredentialFailureSentinel) {
+					t.Fatal("success log leaked install secret")
+				}
+			})
+		}
+	}
+}
 
 func TestCredentialMutationLockFailureCopyIsLocalized(t *testing.T) {
 	zh := i18n.Text("zh", "api.credentialMutationLockFailed")

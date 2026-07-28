@@ -584,7 +584,14 @@ func (a *API) installAppName(w http.ResponseWriter, r *http.Request, app string)
 			}
 			return err
 		}
-		a.bindInstallCredentialReferences(def.Name, moduleReq, log)
+		if err := a.bindInstallCredentialReferences(def.Name, moduleReq, log); err != nil {
+			if count, recordErr := a.recordFailedInstallInstances(ctx, moduleReq, installStartedAt, task.ID, err); recordErr != nil {
+				log.Error(i18n.Text(lang, "api.installFailedInstanceRecordFailed"), recordErr)
+			} else if count > 0 {
+				log.Info(i18n.Text(lang, "api.installFailedInstanceRecorded"), count)
+			}
+			return err
+		}
 		return nil
 	})
 	if err != nil {

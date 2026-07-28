@@ -19,7 +19,7 @@ import (
 )
 
 func TestCredentialTransportLinuxStandaloneExecutesSpecialCharactersAndCleans(t *testing.T) {
-	for _, outcome := range []string{"success", "mysql-failure", "sql-cleanup-failure"} {
+	for _, outcome := range []string{"success", "mysql-failure", "sql-cleanup-failure", "cancel"} {
 		t.Run(outcome, func(t *testing.T) {
 			fixture := newStandaloneCredentialFixture(t)
 			result := fixture.run(t, outcome)
@@ -132,6 +132,21 @@ func TestCredentialTransportLinuxClusterScriptsCleanSuccessFailureAndCancellatio
 	}
 }
 
+func TestCredentialTransportLinuxClusterRejectsSymlinkContextBeforeMySQLShell(t *testing.T) {
+	fixture := newClusterCredentialFixture(t, "start")
+	target := fixture.contextPath + ".target"
+	if err := os.Rename(fixture.contextPath, target); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, fixture.contextPath); err != nil {
+		t.Fatal(err)
+	}
+	result := fixture.run(t, "success")
+	if result.err == nil || fileExists(fixture.capturePath) || strings.Contains(result.stdout, "completed") {
+		t.Fatalf("cluster symlink context reached mysqlsh or completion: err=%v stdout=%q", result.err, result.stdout)
+	}
+}
+
 func TestCredentialTransportLinuxStatusAndPrimaryExecuteContextAndLeaveNoResidue(t *testing.T) {
 	root := t.TempDir()
 	remote := &localCredentialRemote{root: root, reachedPath: filepath.Join(root, "client.reached")}
@@ -212,6 +227,7 @@ func newStandaloneCredentialFixture(t *testing.T) *standaloneCredentialFixture {
 cat > "$CAPTURE_SQL"
 if [ "${OUTCOME:-}" = "sql-cleanup-failure" ]; then rm -f "$SECURE_SQL"; mkdir "$SECURE_SQL"; fi
 if [ "${OUTCOME:-}" = "mysql-failure" ]; then exit 23; fi
+if [ "${OUTCOME:-}" = "cancel" ]; then trap 'exit 130' INT TERM; while :; do sleep 1; done; fi
 `, 0o700)
 	script, err := installStandaloneScript(InstallScriptRequest{Version: "8.0.36", WorkDir: work, ArchivePath: filepath.Join(root, "bundle.tar"), InstallRoot: installRoot, Port: 3306})
 	if err != nil {
@@ -244,7 +260,25 @@ func (f *standaloneCredentialFixture) run(t *testing.T, outcome string) shellRes
 	t.Helper()
 	cmd := exec.Command("/bin/sh", f.scriptPath, f.contextPath)
 	cmd.Env = append(os.Environ(), "OUTCOME="+outcome, "CAPTURE_CLIENT="+f.clientCapture, "CAPTURE_SQL="+f.sqlCapture)
-	return runShellCommand(cmd)
+	if outcome != "cancel" {
+		return runShellCommand(cmd)
+	}
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for !fileExists(f.sqlCapture) && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !fileExists(f.sqlCapture) {
+		t.Fatal("standalone cancellation seam was not reached")
+	}
+	_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
+	err := cmd.Wait()
+	return shellResult{stdout: stdout.String(), stderr: stderr.String(), err: err}
 }
 
 type clusterCredentialFixture struct{ action, root, contextPath, scriptPath, jsPath, capturePath string }
