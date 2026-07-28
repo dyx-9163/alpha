@@ -58,6 +58,9 @@ function rawBackup(overrides: Record<string, unknown> = {}) {
     taskId,
     metadata: JSON.stringify({
       name: 'nightly',
+      threads: 4,
+      maxRateMBps: 0,
+      keepLast: 5,
       phase: 'success',
       mysqlVersion: '8.0.36',
       mysqlShellVersion: '8.0.36',

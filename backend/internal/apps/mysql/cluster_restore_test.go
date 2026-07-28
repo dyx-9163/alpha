@@ -80,6 +80,14 @@ func TestBackupInnoDBClusterUsesRuntimeOnlinePrimaryAndRecordsMembership(t *test
 	if len(data.backups) != 1 || data.backups[0].ServerID != servers[0].ID || clusterIDFromBackup(data.backups[0]) != "cluster_1234567890abcdef12345678" {
 		t.Fatalf("cluster backup record = %+v", data.backups)
 	}
+	var metadata struct {
+		ManifestVersion int    `json:"manifestVersion"`
+		Topology        string `json:"topology"`
+		MySQLVersion    string `json:"mysqlVersion"`
+	}
+	if err := json.Unmarshal([]byte(data.backups[0].Metadata), &metadata); err != nil || metadata.ManifestVersion != 2 || metadata.Topology != "innodb-cluster" || metadata.MySQLVersion != "8.0.36" {
+		t.Fatalf("successful cluster backup metadata must mirror the verified manifest: metadata=%s parsed=%+v err=%v", data.backups[0].Metadata, metadata, err)
+	}
 	manifestRaw, err := os.ReadFile(filepath.Join(filepath.Dir(data.backups[0].Path), "backup-manifest.json"))
 	if err != nil {
 		t.Fatal(err)

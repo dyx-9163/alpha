@@ -687,6 +687,14 @@ func TestRestoreStandalonePreRestoreBackupCoreUsesDedicatedTypeWithoutPlanOrRete
 	if len(data.backups) != 1 || data.backups[0].BackupType != "pre-restore" || data.backups[0].Status != "success" {
 		t.Fatalf("pre-restore records = %+v", data.backups)
 	}
+	var metadata struct {
+		ManifestVersion int    `json:"manifestVersion"`
+		Topology        string `json:"topology"`
+		MySQLVersion    string `json:"mysqlVersion"`
+	}
+	if err := json.Unmarshal([]byte(data.backups[0].Metadata), &metadata); err != nil || metadata.ManifestVersion != 2 || metadata.Topology != "standalone" || metadata.MySQLVersion != "8.0.36" {
+		t.Fatalf("successful pre-restore metadata must mirror the verified manifest: metadata=%s parsed=%+v err=%v", data.backups[0].Metadata, metadata, err)
+	}
 	if len(recorder.startedSteps) != 0 {
 		t.Fatalf("pre-restore core injected ordinary backup steps: %v", recorder.startedSteps)
 	}

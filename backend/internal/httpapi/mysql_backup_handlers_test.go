@@ -510,7 +510,7 @@ func TestMySQLBackupListExcludesDeletedAndExpandsClusterMembersOnce(t *testing.T
 	// Production break caught: listing only the clicked cluster member or including deleted rows would hide/duplicate cluster-level history.
 	api, db, secret := newAuthzTestAPI(t)
 	_, standalone := saveMySQLBackupTarget(t, db, "standalone", "")
-	standaloneBackup, err := db.SaveAppBackup(store.AppBackup{App: "mysql", InstanceID: standalone.ID, ServerID: standalone.ServerID, BackupType: "logical-full", Status: "success", Path: filepathForTestBackup("one"), Checksum: strings.Repeat("a", 64), Size: 10})
+	standaloneBackup, err := db.SaveAppBackup(store.AppBackup{App: "mysql", InstanceID: standalone.ID, ServerID: standalone.ServerID, BackupType: "logical-full", Status: "success", Path: filepathForTestBackup("one"), Checksum: strings.Repeat("a", 64), Size: 10, Metadata: `{"manifestVersion":2,"topology":"standalone","mysqlVersion":"8.0.36","mysqlShellVersion":"8.0.36","schemas":["aifar"],"phase":"success"}`})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -522,6 +522,9 @@ func TestMySQLBackupListExcludesDeletedAndExpandsClusterMembersOnce(t *testing.T
 	if len(items) != 1 || items[0].ID != standaloneBackup.ID {
 		t.Fatalf("standalone items=%+v", items)
 	}
+	if items[0].Metadata != standaloneBackup.Metadata {
+		t.Fatalf("list dropped controlled manifest metadata: got=%s want=%s", items[0].Metadata, standaloneBackup.Metadata)
+	}
 
 	clusterID := "mysql_cluster_1234567890abcdef12345678"
 	var members []store.AppInstance
@@ -529,13 +532,16 @@ func TestMySQLBackupListExcludesDeletedAndExpandsClusterMembersOnce(t *testing.T
 		_, member := saveMySQLBackupTarget(t, db, "innodb-cluster", clusterID)
 		members = append(members, member)
 	}
-	clusterBackup, err := db.SaveAppBackup(store.AppBackup{App: "mysql", InstanceID: members[0].ID, ServerID: members[0].ServerID, BackupType: "logical-full", Status: "success", Path: filepathForTestBackup("cluster"), Checksum: strings.Repeat("c", 64), Size: 20, Metadata: `{"clusterId":"` + clusterID + `"}`})
+	clusterBackup, err := db.SaveAppBackup(store.AppBackup{App: "mysql", InstanceID: members[0].ID, ServerID: members[0].ServerID, BackupType: "logical-full", Status: "success", Path: filepathForTestBackup("cluster"), Checksum: strings.Repeat("c", 64), Size: 20, Metadata: `{"manifestVersion":2,"topology":"innodb-cluster","clusterId":"` + clusterID + `","mysqlVersion":"8.0.36","mysqlShellVersion":"8.0.36","schemas":["aifar"],"phase":"success"}`})
 	if err != nil {
 		t.Fatal(err)
 	}
 	clusterItems := getBackupListItems(t, api, token, members[1].ID)
 	if len(clusterItems) != 1 || clusterItems[0].ID != clusterBackup.ID {
 		t.Fatalf("cluster items=%+v", clusterItems)
+	}
+	if clusterItems[0].Metadata != clusterBackup.Metadata {
+		t.Fatalf("cluster list dropped controlled manifest metadata: got=%s want=%s", clusterItems[0].Metadata, clusterBackup.Metadata)
 	}
 }
 

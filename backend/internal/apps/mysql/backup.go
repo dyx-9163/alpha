@@ -576,7 +576,11 @@ func (s Service) backupStandaloneCore(ctx context.Context, req registry.BackupRe
 		state.record.Path = state.paths.Archive
 		state.record.Checksum = state.archiveSHA
 		state.record.Size = state.archiveSize
-		state.record.Metadata = backupMetadataForExecution(parameters, "committed", inspection, execution)
+		metadata, err := backupMetadataFromVerifiedManifest(parameters, "committed", state.manifest)
+		if err != nil {
+			return err
+		}
+		state.record.Metadata = metadata
 		saved, err := data.SaveAppBackup(state.record)
 		if err != nil {
 			return err
@@ -589,7 +593,11 @@ func (s Service) backupStandaloneCore(ctx context.Context, req registry.BackupRe
 	if err := step(14, func() error {
 		state.record.Status = "success"
 		state.record.CompletedAt = time.Now().UTC()
-		state.record.Metadata = backupMetadataForExecution(parameters, "success", inspection, execution)
+		metadata, err := backupMetadataFromVerifiedManifest(parameters, "success", state.manifest)
+		if err != nil {
+			return err
+		}
+		state.record.Metadata = metadata
 		saved, err := data.SaveAppBackup(state.record)
 		if err != nil {
 			return err
@@ -995,6 +1003,27 @@ func backupMetadataForExecution(parameters backupParameters, phase string, inspe
 	}
 	encoded, _ := json.Marshal(metadata)
 	return string(encoded)
+}
+
+func backupMetadataFromVerifiedManifest(parameters backupParameters, phase string, raw []byte) (string, error) {
+	manifest, err := decodeRestoreManifest(raw)
+	if err != nil {
+		return "", err
+	}
+	metadata := map[string]any{
+		"name": parameters.Name, "threads": parameters.Threads, "maxRateMBps": parameters.MaxRateMBps,
+		"keepLast": parameters.KeepLast, "phase": phase, "manifestVersion": manifest.ManifestVersion,
+		"topology": manifest.Topology, "mysqlVersion": manifest.MySQLVersion,
+		"mysqlShellVersion": manifest.MySQLShellVersion, "schemas": manifest.Schemas,
+	}
+	if manifest.ClusterID != "" {
+		metadata["clusterId"] = manifest.ClusterID
+	}
+	encoded, err := json.Marshal(metadata)
+	if err != nil {
+		return "", err
+	}
+	return string(encoded), nil
 }
 
 func writeMySQLSecretContext(credential store.Credential, port int) (string, error) {

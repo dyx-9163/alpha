@@ -368,6 +368,7 @@ const disasterDialogVisible = ref(false)
 const maintenanceClearVisible = ref(false)
 const maintenanceClearConfirmed = ref(false)
 const maintenanceClearSubmitting = ref(false)
+const maintenanceClearIdentity = ref('')
 const liveInstances = computed(() => instances.value.map((instance) => applyRealtimeStatusToAppInstance(instance, realtime.appInstanceSnapshot(instance.id))))
 const instanceGroups = computed(() => groupDatabaseInstances(liveInstances.value))
 const activeMysqlGroup = computed(() => instanceGroups.value.find((group) => group.id === activeMysqlGroupKey.value) ?? null)
@@ -1544,25 +1545,50 @@ async function openLatestMySQLDisaster(group: DatabaseGroup) {
 }
 
 function openMaintenanceClear(group: DatabaseGroup) {
-  if (!mysqlAvailability(group).clearMaintenance) return
+  const maintenance = mysqlGroupMaintenance(group)
+  if (!mysqlAvailability(group).clearMaintenance || maintenance.kind !== 'required') return
   activateMySQLGroup(group)
+  maintenanceClearIdentity.value = mysqlMaintenanceIdentity(maintenance)
   maintenanceClearConfirmed.value = false
   maintenanceClearVisible.value = true
 }
 
 async function confirmMaintenanceClear() {
-  if (!maintenanceClearConfirmed.value || !activeMysqlGroup.value || !activeAvailability.value.clearMaintenance) return
+  if (!maintenanceClearConfirmed.value) return
+  const group = activeMysqlGroup.value
+  const maintenance = group ? mysqlGroupMaintenance(group) : { kind: 'invalid' as const }
+  if (!group || !activeAvailability.value.clearMaintenance || mysqlMaintenanceIdentity(maintenance) !== maintenanceClearIdentity.value) {
+    ElMessage.warning(t('database.mysqlBackup.staleOperationBlocked'))
+    return
+  }
   maintenanceClearSubmitting.value = true
   try {
     await clearMySQLMaintenance(activeTarget.value.instanceId, taskProgress, t('database.mysqlBackup.clearTaskLabel'))
     maintenanceClearVisible.value = false
     maintenanceClearConfirmed.value = false
+    maintenanceClearIdentity.value = ''
     ElMessage.success(t('database.mysqlBackup.clearAccepted'))
   } catch (error) {
     ElMessage.error(error instanceof Error ? error.message : t('database.mysqlBackup.clearFailed'))
   } finally {
     maintenanceClearSubmitting.value = false
   }
+}
+
+function mysqlMaintenanceIdentity(maintenance: MySQLMaintenanceResult) {
+  if (maintenance.kind !== 'required') return ''
+  const state = maintenance.state
+  return JSON.stringify([
+    state.version,
+    state.state,
+    state.reason,
+    state.scope,
+    state.clusterId ?? '',
+    state.backupId,
+    state.taskId,
+    state.restorePhase,
+    state.recordedAt
+  ])
 }
 
 function guardActiveBackupSubmission() {

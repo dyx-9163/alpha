@@ -77,6 +77,14 @@ func TestBackupStandaloneCompletesOneDumpTransferCommitRetentionAndCleanup(t *te
 	if backup.Status != "success" || backup.TaskID != "tsk_1234567890abcdef12345678" || backup.Checksum != remote.archiveSHA || backup.Size != int64(len(remote.archive)) {
 		t.Fatalf("completed backup = %+v", backup)
 	}
+	var metadata struct {
+		ManifestVersion int    `json:"manifestVersion"`
+		Topology        string `json:"topology"`
+		MySQLVersion    string `json:"mysqlVersion"`
+	}
+	if err := json.Unmarshal([]byte(backup.Metadata), &metadata); err != nil || metadata.ManifestVersion != 2 || metadata.Topology != "standalone" || metadata.MySQLVersion != "8.0.36" {
+		t.Fatalf("successful backup metadata must mirror the verified manifest: metadata=%s parsed=%+v err=%v", backup.Metadata, metadata, err)
+	}
 	for _, name := range []string{"dump.tar", "backup-manifest.json", "checksums.txt"} {
 		if info, err := os.Stat(filepath.Join(filepath.Dir(backup.Path), name)); err != nil || !info.Mode().IsRegular() {
 			t.Fatalf("committed %s missing or unsafe: info=%v err=%v", name, info, err)

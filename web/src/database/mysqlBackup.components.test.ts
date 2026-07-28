@@ -4,7 +4,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { flushPromises, mount } from '@vue/test-utils'
 import { createPinia } from 'pinia'
 import { createMemoryHistory, createRouter } from 'vue-router'
-import ElementPlus, { ElButton, ElCheckbox, ElInput } from 'element-plus'
+import ElementPlus, { ElButton, ElCheckbox, ElInput, ElMessage } from 'element-plus'
 import MySQLBackupDialog from './MySQLBackupDialog.vue'
 import MySQLBackupDrawer from './MySQLBackupDrawer.vue'
 import MySQLDisasterRebuildDialog from './MySQLDisasterRebuildDialog.vue'
@@ -53,6 +53,38 @@ const backup: MySQLBackupRecord = {
   createdAt: '2026-07-28T01:02:03Z'
 }
 
+function backendBackupRecord(record: MySQLBackupRecord) {
+  return {
+    id: record.id,
+    app: 'mysql',
+    instanceId: record.instanceId,
+    serverId: record.serverId,
+    backupType: record.backupType,
+    status: record.status,
+    path: '/managed/mysql-backups/private/dump.tar',
+    checksum: record.checksum,
+    size: record.size,
+    taskId,
+    metadata: JSON.stringify({
+      name: 'nightly',
+      threads: 4,
+      maxRateMBps: 0,
+      keepLast: 5,
+      phase: 'success',
+      manifestVersion: record.metadata.manifestVersion,
+      topology: record.metadata.topology,
+      clusterId: record.metadata.clusterId,
+      mysqlVersion: record.metadata.mysqlVersion,
+      mysqlShellVersion: '8.0.36',
+      schemas: record.metadata.schemas,
+      verificationResult: record.metadata.verificationResult,
+      verifiedAt: '2026-07-28T02:30:00Z'
+    }),
+    createdAt: record.createdAt,
+    completedAt: '2026-07-28T02:20:00Z'
+  }
+}
+
 function mountingOptions() {
   return {
     global: {
@@ -61,6 +93,42 @@ function mountingOptions() {
       mocks: { ResizeObserver: class { observe() {} unobserve() {} disconnect() {} } }
     }
   }
+}
+
+async function mountDatabaseCluster(markerRef: { value: Record<string, unknown> | null }) {
+  localStorage.setItem('aifar-session-token', 'test-token')
+  localStorage.setItem('aifar-role', 'owner')
+  const controlledClusterId = 'cluster_1234567890abcdef12345678'
+  const nodeIds = [instanceId, 'app_222222222222222222222222', 'app_333333333333333333333333']
+  const serverIds = [serverId, 'srv_222222222222222222222222', 'srv_333333333333333333333333']
+  apiGet.mockImplementation(async (path: string) => {
+    if (path === '/database/instances') return nodeIds.map((id, index) => ({
+      id, app: 'mysql', version: '8.0.36', serverId: serverIds[index], status: 'failed', topology: 'innodb-cluster',
+      metadata: JSON.stringify({
+        topology: 'innodb-cluster',
+        clusterId: controlledClusterId,
+        role: index === 0 ? 'primary' : 'secondary',
+        lastCheck: { status: 'success', details: { runtimeStatus: 'running' } },
+        ...(markerRef.value ? { mysqlMaintenance: markerRef.value } : {})
+      }),
+      createdAt: `2026-07-28T01:00:0${index}Z`
+    }))
+    if (path === '/servers') return serverIds.map((id, index) => ({ id, name: `db-${index + 1}`, status: 'available' }))
+    if (path === '/tasks') return []
+    return []
+  })
+  const router = createRouter({ history: createMemoryHistory(), routes: [{ path: '/', component: { template: '<div />' } }] })
+  await router.push('/')
+  await router.isReady()
+  const wrapper = mount(DatabaseView, {
+    global: { plugins: [createPinia(), router, ElementPlus], stubs: { teleport: true, StatusTag: true, RunRecordTable: true, KeyValueGrid: true } }
+  })
+  await flushPromises()
+  return wrapper
+}
+
+function databaseSetupState(wrapper: ReturnType<typeof mount>) {
+  return (wrapper.vm as unknown as { $: { setupState: Record<string, any> } }).$.setupState
 }
 
 describe('MySQL backup and restore surfaces', () => {
@@ -340,7 +408,7 @@ describe('MySQL backup and restore surfaces', () => {
       }))
       if (path === '/servers') return serverIds.map((id, index) => ({ id, name: `db-${index + 1}`, status: 'available' }))
       if (path === '/tasks') return []
-      if (path === `/apps/instances/${instanceId}/backups`) return { instanceId, items: [newer, clusterBackup], defaults: { threads: 4, maxRateMBps: 0 } }
+      if (path === `/apps/instances/${instanceId}/backups`) return { instanceId, items: [backendBackupRecord(newer), backendBackupRecord(clusterBackup)], defaults: { threads: 4, maxRateMBps: 0 } }
       return []
     })
     const router = createRouter({ history: createMemoryHistory(), routes: [{ path: '/', component: { template: '<div />' } }] })
@@ -358,5 +426,101 @@ describe('MySQL backup and restore surfaces', () => {
     await flushPromises()
     expect(wrapper.findComponent(MySQLDisasterRebuildDialog).props('modelValue')).toBe(true)
     expect(wrapper.findComponent(MySQLDisasterRebuildDialog).props('backup')).toMatchObject({ id: backup.id })
+  })
+
+  it.each(['backupId', 'taskId', 'restorePhase', 'recordedAt', 'clusterId', 'scope', 'disappears'])(
+    'refuses maintenance clear when the exact confirmed marker changes at %s', async (drift) => {
+    localStorage.setItem('aifar-session-token', 'test-token')
+    localStorage.setItem('aifar-role', 'owner')
+    const controlledClusterId = 'cluster_1234567890abcdef12345678'
+    const nodeIds = [instanceId, 'app_222222222222222222222222', 'app_333333333333333333333333']
+    const serverIds = [serverId, 'srv_222222222222222222222222', 'srv_333333333333333333333333']
+    const confirmedMarker = {
+      version: 1, state: 'required', reason: 'restore_incomplete', scope: 'cluster', clusterId: controlledClusterId,
+      backupId: backup.id, taskId, restorePhase: 'schema_mutation_started', recordedAt: '2026-07-28T02:00:00Z'
+    }
+    let currentMarker: typeof confirmedMarker | null = confirmedMarker
+    apiGet.mockImplementation(async (path: string) => {
+      if (path === '/database/instances') return nodeIds.map((id, index) => ({
+        id, app: 'mysql', version: '8.0.36', serverId: serverIds[index], status: 'failed', topology: 'innodb-cluster',
+        metadata: JSON.stringify({ topology: 'innodb-cluster', clusterId: controlledClusterId, role: index === 0 ? 'primary' : 'secondary', ...(currentMarker ? { mysqlMaintenance: currentMarker } : {}) }),
+        createdAt: `2026-07-28T01:00:0${index}Z`
+      }))
+      if (path === '/servers') return serverIds.map((id, index) => ({ id, name: `db-${index + 1}`, status: 'available' }))
+      if (path === '/tasks') return []
+      return []
+    })
+    const router = createRouter({ history: createMemoryHistory(), routes: [{ path: '/', component: { template: '<div />' } }] })
+    await router.push('/')
+    await router.isReady()
+    const warning = vi.spyOn(ElMessage, 'warning')
+    const wrapper = mount(DatabaseView, {
+      global: { plugins: [createPinia(), router, ElementPlus], stubs: { teleport: true, StatusTag: true, RunRecordTable: true, KeyValueGrid: true } }
+    })
+    await flushPromises()
+    const clearActions = () => wrapper.findAllComponents(ElButton).filter((button) => button.text() === 'Clear maintenance gate')
+    await clearActions()[0].trigger('click')
+    await flushPromises()
+    const confirmation = wrapper.findAllComponents(ElCheckbox).at(-1)!
+    confirmation.vm.$emit('update:modelValue', true)
+    await wrapper.vm.$nextTick()
+    if (drift === 'disappears') currentMarker = null
+    else if (drift === 'backupId') currentMarker = { ...confirmedMarker, backupId: 'backup_bbbbbbbbbbbbbbbbbbbbbbbb' }
+    else if (drift === 'taskId') currentMarker = { ...confirmedMarker, taskId: 'tsk_bbbbbbbbbbbbbbbbbbbbbbbb' }
+    else if (drift === 'restorePhase') currentMarker = { ...confirmedMarker, restorePhase: 'load_complete' }
+    else if (drift === 'recordedAt') currentMarker = { ...confirmedMarker, recordedAt: '2026-07-28T02:01:00Z' }
+    else if (drift === 'clusterId') currentMarker = { ...confirmedMarker, clusterId: 'cluster_bbbbbbbbbbbbbbbbbbbbbbbb' }
+    else {
+      const { clusterId: _clusterId, ...standaloneMarker } = confirmedMarker
+      currentMarker = { ...standaloneMarker, scope: 'standalone' } as typeof confirmedMarker
+    }
+    const refresh = wrapper.findAllComponents(ElButton).find((button) => button.text() === 'Refresh')!
+    await refresh.trigger('click')
+    await flushPromises()
+    apiPost.mockReset()
+    await clearActions().at(-1)!.trigger('click')
+    await flushPromises()
+    expect(apiPost).not.toHaveBeenCalled()
+    expect(warning).toHaveBeenCalledWith('The MySQL control state changed. Refresh and confirm the operation again.')
+    warning.mockRestore()
+  })
+
+  it('refuses cluster start when maintenance appears after the displayed group was captured', async () => {
+    const markerRef: { value: Record<string, unknown> | null } = { value: null }
+    const wrapper = await mountDatabaseCluster(markerRef)
+    const setup = databaseSetupState(wrapper)
+    const originalGroup = setup.instanceGroups[0]
+    const warning = vi.spyOn(ElMessage, 'warning')
+    markerRef.value = {
+      version: 1, state: 'required', reason: 'restore_incomplete', scope: 'cluster', clusterId: 'cluster_1234567890abcdef12345678',
+      backupId: backup.id, taskId, restorePhase: 'schema_mutation_started', recordedAt: '2026-07-28T02:00:00Z'
+    }
+    await setup.load()
+    await flushPromises()
+    apiPost.mockReset()
+    await setup.startMysqlCluster(originalGroup)
+    expect(apiPost).not.toHaveBeenCalled()
+    expect(warning).toHaveBeenCalledWith('The MySQL control state changed. Refresh and confirm the operation again.')
+    warning.mockRestore()
+  })
+
+  it('refuses group delete when maintenance appears after delete confirmation opens', async () => {
+    const markerRef: { value: Record<string, unknown> | null } = { value: null }
+    const wrapper = await mountDatabaseCluster(markerRef)
+    const setup = databaseSetupState(wrapper)
+    const originalGroup = setup.instanceGroups[0]
+    setup.openDeleteGroup(originalGroup, 'mysql-group')
+    const warning = vi.spyOn(ElMessage, 'warning')
+    markerRef.value = {
+      version: 1, state: 'required', reason: 'restore_incomplete', scope: 'cluster', clusterId: 'cluster_1234567890abcdef12345678',
+      backupId: backup.id, taskId, restorePhase: 'schema_mutation_started', recordedAt: '2026-07-28T02:00:00Z'
+    }
+    await setup.load()
+    await flushPromises()
+    apiPost.mockReset()
+    await setup.confirmDeleteScope()
+    expect(apiPost).not.toHaveBeenCalled()
+    expect(warning).toHaveBeenCalledWith('The MySQL control state changed. Refresh and confirm the operation again.')
+    warning.mockRestore()
   })
 })
