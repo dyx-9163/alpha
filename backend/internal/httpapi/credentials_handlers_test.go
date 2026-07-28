@@ -20,7 +20,7 @@ const installCredentialFailureSentinel = `InstallS3cr'et"$\:@{}[]!`
 
 func TestMySQLInstallCredentialPersistenceFailureRollsBackAndMarksEveryNewInstanceFailed(t *testing.T) {
 	for _, source := range []string{"manual", "selected"} {
-		for _, memberCount := range []int{1, 3} {
+		for _, memberCount := range []int{1, 3, 4} {
 			name := fmt.Sprintf("%s/%d-member", source, memberCount)
 			t.Run(name, func(t *testing.T) {
 				api, db, _ := newAuthzTestAPI(t)
@@ -31,12 +31,12 @@ func TestMySQLInstallCredentialPersistenceFailureRollsBackAndMarksEveryNewInstan
 					serverID := fmt.Sprintf("srv-%d", index+1)
 					serverIDs = append(serverIDs, serverID)
 					metadata := fmt.Sprintf(`{"port":3306,"endpoint":"10.0.0.%d:3306"}`, index+1)
-					if memberCount == 3 {
+					if memberCount >= 3 {
 						metadata = fmt.Sprintf(`{"clusterId":"cluster_1234567890abcdef12345678","port":3306,"endpoint":"10.0.0.%d:3306"}`, index+1)
 					}
 					instance, err := db.SaveAppInstance(store.AppInstance{
 						App: "mysql", Version: "8.0.36", ServerID: serverID, Status: "installed",
-						Topology: map[bool]string{true: "innodb-cluster", false: "standalone"}[memberCount == 3],
+						Topology: map[bool]string{true: "innodb-cluster", false: "standalone"}[memberCount >= 3],
 						Metadata: metadata,
 					})
 					if err != nil {
@@ -59,7 +59,7 @@ func TestMySQLInstallCredentialPersistenceFailureRollsBackAndMarksEveryNewInstan
 					parameters[mysqlRootCredentialVersionParameter] = credential.CurrentVersion
 				}
 				failedInstance := instances[0]
-				if memberCount == 3 {
+				if memberCount >= 3 {
 					failedInstance = instances[1]
 				}
 				trigger := fmt.Sprintf(`create trigger fail_mysql_install_admin_binding before insert on credential_bindings when new.app_instance_id=%q and new.purpose='admin' begin select raise(abort,'injected credential persistence failure'); end`, failedInstance.ID)
@@ -67,7 +67,7 @@ func TestMySQLInstallCredentialPersistenceFailureRollsBackAndMarksEveryNewInstan
 					t.Fatal(err)
 				}
 				req := registry.InstallRequest{
-					App: "mysql", Version: "8.0.36", Topology: map[bool]string{true: "innodb-cluster", false: "standalone"}[memberCount == 3],
+					App: "mysql", Version: "8.0.36", Topology: map[bool]string{true: "innodb-cluster", false: "standalone"}[memberCount >= 3],
 					Language: "en", Actor: "owner", ServerIDs: serverIDs, Parameters: parameters,
 				}
 				log := &installCredentialTestLogger{}
@@ -129,7 +129,7 @@ func (l *installCredentialTestLogger) joined() string { return strings.Join(l.li
 
 func TestMySQLInstallCredentialPersistenceCreatesOneCompleteAdminBindingPerNewInstance(t *testing.T) {
 	for _, source := range []string{"manual", "selected"} {
-		for _, memberCount := range []int{1, 3} {
+		for _, memberCount := range []int{1, 3, 4} {
 			t.Run(fmt.Sprintf("%s/%d-member", source, memberCount), func(t *testing.T) {
 				api, db, _ := newAuthzTestAPI(t)
 				startedAt := time.Now().Add(-time.Second)
@@ -139,12 +139,12 @@ func TestMySQLInstallCredentialPersistenceCreatesOneCompleteAdminBindingPerNewIn
 					serverID := fmt.Sprintf("srv-%d", index+1)
 					serverIDs = append(serverIDs, serverID)
 					metadata := fmt.Sprintf(`{"port":3306,"endpoint":"10.0.0.%d:3306"}`, index+1)
-					if memberCount == 3 {
+					if memberCount >= 3 {
 						metadata = fmt.Sprintf(`{"clusterId":"cluster_1234567890abcdef12345678","port":3306,"endpoint":"10.0.0.%d:3306"}`, index+1)
 					}
 					instance, err := db.SaveAppInstance(store.AppInstance{
 						App: "mysql", Version: "8.0.36", ServerID: serverID, Status: "installed",
-						Topology: map[bool]string{true: "innodb-cluster", false: "standalone"}[memberCount == 3],
+						Topology: map[bool]string{true: "innodb-cluster", false: "standalone"}[memberCount >= 3],
 						Metadata: metadata,
 					})
 					if err != nil {

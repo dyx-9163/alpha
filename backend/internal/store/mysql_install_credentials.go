@@ -17,7 +17,7 @@ type MySQLInstallAdminCredential struct {
 }
 
 func (s *Store) MarkMySQLInstallInstancesFailed(items []AppInstance) error {
-	if len(items) == 0 {
+	if err := validateMySQLInstallInstanceSet(items); err != nil {
 		return ErrMySQLInstallAdminCredentialBinding
 	}
 	tx, err := s.db.Begin()
@@ -37,7 +37,8 @@ func (s *Store) MarkMySQLInstallInstancesFailed(items []AppInstance) error {
 			Scan(&current.ID, &current.App, &current.Version, &current.ServerID, &current.Status, &current.Topology, &current.Metadata, &current.CreatedAt, &current.UpdatedAt); err != nil {
 			return ErrMySQLInstallAdminCredentialBinding
 		}
-		if current.App != "mysql" || current.Version != item.Version || current.ServerID != item.ServerID || !current.CreatedAt.Equal(item.CreatedAt) {
+		if current.App != "mysql" || current.Version != item.Version || current.ServerID != item.ServerID || current.Topology != item.Topology ||
+			mysqlInstallClusterID(current.Metadata) != mysqlInstallClusterID(item.Metadata) || !current.CreatedAt.Equal(item.CreatedAt) {
 			return ErrMySQLInstallAdminCredentialBinding
 		}
 		result, err := tx.Exec(`update app_instances set status='failed',metadata=?,updated_at=? where id=?`, item.Metadata, now, item.ID)
@@ -55,7 +56,11 @@ func (s *Store) MarkMySQLInstallInstancesFailed(items []AppInstance) error {
 }
 
 func (s *Store) SaveMySQLInstallAdminCredentials(items []MySQLInstallAdminCredential) error {
-	if len(items) == 0 {
+	instances := make([]AppInstance, 0, len(items))
+	for _, item := range items {
+		instances = append(instances, item.Instance)
+	}
+	if err := validateMySQLInstallInstanceSet(instances); err != nil {
 		return ErrMySQLInstallAdminCredentialBinding
 	}
 	tx, err := s.db.Begin()
@@ -72,10 +77,11 @@ func (s *Store) SaveMySQLInstallAdminCredentials(items []MySQLInstallAdminCreden
 			return ErrMySQLInstallAdminCredentialBinding
 		}
 		seenInstances[instanceID] = true
-		var app, version, serverID, topology string
+		var app, version, serverID, topology, currentMetadata string
 		var createdAt time.Time
-		if err := tx.QueryRow(`select app,version,server_id,topology,created_at from app_instances where id=?`, instanceID).Scan(&app, &version, &serverID, &topology, &createdAt); err != nil ||
-			app != "mysql" || version != item.Instance.Version || serverID != item.Instance.ServerID || topology != item.Instance.Topology || !createdAt.Equal(item.Instance.CreatedAt) {
+		if err := tx.QueryRow(`select app,version,server_id,topology,metadata,created_at from app_instances where id=?`, instanceID).Scan(&app, &version, &serverID, &topology, &currentMetadata, &createdAt); err != nil ||
+			app != "mysql" || version != item.Instance.Version || serverID != item.Instance.ServerID || topology != item.Instance.Topology ||
+			mysqlInstallClusterID(currentMetadata) != mysqlInstallClusterID(item.Instance.Metadata) || !createdAt.Equal(item.Instance.CreatedAt) {
 			return ErrMySQLInstallAdminCredentialBinding
 		}
 		var existing int
@@ -124,6 +130,45 @@ func (s *Store) SaveMySQLInstallAdminCredentials(items []MySQLInstallAdminCreden
 		return ErrMySQLInstallAdminCredentialBinding
 	}
 	return nil
+}
+
+func validateMySQLInstallInstanceSet(items []AppInstance) error {
+	if len(items) == 0 {
+		return ErrMySQLInstallAdminCredentialBinding
+	}
+	topology := strings.TrimSpace(items[0].Topology)
+	if (topology == "standalone" && len(items) != 1) || (topology == "innodb-cluster" && len(items) < 3) {
+		return ErrMySQLInstallAdminCredentialBinding
+	}
+	if topology != "standalone" && topology != "innodb-cluster" {
+		return ErrMySQLInstallAdminCredentialBinding
+	}
+	clusterID := ""
+	seen := make(map[string]bool, len(items))
+	for _, item := range items {
+		if strings.TrimSpace(item.ID) == "" || seen[item.ID] || item.App != "mysql" || item.Topology != topology {
+			return ErrMySQLInstallAdminCredentialBinding
+		}
+		seen[item.ID] = true
+		if topology != "innodb-cluster" {
+			continue
+		}
+		candidate := mysqlInstallClusterID(item.Metadata)
+		if candidate == "" || (clusterID != "" && candidate != clusterID) {
+			return ErrMySQLInstallAdminCredentialBinding
+		}
+		clusterID = candidate
+	}
+	return nil
+}
+
+func mysqlInstallClusterID(metadata string) string {
+	var value map[string]any
+	if json.Unmarshal([]byte(metadata), &value) != nil {
+		return ""
+	}
+	clusterID, _ := value["clusterId"].(string)
+	return strings.TrimSpace(clusterID)
 }
 
 func (s *Store) insertGeneratedMySQLInstallCredentialTx(tx *sql.Tx, credential Credential, instanceID string, now time.Time) (string, error) {

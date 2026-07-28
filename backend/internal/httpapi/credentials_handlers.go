@@ -319,7 +319,7 @@ func mysqlInstallCredentialTargetServerIDs(req registry.InstallRequest) []string
 func ownedMySQLInstallInstances(req registry.InstallRequest, startedAt time.Time, instances []store.AppInstance) ([]store.AppInstance, error) {
 	targets := mysqlInstallCredentialTargetServerIDs(req)
 	topology := normalizedInstallTopology(req.Topology)
-	if req.App != "mysql" || startedAt.IsZero() || (topology == "standalone" && len(targets) != 1) || (topology == "innodb-cluster" && len(targets) != 3) {
+	if req.App != "mysql" || startedAt.IsZero() || (topology == "standalone" && len(targets) != 1) || (topology == "innodb-cluster" && len(targets) < 3) {
 		return nil, store.ErrMySQLInstallAdminCredentialBinding
 	}
 	if topology != "standalone" && topology != "innodb-cluster" {
