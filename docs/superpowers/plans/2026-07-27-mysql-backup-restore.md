@@ -16,6 +16,7 @@
 - Use bound active MySQL credentials with purpose `admin`; never use `AIFAR_DEFAULT_PASSWORD` as a backup or restore fallback.
 - Never place a MySQL password in a command line, manifest, backup metadata, task log, error details, or audit message. Pass it through a `0600` remote secret context and remove that context on success, failure, and cancellation.
 - Backup may run online. Restore requires an explicit maintenance confirmation and leaves maintenance active when schema deletion or loading has begun but completion fails.
+- Persist incomplete-restore maintenance state in the strict non-secret `app_instances.metadata.mysqlMaintenance` v1 object defined by design section 9.1. Standalone writes one instance; cluster writes all three authoritative members atomically. Valid state blocks ordinary check/start/delete/backup/restore at both HTTP pre-task and locked module/service gates. Malformed or divergent cluster state fails closed. Only owner maintenance clear and explicit disaster rebuild may proceed.
 - Standalone locks use `app-instance/<instanceId>`; cluster operations use `app-cluster/<clusterId>`. Use the existing mutation operation so check/delete/start/backup/restore cannot overlap.
 - `local_infile` must be restored in a finally path. An unreachable target records `app_instances.metadata.mysqlReconciliation` as `{version:1,kind:"local_infile",originalValue:"ON|OFF",recordedAt:<UTC RFC3339>,taskId:<current task ID>}`, fails the task with `MYSQL_LOCAL_INFILE_RESTORE_FAILED`, and blocks later MySQL lifecycle actions until reconciliation succeeds. Unknown or malformed markers fail closed with `MYSQL_RECONCILIATION_REQUIRED`; only a verified successful reconciliation removes the whole marker. The legacy name `MYSQL_RESTORE_LOCAL_INFILE_RESTORE_FAILED` remains a read/translation compatibility alias only and is never emitted by new restore work.
 - Cluster backup and healthy restore require every MySQL member `ONLINE`; backup runs once on the current PRIMARY; healthy restore loads only on the current PRIMARY with `skipBinlog:false`.
@@ -33,7 +34,7 @@
 | Area | Files | Responsibility |
 |---|---|---|
 | Configuration | `backend/internal/config/config.go`, `config/defaults.env`, config tests | Separate MySQL repository root and keep-last policy |
-| Backup records | `backend/internal/store/app_release_assets.go`, `backend/internal/store/credentials.go`, store tests | Backup lookup/status/delete and bound credential lookup |
+| Backup records and maintenance state | `backend/internal/store/app_release_assets.go`, `backend/internal/store/app_instance_metadata.go`, `backend/internal/store/credentials.go`, store tests | Backup lookup/status/delete, bound credential lookup, and compare-and-set atomic instance/cluster maintenance metadata |
 | Repository | `backend/internal/backuprepo/*.go` | Controlled path creation, partial promotion, checksum, upload source validation, deletion, retention |
 | SSH transfer | `backend/internal/adapter/ssh_download.go`, adapter tests | Stream one remote archive into a panel-side `.partial` file with cancellation and size/hash reporting |
 | Registry | `backend/internal/apps/registry/contract.go`, registry tests | Optional backup and restore lifecycle contracts |
@@ -399,6 +400,15 @@ lock: app-instance/<instanceId>/mutate
 - Modify: `backend/internal/httpapi/mysql_backup_handlers.go`
 - Modify: `backend/internal/httpapi/mysql_backup_handlers_test.go`
 - Modify: `backend/internal/httpapi/operation_lock_helpers.go`
+- Modify: `backend/internal/httpapi/apps_handlers.go`
+- Modify: `backend/internal/httpapi/api.go`
+- Modify: `backend/internal/i18n/messages.go`
+- Modify: `backend/internal/i18n/messages_test.go`
+- Modify: `backend/internal/apps/mysql/module.go`
+- Create: `backend/internal/apps/mysql/maintenance.go`
+- Create: `backend/internal/apps/mysql/maintenance_test.go`
+- Create: `backend/internal/store/app_instance_metadata.go`
+- Create: `backend/internal/store/app_instance_metadata_test.go`
 
 **Cluster invariants:**
 
@@ -413,13 +423,17 @@ lock: app-cluster/<clusterId>/mutate
 - [ ] Add refusal tests for `RECOVERING`, `OFFLINE`, `ERROR`, split/missing PRIMARY, incomplete cluster membership, duplicate server UUID, or a representative instance outside the resolved cluster.
 - [ ] Add healthy restore tests proving pre-restore creates one cluster-level backup, application writes are declared stopped, restore runs only on current PRIMARY, `skipBinlog:false` is rendered, all SECONDARY members return ONLINE after load, and Router read/write verification succeeds.
 - [ ] Add failure tests proving member/Router verification failure results in `restore_incomplete`, keeps maintenance active, and never automatically loads the pre-restore backup.
+- [ ] Add RED store and lifecycle tests for the exact section 9.1 `mysqlMaintenance` v1 object: strict field/enumeration validation; standalone one-instance and cluster exactly-three-member compare-and-set writes; transaction rollback with no partial update; no marker on preflight failure; marker atomically written after the `schema_mutation_started` phase and before the first schema mutation; marker retained on PRIMARY/member/Router/load/final-verification failure; `load_complete` phase advancement; and marker cleared only after `verified`. Prove initial persistence failure returns `MYSQL_MAINTENANCE_STATE_PERSIST_FAILED` before remote mutation, while phase-advance or final-clear failure preserves the earlier marker and never reports success.
+- [ ] Add RED gate tests proving valid maintenance state blocks check/start/delete/backup/ordinary restore before HTTP task creation and again after the raw instance/cluster mutate lock is acquired and authoritative state is reread. Malformed markers and missing/divergent member markers fail closed with `MYSQL_MAINTENANCE_STATE_INVALID`; valid state returns `MYSQL_MAINTENANCE_REQUIRED`.
+- [ ] Add RED owner-clear tests for `POST /api/v2/apps/instances/{id}/mysql/maintenance/clear` with exact request `{"recoveryConfirmed":true}`, task type `apps.mysql.maintenance.clear`, target/step/audit records, and the same raw mutate lock. Reject non-owner, missing confirmation, absent/divergent marker, any `mysqlReconciliation`, failed standalone ping, cluster state other than exactly three ONLINE/one PRIMARY, or failed Router 6446 read/write. Prove cluster clear is one transaction with no partial clear.
 - [ ] Run `cd backend; go test ./internal/apps/mysql -run 'Test(BackupInnoDBCluster|RestoreHealthyCluster)'` and confirm failure.
 - [ ] Implement cluster resolution from `app_clusters` and `app_cluster_members`, then cross-check against MySQL `performance_schema.replication_group_members`; do not trust persisted roles for source selection.
 - [ ] Use one representative `app_backups.instance_id`, source PRIMARY `server_id`, and cluster ID in metadata/manifest. Make list/retention operate over all member IDs but de-duplicate by backup ID.
 - [ ] Build the section 10 and 11 target plans, including current PRIMARY discovery at execution time so a failover between request and task start does not target the stale node.
 - [ ] Change cluster operation-lock helpers to use one cluster lock for check/start/delete/backup/restore. Add regression tests for lock conflicts across action names using the shared `mutate` operation.
+- [ ] Implement focused store helpers that transactionally reread expected instance IDs, cluster ownership, and metadata before setting, advancing, or clearing `mysqlMaintenance`. Implement the strict marker parser and two-layer maintenance gates without free-form metadata or secrets. The restore service must establish the marker before the first mutation and retain it until verified clear. The clear worker rereads marker identity/topology under lock, performs the required health checks, and atomically clears marker state; its acknowledgement explicitly accepts post-remediation risk and does not claim data equality.
 - [ ] Run `cd backend; go test ./internal/apps/mysql ./internal/httpapi` and confirm all tests pass.
-- [ ] Commit: `git add backend/internal/apps/mysql/backup.go backend/internal/apps/mysql/backup_test.go backend/internal/apps/mysql/cluster_restore.go backend/internal/apps/mysql/cluster_restore_test.go backend/internal/apps/mysql/restore.go backend/internal/httpapi/mysql_backup_handlers.go backend/internal/httpapi/mysql_backup_handlers_test.go backend/internal/httpapi/operation_lock_helpers.go && git commit -m "feat: back up and restore healthy MySQL clusters"`.
+- [ ] Commit: `git add backend/internal/apps/mysql/backup.go backend/internal/apps/mysql/backup_test.go backend/internal/apps/mysql/cluster_restore.go backend/internal/apps/mysql/cluster_restore_test.go backend/internal/apps/mysql/restore.go backend/internal/apps/mysql/module.go backend/internal/apps/mysql/maintenance.go backend/internal/apps/mysql/maintenance_test.go backend/internal/store/app_instance_metadata.go backend/internal/store/app_instance_metadata_test.go backend/internal/httpapi/mysql_backup_handlers.go backend/internal/httpapi/mysql_backup_handlers_test.go backend/internal/httpapi/operation_lock_helpers.go backend/internal/httpapi/apps_handlers.go backend/internal/httpapi/api.go backend/internal/i18n && git commit -m "feat: guard incomplete MySQL restores"`.
 
 ### Task 10: Implement explicit disaster rebuild and preserve complete-outage semantics
 
@@ -443,6 +457,7 @@ damaged/lost data + explicit disaster confirmation -> restore task mode disaster
 
 - [ ] Add regression tests proving `startMySQLCluster` still calls `dba.rebootClusterFromCompleteOutage()` and never reads, drops, or loads a backup.
 - [ ] Add disaster tests requiring owner, maintenance confirmation, disaster confirmation, exactly three compatible MySQL nodes, a verified cluster backup, explicit target mapping, and per-server SSH password confirmation required by destructive lifecycle rules.
+- [ ] Add tests proving valid maintenance state permits only `mode=disaster-rebuild`, never bypasses its independent confirmations, remains on every failure path, and is cleared for all three authoritative members only in the successful verified control-plane update transaction.
 - [ ] Add plan tests for: stop Router; stop Group Replication; quarantine old data; initialize clean seed; restore seed with `skipBinlog:false`; verify seed; `dba.createCluster()`; clone B/C using `recoveryMethod:"clone"`; wait all ONLINE; re-bootstrap Router; verify 6446 read/write; record completion.
 - [ ] Add failure-boundary tests: before quarantine leaves nodes untouched; seed load failure preserves quarantine and maintenance; clone failure preserves verified seed and stopped Router; Router failure preserves online database cluster but leaves restore incomplete.
 - [ ] Run `cd backend; go test ./internal/apps/mysql ./internal/httpapi -run 'Test(CompleteOutage|DisasterRebuild)'` and confirm failure.
@@ -450,6 +465,7 @@ damaged/lost data + explicit disaster confirmation -> restore task mode disaster
 - [ ] Reuse/refactor existing cluster bootstrap renderers for `dba.createCluster()` and clone joins; keep JavaScript generated only from validated internal host/port/cluster-name values.
 - [ ] Stop and re-bootstrap recorded MySQL Router instances only after the seed and members are healthy. Store non-secret progress markers so retry resumes at the first incomplete member rather than reloading the seed.
 - [ ] Ensure disaster restore metadata records quarantine paths, member progress, Router progress, source backup ID, and task ID but no SSH/MySQL secret.
+- [ ] Treat `mysqlMaintenance` as an allowed recovery prerequisite rather than a normal-operation bypass. After seed, all members, Router, and final data-directory verification succeed, clear all member markers atomically with the rebuilt control-plane state; preserve them if any step or transaction fails.
 - [ ] Run `cd backend; go test ./internal/apps/mysql ./internal/httpapi` and confirm all tests pass.
 - [ ] Commit: `git add backend/internal/apps/mysql/disaster_rebuild.go backend/internal/apps/mysql/disaster_rebuild_test.go backend/internal/apps/mysql/templates/backup/disaster-rebuild.sh backend/internal/apps/mysql/restore.go backend/internal/apps/mysql/script.go backend/internal/apps/mysql/service_test.go backend/internal/httpapi/mysql_backup_handlers.go backend/internal/httpapi/mysql_backup_handlers_test.go && git commit -m "feat: rebuild MySQL clusters from backup"`.
 
@@ -472,6 +488,18 @@ damaged/lost data + explicit disaster confirmation -> restore task mode disaster
 export type MySQLBackupStatus = 'pending' | 'running' | 'success' | 'failed' | 'deleted'
 export type MySQLRestoreMode = 'standalone' | 'healthy-cluster' | 'disaster-rebuild'
 
+export interface MySQLMaintenanceState {
+  version: 1
+  state: 'required'
+  reason: 'restore_incomplete'
+  scope: 'standalone' | 'cluster'
+  clusterId?: string
+  backupId: string
+  taskId: string
+  restorePhase: 'schema_mutation_started' | 'load_complete'
+  recordedAt: string
+}
+
 export interface MySQLBackupRecord {
   id: string
   instanceId: string
@@ -486,7 +514,7 @@ export interface MySQLBackupRecord {
 }
 ```
 
-- [ ] Write failing Vitest tests for JSON metadata parsing, cluster de-duplication, operation availability by topology/status/permission, default backup parameters, restore impact text, and task response tracking.
+- [ ] Write failing Vitest tests for JSON metadata parsing, cluster de-duplication, operation availability by topology/status/permission, default backup parameters, restore impact text, task response tracking, strict maintenance-state parsing, maintenance action blocking, owner clear availability, and clear-task response tracking.
 - [ ] Run `pnpm test:web -- mysqlBackup` and confirm the new tests fail.
 - [ ] Implement typed API helpers using existing `apiGet`, `apiPost`, and `apiDelete`; never accept or display filesystem paths or secrets returned by backend records.
 - [ ] Add row/group actions in `DatabaseView.vue`: **立即备份**, **备份记录**, **校验备份**, and **恢复数据**, with corresponding English messages. Use the current group model so a cluster operation is launched once for the logical cluster.
@@ -494,6 +522,7 @@ export interface MySQLBackupRecord {
 - [ ] Implement a 736px backup drawer showing source, version, topology, schemas, time, size, checksum, verification result, and task link. Deleted records are hidden by default.
 - [ ] Implement a 736px restore dialog that shows source/target compatibility and impact, requires maintenance confirmation, defaults pre-restore backup to enabled, and disables submission until backend-compatible state is present.
 - [ ] Implement a separate owner-only disaster dialog showing three target nodes, quarantine behavior, Router impact, backup identity/checksum, maintenance/disaster confirmations, and per-server SSH password confirmation. Do not reuse the ordinary restore submit button for disaster mode.
+- [ ] Show an accessible maintenance banner for instance/cluster groups with backup/task/phase/time and explicit copy that the panel gate does not stop external clients. Disable ordinary lifecycle actions with a reason. Add a separate owner-only clear dialog that submits `{"recoveryConfirmed":true}` and states health checks do not prove row-level equality.
 - [ ] Follow `design/ant-design-system-portable202606.md`: 24px content spacing, 32px standard actions, semantic status colors, modal/drawer widths above, responsive single-column fallback, keyboard focus, and no color-only status meaning.
 - [ ] Run `pnpm test:web -- mysqlBackup` and `pnpm web:build`; fix all type, test, and build failures.
 - [ ] Commit: `git add web/src/database web/src/views/DatabaseView.vue web/src/i18n/messages.ts && git commit -m "feat: add MySQL backup restore workspace"`.
@@ -512,6 +541,7 @@ export interface MySQLBackupRecord {
 - Backup/verify/restore API and UI workflow.
 - Difference between healthy restore, complete-outage start, and disaster rebuild.
 - Maintenance-window responsibilities and `restore_incomplete` handling.
+- Exact `mysqlMaintenance` marker states, panel-only blocking boundary, external-client maintenance responsibility, owner clear health gates/risk acknowledgement, and `MYSQL_MAINTENANCE_REQUIRED`, `MYSQL_MAINTENANCE_STATE_INVALID`, and `MYSQL_MAINTENANCE_STATE_PERSIST_FAILED` diagnosis.
 - `MYSQL_RECONCILIATION_REQUIRED` diagnosis and safe reconciliation.
 - Retention, off-host/NAS recommendation, capacity monitoring, and test restore cadence.
 - Manual three-node acceptance matrix from design section 17.2 with evidence fields.
@@ -524,6 +554,7 @@ export interface MySQLBackupRecord {
 - [ ] Inspect `git diff --check`, `git status --short`, and `git diff --stat`; confirm no credentials, generated archives, `.partial` files, database files, or unrelated user changes are staged.
 - [ ] Execute the manual acceptance matrix on one standalone and one disposable three-node MySQL 8.0.36 environment. Record task IDs, backup IDs, checksums, member states, Router 6446 read/write result, `local_infile` before/after values, RPO/RTO, and cleanup status without recording secrets.
 - [ ] In the standalone acceptance, retain the desensitized manifest v2 evidence: valid 8.0.36 completion marker, closed metadata catalog, inventory digest, exact schema/base-table counts, successful controlled load, MySQL ping, and matching task/manifest digest. State explicitly that this release does not verify per-table row counts. Also demonstrate that a v1 fixture remains listable/verifiable but is rejected before destructive restore.
+- [ ] In standalone and cluster acceptance, inject a post-mutation failure, capture the non-secret maintenance marker, prove ordinary lifecycle requests are blocked at the API and execution gates, prove external direct clients are not automatically stopped, then complete remediation and exercise owner clear. Record the atomic three-member marker/clear evidence for cluster without secrets.
 - [ ] Append the reusable implementation result and verification status to `memory.md`; keep `memory.md` out of the feature commit unless repository policy for the executing session explicitly includes it.
 - [ ] Commit documentation only: `git add docs/mysql-backup-restore-runbook.md README.md && git commit -m "docs: add MySQL backup restore runbook"`.
 

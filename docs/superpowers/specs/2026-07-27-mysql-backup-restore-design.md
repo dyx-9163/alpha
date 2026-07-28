@@ -306,6 +306,44 @@ release-lock
 - 仅 manifest v2 可进入还原。任务在任何远端 mutation 前计算 `SHA256(CanonicalBackupManifestJSON(manifest))`；把小写十六进制结果作为本次 restore 的不可变 `restoreExpectedManifestSha256`，连同 `restoreTaskId` 写入 `app_backups.metadata`。最终校验重新从受控仓库读取并规范化 manifest，任务 ID 或摘要不一致即失败。
 - 最终校验必须同时满足：任务已经持久化进入 `load_complete`，证明受控 `util.loadDump()` 正常返回；MySQL ping 成功；业务 schema 与 base table 名称集合及各级数量和 manifest v2 完全一致；重新计算的 canonical manifest SHA-256 等于当前任务记录的 `restoreExpectedManifestSha256`。任一条件失败都写入 `restore_incomplete` 并返回 `MYSQL_RESTORE_INCOMPLETE`，不得报告 restore success。
 
+### 9.1 持久化维护门禁
+
+`maintenanceConfirmed` 只证明用户在任务提交时声明已经停止业务写入，不是持久化状态。standalone 或健康集群 restore 完成全部 preflight 后，必须先把 backup restore phase 持久化为 `schema_mutation_started`，再在 `app_instances.metadata.mysqlMaintenance` 写入以下唯一合法对象；marker 写入成功后才能执行第一条 schema mutation：
+
+```json
+{
+  "version": 1,
+  "state": "required",
+  "reason": "restore_incomplete",
+  "scope": "standalone",
+  "backupId": "backup_xxx",
+  "taskId": "tsk_xxx",
+  "restorePhase": "schema_mutation_started",
+  "recordedAt": "2026-07-27T12:00:00Z"
+}
+```
+
+集群对象的 `scope` 固定为 `cluster`，并必须额外包含非空 `clusterId`；standalone 对象不得包含 `clusterId`。`restorePhase` 只能是 `schema_mutation_started` 或 `load_complete`，`recordedAt` 必须是 UTC RFC3339。对象只允许上述固定字段、枚举、受控 ID 和时间，不得包含账号、密码、连接串、远端命令或自由文本。解析使用严格单对象契约：未知字段、未知版本、未知枚举、缺字段或 scope/clusterId 不匹配均失败关闭。
+
+standalone 在本实例写入一个 marker；cluster 必须在同一 SQLite 事务中为控制面记录的三个权威 MySQL 成员写入完全相同的 marker。写入使用事务内重读和比较，成员归属、实例 ID 集合、clusterId 或原 metadata 已变化时整笔回滚，绝不留下部分标记。preflight、pre-restore backup、上传、dry run 或 mutation 前 PRIMARY 切换失败不得设置。marker 在整个 mutation/load/verify 窗口内保持有效；只有 restore 到达 `verified` 后才能原子清除。load 完成后可把 marker 的 `restorePhase` 原子推进到 `load_complete`，推进失败仍保留原 `schema_mutation_started` marker 并使任务失败。
+
+若初始 marker 无法持久化，任务必须在第一条 schema mutation 前返回 `MYSQL_MAINTENANCE_STATE_PERSIST_FAILED`，保持 backup restore phase 为 `restore_incomplete`，并记录不含 secret 的失败证据。若 `verified` 后清除失败，任务同样返回该码且原 marker 保持有效；不得报告 restore success。
+
+有效 marker 存在时，AIFAR 必须在两层失败关闭：HTTP handler 在创建普通任务前拒绝；MySQL module/service 在取得实例或集群 `mutate` 锁并重读权威状态后再次拒绝。被阻断的普通生命周期操作包括 check、start、delete、backup 和 ordinary restore。有效 marker 返回 `MYSQL_MAINTENANCE_REQUIRED`；畸形 marker 或同一集群三成员 marker 缺失/不一致返回 `MYSQL_MAINTENANCE_STATE_INVALID`。唯一允许继续的是 owner-only 维护状态读取/清除任务，以及第 12.2 节显式 disaster rebuild。
+
+维护清除接口固定为：
+
+```text
+POST /api/v2/apps/instances/{id}/mysql/maintenance/clear
+task type: apps.mysql.maintenance.clear
+lock: app-instance/<instanceId>/mutate or app-cluster/<clusterId>/mutate
+request: {"recoveryConfirmed":true}
+```
+
+清除任务必须是 owner-only worker task，并记录 target、step、日志和 audit。取得同一 raw mutate 锁后重读 marker 身份与拓扑，要求没有 `mysqlReconciliation` marker；standalone 必须通过 MySQL ping，cluster 必须恰有三个 `ONLINE` 成员、一个 PRIMARY，且 Router 6446 可真实读写。随后 standalone 清除一个 marker，cluster 在一个 SQLite 事务中清除三个完全一致的 marker。`recoveryConfirmed` 表示 owner 在外部修复后接受继续运行的数据风险；健康检查不证明业务数据逐行相等，任务和 UI 不得如此宣称。
+
+该 marker 只保证 AIFAR 面板控制面的生命周期门禁，不会自动阻止 Java、直连 MySQL 或其它外部客户端写入。运维方仍必须在 restore、故障修复和 marker 清除期间维持外部业务维护窗口。
+
 ## 10. InnoDB Cluster 备份
 
 步骤：
@@ -425,6 +463,7 @@ record-restore
 - Router 必须重新 bootstrap，不能假设旧 metadata 自动指向新集群。
 - 控制面逻辑 `clusterId` 可保留；metadata 增加 `restoreGeneration`、`restoredFromBackupId`、`restoredAt` 和新的 PRIMARY/成员状态。
 - 失败后保持业务和 Router 停止；不能把半完成重建标记为成功，也不能自动覆盖 quarantine 中的旧数据。
+- disaster rebuild 是持久化维护 marker 存在时允许执行的唯一破坏性恢复路径；成功完成 seed、成员、Router 与最终数据目录验证后，必须在更新控制面的同一事务中清除三个成员的 `mysqlMaintenance`。任一阶段失败都保留 marker。
 
 ## 13. 前端交互
 
@@ -440,6 +479,8 @@ record-restore
 
 备份弹窗首版只提供备份名称、线程数、每线程限速和保留数量；默认值由后端返回。恢复弹窗展示备份来源、版本、拓扑、schema、时间、大小、checksum 和影响范围，并要求维护确认。灾难重建额外展示目标三节点、quarantine 策略、Router 影响和 SSH 密码确认。
 
+实例或集群存在 `mysqlMaintenance` 时，Database 页面必须显示不可忽略的维护横幅、来源 backup/task、restore phase、记录时间和“面板门禁不等于外部业务已停止”的提示。普通 check/start/delete/backup/restore 操作禁用并解释原因；owner 可发起独立的“清除维护状态”任务，确认文案必须说明健康检查不证明数据相等，只有在外部修复和风险确认后才能提交。
+
 页面只提交结构化参数并跟踪 task；不拼接 shell、不持有解密密码、不复制后端安全判断。用户可见文案全部提供 zh/en。
 
 ## 14. 失败语义
@@ -448,6 +489,7 @@ record-restore
 - checksum、manifest、路径或版本校验失败：还原在任何 schema 变更前终止。
 - v1 manifest 参与破坏性还原，或 v2 完成标记、metadata 目录图、文件清单、schema/base table 集合、计数、canonical manifest 摘要任一无效：还原在任何远端 mutation 前以 `MYSQL_RESTORE_MANIFEST_INVALID` 终止。
 - 删除 schema 后 load 失败：任务标记 `restore_incomplete`，保持维护模式，不自动恢复业务。
+- schema mutation 前必须按第 9.1 节先原子写入 `mysqlMaintenance`；写入失败不执行 mutation。mutation 后任一失败保留 marker；最终清除失败优先返回 `MYSQL_MAINTENANCE_STATE_PERSIST_FAILED`，不得报告 restore success。
 - `local_infile` 恢复失败：任务必须失败并输出稳定错误码，即使数据导入已完成；目标不可达时保留待调和标记并阻止后续生命周期操作。
 - 健康集群 PRIMARY 切换：任务失败，不跨 PRIMARY 续写。
 - disaster rebuild 中成员 clone 失败：保留已恢复 seed，保持 Router 停止，允许修复后重试未完成成员。
@@ -472,6 +514,9 @@ MYSQL_RESTORE_TARGET_NOT_CLEAN
 MYSQL_RESTORE_PRIMARY_CHANGED
 MYSQL_LOCAL_INFILE_RESTORE_FAILED
 MYSQL_RESTORE_INCOMPLETE
+MYSQL_MAINTENANCE_REQUIRED
+MYSQL_MAINTENANCE_STATE_INVALID
+MYSQL_MAINTENANCE_STATE_PERSIST_FAILED
 MYSQL_REBUILD_CONFIRMATION_REQUIRED
 MYSQL_REBUILD_ROUTER_FAILED
 ```
@@ -497,12 +542,12 @@ MYSQL_REBUILD_ROUTER_FAILED
 
 ### 17.1 单元与集成测试
 
-- Store：`app_backups` pending/running/success/failed、列表、保留策略和删除归属。
+- Store：`app_backups` pending/running/success/failed、列表、保留策略和删除归属；standalone marker 单实例写入/清除、cluster 三成员原子写入/清除、事务比较失败回滚且无部分更新。
 - Adapter：SFTP Download 流式传输、partial、checksum、取消和路径错误。
-- MySQL module：standalone/cluster PlanBackup、PlanRestore、PRIMARY 选择、集群展开和锁冲突。
+- MySQL module：standalone/cluster PlanBackup、PlanRestore、PRIMARY 选择、集群展开和锁冲突；marker 严格解析、preflight 失败不设置、第一条 mutation 前设置、失败保留、验证成功后清除、普通生命周期两层门禁和 owner 清除健康检查。
 - Manifest v2：使用真实 MySQL Shell 8.0.36 完成标记和 metadata 目录图构建完整文件/schema/base table 期望；覆盖 inventory 摘要、缺失/悬空/重复 metadata、v1 只读兼容和 destructive restore 拒绝。
 - 脚本：dump/load 选项、账号排除、metadata 排除、`local_infile` finally 恢复、日志脱敏。
-- HTTP：权限、task id、audit、错误码、危险确认和非法 manifest。
+- HTTP：权限、task id、audit、错误码、危险确认、非法 manifest、维护门禁创建前拒绝和 owner-only clear task。
 - 前端：按钮能力、备份列表、恢复确认、灾难向导、任务追踪和 zh/en。
 - 安全：归档 traversal、symlink、超额展开、checksum 篡改、secret 泄露扫描。
 
@@ -513,6 +558,7 @@ MYSQL_REBUILD_ROUTER_FAILED
 - 三节点集群从 PRIMARY 只生成一份备份。
 - 健康集群只在 PRIMARY 导入，三个成员最终一致。
 - restore 中 PRIMARY 切换后安全失败并保持维护。
+- standalone/cluster 在第一条 mutation 前已经持久化维护 marker，mutation 后失败会保留它；普通 check/start/delete/backup/restore 被阻断，owner clear 经健康检查与风险确认后原子清除。验证 marker 不会阻止外部直连客户端，维护窗口由运维方持续控制。
 - complete outage 使用 reboot 路径，不误触 disaster rebuild。
 - 从备份恢复 clean seed，clone B/C，三个成员 ONLINE。
 - Router 6446 恢复真实读写。
