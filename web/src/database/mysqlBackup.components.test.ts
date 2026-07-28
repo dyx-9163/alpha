@@ -523,4 +523,52 @@ describe('MySQL backup and restore surfaces', () => {
     expect(warning).toHaveBeenCalledWith('The MySQL control state changed. Refresh and confirm the operation again.')
     warning.mockRestore()
   })
+
+  it('shows the affected reconciliation state, posts the exact owner action, and keeps clear disabled until fresh state removes it', async () => {
+    localStorage.setItem('aifar-session-token', 'test-token')
+    localStorage.setItem('aifar-role', 'owner')
+    const maintenance = {
+      version: 1, state: 'required', reason: 'restore_incomplete', scope: 'standalone',
+      backupId: backup.id, taskId, restorePhase: 'load_complete', recordedAt: '2026-07-28T02:00:00Z'
+    }
+    let reconciliation: Record<string, unknown> | null = {
+      version: 1, kind: 'local_infile', originalValue: 'OFF', recordedAt: '2026-07-28T02:01:00Z', taskId
+    }
+    apiGet.mockImplementation(async (path: string) => {
+      if (path === '/database/instances') return [{
+        id: instanceId, app: 'mysql', version: '8.0.36', serverId, status: 'failed', topology: 'standalone',
+        metadata: JSON.stringify({ topology: 'standalone', endpoint: '10.0.0.8:3306', mysqlMaintenance: maintenance, ...(reconciliation ? { mysqlReconciliation: reconciliation } : {}) }),
+        createdAt: '2026-07-28T01:00:00Z'
+      }]
+      if (path === '/servers') return [{ id: serverId, name: 'mysql-primary', status: 'available' }]
+      if (path === '/tasks') return []
+      return []
+    })
+    apiPost.mockImplementation(async (path: string, body: unknown) => {
+      if (path === `/apps/instances/${instanceId}/mysql/reconciliation/run`) {
+        expect(body).toEqual({ reconciliationConfirmed: true })
+        reconciliation = null
+        return { taskId }
+      }
+      throw new Error(`unexpected POST ${path}`)
+    })
+    const router = createRouter({ history: createMemoryHistory(), routes: [{ path: '/', component: { template: '<div />' } }] })
+    await router.push('/'); await router.isReady()
+    const wrapper = mount(DatabaseView, {
+      global: { plugins: [createPinia(), router, ElementPlus], stubs: { teleport: true, StatusTag: true, RunRecordTable: true, KeyValueGrid: true } }
+    })
+    await flushPromises()
+    expect(wrapper.text()).toContain('Affected instance mysql-primary')
+    expect(wrapper.text()).toContain('Original value OFF')
+    expect(wrapper.text()).toContain(`Source task ${taskId}`)
+    expect(wrapper.text()).toContain('It does not validate restored data or clear maintenance.')
+    const button = (label: string) => wrapper.findAllComponents(ElButton).find((candidate) => candidate.text() === label)!
+    expect(button('Clear maintenance gate').props('disabled')).toBe(true)
+    await button('Run reconciliation').trigger('click')
+    await flushPromises()
+    expect(apiPost).toHaveBeenCalledWith(`/apps/instances/${instanceId}/mysql/reconciliation/run`, { reconciliationConfirmed: true })
+    expect(track).toHaveBeenCalledWith(taskId, 'Reconcile MySQL local_infile')
+    expect(button('Clear maintenance gate').props('disabled')).toBe(false)
+    expect(wrapper.text()).not.toContain('Run reconciliation')
+  })
 })

@@ -89,6 +89,20 @@ func (a *API) mysqlMaintenanceGate(instance store.AppInstance) string {
 	return mysql.MySQLMaintenanceRequired
 }
 
+func (a *API) mysqlOrdinaryLifecycleGate(instance store.AppInstance) string {
+	if code := a.mysqlMaintenanceGate(instance); code != "" {
+		return code
+	}
+	if !strings.EqualFold(strings.TrimSpace(instance.App), "mysql") {
+		return ""
+	}
+	present, err := mysql.ReconciliationMarkerState(instance.Metadata)
+	if err != nil || present {
+		return mysql.MySQLReconciliationRequired
+	}
+	return ""
+}
+
 func sameHTTPMySQLMaintenanceMarker(left, right store.MySQLMaintenanceMarker) bool {
 	return left.Version == right.Version && left.State == right.State && left.Reason == right.Reason && left.Scope == right.Scope && left.ClusterID == right.ClusterID && left.BackupID == right.BackupID && left.TaskID == right.TaskID && left.RestorePhase == right.RestorePhase && left.RecordedAt.Equal(right.RecordedAt)
 }

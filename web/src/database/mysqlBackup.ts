@@ -15,6 +15,14 @@ export interface MySQLMaintenanceState {
   recordedAt: string
 }
 
+export interface MySQLReconciliationState {
+  version: 1
+  kind: 'local_infile'
+  originalValue: 'ON' | 'OFF'
+  recordedAt: string
+  taskId: string
+}
+
 export interface MySQLBackupMetadata {
   manifestVersion?: 2
   name?: string
@@ -72,6 +80,16 @@ export type MySQLMaintenanceResult =
   | { kind: 'required'; state: MySQLMaintenanceState }
   | { kind: 'invalid' }
 
+export type MySQLReconciliationResult =
+  | { kind: 'none' }
+  | { kind: 'required'; instanceId: string; state: MySQLReconciliationState }
+  | { kind: 'invalid' }
+
+export type MySQLReconciliationMarkerResult =
+  | { kind: 'none' }
+  | { kind: 'required'; state: MySQLReconciliationState }
+  | { kind: 'invalid' }
+
 export type MySQLActionName = 'check' | 'start' | 'delete' | 'backup' | 'restore'
 
 export interface MySQLOperationAvailability {
@@ -82,6 +100,7 @@ export interface MySQLOperationAvailability {
   restore: boolean
   disaster: boolean
   clearMaintenance: boolean
+  reconcile: boolean
   lifecycleBlocked: boolean
   controlStateInvalid: boolean
   reasonKey: string
@@ -95,6 +114,7 @@ export interface MySQLAvailabilityInput {
   isOwner: boolean
   nodeCount: number
   maintenance: MySQLMaintenanceResult
+  reconciliation?: MySQLReconciliationResult
 }
 
 export interface MySQLRestoreTarget {
@@ -295,21 +315,56 @@ export function groupMySQLMaintenance(topology: string, memberMetadata: unknown[
   return { kind: 'required', state }
 }
 
+export function parseMySQLReconciliation(metadataValue: unknown): MySQLReconciliationMarkerResult {
+  const metadata = jsonObject(metadataValue)
+  if (!metadata) return { kind: 'invalid' }
+  if (!Object.prototype.hasOwnProperty.call(metadata, 'mysqlReconciliation')) return { kind: 'none' }
+  const marker = objectValue(metadata.mysqlReconciliation)
+  if (!marker || !exactKeys(marker, ['version', 'kind', 'originalValue', 'recordedAt', 'taskId'])) return { kind: 'invalid' }
+  const state: MySQLReconciliationState = {
+    version: 1,
+    kind: 'local_infile',
+    originalValue: stringValue(marker.originalValue) as 'ON' | 'OFF',
+    recordedAt: stringValue(marker.recordedAt),
+    taskId: stringValue(marker.taskId)
+  }
+  if (marker.version !== 1 || marker.kind !== 'local_infile' ||
+      (state.originalValue !== 'ON' && state.originalValue !== 'OFF') ||
+      !isUTCTimestamp(state.recordedAt) || !controlledTaskId.test(state.taskId)) {
+    return { kind: 'invalid' }
+  }
+  return { kind: 'required', state }
+}
+
+export function groupMySQLReconciliation(members: Array<{ instanceId: string; metadata: unknown }>): MySQLReconciliationResult {
+  if (!members.length || members.some((member) => !controlledInstanceId.test(member.instanceId))) return { kind: 'invalid' }
+  const parsed = members.map((member) => ({ instanceId: member.instanceId, result: parseMySQLReconciliation(member.metadata) }))
+  if (parsed.some((item) => item.result.kind === 'invalid')) return { kind: 'invalid' }
+  const required = parsed.filter((item) => item.result.kind === 'required')
+  if (required.length === 0) return { kind: 'none' }
+  if (required.length !== 1) return { kind: 'invalid' }
+  return { kind: 'required', instanceId: required[0].instanceId, state: (required[0].result as { kind: 'required'; state: MySQLReconciliationState }).state }
+}
+
 export function mysqlOperationAvailability(input: MySQLAvailabilityInput): MySQLOperationAvailability {
   const supportedTopology = ['standalone', 'innodb-cluster'].includes(input.topology)
   const topologyComplete = input.topology === 'standalone' ? input.nodeCount === 1 : input.topology === 'innodb-cluster' && input.nodeCount === 3
   const supported = input.app === 'mysql' && supportedTopology && topologyComplete
   const online = ['online', 'running', 'success', 'available'].includes(input.status)
-  const lifecycleBlocked = input.maintenance.kind !== 'none'
-  const controlStateInvalid = input.maintenance.kind === 'invalid'
+  const reconciliation = input.reconciliation ?? { kind: 'none' as const }
+  const lifecycleBlocked = input.maintenance.kind !== 'none' || reconciliation.kind !== 'none'
+  const controlStateInvalid = input.maintenance.kind === 'invalid' || reconciliation.kind === 'invalid'
   const healthyAction = supported && online && input.canManage && !lifecycleBlocked
   const ownerAction = healthyAction && input.isOwner
   const maintenanceRequired = input.maintenance.kind === 'required'
   const disaster = supported && input.topology === 'innodb-cluster' && input.nodeCount === 3 &&
     input.canManage && input.isOwner && input.maintenance.kind === 'required' && input.maintenance.state.scope === 'cluster'
-  const clearMaintenance = supported && input.canManage && input.isOwner && maintenanceRequired
+  const clearMaintenance = supported && input.canManage && input.isOwner && maintenanceRequired && reconciliation.kind === 'none'
+  const reconcile = supported && input.canManage && input.isOwner && reconciliation.kind === 'required'
   let reasonKey = ''
-  if (controlStateInvalid) reasonKey = 'database.mysqlBackup.maintenanceInvalid'
+  if (input.maintenance.kind === 'invalid') reasonKey = 'database.mysqlBackup.maintenanceInvalid'
+  else if (reconciliation.kind === 'invalid') reasonKey = 'database.mysqlBackup.reconciliationInvalid'
+  else if (reconciliation.kind === 'required') reasonKey = 'database.mysqlBackup.reconciliationBlocked'
   else if (lifecycleBlocked) reasonKey = 'database.mysqlBackup.maintenanceBlocked'
   else if (!input.canManage) reasonKey = 'common.permissionDenied'
   else if (!online) reasonKey = 'database.mysqlBackup.offlineBlocked'
@@ -324,6 +379,7 @@ export function mysqlOperationAvailability(input: MySQLAvailabilityInput): MySQL
     restore: ownerAction,
     disaster,
     clearMaintenance,
+    reconcile,
     lifecycleBlocked,
     controlStateInvalid,
     reasonKey
@@ -422,6 +478,12 @@ export async function startMySQLRestore(instanceId: string, request: MySQLRestor
 export async function clearMySQLMaintenance(instanceId: string, tracker: TaskTracker, label: string) {
   const id = requiredInstanceId(instanceId)
   const response = await apiPost<TaskResponse>(`/apps/instances/${encodeURIComponent(id)}/mysql/maintenance/clear`, { recoveryConfirmed: true })
+  return trackTaskResponse(response, tracker, label)
+}
+
+export async function runMySQLReconciliation(instanceId: string, tracker: TaskTracker, label: string) {
+  const id = requiredInstanceId(instanceId)
+  const response = await apiPost<TaskResponse>(`/apps/instances/${encodeURIComponent(id)}/mysql/reconciliation/run`, { reconciliationConfirmed: true })
   return trackTaskResponse(response, tracker, label)
 }
 

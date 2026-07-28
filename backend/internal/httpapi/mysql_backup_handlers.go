@@ -114,7 +114,7 @@ func (a *API) startMySQLRestore(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, mysqlapp.MySQLRestoreManifestInvalid, i18n.MySQLBackupErrorText(lang, mysqlapp.MySQLRestoreManifestInvalid), map[string]any{"instanceId": instance.ID})
 			return
 		}
-		if code := a.mysqlMaintenanceGate(instance); code != "" {
+		if code := a.mysqlOrdinaryLifecycleGate(instance); code != "" {
 			writeError(w, http.StatusConflict, code, i18n.MySQLBackupErrorText(lang, code), map[string]any{"instanceId": instance.ID})
 			return
 		}
@@ -323,7 +323,7 @@ func (a *API) startMySQLBackup(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "INSTANCE_SERVER_REQUIRED", i18n.Text(lang, "api.instanceServerRequired"), map[string]any{"instanceId": instanceID})
 		return
 	}
-	if code := a.mysqlMaintenanceGate(instance); code != "" {
+	if code := a.mysqlOrdinaryLifecycleGate(instance); code != "" {
 		writeError(w, http.StatusConflict, code, i18n.MySQLBackupErrorText(lang, code), map[string]any{"instanceId": instance.ID})
 		return
 	}

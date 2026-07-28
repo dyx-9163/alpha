@@ -19,11 +19,14 @@ import {
   deduplicateMySQLBackups,
   deleteMySQLBackup,
   groupMySQLMaintenance,
+  groupMySQLReconciliation,
   listMySQLBackups,
   mysqlOperationAvailability,
   parseMySQLBackupRecord,
   parseMySQLMaintenance,
+  parseMySQLReconciliation,
   restoreImpactKey,
+  runMySQLReconciliation,
   selectMaintenanceDisasterBackup,
   startMySQLBackup,
   startMySQLRestore,
@@ -272,6 +275,36 @@ describe('strict MySQL maintenance state', () => {
   })
 })
 
+describe('strict MySQL reconciliation state', () => {
+  const marker = { version: 1, kind: 'local_infile', originalValue: 'OFF', recordedAt: '2026-07-28T00:00:00Z', taskId }
+
+  it('parses the exact non-secret marker and identifies the affected instance', () => {
+    expect(parseMySQLReconciliation(JSON.stringify({ mysqlReconciliation: marker }))).toEqual({ kind: 'required', state: marker })
+    expect(groupMySQLReconciliation([
+      { instanceId, metadata: JSON.stringify({ mysqlReconciliation: marker }) },
+      { instanceId: 'app_222222222222222222222222', metadata: '{}' },
+      { instanceId: 'app_333333333333333333333333', metadata: '{}' }
+    ])).toEqual({ kind: 'required', instanceId, state: marker })
+  })
+
+  it.each([
+    { ...marker, version: 2 },
+    { ...marker, kind: 'other' },
+    { ...marker, originalValue: 'MAYBE' },
+    { ...marker, recordedAt: '2026-07-28T08:00:00+08:00' },
+    { ...marker, secret: 'must-not-pass' }
+  ])('fails closed for malformed reconciliation marker %#', (invalid) => {
+    expect(parseMySQLReconciliation(JSON.stringify({ mysqlReconciliation: invalid }))).toEqual({ kind: 'invalid' })
+  })
+
+  it('fails closed for multiple affected members', () => {
+    expect(groupMySQLReconciliation([
+      { instanceId, metadata: JSON.stringify({ mysqlReconciliation: marker }) },
+      { instanceId: 'app_222222222222222222222222', metadata: JSON.stringify({ mysqlReconciliation: marker }) }
+    ])).toEqual({ kind: 'invalid' })
+  })
+})
+
 describe('operation availability', () => {
   const noMaintenance: MySQLMaintenanceResult = { kind: 'none' }
   const maintenance: MySQLMaintenanceResult = { kind: 'required', state: validMaintenance() as never }
@@ -435,6 +468,15 @@ describe('typed API and task tracking', () => {
 
     expect(api.post).toHaveBeenCalledWith(`/apps/instances/${instanceId}/mysql/maintenance/clear`, { recoveryConfirmed: true })
     expect(tracker.track).toHaveBeenCalledWith(taskId, 'clear maintenance')
+  })
+
+  it('submits the exact owner reconciliation body for the affected instance and tracks the task', async () => {
+    api.post.mockResolvedValue({ taskId, status: 'pending' })
+
+    await runMySQLReconciliation(instanceId, tracker, 'reconcile local_infile')
+
+    expect(api.post).toHaveBeenCalledWith(`/apps/instances/${instanceId}/mysql/reconciliation/run`, { reconciliationConfirmed: true })
+    expect(tracker.track).toHaveBeenCalledWith(taskId, 'reconcile local_infile')
   })
 
   it('rejects malformed mutation responses instead of tracking an empty task', () => {

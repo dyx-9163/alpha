@@ -85,6 +85,25 @@
             <div v-if="isUnavailable(group.nodeStatus)" class="service-notice danger">{{ databaseServiceUnavailableText(group) }}</div>
             <div v-if="isUnavailable(group.routerStatus)" class="service-notice danger">{{ t('database.routerServiceUnavailable') }}</div>
             <div
+              v-if="mysqlGroupReconciliation(group).kind === 'required'"
+              class="maintenance-banner reconciliation"
+              role="alert"
+              aria-live="polite"
+            >
+              <strong>{{ t('database.mysqlBackup.reconciliationTitle') }}</strong>
+              <span>{{ t('database.mysqlBackup.reconciliationBoundary') }}</span>
+              <span>{{ reconciliationSummary(group) }}</span>
+            </div>
+            <div
+              v-else-if="mysqlGroupReconciliation(group).kind === 'invalid' && group.app === 'mysql'"
+              class="maintenance-banner invalid"
+              role="alert"
+              aria-live="assertive"
+            >
+              <strong>{{ t('database.mysqlBackup.reconciliationInvalidTitle') }}</strong>
+              <span>{{ t('database.mysqlBackup.reconciliationInvalid') }}</span>
+            </div>
+            <div
               v-if="mysqlGroupMaintenance(group).kind === 'required'"
               class="maintenance-banner"
               role="alert"
@@ -153,7 +172,20 @@
                 <span><el-button type="primary" plain :disabled="!mysqlAvailability(group).restore" @click="openLatestMySQLRestore(group)">{{ t('database.mysqlBackup.restoreAction') }}</el-button></span>
               </el-tooltip>
               <el-button v-if="mysqlAvailability(group).disaster" type="danger" plain @click="openLatestMySQLDisaster(group)">{{ t('database.mysqlBackup.disasterAction') }}</el-button>
-              <el-button v-if="mysqlAvailability(group).clearMaintenance" type="warning" plain @click="openMaintenanceClear(group)">{{ t('database.mysqlBackup.clearMaintenance') }}</el-button>
+              <el-button
+                v-if="mysqlAvailability(group).reconcile"
+                type="warning"
+                plain
+                :loading="isReconciliationSubmitting(group)"
+                @click="runReconciliation(group)"
+              >{{ t('database.mysqlBackup.reconciliationAction') }}</el-button>
+              <el-button
+                v-if="mysqlGroupMaintenance(group).kind === 'required' && isOwner && canManageDatabase"
+                type="warning"
+                plain
+                :disabled="!mysqlAvailability(group).clearMaintenance"
+                @click="openMaintenanceClear(group)"
+              >{{ t('database.mysqlBackup.clearMaintenance') }}</el-button>
             </div>
           </article>
         </div>
@@ -255,13 +287,16 @@ import {
   backupTargetCompatibility,
   clearMySQLMaintenance,
   groupMySQLMaintenance,
+  groupMySQLReconciliation,
   listMySQLBackups,
   mysqlOperationAvailability,
   selectMaintenanceDisasterBackup,
+  runMySQLReconciliation,
   verifyMySQLBackup,
   type MySQLBackupDefaults,
   type MySQLBackupRecord,
   type MySQLMaintenanceResult,
+  type MySQLReconciliationResult,
   type MySQLOperationAvailability,
   type MySQLRestoreTarget
 } from '../database/mysqlBackup'
@@ -369,6 +404,7 @@ const maintenanceClearVisible = ref(false)
 const maintenanceClearConfirmed = ref(false)
 const maintenanceClearSubmitting = ref(false)
 const maintenanceClearIdentity = ref('')
+const reconciliationSubmittingId = ref('')
 const liveInstances = computed(() => instances.value.map((instance) => applyRealtimeStatusToAppInstance(instance, realtime.appInstanceSnapshot(instance.id))))
 const instanceGroups = computed(() => groupDatabaseInstances(liveInstances.value))
 const activeMysqlGroup = computed(() => instanceGroups.value.find((group) => group.id === activeMysqlGroupKey.value) ?? null)
@@ -1381,6 +1417,14 @@ function mysqlGroupMaintenance(group: DatabaseGroup): MySQLMaintenanceResult {
   return groupMySQLMaintenance(group.topology, group.nodes.map((node) => node.instance.metadata), clusterId)
 }
 
+function mysqlGroupReconciliation(group: DatabaseGroup): MySQLReconciliationResult {
+  if (group.app !== 'mysql') return { kind: 'none' }
+  return groupMySQLReconciliation(group.nodes.filter((node) => !node.virtual).map((node) => ({
+    instanceId: node.instance.id,
+    metadata: node.instance.metadata
+  })))
+}
+
 function mysqlAvailability(group: DatabaseGroup) {
   return mysqlOperationAvailability({
     app: group.app,
@@ -1389,7 +1433,8 @@ function mysqlAvailability(group: DatabaseGroup) {
     canManage: canManageDatabase.value,
     isOwner: isOwner.value,
     nodeCount: group.nodes.filter((node) => !node.virtual).length,
-    maintenance: mysqlGroupMaintenance(group)
+    maintenance: mysqlGroupMaintenance(group),
+    reconciliation: mysqlGroupReconciliation(group)
   })
 }
 
@@ -1402,6 +1447,7 @@ function emptyMysqlAvailability(): MySQLOperationAvailability {
     restore: false,
     disaster: false,
     clearMaintenance: false,
+    reconcile: false,
     lifecycleBlocked: false,
     controlStateInvalid: false,
     reasonKey: ''
@@ -1424,6 +1470,39 @@ function maintenanceSummary(group: DatabaseGroup) {
     phase: t(`database.mysqlBackup.phase.${maintenance.state.restorePhase}`),
     time: new Date(maintenance.state.recordedAt).toLocaleString()
   })
+}
+
+function reconciliationSummary(group: DatabaseGroup) {
+  const reconciliation = mysqlGroupReconciliation(group)
+  if (reconciliation.kind !== 'required') return ''
+  const node = group.nodes.find((candidate) => candidate.instance.id === reconciliation.instanceId)
+  return t('database.mysqlBackup.reconciliationSummary', {
+    instance: node?.serverLabel || reconciliation.instanceId,
+    value: reconciliation.state.originalValue,
+    task: reconciliation.state.taskId,
+    time: new Date(reconciliation.state.recordedAt).toLocaleString()
+  })
+}
+
+function isReconciliationSubmitting(group: DatabaseGroup) {
+  const reconciliation = mysqlGroupReconciliation(group)
+  return reconciliation.kind === 'required' && reconciliationSubmittingId.value === reconciliation.instanceId
+}
+
+async function runReconciliation(group: DatabaseGroup) {
+  const reconciliation = mysqlGroupReconciliation(group)
+  if (!mysqlAvailability(group).reconcile || reconciliation.kind !== 'required' || reconciliationSubmittingId.value) return
+  activateMySQLGroup(group)
+  reconciliationSubmittingId.value = reconciliation.instanceId
+  try {
+    await runMySQLReconciliation(reconciliation.instanceId, taskProgress, t('database.mysqlBackup.reconciliationTaskLabel'))
+    ElMessage.success(t('database.mysqlBackup.reconciliationAccepted'))
+    await load()
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : t('database.mysqlBackup.reconciliationFailed'))
+  } finally {
+    reconciliationSubmittingId.value = ''
+  }
 }
 
 function representativeMySQLNode(group: DatabaseGroup | null) {

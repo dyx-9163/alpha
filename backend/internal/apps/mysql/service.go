@@ -592,7 +592,7 @@ func (s Service) Check(ctx context.Context, req CheckRequest, log Logger, target
 	if err := s.requireNoMySQLMaintenance(req.Instance, req.Language); err != nil {
 		return CheckResult{Status: "failed", Message: err.Error()}, err
 	}
-	if err := s.reconcileMySQL(ctx, req.Instance, req.Language); err != nil {
+	if err := s.requireNoMySQLReconciliation(req.Instance, req.Language); err != nil {
 		return CheckResult{Status: "failed", Message: err.Error()}, err
 	}
 	copy := CheckCopyFor(req.Language)

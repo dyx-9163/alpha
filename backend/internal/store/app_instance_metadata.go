@@ -134,6 +134,72 @@ func (s *Store) ClearMySQLMaintenance(instanceIDs []string, marker MySQLMaintena
 	return s.mutateMySQLMaintenance(instanceIDs, marker, "clear", "")
 }
 
+// ClearMySQLReconciliation atomically removes only the exact owned
+// local_infile marker. Unrelated metadata, including mysqlMaintenance, is
+// preserved in the same transaction.
+func (s *Store) ClearMySQLReconciliation(instanceID, originalValue, recordedAt, taskID string) error {
+	instanceID = strings.TrimSpace(instanceID)
+	recorded, recordedErr := time.Parse(time.RFC3339, recordedAt)
+	if !controlledMaintenanceInstanceID.MatchString(instanceID) ||
+		(originalValue != "ON" && originalValue != "OFF") ||
+		recordedErr != nil || recorded.Location() != time.UTC ||
+		!controlledMaintenanceTaskID.MatchString(taskID) {
+		return errors.New("invalid MySQL reconciliation ownership")
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var app, raw string
+	if err := tx.QueryRow(`select app,metadata from app_instances where id=?`, instanceID).Scan(&app, &raw); err != nil {
+		return err
+	}
+	if app != "mysql" {
+		return errors.New("MySQL reconciliation instance ownership changed")
+	}
+	metadata, err := appInstanceMetadata(raw)
+	if err != nil {
+		return err
+	}
+	rawMarker, present := metadata["mysqlReconciliation"]
+	if !present {
+		return errors.New("MySQL reconciliation marker missing")
+	}
+	var marker struct {
+		Version       int    `json:"version"`
+		Kind          string `json:"kind"`
+		OriginalValue string `json:"originalValue"`
+		RecordedAt    string `json:"recordedAt"`
+		TaskID        string `json:"taskId"`
+	}
+	decoder := json.NewDecoder(strings.NewReader(string(rawMarker)))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&marker); err != nil {
+		return err
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		return errors.New("MySQL reconciliation marker must be one object")
+	}
+	if marker.Version != 1 || marker.Kind != "local_infile" || marker.OriginalValue != originalValue || marker.RecordedAt != recordedAt || marker.TaskID != taskID {
+		return errors.New("MySQL reconciliation marker ownership changed")
+	}
+	delete(metadata, "mysqlReconciliation")
+	encoded, err := json.Marshal(metadata)
+	if err != nil {
+		return err
+	}
+	result, err := tx.Exec(`update app_instances set metadata=?,updated_at=? where id=? and app='mysql'`, string(encoded), time.Now().UTC(), instanceID)
+	if err != nil {
+		return err
+	}
+	if updated, rowsErr := result.RowsAffected(); rowsErr != nil || updated != 1 {
+		return errors.New("MySQL reconciliation instance changed")
+	}
+	return tx.Commit()
+}
+
 // CompleteMySQLDisasterRebuild performs the final control-plane publication
 // and maintenance clear in one transaction. No caller-visible success can be
 // reported unless all three markers and authoritative member rows still match.

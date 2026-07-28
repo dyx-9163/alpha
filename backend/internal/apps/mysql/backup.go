@@ -273,7 +273,7 @@ func (s Service) backupStandalone(ctx context.Context, req registry.BackupReques
 	if err := s.requireNoMySQLMaintenance(req.Instance, req.Language); err != nil {
 		return err
 	}
-	if err := s.reconcileMySQL(ctx, req.Instance, req.Language); err != nil {
+	if err := s.requireNoMySQLReconciliation(req.Instance, req.Language); err != nil {
 		return err
 	}
 	return s.backupStandaloneCore(ctx, req, run, standaloneBackupExecution{backupType: "logical-full", recordPlan: true, retention: true})

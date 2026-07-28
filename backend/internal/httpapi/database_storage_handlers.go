@@ -70,7 +70,7 @@ func (a *API) startMySQLCluster(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "MYSQL_CLUSTER_REQUIRED", i18n.Text(lang, "api.mysqlClusterRequired"), map[string]any{"instanceId": id})
 			return
 		}
-		if code := a.mysqlMaintenanceGate(instance); code != "" {
+		if code := a.mysqlOrdinaryLifecycleGate(instance); code != "" {
 			writeError(w, http.StatusConflict, code, i18n.MySQLBackupErrorText(lang, code), map[string]any{"instanceId": instance.ID})
 			return
 		}

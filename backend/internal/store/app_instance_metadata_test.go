@@ -1,6 +1,7 @@
 package store
 
 import (
+	"encoding/json"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -193,6 +194,42 @@ func TestMySQLMaintenanceStandaloneCompareAndSetRequiresExactCurrentMarker(t *te
 	}
 	if _, present, err := ParseMySQLMaintenanceMarker(fresh.Metadata); err != nil || present {
 		t.Fatalf("exact clear did not remove marker: present=%v err=%v metadata=%s", present, err, fresh.Metadata)
+	}
+}
+
+func TestClearMySQLReconciliationCompareAndSetPreservesMaintenanceAndUnrelatedMetadata(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "aifar.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	recordedAt := "2026-07-28T00:00:00Z"
+	instance, err := db.SaveAppInstance(AppInstance{
+		App: "mysql", Version: "8.0.36", ServerID: NewID("srv"), Status: "running", Topology: "standalone",
+		Metadata: `{"keep":"value","mysqlMaintenance":{"version":1,"state":"required","reason":"restore_incomplete","scope":"standalone","backupId":"backup_1234567890abcdef12345678","taskId":"tsk_1234567890abcdef12345678","restorePhase":"load_complete","recordedAt":"2026-07-28T00:00:00Z"},"mysqlReconciliation":{"version":1,"kind":"local_infile","originalValue":"OFF","recordedAt":"` + recordedAt + `","taskId":"tsk_abcdef1234567890abcdef12"}}`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.ClearMySQLReconciliation(instance.ID, "OFF", recordedAt, "tsk_000000000000000000000000"); err == nil {
+		t.Fatal("stale reconciliation identity cleared current marker")
+	}
+	if err := db.ClearMySQLReconciliation(instance.ID, "OFF", recordedAt, "tsk_abcdef1234567890abcdef12"); err != nil {
+		t.Fatal(err)
+	}
+	fresh, err := db.GetAppInstance(instance.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var metadata map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(fresh.Metadata), &metadata); err != nil {
+		t.Fatal(err)
+	}
+	if _, present := metadata["mysqlReconciliation"]; present {
+		t.Fatalf("reconciliation marker remained: %s", fresh.Metadata)
+	}
+	if string(metadata["keep"]) != `"value"` || len(metadata["mysqlMaintenance"]) == 0 {
+		t.Fatalf("unrelated or maintenance metadata changed: %s", fresh.Metadata)
 	}
 }
 

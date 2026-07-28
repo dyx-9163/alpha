@@ -293,7 +293,7 @@ func (s Service) restoreLogical(ctx context.Context, req registry.RestoreRequest
 				return err
 			}
 		}
-		return s.reconcileMySQL(ctx, instance, req.Language)
+		return s.requireNoMySQLReconciliation(instance, req.Language)
 	}); err != nil {
 		return err
 	}

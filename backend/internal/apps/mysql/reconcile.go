@@ -53,6 +53,11 @@ type mysqlReconciliationMarker struct {
 	TaskID        string `json:"taskId"`
 }
 
+type reconciliationStore interface {
+	backupStore
+	ClearMySQLReconciliation(instanceID, originalValue, recordedAt, taskID string) error
+}
+
 type remoteLocalInfileSession struct {
 	remote Remote
 	server store.Server
@@ -100,19 +105,144 @@ func localInfileSQLCommand(work string, port int, query string) string {
 		" --execute " + installerkit.ShellQuote(query)
 }
 
-func (s Service) reconcileMySQL(ctx context.Context, expected store.AppInstance, language string) error {
-	marker, present, err := s.restoreMySQLReconciliation(ctx, expected, language)
-	if err != nil || !present {
-		return err
+func (s Service) requireNoMySQLReconciliation(expected store.AppInstance, language string) error {
+	instance := expected
+	if data, ok := s.store.(backupStore); ok {
+		fresh, err := data.GetAppInstance(expected.ID)
+		if err != nil {
+			return localizedMySQLOperationError(language, MySQLReconciliationRequired)
+		}
+		instance = fresh
 	}
-	data, ok := s.store.(restoreStore)
-	if !ok {
-		return localizedMySQLOperationError(language, MySQLReconciliationRequired)
-	}
-	if err := clearMySQLReconciliationMarker(data, expected.ID, marker.OriginalValue, marker.TaskID); err != nil {
+	_, _, present, err := parseMySQLReconciliationMarker(instance.Metadata)
+	if err != nil || present {
 		return localizedMySQLOperationError(language, MySQLReconciliationRequired)
 	}
 	return nil
+}
+
+// ReconciliationMarkerState is the fail-closed public parser used by the
+// HTTP boundary. It exposes no marker contents or credential material.
+func ReconciliationMarkerState(metadata string) (bool, error) {
+	_, _, present, err := parseMySQLReconciliationMarker(metadata)
+	return present, err
+}
+
+// Reconcile is the only public lifecycle entry allowed to mutate a persisted
+// local_infile reconciliation marker.
+func (m Module) Reconcile(ctx context.Context, expected store.AppInstance, language, _ string, _ Logger) error {
+	data, ok := m.service.store.(interface {
+		reconciliationStore
+		maintenanceStore
+	})
+	if !ok {
+		return localizedMySQLOperationError(language, MySQLReconciliationRequired)
+	}
+	fresh, err := data.GetAppInstance(expected.ID)
+	if err != nil || fresh.App != "mysql" || fresh.ServerID != expected.ServerID || instanceTopology(fresh) != instanceTopology(expected) {
+		return localizedMySQLOperationError(language, MySQLReconciliationRequired)
+	}
+	initialMembers, err := maintenanceInstances(data, fresh)
+	if err != nil || !containsInstance(initialMembers, fresh.ID) || !validOptionalMaintenanceState(initialMembers) {
+		return localizedMySQLOperationError(language, MySQLReconciliationRequired)
+	}
+	_, marker, present, err := parseMySQLReconciliationMarker(fresh.Metadata)
+	if err != nil {
+		return localizedMySQLOperationError(language, MySQLReconciliationRequired)
+	}
+	if !present {
+		return localizedMySQLOperationError(language, MySQLReconciliationNotRequired)
+	}
+	_, expectedMarker, expectedPresent, expectedErr := parseMySQLReconciliationMarker(expected.Metadata)
+	if expectedErr != nil || !expectedPresent || expectedMarker != marker {
+		return localizedMySQLOperationError(language, MySQLReconciliationRequired)
+	}
+	server, err := m.service.store.GetServer(fresh.ServerID, false)
+	if err != nil {
+		return localizedMySQLOperationError(language, MySQLReconciliationRequired)
+	}
+	credential, err := data.GetBoundCredential(fresh.ID, "admin", true)
+	if err != nil || credential.Status != "active" || credential.Kind != "mysql" ||
+		strings.TrimSpace(credential.Username) == "" || strings.TrimSpace(credential.Secret["password"]) == "" {
+		return localizedMySQLOperationError(language, MySQLReconciliationRequired)
+	}
+	session, cleanup, err := m.service.localInfileSession(ctx, fresh, server, credential)
+	if err != nil {
+		return localizedMySQLOperationError(language, MySQLReconciliationRequired)
+	}
+	defer cleanup()
+	if err := session.SetLocalInfile(ctx, marker.OriginalValue); err != nil {
+		return localizedMySQLOperationError(language, MySQLReconciliationRequired)
+	}
+	value, err := session.ReadLocalInfile(ctx)
+	if err != nil || strings.ToUpper(strings.TrimSpace(value)) != marker.OriginalValue {
+		return localizedMySQLOperationError(language, MySQLReconciliationRequired)
+	}
+	latest, err := data.GetAppInstance(fresh.ID)
+	if err != nil || latest.App != "mysql" || latest.ServerID != fresh.ServerID || instanceTopology(latest) != instanceTopology(fresh) || clusterIDFromInstance(latest) != clusterIDFromInstance(fresh) {
+		return localizedMySQLOperationError(language, MySQLReconciliationRequired)
+	}
+	latestMembers, err := maintenanceInstances(data, latest)
+	if err != nil || !sameInstanceIDs(initialMembers, latestMembers) {
+		return localizedMySQLOperationError(language, MySQLReconciliationRequired)
+	}
+	_, latestMarker, latestPresent, err := parseMySQLReconciliationMarker(latest.Metadata)
+	if err != nil || !latestPresent || latestMarker != marker {
+		return localizedMySQLOperationError(language, MySQLReconciliationRequired)
+	}
+	if err := data.ClearMySQLReconciliation(latest.ID, marker.OriginalValue, marker.RecordedAt, marker.TaskID); err != nil {
+		return localizedMySQLOperationError(language, MySQLReconciliationRequired)
+	}
+	return nil
+}
+
+func validOptionalMaintenanceState(instances []store.AppInstance) bool {
+	presentCount := 0
+	var common store.MySQLMaintenanceMarker
+	for _, instance := range instances {
+		marker, present, err := store.ParseMySQLMaintenanceMarker(instance.Metadata)
+		if err != nil {
+			return false
+		}
+		if present {
+			if presentCount > 0 && !sameMaintenanceMarker(common, marker) {
+				return false
+			}
+			common = marker
+			presentCount++
+		}
+	}
+	if presentCount == 0 {
+		return true
+	}
+	if presentCount != len(instances) {
+		return false
+	}
+	if len(instances) == 1 {
+		return common.Scope == "standalone" && instanceTopology(instances[0]) == "standalone"
+	}
+	return len(instances) == 3 && common.Scope == "cluster" && common.ClusterID == clusterIDFromInstance(instances[0])
+}
+
+func containsInstance(instances []store.AppInstance, id string) bool {
+	for _, instance := range instances {
+		if instance.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
+func sameInstanceIDs(left, right []store.AppInstance) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index].ID != right[index].ID || left[index].ServerID != right[index].ServerID {
+			return false
+		}
+	}
+	return true
 }
 
 func (s Service) restoreMySQLReconciliation(ctx context.Context, expected store.AppInstance, language string) (mysqlReconciliationMarker, bool, error) {

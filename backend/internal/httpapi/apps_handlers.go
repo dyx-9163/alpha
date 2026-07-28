@@ -87,7 +87,7 @@ func (a *API) deleteAppInstance(w http.ResponseWriter, r *http.Request) {
 		respond(w, nil, err)
 		return
 	}
-	if code := a.mysqlMaintenanceGate(instance); code != "" {
+	if code := a.mysqlOrdinaryLifecycleGate(instance); code != "" {
 		writeError(w, http.StatusConflict, code, i18n.MySQLBackupErrorText(lang, code), map[string]any{"instanceId": instance.ID})
 		return
 	}
@@ -229,7 +229,7 @@ func (a *API) deleteAppInstances(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "INSTANCE_SERVER_REQUIRED", i18n.Text(lang, "api.instanceServerRequired"), map[string]any{"instanceId": id})
 			return
 		}
-		if code := a.mysqlMaintenanceGate(instance); code != "" {
+		if code := a.mysqlOrdinaryLifecycleGate(instance); code != "" {
 			writeError(w, http.StatusConflict, code, i18n.MySQLBackupErrorText(lang, code), map[string]any{"instanceId": instance.ID})
 			return
 		}
@@ -371,7 +371,7 @@ func (a *API) checkAppInstance(w http.ResponseWriter, r *http.Request) {
 		respond(w, nil, err)
 		return
 	}
-	if code := a.mysqlMaintenanceGate(instance); code != "" {
+	if code := a.mysqlOrdinaryLifecycleGate(instance); code != "" {
 		writeError(w, http.StatusConflict, code, i18n.MySQLBackupErrorText(lang, code), map[string]any{"instanceId": instance.ID})
 		return
 	}
