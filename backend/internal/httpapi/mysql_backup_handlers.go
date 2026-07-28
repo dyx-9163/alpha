@@ -97,9 +97,27 @@ func (a *API) startMySQLRestore(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, mysqlapp.MySQLBackupStandaloneRequired, i18n.MySQLBackupErrorText(lang, mysqlapp.MySQLBackupStandaloneRequired), map[string]any{"instanceId": instanceID})
 		return
 	}
-	if code := a.mysqlMaintenanceGate(instance); code != "" {
-		writeError(w, http.StatusConflict, code, i18n.MySQLBackupErrorText(lang, code), map[string]any{"instanceId": instance.ID})
-		return
+	if payload.Mode == "disaster-rebuild" {
+		if topology != "innodb-cluster" {
+			writeError(w, http.StatusBadRequest, mysqlapp.MySQLRebuildConfirmationRequired, i18n.MySQLBackupErrorText(lang, mysqlapp.MySQLRebuildConfirmationRequired), map[string]any{"instanceId": instance.ID})
+			return
+		}
+		if code := a.mysqlMaintenanceGate(instance); code != mysqlapp.MySQLMaintenanceRequired {
+			if code == "" {
+				code = mysqlapp.MySQLMaintenanceRequired
+			}
+			writeError(w, http.StatusConflict, code, i18n.MySQLBackupErrorText(lang, code), map[string]any{"instanceId": instance.ID})
+			return
+		}
+	} else {
+		if payload.Mode != topology {
+			writeError(w, http.StatusBadRequest, mysqlapp.MySQLRestoreManifestInvalid, i18n.MySQLBackupErrorText(lang, mysqlapp.MySQLRestoreManifestInvalid), map[string]any{"instanceId": instance.ID})
+			return
+		}
+		if code := a.mysqlMaintenanceGate(instance); code != "" {
+			writeError(w, http.StatusConflict, code, i18n.MySQLBackupErrorText(lang, code), map[string]any{"instanceId": instance.ID})
+			return
+		}
 	}
 	backup, err := a.store.GetAppBackup(payload.BackupID)
 	if err != nil || backup.App != "mysql" || backup.BackupType != "logical-full" || backup.Status != "success" || (topology == "standalone" && (backup.InstanceID != instance.ID || backup.ServerID != instance.ServerID)) || (topology == "innodb-cluster" && mysqlClusterIDFromBackup(backup) != mysqlClusterID(instance)) {
@@ -110,6 +128,35 @@ func (a *API) startMySQLRestore(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		respond(w, nil, err)
 		return
+	}
+	targetMapping := map[string]any{}
+	serverPasswordsConfirmed := false
+	if payload.Mode == "disaster-rebuild" {
+		if code := a.validateDisasterRebuildTargets(instances, servers, payload.TargetMapping, payload.ServerPasswords); code != "" {
+			status := http.StatusBadRequest
+			if code == "SERVER_PASSWORD_INVALID" {
+				status = http.StatusForbidden
+			} else if code == "SERVER_PASSWORD_NOT_CONFIGURED" {
+				status = http.StatusConflict
+			}
+			message := i18n.MySQLBackupErrorText(lang, mysqlapp.MySQLRebuildConfirmationRequired)
+			if strings.HasPrefix(code, "SERVER_PASSWORD_") {
+				key := "api.serverPasswordRequired"
+				if code == "SERVER_PASSWORD_INVALID" {
+					key = "api.serverPasswordInvalid"
+				}
+				if code == "SERVER_PASSWORD_NOT_CONFIGURED" {
+					key = "api.serverPasswordNotConfigured"
+				}
+				message = i18n.Text(lang, key)
+			}
+			writeError(w, status, code, message, map[string]any{"instanceId": instance.ID})
+			return
+		}
+		for instanceID, serverID := range payload.TargetMapping {
+			targetMapping[instanceID] = serverID
+		}
+		serverPasswordsConfirmed = true
 	}
 	module, exists := a.apps.Get("mysql")
 	if !exists {
@@ -128,6 +175,7 @@ func (a *API) startMySQLRestore(w http.ResponseWriter, r *http.Request) {
 		Parameters: map[string]any{
 			"mode": payload.Mode, "maintenanceConfirmed": payload.MaintenanceConfirmed,
 			"createPreRestoreBackup": payload.CreatePreRestoreBackup, "disasterConfirmed": payload.DisasterConfirmed, "threads": payload.Threads,
+			"targetMapping": targetMapping, "serverPasswordsConfirmed": serverPasswordsConfirmed,
 		},
 	}
 	plan, err := restoreModule.PlanRestore(r.Context(), restoreRequest)
@@ -167,6 +215,36 @@ func (a *API) startMySQLRestore(w http.ResponseWriter, r *http.Request) {
 		a.audit(r, mysqlRestoreTaskType, instance.ID, "running", task.ID)
 	}
 	respondTask(w, task, err)
+}
+
+func (a *API) validateDisasterRebuildTargets(instances []store.AppInstance, servers []store.Server, mapping, passwords map[string]string) string {
+	if len(instances) != 3 || len(servers) != 3 || len(mapping) != 3 || len(passwords) != 3 {
+		return mysqlapp.MySQLRebuildConfirmationRequired
+	}
+	serverByID := make(map[string]store.Server, len(servers))
+	for _, server := range servers {
+		serverByID[server.ID] = server
+	}
+	seenServers := map[string]bool{}
+	for _, instance := range instances {
+		serverID, present := mapping[instance.ID]
+		if !present || serverID != instance.ServerID || seenServers[serverID] || serverByID[serverID].ID == "" {
+			return mysqlapp.MySQLRebuildConfirmationRequired
+		}
+		seenServers[serverID] = true
+		confirmed, present := passwords[serverID]
+		if !present || strings.TrimSpace(confirmed) == "" {
+			return "SERVER_PASSWORD_REQUIRED"
+		}
+		stored, err := a.store.GetServer(serverID, true)
+		if err != nil || strings.TrimSpace(stored.Password) == "" {
+			return "SERVER_PASSWORD_NOT_CONFIGURED"
+		}
+		if strings.TrimSpace(confirmed) != strings.TrimSpace(stored.Password) {
+			return "SERVER_PASSWORD_INVALID"
+		}
+	}
+	return ""
 }
 
 var mysqlBackupVerificationSteps = []string{"load-backup", "verify-manifest", "verify-checksum", "record-verification"}

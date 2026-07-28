@@ -26,6 +26,31 @@ type MySQLMaintenanceMarker struct {
 	RecordedAt   time.Time `json:"recordedAt"`
 }
 
+// MySQLDisasterRebuildCompletion is the controlled, non-secret payload used
+// to atomically publish a rebuilt cluster and clear its maintenance markers.
+type MySQLDisasterRebuildCompletion struct {
+	ClusterID      string            `json:"clusterId"`
+	SourceBackupID string            `json:"sourceBackupId"`
+	TaskID         string            `json:"taskId"`
+	Generation     int               `json:"generation"`
+	Roles          map[string]string `json:"roles"`
+	CompletedAt    time.Time         `json:"completedAt"`
+}
+
+type mysqlDisasterRebuildProgress struct {
+	Version           int               `json:"version"`
+	TaskID            string            `json:"taskId"`
+	SourceBackupID    string            `json:"sourceBackupId"`
+	ClusterID         string            `json:"clusterId"`
+	RestoreGeneration int               `json:"restoreGeneration"`
+	QuarantinePaths   map[string]string `json:"quarantinePaths"`
+	SeedStage         string            `json:"seedStage"`
+	MemberStages      map[string]string `json:"memberStages"`
+	RouterStage       string            `json:"routerStage"`
+	RouterStages      map[string]string `json:"routerStages"`
+	CompletionStage   string            `json:"completionStage,omitempty"`
+}
+
 var (
 	controlledMaintenanceInstanceID = regexp.MustCompile(`^app_[0-9a-f]{24}$`)
 	controlledMaintenanceBackupID   = regexp.MustCompile(`^backup_[0-9a-f]{24}$`)
@@ -92,6 +117,177 @@ func (s *Store) AdvanceMySQLMaintenance(instanceIDs []string, marker MySQLMainte
 // ClearMySQLMaintenance atomically removes only an identical owned marker.
 func (s *Store) ClearMySQLMaintenance(instanceIDs []string, marker MySQLMaintenanceMarker) error {
 	return s.mutateMySQLMaintenance(instanceIDs, marker, "clear", "")
+}
+
+// CompleteMySQLDisasterRebuild performs the final control-plane publication
+// and maintenance clear in one transaction. No caller-visible success can be
+// reported unless all three markers and authoritative member rows still match.
+func (s *Store) CompleteMySQLDisasterRebuild(instanceIDs []string, marker MySQLMaintenanceMarker, completion MySQLDisasterRebuildCompletion) error {
+	if err := validateMySQLMaintenanceMarker(marker); err != nil {
+		return err
+	}
+	if marker.Scope != "cluster" || completion.ClusterID != marker.ClusterID || completion.SourceBackupID != marker.BackupID ||
+		!controlledMaintenanceTaskID.MatchString(completion.TaskID) || completion.Generation < 1 || completion.CompletedAt.IsZero() || completion.CompletedAt.Location() != time.UTC {
+		return errors.New("invalid MySQL disaster rebuild completion")
+	}
+	ids := append([]string(nil), instanceIDs...)
+	sort.Strings(ids)
+	if len(ids) != 3 || len(completion.Roles) != 3 {
+		return errors.New("MySQL disaster rebuild requires exactly three members")
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	instances := make([]AppInstance, 0, 3)
+	for index, id := range ids {
+		if !controlledMaintenanceInstanceID.MatchString(id) || (index > 0 && ids[index-1] == id) {
+			return errors.New("invalid MySQL disaster rebuild member")
+		}
+		var instance AppInstance
+		if err := tx.QueryRow(`select id,app,version,server_id,status,topology,metadata,created_at,updated_at from app_instances where id=?`, id).Scan(&instance.ID, &instance.App, &instance.Version, &instance.ServerID, &instance.Status, &instance.Topology, &instance.Metadata, &instance.CreatedAt, &instance.UpdatedAt); err != nil {
+			return err
+		}
+		if instance.App != "mysql" {
+			return errors.New("MySQL disaster rebuild member ownership changed")
+		}
+		existing, present, err := ParseMySQLMaintenanceMarker(instance.Metadata)
+		if err != nil || !present || !sameMySQLMaintenanceMarker(existing, marker) || validateMaintenanceTopology(instance, marker) != nil {
+			return errors.New("MySQL disaster rebuild maintenance ownership changed")
+		}
+		role := strings.ToUpper(strings.TrimSpace(completion.Roles[id]))
+		if role != "PRIMARY" && role != "SECONDARY" {
+			return errors.New("invalid MySQL disaster rebuild member role")
+		}
+		instances = append(instances, instance)
+	}
+	if err := validateAuthoritativeMySQLMaintenanceClusterTx(tx, ids, instances, completion.ClusterID); err != nil {
+		return err
+	}
+	if err := completeMySQLDisasterBackupTx(tx, completion); err != nil {
+		return err
+	}
+	primaryCount := 0
+	for _, instance := range instances {
+		role := strings.ToUpper(strings.TrimSpace(completion.Roles[instance.ID]))
+		if role == "PRIMARY" {
+			primaryCount++
+		}
+		metadata, err := appInstanceMetadata(instance.Metadata)
+		if err != nil {
+			return err
+		}
+		delete(metadata, "mysqlMaintenance")
+		metadata["role"], _ = json.Marshal(strings.ToLower(role))
+		metadata["mysqlDisasterRestore"], _ = json.Marshal(map[string]any{
+			"version": 1, "generation": completion.Generation, "sourceBackupId": completion.SourceBackupID,
+			"taskId": completion.TaskID, "completedAt": completion.CompletedAt, "role": role, "status": "ONLINE",
+		})
+		encoded, err := json.Marshal(metadata)
+		if err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`update app_instances set status='running',metadata=?,updated_at=? where id=?`, string(encoded), completion.CompletedAt, instance.ID); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`update app_cluster_members set role=?,status='ONLINE',updated_at=? where cluster_id=? and instance_id=?`, role, completion.CompletedAt, completion.ClusterID, instance.ID); err != nil {
+			return err
+		}
+	}
+	if primaryCount != 1 {
+		return errors.New("MySQL disaster rebuild must publish one PRIMARY")
+	}
+	var clusterMetadata string
+	if err := tx.QueryRow(`select coalesce(metadata,'{}') from app_clusters where id=?`, completion.ClusterID).Scan(&clusterMetadata); err != nil {
+		return err
+	}
+	metadata, err := appInstanceMetadata(clusterMetadata)
+	if err != nil {
+		return err
+	}
+	previousGeneration := 0
+	if rawPrevious, present := metadata["mysqlDisasterRestore"]; present {
+		var previous struct {
+			Version    int `json:"version"`
+			Generation int `json:"generation"`
+		}
+		if json.Unmarshal(rawPrevious, &previous) != nil || previous.Version != 1 || previous.Generation < 1 {
+			return errors.New("invalid previous MySQL disaster rebuild generation")
+		}
+		previousGeneration = previous.Generation
+	}
+	if previousGeneration == int(^uint(0)>>1) || completion.Generation != previousGeneration+1 {
+		return errors.New("MySQL disaster rebuild generation changed")
+	}
+	metadata["mysqlDisasterRestore"], _ = json.Marshal(map[string]any{
+		"version": 1, "generation": completion.Generation, "sourceBackupId": completion.SourceBackupID,
+		"taskId": completion.TaskID, "completedAt": completion.CompletedAt,
+	})
+	encoded, err := json.Marshal(metadata)
+	if err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`update app_clusters set status='active',metadata=?,updated_at=? where id=?`, string(encoded), completion.CompletedAt, completion.ClusterID); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func completeMySQLDisasterBackupTx(tx *sql.Tx, completion MySQLDisasterRebuildCompletion) error {
+	var app, backupType, status, raw string
+	if err := tx.QueryRow(`select app,backup_type,status,coalesce(metadata,'{}') from app_backups where id=?`, completion.SourceBackupID).Scan(&app, &backupType, &status, &raw); err != nil {
+		return err
+	}
+	if app != "mysql" || backupType != "logical-full" || status != "success" {
+		return errors.New("MySQL disaster rebuild backup ownership changed")
+	}
+	metadata, err := appInstanceMetadata(raw)
+	if err != nil {
+		return err
+	}
+	var restoreTaskID string
+	if value, present := metadata["restoreTaskId"]; !present || json.Unmarshal(value, &restoreTaskID) != nil || restoreTaskID != completion.TaskID {
+		return errors.New("MySQL disaster rebuild backup task changed")
+	}
+	rawProgress, present := metadata["disasterRebuild"]
+	if !present {
+		return errors.New("MySQL disaster rebuild progress missing")
+	}
+	decoder := json.NewDecoder(strings.NewReader(string(rawProgress)))
+	decoder.DisallowUnknownFields()
+	var progress mysqlDisasterRebuildProgress
+	if err := decoder.Decode(&progress); err != nil {
+		return err
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		return errors.New("MySQL disaster rebuild progress must be one object")
+	}
+	if progress.Version != 1 || progress.TaskID != completion.TaskID || progress.SourceBackupID != completion.SourceBackupID ||
+		progress.ClusterID != completion.ClusterID || progress.RestoreGeneration != completion.Generation ||
+		progress.SeedStage != "verified" || progress.RouterStage != "verified" || progress.CompletionStage != "" {
+		return errors.New("MySQL disaster rebuild progress is not ready for completion")
+	}
+	progress.CompletionStage = "completed"
+	metadata["restorePhase"], _ = json.Marshal("verified")
+	metadata["disasterRebuild"], err = json.Marshal(progress)
+	if err != nil {
+		return err
+	}
+	encoded, err := json.Marshal(metadata)
+	if err != nil {
+		return err
+	}
+	result, err := tx.Exec(`update app_backups set metadata=? where id=? and status='success'`, string(encoded), completion.SourceBackupID)
+	if err != nil {
+		return err
+	}
+	updated, err := result.RowsAffected()
+	if err != nil || updated != 1 {
+		return errors.New("MySQL disaster rebuild backup completion changed")
+	}
+	return nil
 }
 
 func (s *Store) mutateMySQLMaintenance(instanceIDs []string, marker MySQLMaintenanceMarker, action, phase string) error {

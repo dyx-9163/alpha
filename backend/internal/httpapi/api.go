@@ -277,12 +277,14 @@ type mysqlBackupRequest struct {
 }
 
 type mysqlRestoreRequest struct {
-	BackupID               string `json:"backupId"`
-	Mode                   string `json:"mode"`
-	MaintenanceConfirmed   bool   `json:"maintenanceConfirmed"`
-	CreatePreRestoreBackup bool   `json:"createPreRestoreBackup"`
-	DisasterConfirmed      bool   `json:"disasterConfirmed"`
-	Threads                int    `json:"threads"`
+	BackupID               string            `json:"backupId"`
+	Mode                   string            `json:"mode"`
+	MaintenanceConfirmed   bool              `json:"maintenanceConfirmed"`
+	CreatePreRestoreBackup bool              `json:"createPreRestoreBackup"`
+	DisasterConfirmed      bool              `json:"disasterConfirmed"`
+	Threads                int               `json:"threads"`
+	TargetMapping          map[string]string `json:"targetMapping"`
+	ServerPasswords        map[string]string `json:"serverPasswords"`
 }
 
 func decodeMySQLRestoreRequest(w http.ResponseWriter, r *http.Request) (mysqlRestoreRequest, bool) {
@@ -304,8 +306,19 @@ func decodeMySQLRestoreRequest(w http.ResponseWriter, r *http.Request) (mysqlRes
 	}
 	request.BackupID = strings.TrimSpace(request.BackupID)
 	request.Mode = strings.ToLower(strings.TrimSpace(request.Mode))
-	if request.BackupID == "" || request.Mode != "standalone" || !request.MaintenanceConfirmed || request.Threads < 1 || request.Threads > 64 {
-		writeError(w, http.StatusBadRequest, mysqlapp.MySQLRestoreMaintenanceRequired, i18n.MySQLBackupErrorText(languageFromRequest(r), mysqlapp.MySQLRestoreMaintenanceRequired), nil)
+	validMode := request.Mode == "standalone" || request.Mode == "innodb-cluster" || request.Mode == "disaster-rebuild"
+	valid := request.BackupID != "" && validMode && request.MaintenanceConfirmed && request.Threads >= 1 && request.Threads <= 64
+	if request.Mode == "disaster-rebuild" {
+		valid = valid && request.DisasterConfirmed && len(request.TargetMapping) == 3 && len(request.ServerPasswords) == 3 && !request.CreatePreRestoreBackup
+	} else {
+		valid = valid && len(request.TargetMapping) == 0 && len(request.ServerPasswords) == 0
+	}
+	if !valid {
+		code := mysqlapp.MySQLRestoreMaintenanceRequired
+		if request.Mode == "disaster-rebuild" {
+			code = mysqlapp.MySQLRebuildConfirmationRequired
+		}
+		writeError(w, http.StatusBadRequest, code, i18n.MySQLBackupErrorText(languageFromRequest(r), code), nil)
 		return mysqlRestoreRequest{}, false
 	}
 	return request, true

@@ -100,6 +100,9 @@ func (m Module) PlanRestore(ctx context.Context, req registry.RestoreRequest) ([
 	if req.Instance.App != "mysql" {
 		return nil, mysqlOperationError(MySQLBackupStandaloneRequired)
 	}
+	if strings.TrimSpace(fmt.Sprint(req.Parameters["mode"])) == "disaster-rebuild" {
+		return m.planDisasterRebuild(ctx, req)
+	}
 	if instanceTopology(req.Instance) == "innodb-cluster" {
 		return m.planHealthyClusterRestore(ctx, req)
 	}
@@ -120,6 +123,9 @@ func (m Module) PlanRestore(ctx context.Context, req registry.RestoreRequest) ([
 func (m Module) Restore(ctx context.Context, req registry.RestoreRequest, run registry.RunContext) error {
 	if _, err := m.PlanRestore(ctx, req); err != nil {
 		return err
+	}
+	if strings.TrimSpace(fmt.Sprint(req.Parameters["mode"])) == "disaster-rebuild" {
+		return m.restoreDisasterRebuild(ctx, req.Clone(), run)
 	}
 	if instanceTopology(req.Instance) == "innodb-cluster" {
 		return m.restoreHealthyInnoDBCluster(ctx, req.Clone(), run)

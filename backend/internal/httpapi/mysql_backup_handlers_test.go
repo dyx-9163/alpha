@@ -232,6 +232,133 @@ func TestMySQLRestoreHandlerRejectsUnsafeRequestsBeforeTaskOrMutation(t *testing
 	}
 }
 
+func TestDisasterRebuildHandlerRequiresOwnerConfirmationsMappingAndEveryServerPassword(t *testing.T) {
+	api, db, secret := newAuthzTestAPI(t)
+	cluster, err := db.SaveAppCluster(store.AppCluster{App: "mysql", Name: "disaster-cluster", Topology: "innodb-cluster", Status: "maintenance", Metadata: `{}`})
+	if err != nil {
+		t.Fatal(err)
+	}
+	servers := make([]store.Server, 0, 3)
+	instances := make([]store.AppInstance, 0, 3)
+	for index := 0; index < 3; index++ {
+		server, saveErr := db.SaveServer(store.Server{Name: fmt.Sprintf("mysql-%d", index+1), Host: fmt.Sprintf("10.0.0.%d", index+11), Username: "root", Password: fmt.Sprintf("ssh-pass-%d", index+1)})
+		if saveErr != nil {
+			t.Fatal(saveErr)
+		}
+		instance, saveErr := db.SaveAppInstance(store.AppInstance{App: "mysql", Version: "8.0.36", ServerID: server.ID, Status: "failed", Topology: "innodb-cluster", Metadata: fmt.Sprintf(`{"clusterId":%q,"port":3306,"endpoint":%q}`, cluster.ID, server.Host+":3306")})
+		if saveErr != nil {
+			t.Fatal(saveErr)
+		}
+		if _, saveErr = db.SaveAppClusterMember(store.AppClusterMember{ClusterID: cluster.ID, InstanceID: instance.ID, ServerID: server.ID, Role: "SECONDARY", Status: "failed", Metadata: `{}`}); saveErr != nil {
+			t.Fatal(saveErr)
+		}
+		servers = append(servers, server)
+		instances = append(instances, instance)
+	}
+	backup, err := db.SaveAppBackup(store.AppBackup{App: "mysql", InstanceID: instances[0].ID, ServerID: servers[0].ID, BackupType: "logical-full", Status: "success", Path: filepathForTestBackup("disaster"), Checksum: strings.Repeat("d", 64), Size: 10, Metadata: fmt.Sprintf(`{"clusterId":%q}`, cluster.ID)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	marker := store.MySQLMaintenanceMarker{Version: 1, State: "required", Reason: "restore_incomplete", Scope: "cluster", ClusterID: cluster.ID, BackupID: backup.ID, TaskID: store.NewID("tsk"), RestorePhase: "load_complete", RecordedAt: time.Now().UTC()}
+	ids := []string{instances[0].ID, instances[1].ID, instances[2].ID}
+	if err := db.SetMySQLMaintenance(ids, marker); err != nil {
+		t.Fatal(err)
+	}
+
+	targetMapping := map[string]string{}
+	passwords := map[string]string{}
+	for index := range instances {
+		targetMapping[instances[index].ID] = servers[index].ID
+		passwords[servers[index].ID] = fmt.Sprintf("ssh-pass-%d", index+1)
+	}
+	body := map[string]any{"backupId": backup.ID, "mode": "disaster-rebuild", "maintenanceConfirmed": true, "disasterConfirmed": true, "threads": 4, "targetMapping": targetMapping, "serverPasswords": passwords}
+	encoded, _ := json.Marshal(body)
+	module := newBackupHandlerModule()
+	api.apps = registry.New(module)
+	owner := issueTestToken(t, db, secret, "owner", "owner")
+	req := httptest.NewRequest(http.MethodPost, "/api/v2/apps/instances/"+instances[1].ID+"/restore", strings.NewReader(string(encoded)))
+	req.Header.Set("Authorization", "Bearer "+owner)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	api.Router().ServeHTTP(rec, req)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("disaster rebuild status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var response struct {
+		TaskID string `json:"taskId"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil || response.TaskID == "" {
+		t.Fatalf("task response=%s err=%v", rec.Body.String(), err)
+	}
+	var call restoreHandlerCall
+	select {
+	case call = <-module.restoreCalls:
+	case <-time.After(2 * time.Second):
+		t.Fatal("disaster worker did not call module")
+	}
+	if call.request.Parameters["mode"] != "disaster-rebuild" || call.request.Parameters["serverPasswordsConfirmed"] != true || !reflect.DeepEqual(call.request.Parameters["targetMapping"], mapStringAny(targetMapping)) {
+		t.Fatalf("controlled disaster parameters=%+v", call.request.Parameters)
+	}
+	parameterJSON, _ := json.Marshal(call.request.Parameters)
+	if strings.Contains(string(parameterJSON), "ssh-pass-") {
+		t.Fatalf("SSH confirmations leaked into worker parameters: %s", parameterJSON)
+	}
+	locks, err := db.ListOperationLocks("app-cluster", cluster.ID, false)
+	if err != nil || len(locks) != 1 || locks[0].Operation != operationLockMutation || locks[0].OwnerTaskID != response.TaskID {
+		t.Fatalf("disaster cluster lock=%+v err=%v", locks, err)
+	}
+	close(module.restoreRelease)
+	waitForTaskStatus(t, db, response.TaskID, "success")
+
+	for _, test := range []struct {
+		name     string
+		wantCode string
+		mutate   func(map[string]any)
+	}{
+		{"maintenance confirmation", mysqlapp.MySQLRebuildConfirmationRequired, func(value map[string]any) { value["maintenanceConfirmed"] = false }},
+		{"disaster confirmation", mysqlapp.MySQLRebuildConfirmationRequired, func(value map[string]any) { value["disasterConfirmed"] = false }},
+		{"exact mapping", mysqlapp.MySQLRebuildConfirmationRequired, func(value map[string]any) { delete(value["targetMapping"].(map[string]string), instances[2].ID) }},
+		{"all SSH passwords", mysqlapp.MySQLRebuildConfirmationRequired, func(value map[string]any) { delete(value["serverPasswords"].(map[string]string), servers[2].ID) }},
+		{"matching SSH passwords", "SERVER_PASSWORD_INVALID", func(value map[string]any) { value["serverPasswords"].(map[string]string)[servers[2].ID] = "wrong" }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			candidate := map[string]any{"backupId": backup.ID, "mode": "disaster-rebuild", "maintenanceConfirmed": true, "disasterConfirmed": true, "threads": 4, "targetMapping": cloneStringMap(targetMapping), "serverPasswords": cloneStringMap(passwords)}
+			test.mutate(candidate)
+			raw, _ := json.Marshal(candidate)
+			request := httptest.NewRequest(http.MethodPost, "/api/v2/apps/instances/"+instances[0].ID+"/restore", strings.NewReader(string(raw)))
+			request.Header.Set("Authorization", "Bearer "+owner)
+			request.Header.Set("Content-Type", "application/json")
+			responseRecorder := httptest.NewRecorder()
+			api.Router().ServeHTTP(responseRecorder, request)
+			if responseRecorder.Code == http.StatusAccepted {
+				t.Fatalf("unsafe disaster request accepted: %s", responseRecorder.Body.String())
+			}
+			var errorBody struct {
+				Code string `json:"code"`
+			}
+			if json.Unmarshal(responseRecorder.Body.Bytes(), &errorBody) != nil || errorBody.Code != test.wantCode {
+				t.Fatalf("unsafe disaster code=%q want=%q body=%s", errorBody.Code, test.wantCode, responseRecorder.Body.String())
+			}
+		})
+	}
+}
+
+func cloneStringMap(input map[string]string) map[string]string {
+	result := make(map[string]string, len(input))
+	for key, value := range input {
+		result[key] = value
+	}
+	return result
+}
+
+func mapStringAny(input map[string]string) map[string]any {
+	result := make(map[string]any, len(input))
+	for key, value := range input {
+		result[key] = value
+	}
+	return result
+}
+
 func TestMySQLBackupHandlerValidatesInstanceAppAndSupportedTopology(t *testing.T) {
 	// Production break caught: dispatching a MySQL backup task for a foreign app
 	// or unsupported topology would select the wrong safety model.

@@ -467,7 +467,7 @@ func TestServiceCheckInnoDBClusterUsesSystemdRuntimeWhenPrimaryMissing(t *testin
 	}
 }
 
-func TestServiceStartsInnoDBClusterAndMarksAllNodesRunning(t *testing.T) {
+func TestCompleteOutageStartsInnoDBClusterWithoutBackupMutation(t *testing.T) {
 	clusterID := "mysql_cluster_test"
 	now := time.Now()
 	instances := []store.AppInstance{
@@ -501,6 +501,11 @@ func TestServiceStartsInnoDBClusterAndMarksAllNodesRunning(t *testing.T) {
 	joinedCommands := remote.joinedCommands()
 	if !strings.Contains(joinedCommands, "rebootClusterFromCompleteOutage") || !strings.Contains(joinedCommands, "rejoinInstance") {
 		t.Fatalf("expected InnoDB Cluster start script to run, got: %s", joinedCommands)
+	}
+	for _, forbidden := range []string{"loadDump", "DROP DATABASE", "quarantine", "backup-manifest"} {
+		if strings.Contains(joinedCommands, forbidden) {
+			t.Fatalf("complete-outage start crossed into disaster restore via %q: %s", forbidden, joinedCommands)
+		}
 	}
 	for _, instance := range s.instances {
 		if instance.Status != "running" {
