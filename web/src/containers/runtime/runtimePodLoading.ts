@@ -1,14 +1,17 @@
-export type RuntimePodLoadTrigger = 'enter' | 'scope-change' | 'refresh' | 'status-event' | 'logs'
+export type RuntimePodLoadTrigger = 'enter' | 'scope-change' | 'refresh' | 'metrics' | 'status-event' | 'logs'
 
-export function runtimePodLoadArgs(trigger: RuntimePodLoadTrigger): [force: boolean, includeStats: boolean] {
+export function runtimePodLoadArgs(trigger: RuntimePodLoadTrigger): [force: boolean, includeStats: boolean, background: boolean] {
   switch (trigger) {
+    case 'metrics':
+      return [true, true, true]
     case 'refresh':
-    case 'status-event':
-      return [true, true]
+      return [true, false, false]
     case 'enter':
     case 'scope-change':
-      return [false, true]
+      return [false, false, false]
+    case 'status-event':
+      return [true, false, true]
     case 'logs':
-      return [false, false]
+      return [false, false, true]
   }
 }
