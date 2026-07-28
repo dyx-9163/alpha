@@ -30,10 +30,14 @@ func TestMySQLInstallCredentialPersistenceFailureRollsBackAndMarksEveryNewInstan
 				for index := 0; index < memberCount; index++ {
 					serverID := fmt.Sprintf("srv-%d", index+1)
 					serverIDs = append(serverIDs, serverID)
+					metadata := fmt.Sprintf(`{"port":3306,"endpoint":"10.0.0.%d:3306"}`, index+1)
+					if memberCount == 3 {
+						metadata = fmt.Sprintf(`{"clusterId":"cluster_1234567890abcdef12345678","port":3306,"endpoint":"10.0.0.%d:3306"}`, index+1)
+					}
 					instance, err := db.SaveAppInstance(store.AppInstance{
 						App: "mysql", Version: "8.0.36", ServerID: serverID, Status: "installed",
 						Topology: map[bool]string{true: "innodb-cluster", false: "standalone"}[memberCount == 3],
-						Metadata: fmt.Sprintf(`{"port":3306,"endpoint":"10.0.0.%d:3306"}`, index+1),
+						Metadata: metadata,
 					})
 					if err != nil {
 						t.Fatal(err)
@@ -134,10 +138,14 @@ func TestMySQLInstallCredentialPersistenceCreatesOneCompleteAdminBindingPerNewIn
 				for index := 0; index < memberCount; index++ {
 					serverID := fmt.Sprintf("srv-%d", index+1)
 					serverIDs = append(serverIDs, serverID)
+					metadata := fmt.Sprintf(`{"port":3306,"endpoint":"10.0.0.%d:3306"}`, index+1)
+					if memberCount == 3 {
+						metadata = fmt.Sprintf(`{"clusterId":"cluster_1234567890abcdef12345678","port":3306,"endpoint":"10.0.0.%d:3306"}`, index+1)
+					}
 					instance, err := db.SaveAppInstance(store.AppInstance{
 						App: "mysql", Version: "8.0.36", ServerID: serverID, Status: "installed",
 						Topology: map[bool]string{true: "innodb-cluster", false: "standalone"}[memberCount == 3],
-						Metadata: fmt.Sprintf(`{"port":3306,"endpoint":"10.0.0.%d:3306"}`, index+1),
+						Metadata: metadata,
 					})
 					if err != nil {
 						t.Fatal(err)
@@ -154,6 +162,7 @@ func TestMySQLInstallCredentialPersistenceCreatesOneCompleteAdminBindingPerNewIn
 					selectedID = credential.ID
 					parameters["rootCredentialId"] = credential.ID
 					parameters[mysqlRootCredentialVersionParameter] = credential.CurrentVersion
+					parameters["rootUser"] = credential.Username
 				}
 				req := registry.InstallRequest{App: "mysql", Version: "8.0.36", Topology: instances[0].Topology, Language: "en", Actor: "owner", ServerIDs: serverIDs, Parameters: parameters}
 				log := &installCredentialTestLogger{}
@@ -264,6 +273,51 @@ func TestMySQLInstallCredentialFailureMarkingIsAtomicAndCancellationIndependent(
 	}
 }
 
+func TestMySQLInstallCredentialClosureRejectsMissingOrMismatchedClusterMembers(t *testing.T) {
+	for _, scenario := range []string{"missing", "mismatched-cluster"} {
+		t.Run(scenario, func(t *testing.T) {
+			api, db, _ := newAuthzTestAPI(t)
+			startedAt := time.Now().Add(-time.Second)
+			serverIDs := []string{"srv-1", "srv-2", "srv-3"}
+			created := 3
+			if scenario == "missing" {
+				created = 2
+			}
+			instances := make([]store.AppInstance, 0, created)
+			for index := 0; index < created; index++ {
+				clusterID := "cluster_1234567890abcdef12345678"
+				if scenario == "mismatched-cluster" && index == 2 {
+					clusterID = "cluster_abcdef1234567890abcdef12"
+				}
+				instance, err := db.SaveAppInstance(store.AppInstance{
+					App: "mysql", Version: "8.0.36", ServerID: serverIDs[index], Status: "installed", Topology: "innodb-cluster",
+					Metadata: `{"clusterId":"` + clusterID + `","port":3306}`,
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				instances = append(instances, instance)
+			}
+			req := registry.InstallRequest{
+				App: "mysql", Version: "8.0.36", Topology: "innodb-cluster", ServerIDs: serverIDs,
+				Parameters: map[string]any{"rootUser": "root", "rootPassword": installCredentialFailureSentinel},
+			}
+			if err := api.bindInstallCredentialReferences("mysql", req, &installCredentialTestLogger{}, startedAt); err == nil {
+				t.Fatal("invalid cluster closure was bound")
+			}
+			if _, err := api.markRecordedInstallInstancesFailed(req, startedAt, "tsk-invalid-closure", errors.New("binding failed")); err == nil {
+				t.Fatal("invalid cluster closure committed a failed subset")
+			}
+			for _, instance := range instances {
+				current, err := db.GetAppInstance(instance.ID)
+				if err != nil || current.Status != "installed" || strings.Contains(current.Metadata, "installFailed") {
+					t.Fatalf("invalid closure mutated a subset: row=%+v err=%v", current, err)
+				}
+			}
+		})
+	}
+}
+
 func TestMySQLSelectedInstallCredentialVersionDriftFailsBeforeBinding(t *testing.T) {
 	api, db, _ := newAuthzTestAPI(t)
 	credential, err := db.SaveCredential(store.Credential{
@@ -292,6 +346,43 @@ func TestMySQLSelectedInstallCredentialVersionDriftFailsBeforeBinding(t *testing
 	}
 	if _, err := db.GetBoundCredential(instance.ID, "admin", true); !errors.Is(err, store.ErrBoundCredentialNotFound) {
 		t.Fatalf("credential drift retained a binding: %v", err)
+	}
+}
+
+func TestMySQLSelectedInstallCredentialUsernameDriftFailsEvenWithoutVersionChange(t *testing.T) {
+	api, db, _ := newAuthzTestAPI(t)
+	credential, err := db.SaveCredential(store.Credential{
+		Name: "selected-admin", Kind: "mysql", Username: "root", Status: "active", Scope: "global", Purpose: "admin",
+		Secret: map[string]string{"password": "stable-secret"}, CreatedBy: "owner",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	parameters := map[string]any{
+		"rootCredentialId": credential.ID, "rootUser": credential.Username, "rootPassword": "stable-secret",
+		mysqlRootCredentialVersionParameter: credential.CurrentVersion,
+	}
+	startedAt := time.Now().Add(-time.Second)
+	instance, err := db.SaveAppInstance(store.AppInstance{App: "mysql", Version: "8.0.36", ServerID: "srv-1", Status: "installed", Topology: "standalone", Metadata: `{"port":3306}`})
+	if err != nil {
+		t.Fatal(err)
+	}
+	originalVersion := credential.CurrentVersion
+	credential.Username = "rotated-root"
+	credential.Secret = nil
+	rotated, err := db.SaveCredential(credential)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rotated.CurrentVersion != originalVersion {
+		t.Fatalf("username-only drift unexpectedly changed version: before=%d after=%d", originalVersion, rotated.CurrentVersion)
+	}
+	req := registry.InstallRequest{App: "mysql", Version: "8.0.36", Topology: "standalone", ServerIDs: []string{"srv-1"}, Parameters: parameters}
+	if err := api.bindInstallCredentialReferences("mysql", req, &installCredentialTestLogger{}, startedAt); err == nil {
+		t.Fatal("username-only selected credential drift was accepted")
+	}
+	if _, err := db.GetBoundCredential(instance.ID, "admin", true); !errors.Is(err, store.ErrBoundCredentialNotFound) {
+		t.Fatalf("username drift retained a binding: %v", err)
 	}
 }
 

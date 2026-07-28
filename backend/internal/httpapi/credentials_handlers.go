@@ -271,13 +271,12 @@ func (a *API) bindMySQLInstallAdminCredentials(req registry.InstallRequest, star
 	if err != nil {
 		return store.ErrMySQLInstallAdminCredentialBinding
 	}
-	seenInstances := map[string]bool{}
-	for _, serverID := range targets {
-		instance, ok := uniqueInstallInstanceCreatedAfter(instances, "mysql", req.Version, serverID, startedAt)
-		if !ok || seenInstances[instance.ID] {
-			return store.ErrMySQLInstallAdminCredentialBinding
-		}
-		seenInstances[instance.ID] = true
+	owned, err := ownedMySQLInstallInstances(req, startedAt, instances)
+	if err != nil || len(owned) != len(targets) {
+		return store.ErrMySQLInstallAdminCredentialBinding
+	}
+	for index, serverID := range targets {
+		instance := owned[index]
 		item := store.MySQLInstallAdminCredential{Instance: instance, Generated: generated}
 		if generated {
 			endpoint := a.credentialEndpointForInstance(instance, spec)
@@ -289,7 +288,10 @@ func (a *API) bindMySQLInstallAdminCredentials(req registry.InstallRequest, star
 			if selectedVersion <= 0 {
 				return store.ErrMySQLInstallAdminCredentialBinding
 			}
-			item.Credential = store.Credential{ID: selectedID, CurrentVersion: selectedVersion}
+			item.Credential = store.Credential{
+				ID: selectedID, CurrentVersion: selectedVersion,
+				Username: paramString(req.Parameters, "rootUser", ""), Secret: map[string]string{"password": paramString(req.Parameters, "rootPassword", "")},
+			}
 		}
 		items = append(items, item)
 	}
@@ -312,6 +314,36 @@ func mysqlInstallCredentialTargetServerIDs(req registry.InstallRequest) []string
 		}
 	}
 	return cleanStringIDs(req.TargetServerIDs())
+}
+
+func ownedMySQLInstallInstances(req registry.InstallRequest, startedAt time.Time, instances []store.AppInstance) ([]store.AppInstance, error) {
+	targets := mysqlInstallCredentialTargetServerIDs(req)
+	topology := normalizedInstallTopology(req.Topology)
+	if req.App != "mysql" || startedAt.IsZero() || (topology == "standalone" && len(targets) != 1) || (topology == "innodb-cluster" && len(targets) != 3) {
+		return nil, store.ErrMySQLInstallAdminCredentialBinding
+	}
+	if topology != "standalone" && topology != "innodb-cluster" {
+		return nil, store.ErrMySQLInstallAdminCredentialBinding
+	}
+	owned := make([]store.AppInstance, 0, len(targets))
+	seen := map[string]bool{}
+	clusterID := ""
+	for _, serverID := range targets {
+		instance, ok := uniqueInstallInstanceCreatedAfter(instances, req.App, req.Version, serverID, topology, startedAt)
+		if !ok || seen[instance.ID] {
+			return nil, store.ErrMySQLInstallAdminCredentialBinding
+		}
+		seen[instance.ID] = true
+		if topology == "innodb-cluster" {
+			candidateClusterID := mysqlClusterID(instance)
+			if candidateClusterID == "" || (clusterID != "" && candidateClusterID != clusterID) {
+				return nil, store.ErrMySQLInstallAdminCredentialBinding
+			}
+			clusterID = candidateClusterID
+		}
+		owned = append(owned, instance)
+	}
+	return owned, nil
 }
 
 func (a *API) bindSelectedInstallCredentialReferences(app string, req registry.InstallRequest) {

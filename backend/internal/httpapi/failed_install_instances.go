@@ -72,12 +72,13 @@ func (a *API) markRecordedInstallInstancesFailed(req registry.InstallRequest, st
 	if err != nil {
 		return 0, err
 	}
-	updates := make([]store.AppInstance, 0, len(req.TargetServerIDs()))
-	for _, serverID := range req.TargetServerIDs() {
-		instance, found := uniqueInstallInstanceCreatedAfter(instances, req.App, req.Version, serverID, startedAt)
-		if !found {
-			continue
-		}
+	owned, err := ownedMySQLInstallInstances(req, startedAt, instances)
+	if err != nil {
+		return 0, err
+	}
+	updates := make([]store.AppInstance, 0, len(owned))
+	for _, instance := range owned {
+		serverID := instance.ServerID
 		metadata, err := a.failedInstallMetadata(req, serverID, taskID, installErr)
 		if err != nil {
 			return 0, err
@@ -107,13 +108,13 @@ func (a *API) markRecordedInstallInstancesFailed(req registry.InstallRequest, st
 	return len(updates), nil
 }
 
-func uniqueInstallInstanceCreatedAfter(instances []store.AppInstance, app, version, serverID string, startedAt time.Time) (store.AppInstance, bool) {
+func uniqueInstallInstanceCreatedAfter(instances []store.AppInstance, app, version, serverID, topology string, startedAt time.Time) (store.AppInstance, bool) {
 	if startedAt.IsZero() {
 		return store.AppInstance{}, false
 	}
 	var selected store.AppInstance
 	for _, item := range instances {
-		if item.App != app || item.Version != version || item.ServerID != serverID || item.CreatedAt.Before(startedAt) {
+		if item.App != app || item.Version != version || item.ServerID != serverID || normalizedInstallTopology(item.Topology) != topology || item.CreatedAt.Before(startedAt) {
 			continue
 		}
 		if selected.ID != "" {

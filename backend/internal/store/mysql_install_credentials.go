@@ -72,8 +72,10 @@ func (s *Store) SaveMySQLInstallAdminCredentials(items []MySQLInstallAdminCreden
 			return ErrMySQLInstallAdminCredentialBinding
 		}
 		seenInstances[instanceID] = true
-		var app string
-		if err := tx.QueryRow(`select app from app_instances where id=?`, instanceID).Scan(&app); err != nil || !strings.EqualFold(strings.TrimSpace(app), "mysql") {
+		var app, version, serverID, topology string
+		var createdAt time.Time
+		if err := tx.QueryRow(`select app,version,server_id,topology,created_at from app_instances where id=?`, instanceID).Scan(&app, &version, &serverID, &topology, &createdAt); err != nil ||
+			app != "mysql" || version != item.Instance.Version || serverID != item.Instance.ServerID || topology != item.Instance.Topology || !createdAt.Equal(item.Instance.CreatedAt) {
 			return ErrMySQLInstallAdminCredentialBinding
 		}
 		var existing int
@@ -89,7 +91,7 @@ func (s *Store) SaveMySQLInstallAdminCredentials(items []MySQLInstallAdminCreden
 		} else if credentialID == "" {
 			return ErrMySQLInstallAdminCredentialBinding
 		} else if !validatedSelected[credentialID] {
-			if err := s.validateSelectedMySQLInstallCredentialTx(tx, credentialID, item.Credential.CurrentVersion); err != nil {
+			if err := s.validateSelectedMySQLInstallCredentialTx(tx, item.Credential); err != nil {
 				return ErrMySQLInstallAdminCredentialBinding
 			}
 			validatedSelected[credentialID] = true
@@ -154,20 +156,21 @@ func (s *Store) insertGeneratedMySQLInstallCredentialTx(tx *sql.Tx, credential C
 	return credential.ID, nil
 }
 
-func (s *Store) validateSelectedMySQLInstallCredentialTx(tx *sql.Tx, credentialID string, expectedVersion int) error {
+func (s *Store) validateSelectedMySQLInstallCredentialTx(tx *sql.Tx, expected Credential) error {
 	var kind, username, status, cipher string
 	var currentVersion int
-	if expectedVersion <= 0 {
+	credentialID := strings.TrimSpace(expected.ID)
+	if credentialID == "" || expected.CurrentVersion <= 0 || strings.TrimSpace(expected.Username) == "" || expected.Secret["password"] == "" {
 		return ErrMySQLInstallAdminCredentialBinding
 	}
 	if err := tx.QueryRow(`select kind,coalesce(username,''),status,coalesce(secret_cipher,''),current_version from credentials where id=?`, credentialID).Scan(&kind, &username, &status, &cipher, &currentVersion); err != nil {
 		return err
 	}
-	if !strings.EqualFold(kind, "mysql") || status != "active" || currentVersion != expectedVersion || strings.TrimSpace(username) == "" || strings.TrimSpace(cipher) == "" {
+	if !strings.EqualFold(kind, "mysql") || status != "active" || currentVersion != expected.CurrentVersion || username != expected.Username || strings.TrimSpace(cipher) == "" {
 		return ErrMySQLInstallAdminCredentialBinding
 	}
 	secret, err := s.decodeCredentialSecret(cipher)
-	if err != nil || strings.TrimSpace(secret["password"]) == "" {
+	if err != nil || secret["password"] != expected.Secret["password"] {
 		return ErrMySQLInstallAdminCredentialBinding
 	}
 	return nil
