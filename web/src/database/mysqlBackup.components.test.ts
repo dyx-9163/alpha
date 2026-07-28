@@ -231,6 +231,26 @@ describe('MySQL backup and restore surfaces', () => {
     expect(wrapper.text()).toContain('Standalone')
   })
 
+  it('disables verification for a successful protective pre-restore record', async () => {
+    const protective = { ...backup, backupType: 'pre-restore' as const }
+    const wrapper = mount(MySQLBackupDrawer, {
+      ...mountingOptions(),
+      props: {
+        modelValue: true,
+        sourceLabel: 'mysql-primary',
+        version: '8.0.36',
+        topology: 'standalone',
+        target: { topology: 'standalone', mysqlVersion: '8.0.36', instanceId, serverId },
+        records: [protective],
+        canVerify: true,
+        canRestore: true
+      }
+    })
+    await flushPromises()
+    const verify = wrapper.findAllComponents(ElButton).find((button) => button.text() === 'Verify backup')
+    expect(verify?.props('disabled')).toBe(true)
+  })
+
   it('blocks a stale disaster submit and clears all password fields when closed', async () => {
     const clusterBackup: MySQLBackupRecord = {
       ...backup,

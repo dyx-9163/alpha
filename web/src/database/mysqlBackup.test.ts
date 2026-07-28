@@ -20,6 +20,7 @@ import {
   deleteMySQLBackup,
   groupMySQLMaintenance,
   groupMySQLReconciliation,
+  latestVerifiableMySQLBackup,
   listMySQLBackups,
   mysqlOperationAvailability,
   parseMySQLBackupRecord,
@@ -152,6 +153,13 @@ describe('MySQL backup records', () => {
       backupId,
       'backup_aaaaaaaaaaaaaaaaaaaaaaaa'
     ])
+  })
+
+  it('selects only successful logical-full records for backup verification', () => {
+    const logical = parseMySQLBackupRecord(rawBackup()) as MySQLBackupRecord
+    const protective = { ...logical, id: 'backup_bbbbbbbbbbbbbbbbbbbbbbbb', backupType: 'pre-restore' as const }
+    expect(latestVerifiableMySQLBackup([protective, logical])).toBe(logical)
+    expect(latestVerifiableMySQLBackup([protective])).toBeNull()
   })
 
   it('uses backend defaults but normalizes invalid bounds and optional retention', () => {

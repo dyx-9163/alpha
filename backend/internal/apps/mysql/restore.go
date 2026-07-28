@@ -26,7 +26,7 @@ var standaloneRestoreStepNames = []string{
 	"load-backup", "acquire-instance-lock", "verify-maintenance-confirmation", "verify-manifest",
 	"verify-checksum", "verify-version", "create-pre-restore-backup", "upload-backup", "extract-backup",
 	"dry-run-load", "capture-local-infile", "enable-local-infile", "drop-target-schemas", "load-dump",
-	"restore-local-infile", "verify-schemas", "verify-data", "record-restore", "cleanup-workdir", "release-lock",
+	"restore-local-infile", "verify-schemas", "verify-data", "cleanup-workdir", "record-restore", "release-lock",
 }
 
 type restoreStore interface {
@@ -234,14 +234,16 @@ func (s Service) restoreLogical(ctx context.Context, req registry.RestoreRequest
 		}
 		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 		defer cancel()
-		_, err := s.remote.Run(cleanupCtx, server, cleanupBackupCommand(probeWork))
-		return err
+		if _, err := s.remote.Run(cleanupCtx, server, cleanupBackupCommand(probeWork)); err != nil {
+			return errors.New("unable to clean remote MySQL restore work directory")
+		}
+		return nil
 	}
 	defer func() {
-		if progress.started[19] {
+		if progress.started[18] {
 			return
 		}
-		cleanupErr := progress.step(19, cleanupRestoreWorkdir)
+		cleanupErr := progress.step(18, cleanupRestoreWorkdir)
 		if cleanupErr != nil && retErr == nil {
 			retErr = cleanupErr
 		}
@@ -365,6 +367,18 @@ func (s Service) restoreLogical(ctx context.Context, req registry.RestoreRequest
 
 	var session localInfileSession
 	var sessionCleanup func()
+	sessionCleaned := false
+	cleanupLocalInfileSession := func() error {
+		if sessionCleaned || sessionCleanup == nil {
+			return nil
+		}
+		sessionCleanup()
+		sessionCleaned = true
+		if reporter, ok := session.(credentialCleanupReporter); ok {
+			return reporter.CredentialCleanupError()
+		}
+		return nil
+	}
 	var guard *localInfileGuard
 	if err := progress.step(11, func() error {
 		var err error
@@ -378,15 +392,17 @@ func (s Service) restoreLogical(ctx context.Context, req registry.RestoreRequest
 		return err
 	}
 	defer func() {
-		sessionCleanup()
-		if reporter, ok := session.(credentialCleanupReporter); ok {
-			retErr = errors.Join(retErr, reporter.CredentialCleanupError())
-		}
+		retErr = errors.Join(retErr, cleanupLocalInfileSession())
 	}()
 	localInfileMayBeEnabled := false
+	reconciliationCleared := false
+	restoreFinalized := false
 	var maintenanceMarker store.MySQLMaintenanceMarker
 	var maintenanceInstanceIDs []string
 	defer func() {
+		if restoreFinalized {
+			return
+		}
 		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 		defer cancel()
 		var restoreErr error
@@ -396,7 +412,7 @@ func (s Service) restoreLogical(ctx context.Context, req registry.RestoreRequest
 			restoreErr = guard.Restore(cleanupCtx)
 		}
 		var clearErr error
-		if restoreErr == nil {
+		if restoreErr == nil && !reconciliationCleared {
 			clearErr = clearMySQLReconciliationMarker(data, instance.ID, guard.original, run.TaskID)
 		}
 		if restoreErr != nil {
@@ -499,20 +515,30 @@ func (s Service) restoreLogical(ctx context.Context, req registry.RestoreRequest
 		return localizedMySQLOperationError(req.Language, MySQLRestoreIncomplete)
 	}
 	if err := progress.step(18, func() error {
-		if err := clearMySQLReconciliationMarker(data, instance.ID, guard.original, run.TaskID); err != nil {
-			return errors.Join(localizedMySQLOperationError(req.Language, MySQLReconciliationRequired), err)
-		}
-		if err := updateRestorePhase(data, &backup, "verified", run.TaskID, expectedManifestSHA); err != nil {
-			return err
-		}
-		return s.clearMySQLMaintenance(maintenanceInstanceIDs, maintenanceMarker, req.Language)
+		return errors.Join(cleanupRestoreWorkdir(), cleanupLocalInfileSession())
 	}); err != nil {
 		return err
 	}
-	if err := progress.step(19, cleanupRestoreWorkdir); err != nil {
+	if err := progress.step(19, func() error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := clearMySQLReconciliationMarker(data, instance.ID, guard.original, run.TaskID); err != nil {
+			return errors.Join(localizedMySQLOperationError(req.Language, MySQLReconciliationRequired), err)
+		}
+		reconciliationCleared = true
+		if err := updateRestorePhase(data, &backup, "verified", run.TaskID, expectedManifestSHA); err != nil {
+			return err
+		}
+		if err := s.clearMySQLMaintenance(maintenanceInstanceIDs, maintenanceMarker, req.Language); err != nil {
+			return err
+		}
+		restoreFinalized = true
+		return nil
+	}); err != nil {
 		return err
 	}
-	if err := progress.step(20, func() error { return ctx.Err() }); err != nil {
+	if err := progress.step(20, func() error { return nil }); err != nil {
 		return err
 	}
 	return nil

@@ -50,7 +50,7 @@ func TestRestoreStandalonePlanMatchesApprovedSectionNine(t *testing.T) {
 		"load-backup", "acquire-instance-lock", "verify-maintenance-confirmation", "verify-manifest",
 		"verify-checksum", "verify-version", "create-pre-restore-backup", "upload-backup", "extract-backup",
 		"dry-run-load", "capture-local-infile", "enable-local-infile", "drop-target-schemas", "load-dump",
-		"restore-local-infile", "verify-schemas", "verify-data", "record-restore", "cleanup-workdir", "release-lock",
+		"restore-local-infile", "verify-schemas", "verify-data", "cleanup-workdir", "record-restore", "release-lock",
 	}
 	got := make([]string, len(plan))
 	for i := range plan {
@@ -136,6 +136,8 @@ type restoreFakeRemote struct {
 	inspectErr  error
 	loadErr     error
 	verifyErr   error
+	cleanupErr  error
+	cleanupRuns int
 	onLoad      func()
 	finalOutput string
 	onFinal     func()
@@ -164,8 +166,98 @@ func (r *restoreFakeRemote) Run(_ context.Context, _ store.Server, command strin
 		return adapter.CommandResult{Stdout: "aifar_business\n"}, r.verifyErr
 	case strings.Contains(command, "__AIFAR_VERIFY_DATA__"):
 		return adapter.CommandResult{Stdout: "1\n"}, r.verifyErr
+	case strings.Contains(command, "rm -rf --"):
+		r.cleanupRuns++
+		return adapter.CommandResult{}, r.cleanupErr
 	default:
 		return adapter.CommandResult{}, nil
+	}
+}
+
+type cleanupReportingLocalInfileSession struct {
+	*fakeLocalInfileSession
+	cleanupErr error
+}
+
+func (s *cleanupReportingLocalInfileSession) CredentialCleanupError() error { return s.cleanupErr }
+
+type maintenanceAwareRestoreStore struct{ *restoreFakeStore }
+
+func (s *maintenanceAwareRestoreStore) SetMySQLMaintenance(ids []string, marker store.MySQLMaintenanceMarker) error {
+	if len(ids) != 1 || ids[0] != s.instance.ID {
+		return errors.New("unexpected maintenance owner")
+	}
+	metadata, err := strictBackupMetadata(s.instance.Metadata)
+	if err != nil {
+		return err
+	}
+	metadata["mysqlMaintenance"], err = json.Marshal(marker)
+	if err != nil {
+		return err
+	}
+	encoded, err := json.Marshal(metadata)
+	if err == nil {
+		s.instance.Metadata = string(encoded)
+	}
+	return err
+}
+
+func (s *maintenanceAwareRestoreStore) AdvanceMySQLMaintenance(ids []string, marker store.MySQLMaintenanceMarker, phase string) error {
+	current, present, err := store.ParseMySQLMaintenanceMarker(s.instance.Metadata)
+	if err != nil || !present || !sameMaintenanceMarker(current, marker) || len(ids) != 1 || ids[0] != s.instance.ID {
+		return errors.New("maintenance ownership changed")
+	}
+	current.RestorePhase = phase
+	return s.SetMySQLMaintenance(ids, current)
+}
+
+func (s *maintenanceAwareRestoreStore) ClearMySQLMaintenance(ids []string, marker store.MySQLMaintenanceMarker) error {
+	current, present, err := store.ParseMySQLMaintenanceMarker(s.instance.Metadata)
+	if err != nil || !present || !sameMaintenanceMarker(current, marker) || len(ids) != 1 || ids[0] != s.instance.ID {
+		return errors.New("maintenance ownership changed")
+	}
+	metadata, err := strictBackupMetadata(s.instance.Metadata)
+	if err != nil {
+		return err
+	}
+	delete(metadata, "mysqlMaintenance")
+	encoded, err := json.Marshal(metadata)
+	if err == nil {
+		s.instance.Metadata = string(encoded)
+	}
+	return err
+}
+
+func TestRestoreCleanupFailureRetainsMaintenanceBeforeFinalPublication(t *testing.T) {
+	for _, test := range []struct {
+		name           string
+		remoteCleanup  error
+		sessionCleanup error
+	}{
+		{name: "restore workdir", remoteCleanup: errors.New("private restore workdir cleanup failure")},
+		{name: "local infile credential workdir", sessionCleanup: errors.New("generic credential cleanup failure")},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			const cleanupTaskID = "tsk_cccccccccccccccccccccccc"
+			data := &maintenanceAwareRestoreStore{restoreFakeStore: &restoreFakeStore{backupFakeStore: newBackupFakeStore(t)}}
+			repositoryDir, backup := createStandaloneRestoreBackup(t, data.instance)
+			data.backups = []store.AppBackup{backup}
+			remote := &restoreFakeRemote{inspect: standaloneInspection("aifar_business"), cleanupErr: test.remoteCleanup}
+			service := NewService(data, remote)
+			service.preRestoreBackup = func(context.Context, registry.BackupRequest, registry.RunContext) error { return nil }
+			session := &cleanupReportingLocalInfileSession{fakeLocalInfileSession: &fakeLocalInfileSession{value: "OFF"}, cleanupErr: test.sessionCleanup}
+			service.localInfileSession = func(context.Context, store.AppInstance, store.Server, store.Credential) (localInfileSession, func(), error) {
+				return session, func() {}, nil
+			}
+			err := service.restoreStandalone(context.Background(), standaloneRestoreRequest(data.instance, backup, repositoryDir), registry.RunContext{TaskID: cleanupTaskID, Log: &restoreProgressRecorder{}})
+			if err == nil || restorePhase(data.backups[0].Metadata) != "restore_incomplete" {
+				t.Fatalf("cleanup failure published restore success: phase=%s err=%v", restorePhase(data.backups[0].Metadata), err)
+			}
+			marker, present, markerErr := store.ParseMySQLMaintenanceMarker(data.instance.Metadata)
+			if markerErr != nil || !present || marker.TaskID != cleanupTaskID || marker.RestorePhase != "load_complete" {
+				t.Fatalf("cleanup failure cleared maintenance: marker=%+v present=%v err=%v metadata=%s", marker, present, markerErr, data.instance.Metadata)
+			}
+		})
 	}
 }
 

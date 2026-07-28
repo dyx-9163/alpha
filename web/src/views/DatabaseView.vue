@@ -288,6 +288,8 @@ import {
   clearMySQLMaintenance,
   groupMySQLMaintenance,
   groupMySQLReconciliation,
+  isMySQLBackupVerifiable,
+  latestVerifiableMySQLBackup,
   listMySQLBackups,
   mysqlOperationAvailability,
   selectMaintenanceDisasterBackup,
@@ -1571,7 +1573,7 @@ function compatibleBackup(group: DatabaseGroup) {
 async function verifyLatestMySQLBackup(group: DatabaseGroup) {
   if (!mysqlAvailability(group).verify) return
   if (!await loadBackupsForGroup(group)) return
-  const record = backupRecords.value.find((item) => item.status === 'success')
+  const record = latestVerifiableMySQLBackup(backupRecords.value)
   if (!record) {
     ElMessage.warning(t('database.mysqlBackup.noVerifiableBackup'))
     return
@@ -1580,7 +1582,7 @@ async function verifyLatestMySQLBackup(group: DatabaseGroup) {
 }
 
 async function verifySelectedMySQLBackup(record: MySQLBackupRecord) {
-  if (!activeAvailability.value.verify) return
+  if (!activeAvailability.value.verify || !isMySQLBackupVerifiable(record)) return
   try {
     await verifyMySQLBackup(record.id, taskProgress, t('database.mysqlBackup.verifyTaskLabel'))
     ElMessage.success(t('database.mysqlBackup.verifyAccepted'))

@@ -202,6 +202,14 @@ export function deduplicateMySQLBackups(items: MySQLBackupRecord[]) {
   })
 }
 
+export function isMySQLBackupVerifiable(record: MySQLBackupRecord) {
+  return record.status === 'success' && record.backupType === 'logical-full'
+}
+
+export function latestVerifiableMySQLBackup(records: MySQLBackupRecord[]) {
+  return records.find(isMySQLBackupVerifiable) ?? null
+}
+
 export function backupDefaults(value: unknown): MySQLBackupParameters {
   const defaults = objectValue(value) ?? {}
   const threads = positiveInteger(defaults.threads, 1, 64) ?? 4

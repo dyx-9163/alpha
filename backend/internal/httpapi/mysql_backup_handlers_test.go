@@ -1058,7 +1058,7 @@ func (m *backupHandlerModule) Backup(ctx context.Context, req registry.BackupReq
 	}
 }
 
-var mysqlRestoreHandlerSteps = []string{"load-backup", "acquire-instance-lock", "verify-maintenance-confirmation", "verify-manifest", "verify-checksum", "verify-version", "create-pre-restore-backup", "upload-backup", "extract-backup", "dry-run-load", "capture-local-infile", "enable-local-infile", "drop-target-schemas", "load-dump", "restore-local-infile", "verify-schemas", "verify-data", "record-restore", "cleanup-workdir", "release-lock"}
+var mysqlRestoreHandlerSteps = []string{"load-backup", "acquire-instance-lock", "verify-maintenance-confirmation", "verify-manifest", "verify-checksum", "verify-version", "create-pre-restore-backup", "upload-backup", "extract-backup", "dry-run-load", "capture-local-infile", "enable-local-infile", "drop-target-schemas", "load-dump", "restore-local-infile", "verify-schemas", "verify-data", "cleanup-workdir", "record-restore", "release-lock"}
 
 func (m *backupHandlerModule) PlanRestore(_ context.Context, req registry.RestoreRequest) ([]registry.InstallStepPlan, error) {
 	if m.restorePlanErr != nil {

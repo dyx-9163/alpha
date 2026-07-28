@@ -37,7 +37,7 @@
           <span v-if="!restoreCompatibility(record).compatible" class="compatibility-note" role="status">
             {{ t(restoreCompatibility(record).reasonKey) }}
           </span>
-          <el-button :disabled="!canVerify || record.status !== 'success'" @click="emit('verify', record)">{{ t('database.mysqlBackup.verifyAction') }}</el-button>
+          <el-button :disabled="!canVerify || !isMySQLBackupVerifiable(record)" @click="emit('verify', record)">{{ t('database.mysqlBackup.verifyAction') }}</el-button>
           <el-tooltip :content="restoreCompatibility(record).reasonKey ? t(restoreCompatibility(record).reasonKey) : ''" :disabled="restoreCompatibility(record).compatible" placement="top">
             <span><el-button type="primary" :disabled="!canRestore || !restoreCompatibility(record).compatible" @click="emit('restore', record)">{{ t('database.mysqlBackup.restoreAction') }}</el-button></span>
           </el-tooltip>
@@ -51,7 +51,7 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import { useI18n } from '../i18n'
-import { backupTargetCompatibility, type MySQLBackupRecord, type MySQLBackupStatus, type MySQLRestoreTarget } from './mysqlBackup'
+import { backupTargetCompatibility, isMySQLBackupVerifiable, type MySQLBackupRecord, type MySQLBackupStatus, type MySQLRestoreTarget } from './mysqlBackup'
 
 const props = defineProps<{
   modelValue: boolean
