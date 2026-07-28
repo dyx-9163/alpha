@@ -67,6 +67,7 @@ type Service struct {
 	store                   Store
 	remote                  Remote
 	localInfileSession      localInfileSessionFactory
+	reconciliationSession   reconciliationSessionFactory
 	preRestoreBackup        func(context.Context, registry.BackupRequest, registry.RunContext) error
 	removeMaintenanceSecret func(string) error
 }
@@ -90,6 +91,7 @@ func NewService(s Store, remote Remote) Service {
 		store:                   s,
 		remote:                  remote,
 		localInfileSession:      defaultLocalInfileSessionFactory(remote),
+		reconciliationSession:   defaultReconciliationSessionFactory(remote),
 		removeMaintenanceSecret: os.Remove,
 	}
 }

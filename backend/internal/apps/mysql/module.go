@@ -13,9 +13,8 @@ import (
 )
 
 type Module struct {
-	service               Service
-	reconciliationSession reconciliationSessionFactory
-	defaultPassword       string
+	service         Service
+	defaultPassword string
 }
 
 func init() {
@@ -30,9 +29,8 @@ func NewModule(s Store, remote Remote, defaultPassword ...string) Module {
 		password = defaultPassword[0]
 	}
 	return Module{
-		service:               NewService(s, remote),
-		reconciliationSession: defaultReconciliationSessionFactory(remote),
-		defaultPassword:       password,
+		service:         NewService(s, remote),
+		defaultPassword: password,
 	}
 }
 

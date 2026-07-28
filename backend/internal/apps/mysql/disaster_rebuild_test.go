@@ -547,6 +547,9 @@ func TestDisasterRebuildRetryReconcilesLocalInfileBeforeContinuing(t *testing.T)
 	fixture.module.service.localInfileSession = func(context.Context, store.AppInstance, store.Server, store.Credential) (localInfileSession, func(), error) {
 		return local, func() {}, nil
 	}
+	fixture.module.service.reconciliationSession = func(context.Context, store.AppInstance, store.Server, store.Credential) (localInfileSession, func() error, error) {
+		return local, func() error { return nil }, nil
+	}
 	if err := fixture.module.Restore(context.Background(), fixture.request, registry.RunContext{TaskID: fixture.taskID, Log: &restoreProgressRecorder{}}); err == nil {
 		t.Fatal("failed local_infile restoration unexpectedly reported success")
 	}
@@ -590,11 +593,87 @@ func TestDisasterRebuildRetryReconcilesLocalInfileBeforeContinuing(t *testing.T)
 	}
 }
 
+func TestDisasterRebuildReconciliationCleanupFailuresRetainMarkerAndProgress(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		cleanupErr error
+		cancel     bool
+	}{
+		{name: "local cleanup failure", cleanupErr: errors.New("private-local-path cleanup failure")},
+		{name: "remote cleanup failure", cleanupErr: errors.New("private-remote-path cleanup failure")},
+		{name: "both cleanup failures", cleanupErr: errors.Join(errors.New("private-local-path cleanup failure"), errors.New("private-remote-path cleanup failure"))},
+		{name: "cancelled reconciliation", cancel: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newDisasterRebuildFixture(t, "")
+			initial := &fakeLocalInfileSession{value: "OFF", setErrors: map[string]error{"OFF": errors.New("initial restore failed")}}
+			fixture.module.service.localInfileSession = func(context.Context, store.AppInstance, store.Server, store.Credential) (localInfileSession, func(), error) {
+				return initial, func() {}, nil
+			}
+			if err := fixture.module.Restore(context.Background(), fixture.request, registry.RunContext{TaskID: fixture.taskID, Log: &restoreProgressRecorder{}}); err == nil {
+				t.Fatal("fixture did not create a reconciliation marker")
+			}
+			cleanupCalls := 0
+			ctx := context.Background()
+			var cancel context.CancelFunc
+			if test.cancel {
+				ctx, cancel = context.WithCancel(ctx)
+			}
+			fixture.module.service.reconciliationSession = func(context.Context, store.AppInstance, store.Server, store.Credential) (localInfileSession, func() error, error) {
+				session := localInfileSession(&fakeLocalInfileSession{value: "ON"})
+				if test.cancel {
+					session = cancelOnReconciliationSession{cancel: cancel}
+				}
+				return session, func() error {
+					cleanupCalls++
+					return test.cleanupErr
+				}, nil
+			}
+			loadsBefore := fixture.remote.count("logical-restore.sh")
+			err := fixture.module.Restore(ctx, fixture.request, registry.RunContext{TaskID: fixture.taskID, Log: &restoreProgressRecorder{}})
+			if err == nil || cleanupCalls != 1 || strings.Contains(err.Error(), "private-local-path") || strings.Contains(err.Error(), "private-remote-path") {
+				t.Fatalf("unsafe reconciliation cleanup result: calls=%d err=%v", cleanupCalls, err)
+			}
+			seed, getErr := fixture.db.GetAppInstance(fixture.backup.InstanceID)
+			if getErr != nil {
+				t.Fatal(getErr)
+			}
+			if _, marker, present, parseErr := parseMySQLReconciliationMarker(seed.Metadata); parseErr != nil || !present || marker.TaskID != fixture.taskID {
+				t.Fatalf("cleanup failure cleared marker: marker=%+v present=%v err=%v", marker, present, parseErr)
+			}
+			backup, getErr := fixture.db.GetAppBackup(fixture.backup.ID)
+			if getErr != nil {
+				t.Fatal(getErr)
+			}
+			if progress := mustDisasterProgress(t, backup.Metadata); progress.SeedStage != "load-effect-complete" {
+				t.Fatalf("cleanup failure published seed stage %q", progress.SeedStage)
+			}
+			if fixture.remote.count("logical-restore.sh") != loadsBefore {
+				t.Fatal("failed reconciliation reloaded the disaster seed")
+			}
+		})
+	}
+}
+
+type cancelOnReconciliationSession struct{ cancel context.CancelFunc }
+
+func (s cancelOnReconciliationSession) SetLocalInfile(ctx context.Context, _ string) error {
+	s.cancel()
+	return ctx.Err()
+}
+
+func (s cancelOnReconciliationSession) ReadLocalInfile(ctx context.Context) (string, error) {
+	return "", ctx.Err()
+}
+
 func TestDisasterRebuildRetryResumesWhenReconciliationProgressTransactionFails(t *testing.T) {
 	fixture := newDisasterRebuildFixture(t, "")
 	local := &fakeLocalInfileSession{value: "OFF", setErrors: map[string]error{"OFF": errors.New("target unavailable during initial local_infile restore")}}
 	fixture.module.service.localInfileSession = func(context.Context, store.AppInstance, store.Server, store.Credential) (localInfileSession, func(), error) {
 		return local, func() {}, nil
+	}
+	fixture.module.service.reconciliationSession = func(context.Context, store.AppInstance, store.Server, store.Credential) (localInfileSession, func() error, error) {
+		return local, func() error { return nil }, nil
 	}
 	if err := fixture.module.Restore(context.Background(), fixture.request, registry.RunContext{TaskID: fixture.taskID, Log: &restoreProgressRecorder{}}); err == nil {
 		t.Fatal("initial local_infile restoration failure unexpectedly succeeded")

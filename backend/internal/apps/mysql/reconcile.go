@@ -208,8 +208,9 @@ func localInfileSetCommand(work string, port int, value string) string {
 
 func localInfileSQLCommand(work string, port int, query string) string {
 	mysqlsh := path.Join(mysqlInstallRoot, "mysql-shell", "bin", "mysqlsh")
-	return "set -eu; test -x " + installerkit.ShellQuote(mysqlsh) + "; " + installerkit.ShellQuote(mysqlsh) +
-		" --defaults-file=" + installerkit.ShellQuote(path.Join(work, "secret-context.cnf")) +
+	secretPath := path.Join(work, "secret-context.cnf")
+	return mysqlRemoteCredentialValidationCommand(secretPath) + "; test -x " + installerkit.ShellQuote(mysqlsh) + "; " + installerkit.ShellQuote(mysqlsh) +
+		" --defaults-file=" + installerkit.ShellQuote(secretPath) +
 		" --sql --raw --skip-column-names --host=127.0.0.1 --port=" + strconv.Itoa(port) +
 		" --execute " + installerkit.ShellQuote(query)
 }
@@ -227,20 +228,30 @@ func (s Service) requireNoMySQLReconciliation(expected store.AppInstance, langua
 	if err != nil || fresh.App != "mysql" || fresh.ServerID != expected.ServerID || instanceTopology(fresh) != instanceTopology(expected) || clusterIDFromInstance(fresh) != clusterIDFromInstance(expected) {
 		return localizedMySQLOperationError(language, MySQLReconciliationRequired)
 	}
+	_, _, representativePresent, representativeErr := parseMySQLReconciliationMarker(fresh.Metadata)
+	if representativeErr != nil || representativePresent {
+		return localizedMySQLOperationError(language, MySQLReconciliationRequired)
+	}
 	instances := []store.AppInstance{fresh}
 	if instanceTopology(fresh) == "innodb-cluster" {
-		topology, supported := s.store.(maintenanceStore)
+		topology, supported := s.store.(maintenanceReader)
 		if !supported {
-			return localizedMySQLOperationError(language, MySQLReconciliationRequired)
+			return nil
 		}
 		instances, err = maintenanceInstances(topology, fresh)
 		if err != nil || !containsInstance(instances, fresh.ID) {
-			return localizedMySQLOperationError(language, MySQLReconciliationRequired)
+			// Invalid cluster ownership is handled by the lifecycle resolver's
+			// cluster-health contract. With no representative marker present,
+			// it is not itself evidence of unfinished reconciliation.
+			return nil
 		}
 	} else if instanceTopology(fresh) != "standalone" {
 		return localizedMySQLOperationError(language, MySQLReconciliationRequired)
 	}
 	for _, instance := range instances {
+		if instance.ID == fresh.ID {
+			continue
+		}
 		_, _, present, parseErr := parseMySQLReconciliationMarker(instance.Metadata)
 		if parseErr != nil || present {
 			return localizedMySQLOperationError(language, MySQLReconciliationRequired)
@@ -295,7 +306,7 @@ func (m Module) Reconcile(ctx context.Context, plan ReconciliationPlan, language
 		strings.TrimSpace(credential.Username) == "" || strings.TrimSpace(credential.Secret["password"]) == "" {
 		return localizedMySQLOperationError(language, MySQLReconciliationRequired)
 	}
-	factory := m.reconciliationSession
+	factory := m.service.reconciliationSession
 	if factory == nil {
 		factory = defaultReconciliationSessionFactory(m.service.remote)
 	}
@@ -419,16 +430,26 @@ func (s Service) restoreMySQLReconciliation(ctx context.Context, expected store.
 	if err != nil || credential.Status != "active" || credential.Kind != "mysql" || strings.TrimSpace(credential.Secret["password"]) == "" {
 		return mysqlReconciliationMarker{}, true, localizedMySQLOperationError(language, MySQLReconciliationRequired)
 	}
-	session, cleanup, err := s.localInfileSession(ctx, instance, server, credential)
+	factory := s.reconciliationSession
+	if factory == nil {
+		factory = defaultReconciliationSessionFactory(s.remote)
+	}
+	session, cleanup, err := factory(ctx, instance, server, credential)
 	if err != nil {
 		return mysqlReconciliationMarker{}, true, localizedMySQLOperationError(language, MySQLReconciliationRequired)
 	}
-	defer cleanup()
+	var primaryErr error
 	if err := session.SetLocalInfile(ctx, marker.OriginalValue); err != nil {
-		return mysqlReconciliationMarker{}, true, localizedMySQLOperationError(language, MySQLReconciliationRequired)
+		primaryErr = errors.New("MySQL reconciliation mutation failed")
 	}
-	value, err := session.ReadLocalInfile(ctx)
-	if err != nil || strings.ToUpper(strings.TrimSpace(value)) != marker.OriginalValue {
+	if primaryErr == nil {
+		value, readErr := session.ReadLocalInfile(ctx)
+		if readErr != nil || strings.ToUpper(strings.TrimSpace(value)) != marker.OriginalValue {
+			primaryErr = errors.New("MySQL reconciliation readback failed")
+		}
+	}
+	cleanupErr := cleanup()
+	if primaryErr != nil || cleanupErr != nil {
 		return mysqlReconciliationMarker{}, true, localizedMySQLOperationError(language, MySQLReconciliationRequired)
 	}
 	return marker, true, nil
