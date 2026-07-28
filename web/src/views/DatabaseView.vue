@@ -176,6 +176,8 @@
       :instance-id="activeTarget.instanceId"
       :source-label="activeTarget.label"
       :defaults="backupListDefaults"
+      :submission-allowed="activeAvailability.backup"
+      :before-submit="guardActiveBackupSubmission"
       @submitted="refreshActiveBackups"
     />
     <MySQLBackupDrawer
@@ -183,6 +185,7 @@
       :source-label="activeTarget.label"
       :version="activeMysqlGroup?.version || ''"
       :topology="activeTarget.topology"
+      :target="activeTarget"
       :records="backupRecords"
       :loading="backupListLoading"
       :can-verify="activeAvailability.verify"
@@ -196,15 +199,20 @@
       :backup="activeBackup"
       :target="activeTarget"
       :default-threads="backupListDefaults.threads"
+      :submission-allowed="activeAvailability.restore"
+      :before-submit="guardActiveRestoreSubmission"
       @submitted="refreshActiveBackups"
     />
     <MySQLDisasterRebuildDialog
       v-model="disasterDialogVisible"
       :instance-id="activeTarget.instanceId"
       :cluster-id="activeTarget.clusterId || ''"
+      :mysql-version="activeTarget.mysqlVersion"
       :backup="activeBackup"
       :nodes="activeDisasterNodes"
       :default-threads="backupListDefaults.threads"
+      :submission-allowed="activeAvailability.disaster"
+      :before-submit="guardActiveDisasterSubmission"
       @submitted="refreshActiveBackups"
     />
     <el-dialog
@@ -249,6 +257,7 @@ import {
   groupMySQLMaintenance,
   listMySQLBackups,
   mysqlOperationAvailability,
+  selectMaintenanceDisasterBackup,
   verifyMySQLBackup,
   type MySQLBackupDefaults,
   type MySQLBackupRecord,
@@ -320,6 +329,7 @@ type DeleteScope = {
   title: string
   message: string
   nodes: DatabaseNode[]
+  groupId?: string
 }
 
 type DatabaseState = {
@@ -346,7 +356,7 @@ const deletePasswords = ref<Record<string, string>>({})
 const sameDeletePassword = ref(false)
 const deleteSharedPassword = ref('')
 const startingClusterId = ref('')
-const activeMysqlGroup = ref<DatabaseGroup | null>(null)
+const activeMysqlGroupKey = ref('')
 const activeBackup = ref<MySQLBackupRecord | null>(null)
 const backupRecords = ref<MySQLBackupRecord[]>([])
 const backupListDefaults = ref<MySQLBackupDefaults>({ threads: 4, maxRateMBps: 0 })
@@ -358,11 +368,13 @@ const disasterDialogVisible = ref(false)
 const maintenanceClearVisible = ref(false)
 const maintenanceClearConfirmed = ref(false)
 const maintenanceClearSubmitting = ref(false)
+const liveInstances = computed(() => instances.value.map((instance) => applyRealtimeStatusToAppInstance(instance, realtime.appInstanceSnapshot(instance.id))))
+const instanceGroups = computed(() => groupDatabaseInstances(liveInstances.value))
+const activeMysqlGroup = computed(() => instanceGroups.value.find((group) => group.id === activeMysqlGroupKey.value) ?? null)
 const mysqlGroupCount = computed(() => instanceGroups.value.filter((item) => item.app === 'mysql').length)
 const redisGroupCount = computed(() => instanceGroups.value.filter((item) => item.app === 'redis').length)
 const databaseNodeCount = computed(() => instanceGroups.value.reduce((total, group) => total + group.nodes.length, 0))
 const sentinelNodeCount = computed(() => instanceGroups.value.reduce((total, group) => total + group.sentinels.length, 0))
-const liveInstances = computed(() => instances.value.map((instance) => applyRealtimeStatusToAppInstance(instance, realtime.appInstanceSnapshot(instance.id))))
 const routerInstanceCount = computed(() => liveInstances.value.filter((item) => item.app === 'mysql-router').length)
 const canManageApps = computed(() => can(permissions.appsManage))
 const canManageDatabase = computed(() => can(permissions.databaseManage))
@@ -409,7 +421,6 @@ const visibleDeleteServers = computed(() => {
   }
   return deleteServers.value
 })
-const instanceGroups = computed(() => groupDatabaseInstances(liveInstances.value))
 const filteredGroups = computed(() => {
   const q = search.value.trim().toLowerCase()
   if (!q) return instanceGroups.value
@@ -1423,6 +1434,7 @@ function mysqlRestoreTarget(group: DatabaseGroup | null): MySQLRestoreTarget & {
   const node = representativeMySQLNode(group)
   return {
     topology: group?.topology || '',
+    mysqlVersion: group?.version || '',
     instanceId: node?.instance.id || '',
     serverId: node?.instance.serverId || '',
     clusterId: group?.topology === 'innodb-cluster' ? groupMetadataValue(group, 'clusterId') : undefined,
@@ -1431,7 +1443,7 @@ function mysqlRestoreTarget(group: DatabaseGroup | null): MySQLRestoreTarget & {
 }
 
 function activateMySQLGroup(group: DatabaseGroup) {
-  activeMysqlGroup.value = group
+  activeMysqlGroupKey.value = group.id
   activeBackup.value = null
   backupRecords.value = []
   backupListDefaults.value = { threads: 4, maxRateMBps: 0 }
@@ -1520,19 +1532,20 @@ function openSelectedMySQLRestore(record: MySQLBackupRecord) {
 async function openLatestMySQLDisaster(group: DatabaseGroup) {
   if (!mysqlAvailability(group).disaster) return
   if (!await loadBackupsForGroup(group)) return
-  const record = compatibleBackup(group)
-  if (!record) {
-    backupDrawerVisible.value = true
-    ElMessage.warning(t('database.mysqlBackup.noCompatibleBackup'))
+  const current = activeMysqlGroup.value
+  if (!current) return
+  const selection = selectMaintenanceDisasterBackup(backupRecords.value, mysqlGroupMaintenance(current), mysqlRestoreTarget(current))
+  if (!selection.backup) {
+    ElMessage.warning(t(selection.reasonKey))
     return
   }
-  activeBackup.value = record
+  activeBackup.value = selection.backup
   disasterDialogVisible.value = true
 }
 
 function openMaintenanceClear(group: DatabaseGroup) {
   if (!mysqlAvailability(group).clearMaintenance) return
-  activeMysqlGroup.value = group
+  activateMySQLGroup(group)
   maintenanceClearConfirmed.value = false
   maintenanceClearVisible.value = true
 }
@@ -1550,6 +1563,24 @@ async function confirmMaintenanceClear() {
   } finally {
     maintenanceClearSubmitting.value = false
   }
+}
+
+function guardActiveBackupSubmission() {
+  return !!activeMysqlGroup.value && activeAvailability.value.backup
+}
+
+function guardActiveRestoreSubmission() {
+  const group = activeMysqlGroup.value
+  const backup = activeBackup.value
+  return !!group && !!backup && mysqlAvailability(group).restore && backupTargetCompatibility(backup, mysqlRestoreTarget(group)).compatible
+}
+
+function guardActiveDisasterSubmission() {
+  const group = activeMysqlGroup.value
+  const backup = activeBackup.value
+  if (!group || !backup || !mysqlAvailability(group).disaster) return false
+  const selection = selectMaintenanceDisasterBackup(backupRecords.value, mysqlGroupMaintenance(group), mysqlRestoreTarget(group))
+  return selection.backup?.id === backup.id
 }
 
 function hasMysqlGroupDelete(group: DatabaseGroup) {
@@ -1571,7 +1602,8 @@ function mysqlClusterStartReason(group: DatabaseGroup) {
 }
 
 function isMysqlClusterStartable(group: DatabaseGroup) {
-  return group.nodes.length >= 3 && isMysqlClusterIneffective(group) && group.nodes.every((node) => mysqlRuntimeHealth(node) === 'online')
+  const nodes = group.nodes.filter((node) => !node.virtual)
+  return nodes.length === 3 && isMysqlClusterIneffective(group) && nodes.every((node) => mysqlRuntimeHealth(node) === 'online')
 }
 
 function isMysqlClusterIneffective(group: DatabaseGroup) {
@@ -1645,6 +1677,7 @@ function mysqlGroupDeleteNodes(group: DatabaseGroup) {
     return []
   }
   if (group.topology === 'innodb-cluster') {
+    if (group.nodes.filter((node) => !node.virtual).length !== 3) return []
     return uniqueRealNodes([...group.routers, ...group.nodes])
   }
   return uniqueRealNodes(group.nodes)
@@ -1673,10 +1706,12 @@ async function startMysqlCluster(group: DatabaseGroup) {
     ElMessage.warning(deniedText.value)
     return
   }
-  if (!isMysqlClusterStartable(group)) {
+  const current = instanceGroups.value.find((item) => item.id === group.id)
+  if (!current || mysqlGroupMaintenance(current).kind !== 'none' || !isMysqlClusterStartable(current)) {
+    ElMessage.warning(t('database.mysqlBackup.staleOperationBlocked'))
     return
   }
-  const instanceIds = group.nodes.map((node) => node.instance.id).filter(Boolean)
+  const instanceIds = current.nodes.filter((node) => !node.virtual).map((node) => node.instance.id).filter(Boolean)
   if (!instanceIds.length) {
     return
   }
@@ -1705,7 +1740,8 @@ function openDeleteNodes(nodes: DatabaseNode[], kind: DeleteScopeKind, group?: D
     kind,
     title: deleteScopeTitle(kind),
     message: deleteScopeMessage(kind, cleanNodes, group),
-    nodes: cleanNodes
+    nodes: cleanNodes,
+    ...(group ? { groupId: group.id } : {})
   }
   const initialPasswords: Record<string, string> = {}
   for (const node of cleanNodes) {
@@ -1762,6 +1798,18 @@ async function confirmDeleteScope() {
   const scope = pendingDeleteScope.value
   if (!scope) {
     return
+  }
+  if (!canManageApps.value) {
+    ElMessage.warning(t('database.mysqlBackup.staleOperationBlocked'))
+    return
+  }
+  if (scope.kind === 'mysql-group') {
+    const current = instanceGroups.value.find((group) => group.id === scope.groupId)
+    if (!current || mysqlGroupMaintenance(current).kind !== 'none' || mysqlGroupDeleteNodes(current).length === 0) {
+      ElMessage.warning(t('database.mysqlBackup.staleOperationBlocked'))
+      return
+    }
+    scope.nodes = mysqlGroupDeleteNodes(current)
   }
   const passwords = deletePasswordPayload()
   if (Object.keys(passwords).length !== deleteServers.value.length) {

@@ -7,10 +7,10 @@
     destroy-on-close
     @update:model-value="emit('update:modelValue', $event)"
   >
-    <div class="drawer-summary" aria-label="MySQL backup source summary">
+    <div class="drawer-summary" :aria-label="t('database.mysqlBackup.drawerSummaryAria')">
       <div><span>{{ t('database.mysqlBackup.source') }}</span><strong>{{ sourceLabel }}</strong></div>
       <div><span>{{ t('common.version') }}</span><strong>{{ version || '-' }}</strong></div>
-      <div><span>{{ t('dashboard.topology') }}</span><strong>{{ topology || '-' }}</strong></div>
+      <div><span>{{ t('dashboard.topology') }}</span><strong>{{ topologyLabel(topology) }}</strong></div>
     </div>
     <el-skeleton v-if="loading" :rows="5" animated />
     <div v-else-if="visibleRecords.length" class="backup-list">
@@ -25,7 +25,7 @@
         <dl class="record-grid">
           <div><dt>{{ t('database.mysqlBackup.source') }}</dt><dd>{{ sourceLabel }}</dd></div>
           <div><dt>{{ t('common.version') }}</dt><dd>{{ record.metadata.mysqlVersion || version || '-' }}</dd></div>
-          <div><dt>{{ t('dashboard.topology') }}</dt><dd>{{ record.metadata.topology || topology || '-' }}</dd></div>
+          <div><dt>{{ t('dashboard.topology') }}</dt><dd>{{ topologyLabel(record.metadata.topology || topology) }}</dd></div>
           <div><dt>{{ t('database.mysqlBackup.schemas') }}</dt><dd>{{ schemaSummary(record) }}</dd></div>
           <div><dt>{{ t('common.time') }}</dt><dd>{{ formatTime(record.completedAt || record.createdAt) }}</dd></div>
           <div><dt>{{ t('database.mysqlBackup.size') }}</dt><dd>{{ formatBytes(record.size) }}</dd></div>
@@ -34,8 +34,13 @@
           <div><dt>{{ t('database.mysqlBackup.task') }}</dt><dd><el-button v-if="record.taskId" link type="primary" @click="emit('openTask', record.taskId)">{{ record.taskId }}</el-button><span v-else>-</span></dd></div>
         </dl>
         <div class="record-actions">
+          <span v-if="!restoreCompatibility(record).compatible" class="compatibility-note" role="status">
+            {{ t(restoreCompatibility(record).reasonKey) }}
+          </span>
           <el-button :disabled="!canVerify || record.status !== 'success'" @click="emit('verify', record)">{{ t('database.mysqlBackup.verifyAction') }}</el-button>
-          <el-button type="primary" :disabled="!canRestore || record.status !== 'success' || record.backupType !== 'logical-full'" @click="emit('restore', record)">{{ t('database.mysqlBackup.restoreAction') }}</el-button>
+          <el-tooltip :content="restoreCompatibility(record).reasonKey ? t(restoreCompatibility(record).reasonKey) : ''" :disabled="restoreCompatibility(record).compatible" placement="top">
+            <span><el-button type="primary" :disabled="!canRestore || !restoreCompatibility(record).compatible" @click="emit('restore', record)">{{ t('database.mysqlBackup.restoreAction') }}</el-button></span>
+          </el-tooltip>
         </div>
       </article>
     </div>
@@ -46,13 +51,14 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import { useI18n } from '../i18n'
-import type { MySQLBackupRecord, MySQLBackupStatus } from './mysqlBackup'
+import { backupTargetCompatibility, type MySQLBackupRecord, type MySQLBackupStatus, type MySQLRestoreTarget } from './mysqlBackup'
 
 const props = defineProps<{
   modelValue: boolean
   sourceLabel: string
   version: string
   topology: string
+  target: MySQLRestoreTarget
   records: MySQLBackupRecord[]
   loading?: boolean
   canVerify: boolean
@@ -68,6 +74,16 @@ const emit = defineEmits<{
 
 const { t } = useI18n()
 const visibleRecords = computed(() => props.records.filter((record) => record.status !== 'deleted'))
+
+function restoreCompatibility(record: MySQLBackupRecord) {
+  return backupTargetCompatibility(record, props.target)
+}
+
+function topologyLabel(topology: string | undefined) {
+  if (topology === 'standalone') return t('database.mysqlBackup.topologyStandalone')
+  if (topology === 'innodb-cluster') return t('database.mysqlBackup.topologyCluster')
+  return '-'
+}
 
 function statusType(status: MySQLBackupStatus) {
   if (status === 'success') return 'success'
@@ -191,6 +207,13 @@ dd {
 
 .record-actions {
   justify-content: flex-end;
+  flex-wrap: wrap;
+}
+
+.compatibility-note {
+  margin-right: auto;
+  color: var(--aifar-text-danger);
+  font-size: 12px;
 }
 
 @media (max-width: 767px) {

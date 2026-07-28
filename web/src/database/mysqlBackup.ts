@@ -16,6 +16,7 @@ export interface MySQLMaintenanceState {
 }
 
 export interface MySQLBackupMetadata {
+  manifestVersion?: 2
   name?: string
   phase?: string
   mysqlVersion?: string
@@ -98,6 +99,7 @@ export interface MySQLAvailabilityInput {
 
 export interface MySQLRestoreTarget {
   topology: string
+  mysqlVersion: string
   instanceId: string
   serverId: string
   clusterId?: string
@@ -198,6 +200,15 @@ export function backupTargetCompatibility(record: MySQLBackupRecord, target: MyS
   if (record.status !== 'success' || record.backupType !== 'logical-full' || !checksumPattern.test(record.checksum)) {
     return { compatible: false, reasonKey: 'database.mysqlBackup.compatibilityStatus' }
   }
+  if (record.metadata.manifestVersion !== 2) {
+    return { compatible: false, reasonKey: 'database.mysqlBackup.compatibilityManifest' }
+  }
+  if (!record.metadata.topology || record.metadata.topology !== target.topology) {
+    return { compatible: false, reasonKey: 'database.mysqlBackup.compatibilityTopology' }
+  }
+  if (!record.metadata.mysqlVersion || !target.mysqlVersion || record.metadata.mysqlVersion !== target.mysqlVersion) {
+    return { compatible: false, reasonKey: 'database.mysqlBackup.compatibilityVersion' }
+  }
   if (target.topology === 'standalone') {
     if (record.instanceId !== target.instanceId || record.serverId !== target.serverId || record.metadata.clusterId) {
       return { compatible: false, reasonKey: 'database.mysqlBackup.compatibilityOwnership' }
@@ -211,6 +222,25 @@ export function backupTargetCompatibility(record: MySQLBackupRecord, target: MyS
     return { compatible: true, reasonKey: '' }
   }
   return { compatible: false, reasonKey: 'database.mysqlBackup.unsupportedTopology' }
+}
+
+export function selectMaintenanceDisasterBackup(
+  records: MySQLBackupRecord[],
+  maintenance: MySQLMaintenanceResult,
+  target: MySQLRestoreTarget
+) {
+  if (maintenance.kind !== 'required' || maintenance.state.scope !== 'cluster') {
+    return { backup: null, reasonKey: 'database.mysqlBackup.disasterMarkerBackupInvalid' }
+  }
+  const backup = records.find((record) => record.id === maintenance.state.backupId) ?? null
+  if (!backup) {
+    return { backup: null, reasonKey: 'database.mysqlBackup.disasterMarkerBackupMissing' }
+  }
+  const compatibility = backupTargetCompatibility(backup, target)
+  if (!compatibility.compatible || backup.metadata.verificationResult !== 'success' || backup.metadata.manifestVersion !== 2) {
+    return { backup: null, reasonKey: 'database.mysqlBackup.disasterMarkerBackupInvalid' }
+  }
+  return { backup, reasonKey: '' }
 }
 
 export function parseMySQLMaintenance(metadataValue: unknown): MySQLMaintenanceResult {
@@ -248,6 +278,8 @@ export function parseMySQLMaintenance(metadataValue: unknown): MySQLMaintenanceR
 
 export function groupMySQLMaintenance(topology: string, memberMetadata: unknown[], expectedClusterId = ''): MySQLMaintenanceResult {
   if (!memberMetadata.length) return { kind: 'invalid' }
+  if (topology === 'innodb-cluster' && memberMetadata.length !== 3) return { kind: 'invalid' }
+  if (topology !== 'innodb-cluster' && memberMetadata.length !== 1) return { kind: 'invalid' }
   const parsed = memberMetadata.map(parseMySQLMaintenance)
   if (parsed.every((item) => item.kind === 'none')) return { kind: 'none' }
   if (parsed.some((item) => item.kind !== 'required')) return { kind: 'invalid' }
@@ -264,7 +296,9 @@ export function groupMySQLMaintenance(topology: string, memberMetadata: unknown[
 }
 
 export function mysqlOperationAvailability(input: MySQLAvailabilityInput): MySQLOperationAvailability {
-  const supported = input.app === 'mysql' && ['standalone', 'innodb-cluster'].includes(input.topology)
+  const supportedTopology = ['standalone', 'innodb-cluster'].includes(input.topology)
+  const topologyComplete = input.topology === 'standalone' ? input.nodeCount === 1 : input.topology === 'innodb-cluster' && input.nodeCount === 3
+  const supported = input.app === 'mysql' && supportedTopology && topologyComplete
   const online = ['online', 'running', 'success', 'available'].includes(input.status)
   const lifecycleBlocked = input.maintenance.kind !== 'none'
   const controlStateInvalid = input.maintenance.kind === 'invalid'
@@ -279,6 +313,7 @@ export function mysqlOperationAvailability(input: MySQLAvailabilityInput): MySQL
   else if (lifecycleBlocked) reasonKey = 'database.mysqlBackup.maintenanceBlocked'
   else if (!input.canManage) reasonKey = 'common.permissionDenied'
   else if (!online) reasonKey = 'database.mysqlBackup.offlineBlocked'
+  else if (input.app === 'mysql' && supportedTopology && !topologyComplete) reasonKey = 'database.mysqlBackup.clusterIncomplete'
   else if (!supported) reasonKey = 'database.mysqlBackup.unsupportedTopology'
   else if (!input.isOwner) reasonKey = 'database.mysqlBackup.ownerRequired'
   return {
@@ -342,8 +377,10 @@ export async function verifyMySQLBackup(backupId: string, tracker: TaskTracker, 
   return trackTaskResponse(response, tracker, label)
 }
 
-export function deleteMySQLBackup(backupId: string) {
-  return apiDelete<{ deleted?: boolean }>(`/apps/backups/${encodeURIComponent(requiredBackupId(backupId))}`)
+export async function deleteMySQLBackup(backupId: string): Promise<{ backup: MySQLBackupRecord | null }> {
+  const raw = await apiDelete<unknown>(`/apps/backups/${encodeURIComponent(requiredBackupId(backupId))}`)
+  const response = objectValue(raw)
+  return { backup: parseMySQLBackupRecord(response?.backup) }
 }
 
 export async function startMySQLRestore(instanceId: string, request: MySQLRestoreRequest, tracker: TaskTracker, label: string) {
@@ -395,6 +432,7 @@ function parseBackupMetadata(value: unknown): MySQLBackupMetadata | null {
     ? Array.from(new Set(raw.schemas.map((item) => item.trim())))
     : []
   const result: MySQLBackupMetadata = { schemas }
+  if (raw.manifestVersion === 2) result.manifestVersion = 2
   const controlledResult = result as unknown as Record<string, unknown>
   assignControlledString(controlledResult, 'name', raw.name)
   assignControlledString(controlledResult, 'phase', raw.phase)

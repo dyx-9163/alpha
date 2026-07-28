@@ -51,12 +51,14 @@ import { useI18n } from '../i18n'
 import { useTaskProgressStore } from '../stores/taskProgress'
 import { backupDefaults, startMySQLBackup, type MySQLBackupDefaults } from './mysqlBackup'
 
-const props = defineProps<{
+const props = withDefaults(defineProps<{
   modelValue: boolean
   instanceId: string
   sourceLabel: string
   defaults: MySQLBackupDefaults
-}>()
+  submissionAllowed?: boolean
+  beforeSubmit?: () => boolean | Promise<boolean>
+}>(), { submissionAllowed: true })
 
 const emit = defineEmits<{
   'update:modelValue': [value: boolean]
@@ -67,11 +69,11 @@ const { t } = useI18n()
 const taskProgress = useTaskProgressStore()
 const submitting = computed(() => form.submitting)
 const form = reactive({ name: '', threads: 4, maxRateMBps: 0, keepLast: undefined as number | undefined, submitting: false })
-const canSubmit = computed(() => !!form.name.trim() && Number.isInteger(form.threads) && form.threads >= 1 && form.threads <= 64 && form.maxRateMBps >= 0 && !form.submitting)
+const canSubmit = computed(() => props.submissionAllowed && !!form.name.trim() && Number.isInteger(form.threads) && form.threads >= 1 && form.threads <= 64 && form.maxRateMBps >= 0 && !form.submitting)
 
 watch(() => props.modelValue, (visible) => {
   if (visible) resetForm()
-})
+}, { immediate: true })
 
 function resetForm() {
   if (form.submitting) return
@@ -84,6 +86,10 @@ function resetForm() {
 
 async function submit() {
   if (!canSubmit.value) return
+  if (props.beforeSubmit && !await props.beforeSubmit()) {
+    ElMessage.warning(t('database.mysqlBackup.staleOperationBlocked'))
+    return
+  }
   form.submitting = true
   try {
     await startMySQLBackup(props.instanceId, {

@@ -65,14 +65,17 @@ type DisasterNode = {
   serverLabel: string
 }
 
-const props = defineProps<{
+const props = withDefaults(defineProps<{
   modelValue: boolean
   instanceId: string
   clusterId: string
+  mysqlVersion: string
   backup: MySQLBackupRecord | null
   nodes: DisasterNode[]
   defaultThreads: number
-}>()
+  submissionAllowed?: boolean
+  beforeSubmit?: () => boolean | Promise<boolean>
+}>(), { submissionAllowed: true })
 
 const emit = defineEmits<{
   'update:modelValue': [value: boolean]
@@ -88,16 +91,16 @@ const disasterConfirmed = ref(false)
 const submitting = ref(false)
 const targetMapping = computed(() => Object.fromEntries(props.nodes.map((node) => [node.instanceId, node.serverId])))
 const compatible = computed(() => !!props.backup && backupTargetCompatibility(props.backup, {
-  topology: 'innodb-cluster', instanceId: props.instanceId, serverId: props.nodes[0]?.serverId || '', clusterId: props.clusterId
+  topology: 'innodb-cluster', mysqlVersion: props.mysqlVersion, instanceId: props.instanceId, serverId: props.nodes[0]?.serverId || '', clusterId: props.clusterId
 }).compatible)
-const canSubmit = computed(() => compatible.value && props.nodes.length === 3 && new Set(props.nodes.map((node) => node.serverId)).size === 3 &&
+const canSubmit = computed(() => props.submissionAllowed && compatible.value && props.nodes.length === 3 && new Set(props.nodes.map((node) => node.serverId)).size === 3 &&
   props.nodes.every((node) => !!serverPasswords[node.serverId]?.trim()) && maintenanceConfirmed.value && disasterConfirmed.value &&
   threads.value >= 1 && threads.value <= 64 && !submitting.value)
 
 watch(() => props.modelValue, (visible) => {
   if (visible) reset()
   else clearPasswords()
-})
+}, { immediate: true })
 
 function reset() {
   clearPasswords()
@@ -119,6 +122,10 @@ function handleVisibility(value: boolean) {
 
 async function submit() {
   if (!props.backup || !canSubmit.value) return
+  if (props.beforeSubmit && !await props.beforeSubmit()) {
+    ElMessage.warning(t('database.mysqlBackup.staleOperationBlocked'))
+    return
+  }
   submitting.value = true
   try {
     const passwords = Object.fromEntries(props.nodes.map((node) => [node.serverId, serverPasswords[node.serverId]]))

@@ -50,12 +50,14 @@ import {
 
 type RestoreTarget = MySQLRestoreTarget & { label: string }
 
-const props = defineProps<{
+const props = withDefaults(defineProps<{
   modelValue: boolean
   backup: MySQLBackupRecord | null
   target: RestoreTarget
   defaultThreads: number
-}>()
+  submissionAllowed?: boolean
+  beforeSubmit?: () => boolean | Promise<boolean>
+}>(), { submissionAllowed: true })
 
 const emit = defineEmits<{
   'update:modelValue': [value: boolean]
@@ -72,11 +74,11 @@ const mode = computed<MySQLRestoreMode>(() => props.target.topology === 'innodb-
 const compatibility = computed(() => props.backup
   ? backupTargetCompatibility(props.backup, props.target)
   : { compatible: false, reasonKey: 'database.mysqlBackup.compatibilityMissing' })
-const canSubmit = computed(() => !!props.backup && compatibility.value.compatible && maintenanceConfirmed.value && createPreRestoreBackup.value && threads.value >= 1 && threads.value <= 64 && !submitting.value)
+const canSubmit = computed(() => props.submissionAllowed && !!props.backup && compatibility.value.compatible && maintenanceConfirmed.value && threads.value >= 1 && threads.value <= 64 && !submitting.value)
 
 watch(() => props.modelValue, (visible) => {
   if (visible) reset()
-})
+}, { immediate: true })
 
 function reset() {
   if (submitting.value) return
@@ -87,6 +89,10 @@ function reset() {
 
 async function submit() {
   if (!props.backup || !canSubmit.value) return
+  if (props.beforeSubmit && !await props.beforeSubmit()) {
+    ElMessage.warning(t('database.mysqlBackup.staleOperationBlocked'))
+    return
+  }
   submitting.value = true
   try {
     await startMySQLRestore(props.target.instanceId, {

@@ -24,6 +24,7 @@ import {
   parseMySQLBackupRecord,
   parseMySQLMaintenance,
   restoreImpactKey,
+  selectMaintenanceDisasterBackup,
   startMySQLBackup,
   startMySQLRestore,
   trackTaskResponse,
@@ -60,6 +61,7 @@ function rawBackup(overrides: Record<string, unknown> = {}) {
       phase: 'success',
       mysqlVersion: '8.0.36',
       mysqlShellVersion: '8.0.36',
+      manifestVersion: 2,
       topology: 'innodb-cluster',
       clusterId,
       schemas: ['aifar', 'billing'],
@@ -115,6 +117,7 @@ describe('MySQL backup records', () => {
         phase: 'success',
         mysqlVersion: '8.0.36',
         mysqlShellVersion: '8.0.36',
+        manifestVersion: 2,
         topology: 'innodb-cluster',
         clusterId,
         schemas: ['aifar', 'billing'],
@@ -168,32 +171,63 @@ describe('MySQL backup records', () => {
 
   it('requires a successful logical backup owned by the exact standalone instance or cluster', () => {
     const standalone = parseMySQLBackupRecord(rawBackup({
-      metadata: JSON.stringify({ topology: 'standalone', schemas: ['aifar'] })
+      metadata: JSON.stringify({ topology: 'standalone', mysqlVersion: '8.0.36', manifestVersion: 2, schemas: ['aifar'] })
     })) as MySQLBackupRecord
     const cluster = parseMySQLBackupRecord(rawBackup()) as MySQLBackupRecord
 
     expect(backupTargetCompatibility(standalone, {
-      topology: 'standalone', instanceId, serverId
+      topology: 'standalone', instanceId, serverId, mysqlVersion: '8.0.36'
     })).toEqual({ compatible: true, reasonKey: '' })
     expect(backupTargetCompatibility(standalone, {
-      topology: 'standalone', instanceId: 'app_aaaaaaaaaaaaaaaaaaaaaaaa', serverId
+      topology: 'standalone', instanceId: 'app_aaaaaaaaaaaaaaaaaaaaaaaa', serverId, mysqlVersion: '8.0.36'
     })).toEqual({ compatible: false, reasonKey: 'database.mysqlBackup.compatibilityOwnership' })
     expect(backupTargetCompatibility(cluster, {
-      topology: 'innodb-cluster', instanceId, serverId, clusterId
+      topology: 'innodb-cluster', instanceId, serverId, clusterId, mysqlVersion: '8.0.36'
     })).toEqual({ compatible: true, reasonKey: '' })
     const legacyClusterId = 'mysql_cluster_aaaaaaaaaaaaaaaaaaaaaaaa'
     const legacyCluster = parseMySQLBackupRecord(rawBackup({
-      metadata: JSON.stringify({ topology: 'innodb-cluster', clusterId: legacyClusterId, schemas: ['aifar'] })
+      metadata: JSON.stringify({ topology: 'innodb-cluster', clusterId: legacyClusterId, mysqlVersion: '8.0.36', manifestVersion: 2, schemas: ['aifar'] })
     })) as MySQLBackupRecord
     expect(backupTargetCompatibility(legacyCluster, {
-      topology: 'innodb-cluster', instanceId, serverId, clusterId: legacyClusterId
+      topology: 'innodb-cluster', instanceId, serverId, clusterId: legacyClusterId, mysqlVersion: '8.0.36'
     })).toEqual({ compatible: true, reasonKey: '' })
     expect(backupTargetCompatibility(cluster, {
-      topology: 'innodb-cluster', instanceId, serverId, clusterId: 'cluster_aaaaaaaaaaaaaaaaaaaaaaaa'
+      topology: 'innodb-cluster', instanceId, serverId, clusterId: 'cluster_aaaaaaaaaaaaaaaaaaaaaaaa', mysqlVersion: '8.0.36'
     })).toEqual({ compatible: false, reasonKey: 'database.mysqlBackup.compatibilityCluster' })
     expect(backupTargetCompatibility({ ...cluster, status: 'failed' }, {
-      topology: 'innodb-cluster', instanceId, serverId, clusterId
+      topology: 'innodb-cluster', instanceId, serverId, clusterId, mysqlVersion: '8.0.36'
     })).toEqual({ compatible: false, reasonKey: 'database.mysqlBackup.compatibilityStatus' })
+    expect(backupTargetCompatibility(cluster, {
+      topology: 'standalone', instanceId, serverId, mysqlVersion: '8.0.36'
+    })).toEqual({ compatible: false, reasonKey: 'database.mysqlBackup.compatibilityTopology' })
+    expect(backupTargetCompatibility(cluster, {
+      topology: 'innodb-cluster', instanceId, serverId, clusterId, mysqlVersion: '8.0.37'
+    })).toEqual({ compatible: false, reasonKey: 'database.mysqlBackup.compatibilityVersion' })
+    expect(backupTargetCompatibility({ ...cluster, metadata: { ...cluster.metadata, mysqlVersion: undefined } }, {
+      topology: 'innodb-cluster', instanceId, serverId, clusterId, mysqlVersion: '8.0.36'
+    })).toEqual({ compatible: false, reasonKey: 'database.mysqlBackup.compatibilityVersion' })
+    expect(backupTargetCompatibility({ ...cluster, metadata: { ...cluster.metadata, topology: undefined } }, {
+      topology: 'innodb-cluster', instanceId, serverId, clusterId, mysqlVersion: '8.0.36'
+    })).toEqual({ compatible: false, reasonKey: 'database.mysqlBackup.compatibilityTopology' })
+  })
+
+  it('selects only the exact verified manifest-v2 backup named by the maintenance marker', () => {
+    const marker = validMaintenance({ scope: 'cluster', clusterId, restorePhase: 'load_complete' })
+    const maintenance: MySQLMaintenanceResult = { kind: 'required', state: marker as never }
+    const marked = parseMySQLBackupRecord(rawBackup()) as MySQLBackupRecord
+    const newer = { ...marked, id: 'backup_aaaaaaaaaaaaaaaaaaaaaaaa', createdAt: '2026-07-29T00:00:00Z' }
+    const target = { topology: 'innodb-cluster', instanceId, serverId, clusterId, mysqlVersion: '8.0.36' }
+
+    expect(selectMaintenanceDisasterBackup([newer, marked], maintenance, target)).toEqual({ backup: marked, reasonKey: '' })
+    expect(selectMaintenanceDisasterBackup([newer], maintenance, target)).toEqual({
+      backup: null, reasonKey: 'database.mysqlBackup.disasterMarkerBackupMissing'
+    })
+    expect(selectMaintenanceDisasterBackup([{ ...marked, metadata: { ...marked.metadata, verificationResult: undefined } }], maintenance, target)).toEqual({
+      backup: null, reasonKey: 'database.mysqlBackup.disasterMarkerBackupInvalid'
+    })
+    expect(selectMaintenanceDisasterBackup([{ ...marked, metadata: { ...marked.metadata, manifestVersion: undefined } }], maintenance, target)).toEqual({
+      backup: null, reasonKey: 'database.mysqlBackup.disasterMarkerBackupInvalid'
+    })
   })
 })
 
@@ -230,6 +264,8 @@ describe('strict MySQL maintenance state', () => {
     expect(groupMySQLMaintenance('innodb-cluster', [same, same, divergent], clusterId)).toEqual({ kind: 'invalid' })
     expect(groupMySQLMaintenance('innodb-cluster', [same, same, '{}'], clusterId)).toEqual({ kind: 'invalid' })
     expect(groupMySQLMaintenance('innodb-cluster', [same, same], clusterId)).toEqual({ kind: 'invalid' })
+    expect(groupMySQLMaintenance('innodb-cluster', ['{}'], clusterId)).toEqual({ kind: 'invalid' })
+    expect(groupMySQLMaintenance('innodb-cluster', ['{}', '{}'], clusterId)).toEqual({ kind: 'invalid' })
   })
 })
 
@@ -377,13 +413,15 @@ describe('typed API and task tracking', () => {
 
   it('uses the exact verify and delete endpoints', async () => {
     api.post.mockResolvedValue({ taskId, status: 'pending' })
-    api.del.mockResolvedValue({ deleted: true })
+    api.del.mockResolvedValue({ backup: rawBackup() })
 
     await verifyMySQLBackup(backupId, tracker, 'verify')
-    await deleteMySQLBackup(backupId)
+    const deleted = await deleteMySQLBackup(backupId)
 
     expect(api.post).toHaveBeenCalledWith(`/apps/backups/${backupId}/verify`, {})
     expect(api.del).toHaveBeenCalledWith(`/apps/backups/${backupId}`)
+    expect(deleted.backup).toMatchObject({ id: backupId })
+    expect(JSON.stringify(deleted)).not.toContain('/repository')
     expect(tracker.track).toHaveBeenCalledWith(taskId, 'verify')
   })
 
