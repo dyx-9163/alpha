@@ -6,8 +6,7 @@ WORK_DIR={{shq .WorkDir}}
 ARCHIVE={{shq .ArchivePath}}
 INSTALL_ROOT={{shq .InstallRoot}}
 PORT={{.Port}}
-ROOT_USER={{shq .RootUser}}
-ROOT_PASSWORD={{shq .RootPassword}}
+CREDENTIAL_CONTEXT="${1:-}"
 MYSQL_USER="aifar-mysql"
 SERVICE_NAME="aifar-mysql"
 LEGACY_SERVICE_NAME="aifar-mysql-$PORT"
@@ -20,10 +19,57 @@ RUN_DIR="$INSTALL_ROOT/run"
 IMPORT_DIR="$INSTALL_ROOT/import"
 CONFIG_FILE="$CONFIG_DIR/my.cnf"
 SOCKET_FILE="$RUN_DIR/mysql.sock"
+SECURE_ROOT_SQL="$WORK_DIR/secure-root.sql"
+SECURE_CLIENT_FILE="$WORK_DIR/secure-client.cnf"
 SUDO=""
 if [ "$(id -u)" != "0" ]; then
   SUDO="sudo -n"
 fi
+
+umask 077
+cleanup_secret_artifacts() {
+  cleanup_status=0
+  rm -f -- "$SECURE_ROOT_SQL" || cleanup_status=1
+  rm -f -- "$SECURE_CLIENT_FILE" || cleanup_status=1
+  rm -f -- "$CREDENTIAL_CONTEXT" || cleanup_status=1
+  return "$cleanup_status"
+}
+finish() {
+  status=$?
+  trap - EXIT HUP INT TERM
+  if ! cleanup_secret_artifacts; then
+    status=1
+  fi
+  exit "$status"
+}
+trap finish EXIT
+trap 'exit 1' HUP INT TERM
+
+[ "$CREDENTIAL_CONTEXT" = "$WORK_DIR/mysql-credential.context" ] || { echo "invalid MySQL credential context path"; exit 1; }
+[ -f "$CREDENTIAL_CONTEXT" ] && [ ! -L "$CREDENTIAL_CONTEXT" ] || { echo "invalid MySQL credential context"; exit 1; }
+[ "$(stat -c '%u' "$CREDENTIAL_CONTEXT")" = "$(id -u)" ] || { echo "invalid MySQL credential context owner"; exit 1; }
+[ "$(stat -c '%a' "$CREDENTIAL_CONTEXT")" = "600" ] || { echo "invalid MySQL credential context mode"; exit 1; }
+exec 3< "$CREDENTIAL_CONTEXT"
+IFS= read -r CREDENTIAL_MAGIC <&3 || { echo "invalid MySQL credential context"; exit 1; }
+IFS= read -r ROOT_USER <&3 || { echo "invalid MySQL credential context"; exit 1; }
+IFS= read -r ROOT_PASSWORD <&3 || { echo "invalid MySQL credential context"; exit 1; }
+if IFS= read -r CREDENTIAL_EXTRA <&3; then
+  echo "invalid MySQL credential context"
+  exit 1
+fi
+exec 3<&-
+[ "$CREDENTIAL_MAGIC" = "AIFAR_MYSQL_CREDENTIAL_CONTEXT_V1" ] || { echo "invalid MySQL credential context version"; exit 1; }
+[ -n "$ROOT_USER" ] && [ -n "$ROOT_PASSWORD" ] || { echo "incomplete MySQL credential context"; exit 1; }
+OPTION_USER="$(printf '%s' "$ROOT_USER" | sed 's/\\/\\\\/g; s/"/\\"/g')"
+OPTION_PASSWORD="$(printf '%s' "$ROOT_PASSWORD" | sed 's/\\/\\\\/g; s/"/\\"/g')"
+rm -f -- "$SECURE_CLIENT_FILE" "$SECURE_ROOT_SQL"
+(umask 077; cat > "$SECURE_CLIENT_FILE" <<CLIENT
+[client]
+user="$OPTION_USER"
+password="$OPTION_PASSWORD"
+CLIENT
+)
+chmod 0600 "$SECURE_CLIENT_FILE"
 
 dump_mysql_diagnostics() {
   echo "MySQL systemd status"
@@ -219,7 +265,7 @@ while [ "$i" -le 300 ]; do
       break
     fi
   else
-    if MYSQL_PWD="$ROOT_PASSWORD" "$MYSQL_BASE/bin/mysqladmin" --protocol=tcp -h 127.0.0.1 -P "$PORT" -u "$ROOT_USER" ping >/dev/null 2>&1; then
+    if "$MYSQL_BASE/bin/mysqladmin" --defaults-extra-file="$SECURE_CLIENT_FILE" --protocol=tcp -h 127.0.0.1 -P "$PORT" ping >/dev/null 2>&1; then
       MYSQL_BOOTSTRAP_READY=1
       MYSQL_BOOTSTRAP_PROTOCOL="tcp"
       break
@@ -244,9 +290,9 @@ fi
 
 if [ "$NEED_SECURE" = "1" ]; then
   echo "setting MySQL administrator password and remote account"
-  SQL_USER="$(printf "%s" "$ROOT_USER" | sed "s/'/''/g")"
-  SQL_PASSWORD="$(printf "%s" "$ROOT_PASSWORD" | sed "s/'/''/g")"
-  cat > "$WORK_DIR/secure-root.sql" <<SQL
+  SQL_USER="$(printf "%s" "$ROOT_USER" | sed "s/\\\\/\\\\\\\\/g; s/'/''/g")"
+  SQL_PASSWORD="$(printf "%s" "$ROOT_PASSWORD" | sed "s/\\\\/\\\\\\\\/g; s/'/''/g")"
+  (umask 077; cat > "$SECURE_ROOT_SQL" <<SQL
 ALTER USER 'root'@'localhost' IDENTIFIED BY '$SQL_PASSWORD';
 CREATE USER IF NOT EXISTS '$SQL_USER'@'%' IDENTIFIED BY '$SQL_PASSWORD';
 ALTER USER '$SQL_USER'@'%' IDENTIFIED BY '$SQL_PASSWORD';
@@ -256,19 +302,21 @@ GRANT ALL PRIVILEGES ON *.* TO '$SQL_USER'@'%' WITH GRANT OPTION;
 GRANT ALL PRIVILEGES ON *.* TO '$SQL_USER'@'127.0.0.1' WITH GRANT OPTION;
 FLUSH PRIVILEGES;
 SQL
+  )
+  chmod 0600 "$SECURE_ROOT_SQL"
   if [ "$MYSQL_BOOTSTRAP_PROTOCOL" = "tcp" ]; then
-    "$MYSQL_BASE/bin/mysql" --protocol=tcp -h 127.0.0.1 -P "$PORT" -uroot < "$WORK_DIR/secure-root.sql"
+    "$MYSQL_BASE/bin/mysql" --protocol=tcp -h 127.0.0.1 -P "$PORT" -uroot < "$SECURE_ROOT_SQL"
   else
-    "$MYSQL_BASE/bin/mysql" --protocol=socket --socket="$SOCKET_FILE" -uroot < "$WORK_DIR/secure-root.sql"
+    "$MYSQL_BASE/bin/mysql" --protocol=socket --socket="$SOCKET_FILE" -uroot < "$SECURE_ROOT_SQL"
   fi
-  rm -f "$WORK_DIR/secure-root.sql"
+  rm -f -- "$SECURE_ROOT_SQL"
 fi
 
 echo "verifying MySQL service"
 MYSQL_READY=0
 i=1
 while [ "$i" -le 120 ]; do
-  if MYSQL_PWD="$ROOT_PASSWORD" "$MYSQL_BASE/bin/mysqladmin" --protocol=tcp -h 127.0.0.1 -P "$PORT" -u "$ROOT_USER" ping >/dev/null 2>&1; then
+  if "$MYSQL_BASE/bin/mysqladmin" --defaults-extra-file="$SECURE_CLIENT_FILE" --protocol=tcp -h 127.0.0.1 -P "$PORT" ping >/dev/null 2>&1; then
     MYSQL_READY=1
     break
   fi
@@ -282,7 +330,7 @@ if [ "$MYSQL_READY" != "1" ]; then
 fi
 
 "$MYSQL_BASE/bin/mysqld" --version
-MYSQL_PWD="$ROOT_PASSWORD" "$MYSQL_BASE/bin/mysqladmin" --protocol=tcp -h 127.0.0.1 -P "$PORT" -u "$ROOT_USER" ping
+"$MYSQL_BASE/bin/mysqladmin" --defaults-extra-file="$SECURE_CLIENT_FILE" --protocol=tcp -h 127.0.0.1 -P "$PORT" ping
 open_firewall_ports "$PORT"
 allow_selinux_ports mysqld_port_t "$PORT"
 echo "MySQL service installed: $SERVICE_NAME"

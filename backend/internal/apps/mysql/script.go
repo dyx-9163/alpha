@@ -42,11 +42,11 @@ func uninstallStandaloneScript(version, installRoot, legacyInstallRoot string, p
 	})
 }
 
-func bootstrapInnoDBClusterScript(req InnoDBClusterBootstrapRequest) (string, error) {
+func bootstrapInnoDBClusterScript(req InnoDBClusterBootstrapScriptRequest) (string, error) {
 	return installerkit.RenderTemplate("mysql", "innodb-cluster/bootstrap.sh", "mysql-innodb-cluster-bootstrap", innodbClusterBootstrapScriptTemplate, mysqlScriptFuncs, req)
 }
 
-func startInnoDBClusterScript(req InnoDBClusterStartRequest) (string, error) {
+func startInnoDBClusterScript(req InnoDBClusterStartScriptRequest) (string, error) {
 	return installerkit.RenderTemplate("mysql", "innodb-cluster/start.sh", "mysql-innodb-cluster-start", innodbClusterStartScriptTemplate, mysqlScriptFuncs, req)
 }
 
@@ -66,15 +66,13 @@ func renderDisasterRebuildScript(options DisasterRebuildScriptOptions) (string, 
 }
 
 type InstallScriptRequest struct {
-	Version      string
-	WorkDir      string
-	ArchivePath  string
-	InstallRoot  string
-	ReportHost   string
-	Port         int
-	ServerID     uint32
-	RootUser     string
-	RootPassword string
+	Version     string
+	WorkDir     string
+	ArchivePath string
+	InstallRoot string
+	ReportHost  string
+	Port        int
+	ServerID    uint32
 }
 
 type UninstallScriptRequest struct {
@@ -93,11 +91,24 @@ type InnoDBClusterBootstrapRequest struct {
 }
 
 type InnoDBClusterStartRequest struct {
-	ClusterName  string
-	InstallRoot  string
-	RootUser     string
-	RootPassword string
-	Nodes        []InnoDBClusterNode
+	ClusterName string
+	InstallRoot string
+	Connections []mysqlConnectionCredential
+	Nodes       []InnoDBClusterNode
+}
+
+type InnoDBClusterBootstrapScriptRequest struct {
+	ClusterName           string
+	InstallRoot           string
+	CredentialContextPath string
+	Nodes                 []InnoDBClusterNode
+}
+
+type InnoDBClusterStartScriptRequest struct {
+	ClusterName           string
+	InstallRoot           string
+	CredentialContextPath string
+	Nodes                 []InnoDBClusterNode
 }
 
 type InnoDBClusterNode struct {
