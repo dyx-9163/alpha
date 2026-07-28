@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
 	"path"
 	"sort"
 	"strings"
@@ -309,7 +308,11 @@ func (s Service) probeMySQLMaintenanceCredential(ctx context.Context, server sto
 	if err != nil {
 		return errors.New("unable to create MySQL maintenance credential context")
 	}
-	defer os.Remove(secret)
+	defer func() {
+		if err := s.removeMaintenanceSecret(secret); err != nil {
+			retErr = errors.Join(retErr, errors.New("unable to clean local MySQL maintenance credential context"))
+		}
+	}()
 	if err := s.remote.UploadFile(ctx, server, secret, path.Join(work, "secret-context.cnf"), 0o600); err != nil {
 		return errors.New("unable to upload MySQL maintenance credential context")
 	}

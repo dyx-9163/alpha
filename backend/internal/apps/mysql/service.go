@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -63,10 +64,11 @@ type CheckResult struct {
 }
 
 type Service struct {
-	store              Store
-	remote             Remote
-	localInfileSession localInfileSessionFactory
-	preRestoreBackup   func(context.Context, registry.BackupRequest, registry.RunContext) error
+	store                   Store
+	remote                  Remote
+	localInfileSession      localInfileSessionFactory
+	preRestoreBackup        func(context.Context, registry.BackupRequest, registry.RunContext) error
+	removeMaintenanceSecret func(string) error
 }
 
 type stepDef = installflow.Step
@@ -84,7 +86,12 @@ type clusterStartNode struct {
 }
 
 func NewService(s Store, remote Remote) Service {
-	return Service{store: s, remote: remote, localInfileSession: defaultLocalInfileSessionFactory(remote)}
+	return Service{
+		store:                   s,
+		remote:                  remote,
+		localInfileSession:      defaultLocalInfileSessionFactory(remote),
+		removeMaintenanceSecret: os.Remove,
+	}
 }
 
 func (s Service) Install(ctx context.Context, req InstallRequest, resources []store.Resource, log Logger, targetLog targetLogger) error {

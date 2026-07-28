@@ -109,6 +109,200 @@ func TestClearMaintenanceStandaloneRejectsFailedHealthAndRetainsMarker(t *testin
 	}
 }
 
+func TestClearMaintenanceStandaloneRequiresIndependentCredentialContextCleanup(t *testing.T) {
+	// Production break caught: a successful ping must not clear the durable
+	// marker unless both the local credential file and remote work directory
+	// were cleaned. Every failure path still attempts both cleanups.
+	tests := []struct {
+		name               string
+		configureRemote    func(*maintenancePingRemote)
+		configureRemoval   func(*Module, *string)
+		wantCode           string
+		wantMarker         bool
+		wantUploadCalls    int
+		wantPingCalls      int
+		wantLocalFile      bool
+		forbiddenRawDetail string
+	}{
+		{
+			name:            "success",
+			wantMarker:      false,
+			wantUploadCalls: 1,
+			wantPingCalls:   1,
+		},
+		{
+			name: "upload failure",
+			configureRemote: func(remote *maintenancePingRemote) {
+				remote.uploadErr = errors.New("upload raw detail bound_admin bound-password")
+			},
+			wantCode:           MySQLMaintenanceStateInvalid,
+			wantMarker:         true,
+			wantUploadCalls:    1,
+			forbiddenRawDetail: "upload raw detail",
+		},
+		{
+			name: "ping command failure",
+			configureRemote: func(remote *maintenancePingRemote) {
+				remote.pingErr = errors.New("ping raw detail bound_admin bound-password")
+			},
+			wantCode:           MySQLMaintenanceStateInvalid,
+			wantMarker:         true,
+			wantUploadCalls:    1,
+			wantPingCalls:      1,
+			forbiddenRawDetail: "ping raw detail",
+		},
+		{
+			name: "local cleanup failure",
+			configureRemoval: func(module *Module, failedPath *string) {
+				module.service.removeMaintenanceSecret = func(localPath string) error {
+					*failedPath = localPath
+					return fmt.Errorf("remove raw detail %s bound_admin bound-password", localPath)
+				}
+			},
+			wantCode:           MySQLMaintenanceStateInvalid,
+			wantMarker:         true,
+			wantUploadCalls:    1,
+			wantPingCalls:      1,
+			wantLocalFile:      true,
+			forbiddenRawDetail: "remove raw detail",
+		},
+		{
+			name: "remote cleanup failure",
+			configureRemote: func(remote *maintenancePingRemote) {
+				remote.cleanupErr = errors.New("cleanup raw detail bound_admin bound-password")
+			},
+			wantCode:           MySQLMaintenanceStateInvalid,
+			wantMarker:         true,
+			wantUploadCalls:    1,
+			wantPingCalls:      1,
+			forbiddenRawDetail: "cleanup raw detail",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			db := openMaintenanceTestStore(t)
+			server, err := db.SaveServer(store.Server{Name: "mysql", Host: "10.0.0.8", Username: "root"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			instance, err := db.SaveAppInstance(store.AppInstance{
+				App: "mysql", Version: "8.0.36", ServerID: server.ID, Status: "installed", Topology: "standalone", Metadata: `{"port":3306}`,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			marker := maintenanceTestMarker("standalone", "", "schema_mutation_started")
+			if err := db.SetMySQLMaintenance([]string{instance.ID}, marker); err != nil {
+				t.Fatal(err)
+			}
+			bindMaintenanceCredential(t, db, instance.ID, "bound_admin", "bound-password")
+			remote := &maintenancePingRemote{}
+			if test.configureRemote != nil {
+				test.configureRemote(remote)
+			}
+			module := NewModule(db, remote)
+			failedLocalPath := ""
+			if test.configureRemoval != nil {
+				test.configureRemoval(&module, &failedLocalPath)
+			}
+			logger := &recordingLogger{}
+			err = module.ClearMaintenance(context.Background(), instance, "en", marker.TaskID, logger)
+			if got := maintenanceErrorCode(err); got != test.wantCode {
+				t.Fatalf("error code=%q want=%q err=%T %v", got, test.wantCode, err, err)
+			}
+			if remote.uploadCalls != test.wantUploadCalls || remote.pingCalls != test.wantPingCalls || remote.cleanupRuns != 1 {
+				t.Fatalf("remote calls upload=%d ping=%d cleanup=%d", remote.uploadCalls, remote.pingCalls, remote.cleanupRuns)
+			}
+			localPath := remote.uploadedLocalPath
+			if failedLocalPath != "" {
+				localPath = failedLocalPath
+				t.Cleanup(func() { _ = os.Remove(failedLocalPath) })
+			}
+			if localPath == "" {
+				t.Fatal("probe did not expose its local credential path to the controlled test boundary")
+			}
+			_, statErr := os.Lstat(localPath)
+			if test.wantLocalFile {
+				if statErr != nil {
+					t.Fatalf("injected cleanup failure did not leave the test credential file: %v", statErr)
+				}
+			} else if !errors.Is(statErr, os.ErrNotExist) {
+				t.Fatalf("local credential context survived completed cleanup: %v", statErr)
+			}
+			fresh, getErr := db.GetAppInstance(instance.ID)
+			if getErr != nil {
+				t.Fatal(getErr)
+			}
+			_, markerPresent, parseErr := store.ParseMySQLMaintenanceMarker(fresh.Metadata)
+			if parseErr != nil || markerPresent != test.wantMarker {
+				t.Fatalf("marker present=%v want=%v err=%v metadata=%s", markerPresent, test.wantMarker, parseErr, fresh.Metadata)
+			}
+			visible := ""
+			if err != nil {
+				visible = err.Error()
+			}
+			visible += "\n" + logger.joined()
+			for _, forbidden := range []string{localPath, "bound_admin", "bound-password", test.forbiddenRawDetail} {
+				if forbidden != "" && strings.Contains(visible, forbidden) {
+					t.Fatalf("sensitive cleanup detail leaked in user-visible evidence: %q", visible)
+				}
+			}
+		})
+	}
+}
+
+func TestProbeMySQLMaintenanceCredentialJoinsPrimaryAndCleanupFailuresGenerically(t *testing.T) {
+	// Production break caught: a primary ping error must not mask either local
+	// or remote cleanup failure, and raw cleanup details must never escape.
+	tests := []struct {
+		name            string
+		configure       func(*Service, *maintenancePingRemote)
+		wantCleanupText string
+	}{
+		{
+			name: "local cleanup",
+			configure: func(service *Service, _ *maintenancePingRemote) {
+				service.removeMaintenanceSecret = func(localPath string) error {
+					return fmt.Errorf("raw local cleanup detail %s bound_admin bound-password", localPath)
+				}
+			},
+			wantCleanupText: "unable to clean local MySQL maintenance credential context",
+		},
+		{
+			name: "remote cleanup",
+			configure: func(_ *Service, remote *maintenancePingRemote) {
+				remote.cleanupErr = errors.New("raw remote cleanup detail bound_admin bound-password")
+			},
+			wantCleanupText: "unable to clean MySQL maintenance health check",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			remote := &maintenancePingRemote{pingErr: errors.New("raw ping detail bound_admin bound-password")}
+			service := NewService(nil, remote)
+			test.configure(&service, remote)
+			server := store.Server{Host: "10.0.0.8"}
+			instance := store.AppInstance{Version: "8.0.36", Metadata: `{"port":3306}`}
+			credential := store.Credential{Username: "bound_admin", Secret: map[string]string{"password": "bound-password"}}
+			err := service.probeMySQLMaintenanceCredential(context.Background(), server, instance, credential, "tsk_1234567890abcdef12345678", &recordingLogger{})
+			if err == nil || !strings.Contains(err.Error(), "MySQL maintenance health check failed") || !strings.Contains(err.Error(), test.wantCleanupText) {
+				t.Fatalf("primary and cleanup errors were not joined: %v", err)
+			}
+			for _, forbidden := range []string{"raw ping detail", "raw local cleanup detail", "raw remote cleanup detail", "bound_admin", "bound-password", remote.uploadedLocalPath} {
+				if forbidden != "" && strings.Contains(err.Error(), forbidden) {
+					t.Fatalf("sensitive cleanup detail leaked from probe: %v", err)
+				}
+			}
+			if remote.cleanupRuns != 1 {
+				t.Fatalf("remote cleanup runs=%d want=1", remote.cleanupRuns)
+			}
+			if remote.uploadedLocalPath != "" {
+				_ = os.Remove(remote.uploadedLocalPath)
+			}
+		})
+	}
+}
+
 func TestClearMaintenanceRejectsAbsentDivergentAndReconciliationState(t *testing.T) {
 	t.Run("absent marker", func(t *testing.T) {
 		db := openMaintenanceTestStore(t)
@@ -443,26 +637,39 @@ func TestRestoreMaintenanceProductionStoreMarkerLifecycleAroundRemoteMutation(t 
 }
 
 type maintenancePingRemote struct {
-	commands       []string
-	uploadedSecret string
-	pingErr        error
+	commands          []string
+	uploadedSecret    string
+	uploadedLocalPath string
+	uploadErr         error
+	pingErr           error
+	cleanupErr        error
+	uploadCalls       int
+	pingCalls         int
+	cleanupRuns       int
 }
 
 func (r *maintenancePingRemote) Run(_ context.Context, _ store.Server, command string) (adapter.CommandResult, error) {
 	r.commands = append(r.commands, command)
+	if strings.Contains(command, "rm -rf") {
+		r.cleanupRuns++
+		return adapter.CommandResult{}, r.cleanupErr
+	}
 	if strings.Contains(command, "mysqladmin") && strings.Contains(command, "ping") {
+		r.pingCalls++
 		return adapter.CommandResult{Stdout: "__AIFAR_MYSQL_PING__\t1\n"}, r.pingErr
 	}
 	return adapter.CommandResult{}, nil
 }
 
 func (r *maintenancePingRemote) UploadFile(_ context.Context, _ store.Server, localPath, _ string, _ os.FileMode) error {
+	r.uploadCalls++
+	r.uploadedLocalPath = localPath
 	contents, err := os.ReadFile(localPath)
 	if err != nil {
 		return err
 	}
 	r.uploadedSecret = string(contents)
-	return nil
+	return r.uploadErr
 }
 
 func openMaintenanceTestStore(t *testing.T) *store.Store {
