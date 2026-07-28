@@ -243,6 +243,23 @@ util.loadDump(dumpDir, {
 
 `originalValue` 只能是 `ON` 或 `OFF`，`recordedAt` 使用 UTC RFC3339，`taskId` 必须是当前受控 restore task ID。对象不得包含账号、密码、连接串或远端命令。调和成功后只有在重新读取并确认 `@@GLOBAL.local_infile` 等于记录原值时才能删除整个 `mysqlReconciliation` 字段；未知 `version`、未知 `kind`、畸形或不完整 marker 均失败关闭并返回 `MYSQL_RECONCILIATION_REQUIRED`。
 
+### 7.1 显式调和恢复任务
+
+普通 check、backup 和 restore 不能承担调和入口：它们会被持久化维护门禁在任务创建前拒绝，而且把变量修复隐藏在普通生命周期动作中会削弱审计边界。AIFAR 必须提供独立的 owner-only worker task：
+
+```text
+POST /api/v2/apps/instances/{id}/mysql/reconciliation/run
+task type: apps.mysql.reconciliation.run
+lock: app-instance/<instanceId>/mutate or app-cluster/<clusterId>/mutate
+request: {"reconciliationConfirmed":true}
+```
+
+接口只接受携带严格有效 `mysqlReconciliation` marker 的 MySQL 实例；无 marker 返回 `MYSQL_RECONCILIATION_NOT_REQUIRED`，缺少明确确认返回 `MYSQL_RECONCILIATION_CONFIRMATION_REQUIRED`，畸形 marker 继续失败关闭并返回 `MYSQL_RECONCILIATION_REQUIRED`。任务允许在同一实例或集群仍有有效 `mysqlMaintenance` 时执行，这是维护门禁的受控例外；它不得删除、改写或放宽维护 marker。
+
+handler 创建 task、target、step 和 audit 后，worker 取得与其它 MySQL mutation 相同的 raw `mutate` 锁，并在锁内重读实例、拓扑和 marker。集群锁必须由 marker 所在实例的权威 `clusterId` 推导，不得信任请求提供的拓扑。任务只使用唯一、启用、绑定 `purpose=admin` 且同时含用户名和密码的凭据；随后重新连接目标，恢复 marker 记录的 `@@GLOBAL.local_infile` 原值，再次读取并验证相等，最后以比较并交换方式仅删除该实例的整个 `mysqlReconciliation` 字段。连接失败、设置失败、复验失败、凭据不完整、marker 或拓扑漂移、metadata 清除失败均保持 marker 并使任务失败；日志、错误 details 和 audit 不得泄露凭据。
+
+调和成功只证明 `local_infile` 已恢复到记录原值，不证明 restore 数据完整，也不解除维护状态。若 `mysqlMaintenance` 同时存在，owner 仍须完成外部修复并另行执行第 9.1 节维护清除任务。
+
 ## 8. Standalone 备份
 
 步骤：
@@ -329,7 +346,7 @@ standalone 在本实例写入一个 marker；cluster 必须在同一 SQLite 事�
 
 若初始 marker 无法持久化，任务必须在第一条 schema mutation 前返回 `MYSQL_MAINTENANCE_STATE_PERSIST_FAILED`，保持 backup restore phase 为 `restore_incomplete`，并记录不含 secret 的失败证据。若 `verified` 后清除失败，任务同样返回该码且原 marker 保持有效；不得报告 restore success。
 
-有效 marker 存在时，AIFAR 必须在两层失败关闭：HTTP handler 在创建普通任务前拒绝；MySQL module/service 在取得实例或集群 `mutate` 锁并重读权威状态后再次拒绝。被阻断的普通生命周期操作包括 check、start、delete、backup 和 ordinary restore。有效 marker 返回 `MYSQL_MAINTENANCE_REQUIRED`；畸形 marker 或同一集群三成员 marker 缺失/不一致返回 `MYSQL_MAINTENANCE_STATE_INVALID`。唯一允许继续的是 owner-only 维护状态读取/清除任务，以及第 12.2 节显式 disaster rebuild。
+有效 marker 存在时，AIFAR 必须在两层失败关闭：HTTP handler 在创建普通任务前拒绝；MySQL module/service 在取得实例或集群 `mutate` 锁并重读权威状态后再次拒绝。被阻断的普通生命周期操作包括 check、start、delete、backup 和 ordinary restore。有效 marker 返回 `MYSQL_MAINTENANCE_REQUIRED`；畸形 marker 或同一集群三成员 marker 缺失/不一致返回 `MYSQL_MAINTENANCE_STATE_INVALID`。唯一允许继续的是 owner-only 维护状态读取/清除任务、第 7.1 节显式调和恢复任务，以及第 12.2 节显式 disaster rebuild。
 
 维护清除接口固定为：
 
@@ -481,6 +498,8 @@ record-restore
 
 实例或集群存在 `mysqlMaintenance` 时，Database 页面必须显示不可忽略的维护横幅、来源 backup/task、restore phase、记录时间和“面板门禁不等于外部业务已停止”的提示。普通 check/start/delete/backup/restore 操作禁用并解释原因；owner 可发起独立的“清除维护状态”任务，确认文案必须说明健康检查不证明数据相等，只有在外部修复和风险确认后才能提交。
 
+任一实例存在严格有效 `mysqlReconciliation` 时，页面必须显示受影响实例、原 `local_infile` 值、来源 task 和记录时间，并向 owner 提供独立的“执行调和”动作，提交 `{"reconciliationConfirmed":true}` 并跟踪返回 task。若维护 marker 同时存在，“清除维护状态”保持禁用，直到重新读取状态确认调和 marker 已消失。UI 必须明确说明调和只恢复 `local_infile`，不会校验数据、不会解除维护；畸形 marker 只显示失败关闭诊断，不提供绕过动作。
+
 页面只提交结构化参数并跟踪 task；不拼接 shell、不持有解密密码、不复制后端安全判断。用户可见文案全部提供 zh/en。
 
 ## 14. 失败语义
@@ -491,6 +510,7 @@ record-restore
 - 删除 schema 后 load 失败：任务标记 `restore_incomplete`，保持维护模式，不自动恢复业务。
 - schema mutation 前必须按第 9.1 节先原子写入 `mysqlMaintenance`；写入失败不执行 mutation。mutation 后任一失败保留 marker；最终清除失败优先返回 `MYSQL_MAINTENANCE_STATE_PERSIST_FAILED`，不得报告 restore success。
 - `local_infile` 恢复失败：任务必须失败并输出稳定错误码，即使数据导入已完成；目标不可达时保留待调和标记并阻止后续生命周期操作。
+- 显式调和失败：保留完整 `mysqlReconciliation`，不修改 `mysqlMaintenance`；只有恢复、复读验证和比较并交换清除都成功，任务才可报告 success。
 - 健康集群 PRIMARY 切换：任务失败，不跨 PRIMARY 续写。
 - disaster rebuild 中成员 clone 失败：保留已恢复 seed，保持 Router 停止，允许修复后重试未完成成员。
 - 自动 pre-restore 备份是安全回退点，但恢复它仍需显式创建新的 restore task，不能在失败路径隐式执行。
@@ -517,6 +537,8 @@ MYSQL_RESTORE_INCOMPLETE
 MYSQL_MAINTENANCE_REQUIRED
 MYSQL_MAINTENANCE_STATE_INVALID
 MYSQL_MAINTENANCE_STATE_PERSIST_FAILED
+MYSQL_RECONCILIATION_CONFIRMATION_REQUIRED
+MYSQL_RECONCILIATION_NOT_REQUIRED
 MYSQL_REBUILD_CONFIRMATION_REQUIRED
 MYSQL_REBUILD_ROUTER_FAILED
 ```
@@ -544,11 +566,11 @@ MYSQL_REBUILD_ROUTER_FAILED
 
 - Store：`app_backups` pending/running/success/failed、列表、保留策略和删除归属；standalone marker 单实例写入/清除、cluster 三成员原子写入/清除、事务比较失败回滚且无部分更新。
 - Adapter：SFTP Download 流式传输、partial、checksum、取消和路径错误。
-- MySQL module：standalone/cluster PlanBackup、PlanRestore、PRIMARY 选择、集群展开和锁冲突；marker 严格解析、preflight 失败不设置、第一条 mutation 前设置、失败保留、验证成功后清除、普通生命周期两层门禁和 owner 清除健康检查。
+- MySQL module：standalone/cluster PlanBackup、PlanRestore、PRIMARY 选择、集群展开和锁冲突；marker 严格解析、preflight 失败不设置、第一条 mutation 前设置、失败保留、验证成功后清除、普通生命周期两层门禁、owner 调和和 owner 清除健康检查。
 - Manifest v2：使用真实 MySQL Shell 8.0.36 完成标记和 metadata 目录图构建完整文件/schema/base table 期望；覆盖 inventory 摘要、缺失/悬空/重复 metadata、v1 只读兼容和 destructive restore 拒绝。
 - 脚本：dump/load 选项、账号排除、metadata 排除、`local_infile` finally 恢复、日志脱敏。
-- HTTP：权限、task id、audit、错误码、危险确认、非法 manifest、维护门禁创建前拒绝和 owner-only clear task。
-- 前端：按钮能力、备份列表、恢复确认、灾难向导、任务追踪和 zh/en。
+- HTTP：权限、task id、target、step、audit、错误码、危险确认、非法 manifest、维护门禁创建前拒绝、owner-only reconciliation task 和 owner-only clear task。
+- 前端：按钮能力、备份列表、恢复确认、灾难向导、调和动作、任务追踪和 zh/en。
 - 安全：归档 traversal、symlink、超额展开、checksum 篡改、secret 泄露扫描。
 
 ### 17.2 真实环境验收
@@ -562,7 +584,7 @@ MYSQL_REBUILD_ROUTER_FAILED
 - complete outage 使用 reboot 路径，不误触 disaster rebuild。
 - 从备份恢复 clean seed，clone B/C，三个成员 ONLINE。
 - Router 6446 恢复真实读写。
-- 目标仍可达的成功、失败和取消场景恢复 `local_infile` 原值；不可达场景产生门禁标记，并在目标恢复后完成调和。
+- 目标仍可达的成功、失败和取消场景恢复 `local_infile` 原值；不可达场景产生门禁标记，并在目标恢复后通过独立 owner 调和任务完成恢复与复验。若维护 marker 同时存在，证明调和只清自己的 marker，随后才允许另行执行维护清除。
 - task、step、target、log、audit、`app_backups` 完整且无 secret。
 
 ### 17.3 本地门禁

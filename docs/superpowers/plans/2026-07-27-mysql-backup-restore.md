@@ -16,9 +16,10 @@
 - Use bound active MySQL credentials with purpose `admin`; never use `AIFAR_DEFAULT_PASSWORD` as a backup or restore fallback.
 - Never place a MySQL password in a command line, manifest, backup metadata, task log, error details, or audit message. Pass it through a `0600` remote secret context and remove that context on success, failure, and cancellation.
 - Backup may run online. Restore requires an explicit maintenance confirmation and leaves maintenance active when schema deletion or loading has begun but completion fails.
-- Persist incomplete-restore maintenance state in the strict non-secret `app_instances.metadata.mysqlMaintenance` v1 object defined by design section 9.1. Standalone writes one instance; cluster writes all three authoritative members atomically. Valid state blocks ordinary check/start/delete/backup/restore at both HTTP pre-task and locked module/service gates. Malformed or divergent cluster state fails closed. Only owner maintenance clear and explicit disaster rebuild may proceed.
+- Persist incomplete-restore maintenance state in the strict non-secret `app_instances.metadata.mysqlMaintenance` v1 object defined by design section 9.1. Standalone writes one instance; cluster writes all three authoritative members atomically. Valid state blocks ordinary check/start/delete/backup/restore at both HTTP pre-task and locked module/service gates. Malformed or divergent cluster state fails closed. Only owner maintenance clear, owner reconciliation, and explicit disaster rebuild may proceed.
 - Standalone locks use `app-instance/<instanceId>`; cluster operations use `app-cluster/<clusterId>`. Use the existing mutation operation so check/delete/start/backup/restore cannot overlap.
 - `local_infile` must be restored in a finally path. An unreachable target records `app_instances.metadata.mysqlReconciliation` as `{version:1,kind:"local_infile",originalValue:"ON|OFF",recordedAt:<UTC RFC3339>,taskId:<current task ID>}`, fails the task with `MYSQL_LOCAL_INFILE_RESTORE_FAILED`, and blocks later MySQL lifecycle actions until reconciliation succeeds. Unknown or malformed markers fail closed with `MYSQL_RECONCILIATION_REQUIRED`; only a verified successful reconciliation removes the whole marker. The legacy name `MYSQL_RESTORE_LOCAL_INFILE_RESTORE_FAILED` remains a read/translation compatibility alias only and is never emitted by new restore work.
+- Recovery from a persisted reconciliation marker is an explicit owner-only `apps.mysql.reconciliation.run` worker task at `POST /api/v2/apps/instances/{id}/mysql/reconciliation/run`, requiring `{"reconciliationConfirmed":true}` and the same raw instance/cluster `mutate` lock. It may run while maintenance remains active, restores and verifies only the recorded `local_infile` value, atomically clears only the reconciliation marker, and never clears maintenance or claims data equality.
 - Cluster backup and healthy restore require every MySQL member `ONLINE`; backup runs once on the current PRIMARY; healthy restore loads only on the current PRIMARY with `skipBinlog:false`.
 - Complete outage with intact data remains the existing `dba.rebootClusterFromCompleteOutage()` operation and is not represented as backup restore.
 - Disaster rebuild is explicit and owner-only: quarantine old data, restore a clean seed, call `dba.createCluster()`, clone remaining members, and re-bootstrap Router. No automatic destructive fallback is allowed.
@@ -40,9 +41,9 @@
 | Registry | `backend/internal/apps/registry/contract.go`, registry tests | Optional backup and restore lifecycle contracts |
 | MySQL common | `backend/internal/apps/mysql/backup_types.go`, `backup_manifest.go`, `backup_scripts.go`, templates and tests | Requests, manifest, safe mysqlsh scripts, stable errors, reconciliation marker |
 | MySQL backup | `backend/internal/apps/mysql/backup.go`, tests | Standalone and cluster source selection, dump, package, download, record, retention |
-| MySQL restore | `backend/internal/apps/mysql/restore.go`, `cluster_restore.go`, tests | Pre-restore backup, local-infile guard, standalone/healthy cluster restore, disaster rebuild |
-| HTTP | `backend/internal/httpapi/mysql_backup_handlers.go`, `api.go`, handler/authz tests | Resolve instances/groups, create tasks/plans/locks, audit, list/verify/delete endpoints |
-| Frontend | `web/src/database/mysqlBackup.ts`, backup components, `DatabaseView.vue`, `messages.ts`, tests | Backup records, dialogs, disaster confirmation, task tracking |
+| MySQL restore | `backend/internal/apps/mysql/restore.go`, `cluster_restore.go`, reconciliation/maintenance services and tests | Pre-restore backup, local-infile guard, explicit reconciliation, standalone/healthy cluster restore, disaster rebuild |
+| HTTP | `backend/internal/httpapi/mysql_backup_handlers.go`, maintenance/reconciliation handlers, `api.go`, handler/authz tests | Resolve instances/groups, create tasks/plans/locks, audit, list/verify/delete/reconciliation endpoints |
+| Frontend | `web/src/database/mysqlBackup.ts`, backup components, `DatabaseView.vue`, `messages.ts`, tests | Backup records, dialogs, reconciliation, disaster confirmation, task tracking |
 | Operations | `docs/mysql-backup-restore-runbook.md` | Environment configuration and real-target acceptance/runbook |
 
 ---
@@ -535,6 +536,14 @@ export interface MySQLBackupRecord {
 - Modify: `README.md`
 - Modify: `memory.md`
 
+**Release remediation before documentation convergence:**
+
+- [ ] Add RED backend tests for `POST /api/v2/apps/instances/{id}/mysql/reconciliation/run`: owner-only, exact `{"reconciliationConfirmed":true}`, no-marker and malformed-marker errors, task/target/step/audit creation, raw instance/cluster mutate locking, locked authoritative reread, and secret-free errors/logs.
+- [ ] Add RED MySQL service/store tests proving a complete bound `purpose=admin` credential is required; a valid reconciliation marker can be repaired while `mysqlMaintenance` remains active; exact `local_infile` restoration is reread and verified; only the reconciliation marker is compare-and-swap cleared; maintenance and unrelated metadata remain unchanged; every failure preserves both markers as applicable.
+- [ ] Implement the owner-only reconciliation route, worker service, stable errors `MYSQL_RECONCILIATION_CONFIRMATION_REQUIRED` and `MYSQL_RECONCILIATION_NOT_REQUIRED`, zh/en logs/messages, and focused regression tests. Do not reuse ordinary check and do not weaken maintenance clear.
+- [ ] Add RED then GREEN frontend tests and controls: show valid marker details, submit the exact owner-only action for the affected instance, track the returned task, keep maintenance clear disabled until a fresh state read confirms reconciliation disappeared, and state that reconciliation neither validates data nor clears maintenance.
+- [ ] Run focused backend tests, `pnpm test:web -- mysqlBackup`, and `pnpm web:build`; commit the remediation separately before final documentation and full gates.
+
 **Runbook contents:**
 
 - Configuration and mount ownership for `AIFAR_MYSQL_BACKUP_DIR`.
@@ -542,7 +551,7 @@ export interface MySQLBackupRecord {
 - Difference between healthy restore, complete-outage start, and disaster rebuild.
 - Maintenance-window responsibilities and `restore_incomplete` handling.
 - Exact `mysqlMaintenance` marker states, panel-only blocking boundary, external-client maintenance responsibility, owner clear health gates/risk acknowledgement, and `MYSQL_MAINTENANCE_REQUIRED`, `MYSQL_MAINTENANCE_STATE_INVALID`, and `MYSQL_MAINTENANCE_STATE_PERSIST_FAILED` diagnosis.
-- `MYSQL_RECONCILIATION_REQUIRED` diagnosis and safe reconciliation.
+- `MYSQL_RECONCILIATION_REQUIRED`, `MYSQL_RECONCILIATION_CONFIRMATION_REQUIRED`, and `MYSQL_RECONCILIATION_NOT_REQUIRED` diagnosis; explicit owner reconciliation workflow; and the rule that reconciliation does not clear maintenance.
 - Retention, off-host/NAS recommendation, capacity monitoring, and test restore cadence.
 - Manual three-node acceptance matrix from design section 17.2 with evidence fields.
 
