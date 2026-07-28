@@ -464,6 +464,11 @@ func (s Service) installIntegratedMySQLRouters(ctx context.Context, req InstallR
 }
 
 func (s Service) StartInnoDBCluster(ctx context.Context, req StartClusterRequest, log Logger, targetLog targetLogger) error {
+	if len(req.Instances) > 0 {
+		if err := s.requireNoMySQLMaintenance(req.Instances[0], req.Language); err != nil {
+			return err
+		}
+	}
 	copy := ClusterStartCopyFor(req.Language)
 	nodes, err := s.clusterStartNodes(req, copy)
 	if err != nil {
@@ -540,6 +545,9 @@ func recordClusterBaseFailure(mu *sync.Mutex, failedTargets map[string]bool, fai
 }
 
 func (s Service) Delete(ctx context.Context, req DeleteRequest, log Logger, targetLog targetLogger) error {
+	if err := s.requireNoMySQLMaintenance(req.Instance, req.Language); err != nil {
+		return err
+	}
 	copy := DeleteCopyFor(req.Language)
 	target := req.Instance.ServerID
 	if target == "" {
@@ -574,6 +582,9 @@ func (s Service) Delete(ctx context.Context, req DeleteRequest, log Logger, targ
 }
 
 func (s Service) Check(ctx context.Context, req CheckRequest, log Logger, targetLog targetLogger) (CheckResult, error) {
+	if err := s.requireNoMySQLMaintenance(req.Instance, req.Language); err != nil {
+		return CheckResult{Status: "failed", Message: err.Error()}, err
+	}
 	if err := s.reconcileMySQL(ctx, req.Instance, req.Language); err != nil {
 		return CheckResult{Status: "failed", Message: err.Error()}, err
 	}

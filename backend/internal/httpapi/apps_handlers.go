@@ -87,6 +87,10 @@ func (a *API) deleteAppInstance(w http.ResponseWriter, r *http.Request) {
 		respond(w, nil, err)
 		return
 	}
+	if code := a.mysqlMaintenanceGate(instance); code != "" {
+		writeError(w, http.StatusConflict, code, i18n.MySQLBackupErrorText(lang, code), map[string]any{"instanceId": instance.ID})
+		return
+	}
 	lockSpecs, lockSpecErr := validatedAppMutationOperationLockSpecs("delete", []store.AppInstance{instance})
 	if lockSpecErr != nil {
 		writeError(w, http.StatusConflict, mysqlapp.MySQLBackupClusterUnhealthy, i18n.MySQLBackupErrorText(lang, mysqlapp.MySQLBackupClusterUnhealthy), map[string]any{"instanceId": instance.ID})
@@ -355,6 +359,10 @@ func (a *API) checkAppInstance(w http.ResponseWriter, r *http.Request) {
 	instance, err := a.store.GetAppInstance(id)
 	if err != nil {
 		respond(w, nil, err)
+		return
+	}
+	if code := a.mysqlMaintenanceGate(instance); code != "" {
+		writeError(w, http.StatusConflict, code, i18n.MySQLBackupErrorText(lang, code), map[string]any{"instanceId": instance.ID})
 		return
 	}
 	if strings.TrimSpace(instance.ServerID) == "" {

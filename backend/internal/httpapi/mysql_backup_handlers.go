@@ -97,6 +97,10 @@ func (a *API) startMySQLRestore(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, mysqlapp.MySQLBackupStandaloneRequired, i18n.MySQLBackupErrorText(lang, mysqlapp.MySQLBackupStandaloneRequired), map[string]any{"instanceId": instanceID})
 		return
 	}
+	if code := a.mysqlMaintenanceGate(instance); code != "" {
+		writeError(w, http.StatusConflict, code, i18n.MySQLBackupErrorText(lang, code), map[string]any{"instanceId": instance.ID})
+		return
+	}
 	backup, err := a.store.GetAppBackup(payload.BackupID)
 	if err != nil || backup.App != "mysql" || backup.BackupType != "logical-full" || backup.Status != "success" || (topology == "standalone" && (backup.InstanceID != instance.ID || backup.ServerID != instance.ServerID)) || (topology == "innodb-cluster" && mysqlClusterIDFromBackup(backup) != mysqlClusterID(instance)) {
 		writeError(w, http.StatusConflict, mysqlapp.MySQLBackupVerifyNotAllowed, i18n.MySQLBackupErrorText(lang, mysqlapp.MySQLBackupVerifyNotAllowed), map[string]any{"backupId": payload.BackupID})
@@ -239,6 +243,10 @@ func (a *API) startMySQLBackup(w http.ResponseWriter, r *http.Request) {
 	}
 	if strings.TrimSpace(instance.ServerID) == "" {
 		writeError(w, http.StatusBadRequest, "INSTANCE_SERVER_REQUIRED", i18n.Text(lang, "api.instanceServerRequired"), map[string]any{"instanceId": instanceID})
+		return
+	}
+	if code := a.mysqlMaintenanceGate(instance); code != "" {
+		writeError(w, http.StatusConflict, code, i18n.MySQLBackupErrorText(lang, code), map[string]any{"instanceId": instance.ID})
 		return
 	}
 	instances, servers, err := a.mysqlBackupTargets(instance)

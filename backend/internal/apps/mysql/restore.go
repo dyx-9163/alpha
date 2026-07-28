@@ -132,6 +132,9 @@ func (s Service) restoreStandalone(ctx context.Context, req registry.RestoreRequ
 }
 
 func (s Service) restoreLogical(ctx context.Context, req registry.RestoreRequest, run registry.RunContext, cluster *resolvedInnoDBCluster) (retErr error) {
+	if err := s.requireNoMySQLMaintenance(req.Instance, req.Language); err != nil {
+		return err
+	}
 	progressTarget := req.Instance.ServerID
 	if cluster != nil {
 		progressTarget = cluster.clusterID
@@ -359,6 +362,8 @@ func (s Service) restoreLogical(ctx context.Context, req registry.RestoreRequest
 	}
 	defer sessionCleanup()
 	localInfileMayBeEnabled := false
+	var maintenanceMarker store.MySQLMaintenanceMarker
+	var maintenanceInstanceIDs []string
 	defer func() {
 		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 		defer cancel()
@@ -408,6 +413,11 @@ func (s Service) restoreLogical(ctx context.Context, req registry.RestoreRequest
 		if err := updateRestorePhase(data, &backup, "schema_mutation_started", run.TaskID, expectedManifestSHA); err != nil {
 			return err
 		}
+		var persistErr error
+		maintenanceMarker, maintenanceInstanceIDs, persistErr = s.setMySQLMaintenance(instance, backup.ID, run.TaskID, req.Language)
+		if persistErr != nil {
+			return persistErr
+		}
 		_, err := s.remote.Run(ctx, server, dropSchemasCommand(probeWork, instancePort(instance), manifest.Schemas))
 		return err
 	}); err != nil {
@@ -429,6 +439,11 @@ func (s Service) restoreLogical(ctx context.Context, req registry.RestoreRequest
 		}
 		if _, err := s.remote.Run(ctx, server, "sh "+installerkit.ShellQuote(remoteScript)); err != nil {
 			return err
+		}
+		var persistErr error
+		maintenanceMarker, persistErr = s.advanceMySQLMaintenance(maintenanceInstanceIDs, maintenanceMarker, req.Language)
+		if persistErr != nil {
+			return persistErr
 		}
 		return updateRestorePhase(data, &backup, "load_complete", run.TaskID, expectedManifestSHA)
 	}); err != nil {
@@ -465,7 +480,10 @@ func (s Service) restoreLogical(ctx context.Context, req registry.RestoreRequest
 		if err := clearMySQLReconciliationMarker(data, instance.ID, guard.original, run.TaskID); err != nil {
 			return errors.Join(localizedMySQLOperationError(req.Language, MySQLReconciliationRequired), err)
 		}
-		return updateRestorePhase(data, &backup, "verified", run.TaskID, expectedManifestSHA)
+		if err := updateRestorePhase(data, &backup, "verified", run.TaskID, expectedManifestSHA); err != nil {
+			return err
+		}
+		return s.clearMySQLMaintenance(maintenanceInstanceIDs, maintenanceMarker, req.Language)
 	}); err != nil {
 		return err
 	}

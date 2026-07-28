@@ -286,6 +286,9 @@ func routerPort(instance store.AppInstance) int {
 }
 
 func (s Service) backupInnoDBCluster(ctx context.Context, req registry.BackupRequest, run registry.RunContext) error {
+	if err := s.requireNoMySQLMaintenance(req.Instance, req.Language); err != nil {
+		return err
+	}
 	cluster, err := s.resolveHealthyInnoDBCluster(ctx, req.Instance, run.TaskID)
 	if err != nil {
 		return err
@@ -375,6 +378,52 @@ func (s Service) verifyClusterRecovered(ctx context.Context, cluster *resolvedIn
 	return nil
 }
 
+// verifyMaintenanceClusterHealth deliberately performs a router-port 6446
+// read/write transaction without assuming a restored business schema exists.
+func (s Service) verifyMaintenanceClusterHealth(ctx context.Context, cluster *resolvedInnoDBCluster, taskID string) error {
+	if err := s.inspectInnoDBClusterRuntime(ctx, cluster, taskID); err != nil {
+		return err
+	}
+	if len(cluster.routers) == 0 {
+		return mysqlOperationError(MySQLBackupClusterUnhealthy)
+	}
+	data, ok := s.store.(backupStore)
+	if !ok {
+		return errors.New("MySQL backup store is unavailable")
+	}
+	credential, err := data.GetBoundCredential(cluster.primary.instance.ID, "admin", true)
+	if err != nil || credential.Status != "active" || credential.Kind != "mysql" || strings.TrimSpace(credential.Secret["password"]) == "" {
+		return mysqlOperationError(MySQLCredentialUnavailable)
+	}
+	for _, router := range cluster.routers {
+		server, err := s.store.GetServer(router.ServerID, false)
+		if err != nil {
+			return err
+		}
+		work := mysqlBackupWorkDir(taskID + "-maintenance-router-" + router.InstanceID[len("app_"):])
+		if _, err := s.remote.Run(ctx, server, bootstrapBackupWorkCommand(work)); err != nil {
+			return mysqlOperationError(MySQLBackupClusterUnhealthy)
+		}
+		secret, err := writeMySQLSecretContext(credential, routerPortForEndpoint(router.Endpoint))
+		if err != nil {
+			return mysqlOperationError(MySQLCredentialUnavailable)
+		}
+		if uploadErr := s.remote.UploadFile(ctx, server, secret, path.Join(work, "secret-context.cnf"), 0o600); uploadErr != nil {
+			_ = os.Remove(secret)
+			return mysqlOperationError(MySQLBackupClusterUnhealthy)
+		}
+		_ = os.Remove(secret)
+		result, verifyErr := s.remote.Run(ctx, server, routerMaintenanceHealthCommand(work, routerPortForEndpoint(router.Endpoint)))
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		_, cleanupErr := s.remote.Run(cleanupCtx, server, cleanupBackupCommand(work))
+		cancel()
+		if verifyErr != nil || cleanupErr != nil || !strings.Contains(result.Stdout, "__AIFAR_ROUTER_WRITE__\t1") || !strings.Contains(result.Stdout, "__AIFAR_ROUTER_READ__\t1") {
+			return mysqlOperationError(MySQLBackupClusterUnhealthy)
+		}
+	}
+	return nil
+}
+
 func routerPortForEndpoint(endpoint string) int {
 	_, port, err := net.SplitHostPort(endpoint)
 	if err != nil {
@@ -399,5 +448,11 @@ func routerVerificationSchema(schemas []string) (string, bool) {
 func routerReadWriteVerificationCommand(work string, port int, schema string) string {
 	mysqlsh := path.Join(mysqlInstallRoot, "mysql-shell", "bin", "mysqlsh")
 	query := "USE `" + schema + "`; CREATE TEMPORARY TABLE aifar_router_verify(v INT NOT NULL); INSERT INTO aifar_router_verify VALUES (1); SELECT '__AIFAR_ROUTER_WRITE__',COUNT(*) FROM aifar_router_verify; SELECT '__AIFAR_ROUTER_READ__',v FROM aifar_router_verify"
+	return "set -eu; test -x " + installerkit.ShellQuote(mysqlsh) + "; " + installerkit.ShellQuote(mysqlsh) + " --defaults-file=" + installerkit.ShellQuote(path.Join(work, "secret-context.cnf")) + " --sql --raw --skip-column-names --host=127.0.0.1 --port=" + strconv.Itoa(port) + " --execute " + installerkit.ShellQuote(query)
+}
+
+func routerMaintenanceHealthCommand(work string, port int) string {
+	mysqlsh := path.Join(mysqlInstallRoot, "mysql-shell", "bin", "mysqlsh")
+	query := "START TRANSACTION READ WRITE; SELECT '__AIFAR_ROUTER_WRITE__',1; COMMIT; SELECT '__AIFAR_ROUTER_READ__',1"
 	return "set -eu; test -x " + installerkit.ShellQuote(mysqlsh) + "; " + installerkit.ShellQuote(mysqlsh) + " --defaults-file=" + installerkit.ShellQuote(path.Join(work, "secret-context.cnf")) + " --sql --raw --skip-column-names --host=127.0.0.1 --port=" + strconv.Itoa(port) + " --execute " + installerkit.ShellQuote(query)
 }

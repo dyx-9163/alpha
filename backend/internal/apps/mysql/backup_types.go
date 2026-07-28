@@ -28,6 +28,9 @@ const (
 	MySQLRestoreIncomplete               = "MYSQL_RESTORE_INCOMPLETE"
 	MySQLRebuildConfirmationRequired     = "MYSQL_REBUILD_CONFIRMATION_REQUIRED"
 	MySQLRebuildRouterFailed             = "MYSQL_REBUILD_ROUTER_FAILED"
+	MySQLMaintenanceRequired             = "MYSQL_MAINTENANCE_REQUIRED"
+	MySQLMaintenanceStateInvalid         = "MYSQL_MAINTENANCE_STATE_INVALID"
+	MySQLMaintenanceStatePersistFailed   = "MYSQL_MAINTENANCE_STATE_PERSIST_FAILED"
 )
 
 // BackupManifest is the non-secret, portable description of a logical MySQL

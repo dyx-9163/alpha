@@ -75,6 +75,9 @@ var mysqlBackupErrorMessageKeys = map[string]string{
 	"MYSQL_RESTORE_INCOMPLETE":                  "mysql.restore.incomplete",
 	"MYSQL_REBUILD_CONFIRMATION_REQUIRED":       "mysql.rebuild.confirmationRequired",
 	"MYSQL_REBUILD_ROUTER_FAILED":               "mysql.rebuild.routerFailed",
+	"MYSQL_MAINTENANCE_REQUIRED":                "mysql.maintenance.required",
+	"MYSQL_MAINTENANCE_STATE_INVALID":           "mysql.maintenance.stateInvalid",
+	"MYSQL_MAINTENANCE_STATE_PERSIST_FAILED":    "mysql.maintenance.statePersistFailed",
 }
 
 // MySQLBackupErrorText resolves the stable backup/restore code through the
@@ -160,8 +163,11 @@ var mysqlBackupCatalogs = map[Locale]map[string]string{
 		"mysql.restore.step.restore-local-infile": "恢复 local_infile 原值", "mysql.restore.step.verify-schemas": "校验业务 schema",
 		"mysql.restore.step.verify-data": "校验业务数据", "mysql.restore.step.record-restore": "记录还原结果",
 		"mysql.restore.step.cleanup-workdir": "清理还原工作目录", "mysql.restore.step.release-lock": "释放实例操作锁",
-		"mysql.rebuild.confirmationRequired": "MySQL 灾难重建需要明确确认",
-		"mysql.rebuild.routerFailed":         "MySQL Router 重建失败",
+		"mysql.rebuild.confirmationRequired":   "MySQL 灾难重建需要明确确认",
+		"mysql.rebuild.routerFailed":           "MySQL Router 重建失败",
+		"mysql.maintenance.required":           "MySQL 处于维护恢复状态，常规操作已被阻止",
+		"mysql.maintenance.stateInvalid":       "MySQL 维护状态无效，常规操作已被阻止",
+		"mysql.maintenance.statePersistFailed": "无法持久化 MySQL 维护状态，已停止操作",
 	},
 	En: {
 		"mysql.backup.standaloneRequired":              "this operation currently supports only standalone MySQL backups",
@@ -233,8 +239,11 @@ var mysqlBackupCatalogs = map[Locale]map[string]string{
 		"mysql.restore.step.restore-local-infile": "restore local_infile", "mysql.restore.step.verify-schemas": "verify business schemas",
 		"mysql.restore.step.verify-data": "verify business data", "mysql.restore.step.record-restore": "record restore result",
 		"mysql.restore.step.cleanup-workdir": "clean restore work directory", "mysql.restore.step.release-lock": "release instance operation lock",
-		"mysql.rebuild.confirmationRequired": "MySQL disaster rebuild requires explicit confirmation",
-		"mysql.rebuild.routerFailed":         "MySQL Router rebuild failed",
+		"mysql.rebuild.confirmationRequired":   "MySQL disaster rebuild requires explicit confirmation",
+		"mysql.rebuild.routerFailed":           "MySQL Router rebuild failed",
+		"mysql.maintenance.required":           "MySQL is in maintenance recovery state; ordinary operations are blocked",
+		"mysql.maintenance.stateInvalid":       "MySQL maintenance state is invalid; ordinary operations are blocked",
+		"mysql.maintenance.statePersistFailed": "unable to persist MySQL maintenance state; operation stopped",
 	},
 }
 

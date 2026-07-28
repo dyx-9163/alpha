@@ -270,6 +270,9 @@ type standaloneBackupExecution struct {
 }
 
 func (s Service) backupStandalone(ctx context.Context, req registry.BackupRequest, run registry.RunContext) error {
+	if err := s.requireNoMySQLMaintenance(req.Instance, req.Language); err != nil {
+		return err
+	}
 	if err := s.reconcileMySQL(ctx, req.Instance, req.Language); err != nil {
 		return err
 	}
