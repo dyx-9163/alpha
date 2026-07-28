@@ -165,12 +165,71 @@ func TestInstallerCleanupFailureCannotPublishSuccess(t *testing.T) {
 		}
 		return adapter.CommandResult{Stdout: "ok"}, nil
 	}}
-	err := NewInstaller(remote).Install(context.Background(), store.Server{ID: "srv-1", Host: "10.0.0.1", DeployDir: "/aifar/apps"}, Bundle{Version: "8.0.36", ArchivePath: archive}, InstallOptions{Port: 3306, RootUser: "root", RootPassword: credentialTransportSentinel}, installerTestLogger{})
+	log := &recordingLogger{}
+	err := NewInstaller(remote).Install(context.Background(), store.Server{ID: "srv-1", Host: "10.0.0.1", DeployDir: "/aifar/apps"}, Bundle{Version: "8.0.36", ArchivePath: archive}, InstallOptions{Port: 3306, RootUser: "root", RootPassword: credentialTransportSentinel}, log)
 	if err == nil {
 		t.Fatal("cleanup failure must fail the state-changing install")
 	}
 	if strings.Contains(err.Error(), credentialTransportSentinel) {
 		t.Fatal("cleanup error leaked credential material")
+	}
+	if strings.Contains(log.joined(), "installed and verified") {
+		t.Fatalf("cleanup failure published installer success: %s", log.joined())
+	}
+}
+
+func TestClusterCleanupFailureSuppressesRemoteCompletionOutput(t *testing.T) {
+	remote := &installerFakeRemote{runHook: func(command string) (adapter.CommandResult, error) {
+		if strings.Contains(command, "start-cluster.sh") {
+			return adapter.CommandResult{Stdout: "MySQL InnoDB Cluster start completed"}, nil
+		}
+		if strings.Contains(command, "rm -rf --") && strings.Contains(command, "mysql-credential-start") {
+			return adapter.CommandResult{}, errors.New("cleanup failed")
+		}
+		return adapter.CommandResult{}, nil
+	}}
+	log := &recordingLogger{}
+	err := NewInstaller(remote).StartInnoDBCluster(context.Background(), store.Server{ID: "srv-1", DeployDir: "/aifar/apps"}, InnoDBClusterStartRequest{
+		ClusterName: "aifarCluster", InstallRoot: "/aifar/apps/mysql",
+		Connections: []mysqlConnectionCredential{{Host: "10.0.0.1", Port: 3306, User: "root", Password: credentialTransportSentinel}},
+		Nodes:       []InnoDBClusterNode{{Host: "10.0.0.1", Port: 3306}},
+	}, log)
+	if err == nil {
+		t.Fatal("cluster cleanup failure must fail")
+	}
+	if strings.Contains(log.joined(), "start completed") {
+		t.Fatalf("cleanup failure published remote completion output: %s", log.joined())
+	}
+}
+
+func TestStateChangingScriptsPublishCompletionOnlyAfterExplicitCleanup(t *testing.T) {
+	tests := map[string]string{}
+	install, err := installStandaloneScript(InstallScriptRequest{Version: "8.0.36", WorkDir: "/aifar/apps/_work/mysql-8.0.36-1", ArchivePath: "/tmp/mysql.tar", InstallRoot: "/aifar/apps/mysql", Port: 3306})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests["install"] = install
+	bootstrap, err := bootstrapInnoDBClusterScript(InnoDBClusterBootstrapScriptRequest{ClusterName: "aifarCluster", InstallRoot: "/aifar/apps/mysql", CredentialContextPath: "/aifar/apps/_work/mysql-credential-bootstrap-1/credential-context.json", Nodes: []InnoDBClusterNode{{Host: "10.0.0.1", Port: 3306}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests["bootstrap"] = bootstrap
+	start, err := startInnoDBClusterScript(InnoDBClusterStartScriptRequest{ClusterName: "aifarCluster", InstallRoot: "/aifar/apps/mysql", CredentialContextPath: "/aifar/apps/_work/mysql-credential-start-1/credential-context.json", Nodes: []InnoDBClusterNode{{Host: "10.0.0.1", Port: 3306}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests["start"] = start
+	for name, script := range tests {
+		t.Run(name, func(t *testing.T) {
+			completion := strings.LastIndex(script, "completed")
+			if name == "install" {
+				completion = strings.LastIndex(script, "installed:")
+			}
+			cleanup := strings.LastIndex(script, "cleanup_secret_artifacts")
+			if completion < 0 || strings.Count(script, "cleanup_secret_artifacts") < 3 || cleanup > completion {
+				t.Fatalf("%s completion is not ordered after explicit cleanup", name)
+			}
+		})
 	}
 }
 
@@ -200,6 +259,34 @@ func TestInstallerAttemptsLocalCleanupWhenRemoteCleanupFails(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), credentialTransportSentinel) {
 		t.Fatal("combined cleanup failure leaked credential material")
+	}
+}
+
+func TestStatusCredentialCleanupAttemptsRemoteAndLocalAndReturnsGenericError(t *testing.T) {
+	remoteCleanupAttempts := 0
+	remote := &installerFakeRemote{runHook: func(command string) (adapter.CommandResult, error) {
+		if strings.Contains(command, "rm -rf --") && strings.Contains(command, "_backup/credential_") {
+			remoteCleanupAttempts++
+			return adapter.CommandResult{}, errors.New("remote private path " + credentialTransportSentinel)
+		}
+		return adapter.CommandResult{Stdout: "runtimeStatus=running\n"}, nil
+	}}
+	localCleanupAttempts := 0
+	originalRemove := removeMySQLCredentialContextFile
+	removeMySQLCredentialContextFile = func(name string) error {
+		localCleanupAttempts++
+		_ = os.Remove(name)
+		return errors.New("local private path " + credentialTransportSentinel)
+	}
+	t.Cleanup(func() { removeMySQLCredentialContextFile = originalRemove })
+	instance := store.AppInstance{ID: "app-1", App: "mysql", Version: "8.0.36", Metadata: `{"port":3306}`}
+	credential := store.Credential{Kind: "mysql", Status: "active", Username: "root", Secret: map[string]string{"password": credentialTransportSentinel}}
+	_, err := NewService(&fakeStore{}, remote).runMySQLCredentialCommand(context.Background(), store.Server{ID: "srv-1"}, instance, credential, fakeLogger{}, func(string) string { return "printf ok" })
+	if err == nil || remoteCleanupAttempts != 1 || localCleanupAttempts != 1 {
+		t.Fatalf("credential cleanup attempts: err=%v remote=%d local=%d", err, remoteCleanupAttempts, localCleanupAttempts)
+	}
+	if strings.Contains(err.Error(), credentialTransportSentinel) || strings.Contains(err.Error(), "private path") {
+		t.Fatalf("credential cleanup error exposed private detail: %v", err)
 	}
 }
 

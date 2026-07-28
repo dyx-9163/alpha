@@ -5,8 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"aifar-deployment/backend/internal/appmeta"
 	"aifar-deployment/backend/internal/apps/registry"
@@ -72,6 +74,11 @@ func (a *API) saveCredential(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "CREDENTIAL_INVALID", i18n.Text(lang, "api.credentialInvalid"), nil)
 		return
 	}
+	locks, ok := a.acquireMySQLAdminCredentialMutationLocks(w, r, item)
+	if !ok {
+		return
+	}
+	defer a.releaseOperationLocks(locks)
 	saved, err := a.store.SaveCredential(item)
 	if err == nil {
 		action := "credentials.create"
@@ -81,6 +88,78 @@ func (a *API) saveCredential(w http.ResponseWriter, r *http.Request) {
 		a.audit(r, action, saved.ID, "success", saved.Kind)
 	}
 	respond(w, saved, err)
+}
+
+func (a *API) acquireMySQLAdminCredentialMutationLocks(w http.ResponseWriter, r *http.Request, item store.Credential) ([]store.OperationLock, bool) {
+	lang := languageFromRequest(r)
+	lockFailure := func(status int) ([]store.OperationLock, bool) {
+		writeError(w, status, "CREDENTIAL_MUTATION_LOCK_FAILED", i18n.Text(lang, "api.credentialMutationLockFailed"), nil)
+		return nil, false
+	}
+	instances := map[string]store.AppInstance{}
+	isMySQL := strings.EqualFold(strings.TrimSpace(item.Kind), "mysql")
+	if item.ID != "" {
+		if existing, err := a.store.GetCredential(item.ID, false); err == nil {
+			isMySQL = isMySQL || strings.EqualFold(strings.TrimSpace(existing.Kind), "mysql")
+		}
+		bindings, err := a.store.CredentialBindings(item.ID)
+		if err != nil {
+			return lockFailure(http.StatusInternalServerError)
+		}
+		for _, binding := range bindings {
+			if !strings.EqualFold(strings.TrimSpace(binding.Purpose), "admin") {
+				continue
+			}
+			instance, err := a.store.GetAppInstance(binding.AppInstanceID)
+			if err != nil {
+				return lockFailure(http.StatusConflict)
+			}
+			instances[instance.ID] = instance
+		}
+	}
+	if isMySQL && strings.EqualFold(strings.TrimSpace(item.Purpose), "admin") && strings.TrimSpace(item.AppInstanceID) != "" {
+		instance, err := a.store.GetAppInstance(item.AppInstanceID)
+		if err != nil {
+			return lockFailure(http.StatusConflict)
+		}
+		instances[instance.ID] = instance
+	}
+	if !isMySQL || len(instances) == 0 {
+		return nil, true
+	}
+	values := make([]store.AppInstance, 0, len(instances))
+	for _, instance := range instances {
+		values = append(values, instance)
+	}
+	specs, err := validatedAppMutationOperationLockSpecs("mysql-admin-credential-update", values)
+	if err != nil {
+		return lockFailure(http.StatusConflict)
+	}
+	sort.Slice(specs, func(i, j int) bool {
+		return specs[i].Scope+"\x00"+specs[i].ResourceID < specs[j].Scope+"\x00"+specs[j].ResourceID
+	})
+	locks := make([]store.OperationLock, 0, len(specs))
+	for _, spec := range specs {
+		lock, err := a.store.AcquireOperationLock(store.OperationLock{
+			Scope: spec.Scope, ResourceID: spec.ResourceID, Operation: operationLockMutation,
+			Owner: currentUser(r).Username, ExpiresAt: time.Now().UTC().Add(operationLockTTL),
+			Metadata: operationLockMetadata(map[string]any{"action": "mysql-admin-credential-update", "credentialId": item.ID}),
+		})
+		if err != nil {
+			a.releaseOperationLocks(locks)
+			var conflict store.OperationLockConflict
+			if errors.As(err, &conflict) {
+				writeError(w, http.StatusConflict, "OPERATION_LOCKED", i18n.Text(lang, "api.operationLocked", conflict.Lock.ResourceID), map[string]any{
+					"scope": conflict.Lock.Scope, "resourceId": conflict.Lock.ResourceID, "operation": conflict.Lock.Operation,
+					"ownerTaskId": conflict.Lock.OwnerTaskID, "expiresAt": conflict.Lock.ExpiresAt,
+				})
+				return nil, false
+			}
+			return lockFailure(http.StatusInternalServerError)
+		}
+		locks = append(locks, lock)
+	}
+	return locks, true
 }
 
 func (a *API) deleteCredential(w http.ResponseWriter, r *http.Request) {

@@ -192,7 +192,7 @@ func TestServiceInstallsStandaloneMySQLAndRecordsInstalledInstance(t *testing.T)
 		Topology:        "single",
 		Language:        "en",
 		DefaultPassword: "Oversea.123",
-		Parameters:      map[string]any{"port": 3307, "rootUser": "root"},
+		Parameters:      map[string]any{"port": 3307, "rootUser": "root", "rootPassword": "explicit-install-secret"},
 	}, []store.Resource{{App: "mysql", Part: "backend", Version: "8.0.36", Path: archive}}, fakeLogger{}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -235,7 +235,7 @@ func TestServiceInstallsInnoDBClusterAndRecordsEachNode(t *testing.T) {
 		Language:        "en",
 		DefaultPassword: "Oversea.123",
 		ServerIDs:       []string{"srv-1", "srv-2", "srv-3"},
-		Parameters:      map[string]any{"port": 3306, "rootUser": "root", "clusterName": "aifarCluster"},
+		Parameters:      map[string]any{"port": 3306, "rootUser": "root", "rootPassword": "explicit-install-secret", "clusterName": "aifarCluster"},
 	}, []store.Resource{{App: "mysql", Part: "backend", Version: "8.0.36", Path: archive}}, fakeLogger{}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -340,7 +340,7 @@ func TestServiceLogsClusterNodeCompletionForInnoDBCluster(t *testing.T) {
 		Language:        "en",
 		DefaultPassword: "Oversea.123",
 		ServerIDs:       []string{"srv-1", "srv-2", "srv-3"},
-		Parameters:      map[string]any{"port": 3306, "rootUser": "root", "clusterName": "aifarCluster"},
+		Parameters:      map[string]any{"port": 3306, "rootUser": "root", "rootPassword": "explicit-install-secret", "clusterName": "aifarCluster"},
 	}, []store.Resource{{App: "mysql", Part: "backend", Version: "8.0.36", Path: archive}}, log, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -597,7 +597,7 @@ func TestServiceInstallsInnoDBClusterBaseConcurrently(t *testing.T) {
 			DefaultPassword: "Oversea.123",
 			ServerIDs:       []string{"srv-1", "srv-2", "srv-3"},
 			Concurrency:     3,
-			Parameters:      map[string]any{"port": 3306, "rootUser": "root", "clusterName": "aifarCluster"},
+			Parameters:      map[string]any{"port": 3306, "rootUser": "root", "rootPassword": "explicit-install-secret", "clusterName": "aifarCluster"},
 		}, []store.Resource{{App: "mysql", Part: "backend", Version: "8.0.36", Path: archive}}, fakeLogger{}, nil)
 	}()
 
@@ -621,12 +621,43 @@ func TestServiceInstallsInnoDBClusterBaseConcurrently(t *testing.T) {
 	}
 }
 
-func TestMySQLPasswordFallsBackToDefaultPassword(t *testing.T) {
-	if got := passwordParam(nil, "Oversea.123"); got != "Oversea.123" {
-		t.Fatalf("expected default mysql password, got %q", got)
+func TestMySQLPasswordRequiresExplicitOrResolvedRequestCredential(t *testing.T) {
+	if got := passwordParam(nil, "forbidden-default"); got != "" {
+		t.Fatalf("missing MySQL install credential resolved to %q, want empty", got)
 	}
-	if got := passwordParam(map[string]any{"rootPassword": "custom-password"}, "Oversea.123"); got != "custom-password" {
+	if got := passwordParam(map[string]any{"rootPassword": "custom-password"}, "forbidden-default"); got != "custom-password" {
 		t.Fatalf("expected explicit mysql password, got %q", got)
+	}
+}
+
+func TestServiceInstallMissingExplicitCredentialFailsBeforeRemoteWork(t *testing.T) {
+	for _, topology := range []string{"standalone", "innodb-cluster"} {
+		t.Run(topology, func(t *testing.T) {
+			serverIDs := []string{"srv-1"}
+			servers := map[string]store.Server{"srv-1": {ID: "srv-1", Host: "10.0.0.1", DeployDir: "/aifar/apps"}}
+			if topology == "innodb-cluster" {
+				serverIDs = []string{"srv-1", "srv-2", "srv-3"}
+				servers["srv-2"] = store.Server{ID: "srv-2", Host: "10.0.0.2", DeployDir: "/aifar/apps"}
+				servers["srv-3"] = store.Server{ID: "srv-3", Host: "10.0.0.3", DeployDir: "/aifar/apps"}
+			}
+			root := t.TempDir()
+			archive := filepath.Join(root, "mysql-aifar-8.0.36-official-bundle.tar")
+			if err := os.WriteFile(archive, []byte("mysql"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			data := &fakeStore{servers: servers}
+			remote := &fakeRemote{}
+			err := NewService(data, remote).Install(context.Background(), InstallRequest{
+				Version: "8.0.36", Topology: topology, ServerIDs: serverIDs, DefaultPassword: "forbidden-default",
+				Parameters: map[string]any{"rootUser": "root"}, Language: "en",
+			}, []store.Resource{{App: "mysql", Part: "backend", Version: "8.0.36", Path: archive}}, fakeLogger{}, nil)
+			if err == nil {
+				t.Fatal("missing explicit/resolved MySQL credential must fail")
+			}
+			if len(remote.commands) != 0 || len(remote.uploads) != 0 || len(data.instances) != 0 {
+				t.Fatalf("missing credential crossed the remote/record boundary: commands=%d uploads=%d instances=%d", len(remote.commands), len(remote.uploads), len(data.instances))
+			}
+		})
 	}
 }
 

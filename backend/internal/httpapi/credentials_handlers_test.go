@@ -1,11 +1,78 @@
 package httpapi
 
 import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
 
 	"aifar-deployment/backend/internal/apps/registry"
+	"aifar-deployment/backend/internal/i18n"
 	"aifar-deployment/backend/internal/store"
 )
+
+func TestCredentialMutationLockFailureCopyIsLocalized(t *testing.T) {
+	zh := i18n.Text("zh", "api.credentialMutationLockFailed")
+	en := i18n.Text("en", "api.credentialMutationLockFailed")
+	if zh == en || strings.Contains(zh, "credentialMutationLockFailed") || strings.Contains(en, "credentialMutationLockFailed") {
+		t.Fatalf("credential mutation lock copy is not localized: zh=%q en=%q", zh, en)
+	}
+}
+
+func TestMySQLAdminCredentialRotationIsRejectedWhileClusterStartSnapshotLockIsHeld(t *testing.T) {
+	api, db, jwtSecret := newAuthzTestAPI(t)
+	const clusterID = "mysql_cluster_credential_snapshot"
+	instance, err := db.SaveAppInstance(store.AppInstance{
+		App: "mysql", Version: "8.0.36", ServerID: "srv-1", Status: "running", Topology: "innodb-cluster",
+		Metadata: `{"clusterId":"` + clusterID + `","port":3306}`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	credential, err := db.SaveCredential(store.Credential{
+		Name: "mysql-admin", Kind: "mysql", Username: "root", Scope: "app-instance", Status: "active",
+		App: "mysql", AppInstanceID: instance.ID, Purpose: "admin", Secret: map[string]string{"password": "old-secret"}, CreatedBy: "owner",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.BindCredential(store.CredentialBinding{CredentialID: credential.ID, AppInstanceID: instance.ID, Purpose: "admin", ServiceName: "mysql"}); err != nil {
+		t.Fatal(err)
+	}
+	lock, err := db.AcquireOperationLock(store.OperationLock{
+		Scope: "app-cluster", ResourceID: clusterID, Operation: operationLockMutation, OwnerTaskID: "tsk-cluster-start",
+		Owner: "owner", ExpiresAt: time.Now().Add(time.Hour), Metadata: `{"action":"mysql-cluster-start"}`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	body, _ := json.Marshal(map[string]any{
+		"name": "mysql-admin", "kind": "mysql", "username": "root", "scope": "app-instance", "status": "active",
+		"app": "mysql", "appInstanceId": instance.ID, "purpose": "admin", "password": "rotated-secret",
+	})
+	req := httptest.NewRequest(http.MethodPut, "/api/v2/credentials/"+credential.ID, strings.NewReader(string(body)))
+	req.Header.Set("Authorization", "Bearer "+issueTestToken(t, db, jwtSecret, "owner", "owner"))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	api.Router().ServeHTTP(rec, req)
+	if rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), "OPERATION_LOCKED") {
+		t.Fatalf("credential mutation during cluster snapshot = %d %s, want OPERATION_LOCKED", rec.Code, rec.Body.String())
+	}
+	current, err := db.GetCredential(credential.ID, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.Secret["password"] != "old-secret" || current.CurrentVersion != credential.CurrentVersion {
+		t.Fatalf("credential drifted while cluster snapshot lock was held: version=%d secret=%q", current.CurrentVersion, current.Secret["password"])
+	}
+	active, err := db.GetOperationLock(lock.ID)
+	if err != nil || active.Status != "active" {
+		t.Fatalf("cluster-start lock ownership was changed: lock=%+v err=%v", active, err)
+	}
+}
 
 func TestInstallManualPasswordCreatesGeneratedCredential(t *testing.T) {
 	api, db, _ := newAuthzTestAPI(t)

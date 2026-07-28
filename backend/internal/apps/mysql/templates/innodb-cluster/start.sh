@@ -175,4 +175,8 @@ JS
 )
 
 "$MYSQLSH" --js --file "$JS_FILE"
+if ! cleanup_secret_artifacts; then
+  exit 1
+fi
+trap - EXIT HUP INT TERM
 echo "MySQL InnoDB Cluster start completed: $CLUSTER_NAME"

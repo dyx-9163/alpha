@@ -333,5 +333,9 @@ fi
 "$MYSQL_BASE/bin/mysqladmin" --defaults-extra-file="$SECURE_CLIENT_FILE" --protocol=tcp -h 127.0.0.1 -P "$PORT" ping
 open_firewall_ports "$PORT"
 allow_selinux_ports mysqld_port_t "$PORT"
+if ! cleanup_secret_artifacts; then
+  exit 1
+fi
+trap - EXIT HUP INT TERM
 echo "MySQL service installed: $SERVICE_NAME"
 echo "MySQL endpoint: 127.0.0.1:$PORT"
