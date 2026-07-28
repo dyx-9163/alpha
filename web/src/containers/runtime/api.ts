@@ -139,3 +139,7 @@ export function scaleInRuntimeService(query: string, service: string, instanceId
 export function offlineRuntimeService(query: string, service: string, instanceId: string) {
   return apiPost<RuntimeTaskResponse>(`/containers/aifar/services/${encodeURIComponent(service)}/offline?${query}`, { instanceId })
 }
+
+export function offlineRuntimeServices(query: string, instanceId: string, services: string[]) {
+  return apiPost<RuntimeTaskResponse>(`/containers/aifar/services/batch-offline?${query}`, { instanceId, services })
+}

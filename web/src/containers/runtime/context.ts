@@ -73,6 +73,7 @@ export type AifarRuntimeContext = {
   scaleInAifarDeployment: (row: AifarRuntimeDeployment) => Promise<void>
   aifarRuntimeOfflineDisabledReason: (row: AifarRuntimeService) => string
   offlineAifarService: (row: AifarRuntimeService) => Promise<void>
+  offlineAifarServices: (rows: AifarRuntimeService[]) => Promise<boolean>
   aifarReleases: Ref<AifarRelease[]>
   loadAifarReleases: (force?: boolean) => Promise<void>
   releaseKindLabel: (kind?: string) => string

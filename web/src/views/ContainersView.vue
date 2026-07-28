@@ -177,6 +177,7 @@ import {
   fetchAifarReleases,
   fetchAifarRuntime,
   installRuntimeServices,
+  offlineRuntimeServices as offlineRuntimeServicesRequest,
   offlineRuntimeService,
   reconcileRuntime,
   restartAllRuntime,
@@ -1618,6 +1619,54 @@ async function offlineAifarService(row: AifarRuntimeService) {
   })
 }
 
+async function offlineAifarServices(rows: AifarRuntimeService[]) {
+  const services = [...new Set(rows.map((row) => row.serviceName.trim()).filter(Boolean))]
+  if (!services.length) {
+    ElMessage.warning(t('containers.selectDeploymentsToOffline'))
+    return false
+  }
+  for (const row of rows) {
+    const reason = aifarRuntimeOfflineDisabledReason(row)
+    if (reason) {
+      ElMessage.warning(reason)
+      return false
+    }
+  }
+  const instanceId = selectedRuntimeInstance.value?.id
+  if (!instanceId) {
+    ElMessage.warning(t('containers.selectAifarInstance'))
+    return false
+  }
+  try {
+    await ElMessageBox.confirm(
+      t('containers.confirmBatchOfflineDeployments', { count: services.length, services: services.join(', ') }),
+      t('containers.batchOfflineDeployments'),
+      {
+        type: 'warning',
+        confirmButtonText: t('containers.batchOfflineDeployments'),
+        cancelButtonText: t('common.cancel')
+      }
+    )
+  } catch {
+    return false
+  }
+  const query = targetQuery()
+  if (!query) {
+    ElMessage.warning(t('containers.selectDockerHost'))
+    return false
+  }
+  try {
+    const result = await offlineRuntimeServicesRequest(query, instanceId, services)
+    ElMessage.success(t('containers.batchOfflineAccepted'))
+    trackTask(result.taskId, `${t('containers.batchOfflineDeployments')} ${services.join(', ')}`)
+    void loadAifarRuntime(true)
+    return true
+  } catch (err) {
+    ElMessage.error(err instanceof Error ? err.message : t('containers.runtimeActionFailed'))
+    return false
+  }
+}
+
 async function submitAifarScaleOut(service: string, instanceId: string, afterSubmitted?: () => void) {
   try {
     await ElMessageBox.confirm(t('containers.confirmScaleOut', { service }), t('containers.scaleOut'), {
@@ -1727,6 +1776,7 @@ useAifarRuntimeProvider({
   scaleInAifarDeployment,
   aifarRuntimeOfflineDisabledReason,
   offlineAifarService,
+  offlineAifarServices,
   aifarReleases,
   loadAifarReleases,
   releaseKindLabel,
