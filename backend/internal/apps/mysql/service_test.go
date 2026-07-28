@@ -16,8 +16,20 @@ import (
 )
 
 type fakeStore struct {
-	servers   map[string]store.Server
-	instances []store.AppInstance
+	servers     map[string]store.Server
+	instances   []store.AppInstance
+	credentials map[string]store.Credential
+}
+
+func (f *fakeStore) GetBoundCredential(appInstanceID, purpose string, includeSecret bool) (store.Credential, error) {
+	credential, ok := f.credentials[appInstanceID]
+	if !ok || purpose != "admin" || credential.Status != "active" {
+		return store.Credential{}, store.ErrBoundCredentialNotFound
+	}
+	if !includeSecret {
+		credential.Secret = nil
+	}
+	return credential, nil
 }
 
 func (f *fakeStore) GetServer(id string, includeSecret bool) (store.Server, error) {
@@ -73,6 +85,14 @@ type fakeRemote struct {
 	releaseInstall chan struct{}
 	primaryOutput  string
 	runtimeOutput  string
+	uploads        []credentialTransportUpload
+}
+
+type credentialTransportUpload struct {
+	serverID   string
+	remotePath string
+	mode       os.FileMode
+	content    string
 }
 
 func (f *fakeRemote) Run(ctx context.Context, server store.Server, command string) (adapter.CommandResult, error) {
@@ -101,6 +121,13 @@ func (f *fakeRemote) Run(ctx context.Context, server store.Server, command strin
 }
 
 func (f *fakeRemote) UploadFile(ctx context.Context, server store.Server, localPath, remotePath string, mode os.FileMode) error {
+	content, err := os.ReadFile(localPath)
+	if err != nil {
+		return err
+	}
+	f.mu.Lock()
+	f.uploads = append(f.uploads, credentialTransportUpload{serverID: server.ID, remotePath: remotePath, mode: mode, content: string(content)})
+	f.mu.Unlock()
 	return nil
 }
 
@@ -136,6 +163,18 @@ func (f *fakeRemote) joinedCommands() string {
 	return strings.Join(f.commands, "\n")
 }
 
+func (f *fakeRemote) joinedExecutableEvidence() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	parts := append([]string(nil), f.commands...)
+	for _, upload := range f.uploads {
+		if strings.HasSuffix(upload.remotePath, ".sh") {
+			parts = append(parts, upload.content)
+		}
+	}
+	return strings.Join(parts, "\n")
+}
+
 func TestServiceInstallsStandaloneMySQLAndRecordsInstalledInstance(t *testing.T) {
 	root := t.TempDir()
 	archive := filepath.Join(root, "mysql-aifar-8.0.36-official-bundle.tar")
@@ -153,7 +192,7 @@ func TestServiceInstallsStandaloneMySQLAndRecordsInstalledInstance(t *testing.T)
 		Topology:        "single",
 		Language:        "en",
 		DefaultPassword: "Oversea.123",
-		Parameters:      map[string]any{"port": 3307, "rootUser": "root"},
+		Parameters:      map[string]any{"port": 3307, "rootUser": "root", "rootPassword": "explicit-install-secret"},
 	}, []store.Resource{{App: "mysql", Part: "backend", Version: "8.0.36", Path: archive}}, fakeLogger{}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -196,7 +235,7 @@ func TestServiceInstallsInnoDBClusterAndRecordsEachNode(t *testing.T) {
 		Language:        "en",
 		DefaultPassword: "Oversea.123",
 		ServerIDs:       []string{"srv-1", "srv-2", "srv-3"},
-		Parameters:      map[string]any{"port": 3306, "rootUser": "root", "clusterName": "aifarCluster"},
+		Parameters:      map[string]any{"port": 3306, "rootUser": "root", "rootPassword": "explicit-install-secret", "clusterName": "aifarCluster"},
 	}, []store.Resource{{App: "mysql", Part: "backend", Version: "8.0.36", Path: archive}}, fakeLogger{}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -207,9 +246,9 @@ func TestServiceInstallsInnoDBClusterAndRecordsEachNode(t *testing.T) {
 	if s.instances[0].Topology != "innodb-cluster" || strings.Contains(s.instances[0].Metadata, "Oversea.123") {
 		t.Fatalf("expected safe cluster metadata: %+v", s.instances[0])
 	}
-	joinedCommands := remote.joinedCommands()
-	if strings.Count(joinedCommands, `"$MYSQLSH" --js --file`) != 1 || !strings.Contains(joinedCommands, `MYSQLSH="$INSTALL_ROOT/mysql-shell/bin/mysqlsh"`) {
-		t.Fatalf("expected one innodb cluster bootstrap action: %s", joinedCommands)
+	executableEvidence := remote.joinedExecutableEvidence()
+	if strings.Count(executableEvidence, `"$MYSQLSH" --js --file`) != 1 || !strings.Contains(executableEvidence, `MYSQLSH="$INSTALL_ROOT/mysql-shell/bin/mysqlsh"`) {
+		t.Fatalf("expected one innodb cluster bootstrap action: %s", executableEvidence)
 	}
 }
 
@@ -301,7 +340,7 @@ func TestServiceLogsClusterNodeCompletionForInnoDBCluster(t *testing.T) {
 		Language:        "en",
 		DefaultPassword: "Oversea.123",
 		ServerIDs:       []string{"srv-1", "srv-2", "srv-3"},
-		Parameters:      map[string]any{"port": 3306, "rootUser": "root", "clusterName": "aifarCluster"},
+		Parameters:      map[string]any{"port": 3306, "rootUser": "root", "rootPassword": "explicit-install-secret", "clusterName": "aifarCluster"},
 	}, []store.Resource{{App: "mysql", Part: "backend", Version: "8.0.36", Path: archive}}, log, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -329,7 +368,8 @@ func TestServiceCheckInnoDBClusterRecordsCurrentPrimary(t *testing.T) {
 			"srv-2": {ID: "srv-2", Name: "mysql-2", Host: "10.0.0.2", DeployDir: "/aifar/apps"},
 			"srv-3": {ID: "srv-3", Name: "mysql-3", Host: "10.0.0.3", DeployDir: "/aifar/apps"},
 		},
-		instances: instances,
+		instances:   instances,
+		credentials: testMySQLCredentials(instances),
 	}
 	remote := &fakeRemote{primaryOutput: "10.0.0.2:3306\n"}
 	service := NewService(s, remote)
@@ -388,7 +428,8 @@ func TestServiceCheckInnoDBClusterRecordsRuntimeWhenPrimaryMissing(t *testing.T)
 			"srv-2": {ID: "srv-2", Name: "mysql-2", Host: "10.0.0.2", DeployDir: "/aifar/apps"},
 			"srv-3": {ID: "srv-3", Name: "mysql-3", Host: "10.0.0.3", DeployDir: "/aifar/apps"},
 		},
-		instances: instances,
+		instances:   instances,
+		credentials: testMySQLCredentials(instances),
 	}
 	remote := &fakeRemote{}
 	service := NewService(s, remote)
@@ -430,9 +471,10 @@ func TestServiceCheckInnoDBClusterUsesSystemdRuntimeWhenPrimaryMissing(t *testin
 			"srv-2": {ID: "srv-2", Name: "mysql-2", Host: "10.0.0.2", DeployDir: "/aifar/apps"},
 			"srv-3": {ID: "srv-3", Name: "mysql-3", Host: "10.0.0.3", DeployDir: "/aifar/apps"},
 		},
-		instances: instances,
+		instances:   instances,
+		credentials: testMySQLCredentials(instances),
 	}
-	remote := &fakeRemote{runtimeOutput: "runtimeStatus=running\nmysqlPingStatus=offline\nmysqlServiceStatus=running\nmysqlPortStatus=offline\nmysqlRuntimeSource=systemd\n"}
+	remote := &fakeRemote{runtimeOutput: "runtimeStatus=offline\nmysqlPingStatus=offline\nmysqlServiceStatus=running\nmysqlPortStatus=offline\nmysqlRuntimeSource=none\n"}
 	service := NewService(s, remote)
 
 	_, err := service.Check(context.Background(), CheckRequest{
@@ -450,8 +492,8 @@ func TestServiceCheckInnoDBClusterUsesSystemdRuntimeWhenPrimaryMissing(t *testin
 	}
 	lastCheck, _ := metadata["lastCheck"].(map[string]any)
 	details, _ := lastCheck["details"].(map[string]any)
-	if got := details["runtimeStatus"]; got != "running" {
-		t.Fatalf("expected runtimeStatus running from systemd service, got %v", got)
+	if got := details["runtimeStatus"]; got != "offline" {
+		t.Fatalf("expected authenticated runtimeStatus offline, got %v", got)
 	}
 	if got := details["mysqlPingStatus"]; got != "offline" {
 		t.Fatalf("expected mysqlPingStatus offline, got %v", got)
@@ -459,15 +501,15 @@ func TestServiceCheckInnoDBClusterUsesSystemdRuntimeWhenPrimaryMissing(t *testin
 	if got := details["mysqlServiceStatus"]; got != "running" {
 		t.Fatalf("expected mysqlServiceStatus running, got %v", got)
 	}
-	if got := details["mysqlRuntimeSource"]; got != "systemd" {
-		t.Fatalf("expected mysqlRuntimeSource systemd, got %v", got)
+	if got := details["mysqlRuntimeSource"]; got != "none" {
+		t.Fatalf("expected no authenticated runtime source, got %v", got)
 	}
 	if s.instances[0].Status != "failed" {
 		t.Fatalf("expected cluster check status failed, got %s", s.instances[0].Status)
 	}
 }
 
-func TestServiceStartsInnoDBClusterAndMarksAllNodesRunning(t *testing.T) {
+func TestCompleteOutageStartsInnoDBClusterWithoutBackupMutation(t *testing.T) {
 	clusterID := "mysql_cluster_test"
 	now := time.Now()
 	instances := []store.AppInstance{
@@ -484,7 +526,8 @@ func TestServiceStartsInnoDBClusterAndMarksAllNodesRunning(t *testing.T) {
 			"srv-2": {ID: "srv-2", Name: "mysql-2", Host: "10.0.0.2", DeployDir: "/aifar/apps"},
 			"srv-3": {ID: "srv-3", Name: "mysql-3", Host: "10.0.0.3", DeployDir: "/aifar/apps"},
 		},
-		instances: instances,
+		instances:   instances,
+		credentials: testMySQLCredentials(instances),
 	}
 	remote := &fakeRemote{primaryOutput: "10.0.0.2:3306\n"}
 	service := NewService(s, remote)
@@ -498,9 +541,14 @@ func TestServiceStartsInnoDBClusterAndMarksAllNodesRunning(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	joinedCommands := remote.joinedCommands()
-	if !strings.Contains(joinedCommands, "rebootClusterFromCompleteOutage") || !strings.Contains(joinedCommands, "rejoinInstance") {
-		t.Fatalf("expected InnoDB Cluster start script to run, got: %s", joinedCommands)
+	executableEvidence := remote.joinedExecutableEvidence()
+	if !strings.Contains(executableEvidence, "rebootClusterFromCompleteOutage") || !strings.Contains(executableEvidence, "rejoinInstance") {
+		t.Fatalf("expected InnoDB Cluster start script to run, got: %s", executableEvidence)
+	}
+	for _, forbidden := range []string{"loadDump", "DROP DATABASE", "quarantine", "backup-manifest"} {
+		if strings.Contains(executableEvidence, forbidden) {
+			t.Fatalf("complete-outage start crossed into disaster restore via %q: %s", forbidden, executableEvidence)
+		}
 	}
 	for _, instance := range s.instances {
 		if instance.Status != "running" {
@@ -549,7 +597,7 @@ func TestServiceInstallsInnoDBClusterBaseConcurrently(t *testing.T) {
 			DefaultPassword: "Oversea.123",
 			ServerIDs:       []string{"srv-1", "srv-2", "srv-3"},
 			Concurrency:     3,
-			Parameters:      map[string]any{"port": 3306, "rootUser": "root", "clusterName": "aifarCluster"},
+			Parameters:      map[string]any{"port": 3306, "rootUser": "root", "rootPassword": "explicit-install-secret", "clusterName": "aifarCluster"},
 		}, []store.Resource{{App: "mysql", Part: "backend", Version: "8.0.36", Path: archive}}, fakeLogger{}, nil)
 	}()
 
@@ -573,12 +621,43 @@ func TestServiceInstallsInnoDBClusterBaseConcurrently(t *testing.T) {
 	}
 }
 
-func TestMySQLPasswordFallsBackToDefaultPassword(t *testing.T) {
-	if got := passwordParam(nil, "Oversea.123"); got != "Oversea.123" {
-		t.Fatalf("expected default mysql password, got %q", got)
+func TestMySQLPasswordRequiresExplicitOrResolvedRequestCredential(t *testing.T) {
+	if got := passwordParam(nil, "forbidden-default"); got != "" {
+		t.Fatalf("missing MySQL install credential resolved to %q, want empty", got)
 	}
-	if got := passwordParam(map[string]any{"rootPassword": "custom-password"}, "Oversea.123"); got != "custom-password" {
+	if got := passwordParam(map[string]any{"rootPassword": "custom-password"}, "forbidden-default"); got != "custom-password" {
 		t.Fatalf("expected explicit mysql password, got %q", got)
+	}
+}
+
+func TestServiceInstallMissingExplicitCredentialFailsBeforeRemoteWork(t *testing.T) {
+	for _, topology := range []string{"standalone", "innodb-cluster"} {
+		t.Run(topology, func(t *testing.T) {
+			serverIDs := []string{"srv-1"}
+			servers := map[string]store.Server{"srv-1": {ID: "srv-1", Host: "10.0.0.1", DeployDir: "/aifar/apps"}}
+			if topology == "innodb-cluster" {
+				serverIDs = []string{"srv-1", "srv-2", "srv-3"}
+				servers["srv-2"] = store.Server{ID: "srv-2", Host: "10.0.0.2", DeployDir: "/aifar/apps"}
+				servers["srv-3"] = store.Server{ID: "srv-3", Host: "10.0.0.3", DeployDir: "/aifar/apps"}
+			}
+			root := t.TempDir()
+			archive := filepath.Join(root, "mysql-aifar-8.0.36-official-bundle.tar")
+			if err := os.WriteFile(archive, []byte("mysql"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			data := &fakeStore{servers: servers}
+			remote := &fakeRemote{}
+			err := NewService(data, remote).Install(context.Background(), InstallRequest{
+				Version: "8.0.36", Topology: topology, ServerIDs: serverIDs, DefaultPassword: "forbidden-default",
+				Parameters: map[string]any{"rootUser": "root"}, Language: "en",
+			}, []store.Resource{{App: "mysql", Part: "backend", Version: "8.0.36", Path: archive}}, fakeLogger{}, nil)
+			if err == nil {
+				t.Fatal("missing explicit/resolved MySQL credential must fail")
+			}
+			if len(remote.commands) != 0 || len(remote.uploads) != 0 || len(data.instances) != 0 {
+				t.Fatalf("missing credential crossed the remote/record boundary: commands=%d uploads=%d instances=%d", len(remote.commands), len(remote.uploads), len(data.instances))
+			}
+		})
 	}
 }
 
@@ -592,8 +671,9 @@ func TestServiceCheckClearsRecoveredInstallFailure(t *testing.T) {
 		Metadata: `{"port":3306,"installFailed":true,"failedAt":"2026-07-07T00:00:00Z","taskId":"tsk_failed","error":"partial install"}`,
 	}
 	s := &fakeStore{
-		servers:   map[string]store.Server{"srv-1": {ID: "srv-1", Name: "db-1", Host: "10.0.0.1", DeployDir: "/aifar/apps"}},
-		instances: []store.AppInstance{instance},
+		servers:     map[string]store.Server{"srv-1": {ID: "srv-1", Name: "db-1", Host: "10.0.0.1", DeployDir: "/aifar/apps"}},
+		instances:   []store.AppInstance{instance},
+		credentials: testMySQLCredentials([]store.AppInstance{instance}),
 	}
 	service := NewService(s, &fakeRemote{})
 	if _, err := service.Check(context.Background(), CheckRequest{
@@ -666,4 +746,12 @@ func mysqlClusterInstance(id, serverID, clusterID, endpoint string, createdAt ti
 		CreatedAt: createdAt,
 		UpdatedAt: createdAt,
 	}
+}
+
+func testMySQLCredentials(instances []store.AppInstance) map[string]store.Credential {
+	credentials := make(map[string]store.Credential, len(instances))
+	for _, instance := range instances {
+		credentials[instance.ID] = store.Credential{Kind: "mysql", Status: "active", Username: "root", Secret: map[string]string{"password": "test-bound-password"}}
+	}
+	return credentials
 }

@@ -75,6 +75,10 @@ The server reads these environment variables:
 
 轮换 `AIFAR_CREDENTIAL_SECRET` 时，不要直接丢弃旧值。第一次使用新密钥启动时，同时通过环境变量设置 `AIFAR_PREVIOUS_CREDENTIAL_SECRET=<旧密钥>`；服务会在单个数据库事务中重加密服务器密码、凭据版本、存储密钥和 Nacos 配置。启动日志确认轮换成功后，立即移除 previous secret。轮换失败会回滚全部密文并拒绝启动。
 
+## 运维手册 / Operations Runbooks
+
+- [MySQL backup and restore operator runbook](docs/mysql-backup-restore-runbook.md)：MySQL standalone/InnoDB Cluster 备份、校验、维护窗口恢复、完整停机启动、灾难重建、维护标记、验收证据与真实环境边界。
+
 后续可以继续抽出的配置项：
 
 - `AIFAR_AGENT_BINARY`：用于指定自定义 `aifar-agent` 二进制。

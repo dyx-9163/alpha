@@ -5,12 +5,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 	"time"
 
 	"aifar-deployment/backend/internal/apps/deleteflow"
 	mysqlrouter "aifar-deployment/backend/internal/apps/mysqlrouter"
+	"aifar-deployment/backend/internal/apps/registry"
 	"aifar-deployment/backend/internal/installer/installerkit"
 	"aifar-deployment/backend/internal/installflow"
 	"aifar-deployment/backend/internal/store"
@@ -62,8 +64,12 @@ type CheckResult struct {
 }
 
 type Service struct {
-	store  Store
-	remote Remote
+	store                   Store
+	remote                  Remote
+	localInfileSession      localInfileSessionFactory
+	reconciliationSession   reconciliationSessionFactory
+	preRestoreBackup        func(context.Context, registry.BackupRequest, registry.RunContext) error
+	removeMaintenanceSecret func(string) error
 }
 
 type stepDef = installflow.Step
@@ -81,7 +87,13 @@ type clusterStartNode struct {
 }
 
 func NewService(s Store, remote Remote) Service {
-	return Service{store: s, remote: remote}
+	return Service{
+		store:                   s,
+		remote:                  remote,
+		localInfileSession:      defaultLocalInfileSessionFactory(remote),
+		reconciliationSession:   defaultReconciliationSessionFactory(remote),
+		removeMaintenanceSecret: os.Remove,
+	}
 }
 
 func (s Service) Install(ctx context.Context, req InstallRequest, resources []store.Resource, log Logger, targetLog targetLogger) error {
@@ -461,13 +473,31 @@ func (s Service) installIntegratedMySQLRouters(ctx context.Context, req InstallR
 }
 
 func (s Service) StartInnoDBCluster(ctx context.Context, req StartClusterRequest, log Logger, targetLog targetLogger) error {
+	if len(req.Instances) > 0 {
+		if err := s.requireNoMySQLMaintenance(req.Instances[0], req.Language); err != nil {
+			return err
+		}
+		if err := s.requireNoMySQLReconciliation(req.Instances[0], req.Language); err != nil {
+			return err
+		}
+	}
 	copy := ClusterStartCopyFor(req.Language)
-	nodes, err := s.clusterStartNodes(req, copy)
+	nodes, err := s.authoritativeClusterStartNodes(req, copy)
 	if err != nil {
 		return err
 	}
 	if len(nodes) == 0 {
 		return errors.New(copy.ClusterRequired)
+	}
+	connections := make([]mysqlConnectionCredential, 0, len(nodes))
+	credentialsByInstance := make(map[string]store.Credential, len(nodes))
+	for _, node := range nodes {
+		credential, credentialErr := resolveMySQLAdminCredential(s.store, node.instance)
+		if credentialErr != nil {
+			return credentialErr
+		}
+		credentialsByInstance[node.instance.ID] = credential
+		connections = append(connections, mysqlConnectionCredential{Host: node.host, Port: node.port, User: credential.Username, Password: credential.Secret["password"]})
 	}
 	targets := clusterStartTargets(nodes)
 	recorder, _ := log.(stepRecorder)
@@ -494,11 +524,10 @@ func (s Service) StartInnoDBCluster(ctx context.Context, req StartClusterRequest
 	installer := NewInstaller(s.remote)
 	if err := step(2, "start-cluster", copy.StartCluster, func() error {
 		return installer.StartInnoDBCluster(ctx, bootstrap.server, InnoDBClusterStartRequest{
-			ClusterName:  clusterNameFromInstance(bootstrap.instance),
-			InstallRoot:  remoteInstallRoot(bootstrap.server, "mysql", bootstrap.instance.Version),
-			RootUser:     instanceRootUser(bootstrap.instance),
-			RootPassword: passwordParam(nil, req.DefaultPassword),
-			Nodes:        innodbClusterNodes(nodes),
+			ClusterName: clusterNameFromInstance(bootstrap.instance),
+			InstallRoot: remoteInstallRoot(bootstrap.server, "mysql", bootstrap.instance.Version),
+			Connections: connections,
+			Nodes:       innodbClusterNodes(nodes),
 		}, logForServer)
 	}); err != nil {
 		return fail(err)
@@ -507,7 +536,7 @@ func (s Service) StartInnoDBCluster(ctx context.Context, req StartClusterRequest
 	primaryEndpoint := ""
 	if err := step(3, "detect-primary", copy.DetectPrimary, func() error {
 		var detectErr error
-		primaryEndpoint, detectErr = s.detectInnoDBPrimary(ctx, bootstrap.server, bootstrap.instance, req.DefaultPassword, logForServer)
+		primaryEndpoint, detectErr = s.detectInnoDBPrimary(ctx, bootstrap.server, bootstrap.instance, credentialsByInstance[bootstrap.instance.ID], logForServer)
 		return detectErr
 	}); err != nil {
 		return fail(err)
@@ -537,6 +566,12 @@ func recordClusterBaseFailure(mu *sync.Mutex, failedTargets map[string]bool, fai
 }
 
 func (s Service) Delete(ctx context.Context, req DeleteRequest, log Logger, targetLog targetLogger) error {
+	if err := s.requireNoMySQLMaintenance(req.Instance, req.Language); err != nil {
+		return err
+	}
+	if err := s.requireNoMySQLReconciliation(req.Instance, req.Language); err != nil {
+		return err
+	}
 	copy := DeleteCopyFor(req.Language)
 	target := req.Instance.ServerID
 	if target == "" {
@@ -571,6 +606,16 @@ func (s Service) Delete(ctx context.Context, req DeleteRequest, log Logger, targ
 }
 
 func (s Service) Check(ctx context.Context, req CheckRequest, log Logger, targetLog targetLogger) (CheckResult, error) {
+	if err := s.requireNoMySQLMaintenance(req.Instance, req.Language); err != nil {
+		return CheckResult{Status: "failed", Message: err.Error()}, err
+	}
+	if err := s.requireNoMySQLReconciliation(req.Instance, req.Language); err != nil {
+		return CheckResult{Status: "failed", Message: err.Error()}, err
+	}
+	credential, err := resolveMySQLAdminCredential(s.store, req.Instance)
+	if err != nil {
+		return CheckResult{Status: "failed", Message: err.Error()}, err
+	}
 	copy := CheckCopyFor(req.Language)
 	target := req.Instance.ServerID
 	if target == "" {
@@ -602,7 +647,7 @@ func (s Service) Check(ctx context.Context, req CheckRequest, log Logger, target
 	var runtimeProbe mysqlRuntimeProbe
 	if err := step(1, "check-runtime", copy.CheckRuntime, func() error {
 		var err error
-		runtimeProbe, err = s.probeMySQLRuntime(ctx, req.Server, req.Instance, req.DefaultPassword, logForServer)
+		runtimeProbe, err = s.probeMySQLRuntime(ctx, req.Server, req.Instance, credential, logForServer)
 		mergeDetails(details, runtimeProbe.details())
 		if err != nil {
 			return err
@@ -624,7 +669,7 @@ func (s Service) Check(ctx context.Context, req CheckRequest, log Logger, target
 	if topology == "innodb-cluster" {
 		if err := step(2, "detect-primary", copy.DetectPrimary, func() error {
 			var detectErr error
-			primaryEndpoint, detectErr = s.detectInnoDBPrimary(ctx, req.Server, req.Instance, req.DefaultPassword, logForServer)
+			primaryEndpoint, detectErr = s.detectInnoDBPrimary(ctx, req.Server, req.Instance, credential, logForServer)
 			return detectErr
 		}); err != nil {
 			return fail(err)
@@ -646,6 +691,40 @@ func (s Service) Check(ctx context.Context, req CheckRequest, log Logger, target
 	logForServer.Info("%s", msg)
 	finishTarget(recorder, target, "success", "")
 	return CheckResult{Status: "running", Message: msg, Details: details}, nil
+}
+
+func (s Service) authoritativeClusterStartNodes(req StartClusterRequest, copy ClusterStartCopy) ([]clusterStartNode, error) {
+	if len(req.Instances) == 0 {
+		return nil, errors.New(copy.ClusterRequired)
+	}
+	all, err := s.store.ListAppInstances()
+	if err != nil {
+		return nil, err
+	}
+	var base store.AppInstance
+	requestedBaseID := strings.TrimSpace(req.Instances[0].ID)
+	for _, candidate := range all {
+		if candidate.ID == requestedBaseID {
+			base = candidate
+			break
+		}
+	}
+	if base.ID == "" || base.App != "mysql" || instanceTopology(base) != "innodb-cluster" {
+		return nil, errors.New(copy.ClusterRequired)
+	}
+	members := make([]store.AppInstance, 0, 3)
+	for _, candidate := range all {
+		if sameMySQLCluster(base, candidate) {
+			members = append(members, candidate)
+		}
+	}
+	if len(members) != 3 {
+		return nil, errors.New(copy.ClusterNoServers)
+	}
+	freshReq := req
+	freshReq.Instances = members
+	freshReq.Servers = nil
+	return s.clusterStartNodes(freshReq, copy)
 }
 
 func targetServerIDs(req InstallRequest) []string {

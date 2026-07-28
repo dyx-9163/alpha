@@ -28,7 +28,10 @@ func NewModule(s Store, remote Remote, defaultPassword ...string) Module {
 	if len(defaultPassword) > 0 {
 		password = defaultPassword[0]
 	}
-	return Module{service: NewService(s, remote), defaultPassword: password}
+	return Module{
+		service:         NewService(s, remote),
+		defaultPassword: password,
+	}
 }
 
 func (m Module) Name() string {

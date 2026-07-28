@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"path"
 	"sort"
 	"strings"
 	"time"
@@ -39,10 +40,8 @@ func (p mysqlRuntimeProbe) pingRunning() bool {
 	return normalizeRuntimeProbeStatus(p.PingStatus) == "running"
 }
 
-func (s Service) probeMySQLRuntime(ctx context.Context, server store.Server, instance store.AppInstance, defaultPassword string, log Logger) (mysqlRuntimeProbe, error) {
+func (s Service) probeMySQLRuntime(ctx context.Context, server store.Server, instance store.AppInstance, credential store.Credential, log Logger) (mysqlRuntimeProbe, error) {
 	port := instancePort(instance)
-	rootUser := instanceRootUser(instance)
-	rootPassword := passwordParam(nil, defaultPassword)
 	installRoot := remoteInstallRoot(server, "mysql", instance.Version)
 	legacyInstallRoot := remoteLegacyInstallRoot(server, "mysql", instance.Version)
 	metadata := appMetadata(instance)
@@ -51,12 +50,12 @@ func (s Service) probeMySQLRuntime(ctx context.Context, server store.Server, ins
 		serviceName = "aifar-mysql"
 	}
 	legacyServiceName := fmt.Sprintf("aifar-mysql-%d", port)
-	cmd := fmt.Sprintf(`AIFAR_MYSQL_RUNTIME_PROBE=1
+	result, err := s.runMySQLCredentialCommand(ctx, server, instance, credential, log, func(work string) string {
+		return fmt.Sprintf(`AIFAR_MYSQL_RUNTIME_PROBE=1
 INSTALL_ROOT=%s
 LEGACY_ROOT=%s
 PORT=%d
-ROOT_USER=%s
-ROOT_PASSWORD=%s
+SECRET_CONTEXT=%s
 SERVICE_NAME=%s
 LEGACY_SERVICE_NAME=%s
 if [ ! -x "$INSTALL_ROOT/mysql/bin/mysqladmin" ] && [ -x "$LEGACY_ROOT/mysql/bin/mysqladmin" ]; then INSTALL_ROOT="$LEGACY_ROOT"; fi
@@ -73,7 +72,7 @@ if command -v systemctl >/dev/null 2>&1; then
   fi
 fi
 if [ -x "$INSTALL_ROOT/mysql/bin/mysqladmin" ]; then
-  if MYSQL_PWD="$ROOT_PASSWORD" "$INSTALL_ROOT/mysql/bin/mysqladmin" --protocol=tcp -h 127.0.0.1 -P "$PORT" -u "$ROOT_USER" ping >/dev/null 2>&1; then
+  if "$INSTALL_ROOT/mysql/bin/mysqladmin" --defaults-file="$SECRET_CONTEXT" --protocol=tcp -h 127.0.0.1 -P "$PORT" ping >/dev/null 2>&1; then
     ping_status="running"
   else
     ping_status="offline"
@@ -91,12 +90,6 @@ fi
 if [ "$ping_status" = "running" ]; then
   runtime_status="running"
   runtime_source="mysqladmin"
-elif [ "$service_status" = "running" ]; then
-  runtime_status="running"
-  runtime_source="systemd"
-elif [ "$port_status" = "listening" ]; then
-  runtime_status="running"
-  runtime_source="tcp-port"
 fi
 printf 'runtimeStatus=%%s\n' "$runtime_status"
 printf 'mysqlPingStatus=%%s\n' "$ping_status"
@@ -105,16 +98,14 @@ printf 'mysqlPortStatus=%%s\n' "$port_status"
 printf 'mysqlRuntimeSource=%%s\n' "$runtime_source"
 if [ "$runtime_status" = "running" ]; then exit 0; fi
 exit 1`,
-		installerkit.ShellQuote(installRoot),
-		installerkit.ShellQuote(legacyInstallRoot),
-		port,
-		installerkit.ShellQuote(rootUser),
-		installerkit.ShellQuote(rootPassword),
-		installerkit.ShellQuote(serviceName),
-		installerkit.ShellQuote(legacyServiceName),
-	)
-	result, err := s.remote.Run(ctx, server, cmd)
-	installerkit.LogCommandResult(result, err, log)
+			installerkit.ShellQuote(installRoot),
+			installerkit.ShellQuote(legacyInstallRoot),
+			port,
+			installerkit.ShellQuote(path.Join(work, "secret-context.cnf")),
+			installerkit.ShellQuote(serviceName),
+			installerkit.ShellQuote(legacyServiceName),
+		)
+	})
 	probe := parseMySQLRuntimeProbe(result.Stdout)
 	if err != nil {
 		return probe, fmt.Errorf("mysql remote command failed: %w", err)
@@ -125,22 +116,20 @@ exit 1`,
 	return probe, nil
 }
 
-func (s Service) detectInnoDBPrimary(ctx context.Context, server store.Server, instance store.AppInstance, defaultPassword string, log Logger) (string, error) {
+func (s Service) detectInnoDBPrimary(ctx context.Context, server store.Server, instance store.AppInstance, credential store.Credential, log Logger) (string, error) {
 	port := instancePort(instance)
-	rootUser := instanceRootUser(instance)
-	rootPassword := passwordParam(nil, defaultPassword)
 	installRoot := remoteInstallRoot(server, "mysql", instance.Version)
 	legacyInstallRoot := remoteLegacyInstallRoot(server, "mysql", instance.Version)
 	query := "SELECT CONCAT(MEMBER_HOST, ':', MEMBER_PORT) FROM performance_schema.replication_group_members WHERE MEMBER_ROLE='PRIMARY' LIMIT 1"
-	cmd := fmt.Sprintf("INSTALL_ROOT=%s\nLEGACY_ROOT=%s\nif [ ! -x \"$INSTALL_ROOT/mysql/bin/mysql\" ] && [ -x \"$LEGACY_ROOT/mysql/bin/mysql\" ]; then INSTALL_ROOT=\"$LEGACY_ROOT\"; fi\nMYSQL_PWD=%s \"$INSTALL_ROOT/mysql/bin/mysql\" --protocol=tcp -h 127.0.0.1 -P %d -u %s --batch --skip-column-names -e %s",
-		installerkit.ShellQuote(installRoot),
-		installerkit.ShellQuote(legacyInstallRoot),
-		installerkit.ShellQuote(rootPassword),
-		port,
-		installerkit.ShellQuote(rootUser),
-		installerkit.ShellQuote(query),
-	)
-	result, err := installerkit.Run(ctx, s.remote, server, cmd, log, "mysql remote command failed")
+	result, err := s.runMySQLCredentialCommand(ctx, server, instance, credential, log, func(work string) string {
+		return fmt.Sprintf("INSTALL_ROOT=%s\nLEGACY_ROOT=%s\nif [ ! -x \"$INSTALL_ROOT/mysql/bin/mysql\" ] && [ -x \"$LEGACY_ROOT/mysql/bin/mysql\" ]; then INSTALL_ROOT=\"$LEGACY_ROOT\"; fi\n\"$INSTALL_ROOT/mysql/bin/mysql\" --defaults-file=%s --protocol=tcp -h 127.0.0.1 -P %d --batch --skip-column-names -e %s",
+			installerkit.ShellQuote(installRoot),
+			installerkit.ShellQuote(legacyInstallRoot),
+			installerkit.ShellQuote(path.Join(work, "secret-context.cnf")),
+			port,
+			installerkit.ShellQuote(query),
+		)
+	})
 	if err != nil {
 		return "", err
 	}
@@ -149,6 +138,48 @@ func (s Service) detectInnoDBPrimary(ctx context.Context, server store.Server, i
 		return "", errors.New("InnoDB Cluster primary was not returned")
 	}
 	return primary, nil
+}
+
+func (s Service) runMySQLCredentialCommand(ctx context.Context, server store.Server, instance store.AppInstance, credential store.Credential, log Logger, command func(work string) string) (result installerkit.CommandResult, retErr error) {
+	if strings.TrimSpace(credential.Username) == "" || strings.TrimSpace(credential.Secret["password"]) == "" {
+		return result, mysqlOperationError(MySQLCredentialUnavailable)
+	}
+	work := mysqlBackupWorkDir(store.NewID("credential"))
+	if _, err := s.remote.Run(ctx, server, bootstrapBackupWorkCommand(work)); err != nil {
+		return result, errors.New("unable to prepare MySQL credential context")
+	}
+	secretPath, err := writeMySQLSecretContext(credential, instancePort(instance))
+	if err != nil {
+		cleanupCtx, cancel := mysqlCredentialCleanupContext(ctx)
+		_, _ = s.remote.Run(cleanupCtx, server, cleanupBackupCommand(work))
+		cancel()
+		return result, errors.New("unable to create MySQL credential context")
+	}
+	defer func() {
+		var cleanupErrors []error
+		cleanupCtx, cancel := mysqlCredentialCleanupContext(ctx)
+		if _, err := s.remote.Run(cleanupCtx, server, cleanupBackupCommand(work)); err != nil {
+			cleanupErrors = append(cleanupErrors, errors.New("unable to clean remote MySQL credential context"))
+		}
+		cancel()
+		if err := removeMySQLCredentialContext(secretPath); err != nil {
+			cleanupErrors = append(cleanupErrors, errors.New("unable to clean local MySQL credential context"))
+		}
+		retErr = errors.Join(retErr, errors.Join(cleanupErrors...))
+	}()
+	if err := s.remote.UploadFile(ctx, server, secretPath, path.Join(work, "secret-context.cnf"), 0o600); err != nil {
+		return result, errors.New("unable to upload MySQL credential context")
+	}
+	remoteSecretPath := path.Join(work, "secret-context.cnf")
+	result, err = s.remote.Run(ctx, server, mysqlRemoteCredentialValidationCommand(remoteSecretPath)+"\n"+command(work))
+	secret := credential.Secret["password"]
+	result.Stdout = sanitizeMySQLCredentialText(result.Stdout, secret)
+	result.Stderr = sanitizeMySQLCredentialText(result.Stderr, secret)
+	installerkit.LogCommandResult(result, err, mysqlSanitizedLogger{base: log, secrets: []string{secret}})
+	if err != nil {
+		return result, errors.New("mysql remote command failed")
+	}
+	return result, nil
 }
 
 func (s Service) markInnoDBClusterPrimary(instance store.AppInstance, primaryEndpoint string, details map[string]any) error {

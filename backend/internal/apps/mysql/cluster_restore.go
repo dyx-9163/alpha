@@ -1,0 +1,455 @@
+package mysql
+
+import (
+	"bufio"
+	"context"
+	"encoding/json"
+	"errors"
+	"net"
+	"path"
+	"strconv"
+	"strings"
+
+	"aifar-deployment/backend/internal/apps/registry"
+	"aifar-deployment/backend/internal/installer/installerkit"
+	"aifar-deployment/backend/internal/store"
+)
+
+// Cluster operations intentionally resolve the PRIMARY at execution time. The
+// database records identify the expected members but never select a source.
+type clusterBackupStore interface {
+	backupStore
+	GetAppCluster(string) (store.AppCluster, error)
+	ListAppClusterMembers(string) ([]store.AppClusterMember, error)
+	ListAppInstances() ([]store.AppInstance, error)
+}
+
+type resolvedInnoDBCluster struct {
+	clusterID      string
+	members        []clusterMemberNode
+	routers        []RouterRef
+	primary        clusterMemberNode
+	representative store.AppInstance
+}
+
+type clusterMemberNode struct {
+	instance store.AppInstance
+	server   store.Server
+	endpoint string
+	role     string
+	status   string
+	uuid     string
+}
+
+func (m Module) planInnoDBClusterBackup(ctx context.Context, req registry.BackupRequest) ([]registry.InstallStepPlan, error) {
+	if err := validateClusterRequest(req.Instance, req.Instances, req.Servers); err != nil {
+		return nil, err
+	}
+	return clusterBackupPlan(req.Instances, standaloneBackupStepNames), nil
+}
+
+func (m Module) planHealthyClusterRestore(ctx context.Context, req registry.RestoreRequest) ([]registry.InstallStepPlan, error) {
+	if err := validateClusterRequest(req.Instance, req.Instances, req.Servers); err != nil {
+		return nil, err
+	}
+	if req.Backup.App != "mysql" || req.Backup.BackupType != "logical-full" || req.Backup.Status != "success" || strings.TrimSpace(req.RepositoryDir) == "" || clusterIDFromBackup(req.Backup) != clusterIDFromInstance(req.Instance) {
+		return nil, mysqlOperationError(MySQLBackupClusterUnhealthy)
+	}
+	// restoreLogical owns the concrete restore lifecycle and terminally records
+	// standaloneRestoreStepNames for both standalone and cluster targets. Keep
+	// the worker plan identical so the one cluster target has no unclosable
+	// synthetic steps.
+	return clusterBackupPlan(req.Instances, standaloneRestoreStepNames), nil
+}
+
+func clusterBackupPlan(instances []store.AppInstance, names []string) []registry.InstallStepPlan {
+	if len(instances) == 0 {
+		return nil
+	}
+	target := clusterIDFromInstance(instances[0])
+	plan := make([]registry.InstallStepPlan, 0, len(names))
+	for index, name := range names {
+		plan = append(plan, registry.InstallStepPlan{Target: target, Name: name, Title: restoreStepTitle("en", name), Order: index + 1})
+	}
+	return plan
+}
+
+func validateClusterRequest(representative store.AppInstance, instances []store.AppInstance, servers []store.Server) error {
+	clusterID := clusterIDFromInstance(representative)
+	if representative.App != "mysql" || instanceTopology(representative) != "innodb-cluster" || clusterID == "" || len(instances) != 3 || len(servers) != 3 {
+		return mysqlOperationError(MySQLBackupClusterUnhealthy)
+	}
+	serverSet := map[string]store.Server{}
+	for _, server := range servers {
+		serverSet[server.ID] = server
+	}
+	seenInstances, seenServers := map[string]bool{}, map[string]bool{}
+	matched := false
+	for _, instance := range instances {
+		if instance.App != "mysql" || instanceTopology(instance) != "innodb-cluster" || clusterIDFromInstance(instance) != clusterID || instance.ID == "" || instance.ServerID == "" || seenInstances[instance.ID] || seenServers[instance.ServerID] || serverSet[instance.ServerID].ID == "" {
+			return mysqlOperationError(MySQLBackupClusterUnhealthy)
+		}
+		seenInstances[instance.ID], seenServers[instance.ServerID] = true, true
+		matched = matched || instance.ID == representative.ID
+	}
+	if !matched {
+		return mysqlOperationError(MySQLBackupClusterUnhealthy)
+	}
+	return nil
+}
+
+func clusterIDFromInstance(instance store.AppInstance) string {
+	return strings.TrimSpace(metadataString(appMetadata(instance), "clusterId"))
+}
+
+func clusterIDFromBackup(backup store.AppBackup) string {
+	metadata, err := strictBackupMetadata(backup.Metadata)
+	if err != nil {
+		return ""
+	}
+	var clusterID string
+	_ = jsonRawString(metadata["clusterId"], &clusterID)
+	return strings.TrimSpace(clusterID)
+}
+
+func jsonRawString(raw []byte, target *string) error {
+	if len(raw) == 0 {
+		return errors.New("missing JSON string")
+	}
+	return json.Unmarshal(raw, target)
+}
+
+func (s Service) resolveHealthyInnoDBCluster(ctx context.Context, representative store.AppInstance, taskID string) (resolvedInnoDBCluster, error) {
+	data, ok := s.store.(clusterBackupStore)
+	if !ok {
+		return resolvedInnoDBCluster{}, errors.New("MySQL cluster backup store is unavailable")
+	}
+	clusterID := clusterIDFromInstance(representative)
+	cluster, err := data.GetAppCluster(clusterID)
+	if err != nil || cluster.App != "mysql" || normalizeTopology(cluster.Topology) != "innodb-cluster" {
+		return resolvedInnoDBCluster{}, mysqlOperationError(MySQLBackupClusterUnhealthy)
+	}
+	members, err := data.ListAppClusterMembers(clusterID)
+	if err != nil || len(members) != 3 {
+		return resolvedInnoDBCluster{}, mysqlOperationError(MySQLBackupClusterUnhealthy)
+	}
+	instances, err := data.ListAppInstances()
+	if err != nil {
+		return resolvedInnoDBCluster{}, err
+	}
+	byID := map[string]store.AppInstance{}
+	for _, instance := range instances {
+		byID[instance.ID] = instance
+	}
+	result := resolvedInnoDBCluster{clusterID: clusterID, representative: representative}
+	seenInstance, seenServer := map[string]bool{}, map[string]bool{}
+	for _, member := range members {
+		instance, found := byID[member.InstanceID]
+		if !found || instance.App != "mysql" || instanceTopology(instance) != "innodb-cluster" || clusterIDFromInstance(instance) != clusterID || instance.ServerID != member.ServerID || seenInstance[instance.ID] || seenServer[instance.ServerID] {
+			return resolvedInnoDBCluster{}, mysqlOperationError(MySQLBackupClusterUnhealthy)
+		}
+		server, err := s.store.GetServer(instance.ServerID, false)
+		if err != nil || strings.TrimSpace(server.Host) == "" {
+			return resolvedInnoDBCluster{}, mysqlOperationError(MySQLBackupClusterUnhealthy)
+		}
+		seenInstance[instance.ID], seenServer[instance.ServerID] = true, true
+		result.members = append(result.members, clusterMemberNode{instance: instance, server: server, endpoint: net.JoinHostPort(server.Host, strconv.Itoa(instancePort(instance)))})
+	}
+	foundRepresentative := false
+	for _, member := range result.members {
+		foundRepresentative = foundRepresentative || member.instance.ID == representative.ID
+	}
+	if !foundRepresentative {
+		return resolvedInnoDBCluster{}, mysqlOperationError(MySQLBackupClusterUnhealthy)
+	}
+	for _, instance := range instances {
+		if instance.App != "mysql-router" || clusterIDFromInstance(instance) != clusterID {
+			continue
+		}
+		server, err := s.store.GetServer(instance.ServerID, false)
+		if err != nil {
+			return resolvedInnoDBCluster{}, err
+		}
+		result.routers = append(result.routers, RouterRef{InstanceID: instance.ID, ServerID: instance.ServerID, Endpoint: net.JoinHostPort(server.Host, strconv.Itoa(routerPort(instance))), Status: instance.Status})
+	}
+	if err := s.inspectInnoDBClusterRuntime(ctx, &result, taskID); err != nil {
+		return resolvedInnoDBCluster{}, err
+	}
+	return result, nil
+}
+
+func (s Service) inspectInnoDBClusterRuntime(ctx context.Context, result *resolvedInnoDBCluster, taskID string) error {
+	if result == nil || len(result.members) != 3 || !validLogicalTaskID(taskID) {
+		return mysqlOperationError(MySQLBackupClusterUnhealthy)
+	}
+	probe := result.members[0]
+	data, ok := s.store.(backupStore)
+	if !ok {
+		return errors.New("MySQL backup store is unavailable")
+	}
+	credential, err := data.GetBoundCredential(probe.instance.ID, "admin", true)
+	if err != nil || credential.Status != "active" || credential.Kind != "mysql" || strings.TrimSpace(credential.Secret["password"]) == "" {
+		return mysqlOperationError(MySQLCredentialUnavailable)
+	}
+	work := mysqlBackupWorkDir(taskID + "-cluster")
+	var output string
+	if err := s.withMySQLCredentialWork(ctx, probe.server, work, credential, instancePort(probe.instance), func() error {
+		result, runErr := s.remote.Run(ctx, probe.server, inspectClusterMembersCommand(work, instancePort(probe.instance)))
+		output = result.Stdout
+		return runErr
+	}); err != nil {
+		return err
+	}
+	runtime, err := parseInnoDBClusterRuntime(output)
+	if err != nil {
+		return mysqlOperationError(MySQLBackupClusterUnhealthy)
+	}
+	if len(runtime) != len(result.members) {
+		return mysqlOperationError(MySQLBackupClusterUnhealthy)
+	}
+	byEndpoint := map[string]clusterMemberNode{}
+	for _, member := range result.members {
+		byEndpoint[normalizeEndpoint(member.endpoint)] = member
+	}
+	seenUUID, seenEndpoint, primaries := map[string]bool{}, map[string]bool{}, 0
+	for _, observed := range runtime {
+		endpoint := normalizeEndpoint(observed.endpoint)
+		member, found := byEndpoint[endpoint]
+		if !found || seenEndpoint[endpoint] || seenUUID[observed.uuid] || observed.status != "ONLINE" || (observed.role != "PRIMARY" && observed.role != "SECONDARY") {
+			return mysqlOperationError(MySQLBackupClusterUnhealthy)
+		}
+		seenEndpoint[endpoint], seenUUID[observed.uuid] = true, true
+		member.role, member.status, member.uuid = observed.role, observed.status, observed.uuid
+		for index := range result.members {
+			if result.members[index].instance.ID == member.instance.ID {
+				result.members[index] = member
+			}
+		}
+		if observed.role == "PRIMARY" {
+			result.primary = member
+			primaries++
+		}
+	}
+	if primaries != 1 || result.primary.instance.ID == "" {
+		return mysqlOperationError(MySQLBackupPrimaryNotFound)
+	}
+	return nil
+}
+
+type observedClusterMember struct{ endpoint, role, status, uuid string }
+
+func inspectClusterMembersCommand(work string, port int) string {
+	mysqlsh := path.Join(mysqlInstallRoot, "mysql-shell", "bin", "mysqlsh")
+	secretPath := path.Join(work, "secret-context.cnf")
+	query := "SELECT '__AIFAR_CLUSTER__',MEMBER_HOST,MEMBER_PORT,MEMBER_ROLE,MEMBER_STATE,MEMBER_ID FROM performance_schema.replication_group_members ORDER BY MEMBER_ID"
+	return mysqlRemoteCredentialValidationCommand(secretPath) + "; test -x " + installerkit.ShellQuote(mysqlsh) + "; " + installerkit.ShellQuote(mysqlsh) + " --defaults-file=" + installerkit.ShellQuote(secretPath) + " --sql --raw --skip-column-names --host=127.0.0.1 --port=" + strconv.Itoa(port) + " --execute " + installerkit.ShellQuote(query)
+}
+
+func parseInnoDBClusterRuntime(output string) ([]observedClusterMember, error) {
+	var out []observedClusterMember
+	scanner := bufio.NewScanner(strings.NewReader(output))
+	for scanner.Scan() {
+		parts := strings.Split(scanner.Text(), "\t")
+		if len(parts) != 6 || parts[0] != "__AIFAR_CLUSTER__" {
+			continue
+		}
+		port, err := strconv.Atoi(parts[2])
+		if err != nil || port < 1 || port > 65535 || !uuidPattern.MatchString(strings.ToLower(parts[5])) {
+			return nil, errors.New("invalid cluster member")
+		}
+		out = append(out, observedClusterMember{endpoint: net.JoinHostPort(parts[1], parts[2]), role: parts[3], status: parts[4], uuid: strings.ToLower(parts[5])})
+	}
+	if err := scanner.Err(); err != nil || len(out) == 0 {
+		return nil, errors.New("missing cluster member inspection")
+	}
+	return out, nil
+}
+
+func routerPort(instance store.AppInstance) int {
+	if port := intParameter(appMetadata(instance), "readWritePort"); port > 0 {
+		return port
+	}
+	return 6446
+}
+
+func (s Service) backupInnoDBCluster(ctx context.Context, req registry.BackupRequest, run registry.RunContext) error {
+	if err := s.requireNoMySQLMaintenance(req.Instance, req.Language); err != nil {
+		return err
+	}
+	if err := s.requireNoMySQLReconciliation(req.Instance, req.Language); err != nil {
+		return err
+	}
+	cluster, err := s.resolveHealthyInnoDBCluster(ctx, req.Instance, run.TaskID)
+	if err != nil {
+		return err
+	}
+	members := make([]ClusterMemberRef, 0, len(cluster.members))
+	ids := make([]string, 0, len(cluster.members))
+	for _, member := range cluster.members {
+		members = append(members, ClusterMemberRef{InstanceID: member.instance.ID, ServerID: member.server.ID, Endpoint: member.endpoint, Role: member.role, Status: member.status})
+		ids = append(ids, member.instance.ID)
+	}
+	req.Instance, req.Instances, req.Servers = cluster.primary.instance, clusterInstances(cluster.members), clusterServers(cluster.members)
+	return s.backupStandaloneCore(ctx, req, run, standaloneBackupExecution{backupType: "logical-full", recordPlan: true, retention: true, topology: "innodb-cluster", clusterID: cluster.clusterID, members: members, routers: cluster.routers, retentionInstanceIDs: ids, progressTarget: cluster.clusterID})
+}
+
+func clusterInstances(members []clusterMemberNode) []store.AppInstance {
+	out := make([]store.AppInstance, 0, len(members))
+	for _, member := range members {
+		out = append(out, member.instance)
+	}
+	return out
+}
+func clusterServers(members []clusterMemberNode) []store.Server {
+	out := make([]store.Server, 0, len(members))
+	for _, member := range members {
+		out = append(out, member.server)
+	}
+	return out
+}
+
+func (m Module) restoreHealthyInnoDBCluster(ctx context.Context, req registry.RestoreRequest, run registry.RunContext) error {
+	if err := m.service.requireNoMySQLMaintenance(req.Instance, req.Language); err != nil {
+		return err
+	}
+	if err := m.service.requireNoMySQLReconciliation(req.Instance, req.Language); err != nil {
+		return err
+	}
+	cluster, err := m.service.resolveHealthyInnoDBCluster(ctx, req.Instance, run.TaskID)
+	if err != nil {
+		return err
+	}
+	if clusterIDFromBackup(req.Backup) != cluster.clusterID {
+		return mysqlOperationError(MySQLBackupClusterUnhealthy)
+	}
+	req.Instance, req.Instances, req.Servers = cluster.primary.instance, clusterInstances(cluster.members), clusterServers(cluster.members)
+	return m.service.restoreLogical(ctx, req, run, &cluster)
+}
+
+func (s Service) verifyClusterRecovered(ctx context.Context, cluster *resolvedInnoDBCluster, schemas []string, taskID string) error {
+	if err := s.inspectInnoDBClusterRuntime(ctx, cluster, taskID); err != nil {
+		return err
+	}
+	if len(cluster.routers) == 0 {
+		return mysqlOperationError(MySQLRestoreIncomplete)
+	}
+	schema, ok := routerVerificationSchema(schemas)
+	if !ok {
+		return mysqlOperationError(MySQLRestoreIncomplete)
+	}
+	data, ok := s.store.(backupStore)
+	if !ok {
+		return errors.New("MySQL backup store is unavailable")
+	}
+	credential, err := data.GetBoundCredential(cluster.primary.instance.ID, "admin", true)
+	if err != nil || credential.Status != "active" || credential.Kind != "mysql" || strings.TrimSpace(credential.Secret["password"]) == "" {
+		return mysqlOperationError(MySQLCredentialUnavailable)
+	}
+	for _, router := range cluster.routers {
+		server, err := s.store.GetServer(router.ServerID, true)
+		if err != nil {
+			return err
+		}
+		work := mysqlBackupWorkDir(taskID + "-router-" + router.InstanceID[len("app_"):])
+		var output string
+		verifyErr := s.withMySQLCredentialWork(ctx, server, work, credential, routerPortForEndpoint(router.Endpoint), func() error {
+			result, runErr := s.remote.Run(ctx, server, routerReadWriteVerificationCommand(work, routerPortForEndpoint(router.Endpoint), schema))
+			output = result.Stdout
+			return runErr
+		})
+		if verifyErr != nil || !strings.Contains(output, "__AIFAR_ROUTER_WRITE__\t1") || !strings.Contains(output, "__AIFAR_ROUTER_READ__\t1") {
+			return mysqlOperationError(MySQLRestoreIncomplete)
+		}
+	}
+	return nil
+}
+
+// verifyMaintenanceClusterHealth deliberately performs a router-port 6446
+// read/write transaction without assuming a restored business schema exists.
+func (s Service) verifyMaintenanceClusterHealth(ctx context.Context, cluster *resolvedInnoDBCluster, taskID string) error {
+	if err := s.inspectInnoDBClusterRuntime(ctx, cluster, taskID); err != nil {
+		return err
+	}
+	if len(cluster.routers) == 0 {
+		return mysqlOperationError(MySQLBackupClusterUnhealthy)
+	}
+	data, ok := s.store.(backupStore)
+	if !ok {
+		return errors.New("MySQL backup store is unavailable")
+	}
+	credential, err := data.GetBoundCredential(cluster.primary.instance.ID, "admin", true)
+	if err != nil || credential.Status != "active" || credential.Kind != "mysql" || strings.TrimSpace(credential.Secret["password"]) == "" {
+		return mysqlOperationError(MySQLCredentialUnavailable)
+	}
+	schema, err := s.maintenanceRouterVerificationSchema(ctx, cluster.primary, credential, taskID)
+	if err != nil {
+		return mysqlOperationError(MySQLBackupClusterUnhealthy)
+	}
+	for _, router := range cluster.routers {
+		server, err := s.store.GetServer(router.ServerID, false)
+		if err != nil {
+			return err
+		}
+		work := mysqlBackupWorkDir(taskID + "-maintenance-router-" + router.InstanceID[len("app_"):])
+		var output string
+		verifyErr := s.withMySQLCredentialWork(ctx, server, work, credential, routerPortForEndpoint(router.Endpoint), func() error {
+			result, runErr := s.remote.Run(ctx, server, routerReadWriteVerificationCommand(work, routerPortForEndpoint(router.Endpoint), schema))
+			output = result.Stdout
+			return runErr
+		})
+		if verifyErr != nil || !strings.Contains(output, "__AIFAR_ROUTER_WRITE__\t1") || !strings.Contains(output, "__AIFAR_ROUTER_READ__\t1") {
+			return mysqlOperationError(MySQLBackupClusterUnhealthy)
+		}
+	}
+	return nil
+}
+
+func (s Service) maintenanceRouterVerificationSchema(ctx context.Context, primary clusterMemberNode, credential store.Credential, taskID string) (schema string, retErr error) {
+	work := mysqlBackupWorkDir(taskID + "-maintenance-schema")
+	retErr = s.withMySQLCredentialWork(ctx, primary.server, work, credential, instancePort(primary.instance), func() error {
+		result, err := s.remote.Run(ctx, primary.server, inspectBackupCommand(work, instancePort(primary.instance)))
+		if err != nil {
+			return err
+		}
+		inspection, err := parseMySQLBackupInspection(result.Stdout)
+		if err != nil {
+			return err
+		}
+		for _, candidate := range inspection.Schemas {
+			if strictSchemaName.MatchString(candidate) && !isSystemSchema(candidate) {
+				schema = candidate
+				return nil
+			}
+		}
+		return errors.New("no business schema for router maintenance verification")
+	})
+	return schema, retErr
+}
+
+func routerPortForEndpoint(endpoint string) int {
+	_, port, err := net.SplitHostPort(endpoint)
+	if err != nil {
+		return 6446
+	}
+	value, err := strconv.Atoi(port)
+	if err != nil || value < 1 || value > 65535 {
+		return 6446
+	}
+	return value
+}
+
+func routerVerificationSchema(schemas []string) (string, bool) {
+	for _, schema := range schemas {
+		if strictSchemaName.MatchString(schema) && !isSystemSchema(schema) {
+			return schema, true
+		}
+	}
+	return "", false
+}
+
+func routerReadWriteVerificationCommand(work string, port int, schema string) string {
+	mysqlsh := path.Join(mysqlInstallRoot, "mysql-shell", "bin", "mysqlsh")
+	secretPath := path.Join(work, "secret-context.cnf")
+	query := "USE `" + schema + "`; START TRANSACTION READ WRITE; CREATE TEMPORARY TABLE aifar_router_verify(v INT NOT NULL); INSERT INTO aifar_router_verify VALUES (1); SELECT '__AIFAR_ROUTER_WRITE__',COUNT(*) FROM aifar_router_verify; SELECT '__AIFAR_ROUTER_READ__',v FROM aifar_router_verify; ROLLBACK"
+	return mysqlRemoteCredentialValidationCommand(secretPath) + "; test -x " + installerkit.ShellQuote(mysqlsh) + "; " + installerkit.ShellQuote(mysqlsh) + " --defaults-file=" + installerkit.ShellQuote(secretPath) + " --sql --raw --skip-column-names --host=127.0.0.1 --port=" + strconv.Itoa(port) + " --execute " + installerkit.ShellQuote(query)
+}

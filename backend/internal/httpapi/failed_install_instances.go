@@ -38,12 +38,8 @@ func (a *API) recordFailedInstallInstances(ctx context.Context, req registry.Ins
 			return count, err
 		}
 		_, err = a.store.SaveAppInstance(store.AppInstance{
-			App:      req.App,
-			Version:  req.Version,
-			ServerID: serverID,
-			Status:   failedInstallStatus(req.App),
-			Topology: normalizedInstallTopology(req.Topology),
-			Metadata: string(raw),
+			App: req.App, Version: req.Version, ServerID: serverID, Status: failedInstallStatus(req.App),
+			Topology: normalizedInstallTopology(req.Topology), Metadata: string(raw),
 		})
 		if err != nil {
 			return count, err
@@ -66,6 +62,67 @@ func installInstanceRecordedAfter(instances []store.AppInstance, app, serverID s
 		}
 	}
 	return false
+}
+
+// markRecordedInstallInstancesFailed mutates only rows provably created by
+// this install window. It is reserved for post-install finalization failures;
+// the general failure recorder above keeps its historical non-mutating rule.
+func (a *API) markRecordedInstallInstancesFailed(req registry.InstallRequest, startedAt time.Time, taskID string, installErr error) (int, error) {
+	instances, err := a.store.ListAppInstances()
+	if err != nil {
+		return 0, err
+	}
+	owned, err := ownedMySQLInstallInstances(req, startedAt, instances)
+	if err != nil {
+		return 0, err
+	}
+	updates := make([]store.AppInstance, 0, len(owned))
+	for _, instance := range owned {
+		serverID := instance.ServerID
+		metadata, err := a.failedInstallMetadata(req, serverID, taskID, installErr)
+		if err != nil {
+			return 0, err
+		}
+		current := map[string]any{}
+		_ = json.Unmarshal([]byte(instance.Metadata), &current)
+		for key, value := range metadata {
+			if key == "clusterId" && strings.TrimSpace(installMetadataString(current, key)) != "" {
+				continue
+			}
+			current[key] = value
+		}
+		raw, err := json.Marshal(current)
+		if err != nil {
+			return 0, err
+		}
+		instance.Status = failedInstallStatus(req.App)
+		instance.Metadata = string(raw)
+		updates = append(updates, instance)
+	}
+	if len(updates) == 0 {
+		return 0, nil
+	}
+	if err := a.store.MarkMySQLInstallInstancesFailed(updates); err != nil {
+		return 0, err
+	}
+	return len(updates), nil
+}
+
+func uniqueInstallInstanceCreatedAfter(instances []store.AppInstance, app, version, serverID, topology string, startedAt time.Time) (store.AppInstance, bool) {
+	if startedAt.IsZero() {
+		return store.AppInstance{}, false
+	}
+	var selected store.AppInstance
+	for _, item := range instances {
+		if item.App != app || item.Version != version || item.ServerID != serverID || normalizedInstallTopology(item.Topology) != topology || item.CreatedAt.Before(startedAt) {
+			continue
+		}
+		if selected.ID != "" {
+			return store.AppInstance{}, false
+		}
+		selected = item
+	}
+	return selected, selected.ID != ""
 }
 
 func failedInstallInstanceExists(instances []store.AppInstance, app, serverID, taskID string) bool {

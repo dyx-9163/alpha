@@ -1,7 +1,11 @@
 package httpapi
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -9,6 +13,7 @@ import (
 	"time"
 
 	_ "aifar-deployment/backend/internal/apps/autoload"
+	mysqlapp "aifar-deployment/backend/internal/apps/mysql"
 	"aifar-deployment/backend/internal/apps/registry"
 	"aifar-deployment/backend/internal/auditkit"
 	"aifar-deployment/backend/internal/config"
@@ -111,7 +116,14 @@ func NewWithRealtime(cfg config.Config, s *store.Store, tasks *worker.Manager, e
 			r.Get("/apps/catalog", api.appsCatalog)
 			r.Get("/apps/{app}/install-modules", api.appInstallModules)
 			r.Get("/apps/instances", api.appInstances)
+			r.Get("/apps/instances/{id}/backups", api.listMySQLBackups)
 			r.Post("/apps/{app}/install", api.requirePermission(rbac.AppsManage, api.installApp))
+			r.Post("/apps/instances/{id}/backup", api.requirePermission(rbac.AppsManage, api.startMySQLBackup))
+			r.Post("/apps/instances/{id}/restore", api.requireOwner(api.startMySQLRestore))
+			r.Post("/apps/instances/{id}/mysql/maintenance/clear", api.requireOwner(api.clearMySQLMaintenance))
+			r.Post("/apps/instances/{id}/mysql/reconciliation/run", api.requireOwner(api.runMySQLReconciliation))
+			r.Post("/apps/backups/{backupId}/verify", api.requirePermission(rbac.AppsManage, api.verifyMySQLBackup))
+			r.Delete("/apps/backups/{backupId}", api.requirePermission(rbac.AppsManage, api.deleteMySQLBackup))
 			r.Post("/apps/instances/batch-delete", api.requirePermission(rbac.AppsManage, api.deleteAppInstances))
 			r.Post("/apps/instances/{id}/check", api.requirePermission(rbac.AppsManage, api.checkAppInstance))
 			r.Get("/apps/instances/{id}/aifar/releases", api.listAIFARReleases)
@@ -260,6 +272,114 @@ type credentialSaveRequest struct {
 type startMySQLClusterRequest struct {
 	InstanceIDs []string `json:"instanceIds"`
 	Language    string   `json:"language"`
+}
+
+type mysqlBackupRequest struct {
+	Name        string `json:"name"`
+	Threads     int    `json:"threads"`
+	MaxRateMBps int    `json:"maxRateMBps"`
+	KeepLast    *int   `json:"keepLast"`
+}
+
+type mysqlRestoreRequest struct {
+	BackupID               string            `json:"backupId"`
+	Mode                   string            `json:"mode"`
+	MaintenanceConfirmed   bool              `json:"maintenanceConfirmed"`
+	CreatePreRestoreBackup bool              `json:"createPreRestoreBackup"`
+	DisasterConfirmed      bool              `json:"disasterConfirmed"`
+	Threads                int               `json:"threads"`
+	TargetMapping          map[string]string `json:"targetMapping"`
+	ServerPasswords        map[string]string `json:"serverPasswords"`
+}
+
+func decodeMySQLRestoreRequest(w http.ResponseWriter, r *http.Request) (mysqlRestoreRequest, bool) {
+	defer r.Body.Close()
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	var request mysqlRestoreRequest
+	if err := decoder.Decode(&request); err != nil {
+		writeMySQLBackupDecodeError(w, r, err)
+		return mysqlRestoreRequest{}, false
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		if err == nil {
+			err = errors.New("request body must contain exactly one JSON object")
+		}
+		writeMySQLBackupDecodeError(w, r, err)
+		return mysqlRestoreRequest{}, false
+	}
+	request.BackupID = strings.TrimSpace(request.BackupID)
+	request.Mode = strings.ToLower(strings.TrimSpace(request.Mode))
+	validMode := request.Mode == "standalone" || request.Mode == "innodb-cluster" || request.Mode == "disaster-rebuild"
+	valid := request.BackupID != "" && validMode && request.MaintenanceConfirmed && request.Threads >= 1 && request.Threads <= 64
+	if request.Mode == "disaster-rebuild" {
+		valid = valid && request.DisasterConfirmed && len(request.TargetMapping) == 3 && len(request.ServerPasswords) == 3 && !request.CreatePreRestoreBackup
+	} else {
+		valid = valid && len(request.TargetMapping) == 0 && len(request.ServerPasswords) == 0
+	}
+	if !valid {
+		code := mysqlapp.MySQLRestoreMaintenanceRequired
+		if request.Mode == "disaster-rebuild" {
+			code = mysqlapp.MySQLRebuildConfirmationRequired
+		}
+		writeError(w, http.StatusBadRequest, code, i18n.MySQLBackupErrorText(languageFromRequest(r), code), nil)
+		return mysqlRestoreRequest{}, false
+	}
+	return request, true
+}
+
+func (r *mysqlBackupRequest) UnmarshalJSON(data []byte) error {
+	type request mysqlBackupRequest
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	var decoded request
+	if err := decoder.Decode(&decoded); err != nil {
+		return err
+	}
+	if decoded.KeepLast != nil && *decoded.KeepLast <= 0 {
+		return errors.New("keepLast must be positive")
+	}
+	*r = mysqlBackupRequest(decoded)
+	return nil
+}
+
+func decodeMySQLBackupRequest(w http.ResponseWriter, r *http.Request) (mysqlBackupRequest, bool) {
+	defer r.Body.Close()
+	decoder := json.NewDecoder(r.Body)
+	var raw json.RawMessage
+	if err := decoder.Decode(&raw); err != nil {
+		writeMySQLBackupDecodeError(w, r, err)
+		return mysqlBackupRequest{}, false
+	}
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || trimmed[0] != '{' {
+		writeMySQLBackupDecodeError(w, r, errors.New("request body must be a JSON object"))
+		return mysqlBackupRequest{}, false
+	}
+	var request mysqlBackupRequest
+	if err := json.Unmarshal(trimmed, &request); err != nil {
+		writeMySQLBackupDecodeError(w, r, err)
+		return mysqlBackupRequest{}, false
+	}
+	var extra json.RawMessage
+	if err := decoder.Decode(&extra); err != io.EOF {
+		if err == nil {
+			err = errors.New("request body must contain exactly one JSON object")
+		}
+		writeMySQLBackupDecodeError(w, r, err)
+		return mysqlBackupRequest{}, false
+	}
+	return request, true
+}
+
+func writeMySQLBackupDecodeError(w http.ResponseWriter, r *http.Request, err error) {
+	var maxBytesErr *http.MaxBytesError
+	if errors.As(err, &maxBytesErr) {
+		writeError(w, http.StatusRequestEntityTooLarge, "REQUEST_BODY_TOO_LARGE", i18n.Text(languageFromRequest(r), "api.requestBodyTooLarge"), map[string]any{"limit": maxBytesErr.Limit})
+		return
+	}
+	writeError(w, http.StatusBadRequest, "INVALID_JSON", i18n.Text(languageFromRequest(r), "api.invalidJSON"), map[string]any{"error": err.Error()})
 }
 
 type installAppRequest struct {

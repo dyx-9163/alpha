@@ -14,21 +14,27 @@ import (
 type installerFakeRemote struct {
 	commands      []string
 	uploads       []string
+	uploadDetails []credentialTransportUpload
 	installScript string
+	runHook       func(string) (adapter.CommandResult, error)
 }
 
 func (f *installerFakeRemote) Run(ctx context.Context, server store.Server, command string) (adapter.CommandResult, error) {
 	f.commands = append(f.commands, command)
+	if f.runHook != nil {
+		return f.runHook(command)
+	}
 	return adapter.CommandResult{Stdout: "ok"}, nil
 }
 
 func (f *installerFakeRemote) UploadFile(ctx context.Context, server store.Server, localPath, remotePath string, mode os.FileMode) error {
 	f.uploads = append(f.uploads, filepath.Base(localPath)+"->"+remotePath)
+	content, err := os.ReadFile(localPath)
+	if err != nil {
+		return err
+	}
+	f.uploadDetails = append(f.uploadDetails, credentialTransportUpload{serverID: server.ID, remotePath: remotePath, mode: mode, content: string(content)})
 	if strings.HasSuffix(remotePath, "/install-mysql.sh") {
-		content, err := os.ReadFile(localPath)
-		if err != nil {
-			return err
-		}
 		f.installScript = string(content)
 	}
 	return nil
@@ -121,8 +127,8 @@ func TestInstallerUploadsBundleAndRunsMySQLScript(t *testing.T) {
 			t.Fatalf("installer should preconfigure InnoDB Cluster option %q:\n%s", want, remote.installScript)
 		}
 	}
-	if !strings.Contains(remote.installScript, `MYSQL_PWD="$ROOT_PASSWORD" "$MYSQL_BASE/bin/mysqladmin" --protocol=tcp`) {
-		t.Fatalf("installer should verify password login via mysqladmin:\n%s", remote.installScript)
+	if strings.Contains(remote.installScript, `MYSQL_PWD=`) || !strings.Contains(remote.installScript, `--defaults-extra-file="$SECURE_CLIENT_FILE"`) {
+		t.Fatalf("installer should verify with a protected option context:\n%s", remote.installScript)
 	}
 	if !strings.Contains(remote.installScript, "dump_mysql_diagnostics") ||
 		!strings.Contains(remote.installScript, "still waiting for MySQL readiness ($i/300)") ||
@@ -145,15 +151,13 @@ func TestInstallerUploadsBundleAndRunsMySQLScript(t *testing.T) {
 
 func TestMySQLStandaloneScriptsRenderTemplates(t *testing.T) {
 	install, err := installStandaloneScript(InstallScriptRequest{
-		Version:      "8.0.36",
-		WorkDir:      "/aifar/apps/_work/mysql",
-		ArchivePath:  "/tmp/mysql.tar",
-		InstallRoot:  "/aifar/apps/mysql/8.0.36",
-		ReportHost:   "10.0.0.1",
-		Port:         3307,
-		ServerID:     12345,
-		RootUser:     "root",
-		RootPassword: "Oversea.123",
+		Version:     "8.0.36",
+		WorkDir:     "/aifar/apps/_work/mysql",
+		ArchivePath: "/tmp/mysql.tar",
+		InstallRoot: "/aifar/apps/mysql/8.0.36",
+		ReportHost:  "10.0.0.1",
+		Port:        3307,
+		ServerID:    12345,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -167,12 +171,11 @@ func TestMySQLStandaloneScriptsRenderTemplates(t *testing.T) {
 	if !strings.Contains(install, "server-id=12345") || !strings.Contains(install, "gtid_mode=ON") || !strings.Contains(install, "binlog_transaction_dependency_tracking=WRITESET") {
 		t.Fatalf("install script did not render InnoDB Cluster bootstrap-friendly config:\n%s", install)
 	}
-	bootstrap, err := bootstrapInnoDBClusterScript(InnoDBClusterBootstrapRequest{
-		ClusterName:  "aifarCluster",
-		InstallRoot:  "/aifar/apps/mysql",
-		RootUser:     "root",
-		RootPassword: "Oversea.123",
-		Nodes:        []InnoDBClusterNode{{Host: "10.0.0.1", Port: 3306}},
+	bootstrap, err := bootstrapInnoDBClusterScript(InnoDBClusterBootstrapScriptRequest{
+		ClusterName:           "aifarCluster",
+		InstallRoot:           "/aifar/apps/mysql",
+		CredentialContextPath: "/aifar/apps/_work/mysql-credential-bootstrap/context/credential-context.json",
+		Nodes:                 []InnoDBClusterNode{{Host: "10.0.0.1", Port: 3306}},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -183,12 +186,11 @@ func TestMySQLStandaloneScriptsRenderTemplates(t *testing.T) {
 	if !strings.Contains(bootstrap, "clusterAdminPassword is not allowed") || !strings.Contains(bootstrap, "cluster admin account already exists") {
 		t.Fatalf("bootstrap script should retry existing cluster admin accounts:\n%s", bootstrap)
 	}
-	start, err := startInnoDBClusterScript(InnoDBClusterStartRequest{
-		ClusterName:  "aifarCluster",
-		InstallRoot:  "/aifar/apps/mysql",
-		RootUser:     "root",
-		RootPassword: "Oversea.123",
-		Nodes:        []InnoDBClusterNode{{Host: "10.0.0.1", Port: 3306}},
+	start, err := startInnoDBClusterScript(InnoDBClusterStartScriptRequest{
+		ClusterName:           "aifarCluster",
+		InstallRoot:           "/aifar/apps/mysql",
+		CredentialContextPath: "/aifar/apps/_work/mysql-credential-start/context/credential-context.json",
+		Nodes:                 []InnoDBClusterNode{{Host: "10.0.0.1", Port: 3306}},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -198,11 +200,18 @@ func TestMySQLStandaloneScriptsRenderTemplates(t *testing.T) {
 		"information_schema.tables",
 		"PRIMARY KEY or a NOT NULL UNIQUE key",
 		"Group Replication table key validation failed",
+		"@@GLOBAL.gtid_executed",
+		"GTID_SUBSET(?, ?)",
+		"candidates.length !== 1",
+		"{dryRun: true}",
 		"rebootClusterFromCompleteOutage",
 	} {
 		if !strings.Contains(start, want) {
 			t.Fatalf("start script should include Group Replication key diagnostics %q:\n%s", want, start)
 		}
+	}
+	if strings.Contains(start, "force: true") || strings.Index(start, "{dryRun: true}") > strings.LastIndex(start, "rebootClusterFromCompleteOutage") {
+		t.Fatalf("start script must dry-run before mutation and must never force recovery:\n%s", start)
 	}
 	uninstall, err := uninstallStandaloneScript("8.0.36", "/aifar/apps/mysql", "/aifar/apps/mysql/8.0.36", 3307)
 	if err != nil {

@@ -216,6 +216,135 @@ func TestAppClusterReleaseAssetsAndBackups(t *testing.T) {
 	}
 }
 
+func TestAppBackupLookupAndListForInstances(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "aifar.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	first, err := db.SaveAppBackup(AppBackup{ID: "backup-first", App: "mysql", InstanceID: "instance-a", BackupType: "logical-full", Status: "success", Path: "/backups/first", Checksum: "first", CreatedAt: time.Date(2026, 7, 27, 1, 0, 0, 0, time.UTC)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := db.SaveAppBackup(AppBackup{ID: "backup-second", App: "mysql", InstanceID: "instance-b", BackupType: "logical-full", Status: "success", Path: "/backups/second", Checksum: "second", CreatedAt: time.Date(2026, 7, 27, 2, 0, 0, 0, time.UTC)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.SaveAppBackup(AppBackup{ID: "backup-deleted", App: "mysql", InstanceID: "instance-c", BackupType: "logical-full", Status: "deleted", Path: "/backups/deleted", Checksum: "deleted", CreatedAt: time.Date(2026, 7, 27, 3, 0, 0, 0, time.UTC)}); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := db.GetAppBackup(first.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ID != first.ID || got.Path != "/backups/first" || got.Checksum != "first" {
+		t.Fatalf("GetAppBackup returned %+v, want exact first backup", got)
+	}
+
+	listed, err := db.ListAppBackupsForInstances([]string{" instance-a ", "instance-b", "instance-a", ""}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(listed) != 2 || listed[0].ID != second.ID || listed[1].ID != first.ID {
+		t.Fatalf("active cluster backups = %+v, want second then first", listed)
+	}
+	excludedDeleted, err := db.ListAppBackupsForInstances([]string{"instance-c"}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(excludedDeleted) != 0 {
+		t.Fatalf("deleted backups without includeDeleted = %+v, want none", excludedDeleted)
+	}
+	withDeleted, err := db.ListAppBackupsForInstances([]string{"instance-c"}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(withDeleted) != 1 || withDeleted[0].Status != "deleted" {
+		t.Fatalf("deleted backups = %+v, want deleted record when requested", withDeleted)
+	}
+	empty, err := db.ListAppBackupsForInstances(nil, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(empty) != 0 {
+		t.Fatalf("empty instance list = %+v, want no records", empty)
+	}
+}
+
+func TestAppBackupStatusIsMonotonicAndDeletePreservesAuditMetadata(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "aifar.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	createdAt := time.Date(2026, 7, 27, 1, 0, 0, 0, time.UTC)
+	backup, err := db.SaveAppBackup(AppBackup{ID: "backup-status", App: "mysql", InstanceID: "instance-a", BackupType: "logical-full", Status: "pending", Path: "/backups/archive.tar", Checksum: "checksum", TaskID: "task-create", Metadata: `{"source":"primary"}`, CreatedAt: createdAt})
+	if err != nil {
+		t.Fatal(err)
+	}
+	backup.Status = "running"
+	if _, err := db.SaveAppBackup(backup); err != nil {
+		t.Fatal(err)
+	}
+	backup.Status = "pending"
+	backup.Path = "/backups/stale-path.tar"
+	got, err := db.SaveAppBackup(backup)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != "running" || got.Path != "/backups/archive.tar" {
+		t.Fatalf("stale update must not regress a running backup: %+v", got)
+	}
+	got.Status = "success"
+	finished, err := db.SaveAppBackup(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	finished.Status = "running"
+	finished.Path = "/backups/regressed-after-success.tar"
+	finished, err = db.SaveAppBackup(finished)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if finished.Status != "success" || finished.Path != "/backups/archive.tar" {
+		t.Fatalf("stale update must not regress a successful backup: %+v", finished)
+	}
+	directDelete := finished
+	directDelete.Status = "deleted"
+	directDelete.TaskID = "task-delete"
+	directDelete.Path = "/backups/replaced.tar"
+	directDelete.Checksum = "replaced"
+	directDelete.Size = 999
+	directDelete.Metadata = `{"deletedBy":"generic-save"}`
+	directDelete, err = db.SaveAppBackup(directDelete)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if directDelete.Status != "success" || directDelete.TaskID != "task-create" || directDelete.Path != "/backups/archive.tar" || directDelete.Checksum != "checksum" || directDelete.Size != 0 || directDelete.Metadata != `{"source":"primary"}` {
+		t.Fatalf("generic save must not perform deletion or replace provenance: %+v", directDelete)
+	}
+	completedAt := createdAt.Add(time.Hour)
+	deleted, err := db.MarkAppBackupDeleted(backup.ID, completedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deleted.Status != "deleted" || deleted.TaskID != "task-create" || deleted.Path != "/backups/archive.tar" || deleted.Checksum != "checksum" || deleted.Size != 0 || deleted.Metadata != `{"source":"primary"}` || !deleted.CompletedAt.Equal(completedAt) {
+		t.Fatalf("deleted backup lost audit metadata: %+v", deleted)
+	}
+	afterDelete := deleted
+	afterDelete.TaskID = "task-rewrite"
+	afterDelete.Path = "/backups/rewrite.tar"
+	afterDelete, err = db.SaveAppBackup(afterDelete)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterDelete.TaskID != "task-create" || afterDelete.Path != "/backups/archive.tar" || !afterDelete.CompletedAt.Equal(completedAt) {
+		t.Fatalf("generic save must not rewrite a deleted backup: %+v", afterDelete)
+	}
+}
+
 func TestSaveAppReleaseExpandsManifestAssets(t *testing.T) {
 	db, err := Open(filepath.Join(t.TempDir(), "aifar.db"))
 	if err != nil {

@@ -1,7 +1,9 @@
 package mysql
 
 import (
+	"bytes"
 	_ "embed"
+	"fmt"
 	"text/template"
 
 	"aifar-deployment/backend/internal/installer/installerkit"
@@ -20,6 +22,9 @@ var innodbClusterBootstrapScriptTemplate string
 //go:embed templates/innodb-cluster/start.sh
 var innodbClusterStartScriptTemplate string
 
+//go:embed templates/backup/disaster-rebuild.sh
+var disasterRebuildScriptTemplate string
+
 var mysqlScriptFuncs = selinux.AddTemplateFuncs(template.FuncMap{
 	"shq": installerkit.ShellQuote,
 })
@@ -37,24 +42,37 @@ func uninstallStandaloneScript(version, installRoot, legacyInstallRoot string, p
 	})
 }
 
-func bootstrapInnoDBClusterScript(req InnoDBClusterBootstrapRequest) (string, error) {
+func bootstrapInnoDBClusterScript(req InnoDBClusterBootstrapScriptRequest) (string, error) {
 	return installerkit.RenderTemplate("mysql", "innodb-cluster/bootstrap.sh", "mysql-innodb-cluster-bootstrap", innodbClusterBootstrapScriptTemplate, mysqlScriptFuncs, req)
 }
 
-func startInnoDBClusterScript(req InnoDBClusterStartRequest) (string, error) {
+func startInnoDBClusterScript(req InnoDBClusterStartScriptRequest) (string, error) {
 	return installerkit.RenderTemplate("mysql", "innodb-cluster/start.sh", "mysql-innodb-cluster-start", innodbClusterStartScriptTemplate, mysqlScriptFuncs, req)
 }
 
+func renderDisasterRebuildScript(options DisasterRebuildScriptOptions) (string, error) {
+	if err := validateDisasterRebuildScriptOptions(options); err != nil {
+		return "", err
+	}
+	tpl, err := template.New("mysql-disaster-rebuild").Funcs(mysqlScriptFuncs).Parse(disasterRebuildScriptTemplate)
+	if err != nil {
+		return "", fmt.Errorf("parse fixed MySQL disaster rebuild template: %w", err)
+	}
+	var output bytes.Buffer
+	if err := tpl.Execute(&output, options); err != nil {
+		return "", fmt.Errorf("render fixed MySQL disaster rebuild template: %w", err)
+	}
+	return output.String(), nil
+}
+
 type InstallScriptRequest struct {
-	Version      string
-	WorkDir      string
-	ArchivePath  string
-	InstallRoot  string
-	ReportHost   string
-	Port         int
-	ServerID     uint32
-	RootUser     string
-	RootPassword string
+	Version     string
+	WorkDir     string
+	ArchivePath string
+	InstallRoot string
+	ReportHost  string
+	Port        int
+	ServerID    uint32
 }
 
 type UninstallScriptRequest struct {
@@ -73,11 +91,24 @@ type InnoDBClusterBootstrapRequest struct {
 }
 
 type InnoDBClusterStartRequest struct {
-	ClusterName  string
-	InstallRoot  string
-	RootUser     string
-	RootPassword string
-	Nodes        []InnoDBClusterNode
+	ClusterName string
+	InstallRoot string
+	Connections []mysqlConnectionCredential
+	Nodes       []InnoDBClusterNode
+}
+
+type InnoDBClusterBootstrapScriptRequest struct {
+	ClusterName           string
+	InstallRoot           string
+	CredentialContextPath string
+	Nodes                 []InnoDBClusterNode
+}
+
+type InnoDBClusterStartScriptRequest struct {
+	ClusterName           string
+	InstallRoot           string
+	CredentialContextPath string
+	Nodes                 []InnoDBClusterNode
 }
 
 type InnoDBClusterNode struct {

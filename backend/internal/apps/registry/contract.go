@@ -414,6 +414,68 @@ type ClusterStartRequest struct {
 	DefaultPassword string
 }
 
+type BackupRequest struct {
+	Instance      store.AppInstance
+	Instances     []store.AppInstance
+	Servers       []store.Server
+	Language      string
+	Actor         string
+	RepositoryDir string
+	KeepLast      int
+	Parameters    map[string]any
+}
+
+func (r BackupRequest) Clone() BackupRequest {
+	r.Instances = append([]store.AppInstance(nil), r.Instances...)
+	r.Servers = append([]store.Server(nil), r.Servers...)
+	r.Parameters = cloneParameters(r.Parameters)
+	return r
+}
+
+type RestoreRequest struct {
+	Instance      store.AppInstance
+	Instances     []store.AppInstance
+	Servers       []store.Server
+	Backup        store.AppBackup
+	Language      string
+	Actor         string
+	RepositoryDir string
+	Parameters    map[string]any
+}
+
+func (r RestoreRequest) Clone() RestoreRequest {
+	r.Instances = append([]store.AppInstance(nil), r.Instances...)
+	r.Servers = append([]store.Server(nil), r.Servers...)
+	r.Parameters = cloneParameters(r.Parameters)
+	return r
+}
+
+func cloneParameters(parameters map[string]any) map[string]any {
+	if parameters == nil {
+		return nil
+	}
+	cloned := make(map[string]any, len(parameters))
+	for key, value := range parameters {
+		cloned[key] = cloneParameterValue(value)
+	}
+	return cloned
+}
+
+func cloneParameterValue(value any) any {
+	switch typed := value.(type) {
+	case map[string]any:
+		return cloneParameters(typed)
+	case []any:
+		cloned := make([]any, len(typed))
+		for index, item := range typed {
+			cloned[index] = cloneParameterValue(item)
+		}
+		return cloned
+	default:
+		return value
+	}
+}
+
 type InstanceStatus struct {
 	Status  string         `json:"status"`
 	Message string         `json:"message,omitempty"`
@@ -533,4 +595,14 @@ type RuntimeDiagnosticsModule interface {
 type ClusterStartModule interface {
 	PlanClusterStart(ctx context.Context, req ClusterStartRequest) ([]InstallStepPlan, error)
 	StartCluster(ctx context.Context, req ClusterStartRequest, run RunContext) error
+}
+
+type BackupModule interface {
+	PlanBackup(context.Context, BackupRequest) ([]InstallStepPlan, error)
+	Backup(context.Context, BackupRequest, RunContext) error
+}
+
+type RestoreModule interface {
+	PlanRestore(context.Context, RestoreRequest) ([]InstallStepPlan, error)
+	Restore(context.Context, RestoreRequest, RunContext) error
 }

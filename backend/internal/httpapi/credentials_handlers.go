@@ -5,8 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"aifar-deployment/backend/internal/appmeta"
 	"aifar-deployment/backend/internal/apps/registry"
@@ -16,6 +18,8 @@ import (
 
 	"github.com/go-chi/chi/v5"
 )
+
+const mysqlRootCredentialVersionParameter = "__aifar_mysql_root_credential_version"
 
 func (a *API) listCredentials(w http.ResponseWriter, r *http.Request) {
 	items, err := a.store.ListCredentials(store.CredentialQuery{
@@ -72,6 +76,11 @@ func (a *API) saveCredential(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "CREDENTIAL_INVALID", i18n.Text(lang, "api.credentialInvalid"), nil)
 		return
 	}
+	locks, ok := a.acquireMySQLAdminCredentialMutationLocks(w, r, item)
+	if !ok {
+		return
+	}
+	defer a.releaseOperationLocks(locks)
 	saved, err := a.store.SaveCredential(item)
 	if err == nil {
 		action := "credentials.create"
@@ -83,9 +92,98 @@ func (a *API) saveCredential(w http.ResponseWriter, r *http.Request) {
 	respond(w, saved, err)
 }
 
+func (a *API) acquireMySQLAdminCredentialMutationLocks(w http.ResponseWriter, r *http.Request, item store.Credential) ([]store.OperationLock, bool) {
+	lang := languageFromRequest(r)
+	lockFailure := func(status int) ([]store.OperationLock, bool) {
+		writeError(w, status, "CREDENTIAL_MUTATION_LOCK_FAILED", i18n.Text(lang, "api.credentialMutationLockFailed"), nil)
+		return nil, false
+	}
+	instances := map[string]store.AppInstance{}
+	isMySQL := strings.EqualFold(strings.TrimSpace(item.Kind), "mysql")
+	if item.ID != "" {
+		if existing, err := a.store.GetCredential(item.ID, false); err == nil {
+			isMySQL = isMySQL || strings.EqualFold(strings.TrimSpace(existing.Kind), "mysql")
+		}
+		bindings, err := a.store.CredentialBindings(item.ID)
+		if err != nil {
+			return lockFailure(http.StatusInternalServerError)
+		}
+		for _, binding := range bindings {
+			if !strings.EqualFold(strings.TrimSpace(binding.Purpose), "admin") {
+				continue
+			}
+			instance, err := a.store.GetAppInstance(binding.AppInstanceID)
+			if err != nil {
+				return lockFailure(http.StatusConflict)
+			}
+			instances[instance.ID] = instance
+		}
+	}
+	if isMySQL && strings.EqualFold(strings.TrimSpace(item.Purpose), "admin") && strings.TrimSpace(item.AppInstanceID) != "" {
+		instance, err := a.store.GetAppInstance(item.AppInstanceID)
+		if err != nil {
+			return lockFailure(http.StatusConflict)
+		}
+		instances[instance.ID] = instance
+	}
+	if !isMySQL {
+		return nil, true
+	}
+	specs := credentialOperationLockSpecs("mysql-admin-credential-update", item.ID)
+	values := make([]store.AppInstance, 0, len(instances))
+	for _, instance := range instances {
+		values = append(values, instance)
+	}
+	if len(values) > 0 {
+		instanceSpecs, err := validatedAppMutationOperationLockSpecs("mysql-admin-credential-update", values)
+		if err != nil {
+			return lockFailure(http.StatusConflict)
+		}
+		specs = append(specs, instanceSpecs...)
+	}
+	if len(specs) == 0 {
+		return nil, true
+	}
+	sort.Slice(specs, func(i, j int) bool {
+		return specs[i].Scope+"\x00"+specs[i].ResourceID < specs[j].Scope+"\x00"+specs[j].ResourceID
+	})
+	locks := make([]store.OperationLock, 0, len(specs))
+	for _, spec := range specs {
+		lock, err := a.store.AcquireOperationLock(store.OperationLock{
+			Scope: spec.Scope, ResourceID: spec.ResourceID, Operation: operationLockMutation,
+			Owner: currentUser(r).Username, ExpiresAt: time.Now().UTC().Add(operationLockTTL),
+			Metadata: operationLockMetadata(map[string]any{"action": "mysql-admin-credential-update", "credentialId": item.ID}),
+		})
+		if err != nil {
+			a.releaseOperationLocks(locks)
+			var conflict store.OperationLockConflict
+			if errors.As(err, &conflict) {
+				writeError(w, http.StatusConflict, "OPERATION_LOCKED", i18n.Text(lang, "api.operationLocked", conflict.Lock.ResourceID), map[string]any{
+					"scope": conflict.Lock.Scope, "resourceId": conflict.Lock.ResourceID, "operation": conflict.Lock.Operation,
+					"ownerTaskId": conflict.Lock.OwnerTaskID, "expiresAt": conflict.Lock.ExpiresAt,
+				})
+				return nil, false
+			}
+			return lockFailure(http.StatusInternalServerError)
+		}
+		locks = append(locks, lock)
+	}
+	return locks, true
+}
+
 func (a *API) deleteCredential(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
-	err := a.store.DeleteCredential(id)
+	item, err := a.store.GetCredential(id, false)
+	if err != nil {
+		respond(w, nil, err)
+		return
+	}
+	locks, ok := a.acquireMySQLAdminCredentialMutationLocks(w, r, item)
+	if !ok {
+		return
+	}
+	defer a.releaseOperationLocks(locks)
+	err = a.store.DeleteCredential(id)
 	if err == nil {
 		a.audit(r, "credentials.delete", id, "success", "")
 		writeJSON(w, http.StatusOK, map[string]any{"deleted": true})
@@ -132,14 +230,120 @@ func (a *API) resolveCredentialParameters(r *http.Request, parameters map[string
 			return nil, errors.New(i18n.Text(languageFromRequest(r), "api.credentialInactive"))
 		}
 		applyCredentialMapping(out, credential, mapping)
+		if mapping.IDKey == "rootCredentialId" && strings.EqualFold(credential.Kind, "mysql") {
+			out[mysqlRootCredentialVersionParameter] = credential.CurrentVersion
+		}
 	}
 	return out, nil
 }
 
-func (a *API) bindInstallCredentialReferences(app string, req registry.InstallRequest, log registry.Logger) {
+func (a *API) bindInstallCredentialReferences(app string, req registry.InstallRequest, log registry.Logger, installStartedAt ...time.Time) error {
+	if strings.EqualFold(strings.TrimSpace(app), "mysql") {
+		startedAt := time.Time{}
+		if len(installStartedAt) == 1 {
+			startedAt = installStartedAt[0]
+		}
+		if err := a.bindMySQLInstallAdminCredentials(req, startedAt); err != nil {
+			return errors.New(i18n.Text(req.Language, "api.mysqlInstallCredentialBindingFailed"))
+		}
+		a.recordInstallClusterMembership(app, req, log)
+		return nil
+	}
 	a.bindSelectedInstallCredentialReferences(app, req)
 	a.registerGeneratedInstallCredentials(app, req, log)
 	a.recordInstallClusterMembership(app, req, log)
+	return nil
+}
+
+func (a *API) bindMySQLInstallAdminCredentials(req registry.InstallRequest, startedAt time.Time) error {
+	targets := mysqlInstallCredentialTargetServerIDs(req)
+	if len(targets) == 0 {
+		return store.ErrMySQLInstallAdminCredentialBinding
+	}
+	selectedID := strings.TrimSpace(paramString(req.Parameters, "rootCredentialId", ""))
+	selectedVersion := paramInt(req.Parameters, mysqlRootCredentialVersionParameter, 0)
+	spec, generated := generatedInstallCredentialSpecFor("mysql", req.Parameters)
+	if selectedID == "" && !generated {
+		return store.ErrMySQLInstallAdminCredentialBinding
+	}
+	items := make([]store.MySQLInstallAdminCredential, 0, len(targets))
+	instances, err := a.store.ListAppInstances()
+	if err != nil {
+		return store.ErrMySQLInstallAdminCredentialBinding
+	}
+	owned, err := ownedMySQLInstallInstances(req, startedAt, instances)
+	if err != nil || len(owned) != len(targets) {
+		return store.ErrMySQLInstallAdminCredentialBinding
+	}
+	for index, serverID := range targets {
+		instance := owned[index]
+		item := store.MySQLInstallAdminCredential{Instance: instance, Generated: generated}
+		if generated {
+			endpoint := a.credentialEndpointForInstance(instance, spec)
+			item.Credential = store.Credential{
+				Name: generatedCredentialName(spec, endpoint, serverID), Kind: "mysql", Username: spec.Username, Endpoint: endpoint,
+				ServerID: serverID, Tags: "generated,install", Secret: map[string]string{"password": spec.SecretValue}, CreatedBy: req.Actor,
+			}
+		} else {
+			if selectedVersion <= 0 {
+				return store.ErrMySQLInstallAdminCredentialBinding
+			}
+			item.Credential = store.Credential{
+				ID: selectedID, CurrentVersion: selectedVersion,
+				Username: paramString(req.Parameters, "rootUser", ""), Secret: map[string]string{"password": paramString(req.Parameters, "rootPassword", "")},
+			}
+		}
+		items = append(items, item)
+	}
+	if err := a.store.SaveMySQLInstallAdminCredentials(items); err != nil {
+		return store.ErrMySQLInstallAdminCredentialBinding
+	}
+	for _, item := range items {
+		credential, err := a.store.GetBoundCredential(item.Instance.ID, "admin", true)
+		if err != nil || credential.Kind != "mysql" || credential.Status != "active" || strings.TrimSpace(credential.Username) == "" || strings.TrimSpace(credential.Secret["password"]) == "" {
+			return store.ErrMySQLInstallAdminCredentialBinding
+		}
+	}
+	return nil
+}
+
+func mysqlInstallCredentialTargetServerIDs(req registry.InstallRequest) []string {
+	for _, key := range []string{"mysqlServerIds", "mysqlDataServerIds", "clusterServerIds"} {
+		if targets := cleanStringIDs(stringSliceFromRaw(req.Parameters[key])); len(targets) > 0 {
+			return targets
+		}
+	}
+	return cleanStringIDs(req.TargetServerIDs())
+}
+
+func ownedMySQLInstallInstances(req registry.InstallRequest, startedAt time.Time, instances []store.AppInstance) ([]store.AppInstance, error) {
+	targets := mysqlInstallCredentialTargetServerIDs(req)
+	topology := normalizedInstallTopology(req.Topology)
+	if req.App != "mysql" || startedAt.IsZero() || (topology == "standalone" && len(targets) != 1) || (topology == "innodb-cluster" && len(targets) < 3) {
+		return nil, store.ErrMySQLInstallAdminCredentialBinding
+	}
+	if topology != "standalone" && topology != "innodb-cluster" {
+		return nil, store.ErrMySQLInstallAdminCredentialBinding
+	}
+	owned := make([]store.AppInstance, 0, len(targets))
+	seen := map[string]bool{}
+	clusterID := ""
+	for _, serverID := range targets {
+		instance, ok := uniqueInstallInstanceCreatedAfter(instances, req.App, req.Version, serverID, topology, startedAt)
+		if !ok || seen[instance.ID] {
+			return nil, store.ErrMySQLInstallAdminCredentialBinding
+		}
+		seen[instance.ID] = true
+		if topology == "innodb-cluster" {
+			candidateClusterID := mysqlClusterID(instance)
+			if candidateClusterID == "" || (clusterID != "" && candidateClusterID != clusterID) {
+				return nil, store.ErrMySQLInstallAdminCredentialBinding
+			}
+			clusterID = candidateClusterID
+		}
+		owned = append(owned, instance)
+	}
+	return owned, nil
 }
 
 func (a *API) bindSelectedInstallCredentialReferences(app string, req registry.InstallRequest) {

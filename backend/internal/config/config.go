@@ -12,6 +12,8 @@ type Config struct {
 	ResourceDir                    string `json:"resourceDir"`
 	DatabasePath                   string `json:"databasePath"`
 	DatabaseBackupDir              string `json:"databaseBackupDir"`
+	MySQLBackupDir                 string `json:"mysqlBackupDir"`
+	MySQLBackupKeepLast            int    `json:"mysqlBackupKeepLast"`
 	DiagnosticExportDir            string `json:"diagnosticExportDir"`
 	DiagnosticExportRetentionHours int    `json:"diagnosticExportRetentionHours"`
 	DiagnosticExportQuotaBytes     int64  `json:"diagnosticExportQuotaBytes"`
@@ -53,6 +55,8 @@ func Load() Config {
 		ResourceDir:                    getenv("AIFAR_RESOURCE_DIR", filepath.Join(root, "resources")),
 		DatabasePath:                   databasePath,
 		DatabaseBackupDir:              getenv("AIFAR_DATABASE_BACKUP_DIR", filepath.Join(filepath.Dir(databasePath), "backups")),
+		MySQLBackupDir:                 getenv("AIFAR_MYSQL_BACKUP_DIR", filepath.Join(root, "data", "mysql-backups")),
+		MySQLBackupKeepLast:            getenvInt("AIFAR_MYSQL_BACKUP_KEEP_LAST", 5),
 		DiagnosticExportDir:            getenv("AIFAR_DIAGNOSTIC_EXPORT_DIR", filepath.Join(filepath.Dir(databasePath), "diagnostic-exports")),
 		DiagnosticExportRetentionHours: getenvInt("AIFAR_DIAGNOSTIC_EXPORT_RETENTION_HOURS", 24),
 		DiagnosticExportQuotaBytes:     getenvInt64("AIFAR_DIAGNOSTIC_EXPORT_QUOTA_BYTES", 5*1024*1024*1024),

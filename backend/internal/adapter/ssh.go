@@ -47,6 +47,10 @@ func (SSHRemote) StreamCommand(ctx context.Context, server store.Server, command
 	return StreamSSHCommand(ctx, server, command, dst)
 }
 
+func (SSHRemote) DownloadFile(ctx context.Context, server store.Server, remotePath, localPath string, mode os.FileMode) (DownloadResult, error) {
+	return DownloadSSHFile(ctx, server, remotePath, localPath, mode)
+}
+
 func ProbeSSH(ctx context.Context, server store.Server) error {
 	client, err := dialSSH(ctx, server)
 	if err != nil {

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"time"
@@ -32,7 +33,7 @@ func NewInstaller(remote Remote) Installer {
 	return Installer{remote: remote}
 }
 
-func (i Installer) Install(ctx context.Context, server store.Server, bundle Bundle, req InstallOptions, log Logger) error {
+func (i Installer) Install(ctx context.Context, server store.Server, bundle Bundle, req InstallOptions, log Logger) (retErr error) {
 	if err := VerifyBundle(bundle); err != nil {
 		return err
 	}
@@ -43,10 +44,30 @@ func (i Installer) Install(ctx context.Context, server store.Server, bundle Bund
 	workDir := installerkit.WorkDir(deployDir, "mysql", bundle.Version, time.Now())
 	installRoot := installerkit.InstallRoot(deployDir, "mysql")
 	archiveRemote := workDir + "/" + filepath.Base(bundle.ArchivePath)
+	credentialRemote := path.Join(workDir, "mysql-credential.context")
+	credentialLocal, err := writeMySQLInstallCredentialContext(req.RootUser, req.RootPassword)
+	if err != nil {
+		return errors.New("unable to create MySQL install credential context")
+	}
+	remotePrepared := false
+	credentialsCleaned := false
+	defer func() {
+		if credentialsCleaned {
+			return
+		}
+		if cleanupErr := i.cleanupInstallCredentials(ctx, server, workDir, credentialLocal, remotePrepared); cleanupErr != nil {
+			retErr = errors.Join(retErr, cleanupErr)
+		}
+	}()
 
 	log.Info("prepare MySQL work directory: %s", workDir)
-	if _, err := i.run(ctx, server, "mkdir -p "+installerkit.ShellQuote(workDir+"/rpms"), log); err != nil {
+	prepareWork := "set -eu; install -d -m 0700 " + installerkit.ShellQuote(workDir) + "; test ! -L " + installerkit.ShellQuote(workDir) + "; install -d -m 0700 " + installerkit.ShellQuote(workDir+"/rpms") + "; test ! -L " + installerkit.ShellQuote(workDir+"/rpms")
+	if _, err := i.run(ctx, server, prepareWork, log); err != nil {
 		return err
+	}
+	remotePrepared = true
+	if err := i.remote.UploadFile(ctx, server, credentialLocal, credentialRemote, 0o600); err != nil {
+		return errors.New("upload MySQL credential context failed")
 	}
 
 	if err := uploadkit.Upload(ctx, i.remote, server, uploadkit.File{
@@ -65,15 +86,13 @@ func (i Installer) Install(ctx context.Context, server store.Server, bundle Bund
 	}
 
 	script, err := installStandaloneScript(InstallScriptRequest{
-		Version:      bundle.Version,
-		WorkDir:      workDir,
-		ArchivePath:  archiveRemote,
-		InstallRoot:  installRoot,
-		ReportHost:   strings.TrimSpace(server.Host),
-		Port:         req.Port,
-		ServerID:     mysqlServerID(server, req.Port),
-		RootUser:     req.RootUser,
-		RootPassword: req.RootPassword,
+		Version:     bundle.Version,
+		WorkDir:     workDir,
+		ArchivePath: archiveRemote,
+		InstallRoot: installRoot,
+		ReportHost:  strings.TrimSpace(server.Host),
+		Port:        req.Port,
+		ServerID:    mysqlServerID(server, req.Port),
 	})
 	if err != nil {
 		return err
@@ -93,30 +112,127 @@ func (i Installer) Install(ctx context.Context, server store.Server, bundle Bund
 	}, log); err != nil {
 		return err
 	}
-	log.Info("install MySQL service")
-	if _, err := i.run(ctx, server, "sh "+installerkit.ShellQuote(scriptRemote), log); err != nil {
+	secureLog := mysqlSanitizedLogger{base: log, secrets: []string{req.RootPassword}}
+	secureLog.Info("install MySQL service")
+	result, err := i.runSanitizedCapture(ctx, server, "sh "+installerkit.ShellQuote(scriptRemote)+" "+installerkit.ShellQuote(credentialRemote), secureLog, req.RootPassword)
+	if err != nil {
 		return err
 	}
-	log.Info("MySQL %s installed and verified on port %d", bundle.Version, req.Port)
+	cleanupErr := i.cleanupInstallCredentials(ctx, server, workDir, credentialLocal, remotePrepared)
+	credentialsCleaned = true
+	if cleanupErr != nil {
+		return cleanupErr
+	}
+	installerkit.LogCommandResult(result, nil, secureLog)
+	secureLog.Info("MySQL %s installed and verified on port %d", bundle.Version, req.Port)
 	return nil
 }
 
 func (i Installer) BootstrapInnoDBCluster(ctx context.Context, server store.Server, req InnoDBClusterBootstrapRequest, log Logger) error {
-	script, err := bootstrapInnoDBClusterScript(req)
-	if err != nil {
-		return err
+	connections := make([]mysqlConnectionCredential, 0, len(req.Nodes))
+	for _, node := range req.Nodes {
+		connections = append(connections, mysqlConnectionCredential{Host: node.Host, Port: node.Port, User: req.RootUser, Password: req.RootPassword})
 	}
-	_, err = i.run(ctx, server, "sh -s <<'AIFAR_MYSQL_INNODB_CLUSTER'\n"+script+"\nAIFAR_MYSQL_INNODB_CLUSTER", log)
-	return err
+	return i.runClusterCredentialScript(ctx, server, "bootstrap", connections, log, func(work, credentialPath string) (string, error) {
+		return bootstrapInnoDBClusterScript(InnoDBClusterBootstrapScriptRequest{
+			ClusterName: req.ClusterName, InstallRoot: req.InstallRoot, CredentialContextPath: credentialPath, Nodes: req.Nodes,
+		})
+	})
 }
 
 func (i Installer) StartInnoDBCluster(ctx context.Context, server store.Server, req InnoDBClusterStartRequest, log Logger) error {
-	script, err := startInnoDBClusterScript(req)
+	connections := req.Connections
+	return i.runClusterCredentialScript(ctx, server, "start", connections, log, func(work, credentialPath string) (string, error) {
+		return startInnoDBClusterScript(InnoDBClusterStartScriptRequest{
+			ClusterName: req.ClusterName, InstallRoot: req.InstallRoot, CredentialContextPath: credentialPath, Nodes: req.Nodes,
+		})
+	})
+}
+
+func (i Installer) runClusterCredentialScript(ctx context.Context, server store.Server, action string, connections []mysqlConnectionCredential, log Logger, render func(work, credentialPath string) (string, error)) (retErr error) {
+	if len(connections) == 0 {
+		return mysqlOperationError(MySQLCredentialUnavailable)
+	}
+	workDir := installerkit.WorkDir(installerkit.RemoteDeployDir(server.DeployDir), "mysql-credential-"+action, "context", time.Now())
+	credentialRemote := path.Join(workDir, "credential-context.json")
+	scriptRemote := path.Join(workDir, action+"-cluster.sh")
+	credentialLocal, err := writeMySQLJSONCredentialContext(connections)
+	if err != nil {
+		return errors.New("unable to create MySQL credential context")
+	}
+	remotePrepared := false
+	credentialsCleaned := false
+	defer func() {
+		if credentialsCleaned {
+			return
+		}
+		if cleanupErr := i.cleanupCredentialWork(ctx, server, workDir, credentialLocal, remotePrepared); cleanupErr != nil {
+			retErr = errors.Join(retErr, cleanupErr)
+		}
+	}()
+	if _, err := i.remote.Run(ctx, server, "set -eu; install -d -m 0700 "+installerkit.ShellQuote(workDir)+"; test ! -L "+installerkit.ShellQuote(workDir)); err != nil {
+		return errors.New("unable to prepare MySQL credential work directory")
+	}
+	remotePrepared = true
+	if err := i.remote.UploadFile(ctx, server, credentialLocal, credentialRemote, 0o600); err != nil {
+		return errors.New("upload MySQL credential context failed")
+	}
+	script, err := render(workDir, credentialRemote)
 	if err != nil {
 		return err
 	}
-	_, err = i.run(ctx, server, "sh -s <<'AIFAR_MYSQL_INNODB_CLUSTER_START'\n"+script+"\nAIFAR_MYSQL_INNODB_CLUSTER_START", log)
-	return err
+	scriptLocal, err := installerkit.WriteTempScript("aifar-mysql-"+action+"-*.sh", script)
+	if err != nil {
+		return err
+	}
+	defer os.Remove(scriptLocal)
+	if err := i.remote.UploadFile(ctx, server, scriptLocal, scriptRemote, 0o700); err != nil {
+		return errors.New("upload MySQL cluster script failed")
+	}
+	secrets := mysqlCredentialSecrets(connections)
+	secureLog := mysqlSanitizedLogger{base: log, secrets: secrets}
+	result, err := i.runSanitizedCapture(ctx, server, "sh "+installerkit.ShellQuote(scriptRemote), secureLog, secrets...)
+	if err != nil {
+		return err
+	}
+	cleanupErr := i.cleanupCredentialWork(ctx, server, workDir, credentialLocal, remotePrepared)
+	credentialsCleaned = true
+	if cleanupErr != nil {
+		return cleanupErr
+	}
+	installerkit.LogCommandResult(result, nil, secureLog)
+	return nil
+}
+
+func (i Installer) cleanupInstallCredentials(ctx context.Context, server store.Server, workDir, localPath string, remotePrepared bool) error {
+	var cleanupErrors []error
+	if remotePrepared {
+		cleanupCtx, cancel := mysqlCredentialCleanupContext(ctx)
+		command := "set -eu; rm -f -- " + installerkit.ShellQuote(path.Join(workDir, "mysql-credential.context")) + " " + installerkit.ShellQuote(path.Join(workDir, "secure-root.sql")) + " " + installerkit.ShellQuote(path.Join(workDir, "secure-client.cnf"))
+		if _, err := i.remote.Run(cleanupCtx, server, command); err != nil {
+			cleanupErrors = append(cleanupErrors, errors.New("unable to clean remote MySQL install credentials"))
+		}
+		cancel()
+	}
+	if err := removeMySQLCredentialContext(localPath); err != nil {
+		cleanupErrors = append(cleanupErrors, errors.New("unable to clean local MySQL install credentials"))
+	}
+	return errors.Join(cleanupErrors...)
+}
+
+func (i Installer) cleanupCredentialWork(ctx context.Context, server store.Server, workDir, localPath string, remotePrepared bool) error {
+	var cleanupErrors []error
+	if remotePrepared {
+		cleanupCtx, cancel := mysqlCredentialCleanupContext(ctx)
+		if _, err := i.remote.Run(cleanupCtx, server, mysqlCredentialWorkCleanupCommand(workDir)); err != nil {
+			cleanupErrors = append(cleanupErrors, errors.New("unable to clean remote MySQL credential work directory"))
+		}
+		cancel()
+	}
+	if err := removeMySQLCredentialContext(localPath); err != nil {
+		cleanupErrors = append(cleanupErrors, errors.New("unable to clean local MySQL credential context"))
+	}
+	return errors.Join(cleanupErrors...)
 }
 
 func (o InstallOptions) Validate() error {
@@ -143,6 +259,28 @@ func (o InstallOptions) Validate() error {
 
 func (i Installer) run(ctx context.Context, server store.Server, command string, log Logger) (installerkit.CommandResult, error) {
 	return installerkit.Run(ctx, i.remote, server, command, log, "mysql remote command failed")
+}
+
+func (i Installer) runSanitized(ctx context.Context, server store.Server, command string, log Logger, secrets ...string) (installerkit.CommandResult, error) {
+	result, err := i.remote.Run(ctx, server, command)
+	result.Stdout = sanitizeMySQLCredentialText(result.Stdout, secrets...)
+	result.Stderr = sanitizeMySQLCredentialText(result.Stderr, secrets...)
+	installerkit.LogCommandResult(result, err, log)
+	if err != nil {
+		return result, errors.New("mysql remote command failed")
+	}
+	return result, nil
+}
+
+func (i Installer) runSanitizedCapture(ctx context.Context, server store.Server, command string, log Logger, secrets ...string) (installerkit.CommandResult, error) {
+	result, err := i.remote.Run(ctx, server, command)
+	result.Stdout = sanitizeMySQLCredentialText(result.Stdout, secrets...)
+	result.Stderr = sanitizeMySQLCredentialText(result.Stderr, secrets...)
+	if err != nil {
+		installerkit.LogCommandResult(result, err, log)
+		return result, errors.New("mysql remote command failed")
+	}
+	return result, nil
 }
 
 func mysqlServerID(server store.Server, port int) uint32 {

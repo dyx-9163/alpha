@@ -3,8 +3,35 @@ set -eu
 
 CLUSTER_NAME={{shq .ClusterName}}
 INSTALL_ROOT={{shq .InstallRoot}}
-ROOT_USER={{shq .RootUser}}
-ROOT_PASSWORD={{shq .RootPassword}}
+CREDENTIAL_CONTEXT={{shq .CredentialContextPath}}
+JS_FILE="${CREDENTIAL_CONTEXT%/*}/start-cluster.js"
+umask 077
+
+cleanup_secret_artifacts() {
+  cleanup_status=0
+  rm -f -- "$JS_FILE" || cleanup_status=1
+  rm -f -- "$CREDENTIAL_CONTEXT" || cleanup_status=1
+  return "$cleanup_status"
+}
+
+finish() {
+  status=$?
+  trap - EXIT HUP INT TERM
+  if ! cleanup_secret_artifacts; then
+    status=1
+  fi
+  exit "$status"
+}
+trap finish EXIT
+trap 'exit 1' HUP INT TERM
+
+case "$CREDENTIAL_CONTEXT" in
+  */_work/mysql-credential-*/*) ;;
+  *) echo "invalid MySQL credential context"; exit 1 ;;
+esac
+[ -f "$CREDENTIAL_CONTEXT" ] && [ ! -L "$CREDENTIAL_CONTEXT" ] || { echo "invalid MySQL credential context"; exit 1; }
+[ "$(stat -c '%u' "$CREDENTIAL_CONTEXT")" = "$(id -u)" ] || { echo "invalid MySQL credential context owner"; exit 1; }
+[ "$(stat -c '%a' "$CREDENTIAL_CONTEXT")" = "600" ] || { echo "invalid MySQL credential context mode"; exit 1; }
 
 echo "checking MySQL Shell"
 MYSQLSH="$INSTALL_ROOT/mysql-shell/bin/mysqlsh"
@@ -16,17 +43,26 @@ if [ -z "$MYSQLSH" ] || [ ! -x "$MYSQLSH" ]; then
   exit 1
 fi
 
-JS_FILE="$(mktemp /tmp/aifar-mysql-innodb-start-XXXXXX.js)"
-cat > "$JS_FILE" <<'JS'
+rm -f -- "$JS_FILE"
+(umask 077; cat > "$JS_FILE" <<'JS'
 const clusterName = {{printf "%q" .ClusterName}};
-const rootUser = {{printf "%q" .RootUser}};
-const rootPassword = {{printf "%q" .RootPassword}};
+const credentialPath = {{printf "%q" .CredentialContextPath}};
 const nodes = [
 {{range .Nodes}}  { host: {{printf "%q" .Host}}, port: {{.Port}} },
 {{end}}];
 
-function uri(node) {
-  return rootUser + ':' + rootPassword + '@' + node.host + ':' + node.port;
+const credentialContext = JSON.parse(os.loadTextFile(credentialPath));
+if (credentialContext.version !== 1 || !Array.isArray(credentialContext.connections)) {
+  throw new Error('invalid MySQL credential context');
+}
+
+function connection(node) {
+  const matches = credentialContext.connections.filter((candidate) =>
+	candidate.host === node.host && Number(candidate.port) === Number(node.port));
+  if (matches.length !== 1 || !matches[0].user || !matches[0].password) {
+	throw new Error('missing MySQL member credential');
+  }
+  return {scheme: 'mysql', host: node.host, port: Number(node.port), user: matches[0].user, password: matches[0].password};
 }
 
 function messageOf(error) {
@@ -42,17 +78,45 @@ function isAlreadyReady(message) {
     value.indexOf('current instance') >= 0;
 }
 
-shell.connect(uri(nodes[0]));
-
-function fetchFirstColumn(sql) {
+function fetchFirstColumn(sql, args) {
   const rows = [];
-  const result = session.runSql(sql);
+  const result = session.runSql(sql, args || []);
   let row;
   while ((row = result.fetchOne())) {
     rows.push(String(row[0]));
   }
   return rows;
 }
+
+const gtidSnapshots = nodes.map((node) => {
+  shell.connect(connection(node));
+  const rows = fetchFirstColumn('SELECT @@GLOBAL.gtid_executed');
+  if (rows.length !== 1 || !rows[0]) {
+    throw new Error('unable to read a non-empty GTID set from every cluster member');
+  }
+  return {node: node, gtid: rows[0]};
+});
+
+const candidates = [];
+for (const candidate of gtidSnapshots) {
+  shell.connect(connection(candidate.node));
+  let coversEveryMember = true;
+  for (const observed of gtidSnapshots) {
+    const subset = fetchFirstColumn('SELECT GTID_SUBSET(?, ?)', [observed.gtid, candidate.gtid]);
+    if (subset.length !== 1 || subset[0] !== '1') {
+      coversEveryMember = false;
+      break;
+    }
+  }
+  if (coversEveryMember) {
+    candidates.push(candidate);
+  }
+}
+if (candidates.length !== 1) {
+  throw new Error('complete-outage recovery requires one unique GTID-superset member');
+}
+const seed = candidates[0].node;
+shell.connect(connection(seed));
 
 function assertGroupReplicationTableKeys() {
   const missingKeys = fetchFirstColumn(`
@@ -97,27 +161,17 @@ ORDER BY t.table_schema, t.table_name`);
 
 assertGroupReplicationTableKeys();
 
-let cluster;
-try {
-  print('attempting InnoDB Cluster reboot from complete outage: ' + clusterName);
-  cluster = dba.rebootClusterFromCompleteOutage(clusterName);
-  print('InnoDB Cluster complete-outage reboot completed: ' + clusterName);
-} catch (e) {
-  const rebootMessage = messageOf(e);
-  print('complete-outage reboot was not applied: ' + rebootMessage);
-  try {
-    cluster = dba.getCluster(clusterName);
-    print('existing InnoDB Cluster metadata loaded: ' + clusterName);
-  } catch (inner) {
-    throw e;
-  }
-}
+print('validating InnoDB Cluster complete-outage reboot without mutation: ' + clusterName);
+dba.rebootClusterFromCompleteOutage(clusterName, {dryRun: true});
+print('attempting InnoDB Cluster reboot from the unique GTID-superset member: ' + clusterName);
+const cluster = dba.rebootClusterFromCompleteOutage(clusterName);
+print('InnoDB Cluster complete-outage reboot completed: ' + clusterName);
 
 const failures = [];
 for (const node of nodes) {
-  const instanceUri = uri(node);
+	const instanceConnection = connection(node);
   try {
-    cluster.rejoinInstance(instanceUri, { interactive: false });
+	cluster.rejoinInstance(instanceConnection, { interactive: false });
     print('rejoined MySQL instance: ' + node.host + ':' + node.port);
   } catch (e) {
     const message = messageOf(e);
@@ -136,7 +190,11 @@ if (failures.length > 0) {
 
 cluster.status({ extended: 1 });
 JS
+)
 
 "$MYSQLSH" --js --file "$JS_FILE"
-rm -f "$JS_FILE"
+if ! cleanup_secret_artifacts; then
+  exit 1
+fi
+trap - EXIT HUP INT TERM
 echo "MySQL InnoDB Cluster start completed: $CLUSTER_NAME"

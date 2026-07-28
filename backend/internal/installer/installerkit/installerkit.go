@@ -22,9 +22,15 @@ type Logger interface {
 
 type CommandResult = adapter.CommandResult
 
+type DownloadResult = adapter.DownloadResult
+
 type Remote interface {
 	Run(ctx context.Context, server store.Server, command string) (adapter.CommandResult, error)
 	UploadFile(ctx context.Context, server store.Server, localPath, remotePath string, mode os.FileMode) error
+}
+
+type FileDownloader interface {
+	DownloadFile(ctx context.Context, server store.Server, remotePath, localPath string, mode os.FileMode) (DownloadResult, error)
 }
 
 const TemplateDirEnv = "AIFAR_INSTALLER_TEMPLATE_DIR"

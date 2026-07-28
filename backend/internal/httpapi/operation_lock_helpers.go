@@ -23,6 +23,8 @@ type operationLockSpec struct {
 	Metadata   string
 }
 
+var errMySQLClusterLockIdentity = errors.New("MySQL cluster mutation requires a raw clusterId")
+
 func (a *API) acquireTaskOperationLocks(w http.ResponseWriter, lang string, task store.Task, specs []operationLockSpec) ([]store.OperationLock, bool) {
 	locks := make([]store.OperationLock, 0, len(specs))
 	seen := map[string]bool{}
@@ -100,6 +102,17 @@ func appInstallOperationLockSpecs(app string, serverIDs []string) []operationLoc
 	return specs
 }
 
+func credentialOperationLockSpecs(action, credentialID string) []operationLockSpec {
+	credentialID = strings.TrimSpace(credentialID)
+	if credentialID == "" {
+		return nil
+	}
+	return []operationLockSpec{{
+		Scope: "credential", ResourceID: credentialID, Operation: operationLockMutation,
+		Metadata: operationLockMetadata(map[string]any{"action": action, "credentialId": credentialID}),
+	}}
+}
+
 func appInstanceOperationLockSpecs(action string, instances []store.AppInstance) []operationLockSpec {
 	specs := make([]operationLockSpec, 0, len(instances))
 	for _, instance := range instances {
@@ -132,6 +145,59 @@ func aifarRuntimeMutationLockSpec(action string, instance store.AppInstance) ope
 			"serverId":   instance.ServerID,
 		}),
 	}
+}
+
+func mysqlBackupOperationLockSpecs(instance store.AppInstance) []operationLockSpec {
+	if clusterID := mysqlClusterID(instance); clusterID != "" && strings.EqualFold(strings.TrimSpace(instance.Topology), "innodb-cluster") {
+		return []operationLockSpec{{
+			Scope: "app-cluster", ResourceID: clusterID, Operation: operationLockMutation,
+			Metadata: operationLockMetadata(map[string]any{"action": "mysql-backup", "app": "mysql", "clusterId": clusterID}),
+		}}
+	}
+	return appInstanceOperationLockSpecs("mysql-backup", []store.AppInstance{instance})
+}
+
+func mysqlClusterOperationLockSpecs(action string, instance store.AppInstance) []operationLockSpec {
+	if clusterID := mysqlClusterID(instance); clusterID != "" && strings.EqualFold(strings.TrimSpace(instance.Topology), "innodb-cluster") {
+		return []operationLockSpec{{
+			Scope: "app-cluster", ResourceID: clusterID, Operation: operationLockMutation,
+			Metadata: operationLockMetadata(map[string]any{"action": action, "app": "mysql", "clusterId": clusterID}),
+		}}
+	}
+	return appInstanceOperationLockSpecs(action, []store.AppInstance{instance})
+}
+
+// appMutationOperationLockSpecs keeps every mutation for a MySQL cluster on
+// its one authoritative raw-cluster lock. Other applications and standalone
+// MySQL retain their existing per-instance serialization.
+func appMutationOperationLockSpecs(action string, instances []store.AppInstance) []operationLockSpec {
+	specs := make([]operationLockSpec, 0, len(instances))
+	seenClusters := map[string]bool{}
+	for _, instance := range instances {
+		if strings.EqualFold(strings.TrimSpace(instance.App), "mysql") && strings.EqualFold(strings.TrimSpace(instance.Topology), "innodb-cluster") {
+			clusterID := mysqlClusterID(instance)
+			if clusterID != "" && !seenClusters[clusterID] {
+				seenClusters[clusterID] = true
+				specs = append(specs, mysqlClusterOperationLockSpecs(action, instance)...)
+			}
+			continue
+		}
+		specs = append(specs, appInstanceOperationLockSpecs(action, []store.AppInstance{instance})...)
+	}
+	return specs
+}
+
+// validatedAppMutationOperationLockSpecs refuses an InnoDB Cluster mutation
+// when the persisted instance metadata does not contain one raw string
+// clusterId. Falling back to an instance lock would break cross-member lock
+// closure for destructive operations.
+func validatedAppMutationOperationLockSpecs(action string, instances []store.AppInstance) ([]operationLockSpec, error) {
+	for _, instance := range instances {
+		if strings.EqualFold(strings.TrimSpace(instance.App), "mysql") && strings.EqualFold(strings.TrimSpace(instance.Topology), "innodb-cluster") && mysqlClusterID(instance) == "" {
+			return nil, errMySQLClusterLockIdentity
+		}
+	}
+	return appMutationOperationLockSpecs(action, instances), nil
 }
 
 func operationLockMetadata(fields map[string]any) string {

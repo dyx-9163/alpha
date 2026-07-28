@@ -13,6 +13,12 @@ import (
 
 const maxCredentialVersions = 3
 
+var (
+	ErrBoundCredentialNotFound      = errors.New("bound credential not found")
+	ErrBoundCredentialSecretMissing = errors.New("bound credential secret is missing")
+	ErrBoundCredentialAmbiguous     = errors.New("bound credential is ambiguous")
+)
+
 func (s *Store) ListCredentials(query CredentialQuery) ([]Credential, error) {
 	clauses := []string{"1=1"}
 	args := []any{}
@@ -78,6 +84,49 @@ func (s *Store) GetCredential(id string, includeSecret bool) (Credential, error)
 		item.Secret = secret
 	}
 	return item, nil
+}
+
+func (s *Store) GetBoundCredential(appInstanceID, purpose string, includeSecret bool) (Credential, error) {
+	rows, err := s.db.Query(`select c.id,c.name,c.kind,coalesce(c.username,''),coalesce(c.endpoint,''),c.scope,c.status,
+		coalesce(c.app,''),coalesce(c.server_id,''),cb.app_instance_id,cb.purpose,coalesce(c.tags,''),
+		coalesce(c.secret_cipher,''),c.current_version,coalesce(c.created_by,''),c.created_at,c.updated_at
+		from credential_bindings cb join credentials c on c.id=cb.credential_id
+		where cb.app_instance_id=? and cb.purpose=? and c.status='active'
+		order by cb.created_at asc, cb.id asc, c.id asc`, strings.TrimSpace(appInstanceID), strings.TrimSpace(purpose))
+	if err != nil {
+		return Credential{}, err
+	}
+	defer rows.Close()
+	items := []Credential{}
+	ciphers := []string{}
+	for rows.Next() {
+		item, cipher, err := scanCredentialWithCipher(rows)
+		if err != nil {
+			return Credential{}, err
+		}
+		items = append(items, item)
+		ciphers = append(ciphers, cipher)
+	}
+	if err := rows.Err(); err != nil {
+		return Credential{}, err
+	}
+	if len(items) == 0 {
+		return Credential{}, ErrBoundCredentialNotFound
+	}
+	if len(items) > 1 {
+		return Credential{}, ErrBoundCredentialAmbiguous
+	}
+	if strings.TrimSpace(ciphers[0]) == "" {
+		return Credential{}, ErrBoundCredentialSecretMissing
+	}
+	if includeSecret {
+		secret, err := s.decodeCredentialSecret(ciphers[0])
+		if err != nil {
+			return Credential{}, err
+		}
+		items[0].Secret = secret
+	}
+	return items[0], nil
 }
 
 func (s *Store) SaveCredential(item Credential) (Credential, error) {
@@ -255,16 +304,23 @@ func cleanupStaleCredentialReferencesTx(tx *sql.Tx) error {
 func scanCredential(rows interface {
 	Scan(dest ...any) error
 }) (Credential, error) {
+	item, _, err := scanCredentialWithCipher(rows)
+	return item, err
+}
+
+func scanCredentialWithCipher(rows interface {
+	Scan(dest ...any) error
+}) (Credential, string, error) {
 	var item Credential
 	var cipher string
 	err := rows.Scan(&item.ID, &item.Name, &item.Kind, &item.Username, &item.Endpoint, &item.Scope, &item.Status,
 		&item.App, &item.ServerID, &item.AppInstanceID, &item.Purpose, &item.Tags, &cipher, &item.CurrentVersion, &item.CreatedBy, &item.CreatedAt, &item.UpdatedAt)
 	if err != nil {
-		return Credential{}, err
+		return Credential{}, "", err
 	}
 	item.HasSecret = strings.TrimSpace(cipher) != ""
 	item.SecretPreview = credentialSecretPreview(item)
-	return item, nil
+	return item, cipher, nil
 }
 
 func (s *Store) encodeCredentialSecret(secret map[string]string) (string, string, error) {

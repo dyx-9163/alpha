@@ -24,11 +24,7 @@ func passwordParam(params map[string]any, fallback string) string {
 			}
 		}
 	}
-	fallback = strings.TrimSpace(fallback)
-	if fallback == "" {
-		return "Oversea.123"
-	}
-	return fallback
+	return ""
 }
 
 func mysqlClusterName(params map[string]any) string {

@@ -1,0 +1,143 @@
+package mysql
+
+import "time"
+
+const (
+	MySQLCredentialUnavailable              = "MYSQL_CREDENTIAL_UNAVAILABLE"
+	MySQLBackupUnsupportedTopology          = "MYSQL_BACKUP_UNSUPPORTED_TOPOLOGY"
+	MySQLBackupClusterUnhealthy             = "MYSQL_BACKUP_CLUSTER_UNHEALTHY"
+	MySQLBackupPrimaryNotFound              = "MYSQL_BACKUP_PRIMARY_NOT_FOUND"
+	MySQLBackupSpaceInsufficient            = "MYSQL_BACKUP_SPACE_INSUFFICIENT"
+	MySQLBackupTransferFailed               = "MYSQL_BACKUP_TRANSFER_FAILED"
+	MySQLBackupChecksumMismatch             = "MYSQL_BACKUP_CHECKSUM_MISMATCH"
+	MySQLBackupStandaloneRequired           = "MYSQL_BACKUP_STANDALONE_REQUIRED"
+	MySQLBackupVerifyNotAllowed             = "MYSQL_BACKUP_VERIFY_NOT_ALLOWED"
+	MySQLBackupVerifyFailed                 = "MYSQL_BACKUP_VERIFY_FAILED"
+	MySQLBackupVerificationRecordFailed     = "MYSQL_BACKUP_VERIFICATION_RECORD_FAILED"
+	MySQLBackupRetentionCleanupFailed       = "MYSQL_BACKUP_RETENTION_CLEANUP_FAILED"
+	MySQLRestoreMaintenanceRequired         = "MYSQL_RESTORE_MAINTENANCE_REQUIRED"
+	MySQLRestoreVersionIncompatible         = "MYSQL_RESTORE_VERSION_INCOMPATIBLE"
+	MySQLRestoreManifestInvalid             = "MYSQL_RESTORE_MANIFEST_INVALID"
+	MySQLRestoreTargetNotClean              = "MYSQL_RESTORE_TARGET_NOT_CLEAN"
+	MySQLRestorePrimaryChanged              = "MYSQL_RESTORE_PRIMARY_CHANGED"
+	MySQLLocalInfileRestoreFailed           = "MYSQL_LOCAL_INFILE_RESTORE_FAILED"
+	MySQLReconciliationRequired             = "MYSQL_RECONCILIATION_REQUIRED"
+	MySQLReconciliationConfirmationRequired = "MYSQL_RECONCILIATION_CONFIRMATION_REQUIRED"
+	MySQLReconciliationNotRequired          = "MYSQL_RECONCILIATION_NOT_REQUIRED"
+	// MySQLRestoreLocalInfileRestoreFailed is retained only to recognize and
+	// translate historical tasks. New restore work must not emit it.
+	MySQLRestoreLocalInfileRestoreFailed = "MYSQL_RESTORE_LOCAL_INFILE_RESTORE_FAILED"
+	MySQLRestoreIncomplete               = "MYSQL_RESTORE_INCOMPLETE"
+	MySQLRebuildConfirmationRequired     = "MYSQL_REBUILD_CONFIRMATION_REQUIRED"
+	MySQLRebuildRouterFailed             = "MYSQL_REBUILD_ROUTER_FAILED"
+	MySQLMaintenanceRequired             = "MYSQL_MAINTENANCE_REQUIRED"
+	MySQLMaintenanceStateInvalid         = "MYSQL_MAINTENANCE_STATE_INVALID"
+	MySQLMaintenanceStatePersistFailed   = "MYSQL_MAINTENANCE_STATE_PERSIST_FAILED"
+)
+
+// BackupManifest is the non-secret, portable description of a logical MySQL
+// backup. It is persisted alongside the archive and is intentionally limited
+// to provenance and compatibility data.
+type BackupManifest struct {
+	ManifestVersion   int                 `json:"manifestVersion,omitempty"`
+	BackupID          string              `json:"backupId"`
+	App               string              `json:"app"`
+	Topology          string              `json:"topology"`
+	InstanceID        string              `json:"instanceId"`
+	ClusterID         string              `json:"clusterId,omitempty"`
+	SourceServerID    string              `json:"sourceServerId"`
+	SourceEndpoint    string              `json:"sourceEndpoint"`
+	SourceServerUUID  string              `json:"sourceServerUuid"`
+	MySQLVersion      string              `json:"mysqlVersion"`
+	MySQLShellVersion string              `json:"mysqlShellVersion"`
+	Schemas           []string            `json:"schemas"`
+	ExcludedSchemas   []string            `json:"excludedSchemas"`
+	Consistent        bool                `json:"consistent"`
+	GTIDExecuted      string              `json:"gtidExecuted"`
+	Members           []ClusterMemberRef  `json:"members,omitempty"`
+	Routers           []RouterRef         `json:"routers,omitempty"`
+	CreatedAt         time.Time           `json:"createdAt"`
+	TaskID            string              `json:"taskId"`
+	Verification      *BackupVerification `json:"verification,omitempty"`
+}
+
+type BackupVerification struct {
+	Source             string                     `json:"source"`
+	InventoryAlgorithm string                     `json:"inventoryAlgorithm"`
+	InventorySHA256    string                     `json:"inventorySha256"`
+	Inventory          []BackupInventoryEntry     `json:"files"`
+	SchemaCount        int                        `json:"schemaCount"`
+	TableCount         int                        `json:"tableCount"`
+	Schemas            []BackupSchemaVerification `json:"schemas"`
+}
+
+type BackupInventoryEntry struct {
+	Path   string `json:"path"`
+	Size   int64  `json:"size"`
+	SHA256 string `json:"sha256"`
+}
+
+type BackupSchemaVerification struct {
+	Name       string                    `json:"name"`
+	TableCount int                       `json:"tableCount"`
+	Tables     []BackupTableVerification `json:"tables"`
+}
+
+type BackupTableVerification struct {
+	Name string `json:"name"`
+}
+
+// ClusterMemberRef contains only the public cluster member data required to
+// verify that a backup came from a healthy InnoDB Cluster primary.
+type ClusterMemberRef struct {
+	InstanceID string `json:"instanceId"`
+	ServerID   string `json:"serverId"`
+	Endpoint   string `json:"endpoint"`
+	Role       string `json:"role"`
+	Status     string `json:"status"`
+}
+
+// RouterRef records a Router summary without configuration or credentials.
+type RouterRef struct {
+	InstanceID string `json:"instanceId"`
+	ServerID   string `json:"serverId"`
+	Endpoint   string `json:"endpoint"`
+	Status     string `json:"status"`
+}
+
+// LogicalBackupScriptOptions contains the only renderable backup inputs. The
+// task ID is generated by the worker; all rendered paths are derived from it.
+type LogicalBackupScriptOptions struct {
+	TaskID      string
+	Threads     int
+	MaxRateMBps int
+}
+
+// LogicalRestoreScriptOptions contains the only renderable restore inputs.
+// The task ID is generated by the worker; all rendered paths are derived from
+// it and no caller-supplied path or secret is accepted.
+type LogicalRestoreScriptOptions struct {
+	TaskID  string
+	Threads int
+}
+
+// MySQLOperationError is safe for task and API exposure: it contains only a
+// stable code, never credential record details or decrypted secret material.
+type MySQLOperationError struct {
+	Code string
+}
+
+func (e *MySQLOperationError) Error() string {
+	return e.Code
+}
+
+func (e *MySQLOperationError) StableCode() string {
+	if e == nil {
+		return ""
+	}
+	return e.Code
+}
+
+func mysqlOperationError(code string) error {
+	return &MySQLOperationError{Code: code}
+}

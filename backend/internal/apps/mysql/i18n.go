@@ -1,6 +1,54 @@
 package mysql
 
-import "strings"
+import (
+	"strings"
+
+	globali18n "aifar-deployment/backend/internal/i18n"
+)
+
+// MySQLBackupErrorText turns an approved stable error code into a localized,
+// non-secret user message. Unknown codes intentionally fall back to the code.
+func MySQLBackupErrorText(lang, code string) string {
+	return globali18n.MySQLBackupErrorText(lang, code)
+}
+
+func restoreStepTitle(lang, name string) string {
+	return globali18n.Text(lang, "mysql.restore.step."+name)
+}
+
+type BackupCopy struct {
+	StepStart                string
+	StepDone                 string
+	StepFailed               string
+	RemoteCleanupFailed      string
+	RetentionSelected        string
+	RetentionCleanupFailed   string
+	VerificationFailed       string
+	VerificationRecordFailed string
+	StepTitles               map[string]string
+}
+
+func BackupCopyFor(lang string) BackupCopy {
+	names := []string{"load-instance", "acquire-instance-lock", "resolve-credential", "inspect-mysql", "check-backup-space", "prepare-workdir", "dry-run-dump", "dump-instance", "build-manifest", "package-backup", "transfer-backup", "verify-checksum", "record-backup", "apply-retention", "cleanup-workdir"}
+	titles := make(map[string]string, len(names))
+	for _, name := range names {
+		titles[name] = globali18n.Text(lang, "mysql.backup.step."+name)
+	}
+	for _, name := range []string{"load-backup", "verify-manifest", "verify-checksum", "record-verification"} {
+		titles[name] = globali18n.Text(lang, "mysql.backup.verify.step."+name)
+	}
+	return BackupCopy{
+		StepStart:                globali18n.Text(lang, "mysql.backup.stepStart"),
+		StepDone:                 globali18n.Text(lang, "mysql.backup.stepDone"),
+		StepFailed:               globali18n.Text(lang, "mysql.backup.stepFailed"),
+		RemoteCleanupFailed:      globali18n.Text(lang, "mysql.backup.remoteCleanupFailed"),
+		RetentionSelected:        globali18n.Text(lang, "mysql.backup.retentionSelected"),
+		RetentionCleanupFailed:   globali18n.Text(lang, "mysql.backup.retentionCleanupFailed"),
+		VerificationFailed:       globali18n.Text(lang, "mysql.backup.verificationFailed"),
+		VerificationRecordFailed: globali18n.Text(lang, "mysql.backup.verificationRecordFailed"),
+		StepTitles:               titles,
+	}
+}
 
 type Copy struct {
 	CategoryLabel         string

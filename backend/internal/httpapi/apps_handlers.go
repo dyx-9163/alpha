@@ -8,14 +8,26 @@ import (
 	"strings"
 
 	"aifar-deployment/backend/internal/appcatalog"
+	mysqlapp "aifar-deployment/backend/internal/apps/mysql"
 	"aifar-deployment/backend/internal/apps/registry"
 	"aifar-deployment/backend/internal/i18n"
+	"aifar-deployment/backend/internal/rbac"
 	"aifar-deployment/backend/internal/store"
 	"aifar-deployment/backend/internal/taskplan"
 	"aifar-deployment/backend/internal/worker"
 
 	"github.com/go-chi/chi/v5"
 )
+
+func (a *API) requireOwner(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if rbac.NormalizeRole(currentUser(r).Role) != "owner" {
+			writeError(w, http.StatusForbidden, "FORBIDDEN", i18n.Text(languageFromRequest(r), "api.permissionDenied"), map[string]any{"role": rbac.NormalizeRole(currentUser(r).Role)})
+			return
+		}
+		next(w, r)
+	}
+}
 
 func (a *API) appsCatalog(w http.ResponseWriter, r *http.Request) {
 	resources, err := a.store.ListResources()
@@ -73,6 +85,15 @@ func (a *API) deleteAppInstance(w http.ResponseWriter, r *http.Request) {
 	instance, err := a.store.GetAppInstance(id)
 	if err != nil {
 		respond(w, nil, err)
+		return
+	}
+	if code := a.mysqlOrdinaryLifecycleGate(instance); code != "" {
+		writeError(w, http.StatusConflict, code, i18n.MySQLBackupErrorText(lang, code), map[string]any{"instanceId": instance.ID})
+		return
+	}
+	lockSpecs, lockSpecErr := validatedAppMutationOperationLockSpecs("delete", []store.AppInstance{instance})
+	if lockSpecErr != nil {
+		writeError(w, http.StatusConflict, mysqlapp.MySQLBackupClusterUnhealthy, i18n.MySQLBackupErrorText(lang, mysqlapp.MySQLBackupClusterUnhealthy), map[string]any{"instanceId": instance.ID})
 		return
 	}
 	if !a.ensureCompleteDeleteSelection(w, lang, []store.AppInstance{instance}) {
@@ -142,7 +163,7 @@ func (a *API) deleteAppInstance(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "DELETE_PLAN_STORE_FAILED", err.Error(), map[string]any{"app": instance.App, "instanceId": instance.ID})
 		return
 	}
-	locks, ok := a.acquireTaskOperationLocks(w, lang, task, appInstanceOperationLockSpecs("delete", []store.AppInstance{instance}))
+	locks, ok := a.acquireTaskOperationLocks(w, lang, task, lockSpecs)
 	if !ok {
 		return
 	}
@@ -206,6 +227,10 @@ func (a *API) deleteAppInstances(w http.ResponseWriter, r *http.Request) {
 		}
 		if strings.TrimSpace(instance.ServerID) == "" {
 			writeError(w, http.StatusBadRequest, "INSTANCE_SERVER_REQUIRED", i18n.Text(lang, "api.instanceServerRequired"), map[string]any{"instanceId": id})
+			return
+		}
+		if code := a.mysqlOrdinaryLifecycleGate(instance); code != "" {
+			writeError(w, http.StatusConflict, code, i18n.MySQLBackupErrorText(lang, code), map[string]any{"instanceId": instance.ID})
 			return
 		}
 		server, err := a.store.GetServer(instance.ServerID, true)
@@ -291,7 +316,13 @@ func (a *API) deleteAppInstances(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "DELETE_PLAN_STORE_FAILED", err.Error(), map[string]any{"target": target})
 		return
 	}
-	locks, ok := a.acquireTaskOperationLocks(w, lang, task, appInstanceOperationLockSpecs("delete", selectedInstances))
+	lockSpecs, lockErr := validatedAppMutationOperationLockSpecs("delete", selectedInstances)
+	if lockErr != nil {
+		_ = a.store.DeleteTask(task.ID)
+		writeError(w, http.StatusConflict, mysqlapp.MySQLBackupClusterUnhealthy, i18n.MySQLBackupErrorText(lang, mysqlapp.MySQLBackupClusterUnhealthy), nil)
+		return
+	}
+	locks, ok := a.acquireTaskOperationLocks(w, lang, task, lockSpecs)
 	if !ok {
 		return
 	}
@@ -340,6 +371,10 @@ func (a *API) checkAppInstance(w http.ResponseWriter, r *http.Request) {
 		respond(w, nil, err)
 		return
 	}
+	if code := a.mysqlOrdinaryLifecycleGate(instance); code != "" {
+		writeError(w, http.StatusConflict, code, i18n.MySQLBackupErrorText(lang, code), map[string]any{"instanceId": instance.ID})
+		return
+	}
 	if strings.TrimSpace(instance.ServerID) == "" {
 		writeError(w, http.StatusBadRequest, "INSTANCE_SERVER_REQUIRED", i18n.Text(lang, "api.instanceServerRequired"), map[string]any{"instanceId": id})
 		return
@@ -382,10 +417,19 @@ func (a *API) checkAppInstance(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "CHECK_PLAN_STORE_FAILED", err.Error(), map[string]any{"app": instance.App, "instanceId": instance.ID})
 		return
 	}
+	var locks []store.OperationLock
+	if strings.EqualFold(strings.TrimSpace(instance.App), "mysql") {
+		var acquired bool
+		locks, acquired = a.acquireTaskOperationLocks(w, lang, task, mysqlClusterOperationLockSpecs("mysql-check", instance))
+		if !acquired {
+			return
+		}
+	}
 	task, err = a.tasks.StartExistingWithLanguage(task, lang, func(ctx context.Context, log worker.Logger) error {
 		log.Info(i18n.Text(lang, "api.checkInstanceRequested"), instance.App, instance.ID)
 		status, err := checkModule.Check(ctx, checkReq, registry.RunContext{
-			Log: log,
+			TaskID: task.ID,
+			Log:    log,
 			TargetLog: func(target string) registry.Logger {
 				return log.Target(target)
 			},
@@ -396,6 +440,9 @@ func (a *API) checkAppInstance(w http.ResponseWriter, r *http.Request) {
 		log.Info(i18n.Text(lang, "api.checkInstanceCompleted"), instance.App, instance.ID, status.Status)
 		return nil
 	})
+	if err != nil {
+		a.releaseOperationLocks(locks)
+	}
 	if err == nil {
 		a.audit(r, taskType, target, "running", task.ID)
 	}
@@ -503,7 +550,11 @@ func (a *API) installAppName(w http.ResponseWriter, r *http.Request, app string)
 		writeError(w, http.StatusInternalServerError, "INSTALL_PLAN_STORE_FAILED", err.Error(), map[string]any{"app": def.Name})
 		return
 	}
-	locks, ok := a.acquireTaskOperationLocks(w, lang, task, appInstallOperationLockSpecs(def.Name, serverIDs))
+	lockSpecs := appInstallOperationLockSpecs(def.Name, serverIDs)
+	if strings.EqualFold(def.Name, "mysql") {
+		lockSpecs = append(lockSpecs, credentialOperationLockSpecs("mysql-install", paramString(moduleReq.Parameters, "rootCredentialId", ""))...)
+	}
+	locks, ok := a.acquireTaskOperationLocks(w, lang, task, lockSpecs)
 	if !ok {
 		return
 	}
@@ -537,7 +588,18 @@ func (a *API) installAppName(w http.ResponseWriter, r *http.Request, app string)
 			}
 			return err
 		}
-		a.bindInstallCredentialReferences(def.Name, moduleReq, log)
+		if err := a.bindInstallCredentialReferences(def.Name, moduleReq, log, installStartedAt); err != nil {
+			marked, markErr := a.markRecordedInstallInstancesFailed(moduleReq, installStartedAt, task.ID, err)
+			if markErr != nil {
+				log.Error(i18n.Text(lang, "api.installFailedInstanceRecordFailed"), markErr)
+			}
+			if count, recordErr := a.recordFailedInstallInstances(ctx, moduleReq, installStartedAt, task.ID, err); recordErr != nil {
+				log.Error(i18n.Text(lang, "api.installFailedInstanceRecordFailed"), recordErr)
+			} else if count+marked > 0 {
+				log.Info(i18n.Text(lang, "api.installFailedInstanceRecorded"), count+marked)
+			}
+			return err
+		}
 		return nil
 	})
 	if err != nil {
