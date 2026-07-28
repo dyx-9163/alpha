@@ -5,14 +5,16 @@
         <el-option v-for="service in installedRuntimeServiceNamesList" :key="service" :label="service" :value="service" />
       </el-select>
       <div class="runtime-tab-actions">
-        <el-button size="small" :loading="loading" @click="refreshRuntimePods">{{ t('common.refresh') }}</el-button>
-        <el-button size="small" plain :loading="loading" @click="refreshRuntimePods">{{ t('containers.refreshPodStats') }}</el-button>
+        <el-button size="small" :loading="loading" @click="refreshRuntimePodBase">{{ t('common.refresh') }}</el-button>
+        <el-button size="small" plain @click="refreshRuntimePodMetrics">{{ t('containers.refreshPodStats') }}</el-button>
       </div>
     </div>
-    <div v-if="!runtimePodsLoadedForCurrentScope" class="runtime-lazy-state">
-      <el-button size="small" type="primary" plain :loading="loading" @click="refreshRuntimePods">{{ t('containers.loadPods') }}</el-button>
-    </div>
-    <el-table v-else :data="selectedRuntimePods" height="100%" row-key="containerName">
+    <el-table
+      :data="selectedRuntimePods"
+      :aria-busy="loading && !runtimePodsLoadedForCurrentScope"
+      height="100%"
+      row-key="containerName"
+    >
       <el-table-column prop="containerName" :label="t('containers.name')" min-width="260" show-overflow-tooltip />
       <el-table-column prop="serviceName" :label="t('containers.service')" width="120" show-overflow-tooltip />
       <el-table-column prop="status" :label="t('common.status')" width="120">
@@ -40,7 +42,6 @@
 <script setup lang="ts">
 import StatusTag from '../../components/StatusTag.vue'
 import { useAifarRuntimeContext } from './context'
-import { runtimePodLoadArgs } from './runtimePodLoading'
 
 const {
   t,
@@ -48,16 +49,13 @@ const {
   runtimePodServiceFilter,
   clearRuntimePodServiceFilter,
   installedRuntimeServiceNamesList,
-  ensureRuntimePodsLoaded,
   runtimePodsLoadedForCurrentScope,
   selectedRuntimePods,
+  refreshRuntimePodBase,
+  refreshRuntimePodMetrics,
   aifarRuntimeStatusKind,
   aifarRuntimeStatusLabel,
   percentText,
   openRuntimePodLogs
 } = useAifarRuntimeContext()
-
-function refreshRuntimePods() {
-  return ensureRuntimePodsLoaded(...runtimePodLoadArgs('refresh'))
-}
 </script>

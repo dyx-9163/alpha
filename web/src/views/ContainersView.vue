@@ -222,6 +222,8 @@ import {
   isRuntimeStatusEventForSelection
 } from '../containers/runtime/runtimeStatusRefresh'
 import { runtimePodLoadArgs } from '../containers/runtime/runtimePodLoading'
+import { mergeRuntimePodMetrics } from '../containers/runtime/runtimePodMetrics'
+import { createRuntimePodMetricsScheduler } from '../containers/runtime/runtimePodMetricsScheduler'
 import {
   buildAifarServiceOptions,
   buildRuntimeLogPodOptions,
@@ -409,9 +411,13 @@ const runtimeServiceMap = computed(() => buildRuntimeServiceMap(selectedRuntimeS
 const runtimePodsLoadedForCurrentScope = computed(() => Boolean(runtimePodsLoaded.value[runtimeCacheKey('pods')]))
 const runtimePodStatsLoadedForCurrentScope = computed(() => Boolean(runtimePodStatsLoaded.value[runtimeCacheKey('pods')]))
 const runtimeStatusRefresh = createRuntimeStatusRefreshScheduler(() => {
-  const podsActive = runtimeResourceTab.value === 'pods'
-  const [force, includeStats] = runtimePodLoadArgs('status-event')
-  return loadAifarRuntime(force, podsActive, podsActive && includeStats, true)
+  const podsActive = runtimePodsActive()
+  const [force, includeStats, background] = runtimePodLoadArgs('status-event')
+  return loadAifarRuntime(force, podsActive, podsActive && includeStats, background)
+})
+const runtimePodMetricsScheduler = createRuntimePodMetricsScheduler(async () => {
+  if (!runtimePodsActive()) return
+  await ensureRuntimePodsLoaded(...runtimePodLoadArgs('metrics'))
 })
 const runtimeLogsLoadedForCurrentScope = computed(() => Boolean(runtimeLogsLoaded.value[runtimeLogCacheKey()]))
 const runtimeLogGroups = computed(() => asArray<AifarRuntimeLogPod>(runtimeLogs.value.pods))
@@ -705,7 +711,7 @@ async function loadCollection(force = false) {
   collectionCache.value = { ...collectionCache.value, [key]: next }
 }
 
-async function loadAifarRuntime(force = false, includePods = runtimeResourceTab.value === 'pods', includeStats = includePods && runtimeResourceTab.value === 'pods', background = false) {
+async function loadAifarRuntime(force = false, includePods = runtimeResourceTab.value === 'pods', includeStats = false, background = false) {
   const execute = async () => {
     const query = targetQuery()
     if (!query) {
@@ -720,18 +726,26 @@ async function loadAifarRuntime(force = false, includePods = runtimeResourceTab.
       aifarRuntime.value = includePods ? runtimeCache.value[key] : { ...runtimeCache.value[key], pods: asArray<AifarRuntimePod>(aifarRuntime.value.pods) }
       return
     }
-    const next = await fetchAifarRuntime(query, { includePods, includeStats }).catch((err) => {
-      error.value = err.message
-      return { runtimeStatus: 'degraded', agent: { status: 'missing', error: err.message }, instances: [], services: [], pods: [], ingress: [], warnings: [err.message] }
-    })
+    let next: AifarRuntimeResponse
+    try {
+      next = await fetchAifarRuntime(query, { includePods, includeStats })
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      error.value = message
+      if (background) return
+      next = { runtimeStatus: 'degraded', agent: { status: 'missing', error: message }, instances: [], services: [], pods: [], ingress: [], warnings: [message] }
+    }
+    if (key !== runtimeCacheKey(scope)) return
     const currentPods = asArray<AifarRuntimePod>(aifarRuntime.value.pods)
-    const merged = includePods ? next : { ...next, pods: currentPods }
+    const merged = includePods
+      ? { ...next, pods: includeStats ? asArray<AifarRuntimePod>(next.pods) : mergeRuntimePodMetrics(currentPods, asArray<AifarRuntimePod>(next.pods)) }
+      : { ...next, pods: currentPods }
     aifarRuntime.value = merged
     runtimeCache.value = { ...runtimeCache.value, [key]: merged }
     if (includePods) {
       const podsKey = runtimeCacheKey('pods')
       runtimePodsLoaded.value = { ...runtimePodsLoaded.value, [podsKey]: true }
-      runtimePodStatsLoaded.value = { ...runtimePodStatsLoaded.value, [podsKey]: includeStats }
+      runtimePodStatsLoaded.value = { ...runtimePodStatsLoaded.value, [podsKey]: includeStats || Boolean(runtimePodStatsLoaded.value[podsKey]) }
       runtimeCache.value = { ...runtimeCache.value, [runtimeCacheKey('base')]: { ...merged, pods: [] } }
     }
     const instances = asArray<AifarRuntimeInstance>(aifarRuntime.value.instances)
@@ -763,10 +777,35 @@ async function loadAifarReleases(force = false) {
   })
 }
 
-async function ensureRuntimePodsLoaded(force = false, includeStats = false) {
+async function ensureRuntimePodsLoaded(force = false, includeStats = false, background = false) {
   if (!targetQuery()) return
   if (!force && runtimePodsLoadedForCurrentScope.value && (!includeStats || runtimePodStatsLoadedForCurrentScope.value)) return
-  await loadAifarRuntime(force, true, includeStats)
+  await loadAifarRuntime(force, true, includeStats, background)
+}
+
+function runtimePodsVisible() {
+  return tab.value === 'aifar-runtime' && runtimeResourceTab.value === 'pods' && Boolean(targetQuery())
+}
+
+function runtimePodsActive() {
+  return runtimePodsVisible() && Boolean(selectedRuntimeInstance.value?.id)
+}
+
+async function activateRuntimePods(trigger: 'enter' | 'scope-change') {
+  runtimePodMetricsScheduler.stop()
+  if (!runtimePodsVisible()) return
+  await ensureRuntimePodsLoaded(...runtimePodLoadArgs(trigger))
+  if (runtimePodsActive()) runtimePodMetricsScheduler.start()
+}
+
+async function refreshRuntimePodBase() {
+  await ensureRuntimePodsLoaded(...runtimePodLoadArgs('refresh'))
+  runtimePodMetricsScheduler.stop()
+  if (runtimePodsActive()) runtimePodMetricsScheduler.start()
+}
+
+function refreshRuntimePodMetrics() {
+  if (runtimePodsActive()) runtimePodMetricsScheduler.request()
 }
 
 function clearRuntimePodServiceFilter() {
@@ -1795,6 +1834,8 @@ useAifarRuntimeProvider({
   clearRuntimePodServiceFilter,
   installedRuntimeServiceNamesList,
   ensureRuntimePodsLoaded,
+  refreshRuntimePodBase,
+  refreshRuntimePodMetrics,
   runtimePodsLoadedForCurrentScope,
   selectedRuntimePods,
   openRuntimePodLogs,
@@ -1856,11 +1897,15 @@ useAifarRuntimeProvider({
   submitRuntimeConfig
 })
 
-watch(tab, (next) => {
+watch(tab, async (next) => {
   if (next !== 'aifar-runtime') {
+    runtimePodMetricsScheduler.stop()
     closeRuntimeLogStream()
   }
-  void loadActive(false)
+  await loadActive(false)
+  if (next === 'aifar-runtime' && runtimeResourceTab.value === 'pods') {
+    void activateRuntimePods('enter')
+  }
 })
 watch(resourceTab, () => {
   if (tab.value === 'images') {
@@ -1869,20 +1914,24 @@ watch(resourceTab, () => {
 })
 watch(runtimeResourceTab, (next) => {
   if (next === 'pods') {
-    void ensureRuntimePodsLoaded(...runtimePodLoadArgs('enter'))
+    void activateRuntimePods('enter')
   } else if (next === 'releases') {
+    runtimePodMetricsScheduler.stop()
     closeRuntimeLogStream()
     void loadAifarReleases(false)
   } else if (next === 'logs') {
+    runtimePodMetricsScheduler.stop()
     void ensureRuntimePodsLoaded(...runtimePodLoadArgs('logs'))
     if (runtimeLogSelectionReady.value) {
       void loadRuntimeLogs(false)
     }
   } else {
+    runtimePodMetricsScheduler.stop()
     closeRuntimeLogStream()
   }
 })
 watch(selectedRuntimeInstanceId, () => {
+  runtimePodMetricsScheduler.stop()
   runtimePodServiceFilter.value = ''
   runtimeLogServiceFilter.value = []
   runtimeLogPodFilter.value = []
@@ -1894,7 +1943,7 @@ watch(selectedRuntimeInstanceId, () => {
   aifarReleases.value = []
   closeRuntimeLogStream()
   if (runtimeResourceTab.value === 'pods') {
-    void ensureRuntimePodsLoaded(...runtimePodLoadArgs('scope-change'))
+    void activateRuntimePods('scope-change')
   } else if (runtimeResourceTab.value === 'logs') {
     void ensureRuntimePodsLoaded(...runtimePodLoadArgs('logs'))
   } else if (runtimeResourceTab.value === 'releases') {
@@ -1942,7 +1991,8 @@ watch(() => realtime.revision, () => {
 watch([aifarUpdateService, aifarUpdateMode], () => {
   aifarArtifactFile.value = null
 })
-watch(selectedServerId, () => {
+watch(selectedServerId, async () => {
+  runtimePodMetricsScheduler.stop()
   runtimeLogServiceFilter.value = []
   runtimeLogPodFilter.value = []
   runtimeLogLevelFilter.value = []
@@ -1952,7 +2002,10 @@ watch(selectedServerId, () => {
   runtimeLogsLoaded.value = {}
   closeRuntimeLogStream()
   if (pageReady.value) {
-    void load(true)
+    await load(true)
+    if (runtimeResourceTab.value === 'pods') {
+      void activateRuntimePods('scope-change')
+    }
   }
 })
 onMounted(async () => {
@@ -1962,6 +2015,7 @@ onMounted(async () => {
 })
 onBeforeUnmount(() => {
   runtimeStatusRefresh.dispose()
+  runtimePodMetricsScheduler.dispose()
   closeRuntimeLogStream()
 })
 </script>

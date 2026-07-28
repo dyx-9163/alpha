@@ -47,8 +47,8 @@ describe('AIFAR Runtime reconcile entries', () => {
     expect(renderedText).toContain('Endpoint')
     expect(renderedText).toContain('代理')
     expect(renderedText).toContain('镜像')
-    expect(renderedText).not.toContain('CPU')
-    expect(renderedText).not.toContain('内存')
+    expect(renderedText).toContain('CPU')
+    expect(renderedText).toContain('内存')
   })
 })
 
@@ -130,6 +130,8 @@ function runtimeContext(): AifarRuntimeContext {
     ensureRuntimePodsLoaded: async () => {},
     runtimePodsLoadedForCurrentScope: computed(() => false),
     selectedRuntimePods: computed(() => []),
+    refreshRuntimePodBase: async () => {},
+    refreshRuntimePodMetrics: () => {},
     selectedRuntimeServices: computed(() => []),
     runtimeEndpointText: () => '-',
     percentText: () => '-',

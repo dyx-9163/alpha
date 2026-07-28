@@ -91,9 +91,11 @@ export type AifarRuntimeContext = {
   runtimePodServiceFilter: Ref<string>
   clearRuntimePodServiceFilter: () => void
   installedRuntimeServiceNamesList: ComputedRef<string[]>
-  ensureRuntimePodsLoaded: (force?: boolean, includeStats?: boolean) => Promise<void>
+  ensureRuntimePodsLoaded: (force?: boolean, includeStats?: boolean, background?: boolean) => Promise<void>
   runtimePodsLoadedForCurrentScope: ComputedRef<boolean>
   selectedRuntimePods: ComputedRef<AifarRuntimePod[]>
+  refreshRuntimePodBase: () => Promise<void>
+  refreshRuntimePodMetrics: () => void
   openRuntimePodLogs: (row: AifarRuntimePod) => void
   runtimeLogServiceFilter: Ref<string[]>
   clearRuntimeLogServiceFilter: () => void
