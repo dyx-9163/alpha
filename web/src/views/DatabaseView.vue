@@ -47,7 +47,7 @@
               </div>
               <div class="db-head-actions">
                 <StatusTag :status="group.status" />
-                <el-tooltip v-if="hasMysqlClusterStart(group)" :content="deniedText" :disabled="canManageDatabase" placement="top">
+                <el-tooltip v-if="hasMysqlClusterStart(group)" :content="mysqlClusterStartReason(group)" :disabled="!isMysqlClusterStartDisabled(group)" placement="top">
                   <span>
                     <el-button
                       size="small"
@@ -84,6 +84,25 @@
             <div v-if="isInstallFailedGroup(group)" class="service-notice danger">{{ t('apps.installFailedCleanupHint') }}</div>
             <div v-if="isUnavailable(group.nodeStatus)" class="service-notice danger">{{ databaseServiceUnavailableText(group) }}</div>
             <div v-if="isUnavailable(group.routerStatus)" class="service-notice danger">{{ t('database.routerServiceUnavailable') }}</div>
+            <div
+              v-if="mysqlGroupMaintenance(group).kind === 'required'"
+              class="maintenance-banner"
+              role="alert"
+              aria-live="polite"
+            >
+              <strong>{{ t('database.mysqlBackup.maintenanceTitle') }}</strong>
+              <span>{{ t('database.mysqlBackup.maintenanceExternalClients') }}</span>
+              <span>{{ maintenanceSummary(group) }}</span>
+            </div>
+            <div
+              v-else-if="mysqlGroupMaintenance(group).kind === 'invalid' && group.app === 'mysql'"
+              class="maintenance-banner invalid"
+              role="alert"
+              aria-live="assertive"
+            >
+              <strong>{{ t('database.mysqlBackup.maintenanceInvalidTitle') }}</strong>
+              <span>{{ t('database.mysqlBackup.maintenanceInvalid') }}</span>
+            </div>
             <div v-if="group.nodes.length" class="node-list">
               <div v-for="node in group.nodes" :key="node.instance.id" class="node-row">
                 <div class="node-main">
@@ -122,6 +141,20 @@
                 </div>
               </div>
             </div>
+            <div v-if="mysqlAvailability(group).visible" class="mysql-backup-actions" :aria-label="t('database.mysqlBackup.actionsLabel')">
+              <el-tooltip :content="mysqlActionReason(group)" :disabled="mysqlAvailability(group).backup" placement="top">
+                <span><el-button :disabled="!mysqlAvailability(group).backup" @click="openMySQLBackup(group)">{{ t('database.mysqlBackup.createAction') }}</el-button></span>
+              </el-tooltip>
+              <el-button @click="openMySQLBackupRecords(group)">{{ t('database.mysqlBackup.recordsAction') }}</el-button>
+              <el-tooltip :content="mysqlActionReason(group)" :disabled="mysqlAvailability(group).verify" placement="top">
+                <span><el-button :disabled="!mysqlAvailability(group).verify" @click="verifyLatestMySQLBackup(group)">{{ t('database.mysqlBackup.verifyAction') }}</el-button></span>
+              </el-tooltip>
+              <el-tooltip :content="mysqlActionReason(group)" :disabled="mysqlAvailability(group).restore" placement="top">
+                <span><el-button type="primary" plain :disabled="!mysqlAvailability(group).restore" @click="openLatestMySQLRestore(group)">{{ t('database.mysqlBackup.restoreAction') }}</el-button></span>
+              </el-tooltip>
+              <el-button v-if="mysqlAvailability(group).disaster" type="danger" plain @click="openLatestMySQLDisaster(group)">{{ t('database.mysqlBackup.disasterAction') }}</el-button>
+              <el-button v-if="mysqlAvailability(group).clearMaintenance" type="warning" plain @click="openMaintenanceClear(group)">{{ t('database.mysqlBackup.clearMaintenance') }}</el-button>
+            </div>
           </article>
         </div>
         <div v-else class="empty-state"><div><strong>{{ t('database.noInstancesTitle') }}</strong><span>{{ t('database.noInstancesDesc') }}</span></div></div>
@@ -138,6 +171,61 @@
       </template>
     </div>
 
+    <MySQLBackupDialog
+      v-model="backupDialogVisible"
+      :instance-id="activeTarget.instanceId"
+      :source-label="activeTarget.label"
+      :defaults="backupListDefaults"
+      @submitted="refreshActiveBackups"
+    />
+    <MySQLBackupDrawer
+      v-model="backupDrawerVisible"
+      :source-label="activeTarget.label"
+      :version="activeMysqlGroup?.version || ''"
+      :topology="activeTarget.topology"
+      :records="backupRecords"
+      :loading="backupListLoading"
+      :can-verify="activeAvailability.verify"
+      :can-restore="activeAvailability.restore"
+      @verify="verifySelectedMySQLBackup"
+      @restore="openSelectedMySQLRestore"
+      @open-task="openTaskById"
+    />
+    <MySQLRestoreDialog
+      v-model="restoreDialogVisible"
+      :backup="activeBackup"
+      :target="activeTarget"
+      :default-threads="backupListDefaults.threads"
+      @submitted="refreshActiveBackups"
+    />
+    <MySQLDisasterRebuildDialog
+      v-model="disasterDialogVisible"
+      :instance-id="activeTarget.instanceId"
+      :cluster-id="activeTarget.clusterId || ''"
+      :backup="activeBackup"
+      :nodes="activeDisasterNodes"
+      :default-threads="backupListDefaults.threads"
+      @submitted="refreshActiveBackups"
+    />
+    <el-dialog
+      v-model="maintenanceClearVisible"
+      :title="t('database.mysqlBackup.clearMaintenanceTitle')"
+      width="min(520px, calc(100vw - 32px))"
+      :close-on-click-modal="false"
+      destroy-on-close
+    >
+      <el-alert type="warning" :closable="false" show-icon :title="t('database.mysqlBackup.clearMaintenanceWarning')" />
+      <el-checkbox v-model="maintenanceClearConfirmed" class="maintenance-clear-confirm">
+        {{ t('database.mysqlBackup.clearMaintenanceConfirm') }}
+      </el-checkbox>
+      <template #footer>
+        <el-button @click="maintenanceClearVisible = false">{{ t('common.cancel') }}</el-button>
+        <el-button type="warning" :loading="maintenanceClearSubmitting" :disabled="!maintenanceClearConfirmed" @click="confirmMaintenanceClear">
+          {{ t('database.mysqlBackup.clearMaintenance') }}
+        </el-button>
+      </template>
+    </el-dialog>
+
   </section>
 </template>
 
@@ -151,9 +239,27 @@ import KeyValueGrid from '../components/KeyValueGrid.vue'
 import RunRecordTable from '../components/RunRecordTable.vue'
 import StatusTag from '../components/StatusTag.vue'
 import { usePermissions } from '../composables/usePermissions'
+import MySQLBackupDialog from '../database/MySQLBackupDialog.vue'
+import MySQLBackupDrawer from '../database/MySQLBackupDrawer.vue'
+import MySQLDisasterRebuildDialog from '../database/MySQLDisasterRebuildDialog.vue'
+import MySQLRestoreDialog from '../database/MySQLRestoreDialog.vue'
+import {
+  backupTargetCompatibility,
+  clearMySQLMaintenance,
+  groupMySQLMaintenance,
+  listMySQLBackups,
+  mysqlOperationAvailability,
+  verifyMySQLBackup,
+  type MySQLBackupDefaults,
+  type MySQLBackupRecord,
+  type MySQLMaintenanceResult,
+  type MySQLOperationAvailability,
+  type MySQLRestoreTarget
+} from '../database/mysqlBackup'
 import { useI18n } from '../i18n'
 import { permissions } from '../rbac'
 import { applyRealtimeStatusToAppInstance, useRealtimeStore } from '../stores/realtime'
+import { useSessionStore } from '../stores/session'
 import { useTaskProgressStore } from '../stores/taskProgress'
 import { visibleManagementHeaderActions, visibleManagementTabs } from './managementEntries'
 
@@ -226,6 +332,7 @@ const { t } = useI18n()
 const { can, deniedText } = usePermissions()
 const router = useRouter()
 const realtime = useRealtimeStore()
+const session = useSessionStore()
 const taskProgress = useTaskProgressStore()
 const instances = ref<AppInstance[]>([])
 const servers = ref<any[]>([])
@@ -239,6 +346,18 @@ const deletePasswords = ref<Record<string, string>>({})
 const sameDeletePassword = ref(false)
 const deleteSharedPassword = ref('')
 const startingClusterId = ref('')
+const activeMysqlGroup = ref<DatabaseGroup | null>(null)
+const activeBackup = ref<MySQLBackupRecord | null>(null)
+const backupRecords = ref<MySQLBackupRecord[]>([])
+const backupListDefaults = ref<MySQLBackupDefaults>({ threads: 4, maxRateMBps: 0 })
+const backupListLoading = ref(false)
+const backupDialogVisible = ref(false)
+const backupDrawerVisible = ref(false)
+const restoreDialogVisible = ref(false)
+const disasterDialogVisible = ref(false)
+const maintenanceClearVisible = ref(false)
+const maintenanceClearConfirmed = ref(false)
+const maintenanceClearSubmitting = ref(false)
 const mysqlGroupCount = computed(() => instanceGroups.value.filter((item) => item.app === 'mysql').length)
 const redisGroupCount = computed(() => instanceGroups.value.filter((item) => item.app === 'redis').length)
 const databaseNodeCount = computed(() => instanceGroups.value.reduce((total, group) => total + group.nodes.length, 0))
@@ -247,6 +366,17 @@ const liveInstances = computed(() => instances.value.map((instance) => applyReal
 const routerInstanceCount = computed(() => liveInstances.value.filter((item) => item.app === 'mysql-router').length)
 const canManageApps = computed(() => can(permissions.appsManage))
 const canManageDatabase = computed(() => can(permissions.databaseManage))
+const isOwner = computed(() => session.role.trim().toLowerCase() === 'owner')
+const activeTarget = computed(() => mysqlRestoreTarget(activeMysqlGroup.value))
+const activeAvailability = computed<MySQLOperationAvailability>(() => activeMysqlGroup.value
+  ? mysqlAvailability(activeMysqlGroup.value)
+  : emptyMysqlAvailability())
+const activeDisasterNodes = computed(() => (activeMysqlGroup.value?.nodes ?? []).filter((node) => !node.virtual).map((node) => ({
+  instanceId: node.instance.id,
+  instanceLabel: node.serverLabel,
+  serverId: node.instance.serverId,
+  serverLabel: serverName(node.instance.serverId)
+})))
 const lastMonitorAt = computed(() => latestSnapshotTime(liveInstances.value.map((instance) => realtime.appInstanceSnapshot(instance.id))))
 const monitoringStatusLabel = computed(() => {
   if (!canManageApps.value) {
@@ -1229,6 +1359,199 @@ function openTaskDetails(row: { id: string }) {
   void router.push({ path: '/tasks', query: { taskId: row.id } })
 }
 
+function openTaskById(taskId: string) {
+  if (taskId) void router.push({ path: '/tasks', query: { taskId } })
+}
+
+function mysqlGroupMaintenance(group: DatabaseGroup): MySQLMaintenanceResult {
+  if (group.app !== 'mysql') return { kind: 'none' }
+  const clusterId = group.topology === 'innodb-cluster' ? groupMetadataValue(group, 'clusterId') : ''
+  return groupMySQLMaintenance(group.topology, group.nodes.map((node) => node.instance.metadata), clusterId)
+}
+
+function mysqlAvailability(group: DatabaseGroup) {
+  return mysqlOperationAvailability({
+    app: group.app,
+    topology: group.topology,
+    status: group.status,
+    canManage: canManageDatabase.value,
+    isOwner: isOwner.value,
+    nodeCount: group.nodes.filter((node) => !node.virtual).length,
+    maintenance: mysqlGroupMaintenance(group)
+  })
+}
+
+function emptyMysqlAvailability(): MySQLOperationAvailability {
+  return {
+    visible: false,
+    backup: false,
+    records: false,
+    verify: false,
+    restore: false,
+    disaster: false,
+    clearMaintenance: false,
+    lifecycleBlocked: false,
+    controlStateInvalid: false,
+    reasonKey: ''
+  }
+}
+
+function mysqlActionReason(group: DatabaseGroup) {
+  const availability = mysqlAvailability(group)
+  if (availability.reasonKey) return t(availability.reasonKey)
+  if (!availability.restore && !isOwner.value) return t('database.mysqlBackup.ownerRequired')
+  return t('database.mysqlBackup.actionUnavailable')
+}
+
+function maintenanceSummary(group: DatabaseGroup) {
+  const maintenance = mysqlGroupMaintenance(group)
+  if (maintenance.kind !== 'required') return ''
+  return t('database.mysqlBackup.maintenanceSummary', {
+    backup: maintenance.state.backupId,
+    task: maintenance.state.taskId,
+    phase: t(`database.mysqlBackup.phase.${maintenance.state.restorePhase}`),
+    time: new Date(maintenance.state.recordedAt).toLocaleString()
+  })
+}
+
+function representativeMySQLNode(group: DatabaseGroup | null) {
+  if (!group) return undefined
+  return group.nodes.find((node) => node.role === 'primary') || group.nodes.find((node) => !node.virtual)
+}
+
+function mysqlRestoreTarget(group: DatabaseGroup | null): MySQLRestoreTarget & { label: string } {
+  const node = representativeMySQLNode(group)
+  return {
+    topology: group?.topology || '',
+    instanceId: node?.instance.id || '',
+    serverId: node?.instance.serverId || '',
+    clusterId: group?.topology === 'innodb-cluster' ? groupMetadataValue(group, 'clusterId') : undefined,
+    label: group?.title || '-'
+  }
+}
+
+function activateMySQLGroup(group: DatabaseGroup) {
+  activeMysqlGroup.value = group
+  activeBackup.value = null
+  backupRecords.value = []
+  backupListDefaults.value = { threads: 4, maxRateMBps: 0 }
+}
+
+async function refreshActiveBackups() {
+  const group = activeMysqlGroup.value
+  if (!group) return false
+  backupListLoading.value = true
+  try {
+    const response = await listMySQLBackups(mysqlRestoreTarget(group).instanceId)
+    backupRecords.value = response.items
+    backupListDefaults.value = response.defaults
+    return true
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : t('database.mysqlBackup.listFailed'))
+    return false
+  } finally {
+    backupListLoading.value = false
+  }
+}
+
+async function loadBackupsForGroup(group: DatabaseGroup) {
+  activateMySQLGroup(group)
+  return refreshActiveBackups()
+}
+
+async function openMySQLBackup(group: DatabaseGroup) {
+  if (!mysqlAvailability(group).backup) return
+  if (!await loadBackupsForGroup(group)) return
+  backupDialogVisible.value = true
+}
+
+async function openMySQLBackupRecords(group: DatabaseGroup) {
+  activateMySQLGroup(group)
+  backupDrawerVisible.value = true
+  await refreshActiveBackups()
+}
+
+function compatibleBackup(group: DatabaseGroup) {
+  const target = mysqlRestoreTarget(group)
+  return backupRecords.value.find((record) => backupTargetCompatibility(record, target).compatible) || null
+}
+
+async function verifyLatestMySQLBackup(group: DatabaseGroup) {
+  if (!mysqlAvailability(group).verify) return
+  if (!await loadBackupsForGroup(group)) return
+  const record = backupRecords.value.find((item) => item.status === 'success')
+  if (!record) {
+    ElMessage.warning(t('database.mysqlBackup.noVerifiableBackup'))
+    return
+  }
+  await verifySelectedMySQLBackup(record)
+}
+
+async function verifySelectedMySQLBackup(record: MySQLBackupRecord) {
+  if (!activeAvailability.value.verify) return
+  try {
+    await verifyMySQLBackup(record.id, taskProgress, t('database.mysqlBackup.verifyTaskLabel'))
+    ElMessage.success(t('database.mysqlBackup.verifyAccepted'))
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : t('database.mysqlBackup.verifyFailed'))
+  }
+}
+
+async function openLatestMySQLRestore(group: DatabaseGroup) {
+  if (!mysqlAvailability(group).restore) return
+  if (!await loadBackupsForGroup(group)) return
+  const record = compatibleBackup(group)
+  if (!record) {
+    backupDrawerVisible.value = true
+    ElMessage.warning(t('database.mysqlBackup.noCompatibleBackup'))
+    return
+  }
+  openSelectedMySQLRestore(record)
+}
+
+function openSelectedMySQLRestore(record: MySQLBackupRecord) {
+  const group = activeMysqlGroup.value
+  if (!group || !mysqlAvailability(group).restore || !backupTargetCompatibility(record, mysqlRestoreTarget(group)).compatible) return
+  activeBackup.value = record
+  backupDrawerVisible.value = false
+  restoreDialogVisible.value = true
+}
+
+async function openLatestMySQLDisaster(group: DatabaseGroup) {
+  if (!mysqlAvailability(group).disaster) return
+  if (!await loadBackupsForGroup(group)) return
+  const record = compatibleBackup(group)
+  if (!record) {
+    backupDrawerVisible.value = true
+    ElMessage.warning(t('database.mysqlBackup.noCompatibleBackup'))
+    return
+  }
+  activeBackup.value = record
+  disasterDialogVisible.value = true
+}
+
+function openMaintenanceClear(group: DatabaseGroup) {
+  if (!mysqlAvailability(group).clearMaintenance) return
+  activeMysqlGroup.value = group
+  maintenanceClearConfirmed.value = false
+  maintenanceClearVisible.value = true
+}
+
+async function confirmMaintenanceClear() {
+  if (!maintenanceClearConfirmed.value || !activeMysqlGroup.value || !activeAvailability.value.clearMaintenance) return
+  maintenanceClearSubmitting.value = true
+  try {
+    await clearMySQLMaintenance(activeTarget.value.instanceId, taskProgress, t('database.mysqlBackup.clearTaskLabel'))
+    maintenanceClearVisible.value = false
+    maintenanceClearConfirmed.value = false
+    ElMessage.success(t('database.mysqlBackup.clearAccepted'))
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : t('database.mysqlBackup.clearFailed'))
+  } finally {
+    maintenanceClearSubmitting.value = false
+  }
+}
+
 function hasMysqlGroupDelete(group: DatabaseGroup) {
   return group.app === 'mysql' && mysqlGroupDeleteNodes(group).length > 0
 }
@@ -1238,7 +1561,13 @@ function hasMysqlClusterStart(group: DatabaseGroup) {
 }
 
 function isMysqlClusterStartDisabled(group: DatabaseGroup) {
-  return !canManageDatabase.value || !isMysqlClusterStartable(group) || (!!startingClusterId.value && startingClusterId.value !== group.id)
+  return !canManageDatabase.value || mysqlGroupMaintenance(group).kind !== 'none' || !isMysqlClusterStartable(group) || (!!startingClusterId.value && startingClusterId.value !== group.id)
+}
+
+function mysqlClusterStartReason(group: DatabaseGroup) {
+  if (!canManageDatabase.value) return deniedText.value
+  if (mysqlGroupMaintenance(group).kind !== 'none') return mysqlActionReason(group)
+  return t('database.mysqlBackup.actionUnavailable')
 }
 
 function isMysqlClusterStartable(group: DatabaseGroup) {
@@ -1293,6 +1622,10 @@ function showSentinelDeleteButton(group: DatabaseGroup, node: DatabaseNode) {
 }
 
 function openDeleteGroup(group: DatabaseGroup, kind: DeleteScopeKind) {
+  if (group.app === 'mysql' && mysqlGroupMaintenance(group).kind !== 'none') {
+    ElMessage.warning(mysqlActionReason(group))
+    return
+  }
   const nodes = groupDeleteNodes(group, kind)
   openDeleteNodes(nodes, kind, group)
 }
@@ -1527,8 +1860,8 @@ onMounted(async () => {
 .db-card-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(min(100%, 420px), 1fr));
-  gap: 12px;
-  padding: 12px;
+  gap: 16px;
+  padding: 24px;
   min-height: 0;
   overflow: auto;
 }
@@ -1537,7 +1870,7 @@ onMounted(async () => {
   border: 1px solid var(--aifar-border);
   border-radius: var(--aifar-radius-lg);
   background: #fff;
-  padding: 12px;
+  padding: 16px;
   box-shadow: 0 1px 2px rgba(15, 35, 68, .03);
   transition: border-color .16s ease, box-shadow .16s ease, transform .16s ease;
 }
@@ -1655,6 +1988,48 @@ onMounted(async () => {
   border: 1px solid #ffccc7;
 }
 
+.maintenance-banner {
+  display: grid;
+  gap: 4px;
+  margin-top: 16px;
+  padding: 12px 16px;
+  border: 1px solid #ffe58f;
+  border-radius: 8px;
+  background: #fffbe6;
+  color: #874d00;
+  line-height: 20px;
+}
+
+.maintenance-banner.invalid {
+  border-color: #ffccc7;
+  background: #fff2f0;
+  color: #a8071a;
+}
+
+.maintenance-banner span {
+  font-size: 12px;
+}
+
+.mysql-backup-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px solid var(--aifar-border-soft);
+}
+
+.mysql-backup-actions :deep(.el-button + .el-button) {
+  margin-left: 0;
+}
+
+.maintenance-clear-confirm {
+  align-items: flex-start;
+  margin-top: 24px;
+  white-space: normal;
+}
+
 .node-list {
   display: grid;
   gap: 8px;
@@ -1731,7 +2106,7 @@ onMounted(async () => {
   line-height: 22px;
 }
 
-@media (max-width: 720px) {
+@media (max-width: 767px) {
   .monitor-actions {
     flex-wrap: wrap;
     justify-content: flex-start;
@@ -1752,6 +2127,15 @@ onMounted(async () => {
   }
 
   .node-tags {
+    justify-content: flex-start;
+  }
+
+  .db-card-grid {
+    grid-template-columns: 1fr;
+    padding: 16px;
+  }
+
+  .mysql-backup-actions {
     justify-content: flex-start;
   }
 
