@@ -24,6 +24,24 @@ type rollbackArtifactRef struct {
 	RemotePath  string
 }
 
+type artifactRollbackSelectionError struct {
+	reason  string
+	service string
+}
+
+func (e artifactRollbackSelectionError) Error() string {
+	switch e.reason {
+	case "ROLLBACK_RECORD":
+		return "rollback audit record cannot be selected as a rollback target"
+	case "ALREADY_ACTIVE":
+		return fmt.Sprintf("target release is already active for service %s", e.service)
+	case "ARTIFACT_UNAVAILABLE":
+		return "target release is not rollback-capable"
+	default:
+		return "invalid rollback target"
+	}
+}
+
 func inspectArtifactRollback(instance store.AppInstance, release store.AppRelease, manifest map[string]any) registry.ArtifactRollbackInspection {
 	inspection := registry.ArtifactRollbackInspection{}
 	if strings.TrimSpace(release.Status) != "success" || strings.TrimSpace(release.ReleaseID) == "" {
@@ -71,7 +89,7 @@ func (s Service) ValidateArtifactRollback(req ArtifactRollbackRequest) error {
 	if strings.TrimSpace(req.Reason) == "" {
 		return errors.New("rollback reason is required")
 	}
-	_, manifest, err := s.findReleaseManifest(req.Instance.ID, req.TargetReleaseID)
+	release, manifest, err := s.findReleaseManifest(req.Instance.ID, req.TargetReleaseID)
 	if err != nil {
 		return err
 	}
@@ -83,9 +101,9 @@ func (s Service) ValidateArtifactRollback(req ArtifactRollbackRequest) error {
 		if !aifarServiceSupported(service) {
 			return fmt.Errorf(copy.UnsupportedService, service)
 		}
-		if _, err := rollbackArtifactFromManifest(manifest, service); err != nil {
-			return err
-		}
+	}
+	if err := validateArtifactRollbackSelection(req.Instance, release, manifest, req.Services); err != nil {
+		return localizeArtifactRollbackSelectionError(err, copy)
 	}
 	return nil
 }
@@ -149,6 +167,9 @@ func (s Service) RollbackArtifact(ctx context.Context, req ArtifactRollbackReque
 		targetRelease, targetManifest, err = s.findReleaseManifest(req.Instance.ID, req.TargetReleaseID)
 		if err != nil {
 			return err
+		}
+		if err := validateArtifactRollbackSelection(req.Instance, targetRelease, targetManifest, req.Services); err != nil {
+			return localizeArtifactRollbackSelectionError(err, copy)
 		}
 		metadata = metadataFromInstance(req.Instance)
 		if err := ensureK8sLikeMetadata(metadata, copy); err != nil {
@@ -371,6 +392,42 @@ func (s Service) findReleaseManifest(instanceID, releaseID string) (store.AppRel
 		return item, manifest, nil
 	}
 	return store.AppRelease{}, nil, fmt.Errorf("target release not found: %s", releaseID)
+}
+
+func validateArtifactRollbackSelection(instance store.AppInstance, release store.AppRelease, manifest map[string]any, requested []string) error {
+	inspection := inspectArtifactRollback(instance, release, manifest)
+	if inspection.RollbackUnavailableReason == "ROLLBACK_RECORD" {
+		return artifactRollbackSelectionError{reason: "ROLLBACK_RECORD"}
+	}
+	if inspection.RollbackUnavailableReason == "ARTIFACT_UNAVAILABLE" && strings.TrimSpace(release.Status) != "success" {
+		return artifactRollbackSelectionError{reason: "ARTIFACT_UNAVAILABLE"}
+	}
+	for _, service := range rollbackServicesFromRequest(requested, manifest) {
+		if _, err := rollbackArtifactFromManifest(manifest, service); err != nil {
+			return err
+		}
+		if currentRevisionForService(metadataFromInstance(instance), service) == release.ReleaseID {
+			return artifactRollbackSelectionError{reason: "ALREADY_ACTIVE", service: service}
+		}
+	}
+	return nil
+}
+
+func localizeArtifactRollbackSelectionError(err error, copy UpdateCopy) error {
+	var selectionErr artifactRollbackSelectionError
+	if !errors.As(err, &selectionErr) {
+		return err
+	}
+	switch selectionErr.reason {
+	case "ROLLBACK_RECORD":
+		return errors.New(copy.RollbackAuditRecord)
+	case "ALREADY_ACTIVE":
+		return fmt.Errorf(copy.RollbackAlreadyActive, selectionErr.service)
+	case "ARTIFACT_UNAVAILABLE":
+		return errors.New(copy.RollbackUnavailable)
+	default:
+		return err
+	}
 }
 
 func rollbackServicesFromRequest(requested []string, manifest map[string]any) []string {

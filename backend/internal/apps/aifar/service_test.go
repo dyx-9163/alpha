@@ -2911,6 +2911,145 @@ func TestServiceRollsBackAIFARServiceToReleaseArtifact(t *testing.T) {
 	}
 }
 
+func TestValidateArtifactRollbackRejectsAlreadyActiveRelease(t *testing.T) {
+	const targetReleaseID = "release-target"
+	instance := installedAIFARInstance(t)
+	metadata := metadataFromInstance(instance)
+	delete(metadata, "activeEndpoints")
+	metadata["serviceRevisions"] = map[string]any{"oauth": targetReleaseID}
+	instance.Metadata = mustMetadata(t, metadata)
+	manifest := map[string]any{
+		"kind":            "rollout",
+		"changedServices": []string{"oauth"},
+		"artifacts": map[string]any{
+			"oauth": map[string]any{
+				"file":       "oauth.jar",
+				"sha256":     strings.Repeat("a", 64),
+				"remotePath": "/aifar/apps/admin/releases/release-target/services/oauth/artifact/oauth.jar",
+			},
+		},
+	}
+
+	raw, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := NewService(&fakeStore{instances: []store.AppInstance{instance}, releases: []store.AppRelease{{
+		InstanceID: instance.ID, ReleaseID: targetReleaseID, Status: "success", ManifestJSON: string(raw),
+	}}}, &fakeRemote{})
+	err = service.ValidateArtifactRollback(ArtifactRollbackRequest{
+		Instance: instance, Language: "en", TargetReleaseID: targetReleaseID, Services: []string{"oauth"}, Reason: "test validation",
+	})
+	if err == nil || !strings.Contains(err.Error(), "already active") {
+		t.Fatalf("expected already active validation error, got %v", err)
+	}
+}
+
+func TestValidateArtifactRollbackRejectsRollbackAuditRecord(t *testing.T) {
+	const targetReleaseID = "release-target"
+	instance := installedAIFARInstance(t)
+	manifest := map[string]any{
+		"kind":            "rollback",
+		"changedServices": []string{"oauth"},
+		"artifacts": map[string]any{
+			"oauth": map[string]any{
+				"file":       "oauth.jar",
+				"sha256":     strings.Repeat("a", 64),
+				"remotePath": "/aifar/apps/admin/releases/release-target/services/oauth/artifact/oauth.jar",
+			},
+		},
+	}
+
+	raw, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := NewService(&fakeStore{instances: []store.AppInstance{instance}, releases: []store.AppRelease{{
+		InstanceID: instance.ID, ReleaseID: targetReleaseID, Status: "success", ManifestJSON: string(raw),
+	}}}, &fakeRemote{})
+	err = service.ValidateArtifactRollback(ArtifactRollbackRequest{
+		Instance: instance, Language: "en", TargetReleaseID: targetReleaseID, Services: []string{"oauth"}, Reason: "test validation",
+	})
+	if err == nil || !strings.Contains(err.Error(), "audit record") {
+		t.Fatalf("expected audit record validation error, got %v", err)
+	}
+}
+
+func TestRollbackArtifactRevalidatesAfterLock(t *testing.T) {
+	const targetReleaseID = "release-target"
+	const staleRevision = "release-current"
+	staleRequestInstance := installedAIFARInstance(t)
+	staleRequestInstance.Metadata = mustMetadata(t, map[string]any{
+		"orchestrationModel": orchestrationModelK8sLikeV1,
+		"currentRevision":    staleRevision,
+		"serviceRevisions":   map[string]any{"oauth": staleRevision},
+	})
+	lockedInstance := staleRequestInstance
+	lockedInstance.Metadata = mustMetadata(t, map[string]any{
+		"orchestrationModel": orchestrationModelK8sLikeV1,
+		"currentRevision":    targetReleaseID,
+		"serviceRevisions":   map[string]any{"oauth": targetReleaseID},
+	})
+	manifest, err := json.Marshal(map[string]any{
+		"schema":          releaseManifestSchemaV2,
+		"kind":            "rollout",
+		"releaseId":       targetReleaseID,
+		"changedServices": []string{"oauth"},
+		"artifacts": map[string]any{
+			"oauth": map[string]any{
+				"file":       "oauth.jar",
+				"sha256":     strings.Repeat("a", 64),
+				"remotePath": "/aifar/apps/admin/releases/release-target/services/oauth/artifact/oauth.jar",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &fakeStore{
+		servers: map[string]store.Server{
+			"srv-1": {ID: "srv-1", Name: "app-1", Host: "10.0.0.10", DeployDir: "/aifar/apps"},
+		},
+		instances: []store.AppInstance{lockedInstance},
+		releases: []store.AppRelease{{
+			InstanceID:   lockedInstance.ID,
+			App:          AppName,
+			Version:      appBundleVersion,
+			ReleaseID:    targetReleaseID,
+			ServerID:     "srv-1",
+			Status:       "success",
+			ManifestJSON: string(manifest),
+			CreatedAt:    time.Now().Add(-time.Hour),
+			ActivatedAt:  time.Now().Add(-time.Hour),
+		}},
+	}
+	remote := &fakeRemote{}
+	service := NewService(s, remote)
+	err = service.RollbackArtifact(context.Background(), ArtifactRollbackRequest{
+		Instance:        staleRequestInstance,
+		Server:          s.servers["srv-1"],
+		Language:        "en",
+		Actor:           "admin",
+		TargetReleaseID: targetReleaseID,
+		Services:        []string{"oauth"},
+		Reason:          "test lock-time revalidation",
+	}, fakeLogger{}, nil)
+	if err == nil {
+		t.Fatal("expected lock-time revalidation to reject the active target")
+	}
+	if uploads := remote.joinedUploads(); uploads != "" {
+		t.Fatalf("lock-time rejection must not upload rollback scripts, uploads=%s", uploads)
+	}
+	if commands := remote.joinedCommands(); strings.Contains(commands, "rollback-oauth.sh") {
+		t.Fatalf("lock-time rejection must not run rollback scripts, commands=%s", commands)
+	}
+	for _, release := range s.releases {
+		if release.Status == "success" && strings.Contains(release.ManifestJSON, `"kind":"rollback"`) {
+			t.Fatalf("lock-time rejection must not record a successful rollback release, got %+v", release)
+		}
+	}
+}
+
 func TestInspectArtifactRollbackEligibilityByServiceRevision(t *testing.T) {
 	const targetReleaseID = "release-target"
 	const currentReleaseID = "release-current"
