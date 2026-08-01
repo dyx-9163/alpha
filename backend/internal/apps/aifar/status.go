@@ -389,9 +389,6 @@ type UpdateCopy struct {
 	BundleUpdating          string
 	BundleServiceUpdating   string
 	BundleUpdated           string
-	RollbackAuditRecord     string
-	RollbackAlreadyActive   string
-	RollbackUnavailable     string
 }
 
 func copyFor(lang string) Copy {
@@ -498,9 +495,6 @@ func updateCopyFor(lang string) UpdateCopy {
 			BundleUpdating:          "updating %d AIFAR service artifact(s) from bundle",
 			BundleServiceUpdating:   "bundle update service %d/%d: %s",
 			BundleUpdated:           "AIFAR artifact bundle update completed on %s, services: %d",
-			RollbackAuditRecord:     "rollback audit record cannot be selected as a rollback target",
-			RollbackAlreadyActive:   "target release is already active for service %s",
-			RollbackUnavailable:     "target release is not rollback-capable",
 		}
 	}
 	return UpdateCopy{
@@ -536,9 +530,6 @@ func updateCopyFor(lang string) UpdateCopy {
 		BundleUpdating:          "正在从批量包更新 %d 个 AIFAR 服务制品",
 		BundleServiceUpdating:   "批量更新服务 %d/%d：%s",
 		BundleUpdated:           "AIFAR 批量制品更新完成，目标：%s，服务数：%d",
-		RollbackAuditRecord:     "回滚审计记录不能作为回滚目标",
-		RollbackAlreadyActive:   "目标版本已是服务 %s 的当前版本",
-		RollbackUnavailable:     "目标版本不具备可回滚条件",
 	}
 }
 

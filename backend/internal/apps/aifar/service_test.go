@@ -3134,6 +3134,7 @@ func TestInspectArtifactRollbackEligibilityByServiceRevision(t *testing.T) {
 		release  store.AppRelease
 		manifest map[string]any
 		reason   string
+		current  []string
 	}{
 		{
 			name:     "rollback audit record",
@@ -3167,7 +3168,8 @@ func TestInspectArtifactRollbackEligibilityByServiceRevision(t *testing.T) {
 					},
 				},
 			},
-			reason: "ARTIFACT_UNAVAILABLE",
+			reason:  "ARTIFACT_UNAVAILABLE",
+			current: []string{"oauth"},
 		},
 		{
 			name:     "short artifact checksum",
@@ -3221,6 +3223,9 @@ func TestInspectArtifactRollbackEligibilityByServiceRevision(t *testing.T) {
 			}
 			if len(inspection.RollbackServices) != 0 {
 				t.Fatalf("rollback services = %#v, want none", inspection.RollbackServices)
+			}
+			if test.current != nil && !reflect.DeepEqual(inspection.CurrentServices, test.current) {
+				t.Fatalf("current services = %#v, want %#v", inspection.CurrentServices, test.current)
 			}
 		})
 	}

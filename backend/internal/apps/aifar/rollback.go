@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"aifar-deployment/backend/internal/apps/registry"
+	"aifar-deployment/backend/internal/i18n"
 	"aifar-deployment/backend/internal/installer/installerkit"
 	"aifar-deployment/backend/internal/installer/uploadkit"
 	"aifar-deployment/backend/internal/store"
@@ -61,7 +62,6 @@ func inspectArtifactRollback(instance store.AppInstance, release store.AppReleas
 	metadata := metadataFromInstance(instance)
 	for _, service := range services {
 		if _, err := rollbackArtifactFromManifest(manifest, service); err != nil {
-			inspection.CurrentServices = nil
 			inspection.RollbackServices = nil
 			inspection.RollbackUnavailableReason = "ARTIFACT_UNAVAILABLE"
 			return inspection
@@ -103,7 +103,7 @@ func (s Service) ValidateArtifactRollback(req ArtifactRollbackRequest) error {
 		}
 	}
 	if err := validateArtifactRollbackSelection(req.Instance, release, manifest, req.Services); err != nil {
-		return localizeArtifactRollbackSelectionError(err, copy)
+		return localizeArtifactRollbackSelectionError(err, req.Language)
 	}
 	return nil
 }
@@ -176,7 +176,7 @@ func (s Service) RollbackArtifact(ctx context.Context, req ArtifactRollbackReque
 			return err
 		}
 		if err := validateArtifactRollbackSelection(req.Instance, targetRelease, targetManifest, req.Services); err != nil {
-			return localizeArtifactRollbackSelectionError(err, copy)
+			return localizeArtifactRollbackSelectionError(err, req.Language)
 		}
 		metadata = metadataFromInstance(req.Instance)
 		if err := ensureK8sLikeMetadata(metadata, copy); err != nil {
@@ -420,18 +420,18 @@ func validateArtifactRollbackSelection(instance store.AppInstance, release store
 	return nil
 }
 
-func localizeArtifactRollbackSelectionError(err error, copy UpdateCopy) error {
+func localizeArtifactRollbackSelectionError(err error, language string) error {
 	var selectionErr artifactRollbackSelectionError
 	if !errors.As(err, &selectionErr) {
 		return err
 	}
 	switch selectionErr.reason {
 	case "ROLLBACK_RECORD":
-		return errors.New(copy.RollbackAuditRecord)
+		return errors.New(i18n.Text(language, "aifar.rollback.auditRecord"))
 	case "ALREADY_ACTIVE":
-		return fmt.Errorf(copy.RollbackAlreadyActive, selectionErr.service)
+		return fmt.Errorf(i18n.Text(language, "aifar.rollback.alreadyActive"), selectionErr.service)
 	case "ARTIFACT_UNAVAILABLE":
-		return errors.New(copy.RollbackUnavailable)
+		return errors.New(i18n.Text(language, "aifar.rollback.unavailable"))
 	default:
 		return err
 	}
