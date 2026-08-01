@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -111,7 +112,7 @@ func TestAIFARReleaseResponseOmitsZeroActivationTime(t *testing.T) {
 	failed := aifarReleaseResponseItem(store.AppRelease{
 		ID: "rel-failed", InstanceID: "aifar-1", App: "aifar", Version: "runtime-v2",
 		ReleaseID: "release-failed", Status: "failed", CreatedAt: time.Now(),
-	}, map[string]any{"kind": "rollout", "changedServices": []any{"oauth"}})
+	}, map[string]any{"kind": "rollout", "changedServices": []any{"oauth"}}, registry.ArtifactRollbackInspection{})
 	if _, exists := failed["activatedAt"]; exists {
 		t.Fatalf("failed release must not expose a zero activation time: %+v", failed)
 	}
@@ -120,9 +121,21 @@ func TestAIFARReleaseResponseOmitsZeroActivationTime(t *testing.T) {
 	success := aifarReleaseResponseItem(store.AppRelease{
 		ID: "rel-success", InstanceID: "aifar-1", App: "aifar", Version: "runtime-v2",
 		ReleaseID: "release-success", Status: "success", CreatedAt: activatedAt, ActivatedAt: activatedAt,
-	}, map[string]any{"kind": "rollout", "changedServices": []any{"oauth"}, "artifacts": map[string]any{"oauth": map[string]any{"file": "oauth.jar"}}})
+	}, map[string]any{"kind": "rollout", "changedServices": []any{"oauth", "gateway"}}, registry.ArtifactRollbackInspection{
+		CurrentServices:  []string{"oauth"},
+		RollbackServices: []string{"gateway"},
+	})
 	if got, exists := success["activatedAt"]; !exists || got != activatedAt {
 		t.Fatalf("successful release must expose activation time: %+v", success)
+	}
+	if got := success["currentServices"]; !reflect.DeepEqual(got, []string{"oauth"}) {
+		t.Fatalf("current services = %#v, want [oauth]", got)
+	}
+	if got := success["rollbackServices"]; !reflect.DeepEqual(got, []string{"gateway"}) {
+		t.Fatalf("rollback services = %#v, want [gateway]", got)
+	}
+	if got := success["rollbackAvailable"]; got != true {
+		t.Fatalf("rollback available = %#v, want true", got)
 	}
 }
 

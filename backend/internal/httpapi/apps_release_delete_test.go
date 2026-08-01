@@ -1,10 +1,14 @@
 package httpapi
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
 
+	"aifar-deployment/backend/internal/apps/registry"
 	"aifar-deployment/backend/internal/store"
 )
 
@@ -120,5 +124,128 @@ func TestDeleteAIFARReleaseRejectsCurrentRelease(t *testing.T) {
 	releases, err := db.ListAppReleases(instance.ID)
 	if err != nil || len(releases) != 1 {
 		t.Fatalf("expected current release to remain, got %+v err=%v", releases, err)
+	}
+}
+
+// Production break caught: release history used changedServices alone, so the
+// active artifact release appeared rollbackable and could trigger a no-op.
+func TestListAIFARReleasesReportsRollbackEligibility(t *testing.T) {
+	api, db, secret := newAuthzTestAPI(t)
+	instance, err := db.SaveAppInstance(store.AppInstance{
+		App: "aifar", Version: "runtime-v2", Status: "installed",
+		Metadata: `{"serviceRevisions":{"oauth":"release-current"}}`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := func(releaseID string) string {
+		t.Helper()
+		body, err := json.Marshal(map[string]any{
+			"kind":            "rollout",
+			"changedServices": []string{"oauth"},
+			"artifacts": map[string]any{
+				"oauth": map[string]any{
+					"file":       "oauth.jar",
+					"sha256":     strings.Repeat("a", 64),
+					"remotePath": "/aifar/releases/" + releaseID + "/oauth.jar",
+				},
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(body)
+	}
+	for _, release := range []store.AppRelease{
+		{InstanceID: instance.ID, App: "aifar", Version: "runtime-v2", ReleaseID: "release-current", Status: "success", ManifestJSON: manifest("release-current"), CreatedAt: time.Now().UTC()},
+		{InstanceID: instance.ID, App: "aifar", Version: "runtime-v2", ReleaseID: "release-old", Status: "success", ManifestJSON: manifest("release-old"), CreatedAt: time.Now().Add(-time.Minute).UTC()},
+	} {
+		if _, err := db.SaveAppRelease(release); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v2/apps/instances/"+instance.ID+"/aifar/releases", nil)
+	req.Header.Set("Authorization", "Bearer "+issueTestToken(t, db, secret, "owner", "owner"))
+	rec := httptest.NewRecorder()
+	api.Router().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	var response struct {
+		Items []struct {
+			ReleaseID                 string   `json:"releaseId"`
+			CurrentServices           []string `json:"currentServices"`
+			RollbackServices          []string `json:"rollbackServices"`
+			RollbackUnavailableReason string   `json:"rollbackUnavailableReason"`
+			RollbackAvailable         bool     `json:"rollbackAvailable"`
+		} `json:"items"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	rows := map[string]struct {
+		CurrentServices           []string
+		RollbackServices          []string
+		RollbackUnavailableReason string
+		RollbackAvailable         bool
+	}{}
+	for _, row := range response.Items {
+		rows[row.ReleaseID] = struct {
+			CurrentServices           []string
+			RollbackServices          []string
+			RollbackUnavailableReason string
+			RollbackAvailable         bool
+		}{row.CurrentServices, row.RollbackServices, row.RollbackUnavailableReason, row.RollbackAvailable}
+	}
+	current := rows["release-current"]
+	if len(current.CurrentServices) != 1 || current.CurrentServices[0] != "oauth" || current.RollbackUnavailableReason != "ALREADY_ACTIVE" || current.RollbackAvailable || len(current.RollbackServices) != 0 {
+		t.Fatalf("current release eligibility = %+v", current)
+	}
+	old := rows["release-old"]
+	if len(old.CurrentServices) != 0 || len(old.RollbackServices) != 1 || old.RollbackServices[0] != "oauth" || old.RollbackUnavailableReason != "" || !old.RollbackAvailable {
+		t.Fatalf("old release eligibility = %+v", old)
+	}
+}
+
+// Production break caught: a module that cannot inspect rollback eligibility
+// must not retain the former changed-services fallback.
+func TestListAIFARReleasesFailsClosedWithoutInspector(t *testing.T) {
+	api, db, secret := newAuthzTestAPI(t)
+	api.apps = registry.New(&fakePlannedLifecycleModule{name: "aifar"})
+	instance, err := db.SaveAppInstance(store.AppInstance{App: "aifar", Version: "runtime-v2", Status: "installed", Metadata: `{}`})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.SaveAppRelease(store.AppRelease{
+		InstanceID: instance.ID, App: "aifar", Version: "runtime-v2", ReleaseID: "release-old", Status: "success",
+		ManifestJSON: `{"kind":"rollout","changedServices":["oauth"],"artifacts":{"oauth":{"file":"oauth.jar"}}}`,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/api/v2/apps/instances/"+instance.ID+"/aifar/releases", nil)
+	req.Header.Set("Authorization", "Bearer "+issueTestToken(t, db, secret, "owner", "owner"))
+	rec := httptest.NewRecorder()
+	api.Router().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	var response struct {
+		Items []struct {
+			CurrentServices           []string `json:"currentServices"`
+			RollbackServices          []string `json:"rollbackServices"`
+			RollbackUnavailableReason string   `json:"rollbackUnavailableReason"`
+			RollbackAvailable         bool     `json:"rollbackAvailable"`
+		} `json:"items"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if len(response.Items) != 1 {
+		t.Fatalf("items = %+v", response.Items)
+	}
+	row := response.Items[0]
+	if row.CurrentServices == nil || row.RollbackServices == nil || len(row.CurrentServices) != 0 || len(row.RollbackServices) != 0 || row.RollbackUnavailableReason != "ARTIFACT_UNAVAILABLE" || row.RollbackAvailable {
+		t.Fatalf("unsafe fallback response = %+v", row)
 	}
 }

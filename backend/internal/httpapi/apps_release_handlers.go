@@ -45,39 +45,64 @@ func (a *API) listAIFARReleases(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "AIFAR_RELEASE_LIST_FAILED", err.Error(), nil)
 		return
 	}
+	module, moduleFound := a.apps.Get(instance.App)
+	inspector, canInspect := module.(registry.ArtifactRollbackInspectionModule)
 	items := make([]map[string]any, 0, len(releases))
 	for _, release := range releases {
 		manifest := map[string]any{}
 		if strings.TrimSpace(release.ManifestJSON) != "" {
 			_ = json.Unmarshal([]byte(release.ManifestJSON), &manifest)
 		}
-		items = append(items, aifarReleaseResponseItem(release, manifest))
+		inspection := registry.ArtifactRollbackInspection{
+			CurrentServices:           []string{},
+			RollbackServices:          []string{},
+			RollbackUnavailableReason: "ARTIFACT_UNAVAILABLE",
+		}
+		if moduleFound && canInspect {
+			inspection = inspector.InspectArtifactRollback(r.Context(), registry.ArtifactRollbackInspectionRequest{
+				Instance: instance,
+				Release:  release,
+				Manifest: manifest,
+			})
+		}
+		items = append(items, aifarReleaseResponseItem(release, manifest, inspection))
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"items": items})
 }
 
-func aifarReleaseResponseItem(release store.AppRelease, manifest map[string]any) map[string]any {
+func aifarReleaseResponseItem(release store.AppRelease, manifest map[string]any, inspection registry.ArtifactRollbackInspection) map[string]any {
 	changed := stringsFromAny(manifest["changedServices"])
-	artifacts := mapFromAny(manifest["artifacts"])
+	currentServices := nonNilStrings(inspection.CurrentServices)
+	rollbackServices := nonNilStrings(inspection.RollbackServices)
 	item := map[string]any{
-		"id":                release.ID,
-		"instanceId":        release.InstanceID,
-		"releaseId":         release.ReleaseID,
-		"kind":              stringFromAny(manifest["kind"], ""),
-		"status":            release.Status,
-		"manifestStatus":    stringFromAny(manifest["status"], ""),
-		"version":           release.Version,
-		"serverId":          release.ServerID,
-		"configHash":        release.ConfigHash,
-		"createdAt":         release.CreatedAt,
-		"changedServices":   changed,
-		"rollbackAvailable": release.Status == "success" && len(changed) > 0 && len(artifacts) > 0,
-		"manifest":          manifest,
+		"id":                        release.ID,
+		"instanceId":                release.InstanceID,
+		"releaseId":                 release.ReleaseID,
+		"kind":                      stringFromAny(manifest["kind"], ""),
+		"status":                    release.Status,
+		"manifestStatus":            stringFromAny(manifest["status"], ""),
+		"version":                   release.Version,
+		"serverId":                  release.ServerID,
+		"configHash":                release.ConfigHash,
+		"createdAt":                 release.CreatedAt,
+		"changedServices":           changed,
+		"currentServices":           currentServices,
+		"rollbackServices":          rollbackServices,
+		"rollbackUnavailableReason": inspection.RollbackUnavailableReason,
+		"rollbackAvailable":         release.Status == "success" && inspection.RollbackUnavailableReason == "" && len(rollbackServices) > 0,
+		"manifest":                  manifest,
 	}
 	if !release.ActivatedAt.IsZero() {
 		item["activatedAt"] = release.ActivatedAt
 	}
 	return item
+}
+
+func nonNilStrings(values []string) []string {
+	if values == nil {
+		return []string{}
+	}
+	return values
 }
 
 func (a *API) deleteAIFARRelease(w http.ResponseWriter, r *http.Request) {
