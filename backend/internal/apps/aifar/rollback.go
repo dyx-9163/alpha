@@ -408,10 +408,18 @@ func rollbackArtifactFromManifest(manifest map[string]any, service string) (roll
 		SHA256:      metadataText(raw["sha256"]),
 		RemotePath:  metadataText(raw["remotePath"]),
 	}
-	if ref.FileName == "" || ref.SHA256 == "" || ref.RemotePath == "" {
+	if ref.FileName == "" || ref.RemotePath == "" || !validRollbackArtifactSHA256(ref.SHA256) {
 		return rollbackArtifactRef{}, fmt.Errorf("release artifact for service %s is not rollback-capable", service)
 	}
 	return ref, nil
+}
+
+func validRollbackArtifactSHA256(value string) bool {
+	if len(value) != sha256.Size*2 {
+		return false
+	}
+	_, err := hex.DecodeString(value)
+	return err == nil
 }
 
 func stringsFromManifestValue(value any) []string {

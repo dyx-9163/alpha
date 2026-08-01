@@ -3005,6 +3005,39 @@ func TestInspectArtifactRollbackEligibilityByServiceRevision(t *testing.T) {
 			reason: "ARTIFACT_UNAVAILABLE",
 		},
 		{
+			name:     "short artifact checksum",
+			instance: instance,
+			release:  store.AppRelease{ReleaseID: targetReleaseID, Status: "success"},
+			manifest: func() map[string]any {
+				manifest := completeManifest("rollout-bundle")
+				manifest["artifacts"].(map[string]any)["gateway"].(map[string]any)["sha256"] = "abc123"
+				return manifest
+			}(),
+			reason: "ARTIFACT_UNAVAILABLE",
+		},
+		{
+			name:     "non hexadecimal artifact checksum",
+			instance: instance,
+			release:  store.AppRelease{ReleaseID: targetReleaseID, Status: "success"},
+			manifest: func() map[string]any {
+				manifest := completeManifest("rollout-bundle")
+				manifest["artifacts"].(map[string]any)["gateway"].(map[string]any)["sha256"] = strings.Repeat("z", 64)
+				return manifest
+			}(),
+			reason: "ARTIFACT_UNAVAILABLE",
+		},
+		{
+			name:     "missing artifact remote path",
+			instance: instance,
+			release:  store.AppRelease{ReleaseID: targetReleaseID, Status: "success"},
+			manifest: func() map[string]any {
+				manifest := completeManifest("rollout-bundle")
+				delete(manifest["artifacts"].(map[string]any)["gateway"].(map[string]any), "remotePath")
+				return manifest
+			}(),
+			reason: "ARTIFACT_UNAVAILABLE",
+		},
+		{
 			name:     "failed release",
 			instance: instance,
 			release:  store.AppRelease{ReleaseID: targetReleaseID, Status: "failed"},
