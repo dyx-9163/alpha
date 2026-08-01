@@ -187,9 +187,14 @@ export type AifarRelease = {
   createdAt?: string
   activatedAt?: string
   changedServices?: string[]
+  currentServices?: string[]
+  rollbackServices?: string[]
+  rollbackUnavailableReason?: RollbackUnavailableReason
   rollbackAvailable?: boolean
   manifest?: Record<string, any>
 }
+
+export type RollbackUnavailableReason = '' | 'ROLLBACK_RECORD' | 'ALREADY_ACTIVE' | 'ARTIFACT_UNAVAILABLE'
 
 export type AifarReleaseListResponse = {
   items?: AifarRelease[]

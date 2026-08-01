@@ -207,6 +207,10 @@ import {
   runtimeInstanceLabel as formatRuntimeInstanceLabel,
   runtimeNacosStatus
 } from '../containers/runtime/format'
+import {
+  runtimeReleaseRollbackDisabledReason,
+  runtimeReleaseRollbackServices
+} from '../containers/runtime/releaseRules'
 import { useAifarRuntimeProvider } from '../containers/runtime/useAifarRuntimeProvider'
 import {
   parseRuntimeLogErrorEvent,
@@ -1147,10 +1151,11 @@ function runtimeInstanceLabel(instance: AifarRuntimeInstance) {
 }
 
 function releaseRollbackDisabledReason(row: AifarRelease) {
-  if (!canManageApps.value) return deniedText.value
-  if (!row.rollbackAvailable) return t('containers.releaseRollbackUnavailable')
-  if (!row.releaseId) return t('containers.releaseIdRequired')
-  return ''
+  return runtimeReleaseRollbackDisabledReason(row, {
+    canManage: canManageApps.value,
+    deniedText: deniedText.value,
+    t
+  })
 }
 
 function releaseDeleteDisabledReason(row: AifarRelease) {
@@ -1206,6 +1211,11 @@ async function rollbackAifarRelease(row: AifarRelease) {
     ElMessage.warning(reason)
     return
   }
+  const services = runtimeReleaseRollbackServices(row)
+  if (!services.length) {
+    ElMessage.warning(t('containers.releaseRollbackUnavailable'))
+    return
+  }
   const instance = selectedRuntimeInstance.value
   if (!instance?.id) {
     ElMessage.warning(t('containers.selectAifarInstance'))
@@ -1232,7 +1242,7 @@ async function rollbackAifarRelease(row: AifarRelease) {
   try {
     const result = await rollbackAifarReleaseRequest(instance.id, {
       targetReleaseId: row.releaseId,
-      services: asArray<string>(row.changedServices),
+      services,
       reason: input
     })
     trackTask(result.taskId, t('containers.rollbackRelease'))
