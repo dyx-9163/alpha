@@ -7,7 +7,27 @@
       </div>
     </div>
     <el-table :data="aifarReleases" height="calc(100% - 44px)" row-key="releaseId">
-      <el-table-column prop="releaseId" :label="t('containers.releaseId')" min-width="240" show-overflow-tooltip />
+      <el-table-column :label="t('containers.releaseId')" min-width="240" show-overflow-tooltip>
+        <template #default="{ row }">
+          <el-space size="small">
+            <span>{{ row.releaseId }}</span>
+            <el-tooltip
+              v-if="releaseIsCurrent(row)"
+              :content="t('containers.releaseCurrentServices', { services: releaseCurrentServicesText(row) })"
+              placement="top"
+            >
+              <el-tag
+                data-testid="release-current-services"
+                size="small"
+                type="info"
+                :title="t('containers.releaseCurrentServices', { services: releaseCurrentServicesText(row) })"
+              >
+                {{ t('containers.releaseCurrent') }}
+              </el-tag>
+            </el-tooltip>
+          </el-space>
+        </template>
+      </el-table-column>
       <el-table-column :label="t('containers.releaseKind')" width="130">
         <template #default="{ row }">{{ releaseKindLabel(row.kind) }}</template>
       </el-table-column>
@@ -65,6 +85,8 @@ const {
   aifarRuntimeStatusKind,
   releaseStatusLabel,
   releaseServicesText,
+  releaseCurrentServicesText,
+  releaseIsCurrent,
   releaseRollbackDisabledReason,
   rollbackAifarRelease,
   releaseDeletingId,

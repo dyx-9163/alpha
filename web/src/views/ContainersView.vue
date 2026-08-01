@@ -1142,6 +1142,16 @@ function releaseStatusLabel(status?: string) {
   return formatReleaseStatusLabel(status, t)
 }
 
+function releaseCurrentServicesText(row: AifarRelease) {
+  return Array.isArray(row.currentServices)
+    ? row.currentServices.filter((service) => typeof service === 'string' && service.trim() !== '').join(', ')
+    : ''
+}
+
+function releaseIsCurrent(row: AifarRelease) {
+  return Boolean(releaseCurrentServicesText(row))
+}
+
 function runtimeApplyStatusLabel(status?: string) {
   return formatRuntimeApplyStatusLabel(status, t)
 }
@@ -1831,6 +1841,8 @@ useAifarRuntimeProvider({
   releaseKindLabel,
   releaseStatusLabel,
   releaseServicesText,
+  releaseCurrentServicesText,
+  releaseIsCurrent,
   formatDate,
   releaseRollbackDisabledReason,
   rollbackAifarRelease,
