@@ -2911,6 +2911,123 @@ func TestServiceRollsBackAIFARServiceToReleaseArtifact(t *testing.T) {
 	}
 }
 
+func TestInspectArtifactRollbackEligibilityByServiceRevision(t *testing.T) {
+	const targetReleaseID = "release-target"
+	const currentReleaseID = "release-current"
+	instance := installedAIFARInstance(t)
+	instance.Metadata = mustMetadata(t, map[string]any{
+		"serviceRevisions": map[string]any{
+			"oauth":   targetReleaseID,
+			"gateway": currentReleaseID,
+		},
+	})
+	completeManifest := func(kind string) map[string]any {
+		return map[string]any{
+			"kind":            kind,
+			"changedServices": []string{"oauth", "gateway"},
+			"artifacts": map[string]any{
+				"oauth": map[string]any{
+					"file":       "oauth.jar",
+					"sha256":     strings.Repeat("a", 64),
+					"remotePath": "/aifar/apps/admin/releases/release-target/services/oauth/artifact/oauth.jar",
+				},
+				"gateway": map[string]any{
+					"file":       "gateway.jar",
+					"sha256":     strings.Repeat("b", 64),
+					"remotePath": "/aifar/apps/admin/releases/release-target/services/gateway/artifact/gateway.jar",
+				},
+			},
+		}
+	}
+
+	module := Module{}
+	inspection := module.InspectArtifactRollback(context.Background(), registry.ArtifactRollbackInspectionRequest{
+		Instance: instance,
+		Release:  store.AppRelease{ReleaseID: targetReleaseID, Status: "success"},
+		Manifest: completeManifest("rollout-bundle"),
+	})
+	if got, want := inspection.CurrentServices, []string{"oauth"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("current services = %#v, want %#v", got, want)
+	}
+	if got, want := inspection.RollbackServices, []string{"gateway"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("rollback services = %#v, want %#v", got, want)
+	}
+	if inspection.RollbackUnavailableReason != "" {
+		t.Fatalf("rollback unavailable reason = %q, want empty", inspection.RollbackUnavailableReason)
+	}
+
+	allCurrent := installedAIFARInstance(t)
+	allCurrent.Metadata = mustMetadata(t, map[string]any{
+		"serviceRevisions": map[string]any{
+			"oauth":   targetReleaseID,
+			"gateway": targetReleaseID,
+		},
+	})
+	for _, test := range []struct {
+		name     string
+		instance store.AppInstance
+		release  store.AppRelease
+		manifest map[string]any
+		reason   string
+	}{
+		{
+			name:     "rollback audit record",
+			instance: instance,
+			release:  store.AppRelease{ReleaseID: targetReleaseID, Status: "success"},
+			manifest: completeManifest("rollback"),
+			reason:   "ROLLBACK_RECORD",
+		},
+		{
+			name:     "all changed services current",
+			instance: allCurrent,
+			release:  store.AppRelease{ReleaseID: targetReleaseID, Status: "success"},
+			manifest: completeManifest("rollout-bundle"),
+			reason:   "ALREADY_ACTIVE",
+		},
+		{
+			name:     "missing artifact metadata",
+			instance: instance,
+			release:  store.AppRelease{ReleaseID: targetReleaseID, Status: "success"},
+			manifest: map[string]any{
+				"kind":            "rollout-bundle",
+				"changedServices": []string{"oauth", "gateway"},
+				"artifacts": map[string]any{
+					"oauth": map[string]any{
+						"file":       "oauth.jar",
+						"sha256":     strings.Repeat("a", 64),
+						"remotePath": "/aifar/apps/admin/releases/release-target/services/oauth/artifact/oauth.jar",
+					},
+					"gateway": map[string]any{
+						"file": "gateway.jar",
+					},
+				},
+			},
+			reason: "ARTIFACT_UNAVAILABLE",
+		},
+		{
+			name:     "failed release",
+			instance: instance,
+			release:  store.AppRelease{ReleaseID: targetReleaseID, Status: "failed"},
+			manifest: completeManifest("rollout-bundle"),
+			reason:   "ARTIFACT_UNAVAILABLE",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			inspection := module.InspectArtifactRollback(context.Background(), registry.ArtifactRollbackInspectionRequest{
+				Instance: test.instance,
+				Release:  test.release,
+				Manifest: test.manifest,
+			})
+			if inspection.RollbackUnavailableReason != test.reason {
+				t.Fatalf("rollback unavailable reason = %q, want %q", inspection.RollbackUnavailableReason, test.reason)
+			}
+			if len(inspection.RollbackServices) != 0 {
+				t.Fatalf("rollback services = %#v, want none", inspection.RollbackServices)
+			}
+		})
+	}
+}
+
 func TestRollbackJavaEntrypointUsesImageWorkingDirectoryJar(t *testing.T) {
 	script, err := renderRollbackScript(rollbackScriptData{})
 	if err != nil {

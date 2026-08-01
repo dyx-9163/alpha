@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"aifar-deployment/backend/internal/apps/registry"
 	"aifar-deployment/backend/internal/installer/installerkit"
 	"aifar-deployment/backend/internal/installer/uploadkit"
 	"aifar-deployment/backend/internal/store"
@@ -21,6 +22,42 @@ type rollbackArtifactRef struct {
 	FileName    string
 	SHA256      string
 	RemotePath  string
+}
+
+func inspectArtifactRollback(instance store.AppInstance, release store.AppRelease, manifest map[string]any) registry.ArtifactRollbackInspection {
+	inspection := registry.ArtifactRollbackInspection{}
+	if strings.TrimSpace(release.Status) != "success" || strings.TrimSpace(release.ReleaseID) == "" {
+		inspection.RollbackUnavailableReason = "ARTIFACT_UNAVAILABLE"
+		return inspection
+	}
+	if strings.EqualFold(strings.TrimSpace(fmt.Sprint(manifest["kind"])), "rollback") {
+		inspection.RollbackUnavailableReason = "ROLLBACK_RECORD"
+		return inspection
+	}
+
+	services := rollbackServicesFromRequest(nil, manifest)
+	if len(services) == 0 {
+		inspection.RollbackUnavailableReason = "ARTIFACT_UNAVAILABLE"
+		return inspection
+	}
+	metadata := metadataFromInstance(instance)
+	for _, service := range services {
+		if _, err := rollbackArtifactFromManifest(manifest, service); err != nil {
+			inspection.CurrentServices = nil
+			inspection.RollbackServices = nil
+			inspection.RollbackUnavailableReason = "ARTIFACT_UNAVAILABLE"
+			return inspection
+		}
+		if currentRevisionForService(metadata, service) == release.ReleaseID {
+			inspection.CurrentServices = append(inspection.CurrentServices, service)
+			continue
+		}
+		inspection.RollbackServices = append(inspection.RollbackServices, service)
+	}
+	if len(inspection.RollbackServices) == 0 {
+		inspection.RollbackUnavailableReason = "ALREADY_ACTIVE"
+	}
+	return inspection
 }
 
 func (s Service) ValidateArtifactRollback(req ArtifactRollbackRequest) error {
@@ -367,9 +404,9 @@ func rollbackArtifactFromManifest(manifest map[string]any, service string) (roll
 	raw, _ := artifacts[service].(map[string]any)
 	ref := rollbackArtifactRef{
 		ServiceName: service,
-		FileName:    strings.TrimSpace(fmt.Sprint(raw["file"])),
-		SHA256:      strings.TrimSpace(fmt.Sprint(raw["sha256"])),
-		RemotePath:  strings.TrimSpace(fmt.Sprint(raw["remotePath"])),
+		FileName:    metadataText(raw["file"]),
+		SHA256:      metadataText(raw["sha256"]),
+		RemotePath:  metadataText(raw["remotePath"]),
 	}
 	if ref.FileName == "" || ref.SHA256 == "" || ref.RemotePath == "" {
 		return rollbackArtifactRef{}, fmt.Errorf("release artifact for service %s is not rollback-capable", service)

@@ -243,6 +243,18 @@ type ArtifactRollbackRequest struct {
 	Force           bool
 }
 
+type ArtifactRollbackInspectionRequest struct {
+	Instance store.AppInstance
+	Release  store.AppRelease
+	Manifest map[string]any
+}
+
+type ArtifactRollbackInspection struct {
+	CurrentServices           []string
+	RollbackServices          []string
+	RollbackUnavailableReason string
+}
+
 type ServiceScaleOutRequest struct {
 	Instance    store.AppInstance
 	Server      store.Server
@@ -559,6 +571,10 @@ type ArtifactRollbackModule interface {
 	PlanArtifactRollback(ctx context.Context, req ArtifactRollbackRequest) ([]InstallStepPlan, error)
 	ValidateArtifactRollback(ctx context.Context, req ArtifactRollbackRequest) error
 	RollbackArtifact(ctx context.Context, req ArtifactRollbackRequest, run RunContext) error
+}
+
+type ArtifactRollbackInspectionModule interface {
+	InspectArtifactRollback(context.Context, ArtifactRollbackInspectionRequest) ArtifactRollbackInspection
 }
 
 type ServiceScaleOutModule interface {

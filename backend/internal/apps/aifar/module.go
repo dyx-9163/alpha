@@ -350,6 +350,13 @@ func (m Module) UpdateArtifactBundle(ctx context.Context, req registry.ArtifactB
 	})
 }
 
+func (m Module) InspectArtifactRollback(ctx context.Context, req registry.ArtifactRollbackInspectionRequest) registry.ArtifactRollbackInspection {
+	if ctx.Err() != nil {
+		return registry.ArtifactRollbackInspection{RollbackUnavailableReason: "ARTIFACT_UNAVAILABLE"}
+	}
+	return inspectArtifactRollback(req.Instance, req.Release, req.Manifest)
+}
+
 func (m Module) PlanArtifactRollback(ctx context.Context, req registry.ArtifactRollbackRequest) ([]registry.InstallStepPlan, error) {
 	if ctx.Err() != nil {
 		return nil, ctx.Err()
