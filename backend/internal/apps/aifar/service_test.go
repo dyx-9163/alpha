@@ -41,6 +41,31 @@ type fakeStore struct {
 	failSaveOn  int
 }
 
+type rollbackLockRaceStore struct {
+	*fakeStore
+	instanceAfterLock store.AppInstance
+}
+
+func (s *rollbackLockRaceStore) AcquireAIFAROrchestrationLock(lock store.AIFAROrchestrationLock) (store.AIFAROrchestrationLock, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for idx, instance := range s.instances {
+		if instance.ID == s.instanceAfterLock.ID {
+			s.instances[idx] = s.instanceAfterLock
+			break
+		}
+	}
+	return lock, nil
+}
+
+func (*rollbackLockRaceStore) ReleaseAIFAROrchestrationLock(string, string, string) (bool, error) {
+	return true, nil
+}
+
+func (*rollbackLockRaceStore) RecoverAIFAROrchestrationLocks(string, string) (int, error) {
+	return 0, nil
+}
+
 type resourceFakeStore struct {
 	*fakeStore
 	resources []store.Resource
@@ -3006,11 +3031,11 @@ func TestRollbackArtifactRevalidatesAfterLock(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s := &fakeStore{
+	baseStore := &fakeStore{
 		servers: map[string]store.Server{
 			"srv-1": {ID: "srv-1", Name: "app-1", Host: "10.0.0.10", DeployDir: "/aifar/apps"},
 		},
-		instances: []store.AppInstance{lockedInstance},
+		instances: []store.AppInstance{staleRequestInstance},
 		releases: []store.AppRelease{{
 			InstanceID:   lockedInstance.ID,
 			App:          AppName,
@@ -3023,6 +3048,7 @@ func TestRollbackArtifactRevalidatesAfterLock(t *testing.T) {
 			ActivatedAt:  time.Now().Add(-time.Hour),
 		}},
 	}
+	s := &rollbackLockRaceStore{fakeStore: baseStore, instanceAfterLock: lockedInstance}
 	remote := &fakeRemote{}
 	service := NewService(s, remote)
 	err = service.RollbackArtifact(context.Background(), ArtifactRollbackRequest{
