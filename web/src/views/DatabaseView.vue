@@ -284,6 +284,12 @@ import MySQLBackupDrawer from '../database/MySQLBackupDrawer.vue'
 import MySQLDisasterRebuildDialog from '../database/MySQLDisasterRebuildDialog.vue'
 import MySQLRestoreDialog from '../database/MySQLRestoreDialog.vue'
 import {
+  healthFromCheckStatus,
+  resolveDatabaseNodeHealth,
+  resolveMySQLRuntimeHealth,
+  type DatabaseHealth
+} from '../database/databaseHealth'
+import {
   backupTargetCompatibility,
   clearMySQLMaintenance,
   groupMySQLMaintenance,
@@ -356,8 +362,6 @@ type DatabaseGroup = {
   routers: DatabaseNode[]
   sentinels: DatabaseNode[]
 }
-
-type DatabaseHealth = 'online' | 'offline' | 'unknown' | 'probing'
 
 type DeleteScopeKind = 'single' | 'mysql-group' | 'redis-group'
 
@@ -971,42 +975,16 @@ function nodeHealthType(node: DatabaseNode) {
 }
 
 function nodeHealth(node: DatabaseNode): DatabaseHealth {
-  if (isMysqlInnoDBNode(node)) {
-    const runtimeHealth = mysqlRuntimeHealth(node)
-    if (runtimeHealth !== 'unknown') {
-      return runtimeHealth
-    }
-  }
-  return baseNodeHealth(node)
+  return resolveDatabaseNodeHealth({
+    app: node.instance.app,
+    topology: normalizedTopology(node.instance, node.metadata),
+    checkStatus: node.metadata.lastCheck?.status,
+    runtimeStatus: mysqlRuntimeStatus(node)
+  })
 }
 
 function baseNodeHealth(node: DatabaseNode): DatabaseHealth {
-  if (serverStatusOffline(nodeServerStatus(node))) {
-    return 'offline'
-  }
-  const lastCheckStatus = stringValue(node.metadata.lastCheck?.status)
-  const instanceStatus = stringValue(node.instance.status).toLowerCase()
-  const status = lastCheckStatus || instanceStatus
-  if (node.virtual && !serverStatusOnline(nodeServerStatus(node))) {
-    return 'unknown'
-  }
-  if (lastCheckStatus && statusIsOnline(lastCheckStatus)) {
-    return 'online'
-  }
-  if (lastCheckStatus && statusIsOffline(lastCheckStatus)) {
-    return 'offline'
-  }
-  if (statusIsOffline(instanceStatus)) {
-    return 'offline'
-  }
-  if (statusIsOnline(instanceStatus)) {
-    return 'online'
-  }
-  return 'unknown'
-}
-
-function isMysqlInnoDBNode(node: DatabaseNode) {
-  return node.instance.app === 'mysql' && normalizedTopology(node.instance, node.metadata) === 'innodb-cluster'
+  return healthFromCheckStatus(node.metadata.lastCheck?.status)
 }
 
 function nodeLastCheckedAt(node: DatabaseNode) {
@@ -1016,29 +994,6 @@ function nodeLastCheckedAt(node: DatabaseNode) {
   }
   const time = new Date(value).getTime()
   return Number.isNaN(time) ? 0 : time
-}
-
-function nodeServerStatus(node: DatabaseNode) {
-  const server = node.instance.serverId
-    ? servers.value.find((item) => item.id === node.instance.serverId)
-    : serverByEndpoint(node.endpoint)
-  return String(server?.status || '').trim().toLowerCase()
-}
-
-function serverStatusOnline(status: string) {
-  return ['available', 'running', 'success', 'ok'].includes(status)
-}
-
-function serverStatusOffline(status: string) {
-  return ['failed', 'error', 'missing', 'stopped', 'offline', 'unavailable'].includes(status)
-}
-
-function statusIsOnline(status: string) {
-  return ['ok', 'success', 'running', 'available'].includes(String(status ?? '').trim().toLowerCase())
-}
-
-function statusIsOffline(status: string) {
-  return ['failed', 'error', 'missing', 'stopped', 'offline', 'unavailable', 'unhealthy', 'down', 'no-endpoints'].includes(String(status ?? '').trim().toLowerCase())
 }
 
 function nodeRunsSentinel(node: DatabaseNode) {
@@ -1718,17 +1673,10 @@ function isMysqlClusterIneffective(group: DatabaseGroup) {
 }
 
 function mysqlRuntimeHealth(node: DatabaseNode): DatabaseHealth {
-  if (serverStatusOffline(nodeServerStatus(node))) {
-    return 'offline'
-  }
-  const runtimeStatus = mysqlRuntimeStatus(node)
-  if (statusIsOnline(runtimeStatus)) {
-    return 'online'
-  }
-  if (statusIsOffline(runtimeStatus)) {
-    return 'offline'
-  }
-  return baseNodeHealth(node)
+  return resolveMySQLRuntimeHealth({
+    checkStatus: node.metadata.lastCheck?.status,
+    runtimeStatus: mysqlRuntimeStatus(node)
+  })
 }
 
 function mysqlRuntimeStatus(node: DatabaseNode) {
