@@ -10,7 +10,7 @@
 
 ## Global Constraints
 
-- Preserve all pre-existing dirty-worktree changes. In particular, `backend/internal/collector/manager.go` and `manager_test.go` already contain uncommitted Docker/app timeout separation work; do not revert it and do not include it accidentally in this feature's commits.
+- Use committed baseline `22fc1ae7` or later. That baseline already contains the Docker/app timeout separation in `backend/internal/collector/manager.go` and `manager_test.go`; preserve those fields and tests. Start each implementation task only when `git status --short` has no unexpected new changes.
 - Before editing `web/src`, read `design/ant-design-system-portable202606.md` completely as required by `AGENTS.md`; this feature changes behavior only and must not introduce visual or style changes.
 - Keep the existing 15-second `AIFAR_COLLECTOR_INTERVAL_SECONDS` schedule, a fixed five-second server-probe timeout, and a fixed maximum of eight concurrent server probes.
 - Routine background checks are collector observations, not worker tasks and not audit events. The manual `POST /api/v2/servers/{id}/probe` flow remains task-backed and audited.
@@ -140,22 +140,23 @@ git commit -m "fix: honor SSH handshake deadlines"
 - Modify: `backend/internal/collector/manager.go:27-54`
 - Modify: `backend/internal/collector/manager.go:133-164`
 - Modify: `backend/internal/collector/manager.go:468-491`
-- Preserve without staging: current timeout-separation changes in `backend/internal/collector/manager.go` and `backend/internal/collector/manager_test.go`
 
 **Interfaces:**
 - Consumes: `(*store.Store).ListServers()`, `(*store.Store).GetServer(id, true)`, `(*store.Store).UpsertStatusSnapshot`, `adapter.ProbeSSH`, `logmask.Mask`, and `Publisher.Publish(realtime.Event)`.
 - Produces: manager fields `serverProbe func(context.Context, store.Server) error`, `serverProbeTimeout time.Duration`, and `serverProbeWorkers int`; methods `collectLiveServers(context.Context) error`, `collectOneServer(context.Context, store.Server) error`, and `saveSnapshotWithPolicy(context.Context, store.StatusSnapshot, bool) error`.
 - Keeps: `collectServers(context.Context) error` as the collector-stage entrypoint and `saveSnapshot(context.Context, store.StatusSnapshot) error` as publish-on-every-collection behavior for all existing non-server scopes.
 
-- [ ] **Step 1: Record the overlapping dirty diff before editing**
+- [ ] **Step 1: Verify the committed collector baseline before editing**
 
 Run:
 
 ```text
-git diff -- backend/internal/collector/manager.go backend/internal/collector/manager_test.go
+git status --short
+git show --stat --oneline 22fc1ae7
+rg -n "dockerSummaryTimeout|appInstanceTimeout" backend/internal/collector/manager.go backend/internal/collector/manager_test.go
 ```
 
-Expected: the existing diff only separates `timeout` into `dockerSummaryTimeout` and `appInstanceTimeout` and adds its regression test. Save this output in the task notes; do not stage or revert those lines.
+Expected: no unexpected worktree changes, baseline `22fc1ae7` is present, and the committed source contains both `dockerSummaryTimeout` and `appInstanceTimeout` plus their regression assertions.
 
 - [ ] **Step 2: Write failing server collector tests**
 
@@ -239,7 +240,7 @@ Expected: compilation fails because `Manager.serverProbe`, `serverProbeWorkers`,
 
 - [ ] **Step 4: Add manager defaults and preserve existing timeout fields**
 
-Add these exact fields immediately after `appInstanceTimeout time.Duration` in `Manager`, without changing the existing dirty `dockerSummaryTimeout` or `appInstanceTimeout` lines:
+Add these exact fields immediately after `appInstanceTimeout time.Duration` in `Manager`, without changing the committed `dockerSummaryTimeout` or `appInstanceTimeout` behavior:
 
 ```go
 serverProbe        func(context.Context, store.Server) error
@@ -397,17 +398,16 @@ Expected: all selected packages pass; no real SSH connection is attempted becaus
 
 - [ ] **Step 8: Stage only this feature and commit**
 
-Stage the two new files normally. Use patch staging for `manager.go`; split/edit the overlapping field and constructor hunks so the pre-existing `timeout` separation remains unstaged:
+Stage the two new files and the manager integration from the clean committed baseline:
 
 ```text
-git add backend/internal/collector/server_status.go backend/internal/collector/server_status_test.go
-git add -p backend/internal/collector/manager.go
+git add backend/internal/collector/manager.go backend/internal/collector/server_status.go backend/internal/collector/server_status_test.go
 git diff --cached --check
 git diff --cached -- backend/internal/collector/manager.go backend/internal/collector/server_status.go backend/internal/collector/server_status_test.go
 git commit -m "feat: collect live server status"
 ```
 
-Expected staged content: only server probe fields/defaults, cached-body delegation, server collection code, server tests, and snapshot publish-policy extraction. `git diff -- backend/internal/collector/manager.go backend/internal/collector/manager_test.go` after the commit must still show the pre-existing timeout separation as uncommitted.
+Expected staged content: only server probe fields/defaults, cached-body delegation, server collection code, server tests, and snapshot publish-policy extraction. `backend/internal/collector/manager_test.go` remains unchanged because its timeout-separation test is already committed in the baseline.
 
 ---
 
@@ -753,7 +753,7 @@ git status --short
 git log -4 --oneline
 ```
 
-Expected: no whitespace errors in feature files; four feature commits follow the design commit. Existing unrelated MySQL, timeout-separation, documentation, and `memory.md` changes remain visible and uncommitted unless they were independently owned and committed by their original task.
+Expected: no whitespace errors in feature files; four feature commits follow the plan commit. The MySQL, timeout-separation, and earlier documentation work remain part of committed baseline `22fc1ae7`; only the required end-of-task `memory.md` entry may remain unstaged.
 
 - [ ] **Step 4: Perform read-only page acceptance**
 
@@ -772,7 +772,7 @@ Do not stop, restart, edit, or probe a real target as part of this acceptance. I
 
 Append a concise entry under `## 2026-08-03` in `memory.md` stating that page entry no longer creates probe tasks, the collector uses 15-second scheduling with five-second/eight-worker SSH checks, server changes arrive through `status.server.updated`, and list interaction state is preserved. Do not include credentials, addresses, tokens, or long logs.
 
-Because `memory.md` already contains unrelated uncommitted history, leave it unstaged unless its owner explicitly authorizes a combined memory commit.
+Leave the new `memory.md` entry unstaged unless the user explicitly asks to include repository memory in a feature commit.
 
 - [ ] **Step 6: Verify final commits contain only feature files**
 
@@ -792,4 +792,4 @@ feat: collect live server status
 fix: honor SSH handshake deadlines
 ```
 
-If the backend commit cannot be separated safely from the pre-existing timeout hunks, stop before committing and report the exact overlapping hunk. Never commit or discard someone else's changes to satisfy the expected history.
+If any new unrelated worktree change appears during execution, stop before staging the affected file and report the exact overlap. Never commit or discard someone else's changes to satisfy the expected history.
