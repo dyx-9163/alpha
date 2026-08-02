@@ -32,6 +32,9 @@ type Manager struct {
 	interval               time.Duration
 	dockerSummaryTimeout   time.Duration
 	appInstanceTimeout     time.Duration
+	serverProbe            func(context.Context, store.Server) error
+	serverProbeTimeout     time.Duration
+	serverProbeWorkers     int
 	dockerSummaryForServer func(context.Context, store.Server) (adapter.DockerSummary, error)
 	dockerSummaryWorkers   int
 	startedCh              chan struct{}
@@ -47,6 +50,9 @@ func NewManager(s *store.Store, events Publisher, interval time.Duration) *Manag
 		interval:               interval,
 		dockerSummaryTimeout:   5 * time.Second,
 		appInstanceTimeout:     30 * time.Second,
+		serverProbe:            adapter.ProbeSSH,
+		serverProbeTimeout:     5 * time.Second,
+		serverProbeWorkers:     8,
 		dockerSummaryForServer: adapter.DockerSummaryForServer,
 		dockerSummaryWorkers:   8,
 		startedCh:              make(chan struct{}),
@@ -131,36 +137,7 @@ func (m *Manager) run(ctx context.Context, name string, fn func(context.Context)
 }
 
 func (m *Manager) collectServers(ctx context.Context) error {
-	servers, err := m.store.ListServers()
-	if err != nil {
-		return err
-	}
-	for _, server := range servers {
-		payload := map[string]any{
-			"id":         server.ID,
-			"name":       server.Name,
-			"host":       server.Host,
-			"status":     server.Status,
-			"dockerHost": server.DockerHost,
-			"updatedAt":  server.UpdatedAt,
-		}
-		status := strings.TrimSpace(server.Status)
-		if status == "" {
-			status = "unknown"
-		}
-		if err := m.saveSnapshot(ctx, store.StatusSnapshot{
-			Scope:       "server",
-			ResourceID:  server.ID,
-			ServerID:    server.ID,
-			Status:      status,
-			LastError:   server.LastError,
-			Payload:     marshalPayload(payload),
-			CollectedAt: time.Now(),
-		}); err != nil {
-			return err
-		}
-	}
-	return nil
+	return m.collectLiveServers(ctx)
 }
 
 func (m *Manager) collectDockerSummaries(ctx context.Context) error {
@@ -466,6 +443,10 @@ func (silentLogger) Info(string, ...any)  {}
 func (silentLogger) Error(string, ...any) {}
 
 func (m *Manager) saveSnapshot(ctx context.Context, snapshot store.StatusSnapshot) error {
+	return m.saveSnapshotWithPolicy(ctx, snapshot, true)
+}
+
+func (m *Manager) saveSnapshotWithPolicy(ctx context.Context, snapshot store.StatusSnapshot, publishUnchanged bool) error {
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
@@ -473,7 +454,7 @@ func (m *Manager) saveSnapshot(ctx context.Context, snapshot store.StatusSnapsho
 	if err != nil {
 		return err
 	}
-	if m.events != nil {
+	if m.events != nil && (changed || publishUnchanged) {
 		payload := snapshotEventPayload(saved)
 		payload["changed"] = changed
 		m.events.Publish(realtime.Event{
