@@ -69,6 +69,9 @@ func (m *Manager) collectOneServer(ctx context.Context, public store.Server) err
 	status := "available"
 	errText := ""
 	server, err := m.store.GetServer(public.ID, true)
+	if err != nil && !errors.Is(err, store.ErrServerCredentialDecryption) {
+		return err
+	}
 	if err == nil {
 		timeout := m.serverProbeTimeout
 		if timeout <= 0 {

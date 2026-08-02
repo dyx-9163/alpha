@@ -28,6 +28,9 @@ type Store struct {
 	secretKeyMu       sync.RWMutex
 }
 
+// ErrServerCredentialDecryption identifies a failure to decrypt a saved server credential.
+var ErrServerCredentialDecryption = errors.New("server credential decryption failed")
+
 func Open(path string) (*Store, error) {
 	return OpenWithSecret(path, "")
 }
@@ -515,10 +518,10 @@ func (s *Store) GetServer(id string, includeSecret bool) (Server, error) {
 		return v, nil
 	}
 	if v.Password, err = s.decryptSecret(v.Password); err != nil {
-		return Server{}, err
+		return Server{}, fmt.Errorf("%w: %v", ErrServerCredentialDecryption, err)
 	}
 	if v.PrivateKey, err = s.decryptSecret(v.PrivateKey); err != nil {
-		return Server{}, err
+		return Server{}, fmt.Errorf("%w: %v", ErrServerCredentialDecryption, err)
 	}
 	return v, err
 }

@@ -2,6 +2,7 @@ package collector
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -189,5 +190,85 @@ func TestServerCollectorReturnsInfrastructureError(t *testing.T) {
 
 	if err := manager.collectServers(context.Background()); err == nil {
 		t.Fatal("expected closed store to fail collection")
+	}
+}
+
+func TestServerCollectorReturnsGetServerDatabaseError(t *testing.T) {
+	databasePath := filepath.Join(t.TempDir(), "aifar.db")
+	db, err := store.Open(databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	server, err := db.SaveServer(store.Server{Name: "node-1", Host: "10.0.0.10"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mutator, err := sql.Open("sqlite", databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mutator.Exec(`update servers set password=null where id=?`, server.ID); err != nil {
+		_ = mutator.Close()
+		t.Fatal(err)
+	}
+	if err := mutator.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	manager := NewManager(db, nil, time.Minute)
+	manager.serverProbe = func(context.Context, store.Server) error {
+		t.Fatal("probe must not run when the server row cannot be scanned")
+		return nil
+	}
+	if err := manager.collectServers(context.Background()); err == nil {
+		t.Fatal("expected post-list GetServer database error to fail collection")
+	}
+	if _, err := db.GetStatusSnapshot("server", server.ID); !store.IsNotFound(err) {
+		t.Fatalf("database error was persisted as an observation: %v", err)
+	}
+}
+
+func TestServerCollectorTreatsCredentialDecryptionAsFailedObservation(t *testing.T) {
+	databasePath := filepath.Join(t.TempDir(), "aifar.db")
+	seed, err := store.OpenWithSecret(databasePath, "correct-credential-key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, err := seed.SaveServer(store.Server{
+		Name: "node-1", Host: "10.0.0.10", Username: "root",
+		AuthType: "password", Password: "collector-password-secret",
+	})
+	if err != nil {
+		_ = seed.Close()
+		t.Fatal(err)
+	}
+	if err := seed.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err := store.OpenWithSecret(databasePath, "wrong-credential-key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	manager := NewManager(db, nil, time.Minute)
+	manager.serverProbe = func(context.Context, store.Server) error {
+		t.Fatal("probe must not run when credentials cannot be decrypted")
+		return nil
+	}
+	if err := manager.collectServers(context.Background()); err != nil {
+		t.Fatalf("credential decryption should remain a per-server observation: %v", err)
+	}
+	snapshot, err := db.GetStatusSnapshot("server", server.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.Status != "failed" || snapshot.LastError == "" {
+		t.Fatalf("expected failed credential-decryption snapshot, got %+v", snapshot)
+	}
+	if strings.Contains(snapshot.LastError, "collector-password-secret") {
+		t.Fatalf("credential leaked in failed snapshot: %+v", snapshot)
 	}
 }
