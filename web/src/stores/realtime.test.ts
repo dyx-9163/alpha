@@ -276,6 +276,28 @@ describe('realtime status snapshots', () => {
     expect(store.revision).toBe(1)
   })
 
+  it('indexes a server status event by server id', () => {
+    const store = useRealtimeStore()
+
+    store.applyEvent({
+      type: 'status.server.updated',
+      resource: 'server',
+      resourceId: 'server-9',
+      serverId: 'server-9',
+      status: 'failed',
+      version: 4,
+      collectedAt: '2026-08-03T10:00:00Z',
+      payload: {
+        scope: 'server', resourceId: 'server-9', serverId: 'server-9',
+        status: 'failed', lastError: 'connection refused', version: 4,
+        collectedAt: '2026-08-03T10:00:00Z', updatedAt: '2026-08-03T10:00:01Z',
+        payload: { status: 'failed' }
+      }
+    })
+
+    expect(store.serverSnapshot('server-9')?.status).toBe('failed')
+  })
+
   it('does not let an older in-flight GET overwrite a newer SSE snapshot', async () => {
     const store = useRealtimeStore()
     const older = deferred<{ items: StatusSnapshot[] }>()

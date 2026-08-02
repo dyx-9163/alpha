@@ -69,6 +69,9 @@ export const useRealtimeStore = defineStore('realtime', {
     dockerSummarySnapshot(state): (serverId: string) => StatusSnapshot | undefined {
       return (serverId: string) => state.statusSnapshotsByKey[snapshotKey('docker.summary', serverId)]
     },
+    serverSnapshot(state): (serverId: string) => StatusSnapshot | undefined {
+      return (serverId: string) => state.statusSnapshotsByKey[snapshotKey('server', serverId)]
+    },
     aifarRuntimeSnapshot(state): (instanceId: string) => StatusSnapshot | undefined {
       return (instanceId: string) => state.statusSnapshotsByKey[snapshotKey('aifar.runtime', instanceId)]
     }
