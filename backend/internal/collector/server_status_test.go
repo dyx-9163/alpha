@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -35,15 +36,23 @@ func TestServerCollectorProbesWithSecretAndPublishesOnlyChanges(t *testing.T) {
 	ch, unsubscribe := events.Subscribe()
 	defer unsubscribe()
 	manager := NewManager(db, events, time.Minute)
+	var credentialMu sync.Mutex
+	observedPassword := ""
 	manager.serverProbe = func(_ context.Context, target store.Server) error {
-		if target.Password != secret {
-			t.Fatalf("probe did not receive decrypted credential")
-		}
+		credentialMu.Lock()
+		observedPassword = target.Password
+		credentialMu.Unlock()
 		return fmt.Errorf("password=%s connection refused", target.Password)
 	}
 
 	if err := manager.collectServers(context.Background()); err != nil {
 		t.Fatal(err)
+	}
+	credentialMu.Lock()
+	passwordSeenByProbe := observedPassword
+	credentialMu.Unlock()
+	if passwordSeenByProbe != secret {
+		t.Fatal("probe did not receive decrypted credential")
 	}
 	snapshot, err := db.GetStatusSnapshot("server", server.ID)
 	if err != nil {
@@ -218,12 +227,16 @@ func TestServerCollectorReturnsGetServerDatabaseError(t *testing.T) {
 	}
 
 	manager := NewManager(db, nil, time.Minute)
+	var unexpectedProbe atomic.Bool
 	manager.serverProbe = func(context.Context, store.Server) error {
-		t.Fatal("probe must not run when the server row cannot be scanned")
-		return nil
+		unexpectedProbe.Store(true)
+		return fmt.Errorf("unexpected probe for unscannable server row")
 	}
 	if err := manager.collectServers(context.Background()); err == nil {
 		t.Fatal("expected post-list GetServer database error to fail collection")
+	}
+	if unexpectedProbe.Load() {
+		t.Fatal("probe ran when the server row could not be scanned")
 	}
 	if _, err := db.GetStatusSnapshot("server", server.ID); !store.IsNotFound(err) {
 		t.Fatalf("database error was persisted as an observation: %v", err)
@@ -254,12 +267,16 @@ func TestServerCollectorTreatsCredentialDecryptionAsFailedObservation(t *testing
 	}
 	defer db.Close()
 	manager := NewManager(db, nil, time.Minute)
+	var unexpectedProbe atomic.Bool
 	manager.serverProbe = func(context.Context, store.Server) error {
-		t.Fatal("probe must not run when credentials cannot be decrypted")
-		return nil
+		unexpectedProbe.Store(true)
+		return fmt.Errorf("unexpected probe for undecryptable credentials")
 	}
 	if err := manager.collectServers(context.Background()); err != nil {
 		t.Fatalf("credential decryption should remain a per-server observation: %v", err)
+	}
+	if unexpectedProbe.Load() {
+		t.Fatal("probe ran when credentials could not be decrypted")
 	}
 	snapshot, err := db.GetStatusSnapshot("server", server.ID)
 	if err != nil {

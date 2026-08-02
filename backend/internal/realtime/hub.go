@@ -23,11 +23,22 @@ type Event struct {
 type Hub struct {
 	mu          sync.Mutex
 	next        int64
-	subscribers map[chan Event]struct{}
+	subscribers map[*subscriber]struct{}
 }
 
 func NewHub() *Hub {
-	return &Hub{subscribers: map[chan Event]struct{}{}}
+	return &Hub{subscribers: map[*subscriber]struct{}{}}
+}
+
+const subscriberBufferSize = 64
+
+type subscriber struct {
+	events     chan Event
+	gap        chan struct{}
+	output     chan Event
+	done       chan struct{}
+	stopOnce   sync.Once
+	gapPending bool
 }
 
 func (h *Hub) Publish(event Event) {
@@ -42,35 +53,100 @@ func (h *Hub) Publish(event Event) {
 	if event.CreatedAt.IsZero() {
 		event.CreatedAt = time.Now().UTC()
 	}
-	subscribers := make([]chan Event, 0, len(h.subscribers))
-	for ch := range h.subscribers {
-		subscribers = append(subscribers, ch)
+	for subscriber := range h.subscribers {
+		select {
+		case subscriber.events <- event:
+		default:
+			if !subscriber.gapPending {
+				subscriber.gapPending = true
+				subscriber.gap <- struct{}{}
+			}
+		}
 	}
 	h.mu.Unlock()
-	for _, ch := range subscribers {
+}
+
+func (h *Hub) Subscribe() (<-chan Event, func()) {
+	if h == nil {
+		output := make(chan Event)
+		close(output)
+		return output, func() {}
+	}
+	subscriber := &subscriber{
+		events: make(chan Event, subscriberBufferSize),
+		gap:    make(chan struct{}, 1),
+		output: make(chan Event),
+		done:   make(chan struct{}),
+	}
+	h.mu.Lock()
+	h.subscribers[subscriber] = struct{}{}
+	h.mu.Unlock()
+	go h.forward(subscriber)
+	return subscriber.output, func() {
+		h.mu.Lock()
+		if _, ok := h.subscribers[subscriber]; ok {
+			delete(h.subscribers, subscriber)
+			subscriber.stopOnce.Do(func() { close(subscriber.done) })
+		}
+		h.mu.Unlock()
+	}
+}
+
+func (h *Hub) forward(subscriber *subscriber) {
+	defer close(subscriber.output)
+	for {
 		select {
-		case ch <- event:
+		case <-subscriber.done:
+			return
+		case <-subscriber.gap:
+			if !sendSubscriberEvent(subscriber, overflowGapEvent()) {
+				return
+			}
+			h.clearGap(subscriber)
+			continue
 		default:
+		}
+
+		select {
+		case <-subscriber.done:
+			return
+		case <-subscriber.gap:
+			if !sendSubscriberEvent(subscriber, overflowGapEvent()) {
+				return
+			}
+			h.clearGap(subscriber)
+		case event := <-subscriber.events:
+			if !sendSubscriberEvent(subscriber, event) {
+				return
+			}
 		}
 	}
 }
 
-func (h *Hub) Subscribe() (<-chan Event, func()) {
-	ch := make(chan Event, 64)
-	if h == nil {
-		close(ch)
-		return ch, func() {}
-	}
+func (h *Hub) clearGap(subscriber *subscriber) {
 	h.mu.Lock()
-	h.subscribers[ch] = struct{}{}
+	if _, ok := h.subscribers[subscriber]; ok {
+		subscriber.gapPending = false
+	}
 	h.mu.Unlock()
-	return ch, func() {
-		h.mu.Lock()
-		if _, ok := h.subscribers[ch]; ok {
-			delete(h.subscribers, ch)
-			close(ch)
-		}
-		h.mu.Unlock()
+}
+
+func sendSubscriberEvent(subscriber *subscriber, event Event) bool {
+	select {
+	case subscriber.output <- event:
+		return true
+	case <-subscriber.done:
+		return false
+	}
+}
+
+func overflowGapEvent() Event {
+	return Event{
+		Type:      "realtime.gap",
+		Resource:  "status",
+		Status:    "overflow",
+		CreatedAt: time.Now().UTC(),
+		Payload:   map[string]any{"reason": "subscriber_overflow"},
 	}
 }
 

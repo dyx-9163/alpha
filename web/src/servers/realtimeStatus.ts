@@ -10,7 +10,8 @@ export function applyRealtimeStatusToServer(server: ServerRecord, snapshot?: Sta
   if (typeof snapshot.status !== 'string') return server
   const status = snapshot.status.trim()
   if (!status) return server
-  const lastError = String(snapshot.lastError ?? '').trim()
+  if (snapshot.lastError !== undefined && typeof snapshot.lastError !== 'string') return server
+  const lastError = (snapshot.lastError ?? '').trim()
   if (server.status === status && String(server.lastError ?? '') === lastError) return server
   return { ...server, status, lastError }
 }

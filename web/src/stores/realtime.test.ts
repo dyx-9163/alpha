@@ -11,8 +11,21 @@ vi.mock('../api/client', () => ({
 }))
 
 import { type StatusSnapshot, useRealtimeStore } from './realtime'
+import { applyRealtimeStatusToServer } from '../servers/realtimeStatus'
+import type { ServerRecord } from '../servers/types'
 
 const key = 'app.instance:instance-1'
+const canonicalServer: ServerRecord = {
+  id: 'server-9',
+  name: 'Primary',
+  host: '10.0.0.9',
+  port: 22,
+  username: 'root',
+  authType: 'password',
+  status: 'available',
+  lastError: '',
+  updatedAt: '2026-08-03T09:59:59Z'
+}
 
 describe('realtime status snapshots', () => {
   beforeEach(() => {
@@ -296,6 +309,84 @@ describe('realtime status snapshots', () => {
     })
 
     expect(store.serverSnapshot('server-9')?.status).toBe('failed')
+  })
+
+  it.each([
+    ['status', { status: { state: 'failed' }, lastError: '' }],
+    ['lastError', { status: 'failed', lastError: { message: 'connection refused' } }]
+  ])('rejects a server SSE snapshot with non-string %s before it reaches a server row', (_field, malformed) => {
+    const store = useRealtimeStore()
+
+    store.applyEvent({
+      type: 'status.server.updated',
+      resource: 'server',
+      resourceId: 'server-9',
+      version: 4,
+      collectedAt: '2026-08-03T10:00:00Z',
+      payload: {
+        scope: 'server',
+        resourceId: 'server-9',
+        version: 4,
+        collectedAt: '2026-08-03T10:00:00Z',
+        ...malformed
+      }
+    } as unknown as Parameters<typeof store.applyEvent>[0])
+
+    expect(store.serverSnapshot('server-9')).toBeUndefined()
+    expect(applyRealtimeStatusToServer(canonicalServer, store.serverSnapshot('server-9'))).toBe(canonicalServer)
+  })
+
+  it.each([
+    ['status', { status: { state: 'failed' }, lastError: '' }],
+    ['lastError', { status: 'failed', lastError: ['connection refused'] }]
+  ])('rejects a server snapshot GET item with non-string %s before it reaches a server row', async (_field, malformed) => {
+    const store = useRealtimeStore()
+    apiGetMock.mockResolvedValueOnce({
+      items: [{
+        scope: 'server',
+        resourceId: 'server-9',
+        version: 4,
+        collectedAt: '2026-08-03T10:00:00Z',
+        ...malformed
+      }]
+    })
+
+    await expect(store.loadStatusSnapshots()).resolves.toBe(true)
+
+    expect(store.serverSnapshot('server-9')).toBeUndefined()
+    expect(applyRealtimeStatusToServer(canonicalServer, store.serverSnapshot('server-9'))).toBe(canonicalServer)
+  })
+
+  it('coalesces realtime gaps and reloads persisted snapshots again after an in-flight recovery', async () => {
+    const store = useRealtimeStore()
+    const first = deferred<{ items: StatusSnapshot[] }>()
+    const followUp = deferred<{ items: StatusSnapshot[] }>()
+    apiGetMock.mockReturnValueOnce(first.promise).mockReturnValueOnce(followUp.promise)
+
+    store.applyEvent({ type: 'realtime.gap' })
+    store.applyEvent({ type: 'realtime.gap' })
+    store.applyEvent({ type: 'realtime.gap' })
+
+    expect(apiGetMock).toHaveBeenCalledTimes(1)
+    first.resolve({ items: [] })
+    await vi.waitFor(() => expect(apiGetMock).toHaveBeenCalledTimes(2))
+    followUp.resolve({
+      items: [{
+        scope: 'server',
+        resourceId: 'server-9',
+        status: 'failed',
+        lastError: 'connection refused',
+        version: 9,
+        collectedAt: '2026-08-03T10:00:30Z'
+      }]
+    })
+    await vi.waitFor(() => expect(store.serverSnapshot('server-9')?.version).toBe(9))
+
+    expect(applyRealtimeStatusToServer(canonicalServer, store.serverSnapshot('server-9'))).toEqual({
+      ...canonicalServer,
+      status: 'failed',
+      lastError: 'connection refused'
+    })
   })
 
   it('does not let an older in-flight GET overwrite a newer SSE snapshot', async () => {

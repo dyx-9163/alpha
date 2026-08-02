@@ -54,6 +54,8 @@ export const useRealtimeStore = defineStore('realtime', {
     revision: 0,
     statusRevision: 0,
     snapshotsLoadedAt: 0,
+    statusRecoveryInFlight: false,
+    statusRecoveryPending: false,
     statusSnapshotsByKey: {} as Record<string, StatusSnapshot>
   }),
   getters: {
@@ -143,6 +145,9 @@ export const useRealtimeStore = defineStore('realtime', {
       if (snapshot) {
         this.applyStatusSnapshot(snapshot)
       }
+      if (event.type === 'realtime.gap') {
+        this.recoverStatusSnapshots()
+      }
       if (event.taskId && (event.type === 'task.updated' || event.type === 'task.finished')) {
         void useTaskProgressStore().refreshTask(event.taskId)
       }
@@ -164,6 +169,20 @@ export const useRealtimeStore = defineStore('realtime', {
       }
       this.snapshotsLoadedAt = Date.now()
       return true
+    },
+    recoverStatusSnapshots() {
+      if (this.statusRecoveryInFlight) {
+        this.statusRecoveryPending = true
+        return
+      }
+      this.statusRecoveryInFlight = true
+      void this.loadStatusSnapshots().finally(() => {
+        this.statusRecoveryInFlight = false
+        if (this.statusRecoveryPending) {
+          this.statusRecoveryPending = false
+          this.recoverStatusSnapshots()
+        }
+      })
     },
     applyStatusSnapshot(snapshot: StatusSnapshot) {
       const merged = mergeStatusSnapshots(this.statusSnapshotsByKey, [snapshot])
@@ -231,20 +250,30 @@ function snapshotFromRealtimeEvent(event: RealtimeEvent): StatusSnapshot | null 
   if (!resourceId) {
     return null
   }
+  const status = Object.prototype.hasOwnProperty.call(payload, 'status') ? payload.status : event.status
+  const lastError = Object.prototype.hasOwnProperty.call(payload, 'lastError') ? payload.lastError : undefined
   return normalizeSnapshot({
     scope,
     resourceId,
     serverId: normalizeString(payload.serverId || event.serverId),
-    status: normalizeString(payload.status || event.status),
+    status,
     payload: objectRecord(payload.payload),
-    lastError: stringValue(payload.lastError),
+    lastError,
     version: Number(payload.version || event.version || 0),
     collectedAt: stringValue(payload.collectedAt || event.collectedAt),
     updatedAt: stringValue(payload.updatedAt)
   })
 }
 
-function normalizeSnapshot(snapshot: StatusSnapshot): StatusSnapshot {
+type RuntimeStatusSnapshot = Omit<StatusSnapshot, 'status' | 'lastError'> & {
+  status?: unknown
+  lastError?: unknown
+}
+
+function normalizeSnapshot(snapshot: RuntimeStatusSnapshot): StatusSnapshot | null {
+  if (!isOptionalString(snapshot.status) || !isOptionalString(snapshot.lastError)) {
+    return null
+  }
   return {
     ...snapshot,
     scope: normalizeString(snapshot.scope),
@@ -264,6 +293,9 @@ function mergeStatusSnapshots(
   let changed = false
   for (const snapshot of incoming) {
     const normalized = normalizeSnapshot(snapshot)
+    if (!normalized) {
+      continue
+    }
     const key = snapshotKey(normalized.scope, normalized.resourceId)
     if (!key) {
       continue
@@ -349,6 +381,10 @@ function objectRecord(value: unknown): Record<string, unknown> {
 
 function stringValue(value: unknown) {
   return String(value ?? '').trim()
+}
+
+function isOptionalString(value: unknown) {
+  return value === undefined || typeof value === 'string'
 }
 
 function normalizeString(value: unknown) {

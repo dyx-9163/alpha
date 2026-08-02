@@ -63,12 +63,15 @@ describe('applyRealtimeStatusToServer', () => {
     expect(result).toBe(server)
   })
 
-  it('keeps the canonical server when the snapshot status is not a string', () => {
+  it.each([
+    ['status', { status: { state: 'failed' }, lastError: '' }],
+    ['lastError', { status: 'failed', lastError: { message: 'connection refused' } }]
+  ])('keeps the canonical server when snapshot %s is not a string', (_field, malformed) => {
     const result = applyRealtimeStatusToServer(server, {
       scope: 'server',
       resourceId: 'server-9',
-      status: { state: 'failed' },
-      collectedAt: '2026-08-03T10:00:01Z'
+      collectedAt: '2026-08-03T10:00:01Z',
+      ...malformed
     } as unknown as StatusSnapshot)
 
     expect(result).toBe(server)
