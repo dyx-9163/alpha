@@ -63,7 +63,7 @@ export function useServerWorkbench(
 
   function mergeLiveStatus(server: ServerRecord) {
     return probingIds.value.has(server.id)
-      ? server
+      ? { ...server, status: 'probing', lastError: '' }
       : applyRealtimeStatusToServer(server, resolveSnapshot(server.id))
   }
 

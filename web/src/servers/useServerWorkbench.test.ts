@@ -84,7 +84,7 @@ describe('useServerWorkbench realtime status', () => {
     expect(workbench.form.name).toBe('draft name')
   })
 
-  it('keeps manual probing status until the probe task finishes and then reloads', async () => {
+  it('keeps manual probing status through refresh until the probe task finishes', async () => {
     const snapshots = new Map<string, StatusSnapshot>()
     const taskDone = deferred<string>()
     listServersMock.mockResolvedValue([server])
@@ -101,11 +101,16 @@ describe('useServerWorkbench realtime status', () => {
     expect(workbench.probingIds.value.has('srv-1')).toBe(true)
     expect(workbench.servers.value[0]).toMatchObject({ status: 'probing', lastError: '' })
 
+    await workbench.load()
+
+    expect(workbench.probingIds.value.has('srv-1')).toBe(true)
+    expect(workbench.servers.value[0]).toMatchObject({ status: 'probing', lastError: '' })
+
     taskDone.resolve('success')
     await probePromise
 
     expect(workbench.probingIds.value.has('srv-1')).toBe(false)
-    expect(listServersMock).toHaveBeenCalledTimes(2)
+    expect(listServersMock).toHaveBeenCalledTimes(3)
     expect(workbench.servers.value[0]).toMatchObject({ status: 'failed', lastError: 'timeout' })
   })
 })
