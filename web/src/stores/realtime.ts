@@ -42,6 +42,8 @@ type AppInstanceLike = {
 
 let source: EventSource | null = null
 let reconnectTimer: number | undefined
+const statusRecoveryRetryBaseDelay = 1000
+const statusRecoveryRetryMaxDelay = 30000
 
 export const useRealtimeStore = defineStore('realtime', {
   state: () => ({
@@ -56,6 +58,9 @@ export const useRealtimeStore = defineStore('realtime', {
     snapshotsLoadedAt: 0,
     statusRecoveryInFlight: false,
     statusRecoveryPending: false,
+    statusRecoveryRetryAttempts: 0,
+    statusRecoveryRetryTimer: undefined as number | undefined,
+    statusRecoveryGeneration: 0,
     statusSnapshotsByKey: {} as Record<string, StatusSnapshot>
   }),
   getters: {
@@ -112,6 +117,7 @@ export const useRealtimeStore = defineStore('realtime', {
     },
     disconnect() {
       clearReconnectTimer()
+      this.resetStatusRecovery()
       if (source) {
         source.close()
         source = null
@@ -120,6 +126,7 @@ export const useRealtimeStore = defineStore('realtime', {
       this.error = ''
     },
     scheduleReconnect() {
+      this.resetStatusRecovery()
       if (reconnectTimer !== undefined) {
         return
       }
@@ -146,7 +153,7 @@ export const useRealtimeStore = defineStore('realtime', {
         this.applyStatusSnapshot(snapshot)
       }
       if (event.type === 'realtime.gap') {
-        this.recoverStatusSnapshots()
+        void this.recoverStatusSnapshots()
       }
       if (event.taskId && (event.type === 'task.updated' || event.type === 'task.finished')) {
         void useTaskProgressStore().refreshTask(event.taskId)
@@ -155,11 +162,16 @@ export const useRealtimeStore = defineStore('realtime', {
         useAlertsStore().applyRealtimeEvent(event)
       }
     },
-    async loadStatusSnapshots() {
+    async loadStatusSnapshots(recoveryGeneration?: number) {
       let result: { items?: StatusSnapshot[] } | null
       try {
         result = await apiGet<{ items?: StatusSnapshot[] } | null>('/status/snapshots')
       } catch {
+        return false
+      }
+      if (recoveryGeneration !== undefined && (
+        recoveryGeneration !== this.statusRecoveryGeneration || !this.connected
+      )) {
         return false
       }
       const merged = mergeStatusSnapshots(this.statusSnapshotsByKey, asArray<StatusSnapshot>(result?.items))
@@ -170,19 +182,62 @@ export const useRealtimeStore = defineStore('realtime', {
       this.snapshotsLoadedAt = Date.now()
       return true
     },
-    recoverStatusSnapshots() {
+    async recoverStatusSnapshots() {
+      if (!this.connected || this.statusRecoveryRetryTimer !== undefined) {
+        return
+      }
       if (this.statusRecoveryInFlight) {
         this.statusRecoveryPending = true
         return
       }
+      const generation = this.statusRecoveryGeneration
       this.statusRecoveryInFlight = true
-      void this.loadStatusSnapshots().finally(() => {
-        this.statusRecoveryInFlight = false
-        if (this.statusRecoveryPending) {
-          this.statusRecoveryPending = false
-          this.recoverStatusSnapshots()
+      const recovered = await this.loadStatusSnapshots(generation)
+      if (generation !== this.statusRecoveryGeneration) {
+        return
+      }
+      this.statusRecoveryInFlight = false
+      if (!this.connected) {
+        return
+      }
+      if (!recovered) {
+        this.statusRecoveryPending = false
+        this.scheduleStatusRecoveryRetry()
+        return
+      }
+      this.statusRecoveryRetryAttempts = 0
+      if (this.statusRecoveryPending) {
+        this.statusRecoveryPending = false
+        void this.recoverStatusSnapshots()
+      }
+    },
+    scheduleStatusRecoveryRetry() {
+      if (!this.connected || this.statusRecoveryRetryTimer !== undefined) {
+        return
+      }
+      const exponent = Math.min(this.statusRecoveryRetryAttempts, 5)
+      const delay = Math.min(statusRecoveryRetryMaxDelay, statusRecoveryRetryBaseDelay * (2 ** exponent))
+      const generation = this.statusRecoveryGeneration
+      this.statusRecoveryRetryAttempts += 1
+      this.statusRecoveryRetryTimer = globalThis.setTimeout(() => {
+        if (generation !== this.statusRecoveryGeneration) {
+          return
         }
-      })
+        this.statusRecoveryRetryTimer = undefined
+        if (this.connected) {
+          void this.recoverStatusSnapshots()
+        }
+      }, delay)
+    },
+    resetStatusRecovery() {
+      if (this.statusRecoveryRetryTimer !== undefined) {
+        globalThis.clearTimeout(this.statusRecoveryRetryTimer)
+      }
+      this.statusRecoveryRetryTimer = undefined
+      this.statusRecoveryRetryAttempts = 0
+      this.statusRecoveryPending = false
+      this.statusRecoveryInFlight = false
+      this.statusRecoveryGeneration += 1
     },
     applyStatusSnapshot(snapshot: StatusSnapshot) {
       const merged = mergeStatusSnapshots(this.statusSnapshotsByKey, [snapshot])

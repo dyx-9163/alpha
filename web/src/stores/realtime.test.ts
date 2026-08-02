@@ -359,6 +359,7 @@ describe('realtime status snapshots', () => {
 
   it('coalesces realtime gaps and reloads persisted snapshots again after an in-flight recovery', async () => {
     const store = useRealtimeStore()
+    store.status = 'connected'
     const first = deferred<{ items: StatusSnapshot[] }>()
     const followUp = deferred<{ items: StatusSnapshot[] }>()
     apiGetMock.mockReturnValueOnce(first.promise).mockReturnValueOnce(followUp.promise)
@@ -387,6 +388,97 @@ describe('realtime status snapshots', () => {
       status: 'failed',
       lastError: 'connection refused'
     })
+  })
+
+  it('retries a failed realtime gap recovery until the persisted server snapshot converges', async () => {
+    vi.useFakeTimers()
+    try {
+      const store = useRealtimeStore()
+      store.status = 'connected'
+      apiGetMock
+        .mockRejectedValueOnce(new Error('temporary snapshot failure'))
+        .mockResolvedValueOnce({
+          items: [{
+            scope: 'server',
+            resourceId: 'server-9',
+            status: 'failed',
+            lastError: 'connection refused',
+            version: 10,
+            collectedAt: '2026-08-03T10:00:45Z'
+          }]
+        })
+
+      store.applyEvent({ type: 'realtime.gap' })
+      await Promise.resolve()
+      await Promise.resolve()
+
+      expect(apiGetMock).toHaveBeenCalledTimes(1)
+      expect(store.serverSnapshot('server-9')).toBeUndefined()
+
+      await vi.runOnlyPendingTimersAsync()
+
+      expect(apiGetMock).toHaveBeenCalledTimes(2)
+      expect(applyRealtimeStatusToServer(canonicalServer, store.serverSnapshot('server-9'))).toEqual({
+        ...canonicalServer,
+        status: 'failed',
+        lastError: 'connection refused'
+      })
+    } finally {
+      vi.clearAllTimers()
+      vi.useRealTimers()
+    }
+  })
+
+  it('disconnect cancels a scheduled realtime gap recovery retry', async () => {
+    vi.useFakeTimers()
+    try {
+      const store = useRealtimeStore()
+      store.status = 'connected'
+      apiGetMock.mockRejectedValueOnce(new Error('temporary snapshot failure'))
+
+      store.applyEvent({ type: 'realtime.gap' })
+      await Promise.resolve()
+      await Promise.resolve()
+      await Promise.resolve()
+      await Promise.resolve()
+
+      expect(vi.getTimerCount()).toBe(1)
+      store.disconnect()
+      expect(vi.getTimerCount()).toBe(0)
+
+      await vi.runAllTimersAsync()
+
+      expect(apiGetMock).toHaveBeenCalledTimes(1)
+      expect(store.status).toBe('disconnected')
+    } finally {
+      vi.clearAllTimers()
+      vi.useRealTimers()
+    }
+  })
+
+  it('disconnect prevents an in-flight realtime gap recovery from mutating snapshots', async () => {
+    const store = useRealtimeStore()
+    store.status = 'connected'
+    const pending = deferred<{ items: StatusSnapshot[] }>()
+    apiGetMock.mockReturnValueOnce(pending.promise)
+
+    store.applyEvent({ type: 'realtime.gap' })
+    store.disconnect()
+    pending.resolve({
+      items: [{
+        scope: 'server',
+        resourceId: 'server-9',
+        status: 'failed',
+        lastError: 'connection refused',
+        version: 10,
+        collectedAt: '2026-08-03T10:00:45Z'
+      }]
+    })
+    await Promise.resolve()
+    await Promise.resolve()
+
+    expect(store.serverSnapshot('server-9')).toBeUndefined()
+    expect(store.status).toBe('disconnected')
   })
 
   it('does not let an older in-flight GET overwrite a newer SSE snapshot', async () => {
