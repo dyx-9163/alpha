@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"aifar-deployment/backend/internal/installer/installerkit"
+	"aifar-deployment/backend/internal/logmask"
 	"aifar-deployment/backend/internal/store"
 )
 
@@ -111,7 +112,7 @@ func sanitizeMySQLCredentialText(value string, secrets ...string) string {
 		}
 		value = strings.ReplaceAll(value, secret, "[REDACTED]")
 	}
-	return value
+	return logmask.Mask(value)
 }
 
 type mysqlSanitizedLogger struct {

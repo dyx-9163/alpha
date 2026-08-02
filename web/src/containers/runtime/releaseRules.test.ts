@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import {
+  runtimeReleaseDeleteDisabledReason,
   runtimeReleaseRollbackDisabledReason,
   runtimeReleaseRollbackServices
 } from './releaseRules'
@@ -60,5 +61,43 @@ describe('runtime release rollback rules', () => {
     expect(services).not.toBe(row.rollbackServices)
     services.push('mutated')
     expect(row.rollbackServices).toEqual(['gateway', 'oauth', 'gateway', ''])
+  })
+})
+
+describe('runtime release deletion rules', () => {
+  it.each([
+    ['AIFAR_RELEASE_DELETE_CURRENT', 'containers.releaseDeleteCurrentUnavailable'],
+    ['AIFAR_RELEASE_DELETE_ACTIVE', 'containers.releaseDeleteActiveUnavailable']
+  ] as const)('maps %s to its disabled explanation', (deleteUnavailableReason, messageKey) => {
+    const row = {
+      ...release(),
+      deleteAvailable: false,
+      deleteUnavailableReason
+    } as AifarRelease
+
+    expect(runtimeReleaseDeleteDisabledReason(row, options)).toBe(`translated:${messageKey}`)
+  })
+
+  it('allows a historical release that the backend marks deletable', () => {
+    const row = {
+      ...release(),
+      deleteAvailable: true,
+      deleteUnavailableReason: ''
+    } as AifarRelease
+
+    expect(runtimeReleaseDeleteDisabledReason(row, options)).toBe('')
+  })
+
+  it('denies deletion before checking the backend reason', () => {
+    const row = {
+      ...release({ releaseId: '' }),
+      deleteAvailable: true,
+      deleteUnavailableReason: ''
+    } as AifarRelease
+
+    expect(runtimeReleaseDeleteDisabledReason(row, {
+      ...options,
+      canManage: false
+    })).toBe('permission denied')
   })
 })

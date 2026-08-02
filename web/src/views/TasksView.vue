@@ -7,7 +7,13 @@
       </div>
     </div>
 
-    <TaskLogPane :task-id="selectedTaskId" :can-manage="canManageTasks" :disabled-reason="deniedText" />
+    <TaskLogPane
+      :task-id="selectedTaskId"
+      :type-prefix="selectedTypePrefix"
+      :task-target="selectedTaskTarget"
+      :can-manage="canManageTasks"
+      :disabled-reason="deniedText"
+    />
   </section>
 </template>
 
@@ -23,5 +29,7 @@ const route = useRoute()
 const { t } = useI18n()
 const { can, deniedText } = usePermissions()
 const selectedTaskId = computed(() => typeof route.query.taskId === 'string' ? route.query.taskId : '')
+const selectedTypePrefix = computed(() => typeof route.query.typePrefix === 'string' ? route.query.typePrefix : '')
+const selectedTaskTarget = computed(() => typeof route.query.target === 'string' ? route.query.target : '')
 const canManageTasks = computed(() => can(permissions.tasksManage))
 </script>

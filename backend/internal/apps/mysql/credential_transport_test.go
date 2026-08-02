@@ -59,6 +59,28 @@ func TestMySQLCredentialConsumersValidateRemoteContextBeforeEveryRead(t *testing
 	}
 }
 
+func TestMySQLShellSQLCommandsUseSupportedTabbedResultFormat(t *testing.T) {
+	commands := map[string]string{
+		"backup inspection":   inspectBackupCommand("/aifar/apps/mysql/_backup/task", 3306),
+		"cluster inspection":  inspectClusterMembersCommand("/aifar/apps/mysql/_backup/task", 3306),
+		"router verification": routerReadWriteVerificationCommand("/aifar/apps/mysql/_backup/task", 6446, "aifar_business"),
+		"reconciliation":      localInfileReadCommand("/aifar/apps/mysql/_backup/task", 3306),
+	}
+	for name, command := range commands {
+		t.Run(name, func(t *testing.T) {
+			if strings.Contains(command, " --raw") {
+				t.Fatalf("unsupported mysqlsh --raw remains: %s", command)
+			}
+			if strings.Contains(command, "--skip-column-names") {
+				t.Fatalf("unsupported mysqlsh --skip-column-names remains: %s", command)
+			}
+			if !strings.Contains(command, "--result-format=tabbed") {
+				t.Fatalf("tabbed mysqlsh output missing: %s", command)
+			}
+		})
+	}
+}
+
 func TestInstallerTransportsCredentialOnlyIn0600Context(t *testing.T) {
 	root := t.TempDir()
 	archive := filepath.Join(root, "mysql-aifar-8.0.36-official-bundle.tar")

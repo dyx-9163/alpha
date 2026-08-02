@@ -123,6 +123,18 @@ func TestContainsSecretShapeTraversesFutureJSONFields(t *testing.T) {
 	}
 }
 
+func TestContainsSecretShapeAllowsOrdinaryIdentifiersContainingToken(t *testing.T) {
+	for _, value := range []any{
+		map[string]any{"table": "access_tokens"},
+		map[string]any{"table": "credential_history"},
+		map[string]any{"schema": "secretariat"},
+	} {
+		if containsSecretShape(value) {
+			t.Fatalf("ordinary database identifier was treated as a secret: %#v", value)
+		}
+	}
+}
+
 func TestBackupManifestRejectsNonCanonicalRequiredValues(t *testing.T) {
 	// Production break caught: trimming or alias-normalizing persisted manifest fields would make two textual identities validate as the same backup source.
 	cases := []struct {

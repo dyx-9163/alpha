@@ -208,6 +208,7 @@ import {
   runtimeNacosStatus
 } from '../containers/runtime/format'
 import {
+  runtimeReleaseDeleteDisabledReason,
   runtimeReleaseRollbackDisabledReason,
   runtimeReleaseRollbackServices
 } from '../containers/runtime/releaseRules'
@@ -1169,10 +1170,11 @@ function releaseRollbackDisabledReason(row: AifarRelease) {
 }
 
 function releaseDeleteDisabledReason(row: AifarRelease) {
-  if (!canManageApps.value) return deniedText.value
-  if (!row.releaseId) return t('containers.releaseIdRequired')
-  if (row.status === 'pending' || row.status === 'running') return t('containers.releaseDeleteActiveUnavailable')
-  return ''
+  return runtimeReleaseDeleteDisabledReason(row, {
+    canManage: canManageApps.value,
+    deniedText: deniedText.value,
+    t
+  })
 }
 
 async function deleteAifarRelease(row: AifarRelease) {

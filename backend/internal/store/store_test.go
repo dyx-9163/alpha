@@ -3,6 +3,7 @@ package store
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -1160,7 +1161,7 @@ func TestAppReleaseRetentionKeepsLatestThreeSuccesses(t *testing.T) {
 	}
 }
 
-func TestAppReleaseRetentionProtectsPartialBaseChain(t *testing.T) {
+func TestAppReleaseRetentionPrunesHistoricalBaseChain(t *testing.T) {
 	db, err := Open(filepath.Join(t.TempDir(), "aifar.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -1206,8 +1207,8 @@ func TestAppReleaseRetentionProtectsPartialBaseChain(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if deleted != 1 {
-		t.Fatalf("expected only unprotected old release deleted, got %d", deleted)
+	if deleted != 2 {
+		t.Fatalf("expected historical ancestors outside retention window to be deleted, got %d", deleted)
 	}
 	got, err := db.ListAppReleases(instance.ID)
 	if err != nil {
@@ -1217,12 +1218,72 @@ func TestAppReleaseRetentionProtectsPartialBaseChain(t *testing.T) {
 	for _, release := range got {
 		kept[release.ReleaseID] = true
 	}
-	for _, want := range []string{"partial-5", "partial-4", "base-3", "base-1"} {
+	for _, want := range []string{"partial-5", "partial-4", "base-3"} {
 		if !kept[want] {
-			t.Fatalf("expected protected release %s to be kept, got %+v", want, got)
+			t.Fatalf("expected retained release %s to be kept, got %+v", want, got)
 		}
 	}
-	if kept["base-2"] {
-		t.Fatalf("expected unprotected base-2 to be deleted, got %+v", got)
+	for _, unwanted := range []string{"base-2", "base-1"} {
+		if kept[unwanted] {
+			t.Fatalf("expected historical ancestor %s to be deleted, got %+v", unwanted, got)
+		}
+	}
+}
+
+func TestAppReleaseRetentionKeepsActiveServiceRevisionOutsideWindow(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "aifar.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	instance, err := db.SaveAppInstance(AppInstance{
+		App:      "aifar",
+		Version:  "docker-apps",
+		ServerID: "srv-1",
+		Status:   "installed",
+		Metadata: `{"currentRevision":"rel-5","serviceRevisions":{"oauth":"rel-1","web-vue3":"rel-5"}}`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for idx := 1; idx <= 5; idx++ {
+		releaseID := fmt.Sprintf("rel-%d", idx)
+		if _, err := db.SaveAppRelease(AppRelease{
+			InstanceID:   instance.ID,
+			App:          "aifar",
+			Version:      "docker-apps",
+			ReleaseID:    releaseID,
+			ServerID:     "srv-1",
+			Status:       "success",
+			ManifestJSON: `{"releaseId":"` + releaseID + `"}`,
+			CreatedAt:    time.Date(2026, 7, 3, 12, idx, 0, 0, time.UTC),
+			ActivatedAt:  time.Date(2026, 7, 3, 12, idx, 0, 0, time.UTC),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	deleted, err := db.DeleteOldAppReleases(instance.ID, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deleted != 1 {
+		t.Fatalf("expected only inactive rel-2 outside retention window to be deleted, got %d", deleted)
+	}
+	got, err := db.ListAppReleases(instance.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	kept := map[string]bool{}
+	for _, release := range got {
+		kept[release.ReleaseID] = true
+	}
+	for _, want := range []string{"rel-5", "rel-4", "rel-3", "rel-1"} {
+		if !kept[want] {
+			t.Fatalf("expected release %s to be kept, got %+v", want, got)
+		}
+	}
+	if kept["rel-2"] {
+		t.Fatalf("expected inactive rel-2 to be deleted, got %+v", got)
 	}
 }

@@ -17,13 +17,18 @@ func TestAIFARReleaseDeleteBlockReason(t *testing.T) {
 		name     string
 		instance store.AppInstance
 		target   store.AppRelease
-		releases []store.AppRelease
 		wantCode string
 	}{
 		{
 			name:     "current revision",
 			instance: store.AppInstance{Metadata: `{"currentRevision":"release-current"}`},
 			target:   store.AppRelease{ReleaseID: "release-current", Status: "success"},
+			wantCode: "AIFAR_RELEASE_DELETE_CURRENT",
+		},
+		{
+			name:     "current service revision",
+			instance: store.AppInstance{Metadata: `{"currentRevision":"release-latest","serviceRevisions":{"oauth":"release-service-current"}}`},
+			target:   store.AppRelease{ReleaseID: "release-service-current", Status: "success"},
 			wantCode: "AIFAR_RELEASE_DELETE_CURRENT",
 		},
 		{
@@ -39,30 +44,15 @@ func TestAIFARReleaseDeleteBlockReason(t *testing.T) {
 			wantCode: "AIFAR_RELEASE_DELETE_ACTIVE",
 		},
 		{
-			name:     "base release reference",
-			instance: store.AppInstance{Metadata: `{}`},
-			target:   store.AppRelease{ReleaseID: "release-base", Status: "success"},
-			releases: []store.AppRelease{{ReleaseID: "release-child", ManifestJSON: `{"baseReleaseId":"release-base"}`}},
-			wantCode: "AIFAR_RELEASE_DELETE_REFERENCED",
-		},
-		{
-			name:     "rollback reference",
-			instance: store.AppInstance{Metadata: `{}`},
-			target:   store.AppRelease{ReleaseID: "release-target", Status: "failed"},
-			releases: []store.AppRelease{{ReleaseID: "release-rollback", ManifestJSON: `{"rollbackTo":"release-target"}`}},
-			wantCode: "AIFAR_RELEASE_DELETE_REFERENCED",
-		},
-		{
 			name:     "unreferenced historical release",
 			instance: store.AppInstance{Metadata: `{"currentRevision":"release-current"}`},
 			target:   store.AppRelease{ReleaseID: "release-old", Status: "failed"},
-			releases: []store.AppRelease{{ReleaseID: "release-current", ManifestJSON: `{}`}},
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			block := aifarReleaseDeleteBlockReason(tt.instance, tt.target, tt.releases)
+			block := aifarReleaseDeleteBlockReason(tt.instance, tt.target)
 			if tt.wantCode == "" {
 				if block != nil {
 					t.Fatalf("expected deletion to be allowed, got %+v", block)
@@ -85,6 +75,12 @@ func TestDeleteAIFARReleaseDeletesRecordAndWritesAudit(t *testing.T) {
 	if _, err := db.SaveAppRelease(store.AppRelease{InstanceID: instance.ID, App: "aifar", Version: "runtime-v2", ReleaseID: "release-old", Status: "failed"}); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := db.SaveAppRelease(store.AppRelease{
+		InstanceID: instance.ID, App: "aifar", Version: "runtime-v2", ReleaseID: "release-child", Status: "success",
+		ManifestJSON: `{"baseReleaseId":"release-old","rollbackTo":"release-old"}`,
+	}); err != nil {
+		t.Fatal(err)
+	}
 	token := issueTestToken(t, db, secret, "owner", "owner")
 	req := httptest.NewRequest(http.MethodDelete, "/api/v2/apps/instances/"+instance.ID+"/aifar/releases/release-old", nil)
 	req.Header.Set("Authorization", "Bearer "+token)
@@ -96,15 +92,18 @@ func TestDeleteAIFARReleaseDeletesRecordAndWritesAudit(t *testing.T) {
 		t.Fatalf("expected 200, got %d body=%s", rec.Code, rec.Body.String())
 	}
 	releases, err := db.ListAppReleases(instance.ID)
-	if err != nil || len(releases) != 0 {
+	if err != nil || len(releases) != 1 || releases[0].ReleaseID != "release-child" {
 		t.Fatalf("expected release to be deleted, got %+v err=%v", releases, err)
 	}
 	assertAuditExists(t, db, "aifar.release.delete", "success", "owner", instance.ID+":release-old")
 }
 
-func TestDeleteAIFARReleaseRejectsCurrentRelease(t *testing.T) {
+func TestDeleteAIFARReleaseRejectsCurrentServiceRevision(t *testing.T) {
 	api, db, secret := newAuthzTestAPI(t)
-	instance, err := db.SaveAppInstance(store.AppInstance{App: "aifar", Version: "runtime-v2", Status: "installed", Metadata: `{"currentRevision":"release-current"}`})
+	instance, err := db.SaveAppInstance(store.AppInstance{
+		App: "aifar", Version: "runtime-v2", Status: "installed",
+		Metadata: `{"currentRevision":"release-latest","serviceRevisions":{"oauth":"release-current"}}`,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -179,6 +178,8 @@ func TestListAIFARReleasesReportsRollbackEligibility(t *testing.T) {
 			RollbackServices          []string `json:"rollbackServices"`
 			RollbackUnavailableReason string   `json:"rollbackUnavailableReason"`
 			RollbackAvailable         bool     `json:"rollbackAvailable"`
+			DeleteAvailable           bool     `json:"deleteAvailable"`
+			DeleteUnavailableReason   string   `json:"deleteUnavailableReason"`
 		} `json:"items"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
@@ -189,6 +190,8 @@ func TestListAIFARReleasesReportsRollbackEligibility(t *testing.T) {
 		RollbackServices          []string
 		RollbackUnavailableReason string
 		RollbackAvailable         bool
+		DeleteAvailable           bool
+		DeleteUnavailableReason   string
 	}{}
 	for _, row := range response.Items {
 		rows[row.ReleaseID] = struct {
@@ -196,14 +199,16 @@ func TestListAIFARReleasesReportsRollbackEligibility(t *testing.T) {
 			RollbackServices          []string
 			RollbackUnavailableReason string
 			RollbackAvailable         bool
-		}{row.CurrentServices, row.RollbackServices, row.RollbackUnavailableReason, row.RollbackAvailable}
+			DeleteAvailable           bool
+			DeleteUnavailableReason   string
+		}{row.CurrentServices, row.RollbackServices, row.RollbackUnavailableReason, row.RollbackAvailable, row.DeleteAvailable, row.DeleteUnavailableReason}
 	}
 	current := rows["release-current"]
-	if len(current.CurrentServices) != 1 || current.CurrentServices[0] != "oauth" || current.RollbackUnavailableReason != "ALREADY_ACTIVE" || current.RollbackAvailable || len(current.RollbackServices) != 0 {
+	if len(current.CurrentServices) != 1 || current.CurrentServices[0] != "oauth" || current.RollbackUnavailableReason != "ALREADY_ACTIVE" || current.RollbackAvailable || len(current.RollbackServices) != 0 || current.DeleteAvailable || current.DeleteUnavailableReason != "AIFAR_RELEASE_DELETE_CURRENT" {
 		t.Fatalf("current release eligibility = %+v", current)
 	}
 	old := rows["release-old"]
-	if len(old.CurrentServices) != 0 || len(old.RollbackServices) != 1 || old.RollbackServices[0] != "oauth" || old.RollbackUnavailableReason != "" || !old.RollbackAvailable {
+	if len(old.CurrentServices) != 0 || len(old.RollbackServices) != 1 || old.RollbackServices[0] != "oauth" || old.RollbackUnavailableReason != "" || !old.RollbackAvailable || !old.DeleteAvailable || old.DeleteUnavailableReason != "" {
 		t.Fatalf("old release eligibility = %+v", old)
 	}
 }

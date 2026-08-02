@@ -3,6 +3,46 @@
 
 本文件记录后续对话的精简问题与结论。每次开始先读，结束前追加。禁止写入密码、token、私钥、完整连接串和长日志。
 
+## 2026-08-02
+- 问题：用户要求详细比较 Commvault、NetBackup、Dell PowerProtect、Veeam、Rubrik、Cohesity、Bacula/Bareos 及组件原生备份方案。
+- 结论：AIFAR 统一商业平台优先短名单为 Commvault、NetBackup、Dell PowerProtect：Commvault 当前对 MySQL 与 MinIO 受保护源覆盖最明确；NetBackup具备 MySQL 和 Cloud Object Store 工作负载，但 MinIO需按S3兼容性PoC；PowerProtect 20.2通用应用代理明确覆盖MySQL和Redis，但公开资料未证实MinIO源端保护。Veeam更适合VM/主机优先，MinIO主要为目标仓库且当前数据库级插件不含MySQL；Rubrik公开工作负载未显示本地MySQL/Redis/MinIO直接保护；Cohesity DataProtect有MySQL路径但Redis/MinIO需核验；Bacula Enterprise覆盖MySQL Percona及S3对象插件但工程复杂，Bareos与组件原生组合许可成本低但统一目录、保留、审计和恢复编排需自建。所有方案都不能自动保证AIFAR跨组件一致性，且华为DCS虚拟化层必须按准确产品和版本单独核验兼容性。
+- 问题：用户询问除 Commvault 外还有哪些备份工具。
+- 结论：若目标是 AIFAR 整套可恢复，商业候选可重点验证 NetBackup 与 Dell PowerProtect Data Manager，前者有 MySQL 和 Cloud Object Store 工作负载，后者当前通用应用代理覆盖 MySQL、Redis；Veeam更适合虚拟机/文件保护及把 MinIO 用作备份目标，其当前数据库级插件不含 MySQL，不能仅凭“支持 S3 Compatible”认定可直接保护现有 MinIO Bucket。MinIO 专项可采用 Site/Bucket Replication、rclone 或 mc mirror，但复制不等于独立备份，mc mirror 只覆盖当前对象且不保留版本历史；所有方案仍需分别覆盖 Nacos、SQLite解密配置、IAM/KMS/证书、Runtime制品与挂载卷并做隔离恢复演练。
+- 问题：用户询问 DCS 克隆是否影响数据库完备性。
+- 结论：若 DCS 指 Redis 分布式缓存，克隆通常不修改源实例，但目标只反映克隆/备份时间点；全量迁移期间的后续写入不会进入目标，只有全量加增量并完成停写、追平和切换门禁，才能用于一致切换。DCS 克隆也不能证明 MySQL、MinIO、Nacos 等业务持久化数据完整，需分别备份并做跨组件一致性和业务验收。
+- 问题：用户澄清 DCS 是华为数据中心虚拟化方案，询问克隆数据库虚拟机是否影响数据库完备性。
+- 结论：虚拟机克隆一般不改写源数据库，但在线克隆通常最多是崩溃一致性，不能自动保证数据库应用一致性、跨盘一致性或多节点同一时间点；关库并关机后克隆最稳妥。克隆机首次启动必须与生产网络隔离，避免相同 IP、主机名、数据库 server UUID 和集群身份造成冲突；若用于备份或容灾，仍需数据库原生备份、恢复校验和业务验收，不能只凭 DCS 克隆任务成功认定数据完备。
+- 问题：用户进一步询问通过华为 DCS 克隆 MySQL、Redis、Nacos、MinIO 的具体风险。
+- 结论：在线分别克隆四类组件不能作为整套系统完备备份：MySQL 有崩溃恢复、跨节点 GTID 时间点和重复 server UUID 风险；Redis 的可恢复点取决于 RDB/AOF及 fsync，Sentinel克隆身份可能误连生产；Nacos集群的持久配置通常在外部 MySQL，Nacos节点与MySQL分时克隆会形成跨组件不一致；MinIO必须覆盖全部数据卷、配置、IAM和KMS，分布式节点分时快照风险更高。克隆机必须先隔离网络；推荐先停业务写入并追平复制，再按 Nacos、MinIO、Redis、MySQL 顺序干净停止，关机协调克隆，隔离启动后逐组件及端到端验收，并继续保留组件原生备份。
+- 问题：用户询问源虚拟机使用手工静态 IP、未关机完成 DCS 克隆并重启后实际使用哪个 IP。
+- 结论：普通虚拟机克隆会复制客户机操作系统中的静态网络配置，因此源机和克隆机通常都声明原静态 IP；新虚拟网卡可能有不同 MAC，但不会自动改变客户机静态 IP。两机在同一二层网络同时启动会产生 IP 冲突和 ARP 漂移；若克隆时启用了客户机网络定制则按新配置，若 Linux 网络配置绑定旧 MAC 则克隆机也可能无法启用网卡而没有 IP。应先断开克隆机网卡，用控制台核对后改 IP；若整套克隆用于隔离测试，可保留原 IP但必须置于完全隔离的 VLAN/端口组。
+
+## 2026-07-30
+- 问题：用户根据“后端从 MinIO 取文件、边解密边流式输出”的截图询问压力是否给到了 MinIO。
+- 结论：该描述是下载链路。压力并非全部转移给 MinIO：MinIO承担并发 GET、数据盘读取和到后端的出站流量；后端每个请求同时维持客户端连接和 MinIO连接，并承担流式解密 CPU、双向网络、线程/协程及少量固定缓冲区；Nginx/网关也维持长连接。正确流式实现不会为每个 100 MB 文件全量占用内存，但慢客户端会通过背压延长后端和 MinIO连接占用。需确认未使用 `readAllBytes`/整文件缓冲、代理缓冲关闭、超时充足，并联合压测 MinIO读、后端解密和出口链路。
+- 问题：用户确认目标 MinIO 为单节点而非分布式。
+- 结论：单节点没有 MinIO 节点间纠删码网络流量；在万兆网络、`LimitNOFILE=65536` 且未设置低于 100 的 API 并发上限时，静态配置允许 100×100 MB 并发上传。约 10 GB 总写入将集中到单节点数据盘，实际耗时通常由 HDD/SATA SSD/NVMe 的持续写带宽与并发写延迟决定；无需先提高连接数，应先核验生效的文件句柄限制并做 Warp 压测。
+- 问题：用户确认 MinIO 上传链路为万兆光纤。
+- 结论：链路速率确认为 10 Gbps；100×100 MB 的约 10 GB 总上传量，纯网络理论下限约 8 秒，实际有效网络传输通常约 9～12 秒。当前静态配置支持该并发量，端到端耗时主要需验证客户端汇聚带宽、交换链路、MinIO 数据盘持续写入以及分布式节点间流量。
+- 问题：用户补充 MinIO 上传链路网络为“10000GB”，按常见网卡标法暂理解为 10000 Mbps（10 Gbps）。
+- 结论：100×100 MB 总量约 10 GB，在 10 Gbps 链路上的纯网络理论下限约 8 秒；考虑协议、并发、网卡及交换机效率，网络传输通常约 10～15 秒，但端到端更可能受 MinIO 数据盘持续写带宽、分布式纠删码/节点间流量和客户端性能限制。若实际单位不是 10000 Mbps，需按真实单位重新计算。
+- 问题：用户询问当前 MinIO 配置是否支持 100 并发同时上传 100 MB 文件。
+- 结论：配置门槛上支持：100 个并发连接远低于 AIFAR MinIO 模板的 `LimitNOFILE=65536`，模板未设置低于 100 的 `MINIO_API_REQUESTS_MAX`；随包 Nginx 配置的 `client_max_body_size=1000m` 也不阻止单个 100 MB 请求。但 100×100 MB 约为 10 GB 总写入，完成时间和稳定性取决于实际网络、数据盘持续写带宽/延迟、内存、MinIO 拓扑、入口代理及应用超时，当前未做现场负载测试，不能据静态配置承诺性能。建议在 UAT 使用 MinIO Warp 以 `--concurrent 100 --obj.size 100MiB` 验收吞吐、P99、错误率、FD、内存和磁盘指标。
+- 问题：用户询问 MinIO 是否存在连接数限制，以及是否与服务器文件句柄有关。
+- 结论：MinIO 没有 Redis `maxclients` 式的单一 TCP 连接数参数；每个连接会占用文件描述符，所以实际容量受 systemd `LimitNOFILE`、进程/系统文件描述符、内存、反向代理和客户端连接池共同影响。AIFAR 当前 `aifar-minio` 模板设置 `LimitNOFILE=65536`，但未显式配置 `MINIO_API_REQUESTS_MAX`；后者限制的是并发 S3/Admin API 请求而不是 TCP 连接总数，默认由 MinIO 自动计算。应先核对进程 FD 使用率、9000 端口已建立连接数、API `requests_max` 和错误日志，再决定是否调整。
+- 问题：用户询问 AIFAR 部署的 Redis 如何调整最大连接参数。
+- 结论：服务端并发连接上限由 `maxclients` 控制，AIFAR 当前生成的 `redis.conf` 未显式设置该项，Redis 默认值为 10000；systemd 模板的 `LimitNOFILE=10032` 是进程文件描述符上限。若提高到 20000，应在 `/aifar/apps/redis/conf/redis.conf` 持久化 `maxclients 20000`，通过 `aifar-redis.service` drop-in 将 `LimitNOFILE` 提高到至少 `maxclients+32`（建议 65535），再滚动重启并验证。Sentinel/Cluster 模式需统一修改所有数据节点；Java Lettuce 的 `max-active` 是独立的客户端连接池限制，池耗尽不能直接归因于 Redis `maxclients`。
+- 问题：用户要求先查看 MySQL 8.0.36 三节点 InnoDB Cluster 的完整参数方案，并区分固定参数和随服务器资源变化的参数。
+- 结论：参数应分为固定正确性/持久性基线、按 RAM/CPU/IOPS/磁盘与连接池计算的容量参数，以及按网络和 HA 策略确定的 Group Replication 参数。固定候选包括三个已确认参数、GTID/ROW/log_replica_updates、`skip_replica_start=ON` 和 `replica_preserve_commit_order=ON`；容量参数包括 buffer pool、redo capacity、parallel workers、max_connections、I/O capacity 和 binlog retention。当前模板 `max_connections=500` 不应长期无条件写死，`binlog_transaction_dependency_tracking=WRITESET` 在 MySQL 8.0.35 起已弃用，应列入移除评估而非继续扩散。
+- 问题：用户询问 InnoDB Cluster 是否建议增加 `sync_binlog=1` 和 `innodb_flush_log_at_trx_commit=1`。
+- 结论：建议生产三节点全部显式保持为 1，尤其面向 RPO=0；MySQL 8.0 两者默认均为 1，但 AIFAR 当前生成的 my.cnf 只显式配置 binlog/ROW/GTID，未写这两项。它们分别保证 binlog 与 InnoDB redo 在提交时刷盘，属于单节点崩溃持久性，不替代 `group_replication_consistency`，也不表示事务已在所有 SECONDARY 应用完成。现有集群应逐成员查询并用 `SET PERSIST` 在线固化，新安装应同步写入安装模板；需评估 fsync 对写延迟和存储 IOPS 的影响。
+- 问题：用户计划为现有 MySQL InnoDB Cluster 设置 `group_replication_consistency`，并询问默认值。
+- 结论：MySQL 8.0 默认值是 `EVENTUAL`；AIFAR 当前 `dba.createCluster(clusterName)` 未显式传入 consistency。单主集群推荐通过 MySQL Shell AdminAPI 在有仲裁且连接 PRIMARY 时在线执行 `cluster.setOption('consistency', 'BEFORE_ON_PRIMARY_FAILOVER')`，无需重启，并逐成员验证全局变量；该值只在主切换时让新 PRIMARY 等待旧事务积压应用完成，不会让每次提交等待所有 SECONDARY。
+- 问题：用户询问 MySQL InnoDB Cluster 的同步规则。
+- 结论：AIFAR 当前通过默认 `dba.createCluster()` 建立单主 InnoDB Cluster，底层 Group Replication 采用组内有序复制和事务冲突认证；默认一致性是最终一致，事务提交不代表所有 SECONDARY 已完成本地应用，读后写应走 PRIMARY/Router 6446 或显式提高 `group_replication_consistency`。三节点需保持至少两节点组成多数派，一节点故障可继续服务，两节点故障后不得强行写入；现场应联合检查 `cluster.status({extended:1})`、`replication_group_members`、复制队列和一致性变量。
+- 问题：梳理 AIFAR Panel 当前实际具备的能力，并用关键真实界面截图说明“是什么、用来干什么”。
+- 结论：已生成 `docs/AIFAR-Panel-实际能力清单.md`，按仪表盘、服务器、应用商店、Docker/AIFAR Runtime、数据库、Nacos、MinIO、凭据、终端、任务、审计和设置梳理当前能力与边界；截图来自当前代码配合全新隔离数据库的真实页面，未伪造远端部署成功状态。对象存储控制面记录、任务取消与服务下线、控制面数据库备份与 MySQL 业务备份等边界已明确区分。
+
 ## 2026-07-22
 - 问题：用户截图显示单机 Redis 验证码读取正常，而 Sentinel 模式在读取 Navicat 列表第一条验证码时异常。
 - 结论：截图仅能确认验证码以随机 key 写在 `192.168.74.132:6379` 的 DB 1，TTL 约 5 分钟；Redis 不存在稳定的“第一行”，不能用 KEYS/SCAN/Navicat 排序后的首项定位验证码，必须用请求携带的精确验证码 key 查询。若代码已按精确 key 查询，则需在 Sentinel 当前 master 的 DB 1 对同一 key 执行 GET/TTL，并核对所有应用实例使用相同的 Sentinel masterName、26379 节点列表、database=1 和读写序列化器；现场输出不足以确认具体命中哪项。
@@ -1031,5 +1071,204 @@
 - 结论：在 `codex/runtime-batch-offline` 隔离分支实现单任务/单 Agent 提交/一次元数据持久化的多服务批量下线，前端仅允许选择在线 deployment 并接入确认与任务跟踪；Services 不再显示 CPU/内存，Pods 进入、作用域变化和状态事件时自动取指标，日志虚拟列表会把非法滚动状态归零。前端 256 项、Web 构建、第二次完整后端测试及后端三目标构建通过；第五点回滚逻辑未修改，原 `codex/status-collector-realtime` 工作区未合并或清理。
 - 问题：用户选择把 `codex/runtime-batch-offline` 本地合并回 `codex/status-collector-realtime`。
 - 结论：已创建本地 merge commit `402c69f9`，并在合并中保留当前分支的 MySQL registry 契约、Runtime 锁释放断言和原未提交文件。聚焦 AIFAR/HTTP API 与前端 311 项通过；纯 merge commit 的完整后端套件仅有两个既有诊断清理分页测试因固定 30 秒等待在并发负载下超时，两个用例单独分别 29.00 秒和 20.41 秒通过，工作区已有未提交修订将等待上限增至 60 秒。该修订未擅自提交，两个 stash、功能分支和隔离工作树暂时保留，待决定后再完成全量复验与清理。
+- 问题：用户要求 Pods 页先展示基础状态，再周期性静默加载 CPU/内存，避免指标采集阻塞整张表。
+- 结论：确认采用两阶段方案：基础 Pods 请求先渲染表格，随后后台补齐指标；仅在 Pods 页有效作用域内每 10 秒单飞刷新，离开或切换作用域即停止，指标失败保留基础状态和最后成功值。设计规格提交为 `d074bcad`，坏更新包与回滚逻辑不在范围内。
 - 问题：用户要求启动当前 `codex/status-collector-realtime` 工作区，发现问题后直接修复。
 - 结论：修复批量扩缩容重构遗留的未定义 `service` 编译错误，锁释放改为复用与加锁完全一致的规范化组合键并补释放断言；该修复随后随 Runtime 合并进入 `402c69f9`。完整门禁首次暴露两个诊断清理条件等待在 Windows 多包并发负载下超时，隔离连续 5 轮均通过，测试安全上限从 2/30 秒调整为 10/60 秒后 `pnpm test:local` 通过：前端 311 项、脚本 291 项、工具 25 项、双平台构建/打包及 2974/2962 文件和归档复验全部通过。另将误写为 `backend*`、`/backend/*`、`/deliverables*` 的宽泛忽略规则收紧为仅忽略 `backend/.codex-cache/` 和既有精确目录；最终 HEAD 实际启动后 live、ready 和前端均返回 200，临时监听进程已精确回收。
+- 问题：用户截图询问任务 `tsk_cf4a7e8a0cb4b1acd2c34779` 的 MySQL 单体备份为何在第 4 步失败。
+- 结论：任务数据库仅保存 `Process exited with status 1`，因为备份第 4 步直接调用 `remote.Run` 后丢弃了 `CommandResult.Stderr`。使用相同实例、3306 端口、绑定管理员凭据和受控 0600 临时凭据文件只读复现后，目标机 MySQL Shell 8.0.36 明确报 `/aifar/apps/mysql/mysql-shell/bin/mysqlsh: unknown option --raw`；根因是 `inspectBackupCommand` 错把 mysql 客户端的 `--raw` 参数传给 mysqlsh。MySQL Shell 应使用 `--result-format=tabbed` 或 `--tabbed`，并应将脱敏 stderr 写入任务日志；诊断远端目录和本地临时文件均已清理，本轮仅诊断未修改生产代码。
+- 问题：实施 Runtime Pods 基础状态先渲染、CPU/内存后台周期刷新。
+- 结论：在 `codex/runtime-pod-progressive-metrics` 隔离分支完成两阶段加载：Pods 表格始终显示，基础请求不采集指标，随后仅在 Runtime Pods 有效作用域内每 10 秒单飞静默刷新指标；切换页签、实例、服务器或卸载即停止，基础响应保留最后成功指标，后台失败和旧服务器响应不会清空/覆盖当前视图。提交为 `aaf45b40`、`600bf6c4`、`dc801380`；前端 319 项与生产 Web 构建通过。第五点坏包回滚逻辑未修改。
+- 问题：将 Runtime Pods 渐进式指标分支本地合并回当前 `codex/status-collector-realtime`。
+- 结论：已快进到 `dc801380`，合并后的实际主工作区前端 38 个测试文件、321 项测试及生产 Web 构建通过；隔离工作树已注销并清理，功能分支已删除。当前 MySQL 备份 schema 选择相关已修改/暂存文件和 `memory.md` 保持原状，未纳入 Pods 提交；第五点回滚逻辑仍未修改。
+- 问题：在 MySQL 备份弹窗区分 Server 系统库、InnoDB Cluster 内部元数据库和业务库，允许手选业务库，并修复 mysqlsh 参数与失败日志。
+- 结论：新增实时 schema 发现接口；单体读取本节点、集群从健康 PRIMARY 读取，系统库与 `mysql_innodb_cluster_metadata*` 仅展示不可选，业务库默认全选且提交后由 worker 按实时列表再次校验。逻辑备份继续使用 `util.dumpInstance` 的 `includeSchemas` 并关闭 users；MySQL Shell SQL 命令统一改为 `--result-format=tabbed`，探测失败的 stderr 经凭据替换和通用脱敏后写任务日志。全量后端测试、前端 321 项和生产双端构建通过；未连接真实目标 MySQL 执行备份验收。
+
+## 2026-07-29
+- 问题：用户询问 Windows 上的 AIFAR SQLite 数据库能否直接复制到 Linux 使用，以及迁移方式。
+- 结论：SQLite 主数据库文件跨 Windows/Linux 可移植；AIFAR 推荐从“设置-数据维护”生成并校验 `VACUUM INTO` 一致性备份后传到 Linux，也可在完全停止 Windows 服务后复制主 `.db`。Linux 启动前需设置正确的 `AIFAR_DATABASE_PATH`、文件属主/权限，并保持与原环境相同的 `AIFAR_CREDENTIAL_SECRET`，否则已保存的 SSH/对象存储等密文无法解密；不可在服务运行时只复制 `.db`，也不能遗漏外部资源文件和路径类配置的单独迁移。
+- 问题：客户计划通过备份测试服务器的 `/aifar`、删除原目录再拷回的方式验收服务备份还原。
+- 结论：不应在原测试机把整目录删除回拷作为正式恢复验收；它最多是在所有写入和相关服务完全停止、备份位于独立故障域且具备快照回退时验证文件级冷恢复，不能覆盖 `/aifar` 外的 systemd、`/var/lib/aifar-agent`、外置 MinIO 数据盘、Nacos 外部 MySQL、权限/SELinux 等状态。推荐在隔离的新主机按控制面 SQLite、MySQL、Redis、Nacos、MinIO、Runtime/持久卷分别采用一致性备份恢复，再做校验和、数据清单、重启和端到端业务验收；当前代码已实现控制面 SQLite 备份及 MySQL 备份/还原，其他组件尚无统一一键恢复。
+- 问题：真实备份弹窗调用 schema 发现接口后仍提示“读取实时 Schema 失败”。
+- 结论：现场存在两个连续根因：standalone 发现服务用 `GetServer(..., false)` 丢失 SSH 凭据；目标 MySQL Shell 8.0.36 同样不支持 mysql 客户端参数 `--skip-column-names`。修复为读取服务器密钥、删除所有 mysqlsh 的该参数并用 `marker` 别名忽略 tabbed 表头，local_infile 与灾难重建计数同步增加标记解析。真实只读查询返回系统库 information_schema/mysql/performance_schema/sys、业务库 aifar_admin/aifar_nacos/test，当前无 InnoDB Cluster 元数据库；MySQL 全包测试和后端三目标构建通过，开发服务 `/live` 为 200。
+- 问题：真实 MySQL 单体备份先在 dry-run 第 7 步失败，修复后又在清单第 9 步失败；用户要求修复并连续成功备份三次。
+- 结论：安装脚本将 MySQL 安装目录归属 mysql 用户，但 dry-run/正式导出错误要求 mysqlsh 归 SSH 用户所有；改为工作目录与凭据保持 owner/精确模式校验，固定 mysqlsh 路径保持 nofollow、普通文件及不可组/其他用户写。清单防泄漏扫描又把包含 token 的合法表名误判为秘密，修为敏感键仍按子串拒绝、普通字符串仅拒绝裸敏感词及赋值/用户信息 URL。第 4/7/8 步 mysqlsh stderr 均经脱敏写任务日志。实例 mysql-0010dc 真实串行备份三次均 15/15 成功，三条归档各 24.6 MiB，均含 aifar_admin/aifar_nacos/test 和独立 SHA-256；MySQL 全包、前端 321 项、Web 构建、后端三目标构建通过，开发服务 live=200。
+- 问题：修复 MySQL 单体逻辑恢复并在真实实例上连续成功导入三次。
+- 结论：修复恢复读取 SSH 凭据、空目标与保护性备份边界、local_infile 数值解析、mysqlsh 安装归属校验及脱敏 stderr；新增仅允许同实例同备份且阶段为 schema_mutation_started/load_complete 的维护续跑，续跑只接受备份 Schema 子集并拒绝额外业务库。最终校验为 mysqlsh tabbed 输出增加固定表头别名和严格解析。实例 mysql-0010dc 使用 backup_700145f86e6e66e8dfce9d8e 串行恢复三次均 20/20 成功：tsk_7c95b0f606aef1bc03bf4208、tsk_8d606db4d2f25eb878f733f7、tsk_15c76880162aef74afb433af；实时 Schema 为 aifar_admin/aifar_nacos/test，实例在线且维护门禁已清除。全量后端、前端 324 项、Web 与后端三目标构建通过，live=200；未提交或推送。
+- 问题：用户询问客户关闭三个 MySQL InnoDB Cluster 节点并重启后，如何让节点重新进入正常集群。
+- 结论：按 complete outage 处理：先停业务写入并启动、验证全部 mysqld 可达，再以 dryRun 和 GTID 包含关系选择安全 seed，无 force 执行 rebootClusterFromCompleteOutage，仅对未 ONLINE 成员 rejoin，最后验收唯一 PRIMARY、两台 SECONDARY 全部 ONLINE、Router 6446 和业务读写。当前面板“启动集群”已读取三节点凭据和 GTID、执行 dryRun/reboot/rejoin，但脚本要求恰好一个 GTID superset；若干净停机后三节点 GTID 完全相同会被误拦截，而 MySQL 官方允许任选已同步节点作为 seed，现场需改走人工 mysqlsh 或先修正脚本，禁止用 force 绕过。
+- 问题：用户要求一份最完整的三节点 MySQL InnoDB Cluster 全停机后恢复方案。
+- 结论：完整 SOP 应同时覆盖计划停机准备、业务停写、备份与基线、三节点 mysqld/存储/网络预检、complete outage 分类、dryRun/GTID 三分支决策、无 force 恢复、非 ONLINE 成员 rejoin、Router 6446 与业务验收、失败停止和升级条件、证据留存、回退边界及后续自动化修正；任务成功不是最终验收，必须确认一个 PRIMARY、两个 SECONDARY、三节点 ONLINE、Router 可写和业务 smoke 成功。
+- 问题：用户要求将全停机恢复拆成重启后正常可用 rebootClusterFromCompleteOutage 的方案，以及该命令无法恢复时的异常方案，并附官方文档。
+- 结论：正常方案仅适用于三台 mysqld 可达、全体 GR 停止、metadata 完整且 GTID 相同或存在安全 superset；先 dryRun，再从安全 seed 无 force reboot，按状态 rejoin 并验收三节点 ONLINE、唯一 PRIMARY、Router 6446 与业务读写。异常方案不得统一 force，应按不可达/认证配置、非 complete outage 的 quorum loss、GTID 分叉、单成员 rejoin/增量失败、metadata 损坏及 Router 旧状态分别处置；force、clone、removeInstance、dropMetadataSchema 和从备份重建均需独立数据损失确认。
+- 问题：用户要求把正常/异常两套 MySQL InnoDB Cluster 重启恢复方案压缩成可交付客户的 Markdown 文件。
+- 结论：已新增 `docs/mysql-innodb-cluster-restart-recovery.md`，保留执行前要求、正常 complete-outage 的 dryRun/reboot/rejoin/验收、异常原因处置表、受控 Clone 边界、停止升级条件和 MySQL 官方文档链接，删除平台内部实现细节和过长说明。
+- 问题：将 MySQL 实例卡片的备份恢复入口收敛为“立即备份、备份记录、恢复记录”。
+- 结论：卡片移除独立“校验备份”和“恢复数据”，校验及恢复仍从备份记录选择具体备份后执行；“恢复记录”跳转任务中心，并按 `apps.mysql.restore` 与当前实例 ID 精确筛选。前端 326 项测试、生产构建及真实页面验证通过，现场该实例显示 12 条恢复记录且未混入其他任务；未提交或推送。
+- 问题：用户要求客户版 MySQL 集群恢复文档删除全部前置检查，只保留最简短的 MySQL Shell 命令。
+- 结论：`docs/mysql-innodb-cluster-restart-recovery.md` 已压缩为三组命令：complete outage 的 dryRun/reboot/rejoin、丢仲裁的 forceQuorum/rejoin、单成员失败的 remove/add clone；仅保留 GTID 分叉、metadata 损坏和 force/clone 风险警告及五个官方文档链接。
+
+## 2026-07-30
+- 问题：MySQL InnoDB Cluster 安装失败后生成的三条失败实例无法整体卸载，接口提示维护状态无效。
+- 结论：失败安装占位记录使用合成 `mysql-failed-<taskId>` 分组且没有正式集群拓扑，原接口层和服务层维护门禁因此按畸形正式集群拒绝。现仅对状态为 failed、带 installFailed 标记、任务 ID 与合成分组严格匹配且不存在维护/恢复协调标记的完整失败组放行删除；服务执行前会重新读取持久化状态。新增接口、服务和伪造标识/安全标记回归测试，全量后端测试及双平台后端构建通过，开发服务已重启；真实卸载尚未执行，等待用户操作时确认。
+- 问题：用户确认整体卸载失败的三节点 MySQL 集群实例。
+- 结论：已提交真实卸载任务 `tsk_7b53bb6d9b10aa6ee579acf7`，维护门禁不再拦截；任务在首个目标 `192.168.74.137:22` 建立 SSH 连接超时后失败并停止。只读 TCP 检查显示 133、134 的 SSH 端口可达，137 不可达；远程删除步骤未完成，三条控制面记录均保留，未发生半卸载。应先恢复 137 的 SSH 连通性后重试；若要仅强制移除控制面记录并接受 137 可能残留 MySQL 文件，必须另行明确确认。
+- 问题：用户要求继续重试整体卸载三条失败的 MySQL 集群实例。
+- 结论：三台目标 SSH 端口重新可达后提交重试任务 `tsk_e4220e0d35f587c9ebbe2235`；任务依次完成 137、134、133 三台节点的 MySQL 服务与文件清理，并删除 `app_85b62babbaf7ecc1992dc983`、`app_2f2405e7da81feddb20f1225`、`app_d0e45cc2ab6766e46c017a7f` 三条控制面记录，状态为成功。应用商店“已安装”列表复核只保留 132 上的 MySQL 单体实例，失败集群组已消失。
+- 问题：新装三节点 MySQL InnoDB Cluster 任务成功且 Router 在线，但数据库页把三个 MySQL 节点都显示为离线，用户确认三台 SSH 账号一致。
+- 结论：只读验证确认 133、134、137 的 SSH 登录、遥测和安装均成功；安装日志显示三台 mysqld、Clone 加入集群和三个 Router 均完成。实际失败点是 `app.instances` 采集器在凭据解析前被 `MYSQL_MAINTENANCE_STATE_INVALID` 拦截：集群安装仍生成 `mysql_cluster_*` 元数据且只保存 app_instances，没有创建维护安全门禁要求的 `cluster_*`、app_clusters 和 3 条 app_cluster_members 权威拓扑，因此被误判为维护状态损坏。Router 检查不走该门禁所以仍在线。132 的单体 MySQL/Redis 不可用是另一个问题，其 SSH 22 端口当前超时。推荐保持严格门禁，修正新安装的权威集群落库并对现有刚安装集群做受控拓扑补登记，不应通过放宽维护校验绕过。
+- 问题：修复新装 MySQL InnoDB Cluster 的权威拓扑缺失和远程实例采集误超时，并现场复核三节点状态。
+- 结论：新集群安装改为原子写入 `cluster_*`、app_clusters、三条 app_instances 和三条 app_cluster_members；启动迁移仅对可唯一确认的旧三节点 `mysql_cluster_*` 组补登记并同步 Router，歧义组保持不动。采集器将 Docker 5 秒预算与 SSH 型应用 30 秒预算拆开。现有集群迁移后数据库页显示 133 为 PRIMARY、134/137 为 SECONDARY，三个 MySQL 节点和三个 Router 全部在线；132 的单体实例仍因 SSH 超时离线。全量后端测试、后端三目标构建和差异检查通过，未提交或推送。
+- 问题：三节点 MySQL InnoDB Cluster 在线后，备份弹窗仍提示读取实时 Schema 失败。
+- 结论：集群 Schema 发现会先探测运行时 PRIMARY，但拓扑解析用 `GetServer(..., false)` 清空了成员 SSH 凭据，随后远程检查因无可用 SSH 凭据失败；修复为仅对 MySQL 成员读取解密后的服务器凭据，Router 仍无密钥读取。回归测试先稳定复现再通过；MySQL、HTTP API、全量后端测试及三目标后端构建通过。真实弹窗现显示 4 个系统库、1 个 InnoDB Cluster 元数据库和 0 个业务库；该新集群尚无业务 Schema，因此备份按钮正确禁用。未提交或推送。
+- 问题：用户要求关闭当前不清楚从何处启动的本地 AIFAR 服务。
+- 结论：该服务是本轮从仓库根目录执行 `pnpm dev` 启动的开发环境；已精确停止监听 8080 的后端和监听 5173 的前端，复核两个端口均无监听。
+- 问题：用户要求只读诊断当前三节点 MySQL InnoDB Cluster 为何无法启动。
+- 结论：任务 `tsk_e78e6de5963bfa8e75c1d8e3` 在真正 reboot 前被 start.sh 的 `candidates.length !== 1` 门禁拦截。现场只读检查确认 133/134/137 三台 mysqld 可达、aifarCluster metadata 存在、GR 均为 OFFLINE、read_only/super_read_only 均为 1，且三台 gtid_executed 完全一致；在 133 上执行 `rebootClusterFromCompleteOutage('aifarCluster',{dryRun:true})` 成功。根因是等价 GTID 使三台都成为 superset 候选，而脚本误要求唯一候选，不是 GTID 分叉或节点损坏；本轮未执行实际 reboot、force、rejoin、重启或配置修改，临时只读凭据和脚本已清理。
+- 问题：用户要求修复三节点 GTID 完全一致时 InnoDB Cluster 启动被错误拒绝的问题。
+- 结论：完整停机启动脚本改为仅在找不到任何 GTID superset 时拒绝；多个等价候选时选择已排序的第一台（历史主节点优先），继续先执行官方 dryRun 且不使用 force。新增执行真实渲染 JavaScript 的回归测试，覆盖等价 GTID 可恢复及分叉 GTID 在变更前拒绝；MySQL 包测试、全量后端测试和三目标后端构建通过。未操作现场集群，需部署并重启新后端后再提交启动任务。
+- 问题：用户反馈源码修复后再次启动 MySQL 集群仍失败。
+- 结论：最新任务 `tsk_fa45b06b784dcdfcfd116d72` 于 04:11 仍执行旧脚本并报 `requires one unique GTID-superset member`；当前 `aifar-server` 进程启动于 03:17，早于 03:54 生成的修复后二进制，证明运行服务未加载修复。需重启或部署新后端后再提交启动任务，本轮仅诊断、未重启服务或再次操作集群。
+- 问题：用户要求提供查看当前三节点 MySQL InnoDB Cluster 状态的脚本。
+- 结论：新增 `docs/mysql-cluster-status.sh`，默认只读检查 133/134/137 的连接、server UUID、read_only、super_read_only、GTID、Group Replication 成员，并在可用节点输出 `cluster.status({extended:1})`；密码通过 MySQL Shell 隐藏输入，不写入脚本。Shell 与 JavaScript 语法检查通过，未在现场执行。
+- 问题：用户要求为客户版 MySQL InnoDB Cluster 三节点重启恢复 Markdown 提供英文版本。
+- 结论：新增 `docs/mysql-innodb-cluster-restart-recovery-en.md`，逐段保留正常 complete-outage 恢复、quorum loss、Clone 重加成员、停止升级条件和五个官方链接；账号与节点占位符改为英文。标题、代码块、链接数量及关键 MySQL Shell 命令与中文版一致，英文字符与差异检查通过。
+- 问题：用户要求把英文 MySQL 集群恢复文档扩展为零基础客户可逐步执行的版本，并解释 SEED_IP 等全部参数。
+- 结论：英文手册新增 9 个参数/占位符表、当前三节点示例、基础术语表和场景选择表；complete outage、quorum loss、单成员 Clone 三条路径均拆为编号步骤，说明目的、命令、密码输入、成功结果及停止条件，并明确 SEED_IP 从 dryRun 输出确定。危险 force/Clone 操作增加脑裂和数据覆盖警告；9 个参数、7 类关键命令、46 个代码围栏、5 个官方链接及纯英文/差异检查通过。
+- 问题：用户要求查看与零基础英文手册对应的中文版本。
+- 结论：`docs/mysql-innodb-cluster-restart-recovery.md` 已升级为完整中文零基础操作手册，保留与英文版相同的 9 个参数定义、术语表、三种恢复路径、逐步命令、成功结果、停止条件和风险警告；中英文 23 个命令代码块逐个完全一致，5 个官方链接一致，UTF-8 中文和差异检查通过。
+- 问题：用户询问当前页面在三节点重启后将 MySQL 节点加入 InnoDB Cluster 使用什么命令。
+- 结论：当前页面提交 `/api/v2/database/mysql/clusters/start` 任务，后端在选定节点执行临时 `start-cluster.sh`，其 MySQL Shell 流程为读取并比较三节点 GTID、选择 GTID superset seed、执行 `dba.rebootClusterFromCompleteOutage(clusterName, {dryRun:true})`、实际 `dba.rebootClusterFromCompleteOutage(clusterName)`，再对节点执行 `cluster.rejoinInstance(connection, {interactive:false})`，最后检查 `cluster.status({extended:1})`；未使用 `addInstance()`。
+- 问题：用户询问恢复时加入两个节点与加入三个节点的区别。
+- 结论：三成员完整停机恢复中，`rebootClusterFromCompleteOutage()` 已恢复 seed 并使其成为活动成员，原则上只需对其余两个成员执行 `rejoinInstance()`；当前脚本为统一和幂等而遍历三个登记节点，seed 的 `rejoinInstance()` 会返回已在线/已是活动成员并被按成功处理，不会产生重复或第四个节点。若指集群总规模，两成员失去任一成员即失去多数派，三成员可容忍一台故障；AIFAR 前后端均要求 InnoDB Cluster 至少三台数据节点。
+- 问题：用户质疑 MySQL 集群恢复为何没有连接对应 seed/server ID。
+- 结论：当前链路先用 app instance 的 `ServerID` 加载面板服务器及 SSH 凭据，再转换为 MySQL `host/port/user/password`；MySQL Shell 不认识 AIFAR `serverId`。脚本读取所有成员 GTID，选出 `candidates[0].node` 后明确执行 `shell.connect(connection(seed))`，因此确实连接 seed。页面日志未显示 seed 的 serverId 或 host:port，是因为传入 JS 的节点不含 serverId，且 reboot 前日志只输出 clusterName；这是可观测性缺口，不是连接缺失。
+- 问题：用户询问当前三节点集群手册中的 `CLUSTER_ADMIN` 应填写什么。
+- 结论：只读查询 `data/aifar.db` 的 app_instances、credential_bindings 和 credentials 非敏感字段，当前三条 InnoDB Cluster 实例各自绑定一条 active、purpose=admin 的 MySQL 凭据，三条凭据用户名均为 `root`；因此当前 `CLUSTER_ADMIN=root`。密码未读取或输出，实际启动/恢复由每个实例绑定的加密凭据提供，不应从默认密码推断。
+- 问题：用户要求模拟平台全部功能，识别仍无法执行的 bug。
+- 结论：使用工作区 GOCACHE 后完整 `pnpm test:local` 通过（后端、326 个前端测试、291 个脚本测试、25 个工具测试、构建、打包及双平台发布校验）；隔离数据库下核心 API、登录权限、用户/凭据/服务器 CRUD、任务、资源扫描、数据库备份/校验/下载/删除及全部主页面可执行，浏览器无 JavaScript 错误。当前登记的 4 台服务器 SSH 均超时，Docker 远程 API 也超时，故服务器探测/终端、容器、应用部署检查卸载、数据库/Nacos/MinIO 远端实操无法现场验证；变更型 E2E 因缺少显式白名单与测试凭据按设计拒绝。确认资源重扫仍是同步 HTTP 处理并直接写审计、未走 worker 任务；Storage 的 bucket/object/user/access-key/replica 仍仅保存控制面记录；另有 Element Plus 废弃属性和主包体积偏大告警。未执行任何现场变更。
+- 问题：用户询问 Docker Compose 是否可以直接做副本。
+- 结论：Compose 可用 `docker compose up -d --scale <service>=N` 或服务级 `scale`/`deploy.replicas` 在同一 Docker 主机启动多个无状态容器实例，但这只是单机多实例，不是跨主机高可用；不能配置固定 `container_name`，固定宿主机端口和共享可写卷也需重新设计，并需另配反向代理或负载均衡。跨主机调度、节点故障迁移和期望副本自动恢复应使用 Swarm、Kubernetes 等编排器，数据库副本还必须由数据库自身复制协议实现。
+- 问题：用户追问代码层为何曾移除 Docker Compose。
+- 结论：Git 历史确认 2026-07-04 的 `135b013e` 将 AIFAR 从 Compose release 重构为 k8s-like Deployment/ReplicaSet/Pod/Endpoint 模型，`6b866cf9` 按“去掉旧部署逻辑、只保留 agent”的明确要求删除 Compose fallback。旧模板为每个服务写死 `container_name`，本就不能直接 `--scale`；新 Runtime 将 `runtime-spec.json` 作为节点期望态，由 `aifar-agent` 逐副本 `docker run`、健康门禁、滚动替换、端点刷新和多余副本清理。Compose 并非不能做单机副本，彻底移除它是为了避免 Compose 与 agent 双编排源并统一滚动发布/自恢复控制面；若只需要单机副本，当时也可保留 Compose 作为受 agent 管理的执行器，因此这是架构取舍而非技术必然。
+- 问题：用户质疑 AIFAR Runtime 回滚为何会选择最新已部署版本。
+- 结论：当前按钮语义实际是“回滚到所选发布”，前端把所选行 `releaseId` 直接作为 `targetReleaseId`；API 仅凭成功状态、changedServices 和 artifacts 判定可回滚，前后端均未比较目标发布与各服务当前 revision。因此最新已生效发布和新生成的 rollback 发布仍可再次回滚，结果会重复部署相同制品并可能只改变 revision 标签。正确修复需按服务当前 revision 标记当前版本、禁用无变化目标，并在后端再次拒绝 no-op 回滚；本轮仅诊断未改业务代码。
+- 问题：用户确认修复 AIFAR Runtime 回滚会重复部署最新已生效版本的问题。
+- 结论：已确认继续采用“回滚到所选版本”语义，并新增设计规格 `docs/superpowers/specs/2026-07-30-aifar-runtime-rollback-target-guard-design.md`（提交 `74c403d8`）：按服务 current revision 计算 `currentServices`/`rollbackServices`，排除 rollback 审计记录，前端改为“回滚到此版本”，后端预校验与锁内复验共同拒绝 no-op；无数据库迁移。按 brainstorming 门禁，待用户复核书面规格后进入 TDD 实施。
+- 问题：用户批准回滚目标保护规格并要求继续实施。
+- 结论：已新增实施计划 `docs/superpowers/plans/2026-07-30-aifar-runtime-rollback-target-guard.md`（提交 `0c3e9fc7`），拆为 AIFAR inspector、预校验与锁内复验、发布列表派生字段、前端目标规则、当前标记和完整门禁六个 TDD 任务；计划明确当前脏工作区不整文件暂存共享文件，避免纳入无关 MySQL/i18n 改动。待选择执行方式后开始代码实现。
+
+## 2026-08-01
+- 问题：用户询问 MinIO 是否有每天备份操作。
+- 结论：当前 AIFAR 面板没有 MinIO 每日备份、备份记录或定时调度能力；已有的是 MinIO 安装/检测、ILM 清理策略，以及安装时可选的双节点 Bucket Replication 容灾。Bucket Replication 是持续复制而非每日备份，Storage 页手工新增的复制配置仍只写控制面记录。若要求每日可恢复副本，需要另行设计受控任务和调度，并明确版本历史、删除保护、异地目标、保留周期和恢复演练。
+- 问题：用户进一步确认后台是否实际存在每天执行一次的 MinIO 备份动作。
+- 结论：全仓复核未发现 MinIO backup 任务类型、`mc mirror`/`mc cp` 备份命令或每日调度器；现有 `cron: 0 0 2 * * ?` 位于下发给业务应用的 MinIO cleanup 配置中，不是 AIFAR 后台执行的 MinIO 备份动作。
+- 问题：用户询问是否可以新增 MinIO 每日备份能力。
+- 结论：可以新增，并可复用现有 worker/task/target/step、审计、operation lock 与 `app_backups` 记录模型，增加持久化备份策略和后台到期调度；实施前必须先确定独立备份目标、备份语义、保留周期和恢复验收，不能把 Bucket Replication 或无历史版本的简单镜像直接等同于每日可恢复备份。
+- 问题：用户选择 MinIO 每日备份保存到 AIFAR 面板服务器本地目录。
+- 结论：设计应使用独立配置的面板本地备份根目录，不暴露或接受任意路径；执行前预留容量并保持安全余量，远端对象经受控 SSH/MinIO 客户端流式写入临时文件，完成校验后原子落盘，避免在内存或不受控临时目录中整包缓存。
+- 问题：用户确认每日备份覆盖当前 MinIO 实例的全部 Bucket。
+- 结论：调度执行时必须重新读取实时 Bucket 清单并固化到备份清单中，不能只使用策略创建时的静态列表；任一 Bucket 失败时整次备份应标记失败或部分失败并明确列出，不能把未覆盖全部 Bucket 的任务报告为成功。
+- 问题：用户要求每天自动备份前一天的数据，备份后验证，验证失败则继续备份同一个前一天窗口。
+- 结论：调度应以日期窗口建立持久化 backup run，并以“产物完成且清单/对象数量/字节数/校验验证成功”作为唯一完成条件；失败时重试同一日期窗口并防止重复并发，不能因跨日或服务重启跳过未成功日期。仍需明确“前一天”是全量日恢复点、仅前一日新增修改对象，还是按前一日结束时刻重建状态。
+- 问题：用户担心每日完整备份在数据增长后占用过大。
+- 结论：不推荐每天物理复制一套全量对象；推荐首次全量、后续按对象变化增量保存，并用每日完整清单形成逻辑日恢复点。相同对象内容只保存一份，删除用清单差异/删除标记表达；校验覆盖新增内容 SHA-256、清单完整性、对象数量和字节数，恢复时按某日清单重建。这样容量主要随实际新增和变化量增长，而不是按“总数据量×天数”增长。
+- 问题：用户询问每日 MinIO 恢复点建议保留多少天。
+- 结论：默认建议保留 30 天，最低不建议低于 7 天；采用内容去重的逻辑日恢复点后，容量约为首次基线全量加 30 天实际新增/变化内容及少量清单开销。设计还应设置独立配额和文件系统安全余量，空间不足时停止新备份并告警，不能为了腾空间先删除最后一个已验证成功的恢复点。
+- 问题：用户确认 MinIO 每日恢复点保留 30 天。
+- 结论：策略默认 retentionDays=30；清理只处理已超期且不再被任何保留清单引用的内容对象，并在新备份完成验证后执行。未验证或重试中的备份不能触发删除旧恢复点，至少保留最后一个验证成功的完整逻辑恢复点。
+- 问题：用户确认 MinIO 每日自动备份在面板服务器时区凌晨 03:00 执行。
+- 结论：每日策略以面板服务器时区计算前一自然日和目标恢复点；同一实例同一日期只能有一个持久化 run。为保证失败重试仍能获取相同对象版本，必须在设计中处理 Bucket Versioning 和固定版本清单，否则重试期间源对象被覆盖或删除后无法证明仍备份的是同一日状态。
+- 问题：用户补充客户已有 Commvault，并询问能否直接备份当前 AIFAR 部署的 MinIO。
+- 结论：Commvault 11.42 官方 S3 Compatible Storage 支持列表明确包含 MinIO，可通过 S3 API执行 Bucket/对象的全量、增量、合成全量和恢复；应优先采用其 Object Storage/Cloud Apps能力，而不是把运行中的 MinIO `MINIO_VOLUMES` 当普通服务器目录在线复制。需确认客户 Commvault版本、对象存储授权、Access Node/Cloud Apps、网络和最小权限凭据；该能力不保护 MinIO旧对象版本，MinIO IAM/服务账号/策略、TLS/KMS和AIFAR安装配置仍需单独纳入。若客户只有文件系统备份能力，单节点只能采用停写停服务后的冷备并完整覆盖全部数据卷和配置，分布式拓扑不得逐节点在线目录复制。
+- 问题：修复 AIFAR Runtime 回滚会把最新已部署版本再次作为目标、重复部署相同制品的问题。
+- 结论：已在隔离分支 `codex/runtime-rollback-target-guard` 完成修复（HEAD `09a84c82`）：按服务 revision 派生当前/可回滚服务，排除 rollback 审计记录和不完整制品；直接请求与持久编排锁后均拒绝 no-op，锁后重新读取最新实例；发布列表失败关闭，前端仅提交 `rollbackServices` 并显示“当前”标记及“回滚到此版本”。最终验证通过：前端 40 文件/328 测试、全后端测试、前后端构建、差异与范围审计；未执行真实 Runtime/SSH 回滚。
+- 问题：用户选择将 Runtime 回滚目标保护功能分支本地合并回 `codex/status-collector-realtime`。
+- 结论：已快进合并至 `09a84c82`，自动暂存恢复无冲突，并从自动暂存索引精确恢复两个 MySQL 新文件原有的部分暂存边界。主工作区组合状态验证通过：前端 41 文件/335 测试、全后端测试、前后端生产构建；隔离 worktree 与已合并功能分支已清理，其他未提交改动、worktree 和 stash 均保留。
+- 问题：用户要求专项测试 Runtime 回滚目标保护功能。
+- 结论：本地 fake/in-process 专项验证通过：后端覆盖正常回滚、已当前版本拒绝、rollback 审计记录拒绝、锁获取期间状态变化后的再次拒绝、制品字段与 SHA-256 校验、发布列表 eligibility 与缺失 inspector 失败关闭、中英文错误目录；前端 3 文件/80 测试覆盖禁用规则、仅使用 `rollbackServices`、当前标记与禁用点击。受影响后端三包全量测试及前端生产构建通过；未连接真实服务器或执行真实回滚。
+- 问题：用户要求隐藏对象存储实例页右侧的 Bucket、Prefix、保留天数和“统计可清理”工具栏功能。
+- 结论：已仅移除 `StorageView.vue` 实例页的清理工具栏入口，并避免渲染空的右侧操作容器；后端清理 API、策略数据和实例卡片只读状态保持不变。新增组件回归测试确认入口不再渲染；`pnpm test:web` 42 文件/336 测试、`pnpm web:build` 和定向 `git diff --check` 通过。
+## 2026-08-02
+- 问题：用户要求预估 3000 人使用融云时 Pika 数据量增长梯度。
+- 结论：仅按人数不能精确估算，应以 DAU、每活跃用户日均上行消息、平均消息/索引有效写入字节、群消息分发与离线比例、TTL 为核心变量。3000 人常规办公 IM 可先按 Pika 物理净增长约 0.3～0.6 GB/日、9～18 GB/月作为容量基线；轻载约 0.1～0.2 GB/日，重载群聊/高离线场景约 1～3 GB/日。若 Pika 只保留默认 7 天离线消息，活动数据会在 TTL 后趋稳而非持续线性累加；历史消息无过期则按月/年线性增长。媒体文件通常由文件服务或对象存储承载，不应直接计入 Pika，但必须按现场私有化版本确认。两节点复制时每个节点均保存一份完整数据，容量不能对半分；生产磁盘还需给 RocksDB compaction、binlog、备份和故障恢复留余量。
+- 问题：数据库实例页节点“在线/离线”错误使用所属服务器的检查状态，用户要求给出推荐修复方案文档。
+- 结论：推荐将数据库服务健康与服务器探测彻底解耦；MySQL、Redis、Router 以 `app.instance` 应用检测快照和运行时详情为权威来源，无可信应用检测时显示“未知”，服务器状态只用于服务器页面和名称/地址等管理上下文。InnoDB Cluster 继续保留运行时、Primary 和集群有效性判断。设计见 `docs/superpowers/specs/2026-08-02-database-runtime-health-source-design.md`。
+- 问题：实施数据库实例页在线/离线状态数据源修复。
+- 结论：新增 `web/src/database/databaseHealth.ts` 纯解析器并接入 `DatabaseView.vue`，移除数据库健康路径对 `server.status` 和安装状态的兜底；普通节点以 `metadata.lastCheck.status` 为准，InnoDB Cluster 优先读取 MySQL 运行时详情，无可信检测结果显示未知。修复以测试先行完成，合并后完整前端测试和生产构建通过。
+- 问题：用户询问哪些 Commvault 版本没有直接备份 MinIO Bucket/对象的能力。
+- 结论：官方历史文档可确认 Commvault 2022E（11.28）、2023E（11.32）、2024E（11.36）、11.38、11.40、11.42 具备把 Amazon S3/完全 S3 兼容存储（明确包含 MinIO）作为被保护源的对象级备份；公开文档未找到可信的首次引入版本，不能把所有低于 11.28 的版本一概判为不支持。11.16/11.20 检索资料主要证明 S3 兼容存储可作备份目标，不足以证明 MinIO 可作被保护源。项目上可把 11.28+ 作为已获官方文档确认的边界；低于 11.28 必须按精确 Feature Release/Maintenance Release、授权和产品界面确认。仅能创建 S3 cloud library 表示目标能力，不等于对象源备份。
+- 问题：用户询问 Commvault 是否开源。
+- 结论：Commvault 核心备份、恢复和管理平台不是开源软件，而是闭源商业软件；官方条款仅授予有限、非独占、不可转授权、不可转让的二进制使用许可，采购通常采用订阅或永久许可。其文档、SDK/API、集成示例或个别外围项目公开，不代表核心产品开源。
+- 问题：用户询问 Commvault 是否有相关开源软件。
+- 结论：Commvault 官方 GitHub 公开了 CVPySDK、PowerShell SDK、Ansible Collection、MCP Server、Helm Charts 等自动化与集成项目，但它们需要连接已部署并授权的 Commvault，不能替代其闭源备份引擎。若目标是开源替代方案，MinIO 对象备份可用 MinIO Client 或 rclone 配合校验和定时任务，服务器/目录可评估 Bareos、Bacula Community 或 restic，Kubernetes 可评估 Velero；这些需要自行组合调度、目录、保留、告警和恢复演练，不等价于完整 Commvault 平台。
+- 问题：用户要求比较 Commvault 的开源和闭源部分。
+- 结论：Commvault 没有与商业版对应的开源备份产品版本；闭源部分是实际承担备份、索引、去重、保留、恢复和集中管理的商业平台，开源部分主要是调用该平台的 SDK、Ansible、PowerShell、MCP、Helm 等集成工具。完整开源替代方案可以降低许可成本并提高可控性，但需要自行组合组件级备份、调度、校验、告警、保留、权限隔离和恢复编排。客户已有 Commvault 时，当前 AIFAR 更适合优先复用其闭源平台保护 MinIO/MySQL/服务器目录，再用 AIFAR 或开源工具补足应用配置和组件级恢复边界。
+- 问题：用户询问 Commvault 能备份还原哪些内容。
+- 结论：Commvault 可保护文件与目录、Windows/Linux 整机或系统状态、主流虚拟机、数据库、NAS/对象存储、Kubernetes 应用及部分 SaaS；恢复粒度可从文件、对象、数据库和时间点到整机/整 VM，具体以版本、许可、代理、源端配置和目标兼容性为准。对当前 AIFAR，MySQL 应用级备份和 MinIO S3 对象级备份可直接规划；Redis、Nacos、SQLite、面板配置及凭据需分别设计一致性备份和恢复顺序，不能只靠运行中目录复制宣称整套系统可恢复。
+- 问题：用户询问 InnoDB Cluster 是否同步截图中的 information_schema、mysql、mysql_innodb_cluster_metadata、performance_schema 和 sys。
+- 结论：information_schema 是各节点按本地数据字典生成的只读视图，performance_schema 是各节点本地内存监控数据，二者不走 Group Replication；sys 的对象由实例初始化安装，其查询结果来自本地 performance_schema/information_schema，也不是复制数据。mysql 系统库需按操作区分：在 PRIMARY 上正常执行且写入 binlog 的 CREATE/ALTER USER、GRANT 等账号事务会复制，但禁用 binlog 的 dba.configureInstance 配置账号及节点本地配置不会复制。mysql_innodb_cluster_metadata 是 MySQL Shell/AdminAPI 管理的集群拓扑元数据，会作为集群数据复制到成员，但不得手工修改，也不应作为业务数据恢复到另一套新集群。
+- 问题：用户要求提供客户生产环境 MySQL 备份与版本保留策略，并明确忽略 AIFAR 现有备份功能。
+- 结论：方案应保持产品无关，推荐采用每周物理全量、每日物理增量、连续归档 binlog、周期性业务 Schema 逻辑备份和 3-2-1-1-0 存储原则；版本采用日 14、周 8、月 12、年 3（合规可调）及 PITR 35 天的 GFS 基线。删除必须晚于新恢复点校验和异地复制成功，不计失败/未验证版本且始终保留至少两个已验证恢复点；每月隔离恢复、每季度完整灾备演练，以实际业务验收确认 RPO/RTO。
+- 问题：用户要求进一步明确 MySQL 全量、增量、版本保留与清理策略。
+- 结论：采用每周日物理全量，周一至周六执行相对本周全量的累计增量，连续归档 binlog；恢复最多组合一个全量、一个累计增量及其后的 binlog。保留最近14个每日恢复点、8个周全量、12个月全量、3个年全量和35天 binlog，同一全量命中多档时按最长周期保留。清理每日串行执行，先确认新备份校验和异地复制成功，再计算全量与增量/binlog依赖；被保留增量引用的全量、PITR窗口所需binlog、最后两个已验证全量及冻结版本禁止删除，候选先隔离7天并二次复核后物理清除。
+- 问题：用户询问恢复到3天前数据的标准流程。
+- 结论：默认先把目标恢复点还原到隔离实例而非覆盖生产；先明确是整库回退还是误删数据定向找回，确定精确目标时间T并保全当前生产状态。选择T之前最近的已验证周全量、对应累计增量和连续binlog，在同版本隔离实例依次应用并停在T前的安全事件位置；完成校验、GTID/目录/数据抽样与业务验收后，误删场景只导出所需对象回灌当前PRIMARY，整库回退则停写并从恢复种子重建InnoDB Cluster、克隆其余成员和验证Router。全过程保留当前数据回退点，未确认范围、binlog缺口、校验失败或集群分叉时停止。
+- 问题：用户询问直接把3天前备份恢复到生产可能出现的问题。
+- 结论：直接覆盖生产会立即丢弃恢复点之后的新增和修改，并可能在未停写时把旧快照与新事务混合，形成外键、订单状态、流水和跨组件不一致；恢复中途失败还可能留下半恢复状态。InnoDB Cluster 上直接替换单节点会因GTID和数据集分叉而无法rejoin，继续强制可能导致复制错误或数据冲突；在三节点重复导入也会重复执行变更。标准门禁是先停写和保全当前状态，在隔离环境验证后，误删场景定向回灌，整库回退则从验证后的种子重建集群并保留原生产回退点。
+- 问题：用户要求检查 C、D 盘占用并给出清理建议。
+- 结论：C 盘约使用 119.34/150 GB，重点候选为 12.7 GB 休眠文件、8.5 GB 用户临时目录和桌面安装归档；D 盘约使用 301.84/326.63 GB，主要由 191.4 GB VMware、55.1 GB workspace、34.3 GB tools 构成。VMware 正有三个虚拟机进程运行且存在快照增量盘，VMDK/VHDX 不得手工删除；优先通过系统清理、确认后删除可再生成的 AIFAR 构建/Go 缓存、清理回收站，并在 VMware 内关机后处理挂起内存、废弃克隆与快照合并。
+- 问题：用户确认执行磁盘清理第一批低风险项目。
+- 结论：保留 Linux/Windows 两个发布归档，删除对应重复解压目录及仓库内 `.cache`、`.codex-cache`、`.tmp`、`.gocache`、`backend/.gocache` 可再生成缓存，并清空当前用户 D 盘回收站。实际释放 19.86 GB，D 盘可用空间由 24.79 GB 提升至 44.66 GB；复查所有目标均不存在、两个归档仍在、Git 无新增 tracked deletion。
+- 问题：用户反馈 InnoDB Cluster 实际正常，但数据库实例卡片显示“服务不可用”。
+- 结论：本机 SQLite 与状态历史显示三个 MySQL 节点的 runtime、mysqladmin ping、systemd 和端口均为 running，Primary 仍记录为 `192.168.74.134:3306`；但 `192.168.74.137:3306` 连续多次本地拓扑查询返回空 Primary，`lastCheck.status=failed`、错误为 `InnoDB Cluster primary was not returned`，另外两节点和三个 Router 持续 running。前端 `mysqlClusterServiceStatus` 在“全部 runtime 在线但任一节点应用检查失败”时直接返回 `unavailable`，进而遮蔽已知 Primary，导致单节点拓扑检测异常被错误放大为整个集群服务不可用。应把节点运行时、节点拓扑检测和集群级健康分层；已知 Primary 且多数检测成功时至少显示 degraded/检测异常，而不是 unavailable。
+- 问题：用户询问 InnoDB Cluster 是否可以只在 Primary 恢复业务数据，以及可能的问题。
+- 结论：健康单主集群的完整业务 Schema 逻辑恢复应只连接当前 ONLINE Primary，并保持 `sql_log_bin=ON`/`skipBinlog:false`，由 Group Replication 同步到 Secondary，禁止三节点重复导入；物理备份或数据目录不能按此方式覆盖现有 Primary。恢复前必须停业务写入并做当前状态备份，按已验证清单删除目标业务 Schema 后再加载，禁止导入系统库、账号和 `mysql_innodb_cluster_metadata*`，禁止修改活动集群的 `GTID_PURGED`。过程中 Primary 切换或连接中断应失败停止；完成后等待成员应用追平并验证 Schema、Router 和业务。少量误删应先恢复到隔离实例，再定向回灌 Primary，避免整库回退覆盖新数据。
+- 问题：用户询问客户 MinIO 备份如何操作。
+- 结论：AIFAR 当前没有一键完整 MinIO 备份/恢复；客户应优先备份到独立故障域的另一套 MinIO/S3。仅需当前对象可在停写窗口执行两轮 `mc mirror`，但其不保留完整版本历史和全部元数据；需要低 RPO、版本、删除标记和元数据时应启用 Bucket/Site Replication 或商业对象备份。对象数据之外还需导出 MinIO 集群配置、Bucket 元数据和 IAM，保管 KMS/证书等外部依赖，并在隔离环境执行恢复、对象数量/容量/抽样校验和业务验收；禁止在线逐节点复制分布式 MinIO 底层数据目录。
+- 问题：用户追问不用 `mc` 时如何备份 MinIO。
+- 结论：已有 Commvault 时优先把 MinIO 配置为 S3 Compatible Storage 被保护源；无商业软件可用 `rclone copy` 通过 S3 API复制到独立、启用版本控制/不可变保留的目标，默认不用会删除目标对象的 `sync`。两者仍需另外保护 MinIO 集群配置、Bucket/IAM、证书和 KMS，并在停写窗口做最终增量和隔离恢复验收。存储或虚拟机快照仅适合协调停写、停止整套 MinIO并同时快照所有数据卷的冷备；禁止在线 `cp`、`rsync` 或 `tar` 分布式节点数据目录。
+- 问题：用户询问 MinIO 是否有类似 `mysqldump` 的原生备份工具。
+- 结论：MinIO 没有把整套实例导出为单一可移植备份文件的 `mysqldump` 等价物；对象数据应通过 S3 API复制、对象备份软件或复制机制保护，集群配置、Bucket 元数据、IAM、证书和 KMS需另行备份。若必须生成单一归档，只能在对象级下载后打包，或在整套 MinIO协调停机后对全部数据卷做冷快照，不能在线打包分布式底层数据目录。
+- 问题：用户询问通过 `rclone` 导出的 MinIO 数据是否能够重新导入。
+- 结论：可以把本地备份目录或备份 S3 Bucket 作为源，用 `rclone copy` 反向复制到新 MinIO；对象内容和 key 可恢复，受后端支持时可用 `--metadata` 恢复部分对象元数据。恢复前需重建 Bucket、版本控制和 Object Lock等设置；历史版本、删除标记、IAM、Bucket规则、集群配置、证书及KMS不由普通对象复制完整恢复，必须另行恢复并进行对象数量、容量、内容校验和业务验收。
+- 问题：用户要求解释 MinIO `rclone` 恢复和校验命令中的各项参数。
+- 结论：`rclone copy` 负责从源向目标复制且不删除目标额外对象；源可为本地目录或备份端 remote，目标 `minio-restore:<bucket>` 表示已配置的恢复端及Bucket。`--dry-run` 仅预演，`--checksum` 优先按大小和可用哈希判断差异，`--metadata` 尝试复制后端支持的对象元数据，`--fast-list` 以更多内存换更少列举请求。`rclone check` 只校验不写入，`--one-way` 只要求源对象在目标存在且匹配，允许目标额外对象，`--download` 下载两端内容计算校验，准确但耗时和流量最大。
+- 问题：用户要求修复健康 InnoDB Cluster 因单成员拓扑检测失败而显示“服务不可用”并误开放“启动集群”的问题。
+- 结论：将 MySQL 集群状态聚合和启动门禁抽为 `databaseHealth.ts` 纯函数；三个 runtime 在线、Primary 已知且至少一个当前集群检查成功但部分失败时显示 `degraded`，检查中或结果不完整时显示 `probing`/`unknown`，仅在恰好三个非虚拟节点 runtime 全在线且三个当前集群检查均明确 `offline` 时允许启动集群。新增回归测试覆盖截图场景、完全健康、检查中/未知和完整失效；前端测试、生产构建与差异检查通过，未提交或推送。
+- 问题：用户反馈修复后 InnoDB Cluster 仍显示“降级”，并提供 `replication_group_members` 实际结果。
+- 结论：实际集群并非三成员完全健康：`192.168.74.134` 为 ONLINE PRIMARY，`192.168.74.133` 为 ONLINE SECONDARY，`192.168.74.137` 为 RECOVERING SECONDARY。因此集群具备服务能力和 quorum，但冗余尚未完全恢复，显示 `degraded` 正确；页面节点绿色“在线”当前仅表达 mysqld runtime 在线，未表达 Group Replication 的 RECOVERING 状态。后续正确改进是采集并展示每个成员的 `MEMBER_STATE`，而不是把集群强制显示 running；集群已有 Primary 时禁止再执行完整宕机“启动集群”。
+- 问题：用户提供 `.137` 的 `group_replication_recovery` 通道详情，要求继续判断 RECOVERING 原因。
+- 结论：恢复接收线程仍运行，但 SQL 应用线程因错误 1114 停止；`Replica_IO_State=Waiting for disk space`、`Replica_SQL_Running=No`、worker 在 GTID `...:13541` 失败，表明 `.137` 存在文件系统/临时目录/表空间扩展或 relay log 限额方面的空间问题。先检查 `df -hT`、`df -ih`、`@@datadir`、`@@tmpdir`、`relay_log_space_limit` 和 worker 错误并安全释放空间；禁止跳过 GTID、手工删除 relay/binlog、执行 `RESET REPLICA` 或对 recovery channel 执行 `START REPLICA`。释放空间后如未自动恢复，仅在确认另外两成员 ONLINE 后对 `.137` 执行 `STOP GROUP_REPLICATION; START GROUP_REPLICATION;`，直至成员变为 ONLINE。
+- 问题：用户反馈整个 InnoDB Cluster 已无可用成员，但页面仍显示历史 Primary 和“降级”，要求查询当前集群情况。
+- 结论：21:11 最新采集显示 `.133`、`.134` 的 mysqld/ping/systemd/端口仍 running，但两者拓扑检查均失败且返回 `InnoDB Cluster primary was not returned`；`.137` 的 runtime/ping/systemd/端口均 offline；三个 Router 仅进程 running。页面的 Primary `.134` 来自 21:09:43 的旧成功快照，当前没有任何成功拓扑检查。现有前端“部分 runtime 在线即 degraded”规则把无 Primary 的集群误显示为降级，并继续展示旧 Primary。推荐修订为：至少一个当前拓扑检查成功且 Primary 有效时才允许 degraded；所有当前拓扑检查明确失败时显示 unavailable 并隐藏历史 Primary，同时保留完全宕机启动门禁。
+- 问题：用户确认只删除当前三节点 `aifarCluster`，保留 `.132` standalone MySQL。
+- 结论：21:12 已有批量删除任务先后成功卸载并删除 `.133/.134/.137` 的三个 MySQL Router，以及 `.137` 的 MySQL 服务和实例记录；随后删除 `.134` 前因 `MYSQL_MAINTENANCE_STATE_INVALID` 失败，`.133` 尚未执行，`.132` 未触碰。根因是删除首个成员后权威集群成员从 3 变 2，后续逐成员 Delete 重新调用要求恰好三成员的 maintenance guard，导致批量删除不可续跑。完成删除需要修复为批次开始时对完整集群一次性预检/冻结删除范围，后续成员删除不因同批次已删除成员而失败，并在最后成员删除后清理集群控制面记录；重试仍应通过面板密码确认、任务和审计执行。
+- 问题：用户确认修复并继续清理部分删除后的当前三节点 MySQL 集群。
+- 结论：新增可选批量删除预检协议，MySQL 在远端变更前冻结所有剩余成员范围；完整选择两节点的部分集群可续删，漏选、归属漂移、maintenance 或 reconciliation 标记仍失败关闭。每个节点执行前复核身份和安全标记，`DeleteAppInstance` 在同一事务中仅清理变空的集群记录，因此新旧两套指向 `.133/.134` 的集群行都会在最后成员删除后移除，`.132` standalone 不受影响。定向回归及工作区可写 `GOCACHE` 下的 `go test ./...` 全部通过；修复版本地 API/前端已在 8080/5173 启动，等待用户登录并在面板内输入 SSH 确认密码完成剩余远端删除。
+- 问题：用户登录后继续执行仅删除当前三节点 MySQL 集群。
+- 结论：已在应用商店“已安装”页打开 MySQL `innodb-cluster` 整体卸载确认框，界面范围为 `.133/.134/.137` 三个集群节点，`.132` standalone 未包含；尚未提交删除，等待用户在面板内确认 SSH 密码并作最终操作确认。
+- 问题：用户要求检查最新一次 MySQL InnoDB Cluster“启动集群”失败原因。
+- 结论：22:59 首次启动任务在 `.133` 恢复为种子且 `.134` 成功 rejoin 后，因 `.137` 的 `group_replication_recovery` relay-log 索引返回 OS errno 13 `Permission denied` 而失败；`.137` 的 systemd 日志显示 23:06:50 开始明确 stop/start，服务于 23:06:53 重新启动并重建 relay 索引，23:07 第二次启动任务随后成功，23:11 页面实时采集为 `.133` PRIMARY、`.134/.137` SECONDARY，三成员和三个 Router 均在线。当前 relay 索引属主/组为 `aifar-mysql`、模式 `0640`，SELinux 为 Permissive；旧失败 inode 已被替换，无法事后进一步证明当时是属主、ACL 还是目录瞬时状态。
+
+## 2026-08-03
+- 问题：用户询问 AIFAR Runtime 批量更新失败原因，随后表示已知磁盘满并要求停止继续检查。
+- 结论：任务 `aifar.rollout.bundle` 已完成 10 个制品校验与上传，在并行构建 `message`、`meeting` 等 Docker 镜像时返回 `no space left on device`，因此 `apply-update` 失败且未记录新 release；目标 `.132` 的 Docker Root 为 `/aifar/apps/docker/data`，与 Runtime 目录同在 35G 根分区。用户已自行删除三个失败批次镜像并要求停止，已结束只读 SSH 会话，未执行清理、重试或回滚。
+- 问题：用户删除 AIFAR Runtime 发布历史时提示“该发布记录仍被其他发布记录引用，不能删除”。
+- 结论：这是后端回滚链保护而非发布故障；删除前会阻止移除被其他 release 的 `baseReleaseId` 或 `rollbackTo` 引用的记录。本地当前数据中 `20260801T114444...rollout-web-vue3` 同时被后续 bundle 和 web-vue3 rollout 引用，`20260802T180934...rollout-bundle` 又被当前 web-vue3 rollout 引用，直接删除会破坏后续版本的回滚基线。
+- 问题：用户确认点的是发布历史最后一条，要求判断删除提示是否存在问题。
+- 结论：最后一条 `20260801T114444...rollout-web-vue3` 确被 `20260802T174826...rollout-web-vue3` 和 `20260802T180934...rollout-bundle` 的 `baseReleaseId` 引用，后台拒绝与当前规则一致；但前端只禁用 pending/running，未展示后端删除资格，导致必然失败的删除按钮仍可点击。更深层问题是成功发布形成父链后，当前版本不可删、父版本因被引用也不可删，自动保留 3 条可能长期无法收缩；且该 bundle 的 `baseReleaseId` 指向旧的 `11:44` 版本，而 `serviceRevisionsBefore.web-vue3` 实际为 `17:48`，说明用粗粒度 `baseReleaseId` 作为硬删除依赖会造成过度保护。
+- 问题：用户要求修复 AIFAR Runtime 发布历史最后一条因历史引用无法删除的问题。
+- 结论：发布记录的 `baseReleaseId`、`rollbackTo` 等字段改为审计历史，不再作为硬删除依赖；删除仅保护 pending/running 记录以及实例元数据中 `currentRevision`、`releaseId`、`serviceRevisions` 当前仍使用的版本。列表 API 返回删除资格，前端提前禁用并解释不可删除项；自动保留改为最新 3 条成功记录加当前活跃版本。完整后端测试、351 个前端测试、前端生产构建和差异检查通过；本地页面实测两条当前记录禁用删除，两条历史记录（含最后一条）可删除，未实际删除记录、未提交或推送。
+- 问题：用户询问当前回滚到 `20260802T180934...rollout-bundle` 会影响哪些服务。
+- 结论：当前 `oauth/permission/system/file/message/im/contacts/meeting/gateway` 已在该 bundle revision，只有 `web-vue3` 运行于较新的 `20260802T185746...rollout-web-vue3`；回滚提交使用后端计算的 `rollbackServices`，因此本次只会将 `web-vue3` 回滚到 bundle 中的制品，其余 9 个服务不会重新发布，业务数据也不会自动回滚。已只读打开并取消确认框，未提交回滚任务。
+- 问题：用户希望服务器页面不再每次进入都探测，改为后端主动推送状态。
+- 结论：当前全局 SSE 与 15 秒 collector 已存在，但 `collectServers()` 只把数据库中的服务器状态写入快照，不执行 SSH 探测；`ServersView.vue` 仍在 `onMounted` 调用 `probeAllOnce()`，因此每次进入页面都会为全部服务器创建探测任务。正确改造需把周期性轻量探测放到后端采集链路，并让页面消费 `status.server.updated`，页面加载只读取现有列表/快照，保留手工“探测主机”任务作为即时诊断入口。
+- 问题：用户确认服务器后台主动探测采用现有采集周期。
+- 结论：服务器轻量 SSH 状态采集周期确定为 15 秒；页面进入不再触发批量任务，状态变化通过全局 SSE 推送，手工探测继续作为带任务和审计的即时诊断入口。
+- 问题：用户确认服务器主动状态推送的总体架构。
+- 结论：采用扩展现有 Collector 的方案，不创建周期性 `servers.probe` 任务，也不新增独立监控服务；后台采集轻量 SSH 状态并写 `server` 快照，页面通过全局 SSE 原地更新。
+- 问题：用户确认服务器后台探测的状态与异常处理语义。
+- 结论：单机超时 5 秒、最大并发 8，只验证 SSH 建连认证；单机失败写脱敏后的 failed 快照但不判定整个 Collector 失败，后台不周期性展示 probing，不修改服务器基础记录；SSE 重连后加载最新快照，凭据不进入快照、事件、日志或前端。当前待确认具体代码范围、测试和验收门禁。
+- 问题：用户确认服务器状态后端主动推送的完整改动范围与验收门禁。
+- 结论：设计文档已写入 `docs/superpowers/specs/2026-08-03-server-status-backend-push-design.md` 并以提交 `feac2d97` 单独提交；范围包括 Collector 轻量 SSH 探测、仅 server 状态变化时 SSE 推送、服务器页取消自动批量探测、快照原地合并，以及 Go/前端测试和页面无新增 probe 任务验收。等待用户审阅书面设计后再编写实现计划。

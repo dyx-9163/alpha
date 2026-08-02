@@ -2,9 +2,81 @@ package store
 
 import (
 	"database/sql"
+	"fmt"
 	"strings"
 	"time"
 )
+
+func (s *Store) SaveAppClusterDeployment(cluster AppCluster, instances []AppInstance, members []AppClusterMember) ([]AppInstance, error) {
+	cluster = normalizeAppCluster(cluster)
+	if cluster.ID == "" || cluster.App == "" || cluster.Name == "" || len(instances) == 0 || len(instances) != len(members) {
+		return nil, sql.ErrNoRows
+	}
+	now := time.Now()
+	if cluster.CreatedAt.IsZero() {
+		cluster.CreatedAt = now
+	}
+	cluster.UpdatedAt = now
+	instanceByID := make(map[string]AppInstance, len(instances))
+	serverIDs := make(map[string]bool, len(instances))
+	for index := range instances {
+		instance := instances[index]
+		instance.ID = strings.TrimSpace(instance.ID)
+		instance.ServerID = strings.TrimSpace(instance.ServerID)
+		if instance.ID == "" || instance.App != cluster.App || instance.ServerID == "" || serverIDs[instance.ServerID] {
+			return nil, fmt.Errorf("invalid app cluster instance ownership")
+		}
+		if instance.CreatedAt.IsZero() {
+			instance.CreatedAt = now
+		}
+		instance.UpdatedAt = now
+		instances[index] = instance
+		instanceByID[instance.ID] = instance
+		serverIDs[instance.ServerID] = true
+	}
+	seenMembers := make(map[string]bool, len(members))
+	for index := range members {
+		member := normalizeAppClusterMember(members[index])
+		instance, ok := instanceByID[member.InstanceID]
+		if member.ClusterID != cluster.ID || !ok || member.ServerID != instance.ServerID || seenMembers[member.InstanceID] {
+			return nil, fmt.Errorf("invalid app cluster membership")
+		}
+		if member.ID == "" {
+			member.ID = NewID("clmember")
+		}
+		if member.CreatedAt.IsZero() {
+			member.CreatedAt = now
+		}
+		member.UpdatedAt = now
+		members[index] = member
+		seenMembers[member.InstanceID] = true
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`insert into app_clusters(id,app,name,topology,status,metadata,created_at,updated_at) values(?,?,?,?,?,?,?,?)`,
+		cluster.ID, cluster.App, cluster.Name, cluster.Topology, cluster.Status, cluster.Metadata, cluster.CreatedAt, cluster.UpdatedAt); err != nil {
+		return nil, err
+	}
+	for _, instance := range instances {
+		if _, err := tx.Exec(`insert into app_instances(id,app,version,server_id,status,topology,metadata,created_at,updated_at) values(?,?,?,?,?,?,?,?,?)`,
+			instance.ID, instance.App, instance.Version, instance.ServerID, instance.Status, instance.Topology, instance.Metadata, instance.CreatedAt, instance.UpdatedAt); err != nil {
+			return nil, err
+		}
+	}
+	for _, member := range members {
+		if _, err := tx.Exec(`insert into app_cluster_members(id,cluster_id,instance_id,server_id,role,status,metadata,created_at,updated_at) values(?,?,?,?,?,?,?,?,?)`,
+			member.ID, member.ClusterID, member.InstanceID, member.ServerID, member.Role, member.Status, member.Metadata, member.CreatedAt, member.UpdatedAt); err != nil {
+			return nil, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return instances, nil
+}
 
 func (s *Store) SaveAppCluster(cluster AppCluster) (AppCluster, error) {
 	cluster = normalizeAppCluster(cluster)

@@ -18,6 +18,7 @@ import {
   clearMySQLMaintenance,
   deduplicateMySQLBackups,
   deleteMySQLBackup,
+	discoverMySQLBackupSchemas,
   groupMySQLMaintenance,
   groupMySQLReconciliation,
   latestVerifiableMySQLBackup,
@@ -321,7 +322,7 @@ describe('operation availability', () => {
     expect(mysqlOperationAvailability({
       app: 'mysql', topology: 'standalone', status: 'online', canManage: true, isOwner: false,
       nodeCount: 1, maintenance: noMaintenance
-    })).toMatchObject({ backup: true, records: true, verify: true, restore: false, disaster: false, clearMaintenance: false })
+    })).toMatchObject({ backup: true, records: true, verify: true, restore: false, resumeRestore: false, disaster: false, clearMaintenance: false })
 
     expect(mysqlOperationAvailability({
       app: 'mysql', topology: 'innodb-cluster', status: 'online', canManage: true, isOwner: true,
@@ -352,19 +353,34 @@ describe('operation availability', () => {
     expect(mysqlOperationAvailability({
       app: 'mysql', topology: 'standalone', status: 'online', canManage: true, isOwner: true,
       nodeCount: 1, maintenance
-    })).toMatchObject({ backup: false, restore: false, disaster: false, clearMaintenance: true, lifecycleBlocked: true })
+    })).toMatchObject({ backup: false, restore: false, resumeRestore: true, disaster: false, clearMaintenance: true, lifecycleBlocked: true })
     expect(mysqlOperationAvailability({
       app: 'mysql', topology: 'innodb-cluster', status: 'degraded', canManage: true, isOwner: true,
       nodeCount: 3, maintenance: { ...maintenance, state: validMaintenance({ scope: 'cluster', clusterId }) as never }
-    })).toMatchObject({ backup: false, restore: false, disaster: true, clearMaintenance: true, lifecycleBlocked: true })
+    })).toMatchObject({ backup: false, restore: false, resumeRestore: false, disaster: true, clearMaintenance: true, lifecycleBlocked: true })
     expect(mysqlOperationAvailability({
       app: 'mysql', topology: 'innodb-cluster', status: 'degraded', canManage: true, isOwner: false,
       nodeCount: 3, maintenance
-    })).toMatchObject({ disaster: false, clearMaintenance: false })
+    })).toMatchObject({ resumeRestore: false, disaster: false, clearMaintenance: false })
     expect(mysqlOperationAvailability({
       app: 'mysql', topology: 'standalone', status: 'online', canManage: true, isOwner: true,
       nodeCount: 1, maintenance: { kind: 'invalid' }
-    })).toMatchObject({ backup: false, restore: false, clearMaintenance: false, lifecycleBlocked: true, controlStateInvalid: true })
+    })).toMatchObject({ backup: false, restore: false, resumeRestore: false, clearMaintenance: false, lifecycleBlocked: true, controlStateInvalid: true })
+  })
+
+  it('exposes standalone resume only for an owner, without reconciliation, at a resumable phase', () => {
+    const base = {
+      app: 'mysql', topology: 'standalone', status: 'offline', canManage: true, isOwner: true,
+      nodeCount: 1, maintenance,
+      reconciliation: { kind: 'none' as const }
+    }
+    expect(mysqlOperationAvailability(base)).toMatchObject({ resumeRestore: true })
+    expect(mysqlOperationAvailability({ ...base, isOwner: false })).toMatchObject({ resumeRestore: false })
+    expect(mysqlOperationAvailability({ ...base, reconciliation: { kind: 'required', instanceId, state: {} as never } })).toMatchObject({ resumeRestore: false })
+    expect(mysqlOperationAvailability({
+      ...base,
+      maintenance: { kind: 'required', state: validMaintenance({ restorePhase: 'preflight_complete' }) as never }
+    })).toMatchObject({ resumeRestore: false })
   })
 })
 
@@ -391,13 +407,31 @@ describe('typed API and task tracking', () => {
   it('submits the exact backup body and tracks the returned task', async () => {
     api.post.mockResolvedValue({ taskId, status: 'pending' })
 
-    await startMySQLBackup(instanceId, { name: 'nightly', threads: 4, maxRateMBps: 64, keepLast: 8 }, tracker, 'backup')
+	await startMySQLBackup(instanceId, { name: 'nightly', threads: 4, maxRateMBps: 64, keepLast: 8, schemas: ['orders', 'billing'] }, tracker, 'backup')
 
     expect(api.post).toHaveBeenCalledWith(`/apps/instances/${instanceId}/backup`, {
-      name: 'nightly', threads: 4, maxRateMBps: 64, keepLast: 8
-    })
+	  name: 'nightly', threads: 4, maxRateMBps: 64, keepLast: 8, schemas: ['orders', 'billing']
+	})
     expect(tracker.track).toHaveBeenCalledWith(taskId, 'backup')
   })
+
+	it('strictly parses the three-category live schema catalog', async () => {
+	  api.get.mockResolvedValue({
+		instanceId,
+		sourceInstanceId: instanceId,
+		sourceServerId: serverId,
+		schemas: [
+		  { name: 'mysql', category: 'server-system', selectable: false, selectedByDefault: false },
+		  { name: 'mysql_innodb_cluster_metadata', category: 'cluster-metadata', selectable: false, selectedByDefault: false },
+		  { name: 'orders', category: 'business', selectable: true, selectedByDefault: true }
+		]
+	  })
+	  const result = await discoverMySQLBackupSchemas(instanceId)
+	  expect(api.get).toHaveBeenCalledWith(`/apps/instances/${instanceId}/backup-schemas`)
+	  expect(result.schemas.map((schema) => [schema.name, schema.category, schema.selectable])).toEqual([
+		['mysql', 'server-system', false], ['mysql_innodb_cluster_metadata', 'cluster-metadata', false], ['orders', 'business', true]
+	  ])
+	})
 
   it('maps healthy-cluster to the exact ordinary restore wire body', async () => {
     api.post.mockResolvedValue({ taskId, status: 'pending' })
@@ -419,6 +453,29 @@ describe('typed API and task tracking', () => {
       threads: 8
     })
     expect(JSON.stringify(api.post.mock.calls[0])).not.toContain('healthy-cluster')
+  })
+
+  it('adds the maintenance resume flag only to an explicit standalone resume request', async () => {
+    api.post.mockResolvedValue({ taskId, status: 'pending' })
+
+    await startMySQLRestore(instanceId, {
+      backupId,
+      mode: 'standalone',
+      maintenanceConfirmed: true,
+      createPreRestoreBackup: false,
+      resumeMaintenance: true,
+      threads: 4
+    }, tracker, 'resume restore')
+
+    expect(api.post).toHaveBeenCalledWith(`/apps/instances/${instanceId}/restore`, {
+      backupId,
+      mode: 'standalone',
+      maintenanceConfirmed: true,
+      createPreRestoreBackup: false,
+      disasterConfirmed: false,
+      resumeMaintenance: true,
+      threads: 4
+    })
   })
 
   it('keeps disaster passwords in the request only and tracks no secret-bearing label', async () => {

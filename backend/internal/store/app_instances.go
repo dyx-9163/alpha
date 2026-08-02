@@ -54,6 +54,26 @@ func (s *Store) DeleteAppInstance(id string) error {
 		return err
 	}
 	defer tx.Rollback()
+	clusterRows, err := tx.Query(`select distinct cluster_id from app_cluster_members where instance_id=?`, id)
+	if err != nil {
+		return err
+	}
+	affectedClusterIDs := []string{}
+	for clusterRows.Next() {
+		var clusterID string
+		if err := clusterRows.Scan(&clusterID); err != nil {
+			clusterRows.Close()
+			return err
+		}
+		affectedClusterIDs = append(affectedClusterIDs, clusterID)
+	}
+	if err := clusterRows.Err(); err != nil {
+		clusterRows.Close()
+		return err
+	}
+	if err := clusterRows.Close(); err != nil {
+		return err
+	}
 	if _, err := tx.Exec(`delete from operation_locks where scope='app-instance' and resource_id=?`, id); err != nil {
 		return err
 	}
@@ -90,6 +110,11 @@ func (s *Store) DeleteAppInstance(id string) error {
 	}
 	if rows, _ := res.RowsAffected(); rows == 0 {
 		return sql.ErrNoRows
+	}
+	for _, clusterID := range affectedClusterIDs {
+		if _, err := tx.Exec(`delete from app_clusters where id=? and not exists (select 1 from app_cluster_members where cluster_id=?)`, clusterID, clusterID); err != nil {
+			return err
+		}
 	}
 	return tx.Commit()
 }
@@ -258,20 +283,19 @@ func (s *Store) DeleteOldAppReleases(instanceID string, keep int) (int, error) {
 	if keep < 1 {
 		keep = 1
 	}
-	rows, err := s.db.Query(`select id,release_id,coalesce(manifest_json,'') from app_releases where instance_id=? and status='success' order by activated_at desc, created_at desc`, instanceID)
+	rows, err := s.db.Query(`select id,release_id from app_releases where instance_id=? and status='success' order by activated_at desc, created_at desc`, instanceID)
 	if err != nil {
 		return 0, err
 	}
 	defer rows.Close()
 	type releaseRow struct {
-		id       string
-		release  string
-		manifest string
+		id      string
+		release string
 	}
 	var rowsData []releaseRow
 	for rows.Next() {
 		var row releaseRow
-		if err := rows.Scan(&row.id, &row.release, &row.manifest); err != nil {
+		if err := rows.Scan(&row.id, &row.release); err != nil {
 			return 0, err
 		}
 		rowsData = append(rowsData, row)
@@ -282,14 +306,7 @@ func (s *Store) DeleteOldAppReleases(instanceID string, keep int) (int, error) {
 	if len(rowsData) <= keep {
 		return 0, nil
 	}
-	manifests := map[string]string{}
-	for _, row := range rowsData {
-		manifests[row.release] = row.manifest
-	}
-	protected := map[string]bool{}
-	for _, row := range rowsData[:keep] {
-		protectReleaseChain(row.release, manifests, protected)
-	}
+	protected := s.activeAppReleaseIDs(instanceID)
 	deleted := 0
 	for _, row := range rowsData[keep:] {
 		if protected[row.release] {
@@ -312,24 +329,29 @@ func (s *Store) DeleteOldAppReleases(instanceID string, keep int) (int, error) {
 	return deleted, nil
 }
 
-func protectReleaseChain(releaseID string, manifests map[string]string, protected map[string]bool) {
-	seen := map[string]bool{}
-	for releaseID != "" {
-		if seen[releaseID] {
-			return
-		}
-		seen[releaseID] = true
-		protected[releaseID] = true
-		manifest := manifests[releaseID]
-		if manifest == "" {
-			return
-		}
-		var data struct {
-			BaseReleaseID string `json:"baseReleaseId"`
-		}
-		if err := json.Unmarshal([]byte(manifest), &data); err != nil {
-			return
-		}
-		releaseID = data.BaseReleaseID
+func (s *Store) activeAppReleaseIDs(instanceID string) map[string]bool {
+	protected := map[string]bool{}
+	var metadata string
+	if err := s.db.QueryRow(`select coalesce(metadata,'') from app_instances where id=?`, instanceID).Scan(&metadata); err != nil || strings.TrimSpace(metadata) == "" {
+		return protected
 	}
+	var data struct {
+		CurrentRevision  string            `json:"currentRevision"`
+		ReleaseID        string            `json:"releaseId"`
+		ServiceRevisions map[string]string `json:"serviceRevisions"`
+	}
+	if err := json.Unmarshal([]byte(metadata), &data); err != nil {
+		return protected
+	}
+	for _, releaseID := range []string{data.CurrentRevision, data.ReleaseID} {
+		if releaseID = strings.TrimSpace(releaseID); releaseID != "" {
+			protected[releaseID] = true
+		}
+	}
+	for _, releaseID := range data.ServiceRevisions {
+		if releaseID = strings.TrimSpace(releaseID); releaseID != "" {
+			protected[releaseID] = true
+		}
+	}
+	return protected
 }

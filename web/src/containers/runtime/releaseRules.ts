@@ -9,6 +9,23 @@ type RuntimeReleaseRollbackOptions = {
   t: RuntimeTranslate
 }
 
+type RuntimeReleaseDeleteOptions = RuntimeReleaseRollbackOptions
+
+export function runtimeReleaseDeleteDisabledReason(row: AifarRelease, options: RuntimeReleaseDeleteOptions): string {
+  if (!options.canManage) return options.deniedText
+  if (!row.releaseId) return options.t('containers.releaseIdRequired')
+
+  switch (row.deleteUnavailableReason) {
+    case 'AIFAR_RELEASE_DELETE_CURRENT':
+      return options.t('containers.releaseDeleteCurrentUnavailable')
+    case 'AIFAR_RELEASE_DELETE_ACTIVE':
+      return options.t('containers.releaseDeleteActiveUnavailable')
+  }
+
+  if (!row.deleteAvailable) return options.t('containers.releaseDeleteUnavailable')
+  return ''
+}
+
 export function runtimeReleaseRollbackDisabledReason(row: AifarRelease, options: RuntimeReleaseRollbackOptions): string {
   if (!options.canManage) return options.deniedText
   if (!row.releaseId) return options.t('containers.releaseIdRequired')

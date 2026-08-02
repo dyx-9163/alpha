@@ -64,6 +64,25 @@ func TestRestoreStandalonePlanMatchesApprovedSectionNine(t *testing.T) {
 	}
 }
 
+func TestRestoreStandaloneLoadsServerWithSSHCredentialBeforeRemoteWork(t *testing.T) {
+	data := &restoreFakeStore{backupFakeStore: newBackupFakeStore(t)}
+	repositoryDir, backup := createStandaloneRestoreBackup(t, data.instance)
+	data.backups = []store.AppBackup{backup}
+	remote := &restoreFakeRemote{inspect: standaloneInspection("aifar_business")}
+	service := NewService(data, remote)
+	service.preRestoreBackup = func(context.Context, registry.BackupRequest, registry.RunContext) error { return nil }
+	service.localInfileSession = func(context.Context, store.AppInstance, store.Server, store.Credential) (localInfileSession, func(), error) {
+		return &fakeLocalInfileSession{value: "OFF"}, func() {}, nil
+	}
+
+	if err := service.restoreStandalone(context.Background(), standaloneRestoreRequest(data.instance, backup, repositoryDir), registry.RunContext{TaskID: "task_restore_ssh_credential", Log: fakeLogger{}}); err != nil {
+		t.Fatal(err)
+	}
+	if len(data.serverSecretRequests) == 0 || !data.serverSecretRequests[0] {
+		t.Fatalf("GetServer includeSecret calls = %v, want first call true", data.serverSecretRequests)
+	}
+}
+
 type restoreProgressRecorder struct {
 	backupRecorder
 	targetStarts    int
@@ -130,29 +149,31 @@ func TestRestoreStandaloneTerminallyRecordsExactPlanAndSingleTargetOnEveryOutcom
 }
 
 type restoreFakeRemote struct {
-	commands    []string
-	uploads     map[string]string
-	inspect     string
-	inspectErr  error
-	loadErr     error
-	verifyErr   error
-	cleanupErr  error
-	cleanupRuns int
-	onLoad      func()
-	finalOutput string
-	onFinal     func()
+	commands      []string
+	uploads       map[string]string
+	inspect       string
+	inspectStderr string
+	inspectErr    error
+	loadStderr    string
+	loadErr       error
+	verifyErr     error
+	cleanupErr    error
+	cleanupRuns   int
+	onLoad        func()
+	finalOutput   string
+	onFinal       func()
 }
 
 func (r *restoreFakeRemote) Run(_ context.Context, _ store.Server, command string) (adapter.CommandResult, error) {
 	r.commands = append(r.commands, command)
 	switch {
 	case strings.Contains(command, "__AIFAR_INFO__"):
-		return adapter.CommandResult{Stdout: r.inspect}, r.inspectErr
+		return adapter.CommandResult{Stdout: r.inspect, Stderr: r.inspectStderr}, r.inspectErr
 	case strings.Contains(command, "logical-restore.sh"):
 		if r.onLoad != nil {
 			r.onLoad()
 		}
-		return adapter.CommandResult{}, r.loadErr
+		return adapter.CommandResult{Stderr: r.loadStderr}, r.loadErr
 	case strings.Contains(command, "__AIFAR_VERIFY_FINAL__"):
 		if r.onFinal != nil {
 			r.onFinal()
@@ -263,8 +284,11 @@ func TestRestoreCleanupFailureRetainsMaintenanceBeforeFinalPublication(t *testin
 
 func finalRestoreVerificationLiteral() string {
 	return strings.Join([]string{
+		"marker\tok",
 		"__AIFAR_VERIFY_PING__\t1",
+		"marker\tschema_name\ttable_count",
 		"__AIFAR_VERIFY_SCHEMA__\taifar_business\t4",
+		"marker\ttable_schema\ttable_name",
 		"__AIFAR_VERIFY_TABLE__\taifar_business\talpha",
 		"__AIFAR_VERIFY_TABLE__\taifar_business\tbeta",
 		"__AIFAR_VERIFY_TABLE__\taifar_business\tdelta",
@@ -277,6 +301,11 @@ func TestFinalRestoreVerificationDoesNotIssueSampleRowCounts(t *testing.T) {
 	for _, forbidden := range []string{"__AIFAR_VERIFY_SAMPLE__", "COUNT(*) FROM `"} {
 		if strings.Contains(command, forbidden) {
 			t.Fatalf("final verification contains removed row-sampling query %q: %s", forbidden, command)
+		}
+	}
+	for _, alias := range []string{"AS marker", "AS ok", "AS schema_name", "AS table_count", "AS table_schema", "AS table_name"} {
+		if !strings.Contains(command, alias) {
+			t.Fatalf("final verification query missing stable tabbed header alias %q: %s", alias, command)
 		}
 	}
 }
@@ -734,6 +763,79 @@ func TestRestoreStandaloneDisasterSkipRequiresExplicitConnectionUnreachable(t *t
 	})
 }
 
+func TestRestoreStandaloneLogsSanitizedInspectionStderr(t *testing.T) {
+	data := &restoreFakeStore{backupFakeStore: newBackupFakeStore(t)}
+	repositoryDir, backup := createStandaloneRestoreBackup(t, data.instance)
+	data.backups = []store.AppBackup{backup}
+	remote := &restoreFakeRemote{
+		inspectStderr: "mysqlsh failed for password=top-secret",
+		inspectErr:    errors.New("process exited with status 1"),
+	}
+	recorder := &backupRecorder{}
+	service := NewService(data, remote)
+
+	err := service.restoreStandalone(context.Background(), standaloneRestoreRequest(data.instance, backup, repositoryDir), registry.RunContext{TaskID: "task_restore_inspection_stderr", Log: recorder})
+	if err == nil {
+		t.Fatal("expected inspection failure")
+	}
+	logs := strings.Join(recorder.messages, "\n")
+	if !strings.Contains(logs, "mysqlsh failed") || strings.Contains(logs, "top-secret") || !strings.Contains(logs, "[REDACTED]") {
+		t.Fatalf("sanitized restore inspection stderr = %q", logs)
+	}
+}
+
+func TestRestoreStandaloneLogsSanitizedLoadStderr(t *testing.T) {
+	data := &restoreFakeStore{backupFakeStore: newBackupFakeStore(t)}
+	repositoryDir, backup := createStandaloneRestoreBackup(t, data.instance)
+	data.backups = []store.AppBackup{backup}
+	remote := &restoreFakeRemote{
+		inspect:    standaloneInspection("aifar_business"),
+		loadStderr: "mysqlsh load failed for password=top-secret",
+		loadErr:    errors.New("process exited with status 1"),
+	}
+	recorder := &backupRecorder{}
+	service := NewService(data, remote)
+	service.preRestoreBackup = func(context.Context, registry.BackupRequest, registry.RunContext) error { return nil }
+	service.localInfileSession = func(context.Context, store.AppInstance, store.Server, store.Credential) (localInfileSession, func(), error) {
+		return &fakeLocalInfileSession{value: "OFF"}, func() {}, nil
+	}
+
+	err := service.restoreStandalone(context.Background(), standaloneRestoreRequest(data.instance, backup, repositoryDir), registry.RunContext{TaskID: "task_restore_load_stderr", Log: recorder})
+	if err == nil {
+		t.Fatal("expected load failure")
+	}
+	logs := strings.Join(recorder.messages, "\n")
+	if !strings.Contains(logs, "mysqlsh load failed") || strings.Contains(logs, "top-secret") || !strings.Contains(logs, "[REDACTED]") {
+		t.Fatalf("sanitized restore load stderr = %q", logs)
+	}
+}
+
+func TestRestoreStandaloneAllowsReadableTargetWithNoBusinessSchemas(t *testing.T) {
+	data := &restoreFakeStore{backupFakeStore: newBackupFakeStore(t)}
+	repositoryDir, backup := createStandaloneRestoreBackup(t, data.instance)
+	data.backups = []store.AppBackup{backup}
+	remote := &restoreFakeRemote{inspect: standaloneInspection()}
+	service := NewService(data, remote)
+	preRestoreCalls := 0
+	service.preRestoreBackup = func(context.Context, registry.BackupRequest, registry.RunContext) error {
+		preRestoreCalls++
+		return nil
+	}
+	service.localInfileSession = func(context.Context, store.AppInstance, store.Server, store.Credential) (localInfileSession, func(), error) {
+		return &fakeLocalInfileSession{value: "OFF"}, func() {}, nil
+	}
+
+	if err := service.restoreStandalone(context.Background(), standaloneRestoreRequest(data.instance, backup, repositoryDir), registry.RunContext{TaskID: "task_restore_empty_target", Log: fakeLogger{}}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(strings.Join(remote.commands, "\n"), "DROP DATABASE") {
+		t.Fatalf("empty target restore did not reach controlled schema replacement: %v", remote.commands)
+	}
+	if preRestoreCalls != 0 {
+		t.Fatalf("empty target restore created %d unnecessary protective backups", preRestoreCalls)
+	}
+}
+
 func TestRestoreStandaloneReadableTargetRequiresExactManifestSchemaSetBeforeEnable(t *testing.T) {
 	for _, schemas := range [][]string{{"aifar_business", "extra"}, {"other"}} {
 		t.Run(strings.Join(schemas, "+"), func(t *testing.T) {
@@ -750,6 +852,26 @@ func TestRestoreStandaloneReadableTargetRequiresExactManifestSchemaSetBeforeEnab
 			var stable interface{ StableCode() string }
 			if !errors.As(err, &stable) || stable.StableCode() != MySQLRestoreTargetNotClean || len(local.setCalls) != 0 || strings.Contains(strings.Join(remote.commands, "\n"), "DROP DATABASE") {
 				t.Fatalf("schema gate failed: schemas=%v calls=%v err=%v commands=%v", schemas, local.setCalls, err, remote.commands)
+			}
+		})
+	}
+}
+
+func TestResumeRestoreTargetAllowsOnlyManifestSchemaSubset(t *testing.T) {
+	expected := []string{"aifar_admin", "aifar_nacos", "test"}
+	for _, test := range []struct {
+		name    string
+		current []string
+		want    bool
+	}{
+		{name: "empty", current: nil, want: true},
+		{name: "partial", current: []string{"aifar_admin", "test"}, want: true},
+		{name: "complete", current: expected, want: true},
+		{name: "unexpected", current: []string{"aifar_admin", "foreign"}, want: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := schemaSubset(test.current, expected); got != test.want {
+				t.Fatalf("schemaSubset(%v, %v)=%v want %v", test.current, expected, got, test.want)
 			}
 		})
 	}

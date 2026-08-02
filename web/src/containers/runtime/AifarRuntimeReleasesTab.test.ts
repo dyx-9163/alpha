@@ -10,6 +10,7 @@ vi.mock('../../i18n', () => ({
 
 import AifarRuntimeReleasesTab from './AifarRuntimeReleasesTab.vue'
 import { aifarRuntimeContextKey, type AifarRuntimeContext } from './context'
+import { runtimeReleaseDeleteDisabledReason } from './releaseRules'
 import type { AifarRelease } from './types'
 
 const tableRowsKey = Symbol('release-table-rows')
@@ -35,6 +36,15 @@ describe('AifarRuntimeReleasesTab', () => {
 
     await rollbackButtons[0].trigger('click')
     expect(rollback).not.toHaveBeenCalled()
+  })
+
+  it('disables deletion for the current release and enables an eligible historical release', () => {
+    const wrapper = mountReleaseTab()
+
+    const deleteButtons = wrapper.findAll('button').filter((button) => button.text() === 'Delete')
+    expect(deleteButtons).toHaveLength(2)
+    expect(deleteButtons[0].attributes('disabled')).toBeDefined()
+    expect(deleteButtons[1].attributes('disabled')).toBeUndefined()
   })
 })
 
@@ -109,11 +119,15 @@ function runtimeContext(rollback: ReturnType<typeof vi.fn>): AifarRuntimeContext
       instanceId: 'instance-1',
       releaseId: 'release-current',
       currentServices: ['oauth'],
-      rollbackUnavailableReason: 'ALREADY_ACTIVE'
+      rollbackUnavailableReason: 'ALREADY_ACTIVE',
+      deleteAvailable: false,
+      deleteUnavailableReason: 'AIFAR_RELEASE_DELETE_CURRENT'
     },
     {
       instanceId: 'instance-1',
-      releaseId: 'release-previous'
+      releaseId: 'release-previous',
+      deleteAvailable: true,
+      deleteUnavailableReason: ''
     }
   ]
   const labels: Record<string, string> = {
@@ -144,7 +158,11 @@ function runtimeContext(rollback: ReturnType<typeof vi.fn>): AifarRuntimeContext
     releaseRollbackDisabledReason: (row: AifarRelease) => row.rollbackUnavailableReason === 'ALREADY_ACTIVE' ? 'already active' : '',
     rollbackAifarRelease: rollback,
     releaseDeletingId: ref(''),
-    releaseDeleteDisabledReason: () => '',
+    releaseDeleteDisabledReason: (row: AifarRelease) => runtimeReleaseDeleteDisabledReason(row, {
+      canManage: true,
+      deniedText: 'permission denied',
+      t: (key: string) => labels[key] ?? key
+    }),
     deleteAifarRelease: async () => {}
   } as unknown as AifarRuntimeContext
 }

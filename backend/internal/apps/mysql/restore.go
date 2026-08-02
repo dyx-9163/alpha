@@ -138,7 +138,16 @@ func (s Service) restoreStandalone(ctx context.Context, req registry.RestoreRequ
 }
 
 func (s Service) restoreLogical(ctx context.Context, req registry.RestoreRequest, run registry.RunContext, cluster *resolvedInnoDBCluster) (retErr error) {
-	if err := s.requireNoMySQLMaintenance(req.Instance, req.Language); err != nil {
+	resumeMaintenance := boolParameter(req.Parameters, "resumeMaintenance")
+	var resumedMaintenanceMarker store.MySQLMaintenanceMarker
+	var resumedMaintenanceInstanceIDs []string
+	if resumeMaintenance {
+		var err error
+		resumedMaintenanceMarker, resumedMaintenanceInstanceIDs, err = s.requireMySQLMaintenanceResume(req.Instance, req.Backup.ID, req.Language)
+		if err != nil {
+			return err
+		}
+	} else if err := s.requireNoMySQLMaintenance(req.Instance, req.Language); err != nil {
 		return err
 	}
 	progressTarget := req.Instance.ServerID
@@ -253,7 +262,7 @@ func (s Service) restoreLogical(ctx context.Context, req registry.RestoreRequest
 			return err
 		}
 		var err error
-		server, err = s.store.GetServer(instance.ServerID, false)
+		server, err = s.store.GetServer(instance.ServerID, true)
 		if err != nil {
 			return err
 		}
@@ -274,6 +283,7 @@ func (s Service) restoreLogical(ctx context.Context, req registry.RestoreRequest
 			return err
 		}
 		inspectionResult, inspectErr := s.remote.Run(ctx, server, inspectBackupCommand(probeWork, instancePort(instance)))
+		logMySQLCommandStderr(run.Log, inspectionResult, inspectErr, credential.Secret["password"])
 		readable = inspectErr == nil
 		if readable {
 			inspection, err = parseMySQLBackupInspection(inspectionResult.Stdout)
@@ -288,7 +298,11 @@ func (s Service) restoreLogical(ctx context.Context, req registry.RestoreRequest
 				return localizedMySQLOperationError(req.Language, MySQLRestoreTargetNotClean)
 			}
 		} else {
-			if !sameSchemaSet(strings.Join(inspection.Schemas, "\n"), manifest.Schemas) || !boolParameter(req.Parameters, "createPreRestoreBackup") {
+			if resumeMaintenance {
+				if !schemaSubset(inspection.Schemas, manifest.Schemas) {
+					return localizedMySQLOperationError(req.Language, MySQLRestoreTargetNotClean)
+				}
+			} else if (len(inspection.Schemas) > 0 && !sameSchemaSet(strings.Join(inspection.Schemas, "\n"), manifest.Schemas)) || !boolParameter(req.Parameters, "createPreRestoreBackup") {
 				return localizedMySQLOperationError(req.Language, MySQLRestoreTargetNotClean)
 			}
 			if err := ValidateRestoreCompatibility(manifest, backup.BackupType, instanceTopology(instance), inspection.MySQLVersion); err != nil {
@@ -305,7 +319,7 @@ func (s Service) restoreLogical(ctx context.Context, req registry.RestoreRequest
 		}
 	}()
 	if err := progress.step(7, func() error {
-		if readable {
+		if readable && len(inspection.Schemas) > 0 && !resumeMaintenance {
 			preRequest := registry.BackupRequest{
 				Instance: instance, Servers: []store.Server{server}, Language: req.Language, Actor: req.Actor,
 				RepositoryDir: req.RepositoryDir, KeepLast: 1,
@@ -452,9 +466,14 @@ func (s Service) restoreLogical(ctx context.Context, req registry.RestoreRequest
 			return err
 		}
 		var persistErr error
-		maintenanceMarker, maintenanceInstanceIDs, persistErr = s.setMySQLMaintenance(instance, backup.ID, run.TaskID, req.Language)
-		if persistErr != nil {
-			return persistErr
+		if resumeMaintenance {
+			maintenanceMarker = resumedMaintenanceMarker
+			maintenanceInstanceIDs = append([]string(nil), resumedMaintenanceInstanceIDs...)
+		} else {
+			maintenanceMarker, maintenanceInstanceIDs, persistErr = s.setMySQLMaintenance(instance, backup.ID, run.TaskID, req.Language)
+			if persistErr != nil {
+				return persistErr
+			}
 		}
 		_, err := s.remote.Run(ctx, server, dropSchemasCommand(probeWork, instancePort(instance), manifest.Schemas))
 		return err
@@ -475,7 +494,9 @@ func (s Service) restoreLogical(ctx context.Context, req registry.RestoreRequest
 		if err := s.remote.UploadFile(ctx, server, localScript, remoteScript, 0o700); err != nil {
 			return err
 		}
-		if _, err := s.remote.Run(ctx, server, "sh "+installerkit.ShellQuote(remoteScript)); err != nil {
+		result, err := s.remote.Run(ctx, server, "sh "+installerkit.ShellQuote(remoteScript))
+		logMySQLCommandStderr(run.Log, result, err, credential.Secret["password"])
+		if err != nil {
 			return err
 		}
 		var persistErr error
@@ -769,9 +790,9 @@ func verifyRestoreDataCommand(work string, port int, schemas []string) string {
 
 func finalRestoreVerificationCommand(work string, port int) string {
 	statements := []string{
-		"SELECT '__AIFAR_VERIFY_PING__',1 /*__AIFAR_VERIFY_FINAL__*/",
-		"SELECT '__AIFAR_VERIFY_SCHEMA__',s.schema_name,(SELECT COUNT(*) FROM information_schema.tables t WHERE t.table_schema=s.schema_name AND t.table_type='BASE TABLE') FROM information_schema.schemata s WHERE s.schema_name NOT IN ('information_schema','mysql','mysql_innodb_cluster_metadata','performance_schema','sys') ORDER BY s.schema_name",
-		"SELECT '__AIFAR_VERIFY_TABLE__',table_schema,table_name FROM information_schema.tables WHERE table_type='BASE TABLE' AND table_schema NOT IN ('information_schema','mysql','mysql_innodb_cluster_metadata','performance_schema','sys') ORDER BY table_schema,table_name",
+		"SELECT '__AIFAR_VERIFY_PING__' AS marker,1 AS ok /*__AIFAR_VERIFY_FINAL__*/",
+		"SELECT '__AIFAR_VERIFY_SCHEMA__' AS marker,s.schema_name AS schema_name,(SELECT COUNT(*) FROM information_schema.tables t WHERE t.table_schema=s.schema_name AND t.table_type='BASE TABLE') AS table_count FROM information_schema.schemata s WHERE s.schema_name NOT IN ('information_schema','mysql','mysql_innodb_cluster_metadata','performance_schema','sys') ORDER BY s.schema_name",
+		"SELECT '__AIFAR_VERIFY_TABLE__' AS marker,table_schema AS table_schema,table_name AS table_name FROM information_schema.tables WHERE table_type='BASE TABLE' AND table_schema NOT IN ('information_schema','mysql','mysql_innodb_cluster_metadata','performance_schema','sys') ORDER BY table_schema,table_name",
 	}
 	return localInfileSQLCommand(work, port, strings.Join(statements, "; "))
 }
@@ -781,6 +802,7 @@ func matchesFinalRestoreVerification(output string, expected *BackupVerification
 		return false
 	}
 	ping := 0
+	headerCounts := map[string]int{}
 	schemaCounts := map[string]int{}
 	tables := make([]string, 0, expected.TableCount)
 	for _, line := range strings.Split(output, "\n") {
@@ -789,6 +811,8 @@ func matchesFinalRestoreVerification(output string, expected *BackupVerification
 		}
 		fields := strings.Split(line, "\t")
 		switch {
+		case line == "marker\tok" || line == "marker\tschema_name\ttable_count" || line == "marker\ttable_schema\ttable_name":
+			headerCounts[line]++
 		case len(fields) == 2 && fields[0] == "__AIFAR_VERIFY_PING__" && fields[1] == "1":
 			ping++
 		case len(fields) == 3 && fields[0] == "__AIFAR_VERIFY_SCHEMA__" && strictSchemaName.MatchString(fields[1]):
@@ -806,7 +830,8 @@ func matchesFinalRestoreVerification(output string, expected *BackupVerification
 			return false
 		}
 	}
-	if ping != 1 || len(schemaCounts) != expected.SchemaCount || len(tables) != expected.TableCount {
+	if headerCounts["marker\tok"] != 1 || headerCounts["marker\tschema_name\ttable_count"] != 1 || headerCounts["marker\ttable_schema\ttable_name"] != 1 ||
+		ping != 1 || len(schemaCounts) != expected.SchemaCount || len(tables) != expected.TableCount {
 		return false
 	}
 	wantTables := make([]string, 0, expected.TableCount)
@@ -837,6 +862,19 @@ func sameSchemaSet(output string, expected []string) bool {
 	sort.Strings(got)
 	sort.Strings(want)
 	return strings.Join(got, "\x00") == strings.Join(want, "\x00")
+}
+
+func schemaSubset(current, expected []string) bool {
+	want := make(map[string]struct{}, len(expected))
+	for _, schema := range expected {
+		want[strings.TrimSpace(schema)] = struct{}{}
+	}
+	for _, schema := range current {
+		if _, ok := want[strings.TrimSpace(schema)]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 var _ registry.RestoreModule = Module{}

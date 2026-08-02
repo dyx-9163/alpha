@@ -337,7 +337,7 @@ func setupLogicalScriptLinux(t *testing.T, kind logicalScriptKind) logicalLinuxP
 
 func renderLogicalLinuxTestScript(kind logicalScriptKind) (string, error) {
 	if kind == logicalBackupKind {
-		return RenderLogicalBackupScript(LogicalBackupScriptOptions{TaskID: "task-001", Threads: 4, MaxRateMBps: 32})
+		return RenderLogicalBackupScript(LogicalBackupScriptOptions{TaskID: "task-001", Threads: 4, MaxRateMBps: 32, Schemas: []string{"aifar_business"}})
 	}
 	return RenderLogicalRestoreScript(LogicalRestoreScriptOptions{TaskID: "task-001", Threads: 4})
 }

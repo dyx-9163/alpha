@@ -517,6 +517,93 @@ func TestMySQLMaintenancePostLockServiceGateBlocksEveryOrdinaryLifecycleAction(t
 	})
 }
 
+// Production break caught: the worker-side maintenance reread treated a
+// failed-install placeholder group as a malformed live cluster and stopped
+// before remote cleanup could run.
+func TestDeleteAllowsFailedInstallClusterCleanupWithoutAuthoritativeTopology(t *testing.T) {
+	db := openMaintenanceTestStore(t)
+	server, err := db.SaveServer(store.Server{Name: "mysql-failed", Host: "10.0.1.1", Username: "root"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const installTaskID = "tsk_1234567890abcdef12345678"
+	instance, err := db.SaveAppInstance(store.AppInstance{
+		App: "mysql", Version: "8.0.36", ServerID: server.ID, Status: "failed", Topology: "innodb-cluster",
+		Metadata: `{"installFailed":true,"taskId":"` + installTaskID + `","clusterId":"mysql-failed-` + installTaskID + `","topology":"innodb-cluster","port":3306}`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	remote := &maintenancePingRemote{}
+	err = NewService(db, remote).Delete(context.Background(), DeleteRequest{Instance: instance, Server: server, Language: "en"}, fakeLogger{}, nil)
+	if err != nil {
+		t.Fatalf("failed install cleanup was blocked: %T %v", err, err)
+	}
+	if _, err := db.GetAppInstance(instance.ID); !store.IsNotFound(err) {
+		t.Fatalf("failed placeholder still exists after cleanup: %v", err)
+	}
+	if len(remote.commands) == 0 {
+		t.Fatal("failed install cleanup did not reach remote uninstaller")
+	}
+}
+
+func TestDeleteFailedInstallCleanupRereadsPersistedSafetyState(t *testing.T) {
+	db := openMaintenanceTestStore(t)
+	server, err := db.SaveServer(store.Server{Name: "mysql-failed", Host: "10.0.1.1", Username: "root"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stale, err := db.SaveAppInstance(store.AppInstance{
+		App: "mysql", Version: "8.0.36", ServerID: server.ID, Status: "failed", Topology: "innodb-cluster",
+		Metadata: `{"installFailed":true,"taskId":"tsk_1234567890abcdef12345678","clusterId":"mysql-failed-tsk_1234567890abcdef12345678","topology":"innodb-cluster","port":3306}`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fresh := stale
+	fresh.Metadata = `{"installFailed":true,"taskId":"tsk_1234567890abcdef12345678","clusterId":"mysql-failed-tsk_1234567890abcdef12345678","topology":"innodb-cluster","port":3306,"mysqlMaintenance":{}}`
+	if _, err := db.SaveAppInstance(fresh); err != nil {
+		t.Fatal(err)
+	}
+	remote := &maintenancePingRemote{}
+	err = NewService(db, remote).Delete(context.Background(), DeleteRequest{Instance: stale, Server: server, Language: "en"}, fakeLogger{}, nil)
+	if maintenanceErrorCode(err) != MySQLMaintenanceStateInvalid {
+		t.Fatalf("persisted safety state did not block stale cleanup request: %T %v", err, err)
+	}
+	if len(remote.commands) != 0 {
+		t.Fatalf("stale cleanup request reached remote after safety state appeared: %v", remote.commands)
+	}
+	if _, err := db.GetAppInstance(stale.ID); err != nil {
+		t.Fatalf("blocked cleanup removed the placeholder: %v", err)
+	}
+}
+
+func TestRestoreStandaloneCanResumeIncompleteMaintenanceWithSameBackup(t *testing.T) {
+	fixture := newProductionMaintenanceRestoreFixture(t)
+	marker := maintenanceTestMarker("standalone", "", "schema_mutation_started")
+	marker.BackupID = fixture.backup.ID
+	if err := fixture.db.SetMySQLMaintenance([]string{fixture.instance.ID}, marker); err != nil {
+		t.Fatal(err)
+	}
+	fixture.request.Parameters["resumeMaintenance"] = true
+	fixture.request.Parameters["createPreRestoreBackup"] = false
+	fixture.remote.inspect = standaloneInspection("aifar_business")
+
+	if err := fixture.run(); err != nil {
+		t.Fatal(err)
+	}
+	current, err := fixture.db.GetAppInstance(fixture.instance.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, present, parseErr := store.ParseMySQLMaintenanceMarker(current.Metadata); parseErr != nil || present {
+		t.Fatalf("successful maintenance resume left marker: present=%v err=%v metadata=%s", present, parseErr, current.Metadata)
+	}
+	if !strings.Contains(strings.Join(fixture.remote.commands, "\n"), "logical-restore.sh") {
+		t.Fatalf("maintenance resume did not reach logical load: %v", fixture.remote.commands)
+	}
+}
+
 func TestRestoreMaintenanceProductionStorePersistenceFailuresPreserveSafetyBoundary(t *testing.T) {
 	// Production break caught: a fake-store-only path can miss SQLite
 	// transaction failures and let schema mutation continue or report success

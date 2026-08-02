@@ -205,7 +205,7 @@ func TestOrdinaryClusterLifecycleRejectsReconciliationOnNonRequestedSecondaryBef
 				req = httptest.NewRequest(http.MethodPost, "/api/v2/apps/instances/"+instances[0].ID+"/check", nil)
 			case "backup":
 				api.apps = registry.New(newBackupHandlerModule())
-				req = httptest.NewRequest(http.MethodPost, "/api/v2/apps/instances/"+instances[0].ID+"/backup", strings.NewReader(`{}`))
+				req = httptest.NewRequest(http.MethodPost, "/api/v2/apps/instances/"+instances[0].ID+"/backup", strings.NewReader(`{"schemas":["orders"]}`))
 			case "restore":
 				api.apps = registry.New(newBackupHandlerModule())
 				req = httptest.NewRequest(http.MethodPost, "/api/v2/apps/instances/"+instances[0].ID+"/restore", strings.NewReader(`{"backupId":"backup_1234567890abcdef12345678","mode":"innodb-cluster","maintenanceConfirmed":true,"createPreRestoreBackup":true,"disasterConfirmed":false,"threads":4}`))
@@ -317,7 +317,7 @@ func TestOrdinaryMySQLLifecycleRejectsReconciliationBeforeTask(t *testing.T) {
 				req = httptest.NewRequest(http.MethodPost, "/api/v2/apps/instances/"+instance.ID+"/check", nil)
 			case "backup":
 				api.apps = registry.New(newBackupHandlerModule())
-				req = httptest.NewRequest(http.MethodPost, "/api/v2/apps/instances/"+instance.ID+"/backup", strings.NewReader(`{}`))
+				req = httptest.NewRequest(http.MethodPost, "/api/v2/apps/instances/"+instance.ID+"/backup", strings.NewReader(`{"schemas":["orders"]}`))
 			case "restore":
 				api.apps = registry.New(newBackupHandlerModule())
 				req = httptest.NewRequest(http.MethodPost, "/api/v2/apps/instances/"+instance.ID+"/restore", strings.NewReader(`{"backupId":"backup_1234567890abcdef12345678","mode":"standalone","maintenanceConfirmed":true,"createPreRestoreBackup":true,"disasterConfirmed":false,"threads":4}`))

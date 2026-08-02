@@ -3,6 +3,7 @@ package mysql
 import (
 	"bytes"
 	_ "embed"
+	"encoding/json"
 	"fmt"
 	"path"
 	"regexp"
@@ -36,10 +37,16 @@ type logicalScriptTemplateData struct {
 	TaskID      string
 	Threads     int
 	MaxRateMBps int
+	SchemasJSON string
 }
 
 func RenderLogicalBackupScript(options LogicalBackupScriptOptions) (string, error) {
 	if err := validateLogicalBackupOptions(options); err != nil {
+		return "", err
+	}
+	schemas, _ := normalizeBusinessSchemas(options.Schemas)
+	encoded, err := json.Marshal(schemas)
+	if err != nil {
 		return "", err
 	}
 	return renderLogicalScript("logical-backup.sh", "mysql-logical-backup", logicalBackupScriptTemplate, logicalScriptTemplateData{
@@ -48,6 +55,7 @@ func RenderLogicalBackupScript(options LogicalBackupScriptOptions) (string, erro
 		TaskID:      options.TaskID,
 		Threads:     options.Threads,
 		MaxRateMBps: options.MaxRateMBps,
+		SchemasJSON: string(encoded),
 	})
 }
 
@@ -71,6 +79,9 @@ func MySQLInspectSQL() string {
 
 func validateLogicalBackupOptions(options LogicalBackupScriptOptions) error {
 	if !validLogicalTaskID(options.TaskID) || !validLogicalThreads(options.Threads) || options.MaxRateMBps < 0 || options.MaxRateMBps > maxLogicalRateMBps {
+		return fmt.Errorf("invalid controlled logical backup script options")
+	}
+	if _, err := normalizeBusinessSchemas(options.Schemas); err != nil {
 		return fmt.Errorf("invalid controlled logical backup script options")
 	}
 	return nil

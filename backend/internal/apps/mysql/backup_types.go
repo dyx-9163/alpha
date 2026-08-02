@@ -15,6 +15,7 @@ const (
 	MySQLBackupVerifyFailed                 = "MYSQL_BACKUP_VERIFY_FAILED"
 	MySQLBackupVerificationRecordFailed     = "MYSQL_BACKUP_VERIFICATION_RECORD_FAILED"
 	MySQLBackupRetentionCleanupFailed       = "MYSQL_BACKUP_RETENTION_CLEANUP_FAILED"
+	MySQLBackupSchemaSelectionInvalid       = "MYSQL_BACKUP_SCHEMA_SELECTION_INVALID"
 	MySQLRestoreMaintenanceRequired         = "MYSQL_RESTORE_MAINTENANCE_REQUIRED"
 	MySQLRestoreVersionIncompatible         = "MYSQL_RESTORE_VERSION_INCOMPATIBLE"
 	MySQLRestoreManifestInvalid             = "MYSQL_RESTORE_MANIFEST_INVALID"
@@ -111,6 +112,7 @@ type LogicalBackupScriptOptions struct {
 	TaskID      string
 	Threads     int
 	MaxRateMBps int
+	Schemas     []string
 }
 
 // LogicalRestoreScriptOptions contains the only renderable restore inputs.

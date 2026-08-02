@@ -101,6 +101,122 @@ func TestBackupStandaloneCompletesOneDumpTransferCommitRetentionAndCleanup(t *te
 	}
 }
 
+func TestBackupStandaloneLogsMaskedInspectionStderr(t *testing.T) {
+	module, _, remote := newStandaloneBackupModule(t)
+	remote.inspectErr = errors.New("exit status 1")
+	remote.inspectStderr = "mysqlsh: unknown option --raw; password=top-secret; token=diagnostic-token"
+	recorder := &backupRecorder{}
+	err := module.Backup(context.Background(), standaloneBackupRequest(t), registry.RunContext{TaskID: "tsk_1234567890abcdef12345678", Log: recorder})
+	if err == nil {
+		t.Fatal("inspection failure was ignored")
+	}
+	joined := strings.Join(recorder.messages, "\n")
+	if !strings.Contains(joined, "mysqlsh: unknown option --raw") {
+		t.Fatalf("diagnostic stderr missing from task log: %q", joined)
+	}
+	for _, secret := range []string{"top-secret", "diagnostic-token"} {
+		if strings.Contains(joined, secret) {
+			t.Fatalf("secret %q leaked in task log: %q", secret, joined)
+		}
+	}
+}
+
+func TestBackupStandaloneLogsMaskedDryRunStderr(t *testing.T) {
+	module, _, remote := newStandaloneBackupModule(t)
+	remote.dryRunErr = errors.New("exit status 1")
+	remote.dryRunStderr = "mysqlsh: dry-run rejected; password=top-secret; token=diagnostic-token"
+	recorder := &backupRecorder{}
+	err := module.Backup(context.Background(), standaloneBackupRequest(t), registry.RunContext{TaskID: "tsk_1234567890abcdef12345678", Log: recorder})
+	if err == nil {
+		t.Fatal("dry-run failure was ignored")
+	}
+	joined := strings.Join(recorder.messages, "\n")
+	if !strings.Contains(joined, "mysqlsh: dry-run rejected") {
+		t.Fatalf("dry-run stderr missing from task log: %q", joined)
+	}
+	for _, secret := range []string{"top-secret", "diagnostic-token"} {
+		if strings.Contains(joined, secret) {
+			t.Fatalf("secret %q leaked in task log: %q", secret, joined)
+		}
+	}
+}
+
+func TestBackupStandaloneLogsMaskedDumpStderr(t *testing.T) {
+	module, _, remote := newStandaloneBackupModule(t)
+	remote.dumpErr = errors.New("exit status 1")
+	remote.dumpStderr = "mysqlsh: dump rejected; password=top-secret; token=diagnostic-token"
+	recorder := &backupRecorder{}
+	err := module.Backup(context.Background(), standaloneBackupRequest(t), registry.RunContext{TaskID: "tsk_1234567890abcdef12345678", Log: recorder})
+	if err == nil {
+		t.Fatal("dump failure was ignored")
+	}
+	joined := strings.Join(recorder.messages, "\n")
+	if !strings.Contains(joined, "mysqlsh: dump rejected") {
+		t.Fatalf("dump stderr missing from task log: %q", joined)
+	}
+	for _, secret := range []string{"top-secret", "diagnostic-token"} {
+		if strings.Contains(joined, secret) {
+			t.Fatalf("secret %q leaked in task log: %q", secret, joined)
+		}
+	}
+}
+
+func TestLogicalBackupDryRunHelperForwardsBoundedDiagnostics(t *testing.T) {
+	for _, required := range []string{
+		"stdout=subprocess.PIPE",
+		"stderr=subprocess.PIPE",
+		"stream[-8192:]",
+		"sys.stderr.buffer.write",
+		"owner_invalid = False if executable",
+		"stat.S_IMODE(details.st_mode) & 0o022",
+		`label="mysqlsh executable"`,
+		`invalid %s`,
+	} {
+		if !strings.Contains(logicalBackupDryRunHelper, required) {
+			t.Fatalf("dry-run helper does not forward bounded diagnostics: missing %q", required)
+		}
+	}
+}
+
+func TestLogicalBackupScriptAllowsInstallerOwnedMySQLShellWithoutWeakeningWorkFiles(t *testing.T) {
+	script, err := RenderLogicalBackupScript(LogicalBackupScriptOptions{TaskID: "task-001", Threads: 4, MaxRateMBps: 32, Schemas: []string{"aifar_business"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, required := range []string{
+		"def open_trusted_dir(path):",
+		"def open_trusted_file(parent_fd, name):",
+		"details.st_mode & 0o022",
+		`secret_fd = open_file(work_fd, "secret-context.cnf", 0o600)`,
+		`mysqlsh_fd = open_trusted_file(mysqlsh_dir_fd, os.path.basename(mysqlsh))`,
+	} {
+		if !strings.Contains(script, required) {
+			t.Fatalf("logical backup script missing ownership-compatible safety rule %q", required)
+		}
+	}
+}
+
+func TestBackupStandaloneLogsSafeVerificationReason(t *testing.T) {
+	module, _, remote := newStandaloneBackupModule(t)
+	remote.verificationOutput = strings.Replace(remote.verificationOutput, `"inventorySha256":"75033abd15ea32598b2c7f68d7059c0f5f79992ec65529c4a057c57d27be33fc"`, `"inventorySha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"`, 1)
+	recorder := &backupRecorder{}
+	err := module.Backup(context.Background(), standaloneBackupRequest(t), registry.RunContext{TaskID: "tsk_1234567890abcdef12345678", Log: recorder})
+	if err == nil {
+		t.Fatal("invalid verification was accepted")
+	}
+	joined := strings.Join(recorder.messages, "\n")
+	if !strings.Contains(joined, "backup verification rejected: inventory digest mismatch") {
+		t.Fatalf("safe verification reason missing from task log: %q", joined)
+	}
+}
+
+func TestBackupManifestDiagnosticIdentifiesInvalidSourceIdentity(t *testing.T) {
+	manifest := BackupManifest{App: "mysql", Topology: "standalone", Consistent: true, CreatedAt: time.Now().UTC(), BackupID: "backup_1234567890abcdef12345678", InstanceID: "app_1234567890abcdef12345678", SourceServerID: "srv_1234567890abcdef12345678", TaskID: "tsk_1234567890abcdef12345678", SourceServerUUID: "invalid", MySQLVersion: "8.0.36", MySQLShellVersion: "8.0.36"}
+	if got := backupManifestDiagnostic(manifest); got != "source identity or version is invalid" {
+		t.Fatalf("diagnostic = %q", got)
+	}
+}
+
 func TestBackupStandaloneRetentionCountsTheNewCommittedBackup(t *testing.T) {
 	// Production break caught: treating the current committed archive as still running makes keepLast=1 retain an older success too.
 	module, data, _ := newStandaloneBackupModule(t)
@@ -551,7 +667,7 @@ func TestBackupStandaloneRetainsFailedRecordWithoutFinalArchive(t *testing.T) {
 		{"inactive credential", func(s *backupFakeStore, _ *backupFakeRemote) { s.credentialErr = store.ErrBoundCredentialNotFound }, MySQLCredentialUnavailable},
 		{"ambiguous credential", func(s *backupFakeStore, _ *backupFakeRemote) { s.credentialErr = store.ErrBoundCredentialAmbiguous }, MySQLCredentialUnavailable},
 		{"mysqlsh failure", func(_ *backupFakeStore, r *backupFakeRemote) { r.inspectErr = errors.New("mysqlsh failed") }, ""},
-		{"system schema discovery", func(_ *backupFakeStore, r *backupFakeRemote) { r.inspectOutput += "__AIFAR_SCHEMA__\tmysql\n" }, MySQLRestoreManifestInvalid},
+		{"duplicate schema discovery", func(_ *backupFakeStore, r *backupFakeRemote) { r.inspectOutput += "__AIFAR_SCHEMA__\taifar_business\n" }, MySQLBackupSchemaSelectionInvalid},
 		{"insufficient source space", func(_ *backupFakeStore, r *backupFakeRemote) { r.sourceAvailable = 1 }, MySQLBackupSpaceInsufficient},
 		{"transfer cancellation", func(_ *backupFakeStore, r *backupFakeRemote) { r.downloadErr = context.Canceled }, MySQLBackupTransferFailed},
 		{"checksum mismatch", func(_ *backupFakeStore, r *backupFakeRemote) { r.downloadSHA = strings.Repeat("0", 64) }, MySQLBackupChecksumMismatch},
@@ -905,6 +1021,7 @@ type backupFakeStore struct {
 	saveCalls               int
 	failRepeatedSuccessSave bool
 	markDeleteErr           error
+	serverSecretRequests    []bool
 }
 
 func newBackupFakeStore(t *testing.T) *backupFakeStore {
@@ -917,6 +1034,7 @@ func newBackupFakeStore(t *testing.T) *backupFakeStore {
 }
 
 func (s *backupFakeStore) GetServer(id string, includeSecret bool) (store.Server, error) {
+	s.serverSecretRequests = append(s.serverSecretRequests, includeSecret)
 	if s.servers != nil {
 		server, ok := s.servers[id]
 		if !ok {
@@ -1036,6 +1154,11 @@ type backupFakeRemote struct {
 	verificationOutput string
 	sourceAvailable    int64
 	inspectErr         error
+	inspectStderr      string
+	dryRunErr          error
+	dryRunStderr       string
+	dumpErr            error
+	dumpStderr         string
 	downloadErr        error
 	cleanupErr         error
 	commands           []string
@@ -1074,15 +1197,15 @@ func (r *backupFakeRemote) Run(ctx context.Context, server store.Server, command
 	case strings.Contains(command, "__AIFAR_VERIFICATION__"):
 		return adapter.CommandResult{Stdout: r.verificationOutput}, nil
 	case strings.Contains(command, "__AIFAR_INFO__"):
-		return adapter.CommandResult{Stdout: r.inspectOutput}, r.inspectErr
+		return adapter.CommandResult{Stdout: r.inspectOutput, Stderr: r.inspectStderr}, r.inspectErr
 	case strings.Contains(command, "df -Pk"):
 		return adapter.CommandResult{Stdout: fmt.Sprintf("%d\n", r.sourceAvailable)}, nil
 	case strings.Contains(command, "dryRun: true"):
 		r.dryRunRuns++
-		return adapter.CommandResult{}, nil
+		return adapter.CommandResult{Stderr: r.dryRunStderr}, r.dryRunErr
 	case strings.Contains(command, "logical-backup.sh"):
 		r.dumpRuns++
-		return adapter.CommandResult{}, nil
+		return adapter.CommandResult{Stderr: r.dumpStderr}, r.dumpErr
 	case strings.Contains(command, "sha256sum"):
 		r.packageRuns++
 		return adapter.CommandResult{Stdout: fmt.Sprintf("__AIFAR_ARCHIVE__\t%d\t%s\n", len(r.archive), r.archiveSHA)}, nil

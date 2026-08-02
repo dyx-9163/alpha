@@ -191,10 +191,14 @@ export type AifarRelease = {
   rollbackServices?: string[]
   rollbackUnavailableReason?: RollbackUnavailableReason
   rollbackAvailable?: boolean
+  deleteAvailable?: boolean
+  deleteUnavailableReason?: DeleteUnavailableReason
+  deleteUnavailableDetails?: Record<string, any>
   manifest?: Record<string, any>
 }
 
 export type RollbackUnavailableReason = '' | 'ROLLBACK_RECORD' | 'ALREADY_ACTIVE' | 'ARTIFACT_UNAVAILABLE'
+export type DeleteUnavailableReason = '' | 'AIFAR_RELEASE_DELETE_CURRENT' | 'AIFAR_RELEASE_DELETE_ACTIVE'
 
 export type AifarReleaseListResponse = {
   items?: AifarRelease[]

@@ -65,7 +65,16 @@ func (a *API) listAIFARReleases(w http.ResponseWriter, r *http.Request) {
 				Manifest: manifest,
 			})
 		}
-		items = append(items, aifarReleaseResponseItem(release, manifest, inspection))
+		item := aifarReleaseResponseItem(release, manifest, inspection)
+		deleteBlock := aifarReleaseDeleteBlockReason(instance, release)
+		item["deleteAvailable"] = deleteBlock == nil
+		item["deleteUnavailableReason"] = ""
+		item["deleteUnavailableDetails"] = map[string]any{}
+		if deleteBlock != nil {
+			item["deleteUnavailableReason"] = deleteBlock.Code
+			item["deleteUnavailableDetails"] = deleteBlock.Details
+		}
+		items = append(items, item)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"items": items})
 }
@@ -134,7 +143,7 @@ func (a *API) deleteAIFARRelease(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "AIFAR_RELEASE_NOT_FOUND", i18n.Text(lang, "api.aifarReleaseNotFound"), map[string]any{"instanceId": instanceID, "releaseId": releaseID})
 		return
 	}
-	if block := aifarReleaseDeleteBlockReason(instance, *target, releases); block != nil {
+	if block := aifarReleaseDeleteBlockReason(instance, *target); block != nil {
 		writeError(w, http.StatusConflict, block.Code, i18n.Text(lang, block.MessageKey), block.Details)
 		return
 	}
@@ -150,7 +159,7 @@ func (a *API) deleteAIFARRelease(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"releaseId": releaseID})
 }
 
-func aifarReleaseDeleteBlockReason(instance store.AppInstance, target store.AppRelease, releases []store.AppRelease) *aifarReleaseDeleteBlock {
+func aifarReleaseDeleteBlockReason(instance store.AppInstance, target store.AppRelease) *aifarReleaseDeleteBlock {
 	metadata := map[string]any{}
 	if strings.TrimSpace(instance.Metadata) != "" {
 		_ = json.Unmarshal([]byte(instance.Metadata), &metadata)
@@ -163,29 +172,21 @@ func aifarReleaseDeleteBlockReason(instance store.AppInstance, target store.AppR
 			Details:    map[string]any{"releaseId": target.ReleaseID},
 		}
 	}
+	for service, revision := range mapFromAny(metadata["serviceRevisions"]) {
+		if stringFromAny(revision, "") != target.ReleaseID {
+			continue
+		}
+		return &aifarReleaseDeleteBlock{
+			Code:       "AIFAR_RELEASE_DELETE_CURRENT",
+			MessageKey: "api.aifarReleaseDeleteCurrent",
+			Details:    map[string]any{"releaseId": target.ReleaseID, "service": service},
+		}
+	}
 	if target.Status == "pending" || target.Status == "running" {
 		return &aifarReleaseDeleteBlock{
 			Code:       "AIFAR_RELEASE_DELETE_ACTIVE",
 			MessageKey: "api.aifarReleaseDeleteActive",
 			Details:    map[string]any{"releaseId": target.ReleaseID, "status": target.Status},
-		}
-	}
-	for _, release := range releases {
-		if release.ReleaseID == target.ReleaseID {
-			continue
-		}
-		manifest := map[string]any{}
-		if strings.TrimSpace(release.ManifestJSON) == "" || json.Unmarshal([]byte(release.ManifestJSON), &manifest) != nil {
-			continue
-		}
-		for _, field := range []string{"baseReleaseId", "rollbackTo"} {
-			if stringFromAny(manifest[field], "") == target.ReleaseID {
-				return &aifarReleaseDeleteBlock{
-					Code:       "AIFAR_RELEASE_DELETE_REFERENCED",
-					MessageKey: "api.aifarReleaseDeleteReferenced",
-					Details:    map[string]any{"releaseId": target.ReleaseID, "referencedBy": release.ReleaseID, "field": field},
-				}
-			}
 		}
 	}
 	return nil

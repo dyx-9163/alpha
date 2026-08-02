@@ -65,6 +65,31 @@ func (s Service) requireNoMySQLMaintenance(expected store.AppInstance, language 
 	return localizedMySQLOperationError(language, MySQLMaintenanceRequired)
 }
 
+func (s Service) requireMySQLMaintenanceResume(expected store.AppInstance, backupID, language string) (store.MySQLMaintenanceMarker, []string, error) {
+	data, ok := s.store.(maintenanceStore)
+	if !ok {
+		return store.MySQLMaintenanceMarker{}, nil, localizedMySQLOperationError(language, MySQLMaintenanceStateInvalid)
+	}
+	instance, err := data.GetAppInstance(expected.ID)
+	if err != nil || instance.App != "mysql" || instanceTopology(instance) != "standalone" || instance.ServerID != expected.ServerID {
+		return store.MySQLMaintenanceMarker{}, nil, localizedMySQLOperationError(language, MySQLMaintenanceStateInvalid)
+	}
+	instances, err := maintenanceInstances(data, instance)
+	if err != nil || len(instances) != 1 {
+		return store.MySQLMaintenanceMarker{}, nil, localizedMySQLOperationError(language, MySQLMaintenanceStateInvalid)
+	}
+	_, _, reconciliationPresent, reconciliationErr := parseMySQLReconciliationMarker(instance.Metadata)
+	if reconciliationErr != nil || reconciliationPresent {
+		return store.MySQLMaintenanceMarker{}, nil, localizedMySQLOperationError(language, MySQLReconciliationRequired)
+	}
+	marker, present, parseErr := store.ParseMySQLMaintenanceMarker(instance.Metadata)
+	validPhase := marker.RestorePhase == "schema_mutation_started" || marker.RestorePhase == "load_complete"
+	if parseErr != nil || !present || marker.Scope != "standalone" || marker.ClusterID != "" || marker.BackupID != backupID || !validPhase {
+		return store.MySQLMaintenanceMarker{}, nil, localizedMySQLOperationError(language, MySQLMaintenanceStateInvalid)
+	}
+	return marker, []string{instance.ID}, nil
+}
+
 func maintenanceInstances(data maintenanceReader, representative store.AppInstance) ([]store.AppInstance, error) {
 	topology := instanceTopology(representative)
 	if topology == "standalone" {

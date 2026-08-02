@@ -19,6 +19,8 @@ type fakeStore struct {
 	servers     map[string]store.Server
 	instances   []store.AppInstance
 	credentials map[string]store.Credential
+	cluster     store.AppCluster
+	members     []store.AppClusterMember
 }
 
 func (f *fakeStore) GetBoundCredential(appInstanceID, purpose string, includeSecret bool) (store.Credential, error) {
@@ -75,6 +77,20 @@ func (f *fakeStore) DeleteAppInstance(id string) error {
 	}
 	f.instances = next
 	return nil
+}
+
+func (f *fakeStore) SaveAppClusterDeployment(cluster store.AppCluster, instances []store.AppInstance, members []store.AppClusterMember) ([]store.AppInstance, error) {
+	f.cluster = cluster
+	f.members = append([]store.AppClusterMember(nil), members...)
+	saved := make([]store.AppInstance, 0, len(instances))
+	for _, instance := range instances {
+		item, err := f.SaveAppInstance(instance)
+		if err != nil {
+			return nil, err
+		}
+		saved = append(saved, item)
+	}
+	return saved, nil
 }
 
 type fakeRemote struct {
@@ -242,6 +258,14 @@ func TestServiceInstallsInnoDBClusterAndRecordsEachNode(t *testing.T) {
 	}
 	if len(s.instances) != 3 {
 		t.Fatalf("expected three mysql cluster instances, got %d", len(s.instances))
+	}
+	if !strings.HasPrefix(s.cluster.ID, "cluster_") || s.cluster.Name != "aifarCluster" || len(s.members) != 3 {
+		t.Fatalf("expected authoritative cluster topology, cluster=%+v members=%+v", s.cluster, s.members)
+	}
+	for _, instance := range s.instances {
+		if !strings.Contains(instance.Metadata, `"clusterId":"`+s.cluster.ID+`"`) {
+			t.Fatalf("instance %s does not reference authoritative cluster %s: %s", instance.ID, s.cluster.ID, instance.Metadata)
+		}
 	}
 	if s.instances[0].Topology != "innodb-cluster" || strings.Contains(s.instances[0].Metadata, "Oversea.123") {
 		t.Fatalf("expected safe cluster metadata: %+v", s.instances[0])

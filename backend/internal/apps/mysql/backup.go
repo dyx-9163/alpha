@@ -3,6 +3,7 @@ package mysql
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -68,6 +69,8 @@ type mysqlBackupInspection struct {
 	ServerUUID        string
 	GTIDExecuted      string
 	Schemas           []string
+	ExcludedSchemas   []string
+	AvailableSchemas  []mysqlBackupSchema
 	EstimatedBytes    int64
 }
 
@@ -89,6 +92,13 @@ type standaloneBackupState struct {
 }
 
 var panelBackupAvailableBytes = panelFilesystemAvailableBytes
+
+func logMySQLCommandStderr(log Logger, result adapter.CommandResult, commandErr error, secrets ...string) {
+	if log == nil || commandErr == nil || strings.TrimSpace(result.Stderr) == "" {
+		return
+	}
+	mysqlSanitizedLogger{base: log, secrets: secrets}.Error("%s", strings.TrimSpace(result.Stderr))
+}
 
 type mysqlSecretContextFile interface {
 	io.Writer
@@ -514,9 +524,22 @@ func (s Service) backupStandaloneCore(ctx context.Context, req registry.BackupRe
 		}
 		result, err := s.remote.Run(ctx, state.server, inspectBackupCommand(state.remoteWork, instancePort(req.Instance)))
 		if err != nil {
+			logMySQLCommandStderr(state.log, result, err, credential.Secret["password"])
 			return err
 		}
 		inspection, err = parseMySQLBackupInspection(result.Stdout)
+		if err != nil {
+			return err
+		}
+		requested, explicitlySelected := selectedSchemaParameter(req.Parameters)
+		if !explicitlySelected {
+			requested = append([]string(nil), inspection.Schemas...)
+		}
+		totalEstimatedBytes := inspection.EstimatedBytes
+		inspection.Schemas, inspection.ExcludedSchemas, inspection.EstimatedBytes, err = selectBackupSchemas(inspection.AvailableSchemas, requested)
+		if err == nil && inspection.EstimatedBytes == 0 && totalEstimatedBytes > 0 {
+			inspection.EstimatedBytes = totalEstimatedBytes
+		}
 		return err
 	}); err != nil {
 		return err
@@ -560,11 +583,12 @@ func (s Service) backupStandaloneCore(ctx context.Context, req registry.BackupRe
 	}
 	if err := step(7, func() error {
 		var err error
-		script, err = RenderLogicalBackupScript(LogicalBackupScriptOptions{TaskID: run.TaskID, Threads: parameters.Threads, MaxRateMBps: parameters.MaxRateMBps})
+		script, err = RenderLogicalBackupScript(LogicalBackupScriptOptions{TaskID: run.TaskID, Threads: parameters.Threads, MaxRateMBps: parameters.MaxRateMBps, Schemas: inspection.Schemas})
 		if err != nil {
 			return err
 		}
-		_, err = s.remote.Run(ctx, state.server, dryRunBackupCommand(state.remoteWork, parameters.Threads, parameters.MaxRateMBps))
+		result, err := s.remote.Run(ctx, state.server, dryRunBackupCommand(state.remoteWork, parameters.Threads, parameters.MaxRateMBps, inspection.Schemas))
+		logMySQLCommandStderr(state.log, result, err, credential.Secret["password"])
 		return err
 	}); err != nil {
 		return err
@@ -579,7 +603,8 @@ func (s Service) backupStandaloneCore(ctx context.Context, req registry.BackupRe
 		if err := s.remote.UploadFile(ctx, state.server, local, remoteScript, 0o700); err != nil {
 			return err
 		}
-		_, err = s.remote.Run(ctx, state.server, "sh "+installerkit.ShellQuote(remoteScript))
+		result, err := s.remote.Run(ctx, state.server, "sh "+installerkit.ShellQuote(remoteScript))
+		logMySQLCommandStderr(state.log, result, err, credential.Secret["password"])
 		return err
 	}); err != nil {
 		return err
@@ -591,6 +616,9 @@ func (s Service) backupStandaloneCore(ctx context.Context, req registry.BackupRe
 		}
 		verification, err = parseDumpVerification(result.Stdout, inspection.Schemas)
 		if err != nil {
+			if state.log != nil {
+				state.log.Error("backup verification rejected: %s", dumpVerificationDiagnostic(result.Stdout, inspection.Schemas))
+			}
 			return err
 		}
 		manifest := BackupManifest{
@@ -598,11 +626,14 @@ func (s Service) backupStandaloneCore(ctx context.Context, req registry.BackupRe
 			BackupID:        backupID, App: "mysql", Topology: topology, InstanceID: req.Instance.ID, ClusterID: execution.clusterID,
 			SourceServerID: state.server.ID, SourceEndpoint: net.JoinHostPort(state.server.Host, strconv.Itoa(instancePort(req.Instance))),
 			SourceServerUUID: inspection.ServerUUID, MySQLVersion: inspection.MySQLVersion, MySQLShellVersion: inspection.MySQLShellVersion,
-			Schemas: inspection.Schemas, ExcludedSchemas: append([]string(nil), fixedSystemSchemas...), Consistent: true,
+			Schemas: inspection.Schemas, ExcludedSchemas: append([]string(nil), inspection.ExcludedSchemas...), Consistent: true,
 			GTIDExecuted: inspection.GTIDExecuted, CreatedAt: state.record.CreatedAt, TaskID: run.TaskID,
 			Verification: verification, Members: execution.members, Routers: execution.routers,
 		}
 		state.manifest, err = CanonicalBackupManifestJSON(manifest)
+		if err != nil && state.log != nil {
+			state.log.Error("backup manifest rejected: %s", backupManifestDiagnostic(manifest))
+		}
 		return err
 	}); err != nil {
 		return err
@@ -806,6 +837,111 @@ func parseDumpVerification(output string, schemas []string) (*BackupVerification
 		return nil, err
 	}
 	return normalized, nil
+}
+
+func dumpVerificationDiagnostic(output string, expectedSchemas []string) string {
+	const prefix = "__AIFAR_VERIFICATION__"
+	var encoded string
+	for _, line := range strings.Split(output, "\n") {
+		if !strings.HasPrefix(line, prefix) {
+			continue
+		}
+		if encoded != "" {
+			return "multiple verification records"
+		}
+		encoded = strings.TrimPrefix(line, prefix)
+	}
+	if encoded == "" {
+		return "verification record missing"
+	}
+	var value BackupVerification
+	if err := json.Unmarshal([]byte(encoded), &value); err != nil {
+		return "verification record is not valid JSON"
+	}
+	if value.Source != "mysql-shell-dump" || value.InventoryAlgorithm != "sha256-nul-records-v1" || !lowerSHA256Pattern.MatchString(value.InventorySHA256) {
+		return "verification header is invalid"
+	}
+	if len(value.Inventory) == 0 {
+		return "inventory is empty"
+	}
+	hasher := sha256.New()
+	previousPath := ""
+	for index, entry := range value.Inventory {
+		if !validInventoryPath(entry.Path) || entry.Size < 0 || !lowerSHA256Pattern.MatchString(entry.SHA256) || (index > 0 && strings.Compare(previousPath, entry.Path) >= 0) {
+			return "inventory entry is invalid or out of order"
+		}
+		writeInventoryRecord(hasher, entry)
+		previousPath = entry.Path
+	}
+	if fmt.Sprintf("%x", hasher.Sum(nil)) != value.InventorySHA256 {
+		return "inventory digest mismatch"
+	}
+	if value.SchemaCount != len(value.Schemas) || len(value.Schemas) != len(expectedSchemas) {
+		return "schema count mismatch"
+	}
+	totalTables := 0
+	for index, schema := range value.Schemas {
+		if schema.Name != expectedSchemas[index] || !strictSchemaName.MatchString(schema.Name) || schema.TableCount < 0 || schema.TableCount != len(schema.Tables) {
+			return "schema inventory mismatch"
+		}
+		totalTables += schema.TableCount
+		previousTable := ""
+		for tableIndex, table := range schema.Tables {
+			if !strictSchemaName.MatchString(table.Name) || (tableIndex > 0 && strings.Compare(previousTable, table.Name) >= 0) {
+				return "table inventory is invalid or out of order"
+			}
+			previousTable = table.Name
+		}
+	}
+	if totalTables != value.TableCount {
+		return "table count mismatch"
+	}
+	return "verification record failed strict decoding"
+}
+
+func backupManifestDiagnostic(manifest BackupManifest) string {
+	if manifest.App != "mysql" || (manifest.Topology != "standalone" && manifest.Topology != "innodb-cluster") {
+		return "application or topology is invalid"
+	}
+	if !manifest.Consistent || manifest.CreatedAt.IsZero() || !validManifestStoreID(manifest.BackupID, "backup_") || !validManifestStoreID(manifest.InstanceID, "app_") || !validManifestStoreID(manifest.SourceServerID, "srv_") || !validManifestStoreID(manifest.TaskID, "tsk_") || !uuidPattern.MatchString(manifest.SourceServerUUID) || !canonicalRequired(manifest.MySQLVersion, manifest.MySQLShellVersion) {
+		return "source identity or version is invalid"
+	}
+	if containsSecretShape(manifest) {
+		return "manifest contains a prohibited secret-shaped value"
+	}
+	if _, ok := canonicalEndpoint(manifest.SourceEndpoint); !ok {
+		return "source endpoint is invalid"
+	}
+	schemas, err := normalizeBusinessSchemas(manifest.Schemas)
+	if err != nil {
+		return "selected schema set is invalid"
+	}
+	if _, err := normalizeExcludedSchemas(manifest.ExcludedSchemas, schemas); err != nil {
+		return "excluded schema set is invalid"
+	}
+	if manifest.Topology == "standalone" {
+		if manifest.ClusterID != "" || len(manifest.Members) != 0 {
+			return "standalone topology metadata is invalid"
+		}
+	} else {
+		if !validManifestStoreID(manifest.ClusterID, "mysql_cluster_", "cluster_") {
+			return "cluster identity is invalid"
+		}
+		if _, err := normalizeClusterMembers(manifest.Members, manifest.SourceServerID, manifest.SourceEndpoint); err != nil {
+			return "cluster member metadata is invalid"
+		}
+	}
+	if _, err := normalizeRouters(manifest.Routers); err != nil {
+		return "router metadata is invalid"
+	}
+	if manifest.ManifestVersion != 2 || manifest.Verification == nil {
+		return "verification contract is missing"
+	}
+	encoded, err := json.Marshal(manifest.Verification)
+	if err != nil {
+		return "verification record cannot be encoded"
+	}
+	return dumpVerificationDiagnostic("__AIFAR_VERIFICATION__"+string(encoded), schemas)
 }
 
 const dumpVerificationHelper = `
@@ -1163,8 +1299,8 @@ func bootstrapBackupWorkCommand(work string) string {
 func inspectBackupCommand(work string, port int) string {
 	mysqlsh := path.Join(mysqlInstallRoot, "mysql-shell", "bin", "mysqlsh")
 	secretPath := path.Join(work, "secret-context.cnf")
-	query := "SELECT '__AIFAR_INFO__',@@version,@@server_uuid,@@GLOBAL.gtid_executed,COALESCE((SELECT SUM(data_length+index_length) FROM information_schema.tables WHERE table_schema NOT IN ('information_schema','mysql','mysql_innodb_cluster_metadata','performance_schema','sys')),0); SELECT '__AIFAR_SCHEMA__',schema_name FROM information_schema.schemata WHERE schema_name NOT IN ('information_schema','mysql','mysql_innodb_cluster_metadata','performance_schema','sys') ORDER BY schema_name;"
-	return mysqlRemoteCredentialValidationCommand(secretPath) + "; test -x " + installerkit.ShellQuote(mysqlsh) + "; printf '__AIFAR_SHELL__\\t'; " + installerkit.ShellQuote(mysqlsh) + " --version | awk '{print $NF}'; " + installerkit.ShellQuote(mysqlsh) + " --defaults-file=" + installerkit.ShellQuote(secretPath) + " --sql --raw --skip-column-names --host=127.0.0.1 --port=" + strconv.Itoa(port) + " --execute " + installerkit.ShellQuote(query)
+	query := "SELECT '__AIFAR_INFO__' AS marker,@@version,@@server_uuid,@@GLOBAL.gtid_executed,COALESCE((SELECT SUM(data_length+index_length) FROM information_schema.tables),0); SELECT '__AIFAR_SCHEMA__' AS marker,s.schema_name,COALESCE(SUM(t.data_length+t.index_length),0) FROM information_schema.schemata s LEFT JOIN information_schema.tables t ON t.table_schema=s.schema_name GROUP BY s.schema_name ORDER BY s.schema_name;"
+	return mysqlRemoteCredentialValidationCommand(secretPath) + "; test -x " + installerkit.ShellQuote(mysqlsh) + "; printf '__AIFAR_SHELL__\\t'; " + installerkit.ShellQuote(mysqlsh) + " --version | awk '{for (i=1;i<=NF;i++) if ($i==\"Ver\") {print $(i+1); exit}}'; " + installerkit.ShellQuote(mysqlsh) + " --defaults-file=" + installerkit.ShellQuote(secretPath) + " --sql --result-format=tabbed --host=127.0.0.1 --port=" + strconv.Itoa(port) + " --execute " + installerkit.ShellQuote(query)
 }
 
 func parseMySQLBackupInspection(output string) (mysqlBackupInspection, error) {
@@ -1181,18 +1317,29 @@ func parseMySQLBackupInspection(output string) (mysqlBackupInspection, error) {
 		case len(parts) >= 5 && parts[0] == "__AIFAR_INFO__":
 			result.MySQLVersion, result.ServerUUID, result.GTIDExecuted = parts[1], parts[2], parts[3]
 			result.EstimatedBytes, _ = strconv.ParseInt(parts[4], 10, 64)
-		case len(parts) == 2 && parts[0] == "__AIFAR_SCHEMA__":
-			result.Schemas = append(result.Schemas, parts[1])
+		case len(parts) >= 2 && parts[0] == "__AIFAR_SCHEMA__":
+			schema := mysqlBackupSchema{Name: parts[1]}
+			if len(parts) >= 3 {
+				schema.EstimatedBytes, _ = strconv.ParseInt(parts[2], 10, 64)
+			}
+			result.AvailableSchemas = append(result.AvailableSchemas, schema)
+			if backupSchemaCategory(schema.Name) == registry.BackupSchemaBusiness {
+				result.Schemas = append(result.Schemas, schema.Name)
+			}
 		}
 	}
 	if scanner.Err() != nil {
 		return result, scanner.Err()
 	}
-	manifest := BackupManifest{App: "mysql", Topology: "standalone", Schemas: result.Schemas, ExcludedSchemas: append([]string(nil), fixedSystemSchemas...)}
-	if _, err := normalizeBusinessSchemas(manifest.Schemas); err != nil {
+	if len(result.AvailableSchemas) == 0 {
+		for _, name := range result.Schemas {
+			result.AvailableSchemas = append(result.AvailableSchemas, mysqlBackupSchema{Name: name})
+		}
+	}
+	if _, err := classifyBackupSchemas(result.AvailableSchemas); err != nil {
 		return result, err
 	}
-	if !canonicalRequired(result.MySQLVersion, result.MySQLShellVersion, result.ServerUUID) || result.EstimatedBytes <= 0 {
+	if !canonicalRequired(result.MySQLVersion, result.MySQLShellVersion, result.ServerUUID) || result.EstimatedBytes < 0 {
 		return result, mysqlOperationError(MySQLRestoreManifestInvalid)
 	}
 	return result, nil
@@ -1207,35 +1354,45 @@ import stat
 import subprocess
 import sys
 
-work, mysqlsh, threads, max_rate = sys.argv[1:]
-def checked(path, directory, mode=None):
+work, mysqlsh, threads, max_rate, schemas_json = sys.argv[1:]
+def checked(path, directory, mode=None, executable=False, label="path"):
     flags = os.O_RDONLY | os.O_NOFOLLOW
     if directory:
         flags |= os.O_DIRECTORY
-    fd = os.open(path, flags)
+    try:
+        fd = os.open(path, flags)
+    except OSError:
+        raise SystemExit("aifar dry-run: cannot open %s" % label)
     details = os.fstat(fd)
     valid = stat.S_ISDIR(details.st_mode) if directory else stat.S_ISREG(details.st_mode)
-    if not valid or details.st_uid != os.geteuid() or (mode is not None and stat.S_IMODE(details.st_mode) != mode):
+    owner_invalid = False if executable else details.st_uid != os.geteuid()
+    writable_executable = executable and stat.S_IMODE(details.st_mode) & 0o022
+    if not valid or owner_invalid or writable_executable or (mode is not None and stat.S_IMODE(details.st_mode) != mode):
         os.close(fd)
-        raise SystemExit(1)
+        raise SystemExit("aifar dry-run: invalid %s" % label)
     return fd
-dump_fd = checked(os.path.join(work, "dump"), True, 0o700)
-secret_fd = checked(os.path.join(work, "secret-context.cnf"), False, 0o600)
-mysqlsh_fd = checked(mysqlsh, False)
-options = 'consistent: true, threads: %s, compression: "zstd", users: false, showProgress: false, dryRun: true, excludeSchemas: ["information_schema", "mysql", "mysql_innodb_cluster_metadata", "performance_schema", "sys"]' % threads
+dump_fd = checked(os.path.join(work, "dump"), True, 0o700, label="dump directory")
+secret_fd = checked(os.path.join(work, "secret-context.cnf"), False, 0o600, label="credential context")
+mysqlsh_fd = checked(mysqlsh, False, executable=True, label="mysqlsh executable")
+options = 'consistent: true, threads: %s, compression: "zstd", users: false, showProgress: false, dryRun: true, includeSchemas: %s' % (threads, schemas_json)
 if int(max_rate) > 0:
     options += ', maxRate: "%sM"' % max_rate
 js = 'util.dumpInstance("/proc/self/fd/%d", {%s});' % (dump_fd, options)
 js_fd = os.memfd_create("aifar-logical-backup-dry-run", os.MFD_CLOEXEC)
 os.fchmod(js_fd, 0o600)
 os.write(js_fd, js.encode("utf-8"))
-completed = subprocess.run(["/proc/self/fd/%d" % mysqlsh_fd, "--defaults-file=/proc/self/fd/%d" % secret_fd, "--js", "--file", "/proc/self/fd/%d" % js_fd], pass_fds=(dump_fd, secret_fd, mysqlsh_fd, js_fd), check=False)
+completed = subprocess.run(["/proc/self/fd/%d" % mysqlsh_fd, "--defaults-file=/proc/self/fd/%d" % secret_fd, "--js", "--file", "/proc/self/fd/%d" % js_fd], pass_fds=(dump_fd, secret_fd, mysqlsh_fd, js_fd), stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+if completed.returncode:
+    for stream in (completed.stderr, completed.stdout):
+        if stream:
+            sys.stderr.buffer.write(stream[-8192:])
 raise SystemExit(completed.returncode)
 `
 
-func dryRunBackupCommand(work string, threads, maxRateMBps int) string {
+func dryRunBackupCommand(work string, threads, maxRateMBps int, schemas []string) string {
 	mysqlsh := path.Join(mysqlInstallRoot, "mysql-shell", "bin", "mysqlsh")
-	return "python3 -c " + installerkit.ShellQuote(logicalBackupDryRunHelper) + " " + installerkit.ShellQuote(work) + " " + installerkit.ShellQuote(mysqlsh) + " " + strconv.Itoa(threads) + " " + strconv.Itoa(maxRateMBps)
+	encoded, _ := json.Marshal(schemas)
+	return "python3 -c " + installerkit.ShellQuote(logicalBackupDryRunHelper) + " " + installerkit.ShellQuote(work) + " " + installerkit.ShellQuote(mysqlsh) + " " + strconv.Itoa(threads) + " " + strconv.Itoa(maxRateMBps) + " " + installerkit.ShellQuote(string(encoded))
 }
 func prepareDumpDirectoryCommand(work string) string {
 	return "set -eu; test -d " + installerkit.ShellQuote(work) + "; test ! -e " + installerkit.ShellQuote(path.Join(work, "dump")) + "; install -d -m 0700 " + installerkit.ShellQuote(path.Join(work, "dump"))

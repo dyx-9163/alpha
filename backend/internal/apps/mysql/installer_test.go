@@ -202,7 +202,7 @@ func TestMySQLStandaloneScriptsRenderTemplates(t *testing.T) {
 		"Group Replication table key validation failed",
 		"@@GLOBAL.gtid_executed",
 		"GTID_SUBSET(?, ?)",
-		"candidates.length !== 1",
+		"candidates.length === 0",
 		"{dryRun: true}",
 		"rebootClusterFromCompleteOutage",
 	} {

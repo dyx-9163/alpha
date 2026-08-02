@@ -146,6 +146,48 @@ type DeleteRequest struct {
 	Language   string
 	Actor      string
 	Parameters map[string]any
+	Batch      *DeleteBatchScope
+}
+
+// DeleteBatchScope is created by the HTTP boundary only after an application
+// module has successfully preflighted the complete batch. It is intentionally
+// not decoded from client JSON.
+type DeleteBatchScope struct {
+	instanceIDs []string
+}
+
+func NewDeleteBatchScope(instanceIDs []string) *DeleteBatchScope {
+	seen := make(map[string]bool, len(instanceIDs))
+	clean := make([]string, 0, len(instanceIDs))
+	for _, value := range instanceIDs {
+		value = strings.TrimSpace(value)
+		if value == "" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		clean = append(clean, value)
+	}
+	return &DeleteBatchScope{instanceIDs: clean}
+}
+
+func (s *DeleteBatchScope) Includes(instanceID string) bool {
+	if s == nil {
+		return false
+	}
+	instanceID = strings.TrimSpace(instanceID)
+	for _, value := range s.instanceIDs {
+		if value == instanceID {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *DeleteBatchScope) IDs() []string {
+	if s == nil {
+		return nil
+	}
+	return append([]string(nil), s.instanceIDs...)
 }
 
 const DeleteParamConfirmedWithServerPassword = "confirmedWithServerPassword"
@@ -446,6 +488,28 @@ type BackupRequest struct {
 	Parameters    map[string]any
 }
 
+type BackupSchemaCategory string
+
+const (
+	BackupSchemaServerSystem    BackupSchemaCategory = "server-system"
+	BackupSchemaClusterMetadata BackupSchemaCategory = "cluster-metadata"
+	BackupSchemaBusiness        BackupSchemaCategory = "business"
+)
+
+type BackupSchema struct {
+	Name              string               `json:"name"`
+	Category          BackupSchemaCategory `json:"category"`
+	Selectable        bool                 `json:"selectable"`
+	SelectedByDefault bool                 `json:"selectedByDefault"`
+}
+
+type BackupSchemaCatalog struct {
+	InstanceID       string         `json:"instanceId"`
+	SourceInstanceID string         `json:"sourceInstanceId"`
+	SourceServerID   string         `json:"sourceServerId"`
+	Schemas          []BackupSchema `json:"schemas"`
+}
+
 func (r BackupRequest) Clone() BackupRequest {
 	r.Instances = append([]store.AppInstance(nil), r.Instances...)
 	r.Servers = append([]store.Server(nil), r.Servers...)
@@ -492,6 +556,8 @@ func cloneParameterValue(value any) any {
 			cloned[index] = cloneParameterValue(item)
 		}
 		return cloned
+	case []string:
+		return append([]string(nil), typed...)
 	default:
 		return value
 	}
@@ -540,6 +606,12 @@ type Module interface {
 type DeleteModule interface {
 	PlanDelete(ctx context.Context, req DeleteRequest) ([]InstallStepPlan, error)
 	Delete(ctx context.Context, req DeleteRequest, run RunContext) error
+}
+
+// BatchDeleteModule validates a complete, immutable deletion selection before
+// the worker performs the first remote mutation.
+type BatchDeleteModule interface {
+	PreflightDeleteBatch(context.Context, []DeleteRequest) error
 }
 
 type CheckModule interface {
@@ -629,6 +701,10 @@ type ClusterStartModule interface {
 type BackupModule interface {
 	PlanBackup(context.Context, BackupRequest) ([]InstallStepPlan, error)
 	Backup(context.Context, BackupRequest, RunContext) error
+}
+
+type BackupSchemaModule interface {
+	DiscoverBackupSchemas(context.Context, BackupRequest) (BackupSchemaCatalog, error)
 }
 
 type RestoreModule interface {

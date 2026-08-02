@@ -148,7 +148,7 @@ func (s Service) resolveHealthyInnoDBCluster(ctx context.Context, representative
 		if !found || instance.App != "mysql" || instanceTopology(instance) != "innodb-cluster" || clusterIDFromInstance(instance) != clusterID || instance.ServerID != member.ServerID || seenInstance[instance.ID] || seenServer[instance.ServerID] {
 			return resolvedInnoDBCluster{}, mysqlOperationError(MySQLBackupClusterUnhealthy)
 		}
-		server, err := s.store.GetServer(instance.ServerID, false)
+		server, err := s.store.GetServer(instance.ServerID, true)
 		if err != nil || strings.TrimSpace(server.Host) == "" {
 			return resolvedInnoDBCluster{}, mysqlOperationError(MySQLBackupClusterUnhealthy)
 		}
@@ -241,8 +241,8 @@ type observedClusterMember struct{ endpoint, role, status, uuid string }
 func inspectClusterMembersCommand(work string, port int) string {
 	mysqlsh := path.Join(mysqlInstallRoot, "mysql-shell", "bin", "mysqlsh")
 	secretPath := path.Join(work, "secret-context.cnf")
-	query := "SELECT '__AIFAR_CLUSTER__',MEMBER_HOST,MEMBER_PORT,MEMBER_ROLE,MEMBER_STATE,MEMBER_ID FROM performance_schema.replication_group_members ORDER BY MEMBER_ID"
-	return mysqlRemoteCredentialValidationCommand(secretPath) + "; test -x " + installerkit.ShellQuote(mysqlsh) + "; " + installerkit.ShellQuote(mysqlsh) + " --defaults-file=" + installerkit.ShellQuote(secretPath) + " --sql --raw --skip-column-names --host=127.0.0.1 --port=" + strconv.Itoa(port) + " --execute " + installerkit.ShellQuote(query)
+	query := "SELECT '__AIFAR_CLUSTER__' AS marker,MEMBER_HOST,MEMBER_PORT,MEMBER_ROLE,MEMBER_STATE,MEMBER_ID FROM performance_schema.replication_group_members ORDER BY MEMBER_ID"
+	return mysqlRemoteCredentialValidationCommand(secretPath) + "; test -x " + installerkit.ShellQuote(mysqlsh) + "; " + installerkit.ShellQuote(mysqlsh) + " --defaults-file=" + installerkit.ShellQuote(secretPath) + " --sql --result-format=tabbed --host=127.0.0.1 --port=" + strconv.Itoa(port) + " --execute " + installerkit.ShellQuote(query)
 }
 
 func parseInnoDBClusterRuntime(output string) ([]observedClusterMember, error) {
@@ -450,6 +450,6 @@ func routerVerificationSchema(schemas []string) (string, bool) {
 func routerReadWriteVerificationCommand(work string, port int, schema string) string {
 	mysqlsh := path.Join(mysqlInstallRoot, "mysql-shell", "bin", "mysqlsh")
 	secretPath := path.Join(work, "secret-context.cnf")
-	query := "USE `" + schema + "`; START TRANSACTION READ WRITE; CREATE TEMPORARY TABLE aifar_router_verify(v INT NOT NULL); INSERT INTO aifar_router_verify VALUES (1); SELECT '__AIFAR_ROUTER_WRITE__',COUNT(*) FROM aifar_router_verify; SELECT '__AIFAR_ROUTER_READ__',v FROM aifar_router_verify; ROLLBACK"
-	return mysqlRemoteCredentialValidationCommand(secretPath) + "; test -x " + installerkit.ShellQuote(mysqlsh) + "; " + installerkit.ShellQuote(mysqlsh) + " --defaults-file=" + installerkit.ShellQuote(secretPath) + " --sql --raw --skip-column-names --host=127.0.0.1 --port=" + strconv.Itoa(port) + " --execute " + installerkit.ShellQuote(query)
+	query := "USE `" + schema + "`; START TRANSACTION READ WRITE; CREATE TEMPORARY TABLE aifar_router_verify(v INT NOT NULL); INSERT INTO aifar_router_verify VALUES (1); SELECT '__AIFAR_ROUTER_WRITE__' AS marker,COUNT(*) FROM aifar_router_verify; SELECT '__AIFAR_ROUTER_READ__' AS marker,v FROM aifar_router_verify; ROLLBACK"
+	return mysqlRemoteCredentialValidationCommand(secretPath) + "; test -x " + installerkit.ShellQuote(mysqlsh) + "; " + installerkit.ShellQuote(mysqlsh) + " --defaults-file=" + installerkit.ShellQuote(secretPath) + " --sql --result-format=tabbed --host=127.0.0.1 --port=" + strconv.Itoa(port) + " --execute " + installerkit.ShellQuote(query)
 }

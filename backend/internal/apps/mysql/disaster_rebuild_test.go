@@ -112,6 +112,22 @@ func TestDisasterRebuildInitializedInspectionVerifiesBoundCredential(t *testing.
 	}
 }
 
+func TestDisasterRebuildMySQLShellUsesSupportedTabbedOutput(t *testing.T) {
+	script, err := renderDisasterRebuildScript(DisasterRebuildScriptOptions{
+		TaskID: "tsk_1234567890abcdef12345678", InstallRoot: "/aifar/apps/mysql", WorkDir: "/aifar/apps/mysql/_disaster/tsk_1234567890abcdef12345678", DataDir: "/aifar/apps/mysql/data",
+		QuarantineDir: "/aifar/apps/mysql/data.quarantine-tsk_1234567890abcdef12345678", Port: 3306,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(script, "mysqlsh\" --defaults-file=\"$WORK_DIR/secret-context.cnf\" --sql --result-format=tabbed --skip-column-names") {
+		t.Fatalf("disaster rebuild uses unsupported mysqlsh --skip-column-names:\n%s", script)
+	}
+	if !strings.Contains(script, `--sql --result-format=tabbed`) {
+		t.Fatalf("disaster rebuild is missing tabbed mysqlsh output:\n%s", script)
+	}
+}
+
 func TestDisasterRebuildScriptValidatesCredentialFilesBeforeEveryRead(t *testing.T) {
 	script, err := renderDisasterRebuildScript(DisasterRebuildScriptOptions{
 		TaskID: "tsk_1234567890abcdef12345678", InstallRoot: "/aifar/apps/mysql", WorkDir: "/aifar/apps/mysql/_disaster/tsk_1234567890abcdef12345678", DataDir: "/aifar/apps/mysql/data",

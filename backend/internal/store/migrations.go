@@ -257,6 +257,11 @@ var storeMigrations = []storeMigration{
 			return ensureColumnTx(tx, "diagnostic_exports", "local_date", `alter table diagnostic_exports add column local_date text not null default ''`)
 		},
 	},
+	{
+		Version: 2026073001,
+		Name:    "mysql cluster authoritative topology",
+		Up:      backfillLegacyMySQLClusterTopologies,
+	},
 }
 
 func runStoreMigrations(db *sql.DB) error {

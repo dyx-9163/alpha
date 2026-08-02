@@ -114,7 +114,13 @@ func (a *API) startMySQLRestore(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, mysqlapp.MySQLRestoreManifestInvalid, i18n.MySQLBackupErrorText(lang, mysqlapp.MySQLRestoreManifestInvalid), map[string]any{"instanceId": instance.ID})
 			return
 		}
-		if code := a.mysqlOrdinaryLifecycleGate(instance); code != "" {
+		var gateCode string
+		if payload.ResumeMaintenance {
+			gateCode = a.mysqlStandaloneMaintenanceResumeGate(instance, payload.BackupID)
+		} else {
+			gateCode = a.mysqlOrdinaryLifecycleGate(instance)
+		}
+		if code := gateCode; code != "" {
 			writeError(w, http.StatusConflict, code, i18n.MySQLBackupErrorText(lang, code), map[string]any{"instanceId": instance.ID})
 			return
 		}
@@ -175,7 +181,8 @@ func (a *API) startMySQLRestore(w http.ResponseWriter, r *http.Request) {
 		Parameters: map[string]any{
 			"mode": payload.Mode, "maintenanceConfirmed": payload.MaintenanceConfirmed,
 			"createPreRestoreBackup": payload.CreatePreRestoreBackup, "disasterConfirmed": payload.DisasterConfirmed, "threads": payload.Threads,
-			"targetMapping": targetMapping, "serverPasswordsConfirmed": serverPasswordsConfirmed,
+			"resumeMaintenance": payload.ResumeMaintenance,
+			"targetMapping":     targetMapping, "serverPasswordsConfirmed": serverPasswordsConfirmed,
 		},
 	}
 	plan, err := restoreModule.PlanRestore(r.Context(), restoreRequest)
@@ -355,7 +362,7 @@ func (a *API) startMySQLBackup(w http.ResponseWriter, r *http.Request) {
 		Actor:         actor,
 		RepositoryDir: a.cfg.MySQLBackupDir,
 		KeepLast:      keepLast,
-		Parameters:    map[string]any{"name": payload.Name, "threads": payload.Threads, "maxRateMBps": payload.MaxRateMBps},
+		Parameters:    map[string]any{"name": payload.Name, "threads": payload.Threads, "maxRateMBps": payload.MaxRateMBps, "schemas": append([]string(nil), payload.Schemas...)},
 	}
 	plan, err := backupModule.PlanBackup(r.Context(), backupRequest)
 	if err != nil {
@@ -401,6 +408,54 @@ func (a *API) startMySQLBackup(w http.ResponseWriter, r *http.Request) {
 		a.audit(r, mysqlBackupTaskType, instance.ID, "running", task.ID)
 	}
 	respondTask(w, task, err)
+}
+
+func (a *API) listMySQLBackupSchemas(w http.ResponseWriter, r *http.Request) {
+	lang := languageFromRequest(r)
+	instanceID := strings.TrimSpace(chi.URLParam(r, "id"))
+	instance, err := a.store.GetAppInstance(instanceID)
+	if err != nil {
+		respond(w, nil, err)
+		return
+	}
+	topology := appInstanceTopology(instance)
+	if instance.App != "mysql" || (topology != "standalone" && topology != "innodb-cluster") || strings.TrimSpace(instance.ServerID) == "" {
+		writeError(w, http.StatusBadRequest, mysqlapp.MySQLBackupUnsupportedTopology, i18n.MySQLBackupErrorText(lang, mysqlapp.MySQLBackupUnsupportedTopology), map[string]any{"instanceId": instanceID})
+		return
+	}
+	if code := a.mysqlOrdinaryLifecycleGate(instance); code != "" {
+		writeError(w, http.StatusConflict, code, i18n.MySQLBackupErrorText(lang, code), map[string]any{"instanceId": instanceID})
+		return
+	}
+	instances, servers, err := a.mysqlBackupTargets(instance)
+	if err != nil {
+		respond(w, nil, err)
+		return
+	}
+	module, exists := a.apps.Get("mysql")
+	if !exists {
+		writeError(w, http.StatusNotFound, "APP_BACKEND_MODULE_MISSING", i18n.Text(lang, "api.appBackendMissing"), map[string]any{"app": "mysql"})
+		return
+	}
+	discovery, ok := module.(registry.BackupSchemaModule)
+	if !ok {
+		writeError(w, http.StatusConflict, "MYSQL_BACKUP_SCHEMA_DISCOVERY_UNSUPPORTED", i18n.MySQLBackupErrorText(lang, mysqlapp.MySQLBackupSchemaSelectionInvalid), map[string]any{"instanceId": instanceID})
+		return
+	}
+	catalog, err := discovery.DiscoverBackupSchemas(r.Context(), registry.BackupRequest{
+		Instance: instance, Instances: instances, Servers: servers, Language: lang, Actor: currentUser(r).Username,
+	})
+	if err != nil {
+		var stable interface{ StableCode() string }
+		if errors.As(err, &stable) && stable.StableCode() != "" {
+			code := stable.StableCode()
+			writeError(w, http.StatusBadRequest, code, i18n.MySQLBackupErrorText(lang, code), map[string]any{"instanceId": instanceID})
+			return
+		}
+		writeError(w, http.StatusBadGateway, "MYSQL_BACKUP_SCHEMA_DISCOVERY_FAILED", i18n.MySQLBackupErrorText(lang, mysqlapp.MySQLBackupSchemaSelectionInvalid), map[string]any{"instanceId": instanceID})
+		return
+	}
+	writeJSON(w, http.StatusOK, catalog)
 }
 
 func (a *API) verifyMySQLBackup(w http.ResponseWriter, r *http.Request) {

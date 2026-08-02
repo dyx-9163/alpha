@@ -17,18 +17,18 @@
       <div><span>{{ t('database.mysqlBackup.schemas') }}</span><strong>{{ backup.metadata.schemas.length }}</strong></div>
       <div><span>{{ t('database.mysqlBackup.compatibility') }}</span><el-tag :type="compatibility.compatible ? 'success' : 'danger'" effect="plain">{{ compatibility.compatible ? t('database.mysqlBackup.compatible') : t(compatibility.reasonKey) }}</el-tag></div>
     </div>
-    <el-alert type="warning" :closable="false" show-icon :title="t(restoreImpactKey(mode))" />
+    <el-alert type="warning" :closable="false" show-icon :title="t(resumeMaintenance ? 'database.mysqlBackup.resumeRestoreImpact' : restoreImpactKey(mode))" />
     <el-form class="restore-form" label-position="top" @submit.prevent="submit">
       <el-form-item :label="t('database.mysqlBackup.restoreThreads')" required>
         <el-input-number v-model="threads" :min="1" :max="64" :step="1" :precision="0" controls-position="right" />
       </el-form-item>
-      <el-checkbox v-model="createPreRestoreBackup">{{ t('database.mysqlBackup.preRestoreBackup') }}</el-checkbox>
+      <el-checkbox v-model="createPreRestoreBackup" :disabled="resumeMaintenance">{{ t('database.mysqlBackup.preRestoreBackup') }}</el-checkbox>
       <el-checkbox v-model="maintenanceConfirmed" class="danger-confirm">{{ t('database.mysqlBackup.maintenanceConfirm') }}</el-checkbox>
     </el-form>
     <template #footer>
       <el-button @click="emit('update:modelValue', false)">{{ t('common.cancel') }}</el-button>
       <el-button type="danger" :loading="submitting" :disabled="!canSubmit" @click="submit">
-        {{ t('database.mysqlBackup.restoreAction') }}
+        {{ t(resumeMaintenance ? 'database.mysqlBackup.resumeRestoreAction' : 'database.mysqlBackup.restoreAction') }}
       </el-button>
     </template>
   </el-dialog>
@@ -56,8 +56,9 @@ const props = withDefaults(defineProps<{
   target: RestoreTarget
   defaultThreads: number
   submissionAllowed?: boolean
+  resumeMaintenance?: boolean
   beforeSubmit?: () => boolean | Promise<boolean>
-}>(), { submissionAllowed: true })
+}>(), { submissionAllowed: true, resumeMaintenance: false })
 
 const emit = defineEmits<{
   'update:modelValue': [value: boolean]
@@ -84,7 +85,7 @@ function reset() {
   if (submitting.value) return
   threads.value = props.defaultThreads >= 1 && props.defaultThreads <= 64 ? props.defaultThreads : 4
   maintenanceConfirmed.value = false
-  createPreRestoreBackup.value = true
+  createPreRestoreBackup.value = !props.resumeMaintenance
 }
 
 async function submit() {
@@ -100,6 +101,7 @@ async function submit() {
       mode: mode.value as 'standalone' | 'healthy-cluster',
       maintenanceConfirmed: true,
       createPreRestoreBackup: createPreRestoreBackup.value,
+      ...(props.resumeMaintenance ? { resumeMaintenance: true as const } : {}),
       threads: threads.value
     }, taskProgress, t('database.mysqlBackup.restoreTaskLabel'))
     ElMessage.success(t('database.mysqlBackup.restoreAccepted'))

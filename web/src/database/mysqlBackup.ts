@@ -56,8 +56,25 @@ export interface MySQLBackupDefaults {
   keepLast?: number
 }
 
+export type MySQLBackupSchemaCategory = 'server-system' | 'cluster-metadata' | 'business'
+
+export interface MySQLBackupSchema {
+  name: string
+  category: MySQLBackupSchemaCategory
+  selectable: boolean
+  selectedByDefault: boolean
+}
+
+export interface MySQLBackupSchemaCatalog {
+  instanceId: string
+  sourceInstanceId: string
+  sourceServerId: string
+  schemas: MySQLBackupSchema[]
+}
+
 export interface MySQLBackupParameters extends MySQLBackupDefaults {
   name: string
+  schemas: string[]
 }
 
 export interface MySQLBackupListResponse {
@@ -98,6 +115,7 @@ export interface MySQLOperationAvailability {
   records: boolean
   verify: boolean
   restore: boolean
+  resumeRestore: boolean
   disaster: boolean
   clearMaintenance: boolean
   reconcile: boolean
@@ -130,6 +148,7 @@ export interface OrdinaryRestoreRequest {
   mode: 'standalone' | 'healthy-cluster'
   maintenanceConfirmed: true
   createPreRestoreBackup: boolean
+  resumeMaintenance?: true
   threads: number
 }
 
@@ -210,7 +229,7 @@ export function latestVerifiableMySQLBackup(records: MySQLBackupRecord[]) {
   return records.find(isMySQLBackupVerifiable) ?? null
 }
 
-export function backupDefaults(value: unknown): MySQLBackupParameters {
+export function backupDefaults(value: unknown): Omit<MySQLBackupParameters, 'schemas'> {
   const defaults = objectValue(value) ?? {}
   const threads = positiveInteger(defaults.threads, 1, 64) ?? 4
   const maxRateMBps = nonNegativeNumber(defaults.maxRateMBps) ?? 0
@@ -367,6 +386,9 @@ export function mysqlOperationAvailability(input: MySQLAvailabilityInput): MySQL
   const maintenanceRequired = input.maintenance.kind === 'required'
   const disaster = supported && input.topology === 'innodb-cluster' && input.nodeCount === 3 &&
     input.canManage && input.isOwner && input.maintenance.kind === 'required' && input.maintenance.state.scope === 'cluster'
+  const resumeRestore = supported && input.topology === 'standalone' && input.canManage && input.isOwner &&
+    input.maintenance.kind === 'required' && input.maintenance.state.scope === 'standalone' &&
+    ['schema_mutation_started', 'load_complete'].includes(input.maintenance.state.restorePhase) && reconciliation.kind === 'none'
   const clearMaintenance = supported && input.canManage && input.isOwner && maintenanceRequired && reconciliation.kind === 'none'
   const reconcile = supported && input.canManage && input.isOwner && reconciliation.kind === 'required'
   let reasonKey = ''
@@ -385,6 +407,7 @@ export function mysqlOperationAvailability(input: MySQLAvailabilityInput): MySQL
     records: supported,
     verify: supported && input.canManage,
     restore: ownerAction,
+    resumeRestore,
     disaster,
     clearMaintenance,
     reconcile,
@@ -421,16 +444,48 @@ export async function listMySQLBackups(instanceId: string): Promise<MySQLBackupL
   }
 }
 
+export async function discoverMySQLBackupSchemas(instanceId: string): Promise<MySQLBackupSchemaCatalog> {
+  const id = requiredInstanceId(instanceId)
+  const raw = await apiGet<unknown>(`/apps/instances/${encodeURIComponent(id)}/backup-schemas`)
+  const response = objectValue(raw)
+  const sourceInstanceId = stringValue(response?.sourceInstanceId)
+  const sourceServerId = stringValue(response?.sourceServerId)
+  if (!response || stringValue(response.instanceId) !== id || !controlledInstanceId.test(sourceInstanceId) || !controlledServerId.test(sourceServerId) || !Array.isArray(response.schemas)) {
+    throw new Error('Invalid backup schema response')
+  }
+  const seen = new Set<string>()
+  const schemas = response.schemas.map((rawSchema) => {
+    const schema = objectValue(rawSchema)
+    const name = stringValue(schema?.name)
+    const category = stringValue(schema?.category) as MySQLBackupSchemaCategory
+    const selectable = schema?.selectable
+    const selectedByDefault = schema?.selectedByDefault
+    const business = category === 'business'
+    const key = name.toLocaleLowerCase('en-US')
+    if (!schema || !exactKeys(schema, ['name', 'category', 'selectable', 'selectedByDefault']) || !/^[A-Za-z_][A-Za-z0-9_]{0,63}$/.test(name) ||
+        !['server-system', 'cluster-metadata', 'business'].includes(category) || typeof selectable !== 'boolean' || typeof selectedByDefault !== 'boolean' ||
+        selectable !== business || selectedByDefault !== business || seen.has(key)) {
+      throw new Error('Invalid backup schema response')
+    }
+    seen.add(key)
+    return { name, category, selectable, selectedByDefault }
+  })
+  return { instanceId: id, sourceInstanceId, sourceServerId, schemas }
+}
+
 export async function startMySQLBackup(instanceId: string, parameters: MySQLBackupParameters, tracker: TaskTracker, label: string) {
   const id = requiredInstanceId(instanceId)
   const name = parameters.name.trim()
   const threads = positiveInteger(parameters.threads, 1, 64)
   const maxRateMBps = nonNegativeNumber(parameters.maxRateMBps)
   const keepLast = positiveInteger(parameters.keepLast, 1, Number.MAX_SAFE_INTEGER)
-  if (!name || threads === undefined || maxRateMBps === undefined || (parameters.keepLast !== undefined && keepLast === undefined)) {
+	const schemas = Array.isArray(parameters.schemas) ? parameters.schemas.map((schema) => schema.trim()) : []
+	const folded = schemas.map((schema) => schema.toLocaleLowerCase('en-US'))
+	if (!name || threads === undefined || maxRateMBps === undefined || (parameters.keepLast !== undefined && keepLast === undefined) || !schemas.length ||
+		schemas.some((schema) => !/^[A-Za-z_][A-Za-z0-9_]{0,63}$/.test(schema)) || new Set(folded).size !== schemas.length) {
     throw new Error('Invalid backup parameters')
   }
-  const body = { name, threads, maxRateMBps, ...(keepLast ? { keepLast } : {}) }
+	const body = { name, threads, maxRateMBps, ...(keepLast ? { keepLast } : {}), schemas: [...schemas] }
   const response = await apiPost<TaskResponse>(`/apps/instances/${encodeURIComponent(id)}/backup`, body)
   return trackTaskResponse(response, tracker, label)
 }
@@ -470,12 +525,14 @@ export async function startMySQLRestore(instanceId: string, request: MySQLRestor
       serverPasswords: { ...request.serverPasswords }
     }
   } else {
+    if (request.resumeMaintenance === true && request.mode !== 'standalone') throw new Error('Invalid restore parameters')
     body = {
       backupId,
       mode: request.mode === 'healthy-cluster' ? 'innodb-cluster' : 'standalone',
       maintenanceConfirmed: true,
       createPreRestoreBackup: request.createPreRestoreBackup,
       disasterConfirmed: false,
+      ...(request.resumeMaintenance === true ? { resumeMaintenance: true } : {}),
       threads
     }
   }

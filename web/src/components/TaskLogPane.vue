@@ -82,10 +82,9 @@
 
     <div class="task-layout">
       <TaskListPanel
-        :tasks="tasks"
+        :tasks="selectableTasks"
         :selected-id="selectedTaskId"
         :selected-ids="selectedTaskIds"
-        :type-prefix="props.typePrefix"
         @select="selectTask"
         @selection-change="selectedTaskIds = $event"
       />
@@ -104,6 +103,7 @@ import { ElMessage } from 'element-plus'
 import { apiDelete, apiGet, asArray } from '../api/client'
 import { useI18n } from '../i18n'
 import { cancelTask, isTaskCancellable } from '../tasks/actions'
+import { filterTasksByScope } from '../tasks/taskScope'
 import ConfirmAction from './ConfirmAction.vue'
 import TaskListPanel from './TaskListPanel.vue'
 import TaskRunPanel from './TaskRunPanel.vue'
@@ -162,7 +162,7 @@ type ServerSummary = {
   host?: string
 }
 
-const props = withDefaults(defineProps<{ taskId?: string; typePrefix?: string; canManage?: boolean; disabledReason?: string }>(), {
+const props = withDefaults(defineProps<{ taskId?: string; typePrefix?: string; taskTarget?: string; canManage?: boolean; disabledReason?: string }>(), {
   canManage: true,
   disabledReason: ''
 })
@@ -180,11 +180,8 @@ let source: EventSource | null = null
 let refreshTimer: number | null = null
 
 const selectableTasks = computed(() => {
-  const ordered = tasks.value.slice().sort((a, b) => taskTime(b.createdAt) - taskTime(a.createdAt))
-  if (!props.typePrefix) {
-    return ordered
-  }
-  return ordered.filter((task) => task.type.startsWith(props.typePrefix || ''))
+  const scoped = filterTasksByScope(tasks.value, props.typePrefix, props.taskTarget)
+  return scoped.sort((a, b) => taskTime(b.createdAt) - taskTime(a.createdAt))
 })
 
 const deleteConfirmText = computed(() => {

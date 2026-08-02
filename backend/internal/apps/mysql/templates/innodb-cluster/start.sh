@@ -112,8 +112,8 @@ for (const candidate of gtidSnapshots) {
     candidates.push(candidate);
   }
 }
-if (candidates.length !== 1) {
-  throw new Error('complete-outage recovery requires one unique GTID-superset member');
+if (candidates.length === 0) {
+  throw new Error('complete-outage recovery could not identify a GTID-superset member; transaction sets may have diverged');
 }
 const seed = candidates[0].node;
 shell.connect(connection(seed));
@@ -163,7 +163,7 @@ assertGroupReplicationTableKeys();
 
 print('validating InnoDB Cluster complete-outage reboot without mutation: ' + clusterName);
 dba.rebootClusterFromCompleteOutage(clusterName, {dryRun: true});
-print('attempting InnoDB Cluster reboot from the unique GTID-superset member: ' + clusterName);
+print('attempting InnoDB Cluster reboot from the selected GTID-superset member: ' + clusterName);
 const cluster = dba.rebootClusterFromCompleteOutage(clusterName);
 print('InnoDB Cluster complete-outage reboot completed: ' + clusterName);
 

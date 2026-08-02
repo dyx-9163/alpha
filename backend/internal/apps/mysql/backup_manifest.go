@@ -60,11 +60,12 @@ func NormalizeBackupManifest(manifest BackupManifest) (BackupManifest, error) {
 	if err != nil {
 		return BackupManifest{}, err
 	}
-	if !hasFixedSystemSchemaExclusions(manifest.ExcludedSchemas) {
-		return BackupManifest{}, mysqlOperationError(MySQLRestoreManifestInvalid)
-	}
 	manifest.Schemas = schemas
-	manifest.ExcludedSchemas = append([]string(nil), fixedSystemSchemas...)
+	excluded, err := normalizeExcludedSchemas(manifest.ExcludedSchemas, schemas)
+	if err != nil {
+		return BackupManifest{}, err
+	}
+	manifest.ExcludedSchemas = excluded
 
 	switch manifest.Topology {
 	case "standalone":
@@ -229,16 +230,37 @@ func normalizeBusinessSchemas(schemas []string) ([]string, error) {
 }
 
 func isSystemSchema(schema string) bool {
-	for _, systemSchema := range fixedSystemSchemas {
-		if strings.EqualFold(schema, systemSchema) {
-			return true
+	return isServerSystemSchema(schema) || isClusterMetadataSchema(schema)
+}
+
+func normalizeExcludedSchemas(excluded, selected []string) ([]string, error) {
+	selectedSet := make(map[string]bool, len(selected))
+	for _, name := range selected {
+		selectedSet[strings.ToLower(name)] = true
+	}
+	seen := make(map[string]string, len(excluded))
+	for _, name := range excluded {
+		key := strings.ToLower(name)
+		if !strictSchemaName.MatchString(name) || selectedSet[key] || seen[key] != "" {
+			return nil, mysqlOperationError(MySQLRestoreManifestInvalid)
+		}
+		seen[key] = name
+	}
+	for _, fixed := range fixedSystemSchemas {
+		if seen[strings.ToLower(fixed)] == "" {
+			return nil, mysqlOperationError(MySQLRestoreManifestInvalid)
 		}
 	}
-	return false
+	result := make([]string, 0, len(seen))
+	for _, name := range seen {
+		result = append(result, name)
+	}
+	sort.Strings(result)
+	return result, nil
 }
 
 func hasFixedSystemSchemaExclusions(schemas []string) bool {
-	if len(schemas) != len(fixedSystemSchemas) {
+	if len(schemas) < len(fixedSystemSchemas) {
 		return false
 	}
 	seen := make(map[string]struct{}, len(schemas))
@@ -460,8 +482,7 @@ func containsSecretShape(value any) bool {
 func containsSecretJSONShape(value any) bool {
 	switch typed := value.(type) {
 	case string:
-		value := strings.ToLower(strings.TrimSpace(typed))
-		return isSecretJSONName(value) || secretAssignment.MatchString(typed) || strings.Contains(typed, "://") && strings.Contains(typed, "@")
+		return isBareSecretJSONValue(typed) || secretAssignment.MatchString(typed) || strings.Contains(typed, "://") && strings.Contains(typed, "@")
 	case []any:
 		for _, item := range typed {
 			if containsSecretJSONShape(item) {
@@ -476,6 +497,16 @@ func containsSecretJSONShape(value any) bool {
 		}
 	}
 	return false
+}
+
+func isBareSecretJSONValue(value string) bool {
+	normalized := strings.NewReplacer("_", "", "-", "", " ", "").Replace(strings.ToLower(strings.TrimSpace(value)))
+	switch normalized {
+	case "password", "passwd", "secret", "token", "privatekey", "credential":
+		return true
+	default:
+		return false
+	}
 }
 
 func isSecretJSONName(value string) bool {

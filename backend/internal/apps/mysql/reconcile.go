@@ -202,11 +202,33 @@ func (s *remoteLocalInfileSession) ReadLocalInfile(ctx context.Context) (string,
 	if err != nil {
 		return "", err
 	}
-	value := strings.ToUpper(strings.TrimSpace(result.Stdout))
-	if value != "ON" && value != "OFF" {
-		return "", errors.New("local_infile returned an unsupported value")
+	return parseLocalInfileOutput(result.Stdout)
+}
+
+func parseLocalInfileOutput(output string) (string, error) {
+	if value, ok := normalizeLocalInfileValue(output); ok {
+		return value, nil
 	}
-	return value, nil
+	for _, line := range strings.Split(output, "\n") {
+		parts := strings.Split(strings.TrimSpace(line), "\t")
+		if len(parts) == 2 && parts[1] == "__AIFAR_LOCAL_INFILE__" {
+			if value, ok := normalizeLocalInfileValue(parts[0]); ok {
+				return value, nil
+			}
+		}
+	}
+	return "", errors.New("local_infile returned an unsupported value")
+}
+
+func normalizeLocalInfileValue(raw string) (string, bool) {
+	switch strings.ToUpper(strings.TrimSpace(raw)) {
+	case "ON", "1":
+		return "ON", true
+	case "OFF", "0":
+		return "OFF", true
+	default:
+		return "", false
+	}
 }
 
 func (s *remoteLocalInfileSession) SetLocalInfile(ctx context.Context, value string) error {
@@ -219,7 +241,7 @@ func (s *remoteLocalInfileSession) SetLocalInfile(ctx context.Context, value str
 }
 
 func localInfileReadCommand(work string, port int) string {
-	return localInfileSQLCommand(work, port, "SELECT @@GLOBAL.local_infile")
+	return localInfileSQLCommand(work, port, "SELECT @@GLOBAL.local_infile AS value, '__AIFAR_LOCAL_INFILE__' AS marker")
 }
 
 func localInfileSetCommand(work string, port int, value string) string {
@@ -234,7 +256,7 @@ func localInfileSQLCommand(work string, port int, query string) string {
 	secretPath := path.Join(work, "secret-context.cnf")
 	return mysqlRemoteCredentialValidationCommand(secretPath) + "; test -x " + installerkit.ShellQuote(mysqlsh) + "; " + installerkit.ShellQuote(mysqlsh) +
 		" --defaults-file=" + installerkit.ShellQuote(secretPath) +
-		" --sql --raw --skip-column-names --host=127.0.0.1 --port=" + strconv.Itoa(port) +
+		" --sql --result-format=tabbed --host=127.0.0.1 --port=" + strconv.Itoa(port) +
 		" --execute " + installerkit.ShellQuote(query)
 }
 

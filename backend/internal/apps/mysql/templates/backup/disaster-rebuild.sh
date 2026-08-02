@@ -64,7 +64,7 @@ case "$ACTION" in
       *) exit 65 ;;
     esac
     "$INSTALL_ROOT/mysql/bin/mysqladmin" --defaults-file="$WORK_DIR/secret-context.cnf" --protocol=tcp --host=127.0.0.1 --port="$PORT" ping >/dev/null 2>&1
-    member_count="$("$INSTALL_ROOT/mysql-shell/bin/mysqlsh" --defaults-file="$WORK_DIR/secret-context.cnf" --sql --raw --skip-column-names --host=127.0.0.1 --port="$PORT" --execute "SELECT COUNT(*) FROM performance_schema.replication_group_members")"
+    member_count="$("$INSTALL_ROOT/mysql-shell/bin/mysqlsh" --defaults-file="$WORK_DIR/secret-context.cnf" --sql --result-format=tabbed --host=127.0.0.1 --port="$PORT" --execute "SELECT '__AIFAR_MEMBER_COUNT__' AS marker, COUNT(*) AS member_count FROM performance_schema.replication_group_members" | awk -F '\t' '$1 == "__AIFAR_MEMBER_COUNT__" {print $2; found=1} END {if (!found) exit 1}')"
     case "$member_count" in
       0) printf '__AIFAR_STOP_GR__\talready-stopped\n' ;;
       *[!0-9]*|'') exit 65 ;;

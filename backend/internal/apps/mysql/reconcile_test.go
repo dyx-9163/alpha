@@ -15,6 +15,23 @@ import (
 	"aifar-deployment/backend/internal/store"
 )
 
+func TestParseLocalInfileOutputIgnoresTabbedHeader(t *testing.T) {
+	for _, test := range []struct {
+		output string
+		want   string
+	}{
+		{output: "value\tmarker\nON\t__AIFAR_LOCAL_INFILE__\n", want: "ON"},
+		{output: "value\tmarker\n1\t__AIFAR_LOCAL_INFILE__\n", want: "ON"},
+		{output: "value\tmarker\n0\t__AIFAR_LOCAL_INFILE__\n", want: "OFF"},
+		{output: "OFF\n", want: "OFF"},
+	} {
+		got, err := parseLocalInfileOutput(test.output)
+		if err != nil || got != test.want {
+			t.Fatalf("parseLocalInfileOutput(%q) = %q, %v; want %q", test.output, got, err, test.want)
+		}
+	}
+}
+
 type credentialRequiredReconcileRemote struct {
 	password   string
 	cleanupErr error

@@ -96,6 +96,21 @@ func (a *API) mysqlOrdinaryLifecycleGate(instance store.AppInstance) string {
 	return a.mysqlMaintenanceGate(instance)
 }
 
+func (a *API) mysqlStandaloneMaintenanceResumeGate(instance store.AppInstance, backupID string) string {
+	if code := a.mysqlReconciliationGate(instance); code != "" {
+		return code
+	}
+	if !strings.EqualFold(strings.TrimSpace(instance.App), "mysql") || !strings.EqualFold(strings.TrimSpace(instance.Topology), "standalone") {
+		return mysql.MySQLMaintenanceStateInvalid
+	}
+	marker, present, err := store.ParseMySQLMaintenanceMarker(instance.Metadata)
+	validPhase := marker.RestorePhase == "schema_mutation_started" || marker.RestorePhase == "load_complete"
+	if err != nil || !present || marker.Scope != "standalone" || marker.ClusterID != "" || marker.BackupID != strings.TrimSpace(backupID) || !validPhase {
+		return mysql.MySQLMaintenanceStateInvalid
+	}
+	return ""
+}
+
 func (a *API) mysqlReconciliationGate(instance store.AppInstance) string {
 	if !strings.EqualFold(strings.TrimSpace(instance.App), "mysql") {
 		return ""

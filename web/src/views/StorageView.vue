@@ -24,16 +24,7 @@
     <div class="workspace-card storage-main">
       <div class="table-toolbar">
         <el-input v-model="search" :placeholder="t('storage.search')" clearable class="toolbar-control" />
-        <div class="head-actions">
-          <template v-if="tab === 'instances'">
-            <el-input v-model="cleanupPolicyBucket" :placeholder="t('storage.cleanupBucket')" size="small" class="cleanup-policy-control" />
-            <el-input v-model="cleanupPolicyPrefix" :placeholder="t('storage.cleanupPrefix')" size="small" class="cleanup-policy-control" clearable />
-            <el-button-group class="cleanup-day-presets">
-              <el-button v-for="days in cleanupRetentionOptions" :key="days" size="small" @click="cleanupRetentionDays = days">{{ days }}</el-button>
-            </el-button-group>
-            <el-input-number v-model="cleanupRetentionDays" :min="1" :max="3650" :step="1" size="small" class="cleanup-retention-control" />
-            <el-button :loading="cleanupEstimating" @click="estimateVisibleStorageCleanup">{{ t('storage.estimateCleanup') }}</el-button>
-          </template>
+        <div v-if="tab !== 'instances'" class="head-actions">
           <el-select v-if="tab !== 'instances'" v-model="selectedInstanceId" :placeholder="t('storage.selectInstance')" class="toolbar-control">
             <el-option v-for="item in instances" :key="item.id" :label="instanceLabel(item)" :value="item.id" />
           </el-select>

@@ -63,11 +63,41 @@ def open_child_dir(parent_fd, name, exact_mode):
     except Exception:
         fail()
 
+def open_trusted_dir(path):
+    if not path.startswith("/"):
+        fail()
+    fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for component in [part for part in path.split("/") if part]:
+            next_fd = os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            os.close(fd)
+            fd = next_fd
+            details = os.fstat(fd)
+            if not stat.S_ISDIR(details.st_mode) or details.st_mode & 0o022:
+                fail()
+        return fd
+    except Exception:
+        try: os.close(fd)
+        except OSError: pass
+        fail()
+
+def open_trusted_file(parent_fd, name):
+    try:
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent_fd)
+        details = os.fstat(fd)
+        if not stat.S_ISREG(details.st_mode) or details.st_mode & 0o022:
+            os.close(fd)
+            fail()
+        return fd
+    except Exception:
+        fail()
+
 base_fd = open_dir(backup_root, 0o700)
 work_fd = open_child_dir(base_fd, task_id, 0o700)
 dump_fd = open_child_dir(work_fd, "dump", 0o700)
 secret_fd = open_file(work_fd, "secret-context.cnf", 0o600)
-mysqlsh_fd = open_file(open_dir(os.path.dirname(mysqlsh)), os.path.basename(mysqlsh))
+mysqlsh_dir_fd = open_trusted_dir(os.path.dirname(mysqlsh))
+mysqlsh_fd = open_trusted_file(mysqlsh_dir_fd, os.path.basename(mysqlsh))
 js = '''util.loadDump("/proc/self/fd/%d", {
   threads: {{.Threads}},
   loadUsers: false,
@@ -94,7 +124,7 @@ try:
     ], pass_fds=(dump_fd, secret_fd, mysqlsh_fd, js_fd), check=False)
     raise SystemExit(completed.returncode)
 finally:
-    for fd in (base_fd, work_fd, dump_fd, secret_fd, mysqlsh_fd):
+    for fd in (base_fd, work_fd, dump_fd, secret_fd, mysqlsh_dir_fd, mysqlsh_fd):
         try: os.close(fd)
         except OSError: pass
 PY

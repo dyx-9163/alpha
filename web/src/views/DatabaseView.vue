@@ -165,12 +165,8 @@
                 <span><el-button :disabled="!mysqlAvailability(group).backup" @click="openMySQLBackup(group)">{{ t('database.mysqlBackup.createAction') }}</el-button></span>
               </el-tooltip>
               <el-button @click="openMySQLBackupRecords(group)">{{ t('database.mysqlBackup.recordsAction') }}</el-button>
-              <el-tooltip :content="mysqlActionReason(group)" :disabled="mysqlAvailability(group).verify" placement="top">
-                <span><el-button :disabled="!mysqlAvailability(group).verify" @click="verifyLatestMySQLBackup(group)">{{ t('database.mysqlBackup.verifyAction') }}</el-button></span>
-              </el-tooltip>
-              <el-tooltip :content="mysqlActionReason(group)" :disabled="mysqlAvailability(group).restore" placement="top">
-                <span><el-button type="primary" plain :disabled="!mysqlAvailability(group).restore" @click="openLatestMySQLRestore(group)">{{ t('database.mysqlBackup.restoreAction') }}</el-button></span>
-              </el-tooltip>
+              <el-button @click="openMySQLRestoreRecords(group)">{{ t('database.mysqlBackup.restoreRecordsAction') }}</el-button>
+              <el-button v-if="mysqlAvailability(group).resumeRestore" type="danger" plain @click="openMySQLMaintenanceResume(group)">{{ t('database.mysqlBackup.resumeRestoreAction') }}</el-button>
               <el-button v-if="mysqlAvailability(group).disaster" type="danger" plain @click="openLatestMySQLDisaster(group)">{{ t('database.mysqlBackup.disasterAction') }}</el-button>
               <el-button
                 v-if="mysqlAvailability(group).reconcile"
@@ -231,7 +227,8 @@
       :backup="activeBackup"
       :target="activeTarget"
       :default-threads="backupListDefaults.threads"
-      :submission-allowed="activeAvailability.restore"
+      :submission-allowed="activeAvailability.restore || (restoreResumeMaintenance && activeAvailability.resumeRestore)"
+      :resume-maintenance="restoreResumeMaintenance"
       :before-submit="guardActiveRestoreSubmission"
       @submitted="refreshActiveBackups"
     />
@@ -284,8 +281,10 @@ import MySQLBackupDrawer from '../database/MySQLBackupDrawer.vue'
 import MySQLDisasterRebuildDialog from '../database/MySQLDisasterRebuildDialog.vue'
 import MySQLRestoreDialog from '../database/MySQLRestoreDialog.vue'
 import {
+  canStartMySQLCluster,
   healthFromCheckStatus,
   resolveDatabaseNodeHealth,
+  resolveMySQLClusterServiceStatus,
   resolveMySQLRuntimeHealth,
   type DatabaseHealth
 } from '../database/databaseHealth'
@@ -295,7 +294,6 @@ import {
   groupMySQLMaintenance,
   groupMySQLReconciliation,
   isMySQLBackupVerifiable,
-  latestVerifiableMySQLBackup,
   listMySQLBackups,
   mysqlOperationAvailability,
   selectMaintenanceDisasterBackup,
@@ -405,6 +403,7 @@ const backupListLoading = ref(false)
 const backupDialogVisible = ref(false)
 const backupDrawerVisible = ref(false)
 const restoreDialogVisible = ref(false)
+const restoreResumeMaintenance = ref(false)
 const disasterDialogVisible = ref(false)
 const maintenanceClearVisible = ref(false)
 const maintenanceClearConfirmed = ref(false)
@@ -1178,28 +1177,11 @@ function serviceStatus(nodes: DatabaseNode[]) {
 }
 
 function mysqlClusterServiceStatus(group: DatabaseGroup) {
-  const runtimeHealths = group.nodes.map((node) => mysqlRuntimeHealth(node))
-  if (!runtimeHealths.length) {
-    return 'unknown'
-  }
-  if (runtimeHealths.every((status) => status === 'offline')) {
-    return 'unavailable'
-  }
-  if (runtimeHealths.some((status) => status === 'probing')) {
-    return 'probing'
-  }
-  const clusterHealths = group.nodes.map((node) => baseNodeHealth(node))
-  const hasPrimary = !!groupCurrentPrimaryEndpoint(group)
-  if (hasPrimary && clusterHealths.every((status) => status === 'online')) {
-    return 'running'
-  }
-  if (runtimeHealths.every((status) => status === 'online')) {
-    return 'unavailable'
-  }
-  if (runtimeHealths.some((status) => status === 'online')) {
-    return 'degraded'
-  }
-  return 'unknown'
+  return resolveMySQLClusterServiceStatus({
+    runtimeHealths: group.nodes.map((node) => mysqlRuntimeHealth(node)),
+    checkHealths: group.nodes.map((node) => baseNodeHealth(node)),
+    hasPrimary: !!groupCurrentPrimaryEndpoint(group)
+  })
 }
 
 function groupStatus(nodeStatus: string, routerStatus: string, hasRouters: boolean) {
@@ -1402,6 +1384,7 @@ function emptyMysqlAvailability(): MySQLOperationAvailability {
     records: false,
     verify: false,
     restore: false,
+    resumeRestore: false,
     disaster: false,
     clearMaintenance: false,
     reconcile: false,
@@ -1482,6 +1465,7 @@ function mysqlRestoreTarget(group: DatabaseGroup | null): MySQLRestoreTarget & {
 function activateMySQLGroup(group: DatabaseGroup) {
   activeMysqlGroupKey.value = group.id
   activeBackup.value = null
+  restoreResumeMaintenance.value = false
   backupRecords.value = []
   backupListDefaults.value = { threads: 4, maxRateMBps: 0 }
 }
@@ -1520,20 +1504,10 @@ async function openMySQLBackupRecords(group: DatabaseGroup) {
   await refreshActiveBackups()
 }
 
-function compatibleBackup(group: DatabaseGroup) {
-  const target = mysqlRestoreTarget(group)
-  return backupRecords.value.find((record) => backupTargetCompatibility(record, target).compatible) || null
-}
-
-async function verifyLatestMySQLBackup(group: DatabaseGroup) {
-  if (!mysqlAvailability(group).verify) return
-  if (!await loadBackupsForGroup(group)) return
-  const record = latestVerifiableMySQLBackup(backupRecords.value)
-  if (!record) {
-    ElMessage.warning(t('database.mysqlBackup.noVerifiableBackup'))
-    return
-  }
-  await verifySelectedMySQLBackup(record)
+function openMySQLRestoreRecords(group: DatabaseGroup) {
+  const target = mysqlRestoreTarget(group).instanceId
+  if (!target) return
+  void router.push({ path: '/tasks', query: { typePrefix: 'apps.mysql.restore', target } })
 }
 
 async function verifySelectedMySQLBackup(record: MySQLBackupRecord) {
@@ -1546,22 +1520,32 @@ async function verifySelectedMySQLBackup(record: MySQLBackupRecord) {
   }
 }
 
-async function openLatestMySQLRestore(group: DatabaseGroup) {
-  if (!mysqlAvailability(group).restore) return
-  if (!await loadBackupsForGroup(group)) return
-  const record = compatibleBackup(group)
-  if (!record) {
-    backupDrawerVisible.value = true
-    ElMessage.warning(t('database.mysqlBackup.noCompatibleBackup'))
-    return
-  }
-  openSelectedMySQLRestore(record)
-}
-
 function openSelectedMySQLRestore(record: MySQLBackupRecord) {
   const group = activeMysqlGroup.value
   if (!group || !mysqlAvailability(group).restore || !backupTargetCompatibility(record, mysqlRestoreTarget(group)).compatible) return
   activeBackup.value = record
+  restoreResumeMaintenance.value = false
+  backupDrawerVisible.value = false
+  restoreDialogVisible.value = true
+}
+
+async function openMySQLMaintenanceResume(group: DatabaseGroup) {
+  const availability = mysqlAvailability(group)
+  const maintenance = mysqlGroupMaintenance(group)
+  if (!availability.resumeRestore || maintenance.kind !== 'required') return
+  if (!await loadBackupsForGroup(group)) return
+  const current = activeMysqlGroup.value
+  const currentMaintenance = current ? mysqlGroupMaintenance(current) : { kind: 'invalid' as const }
+  const record = currentMaintenance.kind === 'required'
+    ? backupRecords.value.find((candidate) => candidate.id === currentMaintenance.state.backupId) ?? null
+    : null
+  if (!current || currentMaintenance.kind !== 'required' || !mysqlAvailability(current).resumeRestore ||
+      !record || !backupTargetCompatibility(record, mysqlRestoreTarget(current)).compatible) {
+    ElMessage.warning(t('database.mysqlBackup.resumeBackupMissing'))
+    return
+  }
+  activeBackup.value = record
+  restoreResumeMaintenance.value = true
   backupDrawerVisible.value = false
   restoreDialogVisible.value = true
 }
@@ -1634,7 +1618,10 @@ function guardActiveBackupSubmission() {
 function guardActiveRestoreSubmission() {
   const group = activeMysqlGroup.value
   const backup = activeBackup.value
-  return !!group && !!backup && mysqlAvailability(group).restore && backupTargetCompatibility(backup, mysqlRestoreTarget(group)).compatible
+  if (!group || !backup || !backupTargetCompatibility(backup, mysqlRestoreTarget(group)).compatible) return false
+  if (!restoreResumeMaintenance.value) return mysqlAvailability(group).restore
+  const maintenance = mysqlGroupMaintenance(group)
+  return mysqlAvailability(group).resumeRestore && maintenance.kind === 'required' && maintenance.state.backupId === backup.id
 }
 
 function guardActiveDisasterSubmission() {
@@ -1665,11 +1652,11 @@ function mysqlClusterStartReason(group: DatabaseGroup) {
 
 function isMysqlClusterStartable(group: DatabaseGroup) {
   const nodes = group.nodes.filter((node) => !node.virtual)
-  return nodes.length === 3 && isMysqlClusterIneffective(group) && nodes.every((node) => mysqlRuntimeHealth(node) === 'online')
-}
-
-function isMysqlClusterIneffective(group: DatabaseGroup) {
-  return ['unavailable', 'degraded', 'failed', 'error'].includes(group.nodeStatus)
+  return canStartMySQLCluster({
+    runtimeHealths: nodes.map((node) => mysqlRuntimeHealth(node)),
+    checkHealths: nodes.map((node) => baseNodeHealth(node)),
+    hasPrimary: !!groupCurrentPrimaryEndpoint(group)
+  })
 }
 
 function mysqlRuntimeHealth(node: DatabaseNode): DatabaseHealth {

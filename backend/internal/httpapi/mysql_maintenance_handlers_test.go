@@ -212,7 +212,7 @@ func TestMySQLMaintenanceHandlerGateBlocksEveryOrdinaryStandaloneActionBeforeTas
 				req = httptest.NewRequest(http.MethodPost, "/api/v2/apps/instances/batch-delete", strings.NewReader(`{"instanceIds":["`+instance.ID+`"],"serverPasswords":{"`+server.ID+`":"unused"}}`))
 			case "backup":
 				api.apps = registry.New(newBackupHandlerModule())
-				req = httptest.NewRequest(http.MethodPost, "/api/v2/apps/instances/"+instance.ID+"/backup", strings.NewReader(`{}`))
+				req = httptest.NewRequest(http.MethodPost, "/api/v2/apps/instances/"+instance.ID+"/backup", strings.NewReader(`{"schemas":["orders"]}`))
 			case "restore":
 				api.apps = registry.New(newBackupHandlerModule())
 				req = httptest.NewRequest(http.MethodPost, "/api/v2/apps/instances/"+instance.ID+"/restore", strings.NewReader(`{"backupId":"backup_1234567890abcdef12345678","mode":"standalone","maintenanceConfirmed":true,"createPreRestoreBackup":true,"disasterConfirmed":false,"threads":4}`))
@@ -230,6 +230,46 @@ func TestMySQLMaintenanceHandlerGateBlocksEveryOrdinaryStandaloneActionBeforeTas
 			}
 		})
 	}
+}
+
+func TestMySQLMaintenanceHandlerAllowsSameBackupStandaloneResume(t *testing.T) {
+	api, db, secret := newAuthzTestAPI(t)
+	server, instance := saveMySQLBackupTarget(t, db, "standalone", "")
+	backup, err := db.SaveAppBackup(store.AppBackup{
+		App: "mysql", InstanceID: instance.ID, ServerID: server.ID, BackupType: "logical-full", Status: "success",
+		Path: filepathForTestBackup("maintenance-resume"), Checksum: strings.Repeat("a", 64), Size: 10, Metadata: `{}`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	marker := store.MySQLMaintenanceMarker{
+		Version: 1, State: "required", Reason: "restore_incomplete", Scope: "standalone",
+		BackupID: backup.ID, TaskID: "tsk_1234567890abcdef12345678",
+		RestorePhase: "schema_mutation_started", RecordedAt: time.Date(2026, 7, 28, 0, 0, 0, 0, time.UTC),
+	}
+	if err := db.SetMySQLMaintenance([]string{instance.ID}, marker); err != nil {
+		t.Fatal(err)
+	}
+	module := newBackupHandlerModule()
+	api.apps = registry.New(module)
+	body := `{"backupId":"` + backup.ID + `","mode":"standalone","maintenanceConfirmed":true,"createPreRestoreBackup":true,"disasterConfirmed":false,"resumeMaintenance":true,"threads":4}`
+	req := httptest.NewRequest(http.MethodPost, "/api/v2/apps/instances/"+instance.ID+"/restore", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+issueTestToken(t, db, secret, "owner", "owner"))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	api.Router().ServeHTTP(rec, req)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("resume restore status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	select {
+	case call := <-module.restoreCalls:
+		if call.request.Parameters["resumeMaintenance"] != true || call.request.Backup.ID != backup.ID {
+			t.Fatalf("resume restore request=%+v", call.request)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("resume restore worker did not call module")
+	}
+	close(module.restoreRelease)
 }
 
 func TestMySQLMaintenanceHandlerGateBlocksClusterStartBeforeTask(t *testing.T) {

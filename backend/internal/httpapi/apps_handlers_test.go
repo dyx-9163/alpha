@@ -17,17 +17,17 @@ import (
 )
 
 func TestDecodeMySQLBackupRequestAcceptsOnlyPositiveKeepLastOverride(t *testing.T) {
-	req := httptest.NewRequest(http.MethodPost, "/api/v2/apps/instances/instance-1/backup", strings.NewReader(`{"name":"nightly","threads":4,"maxRateMBps":64,"keepLast":8}`))
+	req := httptest.NewRequest(http.MethodPost, "/api/v2/apps/instances/instance-1/backup", strings.NewReader(`{"name":"nightly","threads":4,"maxRateMBps":64,"keepLast":8,"schemas":["orders","billing"]}`))
 	rec := httptest.NewRecorder()
 	body, ok := decodeMySQLBackupRequest(rec, req)
 	if !ok {
 		t.Fatalf("expected valid request, got status=%d body=%s", rec.Code, rec.Body.String())
 	}
-	if body.Name != "nightly" || body.Threads != 4 || body.MaxRateMBps != 64 || body.KeepLast == nil || *body.KeepLast != 8 {
+	if body.Name != "nightly" || body.Threads != 4 || body.MaxRateMBps != 64 || body.KeepLast == nil || *body.KeepLast != 8 || len(body.Schemas) != 2 {
 		t.Fatalf("unexpected decoded request: %#v", body)
 	}
 
-	omittedReq := httptest.NewRequest(http.MethodPost, "/api/v2/apps/instances/instance-1/backup", strings.NewReader(`{"name":"default-policy"}`))
+	omittedReq := httptest.NewRequest(http.MethodPost, "/api/v2/apps/instances/instance-1/backup", strings.NewReader(`{"name":"default-policy","schemas":["orders"]}`))
 	omittedRec := httptest.NewRecorder()
 	omitted, ok := decodeMySQLBackupRequest(omittedRec, omittedReq)
 	if !ok {
@@ -48,6 +48,8 @@ func TestDecodeMySQLBackupRequestRejectsRepositoryDirAndNonPositiveKeepLast(t *t
 		`{"name":"first"}{"repositoryDir":"/tmp/user-controlled"}`,
 		`null`,
 		`{"unknown":true}`,
+		`{"name":"nightly","schemas":[]}`,
+		`{"name":"nightly"}`,
 	}
 	for _, body := range tests {
 		t.Run(body, func(t *testing.T) {
@@ -235,6 +237,94 @@ func TestDeleteAppInstanceStoresPlanBeforeTaskRuns(t *testing.T) {
 	waitForTaskStatus(t, db, taskID, "success")
 	if module.deleteCalls != 1 {
 		t.Fatalf("expected delete module call, got %d", module.deleteCalls)
+	}
+}
+
+// Production break caught: failed InnoDB Cluster installation placeholders do
+// not have authoritative app_clusters rows, but selecting the complete failed
+// group must still create and run the cleanup task.
+func TestBatchDeleteAllowsCompleteFailedMySQLClusterCleanup(t *testing.T) {
+	api, db, secret := newAuthzTestAPI(t)
+	module := &fakePlannedLifecycleModule{name: "mysql"}
+	api.apps = registry.New(module)
+	const installTaskID = "tsk_1234567890abcdef12345678"
+	clusterID := "mysql-failed-" + installTaskID
+	passwords := map[string]string{}
+	instanceIDs := make([]string, 0, 3)
+	for index := 0; index < 3; index++ {
+		server, err := db.SaveServer(store.Server{
+			Name: fmt.Sprintf("mysql-failed-%d", index+1), Host: fmt.Sprintf("10.0.1.%d", index+1),
+			Username: "root", Password: "server-pass",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		instance, err := db.SaveAppInstance(store.AppInstance{
+			App: "mysql", Version: "8.0.36", ServerID: server.ID, Status: "failed", Topology: "innodb-cluster",
+			Metadata: fmt.Sprintf(`{"installFailed":true,"taskId":%q,"clusterId":%q,"topology":"innodb-cluster","port":3306}`, installTaskID, clusterID),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		passwords[server.ID] = "server-pass"
+		instanceIDs = append(instanceIDs, instance.ID)
+	}
+	body, _ := json.Marshal(map[string]any{"instanceIds": instanceIDs, "serverPasswords": passwords})
+	req := httptest.NewRequest(http.MethodPost, "/api/v2/apps/instances/batch-delete", strings.NewReader(string(body)))
+	req.Header.Set("Authorization", "Bearer "+issueTestToken(t, db, secret, "owner", "owner"))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	api.Router().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("expected failed cluster cleanup to be accepted, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	taskID := decodeTaskID(t, rec)
+	waitForTaskStatus(t, db, taskID, "success")
+	if module.deleteCalls != 3 {
+		t.Fatalf("expected all three failed placeholders to be cleaned, got %d delete calls", module.deleteCalls)
+	}
+}
+
+// Production break caught: a batch-aware application must validate once
+// before the worker starts and every per-item delete must receive the same
+// immutable selected-instance scope.
+func TestBatchDeletePreflightsAndFreezesSelectedScope(t *testing.T) {
+	api, db, secret := newAuthzTestAPI(t)
+	base := &fakePlannedLifecycleModule{name: "demo"}
+	module := &fakeBatchDeleteModule{fakePlannedLifecycleModule: base}
+	api.apps = registry.New(module)
+	passwords := map[string]string{}
+	ids := make([]string, 0, 2)
+	for index := 0; index < 2; index++ {
+		server, err := db.SaveServer(store.Server{Name: fmt.Sprintf("demo-%d", index), Host: fmt.Sprintf("10.0.2.%d", index+1), Username: "root", Password: "server-pass"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		instance, err := db.SaveAppInstance(store.AppInstance{App: "demo", Version: "1.0.0", ServerID: server.ID, Status: "installed"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		passwords[server.ID] = "server-pass"
+		ids = append(ids, instance.ID)
+	}
+	body, _ := json.Marshal(map[string]any{"instanceIds": ids, "serverPasswords": passwords})
+	req := httptest.NewRequest(http.MethodPost, "/api/v2/apps/instances/batch-delete", strings.NewReader(string(body)))
+	req.Header.Set("Authorization", "Bearer "+issueTestToken(t, db, secret, "owner", "owner"))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	api.Router().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	waitForTaskStatus(t, db, decodeTaskID(t, rec), "success")
+	if module.preflightCalls != 1 || base.deleteCalls != 2 {
+		t.Fatalf("preflightCalls=%d deleteCalls=%d", module.preflightCalls, base.deleteCalls)
+	}
+	if len(base.deleteScopes) != 2 || !reflect.DeepEqual(base.deleteScopes[0], ids) || !reflect.DeepEqual(base.deleteScopes[1], ids) {
+		t.Fatalf("delete scopes=%v want=%v", base.deleteScopes, ids)
 	}
 }
 
@@ -784,6 +874,7 @@ func decodeTaskID(t *testing.T, rec *httptest.ResponseRecorder) string {
 type fakePlannedLifecycleModule struct {
 	name                           string
 	deleteCalls                    int
+	deleteScopes                   [][]string
 	checkCalls                     int
 	installCalls                   int
 	clusterStartCalls              int
@@ -839,6 +930,19 @@ func (m *fakePlannedLifecycleModule) PlanDelete(ctx context.Context, req registr
 
 func (m *fakePlannedLifecycleModule) Delete(ctx context.Context, req registry.DeleteRequest, run registry.RunContext) error {
 	m.deleteCalls++
+	if req.Batch != nil {
+		m.deleteScopes = append(m.deleteScopes, req.Batch.IDs())
+	}
+	return nil
+}
+
+type fakeBatchDeleteModule struct {
+	*fakePlannedLifecycleModule
+	preflightCalls int
+}
+
+func (m *fakeBatchDeleteModule) PreflightDeleteBatch(ctx context.Context, requests []registry.DeleteRequest) error {
+	m.preflightCalls++
 	return nil
 }
 

@@ -138,6 +138,17 @@ describe('MySQL backup and restore surfaces', () => {
     track.mockReset()
     localStorage.clear()
     setLocale('en')
+	apiGet.mockResolvedValue({
+	  instanceId,
+	  sourceInstanceId: instanceId,
+	  sourceServerId: serverId,
+	  schemas: [
+		{ name: 'mysql', category: 'server-system', selectable: false, selectedByDefault: false },
+		{ name: 'mysql_innodb_cluster_metadata', category: 'cluster-metadata', selectable: false, selectedByDefault: false },
+		{ name: 'billing', category: 'business', selectable: true, selectedByDefault: true },
+		{ name: 'orders', category: 'business', selectable: true, selectedByDefault: true }
+	  ]
+	})
   })
 
   it('rechecks live state immediately before creating a backup', async () => {
@@ -176,10 +187,25 @@ describe('MySQL backup and restore surfaces', () => {
     await wrapper.findAllComponents(ElButton).at(-1)!.trigger('click')
     await flushPromises()
     expect(apiPost).toHaveBeenCalledWith(`/apps/instances/${instanceId}/backup`, {
-      name: 'nightly', threads: 6, maxRateMBps: 12, keepLast: 5
+	  name: 'nightly', threads: 6, maxRateMBps: 12, keepLast: 5, schemas: ['billing', 'orders']
     })
     expect(track).toHaveBeenCalledWith(taskId, expect.any(String))
   })
+
+	it('shows three schema categories and never enables system or cluster metadata schemas', async () => {
+	  const wrapper = mount(MySQLBackupDialog, {
+		...mountingOptions(),
+		props: { modelValue: true, instanceId, sourceLabel: 'mysql-primary', defaults: { threads: 4, maxRateMBps: 0 } }
+	  })
+	  await flushPromises()
+	  expect(wrapper.text()).toContain('MySQL Server system schemas')
+	  expect(wrapper.text()).toContain('MySQL Shell / InnoDB Cluster metadata')
+	  expect(wrapper.text()).toContain('Business schemas')
+	  const checks = wrapper.findAllComponents(ElCheckbox)
+	  expect(checks).toHaveLength(4)
+	  expect(checks.slice(0, 2).every((check) => check.props('disabled'))).toBe(true)
+	  expect(checks.slice(2).every((check) => check.props('modelValue'))).toBe(true)
+	})
 
   it('allows disabling the default pre-restore backup and submits the exact typed body', async () => {
     apiPost.mockResolvedValue({ taskId })
@@ -208,6 +234,37 @@ describe('MySQL backup and restore surfaces', () => {
       threads: 4
     })
     expect(track).toHaveBeenCalledWith(taskId, expect.any(String))
+  })
+
+  it('submits only the marker backup as an explicit maintenance resume', async () => {
+    apiPost.mockResolvedValue({ taskId })
+    const wrapper = mount(MySQLRestoreDialog, {
+      ...mountingOptions(),
+      props: {
+        modelValue: true,
+        backup,
+        target: { topology: 'standalone', mysqlVersion: '8.0.36', instanceId, serverId, label: 'mysql-primary' },
+        defaultThreads: 4,
+        resumeMaintenance: true
+      }
+    })
+    await flushPromises()
+    expect(wrapper.text()).toContain('Resume the incomplete restore with the original backup only')
+    const checks = wrapper.findAllComponents(ElCheckbox)
+    expect(checks[0].props('disabled')).toBe(true)
+    checks[1].vm.$emit('update:modelValue', true)
+    await wrapper.vm.$nextTick()
+    await wrapper.findAllComponents(ElButton).at(-1)!.trigger('click')
+    await flushPromises()
+    expect(apiPost).toHaveBeenCalledWith(`/apps/instances/${instanceId}/restore`, {
+      backupId: backup.id,
+      mode: 'standalone',
+      maintenanceConfirmed: true,
+      createPreRestoreBackup: false,
+      disasterConfirmed: false,
+      resumeMaintenance: true,
+      threads: 4
+    })
   })
 
   it('disables drawer restore for a full-version mismatch and exposes the localized reason', async () => {
@@ -364,6 +421,17 @@ describe('MySQL backup and restore surfaces', () => {
     })
     await flushPromises()
     const action = (label: string) => wrapper.findAllComponents(ElButton).find((button) => button.text() === label)!
+    const cardActionLabels = wrapper.find('.mysql-backup-actions').findAll('button').map((button) => button.text())
+    expect(cardActionLabels).toEqual(['Back up now', 'Backup records', 'Restore records'])
+    expect(cardActionLabels).not.toContain('Verify backup')
+    expect(cardActionLabels).not.toContain('Restore data')
+    await action('Restore records').trigger('click')
+    await flushPromises()
+    expect(router.currentRoute.value).toMatchObject({
+      path: '/tasks',
+      query: { typePrefix: 'apps.mysql.restore', target: instanceId }
+    })
+    await router.push('/')
     await action('Back up now').trigger('click')
     await flushPromises()
     expect(wrapper.findComponent(MySQLBackupDialog).props('modelValue')).toBe(true)

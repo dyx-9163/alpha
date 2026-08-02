@@ -136,7 +136,7 @@ func TestAppInstanceCollectorTimeoutDoesNotBlockOtherInstances(t *testing.T) {
 		t.Fatal(err)
 	}
 	manager := NewManager(db, nil, time.Minute)
-	manager.timeout = 25 * time.Millisecond
+	manager.appInstanceTimeout = 25 * time.Millisecond
 	manager.SetAppRegistry(registry.New(fakeCheckModule{
 		name: "mysql",
 		check: func(ctx context.Context, req registry.CheckRequest) (registry.InstanceStatus, error) {
@@ -192,7 +192,7 @@ func TestDockerSummaryCollectorTimeoutDoesNotBlockOtherHosts(t *testing.T) {
 		t.Fatal(err)
 	}
 	manager := NewManager(db, nil, time.Minute)
-	manager.timeout = 30 * time.Millisecond
+	manager.dockerSummaryTimeout = 30 * time.Millisecond
 	slowStarted := make(chan struct{})
 	var slowStartedOnce sync.Once
 	manager.dockerSummaryForServer = func(ctx context.Context, server store.Server) (adapter.DockerSummary, error) {
@@ -220,6 +220,17 @@ func TestDockerSummaryCollectorTimeoutDoesNotBlockOtherHosts(t *testing.T) {
 	}
 	if fastSnapshot.Status != "available" {
 		t.Fatalf("expected fast Docker host snapshot to be available, got %+v", fastSnapshot)
+	}
+}
+
+func TestCollectorUsesSeparateRemoteCheckTimeoutBudgets(t *testing.T) {
+	manager := NewManager(nil, nil, time.Minute)
+
+	if manager.dockerSummaryTimeout != 5*time.Second {
+		t.Fatalf("expected Docker summary timeout to remain 5s, got %s", manager.dockerSummaryTimeout)
+	}
+	if manager.appInstanceTimeout != 30*time.Second {
+		t.Fatalf("expected SSH-backed app check timeout to be 30s, got %s", manager.appInstanceTimeout)
 	}
 }
 

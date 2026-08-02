@@ -205,14 +205,30 @@ func (m Module) PlanDelete(ctx context.Context, req registry.DeleteRequest) ([]r
 	return installflow.RegistryPlan([]string{target}, steps), nil
 }
 
+func (m Module) PreflightDeleteBatch(ctx context.Context, requests []registry.DeleteRequest) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	instances := make([]store.AppInstance, 0, len(requests))
+	for _, request := range requests {
+		instances = append(instances, request.Instance)
+	}
+	language := ""
+	if len(requests) > 0 {
+		language = requests[0].Language
+	}
+	return m.service.preflightDeleteBatch(instances, language)
+}
+
 func (m Module) Delete(ctx context.Context, req registry.DeleteRequest, run registry.RunContext) error {
 	if !registry.DeleteConfirmedWithServerPassword(req) {
 		return errors.New(i18n.Text(req.Language, "api.deleteRequiresServerPasswordConfirmation"))
 	}
 	return m.service.Delete(ctx, DeleteRequest{
-		Instance: req.Instance,
-		Server:   req.Server,
-		Language: req.Language,
+		Instance:         req.Instance,
+		Server:           req.Server,
+		Language:         req.Language,
+		BatchPreflighted: req.Batch != nil && req.Batch.Includes(req.Instance.ID),
 	}, run.Log, func(target string) Logger {
 		return run.LoggerForTarget(target)
 	})

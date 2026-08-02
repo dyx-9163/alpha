@@ -117,6 +117,7 @@ func NewWithRealtime(cfg config.Config, s *store.Store, tasks *worker.Manager, e
 			r.Get("/apps/{app}/install-modules", api.appInstallModules)
 			r.Get("/apps/instances", api.appInstances)
 			r.Get("/apps/instances/{id}/backups", api.listMySQLBackups)
+			r.Get("/apps/instances/{id}/backup-schemas", api.listMySQLBackupSchemas)
 			r.Post("/apps/{app}/install", api.requirePermission(rbac.AppsManage, api.installApp))
 			r.Post("/apps/instances/{id}/backup", api.requirePermission(rbac.AppsManage, api.startMySQLBackup))
 			r.Post("/apps/instances/{id}/restore", api.requireOwner(api.startMySQLRestore))
@@ -275,10 +276,11 @@ type startMySQLClusterRequest struct {
 }
 
 type mysqlBackupRequest struct {
-	Name        string `json:"name"`
-	Threads     int    `json:"threads"`
-	MaxRateMBps int    `json:"maxRateMBps"`
-	KeepLast    *int   `json:"keepLast"`
+	Name        string   `json:"name"`
+	Threads     int      `json:"threads"`
+	MaxRateMBps int      `json:"maxRateMBps"`
+	KeepLast    *int     `json:"keepLast"`
+	Schemas     []string `json:"schemas"`
 }
 
 type mysqlRestoreRequest struct {
@@ -287,6 +289,7 @@ type mysqlRestoreRequest struct {
 	MaintenanceConfirmed   bool              `json:"maintenanceConfirmed"`
 	CreatePreRestoreBackup bool              `json:"createPreRestoreBackup"`
 	DisasterConfirmed      bool              `json:"disasterConfirmed"`
+	ResumeMaintenance      bool              `json:"resumeMaintenance"`
 	Threads                int               `json:"threads"`
 	TargetMapping          map[string]string `json:"targetMapping"`
 	ServerPasswords        map[string]string `json:"serverPasswords"`
@@ -314,7 +317,7 @@ func decodeMySQLRestoreRequest(w http.ResponseWriter, r *http.Request) (mysqlRes
 	validMode := request.Mode == "standalone" || request.Mode == "innodb-cluster" || request.Mode == "disaster-rebuild"
 	valid := request.BackupID != "" && validMode && request.MaintenanceConfirmed && request.Threads >= 1 && request.Threads <= 64
 	if request.Mode == "disaster-rebuild" {
-		valid = valid && request.DisasterConfirmed && len(request.TargetMapping) == 3 && len(request.ServerPasswords) == 3 && !request.CreatePreRestoreBackup
+		valid = valid && request.DisasterConfirmed && !request.ResumeMaintenance && len(request.TargetMapping) == 3 && len(request.ServerPasswords) == 3 && !request.CreatePreRestoreBackup
 	} else {
 		valid = valid && len(request.TargetMapping) == 0 && len(request.ServerPasswords) == 0
 	}
@@ -339,6 +342,15 @@ func (r *mysqlBackupRequest) UnmarshalJSON(data []byte) error {
 	}
 	if decoded.KeepLast != nil && *decoded.KeepLast <= 0 {
 		return errors.New("keepLast must be positive")
+	}
+	if len(decoded.Schemas) == 0 || len(decoded.Schemas) > 1024 {
+		return errors.New("schemas must contain at least one item")
+	}
+	for index := range decoded.Schemas {
+		decoded.Schemas[index] = strings.TrimSpace(decoded.Schemas[index])
+		if decoded.Schemas[index] == "" {
+			return errors.New("schemas must not contain blanks")
+		}
 	}
 	*r = mysqlBackupRequest(decoded)
 	return nil

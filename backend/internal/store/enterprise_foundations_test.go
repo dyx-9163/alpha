@@ -1,6 +1,8 @@
 package store
 
 import (
+	"database/sql"
+	"encoding/json"
 	"errors"
 	"path/filepath"
 	"strings"
@@ -213,6 +215,43 @@ func TestAppClusterReleaseAssetsAndBackups(t *testing.T) {
 	backups, err = db.ListAppBackups(instance.ID)
 	if err != nil || len(backups) != 1 {
 		t.Fatalf("expected backup record to be retained for audit, got %+v err=%v", backups, err)
+	}
+}
+
+// Production break caught: deleting app_cluster_members without pruning the
+// now-empty parent leaves a stale cluster card after the final node is gone.
+func TestDeleteAppInstancePrunesClusterOnlyAfterLastMember(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "aifar.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	cluster, err := db.SaveAppCluster(AppCluster{App: "mysql", Name: "aifarCluster", Topology: "innodb-cluster"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	instances := make([]AppInstance, 0, 2)
+	for _, serverID := range []string{"srv-1", "srv-2"} {
+		instance, err := db.SaveAppInstance(AppInstance{App: "mysql", Version: "8.0.36", ServerID: serverID, Status: "installed", Topology: "innodb-cluster"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.SaveAppClusterMember(AppClusterMember{ClusterID: cluster.ID, InstanceID: instance.ID, ServerID: serverID}); err != nil {
+			t.Fatal(err)
+		}
+		instances = append(instances, instance)
+	}
+	if err := db.DeleteAppInstance(instances[0].ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.GetAppCluster(cluster.ID); err != nil {
+		t.Fatalf("cluster with a remaining member was pruned: %v", err)
+	}
+	if err := db.DeleteAppInstance(instances[1].ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.GetAppCluster(cluster.ID); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("empty cluster still exists or returned unexpected error: %v", err)
 	}
 }
 
@@ -436,5 +475,218 @@ func TestStatusSnapshotHistoryOnlyRecordsChanges(t *testing.T) {
 	}
 	if len(history) != 2 || history[0].Status != "failed" || history[1].Status != "available" {
 		t.Fatalf("unexpected status history: %+v", history)
+	}
+}
+
+func TestLegacyMySQLClusterMigrationBackfillsAuthoritativeTopology(t *testing.T) {
+	databasePath := filepath.Join(t.TempDir(), "aifar.db")
+	db, err := Open(databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyClusterID := "mysql_cluster_1234567890abcdef12345678"
+	mysqlInstanceIDs := []string{
+		"app_111111111111111111111111",
+		"app_222222222222222222222222",
+		"app_333333333333333333333333",
+	}
+	serverIDs := []string{
+		"srv_111111111111111111111111",
+		"srv_222222222222222222222222",
+		"srv_333333333333333333333333",
+	}
+	for index := range mysqlInstanceIDs {
+		metadata, _ := json.Marshal(map[string]any{
+			"clusterId":   legacyClusterID,
+			"clusterName": "aifarCluster",
+			"endpoint":    "192.0.2." + string(rune('1'+index)) + ":3306",
+			"topology":    "innodb-cluster",
+		})
+		if _, err := db.SaveAppInstance(AppInstance{
+			ID: mysqlInstanceIDs[index], App: "mysql", Version: "8.0.36", ServerID: serverIDs[index],
+			Status: "installed", Topology: "innodb-cluster", Metadata: string(metadata),
+		}); err != nil {
+			db.Close()
+			t.Fatal(err)
+		}
+		routerMetadata, _ := json.Marshal(map[string]any{
+			"clusterId":   legacyClusterID,
+			"clusterName": "aifarCluster",
+			"endpoint":    "192.0.2." + string(rune('1'+index)) + ":6446",
+			"topology":    "router",
+		})
+		if _, err := db.SaveAppInstance(AppInstance{
+			ID: NewID("app"), App: "mysql-router", Version: "8.0.36", ServerID: serverIDs[index],
+			Status: "installed", Topology: "router", Metadata: string(routerMetadata),
+		}); err != nil {
+			db.Close()
+			t.Fatal(err)
+		}
+	}
+	if _, err := db.db.Exec(`delete from schema_migrations where version=2026073001`); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err = Open(databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	clusters, err := db.ListAppClusters("mysql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(clusters) != 1 || clusters[0].Name != "aifarCluster" || !strings.HasPrefix(clusters[0].ID, "cluster_") {
+		t.Fatalf("expected one controlled MySQL cluster, got %+v", clusters)
+	}
+	members, err := db.ListAppClusterMembers(clusters[0].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(members) != 3 {
+		t.Fatalf("expected three authoritative members, got %+v", members)
+	}
+	roles := map[string]int{}
+	for _, member := range members {
+		roles[member.Role]++
+		if member.Status != "ONLINE" {
+			t.Fatalf("member status=%q, want ONLINE", member.Status)
+		}
+	}
+	if roles["PRIMARY"] != 1 || roles["SECONDARY"] != 2 {
+		t.Fatalf("unexpected initial roles: %+v", roles)
+	}
+	instances, err := db.ListAppInstances()
+	if err != nil {
+		t.Fatal(err)
+	}
+	rewritten := 0
+	for _, instance := range instances {
+		var metadata map[string]any
+		if err := json.Unmarshal([]byte(instance.Metadata), &metadata); err != nil {
+			t.Fatal(err)
+		}
+		if metadata["clusterId"] == clusters[0].ID {
+			rewritten++
+		}
+		if metadata["clusterId"] == legacyClusterID {
+			t.Fatalf("legacy cluster ID remains on %s", instance.ID)
+		}
+	}
+	if rewritten != 6 {
+		t.Fatalf("rewritten instances=%d, want 6", rewritten)
+	}
+}
+
+func TestSaveAppClusterDeploymentRegistersInstancesAndMembersAtomically(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "aifar.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	clusterID := "cluster_1234567890abcdef12345678"
+	instances := []AppInstance{
+		{ID: "app_111111111111111111111111", App: "mysql", Version: "8.0.36", ServerID: "srv_111111111111111111111111", Status: "installed", Topology: "innodb-cluster", Metadata: `{"clusterId":"cluster_1234567890abcdef12345678"}`},
+		{ID: "app_222222222222222222222222", App: "mysql", Version: "8.0.36", ServerID: "srv_222222222222222222222222", Status: "installed", Topology: "innodb-cluster", Metadata: `{"clusterId":"cluster_1234567890abcdef12345678"}`},
+		{ID: "app_333333333333333333333333", App: "mysql", Version: "8.0.36", ServerID: "srv_333333333333333333333333", Status: "installed", Topology: "innodb-cluster", Metadata: `{"clusterId":"cluster_1234567890abcdef12345678"}`},
+	}
+	members := []AppClusterMember{
+		{ClusterID: clusterID, InstanceID: instances[0].ID, ServerID: instances[0].ServerID, Role: "PRIMARY", Status: "ONLINE"},
+		{ClusterID: clusterID, InstanceID: instances[1].ID, ServerID: instances[1].ServerID, Role: "SECONDARY", Status: "ONLINE"},
+		{ClusterID: clusterID, InstanceID: instances[2].ID, ServerID: instances[2].ServerID, Role: "SECONDARY", Status: "ONLINE"},
+	}
+	saved, err := db.SaveAppClusterDeployment(AppCluster{ID: clusterID, App: "mysql", Name: "aifarCluster", Topology: "innodb-cluster", Status: "active"}, instances, members)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(saved) != 3 {
+		t.Fatalf("saved instances=%d, want 3", len(saved))
+	}
+	cluster, err := db.GetAppCluster(clusterID)
+	if err != nil || cluster.Name != "aifarCluster" {
+		t.Fatalf("unexpected cluster=%+v err=%v", cluster, err)
+	}
+	gotMembers, err := db.ListAppClusterMembers(clusterID)
+	if err != nil || len(gotMembers) != 3 {
+		t.Fatalf("unexpected members=%+v err=%v", gotMembers, err)
+	}
+	if gotInstances, err := db.ListAppInstances(); err != nil || len(gotInstances) != 3 {
+		t.Fatalf("unexpected instances=%+v err=%v", gotInstances, err)
+	}
+}
+
+func TestSaveAppClusterDeploymentRollsBackEveryRecordWhenInstanceInsertFails(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "aifar.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.db.Exec(`create trigger reject_cluster_instance before insert on app_instances begin select raise(abort,'injected'); end`); err != nil {
+		t.Fatal(err)
+	}
+	clusterID := "cluster_1234567890abcdef12345678"
+	instance := AppInstance{ID: "app_111111111111111111111111", App: "mysql", Version: "8.0.36", ServerID: "srv_111111111111111111111111", Status: "installed", Topology: "innodb-cluster", Metadata: `{}`}
+	_, err = db.SaveAppClusterDeployment(
+		AppCluster{ID: clusterID, App: "mysql", Name: "aifarCluster", Topology: "innodb-cluster"},
+		[]AppInstance{instance},
+		[]AppClusterMember{{ClusterID: clusterID, InstanceID: instance.ID, ServerID: instance.ServerID, Role: "PRIMARY", Status: "ONLINE"}},
+	)
+	if err == nil {
+		t.Fatal("expected injected instance failure")
+	}
+	for _, table := range []string{"app_clusters", "app_instances", "app_cluster_members"} {
+		count, countErr := db.CountRows(table)
+		if countErr != nil || count != 0 {
+			t.Fatalf("%s count=%d err=%v, want empty rollback", table, count, countErr)
+		}
+	}
+}
+
+func TestLegacyMySQLClusterMigrationLeavesAmbiguousMembershipUntouched(t *testing.T) {
+	databasePath := filepath.Join(t.TempDir(), "aifar.db")
+	db, err := Open(databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyClusterID := "mysql_cluster_abcdef1234567890abcdef12"
+	for index, id := range []string{"app_aaaaaaaaaaaaaaaaaaaaaaaa", "app_bbbbbbbbbbbbbbbbbbbbbbbb", "app_cccccccccccccccccccccccc"} {
+		metadata := `{"clusterId":"` + legacyClusterID + `","clusterName":"ambiguous","topology":"innodb-cluster"}`
+		if _, err := db.SaveAppInstance(AppInstance{ID: id, App: "mysql", Version: "8.0.36", ServerID: "srv_duplicate", Status: "installed", Topology: "innodb-cluster", Metadata: metadata}); err != nil {
+			db.Close()
+			t.Fatal(err)
+		}
+		_ = index
+	}
+	if _, err := db.db.Exec(`delete from schema_migrations where version=2026073001`); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err = Open(databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	clusters, err := db.ListAppClusters("mysql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(clusters) != 0 {
+		t.Fatalf("ambiguous legacy group must not be repaired: %+v", clusters)
+	}
+	instances, err := db.ListAppInstances()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, instance := range instances {
+		if !strings.Contains(instance.Metadata, legacyClusterID) {
+			t.Fatalf("ambiguous instance was unexpectedly rewritten: %+v", instance)
+		}
 	}
 }

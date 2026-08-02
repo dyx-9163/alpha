@@ -26,6 +26,10 @@ type Store interface {
 	DeleteAppInstance(id string) error
 }
 
+type clusterDeploymentStore interface {
+	SaveAppClusterDeployment(store.AppCluster, []store.AppInstance, []store.AppClusterMember) ([]store.AppInstance, error)
+}
+
 type InstallRequest struct {
 	Version         string
 	Topology        string
@@ -38,9 +42,10 @@ type InstallRequest struct {
 }
 
 type DeleteRequest struct {
-	Instance store.AppInstance
-	Server   store.Server
-	Language string
+	Instance         store.AppInstance
+	Server           store.Server
+	Language         string
+	BatchPreflighted bool
 }
 
 type CheckRequest struct {
@@ -210,7 +215,7 @@ func (s Service) installInnoDBCluster(ctx context.Context, req InstallRequest, r
 	log.Info(copy.UsingArchive, bundle.ArchivePath)
 	log.Info(copy.UsingRPMs, len(bundle.RPMPaths))
 
-	clusterID := store.NewID("mysql_cluster")
+	clusterID := store.NewID("cluster")
 	clusterName := mysqlClusterName(req.Parameters)
 	preloadedServers := make(map[string]store.Server, len(targets))
 	nodes := make([]InnoDBClusterNode, 0, len(targets))
@@ -258,33 +263,68 @@ func (s Service) installInnoDBCluster(ctx context.Context, req InstallRequest, r
 		return err
 	}
 
-	for _, target := range targets {
+	registrar, ok := s.store.(clusterDeploymentStore)
+	if !ok {
+		return errors.New(copy.RecordFailed)
+	}
+	instances := make([]store.AppInstance, 0, len(targets))
+	members := make([]store.AppClusterMember, 0, len(targets))
+	for index, target := range targets {
+		server := preloadedServers[target]
+		metadata, _ := json.Marshal(map[string]any{
+			"clusterId":    clusterID,
+			"clusterName":  clusterName,
+			"resourcePath": bundle.ArchivePath,
+			"rpmCount":     len(bundle.RPMPaths),
+			"port":         options.Port,
+			"rootUser":     options.RootUser,
+			"endpoint":     fmt.Sprintf("%s:%d", server.Host, options.Port),
+			"topology":     "innodb-cluster",
+			"auth":         "password",
+		})
+		instance := store.AppInstance{
+			ID:       store.NewID("app"),
+			App:      "mysql",
+			Version:  bundle.Version,
+			ServerID: server.ID,
+			Status:   "installed",
+			Topology: "innodb-cluster",
+			Metadata: string(metadata),
+		}
+		role := "SECONDARY"
+		if index == 0 {
+			role = "PRIMARY"
+		}
+		instances = append(instances, instance)
+		members = append(members, store.AppClusterMember{
+			ClusterID: clusterID, InstanceID: instance.ID, ServerID: server.ID, Role: role, Status: "ONLINE",
+		})
+	}
+	clusterMetadata, _ := json.Marshal(map[string]any{
+		"resourcePath": bundle.ArchivePath,
+		"rpmCount":     len(bundle.RPMPaths),
+		"port":         options.Port,
+	})
+	var savedInstances []store.AppInstance
+	for index, target := range targets {
 		logForServer := logForTarget(log, targetLog, target)
 		step := newStepRunnerWithSteps(logForServer, recorder, target, copy, steps)
-		server := preloadedServers[target]
 		var instance store.AppInstance
 		if err := step(5, "record-instance", copy.RecordInstance, func() error {
-			metadata, _ := json.Marshal(map[string]any{
-				"clusterId":    clusterID,
-				"clusterName":  clusterName,
-				"resourcePath": bundle.ArchivePath,
-				"rpmCount":     len(bundle.RPMPaths),
-				"port":         options.Port,
-				"rootUser":     options.RootUser,
-				"endpoint":     fmt.Sprintf("%s:%d", server.Host, options.Port),
-				"topology":     "innodb-cluster",
-				"auth":         "password",
-			})
-			var saveErr error
-			instance, saveErr = s.store.SaveAppInstance(store.AppInstance{
-				App:      "mysql",
-				Version:  bundle.Version,
-				ServerID: server.ID,
-				Status:   "installed",
-				Topology: "innodb-cluster",
-				Metadata: string(metadata),
-			})
-			return saveErr
+			if index == 0 {
+				var saveErr error
+				savedInstances, saveErr = registrar.SaveAppClusterDeployment(store.AppCluster{
+					ID: clusterID, App: "mysql", Name: clusterName, Topology: "innodb-cluster", Status: "active", Metadata: string(clusterMetadata),
+				}, instances, members)
+				if saveErr != nil {
+					return saveErr
+				}
+			}
+			if len(savedInstances) != len(targets) {
+				return errors.New(copy.RecordFailed)
+			}
+			instance = savedInstances[index]
+			return nil
 		}); err != nil {
 			msg := fmt.Sprintf(copy.RecordFailed, err)
 			logForServer.Error("%s", msg)
@@ -566,11 +606,19 @@ func recordClusterBaseFailure(mu *sync.Mutex, failedTargets map[string]bool, fai
 }
 
 func (s Service) Delete(ctx context.Context, req DeleteRequest, log Logger, targetLog targetLogger) error {
-	if err := s.requireNoMySQLMaintenance(req.Instance, req.Language); err != nil {
-		return err
-	}
-	if err := s.requireNoMySQLReconciliation(req.Instance, req.Language); err != nil {
-		return err
+	if !s.isFreshFailedInstallCleanupInstance(req.Instance) {
+		if req.BatchPreflighted {
+			if err := s.requirePreflightedDeleteMember(req.Instance, req.Language); err != nil {
+				return err
+			}
+		} else {
+			if err := s.requireNoMySQLMaintenance(req.Instance, req.Language); err != nil {
+				return err
+			}
+			if err := s.requireNoMySQLReconciliation(req.Instance, req.Language); err != nil {
+				return err
+			}
+		}
 	}
 	copy := DeleteCopyFor(req.Language)
 	target := req.Instance.ServerID

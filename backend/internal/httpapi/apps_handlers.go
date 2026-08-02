@@ -3,6 +3,7 @@ package httpapi
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -87,9 +88,11 @@ func (a *API) deleteAppInstance(w http.ResponseWriter, r *http.Request) {
 		respond(w, nil, err)
 		return
 	}
-	if code := a.mysqlOrdinaryLifecycleGate(instance); code != "" {
-		writeError(w, http.StatusConflict, code, i18n.MySQLBackupErrorText(lang, code), map[string]any{"instanceId": instance.ID})
-		return
+	if !mysqlapp.IsFailedInstallCleanupInstance(instance) {
+		if code := a.mysqlOrdinaryLifecycleGate(instance); code != "" {
+			writeError(w, http.StatusConflict, code, i18n.MySQLBackupErrorText(lang, code), map[string]any{"instanceId": instance.ID})
+			return
+		}
 	}
 	lockSpecs, lockSpecErr := validatedAppMutationOperationLockSpecs("delete", []store.AppInstance{instance})
 	if lockSpecErr != nil {
@@ -194,6 +197,7 @@ type preparedDeleteInstance struct {
 	instance     store.AppInstance
 	server       store.Server
 	deleteModule registry.DeleteModule
+	deleteReq    registry.DeleteRequest
 	plan         []registry.InstallStepPlan
 }
 
@@ -229,9 +233,15 @@ func (a *API) deleteAppInstances(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "INSTANCE_SERVER_REQUIRED", i18n.Text(lang, "api.instanceServerRequired"), map[string]any{"instanceId": id})
 			return
 		}
-		if code := a.mysqlOrdinaryLifecycleGate(instance); code != "" {
-			writeError(w, http.StatusConflict, code, i18n.MySQLBackupErrorText(lang, code), map[string]any{"instanceId": instance.ID})
-			return
+		// InnoDB Cluster batches are validated as one frozen selection after
+		// acquiring the raw cluster lock. Other MySQL topologies retain the
+		// existing fail-fast handler guard before password/task processing.
+		isMySQLCluster := strings.EqualFold(strings.TrimSpace(instance.App), "mysql") && strings.EqualFold(strings.TrimSpace(instance.Topology), "innodb-cluster")
+		if !isMySQLCluster && !mysqlapp.IsFailedInstallCleanupInstance(instance) {
+			if code := a.mysqlOrdinaryLifecycleGate(instance); code != "" {
+				writeError(w, http.StatusConflict, code, i18n.MySQLBackupErrorText(lang, code), map[string]any{"instanceId": instance.ID})
+				return
+			}
 		}
 		server, err := a.store.GetServer(instance.ServerID, true)
 		if err != nil {
@@ -304,6 +314,7 @@ func (a *API) deleteAppInstances(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "DELETE_PLAN_FAILED", err.Error(), map[string]any{"app": items[index].instance.App, "instanceId": items[index].instance.ID})
 			return
 		}
+		items[index].deleteReq = deleteReq
 		items[index].plan = plan
 		combinedPlan = append(combinedPlan, plan...)
 	}
@@ -326,21 +337,25 @@ func (a *API) deleteAppInstances(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	if err := a.preflightBatchDelete(r.Context(), items, lang); err != nil {
+		a.releaseOperationLocks(locks)
+		_ = a.store.DeleteTask(task.ID)
+		code := "DELETE_PREFLIGHT_FAILED"
+		var stable interface{ StableCode() string }
+		if errors.As(err, &stable) && strings.TrimSpace(stable.StableCode()) != "" {
+			code = strings.TrimSpace(stable.StableCode())
+		}
+		writeError(w, http.StatusConflict, code, err.Error(), nil)
+		return
+	}
 	task, err = a.tasks.StartExistingWithLanguage(task, lang, func(ctx context.Context, log worker.Logger) error {
 		log.Info(i18n.Text(lang, "api.deleteInstancesRequested"), len(items), target)
 		for _, item := range items {
 			if err := ctx.Err(); err != nil {
 				return err
 			}
-			deleteReq := registry.DeleteRequest{
-				Instance:   item.instance,
-				Server:     item.server,
-				Language:   lang,
-				Actor:      actor,
-				Parameters: parameters,
-			}
 			log.Info(i18n.Text(lang, "api.deleteInstanceRequested"), item.instance.App, item.instance.ID)
-			if err := item.deleteModule.Delete(ctx, deleteReq, registry.RunContext{
+			if err := item.deleteModule.Delete(ctx, item.deleteReq, registry.RunContext{
 				TaskID: log.TaskID(),
 				Log:    log,
 				TargetLog: func(target string) registry.Logger {
@@ -361,6 +376,48 @@ func (a *API) deleteAppInstances(w http.ResponseWriter, r *http.Request) {
 		a.audit(r, taskType, target, "running", task.ID)
 	}
 	respondTask(w, task, err)
+}
+
+func (a *API) preflightBatchDelete(ctx context.Context, items []preparedDeleteInstance, lang string) error {
+	groups := map[string][]int{}
+	order := make([]string, 0)
+	for index := range items {
+		app := strings.ToLower(strings.TrimSpace(items[index].instance.App))
+		if _, exists := groups[app]; !exists {
+			order = append(order, app)
+		}
+		groups[app] = append(groups[app], index)
+	}
+	for _, app := range order {
+		indices := groups[app]
+		module, batchAware := items[indices[0]].deleteModule.(registry.BatchDeleteModule)
+		if !batchAware {
+			for _, index := range indices {
+				instance := items[index].instance
+				if mysqlapp.IsFailedInstallCleanupInstance(instance) {
+					continue
+				}
+				if code := a.mysqlOrdinaryLifecycleGate(instance); code != "" {
+					return errors.New(i18n.MySQLBackupErrorText(lang, code))
+				}
+			}
+			continue
+		}
+		requests := make([]registry.DeleteRequest, 0, len(indices))
+		instanceIDs := make([]string, 0, len(indices))
+		for _, index := range indices {
+			requests = append(requests, items[index].deleteReq)
+			instanceIDs = append(instanceIDs, items[index].instance.ID)
+		}
+		if err := module.PreflightDeleteBatch(ctx, requests); err != nil {
+			return err
+		}
+		scope := registry.NewDeleteBatchScope(instanceIDs)
+		for _, index := range indices {
+			items[index].deleteReq.Batch = scope
+		}
+	}
+	return nil
 }
 
 func (a *API) checkAppInstance(w http.ResponseWriter, r *http.Request) {

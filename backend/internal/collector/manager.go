@@ -30,7 +30,8 @@ type Manager struct {
 	alerts                 AlertEvaluator
 	apps                   *registry.Registry
 	interval               time.Duration
-	timeout                time.Duration
+	dockerSummaryTimeout   time.Duration
+	appInstanceTimeout     time.Duration
 	dockerSummaryForServer func(context.Context, store.Server) (adapter.DockerSummary, error)
 	dockerSummaryWorkers   int
 	startedCh              chan struct{}
@@ -44,7 +45,8 @@ func NewManager(s *store.Store, events Publisher, interval time.Duration) *Manag
 		store:                  s,
 		events:                 events,
 		interval:               interval,
-		timeout:                5 * time.Second,
+		dockerSummaryTimeout:   5 * time.Second,
+		appInstanceTimeout:     30 * time.Second,
 		dockerSummaryForServer: adapter.DockerSummaryForServer,
 		dockerSummaryWorkers:   8,
 		startedCh:              make(chan struct{}),
@@ -216,7 +218,7 @@ func (m *Manager) collectDockerSummaries(ctx context.Context) error {
 }
 
 func (m *Manager) collectOneDockerSummary(ctx context.Context, server store.Server) string {
-	child, cancel := context.WithTimeout(ctx, m.timeout)
+	child, cancel := context.WithTimeout(ctx, m.dockerSummaryTimeout)
 	summary, err := m.dockerSummaryForServer(child, server)
 	cancel()
 	status := "available"
@@ -306,7 +308,7 @@ func (m *Manager) collectOneAppInstance(ctx context.Context, instance store.AppI
 		}
 		return fmt.Errorf("%s: %s", instance.ID, errText)
 	}
-	child, cancel := context.WithTimeout(ctx, m.timeout)
+	child, cancel := context.WithTimeout(ctx, m.appInstanceTimeout)
 	defer cancel()
 	resultCh := make(chan appInstanceCheckResult, 1)
 	go func() {
@@ -370,13 +372,13 @@ func (m *Manager) saveAppInstanceCheckSnapshot(ctx context.Context, instance sto
 }
 
 func (m *Manager) saveAppInstanceTimeoutSnapshot(ctx context.Context, instance store.AppInstance) error {
-	errText := logmask.Mask("collector timeout after " + m.timeout.String())
+	errText := logmask.Mask("collector timeout after " + m.appInstanceTimeout.String())
 	status := registry.InstanceStatus{
 		Status:  "unavailable",
 		Message: errText,
 		Details: map[string]any{
 			"checkedAt": time.Now().UTC().Format(time.RFC3339),
-			"timeout":   m.timeout.String(),
+			"timeout":   m.appInstanceTimeout.String(),
 		},
 	}
 	if err := m.saveAppInstanceSnapshot(ctx, instance, status, errText); err != nil {
