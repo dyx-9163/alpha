@@ -7,7 +7,8 @@ export function applyRealtimeStatusToServer(server: ServerRecord, snapshot?: Sta
   const configuredAt = Date.parse(server.updatedAt ?? '')
   if (Number.isFinite(observedAt) && Number.isFinite(configuredAt) && observedAt < configuredAt) return server
 
-  const status = String(snapshot.status ?? '').trim()
+  if (typeof snapshot.status !== 'string') return server
+  const status = snapshot.status.trim()
   if (!status) return server
   const lastError = String(snapshot.lastError ?? '').trim()
   if (server.status === status && String(server.lastError ?? '') === lastError) return server

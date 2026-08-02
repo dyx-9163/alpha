@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { applyRealtimeStatusToServer } from './realtimeStatus'
+import type { StatusSnapshot } from '../stores/realtime'
 import type { ServerRecord } from './types'
 
 const server: ServerRecord = {
@@ -58,6 +59,17 @@ describe('applyRealtimeStatusToServer', () => {
       status: '   ',
       collectedAt: '2026-08-03T10:00:01Z'
     })
+
+    expect(result).toBe(server)
+  })
+
+  it('keeps the canonical server when the snapshot status is not a string', () => {
+    const result = applyRealtimeStatusToServer(server, {
+      scope: 'server',
+      resourceId: 'server-9',
+      status: { state: 'failed' },
+      collectedAt: '2026-08-03T10:00:01Z'
+    } as unknown as StatusSnapshot)
 
     expect(result).toBe(server)
   })
