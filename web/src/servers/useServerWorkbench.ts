@@ -1,6 +1,8 @@
 import { computed, reactive, ref } from 'vue'
 import { confirmAction } from '../composables/useConfirmAction'
+import type { StatusSnapshot } from '../stores/realtime'
 import { deleteServer, getServerDefaults, listServers, probeServer, reorderServers, saveServer, waitTaskDone } from './api'
+import { applyRealtimeStatusToServer } from './realtimeStatus'
 import type { ServerFormModel, ServerRecord } from './types'
 
 type ServerDefaults = {
@@ -10,6 +12,8 @@ type ServerDefaults = {
 const fallbackServerDefaults: ServerDefaults = {
   defaultDeployDir: '/aifar/apps'
 }
+
+export type ServerSnapshotResolver = (serverId: string) => StatusSnapshot | undefined
 
 export function createServerForm(row?: Partial<ServerRecord>, defaults: ServerDefaults = fallbackServerDefaults): ServerFormModel {
   return {
@@ -29,14 +33,16 @@ export function createServerForm(row?: Partial<ServerRecord>, defaults: ServerDe
   }
 }
 
-export function useServerWorkbench(t: (key: string, params?: Record<string, unknown>) => string) {
+export function useServerWorkbench(
+  t: (key: string, params?: Record<string, unknown>) => string,
+  resolveSnapshot: ServerSnapshotResolver = () => undefined
+) {
   const servers = ref<ServerRecord[]>([])
   const selectedId = ref('')
   const search = ref('')
   const drawer = ref(false)
   const activeTab = ref('overview')
   const probingIds = ref<Set<string>>(new Set())
-  const defaultProbeDone = ref(false)
   const serverDefaults = ref<ServerDefaults>({ ...fallbackServerDefaults })
   const form = reactive<ServerFormModel>(createServerForm(undefined, serverDefaults.value))
 
@@ -55,12 +61,22 @@ export function useServerWorkbench(t: (key: string, params?: Record<string, unkn
     unknown: servers.value.filter((server) => !server.status || server.status === 'unknown').length
   }))
 
+  function mergeLiveStatus(server: ServerRecord) {
+    return probingIds.value.has(server.id)
+      ? server
+      : applyRealtimeStatusToServer(server, resolveSnapshot(server.id))
+  }
+
   async function load() {
-    servers.value = await listServers()
+    servers.value = (await listServers()).map(mergeLiveStatus)
     if (!selectedId.value && servers.value.length) selectedId.value = servers.value[0].id
     if (selectedId.value && !servers.value.some((server) => server.id === selectedId.value)) {
       selectedId.value = servers.value[0]?.id ?? ''
     }
+  }
+
+  function applyStatusSnapshots() {
+    servers.value = servers.value.map(mergeLiveStatus)
   }
 
   async function loadDefaults() {
@@ -135,28 +151,6 @@ export function useServerWorkbench(t: (key: string, params?: Record<string, unkn
     }
   }
 
-  async function probeSelectedOnce() {
-    if (defaultProbeDone.value) {
-      return
-    }
-    defaultProbeDone.value = true
-    if (selectedServer.value) {
-      await probe(selectedServer.value)
-    }
-  }
-
-  async function probeAllOnce() {
-    if (defaultProbeDone.value) {
-      return
-    }
-    defaultProbeDone.value = true
-    const snapshot = servers.value.slice()
-    if (!snapshot.length) {
-      return
-    }
-    await Promise.allSettled(snapshot.map((server) => probe(server)))
-  }
-
   function setProbing(id: string, probing: boolean) {
     const next = new Set(probingIds.value)
     if (probing) {
@@ -189,7 +183,6 @@ export function useServerWorkbench(t: (key: string, params?: Record<string, unkn
     remove,
     reorder,
     probe,
-    probeSelectedOnce,
-    probeAllOnce
+    applyStatusSnapshots
   }
 }

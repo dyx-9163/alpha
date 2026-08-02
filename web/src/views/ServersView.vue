@@ -44,7 +44,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted } from 'vue'
+import { computed, onMounted, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import MetricGrid from '../components/MetricGrid.vue'
 import { usePermissions } from '../composables/usePermissions'
@@ -54,10 +54,12 @@ import ServerDetailPanel from '../servers/components/ServerDetailPanel.vue'
 import ServerFormDrawer from '../servers/components/ServerFormDrawer.vue'
 import ServerInventoryList from '../servers/components/ServerInventoryList.vue'
 import { useServerWorkbench } from '../servers/useServerWorkbench'
+import { useRealtimeStore } from '../stores/realtime'
 
 const { t } = useI18n()
 const { can, deniedText } = usePermissions()
 const canManageServers = computed(() => can(permissions.serversManage))
+const realtime = useRealtimeStore()
 const {
   filteredServers,
   selectedServer,
@@ -75,8 +77,8 @@ const {
   remove,
   reorder,
   probe,
-  probeAllOnce
-} = useServerWorkbench(t)
+  applyStatusSnapshots
+} = useServerWorkbench(t, (serverId) => realtime.serverSnapshot(serverId))
 
 const selectedProbing = computed(() => selectedServer.value ? probingIds.value.has(selectedServer.value.id) : false)
 const serverMetrics = computed(() => [
@@ -86,12 +88,13 @@ const serverMetrics = computed(() => [
   { label: t('servers.unknownCount'), value: summary.value.unknown }
 ])
 
+watch(() => realtime.statusRevision, () => {
+  applyStatusSnapshots()
+})
+
 onMounted(async () => {
   await loadDefaults()
   await load()
-  if (canManageServers.value) {
-    await probeAllOnce()
-  }
 })
 
 function ensureServerPermission() {
