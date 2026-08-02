@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -61,6 +62,42 @@ func TestAIFARReleaseDeleteBlockReason(t *testing.T) {
 			}
 			if block == nil || block.Code != tt.wantCode {
 				t.Fatalf("expected %s, got %+v", tt.wantCode, block)
+			}
+		})
+	}
+}
+
+func TestAIFARReleaseCurrentServiceRevisions(t *testing.T) {
+	tests := []struct {
+		name     string
+		metadata string
+		services []string
+		want     map[string]string
+	}{
+		{
+			name:     "service revision wins and current revision fills missing services",
+			metadata: `{"currentRevision":"release-live-bundle","serviceRevisions":{"gateway":"release-live-gateway","oauth":""}}`,
+			services: []string{"gateway", "oauth", ""},
+			want:     map[string]string{"gateway": "release-live-gateway", "oauth": "release-live-bundle"},
+		},
+		{
+			name:     "legacy release ID is the final fallback",
+			metadata: `{"releaseId":"release-live-legacy","serviceRevisions":{}}`,
+			services: []string{"oauth"},
+			want:     map[string]string{"oauth": "release-live-legacy"},
+		},
+		{
+			name:     "malformed metadata omits unknown revisions",
+			metadata: `{not-json}`,
+			services: []string{"oauth"},
+			want:     map[string]string{},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got := aifarReleaseCurrentServiceRevisions(store.AppInstance{Metadata: test.metadata}, test.services)
+			if !reflect.DeepEqual(got, test.want) {
+				t.Fatalf("revisions = %#v, want %#v", got, test.want)
 			}
 		})
 	}
@@ -132,23 +169,25 @@ func TestListAIFARReleasesReportsRollbackEligibility(t *testing.T) {
 	api, db, secret := newAuthzTestAPI(t)
 	instance, err := db.SaveAppInstance(store.AppInstance{
 		App: "aifar", Version: "runtime-v2", Status: "installed",
-		Metadata: `{"serviceRevisions":{"oauth":"release-current"}}`,
+		Metadata: `{"currentRevision":"release-live-bundle","serviceRevisions":{"oauth":"release-current","gateway":"release-live-gateway"}}`,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	manifest := func(releaseID string) string {
+	manifest := func(releaseID string, services ...string) string {
 		t.Helper()
+		artifacts := map[string]any{}
+		for _, service := range services {
+			artifacts[service] = map[string]any{
+				"file":       service + ".jar",
+				"sha256":     strings.Repeat("a", 64),
+				"remotePath": "/aifar/releases/" + releaseID + "/" + service + ".jar",
+			}
+		}
 		body, err := json.Marshal(map[string]any{
 			"kind":            "rollout",
-			"changedServices": []string{"oauth"},
-			"artifacts": map[string]any{
-				"oauth": map[string]any{
-					"file":       "oauth.jar",
-					"sha256":     strings.Repeat("a", 64),
-					"remotePath": "/aifar/releases/" + releaseID + "/oauth.jar",
-				},
-			},
+			"changedServices": services,
+			"artifacts":       artifacts,
 		})
 		if err != nil {
 			t.Fatal(err)
@@ -156,8 +195,8 @@ func TestListAIFARReleasesReportsRollbackEligibility(t *testing.T) {
 		return string(body)
 	}
 	for _, release := range []store.AppRelease{
-		{InstanceID: instance.ID, App: "aifar", Version: "runtime-v2", ReleaseID: "release-current", Status: "success", ManifestJSON: manifest("release-current"), CreatedAt: time.Now().UTC()},
-		{InstanceID: instance.ID, App: "aifar", Version: "runtime-v2", ReleaseID: "release-old", Status: "success", ManifestJSON: manifest("release-old"), CreatedAt: time.Now().Add(-time.Minute).UTC()},
+		{InstanceID: instance.ID, App: "aifar", Version: "runtime-v2", ReleaseID: "release-current", Status: "success", ManifestJSON: manifest("release-current", "oauth"), CreatedAt: time.Now().UTC()},
+		{InstanceID: instance.ID, App: "aifar", Version: "runtime-v2", ReleaseID: "release-old", Status: "success", ManifestJSON: manifest("release-old", "oauth", "gateway"), CreatedAt: time.Now().Add(-time.Minute).UTC()},
 	} {
 		if _, err := db.SaveAppRelease(release); err != nil {
 			t.Fatal(err)
@@ -173,13 +212,14 @@ func TestListAIFARReleasesReportsRollbackEligibility(t *testing.T) {
 	}
 	var response struct {
 		Items []struct {
-			ReleaseID                 string   `json:"releaseId"`
-			CurrentServices           []string `json:"currentServices"`
-			RollbackServices          []string `json:"rollbackServices"`
-			RollbackUnavailableReason string   `json:"rollbackUnavailableReason"`
-			RollbackAvailable         bool     `json:"rollbackAvailable"`
-			DeleteAvailable           bool     `json:"deleteAvailable"`
-			DeleteUnavailableReason   string   `json:"deleteUnavailableReason"`
+			ReleaseID                 string            `json:"releaseId"`
+			CurrentServices           []string          `json:"currentServices"`
+			RollbackServices          []string          `json:"rollbackServices"`
+			RollbackUnavailableReason string            `json:"rollbackUnavailableReason"`
+			RollbackAvailable         bool              `json:"rollbackAvailable"`
+			CurrentServiceRevisions   map[string]string `json:"currentServiceRevisions"`
+			DeleteAvailable           bool              `json:"deleteAvailable"`
+			DeleteUnavailableReason   string            `json:"deleteUnavailableReason"`
 		} `json:"items"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
@@ -190,6 +230,7 @@ func TestListAIFARReleasesReportsRollbackEligibility(t *testing.T) {
 		RollbackServices          []string
 		RollbackUnavailableReason string
 		RollbackAvailable         bool
+		CurrentServiceRevisions   map[string]string
 		DeleteAvailable           bool
 		DeleteUnavailableReason   string
 	}{}
@@ -199,16 +240,17 @@ func TestListAIFARReleasesReportsRollbackEligibility(t *testing.T) {
 			RollbackServices          []string
 			RollbackUnavailableReason string
 			RollbackAvailable         bool
+			CurrentServiceRevisions   map[string]string
 			DeleteAvailable           bool
 			DeleteUnavailableReason   string
-		}{row.CurrentServices, row.RollbackServices, row.RollbackUnavailableReason, row.RollbackAvailable, row.DeleteAvailable, row.DeleteUnavailableReason}
+		}{row.CurrentServices, row.RollbackServices, row.RollbackUnavailableReason, row.RollbackAvailable, row.CurrentServiceRevisions, row.DeleteAvailable, row.DeleteUnavailableReason}
 	}
 	current := rows["release-current"]
 	if len(current.CurrentServices) != 1 || current.CurrentServices[0] != "oauth" || current.RollbackUnavailableReason != "ALREADY_ACTIVE" || current.RollbackAvailable || len(current.RollbackServices) != 0 || current.DeleteAvailable || current.DeleteUnavailableReason != "AIFAR_RELEASE_DELETE_CURRENT" {
 		t.Fatalf("current release eligibility = %+v", current)
 	}
 	old := rows["release-old"]
-	if len(old.CurrentServices) != 0 || len(old.RollbackServices) != 1 || old.RollbackServices[0] != "oauth" || old.RollbackUnavailableReason != "" || !old.RollbackAvailable || !old.DeleteAvailable || old.DeleteUnavailableReason != "" {
+	if len(old.CurrentServices) != 0 || !reflect.DeepEqual(old.RollbackServices, []string{"oauth", "gateway"}) || old.RollbackUnavailableReason != "" || !old.RollbackAvailable || !reflect.DeepEqual(old.CurrentServiceRevisions, map[string]string{"oauth": "release-current", "gateway": "release-live-gateway"}) || !old.DeleteAvailable || old.DeleteUnavailableReason != "" {
 		t.Fatalf("old release eligibility = %+v", old)
 	}
 }

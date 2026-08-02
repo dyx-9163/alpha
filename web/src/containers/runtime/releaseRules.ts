@@ -3,6 +3,11 @@ import type { AifarRelease, RollbackUnavailableReason } from './types'
 
 export type { RollbackUnavailableReason } from './types'
 
+export type RuntimeReleaseScope = {
+  currentServices: string[]
+  totalServices: string[]
+}
+
 type RuntimeReleaseRollbackOptions = {
   canManage: boolean
   deniedText: string
@@ -48,4 +53,29 @@ export function runtimeReleaseRollbackDisabledReason(row: AifarRelease, options:
 export function runtimeReleaseRollbackServices(row: AifarRelease): string[] {
   if (!Array.isArray(row.rollbackServices)) return []
   return [...new Set(row.rollbackServices.filter((service) => typeof service === 'string' && service.trim() !== ''))]
+}
+
+export function runtimeReleaseScope(row: AifarRelease): RuntimeReleaseScope {
+  const currentServices = uniqueReleaseServices(row.currentServices)
+  return {
+    currentServices,
+    totalServices: uniqueReleaseServices([
+      ...(Array.isArray(row.changedServices) ? row.changedServices : []),
+      ...currentServices,
+      ...(Array.isArray(row.rollbackServices) ? row.rollbackServices : [])
+    ])
+  }
+}
+
+function uniqueReleaseServices(values?: string[]): string[] {
+  const services: string[] = []
+  const seen = new Set<string>()
+  for (const value of values ?? []) {
+    if (typeof value !== 'string') continue
+    const service = value.trim()
+    if (!service || seen.has(service)) continue
+    seen.add(service)
+    services.push(service)
+  }
+  return services
 }

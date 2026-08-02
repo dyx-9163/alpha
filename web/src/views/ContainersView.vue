@@ -212,6 +212,7 @@ import {
   runtimeReleaseRollbackDisabledReason,
   runtimeReleaseRollbackServices
 } from '../containers/runtime/releaseRules'
+import { promptRuntimeReleaseRollback } from '../containers/runtime/releaseImpact'
 import { useAifarRuntimeProvider } from '../containers/runtime/useAifarRuntimeProvider'
 import {
   parseRuntimeLogErrorEvent,
@@ -1193,7 +1194,7 @@ async function deleteAifarRelease(row: AifarRelease) {
       t('containers.confirmDeleteRelease', { release: row.releaseId }),
       t('containers.deleteRelease'),
       {
-        confirmButtonText: t('common.delete'),
+        confirmButtonText: t('containers.deleteRelease'),
         cancelButtonText: t('common.cancel'),
         type: 'warning',
         confirmButtonClass: 'el-button--danger'
@@ -1233,30 +1234,18 @@ async function rollbackAifarRelease(row: AifarRelease) {
     ElMessage.warning(t('containers.selectAifarInstance'))
     return
   }
-  let input = ''
+  let payload: Awaited<ReturnType<typeof promptRuntimeReleaseRollback>>
   try {
-    const result = await ElMessageBox.prompt(
-      t('containers.rollbackReasonPrompt', { release: row.releaseId }),
-      t('containers.rollbackRelease'),
-      {
-        inputType: 'textarea',
-        inputPlaceholder: t('containers.rollbackReasonPlaceholder'),
-        confirmButtonText: t('containers.rollbackRelease'),
-        cancelButtonText: t('common.cancel'),
-        type: 'warning',
-        inputValidator: (value) => Boolean(String(value || '').trim()) || t('containers.rollbackReasonRequired')
-      }
+    payload = await promptRuntimeReleaseRollback(
+      row,
+      t,
+      (message, title, options) => ElMessageBox.prompt(message, title, options)
     )
-    input = String(result.value || '').trim()
   } catch {
     return
   }
   try {
-    const result = await rollbackAifarReleaseRequest(instance.id, {
-      targetReleaseId: row.releaseId,
-      services,
-      reason: input
-    })
+    const result = await rollbackAifarReleaseRequest(instance.id, payload)
     trackTask(result.taskId, t('containers.rollbackRelease'))
     ElMessage.success(t('containers.rollbackAccepted'))
     aifarReleaseCache.value = {}

@@ -66,6 +66,7 @@ func (a *API) listAIFARReleases(w http.ResponseWriter, r *http.Request) {
 			})
 		}
 		item := aifarReleaseResponseItem(release, manifest, inspection)
+		item["currentServiceRevisions"] = aifarReleaseCurrentServiceRevisions(instance, inspection.RollbackServices)
 		deleteBlock := aifarReleaseDeleteBlockReason(instance, release)
 		item["deleteAvailable"] = deleteBlock == nil
 		item["deleteUnavailableReason"] = ""
@@ -112,6 +113,27 @@ func nonNilStrings(values []string) []string {
 		return []string{}
 	}
 	return values
+}
+
+func aifarReleaseCurrentServiceRevisions(instance store.AppInstance, services []string) map[string]string {
+	metadata := map[string]any{}
+	if strings.TrimSpace(instance.Metadata) != "" {
+		_ = json.Unmarshal([]byte(instance.Metadata), &metadata)
+	}
+	serviceRevisions := mapFromAny(metadata["serviceRevisions"])
+	fallback := stringFromAny(metadata["currentRevision"], stringFromAny(metadata["releaseId"], ""))
+	revisions := make(map[string]string, len(services))
+	for _, service := range services {
+		service = strings.TrimSpace(service)
+		if service == "" {
+			continue
+		}
+		revision := stringFromAny(serviceRevisions[service], fallback)
+		if revision != "" {
+			revisions[service] = revision
+		}
+	}
+	return revisions
 }
 
 func (a *API) deleteAIFARRelease(w http.ResponseWriter, r *http.Request) {

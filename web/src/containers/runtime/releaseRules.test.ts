@@ -2,7 +2,8 @@ import { describe, expect, it } from 'vitest'
 import {
   runtimeReleaseDeleteDisabledReason,
   runtimeReleaseRollbackDisabledReason,
-  runtimeReleaseRollbackServices
+  runtimeReleaseRollbackServices,
+  runtimeReleaseScope
 } from './releaseRules'
 import type { AifarRelease } from './types'
 
@@ -99,5 +100,18 @@ describe('runtime release deletion rules', () => {
       ...options,
       canManage: false
     })).toBe('permission denied')
+  })
+})
+
+describe('runtime release scope', () => {
+  it('builds an ordered service union while keeping the current subset distinct', () => {
+    expect(runtimeReleaseScope(release({
+      changedServices: ['oauth', 'gateway'],
+      currentServices: ['oauth', 'oauth', ''],
+      rollbackServices: ['gateway', 'file', 'gateway']
+    }))).toEqual({
+      currentServices: ['oauth'],
+      totalServices: ['oauth', 'gateway', 'file']
+    })
   })
 })

@@ -189,6 +189,7 @@ export type AifarRelease = {
   changedServices?: string[]
   currentServices?: string[]
   rollbackServices?: string[]
+  currentServiceRevisions?: Record<string, string>
   rollbackUnavailableReason?: RollbackUnavailableReason
   rollbackAvailable?: boolean
   deleteAvailable?: boolean

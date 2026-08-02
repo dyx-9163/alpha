@@ -8,25 +8,7 @@
     </div>
     <el-table :data="aifarReleases" height="calc(100% - 44px)" row-key="releaseId">
       <el-table-column :label="t('containers.releaseId')" min-width="240" show-overflow-tooltip>
-        <template #default="{ row }">
-          <el-space size="small">
-            <span>{{ row.releaseId }}</span>
-            <el-tooltip
-              v-if="releaseIsCurrent(row)"
-              :content="t('containers.releaseCurrentServices', { services: releaseCurrentServicesText(row) })"
-              placement="top"
-            >
-              <el-tag
-                data-testid="release-current-services"
-                size="small"
-                type="info"
-                :title="t('containers.releaseCurrentServices', { services: releaseCurrentServicesText(row) })"
-              >
-                {{ t('containers.releaseCurrent') }}
-              </el-tag>
-            </el-tooltip>
-          </el-space>
-        </template>
+        <template #default="{ row }">{{ row.releaseId }}</template>
       </el-table-column>
       <el-table-column :label="t('containers.releaseKind')" width="130">
         <template #default="{ row }">{{ releaseKindLabel(row.kind) }}</template>
@@ -39,32 +21,86 @@
       <el-table-column :label="t('containers.service')" min-width="150" show-overflow-tooltip>
         <template #default="{ row }">{{ releaseServicesText(row) }}</template>
       </el-table-column>
+      <el-table-column :label="t('containers.releaseCurrentScopeLabel')" min-width="180">
+        <template #default="{ row }">
+          <div v-if="runtimeReleaseScope(row).currentServices.length" class="release-scope-cell">
+            <el-tag
+              data-testid="release-current-scope"
+              size="small"
+              type="info"
+              :title="t('containers.releaseCurrentServices', { services: releaseCurrentServicesText(row) })"
+              :aria-label="t('containers.releaseCurrentServices', { services: releaseCurrentServicesText(row) })"
+            >
+              {{ t('containers.releaseCurrentScope', {
+                current: runtimeReleaseScope(row).currentServices.length,
+                total: runtimeReleaseScope(row).totalServices.length
+              }) }}
+            </el-tag>
+            <span
+              class="release-scope-services"
+              data-testid="release-current-service-list"
+              :title="releaseCurrentServicesText(row)"
+            >
+              {{ releaseCurrentServicesText(row) }}
+            </span>
+          </div>
+          <span v-else>—</span>
+        </template>
+      </el-table-column>
       <el-table-column prop="activatedAt" :label="t('containers.activatedAt')" min-width="170" show-overflow-tooltip>
         <template #default="{ row }">{{ releaseActivatedAtText(row) }}</template>
       </el-table-column>
-      <el-table-column :label="t('common.operation')" width="205" fixed="right">
+      <el-table-column :label="t('common.operation')" width="290" fixed="right">
         <template #default="{ row }">
-          <el-tooltip :content="releaseRollbackDisabledReason(row)" :disabled="!releaseRollbackDisabledReason(row)" placement="top">
-            <span>
-              <el-button size="small" type="warning" plain :disabled="Boolean(releaseRollbackDisabledReason(row))" @click="rollbackAifarRelease(row)">
-                {{ t('containers.rollbackRelease') }}
-              </el-button>
+          <div class="release-action-cell">
+            <div class="release-action-buttons">
+              <el-tooltip :content="releaseRollbackDisabledReason(row)" :disabled="!releaseRollbackDisabledReason(row)" placement="top">
+                <span>
+                  <el-button
+                    size="small"
+                    type="warning"
+                    plain
+                    :disabled="Boolean(releaseRollbackDisabledReason(row))"
+                    :aria-describedby="releaseRollbackDisabledReason(row) ? `release-rollback-reason-${row.releaseId}` : undefined"
+                    @click="rollbackAifarRelease(row)"
+                  >
+                    {{ t('containers.rollbackRelease') }}
+                  </el-button>
+                </span>
+              </el-tooltip>
+              <el-tooltip :content="releaseDeleteDisabledReason(row)" :disabled="!releaseDeleteDisabledReason(row)" placement="top">
+                <span>
+                  <el-button
+                    size="small"
+                    type="danger"
+                    plain
+                    :loading="releaseDeletingId === row.releaseId"
+                    :disabled="Boolean(releaseDeleteDisabledReason(row))"
+                    :aria-describedby="releaseDeleteDisabledReason(row) ? `release-delete-reason-${row.releaseId}` : undefined"
+                    @click="deleteAifarRelease(row)"
+                  >
+                    {{ t('containers.deleteRelease') }}
+                  </el-button>
+                </span>
+              </el-tooltip>
+            </div>
+            <span
+              v-if="releaseRollbackDisabledReason(row)"
+              :id="`release-rollback-reason-${row.releaseId}`"
+              class="release-action-reason"
+              data-testid="release-rollback-disabled-reason"
+            >
+              {{ releaseRollbackDisabledReason(row) }}
             </span>
-          </el-tooltip>
-          <el-tooltip :content="releaseDeleteDisabledReason(row)" :disabled="!releaseDeleteDisabledReason(row)" placement="top">
-            <span>
-              <el-button
-                size="small"
-                type="danger"
-                plain
-                :loading="releaseDeletingId === row.releaseId"
-                :disabled="Boolean(releaseDeleteDisabledReason(row))"
-                @click="deleteAifarRelease(row)"
-              >
-                {{ t('common.delete') }}
-              </el-button>
+            <span
+              v-if="releaseDeleteDisabledReason(row)"
+              :id="`release-delete-reason-${row.releaseId}`"
+              class="release-action-reason"
+              data-testid="release-delete-disabled-reason"
+            >
+              {{ releaseDeleteDisabledReason(row) }}
             </span>
-          </el-tooltip>
+          </div>
         </template>
       </el-table-column>
     </el-table>
@@ -75,6 +111,7 @@
 import StatusTag from '../../components/StatusTag.vue'
 import { useAifarRuntimeContext } from './context'
 import { releaseActivatedAtText } from './format'
+import { runtimeReleaseScope } from './releaseRules'
 
 const {
   t,
@@ -86,7 +123,6 @@ const {
   releaseStatusLabel,
   releaseServicesText,
   releaseCurrentServicesText,
-  releaseIsCurrent,
   releaseRollbackDisabledReason,
   rollbackAifarRelease,
   releaseDeletingId,

@@ -16,14 +16,15 @@ import type { AifarRelease } from './types'
 const tableRowsKey = Symbol('release-table-rows')
 
 describe('AifarRuntimeReleasesTab', () => {
-  it('marks current release services without marking a non-current release', () => {
+  it('shows the current service scope without marking a non-current release', () => {
     const wrapper = mountReleaseTab()
 
-    const current = wrapper.get('[data-testid="release-current-services"]')
-    expect(current.text()).toBe('Current')
+    const current = wrapper.get('[data-testid="release-current-scope"]')
+    expect(current.text()).toBe('Current 1/1')
     expect(current.attributes('title')).toContain('oauth')
+    expect(wrapper.get('[data-testid="release-current-service-list"]').text()).toBe('oauth')
     expect(wrapper.findAll('button').some((button) => button.text() === 'Roll back to this release')).toBe(true)
-    expect(wrapper.findAll('[data-testid="release-current-services"]')).toHaveLength(1)
+    expect(wrapper.findAll('[data-testid="release-current-scope"]')).toHaveLength(1)
   })
 
   it('does not invoke rollback for an already-active release', async () => {
@@ -41,10 +42,19 @@ describe('AifarRuntimeReleasesTab', () => {
   it('disables deletion for the current release and enables an eligible historical release', () => {
     const wrapper = mountReleaseTab()
 
-    const deleteButtons = wrapper.findAll('button').filter((button) => button.text() === 'Delete')
+    const deleteButtons = wrapper.findAll('button').filter((button) => button.text() === 'Delete release record')
     expect(deleteButtons).toHaveLength(2)
     expect(deleteButtons[0].attributes('disabled')).toBeDefined()
     expect(deleteButtons[1].attributes('disabled')).toBeUndefined()
+    const rollbackReason = wrapper.get('[data-testid="release-rollback-disabled-reason"]')
+    const deleteReason = wrapper.get('[data-testid="release-delete-disabled-reason"]')
+    expect(rollbackReason.text()).toBe('already active')
+    expect(deleteReason.text()).toBe('still used by a running service')
+    expect(rollbackReason.attributes('id')).toBe('release-rollback-reason-release-current')
+    expect(deleteReason.attributes('id')).toBe('release-delete-reason-release-current')
+    const rollbackButtons = wrapper.findAll('button').filter((button) => button.text() === 'Roll back to this release')
+    expect(rollbackButtons[0].attributes('aria-describedby')).toBe('release-rollback-reason-release-current')
+    expect(deleteButtons[0].attributes('aria-describedby')).toBe('release-delete-reason-release-current')
   })
 })
 
@@ -79,6 +89,7 @@ function mountReleaseTab({ rollback = vi.fn() }: { rollback?: ReturnType<typeof 
           props: { disabled: Boolean, loading: Boolean },
           setup(props, { slots, attrs }) {
             return () => h('button', {
+              ...attrs,
               disabled: props.disabled,
               onClick: (event: MouseEvent) => {
                 if (!props.disabled) (attrs.onClick as ((event: MouseEvent) => void) | undefined)?.(event)
@@ -120,6 +131,7 @@ function runtimeContext(rollback: ReturnType<typeof vi.fn>): AifarRuntimeContext
       releaseId: 'release-current',
       currentServices: ['oauth'],
       rollbackUnavailableReason: 'ALREADY_ACTIVE',
+      changedServices: ['oauth'],
       deleteAvailable: false,
       deleteUnavailableReason: 'AIFAR_RELEASE_DELETE_CURRENT'
     },
@@ -140,12 +152,18 @@ function runtimeContext(rollback: ReturnType<typeof vi.fn>): AifarRuntimeContext
     'containers.activatedAt': 'Activated at',
     'common.operation': 'Operation',
     'containers.rollbackRelease': 'Roll back to this release',
-    'common.delete': 'Delete',
+    'containers.deleteRelease': 'Delete release record',
     'containers.releaseCurrent': 'Current',
-    'containers.releaseCurrentServices': 'Current services: {services}'
+    'containers.releaseCurrentServices': 'Current services: {services}',
+    'containers.releaseCurrentScope': 'Current {current}/{total}',
+    'containers.releaseCurrentScopeLabel': 'Current scope',
+    'containers.releaseDeleteCurrentUnavailable': 'still used by a running service'
   }
   return {
-    t: (key: string, named?: Record<string, unknown>) => labels[key]?.replace('{services}', String(named?.services ?? '')) ?? key,
+    t: (key: string, named?: Record<string, unknown>) => labels[key]
+      ?.replace('{services}', String(named?.services ?? ''))
+      .replace('{current}', String(named?.current ?? ''))
+      .replace('{total}', String(named?.total ?? '')) ?? key,
     loading: computed(() => false),
     aifarReleases: ref(releases),
     loadAifarReleases: async () => {},
