@@ -535,8 +535,28 @@ func dialSSH(ctx context.Context, server store.Server) (*ssh.Client, error) {
 	if err != nil {
 		return nil, err
 	}
+	if deadline, ok := ctx.Deadline(); ok {
+		if err := conn.SetDeadline(deadline); err != nil {
+			_ = conn.Close()
+			return nil, err
+		}
+	}
+	stopCancel := context.AfterFunc(ctx, func() {
+		_ = conn.SetDeadline(time.Now())
+	})
 	c, chans, reqs, err := ssh.NewClientConn(conn, addr, cfg)
+	stopped := stopCancel()
 	if err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	if !stopped && ctx.Err() != nil {
+		_ = c.Close()
+		_ = conn.Close()
+		return nil, ctx.Err()
+	}
+	if err := conn.SetDeadline(time.Time{}); err != nil {
+		_ = c.Close()
 		_ = conn.Close()
 		return nil, err
 	}
