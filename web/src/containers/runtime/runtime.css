@@ -247,6 +247,14 @@
   min-height: 0;
 }
 
+.runtime-diagnostics-pagination {
+  display: flex;
+  flex: 0 0 auto;
+  justify-content: flex-end;
+  overflow-x: auto;
+  padding-top: 4px;
+}
+
 .runtime-diagnostics-stacked,
 .runtime-diagnostics-status {
   display: grid;
@@ -804,6 +812,10 @@
 
   .runtime-diagnostics-actions {
     flex-wrap: wrap;
+  }
+
+  .runtime-diagnostics-pagination {
+    justify-content: flex-start;
   }
 }
 

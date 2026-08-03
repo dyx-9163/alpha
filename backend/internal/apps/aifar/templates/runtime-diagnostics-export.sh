@@ -116,7 +116,12 @@ case "$base_name" in *.lck|*.idx) exit 0 ;; *.log|*.log.[A-Za-z0-9]*) ;; *) exit
 
 selected=0
 case "$relative" in *"$LOCAL_DATE"*) selected=1 ;; esac
-if [ "$IS_CURRENT_DATE" -eq 1 ]; then case "$relative" in */*) ;; *.log) selected=1 ;; esac; fi
+if [ "$IS_CURRENT_DATE" -eq 1 ]; then
+  case "$relative" in
+    *[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]*) ;;
+    *.log) selected=1 ;;
+  esac
+fi
 [ "$selected" -eq 1 ] || exit 0
 
 read -r initial_device initial_inode initial_size < <(stat -Lc '%d %i %s' -- "$source_descriptor") || exit 31

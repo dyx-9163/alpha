@@ -60,7 +60,12 @@ for service in $SERVICES; do
       case "${relative##*/}" in *.lck|*.idx) continue ;; *.log|*.log.[A-Za-z0-9]*) ;; *) continue ;; esac
       selected=0
       case "$relative" in *"$LOCAL_DATE"*) selected=1 ;; esac
-      if [ "$is_current" -eq 1 ]; then case "$relative" in */*) ;; *.log) selected=1 ;; esac; fi
+      if [ "$is_current" -eq 1 ]; then
+        case "$relative" in
+          *[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]*) ;;
+          *.log) selected=1 ;;
+        esac
+      fi
       [ "$selected" -eq 1 ] || continue
       case "$file_size" in ''|*[!0-9]*) exit 21 ;; esac
       service_files=$((service_files + 1))

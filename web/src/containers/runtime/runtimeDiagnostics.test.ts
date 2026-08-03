@@ -5,12 +5,13 @@ import {
   enabledRuntimeDiagnosticServices,
   runtimeDiagnosticCapacityBlocked,
   runtimeDiagnosticLimitRows,
+  runtimeDiagnosticLifecycle,
   runtimeDiagnosticRequestFingerprint,
   runtimeDiagnosticServicePreview,
   runtimeDiagnosticSubmitDisabledReason,
   terminalDiagnosticTaskToRefresh
 } from './runtimeDiagnostics'
-import type { RuntimeDiagnosticEstimate } from './types'
+import type { RuntimeDiagnosticEstimate, RuntimeDiagnosticExport } from './types'
 
 const estimate: RuntimeDiagnosticEstimate = {
   services: [{ service: 'gateway', candidateFiles: 2, candidateScanBytes: 1024 }],
@@ -73,10 +74,39 @@ describe('runtime diagnostic interactions', () => {
   })
 
   it('clears diagnostic rows immediately when the export scope changes', () => {
-    const cleared = emptyRuntimeDiagnosticExportPage()
+    const cleared = emptyRuntimeDiagnosticExportPage(1, 5)
 
-    expect(cleared).toEqual({ items: [], total: 0, page: 1, pageSize: 20 })
+    expect(cleared).toEqual({ items: [], total: 0, page: 1, pageSize: 5 })
     expect(cleared.items).toHaveLength(0)
+  })
+
+  it('shows the downloadable lifetime from ready time through automatic expiry', () => {
+    const row = {
+      status: 'ready',
+      createdAt: '2026-08-03T09:50:28Z',
+      readyAt: '2026-08-03T09:50:33Z',
+      expiresAt: '2026-08-04T09:50:33Z'
+    } as RuntimeDiagnosticExport
+
+    expect(runtimeDiagnosticLifecycle(row)).toEqual({
+      startsAt: '2026-08-03T09:50:33Z',
+      startsLabelKey: 'containers.diagnosticsReadyAt',
+      expiresAt: '2026-08-04T09:50:33Z'
+    })
+  })
+
+  it('falls back to creation time while an archive is not ready', () => {
+    const row = {
+      status: 'building',
+      createdAt: '2026-08-03T09:50:28Z',
+      expiresAt: '2026-08-04T09:50:28Z'
+    } as RuntimeDiagnosticExport
+
+    expect(runtimeDiagnosticLifecycle(row)).toEqual({
+      startsAt: '2026-08-03T09:50:28Z',
+      startsLabelKey: 'containers.created',
+      expiresAt: '2026-08-04T09:50:28Z'
+    })
   })
 
   it('shows every enforced byte limit from the estimate contract', () => {

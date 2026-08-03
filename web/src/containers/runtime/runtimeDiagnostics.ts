@@ -70,8 +70,17 @@ export function runtimeDiagnosticExportScopeFingerprint(query: string, instanceI
   return `${query}\u0000${instanceId}`
 }
 
-export function emptyRuntimeDiagnosticExportPage(): RuntimeDiagnosticExportPage {
-  return { items: [], total: 0, page: 1, pageSize: 20 }
+export function emptyRuntimeDiagnosticExportPage(page = 1, pageSize = 5): RuntimeDiagnosticExportPage {
+  return { items: [], total: 0, page, pageSize }
+}
+
+export function runtimeDiagnosticLifecycle(row: Pick<RuntimeDiagnosticExport, 'createdAt' | 'readyAt' | 'expiresAt'>) {
+  const readyAt = row.readyAt?.trim() || ''
+  return {
+    startsAt: readyAt || row.createdAt,
+    startsLabelKey: readyAt ? 'containers.diagnosticsReadyAt' as const : 'containers.created' as const,
+    expiresAt: row.expiresAt
+  }
 }
 
 export function trackRuntimeDiagnosticTask(

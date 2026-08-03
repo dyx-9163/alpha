@@ -42,7 +42,10 @@
       </el-table-column>
       <el-table-column :label="t('containers.diagnosticLifecycle')" min-width="180">
         <template #default="{ row }">
-          <div class="runtime-diagnostics-stacked"><span>{{ formatDate(row.createdAt) }}</span><span>{{ formatDate(row.expiresAt) }}</span></div>
+          <div class="runtime-diagnostics-stacked">
+            <span>{{ t(diagnosticLifecycle(row).startsLabelKey) }}: {{ formatDate(diagnosticLifecycle(row).startsAt) }}</span>
+            <span>{{ t('containers.diagnosticsExpiresAt') }}: {{ formatDate(diagnosticLifecycle(row).expiresAt) }}</span>
+          </div>
         </template>
       </el-table-column>
       <el-table-column :label="t('common.operation')" width="192" fixed="right">
@@ -56,6 +59,20 @@
       </el-table-column>
       <template #empty><span>{{ t('containers.diagnosticsNoRecords') }}</span></template>
     </el-table>
+
+    <div class="runtime-diagnostics-pagination">
+      <el-pagination
+        v-model:current-page="exportsPageNumber"
+        v-model:page-size="exportsPageSize"
+        small
+        background
+        layout="sizes, prev, pager, next, jumper"
+        :page-sizes="[5, 10, 20]"
+        :total="exportsPage.total"
+        @size-change="resetExportsPageAndLoad"
+        @current-change="loadExports"
+      />
+    </div>
 
     <el-dialog v-model="dialogVisible" :title="t('containers.diagnosticsRawExportTitle')" width="760px" class="runtime-diagnostics-dialog" @closed="resetDialog">
       <el-form label-position="top">
@@ -161,6 +178,7 @@ import {
   enabledRuntimeDiagnosticServices,
   runtimeDiagnosticCapacityBlocked,
   runtimeDiagnosticExportScopeFingerprint,
+  runtimeDiagnosticLifecycle,
   runtimeDiagnosticLimitRows,
   runtimeDiagnosticRequestFingerprint,
   runtimeDiagnosticServicePreview,
@@ -185,7 +203,9 @@ const selectedServices = ref<string[]>([])
 const localDate = ref(defaultRuntimeDiagnosticDate())
 const estimate = ref<RuntimeDiagnosticEstimate | null>(null)
 const estimateFingerprint = ref('')
-const exportsPage = ref<RuntimeDiagnosticExportPage>(emptyRuntimeDiagnosticExportPage())
+const exportsPageNumber = ref(1)
+const exportsPageSize = ref(5)
+const exportsPage = ref<RuntimeDiagnosticExportPage>(emptyRuntimeDiagnosticExportPage(exportsPageNumber.value, exportsPageSize.value))
 const estimating = ref(false)
 const submitting = ref(false)
 const trackedTaskIds = new Set<string>()
@@ -211,7 +231,8 @@ const submitDisabledReason = computed(() => runtimeDiagnosticSubmitDisabledReaso
 watch([selectedServices, localDate], invalidateEstimate, { deep: true })
 watch(() => [props.instanceId, props.targetQuery], () => {
   invalidateEstimate()
-  exportsPage.value = emptyRuntimeDiagnosticExportPage()
+  exportsPageNumber.value = 1
+  exportsPage.value = emptyRuntimeDiagnosticExportPage(exportsPageNumber.value, exportsPageSize.value)
   void loadExports()
 }, { immediate: true })
 watch(() => taskProgress.items.map(({ id, status }) => ({ id, status })), (items) => {
@@ -278,6 +299,7 @@ async function submit() {
     const result = await createRuntimeDiagnosticExport(props.targetQuery, request)
     trackTask(result.taskId, t('containers.diagnosticsExportTask'))
     dialogVisible.value = false
+    exportsPageNumber.value = 1
     await loadExports()
   } catch (err) {
     ElMessage.error(errorMessage(err))
@@ -291,18 +313,31 @@ async function loadExports() {
   const requestScope = runtimeDiagnosticExportScopeFingerprint(props.targetQuery, props.instanceId)
   if (!props.instanceId || !props.targetQuery) {
     if (requestSequence === exportsRequestSequence) {
-      exportsPage.value = emptyRuntimeDiagnosticExportPage()
+      exportsPage.value = emptyRuntimeDiagnosticExportPage(exportsPageNumber.value, exportsPageSize.value)
     }
     return
   }
   try {
-    const page = await fetchRuntimeDiagnosticExports(props.targetQuery, props.instanceId)
+    const page = await fetchRuntimeDiagnosticExports(props.targetQuery, props.instanceId, exportsPageNumber.value, exportsPageSize.value)
     if (requestSequence === exportsRequestSequence && requestScope === currentExportScope()) {
+      const maxPage = Math.max(1, Math.ceil(page.total / Math.max(1, page.pageSize)))
+      if (page.total > 0 && page.items.length === 0 && exportsPageNumber.value > maxPage) {
+        exportsPageNumber.value = maxPage
+        await loadExports()
+        return
+      }
       exportsPage.value = page
+      exportsPageNumber.value = page.page
+      exportsPageSize.value = page.pageSize
     }
   } catch (err) {
     if (requestSequence === exportsRequestSequence && requestScope === currentExportScope()) ElMessage.error(errorMessage(err))
   }
+}
+
+async function resetExportsPageAndLoad() {
+  exportsPageNumber.value = 1
+  await loadExports()
 }
 
 async function download(row: RuntimeDiagnosticExport) {
@@ -377,6 +412,10 @@ function formatDate(value?: string) {
 
 function servicePreview(row: RuntimeDiagnosticExport) {
   return runtimeDiagnosticServicePreview(row.services, 3)
+}
+
+function diagnosticLifecycle(row: RuntimeDiagnosticExport) {
+  return runtimeDiagnosticLifecycle(row)
 }
 
 function formatDurationRange(value: RuntimeDiagnosticEstimate) {

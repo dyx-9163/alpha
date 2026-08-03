@@ -1381,13 +1381,16 @@ func (f *runtimeDiagnosticExportShellFixture) render() string {
 func TestRuntimeDiagnosticExportRawSnapshotUsesOneServerLocalDate(t *testing.T) {
 	fixture := newRuntimeDiagnosticExportShellFixture(t)
 	active := []byte("unparsed active line\npassword=VisibleSecret\n")
+	nestedActive := []byte("nested java active line\n")
 	today := []byte("today rotated bytes\x00remain raw\n")
 	yesterday := []byte("yesterday bytes\n")
 	paths := map[string][]byte{
-		"active.log":                active,
-		"active.log.2026-07-27":     yesterday,
-		"2026-07-28/log_info.0.log": today,
-		"2026-07-27/log_info.0.log": yesterday,
+		"active.log":                                   active,
+		"active.log.2026-07-27":                        yesterday,
+		"alpha-gateway/log_info.log":                   nestedActive,
+		"alpha-gateway/info/log-info-2026-07-27.0.log": yesterday,
+		"2026-07-28/log_info.0.log":                    today,
+		"2026-07-27/log_info.0.log":                    yesterday,
 	}
 	for relative, content := range paths {
 		absolute := filepath.Join(fixture.installNative, "runtime", "logs", "gateway", filepath.FromSlash(relative))
@@ -1405,7 +1408,7 @@ func TestRuntimeDiagnosticExportRawSnapshotUsesOneServerLocalDate(t *testing.T) 
 	}
 	root := fixture.archiveBase + "/services/gateway/"
 	entries := runtimeDiagnosticStreamArchiveEntries(t, output)
-	if !slices.Contains(entries, root+"active.log") || !slices.Contains(entries, root+"2026-07-28/log_info.0.log") || slices.Contains(entries, root+"active.log.2026-07-27") || slices.Contains(entries, root+"2026-07-27/log_info.0.log") {
+	if !slices.Contains(entries, root+"active.log") || !slices.Contains(entries, root+"alpha-gateway/log_info.log") || !slices.Contains(entries, root+"2026-07-28/log_info.0.log") || slices.Contains(entries, root+"active.log.2026-07-27") || slices.Contains(entries, root+"alpha-gateway/info/log-info-2026-07-27.0.log") || slices.Contains(entries, root+"2026-07-27/log_info.0.log") {
 		t.Fatalf("unexpected current-day archive entries: %v", entries)
 	}
 	if got := []byte(runtimeDiagnosticStreamArchiveFile(t, output, root+"active.log")); !bytes.Equal(got, active) {
@@ -1413,6 +1416,9 @@ func TestRuntimeDiagnosticExportRawSnapshotUsesOneServerLocalDate(t *testing.T) 
 	}
 	if got := []byte(runtimeDiagnosticStreamArchiveFile(t, output, root+"2026-07-28/log_info.0.log")); !bytes.Equal(got, today) {
 		t.Fatalf("dated log bytes changed: got=%q want=%q", got, today)
+	}
+	if got := []byte(runtimeDiagnosticStreamArchiveFile(t, output, root+"alpha-gateway/log_info.log")); !bytes.Equal(got, nestedActive) {
+		t.Fatalf("nested active log bytes changed: got=%q want=%q", got, nestedActive)
 	}
 	activeSHA := sha256.Sum256(active)
 	manifest := runtimeDiagnosticStreamArchiveFile(t, output, fixture.archiveBase+"/manifest.json")
@@ -1527,10 +1533,12 @@ func TestRuntimeDiagnosticExportCurrentDateAllowsAppendAfterFixedLengthSnapshot(
 func TestRuntimeDiagnosticEstimateSelectsExactlyOneServerLocalDate(t *testing.T) {
 	fixture := newRuntimeDiagnosticExportShellFixture(t)
 	for relative, content := range map[string]string{
-		"active.log":                "active bytes\n",
-		"2026-07-27/log_info.0.log": "history bytes\n",
-		"2026-07-28/log_info.0.log": "today bytes\n",
-		"2026-07-28/index.log.lck":  "lock bytes\n",
+		"active.log":                 "active bytes\n",
+		"alpha-gateway/log_info.log": "nested active bytes\n",
+		"alpha-gateway/info/log-info-2026-07-27.0.log": "old nested rotation\n",
+		"2026-07-27/log_info.0.log":                    "history bytes\n",
+		"2026-07-28/log_info.0.log":                    "today bytes\n",
+		"2026-07-28/index.log.lck":                     "lock bytes\n",
 	} {
 		absolute := filepath.Join(fixture.installNative, "runtime", "logs", "gateway", filepath.FromSlash(relative))
 		if err := os.MkdirAll(filepath.Dir(absolute), 0o755); err != nil {
@@ -1547,8 +1555,8 @@ func TestRuntimeDiagnosticEstimateSelectsExactlyOneServerLocalDate(t *testing.T)
 		wantBytes int64
 		current   bool
 	}{
-		{localDate: "2026-07-28", wantFiles: 2, wantBytes: int64(len("active bytes\n") + len("today bytes\n")), current: true},
-		{localDate: "2026-07-27", wantFiles: 1, wantBytes: int64(len("history bytes\n"))},
+		{localDate: "2026-07-28", wantFiles: 3, wantBytes: int64(len("active bytes\n") + len("nested active bytes\n") + len("today bytes\n")), current: true},
+		{localDate: "2026-07-27", wantFiles: 2, wantBytes: int64(len("old nested rotation\n") + len("history bytes\n"))},
 	} {
 		t.Run(test.localDate, func(t *testing.T) {
 			script, err := renderRuntimeDiagnosticEstimateScript(runtimeDiagnosticEstimateScriptData{

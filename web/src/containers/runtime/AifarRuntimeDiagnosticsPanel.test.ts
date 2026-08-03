@@ -32,6 +32,7 @@ describe('AIFAR Runtime diagnostic archives', () => {
     })
     app.component('ElTable', tableStub)
     app.component('ElDatePicker', datePickerStub)
+    app.component('ElPagination', paginationStub)
     for (const name of ['ElAlert', 'ElButton', 'ElCheckbox', 'ElCheckboxGroup', 'ElDialog', 'ElForm', 'ElFormItem', 'ElRadioButton', 'ElRadioGroup', 'ElTableColumn', 'ElTag', 'ElTooltip']) {
       app.component(name, passThroughComponent)
     }
@@ -51,6 +52,7 @@ describe('AIFAR Runtime diagnostic archives', () => {
     })
     app.component('ElTable', tableStub)
     app.component('ElDatePicker', datePickerStub)
+    app.component('ElPagination', paginationStub)
     for (const name of ['ElAlert', 'ElButton', 'ElCheckbox', 'ElCheckboxGroup', 'ElDialog', 'ElForm', 'ElFormItem', 'ElRadioButton', 'ElRadioGroup', 'ElTableColumn', 'ElTag', 'ElTooltip']) {
       app.component(name, passThroughComponent)
     }
@@ -59,6 +61,28 @@ describe('AIFAR Runtime diagnostic archives', () => {
 
     expect(html).toContain('data-picker-type="date"')
     expect(html).toContain('data-value-format="YYYY-MM-DD"')
+  })
+
+  it('renders server-backed archive pagination with compact page sizes', async () => {
+    const app = createSSRApp({
+      render: () => h(AifarRuntimeDiagnosticsPanel, {
+        instanceId: '',
+        deployments: [],
+        targetQuery: ''
+      })
+    })
+    app.component('ElTable', tableStub)
+    app.component('ElDatePicker', datePickerStub)
+    app.component('ElPagination', paginationStub)
+    for (const name of ['ElAlert', 'ElButton', 'ElCheckbox', 'ElCheckboxGroup', 'ElDialog', 'ElForm', 'ElFormItem', 'ElRadioButton', 'ElRadioGroup', 'ElTableColumn', 'ElTag', 'ElTooltip']) {
+      app.component(name, passThroughComponent)
+    }
+
+    const html = await renderToString(app)
+
+    expect(html).toContain('data-pagination-layout="sizes, prev, pager, next, jumper"')
+    expect(html).toContain('data-pagination-page-size="5"')
+    expect(html).toContain('data-pagination-page-sizes="5,10,20"')
   })
 })
 
@@ -75,6 +99,24 @@ const datePickerStub = defineComponent({
     return () => h('span', {
       'data-picker-type': attrs.type,
       'data-value-format': attrs['value-format']
+    })
+  }
+})
+
+const paginationStub = defineComponent({
+  inheritAttrs: false,
+  props: {
+    currentPage: Number,
+    pageSize: Number,
+    pageSizes: Array,
+    layout: String
+  },
+  emits: ['update:currentPage', 'update:pageSize', 'size-change', 'current-change'],
+  setup(props) {
+    return () => h('span', {
+      'data-pagination-layout': props.layout,
+      'data-pagination-page-size': props.pageSize,
+      'data-pagination-page-sizes': Array.isArray(props.pageSizes) ? props.pageSizes.join(',') : ''
     })
   }
 })

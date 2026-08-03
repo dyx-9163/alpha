@@ -1272,3 +1272,63 @@
 - 结论：单机超时 5 秒、最大并发 8，只验证 SSH 建连认证；单机失败写脱敏后的 failed 快照但不判定整个 Collector 失败，后台不周期性展示 probing，不修改服务器基础记录；SSE 重连后加载最新快照，凭据不进入快照、事件、日志或前端。当前待确认具体代码范围、测试和验收门禁。
 - 问题：用户确认服务器状态后端主动推送的完整改动范围与验收门禁。
 - 结论：设计文档已写入 `docs/superpowers/specs/2026-08-03-server-status-backend-push-design.md` 并以提交 `feac2d97` 单独提交；范围包括 Collector 轻量 SSH 探测、仅 server 状态变化时 SSE 推送、服务器页取消自动批量探测、快照原地合并，以及 Go/前端测试和页面无新增 probe 任务验收。等待用户审阅书面设计后再编写实现计划。
+- 问题：用户要求先确认代码提交，再编写服务器状态主动推送的实现计划。
+- 结论：现有代码已由基线提交 `22fc1ae7` 提交并同步到当前远端分支，工作区恢复干净；实现计划已写入 `docs/superpowers/plans/2026-08-03-server-status-backend-push.md`，并通过 `8999bdfa`、`a5c61575` 提交。计划拆为 SSH 握手 deadline、后端 Collector、前端快照合并、服务器页取消自动探测、集成验收五个任务，等待用户选择执行方式。
+- 问题：服务器状态 Collector 首版无法区分 `GetServer(id, true)` 的数据库读取错误与凭据解密错误，可能把数据库故障误记为单机不可达。
+- 结论：Store 现以 `ErrServerCredentialDecryption` 标识服务器凭据解密失败；Collector 只将该错误和 SSH 探测失败写为脱敏的 failed 快照，其他 GetServer 查询/扫描错误直接上抛并使采集失败。新增真实 SQLite 回归覆盖 ListServers 成功后 GetServer 扫描失败且不落状态快照。
+- 问题：服务器后台采集需要按现有周期执行轻量 SSH 状态探测，并仅在状态快照变化时推送事件。
+- 结论：Collector 已通过固定工作池（默认 8）和单机 5 秒超时执行 SSH 探测；凭据仅解密后传给探测函数，失败信息脱敏写入 server 快照，不修改服务器基础记录、不创建任务或审计；server 快照未变化时不再重复推送 SSE，其他快照仍保持每轮推送。
+- 问题：服务器状态后台采集前，需要让 SSH 探测在 SSH banner/握手阻塞时仍遵守调用方 context deadline。
+- 结论：`dialSSH` 已在 `ssh.NewClientConn` 前设置连接 deadline，并用 `context.AfterFunc` 中断纯取消；成功握手后清除临时 deadline。真实 loopback stalled-banner 回归测试在改动前约 501ms 失败、改动后通过；adapter 全套测试通过。实现提交为 `ce436d77`。
+- 问题：为服务器状态 SSE 快照增加前端类型边界和保守合并逻辑。
+- 结论：实时 store 现以 `server:<id>` 暴露 `serverSnapshot`；纯 helper 只在 scope/id 匹配且快照采集时间不早于服务器规范更新时间时，合并 `status` 与 `lastError`，不复制 payload 字段。实现已由 focused Vitest 与前端构建验证，提交为 `9386474d`。
+- 问题：Task 3 审查发现运行时非字符串 status 会被转换为 `[object Object]` 并错误覆盖服务器状态。
+- 结论：`applyRealtimeStatusToServer` 现显式要求 status 为 string；非字符串与空白值均保留原对象。回归测试和前端构建已通过，修复提交为 `2c6a2889`。
+- 问题：服务器工作台接入实时 server 快照，并取消进入页面时自动创建探测任务。
+- 结论：`useServerWorkbench` 通过可注入 resolver 在列表加载和 `statusRevision` 变化时原地合并快照，手工探测中的服务器保持 `probing` 且任务结束后重新加载；`ServersView` 进入时只加载默认值和列表，显式“探测主机”入口保持不变。前端 362 个测试与生产构建通过，提交为 `b4b51a9e`。
+- 问题：Task 4 审查发现手工探测未完成时点击刷新会用 API 行覆盖本地 `probing` 状态。
+- 结论：工作台对 `probingIds` 中的服务器在任何列表/快照合并路径都强制保留 `status=probing` 和空 `lastError`，同时允许其他规范字段刷新；任务完成后清除本地覆盖并重新加载实时状态。延迟任务刷新回归、前端 362 个测试及生产构建通过，修复提交为 `677cf213`。
+- 问题：服务器页改为后端主动状态推送后的可复用验收结论。
+- 结论：页面进入不再创建 `servers.probe` 任务；Collector 每 15 秒以 8 个 worker、单机 5 秒 SSH 检查采集状态，变化通过 `status.server.updated` 推送；列表搜索、选择和详情页签等交互状态在快照更新时保留。
+- 问题：服务器状态 SSE 订阅积压超过 64 个变化时可能静默丢失最终状态，且前端会把非字符串状态或错误强制转换为文本。
+- 结论：Realtime Hub 现以单个 `realtime.gap` 合并订阅积压溢出，前端收到后按单次在途加一次跟进的方式重载持久化快照；SSE 与快照 GET 的 `status`、`lastError` 在字符串转换前执行严格类型校验，避免无效值进入服务器行。
+- 问题：单个 `realtime.gap` 的快照恢复请求若瞬时失败，会消耗唯一恢复信号并让页面长期停留在旧服务器状态。
+- 结论：Gap 恢复现以 1 秒起步、上限 30 秒的退避持续重试至成功或断开；后续 gap 与在途请求合并，disconnect/reconnect 清理重试状态并用 generation 阻止旧请求在 teardown 后写入快照。
+- 问题：用户选择将服务器状态后端主动推送功能分支本地合并回 `codex/status-collector-realtime`。
+- 结论：已 fast-forward 到 `44d1694a`，合并结果的后端全量测试、前端 371 项测试和生产构建通过；隔离 worktree 与已合并本地分支已清理，复用结论完整保留在未暂存的 `memory.md`。
+- 问题：用户提供 AIFAR Runtime“发布历史”截图，询问还有哪些问题需要修复。
+- 结论：现有后端已按服务区分 `currentServices`/`rollbackServices` 并阻止删除当前记录，剩余最高优先级问题是 UI 未直观解释“当前”只覆盖部分服务、回滚确认未展示实际受影响服务和源/目标版本、删除按钮仍简称“删除”而实际仅删除面板记录；其次应补发布详情/任务审计入口、明确时区和技术发布 ID、合并多处刷新并补可聚焦的禁用原因及失败/空状态。
+- 问题：用户要求继续处理发布历史审计发现的问题。
+- 结论：当前进入交互设计确认阶段；拟优先实现当前服务范围可视化、回滚影响预览和“删除记录”语义/禁用原因，是否同时纳入发布详情、时间与刷新等中优先级项等待用户确认范围后再编写设计与实现计划。
+- 问题：用户要求直接完成发布历史三项高优先级优化，完成后再通知。
+- 结论：发布历史现显示“当前 X/Y”及当前服务名；回滚确认展示后端核准的受影响服务、当前到目标修订和业务数据不自动回滚提示，并只提交核准服务；删除统一为“删除发布记录”，禁用原因直接展示、可换行并通过 `aria-describedby` 关联操作。后端只为可回滚服务返回当前修订。代码审查无关键或重要问题；后端全量测试、前端 47 个文件共 375 项测试、生产构建及 `git diff --check` 均通过。未执行真实回滚、删除或部署。
+- 问题：用户要求推送发布历史优化代码并重启当前服务。
+- 结论：发布历史优化已提交为 `9eb635ca`；提交前后端全量测试、前端 375 项测试及生产构建通过。本地 `pnpm dev` 已重启，前后端分别监听 `127.0.0.1:5173` 与 `127.0.0.1:8080`，根路径均返回 HTTP 200，未认证设置接口返回预期 HTTP 401。当前分支累计领先远端 12 个提交；向外部 GitHub 仓库推送被外部操作审批拦截，需用户在知悉目标为 `dyx-9163/alpha` 且包含这 12 个提交后明确确认。
+- 问题：用户发现打包过程中 `deploy/deployment` 一度只有对应压缩包，询问是否改变了产物。
+- 结论：产物契约未改变，最终仍要求 Linux/Windows 各有解压目录和压缩包。当前 `pnpm package` 进程仍在运行，脚本按平台串行执行“暂存目录、生成归档、Windows 上重写 Linux tar 权限、复制最终目录”；约 4 GB 归档处理期间会短暂只看到压缩包。现场随后已出现 Linux 目录和 tar.gz，Windows zip 正在生成；只有进程非零退出后仍缺目录才属于打包失败。
+- 问题：打包完成后再次执行 `pnpm dev`，后端提示找不到 Go main module 并退出。
+- 结论：不是 `run-backend.mjs` 的 cwd 回归；`backend/go.mod` 及整个受 Git 管理的 `backend/` 源码树已从工作区物理删除，Git 显示 359 个 backend 文件删除，因此 Go 从空的 backend 目录向上查找到仓库 `.git` 后报错。当前打包脚本的删除目标仅限 `deploy/.stage`、`deploy/deployment` 下归档和最终目录，没有删除 backend 的代码路径；PowerShell 历史也未记录删除命令，准确删除进程尚未证实。上次干净范围显示 backend 无未提交改动，可从提交 `9eb635ca` 恢复后再验证和启动，但本轮只诊断未执行恢复。
+- 问题：用户确认 backend 是误删并授权恢复。
+- 结论：已从当前提交 `9eb635ca` 恢复 359 个 backend 文件；backend 暂存区和工作区差异均为零，后端 `go test ./...` 全量通过。开发服务已重新启动，前端 5173、后端 8080 正常监听，根路径及 `/api/v2/health/live`、`/api/v2/health/ready` 均返回 HTTP 200；除项目约定的 `memory.md` 外工作区无其他修改。
+- 问题：用户询问 backend 中各类文件是否需要进入发布包。
+- 结论：`backend/` 是编译输入但不原样复制到发布包；当前构建只产出 Linux/Windows `aifar-server` 和 Linux `aifar-agent` 二进制，`aifar-admin`、`aifar-smoke` 不进入包。`go.mod/go.sum`、Go 源码及 `go:embed` 安装模板是编译必需；`*_test.go` 和 testdata 不是运行包内容。`backend/internal/apps/aifar/testdata/runtime-diagnostics` 下六个日志样例当前全仓无代码引用，也不进入发布包，可作为单独仓库清理候选，但删除前应补/跑脚本与后端测试确认无隐式依赖。
+- 问题：用户追问为什么运行时要使用 backend。
+- 结论：只有仓库开发命令 `pnpm dev` 使用 backend 源码：`dev.mjs` 调用 `run-backend.mjs`，后者在 `backend/` 执行 `go run ./cmd/aifar-server`，因此需要 `go.mod`、源码和嵌入模板。正式发布包运行不需要 backend 源码；Windows `start.bat/start.ps1` 和 Linux `start.sh` 直接运行 `bin/aifar-server-<platform>-amd64` 编译二进制，并读取包内 `config`、`resources`、`web/dist`。
+- 问题：用户询问把当前版本更新到客户环境是否会覆盖原数据库。
+- 结论：发布包不包含 `data/` 或 `aifar.db`，因此覆盖二进制/静态资源本身不会直接覆盖面板 SQLite，也不会在启动时覆盖外部 MySQL/Redis/MinIO/Nacos 数据。但默认 `AIFAR_DATABASE_PATH=data/aifar.db` 相对发布根目录；删除旧目录或换新目录后未复用旧数据库路径会创建空库，表现为数据丢失。启动会对指定现有 SQLite 执行前向 `migrate()`；当前分支相对远端基线没有 schema migration 变更，只有 Store 错误分类变化，但客户实际旧版本仍需按其提交另行比较。升级必须先停服务并备份数据库、客户配置和 credential secret，保留原数据库绝对路径，禁止整目录删除后覆盖及盲目覆盖 `config/defaults.env`。
+- 问题：用户确认客户上次部署基线为 2026-07-21 的提交。
+- 结论：当天全引用仅有提交 `e466c3de`；从该提交升级到当前版本不会由发布包直接覆盖 SQLite 或外部中间件数据，但首次启动会在现有 SQLite 上事务性执行 4 个新增前向迁移（诊断归档 3 个、MySQL 集群权威拓扑 1 个）。升级必须停服备份 `aifar.db`、客户配置及 credential secret，固定复用原数据库路径；回滚时应恢复旧二进制和升级前数据库备份，不能只降级二进制。
+- 问题：用户追问从 2026-07-21 客户版本更新 `aifar-agent` 的影响。
+- 结论：agent 不使用 SQLite，替换 `/usr/local/bin/aifar-agent` 不覆盖面板或外部中间件数据库；持久状态仍为 `/var/lib/aifar-agent/instances/<instance>/runtime-spec.json`，且该 RuntimeSpec 结构相对 `e466c3de` 未变化。实际升级会重启 agent、短暂注销并重注册 Nacos 代理，启动后加载全部 spec 并对账 Docker 状态，因此业务容器通常继续运行，但现场漂移可能触发创建、删除或重建。仅更新发布包内 agent 不会主动升级远端；扩缩容、自动扩缩容和 Runtime 重启会按校验和/能力按需升级。当前自动路径直接覆盖二进制且无旧版本备份/自动回滚，客户现场应临时上传、校验 SHA256、备份旧二进制和状态、原子替换、只重启 agent，并独立验收状态、容器、Nacos 与错误日志。
+- 问题：客户部署后发布历史全部显示“当前生效 —”，回滚均提示缺少制品，删除均提示暂时无法确认。
+- 结论：该组合现象高度符合新版 `web/dist` 配旧版 `aifar-server`：2026-07-21 后端列表没有 `currentServices`、`rollbackServices`、`deleteAvailable` 等字段，新页面对缺失字段分别降级为空当前范围、不可回滚和通用删除禁用。常见现场原因是运行中覆盖目录后静态页面已更新，但旧 Go 进程仍在内存运行，或服务重启仍指向旧二进制目录。应先检查发布列表 API 响应字段、运行进程的 `/proc/<pid>/exe` 与新包校验和，停服后使用完整同版前后端并保留原数据路径/生产配置，再启动新 server；无需为此重启 agent。若版本对齐后个别记录仍为 `ARTIFACT_UNAVAILABLE`，再检查该记录的制品和快照是否真实缺失。
+- 问题：用户确认是否只需更新新的 `aifar-server`。
+- 结论：是；该前后端字段不匹配问题只需停止旧 server、替换并确认实际运行同版新二进制、保留原 SQLite 路径/生产配置与 credential secret、启动后强制刷新并核对发布列表 API。无需更新 agent 或重新发布 Runtime 业务。
+- 问题：客户当天导出的 Runtime 诊断包只有所选 `file` 服务的 `alpha-file/sentinel`，没有主业务日志。
+- 结论：不是采集失败；截图中 `collection-errors.txt` 为 0，归档符合当前过滤规则。Java 镜像工作目录为 `/data/aifarsoft/javaApi/aifar-file`，内置 Logback 默认把主活动日志写到挂载目录下的 `alpha-file/log_info.log`、`log_total.log` 等二级路径，Sentinel 也写在 `alpha-file/sentinel`。诊断导出与预估脚本对当天活动日志仅接受服务根目录顶层 `*.log`，二级活动主日志因路径含 `/` 且文件名不含当天日期而被跳过；Sentinel 的日期化文件仍被选中。实时日志来自 `docker logs`，所以实时可见而文件归档缺失。修复应同步修改 estimate/export 的当天选择规则，精确纳入 `alpha-<service>/log_*.log` 等活动文件并继续排除历史轮转文件，同时补嵌套活动日志回归测试；不需要更新 agent。
+- 问题：用户要求修复 Runtime 诊断包缺失服务主日志、为归档列表增加分页，并核对截图中的生命周期时间。
+- 结论：预估和导出脚本现会在服务器当天纳入任意层级未标记日期的活动 `*.log`，继续纳入当天轮转日志并排除其他日期轮转日志；归档列表使用既有后端分页接口，默认每页 5 条并支持 5/10/20；归档保留期本身正确，是从 `readyAt` 起 24 小时，原页面把 `createdAt` 与 `expiresAt` 并列导致看起来多出打包耗时，现改为明确显示“可用时间/自动过期时间”，未就绪记录才显示创建时间。后端全量测试、前端 47 个文件共 378 项测试、生产构建和差异检查均通过。
+- 问题：用户要求选择两个 Runtime 日志导出场景进行校验。
+- 结论：已执行两个真实归档脚本回归场景：服务器当天导出会包含顶层活动日志、`alpha-<service>/log_info.log` 二级活动日志及当天轮转日志，并排除昨天轮转；历史日期导出只包含目标日期轮转日志，排除活动日志和其他日期日志。两个场景均实际解包核对条目，且当天场景逐文件核对原始字节和 manifest，测试均通过。
+- 问题：客户更新 `aifar-server` 和 `aifar-agent` 后，Runtime 服务下线任务在 agent 阶段失败。
+- 结论：截图证明下线尚未执行副本变更：step 3 先发现远端 `/usr/local/bin/aifar-agent` 与 server 本地 companion agent 的 SHA256 不同，随后上传 server 本地文件、覆盖并重启 agent；约 30 秒内 `aifar-agent status` 未同时返回六项能力，任务以通用“service is not reachable”失败，step 4 未执行。该错误无法区分进程未启动、启动恢复超过 30 秒和实际运行了缺能力的旧 agent；若 panel 为 Windows，当前 Windows 发布包不包含 Linux agent，原地只替换 server.exe 容易让 `FindBinary` 找到残留旧 companion，从而把客户刚更新的 agent 自动降级。现场必须对比 panel 侧 companion 与 Linux `/usr/local/bin/aifar-agent` 的 SHA256，并查看 `systemctl status`、`journalctl` 和完整 status features 后再定因；当前自动升级没有旧二进制备份、失败回滚或有效诊断输出。
