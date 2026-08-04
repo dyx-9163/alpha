@@ -3,6 +3,10 @@
 
 本文件记录后续对话的精简问题与结论。每次开始先读，结束前追加。禁止写入密码、token、私钥、完整连接串和长日志。
 
+## 2026-08-03
+- 问题：用户询问数据库页面 MySQL、MySQL Router、Redis 节点在线/离线状态是否来源于服务器 SSH。
+- 结论：当前数据库实时状态由后端 collector 按配置周期对 `app.instance` 执行应用模块 Check；collector 使用实例关联服务器中保存的 SSH 凭据远程执行探测，所以 SSH 是传输和执行通道，但状态不是单纯复用服务器 SSH 可达性。MySQL 远端检查 systemd、mysqladmin 本机 TCP ping 和监听端口，InnoDB Cluster 还检测当前 PRIMARY；MySQL Router 检查 systemd 与 mysqlrouter 版本命令；Redis 检查 systemd、redis-cli PING，并按拓扑读取 ROLE/Sentinel 信息。SSH 或凭据失败会使组件检查失败并在前端映射为离线，即使组件本身可能仍在运行。
+
 ## 2026-08-02
 - 问题：用户要求详细比较 Commvault、NetBackup、Dell PowerProtect、Veeam、Rubrik、Cohesity、Bacula/Bareos 及组件原生备份方案。
 - 结论：AIFAR 统一商业平台优先短名单为 Commvault、NetBackup、Dell PowerProtect：Commvault 当前对 MySQL 与 MinIO 受保护源覆盖最明确；NetBackup具备 MySQL 和 Cloud Object Store 工作负载，但 MinIO需按S3兼容性PoC；PowerProtect 20.2通用应用代理明确覆盖MySQL和Redis，但公开资料未证实MinIO源端保护。Veeam更适合VM/主机优先，MinIO主要为目标仓库且当前数据库级插件不含MySQL；Rubrik公开工作负载未显示本地MySQL/Redis/MinIO直接保护；Cohesity DataProtect有MySQL路径但Redis/MinIO需核验；Bacula Enterprise覆盖MySQL Percona及S3对象插件但工程复杂，Bareos与组件原生组合许可成本低但统一目录、保留、审计和恢复编排需自建。所有方案都不能自动保证AIFAR跨组件一致性，且华为DCS虚拟化层必须按准确产品和版本单独核验兼容性。
@@ -1331,4 +1335,42 @@
 - 问题：用户要求选择两个 Runtime 日志导出场景进行校验。
 - 结论：已执行两个真实归档脚本回归场景：服务器当天导出会包含顶层活动日志、`alpha-<service>/log_info.log` 二级活动日志及当天轮转日志，并排除昨天轮转；历史日期导出只包含目标日期轮转日志，排除活动日志和其他日期日志。两个场景均实际解包核对条目，且当天场景逐文件核对原始字节和 manifest，测试均通过。
 - 问题：客户更新 `aifar-server` 和 `aifar-agent` 后，Runtime 服务下线任务在 agent 阶段失败。
-- 结论：截图证明下线尚未执行副本变更：step 3 先发现远端 `/usr/local/bin/aifar-agent` 与 server 本地 companion agent 的 SHA256 不同，随后上传 server 本地文件、覆盖并重启 agent；约 30 秒内 `aifar-agent status` 未同时返回六项能力，任务以通用“service is not reachable”失败，step 4 未执行。该错误无法区分进程未启动、启动恢复超过 30 秒和实际运行了缺能力的旧 agent；若 panel 为 Windows，当前 Windows 发布包不包含 Linux agent，原地只替换 server.exe 容易让 `FindBinary` 找到残留旧 companion，从而把客户刚更新的 agent 自动降级。现场必须对比 panel 侧 companion 与 Linux `/usr/local/bin/aifar-agent` 的 SHA256，并查看 `systemctl status`、`journalctl` 和完整 status features 后再定因；当前自动升级没有旧二进制备份、失败回滚或有效诊断输出。
+- 结论：截图只能证明客户现场的下线尚未执行副本变更：step 3 发现目标机 agent 与客户侧 server 可用的 companion agent SHA256 不同，随后上传、覆盖并重启；约 30 秒内 `aifar-agent status` 未满足能力/可达性门禁，任务以通用“service is not reachable”失败，step 4 未执行。该截图无法进一步区分客户机上的进程启动失败、启动恢复超过 30 秒或 agent 能力版本不匹配，不能用本地产物替代客户现场证据；必须取得客户目标机的 `systemctl status`、`journalctl`、完整 status features 和两端 SHA256 后再定因。当前自动升级缺少旧二进制备份、失败回滚和有效诊断输出。
+- 问题：用户提供客户第二次下线失败时段的 `aifar-agent` journal，要求继续定因。
+- 结论：客户日志排除了 agent 启动失败和 30 秒启动过慢：15:06:37 systemd 成功重启，15:06:38 已监听 `127.0.0.1:18081` 并完成 Runtime/Nacos 加载，15:06:54、15:07:08、15:07:23 仍持续工作。任务在同一约 30 秒窗口失败，只可能是下线前的 `aifar-agent status` 命令失败或其 JSON 未包含 server 要求的完整能力字符串，现有脚本把这两类情况都吞掉并误报为不可达。还需客户现场提供 `/usr/local/bin/aifar-agent status`、`type -a aifar-agent` 和 systemd `ExecStart` 才能区分实际 agent 能力不匹配与命令路径指向另一二进制。日志还显示 `alpha-system` 在重启前后均为 `deregister offline`，应额外核对容器与控制面期望状态，防止任务失败但目标实际已下线造成漂移。
+
+## 2026-08-03
+- 问题：用户询问被探测服务所在服务器需要开放哪些端口。
+- 结论：当前服务器连通性、遥测和应用实例状态探测都先由面板通过保存的 SSH 端口进入目标机，默认 TCP 22；Docker、MySQL、Redis、MinIO、Nacos 检查均在目标机本地执行，因此仅为面板探测不需要向面板开放 2375、3306、6379、26379、9000、8848 等服务端口。业务访问和集群节点互联端口仍须按组件拓扑另行放行，并应限制来源。
+- 问题：用户把 Windows 面板数据库迁移到 Linux 后，数据库、MinIO、Nacos 页面均为空。
+- 结论：三个页面都从同一个 SQLite `app_instances` 表取控制面实例记录，再按应用类型过滤；同时为空优先说明 Linux `aifar-server` 打开了另一份新建空库、源库本身没有相应记录，或在线仅复制主 `.db` 遗漏 WAL。默认 `AIFAR_DATABASE_PATH=data/aifar.db` 为相对发布根目录；应以启动日志中的 `database=`、进程工作目录和 SQLite `app_instances` 分组计数核对实际库。只迁移 SQLite 不会迁移 MySQL、MinIO、Nacos 的真实业务数据；原 `AIFAR_CREDENTIAL_SECRET` 也必须保留，否则加密凭据通常会导致启动校验失败而不是页面静默为空。
+- 问题：用户补充迁移后其他面板数据都在，只有安装记录以及数据库、MinIO、Nacos 列表丢失。
+- 结论：应用商店安装记录和数据库、MinIO、Nacos 列表都由同一张 `app_instances` 表派生，范围收敛为该表记录缺失，而不是整库路径错误。当前启动迁移不会自动清空该表；应比较 Windows 源库、传输文件与 Linux 实际运行库的 `app_instances` 分组计数及 SHA256。若源库有记录而传输/运行库没有，优先判断拿了旧备份或在线只复制 `.db` 遗漏 WAL；不要通过重新安装组件来补页面记录。
+- 问题：用户询问 `aifar.db-wal` 在哪里。
+- 结论：SQLite WAL 文件若存在，固定与主库同目录并命名为 `aifar.db-wal`，默认是发布目录下 `data/aifar.db-wal`；它可能在正常 checkpoint 或服务停止后消失，缺失本身不代表异常。迁移时不要复制运行中的单个主库，应使用面板一致性备份或停服后处理。
+- 问题：用户反馈完整复制 Windows `data` 目录到 Linux 后数据正常，但单独复制 `aifar.db` 时安装记录和实例列表缺失。
+- 结论：该现象优先说明完整目录复制时同时带入了 `aifar.db-wal` 中尚未 checkpoint 的记录，或恰好放到了服务实际读取的发布根目录 `data/aifar.db`；单文件复制也可能发生在 Linux 服务仍持有旧数据库连接时。不能把热复制整个目录当作可靠方案，正式迁移仍应使用一致性备份，或两端停服后核对实际路径、完整性与权限。
+- 问题：用户现在看不到 `aifar.db-wal`、`aifar.db-shm` 等辅助文件。
+- 结论：当前 Store 仅以普通 SQLite DSN 打开数据库，没有在代码中强制启用 WAL；实际 `journal_mode` 由数据库状态决定。`delete` 模式通常不会保留 `-wal/-shm`，WAL 模式的辅助文件也可在恢复、checkpoint 或最后连接关闭后被截断/删除。因此当前只剩 `aifar.db` 可以正常；若 `PRAGMA journal_mode` 返回 `delete`，完整目录复制成功更应排查单文件来源/目标路径、复制时服务是否仍运行以及复制后是否重启，而不能仅归因于 WAL。
+- 问题：客户 Runtime 发布历史页面返回 `database disk image is malformed (11)`。
+- 结论：错误码 11 是面板控制面 SQLite 的 `SQLITE_CORRUPT`，当前请求在读取 `app_releases` 时触发，不能归因于 Runtime MySQL/Nacos 或 agent。结合此前 Windows 到 Linux 的数据库复制，最高概率是运行中热复制/覆盖、主库与 journal/WAL 状态不配套或文件替换时旧 server 仍持有连接；磁盘、文件系统或异常断电仍需现场排除。应先停止写操作并保全实际 `aifar.db*`，在副本上执行 `quick_check`/`integrity_check`，优先恢复已验证备份，禁止直接对唯一原件 VACUUM 或原位 `.recover`。
+- 问题：用户确认完整更新同一发布包的 server 和 agent 后下线恢复，并询问两者版本比较位置。
+- 结论：当前没有比较 server/agent 语义版本号；agent 虽返回固定 `runtime-v2`，server 只解析展示而不用于升级判断。`ensureRuntimeAgent` 定位发布包中的 companion agent，计算其 SHA256，与目标机 `command -v aifar-agent` 的文件 SHA256 比较，同时要求 running 和六项 Runtime 能力；任一不满足就上传 companion agent、覆盖 `/usr/local/bin/aifar-agent`、重启并等待能力门禁。Linux 完整发布包同时携带同次构建的 server 与 agent，因此整包更新会对齐该校验链路。该机制能解释下线恢复，但不能解释或修复 SQLite 错误；若 malformed 提示也消失，应核对新 server 实际打开的数据库路径是否改变。
+- 问题：用户询问 SQLite malformed 错误是否也是 server/agent 不匹配导致，并说明已还原 SQLite。
+- 结论：不是。`database disk image is malformed (11)` 的直接原因是 aifar-server 读取到结构损坏的控制面 SQLite；还原健康 SQLite 才解决该错误。server/agent 的 SHA256/能力不匹配只影响下线、扩缩容和 Runtime 重启等需要 agent 的任务。现场同时还原 SQLite并更新整包，实际分别修复了数据库损坏和 server/agent 配套两个独立故障。
+- 问题：用户追问 malformed 错误最初由什么事件造成。
+- 结论：已确认的直接原因仅是还原前的 `aifar.db` 在 `app_releases` 查询触及的表或索引页存在结构损坏；结合此前 Windows 到 Linux 迁移及“完整 data 目录正常、单独主库异常”的证据，最可能的起因是服务未完全停止时热复制/覆盖数据库，或主库与当时 journal/WAL 状态不配套。磁盘、文件系统、断电仍是次要候选；原损坏文件若未保留，无法再精确证明是哪一次复制或 I/O 事件。
+- 问题：用户询问当前环境是否使用 SHA256 校验。
+- 结论：当前代码会在下线/扩缩容、自动扩缩容和 Runtime 重启进入 `ensureRuntimeAgent` 时，实时计算发布包 companion agent 与目标机已安装 agent 的 SHA256 并比较，同时校验运行状态和能力；不是 server 与 agent 版本字符串比较，也不是后台持续检查。发布包生成 `checksums.txt` 并由发布验证脚本复验，但启动脚本不自动复验整包。SQLite 备份由 `VACUUM INTO` 生成后记录 SHA256，备份验证另用 `PRAGMA integrity_check`；server 启动不会只靠 SHA256 判定当前 SQLite 健康，哈希相同也可能代表复制了一份同样损坏的数据库。
+- 问题：用户要求在 Runtime 操作前增加 SHA256 门禁，不一致时提示并禁止执行。
+- 结论：现状只在 API 前置阶段检查 agent 为 running，任务执行到 `ensureRuntimeAgent` 才比较 companion/目标 agent SHA256，并自动覆盖和重启 agent；前端状态尚不包含兼容性字段。拟改为只读前置兼容检查、后端强制拒绝并向前端暴露明确禁用原因，当前待确认是覆盖所有依赖 agent 的 Runtime 变更还是仅下线操作。
+- 问题：客户两个 Runtime 节点执行同次全量制品更新后，第一个节点的旧 `rollout-permission` 仍提示 permission 在使用，第二个节点新发布显示当前 10/10。
+- 结论：截图显示第一个节点整体仍为就绪且 agent 运行，问题是 permission 未被归属到新批量 revision 的混合版本状态，不等于整个节点宕机。发布历史的当前判定优先读取 `app_instances.metadata.activeEndpoints.permission` 的 revision，再读 `serviceRevisions.permission`；需对账第一个节点的工作 `runtime-spec.json`、agent 持久 spec、`permission.env` 和 Docker permission 容器 label。同包第二节点正常使“包缺 permission”可能性较低；未获取第一节点现场输出前，不能在实际旧容器未更新与面板控制面残留之间进一步定因。
+- 问题：用户确认 SHA256 门禁覆盖所有依赖 agent 的 Runtime 操作。
+- 结论：设计范围包括下线、批量下线、扩缩容、Runtime 重启、服务更新/安装及自动扩缩容的实际变更；推荐后端与前端双层 fail-closed：运行时摘要暴露兼容状态供按钮禁用，API 创建任务前强制复检，worker 远程提交前再复检防竞态；不匹配或无法完成校验时不自动覆盖/重启 agent，提示先更新同一发布包。待用户批准具体设计后写入 spec。
+- 问题：用户指出门禁也必须校验当前运行的 aifar-server。
+- 结论：修订设计以发布包根目录 `checksums.txt` 为同一可信参考：校验当前 Linux 运行进程 `/proc/self/exe` 的 SHA256 对应 server 条目、包内 companion agent 对应 agent 条目，以及目标机 agent 与同一 agent 条目一致；任一缺失、不一致或无法读取均 fail-closed。这样能识别“旧 server 进程仍在运行但磁盘已覆盖新包”和“server/companion/远端 agent 混包”，而不是仅比较两个 agent。开发态无正式 manifest 需保留显式测试/本地路径，生产包缺 manifest 则禁止 Runtime 变更。
+- 问题：用户要求明确更新 aifar-server 时应复制哪些文件。
+- 结论：Linux 最小同版集合是 `bin/aifar-server-linux-amd64`、`bin/aifar-agent-linux-amd64`、完整 `web/dist/`、`checksums.txt`、`VERSION`，并建议同步同版 `start.sh`/`stop.sh`；每台 Runtime 节点还应以包内 agent 更新 `/usr/local/bin/aifar-agent` 并重启验收。禁止覆盖客户 `data/`、`aifar.db*` 和生产 `config/defaults.env`，配置只做差异合并；最稳妥是停 server 后用新目录部署完整解压包并继续指向原绝对数据库路径。
+- 问题：用户询问发布包 `checksums.txt` 的用途。
+- 结论：打包脚本为包内除 `checksums.txt` 自身外的每个文件生成 `SHA256  相对路径` 清单，`release:verify` 用它发现缺失、额外、被修改或混版文件；Linux 可手工执行 `sha256sum -c checksums.txt`。当前启动脚本和 Runtime 操作尚不会自动读取该文件，前述 server/agent 前置门禁仍处于设计阶段。该清单只证明相对可信清单的文件完整性，不提供签名级来源认证，也不检查包外 SQLite 的逻辑健康。
