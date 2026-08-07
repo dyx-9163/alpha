@@ -15,7 +15,10 @@ const (
 	DefaultDeploymentRollbackOnError = true
 )
 
-type RuntimeSpec struct {
+// LegacyRuntimeSpec is the former instance-wide desired-state resource. It is
+// retained only for migration/bootstrap compatibility while callers move to
+// InstanceConfig and per-service DeploymentManifest resources.
+type LegacyRuntimeSpec struct {
 	Version     string           `json:"version,omitempty"`
 	InstanceID  string           `json:"instanceId,omitempty"`
 	InstallRoot string           `json:"installRoot,omitempty"`
@@ -25,6 +28,10 @@ type RuntimeSpec struct {
 	Ingress     IngressSpec      `json:"ingress"`
 	Nacos       NacosSpec        `json:"nacos,omitempty"`
 }
+
+// RuntimeSpec keeps the existing agent API source-compatible during the
+// dual-read migration window. New desired state must use DeploymentManifest.
+type RuntimeSpec = LegacyRuntimeSpec
 
 type IngressSpec struct {
 	Mode           string `json:"mode,omitempty"`
@@ -44,21 +51,22 @@ type ServiceSpec struct {
 }
 
 type DeploymentSpec struct {
-	ServiceName    string                 `json:"serviceName"`
-	DeploymentName string                 `json:"deploymentName,omitempty"`
-	Image          string                 `json:"image,omitempty"`
-	PodRevision    string                 `json:"podRevision,omitempty"`
-	Replicas       int                    `json:"replicas,omitempty"`
-	Strategy       DeploymentStrategySpec `json:"strategy,omitempty"`
-	Ports          []ContainerPort        `json:"ports,omitempty"`
-	EnvFiles       []string               `json:"envFiles,omitempty"`
-	Volumes        []VolumeMount          `json:"volumes,omitempty"`
-	Resources      ResourceSpec           `json:"resources,omitempty"`
-	HealthCheck    HealthCheckSpec        `json:"healthCheck,omitempty"`
-	Entrypoint     []string               `json:"entrypoint,omitempty"`
-	Command        []string               `json:"command,omitempty"`
-	Environment    map[string]string      `json:"environment,omitempty"`
-	Labels         map[string]string      `json:"labels,omitempty"`
+	ServiceName       string                 `json:"serviceName"`
+	DeploymentName    string                 `json:"deploymentName,omitempty"`
+	Image             string                 `json:"image,omitempty"`
+	PodRevision       string                 `json:"podRevision,omitempty"`
+	RestartGeneration int64                  `json:"restartGeneration,omitempty"`
+	Replicas          int                    `json:"replicas,omitempty"`
+	Strategy          DeploymentStrategySpec `json:"strategy,omitempty"`
+	Ports             []ContainerPort        `json:"ports,omitempty"`
+	EnvFiles          []string               `json:"envFiles,omitempty"`
+	Volumes           []VolumeMount          `json:"volumes,omitempty"`
+	Resources         ResourceSpec           `json:"resources,omitempty"`
+	HealthCheck       HealthCheckSpec        `json:"healthCheck,omitempty"`
+	Entrypoint        []string               `json:"entrypoint,omitempty"`
+	Command           []string               `json:"command,omitempty"`
+	Environment       map[string]string      `json:"environment,omitempty"`
+	Labels            map[string]string      `json:"labels,omitempty"`
 }
 
 type DeploymentStrategySpec struct {
