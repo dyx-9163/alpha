@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"text/template"
 	"time"
 	"unicode"
@@ -70,8 +71,45 @@ type aifarRuntimeCleanupStore interface {
 
 type aifarOrchestrationLockStore interface {
 	AcquireAIFAROrchestrationLock(store.AIFAROrchestrationLock) (store.AIFAROrchestrationLock, error)
+	RenewAIFAROrchestrationLock(id string, expiresAt time.Time) (bool, error)
 	ReleaseAIFAROrchestrationLock(instanceID, operation, serviceName string) (bool, error)
 	RecoverAIFAROrchestrationLocks(instanceID, reason string) (int, error)
+}
+
+func (s Service) startAIFAROrchestrationLockHeartbeat(ctx context.Context, lock store.AIFAROrchestrationLock) (context.Context, func()) {
+	lockStore, ok := s.store.(aifarOrchestrationLockStore)
+	if !ok || strings.TrimSpace(lock.ID) == "" {
+		return ctx, func() {}
+	}
+	taskCtx, cancelTask := context.WithCancel(ctx)
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	var stopOnce sync.Once
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(orchestrationLockTTL / 3)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-stop:
+				return
+			case <-ticker.C:
+				renewed, err := lockStore.RenewAIFAROrchestrationLock(lock.ID, time.Now().UTC().Add(orchestrationLockTTL))
+				if err != nil || !renewed {
+					cancelTask()
+					return
+				}
+			}
+		}
+	}()
+	return taskCtx, func() {
+		stopOnce.Do(func() {
+			close(stop)
+			<-done
+		})
+	}
 }
 
 type taskLookupStore interface {

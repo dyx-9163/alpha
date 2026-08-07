@@ -382,6 +382,19 @@ func (s *Store) ReleaseAIFAROrchestrationLock(instanceID, operation, serviceName
 	return affected > 0, err
 }
 
+func (s *Store) RenewAIFAROrchestrationLock(id string, expiresAt time.Time) (bool, error) {
+	now := time.Now().UTC()
+	res, err := s.db.Exec(`update aifar_orchestration_locks
+		set expires_at=?, updated_at=?
+		where id=? and status='active' and expires_at > ?`,
+		expiresAt.UTC(), now, strings.TrimSpace(id), now)
+	if err != nil {
+		return false, err
+	}
+	affected, err := res.RowsAffected()
+	return affected > 0, err
+}
+
 func (s *Store) RecoverAIFAROrchestrationLocks(instanceID, reason string) (int, error) {
 	now := time.Now().UTC()
 	query := `update aifar_orchestration_locks
@@ -512,12 +525,19 @@ func expireAIFAROrchestrationLocks(tx *sql.Tx, now time.Time) error {
 	return err
 }
 
-func findAIFAROrchestrationLockConflict(tx *sql.Tx, instanceID, _ string) (AIFAROrchestrationLock, bool, error) {
+func findAIFAROrchestrationLockConflict(tx *sql.Tx, instanceID, serviceName string) (AIFAROrchestrationLock, bool, error) {
 	query := `select id,instance_id,service_name,operation,coalesce(actor,''),coalesce(task_id,''),status,started_at,expires_at,released_at,created_at,updated_at
 		from aifar_orchestration_locks
 		where instance_id=? and status='active'
 		order by started_at limit 1`
 	args := []any{instanceID}
+	if strings.TrimSpace(serviceName) != "" {
+		query = `select id,instance_id,service_name,operation,coalesce(actor,''),coalesce(task_id,''),status,started_at,expires_at,released_at,created_at,updated_at
+			from aifar_orchestration_locks
+			where instance_id=? and status='active' and (service_name='' or service_name=?)
+			order by started_at limit 1`
+		args = append(args, strings.TrimSpace(serviceName))
+	}
 	row := tx.QueryRow(query, args...)
 	lock, err := scanAIFAROrchestrationLock(row)
 	if err == sql.ErrNoRows {

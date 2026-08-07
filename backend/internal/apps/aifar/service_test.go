@@ -62,6 +62,10 @@ func (*rollbackLockRaceStore) ReleaseAIFAROrchestrationLock(string, string, stri
 	return true, nil
 }
 
+func (*rollbackLockRaceStore) RenewAIFAROrchestrationLock(string, time.Time) (bool, error) {
+	return true, nil
+}
+
 func (*rollbackLockRaceStore) RecoverAIFAROrchestrationLocks(string, string) (int, error) {
 	return 0, nil
 }
@@ -1478,7 +1482,7 @@ func (f scaleServiceShellFixture) assertNoStagedFiles(t *testing.T) {
 	}
 }
 
-func TestServiceOrchestrationLocksBlockDifferentServices(t *testing.T) {
+func TestServiceOrchestrationLocksAllowDifferentServices(t *testing.T) {
 	instance := installedAIFARInstance(t)
 	metadata := metadataFromInstance(instance)
 	metadata["orchestrationLocks"] = map[string]any{
@@ -1493,8 +1497,8 @@ func TestServiceOrchestrationLocksBlockDifferentServices(t *testing.T) {
 	s := &fakeStore{instances: []store.AppInstance{instance}}
 	service := NewService(s, &fakeRemote{})
 
-	if _, err := service.acquireOrchestrationLock(instance.ID, "scale-service", "permission", "operator", ""); err == nil {
-		t.Fatal("expected file mutation to block permission mutation on the same instance")
+	if _, err := service.acquireOrchestrationLock(instance.ID, "scale-service", "permission", "operator", ""); err != nil {
+		t.Fatalf("expected file mutation not to block permission mutation, got %v", err)
 	}
 	saved, err := s.GetAppInstance(instance.ID)
 	if err != nil {
@@ -1504,15 +1508,15 @@ func TestServiceOrchestrationLocksBlockDifferentServices(t *testing.T) {
 	if _, ok := locks["file"]; !ok {
 		t.Fatalf("expected existing file lock to be preserved, got %s", saved.Metadata)
 	}
-	if _, ok := locks["permission"]; ok {
-		t.Fatalf("blocked permission lock must not be recorded, got %s", saved.Metadata)
+	if _, ok := locks["permission"]; !ok {
+		t.Fatalf("expected permission lock to be recorded, got %s", saved.Metadata)
 	}
 	if _, ok := locks["file"]; !ok {
 		t.Fatalf("expected unrelated file lock to remain, got %s", saved.Metadata)
 	}
 }
 
-func TestAutoscalerTreatsAnyInstanceMutationAsLocked(t *testing.T) {
+func TestAutoscalerAllowsDifferentServiceMutation(t *testing.T) {
 	db, err := store.Open(filepath.Join(t.TempDir(), "aifar.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -1532,8 +1536,8 @@ func TestAutoscalerTreatsAnyInstanceMutationAsLocked(t *testing.T) {
 		t.Fatal(err)
 	}
 	autoscaler := &Autoscaler{store: db}
-	if !autoscaler.orchestrationLocked(instance.ID, "permission", time.Now().UTC()) {
-		t.Fatal("any active instance mutation must block autoscaling another service")
+	if autoscaler.orchestrationLocked(instance.ID, "permission", time.Now().UTC()) {
+		t.Fatal("file mutation must not block autoscaling another service")
 	}
 }
 

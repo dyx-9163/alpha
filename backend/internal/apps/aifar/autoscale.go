@@ -789,11 +789,14 @@ func (a *Autoscaler) orchestrationLocked(instanceID, serviceName string, now tim
 	if err != nil {
 		return false
 	}
+	serviceName = strings.TrimSpace(serviceName)
 	for _, lock := range locks {
 		if !lock.ExpiresAt.IsZero() && !now.Before(lock.ExpiresAt) {
 			continue
 		}
-		return true
+		if serviceName == "" || strings.TrimSpace(lock.ServiceName) == "" || strings.TrimSpace(lock.ServiceName) == serviceName {
+			return true
+		}
 	}
 	return false
 }
@@ -830,7 +833,10 @@ func (s Service) acquireOrchestrationLock(instanceID, operation, serviceName, ac
 		return instance, nil
 	}
 	pruneExpiredOrchestrationLocks(metadata, now)
-	if orchestrationLocked(metadata, now) || anyServiceOrchestrationLocked(metadata, now) {
+	serviceName = strings.TrimSpace(serviceName)
+	if orchestrationLocked(metadata, now) ||
+		(serviceName == "" && anyServiceOrchestrationLocked(metadata, now)) ||
+		(serviceName != "" && serviceOrchestrationLocked(metadata, serviceName, now)) {
 		return instance, fmt.Errorf("AIFAR instance orchestration is locked")
 	}
 	lock := map[string]any{
