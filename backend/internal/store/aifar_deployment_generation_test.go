@@ -43,6 +43,24 @@ func TestSaveAIFARDeploymentGenerationRejectsStaleWriter(t *testing.T) {
 	}
 }
 
+func TestSaveAIFARDeploymentGenerationDoesNotCreateWithNonZeroExpectedGeneration(t *testing.T) {
+	db := openTestStore(t)
+	_, err := db.SaveAIFARDeploymentGeneration(AIFARDeployment{
+		InstanceID: "instance-missing", ServiceName: "permission", DesiredReplicas: 1,
+		CurrentRevision: "r1", SpecJSON: `{"metadata":{"generation":2}}`,
+	}, 1)
+	if !errors.Is(err, ErrAIFARDeploymentNotFound) {
+		t.Fatalf("error=%v, want deployment not found", err)
+	}
+	deployments, err := db.ListAIFARDeployments("instance-missing")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(deployments) != 0 {
+		t.Fatalf("missing deployment was created: %+v", deployments)
+	}
+}
+
 func TestObserveAIFARDeploymentCannotAdvancePastDesiredGeneration(t *testing.T) {
 	db := openTestStore(t)
 	first, err := db.SaveAIFARDeploymentGeneration(AIFARDeployment{
@@ -75,8 +93,8 @@ func TestObserveAIFARDeploymentCannotAdvancePastDesiredGeneration(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if older.ObservedGeneration != 2 {
-		t.Fatalf("older observation reduced observed_generation to %d, want 2", older.ObservedGeneration)
+	if older.ObservedGeneration != 2 || older.Status != "ready" || older.ConditionsJSON != `[{"type":"Available","status":"True"}]` || !older.LastTransitionAt.Equal(at) {
+		t.Fatalf("older observation overwrote newer deployment state: %+v", older)
 	}
 
 	_, err = db.ObserveAIFARDeployment("instance-1", "permission", 3, "offline", `[]`, at.Add(time.Minute))

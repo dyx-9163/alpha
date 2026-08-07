@@ -94,13 +94,14 @@ func (s *Store) SaveAIFARDeploymentGeneration(next AIFARDeployment, expectedGene
 	}
 	defer tx.Rollback()
 	result, err := tx.Exec(`insert into aifar_deployments(id,instance_id,service_name,desired_replicas,current_revision,updating_revision,strategy_json,spec_json,generation,observed_generation,status,metadata_json,conditions_json,last_transition_at,created_at,updated_at)
-		values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+		select ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
+		where ?=0 or exists(select 1 from aifar_deployments where instance_id=? and service_name=?)
 		on conflict(instance_id, service_name) do update set
 		desired_replicas=excluded.desired_replicas,current_revision=excluded.current_revision,updating_revision=excluded.updating_revision,
 		strategy_json=excluded.strategy_json,spec_json=excluded.spec_json,generation=excluded.generation,status=excluded.status,
 		metadata_json=excluded.metadata_json,conditions_json=excluded.conditions_json,last_transition_at=excluded.last_transition_at,updated_at=excluded.updated_at
 		where aifar_deployments.generation=?`,
-		next.ID, next.InstanceID, next.ServiceName, next.DesiredReplicas, next.CurrentRevision, next.UpdatingRevision, next.StrategyJSON, next.SpecJSON, next.Generation, next.ObservedGeneration, next.Status, next.MetadataJSON, next.ConditionsJSON, nullableTime(next.LastTransitionAt), next.CreatedAt, next.UpdatedAt, expectedGeneration)
+		next.ID, next.InstanceID, next.ServiceName, next.DesiredReplicas, next.CurrentRevision, next.UpdatingRevision, next.StrategyJSON, next.SpecJSON, next.Generation, next.ObservedGeneration, next.Status, next.MetadataJSON, next.ConditionsJSON, nullableTime(next.LastTransitionAt), next.CreatedAt, next.UpdatedAt, expectedGeneration, next.InstanceID, next.ServiceName, expectedGeneration)
 	if err != nil {
 		return AIFARDeployment{}, err
 	}
@@ -134,10 +135,13 @@ func (s *Store) ObserveAIFARDeployment(instanceID, serviceName string, generatio
 	}
 	defer tx.Rollback()
 	result, err := tx.Exec(`update aifar_deployments set
-		status=?, conditions_json=?, observed_generation=case when ? > observed_generation then ? else observed_generation end,
-		last_transition_at=?, updated_at=?
+		status=case when ? >= observed_generation then ? else status end,
+		conditions_json=case when ? >= observed_generation then ? else conditions_json end,
+		observed_generation=case when ? > observed_generation then ? else observed_generation end,
+		last_transition_at=case when ? >= observed_generation then ? else last_transition_at end,
+		updated_at=case when ? >= observed_generation then ? else updated_at end
 		where instance_id=? and service_name=? and generation >= ?`,
-		status, conditionsJSON, generation, generation, at, time.Now(), instanceID, serviceName, generation)
+		generation, status, generation, conditionsJSON, generation, generation, generation, at, generation, time.Now(), instanceID, serviceName, generation)
 	if err != nil {
 		return AIFARDeployment{}, err
 	}
