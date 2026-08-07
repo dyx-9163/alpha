@@ -281,17 +281,22 @@ type OperationLock struct {
 }
 
 type AIFARDeployment struct {
-	ID               string    `json:"id"`
-	InstanceID       string    `json:"instanceId"`
-	ServiceName      string    `json:"serviceName"`
-	DesiredReplicas  int       `json:"desiredReplicas"`
-	CurrentRevision  string    `json:"currentRevision"`
-	UpdatingRevision string    `json:"updatingRevision,omitempty"`
-	StrategyJSON     string    `json:"strategyJson,omitempty"`
-	Status           string    `json:"status"`
-	MetadataJSON     string    `json:"metadataJson,omitempty"`
-	CreatedAt        time.Time `json:"createdAt"`
-	UpdatedAt        time.Time `json:"updatedAt"`
+	ID                 string    `json:"id"`
+	InstanceID         string    `json:"instanceId"`
+	ServiceName        string    `json:"serviceName"`
+	DesiredReplicas    int       `json:"desiredReplicas"`
+	CurrentRevision    string    `json:"currentRevision"`
+	UpdatingRevision   string    `json:"updatingRevision,omitempty"`
+	StrategyJSON       string    `json:"strategyJson,omitempty"`
+	SpecJSON           string    `json:"specJson,omitempty"`
+	Generation         int64     `json:"generation"`
+	ObservedGeneration int64     `json:"observedGeneration"`
+	Status             string    `json:"status"`
+	MetadataJSON       string    `json:"metadataJson,omitempty"`
+	ConditionsJSON     string    `json:"conditionsJson,omitempty"`
+	LastTransitionAt   time.Time `json:"lastTransitionAt,omitempty"`
+	CreatedAt          time.Time `json:"createdAt"`
+	UpdatedAt          time.Time `json:"updatedAt"`
 }
 
 type AIFARReplicaSet struct {

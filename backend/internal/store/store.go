@@ -214,7 +214,9 @@ func (s *Store) migrate() error {
 		`create table if not exists aifar_deployments (
 			id text primary key, instance_id text not null, service_name text not null,
 			desired_replicas integer not null, current_revision text not null, updating_revision text,
-			strategy_json text, status text not null, metadata_json text,
+			strategy_json text, spec_json text, generation integer not null default 1,
+			observed_generation integer not null default 0, status text not null, metadata_json text,
+			conditions_json text, last_transition_at datetime,
 			created_at datetime not null, updated_at datetime not null,
 			unique(instance_id, service_name)
 		)`,
@@ -334,6 +336,21 @@ func (s *Store) migrate() error {
 		return err
 	}
 	if err := s.ensureColumn("alerts", "acknowledged_at", `alter table alerts add column acknowledged_at datetime`); err != nil {
+		return err
+	}
+	if err := s.ensureColumn("aifar_deployments", "spec_json", `alter table aifar_deployments add column spec_json text`); err != nil {
+		return err
+	}
+	if err := s.ensureColumn("aifar_deployments", "generation", `alter table aifar_deployments add column generation integer not null default 1`); err != nil {
+		return err
+	}
+	if err := s.ensureColumn("aifar_deployments", "observed_generation", `alter table aifar_deployments add column observed_generation integer not null default 0`); err != nil {
+		return err
+	}
+	if err := s.ensureColumn("aifar_deployments", "conditions_json", `alter table aifar_deployments add column conditions_json text`); err != nil {
+		return err
+	}
+	if err := s.ensureColumn("aifar_deployments", "last_transition_at", `alter table aifar_deployments add column last_transition_at datetime`); err != nil {
 		return err
 	}
 	return runStoreMigrations(s.db)
