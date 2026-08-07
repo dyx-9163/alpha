@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -16,15 +17,19 @@ import (
 var manifestStoreWriteMu sync.Mutex
 
 type ManifestStore struct {
-	StateDir      string
-	syncFile      func(*os.File) error
-	renameFile    func(string, string) error
-	syncDirectory func(string) error
+	StateDir          string
+	syncFile          func(*os.File) error
+	renameFile        func(string, string) error
+	syncDirectory     func(string) error
+	manifestPathLstat func(string) (os.FileInfo, error)
 }
 
 func (s ManifestStore) PutInstance(config InstanceConfig) error {
 	config = NormalizeInstanceConfig(config)
 	if err := ValidateInstanceConfig(config); err != nil {
+		return err
+	}
+	if err := s.validateInstanceFilesystem(config); err != nil {
 		return err
 	}
 	data, err := json.MarshalIndent(config, "", "  ")
@@ -60,6 +65,9 @@ func (s ManifestStore) GetInstance(instanceID string) (InstanceConfig, error) {
 	if err := ValidateInstanceConfig(config); err != nil {
 		return InstanceConfig{}, fmt.Errorf("validate instance config: %w", err)
 	}
+	if err := s.validateInstanceFilesystem(config); err != nil {
+		return InstanceConfig{}, err
+	}
 	return config, nil
 }
 
@@ -79,6 +87,9 @@ func (s ManifestStore) Put(manifest DeploymentManifest) (DeploymentAcceptance, e
 		return DeploymentAcceptance{}, err
 	}
 	if err := ValidateDeploymentManifest(config, manifest); err != nil {
+		return DeploymentAcceptance{}, err
+	}
+	if err := s.validateDeploymentFilesystem(config, manifest); err != nil {
 		return DeploymentAcceptance{}, err
 	}
 	hash, err := DeploymentManifestSpecHash(manifest)
@@ -150,6 +161,9 @@ func (s ManifestStore) Get(instanceID, serviceName string) (DeploymentManifest, 
 	if err := ValidateDeploymentManifest(config, manifest); err != nil {
 		return DeploymentManifest{}, fmt.Errorf("validate deployment manifest: %w", err)
 	}
+	if err := s.validateDeploymentFilesystem(config, manifest); err != nil {
+		return DeploymentManifest{}, err
+	}
 	return manifest, nil
 }
 
@@ -199,6 +213,65 @@ func (s ManifestStore) stateDir() string {
 		return DefaultStateDir
 	}
 	return filepath.Clean(s.StateDir)
+}
+
+func (s ManifestStore) validateInstanceFilesystem(config InstanceConfig) error {
+	if err := validateManifestPathComponents(config.InstallRoot, s.pathLstat()); err != nil {
+		return fmt.Errorf("validate instance installRoot filesystem path: %w", err)
+	}
+	return nil
+}
+
+func (s ManifestStore) validateDeploymentFilesystem(config InstanceConfig, manifest DeploymentManifest) error {
+	if err := s.validateInstanceFilesystem(config); err != nil {
+		return err
+	}
+	for index, envFile := range manifest.Spec.EnvFiles {
+		if err := validateManifestPathComponents(envFile, s.pathLstat()); err != nil {
+			return fmt.Errorf("validate deployment envFiles[%d] filesystem path: %w", index, err)
+		}
+	}
+	for index, volume := range manifest.Spec.Volumes {
+		if err := validateManifestPathComponents(volume.Source, s.pathLstat()); err != nil {
+			return fmt.Errorf("validate deployment volumes[%d] source filesystem path: %w", index, err)
+		}
+	}
+	return nil
+}
+
+func (s ManifestStore) pathLstat() func(string) (os.FileInfo, error) {
+	if s.manifestPathLstat != nil {
+		return s.manifestPathLstat
+	}
+	return os.Lstat
+}
+
+func validateManifestPathComponents(value string, lstat func(string) (os.FileInfo, error)) error {
+	components := []string{"/"}
+	current := "/"
+	for _, component := range strings.Split(strings.TrimPrefix(value, "/"), "/") {
+		if component == "" {
+			continue
+		}
+		current = path.Join(current, component)
+		components = append(components, current)
+	}
+	for index, component := range components {
+		info, err := lstat(component)
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("inspect existing path component: %w", err)
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return errors.New("existing path component must not be a symbolic link")
+		}
+		if index < len(components)-1 && !info.IsDir() {
+			return errors.New("existing parent path component must be a directory")
+		}
+	}
+	return nil
 }
 
 func (s ManifestStore) ensureDirectory(directory string) error {

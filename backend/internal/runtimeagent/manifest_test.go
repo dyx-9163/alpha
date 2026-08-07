@@ -4,11 +4,13 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"path"
 	"path/filepath"
 	"reflect"
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestManifestNormalizationKeepsLegacyNacosSeparate(t *testing.T) {
@@ -377,6 +379,49 @@ func TestManifestStoreRejectsPathIdentitiesBeforeFilesystemAccess(t *testing.T) 
 	}
 }
 
+func TestManifestStoreRejectsSymlinkInstallRoot(t *testing.T) {
+	store := newTestManifestStore(t)
+	store.manifestPathLstat = fakeManifestPathLstat(map[string]os.FileMode{
+		"/":                   os.ModeDir | 0o755,
+		"/aifar":              os.ModeDir | 0o755,
+		"/aifar/apps":         os.ModeDir | 0o755,
+		"/aifar/apps/app_123": os.ModeSymlink | 0o777,
+	})
+	if _, err := store.Put(testManifest("permission", 1, 1)); err == nil || !strings.Contains(err.Error(), "symbolic link") {
+		t.Fatalf("error=%v, want installRoot symbolic-link rejection", err)
+	}
+}
+
+func TestManifestStoreRejectsExistingSymlinkParent(t *testing.T) {
+	store := newTestManifestStore(t)
+	store.manifestPathLstat = fakeManifestPathLstat(safeManifestPathEntries(
+		"/aifar/apps/app_123/runtime/escape", os.ModeSymlink|0o777,
+	))
+	manifest := testManifest("permission", 1, 1)
+	manifest.Spec.EnvFiles = []string{"/aifar/apps/app_123/runtime/escape/secret.env"}
+	if _, err := store.Put(manifest); err == nil || !strings.Contains(err.Error(), "symbolic link") {
+		t.Fatalf("error=%v, want existing parent symbolic-link rejection", err)
+	}
+}
+
+func TestManifestStoreRejectsSymlinkLeaf(t *testing.T) {
+	store := newTestManifestStore(t)
+	store.manifestPathLstat = fakeManifestPathLstat(safeManifestPathEntries(
+		"/aifar/apps/app_123/runtime/logs/permission", os.ModeSymlink|0o777,
+	))
+	if _, err := store.Put(testManifest("permission", 1, 1)); err == nil || !strings.Contains(err.Error(), "symbolic link") {
+		t.Fatalf("error=%v, want volume leaf symbolic-link rejection", err)
+	}
+}
+
+func TestManifestStoreAllowsSafeNonexistentLeaves(t *testing.T) {
+	store := newTestManifestStore(t)
+	store.manifestPathLstat = fakeManifestPathLstat(safeManifestPathEntries())
+	if _, err := store.Put(testManifest("permission", 1, 1)); err != nil {
+		t.Fatalf("safe nonexistent env/volume leaves rejected: %v", err)
+	}
+}
+
 func TestManifestStoreRejectsPersistedResourceWithoutSchema(t *testing.T) {
 	store := newTestManifestStore(t)
 	if _, err := store.Put(testManifest("permission", 1, 1)); err != nil {
@@ -500,4 +545,47 @@ func containsPath(paths []string, want string) bool {
 		}
 	}
 	return false
+}
+
+type fakeManifestFileInfo struct {
+	name string
+	mode os.FileMode
+}
+
+func (f fakeManifestFileInfo) Name() string       { return f.name }
+func (f fakeManifestFileInfo) Size() int64        { return 0 }
+func (f fakeManifestFileInfo) Mode() os.FileMode  { return f.mode }
+func (f fakeManifestFileInfo) ModTime() time.Time { return time.Time{} }
+func (f fakeManifestFileInfo) IsDir() bool        { return f.mode.IsDir() }
+func (f fakeManifestFileInfo) Sys() any           { return nil }
+
+func fakeManifestPathLstat(entries map[string]os.FileMode) func(string) (os.FileInfo, error) {
+	return func(name string) (os.FileInfo, error) {
+		name = path.Clean(name)
+		mode, ok := entries[name]
+		if !ok {
+			return nil, os.ErrNotExist
+		}
+		return fakeManifestFileInfo{name: path.Base(name), mode: mode}, nil
+	}
+}
+
+func safeManifestPathEntries(extra ...any) map[string]os.FileMode {
+	entries := map[string]os.FileMode{
+		"/":                                os.ModeDir | 0o755,
+		"/aifar":                           os.ModeDir | 0o755,
+		"/aifar/apps":                      os.ModeDir | 0o755,
+		"/aifar/apps/app_123":              os.ModeDir | 0o750,
+		"/aifar/apps/app_123/runtime":      os.ModeDir | 0o750,
+		"/aifar/apps/app_123/runtime/env":  os.ModeDir | 0o750,
+		"/aifar/apps/app_123/runtime/logs": os.ModeDir | 0o750,
+	}
+	for index := 0; index+1 < len(extra); index += 2 {
+		name, nameOK := extra[index].(string)
+		mode, modeOK := extra[index+1].(os.FileMode)
+		if nameOK && modeOK {
+			entries[path.Clean(name)] = mode
+		}
+	}
+	return entries
 }
