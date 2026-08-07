@@ -59,6 +59,7 @@ func (s Service) InstallServices(ctx context.Context, req InstallServicesRequest
 	)
 
 	var current store.AppInstance
+	var lock store.AIFAROrchestrationLock
 	var metadata map[string]any
 	var requested []string
 	var missing []string
@@ -79,7 +80,7 @@ func (s Service) InstallServices(ctx context.Context, req InstallServicesRequest
 
 	if err := step(1, func() error {
 		var err error
-		current, err = s.acquireOrchestrationLock(req.Instance.ID, "install-services", "", req.Actor, fallbackTaskID(req.TaskID, log))
+		current, lock, err = s.acquireOrchestrationLock(req.Instance.ID, "install-services", "", req.Actor, fallbackTaskID(req.TaskID, log))
 		if err != nil {
 			return err
 		}
@@ -128,13 +129,13 @@ func (s Service) InstallServices(ctx context.Context, req InstallServicesRequest
 		webPort = intFromMetadata(metadata, "webPort", defaultWebPort)
 		return nil
 	}); err != nil {
-		if current.ID != "" {
-			s.releaseOrchestrationLock(current.ID, "install-services", "")
+		if lock.InstanceID != "" {
+			s.releaseOrchestrationLock(lock)
 		}
 		finishTarget(recorder, target, "failed", err.Error())
 		return err
 	}
-	defer s.releaseOrchestrationLock(current.ID, "install-services", "")
+	defer s.releaseOrchestrationLock(lock)
 
 	if err := step(2, func() error {
 		var err error

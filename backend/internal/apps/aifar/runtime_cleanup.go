@@ -29,12 +29,12 @@ func (s Service) CleanupRuntimeStalePods(ctx context.Context, req RuntimeCleanup
 		"AIFAR runtime cleanup step %d/%d failed: %s: %v",
 	)
 
-	current, err := s.acquireOrchestrationLock(req.Instance.ID, "runtime-cleanup", "", req.Actor, fallbackTaskID(req.TaskID, log))
+	current, lock, err := s.acquireOrchestrationLock(req.Instance.ID, "runtime-cleanup", "", req.Actor, fallbackTaskID(req.TaskID, log))
 	if err != nil {
 		finishTarget(recorder, target, "failed", err.Error())
 		return err
 	}
-	defer s.releaseOrchestrationLock(current.ID, "runtime-cleanup", "")
+	defer s.releaseOrchestrationLock(lock)
 
 	var installRoot string
 	var existingContainers []string
@@ -130,12 +130,12 @@ func (s Service) UninstallRuntimeAgent(ctx context.Context, req RuntimeAgentUnin
 		"AIFAR agent uninstall step %d/%d failed: %s: %v",
 	)
 
-	current, err := s.acquireOrchestrationLock(req.Instance.ID, "runtime-agent-uninstall", "", req.Actor, fallbackTaskID(req.TaskID, log))
+	current, lock, err := s.acquireOrchestrationLock(req.Instance.ID, "runtime-agent-uninstall", "", req.Actor, fallbackTaskID(req.TaskID, log))
 	if err != nil {
 		finishTarget(recorder, target, "failed", err.Error())
 		return err
 	}
-	defer s.releaseOrchestrationLock(current.ID, "runtime-agent-uninstall", "")
+	defer s.releaseOrchestrationLock(lock)
 
 	var installRoot string
 	var specPath string

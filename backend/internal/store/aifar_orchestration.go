@@ -382,6 +382,18 @@ func (s *Store) ReleaseAIFAROrchestrationLock(instanceID, operation, serviceName
 	return affected > 0, err
 }
 
+func (s *Store) ReleaseAIFAROrchestrationLockByID(id string) (bool, error) {
+	now := time.Now().UTC()
+	res, err := s.db.Exec(`update aifar_orchestration_locks
+		set status='released', released_at=?, updated_at=?
+		where id=? and status='active'`, now, now, strings.TrimSpace(id))
+	if err != nil {
+		return false, err
+	}
+	affected, err := res.RowsAffected()
+	return affected > 0, err
+}
+
 func (s *Store) RenewAIFAROrchestrationLock(id string, expiresAt time.Time) (bool, error) {
 	now := time.Now().UTC()
 	res, err := s.db.Exec(`update aifar_orchestration_locks

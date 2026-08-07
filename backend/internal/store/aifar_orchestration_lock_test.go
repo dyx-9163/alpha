@@ -77,6 +77,31 @@ func TestAIFAROrchestrationLocksRenewOnlyActiveUnexpiredLocks(t *testing.T) {
 	}
 }
 
+func TestAIFAROrchestrationLocksDoNotReleaseASuccessorByStaleID(t *testing.T) {
+	db := openTestStore(t)
+	now := time.Now().UTC()
+	ownerA := testAIFAROrchestrationLock("i1", "file", "scale")
+	ownerA.ID = "owner-a"
+	ownerA.StartedAt = now.Add(-2 * time.Hour)
+	ownerA.ExpiresAt = now.Add(-time.Hour)
+	if _, err := db.AcquireAIFAROrchestrationLock(ownerA); err != nil {
+		t.Fatal(err)
+	}
+	ownerB := testAIFAROrchestrationLock("i1", "file", "scale")
+	ownerB.ID = "owner-b"
+	if _, err := db.AcquireAIFAROrchestrationLock(ownerB); err != nil {
+		t.Fatal(err)
+	}
+	if released, err := db.ReleaseAIFAROrchestrationLockByID(ownerA.ID); err != nil || released {
+		t.Fatalf("release stale owner: released=%v err=%v", released, err)
+	}
+	_, err := db.AcquireAIFAROrchestrationLock(testAIFAROrchestrationLock("i1", "file", "scale"))
+	var conflict AIFAROrchestrationLockConflict
+	if !errors.As(err, &conflict) || conflict.Lock.ID != ownerB.ID {
+		t.Fatalf("same-service successor must stay locked: err=%v", err)
+	}
+}
+
 func testAIFAROrchestrationLock(instanceID, serviceName, operation string) AIFAROrchestrationLock {
 	now := time.Now().UTC()
 	return AIFAROrchestrationLock{

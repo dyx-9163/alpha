@@ -125,14 +125,14 @@ func (s Service) RollbackArtifact(ctx context.Context, req ArtifactRollbackReque
 	if len(servicesForLock) == 1 {
 		lockService = cleanAIFARServiceName(servicesForLock[0])
 	}
-	_, err := s.acquireOrchestrationLock(req.Instance.ID, "rollback-artifact", lockService, req.Actor, fallbackTaskID(req.TaskID, log))
+	_, lock, err := s.acquireOrchestrationLock(req.Instance.ID, "rollback-artifact", lockService, req.Actor, fallbackTaskID(req.TaskID, log))
 	if err != nil {
 		msg := fmt.Sprintf(copy.UpdateFailed, err)
 		logForServer.Error("%s", msg)
 		finishTarget(recorder, target, "failed", msg)
 		return err
 	}
-	defer s.releaseOrchestrationLock(req.Instance.ID, "rollback-artifact", lockService)
+	defer s.releaseOrchestrationLock(lock)
 	lockedInstance, err := s.store.GetAppInstance(req.Instance.ID)
 	if err != nil {
 		msg := fmt.Sprintf(copy.UpdateFailed, err)

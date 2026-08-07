@@ -25,12 +25,12 @@ func (s Service) ReconcileRuntime(ctx context.Context, req RuntimeReconcileReque
 	if recorder != nil {
 		recorder.StartTarget(target)
 	}
-	current, err := s.acquireOrchestrationLock(req.Instance.ID, "runtime-reconcile", "", req.Actor, fallbackTaskID(req.TaskID, log))
+	current, lock, err := s.acquireOrchestrationLock(req.Instance.ID, "runtime-reconcile", "", req.Actor, fallbackTaskID(req.TaskID, log))
 	if err != nil {
 		finishTarget(recorder, target, "failed", err.Error())
 		return err
 	}
-	defer s.releaseOrchestrationLock(req.Instance.ID, "runtime-reconcile", "")
+	defer s.releaseOrchestrationLock(lock)
 
 	metadata := metadataFromInstance(current)
 	if err := ensureK8sLikeMetadata(metadata, UpdateCopy{LegacyUpdateUnsupported: "legacy AIFAR orchestration model %s does not support runtime reconcile; reinstall with k8s-like orchestration first"}); err != nil {

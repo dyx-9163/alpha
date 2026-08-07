@@ -25,6 +25,7 @@ import (
 	"aifar-deployment/backend/internal/adapter"
 	"aifar-deployment/backend/internal/apps/registry"
 	"aifar-deployment/backend/internal/store"
+	"aifar-deployment/backend/internal/worker"
 )
 
 type fakeStore struct {
@@ -63,6 +64,10 @@ func (*rollbackLockRaceStore) ReleaseAIFAROrchestrationLock(string, string, stri
 }
 
 func (*rollbackLockRaceStore) RenewAIFAROrchestrationLock(string, time.Time) (bool, error) {
+	return true, nil
+}
+
+func (*rollbackLockRaceStore) ReleaseAIFAROrchestrationLockByID(string) (bool, error) {
 	return true, nil
 }
 
@@ -1497,7 +1502,7 @@ func TestServiceOrchestrationLocksAllowDifferentServices(t *testing.T) {
 	s := &fakeStore{instances: []store.AppInstance{instance}}
 	service := NewService(s, &fakeRemote{})
 
-	if _, err := service.acquireOrchestrationLock(instance.ID, "scale-service", "permission", "operator", ""); err != nil {
+	if _, _, err := service.acquireOrchestrationLock(instance.ID, "scale-service", "permission", "operator", ""); err != nil {
 		t.Fatalf("expected file mutation not to block permission mutation, got %v", err)
 	}
 	saved, err := s.GetAppInstance(instance.ID)
@@ -1541,6 +1546,102 @@ func TestAutoscalerAllowsDifferentServiceMutation(t *testing.T) {
 	}
 }
 
+func TestAutoscalerTickStartsUnrelatedServiceDespiteServiceLock(t *testing.T) {
+	db := openAIFARTestStore(t)
+	instance := installedAIFARInstance(t)
+	metadata := metadataFromInstance(instance)
+	now := time.Now().UTC()
+	metadata["autoscalePolicy"] = AutoscalePolicy{Enabled: true, MemoryThreshold: 80, Sustain: time.Minute, Cooldown: time.Minute, MaxReplicas: 3}.metadata()
+	metadata["autoscaleSignals"] = map[string]any{"permission": map[string]any{"since": now.Add(-2 * time.Minute).Format(time.RFC3339)}}
+	instance.Metadata = mustMetadata(t, metadata)
+	if _, err := db.SaveAppInstance(instance); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.SaveServer(store.Server{ID: instance.ServerID, Name: "node-1", Host: "127.0.0.1", Username: "root"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.AcquireAIFAROrchestrationLock(store.AIFAROrchestrationLock{
+		InstanceID: instance.ID, ServiceName: "file", Operation: "scale-service", ExpiresAt: now.Add(time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	remote := &fakeRemote{autoscaleStatusFallback: "endpoint=permission|aifar-permission-rel|rel|1|38010|true|healthy|90|2147483648\nhostMemoryAvailableBytes=8589934592\n"}
+	autoscaler := NewAutoscaler(db, worker.NewManager(db), remote)
+	autoscaler.tick(context.Background(), now)
+	tasks, err := db.ListTasks()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tasks) != 1 || tasks[0].Target != instance.ID+":permission" {
+		t.Fatalf("unrelated service lock prevented permission autoscale task: %+v", tasks)
+	}
+}
+
+func TestScaleServicesLockEachAffectedService(t *testing.T) {
+	db := openAIFARTestStore(t)
+	instance := installedAIFARInstance(t)
+	if _, err := db.SaveAppInstance(instance); err != nil {
+		t.Fatal(err)
+	}
+	service := NewService(db, &fakeRemote{})
+	if _, err := db.AcquireAIFAROrchestrationLock(store.AIFAROrchestrationLock{
+		InstanceID: instance.ID, ServiceName: "file", Operation: "scale-service", ExpiresAt: time.Now().UTC().Add(time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := service.acquireServiceOrchestrationLocks(instance.ID, "scale-service", []string{"file", "gateway"}, "operator", "task-file"); err == nil {
+		t.Fatal("batch containing file must conflict with active file operation")
+	}
+	_, locks, err := service.acquireServiceOrchestrationLocks(instance.ID, "scale-service", []string{"gateway", "permission"}, "operator", "task-other")
+	if err != nil {
+		t.Fatalf("batch of unrelated services must proceed: %v", err)
+	}
+	defer service.releaseOrchestrationLocks(locks)
+	if len(locks) != 2 || locks[0].ServiceName != "gateway" || locks[1].ServiceName != "permission" {
+		t.Fatalf("batch locks=%+v, want deterministic gateway and permission scopes", locks)
+	}
+}
+
+func TestServiceReleaseOrchestrationLockDoesNotReleaseSuccessor(t *testing.T) {
+	db := openAIFARTestStore(t)
+	instance := installedAIFARInstance(t)
+	if _, err := db.SaveAppInstance(instance); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	ownerA, err := db.AcquireAIFAROrchestrationLock(store.AIFAROrchestrationLock{
+		ID: "owner-a", InstanceID: instance.ID, ServiceName: "file", Operation: "scale-service",
+		StartedAt: now.Add(-2 * time.Hour), ExpiresAt: now.Add(-time.Hour),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ownerB, err := db.AcquireAIFAROrchestrationLock(store.AIFAROrchestrationLock{
+		ID: "owner-b", InstanceID: instance.ID, ServiceName: "file", Operation: "scale-service", ExpiresAt: now.Add(time.Hour),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	NewService(db, &fakeRemote{}).releaseOrchestrationLock(ownerA)
+	_, err = db.AcquireAIFAROrchestrationLock(store.AIFAROrchestrationLock{
+		InstanceID: instance.ID, ServiceName: "file", Operation: "scale-service", ExpiresAt: now.Add(time.Hour),
+	})
+	var conflict store.AIFAROrchestrationLockConflict
+	if !errors.As(err, &conflict) || conflict.Lock.ID != ownerB.ID {
+		t.Fatalf("stale owner released successor: err=%v", err)
+	}
+}
+
+func openAIFARTestStore(t *testing.T) *store.Store {
+	t.Helper()
+	db, err := store.Open(filepath.Join(t.TempDir(), "aifar.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	return db
+}
+
 func TestServiceOrchestrationLocksBlockSameServiceAndGlobalOperations(t *testing.T) {
 	instance := installedAIFARInstance(t)
 	metadata := metadataFromInstance(instance)
@@ -1556,10 +1657,10 @@ func TestServiceOrchestrationLocksBlockSameServiceAndGlobalOperations(t *testing
 	s := &fakeStore{instances: []store.AppInstance{instance}}
 	service := NewService(s, &fakeRemote{})
 
-	if _, err := service.acquireOrchestrationLock(instance.ID, "scale-service", "file", "operator", ""); err == nil || !strings.Contains(err.Error(), "instance orchestration is locked") {
+	if _, _, err := service.acquireOrchestrationLock(instance.ID, "scale-service", "file", "operator", ""); err == nil || !strings.Contains(err.Error(), "instance orchestration is locked") {
 		t.Fatalf("expected instance mutation lock to block the same service, got %v", err)
 	}
-	if _, err := service.acquireOrchestrationLock(instance.ID, "runtime-config", "", "operator", ""); err == nil || !strings.Contains(err.Error(), "instance orchestration is locked") {
+	if _, _, err := service.acquireOrchestrationLock(instance.ID, "runtime-config", "", "operator", ""); err == nil || !strings.Contains(err.Error(), "instance orchestration is locked") {
 		t.Fatalf("expected global operation to wait for service lock, got %v", err)
 	}
 }
@@ -1576,7 +1677,7 @@ func TestGlobalOrchestrationLockBlocksServiceOperations(t *testing.T) {
 	s := &fakeStore{instances: []store.AppInstance{instance}}
 	service := NewService(s, &fakeRemote{})
 
-	if _, err := service.acquireOrchestrationLock(instance.ID, "scale-service", "permission", "operator", ""); err == nil || !strings.Contains(err.Error(), "instance orchestration is locked") {
+	if _, _, err := service.acquireOrchestrationLock(instance.ID, "scale-service", "permission", "operator", ""); err == nil || !strings.Contains(err.Error(), "instance orchestration is locked") {
 		t.Fatalf("expected global lock to block service operation, got %v", err)
 	}
 }
@@ -1649,7 +1750,7 @@ func TestServiceMigratesMetadataOrchestrationLocksToStructuredStore(t *testing.T
 		t.Fatal(err)
 	}
 	service := NewService(db, &fakeRemote{})
-	if _, err := service.acquireOrchestrationLock(instance.ID, "delete", "", "admin", "tsk-delete"); err == nil || !strings.Contains(err.Error(), "instance orchestration is locked") {
+	if _, _, err := service.acquireOrchestrationLock(instance.ID, "delete", "", "admin", "tsk-delete"); err == nil || !strings.Contains(err.Error(), "instance orchestration is locked") {
 		locks, listErr := db.ListAIFAROrchestrationLocks(instance.ID, false)
 		t.Fatalf("expected migrated gateway lock to block global delete, got %v locks=%+v listErr=%v", err, locks, listErr)
 	}
@@ -1671,7 +1772,7 @@ func TestServiceMigratesMetadataOrchestrationLocksToStructuredStore(t *testing.T
 	if _, err := db.RecoverAIFAROrchestrationLocks(instance.ID, "test recovery"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := service.acquireOrchestrationLock(instance.ID, "delete", "", "admin", "tsk-delete"); err != nil {
+	if _, _, err := service.acquireOrchestrationLock(instance.ID, "delete", "", "admin", "tsk-delete"); err != nil {
 		t.Fatalf("expected global delete lock after recovery, got %v", err)
 	}
 }

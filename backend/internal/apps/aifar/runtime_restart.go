@@ -60,11 +60,11 @@ func (s Service) RestartRuntime(ctx context.Context, req RuntimeRestartRequest, 
 	}
 
 	startStep(0)
-	current, err := s.acquireOrchestrationLock(req.Instance.ID, "runtime-restart-all", "", req.Actor, fallbackTaskID(req.TaskID, log))
+	current, lock, err := s.acquireOrchestrationLock(req.Instance.ID, "runtime-restart-all", "", req.Actor, fallbackTaskID(req.TaskID, log))
 	if err != nil {
 		return fail(err)
 	}
-	defer s.releaseOrchestrationLock(req.Instance.ID, "runtime-restart-all", "")
+	defer s.releaseOrchestrationLock(lock)
 	finishStep("success", "")
 
 	startStep(1)

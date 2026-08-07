@@ -72,6 +72,7 @@ type aifarRuntimeCleanupStore interface {
 type aifarOrchestrationLockStore interface {
 	AcquireAIFAROrchestrationLock(store.AIFAROrchestrationLock) (store.AIFAROrchestrationLock, error)
 	RenewAIFAROrchestrationLock(id string, expiresAt time.Time) (bool, error)
+	ReleaseAIFAROrchestrationLockByID(id string) (bool, error)
 	ReleaseAIFAROrchestrationLock(instanceID, operation, serviceName string) (bool, error)
 	RecoverAIFAROrchestrationLocks(instanceID, reason string) (int, error)
 }
@@ -1211,14 +1212,14 @@ func (s Service) UpdateArtifact(ctx context.Context, req ArtifactUpdateRequest, 
 		recorder.StartTarget(target)
 	}
 	step := newStepRunner(logForServer, recorder, target, updateSteps(copy), copy.StepStart, copy.StepDone, copy.StepFailed)
-	lockedInstance, err := s.acquireOrchestrationLock(req.Instance.ID, "update-artifact", strings.TrimSpace(req.ServiceName), req.Actor, fallbackTaskID(req.TaskID, log))
+	lockedInstance, lock, err := s.acquireOrchestrationLock(req.Instance.ID, "update-artifact", strings.TrimSpace(req.ServiceName), req.Actor, fallbackTaskID(req.TaskID, log))
 	if err != nil {
 		msg := fmt.Sprintf(copy.UpdateFailed, err)
 		logForServer.Error("%s", msg)
 		finishTarget(recorder, target, "failed", msg)
 		return err
 	}
-	defer s.releaseOrchestrationLock(req.Instance.ID, "update-artifact", strings.TrimSpace(req.ServiceName))
+	defer s.releaseOrchestrationLock(lock)
 	req.Instance = lockedInstance
 
 	var artifact artifactInfo
@@ -1732,14 +1733,14 @@ func (s Service) Delete(ctx context.Context, req DeleteRequest, log Logger, targ
 		recorder.StartTarget(target)
 	}
 	step := newStepRunner(logForServer, recorder, target, deleteSteps(copy), copy.StepStart, copy.StepDone, copy.StepFailed)
-	lockedInstance, err := s.acquireOrchestrationLock(req.Instance.ID, "delete", "", req.Actor, fallbackTaskID(req.TaskID, log))
+	lockedInstance, lock, err := s.acquireOrchestrationLock(req.Instance.ID, "delete", "", req.Actor, fallbackTaskID(req.TaskID, log))
 	if err != nil {
 		msg := fmt.Sprintf(copy.DeleteFailed, err)
 		logForServer.Error("%s", msg)
 		finishTarget(recorder, target, "failed", msg)
 		return err
 	}
-	defer s.releaseOrchestrationLock(req.Instance.ID, "delete", "")
+	defer s.releaseOrchestrationLock(lock)
 	req.Instance = lockedInstance
 	metadata := metadataFromInstance(req.Instance)
 	networkName := stringFromMetadata(metadata, "networkName", defaultNetworkName)
