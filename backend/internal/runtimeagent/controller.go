@@ -1,0 +1,483 @@
+package runtimeagent
+
+import (
+	"context"
+	"errors"
+	"strings"
+	"sync"
+	"time"
+)
+
+const (
+	deploymentConditionAccepted    = "Accepted"
+	deploymentConditionProgressing = "Progressing"
+	deploymentConditionAvailable   = "Available"
+	deploymentConditionDegraded    = "Degraded"
+	deploymentConditionOffline     = "Offline"
+)
+
+var deploymentRetryBackoff = [...]time.Duration{
+	time.Second,
+	2 * time.Second,
+	4 * time.Second,
+	8 * time.Second,
+	16 * time.Second,
+	30 * time.Second,
+	60 * time.Second,
+}
+
+type controllerTimer interface {
+	C() <-chan time.Time
+	Stop() bool
+}
+
+type controllerClock interface {
+	Now() time.Time
+	NewTimer(time.Duration) controllerTimer
+}
+
+type realControllerClock struct{}
+
+func (realControllerClock) Now() time.Time { return time.Now() }
+
+func (realControllerClock) NewTimer(duration time.Duration) controllerTimer {
+	return realControllerTimer{Timer: time.NewTimer(duration)}
+}
+
+type realControllerTimer struct{ *time.Timer }
+
+func (timer realControllerTimer) C() <-chan time.Time { return timer.Timer.C }
+
+type serviceController struct {
+	manager    *Manager
+	instanceID string
+	service    string
+	wake       chan struct{}
+	stop       chan struct{}
+
+	mu                 sync.Mutex
+	cancel             context.CancelFunc
+	activeGeneration   int64
+	rejectedGeneration int64
+	failures           int
+	stopped            bool
+}
+
+func (m *Manager) AcceptDeployment(ctx context.Context, manifest DeploymentManifest) (DeploymentAcceptance, error) {
+	if err := ctx.Err(); err != nil {
+		return DeploymentAcceptance{}, err
+	}
+	manifest = NormalizeDeploymentManifest(manifest)
+	acceptance, err := m.manifestStore.Put(manifest)
+	if err != nil {
+		return acceptance, err
+	}
+
+	key := endpointKey(manifest.Metadata.InstanceID, manifest.Metadata.Name)
+	m.controllerMu.Lock()
+	m.manifestCache[key] = manifest
+	controller := m.controllerForLocked(manifest.Metadata.InstanceID, manifest.Metadata.Name)
+	previous := m.controllerStates[key]
+	m.controllerStates[key] = transitionDeploymentState(previous, manifest, acceptance.SpecHash, deploymentConditionAccepted, "ManifestAccepted", 0, 0, m.controllerClock.Now())
+	m.controllerMu.Unlock()
+
+	controller.supersede(manifest.Metadata.Generation)
+	controller.enqueue()
+	return acceptance, nil
+}
+
+func (m *Manager) enqueuePersistedDeployment(manifest DeploymentManifest) error {
+	manifest = NormalizeDeploymentManifest(manifest)
+	hash, err := DeploymentManifestSpecHash(manifest)
+	if err != nil {
+		return err
+	}
+	key := endpointKey(manifest.Metadata.InstanceID, manifest.Metadata.Name)
+	m.controllerMu.Lock()
+	m.manifestCache[key] = manifest
+	controller := m.controllerForLocked(manifest.Metadata.InstanceID, manifest.Metadata.Name)
+	previous := m.controllerStates[key]
+	m.controllerStates[key] = transitionDeploymentState(previous, manifest, hash, deploymentConditionAccepted, "ManifestAccepted", 0, 0, m.controllerClock.Now())
+	m.controllerMu.Unlock()
+	controller.supersede(manifest.Metadata.Generation)
+	controller.enqueue()
+	return nil
+}
+
+func (m *Manager) ReconcileDeployment(instanceID, serviceName string) {
+	instanceID = strings.TrimSpace(instanceID)
+	serviceName = normalizeServiceManifestName(serviceName)
+	if validateInstanceManifestName(instanceID) != nil || validateServiceManifestName(serviceName) != nil {
+		return
+	}
+	m.controllerMu.Lock()
+	controller := m.controllerForLocked(instanceID, serviceName)
+	m.controllerMu.Unlock()
+	controller.resetBackoff()
+	controller.enqueue()
+}
+
+func (m *Manager) DeploymentState(instanceID, serviceName string) (DeploymentState, bool) {
+	key := endpointKey(strings.TrimSpace(instanceID), normalizeServiceManifestName(serviceName))
+	m.controllerMu.Lock()
+	defer m.controllerMu.Unlock()
+	state, ok := m.controllerStates[key]
+	if !ok {
+		return DeploymentState{}, false
+	}
+	state.Conditions = append([]DeploymentCondition(nil), state.Conditions...)
+	return state, true
+}
+
+func (m *Manager) controllerForLocked(instanceID, serviceName string) *serviceController {
+	key := endpointKey(instanceID, serviceName)
+	if controller := m.controllers[key]; controller != nil {
+		return controller
+	}
+	controller := &serviceController{
+		manager:    m,
+		instanceID: instanceID,
+		service:    serviceName,
+		wake:       make(chan struct{}, 1),
+		stop:       make(chan struct{}),
+	}
+	m.controllers[key] = controller
+	go controller.run()
+	return controller
+}
+
+func (m *Manager) instanceMaintenanceLock(instanceID string) *sync.RWMutex {
+	instanceID = strings.TrimSpace(instanceID)
+	m.maintenanceMu.Lock()
+	defer m.maintenanceMu.Unlock()
+	lock := m.maintenanceLocks[instanceID]
+	if lock == nil {
+		lock = &sync.RWMutex{}
+		m.maintenanceLocks[instanceID] = lock
+	}
+	return lock
+}
+
+func (controller *serviceController) enqueue() {
+	controller.mu.Lock()
+	stopped := controller.stopped
+	controller.mu.Unlock()
+	if stopped {
+		return
+	}
+	select {
+	case controller.wake <- struct{}{}:
+	default:
+	}
+}
+
+func (controller *serviceController) supersede(generation int64) {
+	controller.mu.Lock()
+	if controller.cancel != nil && generation > controller.activeGeneration {
+		controller.cancel()
+	}
+	controller.mu.Unlock()
+}
+
+func (controller *serviceController) resetBackoff() {
+	controller.mu.Lock()
+	controller.failures = 0
+	controller.mu.Unlock()
+}
+
+func (controller *serviceController) run() {
+	defer recoverRuntimeAgentPanic(controller.manager.log, "per-service deployment controller")
+	for {
+		select {
+		case <-controller.stop:
+			return
+		case <-controller.wake:
+			controller.reconcileUntilStable()
+		}
+	}
+}
+
+func (controller *serviceController) reconcileUntilStable() {
+	for {
+		if controller.isStopped() {
+			return
+		}
+		result := controller.reconcileOnce()
+		switch result.kind {
+		case reconcileSuperseded:
+			continue
+		case reconcileStable, reconcileSpecRejected:
+			return
+		case reconcileRetry:
+			delay := controller.nextBackoff()
+			timer := controller.manager.controllerClock.NewTimer(delay)
+			select {
+			case <-controller.stop:
+				timer.Stop()
+				return
+			case <-controller.wake:
+				timer.Stop()
+				continue
+			case <-timer.C():
+				continue
+			}
+		}
+	}
+}
+
+func (controller *serviceController) isStopped() bool {
+	controller.mu.Lock()
+	defer controller.mu.Unlock()
+	return controller.stopped
+}
+
+func (controller *serviceController) stopController() {
+	controller.mu.Lock()
+	if controller.stopped {
+		controller.mu.Unlock()
+		return
+	}
+	controller.stopped = true
+	if controller.cancel != nil {
+		controller.cancel()
+	}
+	close(controller.stop)
+	controller.mu.Unlock()
+}
+
+type reconcileResultKind uint8
+
+const (
+	reconcileStable reconcileResultKind = iota
+	reconcileRetry
+	reconcileSpecRejected
+	reconcileSuperseded
+)
+
+type reconcileResult struct{ kind reconcileResultKind }
+
+func (controller *serviceController) reconcileOnce() reconcileResult {
+	manager := controller.manager
+	cachedGeneration := manager.cachedControllerGeneration(controller.instanceID, controller.service)
+	if controller.rejectsGeneration(cachedGeneration) {
+		return reconcileResult{kind: reconcileSpecRejected}
+	}
+	maintenance := manager.instanceMaintenanceLock(controller.instanceID)
+	maintenance.RLock()
+	defer maintenance.RUnlock()
+
+	manifest, err := manager.manifestStore.Get(controller.instanceID, controller.service)
+	if err != nil {
+		controller.markRejected(cachedGeneration)
+		manager.setControllerRejected(controller.instanceID, controller.service, err)
+		return reconcileResult{kind: reconcileSpecRejected}
+	}
+	config, err := manager.manifestStore.GetInstance(controller.instanceID)
+	if err != nil {
+		controller.markRejected(manifest.Metadata.Generation)
+		manager.setControllerRejected(controller.instanceID, controller.service, err)
+		return reconcileResult{kind: reconcileSpecRejected}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	controller.mu.Lock()
+	controller.cancel = cancel
+	controller.activeGeneration = manifest.Metadata.Generation
+	controller.mu.Unlock()
+	defer func() {
+		cancel()
+		controller.mu.Lock()
+		if controller.activeGeneration == manifest.Metadata.Generation {
+			controller.cancel = nil
+		}
+		controller.mu.Unlock()
+	}()
+
+	hash, hashErr := DeploymentManifestSpecHash(manifest)
+	if hashErr != nil {
+		controller.markRejected(manifest.Metadata.Generation)
+		manager.setControllerRejected(controller.instanceID, controller.service, hashErr)
+		return reconcileResult{kind: reconcileSpecRejected}
+	}
+	manager.setControllerCondition(manifest, hash, deploymentConditionProgressing, "Reconciling", false)
+	spec := runtimeSpecForDeployment(config, manifest)
+	err = manager.ensureDeployment(ctx, spec, manifest.Spec)
+	if errors.Is(err, context.Canceled) && controller.isSuperseded(manifest.Metadata.Generation) {
+		return reconcileResult{kind: reconcileSuperseded}
+	}
+	if err != nil {
+		manager.setControllerCondition(manifest, hash, deploymentConditionDegraded, deploymentFailureReason(err), true)
+		return reconcileResult{kind: reconcileRetry}
+	}
+
+	controller.resetBackoff()
+	controller.clearRejected(manifest.Metadata.Generation)
+	if manifest.Spec.Replicas == 0 {
+		manager.setControllerCondition(manifest, hash, deploymentConditionOffline, "DesiredReplicasZero", true)
+	} else {
+		manager.setControllerCondition(manifest, hash, deploymentConditionAvailable, "MinimumReplicasAvailable", true)
+	}
+	return reconcileResult{kind: reconcileStable}
+}
+
+func (controller *serviceController) rejectsGeneration(generation int64) bool {
+	controller.mu.Lock()
+	defer controller.mu.Unlock()
+	return generation > 0 && generation <= controller.rejectedGeneration
+}
+
+func (controller *serviceController) markRejected(generation int64) {
+	controller.mu.Lock()
+	if generation > controller.rejectedGeneration {
+		controller.rejectedGeneration = generation
+	}
+	controller.mu.Unlock()
+}
+
+func (controller *serviceController) clearRejected(generation int64) {
+	controller.mu.Lock()
+	if generation >= controller.rejectedGeneration {
+		controller.rejectedGeneration = 0
+	}
+	controller.mu.Unlock()
+}
+
+func (controller *serviceController) isSuperseded(generation int64) bool {
+	controller.mu.Lock()
+	defer controller.mu.Unlock()
+	return controller.activeGeneration == generation && controller.cancel != nil
+}
+
+func (controller *serviceController) nextBackoff() time.Duration {
+	controller.mu.Lock()
+	defer controller.mu.Unlock()
+	index := controller.failures
+	if index >= len(deploymentRetryBackoff) {
+		index = len(deploymentRetryBackoff) - 1
+	}
+	controller.failures++
+	return deploymentRetryBackoff[index]
+}
+
+func runtimeSpecForDeployment(config InstanceConfig, manifest DeploymentManifest) RuntimeSpec {
+	return RuntimeSpec{
+		Version:     DefaultAgentVersion,
+		InstanceID:  config.InstanceID,
+		InstallRoot: config.InstallRoot,
+		Network:     config.Network,
+		Ingress:     config.Ingress,
+		Deployments: []DeploymentSpec{manifest.Spec},
+		Services:    []ServiceSpec{manifest.Service},
+	}
+}
+
+func (m *Manager) setControllerRejected(instanceID, serviceName string, reconcileErr error) {
+	key := endpointKey(instanceID, serviceName)
+	m.controllerMu.Lock()
+	manifest, ok := m.manifestCache[key]
+	state := m.controllerStates[key]
+	hash := state.SpecHash
+	if ok {
+		state = transitionDeploymentState(state, manifest, hash, deploymentConditionDegraded, "SpecRejected", 0, 0, m.controllerClock.Now())
+	} else {
+		state.InstanceID = instanceID
+		state.ServiceName = serviceName
+		state.Conditions = []DeploymentCondition{{Type: deploymentConditionDegraded, Status: true, Reason: "SpecRejected", Generation: state.Generation, LastTransitionTime: m.controllerClock.Now()}}
+	}
+	m.controllerStates[key] = state
+	m.controllerMu.Unlock()
+	logf(m.log, "AIFAR deployment manifest rejected instance=%s service=%s error=%v\n", instanceID, serviceName, reconcileErr)
+}
+
+func (m *Manager) setControllerCondition(manifest DeploymentManifest, hash, conditionType, reason string, observed bool) {
+	key := endpointKey(manifest.Metadata.InstanceID, manifest.Metadata.Name)
+	currentReplicas, readyReplicas := m.controllerReplicaCounts(key)
+	m.controllerMu.Lock()
+	state := m.controllerStates[key]
+	if state.Generation > manifest.Metadata.Generation {
+		m.controllerMu.Unlock()
+		return
+	}
+	state = transitionDeploymentState(state, manifest, hash, conditionType, reason, currentReplicas, readyReplicas, m.controllerClock.Now())
+	if observed {
+		state.ObservedGeneration = manifest.Metadata.Generation
+	}
+	m.controllerStates[key] = state
+	m.controllerMu.Unlock()
+}
+
+func (m *Manager) controllerReplicaCounts(key string) (int, int) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	status := m.deployments[key]
+	return status.CurrentReplicas, status.ReadyReplicas
+}
+
+func (m *Manager) cachedControllerGeneration(instanceID, serviceName string) int64 {
+	key := endpointKey(instanceID, serviceName)
+	m.controllerMu.Lock()
+	defer m.controllerMu.Unlock()
+	return m.manifestCache[key].Metadata.Generation
+}
+
+func transitionDeploymentState(current DeploymentState, manifest DeploymentManifest, hash, conditionType, reason string, currentReplicas, readyReplicas int, now time.Time) DeploymentState {
+	condition := DeploymentCondition{
+		Type:               conditionType,
+		Status:             true,
+		Reason:             reason,
+		Generation:         manifest.Metadata.Generation,
+		LastTransitionTime: now,
+	}
+	if len(current.Conditions) == 1 {
+		previous := current.Conditions[0]
+		if previous.Type == condition.Type && previous.Status == condition.Status && previous.Reason == condition.Reason && previous.Generation == condition.Generation {
+			condition.LastTransitionTime = previous.LastTransitionTime
+		}
+	}
+	current.InstanceID = manifest.Metadata.InstanceID
+	current.ServiceName = manifest.Metadata.Name
+	current.Generation = manifest.Metadata.Generation
+	current.SpecHash = hash
+	current.DesiredReplicas = manifest.Spec.Replicas
+	current.CurrentReplicas = currentReplicas
+	current.ReadyReplicas = readyReplicas
+	current.Conditions = []DeploymentCondition{condition}
+	return current
+}
+
+func deploymentFailureReason(err error) string {
+	message := strings.ToLower(strings.TrimSpace(err.Error()))
+	switch {
+	case strings.Contains(message, "no such image"), strings.Contains(message, "pull access denied"), strings.Contains(message, "manifest unknown"):
+		return "ImageMissing"
+	case strings.Contains(message, "crashloopbackoff"), strings.Contains(message, "crash loop"):
+		return "CrashLoopBackOff"
+	case strings.Contains(message, "no space left"), strings.Contains(message, "resource pressure"), strings.Contains(message, "cannot allocate memory"), strings.Contains(message, "oom"):
+		return "NodeResourcePressure"
+	case strings.Contains(message, "cannot connect to the docker daemon"), strings.Contains(message, "docker daemon is unavailable"), strings.Contains(message, "connection refused"):
+		return "AgentUnavailable"
+	case strings.Contains(message, "did not become ready"), strings.Contains(message, "readiness"), strings.Contains(message, "health"):
+		return "ReadinessFailed"
+	case strings.Contains(message, "start stopped"), strings.Contains(message, "restart unhealthy"):
+		return "ContainerStartFailed"
+	case strings.Contains(message, "create"), strings.Contains(message, "start aifar pod"), strings.Contains(message, "docker run"):
+		return "ContainerCreateFailed"
+	default:
+		return "ContainerCreateFailed"
+	}
+}
+
+func (m *Manager) removeServiceControllers(instanceID string) {
+	prefix := strings.TrimSpace(instanceID) + "/"
+	m.controllerMu.Lock()
+	for key, controller := range m.controllers {
+		if !strings.HasPrefix(key, prefix) {
+			continue
+		}
+		controller.stopController()
+		delete(m.controllers, key)
+		delete(m.controllerStates, key)
+		delete(m.manifestCache, key)
+	}
+	m.controllerMu.Unlock()
+}

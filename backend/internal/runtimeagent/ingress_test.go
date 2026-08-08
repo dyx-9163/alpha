@@ -46,6 +46,49 @@ func (f *fakeRunner) callsString() string {
 	return strings.Join(f.calls, "\n")
 }
 
+func TestManagerRemoveCancelsActiveServiceControllerBeforeMaintenance(t *testing.T) {
+	runner := newControllerTestRunner()
+	runner.blockedService = "permission"
+	manager := newControllerTestManager(t, runner)
+	if _, err := manager.AcceptDeployment(context.Background(), controllerTestManifest("permission", 1, 1)); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-runner.blocked:
+	case <-time.After(time.Second):
+		t.Fatal("service controller did not enter active reconcile")
+	}
+	done := make(chan error, 1)
+	go func() { done <- manager.Remove(context.Background(), "admin") }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("instance removal deadlocked behind its active service controller")
+	}
+}
+
+func TestManagerLoadStartsPersistedServiceControllers(t *testing.T) {
+	stateDir := t.TempDir()
+	store := ManifestStore{StateDir: stateDir}
+	if err := store.PutInstance(controllerTestConfig()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Put(controllerTestManifest("permission", 1, 1)); err != nil {
+		t.Fatal(err)
+	}
+	manager := NewManager(ManagerOptions{StateDir: stateDir, Runner: newControllerTestRunner(), ManifestStore: &store})
+	if err := manager.Load(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	state := waitForDeploymentCondition(t, manager, "permission", "Available", time.Second)
+	if state.ObservedGeneration != 1 {
+		t.Fatalf("observed generation=%d, want 1", state.ObservedGeneration)
+	}
+}
+
 func TestManagerRestartAllRestoresMissingDesiredPod(t *testing.T) {
 	runner := newStopAllRestartRunner("aifar-pod-admin-gateway-rev-1-r1")
 	manager := NewManager(ManagerOptions{StateDir: t.TempDir(), Runner: runner})

@@ -58,9 +58,11 @@ func (r Reconciler) ReconcileIngress(ctx context.Context, spec RuntimeSpec) erro
 }
 
 type ManagerOptions struct {
-	StateDir string
-	Runner   CommandRunner
-	Log      io.Writer
+	StateDir        string
+	Runner          CommandRunner
+	Log             io.Writer
+	ManifestStore   *ManifestStore
+	controllerClock controllerClock
 }
 
 type Manager struct {
@@ -79,6 +81,14 @@ type Manager struct {
 	endpoints         map[string][]endpoint
 	deployments       map[string]deploymentRuntimeStatus
 	services          map[string]serviceRuntimeStatus
+	controllerMu      sync.Mutex
+	controllers       map[string]*serviceController
+	controllerStates  map[string]DeploymentState
+	manifestCache     map[string]DeploymentManifest
+	manifestStore     ManifestStore
+	controllerClock   controllerClock
+	maintenanceMu     sync.Mutex
+	maintenanceLocks  map[string]*sync.RWMutex
 }
 
 type proxyRoute struct {
@@ -141,7 +151,7 @@ func NewManager(options ManagerOptions) *Manager {
 	if runner == nil {
 		runner = ExecRunner{}
 	}
-	return &Manager{
+	manager := &Manager{
 		stateDir:          stateDir,
 		runner:            runner,
 		log:               options.Log,
@@ -153,7 +163,21 @@ func NewManager(options ManagerOptions) *Manager {
 		endpoints:         map[string][]endpoint{},
 		deployments:       map[string]deploymentRuntimeStatus{},
 		services:          map[string]serviceRuntimeStatus{},
+		controllers:       map[string]*serviceController{},
+		controllerStates:  map[string]DeploymentState{},
+		manifestCache:     map[string]DeploymentManifest{},
+		controllerClock:   options.controllerClock,
+		maintenanceLocks:  map[string]*sync.RWMutex{},
 	}
+	if manager.controllerClock == nil {
+		manager.controllerClock = realControllerClock{}
+	}
+	if options.ManifestStore != nil {
+		manager.manifestStore = *options.ManifestStore
+	} else {
+		manager.manifestStore = ManifestStore{StateDir: stateDir}
+	}
+	return manager
 }
 
 func (m *Manager) Load(ctx context.Context) error {
@@ -166,6 +190,29 @@ func (m *Manager) Load(ctx context.Context) error {
 	}
 	for _, entry := range entries {
 		if !entry.IsDir() {
+			continue
+		}
+		instancePath := filepath.Join(m.stateDir, entry.Name(), "instance.json")
+		if _, statErr := os.Lstat(instancePath); statErr == nil {
+			if _, configErr := m.manifestStore.GetInstance(entry.Name()); configErr != nil {
+				logf(m.log, "skip invalid AIFAR runtime instance config %s: %v\n", entry.Name(), configErr)
+				continue
+			}
+			manifests, listErr := m.manifestStore.List(entry.Name())
+			for _, manifest := range manifests {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+				if enqueueErr := m.enqueuePersistedDeployment(manifest); enqueueErr != nil {
+					logf(m.log, "skip invalid AIFAR deployment manifest instance=%s service=%s: %v\n", entry.Name(), manifest.Metadata.Name, enqueueErr)
+				}
+			}
+			if listErr != nil {
+				logf(m.log, "one or more AIFAR deployment manifests were rejected for instance %s: %v\n", entry.Name(), listErr)
+			}
+			continue
+		} else if !os.IsNotExist(statErr) {
+			logf(m.log, "skip unreadable AIFAR runtime instance config %s: %v\n", entry.Name(), statErr)
 			continue
 		}
 		spec, err := readSpecFile(filepath.Join(m.stateDir, entry.Name(), "runtime-spec.json"))
@@ -188,6 +235,9 @@ func (m *Manager) Apply(ctx context.Context, spec RuntimeSpec) error {
 	if err := validateRuntimeSpec(spec); err != nil {
 		return err
 	}
+	maintenance := m.instanceMaintenanceLock(spec.InstanceID)
+	maintenance.Lock()
+	defer maintenance.Unlock()
 	m.mu.RLock()
 	current, hasCurrent := m.specs[spec.InstanceID]
 	m.mu.RUnlock()
@@ -492,6 +542,10 @@ func (m *Manager) Remove(ctx context.Context, instanceID string) error {
 	if instanceID == "" {
 		instanceID = "admin"
 	}
+	m.removeServiceControllers(instanceID)
+	maintenance := m.instanceMaintenanceLock(instanceID)
+	maintenance.Lock()
+	defer maintenance.Unlock()
 	portsToStop := []int{}
 	var spec RuntimeSpec
 	var hasSpec bool
