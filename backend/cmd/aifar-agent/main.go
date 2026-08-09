@@ -149,6 +149,9 @@ func health(ctx context.Context) error {
 }
 
 func serve(addr string) error {
+	if err := validateAgentListenAddress(addr); err != nil {
+		return fmt.Errorf("refuse unsafe aifar-agent listen address: %w", err)
+	}
 	ctx := context.Background()
 	manager := runtimeagent.NewManager(runtimeagent.ManagerOptions{Log: os.Stdout})
 	if err := manager.Load(ctx); err != nil {
@@ -523,13 +526,16 @@ func handleDeploymentRequest(manager *runtimeagent.Manager, w http.ResponseWrite
 		}
 		acceptance, err := manager.AcceptDeployment(r.Context(), manifest)
 		if err != nil {
+			err = manager.ClassifyDeploymentAcceptanceError(manifest, err)
 			switch {
 			case errors.Is(err, runtimeagent.ErrStaleDeploymentGeneration):
 				writeAgentError(w, http.StatusConflict, "STALE_DEPLOYMENT_GENERATION", "deployment generation is stale", map[string]any{"currentGeneration": acceptance.Generation, "currentSpecHash": acceptance.SpecHash})
 			case errors.Is(err, runtimeagent.ErrDeploymentGenerationConflict):
 				writeAgentError(w, http.StatusConflict, "DEPLOYMENT_GENERATION_CONFLICT", "deployment generation already has a different specification", map[string]any{"currentGeneration": acceptance.Generation, "currentSpecHash": acceptance.SpecHash})
-			default:
+			case errors.Is(err, runtimeagent.ErrInvalidDeploymentManifest):
 				writeAgentError(w, http.StatusBadRequest, "INVALID_DEPLOYMENT_MANIFEST", "deployment manifest is invalid", nil)
+			default:
+				writeAgentError(w, http.StatusInternalServerError, "AGENT_STATE_PERSISTENCE_FAILED", "agent state persistence failed", nil)
 			}
 			return
 		}
@@ -743,6 +749,10 @@ func validateLoopbackAgentAddress(addr string) error {
 		return errors.New("agent address must use a loopback host")
 	}
 	return nil
+}
+
+func validateAgentListenAddress(addr string) error {
+	return validateLoopbackAgentAddress(addr)
 }
 
 func validAgentIdentity(instanceID, serviceName string) bool {

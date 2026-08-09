@@ -34,6 +34,22 @@ func TestStatusDoesNotRequireDockerHealth(t *testing.T) {
 	}
 }
 
+func TestServeAddressMustBeLoopback(t *testing.T) {
+	for _, addr := range []string{"127.0.0.1:18081", "127.42.9.8:18081", "[::1]:18081", "localhost:18081", "LOCALHOST:18081"} {
+		if err := validateAgentListenAddress(addr); err != nil {
+			t.Errorf("loopback address %q rejected: %v", addr, err)
+		}
+	}
+	for _, addr := range []string{"0.0.0.0:18081", "[::]:18081", "192.168.1.10:18081", "example.com:18081", ":18081", "[fe80::1%eth0]:18081", "127.0.0.1", "127.0.0.1:0", "127.0.0.1:70000"} {
+		if err := validateAgentListenAddress(addr); err == nil {
+			t.Errorf("non-loopback/invalid address %q accepted", addr)
+		}
+	}
+	if err := serve("0.0.0.0:18081"); err == nil || !strings.Contains(err.Error(), "unsafe") {
+		t.Fatalf("serve did not fail closed before listening: %v", err)
+	}
+}
+
 func TestHealthStillReportsDockerHealth(t *testing.T) {
 	handler := newAgentHandler(runtimeagent.NewManager(runtimeagent.ManagerOptions{StateDir: t.TempDir()}), func(context.Context) error {
 		return errors.New("docker is not ready")
@@ -191,6 +207,31 @@ func TestPutDeploymentReturnsAcceptedBeforeReadiness(t *testing.T) {
 	}
 	if !strings.Contains(recorder.Body.String(), `"accepted":true`) {
 		t.Fatalf("body=%s", recorder.Body.String())
+	}
+}
+
+func TestPutDeploymentPersistenceFailureReturnsSanitized500(t *testing.T) {
+	stateDir := t.TempDir()
+	store := &runtimeagent.ManifestStore{StateDir: stateDir}
+	if err := store.PutInstance(agentTestInstanceConfig()); err != nil {
+		t.Fatal(err)
+	}
+	deploymentsPath := filepath.Join(stateDir, "admin", "deployments")
+	if err := os.WriteFile(deploymentsPath, []byte("remote-secret-path"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	manager := runtimeagent.NewManager(runtimeagent.ManagerOptions{StateDir: stateDir, ManifestStore: store})
+	handler := newAgentHandler(manager, func(context.Context) error { return nil })
+	body, _ := json.Marshal(agentTestManifest(1, "permission:rev-1"))
+	request := httptest.NewRequest(http.MethodPut, "/runtime/instances/admin/deployments/permission", bytes.NewReader(body))
+	request.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusInternalServerError || !strings.Contains(recorder.Body.String(), "AGENT_STATE_PERSISTENCE_FAILED") {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if strings.Contains(recorder.Body.String(), "remote-secret") || strings.Contains(recorder.Body.String(), stateDir) {
+		t.Fatalf("persistence error leaked internal data: %s", recorder.Body.String())
 	}
 }
 

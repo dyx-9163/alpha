@@ -9,6 +9,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestBootstrapRuntimeSplitsLegacySpecWithoutNacos(t *testing.T) {
@@ -42,6 +43,18 @@ func TestBootstrapRuntimeSplitsLegacySpecWithoutNacos(t *testing.T) {
 	}
 	if containsAny(string(data), "nacos", "secret") {
 		t.Fatalf("deployment copied discovery data: %s", data)
+	}
+	entries, err := os.ReadDir(filepath.Join(stateDir, "admin", "deployments"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 2 || entries[0].Name() != "gateway.json" || entries[1].Name() != "permission.json" {
+		t.Fatalf("new deployment directory contains unexpected files: %v", entries)
+	}
+	for _, name := range []string{legacyBootstrapStageDirectory, legacyBootstrapBackupDirectory, legacyBootstrapMarkerFile} {
+		if _, err := os.Lstat(filepath.Join(stateDir, "admin", name)); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("bootstrap artifact %s remains: %v", name, err)
+		}
 	}
 	if _, err := manager.BootstrapLegacyRuntime(context.Background(), legacyBootstrapTestSpec()); !errors.Is(err, ErrLegacyRuntimeSpecDisabled) {
 		t.Fatalf("second bootstrap error=%v", err)
@@ -81,7 +94,7 @@ func TestBootstrapRuntimePartialFailureLeavesLegacyEnabledAndRetries(t *testing.
 	stateDir := t.TempDir()
 	var deploymentRenames atomic.Int32
 	store := &ManifestStore{StateDir: stateDir, renameFile: func(oldPath, newPath string) error {
-		if filepath.Base(filepath.Dir(newPath)) == "deployments" && deploymentRenames.Add(1) == 2 {
+		if filepath.Base(filepath.Dir(newPath)) == legacyBootstrapStageDirectory && deploymentRenames.Add(1) == 2 {
 			return errors.New("injected deployment rename failure")
 		}
 		return os.Rename(oldPath, newPath)
@@ -103,6 +116,128 @@ func TestBootstrapRuntimePartialFailureLeavesLegacyEnabledAndRetries(t *testing.
 		if _, err := store.Get("admin", service); err != nil {
 			t.Fatalf("missing %s after retry: %v", service, err)
 		}
+	}
+}
+
+func TestBootstrapRuntimeHoldsMaintenanceThroughInitialEnqueue(t *testing.T) {
+	stateDir := t.TempDir()
+	markerWritten := make(chan struct{})
+	releaseMarkerSync := make(chan struct{})
+	var signaled atomic.Bool
+	store := &ManifestStore{StateDir: stateDir, syncDirectory: func(path string) error {
+		if filepath.Clean(path) == filepath.Join(stateDir, "admin") {
+			if _, err := os.Lstat(filepath.Join(stateDir, "admin", "instance.json")); err == nil && signaled.CompareAndSwap(false, true) {
+				close(markerWritten)
+				<-releaseMarkerSync
+			}
+		}
+		return nil
+	}}
+	manager := NewManager(ManagerOptions{StateDir: stateDir, ManifestStore: store, Runner: &fakeRunner{}})
+	bootstrapDone := make(chan error, 1)
+	go func() {
+		_, err := manager.BootstrapLegacyRuntime(context.Background(), legacyBootstrapTestSpec())
+		bootstrapDone <- err
+	}()
+	select {
+	case <-markerWritten:
+	case <-time.After(3 * time.Second):
+		t.Fatal("bootstrap did not reach marker-written window")
+	}
+	gen2 := NormalizeDeploymentManifest(DeploymentManifest{
+		Metadata: DeploymentMetadata{InstanceID: "admin", Name: "permission", Generation: 2},
+		Spec:     DeploymentSpec{ServiceName: "permission", Image: "permission:rev-2", PodRevision: "rev-2", Replicas: 1},
+		Service:  ServiceSpec{Name: "permission", AppName: "permission", Port: 8081},
+	})
+	acceptDone := make(chan error, 1)
+	go func() {
+		_, err := manager.AcceptDeployment(context.Background(), gen2)
+		acceptDone <- err
+	}()
+	var acceptedEarly bool
+	var earlyErr error
+	select {
+	case err := <-acceptDone:
+		acceptedEarly = true
+		earlyErr = err
+	case <-time.After(150 * time.Millisecond):
+	}
+	close(releaseMarkerSync)
+	if err := <-bootstrapDone; err != nil {
+		t.Fatal(err)
+	}
+	if acceptedEarly {
+		t.Fatalf("generation 2 bypassed bootstrap maintenance lock: %v", earlyErr)
+	}
+	if err := <-acceptDone; err != nil {
+		t.Fatal(err)
+	}
+	state, ok := manager.DeploymentState("admin", "permission")
+	if !ok || state.Generation != 2 {
+		t.Fatalf("final state=%+v exists=%v", state, ok)
+	}
+}
+
+func TestBootstrapRuntimePreMarkerFailurePreservesLegacyDeploymentDirectory(t *testing.T) {
+	stateDir := t.TempDir()
+	legacyDir := filepath.Join(stateDir, "admin", "deployments")
+	if err := os.MkdirAll(legacyDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	diagnosticPath := filepath.Join(legacyDir, "diagnostic.json")
+	if err := os.WriteFile(diagnosticPath, []byte(`{"owner":"legacy"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store := &ManifestStore{StateDir: stateDir, renameFile: func(oldPath, newPath string) error {
+		if filepath.Base(newPath) == "instance.json" {
+			return errors.New("injected marker rename failure")
+		}
+		return os.Rename(oldPath, newPath)
+	}}
+	manager := NewManager(ManagerOptions{StateDir: stateDir, ManifestStore: store, Runner: &fakeRunner{}})
+	if _, err := manager.BootstrapLegacyRuntime(context.Background(), legacyBootstrapTestSpec()); err == nil {
+		t.Fatal("marker failure was ignored")
+	}
+	data, err := os.ReadFile(diagnosticPath)
+	if err != nil || !strings.Contains(string(data), "legacy") {
+		t.Fatalf("legacy diagnostic was not preserved: data=%q err=%v", data, err)
+	}
+	if _, err := os.Lstat(filepath.Join(stateDir, "admin", "instance.json")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("marker unexpectedly switched: %v", err)
+	}
+}
+
+func TestBootstrapRuntimeRecoversQuarantineBeforeRetry(t *testing.T) {
+	stateDir := t.TempDir()
+	instanceDir := filepath.Join(stateDir, "admin")
+	finalDir := filepath.Join(instanceDir, "deployments")
+	backupDir := filepath.Join(instanceDir, "deployments.bootstrap-backup")
+	if err := os.MkdirAll(finalDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(finalDir, "permission.json"), []byte(`{"staged":true}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(backupDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(backupDir, "diagnostic.json"), []byte(`{"owner":"legacy"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var markerFailed atomic.Bool
+	store := &ManifestStore{StateDir: stateDir, renameFile: func(oldPath, newPath string) error {
+		if filepath.Base(newPath) == "instance.json" && markerFailed.CompareAndSwap(false, true) {
+			return errors.New("stop after recovery")
+		}
+		return os.Rename(oldPath, newPath)
+	}}
+	manager := NewManager(ManagerOptions{StateDir: stateDir, ManifestStore: store, Runner: &fakeRunner{}})
+	if _, err := manager.BootstrapLegacyRuntime(context.Background(), legacyBootstrapTestSpec()); err == nil {
+		t.Fatal("marker failure was ignored")
+	}
+	data, err := os.ReadFile(filepath.Join(finalDir, "diagnostic.json"))
+	if err != nil || !strings.Contains(string(data), "legacy") {
+		t.Fatalf("quarantined legacy directory was not recovered: data=%q err=%v", data, err)
 	}
 }
 
@@ -128,6 +263,44 @@ func TestBootstrapRuntimeMarkerSyncFailureLeavesCompleteNewModel(t *testing.T) {
 		if _, err := store.Get("admin", service); err != nil {
 			t.Fatalf("new model is incomplete for %s: %v", service, err)
 		}
+		state, ok := manager.DeploymentState("admin", service)
+		if !ok || state.Generation != 1 {
+			t.Fatalf("controller was not enqueued after marker sync error for %s: %+v exists=%v", service, state, ok)
+		}
+	}
+}
+
+func TestBootstrapRuntimeMarkerSyncFailureCleansSuccessfulQuarantine(t *testing.T) {
+	stateDir := t.TempDir()
+	legacyDir := filepath.Join(stateDir, "admin", "deployments")
+	if err := os.MkdirAll(legacyDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(legacyDir, "diagnostic.json"), []byte(`{"owner":"legacy"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var failed atomic.Bool
+	store := &ManifestStore{StateDir: stateDir, syncDirectory: func(path string) error {
+		if filepath.Clean(path) == filepath.Join(stateDir, "admin") {
+			if _, err := os.Lstat(filepath.Join(stateDir, "admin", "instance.json")); err == nil && failed.CompareAndSwap(false, true) {
+				return errors.New("injected marker directory sync failure")
+			}
+		}
+		return nil
+	}}
+	manager := NewManager(ManagerOptions{StateDir: stateDir, ManifestStore: store, Runner: &fakeRunner{}})
+	if _, err := manager.BootstrapLegacyRuntime(context.Background(), legacyBootstrapTestSpec()); err == nil {
+		t.Fatal("marker sync failure was ignored")
+	}
+	if _, err := os.Lstat(filepath.Join(stateDir, "admin", legacyBootstrapBackupDirectory)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("successful quarantine remains after marker switch: %v", err)
+	}
+	entries, err := os.ReadDir(filepath.Join(stateDir, "admin", "deployments"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 2 || entries[0].Name() != "gateway.json" || entries[1].Name() != "permission.json" {
+		t.Fatalf("marker-complete deployment directory is not canonical: %v", entries)
 	}
 }
 

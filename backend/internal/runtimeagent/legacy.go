@@ -2,6 +2,7 @@ package runtimeagent
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -14,7 +15,15 @@ import (
 var (
 	ErrLegacyRuntimeSpecDisabled = errors.New("legacy runtime spec is disabled")
 	ErrInvalidLegacyRuntimeSpec  = errors.New("invalid legacy runtime spec")
+	ErrInvalidDeploymentManifest = errors.New("invalid deployment manifest")
+	ErrAgentStatePersistence     = errors.New("agent state persistence failed")
 	legacyRuntimeBootstrapMu     sync.Mutex
+)
+
+const (
+	legacyBootstrapStageDirectory  = "deployments.bootstrap-staging"
+	legacyBootstrapBackupDirectory = "deployments.bootstrap-backup"
+	legacyBootstrapMarkerFile      = "instance.bootstrap.json"
 )
 
 // LegacyBootstrapAcceptance records the complete marker-last conversion of a
@@ -23,6 +32,26 @@ type LegacyBootstrapAcceptance struct {
 	Accepted    bool                   `json:"accepted"`
 	InstanceID  string                 `json:"instanceId"`
 	Deployments []DeploymentAcceptance `json:"deployments"`
+}
+
+// ClassifyDeploymentAcceptanceError keeps validation errors client-visible
+// without ever treating state read/write failures as a bad Manifest.
+func (m *Manager) ClassifyDeploymentAcceptanceError(manifest DeploymentManifest, acceptErr error) error {
+	if acceptErr == nil || errors.Is(acceptErr, ErrStaleDeploymentGeneration) || errors.Is(acceptErr, ErrDeploymentGenerationConflict) {
+		return acceptErr
+	}
+	manifest = NormalizeDeploymentManifest(manifest)
+	config, err := m.manifestStore.GetInstance(manifest.Metadata.InstanceID)
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrAgentStatePersistence, acceptErr)
+	}
+	if err := ValidateDeploymentManifest(config, manifest); err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidDeploymentManifest, err)
+	}
+	if err := m.manifestStore.validateDeploymentFilesystem(config, manifest); err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidDeploymentManifest, err)
+	}
+	return fmt.Errorf("%w: %v", ErrAgentStatePersistence, acceptErr)
 }
 
 // EnsureLegacyRuntimeSpecEnabled fails closed once instance.json exists. The
@@ -86,10 +115,6 @@ func (m *Manager) BootstrapLegacyRuntime(ctx context.Context, legacy LegacyRunti
 	if err := validateRuntimeSpec(legacy); err != nil {
 		return LegacyBootstrapAcceptance{}, fmt.Errorf("%w: %v", ErrInvalidLegacyRuntimeSpec, err)
 	}
-	if err := m.ensureLegacyRuntimeSpecEnabledLocked(legacy.InstanceID); err != nil {
-		return LegacyBootstrapAcceptance{}, err
-	}
-
 	config := NormalizeInstanceConfig(InstanceConfig{
 		APIVersion:  ManifestAPIVersion,
 		InstanceID:  legacy.InstanceID,
@@ -104,69 +129,91 @@ func (m *Manager) BootstrapLegacyRuntime(ctx context.Context, legacy LegacyRunti
 	if err != nil {
 		return LegacyBootstrapAcceptance{}, fmt.Errorf("%w: %v", ErrInvalidLegacyRuntimeSpec, err)
 	}
-
 	if err := m.manifestStore.ensureDirectory(m.stateDir); err != nil {
 		return LegacyBootstrapAcceptance{}, fmt.Errorf("prepare runtime state root: %w", err)
 	}
-	stageRoot, err := os.MkdirTemp(m.stateDir, ".legacy-bootstrap-")
-	if err != nil {
-		return LegacyBootstrapAcceptance{}, fmt.Errorf("create bootstrap staging root: %w", err)
+	instanceDir := filepath.Join(m.stateDir, config.InstanceID)
+	if err := m.manifestStore.ensureDirectory(instanceDir); err != nil {
+		return LegacyBootstrapAcceptance{}, fmt.Errorf("prepare instance state directory: %w", err)
 	}
-	defer os.RemoveAll(stageRoot)
-	stage := ManifestStore{StateDir: stageRoot, manifestPathLstat: m.manifestStore.manifestPathLstat}
-	if err := stage.PutInstance(config); err != nil {
-		return LegacyBootstrapAcceptance{}, fmt.Errorf("stage instance config: %w", err)
+	paths := newLegacyBootstrapPaths(instanceDir)
+	markerExists, err := regularBootstrapMarkerExists(paths.marker)
+	if err != nil {
+		return LegacyBootstrapAcceptance{}, err
+	}
+	if markerExists {
+		cleanupErr := cleanupCompletedLegacyBootstrap(paths, m.manifestStore)
+		if cleanupErr != nil {
+			return LegacyBootstrapAcceptance{}, fmt.Errorf("%w: cleanup completed bootstrap: %v", ErrLegacyRuntimeSpecDisabled, cleanupErr)
+		}
+		return LegacyBootstrapAcceptance{}, ErrLegacyRuntimeSpecDisabled
+	}
+	if err := recoverLegacyBootstrapSwap(paths, m.manifestStore); err != nil {
+		return LegacyBootstrapAcceptance{}, err
+	}
+	if err := prepareLegacyBootstrapStage(paths, m.manifestStore); err != nil {
+		return LegacyBootstrapAcceptance{}, err
 	}
 	acceptances := make([]DeploymentAcceptance, 0, len(manifests))
 	for _, manifest := range manifests {
 		if err := ctx.Err(); err != nil {
 			return LegacyBootstrapAcceptance{}, err
 		}
-		acceptance, putErr := stage.Put(manifest)
-		if putErr != nil {
-			return LegacyBootstrapAcceptance{}, fmt.Errorf("stage deployment manifest: %w", putErr)
+		if err := m.manifestStore.validateDeploymentFilesystem(config, manifest); err != nil {
+			return LegacyBootstrapAcceptance{}, fmt.Errorf("%w: %v", ErrInvalidLegacyRuntimeSpec, err)
 		}
-		acceptances = append(acceptances, acceptance)
+		data, marshalErr := json.MarshalIndent(manifest, "", "  ")
+		if marshalErr != nil {
+			return LegacyBootstrapAcceptance{}, fmt.Errorf("marshal staged deployment manifest: %w", marshalErr)
+		}
+		if writeErr := m.manifestStore.atomicWrite(filepath.Join(paths.stage, manifest.Metadata.Name+".json"), append(data, '\n')); writeErr != nil {
+			return LegacyBootstrapAcceptance{}, fmt.Errorf("stage deployment manifest: %w", writeErr)
+		}
+		hash, hashErr := DeploymentManifestSpecHash(manifest)
+		if hashErr != nil {
+			return LegacyBootstrapAcceptance{}, fmt.Errorf("hash staged deployment manifest: %w", hashErr)
+		}
+		acceptances = append(acceptances, DeploymentAcceptance{Accepted: true, Generation: manifest.Metadata.Generation, SpecHash: hash})
+	}
+	markerData, err := json.MarshalIndent(config, "", "  ")
+	if err != nil {
+		return LegacyBootstrapAcceptance{}, fmt.Errorf("marshal staged instance marker: %w", err)
+	}
+	if err := m.manifestStore.atomicWrite(paths.stagedMarker, append(markerData, '\n')); err != nil {
+		return LegacyBootstrapAcceptance{}, fmt.Errorf("stage instance marker: %w", err)
+	}
+	if err := m.manifestStore.directorySync(instanceDir); err != nil {
+		return LegacyBootstrapAcceptance{}, fmt.Errorf("sync complete bootstrap stage: %w", err)
 	}
 
-	instanceDir := filepath.Join(m.stateDir, config.InstanceID)
-	deploymentsDir := filepath.Join(instanceDir, "deployments")
-	if err := m.manifestStore.ensureDirectory(instanceDir); err != nil {
-		return LegacyBootstrapAcceptance{}, fmt.Errorf("prepare instance state directory: %w", err)
-	}
-	if err := m.manifestStore.ensureDirectory(deploymentsDir); err != nil {
-		return LegacyBootstrapAcceptance{}, fmt.Errorf("prepare deployment state directory: %w", err)
-	}
-	if err := clearBootstrapDeploymentFiles(deploymentsDir, m.manifestStore); err != nil {
-		return LegacyBootstrapAcceptance{}, err
-	}
-	for _, manifest := range manifests {
-		if err := ctx.Err(); err != nil {
-			return LegacyBootstrapAcceptance{}, err
-		}
-		data, readErr := os.ReadFile(filepath.Join(stageRoot, config.InstanceID, "deployments", manifest.Metadata.Name+".json"))
-		if readErr != nil {
-			return LegacyBootstrapAcceptance{}, fmt.Errorf("read staged deployment manifest: %w", readErr)
-		}
-		if writeErr := m.manifestStore.atomicWrite(filepath.Join(deploymentsDir, manifest.Metadata.Name+".json"), data); writeErr != nil {
-			return LegacyBootstrapAcceptance{}, fmt.Errorf("install deployment manifest: %w", writeErr)
-		}
-	}
+	maintenance := m.instanceMaintenanceLock(config.InstanceID)
+	maintenance.Lock()
+	defer maintenance.Unlock()
 	if err := ctx.Err(); err != nil {
 		return LegacyBootstrapAcceptance{}, err
 	}
-	markerData, err := os.ReadFile(filepath.Join(stageRoot, config.InstanceID, "instance.json"))
+	hadFinal, err := installLegacyBootstrapStage(paths, m.manifestStore)
 	if err != nil {
-		return LegacyBootstrapAcceptance{}, fmt.Errorf("read staged instance marker: %w", err)
+		return LegacyBootstrapAcceptance{}, err
 	}
-	if err := m.manifestStore.atomicWrite(filepath.Join(instanceDir, "instance.json"), markerData); err != nil {
-		return LegacyBootstrapAcceptance{}, fmt.Errorf("switch runtime orchestration model: %w", err)
+	if err := m.manifestStore.fileRename(paths.stagedMarker, paths.marker); err != nil {
+		restoreErr := restoreLegacyBootstrapSwap(paths, m.manifestStore, hadFinal)
+		return LegacyBootstrapAcceptance{}, errors.Join(fmt.Errorf("switch runtime orchestration model: %w", err), restoreErr)
 	}
-
+	var completionErrors []error
+	if err := m.manifestStore.directorySync(instanceDir); err != nil {
+		completionErrors = append(completionErrors, fmt.Errorf("sync runtime orchestration marker: %w", err))
+	}
 	for _, manifest := range manifests {
 		if err := m.enqueuePersistedDeployment(manifest); err != nil {
-			return LegacyBootstrapAcceptance{}, fmt.Errorf("start deployment controller: %w", err)
+			completionErrors = append(completionErrors, fmt.Errorf("start deployment controller: %w", err))
 		}
+	}
+	if err := cleanupCompletedLegacyBootstrap(paths, m.manifestStore); err != nil {
+		completionErrors = append(completionErrors, err)
+	}
+	if err := errors.Join(completionErrors...); err != nil {
+		return LegacyBootstrapAcceptance{}, err
 	}
 	return LegacyBootstrapAcceptance{Accepted: true, InstanceID: config.InstanceID, Deployments: acceptances}, nil
 }
@@ -243,24 +290,242 @@ func splitLegacyRuntimeSpec(config InstanceConfig, legacy LegacyRuntimeSpec) ([]
 	return manifests, nil
 }
 
-func clearBootstrapDeploymentFiles(directory string, store ManifestStore) error {
-	entries, err := os.ReadDir(directory)
+type legacyBootstrapPaths struct {
+	instanceDir  string
+	final        string
+	stage        string
+	backup       string
+	marker       string
+	stagedMarker string
+}
+
+func newLegacyBootstrapPaths(instanceDir string) legacyBootstrapPaths {
+	return legacyBootstrapPaths{
+		instanceDir:  instanceDir,
+		final:        filepath.Join(instanceDir, "deployments"),
+		stage:        filepath.Join(instanceDir, legacyBootstrapStageDirectory),
+		backup:       filepath.Join(instanceDir, legacyBootstrapBackupDirectory),
+		marker:       filepath.Join(instanceDir, "instance.json"),
+		stagedMarker: filepath.Join(instanceDir, legacyBootstrapMarkerFile),
+	}
+}
+
+func regularBootstrapMarkerExists(marker string) (bool, error) {
+	info, err := os.Lstat(marker)
+	switch {
+	case err == nil:
+		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+			return false, errors.New("new-model marker is not a regular file")
+		}
+		return true, nil
+	case errors.Is(err, os.ErrNotExist):
+		return false, nil
+	default:
+		return false, fmt.Errorf("inspect new-model marker: %w", err)
+	}
+}
+
+func prepareLegacyBootstrapStage(paths legacyBootstrapPaths, store ManifestStore) error {
+	if err := removeAgentBootstrapDirectory(paths.stage, paths.instanceDir, store); err != nil {
+		return err
+	}
+	if err := removeAgentBootstrapFile(paths.stagedMarker, paths.instanceDir, store); err != nil {
+		return err
+	}
+	if err := store.ensureDirectory(paths.stage); err != nil {
+		return fmt.Errorf("create deployment bootstrap stage: %w", err)
+	}
+	return nil
+}
+
+// recoverLegacyBootstrapSwap repairs only the fixed Agent-owned transaction
+// paths. A quarantined legacy directory is never deleted before instance.json
+// exists; it is restored first after any interrupted pre-marker switch.
+func recoverLegacyBootstrapSwap(paths legacyBootstrapPaths, store ManifestStore) error {
+	backupExists, err := bootstrapDirectoryExists(paths.backup)
 	if err != nil {
-		return fmt.Errorf("read deployment state directory: %w", err)
+		return err
 	}
-	for _, entry := range entries {
-		if filepath.Ext(entry.Name()) != ".json" {
-			continue
+	if backupExists {
+		finalExists, finalErr := bootstrapDirectoryExists(paths.final)
+		if finalErr != nil {
+			return finalErr
 		}
-		if !entry.Type().IsRegular() {
-			return errors.New("deployment state entry is not a regular file")
+		if finalExists {
+			if err := removeAgentBootstrapDirectory(paths.stage, paths.instanceDir, store); err != nil {
+				return err
+			}
+			if err := store.fileRename(paths.final, paths.stage); err != nil {
+				return fmt.Errorf("quarantine interrupted new deployment directory: %w", err)
+			}
 		}
-		if err := os.Remove(filepath.Join(directory, entry.Name())); err != nil {
-			return fmt.Errorf("clear incomplete deployment manifest: %w", err)
+		if err := store.fileRename(paths.backup, paths.final); err != nil {
+			return fmt.Errorf("restore quarantined legacy deployment directory: %w", err)
+		}
+		if err := store.directorySync(paths.instanceDir); err != nil {
+			return fmt.Errorf("sync restored legacy deployment directory: %w", err)
+		}
+		if err := removeAgentBootstrapDirectory(paths.stage, paths.instanceDir, store); err != nil {
+			return err
 		}
 	}
-	if err := store.directorySync(directory); err != nil {
-		return fmt.Errorf("sync cleared deployment state directory: %w", err)
+	if err := removeAgentBootstrapFile(paths.stagedMarker, paths.instanceDir, store); err != nil {
+		return err
+	}
+	return nil
+}
+
+func installLegacyBootstrapStage(paths legacyBootstrapPaths, store ManifestStore) (bool, error) {
+	if markerExists, err := regularBootstrapMarkerExists(paths.marker); err != nil {
+		return false, err
+	} else if markerExists {
+		return false, ErrLegacyRuntimeSpecDisabled
+	}
+	if backupExists, err := bootstrapDirectoryExists(paths.backup); err != nil {
+		return false, err
+	} else if backupExists {
+		return false, errors.New("legacy deployment quarantine was not recovered")
+	}
+	hadFinal, err := bootstrapDirectoryExists(paths.final)
+	if err != nil {
+		return false, err
+	}
+	if hadFinal {
+		if err := store.fileRename(paths.final, paths.backup); err != nil {
+			return false, fmt.Errorf("quarantine legacy deployment directory: %w", err)
+		}
+		if err := store.directorySync(paths.instanceDir); err != nil {
+			restoreErr := restoreLegacyBootstrapSwap(paths, store, true)
+			return false, errors.Join(fmt.Errorf("sync legacy deployment quarantine: %w", err), restoreErr)
+		}
+	}
+	if err := store.fileRename(paths.stage, paths.final); err != nil {
+		restoreErr := restoreLegacyBootstrapSwap(paths, store, hadFinal)
+		return false, errors.Join(fmt.Errorf("install staged deployment directory: %w", err), restoreErr)
+	}
+	if err := store.directorySync(paths.instanceDir); err != nil {
+		restoreErr := restoreLegacyBootstrapSwap(paths, store, hadFinal)
+		return false, errors.Join(fmt.Errorf("sync installed deployment directory: %w", err), restoreErr)
+	}
+	return hadFinal, nil
+}
+
+func restoreLegacyBootstrapSwap(paths legacyBootstrapPaths, store ManifestStore, hadFinal bool) error {
+	markerExists, err := regularBootstrapMarkerExists(paths.marker)
+	if err != nil || markerExists {
+		return err
+	}
+	finalExists, err := bootstrapDirectoryExists(paths.final)
+	if err != nil {
+		return err
+	}
+	if finalExists {
+		if err := removeAgentBootstrapDirectory(paths.stage, paths.instanceDir, store); err != nil {
+			return err
+		}
+		if err := store.fileRename(paths.final, paths.stage); err != nil {
+			return fmt.Errorf("preserve failed staged deployment directory: %w", err)
+		}
+	}
+	if hadFinal {
+		backupExists, backupErr := bootstrapDirectoryExists(paths.backup)
+		if backupErr != nil {
+			return backupErr
+		}
+		if !backupExists {
+			return errors.New("legacy deployment quarantine is missing")
+		}
+		if err := store.fileRename(paths.backup, paths.final); err != nil {
+			return fmt.Errorf("restore legacy deployment directory: %w", err)
+		}
+	}
+	if err := store.directorySync(paths.instanceDir); err != nil {
+		return fmt.Errorf("sync restored bootstrap state: %w", err)
+	}
+	if err := removeAgentBootstrapDirectory(paths.stage, paths.instanceDir, store); err != nil {
+		return err
+	}
+	if err := removeAgentBootstrapFile(paths.stagedMarker, paths.instanceDir, store); err != nil {
+		return err
+	}
+	return nil
+}
+
+func cleanupCompletedLegacyBootstrap(paths legacyBootstrapPaths, store ManifestStore) error {
+	markerExists, err := regularBootstrapMarkerExists(paths.marker)
+	if err != nil {
+		return err
+	}
+	if !markerExists {
+		return errors.New("cannot clean bootstrap quarantine before new-model marker")
+	}
+	if err := removeAgentBootstrapDirectory(paths.backup, paths.instanceDir, store); err != nil {
+		return err
+	}
+	if err := removeAgentBootstrapDirectory(paths.stage, paths.instanceDir, store); err != nil {
+		return err
+	}
+	return removeAgentBootstrapFile(paths.stagedMarker, paths.instanceDir, store)
+}
+
+func bootstrapDirectoryExists(directory string) (bool, error) {
+	info, err := os.Lstat(directory)
+	switch {
+	case err == nil:
+		if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+			return false, errors.New("bootstrap deployment path is not a directory")
+		}
+		return true, nil
+	case errors.Is(err, os.ErrNotExist):
+		return false, nil
+	default:
+		return false, fmt.Errorf("inspect bootstrap deployment directory: %w", err)
+	}
+}
+
+func removeAgentBootstrapDirectory(target, instanceDir string, store ManifestStore) error {
+	base := filepath.Base(target)
+	if filepath.Dir(target) != instanceDir || (base != legacyBootstrapStageDirectory && base != legacyBootstrapBackupDirectory) {
+		return errors.New("refuse to remove non-bootstrap directory")
+	}
+	info, err := os.Lstat(target)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("inspect Agent bootstrap directory: %w", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return errors.New("Agent bootstrap directory is not a safe directory")
+	}
+	if err := os.RemoveAll(target); err != nil {
+		return fmt.Errorf("remove Agent bootstrap directory: %w", err)
+	}
+	if err := store.directorySync(instanceDir); err != nil {
+		return fmt.Errorf("sync removed Agent bootstrap directory: %w", err)
+	}
+	return nil
+}
+
+func removeAgentBootstrapFile(target, instanceDir string, store ManifestStore) error {
+	if filepath.Dir(target) != instanceDir || filepath.Base(target) != legacyBootstrapMarkerFile {
+		return errors.New("refuse to remove non-bootstrap file")
+	}
+	info, err := os.Lstat(target)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("inspect Agent bootstrap file: %w", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		return errors.New("Agent bootstrap file is not a safe regular file")
+	}
+	if err := os.Remove(target); err != nil {
+		return fmt.Errorf("remove Agent bootstrap file: %w", err)
+	}
+	if err := store.directorySync(instanceDir); err != nil {
+		return fmt.Errorf("sync removed Agent bootstrap file: %w", err)
 	}
 	return nil
 }
