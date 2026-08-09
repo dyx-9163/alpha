@@ -251,12 +251,13 @@ type InstallServicesRequest struct {
 }
 
 type RuntimeReconcileRequest struct {
-	Instance store.AppInstance
-	Server   store.Server
-	Language string
-	Actor    string
-	TaskID   string
-	Reason   string
+	Instance    store.AppInstance
+	Server      store.Server
+	Language    string
+	Actor       string
+	TaskID      string
+	ServiceName string
+	Reason      string
 }
 
 type RuntimeRestartRequest struct {
@@ -1189,6 +1190,11 @@ func ensureK8sLikeMetadata(metadata map[string]any, copy UpdateCopy) error {
 }
 
 func currentRevisionForService(metadata map[string]any, serviceName string) string {
+	if revisions, ok := metadata["serviceRevisions"].(map[string]any); ok {
+		if revision := metadataText(revisions[serviceName]); revision != "" {
+			return revision
+		}
+	}
 	if endpoints, ok := metadata["activeEndpoints"].(map[string]any); ok {
 		if items, ok := endpoints[serviceName]; ok {
 			if revision := firstEndpointRevision(items); revision != "" {
@@ -1196,12 +1202,18 @@ func currentRevisionForService(metadata map[string]any, serviceName string) stri
 			}
 		}
 	}
-	if revisions, ok := metadata["serviceRevisions"].(map[string]any); ok {
-		if revision := metadataText(revisions[serviceName]); revision != "" {
-			return revision
-		}
-	}
 	return stringFromMetadata(metadata, "currentRevision", stringFromMetadata(metadata, "releaseId", ""))
+}
+
+func rolloutAcceptedIntentMetadata(current map[string]any, revision string, changedServices []string) map[string]any {
+	next := copyMetadata(current)
+	revisions := serviceRevisionsFromMetadata(current)
+	for _, serviceName := range changedServices {
+		revisions[serviceName] = revision
+	}
+	next["serviceRevisions"] = revisions
+	next["releasePhase"] = releasePhaseActive
+	return next
 }
 
 func firstEndpointRevision(value any) string {
@@ -1552,7 +1564,7 @@ func (s Service) UpdateArtifact(ctx context.Context, req ArtifactUpdateRequest, 
 		releaseArtifact = releaseServiceArtifactPath(installRoot, releaseID, artifact.ServiceName, artifact.FileName)
 		scriptRemote = workDir + "/update-aifar-artifact.sh"
 		if releases, ok := s.store.(releaseStore); ok {
-			orchestration := rolloutOrchestrationMetadata(metadata, installRoot, releaseID, ingressNetwork, gatewayPort, webPort, []string{artifact.ServiceName})
+			orchestration := rolloutAcceptedIntentMetadata(metadata, releaseID, []string{artifact.ServiceName})
 			manifest := rolloutReleaseManifest(version, releaseID, releaseTime, configHash, baseReleaseID, ingressNetwork, gatewayPort, webPort, artifact, orchestration, installRoot, req.Actor, fallbackTaskID(req.TaskID, log), serviceRevisionsBefore)
 			manifest["status"] = "pending"
 			manifest["phase"] = "pending"
@@ -1647,12 +1659,24 @@ func (s Service) UpdateArtifact(ctx context.Context, req ArtifactUpdateRequest, 
 	}
 
 	if err := step(4, func() error {
-		metadata["releaseId"] = releaseID
-		metadata["currentRevision"] = releaseID
+		accepted, err := s.mutateDeploymentsFanOut(ctx, req.Instance, req.Server, req.Actor, fallbackTaskID(req.TaskID, log), req.Language, 1, []deploymentMutationPlan{{
+			ServiceName: artifact.ServiceName,
+			Operation:   "update-artifact",
+			Mutate: func(manifest *runtimeagent.DeploymentManifest) error {
+				manifest.Spec.PodRevision = releaseID
+				manifest.Spec.Image = "aifar-" + artifact.ServiceName + ":" + releaseID
+				return nil
+			},
+		}}, log, targetLog)
+		if err != nil {
+			return err
+		}
+		if len(accepted) != 1 {
+			return repairRequired("AIFAR_ARTIFACT_ACCEPTANCE_INCOMPLETE", nil)
+		}
 		metadata["releaseVersion"] = version
-		metadata["releaseCreatedAt"] = releaseTime.Format(time.RFC3339)
 		metadata["configHash"] = configHash
-		orchestration := rolloutOrchestrationMetadata(metadata, installRoot, releaseID, ingressNetwork, gatewayPort, webPort, []string{artifact.ServiceName})
+		orchestration := rolloutAcceptedIntentMetadata(metadata, releaseID, []string{artifact.ServiceName})
 		for key, value := range orchestration {
 			metadata[key] = value
 		}
@@ -1672,10 +1696,7 @@ func (s Service) UpdateArtifact(ctx context.Context, req ArtifactUpdateRequest, 
 		next.Metadata = string(data)
 		saved, err := s.store.SaveAppInstance(next)
 		if err != nil {
-			return err
-		}
-		if err := s.saveRolloutControlPlane(saved.ID, version, releaseID, artifact.ServiceName, artifact.SHA256, desiredReplicasFromMetadata(metadata)[artifact.ServiceName], gatewayPort, webPort, releaseTime); err != nil {
-			return err
+			return repairRequired("AIFAR_ARTIFACT_METADATA_REPAIR_REQUIRED", err)
 		}
 		if releases, ok := s.store.(releaseStore); ok {
 			manifest, _ := json.Marshal(rolloutReleaseManifest(version, releaseID, releaseTime, configHash, baseReleaseID, ingressNetwork, gatewayPort, webPort, artifact, orchestration, installRoot, req.Actor, fallbackTaskID(req.TaskID, log), serviceRevisionsBefore))
@@ -1691,7 +1712,7 @@ func (s Service) UpdateArtifact(ctx context.Context, req ArtifactUpdateRequest, 
 				CreatedAt:    releaseTime,
 				ActivatedAt:  releaseTime,
 			}); err != nil {
-				return err
+				return repairRequired("AIFAR_ARTIFACT_RELEASE_REPAIR_REQUIRED", err)
 			}
 			pendingRelease = nil
 			if _, err := releases.DeleteOldAppReleases(saved.ID, releaseKeepCount); err != nil {

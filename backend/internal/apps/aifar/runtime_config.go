@@ -12,6 +12,7 @@ import (
 
 	"aifar-deployment/backend/internal/apps/registry"
 	"aifar-deployment/backend/internal/installer/installerkit"
+	"aifar-deployment/backend/internal/runtimeagent"
 	"aifar-deployment/backend/internal/store"
 )
 
@@ -236,7 +237,8 @@ func effectiveRuntimeConfigForService(state RuntimeConfigState, service string) 
 func runtimeConfigChangedForService(oldState, newState RuntimeConfigState, service string) bool {
 	oldValues := effectiveRuntimeConfigForService(oldState, service)
 	newValues := effectiveRuntimeConfigForService(newState, service)
-	return !strings.EqualFold(strings.TrimSpace(oldValues.AppMemoryLimit), strings.TrimSpace(newValues.AppMemoryLimit)) ||
+	return strings.TrimSpace(oldValues.AppCPUs) != strings.TrimSpace(newValues.AppCPUs) ||
+		!strings.EqualFold(strings.TrimSpace(oldValues.AppMemoryLimit), strings.TrimSpace(newValues.AppMemoryLimit)) ||
 		oldValues.JVMInitialRAMPercentage != newValues.JVMInitialRAMPercentage ||
 		oldValues.JVMMaxRAMPercentage != newValues.JVMMaxRAMPercentage
 }
@@ -322,7 +324,28 @@ func (s Service) ApplyRuntimeConfig(ctx context.Context, req RuntimeConfigReques
 
 	if err := step(3, func() error {
 		_, runErr := installerkit.Run(ctx, s.remote, req.Server, "sh -s <<'AIFAR_RUNTIME_CONFIG'\n"+script+"\nAIFAR_RUNTIME_CONFIG", logForServer, "AIFAR runtime config apply failed")
-		return runErr
+		if runErr != nil {
+			return runErr
+		}
+		plans := make([]deploymentMutationPlan, 0)
+		for _, serviceName := range servicesFromMetadata(metadata) {
+			if !runtimeConfigChangedForService(previous, next, serviceName) && previous.NacosEphemeral == next.NacosEphemeral {
+				continue
+			}
+			values := effectiveRuntimeConfigForService(next, serviceName)
+			plans = append(plans, deploymentMutationPlan{
+				ServiceName: serviceName,
+				Operation:   "runtime-config",
+				Mutate: func(manifest *runtimeagent.DeploymentManifest) error {
+					manifest.Spec.Resources.CPUs = values.AppCPUs
+					manifest.Spec.Resources.Memory = values.AppMemoryLimit
+					manifest.Spec.RestartGeneration++
+					return nil
+				},
+			})
+		}
+		_, mutationErr := s.mutateDeploymentsFanOut(ctx, current, req.Server, req.Actor, fallbackTaskID(req.TaskID, log), req.Language, defaultRuntimeMutationConcurrency, plans, log, targetLog)
+		return mutationErr
 	}); err != nil {
 		_ = s.markRuntimeConfigApplyFailed(current.ID, next, err)
 		finishTarget(recorder, target, "failed", err.Error())

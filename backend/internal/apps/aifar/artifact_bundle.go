@@ -19,6 +19,7 @@ import (
 
 	"aifar-deployment/backend/internal/installer/installerkit"
 	"aifar-deployment/backend/internal/installer/uploadkit"
+	"aifar-deployment/backend/internal/runtimeagent"
 	"aifar-deployment/backend/internal/store"
 )
 
@@ -87,14 +88,18 @@ func (s Service) UpdateArtifactBundle(ctx context.Context, req ArtifactBundleUpd
 		recorder.StartTarget(target)
 	}
 	step := newStepRunner(logForServer, recorder, target, updateSteps(copy), copy.StepStart, copy.StepDone, copy.StepFailed)
-	lockedInstance, lock, err := s.acquireOrchestrationLock(req.Instance.ID, "update-artifact-bundle", "", req.Actor, fallbackTaskID(req.TaskID, log))
+	services := make([]string, 0, len(items))
+	for _, item := range items {
+		services = append(services, item.ServiceName)
+	}
+	lockedInstance, locks, err := s.acquireServiceOrchestrationLocks(req.Instance.ID, "update-artifact-bundle", services, req.Actor, fallbackTaskID(req.TaskID, log))
 	if err != nil {
 		msg := fmt.Sprintf(copy.UpdateFailed, err)
 		logForServer.Error("%s", msg)
 		finishTarget(recorder, target, "failed", msg)
 		return err
 	}
-	defer s.releaseOrchestrationLock(lock)
+	defer s.releaseOrchestrationLocks(locks)
 	req.Instance = lockedInstance
 	concurrency := store.NormalizeDeploymentConcurrency(fmt.Sprint(req.Concurrency), 1)
 	artifacts := make([]artifactInfo, 0, len(items))
@@ -171,7 +176,7 @@ func (s Service) UpdateArtifactBundle(ctx context.Context, req ArtifactBundleUpd
 			})
 		}
 		if releases, ok := s.store.(releaseStore); ok {
-			orchestration := rolloutOrchestrationMetadata(metadata, installRoot, releaseID, ingressNetwork, gatewayPort, webPort, artifactServiceNames(artifacts))
+			orchestration := rolloutAcceptedIntentMetadata(metadata, releaseID, artifactServiceNames(artifacts))
 			manifest := rolloutBundleReleaseManifest(version, releaseID, releaseTime, configHash, baseReleaseID, ingressNetwork, gatewayPort, webPort, artifacts, concurrency, orchestration, installRoot, req.Actor, fallbackTaskID(req.TaskID, log), serviceRevisionsBefore)
 			manifest["status"] = "pending"
 			manifest["phase"] = "pending"
@@ -266,12 +271,29 @@ func (s Service) UpdateArtifactBundle(ctx context.Context, req ArtifactBundleUpd
 	}
 
 	if err := step(4, func() error {
-		metadata["releaseId"] = releaseID
-		metadata["currentRevision"] = releaseID
+		plans := make([]deploymentMutationPlan, 0, len(artifacts))
+		for _, artifact := range artifacts {
+			artifact := artifact
+			plans = append(plans, deploymentMutationPlan{
+				ServiceName: artifact.ServiceName,
+				Operation:   "update-artifact-bundle",
+				Mutate: func(manifest *runtimeagent.DeploymentManifest) error {
+					manifest.Spec.PodRevision = releaseID
+					manifest.Spec.Image = "aifar-" + artifact.ServiceName + ":" + releaseID
+					return nil
+				},
+			})
+		}
+		accepted, err := s.mutateDeploymentsFanOut(ctx, req.Instance, req.Server, req.Actor, fallbackTaskID(req.TaskID, log), req.Language, concurrency, plans, log, targetLog)
+		if err != nil {
+			return err
+		}
+		if len(accepted) != len(plans) {
+			return repairRequired("AIFAR_ARTIFACT_BUNDLE_ACCEPTANCE_INCOMPLETE", nil)
+		}
 		metadata["releaseVersion"] = version
-		metadata["releaseCreatedAt"] = releaseTime.Format(time.RFC3339)
 		metadata["configHash"] = configHash
-		orchestration := rolloutOrchestrationMetadata(metadata, installRoot, releaseID, ingressNetwork, gatewayPort, webPort, artifactServiceNames(artifacts))
+		orchestration := rolloutAcceptedIntentMetadata(metadata, releaseID, artifactServiceNames(artifacts))
 		for key, value := range orchestration {
 			metadata[key] = value
 		}
@@ -290,13 +312,7 @@ func (s Service) UpdateArtifactBundle(ctx context.Context, req ArtifactBundleUpd
 		next.Metadata = string(data)
 		saved, err := s.store.SaveAppInstance(next)
 		if err != nil {
-			return err
-		}
-		desired := desiredReplicasFromMetadata(metadata)
-		for _, artifact := range artifacts {
-			if err := s.saveRolloutControlPlane(saved.ID, version, releaseID, artifact.ServiceName, artifact.SHA256, desired[artifact.ServiceName], gatewayPort, webPort, releaseTime); err != nil {
-				return err
-			}
+			return repairRequired("AIFAR_ARTIFACT_BUNDLE_METADATA_REPAIR_REQUIRED", err)
 		}
 		if releases, ok := s.store.(releaseStore); ok {
 			manifest, _ := json.Marshal(rolloutBundleReleaseManifest(version, releaseID, releaseTime, configHash, baseReleaseID, ingressNetwork, gatewayPort, webPort, artifacts, concurrency, orchestration, installRoot, req.Actor, fallbackTaskID(req.TaskID, log), serviceRevisionsBefore))
@@ -312,7 +328,7 @@ func (s Service) UpdateArtifactBundle(ctx context.Context, req ArtifactBundleUpd
 				CreatedAt:    releaseTime,
 				ActivatedAt:  releaseTime,
 			}); err != nil {
-				return err
+				return repairRequired("AIFAR_ARTIFACT_BUNDLE_RELEASE_REPAIR_REQUIRED", err)
 			}
 			pendingRelease = nil
 			if _, err := releases.DeleteOldAppReleases(saved.ID, releaseKeepCount); err != nil {

@@ -15,6 +15,7 @@ import (
 	"aifar-deployment/backend/internal/i18n"
 	"aifar-deployment/backend/internal/installer/installerkit"
 	"aifar-deployment/backend/internal/installer/uploadkit"
+	"aifar-deployment/backend/internal/runtimeagent"
 	"aifar-deployment/backend/internal/store"
 )
 
@@ -120,24 +121,21 @@ func (s Service) RollbackArtifact(ctx context.Context, req ArtifactRollbackReque
 		recorder.StartTarget(target)
 	}
 	step := newStepRunner(logForServer, recorder, target, updateSteps(copy), copy.StepStart, copy.StepDone, copy.StepFailed)
-	lockService := ""
-	servicesForLock := req.Services
-	if len(servicesForLock) == 1 {
-		lockService = cleanAIFARServiceName(servicesForLock[0])
+	_, initialManifest, err := s.findReleaseManifest(req.Instance.ID, req.TargetReleaseID)
+	if err != nil {
+		return err
 	}
-	_, lock, err := s.acquireOrchestrationLock(req.Instance.ID, "rollback-artifact", lockService, req.Actor, fallbackTaskID(req.TaskID, log))
+	servicesForLock := rollbackServicesFromRequest(req.Services, initialManifest)
+	lockedInstance, locks, err := s.acquireServiceOrchestrationLocks(req.Instance.ID, "rollback-artifact", servicesForLock, req.Actor, fallbackTaskID(req.TaskID, log))
 	if err != nil {
 		msg := fmt.Sprintf(copy.UpdateFailed, err)
 		logForServer.Error("%s", msg)
 		finishTarget(recorder, target, "failed", msg)
 		return err
 	}
-	defer s.releaseOrchestrationLock(lock)
-	lockedInstance, err := s.store.GetAppInstance(req.Instance.ID)
+	defer s.releaseOrchestrationLocks(locks)
+	lockedInstance, err = s.store.GetAppInstance(req.Instance.ID)
 	if err != nil {
-		msg := fmt.Sprintf(copy.UpdateFailed, err)
-		logForServer.Error("%s", msg)
-		finishTarget(recorder, target, "failed", msg)
 		return err
 	}
 	req.Instance = lockedInstance
@@ -307,12 +305,29 @@ func (s Service) RollbackArtifact(ctx context.Context, req ArtifactRollbackReque
 
 	if err := step(4, func() error {
 		targetRevision := req.TargetReleaseID
-		metadata["releaseId"] = targetRevision
-		metadata["currentRevision"] = targetRevision
+		plans := make([]deploymentMutationPlan, 0, len(serviceNames))
+		for _, serviceName := range serviceNames {
+			serviceName := serviceName
+			plans = append(plans, deploymentMutationPlan{
+				ServiceName: serviceName,
+				Operation:   "rollback-artifact",
+				Mutate: func(manifest *runtimeagent.DeploymentManifest) error {
+					manifest.Spec.PodRevision = targetRevision
+					manifest.Spec.Image = "aifar-" + serviceName + ":" + targetRevision
+					return nil
+				},
+			})
+		}
+		accepted, err := s.mutateDeploymentsFanOut(ctx, req.Instance, req.Server, req.Actor, fallbackTaskID(req.TaskID, log), req.Language, defaultRuntimeMutationConcurrency, plans, log, targetLog)
+		if err != nil {
+			return err
+		}
+		if len(accepted) != len(plans) {
+			return repairRequired("AIFAR_ARTIFACT_ROLLBACK_ACCEPTANCE_INCOMPLETE", nil)
+		}
 		metadata["releaseVersion"] = version
-		metadata["releaseCreatedAt"] = rollbackTime.Format(time.RFC3339)
 		metadata["configHash"] = configHash
-		orchestration := rolloutOrchestrationMetadata(metadata, installRoot, targetRevision, ingressNetwork, gatewayPort, webPort, serviceNames)
+		orchestration := rolloutAcceptedIntentMetadata(metadata, targetRevision, serviceNames)
 		for key, value := range orchestration {
 			metadata[key] = value
 		}
@@ -332,17 +347,7 @@ func (s Service) RollbackArtifact(ctx context.Context, req ArtifactRollbackReque
 		next.Metadata = string(data)
 		saved, err := s.store.SaveAppInstance(next)
 		if err != nil {
-			return err
-		}
-		desired := desiredReplicasFromMetadata(metadata)
-		hashByService := map[string]string{}
-		for _, artifact := range artifacts {
-			hashByService[artifact.ServiceName] = artifact.SHA256
-		}
-		for _, service := range serviceNames {
-			if err := s.saveRolloutControlPlane(saved.ID, version, targetRevision, service, hashByService[service], desired[service], gatewayPort, webPort, rollbackTime); err != nil {
-				return err
-			}
+			return repairRequired("AIFAR_ARTIFACT_ROLLBACK_METADATA_REPAIR_REQUIRED", err)
 		}
 		if releases, ok := s.store.(releaseStore); ok {
 			manifest := rollbackReleaseManifest(version, rollbackID, rollbackTime, configHash, currentBaseRevision, req.TargetReleaseID, req.Reason, req.Actor, fallbackTaskID(req.TaskID, log), installRoot, ingressNetwork, gatewayPort, webPort, serviceNames, artifacts, revisionsBefore)
@@ -359,7 +364,7 @@ func (s Service) RollbackArtifact(ctx context.Context, req ArtifactRollbackReque
 				CreatedAt:    rollbackTime,
 				ActivatedAt:  rollbackTime,
 			}); err != nil {
-				return err
+				return repairRequired("AIFAR_ARTIFACT_ROLLBACK_RELEASE_REPAIR_REQUIRED", err)
 			}
 			pendingRelease = nil
 			if _, err := releases.DeleteOldAppReleases(saved.ID, releaseKeepCount); err != nil {

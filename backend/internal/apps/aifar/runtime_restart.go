@@ -3,117 +3,49 @@ package aifar
 import (
 	"context"
 	"errors"
-	"strings"
-	"text/template"
+	"sort"
 
 	"aifar-deployment/backend/internal/i18n"
-	"aifar-deployment/backend/internal/installer/installerkit"
-	"aifar-deployment/backend/internal/installer/selinux"
+	"aifar-deployment/backend/internal/runtimeagent"
 )
 
-type runtimeRestartScriptData struct {
-	InstallRoot string
-	SpecPath    string
-}
-
 func (s Service) RestartRuntime(ctx context.Context, req RuntimeRestartRequest, log Logger, targetLog targetLogger) error {
-	target := req.Instance.ServerID
-	if target == "" {
-		target = req.Server.ID
+	control, ok := s.store.(aifarDeploymentControlStore)
+	if !ok {
+		return repairRequired("AIFAR_RUNTIME_CONTROL_STORE_UNAVAILABLE", nil)
 	}
-	logForServer := logForTarget(log, targetLog, target)
-	recorder, _ := log.(stepRecorder)
-	if recorder != nil {
-		recorder.StartTarget(target)
+	deployments, err := control.ListAIFARDeployments(req.Instance.ID)
+	if err != nil {
+		return repairRequired("AIFAR_RUNTIME_CONTROL_STORE_READ_FAILED", err)
 	}
-	steps := []struct {
-		name  string
-		title string
-	}{
-		{"load-instance", i18n.Text(req.Language, "aifar.runtimeRestart.stepLoadInstance")},
-		{"preflight-runtime", i18n.Text(req.Language, "aifar.runtimeRestart.stepPreflight")},
-		{"stop-all-pods", i18n.Text(req.Language, "aifar.runtimeRestart.stepStopAll")},
-		{"start-all-pods", i18n.Text(req.Language, "aifar.runtimeRestart.stepStartAll")},
-		{"verify-runtime", i18n.Text(req.Language, "aifar.runtimeRestart.stepVerify")},
-	}
-	activeStep := ""
-	startStep := func(index int) {
-		activeStep = steps[index].name
-		if recorder != nil {
-			recorder.StartStep(target, activeStep, steps[index].title, index+1)
+	services := make([]string, 0, len(deployments))
+	for _, deployment := range deployments {
+		if deployment.DesiredReplicas > 0 {
+			services = append(services, deployment.ServiceName)
 		}
 	}
-	finishStep := func(status, errText string) {
-		if recorder != nil && activeStep != "" {
-			recorder.FinishStep(target, activeStep, status, errText)
-		}
-		activeStep = ""
+	sort.Strings(services)
+	if len(services) == 0 {
+		return errors.New(i18n.Text(req.Language, "aifar.runtimeMutation.noTargets"))
 	}
-	fail := func(err error) error {
-		status := "failed"
-		if errors.Is(err, context.Canceled) || errors.Is(ctx.Err(), context.Canceled) {
-			status = "cancelled"
-		}
-		finishStep(status, err.Error())
-		finishTarget(recorder, target, status, err.Error())
+	current, locks, err := s.acquireServiceOrchestrationLocks(req.Instance.ID, "runtime-restart-all", services, req.Actor, fallbackTaskID(req.TaskID, log))
+	if err != nil {
 		return err
 	}
+	defer s.releaseOrchestrationLocks(locks)
+	req.Instance = current
 
-	startStep(0)
-	current, lock, err := s.acquireOrchestrationLock(req.Instance.ID, "runtime-restart-all", "", req.Actor, fallbackTaskID(req.TaskID, log))
-	if err != nil {
-		return fail(err)
+	plans := make([]deploymentMutationPlan, 0, len(services))
+	for _, serviceName := range services {
+		plans = append(plans, deploymentMutationPlan{
+			ServiceName: serviceName,
+			Operation:   "restart",
+			Mutate: func(manifest *runtimeagent.DeploymentManifest) error {
+				manifest.Spec.RestartGeneration++
+				return nil
+			},
+		})
 	}
-	defer s.releaseOrchestrationLock(lock)
-	finishStep("success", "")
-
-	startStep(1)
-	metadata := metadataFromInstance(current)
-	if err := ensureK8sLikeMetadata(metadata, UpdateCopy{LegacyUpdateUnsupported: "legacy AIFAR orchestration model %s does not support runtime restart; reinstall with k8s-like orchestration first"}); err != nil {
-		return fail(err)
-	}
-	installRoot := stringFromMetadata(metadata, "installRoot", installRootFromDeployDir(req.Server.DeployDir))
-	if strings.TrimSpace(installRoot) == "" {
-		err := errors.New("AIFAR install root is missing")
-		return fail(err)
-	}
-	if err := s.ensureRuntimeAgent(ctx, req.Server, "", req.Language, logForServer); err != nil {
-		return fail(err)
-	}
-	specPath := stringFromMetadata(metadata, "runtimeSpecPath", runtimeSpecPath(installRoot))
-	script, err := renderRuntimeRestartScript(runtimeRestartScriptData{InstallRoot: installRoot, SpecPath: specPath})
-	if err != nil {
-		return fail(err)
-	}
-	finishStep("success", "")
-
-	startStep(2)
-	logForServer.Info("stopping all AIFAR runtime pods before restarting instance %s", current.ID)
-	if _, err := installerkit.Run(ctx, s.remote, req.Server, "sh -s <<'AIFAR_RUNTIME_RESTART'\n"+script+"\nAIFAR_RUNTIME_RESTART", logForServer, "AIFAR runtime restart failed"); err != nil {
-		return fail(err)
-	}
-	finishStep("success", "")
-
-	startStep(3)
-	logForServer.Info("all desired AIFAR runtime pod starts were submitted for instance %s", current.ID)
-	finishStep("success", "")
-
-	startStep(4)
-	if err := ctx.Err(); err != nil {
-		return fail(err)
-	}
-	finishStep("success", "")
-	logForServer.Info("all desired AIFAR runtime pods restarted and verified for instance %s", current.ID)
-	finishTarget(recorder, target, "success", "")
-	return nil
-}
-
-func renderRuntimeRestartScript(data runtimeRestartScriptData) (string, error) {
-	content, err := templateFS.ReadFile("templates/runtime-restart.sh")
-	if err != nil {
-		return "", err
-	}
-	return installerkit.RenderTemplate(AppName, "runtime-restart.sh", "aifar-runtime-restart", string(content), selinux.AddTemplateFuncs(template.FuncMap{
-		"quote": shellQuoteAny,
-	}), data)
+	_, err = s.mutateDeploymentsFanOut(ctx, current, req.Server, req.Actor, fallbackTaskID(req.TaskID, log), req.Language, defaultRuntimeMutationConcurrency, plans, log, targetLog)
+	return err
 }
