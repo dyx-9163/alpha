@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -64,6 +65,7 @@ func (s Service) InstallServices(ctx context.Context, req InstallServicesRequest
 	var metadata map[string]any
 	var requested []string
 	var missing []string
+	var prepareServices []string
 	var allServices []string
 	var installRoot string
 	var version string
@@ -126,6 +128,17 @@ func (s Service) InstallServices(ctx context.Context, req InstallServicesRequest
 		releaseTime = time.Now().UTC()
 		releaseID = newReleaseID("services-"+strings.Join(missing, "-"), releaseTime)
 		configHash = serviceInstallConfigHash(stringFromMetadata(metadata, "configHash", ""), missing)
+		attempt, prepare, err := s.planServiceInstallAttempt(current.ID, missing, serviceInstallAttempt{
+			Revision: releaseID, Version: version, ConfigHash: configHash, CreatedAt: releaseTime,
+		})
+		if err != nil {
+			return err
+		}
+		releaseID = attempt.Revision
+		version = attempt.Version
+		configHash = attempt.ConfigHash
+		releaseTime = attempt.CreatedAt
+		prepareServices = prepare
 		ingressNetwork = stringFromMetadata(metadata, "ingressNetwork", stringFromMetadata(metadata, "networkName", defaultNetworkName))
 		gatewayPort = intFromMetadata(metadata, "gatewayPort", defaultGatewayPort)
 		webPort = intFromMetadata(metadata, "webPort", defaultWebPort)
@@ -144,7 +157,7 @@ func (s Service) InstallServices(ctx context.Context, req InstallServicesRequest
 		script, err = renderServiceInstallScript(serviceInstallScriptData{
 			InstallRoot:         installRoot,
 			ServiceOrder:        strings.Join(allServices, " "),
-			NewServices:         strings.Join(missing, " "),
+			NewServices:         strings.Join(prepareServices, " "),
 			ServiceApplications: serviceCatalogPairs(serviceDefinitions, allServices, func(definition serviceDefinition) string { return definition.ApplicationName }),
 			ServicePorts:        serviceCatalogPairs(serviceDefinitions, allServices, func(definition serviceDefinition) string { return fmt.Sprint(definition.Port) }),
 			ServiceKinds:        serviceCatalogPairs(serviceDefinitions, allServices, func(definition serviceDefinition) string { return definition.Kind }),
@@ -170,7 +183,10 @@ func (s Service) InstallServices(ctx context.Context, req InstallServicesRequest
 			if err != nil {
 				return err
 			}
-			moduleArchiveLocal, err = CreateServiceModuleArchive(bundle, missing)
+			if len(prepareServices) == 0 {
+				return nil
+			}
+			moduleArchiveLocal, err = CreateServiceModuleArchive(bundle, prepareServices)
 			if err != nil {
 				return err
 			}
@@ -199,12 +215,14 @@ func (s Service) InstallServices(ctx context.Context, req InstallServicesRequest
 				return err
 			}
 		}
-		_, runErr := installerkit.Run(ctx, s.remote, req.Server, "sh -s <<'AIFAR_SERVICE_INSTALL'\n"+script+"\nAIFAR_SERVICE_INSTALL", logForServer, "AIFAR service installation failed")
-		if runErr != nil {
-			return runErr
+		if len(prepareServices) > 0 {
+			if _, runErr := installerkit.Run(ctx, s.remote, req.Server, "sh -s <<'AIFAR_SERVICE_INSTALL'\n"+script+"\nAIFAR_SERVICE_INSTALL", logForServer, "AIFAR service installation failed"); runErr != nil {
+				return runErr
+			}
 		}
-		acceptedRevisions, runErr = s.acceptInstalledServiceManifests(ctx, req, current, metadata, allServices, missing, serviceDefinitions, releaseID, version, configHash, releaseTime, logForServer)
-		return runErr
+		var acceptErr error
+		acceptedRevisions, acceptErr = s.acceptInstalledServiceManifests(ctx, req, current, metadata, allServices, missing, serviceDefinitions, releaseID, version, configHash, releaseTime, logForServer)
+		return acceptErr
 	}); err != nil {
 		finishTarget(recorder, target, "failed", err.Error())
 		return err
@@ -263,6 +281,102 @@ func (s Service) InstallServices(ctx context.Context, req InstallServicesRequest
 	return nil
 }
 
+type serviceInstallAttempt struct {
+	Revision   string    `json:"revision"`
+	Version    string    `json:"version"`
+	ConfigHash string    `json:"configHash"`
+	CreatedAt  time.Time `json:"createdAt"`
+}
+
+func (s Service) planServiceInstallAttempt(instanceID string, services []string, proposed serviceInstallAttempt) (serviceInstallAttempt, []string, error) {
+	control, ok := s.store.(aifarDeploymentControlStore)
+	if !ok {
+		return proposed, nil, repairRequired("AIFAR_RUNTIME_CONTROL_STORE_UNAVAILABLE", nil)
+	}
+	deployments, err := control.ListAIFARDeployments(instanceID)
+	if err != nil {
+		return proposed, nil, err
+	}
+	byService := make(map[string]store.AIFARDeployment, len(deployments))
+	for _, deployment := range deployments {
+		byService[cleanAIFARServiceName(deployment.ServiceName)] = deployment
+	}
+	prepare := make([]string, 0, len(services))
+	var persisted *serviceInstallAttempt
+	for _, serviceName := range services {
+		deployment, exists := byService[serviceName]
+		if !exists {
+			prepare = append(prepare, serviceName)
+			continue
+		}
+		accepted := deploymentHasAcceptedDesired(deployment)
+		pending := deployment.Generation > 0 && deployment.Status == "pending_acceptance" && deployment.DesiredReplicas == 1 && strings.TrimSpace(deployment.SpecJSON) != ""
+		prepared := deployment.Generation == 0 && deployment.Status == "install_prepared"
+		if !accepted && !pending && !prepared {
+			return proposed, nil, repairRequired("AIFAR_RUNTIME_INSTALL_RETRY_STATE_INVALID", nil)
+		}
+		attempt, err := decodeServiceInstallAttempt(deployment.MetadataJSON)
+		if err != nil || attempt.Revision != deployment.CurrentRevision {
+			return proposed, nil, repairRequired("AIFAR_RUNTIME_INSTALL_RETRY_IDENTITY_INVALID", err)
+		}
+		if persisted == nil {
+			copyAttempt := attempt
+			persisted = &copyAttempt
+			continue
+		}
+		if persisted.Revision != attempt.Revision || persisted.Version != attempt.Version || persisted.ConfigHash != attempt.ConfigHash || !persisted.CreatedAt.Equal(attempt.CreatedAt) {
+			return proposed, nil, repairRequired("AIFAR_RUNTIME_INSTALL_RETRY_IDENTITY_CONFLICT", nil)
+		}
+	}
+	if persisted == nil {
+		return proposed, prepare, nil
+	}
+	if len(prepare) > 0 {
+		return proposed, nil, repairRequired("AIFAR_RUNTIME_INSTALL_RETRY_SET_CHANGED", nil)
+	}
+	return *persisted, nil, nil
+}
+
+func deploymentHasAcceptedDesired(deployment store.AIFARDeployment) bool {
+	if deployment.Generation <= 0 || deployment.DesiredReplicas != 1 || strings.TrimSpace(deployment.SpecJSON) == "" {
+		return false
+	}
+	if deployment.Status == "Accepted" {
+		return true
+	}
+	if deployment.ObservedGeneration < deployment.Generation {
+		return false
+	}
+	switch deployment.Status {
+	case "Progressing", "Available", "Degraded", "Offline":
+		return true
+	default:
+		return false
+	}
+}
+
+func encodeServiceInstallAttempt(attempt serviceInstallAttempt) (string, error) {
+	data, err := json.Marshal(attempt)
+	return string(data), err
+}
+
+func decodeServiceInstallAttempt(data string) (serviceInstallAttempt, error) {
+	var attempt serviceInstallAttempt
+	decoder := json.NewDecoder(strings.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&attempt); err != nil {
+		return attempt, err
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		return attempt, errors.New("AIFAR service install attempt metadata is invalid")
+	}
+	if strings.TrimSpace(attempt.Revision) == "" || strings.TrimSpace(attempt.Version) == "" || !deploymentSpecHashPattern.MatchString(attempt.ConfigHash) || attempt.CreatedAt.IsZero() {
+		return attempt, errors.New("AIFAR service install attempt identity is incomplete")
+	}
+	return attempt, nil
+}
+
 func (s Service) acceptInstalledServiceManifests(
 	ctx context.Context,
 	req InstallServicesRequest,
@@ -296,7 +410,7 @@ func (s Service) acceptInstalledServiceManifests(
 	acceptedRevisions := make(map[string]string, len(missing))
 	for _, serviceName := range missing {
 		deployment, exists := byService[serviceName]
-		if exists && deployment.Generation > 0 && deployment.Status == "Accepted" && deployment.DesiredReplicas == 1 && strings.TrimSpace(deployment.SpecJSON) != "" {
+		if exists && deploymentHasAcceptedDesired(deployment) {
 			acceptedRevisions[serviceName] = deployment.CurrentRevision
 			if err := saveAcceptedServiceReplicaSet(orch, current.ID, serviceName, deployment.CurrentRevision, version, configHash, now); err != nil {
 				return nil, err
@@ -320,9 +434,13 @@ func (s Service) acceptInstalledServiceManifests(
 			continue
 		}
 
+		attemptMetadata, err := encodeServiceInstallAttempt(serviceInstallAttempt{Revision: revision, Version: version, ConfigHash: configHash, CreatedAt: now})
+		if err != nil {
+			return nil, err
+		}
 		base := store.AIFARDeployment{
 			InstanceID: current.ID, ServiceName: serviceName, DesiredReplicas: 1,
-			CurrentRevision: revision, Status: "install_prepared", CreatedAt: now,
+			CurrentRevision: revision, Status: "install_prepared", MetadataJSON: attemptMetadata, CreatedAt: now,
 		}
 		base, err = orch.SaveAIFARDeployment(base)
 		if err != nil {

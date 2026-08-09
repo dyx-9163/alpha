@@ -42,6 +42,8 @@ type fakeStore struct {
 	saveCalls                 int
 	failSaveOn                int
 	directDeploymentSaveCalls int
+	acceptDeploymentCalls     int
+	failDeploymentAcceptOn    int
 }
 
 type rollbackLockRaceStore struct {
@@ -264,6 +266,10 @@ func (f *fakeStore) SaveAIFARDeploymentGeneration(next store.AIFARDeployment, ex
 func (f *fakeStore) AcceptAIFARDeployment(instanceID, serviceName string, generation int64, status, conditionsJSON string, at time.Time) (store.AIFARDeployment, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.acceptDeploymentCalls++
+	if f.failDeploymentAcceptOn > 0 && f.acceptDeploymentCalls == f.failDeploymentAcceptOn {
+		return store.AIFARDeployment{}, errors.New("control-plane acceptance write failed")
+	}
 	for idx, current := range f.deployments {
 		if current.InstanceID != instanceID || current.ServiceName != serviceName {
 			continue
@@ -560,6 +566,9 @@ type fakeRemote struct {
 	autoscaleScript         string
 	runtimeConfigScript     string
 	serviceInstallScript    string
+	servicePrepareCounts    map[string]int
+	servicePrepareRevisions map[string][]string
+	failPreparedServices    map[string]bool
 	scaleServiceScript      string
 	runtimeReconcileScript  string
 	runtimeRestartScript    string
@@ -567,6 +576,10 @@ type fakeRemote struct {
 	runtimeAgentUninstall   string
 	runtimeAgentCheckStdout string
 	installStdout           string
+	installRuns             int
+	bootstrapMode           string
+	bootstrapHashOverrides  map[string]string
+	bootstrapNameOverrides  map[string]string
 	deploymentManifests     map[string]runtimeagent.DeploymentManifest
 	deploymentStates        map[string]runtimeagent.DeploymentState
 	deploymentApplyFailures map[string]int
@@ -600,10 +613,28 @@ func (f *fakeRemote) Run(ctx context.Context, server store.Server, command strin
 	if f.failCommandContains != "" && strings.Contains(command, f.failCommandContains) {
 		return adapter.CommandResult{}, errors.New("remote install failed")
 	}
+	if strings.Contains(command, "AIFAR_SERVICE_INSTALL") {
+		f.serviceInstallScript = command
+		revision := scriptAssignment(command, "REVISION")
+		for _, serviceName := range strings.Fields(scriptAssignment(command, "NEW_SERVICES")) {
+			if f.servicePrepareCounts == nil {
+				f.servicePrepareCounts = map[string]int{}
+			}
+			if f.servicePrepareRevisions == nil {
+				f.servicePrepareRevisions = map[string][]string{}
+			}
+			f.servicePrepareCounts[serviceName]++
+			f.servicePrepareRevisions[serviceName] = append(f.servicePrepareRevisions[serviceName], revision)
+			if f.failPreparedServices[serviceName] {
+				return adapter.CommandResult{}, errors.New("existing accepted service must not be prepared")
+			}
+		}
+	}
 	if strings.Contains(command, "install-aifar.sh") {
+		f.installRuns++
 		stdout := f.installStdout
 		if stdout == "" {
-			stdout = fakeBootstrapAcceptanceOutput(f.installScript)
+			stdout = fakeBootstrapAcceptanceOutput(f.installScript, f.bootstrapHashOverrides, f.bootstrapNameOverrides)
 		}
 		return adapter.CommandResult{Stdout: stdout}, nil
 	}
@@ -663,9 +694,6 @@ func (f *fakeRemote) Run(ctx context.Context, server store.Server, command strin
 	if strings.Contains(command, "AIFAR_RUNTIME_CONFIG") {
 		f.runtimeConfigScript = command
 	}
-	if strings.Contains(command, "AIFAR_SERVICE_INSTALL") {
-		f.serviceInstallScript = command
-	}
 	if strings.Contains(command, "AIFAR_RUNTIME_RECONCILE") {
 		f.runtimeReconcileScript = command
 	}
@@ -681,23 +709,41 @@ func (f *fakeRemote) Run(ctx context.Context, server store.Server, command strin
 	return adapter.CommandResult{Stdout: "ok"}, nil
 }
 
-func fakeBootstrapAcceptanceOutput(script string) string {
-	assignment := func(key string) string {
-		for _, line := range strings.Split(script, "\n") {
-			if strings.HasPrefix(line, key+"=") {
-				return strings.Trim(strings.TrimSpace(strings.TrimPrefix(line, key+"=")), "'")
-			}
+func fakeBootstrapAcceptanceOutput(script string, hashOverrides, nameOverrides map[string]string) string {
+	services := strings.Fields(scriptAssignment(script, "SERVICE_ORDER"))
+	hashes := map[string]string{}
+	for _, pair := range strings.Fields(scriptAssignment(script, "SERVICE_SPEC_HASHES")) {
+		parts := strings.SplitN(pair, "=", 2)
+		if len(parts) == 2 {
+			hashes[parts[0]] = parts[1]
 		}
-		return ""
 	}
-	services := strings.Fields(assignment("SERVICE_ORDER"))
-	deployments := make([]runtimeagent.DeploymentAcceptance, 0, len(services))
+	deployments := make([]bootstrapDeploymentProof, 0, len(services))
+	instanceID := scriptAssignment(script, "INSTANCE_ID")
 	for _, serviceName := range services {
-		sum := sha256.Sum256([]byte(serviceName))
-		deployments = append(deployments, runtimeagent.DeploymentAcceptance{Accepted: true, Generation: 1, SpecHash: hex.EncodeToString(sum[:])})
+		proofName := serviceName
+		if nameOverrides[serviceName] != "" {
+			proofName = nameOverrides[serviceName]
+		}
+		hash := hashes[serviceName]
+		if hashOverrides[serviceName] != "" {
+			hash = hashOverrides[serviceName]
+		}
+		deployments = append(deployments, bootstrapDeploymentProof{
+			Accepted: true, InstanceID: instanceID, ServiceName: proofName, Generation: 1, SpecHash: hash,
+		})
 	}
-	data, _ := json.Marshal(runtimeagent.LegacyBootstrapAcceptance{Accepted: true, InstanceID: assignment("INSTANCE_ID"), Deployments: deployments})
+	data, _ := json.Marshal(bootstrapAcceptanceProof{Accepted: true, InstanceID: instanceID, Deployments: deployments})
 	return bootstrapAcceptanceMarker + string(data)
+}
+
+func scriptAssignment(script, key string) string {
+	for _, line := range strings.Split(script, "\n") {
+		if strings.HasPrefix(line, key+"=") {
+			return strings.Trim(strings.TrimSpace(strings.TrimPrefix(line, key+"=")), "'")
+		}
+	}
+	return ""
 }
 
 func (f *fakeRemote) UploadFile(ctx context.Context, server store.Server, localPath, remotePath string, mode os.FileMode) error {
@@ -2033,9 +2079,13 @@ func TestRuntimeSpecTemplatesMountPerServiceLogVolume(t *testing.T) {
 				t.Fatal(err)
 			}
 			script := string(content)
+			logDir := `log_dir="$LOG_DIR/$service"`
+			if name == "install.sh" {
+				logDir = `log_dir="$INSTALL_ROOT/logs/$service"`
+			}
 			for _, want := range []string{
 				`LOG_DIR="$RUNTIME_DIR/logs"`,
-				`log_dir="$LOG_DIR/$service"`,
+				logDir,
 				`mkdir -p "$log_dir"`,
 				`"target":"/opt/aifar/logs"`,
 				`"target":"/var/log/nginx"`,
@@ -2254,7 +2304,7 @@ func TestServiceInstallsAIFARServiceFromRuntimeV2Bundle(t *testing.T) {
 		`nacos_ephemeral`,
 		`"ephemeral": $(nacos_ephemeral)`,
 		`APP_BACKEND_HEALTH_PATH /actuator/health/readiness`,
-		`curl -fsS --connect-timeout %s %s://%s:%s%s >/dev/null || exit 1`,
+		`curl -fsS --connect-timeout 3 'http://127.0.0.1:%s%s' >/dev/null || exit 1`,
 	} {
 		if !strings.Contains(remote.installScript, want) {
 			t.Fatalf("AIFAR install script should include agent-runtime-v2 orchestration with %q:\n%s", want, remote.installScript)
@@ -2361,21 +2411,9 @@ func TestInstallSucceedsAfterManifestAcceptanceWithoutObservedRuntime(t *testing
 		servers:   map[string]store.Server{"srv-1": {ID: "srv-1", Host: "10.0.0.10", DeployDir: "/aifar/apps"}},
 		instances: []store.AppInstance{previous},
 	}
-	acceptance, err := json.Marshal(runtimeagent.LegacyBootstrapAcceptance{
-		Accepted:   true,
-		InstanceID: instanceID,
-		Deployments: []runtimeagent.DeploymentAcceptance{
-			{Accepted: true, Generation: 1, SpecHash: strings.Repeat("a", 64)},
-			{Accepted: true, Generation: 1, SpecHash: strings.Repeat("b", 64)},
-			{Accepted: true, Generation: 1, SpecHash: strings.Repeat("c", 64)},
-		},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	remote := &fakeRemote{installStdout: "AIFAR_BOOTSTRAP_ACCEPTANCE=" + string(acceptance)}
+	remote := &fakeRemote{}
 	service := NewService(s, remote)
-	err = service.Install(context.Background(), InstallRequest{
+	err := service.Install(context.Background(), InstallRequest{
 		Version: "latest", ServerID: "srv-1", Language: "en",
 		Parameters: map[string]any{"nacosHost": "10.0.0.50", "selectedServices": []string{"gateway", "permission", "web-vue3"}},
 	}, []store.Resource{{App: AppName, Part: "backend", Version: appBundleVersion, Path: filepath.Join(root, appBundleVersion, bundleManifestName)}}, fakeLogger{}, nil)
@@ -2409,13 +2447,63 @@ func TestInstallSucceedsAfterManifestAcceptanceWithoutObservedRuntime(t *testing
 			t.Fatalf("install script must not execute readiness gate %q", forbidden)
 		}
 	}
-	for _, required := range []string{"aifar-agent bootstrap-runtime --spec", "AIFAR_BOOTSTRAP_ACCEPTANCE", `"generation":1`, `"specHash"`} {
+	for _, required := range []string{"aifar-agent bootstrap-runtime --spec", "AIFAR_BOOTSTRAP_ACCEPTANCE", "SERVICE_SPEC_HASHES", "expected_hash"} {
 		if !strings.Contains(remote.installScript, required) {
 			t.Fatalf("install script must validate manifest acceptance with %q", required)
 		}
 	}
 	if !strings.Contains(remote.installScript, `rm -f "$spec"`) {
 		t.Fatal("install script must remove the temporary aggregate bootstrap spec after acceptance")
+	}
+}
+
+func TestDecodeBootstrapAcceptanceRejectsEmptyOrDuplicateMarkers(t *testing.T) {
+	hash := strings.Repeat("a", 64)
+	expected := map[string]string{"gateway": hash}
+	valid := bootstrapAcceptanceMarker + `{"accepted":true,"instanceId":"instance-1","deployments":[{"accepted":true,"instanceId":"instance-1","serviceName":"gateway","generation":1,"specHash":"` + hash + `"}]}`
+	for _, tc := range []struct {
+		name   string
+		stdout string
+	}{
+		{name: "empty first", stdout: bootstrapAcceptanceMarker + "\n" + valid},
+		{name: "empty second", stdout: valid + "\n" + bootstrapAcceptanceMarker},
+		{name: "duplicate valid", stdout: valid + "\n" + valid},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := decodeBootstrapAcceptance(tc.stdout, "instance-1", expected); err == nil {
+				t.Fatal("multiple bootstrap acceptance markers must be rejected even when one payload is empty")
+			}
+		})
+	}
+}
+
+func TestDecodeBootstrapAcceptanceRequiresExactPerServiceProof(t *testing.T) {
+	hashA := strings.Repeat("a", 64)
+	hashB := strings.Repeat("b", 64)
+	expected := map[string]string{"gateway": hashA, "web-vue3": hashB}
+	proof := func(instanceA, serviceA, proofHashA, instanceB, serviceB, proofHashB string) string {
+		return bootstrapAcceptanceMarker + `{"accepted":true,"instanceId":"instance-1","deployments":[` +
+			`{"accepted":true,"instanceId":"` + instanceA + `","serviceName":"` + serviceA + `","generation":1,"specHash":"` + proofHashA + `"},` +
+			`{"accepted":true,"instanceId":"` + instanceB + `","serviceName":"` + serviceB + `","generation":1,"specHash":"` + proofHashB + `"}]}`
+	}
+	valid := proof("instance-1", "gateway", hashA, "instance-1", "web-vue3", hashB)
+	if _, err := decodeBootstrapAcceptance(valid, "instance-1", expected); err != nil {
+		t.Fatalf("exact service-addressable proof must pass: %v", err)
+	}
+	for _, tc := range []struct {
+		name   string
+		stdout string
+	}{
+		{name: "wrong hash", stdout: proof("instance-1", "gateway", hashB, "instance-1", "web-vue3", hashA)},
+		{name: "wrong service", stdout: proof("instance-1", "gateway", hashA, "instance-1", "system", hashB)},
+		{name: "duplicate service", stdout: proof("instance-1", "gateway", hashA, "instance-1", "gateway", hashB)},
+		{name: "wrong entry instance", stdout: proof("instance-1", "gateway", hashA, "other-instance", "web-vue3", hashB)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := decodeBootstrapAcceptance(tc.stdout, "instance-1", expected); err == nil {
+				t.Fatal("non-canonical bootstrap proof must be rejected")
+			}
+		})
 	}
 }
 
@@ -2461,6 +2549,86 @@ func TestInstallRetryReusesPendingBootstrapRevision(t *testing.T) {
 	installedMetadata := metadataFromInstance(s.instances[0])
 	if got := stringFromMetadata(installedMetadata, "releaseId", ""); got != pendingRevision {
 		t.Fatalf("installed releaseId=%q, want retried revision %q", got, pendingRevision)
+	}
+}
+
+func TestInstallChangedConfigRetryAfterAgentPersistenceFailsClosed(t *testing.T) {
+	withFakeRuntimeAgentBinary(t)
+	root := createAIFARBundle(t)
+	s := &fakeStore{
+		servers:                map[string]store.Server{"srv-1": {ID: "srv-1", Host: "10.0.0.10", DeployDir: "/aifar/apps"}},
+		failDeploymentAcceptOn: 1,
+	}
+	remote := &fakeRemote{}
+	service := NewService(s, remote)
+	resources := []store.Resource{{App: AppName, Part: "backend", Version: appBundleVersion, Path: filepath.Join(root, appBundleVersion, bundleManifestName)}}
+	req := InstallRequest{
+		Version: "latest", ServerID: "srv-1", Language: "en",
+		Parameters: map[string]any{"nacosHost": "10.0.0.50", "selectedServices": []string{"gateway"}, "appMemoryLimit": "2GB"},
+	}
+	if err := service.Install(context.Background(), req, resources, fakeLogger{}, nil); err == nil {
+		t.Fatal("first install must fail after Agent persistence when the control-plane acceptance write fails")
+	}
+	if remote.installRuns != 1 || len(s.deployments) == 0 {
+		t.Fatalf("first attempt must reach Agent persistence and retain desired rows: runs=%d deployments=%d", remote.installRuns, len(s.deployments))
+	}
+	before := append([]store.AIFARDeployment(nil), s.deployments...)
+	req.Parameters["appMemoryLimit"] = "3GB"
+	err := service.Install(context.Background(), req, resources, fakeLogger{}, nil)
+	if err == nil {
+		t.Fatal("changed-config retry must fail closed instead of accepting stale Agent generation 1")
+	}
+	var typed *deploymentControlError
+	if !errors.As(err, &typed) || typed.ReasonCode() != "AIFAR_RUNTIME_INSTALL_RETRY_CONFIG_CHANGED" {
+		t.Fatalf("changed-config retry error=%v, want stable repair-required reason", err)
+	}
+	if remote.installRuns != 1 {
+		t.Fatalf("changed-config retry must fail before another bootstrap, runs=%d", remote.installRuns)
+	}
+	if !reflect.DeepEqual(s.deployments, before) {
+		t.Fatalf("changed-config retry must not replace generation-1 desired rows\nbefore=%+v\nafter=%+v", before, s.deployments)
+	}
+}
+
+func TestInstallReconcilesExactServiceProofForDirectAndLostBootstrapResponses(t *testing.T) {
+	withFakeRuntimeAgentBinary(t)
+	root := createAIFARBundle(t)
+	resources := []store.Resource{{App: AppName, Part: "backend", Version: appBundleVersion, Path: filepath.Join(root, appBundleVersion, bundleManifestName)}}
+	for _, tc := range []struct {
+		name          string
+		mode          string
+		hashOverride  string
+		nameOverride  string
+		wantInstalled bool
+	}{
+		{name: "direct exact", mode: "direct", wantInstalled: true},
+		{name: "direct wrong service", mode: "direct", nameOverride: "system"},
+		{name: "lost response exact readback", mode: "lost-response-readback", wantInstalled: true},
+		{name: "lost response wrong hash readback", mode: "lost-response-readback", hashOverride: strings.Repeat("f", 64)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := &fakeStore{servers: map[string]store.Server{"srv-1": {ID: "srv-1", Host: "10.0.0.10", DeployDir: "/aifar/apps"}}}
+			remote := &fakeRemote{bootstrapMode: tc.mode}
+			if tc.hashOverride != "" {
+				remote.bootstrapHashOverrides = map[string]string{"gateway": tc.hashOverride}
+			}
+			if tc.nameOverride != "" {
+				remote.bootstrapNameOverrides = map[string]string{"gateway": tc.nameOverride}
+			}
+			err := NewService(s, remote).Install(context.Background(), InstallRequest{
+				Version: "latest", ServerID: "srv-1", Language: "en",
+				Parameters: map[string]any{"nacosHost": "10.0.0.50", "selectedServices": []string{"gateway"}},
+			}, resources, fakeLogger{}, nil)
+			if tc.wantInstalled {
+				if err != nil || len(s.instances) != 1 || s.instances[0].Status != "installed" {
+					t.Fatalf("%s exact proof must install: err=%v instances=%+v", tc.mode, err, s.instances)
+				}
+				return
+			}
+			if err == nil || len(s.instances) != 1 || s.instances[0].Status != "install_failed" {
+				t.Fatalf("%s mismatched proof must fail closed: err=%v instances=%+v", tc.mode, err, s.instances)
+			}
+		})
 	}
 }
 
@@ -2662,72 +2830,92 @@ func TestServiceInstallsMissingAIFARModulesAfterInitialInstall(t *testing.T) {
 }
 
 func TestInstallServicesRetryKeepsAcceptedPeerGeneration(t *testing.T) {
-	instance := installedAIFARInstance(t)
-	metadata := metadataFromInstance(instance)
-	initialServices := []string{"gateway", "web-vue3"}
-	metadata["services"] = initialServices
-	metadata["serviceCatalog"] = serviceCatalogMetadataForInstall(legacyServiceDefinitions(), defaultGatewayPort, defaultWebPort)
-	instance.Metadata = mustMetadata(t, metadata)
-	base := &fakeStore{
-		servers:   map[string]store.Server{"srv-1": {ID: "srv-1", Host: "10.0.0.10", DeployDir: "/aifar/apps"}},
-		instances: []store.AppInstance{instance},
-	}
-	bundleParent := createAIFARBundle(t)
-	s := &resourceFakeStore{fakeStore: base, resources: []store.Resource{{App: AppName, Part: "backend", Version: appBundleVersion, Path: filepath.Join(bundleParent, appBundleVersion, bundleManifestName)}}}
-	remote := &fakeRemote{deploymentApplyFailures: map[string]int{"system": 1}}
-	service := NewService(s, remote)
-	req := InstallServicesRequest{
-		Instance: instance, Server: s.servers["srv-1"], Language: "en", Actor: "admin", TaskID: "install-services-retry",
-		Services: []string{"file", "system"}, Reason: "complete missing services",
-	}
-	if err := service.InstallServices(context.Background(), req, fakeLogger{}, nil); err == nil {
-		t.Fatal("first install-services attempt must fail when system Manifest persistence fails")
-	}
-	deployments, err := s.ListAIFARDeployments(instance.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	byService := map[string]store.AIFARDeployment{}
-	for _, deployment := range deployments {
-		byService[deployment.ServiceName] = deployment
-	}
-	if got := byService["file"]; got.Generation != 1 || got.Status != "Accepted" {
-		t.Fatalf("accepted file peer must be retained at generation 1: %+v", got)
-	}
-	if got := byService["system"]; got.Generation != 1 || got.Status != "pending_acceptance" {
-		t.Fatalf("failed system target must retain its generation-1 pending Manifest: %+v", got)
-	}
-	if remote.deploymentApplyCounts["file"] != 1 || remote.deploymentApplyCounts["system"] != 1 {
-		t.Fatalf("unexpected first apply counts: %+v", remote.deploymentApplyCounts)
-	}
-
-	if err := service.InstallServices(context.Background(), req, fakeLogger{}, nil); err != nil {
-		t.Fatal(err)
-	}
-	deployments, err = s.ListAIFARDeployments(instance.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, deployment := range deployments {
-		if deployment.ServiceName == "file" || deployment.ServiceName == "system" {
-			if deployment.Generation != 1 || deployment.Status != "Accepted" || deployment.ObservedGeneration != 0 {
-				t.Fatalf("retry must complete the same generation without inventing observation: %+v", deployment)
+	for _, phase := range []string{"Accepted", "Progressing", "Available", "Degraded", "Offline"} {
+		t.Run(phase, func(t *testing.T) {
+			instance := installedAIFARInstance(t)
+			metadata := metadataFromInstance(instance)
+			metadata["services"] = []string{"gateway", "web-vue3"}
+			metadata["serviceCatalog"] = serviceCatalogMetadataForInstall(legacyServiceDefinitions(), defaultGatewayPort, defaultWebPort)
+			instance.Metadata = mustMetadata(t, metadata)
+			base := &fakeStore{
+				servers:   map[string]store.Server{"srv-1": {ID: "srv-1", Host: "10.0.0.10", DeployDir: "/aifar/apps"}},
+				instances: []store.AppInstance{instance},
 			}
-		}
-	}
-	if remote.deploymentApplyCounts["file"] != 1 || remote.deploymentApplyCounts["system"] != 2 {
-		t.Fatalf("retry must skip accepted file and resubmit only pending system: %+v", remote.deploymentApplyCounts)
-	}
-	for _, replicaSet := range s.replicaSets {
-		if (replicaSet.ServiceName == "file" || replicaSet.ServiceName == "system") && (replicaSet.DesiredPods != 1 || replicaSet.ReadyPods != 0) {
-			t.Fatalf("new service replicaSet must start desired=1 ready=0: %+v", replicaSet)
-		}
-	}
-	if len(s.pods) != 0 || len(s.endpoints) != 0 {
-		t.Fatalf("service installation acceptance must not invent Pods or Endpoints: pods=%d endpoints=%d", len(s.pods), len(s.endpoints))
-	}
-	if strings.Contains(remote.serviceInstallScript, "reconcile-runtime") || strings.Contains(remote.serviceInstallScript, "reconcile_runtime") {
-		t.Fatal("service preparation script must not own desired-state mutation")
+			bundleParent := createAIFARBundle(t)
+			s := &resourceFakeStore{fakeStore: base, resources: []store.Resource{{App: AppName, Part: "backend", Version: appBundleVersion, Path: filepath.Join(bundleParent, appBundleVersion, bundleManifestName)}}}
+			remote := &fakeRemote{deploymentApplyFailures: map[string]int{"system": 1}}
+			service := NewService(s, remote)
+			req := InstallServicesRequest{
+				Instance: instance, Server: s.servers["srv-1"], Language: "en", Actor: "admin", TaskID: "install-services-retry",
+				Services: []string{"file", "system"}, Reason: "complete missing services",
+			}
+			if err := service.InstallServices(context.Background(), req, fakeLogger{}, nil); err == nil {
+				t.Fatal("first install-services attempt must fail when system Manifest persistence fails")
+			}
+			byService := map[string]store.AIFARDeployment{}
+			for _, deployment := range s.deployments {
+				byService[deployment.ServiceName] = deployment
+			}
+			if got := byService["file"]; got.Generation != 1 || got.Status != "Accepted" {
+				t.Fatalf("accepted file peer must be retained at generation 1: %+v", got)
+			}
+			pending := byService["system"]
+			if pending.Generation != 1 || pending.Status != "pending_acceptance" {
+				t.Fatalf("failed system target must retain its generation-1 pending Manifest: %+v", pending)
+			}
+			if remote.deploymentApplyCounts["file"] != 1 || remote.deploymentApplyCounts["system"] != 1 {
+				t.Fatalf("unexpected first apply counts: %+v", remote.deploymentApplyCounts)
+			}
+
+			for index := range s.deployments {
+				if s.deployments[index].ServiceName == "file" {
+					s.deployments[index].Status = phase
+					if phase != "Accepted" {
+						s.deployments[index].ObservedGeneration = s.deployments[index].Generation
+					}
+				}
+			}
+			s.pods = append(s.pods, store.AIFARPod{InstanceID: instance.ID, ServiceName: "file", PodID: "file-1", ContainerName: "existing-file-pod"})
+			remote.failPreparedServices = map[string]bool{"file": true}
+
+			if err := service.InstallServices(context.Background(), req, fakeLogger{}, nil); err != nil {
+				t.Fatal(err)
+			}
+			byService = map[string]store.AIFARDeployment{}
+			for _, deployment := range s.deployments {
+				byService[deployment.ServiceName] = deployment
+			}
+			file := byService["file"]
+			if file.Generation != 1 || file.Status != phase {
+				t.Fatalf("retry must preserve accepted/observed file peer: %+v", file)
+			}
+			system := byService["system"]
+			if system.Generation != 1 || system.Status != "Accepted" || system.ObservedGeneration != 0 {
+				t.Fatalf("retry must accept the same pending system generation: %+v", system)
+			}
+			if remote.deploymentApplyCounts["file"] != 1 || remote.deploymentApplyCounts["system"] != 2 {
+				t.Fatalf("retry must skip accepted file and resubmit only pending system: %+v", remote.deploymentApplyCounts)
+			}
+			if remote.servicePrepareCounts["file"] != 1 || remote.servicePrepareCounts["system"] != 1 {
+				t.Fatalf("retry must not rewrite env or build a new revision for prepared peers: %+v", remote.servicePrepareCounts)
+			}
+			for _, serviceName := range []string{"file", "system"} {
+				revisions := remote.servicePrepareRevisions[serviceName]
+				if len(revisions) != 1 || revisions[0] != pending.CurrentRevision {
+					t.Fatalf("%s prepare revisions=%v, want only persisted revision %s", serviceName, revisions, pending.CurrentRevision)
+				}
+			}
+			installedMetadata := metadataFromInstance(s.instances[0])
+			if got := stringFromMetadata(installedMetadata, "releaseId", ""); got != pending.CurrentRevision {
+				t.Fatalf("retry releaseId=%q, want persisted pending revision %q", got, pending.CurrentRevision)
+			}
+			if len(s.pods) != 1 || s.pods[0].ContainerName != "existing-file-pod" || len(s.endpoints) != 0 {
+				t.Fatalf("retry must preserve the existing peer Pod without inventing endpoints: pods=%+v endpoints=%+v", s.pods, s.endpoints)
+			}
+			if strings.Contains(remote.serviceInstallScript, "reconcile-runtime") || strings.Contains(remote.serviceInstallScript, "reconcile_runtime") {
+				t.Fatal("service preparation script must not own desired-state mutation")
+			}
+		})
 	}
 }
 

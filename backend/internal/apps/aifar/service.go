@@ -557,6 +557,7 @@ func (s Service) Install(ctx context.Context, req InstallRequest, resources []st
 		if err := options.Validate(); err != nil {
 			return err
 		}
+		serviceDefinitions = installServiceDefinitionsWithResources(serviceDefinitions, options)
 		var archiveErr error
 		archiveLocal, archiveErr = CreateBundleArchive(bundle)
 		return archiveErr
@@ -589,6 +590,7 @@ func (s Service) Install(ctx context.Context, req InstallRequest, resources []st
 		metadata["taskId"] = strings.TrimSpace(req.TaskID)
 	}
 	var instance store.AppInstance
+	var expectedBootstrapHashes map[string]string
 
 	if err := step(3, func() error {
 		instanceID, err := s.reusableAIFARInstallInstanceID(target, installRoot)
@@ -602,9 +604,10 @@ func (s Service) Install(ctx context.Context, req InstallRequest, resources []st
 			}
 			previousMetadata := metadataFromInstance(previous)
 			previousReleaseID := stringFromMetadata(previousMetadata, "releaseId", "")
-			if previousReleaseID != "" &&
+			sameAttempt := previousReleaseID != "" &&
 				stringFromMetadata(previousMetadata, "releaseVersion", "") == bundle.Version &&
-				stringFromMetadata(previousMetadata, "configHash", "") == configHash {
+				stringFromMetadata(previousMetadata, "configHash", "") == configHash
+			if sameAttempt {
 				releaseID = previousReleaseID
 				if previousReleaseTime, parseErr := time.Parse(time.RFC3339, stringFromMetadata(previousMetadata, "releaseCreatedAt", "")); parseErr == nil {
 					releaseTime = previousReleaseTime.UTC()
@@ -614,6 +617,16 @@ func (s Service) Install(ctx context.Context, req InstallRequest, resources []st
 				metadata["installState"] = "installing"
 				if strings.TrimSpace(req.TaskID) != "" {
 					metadata["taskId"] = strings.TrimSpace(req.TaskID)
+				}
+			} else if control, ok := s.store.(aifarDeploymentControlStore); ok {
+				deployments, listErr := control.ListAIFARDeployments(instanceID)
+				if listErr != nil {
+					return listErr
+				}
+				for _, deployment := range deployments {
+					if deployment.Generation > 0 && strings.TrimSpace(deployment.SpecJSON) != "" {
+						return repairRequired("AIFAR_RUNTIME_INSTALL_RETRY_CONFIG_CHANGED", nil)
+					}
 				}
 			}
 		}
@@ -662,6 +675,14 @@ func (s Service) Install(ctx context.Context, req InstallRequest, resources []st
 				return err
 			}
 		}
+		if err := s.saveInitialControlPlaneDesired(instance, releaseID, bundle.Version, configHash, options, serviceDefinitions, releaseTime); err != nil {
+			return err
+		}
+		var hashErr error
+		expectedBootstrapHashes, hashErr = s.initialDeploymentSpecHashes(instance, options.SelectedServices)
+		if hashErr != nil {
+			return hashErr
+		}
 		script, err := renderInstallScript(installScriptData{
 			InstallRoot:         installRoot,
 			InstanceID:          instance.ID,
@@ -682,6 +703,7 @@ func (s Service) Install(ctx context.Context, req InstallRequest, resources []st
 			ServiceKinds:       serviceCatalogPairs(serviceDefinitions, options.SelectedServices, func(definition serviceDefinition) string { return definition.Kind }),
 			ServiceHealthPaths: serviceCatalogPairs(serviceDefinitions, options.SelectedServices, func(definition serviceDefinition) string { return definition.HealthPath }),
 			ServiceAffinities:  serviceCatalogPairs(serviceDefinitions, options.SelectedServices, func(definition serviceDefinition) string { return definition.AffinityPolicy }),
+			ServiceSpecHashes:  serviceSpecHashPairs(options.SelectedServices, expectedBootstrapHashes),
 			GatewayService:     serviceNameForRole(serviceDefinitions, "gateway"),
 			WebService:         serviceNameForRole(serviceDefinitions, "web"),
 			Version:            bundle.Version,
@@ -708,7 +730,7 @@ func (s Service) Install(ctx context.Context, req InstallRequest, resources []st
 		}, logForServer); err != nil {
 			return err
 		}
-		return s.saveInitialControlPlaneDesired(instance, releaseID, bundle.Version, configHash, options, serviceDefinitions, releaseTime)
+		return nil
 	}); err != nil {
 		_ = s.markInstallFailed(instance, metadata, err)
 		msg := fmt.Sprintf(copy.InstallFailed, err)
@@ -723,7 +745,7 @@ func (s Service) Install(ctx context.Context, req InstallRequest, resources []st
 		if err != nil {
 			return err
 		}
-		_, err = decodeBootstrapAcceptance(result.Stdout, instance.ID, len(options.SelectedServices))
+		_, err = decodeBootstrapAcceptance(result.Stdout, instance.ID, expectedBootstrapHashes)
 		if err != nil {
 			return err
 		}
@@ -808,6 +830,7 @@ func installMetadata(server store.Server, installRoot, version, releaseID string
 		"networkName":           options.NetworkName,
 		"appCPUs":               options.AppCPUs,
 		"appMemoryLimit":        options.AppMemoryLimit,
+		"timezone":              options.Timezone,
 		"runtimeConfigMode":     "dynamic-jvm-v1",
 		"runtimeConfig":         runtimeConfigFromOptions(options, actor, releaseTime),
 		"endpoint":              fmt.Sprintf("%s:%d", server.Host, options.WebPort),
@@ -840,19 +863,43 @@ func installMetadata(server store.Server, installRoot, version, releaseID string
 	return metadata
 }
 
+func installServiceDefinitionsWithResources(definitions []serviceDefinition, options InstallOptions) []serviceDefinition {
+	out := append([]serviceDefinition(nil), definitions...)
+	for index := range out {
+		out[index].Resources = runtimeagent.ResourceSpec{CPUs: options.AppCPUs, Memory: options.AppMemoryLimit}
+	}
+	return out
+}
+
 const bootstrapAcceptanceMarker = "AIFAR_BOOTSTRAP_ACCEPTANCE="
 
-func decodeBootstrapAcceptance(stdout, instanceID string, expectedDeployments int) (runtimeagent.LegacyBootstrapAcceptance, error) {
-	var acceptance runtimeagent.LegacyBootstrapAcceptance
+type bootstrapDeploymentProof struct {
+	Accepted    bool   `json:"accepted"`
+	InstanceID  string `json:"instanceId"`
+	ServiceName string `json:"serviceName"`
+	Generation  int64  `json:"generation"`
+	SpecHash    string `json:"specHash"`
+}
+
+type bootstrapAcceptanceProof struct {
+	Accepted    bool                       `json:"accepted"`
+	InstanceID  string                     `json:"instanceId"`
+	Deployments []bootstrapDeploymentProof `json:"deployments"`
+}
+
+func decodeBootstrapAcceptance(stdout, instanceID string, expectedHashes map[string]string) (bootstrapAcceptanceProof, error) {
+	var acceptance bootstrapAcceptanceProof
 	payload := ""
+	seen := false
 	for _, line := range strings.Split(stdout, "\n") {
 		line = strings.TrimSpace(line)
 		if !strings.HasPrefix(line, bootstrapAcceptanceMarker) {
 			continue
 		}
-		if payload != "" {
+		if seen {
 			return acceptance, errors.New("aifar-agent bootstrap acceptance is duplicated")
 		}
+		seen = true
 		payload = strings.TrimPrefix(line, bootstrapAcceptanceMarker)
 	}
 	if payload == "" || len(payload) > 1<<20 {
@@ -867,15 +914,59 @@ func decodeBootstrapAcceptance(stdout, instanceID string, expectedDeployments in
 	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
 		return acceptance, errors.New("aifar-agent bootstrap acceptance is invalid")
 	}
-	if !acceptance.Accepted || acceptance.InstanceID != instanceID || len(acceptance.Deployments) != expectedDeployments || expectedDeployments < 1 {
+	if !acceptance.Accepted || acceptance.InstanceID != instanceID || len(expectedHashes) < 1 || len(acceptance.Deployments) != len(expectedHashes) {
 		return acceptance, errors.New("aifar-agent bootstrap acceptance does not match the installation")
 	}
+	seenServices := make(map[string]bool, len(expectedHashes))
 	for _, deployment := range acceptance.Deployments {
-		if !deployment.Accepted || deployment.Generation != 1 || !deploymentSpecHashPattern.MatchString(deployment.SpecHash) {
+		expectedHash, exists := expectedHashes[deployment.ServiceName]
+		if !exists || seenServices[deployment.ServiceName] || !deployment.Accepted || deployment.InstanceID != instanceID || deployment.Generation != 1 ||
+			!deploymentSpecHashPattern.MatchString(deployment.SpecHash) || deployment.SpecHash != expectedHash {
 			return acceptance, errors.New("aifar-agent deployment acceptance is invalid")
 		}
+		seenServices[deployment.ServiceName] = true
 	}
 	return acceptance, nil
+}
+
+func (s Service) initialDeploymentSpecHashes(instance store.AppInstance, services []string) (map[string]string, error) {
+	control, ok := s.store.(aifarDeploymentControlStore)
+	if !ok {
+		return nil, repairRequired("AIFAR_RUNTIME_CONTROL_STORE_UNAVAILABLE", nil)
+	}
+	deployments, err := control.ListAIFARDeployments(instance.ID)
+	if err != nil {
+		return nil, err
+	}
+	byService := make(map[string]store.AIFARDeployment, len(deployments))
+	for _, deployment := range deployments {
+		byService[cleanAIFARServiceName(deployment.ServiceName)] = deployment
+	}
+	hashes := make(map[string]string, len(services))
+	for _, serviceName := range services {
+		deployment, exists := byService[serviceName]
+		if !exists || deployment.Generation != 1 || strings.TrimSpace(deployment.SpecJSON) == "" {
+			return nil, repairRequired("AIFAR_RUNTIME_INSTALL_DESIRED_STATE_MISSING", nil)
+		}
+		manifest, err := buildRuntimeManifest(instance, deployment, 1)
+		if err != nil {
+			return nil, repairRequired("AIFAR_RUNTIME_MANIFEST_BUILD_FAILED", err)
+		}
+		hash, err := runtimeagent.DeploymentManifestSpecHash(manifest)
+		if err != nil {
+			return nil, repairRequired("AIFAR_RUNTIME_MANIFEST_HASH_FAILED", err)
+		}
+		hashes[serviceName] = hash
+	}
+	return hashes, nil
+}
+
+func serviceSpecHashPairs(services []string, hashes map[string]string) string {
+	pairs := make([]string, 0, len(services))
+	for _, serviceName := range services {
+		pairs = append(pairs, serviceName+"="+hashes[serviceName])
+	}
+	return strings.Join(pairs, " ")
 }
 
 func (s Service) saveInitialControlPlaneDesired(instance store.AppInstance, revision, version, configHash string, options InstallOptions, definitions []serviceDefinition, now time.Time) error {
@@ -2044,6 +2135,7 @@ type installScriptData struct {
 	ServiceKinds        string
 	ServiceHealthPaths  string
 	ServiceAffinities   string
+	ServiceSpecHashes   string
 	GatewayService      string
 	WebService          string
 	Version             string

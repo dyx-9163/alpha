@@ -12,6 +12,7 @@ SERVICE_PORTS={{ quote .ServicePorts }}
 SERVICE_KINDS={{ quote .ServiceKinds }}
 SERVICE_HEALTH_PATHS={{ quote .ServiceHealthPaths }}
 SERVICE_AFFINITIES={{ quote .ServiceAffinities }}
+SERVICE_SPEC_HASHES={{ quote .ServiceSpecHashes }}
 GATEWAY_SERVICE={{ quote .GatewayService }}
 WEB_SERVICE={{ quote .WebService }}
 VERSION={{ quote .Version }}
@@ -33,6 +34,7 @@ TMP_DIR="$INSTALL_ROOT/.extract-$REVISION-$$"
 INSTALL_SUCCEEDED=0
 
 TIMEZONE={{ quote .Options.Timezone }}
+SPEC_TIMEZONE={{ quote .Options.Timezone }}
 APP_CPUS={{ quote .Options.AppCPUs }}
 APP_MEMORY_LIMIT={{ quote .Options.AppMemoryLimit }}
 JVM_INITIAL_RAM_PERCENTAGE={{ quote .Options.JVMInitialRAMPercentage }}
@@ -428,19 +430,14 @@ build_images() {
 health_cmd_for_service() {
   service="$1"
   port="$(service_port "$service")"
-  protocol="$(read_env_value "$ENV_DIR/compose.env" APP_HEALTH_PROTOCOL http)"
-  host="$(read_env_value "$ENV_DIR/compose.env" APP_HEALTH_HOST 127.0.0.1)"
-  timeout="$(read_env_value "$ENV_DIR/compose.env" APP_HEALTH_CONNECT_TIMEOUT 3)"
   if [ "$(service_kind "$service")" = "web" ]; then
     path="$(catalog_value "$SERVICE_HEALTH_PATHS" "$service" || true)"
-    [ -n "$path" ] || path="$(read_env_value "$ENV_DIR/compose.env" APP_WEB_HEALTH_PATH "/")"
-    printf "wget -q -T %s -O /dev/null %s://%s:%s%s || exit 1" "$timeout" "$protocol" "$host" "$port" "$path"
+    [ -n "$path" ] || path="/"
+    printf "wget -q -T 3 -O /dev/null 'http://127.0.0.1:%s%s' || exit 1" "$port" "$path"
   else
-    path="$(read_env_value "$ENV_DIR/$service.env" HEALTH_PATH "")"
-    [ -n "$path" ] || path="$(catalog_value "$SERVICE_HEALTH_PATHS" "$service" || true)"
-    [ -n "$path" ] || path="$(read_env_value "$ENV_DIR/compose.env" APP_BACKEND_HEALTH_PATH "/actuator/health/readiness")"
+    path="$(catalog_value "$SERVICE_HEALTH_PATHS" "$service" || true)"
     [ -n "$path" ] || path="/actuator/health/readiness"
-    printf "curl -fsS --connect-timeout %s %s://%s:%s%s >/dev/null || exit 1" "$timeout" "$protocol" "$host" "$port" "$path"
+    printf "curl -fsS --connect-timeout 3 'http://127.0.0.1:%s%s' >/dev/null || exit 1" "$port" "$path"
   fi
 }
 
@@ -465,7 +462,7 @@ JSON
     health_cmd="$(health_cmd_for_service "$service")"
     app_cpus="$(resource_value "$service" APP_CPUS "$APP_CPUS")"
     app_memory_limit="$(resource_value "$service" APP_MEMORY_LIMIT "$APP_MEMORY_LIMIT")"
-    log_dir="$LOG_DIR/$service"
+    log_dir="$INSTALL_ROOT/logs/$service"
     mkdir -p "$log_dir"
     if [ "$first_deployment" = "1" ]; then
       first_deployment=0
@@ -482,21 +479,18 @@ JSON
     if [ "$(service_kind "$service")" = "web" ]; then
       printf '      "envFiles": ["%s"],\n' "$(json_escape "$service_env")" >> "$spec"
       printf '      "volumes": [{"source":"%s","target":"/opt/aifar/logs","readOnly":false},{"source":"%s","target":"/var/log/nginx","readOnly":false}],\n' "$(json_escape "$log_dir")" "$(json_escape "$log_dir")" >> "$spec"
-      printf '      "environment": {"APP_CONTAINER_NAME":"${containerName}","AIFAR_LOG_DIR":"/opt/aifar/logs","LOG_DIR":"/opt/aifar/logs","TZ":"%s"},\n' "$(json_escape "$TIMEZONE")" >> "$spec"
+      printf '      "environment": {"APP_CONTAINER_NAME":"${containerName}","AIFAR_LOG_DIR":"/opt/aifar/logs","LOG_DIR":"/opt/aifar/logs","TZ":"%s"},\n' "$(json_escape "$SPEC_TIMEZONE")" >> "$spec"
     else
       printf '      "envFiles": ["%s","%s","%s"],\n' "$(json_escape "$ENV_DIR/java-common.env")" "$(json_escape "$ENV_DIR/java-secrets.env")" "$(json_escape "$service_env")" >> "$spec"
       printf '      "volumes": [{"source":"%s","target":"/opt/aifar/runtime/env","readOnly":true},{"source":"%s","target":"/opt/aifar/logs","readOnly":false},{"source":"%s","target":"/data/aifarsoft/javaApi/aifar-%s/log","readOnly":false}],\n' "$(json_escape "$ENV_DIR")" "$(json_escape "$log_dir")" "$(json_escape "$log_dir")" "$(json_escape "$service")" >> "$spec"
       printf '      "entrypoint": ["/bin/sh"],\n' >> "$spec"
       printf '      "command": ["/opt/aifar/runtime/env/java-entrypoint.sh"],\n' >> "$spec"
-      printf '      "environment": {"APP_CONTAINER_NAME":"${containerName}","AIFAR_SERVICE_NAME":"%s","AIFAR_LOG_DIR":"/opt/aifar/logs","LOG_DIR":"/opt/aifar/logs","TZ":"%s"},\n' "$service" "$(json_escape "$TIMEZONE")" >> "$spec"
+      printf '      "environment": {"APP_CONTAINER_NAME":"${containerName}","AIFAR_SERVICE_NAME":"%s","AIFAR_LOG_DIR":"/opt/aifar/logs","LOG_DIR":"/opt/aifar/logs","TZ":"%s"},\n' "$service" "$(json_escape "$SPEC_TIMEZONE")" >> "$spec"
     fi
     printf '      "resources": {"cpus":"%s","memory":"%s"},\n' "$(json_escape "$app_cpus")" "$(json_escape "$app_memory_limit")" >> "$spec"
     printf '      "healthCheck": {"command":"%s","interval":"%s","timeout":"%s","retries":%s,"startPeriod":"%s"}\n' \
       "$(json_escape "$health_cmd")" \
-      "$(json_escape "$(read_env_value "$ENV_DIR/compose.env" APP_HEALTH_INTERVAL 15s)")" \
-      "$(json_escape "$(read_env_value "$ENV_DIR/compose.env" APP_HEALTH_TIMEOUT 5s)")" \
-      "$(read_env_value "$ENV_DIR/compose.env" APP_HEALTH_RETRIES 3)" \
-      "$(json_escape "$(read_env_value "$ENV_DIR/compose.env" APP_HEALTH_START_PERIOD 30s)")" >> "$spec"
+      "15s" "5s" "3" "30s" >> "$spec"
     printf '    }' >> "$spec"
   done
   cat >> "$spec" <<JSON
@@ -542,12 +536,16 @@ readback_bootstrap_acceptance() {
   separator=""
   for service in $SERVICE_ORDER; do
     state="$(aifar-agent get-deployment --instance "$INSTANCE_ID" --service "$service" 2>/dev/null)" || return 1
+    state_instance="$(printf "%s" "$state" | sed -n 's/.*"instanceId":"\([^"]*\)".*/\1/p')"
+    state_service="$(printf "%s" "$state" | sed -n 's/.*"serviceName":"\([^"]*\)".*/\1/p')"
     generation="$(printf "%s" "$state" | sed -n 's/.*"generation":\([0-9][0-9]*\).*/\1/p')"
     spec_hash="$(printf "%s" "$state" | sed -n 's/.*"specHash":"\([0-9a-f][0-9a-f]*\)".*/\1/p')"
+    expected_hash="$(catalog_value "$SERVICE_SPEC_HASHES" "$service" || true)"
+    [ "$state_instance" = "$INSTANCE_ID" ] || return 1
+    [ "$state_service" = "$service" ] || return 1
     [ "$generation" = "1" ] || return 1
-    [ "${#spec_hash}" -eq 64 ] || return 1
-    case "$spec_hash" in *[!0-9a-f]*) return 1 ;; esac
-    response="${response}${separator}{\"accepted\":true,\"generation\":1,\"specHash\":\"${spec_hash}\"}"
+    [ -n "$expected_hash" ] && [ "$spec_hash" = "$expected_hash" ] || return 1
+    response="${response}${separator}{\"accepted\":true,\"instanceId\":\"${state_instance}\",\"serviceName\":\"${state_service}\",\"generation\":1,\"specHash\":\"${spec_hash}\"}"
     separator=,
   done
   printf '%s]}' "$response"
@@ -556,21 +554,12 @@ readback_bootstrap_acceptance() {
 accept_runtime_manifests() {
   check_agent_dependency
   spec="$(write_runtime_spec)"
-  if acceptance="$(aifar-agent bootstrap-runtime --spec "$spec" 2>/dev/null)"; then
+  if aifar-agent bootstrap-runtime --spec "$spec" >/dev/null 2>&1; then
     :
   else
-    acceptance="$(readback_bootstrap_acceptance)" || fail "aifar-agent could not persist the runtime Manifests"
+    :
   fi
-  printf "%s" "$acceptance" | grep -q '^{' || fail "aifar-agent bootstrap acceptance is invalid"
-  printf "%s" "$acceptance" | grep -q '"accepted":true' || fail "aifar-agent rejected the runtime Manifests"
-  printf "%s" "$acceptance" | grep -q '"instanceId":"'"$INSTANCE_ID"'"' || fail "aifar-agent bootstrap acceptance identity is invalid"
-  for service in $SERVICE_ORDER; do
-    state="$(aifar-agent get-deployment --instance "$INSTANCE_ID" --service "$service" 2>/dev/null)" || fail "aifar-agent deployment acceptance readback failed: $service"
-    printf "%s" "$state" | grep -q '"generation":1' || fail "aifar-agent deployment generation is invalid: $service"
-    spec_hash="$(printf "%s" "$state" | sed -n 's/.*"specHash":"\([0-9a-f][0-9a-f]*\)".*/\1/p')"
-    [ "${#spec_hash}" -eq 64 ] || fail "aifar-agent deployment spec hash is invalid: $service"
-    case "$spec_hash" in *[!0-9a-f]*) fail "aifar-agent deployment spec hash is invalid: $service" ;; esac
-  done
+  acceptance="$(readback_bootstrap_acceptance)" || fail "aifar-agent could not prove the exact runtime Manifests"
   rm -f "$spec"
   printf 'AIFAR_BOOTSTRAP_ACCEPTANCE=%s\n' "$acceptance"
 }
