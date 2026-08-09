@@ -151,6 +151,75 @@ func TestAcceptAndObserveAIFARDeploymentNeverRegressesRuntimeState(t *testing.T)
 	}
 }
 
+func TestStaleObservationBeforeAcceptanceCannotEraseNewDesiredAcceptance(t *testing.T) {
+	db := openTestStore(t)
+	gen1, err := db.SaveAIFARDeploymentGeneration(AIFARDeployment{InstanceID: "instance-1", ServiceName: "permission", Status: "pending_acceptance"}, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gen2, err := db.SaveAIFARDeploymentGeneration(AIFARDeployment{InstanceID: "instance-1", ServiceName: "permission", Status: "pending_acceptance", ConditionsJSON: `[{"type":"Accepted","status":false,"generation":2}]`}, gen1.Generation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stale, err := db.ObserveAIFARDeployment("instance-1", "permission", gen1.Generation, "Available", `[{"type":"Available","generation":1}]`, time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stale.Generation != 2 || stale.ObservedGeneration != 0 || stale.Status != "pending_acceptance" || !strings.Contains(stale.ConditionsJSON, `"generation":2`) {
+		t.Fatalf("stale observation changed generation 2 desired state: %+v", stale)
+	}
+	acceptedConditions := `[{"type":"Accepted","status":true,"generation":2}]`
+	accepted, err := db.AcceptAIFARDeployment("instance-1", "permission", gen2.Generation, "Accepted", acceptedConditions, time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertGenerationTwoAccepted(t, accepted, acceptedConditions)
+	assertGenerationTwoCanBeObserved(t, db)
+}
+
+func TestStaleObservationAfterAcceptanceCannotEraseNewDesiredAcceptance(t *testing.T) {
+	db := openTestStore(t)
+	gen1, err := db.SaveAIFARDeploymentGeneration(AIFARDeployment{InstanceID: "instance-1", ServiceName: "permission", Status: "pending_acceptance"}, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gen2, err := db.SaveAIFARDeploymentGeneration(AIFARDeployment{InstanceID: "instance-1", ServiceName: "permission", Status: "pending_acceptance"}, gen1.Generation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	acceptedConditions := `[{"type":"Accepted","status":true,"generation":2}]`
+	accepted, err := db.AcceptAIFARDeployment("instance-1", "permission", gen2.Generation, "Accepted", acceptedConditions, time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertGenerationTwoAccepted(t, accepted, acceptedConditions)
+	stale, err := db.ObserveAIFARDeployment("instance-1", "permission", gen1.Generation, "Available", `[{"type":"Available","generation":1}]`, time.Now().UTC().Add(time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertGenerationTwoAccepted(t, stale, acceptedConditions)
+	assertGenerationTwoCanBeObserved(t, db)
+}
+
+func assertGenerationTwoAccepted(t *testing.T, deployment AIFARDeployment, conditions string) {
+	t.Helper()
+	if deployment.Generation != 2 || deployment.ObservedGeneration != 0 || deployment.Status != "Accepted" || deployment.ConditionsJSON != conditions {
+		t.Fatalf("generation 2 acceptance was not preserved: %+v", deployment)
+	}
+}
+
+func assertGenerationTwoCanBeObserved(t *testing.T, db *Store) {
+	t.Helper()
+	conditions := `[{"type":"Available","generation":2}]`
+	observed, err := db.ObserveAIFARDeployment("instance-1", "permission", 2, "Available", conditions, time.Now().UTC().Add(2*time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if observed.Generation != 2 || observed.ObservedGeneration != 2 || observed.Status != "Available" || observed.ConditionsJSON != conditions {
+		t.Fatalf("generation 2 observation did not advance runtime state: %+v", observed)
+	}
+}
+
 func TestAcceptAIFARDeploymentRejectsLateGenerationWithoutChangingNewerState(t *testing.T) {
 	db := openTestStore(t)
 	gen1, err := db.SaveAIFARDeploymentGeneration(AIFARDeployment{InstanceID: "instance-1", ServiceName: "permission", Status: "pending_acceptance"}, 0)

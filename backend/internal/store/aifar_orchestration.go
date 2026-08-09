@@ -161,7 +161,7 @@ func (s *Store) AcceptAIFARDeployment(instanceID, serviceName string, generation
 		if current.Generation != generation {
 			return AIFARDeployment{}, ErrAIFARDeploymentGenerationConflict
 		}
-		if strings.EqualFold(current.Status, "Accepted") || current.ObservedGeneration >= generation || isObservedAIFARDeploymentStatus(current.Status) {
+		if strings.EqualFold(current.Status, "Accepted") || current.ObservedGeneration >= generation {
 			if err := tx.Commit(); err != nil {
 				return AIFARDeployment{}, err
 			}
@@ -179,15 +179,6 @@ func (s *Store) AcceptAIFARDeployment(instanceID, serviceName string, generation
 	return accepted, nil
 }
 
-func isObservedAIFARDeploymentStatus(status string) bool {
-	switch strings.ToLower(strings.TrimSpace(status)) {
-	case "available", "degraded", "offline", "progressing":
-		return true
-	default:
-		return false
-	}
-}
-
 func (s *Store) ObserveAIFARDeployment(instanceID, serviceName string, generation int64, status, conditionsJSON string, at time.Time) (AIFARDeployment, error) {
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -195,13 +186,9 @@ func (s *Store) ObserveAIFARDeployment(instanceID, serviceName string, generatio
 	}
 	defer tx.Rollback()
 	result, err := tx.Exec(`update aifar_deployments set
-		status=case when ? >= observed_generation then ? else status end,
-		conditions_json=case when ? >= observed_generation then ? else conditions_json end,
-		observed_generation=case when ? > observed_generation then ? else observed_generation end,
-		last_transition_at=case when ? >= observed_generation then ? else last_transition_at end,
-		updated_at=case when ? >= observed_generation then ? else updated_at end
-		where instance_id=? and service_name=? and generation >= ?`,
-		generation, status, generation, conditionsJSON, generation, generation, generation, at, generation, time.Now(), instanceID, serviceName, generation)
+		status=?, conditions_json=?, observed_generation=?, last_transition_at=?, updated_at=?
+		where instance_id=? and service_name=? and generation=?`,
+		status, conditionsJSON, generation, at, time.Now(), instanceID, serviceName, generation)
 	if err != nil {
 		return AIFARDeployment{}, err
 	}
@@ -210,11 +197,18 @@ func (s *Store) ObserveAIFARDeployment(instanceID, serviceName string, generatio
 		return AIFARDeployment{}, err
 	}
 	if affected == 0 {
-		if _, err := getAIFARDeployment(tx, instanceID, serviceName); err != nil {
+		current, err := getAIFARDeployment(tx, instanceID, serviceName)
+		if err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				return AIFARDeployment{}, ErrAIFARDeploymentNotFound
 			}
 			return AIFARDeployment{}, err
+		}
+		if current.Generation > generation {
+			if err := tx.Commit(); err != nil {
+				return AIFARDeployment{}, err
+			}
+			return current, nil
 		}
 		return AIFARDeployment{}, ErrAIFARDeploymentGenerationConflict
 	}
