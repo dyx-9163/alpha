@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -69,6 +70,71 @@ func TestSyncNacosProxyRegistrationsDeregistersAgentProxyInstances(t *testing.T)
 	}
 	if strings.Contains(joined, "web-vue3") {
 		t.Fatalf("web-vue3 must not be registered in Nacos, got:\n%s", joined)
+	}
+}
+
+func TestSyncNacosDiscoveryEventLoadsInstanceEnvWithoutManifestNacosState(t *testing.T) {
+	var requestsMu sync.Mutex
+	requests := []string{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestsMu.Lock()
+		requests = append(requests, r.Method+" "+r.URL.Path+"?"+r.URL.RawQuery)
+		requestsMu.Unlock()
+		if r.URL.Path == "/nacos/v1/auth/users/login" {
+			_, _ = w.Write([]byte(`{"accessToken":"test-token"}`))
+			return
+		}
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer server.Close()
+	hostPort := strings.TrimPrefix(server.URL, "http://")
+	installRoot := t.TempDir()
+	envDir := filepath.Join(installRoot, "runtime", "env")
+	if err := os.MkdirAll(envDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(envDir, "java-common.env"), []byte("NACOS_HOST="+hostPort+"\nNACOS_NS=prod\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(envDir, "java-secrets.env"), []byte("NACOS_PASSWORD=test-password\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	config := InstanceConfig{InstanceID: "admin", InstallRoot: installRoot}
+	event := readyDiscoveryEvent("permission", "permission-1")
+	event.ListenPort = 38010
+	if err := syncNacosDiscoveryEvent(context.Background(), config, event, NacosProxyRegister); err != nil {
+		t.Fatal(err)
+	}
+	requestsMu.Lock()
+	joined := strings.Join(requests, "\n")
+	requestsMu.Unlock()
+	for _, want := range []string{"POST /nacos/v1/auth/users/login?", "POST /nacos/v1/ns/instance?", "ip=", "port=38010", "serviceName=alpha-permission"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("expected request containing %q, got:\n%s", want, joined)
+		}
+	}
+}
+
+func TestLoadRuntimeSpecsForNacosReplaysNewManifestsAndIsolatesCorruptPeer(t *testing.T) {
+	stateDir := t.TempDir()
+	store := &ManifestStore{StateDir: stateDir}
+	if err := store.PutInstance(controllerTestConfig()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Put(controllerTestManifest("permission", 1, 1)); err != nil {
+		t.Fatal(err)
+	}
+	deploymentDir := filepath.Join(stateDir, "admin", "deployments")
+	if err := os.WriteFile(filepath.Join(deploymentDir, "file.json"), []byte("{corrupt"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	specs, err := loadRuntimeSpecsForNacos(stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(specs) != 1 || len(specs[0].Services) != 1 || specs[0].Services[0].Name != "permission" {
+		t.Fatalf("new-model Nacos replay did not isolate corrupt peer: %+v", specs)
 	}
 }
 

@@ -344,6 +344,7 @@ func (controller *serviceController) reconcileOnce() reconcileResult {
 	manager.setControllerCondition(manifest, hash, deploymentConditionProgressing, "Reconciling", false)
 	spec := runtimeSpecForDeployment(config, manifest)
 	err = manager.ensureDeployment(ctx, spec, manifest.Spec)
+	manager.publishDeploymentEndpoints(config, manifest)
 	if errors.Is(err, context.Canceled) && controller.isSuperseded(manifest.Metadata.Generation) {
 		return reconcileResult{kind: reconcileSuperseded}
 	}

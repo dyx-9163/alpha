@@ -1321,7 +1321,7 @@ func TestManagerConvertsDeploymentPanicToApplyError(t *testing.T) {
 	}
 }
 
-func TestReconcileRuntimeKeepsRuntimeAppliedWhenNacosSyncFails(t *testing.T) {
+func TestReconcileRuntimeNacosFailureDoesNotMutateRuntimeServiceStatus(t *testing.T) {
 	gatewayPort := freePort(t)
 	webPort := freePort(t)
 	manager := NewManager(ManagerOptions{StateDir: t.TempDir(), Runner: &fakeRunner{}})
@@ -1356,8 +1356,11 @@ func TestReconcileRuntimeKeepsRuntimeAppliedWhenNacosSyncFails(t *testing.T) {
 			break
 		}
 	}
-	if gateway.ServiceName == "" || gateway.LastNacosError == "" || gateway.NacosReady {
-		t.Fatalf("expected gateway Nacos status to record degraded sync, got %+v from %+v", gateway, statuses)
+	if gateway.ServiceName == "" {
+		t.Fatalf("expected gateway runtime status, got %+v", statuses)
+	}
+	if gateway.LastNacosError != "" || gateway.NacosRegistered || gateway.NacosReady || gateway.LastNacosHeartbeatAt != "" {
+		t.Fatalf("Nacos failure mutated runtime service status: %+v", gateway)
 	}
 	if err := manager.Remove(context.Background(), "admin"); err != nil {
 		t.Fatal(err)

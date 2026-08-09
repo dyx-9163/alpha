@@ -45,10 +45,8 @@ func (r Reconciler) ReconcileRuntime(ctx context.Context, spec RuntimeSpec) erro
 		RequireConfigured: true,
 	}); err != nil {
 		logf(r.Log, "sync AIFAR Nacos proxies after runtime reconcile failed: %v\n", err)
-		r.Manager.MarkNacosProxyStatus([]RuntimeSpec{spec}, err)
 		return nil
 	}
-	r.Manager.MarkNacosProxyStatus([]RuntimeSpec{spec}, nil)
 	logf(r.Log, "AIFAR agent reconciled runtime instance %s\n", spec.InstanceID)
 	return nil
 }
@@ -65,6 +63,7 @@ type ManagerOptions struct {
 	controllerClock          controllerClock
 	controllerBeforeActivate func(DeploymentManifest)
 	controllerBeforeRead     func(string, string)
+	discoveryController      *DiscoveryController
 }
 
 type Manager struct {
@@ -93,6 +92,7 @@ type Manager struct {
 	maintenanceLocks         map[string]*sync.RWMutex
 	controllerBeforeActivate func(DeploymentManifest)
 	controllerBeforeRead     func(string, string)
+	discoveryController      *DiscoveryController
 }
 
 type proxyRoute struct {
@@ -182,6 +182,15 @@ func NewManager(options ManagerOptions) *Manager {
 		manager.manifestStore = *options.ManifestStore
 	} else {
 		manager.manifestStore = ManifestStore{StateDir: stateDir}
+	}
+	if options.discoveryController != nil {
+		manager.discoveryController = options.discoveryController
+	} else {
+		manager.discoveryController = newDiscoveryController(discoveryControllerOptions{
+			Syncer:            &managerDiscoverySyncer{manager: manager},
+			Log:               manager.log,
+			HeartbeatInterval: 5 * time.Second,
+		})
 	}
 	return manager
 }
@@ -563,11 +572,17 @@ func (m *Manager) Remove(ctx context.Context, instanceID string) error {
 	if instanceID == "" {
 		instanceID = "admin"
 	}
+	if m.discoveryController != nil {
+		m.discoveryController.StopInstance(instanceID)
+	}
 	m.removeServiceControllers(instanceID)
 	maintenance := m.instanceMaintenanceLock(instanceID)
 	maintenance.Lock()
 	defer maintenance.Unlock()
 	m.removeServiceControllers(instanceID)
+	if m.discoveryController != nil {
+		m.discoveryController.StopInstance(instanceID)
+	}
 	portsToStop := []int{}
 	var spec RuntimeSpec
 	var hasSpec bool
@@ -699,9 +714,6 @@ func (m *Manager) StartRuntimeResync(ctx context.Context, interval time.Duration
 			options.Action = NacosProxyRegister
 			if err := SyncNacosProxyRegistrations(ctx, options); err != nil {
 				logf(m.log, "AIFAR runtime periodic Nacos replay failed: %v\n", err)
-				m.MarkNacosProxyStatus(specs, err)
-			} else {
-				m.MarkNacosProxyStatus(specs, nil)
 			}
 		}
 	}

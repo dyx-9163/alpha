@@ -209,8 +209,35 @@ func loadRuntimeSpecsForNacos(stateDir string) ([]RuntimeSpec, error) {
 		return nil, err
 	}
 	specs := make([]RuntimeSpec, 0, len(entries))
+	store := ManifestStore{StateDir: stateDir}
 	for _, entry := range entries {
 		if !entry.IsDir() {
+			continue
+		}
+		instancePath := filepath.Join(stateDir, entry.Name(), "instance.json")
+		if _, statErr := os.Lstat(instancePath); statErr == nil {
+			config, configErr := store.GetInstance(entry.Name())
+			if configErr != nil {
+				continue
+			}
+			manifests, _ := store.List(entry.Name())
+			if len(manifests) == 0 {
+				continue
+			}
+			spec := RuntimeSpec{
+				Version:     DefaultAgentVersion,
+				InstanceID:  config.InstanceID,
+				InstallRoot: config.InstallRoot,
+				Network:     config.Network,
+				Ingress:     config.Ingress,
+				Deployments: make([]DeploymentSpec, 0, len(manifests)),
+				Services:    make([]ServiceSpec, 0, len(manifests)),
+			}
+			for _, manifest := range manifests {
+				spec.Deployments = append(spec.Deployments, manifest.Spec)
+				spec.Services = append(spec.Services, manifest.Service)
+			}
+			specs = append(specs, spec)
 			continue
 		}
 		spec, err := readSpecFile(filepath.Join(stateDir, entry.Name(), "runtime-spec.json"))
@@ -223,7 +250,20 @@ func loadRuntimeSpecsForNacos(stateDir string) ([]RuntimeSpec, error) {
 }
 
 func nacosEnvForSpec(spec RuntimeSpec) (nacosRuntimeEnv, bool) {
-	envDir := filepath.Join(spec.InstallRoot, "runtime", "env")
+	env, ok := nacosEnvForInstance(InstanceConfig{InstallRoot: spec.InstallRoot})
+	if !ok {
+		return nacosRuntimeEnv{}, false
+	}
+	if env.Group == "DEFAULT_GROUP" {
+		if group := strings.TrimSpace(spec.Nacos.Group); group != "" {
+			env.Group = group
+		}
+	}
+	return env, true
+}
+
+func nacosEnvForInstance(config InstanceConfig) (nacosRuntimeEnv, bool) {
+	envDir := filepath.Join(config.InstallRoot, "runtime", "env")
 	common := readEnvFile(filepath.Join(envDir, "java-common.env"))
 	if len(common) == 0 {
 		return nacosRuntimeEnv{}, false
@@ -248,7 +288,7 @@ func nacosEnvForSpec(spec RuntimeSpec) (nacosRuntimeEnv, bool) {
 	}
 	group := strings.TrimSpace(common["NACOS_GROUP"])
 	if group == "" {
-		group = strings.TrimSpace(spec.Nacos.Group)
+		group = "DEFAULT_GROUP"
 	}
 	user := strings.TrimSpace(common["NACOS_USER"])
 	if user == "" {
@@ -262,6 +302,71 @@ func nacosEnvForSpec(spec RuntimeSpec) (nacosRuntimeEnv, bool) {
 		User:      user,
 		Password:  strings.TrimSpace(secrets["NACOS_PASSWORD"]),
 	}, true
+}
+
+func syncNacosDiscoveryEvent(ctx context.Context, config InstanceConfig, event EndpointEvent, action NacosProxyAction) error {
+	if event.ServiceName == "web-vue3" || strings.TrimSpace(event.AppName) == "web-vue3" {
+		return nil
+	}
+	env, ok := nacosEnvForInstance(config)
+	if !ok {
+		return errors.New("nacos discovery configuration is unavailable")
+	}
+	client := &http.Client{Timeout: 5 * time.Second}
+	spec := discoveryRuntimeSpec(config, event)
+	agentIP := resolveNacosAgentIP(spec, env.HostPort, "")
+	if agentIP == "" {
+		return errors.New("nacos discovery agent address is unavailable")
+	}
+	token := nacosAccessToken(ctx, client, env)
+	return syncNacosProxy(ctx, client, env, action, spec, event.AppName, agentIP, event.ListenPort, token, nil)
+}
+
+func heartbeatNacosDiscoveryEvent(ctx context.Context, config InstanceConfig, event EndpointEvent) error {
+	if len(event.Ready) == 0 || event.ServiceName == "web-vue3" || strings.TrimSpace(event.AppName) == "web-vue3" {
+		return nil
+	}
+	env, ok := nacosEnvForInstance(config)
+	if !ok {
+		return errors.New("nacos discovery configuration is unavailable")
+	}
+	client := &http.Client{Timeout: 5 * time.Second}
+	spec := discoveryRuntimeSpec(config, event)
+	agentIP := resolveNacosAgentIP(spec, env.HostPort, "")
+	if agentIP == "" {
+		return errors.New("nacos discovery agent address is unavailable")
+	}
+	token := nacosAccessToken(ctx, client, env)
+	endpoint := nacosHeartbeatURL(env, spec, event.AppName, agentIP, event.ListenPort, token)
+	if err := doNacosRequest(ctx, client, http.MethodPut, endpoint, false); err != nil {
+		if fallbackEphemeral, ok := nacosServiceConflictEphemeral(err); ok && fallbackEphemeral != specNacosEphemeral(spec) {
+			return nil
+		}
+		return err
+	}
+	return nil
+}
+
+func discoveryRuntimeSpec(config InstanceConfig, event EndpointEvent) RuntimeSpec {
+	ephemeral := true
+	return RuntimeSpec{
+		Version:     DefaultAgentVersion,
+		InstanceID:  config.InstanceID,
+		InstallRoot: config.InstallRoot,
+		Network:     config.Network,
+		Ingress:     config.Ingress,
+		Nacos: NacosSpec{
+			Group:           "DEFAULT_GROUP",
+			AgentIPStrategy: "auto",
+			Ephemeral:       &ephemeral,
+		},
+		Services: []ServiceSpec{{
+			Name:       event.ServiceName,
+			AppName:    event.AppName,
+			Port:       event.ListenPort,
+			ListenPort: event.ListenPort,
+		}},
+	}
 }
 
 func readEnvFile(path string) map[string]string {
