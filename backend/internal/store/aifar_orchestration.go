@@ -11,6 +11,7 @@ import (
 var (
 	ErrAIFARDeploymentGenerationConflict = errors.New("AIFAR deployment generation conflict")
 	ErrAIFARDeploymentNotFound           = errors.New("AIFAR deployment not found")
+	ErrAIFAROrchestrationLockOwnership   = errors.New("AIFAR orchestration lock ownership changed")
 )
 
 type AIFAROrchestrationLockConflict struct {
@@ -126,6 +127,169 @@ func (s *Store) SaveAIFARDeploymentGeneration(next AIFARDeployment, expectedGene
 		return AIFARDeployment{}, err
 	}
 	return saved, nil
+}
+
+// SaveAIFARInitialDesiredWithLock atomically verifies the exact active install
+// maintenance lock and publishes the complete generation-1 desired set. An
+// existing exact desired set is idempotent and retains runtime observations.
+func (s *Store) SaveAIFARInitialDesiredWithLock(lockID string, deployments []AIFARDeployment, replicaSets []AIFARReplicaSet) error {
+	if len(deployments) == 0 || len(deployments) != len(replicaSets) {
+		return fmt.Errorf("AIFAR initial desired set is incomplete")
+	}
+	instanceID := strings.TrimSpace(deployments[0].InstanceID)
+	if instanceID == "" || strings.TrimSpace(lockID) == "" {
+		return fmt.Errorf("AIFAR initial desired ownership is incomplete")
+	}
+	now := time.Now().UTC()
+	byService := make(map[string]AIFARDeployment, len(deployments))
+	for index := range deployments {
+		deployment := &deployments[index]
+		deployment.InstanceID = strings.TrimSpace(deployment.InstanceID)
+		deployment.ServiceName = strings.TrimSpace(deployment.ServiceName)
+		if deployment.InstanceID != instanceID || deployment.ServiceName == "" || deployment.Generation != 1 || deployment.ObservedGeneration != 0 || deployment.DesiredReplicas != 1 || strings.TrimSpace(deployment.CurrentRevision) == "" || strings.TrimSpace(deployment.SpecJSON) == "" || strings.ToLower(strings.TrimSpace(deployment.Status)) != "pending_acceptance" {
+			return fmt.Errorf("AIFAR initial desired deployment is invalid")
+		}
+		if _, exists := byService[deployment.ServiceName]; exists {
+			return fmt.Errorf("AIFAR initial desired deployment is duplicated")
+		}
+		if deployment.ID == "" {
+			deployment.ID = NewID("aifardeploy")
+		}
+		if deployment.CreatedAt.IsZero() {
+			deployment.CreatedAt = now
+		}
+		deployment.UpdatedAt = now
+		byService[deployment.ServiceName] = *deployment
+	}
+	for index := range replicaSets {
+		replicaSet := &replicaSets[index]
+		replicaSet.InstanceID = strings.TrimSpace(replicaSet.InstanceID)
+		replicaSet.ServiceName = strings.TrimSpace(replicaSet.ServiceName)
+		deployment, exists := byService[replicaSet.ServiceName]
+		if !exists || replicaSet.InstanceID != instanceID || replicaSet.Revision != deployment.CurrentRevision || replicaSet.DesiredPods != 1 || replicaSet.ReadyPods != 0 {
+			return fmt.Errorf("AIFAR initial desired replicaSet is invalid")
+		}
+		if replicaSet.ID == "" {
+			replicaSet.ID = NewID("aifarrs")
+		}
+		if replicaSet.CreatedAt.IsZero() {
+			replicaSet.CreatedAt = now
+		}
+		replicaSet.UpdatedAt = now
+		delete(byService, replicaSet.ServiceName)
+	}
+	if len(byService) != 0 {
+		return fmt.Errorf("AIFAR initial desired replicaSet is missing")
+	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	lockedInstanceID, err := verifyActiveAIFARInstallLockTx(tx, lockID, now)
+	if err != nil {
+		return err
+	}
+	if lockedInstanceID != instanceID {
+		return ErrAIFAROrchestrationLockOwnership
+	}
+	for _, deployment := range deployments {
+		if _, err := tx.Exec(`insert into aifar_deployments(id,instance_id,service_name,desired_replicas,current_revision,updating_revision,strategy_json,spec_json,generation,observed_generation,status,metadata_json,conditions_json,last_transition_at,created_at,updated_at)
+			values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) on conflict(instance_id,service_name) do nothing`,
+			deployment.ID, deployment.InstanceID, deployment.ServiceName, deployment.DesiredReplicas, deployment.CurrentRevision, deployment.UpdatingRevision, deployment.StrategyJSON, deployment.SpecJSON, deployment.Generation, deployment.ObservedGeneration, deployment.Status, deployment.MetadataJSON, deployment.ConditionsJSON, nullableTime(deployment.LastTransitionAt), deployment.CreatedAt, deployment.UpdatedAt); err != nil {
+			return err
+		}
+		current, err := getAIFARDeployment(tx, deployment.InstanceID, deployment.ServiceName)
+		if err != nil {
+			return err
+		}
+		if current.Generation != deployment.Generation || current.DesiredReplicas != deployment.DesiredReplicas || current.CurrentRevision != deployment.CurrentRevision || current.SpecJSON != deployment.SpecJSON || current.StrategyJSON != deployment.StrategyJSON {
+			return ErrAIFARDeploymentGenerationConflict
+		}
+	}
+	for _, replicaSet := range replicaSets {
+		if _, err := tx.Exec(`insert into aifar_replicasets(id,instance_id,service_name,revision,image,artifact_hash,desired_pods,ready_pods,status,metadata_json,created_at,updated_at)
+			values(?,?,?,?,?,?,?,?,?,?,?,?) on conflict(instance_id,service_name,revision) do nothing`,
+			replicaSet.ID, replicaSet.InstanceID, replicaSet.ServiceName, replicaSet.Revision, replicaSet.Image, replicaSet.ArtifactHash, replicaSet.DesiredPods, replicaSet.ReadyPods, replicaSet.Status, replicaSet.MetadataJSON, replicaSet.CreatedAt, replicaSet.UpdatedAt); err != nil {
+			return err
+		}
+		var current AIFARReplicaSet
+		if err := tx.QueryRow(`select id,instance_id,service_name,revision,image,coalesce(artifact_hash,''),desired_pods,ready_pods,status,coalesce(metadata_json,''),created_at,updated_at
+			from aifar_replicasets where instance_id=? and service_name=? and revision=?`, replicaSet.InstanceID, replicaSet.ServiceName, replicaSet.Revision).
+			Scan(&current.ID, &current.InstanceID, &current.ServiceName, &current.Revision, &current.Image, &current.ArtifactHash, &current.DesiredPods, &current.ReadyPods, &current.Status, &current.MetadataJSON, &current.CreatedAt, &current.UpdatedAt); err != nil {
+			return err
+		}
+		if current.Image != replicaSet.Image || current.ArtifactHash != replicaSet.ArtifactHash || current.DesiredPods != replicaSet.DesiredPods {
+			return ErrAIFARDeploymentGenerationConflict
+		}
+	}
+	return tx.Commit()
+}
+
+// AcceptAIFARDeploymentWithLock accepts only the exact desired revision/spec
+// while the same install maintenance lock remains active in this transaction.
+func (s *Store) AcceptAIFARDeploymentWithLock(lockID string, expected AIFARDeployment, status, conditionsJSON string, at time.Time) (AIFARDeployment, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return AIFARDeployment{}, err
+	}
+	defer tx.Rollback()
+	instanceID, err := verifyActiveAIFARInstallLockTx(tx, lockID, time.Now().UTC())
+	if err != nil {
+		return AIFARDeployment{}, err
+	}
+	if instanceID != expected.InstanceID {
+		return AIFARDeployment{}, ErrAIFAROrchestrationLockOwnership
+	}
+	current, err := getAIFARDeployment(tx, expected.InstanceID, expected.ServiceName)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return AIFARDeployment{}, ErrAIFARDeploymentNotFound
+		}
+		return AIFARDeployment{}, err
+	}
+	if current.Generation != expected.Generation || current.CurrentRevision != expected.CurrentRevision || current.SpecJSON != expected.SpecJSON {
+		return AIFARDeployment{}, ErrAIFARDeploymentGenerationConflict
+	}
+	if strings.EqualFold(current.Status, "Accepted") || current.ObservedGeneration >= current.Generation {
+		if err := tx.Commit(); err != nil {
+			return AIFARDeployment{}, err
+		}
+		return current, nil
+	}
+	result, err := tx.Exec(`update aifar_deployments set status=?,conditions_json=?,last_transition_at=?,updated_at=?
+		where instance_id=? and service_name=? and generation=? and current_revision=? and spec_json=?
+			and observed_generation=0 and lower(status)='pending_acceptance'`,
+		status, conditionsJSON, at, time.Now(), expected.InstanceID, expected.ServiceName, expected.Generation, expected.CurrentRevision, expected.SpecJSON)
+	if err != nil {
+		return AIFARDeployment{}, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return AIFARDeployment{}, err
+	}
+	if affected != 1 {
+		return AIFARDeployment{}, ErrAIFARDeploymentGenerationConflict
+	}
+	accepted, err := getAIFARDeployment(tx, expected.InstanceID, expected.ServiceName)
+	if err != nil {
+		return AIFARDeployment{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return AIFARDeployment{}, err
+	}
+	return accepted, nil
+}
+
+func verifyActiveAIFARInstallLockTx(tx *sql.Tx, lockID string, now time.Time) (string, error) {
+	var instanceID string
+	err := tx.QueryRow(`select instance_id from aifar_orchestration_locks
+		where id=? and service_name='' and operation='install' and status='active' and expires_at>?`, strings.TrimSpace(lockID), now).Scan(&instanceID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", ErrAIFAROrchestrationLockOwnership
+	}
+	return instanceID, err
 }
 
 // AcceptAIFARDeployment records Agent acceptance only while the desired

@@ -71,6 +71,11 @@ type aifarDeploymentControlStore interface {
 	AcceptAIFARDeployment(instanceID, serviceName string, generation int64, status, conditionsJSON string, at time.Time) (store.AIFARDeployment, error)
 }
 
+type aifarInitialInstallFencedStore interface {
+	SaveAIFARInitialDesiredWithLock(lockID string, deployments []store.AIFARDeployment, replicaSets []store.AIFARReplicaSet) error
+	AcceptAIFARDeploymentWithLock(lockID string, expected store.AIFARDeployment, status, conditionsJSON string, at time.Time) (store.AIFARDeployment, error)
+}
+
 type aifarRuntimeCleanupStore interface {
 	PruneAIFARPodRecords(instanceID string, existingContainerNames []string) (int, error)
 	PruneAIFARServiceEndpointRecords(instanceID string, existingContainerNames []string) (int, error)
@@ -591,6 +596,7 @@ func (s Service) Install(ctx context.Context, req InstallRequest, resources []st
 	}
 	var instance store.AppInstance
 	var expectedBootstrapHashes map[string]string
+	var expectedBootstrapDeployments map[string]store.AIFARDeployment
 	var installLock store.AIFAROrchestrationLock
 	installOwner := ""
 	installCtx := ctx
@@ -703,11 +709,13 @@ func (s Service) Install(ctx context.Context, req InstallRequest, resources []st
 				return err
 			}
 		}
-		if err := s.saveInitialControlPlaneDesired(instance, releaseID, bundle.Version, configHash, options, serviceDefinitions, releaseTime); err != nil {
-			return err
+		var desiredErr error
+		expectedBootstrapDeployments, desiredErr = s.saveInitialControlPlaneDesired(installLock.ID, instance, releaseID, bundle.Version, configHash, options, serviceDefinitions, releaseTime)
+		if desiredErr != nil {
+			return desiredErr
 		}
 		var hashErr error
-		expectedBootstrapHashes, hashErr = s.initialDeploymentSpecHashes(instance, options.SelectedServices)
+		expectedBootstrapHashes, hashErr = s.initialDeploymentSpecHashes(instance, options.SelectedServices, expectedBootstrapDeployments)
 		if hashErr != nil {
 			return hashErr
 		}
@@ -777,7 +785,7 @@ func (s Service) Install(ctx context.Context, req InstallRequest, resources []st
 		if err != nil {
 			return err
 		}
-		return s.acceptInitialControlPlane(instance.ID, options.SelectedServices)
+		return s.acceptInitialControlPlane(installLock.ID, expectedBootstrapDeployments, options.SelectedServices)
 	}); err != nil {
 		_ = s.markInstallFailed(instance, metadata, err)
 		msg := fmt.Sprintf(copy.InstallFailed, err)
@@ -793,6 +801,25 @@ func (s Service) Install(ctx context.Context, req InstallRequest, resources []st
 		}
 		if !owned {
 			return repairRequired("AIFAR_RUNTIME_INSTALL_ATTEMPT_OWNERSHIP_CHANGED", nil)
+		}
+		releases, ok := s.store.(releaseStore)
+		if !ok {
+			return repairRequired("AIFAR_RUNTIME_RELEASE_STORE_UNAVAILABLE", nil)
+		}
+		manifest, _ := json.Marshal(releaseManifest(bundle.Version, releaseID, releaseTime, configHash, ingressNetwork, options.GatewayPort, options.WebPort, options.SelectedServices))
+		if _, err := releases.SaveAppRelease(store.AppRelease{
+			InstanceID:   instance.ID,
+			App:          AppName,
+			Version:      bundle.Version,
+			ReleaseID:    releaseID,
+			ServerID:     target,
+			Status:       "success",
+			ManifestJSON: string(manifest),
+			ConfigHash:   configHash,
+			CreatedAt:    releaseTime,
+			ActivatedAt:  releaseTime,
+		}); err != nil {
+			return err
 		}
 		delete(metadata, "installFailed")
 		delete(metadata, "failedAt")
@@ -814,25 +841,8 @@ func (s Service) Install(ctx context.Context, req InstallRequest, resources []st
 		if saveErr != nil {
 			return saveErr
 		}
-		if releases, ok := s.store.(releaseStore); ok {
-			manifest, _ := json.Marshal(releaseManifest(bundle.Version, releaseID, releaseTime, configHash, ingressNetwork, options.GatewayPort, options.WebPort, options.SelectedServices))
-			if _, err := releases.SaveAppRelease(store.AppRelease{
-				InstanceID:   instance.ID,
-				App:          AppName,
-				Version:      bundle.Version,
-				ReleaseID:    releaseID,
-				ServerID:     target,
-				Status:       "success",
-				ManifestJSON: string(manifest),
-				ConfigHash:   configHash,
-				CreatedAt:    releaseTime,
-				ActivatedAt:  releaseTime,
-			}); err != nil {
-				return err
-			}
-			if _, err := releases.DeleteOldAppReleases(instance.ID, releaseKeepCount); err != nil {
-				return err
-			}
+		if _, err := releases.DeleteOldAppReleases(instance.ID, releaseKeepCount); err != nil {
+			logForServer.Info("AIFAR release retention cleanup warning: reason=retention_cleanup_failed")
 		}
 		return nil
 	}); err != nil {
@@ -965,19 +975,7 @@ func decodeBootstrapAcceptance(stdout, instanceID string, expectedHashes map[str
 	return acceptance, nil
 }
 
-func (s Service) initialDeploymentSpecHashes(instance store.AppInstance, services []string) (map[string]string, error) {
-	control, ok := s.store.(aifarDeploymentControlStore)
-	if !ok {
-		return nil, repairRequired("AIFAR_RUNTIME_CONTROL_STORE_UNAVAILABLE", nil)
-	}
-	deployments, err := control.ListAIFARDeployments(instance.ID)
-	if err != nil {
-		return nil, err
-	}
-	byService := make(map[string]store.AIFARDeployment, len(deployments))
-	for _, deployment := range deployments {
-		byService[cleanAIFARServiceName(deployment.ServiceName)] = deployment
-	}
+func (s Service) initialDeploymentSpecHashes(instance store.AppInstance, services []string, byService map[string]store.AIFARDeployment) (map[string]string, error) {
 	hashes := make(map[string]string, len(services))
 	for _, serviceName := range services {
 		deployment, exists := byService[serviceName]
@@ -1005,81 +1003,75 @@ func serviceSpecHashPairs(services []string, hashes map[string]string) string {
 	return strings.Join(pairs, " ")
 }
 
-func (s Service) saveInitialControlPlaneDesired(instance store.AppInstance, revision, version, configHash string, options InstallOptions, definitions []serviceDefinition, now time.Time) error {
-	orch, ok := s.store.(aifarOrchestrationStore)
+func (s Service) saveInitialControlPlaneDesired(lockID string, instance store.AppInstance, revision, version, configHash string, options InstallOptions, definitions []serviceDefinition, now time.Time) (map[string]store.AIFARDeployment, error) {
+	fenced, ok := s.store.(aifarInitialInstallFencedStore)
 	if !ok {
-		return nil
-	}
-	existing, err := orch.ListAIFARDeployments(instance.ID)
-	if err != nil {
-		return err
-	}
-	existingByService := make(map[string]store.AIFARDeployment, len(existing))
-	for _, deployment := range existing {
-		existingByService[cleanAIFARServiceName(deployment.ServiceName)] = deployment
+		return nil, repairRequired("AIFAR_RUNTIME_CONTROL_STORE_UNAVAILABLE", nil)
 	}
 	metadata := metadataFromInstance(instance)
 	strategy := runtimeagent.NormalizeDeploymentStrategy(runtimeagent.DeploymentStrategySpec{})
 	strategyJSON, err := json.Marshal(strategy)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	pendingConditions, err := deploymentConditionsJSON(false, "PendingAgentAcceptance", 1)
 	if err != nil {
-		return err
+		return nil, err
 	}
+	deployments := make([]store.AIFARDeployment, 0, len(options.SelectedServices))
+	replicaSets := make([]store.AIFARReplicaSet, 0, len(options.SelectedServices))
+	byService := make(map[string]store.AIFARDeployment, len(options.SelectedServices))
 	for _, serviceName := range options.SelectedServices {
 		definition, found := catalogDefinition(definitions, serviceName)
 		if !found {
-			return fmt.Errorf("AIFAR service %s is not defined", serviceName)
-		}
-		if current, found := existingByService[serviceName]; found && current.Generation == 1 && current.CurrentRevision == revision && strings.TrimSpace(current.SpecJSON) != "" {
-			continue
+			return nil, fmt.Errorf("AIFAR service %s is not defined", serviceName)
 		}
 		base := store.AIFARDeployment{InstanceID: instance.ID, ServiceName: serviceName, DesiredReplicas: 1, CurrentRevision: revision}
 		installRoot := strings.TrimSpace(stringFromMetadata(metadata, "installRoot", ""))
 		manifest := runtimeagent.NormalizeDeploymentManifest(runtimeManifestDefaults(instance.ID, installRoot, definition, base, 1, metadata))
 		config := runtimeInstanceConfig(instance, metadata, installRoot)
 		if err := runtimeagent.ValidateDeploymentManifest(config, manifest); err != nil {
-			return err
+			return nil, err
 		}
 		specJSON, err := json.Marshal(manifest)
 		if err != nil {
-			return err
+			return nil, err
 		}
-		if _, err := orch.SaveAIFARDeployment(store.AIFARDeployment{
+		deployment := store.AIFARDeployment{
 			InstanceID: instance.ID, ServiceName: serviceName, DesiredReplicas: 1, CurrentRevision: revision,
 			StrategyJSON: string(strategyJSON), SpecJSON: string(specJSON), Generation: 1, ObservedGeneration: 0,
 			Status: "pending_acceptance", MetadataJSON: `{"model":"` + orchestrationModelK8sLikeV1 + `"}`,
 			ConditionsJSON: pendingConditions, LastTransitionAt: now, CreatedAt: now,
-		}); err != nil {
-			return err
 		}
-		if _, err := orch.SaveAIFARReplicaSet(store.AIFARReplicaSet{
+		deployments = append(deployments, deployment)
+		byService[serviceName] = deployment
+		replicaSets = append(replicaSets, store.AIFARReplicaSet{
 			InstanceID: instance.ID, ServiceName: serviceName, Revision: revision,
 			Image: fmt.Sprintf("aifar-%s:%s", serviceName, revision), ArtifactHash: configHash,
 			DesiredPods: 1, ReadyPods: 0, Status: "pending", MetadataJSON: fmt.Sprintf(`{"version":%q}`, version), CreatedAt: now,
-		}); err != nil {
-			return err
-		}
-		if err := orch.ReplaceAIFARServiceEndpoints(instance.ID, serviceName, nil); err != nil {
-			return err
-		}
+		})
 	}
-	return nil
+	if err := fenced.SaveAIFARInitialDesiredWithLock(lockID, deployments, replicaSets); err != nil {
+		return nil, err
+	}
+	return byService, nil
 }
 
-func (s Service) acceptInitialControlPlane(instanceID string, services []string) error {
-	control, ok := s.store.(aifarDeploymentControlStore)
+func (s Service) acceptInitialControlPlane(lockID string, expected map[string]store.AIFARDeployment, services []string) error {
+	fenced, ok := s.store.(aifarInitialInstallFencedStore)
 	if !ok {
-		return nil
+		return repairRequired("AIFAR_RUNTIME_CONTROL_STORE_UNAVAILABLE", nil)
 	}
 	for _, serviceName := range services {
+		desired, exists := expected[serviceName]
+		if !exists {
+			return repairRequired("AIFAR_RUNTIME_INSTALL_DESIRED_STATE_MISSING", nil)
+		}
 		conditions, err := deploymentConditionsJSON(true, "ManifestAccepted", 1)
 		if err != nil {
 			return err
 		}
-		_, err = control.AcceptAIFARDeployment(instanceID, serviceName, 1, "Accepted", conditions, time.Now().UTC())
+		_, err = fenced.AcceptAIFARDeploymentWithLock(lockID, desired, "Accepted", conditions, time.Now().UTC())
 		if err != nil {
 			return err
 		}

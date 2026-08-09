@@ -41,6 +41,9 @@ type fakeStore struct {
 	endpoints                 []store.AIFARServiceEndpoint
 	saveCalls                 int
 	failSaveOn                int
+	releaseSaveCalls          int
+	failReleaseSaveOn         int
+	deleteOldReleaseErr       error
 	directDeploymentSaveCalls int
 	acceptDeploymentCalls     int
 	failDeploymentAcceptOn    int
@@ -211,6 +214,10 @@ func (f *fakeStore) DeleteAppInstance(id string) error {
 func (f *fakeStore) SaveAppRelease(v store.AppRelease) (store.AppRelease, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.releaseSaveCalls++
+	if f.failReleaseSaveOn > 0 && f.releaseSaveCalls == f.failReleaseSaveOn {
+		return store.AppRelease{}, errors.New("required release persistence failed")
+	}
 	if v.ID == "" {
 		v.ID = store.NewID("rel")
 	}
@@ -239,6 +246,9 @@ func (f *fakeStore) ListAppReleases(instanceID string) ([]store.AppRelease, erro
 func (f *fakeStore) DeleteOldAppReleases(instanceID string, keep int) (int, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.deleteOldReleaseErr != nil {
+		return 0, f.deleteOldReleaseErr
+	}
 	if keep < 1 {
 		keep = 1
 	}
@@ -317,6 +327,78 @@ func (f *fakeStore) AcceptAIFARDeployment(instanceID, serviceName string, genera
 		}
 		if current.Generation != generation {
 			return current, store.ErrAIFARDeploymentGenerationConflict
+		}
+		current.Status = status
+		current.ConditionsJSON = conditionsJSON
+		current.LastTransitionAt = at
+		f.deployments[idx] = current
+		return current, nil
+	}
+	return store.AIFARDeployment{}, store.ErrAIFARDeploymentNotFound
+}
+
+func (f *fakeStore) SaveAIFARInitialDesiredWithLock(_ string, deployments []store.AIFARDeployment, replicaSets []store.AIFARReplicaSet) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(deployments) == 0 || len(deployments) != len(replicaSets) {
+		return errors.New("incomplete initial desired set")
+	}
+	for _, desired := range deployments {
+		found := false
+		for _, current := range f.deployments {
+			if current.InstanceID != desired.InstanceID || current.ServiceName != desired.ServiceName {
+				continue
+			}
+			found = true
+			if current.Generation != desired.Generation || current.CurrentRevision != desired.CurrentRevision || current.SpecJSON != desired.SpecJSON {
+				return store.ErrAIFARDeploymentGenerationConflict
+			}
+		}
+		if !found {
+			f.directDeploymentSaveCalls++
+			if desired.ID == "" {
+				desired.ID = store.NewID("aifardeploy")
+			}
+			f.deployments = append(f.deployments, desired)
+		}
+	}
+	for _, desired := range replicaSets {
+		found := false
+		for _, current := range f.replicaSets {
+			if current.InstanceID != desired.InstanceID || current.ServiceName != desired.ServiceName || current.Revision != desired.Revision {
+				continue
+			}
+			found = true
+			if current.Image != desired.Image || current.ArtifactHash != desired.ArtifactHash || current.DesiredPods != desired.DesiredPods {
+				return store.ErrAIFARDeploymentGenerationConflict
+			}
+		}
+		if !found {
+			if desired.ID == "" {
+				desired.ID = store.NewID("aifarrs")
+			}
+			f.replicaSets = append(f.replicaSets, desired)
+		}
+	}
+	return nil
+}
+
+func (f *fakeStore) AcceptAIFARDeploymentWithLock(_ string, expected store.AIFARDeployment, status, conditionsJSON string, at time.Time) (store.AIFARDeployment, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.acceptDeploymentCalls++
+	if f.failDeploymentAcceptOn > 0 && f.acceptDeploymentCalls == f.failDeploymentAcceptOn {
+		return store.AIFARDeployment{}, errors.New("control-plane acceptance write failed")
+	}
+	for idx, current := range f.deployments {
+		if current.InstanceID != expected.InstanceID || current.ServiceName != expected.ServiceName {
+			continue
+		}
+		if current.Generation != expected.Generation || current.CurrentRevision != expected.CurrentRevision || current.SpecJSON != expected.SpecJSON {
+			return current, store.ErrAIFARDeploymentGenerationConflict
+		}
+		if strings.EqualFold(current.Status, "Accepted") || current.ObservedGeneration >= current.Generation {
+			return current, nil
 		}
 		current.Status = status
 		current.ConditionsJSON = conditionsJSON
@@ -633,6 +715,45 @@ type fakeRemote struct {
 	scaleFinalizeScript     string
 }
 
+type installStageBarrierRemote struct {
+	*fakeRemote
+	blockFirstUpload bool
+	blockInstallRun  bool
+	reached          chan struct{}
+	release          chan struct{}
+	once             sync.Once
+	uploads          int
+}
+
+func (r *installStageBarrierRemote) wait(ctx context.Context) error {
+	r.once.Do(func() { close(r.reached) })
+	select {
+	case <-r.release:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (r *installStageBarrierRemote) UploadFile(ctx context.Context, server store.Server, localPath, remotePath string, mode os.FileMode) error {
+	r.uploads++
+	if r.blockFirstUpload && r.uploads == 1 {
+		if err := r.wait(ctx); err != nil {
+			return err
+		}
+	}
+	return r.fakeRemote.UploadFile(ctx, server, localPath, remotePath, mode)
+}
+
+func (r *installStageBarrierRemote) Run(ctx context.Context, server store.Server, command string) (adapter.CommandResult, error) {
+	if r.blockInstallRun && strings.Contains(command, "install-aifar.sh") {
+		if err := r.wait(ctx); err != nil {
+			return adapter.CommandResult{}, err
+		}
+	}
+	return r.fakeRemote.Run(ctx, server, command)
+}
+
 func (f *fakeRemote) Run(ctx context.Context, server store.Server, command string) (adapter.CommandResult, error) {
 	if err := ctx.Err(); err != nil {
 		return adapter.CommandResult{}, err
@@ -851,6 +972,27 @@ type fakeLogger struct{}
 
 func (fakeLogger) Info(format string, args ...any)  {}
 func (fakeLogger) Error(format string, args ...any) {}
+
+type messageLogger struct {
+	mu       sync.Mutex
+	messages []string
+}
+
+func (l *messageLogger) Info(format string, args ...any) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.messages = append(l.messages, fmt.Sprintf(format, args...))
+}
+
+func (l *messageLogger) Error(format string, args ...any) {
+	l.Info(format, args...)
+}
+
+func (l *messageLogger) joined() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return strings.Join(l.messages, "\n")
+}
 
 type rejectingCommitLogger struct{ fakeLogger }
 
@@ -2627,6 +2769,212 @@ func TestInstallChangedConfigRetryAfterAgentPersistenceFailsClosed(t *testing.T)
 	}
 	if !reflect.DeepEqual(s.deployments, before) {
 		t.Fatalf("changed-config retry must not replace generation-1 desired rows\nbefore=%+v\nafter=%+v", before, s.deployments)
+	}
+}
+
+func TestInstallReleasePersistenceFailureRemainsRetryable(t *testing.T) {
+	withFakeRuntimeAgentBinary(t)
+	root := createAIFARBundle(t)
+	resources := []store.Resource{{App: AppName, Part: "backend", Version: appBundleVersion, Path: filepath.Join(root, appBundleVersion, bundleManifestName)}}
+	s := &fakeStore{
+		servers:           map[string]store.Server{"srv-1": {ID: "srv-1", Host: "10.0.0.10", DeployDir: "/aifar/apps"}},
+		failReleaseSaveOn: 1,
+	}
+	remote := &fakeRemote{}
+	service := NewService(s, remote)
+	req := InstallRequest{
+		Version: "latest", ServerID: "srv-1", Language: "en",
+		Parameters: map[string]any{"nacosHost": "10.0.0.50", "selectedServices": []string{"gateway"}},
+	}
+	if err := service.Install(context.Background(), req, resources, fakeLogger{}, nil); err == nil {
+		t.Fatal("required release persistence failure must fail before installed")
+	}
+	if len(s.instances) != 1 || s.instances[0].Status != "install_failed" || len(s.releases) != 0 {
+		t.Fatalf("release failure must leave a retryable instance: instances=%+v releases=%+v", s.instances, s.releases)
+	}
+	failedDeployments := append([]store.AIFARDeployment(nil), s.deployments...)
+	if err := service.Install(context.Background(), req, resources, fakeLogger{}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if s.instances[0].Status != "installed" || len(s.releases) != 1 || s.releases[0].Status != "success" {
+		t.Fatalf("same-attempt retry must repair release and install: instances=%+v releases=%+v", s.instances, s.releases)
+	}
+	if remote.installRuns != 2 {
+		t.Fatalf("release repair retry must re-prove the same Agent manifests, runs=%d", remote.installRuns)
+	}
+	for index, deployment := range s.deployments {
+		if deployment.Generation != 1 || deployment.CurrentRevision != failedDeployments[index].CurrentRevision || deployment.SpecJSON != failedDeployments[index].SpecJSON {
+			t.Fatalf("release repair changed accepted desired state: before=%+v after=%+v", failedDeployments, s.deployments)
+		}
+	}
+}
+
+func TestInstallReleaseRetentionFailureIsBestEffort(t *testing.T) {
+	withFakeRuntimeAgentBinary(t)
+	root := createAIFARBundle(t)
+	s := &fakeStore{
+		servers:             map[string]store.Server{"srv-1": {ID: "srv-1", Host: "10.0.0.10", DeployDir: "/aifar/apps"}},
+		deleteOldReleaseErr: errors.New("retention failed: secret=must-not-leak"),
+	}
+	logger := &messageLogger{}
+	err := NewService(s, &fakeRemote{}).Install(context.Background(), InstallRequest{
+		Version: "latest", ServerID: "srv-1", Language: "en",
+		Parameters: map[string]any{"nacosHost": "10.0.0.50", "selectedServices": []string{"gateway"}},
+	}, []store.Resource{{App: AppName, Part: "backend", Version: appBundleVersion, Path: filepath.Join(root, appBundleVersion, bundleManifestName)}}, logger, nil)
+	if err != nil {
+		t.Fatalf("retention cleanup must not fail accepted install: %v", err)
+	}
+	if len(s.instances) != 1 || s.instances[0].Status != "installed" || len(s.releases) != 1 || s.releases[0].Status != "success" {
+		t.Fatalf("retention cleanup changed required install outcome: instances=%+v releases=%+v", s.instances, s.releases)
+	}
+	messages := logger.joined()
+	if !strings.Contains(strings.ToLower(messages), "warning") || strings.Contains(messages, "must-not-leak") || strings.Contains(messages, "secret=") {
+		t.Fatalf("retention warning must be present and sanitized: %s", messages)
+	}
+}
+
+func takeOverBlockedInstall(t *testing.T, db *store.Store) (store.AppInstance, store.AIFAROrchestrationLock) {
+	t.Helper()
+	instances, err := db.ListAppInstances()
+	if err != nil || len(instances) != 1 {
+		t.Fatalf("blocked install instance=%+v err=%v", instances, err)
+	}
+	instance := instances[0]
+	locks, err := db.ListAIFAROrchestrationLocks(instance.ID, true)
+	if err != nil || len(locks) != 1 || locks[0].Operation != "install" {
+		t.Fatalf("blocked install lock=%+v err=%v", locks, err)
+	}
+	if released, err := db.ReleaseAIFAROrchestrationLockByID(locks[0].ID); err != nil || !released {
+		t.Fatalf("release old install owner=%v err=%v", released, err)
+	}
+	if renewed, err := db.RenewAIFAROrchestrationLock(locks[0].ID, time.Now().UTC().Add(time.Hour)); err != nil || renewed {
+		t.Fatalf("lost install owner renewed=%v err=%v", renewed, err)
+	}
+	ownerB, err := db.AcquireAIFAROrchestrationLock(store.AIFAROrchestrationLock{
+		ID: "install-owner-b", InstanceID: instance.ID, Operation: "install", TaskID: "successor",
+		StartedAt: time.Now().UTC(), ExpiresAt: time.Now().UTC().Add(time.Hour),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	metadata := metadataFromInstance(instance)
+	metadata["installAttemptOwner"] = ownerB.ID
+	metadata["installState"] = "installing"
+	instance.Status = "installing"
+	instance.Metadata = mustMetadata(t, metadata)
+	instance, err = db.SaveAppInstance(instance)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return instance, ownerB
+}
+
+func successorInitialDesired(instance store.AppInstance, revision string, now time.Time) ([]store.AIFARDeployment, []store.AIFARReplicaSet) {
+	services := servicesFromMetadata(metadataFromInstance(instance))
+	deployments := make([]store.AIFARDeployment, 0, len(services))
+	replicaSets := make([]store.AIFARReplicaSet, 0, len(services))
+	for _, serviceName := range services {
+		spec := fmt.Sprintf(`{"owner":"b","service":%q}`, serviceName)
+		deployments = append(deployments, store.AIFARDeployment{
+			InstanceID: instance.ID, ServiceName: serviceName, DesiredReplicas: 1,
+			CurrentRevision: revision, StrategyJSON: `{"type":"RollingUpdate"}`, SpecJSON: spec,
+			Generation: 1, ObservedGeneration: 0, Status: "pending_acceptance", CreatedAt: now,
+		})
+		replicaSets = append(replicaSets, store.AIFARReplicaSet{
+			InstanceID: instance.ID, ServiceName: serviceName, Revision: revision,
+			Image: "successor/" + serviceName + ":" + revision, ArtifactHash: "owner-b-hash",
+			DesiredPods: 1, ReadyPods: 0, Status: "pending", CreatedAt: now,
+		})
+	}
+	return deployments, replicaSets
+}
+
+func TestLostInstallOwnerCannotPublishGenerationOneDesiredAfterSuccessorTakeover(t *testing.T) {
+	withFakeRuntimeAgentBinary(t)
+	root := createAIFARBundle(t)
+	db := openAIFARTestStore(t)
+	if _, err := db.SaveServer(store.Server{ID: "srv-1", Name: "node-1", Host: "10.0.0.10", DeployDir: "/aifar/apps"}); err != nil {
+		t.Fatal(err)
+	}
+	remote := &installStageBarrierRemote{
+		fakeRemote: &fakeRemote{}, blockFirstUpload: true,
+		reached: make(chan struct{}), release: make(chan struct{}),
+	}
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- NewService(db, remote).Install(context.Background(), InstallRequest{
+			Version: "latest", ServerID: "srv-1", Language: "en", TaskID: "owner-a",
+			Parameters: map[string]any{"nacosHost": "10.0.0.50", "selectedServices": []string{"gateway"}},
+		}, []store.Resource{{App: AppName, Part: "backend", Version: appBundleVersion, Path: filepath.Join(root, appBundleVersion, bundleManifestName)}}, fakeLogger{}, nil)
+	}()
+	<-remote.reached
+	instance, ownerB := takeOverBlockedInstall(t, db)
+	ownerBRevision := "owner-b-revision"
+	deploymentsB, replicaSetsB := successorInitialDesired(instance, ownerBRevision, time.Now().UTC())
+	if err := db.SaveAIFARInitialDesiredWithLock(ownerB.ID, deploymentsB, replicaSetsB); err != nil {
+		t.Fatal(err)
+	}
+	close(remote.release)
+	if err := <-errCh; err == nil {
+		t.Fatal("lost owner must fail instead of publishing generation-1 desired state")
+	}
+	current, err := db.ListAIFARDeployments(instance.ID)
+	if err != nil || len(current) != len(deploymentsB) {
+		t.Fatalf("successor desired=%+v err=%v", current, err)
+	}
+	for _, deployment := range current {
+		if deployment.CurrentRevision != ownerBRevision || !strings.Contains(deployment.SpecJSON, `"owner":"b"`) || deployment.Status != "pending_acceptance" {
+			t.Fatalf("lost owner overwrote successor desired: %+v", deployment)
+		}
+	}
+}
+
+func TestLostInstallOwnerCannotAcceptSuccessorGenerationOneDesired(t *testing.T) {
+	withFakeRuntimeAgentBinary(t)
+	root := createAIFARBundle(t)
+	db := openAIFARTestStore(t)
+	if _, err := db.SaveServer(store.Server{ID: "srv-1", Name: "node-1", Host: "10.0.0.10", DeployDir: "/aifar/apps"}); err != nil {
+		t.Fatal(err)
+	}
+	remote := &installStageBarrierRemote{
+		fakeRemote: &fakeRemote{}, blockInstallRun: true,
+		reached: make(chan struct{}), release: make(chan struct{}),
+	}
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- NewService(db, remote).Install(context.Background(), InstallRequest{
+			Version: "latest", ServerID: "srv-1", Language: "en", TaskID: "owner-a",
+			Parameters: map[string]any{"nacosHost": "10.0.0.50", "selectedServices": []string{"gateway"}},
+		}, []store.Resource{{App: AppName, Part: "backend", Version: appBundleVersion, Path: filepath.Join(root, appBundleVersion, bundleManifestName)}}, fakeLogger{}, nil)
+	}()
+	<-remote.reached
+	instance, _ := takeOverBlockedInstall(t, db)
+	ownerBRevision := "owner-b-revision"
+	current, err := db.ListAIFARDeployments(instance.ID)
+	if err != nil || len(current) == 0 {
+		t.Fatalf("owner A desired=%+v err=%v", current, err)
+	}
+	for _, deployment := range current {
+		deployment.CurrentRevision = ownerBRevision
+		deployment.SpecJSON = fmt.Sprintf(`{"owner":"b","service":%q}`, deployment.ServiceName)
+		deployment.Status = "pending_acceptance"
+		deployment.ObservedGeneration = 0
+		if _, err := db.SaveAIFARDeployment(deployment); err != nil {
+			t.Fatal(err)
+		}
+	}
+	close(remote.release)
+	if err := <-errCh; err == nil {
+		t.Fatal("lost owner must fail instead of accepting successor generation-1 desired state")
+	}
+	current, err = db.ListAIFARDeployments(instance.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, deployment := range current {
+		if deployment.CurrentRevision != ownerBRevision || !strings.Contains(deployment.SpecJSON, `"owner":"b"`) || deployment.Status != "pending_acceptance" {
+			t.Fatalf("lost owner accepted or overwrote successor desired: %+v", deployment)
+		}
 	}
 }
 
