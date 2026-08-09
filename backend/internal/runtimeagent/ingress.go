@@ -675,7 +675,7 @@ func (m *Manager) Resync(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	for _, spec := range m.snapshotSpecs() {
+	for _, spec := range m.legacyRuntimeSpecs(m.snapshotSpecs()) {
 		if err := m.reconcileDeployments(ctx, spec); err != nil {
 			return err
 		}
@@ -705,7 +705,7 @@ func (m *Manager) StartRuntimeResync(ctx context.Context, interval time.Duration
 				logf(m.log, "AIFAR runtime periodic resync failed: %v\n", err)
 				continue
 			}
-			specs := m.snapshotSpecs()
+			specs := m.legacyRuntimeSpecs(m.snapshotSpecs())
 			if len(specs) == 0 {
 				continue
 			}
@@ -717,6 +717,18 @@ func (m *Manager) StartRuntimeResync(ctx context.Context, interval time.Duration
 			}
 		}
 	}
+}
+
+func (m *Manager) legacyRuntimeSpecs(specs []RuntimeSpec) []RuntimeSpec {
+	legacy := make([]RuntimeSpec, 0, len(specs))
+	for _, spec := range specs {
+		instancePath := filepath.Join(m.stateDir, strings.TrimSpace(spec.InstanceID), "instance.json")
+		if _, err := os.Lstat(instancePath); err == nil || !os.IsNotExist(err) {
+			continue
+		}
+		legacy = append(legacy, spec)
+	}
+	return legacy
 }
 
 func (m *Manager) StartDockerEventSync(ctx context.Context, debounce time.Duration) {

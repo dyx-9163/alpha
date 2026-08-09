@@ -209,35 +209,12 @@ func loadRuntimeSpecsForNacos(stateDir string) ([]RuntimeSpec, error) {
 		return nil, err
 	}
 	specs := make([]RuntimeSpec, 0, len(entries))
-	store := ManifestStore{StateDir: stateDir}
 	for _, entry := range entries {
 		if !entry.IsDir() {
 			continue
 		}
 		instancePath := filepath.Join(stateDir, entry.Name(), "instance.json")
 		if _, statErr := os.Lstat(instancePath); statErr == nil {
-			config, configErr := store.GetInstance(entry.Name())
-			if configErr != nil {
-				continue
-			}
-			manifests, _ := store.List(entry.Name())
-			if len(manifests) == 0 {
-				continue
-			}
-			spec := RuntimeSpec{
-				Version:     DefaultAgentVersion,
-				InstanceID:  config.InstanceID,
-				InstallRoot: config.InstallRoot,
-				Network:     config.Network,
-				Ingress:     config.Ingress,
-				Deployments: make([]DeploymentSpec, 0, len(manifests)),
-				Services:    make([]ServiceSpec, 0, len(manifests)),
-			}
-			for _, manifest := range manifests {
-				spec.Deployments = append(spec.Deployments, manifest.Spec)
-				spec.Services = append(spec.Services, manifest.Service)
-			}
-			specs = append(specs, spec)
 			continue
 		}
 		spec, err := readSpecFile(filepath.Join(stateDir, entry.Name(), "runtime-spec.json"))
@@ -705,7 +682,7 @@ type nacosHTTPError struct {
 }
 
 func (e *nacosHTTPError) Error() string {
-	return fmt.Sprintf("%s %s: %s", e.Method, e.Status, strings.TrimSpace(e.Body))
+	return fmt.Sprintf("Nacos %s request failed with HTTP %d", e.Method, e.StatusCode)
 }
 
 func isNacosServiceConflict(err error) bool {
@@ -742,11 +719,14 @@ func nacosServiceConflict(err error) (string, bool) {
 func doNacosRequest(ctx context.Context, client *http.Client, method, endpoint string, allowNotFound bool) error {
 	req, err := http.NewRequestWithContext(ctx, method, endpoint, nil)
 	if err != nil {
-		return err
+		return errors.New("create Nacos request failed")
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return err
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		return errors.New("Nacos request transport failed")
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusNotFound && allowNotFound {

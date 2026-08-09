@@ -1367,6 +1367,25 @@ func TestReconcileRuntimeNacosFailureDoesNotMutateRuntimeServiceStatus(t *testin
 	}
 }
 
+func TestPeriodicNacosReplayExcludesNewModelZeroReadyService(t *testing.T) {
+	manager := NewManager(ManagerOptions{StateDir: t.TempDir(), Runner: &fakeRunner{}})
+	if err := manager.manifestStore.PutInstance(controllerTestConfig()); err != nil {
+		t.Fatal(err)
+	}
+	newModel := runtimeSpecForDeployment(controllerTestConfig(), controllerTestManifest("permission", 1, 1))
+	legacy := newModel
+	legacy.InstanceID = "legacy"
+	manager.mu.Lock()
+	manager.specs[newModel.InstanceID] = newModel
+	manager.specs[legacy.InstanceID] = legacy
+	manager.mu.Unlock()
+
+	got := manager.legacyRuntimeSpecs(manager.snapshotSpecs())
+	if len(got) != 1 || got[0].InstanceID != "legacy" {
+		t.Fatalf("periodic Nacos replay included zero-Ready new-model service: %+v", got)
+	}
+}
+
 func TestManagerContainerReadyDiagnosticsIncludesInspectAndLogs(t *testing.T) {
 	runner := &diagnosticRunner{}
 	manager := NewManager(ManagerOptions{StateDir: t.TempDir(), Runner: runner})

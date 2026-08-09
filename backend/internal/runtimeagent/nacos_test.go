@@ -1,15 +1,26 @@
 package runtimeagent
 
 import (
+	"bytes"
 	"context"
+	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (fn roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	return fn(request)
+}
 
 func TestSyncNacosProxyRegistrationsDeregistersAgentProxyInstances(t *testing.T) {
 	requests := []string{}
@@ -115,7 +126,7 @@ func TestSyncNacosDiscoveryEventLoadsInstanceEnvWithoutManifestNacosState(t *tes
 	}
 }
 
-func TestLoadRuntimeSpecsForNacosReplaysNewManifestsAndIsolatesCorruptPeer(t *testing.T) {
+func TestLoadRuntimeSpecsForNacosSkipsNewModelEvenWithDesiredReadyReplica(t *testing.T) {
 	stateDir := t.TempDir()
 	store := &ManifestStore{StateDir: stateDir}
 	if err := store.PutInstance(controllerTestConfig()); err != nil {
@@ -133,8 +144,140 @@ func TestLoadRuntimeSpecsForNacosReplaysNewManifestsAndIsolatesCorruptPeer(t *te
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(specs) != 1 || len(specs[0].Services) != 1 || specs[0].Services[0].Name != "permission" {
-		t.Fatalf("new-model Nacos replay did not isolate corrupt peer: %+v", specs)
+	if len(specs) != 0 {
+		t.Fatalf("global Nacos replay included new-model manifests: %+v", specs)
+	}
+}
+
+func TestLoadRuntimeSpecsForNacosKeepsLegacyFallback(t *testing.T) {
+	stateDir := t.TempDir()
+	manager := NewManager(ManagerOptions{StateDir: stateDir, Runner: &fakeRunner{}})
+	spec := NormalizeSpec(RuntimeSpec{
+		InstanceID:  "legacy",
+		InstallRoot: t.TempDir(),
+		Network:     "aifar-network",
+		Deployments: []DeploymentSpec{{ServiceName: "permission", Image: "permission:rev-1", PodRevision: "rev-1", Replicas: 1}},
+		Services:    []ServiceSpec{{Name: "permission", AppName: "alpha-permission", Port: 38010}},
+	})
+	if err := manager.writeSpec(spec); err != nil {
+		t.Fatal(err)
+	}
+	specs, err := loadRuntimeSpecsForNacos(stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(specs) != 1 || specs[0].InstanceID != "legacy" {
+		t.Fatalf("legacy runtime replay missing: %+v", specs)
+	}
+}
+
+func TestNacosErrorsSanitizeTokenizedTransportURLAndResponseBody(t *testing.T) {
+	spec := nacosErrorTestSpec(t)
+	t.Run("transport", func(t *testing.T) {
+		client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+			if request.URL.Path == "/nacos/v1/auth/users/login" {
+				return nacosTestResponse(request, http.StatusOK, `{"accessToken":"secret-token"}`), nil
+			}
+			return nil, &url.Error{Op: request.Method, URL: request.URL.String(), Err: errors.New("transport-secret")}
+		})}
+		err := SyncNacosProxyRegistrations(context.Background(), NacosProxySyncOptions{Specs: []RuntimeSpec{spec}, Client: client})
+		if err == nil {
+			t.Fatal("expected transport failure")
+		}
+		assertNacosSecretAbsent(t, err.Error(), "secret-token", "accessToken", "transport-secret", "/nacos/v1/ns/instance?")
+	})
+
+	t.Run("response-body", func(t *testing.T) {
+		client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+			if request.URL.Path == "/nacos/v1/auth/users/login" {
+				return nacosTestResponse(request, http.StatusOK, `{"accessToken":"secret-token"}`), nil
+			}
+			return nacosTestResponse(request, http.StatusInternalServerError, "password=body-secret token=response-secret"), nil
+		})}
+		err := SyncNacosProxyRegistrations(context.Background(), NacosProxySyncOptions{Specs: []RuntimeSpec{spec}, Client: client})
+		if err == nil {
+			t.Fatal("expected HTTP failure")
+		}
+		assertNacosSecretAbsent(t, err.Error(), "body-secret", "response-secret", "password=")
+	})
+}
+
+func TestStartNacosProxyHeartbeatLogsOnlySanitizedContext(t *testing.T) {
+	spec := nacosErrorTestSpec(t)
+	requested := make(chan struct{}, 4)
+	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		if request.URL.Path == "/nacos/v1/auth/users/login" {
+			return nacosTestResponse(request, http.StatusOK, `{"accessToken":"secret-token"}`), nil
+		}
+		select {
+		case requested <- struct{}{}:
+		default:
+		}
+		return nil, &url.Error{Op: request.Method, URL: request.URL.String(), Err: errors.New("transport-secret")}
+	})}
+	var log bytes.Buffer
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		StartNacosProxyHeartbeat(ctx, NacosProxySyncOptions{Specs: []RuntimeSpec{spec}, Client: client, Log: &log})
+		close(done)
+	}()
+	select {
+	case <-requested:
+	case <-time.After(time.Second):
+		t.Fatal("heartbeat request did not run")
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("heartbeat loop did not stop")
+	}
+	got := log.String()
+	if !strings.Contains(got, "heartbeat failed") {
+		t.Fatalf("missing stable heartbeat context: %q", got)
+	}
+	assertNacosSecretAbsent(t, got, "secret-token", "accessToken", "transport-secret", "NACOS_PASSWORD")
+}
+
+func nacosErrorTestSpec(t *testing.T) RuntimeSpec {
+	t.Helper()
+	installRoot := t.TempDir()
+	envDir := filepath.Join(installRoot, "runtime", "env")
+	if err := os.MkdirAll(envDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(envDir, "java-common.env"), []byte("NACOS_HOST=127.0.0.1:8848\nNACOS_USER=nacos-user\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(envDir, "java-secrets.env"), []byte("NACOS_PASSWORD=password-secret\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return NormalizeSpec(RuntimeSpec{
+		InstanceID:  "legacy",
+		InstallRoot: installRoot,
+		Network:     "aifar-network",
+		Deployments: []DeploymentSpec{{ServiceName: "permission", Image: "permission:rev-1", PodRevision: "rev-1", Replicas: 1}},
+		Services:    []ServiceSpec{{Name: "permission", AppName: "alpha-permission", Port: 38010}},
+	})
+}
+
+func nacosTestResponse(request *http.Request, status int, body string) *http.Response {
+	return &http.Response{
+		StatusCode: status,
+		Status:     http.StatusText(status),
+		Body:       io.NopCloser(strings.NewReader(body)),
+		Header:     make(http.Header),
+		Request:    request,
+	}
+}
+
+func assertNacosSecretAbsent(t *testing.T, value string, secrets ...string) {
+	t.Helper()
+	for _, secret := range secrets {
+		if strings.Contains(value, secret) {
+			t.Fatalf("Nacos error/log leaked %q: %q", secret, value)
+		}
 	}
 }
 

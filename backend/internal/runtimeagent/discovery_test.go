@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"net"
 	"reflect"
 	"sync"
 	"testing"
@@ -66,12 +67,42 @@ func TestDiscoveryTransitionsAndCanonicalHashDedupe(t *testing.T) {
 
 	changed := readyDiscoveryEvent("permission", "permission-1")
 	discovery.EndpointChanged(changed)
-	waitForDiscovery(t, time.Second, func() bool { return syncer.count("register", "permission") == 2 })
+	waitForDiscovery(t, time.Second, func() bool { return syncer.count("refresh", "permission") == 3 })
+	if got := syncer.count("register", "permission"); got != 1 {
+		t.Fatalf("positive endpoint churn registered Nacos %d times, want 1", got)
+	}
 	discovery.EndpointChanged(offline)
 	waitForDiscovery(t, time.Second, func() bool { return syncer.count("deregister", "permission") == 2 })
 
 	if got := syncer.count("refresh", "permission"); got != 4 {
 		t.Fatalf("route refresh count=%d, want one for each distinct transition", got)
+	}
+}
+
+func TestDiscoveryRouteRollsBackAndRegistrationRecoversAcrossAtoBtoA(t *testing.T) {
+	syncer := newPortTransitionDiscoverySyncer()
+	discovery := newDiscoveryController(discoveryControllerOptions{Syncer: syncer})
+	t.Cleanup(discovery.Stop)
+
+	a := readyDiscoveryEvent("permission", "permission-a")
+	a.ListenPort = 38010
+	discovery.EndpointChanged(a)
+	waitForDiscovery(t, time.Second, func() bool { return syncer.registerCount(38010) == 1 })
+
+	b := readyDiscoveryEvent("permission", "permission-b")
+	b.ListenPort = 38011
+	discovery.EndpointChanged(b)
+	select {
+	case <-syncer.blockedRegister:
+	case <-time.After(time.Second):
+		t.Fatal("B registration did not block")
+	}
+	discovery.EndpointChanged(a)
+	waitForDiscovery(t, time.Second, func() bool {
+		return syncer.refreshCount(38010) >= 2 && syncer.registerCount(38010) >= 2
+	})
+	if got := syncer.registerCount(38011); got != 0 {
+		t.Fatalf("cancelled B registration completed %d times", got)
 	}
 }
 
@@ -148,7 +179,9 @@ func TestDiscoveryRetryBackoffResetsAfterSuccess(t *testing.T) {
 	waitForDiscovery(t, time.Second, func() bool { return discoveryAppliedPod(discovery, "permission") == "permission-1" })
 
 	syncer.setFailure("permission", errors.New("unavailable again"))
-	discovery.EndpointChanged(readyDiscoveryEvent("permission", "permission-2"))
+	changedIdentity := readyDiscoveryEvent("permission", "permission-2")
+	changedIdentity.ListenPort = 30001
+	discovery.EndpointChanged(changedIdentity)
 	waitForDiscovery(t, time.Second, func() bool { return len(clock.snapshotDurations()) == 3 })
 	if got, want := clock.snapshotDurations(), []time.Duration{time.Second, 2 * time.Second, time.Second}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("retry durations=%v, want %v", got, want)
@@ -211,7 +244,7 @@ func TestDiscoveryHeartbeatPanicKeepsOwnerAndPeerAlive(t *testing.T) {
 	discovery.EndpointChanged(readyDiscoveryEvent("file", "file-2"))
 	discovery.EndpointChanged(readyDiscoveryEvent("permission", "permission-2"))
 	waitForDiscovery(t, time.Second, func() bool {
-		return syncer.registeredPod("file", "file-2") && syncer.registeredPod("permission", "permission-2")
+		return discoveryAppliedPod(discovery, "file") == "file-2" && discoveryAppliedPod(discovery, "permission") == "permission-2"
 	})
 }
 
@@ -360,6 +393,99 @@ func TestManagerRemoveCleansDiscoveryPublishedByCancelledReconcile(t *testing.T)
 	}
 }
 
+func TestManagerDiscoveryRouteReplacesListenPortAndAllowsReclaim(t *testing.T) {
+	discovery := newDiscoveryController(discoveryControllerOptions{Syncer: &fakeDiscoverySyncer{}})
+	t.Cleanup(discovery.Stop)
+	manager := newControllerTestManager(t, newControllerTestRunner(), func(options *ManagerOptions) {
+		options.discoveryController = discovery
+	})
+	t.Cleanup(func() { _ = manager.Remove(context.Background(), "admin") })
+	syncer := &managerDiscoverySyncer{manager: manager}
+	portA, portB := freePort(t), freePort(t)
+	if portA == portB {
+		t.Fatal("expected distinct free ports")
+	}
+
+	applyPort := func(generation int64, port int) {
+		t.Helper()
+		manifest := controllerTestManifest("permission", generation, 1)
+		manifest.Service.Port = port
+		manifest.Service.ListenPort = port
+		manifest.Service.TargetPort = port
+		if _, err := manager.manifestStore.Put(manifest); err != nil {
+			t.Fatal(err)
+		}
+		event := readyDiscoveryEvent("permission", "permission-1")
+		event.ListenPort = port
+		if err := syncer.RefreshRoutes(context.Background(), event); err != nil {
+			t.Fatal(err)
+		}
+	}
+	assertOnlyPort := func(want, old int) {
+		t.Helper()
+		manager.mu.RLock()
+		_, hasWantRoute := manager.routes[want]
+		_, hasOldRoute := manager.routes[old]
+		_, hasWantServer := manager.servers[want]
+		_, hasOldServer := manager.servers[old]
+		manager.mu.RUnlock()
+		if !hasWantRoute || !hasWantServer || hasOldRoute || hasOldServer {
+			t.Fatalf("route replacement want=%d old=%d routes=%t/%t servers=%t/%t", want, old, hasWantRoute, hasOldRoute, hasWantServer, hasOldServer)
+		}
+	}
+
+	applyPort(1, portA)
+	applyPort(2, portB)
+	assertOnlyPort(portB, portA)
+	applyPort(3, portA)
+	assertOnlyPort(portA, portB)
+}
+
+func TestManagerDiscoveryRouteRestoresOldPortWhenNewListenerFails(t *testing.T) {
+	discovery := newDiscoveryController(discoveryControllerOptions{Syncer: &fakeDiscoverySyncer{}})
+	t.Cleanup(discovery.Stop)
+	manager := newControllerTestManager(t, newControllerTestRunner(), func(options *ManagerOptions) {
+		options.discoveryController = discovery
+	})
+	t.Cleanup(func() { _ = manager.Remove(context.Background(), "admin") })
+	syncer := &managerDiscoverySyncer{manager: manager}
+	oldPort := freePort(t)
+	occupied, err := net.Listen("tcp", ":0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer occupied.Close()
+	newPort := occupied.Addr().(*net.TCPAddr).Port
+
+	putAndRefresh := func(generation int64, port int) error {
+		manifest := controllerTestManifest("permission", generation, 1)
+		manifest.Service.Port = port
+		manifest.Service.ListenPort = port
+		manifest.Service.TargetPort = port
+		if _, err := manager.manifestStore.Put(manifest); err != nil {
+			return err
+		}
+		event := readyDiscoveryEvent("permission", "permission-1")
+		event.ListenPort = port
+		return syncer.RefreshRoutes(context.Background(), event)
+	}
+	if err := putAndRefresh(1, oldPort); err != nil {
+		t.Fatal(err)
+	}
+	if err := putAndRefresh(2, newPort); err == nil {
+		t.Fatal("expected occupied replacement port to fail")
+	}
+	manager.mu.RLock()
+	oldRoute := manager.routes[oldPort]
+	_, newRoute := manager.routes[newPort]
+	_, oldServer := manager.servers[oldPort]
+	_, newServer := manager.servers[newPort]
+	manager.mu.RUnlock()
+	if oldRoute.InstanceID != "admin" || oldRoute.Service != "permission" || newRoute || !oldServer || newServer {
+		t.Fatalf("failed replacement did not restore old route: old=%+v newRoute=%t oldServer=%t newServer=%t", oldRoute, newRoute, oldServer, newServer)
+	}
+}
+
 type blockingDiscoverySyncer struct {
 	started chan struct{}
 	release chan struct{}
@@ -386,6 +512,58 @@ func (s *blockingDiscoverySyncer) Heartbeat(context.Context, EndpointEvent) erro
 type cancellingDiscoverySyncer struct {
 	started   chan string
 	cancelled chan string
+}
+
+type portTransitionDiscoverySyncer struct {
+	mu              sync.Mutex
+	refreshes       map[int]int
+	registers       map[int]int
+	blockedRegister chan struct{}
+}
+
+func newPortTransitionDiscoverySyncer() *portTransitionDiscoverySyncer {
+	return &portTransitionDiscoverySyncer{
+		refreshes:       map[int]int{},
+		registers:       map[int]int{},
+		blockedRegister: make(chan struct{}, 1),
+	}
+}
+
+func (s *portTransitionDiscoverySyncer) RefreshRoutes(_ context.Context, event EndpointEvent) error {
+	s.mu.Lock()
+	s.refreshes[event.ListenPort]++
+	s.mu.Unlock()
+	return nil
+}
+
+func (s *portTransitionDiscoverySyncer) Register(ctx context.Context, event EndpointEvent) error {
+	if event.ListenPort == 38011 {
+		select {
+		case s.blockedRegister <- struct{}{}:
+		default:
+		}
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	s.mu.Lock()
+	s.registers[event.ListenPort]++
+	s.mu.Unlock()
+	return nil
+}
+
+func (s *portTransitionDiscoverySyncer) Deregister(context.Context, EndpointEvent) error { return nil }
+func (s *portTransitionDiscoverySyncer) Heartbeat(context.Context, EndpointEvent) error  { return nil }
+
+func (s *portTransitionDiscoverySyncer) refreshCount(port int) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.refreshes[port]
+}
+
+func (s *portTransitionDiscoverySyncer) registerCount(port int) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.registers[port]
 }
 
 func (s *cancellingDiscoverySyncer) RefreshRoutes(context.Context, EndpointEvent) error { return nil }

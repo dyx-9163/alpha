@@ -6,9 +6,9 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"sort"
 	"strconv"
 	"strings"
@@ -71,17 +71,20 @@ type discoveryWorker struct {
 	wake       chan struct{}
 	stop       chan struct{}
 
-	mu          sync.Mutex
-	latest      EndpointEvent
-	latestHash  string
-	routeHash   string
-	applied     EndpointEvent
-	appliedHash string
-	hasApplied  bool
-	failures    int
-	stopped     bool
-	activeHash  string
-	cancel      context.CancelFunc
+	mu                 sync.Mutex
+	latest             EndpointEvent
+	latestHash         string
+	routeHash          string
+	applied            EndpointEvent
+	appliedHash        string
+	hasApplied         bool
+	registered         EndpointEvent
+	registeredIdentity string
+	registryKnown      bool
+	failures           int
+	stopped            bool
+	activeHash         string
+	cancel             context.CancelFunc
 }
 
 type managerDiscoverySyncer struct {
@@ -272,11 +275,11 @@ func (worker *discoveryWorker) syncIteration() (result discoveryResult) {
 		}
 	}()
 
-	event, hash, previous, hasPrevious, stopped := worker.snapshot()
+	event, hash, _, _, stopped := worker.snapshot()
 	if stopped || hash == "" {
 		return discoveryStable
 	}
-	if hasPrevious && hash == endpointEventHash(previous) {
+	if worker.isFullyApplied(hash) {
 		return discoveryStable
 	}
 	ctx, finish, active := worker.activate(hash)
@@ -298,20 +301,45 @@ func (worker *discoveryWorker) syncIteration() (result discoveryResult) {
 		return discoverySuperseded
 	}
 
-	actionReason := "RegistrationFailed"
-	var err error
+	registered, registeredIdentity, registryKnown := worker.registrySnapshot()
+	desiredIdentity := registrationIdentityHash(event)
 	if len(event.Ready) == 0 {
-		actionReason = "DeregistrationFailed"
-		err = worker.controller.syncer.Deregister(ctx, event)
-	} else {
-		err = worker.controller.syncer.Register(ctx, event)
-	}
-	if err != nil {
-		if errors.Is(err, context.Canceled) && worker.wasSuperseded(hash) {
-			return discoverySuperseded
+		if !registryKnown || registeredIdentity != "" {
+			target := event
+			if registeredIdentity != "" {
+				target = registered
+			}
+			if err := worker.controller.syncer.Deregister(ctx, target); err != nil {
+				if errors.Is(err, context.Canceled) && worker.wasSuperseded(hash) {
+					return discoverySuperseded
+				}
+				worker.logFailure("DeregistrationFailed")
+				return discoveryRetry
+			}
+			worker.markDeregistered()
 		}
-		worker.logFailure(actionReason)
-		return discoveryRetry
+	} else if !registryKnown || registeredIdentity != desiredIdentity {
+		if registeredIdentity != "" {
+			if err := worker.controller.syncer.Deregister(ctx, registered); err != nil {
+				if errors.Is(err, context.Canceled) && worker.wasSuperseded(hash) {
+					return discoverySuperseded
+				}
+				worker.logFailure("DeregistrationFailed")
+				return discoveryRetry
+			}
+			worker.markDeregistered()
+			if worker.wasSuperseded(hash) {
+				return discoverySuperseded
+			}
+		}
+		if err := worker.controller.syncer.Register(ctx, event); err != nil {
+			if errors.Is(err, context.Canceled) && worker.wasSuperseded(hash) {
+				return discoverySuperseded
+			}
+			worker.logFailure("RegistrationFailed")
+			return discoveryRetry
+		}
+		worker.markRegistered(event)
 	}
 	if worker.wasSuperseded(hash) {
 		return discoverySuperseded
@@ -330,6 +358,34 @@ func (worker *discoveryWorker) wasSuperseded(hash string) bool {
 	worker.mu.Lock()
 	defer worker.mu.Unlock()
 	return worker.stopped || worker.latestHash != hash
+}
+
+func (worker *discoveryWorker) isFullyApplied(hash string) bool {
+	worker.mu.Lock()
+	defer worker.mu.Unlock()
+	return worker.hasApplied && worker.appliedHash == hash && worker.routeHash == hash
+}
+
+func (worker *discoveryWorker) registrySnapshot() (EndpointEvent, string, bool) {
+	worker.mu.Lock()
+	defer worker.mu.Unlock()
+	return worker.registered, worker.registeredIdentity, worker.registryKnown
+}
+
+func (worker *discoveryWorker) markRegistered(event EndpointEvent) {
+	worker.mu.Lock()
+	worker.registered = event
+	worker.registeredIdentity = registrationIdentityHash(event)
+	worker.registryKnown = true
+	worker.mu.Unlock()
+}
+
+func (worker *discoveryWorker) markDeregistered() {
+	worker.mu.Lock()
+	worker.registered = EndpointEvent{}
+	worker.registeredIdentity = ""
+	worker.registryKnown = true
+	worker.mu.Unlock()
 }
 
 func (worker *discoveryWorker) needsRouteRefresh(hash string) bool {
@@ -479,6 +535,7 @@ func (worker *discoveryWorker) replayRegistrationUntilStable() bool {
 			return true
 		}
 		worker.resetFailures()
+		worker.markRegistered(event)
 		return true
 	}
 }
@@ -559,6 +616,23 @@ func endpointEventHash(event EndpointEvent) string {
 	return hex.EncodeToString(sum[:])
 }
 
+func registrationIdentityHash(event EndpointEvent) string {
+	payload := struct {
+		InstanceID  string `json:"instanceId"`
+		ServiceName string `json:"serviceName"`
+		AppName     string `json:"appName"`
+		ListenPort  int    `json:"listenPort"`
+	}{
+		InstanceID:  event.InstanceID,
+		ServiceName: event.ServiceName,
+		AppName:     event.AppName,
+		ListenPort:  event.ListenPort,
+	}
+	data, _ := json.Marshal(payload)
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
+}
+
 func (m *Manager) publishDeploymentEndpoints(config InstanceConfig, manifest DeploymentManifest) {
 	if m.discoveryController == nil {
 		return
@@ -593,6 +667,9 @@ func (m *Manager) publishDeploymentEndpoints(config InstanceConfig, manifest Dep
 
 func (syncer *managerDiscoverySyncer) RefreshRoutes(ctx context.Context, event EndpointEvent) error {
 	manager := syncer.manager
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	config, err := manager.manifestStore.GetInstance(event.InstanceID)
 	if err != nil {
 		return errors.New("instance config unavailable")
@@ -608,7 +685,20 @@ func (syncer *managerDiscoverySyncer) RefreshRoutes(ctx context.Context, event E
 	manager.mu.Lock()
 	if current, ok := manager.routes[event.ListenPort]; ok && (current.InstanceID != event.InstanceID || current.Service != event.ServiceName) {
 		manager.mu.Unlock()
-		return fmt.Errorf("proxy route port is already assigned")
+		return errors.New("proxy route port is already assigned")
+	}
+	previousSpec, hadPreviousSpec := manager.specs[event.InstanceID]
+	previousRoutes := map[int]proxyRoute{}
+	oldPorts := make([]int, 0)
+	for port, route := range manager.routes {
+		if route.InstanceID != event.InstanceID || route.Service != event.ServiceName {
+			continue
+		}
+		previousRoutes[port] = route
+		if port != event.ListenPort {
+			delete(manager.routes, port)
+			oldPorts = append(oldPorts, port)
+		}
 	}
 	spec := manager.specs[event.InstanceID]
 	if spec.InstanceID == "" {
@@ -632,11 +722,39 @@ func (syncer *managerDiscoverySyncer) RefreshRoutes(ctx context.Context, event E
 	manager.mu.Unlock()
 	if !listening {
 		if err := manager.startPort(event.ListenPort); err != nil {
+			manager.mu.Lock()
+			if current, ok := manager.routes[event.ListenPort]; ok && current.InstanceID == event.InstanceID && current.Service == event.ServiceName {
+				delete(manager.routes, event.ListenPort)
+			}
+			for port, route := range previousRoutes {
+				if _, claimed := manager.routes[port]; !claimed {
+					manager.routes[port] = route
+				}
+			}
+			if hadPreviousSpec {
+				manager.specs[event.InstanceID] = previousSpec
+			} else {
+				delete(manager.specs, event.InstanceID)
+			}
+			manager.mu.Unlock()
 			return errors.New("proxy listener unavailable")
 		}
 	}
-	if err := ctx.Err(); err != nil {
-		return err
+	sort.Ints(oldPorts)
+	serversToStop := make([]*http.Server, 0, len(oldPorts))
+	manager.mu.Lock()
+	for _, port := range oldPorts {
+		if _, used := manager.routes[port]; used {
+			continue
+		}
+		if server := manager.servers[port]; server != nil {
+			delete(manager.servers, port)
+			serversToStop = append(serversToStop, server)
+		}
+	}
+	manager.mu.Unlock()
+	for _, server := range serversToStop {
+		_ = server.Shutdown(context.WithoutCancel(ctx))
 	}
 	return nil
 }
