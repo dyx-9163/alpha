@@ -30,7 +30,11 @@ const (
 	remoteCleanupFailedCode          = "AIFAR_RUNTIME_REMOTE_CLEANUP_FAILED"
 )
 
-var deploymentSpecHashPattern = regexp.MustCompile(`^[a-f0-9]{64}$`)
+var (
+	deploymentSpecHashPattern        = regexp.MustCompile(`^[a-f0-9]{64}$`)
+	errAmbiguousDeploymentAcceptance = errors.New("ambiguous deployment acceptance")
+	errExplicitlyInvalidAcceptance   = errors.New("explicitly invalid deployment acceptance")
+)
 
 type DeploymentMutationRequest struct {
 	Instance           store.AppInstance
@@ -48,6 +52,7 @@ type deploymentControlError struct {
 	reasonCode string
 	message    string
 	ambiguous  bool
+	cleanupErr bool
 	cause      error
 }
 
@@ -170,6 +175,7 @@ func (s Service) MutateDeployment(ctx context.Context, req DeploymentMutationReq
 		if errors.As(acceptErr, &typed) && typed.code == remoteCleanupFailedCode && acceptanceMatches(acceptance, nextGeneration, specHash) {
 			cleanupErr = true
 		} else if errors.As(acceptErr, &typed) && typed.ambiguous {
+			cleanupErr = typed.cleanupErr
 			state, readErr := s.readDeploymentStateOnce(ctx, req.Server, req.Instance.ID, req.ServiceName)
 			if readErr != nil || !deploymentStateMatches(state, req.Instance.ID, req.ServiceName, nextGeneration, specHash) {
 				return saved, repairRequired("AIFAR_RUNTIME_AGENT_READBACK_MISMATCH", readErr)
@@ -265,10 +271,13 @@ func (s Service) acceptDeployment(ctx context.Context, server store.Server, mani
 		if explicit := classifyAgentApplyError(result, applyErr); explicit != nil {
 			return acceptance, explicit
 		}
-		return acceptance, &deploymentControlError{code: agentUnavailableCode, reasonCode: agentUnavailableCode, message: i18n.Text("", "aifar.deploymentControl.agentUnavailable"), ambiguous: true}
+		return acceptance, &deploymentControlError{code: agentUnavailableCode, reasonCode: agentUnavailableCode, message: i18n.Text("", "aifar.deploymentControl.agentUnavailable"), ambiguous: true, cleanupErr: cleanupResultErr != nil}
 	}
 	acceptance, err = decodeDeploymentAcceptance(result.Stdout)
 	if err != nil {
+		if errors.Is(err, errAmbiguousDeploymentAcceptance) {
+			return runtimeagent.DeploymentAcceptance{}, &deploymentControlError{code: agentAcceptanceInvalidCode, reasonCode: agentAcceptanceInvalidCode, message: i18n.Text("", "aifar.deploymentControl.acceptanceInvalid"), ambiguous: true, cleanupErr: cleanupResultErr != nil}
+		}
 		return runtimeagent.DeploymentAcceptance{}, deploymentError(agentAcceptanceInvalidCode, agentAcceptanceInvalidCode, "aifar.deploymentControl.acceptanceInvalid")
 	}
 	if cleanupResultErr != nil {
@@ -341,20 +350,20 @@ func (s Service) readDeploymentStateOnce(ctx context.Context, server store.Serve
 
 func decodeDeploymentAcceptance(stdout string) (runtimeagent.DeploymentAcceptance, error) {
 	if len(stdout) > 64<<10 {
-		return runtimeagent.DeploymentAcceptance{}, errors.New("acceptance is too large")
+		return runtimeagent.DeploymentAcceptance{}, errAmbiguousDeploymentAcceptance
 	}
 	decoder := json.NewDecoder(bytes.NewBufferString(stdout))
 	decoder.DisallowUnknownFields()
 	var acceptance runtimeagent.DeploymentAcceptance
 	if err := decoder.Decode(&acceptance); err != nil {
-		return acceptance, err
+		return acceptance, errAmbiguousDeploymentAcceptance
 	}
 	var trailing any
 	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
-		return acceptance, errors.New("acceptance contains trailing data")
+		return acceptance, errAmbiguousDeploymentAcceptance
 	}
 	if !acceptance.Accepted || acceptance.Generation <= 0 || !deploymentSpecHashPattern.MatchString(acceptance.SpecHash) {
-		return acceptance, errors.New("acceptance fields are invalid")
+		return acceptance, errExplicitlyInvalidAcceptance
 	}
 	return acceptance, nil
 }

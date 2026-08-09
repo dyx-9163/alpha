@@ -3,6 +3,7 @@ package store
 import (
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -37,6 +38,116 @@ func TestAcceptAIFARDeploymentKeepsObservedGenerationZero(t *testing.T) {
 	}
 	if accepted.Generation != 1 || accepted.ObservedGeneration != 0 || accepted.Status != "Accepted" || !accepted.LastTransitionAt.Equal(at) {
 		t.Fatalf("accepted=%+v", accepted)
+	}
+}
+
+func TestSaveAIFARDeploymentGenerationResetsObservedGenerationForNewDesiredState(t *testing.T) {
+	db := openTestStore(t)
+	gen1, err := db.SaveAIFARDeploymentGeneration(AIFARDeployment{InstanceID: "instance-1", ServiceName: "permission", Status: "pending_acceptance"}, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ObserveAIFARDeployment("instance-1", "permission", gen1.Generation, "Available", `[{"type":"Available","generation":1}]`, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	gen2, err := db.SaveAIFARDeploymentGeneration(AIFARDeployment{InstanceID: "instance-1", ServiceName: "permission", Status: "pending_acceptance", ConditionsJSON: `[{"generation":2}]`}, gen1.Generation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gen2.Generation != 2 || gen2.ObservedGeneration != 0 || gen2.Status != "pending_acceptance" {
+		t.Fatalf("new desired state retained old observation: %+v", gen2)
+	}
+}
+
+func TestAcceptAIFARDeploymentPreservesAlreadyObservedRuntimeState(t *testing.T) {
+	for _, status := range []string{"Available", "Degraded", "Offline", "Progressing"} {
+		t.Run(status, func(t *testing.T) {
+			db := openTestStore(t)
+			desired, err := db.SaveAIFARDeploymentGeneration(AIFARDeployment{InstanceID: "instance-1", ServiceName: "permission", Status: "pending_acceptance", ConditionsJSON: `[{"reason":"PendingAgentAcceptance"}]`}, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			conditions := `[{"type":"` + status + `","reason":"RuntimeObserved","generation":1}]`
+			observed, err := db.ObserveAIFARDeployment("instance-1", "permission", desired.Generation, status, conditions, time.Now().UTC())
+			if err != nil {
+				t.Fatal(err)
+			}
+			accepted, err := db.AcceptAIFARDeployment("instance-1", "permission", desired.Generation, "Accepted", `[{"type":"Accepted","generation":1}]`, time.Now().UTC().Add(time.Minute))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if accepted.Status != observed.Status || accepted.ConditionsJSON != observed.ConditionsJSON || accepted.ObservedGeneration != observed.ObservedGeneration || !accepted.LastTransitionAt.Equal(observed.LastTransitionAt) {
+				t.Fatalf("late acceptance regressed runtime state: before=%+v after=%+v", observed, accepted)
+			}
+		})
+	}
+}
+
+func TestAcceptAIFARDeploymentIsIdempotentAfterAccepted(t *testing.T) {
+	db := openTestStore(t)
+	desired, err := db.SaveAIFARDeploymentGeneration(AIFARDeployment{InstanceID: "instance-1", ServiceName: "permission", Status: "pending_acceptance"}, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstAt := time.Now().UTC()
+	first, err := db.AcceptAIFARDeployment("instance-1", "permission", desired.Generation, "Accepted", `[{"reason":"ManifestAccepted"}]`, firstAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := db.AcceptAIFARDeployment("instance-1", "permission", desired.Generation, "Accepted", `[{"reason":"different-retry"}]`, firstAt.Add(time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Status != first.Status || second.ConditionsJSON != first.ConditionsJSON || !second.LastTransitionAt.Equal(first.LastTransitionAt) {
+		t.Fatalf("idempotent acceptance changed row: first=%+v second=%+v", first, second)
+	}
+}
+
+func TestAcceptAIFARDeploymentRejectsUnexpectedUnobservedState(t *testing.T) {
+	db := openTestStore(t)
+	desired, err := db.SaveAIFARDeploymentGeneration(AIFARDeployment{InstanceID: "instance-1", ServiceName: "permission", Status: "repair_required", ConditionsJSON: `[{"reason":"ManualRepair"}]`}, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.AcceptAIFARDeployment("instance-1", "permission", desired.Generation, "Accepted", `[{"reason":"ManifestAccepted"}]`, time.Now().UTC())
+	if !errors.Is(err, ErrAIFARDeploymentGenerationConflict) {
+		t.Fatalf("err=%v, want generation conflict", err)
+	}
+	got := deploymentByName(t, db, "instance-1", "permission")
+	if got.Status != "repair_required" || got.ConditionsJSON != `[{"reason":"ManualRepair"}]` {
+		t.Fatalf("unexpected state was overwritten: %+v", got)
+	}
+}
+
+func TestAcceptAndObserveAIFARDeploymentNeverRegressesRuntimeState(t *testing.T) {
+	for iteration := 0; iteration < 20; iteration++ {
+		db := openTestStore(t)
+		desired, err := db.SaveAIFARDeploymentGeneration(AIFARDeployment{InstanceID: "instance-1", ServiceName: "permission", Status: "pending_acceptance"}, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		start := make(chan struct{})
+		done := make(chan error, 2)
+		go func() {
+			<-start
+			_, acceptErr := db.AcceptAIFARDeployment("instance-1", "permission", desired.Generation, "Accepted", `[{"type":"Accepted","generation":1}]`, time.Now().UTC())
+			done <- acceptErr
+		}()
+		go func() {
+			<-start
+			_, observeErr := db.ObserveAIFARDeployment("instance-1", "permission", desired.Generation, "Available", `[{"type":"Available","generation":1}]`, time.Now().UTC())
+			done <- observeErr
+		}()
+		close(start)
+		for call := 0; call < 2; call++ {
+			if err := <-done; err != nil {
+				t.Fatal(err)
+			}
+		}
+		got := deploymentByName(t, db, "instance-1", "permission")
+		if got.Status != "Available" || got.ObservedGeneration != 1 || !strings.Contains(got.ConditionsJSON, `"Available"`) {
+			t.Fatalf("accept/observe race regressed runtime state: %+v", got)
+		}
 	}
 }
 

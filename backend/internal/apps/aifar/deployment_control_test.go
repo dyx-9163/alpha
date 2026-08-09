@@ -116,6 +116,7 @@ type deploymentControlTestRemote struct {
 	acceptance                runtimeagent.DeploymentAcceptance
 	applyErr                  error
 	applyStdout               string
+	applyStdoutSet            bool
 	readback                  runtimeagent.DeploymentState
 	readbackErr               error
 	readbackText              string
@@ -169,7 +170,7 @@ func (r *deploymentControlTestRemote) Run(ctx context.Context, _ store.Server, c
 			r.mu.Lock()
 		}
 		stdout := r.applyStdout
-		if stdout == "" {
+		if !r.applyStdoutSet && stdout == "" {
 			data, _ := json.Marshal(r.acceptance)
 			stdout = string(data)
 		}
@@ -421,6 +422,93 @@ func TestMutateDeploymentLostResponseMismatchRequiresRepairWithoutResubmit(t *te
 	}
 }
 
+func TestMutateDeploymentAmbiguousAcceptanceUsesExactlyOneReadback(t *testing.T) {
+	responses := []struct {
+		name, stdout string
+	}{
+		{name: "empty", stdout: ""},
+		{name: "truncated", stdout: `{"accepted":true`},
+		{name: "malformed", stdout: `{not-json}`},
+	}
+	for _, response := range responses {
+		t.Run(response.name, func(t *testing.T) {
+			for _, matching := range []bool{true, false} {
+				name := "mismatch"
+				if matching {
+					name = "matching"
+				}
+				t.Run(name, func(t *testing.T) {
+					remote := &deploymentControlTestRemote{applyStdout: response.stdout, applyStdoutSet: true}
+					service, _, req := newDeploymentControlTestService(t, remote)
+					hash, err := runtimeagent.DeploymentManifestSpecHash(buildRuntimeManifestForTest(t, req, 2))
+					if err != nil {
+						t.Fatal(err)
+					}
+					remote.readback = runtimeagent.DeploymentState{InstanceID: req.Instance.ID, ServiceName: req.ServiceName, Generation: 2, SpecHash: hash}
+					if !matching {
+						remote.readback.SpecHash = strings.Repeat("f", 64)
+					}
+					got, mutateErr := service.MutateDeployment(context.Background(), req, &deploymentControlTestLog{})
+					if matching {
+						if mutateErr != nil {
+							t.Fatal(mutateErr)
+						}
+						if got.Status != "Accepted" {
+							t.Fatalf("deployment=%+v", got)
+						}
+					} else {
+						assertStableDeploymentControlCode(t, mutateErr, runtimeControlPlaneRepairCode)
+					}
+					if remote.applyCalls != 1 || remote.readbackCalls != 1 {
+						t.Fatalf("apply=%d readback=%d", remote.applyCalls, remote.readbackCalls)
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestMutateDeploymentAmbiguousAcceptanceReadbackUnavailableRequiresRepair(t *testing.T) {
+	remote := &deploymentControlTestRemote{applyStdout: `{"accepted":`, applyStdoutSet: true, readbackErr: errors.New("connection reset")}
+	service, _, req := newDeploymentControlTestService(t, remote)
+	_, err := service.MutateDeployment(context.Background(), req, &deploymentControlTestLog{})
+	assertStableDeploymentControlCode(t, err, runtimeControlPlaneRepairCode)
+	if remote.applyCalls != 1 || remote.readbackCalls != 1 {
+		t.Fatalf("apply=%d readback=%d", remote.applyCalls, remote.readbackCalls)
+	}
+}
+
+func TestMutateDeploymentAmbiguousAcceptanceCleanupFailureAfterMatchingReadbackIsBestEffort(t *testing.T) {
+	remote := &deploymentControlTestRemote{applyStdoutSet: true, cleanupErr: errors.New("cleanup failed with /private/path")}
+	service, _, req := newDeploymentControlTestService(t, remote)
+	hash, err := runtimeagent.DeploymentManifestSpecHash(buildRuntimeManifestForTest(t, req, 2))
+	if err != nil {
+		t.Fatal(err)
+	}
+	remote.readback = runtimeagent.DeploymentState{InstanceID: req.Instance.ID, ServiceName: req.ServiceName, Generation: 2, SpecHash: hash}
+	log := &deploymentControlTestLog{}
+	got, err := service.MutateDeployment(context.Background(), req, log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != "Accepted" || remote.applyCalls != 1 || remote.readbackCalls != 1 {
+		t.Fatalf("deployment=%+v apply=%d readback=%d", got, remote.applyCalls, remote.readbackCalls)
+	}
+	if !strings.Contains(strings.ToLower(log.String()), "cleanup") || strings.Contains(log.String(), "/private/path") {
+		t.Fatalf("cleanup warning is absent or unsafe: %q", log.String())
+	}
+}
+
+func TestMutateDeploymentExplicitRejectedAcceptanceDoesNotReadBack(t *testing.T) {
+	remote := &deploymentControlTestRemote{applyStdout: `{"accepted":false,"generation":2,"specHash":"` + strings.Repeat("a", 64) + `"}`, applyStdoutSet: true}
+	service, _, req := newDeploymentControlTestService(t, remote)
+	_, err := service.MutateDeployment(context.Background(), req, &deploymentControlTestLog{})
+	assertStableDeploymentControlCode(t, err, agentAcceptanceInvalidCode)
+	if remote.applyCalls != 1 || remote.readbackCalls != 0 {
+		t.Fatalf("apply=%d readback=%d", remote.applyCalls, remote.readbackCalls)
+	}
+}
+
 func TestMutateDeploymentClassifiesExplicitAgentRejectsAndInvalidAcceptance(t *testing.T) {
 	tests := []struct {
 		name, stdout string
@@ -447,6 +535,9 @@ func TestMutateDeploymentRejectsMismatchedAcceptance(t *testing.T) {
 	service, _, req := newDeploymentControlTestService(t, remote)
 	_, err := service.MutateDeployment(context.Background(), req, &deploymentControlTestLog{})
 	assertStableDeploymentControlCode(t, err, runtimeControlPlaneRepairCode)
+	if remote.applyCalls != 1 || remote.readbackCalls != 0 {
+		t.Fatalf("apply=%d readback=%d", remote.applyCalls, remote.readbackCalls)
+	}
 }
 
 func TestMutateDeploymentHonorsCancelledContextBeforeCAS(t *testing.T) {

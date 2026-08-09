@@ -98,7 +98,7 @@ func (s *Store) SaveAIFARDeploymentGeneration(next AIFARDeployment, expectedGene
 		where ?=0 or exists(select 1 from aifar_deployments where instance_id=? and service_name=?)
 		on conflict(instance_id, service_name) do update set
 		desired_replicas=excluded.desired_replicas,current_revision=excluded.current_revision,updating_revision=excluded.updating_revision,
-		strategy_json=excluded.strategy_json,spec_json=excluded.spec_json,generation=excluded.generation,status=excluded.status,
+		strategy_json=excluded.strategy_json,spec_json=excluded.spec_json,generation=excluded.generation,observed_generation=excluded.observed_generation,status=excluded.status,
 		metadata_json=excluded.metadata_json,conditions_json=excluded.conditions_json,last_transition_at=excluded.last_transition_at,updated_at=excluded.updated_at
 		where aifar_deployments.generation=?`,
 		next.ID, next.InstanceID, next.ServiceName, next.DesiredReplicas, next.CurrentRevision, next.UpdatingRevision, next.StrategyJSON, next.SpecJSON, next.Generation, next.ObservedGeneration, next.Status, next.MetadataJSON, next.ConditionsJSON, nullableTime(next.LastTransitionAt), next.CreatedAt, next.UpdatedAt, expectedGeneration, next.InstanceID, next.ServiceName, expectedGeneration)
@@ -140,7 +140,8 @@ func (s *Store) AcceptAIFARDeployment(instanceID, serviceName string, generation
 	defer tx.Rollback()
 	result, err := tx.Exec(`update aifar_deployments set
 		status=?, conditions_json=?, last_transition_at=?, updated_at=?
-		where instance_id=? and service_name=? and generation=?`,
+		where instance_id=? and service_name=? and generation=?
+			and observed_generation=0 and lower(status)='pending_acceptance'`,
 		status, conditionsJSON, at, time.Now(), instanceID, serviceName, generation)
 	if err != nil {
 		return AIFARDeployment{}, err
@@ -150,11 +151,21 @@ func (s *Store) AcceptAIFARDeployment(instanceID, serviceName string, generation
 		return AIFARDeployment{}, err
 	}
 	if affected == 0 {
-		if _, err := getAIFARDeployment(tx, instanceID, serviceName); err != nil {
+		current, err := getAIFARDeployment(tx, instanceID, serviceName)
+		if err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				return AIFARDeployment{}, ErrAIFARDeploymentNotFound
 			}
 			return AIFARDeployment{}, err
+		}
+		if current.Generation != generation {
+			return AIFARDeployment{}, ErrAIFARDeploymentGenerationConflict
+		}
+		if strings.EqualFold(current.Status, "Accepted") || current.ObservedGeneration >= generation || isObservedAIFARDeploymentStatus(current.Status) {
+			if err := tx.Commit(); err != nil {
+				return AIFARDeployment{}, err
+			}
+			return current, nil
 		}
 		return AIFARDeployment{}, ErrAIFARDeploymentGenerationConflict
 	}
@@ -166,6 +177,15 @@ func (s *Store) AcceptAIFARDeployment(instanceID, serviceName string, generation
 		return AIFARDeployment{}, err
 	}
 	return accepted, nil
+}
+
+func isObservedAIFARDeploymentStatus(status string) bool {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "available", "degraded", "offline", "progressing":
+		return true
+	default:
+		return false
+	}
 }
 
 func (s *Store) ObserveAIFARDeployment(instanceID, serviceName string, generation int64, status, conditionsJSON string, at time.Time) (AIFARDeployment, error) {
