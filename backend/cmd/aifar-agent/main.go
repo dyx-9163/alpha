@@ -9,13 +9,27 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"mime"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
+	"regexp"
 	"runtime/debug"
+	"strconv"
 	"strings"
 	"time"
 
 	"aifar-deployment/backend/internal/runtimeagent"
+)
+
+const maxAgentRequestBodyBytes int64 = 1 << 20
+
+var (
+	agentInstancePattern  = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
+	agentServicePattern   = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,62}$`)
+	agentErrorCodePattern = regexp.MustCompile(`^[A-Z][A-Z0-9_]{0,63}$`)
+	perServiceFeatures    = []string{"service-manifest-v1", "service-generation-v1", "per-service-reconcile", "per-service-restart", "service-conditions-v1"}
 )
 
 func main() {
@@ -78,6 +92,11 @@ func main() {
 			os.Exit(1)
 		}
 		fmt.Println(`{"status":"restarted"}`)
+	case "apply-deployment", "get-deployment", "reconcile-deployment", "bootstrap-runtime":
+		if err := runServiceAgentCommand(os.Args[1], os.Args[2:], os.Stdout); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
 	case "remove-instance":
 		cmd := flag.NewFlagSet("remove-instance", flag.ExitOnError)
 		instance := cmd.String("instance", "admin", "runtime instance id")
@@ -107,7 +126,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: aifar-agent health | status | reconcile-runtime --spec <file> | restart-runtime --spec <file> | reconcile-ingress --spec <file> | remove-instance [--instance admin] | register-nacos [--state-dir dir] | deregister-nacos [--state-dir dir] | serve [--addr 127.0.0.1:18081]")
+	fmt.Fprintln(os.Stderr, "usage: aifar-agent health | status | apply-deployment --manifest <file> | get-deployment --instance <id> --service <name> | reconcile-deployment --instance <id> --service <name> | bootstrap-runtime --spec <file> | reconcile-runtime --spec <file> | restart-runtime --spec <file> | reconcile-ingress --spec <file> | remove-instance [--instance admin] | register-nacos [--state-dir dir] | deregister-nacos [--state-dir dir] | serve [--addr 127.0.0.1:18081]")
 }
 
 func readSpec(path string) (runtimeagent.RuntimeSpec, error) {
@@ -185,81 +204,121 @@ func newAgentHandler(manager *runtimeagent.Manager, healthCheck func(context.Con
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			writeAgentError(w, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "method not allowed", nil)
 			return
 		}
 		if err := healthCheck(r.Context()); err != nil {
-			http.Error(w, err.Error(), http.StatusServiceUnavailable)
+			writeAgentError(w, http.StatusServiceUnavailable, "AGENT_UNAVAILABLE", "agent health check failed", nil)
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
 	mux.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			writeAgentError(w, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "method not allowed", nil)
 			return
 		}
-		writeJSON(w, http.StatusOK, manager.Status())
+		status := manager.Status()
+		status["features"] = mergeAgentFeatures(status["features"], perServiceFeatures)
+		writeJSON(w, http.StatusOK, status)
 	})
 	mux.HandleFunc("/runtime/reconcile", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			writeAgentError(w, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "method not allowed", nil)
 			return
 		}
-		defer r.Body.Close()
 		var spec runtimeagent.RuntimeSpec
-		if err := json.NewDecoder(r.Body).Decode(&spec); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+		if !decodeAgentJSON(w, r, &spec) {
 			return
 		}
-		if err := (runtimeagent.Reconciler{Manager: manager, Log: os.Stdout}).ReconcileRuntime(r.Context(), spec); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+		if err := manager.ApplyLegacyRuntimeSpec(r.Context(), spec); err != nil {
+			if errors.Is(err, runtimeagent.ErrLegacyRuntimeSpecDisabled) {
+				writeAgentError(w, http.StatusConflict, "LEGACY_RUNTIME_SPEC_DISABLED", "legacy runtime spec is disabled", nil)
+				return
+			}
+			if errors.Is(err, runtimeagent.ErrInvalidLegacyRuntimeSpec) {
+				writeAgentError(w, http.StatusBadRequest, "INVALID_LEGACY_RUNTIME_SPEC", "legacy runtime spec is invalid", nil)
+				return
+			}
+			writeAgentError(w, http.StatusInternalServerError, "LEGACY_RUNTIME_RECONCILE_FAILED", "legacy runtime reconcile failed", nil)
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]string{"status": "reconciled"})
 	})
-	mux.HandleFunc("/runtime/restart-all", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/runtime/bootstrap", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			writeAgentError(w, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "method not allowed", nil)
 			return
 		}
-		defer r.Body.Close()
+		var spec runtimeagent.LegacyRuntimeSpec
+		if !decodeAgentJSON(w, r, &spec) {
+			return
+		}
+		acceptance, err := manager.BootstrapLegacyRuntime(r.Context(), spec)
+		if err != nil {
+			if errors.Is(err, runtimeagent.ErrLegacyRuntimeSpecDisabled) {
+				writeAgentError(w, http.StatusConflict, "LEGACY_RUNTIME_SPEC_DISABLED", "legacy runtime spec is disabled", nil)
+				return
+			}
+			if errors.Is(err, runtimeagent.ErrInvalidLegacyRuntimeSpec) {
+				writeAgentError(w, http.StatusBadRequest, "INVALID_LEGACY_RUNTIME_SPEC", "legacy runtime spec is invalid", nil)
+				return
+			}
+			writeAgentError(w, http.StatusInternalServerError, "BOOTSTRAP_RUNTIME_FAILED", "runtime bootstrap failed", nil)
+			return
+		}
+		writeJSON(w, http.StatusAccepted, acceptance)
+	})
+	mux.HandleFunc("/runtime/restart-all", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeAgentError(w, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "method not allowed", nil)
+			return
+		}
 		var spec runtimeagent.RuntimeSpec
-		if err := json.NewDecoder(r.Body).Decode(&spec); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+		if !decodeAgentJSON(w, r, &spec) {
 			return
 		}
 		if err := manager.RestartAll(r.Context(), spec); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			writeAgentError(w, http.StatusInternalServerError, "RUNTIME_RESTART_FAILED", "runtime restart failed", nil)
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]string{"status": "restarted"})
 	})
 	mux.HandleFunc("/runtime/instances/", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodDelete {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			writeAgentError(w, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "method not allowed", nil)
 			return
 		}
-		instance := strings.Trim(strings.TrimPrefix(r.URL.Path, "/runtime/instances/"), "/")
-		if instance == "" {
-			http.Error(w, "instance is required", http.StatusBadRequest)
+		instance, ok := parseRemoveInstancePath(r.URL.EscapedPath())
+		if !ok {
+			writeAgentError(w, http.StatusBadRequest, "INVALID_INSTANCE_PATH", "runtime instance path is invalid", nil)
 			return
 		}
 		if err := manager.Remove(r.Context(), instance); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			writeAgentError(w, http.StatusInternalServerError, "REMOVE_INSTANCE_FAILED", "runtime instance removal failed", nil)
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]string{"status": "removed"})
 	})
-	return recoverAgentHandler(mux)
+	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
+		writeAgentError(w, http.StatusNotFound, "NOT_FOUND", "route was not found", nil)
+	})
+	router := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.EscapedPath(), "/runtime/instances/") && strings.Contains(r.URL.EscapedPath(), "/deployments/") {
+			handleDeploymentRequest(manager, w, r)
+			return
+		}
+		mux.ServeHTTP(w, r)
+	})
+	return recoverAgentHandler(router)
 }
 
 func recoverAgentHandler(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer func() {
 			if recovered := recover(); recovered != nil {
-				log.Printf("aifar-agent handler panic path=%s: %v\n%s", r.URL.Path, recovered, debug.Stack())
-				http.Error(w, fmt.Sprintf("aifar-agent handler panic: %v", recovered), http.StatusInternalServerError)
+				log.Printf("aifar-agent handler panic path=%s\n%s", r.URL.Path, debug.Stack())
+				writeAgentError(w, http.StatusInternalServerError, "INTERNAL_ERROR", "aifar-agent handler panic recovered", nil)
 			}
 		}()
 		next.ServeHTTP(w, r)
@@ -291,7 +350,7 @@ func postRuntimeRequestOnce(ctx context.Context, addr, path, operation string, s
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 	if resp.StatusCode >= 300 {
-		return fmt.Errorf("aifar-agent %s failed: %s: %s", operation, resp.Status, strings.TrimSpace(string(body)))
+		return sanitizedAgentResponseError(operation, resp.Status, body)
 	}
 	return nil
 }
@@ -320,7 +379,7 @@ func postRuntimeRequest(ctx context.Context, addr, path, operation string, spec 
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		_ = resp.Body.Close()
 		if resp.StatusCode >= 300 {
-			lastErr = fmt.Errorf("aifar-agent %s failed: %s: %s", operation, resp.Status, strings.TrimSpace(string(body)))
+			lastErr = sanitizedAgentResponseError(operation, resp.Status, body)
 			if !isTransientAgentStatus(resp.StatusCode) || attempt == 5 || !sleepAgentRetry(ctx, attempt) {
 				return lastErr
 			}
@@ -365,7 +424,11 @@ func sleepAgentRetry(ctx context.Context, attempt int) bool {
 }
 
 func deleteRuntimeInstance(ctx context.Context, addr, instance string) error {
-	url := "http://" + addr + "/runtime/instances/" + instance
+	instance = strings.TrimSpace(instance)
+	if !validAgentInstanceID(instance) {
+		return errors.New("runtime instance identity is invalid")
+	}
+	url := "http://" + addr + "/runtime/instances/" + url.PathEscape(instance)
 	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, url, nil)
 	if err != nil {
 		return err
@@ -377,7 +440,7 @@ func deleteRuntimeInstance(ctx context.Context, addr, instance string) error {
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return fmt.Errorf("aifar-agent remove instance failed: %s: %s", resp.Status, strings.TrimSpace(string(body)))
+		return sanitizedAgentResponseError("remove instance", resp.Status, body)
 	}
 	return nil
 }
@@ -395,9 +458,379 @@ func getAgentStatus(ctx context.Context, addr string) ([]byte, error) {
 	defer resp.Body.Close()
 	data, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("aifar-agent status failed: %s: %s", resp.Status, strings.TrimSpace(string(data)))
+		return nil, sanitizedAgentResponseError("status", resp.Status, data)
 	}
 	return data, nil
+}
+
+type agentErrorResponse struct {
+	Code    string `json:"code"`
+	Message string `json:"message"`
+	Details any    `json:"details"`
+}
+
+func handleDeploymentRequest(manager *runtimeagent.Manager, w http.ResponseWriter, r *http.Request) {
+	pathParts := strings.Split(r.URL.EscapedPath(), "/")
+	if (len(pathParts) != 6 && len(pathParts) != 7) || (len(pathParts) == 7 && pathParts[6] != "reconcile") {
+		writeAgentError(w, http.StatusNotFound, "NOT_FOUND", "route was not found", nil)
+		return
+	}
+	instanceID, serviceName, reconcile, ok := parseDeploymentPath(r.URL.EscapedPath())
+	if !ok {
+		writeAgentError(w, http.StatusBadRequest, "INVALID_DEPLOYMENT_PATH", "deployment path is invalid", nil)
+		return
+	}
+	if reconcile {
+		if r.Method != http.MethodPost {
+			writeAgentError(w, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "method not allowed", nil)
+			return
+		}
+		if !ensureEmptyAgentBody(w, r) {
+			return
+		}
+		if _, exists := manager.DeploymentState(instanceID, serviceName); !exists {
+			writeAgentError(w, http.StatusNotFound, "DEPLOYMENT_NOT_FOUND", "deployment was not found", nil)
+			return
+		}
+		manager.ReconcileDeployment(instanceID, serviceName)
+		writeJSON(w, http.StatusAccepted, map[string]bool{"accepted": true})
+		return
+	}
+
+	switch r.Method {
+	case http.MethodGet:
+		state, exists := manager.DeploymentState(instanceID, serviceName)
+		if !exists {
+			writeAgentError(w, http.StatusNotFound, "DEPLOYMENT_NOT_FOUND", "deployment was not found", nil)
+			return
+		}
+		writeJSON(w, http.StatusOK, state)
+	case http.MethodPut:
+		var manifest runtimeagent.DeploymentManifest
+		if !decodeAgentJSON(w, r, &manifest) {
+			return
+		}
+		if manifest.APIVersion != runtimeagent.ManifestAPIVersion || manifest.Kind != runtimeagent.DeploymentManifestKind {
+			writeAgentError(w, http.StatusBadRequest, "INVALID_DEPLOYMENT_MANIFEST", "deployment manifest schema is invalid", nil)
+			return
+		}
+		if strings.TrimSpace(manifest.Metadata.InstanceID) != instanceID ||
+			strings.ToLower(strings.TrimSpace(manifest.Metadata.Name)) != serviceName ||
+			strings.ToLower(strings.TrimSpace(manifest.Spec.ServiceName)) != serviceName ||
+			strings.ToLower(strings.TrimSpace(manifest.Service.Name)) != serviceName {
+			writeAgentError(w, http.StatusBadRequest, "DEPLOYMENT_IDENTITY_MISMATCH", "deployment identity does not match request path", nil)
+			return
+		}
+		acceptance, err := manager.AcceptDeployment(r.Context(), manifest)
+		if err != nil {
+			switch {
+			case errors.Is(err, runtimeagent.ErrStaleDeploymentGeneration):
+				writeAgentError(w, http.StatusConflict, "STALE_DEPLOYMENT_GENERATION", "deployment generation is stale", map[string]any{"currentGeneration": acceptance.Generation, "currentSpecHash": acceptance.SpecHash})
+			case errors.Is(err, runtimeagent.ErrDeploymentGenerationConflict):
+				writeAgentError(w, http.StatusConflict, "DEPLOYMENT_GENERATION_CONFLICT", "deployment generation already has a different specification", map[string]any{"currentGeneration": acceptance.Generation, "currentSpecHash": acceptance.SpecHash})
+			default:
+				writeAgentError(w, http.StatusBadRequest, "INVALID_DEPLOYMENT_MANIFEST", "deployment manifest is invalid", nil)
+			}
+			return
+		}
+		writeJSON(w, http.StatusAccepted, acceptance)
+	default:
+		writeAgentError(w, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "method not allowed", nil)
+	}
+}
+
+func parseDeploymentPath(escapedPath string) (string, string, bool, bool) {
+	parts := strings.Split(escapedPath, "/")
+	if len(parts) != 6 && len(parts) != 7 {
+		return "", "", false, false
+	}
+	if parts[0] != "" || parts[1] != "runtime" || parts[2] != "instances" || parts[4] != "deployments" {
+		return "", "", false, false
+	}
+	if len(parts) == 7 && parts[6] != "reconcile" {
+		return "", "", false, false
+	}
+	instanceID, err := url.PathUnescape(parts[3])
+	if err != nil || instanceID != parts[3] || !agentInstancePattern.MatchString(instanceID) || instanceID == "." || instanceID == ".." {
+		return "", "", false, false
+	}
+	serviceName, err := url.PathUnescape(parts[5])
+	if err != nil || serviceName != parts[5] || !agentServicePattern.MatchString(serviceName) {
+		return "", "", false, false
+	}
+	return instanceID, serviceName, len(parts) == 7, true
+}
+
+func parseRemoveInstancePath(escapedPath string) (string, bool) {
+	parts := strings.Split(escapedPath, "/")
+	if len(parts) != 4 || parts[0] != "" || parts[1] != "runtime" || parts[2] != "instances" {
+		return "", false
+	}
+	instanceID, err := url.PathUnescape(parts[3])
+	if err != nil || instanceID != parts[3] || !validAgentInstanceID(instanceID) {
+		return "", false
+	}
+	return instanceID, true
+}
+
+func ensureEmptyAgentBody(w http.ResponseWriter, r *http.Request) bool {
+	defer r.Body.Close()
+	r.Body = http.MaxBytesReader(w, r.Body, 1)
+	data, err := io.ReadAll(r.Body)
+	if err != nil || len(data) != 0 {
+		writeAgentError(w, http.StatusBadRequest, "INVALID_REQUEST_BODY", "request body must be empty", nil)
+		return false
+	}
+	return true
+}
+
+func decodeAgentJSON(w http.ResponseWriter, r *http.Request, target any) bool {
+	mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if err != nil || mediaType != "application/json" {
+		writeAgentError(w, http.StatusUnsupportedMediaType, "UNSUPPORTED_MEDIA_TYPE", "Content-Type must be application/json", nil)
+		return false
+	}
+	defer r.Body.Close()
+	r.Body = http.MaxBytesReader(w, r.Body, maxAgentRequestBodyBytes)
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(target); err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			writeAgentError(w, http.StatusRequestEntityTooLarge, "REQUEST_BODY_TOO_LARGE", "request body exceeds the size limit", nil)
+		} else {
+			writeAgentError(w, http.StatusBadRequest, "INVALID_REQUEST_BODY", "request body is invalid", nil)
+		}
+		return false
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		writeAgentError(w, http.StatusBadRequest, "INVALID_REQUEST_BODY", "request body must contain one JSON value", nil)
+		return false
+	}
+	return true
+}
+
+func writeAgentError(w http.ResponseWriter, status int, code, message string, details any) {
+	writeJSON(w, status, agentErrorResponse{Code: code, Message: message, Details: details})
+}
+
+func runServiceAgentCommand(name string, args []string, out io.Writer) error {
+	command := flag.NewFlagSet(name, flag.ContinueOnError)
+	command.SetOutput(io.Discard)
+	addr := command.String("addr", "127.0.0.1:18081", "agent API address")
+	instanceID := command.String("instance", "", "runtime instance id")
+	serviceName := command.String("service", "", "runtime service name")
+	manifestPath := command.String("manifest", "", "deployment manifest json")
+	specPath := command.String("spec", "", "legacy runtime spec json")
+	if err := command.Parse(args); err != nil {
+		return errors.New("invalid command flags")
+	}
+	if command.NArg() != 0 {
+		return errors.New("positional command arguments are not allowed")
+	}
+	if err := validateLoopbackAgentAddress(*addr); err != nil {
+		return err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	switch name {
+	case "apply-deployment":
+		if strings.TrimSpace(*manifestPath) == "" || *instanceID != "" || *serviceName != "" || *specPath != "" {
+			return errors.New("--manifest is required")
+		}
+		manifest, err := readDeploymentManifest(*manifestPath)
+		if err != nil {
+			return errors.New("deployment manifest file is invalid")
+		}
+		instance := strings.TrimSpace(manifest.Metadata.InstanceID)
+		service := strings.ToLower(strings.TrimSpace(manifest.Metadata.Name))
+		if !validAgentIdentity(instance, service) {
+			return errors.New("deployment manifest identity is invalid")
+		}
+		data, err := json.Marshal(manifest)
+		if err != nil {
+			return errors.New("deployment manifest file is invalid")
+		}
+		return doAgentTypedRequest(ctx, *addr, http.MethodPut, deploymentAgentPath(instance, service, false), data, out)
+	case "get-deployment", "reconcile-deployment":
+		if *manifestPath != "" || *specPath != "" {
+			return errors.New("unsupported flags for deployment command")
+		}
+		instance := strings.TrimSpace(*instanceID)
+		service := strings.ToLower(strings.TrimSpace(*serviceName))
+		if !validAgentIdentity(instance, service) {
+			return errors.New("--instance and --service are required and must be valid")
+		}
+		method := http.MethodGet
+		reconcile := false
+		if name == "reconcile-deployment" {
+			method = http.MethodPost
+			reconcile = true
+		}
+		return doAgentTypedRequest(ctx, *addr, method, deploymentAgentPath(instance, service, reconcile), nil, out)
+	case "bootstrap-runtime":
+		if strings.TrimSpace(*specPath) == "" || *manifestPath != "" || *instanceID != "" || *serviceName != "" {
+			return errors.New("--spec is required")
+		}
+		spec, err := readLegacyRuntimeSpec(*specPath)
+		if err != nil {
+			return errors.New("legacy runtime spec file is invalid")
+		}
+		data, err := json.Marshal(spec)
+		if err != nil {
+			return errors.New("legacy runtime spec file is invalid")
+		}
+		return doAgentTypedRequest(ctx, *addr, http.MethodPost, "/runtime/bootstrap", data, out)
+	default:
+		return errors.New("unsupported service agent command")
+	}
+}
+
+func readDeploymentManifest(path string) (runtimeagent.DeploymentManifest, error) {
+	var manifest runtimeagent.DeploymentManifest
+	err := readBoundedStrictJSONFile(path, &manifest)
+	return manifest, err
+}
+
+func readLegacyRuntimeSpec(path string) (runtimeagent.LegacyRuntimeSpec, error) {
+	var spec runtimeagent.LegacyRuntimeSpec
+	err := readBoundedStrictJSONFile(path, &spec)
+	return spec, err
+}
+
+func readBoundedStrictJSONFile(path string, target any) error {
+	file, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	limited := io.LimitReader(file, maxAgentRequestBodyBytes+1)
+	data, err := io.ReadAll(limited)
+	if err != nil {
+		return err
+	}
+	if int64(len(data)) > maxAgentRequestBodyBytes {
+		return errors.New("JSON file exceeds size limit")
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(target); err != nil {
+		return err
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		return errors.New("JSON file must contain one value")
+	}
+	return nil
+}
+
+func validateLoopbackAgentAddress(addr string) error {
+	host, portText, err := net.SplitHostPort(strings.TrimSpace(addr))
+	if err != nil {
+		return errors.New("agent address must be a loopback host and port")
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil || port < 1 || port > 65535 {
+		return errors.New("agent address port is invalid")
+	}
+	if strings.EqualFold(host, "localhost") {
+		return nil
+	}
+	ip := net.ParseIP(host)
+	if ip == nil || !ip.IsLoopback() {
+		return errors.New("agent address must use a loopback host")
+	}
+	return nil
+}
+
+func validAgentIdentity(instanceID, serviceName string) bool {
+	return validAgentInstanceID(instanceID) && agentServicePattern.MatchString(serviceName)
+}
+
+func validAgentInstanceID(instanceID string) bool {
+	return agentInstancePattern.MatchString(instanceID) && instanceID != "." && instanceID != ".."
+}
+
+func deploymentAgentPath(instanceID, serviceName string, reconcile bool) string {
+	path := "/runtime/instances/" + url.PathEscape(instanceID) + "/deployments/" + url.PathEscape(serviceName)
+	if reconcile {
+		path += "/reconcile"
+	}
+	return path
+}
+
+func doAgentTypedRequest(ctx context.Context, addr, method, path string, body []byte, out io.Writer) error {
+	request, err := http.NewRequestWithContext(ctx, method, "http://"+addr+path, bytes.NewReader(body))
+	if err != nil {
+		return errors.New("cannot create aifar-agent request")
+	}
+	if body != nil {
+		request.Header.Set("Content-Type", "application/json")
+	}
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		return errors.New("aifar-agent service is not reachable")
+	}
+	defer response.Body.Close()
+	data, readErr := io.ReadAll(io.LimitReader(response.Body, maxAgentRequestBodyBytes+1))
+	if readErr != nil || int64(len(data)) > maxAgentRequestBodyBytes {
+		return errors.New("aifar-agent response is invalid")
+	}
+	if response.StatusCode >= 300 {
+		var typed agentErrorResponse
+		code := "UNKNOWN_ERROR"
+		if json.Unmarshal(data, &typed) == nil && agentErrorCodePattern.MatchString(typed.Code) {
+			code = typed.Code
+		}
+		return fmt.Errorf("aifar-agent request failed: %s %s", response.Status, code)
+	}
+	if out != nil {
+		_, _ = out.Write(data)
+		if len(data) > 0 && data[len(data)-1] != '\n' {
+			_, _ = io.WriteString(out, "\n")
+		}
+	}
+	return nil
+}
+
+func sanitizedAgentResponseError(operation, status string, data []byte) error {
+	var typed agentErrorResponse
+	code := "UNKNOWN_ERROR"
+	if json.Unmarshal(data, &typed) == nil && agentErrorCodePattern.MatchString(typed.Code) {
+		code = typed.Code
+	}
+	return fmt.Errorf("aifar-agent %s failed: %s %s", operation, status, code)
+}
+
+func mergeAgentFeatures(existing any, additions []string) []string {
+	seen := map[string]bool{}
+	features := make([]string, 0)
+	appendFeature := func(value string) {
+		value = strings.TrimSpace(value)
+		if value == "" || seen[value] {
+			return
+		}
+		seen[value] = true
+		features = append(features, value)
+	}
+	switch values := existing.(type) {
+	case []string:
+		for _, value := range values {
+			appendFeature(value)
+		}
+	case []any:
+		for _, value := range values {
+			if text, ok := value.(string); ok {
+				appendFeature(text)
+			}
+		}
+	}
+	for _, value := range additions {
+		appendFeature(value)
+	}
+	return features
 }
 
 func writeJSON(w http.ResponseWriter, status int, value any) {
@@ -410,7 +843,7 @@ func agentStatus() map[string]any {
 	return map[string]any{
 		"status":  "running",
 		"version": runtimeagent.DefaultAgentVersion,
-		"features": []string{
+		"features": mergeAgentFeatures([]string{
 			"health",
 			"host-proxy",
 			"nacos-proxy-deregister",
@@ -420,7 +853,7 @@ func agentStatus() map[string]any {
 			"restart-runtime",
 			"remove-instance",
 			"status",
-		},
+		}, perServiceFeatures),
 	}
 }
 
