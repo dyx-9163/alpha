@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"aifar-deployment/backend/internal/apps/registry"
+	"aifar-deployment/backend/internal/runtimeagent"
 )
 
 const serviceDefinitionName = "service.json"
@@ -17,17 +18,18 @@ const serviceDefinitionName = "service.json"
 var serviceNamePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9-]*$`)
 
 type serviceDefinition struct {
-	Schema             string            `json:"schema"`
-	Name               string            `json:"name"`
-	DisplayName        map[string]string `json:"displayName"`
-	Kind               string            `json:"kind"`
-	ApplicationName    string            `json:"applicationName"`
-	Port               int               `json:"port"`
-	Required           bool              `json:"required"`
-	Role               string            `json:"role"`
-	ArtifactExtensions []string          `json:"artifactExtensions"`
-	HealthPath         string            `json:"healthPath"`
-	AffinityPolicy     string            `json:"affinityPolicy"`
+	Schema             string                    `json:"schema"`
+	Name               string                    `json:"name"`
+	DisplayName        map[string]string         `json:"displayName"`
+	Kind               string                    `json:"kind"`
+	ApplicationName    string                    `json:"applicationName"`
+	Port               int                       `json:"port"`
+	Required           bool                      `json:"required"`
+	Role               string                    `json:"role"`
+	ArtifactExtensions []string                  `json:"artifactExtensions"`
+	HealthPath         string                    `json:"healthPath"`
+	AffinityPolicy     string                    `json:"affinityPolicy"`
+	Resources          runtimeagent.ResourceSpec `json:"resources,omitempty"`
 }
 
 func discoverBundleServices(bundle Bundle) ([]serviceDefinition, error) {
@@ -211,6 +213,7 @@ func serviceCatalogMetadata(definitions []serviceDefinition) []map[string]any {
 			"port": definition.Port, "required": definition.Required,
 			"role": definition.Role, "artifactExtensions": definition.ArtifactExtensions,
 			"healthPath": definition.HealthPath, "affinityPolicy": definition.AffinityPolicy,
+			"resources": definition.Resources,
 		})
 	}
 	return out

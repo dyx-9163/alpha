@@ -64,6 +64,12 @@ type aifarOrchestrationStore interface {
 	ListAIFARServiceEndpoints(instanceID string) ([]store.AIFARServiceEndpoint, error)
 }
 
+type aifarDeploymentControlStore interface {
+	ListAIFARDeployments(instanceID string) ([]store.AIFARDeployment, error)
+	SaveAIFARDeploymentGeneration(next store.AIFARDeployment, expectedGeneration int64) (store.AIFARDeployment, error)
+	AcceptAIFARDeployment(instanceID, serviceName string, generation int64, status, conditionsJSON string, at time.Time) (store.AIFARDeployment, error)
+}
+
 type aifarRuntimeCleanupStore interface {
 	PruneAIFARPodRecords(instanceID string, existingContainerNames []string) (int, error)
 	PruneAIFARServiceEndpointRecords(instanceID string, existingContainerNames []string) (int, error)

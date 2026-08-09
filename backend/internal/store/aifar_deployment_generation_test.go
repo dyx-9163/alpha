@@ -21,6 +21,110 @@ func openTestStore(t *testing.T) *Store {
 	return db
 }
 
+func TestAcceptAIFARDeploymentKeepsObservedGenerationZero(t *testing.T) {
+	db := openTestStore(t)
+	desired, err := db.SaveAIFARDeploymentGeneration(AIFARDeployment{
+		InstanceID: "instance-1", ServiceName: "permission", DesiredReplicas: 1,
+		CurrentRevision: "r1", SpecJSON: `{"metadata":{"generation":1}}`, Status: "pending_acceptance",
+	}, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	at := time.Date(2026, time.August, 9, 10, 0, 0, 0, time.UTC)
+	accepted, err := db.AcceptAIFARDeployment("instance-1", "permission", desired.Generation, "Accepted", `[{"type":"Accepted","status":true,"generation":1}]`, at)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if accepted.Generation != 1 || accepted.ObservedGeneration != 0 || accepted.Status != "Accepted" || !accepted.LastTransitionAt.Equal(at) {
+		t.Fatalf("accepted=%+v", accepted)
+	}
+}
+
+func TestAcceptAIFARDeploymentRejectsLateGenerationWithoutChangingNewerState(t *testing.T) {
+	db := openTestStore(t)
+	gen1, err := db.SaveAIFARDeploymentGeneration(AIFARDeployment{InstanceID: "instance-1", ServiceName: "permission", Status: "pending_acceptance"}, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gen2, err := db.SaveAIFARDeploymentGeneration(AIFARDeployment{InstanceID: "instance-1", ServiceName: "permission", Status: "pending_acceptance", ConditionsJSON: `[{"generation":2}]`}, gen1.Generation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gen3, err := db.SaveAIFARDeploymentGeneration(AIFARDeployment{InstanceID: "instance-1", ServiceName: "permission", Status: "pending_acceptance", ConditionsJSON: `[{"generation":3}]`}, gen2.Generation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.AcceptAIFARDeployment("instance-1", "permission", gen2.Generation, "Accepted", `[{"generation":2}]`, time.Now().UTC())
+	if !errors.Is(err, ErrAIFARDeploymentGenerationConflict) {
+		t.Fatalf("err=%v", err)
+	}
+	got := deploymentByName(t, db, "instance-1", "permission")
+	if got.Generation != gen3.Generation || got.Status != "pending_acceptance" || got.ConditionsJSON != `[{"generation":3}]` || got.ObservedGeneration != 0 {
+		t.Fatalf("late acceptance changed newer desired state: %+v", got)
+	}
+}
+
+func TestAcceptAIFARDeploymentMissingRow(t *testing.T) {
+	db := openTestStore(t)
+	_, err := db.AcceptAIFARDeployment("missing", "permission", 1, "Accepted", `[]`, time.Now().UTC())
+	if !errors.Is(err, ErrAIFARDeploymentNotFound) {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestAcceptAIFARDeploymentConcurrentWithNextGenerationDoesNotOverwriteNextGeneration(t *testing.T) {
+	db := openTestStore(t)
+	gen1, err := db.SaveAIFARDeploymentGeneration(AIFARDeployment{InstanceID: "instance-1", ServiceName: "permission", Status: "pending_acceptance"}, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gen2, err := db.SaveAIFARDeploymentGeneration(AIFARDeployment{InstanceID: "instance-1", ServiceName: "permission", Status: "pending_acceptance", ConditionsJSON: `[{"generation":2}]`}, gen1.Generation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := make(chan struct{})
+	done := make(chan error, 2)
+	go func() {
+		<-start
+		_, acceptErr := db.AcceptAIFARDeployment("instance-1", "permission", gen2.Generation, "Accepted", `[{"generation":2,"accepted":true}]`, time.Now().UTC())
+		done <- acceptErr
+	}()
+	go func() {
+		<-start
+		_, saveErr := db.SaveAIFARDeploymentGeneration(AIFARDeployment{InstanceID: "instance-1", ServiceName: "permission", Status: "pending_acceptance", ConditionsJSON: `[{"generation":3}]`}, gen2.Generation)
+		done <- saveErr
+	}()
+	close(start)
+	for i := 0; i < 2; i++ {
+		err := <-done
+		if err != nil && !errors.Is(err, ErrAIFARDeploymentGenerationConflict) {
+			t.Fatal(err)
+		}
+	}
+	got := deploymentByName(t, db, "instance-1", "permission")
+	if got.Generation == 3 && (got.Status != "pending_acceptance" || got.ConditionsJSON != `[{"generation":3}]`) {
+		t.Fatalf("acceptance overwrote concurrent next generation: %+v", got)
+	}
+	if got.ObservedGeneration != 0 {
+		t.Fatalf("observed=%d", got.ObservedGeneration)
+	}
+}
+
+func deploymentByName(t *testing.T, db *Store, instanceID, serviceName string) AIFARDeployment {
+	t.Helper()
+	values, err := db.ListAIFARDeployments(instanceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, value := range values {
+		if value.ServiceName == serviceName {
+			return value
+		}
+	}
+	t.Fatalf("deployment %s not found", serviceName)
+	return AIFARDeployment{}
+}
+
 func TestSaveAIFARDeploymentGenerationRejectsStaleWriter(t *testing.T) {
 	db := openTestStore(t)
 	first, err := db.SaveAIFARDeploymentGeneration(AIFARDeployment{

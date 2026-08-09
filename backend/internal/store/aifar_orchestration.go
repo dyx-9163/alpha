@@ -128,6 +128,46 @@ func (s *Store) SaveAIFARDeploymentGeneration(next AIFARDeployment, expectedGene
 	return saved, nil
 }
 
+// AcceptAIFARDeployment records Agent acceptance only while the desired
+// generation still exactly matches generation. It deliberately does not
+// advance ObservedGeneration: acceptance proves durable enqueue, not runtime
+// reconciliation or readiness.
+func (s *Store) AcceptAIFARDeployment(instanceID, serviceName string, generation int64, status, conditionsJSON string, at time.Time) (AIFARDeployment, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return AIFARDeployment{}, err
+	}
+	defer tx.Rollback()
+	result, err := tx.Exec(`update aifar_deployments set
+		status=?, conditions_json=?, last_transition_at=?, updated_at=?
+		where instance_id=? and service_name=? and generation=?`,
+		status, conditionsJSON, at, time.Now(), instanceID, serviceName, generation)
+	if err != nil {
+		return AIFARDeployment{}, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return AIFARDeployment{}, err
+	}
+	if affected == 0 {
+		if _, err := getAIFARDeployment(tx, instanceID, serviceName); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return AIFARDeployment{}, ErrAIFARDeploymentNotFound
+			}
+			return AIFARDeployment{}, err
+		}
+		return AIFARDeployment{}, ErrAIFARDeploymentGenerationConflict
+	}
+	accepted, err := getAIFARDeployment(tx, instanceID, serviceName)
+	if err != nil {
+		return AIFARDeployment{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return AIFARDeployment{}, err
+	}
+	return accepted, nil
+}
+
 func (s *Store) ObserveAIFARDeployment(instanceID, serviceName string, generation int64, status, conditionsJSON string, at time.Time) (AIFARDeployment, error) {
 	tx, err := s.db.Begin()
 	if err != nil {
