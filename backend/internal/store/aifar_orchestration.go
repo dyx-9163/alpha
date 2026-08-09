@@ -140,7 +140,7 @@ func (s *Store) SaveAIFARInitialDesiredWithLock(lockID string, deployments []AIF
 	if instanceID == "" || strings.TrimSpace(lockID) == "" {
 		return fmt.Errorf("AIFAR initial desired ownership is incomplete")
 	}
-	now := time.Now().UTC()
+	recordedAt := time.Now().UTC()
 	byService := make(map[string]AIFARDeployment, len(deployments))
 	for index := range deployments {
 		deployment := &deployments[index]
@@ -156,9 +156,9 @@ func (s *Store) SaveAIFARInitialDesiredWithLock(lockID string, deployments []AIF
 			deployment.ID = NewID("aifardeploy")
 		}
 		if deployment.CreatedAt.IsZero() {
-			deployment.CreatedAt = now
+			deployment.CreatedAt = recordedAt
 		}
-		deployment.UpdatedAt = now
+		deployment.UpdatedAt = recordedAt
 		byService[deployment.ServiceName] = *deployment
 	}
 	for index := range replicaSets {
@@ -173,9 +173,9 @@ func (s *Store) SaveAIFARInitialDesiredWithLock(lockID string, deployments []AIF
 			replicaSet.ID = NewID("aifarrs")
 		}
 		if replicaSet.CreatedAt.IsZero() {
-			replicaSet.CreatedAt = now
+			replicaSet.CreatedAt = recordedAt
 		}
-		replicaSet.UpdatedAt = now
+		replicaSet.UpdatedAt = recordedAt
 		delete(byService, replicaSet.ServiceName)
 	}
 	if len(byService) != 0 {
@@ -187,12 +187,26 @@ func (s *Store) SaveAIFARInitialDesiredWithLock(lockID string, deployments []AIF
 		return err
 	}
 	defer tx.Rollback()
-	lockedInstanceID, err := verifyActiveAIFARInstallLockTx(tx, lockID, now)
+	lockedInstanceID, err := fenceActiveAIFARInstallLockTx(tx, lockID, time.Now().UTC())
 	if err != nil {
 		return err
 	}
 	if lockedInstanceID != instanceID {
 		return ErrAIFAROrchestrationLockOwnership
+	}
+	existingDeployments, err := listAIFARDeploymentsTx(tx, instanceID)
+	if err != nil {
+		return err
+	}
+	existingReplicaSets, err := listAIFARReplicaSetsTx(tx, instanceID)
+	if err != nil {
+		return err
+	}
+	if len(existingDeployments) != 0 || len(existingReplicaSets) != 0 {
+		if !initialDesiredSetMatchesExisting(deployments, replicaSets, existingDeployments, existingReplicaSets) {
+			return ErrAIFARDeploymentGenerationConflict
+		}
+		return tx.Commit()
 	}
 	for _, deployment := range deployments {
 		if _, err := tx.Exec(`insert into aifar_deployments(id,instance_id,service_name,desired_replicas,current_revision,updating_revision,strategy_json,spec_json,generation,observed_generation,status,metadata_json,conditions_json,last_transition_at,created_at,updated_at)
@@ -227,6 +241,74 @@ func (s *Store) SaveAIFARInitialDesiredWithLock(lockID string, deployments []AIF
 	return tx.Commit()
 }
 
+func listAIFARDeploymentsTx(tx *sql.Tx, instanceID string) ([]AIFARDeployment, error) {
+	rows, err := tx.Query(`select id,instance_id,service_name,desired_replicas,current_revision,coalesce(updating_revision,''),coalesce(strategy_json,''),coalesce(spec_json,''),coalesce(generation,1),coalesce(observed_generation,0),status,coalesce(metadata_json,''),coalesce(conditions_json,''),last_transition_at,created_at,updated_at
+		from aifar_deployments where instance_id=? order by service_name`, instanceID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]AIFARDeployment, 0)
+	for rows.Next() {
+		deployment, err := scanAIFARDeployment(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, deployment)
+	}
+	return out, rows.Err()
+}
+
+func listAIFARReplicaSetsTx(tx *sql.Tx, instanceID string) ([]AIFARReplicaSet, error) {
+	rows, err := tx.Query(`select id,instance_id,service_name,revision,image,coalesce(artifact_hash,''),desired_pods,ready_pods,status,coalesce(metadata_json,''),created_at,updated_at
+		from aifar_replicasets where instance_id=? order by service_name,revision`, instanceID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]AIFARReplicaSet, 0)
+	for rows.Next() {
+		var replicaSet AIFARReplicaSet
+		if err := rows.Scan(&replicaSet.ID, &replicaSet.InstanceID, &replicaSet.ServiceName, &replicaSet.Revision, &replicaSet.Image, &replicaSet.ArtifactHash, &replicaSet.DesiredPods, &replicaSet.ReadyPods, &replicaSet.Status, &replicaSet.MetadataJSON, &replicaSet.CreatedAt, &replicaSet.UpdatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, replicaSet)
+	}
+	return out, rows.Err()
+}
+
+func initialDesiredSetMatchesExisting(expectedDeployments []AIFARDeployment, expectedReplicaSets []AIFARReplicaSet, existingDeployments []AIFARDeployment, existingReplicaSets []AIFARReplicaSet) bool {
+	if len(existingDeployments) != len(expectedDeployments) || len(existingReplicaSets) != len(expectedReplicaSets) {
+		return false
+	}
+	deploymentsByService := make(map[string]AIFARDeployment, len(expectedDeployments))
+	for _, deployment := range expectedDeployments {
+		deploymentsByService[deployment.ServiceName] = deployment
+	}
+	for _, current := range existingDeployments {
+		expected, ok := deploymentsByService[current.ServiceName]
+		if !ok || current.Generation != expected.Generation || current.DesiredReplicas != expected.DesiredReplicas || current.CurrentRevision != expected.CurrentRevision || current.SpecJSON != expected.SpecJSON || current.StrategyJSON != expected.StrategyJSON {
+			return false
+		}
+		delete(deploymentsByService, current.ServiceName)
+	}
+	if len(deploymentsByService) != 0 {
+		return false
+	}
+	replicaSetsByService := make(map[string]AIFARReplicaSet, len(expectedReplicaSets))
+	for _, replicaSet := range expectedReplicaSets {
+		replicaSetsByService[replicaSet.ServiceName] = replicaSet
+	}
+	for _, current := range existingReplicaSets {
+		expected, ok := replicaSetsByService[current.ServiceName]
+		if !ok || current.Revision != expected.Revision || current.Image != expected.Image || current.ArtifactHash != expected.ArtifactHash || current.DesiredPods != expected.DesiredPods {
+			return false
+		}
+		delete(replicaSetsByService, current.ServiceName)
+	}
+	return len(replicaSetsByService) == 0
+}
+
 // AcceptAIFARDeploymentWithLock accepts only the exact desired revision/spec
 // while the same install maintenance lock remains active in this transaction.
 func (s *Store) AcceptAIFARDeploymentWithLock(lockID string, expected AIFARDeployment, status, conditionsJSON string, at time.Time) (AIFARDeployment, error) {
@@ -235,7 +317,7 @@ func (s *Store) AcceptAIFARDeploymentWithLock(lockID string, expected AIFARDeplo
 		return AIFARDeployment{}, err
 	}
 	defer tx.Rollback()
-	instanceID, err := verifyActiveAIFARInstallLockTx(tx, lockID, time.Now().UTC())
+	instanceID, err := fenceActiveAIFARInstallLockTx(tx, lockID, time.Now().UTC())
 	if err != nil {
 		return AIFARDeployment{}, err
 	}
@@ -282,10 +364,25 @@ func (s *Store) AcceptAIFARDeploymentWithLock(lockID string, expected AIFARDeplo
 	return accepted, nil
 }
 
-func verifyActiveAIFARInstallLockTx(tx *sql.Tx, lockID string, now time.Time) (string, error) {
+// fenceActiveAIFARInstallLockTx takes SQLite's write lock while proving that
+// the exact global install lease is still active. The lock remains held by tx,
+// so another connection cannot release, renew, or replace the persisted lease
+// between this check and the desired-state writes in the same transaction.
+func fenceActiveAIFARInstallLockTx(tx *sql.Tx, lockID string, now time.Time) (string, error) {
+	result, err := tx.Exec(`update aifar_orchestration_locks set updated_at=?
+		where id=? and service_name='' and operation='install' and status='active' and expires_at>?`, now, strings.TrimSpace(lockID), now)
+	if err != nil {
+		return "", err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return "", err
+	}
+	if affected != 1 {
+		return "", ErrAIFAROrchestrationLockOwnership
+	}
 	var instanceID string
-	err := tx.QueryRow(`select instance_id from aifar_orchestration_locks
-		where id=? and service_name='' and operation='install' and status='active' and expires_at>?`, strings.TrimSpace(lockID), now).Scan(&instanceID)
+	err = tx.QueryRow(`select instance_id from aifar_orchestration_locks where id=?`, strings.TrimSpace(lockID)).Scan(&instanceID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", ErrAIFAROrchestrationLockOwnership
 	}

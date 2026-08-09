@@ -24,6 +24,7 @@ import (
 
 	"aifar-deployment/backend/internal/adapter"
 	"aifar-deployment/backend/internal/apps/registry"
+	"aifar-deployment/backend/internal/i18n"
 	"aifar-deployment/backend/internal/runtimeagent"
 	"aifar-deployment/backend/internal/store"
 	"aifar-deployment/backend/internal/worker"
@@ -343,42 +344,65 @@ func (f *fakeStore) SaveAIFARInitialDesiredWithLock(_ string, deployments []stor
 	if len(deployments) == 0 || len(deployments) != len(replicaSets) {
 		return errors.New("incomplete initial desired set")
 	}
-	for _, desired := range deployments {
-		found := false
-		for _, current := range f.deployments {
-			if current.InstanceID != desired.InstanceID || current.ServiceName != desired.ServiceName {
-				continue
-			}
-			found = true
-			if current.Generation != desired.Generation || current.CurrentRevision != desired.CurrentRevision || current.SpecJSON != desired.SpecJSON {
-				return store.ErrAIFARDeploymentGenerationConflict
-			}
-		}
-		if !found {
-			f.directDeploymentSaveCalls++
-			if desired.ID == "" {
-				desired.ID = store.NewID("aifardeploy")
-			}
-			f.deployments = append(f.deployments, desired)
+	instanceID := deployments[0].InstanceID
+	existingDeployments := make([]store.AIFARDeployment, 0)
+	for _, deployment := range f.deployments {
+		if deployment.InstanceID == instanceID {
+			existingDeployments = append(existingDeployments, deployment)
 		}
 	}
-	for _, desired := range replicaSets {
-		found := false
-		for _, current := range f.replicaSets {
-			if current.InstanceID != desired.InstanceID || current.ServiceName != desired.ServiceName || current.Revision != desired.Revision {
-				continue
-			}
-			found = true
-			if current.Image != desired.Image || current.ArtifactHash != desired.ArtifactHash || current.DesiredPods != desired.DesiredPods {
+	existingReplicaSets := make([]store.AIFARReplicaSet, 0)
+	for _, replicaSet := range f.replicaSets {
+		if replicaSet.InstanceID == instanceID {
+			existingReplicaSets = append(existingReplicaSets, replicaSet)
+		}
+	}
+	if len(existingDeployments) != 0 || len(existingReplicaSets) != 0 {
+		if len(existingDeployments) != len(deployments) || len(existingReplicaSets) != len(replicaSets) {
+			return store.ErrAIFARDeploymentGenerationConflict
+		}
+		byService := make(map[string]store.AIFARDeployment, len(deployments))
+		for _, desired := range deployments {
+			byService[desired.ServiceName] = desired
+		}
+		for _, current := range existingDeployments {
+			desired, ok := byService[current.ServiceName]
+			if !ok || current.Generation != desired.Generation || current.DesiredReplicas != desired.DesiredReplicas || current.CurrentRevision != desired.CurrentRevision || current.SpecJSON != desired.SpecJSON || current.StrategyJSON != desired.StrategyJSON {
 				return store.ErrAIFARDeploymentGenerationConflict
 			}
+			delete(byService, current.ServiceName)
 		}
-		if !found {
-			if desired.ID == "" {
-				desired.ID = store.NewID("aifarrs")
+		if len(byService) != 0 {
+			return store.ErrAIFARDeploymentGenerationConflict
+		}
+		replicaSetsByService := make(map[string]store.AIFARReplicaSet, len(replicaSets))
+		for _, desired := range replicaSets {
+			replicaSetsByService[desired.ServiceName] = desired
+		}
+		for _, current := range existingReplicaSets {
+			desired, ok := replicaSetsByService[current.ServiceName]
+			if !ok || current.Revision != desired.Revision || current.Image != desired.Image || current.ArtifactHash != desired.ArtifactHash || current.DesiredPods != desired.DesiredPods {
+				return store.ErrAIFARDeploymentGenerationConflict
 			}
-			f.replicaSets = append(f.replicaSets, desired)
+			delete(replicaSetsByService, current.ServiceName)
 		}
+		if len(replicaSetsByService) != 0 {
+			return store.ErrAIFARDeploymentGenerationConflict
+		}
+		return nil
+	}
+	for _, desired := range deployments {
+		f.directDeploymentSaveCalls++
+		if desired.ID == "" {
+			desired.ID = store.NewID("aifardeploy")
+		}
+		f.deployments = append(f.deployments, desired)
+	}
+	for _, desired := range replicaSets {
+		if desired.ID == "" {
+			desired.ID = store.NewID("aifarrs")
+		}
+		f.replicaSets = append(f.replicaSets, desired)
 	}
 	return nil
 }
@@ -2810,26 +2834,108 @@ func TestInstallReleasePersistenceFailureRemainsRetryable(t *testing.T) {
 }
 
 func TestInstallReleaseRetentionFailureIsBestEffort(t *testing.T) {
+	for _, lang := range []string{"en", "zh"} {
+		t.Run(lang, func(t *testing.T) {
+			withFakeRuntimeAgentBinary(t)
+			root := createAIFARBundle(t)
+			s := &fakeStore{
+				servers:             map[string]store.Server{"srv-1": {ID: "srv-1", Host: "10.0.0.10", DeployDir: "/aifar/apps"}},
+				deleteOldReleaseErr: errors.New("retention failed: secret=must-not-leak"),
+			}
+			logger := &messageLogger{}
+			err := NewService(s, &fakeRemote{}).Install(context.Background(), InstallRequest{
+				Version: "latest", ServerID: "srv-1", Language: lang,
+				Parameters: map[string]any{"nacosHost": "10.0.0.50", "selectedServices": []string{"gateway"}},
+			}, []store.Resource{{App: AppName, Part: "backend", Version: appBundleVersion, Path: filepath.Join(root, appBundleVersion, bundleManifestName)}}, logger, nil)
+			if err != nil {
+				t.Fatalf("retention cleanup must not fail accepted install: %v", err)
+			}
+			if len(s.instances) != 1 || s.instances[0].Status != "installed" || len(s.releases) != 1 || s.releases[0].Status != "success" {
+				t.Fatalf("retention cleanup changed required install outcome: instances=%+v releases=%+v", s.instances, s.releases)
+			}
+			const messageKey = "aifar.install.releaseRetentionCleanupWarning"
+			want := i18n.Text(lang, messageKey)
+			if want == "" || want == messageKey {
+				t.Fatalf("retention warning translation is missing for %s: %q", lang, want)
+			}
+			messages := logger.joined()
+			if !strings.Contains(messages, want) || strings.Contains(messages, "must-not-leak") || strings.Contains(messages, "secret=") {
+				t.Fatalf("localized retention warning must be present and sanitized: want=%q messages=%s", want, messages)
+			}
+		})
+	}
+}
+
+func TestInstallRetryFailsClosedWhenFailedServiceInstallLeftExtraDesired(t *testing.T) {
 	withFakeRuntimeAgentBinary(t)
-	root := createAIFARBundle(t)
-	s := &fakeStore{
-		servers:             map[string]store.Server{"srv-1": {ID: "srv-1", Host: "10.0.0.10", DeployDir: "/aifar/apps"}},
-		deleteOldReleaseErr: errors.New("retention failed: secret=must-not-leak"),
+	bundleParent := createAIFARBundle(t)
+	resource := store.Resource{
+		App: AppName, Part: "backend", Version: appBundleVersion,
+		Path: filepath.Join(bundleParent, appBundleVersion, bundleManifestName),
 	}
-	logger := &messageLogger{}
-	err := NewService(s, &fakeRemote{}).Install(context.Background(), InstallRequest{
-		Version: "latest", ServerID: "srv-1", Language: "en",
-		Parameters: map[string]any{"nacosHost": "10.0.0.50", "selectedServices": []string{"gateway"}},
-	}, []store.Resource{{App: AppName, Part: "backend", Version: appBundleVersion, Path: filepath.Join(root, appBundleVersion, bundleManifestName)}}, logger, nil)
+	db := openAIFARTestStore(t)
+	server, err := db.SaveServer(store.Server{ID: "srv-1", Name: "node-1", Host: "10.0.0.10", DeployDir: "/aifar/apps"})
 	if err != nil {
-		t.Fatalf("retention cleanup must not fail accepted install: %v", err)
+		t.Fatal(err)
 	}
-	if len(s.instances) != 1 || s.instances[0].Status != "installed" || len(s.releases) != 1 || s.releases[0].Status != "success" {
-		t.Fatalf("retention cleanup changed required install outcome: instances=%+v releases=%+v", s.instances, s.releases)
+	if err := db.UpsertResource(resource); err != nil {
+		t.Fatal(err)
 	}
-	messages := logger.joined()
-	if !strings.Contains(strings.ToLower(messages), "warning") || strings.Contains(messages, "must-not-leak") || strings.Contains(messages, "secret=") {
-		t.Fatalf("retention warning must be present and sanitized: %s", messages)
+	remote := &fakeRemote{failCommandContains: "install-aifar.sh"}
+	service := NewService(db, remote)
+	request := InstallRequest{
+		Version: "latest", ServerID: server.ID, Language: "en", TaskID: "initial-failure",
+		Parameters: map[string]any{"nacosHost": "10.0.0.50", "selectedServices": []string{"gateway"}},
+	}
+	if err := service.Install(context.Background(), request, []store.Resource{resource}, fakeLogger{}, nil); err == nil {
+		t.Fatal("initial install must fail after publishing its selected desired set")
+	}
+	instances, err := db.ListAppInstances()
+	if err != nil || len(instances) != 1 || instances[0].Status != "install_failed" {
+		t.Fatalf("failed initial instance=%+v err=%v", instances, err)
+	}
+	failedInstance := instances[0]
+	originalDeployments, err := db.ListAIFARDeployments(failedInstance.ID)
+	if err != nil || len(originalDeployments) == 0 {
+		t.Fatalf("initial selected desired set=%+v err=%v", originalDeployments, err)
+	}
+
+	remote.failCommandContains = ""
+	if err := service.InstallServices(context.Background(), InstallServicesRequest{
+		Instance: failedInstance, Server: server, Language: "en", Actor: "admin", TaskID: "failed-add-service",
+		Services: []string{"system"}, Reason: "reproduce interrupted add-service",
+	}, fakeLogger{}, nil); err == nil {
+		t.Fatal("add-service attempt must fail after leaving its extra desired row")
+	}
+	withExtra, err := db.ListAIFARDeployments(failedInstance.ID)
+	if err != nil || len(withExtra) != len(originalDeployments)+1 {
+		t.Fatalf("failed add-service did not leave one extra desired row: before=%+v after=%+v err=%v", originalDeployments, withExtra, err)
+	}
+	foundExtra := false
+	for _, deployment := range withExtra {
+		foundExtra = foundExtra || deployment.ServiceName == "system"
+	}
+	if !foundExtra {
+		t.Fatalf("failed add-service extra row is missing: %+v", withExtra)
+	}
+
+	runsBeforeRetry := remote.installRuns
+	request.TaskID = "same-attempt-retry"
+	err = service.Install(context.Background(), request, []store.Resource{resource}, fakeLogger{}, nil)
+	var controlErr *deploymentControlError
+	if !errors.As(err, &controlErr) || controlErr.ReasonCode() != "AIFAR_RUNTIME_INSTALL_RETRY_SET_CHANGED" {
+		t.Fatalf("same-attempt retry error=%v, want repair-required exact-set conflict", err)
+	}
+	current, getErr := db.GetAppInstance(failedInstance.ID)
+	if getErr != nil || current.Status != "install_failed" {
+		t.Fatalf("set-conflicted retry finalized installation: current=%+v err=%v", current, getErr)
+	}
+	if remote.installRuns != runsBeforeRetry {
+		t.Fatalf("set-conflicted retry reached Agent bootstrap: before=%d after=%d", runsBeforeRetry, remote.installRuns)
+	}
+	afterRetry, err := db.ListAIFARDeployments(failedInstance.ID)
+	if err != nil || len(afterRetry) != len(withExtra) {
+		t.Fatalf("set-conflicted retry deleted or added desired rows: before=%+v after=%+v err=%v", withExtra, afterRetry, err)
 	}
 }
 

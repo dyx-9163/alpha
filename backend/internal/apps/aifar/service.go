@@ -19,6 +19,7 @@ import (
 
 	"aifar-deployment/backend/internal/agentdist"
 	"aifar-deployment/backend/internal/apps/registry"
+	"aifar-deployment/backend/internal/i18n"
 	"aifar-deployment/backend/internal/installer/installerkit"
 	"aifar-deployment/backend/internal/installer/selinux"
 	"aifar-deployment/backend/internal/installer/uploadkit"
@@ -842,7 +843,7 @@ func (s Service) Install(ctx context.Context, req InstallRequest, resources []st
 			return saveErr
 		}
 		if _, err := releases.DeleteOldAppReleases(instance.ID, releaseKeepCount); err != nil {
-			logForServer.Info("AIFAR release retention cleanup warning: reason=retention_cleanup_failed")
+			logForServer.Info("%s", i18n.Text(req.Language, "aifar.install.releaseRetentionCleanupWarning"))
 		}
 		return nil
 	}); err != nil {
@@ -1052,6 +1053,9 @@ func (s Service) saveInitialControlPlaneDesired(lockID string, instance store.Ap
 		})
 	}
 	if err := fenced.SaveAIFARInitialDesiredWithLock(lockID, deployments, replicaSets); err != nil {
+		if errors.Is(err, store.ErrAIFARDeploymentGenerationConflict) {
+			return nil, repairRequired("AIFAR_RUNTIME_INSTALL_RETRY_SET_CHANGED", err)
+		}
 		return nil, err
 	}
 	return byService, nil
