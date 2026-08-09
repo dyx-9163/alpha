@@ -240,7 +240,7 @@ func (controller *serviceController) reconcileUntilStable() {
 func (controller *serviceController) reconcileIteration() (result reconcileResult) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
-			controller.manager.setControllerPanic(controller.instanceID, controller.service, controller.activeGenerationSnapshot())
+			controller.manager.setControllerPanic(controller, controller.activeGenerationSnapshot())
 			logf(controller.manager.log, "AIFAR deployment reconcile panic recovered instance=%s service=%s\n", controller.instanceID, controller.service)
 			result = reconcileResult{kind: reconcileRetry}
 		}
@@ -431,16 +431,32 @@ func (m *Manager) setControllerRejected(instanceID, serviceName string, reconcil
 	logf(m.log, "AIFAR deployment manifest rejected instance=%s service=%s error=%v\n", instanceID, serviceName, reconcileErr)
 }
 
-func (m *Manager) setControllerPanic(instanceID, serviceName string, generation int64) {
-	key := endpointKey(instanceID, serviceName)
-	m.controllerMu.Lock()
-	manifest, ok := m.manifestCache[key]
-	hash := m.controllerStates[key].SpecHash
-	m.controllerMu.Unlock()
-	if !ok || generation <= 0 || manifest.Metadata.Generation != generation {
+func (m *Manager) setControllerPanic(owner *serviceController, generation int64) {
+	m.setControllerPanicWithHook(owner, generation, nil)
+}
+
+func (m *Manager) setControllerPanicWithHook(owner *serviceController, generation int64, beforeWrite func()) {
+	if owner == nil || generation <= 0 {
 		return
 	}
-	m.setControllerCondition(manifest, hash, deploymentConditionDegraded, "ContainerCreateFailed", true)
+	key := endpointKey(owner.instanceID, owner.service)
+	currentReplicas, readyReplicas := m.controllerReplicaCounts(key)
+	m.controllerMu.Lock()
+	defer m.controllerMu.Unlock()
+	if m.controllers[key] != owner {
+		return
+	}
+	manifest, ok := m.manifestCache[key]
+	state, stateOK := m.controllerStates[key]
+	if !ok || !stateOK || manifest.Metadata.Generation != generation || state.Generation != generation {
+		return
+	}
+	if beforeWrite != nil {
+		beforeWrite()
+	}
+	state = transitionDeploymentState(state, manifest, state.SpecHash, deploymentConditionDegraded, "ContainerCreateFailed", currentReplicas, readyReplicas, m.controllerClock.Now())
+	state.ObservedGeneration = generation
+	m.controllerStates[key] = state
 }
 
 func (m *Manager) setControllerCondition(manifest DeploymentManifest, hash, conditionType, reason string, observed bool) {

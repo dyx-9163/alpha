@@ -334,8 +334,11 @@ func TestSupersededGenerationCannotRegressDeploymentState(t *testing.T) {
 		t.Fatal(err)
 	}
 	manager.setControllerCondition(stale, hash, deploymentConditionAvailable, "MinimumReplicasAvailable", true)
-	manager.setControllerPanic("admin", "permission", 1)
-	manager.setControllerPanic("admin", "permission", 0)
+	manager.controllerMu.Lock()
+	owner := manager.controllers[endpointKey("admin", "permission")]
+	manager.controllerMu.Unlock()
+	manager.setControllerPanic(owner, 1)
+	manager.setControllerPanic(owner, 0)
 	state, ok := manager.DeploymentState("admin", "permission")
 	if !ok {
 		t.Fatal("deployment state missing")
@@ -348,6 +351,71 @@ func TestSupersededGenerationCannotRegressDeploymentState(t *testing.T) {
 	}
 	close(release)
 	waitForDeploymentCondition(t, manager, "permission", "Offline", time.Second)
+}
+
+func TestControllerPanicCannotResurrectStateAfterRemove(t *testing.T) {
+	validated := make(chan struct{})
+	release := make(chan struct{})
+	manager := newControllerTestManager(t, newControllerTestRunner())
+	if _, err := manager.AcceptDeployment(context.Background(), controllerTestManifest("permission", 1, 0)); err != nil {
+		t.Fatal(err)
+	}
+	waitForDeploymentCondition(t, manager, "permission", "Offline", time.Second)
+	manager.controllerMu.Lock()
+	owner := manager.controllers[endpointKey("admin", "permission")]
+	manager.controllerMu.Unlock()
+	if owner == nil {
+		t.Fatal("permission controller missing")
+	}
+	panicDone := make(chan struct{})
+	go func() {
+		manager.setControllerPanicWithHook(owner, 1, func() {
+			close(validated)
+			<-release
+		})
+		close(panicDone)
+	}()
+	select {
+	case <-validated:
+	case <-time.After(time.Second):
+		t.Fatal("panic writer did not reach validated window")
+	}
+
+	removeDone := make(chan error, 1)
+	go func() { removeDone <- manager.Remove(context.Background(), "admin") }()
+	deadline := time.Now().Add(50 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		owner.mu.Lock()
+		stopped := owner.stopped
+		owner.mu.Unlock()
+		if stopped {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	close(release)
+	select {
+	case <-panicDone:
+	case <-time.After(time.Second):
+		t.Fatal("panic writer did not finish")
+	}
+	select {
+	case err := <-removeDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("remove did not finish")
+	}
+	if state, ok := manager.DeploymentState("admin", "permission"); ok {
+		t.Fatalf("panic writer resurrected removed deployment state: %+v", state)
+	}
+	manager.controllerMu.Lock()
+	_, controllerExists := manager.controllers[endpointKey("admin", "permission")]
+	manager.controllerMu.Unlock()
+	if controllerExists {
+		t.Fatal("removed service controller was resurrected")
+	}
 }
 
 func TestControllerUsesSingleOwnerAndWakeChannelPerService(t *testing.T) {
