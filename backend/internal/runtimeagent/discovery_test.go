@@ -642,6 +642,119 @@ func TestManagerDiscoveryRetiredListenerDoesNotBlockRegistrationOrStop(t *testin
 	close(releaseRetirement)
 }
 
+func TestManagerDiscoveryStaleFailedAttemptCannotDeleteReplacementRouteOnSamePort(t *testing.T) {
+	manager := newControllerTestManager(t, newControllerTestRunner())
+	oldPort, port := freePort(t), freePort(t)
+	baseline := &managerDiscoverySyncer{manager: manager}
+	putManifest := func(generation int64, listenPort int, image string) {
+		t.Helper()
+		manifest := controllerTestManifest("permission", generation, 1)
+		manifest.Spec.Image = image
+		manifest.Spec.PodRevision = fmt.Sprintf("rev-%d", generation)
+		manifest.Service.Port = listenPort
+		manifest.Service.ListenPort = listenPort
+		manifest.Service.TargetPort = listenPort
+		if _, err := manager.manifestStore.Put(manifest); err != nil {
+			t.Fatal(err)
+		}
+	}
+	putManifest(1, oldPort, "permission:baseline")
+	baselineEvent := readyDiscoveryEvent("permission", "permission-baseline")
+	baselineEvent.ListenPort = oldPort
+	if err := baseline.RefreshRoutes(context.Background(), baselineEvent); err != nil {
+		t.Fatal(err)
+	}
+
+	oldStartBlocked := make(chan struct{})
+	releaseOldStart := make(chan struct{})
+	var startMu sync.Mutex
+	startCalls := 0
+	routeSyncer := &managerDiscoverySyncer{
+		manager: manager,
+		startPort: func(got int) error {
+			startMu.Lock()
+			startCalls++
+			call := startCalls
+			startMu.Unlock()
+			if call == 1 {
+				close(oldStartBlocked)
+				<-releaseOldStart
+				return errors.New("stale listener start failed")
+			}
+			return manager.startPort(got)
+		},
+	}
+	syncer := &samePortLifecycleDiscoverySyncer{
+		routes:     routeSyncer,
+		registered: make(chan EndpointEvent, 2),
+		oldDone:    make(chan error, 1),
+	}
+	discovery := newDiscoveryController(discoveryControllerOptions{Syncer: syncer})
+	t.Cleanup(func() {
+		select {
+		case <-releaseOldStart:
+		default:
+			close(releaseOldStart)
+		}
+		discovery.Stop()
+		_ = manager.Remove(context.Background(), "admin")
+		manager.stopPort(context.Background(), oldPort)
+		manager.stopPort(context.Background(), port)
+	})
+
+	putManifest(2, port, "permission:old-attempt")
+	oldEvent := readyDiscoveryEvent("permission", "permission-old")
+	oldEvent.ListenPort = port
+	discovery.EndpointChanged(oldEvent)
+	select {
+	case <-oldStartBlocked:
+	case <-time.After(time.Second):
+		t.Fatal("old route attempt did not block in startPort")
+	}
+	discovery.StopInstance("admin")
+
+	putManifest(3, port, "permission:replacement")
+	newEvent := readyDiscoveryEvent("permission", "permission-new")
+	newEvent.ListenPort = port
+	discovery.EndpointChanged(newEvent)
+	select {
+	case registered := <-syncer.registered:
+		if registered.Ready[0].PodID != "permission-new" {
+			t.Fatalf("registered stale event: %+v", registered)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("replacement worker did not register same-port route")
+	}
+	close(releaseOldStart)
+	select {
+	case err := <-syncer.oldDone:
+		if err == nil {
+			t.Fatal("expected old route attempt to fail")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("old route attempt did not finish")
+	}
+
+	manager.mu.RLock()
+	route, hasRoute := manager.routes[port]
+	_, restoredOldRoute := manager.routes[oldPort]
+	_, hasServer := manager.servers[port]
+	spec := manager.specs["admin"]
+	manager.mu.RUnlock()
+	if !hasRoute || route.InstanceID != "admin" || route.Service != "permission" || !hasServer {
+		t.Fatalf("stale failure removed replacement route/server: route=%+v hasRoute=%t hasServer=%t", route, hasRoute, hasServer)
+	}
+	if restoredOldRoute {
+		t.Fatal("stale failure restored old route")
+	}
+	if got := discoverySpecServicePort(spec, "permission"); got != port {
+		t.Fatalf("stale failure restored old service port=%d, want %d", got, port)
+	}
+	if got := discoverySpecImage(spec, "permission"); got != "permission:replacement" {
+		t.Fatalf("stale failure restored old deployment image=%q", got)
+	}
+}
+
 func discoverySpecServicePort(spec RuntimeSpec, service string) int {
 	for _, item := range spec.Services {
 		if item.Name == service {
@@ -698,6 +811,32 @@ type portTransitionDiscoverySyncer struct {
 type retirementDiscoverySyncer struct {
 	routes     *managerDiscoverySyncer
 	registered chan int
+}
+
+type samePortLifecycleDiscoverySyncer struct {
+	routes     *managerDiscoverySyncer
+	registered chan EndpointEvent
+	oldDone    chan error
+}
+
+func (s *samePortLifecycleDiscoverySyncer) RefreshRoutes(ctx context.Context, event EndpointEvent) error {
+	err := s.routes.RefreshRoutes(ctx, event)
+	if len(event.Ready) > 0 && event.Ready[0].PodID == "permission-old" {
+		s.oldDone <- err
+	}
+	return err
+}
+
+func (s *samePortLifecycleDiscoverySyncer) Register(_ context.Context, event EndpointEvent) error {
+	s.registered <- event
+	return nil
+}
+
+func (s *samePortLifecycleDiscoverySyncer) Deregister(context.Context, EndpointEvent) error {
+	return nil
+}
+func (s *samePortLifecycleDiscoverySyncer) Heartbeat(context.Context, EndpointEvent) error {
+	return nil
 }
 
 func (s *retirementDiscoverySyncer) RefreshRoutes(ctx context.Context, event EndpointEvent) error {

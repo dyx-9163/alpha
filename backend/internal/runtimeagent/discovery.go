@@ -691,6 +691,11 @@ func (syncer *managerDiscoverySyncer) RefreshRoutes(ctx context.Context, event E
 		manager.mu.Unlock()
 		return errors.New("proxy route port is already assigned")
 	}
+	manager.routeAttemptNext++
+	if manager.routeAttemptNext == 0 {
+		manager.routeAttemptNext++
+	}
+	attempt := manager.routeAttemptNext
 	previousSpec, hadPreviousSpec := manager.specs[event.InstanceID]
 	previousDeployment, hadPreviousDeployment := discoveryDeployment(previousSpec.Deployments, event.ServiceName)
 	previousService, hadPreviousService := discoveryService(previousSpec.Services, event.ServiceName)
@@ -723,6 +728,7 @@ func (syncer *managerDiscoverySyncer) RefreshRoutes(ctx context.Context, event E
 		InstanceID: event.InstanceID,
 		Service:    event.ServiceName,
 		WebIngress: event.ServiceName == config.Ingress.WebService,
+		attempt:    attempt,
 	}
 	_, listening := manager.servers[event.ListenPort]
 	manager.mu.Unlock()
@@ -733,8 +739,27 @@ func (syncer *managerDiscoverySyncer) RefreshRoutes(ctx context.Context, event E
 		}
 		if err := startPort(event.ListenPort); err != nil {
 			manager.mu.Lock()
-			if current, ok := manager.routes[event.ListenPort]; ok && current.InstanceID == event.InstanceID && current.Service == event.ServiceName {
+			current, routeExists := manager.routes[event.ListenPort]
+			ownsAttempt := routeExists && current.InstanceID == event.InstanceID && current.Service == event.ServiceName && current.attempt == attempt
+			if ownsAttempt {
 				delete(manager.routes, event.ListenPort)
+			}
+			if !ownsAttempt {
+				serversToStop := make([]*http.Server, 0, len(oldPorts))
+				for _, port := range oldPorts {
+					if _, used := manager.routes[port]; used {
+						continue
+					}
+					if server := manager.servers[port]; server != nil {
+						delete(manager.servers, port)
+						serversToStop = append(serversToStop, server)
+					}
+				}
+				manager.mu.Unlock()
+				for _, server := range serversToStop {
+					syncer.retireServer(server)
+				}
+				return errors.New("proxy listener unavailable")
 			}
 			newerRoute := false
 			for port, route := range manager.routes {

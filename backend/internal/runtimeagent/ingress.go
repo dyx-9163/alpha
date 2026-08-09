@@ -78,6 +78,7 @@ type Manager struct {
 	specs                    map[string]RuntimeSpec
 	routes                   map[int]proxyRoute
 	servers                  map[int]*http.Server
+	routeAttemptNext         uint64
 	next                     map[string]uint64
 	endpoints                map[string][]endpoint
 	deployments              map[string]deploymentRuntimeStatus
@@ -99,6 +100,7 @@ type proxyRoute struct {
 	InstanceID string
 	Service    string
 	WebIngress bool
+	attempt    uint64
 }
 
 type endpoint struct {
