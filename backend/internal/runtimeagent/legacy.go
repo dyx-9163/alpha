@@ -16,7 +16,7 @@ var (
 	ErrLegacyRuntimeSpecDisabled = errors.New("legacy runtime spec is disabled")
 	ErrInvalidLegacyRuntimeSpec  = errors.New("invalid legacy runtime spec")
 	ErrInvalidDeploymentManifest = errors.New("invalid deployment manifest")
-	ErrAgentStatePersistence     = errors.New("agent state persistence failed")
+	errAgentStatePersistence     = errors.New("agent state persistence failed")
 	legacyRuntimeBootstrapMu     sync.Mutex
 )
 
@@ -43,15 +43,21 @@ func (m *Manager) ClassifyDeploymentAcceptanceError(manifest DeploymentManifest,
 	manifest = NormalizeDeploymentManifest(manifest)
 	config, err := m.manifestStore.GetInstance(manifest.Metadata.InstanceID)
 	if err != nil {
-		return fmt.Errorf("%w: %v", ErrAgentStatePersistence, acceptErr)
+		if errors.Is(err, errUnsafeManifestFilesystemShape) {
+			return errors.Join(ErrInvalidDeploymentManifest, err)
+		}
+		return errors.Join(errAgentStatePersistence, acceptErr)
 	}
 	if err := ValidateDeploymentManifest(config, manifest); err != nil {
-		return fmt.Errorf("%w: %v", ErrInvalidDeploymentManifest, err)
+		return errors.Join(ErrInvalidDeploymentManifest, err)
 	}
 	if err := m.manifestStore.validateDeploymentFilesystem(config, manifest); err != nil {
-		return fmt.Errorf("%w: %v", ErrInvalidDeploymentManifest, err)
+		if errors.Is(err, errUnsafeManifestFilesystemShape) {
+			return errors.Join(ErrInvalidDeploymentManifest, err)
+		}
+		return errors.Join(errAgentStatePersistence, acceptErr)
 	}
-	return fmt.Errorf("%w: %v", ErrAgentStatePersistence, acceptErr)
+	return errors.Join(errAgentStatePersistence, acceptErr)
 }
 
 // EnsureLegacyRuntimeSpecEnabled fails closed once instance.json exists. The
@@ -160,7 +166,10 @@ func (m *Manager) BootstrapLegacyRuntime(ctx context.Context, legacy LegacyRunti
 			return LegacyBootstrapAcceptance{}, err
 		}
 		if err := m.manifestStore.validateDeploymentFilesystem(config, manifest); err != nil {
-			return LegacyBootstrapAcceptance{}, fmt.Errorf("%w: %v", ErrInvalidLegacyRuntimeSpec, err)
+			if errors.Is(err, errUnsafeManifestFilesystemShape) {
+				return LegacyBootstrapAcceptance{}, fmt.Errorf("%w: %v", ErrInvalidLegacyRuntimeSpec, err)
+			}
+			return LegacyBootstrapAcceptance{}, fmt.Errorf("observe deployment filesystem: %w", err)
 		}
 		data, marshalErr := json.MarshalIndent(manifest, "", "  ")
 		if marshalErr != nil {

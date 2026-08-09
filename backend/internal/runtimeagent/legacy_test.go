@@ -4,13 +4,77 @@ import (
 	"context"
 	"errors"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
+
+func TestClassifyDeploymentAcceptanceFilesystemErrors(t *testing.T) {
+	testCases := []struct {
+		name       string
+		targetPath string
+		pathErr    error
+		mode       os.FileMode
+		mutate     func(*DeploymentManifest)
+		want       error
+		wantCause  error
+		accepted   bool
+	}{
+		{name: "install root permission", targetPath: "/aifar/apps/app_123", pathErr: os.ErrPermission, want: errAgentStatePersistence, wantCause: os.ErrPermission},
+		{name: "env leaf permission", targetPath: "/aifar/apps/app_123/runtime/env/permission.env", pathErr: os.ErrPermission, want: errAgentStatePersistence, wantCause: os.ErrPermission},
+		{name: "volume parent EIO", targetPath: "/aifar/apps/app_123/runtime/logs", pathErr: &os.PathError{Op: "lstat", Path: "/secret/device", Err: syscall.EIO}, want: errAgentStatePersistence, wantCause: syscall.EIO},
+		{name: "symlink parent", targetPath: "/aifar/apps/app_123/runtime", mode: os.ModeSymlink | 0o777, want: ErrInvalidDeploymentManifest},
+		{name: "non directory parent", targetPath: "/aifar/apps/app_123/runtime", mode: 0o600, want: ErrInvalidDeploymentManifest},
+		{name: "lexical escape", mutate: func(manifest *DeploymentManifest) { manifest.Spec.EnvFiles = []string{"/outside/permission.env"} }, want: ErrInvalidDeploymentManifest},
+		{name: "ENOENT safe suffix", targetPath: "/aifar/apps/app_123/runtime/env/permission.env", pathErr: os.ErrNotExist, accepted: true},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			stateDir := t.TempDir()
+			plainStore := ManifestStore{StateDir: stateDir}
+			if err := plainStore.PutInstance(testInstanceConfig()); err != nil {
+				t.Fatal(err)
+			}
+			observer := func(name string) (os.FileInfo, error) {
+				if tc.targetPath != "" && path.Clean(name) == path.Clean(tc.targetPath) {
+					if tc.pathErr != nil {
+						return nil, tc.pathErr
+					}
+					return fakeManifestFileInfo{name: path.Base(name), mode: tc.mode}, nil
+				}
+				return fakeManifestFileInfo{name: path.Base(name), mode: os.ModeDir | 0o750}, nil
+			}
+			store := &ManifestStore{StateDir: stateDir, manifestPathLstat: observer}
+			manager := NewManager(ManagerOptions{StateDir: stateDir, ManifestStore: store, Runner: &fakeRunner{}})
+			manifest := testManifest("permission", 1, 1)
+			if tc.mutate != nil {
+				tc.mutate(&manifest)
+			}
+			_, acceptErr := manager.AcceptDeployment(context.Background(), manifest)
+			if tc.accepted {
+				if acceptErr != nil {
+					t.Fatalf("safe ENOENT suffix rejected: %v", acceptErr)
+				}
+				return
+			}
+			if acceptErr == nil {
+				t.Fatal("filesystem failure was accepted")
+			}
+			classified := manager.ClassifyDeploymentAcceptanceError(manifest, acceptErr)
+			if !errors.Is(classified, tc.want) {
+				t.Fatalf("classification=%v want errors.Is %v", classified, tc.want)
+			}
+			if tc.wantCause != nil && !errors.Is(classified, tc.wantCause) {
+				t.Fatalf("classification lost operational cause %v: %v", tc.wantCause, classified)
+			}
+		})
+	}
+}
 
 func TestBootstrapRuntimeSplitsLegacySpecWithoutNacos(t *testing.T) {
 	stateDir := t.TempDir()

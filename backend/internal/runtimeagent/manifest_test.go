@@ -9,9 +9,58 @@ import (
 	"reflect"
 	"runtime"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
+
+func TestManifestFilesystemErrorsAreTypedAtSource(t *testing.T) {
+	permissionPath := "/aifar/apps/app_123/runtime/env/permission.env"
+	permissionErr := validateManifestPathComponents(permissionPath, func(name string) (os.FileInfo, error) {
+		if path.Clean(name) == permissionPath {
+			return nil, os.ErrPermission
+		}
+		return fakeManifestFileInfo{name: path.Base(name), mode: os.ModeDir | 0o750}, nil
+	})
+	if !errors.Is(permissionErr, errManifestFilesystemObservation) || !errors.Is(permissionErr, os.ErrPermission) || errors.Is(permissionErr, errUnsafeManifestFilesystemShape) {
+		t.Fatalf("permission error classification=%v", permissionErr)
+	}
+
+	eio := &os.PathError{Op: "lstat", Path: "/redacted/device", Err: syscall.EIO}
+	eioErr := validateManifestPathComponents(permissionPath, func(name string) (os.FileInfo, error) {
+		if path.Clean(name) == "/aifar/apps/app_123/runtime" {
+			return nil, eio
+		}
+		return fakeManifestFileInfo{name: path.Base(name), mode: os.ModeDir | 0o750}, nil
+	})
+	var gotPathError *os.PathError
+	if !errors.Is(eioErr, errManifestFilesystemObservation) || !errors.Is(eioErr, syscall.EIO) || !errors.As(eioErr, &gotPathError) || errors.Is(eioErr, errUnsafeManifestFilesystemShape) {
+		t.Fatalf("EIO error classification=%v", eioErr)
+	}
+
+	for name, mode := range map[string]os.FileMode{"symlink": os.ModeSymlink | 0o777, "non-directory": 0o600} {
+		t.Run(name, func(t *testing.T) {
+			err := validateManifestPathComponents(permissionPath, func(component string) (os.FileInfo, error) {
+				if path.Clean(component) == "/aifar/apps/app_123/runtime" {
+					return fakeManifestFileInfo{name: "runtime", mode: mode}, nil
+				}
+				return fakeManifestFileInfo{name: path.Base(component), mode: os.ModeDir | 0o750}, nil
+			})
+			if !errors.Is(err, errUnsafeManifestFilesystemShape) || errors.Is(err, errManifestFilesystemObservation) {
+				t.Fatalf("unsafe shape classification=%v", err)
+			}
+		})
+	}
+
+	if err := validateManifestPathComponents(permissionPath, func(name string) (os.FileInfo, error) {
+		if path.Clean(name) == permissionPath {
+			return nil, os.ErrNotExist
+		}
+		return fakeManifestFileInfo{name: path.Base(name), mode: os.ModeDir | 0o750}, nil
+	}); err != nil {
+		t.Fatalf("ENOENT safe suffix rejected: %v", err)
+	}
+}
 
 func TestManifestNormalizationKeepsLegacyNacosSeparate(t *testing.T) {
 	legacy := LegacyRuntimeSpec{Nacos: NacosSpec{Namespace: "prod"}}

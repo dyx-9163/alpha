@@ -14,7 +14,11 @@ import (
 	"sync"
 )
 
-var manifestStoreWriteMu sync.Mutex
+var (
+	manifestStoreWriteMu             sync.Mutex
+	errUnsafeManifestFilesystemShape = errors.New("unsafe manifest filesystem shape")
+	errManifestFilesystemObservation = errors.New("manifest filesystem observation failed")
+)
 
 type ManifestStore struct {
 	StateDir          string
@@ -262,13 +266,13 @@ func validateManifestPathComponents(value string, lstat func(string) (os.FileInf
 			return nil
 		}
 		if err != nil {
-			return fmt.Errorf("inspect existing path component: %w", err)
+			return fmt.Errorf("%w: inspect existing path component: %w", errManifestFilesystemObservation, err)
 		}
 		if info.Mode()&os.ModeSymlink != 0 {
-			return errors.New("existing path component must not be a symbolic link")
+			return fmt.Errorf("%w: existing path component must not be a symbolic link", errUnsafeManifestFilesystemShape)
 		}
 		if index < len(components)-1 && !info.IsDir() {
-			return errors.New("existing parent path component must be a directory")
+			return fmt.Errorf("%w: existing parent path component must be a directory", errUnsafeManifestFilesystemShape)
 		}
 	}
 	return nil
