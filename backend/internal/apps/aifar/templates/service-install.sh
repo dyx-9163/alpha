@@ -392,13 +392,6 @@ JSON
   printf "%s" "$spec"
 }
 
-reconcile_runtime() {
-  check_agent_dependency
-  write_desired_replicas_env
-  spec="$(write_runtime_spec)"
-  aifar-agent reconcile-runtime --spec "$spec"
-}
-
 write_model_manifest() {
   mkdir -p "$AIFAR_DIR"
   cat > "$AIFAR_DIR/last-service-install.json" <<JSON
@@ -445,11 +438,6 @@ for service in $NEW_SERVICES; do
   [ -n "$image" ] || fail "service image is empty: $service"
   docker build -t "$image" "$APP_DIR/$service"
 done
-
-if ! reconcile_runtime; then
-  cleanup_failed_service_install
-  fail "AIFAR runtime reconcile failed after service installation"
-fi
 
 open_service_ports $NEW_SERVICES
 

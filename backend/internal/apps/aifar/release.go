@@ -343,15 +343,16 @@ func releaseRoutes(gatewayPort, webPort int) map[string]any {
 
 func releaseOrchestrationMetadata(installRoot, releaseID, ingressNetwork string, gatewayPort, webPort int, services []string) map[string]any {
 	_ = installRoot
+	_ = releaseID
 	services = serviceListOrDefault(services)
 	desired := desiredReplicasForServices(services)
-	activeEndpoints := releaseActiveEndpointsForServices(releaseID, gatewayPort, webPort, services)
+	activeEndpoints := map[string]any{}
 	return map[string]any{
 		"orchestrationModel": orchestrationModelK8sLikeV1,
 		"ingressNetwork":     ingressNetwork,
 		"runtimeService":     "aifar-agent",
 		"activeRoutes":       releaseRoutes(gatewayPort, webPort),
-		"containers":         releaseContainersForServices(releaseID, services),
+		"containers":         map[string]any{},
 		"desiredReplicas":    desired,
 		"activeEndpoints":    activeEndpoints,
 		"activeServices":     activeServicesFromEndpointsForServices(desired, activeEndpoints, services),
@@ -361,13 +362,14 @@ func releaseOrchestrationMetadata(installRoot, releaseID, ingressNetwork string,
 }
 
 func releaseManifestFields(releaseID, ingressNetwork string, gatewayPort, webPort int, services []string) map[string]any {
+	_ = releaseID
 	services = serviceListOrDefault(services)
 	desired := desiredReplicasForServices(services)
-	endpoints := releaseActiveEndpointsForServices(releaseID, gatewayPort, webPort, services)
+	endpoints := map[string]any{}
 	return map[string]any{
 		"orchestrationModel": orchestrationModelK8sLikeV1,
 		"ingressNetwork":     ingressNetwork,
-		"containers":         releaseContainersForServices(releaseID, services),
+		"containers":         map[string]any{},
 		"routes":             releaseRoutes(gatewayPort, webPort),
 		"desiredReplicas":    desired,
 		"endpoints":          endpoints,

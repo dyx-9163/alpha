@@ -17,6 +17,7 @@ import (
 	"aifar-deployment/backend/internal/installer/installerkit"
 	"aifar-deployment/backend/internal/installer/selinux"
 	"aifar-deployment/backend/internal/installer/uploadkit"
+	"aifar-deployment/backend/internal/runtimeagent"
 	"aifar-deployment/backend/internal/store"
 )
 
@@ -74,6 +75,7 @@ func (s Service) InstallServices(ctx context.Context, req InstallServicesRequest
 	var webPort int
 	var script string
 	var serviceDefinitions []serviceDefinition
+	var acceptedRevisions map[string]string
 	var moduleArchiveLocal string
 	var moduleArchiveRemote string
 	var workDir string
@@ -198,6 +200,10 @@ func (s Service) InstallServices(ctx context.Context, req InstallServicesRequest
 			}
 		}
 		_, runErr := installerkit.Run(ctx, s.remote, req.Server, "sh -s <<'AIFAR_SERVICE_INSTALL'\n"+script+"\nAIFAR_SERVICE_INSTALL", logForServer, "AIFAR service installation failed")
+		if runErr != nil {
+			return runErr
+		}
+		acceptedRevisions, runErr = s.acceptInstalledServiceManifests(ctx, req, current, metadata, allServices, missing, serviceDefinitions, releaseID, version, configHash, releaseTime, logForServer)
 		return runErr
 	}); err != nil {
 		finishTarget(recorder, target, "failed", err.Error())
@@ -212,7 +218,7 @@ func (s Service) InstallServices(ctx context.Context, req InstallServicesRequest
 		nextMetadata["releaseCreatedAt"] = releaseTime.Format(time.RFC3339)
 		nextMetadata["configHash"] = configHash
 		nextMetadata["serviceCatalog"] = serviceCatalogMetadataForInstall(serviceDefinitions, gatewayPort, webPort)
-		nextMetadata = serviceInstallOrchestrationMetadata(nextMetadata, installRoot, releaseID, ingressNetwork, gatewayPort, webPort, missing)
+		nextMetadata = serviceInstallOrchestrationMetadata(nextMetadata, installRoot, ingressNetwork, gatewayPort, webPort, missing, acceptedRevisions)
 		nextMetadata["lastServiceInstall"] = map[string]any{
 			"services":    missing,
 			"releaseId":   releaseID,
@@ -225,11 +231,6 @@ func (s Service) InstallServices(ctx context.Context, req InstallServicesRequest
 		next.Version = version
 		if err := saveMetadata(s.store, next, nextMetadata); err != nil {
 			return err
-		}
-		if orch, ok := s.store.(aifarOrchestrationStore); ok {
-			if err := saveControlPlaneRevision(orch, current.ID, version, releaseID, configHash, desiredReplicasFromMetadata(nextMetadata), gatewayPort, webPort, missing, releaseTime, servicePorts(serviceDefinitions)); err != nil {
-				return err
-			}
 		}
 		if releases, ok := s.store.(releaseStore); ok {
 			manifest, _ := json.Marshal(serviceInstallReleaseManifest(version, releaseID, releaseTime, configHash, strings.TrimSpace(req.Reason), missing, nextMetadata))
@@ -260,6 +261,147 @@ func (s Service) InstallServices(ctx context.Context, req InstallServicesRequest
 	logForServer.Info("AIFAR services installed: %s", strings.Join(missing, ", "))
 	finishTarget(recorder, target, "success", "")
 	return nil
+}
+
+func (s Service) acceptInstalledServiceManifests(
+	ctx context.Context,
+	req InstallServicesRequest,
+	current store.AppInstance,
+	metadata map[string]any,
+	allServices, missing []string,
+	definitions []serviceDefinition,
+	revision, version, configHash string,
+	now time.Time,
+	log Logger,
+) (map[string]string, error) {
+	control, controlOK := s.store.(aifarDeploymentControlStore)
+	orch, orchOK := s.store.(aifarOrchestrationStore)
+	if !controlOK || !orchOK {
+		return nil, errors.New("AIFAR per-service deployment control store is unavailable")
+	}
+	deployments, err := control.ListAIFARDeployments(current.ID)
+	if err != nil {
+		return nil, err
+	}
+	byService := make(map[string]store.AIFARDeployment, len(deployments))
+	for _, deployment := range deployments {
+		byService[cleanAIFARServiceName(deployment.ServiceName)] = deployment
+	}
+
+	mutationMetadata := copyMetadata(metadata)
+	mutationMetadata["services"] = allServices
+	mutationMetadata["serviceCatalog"] = serviceCatalogMetadataForInstall(definitions, intFromMetadata(metadata, "gatewayPort", defaultGatewayPort), intFromMetadata(metadata, "webPort", defaultWebPort))
+	mutationInstance := current
+	mutationInstance.Metadata = mustJSONMetadata(mutationMetadata)
+	acceptedRevisions := make(map[string]string, len(missing))
+	for _, serviceName := range missing {
+		deployment, exists := byService[serviceName]
+		if exists && deployment.Generation > 0 && deployment.Status == "Accepted" && deployment.DesiredReplicas == 1 && strings.TrimSpace(deployment.SpecJSON) != "" {
+			acceptedRevisions[serviceName] = deployment.CurrentRevision
+			if err := saveAcceptedServiceReplicaSet(orch, current.ID, serviceName, deployment.CurrentRevision, version, configHash, now); err != nil {
+				return nil, err
+			}
+			continue
+		}
+
+		if exists && deployment.Generation > 0 {
+			if deployment.Status != "pending_acceptance" || strings.TrimSpace(deployment.SpecJSON) == "" {
+				return nil, repairRequired("AIFAR_RUNTIME_INSTALL_RETRY_STATE_INVALID", nil)
+			}
+			accepted, err := s.resumePendingServiceInstall(ctx, req, mutationInstance, deployment, log)
+			if err != nil {
+				return nil, err
+			}
+			byService[serviceName] = accepted
+			acceptedRevisions[serviceName] = accepted.CurrentRevision
+			if err := saveAcceptedServiceReplicaSet(orch, current.ID, serviceName, accepted.CurrentRevision, version, configHash, now); err != nil {
+				return nil, err
+			}
+			continue
+		}
+
+		base := store.AIFARDeployment{
+			InstanceID: current.ID, ServiceName: serviceName, DesiredReplicas: 1,
+			CurrentRevision: revision, Status: "install_prepared", CreatedAt: now,
+		}
+		base, err = orch.SaveAIFARDeployment(base)
+		if err != nil {
+			return nil, err
+		}
+		accepted, err := s.MutateDeployment(ctx, DeploymentMutationRequest{
+			Instance: mutationInstance, Server: req.Server, ServiceName: serviceName,
+			ExpectedGeneration: 0, Actor: req.Actor, TaskID: req.TaskID, Operation: "install-service",
+			Mutate: func(manifest *runtimeagent.DeploymentManifest) error {
+				manifest.Spec.Replicas = 1
+				manifest.Spec.PodRevision = revision
+				manifest.Spec.Image = "aifar-" + serviceName + ":" + revision
+				return nil
+			},
+		}, log)
+		if err != nil {
+			return nil, err
+		}
+		byService[serviceName] = accepted
+		acceptedRevisions[serviceName] = accepted.CurrentRevision
+		if err := saveAcceptedServiceReplicaSet(orch, current.ID, serviceName, accepted.CurrentRevision, version, configHash, now); err != nil {
+			return nil, err
+		}
+	}
+	return acceptedRevisions, nil
+}
+
+func (s Service) resumePendingServiceInstall(ctx context.Context, req InstallServicesRequest, instance store.AppInstance, pending store.AIFARDeployment, log Logger) (store.AIFARDeployment, error) {
+	control := s.store.(aifarDeploymentControlStore)
+	manifest, err := buildRuntimeManifest(instance, pending, pending.Generation)
+	if err != nil {
+		return pending, repairRequired("AIFAR_RUNTIME_MANIFEST_BUILD_FAILED", err)
+	}
+	hash, err := runtimeagent.DeploymentManifestSpecHash(manifest)
+	if err != nil {
+		return pending, repairRequired("AIFAR_RUNTIME_MANIFEST_HASH_FAILED", err)
+	}
+	installRoot := stringFromMetadata(metadataFromInstance(instance), "installRoot", "")
+	acceptance, acceptErr := s.acceptDeployment(ctx, req.Server, manifest, req.TaskID, installRoot)
+	if acceptErr != nil {
+		var typed *deploymentControlError
+		if errors.As(acceptErr, &typed) && typed.ambiguous {
+			state, readErr := s.readDeploymentStateOnce(ctx, req.Server, instance.ID, pending.ServiceName)
+			if readErr != nil || !deploymentStateMatches(state, instance.ID, pending.ServiceName, pending.Generation, hash) {
+				return pending, repairRequired("AIFAR_RUNTIME_AGENT_READBACK_MISMATCH", readErr)
+			}
+			acceptance = runtimeagent.DeploymentAcceptance{Accepted: true, Generation: state.Generation, SpecHash: state.SpecHash}
+		} else {
+			return pending, acceptErr
+		}
+	}
+	if !acceptanceMatches(acceptance, pending.Generation, hash) {
+		return pending, repairRequired("AIFAR_RUNTIME_AGENT_ACCEPTANCE_MISMATCH", nil)
+	}
+	accepted, err := markDeploymentAccepted(control, pending, pending.Generation)
+	if err != nil {
+		return pending, repairRequired("AIFAR_RUNTIME_CONTROL_STORE_ACCEPT_FAILED", err)
+	}
+	if log != nil {
+		log.Info("AIFAR deployment accepted: service=%s generation=%d", pending.ServiceName, pending.Generation)
+	}
+	return accepted, nil
+}
+
+func saveAcceptedServiceReplicaSet(orch aifarOrchestrationStore, instanceID, serviceName, revision, version, configHash string, now time.Time) error {
+	_, err := orch.SaveAIFARReplicaSet(store.AIFARReplicaSet{
+		InstanceID: instanceID, ServiceName: serviceName, Revision: revision,
+		Image: "aifar-" + serviceName + ":" + revision, ArtifactHash: configHash,
+		DesiredPods: 1, ReadyPods: 0, Status: "pending", MetadataJSON: fmt.Sprintf(`{"version":%q}`, version), CreatedAt: now,
+	})
+	if err != nil {
+		return err
+	}
+	return orch.ReplaceAIFARServiceEndpoints(instanceID, serviceName, nil)
+}
+
+func mustJSONMetadata(metadata map[string]any) string {
+	data, _ := json.Marshal(metadata)
+	return string(data)
 }
 
 func serviceInstallSteps() []installStepDef {
@@ -362,7 +504,7 @@ func serviceInstallConfigHash(baseHash string, services []string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-func serviceInstallOrchestrationMetadata(current map[string]any, installRoot, revision, ingressNetwork string, gatewayPort, webPort int, installedServices []string) map[string]any {
+func serviceInstallOrchestrationMetadata(current map[string]any, installRoot, ingressNetwork string, gatewayPort, webPort int, installedServices []string, acceptedRevisions map[string]string) map[string]any {
 	next := copyMetadata(current)
 	existing := servicesFromMetadata(current)
 	allServices := mergeServices(existing, installedServices)
@@ -401,9 +543,9 @@ func serviceInstallOrchestrationMetadata(current map[string]any, installRoot, re
 	}
 	for _, service := range installedServices {
 		desired[service] = 1
-		activeEndpoints[service] = releaseEndpointsForService(service, revision, 1, gatewayPort, webPort)
-		serviceRevisions[service] = revision
-		containers[service] = podContainerName(service, revision, 1)
+		serviceRevisions[service] = acceptedRevisions[service]
+		delete(activeEndpoints, service)
+		delete(containers, service)
 	}
 	next["desiredReplicas"] = desired
 	next["activeEndpoints"] = activeEndpoints

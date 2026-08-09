@@ -2,6 +2,7 @@
 set -eu
 
 INSTALL_ROOT={{ quote .InstallRoot }}
+INSTANCE_ID={{ quote .InstanceID }}
 WORK_DIR={{ quote .WorkDir }}
 ARCHIVE={{ quote .ArchiveRemote }}
 AGENT_BINARY={{ quote .AgentBinaryRemote }}
@@ -153,50 +154,6 @@ require_local_image() {
   docker image inspect "$image" >/dev/null 2>&1 || fail "required offline Docker image is missing after docker load: $image"
 }
 
-tcp_probe() {
-  host="$1"
-  port="$2"
-  if command -v nc >/dev/null 2>&1; then
-    nc -z -w 3 "$host" "$port" >/dev/null 2>&1
-    return $?
-  fi
-  if command -v bash >/dev/null 2>&1; then
-    if command -v timeout >/dev/null 2>&1; then
-      timeout 5 bash -c "</dev/tcp/$host/$port" >/dev/null 2>&1
-      return $?
-    fi
-    bash -c "</dev/tcp/$host/$port" >/dev/null 2>&1
-    return $?
-  fi
-  return 2
-}
-
-http_probe() {
-  url="$1"
-  if command -v curl >/dev/null 2>&1; then
-    curl -fsS --connect-timeout 5 "$url" >/dev/null 2>&1
-    return $?
-  fi
-  if command -v wget >/dev/null 2>&1; then
-    wget -q -T 5 -O /dev/null "$url" >/dev/null 2>&1
-    return $?
-  fi
-  return 2
-}
-
-check_nacos_dependency() {
-  url="http://${NACOS_CONNECT_HOST}:${NACOS_PORT_WEB}/nacos/v1/console/health/readiness"
-  if http_probe "$url"; then
-    echo "Nacos dependency is ready at ${NACOS_CONNECT_HOST}:${NACOS_PORT_WEB}"
-    return 0
-  fi
-  if tcp_probe "$NACOS_CONNECT_HOST" "$NACOS_PORT_WEB"; then
-    echo "Nacos dependency is reachable at ${NACOS_CONNECT_HOST}:${NACOS_PORT_WEB}"
-    return 0
-  fi
-  fail "Nacos dependency readiness check failed at $url"
-}
-
 agent_status_ok() {
   command -v aifar-agent >/dev/null 2>&1 && wait_agent_status
 }
@@ -213,9 +170,9 @@ wait_agent_status() {
 
 agent_has_runtime_features() {
   status="$1"
-  printf "%s" "$status" | grep -q '"reconcile-runtime"' || return 1
-  printf "%s" "$status" | grep -q '"local-runtime-controller"' || return 1
-  printf "%s" "$status" | grep -q '"endpoint-cache"' || return 1
+  for feature in service-manifest-v1 service-generation-v1 per-service-reconcile per-service-restart service-conditions-v1; do
+    printf "%s" "$status" | grep -q "\"$feature\"" || return 1
+  done
   return 0
 }
 
@@ -493,7 +450,7 @@ write_runtime_spec() {
   cat > "$spec" <<JSON
 {
   "version": "runtime-v2",
-  "instanceId": "admin",
+  "instanceId": "${INSTANCE_ID}",
   "installRoot": "${INSTALL_ROOT}",
   "network": "${INGRESS_NETWORK}",
   "deployments": [
@@ -580,59 +537,42 @@ JSON
   printf "%s" "$spec"
 }
 
-reconcile_runtime() {
+readback_bootstrap_acceptance() {
+  response='{"accepted":true,"instanceId":"'"$INSTANCE_ID"'","deployments":['
+  separator=""
+  for service in $SERVICE_ORDER; do
+    state="$(aifar-agent get-deployment --instance "$INSTANCE_ID" --service "$service" 2>/dev/null)" || return 1
+    generation="$(printf "%s" "$state" | sed -n 's/.*"generation":\([0-9][0-9]*\).*/\1/p')"
+    spec_hash="$(printf "%s" "$state" | sed -n 's/.*"specHash":"\([0-9a-f][0-9a-f]*\)".*/\1/p')"
+    [ "$generation" = "1" ] || return 1
+    [ "${#spec_hash}" -eq 64 ] || return 1
+    case "$spec_hash" in *[!0-9a-f]*) return 1 ;; esac
+    response="${response}${separator}{\"accepted\":true,\"generation\":1,\"specHash\":\"${spec_hash}\"}"
+    separator=,
+  done
+  printf '%s]}' "$response"
+}
+
+accept_runtime_manifests() {
   check_agent_dependency
   spec="$(write_runtime_spec)"
-  echo "reconciling AIFAR runtime through aifar-agent: $spec"
-  aifar-agent reconcile-runtime --spec "$spec"
-  wait_runtime_pods
-  wait_runtime_ports
-}
-
-wait_runtime_pods() {
-  expected=0
+  if acceptance="$(aifar-agent bootstrap-runtime --spec "$spec" 2>/dev/null)"; then
+    :
+  else
+    acceptance="$(readback_bootstrap_acceptance)" || fail "aifar-agent could not persist the runtime Manifests"
+  fi
+  printf "%s" "$acceptance" | grep -q '^{' || fail "aifar-agent bootstrap acceptance is invalid"
+  printf "%s" "$acceptance" | grep -q '"accepted":true' || fail "aifar-agent rejected the runtime Manifests"
+  printf "%s" "$acceptance" | grep -q '"instanceId":"'"$INSTANCE_ID"'"' || fail "aifar-agent bootstrap acceptance identity is invalid"
   for service in $SERVICE_ORDER; do
-    [ -f "$ENV_DIR/$service.env" ] && expected=$((expected + 1))
+    state="$(aifar-agent get-deployment --instance "$INSTANCE_ID" --service "$service" 2>/dev/null)" || fail "aifar-agent deployment acceptance readback failed: $service"
+    printf "%s" "$state" | grep -q '"generation":1' || fail "aifar-agent deployment generation is invalid: $service"
+    spec_hash="$(printf "%s" "$state" | sed -n 's/.*"specHash":"\([0-9a-f][0-9a-f]*\)".*/\1/p')"
+    [ "${#spec_hash}" -eq 64 ] || fail "aifar-agent deployment spec hash is invalid: $service"
+    case "$spec_hash" in *[!0-9a-f]*) fail "aifar-agent deployment spec hash is invalid: $service" ;; esac
   done
-  [ "$expected" -gt 0 ] || fail "AIFAR runtime has no selected services"
-  for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
-    count="$(docker ps -a \
-      --filter "label=aifar.app=aifar" \
-      --filter "label=aifar.install-root=$INSTALL_ROOT" \
-      --filter "label=aifar.component=pod" \
-      --filter "label=aifar.revision=$REVISION" \
-      --format '{{ "{{" }}.Names{{ "}}" }}' 2>/dev/null | wc -l | tr -d ' ')"
-    if [ "${count:-0}" -ge "$expected" ]; then
-      echo "AIFAR runtime Pod containers are present: $count/$expected"
-      return 0
-    fi
-    sleep 3
-  done
-  echo "AIFAR runtime Pod containers are missing after reconcile"
-  docker ps -a \
-    --filter "label=aifar.app=aifar" \
-    --filter "label=aifar.install-root=$INSTALL_ROOT" \
-    --filter "label=aifar.component=pod" \
-    --format 'table {{ "{{" }}.Names{{ "}}" }}\t{{ "{{" }}.Status{{ "}}" }}\t{{ "{{" }}.Image{{ "}}" }}' || true
-  aifar-agent status || true
-  $SUDO systemctl --no-pager --full status aifar-agent || true
-  $SUDO journalctl -u aifar-agent -n 120 --no-pager || true
-  return 1
-}
-
-wait_runtime_ports() {
-  for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do
-    if tcp_probe 127.0.0.1 "$GATEWAY_PORT" && tcp_probe 127.0.0.1 "$WEB_VUE3_PORT"; then
-      echo "AIFAR runtime ports are listening: gateway=$GATEWAY_PORT web=$WEB_VUE3_PORT"
-      return 0
-    fi
-    sleep 1
-  done
-  echo "AIFAR runtime ports are not listening after reconcile"
-  aifar-agent status || true
-  $SUDO systemctl --no-pager --full status aifar-agent || true
-  $SUDO journalctl -u aifar-agent -n 80 --no-pager || true
-  return 1
+  rm -f "$spec"
+  printf 'AIFAR_BOOTSTRAP_ACCEPTANCE=%s\n' "$acceptance"
 }
 
 write_model_manifest() {
@@ -652,10 +592,7 @@ JSON
 
 cleanup_failed_install() {
   [ "$INSTALL_SUCCEEDED" = "1" ] && return 0
-  pods="$(docker ps -a --filter "label=aifar.app=aifar" --filter "label=aifar.install-root=$INSTALL_ROOT" --filter "label=aifar.component=pod" --filter "label=aifar.revision=$REVISION" --format '{{ "{{" }}.Names{{ "}}" }}' 2>/dev/null || true)"
-  [ -z "$pods" ] || docker rm -f $pods >/dev/null 2>&1 || true
   rm -f "$AGENT_DIR/runtime-spec.json" >/dev/null 2>&1 || true
-  command -v aifar-agent >/dev/null 2>&1 && aifar-agent remove-instance --instance admin >/dev/null 2>&1 || true
   rm -rf "$TMP_DIR" >/dev/null 2>&1 || true
 }
 
@@ -681,7 +618,6 @@ cp "$TMP_DIR/manifest.json" "$RUNTIME_DIR/manifest.json"
 rm -rf "$TMP_DIR"
 
 trap 'cleanup_failed_install' EXIT INT TERM
-check_nacos_dependency
 resolve_system_timezone
 write_compose_env
 write_java_env
@@ -693,11 +629,9 @@ require_local_image "bellsoft/liberica-openjre-rocky:21"
 require_local_image "nginx:stable-alpine"
 ensure_network
 build_images
-
-reconcile_runtime
-
 open_service_ports $SERVICE_ORDER
 write_model_manifest
+accept_runtime_manifests
 INSTALL_SUCCEEDED=1
 trap - EXIT INT TERM
 echo "AIFAR k8s-like orchestration installed, revision $REVISION"

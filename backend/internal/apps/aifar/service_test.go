@@ -24,22 +24,24 @@ import (
 
 	"aifar-deployment/backend/internal/adapter"
 	"aifar-deployment/backend/internal/apps/registry"
+	"aifar-deployment/backend/internal/runtimeagent"
 	"aifar-deployment/backend/internal/store"
 	"aifar-deployment/backend/internal/worker"
 )
 
 type fakeStore struct {
-	mu          sync.Mutex
-	servers     map[string]store.Server
-	instances   []store.AppInstance
-	tasks       map[string]store.Task
-	releases    []store.AppRelease
-	deployments []store.AIFARDeployment
-	replicaSets []store.AIFARReplicaSet
-	pods        []store.AIFARPod
-	endpoints   []store.AIFARServiceEndpoint
-	saveCalls   int
-	failSaveOn  int
+	mu                        sync.Mutex
+	servers                   map[string]store.Server
+	instances                 []store.AppInstance
+	tasks                     map[string]store.Task
+	releases                  []store.AppRelease
+	deployments               []store.AIFARDeployment
+	replicaSets               []store.AIFARReplicaSet
+	pods                      []store.AIFARPod
+	endpoints                 []store.AIFARServiceEndpoint
+	saveCalls                 int
+	failSaveOn                int
+	directDeploymentSaveCalls int
 }
 
 type rollbackLockRaceStore struct {
@@ -217,6 +219,7 @@ func (f *fakeStore) DeleteOldAppReleases(instanceID string, keep int) (int, erro
 func (f *fakeStore) SaveAIFARDeployment(v store.AIFARDeployment) (store.AIFARDeployment, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.directDeploymentSaveCalls++
 	if v.ID == "" {
 		v.ID = store.NewID("aifardeploy")
 	}
@@ -228,6 +231,53 @@ func (f *fakeStore) SaveAIFARDeployment(v store.AIFARDeployment) (store.AIFARDep
 	}
 	f.deployments = append(f.deployments, v)
 	return v, nil
+}
+
+func (f *fakeStore) SaveAIFARDeploymentGeneration(next store.AIFARDeployment, expectedGeneration int64) (store.AIFARDeployment, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for idx, current := range f.deployments {
+		if current.InstanceID != next.InstanceID || current.ServiceName != next.ServiceName {
+			continue
+		}
+		if current.Generation != expectedGeneration {
+			return current, store.ErrAIFARDeploymentGenerationConflict
+		}
+		next.ID = current.ID
+		next.CreatedAt = current.CreatedAt
+		next.Generation = expectedGeneration + 1
+		next.ObservedGeneration = 0
+		f.deployments[idx] = next
+		return next, nil
+	}
+	if expectedGeneration != 0 {
+		return store.AIFARDeployment{}, store.ErrAIFARDeploymentNotFound
+	}
+	next.ID = store.NewID("aifardeploy")
+	next.Generation = 1
+	next.ObservedGeneration = 0
+	next.CreatedAt = time.Now().UTC()
+	f.deployments = append(f.deployments, next)
+	return next, nil
+}
+
+func (f *fakeStore) AcceptAIFARDeployment(instanceID, serviceName string, generation int64, status, conditionsJSON string, at time.Time) (store.AIFARDeployment, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for idx, current := range f.deployments {
+		if current.InstanceID != instanceID || current.ServiceName != serviceName {
+			continue
+		}
+		if current.Generation != generation {
+			return current, store.ErrAIFARDeploymentGenerationConflict
+		}
+		current.Status = status
+		current.ConditionsJSON = conditionsJSON
+		current.LastTransitionAt = at
+		f.deployments[idx] = current
+		return current, nil
+	}
+	return store.AIFARDeployment{}, store.ErrAIFARDeploymentNotFound
 }
 
 func (f *fakeStore) ListAIFARDeployments(instanceID string) ([]store.AIFARDeployment, error) {
@@ -516,6 +566,11 @@ type fakeRemote struct {
 	runtimePodScanStdout    string
 	runtimeAgentUninstall   string
 	runtimeAgentCheckStdout string
+	installStdout           string
+	deploymentManifests     map[string]runtimeagent.DeploymentManifest
+	deploymentStates        map[string]runtimeagent.DeploymentState
+	deploymentApplyFailures map[string]int
+	deploymentApplyCounts   map[string]int
 	statusStdout            string
 	autoscaleStatusStdouts  []string
 	autoscaleStatusFallback string
@@ -544,6 +599,49 @@ func (f *fakeRemote) Run(ctx context.Context, server store.Server, command strin
 	}
 	if f.failCommandContains != "" && strings.Contains(command, f.failCommandContains) {
 		return adapter.CommandResult{}, errors.New("remote install failed")
+	}
+	if strings.Contains(command, "install-aifar.sh") {
+		stdout := f.installStdout
+		if stdout == "" {
+			stdout = fakeBootstrapAcceptanceOutput(f.installScript)
+		}
+		return adapter.CommandResult{Stdout: stdout}, nil
+	}
+	if strings.Contains(command, "aifar-agent apply-deployment --manifest") {
+		for remotePath, manifest := range f.deploymentManifests {
+			if !strings.Contains(command, remotePath) {
+				continue
+			}
+			serviceName := manifest.Metadata.Name
+			if f.deploymentApplyCounts == nil {
+				f.deploymentApplyCounts = map[string]int{}
+			}
+			f.deploymentApplyCounts[serviceName]++
+			if f.deploymentApplyFailures[serviceName] > 0 {
+				f.deploymentApplyFailures[serviceName]--
+				return adapter.CommandResult{}, errors.New("agent state persistence failed")
+			}
+			hash, _ := runtimeagent.DeploymentManifestSpecHash(manifest)
+			if f.deploymentStates == nil {
+				f.deploymentStates = map[string]runtimeagent.DeploymentState{}
+			}
+			f.deploymentStates[serviceName] = runtimeagent.DeploymentState{
+				InstanceID: manifest.Metadata.InstanceID, ServiceName: serviceName,
+				Generation: manifest.Metadata.Generation, SpecHash: hash,
+				DesiredReplicas: manifest.Spec.Replicas,
+			}
+			data, _ := json.Marshal(runtimeagent.DeploymentAcceptance{Accepted: true, Generation: manifest.Metadata.Generation, SpecHash: hash})
+			return adapter.CommandResult{Stdout: string(data)}, nil
+		}
+	}
+	if strings.Contains(command, "aifar-agent get-deployment") {
+		for serviceName, state := range f.deploymentStates {
+			if strings.Contains(command, serviceName) {
+				data, _ := json.Marshal(state)
+				return adapter.CommandResult{Stdout: string(data)}, nil
+			}
+		}
+		return adapter.CommandResult{}, errors.New("deployment not found")
 	}
 	if strings.Contains(command, "AIFAR_AGENT_CHECK") && f.runtimeAgentCheckStdout != "" {
 		return adapter.CommandResult{Stdout: f.runtimeAgentCheckStdout}, nil
@@ -583,10 +681,43 @@ func (f *fakeRemote) Run(ctx context.Context, server store.Server, command strin
 	return adapter.CommandResult{Stdout: "ok"}, nil
 }
 
+func fakeBootstrapAcceptanceOutput(script string) string {
+	assignment := func(key string) string {
+		for _, line := range strings.Split(script, "\n") {
+			if strings.HasPrefix(line, key+"=") {
+				return strings.Trim(strings.TrimSpace(strings.TrimPrefix(line, key+"=")), "'")
+			}
+		}
+		return ""
+	}
+	services := strings.Fields(assignment("SERVICE_ORDER"))
+	deployments := make([]runtimeagent.DeploymentAcceptance, 0, len(services))
+	for _, serviceName := range services {
+		sum := sha256.Sum256([]byte(serviceName))
+		deployments = append(deployments, runtimeagent.DeploymentAcceptance{Accepted: true, Generation: 1, SpecHash: hex.EncodeToString(sum[:])})
+	}
+	data, _ := json.Marshal(runtimeagent.LegacyBootstrapAcceptance{Accepted: true, InstanceID: assignment("INSTANCE_ID"), Deployments: deployments})
+	return bootstrapAcceptanceMarker + string(data)
+}
+
 func (f *fakeRemote) UploadFile(ctx context.Context, server store.Server, localPath, remotePath string, mode os.FileMode) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.uploads = append(f.uploads, filepath.Base(localPath)+"->"+remotePath)
+	if strings.Contains(remotePath, "/mutations/") && strings.HasSuffix(remotePath, ".json") {
+		data, err := os.ReadFile(localPath)
+		if err != nil {
+			return err
+		}
+		var manifest runtimeagent.DeploymentManifest
+		if err := json.Unmarshal(data, &manifest); err != nil {
+			return err
+		}
+		if f.deploymentManifests == nil {
+			f.deploymentManifests = map[string]runtimeagent.DeploymentManifest{}
+		}
+		f.deploymentManifests[remotePath] = manifest
+	}
 	if strings.HasSuffix(remotePath, "/install-aifar.sh") {
 		content, err := os.ReadFile(localPath)
 		if err != nil {
@@ -2074,13 +2205,13 @@ func TestServiceInstallsAIFARServiceFromRuntimeV2Bundle(t *testing.T) {
 	if metadata["runtimeSpecPath"] != "/aifar/apps/admin/runtime/agent/runtime-spec.json" {
 		t.Fatalf("expected canonical runtime spec path, got %s", instance.Metadata)
 	}
-	if metadata["orchestrationModel"] != orchestrationModelK8sLikeV1 || !strings.Contains(instance.Metadata, "agent-proxy") || strings.Contains(instance.Metadata, "aifar-svc-admin-gateway") || !strings.Contains(instance.Metadata, "aifar-pod-admin-gateway") {
-		t.Fatalf("expected k8s-like agent proxy and pod metadata, got %s", instance.Metadata)
+	if metadata["orchestrationModel"] != orchestrationModelK8sLikeV1 || !strings.Contains(instance.Metadata, "agent-proxy") || strings.Contains(instance.Metadata, "aifar-svc-admin-gateway") || strings.Contains(instance.Metadata, "aifar-pod-admin-gateway") {
+		t.Fatalf("expected k8s-like agent proxy without fabricated pod metadata, got %s", instance.Metadata)
 	}
 	if len(s.releases) != 1 || s.releases[0].InstanceID != instance.ID || s.releases[0].Status != "success" {
 		t.Fatalf("expected one recorded release, got %+v", s.releases)
 	}
-	if len(s.deployments) != len(serviceOrder) || len(s.replicaSets) != len(serviceOrder) || len(s.pods) != len(serviceOrder) || len(s.endpoints) != len(serviceOrder) {
+	if len(s.deployments) != len(serviceOrder) || len(s.replicaSets) != len(serviceOrder) || len(s.pods) != 0 || len(s.endpoints) != 0 {
 		t.Fatalf("expected AIFAR control plane rows for every service, deployments=%d replicaSets=%d pods=%d endpoints=%d", len(s.deployments), len(s.replicaSets), len(s.pods), len(s.endpoints))
 	}
 	if metadata["nacosEndpoint"] != "10.0.0.50:8848" || metadata["nacosHost"] != "10.0.0.50" || int(metadata["nacosPort"].(float64)) != 8848 {
@@ -2095,7 +2226,7 @@ func TestServiceInstallsAIFARServiceFromRuntimeV2Bundle(t *testing.T) {
 		`ExecStopPost=-/usr/local/bin/aifar-agent deregister-nacos --state-dir /var/lib/aifar-agent/instances`,
 		`systemctl $agent_start_cmd aifar-agent`,
 		`agent_has_runtime_features`,
-		`"local-runtime-controller"`,
+		`service-manifest-v1`,
 		`RUNTIME_DIR="$INSTALL_ROOT/runtime"`,
 		`APP_DIR="$RUNTIME_DIR/services"`,
 		`IMAGE_DIR="$RUNTIME_DIR/images"`,
@@ -2107,14 +2238,9 @@ func TestServiceInstallsAIFARServiceFromRuntimeV2Bundle(t *testing.T) {
 		`check_agent_dependency`,
 		`agent_runtime_status="$(aifar-agent status 2>/dev/null)"`,
 		`SPRING_CLOUD_NACOS_DISCOVERY_REGISTER_ENABLED "false"`,
-		`reconcile_runtime`,
-		`aifar-agent reconcile-runtime --spec "$spec"`,
-		`wait_runtime_pods`,
-		`AIFAR runtime Pod containers are present`,
-		`wait_runtime_ports`,
-		`tcp_probe 127.0.0.1 "$GATEWAY_PORT"`,
-		`tcp_probe 127.0.0.1 "$WEB_VUE3_PORT"`,
-		`AIFAR runtime ports are listening`,
+		`aifar-agent bootstrap-runtime --spec "$spec"`,
+		`aifar-agent get-deployment --instance "$INSTANCE_ID" --service "$service"`,
+		`AIFAR_BOOTSTRAP_ACCEPTANCE`,
 		`runtime-spec.json`,
 		`"version": "runtime-v2"`,
 		`"deployments": [`,
@@ -2182,13 +2308,6 @@ func TestServiceInstallsAIFARServiceFromRuntimeV2Bundle(t *testing.T) {
 		t.Fatalf("AIFAR install script should load offline Docker base images before build:\n%s", remote.installScript)
 	}
 	for _, want := range []string{
-		"check_nacos_dependency",
-	} {
-		if !strings.Contains(remote.installScript, want) {
-			t.Fatalf("AIFAR install script should include dependency checks with %q:\n%s", want, remote.installScript)
-		}
-	}
-	for _, want := range []string{
 		`set_env NACOS_HOST "${NACOS_CONNECT_HOST}:${NACOS_PORT_WEB}" "$common_env"`,
 		`set_env NACOS_PASSWORD "$NACOS_PASSWORD" "$secrets_env"`,
 	} {
@@ -2230,6 +2349,142 @@ func TestServiceInstallsAIFARServiceFromRuntimeV2Bundle(t *testing.T) {
 	}
 }
 
+func TestInstallSucceedsAfterManifestAcceptanceWithoutObservedRuntime(t *testing.T) {
+	withFakeRuntimeAgentBinary(t)
+	root := createAIFARBundle(t)
+	instanceID := "install-boundary"
+	previous := store.AppInstance{
+		ID: instanceID, App: AppName, Version: appBundleVersion, ServerID: "srv-1", Status: "install_failed",
+		Metadata: `{"installRoot":"/aifar/apps/admin","installState":"install_failed"}`,
+	}
+	s := &fakeStore{
+		servers:   map[string]store.Server{"srv-1": {ID: "srv-1", Host: "10.0.0.10", DeployDir: "/aifar/apps"}},
+		instances: []store.AppInstance{previous},
+	}
+	acceptance, err := json.Marshal(runtimeagent.LegacyBootstrapAcceptance{
+		Accepted:   true,
+		InstanceID: instanceID,
+		Deployments: []runtimeagent.DeploymentAcceptance{
+			{Accepted: true, Generation: 1, SpecHash: strings.Repeat("a", 64)},
+			{Accepted: true, Generation: 1, SpecHash: strings.Repeat("b", 64)},
+			{Accepted: true, Generation: 1, SpecHash: strings.Repeat("c", 64)},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	remote := &fakeRemote{installStdout: "AIFAR_BOOTSTRAP_ACCEPTANCE=" + string(acceptance)}
+	service := NewService(s, remote)
+	err = service.Install(context.Background(), InstallRequest{
+		Version: "latest", ServerID: "srv-1", Language: "en",
+		Parameters: map[string]any{"nacosHost": "10.0.0.50", "selectedServices": []string{"gateway", "permission", "web-vue3"}},
+	}, []store.Resource{{App: AppName, Part: "backend", Version: appBundleVersion, Path: filepath.Join(root, appBundleVersion, bundleManifestName)}}, fakeLogger{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := s.instances[0].Status; got != "installed" {
+		t.Fatalf("status=%s, want installed", got)
+	}
+	if len(s.deployments) != 3 || len(s.replicaSets) != 3 {
+		t.Fatalf("deployments=%d replicaSets=%d, want 3 each", len(s.deployments), len(s.replicaSets))
+	}
+	for _, deployment := range s.deployments {
+		if deployment.Generation != 1 || deployment.ObservedGeneration != 0 || deployment.Status != "Accepted" || deployment.SpecJSON == "" {
+			t.Fatalf("deployment must be accepted desired state without an observation: %+v", deployment)
+		}
+	}
+	for _, replicaSet := range s.replicaSets {
+		if replicaSet.DesiredPods != 1 || replicaSet.ReadyPods != 0 {
+			t.Fatalf("replicaSet must start at desired=1 ready=0: %+v", replicaSet)
+		}
+	}
+	if len(s.pods) != 0 || len(s.endpoints) != 0 {
+		t.Fatalf("install acceptance must not invent Pods or Endpoints: pods=%d endpoints=%d", len(s.pods), len(s.endpoints))
+	}
+	if s.directDeploymentSaveCalls != len(s.deployments) {
+		t.Fatalf("accepted deployments must not be overwritten by a stale direct save: direct saves=%d deployments=%d", s.directDeploymentSaveCalls, len(s.deployments))
+	}
+	for _, forbidden := range []string{"reconcile_runtime", "wait_runtime_pods", "wait_runtime_ports", "check_nacos_dependency"} {
+		if strings.Contains(remote.installScript, forbidden+"\n") || strings.Contains(remote.installScript, forbidden+" ") {
+			t.Fatalf("install script must not execute readiness gate %q", forbidden)
+		}
+	}
+	for _, required := range []string{"aifar-agent bootstrap-runtime --spec", "AIFAR_BOOTSTRAP_ACCEPTANCE", `"generation":1`, `"specHash"`} {
+		if !strings.Contains(remote.installScript, required) {
+			t.Fatalf("install script must validate manifest acceptance with %q", required)
+		}
+	}
+	if !strings.Contains(remote.installScript, `rm -f "$spec"`) {
+		t.Fatal("install script must remove the temporary aggregate bootstrap spec after acceptance")
+	}
+}
+
+func TestInstallRetryReusesPendingBootstrapRevision(t *testing.T) {
+	withFakeRuntimeAgentBinary(t)
+	root := createAIFARBundle(t)
+	s := &fakeStore{servers: map[string]store.Server{
+		"srv-1": {ID: "srv-1", Host: "10.0.0.10", DeployDir: "/aifar/apps"},
+	}}
+	remote := &fakeRemote{installStdout: `AIFAR_BOOTSTRAP_ACCEPTANCE={"accepted":true,"instanceId":"wrong-instance","deployments":[{"accepted":true,"generation":1,"specHash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]}`}
+	service := NewService(s, remote)
+	req := InstallRequest{
+		Version: "latest", ServerID: "srv-1", Language: "en",
+		Parameters: map[string]any{"nacosHost": "10.0.0.50", "selectedServices": []string{"gateway"}},
+	}
+	resources := []store.Resource{{App: AppName, Part: "backend", Version: appBundleVersion, Path: filepath.Join(root, appBundleVersion, bundleManifestName)}}
+	if err := service.Install(context.Background(), req, resources, fakeLogger{}, nil); err == nil {
+		t.Fatal("first install must fail when the bootstrap response cannot be associated with the instance")
+	}
+	if len(s.deployments) == 0 {
+		t.Fatal("first attempt must retain pending generations")
+	}
+	pendingRevision := s.deployments[0].CurrentRevision
+	for _, deployment := range s.deployments {
+		if deployment.Generation != 1 || deployment.Status != "pending_acceptance" || deployment.CurrentRevision != pendingRevision {
+			t.Fatalf("first attempt must retain one atomic pending revision: %+v", s.deployments)
+		}
+	}
+	failedMetadata := metadataFromInstance(s.instances[0])
+	if got := stringFromMetadata(failedMetadata, "releaseId", ""); got != pendingRevision {
+		t.Fatalf("failed install releaseId=%q, want pending revision %q", got, pendingRevision)
+	}
+
+	remote.installStdout = ""
+	if err := service.Install(context.Background(), req, resources, fakeLogger{}, nil); err != nil {
+		t.Fatal(err)
+	}
+	for _, deployment := range s.deployments {
+		if deployment.Generation != 1 || deployment.CurrentRevision != pendingRevision || deployment.Status != "Accepted" {
+			t.Fatalf("retry must accept the original pending generation and revision: %+v", deployment)
+		}
+	}
+	installedMetadata := metadataFromInstance(s.instances[0])
+	if got := stringFromMetadata(installedMetadata, "releaseId", ""); got != pendingRevision {
+		t.Fatalf("installed releaseId=%q, want retried revision %q", got, pendingRevision)
+	}
+}
+
+func TestInstallFailsWhenBootstrapAcceptanceIsInvalid(t *testing.T) {
+	withFakeRuntimeAgentBinary(t)
+	root := createAIFARBundle(t)
+	s := &fakeStore{
+		servers:   map[string]store.Server{"srv-1": {ID: "srv-1", Host: "10.0.0.10", DeployDir: "/aifar/apps"}},
+		instances: []store.AppInstance{{ID: "invalid-acceptance", App: AppName, ServerID: "srv-1", Status: "install_failed", Metadata: `{"installRoot":"/aifar/apps/admin","installState":"install_failed"}`}},
+	}
+	err := NewService(s, &fakeRemote{installStdout: `AIFAR_BOOTSTRAP_ACCEPTANCE={"accepted":true,"instanceId":"invalid-acceptance","deployments":[{"accepted":true,"generation":1,"specHash":"short"}]}`}).Install(
+		context.Background(),
+		InstallRequest{Version: "latest", ServerID: "srv-1", Language: "en", Parameters: map[string]any{"nacosHost": "10.0.0.50", "selectedServices": []string{"gateway"}}},
+		[]store.Resource{{App: AppName, Part: "backend", Version: appBundleVersion, Path: filepath.Join(root, appBundleVersion, bundleManifestName)}},
+		fakeLogger{}, nil,
+	)
+	if err == nil {
+		t.Fatal("invalid Agent acceptance must fail installation")
+	}
+	if got := s.instances[0].Status; got != "install_failed" {
+		t.Fatalf("status=%s, want install_failed", got)
+	}
+}
+
 func TestServiceMarksAIFARInstallFailedWhenRemoteDeployFails(t *testing.T) {
 	withFakeRuntimeAgentBinary(t)
 	root := createAIFARBundle(t)
@@ -2260,8 +2515,8 @@ func TestServiceMarksAIFARInstallFailedWhenRemoteDeployFails(t *testing.T) {
 	if !aifarInstallFailedInstance(instance, metadata) || metadata["installState"] != "install_failed" || metadata["runtimeSpecPath"] != "/aifar/apps/admin/runtime/agent/runtime-spec.json" {
 		t.Fatalf("expected failed install metadata with runtime spec path, got %s", instance.Metadata)
 	}
-	if len(s.releases) != 0 || len(s.deployments) != 0 || len(s.replicaSets) != 0 || len(s.pods) != 0 || len(s.endpoints) != 0 {
-		t.Fatalf("failed install must not record successful release/control plane rows, releases=%d deployments=%d replicaSets=%d pods=%d endpoints=%d", len(s.releases), len(s.deployments), len(s.replicaSets), len(s.pods), len(s.endpoints))
+	if len(s.releases) != 0 || len(s.deployments) != len(serviceOrder) || len(s.replicaSets) != len(serviceOrder) || len(s.pods) != 0 || len(s.endpoints) != 0 {
+		t.Fatalf("failed Agent acceptance must retain pending desired state without observed runtime, releases=%d deployments=%d replicaSets=%d pods=%d endpoints=%d", len(s.releases), len(s.deployments), len(s.replicaSets), len(s.pods), len(s.endpoints))
 	}
 }
 
@@ -2310,7 +2565,7 @@ func TestServiceInstallsSelectedAIFARModules(t *testing.T) {
 	if len(s.releases) != 1 {
 		t.Fatalf("expected one recorded release, got %+v", s.releases)
 	}
-	if len(s.deployments) != 3 || len(s.replicaSets) != 3 || len(s.pods) != 3 || len(s.endpoints) != 3 {
+	if len(s.deployments) != 3 || len(s.replicaSets) != 3 || len(s.pods) != 0 || len(s.endpoints) != 0 {
 		t.Fatalf("expected control plane rows only for selected services, deployments=%d replicaSets=%d pods=%d endpoints=%d", len(s.deployments), len(s.replicaSets), len(s.pods), len(s.endpoints))
 	}
 	manifest := map[string]any{}
@@ -2361,7 +2616,6 @@ func TestServiceInstallsMissingAIFARModulesAfterInitialInstall(t *testing.T) {
 		`NEW_SERVICES='file system'`,
 		`SERVICE_ORDER='file gateway system web-vue3'`,
 		`docker build -t "$image" "$APP_DIR/$service"`,
-		`aifar-agent reconcile-runtime --spec "$spec"`,
 		`open_service_ports $NEW_SERVICES`,
 		`allow_selinux_ports http_port_t $ports`,
 		`trap 'cleanup_failed_service_install' EXIT INT TERM`,
@@ -2399,11 +2653,81 @@ func TestServiceInstallsMissingAIFARModulesAfterInitialInstall(t *testing.T) {
 	if _, ok := desired["oauth"]; ok {
 		t.Fatalf("metadata should not add uninstalled oauth desired replica: %#v", desired)
 	}
-	if len(s.deployments) != 2 || len(s.replicaSets) != 2 || len(s.pods) != 2 || len(s.endpoints) != 2 {
+	if len(s.deployments) != 2 || len(s.replicaSets) != 2 || len(s.pods) != 0 || len(s.endpoints) != 0 {
 		t.Fatalf("expected control-plane rows for two newly installed services, deployments=%d replicaSets=%d pods=%d endpoints=%d", len(s.deployments), len(s.replicaSets), len(s.pods), len(s.endpoints))
 	}
 	if len(s.releases) != 1 || !strings.Contains(s.releases[0].ManifestJSON, `"kind":"service-install"`) || !strings.Contains(s.releases[0].ManifestJSON, `"installedServices":["file","system"]`) {
 		t.Fatalf("expected service-install release manifest, got %+v", s.releases)
+	}
+}
+
+func TestInstallServicesRetryKeepsAcceptedPeerGeneration(t *testing.T) {
+	instance := installedAIFARInstance(t)
+	metadata := metadataFromInstance(instance)
+	initialServices := []string{"gateway", "web-vue3"}
+	metadata["services"] = initialServices
+	metadata["serviceCatalog"] = serviceCatalogMetadataForInstall(legacyServiceDefinitions(), defaultGatewayPort, defaultWebPort)
+	instance.Metadata = mustMetadata(t, metadata)
+	base := &fakeStore{
+		servers:   map[string]store.Server{"srv-1": {ID: "srv-1", Host: "10.0.0.10", DeployDir: "/aifar/apps"}},
+		instances: []store.AppInstance{instance},
+	}
+	bundleParent := createAIFARBundle(t)
+	s := &resourceFakeStore{fakeStore: base, resources: []store.Resource{{App: AppName, Part: "backend", Version: appBundleVersion, Path: filepath.Join(bundleParent, appBundleVersion, bundleManifestName)}}}
+	remote := &fakeRemote{deploymentApplyFailures: map[string]int{"system": 1}}
+	service := NewService(s, remote)
+	req := InstallServicesRequest{
+		Instance: instance, Server: s.servers["srv-1"], Language: "en", Actor: "admin", TaskID: "install-services-retry",
+		Services: []string{"file", "system"}, Reason: "complete missing services",
+	}
+	if err := service.InstallServices(context.Background(), req, fakeLogger{}, nil); err == nil {
+		t.Fatal("first install-services attempt must fail when system Manifest persistence fails")
+	}
+	deployments, err := s.ListAIFARDeployments(instance.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byService := map[string]store.AIFARDeployment{}
+	for _, deployment := range deployments {
+		byService[deployment.ServiceName] = deployment
+	}
+	if got := byService["file"]; got.Generation != 1 || got.Status != "Accepted" {
+		t.Fatalf("accepted file peer must be retained at generation 1: %+v", got)
+	}
+	if got := byService["system"]; got.Generation != 1 || got.Status != "pending_acceptance" {
+		t.Fatalf("failed system target must retain its generation-1 pending Manifest: %+v", got)
+	}
+	if remote.deploymentApplyCounts["file"] != 1 || remote.deploymentApplyCounts["system"] != 1 {
+		t.Fatalf("unexpected first apply counts: %+v", remote.deploymentApplyCounts)
+	}
+
+	if err := service.InstallServices(context.Background(), req, fakeLogger{}, nil); err != nil {
+		t.Fatal(err)
+	}
+	deployments, err = s.ListAIFARDeployments(instance.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, deployment := range deployments {
+		if deployment.ServiceName == "file" || deployment.ServiceName == "system" {
+			if deployment.Generation != 1 || deployment.Status != "Accepted" || deployment.ObservedGeneration != 0 {
+				t.Fatalf("retry must complete the same generation without inventing observation: %+v", deployment)
+			}
+		}
+	}
+	if remote.deploymentApplyCounts["file"] != 1 || remote.deploymentApplyCounts["system"] != 2 {
+		t.Fatalf("retry must skip accepted file and resubmit only pending system: %+v", remote.deploymentApplyCounts)
+	}
+	for _, replicaSet := range s.replicaSets {
+		if (replicaSet.ServiceName == "file" || replicaSet.ServiceName == "system") && (replicaSet.DesiredPods != 1 || replicaSet.ReadyPods != 0) {
+			t.Fatalf("new service replicaSet must start desired=1 ready=0: %+v", replicaSet)
+		}
+	}
+	if len(s.pods) != 0 || len(s.endpoints) != 0 {
+		t.Fatalf("service installation acceptance must not invent Pods or Endpoints: pods=%d endpoints=%d", len(s.pods), len(s.endpoints))
+	}
+	if strings.Contains(remote.serviceInstallScript, "reconcile-runtime") || strings.Contains(remote.serviceInstallScript, "reconcile_runtime") {
+		t.Fatal("service preparation script must not own desired-state mutation")
 	}
 }
 

@@ -22,6 +22,7 @@ import (
 	"aifar-deployment/backend/internal/installer/installerkit"
 	"aifar-deployment/backend/internal/installer/selinux"
 	"aifar-deployment/backend/internal/installer/uploadkit"
+	"aifar-deployment/backend/internal/runtimeagent"
 	"aifar-deployment/backend/internal/store"
 )
 
@@ -594,6 +595,28 @@ func (s Service) Install(ctx context.Context, req InstallRequest, resources []st
 		if err != nil {
 			return err
 		}
+		if instanceID != "" {
+			previous, err := s.store.GetAppInstance(instanceID)
+			if err != nil {
+				return err
+			}
+			previousMetadata := metadataFromInstance(previous)
+			previousReleaseID := stringFromMetadata(previousMetadata, "releaseId", "")
+			if previousReleaseID != "" &&
+				stringFromMetadata(previousMetadata, "releaseVersion", "") == bundle.Version &&
+				stringFromMetadata(previousMetadata, "configHash", "") == configHash {
+				releaseID = previousReleaseID
+				if previousReleaseTime, parseErr := time.Parse(time.RFC3339, stringFromMetadata(previousMetadata, "releaseCreatedAt", "")); parseErr == nil {
+					releaseTime = previousReleaseTime.UTC()
+				}
+				metadata = installMetadata(server, installRoot, bundle.Version, releaseID, releaseTime, configHash, options, req.Actor)
+				metadata["serviceCatalog"] = serviceCatalogMetadataForInstall(serviceDefinitions, options.GatewayPort, options.WebPort)
+				metadata["installState"] = "installing"
+				if strings.TrimSpace(req.TaskID) != "" {
+					metadata["taskId"] = strings.TrimSpace(req.TaskID)
+				}
+			}
+		}
 		data, _ := json.Marshal(metadata)
 		instance = store.AppInstance{
 			ID:       instanceID,
@@ -641,6 +664,7 @@ func (s Service) Install(ctx context.Context, req InstallRequest, resources []st
 		}
 		script, err := renderInstallScript(installScriptData{
 			InstallRoot:         installRoot,
+			InstanceID:          instance.ID,
 			WorkDir:             workDir,
 			ArchiveRemote:       archiveRemote,
 			AgentBinaryRemote:   agentRemote,
@@ -675,13 +699,16 @@ func (s Service) Install(ctx context.Context, req InstallRequest, resources []st
 			return err
 		}
 		defer os.Remove(scriptLocal)
-		return uploadkit.Upload(ctx, s.remote, server, uploadkit.File{
+		if err := uploadkit.Upload(ctx, s.remote, server, uploadkit.File{
 			LocalPath:      scriptLocal,
 			RemotePath:     scriptRemote,
 			Mode:           0o755,
 			LogMessage:     copy.UploadScript,
 			FailureMessage: copy.UploadScriptFailed,
-		}, logForServer)
+		}, logForServer); err != nil {
+			return err
+		}
+		return s.saveInitialControlPlaneDesired(instance, releaseID, bundle.Version, configHash, options, serviceDefinitions, releaseTime)
 	}); err != nil {
 		_ = s.markInstallFailed(instance, metadata, err)
 		msg := fmt.Sprintf(copy.InstallFailed, err)
@@ -692,8 +719,15 @@ func (s Service) Install(ctx context.Context, req InstallRequest, resources []st
 
 	if err := step(5, func() error {
 		logForServer.Info(copy.Deploying)
-		_, err := installerkit.Run(ctx, s.remote, server, "sh "+installerkit.ShellQuote(scriptRemote), logForServer, copy.RemoteCommandFailed)
-		return err
+		result, err := installerkit.Run(ctx, s.remote, server, "sh "+installerkit.ShellQuote(scriptRemote), logForServer, copy.RemoteCommandFailed)
+		if err != nil {
+			return err
+		}
+		_, err = decodeBootstrapAcceptance(result.Stdout, instance.ID, len(options.SelectedServices))
+		if err != nil {
+			return err
+		}
+		return s.acceptInitialControlPlane(instance.ID, options.SelectedServices)
 	}); err != nil {
 		_ = s.markInstallFailed(instance, metadata, err)
 		msg := fmt.Sprintf(copy.InstallFailed, err)
@@ -721,9 +755,6 @@ func (s Service) Install(ctx context.Context, req InstallRequest, resources []st
 		instance, saveErr = s.store.SaveAppInstance(instance)
 		if saveErr != nil {
 			return saveErr
-		}
-		if err := s.saveInitialControlPlane(instance.ID, releaseID, bundle.Version, configHash, options, serviceDefinitions, releaseTime); err != nil {
-			return err
 		}
 		if releases, ok := s.store.(releaseStore); ok {
 			manifest, _ := json.Marshal(releaseManifest(bundle.Version, releaseID, releaseTime, configHash, ingressNetwork, options.GatewayPort, options.WebPort, options.SelectedServices))
@@ -809,9 +840,122 @@ func installMetadata(server store.Server, installRoot, version, releaseID string
 	return metadata
 }
 
-func (s Service) saveInitialControlPlane(instanceID, revision, version, configHash string, options InstallOptions, definitions []serviceDefinition, now time.Time) error {
-	if orch, ok := s.store.(aifarOrchestrationStore); ok {
-		return saveControlPlaneRevision(orch, instanceID, version, revision, configHash, desiredReplicasForServices(options.SelectedServices), options.GatewayPort, options.WebPort, options.SelectedServices, now, servicePorts(definitions))
+const bootstrapAcceptanceMarker = "AIFAR_BOOTSTRAP_ACCEPTANCE="
+
+func decodeBootstrapAcceptance(stdout, instanceID string, expectedDeployments int) (runtimeagent.LegacyBootstrapAcceptance, error) {
+	var acceptance runtimeagent.LegacyBootstrapAcceptance
+	payload := ""
+	for _, line := range strings.Split(stdout, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, bootstrapAcceptanceMarker) {
+			continue
+		}
+		if payload != "" {
+			return acceptance, errors.New("aifar-agent bootstrap acceptance is duplicated")
+		}
+		payload = strings.TrimPrefix(line, bootstrapAcceptanceMarker)
+	}
+	if payload == "" || len(payload) > 1<<20 {
+		return acceptance, errors.New("aifar-agent bootstrap acceptance is missing")
+	}
+	decoder := json.NewDecoder(strings.NewReader(payload))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&acceptance); err != nil {
+		return acceptance, errors.New("aifar-agent bootstrap acceptance is invalid")
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		return acceptance, errors.New("aifar-agent bootstrap acceptance is invalid")
+	}
+	if !acceptance.Accepted || acceptance.InstanceID != instanceID || len(acceptance.Deployments) != expectedDeployments || expectedDeployments < 1 {
+		return acceptance, errors.New("aifar-agent bootstrap acceptance does not match the installation")
+	}
+	for _, deployment := range acceptance.Deployments {
+		if !deployment.Accepted || deployment.Generation != 1 || !deploymentSpecHashPattern.MatchString(deployment.SpecHash) {
+			return acceptance, errors.New("aifar-agent deployment acceptance is invalid")
+		}
+	}
+	return acceptance, nil
+}
+
+func (s Service) saveInitialControlPlaneDesired(instance store.AppInstance, revision, version, configHash string, options InstallOptions, definitions []serviceDefinition, now time.Time) error {
+	orch, ok := s.store.(aifarOrchestrationStore)
+	if !ok {
+		return nil
+	}
+	existing, err := orch.ListAIFARDeployments(instance.ID)
+	if err != nil {
+		return err
+	}
+	existingByService := make(map[string]store.AIFARDeployment, len(existing))
+	for _, deployment := range existing {
+		existingByService[cleanAIFARServiceName(deployment.ServiceName)] = deployment
+	}
+	metadata := metadataFromInstance(instance)
+	strategy := runtimeagent.NormalizeDeploymentStrategy(runtimeagent.DeploymentStrategySpec{})
+	strategyJSON, err := json.Marshal(strategy)
+	if err != nil {
+		return err
+	}
+	pendingConditions, err := deploymentConditionsJSON(false, "PendingAgentAcceptance", 1)
+	if err != nil {
+		return err
+	}
+	for _, serviceName := range options.SelectedServices {
+		definition, found := catalogDefinition(definitions, serviceName)
+		if !found {
+			return fmt.Errorf("AIFAR service %s is not defined", serviceName)
+		}
+		if current, found := existingByService[serviceName]; found && current.Generation == 1 && current.CurrentRevision == revision && strings.TrimSpace(current.SpecJSON) != "" {
+			continue
+		}
+		base := store.AIFARDeployment{InstanceID: instance.ID, ServiceName: serviceName, DesiredReplicas: 1, CurrentRevision: revision}
+		installRoot := strings.TrimSpace(stringFromMetadata(metadata, "installRoot", ""))
+		manifest := runtimeagent.NormalizeDeploymentManifest(runtimeManifestDefaults(instance.ID, installRoot, definition, base, 1, metadata))
+		config := runtimeInstanceConfig(instance, metadata, installRoot)
+		if err := runtimeagent.ValidateDeploymentManifest(config, manifest); err != nil {
+			return err
+		}
+		specJSON, err := json.Marshal(manifest)
+		if err != nil {
+			return err
+		}
+		if _, err := orch.SaveAIFARDeployment(store.AIFARDeployment{
+			InstanceID: instance.ID, ServiceName: serviceName, DesiredReplicas: 1, CurrentRevision: revision,
+			StrategyJSON: string(strategyJSON), SpecJSON: string(specJSON), Generation: 1, ObservedGeneration: 0,
+			Status: "pending_acceptance", MetadataJSON: `{"model":"` + orchestrationModelK8sLikeV1 + `"}`,
+			ConditionsJSON: pendingConditions, LastTransitionAt: now, CreatedAt: now,
+		}); err != nil {
+			return err
+		}
+		if _, err := orch.SaveAIFARReplicaSet(store.AIFARReplicaSet{
+			InstanceID: instance.ID, ServiceName: serviceName, Revision: revision,
+			Image: fmt.Sprintf("aifar-%s:%s", serviceName, revision), ArtifactHash: configHash,
+			DesiredPods: 1, ReadyPods: 0, Status: "pending", MetadataJSON: fmt.Sprintf(`{"version":%q}`, version), CreatedAt: now,
+		}); err != nil {
+			return err
+		}
+		if err := orch.ReplaceAIFARServiceEndpoints(instance.ID, serviceName, nil); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s Service) acceptInitialControlPlane(instanceID string, services []string) error {
+	control, ok := s.store.(aifarDeploymentControlStore)
+	if !ok {
+		return nil
+	}
+	for _, serviceName := range services {
+		conditions, err := deploymentConditionsJSON(true, "ManifestAccepted", 1)
+		if err != nil {
+			return err
+		}
+		_, err = control.AcceptAIFARDeployment(instanceID, serviceName, 1, "Accepted", conditions, time.Now().UTC())
+		if err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -1890,6 +2034,7 @@ func (s Service) markInstanceStatus(instance store.AppInstance, status string, d
 
 type installScriptData struct {
 	InstallRoot         string
+	InstanceID          string
 	WorkDir             string
 	ArchiveRemote       string
 	AgentBinaryRemote   string
