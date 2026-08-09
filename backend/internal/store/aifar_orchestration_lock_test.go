@@ -152,7 +152,7 @@ func TestSaveAIFARInitialDesiredWithLockRechecksExpiryAtTransactionWriteBoundary
 	owner := testAIFAROrchestrationLock("instance-1", "", "install")
 	owner.ID = "near-expiry-owner"
 	owner.StartedAt = now.Add(-time.Hour)
-	owner.ExpiresAt = now.Add(time.Second)
+	owner.ExpiresAt = now.Add(2 * time.Second)
 	if _, err := db.AcquireAIFAROrchestrationLock(owner); err != nil {
 		t.Fatal(err)
 	}
@@ -176,13 +176,25 @@ func TestSaveAIFARInitialDesiredWithLockRechecksExpiryAtTransactionWriteBoundary
 			DesiredPods: 1, Status: "pending",
 		}})
 	}()
-	deadline := time.Now().Add(time.Second)
+	deadline := owner.ExpiresAt.Add(-500 * time.Millisecond)
 	for db.db.Stats().WaitCount <= baselineWaitCount && time.Now().Before(deadline) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	if db.db.Stats().WaitCount <= baselineWaitCount {
 		_ = blocker.Rollback()
+		<-errCh
 		t.Fatal("save did not reach the blocked transaction boundary")
+	}
+	// WaitCount can advance only after the goroutine has called Begin. The old
+	// implementation captured its authorization time before that call, so this
+	// assertion proves that stale timestamp was captured while the lease was
+	// still valid. Releasing the connection only after expiry then exercises the
+	// transaction write-boundary recheck deterministically.
+	waitObservedAt := time.Now().UTC()
+	if !waitObservedAt.Before(owner.ExpiresAt) {
+		_ = blocker.Rollback()
+		<-errCh
+		t.Fatalf("save reached the transaction wait too late: observed=%s expires=%s", waitObservedAt, owner.ExpiresAt)
 	}
 	if wait := time.Until(owner.ExpiresAt.Add(25 * time.Millisecond)); wait > 0 {
 		time.Sleep(wait)
