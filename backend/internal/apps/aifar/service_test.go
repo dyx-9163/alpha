@@ -84,6 +84,47 @@ type resourceFakeStore struct {
 	resources []store.Resource
 }
 
+type barrierListStore struct {
+	*store.Store
+	mu                sync.Mutex
+	remaining         int
+	ready             chan struct{}
+	release           chan struct{}
+	firstLockTaskID   string
+	firstLockAcquired chan struct{}
+}
+
+func (s *barrierListStore) ListAppInstances() ([]store.AppInstance, error) {
+	instances, err := s.Store.ListAppInstances()
+	if err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	wait := s.remaining > 0
+	if wait {
+		s.remaining--
+		if s.remaining == 0 {
+			close(s.ready)
+		}
+	}
+	s.mu.Unlock()
+	if wait {
+		<-s.release
+	}
+	return instances, nil
+}
+
+func (s *barrierListStore) AcquireAIFAROrchestrationLock(lock store.AIFAROrchestrationLock) (store.AIFAROrchestrationLock, error) {
+	if s.firstLockAcquired != nil && lock.TaskID != s.firstLockTaskID {
+		<-s.firstLockAcquired
+	}
+	acquired, err := s.Store.AcquireAIFAROrchestrationLock(lock)
+	if s.firstLockAcquired != nil && lock.TaskID == s.firstLockTaskID {
+		close(s.firstLockAcquired)
+	}
+	return acquired, err
+}
+
 func (s *resourceFakeStore) ListResources() ([]store.Resource, error) {
 	return append([]store.Resource(nil), s.resources...), nil
 }
@@ -577,7 +618,6 @@ type fakeRemote struct {
 	runtimeAgentCheckStdout string
 	installStdout           string
 	installRuns             int
-	bootstrapMode           string
 	bootstrapHashOverrides  map[string]string
 	bootstrapNameOverrides  map[string]string
 	deploymentManifests     map[string]runtimeagent.DeploymentManifest
@@ -2590,25 +2630,194 @@ func TestInstallChangedConfigRetryAfterAgentPersistenceFailsClosed(t *testing.T)
 	}
 }
 
-func TestInstallReconcilesExactServiceProofForDirectAndLostBootstrapResponses(t *testing.T) {
+func TestConcurrentFailedInstallRetriesHaveOnePersistentAttemptOwner(t *testing.T) {
+	withFakeRuntimeAgentBinary(t)
+	root := createAIFARBundle(t)
+	resources := []store.Resource{{App: AppName, Part: "backend", Version: appBundleVersion, Path: filepath.Join(root, appBundleVersion, bundleManifestName)}}
+	db := openAIFARTestStore(t)
+	if _, err := db.SaveServer(store.Server{ID: "srv-1", Name: "node-1", Host: "10.0.0.10", DeployDir: "/aifar/apps"}); err != nil {
+		t.Fatal(err)
+	}
+	baseRequest := InstallRequest{
+		Version: "latest", ServerID: "srv-1", Language: "en", TaskID: "initial-failure",
+		Parameters: map[string]any{"nacosHost": "10.0.0.50", "selectedServices": []string{"gateway"}, "appMemoryLimit": "2GB"},
+	}
+	remote := &fakeRemote{failCommandContains: "mkdir -p"}
+	if err := NewService(db, remote).Install(context.Background(), baseRequest, resources, fakeLogger{}, nil); err == nil {
+		t.Fatal("initial attempt must fail before generation-1 desired state is created")
+	}
+	instances, err := db.ListAppInstances()
+	if err != nil || len(instances) != 1 || instances[0].Status != "install_failed" {
+		t.Fatalf("initial failed claim=%+v err=%v", instances, err)
+	}
+	deployments, err := db.ListAIFARDeployments(instances[0].ID)
+	if err != nil || len(deployments) != 0 {
+		t.Fatalf("precondition requires no desired rows: deployments=%+v err=%v", deployments, err)
+	}
+
+	remote.failCommandContains = ""
+	gated := &barrierListStore{
+		Store: db, remaining: 2, ready: make(chan struct{}), release: make(chan struct{}),
+		firstLockTaskID: "same-config-retry", firstLockAcquired: make(chan struct{}),
+	}
+	requests := []InstallRequest{baseRequest, baseRequest}
+	requests[0].TaskID = "same-config-retry"
+	requests[1].TaskID = "changed-config-retry"
+	requests[1].Parameters = map[string]any{"nacosHost": "10.0.0.50", "selectedServices": []string{"gateway"}, "appMemoryLimit": "3GB"}
+	type retryResult struct {
+		taskID string
+		err    error
+	}
+	resultsCh := make(chan retryResult, len(requests))
+	for _, req := range requests {
+		req := req
+		go func() {
+			resultsCh <- retryResult{taskID: req.TaskID, err: NewService(gated, remote).Install(context.Background(), req, resources, fakeLogger{}, nil)}
+		}()
+	}
+	<-gated.ready
+	close(gated.release)
+	results := []retryResult{<-resultsCh, <-resultsCh}
+	successes := 0
+	for _, result := range results {
+		if result.err == nil {
+			successes++
+		}
+		if result.taskID == "same-config-retry" && result.err != nil {
+			t.Fatalf("same-config owner must win the ordered claim: %v", result.err)
+		}
+		if result.taskID == "changed-config-retry" && result.err == nil {
+			t.Fatal("changed-config concurrent retry must fail closed")
+		}
+	}
+	if successes != 1 {
+		t.Fatalf("concurrent retries must have exactly one owner, results=%v", results)
+	}
+	if remote.installRuns != 1 {
+		t.Fatalf("only the persistent owner may bootstrap, runs=%d", remote.installRuns)
+	}
+	instances, err = db.ListAppInstances()
+	if err != nil || len(instances) != 1 || instances[0].Status != "installed" {
+		t.Fatalf("winning attempt must remain authoritative: instances=%+v err=%v", instances, err)
+	}
+	deployments, err = db.ListAIFARDeployments(instances[0].ID)
+	if err != nil || len(deployments) == 0 {
+		t.Fatalf("winning attempt must own one accepted generation: deployments=%+v err=%v", deployments, err)
+	}
+	winningRevision := deployments[0].CurrentRevision
+	for _, deployment := range deployments {
+		if deployment.Generation != 1 || deployment.Status != "Accepted" || deployment.CurrentRevision != winningRevision {
+			t.Fatalf("winning attempt must own one accepted generation: deployments=%+v", deployments)
+		}
+	}
+}
+
+func TestConcurrentFreshInstallsShareOneAtomicClaim(t *testing.T) {
+	withFakeRuntimeAgentBinary(t)
+	root := createAIFARBundle(t)
+	resources := []store.Resource{{App: AppName, Part: "backend", Version: appBundleVersion, Path: filepath.Join(root, appBundleVersion, bundleManifestName)}}
+	db := openAIFARTestStore(t)
+	if _, err := db.SaveServer(store.Server{ID: "srv-1", Name: "node-1", Host: "10.0.0.10", DeployDir: "/aifar/apps"}); err != nil {
+		t.Fatal(err)
+	}
+	gated := &barrierListStore{Store: db, remaining: 2, ready: make(chan struct{}), release: make(chan struct{})}
+	remote := &fakeRemote{}
+	errs := make(chan error, 2)
+	for _, taskID := range []string{"fresh-a", "fresh-b"} {
+		req := InstallRequest{
+			Version: "latest", ServerID: "srv-1", Language: "en", TaskID: taskID,
+			Parameters: map[string]any{"nacosHost": "10.0.0.50", "selectedServices": []string{"gateway"}},
+		}
+		go func() {
+			errs <- NewService(gated, remote).Install(context.Background(), req, resources, fakeLogger{}, nil)
+		}()
+	}
+	<-gated.ready
+	close(gated.release)
+	results := []error{<-errs, <-errs}
+	successes := 0
+	for _, result := range results {
+		if result == nil {
+			successes++
+		}
+	}
+	instances, err := db.ListAppInstances()
+	if successes != 1 || err != nil || len(instances) != 1 || instances[0].Status != "installed" || remote.installRuns != 1 {
+		t.Fatalf("fresh claim must have one owner: results=%v instances=%+v runs=%d err=%v", results, instances, remote.installRuns, err)
+	}
+	if instances[0].ID != installAttemptClaimInstanceID("srv-1", "/aifar/apps/admin") {
+		t.Fatalf("fresh claim used nondeterministic identity %q", instances[0].ID)
+	}
+	if instances[0].CreatedAt.IsZero() {
+		t.Fatal("fresh deterministic claim must retain a real creation timestamp")
+	}
+}
+
+func TestLateInstallFailureCannotOverwriteInstalledOwner(t *testing.T) {
+	staleMetadata := map[string]any{"installState": "installing", "installAttemptOwner": "owner-a"}
+	currentMetadata := map[string]any{"installState": "installed", "installAttemptOwner": "owner-b"}
+	s := &fakeStore{instances: []store.AppInstance{{
+		ID: "instance-1", App: AppName, Version: "runtime-v2", ServerID: "srv-1", Status: "installed", Metadata: mustMetadata(t, currentMetadata),
+	}}}
+	stale := s.instances[0]
+	stale.Status = "installing"
+	stale.Metadata = mustMetadata(t, staleMetadata)
+	if err := NewService(s, &fakeRemote{}).markInstallFailed(stale, staleMetadata, errors.New("late owner failure")); err != nil {
+		t.Fatal(err)
+	}
+	current, err := s.GetAppInstance("instance-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.Status != "installed" || stringFromMetadata(metadataFromInstance(current), "installAttemptOwner", "") != "owner-b" {
+		t.Fatalf("late failure overwrote current owner: %+v", current)
+	}
+}
+
+func TestExpiredInstallOwnerCannotFinalizeFailure(t *testing.T) {
+	db := openAIFARTestStore(t)
+	metadata := map[string]any{"installState": "installing", "installAttemptOwner": "owner-a"}
+	instance, err := db.SaveAppInstance(store.AppInstance{
+		ID: "instance-1", App: AppName, Version: "runtime-v2", ServerID: "srv-1", Status: "installing", Metadata: mustMetadata(t, metadata), CreatedAt: time.Now().UTC().Add(-time.Hour),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.AcquireAIFAROrchestrationLock(store.AIFAROrchestrationLock{
+		ID: "owner-a", InstanceID: instance.ID, Operation: "install",
+		StartedAt: time.Now().UTC().Add(-2 * time.Hour), ExpiresAt: time.Now().UTC().Add(-time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := NewService(db, &fakeRemote{}).markInstallFailed(instance, metadata, errors.New("expired owner failure")); err != nil {
+		t.Fatal(err)
+	}
+	current, err := db.GetAppInstance(instance.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.Status != "installing" || boolFromMetadata(metadataFromInstance(current), "installFailed") {
+		t.Fatalf("expired owner finalized lifecycle state: %+v", current)
+	}
+}
+
+func TestInstallReconcilesExactServiceAddressableProof(t *testing.T) {
 	withFakeRuntimeAgentBinary(t)
 	root := createAIFARBundle(t)
 	resources := []store.Resource{{App: AppName, Part: "backend", Version: appBundleVersion, Path: filepath.Join(root, appBundleVersion, bundleManifestName)}}
 	for _, tc := range []struct {
 		name          string
-		mode          string
 		hashOverride  string
 		nameOverride  string
 		wantInstalled bool
 	}{
-		{name: "direct exact", mode: "direct", wantInstalled: true},
-		{name: "direct wrong service", mode: "direct", nameOverride: "system"},
-		{name: "lost response exact readback", mode: "lost-response-readback", wantInstalled: true},
-		{name: "lost response wrong hash readback", mode: "lost-response-readback", hashOverride: strings.Repeat("f", 64)},
+		{name: "exact", wantInstalled: true},
+		{name: "wrong service", nameOverride: "system"},
+		{name: "wrong hash", hashOverride: strings.Repeat("f", 64)},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s := &fakeStore{servers: map[string]store.Server{"srv-1": {ID: "srv-1", Host: "10.0.0.10", DeployDir: "/aifar/apps"}}}
-			remote := &fakeRemote{bootstrapMode: tc.mode}
+			remote := &fakeRemote{}
 			if tc.hashOverride != "" {
 				remote.bootstrapHashOverrides = map[string]string{"gateway": tc.hashOverride}
 			}
@@ -2621,12 +2830,12 @@ func TestInstallReconcilesExactServiceProofForDirectAndLostBootstrapResponses(t 
 			}, resources, fakeLogger{}, nil)
 			if tc.wantInstalled {
 				if err != nil || len(s.instances) != 1 || s.instances[0].Status != "installed" {
-					t.Fatalf("%s exact proof must install: err=%v instances=%+v", tc.mode, err, s.instances)
+					t.Fatalf("exact proof must install: err=%v instances=%+v", err, s.instances)
 				}
 				return
 			}
 			if err == nil || len(s.instances) != 1 || s.instances[0].Status != "install_failed" {
-				t.Fatalf("%s mismatched proof must fail closed: err=%v instances=%+v", tc.mode, err, s.instances)
+				t.Fatalf("mismatched proof must fail closed: err=%v instances=%+v", err, s.instances)
 			}
 		})
 	}

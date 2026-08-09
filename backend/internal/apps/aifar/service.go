@@ -591,71 +591,99 @@ func (s Service) Install(ctx context.Context, req InstallRequest, resources []st
 	}
 	var instance store.AppInstance
 	var expectedBootstrapHashes map[string]string
+	var installLock store.AIFAROrchestrationLock
+	installOwner := ""
+	installCtx := ctx
+	instanceCreatedAt := releaseTime
 
 	if err := step(3, func() error {
-		instanceID, err := s.reusableAIFARInstallInstanceID(target, installRoot)
+		instanceID, lock, err := s.acquireInstallAttemptClaim(target, installRoot, req.Actor, fallbackTaskID(req.TaskID, log))
 		if err != nil {
 			return err
 		}
+		installLock = lock
+		installOwner = strings.TrimSpace(lock.ID)
+		if installOwner == "" {
+			installOwner = store.NewID("aifarinstallattempt")
+		}
 		if instanceID != "" {
 			previous, err := s.store.GetAppInstance(instanceID)
-			if err != nil {
+			if err != nil && !store.IsNotFound(err) {
 				return err
 			}
-			previousMetadata := metadataFromInstance(previous)
-			previousReleaseID := stringFromMetadata(previousMetadata, "releaseId", "")
-			sameAttempt := previousReleaseID != "" &&
-				stringFromMetadata(previousMetadata, "releaseVersion", "") == bundle.Version &&
-				stringFromMetadata(previousMetadata, "configHash", "") == configHash
-			if sameAttempt {
-				releaseID = previousReleaseID
-				if previousReleaseTime, parseErr := time.Parse(time.RFC3339, stringFromMetadata(previousMetadata, "releaseCreatedAt", "")); parseErr == nil {
-					releaseTime = previousReleaseTime.UTC()
+			if err == nil {
+				if !previous.CreatedAt.IsZero() {
+					instanceCreatedAt = previous.CreatedAt
 				}
-				metadata = installMetadata(server, installRoot, bundle.Version, releaseID, releaseTime, configHash, options, req.Actor)
-				metadata["serviceCatalog"] = serviceCatalogMetadataForInstall(serviceDefinitions, options.GatewayPort, options.WebPort)
-				metadata["installState"] = "installing"
-				if strings.TrimSpace(req.TaskID) != "" {
-					metadata["taskId"] = strings.TrimSpace(req.TaskID)
+				previousMetadata := metadataFromInstance(previous)
+				if previous.App != AppName || previous.ServerID != target || normalizeInstallRoot(stringFromMetadata(previousMetadata, "installRoot", "")) != normalizeInstallRoot(installRoot) || !s.reusableAIFARInstallInstance(previous, previousMetadata) {
+					return repairRequired("AIFAR_RUNTIME_INSTALL_ATTEMPT_OWNERSHIP_CHANGED", nil)
 				}
-			} else if control, ok := s.store.(aifarDeploymentControlStore); ok {
-				deployments, listErr := control.ListAIFARDeployments(instanceID)
-				if listErr != nil {
-					return listErr
-				}
-				for _, deployment := range deployments {
-					if deployment.Generation > 0 && strings.TrimSpace(deployment.SpecJSON) != "" {
-						return repairRequired("AIFAR_RUNTIME_INSTALL_RETRY_CONFIG_CHANGED", nil)
+				previousReleaseID := stringFromMetadata(previousMetadata, "releaseId", "")
+				sameAttempt := previousReleaseID != "" &&
+					stringFromMetadata(previousMetadata, "releaseVersion", "") == bundle.Version &&
+					stringFromMetadata(previousMetadata, "configHash", "") == configHash
+				if sameAttempt {
+					releaseID = previousReleaseID
+					if previousReleaseTime, parseErr := time.Parse(time.RFC3339, stringFromMetadata(previousMetadata, "releaseCreatedAt", "")); parseErr == nil {
+						releaseTime = previousReleaseTime.UTC()
+					}
+					metadata = installMetadata(server, installRoot, bundle.Version, releaseID, releaseTime, configHash, options, req.Actor)
+					metadata["serviceCatalog"] = serviceCatalogMetadataForInstall(serviceDefinitions, options.GatewayPort, options.WebPort)
+					metadata["installState"] = "installing"
+					if strings.TrimSpace(req.TaskID) != "" {
+						metadata["taskId"] = strings.TrimSpace(req.TaskID)
+					}
+				} else if control, ok := s.store.(aifarDeploymentControlStore); ok {
+					deployments, listErr := control.ListAIFARDeployments(instanceID)
+					if listErr != nil {
+						return listErr
+					}
+					for _, deployment := range deployments {
+						if deployment.Generation > 0 && strings.TrimSpace(deployment.SpecJSON) != "" {
+							return repairRequired("AIFAR_RUNTIME_INSTALL_RETRY_CONFIG_CHANGED", nil)
+						}
 					}
 				}
 			}
 		}
+		metadata["installAttemptOwner"] = installOwner
 		data, _ := json.Marshal(metadata)
 		instance = store.AppInstance{
-			ID:       instanceID,
-			App:      AppName,
-			Version:  bundle.Version,
-			ServerID: target,
-			Status:   "installing",
-			Topology: defaultTopology,
-			Metadata: string(data),
+			ID:        instanceID,
+			App:       AppName,
+			Version:   bundle.Version,
+			ServerID:  target,
+			Status:    "installing",
+			Topology:  defaultTopology,
+			Metadata:  string(data),
+			CreatedAt: instanceCreatedAt,
 		}
 		var saveErr error
 		instance, saveErr = s.store.SaveAppInstance(instance)
 		return saveErr
 	}); err != nil {
+		if installLock.InstanceID != "" {
+			s.releaseOrchestrationLock(installLock)
+		}
 		msg := fmt.Sprintf(copy.RecordFailed, err)
 		logForServer.Error("%s", msg)
 		finishTarget(recorder, target, "failed", msg)
 		return err
 	}
+	if installLock.InstanceID != "" {
+		defer s.releaseOrchestrationLock(installLock)
+		var stopHeartbeat func()
+		installCtx, stopHeartbeat = s.startAIFAROrchestrationLockHeartbeat(ctx, installLock)
+		defer stopHeartbeat()
+	}
 
 	if err := step(4, func() error {
 		logForServer.Info(copy.PrepareWorkDir, workDir)
-		if _, err := installerkit.Run(ctx, s.remote, server, "mkdir -p "+installerkit.ShellQuote(workDir), logForServer, copy.RemoteCommandFailed); err != nil {
+		if _, err := installerkit.Run(installCtx, s.remote, server, "mkdir -p "+installerkit.ShellQuote(workDir), logForServer, copy.RemoteCommandFailed); err != nil {
 			return err
 		}
-		if err := uploadkit.Upload(ctx, s.remote, server, uploadkit.File{
+		if err := uploadkit.Upload(installCtx, s.remote, server, uploadkit.File{
 			LocalPath:      archiveLocal,
 			RemotePath:     archiveRemote,
 			LogMessage:     copy.UploadBundle,
@@ -665,7 +693,7 @@ func (s Service) Install(ctx context.Context, req InstallRequest, resources []st
 			return err
 		}
 		if agentLocal != "" {
-			if err := uploadkit.Upload(ctx, s.remote, server, uploadkit.File{
+			if err := uploadkit.Upload(installCtx, s.remote, server, uploadkit.File{
 				LocalPath:      agentLocal,
 				RemotePath:     agentRemote,
 				Mode:           0o755,
@@ -721,7 +749,7 @@ func (s Service) Install(ctx context.Context, req InstallRequest, resources []st
 			return err
 		}
 		defer os.Remove(scriptLocal)
-		if err := uploadkit.Upload(ctx, s.remote, server, uploadkit.File{
+		if err := uploadkit.Upload(installCtx, s.remote, server, uploadkit.File{
 			LocalPath:      scriptLocal,
 			RemotePath:     scriptRemote,
 			Mode:           0o755,
@@ -741,7 +769,7 @@ func (s Service) Install(ctx context.Context, req InstallRequest, resources []st
 
 	if err := step(5, func() error {
 		logForServer.Info(copy.Deploying)
-		result, err := installerkit.Run(ctx, s.remote, server, "sh "+installerkit.ShellQuote(scriptRemote), logForServer, copy.RemoteCommandFailed)
+		result, err := installerkit.Run(installCtx, s.remote, server, "sh "+installerkit.ShellQuote(scriptRemote), logForServer, copy.RemoteCommandFailed)
 		if err != nil {
 			return err
 		}
@@ -759,19 +787,27 @@ func (s Service) Install(ctx context.Context, req InstallRequest, resources []st
 	}
 
 	if err := step(6, func() error {
+		current, owned, err := s.currentInstallAttemptOwner(instance.ID, installOwner)
+		if err != nil {
+			return err
+		}
+		if !owned {
+			return repairRequired("AIFAR_RUNTIME_INSTALL_ATTEMPT_OWNERSHIP_CHANGED", nil)
+		}
 		delete(metadata, "installFailed")
 		delete(metadata, "failedAt")
 		delete(metadata, "error")
 		metadata["installState"] = "installed"
 		data, _ := json.Marshal(metadata)
 		instance = store.AppInstance{
-			ID:       instance.ID,
-			App:      AppName,
-			Version:  bundle.Version,
-			ServerID: target,
-			Status:   "installed",
-			Topology: defaultTopology,
-			Metadata: string(data),
+			ID:        instance.ID,
+			App:       AppName,
+			Version:   bundle.Version,
+			ServerID:  target,
+			Status:    "installed",
+			Topology:  defaultTopology,
+			Metadata:  string(data),
+			CreatedAt: current.CreatedAt,
 		}
 		var saveErr error
 		instance, saveErr = s.store.SaveAppInstance(instance)
@@ -1799,6 +1835,63 @@ func (s Service) existingAIFARInstanceID(serverID, installRoot string) (string, 
 	return s.reusableAIFARInstallInstanceID(serverID, installRoot)
 }
 
+func installAttemptClaimInstanceID(serverID, installRoot string) string {
+	sum := sha256.Sum256([]byte(strings.TrimSpace(serverID) + "\x00" + normalizeInstallRoot(installRoot)))
+	return "aifarinstall_" + hex.EncodeToString(sum[:12])
+}
+
+func (s Service) acquireInstallAttemptClaim(serverID, installRoot, actor, taskID string) (string, store.AIFAROrchestrationLock, error) {
+	instanceID, err := s.reusableAIFARInstallInstanceID(serverID, installRoot)
+	if err != nil {
+		return "", store.AIFAROrchestrationLock{}, err
+	}
+	if instanceID != "" {
+		_, lock, err := s.acquireOrchestrationLock(instanceID, "install", "", actor, taskID)
+		return instanceID, lock, err
+	}
+
+	lockStore, ok := s.store.(aifarOrchestrationLockStore)
+	if !ok {
+		return "", store.AIFAROrchestrationLock{}, nil
+	}
+	instanceID = installAttemptClaimInstanceID(serverID, installRoot)
+	now := time.Now().UTC()
+	lock, err := lockStore.AcquireAIFAROrchestrationLock(store.AIFAROrchestrationLock{
+		InstanceID: instanceID, Operation: "install", Actor: strings.TrimSpace(actor), TaskID: strings.TrimSpace(taskID),
+		StartedAt: now, ExpiresAt: now.Add(orchestrationLockTTL),
+	})
+	if err != nil {
+		var conflict store.AIFAROrchestrationLockConflict
+		if errors.As(err, &conflict) {
+			return "", store.AIFAROrchestrationLock{}, orchestrationConflictError("", conflict.Lock.ServiceName)
+		}
+		return "", store.AIFAROrchestrationLock{}, err
+	}
+	releaseOnError := func(claimErr error) (string, store.AIFAROrchestrationLock, error) {
+		s.releaseOrchestrationLock(lock)
+		return "", store.AIFAROrchestrationLock{}, claimErr
+	}
+	claimed, getErr := s.store.GetAppInstance(instanceID)
+	if getErr == nil {
+		claimedMetadata := metadataFromInstance(claimed)
+		if claimed.App != AppName || claimed.ServerID != serverID || normalizeInstallRoot(stringFromMetadata(claimedMetadata, "installRoot", "")) != normalizeInstallRoot(installRoot) || !s.reusableAIFARInstallInstance(claimed, claimedMetadata) {
+			return releaseOnError(repairRequired("AIFAR_RUNTIME_INSTALL_ATTEMPT_OWNERSHIP_CHANGED", nil))
+		}
+		return instanceID, lock, nil
+	}
+	if !store.IsNotFound(getErr) {
+		return releaseOnError(getErr)
+	}
+	concurrentID, listErr := s.reusableAIFARInstallInstanceID(serverID, installRoot)
+	if listErr != nil {
+		return releaseOnError(listErr)
+	}
+	if concurrentID != "" && concurrentID != instanceID {
+		return releaseOnError(repairRequired("AIFAR_RUNTIME_INSTALL_ATTEMPT_OWNERSHIP_CHANGED", nil))
+	}
+	return instanceID, lock, nil
+}
+
 func (s Service) reusableAIFARInstallInstanceID(serverID, installRoot string) (string, error) {
 	instances, err := s.store.ListAppInstances()
 	if err != nil {
@@ -1882,6 +1975,17 @@ func (s Service) markInstallFailed(instance store.AppInstance, metadata map[stri
 	if strings.TrimSpace(instance.ID) == "" {
 		return nil
 	}
+	owner := stringFromMetadata(metadata, "installAttemptOwner", "")
+	current, owned, err := s.currentInstallAttemptOwner(instance.ID, owner)
+	if err != nil {
+		if store.IsNotFound(err) {
+			return nil
+		}
+		return err
+	}
+	if !owned || strings.EqualFold(strings.TrimSpace(current.Status), "installed") {
+		return nil
+	}
 	next := copyMetadata(metadata)
 	next["installFailed"] = true
 	next["installState"] = "install_failed"
@@ -1890,8 +1994,27 @@ func (s Service) markInstallFailed(instance store.AppInstance, metadata map[stri
 	raw, _ := json.Marshal(next)
 	instance.Status = "install_failed"
 	instance.Metadata = string(raw)
-	_, err := s.store.SaveAppInstance(instance)
+	instance.CreatedAt = current.CreatedAt
+	_, err = s.store.SaveAppInstance(instance)
 	return err
+}
+
+func (s Service) currentInstallAttemptOwner(instanceID, owner string) (store.AppInstance, bool, error) {
+	owner = strings.TrimSpace(owner)
+	if owner == "" {
+		return store.AppInstance{}, false, nil
+	}
+	if lockStore, ok := s.store.(aifarOrchestrationLockStore); ok {
+		renewed, err := lockStore.RenewAIFAROrchestrationLock(owner, time.Now().UTC().Add(orchestrationLockTTL))
+		if err != nil || !renewed {
+			return store.AppInstance{}, false, err
+		}
+	}
+	current, err := s.store.GetAppInstance(instanceID)
+	if err != nil {
+		return current, false, err
+	}
+	return current, stringFromMetadata(metadataFromInstance(current), "installAttemptOwner", "") == owner, nil
 }
 
 func truncateAIFARError(err error) string {
