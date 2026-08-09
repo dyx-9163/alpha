@@ -675,12 +675,48 @@ func (m *Manager) Resync(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	if err := m.resyncNewModelDeployments(ctx); err != nil {
+		return err
+	}
 	for _, spec := range m.legacyRuntimeSpecs(m.snapshotSpecs()) {
 		if err := m.reconcileDeployments(ctx, spec); err != nil {
 			return err
 		}
 		if err := m.refreshInstanceEndpoints(ctx, spec); err != nil {
 			return err
+		}
+	}
+	return nil
+}
+
+func (m *Manager) resyncNewModelDeployments(ctx context.Context) error {
+	entries, err := os.ReadDir(m.stateDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		instancePath := filepath.Join(m.stateDir, entry.Name(), "instance.json")
+		if _, statErr := os.Lstat(instancePath); statErr != nil {
+			if !os.IsNotExist(statErr) {
+				logf(m.log, "skip unreadable AIFAR runtime instance config %s during resync: %v\n", entry.Name(), statErr)
+			}
+			continue
+		}
+		manifests, listErr := m.manifestStore.List(entry.Name())
+		if listErr != nil {
+			logf(m.log, "skip invalid AIFAR deployment manifest during resync instance=%s: %v\n", entry.Name(), listErr)
+		}
+		for _, manifest := range manifests {
+			m.ReconcileDeployment(manifest.Metadata.InstanceID, manifest.Metadata.Name)
 		}
 	}
 	return nil

@@ -197,6 +197,10 @@ func HeartbeatNacosProxyRegistrations(ctx context.Context, options NacosProxySyn
 }
 
 func loadRuntimeSpecsForNacos(stateDir string) ([]RuntimeSpec, error) {
+	return loadRuntimeSpecsForNacosWithLstat(stateDir, os.Lstat)
+}
+
+func loadRuntimeSpecsForNacosWithLstat(stateDir string, lstat func(string) (os.FileInfo, error)) ([]RuntimeSpec, error) {
 	stateDir = strings.TrimSpace(stateDir)
 	if stateDir == "" {
 		stateDir = DefaultStateDir
@@ -214,7 +218,7 @@ func loadRuntimeSpecsForNacos(stateDir string) ([]RuntimeSpec, error) {
 			continue
 		}
 		instancePath := filepath.Join(stateDir, entry.Name(), "instance.json")
-		if _, statErr := os.Lstat(instancePath); statErr == nil {
+		if _, statErr := lstat(instancePath); statErr == nil || !os.IsNotExist(statErr) {
 			continue
 		}
 		spec, err := readSpecFile(filepath.Join(stateDir, entry.Name(), "runtime-spec.json"))

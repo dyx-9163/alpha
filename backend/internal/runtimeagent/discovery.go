@@ -41,6 +41,8 @@ var discoveryRetryBackoff = [...]time.Duration{
 	60 * time.Second,
 }
 
+const discoveryListenerShutdownTimeout = 2 * time.Second
+
 type discoverySyncer interface {
 	RefreshRoutes(context.Context, EndpointEvent) error
 	Register(context.Context, EndpointEvent) error
@@ -88,7 +90,9 @@ type discoveryWorker struct {
 }
 
 type managerDiscoverySyncer struct {
-	manager *Manager
+	manager        *Manager
+	startPort      func(int) error
+	shutdownServer func(*http.Server)
 }
 
 type discoveryResult uint8
@@ -688,6 +692,8 @@ func (syncer *managerDiscoverySyncer) RefreshRoutes(ctx context.Context, event E
 		return errors.New("proxy route port is already assigned")
 	}
 	previousSpec, hadPreviousSpec := manager.specs[event.InstanceID]
+	previousDeployment, hadPreviousDeployment := discoveryDeployment(previousSpec.Deployments, event.ServiceName)
+	previousService, hadPreviousService := discoveryService(previousSpec.Services, event.ServiceName)
 	previousRoutes := map[int]proxyRoute{}
 	oldPorts := make([]int, 0)
 	for port, route := range manager.routes {
@@ -721,20 +727,52 @@ func (syncer *managerDiscoverySyncer) RefreshRoutes(ctx context.Context, event E
 	_, listening := manager.servers[event.ListenPort]
 	manager.mu.Unlock()
 	if !listening {
-		if err := manager.startPort(event.ListenPort); err != nil {
+		startPort := syncer.startPort
+		if startPort == nil {
+			startPort = manager.startPort
+		}
+		if err := startPort(event.ListenPort); err != nil {
 			manager.mu.Lock()
 			if current, ok := manager.routes[event.ListenPort]; ok && current.InstanceID == event.InstanceID && current.Service == event.ServiceName {
 				delete(manager.routes, event.ListenPort)
 			}
-			for port, route := range previousRoutes {
-				if _, claimed := manager.routes[port]; !claimed {
-					manager.routes[port] = route
+			newerRoute := false
+			for port, route := range manager.routes {
+				if route.InstanceID == event.InstanceID && route.Service == event.ServiceName && port != event.ListenPort {
+					if _, wasPrevious := previousRoutes[port]; !wasPrevious {
+						newerRoute = true
+						break
+					}
 				}
 			}
-			if hadPreviousSpec {
-				manager.specs[event.InstanceID] = previousSpec
-			} else {
+			if !newerRoute {
+				for port, route := range previousRoutes {
+					if _, claimed := manager.routes[port]; !claimed {
+						manager.routes[port] = route
+					}
+				}
+			}
+			currentSpec := manager.specs[event.InstanceID]
+			currentDeployment, hasCurrentDeployment := discoveryDeployment(currentSpec.Deployments, event.ServiceName)
+			if hasCurrentDeployment && sameDiscoveryDeployment(currentDeployment, manifest.Spec) {
+				if hadPreviousDeployment {
+					currentSpec.Deployments = replaceDiscoveryDeployment(currentSpec.Deployments, previousDeployment)
+				} else {
+					currentSpec.Deployments = removeDiscoveryDeployment(currentSpec.Deployments, event.ServiceName)
+				}
+			}
+			currentService, hasCurrentService := discoveryService(currentSpec.Services, event.ServiceName)
+			if hasCurrentService && currentService == manifest.Service {
+				if hadPreviousService {
+					currentSpec.Services = replaceDiscoveryService(currentSpec.Services, previousService)
+				} else {
+					currentSpec.Services = removeDiscoveryService(currentSpec.Services, event.ServiceName)
+				}
+			}
+			if !hadPreviousSpec && len(currentSpec.Deployments) == 0 && len(currentSpec.Services) == 0 {
 				delete(manager.specs, event.InstanceID)
+			} else {
+				manager.specs[event.InstanceID] = currentSpec
 			}
 			manager.mu.Unlock()
 			return errors.New("proxy listener unavailable")
@@ -754,9 +792,29 @@ func (syncer *managerDiscoverySyncer) RefreshRoutes(ctx context.Context, event E
 	}
 	manager.mu.Unlock()
 	for _, server := range serversToStop {
-		_ = server.Shutdown(context.WithoutCancel(ctx))
+		syncer.retireServer(server)
 	}
 	return nil
+}
+
+func (syncer *managerDiscoverySyncer) retireServer(server *http.Server) {
+	shutdownServer := syncer.shutdownServer
+	if shutdownServer == nil {
+		shutdownServer = shutdownRetiredDiscoveryServer
+	}
+	go func() {
+		defer recoverRuntimeAgentPanic(syncer.manager.log, "retired runtime proxy shutdown")
+		shutdownServer(server)
+	}()
+}
+
+func shutdownRetiredDiscoveryServer(server *http.Server) {
+	ctx, cancel := context.WithTimeout(context.Background(), discoveryListenerShutdownTimeout)
+	err := server.Shutdown(ctx)
+	cancel()
+	if err != nil {
+		_ = server.Close()
+	}
 }
 
 func (syncer *managerDiscoverySyncer) Register(ctx context.Context, event EndpointEvent) error {
@@ -802,6 +860,31 @@ func replaceDiscoveryDeployment(items []DeploymentSpec, replacement DeploymentSp
 	return out
 }
 
+func discoveryDeployment(items []DeploymentSpec, serviceName string) (DeploymentSpec, bool) {
+	for _, item := range items {
+		if item.ServiceName == serviceName {
+			return item, true
+		}
+	}
+	return DeploymentSpec{}, false
+}
+
+func removeDiscoveryDeployment(items []DeploymentSpec, serviceName string) []DeploymentSpec {
+	out := make([]DeploymentSpec, 0, len(items))
+	for _, item := range items {
+		if item.ServiceName != serviceName {
+			out = append(out, item)
+		}
+	}
+	return out
+}
+
+func sameDiscoveryDeployment(left, right DeploymentSpec) bool {
+	leftJSON, leftErr := json.Marshal(left)
+	rightJSON, rightErr := json.Marshal(right)
+	return leftErr == nil && rightErr == nil && string(leftJSON) == string(rightJSON)
+}
+
 func replaceDiscoveryService(items []ServiceSpec, replacement ServiceSpec) []ServiceSpec {
 	out := make([]ServiceSpec, 0, len(items)+1)
 	replaced := false
@@ -817,6 +900,25 @@ func replaceDiscoveryService(items []ServiceSpec, replacement ServiceSpec) []Ser
 	}
 	if !replaced {
 		out = append(out, replacement)
+	}
+	return out
+}
+
+func discoveryService(items []ServiceSpec, serviceName string) (ServiceSpec, bool) {
+	for _, item := range items {
+		if item.Name == serviceName {
+			return item, true
+		}
+	}
+	return ServiceSpec{}, false
+}
+
+func removeDiscoveryService(items []ServiceSpec, serviceName string) []ServiceSpec {
+	out := make([]ServiceSpec, 0, len(items))
+	for _, item := range items {
+		if item.Name != serviceName {
+			out = append(out, item)
+		}
 	}
 	return out
 }

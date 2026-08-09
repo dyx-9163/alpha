@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"net"
+	"net/http"
 	"reflect"
 	"sync"
 	"testing"
@@ -486,6 +488,178 @@ func TestManagerDiscoveryRouteRestoresOldPortWhenNewListenerFails(t *testing.T) 
 	}
 }
 
+func TestManagerDiscoveryRouteFailurePreservesConcurrentPeerSpecUpdate(t *testing.T) {
+	discovery := newDiscoveryController(discoveryControllerOptions{Syncer: &fakeDiscoverySyncer{}})
+	t.Cleanup(discovery.Stop)
+	manager := newControllerTestManager(t, newControllerTestRunner(), func(options *ManagerOptions) {
+		options.discoveryController = discovery
+	})
+	t.Cleanup(func() { _ = manager.Remove(context.Background(), "admin") })
+	fileOldPort, fileAttemptPort := freePort(t), freePort(t)
+	permissionOldPort, permissionNewPort := freePort(t), freePort(t)
+	blocked := make(chan struct{})
+	release := make(chan struct{})
+	syncer := &managerDiscoverySyncer{
+		manager: manager,
+		startPort: func(port int) error {
+			if port == fileAttemptPort {
+				close(blocked)
+				<-release
+				return errors.New("injected listener failure")
+			}
+			return manager.startPort(port)
+		},
+	}
+
+	putAndRefresh := func(service string, generation int64, port int) error {
+		manifest := controllerTestManifest(service, generation, 1)
+		manifest.Spec.Image = fmt.Sprintf("aifar-%s:gen-%d", service, generation)
+		manifest.Spec.PodRevision = fmt.Sprintf("gen-%d", generation)
+		manifest.Service.Port = port
+		manifest.Service.ListenPort = port
+		manifest.Service.TargetPort = port
+		if _, err := manager.manifestStore.Put(manifest); err != nil {
+			return err
+		}
+		event := readyDiscoveryEvent(service, service+"-1")
+		event.ListenPort = port
+		return syncer.RefreshRoutes(context.Background(), event)
+	}
+	if err := putAndRefresh("file", 1, fileOldPort); err != nil {
+		t.Fatal(err)
+	}
+	if err := putAndRefresh("permission", 1, permissionOldPort); err != nil {
+		t.Fatal(err)
+	}
+
+	fileDone := make(chan error, 1)
+	go func() { fileDone <- putAndRefresh("file", 2, fileAttemptPort) }()
+	select {
+	case <-blocked:
+	case <-time.After(time.Second):
+		t.Fatal("file listener attempt did not reach the unlocked start window")
+	}
+	if err := putAndRefresh("permission", 2, permissionNewPort); err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+	if err := <-fileDone; err == nil {
+		t.Fatal("expected file listener replacement failure")
+	}
+
+	manager.mu.RLock()
+	spec := manager.specs["admin"]
+	fileOldRoute := manager.routes[fileOldPort]
+	_, fileAttemptRoute := manager.routes[fileAttemptPort]
+	permissionNewRoute := manager.routes[permissionNewPort]
+	_, permissionOldRoute := manager.routes[permissionOldPort]
+	manager.mu.RUnlock()
+	if got := discoverySpecServicePort(spec, "file"); got != fileOldPort {
+		t.Fatalf("file rollback port=%d, want %d", got, fileOldPort)
+	}
+	if got := discoverySpecServicePort(spec, "permission"); got != permissionNewPort {
+		t.Fatalf("concurrent permission update rolled back to port=%d, want %d", got, permissionNewPort)
+	}
+	if got := discoverySpecImage(spec, "permission"); got != "aifar-permission:gen-2" {
+		t.Fatalf("concurrent permission image rolled back to %q", got)
+	}
+	if fileOldRoute.Service != "file" || fileAttemptRoute || permissionNewRoute.Service != "permission" || permissionOldRoute {
+		t.Fatalf("unexpected routes after scoped rollback: fileOld=%+v fileAttempt=%t permissionNew=%+v permissionOld=%t", fileOldRoute, fileAttemptRoute, permissionNewRoute, permissionOldRoute)
+	}
+}
+
+func TestManagerDiscoveryRetiredListenerDoesNotBlockRegistrationOrStop(t *testing.T) {
+	manager := newControllerTestManager(t, newControllerTestRunner())
+	retirementStarted := make(chan struct{})
+	releaseRetirement := make(chan struct{})
+	routeSyncer := &managerDiscoverySyncer{
+		manager: manager,
+		shutdownServer: func(*http.Server) {
+			close(retirementStarted)
+			<-releaseRetirement
+		},
+	}
+	syncer := &retirementDiscoverySyncer{routes: routeSyncer, registered: make(chan int, 4)}
+	discovery := newDiscoveryController(discoveryControllerOptions{Syncer: syncer})
+	t.Cleanup(func() {
+		select {
+		case <-releaseRetirement:
+		default:
+			close(releaseRetirement)
+		}
+		discovery.Stop()
+		_ = manager.Remove(context.Background(), "admin")
+	})
+	oldPort, newPort := freePort(t), freePort(t)
+
+	publish := func(generation int64, port int) {
+		t.Helper()
+		manifest := controllerTestManifest("permission", generation, 1)
+		manifest.Service.Port = port
+		manifest.Service.ListenPort = port
+		manifest.Service.TargetPort = port
+		if _, err := manager.manifestStore.Put(manifest); err != nil {
+			t.Fatal(err)
+		}
+		event := readyDiscoveryEvent("permission", fmt.Sprintf("permission-%d", generation))
+		event.ListenPort = port
+		discovery.EndpointChanged(event)
+	}
+	publish(1, oldPort)
+	select {
+	case got := <-syncer.registered:
+		if got != oldPort {
+			t.Fatalf("initial registered port=%d, want %d", got, oldPort)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("initial registration did not finish")
+	}
+
+	publish(2, newPort)
+	select {
+	case <-retirementStarted:
+	case <-time.After(time.Second):
+		t.Fatal("retired listener shutdown did not start")
+	}
+	select {
+	case got := <-syncer.registered:
+		if got != newPort {
+			t.Fatalf("replacement registered port=%d, want %d", got, newPort)
+		}
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("blocked retired-listener shutdown delayed new registration")
+	}
+	stopped := make(chan struct{})
+	go func() {
+		discovery.StopInstance("admin")
+		close(stopped)
+	}()
+	select {
+	case <-stopped:
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("blocked retired-listener shutdown delayed StopInstance")
+	}
+	close(releaseRetirement)
+}
+
+func discoverySpecServicePort(spec RuntimeSpec, service string) int {
+	for _, item := range spec.Services {
+		if item.Name == service {
+			return item.ListenPort
+		}
+	}
+	return 0
+}
+
+func discoverySpecImage(spec RuntimeSpec, service string) string {
+	for _, deployment := range spec.Deployments {
+		if deployment.ServiceName == service {
+			return deployment.Image
+		}
+	}
+	return ""
+}
+
 type blockingDiscoverySyncer struct {
 	started chan struct{}
 	release chan struct{}
@@ -520,6 +694,23 @@ type portTransitionDiscoverySyncer struct {
 	registers       map[int]int
 	blockedRegister chan struct{}
 }
+
+type retirementDiscoverySyncer struct {
+	routes     *managerDiscoverySyncer
+	registered chan int
+}
+
+func (s *retirementDiscoverySyncer) RefreshRoutes(ctx context.Context, event EndpointEvent) error {
+	return s.routes.RefreshRoutes(ctx, event)
+}
+
+func (s *retirementDiscoverySyncer) Register(_ context.Context, event EndpointEvent) error {
+	s.registered <- event.ListenPort
+	return nil
+}
+
+func (s *retirementDiscoverySyncer) Deregister(context.Context, EndpointEvent) error { return nil }
+func (s *retirementDiscoverySyncer) Heartbeat(context.Context, EndpointEvent) error  { return nil }
 
 func newPortTransitionDiscoverySyncer() *portTransitionDiscoverySyncer {
 	return &portTransitionDiscoverySyncer{

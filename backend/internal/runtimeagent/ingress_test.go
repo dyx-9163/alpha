@@ -1386,6 +1386,98 @@ func TestPeriodicNacosReplayExcludesNewModelZeroReadyService(t *testing.T) {
 	}
 }
 
+func TestManagerResyncRequeuesNewModelServicesWithoutPeerBlocking(t *testing.T) {
+	runner := newControllerTestRunner()
+	manager := newControllerTestManager(t, runner)
+	for _, service := range []string{"permission", "file"} {
+		if _, err := manager.AcceptDeployment(context.Background(), controllerTestManifest(service, 1, 1)); err != nil {
+			t.Fatal(err)
+		}
+		waitForDeploymentCondition(t, manager, service, deploymentConditionAvailable, time.Second)
+	}
+
+	runner.mu.Lock()
+	for pod := range runner.pods {
+		delete(runner.pods, pod)
+	}
+	runner.blockedService = "permission"
+	runner.mu.Unlock()
+
+	if err := manager.Resync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-runner.blocked:
+	case <-time.After(time.Second):
+		t.Fatal("new-model permission service was not requeued")
+	}
+	waitForControllerTestPod(t, runner, "file", time.Second)
+
+	manager.removeServiceControllers("admin")
+}
+
+func TestManagerResyncIsolatesCorruptNewModelManifest(t *testing.T) {
+	runner := newControllerTestRunner()
+	manager := newControllerTestManager(t, runner)
+	if _, err := manager.manifestStore.Put(controllerTestManifest("file", 1, 1)); err != nil {
+		t.Fatal(err)
+	}
+	deploymentDir := filepath.Join(manager.stateDir, "admin", "deployments")
+	if err := os.WriteFile(filepath.Join(deploymentDir, "permission.json"), []byte("{not-json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := manager.Resync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	waitForControllerTestPod(t, runner, "file", time.Second)
+
+	manager.removeServiceControllers("admin")
+}
+
+func TestManagerResyncDoesNotEnqueueNewModelInsideLifecycleCriticalSection(t *testing.T) {
+	manager := newControllerTestManager(t, newControllerTestRunner())
+	if _, err := manager.manifestStore.Put(controllerTestManifest("file", 1, 1)); err != nil {
+		t.Fatal(err)
+	}
+	manager.reconcileMu.Lock()
+	resyncDone := make(chan error, 1)
+	go func() { resyncDone <- manager.Resync(context.Background()) }()
+	time.Sleep(50 * time.Millisecond)
+	manager.controllerMu.Lock()
+	controllerCount := len(manager.controllers)
+	manager.controllerMu.Unlock()
+	manager.reconcileMu.Unlock()
+	if controllerCount != 0 {
+		t.Fatalf("resync enqueued %d new-model controllers inside lifecycle critical section", controllerCount)
+	}
+	if err := <-resyncDone; err != nil {
+		t.Fatal(err)
+	}
+	manager.removeServiceControllers("admin")
+}
+
+func waitForControllerTestPod(t *testing.T, runner *controllerTestRunner, service string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		runner.mu.Lock()
+		found := false
+		for pod := range runner.pods {
+			if strings.Contains(pod, "-"+service+"-") {
+				found = true
+				break
+			}
+		}
+		runner.mu.Unlock()
+		if found {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("service %s was not restored", service)
+}
+
 func TestManagerContainerReadyDiagnosticsIncludesInspectAndLogs(t *testing.T) {
 	runner := &diagnosticRunner{}
 	manager := NewManager(ManagerOptions{StateDir: t.TempDir(), Runner: runner})

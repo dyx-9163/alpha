@@ -171,6 +171,34 @@ func TestLoadRuntimeSpecsForNacosKeepsLegacyFallback(t *testing.T) {
 	}
 }
 
+func TestLoadRuntimeSpecsForNacosFailsClosedOnAmbiguousInstanceMarker(t *testing.T) {
+	stateDir := t.TempDir()
+	manager := NewManager(ManagerOptions{StateDir: stateDir, Runner: &fakeRunner{}})
+	spec := NormalizeSpec(RuntimeSpec{
+		InstanceID:  "ambiguous",
+		InstallRoot: t.TempDir(),
+		Network:     "aifar-network",
+		Deployments: []DeploymentSpec{{ServiceName: "permission", Image: "permission:rev-1", PodRevision: "rev-1", Replicas: 1}},
+		Services:    []ServiceSpec{{Name: "permission", AppName: "alpha-permission", Port: 38010}},
+	})
+	if err := manager.writeSpec(spec); err != nil {
+		t.Fatal(err)
+	}
+
+	loaded, err := loadRuntimeSpecsForNacosWithLstat(stateDir, func(path string) (os.FileInfo, error) {
+		if filepath.Base(path) == "instance.json" {
+			return nil, os.ErrPermission
+		}
+		return os.Lstat(path)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(loaded) != 0 {
+		t.Fatalf("ambiguous new-model marker fell back to legacy spec: %+v", loaded)
+	}
+}
+
 func TestNacosErrorsSanitizeTokenizedTransportURLAndResponseBody(t *testing.T) {
 	spec := nacosErrorTestSpec(t)
 	t.Run("transport", func(t *testing.T) {
