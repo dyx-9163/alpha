@@ -55,12 +55,13 @@ type serviceController struct {
 	wake       chan struct{}
 	stop       chan struct{}
 
-	mu                 sync.Mutex
-	cancel             context.CancelFunc
-	activeGeneration   int64
-	rejectedGeneration int64
-	failures           int
-	stopped            bool
+	mu                  sync.Mutex
+	cancel              context.CancelFunc
+	activeGeneration    int64
+	requestedGeneration int64
+	rejectedGeneration  int64
+	failures            int
+	stopped             bool
 }
 
 func (m *Manager) AcceptDeployment(ctx context.Context, manifest DeploymentManifest) (DeploymentAcceptance, error) {
@@ -68,6 +69,15 @@ func (m *Manager) AcceptDeployment(ctx context.Context, manifest DeploymentManif
 		return DeploymentAcceptance{}, err
 	}
 	manifest = NormalizeDeploymentManifest(manifest)
+	maintenance := m.instanceMaintenanceLock(manifest.Metadata.InstanceID)
+	maintenance.RLock()
+	defer maintenance.RUnlock()
+	if err := ctx.Err(); err != nil {
+		return DeploymentAcceptance{}, err
+	}
+	if _, err := m.manifestStore.GetInstance(manifest.Metadata.InstanceID); err != nil {
+		return DeploymentAcceptance{}, err
+	}
 	acceptance, err := m.manifestStore.Put(manifest)
 	if err != nil {
 		return acceptance, err
@@ -173,7 +183,10 @@ func (controller *serviceController) enqueue() {
 
 func (controller *serviceController) supersede(generation int64) {
 	controller.mu.Lock()
-	if controller.cancel != nil && generation > controller.activeGeneration {
+	if generation > controller.requestedGeneration {
+		controller.requestedGeneration = generation
+	}
+	if controller.cancel != nil && controller.requestedGeneration > controller.activeGeneration {
 		controller.cancel()
 	}
 	controller.mu.Unlock()
@@ -186,7 +199,6 @@ func (controller *serviceController) resetBackoff() {
 }
 
 func (controller *serviceController) run() {
-	defer recoverRuntimeAgentPanic(controller.manager.log, "per-service deployment controller")
 	for {
 		select {
 		case <-controller.stop:
@@ -202,7 +214,7 @@ func (controller *serviceController) reconcileUntilStable() {
 		if controller.isStopped() {
 			return
 		}
-		result := controller.reconcileOnce()
+		result := controller.reconcileIteration()
 		switch result.kind {
 		case reconcileSuperseded:
 			continue
@@ -223,6 +235,23 @@ func (controller *serviceController) reconcileUntilStable() {
 			}
 		}
 	}
+}
+
+func (controller *serviceController) reconcileIteration() (result reconcileResult) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			controller.manager.setControllerPanic(controller.instanceID, controller.service, controller.activeGenerationSnapshot())
+			logf(controller.manager.log, "AIFAR deployment reconcile panic recovered instance=%s service=%s\n", controller.instanceID, controller.service)
+			result = reconcileResult{kind: reconcileRetry}
+		}
+	}()
+	return controller.reconcileOnce()
+}
+
+func (controller *serviceController) activeGenerationSnapshot() int64 {
+	controller.mu.Lock()
+	defer controller.mu.Unlock()
+	return controller.activeGeneration
 }
 
 func (controller *serviceController) isStopped() bool {
@@ -265,6 +294,9 @@ func (controller *serviceController) reconcileOnce() reconcileResult {
 	maintenance := manager.instanceMaintenanceLock(controller.instanceID)
 	maintenance.RLock()
 	defer maintenance.RUnlock()
+	if manager.controllerBeforeRead != nil {
+		manager.controllerBeforeRead(controller.instanceID, controller.service)
+	}
 
 	manifest, err := manager.manifestStore.Get(controller.instanceID, controller.service)
 	if err != nil {
@@ -278,11 +310,18 @@ func (controller *serviceController) reconcileOnce() reconcileResult {
 		manager.setControllerRejected(controller.instanceID, controller.service, err)
 		return reconcileResult{kind: reconcileSpecRejected}
 	}
+	if manager.controllerBeforeActivate != nil {
+		manager.controllerBeforeActivate(manifest)
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	controller.mu.Lock()
 	controller.cancel = cancel
 	controller.activeGeneration = manifest.Metadata.Generation
+	superseded := controller.stopped || controller.requestedGeneration > manifest.Metadata.Generation
+	if superseded {
+		cancel()
+	}
 	controller.mu.Unlock()
 	defer func() {
 		cancel()
@@ -292,6 +331,9 @@ func (controller *serviceController) reconcileOnce() reconcileResult {
 		}
 		controller.mu.Unlock()
 	}()
+	if superseded {
+		return reconcileResult{kind: reconcileSuperseded}
+	}
 
 	hash, hashErr := DeploymentManifestSpecHash(manifest)
 	if hashErr != nil {
@@ -345,7 +387,7 @@ func (controller *serviceController) clearRejected(generation int64) {
 func (controller *serviceController) isSuperseded(generation int64) bool {
 	controller.mu.Lock()
 	defer controller.mu.Unlock()
-	return controller.activeGeneration == generation && controller.cancel != nil
+	return controller.stopped || controller.requestedGeneration > generation
 }
 
 func (controller *serviceController) nextBackoff() time.Duration {
@@ -387,6 +429,18 @@ func (m *Manager) setControllerRejected(instanceID, serviceName string, reconcil
 	m.controllerStates[key] = state
 	m.controllerMu.Unlock()
 	logf(m.log, "AIFAR deployment manifest rejected instance=%s service=%s error=%v\n", instanceID, serviceName, reconcileErr)
+}
+
+func (m *Manager) setControllerPanic(instanceID, serviceName string, generation int64) {
+	key := endpointKey(instanceID, serviceName)
+	m.controllerMu.Lock()
+	manifest, ok := m.manifestCache[key]
+	hash := m.controllerStates[key].SpecHash
+	m.controllerMu.Unlock()
+	if !ok || generation <= 0 || manifest.Metadata.Generation != generation {
+		return
+	}
+	m.setControllerCondition(manifest, hash, deploymentConditionDegraded, "ContainerCreateFailed", true)
 }
 
 func (m *Manager) setControllerCondition(manifest DeploymentManifest, hash, conditionType, reason string, observed bool) {
@@ -454,10 +508,10 @@ func deploymentFailureReason(err error) string {
 		return "CrashLoopBackOff"
 	case strings.Contains(message, "no space left"), strings.Contains(message, "resource pressure"), strings.Contains(message, "cannot allocate memory"), strings.Contains(message, "oom"):
 		return "NodeResourcePressure"
-	case strings.Contains(message, "cannot connect to the docker daemon"), strings.Contains(message, "docker daemon is unavailable"), strings.Contains(message, "connection refused"):
-		return "AgentUnavailable"
 	case strings.Contains(message, "did not become ready"), strings.Contains(message, "readiness"), strings.Contains(message, "health"):
 		return "ReadinessFailed"
+	case strings.Contains(message, "cannot connect to the docker daemon"), strings.Contains(message, "docker daemon is unavailable"), strings.Contains(message, "aifar agent is unavailable"):
+		return "AgentUnavailable"
 	case strings.Contains(message, "start stopped"), strings.Contains(message, "restart unhealthy"):
 		return "ContainerStartFailed"
 	case strings.Contains(message, "create"), strings.Contains(message, "start aifar pod"), strings.Contains(message, "docker run"):

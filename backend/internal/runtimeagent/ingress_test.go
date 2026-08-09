@@ -1,11 +1,14 @@
 package runtimeagent
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"net"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"slices"
 	"sort"
 	"strconv"
@@ -70,6 +73,69 @@ func TestManagerRemoveCancelsActiveServiceControllerBeforeMaintenance(t *testing
 	}
 }
 
+func TestManagerRemoveLinearizesConcurrentDeploymentAcceptance(t *testing.T) {
+	manager := newControllerTestManager(t, newControllerTestRunner())
+	if _, err := manager.AcceptDeployment(context.Background(), controllerTestManifest("permission", 1, 0)); err != nil {
+		t.Fatal(err)
+	}
+	waitForDeploymentCondition(t, manager, "permission", "Offline", time.Second)
+	manager.controllerMu.Lock()
+	controller := manager.controllers[endpointKey("admin", "permission")]
+	manager.controllerMu.Unlock()
+	if controller == nil {
+		t.Fatal("permission controller missing")
+	}
+
+	maintenance := manager.instanceMaintenanceLock("admin")
+	maintenance.RLock()
+	removeDone := make(chan error, 1)
+	go func() { removeDone <- manager.Remove(context.Background(), "admin") }()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		controller.mu.Lock()
+		stopped := controller.stopped
+		controller.mu.Unlock()
+		if stopped {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	time.Sleep(10 * time.Millisecond)
+	type acceptResult struct{ err error }
+	acceptDone := make(chan acceptResult, 1)
+	go func() {
+		_, err := manager.AcceptDeployment(context.Background(), controllerTestManifest("file", 1, 0))
+		acceptDone <- acceptResult{err: err}
+	}()
+	acceptedBeforeRemoval := false
+	select {
+	case <-acceptDone:
+		acceptedBeforeRemoval = true
+	case <-time.After(30 * time.Millisecond):
+	}
+	maintenance.RUnlock()
+	if err := <-removeDone; err != nil {
+		t.Fatal(err)
+	}
+	var result acceptResult
+	if !acceptedBeforeRemoval {
+		select {
+		case result = <-acceptDone:
+		case <-time.After(time.Second):
+			t.Fatal("deployment acceptance remained blocked after removal")
+		}
+	}
+	if acceptedBeforeRemoval || result.err == nil {
+		t.Fatalf("concurrent deployment acceptance escaped removal: early=%v err=%v", acceptedBeforeRemoval, result.err)
+	}
+	manager.controllerMu.Lock()
+	_, orphaned := manager.controllers[endpointKey("admin", "file")]
+	manager.controllerMu.Unlock()
+	if orphaned {
+		t.Fatal("concurrent acceptance left an orphaned controller")
+	}
+}
+
 func TestManagerLoadStartsPersistedServiceControllers(t *testing.T) {
 	stateDir := t.TempDir()
 	store := ManifestStore{StateDir: stateDir}
@@ -86,6 +152,40 @@ func TestManagerLoadStartsPersistedServiceControllers(t *testing.T) {
 	state := waitForDeploymentCondition(t, manager, "permission", "Available", time.Second)
 	if state.ObservedGeneration != 1 {
 		t.Fatalf("observed generation=%d, want 1", state.ObservedGeneration)
+	}
+}
+
+func TestManagerLoadIsolatesCorruptManifestAndRecordsSpecRejected(t *testing.T) {
+	stateDir := t.TempDir()
+	store := ManifestStore{StateDir: stateDir}
+	if err := store.PutInstance(controllerTestConfig()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Put(controllerTestManifest("permission", 1, 1)); err != nil {
+		t.Fatal(err)
+	}
+	deploymentsDir := filepath.Join(stateDir, "admin", "deployments")
+	if err := os.WriteFile(filepath.Join(deploymentsDir, "file.json"), []byte("{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(deploymentsDir, "Bad_Name.json"), []byte("super-secret-invalid-content"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var logs bytes.Buffer
+	manager := NewManager(ManagerOptions{StateDir: stateDir, Runner: newControllerTestRunner(), ManifestStore: &store, Log: &logs})
+	if err := manager.Load(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	waitForDeploymentCondition(t, manager, "permission", "Available", time.Second)
+	rejected := waitForDeploymentCondition(t, manager, "file", "Degraded", 250*time.Millisecond)
+	if condition := currentCondition(rejected); condition.Reason != "SpecRejected" {
+		t.Fatalf("corrupt manifest reason=%s, want SpecRejected", condition.Reason)
+	}
+	if _, ok := manager.DeploymentState("admin", "bad_name"); ok {
+		t.Fatal("unsafe deployment filename was treated as a service")
+	}
+	if output := logs.String(); strings.Contains(output, "super-secret-invalid-content") || strings.Contains(output, "Bad_Name") {
+		t.Fatalf("unsafe manifest detail leaked to logs: %s", output)
 	}
 }
 

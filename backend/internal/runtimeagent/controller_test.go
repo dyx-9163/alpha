@@ -22,6 +22,7 @@ type controllerTestRunner struct {
 	runFailures    int
 	runError       error
 	runAttempts    int
+	panicRuns      int
 }
 
 func newControllerTestRunner() *controllerTestRunner {
@@ -34,6 +35,13 @@ func newControllerTestRunner() *controllerTestRunner {
 }
 
 func (r *controllerTestRunner) Run(ctx context.Context, name string, args ...string) (CommandResult, error) {
+	r.mu.Lock()
+	if r.panicRuns > 0 {
+		r.panicRuns--
+		r.mu.Unlock()
+		panic("injected runner panic")
+	}
+	r.mu.Unlock()
 	call := name + " " + strings.Join(args, " ")
 	service := serviceFromControllerCall(call)
 	if len(args) > 0 && args[0] == "run" {
@@ -264,13 +272,61 @@ func TestNewGenerationSupersedesOnlySameService(t *testing.T) {
 	}
 }
 
-func TestSupersededGenerationCannotRegressDeploymentState(t *testing.T) {
-	manager := newControllerTestManager(t, newControllerTestRunner())
-	maintenance := manager.instanceMaintenanceLock("admin")
-	maintenance.Lock()
-	defer maintenance.Unlock()
+func TestHigherGenerationWinsBeforeOldControllerRegistersCancel(t *testing.T) {
+	runner := newControllerTestRunner()
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	manager := newControllerTestManager(t, runner, func(options *ManagerOptions) {
+		options.controllerBeforeActivate = func(manifest DeploymentManifest) {
+			if manifest.Metadata.Generation != 1 {
+				return
+			}
+			close(entered)
+			<-release
+		}
+	})
+	if _, err := manager.AcceptDeployment(context.Background(), controllerTestManifest("permission", 1, 1)); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("generation 1 did not reach pre-activation window")
+	}
 	if _, err := manager.AcceptDeployment(context.Background(), controllerTestManifest("permission", 2, 0)); err != nil {
 		t.Fatal(err)
+	}
+	close(release)
+	waitForDeploymentCondition(t, manager, "permission", "Offline", time.Second)
+	runner.mu.Lock()
+	attempts := runner.runAttempts
+	runner.mu.Unlock()
+	if attempts != 0 {
+		t.Fatalf("superseded generation entered Docker; run attempts=%d", attempts)
+	}
+}
+
+func TestSupersededGenerationCannotRegressDeploymentState(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	manager := newControllerTestManager(t, newControllerTestRunner(), func(options *ManagerOptions) {
+		options.controllerBeforeActivate = func(manifest DeploymentManifest) {
+			if manifest.Metadata.Generation == 2 {
+				once.Do(func() {
+					close(entered)
+					<-release
+				})
+			}
+		}
+	})
+	if _, err := manager.AcceptDeployment(context.Background(), controllerTestManifest("permission", 2, 0)); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("generation 2 did not reach controlled reconcile window")
 	}
 	stale := controllerTestManifest("permission", 1, 1)
 	hash, err := DeploymentManifestSpecHash(stale)
@@ -278,6 +334,8 @@ func TestSupersededGenerationCannotRegressDeploymentState(t *testing.T) {
 		t.Fatal(err)
 	}
 	manager.setControllerCondition(stale, hash, deploymentConditionAvailable, "MinimumReplicasAvailable", true)
+	manager.setControllerPanic("admin", "permission", 1)
+	manager.setControllerPanic("admin", "permission", 0)
 	state, ok := manager.DeploymentState("admin", "permission")
 	if !ok {
 		t.Fatal("deployment state missing")
@@ -285,6 +343,11 @@ func TestSupersededGenerationCannotRegressDeploymentState(t *testing.T) {
 	if state.Generation != 2 {
 		t.Fatalf("superseded generation regressed state to %d, want 2", state.Generation)
 	}
+	if condition := currentCondition(state); condition.Type != deploymentConditionAccepted {
+		t.Fatalf("unattributed panic changed current condition to %s, want Accepted", condition.Type)
+	}
+	close(release)
+	waitForDeploymentCondition(t, manager, "permission", "Offline", time.Second)
 }
 
 func TestControllerUsesSingleOwnerAndWakeChannelPerService(t *testing.T) {
@@ -317,20 +380,50 @@ func TestControllerUsesSingleOwnerAndWakeChannelPerService(t *testing.T) {
 	}
 }
 
+func TestControllerSurvivesRunnerPanicAndAcceptsNewGeneration(t *testing.T) {
+	runner := newControllerTestRunner()
+	runner.panicRuns = 1
+	manager := newControllerTestManager(t, runner)
+	if _, err := manager.AcceptDeployment(context.Background(), controllerTestManifest("permission", 1, 1)); err != nil {
+		t.Fatal(err)
+	}
+	degraded := waitForDeploymentCondition(t, manager, "permission", "Degraded", 250*time.Millisecond)
+	if condition := currentCondition(degraded); condition.Reason != "ContainerCreateFailed" {
+		t.Fatalf("panic reason=%s, want ContainerCreateFailed", condition.Reason)
+	}
+	if _, err := manager.AcceptDeployment(context.Background(), controllerTestManifest("permission", 2, 1)); err != nil {
+		t.Fatal(err)
+	}
+	available := waitForDeploymentCondition(t, manager, "permission", "Available", time.Second)
+	if available.Generation != 2 || available.ObservedGeneration != 2 {
+		t.Fatalf("state after panic recovery=%+v", available)
+	}
+}
+
 func TestControllerHonorsInstanceMaintenanceWriteLock(t *testing.T) {
 	manager := newControllerTestManager(t, newControllerTestRunner())
 	lock := manager.instanceMaintenanceLock("admin")
 	lock.Lock()
-	if _, err := manager.AcceptDeployment(context.Background(), controllerTestManifest("permission", 1, 0)); err != nil {
-		t.Fatal(err)
-	}
-	time.Sleep(20 * time.Millisecond)
-	if state, ok := manager.DeploymentState("admin", "permission"); ok {
-		if condition := currentCondition(state); condition.Type != "Accepted" {
-			t.Fatalf("condition while maintenance lock held=%s, want Accepted", condition.Type)
-		}
+	acceptDone := make(chan error, 1)
+	go func() {
+		_, err := manager.AcceptDeployment(context.Background(), controllerTestManifest("permission", 1, 0))
+		acceptDone <- err
+	}()
+	select {
+	case err := <-acceptDone:
+		lock.Unlock()
+		t.Fatalf("acceptance escaped maintenance lock: %v", err)
+	case <-time.After(30 * time.Millisecond):
 	}
 	lock.Unlock()
+	select {
+	case err := <-acceptDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("acceptance remained blocked after maintenance")
+	}
 	waitForDeploymentCondition(t, manager, "permission", "Offline", time.Second)
 }
 
@@ -474,9 +567,11 @@ func TestControllerClassifiesStableFailureReasons(t *testing.T) {
 		{name: "create", err: errors.New("docker create failed"), reason: "ContainerCreateFailed"},
 		{name: "start", err: errors.New("start stopped container failed"), reason: "ContainerStartFailed"},
 		{name: "readiness", err: errors.New("pod did not become ready"), reason: "ReadinessFailed"},
+		{name: "readiness with refused diagnostic", err: errors.New("AIFAR pod did not become ready: permission\nhealth probe: connection refused"), reason: "ReadinessFailed"},
 		{name: "crashloop", err: errors.New("CrashLoopBackOff"), reason: "CrashLoopBackOff"},
 		{name: "pressure", err: errors.New("no space left on device"), reason: "NodeResourcePressure"},
 		{name: "agent", err: errors.New("Cannot connect to the Docker daemon"), reason: "AgentUnavailable"},
+		{name: "bare refused is not agent boundary", err: errors.New("connection refused"), reason: "ContainerCreateFailed"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -514,16 +609,33 @@ func TestControllerSpecRejectedDoesNotRetryUntilNewGeneration(t *testing.T) {
 	}
 	clock := newFakeControllerClock()
 	runner := newControllerTestRunner()
-	manager := NewManager(ManagerOptions{StateDir: stateDir, Runner: runner, ManifestStore: store, controllerClock: clock})
-	lock := manager.instanceMaintenanceLock("admin")
-	lock.Lock()
+	readEntered := make(chan struct{})
+	readRelease := make(chan struct{})
+	var readOnce sync.Once
+	manager := NewManager(ManagerOptions{
+		StateDir:        stateDir,
+		Runner:          runner,
+		ManifestStore:   store,
+		controllerClock: clock,
+		controllerBeforeRead: func(_, _ string) {
+			readOnce.Do(func() {
+				close(readEntered)
+				<-readRelease
+			})
+		},
+	})
 	manifest := controllerTestManifest("permission", 1, 1)
 	manifest.Spec.EnvFiles = []string{"/aifar/apps/admin/env/permission.env"}
 	if _, err := manager.AcceptDeployment(context.Background(), manifest); err != nil {
 		t.Fatal(err)
 	}
+	select {
+	case <-readEntered:
+	case <-time.After(time.Second):
+		t.Fatal("controller did not reach pre-read window")
+	}
 	reject.Store(true)
-	lock.Unlock()
+	close(readRelease)
 	state := waitForDeploymentCondition(t, manager, "permission", "Degraded", time.Second)
 	if condition := currentCondition(state); condition.Reason != "SpecRejected" {
 		t.Fatalf("reason=%s, want SpecRejected", condition.Reason)
