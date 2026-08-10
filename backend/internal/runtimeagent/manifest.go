@@ -13,8 +13,9 @@ import (
 )
 
 const (
-	ManifestAPIVersion     = "aifar.io/v1alpha1"
-	DeploymentManifestKind = "Deployment"
+	ManifestAPIVersion      = "aifar.io/v1alpha1"
+	DeploymentManifestKind  = "Deployment"
+	LegacyBootstrapMaxBytes = 4 << 20
 )
 
 var (

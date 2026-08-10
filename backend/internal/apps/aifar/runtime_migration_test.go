@@ -453,6 +453,34 @@ func TestRuntimeMigrationRequiresTypedInputTransportBeforeRemoteAction(t *testin
 	}
 }
 
+func TestRuntimeMigrationLegacyBootstrapByteBoundary(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		size       int
+		wantReason string
+		wantInput  int
+		wantSwitch bool
+	}{
+		{name: "exact limit", size: runtimeMigrationMaxLegacyBytes, wantInput: 1, wantSwitch: true},
+		{name: "limit plus one", size: runtimeMigrationMaxLegacyBytes + 1, wantReason: "AIFAR_RUNTIME_MIGRATION_LEGACY_SPEC_TOO_LARGE"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			control, remote, req := runtimeMigrationFixture(t, 1)
+			if len(remote.legacyJSON) > test.size {
+				t.Fatalf("fixture=%d exceeds target=%d", len(remote.legacyJSON), test.size)
+			}
+			remote.legacyJSON = append(remote.legacyJSON, bytes.Repeat([]byte(" "), test.size-len(remote.legacyJSON))...)
+			err := NewService(control, remote).MigrateRuntimeModel(context.Background(), req, fakeLogger{})
+			if reasonCode(err) != test.wantReason {
+				t.Fatalf("size=%d reason=%q want=%q err=%v", test.size, reasonCode(err), test.wantReason, err)
+			}
+			if remote.inputBootstrapCalls != test.wantInput || remote.agentHasSwitched != test.wantSwitch {
+				t.Fatalf("size=%d typed SSH calls=%d switched=%t", test.size, remote.inputBootstrapCalls, remote.agentHasSwitched)
+			}
+		})
+	}
+}
+
 func TestRuntimeMigrationCommitsThroughExactSQLiteMaintenanceOwner(t *testing.T) {
 	fixture, remote, req := runtimeMigrationFixture(t, 1)
 	db := openAIFARTestStore(t)

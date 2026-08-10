@@ -24,7 +24,7 @@ import (
 const (
 	runtimeMigrationOperation      = "migrate-runtime-model"
 	runtimeMigrationReadMarker     = "AIFAR_RUNTIME_MIGRATION_READ"
-	runtimeMigrationMaxLegacyBytes = 4 << 20
+	runtimeMigrationMaxLegacyBytes = runtimeagent.LegacyBootstrapMaxBytes
 )
 
 var requiredRuntimeMigrationAgentFeatures = []string{
@@ -239,7 +239,7 @@ func (s Service) readRuntimeMigrationState(ctx context.Context, server store.Ser
 		return runtimeMigrationRemoteState{}, repairRequired("AIFAR_RUNTIME_MIGRATION_LEGACY_READ_FAILED", nil)
 	}
 	if len(result.Stdout) > base64.StdEncoding.EncodedLen(runtimeMigrationMaxLegacyBytes)+4096 {
-		return runtimeMigrationRemoteState{}, repairRequired("AIFAR_RUNTIME_MIGRATION_LEGACY_SPEC_INVALID", nil)
+		return runtimeMigrationRemoteState{}, repairRequired("AIFAR_RUNTIME_MIGRATION_LEGACY_SPEC_TOO_LARGE", nil)
 	}
 	var state runtimeMigrationRemoteState
 	seen := map[string]bool{}
@@ -257,7 +257,10 @@ func (s Service) readRuntimeMigrationState(ctx context.Context, server store.Ser
 			state.model = strings.TrimSpace(value)
 		case "legacy":
 			decoded, decodeErr := base64.StdEncoding.DecodeString(strings.TrimSpace(value))
-			if decodeErr != nil || len(decoded) == 0 || len(decoded) > runtimeMigrationMaxLegacyBytes {
+			if len(decoded) > runtimeMigrationMaxLegacyBytes {
+				return state, repairRequired("AIFAR_RUNTIME_MIGRATION_LEGACY_SPEC_TOO_LARGE", nil)
+			}
+			if decodeErr != nil || len(decoded) == 0 {
 				return state, repairRequired("AIFAR_RUNTIME_MIGRATION_LEGACY_SPEC_INVALID", nil)
 			}
 			state.legacyJSON = decoded

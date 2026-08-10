@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -400,11 +401,18 @@ func TestBootstrapRuntimeStdinValidatesExactBytesBeforeTypedRequest(t *testing.T
 	requests := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requests++
-		if r.URL.Path != "/runtime/bootstrap" {
+		if r.URL.Path != "/runtime/bootstrap-verified" {
 			t.Fatalf("path=%q", r.URL.Path)
 		}
+		raw, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(raw, data) {
+			t.Fatalf("verified raw bytes were re-encoded: got=%d want=%d", len(raw), len(data))
+		}
 		var got runtimeagent.LegacyRuntimeSpec
-		decoder := json.NewDecoder(r.Body)
+		decoder := json.NewDecoder(bytes.NewReader(raw))
 		decoder.DisallowUnknownFields()
 		if err := decoder.Decode(&got); err != nil {
 			t.Fatal(err)
@@ -445,6 +453,87 @@ func TestBootstrapRuntimeStdinValidatesExactBytesBeforeTypedRequest(t *testing.T
 			}
 		})
 	}
+}
+
+func TestBootstrapRuntimeStdinDedicatedByteBoundaryAndGenericLimit(t *testing.T) {
+	base, err := json.Marshal(agentTestLegacySpec())
+	if err != nil {
+		t.Fatal(err)
+	}
+	makeBody := func(size int) []byte {
+		if len(base) > size {
+			t.Fatalf("base=%d exceeds target=%d", len(base), size)
+		}
+		return append(append([]byte(nil), base...), bytes.Repeat([]byte(" "), size-len(base))...)
+	}
+
+	t.Run("exact dedicated limit reaches Manager once", func(t *testing.T) {
+		stateDir := t.TempDir()
+		manager := runtimeagent.NewManager(runtimeagent.ManagerOptions{StateDir: stateDir, Runner: failingRestartRunner{}})
+		handler := newAgentHandler(manager, func(context.Context) error { return nil })
+		var dedicatedRequests atomic.Int32
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/runtime/bootstrap-verified" {
+				dedicatedRequests.Add(1)
+			}
+			handler.ServeHTTP(w, r)
+		}))
+		defer server.Close()
+		body := makeBody(int(runtimeagent.LegacyBootstrapMaxBytes))
+		digest := sha256.Sum256(body)
+		args := []string{"--instance", "admin", "--sha256", hex.EncodeToString(digest[:]), "--addr", strings.TrimPrefix(server.URL, "http://")}
+		if err := runServiceAgentCommandWithInput("bootstrap-runtime-stdin", args, bytes.NewReader(body), io.Discard); err != nil {
+			t.Fatal(err)
+		}
+		if dedicatedRequests.Load() != 1 {
+			t.Fatalf("dedicated requests=%d want=1", dedicatedRequests.Load())
+		}
+		if _, err := os.Stat(filepath.Join(stateDir, "admin", "instance.json")); err != nil {
+			t.Fatalf("Manager marker was not written: %v", err)
+		}
+	})
+
+	t.Run("limit plus one stops before request and marker", func(t *testing.T) {
+		stateDir := t.TempDir()
+		manager := runtimeagent.NewManager(runtimeagent.ManagerOptions{StateDir: stateDir, Runner: failingRestartRunner{}})
+		requests := 0
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			requests++
+			newAgentHandler(manager, func(context.Context) error { return nil }).ServeHTTP(w, r)
+		}))
+		defer server.Close()
+		body := makeBody(int(runtimeagent.LegacyBootstrapMaxBytes) + 1)
+		digest := sha256.Sum256(body)
+		args := []string{"--instance", "admin", "--sha256", hex.EncodeToString(digest[:]), "--addr", strings.TrimPrefix(server.URL, "http://")}
+		err := runServiceAgentCommandWithInput("bootstrap-runtime-stdin", args, bytes.NewReader(body), io.Discard)
+		if err == nil || strings.Contains(err.Error(), "SECRET-GROUP") {
+			t.Fatalf("oversize result was not a sanitized rejection: %v", err)
+		}
+		if requests != 0 {
+			t.Fatalf("oversize input reached HTTP: requests=%d", requests)
+		}
+		if _, err := os.Stat(filepath.Join(stateDir, "admin", "instance.json")); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("oversize input changed marker state: %v", err)
+		}
+	})
+
+	t.Run("generic bootstrap keeps one MiB limit", func(t *testing.T) {
+		manager := runtimeagent.NewManager(runtimeagent.ManagerOptions{StateDir: t.TempDir(), Runner: failingRestartRunner{}})
+		handler := newAgentHandler(manager, func(context.Context) error { return nil })
+		oversized := agentTestLegacySpec()
+		oversized.Nacos.Group = strings.Repeat("x", int(maxAgentRequestBodyBytes))
+		body, err := json.Marshal(oversized)
+		if err != nil || int64(len(body)) <= maxAgentRequestBodyBytes {
+			t.Fatalf("failed to build oversized generic payload: size=%d err=%v", len(body), err)
+		}
+		recorder := httptest.NewRecorder()
+		request := httptest.NewRequest(http.MethodPost, "/runtime/bootstrap", bytes.NewReader(body))
+		request.Header.Set("Content-Type", "application/json")
+		handler.ServeHTTP(recorder, request)
+		if recorder.Code != http.StatusRequestEntityTooLarge {
+			t.Fatalf("generic bootstrap status=%d body=%s", recorder.Code, recorder.Body.String())
+		}
+	})
 }
 
 func TestServiceCLINon2xxDoesNotEchoRemoteDetails(t *testing.T) {

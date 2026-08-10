@@ -27,6 +27,8 @@ import (
 
 const maxAgentRequestBodyBytes int64 = 1 << 20
 
+const verifiedRuntimeBootstrapPath = "/runtime/bootstrap-verified"
+
 var (
 	agentInstancePattern  = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
 	agentServicePattern   = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,62}$`)
@@ -258,6 +260,30 @@ func newAgentHandler(manager *runtimeagent.Manager, healthCheck func(context.Con
 		}
 		var spec runtimeagent.LegacyRuntimeSpec
 		if !decodeAgentJSON(w, r, &spec) {
+			return
+		}
+		acceptance, err := manager.BootstrapLegacyRuntime(r.Context(), spec)
+		if err != nil {
+			if errors.Is(err, runtimeagent.ErrLegacyRuntimeSpecDisabled) {
+				writeAgentError(w, http.StatusConflict, "LEGACY_RUNTIME_SPEC_DISABLED", "legacy runtime spec is disabled", nil)
+				return
+			}
+			if errors.Is(err, runtimeagent.ErrInvalidLegacyRuntimeSpec) {
+				writeAgentError(w, http.StatusBadRequest, "INVALID_LEGACY_RUNTIME_SPEC", "legacy runtime spec is invalid", nil)
+				return
+			}
+			writeAgentError(w, http.StatusInternalServerError, "BOOTSTRAP_RUNTIME_FAILED", "runtime bootstrap failed", nil)
+			return
+		}
+		writeJSON(w, http.StatusAccepted, acceptance)
+	})
+	mux.HandleFunc(verifiedRuntimeBootstrapPath, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeAgentError(w, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "method not allowed", nil)
+			return
+		}
+		var spec runtimeagent.LegacyRuntimeSpec
+		if !decodeAgentJSONWithLimit(w, r, &spec, runtimeagent.LegacyBootstrapMaxBytes) {
 			return
 		}
 		acceptance, err := manager.BootstrapLegacyRuntime(r.Context(), spec)
@@ -630,13 +656,17 @@ func ensureEmptyAgentBody(w http.ResponseWriter, r *http.Request) bool {
 }
 
 func decodeAgentJSON(w http.ResponseWriter, r *http.Request, target any) bool {
+	return decodeAgentJSONWithLimit(w, r, target, maxAgentRequestBodyBytes)
+}
+
+func decodeAgentJSONWithLimit(w http.ResponseWriter, r *http.Request, target any, maxBytes int64) bool {
 	mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
 	if err != nil || mediaType != "application/json" {
 		writeAgentError(w, http.StatusUnsupportedMediaType, "UNSUPPORTED_MEDIA_TYPE", "Content-Type must be application/json", nil)
 		return false
 	}
 	defer r.Body.Close()
-	r.Body = http.MaxBytesReader(w, r.Body, maxAgentRequestBodyBytes)
+	r.Body = http.MaxBytesReader(w, r.Body, maxBytes)
 	decoder := json.NewDecoder(r.Body)
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(target); err != nil {
@@ -765,8 +795,8 @@ func runServiceAgentCommandWithInput(name string, args []string, in io.Reader, o
 		if in == nil {
 			return errors.New("runtime bootstrap input is required")
 		}
-		data, err := io.ReadAll(io.LimitReader(in, maxAgentRequestBodyBytes+1))
-		if err != nil || int64(len(data)) > maxAgentRequestBodyBytes {
+		data, err := io.ReadAll(io.LimitReader(in, runtimeagent.LegacyBootstrapMaxBytes+1))
+		if err != nil || len(data) > runtimeagent.LegacyBootstrapMaxBytes {
 			return errors.New("runtime bootstrap input is invalid")
 		}
 		hash := sha256.Sum256(data)
@@ -777,11 +807,7 @@ func runServiceAgentCommandWithInput(name string, args []string, in io.Reader, o
 		if err := decodeBoundedStrictJSON(data, &spec); err != nil || strings.TrimSpace(spec.InstanceID) != instance {
 			return errors.New("runtime bootstrap input is invalid")
 		}
-		body, err := json.Marshal(spec)
-		if err != nil {
-			return errors.New("runtime bootstrap input is invalid")
-		}
-		return doAgentTypedRequest(ctx, *addr, http.MethodPost, "/runtime/bootstrap", body, out)
+		return doAgentTypedRequest(ctx, *addr, http.MethodPost, verifiedRuntimeBootstrapPath, data, out)
 	default:
 		return errors.New("unsupported service agent command")
 	}
