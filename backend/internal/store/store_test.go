@@ -633,6 +633,41 @@ func TestTaskLifecycle(t *testing.T) {
 	}
 }
 
+func TestTerminalTaskStatusAtomicallyTerminalizesPendingTargetsAndSteps(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "aifar.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	task, err := db.CreateTask(Task{Type: "test.queued", Target: "instance-1:permission", CreatedBy: "tester"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.UpsertTaskTarget(task.ID, task.Target, "pending", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.UpsertTaskStep(task.ID, task.Target, "accept-service-intent", "accept service intent", 1, "pending", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.UpdateTaskStatus(task.ID, "cancelled", "queued task cancelled"); err != nil {
+		t.Fatal(err)
+	}
+	targets, err := db.ListTaskTargets(task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(targets) != 1 || targets[0].Status != "cancelled" || targets[0].Error != "queued task cancelled" || targets[0].FinishedAt.IsZero() {
+		t.Fatalf("pending target was not terminalized with task: %+v", targets)
+	}
+	steps, err := db.ListTaskSteps(task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(steps) != 1 || steps[0].Status != "cancelled" || steps[0].Error != "queued task cancelled" || steps[0].FinishedAt.IsZero() {
+		t.Fatalf("pending step was not terminalized with task: %+v", steps)
+	}
+}
+
 func TestRecoverInterruptedTasks(t *testing.T) {
 	db, err := Open(filepath.Join(t.TempDir(), "aifar.db"))
 	if err != nil {

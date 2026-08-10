@@ -706,8 +706,21 @@ func (s *Store) UpdateTaskStatus(id, status, errText string) error {
 		_, err := s.db.Exec(`update tasks set status=?, started_at=? where id=?`, status, now, id)
 		return err
 	case "success", "failed", "cancelled", "timeout":
-		_, err := s.db.Exec(`update tasks set status=?, error=?, lease_owner='', lease_expires_at=null, finished_at=? where id=?`, status, errText, now, id)
-		return err
+		tx, err := s.db.Begin()
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback()
+		if _, err := tx.Exec(`update tasks set status=?, error=?, lease_owner='', lease_expires_at=null, finished_at=? where id=?`, status, errText, now, id); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`update task_targets set status=?, error=?, finished_at=? where task_id=? and status in ('pending','running')`, status, errText, now, id); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`update task_steps set status=?, error=?, finished_at=? where task_id=? and status in ('pending','running')`, status, errText, now, id); err != nil {
+			return err
+		}
+		return tx.Commit()
 	default:
 		_, err := s.db.Exec(`update tasks set status=?, error=? where id=?`, status, errText, id)
 		return err

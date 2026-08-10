@@ -52,6 +52,7 @@ type aifarRuntimeBuildOptions struct {
 	IncludeStats            bool
 	DockerUnavailable       bool
 	DockerUnavailableReason string
+	Language                string
 }
 
 type aifarRuntimeAgent struct {
@@ -333,6 +334,7 @@ func (a *aifarRuntimeController) runtime(w http.ResponseWriter, r *http.Request)
 	response, err := a.buildAIFARRuntime(r.Context(), server, aifarRuntimeBuildOptions{
 		IncludePods:  queryBool(r, "includePods", true),
 		IncludeStats: queryBool(r, "includeStats", true),
+		Language:     lang,
 	})
 	respond(w, response, err)
 }
@@ -759,7 +761,11 @@ func (a *aifarRuntimeController) startRuntimeDeploymentMutation(w http.ResponseW
 		respondTask(w, task, err)
 		return
 	}
-	if err := a.storeTaskPlanOrDelete(task.ID, simpleTaskPlan(target, aifarRuntimeDeploymentSteps(lang, req.ServiceName))); err != nil {
+	if err := a.storeRuntimePlan(task.ID, simpleTaskPlan(target, aifarRuntimeDeploymentSteps(lang, req.ServiceName))); err != nil {
+		if cleanupErr := a.cleanupUnstartedRuntimeMutation(task.ID, "", lang); cleanupErr != nil {
+			a.writeRuntimePrestartCleanupError(w, lang)
+			return
+		}
 		writeError(w, http.StatusInternalServerError, "TASK_PLAN_STORE_FAILED", i18n.Text(lang, "api.aifarRuntimeDeploymentTaskFailed"), nil)
 		return
 	}
@@ -768,7 +774,10 @@ func (a *aifarRuntimeController) startRuntimeDeploymentMutation(w http.ResponseW
 		Actor: actor, TaskID: task.ID, ExpiresAt: time.Now().UTC().Add(time.Hour),
 	})
 	if err != nil {
-		_ = a.store.DeleteTask(task.ID)
+		if cleanupErr := a.cleanupUnstartedRuntimeMutation(task.ID, "", lang); cleanupErr != nil {
+			a.writeRuntimePrestartCleanupError(w, lang)
+			return
+		}
 		var conflict store.AIFAROrchestrationLockConflict
 		if errors.As(err, &conflict) {
 			writeError(w, http.StatusConflict, "AIFAR_RUNTIME_SERVICE_LOCKED", i18n.Text(lang, "api.aifarRuntimeServiceLocked"), map[string]any{"ownerTaskId": conflict.Lock.TaskID})
@@ -778,17 +787,18 @@ func (a *aifarRuntimeController) startRuntimeDeploymentMutation(w http.ResponseW
 		return
 	}
 	taskID := task.ID
-	task, err = a.startExistingWithLanguage(task, lang, func(ctx context.Context, log worker.Logger) error {
-		return a.runWithAIFAROrchestrationLock(ctx, lock, func(lockedCtx context.Context) error {
-			return mutation.MutateRuntimeDeployment(lockedCtx, req, registry.RunContext{
-				TaskID: taskID, Language: lang, Actor: actor, LockID: lock.ID, Log: log,
-				TargetLog: func(target string) registry.Logger { return log.Target(target) },
-			})
+	lifecycle := a.runtimeDeploymentLockLifecycle(lock, lang)
+	task, err = a.startExistingWithLanguageAndLifecycle(task, lang, func(ctx context.Context, log worker.Logger) error {
+		return mutation.MutateRuntimeDeployment(ctx, req, registry.RunContext{
+			TaskID: taskID, Language: lang, Actor: actor, LockID: lock.ID, Log: log,
+			TargetLog: func(target string) registry.Logger { return log.Target(target) },
 		})
-	})
+	}, lifecycle)
 	if err != nil {
-		_, _ = a.store.ReleaseAIFAROrchestrationLockByID(lock.ID)
-		_ = a.store.DeleteTask(task.ID)
+		if cleanupErr := a.cleanupUnstartedRuntimeMutation(taskID, lock.ID, lang); cleanupErr != nil {
+			a.writeRuntimePrestartCleanupError(w, lang)
+			return
+		}
 		respondTask(w, task, err)
 		return
 	}
@@ -796,36 +806,82 @@ func (a *aifarRuntimeController) startRuntimeDeploymentMutation(w http.ResponseW
 	respondTask(w, task, nil)
 }
 
-func (a *aifarRuntimeController) runWithAIFAROrchestrationLock(ctx context.Context, lock store.AIFAROrchestrationLock, action func(context.Context) error) error {
-	lockedCtx, cancel := context.WithCancel(ctx)
+func (a *aifarRuntimeController) cleanupUnstartedRuntimeMutation(taskID, lockID, lang string) error {
+	cleanupErr := errors.New(i18n.Text(lang, "api.aifarRuntimePrestartCleanupFailed"))
+	if strings.TrimSpace(lockID) != "" {
+		released, err := a.releaseAIFARRuntimeLock(lockID)
+		if err != nil || !released {
+			a.recordRuntimePrestartCleanupFailure(taskID, cleanupErr)
+			return cleanupErr
+		}
+	}
+	if err := a.deleteRuntimeTaskByID(taskID); err != nil {
+		a.recordRuntimePrestartCleanupFailure(taskID, cleanupErr)
+		return cleanupErr
+	}
+	return nil
+}
+
+func (a *aifarRuntimeController) recordRuntimePrestartCleanupFailure(taskID string, cleanupErr error) {
+	message := cleanupErr.Error()
+	_ = a.store.UpdateTaskStatus(taskID, "failed", message)
+	_, _ = a.store.AddTaskLog(taskID, "error", message)
+}
+
+func (a *aifarRuntimeController) writeRuntimePrestartCleanupError(w http.ResponseWriter, lang string) {
+	writeError(w, http.StatusInternalServerError, "AIFAR_RUNTIME_PRESTART_CLEANUP_FAILED", i18n.Text(lang, "api.aifarRuntimePrestartCleanupFailed"), nil)
+}
+
+func (a *aifarRuntimeController) runtimeDeploymentLockLifecycle(lock store.AIFAROrchestrationLock, lang string) worker.TaskLifecycle {
 	stop := make(chan struct{})
 	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		ticker := time.NewTicker(time.Hour / 3)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-stop:
-				return
-			case <-lockedCtx.Done():
-				return
-			case <-ticker.C:
-				renewed, err := a.store.RenewAIFAROrchestrationLock(lock.ID, time.Now().UTC().Add(time.Hour))
-				if err != nil || !renewed {
-					cancel()
-					return
+	var startOnce sync.Once
+	var finishOnce sync.Once
+	var resultMu sync.Mutex
+	var lifecycleErr error
+	return worker.TaskLifecycle{
+		Start: func(ctx context.Context, cancel context.CancelFunc) {
+			startOnce.Do(func() {
+				go func() {
+					defer close(done)
+					ticker := time.NewTicker(a.aifarRuntimeLockHeartbeatInterval())
+					defer ticker.Stop()
+					for {
+						renewed, err := a.renewAIFARRuntimeLock(lock.ID, time.Now().UTC().Add(time.Hour))
+						if err != nil || !renewed {
+							resultMu.Lock()
+							lifecycleErr = errors.New(i18n.Text(lang, "api.aifarRuntimeServiceLockLost"))
+							resultMu.Unlock()
+							cancel()
+							return
+						}
+						select {
+						case <-stop:
+							return
+						case <-ctx.Done():
+							return
+						case <-ticker.C:
+						}
+					}
+				}()
+			})
+		},
+		Finish: func() error {
+			finishOnce.Do(func() {
+				close(stop)
+				<-done
+				released, err := a.releaseAIFARRuntimeLock(lock.ID)
+				if err != nil || !released {
+					resultMu.Lock()
+					lifecycleErr = errors.New(i18n.Text(lang, "api.aifarRuntimeServiceLockCleanupFailed"))
+					resultMu.Unlock()
 				}
-			}
-		}
-	}()
-	defer func() {
-		close(stop)
-		cancel()
-		<-done
-		_, _ = a.store.ReleaseAIFAROrchestrationLockByID(lock.ID)
-	}()
-	return action(lockedCtx)
+			})
+			resultMu.Lock()
+			defer resultMu.Unlock()
+			return lifecycleErr
+		},
+	}
 }
 
 func (a *aifarRuntimeController) reconcile(w http.ResponseWriter, r *http.Request) {
@@ -1600,9 +1656,10 @@ func (a *API) appendAIFARInstanceRuntime(response *aifarRuntimeResponse, instanc
 				status = "no-endpoints"
 			}
 		}
-		conditions := []runtimeagent.DeploymentCondition{}
-		if strings.TrimSpace(deployment.ConditionsJSON) != "" {
-			_ = json.Unmarshal([]byte(deployment.ConditionsJSON), &conditions)
+		conditions, conditionsWarning := runtimeDeploymentConditions(deployment, options.Language)
+		if conditionsWarning != "" {
+			response.RuntimeStatus = degradedIfReady(response.RuntimeStatus)
+			response.Warnings = append(response.Warnings, conditionsWarning)
 		}
 		lastTransitionAt := ""
 		if !deployment.LastTransitionAt.IsZero() {
@@ -1644,6 +1701,26 @@ func (a *API) appendAIFARInstanceRuntime(response *aifarRuntimeResponse, instanc
 		response.Services = append(response.Services, serviceRow)
 	}
 	response.Ingress = append(response.Ingress, runtimeIngressFromMetadata(instance.ID, metadata, response.Agent))
+}
+
+func runtimeDeploymentConditions(deployment store.AIFARDeployment, lang string) ([]runtimeagent.DeploymentCondition, string) {
+	raw := strings.TrimSpace(deployment.ConditionsJSON)
+	if raw == "" {
+		return []runtimeagent.DeploymentCondition{}, ""
+	}
+	conditions := []runtimeagent.DeploymentCondition{}
+	if err := json.Unmarshal([]byte(raw), &conditions); err == nil && conditions != nil {
+		return conditions, ""
+	}
+	message := i18n.Text(lang, "api.aifarRuntimeConditionsInvalid", deployment.ServiceName)
+	transitionAt := deployment.LastTransitionAt
+	if transitionAt.IsZero() {
+		transitionAt = deployment.UpdatedAt
+	}
+	return []runtimeagent.DeploymentCondition{{
+		Type: "Degraded", Status: true, Reason: "ControlPlaneConditionsInvalid", Message: message,
+		Generation: deployment.Generation, LastTransitionTime: transitionAt,
+	}}, message
 }
 
 func (a *API) collectAIFARAgentStatus(ctx context.Context, server store.Server) aifarRuntimeAgent {
@@ -1823,10 +1900,10 @@ func applyDockerUnavailableToRuntimeService(row *aifarRuntimeService, options ai
 func (a *API) reconcileAIFARRuntimeControlPlane(instance store.AppInstance, metadata map[string]any, deployments []store.AIFARDeployment, pods []store.AIFARPod, endpoints []store.AIFARServiceEndpoint, containersByName map[string]adapter.DockerContainer) bool {
 	catalog := newAIFARRuntimeServiceCatalog(metadata)
 	discovered := discoverAIFARPodsFromDocker(metadata, containersByName, catalog)
-	changed := a.pruneAIFARRuntimeResidualRecords(instance.ID, discovered, pods)
 	if len(discovered) == 0 {
-		return changed
+		return false
 	}
+	changed := false
 	deploymentsByService := make(map[string]store.AIFARDeployment, len(deployments))
 	for _, deployment := range deployments {
 		deploymentsByService[deployment.ServiceName] = deployment
@@ -1837,8 +1914,12 @@ func (a *API) reconcileAIFARRuntimeControlPlane(instance store.AppInstance, meta
 		replicaSetsByKey[runtimeServiceRevisionKey(item.ServiceName, item.Revision)] = item
 	}
 	podsByKey := make(map[string]store.AIFARPod, len(pods))
+	podsByService := make(map[string][]store.AIFARPod)
+	podsByContainer := make(map[string]store.AIFARPod, len(pods))
 	for _, pod := range pods {
 		podsByKey[runtimeServicePodKey(pod.ServiceName, pod.PodID)] = pod
+		podsByService[pod.ServiceName] = append(podsByService[pod.ServiceName], pod)
+		podsByContainer[runtimeServicePodKey(pod.ServiceName, pod.ContainerName)] = pod
 	}
 	endpointsByService := map[string][]store.AIFARServiceEndpoint{}
 	for _, endpoint := range endpoints {
@@ -1877,25 +1958,27 @@ func (a *API) reconcileAIFARRuntimeControlPlane(instance store.AppInstance, meta
 			conditionType = "Degraded"
 		}
 		needsObservation := existingDeployment.ObservedGeneration != existingDeployment.Generation || existingDeployment.Status != status || !runtimeDeploymentHasCondition(existingDeployment, conditionType, "DockerObserved")
+		conditionsJSON := existingDeployment.ConditionsJSON
+		observedAt := time.Time{}
 		if needsObservation {
-			observedAt := time.Now().UTC()
+			observedAt = time.Now().UTC()
 			conditions, marshalErr := json.Marshal([]runtimeagent.DeploymentCondition{{
 				Type: conditionType, Status: true, Reason: "DockerObserved",
 				Generation: existingDeployment.Generation, LastTransitionTime: observedAt,
 			}})
-			if marshalErr == nil {
-				if _, observeErr := a.store.ObserveAIFARDeployment(instance.ID, service, existingDeployment.Generation, status, string(conditions), observedAt); observeErr == nil {
-					changed = true
-				}
+			if marshalErr != nil {
+				continue
 			}
+			conditionsJSON = string(conditions)
 		}
+		var nextReplicaSet *store.AIFARReplicaSet
 		if revision != "" {
 			existingReplicaSet := replicaSetsByKey[runtimeServiceRevisionKey(service, revision)]
 			artifactHash := cleanRuntimeText(existingReplicaSet.ArtifactHash)
 			if image == "" {
 				image = cleanRuntimeText(existingReplicaSet.Image)
 			}
-			nextReplicaSet := store.AIFARReplicaSet{
+			replicaSet := store.AIFARReplicaSet{
 				ID:           existingReplicaSet.ID,
 				InstanceID:   instance.ID,
 				ServiceName:  service,
@@ -1908,12 +1991,9 @@ func (a *API) reconcileAIFARRuntimeControlPlane(instance store.AppInstance, meta
 				MetadataJSON: runtimeMarshalJSON(map[string]any{"operation": "docker-reconcile", "source": "docker"}),
 				CreatedAt:    existingReplicaSet.CreatedAt,
 			}
-			if existingReplicaSet.ID == "" || !runtimeReplicaSetEqual(existingReplicaSet, nextReplicaSet) {
-				if _, err := a.store.SaveAIFARReplicaSet(nextReplicaSet); err == nil {
-					changed = true
-				}
-			}
+			nextReplicaSet = &replicaSet
 		}
+		nextPods := make([]store.AIFARPod, 0, len(servicePods))
 		nextEndpoints := make([]store.AIFARServiceEndpoint, 0, ready)
 		for _, pod := range servicePods {
 			port := pod.Port
@@ -1921,12 +2001,19 @@ func (a *API) reconcileAIFARRuntimeControlPlane(instance store.AppInstance, meta
 				port = catalog.Port(service)
 			}
 			existingPod := podsByKey[runtimeServicePodKey(service, pod.PodID)]
+			if existingPod.ID == "" {
+				existingPod = podsByContainer[runtimeServicePodKey(service, pod.ContainerName)]
+			}
+			podID := pod.PodID
+			if existingPod.PodID != "" {
+				podID = existingPod.PodID
+			}
 			nextPod := store.AIFARPod{
 				ID:            existingPod.ID,
 				InstanceID:    instance.ID,
 				ServiceName:   service,
 				Revision:      pod.Revision,
-				PodID:         pod.PodID,
+				PodID:         podID,
 				ContainerName: pod.ContainerName,
 				Port:          port,
 				Status:        pod.Status,
@@ -1934,16 +2021,12 @@ func (a *API) reconcileAIFARRuntimeControlPlane(instance store.AppInstance, meta
 				MetadataJSON:  runtimeMarshalJSON(aifarRuntimeEndpointMetadata(pod, port)),
 				CreatedAt:     existingPod.CreatedAt,
 			}
-			if existingPod.ID == "" || !runtimePodEqual(existingPod, nextPod) {
-				if _, err := a.store.SaveAIFARPod(nextPod); err == nil {
-					changed = true
-				}
-			}
+			nextPods = append(nextPods, nextPod)
 			if pod.Ready {
 				nextEndpoints = append(nextEndpoints, store.AIFARServiceEndpoint{
 					InstanceID:    instance.ID,
 					ServiceName:   service,
-					PodID:         pod.PodID,
+					PodID:         podID,
 					ContainerName: pod.ContainerName,
 					Revision:      pod.Revision,
 					Port:          port,
@@ -1953,38 +2036,18 @@ func (a *API) reconcileAIFARRuntimeControlPlane(instance store.AppInstance, meta
 				})
 			}
 		}
-		if !runtimeEndpointsEqual(endpointsByService[service], nextEndpoints) {
-			if err := a.store.ReplaceAIFARServiceEndpoints(instance.ID, service, nextEndpoints); err == nil {
-				changed = true
-			}
-		}
-	}
-	return changed
-}
-
-func (a *API) pruneAIFARRuntimeResidualRecords(instanceID string, discovered []discoveredAIFARPod, currentPods []store.AIFARPod) bool {
-	observedServices := make(map[string]bool, len(discovered))
-	existingContainers := make([]string, 0, len(discovered)+len(currentPods))
-	for _, pod := range discovered {
-		observedServices[pod.ServiceName] = true
-		if name := cleanRuntimeText(pod.ContainerName); name != "" {
-			existingContainers = append(existingContainers, name)
-		}
-	}
-	for _, pod := range currentPods {
-		if observedServices[pod.ServiceName] {
+		replicaSetChanged := nextReplicaSet != nil && (nextReplicaSet.ID == "" || !runtimeReplicaSetEqual(replicaSetsByKey[runtimeServiceRevisionKey(service, revision)], *nextReplicaSet))
+		projectionChanged := replicaSetChanged || !runtimeServicePodsEqual(podsByService[service], nextPods) || !runtimeEndpointsEqual(endpointsByService[service], nextEndpoints)
+		if !needsObservation && !projectionChanged {
 			continue
 		}
-		if name := cleanRuntimeText(pod.ContainerName); name != "" {
-			existingContainers = append(existingContainers, name)
+		if _, err := a.store.ObserveAIFARRuntimeService(store.AIFARRuntimeServiceObservation{
+			InstanceID: instance.ID, ServiceName: service, Generation: existingDeployment.Generation,
+			Status: status, ConditionsJSON: conditionsJSON, ObservedAt: observedAt,
+			ReplicaSet: nextReplicaSet, Pods: nextPods, Endpoints: nextEndpoints,
+		}); err == nil {
+			changed = true
 		}
-	}
-	changed := false
-	if pruned, err := a.store.PruneAIFARPodRecords(instanceID, existingContainers); err == nil && pruned > 0 {
-		changed = true
-	}
-	if pruned, err := a.store.PruneAIFARServiceEndpointRecords(instanceID, existingContainers); err == nil && pruned > 0 {
-		changed = true
 	}
 	return changed
 }
@@ -2543,6 +2606,23 @@ func runtimePodEqual(a, b store.AIFARPod) bool {
 		cleanRuntimeText(a.Status) == cleanRuntimeText(b.Status) &&
 		a.Ready == b.Ready &&
 		cleanRuntimeText(a.MetadataJSON) == cleanRuntimeText(b.MetadataJSON)
+}
+
+func runtimeServicePodsEqual(current, next []store.AIFARPod) bool {
+	if len(current) != len(next) {
+		return false
+	}
+	byPodID := make(map[string]store.AIFARPod, len(current))
+	for _, pod := range current {
+		byPodID[pod.PodID] = pod
+	}
+	for _, pod := range next {
+		existing, ok := byPodID[pod.PodID]
+		if !ok || !runtimePodEqual(existing, pod) {
+			return false
+		}
+	}
+	return true
 }
 
 func runtimeEndpointsEqual(a, b []store.AIFARServiceEndpoint) bool {

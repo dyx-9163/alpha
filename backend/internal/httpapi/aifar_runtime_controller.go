@@ -1,6 +1,8 @@
 package httpapi
 
 import (
+	"time"
+
 	"aifar-deployment/backend/internal/rbac"
 	"aifar-deployment/backend/internal/store"
 	"aifar-deployment/backend/internal/taskplan"
@@ -11,10 +13,16 @@ import (
 
 type aifarRuntimeController struct {
 	*API
-	startExistingTask         func(store.Task, string, worker.Job) (store.Task, error)
-	storeDiagnosticTaskPlan   func(string, string, []simpleTaskStep) error
-	deleteDiagnosticTask      func(string) error
-	terminalizeDiagnosticTask func(string, string, string) error
+	startExistingTask              func(store.Task, string, worker.Job) (store.Task, error)
+	startExistingTaskWithLifecycle func(store.Task, string, worker.Job, worker.TaskLifecycle) (store.Task, error)
+	storeDiagnosticTaskPlan        func(string, string, []simpleTaskStep) error
+	storeRuntimeTaskPlan           func(string, []taskplan.Step) error
+	deleteDiagnosticTask           func(string) error
+	deleteRuntimeTask              func(string) error
+	terminalizeDiagnosticTask      func(string, string, string) error
+	renewRuntimeLock               func(string, time.Time) (bool, error)
+	releaseRuntimeLock             func(string) (bool, error)
+	runtimeLockHeartbeatInterval   time.Duration
 }
 
 func newAIFARRuntimeController(api *API) *aifarRuntimeController {
@@ -28,11 +36,56 @@ func (a *aifarRuntimeController) startExistingWithLanguage(task store.Task, lang
 	return a.tasks.StartExistingWithLanguage(task, lang, job)
 }
 
+func (a *aifarRuntimeController) startExistingWithLanguageAndLifecycle(task store.Task, lang string, job worker.Job, lifecycle worker.TaskLifecycle) (store.Task, error) {
+	if a.startExistingTaskWithLifecycle != nil {
+		return a.startExistingTaskWithLifecycle(task, lang, job, lifecycle)
+	}
+	if a.startExistingTask != nil {
+		return a.startExistingTask(task, lang, job)
+	}
+	return a.tasks.StartExistingWithLanguageAndLifecycle(task, lang, job, lifecycle)
+}
+
+func (a *aifarRuntimeController) renewAIFARRuntimeLock(id string, expiresAt time.Time) (bool, error) {
+	if a.renewRuntimeLock != nil {
+		return a.renewRuntimeLock(id, expiresAt)
+	}
+	return a.store.RenewAIFAROrchestrationLock(id, expiresAt)
+}
+
+func (a *aifarRuntimeController) releaseAIFARRuntimeLock(id string) (bool, error) {
+	if a.releaseRuntimeLock != nil {
+		return a.releaseRuntimeLock(id)
+	}
+	return a.store.ReleaseAIFAROrchestrationLockByID(id)
+}
+
+func (a *aifarRuntimeController) aifarRuntimeLockHeartbeatInterval() time.Duration {
+	if a.runtimeLockHeartbeatInterval > 0 {
+		return a.runtimeLockHeartbeatInterval
+	}
+	return time.Hour / 3
+}
+
 func (a *aifarRuntimeController) storeDiagnosticPlan(taskID, target string, steps []simpleTaskStep) error {
 	if a.storeDiagnosticTaskPlan != nil {
 		return a.storeDiagnosticTaskPlan(taskID, target, steps)
 	}
 	return taskplan.StorePlan(a.store, taskID, simpleTaskPlan(target, steps))
+}
+
+func (a *aifarRuntimeController) storeRuntimePlan(taskID string, plan []taskplan.Step) error {
+	if a.storeRuntimeTaskPlan != nil {
+		return a.storeRuntimeTaskPlan(taskID, plan)
+	}
+	return taskplan.StorePlan(a.store, taskID, plan)
+}
+
+func (a *aifarRuntimeController) deleteRuntimeTaskByID(taskID string) error {
+	if a.deleteRuntimeTask != nil {
+		return a.deleteRuntimeTask(taskID)
+	}
+	return a.store.DeleteTask(taskID)
 }
 
 func (a *aifarRuntimeController) deleteDiagnosticTaskByID(taskID string) error {

@@ -72,6 +72,11 @@ func (l Logger) FinishStep(target, name, status, errText string) {
 
 type Job func(ctx context.Context, log Logger) error
 
+type TaskLifecycle struct {
+	Start  func(context.Context, context.CancelFunc)
+	Finish func() error
+}
+
 type EventPublisher interface {
 	Publish(realtime.Event)
 }
@@ -138,6 +143,10 @@ func (m *Manager) StartWithLanguage(taskType, target, actor, lang string, job Jo
 }
 
 func (m *Manager) StartExistingWithLanguage(task store.Task, lang string, job Job) (store.Task, error) {
+	return m.StartExistingWithLanguageAndLifecycle(task, lang, job, TaskLifecycle{})
+}
+
+func (m *Manager) StartExistingWithLanguageAndLifecycle(task store.Task, lang string, job Job, lifecycle TaskLifecycle) (store.Task, error) {
 	if task.ID == "" {
 		return task, errors.New("task id is required")
 	}
@@ -175,8 +184,23 @@ func (m *Manager) StartExistingWithLanguage(task store.Task, lang string, job Jo
 		lockHeartbeatCtx, stopLockHeartbeat := context.WithCancel(ctx)
 		defer stopLockHeartbeat()
 		go m.heartbeatOperationLocks(lockHeartbeatCtx, task.ID)
+		if lifecycle.Start != nil {
+			lifecycle.Start(ctx, cancel)
+		}
+		finishTask := func(status, errText string) {
+			if lifecycle.Finish != nil {
+				if cleanupErr := lifecycle.Finish(); cleanupErr != nil {
+					m.AppendLog(task.ID, "error", cleanupErr.Error())
+					if status == "success" {
+						status = "failed"
+						errText = cleanupErr.Error()
+					}
+				}
+			}
+			m.finalizeTask(task.ID, status, errText)
+		}
 		if !m.acquireSlot(ctx) {
-			m.finalizeTask(task.ID, "cancelled", ctx.Err().Error())
+			finishTask("cancelled", ctx.Err().Error())
 			return
 		}
 		defer m.releaseSlot()
@@ -187,7 +211,7 @@ func (m *Manager) StartExistingWithLanguage(task store.Task, lang string, job Jo
 		status := m.claimJobOutcome(task.ID, ctx, err, panicked)
 		if status == "success" {
 			m.AppendLog(task.ID, "info", i18n.Text(lang, "worker.taskCompleted"))
-			m.finalizeTask(task.ID, status, "")
+			finishTask(status, "")
 			return
 		}
 		if err == nil {
@@ -197,7 +221,7 @@ func (m *Manager) StartExistingWithLanguage(task store.Task, lang string, job Jo
 			}
 		}
 		m.AppendLog(task.ID, "error", err.Error())
-		m.finalizeTask(task.ID, status, err.Error())
+		finishTask(status, err.Error())
 	}()
 	return task, nil
 }

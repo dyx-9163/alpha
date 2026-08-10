@@ -59,6 +59,175 @@ func TestSaveAIFARDeploymentGenerationResetsObservedGenerationForNewDesiredState
 	}
 }
 
+func TestObserveAIFARRuntimeServiceRejectsStaleGenerationWithoutChangingProjection(t *testing.T) {
+	db := openTestStore(t)
+	gen1, err := db.SaveAIFARDeploymentGeneration(AIFARDeployment{
+		InstanceID: "instance-1", ServiceName: "permission", DesiredReplicas: 1,
+		CurrentRevision: "rev-old", Status: "pending_acceptance",
+	}, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gen2, err := db.SaveAIFARDeploymentGeneration(AIFARDeployment{
+		InstanceID: "instance-1", ServiceName: "permission", DesiredReplicas: 1,
+		CurrentRevision: "rev-new", Status: "pending_acceptance",
+	}, gen1.Generation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.SaveAIFARReplicaSet(AIFARReplicaSet{
+		InstanceID: "instance-1", ServiceName: "permission", Revision: "rev-new",
+		Image: "aifar-permission:rev-new", DesiredPods: 1, ReadyPods: 1, Status: "ready",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.SaveAIFARPod(AIFARPod{
+		InstanceID: "instance-1", ServiceName: "permission", Revision: "rev-new", PodID: "permission-0",
+		ContainerName: "aifar-permission-new", Port: 18080, Status: "running", Ready: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.ReplaceAIFARServiceEndpoints("instance-1", "permission", []AIFARServiceEndpoint{{
+		InstanceID: "instance-1", ServiceName: "permission", Revision: "rev-new", PodID: "permission-0",
+		ContainerName: "aifar-permission-new", Port: 18080, State: "ready", Ready: true,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = db.ObserveAIFARRuntimeService(AIFARRuntimeServiceObservation{
+		InstanceID: "instance-1", ServiceName: "permission", Generation: gen1.Generation,
+		Status: "ready", ConditionsJSON: `[{"type":"Available","generation":1}]`, ObservedAt: time.Now().UTC(),
+		ReplicaSet: &AIFARReplicaSet{
+			InstanceID: "instance-1", ServiceName: "permission", Revision: "rev-old",
+			Image: "aifar-permission:rev-old", DesiredPods: 1, ReadyPods: 1, Status: "ready",
+		},
+		Pods: []AIFARPod{{
+			InstanceID: "instance-1", ServiceName: "permission", Revision: "rev-old", PodID: "permission-0",
+			ContainerName: "aifar-permission-old", Port: 8080, Status: "running", Ready: true,
+		}},
+		Endpoints: []AIFARServiceEndpoint{{
+			InstanceID: "instance-1", ServiceName: "permission", Revision: "rev-old", PodID: "permission-0",
+			ContainerName: "aifar-permission-old", Port: 8080, State: "ready", Ready: true,
+		}},
+	})
+	if !errors.Is(err, ErrAIFARDeploymentGenerationConflict) {
+		t.Fatalf("stale observation err=%v, want generation conflict", err)
+	}
+	deployment := deploymentByName(t, db, "instance-1", "permission")
+	if deployment.Generation != gen2.Generation || deployment.CurrentRevision != "rev-new" || deployment.ObservedGeneration != 0 {
+		t.Fatalf("stale observation changed successor deployment: %+v", deployment)
+	}
+	replicaSets, err := db.ListAIFARReplicaSets("instance-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(replicaSets) != 1 || replicaSets[0].Revision != "rev-new" || replicaSets[0].Image != "aifar-permission:rev-new" {
+		t.Fatalf("stale observation changed successor replica set: %+v", replicaSets)
+	}
+	pods, err := db.ListAIFARPods("instance-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pods) != 1 || pods[0].Revision != "rev-new" || pods[0].ContainerName != "aifar-permission-new" {
+		t.Fatalf("stale observation changed successor pod: %+v", pods)
+	}
+	endpoints, err := db.ListAIFARServiceEndpoints("instance-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(endpoints) != 1 || endpoints[0].Revision != "rev-new" || endpoints[0].ContainerName != "aifar-permission-new" {
+		t.Fatalf("stale observation changed successor endpoints: %+v", endpoints)
+	}
+}
+
+func TestObserveAIFARRuntimeServiceAtomicallyReplacesOnlyTargetProjection(t *testing.T) {
+	db := openTestStore(t)
+	permission, err := db.SaveAIFARDeploymentGeneration(AIFARDeployment{
+		InstanceID: "instance-1", ServiceName: "permission", DesiredReplicas: 1,
+		CurrentRevision: "rev-new", Status: "Accepted",
+	}, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.SaveAIFARDeploymentGeneration(AIFARDeployment{
+		InstanceID: "instance-1", ServiceName: "file", DesiredReplicas: 1,
+		CurrentRevision: "file-rev", Status: "Available",
+	}, 0); err != nil {
+		t.Fatal(err)
+	}
+	for _, pod := range []AIFARPod{
+		{InstanceID: "instance-1", ServiceName: "permission", Revision: "rev-old", PodID: "permission-old", ContainerName: "permission-old", Port: 8080},
+		{InstanceID: "instance-1", ServiceName: "file", Revision: "file-rev", PodID: "file-0", ContainerName: "file-0", Port: 8081, Ready: true},
+	} {
+		if _, err := db.SaveAIFARPod(pod); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.ReplaceAIFARServiceEndpoints("instance-1", "file", []AIFARServiceEndpoint{{
+		InstanceID: "instance-1", ServiceName: "file", Revision: "file-rev", PodID: "file-0", ContainerName: "file-0", Port: 8081, Ready: true,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	observedAt := time.Date(2026, time.August, 10, 12, 0, 0, 0, time.UTC)
+	observed, err := db.ObserveAIFARRuntimeService(AIFARRuntimeServiceObservation{
+		InstanceID: "instance-1", ServiceName: "permission", Generation: permission.Generation,
+		Status: "Available", ConditionsJSON: `[{"type":"Available","generation":1}]`, ObservedAt: observedAt,
+		ReplicaSet: &AIFARReplicaSet{
+			InstanceID: "instance-1", ServiceName: "permission", Revision: "rev-new",
+			Image: "aifar-permission:rev-new", DesiredPods: 1, ReadyPods: 1, Status: "ready",
+		},
+		Pods: []AIFARPod{{
+			InstanceID: "instance-1", ServiceName: "permission", Revision: "rev-new", PodID: "permission-0",
+			ContainerName: "permission-new", Port: 18080, Status: "running", Ready: true,
+		}},
+		Endpoints: []AIFARServiceEndpoint{{
+			InstanceID: "instance-1", ServiceName: "permission", Revision: "rev-new", PodID: "permission-0",
+			ContainerName: "permission-new", Port: 18080, State: "ready", Ready: true,
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if observed.ObservedGeneration != permission.Generation || observed.Status != "Available" || !observed.LastTransitionAt.Equal(observedAt) {
+		t.Fatalf("unexpected deployment observation: %+v", observed)
+	}
+	replicaSets, err := db.ListAIFARReplicaSets("instance-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(replicaSets) != 1 || replicaSets[0].Revision != "rev-new" || replicaSets[0].ReadyPods != 1 {
+		t.Fatalf("target replica set was not projected: %+v", replicaSets)
+	}
+	pods, err := db.ListAIFARPods("instance-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pods) != 2 {
+		t.Fatalf("expected target replacement plus peer preservation, got %+v", pods)
+	}
+	byService := map[string]AIFARPod{}
+	for _, pod := range pods {
+		byService[pod.ServiceName] = pod
+	}
+	if byService["permission"].ContainerName != "permission-new" || byService["file"].ContainerName != "file-0" {
+		t.Fatalf("unexpected service-local pod projection: %+v", pods)
+	}
+	endpoints, err := db.ListAIFARServiceEndpoints("instance-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(endpoints) != 2 {
+		t.Fatalf("expected target and peer endpoints, got %+v", endpoints)
+	}
+	endpointByService := map[string]AIFARServiceEndpoint{}
+	for _, endpoint := range endpoints {
+		endpointByService[endpoint.ServiceName] = endpoint
+	}
+	if endpointByService["permission"].ContainerName != "permission-new" || endpointByService["file"].ContainerName != "file-0" {
+		t.Fatalf("unexpected service-local endpoint projection: %+v", endpoints)
+	}
+}
+
 func TestAcceptAIFARDeploymentPreservesAlreadyObservedRuntimeState(t *testing.T) {
 	for _, status := range []string{"Available", "Degraded", "Offline", "Progressing"} {
 		t.Run(status, func(t *testing.T) {

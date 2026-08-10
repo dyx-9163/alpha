@@ -421,6 +421,74 @@ func TestManagerCancelsTaskWhileWaitingForSlot(t *testing.T) {
 	assertManagerActiveCount(t, manager, 0)
 }
 
+func TestManagerStartsLifecycleBeforeSlotAndFinishesItOnQueuedCancellation(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "aifar.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	manager := NewManagerWithConcurrency(db, 1)
+	holderStarted := make(chan struct{})
+	holderRelease := make(chan struct{})
+	var releaseHolder sync.Once
+	t.Cleanup(func() { releaseHolder.Do(func() { close(holderRelease) }) })
+	if _, err := manager.Start("test.lifecycle-holder", "holder", "tester", func(ctx context.Context, log Logger) error {
+		close(holderStarted)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-holderRelease:
+			return nil
+		}
+	}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-holderStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("slot holder did not start")
+	}
+	queuedTask, err := db.CreateTask(store.Task{Type: "test.lifecycle-queued", Target: "queued", Status: "pending", CreatedBy: "tester"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lifecycleStarted := make(chan struct{})
+	lifecycleFinished := make(chan struct{})
+	jobStarted := make(chan struct{})
+	if _, err := manager.StartExistingWithLanguageAndLifecycle(queuedTask, "en", func(ctx context.Context, log Logger) error {
+		close(jobStarted)
+		return nil
+	}, TaskLifecycle{
+		Start: func(context.Context, context.CancelFunc) { close(lifecycleStarted) },
+		Finish: func() error {
+			close(lifecycleFinished)
+			return nil
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-lifecycleStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("task lifecycle did not start while queued")
+	}
+	if !manager.Cancel(queuedTask.ID) {
+		t.Fatal("expected queued task cancellation")
+	}
+	waitForTaskStatus(t, db, queuedTask.ID, "cancelled")
+	select {
+	case <-lifecycleFinished:
+	case <-time.After(2 * time.Second):
+		t.Fatal("queued cancellation did not finish task lifecycle")
+	}
+	select {
+	case <-jobStarted:
+		t.Fatal("cancelled queued task entered job body")
+	default:
+	}
+	releaseHolder.Do(func() { close(holderRelease) })
+}
+
 func TestManagerCancellationSignalAndQueuedSlotAdmissionAreAtomic(t *testing.T) {
 	db, err := store.Open(filepath.Join(t.TempDir(), "aifar.db"))
 	if err != nil {

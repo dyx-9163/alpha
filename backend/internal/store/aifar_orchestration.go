@@ -618,6 +618,137 @@ func (s *Store) ObserveAIFARDeployment(instanceID, serviceName string, generatio
 	return observed, nil
 }
 
+type AIFARRuntimeServiceObservation struct {
+	InstanceID     string
+	ServiceName    string
+	Generation     int64
+	Status         string
+	ConditionsJSON string
+	ObservedAt     time.Time
+	ReplicaSet     *AIFARReplicaSet
+	Pods           []AIFARPod
+	Endpoints      []AIFARServiceEndpoint
+}
+
+func (s *Store) ObserveAIFARRuntimeService(v AIFARRuntimeServiceObservation) (AIFARDeployment, error) {
+	if err := validateAIFARRuntimeServiceObservation(v); err != nil {
+		return AIFARDeployment{}, err
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return AIFARDeployment{}, err
+	}
+	defer tx.Rollback()
+	result, err := tx.Exec(`update aifar_deployments set
+		status=?, conditions_json=?, observed_generation=?, last_transition_at=coalesce(?,last_transition_at), updated_at=?
+		where instance_id=? and service_name=? and generation=?`,
+		v.Status, v.ConditionsJSON, v.Generation, nullableTime(v.ObservedAt), time.Now(), v.InstanceID, v.ServiceName, v.Generation)
+	if err != nil {
+		return AIFARDeployment{}, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return AIFARDeployment{}, err
+	}
+	if affected == 0 {
+		if _, getErr := getAIFARDeployment(tx, v.InstanceID, v.ServiceName); getErr != nil {
+			if errors.Is(getErr, sql.ErrNoRows) {
+				return AIFARDeployment{}, ErrAIFARDeploymentNotFound
+			}
+			return AIFARDeployment{}, getErr
+		}
+		return AIFARDeployment{}, ErrAIFARDeploymentGenerationConflict
+	}
+	now := time.Now()
+	if v.ReplicaSet != nil {
+		replicaSet := *v.ReplicaSet
+		if replicaSet.ID == "" {
+			replicaSet.ID = NewID("aifarrs")
+		}
+		if replicaSet.CreatedAt.IsZero() {
+			replicaSet.CreatedAt = now
+		}
+		replicaSet.UpdatedAt = now
+		if replicaSet.DesiredPods < 0 {
+			replicaSet.DesiredPods = 0
+		}
+		if _, err := tx.Exec(`insert into aifar_replicasets(id,instance_id,service_name,revision,image,artifact_hash,desired_pods,ready_pods,status,metadata_json,created_at,updated_at)
+			values(?,?,?,?,?,?,?,?,?,?,?,?)
+			on conflict(instance_id, service_name, revision) do update set
+			image=excluded.image,artifact_hash=excluded.artifact_hash,desired_pods=excluded.desired_pods,
+			ready_pods=excluded.ready_pods,status=excluded.status,metadata_json=excluded.metadata_json,updated_at=excluded.updated_at`,
+			replicaSet.ID, replicaSet.InstanceID, replicaSet.ServiceName, replicaSet.Revision, replicaSet.Image, replicaSet.ArtifactHash,
+			replicaSet.DesiredPods, replicaSet.ReadyPods, replicaSet.Status, replicaSet.MetadataJSON, replicaSet.CreatedAt, replicaSet.UpdatedAt); err != nil {
+			return AIFARDeployment{}, err
+		}
+	}
+	if _, err := tx.Exec(`delete from aifar_pods where instance_id=? and service_name=?`, v.InstanceID, v.ServiceName); err != nil {
+		return AIFARDeployment{}, err
+	}
+	for _, pod := range v.Pods {
+		if pod.ID == "" {
+			pod.ID = NewID("aifarpod")
+		}
+		if pod.CreatedAt.IsZero() {
+			pod.CreatedAt = now
+		}
+		pod.UpdatedAt = now
+		if _, err := tx.Exec(`insert into aifar_pods(id,instance_id,service_name,revision,pod_id,container_name,port,status,ready,metadata_json,created_at,updated_at)
+			values(?,?,?,?,?,?,?,?,?,?,?,?)`, pod.ID, pod.InstanceID, pod.ServiceName, pod.Revision, pod.PodID,
+			pod.ContainerName, pod.Port, pod.Status, boolInt(pod.Ready), pod.MetadataJSON, pod.CreatedAt, pod.UpdatedAt); err != nil {
+			return AIFARDeployment{}, err
+		}
+	}
+	if _, err := tx.Exec(`delete from aifar_service_endpoints where instance_id=? and service_name=?`, v.InstanceID, v.ServiceName); err != nil {
+		return AIFARDeployment{}, err
+	}
+	for _, endpoint := range v.Endpoints {
+		if endpoint.ID == "" {
+			endpoint.ID = NewID("aifarendp")
+		}
+		if endpoint.CreatedAt.IsZero() {
+			endpoint.CreatedAt = now
+		}
+		endpoint.UpdatedAt = now
+		if _, err := tx.Exec(`insert into aifar_service_endpoints(id,instance_id,service_name,pod_id,container_name,revision,port,state,ready,metadata_json,created_at,updated_at)
+			values(?,?,?,?,?,?,?,?,?,?,?,?)`, endpoint.ID, endpoint.InstanceID, endpoint.ServiceName, endpoint.PodID,
+			endpoint.ContainerName, endpoint.Revision, endpoint.Port, endpoint.State, boolInt(endpoint.Ready), endpoint.MetadataJSON,
+			endpoint.CreatedAt, endpoint.UpdatedAt); err != nil {
+			return AIFARDeployment{}, err
+		}
+	}
+	observed, err := getAIFARDeployment(tx, v.InstanceID, v.ServiceName)
+	if err != nil {
+		return AIFARDeployment{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return AIFARDeployment{}, err
+	}
+	return observed, nil
+}
+
+func validateAIFARRuntimeServiceObservation(v AIFARRuntimeServiceObservation) error {
+	instanceID := strings.TrimSpace(v.InstanceID)
+	serviceName := strings.TrimSpace(v.ServiceName)
+	if instanceID == "" || serviceName == "" || v.Generation <= 0 {
+		return errors.New("invalid AIFAR runtime service observation target")
+	}
+	if v.ReplicaSet != nil && (v.ReplicaSet.InstanceID != instanceID || v.ReplicaSet.ServiceName != serviceName) {
+		return errors.New("AIFAR runtime replica set observation target mismatch")
+	}
+	for _, pod := range v.Pods {
+		if pod.InstanceID != instanceID || pod.ServiceName != serviceName {
+			return errors.New("AIFAR runtime pod observation target mismatch")
+		}
+	}
+	for _, endpoint := range v.Endpoints {
+		if endpoint.InstanceID != instanceID || endpoint.ServiceName != serviceName {
+			return errors.New("AIFAR runtime endpoint observation target mismatch")
+		}
+	}
+	return nil
+}
+
 type aifarDeploymentScanner interface {
 	Scan(dest ...any) error
 }

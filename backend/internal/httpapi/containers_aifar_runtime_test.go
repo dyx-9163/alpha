@@ -145,6 +145,57 @@ func TestRuntimeResponseOmitsNacosStatusAndIncludesConditions(t *testing.T) {
 	}
 }
 
+func TestRuntimeResponseDiagnosesCorruptConditionsAsStableArray(t *testing.T) {
+	for _, rawConditions := range []string{`{"broken"`, `null`} {
+		t.Run(rawConditions, func(t *testing.T) {
+			api, db, secret := newAuthzTestAPI(t)
+			api.aifarAgentStatus = func(context.Context, store.Server) aifarRuntimeAgent {
+				return aifarRuntimeAgent{Status: "running"}
+			}
+			server, instance := seedAIFARRuntimeFixture(t, db, "unix:///var/run/docker.sock")
+			if _, err := db.SaveAIFARDeployment(store.AIFARDeployment{
+				InstanceID: instance.ID, ServiceName: "permission", DesiredReplicas: 1,
+				CurrentRevision: "rev-1", Generation: 3, ObservedGeneration: 3, Status: "Available",
+				ConditionsJSON: rawConditions,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			token := issueTestToken(t, db, secret, "owner", "owner")
+			req := httptest.NewRequest(http.MethodGet, "/api/v2/containers/aifar/runtime?serverId="+server.ID+"&includePods=0&includeStats=0", nil)
+			req.Header.Set("Authorization", "Bearer "+token)
+			req.Header.Set("X-AIFAR-Language", "en")
+			rec := httptest.NewRecorder()
+			api.Router().ServeHTTP(rec, req)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("expected 200, got %d body=%s", rec.Code, rec.Body.String())
+			}
+			var body aifarRuntimeResponse
+			if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+				t.Fatal(err)
+			}
+			if len(body.Deployments) != 1 || len(body.Deployments[0].Conditions) != 1 {
+				t.Fatalf("corrupt conditions must become one stable diagnostic array: %+v body=%s", body.Deployments, rec.Body.String())
+			}
+			condition := body.Deployments[0].Conditions[0]
+			if condition.Type != "Degraded" || condition.Reason != "ControlPlaneConditionsInvalid" || condition.Generation != 3 || !condition.Status {
+				t.Fatalf("unexpected corrupt-condition diagnostic: %+v", condition)
+			}
+			conditionWarnings := 0
+			for _, warning := range body.Warnings {
+				if strings.Contains(warning, "permission") && strings.Contains(warning, "conditions") {
+					conditionWarnings++
+					if strings.Contains(warning, rawConditions) {
+						t.Fatalf("condition warning leaked corrupt payload: %q", warning)
+					}
+				}
+			}
+			if conditionWarnings != 1 {
+				t.Fatalf("expected one sanitized service-local condition warning: %+v", body.Warnings)
+			}
+		})
+	}
+}
+
 func TestRuntimeDockerObservationIsServiceLocalAndDoesNotBumpGeneration(t *testing.T) {
 	api, db, _ := newAuthzTestAPI(t)
 	_, instance := seedAIFARRuntimeFixture(t, db, "unix:///var/run/docker.sock")
@@ -233,6 +284,96 @@ func TestRuntimeDockerObservationIsServiceLocalAndDoesNotBumpGeneration(t *testi
 	}
 	if savedInstance.Status != "installed" {
 		t.Fatalf("runtime observation changed app install status: %q", savedInstance.Status)
+	}
+}
+
+func TestStaleRuntimeDockerSnapshotCannotOverwriteSuccessorServiceProjection(t *testing.T) {
+	api, db, _ := newAuthzTestAPI(t)
+	_, instance := seedAIFARRuntimeFixture(t, db, "unix:///var/run/docker.sock")
+	gen1, err := db.SaveAIFARDeployment(store.AIFARDeployment{
+		InstanceID: instance.ID, ServiceName: "permission", DesiredReplicas: 1,
+		CurrentRevision: "rev-old", Generation: 1, Status: "Accepted",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	staleDeployments := []store.AIFARDeployment{gen1}
+	gen2, err := db.SaveAIFARDeploymentGeneration(store.AIFARDeployment{
+		InstanceID: instance.ID, ServiceName: "permission", DesiredReplicas: 1,
+		CurrentRevision: "rev-new", Status: "Accepted",
+	}, gen1.Generation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.SaveAIFARReplicaSet(store.AIFARReplicaSet{
+		InstanceID: instance.ID, ServiceName: "permission", Revision: "rev-new", Image: "aifar-permission:rev-new",
+		DesiredPods: 1, ReadyPods: 1, Status: "ready",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.SaveAIFARPod(store.AIFARPod{
+		InstanceID: instance.ID, ServiceName: "permission", Revision: "rev-new", PodID: "r1",
+		ContainerName: "aifar-pod-admin-permission-rev-new-r1", Status: "ready", Ready: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.ReplaceAIFARServiceEndpoints(instance.ID, "permission", []store.AIFARServiceEndpoint{{
+		InstanceID: instance.ID, ServiceName: "permission", Revision: "rev-new", PodID: "r1",
+		ContainerName: "aifar-pod-admin-permission-rev-new-r1", State: "active", Ready: true,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	currentPods, err := db.ListAIFARPods(instance.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	currentEndpoints, err := db.ListAIFARServiceEndpoints(instance.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	api.reconcileAIFARRuntimeControlPlane(instance, runtimeMetadata(instance.Metadata), staleDeployments, currentPods, currentEndpoints, map[string]adapter.DockerContainer{
+		"aifar-pod-admin-permission-rev-old-r1": {
+			Name: "aifar-pod-admin-permission-rev-old-r1", Image: "aifar-permission:rev-old", State: "running", Status: "Up 1 minute (healthy)",
+			Labels: map[string]string{
+				"aifar.app": "aifar", "aifar.component": "pod", "aifar.install-root": "/aifar/apps/admin",
+				"aifar.service": "permission", "aifar.revision": "rev-old", "aifar.replica": "1",
+			},
+		},
+	})
+	deployment, err := api.currentAIFARDeployment(instance.ID, "permission")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deployment.Generation != gen2.Generation || deployment.CurrentRevision != "rev-new" || deployment.ObservedGeneration != 0 {
+		t.Fatalf("stale snapshot changed successor deployment: %+v", deployment)
+	}
+	replicaSets, err := db.ListAIFARReplicaSets(instance.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	foundNewReplicaSet := false
+	for _, replicaSet := range replicaSets {
+		if replicaSet.ServiceName == "permission" && replicaSet.Revision == "rev-old" {
+			t.Fatalf("stale snapshot inserted predecessor replica set: %+v", replicaSets)
+		}
+		foundNewReplicaSet = foundNewReplicaSet || replicaSet.ServiceName == "permission" && replicaSet.Revision == "rev-new" && replicaSet.Image == "aifar-permission:rev-new"
+	}
+	if !foundNewReplicaSet {
+		t.Fatalf("successor replica set disappeared: %+v", replicaSets)
+	}
+	pods, err := db.ListAIFARPods(instance.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pods) != 1 || pods[0].Revision != "rev-new" || pods[0].ContainerName != "aifar-pod-admin-permission-rev-new-r1" {
+		t.Fatalf("stale snapshot changed successor pod: %+v", pods)
+	}
+	endpoints, err := db.ListAIFARServiceEndpoints(instance.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(endpoints) != 1 || endpoints[0].Revision != "rev-new" || endpoints[0].ContainerName != "aifar-pod-admin-permission-rev-new-r1" {
+		t.Fatalf("stale snapshot changed successor endpoints: %+v", endpoints)
 	}
 }
 
@@ -1016,6 +1157,73 @@ func TestDifferentServiceTasksAcquireDifferentLocks(t *testing.T) {
 	}
 }
 
+func TestRuntimeDeploymentConflictDeleteFailureKeepsFailedAuditableTask(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	defer close(release)
+	module := &fakeAIFARRuntimeActionModule{
+		mutationStarted: map[string]chan struct{}{"permission": started},
+		mutationRelease: map[string]chan struct{}{"permission": release},
+	}
+	api, db, secret := newAuthzTestAPI(t)
+	api.apps = registry.New(module)
+	api.aifarAgentStatus = func(context.Context, store.Server) aifarRuntimeAgent {
+		return aifarRuntimeAgent{Status: "running"}
+	}
+	api.runtime.deleteRuntimeTask = func(string) error {
+		return errors.New("delete failed token=must-not-leak")
+	}
+	server, instance := seedAIFARRuntimeFixture(t, db, "unix:///var/run/docker.sock")
+	token := issueTestToken(t, db, secret, "owner", "owner")
+	request := func(replicas int) *httptest.ResponseRecorder {
+		t.Helper()
+		body := fmt.Sprintf(`{"operation":"scale","expectedGeneration":1,"replicas":%d}`, replicas)
+		req := httptest.NewRequest(http.MethodPut, "/api/v2/apps/instances/"+instance.ID+"/runtime/deployments/permission?serverId="+server.ID, strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		api.Router().ServeHTTP(rec, req)
+		return rec
+	}
+	first := request(2)
+	if first.Code != http.StatusAccepted {
+		t.Fatalf("expected first 202, got %d body=%s", first.Code, first.Body.String())
+	}
+	firstTaskID := responseTaskID(t, first)
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first mutation did not start")
+	}
+	second := request(3)
+	if second.Code != http.StatusInternalServerError || !strings.Contains(second.Body.String(), `"code":"AIFAR_RUNTIME_PRESTART_CLEANUP_FAILED"`) {
+		t.Fatalf("expected stable cleanup failure, got %d body=%s", second.Code, second.Body.String())
+	}
+	if strings.Contains(second.Body.String(), "token") || strings.Contains(second.Body.String(), "must-not-leak") {
+		t.Fatalf("cleanup response leaked delete error: %s", second.Body.String())
+	}
+	tasks, err := db.ListTasks()
+	if err != nil {
+		t.Fatal(err)
+	}
+	failedTaskID := ""
+	for _, task := range tasks {
+		if task.ID != firstTaskID && task.Status == "failed" && !task.FinishedAt.IsZero() {
+			failedTaskID = task.ID
+		}
+	}
+	if len(tasks) != 2 || failedTaskID == "" {
+		t.Fatalf("delete failure did not leave one visible failed conflict task: %+v", tasks)
+	}
+	_, logs, err := db.GetTask(failedTaskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(logs) == 0 || strings.Contains(fmt.Sprint(logs), "must-not-leak") {
+		t.Fatalf("delete cleanup log missing or unsafe: %+v", logs)
+	}
+}
+
 func TestServiceReconcileUsesTypedTaskWithoutGenerationBump(t *testing.T) {
 	module := &fakeAIFARRuntimeActionModule{}
 	api, db, secret := newAuthzTestAPI(t)
@@ -1095,6 +1303,66 @@ func TestRuntimeDeploymentWorkerStartFailureReleasesLockAndDeletesTask(t *testin
 	}
 }
 
+func TestRuntimeDeploymentWorkerStartCleanupFailureKeepsFailedAuditableTask(t *testing.T) {
+	module := &fakeAIFARRuntimeActionModule{}
+	api, db, secret := newAuthzTestAPI(t)
+	api.apps = registry.New(module)
+	api.aifarAgentStatus = func(context.Context, store.Server) aifarRuntimeAgent {
+		return aifarRuntimeAgent{Status: "running"}
+	}
+	api.runtime.startExistingTask = func(task store.Task, _ string, _ worker.Job) (store.Task, error) {
+		return task, errors.New("injected worker start failure")
+	}
+	api.runtime.releaseRuntimeLock = func(string) (bool, error) {
+		return false, errors.New("release failed password=must-not-leak")
+	}
+	server, instance := seedAIFARRuntimeFixture(t, db, "unix:///var/run/docker.sock")
+	token := issueTestToken(t, db, secret, "owner", "owner")
+	req := httptest.NewRequest(http.MethodPut, "/api/v2/apps/instances/"+instance.ID+"/runtime/deployments/permission?serverId="+server.ID, strings.NewReader(`{"operation":"scale","expectedGeneration":1,"replicas":2}`))
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	api.Router().ServeHTTP(rec, req)
+	if rec.Code != http.StatusInternalServerError || !strings.Contains(rec.Body.String(), `"code":"AIFAR_RUNTIME_PRESTART_CLEANUP_FAILED"`) {
+		t.Fatalf("expected stable cleanup failure, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "password") || strings.Contains(rec.Body.String(), "must-not-leak") {
+		t.Fatalf("cleanup response leaked raw store error: %s", rec.Body.String())
+	}
+	tasks, err := db.ListTasks()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tasks) != 1 || tasks[0].Status != "failed" || tasks[0].FinishedAt.IsZero() {
+		t.Fatalf("cleanup failure must keep one failed auditable task: %+v", tasks)
+	}
+	_, logs, err := db.GetTask(tasks[0].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(logs) == 0 || strings.Contains(fmt.Sprint(logs), "must-not-leak") || strings.Contains(fmt.Sprint(logs), "password") {
+		t.Fatalf("cleanup failure log missing or unsafe: %+v", logs)
+	}
+	targets, err := db.ListTaskTargets(tasks[0].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	steps, err := db.ListTaskSteps(tasks[0].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(targets) != 1 || targets[0].Status != "failed" || len(steps) != 1 || steps[0].Status != "failed" {
+		t.Fatalf("cleanup failure did not terminalize task plan: targets=%+v steps=%+v", targets, steps)
+	}
+	locks, err := db.ListAIFAROrchestrationLocks(instance.ID, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(locks) != 1 || locks[0].TaskID != tasks[0].ID {
+		t.Fatalf("unreleased lock must remain attributable to visible failed task: %+v", locks)
+	}
+}
+
 func TestRuntimeDeploymentCancellationReleasesServiceLock(t *testing.T) {
 	started := make(chan struct{})
 	release := make(chan struct{})
@@ -1139,6 +1407,95 @@ func TestRuntimeDeploymentCancellationReleasesServiceLock(t *testing.T) {
 	if len(locks) != 0 {
 		t.Fatalf("cancelled worker leaked locks: %+v", locks)
 	}
+}
+
+func TestQueuedRuntimeDeploymentCancellationReleasesExactLockAndTerminalizesPlan(t *testing.T) {
+	module := &fakeAIFARRuntimeActionModule{}
+	api, db, secret := newAuthzTestAPI(t)
+	api.apps = registry.New(module)
+	api.tasks = worker.NewManagerWithConcurrency(db, 1)
+	api.runtime.runtimeLockHeartbeatInterval = 10 * time.Millisecond
+	api.aifarAgentStatus = func(context.Context, store.Server) aifarRuntimeAgent {
+		return aifarRuntimeAgent{Status: "running"}
+	}
+	holderStarted := make(chan struct{})
+	holderRelease := make(chan struct{})
+	var releaseHolder sync.Once
+	t.Cleanup(func() { releaseHolder.Do(func() { close(holderRelease) }) })
+	if _, err := api.tasks.Start("test.runtime-slot-holder", "holder", "owner", func(ctx context.Context, log worker.Logger) error {
+		close(holderStarted)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-holderRelease:
+			return nil
+		}
+	}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-holderStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("slot holder did not start")
+	}
+	server, instance := seedAIFARRuntimeFixture(t, db, "unix:///var/run/docker.sock")
+	token := issueTestToken(t, db, secret, "owner", "owner")
+	req := httptest.NewRequest(http.MethodPut, "/api/v2/apps/instances/"+instance.ID+"/runtime/deployments/permission?serverId="+server.ID, strings.NewReader(`{"operation":"scale","expectedGeneration":1,"replicas":2}`))
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	api.Router().ServeHTTP(rec, req)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	taskID := responseTaskID(t, rec)
+	renewedDeadline := time.Now().Add(2 * time.Second)
+	for {
+		locks, err := db.ListAIFAROrchestrationLocks(instance.ID, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(locks) == 1 && locks[0].UpdatedAt.After(locks[0].StartedAt) {
+			break
+		}
+		if time.Now().After(renewedDeadline) {
+			t.Fatalf("queued service lock was not heartbeated before worker slot: %+v", locks)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	cancelReq := httptest.NewRequest(http.MethodPost, "/api/v2/tasks/"+taskID+"/cancel", nil)
+	cancelReq.Header.Set("Authorization", "Bearer "+token)
+	cancelRec := httptest.NewRecorder()
+	api.Router().ServeHTTP(cancelRec, cancelReq)
+	if cancelRec.Code != http.StatusOK || !strings.Contains(cancelRec.Body.String(), `"cancelled":true`) {
+		t.Fatalf("cancel failed: code=%d body=%s", cancelRec.Code, cancelRec.Body.String())
+	}
+	waitForTaskStatus(t, db, taskID, "cancelled")
+	locks, err := db.ListAIFAROrchestrationLocks(instance.ID, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(locks) != 0 {
+		t.Fatalf("queued cancellation leaked exact service lock: %+v", locks)
+	}
+	targets, err := db.ListTaskTargets(taskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(targets) != 1 || targets[0].Status != "cancelled" || targets[0].FinishedAt.IsZero() {
+		t.Fatalf("queued cancellation did not terminalize target: %+v", targets)
+	}
+	steps, err := db.ListTaskSteps(taskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(steps) != 1 || steps[0].Status != "cancelled" || steps[0].FinishedAt.IsZero() {
+		t.Fatalf("queued cancellation did not terminalize step: %+v", steps)
+	}
+	if module.mutationCalls.Load() != 0 {
+		t.Fatalf("queued cancelled task entered module %d times", module.mutationCalls.Load())
+	}
+	releaseHolder.Do(func() { close(holderRelease) })
 }
 
 func TestAIFARModuleServiceReconcileKeepsGenerationAndUsesTypedAgentCommand(t *testing.T) {
