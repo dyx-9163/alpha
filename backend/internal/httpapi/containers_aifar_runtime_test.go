@@ -3,16 +3,22 @@ package httpapi
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"aifar-deployment/backend/internal/adapter"
+	aifarapp "aifar-deployment/backend/internal/apps/aifar"
 	"aifar-deployment/backend/internal/apps/registry"
 	"aifar-deployment/backend/internal/store"
+	"aifar-deployment/backend/internal/worker"
 )
 
 func TestAIFARRuntimeReturnsDegradedControlPlaneWhenAgentMissing(t *testing.T) {
@@ -90,6 +96,143 @@ func TestAIFARRuntimeCanSkipPodsAndStats(t *testing.T) {
 	}
 	if len(body.Deployments) != 1 || len(body.Services) != 1 {
 		t.Fatalf("expected deployment and service summaries, got deployments=%+v services=%+v", body.Deployments, body.Services)
+	}
+}
+
+func TestRuntimeResponseOmitsNacosStatusAndIncludesConditions(t *testing.T) {
+	api, db, secret := newAuthzTestAPI(t)
+	api.aifarAgentStatus = func(context.Context, store.Server) aifarRuntimeAgent {
+		return aifarRuntimeAgent{
+			Status: "running",
+			Instances: []aifarAgentInstanceStatus{{
+				InstanceID: "ignored",
+				ServiceStatus: []aifarAgentServiceStatus{{
+					ServiceName: "permission", EndpointCount: 1, ReadyEndpointCount: 1,
+				}},
+			}},
+		}
+	}
+	server, instance := seedAIFARRuntimeFixture(t, db, "unix:///var/run/docker.sock")
+	transitionAt := time.Date(2026, 8, 10, 1, 2, 3, 0, time.UTC)
+	if _, err := db.SaveAIFARDeployment(store.AIFARDeployment{
+		InstanceID: instance.ID, ServiceName: "permission", DesiredReplicas: 1,
+		CurrentRevision: "rev-2", Generation: 2, ObservedGeneration: 1, Status: "Progressing",
+		ConditionsJSON:   `[{"type":"Progressing","status":true,"reason":"ReadinessFailed","generation":1,"lastTransitionTime":"2026-08-10T01:02:03Z"}]`,
+		LastTransitionAt: transitionAt,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	token := issueTestToken(t, db, secret, "owner", "owner")
+	req := httptest.NewRequest(http.MethodGet, "/api/v2/containers/aifar/runtime?serverId="+server.ID+"&includePods=0&includeStats=0", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	rec := httptest.NewRecorder()
+
+	api.Router().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	for _, forbidden := range []string{"nacosRegistered", "nacosReady", "lastNacosHeartbeatAt", "lastNacosError", "must-not-leak"} {
+		if strings.Contains(body, forbidden) {
+			t.Fatalf("response still exposes Nacos runtime status %q: %s", forbidden, body)
+		}
+	}
+	for _, required := range []string{`"generation":2`, `"observedGeneration":1`, `"conditions":[`, `"lastTransitionAt":"2026-08-10T01:02:03Z"`} {
+		if !strings.Contains(body, required) {
+			t.Fatalf("response is missing deployment field %s: %s", required, body)
+		}
+	}
+}
+
+func TestRuntimeDockerObservationIsServiceLocalAndDoesNotBumpGeneration(t *testing.T) {
+	api, db, _ := newAuthzTestAPI(t)
+	_, instance := seedAIFARRuntimeFixture(t, db, "unix:///var/run/docker.sock")
+	permission, err := db.SaveAIFARDeployment(store.AIFARDeployment{
+		InstanceID: instance.ID, ServiceName: "permission", DesiredReplicas: 1,
+		CurrentRevision: "rev-1", Generation: 4, ObservedGeneration: 3, Status: "Progressing",
+		ConditionsJSON: `[{"type":"Progressing","status":true,"generation":3}]`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	file, err := db.SaveAIFARDeployment(store.AIFARDeployment{
+		InstanceID: instance.ID, ServiceName: "file", DesiredReplicas: 1,
+		CurrentRevision: "file-rev", Generation: 7, ObservedGeneration: 7, Status: "Available",
+		ConditionsJSON: `[{"type":"Available","status":true,"generation":7}]`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.SaveAIFARPod(store.AIFARPod{
+		InstanceID: instance.ID, ServiceName: "file", Revision: "file-rev", PodID: "r1",
+		ContainerName: "aifar-pod-admin-file-file-rev-r1", Status: "ready", Ready: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.ReplaceAIFARServiceEndpoints(instance.ID, "file", []store.AIFARServiceEndpoint{{
+		InstanceID: instance.ID, ServiceName: "file", PodID: "r1",
+		ContainerName: "aifar-pod-admin-file-file-rev-r1", Revision: "file-rev", State: "active", Ready: true,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+
+	response := aifarRuntimeResponse{RuntimeStatus: "ready", Agent: aifarRuntimeAgent{Status: "running"}}
+	api.appendAIFARInstanceRuntime(&response, instance, map[string]adapter.DockerContainer{
+		"aifar-pod-admin-permission-rev-1-r1": {
+			Name: "aifar-pod-admin-permission-rev-1-r1", Image: "aifar-permission:rev-1",
+			State: "running", Status: "Up 1 minute (healthy)",
+			Labels: map[string]string{
+				"aifar.app": "aifar", "aifar.component": "pod", "aifar.install-root": "/aifar/apps/admin",
+				"aifar.service": "permission", "aifar.revision": "rev-1", "aifar.replica": "1",
+			},
+		},
+	}, nil, aifarRuntimeBuildOptions{IncludePods: true})
+
+	deployments, err := db.ListAIFARDeployments(instance.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byService := map[string]store.AIFARDeployment{}
+	for _, deployment := range deployments {
+		byService[deployment.ServiceName] = deployment
+	}
+	gotPermission := byService["permission"]
+	if gotPermission.Generation != permission.Generation || gotPermission.ObservedGeneration != permission.Generation {
+		t.Fatalf("permission observation changed desired generation or did not advance observed generation: before=%+v after=%+v", permission, gotPermission)
+	}
+	gotFile := byService["file"]
+	if gotFile.Generation != file.Generation || gotFile.ObservedGeneration != file.ObservedGeneration || gotFile.Status != file.Status || gotFile.ConditionsJSON != file.ConditionsJSON {
+		t.Fatalf("permission observation rewrote peer deployment: before=%+v after=%+v", file, gotFile)
+	}
+	filePods, err := db.ListAIFARPods(instance.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	peerPodFound := false
+	for _, pod := range filePods {
+		peerPodFound = peerPodFound || pod.ServiceName == "file" && pod.ContainerName == "aifar-pod-admin-file-file-rev-r1"
+	}
+	if !peerPodFound {
+		t.Fatalf("permission observation pruned missing peer pods: %+v", filePods)
+	}
+	fileEndpoints, err := db.ListAIFARServiceEndpoints(instance.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	peerEndpointFound := false
+	for _, endpoint := range fileEndpoints {
+		peerEndpointFound = peerEndpointFound || endpoint.ServiceName == "file" && endpoint.ContainerName == "aifar-pod-admin-file-file-rev-r1"
+	}
+	if !peerEndpointFound {
+		t.Fatalf("permission observation pruned missing peer endpoints: %+v", fileEndpoints)
+	}
+	savedInstance, err := db.GetAppInstance(instance.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if savedInstance.Status != "installed" {
+		t.Fatalf("runtime observation changed app install status: %q", savedInstance.Status)
 	}
 }
 
@@ -453,8 +596,8 @@ func TestAIFARRuntimeReconcilesDockerPodsIntoControlPlane(t *testing.T) {
 			break
 		}
 	}
-	if gotDeployment == nil || gotDeployment.DesiredReplicas != 1 || gotDeployment.ReadyReplicas != 1 || gotDeployment.Status != "ready" {
-		t.Fatalf("expected reconciled im deployment to be ready, got %+v in %+v", gotDeployment, response.Deployments)
+	if gotDeployment == nil || gotDeployment.DesiredReplicas != 0 || gotDeployment.ReadyReplicas != 1 || gotDeployment.Status != "offline" || gotDeployment.ObservedGeneration != gotDeployment.Generation {
+		t.Fatalf("expected Docker observation without rewriting offline desired state, got %+v in %+v", gotDeployment, response.Deployments)
 	}
 	var gotPod *aifarRuntimePod
 	for i := range response.Pods {
@@ -477,8 +620,8 @@ func TestAIFARRuntimeReconcilesDockerPodsIntoControlPlane(t *testing.T) {
 			break
 		}
 	}
-	if storedDeployment == nil || storedDeployment.DesiredReplicas != 1 || storedDeployment.Status != "ready" {
-		t.Fatalf("expected im deployment to be persisted, got %+v in %+v", storedDeployment, deployments)
+	if storedDeployment == nil || storedDeployment.DesiredReplicas != 0 || storedDeployment.ObservedGeneration != storedDeployment.Generation || storedDeployment.Status != "degraded" {
+		t.Fatalf("expected im observation to preserve desired state and record the unexpected pod, got %+v in %+v", storedDeployment, deployments)
 	}
 	pods, err := db.ListAIFARPods(instance.ID)
 	if err != nil {
@@ -510,13 +653,8 @@ func TestAIFARRuntimeReconcilesDockerPodsIntoControlPlane(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	metadata := runtimeMetadata(saved.Metadata)
-	desired := runtimeDesiredReplicasFromMetadata(metadata)
-	if desired["im"] != 1 {
-		t.Fatalf("expected im desired replicas in metadata, got %+v metadata=%s", desired, saved.Metadata)
-	}
-	if !stringSet(runtimeServicesFromMetadata(metadata))["im"] {
-		t.Fatalf("expected im to be present in metadata services, got %s", saved.Metadata)
+	if saved.Status != "installed" || saved.Metadata != instance.Metadata {
+		t.Fatalf("Docker observation must not rewrite app instance lifecycle or metadata: before=%+v after=%+v", instance, saved)
 	}
 }
 
@@ -655,7 +793,7 @@ func TestAIFARRuntimeRequiresServiceCatalogForDockerDiscovery(t *testing.T) {
 	}
 }
 
-func TestAIFARRuntimeReconcileHonorsMetadataDesiredWhenDeploymentIsStale(t *testing.T) {
+func TestAIFARRuntimeReconcileKeepsDeploymentDesiredAuthoritativeOverMetadata(t *testing.T) {
 	api, db, _ := newAuthzTestAPI(t)
 	_, instance := seedAIFARRuntimeFixture(t, db, "unix:///var/run/docker.sock")
 	metadata := runtimeMetadata(instance.Metadata)
@@ -703,8 +841,8 @@ func TestAIFARRuntimeReconcileHonorsMetadataDesiredWhenDeploymentIsStale(t *test
 			break
 		}
 	}
-	if gotDeployment == nil || gotDeployment.DesiredReplicas != 1 || gotDeployment.ReadyReplicas != 1 || gotDeployment.Status != "ready" {
-		t.Fatalf("expected stale deployment desired replicas to be corrected, got %+v in %+v", gotDeployment, response.Deployments)
+	if gotDeployment == nil || gotDeployment.DesiredReplicas != 2 || gotDeployment.ReadyReplicas != 1 || gotDeployment.Status != "degraded" || gotDeployment.ObservedGeneration != gotDeployment.Generation {
+		t.Fatalf("expected canonical deployment desired replicas to remain authoritative, got %+v in %+v", gotDeployment, response.Deployments)
 	}
 	deployments, err := db.ListAIFARDeployments(instance.ID)
 	if err != nil {
@@ -712,8 +850,8 @@ func TestAIFARRuntimeReconcileHonorsMetadataDesiredWhenDeploymentIsStale(t *test
 	}
 	for _, deployment := range deployments {
 		if deployment.ServiceName == "system" {
-			if deployment.DesiredReplicas != 1 || deployment.Status != "ready" {
-				t.Fatalf("expected stored system deployment to be corrected, got %+v", deployment)
+			if deployment.DesiredReplicas != 2 || deployment.Status != "degraded" || deployment.ObservedGeneration != deployment.Generation {
+				t.Fatalf("expected stored system observation without desired-state rewrite, got %+v", deployment)
 			}
 			return
 		}
@@ -787,6 +925,361 @@ func TestAIFARRuntimeScaleActionsRequireAgent(t *testing.T) {
 			t.Fatalf("%s: expected agent-required error, got %s", path, rec.Body.String())
 		}
 	}
+}
+
+func TestDifferentServiceTasksAcquireDifferentLocks(t *testing.T) {
+	permissionStarted := make(chan struct{})
+	permissionRelease := make(chan struct{})
+	module := &fakeAIFARRuntimeActionModule{
+		mutationStarted: map[string]chan struct{}{"permission": permissionStarted},
+		mutationRelease: map[string]chan struct{}{"permission": permissionRelease},
+	}
+	api, db, secret := newAuthzTestAPI(t)
+	api.apps = registry.New(module)
+	api.aifarAgentStatus = func(context.Context, store.Server) aifarRuntimeAgent {
+		return aifarRuntimeAgent{Status: "running"}
+	}
+	server, instance := seedAIFARRuntimeFixture(t, db, "unix:///var/run/docker.sock")
+	if _, err := db.SaveAIFARDeployment(store.AIFARDeployment{
+		InstanceID: instance.ID, ServiceName: "file", DesiredReplicas: 1,
+		CurrentRevision: "rev-1", Generation: 1, Status: "Available",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	token := issueTestToken(t, db, secret, "owner", "owner")
+	requestMutation := func(service string, replicas int) *httptest.ResponseRecorder {
+		t.Helper()
+		body := fmt.Sprintf(`{"operation":"scale","expectedGeneration":1,"replicas":%d,"reason":"operator request"}`, replicas)
+		req := httptest.NewRequest(http.MethodPut, "/api/v2/apps/instances/"+instance.ID+"/runtime/deployments/"+service+"?serverId="+server.ID, strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		api.Router().ServeHTTP(rec, req)
+		return rec
+	}
+
+	first := requestMutation("permission", 2)
+	if first.Code != http.StatusAccepted {
+		t.Fatalf("first permission mutation: expected 202, got %d body=%s", first.Code, first.Body.String())
+	}
+	firstTaskID := responseTaskID(t, first)
+	select {
+	case <-permissionStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("permission mutation did not start")
+	}
+
+	file := requestMutation("file", 2)
+	if file.Code != http.StatusAccepted {
+		t.Fatalf("file mutation must not conflict with permission: got %d body=%s", file.Code, file.Body.String())
+	}
+	waitForTaskStatus(t, db, responseTaskID(t, file), "success")
+
+	secondPermission := requestMutation("permission", 3)
+	if secondPermission.Code != http.StatusConflict {
+		t.Fatalf("second permission mutation: expected 409, got %d body=%s", secondPermission.Code, secondPermission.Body.String())
+	}
+	var conflict struct {
+		Code    string         `json:"code"`
+		Details map[string]any `json:"details"`
+	}
+	if err := json.Unmarshal(secondPermission.Body.Bytes(), &conflict); err != nil {
+		t.Fatal(err)
+	}
+	if conflict.Code != "AIFAR_RUNTIME_SERVICE_LOCKED" || len(conflict.Details) != 1 || conflict.Details["ownerTaskId"] != firstTaskID {
+		t.Fatalf("conflict must expose only stable owner task ID: %+v body=%s", conflict, secondPermission.Body.String())
+	}
+	close(permissionRelease)
+	waitForTaskStatus(t, db, firstTaskID, "success")
+
+	locks, err := db.ListAIFAROrchestrationLocks(instance.ID, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(locks) != 0 {
+		t.Fatalf("worker completion leaked orchestration locks: %+v", locks)
+	}
+	assertAuditExists(t, db, "aifar.runtime.deployment.scale", "running", "owner", instance.ID+":permission")
+	targets, err := db.ListTaskTargets(firstTaskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(targets) != 1 || targets[0].Target != instance.ID+":permission" || targets[0].Status != "success" {
+		t.Fatalf("unexpected permission task target: %+v", targets)
+	}
+	steps, err := db.ListTaskSteps(firstTaskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(steps) != 1 || steps[0].Target != instance.ID+":permission" || steps[0].Name != "accept-service-intent" || steps[0].Status != "success" {
+		t.Fatalf("unexpected permission task steps: %+v", steps)
+	}
+}
+
+func TestServiceReconcileUsesTypedTaskWithoutGenerationBump(t *testing.T) {
+	module := &fakeAIFARRuntimeActionModule{}
+	api, db, secret := newAuthzTestAPI(t)
+	api.apps = registry.New(module)
+	api.aifarAgentStatus = func(context.Context, store.Server) aifarRuntimeAgent {
+		return aifarRuntimeAgent{Status: "running"}
+	}
+	server, instance := seedAIFARRuntimeFixture(t, db, "unix:///var/run/docker.sock")
+	before, err := api.currentAIFARDeployment(instance.ID, "permission")
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := issueTestToken(t, db, secret, "owner", "owner")
+	req := httptest.NewRequest(http.MethodPost, "/api/v2/apps/instances/"+instance.ID+"/runtime/deployments/permission/reconcile?serverId="+server.ID, strings.NewReader(`{"expectedGeneration":1,"reason":"retry now"}`))
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	api.Router().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	taskID := responseTaskID(t, rec)
+	waitForTaskStatus(t, db, taskID, "success")
+	after, err := api.currentAIFARDeployment(instance.ID, "permission")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Generation != before.Generation {
+		t.Fatalf("service reconcile bumped generation: before=%d after=%d", before.Generation, after.Generation)
+	}
+	module.mutationMu.Lock()
+	requests := append([]registry.RuntimeDeploymentMutationRequest(nil), module.mutationRequests...)
+	module.mutationMu.Unlock()
+	if len(requests) != 1 || requests[0].Operation != "reconcile" || requests[0].ExpectedGeneration != before.Generation || requests[0].Replicas != nil || requests[0].Restart {
+		t.Fatalf("unexpected typed reconcile request: %+v", requests)
+	}
+	assertAuditExists(t, db, "aifar.runtime.deployment.reconcile", "running", "owner", instance.ID+":permission")
+}
+
+func TestRuntimeDeploymentWorkerStartFailureReleasesLockAndDeletesTask(t *testing.T) {
+	module := &fakeAIFARRuntimeActionModule{}
+	api, db, secret := newAuthzTestAPI(t)
+	api.apps = registry.New(module)
+	api.aifarAgentStatus = func(context.Context, store.Server) aifarRuntimeAgent {
+		return aifarRuntimeAgent{Status: "running"}
+	}
+	api.runtime.startExistingTask = func(task store.Task, _ string, _ worker.Job) (store.Task, error) {
+		return task, errors.New("injected worker start failure")
+	}
+	server, instance := seedAIFARRuntimeFixture(t, db, "unix:///var/run/docker.sock")
+	token := issueTestToken(t, db, secret, "owner", "owner")
+	req := httptest.NewRequest(http.MethodPut, "/api/v2/apps/instances/"+instance.ID+"/runtime/deployments/permission?serverId="+server.ID, strings.NewReader(`{"operation":"scale","expectedGeneration":1,"replicas":2}`))
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	api.Router().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	locks, err := db.ListAIFAROrchestrationLocks(instance.ID, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(locks) != 0 {
+		t.Fatalf("worker start failure leaked locks: %+v", locks)
+	}
+	tasks, err := db.ListTasks()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tasks) != 0 {
+		t.Fatalf("worker start failure left orphan task: %+v", tasks)
+	}
+}
+
+func TestRuntimeDeploymentCancellationReleasesServiceLock(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	defer close(release)
+	module := &fakeAIFARRuntimeActionModule{
+		mutationStarted: map[string]chan struct{}{"permission": started},
+		mutationRelease: map[string]chan struct{}{"permission": release},
+	}
+	api, db, secret := newAuthzTestAPI(t)
+	api.apps = registry.New(module)
+	api.aifarAgentStatus = func(context.Context, store.Server) aifarRuntimeAgent {
+		return aifarRuntimeAgent{Status: "running"}
+	}
+	server, instance := seedAIFARRuntimeFixture(t, db, "unix:///var/run/docker.sock")
+	token := issueTestToken(t, db, secret, "owner", "owner")
+	req := httptest.NewRequest(http.MethodPut, "/api/v2/apps/instances/"+instance.ID+"/runtime/deployments/permission?serverId="+server.ID, strings.NewReader(`{"operation":"scale","expectedGeneration":1,"replicas":2}`))
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	api.Router().ServeHTTP(rec, req)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	taskID := responseTaskID(t, rec)
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("worker did not start")
+	}
+	cancelReq := httptest.NewRequest(http.MethodPost, "/api/v2/tasks/"+taskID+"/cancel", nil)
+	cancelReq.Header.Set("Authorization", "Bearer "+token)
+	cancelRec := httptest.NewRecorder()
+	api.Router().ServeHTTP(cancelRec, cancelReq)
+	if cancelRec.Code != http.StatusOK || !strings.Contains(cancelRec.Body.String(), `"cancelled":true`) {
+		t.Fatalf("cancel failed: code=%d body=%s", cancelRec.Code, cancelRec.Body.String())
+	}
+	waitForTaskStatus(t, db, taskID, "cancelled")
+	locks, err := db.ListAIFAROrchestrationLocks(instance.ID, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(locks) != 0 {
+		t.Fatalf("cancelled worker leaked locks: %+v", locks)
+	}
+}
+
+func TestAIFARModuleServiceReconcileKeepsGenerationAndUsesTypedAgentCommand(t *testing.T) {
+	_, db, _ := newAuthzTestAPI(t)
+	_, instance := seedAIFARRuntimeFixture(t, db, "unix:///var/run/docker.sock")
+	before, err := db.ListAIFARDeployments(instance.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var permission store.AIFARDeployment
+	for _, deployment := range before {
+		if deployment.ServiceName == "permission" {
+			permission = deployment
+		}
+	}
+	lock, err := db.AcquireAIFAROrchestrationLock(store.AIFAROrchestrationLock{
+		InstanceID: instance.ID, ServiceName: "permission", Operation: "reconcile",
+		Actor: "owner", TaskID: "task-reconcile", ExpiresAt: time.Now().UTC().Add(time.Hour),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.ReleaseAIFAROrchestrationLockByID(lock.ID)
+	remote := &runtimeDeploymentTestRemote{}
+	module := aifarapp.NewModule(db, remote)
+	err = module.MutateRuntimeDeployment(context.Background(), registry.RuntimeDeploymentMutationRequest{
+		InstanceID: instance.ID, ServiceName: "permission", ExpectedGeneration: permission.Generation,
+		Operation: "reconcile", Reason: "operator reason must not enter the command",
+	}, registry.RunContext{
+		TaskID: "task-reconcile", Language: "en", Actor: "owner", LockID: lock.ID, Log: runtimeDeploymentTestLogger{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	after, err := db.ListAIFARDeployments(instance.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, deployment := range after {
+		if deployment.ServiceName == "permission" && deployment.Generation != permission.Generation {
+			t.Fatalf("module reconcile bumped generation: before=%d after=%d", permission.Generation, deployment.Generation)
+		}
+	}
+	if len(remote.commands) != 1 || !strings.Contains(remote.commands[0], `aifar-agent reconcile-deployment --instance "$INSTANCE_ID" --service "$SERVICE_NAME"`) {
+		t.Fatalf("module did not use typed reconcile-deployment command: %+v", remote.commands)
+	}
+	if strings.Contains(remote.commands[0], "operator reason") {
+		t.Fatalf("free-form reason entered remote command: %s", remote.commands[0])
+	}
+}
+
+type runtimeDeploymentTestRemote struct {
+	commands []string
+}
+
+func (r *runtimeDeploymentTestRemote) Run(_ context.Context, _ store.Server, command string) (adapter.CommandResult, error) {
+	r.commands = append(r.commands, command)
+	return adapter.CommandResult{}, nil
+}
+
+func (*runtimeDeploymentTestRemote) UploadFile(context.Context, store.Server, string, string, os.FileMode) error {
+	return nil
+}
+
+type runtimeDeploymentTestLogger struct{}
+
+func (runtimeDeploymentTestLogger) Info(string, ...any)  {}
+func (runtimeDeploymentTestLogger) Error(string, ...any) {}
+
+func TestRuntimeDeploymentMutationRejectsInvalidTypedBodies(t *testing.T) {
+	module := &fakeAIFARRuntimeActionModule{}
+	api, db, secret := newAuthzTestAPI(t)
+	api.apps = registry.New(module)
+	api.aifarAgentStatus = func(context.Context, store.Server) aifarRuntimeAgent {
+		return aifarRuntimeAgent{Status: "running"}
+	}
+	server, instance := seedAIFARRuntimeFixture(t, db, "unix:///var/run/docker.sock")
+	token := issueTestToken(t, db, secret, "owner", "owner")
+	cases := []string{
+		`{"operation":"shell","expectedGeneration":1}`,
+		`{"operation":"scale","expectedGeneration":1}`,
+		`{"operation":"offline","expectedGeneration":1,"replicas":1}`,
+		`{"operation":"restart","expectedGeneration":0}`,
+		`{"operation":"apply","expectedGeneration":1}`,
+		`{"operation":"scale","expectedGeneration":1,"replicas":2,"command":"id"}`,
+		`{"operation":"scale","expectedGeneration":1,"replicas":2}{"operation":"offline","expectedGeneration":1}`,
+	}
+	for _, body := range cases {
+		req := httptest.NewRequest(http.MethodPut, "/api/v2/apps/instances/"+instance.ID+"/runtime/deployments/permission?serverId="+server.ID, strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		api.Router().ServeHTTP(rec, req)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("body %s: expected 400, got %d response=%s", body, rec.Code, rec.Body.String())
+		}
+	}
+	if module.mutationCalls.Load() != 0 {
+		t.Fatalf("invalid typed bodies reached module %d times", module.mutationCalls.Load())
+	}
+}
+
+func TestScaleAndOfflineCompatibilityAliasesUseTypedMutationModule(t *testing.T) {
+	module := &fakeAIFARRuntimeActionModule{}
+	api, db, secret := newAuthzTestAPI(t)
+	api.apps = registry.New(module)
+	api.aifarAgentStatus = func(context.Context, store.Server) aifarRuntimeAgent {
+		return aifarRuntimeAgent{Status: "running"}
+	}
+	server, instance := seedAIFARRuntimeFixture(t, db, "unix:///var/run/docker.sock")
+	token := issueTestToken(t, db, secret, "owner", "owner")
+	for _, path := range []string{
+		"/api/v2/containers/aifar/services/permission/scale-out",
+		"/api/v2/containers/aifar/services/permission/offline",
+	} {
+		req := httptest.NewRequest(http.MethodPost, path+"?serverId="+server.ID, strings.NewReader(`{"instanceId":"`+instance.ID+`"}`))
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		api.Router().ServeHTTP(rec, req)
+		if rec.Code != http.StatusAccepted {
+			t.Fatalf("%s: expected 202, got %d body=%s", path, rec.Code, rec.Body.String())
+		}
+		waitForTaskStatus(t, db, responseTaskID(t, rec), "success")
+	}
+	if module.mutationCalls.Load() != 2 {
+		t.Fatalf("compatibility aliases must use typed mutation module, calls=%d", module.mutationCalls.Load())
+	}
+}
+
+func responseTaskID(t *testing.T, rec *httptest.ResponseRecorder) string {
+	t.Helper()
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	taskID, _ := body["taskId"].(string)
+	if taskID == "" {
+		t.Fatalf("expected taskId in response: %s", rec.Body.String())
+	}
+	return taskID
 }
 
 func TestBatchOfflineCreatesOneTaskForNormalizedServices(t *testing.T) {
@@ -1186,6 +1679,11 @@ type fakeAIFARRuntimeActionModule struct {
 	restartErr        error
 	restartStarted    chan struct{}
 	restartRelease    chan struct{}
+	mutationStarted   map[string]chan struct{}
+	mutationRelease   map[string]chan struct{}
+	mutationCalls     atomic.Int32
+	mutationMu        sync.Mutex
+	mutationRequests  []registry.RuntimeDeploymentMutationRequest
 }
 
 func (m *fakeAIFARRuntimeActionModule) Name() string { return "aifar" }
@@ -1207,6 +1705,36 @@ func (m *fakeAIFARRuntimeActionModule) ValidateInstall(ctx context.Context, req 
 }
 
 func (m *fakeAIFARRuntimeActionModule) Install(ctx context.Context, req registry.InstallRequest, run registry.RunContext) error {
+	return nil
+}
+
+func (m *fakeAIFARRuntimeActionModule) MutateRuntimeDeployment(ctx context.Context, req registry.RuntimeDeploymentMutationRequest, run registry.RunContext) error {
+	m.mutationCalls.Add(1)
+	m.mutationMu.Lock()
+	m.mutationRequests = append(m.mutationRequests, req)
+	m.mutationMu.Unlock()
+	if started := m.mutationStarted[req.ServiceName]; started != nil {
+		close(started)
+	}
+	if release := m.mutationRelease[req.ServiceName]; release != nil {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-release:
+		}
+	}
+	target := req.InstanceID + ":" + req.ServiceName
+	if recorder, ok := run.Log.(interface {
+		StartTarget(string)
+		FinishTarget(string, string, string)
+		StartStep(string, string, string, int)
+		FinishStep(string, string, string, string)
+	}); ok {
+		recorder.StartTarget(target)
+		recorder.StartStep(target, "accept-service-intent", "accept-service-intent", 1)
+		recorder.FinishStep(target, "accept-service-intent", "success", "")
+		recorder.FinishTarget(target, "success", "")
+	}
 	return nil
 }
 

@@ -10,6 +10,9 @@ import (
 
 	"aifar-deployment/backend/internal/adapter"
 	"aifar-deployment/backend/internal/apps/registry"
+	"aifar-deployment/backend/internal/i18n"
+	"aifar-deployment/backend/internal/installer/installerkit"
+	"aifar-deployment/backend/internal/runtimeagent"
 	"aifar-deployment/backend/internal/store"
 )
 
@@ -474,6 +477,128 @@ func (m Module) ReconcileRuntime(ctx context.Context, req registry.RuntimeReconc
 	}, run.Log, func(target string) Logger {
 		return run.LoggerForTarget(target)
 	})
+}
+
+func (m Module) MutateRuntimeDeployment(ctx context.Context, req registry.RuntimeDeploymentMutationRequest, run registry.RunContext) error {
+	req.InstanceID = strings.TrimSpace(req.InstanceID)
+	req.ServiceName = cleanAIFARServiceName(req.ServiceName)
+	req.Operation = strings.ToLower(strings.TrimSpace(req.Operation))
+	if req.InstanceID == "" || !aifarServiceSupported(req.ServiceName) || req.ExpectedGeneration <= 0 || strings.TrimSpace(run.LockID) == "" {
+		return errors.New(i18n.Text(run.Language, "aifar.runtimeDeployment.invalidRequest"))
+	}
+	if err := validateRuntimeDeploymentMutationShape(req, run.Language); err != nil {
+		return err
+	}
+	instance, err := m.service.store.GetAppInstance(req.InstanceID)
+	if err != nil {
+		return err
+	}
+	server, err := m.service.store.GetServer(instance.ServerID, true)
+	if err != nil {
+		return err
+	}
+	if req.Operation == "reconcile" {
+		return m.reconcileRuntimeDeploymentWithLock(ctx, instance, server, req, run)
+	}
+
+	replicas := req.Replicas
+	if req.Operation == "offline" {
+		zero := 0
+		replicas = &zero
+	}
+	restart := req.Restart || req.Operation == "restart"
+	plan := deploymentMutationPlan{
+		ServiceName:     req.ServiceName,
+		Operation:       req.Operation,
+		LockAlreadyHeld: true,
+		LockID:          run.LockID,
+		Validate: func(_ store.AppInstance, deployment store.AIFARDeployment) error {
+			if deployment.Generation != req.ExpectedGeneration {
+				return deploymentError(deploymentGenerationConflictCode, deploymentGenerationConflictCode, "aifar.deploymentControl.generationConflict")
+			}
+			return nil
+		},
+		Mutate: func(manifest *runtimeagent.DeploymentManifest) error {
+			if replicas != nil {
+				manifest.Spec.Replicas = *replicas
+			}
+			if restart {
+				manifest.Spec.RestartGeneration++
+			}
+			return nil
+		},
+	}
+	if replicas != nil {
+		plan.Project = func(projectCtx context.Context, lock store.AIFAROrchestrationLock, accepted store.AIFARDeployment) error {
+			_, projectErr := m.service.updateAcceptedDeploymentMetadata(projectCtx, lock, accepted, "AIFAR_RUNTIME_CONTROL_METADATA_WRITE_FAILED", func(metadata map[string]any) error {
+				desired := desiredReplicasFromMetadata(metadata)
+				desired[req.ServiceName] = accepted.DesiredReplicas
+				metadata["desiredReplicas"] = desired
+				return nil
+			})
+			return projectErr
+		}
+	}
+	_, err = m.service.mutateDeploymentsFanOut(ctx, instance, server, run.Actor, fallbackTaskID(run.TaskID, run.Log), run.Language, 1, []deploymentMutationPlan{plan}, run.Log, func(target string) Logger {
+		return run.LoggerForTarget(target)
+	})
+	return err
+}
+
+func validateRuntimeDeploymentMutationShape(req registry.RuntimeDeploymentMutationRequest, language string) error {
+	invalid := func() error { return errors.New(i18n.Text(language, "aifar.runtimeDeployment.invalidRequest")) }
+	switch req.Operation {
+	case "apply":
+		if req.Replicas == nil && !req.Restart {
+			return invalid()
+		}
+	case "scale":
+		if req.Replicas == nil || req.Restart {
+			return invalid()
+		}
+	case "offline", "restart", "reconcile":
+		if req.Replicas != nil || req.Restart {
+			return invalid()
+		}
+	default:
+		return invalid()
+	}
+	if req.Replicas != nil && *req.Replicas < 0 {
+		return invalid()
+	}
+	return nil
+}
+
+func (m Module) reconcileRuntimeDeploymentWithLock(ctx context.Context, instance store.AppInstance, server store.Server, req registry.RuntimeDeploymentMutationRequest, run registry.RunContext) error {
+	control, ok := m.service.store.(aifarDeploymentControlStore)
+	if !ok {
+		return repairRequired("AIFAR_RUNTIME_CONTROL_STORE_UNAVAILABLE", nil)
+	}
+	serviceName := req.ServiceName
+	recorder, _ := run.Log.(stepRecorder)
+	failures := runServiceFanOut(ctx, instance.ID, []string{serviceName}, 1, run.Language, run.Log, func(target string) Logger {
+		return run.LoggerForTarget(target)
+	}, recorder, func(actionCtx context.Context, _ string, serviceLog Logger) error {
+		lock := store.AIFAROrchestrationLock{ID: run.LockID, InstanceID: instance.ID, ServiceName: serviceName, Operation: req.Operation}
+		if ownershipErr := m.service.ensureAIFAROrchestrationLockOwnership(actionCtx, lock); ownershipErr != nil {
+			return ownershipErr
+		}
+		deployment, loadErr := loadDeploymentForMutation(control, instance.ID, serviceName)
+		if loadErr != nil {
+			return loadErr
+		}
+		if deployment.Generation != req.ExpectedGeneration {
+			return deploymentError(deploymentGenerationConflictCode, deploymentGenerationConflictCode, "aifar.deploymentControl.generationConflict")
+		}
+		script, renderErr := renderRuntimeReconcileScript(runtimeReconcileScriptData{InstanceID: instance.ID, ServiceName: serviceName})
+		if renderErr != nil {
+			return renderErr
+		}
+		serviceLog.Info("%s", i18n.Text(run.Language, "aifar.runtimeReconcile.started", serviceName))
+		_, runErr := installerkit.Run(actionCtx, m.service.remote, server, "sh -s <<'AIFAR_RUNTIME_RECONCILE'\n"+script+"\nAIFAR_RUNTIME_RECONCILE", serviceLog, i18n.Text(run.Language, "aifar.runtimeReconcile.failed", serviceName))
+		return runErr
+	})
+	return aggregateServiceActionFailures(run.Language, failures)
 }
 
 func (m Module) RestartRuntime(ctx context.Context, req registry.RuntimeRestartRequest, run registry.RunContext) error {

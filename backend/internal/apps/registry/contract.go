@@ -342,6 +342,16 @@ type RuntimeReconcileRequest struct {
 	Reason   string
 }
 
+type RuntimeDeploymentMutationRequest struct {
+	InstanceID         string
+	ServiceName        string
+	ExpectedGeneration int64
+	Operation          string
+	Replicas           *int
+	Restart            bool
+	Reason             string
+}
+
 type RuntimeRestartRequest struct {
 	Instance store.AppInstance
 	Server   store.Server
@@ -571,6 +581,9 @@ type InstanceStatus struct {
 
 type RunContext struct {
 	TaskID      string
+	Language    string
+	Actor       string
+	LockID      string
 	Resources   []store.Resource
 	Log         Logger
 	TargetLog   func(target string) Logger
@@ -667,6 +680,10 @@ type ServiceInstallModule interface {
 
 type RuntimeReconcileModule interface {
 	ReconcileRuntime(ctx context.Context, req RuntimeReconcileRequest, run RunContext) error
+}
+
+type RuntimeDeploymentMutationModule interface {
+	MutateRuntimeDeployment(ctx context.Context, req RuntimeDeploymentMutationRequest, run RunContext) error
 }
 
 type RuntimeRestartModule interface {

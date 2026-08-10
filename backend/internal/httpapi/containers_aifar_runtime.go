@@ -3,7 +3,9 @@ package httpapi
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"sort"
 	"strconv"
@@ -14,6 +16,7 @@ import (
 	"aifar-deployment/backend/internal/adapter"
 	"aifar-deployment/backend/internal/apps/registry"
 	"aifar-deployment/backend/internal/i18n"
+	"aifar-deployment/backend/internal/runtimeagent"
 	"aifar-deployment/backend/internal/store"
 	"aifar-deployment/backend/internal/worker"
 
@@ -89,10 +92,6 @@ type aifarAgentServiceStatus struct {
 	AppName               string `json:"appName,omitempty"`
 	EndpointCount         int    `json:"endpointCount"`
 	ReadyEndpointCount    int    `json:"readyEndpointCount"`
-	NacosRegistered       bool   `json:"nacosRegistered,omitempty"`
-	NacosReady            bool   `json:"nacosReady,omitempty"`
-	LastNacosHeartbeatAt  string `json:"lastNacosHeartbeatAt,omitempty"`
-	LastNacosError        string `json:"lastNacosError,omitempty"`
 	Status                string `json:"status"`
 	LastEndpointRefreshAt string `json:"lastEndpointRefreshAt,omitempty"`
 }
@@ -110,21 +109,25 @@ type aifarRuntimeInstance struct {
 }
 
 type aifarRuntimeDeployment struct {
-	InstanceID          string `json:"instanceId"`
-	DeploymentName      string `json:"deploymentName"`
-	ServiceName         string `json:"serviceName"`
-	AppName             string `json:"appName"`
-	DesiredReplicas     int    `json:"desiredReplicas"`
-	CurrentReplicas     int    `json:"currentReplicas,omitempty"`
-	ReadyReplicas       int    `json:"readyReplicas"`
-	UpdatedReplicas     int    `json:"updatedReplicas,omitempty"`
-	AvailableReplicas   int    `json:"availableReplicas,omitempty"`
-	PodRevision         string `json:"podRevision,omitempty"`
-	UpdatingPodRevision string `json:"updatingPodRevision,omitempty"`
-	Image               string `json:"image,omitempty"`
-	Status              string `json:"status"`
-	UpdatedAt           string `json:"updatedAt,omitempty"`
-	FailureReason       string `json:"failureReason,omitempty"`
+	InstanceID          string                             `json:"instanceId"`
+	DeploymentName      string                             `json:"deploymentName"`
+	ServiceName         string                             `json:"serviceName"`
+	AppName             string                             `json:"appName"`
+	DesiredReplicas     int                                `json:"desiredReplicas"`
+	CurrentReplicas     int                                `json:"currentReplicas,omitempty"`
+	ReadyReplicas       int                                `json:"readyReplicas"`
+	UpdatedReplicas     int                                `json:"updatedReplicas,omitempty"`
+	AvailableReplicas   int                                `json:"availableReplicas,omitempty"`
+	PodRevision         string                             `json:"podRevision,omitempty"`
+	UpdatingPodRevision string                             `json:"updatingPodRevision,omitempty"`
+	Image               string                             `json:"image,omitempty"`
+	Status              string                             `json:"status"`
+	Generation          int64                              `json:"generation"`
+	ObservedGeneration  int64                              `json:"observedGeneration"`
+	Conditions          []runtimeagent.DeploymentCondition `json:"conditions"`
+	LastTransitionAt    string                             `json:"lastTransitionAt,omitempty"`
+	UpdatedAt           string                             `json:"updatedAt,omitempty"`
+	FailureReason       string                             `json:"failureReason,omitempty"`
 }
 
 type aifarRuntimePod struct {
@@ -157,9 +160,6 @@ type aifarRuntimeService struct {
 	Image              string  `json:"image,omitempty"`
 	Status             string  `json:"status"`
 	RolloutStatus      string  `json:"rolloutStatus,omitempty"`
-	NacosRegistered    bool    `json:"nacosRegistered,omitempty"`
-	NacosReady         bool    `json:"nacosReady,omitempty"`
-	LastNacosError     string  `json:"lastNacosError,omitempty"`
 	LastError          string  `json:"lastError,omitempty"`
 	CPUPercent         float64 `json:"cpuPercent,omitempty"`
 	MemoryPercent      float64 `json:"memoryPercent,omitempty"`
@@ -218,6 +218,19 @@ type aifarRuntimeLogPod struct {
 type aifarRuntimeActionRequest struct {
 	InstanceID string `json:"instanceId"`
 	Reason     string `json:"reason"`
+}
+
+type aifarRuntimeDeploymentMutationBody struct {
+	Operation          string `json:"operation"`
+	ExpectedGeneration int64  `json:"expectedGeneration"`
+	Replicas           *int   `json:"replicas,omitempty"`
+	Restart            bool   `json:"restart,omitempty"`
+	Reason             string `json:"reason,omitempty"`
+}
+
+type aifarRuntimeDeploymentReconcileBody struct {
+	ExpectedGeneration int64  `json:"expectedGeneration"`
+	Reason             string `json:"reason,omitempty"`
 }
 
 type aifarRuntimeServiceInstallRequest struct {
@@ -291,6 +304,10 @@ func aifarRuntimeScaleSteps() []simpleTaskStep {
 		{"apply-scale", "apply desired replicas through aifar-agent"},
 		{"record-scale", "record AIFAR scale result"},
 	}
+}
+
+func aifarRuntimeDeploymentSteps(lang, service string) []simpleTaskStep {
+	return []simpleTaskStep{{"accept-service-intent", i18n.Text(lang, "aifar.runtimeMutation.stepAccept", service)}}
 }
 
 func aifarRuntimeBatchOfflineSteps(lang string) []simpleTaskStep {
@@ -638,6 +655,177 @@ func runtimeLogPodResponse(pod store.AIFARPod, logs []string) aifarRuntimeLogPod
 		Logs:          logs,
 		LineCount:     len(logs),
 	}
+}
+
+func (a *aifarRuntimeController) mutateRuntimeDeployment(w http.ResponseWriter, r *http.Request) {
+	body := aifarRuntimeDeploymentMutationBody{}
+	if !decodeStrictRuntimeDeploymentBody(w, r, &body) {
+		return
+	}
+	req := registry.RuntimeDeploymentMutationRequest{
+		InstanceID: strings.TrimSpace(chi.URLParam(r, "id")), ServiceName: strings.ToLower(strings.TrimSpace(chi.URLParam(r, "service"))),
+		ExpectedGeneration: body.ExpectedGeneration, Operation: strings.ToLower(strings.TrimSpace(body.Operation)),
+		Replicas: body.Replicas, Restart: body.Restart, Reason: strings.TrimSpace(body.Reason),
+	}
+	if !validateRuntimeDeploymentMutationRequest(w, r, req) {
+		return
+	}
+	a.startRuntimeDeploymentMutation(w, r, req, "aifar.runtime.deployment."+req.Operation)
+}
+
+func (a *aifarRuntimeController) reconcileRuntimeDeployment(w http.ResponseWriter, r *http.Request) {
+	body := aifarRuntimeDeploymentReconcileBody{}
+	if !decodeStrictRuntimeDeploymentBody(w, r, &body) {
+		return
+	}
+	req := registry.RuntimeDeploymentMutationRequest{
+		InstanceID: strings.TrimSpace(chi.URLParam(r, "id")), ServiceName: strings.ToLower(strings.TrimSpace(chi.URLParam(r, "service"))),
+		ExpectedGeneration: body.ExpectedGeneration, Operation: "reconcile", Reason: strings.TrimSpace(body.Reason),
+	}
+	if !validateRuntimeDeploymentMutationRequest(w, r, req) {
+		return
+	}
+	a.startRuntimeDeploymentMutation(w, r, req, "aifar.runtime.deployment.reconcile")
+}
+
+func decodeStrictRuntimeDeploymentBody(w http.ResponseWriter, r *http.Request, dst any) bool {
+	lang := languageFromRequest(r)
+	contentType := strings.ToLower(strings.TrimSpace(strings.Split(r.Header.Get("Content-Type"), ";")[0]))
+	if contentType != "application/json" {
+		writeError(w, http.StatusUnsupportedMediaType, "UNSUPPORTED_MEDIA_TYPE", i18n.Text(lang, "api.aifarRuntimeDeploymentJSONRequired"), nil)
+		return false
+	}
+	defer r.Body.Close()
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(dst); err != nil {
+		writeError(w, http.StatusBadRequest, "INVALID_AIFAR_RUNTIME_DEPLOYMENT_REQUEST", i18n.Text(lang, "api.aifarRuntimeDeploymentInvalid"), nil)
+		return false
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		writeError(w, http.StatusBadRequest, "INVALID_AIFAR_RUNTIME_DEPLOYMENT_REQUEST", i18n.Text(lang, "api.aifarRuntimeDeploymentInvalid"), nil)
+		return false
+	}
+	return true
+}
+
+func validateRuntimeDeploymentMutationRequest(w http.ResponseWriter, r *http.Request, req registry.RuntimeDeploymentMutationRequest) bool {
+	valid := req.InstanceID != "" && req.ServiceName != "" && req.ExpectedGeneration > 0
+	switch req.Operation {
+	case "apply":
+		valid = valid && (req.Replicas != nil || req.Restart)
+	case "scale":
+		valid = valid && req.Replicas != nil && !req.Restart
+	case "offline", "restart", "reconcile":
+		valid = valid && req.Replicas == nil && !req.Restart
+	default:
+		valid = false
+	}
+	if req.Replicas != nil && *req.Replicas < 0 {
+		valid = false
+	}
+	if !valid {
+		writeError(w, http.StatusBadRequest, "INVALID_AIFAR_RUNTIME_DEPLOYMENT_REQUEST", i18n.Text(languageFromRequest(r), "api.aifarRuntimeDeploymentInvalid"), nil)
+		return false
+	}
+	return true
+}
+
+func (a *aifarRuntimeController) startRuntimeDeploymentMutation(w http.ResponseWriter, r *http.Request, req registry.RuntimeDeploymentMutationRequest, auditAction string) {
+	lang := languageFromRequest(r)
+	_, instance, ok := a.resolveAIFARRuntimeActionTargetForInstance(w, r, req.InstanceID)
+	if !ok {
+		return
+	}
+	if _, err := a.currentAIFARDeployment(instance.ID, req.ServiceName); err != nil {
+		writeError(w, http.StatusBadRequest, "AIFAR_RUNTIME_DEPLOYMENT_NOT_FOUND", i18n.Text(lang, "api.aifarRuntimeDeploymentNotFound"), nil)
+		return
+	}
+	module, found := a.apps.Get(instance.App)
+	if !found {
+		writeError(w, http.StatusNotFound, "APP_BACKEND_MODULE_MISSING", i18n.Text(lang, "api.appBackendMissing"), map[string]any{"app": instance.App})
+		return
+	}
+	mutation, supported := module.(registry.RuntimeDeploymentMutationModule)
+	if !supported {
+		writeError(w, http.StatusConflict, "AIFAR_RUNTIME_DEPLOYMENT_MUTATION_UNSUPPORTED", i18n.Text(lang, "api.aifarRuntimeDeploymentUnsupported"), map[string]any{"app": instance.App})
+		return
+	}
+	target := instance.ID + ":" + req.ServiceName
+	actor := currentUser(r).Username
+	task, err := a.store.CreateTask(store.Task{Type: auditAction, Target: target, Status: "pending", CreatedBy: actor})
+	if err != nil {
+		respondTask(w, task, err)
+		return
+	}
+	if err := a.storeTaskPlanOrDelete(task.ID, simpleTaskPlan(target, aifarRuntimeDeploymentSteps(lang, req.ServiceName))); err != nil {
+		writeError(w, http.StatusInternalServerError, "TASK_PLAN_STORE_FAILED", i18n.Text(lang, "api.aifarRuntimeDeploymentTaskFailed"), nil)
+		return
+	}
+	lock, err := a.store.AcquireAIFAROrchestrationLock(store.AIFAROrchestrationLock{
+		InstanceID: instance.ID, ServiceName: req.ServiceName, Operation: req.Operation,
+		Actor: actor, TaskID: task.ID, ExpiresAt: time.Now().UTC().Add(time.Hour),
+	})
+	if err != nil {
+		_ = a.store.DeleteTask(task.ID)
+		var conflict store.AIFAROrchestrationLockConflict
+		if errors.As(err, &conflict) {
+			writeError(w, http.StatusConflict, "AIFAR_RUNTIME_SERVICE_LOCKED", i18n.Text(lang, "api.aifarRuntimeServiceLocked"), map[string]any{"ownerTaskId": conflict.Lock.TaskID})
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "AIFAR_RUNTIME_SERVICE_LOCK_FAILED", i18n.Text(lang, "api.aifarRuntimeDeploymentTaskFailed"), nil)
+		return
+	}
+	taskID := task.ID
+	task, err = a.startExistingWithLanguage(task, lang, func(ctx context.Context, log worker.Logger) error {
+		return a.runWithAIFAROrchestrationLock(ctx, lock, func(lockedCtx context.Context) error {
+			return mutation.MutateRuntimeDeployment(lockedCtx, req, registry.RunContext{
+				TaskID: taskID, Language: lang, Actor: actor, LockID: lock.ID, Log: log,
+				TargetLog: func(target string) registry.Logger { return log.Target(target) },
+			})
+		})
+	})
+	if err != nil {
+		_, _ = a.store.ReleaseAIFAROrchestrationLockByID(lock.ID)
+		_ = a.store.DeleteTask(task.ID)
+		respondTask(w, task, err)
+		return
+	}
+	a.audit(r, auditAction, target, "running", task.ID)
+	respondTask(w, task, nil)
+}
+
+func (a *aifarRuntimeController) runWithAIFAROrchestrationLock(ctx context.Context, lock store.AIFAROrchestrationLock, action func(context.Context) error) error {
+	lockedCtx, cancel := context.WithCancel(ctx)
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(time.Hour / 3)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-lockedCtx.Done():
+				return
+			case <-ticker.C:
+				renewed, err := a.store.RenewAIFAROrchestrationLock(lock.ID, time.Now().UTC().Add(time.Hour))
+				if err != nil || !renewed {
+					cancel()
+					return
+				}
+			}
+		}
+	}()
+	defer func() {
+		close(stop)
+		cancel()
+		<-done
+		_, _ = a.store.ReleaseAIFAROrchestrationLockByID(lock.ID)
+	}()
+	return action(lockedCtx)
 }
 
 func (a *aifarRuntimeController) reconcile(w http.ResponseWriter, r *http.Request) {
@@ -1006,184 +1194,60 @@ func (a *aifarRuntimeController) installServices(w http.ResponseWriter, r *http.
 }
 
 func (a *aifarRuntimeController) scaleOut(w http.ResponseWriter, r *http.Request) {
-	lang := languageFromRequest(r)
-	service := strings.TrimSpace(chi.URLParam(r, "service"))
-	if service == "" {
-		writeError(w, http.StatusBadRequest, "AIFAR_SERVICE_REQUIRED", "AIFAR service is required", nil)
-		return
-	}
-	server, instance, ok := a.resolveAIFARRuntimeActionTarget(w, r)
+	_, instance, ok := a.resolveAIFARRuntimeActionTarget(w, r)
 	if !ok {
 		return
 	}
-	module, ok := a.apps.Get(instance.App)
-	if !ok {
-		writeError(w, http.StatusNotFound, "APP_BACKEND_MODULE_MISSING", i18n.Text(lang, "api.appBackendMissing"), map[string]any{"app": instance.App})
+	service := strings.ToLower(strings.TrimSpace(chi.URLParam(r, "service")))
+	deployment, err := a.currentAIFARDeployment(instance.ID, service)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "AIFAR_RUNTIME_DEPLOYMENT_NOT_FOUND", i18n.Text(languageFromRequest(r), "api.aifarRuntimeDeploymentNotFound"), nil)
 		return
 	}
-	scaleOut, ok := module.(registry.ServiceScaleOutModule)
-	if !ok {
-		writeError(w, http.StatusConflict, "AIFAR_SCALE_OUT_UNSUPPORTED", "AIFAR service scale-out is not supported", map[string]any{"app": instance.App})
-		return
-	}
-	actor := currentUser(r).Username
-	target := instance.ID + ":" + service
-	task, err, started := a.startSimplePlannedTaskWithLocks(w, "aifar.scale.out", target, actor, lang, server.ID, aifarRuntimeScaleSteps(), []operationLockSpec{aifarRuntimeMutationLockSpec("scale-out", instance)}, func(ctx context.Context, log worker.Logger) error {
-		current, err := a.store.GetAppInstance(instance.ID)
-		if err != nil {
-			return err
-		}
-		server, err := a.store.GetServer(current.ServerID, true)
-		if err != nil {
-			return err
-		}
-		log.Info("scaling out AIFAR service %s for instance %s", service, current.ID)
-		return scaleOut.ScaleOutService(ctx, registry.ServiceScaleOutRequest{
-			Instance:    current,
-			Server:      server,
-			Language:    lang,
-			Actor:       actor,
-			ServiceName: service,
-			Reason:      "manual container runtime scale-out",
-		}, registry.RunContext{
-			TaskID: log.TaskID(),
-			Log:    log,
-			TargetLog: func(target string) registry.Logger {
-				return log.Target(target)
-			},
-		})
-	})
-	if !started {
-		return
-	}
-	if err == nil {
-		a.audit(r, "aifar.scale.out", target, "running", task.ID)
-	}
-	respondTask(w, task, err)
+	replicas := deployment.DesiredReplicas + 1
+	a.startRuntimeDeploymentMutation(w, r, registry.RuntimeDeploymentMutationRequest{
+		InstanceID: instance.ID, ServiceName: service, ExpectedGeneration: deployment.Generation,
+		Operation: "scale", Replicas: &replicas, Reason: "manual container runtime scale-out",
+	}, "aifar.scale.out")
 }
 
 func (a *aifarRuntimeController) scaleIn(w http.ResponseWriter, r *http.Request) {
-	lang := languageFromRequest(r)
-	service := strings.TrimSpace(chi.URLParam(r, "service"))
-	if service == "" {
-		writeError(w, http.StatusBadRequest, "AIFAR_SERVICE_REQUIRED", "AIFAR service is required", nil)
-		return
-	}
-	server, instance, ok := a.resolveAIFARRuntimeActionTarget(w, r)
+	_, instance, ok := a.resolveAIFARRuntimeActionTarget(w, r)
 	if !ok {
 		return
 	}
-	module, ok := a.apps.Get(instance.App)
-	if !ok {
-		writeError(w, http.StatusNotFound, "APP_BACKEND_MODULE_MISSING", i18n.Text(lang, "api.appBackendMissing"), map[string]any{"app": instance.App})
+	service := strings.ToLower(strings.TrimSpace(chi.URLParam(r, "service")))
+	deployment, err := a.currentAIFARDeployment(instance.ID, service)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "AIFAR_RUNTIME_DEPLOYMENT_NOT_FOUND", i18n.Text(languageFromRequest(r), "api.aifarRuntimeDeploymentNotFound"), nil)
 		return
 	}
-	scaler, ok := module.(registry.ServiceScaleModule)
-	if !ok {
-		writeError(w, http.StatusConflict, "AIFAR_SCALE_UNSUPPORTED", "AIFAR service scale is not supported", map[string]any{"app": instance.App})
+	if deployment.DesiredReplicas <= 1 {
+		writeError(w, http.StatusBadRequest, "AIFAR_RUNTIME_SCALE_IN_REQUIRES_ONLINE_REPLICA", i18n.Text(languageFromRequest(r), "api.aifarRuntimeScaleInRequiresReplica"), nil)
 		return
 	}
-	actor := currentUser(r).Username
-	target := instance.ID + ":" + service
-	task, err, started := a.startSimplePlannedTaskWithLocks(w, "aifar.scale.in", target, actor, lang, server.ID, aifarRuntimeScaleSteps(), []operationLockSpec{aifarRuntimeMutationLockSpec("scale-in", instance)}, func(ctx context.Context, log worker.Logger) error {
-		current, err := a.store.GetAppInstance(instance.ID)
-		if err != nil {
-			return err
-		}
-		server, err := a.store.GetServer(current.ServerID, true)
-		if err != nil {
-			return err
-		}
-		currentDesired, err := a.currentAIFARServiceDesiredReplicas(current.ID, service)
-		if err != nil {
-			return err
-		}
-		if currentDesired <= 1 {
-			return fmt.Errorf("AIFAR service %s has %d desired replicas; use offline to scale to 0", service, currentDesired)
-		}
-		nextReplicas := currentDesired - 1
-		log.Info("scaling in AIFAR service %s for instance %s from %d to %d replicas", service, current.ID, currentDesired, nextReplicas)
-		return scaler.ScaleService(ctx, registry.ServiceScaleRequest{
-			Instance:    current,
-			Server:      server,
-			Language:    lang,
-			Actor:       actor,
-			ServiceName: service,
-			Replicas:    nextReplicas,
-			Reason:      "manual container runtime scale-in",
-		}, registry.RunContext{
-			TaskID: log.TaskID(),
-			Log:    log,
-			TargetLog: func(target string) registry.Logger {
-				return log.Target(target)
-			},
-		})
-	})
-	if !started {
-		return
-	}
-	if err == nil {
-		a.audit(r, "aifar.scale.in", target, "running", task.ID)
-	}
-	respondTask(w, task, err)
+	replicas := deployment.DesiredReplicas - 1
+	a.startRuntimeDeploymentMutation(w, r, registry.RuntimeDeploymentMutationRequest{
+		InstanceID: instance.ID, ServiceName: service, ExpectedGeneration: deployment.Generation,
+		Operation: "scale", Replicas: &replicas, Reason: "manual container runtime scale-in",
+	}, "aifar.scale.in")
 }
 
 func (a *aifarRuntimeController) offlineService(w http.ResponseWriter, r *http.Request) {
-	lang := languageFromRequest(r)
-	service := strings.TrimSpace(chi.URLParam(r, "service"))
-	if service == "" {
-		writeError(w, http.StatusBadRequest, "AIFAR_SERVICE_REQUIRED", "AIFAR service is required", nil)
-		return
-	}
-	server, instance, ok := a.resolveAIFARRuntimeActionTarget(w, r)
+	_, instance, ok := a.resolveAIFARRuntimeActionTarget(w, r)
 	if !ok {
 		return
 	}
-	module, ok := a.apps.Get(instance.App)
-	if !ok {
-		writeError(w, http.StatusNotFound, "APP_BACKEND_MODULE_MISSING", i18n.Text(lang, "api.appBackendMissing"), map[string]any{"app": instance.App})
+	service := strings.ToLower(strings.TrimSpace(chi.URLParam(r, "service")))
+	deployment, err := a.currentAIFARDeployment(instance.ID, service)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "AIFAR_RUNTIME_DEPLOYMENT_NOT_FOUND", i18n.Text(languageFromRequest(r), "api.aifarRuntimeDeploymentNotFound"), nil)
 		return
 	}
-	scaler, ok := module.(registry.ServiceScaleModule)
-	if !ok {
-		writeError(w, http.StatusConflict, "AIFAR_SCALE_UNSUPPORTED", "AIFAR service scale is not supported", map[string]any{"app": instance.App})
-		return
-	}
-	actor := currentUser(r).Username
-	target := instance.ID + ":" + service
-	task, err, started := a.startSimplePlannedTaskWithLocks(w, "aifar.scale.offline", target, actor, lang, server.ID, aifarRuntimeScaleSteps(), []operationLockSpec{aifarRuntimeMutationLockSpec("offline", instance)}, func(ctx context.Context, log worker.Logger) error {
-		current, err := a.store.GetAppInstance(instance.ID)
-		if err != nil {
-			return err
-		}
-		server, err := a.store.GetServer(current.ServerID, true)
-		if err != nil {
-			return err
-		}
-		log.Info("offlining AIFAR service %s for instance %s", service, current.ID)
-		return scaler.ScaleService(ctx, registry.ServiceScaleRequest{
-			Instance:    current,
-			Server:      server,
-			Language:    lang,
-			Actor:       actor,
-			ServiceName: service,
-			Replicas:    0,
-			Reason:      "manual container runtime service offline",
-		}, registry.RunContext{
-			TaskID: log.TaskID(),
-			Log:    log,
-			TargetLog: func(target string) registry.Logger {
-				return log.Target(target)
-			},
-		})
-	})
-	if !started {
-		return
-	}
-	if err == nil {
-		a.audit(r, "aifar.scale.offline", target, "running", task.ID)
-	}
-	respondTask(w, task, err)
+	a.startRuntimeDeploymentMutation(w, r, registry.RuntimeDeploymentMutationRequest{
+		InstanceID: instance.ID, ServiceName: service, ExpectedGeneration: deployment.Generation,
+		Operation: "offline", Reason: "manual container runtime service offline",
+	}, "aifar.scale.offline")
 }
 
 func (a *aifarRuntimeController) batchOfflineServices(w http.ResponseWriter, r *http.Request) {
@@ -1262,17 +1326,22 @@ func (a *aifarRuntimeController) batchOfflineServices(w http.ResponseWriter, r *
 }
 
 func (a *API) currentAIFARServiceDesiredReplicas(instanceID, service string) (int, error) {
+	deployment, err := a.currentAIFARDeployment(instanceID, service)
+	return deployment.DesiredReplicas, err
+}
+
+func (a *API) currentAIFARDeployment(instanceID, service string) (store.AIFARDeployment, error) {
 	deployments, err := a.store.ListAIFARDeployments(instanceID)
 	if err != nil {
-		return 0, err
+		return store.AIFARDeployment{}, err
 	}
-	service = cleanRuntimeText(service)
+	service = strings.ToLower(strings.TrimSpace(service))
 	for _, deployment := range deployments {
 		if deployment.ServiceName == service {
-			return deployment.DesiredReplicas, nil
+			return deployment, nil
 		}
 	}
-	return 0, fmt.Errorf("AIFAR service %s deployment was not found", service)
+	return store.AIFARDeployment{}, fmt.Errorf("AIFAR service %s deployment was not found", service)
 }
 
 func (a *API) resolveAIFARRuntimeActionTarget(w http.ResponseWriter, r *http.Request) (store.Server, store.AppInstance, bool) {
@@ -1531,6 +1600,14 @@ func (a *API) appendAIFARInstanceRuntime(response *aifarRuntimeResponse, instanc
 				status = "no-endpoints"
 			}
 		}
+		conditions := []runtimeagent.DeploymentCondition{}
+		if strings.TrimSpace(deployment.ConditionsJSON) != "" {
+			_ = json.Unmarshal([]byte(deployment.ConditionsJSON), &conditions)
+		}
+		lastTransitionAt := ""
+		if !deployment.LastTransitionAt.IsZero() {
+			lastTransitionAt = deployment.LastTransitionAt.Format(time.RFC3339)
+		}
 		response.Deployments = append(response.Deployments, aifarRuntimeDeployment{
 			InstanceID:          instance.ID,
 			DeploymentName:      appName,
@@ -1545,6 +1622,10 @@ func (a *API) appendAIFARInstanceRuntime(response *aifarRuntimeResponse, instanc
 			UpdatingPodRevision: cleanRuntimeText(deployment.UpdatingRevision),
 			Image:               image,
 			Status:              status,
+			Generation:          deployment.Generation,
+			ObservedGeneration:  deployment.ObservedGeneration,
+			Conditions:          conditions,
+			LastTransitionAt:    lastTransitionAt,
 			UpdatedAt:           deployment.UpdatedAt.Format("2006-01-02T15:04:05Z07:00"),
 			FailureReason:       failureReason,
 		})
@@ -1700,9 +1781,6 @@ func applyAgentStatusToRuntimeService(row *aifarRuntimeService, serviceStatus ai
 		row.EndpointCount = serviceStatus.EndpointCount
 		row.ReadyEndpointCount = serviceStatus.ReadyEndpointCount
 		row.ActiveEndpoints = serviceStatus.ReadyEndpointCount
-		row.NacosRegistered = serviceStatus.NacosRegistered
-		row.NacosReady = serviceStatus.NacosReady
-		row.LastNacosError = cleanRuntimeText(serviceStatus.LastNacosError)
 		if cleanRuntimeText(serviceStatus.Status) != "" {
 			row.Status = cleanRuntimeText(serviceStatus.Status)
 		}
@@ -1719,12 +1797,6 @@ func applyAgentStatusToRuntimeService(row *aifarRuntimeService, serviceStatus ai
 		case "failed", "rolling", "degraded", "offline":
 			row.Status = row.RolloutStatus
 		}
-	}
-	if row.LastError == "" && row.LastNacosError != "" {
-		row.LastError = row.LastNacosError
-	}
-	if row.LastNacosError != "" && row.Status == "ready" {
-		row.Status = "degraded"
 	}
 }
 
@@ -1751,7 +1823,7 @@ func applyDockerUnavailableToRuntimeService(row *aifarRuntimeService, options ai
 func (a *API) reconcileAIFARRuntimeControlPlane(instance store.AppInstance, metadata map[string]any, deployments []store.AIFARDeployment, pods []store.AIFARPod, endpoints []store.AIFARServiceEndpoint, containersByName map[string]adapter.DockerContainer) bool {
 	catalog := newAIFARRuntimeServiceCatalog(metadata)
 	discovered := discoverAIFARPodsFromDocker(metadata, containersByName, catalog)
-	changed := a.pruneAIFARRuntimeResidualRecords(instance.ID, discovered)
+	changed := a.pruneAIFARRuntimeResidualRecords(instance.ID, discovered, pods)
 	if len(discovered) == 0 {
 		return changed
 	}
@@ -1772,26 +1844,9 @@ func (a *API) reconcileAIFARRuntimeControlPlane(instance store.AppInstance, meta
 	for _, endpoint := range endpoints {
 		endpointsByService[endpoint.ServiceName] = append(endpointsByService[endpoint.ServiceName], endpoint)
 	}
-	explicitDesiredFromMetadata := runtimeDesiredReplicasFromMetadata(metadata)
-	desiredFromMetadata := make(map[string]int, len(explicitDesiredFromMetadata)+len(deployments))
-	for service, replicas := range explicitDesiredFromMetadata {
-		desiredFromMetadata[service] = replicas
-	}
-	for _, deployment := range deployments {
-		if _, ok := desiredFromMetadata[deployment.ServiceName]; !ok {
-			desiredFromMetadata[deployment.ServiceName] = deployment.DesiredReplicas
-		}
-	}
 	grouped := map[string][]discoveredAIFARPod{}
 	for _, pod := range discovered {
 		grouped[pod.ServiceName] = append(grouped[pod.ServiceName], pod)
-	}
-	services := runtimeMergeServices(runtimeServicesFromMetadata(metadata), runtimeDeploymentServiceNames(deployments), runtimeDiscoveredServiceNames(discovered))
-	nextMetadata := copyRuntimeMetadata(metadata)
-	metadataChanged := false
-	if !runtimeJSONEqual(runtimeDesiredReplicasFromMetadata(nextMetadata), desiredFromMetadata) {
-		nextMetadata["desiredReplicas"] = desiredFromMetadata
-		metadataChanged = true
 	}
 	for service, servicePods := range grouped {
 		sort.Slice(servicePods, func(i, j int) bool {
@@ -1800,42 +1855,38 @@ func (a *API) reconcileAIFARRuntimeControlPlane(instance store.AppInstance, meta
 			}
 			return servicePods[i].ReplicaID < servicePods[j].ReplicaID
 		})
-		desired := runtimeDiscoveredDesiredReplicas(servicePods)
-		if explicit, ok := explicitDesiredFromMetadata[service]; ok {
-			desired = explicit
-		} else {
-			if existing := deploymentsByService[service]; existing.DesiredReplicas > desired {
-				desired = existing.DesiredReplicas
-			}
-			if existing := desiredFromMetadata[service]; existing > desired {
-				desired = existing
-			}
+		existingDeployment, hasDeployment := deploymentsByService[service]
+		if !hasDeployment {
+			continue
 		}
+		desired := existingDeployment.DesiredReplicas
 		ready := runtimeDiscoveredReadyReplicas(servicePods)
 		revision := runtimeDiscoveredRevision(servicePods)
 		image := runtimeDiscoveredImage(servicePods)
 		status := runtimeDiscoveredServiceStatus(desired, ready)
-		existingDeployment, hasDeployment := deploymentsByService[service]
-		strategyJSON := cleanRuntimeText(existingDeployment.StrategyJSON)
-		if strategyJSON == "" {
-			strategyJSON = runtimeMarshalJSON(map[string]any{"type": "DockerReconcile", "source": "docker"})
+		if desired == 0 && len(servicePods) > 0 {
+			status = "degraded"
 		}
-		deploymentMetadata := runtimeMarshalJSON(map[string]any{"operation": "docker-reconcile", "source": "docker"})
-		nextDeployment := store.AIFARDeployment{
-			ID:               existingDeployment.ID,
-			InstanceID:       instance.ID,
-			ServiceName:      service,
-			DesiredReplicas:  desired,
-			CurrentRevision:  revision,
-			UpdatingRevision: "",
-			StrategyJSON:     strategyJSON,
-			Status:           status,
-			MetadataJSON:     deploymentMetadata,
-			CreatedAt:        existingDeployment.CreatedAt,
+		conditionType := "Progressing"
+		switch status {
+		case "ready":
+			conditionType = "Available"
+		case "offline":
+			conditionType = "Offline"
+		case "degraded", "failed":
+			conditionType = "Degraded"
 		}
-		if !hasDeployment || !runtimeDeploymentEqual(existingDeployment, nextDeployment) {
-			if _, err := a.store.SaveAIFARDeployment(nextDeployment); err == nil {
-				changed = true
+		needsObservation := existingDeployment.ObservedGeneration != existingDeployment.Generation || existingDeployment.Status != status || !runtimeDeploymentHasCondition(existingDeployment, conditionType, "DockerObserved")
+		if needsObservation {
+			observedAt := time.Now().UTC()
+			conditions, marshalErr := json.Marshal([]runtimeagent.DeploymentCondition{{
+				Type: conditionType, Status: true, Reason: "DockerObserved",
+				Generation: existingDeployment.Generation, LastTransitionTime: observedAt,
+			}})
+			if marshalErr == nil {
+				if _, observeErr := a.store.ObserveAIFARDeployment(instance.ID, service, existingDeployment.Generation, status, string(conditions), observedAt); observeErr == nil {
+					changed = true
+				}
 			}
 		}
 		if revision != "" {
@@ -1907,25 +1958,23 @@ func (a *API) reconcileAIFARRuntimeControlPlane(instance store.AppInstance, meta
 				changed = true
 			}
 		}
-		if runtimeApplyDiscoveredServiceMetadata(nextMetadata, service, desired, servicePods, nextEndpoints, services) {
-			metadataChanged = true
-		}
-	}
-	if metadataChanged {
-		nextMetadata["lastDockerReconcileAt"] = time.Now().UTC().Format(time.RFC3339)
-		if raw, err := json.Marshal(nextMetadata); err == nil {
-			instance.Metadata = string(raw)
-			if _, err := a.store.SaveAppInstance(instance); err == nil {
-				changed = true
-			}
-		}
 	}
 	return changed
 }
 
-func (a *API) pruneAIFARRuntimeResidualRecords(instanceID string, discovered []discoveredAIFARPod) bool {
-	existingContainers := make([]string, 0, len(discovered))
+func (a *API) pruneAIFARRuntimeResidualRecords(instanceID string, discovered []discoveredAIFARPod, currentPods []store.AIFARPod) bool {
+	observedServices := make(map[string]bool, len(discovered))
+	existingContainers := make([]string, 0, len(discovered)+len(currentPods))
 	for _, pod := range discovered {
+		observedServices[pod.ServiceName] = true
+		if name := cleanRuntimeText(pod.ContainerName); name != "" {
+			existingContainers = append(existingContainers, name)
+		}
+	}
+	for _, pod := range currentPods {
+		if observedServices[pod.ServiceName] {
+			continue
+		}
 		if name := cleanRuntimeText(pod.ContainerName); name != "" {
 			existingContainers = append(existingContainers, name)
 		}
@@ -2463,6 +2512,19 @@ func runtimeDeploymentEqual(a, b store.AIFARDeployment) bool {
 		cleanRuntimeText(a.StrategyJSON) == cleanRuntimeText(b.StrategyJSON) &&
 		cleanRuntimeText(a.Status) == cleanRuntimeText(b.Status) &&
 		cleanRuntimeText(a.MetadataJSON) == cleanRuntimeText(b.MetadataJSON)
+}
+
+func runtimeDeploymentHasCondition(deployment store.AIFARDeployment, conditionType, reason string) bool {
+	conditions := []runtimeagent.DeploymentCondition{}
+	if err := json.Unmarshal([]byte(deployment.ConditionsJSON), &conditions); err != nil {
+		return false
+	}
+	for _, condition := range conditions {
+		if condition.Status && condition.Type == conditionType && condition.Reason == reason && condition.Generation == deployment.Generation {
+			return true
+		}
+	}
+	return false
 }
 
 func runtimeReplicaSetEqual(a, b store.AIFARReplicaSet) bool {

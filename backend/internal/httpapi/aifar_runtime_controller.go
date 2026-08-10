@@ -51,6 +51,8 @@ func (a *aifarRuntimeController) terminalizeDiagnosticTaskByID(taskID, status, e
 
 func (a *aifarRuntimeController) mount(r chi.Router) {
 	r.Get("/containers/aifar/runtime", a.runtime)
+	r.Put("/apps/instances/{id}/runtime/deployments/{service}", a.requirePermission(rbac.AppsManage, a.mutateRuntimeDeployment))
+	r.Post("/apps/instances/{id}/runtime/deployments/{service}/reconcile", a.requirePermission(rbac.AppsManage, a.reconcileRuntimeDeployment))
 	r.Get("/containers/aifar/runtime/logs", a.logs)
 	r.Get("/containers/aifar/runtime/logs/events", a.logEvents)
 	r.Put("/containers/aifar/runtime/config", a.requirePermission(rbac.AppsManage, a.configure))
