@@ -45,13 +45,11 @@ import {
   fetchRuntimeDiagnosticExports,
   fetchAifarRuntime,
   installRuntimeServices,
-  offlineRuntimeServices,
-  offlineRuntimeService,
-  reconcileRuntime,
+  mutateRuntimeDeployment,
+  reconcileRuntimeDeployment,
   restartAllRuntime,
+  runtimeLockOwnerTaskId,
   rollbackAifarRelease,
-  scaleInRuntimeService,
-  scaleOutRuntimeService,
   updateAifarArtifact
 } from './api'
 
@@ -223,14 +221,11 @@ describe('AIFAR Runtime API service', () => {
     expect(apiPutMock).toHaveBeenCalledWith('/containers/aifar/runtime/config?serverId=server-1', payload)
   })
 
-  it.each([
-    ['reconcileRuntime', reconcileRuntime, '/containers/aifar/runtime/reconcile?serverId=server-1'],
-    ['cleanupStaleRuntime', cleanupStaleRuntime, '/containers/aifar/runtime/cleanup-stale?serverId=server-1']
-  ] as const)('%s posts the selected instance', async (_name, operation, endpoint) => {
+  it('posts cleanup for the selected instance', async () => {
     apiPostMock.mockResolvedValueOnce({ taskId: 'task-runtime' })
 
-    await expect(operation('serverId=server-1', 'instance-1')).resolves.toEqual({ taskId: 'task-runtime' })
-    expect(apiPostMock).toHaveBeenCalledWith(endpoint, { instanceId: 'instance-1' })
+    await expect(cleanupStaleRuntime('serverId=server-1', 'instance-1')).resolves.toEqual({ taskId: 'task-runtime' })
+    expect(apiPostMock).toHaveBeenCalledWith('/containers/aifar/runtime/cleanup-stale?serverId=server-1', { instanceId: 'instance-1' })
   })
 
   it('posts restart all for only the selected runtime instance', async () => {
@@ -251,29 +246,34 @@ describe('AIFAR Runtime API service', () => {
     expect(apiPostMock).toHaveBeenCalledWith('/containers/aifar/services/install?serverId=server-1', payload)
   })
 
-  it.each([
-    ['scaleOutRuntimeService', scaleOutRuntimeService, 'scale-out'],
-    ['scaleInRuntimeService', scaleInRuntimeService, 'scale-in'],
-    ['offlineRuntimeService', offlineRuntimeService, 'offline']
-  ] as const)('%s encodes the service name and posts the selected instance', async (_name, operation, action) => {
-    apiPostMock.mockResolvedValueOnce({ taskId: `task-${action}` })
+  it('puts a typed per-service mutation with the expected generation', async () => {
+    apiPutMock.mockResolvedValueOnce({ taskId: 'task-scale' })
+    const payload = { operation: 'scale' as const, expectedGeneration: 7, replicas: 3, reason: 'capacity' }
 
-    await expect(operation('serverId=server-1', 'web vue/3', 'instance-1'))
-      .resolves.toEqual({ taskId: `task-${action}` })
-    expect(apiPostMock).toHaveBeenCalledWith(
-      `/containers/aifar/services/web%20vue%2F3/${action}?serverId=server-1`,
-      { instanceId: 'instance-1' }
+    await expect(mutateRuntimeDeployment('serverId=server-1', 'instance/1', 'web vue/3', payload))
+      .resolves.toEqual({ taskId: 'task-scale' })
+    expect(apiPutMock).toHaveBeenCalledWith(
+      '/apps/instances/instance%2F1/runtime/deployments/web%20vue%2F3?serverId=server-1',
+      payload
     )
   })
 
-  it('offlines multiple runtime services with one fixed-route request', async () => {
-    apiPostMock.mockResolvedValueOnce({ taskId: 'task-batch-offline' })
+  it('posts a typed per-service reconcile without an operation field', async () => {
+    apiPostMock.mockResolvedValueOnce({ taskId: 'task-reconcile' })
 
-    await expect(offlineRuntimeServices('serverId=server-1', 'instance-1', ['gateway', 'oauth']))
-      .resolves.toEqual({ taskId: 'task-batch-offline' })
+    await expect(reconcileRuntimeDeployment('serverId=server-1', 'instance-1', 'permission', {
+      expectedGeneration: 9,
+      reason: 'retry now'
+    })).resolves.toEqual({ taskId: 'task-reconcile' })
     expect(apiPostMock).toHaveBeenCalledWith(
-      '/containers/aifar/services/batch-offline?serverId=server-1',
-      { instanceId: 'instance-1', services: ['gateway', 'oauth'] }
+      '/apps/instances/instance-1/runtime/deployments/permission/reconcile?serverId=server-1',
+      { expectedGeneration: 9, reason: 'retry now' }
     )
+  })
+
+  it('extracts only a 409 service-lock owner task for UI task location', () => {
+    expect(runtimeLockOwnerTaskId({ status: 409, details: { ownerTaskId: ' task-owner ' } })).toBe('task-owner')
+    expect(runtimeLockOwnerTaskId({ status: 409, details: { currentGeneration: 8 } })).toBe('')
+    expect(runtimeLockOwnerTaskId({ status: 400, details: { ownerTaskId: 'task-other' } })).toBe('')
   })
 })

@@ -1,6 +1,6 @@
 <template>
   <div class="runtime-resource-panel">
-    <el-table :data="selectedRuntimeServices" height="100%" row-key="serviceName">
+    <el-table :data="selectedRuntimeServices" height="100%" row-key="serviceName" :aria-label="t('containers.services')">
       <el-table-column prop="serviceName" :label="t('containers.service')" min-width="130" show-overflow-tooltip />
       <el-table-column prop="appName" :label="t('containers.appName')" min-width="170" show-overflow-tooltip />
       <el-table-column prop="status" :label="t('common.status')" width="120">

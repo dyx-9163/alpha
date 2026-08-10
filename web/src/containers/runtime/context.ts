@@ -66,11 +66,13 @@ export type AifarRuntimeContext = {
   runtimeResourceTab: Ref<RuntimeResourceTab>
   selectedRuntimeDeployments: ComputedRef<AifarRuntimeDeployment[]>
   runtimeDeploymentReplicaText: (row: AifarRuntimeDeployment) => string
+  runtimeServiceActionDisabledReason: (row: AifarRuntimeDeployment) => string
   openAifarRuntimeServiceUpdate: (row: AifarRuntimeService) => void
   runtimeServiceForDeployment: (row: AifarRuntimeDeployment) => AifarRuntimeService
   scaleOutAifarService: (service: string) => Promise<void>
   aifarRuntimeScaleInDisabledReason: (row: AifarRuntimeDeployment) => string
   scaleInAifarDeployment: (row: AifarRuntimeDeployment) => Promise<void>
+  reconcileAifarDeployment: (row: AifarRuntimeDeployment) => Promise<void>
   aifarRuntimeOfflineDisabledReason: (row: AifarRuntimeService) => string
   offlineAifarService: (row: AifarRuntimeService) => Promise<void>
   offlineAifarServices: (rows: AifarRuntimeService[]) => Promise<boolean>
@@ -131,7 +133,6 @@ export type AifarRuntimeContext = {
   runtimeLogBottomSpacer: ComputedRef<number>
   runtimeEntryRoutes: ComputedRef<RuntimeEntryRoute[]>
   runtimeDiscoveryTarget: (row: AifarRuntimeService) => string
-  runtimeNacosStatus: (row: AifarRuntimeService) => string
   aifarUpdateVisible: Ref<boolean>
   selectedAifarContainerLabel: ComputedRef<string>
   selectedAifarInstanceLabel: ComputedRef<string>

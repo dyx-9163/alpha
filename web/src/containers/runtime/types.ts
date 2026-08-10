@@ -64,13 +64,19 @@ export type AifarRuntimeService = {
   image?: string
   status?: string
   rolloutStatus?: string
-  nacosRegistered?: boolean
-  nacosReady?: boolean
-  lastNacosError?: string
   lastError?: string
   cpuPercent?: number
   memoryPercent?: number
   failureReason?: string
+}
+
+export type AifarDeploymentCondition = {
+  type: 'Accepted' | 'Progressing' | 'Available' | 'Degraded' | 'Offline'
+  status: boolean
+  reason: string
+  message?: string
+  generation: number
+  lastTransitionTime: string
 }
 
 export type AifarRuntimeDeployment = {
@@ -87,6 +93,10 @@ export type AifarRuntimeDeployment = {
   updatingPodRevision?: string
   image?: string
   status?: string
+  generation?: number
+  observedGeneration?: number
+  conditions?: AifarDeploymentCondition[]
+  lastTransitionAt?: string
   updatedAt?: string
   failureReason?: string
 }

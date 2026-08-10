@@ -32,10 +32,11 @@ import {
   releaseServicesText,
   releaseStatusLabel,
   runtimeApplyStatusLabel,
+  runtimeConditionReason,
   runtimeDeploymentReplicaText,
+  runtimeGenerationText,
   runtimeEndpointText,
-  runtimeInstanceLabel,
-  runtimeNacosStatus
+  runtimeInstanceLabel
 } from './format'
 import {
   buildAifarServiceOptions,
@@ -47,7 +48,9 @@ import {
   findRuntimeIngressByInstance,
   findSelectedRuntimeInstance,
   resolveRuntimeAppInstance,
+  runtimeDeploymentPhaseCounts,
   runtimeDiscoveryTarget,
+  runtimeServiceActionGate,
   summarizeRuntimeRestartScope,
   runtimeServiceForDeployment
 } from './selectors'
@@ -75,7 +78,7 @@ describe('runtime artifact rules', () => {
     expect(String(messages.en['apps.aifarUpdateBundleHint'])).not.toContain('export-alpha-jars')
   })
 
-  it('warns that restart-all stops every pod before starting all desired replicas', () => {
+  it('explains that restart-all submits independent rolling intents without stopping all services first', () => {
     const zhMessage = messages.zh['containers.confirmRestartAllRuntime']
     const enMessage = messages.en['containers.confirmRestartAllRuntime']
     if (typeof zhMessage !== 'function' || typeof enMessage !== 'function') {
@@ -85,14 +88,14 @@ describe('runtime artifact rules', () => {
     const zh = zhMessage({ services: 10, replicas: 10 })
     const en = enMessage({ services: 10, replicas: 10 })
 
-    for (const expected of ['10', '全部业务不可用', '继续启动其他服务', '不会自动回滚']) {
+    for (const expected of ['10', '独立', '滚动', '不会先停止全部服务']) {
       expect(zh).toContain(expected)
     }
-    expect(zh).not.toContain('滚动')
-    for (const expected of ['10', 'all business services are unavailable', 'continue starting the remaining services', 'not automatically roll back']) {
+    expect(zh).not.toContain('全部业务不可用')
+    for (const expected of ['10', 'independent', 'rolling', 'does not stop all services first']) {
       expect(en).toContain(expected)
     }
-    expect(en.toLowerCase()).not.toContain('rolling')
+    expect(en).not.toContain('all business services are unavailable')
   })
 
   it.each([
@@ -374,12 +377,29 @@ describe('runtime format rules', () => {
       .toBe('2 / 2')
   })
 
-  it('derives Nacos readiness in priority order', () => {
-    expect(runtimeNacosStatus(service({ nacosReady: true, lastNacosError: 'old' }))).toBe('ready')
-    expect(runtimeNacosStatus(service({ lastNacosError: 'failed' }))).toBe('failed')
-    expect(runtimeNacosStatus(service({ nacosRegistered: true }))).toBe('running')
-    expect(runtimeNacosStatus(service({ status: 'offline' }))).toBe('offline')
-    expect(runtimeNacosStatus(service())).toBe('unknown')
+  it('formats generation observation and the active condition reason without inventing readiness', () => {
+    const row = deployment({
+      generation: 7,
+      observedGeneration: 6,
+      conditions: [{
+        type: 'Degraded',
+        status: true,
+        reason: 'ReadinessFailed',
+        message: 'one replica did not pass readiness',
+        generation: 6,
+        lastTransitionTime: '2026-08-10T08:09:10Z'
+      }]
+    })
+
+    expect(runtimeGenerationText(row)).toBe('7 / 6')
+    expect(runtimeConditionReason(row)).toEqual({
+      type: 'Degraded',
+      reason: 'ReadinessFailed',
+      message: 'one replica did not pass readiness',
+      lastTransitionTime: '2026-08-10T08:09:10Z'
+    })
+    expect(runtimeConditionReason(deployment())).toBeNull()
+    expect(runtimeGenerationText(deployment())).toBe('- / -')
   })
 
   it.each([
@@ -474,6 +494,66 @@ describe('runtime selectors', () => {
       deployment({ serviceName: 'contacts', desiredReplicas: 3 }),
       deployment({ serviceName: 'meeting', desiredReplicas: -1 })
     ])).toEqual({ services: 2, replicas: 5 })
+  })
+
+  it('counts service phases for display without using the aggregate runtime status as a gate', () => {
+    expect(runtimeDeploymentPhaseCounts([
+      deployment({ serviceName: 'gateway', status: 'ready' }),
+      deployment({ serviceName: 'oauth', status: 'rolling' }),
+      deployment({ serviceName: 'file', status: 'degraded' }),
+      deployment({ serviceName: 'message', status: 'offline' }),
+      deployment({ serviceName: 'permission', status: 'failed' })
+    ])).toEqual({ available: 1, progressing: 1, degraded: 2, offline: 1 })
+  })
+
+  it('does not disable a healthy service when another service is degraded', () => {
+    const permission = deployment({ serviceName: 'permission', status: 'ready', generation: 1 })
+    const file = deployment({ serviceName: 'file', status: 'degraded', generation: 1 })
+
+    expect(runtimeServiceActionGate(permission, [permission, file], {
+      canManage: true,
+      instanceStatus: 'installed',
+      agentStatus: 'running',
+      agentFeatures: ['service-generation-v1', 'per-service-reconcile', 'per-service-restart', 'service-conditions-v1'],
+      activeTasks: []
+    })).toEqual({ disabled: false, reason: '', ownerTaskId: '' })
+  })
+
+  it.each([
+    ['permission', { canManage: false }, 'containers.permissionDisabled'],
+    ['instance maintenance', { instanceStatus: 'maintenance' }, 'containers.runtimeInstanceMaintenanceDisabled'],
+    ['agent unavailable', { agentStatus: 'offline' }, 'containers.agentUnavailableDisabled'],
+    ['agent capability', { agentFeatures: ['service-generation-v1'] }, 'containers.agentCapabilityDisabled']
+  ])('blocks a target service for %s only', (_name, overrides, expectedReason) => {
+    const row = deployment({ serviceName: 'permission', status: 'ready', generation: 1 })
+    expect(runtimeServiceActionGate(row, [row], {
+      canManage: true,
+      instanceStatus: 'installed',
+      agentStatus: 'running',
+      agentFeatures: ['service-generation-v1', 'per-service-reconcile', 'per-service-restart', 'service-conditions-v1'],
+      activeTasks: [],
+      ...overrides
+    })).toMatchObject({ disabled: true, reason: expectedReason })
+  })
+
+  it('returns the same-service owner task but ignores a peer service task', () => {
+    const row = deployment({ instanceId: 'instance-1', serviceName: 'permission', status: 'ready', generation: 1 })
+    const base = {
+      canManage: true,
+      instanceStatus: 'installed',
+      agentStatus: 'running',
+      agentFeatures: ['service-generation-v1', 'per-service-reconcile', 'per-service-restart', 'service-conditions-v1'],
+      activeTasks: [{ id: 'task-file', status: 'running', target: 'instance-1:file' }]
+    }
+    expect(runtimeServiceActionGate(row, [row], base)).toEqual({ disabled: false, reason: '', ownerTaskId: '' })
+    expect(runtimeServiceActionGate(row, [row], {
+      ...base,
+      activeTasks: [...base.activeTasks, { id: 'task-permission', status: 'pending', target: 'instance-1:permission' }]
+    })).toEqual({
+      disabled: true,
+      reason: 'containers.runtimeServiceTaskDisabled',
+      ownerTaskId: 'task-permission'
+    })
   })
 
   it('maps services by name using the last duplicate and resolves discovery targets', () => {

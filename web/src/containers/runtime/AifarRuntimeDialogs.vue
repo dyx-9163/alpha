@@ -1,5 +1,5 @@
 <template>
-  <el-dialog v-model="aifarUpdateVisible" :title="t('apps.aifarUpdateTitle')" width="560px" destroy-on-close>
+  <el-dialog v-model="aifarUpdateVisible" :title="t('apps.aifarUpdateTitle')" width="min(560px, calc(100vw - 32px))" destroy-on-close>
     <el-form label-width="112px" class="aifar-update-form">
       <el-form-item :label="t('containers.updateTarget')">
         <el-input :model-value="selectedAifarContainerLabel" disabled />
@@ -34,7 +34,7 @@
     </template>
   </el-dialog>
 
-  <el-dialog v-model="serviceInstallVisible" :title="t('containers.installServicesDialog')" width="560px" destroy-on-close>
+  <el-dialog v-model="serviceInstallVisible" :title="t('containers.installServicesDialog')" width="min(560px, calc(100vw - 32px))" destroy-on-close>
     <div class="service-install-dialog">
       <div>
         <div class="runtime-config-section-title">{{ t('containers.installedServices') }}</div>
@@ -56,7 +56,7 @@
     </template>
   </el-dialog>
 
-  <el-dialog v-model="runtimeConfigVisible" :title="t('containers.runtimeConfig')" width="780px" destroy-on-close>
+  <el-dialog v-model="runtimeConfigVisible" :title="t('containers.runtimeConfig')" width="min(780px, calc(100vw - 32px))" destroy-on-close>
     <div class="runtime-config-dialog">
       <KeyValueGrid :items="runtimeConfigMetaItems" />
       <el-form label-width="148px" class="runtime-config-form">

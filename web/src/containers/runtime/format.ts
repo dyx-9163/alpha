@@ -83,20 +83,23 @@ export function runtimeDeploymentReplicaText(row: AifarRuntimeDeployment) {
   return base
 }
 
-export function runtimeNacosStatus(row: AifarRuntimeService) {
-  if (row.nacosReady) {
-    return 'ready'
+export function runtimeGenerationText(row: AifarRuntimeDeployment) {
+  return `${generationValue(row.generation, 1)} / ${generationValue(row.observedGeneration, 0)}`
+}
+
+export function runtimeConditionReason(row: AifarRuntimeDeployment) {
+  const conditions = Array.isArray(row.conditions) ? row.conditions : []
+  const priority = ['Degraded', 'Progressing', 'Offline', 'Available', 'Accepted']
+  const active = [...conditions]
+    .filter((condition) => condition?.status === true)
+    .sort((left, right) => priority.indexOf(left.type) - priority.indexOf(right.type))[0]
+  if (!active) return null
+  return {
+    type: active.type,
+    reason: active.reason || active.type,
+    message: active.message || '',
+    lastTransitionTime: active.lastTransitionTime || row.lastTransitionAt || ''
   }
-  if (row.lastNacosError) {
-    return 'failed'
-  }
-  if (row.nacosRegistered) {
-    return 'running'
-  }
-  if (row.status === 'offline') {
-    return 'offline'
-  }
-  return 'unknown'
 }
 
 export function percentText(value?: number) {
@@ -124,4 +127,10 @@ function normalizeStatus(value?: string) {
 
 function arrayValue<T>(value?: T[]) {
   return Array.isArray(value) ? value : []
+}
+
+function generationValue(value: number | undefined, minimum: number) {
+  if (value === undefined || value === null) return '-'
+  const generation = Number(value)
+  return Number.isFinite(generation) && generation >= minimum ? generation : '-'
 }

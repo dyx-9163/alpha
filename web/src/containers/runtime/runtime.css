@@ -96,6 +96,40 @@
   text-overflow: ellipsis;
 }
 
+.runtime-condition-cell {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: max-content minmax(0, 1fr);
+  align-items: center;
+  gap: 4px 8px;
+}
+
+.runtime-condition-cell strong,
+.runtime-condition-cell > span:last-child {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.runtime-condition-cell > span:last-child {
+  grid-column: 1 / -1;
+  color: var(--aifar-text-tertiary);
+  font-size: 12px;
+}
+
+.runtime-condition-empty {
+  display: grid;
+  gap: 4px;
+  color: var(--aifar-text-tertiary);
+}
+
+.runtime-condition-empty > span:last-child:not(:first-child) {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .runtime-overflow-action-trigger {
   display: block;
 }

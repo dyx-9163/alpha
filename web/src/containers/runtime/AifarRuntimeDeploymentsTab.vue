@@ -15,6 +15,7 @@
     <el-table
       ref="deploymentTable"
       :data="selectedRuntimeDeployments"
+      :aria-label="t('containers.deployments')"
       height="100%"
       row-key="serviceName"
       @selection-change="handleDeploymentSelection"
@@ -27,32 +28,53 @@
           <StatusTag :status="aifarRuntimeStatusKind(row.status)" :label="aifarRuntimeStatusLabel(row.status)" />
         </template>
       </el-table-column>
-      <el-table-column :label="t('containers.replicas')" width="130">
-        <template #default="{ row }">{{ runtimeDeploymentReplicaText(row) }}</template>
-      </el-table-column>
-      <el-table-column :label="t('containers.rollout')" width="120">
+      <el-table-column :label="t('containers.replicas')" width="150">
         <template #default="{ row }">
-          <el-tooltip :content="row.failureReason" :disabled="!row.failureReason" placement="top">
-            <span><StatusTag :status="aifarRuntimeStatusKind(row.status)" :label="aifarRuntimeStatusLabel(row.status)" /></span>
-          </el-tooltip>
+          <span :title="t('containers.runtimeReplicaDetail', {
+            desired: row.desiredReplicas ?? 0,
+            current: row.currentReplicas ?? 0,
+            ready: row.readyReplicas ?? 0
+          })">{{ runtimeDeploymentReplicaText(row) }}</span>
         </template>
+      </el-table-column>
+      <el-table-column :label="t('containers.generationObserved')" width="130">
+        <template #default="{ row }">{{ runtimeGenerationText(row) }}</template>
+      </el-table-column>
+      <el-table-column :label="t('containers.condition')" min-width="190">
+        <template #default="{ row }">
+          <div v-if="runtimeConditionReason(row)" class="runtime-condition-cell">
+            <StatusTag :status="aifarRuntimeStatusKind(row.status)" :label="runtimeConditionReason(row)?.type || aifarRuntimeStatusLabel(row.status)" />
+            <strong>{{ runtimeConditionReason(row)?.reason }}</strong>
+            <span v-if="runtimeConditionReason(row)?.message" :title="runtimeConditionReason(row)?.message">{{ runtimeConditionReason(row)?.message }}</span>
+          </div>
+          <div v-else class="runtime-condition-empty">
+            <span>{{ t('containers.conditionUnavailable') }}</span>
+            <span v-if="row.failureReason" :title="row.failureReason">{{ row.failureReason }}</span>
+          </div>
+        </template>
+      </el-table-column>
+      <el-table-column :label="t('containers.lastTransition')" min-width="170">
+        <template #default="{ row }">{{ formatDate(runtimeConditionReason(row)?.lastTransitionTime || row.lastTransitionAt) }}</template>
       </el-table-column>
       <el-table-column prop="podRevision" :label="t('containers.revision')" min-width="180" show-overflow-tooltip />
       <el-table-column prop="image" :label="t('containers.image')" min-width="240" show-overflow-tooltip />
-      <el-table-column :label="t('common.operation')" width="390" fixed="right">
+      <el-table-column :label="t('common.operation')" width="480" fixed="right">
         <template #default="{ row }">
           <div class="row-actions">
-            <el-tooltip :content="aifarRuntimeActionDisabledReason" :disabled="!aifarRuntimeActionDisabledReason" placement="top">
-              <span><el-button size="small" type="primary" plain :disabled="Boolean(aifarRuntimeActionDisabledReason)" @click="openAifarRuntimeServiceUpdate(runtimeServiceForDeployment(row))">{{ t('containers.updateService') }}</el-button></span>
+            <el-tooltip :content="runtimeServiceActionDisabledReason(row)" :disabled="!runtimeServiceActionDisabledReason(row)" placement="top">
+              <span><el-button size="small" type="primary" plain :aria-label="`${t('containers.updateService')} ${row.serviceName}`" :disabled="Boolean(runtimeServiceActionDisabledReason(row))" @click="openAifarRuntimeServiceUpdate(runtimeServiceForDeployment(row))">{{ t('containers.updateService') }}</el-button></span>
             </el-tooltip>
-            <el-tooltip :content="aifarRuntimeActionDisabledReason" :disabled="!aifarRuntimeActionDisabledReason" placement="top">
-              <span><el-button size="small" :disabled="Boolean(aifarRuntimeActionDisabledReason)" @click="scaleOutAifarService(row.serviceName)">{{ t('containers.scaleOut') }}</el-button></span>
+            <el-tooltip :content="runtimeServiceActionDisabledReason(row)" :disabled="!runtimeServiceActionDisabledReason(row)" placement="top">
+              <span><el-button size="small" :aria-label="`${t('containers.scaleOut')} ${row.serviceName}`" :disabled="Boolean(runtimeServiceActionDisabledReason(row))" @click="scaleOutAifarService(row.serviceName)">{{ t('containers.scaleOut') }}</el-button></span>
             </el-tooltip>
             <el-tooltip :content="aifarRuntimeScaleInDisabledReason(row)" :disabled="!aifarRuntimeScaleInDisabledReason(row)" placement="top">
-              <span><el-button size="small" plain :disabled="Boolean(aifarRuntimeScaleInDisabledReason(row))" @click="scaleInAifarDeployment(row)">{{ t('containers.scaleIn') }}</el-button></span>
+              <span><el-button size="small" plain :aria-label="`${t('containers.scaleIn')} ${row.serviceName}`" :disabled="Boolean(aifarRuntimeScaleInDisabledReason(row))" @click="scaleInAifarDeployment(row)">{{ t('containers.scaleIn') }}</el-button></span>
             </el-tooltip>
             <el-tooltip :content="aifarRuntimeOfflineDisabledReason(runtimeServiceForDeployment(row))" :disabled="!aifarRuntimeOfflineDisabledReason(runtimeServiceForDeployment(row))" placement="top">
-              <span><el-button size="small" type="danger" plain :disabled="Boolean(aifarRuntimeOfflineDisabledReason(runtimeServiceForDeployment(row)))" @click="offlineAifarService(runtimeServiceForDeployment(row))">{{ t('containers.offlineDeployment') }}</el-button></span>
+              <span><el-button size="small" type="danger" plain :aria-label="`${t('containers.offlineDeployment')} ${row.serviceName}`" :disabled="Boolean(aifarRuntimeOfflineDisabledReason(runtimeServiceForDeployment(row)))" @click="offlineAifarService(runtimeServiceForDeployment(row))">{{ t('containers.offlineDeployment') }}</el-button></span>
+            </el-tooltip>
+            <el-tooltip :content="runtimeServiceActionDisabledReason(row)" :disabled="!runtimeServiceActionDisabledReason(row)" placement="top">
+              <span><el-button size="small" plain :aria-label="`${t('containers.reconcileService')} ${row.serviceName}`" :disabled="Boolean(runtimeServiceActionDisabledReason(row))" @click="reconcileAifarDeployment(row)">{{ t('containers.reconcileService') }}</el-button></span>
             </el-tooltip>
           </div>
         </template>
@@ -65,6 +87,7 @@
 import { ref, watch } from 'vue'
 import StatusTag from '../../components/StatusTag.vue'
 import { useAifarRuntimeContext } from './context'
+import { formatDate, runtimeConditionReason, runtimeGenerationText } from './format'
 import { normalizeBatchOfflineDeployments } from './runtimeDeploymentSelection'
 import type { AifarRuntimeDeployment, AifarRuntimeService } from './types'
 
@@ -74,12 +97,13 @@ const {
   aifarRuntimeStatusKind,
   aifarRuntimeStatusLabel,
   runtimeDeploymentReplicaText,
-  aifarRuntimeActionDisabledReason,
+  runtimeServiceActionDisabledReason,
   openAifarRuntimeServiceUpdate,
   runtimeServiceForDeployment,
   scaleOutAifarService,
   aifarRuntimeScaleInDisabledReason,
   scaleInAifarDeployment,
+  reconcileAifarDeployment,
   aifarRuntimeOfflineDisabledReason,
   offlineAifarService,
   offlineAifarServices,

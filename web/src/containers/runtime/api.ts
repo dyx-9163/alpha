@@ -1,4 +1,4 @@
-import { apiDelete, apiDownload, apiEventSourceUrl, apiGet, apiPost, apiPostForm, apiPut } from '../../api/client'
+import { apiDelete, apiDownload, apiEventSourceUrl, apiGet, apiPost, apiPostForm, apiPut, type ApiError } from '../../api/client'
 import type {
   AifarReleaseListResponse,
   AifarRuntimeResponse,
@@ -33,6 +33,19 @@ export type RuntimeRollbackPayload = {
 export type RuntimeServiceInstallPayload = {
   instanceId: string
   services: string[]
+}
+
+export type RuntimeDeploymentMutationPayload = {
+  operation: 'apply' | 'scale' | 'offline' | 'restart'
+  expectedGeneration: number
+  replicas?: number
+  restart?: boolean
+  reason?: string
+}
+
+export type RuntimeDeploymentReconcilePayload = {
+  expectedGeneration: number
+  reason?: string
 }
 
 export function fetchAifarRuntime(query: string, options: LoadRuntimeOptions = {}) {
@@ -107,8 +120,29 @@ export function applyRuntimeConfig(query: string, payload: RuntimeConfigPayload)
   return apiPut<RuntimeTaskResponse>(`/containers/aifar/runtime/config?${query}`, payload)
 }
 
-export function reconcileRuntime(query: string, instanceId: string) {
-  return apiPost<RuntimeTaskResponse>(`/containers/aifar/runtime/reconcile?${query}`, { instanceId })
+export function mutateRuntimeDeployment(
+  query: string,
+  instanceId: string,
+  service: string,
+  payload: RuntimeDeploymentMutationPayload
+) {
+  return apiPut<RuntimeTaskResponse>(runtimeDeploymentEndpoint(query, instanceId, service), payload)
+}
+
+export function reconcileRuntimeDeployment(
+  query: string,
+  instanceId: string,
+  service: string,
+  payload: RuntimeDeploymentReconcilePayload
+) {
+  return apiPost<RuntimeTaskResponse>(runtimeDeploymentEndpoint(query, instanceId, service, '/reconcile'), payload)
+}
+
+export function runtimeLockOwnerTaskId(error: unknown) {
+  const apiError = error as ApiError
+  if (apiError?.status !== 409 || !apiError.details || typeof apiError.details !== 'object') return ''
+  const ownerTaskId = (apiError.details as { ownerTaskId?: unknown }).ownerTaskId
+  return typeof ownerTaskId === 'string' ? ownerTaskId.trim() : ''
 }
 
 export function restartAllRuntime(query: string, instanceId: string, reason = '') {
@@ -128,18 +162,7 @@ export function installRuntimeServices(query: string, payload: RuntimeServiceIns
   return apiPost<RuntimeTaskResponse>(`/containers/aifar/services/install?${query}`, payload)
 }
 
-export function scaleOutRuntimeService(query: string, service: string, instanceId: string) {
-  return apiPost<RuntimeTaskResponse>(`/containers/aifar/services/${encodeURIComponent(service)}/scale-out?${query}`, { instanceId })
-}
-
-export function scaleInRuntimeService(query: string, service: string, instanceId: string) {
-  return apiPost<RuntimeTaskResponse>(`/containers/aifar/services/${encodeURIComponent(service)}/scale-in?${query}`, { instanceId })
-}
-
-export function offlineRuntimeService(query: string, service: string, instanceId: string) {
-  return apiPost<RuntimeTaskResponse>(`/containers/aifar/services/${encodeURIComponent(service)}/offline?${query}`, { instanceId })
-}
-
-export function offlineRuntimeServices(query: string, instanceId: string, services: string[]) {
-  return apiPost<RuntimeTaskResponse>(`/containers/aifar/services/batch-offline?${query}`, { instanceId, services })
+function runtimeDeploymentEndpoint(query: string, instanceId: string, service: string, action = '') {
+  const suffix = query ? `?${query}` : ''
+  return `/apps/instances/${encodeURIComponent(instanceId)}/runtime/deployments/${encodeURIComponent(service)}${action}${suffix}`
 }

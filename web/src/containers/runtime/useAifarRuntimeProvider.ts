@@ -3,5 +3,5 @@ import { aifarRuntimeContextKey, type AifarRuntimeContext } from './context'
 
 export function useAifarRuntimeProvider(context: AifarRuntimeContext) {
   provide(aifarRuntimeContextKey, context)
-  return context
+  return context as Readonly<AifarRuntimeContext>
 }
