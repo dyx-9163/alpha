@@ -3,14 +3,11 @@ package adapter
 import (
 	"bytes"
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"os"
-	"path"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -43,8 +40,8 @@ func (SSHRemote) UploadFile(ctx context.Context, server store.Server, localPath,
 	return UploadSSHFile(ctx, server, localPath, remotePath, mode)
 }
 
-func (SSHRemote) UploadFileAtomicVerified(ctx context.Context, server store.Server, localPath, remoteDir, finalName string, mode os.FileMode, expectedSize int64, expectedSHA256 string) (string, error) {
-	return UploadSSHFileAtomicVerified(ctx, server, localPath, remoteDir, finalName, mode, expectedSize, expectedSHA256)
+func (SSHRemote) RunWithInput(ctx context.Context, server store.Server, command string, input []byte) (CommandResult, error) {
+	return runSSHWithInput(ctx, server, command, input)
 }
 
 func (SSHRemote) StreamFile(ctx context.Context, server store.Server, remotePath string, dst io.Writer) (int64, error) {
@@ -96,6 +93,52 @@ func RunSSH(ctx context.Context, server store.Server, command string) (CommandRe
 	result := CommandResult{Stdout: stdout.String(), Stderr: stderr.String()}
 	if err != nil {
 		return result, err
+	}
+	return result, nil
+}
+
+// runSSHWithInput executes one fixed remote command and writes the exact input
+// bytes to that same SSH session. Input is never included in the command,
+// result, or returned error.
+func runSSHWithInput(ctx context.Context, server store.Server, command string, input []byte) (CommandResult, error) {
+	client, err := dialSSH(ctx, server)
+	if err != nil {
+		return CommandResult{}, err
+	}
+	defer client.Close()
+	session, err := client.NewSession()
+	if err != nil {
+		return CommandResult{}, err
+	}
+	defer session.Close()
+	stdin, err := session.StdinPipe()
+	if err != nil {
+		return CommandResult{}, err
+	}
+	var stdout bytes.Buffer
+	stderr := newBoundedSSHStderr(sshStreamStderrLimit)
+	session.Stdout = &stdout
+	session.Stderr = stderr
+	err = runSSHUploadWithContext(ctx, func() {
+		_ = stdin.Close()
+		_ = session.Signal(ssh.SIGKILL)
+		_ = session.Close()
+		_ = client.Close()
+	}, func() error {
+		return session.Run(command)
+	}, func() error {
+		_, copyErr := io.Copy(stdin, bytes.NewReader(input))
+		closeErr := stdin.Close()
+		if copyErr != nil {
+			return copyErr
+		}
+		return closeErr
+	}, func() string {
+		return ""
+	})
+	result := CommandResult{Stdout: stdout.String()}
+	if err != nil {
+		return result, errors.New("SSH command with input failed")
 	}
 	return result, nil
 }
@@ -514,122 +557,6 @@ func UploadSSHFile(ctx context.Context, server store.Server, localPath, remotePa
 	}, func() string {
 		return stderr.String()
 	})
-}
-
-// UploadSSHFileAtomicVerified streams a file into a fresh, mode-0700 staging
-// directory. The remote shell opens the partial leaf with noclobber semantics,
-// verifies the exact byte count and SHA-256, then atomically renames it. The
-// random staging path is generated locally from cryptographic entropy and is
-// never derived from uploaded content.
-func UploadSSHFileAtomicVerified(ctx context.Context, server store.Server, localPath, remoteDir, finalName string, mode os.FileMode, expectedSize int64, expectedSHA256 string) (string, error) {
-	remoteDir = filepath.ToSlash(filepath.Clean(strings.TrimSpace(remoteDir)))
-	finalName = strings.TrimSpace(finalName)
-	expectedSHA256 = strings.ToLower(strings.TrimSpace(expectedSHA256))
-	if !strings.HasPrefix(remoteDir, "/") || remoteDir == "/" || strings.ContainsAny(remoteDir, "\x00\r\n") {
-		return "", errors.New("atomic upload remote directory is invalid")
-	}
-	if finalName == "" || finalName == "." || finalName == ".." || strings.ContainsAny(finalName, "/\\\x00\r\n") {
-		return "", errors.New("atomic upload final name is invalid")
-	}
-	decodedHash, err := hex.DecodeString(expectedSHA256)
-	if err != nil || len(decodedHash) != 32 || expectedSize < 0 || mode.Perm() != mode || mode.Perm() == 0 {
-		return "", errors.New("atomic upload verification input is invalid")
-	}
-	tokenBytes := make([]byte, 16)
-	if _, err := io.ReadFull(rand.Reader, tokenBytes); err != nil {
-		return "", errors.New("atomic upload staging identity generation failed")
-	}
-	stageDir := path.Join(remoteDir, ".aifar-stage-"+hex.EncodeToString(tokenBytes))
-	partialPath := path.Join(stageDir, ".payload.part")
-	finalPath := path.Join(stageDir, finalName)
-	command := atomicVerifiedUploadCommand(remoteDir, stageDir, partialPath, finalPath, mode, expectedSize, expectedSHA256)
-
-	client, err := dialSSH(ctx, server)
-	if err != nil {
-		return "", err
-	}
-	file, err := os.Open(localPath)
-	if err != nil {
-		_ = client.Close()
-		return "", err
-	}
-	session, err := client.NewSession()
-	if err != nil {
-		_ = file.Close()
-		_ = client.Close()
-		return "", err
-	}
-	stdin, err := session.StdinPipe()
-	if err != nil {
-		_ = session.Close()
-		_ = file.Close()
-		_ = client.Close()
-		return "", err
-	}
-	var stderr bytes.Buffer
-	session.Stderr = &stderr
-	uploadErr := runSSHUploadWithContext(ctx, func() {
-		_ = stdin.Close()
-		_ = session.Signal(ssh.SIGKILL)
-		_ = session.Close()
-		_ = client.Close()
-	}, func() error {
-		return session.Run(command)
-	}, func() error {
-		_, copyErr := io.Copy(stdin, file)
-		closeErr := stdin.Close()
-		if copyErr != nil {
-			return copyErr
-		}
-		return closeErr
-	}, func() string {
-		return logmask.Mask(stderr.String())
-	})
-	_ = file.Close()
-	_ = session.Close()
-	_ = client.Close()
-	if uploadErr != nil {
-		cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		cleanupCommand := "rm -f -- " + shellQuote(partialPath) + " " + shellQuote(finalPath) + " && { rmdir -- " + shellQuote(stageDir) + " 2>/dev/null || [ ! -e " + shellQuote(stageDir) + " ]; }"
-		if _, cleanupErr := RunSSH(cleanupCtx, server, cleanupCommand); cleanupErr != nil {
-			return "", errors.New("atomic upload cleanup failed")
-		}
-		return "", errors.New("atomic verified upload failed")
-	}
-	return finalPath, nil
-}
-
-func atomicVerifiedUploadCommand(remoteDir, stageDir, partialPath, finalPath string, mode os.FileMode, expectedSize int64, expectedSHA256 string) string {
-	return strings.Join([]string{
-		"set -eu",
-		"set -f",
-		"umask 077",
-		"base=" + shellQuote(remoteDir),
-		"stage=" + shellQuote(stageDir),
-		"part=" + shellQuote(partialPath),
-		"final=" + shellQuote(finalPath),
-		"current=",
-		"old_ifs=$IFS",
-		"IFS=/",
-		"for component in ${base#/}; do [ -n \"$component\" ] || continue; current=\"$current/$component\"; if [ -L \"$current\" ]; then exit 71; elif [ -e \"$current\" ]; then [ -d \"$current\" ] || exit 72; else mkdir -m 0700 -- \"$current\"; fi; done",
-		"IFS=$old_ifs",
-		"[ ! -L \"$base\" ] && [ -d \"$base\" ]",
-		"mkdir -m 0700 -- \"$stage\"",
-		"cleanup() { rm -f -- \"$part\" \"$final\"; rmdir -- \"$stage\"; }",
-		"trap 'code=$?; if [ \"$code\" -ne 0 ]; then cleanup || exit 79; fi; exit \"$code\"' EXIT HUP INT TERM",
-		"( set -C; exec 3> \"$part\"; cat >&3 )",
-		"chmod " + fmt.Sprintf("%04o", mode.Perm()) + " -- \"$part\"",
-		"[ \"$(wc -c < \"$part\" | tr -d '[:space:]')\" = " + shellQuote(fmt.Sprintf("%d", expectedSize)) + " ]",
-		"[ \"$(sha256sum -- \"$part\" | awk '{print $1}')\" = " + shellQuote(expectedSHA256) + " ]",
-		"mv -- \"$part\" \"$final\"",
-		"[ ! -L \"$final\" ] && [ -f \"$final\" ]",
-		"[ \"$(wc -c < \"$final\" | tr -d '[:space:]')\" = " + shellQuote(fmt.Sprintf("%d", expectedSize)) + " ]",
-		"[ \"$(sha256sum -- \"$final\" | awk '{print $1}')\" = " + shellQuote(expectedSHA256) + " ]",
-		"sync -f \"$final\"",
-		"sync -d \"$stage\"",
-		"trap - EXIT HUP INT TERM",
-	}, "\n")
 }
 
 func dialSSH(ctx context.Context, server store.Server) (*ssh.Client, error) {

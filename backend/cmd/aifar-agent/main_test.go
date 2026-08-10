@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -386,6 +388,62 @@ func TestServiceCLITransportAndValidation(t *testing.T) {
 	}
 	if err := runServiceAgentCommand("get-deployment", []string{"--instance", "../admin", "--service", "permission", "--addr", addr}, &out); err == nil {
 		t.Fatal("unsafe identity accepted")
+	}
+}
+
+func TestBootstrapRuntimeStdinValidatesExactBytesBeforeTypedRequest(t *testing.T) {
+	data, err := json.Marshal(agentTestLegacySpec())
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(data)
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		if r.URL.Path != "/runtime/bootstrap" {
+			t.Fatalf("path=%q", r.URL.Path)
+		}
+		var got runtimeagent.LegacyRuntimeSpec
+		decoder := json.NewDecoder(r.Body)
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&got); err != nil {
+			t.Fatal(err)
+		}
+		if got.InstanceID != "admin" {
+			t.Fatalf("instance=%q", got.InstanceID)
+		}
+		writeJSON(w, http.StatusAccepted, map[string]bool{"accepted": true})
+	}))
+	defer server.Close()
+	args := []string{"--instance", "admin", "--sha256", hex.EncodeToString(digest[:]), "--addr", strings.TrimPrefix(server.URL, "http://")}
+	var out bytes.Buffer
+	if err := runServiceAgentCommandWithInput("bootstrap-runtime-stdin", args, bytes.NewReader(data), &out); err != nil {
+		t.Fatal(err)
+	}
+	if requests != 1 {
+		t.Fatalf("requests=%d want=1", requests)
+	}
+
+	for _, test := range []struct {
+		name  string
+		args  []string
+		input []byte
+	}{
+		{name: "hash mismatch", args: []string{"--instance", "admin", "--sha256", strings.Repeat("0", 64), "--addr", strings.TrimPrefix(server.URL, "http://")}, input: data},
+		{name: "instance mismatch", args: args, input: bytes.Replace(data, []byte(`"instanceId":"admin"`), []byte(`"instanceId":"other"`), 1)},
+		{name: "oversized", args: args, input: bytes.Repeat([]byte("x"), int(maxAgentRequestBodyBytes)+1)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			before := requests
+			var rejectedOut bytes.Buffer
+			err := runServiceAgentCommandWithInput("bootstrap-runtime-stdin", test.args, bytes.NewReader(test.input), &rejectedOut)
+			if err == nil || requests != before {
+				t.Fatalf("invalid stdin reached bootstrap: err=%v requests=%d before=%d", err, requests, before)
+			}
+			if strings.Contains(err.Error(), "SECRET-GROUP") || strings.Contains(rejectedOut.String(), "SECRET-GROUP") {
+				t.Fatalf("stdin content leaked: err=%v out=%q", err, rejectedOut.String())
+			}
+		})
 	}
 }
 

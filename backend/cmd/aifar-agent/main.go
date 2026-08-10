@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -30,7 +32,7 @@ var (
 	agentServicePattern   = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,62}$`)
 	agentErrorCodePattern = regexp.MustCompile(`^[A-Z][A-Z0-9_]{0,63}$`)
 	agentSHA256Pattern    = regexp.MustCompile(`^[0-9a-f]{64}$`)
-	perServiceFeatures    = []string{"service-manifest-v1", "service-generation-v1", "per-service-reconcile", "per-service-restart", "service-conditions-v1", "runtime-instance-snapshot-v1", "durable-legacy-archive-v1"}
+	perServiceFeatures    = []string{"service-manifest-v1", "service-generation-v1", "per-service-reconcile", "per-service-restart", "service-conditions-v1", "runtime-instance-snapshot-v1", "durable-legacy-archive-v1", "verified-bootstrap-stream-v1"}
 )
 
 func main() {
@@ -93,8 +95,8 @@ func main() {
 			os.Exit(1)
 		}
 		fmt.Println(`{"status":"restarted"}`)
-	case "apply-deployment", "get-deployment", "get-instance-snapshot", "archive-legacy-runtime", "reconcile-deployment", "bootstrap-runtime":
-		if err := runServiceAgentCommand(os.Args[1], os.Args[2:], os.Stdout); err != nil {
+	case "apply-deployment", "get-deployment", "get-instance-snapshot", "archive-legacy-runtime", "reconcile-deployment", "bootstrap-runtime", "bootstrap-runtime-stdin":
+		if err := runServiceAgentCommandWithInput(os.Args[1], os.Args[2:], os.Stdin, os.Stdout); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
@@ -127,7 +129,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: aifar-agent health | status | apply-deployment --manifest <file> | get-deployment --instance <id> --service <name> | get-instance-snapshot --instance <id> | archive-legacy-runtime --instance <id> --sha256 <digest> | reconcile-deployment --instance <id> --service <name> | bootstrap-runtime --spec <file> | reconcile-runtime --spec <file> | restart-runtime --spec <file> | reconcile-ingress --spec <file> | remove-instance [--instance admin] | register-nacos [--state-dir dir] | deregister-nacos [--state-dir dir] | serve [--addr 127.0.0.1:18081]")
+	fmt.Fprintln(os.Stderr, "usage: aifar-agent health | status | apply-deployment --manifest <file> | get-deployment --instance <id> --service <name> | get-instance-snapshot --instance <id> | archive-legacy-runtime --instance <id> --sha256 <digest> | reconcile-deployment --instance <id> --service <name> | bootstrap-runtime --spec <file> | bootstrap-runtime-stdin --instance <id> --sha256 <digest> | reconcile-runtime --spec <file> | restart-runtime --spec <file> | reconcile-ingress --spec <file> | remove-instance [--instance admin] | register-nacos [--state-dir dir] | deregister-nacos [--state-dir dir] | serve [--addr 127.0.0.1:18081]")
 }
 
 func readSpec(path string) (runtimeagent.RuntimeSpec, error) {
@@ -659,6 +661,10 @@ func writeAgentError(w http.ResponseWriter, status int, code, message string, de
 }
 
 func runServiceAgentCommand(name string, args []string, out io.Writer) error {
+	return runServiceAgentCommandWithInput(name, args, bytes.NewReader(nil), out)
+}
+
+func runServiceAgentCommandWithInput(name string, args []string, in io.Reader, out io.Writer) error {
 	command := flag.NewFlagSet(name, flag.ContinueOnError)
 	command.SetOutput(io.Discard)
 	addr := command.String("addr", "127.0.0.1:18081", "agent API address")
@@ -747,6 +753,35 @@ func runServiceAgentCommand(name string, args []string, out io.Writer) error {
 			return errors.New("legacy runtime spec file is invalid")
 		}
 		return doAgentTypedRequest(ctx, *addr, http.MethodPost, "/runtime/bootstrap", data, out)
+	case "bootstrap-runtime-stdin":
+		if *manifestPath != "" || *specPath != "" || *serviceName != "" {
+			return errors.New("unsupported flags for streamed runtime bootstrap")
+		}
+		instance := strings.TrimSpace(*instanceID)
+		digest := strings.ToLower(strings.TrimSpace(*expectedSHA256))
+		if !validAgentInstanceID(instance) || !agentSHA256Pattern.MatchString(digest) {
+			return errors.New("--instance and --sha256 are required and must be valid")
+		}
+		if in == nil {
+			return errors.New("runtime bootstrap input is required")
+		}
+		data, err := io.ReadAll(io.LimitReader(in, maxAgentRequestBodyBytes+1))
+		if err != nil || int64(len(data)) > maxAgentRequestBodyBytes {
+			return errors.New("runtime bootstrap input is invalid")
+		}
+		hash := sha256.Sum256(data)
+		if hex.EncodeToString(hash[:]) != digest {
+			return errors.New("runtime bootstrap input hash differs")
+		}
+		var spec runtimeagent.LegacyRuntimeSpec
+		if err := decodeBoundedStrictJSON(data, &spec); err != nil || strings.TrimSpace(spec.InstanceID) != instance {
+			return errors.New("runtime bootstrap input is invalid")
+		}
+		body, err := json.Marshal(spec)
+		if err != nil {
+			return errors.New("runtime bootstrap input is invalid")
+		}
+		return doAgentTypedRequest(ctx, *addr, http.MethodPost, "/runtime/bootstrap", body, out)
 	default:
 		return errors.New("unsupported service agent command")
 	}
@@ -778,6 +813,10 @@ func readBoundedStrictJSONFile(path string, target any) error {
 	if int64(len(data)) > maxAgentRequestBodyBytes {
 		return errors.New("JSON file exceeds size limit")
 	}
+	return decodeBoundedStrictJSON(data, target)
+}
+
+func decodeBoundedStrictJSON(data []byte, target any) error {
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(target); err != nil {

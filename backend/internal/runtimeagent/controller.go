@@ -192,6 +192,7 @@ type legacyRuntimeArchiveOps struct {
 	createTemp func(string, string) (*os.File, error)
 	rename     func(string, string) error
 	remove     func(string) error
+	chmodFile  func(*os.File, os.FileMode) error
 	syncFile   func(*os.File) error
 	syncDir    func(string) error
 }
@@ -200,6 +201,12 @@ func defaultLegacyRuntimeArchiveOps() legacyRuntimeArchiveOps {
 	return legacyRuntimeArchiveOps{
 		lstat: os.Lstat, open: os.Open, createTemp: os.CreateTemp,
 		rename: os.Rename, remove: os.Remove,
+		chmodFile: func(file *os.File, mode os.FileMode) error {
+			if runtime.GOOS == "windows" {
+				return os.Chmod(file.Name(), mode)
+			}
+			return file.Chmod(mode)
+		},
 		syncFile: func(file *os.File) error {
 			if runtime.GOOS == "windows" {
 				return nil
@@ -302,15 +309,7 @@ func durableArchiveLegacyRuntimeSpec(config InstanceConfig, expectedSHA256 strin
 		backupExists = true
 	}
 	if backupExists {
-		backup, err := ops.open(backupPath)
-		if err != nil {
-			return err
-		}
-		if err := ops.syncFile(backup); err != nil {
-			_ = backup.Close()
-			return err
-		}
-		if err := backup.Close(); err != nil {
+		if err := makeVerifiedLegacyBackupReadOnly(backupPath, expectedSHA256, ops); err != nil {
 			return err
 		}
 		if err := ops.syncDir(directory); err != nil {
@@ -324,6 +323,55 @@ func durableArchiveLegacyRuntimeSpec(config InstanceConfig, expectedSHA256 strin
 		if err := ops.syncDir(directory); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+func makeVerifiedLegacyBackupReadOnly(filePath, expectedSHA256 string, ops legacyRuntimeArchiveOps) error {
+	pathInfo, err := ops.lstat(filePath)
+	if err != nil {
+		return err
+	}
+	if !pathInfo.Mode().IsRegular() || pathInfo.Mode()&os.ModeSymlink != 0 {
+		return errors.New("legacy runtime backup is not a regular file")
+	}
+	file, err := ops.open(filePath)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	openedInfo, err := file.Stat()
+	if err != nil || !openedInfo.Mode().IsRegular() || !os.SameFile(pathInfo, openedInfo) {
+		return errors.New("legacy runtime backup changed before read-only commit")
+	}
+	hash := sha256.New()
+	written, err := io.Copy(hash, io.LimitReader(file, (4<<20)+1))
+	if err != nil || written > 4<<20 || hex.EncodeToString(hash.Sum(nil)) != expectedSHA256 {
+		return errors.New("legacy runtime backup verification failed")
+	}
+	if err := ops.chmodFile(file, 0o400); err != nil {
+		return err
+	}
+	if err := ops.syncFile(file); err != nil {
+		return err
+	}
+	fdInfo, err := file.Stat()
+	if err != nil || !fdInfo.Mode().IsRegular() || !os.SameFile(openedInfo, fdInfo) {
+		return errors.New("legacy runtime backup inode changed during read-only commit")
+	}
+	pathInfo, err = ops.lstat(filePath)
+	if err != nil || !pathInfo.Mode().IsRegular() || pathInfo.Mode()&os.ModeSymlink != 0 || !os.SameFile(fdInfo, pathInfo) {
+		return errors.New("legacy runtime backup path changed during read-only commit")
+	}
+	wantMode := os.FileMode(0o400)
+	if runtime.GOOS == "windows" {
+		wantMode = 0o444
+	}
+	if fdInfo.Mode().Perm() != wantMode || pathInfo.Mode().Perm() != wantMode {
+		return errors.New("legacy runtime backup mode is not read-only")
+	}
+	if err := file.Close(); err != nil {
+		return err
 	}
 	return nil
 }

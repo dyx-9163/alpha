@@ -9,13 +9,13 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
-	"os"
 	"path"
 	"reflect"
 	"sort"
 	"strings"
 	"time"
 
+	"aifar-deployment/backend/internal/adapter"
 	"aifar-deployment/backend/internal/installer/installerkit"
 	"aifar-deployment/backend/internal/runtimeagent"
 	"aifar-deployment/backend/internal/store"
@@ -35,6 +35,7 @@ var requiredRuntimeMigrationAgentFeatures = []string{
 	"service-conditions-v1",
 	"runtime-instance-snapshot-v1",
 	"durable-legacy-archive-v1",
+	"verified-bootstrap-stream-v1",
 }
 
 type runtimeMigrationStore interface {
@@ -46,8 +47,8 @@ type runtimeMigrationAuditStore interface {
 	AddAudit(actor, action, target, status, detail string) error
 }
 
-type runtimeMigrationAtomicUploader interface {
-	UploadFileAtomicVerified(ctx context.Context, server store.Server, localPath, remoteDir, finalName string, mode os.FileMode, expectedSize int64, expectedSHA256 string) (string, error)
+type runtimeMigrationInputRunner interface {
+	RunWithInput(ctx context.Context, server store.Server, command string, input []byte) (adapter.CommandResult, error)
 }
 
 type runtimeMigrationPlan struct {
@@ -85,6 +86,12 @@ func (s Service) MigrateRuntimeModel(ctx context.Context, req RuntimeMigrationRe
 	if !ok {
 		return repairRequired("AIFAR_RUNTIME_MIGRATION_CONTROL_STORE_UNAVAILABLE", nil)
 	}
+	if _, ok := s.store.(aifarOrchestrationLockStore); !ok {
+		return repairRequired("AIFAR_RUNTIME_MIGRATION_EXACT_LOCK_STORE_REQUIRED", nil)
+	}
+	if _, ok := s.remote.(runtimeMigrationInputRunner); !ok {
+		return repairRequired("AIFAR_RUNTIME_MIGRATION_TYPED_BOOTSTRAP_UNAVAILABLE", nil)
+	}
 
 	auditStatus := "failed"
 	defer func() {
@@ -103,6 +110,9 @@ func (s Service) MigrateRuntimeModel(ctx context.Context, req RuntimeMigrationRe
 	instance, lock, err := s.acquireOrchestrationLock(req.Instance.ID, runtimeMigrationOperation, "", req.Actor, req.TaskID)
 	if err != nil {
 		return err
+	}
+	if strings.TrimSpace(lock.ID) == "" {
+		return repairRequired("AIFAR_RUNTIME_MIGRATION_EXACT_LOCK_REQUIRED", nil)
 	}
 	defer func() {
 		if releaseErr := s.releaseRuntimeMigrationLock(lock); releaseErr != nil {
@@ -142,14 +152,8 @@ func (s Service) MigrateRuntimeModel(ctx context.Context, req RuntimeMigrationRe
 		log.Info("AIFAR runtime migration preflight passed: services=%d", len(plan.services))
 	}
 
-	var stageCleanupErr error
 	if remoteState.model == "legacy" {
-		stagedSpecPath, stageErr := s.stageRuntimeMigrationLegacySpec(taskCtx, req.Server, plan)
-		if stageErr != nil {
-			return stageErr
-		}
-		_, bootstrapErr := s.remote.Run(taskCtx, req.Server, "aifar-agent bootstrap-runtime --spec "+installerkit.ShellQuote(stagedSpecPath))
-		stageCleanupErr = s.cleanupRuntimeMigrationStage(taskCtx, req.Server, plan, stagedSpecPath)
+		bootstrapErr := s.bootstrapRuntimeMigrationLegacy(taskCtx, req.Server, plan)
 		if taskCtx.Err() != nil {
 			return taskCtx.Err()
 		}
@@ -162,9 +166,6 @@ func (s Service) MigrateRuntimeModel(ctx context.Context, req RuntimeMigrationRe
 	states, err := s.readRuntimeMigrationDeployments(taskCtx, req.Server, plan)
 	if err != nil {
 		return err
-	}
-	if stageCleanupErr != nil {
-		return repairRequired("AIFAR_RUNTIME_MIGRATION_STAGE_CLEANUP_FAILED", nil)
 	}
 	if err := s.archiveLegacyRuntimeSpec(taskCtx, req.Server, plan); err != nil {
 		return err
@@ -180,8 +181,7 @@ func (s Service) MigrateRuntimeModel(ctx context.Context, req RuntimeMigrationRe
 
 func (s Service) releaseRuntimeMigrationLock(lock store.AIFAROrchestrationLock) error {
 	if strings.TrimSpace(lock.ID) == "" {
-		s.releaseOrchestrationLock(lock)
-		return nil
+		return repairRequired("AIFAR_RUNTIME_MIGRATION_LOCK_RELEASE_FAILED", nil)
 	}
 	lockStore, ok := s.store.(aifarOrchestrationLockStore)
 	if !ok {
@@ -397,52 +397,14 @@ func (s Service) buildRuntimeMigrationPlan(instance store.AppInstance, legacyJSO
 	return plan, nil
 }
 
-func (s Service) stageRuntimeMigrationLegacySpec(ctx context.Context, server store.Server, plan runtimeMigrationPlan) (string, error) {
-	uploader, ok := s.remote.(runtimeMigrationAtomicUploader)
+func (s Service) bootstrapRuntimeMigrationLegacy(ctx context.Context, server store.Server, plan runtimeMigrationPlan) error {
+	runner, ok := s.remote.(runtimeMigrationInputRunner)
 	if !ok {
-		return "", repairRequired("AIFAR_RUNTIME_MIGRATION_SECURE_UPLOAD_UNAVAILABLE", nil)
-	}
-	local, err := os.CreateTemp("", "aifar-runtime-migration-*.json")
-	if err != nil {
-		return "", repairRequired("AIFAR_RUNTIME_MIGRATION_LOCAL_STAGE_FAILED", nil)
-	}
-	localPath := local.Name()
-	defer os.Remove(localPath)
-	if err := local.Chmod(0o600); err != nil {
-		_ = local.Close()
-		return "", repairRequired("AIFAR_RUNTIME_MIGRATION_LOCAL_STAGE_FAILED", nil)
-	}
-	if _, err := local.Write(plan.legacyJSON); err != nil {
-		_ = local.Close()
-		return "", repairRequired("AIFAR_RUNTIME_MIGRATION_LOCAL_STAGE_FAILED", nil)
-	}
-	if err := local.Sync(); err != nil {
-		_ = local.Close()
-		return "", repairRequired("AIFAR_RUNTIME_MIGRATION_LOCAL_STAGE_FAILED", nil)
-	}
-	if err := local.Close(); err != nil {
-		return "", repairRequired("AIFAR_RUNTIME_MIGRATION_LOCAL_STAGE_FAILED", nil)
+		return repairRequired("AIFAR_RUNTIME_MIGRATION_TYPED_BOOTSTRAP_UNAVAILABLE", nil)
 	}
 	digest := sha256.Sum256(plan.legacyJSON)
-	remoteDir := path.Join(plan.installRoot, "runtime", runtimeSpecDirName, "migration")
-	remotePath, err := uploader.UploadFileAtomicVerified(ctx, server, localPath, remoteDir, "migration-legacy-spec.json", 0o600, int64(len(plan.legacyJSON)), hex.EncodeToString(digest[:]))
-	if err != nil {
-		return "", repairRequired("AIFAR_RUNTIME_MIGRATION_REMOTE_STAGE_FAILED", nil)
-	}
-	return remotePath, nil
-}
-
-func (s Service) cleanupRuntimeMigrationStage(ctx context.Context, server store.Server, plan runtimeMigrationPlan, stagedSpecPath string) error {
-	base := path.Join(plan.installRoot, "runtime", runtimeSpecDirName, "migration")
-	stageDir := path.Dir(stagedSpecPath)
-	stageName := path.Base(stageDir)
-	if path.Dir(stageDir) != base || !strings.HasPrefix(stageName, ".aifar-stage-") || path.Base(stagedSpecPath) != "migration-legacy-spec.json" {
-		return errors.New("runtime migration staging path is invalid")
-	}
-	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
-	defer cancel()
-	command := "rm -f -- " + installerkit.ShellQuote(path.Join(stageDir, ".payload.part")) + " " + installerkit.ShellQuote(stagedSpecPath) + " && rmdir -- " + installerkit.ShellQuote(stageDir)
-	_, err := s.remote.Run(cleanupCtx, server, command)
+	command := "aifar-agent bootstrap-runtime-stdin --instance " + installerkit.ShellQuote(plan.instance.ID) + " --sha256 " + installerkit.ShellQuote(hex.EncodeToString(digest[:]))
+	_, err := runner.RunWithInput(ctx, server, command, plan.legacyJSON)
 	return err
 }
 

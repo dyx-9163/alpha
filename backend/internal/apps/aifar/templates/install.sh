@@ -172,7 +172,7 @@ wait_agent_status() {
 
 agent_has_runtime_features() {
   status="$1"
-  for feature in service-manifest-v1 service-generation-v1 per-service-reconcile per-service-restart service-conditions-v1 runtime-instance-snapshot-v1 durable-legacy-archive-v1; do
+  for feature in service-manifest-v1 service-generation-v1 per-service-reconcile per-service-restart service-conditions-v1 runtime-instance-snapshot-v1 durable-legacy-archive-v1 verified-bootstrap-stream-v1; do
     printf "%s" "$status" | grep -q "\"$feature\"" || return 1
   done
   return 0
@@ -554,14 +554,14 @@ readback_bootstrap_acceptance() {
 accept_runtime_manifests() {
   check_agent_dependency
   spec="$(write_runtime_spec)"
-  if aifar-agent bootstrap-runtime --spec "$spec" >/dev/null 2>&1; then
+  legacy_hash="$(sha256sum "$spec" | awk '{print $1}')"
+  if aifar-agent bootstrap-runtime-stdin --instance "$INSTANCE_ID" --sha256 "$legacy_hash" < "$spec" >/dev/null 2>&1; then
     :
   else
     :
   fi
   acceptance="$(readback_bootstrap_acceptance)" || fail "aifar-agent could not prove the exact runtime Manifests"
   legacy_backup="$AGENT_DIR/runtime-spec.legacy-readonly.json"
-  legacy_hash="$(sha256sum "$spec" | awk '{print $1}')"
   aifar-agent archive-legacy-runtime --instance "$INSTANCE_ID" --sha256 "$legacy_hash" >/dev/null 2>&1 || fail "aifar-agent could not durably archive the legacy runtime specification"
   [ -f "$legacy_backup" ] || fail "legacy runtime archive is unavailable"
   chmod 0400 "$legacy_backup"

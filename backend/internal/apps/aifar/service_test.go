@@ -3066,7 +3066,7 @@ func TestServiceInstallsAIFARServiceFromRuntimeV2Bundle(t *testing.T) {
 		`check_agent_dependency`,
 		`agent_runtime_status="$(aifar-agent status 2>/dev/null)"`,
 		`SPRING_CLOUD_NACOS_DISCOVERY_REGISTER_ENABLED "false"`,
-		`aifar-agent bootstrap-runtime --spec "$spec"`,
+		`aifar-agent bootstrap-runtime-stdin --instance "$INSTANCE_ID" --sha256 "$legacy_hash" < "$spec"`,
 		`aifar-agent get-deployment --instance "$INSTANCE_ID" --service "$service"`,
 		`AIFAR_BOOTSTRAP_ACCEPTANCE`,
 		`runtime-spec.json`,
@@ -3225,9 +3225,14 @@ func TestInstallSucceedsAfterManifestAcceptanceWithoutObservedRuntime(t *testing
 			t.Fatalf("install script must not execute readiness gate %q", forbidden)
 		}
 	}
-	for _, required := range []string{"aifar-agent bootstrap-runtime --spec", "AIFAR_BOOTSTRAP_ACCEPTANCE", "SERVICE_SPEC_HASHES", "expected_hash"} {
+	for _, required := range []string{"aifar-agent bootstrap-runtime-stdin --instance", "--sha256 \"$legacy_hash\" < \"$spec\"", "AIFAR_BOOTSTRAP_ACCEPTANCE", "SERVICE_SPEC_HASHES", "expected_hash"} {
 		if !strings.Contains(remote.installScript, required) {
 			t.Fatalf("install script must validate manifest acceptance with %q", required)
+		}
+	}
+	for _, forbidden := range []string{"aifar-agent bootstrap-runtime --spec", ".aifar-stage-", "migration-legacy-spec.json"} {
+		if strings.Contains(remote.installScript, forbidden) {
+			t.Fatalf("install script retained unsafe migration staging contract %q", forbidden)
 		}
 	}
 	if !strings.Contains(remote.installScript, `rm -f "$spec"`) {

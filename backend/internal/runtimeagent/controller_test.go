@@ -10,12 +10,108 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 )
+
+func TestDurableArchiveExistingVerifiedBackupBecomesExactReadOnly(t *testing.T) {
+	installRoot := t.TempDir()
+	directory := filepath.Join(installRoot, "runtime", "agent")
+	if err := os.MkdirAll(directory, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	body := []byte(`{"instanceId":"admin","safe":true}`)
+	backupPath := filepath.Join(directory, "runtime-spec.legacy-readonly.json")
+	if err := os.WriteFile(backupPath, body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(body)
+	if err := durableArchiveLegacyRuntimeSpec(InstanceConfig{InstallRoot: installRoot}, hex.EncodeToString(digest[:]), defaultLegacyRuntimeArchiveOps()); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Lstat(backupPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantMode := os.FileMode(0o400)
+	if runtime.GOOS == "windows" {
+		wantMode = 0o444
+	}
+	if info.Mode().Perm() != wantMode {
+		t.Fatalf("verified backup mode=%#o want=%#o", info.Mode().Perm(), wantMode)
+	}
+}
+
+func TestDurableArchiveExistingBackupReadOnlyFailurePreservesLegacy(t *testing.T) {
+	installRoot := t.TempDir()
+	directory := filepath.Join(installRoot, "runtime", "agent")
+	if err := os.MkdirAll(directory, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	body := []byte(`{"instanceId":"admin","safe":true}`)
+	legacyPath := filepath.Join(directory, "runtime-spec.json")
+	backupPath := filepath.Join(directory, "runtime-spec.legacy-readonly.json")
+	if err := os.WriteFile(legacyPath, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(backupPath, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(body)
+	ops := defaultLegacyRuntimeArchiveOps()
+	ops.chmodFile = func(*os.File, os.FileMode) error { return errors.New("injected fchmod failure") }
+	if err := durableArchiveLegacyRuntimeSpec(InstanceConfig{InstallRoot: installRoot}, hex.EncodeToString(digest[:]), ops); err == nil {
+		t.Fatal("fchmod failure was ignored")
+	}
+	if got, err := os.ReadFile(legacyPath); err != nil || !bytes.Equal(got, body) {
+		t.Fatalf("legacy source removed before read-only commit: body=%q err=%v", got, err)
+	}
+}
+
+func TestDurableArchiveRejectsBackupPathInodeReplacementAfterFchmod(t *testing.T) {
+	installRoot := t.TempDir()
+	directory := filepath.Join(installRoot, "runtime", "agent")
+	if err := os.MkdirAll(directory, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	body := []byte(`{"instanceId":"admin","safe":true}`)
+	legacyPath := filepath.Join(directory, "runtime-spec.json")
+	backupPath := filepath.Join(directory, "runtime-spec.legacy-readonly.json")
+	replacementPath := filepath.Join(directory, "replacement.json")
+	for _, filePath := range []string{legacyPath, backupPath, replacementPath} {
+		if err := os.WriteFile(filePath, body, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	digest := sha256.Sum256(body)
+	ops := defaultLegacyRuntimeArchiveOps()
+	replaced := false
+	baseLstat := ops.lstat
+	baseChmod := ops.chmodFile
+	ops.chmodFile = func(file *os.File, mode os.FileMode) error {
+		if err := baseChmod(file, mode); err != nil {
+			return err
+		}
+		replaced = true
+		return nil
+	}
+	ops.lstat = func(filePath string) (os.FileInfo, error) {
+		if replaced && filePath == backupPath {
+			return baseLstat(replacementPath)
+		}
+		return baseLstat(filePath)
+	}
+	if err := durableArchiveLegacyRuntimeSpec(InstanceConfig{InstallRoot: installRoot}, hex.EncodeToString(digest[:]), ops); err == nil {
+		t.Fatal("backup path inode replacement was accepted")
+	}
+	if _, err := os.Stat(legacyPath); err != nil {
+		t.Fatalf("legacy source removed after inode replacement: %v", err)
+	}
+}
 
 func TestDurableArchiveLegacyRuntimeSpecFileSyncFailurePreservesVerifiedLegacy(t *testing.T) {
 	installRoot := t.TempDir()
