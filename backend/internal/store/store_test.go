@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -1112,6 +1113,164 @@ func TestAppInstanceLifecycle(t *testing.T) {
 	}
 	if len(releases) != 0 {
 		t.Fatalf("expected app releases to be deleted with instance, got %+v", releases)
+	}
+}
+
+func TestSaveAppInstanceIfUnchangedConflictsAndReloadMergePreservesPeerMetadata(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "aifar.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	created, err := db.SaveAppInstance(AppInstance{
+		App: "aifar", Version: "runtime-v2", ServerID: "srv-1", Status: "install_failed",
+		Metadata: `{"serviceRevisions":{"gateway":"release-gateway"}}`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshotA, err := db.GetAppInstance(created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshotB := snapshotA
+	snapshotA.Metadata = `{"serviceRevisions":{"gateway":"release-gateway","permission":"release-permission"}}`
+	snapshotB.Metadata = `{"serviceRevisions":{"gateway":"release-gateway","file":"release-file"}}`
+
+	start := make(chan struct{})
+	type result struct {
+		name string
+		row  AppInstance
+		err  error
+	}
+	results := make(chan result, 2)
+	var wg sync.WaitGroup
+	for name, candidate := range map[string]AppInstance{"permission": snapshotA, "file": snapshotB} {
+		name, candidate := name, candidate
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			row, saveErr := db.SaveAppInstanceIfUnchanged(candidate, snapshotA.UpdatedAt)
+			results <- result{name: name, row: row, err: saveErr}
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+	var loser string
+	var conflictErrors []error
+	successes, conflicts := 0, 0
+	for item := range results {
+		switch {
+		case item.err == nil:
+			successes++
+			if !item.row.UpdatedAt.After(snapshotA.UpdatedAt) {
+				t.Fatalf("fresh updated_at=%v, want after %v", item.row.UpdatedAt, snapshotA.UpdatedAt)
+			}
+		case errors.Is(item.err, ErrAppInstanceConflict):
+			conflicts++
+			loser = item.name
+			conflictErrors = append(conflictErrors, item.err)
+		default:
+			t.Fatalf("unexpected save result for %s: %v", item.name, item.err)
+		}
+	}
+	if successes != 1 || conflicts != 1 {
+		t.Fatalf("successes=%d conflicts=%d, want 1/1: %v", successes, conflicts, conflictErrors)
+	}
+
+	latest, err := db.GetAppInstance(created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var metadata map[string]any
+	if err := json.Unmarshal([]byte(latest.Metadata), &metadata); err != nil {
+		t.Fatal(err)
+	}
+	revisions := metadata["serviceRevisions"].(map[string]any)
+	revisions[loser] = "release-" + loser
+	raw, _ := json.Marshal(metadata)
+	next := latest
+	next.Metadata = string(raw)
+	next.Status = latest.Status
+	merged, err := db.SaveAppInstanceIfUnchanged(next, latest.UpdatedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if merged.Status != "install_failed" {
+		t.Fatalf("status=%q, want install_failed", merged.Status)
+	}
+	var mergedMetadata struct {
+		ServiceRevisions map[string]string `json:"serviceRevisions"`
+	}
+	if err := json.Unmarshal([]byte(merged.Metadata), &mergedMetadata); err != nil {
+		t.Fatal(err)
+	}
+	for _, serviceName := range []string{"gateway", "permission", "file"} {
+		if mergedMetadata.ServiceRevisions[serviceName] == "" {
+			t.Fatalf("service revisions=%v, missing %s", mergedMetadata.ServiceRevisions, serviceName)
+		}
+	}
+}
+
+func TestSaveAppInstanceIfUnchangedRequiresExactTimestampToken(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "aifar.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	created, err := db.SaveAppInstance(AppInstance{
+		App: "aifar", Version: "runtime-v2", ServerID: "srv-1", Status: "installed", Metadata: `{}`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.Exec(`update app_instances set updated_at=cast(? as text) || '0' where id=?`, created.UpdatedAt, created.ID); err != nil {
+		t.Fatal(err)
+	}
+	next := created
+	next.Metadata = `{"changed":true}`
+	if _, err := db.SaveAppInstanceIfUnchanged(next, created.UpdatedAt); !errors.Is(err, ErrAppInstanceConflict) {
+		t.Fatalf("error=%v, want exact timestamp conflict", err)
+	}
+	var metadata string
+	if err := db.db.QueryRow(`select metadata from app_instances where id=?`, created.ID).Scan(&metadata); err != nil {
+		t.Fatal(err)
+	}
+	if metadata != `{}` {
+		t.Fatalf("metadata=%s, mismatched timestamp was accepted", metadata)
+	}
+}
+
+func TestSaveAppInstanceIfUnchangedSupportsLegacyOffsetTimestamp(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "aifar.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	created, err := db.SaveAppInstance(AppInstance{
+		App: "aifar", Version: "runtime-v2", ServerID: "srv-1", Status: "installed", Metadata: `{}`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyUpdatedAt := time.Date(2025, 7, 21, 16, 32, 15, 123456700, time.FixedZone("CST", 8*60*60))
+	if _, err := db.db.Exec(`update app_instances set updated_at=? where id=?`, legacyUpdatedAt, created.ID); err != nil {
+		t.Fatal(err)
+	}
+	legacy, err := db.GetAppInstance(created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	next := legacy
+	next.Metadata = `{"legacy":true}`
+	saved, err := db.SaveAppInstanceIfUnchanged(next, legacy.UpdatedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !saved.UpdatedAt.After(legacy.UpdatedAt) {
+		t.Fatalf("updated_at=%s, want after legacy %s", saved.UpdatedAt, legacy.UpdatedAt)
 	}
 }
 

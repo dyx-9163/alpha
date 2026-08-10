@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -95,6 +96,182 @@ type barrierListStore struct {
 	release           chan struct{}
 	firstLockTaskID   string
 	firstLockAcquired chan struct{}
+}
+
+type barrierCASStore struct {
+	*store.Store
+	mu        sync.Mutex
+	remaining int
+	calls     int
+	ready     chan struct{}
+	release   chan struct{}
+}
+
+type alwaysConflictCASStore struct {
+	*fakeStore
+	mu    sync.Mutex
+	calls int
+}
+
+type renewalFailureStore struct {
+	*store.Store
+	renewOnce sync.Once
+	renewed   chan struct{}
+	armed     chan struct{}
+	mu        sync.Mutex
+	casCalls  int
+}
+
+func (s *renewalFailureStore) RenewAIFAROrchestrationLock(string, time.Time) (bool, error) {
+	s.renewOnce.Do(func() { close(s.renewed) })
+	<-s.armed
+	return false, nil
+}
+
+func (s *renewalFailureStore) SaveAppInstanceIfUnchanged(next store.AppInstance, expectedUpdatedAt time.Time) (store.AppInstance, error) {
+	s.mu.Lock()
+	s.casCalls++
+	s.mu.Unlock()
+	return s.Store.SaveAppInstanceIfUnchanged(next, expectedUpdatedAt)
+}
+
+func (s *renewalFailureStore) appInstanceCASCalls() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.casCalls
+}
+
+type heartbeatBlockingRemote struct {
+	*fakeRemote
+	blockContains string
+	armed         chan struct{}
+	reached       chan struct{}
+	once          sync.Once
+}
+
+func (r *heartbeatBlockingRemote) Run(ctx context.Context, server store.Server, command string) (adapter.CommandResult, error) {
+	if strings.Contains(command, r.blockContains) {
+		r.once.Do(func() {
+			close(r.reached)
+			close(r.armed)
+		})
+		<-ctx.Done()
+		return adapter.CommandResult{}, ctx.Err()
+	}
+	return r.fakeRemote.Run(ctx, server, command)
+}
+
+func requireHeartbeatRenewalCancellation(t *testing.T, renewed, remoteReached <-chan struct{}, done <-chan error, cancel context.CancelFunc) {
+	t.Helper()
+	select {
+	case <-remoteReached:
+	case err := <-done:
+		t.Fatalf("operation ended before the blocking remote call: %v", err)
+	case <-time.After(time.Second):
+		cancel()
+		<-done
+		t.Fatal("operation did not reach the blocking remote call")
+	}
+	select {
+	case <-renewed:
+	case err := <-done:
+		t.Fatalf("operation ended before a heartbeat renewal was attempted: %v", err)
+	case <-time.After(250 * time.Millisecond):
+		cancel()
+		<-done
+		t.Fatal("operation did not start lock heartbeat renewal")
+	}
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("operation succeeded after lock renewal failed")
+		}
+	case <-time.After(time.Second):
+		cancel()
+		<-done
+		t.Fatal("operation did not stop after lock renewal failed")
+	}
+}
+
+func (s *alwaysConflictCASStore) SaveAppInstanceIfUnchanged(store.AppInstance, time.Time) (store.AppInstance, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.calls++
+	return store.AppInstance{}, store.ErrAppInstanceConflict
+}
+
+func (s *alwaysConflictCASStore) callCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.calls
+}
+
+func (s *barrierCASStore) SaveAppInstanceIfUnchanged(next store.AppInstance, expectedUpdatedAt time.Time) (store.AppInstance, error) {
+	s.mu.Lock()
+	s.calls++
+	wait := s.remaining > 0
+	if wait {
+		s.remaining--
+		if s.remaining == 0 {
+			close(s.ready)
+		}
+	}
+	s.mu.Unlock()
+	if wait {
+		<-s.release
+	}
+	return s.Store.SaveAppInstanceIfUnchanged(next, expectedUpdatedAt)
+}
+
+func (s *barrierCASStore) callCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.calls
+}
+
+func TestUpdateAppInstanceMetadataExhaustsCASConflictsAsRepairRequired(t *testing.T) {
+	instance := installedAIFARInstance(t)
+	instance.Status = "install_failed"
+	instance.UpdatedAt = time.Now().UTC()
+	conflicts := &alwaysConflictCASStore{fakeStore: &fakeStore{instances: []store.AppInstance{instance}}}
+
+	_, err := NewService(conflicts, &fakeRemote{}).updateAppInstanceMetadata(instance.ID, "AIFAR_TEST_METADATA_REPAIR_REQUIRED", func(metadata map[string]any) error {
+		metadata["desiredReplicas"] = map[string]int{"permission": 2}
+		return nil
+	})
+	var controlErr *deploymentControlError
+	if !errors.As(err, &controlErr) || controlErr.StableCode() != runtimeControlPlaneRepairCode || controlErr.ReasonCode() != "AIFAR_TEST_METADATA_REPAIR_REQUIRED" || !errors.Is(err, store.ErrAppInstanceConflict) {
+		t.Fatalf("error=%v, want bounded repair-required conflict", err)
+	}
+	if calls := conflicts.callCount(); calls != appInstanceMetadataCASAttempts {
+		t.Fatalf("CAS calls=%d, want bounded attempts=%d", calls, appInstanceMetadataCASAttempts)
+	}
+	saved, err := conflicts.GetAppInstance(instance.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if saved.Status != "install_failed" || saved.Metadata != instance.Metadata {
+		t.Fatalf("exhausted conflicts modified app instance: before=%+v after=%+v", instance, saved)
+	}
+}
+
+type firstDeploymentListBarrierStore struct {
+	*fakeStore
+	once    sync.Once
+	listed  chan struct{}
+	release chan struct{}
+}
+
+func (s *firstDeploymentListBarrierStore) ListAIFARDeployments(instanceID string) ([]store.AIFARDeployment, error) {
+	items, err := s.fakeStore.ListAIFARDeployments(instanceID)
+	if err != nil {
+		return nil, err
+	}
+	s.once.Do(func() {
+		close(s.listed)
+		<-s.release
+	})
+	return items, nil
 }
 
 func (s *barrierListStore) ListAppInstances() ([]store.AppInstance, error) {
@@ -182,20 +359,50 @@ func (f *fakeStore) SaveAppInstance(v store.AppInstance) (store.AppInstance, err
 		v.ID = store.NewID("app")
 		v.CreatedAt = now
 	}
-	if v.UpdatedAt.IsZero() {
-		v.UpdatedAt = now
-	}
 	for idx, existing := range f.instances {
 		if existing.ID == v.ID {
 			if v.CreatedAt.IsZero() {
 				v.CreatedAt = existing.CreatedAt
 			}
+			if !now.After(existing.UpdatedAt) {
+				now = existing.UpdatedAt.Add(time.Millisecond)
+			}
+			v.UpdatedAt = now
 			f.instances[idx] = v
 			return v, nil
 		}
 	}
+	v.UpdatedAt = now
 	f.instances = append(f.instances, v)
 	return v, nil
+}
+
+func (f *fakeStore) SaveAppInstanceIfUnchanged(next store.AppInstance, expectedUpdatedAt time.Time) (store.AppInstance, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.saveCalls++
+	if f.failSaveOn > 0 && f.saveCalls == f.failSaveOn {
+		return store.AppInstance{}, errors.New("control-plane save failed")
+	}
+	for idx, current := range f.instances {
+		if current.ID != next.ID {
+			continue
+		}
+		if !current.UpdatedAt.Equal(expectedUpdatedAt) {
+			return store.AppInstance{}, store.ErrAppInstanceConflict
+		}
+		fresh := time.Now().UTC()
+		if fresh.Sub(expectedUpdatedAt) < time.Millisecond {
+			fresh = expectedUpdatedAt.Add(time.Millisecond)
+		}
+		next.ID = current.ID
+		next.App = current.App
+		next.CreatedAt = current.CreatedAt
+		next.UpdatedAt = fresh
+		f.instances[idx] = next
+		return next, nil
+	}
+	return store.AppInstance{}, sql.ErrNoRows
 }
 
 func (f *fakeStore) DeleteAppInstance(id string) error {
@@ -962,12 +1169,12 @@ func (f *fakeRemote) UploadFile(ctx context.Context, server store.Server, localP
 		}
 		f.updateScript = string(content)
 	}
-	if strings.HasSuffix(remotePath, "/update-aifar-artifact-bundle.sh") {
+	if strings.Contains(remotePath, "/update-aifar-artifact-bundle-") && strings.HasSuffix(remotePath, ".sh") {
 		content, err := os.ReadFile(localPath)
 		if err != nil {
 			return err
 		}
-		f.bundleScript = string(content)
+		f.bundleScript += string(content) + "\n"
 	}
 	if strings.Contains(remotePath, "/rollback-") && strings.HasSuffix(remotePath, ".sh") {
 		content, err := os.ReadFile(localPath)
@@ -1025,6 +1232,43 @@ type recordingStepLogger struct {
 	mu           sync.Mutex
 	steps        []string
 	targetStatus string
+}
+
+type targetStateRecorder struct {
+	mu       sync.Mutex
+	statuses map[string]string
+	errors   map[string]string
+	steps    map[string]string
+}
+
+func (*targetStateRecorder) Info(format string, args ...any)  {}
+func (*targetStateRecorder) Error(format string, args ...any) {}
+func (*targetStateRecorder) StartTarget(target string)        {}
+func (l *targetStateRecorder) FinishTarget(target, status, errText string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.statuses == nil {
+		l.statuses = map[string]string{}
+	}
+	l.statuses[target] = status
+	if l.errors == nil {
+		l.errors = map[string]string{}
+	}
+	l.errors[target] = errText
+}
+func (*targetStateRecorder) StartStep(target, name, title string, order int) {}
+func (l *targetStateRecorder) FinishStep(target, name, status, errText string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.steps == nil {
+		l.steps = map[string]string{}
+	}
+	l.steps[target+":"+name] = status
+}
+func (l *targetStateRecorder) snapshot() (map[string]string, map[string]string, map[string]string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return maps.Clone(l.statuses), maps.Clone(l.errors), maps.Clone(l.steps)
 }
 
 func (*recordingStepLogger) Info(format string, args ...any)  {}
@@ -1511,6 +1755,69 @@ func TestScalePermissionDoesNotRewriteFileDeployment(t *testing.T) {
 	commands := remote.joinedCommands()
 	if strings.Contains(commands, "reconcile-runtime") || strings.Contains(commands, "runtime-spec.json") {
 		t.Fatalf("scale must not submit an aggregate runtime spec:\n%s", commands)
+	}
+}
+
+func TestConcurrentDifferentServiceScalesPreserveBothDesiredContributions(t *testing.T) {
+	agent := withFakeRuntimeAgentBinary(t)
+	sum, _, err := fileSHA256(agent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err := store.Open(filepath.Join(t.TempDir(), "aifar.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	instance := installedAIFARInstance(t)
+	instance.Status = "install_failed"
+	instance, err = db.SaveAppInstance(instance)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, deployment := range seedPerServiceDeployments(t, instance,
+		map[string]int{"permission": 1, "file": 1},
+		map[string]int64{"permission": 3, "file": 7},
+	) {
+		if _, err := db.SaveAIFARDeployment(deployment); err != nil {
+			t.Fatal(err)
+		}
+	}
+	barrier := &barrierCASStore{Store: db, remaining: 2, ready: make(chan struct{}), release: make(chan struct{})}
+	server := store.Server{ID: "srv-1", Host: "10.0.0.10", DeployDir: "/aifar/apps"}
+	remote := &fakeRemote{
+		runtimeAgentCheckStdout: runtimeAgentCheckOutput(t, sum, requiredRuntimeAgentFeatures...),
+		autoscaleStatusFallback: "endpoint=permission|permission-pod-1|release-permission|1|38010|true|healthy|10|64\nendpoint=file|file-pod-1|release-file|1|38005|true|healthy|10|64\n",
+	}
+	service := NewService(barrier, remote)
+	errs := make(chan error, 2)
+	for _, request := range []ScaleRequest{
+		{Instance: instance, Server: server, Actor: "operator-permission", TaskID: "task-scale-permission", ServiceName: "permission", Replicas: 2},
+		{Instance: instance, Server: server, Actor: "operator-file", TaskID: "task-scale-file", ServiceName: "file", Replicas: 3},
+	} {
+		request := request
+		go func() { errs <- service.ScaleService(context.Background(), request, fakeLogger{}, nil) }()
+	}
+	<-barrier.ready
+	close(barrier.release)
+	for range 2 {
+		if err := <-errs; err != nil {
+			t.Fatal(err)
+		}
+	}
+	saved, err := db.GetAppInstance(instance.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if saved.Status != "install_failed" {
+		t.Fatalf("runtime scale changed lifecycle status to %q", saved.Status)
+	}
+	desired := desiredReplicasFromMetadata(metadataFromInstance(saved))
+	if desired["permission"] != 2 || desired["file"] != 3 {
+		t.Fatalf("concurrent desired replicas lost a service contribution: %v", desired)
+	}
+	if calls := barrier.callCount(); calls != 3 {
+		t.Fatalf("CAS calls=%d, want two initial attempts plus one conflict retry", calls)
 	}
 }
 
@@ -2060,6 +2367,58 @@ func TestRuntimeConfigMutatesOnlyAffectedServiceGeneration(t *testing.T) {
 	}
 	if peer, want := after["file"], before["file"]; peer.Generation != want.Generation || peer.SpecJSON != want.SpecJSON {
 		t.Fatalf("file deployment changed: before=%+v after=%+v", want, peer)
+	}
+}
+
+func TestRuntimeConfigLockRenewalFailureCancelsRemoteAndStopsMetadataCAS(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "aifar.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	instance := installedAIFARInstance(t)
+	instance, err = db.SaveAppInstance(instance)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, deployment := range seedPerServiceDeployments(t, instance, map[string]int{"permission": 1}, nil) {
+		if _, err := db.SaveAIFARDeployment(deployment); err != nil {
+			t.Fatal(err)
+		}
+	}
+	renewals := &renewalFailureStore{Store: db, renewed: make(chan struct{}), armed: make(chan struct{})}
+	remote := &heartbeatBlockingRemote{
+		fakeRemote:    &fakeRemote{},
+		blockContains: "AIFAR_RUNTIME_CONFIG",
+		armed:         renewals.armed,
+		reached:       make(chan struct{}),
+	}
+	service := NewService(renewals, remote)
+	service.orchestrationLockHeartbeatInterval = 5 * time.Millisecond
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- service.ApplyRuntimeConfig(ctx, RuntimeConfigRequest{
+			Instance: instance,
+			Server:   store.Server{ID: "srv-1", Host: "10.0.0.10", DeployDir: "/aifar/apps"},
+			Actor:    "operator",
+			TaskID:   "task-config-renewal-loss",
+			Config: RuntimeConfigPayload{Global: RuntimeConfigValues{
+				AppCPUs: "2", AppMemoryLimit: "2GB", JVMInitialRAMPercentage: 25, JVMMaxRAMPercentage: 75,
+			}},
+		}, fakeLogger{}, nil)
+	}()
+	requireHeartbeatRenewalCancellation(t, renewals.renewed, remote.reached, done, cancel)
+	if calls := renewals.appInstanceCASCalls(); calls != 1 {
+		t.Fatalf("app-instance CAS calls=%d, want only the pre-remote pending write", calls)
+	}
+	active, err := db.ListAIFAROrchestrationLocks(instance.ID, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(active) != 0 {
+		t.Fatalf("lost runtime-config lock remained active: %+v", active)
 	}
 }
 
@@ -3409,6 +3768,142 @@ func TestRestartAllAggregatesFailureWithoutRollingBackAcceptedPeer(t *testing.T)
 	}
 }
 
+func TestRestartAllBusyPeerDoesNotBlockFreePeer(t *testing.T) {
+	instance := installedAIFARInstance(t)
+	metadata := metadataFromInstance(instance)
+	metadata["orchestrationLocks"] = map[string]any{
+		"permission": map[string]any{
+			"operation": "update-artifact",
+			"service":   "permission",
+			"actor":     "another-operator",
+			"taskId":    "task-busy-permission",
+			"startedAt": time.Now().UTC().Format(time.RFC3339),
+		},
+	}
+	instance.Metadata = mustMetadata(t, metadata)
+	deployments := seedPerServiceDeployments(t, instance,
+		map[string]int{"permission": 1, "file": 1},
+		map[string]int64{"permission": 3, "file": 7},
+	)
+	s := &fakeStore{
+		servers:     map[string]store.Server{"srv-1": {ID: "srv-1", Host: "10.0.0.10", DeployDir: "/aifar/apps"}},
+		instances:   []store.AppInstance{instance},
+		deployments: deployments,
+	}
+	before := deploymentsByService(deployments)
+	remote := &fakeRemote{}
+	recorder := &targetStateRecorder{}
+
+	err := NewService(s, remote).RestartRuntime(context.Background(), RuntimeRestartRequest{
+		Instance: instance, Server: s.servers["srv-1"], Language: "en", Actor: "operator", TaskID: "task-restart-independent",
+	}, recorder, nil)
+	if err == nil {
+		t.Fatal("expected the busy permission target to fail")
+	}
+	after := deploymentsByService(s.deployments)
+	if got := after["permission"]; got.Generation != before["permission"].Generation || got.SpecJSON != before["permission"].SpecJSON {
+		t.Fatalf("busy permission deployment changed: before=%+v after=%+v", before["permission"], got)
+	}
+	if got := after["file"]; got.Generation != before["file"].Generation+1 || got.Status != "Accepted" {
+		t.Fatalf("free file peer was not accepted independently: %+v", got)
+	}
+	statuses, _, steps := recorder.snapshot()
+	if statuses[instance.ID+":permission"] != "failed" || statuses[instance.ID+":file"] != "success" {
+		t.Fatalf("target statuses=%v, want permission failed and file success", statuses)
+	}
+	if steps[instance.ID+":permission:accept-service-intent"] != "failed" || steps[instance.ID+":file:accept-service-intent"] != "success" {
+		t.Fatalf("step statuses=%v", steps)
+	}
+}
+
+func TestRestartAllSkipsServiceOfflinedAfterInitialList(t *testing.T) {
+	instance := installedAIFARInstance(t)
+	base := &fakeStore{
+		servers:     map[string]store.Server{"srv-1": {ID: "srv-1", Host: "10.0.0.10", DeployDir: "/aifar/apps"}},
+		instances:   []store.AppInstance{instance},
+		deployments: seedPerServiceDeployments(t, instance, map[string]int{"permission": 1}, map[string]int64{"permission": 4}),
+	}
+	s := &firstDeploymentListBarrierStore{fakeStore: base, listed: make(chan struct{}), release: make(chan struct{})}
+	remote := &fakeRemote{}
+	recorder := &targetStateRecorder{}
+	done := make(chan error, 1)
+	go func() {
+		done <- NewService(s, remote).RestartRuntime(context.Background(), RuntimeRestartRequest{
+			Instance: instance, Server: base.servers["srv-1"], Language: "en", Actor: "operator", TaskID: "task-restart-offline-race",
+		}, recorder, nil)
+	}()
+	<-s.listed
+	base.mu.Lock()
+	before := base.deployments[0]
+	var manifest runtimeagent.DeploymentManifest
+	if err := json.Unmarshal([]byte(before.SpecJSON), &manifest); err != nil {
+		base.mu.Unlock()
+		t.Fatal(err)
+	}
+	manifest.Spec.Replicas = 0
+	raw, err := json.Marshal(manifest)
+	if err != nil {
+		base.mu.Unlock()
+		t.Fatal(err)
+	}
+	base.deployments[0].DesiredReplicas = 0
+	base.deployments[0].SpecJSON = string(raw)
+	offline := base.deployments[0]
+	base.mu.Unlock()
+	close(s.release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	base.mu.Lock()
+	after := base.deployments[0]
+	base.mu.Unlock()
+	if after.Generation != offline.Generation || after.SpecJSON != offline.SpecJSON {
+		t.Fatalf("offline race advanced desired intent: offline=%+v after=%+v", offline, after)
+	}
+	if remote.deploymentApplyCounts["permission"] != 0 {
+		t.Fatalf("offline target applied %d times", remote.deploymentApplyCounts["permission"])
+	}
+	statuses, _, steps := recorder.snapshot()
+	if statuses[instance.ID+":permission"] != "skipped" || steps[instance.ID+":permission:accept-service-intent"] != "skipped" {
+		t.Fatalf("offline target terminal states=%v steps=%v", statuses, steps)
+	}
+}
+
+func TestRunServiceFanOutRecoversTargetPanicAndContinuesPeers(t *testing.T) {
+	recorder := &targetStateRecorder{}
+	attempted := map[string]bool{}
+	var attemptedMu sync.Mutex
+	failures := runServiceFanOut(context.Background(), "aifar-1", []string{"permission", "file"}, 2, "en", recorder, nil, recorder,
+		func(_ context.Context, serviceName string, _ Logger) error {
+			if serviceName == "permission" {
+				panic("secret panic payload")
+			}
+			attemptedMu.Lock()
+			attempted[serviceName] = true
+			attemptedMu.Unlock()
+			return nil
+		})
+	if len(failures) != 1 || failures[0].service != "permission" {
+		t.Fatalf("failures=%+v, want one permission failure", failures)
+	}
+	if strings.Contains(failures[0].err.Error(), "secret") || strings.Contains(failures[0].err.Error(), "payload") {
+		t.Fatalf("panic value leaked: %v", failures[0].err)
+	}
+	attemptedMu.Lock()
+	fileAttempted := attempted["file"]
+	attemptedMu.Unlock()
+	if !fileAttempted {
+		t.Fatal("free peer was not attempted after panic")
+	}
+	statuses, errTexts, steps := recorder.snapshot()
+	if statuses["aifar-1:permission"] != "failed" || statuses["aifar-1:file"] != "success" {
+		t.Fatalf("target statuses=%v", statuses)
+	}
+	if strings.Contains(errTexts["aifar-1:permission"], "secret") || steps["aifar-1:permission:accept-service-intent"] != "failed" {
+		t.Fatalf("panic target error/step=%q %v", errTexts["aifar-1:permission"], steps)
+	}
+}
+
 func TestManualReconcileQueuesOnlySelectedServiceWithoutGenerationChange(t *testing.T) {
 	instance := installedAIFARInstance(t)
 	deployments := seedPerServiceDeployments(t, instance,
@@ -3680,6 +4175,151 @@ func TestArtifactUpdateMutatesOnlyTargetServiceGeneration(t *testing.T) {
 	}
 }
 
+func TestArtifactUpdateLockRenewalFailureCancelsPrepareAndSkipsMetadataCAS(t *testing.T) {
+	artifactPath := filepath.Join(t.TempDir(), "permission.jar")
+	if err := os.WriteFile(artifactPath, []byte("new permission jar"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	db, err := store.Open(filepath.Join(t.TempDir(), "aifar.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	instance := installedAIFARInstance(t)
+	instance, err = db.SaveAppInstance(instance)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, deployment := range seedPerServiceDeployments(t, instance, map[string]int{"permission": 1}, nil) {
+		if _, err := db.SaveAIFARDeployment(deployment); err != nil {
+			t.Fatal(err)
+		}
+	}
+	renewals := &renewalFailureStore{Store: db, renewed: make(chan struct{}), armed: make(chan struct{})}
+	remote := &heartbeatBlockingRemote{
+		fakeRemote:    &fakeRemote{},
+		blockContains: "update-aifar-artifact.sh",
+		armed:         renewals.armed,
+		reached:       make(chan struct{}),
+	}
+	service := NewService(renewals, remote)
+	service.orchestrationLockHeartbeatInterval = 5 * time.Millisecond
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- service.UpdateArtifact(ctx, ArtifactUpdateRequest{
+			Instance: instance, Server: store.Server{ID: "srv-1", Host: "10.0.0.10", DeployDir: "/aifar/apps"},
+			Language: "en", Actor: "operator", TaskID: "task-update-renewal-loss",
+			ServiceName: "permission", ArtifactLocalPath: artifactPath, ArtifactFileName: "permission.jar",
+		}, fakeLogger{}, nil)
+	}()
+	requireHeartbeatRenewalCancellation(t, renewals.renewed, remote.reached, done, cancel)
+	if calls := renewals.appInstanceCASCalls(); calls != 0 {
+		t.Fatalf("app-instance CAS calls=%d after artifact lock loss, want 0", calls)
+	}
+	active, err := db.ListAIFAROrchestrationLocks(instance.ID, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(active) != 0 {
+		t.Fatalf("lost artifact-update lock remained active: %+v", active)
+	}
+}
+
+func TestConcurrentDifferentServiceArtifactUpdatesPreserveMetadataAndLifecycleStatus(t *testing.T) {
+	dir := t.TempDir()
+	permissionArtifact := filepath.Join(dir, "permission.jar")
+	fileArtifact := filepath.Join(dir, "file.jar")
+	if err := os.WriteFile(permissionArtifact, []byte("new permission jar"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(fileArtifact, []byte("new file jar"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	db, err := store.Open(filepath.Join(t.TempDir(), "aifar.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	instance := installedAIFARInstance(t)
+	instance.Status = "install_failed"
+	instance, err = db.SaveAppInstance(instance)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, deployment := range seedPerServiceDeployments(t, instance,
+		map[string]int{"permission": 1, "file": 1},
+		map[string]int64{"permission": 3, "file": 7},
+	) {
+		if _, err := db.SaveAIFARDeployment(deployment); err != nil {
+			t.Fatal(err)
+		}
+	}
+	barrier := &barrierCASStore{Store: db, remaining: 2, ready: make(chan struct{}), release: make(chan struct{})}
+	server := store.Server{ID: "srv-1", Host: "10.0.0.10", DeployDir: "/aifar/apps"}
+	service := NewService(barrier, &fakeRemote{})
+	errs := make(chan error, 2)
+	for _, request := range []ArtifactUpdateRequest{
+		{Instance: instance, Server: server, Language: "en", Actor: "operator-permission", TaskID: "task-update-permission", ServiceName: "permission", ArtifactLocalPath: permissionArtifact, ArtifactFileName: "permission.jar"},
+		{Instance: instance, Server: server, Language: "en", Actor: "operator-file", TaskID: "task-update-file", ServiceName: "file", ArtifactLocalPath: fileArtifact, ArtifactFileName: "file.jar"},
+	} {
+		request := request
+		go func() {
+			errs <- service.UpdateArtifact(context.Background(), request, fakeLogger{}, nil)
+		}()
+	}
+	<-barrier.ready
+	close(barrier.release)
+	for range 2 {
+		if err := <-errs; err != nil {
+			t.Fatal(err)
+		}
+	}
+	saved, err := db.GetAppInstance(instance.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if saved.Status != "install_failed" {
+		t.Fatalf("runtime update changed lifecycle status to %q", saved.Status)
+	}
+	metadata := metadataFromInstance(saved)
+	revisions := serviceRevisionsFromMetadata(metadata)
+	for _, serviceName := range []string{"permission", "file"} {
+		if revisions[serviceName] == "" || revisions[serviceName] == "release-"+serviceName {
+			t.Fatalf("service revisions=%v, missing accepted %s update", revisions, serviceName)
+		}
+	}
+	configHashes := mapFromMetadataValue(metadata["serviceConfigHashes"])
+	rollouts := mapFromMetadataValue(metadata["serviceRollouts"])
+	for _, serviceName := range []string{"permission", "file"} {
+		if strings.TrimSpace(fmt.Sprint(configHashes[serviceName])) == "" {
+			t.Fatalf("service config hashes=%v, missing %s", configHashes, serviceName)
+		}
+		rollout, ok := rollouts[serviceName].(map[string]any)
+		if !ok || rollout["service"] != serviceName || strings.TrimSpace(fmt.Sprint(rollout["releaseId"])) == "" {
+			t.Fatalf("service rollouts=%v, missing %s audit", rollouts, serviceName)
+		}
+	}
+	permissionSHA, _, err := fileSHA256(permissionArtifact)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fileSHA, _, err := fileSHA256(fileArtifact)
+	if err != nil {
+		t.Fatal(err)
+	}
+	permissionThenFile := partialUpdateConfigHash(partialUpdateConfigHash("base-config-hash", "permission", "permission.jar", permissionSHA), "file", "file.jar", fileSHA)
+	fileThenPermission := partialUpdateConfigHash(partialUpdateConfigHash("base-config-hash", "file", "file.jar", fileSHA), "permission", "permission.jar", permissionSHA)
+	globalConfigHash := stringFromMetadata(metadata, "configHash", "")
+	if globalConfigHash != permissionThenFile && globalConfigHash != fileThenPermission {
+		t.Fatalf("global configHash=%s, want both concurrent contributions", globalConfigHash)
+	}
+	if calls := barrier.callCount(); calls != 3 {
+		t.Fatalf("CAS calls=%d, want two initial attempts plus one conflict retry", calls)
+	}
+}
+
 func TestServiceUpdatesAIFARServiceArtifactAsPartialRelease(t *testing.T) {
 	artifactDir := t.TempDir()
 	artifactPath := filepath.Join(artifactDir, "oauth.jar")
@@ -3820,6 +4460,58 @@ func TestArtifactBundleFanOutAggregatesFailureWithoutRollingBackAcceptedPeer(t *
 	}
 }
 
+func TestArtifactBundleBusyPeerDoesNotPrepareOrMutateBusyService(t *testing.T) {
+	bundlePath := writeAlphaJarBundle(t, []bundleTestArtifact{
+		{Service: "permission", Module: "alpha-permission", FileName: "alpha-permission.jar", Content: "new permission jar"},
+		{Service: "file", Module: "alpha-file", FileName: "alpha-file.jar", Content: "new file jar"},
+	})
+	instance := installedAIFARInstance(t)
+	metadata := metadataFromInstance(instance)
+	metadata["orchestrationLocks"] = map[string]any{
+		"permission": map[string]any{
+			"operation": "update-artifact",
+			"service":   "permission",
+			"actor":     "another-operator",
+			"taskId":    "task-busy-permission",
+			"startedAt": time.Now().UTC().Format(time.RFC3339),
+		},
+	}
+	instance.Metadata = mustMetadata(t, metadata)
+	deployments := seedPerServiceDeployments(t, instance,
+		map[string]int{"permission": 1, "file": 1},
+		map[string]int64{"permission": 3, "file": 7},
+	)
+	s := &fakeStore{
+		servers:     map[string]store.Server{"srv-1": {ID: "srv-1", Host: "10.0.0.10", DeployDir: "/aifar/apps"}},
+		instances:   []store.AppInstance{instance},
+		deployments: deployments,
+	}
+	before := deploymentsByService(deployments)
+	remote := &fakeRemote{}
+
+	err := NewService(s, remote).UpdateArtifactBundle(context.Background(), ArtifactBundleUpdateRequest{
+		Instance: instance, Server: s.servers["srv-1"], Actor: "operator", TaskID: "task-bundle-independent",
+		BundleLocalPath: bundlePath, BundleFileName: filepath.Base(bundlePath), Concurrency: 2,
+	}, fakeLogger{}, nil)
+	if err == nil {
+		t.Fatal("expected the busy permission target to fail")
+	}
+	after := deploymentsByService(s.deployments)
+	if got := after["permission"]; got.Generation != before["permission"].Generation || got.SpecJSON != before["permission"].SpecJSON {
+		t.Fatalf("busy permission deployment changed: before=%+v after=%+v", before["permission"], got)
+	}
+	if got := after["file"]; got.Generation != before["file"].Generation+1 || got.Status != "Accepted" {
+		t.Fatalf("free file peer was not accepted independently: %+v", got)
+	}
+	commands := remote.joinedCommands()
+	if strings.Contains(commands, "update-aifar-artifact-bundle-permission.sh") {
+		t.Fatalf("busy permission artifact was prepared before its lock was acquired: %s", commands)
+	}
+	if !strings.Contains(commands, "update-aifar-artifact-bundle-file.sh") {
+		t.Fatalf("free file artifact was not prepared under its own lock: %s", commands)
+	}
+}
+
 func TestServiceUpdatesAIFARArtifactBundleAsSingleMultiServicePartialRelease(t *testing.T) {
 	bundlePath := writeAlphaJarBundle(t, []bundleTestArtifact{
 		{Service: "oauth", Module: "alpha-oauth", FileName: "alpha-oauth.jar", Content: "new oauth jar"},
@@ -3850,8 +4542,8 @@ func TestServiceUpdatesAIFARArtifactBundleAsSingleMultiServicePartialRelease(t *
 	if !strings.Contains(uploads, "alpha-oauth.jar") || !strings.Contains(uploads, "alpha-gateway.jar") {
 		t.Fatalf("expected both service jars to be uploaded, uploads=%s", uploads)
 	}
-	if count := strings.Count(remote.joinedCommands(), "update-aifar-artifact-bundle.sh"); count != 1 {
-		t.Fatalf("expected one bundle update script run, commands=%s", remote.joinedCommands())
+	if count := strings.Count(remote.joinedCommands(), "update-aifar-artifact-bundle-"); count != 2 {
+		t.Fatalf("expected one locked preparation per changed service, commands=%s", remote.joinedCommands())
 	}
 	for _, want := range []string{
 		`prepare_artifact 'oauth'`,
@@ -3897,9 +4589,10 @@ func TestServiceMarksFailedAIFARArtifactBundleRelease(t *testing.T) {
 		servers: map[string]store.Server{
 			"srv-1": {ID: "srv-1", Name: "app-1", Host: "10.0.0.10", DeployDir: "/aifar/apps"},
 		},
-		instances: []store.AppInstance{instance},
+		instances:   []store.AppInstance{instance},
+		deployments: seedPerServiceDeployments(t, instance, map[string]int{"oauth": 1, "gateway": 1}, nil),
 	}
-	service := NewService(s, &fakeRemote{failCommandContains: "update-aifar-artifact-bundle.sh"})
+	service := NewService(s, &fakeRemote{failCommandContains: "update-aifar-artifact-bundle-"})
 	err := service.UpdateArtifactBundle(context.Background(), ArtifactBundleUpdateRequest{
 		Instance:        instance,
 		Server:          s.servers["srv-1"],
@@ -3967,6 +4660,70 @@ func TestRollbackMutatesOnlySelectedServiceToNewerGeneration(t *testing.T) {
 		if strings.Contains(remote.rollbackScript, forbidden) {
 			t.Fatalf("rollback preparation script contains aggregate rollback action %q:\n%s", forbidden, remote.rollbackScript)
 		}
+	}
+}
+
+func TestRollbackBusyPeerDoesNotPrepareOrMutateBusyService(t *testing.T) {
+	instance := installedAIFARInstance(t)
+	metadata := metadataFromInstance(instance)
+	metadata["orchestrationLocks"] = map[string]any{
+		"permission": map[string]any{
+			"operation": "update-artifact",
+			"service":   "permission",
+			"actor":     "another-operator",
+			"taskId":    "task-busy-permission",
+			"startedAt": time.Now().UTC().Format(time.RFC3339),
+		},
+	}
+	instance.Metadata = mustMetadata(t, metadata)
+	deployments := seedPerServiceDeployments(t, instance,
+		map[string]int{"permission": 1, "file": 1},
+		map[string]int64{"permission": 3, "file": 7},
+	)
+	const targetReleaseID = "20260702T010203.000000000Z-rollout-runtime"
+	manifest, err := json.Marshal(map[string]any{
+		"schema": releaseManifestSchemaV2, "kind": "rollout-bundle", "releaseId": targetReleaseID,
+		"changedServices": []string{"permission", "file"},
+		"artifacts": map[string]any{
+			"permission": map[string]any{"file": "permission.jar", "sha256": strings.Repeat("a", 64), "remotePath": "/aifar/releases/permission.jar"},
+			"file":       map[string]any{"file": "file.jar", "sha256": strings.Repeat("b", 64), "remotePath": "/aifar/releases/file.jar"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &fakeStore{
+		servers:     map[string]store.Server{"srv-1": {ID: "srv-1", Host: "10.0.0.10", DeployDir: "/aifar/apps"}},
+		instances:   []store.AppInstance{instance},
+		deployments: deployments,
+		releases: []store.AppRelease{{
+			InstanceID: instance.ID, App: AppName, Version: appBundleVersion, ReleaseID: targetReleaseID,
+			ServerID: "srv-1", Status: "success", ManifestJSON: string(manifest), CreatedAt: time.Now().Add(-time.Hour),
+		}},
+	}
+	before := deploymentsByService(deployments)
+	remote := &fakeRemote{}
+
+	err = NewService(s, remote).RollbackArtifact(context.Background(), ArtifactRollbackRequest{
+		Instance: instance, Server: s.servers["srv-1"], Actor: "operator", TaskID: "task-rollback-independent",
+		TargetReleaseID: targetReleaseID, Services: []string{"permission", "file"}, Reason: "repair runtime services",
+	}, fakeLogger{}, nil)
+	if err == nil {
+		t.Fatal("expected the busy permission target to fail")
+	}
+	after := deploymentsByService(s.deployments)
+	if got := after["permission"]; got.Generation != before["permission"].Generation || got.SpecJSON != before["permission"].SpecJSON {
+		t.Fatalf("busy permission deployment changed: before=%+v after=%+v", before["permission"], got)
+	}
+	if got := after["file"]; got.Generation != before["file"].Generation+1 || got.Status != "Accepted" {
+		t.Fatalf("free file peer was not accepted independently: %+v", got)
+	}
+	commands := remote.joinedCommands()
+	if strings.Contains(commands, "rollback-permission.sh") {
+		t.Fatalf("busy permission rollback was prepared before its lock was acquired: %s", commands)
+	}
+	if !strings.Contains(commands, "rollback-file.sh") {
+		t.Fatalf("free file rollback was not prepared under its own lock: %s", commands)
 	}
 }
 
@@ -4363,7 +5120,8 @@ func TestServiceMarksFailedAIFARArtifactRollbackRelease(t *testing.T) {
 		servers: map[string]store.Server{
 			"srv-1": {ID: "srv-1", Name: "app-1", Host: "10.0.0.10", DeployDir: "/aifar/apps"},
 		},
-		instances: []store.AppInstance{instance},
+		instances:   []store.AppInstance{instance},
+		deployments: seedPerServiceDeployments(t, instance, map[string]int{"oauth": 1}, nil),
 		releases: []store.AppRelease{{
 			InstanceID: instance.ID, App: AppName, Version: appBundleVersion,
 			ReleaseID: targetReleaseID, ServerID: "srv-1", Status: "success",

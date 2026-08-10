@@ -3,13 +3,16 @@ package store
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
 )
 
+var ErrAppInstanceConflict = errors.New("app instance changed concurrently")
+
 func (s *Store) SaveAppInstance(v AppInstance) (AppInstance, error) {
-	now := time.Now()
+	now := time.Now().UTC()
 	if v.ID == "" {
 		v.ID = NewID("app")
 		v.CreatedAt = now
@@ -19,6 +22,39 @@ func (s *Store) SaveAppInstance(v AppInstance) (AppInstance, error) {
 		on conflict(id) do update set version=excluded.version,server_id=excluded.server_id,status=excluded.status,topology=excluded.topology,metadata=excluded.metadata,updated_at=excluded.updated_at`,
 		v.ID, v.App, v.Version, v.ServerID, v.Status, v.Topology, v.Metadata, v.CreatedAt, v.UpdatedAt)
 	return v, err
+}
+
+func (s *Store) SaveAppInstanceIfUnchanged(next AppInstance, expectedUpdatedAt time.Time) (AppInstance, error) {
+	freshUpdatedAt := time.Now().UTC()
+	if freshUpdatedAt.Sub(expectedUpdatedAt) < time.Millisecond {
+		freshUpdatedAt = expectedUpdatedAt.Add(time.Millisecond)
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return AppInstance{}, err
+	}
+	defer tx.Rollback()
+	result, err := tx.Exec(`update app_instances set version=?,server_id=?,status=?,topology=?,metadata=?,updated_at=? where id=? and updated_at=?`,
+		next.Version, next.ServerID, next.Status, next.Topology, next.Metadata, freshUpdatedAt, next.ID, expectedUpdatedAt)
+	if err != nil {
+		return AppInstance{}, err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return AppInstance{}, err
+	}
+	if rows == 0 {
+		return AppInstance{}, ErrAppInstanceConflict
+	}
+	var saved AppInstance
+	if err := tx.QueryRow(`select id,app,version,server_id,status,topology,metadata,created_at,updated_at from app_instances where id=?`, next.ID).
+		Scan(&saved.ID, &saved.App, &saved.Version, &saved.ServerID, &saved.Status, &saved.Topology, &saved.Metadata, &saved.CreatedAt, &saved.UpdatedAt); err != nil {
+		return AppInstance{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return AppInstance{}, err
+	}
+	return saved, nil
 }
 
 func (s *Store) ListAppInstances() ([]AppInstance, error) {

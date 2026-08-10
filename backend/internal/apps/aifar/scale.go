@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"aifar-deployment/backend/internal/runtimeagent"
+	"aifar-deployment/backend/internal/store"
 )
 
 const runtimeControlPlaneRepairCode = "AIFAR_RUNTIME_CONTROL_PLANE_REPAIR_REQUIRED"
@@ -28,45 +29,44 @@ func (s Service) ScaleServices(ctx context.Context, req ScaleServicesRequest, lo
 	if err != nil {
 		return err
 	}
-	current, locks, err := s.acquireServiceOrchestrationLocks(req.Instance.ID, "scale-service", services, req.Actor, fallbackTaskID(req.TaskID, log))
-	if err != nil {
-		return err
-	}
-	defer s.releaseOrchestrationLocks(locks)
-	metadata := metadataFromInstance(current)
+	metadata := metadataFromInstance(req.Instance)
 	if err := ensureK8sLikeMetadata(metadata, UpdateCopy{LegacyUpdateUnsupported: "legacy AIFAR orchestration model %s does not support service scale; reinstall with k8s-like orchestration first"}); err != nil {
 		return err
 	}
-	installed := servicesFromMetadata(metadata)
 	plans := make([]deploymentMutationPlan, 0, len(services))
 	for _, serviceName := range services {
-		if !serviceInList(serviceName, installed) {
-			return fmt.Errorf("AIFAR service %s is not installed", serviceName)
-		}
 		replicas := desiredTargets[serviceName]
 		plans = append(plans, deploymentMutationPlan{
 			ServiceName: serviceName,
 			Operation:   "scale",
+			Validate: func(instance store.AppInstance, _ store.AIFARDeployment) error {
+				freshMetadata := metadataFromInstance(instance)
+				if err := ensureK8sLikeMetadata(freshMetadata, UpdateCopy{LegacyUpdateUnsupported: "legacy AIFAR orchestration model %s does not support service scale; reinstall with k8s-like orchestration first"}); err != nil {
+					return err
+				}
+				if !serviceInList(serviceName, servicesFromMetadata(freshMetadata)) {
+					return fmt.Errorf("AIFAR service %s is not installed", serviceName)
+				}
+				return nil
+			},
 			Mutate: func(manifest *runtimeagent.DeploymentManifest) error {
 				manifest.Spec.Replicas = replicas
 				return nil
 			},
 		})
 	}
-	accepted, mutationErr := s.mutateDeploymentsFanOut(ctx, current, req.Server, req.Actor, fallbackTaskID(req.TaskID, log), req.Language, defaultRuntimeMutationConcurrency, plans, log, targetLog)
+	accepted, mutationErr := s.mutateDeploymentsFanOut(ctx, req.Instance, req.Server, req.Actor, fallbackTaskID(req.TaskID, log), req.Language, defaultRuntimeMutationConcurrency, plans, log, targetLog)
 	if len(accepted) > 0 {
-		saved, saveErr := s.store.GetAppInstance(current.ID)
-		if saveErr == nil {
-			nextMetadata := metadataFromInstance(saved)
+		_, saveErr := s.updateAppInstanceMetadata(req.Instance.ID, "AIFAR_RUNTIME_CONTROL_METADATA_WRITE_FAILED", func(nextMetadata map[string]any) error {
 			desired := desiredReplicasFromMetadata(nextMetadata)
 			for serviceName := range accepted {
 				desired[serviceName] = desiredTargets[serviceName]
 			}
 			nextMetadata["desiredReplicas"] = desired
-			saveErr = saveMetadata(s.store, saved, nextMetadata)
-		}
+			return nil
+		})
 		if saveErr != nil {
-			return repairRequired("AIFAR_RUNTIME_CONTROL_METADATA_WRITE_FAILED", saveErr)
+			return saveErr
 		}
 	}
 	return mutationErr

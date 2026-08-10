@@ -7,6 +7,7 @@ import (
 
 	"aifar-deployment/backend/internal/i18n"
 	"aifar-deployment/backend/internal/runtimeagent"
+	"aifar-deployment/backend/internal/store"
 )
 
 func (s Service) RestartRuntime(ctx context.Context, req RuntimeRestartRequest, log Logger, targetLog targetLogger) error {
@@ -28,24 +29,23 @@ func (s Service) RestartRuntime(ctx context.Context, req RuntimeRestartRequest, 
 	if len(services) == 0 {
 		return errors.New(i18n.Text(req.Language, "aifar.runtimeMutation.noTargets"))
 	}
-	current, locks, err := s.acquireServiceOrchestrationLocks(req.Instance.ID, "runtime-restart-all", services, req.Actor, fallbackTaskID(req.TaskID, log))
-	if err != nil {
-		return err
-	}
-	defer s.releaseOrchestrationLocks(locks)
-	req.Instance = current
-
 	plans := make([]deploymentMutationPlan, 0, len(services))
 	for _, serviceName := range services {
 		plans = append(plans, deploymentMutationPlan{
 			ServiceName: serviceName,
 			Operation:   "restart",
+			Validate: func(_ store.AppInstance, deployment store.AIFARDeployment) error {
+				if deployment.DesiredReplicas == 0 {
+					return serviceActionSkippedError{message: i18n.Text(req.Language, "aifar.runtimeMutation.skippedOffline")}
+				}
+				return nil
+			},
 			Mutate: func(manifest *runtimeagent.DeploymentManifest) error {
 				manifest.Spec.RestartGeneration++
 				return nil
 			},
 		})
 	}
-	_, err = s.mutateDeploymentsFanOut(ctx, current, req.Server, req.Actor, fallbackTaskID(req.TaskID, log), req.Language, defaultRuntimeMutationConcurrency, plans, log, targetLog)
+	_, err = s.mutateDeploymentsFanOut(ctx, req.Instance, req.Server, req.Actor, fallbackTaskID(req.TaskID, log), req.Language, defaultRuntimeMutationConcurrency, plans, log, targetLog)
 	return err
 }

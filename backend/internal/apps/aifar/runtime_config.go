@@ -276,6 +276,9 @@ func (s Service) ApplyRuntimeConfig(ctx context.Context, req RuntimeConfigReques
 		return err
 	}
 	defer s.releaseOrchestrationLock(lock)
+	lockedCtx, stopHeartbeat := s.startAIFAROrchestrationLockHeartbeat(ctx, lock)
+	defer stopHeartbeat()
+	ctx = lockedCtx
 
 	var metadata map[string]any
 	var previous RuntimeConfigState
@@ -285,23 +288,29 @@ func (s Service) ApplyRuntimeConfig(ctx context.Context, req RuntimeConfigReques
 	now := time.Now().UTC()
 
 	if err := step(1, func() error {
-		metadata = metadataFromInstance(current)
-		if err := ensureK8sLikeMetadata(metadata, UpdateCopy{LegacyUpdateUnsupported: "legacy AIFAR orchestration model %s does not support runtime config; reinstall with k8s-like orchestration first"}); err != nil {
-			return err
+		saved, saveErr := s.updateAppInstanceMetadata(current.ID, "AIFAR_RUNTIME_CONFIG_METADATA_REPAIR_REQUIRED", func(freshMetadata map[string]any) error {
+			if err := ensureK8sLikeMetadata(freshMetadata, UpdateCopy{LegacyUpdateUnsupported: "legacy AIFAR orchestration model %s does not support runtime config; reinstall with k8s-like orchestration first"}); err != nil {
+				return err
+			}
+			previous = runtimeConfigFromMetadata(freshMetadata)
+			var normalizeErr error
+			next, normalizeErr = normalizeRuntimeConfigPayload(req.Config, previous)
+			if normalizeErr != nil {
+				return normalizeErr
+			}
+			next.ConfigVersion = previous.ConfigVersion + 1
+			next.UpdatedAt = now.Format(time.RFC3339)
+			next.UpdatedBy = strings.TrimSpace(req.Actor)
+			next.LastApplyStatus = runtimeConfigStatusPending
+			next.LastApplyError = ""
+			freshMetadata["runtimeConfig"] = next
+			metadata = freshMetadata
+			return nil
+		})
+		if saveErr == nil {
+			current = saved
 		}
-		previous = runtimeConfigFromMetadata(metadata)
-		var normalizeErr error
-		next, normalizeErr = normalizeRuntimeConfigPayload(req.Config, previous)
-		if normalizeErr != nil {
-			return normalizeErr
-		}
-		next.ConfigVersion = previous.ConfigVersion + 1
-		next.UpdatedAt = now.Format(time.RFC3339)
-		next.UpdatedBy = strings.TrimSpace(req.Actor)
-		next.LastApplyStatus = runtimeConfigStatusPending
-		next.LastApplyError = ""
-		metadata["runtimeConfig"] = next
-		return saveMetadata(s.store, current, metadata)
+		return saveErr
 	}); err != nil {
 		finishTarget(recorder, target, "failed", err.Error())
 		return err
@@ -317,7 +326,9 @@ func (s Service) ApplyRuntimeConfig(ctx context.Context, req RuntimeConfigReques
 		script, renderErr = renderRuntimeConfigScript(data)
 		return renderErr
 	}); err != nil {
-		_ = s.markRuntimeConfigApplyFailed(current.ID, next, err)
+		if ctx.Err() == nil {
+			_ = s.markRuntimeConfigApplyFailed(current.ID, next, err)
+		}
 		finishTarget(recorder, target, "failed", err.Error())
 		return err
 	}
@@ -334,8 +345,9 @@ func (s Service) ApplyRuntimeConfig(ctx context.Context, req RuntimeConfigReques
 			}
 			values := effectiveRuntimeConfigForService(next, serviceName)
 			plans = append(plans, deploymentMutationPlan{
-				ServiceName: serviceName,
-				Operation:   "runtime-config",
+				ServiceName:     serviceName,
+				Operation:       "runtime-config",
+				LockAlreadyHeld: true,
 				Mutate: func(manifest *runtimeagent.DeploymentManifest) error {
 					manifest.Spec.Resources.CPUs = values.AppCPUs
 					manifest.Spec.Resources.Memory = values.AppMemoryLimit
@@ -347,25 +359,28 @@ func (s Service) ApplyRuntimeConfig(ctx context.Context, req RuntimeConfigReques
 		_, mutationErr := s.mutateDeploymentsFanOut(ctx, current, req.Server, req.Actor, fallbackTaskID(req.TaskID, log), req.Language, defaultRuntimeMutationConcurrency, plans, log, targetLog)
 		return mutationErr
 	}); err != nil {
-		_ = s.markRuntimeConfigApplyFailed(current.ID, next, err)
+		if ctx.Err() == nil {
+			_ = s.markRuntimeConfigApplyFailed(current.ID, next, err)
+		}
 		finishTarget(recorder, target, "failed", err.Error())
 		return err
 	}
 
 	if err := step(4, func() error {
-		saved, err := s.store.GetAppInstance(current.ID)
-		if err != nil {
-			return err
+		if err := ctx.Err(); err != nil {
+			return repairRequired("AIFAR_RUNTIME_CONFIG_METADATA_REPAIR_REQUIRED", err)
 		}
-		metadata = metadataFromInstance(saved)
-		state := runtimeConfigFromMetadata(metadata)
-		state.AppliedVersion = next.ConfigVersion
-		state.LastAppliedAt = time.Now().UTC().Format(time.RFC3339)
-		state.LastApplyStatus = runtimeConfigStatusApplied
-		state.LastApplyError = ""
-		metadata["runtimeConfig"] = state
-		delete(metadata, "orchestrationLock")
-		return saveMetadata(s.store, saved, metadata)
+		_, saveErr := s.updateAppInstanceMetadata(current.ID, "AIFAR_RUNTIME_CONFIG_METADATA_REPAIR_REQUIRED", func(freshMetadata map[string]any) error {
+			state := runtimeConfigFromMetadata(freshMetadata)
+			state.AppliedVersion = next.ConfigVersion
+			state.LastAppliedAt = time.Now().UTC().Format(time.RFC3339)
+			state.LastApplyStatus = runtimeConfigStatusApplied
+			state.LastApplyError = ""
+			freshMetadata["runtimeConfig"] = state
+			delete(freshMetadata, "orchestrationLock")
+			return nil
+		})
+		return saveErr
 	}); err != nil {
 		finishTarget(recorder, target, "failed", err.Error())
 		return err
@@ -376,16 +391,14 @@ func (s Service) ApplyRuntimeConfig(ctx context.Context, req RuntimeConfigReques
 }
 
 func (s Service) markRuntimeConfigApplyFailed(instanceID string, state RuntimeConfigState, applyErr error) error {
-	instance, err := s.store.GetAppInstance(instanceID)
-	if err != nil {
-		return err
-	}
-	metadata := metadataFromInstance(instance)
-	state.LastApplyStatus = runtimeConfigStatusFailed
-	state.LastApplyError = applyErr.Error()
-	metadata["runtimeConfig"] = state
-	delete(metadata, "orchestrationLock")
-	return saveMetadata(s.store, instance, metadata)
+	_, err := s.updateAppInstanceMetadata(instanceID, "AIFAR_RUNTIME_CONFIG_METADATA_REPAIR_REQUIRED", func(metadata map[string]any) error {
+		state.LastApplyStatus = runtimeConfigStatusFailed
+		state.LastApplyError = applyErr.Error()
+		metadata["runtimeConfig"] = state
+		delete(metadata, "orchestrationLock")
+		return nil
+	})
+	return err
 }
 
 func runtimeConfigScriptDataFromState(installRoot string, previous, next RuntimeConfigState, services []string) runtimeConfigScriptData {

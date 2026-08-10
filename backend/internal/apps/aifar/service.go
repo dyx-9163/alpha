@@ -45,6 +45,43 @@ type Store interface {
 	DeleteAppInstance(id string) error
 }
 
+type appInstanceCASStore interface {
+	SaveAppInstanceIfUnchanged(next store.AppInstance, expectedUpdatedAt time.Time) (store.AppInstance, error)
+}
+
+const appInstanceMetadataCASAttempts = 8
+
+func (s Service) updateAppInstanceMetadata(instanceID, repairReason string, mutate func(map[string]any) error) (store.AppInstance, error) {
+	casStore, ok := s.store.(appInstanceCASStore)
+	if !ok {
+		return store.AppInstance{}, repairRequired(repairReason, errors.New("app instance compare-and-swap store is unavailable"))
+	}
+	for attempt := 0; attempt < appInstanceMetadataCASAttempts; attempt++ {
+		current, err := s.store.GetAppInstance(instanceID)
+		if err != nil {
+			return store.AppInstance{}, repairRequired(repairReason, err)
+		}
+		metadata := metadataFromInstance(current)
+		if err := mutate(metadata); err != nil {
+			return current, err
+		}
+		raw, err := json.Marshal(metadata)
+		if err != nil {
+			return current, repairRequired(repairReason, err)
+		}
+		next := current
+		next.Metadata = string(raw)
+		saved, err := casStore.SaveAppInstanceIfUnchanged(next, current.UpdatedAt)
+		if err == nil {
+			return saved, nil
+		}
+		if !errors.Is(err, store.ErrAppInstanceConflict) {
+			return current, repairRequired(repairReason, err)
+		}
+	}
+	return store.AppInstance{}, repairRequired(repairReason, store.ErrAppInstanceConflict)
+}
+
 type resourceLister interface {
 	ListResources() ([]store.Resource, error)
 }
@@ -101,7 +138,11 @@ func (s Service) startAIFAROrchestrationLockHeartbeat(ctx context.Context, lock 
 	var stopOnce sync.Once
 	go func() {
 		defer close(done)
-		ticker := time.NewTicker(orchestrationLockTTL / 3)
+		interval := s.orchestrationLockHeartbeatInterval
+		if interval <= 0 {
+			interval = orchestrationLockTTL / 3
+		}
+		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		for {
 			select {
@@ -294,9 +335,10 @@ type CheckResult struct {
 }
 
 type Service struct {
-	store    Store
-	remote   Remote
-	archives RuntimeDiagnosticArchiveStorage
+	store                              Store
+	remote                             Remote
+	archives                           RuntimeDiagnosticArchiveStorage
+	orchestrationLockHeartbeatInterval time.Duration
 }
 
 type installStepDef struct {
@@ -1216,6 +1258,32 @@ func rolloutAcceptedIntentMetadata(current map[string]any, revision string, chan
 	return next
 }
 
+func mergeServiceScopedRolloutMetadata(metadata map[string]any, revision, configHash string, changedServices []string, audit map[string]any) map[string]any {
+	orchestration := rolloutAcceptedIntentMetadata(metadata, revision, changedServices)
+	for key, value := range orchestration {
+		metadata[key] = value
+	}
+	serviceConfigHashes := mapFromMetadataValue(metadata["serviceConfigHashes"])
+	if serviceConfigHashes == nil {
+		serviceConfigHashes = map[string]any{}
+	}
+	serviceRollouts := mapFromMetadataValue(metadata["serviceRollouts"])
+	if serviceRollouts == nil {
+		serviceRollouts = map[string]any{}
+	}
+	for _, serviceName := range changedServices {
+		serviceConfigHashes[serviceName] = configHash
+		serviceAudit := copyMetadata(audit)
+		serviceAudit["service"] = serviceName
+		serviceRollouts[serviceName] = serviceAudit
+	}
+	metadata["serviceConfigHashes"] = serviceConfigHashes
+	metadata["serviceRollouts"] = serviceRollouts
+	metadata["configHash"] = configHash
+	metadata["lastRollout"] = copyMetadata(audit)
+	return orchestration
+}
+
 func firstEndpointRevision(value any) string {
 	switch items := value.(type) {
 	case []map[string]any:
@@ -1505,6 +1573,9 @@ func (s Service) UpdateArtifact(ctx context.Context, req ArtifactUpdateRequest, 
 		return err
 	}
 	defer s.releaseOrchestrationLock(lock)
+	lockedCtx, stopHeartbeat := s.startAIFAROrchestrationLockHeartbeat(ctx, lock)
+	defer stopHeartbeat()
+	ctx = lockedCtx
 	req.Instance = lockedInstance
 
 	var artifact artifactInfo
@@ -1660,8 +1731,9 @@ func (s Service) UpdateArtifact(ctx context.Context, req ArtifactUpdateRequest, 
 
 	if err := step(4, func() error {
 		accepted, err := s.mutateDeploymentsFanOut(ctx, req.Instance, req.Server, req.Actor, fallbackTaskID(req.TaskID, log), req.Language, 1, []deploymentMutationPlan{{
-			ServiceName: artifact.ServiceName,
-			Operation:   "update-artifact",
+			ServiceName:     artifact.ServiceName,
+			Operation:       "update-artifact",
+			LockAlreadyHeld: true,
 			Mutate: func(manifest *runtimeagent.DeploymentManifest) error {
 				manifest.Spec.PodRevision = releaseID
 				manifest.Spec.Image = "aifar-" + artifact.ServiceName + ":" + releaseID
@@ -1674,13 +1746,10 @@ func (s Service) UpdateArtifact(ctx context.Context, req ArtifactUpdateRequest, 
 		if len(accepted) != 1 {
 			return repairRequired("AIFAR_ARTIFACT_ACCEPTANCE_INCOMPLETE", nil)
 		}
-		metadata["releaseVersion"] = version
-		metadata["configHash"] = configHash
-		orchestration := rolloutAcceptedIntentMetadata(metadata, releaseID, []string{artifact.ServiceName})
-		for key, value := range orchestration {
-			metadata[key] = value
+		if err := ctx.Err(); err != nil {
+			return repairRequired("AIFAR_ARTIFACT_METADATA_REPAIR_REQUIRED", err)
 		}
-		metadata["lastRollout"] = map[string]any{
+		audit := map[string]any{
 			"service":        artifact.ServiceName,
 			"artifactFile":   artifact.FileName,
 			"artifactSHA256": artifact.SHA256,
@@ -1689,14 +1758,15 @@ func (s Service) UpdateArtifact(ctx context.Context, req ArtifactUpdateRequest, 
 			"releaseId":      releaseID,
 			"updatedAt":      releaseTime.Format(time.RFC3339),
 		}
-		data, _ := json.Marshal(metadata)
-		next := req.Instance
-		next.Status = "installed"
-		next.Version = version
-		next.Metadata = string(data)
-		saved, err := s.store.SaveAppInstance(next)
+		var orchestration map[string]any
+		saved, err := s.updateAppInstanceMetadata(req.Instance.ID, "AIFAR_ARTIFACT_METADATA_REPAIR_REQUIRED", func(freshMetadata map[string]any) error {
+			freshMetadata["releaseVersion"] = version
+			configHash = partialUpdateConfigHash(stringFromMetadata(freshMetadata, "configHash", ""), artifact.ServiceName, artifact.FileName, artifact.SHA256)
+			orchestration = mergeServiceScopedRolloutMetadata(freshMetadata, releaseID, configHash, []string{artifact.ServiceName}, audit)
+			return nil
+		})
 		if err != nil {
-			return repairRequired("AIFAR_ARTIFACT_METADATA_REPAIR_REQUIRED", err)
+			return err
 		}
 		if releases, ok := s.store.(releaseStore); ok {
 			manifest, _ := json.Marshal(rolloutReleaseManifest(version, releaseID, releaseTime, configHash, baseReleaseID, ingressNetwork, gatewayPort, webPort, artifact, orchestration, installRoot, req.Actor, fallbackTaskID(req.TaskID, log), serviceRevisionsBefore))
