@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -18,11 +19,15 @@ import (
 )
 
 type deploymentControlTestStore struct {
-	mu          sync.Mutex
-	instance    store.AppInstance
-	server      store.Server
-	deployments map[string]store.AIFARDeployment
-	markErr     error
+	mu                sync.Mutex
+	instance          store.AppInstance
+	server            store.Server
+	deployments       map[string]store.AIFARDeployment
+	markErr           error
+	lockSaveErr       error
+	lockAcceptErr     error
+	lockSaveIDs       []string
+	lockAcceptanceIDs []string
 }
 
 func (s *deploymentControlTestStore) GetServer(id string, _ bool) (store.Server, error) {
@@ -70,6 +75,16 @@ func (s *deploymentControlTestStore) SaveAIFARDeploymentGeneration(next store.AI
 	s.deployments[next.ServiceName] = next
 	return next, nil
 }
+func (s *deploymentControlTestStore) SaveAIFARDeploymentGenerationWithLock(lockID string, next store.AIFARDeployment, expected int64) (store.AIFARDeployment, error) {
+	s.mu.Lock()
+	s.lockSaveIDs = append(s.lockSaveIDs, lockID)
+	err := s.lockSaveErr
+	s.mu.Unlock()
+	if err != nil {
+		return store.AIFARDeployment{}, err
+	}
+	return s.SaveAIFARDeploymentGeneration(next, expected)
+}
 func (s *deploymentControlTestStore) ObserveAIFARDeployment(instanceID, serviceName string, generation int64, status, conditionsJSON string, at time.Time) (store.AIFARDeployment, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -109,6 +124,17 @@ func (s *deploymentControlTestStore) AcceptAIFARDeployment(instanceID, serviceNa
 	current.Status, current.ConditionsJSON, current.LastTransitionAt = status, conditionsJSON, at
 	s.deployments[serviceName] = current
 	return current, nil
+}
+
+func (s *deploymentControlTestStore) AcceptAIFARDeploymentWithLock(lockID string, expected store.AIFARDeployment, status, conditionsJSON string, at time.Time) (store.AIFARDeployment, error) {
+	s.mu.Lock()
+	s.lockAcceptanceIDs = append(s.lockAcceptanceIDs, lockID)
+	err := s.lockAcceptErr
+	s.mu.Unlock()
+	if err != nil {
+		return store.AIFARDeployment{}, err
+	}
+	return s.AcceptAIFARDeployment(expected.InstanceID, expected.ServiceName, expected.Generation, status, conditionsJSON, at)
 }
 
 type deploymentControlTestRemote struct {
@@ -246,6 +272,49 @@ func TestMutateDeploymentAcceptsManifestBeforeReturning(t *testing.T) {
 	}
 	if !strings.Contains(strings.Join(remote.commands, "\n"), "task-123") {
 		t.Fatalf("safe task id is missing from controlled temporary path: %v", remote.commands)
+	}
+}
+
+func TestMutateDeploymentUsesExactLockForDesiredAndAcceptanceWrites(t *testing.T) {
+	remote := &deploymentControlTestRemote{}
+	service, db, req := newDeploymentControlTestService(t, remote)
+	req.LockID = "runtime-lock-1"
+	manifest := buildRuntimeManifestForTest(t, req, 2)
+	hash, err := runtimeagent.DeploymentManifestSpecHash(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	remote.acceptance = runtimeagent.DeploymentAcceptance{Accepted: true, Generation: 2, SpecHash: hash}
+	got, err := service.MutateDeployment(context.Background(), req, &deploymentControlTestLog{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != "Accepted" {
+		t.Fatalf("deployment=%+v", got)
+	}
+	if !reflect.DeepEqual(db.lockSaveIDs, []string{req.LockID}) || !reflect.DeepEqual(db.lockAcceptanceIDs, []string{req.LockID}) {
+		t.Fatalf("fenced lock calls: save=%v accept=%v", db.lockSaveIDs, db.lockAcceptanceIDs)
+	}
+}
+
+func TestMutateDeploymentLostLockAfterAgentAcceptanceRequiresRepair(t *testing.T) {
+	remote := &deploymentControlTestRemote{}
+	service, db, req := newDeploymentControlTestService(t, remote)
+	req.LockID = "stale-runtime-lock"
+	manifest := buildRuntimeManifestForTest(t, req, 2)
+	hash, err := runtimeagent.DeploymentManifestSpecHash(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	remote.acceptance = runtimeagent.DeploymentAcceptance{Accepted: true, Generation: 2, SpecHash: hash}
+	db.lockAcceptErr = store.ErrAIFAROrchestrationLockOwnership
+	got, err := service.MutateDeployment(context.Background(), req, &deploymentControlTestLog{})
+	assertStableDeploymentControlCode(t, err, runtimeControlPlaneRepairCode)
+	if got.Generation != 2 || got.Status != "pending_acceptance" {
+		t.Fatalf("lost owner canonical outcome=%+v, want forward-only pending generation", got)
+	}
+	if remote.applyCalls != 1 || !reflect.DeepEqual(db.lockSaveIDs, []string{req.LockID}) || !reflect.DeepEqual(db.lockAcceptanceIDs, []string{req.LockID}) {
+		t.Fatalf("apply=%d save locks=%v accept locks=%v", remote.applyCalls, db.lockSaveIDs, db.lockAcceptanceIDs)
 	}
 }
 

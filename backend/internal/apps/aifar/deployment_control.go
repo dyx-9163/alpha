@@ -44,6 +44,7 @@ type DeploymentMutationRequest struct {
 	Actor              string
 	TaskID             string
 	Operation          string
+	LockID             string
 	Mutate             func(*runtimeagent.DeploymentManifest) error
 }
 
@@ -157,8 +158,20 @@ func (s Service) MutateDeployment(ctx context.Context, req DeploymentMutationReq
 	next.Status = "pending_acceptance"
 	next.ConditionsJSON = pendingConditions
 	next.LastTransitionAt = time.Now().UTC()
-	saved, err := control.SaveAIFARDeploymentGeneration(next, req.ExpectedGeneration)
+	var saved store.AIFARDeployment
+	if strings.TrimSpace(req.LockID) != "" {
+		fenced, ok := s.store.(aifarDeploymentLockFencedStore)
+		if !ok {
+			return current, repairRequired("AIFAR_RUNTIME_ORCHESTRATION_LOCK_FENCE_UNAVAILABLE", nil)
+		}
+		saved, err = fenced.SaveAIFARDeploymentGenerationWithLock(req.LockID, next, req.ExpectedGeneration)
+	} else {
+		saved, err = control.SaveAIFARDeploymentGeneration(next, req.ExpectedGeneration)
+	}
 	if err != nil {
+		if errors.Is(err, store.ErrAIFAROrchestrationLockOwnership) {
+			return current, repairRequired("AIFAR_RUNTIME_ORCHESTRATION_LOCK_LOST", err)
+		}
 		if errors.Is(err, store.ErrAIFARDeploymentGenerationConflict) || errors.Is(err, store.ErrAIFARDeploymentNotFound) {
 			return current, deploymentError(deploymentGenerationConflictCode, deploymentGenerationConflictCode, "aifar.deploymentControl.generationConflict")
 		}
@@ -191,8 +204,17 @@ func (s Service) MutateDeployment(ctx context.Context, req DeploymentMutationReq
 	if !acceptanceMatches(acceptance, nextGeneration, specHash) {
 		return saved, repairRequired("AIFAR_RUNTIME_AGENT_ACCEPTANCE_MISMATCH", nil)
 	}
-	accepted, err := markDeploymentAccepted(control, saved, nextGeneration)
+	var accepted store.AIFARDeployment
+	if strings.TrimSpace(req.LockID) != "" {
+		fenced := s.store.(aifarDeploymentLockFencedStore)
+		accepted, err = markDeploymentAcceptedWithLock(fenced, req.LockID, saved, nextGeneration)
+	} else {
+		accepted, err = markDeploymentAccepted(control, saved, nextGeneration)
+	}
 	if err != nil {
+		if errors.Is(err, store.ErrAIFAROrchestrationLockOwnership) {
+			return saved, repairRequired("AIFAR_RUNTIME_ORCHESTRATION_LOCK_LOST", err)
+		}
 		return saved, repairRequired("AIFAR_RUNTIME_CONTROL_STORE_ACCEPT_FAILED", err)
 	}
 	if log != nil {
@@ -312,6 +334,14 @@ func markDeploymentAccepted(control aifarDeploymentControlStore, saved store.AIF
 		return saved, err
 	}
 	return control.AcceptAIFARDeployment(saved.InstanceID, saved.ServiceName, generation, "Accepted", conditions, time.Now().UTC())
+}
+
+func markDeploymentAcceptedWithLock(control aifarDeploymentLockFencedStore, lockID string, saved store.AIFARDeployment, generation int64) (store.AIFARDeployment, error) {
+	conditions, err := deploymentConditionsJSON(true, "ManifestAccepted", generation)
+	if err != nil {
+		return saved, err
+	}
+	return control.AcceptAIFARDeploymentWithLock(lockID, saved, "Accepted", conditions, time.Now().UTC())
 }
 
 func deploymentConditionsJSON(accepted bool, reason string, generation int64) (string, error) {

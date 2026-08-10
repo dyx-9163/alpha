@@ -109,6 +109,11 @@ type aifarDeploymentControlStore interface {
 	AcceptAIFARDeployment(instanceID, serviceName string, generation int64, status, conditionsJSON string, at time.Time) (store.AIFARDeployment, error)
 }
 
+type aifarDeploymentLockFencedStore interface {
+	SaveAIFARDeploymentGenerationWithLock(lockID string, next store.AIFARDeployment, expectedGeneration int64) (store.AIFARDeployment, error)
+	AcceptAIFARDeploymentWithLock(lockID string, expected store.AIFARDeployment, status, conditionsJSON string, at time.Time) (store.AIFARDeployment, error)
+}
+
 type aifarInitialInstallFencedStore interface {
 	SaveAIFARInitialDesiredWithLock(lockID string, deployments []store.AIFARDeployment, replicaSets []store.AIFARReplicaSet) error
 	AcceptAIFARDeploymentWithLock(lockID string, expected store.AIFARDeployment, status, conditionsJSON string, at time.Time) (store.AIFARDeployment, error)
@@ -1730,14 +1735,36 @@ func (s Service) UpdateArtifact(ctx context.Context, req ArtifactUpdateRequest, 
 	}
 
 	if err := step(4, func() error {
+		var saved store.AppInstance
+		var orchestration map[string]any
 		accepted, err := s.mutateDeploymentsFanOut(ctx, req.Instance, req.Server, req.Actor, fallbackTaskID(req.TaskID, log), req.Language, 1, []deploymentMutationPlan{{
 			ServiceName:     artifact.ServiceName,
 			Operation:       "update-artifact",
 			LockAlreadyHeld: true,
+			LockID:          lock.ID,
 			Mutate: func(manifest *runtimeagent.DeploymentManifest) error {
 				manifest.Spec.PodRevision = releaseID
 				manifest.Spec.Image = "aifar-" + artifact.ServiceName + ":" + releaseID
 				return nil
+			},
+			Project: func(projectCtx context.Context, projectLock store.AIFAROrchestrationLock, acceptedDeployment store.AIFARDeployment) error {
+				audit := map[string]any{
+					"service":        artifact.ServiceName,
+					"artifactFile":   artifact.FileName,
+					"artifactSHA256": artifact.SHA256,
+					"artifactSize":   artifact.Size,
+					"baseReleaseId":  baseReleaseID,
+					"releaseId":      releaseID,
+					"updatedAt":      releaseTime.Format(time.RFC3339),
+				}
+				var projectErr error
+				saved, projectErr = s.updateAcceptedDeploymentMetadata(projectCtx, projectLock, acceptedDeployment, "AIFAR_ARTIFACT_METADATA_REPAIR_REQUIRED", func(freshMetadata map[string]any) error {
+					freshMetadata["releaseVersion"] = version
+					configHash = partialUpdateConfigHash(stringFromMetadata(freshMetadata, "configHash", ""), artifact.ServiceName, artifact.FileName, artifact.SHA256)
+					orchestration = mergeServiceScopedRolloutMetadata(freshMetadata, releaseID, configHash, []string{artifact.ServiceName}, audit)
+					return nil
+				})
+				return projectErr
 			},
 		}}, log, targetLog)
 		if err != nil {
@@ -1748,25 +1775,6 @@ func (s Service) UpdateArtifact(ctx context.Context, req ArtifactUpdateRequest, 
 		}
 		if err := ctx.Err(); err != nil {
 			return repairRequired("AIFAR_ARTIFACT_METADATA_REPAIR_REQUIRED", err)
-		}
-		audit := map[string]any{
-			"service":        artifact.ServiceName,
-			"artifactFile":   artifact.FileName,
-			"artifactSHA256": artifact.SHA256,
-			"artifactSize":   artifact.Size,
-			"baseReleaseId":  baseReleaseID,
-			"releaseId":      releaseID,
-			"updatedAt":      releaseTime.Format(time.RFC3339),
-		}
-		var orchestration map[string]any
-		saved, err := s.updateAppInstanceMetadata(req.Instance.ID, "AIFAR_ARTIFACT_METADATA_REPAIR_REQUIRED", func(freshMetadata map[string]any) error {
-			freshMetadata["releaseVersion"] = version
-			configHash = partialUpdateConfigHash(stringFromMetadata(freshMetadata, "configHash", ""), artifact.ServiceName, artifact.FileName, artifact.SHA256)
-			orchestration = mergeServiceScopedRolloutMetadata(freshMetadata, releaseID, configHash, []string{artifact.ServiceName}, audit)
-			return nil
-		})
-		if err != nil {
-			return err
 		}
 		if releases, ok := s.store.(releaseStore); ok {
 			manifest, _ := json.Marshal(rolloutReleaseManifest(version, releaseID, releaseTime, configHash, baseReleaseID, ingressNetwork, gatewayPort, webPort, artifact, orchestration, installRoot, req.Actor, fallbackTaskID(req.TaskID, log), serviceRevisionsBefore))

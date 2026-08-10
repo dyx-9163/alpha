@@ -107,6 +107,46 @@ type barrierCASStore struct {
 	release   chan struct{}
 }
 
+type staleProjectionCASStore struct {
+	*store.Store
+	once    sync.Once
+	blocked chan struct{}
+	release chan struct{}
+}
+
+type firstProjectionCASStore struct {
+	*store.Store
+	mu       sync.Mutex
+	blocked  chan struct{}
+	release  chan struct{}
+	didBlock bool
+}
+
+func (s *firstProjectionCASStore) SaveAppInstanceIfUnchanged(next store.AppInstance, expectedUpdatedAt time.Time) (store.AppInstance, error) {
+	s.mu.Lock()
+	block := !s.didBlock
+	if block {
+		s.didBlock = true
+		close(s.blocked)
+	}
+	s.mu.Unlock()
+	if block {
+		<-s.release
+	}
+	return s.Store.SaveAppInstanceIfUnchanged(next, expectedUpdatedAt)
+}
+
+func (s *staleProjectionCASStore) SaveAppInstanceIfUnchanged(next store.AppInstance, expectedUpdatedAt time.Time) (store.AppInstance, error) {
+	desired := desiredReplicasFromMetadata(metadataFromInstance(next))
+	if desired["permission"] == 2 {
+		s.once.Do(func() {
+			close(s.blocked)
+			<-s.release
+		})
+	}
+	return s.Store.SaveAppInstanceIfUnchanged(next, expectedUpdatedAt)
+}
+
 type alwaysConflictCASStore struct {
 	*fakeStore
 	mu    sync.Mutex
@@ -120,6 +160,33 @@ type renewalFailureStore struct {
 	armed     chan struct{}
 	mu        sync.Mutex
 	casCalls  int
+}
+
+type postAcceptanceRenewalFailureStore struct {
+	*store.Store
+	mu       sync.Mutex
+	renewals int
+	casCalls int
+}
+
+func (s *postAcceptanceRenewalFailureStore) RenewAIFAROrchestrationLock(string, time.Time) (bool, error) {
+	s.mu.Lock()
+	s.renewals++
+	s.mu.Unlock()
+	return false, nil
+}
+
+func (s *postAcceptanceRenewalFailureStore) SaveAppInstanceIfUnchanged(next store.AppInstance, expectedUpdatedAt time.Time) (store.AppInstance, error) {
+	s.mu.Lock()
+	s.casCalls++
+	s.mu.Unlock()
+	return s.Store.SaveAppInstanceIfUnchanged(next, expectedUpdatedAt)
+}
+
+func (s *postAcceptanceRenewalFailureStore) counts() (int, int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.renewals, s.casCalls
 }
 
 func (s *renewalFailureStore) RenewAIFAROrchestrationLock(string, time.Time) (bool, error) {
@@ -260,6 +327,25 @@ type firstDeploymentListBarrierStore struct {
 	once    sync.Once
 	listed  chan struct{}
 	release chan struct{}
+}
+
+type realFirstDeploymentListBarrierStore struct {
+	*store.Store
+	once    sync.Once
+	listed  chan struct{}
+	release chan struct{}
+}
+
+func (s *realFirstDeploymentListBarrierStore) ListAIFARDeployments(instanceID string) ([]store.AIFARDeployment, error) {
+	items, err := s.Store.ListAIFARDeployments(instanceID)
+	if err != nil {
+		return nil, err
+	}
+	s.once.Do(func() {
+		close(s.listed)
+		<-s.release
+	})
+	return items, nil
 }
 
 func (s *firstDeploymentListBarrierStore) ListAIFARDeployments(instanceID string) ([]store.AIFARDeployment, error) {
@@ -1818,6 +1904,139 @@ func TestConcurrentDifferentServiceScalesPreserveBothDesiredContributions(t *tes
 	}
 	if calls := barrier.callCount(); calls != 3 {
 		t.Fatalf("CAS calls=%d, want two initial attempts plus one conflict retry", calls)
+	}
+}
+
+func TestOlderSameServiceScaleCannotProjectOverAcceptedSuccessor(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "aifar.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	instance := installedAIFARInstance(t)
+	instance.Status = "install_failed"
+	instance, err = db.SaveAppInstance(instance)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, deployment := range seedPerServiceDeployments(t, instance,
+		map[string]int{"permission": 1}, map[string]int64{"permission": 3},
+	) {
+		if _, err := db.SaveAIFARDeployment(deployment); err != nil {
+			t.Fatal(err)
+		}
+	}
+	blocking := &staleProjectionCASStore{Store: db, blocked: make(chan struct{}), release: make(chan struct{})}
+	server := store.Server{ID: "srv-1", Host: "10.0.0.10", DeployDir: "/aifar/apps"}
+	service := NewService(blocking, &fakeRemote{})
+	oldDone := make(chan error, 1)
+	go func() {
+		oldDone <- service.ScaleService(context.Background(), ScaleRequest{
+			Instance: instance, Server: server, Actor: "old-owner", TaskID: "task-scale-old",
+			ServiceName: "permission", Replicas: 2,
+		}, fakeLogger{}, nil)
+	}()
+	select {
+	case <-blocking.blocked:
+	case err := <-oldDone:
+		t.Fatalf("old operation ended before projection barrier: %v", err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("old operation did not reach projection barrier")
+	}
+	if _, err := db.RecoverAIFAROrchestrationLocks(instance.ID, "test successor takeover"); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.ScaleService(context.Background(), ScaleRequest{
+		Instance: instance, Server: server, Actor: "new-owner", TaskID: "task-scale-new",
+		ServiceName: "permission", Replicas: 3,
+	}, fakeLogger{}, nil); err != nil {
+		t.Fatal(err)
+	}
+	close(blocking.release)
+	oldErr := <-oldDone
+	var controlErr *deploymentControlError
+	if !errors.As(oldErr, &controlErr) || controlErr.StableCode() != runtimeControlPlaneRepairCode {
+		t.Fatalf("old operation error=%v, want forward-only repair-required", oldErr)
+	}
+	saved, err := db.GetAppInstance(instance.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if saved.Status != "install_failed" || desiredReplicasFromMetadata(metadataFromInstance(saved))["permission"] != 3 {
+		t.Fatalf("old projection regressed successor or lifecycle: %+v metadata=%s", saved, saved.Metadata)
+	}
+	deployments, err := db.ListAIFARDeployments(instance.ID)
+	if err != nil || len(deployments) != 1 || deployments[0].DesiredReplicas != 3 || deployments[0].Generation != 5 {
+		t.Fatalf("canonical successor desired state=%+v err=%v", deployments, err)
+	}
+}
+
+func TestScaleValidAgentAcceptanceThenLockLossRequiresRepairWithoutProjection(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "aifar.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	instance := installedAIFARInstance(t)
+	instance.Status = "install_failed"
+	instance, err = db.SaveAppInstance(instance)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, deployment := range seedPerServiceDeployments(t, instance,
+		map[string]int{"permission": 1}, map[string]int64{"permission": 3},
+	) {
+		if _, err := db.SaveAIFARDeployment(deployment); err != nil {
+			t.Fatal(err)
+		}
+	}
+	wrapper := &postAcceptanceRenewalFailureStore{Store: db}
+	service := NewService(wrapper, &fakeRemote{})
+	service.orchestrationLockHeartbeatInterval = time.Hour
+	recorder := &targetStateRecorder{}
+	err = service.ScaleService(context.Background(), ScaleRequest{
+		Instance: instance, Server: store.Server{ID: "srv-1", Host: "10.0.0.10", DeployDir: "/aifar/apps"},
+		Language: "en", Actor: "old-owner", TaskID: "task-scale-lost-after-acceptance", ServiceName: "permission", Replicas: 2,
+	}, recorder, nil)
+	var controlErr *deploymentControlError
+	if !errors.As(err, &controlErr) || controlErr.StableCode() != runtimeControlPlaneRepairCode || controlErr.ReasonCode() != "AIFAR_RUNTIME_ORCHESTRATION_LOCK_LOST" {
+		t.Fatalf("error=%v, want lock-loss repair-required", err)
+	}
+	deployments, listErr := db.ListAIFARDeployments(instance.ID)
+	if listErr != nil || len(deployments) != 1 || deployments[0].Generation != 4 || deployments[0].DesiredReplicas != 2 || deployments[0].Status != "Accepted" {
+		t.Fatalf("forward-only canonical acceptance=%+v err=%v", deployments, listErr)
+	}
+	saved, getErr := db.GetAppInstance(instance.ID)
+	if getErr != nil {
+		t.Fatal(getErr)
+	}
+	if saved.Status != "install_failed" || desiredReplicasFromMetadata(metadataFromInstance(saved))["permission"] != 1 {
+		t.Fatalf("lost owner projected metadata or changed lifecycle: %+v metadata=%s", saved, saved.Metadata)
+	}
+	renewals, casCalls := wrapper.counts()
+	if renewals != 1 || casCalls != 0 {
+		t.Fatalf("renewals=%d CAS calls=%d, want one post-accept fence and no projection", renewals, casCalls)
+	}
+	statuses, _, _ := recorder.snapshot()
+	if statuses[instance.ID+":permission"] != "failed" {
+		t.Fatalf("lost owner target status=%q, want failed", statuses[instance.ID+":permission"])
+	}
+	locks, lockErr := db.ListAIFAROrchestrationLocks(instance.ID, true)
+	if lockErr != nil || len(locks) != 0 {
+		t.Fatalf("lost owner lock was not released: locks=%+v err=%v", locks, lockErr)
+	}
+	if err := NewService(db, &fakeRemote{}).ScaleService(context.Background(), ScaleRequest{
+		Instance: instance, Server: store.Server{ID: "srv-1", Host: "10.0.0.10", DeployDir: "/aifar/apps"},
+		Language: "en", Actor: "successor", TaskID: "task-scale-successor", ServiceName: "permission", Replicas: 3,
+	}, fakeLogger{}, nil); err != nil {
+		t.Fatalf("successor could not take over after stale owner failed: %v", err)
+	}
+	successor, err := db.GetAppInstance(instance.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if desiredReplicasFromMetadata(metadataFromInstance(successor))["permission"] != 3 {
+		t.Fatalf("successor projection missing after stale owner failure: %s", successor.Metadata)
 	}
 }
 
@@ -3864,8 +4083,105 @@ func TestRestartAllSkipsServiceOfflinedAfterInitialList(t *testing.T) {
 		t.Fatalf("offline target applied %d times", remote.deploymentApplyCounts["permission"])
 	}
 	statuses, _, steps := recorder.snapshot()
-	if statuses[instance.ID+":permission"] != "skipped" || steps[instance.ID+":permission:accept-service-intent"] != "skipped" {
+	if statuses[instance.ID+":permission"] != "success" || steps[instance.ID+":permission:accept-service-intent"] != "success" {
 		t.Fatalf("offline target terminal states=%v steps=%v", statuses, steps)
+	}
+}
+
+func TestRestartOfflineNoOpUsesRealStoreSuccessTerminalAndLocalizedTargetLog(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "aifar.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	instance := installedAIFARInstance(t)
+	instance, err = db.SaveAppInstance(instance)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, deployment := range seedPerServiceDeployments(t, instance,
+		map[string]int{"permission": 1}, map[string]int64{"permission": 4},
+	) {
+		if _, err := db.SaveAIFARDeployment(deployment); err != nil {
+			t.Fatal(err)
+		}
+	}
+	barrier := &realFirstDeploymentListBarrierStore{Store: db, listed: make(chan struct{}), release: make(chan struct{})}
+	service := NewService(barrier, &fakeRemote{})
+	manager := worker.NewManager(db)
+	task, err := manager.StartWithLanguage("apps.aifar.runtime.restart", instance.ID, "operator", "en", func(ctx context.Context, log worker.Logger) error {
+		return service.RestartRuntime(ctx, RuntimeRestartRequest{
+			Instance: instance, Server: store.Server{ID: "srv-1", Host: "10.0.0.10", DeployDir: "/aifar/apps"},
+			Language: "en", Actor: "operator", TaskID: log.TaskID(),
+		}, log, func(target string) Logger {
+			targeted := log.Target(target)
+			return targeted
+		})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-barrier.listed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("restart did not reach the initial deployment list")
+	}
+	deployments, err := db.ListAIFARDeployments(instance.ID)
+	if err != nil || len(deployments) != 1 {
+		t.Fatalf("deployments=%+v err=%v", deployments, err)
+	}
+	offline := deployments[0]
+	var manifest runtimeagent.DeploymentManifest
+	if err := json.Unmarshal([]byte(offline.SpecJSON), &manifest); err != nil {
+		t.Fatal(err)
+	}
+	manifest.Spec.Replicas = 0
+	raw, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	offline.DesiredReplicas = 0
+	offline.SpecJSON = string(raw)
+	offline.Status = "Offline"
+	offline.ObservedGeneration = offline.Generation
+	if _, err := db.SaveAIFARDeployment(offline); err != nil {
+		t.Fatal(err)
+	}
+	close(barrier.release)
+	deadline := time.Now().Add(3 * time.Second)
+	var persisted store.Task
+	var logs []store.TaskLog
+	for time.Now().Before(deadline) {
+		persisted, logs, err = db.GetTask(task.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if persisted.FinishedAt.IsZero() {
+			time.Sleep(10 * time.Millisecond)
+			continue
+		}
+		break
+	}
+	if persisted.Status != "success" || persisted.FinishedAt.IsZero() {
+		t.Fatalf("task=%+v", persisted)
+	}
+	targets, err := db.ListTaskTargets(task.ID)
+	if err != nil || len(targets) != 1 || targets[0].Status != "success" || targets[0].FinishedAt.IsZero() {
+		t.Fatalf("targets=%+v err=%v", targets, err)
+	}
+	steps, err := db.ListTaskSteps(task.ID)
+	if err != nil || len(steps) != 1 || steps[0].Status != "success" || steps[0].FinishedAt.IsZero() {
+		t.Fatalf("steps=%+v err=%v", steps, err)
+	}
+	wantLog := i18n.Text("en", "aifar.runtimeMutation.skippedOffline")
+	found := false
+	for _, entry := range logs {
+		if entry.Target == instance.ID+":permission" && strings.Contains(entry.Message, wantLog) {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("localized offline no-op target log %q missing: %+v", wantLog, logs)
 	}
 }
 
@@ -4510,6 +4826,89 @@ func TestArtifactBundleBusyPeerDoesNotPrepareOrMutateBusyService(t *testing.T) {
 	if !strings.Contains(commands, "update-aifar-artifact-bundle-file.sh") {
 		t.Fatalf("free file artifact was not prepared under its own lock: %s", commands)
 	}
+	projected := metadataFromInstance(s.instances[0])
+	if revisions := serviceRevisionsFromMetadata(projected); revisions["file"] != after["file"].CurrentRevision {
+		t.Fatalf("free file accepted revision was not projected after busy peer failure: deployment=%+v metadata=%s", after["file"], s.instances[0].Metadata)
+	}
+	if hashes := mapFromMetadataValue(projected["serviceConfigHashes"]); strings.TrimSpace(fmt.Sprint(hashes["file"])) == "" {
+		t.Fatalf("free file config hash contribution is missing: %s", s.instances[0].Metadata)
+	}
+	if rollouts := mapFromMetadataValue(projected["serviceRollouts"]); rollouts["file"] == nil {
+		t.Fatalf("free file rollout audit contribution is missing: %s", s.instances[0].Metadata)
+	}
+}
+
+func TestOlderSameServiceBundleCannotProjectOverAcceptedSuccessor(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "aifar.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	instance := installedAIFARInstance(t)
+	instance.Status = "install_failed"
+	instance, err = db.SaveAppInstance(instance)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, deployment := range seedPerServiceDeployments(t, instance,
+		map[string]int{"permission": 1}, map[string]int64{"permission": 3},
+	) {
+		if _, err := db.SaveAIFARDeployment(deployment); err != nil {
+			t.Fatal(err)
+		}
+	}
+	oldBundle := writeAlphaJarBundle(t, []bundleTestArtifact{{Service: "permission", Module: "alpha-permission", FileName: "alpha-permission.jar", Content: "old operation artifact"}})
+	newBundle := writeAlphaJarBundle(t, []bundleTestArtifact{{Service: "permission", Module: "alpha-permission", FileName: "alpha-permission.jar", Content: "successor artifact"}})
+	barrier := &firstProjectionCASStore{Store: db, blocked: make(chan struct{}), release: make(chan struct{})}
+	server := store.Server{ID: "srv-1", Host: "10.0.0.10", DeployDir: "/aifar/apps"}
+	service := NewService(barrier, &fakeRemote{})
+	oldDone := make(chan error, 1)
+	go func() {
+		oldDone <- service.UpdateArtifactBundle(context.Background(), ArtifactBundleUpdateRequest{
+			Instance: instance, Server: server, Actor: "old-owner", TaskID: "task-bundle-old",
+			BundleLocalPath: oldBundle, BundleFileName: filepath.Base(oldBundle), Concurrency: 1,
+		}, fakeLogger{}, nil)
+	}()
+	select {
+	case <-barrier.blocked:
+	case err := <-oldDone:
+		t.Fatalf("old bundle ended before projection barrier: %v", err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("old bundle did not reach projection barrier")
+	}
+	if _, err := db.RecoverAIFAROrchestrationLocks(instance.ID, "test bundle successor takeover"); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.UpdateArtifactBundle(context.Background(), ArtifactBundleUpdateRequest{
+		Instance: instance, Server: server, Actor: "new-owner", TaskID: "task-bundle-new",
+		BundleLocalPath: newBundle, BundleFileName: filepath.Base(newBundle), Concurrency: 1,
+	}, fakeLogger{}, nil); err != nil {
+		t.Fatal(err)
+	}
+	current, err := db.ListAIFARDeployments(instance.ID)
+	if err != nil || len(current) != 1 {
+		t.Fatalf("successor deployment=%+v err=%v", current, err)
+	}
+	successorRevision := current[0].CurrentRevision
+	close(barrier.release)
+	oldErr := <-oldDone
+	var controlErr *deploymentControlError
+	if !errors.As(oldErr, &controlErr) || controlErr.StableCode() != runtimeControlPlaneRepairCode {
+		t.Fatalf("old bundle error=%v, want forward-only repair-required", oldErr)
+	}
+	saved, err := db.GetAppInstance(instance.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	metadata := metadataFromInstance(saved)
+	if saved.Status != "install_failed" || serviceRevisionsFromMetadata(metadata)["permission"] != successorRevision {
+		t.Fatalf("old bundle regressed successor projection: deployment=%+v metadata=%s", current[0], saved.Metadata)
+	}
+	rollouts := mapFromMetadataValue(metadata["serviceRollouts"])
+	permissionRollout := mapFromMetadataValue(rollouts["permission"])
+	if fmt.Sprint(permissionRollout["releaseId"]) != successorRevision {
+		t.Fatalf("old bundle regressed successor audit: %s", saved.Metadata)
+	}
 }
 
 func TestServiceUpdatesAIFARArtifactBundleAsSingleMultiServicePartialRelease(t *testing.T) {
@@ -4724,6 +5123,107 @@ func TestRollbackBusyPeerDoesNotPrepareOrMutateBusyService(t *testing.T) {
 	}
 	if !strings.Contains(commands, "rollback-file.sh") {
 		t.Fatalf("free file rollback was not prepared under its own lock: %s", commands)
+	}
+	projected := metadataFromInstance(s.instances[0])
+	if revisions := serviceRevisionsFromMetadata(projected); revisions["file"] != after["file"].CurrentRevision {
+		t.Fatalf("free file accepted rollback revision was not projected after busy peer failure: deployment=%+v metadata=%s", after["file"], s.instances[0].Metadata)
+	}
+	if hashes := mapFromMetadataValue(projected["serviceConfigHashes"]); strings.TrimSpace(fmt.Sprint(hashes["file"])) == "" {
+		t.Fatalf("free file rollback config hash contribution is missing: %s", s.instances[0].Metadata)
+	}
+	if rollouts := mapFromMetadataValue(projected["serviceRollouts"]); rollouts["file"] == nil {
+		t.Fatalf("free file rollback audit contribution is missing: %s", s.instances[0].Metadata)
+	}
+}
+
+func TestOlderSameServiceRollbackCannotProjectOverAcceptedSuccessor(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "aifar.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	instance := installedAIFARInstance(t)
+	instance.Status = "install_failed"
+	instance, err = db.SaveAppInstance(instance)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, deployment := range seedPerServiceDeployments(t, instance,
+		map[string]int{"permission": 1}, map[string]int64{"permission": 3},
+	) {
+		if _, err := db.SaveAIFARDeployment(deployment); err != nil {
+			t.Fatal(err)
+		}
+	}
+	const oldTarget = "20260701T010000.000000000Z-rollout-permission-old"
+	const successorTarget = "20260701T020000.000000000Z-rollout-permission-new"
+	for idx, releaseID := range []string{oldTarget, successorTarget} {
+		manifest, err := json.Marshal(map[string]any{
+			"schema": releaseManifestSchemaV2, "kind": "rollout", "releaseId": releaseID,
+			"changedServices": []string{"permission"},
+			"artifacts": map[string]any{"permission": map[string]any{
+				"file": "permission.jar", "sha256": strings.Repeat(string(rune('a'+idx)), 64),
+				"remotePath": "/aifar/releases/" + releaseID + "/permission.jar",
+			}},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.SaveAppRelease(store.AppRelease{
+			InstanceID: instance.ID, App: AppName, Version: appBundleVersion, ReleaseID: releaseID,
+			ServerID: "srv-1", Status: "success", ManifestJSON: string(manifest), CreatedAt: time.Now().Add(time.Duration(idx-2) * time.Hour),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	barrier := &firstProjectionCASStore{Store: db, blocked: make(chan struct{}), release: make(chan struct{})}
+	server := store.Server{ID: "srv-1", Host: "10.0.0.10", DeployDir: "/aifar/apps"}
+	service := NewService(barrier, &fakeRemote{})
+	oldDone := make(chan error, 1)
+	go func() {
+		oldDone <- service.RollbackArtifact(context.Background(), ArtifactRollbackRequest{
+			Instance: instance, Server: server, Actor: "old-owner", TaskID: "task-rollback-old",
+			TargetReleaseID: oldTarget, Services: []string{"permission"}, Reason: "old rollback",
+		}, fakeLogger{}, nil)
+	}()
+	select {
+	case <-barrier.blocked:
+	case err := <-oldDone:
+		t.Fatalf("old rollback ended before projection barrier: %v", err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("old rollback did not reach projection barrier")
+	}
+	if _, err := db.RecoverAIFAROrchestrationLocks(instance.ID, "test rollback successor takeover"); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.RollbackArtifact(context.Background(), ArtifactRollbackRequest{
+		Instance: instance, Server: server, Actor: "new-owner", TaskID: "task-rollback-new",
+		TargetReleaseID: successorTarget, Services: []string{"permission"}, Reason: "new rollback",
+	}, fakeLogger{}, nil); err != nil {
+		t.Fatal(err)
+	}
+	close(barrier.release)
+	oldErr := <-oldDone
+	var controlErr *deploymentControlError
+	if !errors.As(oldErr, &controlErr) || controlErr.StableCode() != runtimeControlPlaneRepairCode {
+		t.Fatalf("old rollback error=%v, want forward-only repair-required", oldErr)
+	}
+	deployments, err := db.ListAIFARDeployments(instance.ID)
+	if err != nil || len(deployments) != 1 || deployments[0].CurrentRevision != successorTarget {
+		t.Fatalf("canonical successor rollback=%+v err=%v", deployments, err)
+	}
+	saved, err := db.GetAppInstance(instance.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	metadata := metadataFromInstance(saved)
+	if saved.Status != "install_failed" || serviceRevisionsFromMetadata(metadata)["permission"] != successorTarget {
+		t.Fatalf("old rollback regressed successor projection: metadata=%s", saved.Metadata)
+	}
+	rollouts := mapFromMetadataValue(metadata["serviceRollouts"])
+	permissionRollout := mapFromMetadataValue(rollouts["permission"])
+	if fmt.Sprint(permissionRollout["rollbackTo"]) != successorTarget {
+		t.Fatalf("old rollback regressed successor audit: %s", saved.Metadata)
 	}
 }
 

@@ -282,6 +282,14 @@ func (s Service) UpdateArtifactBundle(ctx context.Context, req ArtifactBundleUpd
 		plans := make([]deploymentMutationPlan, 0, len(artifacts))
 		for _, artifact := range artifacts {
 			artifact := artifact
+			audit := map[string]any{
+				"service":               "bundle",
+				"changedServices":       artifactServiceNames(artifacts),
+				"baseReleaseId":         baseReleaseID,
+				"releaseId":             releaseID,
+				"updatedAt":             releaseTime.Format(time.RFC3339),
+				"deploymentConcurrency": concurrency,
+			}
 			plans = append(plans, deploymentMutationPlan{
 				ServiceName:      artifact.ServiceName,
 				Operation:        "update-artifact-bundle",
@@ -306,6 +314,15 @@ func (s Service) UpdateArtifactBundle(ctx context.Context, req ArtifactBundleUpd
 					manifest.Spec.Image = "aifar-" + artifact.ServiceName + ":" + releaseID
 					return nil
 				},
+				Project: func(projectCtx context.Context, lock store.AIFAROrchestrationLock, accepted store.AIFARDeployment) error {
+					_, err := s.updateAcceptedDeploymentMetadata(projectCtx, lock, accepted, "AIFAR_ARTIFACT_BUNDLE_METADATA_REPAIR_REQUIRED", func(freshMetadata map[string]any) error {
+						freshMetadata["releaseVersion"] = version
+						projectedConfigHash := partialUpdateConfigHash(stringFromMetadata(freshMetadata, "configHash", ""), artifact.ServiceName, artifact.FileName, artifact.SHA256)
+						mergeServiceScopedRolloutMetadata(freshMetadata, releaseID, projectedConfigHash, []string{artifact.ServiceName}, audit)
+						return nil
+					})
+					return err
+				},
 			})
 		}
 		var err error
@@ -322,24 +339,13 @@ func (s Service) UpdateArtifactBundle(ctx context.Context, req ArtifactBundleUpd
 		if len(accepted) != len(artifacts) {
 			return repairRequired("AIFAR_ARTIFACT_BUNDLE_ACCEPTANCE_INCOMPLETE", nil)
 		}
-		audit := map[string]any{
-			"service":               "bundle",
-			"changedServices":       artifactServiceNames(artifacts),
-			"baseReleaseId":         baseReleaseID,
-			"releaseId":             releaseID,
-			"updatedAt":             releaseTime.Format(time.RFC3339),
-			"deploymentConcurrency": concurrency,
-		}
-		var orchestration map[string]any
-		saved, err := s.updateAppInstanceMetadata(req.Instance.ID, "AIFAR_ARTIFACT_BUNDLE_METADATA_REPAIR_REQUIRED", func(freshMetadata map[string]any) error {
-			freshMetadata["releaseVersion"] = version
-			configHash = partialBundleUpdateConfigHash(stringFromMetadata(freshMetadata, "configHash", ""), artifacts)
-			orchestration = mergeServiceScopedRolloutMetadata(freshMetadata, releaseID, configHash, artifactServiceNames(artifacts), audit)
-			return nil
-		})
+		saved, err := s.store.GetAppInstance(req.Instance.ID)
 		if err != nil {
-			return err
+			return repairRequired("AIFAR_ARTIFACT_BUNDLE_METADATA_REPAIR_REQUIRED", err)
 		}
+		freshMetadata := metadataFromInstance(saved)
+		configHash = stringFromMetadata(freshMetadata, "configHash", configHash)
+		orchestration := rolloutAcceptedIntentMetadata(freshMetadata, releaseID, artifactServiceNames(artifacts))
 		if releases, ok := s.store.(releaseStore); ok {
 			manifest, _ := json.Marshal(rolloutBundleReleaseManifest(version, releaseID, releaseTime, configHash, baseReleaseID, ingressNetwork, gatewayPort, webPort, artifacts, concurrency, orchestration, installRoot, req.Actor, fallbackTaskID(req.TaskID, log), serviceRevisionsBefore))
 			if _, err := releases.SaveAppRelease(store.AppRelease{

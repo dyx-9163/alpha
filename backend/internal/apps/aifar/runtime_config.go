@@ -327,7 +327,7 @@ func (s Service) ApplyRuntimeConfig(ctx context.Context, req RuntimeConfigReques
 		return renderErr
 	}); err != nil {
 		if ctx.Err() == nil {
-			_ = s.markRuntimeConfigApplyFailed(current.ID, next, err)
+			_ = s.markRuntimeConfigApplyFailed(ctx, lock, current.ID, next, err)
 		}
 		finishTarget(recorder, target, "failed", err.Error())
 		return err
@@ -360,7 +360,7 @@ func (s Service) ApplyRuntimeConfig(ctx context.Context, req RuntimeConfigReques
 		return mutationErr
 	}); err != nil {
 		if ctx.Err() == nil {
-			_ = s.markRuntimeConfigApplyFailed(current.ID, next, err)
+			_ = s.markRuntimeConfigApplyFailed(ctx, lock, current.ID, next, err)
 		}
 		finishTarget(recorder, target, "failed", err.Error())
 		return err
@@ -370,7 +370,7 @@ func (s Service) ApplyRuntimeConfig(ctx context.Context, req RuntimeConfigReques
 		if err := ctx.Err(); err != nil {
 			return repairRequired("AIFAR_RUNTIME_CONFIG_METADATA_REPAIR_REQUIRED", err)
 		}
-		_, saveErr := s.updateAppInstanceMetadata(current.ID, "AIFAR_RUNTIME_CONFIG_METADATA_REPAIR_REQUIRED", func(freshMetadata map[string]any) error {
+		_, saveErr := s.updateAppInstanceMetadataWithLock(ctx, lock, current.ID, "AIFAR_RUNTIME_CONFIG_METADATA_REPAIR_REQUIRED", func(freshMetadata map[string]any) error {
 			state := runtimeConfigFromMetadata(freshMetadata)
 			state.AppliedVersion = next.ConfigVersion
 			state.LastAppliedAt = time.Now().UTC().Format(time.RFC3339)
@@ -390,8 +390,8 @@ func (s Service) ApplyRuntimeConfig(ctx context.Context, req RuntimeConfigReques
 	return nil
 }
 
-func (s Service) markRuntimeConfigApplyFailed(instanceID string, state RuntimeConfigState, applyErr error) error {
-	_, err := s.updateAppInstanceMetadata(instanceID, "AIFAR_RUNTIME_CONFIG_METADATA_REPAIR_REQUIRED", func(metadata map[string]any) error {
+func (s Service) markRuntimeConfigApplyFailed(ctx context.Context, lock store.AIFAROrchestrationLock, instanceID string, state RuntimeConfigState, applyErr error) error {
+	_, err := s.updateAppInstanceMetadataWithLock(ctx, lock, instanceID, "AIFAR_RUNTIME_CONFIG_METADATA_REPAIR_REQUIRED", func(metadata map[string]any) error {
 		state.LastApplyStatus = runtimeConfigStatusFailed
 		state.LastApplyError = applyErr.Error()
 		metadata["runtimeConfig"] = state

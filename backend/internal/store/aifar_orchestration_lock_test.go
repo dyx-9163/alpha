@@ -103,6 +103,164 @@ func TestAIFAROrchestrationLocksDoNotReleaseASuccessorByStaleID(t *testing.T) {
 	}
 }
 
+func TestSaveAIFARDeploymentGenerationWithLockRequiresExactActiveServiceOwner(t *testing.T) {
+	db := openTestStore(t)
+	now := time.Now().UTC()
+	base, err := db.SaveAIFARDeployment(AIFARDeployment{
+		InstanceID: "instance-1", ServiceName: "permission", DesiredReplicas: 1,
+		CurrentRevision: "rev-1", SpecJSON: `{"service":"permission","revision":"rev-1"}`,
+		Generation: 1, Status: "Accepted",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	next := base
+	next.DesiredReplicas = 2
+	next.SpecJSON = `{"service":"permission","revision":"rev-1","replicas":2}`
+	next.Status = "pending_acceptance"
+
+	for _, tc := range []struct {
+		name string
+		lock AIFAROrchestrationLock
+	}{
+		{name: "different service", lock: testAIFAROrchestrationLock("instance-1", "file", "scale")},
+		{name: "different instance", lock: testAIFAROrchestrationLock("instance-2", "permission", "scale")},
+		{name: "non install global maintenance", lock: testAIFAROrchestrationLock("instance-1", "", "migrate")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			acquired, err := db.AcquireAIFAROrchestrationLock(tc.lock)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.SaveAIFARDeploymentGenerationWithLock(acquired.ID, next, base.Generation); !errors.Is(err, ErrAIFAROrchestrationLockOwnership) {
+				t.Fatalf("error=%v, want exact lock ownership rejection", err)
+			}
+			if released, err := db.ReleaseAIFAROrchestrationLockByID(acquired.ID); err != nil || !released {
+				t.Fatalf("release test lock: released=%v err=%v", released, err)
+			}
+		})
+	}
+
+	ownerA := testAIFAROrchestrationLock("instance-1", "permission", "scale")
+	ownerA.ID = "runtime-owner-a"
+	ownerA.StartedAt = now.Add(-2 * time.Hour)
+	ownerA.ExpiresAt = now.Add(-time.Hour)
+	if _, err := db.AcquireAIFAROrchestrationLock(ownerA); err != nil {
+		t.Fatal(err)
+	}
+	ownerB := testAIFAROrchestrationLock("instance-1", "permission", "scale")
+	ownerB.ID = "runtime-owner-b"
+	if _, err := db.AcquireAIFAROrchestrationLock(ownerB); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.SaveAIFARDeploymentGenerationWithLock(ownerA.ID, next, base.Generation); !errors.Is(err, ErrAIFAROrchestrationLockOwnership) {
+		t.Fatalf("expired predecessor error=%v", err)
+	}
+	saved, err := db.SaveAIFARDeploymentGenerationWithLock(ownerB.ID, next, base.Generation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if saved.Generation != base.Generation+1 || saved.DesiredReplicas != 2 {
+		t.Fatalf("active successor did not write exact next generation: %+v", saved)
+	}
+}
+
+func TestSaveAIFARDeploymentGenerationWithLockRechecksExpiryAtWriteTransaction(t *testing.T) {
+	db := openTestStore(t)
+	base, err := db.SaveAIFARDeployment(AIFARDeployment{
+		InstanceID: "instance-1", ServiceName: "permission", DesiredReplicas: 1,
+		CurrentRevision: "rev-1", SpecJSON: `{"service":"permission","replicas":1}`,
+		Generation: 1, Status: "Accepted",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	owner := testAIFAROrchestrationLock("instance-1", "permission", "scale")
+	owner.ID = "near-expiry-runtime-owner"
+	owner.StartedAt = now.Add(-time.Hour)
+	owner.ExpiresAt = now.Add(2 * time.Second)
+	if _, err := db.AcquireAIFAROrchestrationLock(owner); err != nil {
+		t.Fatal(err)
+	}
+	blocker, err := db.db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	baselineWaitCount := db.db.Stats().WaitCount
+	next := base
+	next.DesiredReplicas = 2
+	next.SpecJSON = `{"service":"permission","replicas":2}`
+	next.Status = "pending_acceptance"
+	errCh := make(chan error, 1)
+	go func() {
+		_, saveErr := db.SaveAIFARDeploymentGenerationWithLock(owner.ID, next, base.Generation)
+		errCh <- saveErr
+	}()
+	deadline := owner.ExpiresAt.Add(-500 * time.Millisecond)
+	for db.db.Stats().WaitCount <= baselineWaitCount && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if db.db.Stats().WaitCount <= baselineWaitCount {
+		_ = blocker.Rollback()
+		<-errCh
+		t.Fatal("runtime desired save did not reach the blocked transaction boundary")
+	}
+	if observed := time.Now().UTC(); !observed.Before(owner.ExpiresAt) {
+		_ = blocker.Rollback()
+		<-errCh
+		t.Fatalf("runtime desired save reached transaction wait after expiry: observed=%s expires=%s", observed, owner.ExpiresAt)
+	}
+	if wait := time.Until(owner.ExpiresAt.Add(25 * time.Millisecond)); wait > 0 {
+		time.Sleep(wait)
+	}
+	if err := blocker.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-errCh; !errors.Is(err, ErrAIFAROrchestrationLockOwnership) {
+		t.Fatalf("runtime desired write used pre-transaction lease time: %v", err)
+	}
+	current := deploymentByName(t, db, "instance-1", "permission")
+	if current.Generation != base.Generation || current.DesiredReplicas != base.DesiredReplicas || current.SpecJSON != base.SpecJSON {
+		t.Fatalf("expired runtime owner changed desired state: before=%+v after=%+v", base, current)
+	}
+}
+
+func TestAcceptAIFARDeploymentWithLockSupportsExactServiceOwnerAndRejectsPredecessor(t *testing.T) {
+	db := openTestStore(t)
+	now := time.Now().UTC()
+	pending, err := db.SaveAIFARDeployment(AIFARDeployment{
+		InstanceID: "instance-1", ServiceName: "permission", DesiredReplicas: 2,
+		CurrentRevision: "rev-2", SpecJSON: `{"service":"permission","revision":"rev-2"}`,
+		Generation: 2, Status: "pending_acceptance",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ownerA := testAIFAROrchestrationLock("instance-1", "permission", "scale")
+	ownerA.ID = "accept-owner-a"
+	ownerA.StartedAt = now.Add(-2 * time.Hour)
+	ownerA.ExpiresAt = now.Add(-time.Hour)
+	if _, err := db.AcquireAIFAROrchestrationLock(ownerA); err != nil {
+		t.Fatal(err)
+	}
+	ownerB := testAIFAROrchestrationLock("instance-1", "permission", "scale")
+	ownerB.ID = "accept-owner-b"
+	if _, err := db.AcquireAIFAROrchestrationLock(ownerB); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.AcceptAIFARDeploymentWithLock(ownerA.ID, pending, "Accepted", `[{"reason":"A"}]`, now); !errors.Is(err, ErrAIFAROrchestrationLockOwnership) {
+		t.Fatalf("expired predecessor acceptance error=%v", err)
+	}
+	accepted, err := db.AcceptAIFARDeploymentWithLock(ownerB.ID, pending, "Accepted", `[{"reason":"B"}]`, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if accepted.Status != "Accepted" || accepted.Generation != pending.Generation || accepted.CurrentRevision != pending.CurrentRevision || accepted.SpecJSON != pending.SpecJSON {
+		t.Fatalf("active exact service owner did not accept exact desired proof: %+v", accepted)
+	}
+}
+
 func TestSaveAIFARInitialDesiredWithLockRejectsExpiredOwnerAtomically(t *testing.T) {
 	db := openTestStore(t)
 	now := time.Now().UTC()

@@ -302,6 +302,15 @@ func (s Service) RollbackArtifact(ctx context.Context, req ArtifactRollbackReque
 		plans := make([]deploymentMutationPlan, 0, len(serviceNames))
 		for _, serviceName := range serviceNames {
 			serviceName := serviceName
+			audit := map[string]any{
+				"service":         "rollback",
+				"changedServices": serviceNames,
+				"baseReleaseId":   currentBaseRevision,
+				"rollbackId":      rollbackID,
+				"rollbackTo":      req.TargetReleaseID,
+				"reason":          strings.TrimSpace(req.Reason),
+				"updatedAt":       rollbackTime.Format(time.RFC3339),
+			}
 			plans = append(plans, deploymentMutationPlan{
 				ServiceName:      serviceName,
 				Operation:        "rollback-artifact",
@@ -326,6 +335,15 @@ func (s Service) RollbackArtifact(ctx context.Context, req ArtifactRollbackReque
 					manifest.Spec.Image = "aifar-" + serviceName + ":" + targetRevision
 					return nil
 				},
+				Project: func(projectCtx context.Context, lock store.AIFAROrchestrationLock, accepted store.AIFARDeployment) error {
+					_, err := s.updateAcceptedDeploymentMetadata(projectCtx, lock, accepted, "AIFAR_ARTIFACT_ROLLBACK_METADATA_REPAIR_REQUIRED", func(freshMetadata map[string]any) error {
+						freshMetadata["releaseVersion"] = version
+						projectedConfigHash := rollbackConfigHash(stringFromMetadata(freshMetadata, "configHash", ""), req.TargetReleaseID, []string{serviceName})
+						mergeServiceScopedRolloutMetadata(freshMetadata, targetRevision, projectedConfigHash, []string{serviceName}, audit)
+						return nil
+					})
+					return err
+				},
 			})
 		}
 		var err error
@@ -339,28 +357,14 @@ func (s Service) RollbackArtifact(ctx context.Context, req ArtifactRollbackReque
 	}
 
 	if err := step(4, func() error {
-		targetRevision := req.TargetReleaseID
 		if len(accepted) != len(serviceNames) {
 			return repairRequired("AIFAR_ARTIFACT_ROLLBACK_ACCEPTANCE_INCOMPLETE", nil)
 		}
-		audit := map[string]any{
-			"service":         "rollback",
-			"changedServices": serviceNames,
-			"baseReleaseId":   currentBaseRevision,
-			"rollbackId":      rollbackID,
-			"rollbackTo":      req.TargetReleaseID,
-			"reason":          strings.TrimSpace(req.Reason),
-			"updatedAt":       rollbackTime.Format(time.RFC3339),
-		}
-		saved, err := s.updateAppInstanceMetadata(req.Instance.ID, "AIFAR_ARTIFACT_ROLLBACK_METADATA_REPAIR_REQUIRED", func(freshMetadata map[string]any) error {
-			freshMetadata["releaseVersion"] = version
-			configHash = rollbackConfigHash(stringFromMetadata(freshMetadata, "configHash", ""), req.TargetReleaseID, serviceNames)
-			mergeServiceScopedRolloutMetadata(freshMetadata, targetRevision, configHash, serviceNames, audit)
-			return nil
-		})
+		saved, err := s.store.GetAppInstance(req.Instance.ID)
 		if err != nil {
-			return err
+			return repairRequired("AIFAR_ARTIFACT_ROLLBACK_METADATA_REPAIR_REQUIRED", err)
 		}
+		configHash = stringFromMetadata(metadataFromInstance(saved), "configHash", configHash)
 		if releases, ok := s.store.(releaseStore); ok {
 			manifest := rollbackReleaseManifest(version, rollbackID, rollbackTime, configHash, currentBaseRevision, req.TargetReleaseID, req.Reason, req.Actor, fallbackTaskID(req.TaskID, log), installRoot, ingressNetwork, gatewayPort, webPort, serviceNames, artifacts, revisionsBefore)
 			raw, _ := json.Marshal(manifest)

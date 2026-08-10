@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"text/template"
+	"time"
 
 	"aifar-deployment/backend/internal/i18n"
 	"aifar-deployment/backend/internal/installer/installerkit"
@@ -27,10 +28,12 @@ type deploymentMutationPlan struct {
 	ServiceName      string
 	Operation        string
 	LockAlreadyHeld  bool
+	LockID           string
 	ExpectedRevision string
 	Validate         func(store.AppInstance, store.AIFARDeployment) error
 	Prepare          func(context.Context, store.AppInstance, store.AIFARDeployment, Logger) error
 	Mutate           func(*runtimeagent.DeploymentManifest) error
+	Project          func(context.Context, store.AIFAROrchestrationLock, store.AIFARDeployment) error
 }
 
 var errServiceActionSkipped = errors.New("service action skipped")
@@ -44,6 +47,14 @@ type serviceActionFailure struct {
 	service string
 	err     error
 }
+
+type serviceActionAggregateError struct {
+	message string
+	errors  []error
+}
+
+func (e serviceActionAggregateError) Error() string   { return e.message }
+func (e serviceActionAggregateError) Unwrap() []error { return e.errors }
 
 func (s Service) ReconcileRuntime(ctx context.Context, req RuntimeReconcileRequest, log Logger, targetLog targetLogger) error {
 	control, ok := s.store.(aifarDeploymentControlStore)
@@ -70,7 +81,7 @@ func (s Service) ReconcileRuntime(ctx context.Context, req RuntimeReconcileReque
 	}
 	recorder, _ := log.(stepRecorder)
 	failures := runServiceFanOut(ctx, req.Instance.ID, services, defaultRuntimeMutationConcurrency, req.Language, log, targetLog, recorder, func(actionCtx context.Context, serviceName string, serviceLog Logger) error {
-		return s.withServiceOrchestrationLock(actionCtx, req.Instance.ID, "runtime-reconcile", serviceName, req.Actor, fallbackTaskID(req.TaskID, log), func(lockedCtx context.Context, _ store.AppInstance) error {
+		return s.withServiceOrchestrationLock(actionCtx, req.Instance.ID, "runtime-reconcile", serviceName, req.Actor, fallbackTaskID(req.TaskID, log), func(lockedCtx context.Context, _ store.AppInstance, _ store.AIFAROrchestrationLock) error {
 			if _, err := loadDeploymentForMutation(control, req.Instance.ID, serviceName); err != nil {
 				return err
 			}
@@ -126,7 +137,7 @@ func (s Service) mutateDeploymentsFanOut(ctx context.Context, instance store.App
 	var acceptedMu sync.Mutex
 	failures := runServiceFanOut(ctx, instance.ID, services, concurrency, language, log, targetLog, recorder, func(actionCtx context.Context, serviceName string, serviceLog Logger) error {
 		plan := planByService[serviceName]
-		mutate := func(lockedCtx context.Context, freshInstance store.AppInstance) error {
+		mutate := func(lockedCtx context.Context, freshInstance store.AppInstance, lock store.AIFAROrchestrationLock) error {
 			deployment, loadErr := loadDeploymentForMutation(control, freshInstance.ID, serviceName)
 			if loadErr != nil {
 				return loadErr
@@ -150,14 +161,26 @@ func (s Service) mutateDeploymentsFanOut(ctx context.Context, instance store.App
 			result, mutationErr := s.MutateDeployment(lockedCtx, DeploymentMutationRequest{
 				Instance: freshInstance, Server: server, ServiceName: serviceName,
 				ExpectedGeneration: deployment.Generation,
-				Actor:              actor, TaskID: taskID, Operation: plan.Operation, Mutate: plan.Mutate,
+				Actor:              actor, TaskID: taskID, Operation: plan.Operation, LockID: lock.ID, Mutate: plan.Mutate,
 			}, serviceLog)
-			if mutationErr == nil {
-				acceptedMu.Lock()
-				accepted[serviceName] = result
-				acceptedMu.Unlock()
+			if mutationErr != nil {
+				return mutationErr
 			}
-			return mutationErr
+			if err := s.ensureAIFAROrchestrationLockOwnership(lockedCtx, lock); err != nil {
+				return err
+			}
+			if err := ensureAcceptedDeploymentIsCurrent(control, result); err != nil {
+				return err
+			}
+			if plan.Project != nil {
+				if projectErr := plan.Project(lockedCtx, lock, result); projectErr != nil {
+					return projectErr
+				}
+			}
+			acceptedMu.Lock()
+			accepted[serviceName] = result
+			acceptedMu.Unlock()
+			return nil
 		}
 		var mutationErr error
 		if plan.LockAlreadyHeld {
@@ -165,7 +188,9 @@ func (s Service) mutateDeploymentsFanOut(ctx context.Context, instance store.App
 			if getErr != nil {
 				return getErr
 			}
-			mutationErr = mutate(actionCtx, freshInstance)
+			mutationErr = mutate(actionCtx, freshInstance, store.AIFAROrchestrationLock{
+				ID: plan.LockID, InstanceID: instance.ID, ServiceName: serviceName, Operation: plan.Operation,
+			})
 		} else {
 			mutationErr = s.withServiceOrchestrationLock(actionCtx, instance.ID, plan.Operation, serviceName, actor, taskID, mutate)
 		}
@@ -174,7 +199,7 @@ func (s Service) mutateDeploymentsFanOut(ctx context.Context, instance store.App
 	return accepted, aggregateServiceActionFailures(language, failures)
 }
 
-func (s Service) withServiceOrchestrationLock(ctx context.Context, instanceID, operation, serviceName, actor, taskID string, action func(context.Context, store.AppInstance) error) error {
+func (s Service) withServiceOrchestrationLock(ctx context.Context, instanceID, operation, serviceName, actor, taskID string, action func(context.Context, store.AppInstance, store.AIFAROrchestrationLock) error) error {
 	_, lock, err := s.acquireOrchestrationLock(instanceID, operation, serviceName, actor, taskID)
 	if err != nil {
 		return err
@@ -186,7 +211,71 @@ func (s Service) withServiceOrchestrationLock(ctx context.Context, instanceID, o
 	if err != nil {
 		return err
 	}
-	return action(lockedCtx, freshInstance)
+	return action(lockedCtx, freshInstance, lock)
+}
+
+func (s Service) ensureAIFAROrchestrationLockOwnership(ctx context.Context, lock store.AIFAROrchestrationLock) error {
+	if err := ctx.Err(); err != nil {
+		return repairRequired("AIFAR_RUNTIME_ORCHESTRATION_LOCK_LOST", err)
+	}
+	if strings.TrimSpace(lock.ID) == "" {
+		return nil
+	}
+	lockStore, ok := s.store.(aifarOrchestrationLockStore)
+	if !ok {
+		return repairRequired("AIFAR_RUNTIME_ORCHESTRATION_LOCK_FENCE_UNAVAILABLE", nil)
+	}
+	renewed, err := lockStore.RenewAIFAROrchestrationLock(lock.ID, time.Now().UTC().Add(orchestrationLockTTL))
+	if err != nil || !renewed {
+		return repairRequired("AIFAR_RUNTIME_ORCHESTRATION_LOCK_LOST", err)
+	}
+	return nil
+}
+
+func ensureAcceptedDeploymentIsCurrent(control aifarDeploymentControlStore, accepted store.AIFARDeployment) error {
+	current, err := loadDeploymentForMutation(control, accepted.InstanceID, accepted.ServiceName)
+	if err != nil {
+		return err
+	}
+	acceptedCurrent := strings.EqualFold(current.Status, "Accepted") || current.ObservedGeneration >= current.Generation && runtimeObservedDeploymentStatus(current.Status)
+	if current.Generation != accepted.Generation || current.CurrentRevision != accepted.CurrentRevision || current.SpecJSON != accepted.SpecJSON || !acceptedCurrent {
+		return repairRequired("AIFAR_RUNTIME_ACCEPTED_PROJECTION_OBSOLETE", store.ErrAIFARDeploymentGenerationConflict)
+	}
+	return nil
+}
+
+func (s Service) updateAcceptedDeploymentMetadata(ctx context.Context, lock store.AIFAROrchestrationLock, accepted store.AIFARDeployment, repairReason string, mutate func(map[string]any) error) (store.AppInstance, error) {
+	control, ok := s.store.(aifarDeploymentControlStore)
+	if !ok {
+		return store.AppInstance{}, repairRequired("AIFAR_RUNTIME_CONTROL_STORE_UNAVAILABLE", nil)
+	}
+	return s.updateAppInstanceMetadata(accepted.InstanceID, repairReason, func(metadata map[string]any) error {
+		if err := s.ensureAIFAROrchestrationLockOwnership(ctx, lock); err != nil {
+			return err
+		}
+		if err := ensureAcceptedDeploymentIsCurrent(control, accepted); err != nil {
+			return err
+		}
+		return mutate(metadata)
+	})
+}
+
+func (s Service) updateAppInstanceMetadataWithLock(ctx context.Context, lock store.AIFAROrchestrationLock, instanceID, repairReason string, mutate func(map[string]any) error) (store.AppInstance, error) {
+	return s.updateAppInstanceMetadata(instanceID, repairReason, func(metadata map[string]any) error {
+		if err := s.ensureAIFAROrchestrationLockOwnership(ctx, lock); err != nil {
+			return err
+		}
+		return mutate(metadata)
+	})
+}
+
+func runtimeObservedDeploymentStatus(status string) bool {
+	switch status {
+	case "Progressing", "Available", "Degraded", "Offline":
+		return true
+	default:
+		return false
+	}
 }
 
 func runServiceFanOut(ctx context.Context, instanceID string, services []string, concurrency int, language string, log Logger, targetLog targetLogger, recorder stepRecorder, action func(context.Context, string, Logger) error) []serviceActionFailure {
@@ -217,8 +306,7 @@ func runServiceFanOut(ctx context.Context, instanceID string, services []string,
 				status := "success"
 				errText := ""
 				if errors.Is(err, errServiceActionSkipped) {
-					status = "skipped"
-					errText = err.Error()
+					serviceLog.Info("%s", err.Error())
 				} else if err != nil {
 					status = "failed"
 					errText = err.Error()
@@ -265,7 +353,14 @@ func aggregateServiceActionFailures(language string, failures []serviceActionFai
 	for _, failure := range failures {
 		services = append(services, failure.service)
 	}
-	return fmt.Errorf("%s: %s", i18n.Text(language, "aifar.runtimeMutation.batchFailed"), strings.Join(services, ","))
+	causes := make([]error, 0, len(failures))
+	for _, failure := range failures {
+		causes = append(causes, failure.err)
+	}
+	return serviceActionAggregateError{
+		message: fmt.Sprintf("%s: %s", i18n.Text(language, "aifar.runtimeMutation.batchFailed"), strings.Join(services, ",")),
+		errors:  causes,
+	}
 }
 
 func renderRuntimeReconcileScript(data runtimeReconcileScriptData) (string, error) {

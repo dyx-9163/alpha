@@ -75,6 +75,47 @@ func (s *Store) ListAIFARDeployments(instanceID string) ([]AIFARDeployment, erro
 }
 
 func (s *Store) SaveAIFARDeploymentGeneration(next AIFARDeployment, expectedGeneration int64) (AIFARDeployment, error) {
+	next = prepareAIFARDeploymentGeneration(next, expectedGeneration)
+	tx, err := s.db.Begin()
+	if err != nil {
+		return AIFARDeployment{}, err
+	}
+	defer tx.Rollback()
+	saved, err := saveAIFARDeploymentGenerationTx(tx, next, expectedGeneration)
+	if err != nil {
+		return AIFARDeployment{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return AIFARDeployment{}, err
+	}
+	return saved, nil
+}
+
+// SaveAIFARDeploymentGenerationWithLock publishes the exact next desired
+// generation only while lockID is the active unexpired owner for this service.
+// The Task 8 global install lock remains valid for initial installation; other
+// global maintenance locks cannot authorize a Runtime service mutation.
+func (s *Store) SaveAIFARDeploymentGenerationWithLock(lockID string, next AIFARDeployment, expectedGeneration int64) (AIFARDeployment, error) {
+	next = prepareAIFARDeploymentGeneration(next, expectedGeneration)
+	tx, err := s.db.Begin()
+	if err != nil {
+		return AIFARDeployment{}, err
+	}
+	defer tx.Rollback()
+	if err := fenceActiveAIFARMutationLockTx(tx, lockID, next.InstanceID, next.ServiceName, time.Now().UTC()); err != nil {
+		return AIFARDeployment{}, err
+	}
+	saved, err := saveAIFARDeploymentGenerationTx(tx, next, expectedGeneration)
+	if err != nil {
+		return AIFARDeployment{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return AIFARDeployment{}, err
+	}
+	return saved, nil
+}
+
+func prepareAIFARDeploymentGeneration(next AIFARDeployment, expectedGeneration int64) AIFARDeployment {
 	now := time.Now()
 	if next.ID == "" {
 		next.ID = NewID("aifardeploy")
@@ -88,12 +129,10 @@ func (s *Store) SaveAIFARDeploymentGeneration(next AIFARDeployment, expectedGene
 	next.Generation = expectedGeneration + 1
 	next.ObservedGeneration = 0
 	next.UpdatedAt = now
+	return next
+}
 
-	tx, err := s.db.Begin()
-	if err != nil {
-		return AIFARDeployment{}, err
-	}
-	defer tx.Rollback()
+func saveAIFARDeploymentGenerationTx(tx *sql.Tx, next AIFARDeployment, expectedGeneration int64) (AIFARDeployment, error) {
 	result, err := tx.Exec(`insert into aifar_deployments(id,instance_id,service_name,desired_replicas,current_revision,updating_revision,strategy_json,spec_json,generation,observed_generation,status,metadata_json,conditions_json,last_transition_at,created_at,updated_at)
 		select ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
 		where ?=0 or exists(select 1 from aifar_deployments where instance_id=? and service_name=?)
@@ -121,9 +160,6 @@ func (s *Store) SaveAIFARDeploymentGeneration(next AIFARDeployment, expectedGene
 	}
 	saved, err := getAIFARDeployment(tx, next.InstanceID, next.ServiceName)
 	if err != nil {
-		return AIFARDeployment{}, err
-	}
-	if err := tx.Commit(); err != nil {
 		return AIFARDeployment{}, err
 	}
 	return saved, nil
@@ -317,12 +353,8 @@ func (s *Store) AcceptAIFARDeploymentWithLock(lockID string, expected AIFARDeplo
 		return AIFARDeployment{}, err
 	}
 	defer tx.Rollback()
-	instanceID, err := fenceActiveAIFARInstallLockTx(tx, lockID, time.Now().UTC())
-	if err != nil {
+	if err := fenceActiveAIFARMutationLockTx(tx, lockID, expected.InstanceID, expected.ServiceName, time.Now().UTC()); err != nil {
 		return AIFARDeployment{}, err
-	}
-	if instanceID != expected.InstanceID {
-		return AIFARDeployment{}, ErrAIFAROrchestrationLockOwnership
 	}
 	current, err := getAIFARDeployment(tx, expected.InstanceID, expected.ServiceName)
 	if err != nil {
@@ -369,24 +401,58 @@ func (s *Store) AcceptAIFARDeploymentWithLock(lockID string, expected AIFARDeplo
 // so another connection cannot release, renew, or replace the persisted lease
 // between this check and the desired-state writes in the same transaction.
 func fenceActiveAIFARInstallLockTx(tx *sql.Tx, lockID string, now time.Time) (string, error) {
-	result, err := tx.Exec(`update aifar_orchestration_locks set updated_at=?
-		where id=? and service_name='' and operation='install' and status='active' and expires_at>?`, now, strings.TrimSpace(lockID), now)
-	if err != nil {
+	if err := fenceActiveAIFARMutationLockTx(tx, lockID, "", "", now); err != nil {
 		return "", err
-	}
-	affected, err := result.RowsAffected()
-	if err != nil {
-		return "", err
-	}
-	if affected != 1 {
-		return "", ErrAIFAROrchestrationLockOwnership
 	}
 	var instanceID string
-	err = tx.QueryRow(`select instance_id from aifar_orchestration_locks where id=?`, strings.TrimSpace(lockID)).Scan(&instanceID)
+	err := tx.QueryRow(`select instance_id from aifar_orchestration_locks where id=?`, strings.TrimSpace(lockID)).Scan(&instanceID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", ErrAIFAROrchestrationLockOwnership
 	}
 	return instanceID, err
+}
+
+// fenceActiveAIFARMutationLockTx takes SQLite's write lock while proving that
+// lockID still owns the target service. A global lock is accepted only for the
+// Task 8 install operation; runtime maintenance locks must name the exact
+// service. The transaction keeps this ownership stable through the caller's
+// desired or acceptance write.
+func fenceActiveAIFARMutationLockTx(tx *sql.Tx, lockID, instanceID, serviceName string, now time.Time) error {
+	result, err := tx.Exec(`update aifar_orchestration_locks set updated_at=?
+		where id=? and status='active' and expires_at>?`, now, strings.TrimSpace(lockID), now)
+	if err != nil {
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected != 1 {
+		return ErrAIFAROrchestrationLockOwnership
+	}
+	var lockInstanceID, lockServiceName, operation string
+	err = tx.QueryRow(`select instance_id,service_name,operation from aifar_orchestration_locks where id=?`, strings.TrimSpace(lockID)).Scan(&lockInstanceID, &lockServiceName, &operation)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrAIFAROrchestrationLockOwnership
+	}
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(instanceID) != "" && lockInstanceID != strings.TrimSpace(instanceID) {
+		return ErrAIFAROrchestrationLockOwnership
+	}
+	lockServiceName = strings.TrimSpace(lockServiceName)
+	serviceName = strings.TrimSpace(serviceName)
+	if lockServiceName == "" {
+		if operation != "install" {
+			return ErrAIFAROrchestrationLockOwnership
+		}
+		return nil
+	}
+	if lockServiceName != serviceName {
+		return ErrAIFAROrchestrationLockOwnership
+	}
+	return nil
 }
 
 // AcceptAIFARDeployment records Agent acceptance only while the desired
