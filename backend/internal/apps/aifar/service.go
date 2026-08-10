@@ -49,6 +49,14 @@ type appInstanceCASStore interface {
 	SaveAppInstanceIfUnchanged(next store.AppInstance, expectedUpdatedAt time.Time) (store.AppInstance, error)
 }
 
+type aifarAcceptedProjectionStore interface {
+	SaveAIFARAcceptedProjectionWithLock(lockID string, expected store.AIFARDeployment, next store.AppInstance, expectedUpdatedAt time.Time) (store.AppInstance, error)
+}
+
+type runtimeConfigMetadataCASStore interface {
+	SaveAppInstanceIfUnchangedWithLock(lockID string, next store.AppInstance, expectedUpdatedAt time.Time) (store.AppInstance, error)
+}
+
 const appInstanceMetadataCASAttempts = 8
 
 func (s Service) updateAppInstanceMetadata(instanceID, repairReason string, mutate func(map[string]any) error) (store.AppInstance, error) {

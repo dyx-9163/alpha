@@ -2,6 +2,7 @@ package aifar
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
@@ -245,28 +246,71 @@ func ensureAcceptedDeploymentIsCurrent(control aifarDeploymentControlStore, acce
 }
 
 func (s Service) updateAcceptedDeploymentMetadata(ctx context.Context, lock store.AIFAROrchestrationLock, accepted store.AIFARDeployment, repairReason string, mutate func(map[string]any) error) (store.AppInstance, error) {
-	control, ok := s.store.(aifarDeploymentControlStore)
+	projectionStore, ok := s.store.(aifarAcceptedProjectionStore)
 	if !ok {
-		return store.AppInstance{}, repairRequired("AIFAR_RUNTIME_CONTROL_STORE_UNAVAILABLE", nil)
+		return store.AppInstance{}, repairRequired(repairReason, errors.New("accepted projection store is unavailable"))
 	}
-	return s.updateAppInstanceMetadata(accepted.InstanceID, repairReason, func(metadata map[string]any) error {
-		if err := s.ensureAIFAROrchestrationLockOwnership(ctx, lock); err != nil {
-			return err
+	for attempt := 0; attempt < appInstanceMetadataCASAttempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return store.AppInstance{}, repairRequired(repairReason, err)
 		}
-		if err := ensureAcceptedDeploymentIsCurrent(control, accepted); err != nil {
-			return err
+		current, err := s.store.GetAppInstance(accepted.InstanceID)
+		if err != nil {
+			return store.AppInstance{}, repairRequired(repairReason, err)
 		}
-		return mutate(metadata)
-	})
+		metadata := metadataFromInstance(current)
+		if err := mutate(metadata); err != nil {
+			return current, err
+		}
+		raw, err := json.Marshal(metadata)
+		if err != nil {
+			return current, repairRequired(repairReason, err)
+		}
+		next := current
+		next.Metadata = string(raw)
+		saved, err := projectionStore.SaveAIFARAcceptedProjectionWithLock(lock.ID, accepted, next, current.UpdatedAt)
+		if err == nil {
+			return saved, nil
+		}
+		if !errors.Is(err, store.ErrAppInstanceConflict) {
+			return current, repairRequired(repairReason, err)
+		}
+	}
+	return store.AppInstance{}, repairRequired(repairReason, store.ErrAppInstanceConflict)
 }
 
 func (s Service) updateAppInstanceMetadataWithLock(ctx context.Context, lock store.AIFAROrchestrationLock, instanceID, repairReason string, mutate func(map[string]any) error) (store.AppInstance, error) {
-	return s.updateAppInstanceMetadata(instanceID, repairReason, func(metadata map[string]any) error {
-		if err := s.ensureAIFAROrchestrationLockOwnership(ctx, lock); err != nil {
-			return err
+	casStore, ok := s.store.(runtimeConfigMetadataCASStore)
+	if !ok {
+		return store.AppInstance{}, repairRequired(repairReason, errors.New("runtime-config projection store is unavailable"))
+	}
+	for attempt := 0; attempt < appInstanceMetadataCASAttempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return store.AppInstance{}, repairRequired(repairReason, err)
 		}
-		return mutate(metadata)
-	})
+		current, err := s.store.GetAppInstance(instanceID)
+		if err != nil {
+			return store.AppInstance{}, repairRequired(repairReason, err)
+		}
+		metadata := metadataFromInstance(current)
+		if err := mutate(metadata); err != nil {
+			return current, err
+		}
+		raw, err := json.Marshal(metadata)
+		if err != nil {
+			return current, repairRequired(repairReason, err)
+		}
+		next := current
+		next.Metadata = string(raw)
+		saved, err := casStore.SaveAppInstanceIfUnchangedWithLock(lock.ID, next, current.UpdatedAt)
+		if err == nil {
+			return saved, nil
+		}
+		if !errors.Is(err, store.ErrAppInstanceConflict) {
+			return current, repairRequired(repairReason, err)
+		}
+	}
+	return store.AppInstance{}, repairRequired(repairReason, store.ErrAppInstanceConflict)
 }
 
 func runtimeObservedDeploymentStatus(status string) bool {

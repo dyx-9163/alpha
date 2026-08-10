@@ -1274,6 +1274,67 @@ func TestSaveAppInstanceIfUnchangedSupportsLegacyOffsetTimestamp(t *testing.T) {
 	}
 }
 
+func TestSaveAppInstanceIfUnchangedWithLockRequiresExactRuntimeConfigOwner(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "aifar.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	instance, err := db.SaveAppInstance(AppInstance{
+		App: "aifar", Version: "runtime-v2", ServerID: "srv-1", Status: "install_failed", Metadata: `{"runtimeConfig":{"configVersion":1}}`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct {
+		name string
+		lock AIFAROrchestrationLock
+	}{
+		{name: "service lock", lock: testAIFAROrchestrationLock(instance.ID, "permission", "runtime-config")},
+		{name: "wrong operation", lock: testAIFAROrchestrationLock(instance.ID, "", "install")},
+		{name: "wrong instance", lock: testAIFAROrchestrationLock("other-instance", "", "runtime-config")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			owner, err := db.AcquireAIFAROrchestrationLock(tc.lock)
+			if err != nil {
+				t.Fatal(err)
+			}
+			next := instance
+			next.Metadata = `{"runtimeConfig":{"configVersion":2}}`
+			if _, err := db.SaveAppInstanceIfUnchangedWithLock(owner.ID, next, instance.UpdatedAt); !errors.Is(err, ErrAIFAROrchestrationLockOwnership) {
+				t.Fatalf("error=%v, want exact runtime-config lock rejection", err)
+			}
+			if released, err := db.ReleaseAIFAROrchestrationLockByID(owner.ID); err != nil || !released {
+				t.Fatalf("release lock: released=%v err=%v", released, err)
+			}
+		})
+	}
+
+	owner, err := db.AcquireAIFAROrchestrationLock(testAIFAROrchestrationLock(instance.ID, "", "runtime-config"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	next := instance
+	next.Metadata = `{"runtimeConfig":{"configVersion":2,"lastApplyStatus":"pending"}}`
+	saved, err := db.SaveAppInstanceIfUnchangedWithLock(owner.ID, next, instance.UpdatedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if saved.Metadata != next.Metadata || saved.Status != "install_failed" {
+		t.Fatalf("saved runtime config=%+v", saved)
+	}
+	if _, err := db.SaveAppInstanceIfUnchangedWithLock(owner.ID, next, instance.UpdatedAt); !errors.Is(err, ErrAppInstanceConflict) {
+		t.Fatalf("stale token error=%v, want CAS conflict", err)
+	}
+	if released, err := db.ReleaseAIFAROrchestrationLockByID(owner.ID); err != nil || !released {
+		t.Fatalf("release owner: released=%v err=%v", released, err)
+	}
+	if _, err := db.SaveAppInstanceIfUnchangedWithLock(owner.ID, next, saved.UpdatedAt); !errors.Is(err, ErrAIFAROrchestrationLockOwnership) {
+		t.Fatalf("released owner error=%v, want ownership conflict", err)
+	}
+}
+
 func TestAppReleaseRetentionKeepsLatestThreeSuccesses(t *testing.T) {
 	db, err := Open(filepath.Join(t.TempDir(), "aifar.db"))
 	if err != nil {

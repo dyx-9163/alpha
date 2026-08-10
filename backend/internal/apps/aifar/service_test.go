@@ -122,7 +122,80 @@ type firstProjectionCASStore struct {
 	didBlock bool
 }
 
+type acceptedProjectionInterleavingStore struct {
+	*store.Store
+	aBlocked chan struct{}
+	aRelease chan struct{}
+	bBlocked chan struct{}
+	bRelease chan struct{}
+	aOnce    sync.Once
+	bOnce    sync.Once
+}
+
+func (s *acceptedProjectionInterleavingStore) blockProjection(next store.AppInstance) {
+	desired := desiredReplicasFromMetadata(metadataFromInstance(next))["permission"]
+	switch desired {
+	case 2:
+		s.aOnce.Do(func() {
+			close(s.aBlocked)
+			<-s.aRelease
+		})
+	case 3:
+		s.bOnce.Do(func() {
+			close(s.bBlocked)
+			<-s.bRelease
+		})
+	}
+}
+
+func (s *acceptedProjectionInterleavingStore) SaveAppInstanceIfUnchanged(next store.AppInstance, expectedUpdatedAt time.Time) (store.AppInstance, error) {
+	s.blockProjection(next)
+	return s.Store.SaveAppInstanceIfUnchanged(next, expectedUpdatedAt)
+}
+
+func (s *acceptedProjectionInterleavingStore) SaveAIFARAcceptedProjectionWithLock(lockID string, expected store.AIFARDeployment, next store.AppInstance, expectedUpdatedAt time.Time) (store.AppInstance, error) {
+	s.blockProjection(next)
+	return s.Store.SaveAIFARAcceptedProjectionWithLock(lockID, expected, next, expectedUpdatedAt)
+}
+
+type runtimeConfigPendingInterleavingStore struct {
+	*store.Store
+	blocked chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (s *runtimeConfigPendingInterleavingStore) blockOldPending(next store.AppInstance) {
+	state := runtimeConfigFromMetadata(metadataFromInstance(next))
+	if state.UpdatedBy == "old-owner" && state.LastApplyStatus == runtimeConfigStatusPending {
+		s.once.Do(func() {
+			close(s.blocked)
+			<-s.release
+		})
+	}
+}
+
+func (s *runtimeConfigPendingInterleavingStore) SaveAppInstanceIfUnchanged(next store.AppInstance, expectedUpdatedAt time.Time) (store.AppInstance, error) {
+	s.blockOldPending(next)
+	return s.Store.SaveAppInstanceIfUnchanged(next, expectedUpdatedAt)
+}
+
+func (s *runtimeConfigPendingInterleavingStore) SaveAppInstanceIfUnchangedWithLock(lockID string, next store.AppInstance, expectedUpdatedAt time.Time) (store.AppInstance, error) {
+	s.blockOldPending(next)
+	return s.Store.SaveAppInstanceIfUnchangedWithLock(lockID, next, expectedUpdatedAt)
+}
+
 func (s *firstProjectionCASStore) SaveAppInstanceIfUnchanged(next store.AppInstance, expectedUpdatedAt time.Time) (store.AppInstance, error) {
+	s.blockFirstProjection()
+	return s.Store.SaveAppInstanceIfUnchanged(next, expectedUpdatedAt)
+}
+
+func (s *firstProjectionCASStore) SaveAIFARAcceptedProjectionWithLock(lockID string, expected store.AIFARDeployment, next store.AppInstance, expectedUpdatedAt time.Time) (store.AppInstance, error) {
+	s.blockFirstProjection()
+	return s.Store.SaveAIFARAcceptedProjectionWithLock(lockID, expected, next, expectedUpdatedAt)
+}
+
+func (s *firstProjectionCASStore) blockFirstProjection() {
 	s.mu.Lock()
 	block := !s.didBlock
 	if block {
@@ -133,10 +206,19 @@ func (s *firstProjectionCASStore) SaveAppInstanceIfUnchanged(next store.AppInsta
 	if block {
 		<-s.release
 	}
-	return s.Store.SaveAppInstanceIfUnchanged(next, expectedUpdatedAt)
 }
 
 func (s *staleProjectionCASStore) SaveAppInstanceIfUnchanged(next store.AppInstance, expectedUpdatedAt time.Time) (store.AppInstance, error) {
+	s.blockStaleProjection(next)
+	return s.Store.SaveAppInstanceIfUnchanged(next, expectedUpdatedAt)
+}
+
+func (s *staleProjectionCASStore) SaveAIFARAcceptedProjectionWithLock(lockID string, expected store.AIFARDeployment, next store.AppInstance, expectedUpdatedAt time.Time) (store.AppInstance, error) {
+	s.blockStaleProjection(next)
+	return s.Store.SaveAIFARAcceptedProjectionWithLock(lockID, expected, next, expectedUpdatedAt)
+}
+
+func (s *staleProjectionCASStore) blockStaleProjection(next store.AppInstance) {
 	desired := desiredReplicasFromMetadata(metadataFromInstance(next))
 	if desired["permission"] == 2 {
 		s.once.Do(func() {
@@ -144,7 +226,6 @@ func (s *staleProjectionCASStore) SaveAppInstanceIfUnchanged(next store.AppInsta
 			<-s.release
 		})
 	}
-	return s.Store.SaveAppInstanceIfUnchanged(next, expectedUpdatedAt)
 }
 
 type alwaysConflictCASStore struct {
@@ -183,6 +264,13 @@ func (s *postAcceptanceRenewalFailureStore) SaveAppInstanceIfUnchanged(next stor
 	return s.Store.SaveAppInstanceIfUnchanged(next, expectedUpdatedAt)
 }
 
+func (s *postAcceptanceRenewalFailureStore) SaveAIFARAcceptedProjectionWithLock(lockID string, expected store.AIFARDeployment, next store.AppInstance, expectedUpdatedAt time.Time) (store.AppInstance, error) {
+	s.mu.Lock()
+	s.casCalls++
+	s.mu.Unlock()
+	return s.Store.SaveAIFARAcceptedProjectionWithLock(lockID, expected, next, expectedUpdatedAt)
+}
+
 func (s *postAcceptanceRenewalFailureStore) counts() (int, int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -200,6 +288,13 @@ func (s *renewalFailureStore) SaveAppInstanceIfUnchanged(next store.AppInstance,
 	s.casCalls++
 	s.mu.Unlock()
 	return s.Store.SaveAppInstanceIfUnchanged(next, expectedUpdatedAt)
+}
+
+func (s *renewalFailureStore) SaveAppInstanceIfUnchangedWithLock(lockID string, next store.AppInstance, expectedUpdatedAt time.Time) (store.AppInstance, error) {
+	s.mu.Lock()
+	s.casCalls++
+	s.mu.Unlock()
+	return s.Store.SaveAppInstanceIfUnchangedWithLock(lockID, next, expectedUpdatedAt)
 }
 
 func (s *renewalFailureStore) appInstanceCASCalls() int {
@@ -274,6 +369,16 @@ func (s *alwaysConflictCASStore) callCount() int {
 }
 
 func (s *barrierCASStore) SaveAppInstanceIfUnchanged(next store.AppInstance, expectedUpdatedAt time.Time) (store.AppInstance, error) {
+	s.blockCAS()
+	return s.Store.SaveAppInstanceIfUnchanged(next, expectedUpdatedAt)
+}
+
+func (s *barrierCASStore) SaveAIFARAcceptedProjectionWithLock(lockID string, expected store.AIFARDeployment, next store.AppInstance, expectedUpdatedAt time.Time) (store.AppInstance, error) {
+	s.blockCAS()
+	return s.Store.SaveAIFARAcceptedProjectionWithLock(lockID, expected, next, expectedUpdatedAt)
+}
+
+func (s *barrierCASStore) blockCAS() {
 	s.mu.Lock()
 	s.calls++
 	wait := s.remaining > 0
@@ -287,7 +392,6 @@ func (s *barrierCASStore) SaveAppInstanceIfUnchanged(next store.AppInstance, exp
 	if wait {
 		<-s.release
 	}
-	return s.Store.SaveAppInstanceIfUnchanged(next, expectedUpdatedAt)
 }
 
 func (s *barrierCASStore) callCount() int {
@@ -466,6 +570,32 @@ func (f *fakeStore) SaveAppInstance(v store.AppInstance) (store.AppInstance, err
 func (f *fakeStore) SaveAppInstanceIfUnchanged(next store.AppInstance, expectedUpdatedAt time.Time) (store.AppInstance, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	return f.saveAppInstanceIfUnchangedLocked(next, expectedUpdatedAt)
+}
+
+func (f *fakeStore) SaveAppInstanceIfUnchangedWithLock(_ string, next store.AppInstance, expectedUpdatedAt time.Time) (store.AppInstance, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.saveAppInstanceIfUnchangedLocked(next, expectedUpdatedAt)
+}
+
+func (f *fakeStore) SaveAIFARAcceptedProjectionWithLock(_ string, expected store.AIFARDeployment, next store.AppInstance, expectedUpdatedAt time.Time) (store.AppInstance, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	proofMatches := false
+	for _, current := range f.deployments {
+		if current.InstanceID == expected.InstanceID && current.ServiceName == expected.ServiceName && current.Generation == expected.Generation && current.CurrentRevision == expected.CurrentRevision && current.SpecJSON == expected.SpecJSON && (strings.EqualFold(current.Status, "Accepted") || current.ObservedGeneration >= current.Generation) {
+			proofMatches = true
+			break
+		}
+	}
+	if !proofMatches {
+		return store.AppInstance{}, store.ErrAIFARDeploymentGenerationConflict
+	}
+	return f.saveAppInstanceIfUnchangedLocked(next, expectedUpdatedAt)
+}
+
+func (f *fakeStore) saveAppInstanceIfUnchangedLocked(next store.AppInstance, expectedUpdatedAt time.Time) (store.AppInstance, error) {
 	f.saveCalls++
 	if f.failSaveOn > 0 && f.saveCalls == f.failSaveOn {
 		return store.AppInstance{}, errors.New("control-plane save failed")
@@ -1971,6 +2101,90 @@ func TestOlderSameServiceScaleCannotProjectOverAcceptedSuccessor(t *testing.T) {
 	}
 }
 
+func TestAcceptedSuccessorBeforeProjectionAtomicallyRejectsOldScaleProjection(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "aifar.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	instance := installedAIFARInstance(t)
+	instance.Status = "install_failed"
+	instance, err = db.SaveAppInstance(instance)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, deployment := range seedPerServiceDeployments(t, instance,
+		map[string]int{"permission": 1}, map[string]int64{"permission": 3},
+	) {
+		if _, err := db.SaveAIFARDeployment(deployment); err != nil {
+			t.Fatal(err)
+		}
+	}
+	barrier := &acceptedProjectionInterleavingStore{
+		Store: db, aBlocked: make(chan struct{}), aRelease: make(chan struct{}),
+		bBlocked: make(chan struct{}), bRelease: make(chan struct{}),
+	}
+	service := NewService(barrier, &fakeRemote{})
+	service.orchestrationLockHeartbeatInterval = time.Hour
+	server := store.Server{ID: "srv-1", Host: "10.0.0.10", DeployDir: "/aifar/apps"}
+	aDone := make(chan error, 1)
+	go func() {
+		aDone <- service.ScaleService(context.Background(), ScaleRequest{
+			Instance: instance, Server: server, Actor: "old-owner", TaskID: "task-scale-old-before-cas",
+			ServiceName: "permission", Replicas: 2,
+		}, fakeLogger{}, nil)
+	}()
+	select {
+	case <-barrier.aBlocked:
+	case err := <-aDone:
+		t.Fatalf("old operation ended before its projection CAS: %v", err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("old operation did not reach projection CAS")
+	}
+	if _, err := db.RecoverAIFAROrchestrationLocks(instance.ID, "test accepted successor takeover"); err != nil {
+		t.Fatal(err)
+	}
+	bDone := make(chan error, 1)
+	go func() {
+		bDone <- service.ScaleService(context.Background(), ScaleRequest{
+			Instance: instance, Server: server, Actor: "new-owner", TaskID: "task-scale-new-before-projection",
+			ServiceName: "permission", Replicas: 3,
+		}, fakeLogger{}, nil)
+	}()
+	select {
+	case <-barrier.bBlocked:
+	case err := <-bDone:
+		t.Fatalf("successor ended before projection barrier: %v", err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("successor did not accept before projection barrier")
+	}
+	close(barrier.aRelease)
+	aErr := <-aDone
+	beforeSuccessorProjection, err := db.GetAppInstance(instance.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	close(barrier.bRelease)
+	bErr := <-bDone
+	var controlErr *deploymentControlError
+	if !errors.As(aErr, &controlErr) || controlErr.StableCode() != runtimeControlPlaneRepairCode {
+		t.Fatalf("old operation error=%v, want repair-required", aErr)
+	}
+	if got := desiredReplicasFromMetadata(metadataFromInstance(beforeSuccessorProjection))["permission"]; got != 1 {
+		t.Fatalf("old owner projected after accepted successor: desired=%d metadata=%s", got, beforeSuccessorProjection.Metadata)
+	}
+	if bErr != nil {
+		t.Fatalf("successor projection failed: %v", bErr)
+	}
+	final, err := db.GetAppInstance(instance.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if final.Status != "install_failed" || desiredReplicasFromMetadata(metadataFromInstance(final))["permission"] != 3 {
+		t.Fatalf("successor projection/lifecycle=%+v metadata=%s", final, final.Metadata)
+	}
+}
+
 func TestScaleValidAgentAcceptanceThenLockLossRequiresRepairWithoutProjection(t *testing.T) {
 	db, err := store.Open(filepath.Join(t.TempDir(), "aifar.db"))
 	if err != nil {
@@ -2638,6 +2852,79 @@ func TestRuntimeConfigLockRenewalFailureCancelsRemoteAndStopsMetadataCAS(t *test
 	}
 	if len(active) != 0 {
 		t.Fatalf("lost runtime-config lock remained active: %+v", active)
+	}
+}
+
+func TestRecoveredRuntimeConfigOwnerCannotOverwriteSuccessorAfterPendingCASConflict(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "aifar.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	instance := installedAIFARInstance(t)
+	instance.Status = "install_failed"
+	instanceMetadata := metadataFromInstance(instance)
+	instanceMetadata["services"] = []string{"permission"}
+	instance.Metadata = mustMetadata(t, instanceMetadata)
+	instance, err = db.SaveAppInstance(instance)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, deployment := range seedPerServiceDeployments(t, instance, map[string]int{"permission": 1}, nil) {
+		if _, err := db.SaveAIFARDeployment(deployment); err != nil {
+			t.Fatal(err)
+		}
+	}
+	barrier := &runtimeConfigPendingInterleavingStore{Store: db, blocked: make(chan struct{}), release: make(chan struct{})}
+	service := NewService(barrier, &fakeRemote{})
+	service.orchestrationLockHeartbeatInterval = time.Hour
+	server := store.Server{ID: "srv-1", Host: "10.0.0.10", DeployDir: "/aifar/apps"}
+	aDone := make(chan error, 1)
+	go func() {
+		aDone <- service.ApplyRuntimeConfig(context.Background(), RuntimeConfigRequest{
+			Instance: instance, Server: server, Actor: "old-owner", TaskID: "task-config-old",
+			Config: RuntimeConfigPayload{Global: RuntimeConfigValues{
+				AppCPUs: "2", AppMemoryLimit: "2GB", JVMInitialRAMPercentage: 25, JVMMaxRAMPercentage: 75,
+			}},
+		}, fakeLogger{}, nil)
+	}()
+	select {
+	case <-barrier.blocked:
+	case err := <-aDone:
+		t.Fatalf("old config ended before pending CAS: %v", err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("old config did not reach pending CAS")
+	}
+	if _, err := db.RecoverAIFAROrchestrationLocks(instance.ID, "test runtime-config successor takeover"); err != nil {
+		t.Fatal(err)
+	}
+	bErr := service.ApplyRuntimeConfig(context.Background(), RuntimeConfigRequest{
+		Instance: instance, Server: server, Actor: "new-owner", TaskID: "task-config-new",
+		Config: RuntimeConfigPayload{Global: RuntimeConfigValues{
+			AppCPUs: "4", AppMemoryLimit: "4GB", JVMInitialRAMPercentage: 30, JVMMaxRAMPercentage: 70,
+		}},
+	}, fakeLogger{}, nil)
+	if bErr != nil {
+		t.Fatalf("successor config failed: %v", bErr)
+	}
+	beforeOldResume, err := db.GetAppInstance(instance.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	close(barrier.release)
+	aErr := <-aDone
+	var controlErr *deploymentControlError
+	if !errors.As(aErr, &controlErr) || controlErr.StableCode() != runtimeControlPlaneRepairCode {
+		t.Fatalf("old config error=%v, want repair-required", aErr)
+	}
+	final, err := db.GetAppInstance(instance.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := runtimeConfigFromMetadata(metadataFromInstance(beforeOldResume))
+	got := runtimeConfigFromMetadata(metadataFromInstance(final))
+	if final.Status != "install_failed" || got.ConfigVersion != want.ConfigVersion || got.AppliedVersion != want.AppliedVersion || got.LastApplyStatus != runtimeConfigStatusApplied || got.UpdatedBy != "new-owner" || got.Global.AppCPUs != "4" {
+		t.Fatalf("old owner overwrote successor: before=%+v final=%+v metadata=%s", want, got, final.Metadata)
 	}
 }
 

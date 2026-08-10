@@ -261,6 +261,71 @@ func TestAcceptAIFARDeploymentWithLockSupportsExactServiceOwnerAndRejectsPredece
 	}
 }
 
+func TestSaveAIFARAcceptedProjectionWithLockAtomicallyRequiresOwnerProofAndInstanceCAS(t *testing.T) {
+	db := openTestStore(t)
+	instance, err := db.SaveAppInstance(AppInstance{
+		App: "aifar", Version: "runtime-v2", ServerID: "srv-1", Status: "install_failed", Metadata: `{"desiredReplicas":{"permission":1}}`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	accepted, err := db.SaveAIFARDeployment(AIFARDeployment{
+		InstanceID: instance.ID, ServiceName: "permission", DesiredReplicas: 2,
+		CurrentRevision: "rev-2", SpecJSON: `{"service":"permission","revision":"rev-2","replicas":2}`,
+		Generation: 2, Status: "Accepted",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner, err := db.AcquireAIFAROrchestrationLock(testAIFAROrchestrationLock(instance.ID, "permission", "scale-service"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	next := instance
+	next.Metadata = `{"desiredReplicas":{"permission":2}}`
+	saved, err := db.SaveAIFARAcceptedProjectionWithLock(owner.ID, accepted, next, instance.UpdatedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if saved.Status != "install_failed" || saved.Metadata != next.Metadata || !saved.UpdatedAt.After(instance.UpdatedAt) {
+		t.Fatalf("saved projection=%+v", saved)
+	}
+
+	staleNext := saved
+	staleNext.Metadata = `{"desiredReplicas":{"permission":3}}`
+	wrongProof := accepted
+	wrongProof.Generation++
+	if _, err := db.SaveAIFARAcceptedProjectionWithLock(owner.ID, wrongProof, staleNext, saved.UpdatedAt); !errors.Is(err, ErrAIFARDeploymentGenerationConflict) {
+		t.Fatalf("wrong canonical proof error=%v, want generation conflict", err)
+	}
+	if _, err := db.SaveAIFARAcceptedProjectionWithLock(owner.ID, accepted, staleNext, instance.UpdatedAt); !errors.Is(err, ErrAppInstanceConflict) {
+		t.Fatalf("stale app-instance token error=%v, want CAS conflict", err)
+	}
+	if released, err := db.ReleaseAIFAROrchestrationLockByID(owner.ID); err != nil || !released {
+		t.Fatalf("release owner: released=%v err=%v", released, err)
+	}
+	globalInstall, err := db.AcquireAIFAROrchestrationLock(testAIFAROrchestrationLock(instance.ID, "", "install"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.SaveAIFARAcceptedProjectionWithLock(globalInstall.ID, accepted, staleNext, saved.UpdatedAt); !errors.Is(err, ErrAIFAROrchestrationLockOwnership) {
+		t.Fatalf("global install projection error=%v, want exact service ownership conflict", err)
+	}
+	if released, err := db.ReleaseAIFAROrchestrationLockByID(globalInstall.ID); err != nil || !released {
+		t.Fatalf("release global install lock: released=%v err=%v", released, err)
+	}
+	if _, err := db.SaveAIFARAcceptedProjectionWithLock(owner.ID, accepted, staleNext, saved.UpdatedAt); !errors.Is(err, ErrAIFAROrchestrationLockOwnership) {
+		t.Fatalf("released owner error=%v, want ownership conflict", err)
+	}
+	current, err := db.GetAppInstance(instance.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.Metadata != next.Metadata {
+		t.Fatalf("rejected projection changed metadata: %s", current.Metadata)
+	}
+}
+
 func TestSaveAIFARInitialDesiredWithLockRejectsExpiredOwnerAtomically(t *testing.T) {
 	db := openTestStore(t)
 	now := time.Now().UTC()

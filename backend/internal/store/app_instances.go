@@ -25,15 +25,47 @@ func (s *Store) SaveAppInstance(v AppInstance) (AppInstance, error) {
 }
 
 func (s *Store) SaveAppInstanceIfUnchanged(next AppInstance, expectedUpdatedAt time.Time) (AppInstance, error) {
-	freshUpdatedAt := time.Now().UTC()
-	if freshUpdatedAt.Sub(expectedUpdatedAt) < time.Millisecond {
-		freshUpdatedAt = expectedUpdatedAt.Add(time.Millisecond)
-	}
 	tx, err := s.db.Begin()
 	if err != nil {
 		return AppInstance{}, err
 	}
 	defer tx.Rollback()
+	saved, err := saveAppInstanceIfUnchangedTx(tx, next, expectedUpdatedAt)
+	if err != nil {
+		return AppInstance{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return AppInstance{}, err
+	}
+	return saved, nil
+}
+
+// SaveAppInstanceIfUnchangedWithLock persists runtime-config metadata only
+// while lockID is the exact active global runtime-config owner for next.ID.
+func (s *Store) SaveAppInstanceIfUnchangedWithLock(lockID string, next AppInstance, expectedUpdatedAt time.Time) (AppInstance, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return AppInstance{}, err
+	}
+	defer tx.Rollback()
+	if err := fenceActiveAIFARRuntimeConfigLockTx(tx, lockID, next.ID, time.Now().UTC()); err != nil {
+		return AppInstance{}, err
+	}
+	saved, err := saveAppInstanceIfUnchangedTx(tx, next, expectedUpdatedAt)
+	if err != nil {
+		return AppInstance{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return AppInstance{}, err
+	}
+	return saved, nil
+}
+
+func saveAppInstanceIfUnchangedTx(tx *sql.Tx, next AppInstance, expectedUpdatedAt time.Time) (AppInstance, error) {
+	freshUpdatedAt := time.Now().UTC()
+	if freshUpdatedAt.Sub(expectedUpdatedAt) < time.Millisecond {
+		freshUpdatedAt = expectedUpdatedAt.Add(time.Millisecond)
+	}
 	result, err := tx.Exec(`update app_instances set version=?,server_id=?,status=?,topology=?,metadata=?,updated_at=? where id=? and updated_at=?`,
 		next.Version, next.ServerID, next.Status, next.Topology, next.Metadata, freshUpdatedAt, next.ID, expectedUpdatedAt)
 	if err != nil {
@@ -49,9 +81,6 @@ func (s *Store) SaveAppInstanceIfUnchanged(next AppInstance, expectedUpdatedAt t
 	var saved AppInstance
 	if err := tx.QueryRow(`select id,app,version,server_id,status,topology,metadata,created_at,updated_at from app_instances where id=?`, next.ID).
 		Scan(&saved.ID, &saved.App, &saved.Version, &saved.ServerID, &saved.Status, &saved.Topology, &saved.Metadata, &saved.CreatedAt, &saved.UpdatedAt); err != nil {
-		return AppInstance{}, err
-	}
-	if err := tx.Commit(); err != nil {
 		return AppInstance{}, err
 	}
 	return saved, nil

@@ -288,7 +288,7 @@ func (s Service) ApplyRuntimeConfig(ctx context.Context, req RuntimeConfigReques
 	now := time.Now().UTC()
 
 	if err := step(1, func() error {
-		saved, saveErr := s.updateAppInstanceMetadata(current.ID, "AIFAR_RUNTIME_CONFIG_METADATA_REPAIR_REQUIRED", func(freshMetadata map[string]any) error {
+		saved, saveErr := s.updateAppInstanceMetadataWithLock(ctx, lock, current.ID, "AIFAR_RUNTIME_CONFIG_METADATA_REPAIR_REQUIRED", func(freshMetadata map[string]any) error {
 			if err := ensureK8sLikeMetadata(freshMetadata, UpdateCopy{LegacyUpdateUnsupported: "legacy AIFAR orchestration model %s does not support runtime config; reinstall with k8s-like orchestration first"}); err != nil {
 				return err
 			}
