@@ -111,7 +111,12 @@ func (s *Store) CommitAIFARRuntimeMigrationWithLock(commit AIFARRuntimeMigration
 		expected := item.Expected
 		next := item.Next
 		result, err := tx.Exec(`update aifar_deployments set
-			spec_json=?,status=?,metadata_json=?,conditions_json=?,last_transition_at=?,updated_at=?
+			spec_json=?,
+			status=case when observed_generation=0 then ? else status end,
+			metadata_json=case when observed_generation=0 then ? else metadata_json end,
+			conditions_json=case when observed_generation=0 then ? else conditions_json end,
+			last_transition_at=case when observed_generation=0 then ? else last_transition_at end,
+			updated_at=?
 			where instance_id=? and service_name=? and generation=1 and observed_generation<=1
 				and desired_replicas=? and current_revision=? and coalesce(spec_json,'')=?`,
 			next.SpecJSON, next.Status, next.MetadataJSON, next.ConditionsJSON, nullableTime(next.LastTransitionAt), now,

@@ -29,7 +29,8 @@ var (
 	agentInstancePattern  = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
 	agentServicePattern   = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,62}$`)
 	agentErrorCodePattern = regexp.MustCompile(`^[A-Z][A-Z0-9_]{0,63}$`)
-	perServiceFeatures    = []string{"service-manifest-v1", "service-generation-v1", "per-service-reconcile", "per-service-restart", "service-conditions-v1"}
+	agentSHA256Pattern    = regexp.MustCompile(`^[0-9a-f]{64}$`)
+	perServiceFeatures    = []string{"service-manifest-v1", "service-generation-v1", "per-service-reconcile", "per-service-restart", "service-conditions-v1", "runtime-instance-snapshot-v1", "durable-legacy-archive-v1"}
 )
 
 func main() {
@@ -92,7 +93,7 @@ func main() {
 			os.Exit(1)
 		}
 		fmt.Println(`{"status":"restarted"}`)
-	case "apply-deployment", "get-deployment", "reconcile-deployment", "bootstrap-runtime":
+	case "apply-deployment", "get-deployment", "get-instance-snapshot", "archive-legacy-runtime", "reconcile-deployment", "bootstrap-runtime":
 		if err := runServiceAgentCommand(os.Args[1], os.Args[2:], os.Stdout); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
@@ -126,7 +127,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: aifar-agent health | status | apply-deployment --manifest <file> | get-deployment --instance <id> --service <name> | reconcile-deployment --instance <id> --service <name> | bootstrap-runtime --spec <file> | reconcile-runtime --spec <file> | restart-runtime --spec <file> | reconcile-ingress --spec <file> | remove-instance [--instance admin] | register-nacos [--state-dir dir] | deregister-nacos [--state-dir dir] | serve [--addr 127.0.0.1:18081]")
+	fmt.Fprintln(os.Stderr, "usage: aifar-agent health | status | apply-deployment --manifest <file> | get-deployment --instance <id> --service <name> | get-instance-snapshot --instance <id> | archive-legacy-runtime --instance <id> --sha256 <digest> | reconcile-deployment --instance <id> --service <name> | bootstrap-runtime --spec <file> | reconcile-runtime --spec <file> | restart-runtime --spec <file> | reconcile-ingress --spec <file> | remove-instance [--instance admin] | register-nacos [--state-dir dir] | deregister-nacos [--state-dir dir] | serve [--addr 127.0.0.1:18081]")
 }
 
 func readSpec(path string) (runtimeagent.RuntimeSpec, error) {
@@ -288,6 +289,42 @@ func newAgentHandler(manager *runtimeagent.Manager, healthCheck func(context.Con
 		writeJSON(w, http.StatusOK, map[string]string{"status": "restarted"})
 	})
 	mux.HandleFunc("/runtime/instances/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			instance, ok := parseInstanceSnapshotPath(r.URL.EscapedPath())
+			if !ok {
+				writeAgentError(w, http.StatusBadRequest, "INVALID_INSTANCE_PATH", "runtime instance path is invalid", nil)
+				return
+			}
+			if !ensureEmptyAgentBody(w, r) {
+				return
+			}
+			snapshot, err := manager.RuntimeInstanceSnapshot(instance)
+			if err != nil {
+				writeAgentError(w, http.StatusConflict, "INSTANCE_SNAPSHOT_UNAVAILABLE", "runtime instance snapshot is unavailable", nil)
+				return
+			}
+			writeJSON(w, http.StatusOK, snapshot)
+			return
+		}
+		if r.Method == http.MethodPost {
+			instance, ok := parseInstanceArchivePath(r.URL.EscapedPath())
+			if !ok {
+				writeAgentError(w, http.StatusBadRequest, "INVALID_INSTANCE_PATH", "runtime instance path is invalid", nil)
+				return
+			}
+			var request struct {
+				ExpectedSHA256 string `json:"expectedSHA256"`
+			}
+			if !decodeAgentJSON(w, r, &request) {
+				return
+			}
+			if err := manager.ArchiveLegacyRuntimeSpec(instance, request.ExpectedSHA256); err != nil {
+				writeAgentError(w, http.StatusConflict, "LEGACY_RUNTIME_ARCHIVE_FAILED", "legacy runtime archive failed", nil)
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]bool{"archived": true})
+			return
+		}
 		if r.Method != http.MethodDelete {
 			writeAgentError(w, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "method not allowed", nil)
 			return
@@ -629,6 +666,7 @@ func runServiceAgentCommand(name string, args []string, out io.Writer) error {
 	serviceName := command.String("service", "", "runtime service name")
 	manifestPath := command.String("manifest", "", "deployment manifest json")
 	specPath := command.String("spec", "", "legacy runtime spec json")
+	expectedSHA256 := command.String("sha256", "", "expected legacy runtime spec SHA-256")
 	if err := command.Parse(args); err != nil {
 		return errors.New("invalid command flags")
 	}
@@ -643,7 +681,7 @@ func runServiceAgentCommand(name string, args []string, out io.Writer) error {
 	defer cancel()
 	switch name {
 	case "apply-deployment":
-		if strings.TrimSpace(*manifestPath) == "" || *instanceID != "" || *serviceName != "" || *specPath != "" {
+		if strings.TrimSpace(*manifestPath) == "" || *instanceID != "" || *serviceName != "" || *specPath != "" || *expectedSHA256 != "" {
 			return errors.New("--manifest is required")
 		}
 		manifest, err := readDeploymentManifest(*manifestPath)
@@ -661,7 +699,7 @@ func runServiceAgentCommand(name string, args []string, out io.Writer) error {
 		}
 		return doAgentTypedRequest(ctx, *addr, http.MethodPut, deploymentAgentPath(instance, service, false), data, out)
 	case "get-deployment", "reconcile-deployment":
-		if *manifestPath != "" || *specPath != "" {
+		if *manifestPath != "" || *specPath != "" || *expectedSHA256 != "" {
 			return errors.New("unsupported flags for deployment command")
 		}
 		instance := strings.TrimSpace(*instanceID)
@@ -676,8 +714,28 @@ func runServiceAgentCommand(name string, args []string, out io.Writer) error {
 			reconcile = true
 		}
 		return doAgentTypedRequest(ctx, *addr, method, deploymentAgentPath(instance, service, reconcile), nil, out)
+	case "get-instance-snapshot":
+		if *manifestPath != "" || *specPath != "" || *serviceName != "" || *expectedSHA256 != "" {
+			return errors.New("unsupported flags for instance snapshot command")
+		}
+		instance := strings.TrimSpace(*instanceID)
+		if !validAgentInstanceID(instance) {
+			return errors.New("--instance is required and must be valid")
+		}
+		return doAgentTypedRequest(ctx, *addr, http.MethodGet, instanceSnapshotAgentPath(instance), nil, out)
+	case "archive-legacy-runtime":
+		if *manifestPath != "" || *specPath != "" || *serviceName != "" {
+			return errors.New("unsupported flags for legacy runtime archive command")
+		}
+		instance := strings.TrimSpace(*instanceID)
+		digest := strings.ToLower(strings.TrimSpace(*expectedSHA256))
+		if !validAgentInstanceID(instance) || !agentSHA256Pattern.MatchString(digest) {
+			return errors.New("--instance and --sha256 are required and must be valid")
+		}
+		data, _ := json.Marshal(map[string]string{"expectedSHA256": digest})
+		return doAgentTypedRequest(ctx, *addr, http.MethodPost, instanceArchiveAgentPath(instance), data, out)
 	case "bootstrap-runtime":
-		if strings.TrimSpace(*specPath) == "" || *manifestPath != "" || *instanceID != "" || *serviceName != "" {
+		if strings.TrimSpace(*specPath) == "" || *manifestPath != "" || *instanceID != "" || *serviceName != "" || *expectedSHA256 != "" {
 			return errors.New("--spec is required")
 		}
 		spec, err := readLegacyRuntimeSpec(*specPath)
@@ -769,6 +827,38 @@ func deploymentAgentPath(instanceID, serviceName string, reconcile bool) string 
 		path += "/reconcile"
 	}
 	return path
+}
+
+func instanceSnapshotAgentPath(instanceID string) string {
+	return "/runtime/instances/" + url.PathEscape(instanceID) + "/snapshot"
+}
+
+func instanceArchiveAgentPath(instanceID string) string {
+	return "/runtime/instances/" + url.PathEscape(instanceID) + "/archive-legacy-runtime"
+}
+
+func parseInstanceSnapshotPath(escapedPath string) (string, bool) {
+	parts := strings.Split(escapedPath, "/")
+	if len(parts) != 5 || parts[0] != "" || parts[1] != "runtime" || parts[2] != "instances" || parts[4] != "snapshot" {
+		return "", false
+	}
+	instanceID, err := url.PathUnescape(parts[3])
+	if err != nil || instanceID != parts[3] || !validAgentInstanceID(instanceID) {
+		return "", false
+	}
+	return instanceID, true
+}
+
+func parseInstanceArchivePath(escapedPath string) (string, bool) {
+	parts := strings.Split(escapedPath, "/")
+	if len(parts) != 5 || parts[0] != "" || parts[1] != "runtime" || parts[2] != "instances" || parts[4] != "archive-legacy-runtime" {
+		return "", false
+	}
+	instanceID, err := url.PathUnescape(parts[3])
+	if err != nil || instanceID != parts[3] || !validAgentInstanceID(instanceID) {
+		return "", false
+	}
+	return instanceID, true
 }
 
 func doAgentTypedRequest(ctx context.Context, addr, method, path string, body []byte, out io.Writer) error {

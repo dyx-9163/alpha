@@ -797,6 +797,44 @@ func TestCommitAIFARRuntimeMigrationAtomicallyPreservesLifecycleAndPeerMetadata(
 	}
 }
 
+func TestCommitAIFARRuntimeMigrationDoesNotRegressObservedGenerationOneProjection(t *testing.T) {
+	db := openTestStore(t)
+	instance, err := db.SaveAppInstance(AppInstance{ID: "instance-1", App: "aifar", Version: "runtime-v2", ServerID: "srv-1", Status: "installed", Metadata: `{"orchestrationModel":"agent-runtime-v2"}`})
+	if err != nil {
+		t.Fatal(err)
+	}
+	transition := time.Date(2026, 7, 1, 2, 3, 4, 0, time.UTC)
+	base, err := db.SaveAIFARDeployment(AIFARDeployment{
+		InstanceID: instance.ID, ServiceName: "permission", DesiredReplicas: 1, CurrentRevision: "rev-1",
+		Generation: 1, ObservedGeneration: 1, Status: "Available", MetadataJSON: `{"runtime":"peer"}`,
+		ConditionsJSON: `[{"type":"Available","status":true,"generation":1}]`, LastTransitionAt: transition,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner, err := db.AcquireAIFAROrchestrationLock(testAIFAROrchestrationLock(instance.ID, "", "migrate-runtime-model"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	next := base
+	next.SpecJSON = `{"service":"permission"}`
+	next.Status = "Accepted"
+	next.MetadataJSON = `{"model":"agent-service-controller-v1"}`
+	next.ConditionsJSON = `[{"type":"Accepted","status":true,"generation":1}]`
+	next.LastTransitionAt = transition.Add(time.Hour)
+	if _, err := db.CommitAIFARRuntimeMigrationWithLock(AIFARRuntimeMigrationCommit{
+		LockID: owner.ID, InstanceID: instance.ID, ExpectedInstanceUpdatedAt: instance.UpdatedAt,
+		NextMetadata: `{"orchestrationModel":"agent-service-controller-v1"}`,
+		Deployments:  []AIFARRuntimeMigrationDeploymentCommit{{Expected: base, Next: next}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	committed := deploymentByName(t, db, instance.ID, "permission")
+	if committed.SpecJSON != next.SpecJSON || committed.Status != base.Status || committed.MetadataJSON != base.MetadataJSON || committed.ConditionsJSON != base.ConditionsJSON || !committed.LastTransitionAt.Equal(transition) {
+		t.Fatalf("observed runtime projection regressed: %+v", committed)
+	}
+}
+
 func testAIFAROrchestrationLock(instanceID, serviceName, operation string) AIFAROrchestrationLock {
 	now := time.Now().UTC()
 	return AIFAROrchestrationLock{

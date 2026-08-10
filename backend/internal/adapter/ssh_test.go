@@ -3,8 +3,14 @@ package adapter
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -12,6 +18,83 @@ import (
 
 	"aifar-deployment/backend/internal/store"
 )
+
+func TestAtomicVerifiedUploadCommandRejectsSymlinkAndCleansHashFailure(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("remote upload shell contract runs on Linux targets")
+	}
+	body := []byte("validated migration snapshot\n")
+	digest := sha256.Sum256(body)
+	hash := hex.EncodeToString(digest[:])
+
+	t.Run("symlink parent cannot overwrite victim", func(t *testing.T) {
+		root := t.TempDir()
+		victimDir := filepath.Join(root, "victim")
+		if err := os.Mkdir(victimDir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		victimPath := filepath.Join(victimDir, "victim.txt")
+		if err := os.WriteFile(victimPath, []byte("unchanged"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		linkPath := filepath.Join(root, "linked")
+		if err := os.Symlink(victimDir, linkPath); err != nil {
+			t.Fatal(err)
+		}
+		remoteDir := filepath.ToSlash(filepath.Join(linkPath, "migration"))
+		stageDir := remoteDir + "/.aifar-stage-test"
+		command := atomicVerifiedUploadCommand(remoteDir, stageDir, stageDir+"/.payload.part", stageDir+"/runtime-spec.json", 0o600, int64(len(body)), hash)
+		cmd := exec.Command("sh", "-c", command)
+		cmd.Stdin = bytes.NewReader(body)
+		if err := cmd.Run(); err == nil {
+			t.Fatal("symlink parent was accepted")
+		}
+		got, err := os.ReadFile(victimPath)
+		if err != nil || string(got) != "unchanged" {
+			t.Fatalf("symlink victim changed: body=%q err=%v", got, err)
+		}
+	})
+
+	t.Run("hash mismatch removes partial and final", func(t *testing.T) {
+		remoteDir := filepath.ToSlash(filepath.Join(t.TempDir(), "migration"))
+		stageDir := remoteDir + "/.aifar-stage-test"
+		command := atomicVerifiedUploadCommand(remoteDir, stageDir, stageDir+"/.payload.part", stageDir+"/runtime-spec.json", 0o600, int64(len(body)), strings.Repeat("0", 64))
+		cmd := exec.Command("sh", "-c", command)
+		cmd.Stdin = bytes.NewReader(body)
+		if err := cmd.Run(); err == nil {
+			t.Fatal("hash mismatch was accepted")
+		}
+		if _, err := os.Lstat(stageDir); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("failed verified upload left staging debris: %v", err)
+		}
+	})
+
+	t.Run("exact bytes land atomically with requested mode", func(t *testing.T) {
+		remoteDir := filepath.ToSlash(filepath.Join(t.TempDir(), "migration"))
+		stageDir := remoteDir + "/.aifar-stage-test"
+		finalPath := stageDir + "/runtime-spec.json"
+		command := atomicVerifiedUploadCommand(remoteDir, stageDir, stageDir+"/.payload.part", finalPath, 0o600, int64(len(body)), hash)
+		cmd := exec.Command("sh", "-c", command)
+		cmd.Stdin = bytes.NewReader(body)
+		if output, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("verified upload command failed: %v output=%s", err, output)
+		}
+		got, err := os.ReadFile(finalPath)
+		if err != nil || !bytes.Equal(got, body) {
+			t.Fatalf("landed bytes differ: body=%q err=%v", got, err)
+		}
+		info, err := os.Stat(finalPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Mode().Perm() != 0o600 {
+			t.Fatalf("landed mode=%v", info.Mode().Perm())
+		}
+		if _, err := os.Lstat(stageDir + "/.payload.part"); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("successful upload left partial file: %v", err)
+		}
+	})
+}
 
 type closedPipeWriter struct{}
 

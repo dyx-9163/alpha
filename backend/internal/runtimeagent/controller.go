@@ -2,7 +2,14 @@ package runtimeagent
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -137,6 +144,257 @@ func (m *Manager) DeploymentState(instanceID, serviceName string) (DeploymentSta
 	}
 	state.Conditions = append([]DeploymentCondition(nil), state.Conditions...)
 	return state, true
+}
+
+func (m *Manager) RuntimeInstanceSnapshot(instanceID string) (RuntimeInstanceSnapshot, error) {
+	instanceID = strings.TrimSpace(instanceID)
+	maintenance := m.instanceMaintenanceLock(instanceID)
+	maintenance.RLock()
+	defer maintenance.RUnlock()
+	instance, err := m.manifestStore.GetInstance(instanceID)
+	if err != nil {
+		return RuntimeInstanceSnapshot{}, err
+	}
+	manifests, err := m.manifestStore.List(instanceID)
+	if err != nil {
+		return RuntimeInstanceSnapshot{}, err
+	}
+	if len(manifests) > 256 {
+		return RuntimeInstanceSnapshot{}, errors.New("runtime instance snapshot exceeds deployment limit")
+	}
+	snapshot := RuntimeInstanceSnapshot{Instance: instance, Deployments: make([]RuntimeDeploymentSnapshot, 0, len(manifests))}
+	for _, manifest := range manifests {
+		hash, hashErr := DeploymentManifestSpecHash(manifest)
+		if hashErr != nil {
+			return RuntimeInstanceSnapshot{}, hashErr
+		}
+		state, exists := m.DeploymentState(instanceID, manifest.Metadata.Name)
+		if !exists {
+			state = DeploymentState{
+				InstanceID: instanceID, ServiceName: manifest.Metadata.Name,
+				Generation: manifest.Metadata.Generation, SpecHash: hash,
+				DesiredReplicas: manifest.Spec.Replicas,
+			}
+		}
+		snapshot.Deployments = append(snapshot.Deployments, RuntimeDeploymentSnapshot{
+			ServiceName: manifest.Metadata.Name, ManifestGeneration: manifest.Metadata.Generation,
+			ManifestSpecHash: hash, StateGeneration: state.Generation,
+			ObservedGeneration: state.ObservedGeneration, StateSpecHash: state.SpecHash,
+			DesiredReplicas: state.DesiredReplicas,
+		})
+	}
+	return snapshot, nil
+}
+
+type legacyRuntimeArchiveOps struct {
+	lstat      func(string) (os.FileInfo, error)
+	open       func(string) (*os.File, error)
+	createTemp func(string, string) (*os.File, error)
+	rename     func(string, string) error
+	remove     func(string) error
+	syncFile   func(*os.File) error
+	syncDir    func(string) error
+}
+
+func defaultLegacyRuntimeArchiveOps() legacyRuntimeArchiveOps {
+	return legacyRuntimeArchiveOps{
+		lstat: os.Lstat, open: os.Open, createTemp: os.CreateTemp,
+		rename: os.Rename, remove: os.Remove,
+		syncFile: func(file *os.File) error {
+			if runtime.GOOS == "windows" {
+				return nil
+			}
+			return file.Sync()
+		},
+		syncDir: func(directory string) error {
+			if runtime.GOOS == "windows" {
+				return nil
+			}
+			file, err := os.Open(directory)
+			if err != nil {
+				return err
+			}
+			defer file.Close()
+			return file.Sync()
+		},
+	}
+}
+
+func (m *Manager) ArchiveLegacyRuntimeSpec(instanceID, expectedSHA256 string) error {
+	instanceID = strings.TrimSpace(instanceID)
+	maintenance := m.instanceMaintenanceLock(instanceID)
+	maintenance.Lock()
+	defer maintenance.Unlock()
+	config, err := m.manifestStore.GetInstance(instanceID)
+	if err != nil {
+		return err
+	}
+	return durableArchiveLegacyRuntimeSpec(config, expectedSHA256, defaultLegacyRuntimeArchiveOps())
+}
+
+func durableArchiveLegacyRuntimeSpec(config InstanceConfig, expectedSHA256 string, ops legacyRuntimeArchiveOps) (returnErr error) {
+	expectedSHA256 = strings.ToLower(strings.TrimSpace(expectedSHA256))
+	decoded, err := hex.DecodeString(expectedSHA256)
+	if err != nil || len(decoded) != sha256.Size {
+		return errors.New("legacy runtime archive hash is invalid")
+	}
+	directory := filepath.Join(config.InstallRoot, "runtime", "agent")
+	legacyPath := filepath.Join(directory, "runtime-spec.json")
+	backupPath := filepath.Join(directory, "runtime-spec.legacy-readonly.json")
+	if err := validateArchivePathComponents(directory, ops.lstat); err != nil {
+		return fmt.Errorf("validate legacy runtime archive path: %w", err)
+	}
+
+	backupExists, err := verifiedRegularFile(backupPath, expectedSHA256, ops)
+	if err != nil {
+		return err
+	}
+	legacyExists, err := verifiedRegularFile(legacyPath, expectedSHA256, ops)
+	if err != nil {
+		return err
+	}
+	if !backupExists && !legacyExists {
+		return errors.New("verified legacy runtime source is unavailable")
+	}
+	if !backupExists {
+		source, err := ops.open(legacyPath)
+		if err != nil {
+			return err
+		}
+		defer source.Close()
+		temporary, err := ops.createTemp(directory, ".runtime-spec.legacy-*")
+		if err != nil {
+			return err
+		}
+		temporaryPath := temporary.Name()
+		defer func() {
+			_ = temporary.Close()
+			if cleanupErr := ops.remove(temporaryPath); cleanupErr != nil && !errors.Is(cleanupErr, os.ErrNotExist) {
+				returnErr = fmt.Errorf("legacy runtime archive cleanup failed: %w", errors.Join(returnErr, cleanupErr))
+			}
+		}()
+		if err := temporary.Chmod(0o400); err != nil {
+			return err
+		}
+		if _, err := io.Copy(temporary, source); err != nil {
+			return err
+		}
+		if _, err := temporary.Seek(0, io.SeekStart); err != nil {
+			return err
+		}
+		hash := sha256.New()
+		written, err := io.Copy(hash, io.LimitReader(temporary, (4<<20)+1))
+		if err != nil || written > 4<<20 || hex.EncodeToString(hash.Sum(nil)) != expectedSHA256 {
+			return errors.New("legacy runtime archive copy verification failed")
+		}
+		if err := ops.syncFile(temporary); err != nil {
+			return err
+		}
+		if err := temporary.Close(); err != nil {
+			return err
+		}
+		if err := ops.rename(temporaryPath, backupPath); err != nil {
+			return err
+		}
+		if err := ops.syncDir(directory); err != nil {
+			return err
+		}
+		backupExists = true
+	}
+	if backupExists {
+		backup, err := ops.open(backupPath)
+		if err != nil {
+			return err
+		}
+		if err := ops.syncFile(backup); err != nil {
+			_ = backup.Close()
+			return err
+		}
+		if err := backup.Close(); err != nil {
+			return err
+		}
+		if err := ops.syncDir(directory); err != nil {
+			return err
+		}
+	}
+	if legacyExists {
+		if err := ops.remove(legacyPath); err != nil {
+			return err
+		}
+		if err := ops.syncDir(directory); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateArchivePathComponents(value string, lstat func(string) (os.FileInfo, error)) error {
+	value = filepath.Clean(value)
+	if !filepath.IsAbs(value) {
+		return errors.New("legacy runtime archive path is not absolute")
+	}
+	components := []string{}
+	for current := value; ; current = filepath.Dir(current) {
+		components = append(components, current)
+		parent := filepath.Dir(current)
+		if parent == current {
+			break
+		}
+	}
+	for left, right := 0, len(components)-1; left < right; left, right = left+1, right-1 {
+		components[left], components[right] = components[right], components[left]
+	}
+	for index, component := range components {
+		info, err := lstat(component)
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("inspect legacy runtime archive path: %w", err)
+		}
+		if info.Mode()&os.ModeSymlink != 0 || (index < len(components)-1 && !info.IsDir()) {
+			return errors.New("legacy runtime archive path has unsafe filesystem shape")
+		}
+	}
+	return nil
+}
+
+func verifiedRegularFile(filePath, expectedSHA256 string, ops legacyRuntimeArchiveOps) (bool, error) {
+	info, err := ops.lstat(filePath)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+		return false, errors.New("legacy runtime source is not a regular file")
+	}
+	file, err := ops.open(filePath)
+	if err != nil {
+		return false, err
+	}
+	openedInfo, err := file.Stat()
+	if err != nil || !openedInfo.Mode().IsRegular() || !os.SameFile(info, openedInfo) {
+		_ = file.Close()
+		return false, errors.New("legacy runtime source changed during verification")
+	}
+	hash := sha256.New()
+	written, copyErr := io.Copy(hash, io.LimitReader(file, (4<<20)+1))
+	closeErr := file.Close()
+	if copyErr != nil {
+		return false, copyErr
+	}
+	if closeErr != nil {
+		return false, closeErr
+	}
+	if written > 4<<20 {
+		return false, errors.New("legacy runtime source exceeds size limit")
+	}
+	if hex.EncodeToString(hash.Sum(nil)) != expectedSHA256 {
+		return false, errors.New("legacy runtime source hash differs")
+	}
+	return true, nil
 }
 
 func (m *Manager) controllerForLocked(instanceID, serviceName string) *serviceController {

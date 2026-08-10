@@ -1,16 +1,128 @@
 package runtimeagent
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 )
+
+func TestDurableArchiveLegacyRuntimeSpecFileSyncFailurePreservesVerifiedLegacy(t *testing.T) {
+	installRoot := t.TempDir()
+	directory := filepath.Join(installRoot, "runtime", "agent")
+	if err := os.MkdirAll(directory, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	body := []byte(`{"instanceId":"admin","safe":true}`)
+	legacyPath := filepath.Join(directory, "runtime-spec.json")
+	if err := os.WriteFile(legacyPath, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(body)
+	ops := defaultLegacyRuntimeArchiveOps()
+	ops.syncFile = func(*os.File) error { return errors.New("injected file fsync failure") }
+	err := durableArchiveLegacyRuntimeSpec(InstanceConfig{InstallRoot: installRoot}, hex.EncodeToString(digest[:]), ops)
+	if err == nil {
+		t.Fatal("file fsync failure was ignored")
+	}
+	got, readErr := os.ReadFile(legacyPath)
+	if readErr != nil || !bytes.Equal(got, body) {
+		t.Fatalf("verified legacy source was not preserved: body=%q err=%v", got, readErr)
+	}
+	if _, statErr := os.Stat(filepath.Join(directory, "runtime-spec.legacy-readonly.json")); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("unfsynced backup was published: %v", statErr)
+	}
+	entries, _ := os.ReadDir(directory)
+	if len(entries) != 1 || entries[0].Name() != "runtime-spec.json" {
+		t.Fatalf("failed archive left temporary debris: %v", entries)
+	}
+}
+
+func TestDurableArchiveLegacyRuntimeSpecDirectorySyncFailureIsForwardRetryable(t *testing.T) {
+	installRoot := t.TempDir()
+	directory := filepath.Join(installRoot, "runtime", "agent")
+	if err := os.MkdirAll(directory, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	body := []byte(`{"instanceId":"admin","safe":true}`)
+	legacyPath := filepath.Join(directory, "runtime-spec.json")
+	backupPath := filepath.Join(directory, "runtime-spec.legacy-readonly.json")
+	if err := os.WriteFile(legacyPath, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(body)
+	ops := defaultLegacyRuntimeArchiveOps()
+	syncCalls := 0
+	ops.syncDir = func(string) error {
+		syncCalls++
+		if syncCalls == 3 {
+			return errors.New("injected post-remove directory fsync failure")
+		}
+		return nil
+	}
+	err := durableArchiveLegacyRuntimeSpec(InstanceConfig{InstallRoot: installRoot}, hex.EncodeToString(digest[:]), ops)
+	if err == nil {
+		t.Fatal("post-remove directory fsync failure was ignored")
+	}
+	got, readErr := os.ReadFile(backupPath)
+	if readErr != nil || !bytes.Equal(got, body) {
+		t.Fatalf("durable forward repair source missing after archive error %v (sync calls=%d): body=%q err=%v", err, syncCalls, got, readErr)
+	}
+	if retryErr := durableArchiveLegacyRuntimeSpec(InstanceConfig{InstallRoot: installRoot}, hex.EncodeToString(digest[:]), defaultLegacyRuntimeArchiveOps()); retryErr != nil {
+		t.Fatalf("forward-only archive retry failed: %v", retryErr)
+	}
+	if _, statErr := os.Stat(legacyPath); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("legacy writer remained after retry: %v", statErr)
+	}
+}
+
+func TestRuntimeInstanceSnapshotListsEveryManifestWithoutDesiredOrConditionSecrets(t *testing.T) {
+	stateDir := t.TempDir()
+	manifestStore := &ManifestStore{StateDir: stateDir}
+	config := NormalizeInstanceConfig(InstanceConfig{InstanceID: "admin", InstallRoot: "/aifar/apps/admin", Network: "aifar-network"})
+	if err := manifestStore.PutInstance(config); err != nil {
+		t.Fatal(err)
+	}
+	manager := NewManager(ManagerOptions{StateDir: stateDir, ManifestStore: manifestStore, Runner: newControllerTestRunner()})
+	for _, serviceName := range []string{"file", "permission"} {
+		manifest := NormalizeDeploymentManifest(DeploymentManifest{
+			Metadata: DeploymentMetadata{InstanceID: "admin", Name: serviceName, Generation: 1},
+			Spec:     DeploymentSpec{ServiceName: serviceName, Image: "secret-image", PodRevision: "rev-1", Replicas: 1, Environment: map[string]string{"PASSWORD": "do-not-expose"}},
+			Service:  ServiceSpec{Name: serviceName, AppName: serviceName, Port: 8080},
+		})
+		if _, err := manager.AcceptDeployment(context.Background(), manifest); err != nil {
+			t.Fatal(err)
+		}
+	}
+	manager.controllerMu.Lock()
+	state := manager.controllerStates[endpointKey("admin", "file")]
+	state.Conditions = []DeploymentCondition{{Type: "Degraded", Status: true, Message: "condition-secret"}}
+	manager.controllerStates[endpointKey("admin", "file")] = state
+	manager.controllerMu.Unlock()
+	snapshot, err := manager.RuntimeInstanceSnapshot("admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snapshot.Deployments) != 2 || snapshot.Deployments[0].ServiceName != "file" || snapshot.Deployments[1].ServiceName != "permission" {
+		t.Fatalf("snapshot service set is incomplete or unordered: %+v", snapshot.Deployments)
+	}
+	data, _ := json.Marshal(snapshot)
+	for _, secret := range []string{"secret-image", "do-not-expose", "condition-secret", "environment", "conditions"} {
+		if bytes.Contains(data, []byte(secret)) {
+			t.Fatalf("snapshot exposed %q: %s", secret, data)
+		}
+	}
+}
 
 type controllerTestRunner struct {
 	mu             sync.Mutex

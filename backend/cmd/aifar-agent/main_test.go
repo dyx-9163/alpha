@@ -361,6 +361,8 @@ func TestServiceCLITransportAndValidation(t *testing.T) {
 	for _, command := range [][]string{
 		{"apply-deployment", "--manifest", path, "--addr", addr},
 		{"get-deployment", "--instance", "admin", "--service", "permission", "--addr", addr},
+		{"get-instance-snapshot", "--instance", "admin", "--addr", addr},
+		{"archive-legacy-runtime", "--instance", "admin", "--sha256", strings.Repeat("a", 64), "--addr", addr},
 		{"reconcile-deployment", "--instance", "admin", "--service", "permission", "--addr", addr},
 		{"bootstrap-runtime", "--spec", legacyPath, "--addr", addr},
 	} {
@@ -371,6 +373,8 @@ func TestServiceCLITransportAndValidation(t *testing.T) {
 	want := []string{
 		"PUT /runtime/instances/admin/deployments/permission",
 		"GET /runtime/instances/admin/deployments/permission",
+		"GET /runtime/instances/admin/snapshot",
+		"POST /runtime/instances/admin/archive-legacy-runtime",
 		"POST /runtime/instances/admin/deployments/permission/reconcile",
 		"POST /runtime/bootstrap",
 	}
@@ -394,6 +398,38 @@ func TestServiceCLINon2xxDoesNotEchoRemoteDetails(t *testing.T) {
 	err := runServiceAgentCommand("get-deployment", []string{"--instance", "admin", "--service", "permission", "--addr", strings.TrimPrefix(server.URL, "http://")}, &out)
 	if err == nil || strings.Contains(err.Error(), "do-not-echo") || strings.Contains(out.String(), "do-not-echo") {
 		t.Fatalf("err=%v out=%q", err, out.String())
+	}
+}
+
+func TestInstanceSnapshotHTTPReturnsCompleteProofWithoutManifestBody(t *testing.T) {
+	stateDir := t.TempDir()
+	manifestStore := &runtimeagent.ManifestStore{StateDir: stateDir}
+	if err := manifestStore.PutInstance(agentTestInstanceConfig()); err != nil {
+		t.Fatal(err)
+	}
+	manager := runtimeagent.NewManager(runtimeagent.ManagerOptions{StateDir: stateDir, ManifestStore: manifestStore, Runner: failingRestartRunner{}})
+	manifest := agentTestManifest(1, "permission:SECRET-IMAGE")
+	if _, err := manager.AcceptDeployment(context.Background(), manifest); err != nil {
+		t.Fatal(err)
+	}
+	handler := newAgentHandler(manager, func(context.Context) error { return nil })
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/runtime/instances/admin/snapshot", nil)
+	handler.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("snapshot status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	var snapshot runtimeagent.RuntimeInstanceSnapshot
+	decoder := json.NewDecoder(bytes.NewReader(recorder.Body.Bytes()))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&snapshot); err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.Instance.InstanceID != "admin" || len(snapshot.Deployments) != 1 || snapshot.Deployments[0].ServiceName != "permission" || snapshot.Deployments[0].ManifestGeneration != 1 || snapshot.Deployments[0].ManifestSpecHash == "" {
+		t.Fatalf("snapshot proof incomplete: %+v", snapshot)
+	}
+	if strings.Contains(recorder.Body.String(), "SECRET-IMAGE") || strings.Contains(recorder.Body.String(), "envFiles") || strings.Contains(recorder.Body.String(), "spec\"") {
+		t.Fatalf("snapshot exposed manifest content: %s", recorder.Body.String())
 	}
 }
 

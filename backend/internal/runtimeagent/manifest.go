@@ -78,6 +78,24 @@ type DeploymentState struct {
 	Conditions         []DeploymentCondition `json:"conditions"`
 }
 
+// RuntimeDeploymentSnapshot exposes only identity, generation/hash proof and
+// runtime observation. It deliberately omits the manifest body, including env
+// file paths and other potentially sensitive desired-state fields.
+type RuntimeDeploymentSnapshot struct {
+	ServiceName        string `json:"serviceName"`
+	ManifestGeneration int64  `json:"manifestGeneration"`
+	ManifestSpecHash   string `json:"manifestSpecHash"`
+	StateGeneration    int64  `json:"stateGeneration"`
+	ObservedGeneration int64  `json:"observedGeneration"`
+	StateSpecHash      string `json:"stateSpecHash"`
+	DesiredReplicas    int    `json:"desiredReplicas"`
+}
+
+type RuntimeInstanceSnapshot struct {
+	Instance    InstanceConfig              `json:"instance"`
+	Deployments []RuntimeDeploymentSnapshot `json:"deployments"`
+}
+
 func NormalizeInstanceConfig(config InstanceConfig) InstanceConfig {
 	config.APIVersion = strings.TrimSpace(config.APIVersion)
 	if config.APIVersion == "" {

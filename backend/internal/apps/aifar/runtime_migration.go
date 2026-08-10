@@ -3,12 +3,15 @@ package aifar
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
 	"os"
 	"path"
+	"reflect"
 	"sort"
 	"strings"
 	"time"
@@ -21,7 +24,6 @@ import (
 const (
 	runtimeMigrationOperation      = "migrate-runtime-model"
 	runtimeMigrationReadMarker     = "AIFAR_RUNTIME_MIGRATION_READ"
-	runtimeMigrationArchiveMarker  = "AIFAR_RUNTIME_MIGRATION_ARCHIVE"
 	runtimeMigrationMaxLegacyBytes = 4 << 20
 )
 
@@ -31,6 +33,8 @@ var requiredRuntimeMigrationAgentFeatures = []string{
 	"per-service-reconcile",
 	"per-service-restart",
 	"service-conditions-v1",
+	"runtime-instance-snapshot-v1",
+	"durable-legacy-archive-v1",
 }
 
 type runtimeMigrationStore interface {
@@ -40,6 +44,10 @@ type runtimeMigrationStore interface {
 
 type runtimeMigrationAuditStore interface {
 	AddAudit(actor, action, target, status, detail string) error
+}
+
+type runtimeMigrationAtomicUploader interface {
+	UploadFileAtomicVerified(ctx context.Context, server store.Server, localPath, remoteDir, finalName string, mode os.FileMode, expectedSize int64, expectedSHA256 string) (string, error)
 }
 
 type runtimeMigrationPlan struct {
@@ -96,7 +104,15 @@ func (s Service) MigrateRuntimeModel(ctx context.Context, req RuntimeMigrationRe
 	if err != nil {
 		return err
 	}
-	defer s.releaseOrchestrationLock(lock)
+	defer func() {
+		if releaseErr := s.releaseRuntimeMigrationLock(lock); releaseErr != nil {
+			if returnedErr != nil {
+				returnedErr = repairRequired("AIFAR_RUNTIME_MIGRATION_LOCK_RELEASE_FAILED", errors.Join(returnedErr, releaseErr))
+			} else {
+				returnedErr = releaseErr
+			}
+		}
+	}()
 	if instance.App != AppName || instance.ServerID != req.Server.ID {
 		return repairRequired("AIFAR_RUNTIME_MIGRATION_TARGET_INVALID", nil)
 	}
@@ -122,11 +138,6 @@ func (s Service) MigrateRuntimeModel(ctx context.Context, req RuntimeMigrationRe
 	if err := validateRuntimeMigrationModelPair(plan.metadata, remoteState.model); err != nil {
 		return err
 	}
-	if remoteState.model == "switched" {
-		if err := s.cleanupRemoteManifest(taskCtx, req.Server, runtimeMigrationStagedSpecPath(plan)); err != nil {
-			return repairRequired("AIFAR_RUNTIME_MIGRATION_STAGE_CLEANUP_FAILED", nil)
-		}
-	}
 	if log != nil {
 		log.Info("AIFAR runtime migration preflight passed: services=%d", len(plan.services))
 	}
@@ -138,7 +149,7 @@ func (s Service) MigrateRuntimeModel(ctx context.Context, req RuntimeMigrationRe
 			return stageErr
 		}
 		_, bootstrapErr := s.remote.Run(taskCtx, req.Server, "aifar-agent bootstrap-runtime --spec "+installerkit.ShellQuote(stagedSpecPath))
-		stageCleanupErr = s.cleanupRemoteManifest(taskCtx, req.Server, stagedSpecPath)
+		stageCleanupErr = s.cleanupRuntimeMigrationStage(taskCtx, req.Server, plan, stagedSpecPath)
 		if taskCtx.Err() != nil {
 			return taskCtx.Err()
 		}
@@ -161,13 +172,28 @@ func (s Service) MigrateRuntimeModel(ctx context.Context, req RuntimeMigrationRe
 	if err := s.commitRuntimeMigrationControlPlane(control, lock.ID, plan, states, req); err != nil {
 		return err
 	}
-	if taskCtx.Err() != nil {
-		return taskCtx.Err()
-	}
 	if log != nil {
 		log.Info("AIFAR runtime migration committed: services=%d model=%s", len(plan.services), orchestrationModelServiceControllerV1)
 	}
 	return nil
+}
+
+func (s Service) releaseRuntimeMigrationLock(lock store.AIFAROrchestrationLock) error {
+	if strings.TrimSpace(lock.ID) == "" {
+		s.releaseOrchestrationLock(lock)
+		return nil
+	}
+	lockStore, ok := s.store.(aifarOrchestrationLockStore)
+	if !ok {
+		return repairRequired("AIFAR_RUNTIME_MIGRATION_LOCK_RELEASE_FAILED", nil)
+	}
+	for attempt := 0; attempt < 3; attempt++ {
+		released, err := lockStore.ReleaseAIFAROrchestrationLockByID(lock.ID)
+		if err == nil && released {
+			return nil
+		}
+	}
+	return repairRequired("AIFAR_RUNTIME_MIGRATION_LOCK_RELEASE_FAILED", nil)
 }
 
 func validateRuntimeMigrationAgent(inspection runtimeAgentInspection) error {
@@ -372,6 +398,10 @@ func (s Service) buildRuntimeMigrationPlan(instance store.AppInstance, legacyJSO
 }
 
 func (s Service) stageRuntimeMigrationLegacySpec(ctx context.Context, server store.Server, plan runtimeMigrationPlan) (string, error) {
+	uploader, ok := s.remote.(runtimeMigrationAtomicUploader)
+	if !ok {
+		return "", repairRequired("AIFAR_RUNTIME_MIGRATION_SECURE_UPLOAD_UNAVAILABLE", nil)
+	}
 	local, err := os.CreateTemp("", "aifar-runtime-migration-*.json")
 	if err != nil {
 		return "", repairRequired("AIFAR_RUNTIME_MIGRATION_LOCAL_STAGE_FAILED", nil)
@@ -393,20 +423,27 @@ func (s Service) stageRuntimeMigrationLegacySpec(ctx context.Context, server sto
 	if err := local.Close(); err != nil {
 		return "", repairRequired("AIFAR_RUNTIME_MIGRATION_LOCAL_STAGE_FAILED", nil)
 	}
-	remotePath := runtimeMigrationStagedSpecPath(plan)
-	remoteDir := path.Dir(remotePath)
-	if _, err := s.remote.Run(ctx, server, "mkdir -p -- "+installerkit.ShellQuote(remoteDir)+" && chmod 0700 -- "+installerkit.ShellQuote(remoteDir)); err != nil {
-		return "", repairRequired("AIFAR_RUNTIME_MIGRATION_REMOTE_STAGE_FAILED", nil)
-	}
-	if err := s.remote.UploadFile(ctx, server, localPath, remotePath, 0o600); err != nil {
-		_ = s.cleanupRemoteManifest(ctx, server, remotePath)
+	digest := sha256.Sum256(plan.legacyJSON)
+	remoteDir := path.Join(plan.installRoot, "runtime", runtimeSpecDirName, "migration")
+	remotePath, err := uploader.UploadFileAtomicVerified(ctx, server, localPath, remoteDir, "migration-legacy-spec.json", 0o600, int64(len(plan.legacyJSON)), hex.EncodeToString(digest[:]))
+	if err != nil {
 		return "", repairRequired("AIFAR_RUNTIME_MIGRATION_REMOTE_STAGE_FAILED", nil)
 	}
 	return remotePath, nil
 }
 
-func runtimeMigrationStagedSpecPath(plan runtimeMigrationPlan) string {
-	return path.Join(plan.installRoot, "runtime", runtimeSpecDirName, "migration", "migration-legacy-spec.json")
+func (s Service) cleanupRuntimeMigrationStage(ctx context.Context, server store.Server, plan runtimeMigrationPlan, stagedSpecPath string) error {
+	base := path.Join(plan.installRoot, "runtime", runtimeSpecDirName, "migration")
+	stageDir := path.Dir(stagedSpecPath)
+	stageName := path.Base(stageDir)
+	if path.Dir(stageDir) != base || !strings.HasPrefix(stageName, ".aifar-stage-") || path.Base(stagedSpecPath) != "migration-legacy-spec.json" {
+		return errors.New("runtime migration staging path is invalid")
+	}
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	defer cancel()
+	command := "rm -f -- " + installerkit.ShellQuote(path.Join(stageDir, ".payload.part")) + " " + installerkit.ShellQuote(stagedSpecPath) + " && rmdir -- " + installerkit.ShellQuote(stageDir)
+	_, err := s.remote.Run(cleanupCtx, server, command)
+	return err
 }
 
 func decodeRuntimeMigrationLegacySpec(data []byte, target *runtimeagent.LegacyRuntimeSpec) error {
@@ -448,34 +485,62 @@ func validateRuntimeMigrationModelPair(metadata map[string]any, agentModel strin
 }
 
 func (s Service) readRuntimeMigrationDeployments(ctx context.Context, server store.Server, plan runtimeMigrationPlan) (map[string]runtimeagent.DeploymentState, error) {
-	states := make(map[string]runtimeagent.DeploymentState, len(plan.services))
-	for _, serviceName := range plan.services {
-		state, err := s.readDeploymentStateOnce(ctx, server, plan.instance.ID, serviceName)
-		if err != nil {
-			return nil, repairRequired("AIFAR_RUNTIME_MIGRATION_AGENT_READBACK_FAILED", nil)
-		}
-		if state.Generation > 1 || state.ObservedGeneration > 1 {
+	result, err := s.remote.Run(ctx, server, "aifar-agent get-instance-snapshot --instance "+installerkit.ShellQuote(plan.instance.ID))
+	if err != nil || len(result.Stdout) == 0 || len(result.Stdout) > runtimeMigrationMaxLegacyBytes {
+		return nil, repairRequired("AIFAR_RUNTIME_MIGRATION_AGENT_READBACK_FAILED", nil)
+	}
+	var snapshot runtimeagent.RuntimeInstanceSnapshot
+	decoder := json.NewDecoder(strings.NewReader(result.Stdout))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&snapshot); err != nil {
+		return nil, repairRequired("AIFAR_RUNTIME_MIGRATION_AGENT_READBACK_FAILED", nil)
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		return nil, repairRequired("AIFAR_RUNTIME_MIGRATION_AGENT_READBACK_FAILED", nil)
+	}
+	expectedInstance := runtimeagent.NormalizeInstanceConfig(runtimeagent.InstanceConfig{
+		APIVersion: runtimeagent.ManifestAPIVersion, InstanceID: plan.instance.ID,
+		InstallRoot: plan.installRoot, Network: plan.legacy.Network, Ingress: plan.legacy.Ingress,
+	})
+	if !reflect.DeepEqual(runtimeagent.NormalizeInstanceConfig(snapshot.Instance), expectedInstance) {
+		return nil, repairRequired("AIFAR_RUNTIME_MIGRATION_AGENT_INSTANCE_DIVERGED", nil)
+	}
+	states := make(map[string]runtimeagent.DeploymentState, len(snapshot.Deployments))
+	seenServices := make(map[string]bool, len(snapshot.Deployments))
+	for _, deployment := range snapshot.Deployments {
+		serviceName := cleanAIFARServiceName(deployment.ServiceName)
+		if deployment.ManifestGeneration > 1 || deployment.StateGeneration > 1 || deployment.ObservedGeneration > 1 {
 			return nil, repairRequired("AIFAR_RUNTIME_MIGRATION_FORWARD_ONLY", nil)
 		}
-		if !deploymentStateMatches(state, plan.instance.ID, serviceName, 1, plan.hashes[serviceName]) || state.DesiredReplicas != plan.manifests[serviceName].Spec.Replicas {
+		if serviceName == "" || serviceName != deployment.ServiceName || seenServices[serviceName] {
 			return nil, repairRequired("AIFAR_RUNTIME_MIGRATION_AGENT_READBACK_DIVERGED", nil)
 		}
-		states[serviceName] = state
+		seenServices[serviceName] = true
+		states[serviceName] = runtimeagent.DeploymentState{
+			InstanceID: plan.instance.ID, ServiceName: serviceName,
+			Generation: deployment.StateGeneration, ObservedGeneration: deployment.ObservedGeneration,
+			SpecHash: deployment.StateSpecHash, DesiredReplicas: deployment.DesiredReplicas,
+		}
+	}
+	if !sameStringSet(plan.services, sortedMapKeys(states)) {
+		return nil, repairRequired("AIFAR_RUNTIME_MIGRATION_AGENT_SERVICE_SET_DIVERGED", nil)
+	}
+	for _, deployment := range snapshot.Deployments {
+		serviceName := deployment.ServiceName
+		state := states[serviceName]
+		if deployment.ManifestGeneration != 1 || deployment.ManifestSpecHash != plan.hashes[serviceName] ||
+			!deploymentStateMatches(state, plan.instance.ID, serviceName, 1, plan.hashes[serviceName]) ||
+			state.DesiredReplicas != plan.manifests[serviceName].Spec.Replicas {
+			return nil, repairRequired("AIFAR_RUNTIME_MIGRATION_AGENT_READBACK_DIVERGED", nil)
+		}
 	}
 	return states, nil
 }
 
 func (s Service) archiveLegacyRuntimeSpec(ctx context.Context, server store.Server, plan runtimeMigrationPlan) error {
-	command := strings.Join([]string{
-		"set -eu",
-		"echo " + runtimeMigrationArchiveMarker,
-		"legacy=" + installerkit.ShellQuote(plan.legacySpecPath),
-		"backup=" + installerkit.ShellQuote(plan.backupSpecPath),
-		"if [ -f \"$legacy\" ] && [ -f \"$backup\" ]; then cmp -s \"$legacy\" \"$backup\" || { echo 'legacy migration backup differs' >&2; exit 43; }; rm -f -- \"$legacy\"; fi",
-		"if [ -f \"$legacy\" ]; then mv -- \"$legacy\" \"$backup\"; fi",
-		"[ -f \"$backup\" ] || { echo 'legacy migration backup is unavailable' >&2; exit 44; }",
-		"chmod 0400 -- \"$backup\"",
-	}, "\n")
+	digest := sha256.Sum256(plan.legacyJSON)
+	command := "aifar-agent archive-legacy-runtime --instance " + installerkit.ShellQuote(plan.instance.ID) + " --sha256 " + installerkit.ShellQuote(hex.EncodeToString(digest[:]))
 	if _, err := s.remote.Run(ctx, server, command); err != nil {
 		return repairRequired("AIFAR_RUNTIME_MIGRATION_ARCHIVE_FAILED", nil)
 	}
@@ -505,10 +570,12 @@ func (s Service) commitRuntimeMigrationControlPlane(control runtimeMigrationStor
 		current.CurrentRevision = plan.manifests[serviceName].Spec.PodRevision
 		current.SpecJSON = string(specJSON)
 		current.Generation = 1
-		current.Status = "Accepted"
-		current.MetadataJSON = string(metadataJSON)
-		current.ConditionsJSON = conditions
-		current.LastTransitionAt = now
+		if current.ObservedGeneration == 0 {
+			current.Status = "Accepted"
+			current.MetadataJSON = string(metadataJSON)
+			current.ConditionsJSON = conditions
+			current.LastTransitionAt = now
+		}
 		items = append(items, store.AIFARRuntimeMigrationDeploymentCommit{Expected: plan.deployments[serviceName], Next: current})
 	}
 	for attempt := 0; attempt < appInstanceMetadataCASAttempts; attempt++ {
@@ -517,7 +584,7 @@ func (s Service) commitRuntimeMigrationControlPlane(control runtimeMigrationStor
 			return repairRequired("AIFAR_RUNTIME_MIGRATION_METADATA_COMMIT_FAILED", nil)
 		}
 		metadata := metadataFromInstance(current)
-		if err := validateRuntimeMigrationMetadata(metadata, plan); err != nil {
+		if err := validateRuntimeMigrationMetadata(current, metadata, plan); err != nil {
 			return err
 		}
 		metadata["orchestrationModel"] = orchestrationModelServiceControllerV1
@@ -561,9 +628,29 @@ func (s Service) commitRuntimeMigrationControlPlane(control runtimeMigrationStor
 	return repairRequired("AIFAR_RUNTIME_MIGRATION_METADATA_COMMIT_FAILED", store.ErrAppInstanceConflict)
 }
 
-func validateRuntimeMigrationMetadata(metadata map[string]any, plan runtimeMigrationPlan) error {
+func validateRuntimeMigrationMetadata(current store.AppInstance, metadata map[string]any, plan runtimeMigrationPlan) error {
+	if current.ID != plan.instance.ID || current.App != AppName || current.ServerID != plan.instance.ServerID {
+		return repairRequired("AIFAR_RUNTIME_MIGRATION_METADATA_DIVERGED", nil)
+	}
 	if err := validateRuntimeMigrationModelPair(metadata, "switched"); err != nil {
 		return err
+	}
+	if stringFromMetadata(metadata, "installRoot", "") != plan.installRoot ||
+		stringFromMetadata(metadata, "runtimeSpecPath", "") != plan.legacySpecPath ||
+		stringFromMetadata(metadata, "runtimeDir", "") != path.Join(plan.installRoot, "runtime") ||
+		stringFromMetadata(metadata, "envDir", "") != path.Join(plan.installRoot, "runtime", releaseEnvDirName) ||
+		stringFromMetadata(metadata, "ingressNetwork", stringFromMetadata(metadata, "networkName", defaultNetworkName)) != plan.legacy.Network ||
+		intFromMetadata(metadata, "gatewayPort", defaultGatewayPort) != plan.legacy.Ingress.GatewayPort ||
+		intFromMetadata(metadata, "webPort", defaultWebPort) != plan.legacy.Ingress.WebPort ||
+		!reflect.DeepEqual(serviceDefinitionsFromMetadata(metadata), serviceDefinitionsFromMetadata(plan.metadata)) {
+		return repairRequired("AIFAR_RUNTIME_MIGRATION_METADATA_DIVERGED", nil)
+	}
+	expectedInstance := runtimeagent.NormalizeInstanceConfig(runtimeagent.InstanceConfig{
+		APIVersion: runtimeagent.ManifestAPIVersion, InstanceID: current.ID,
+		InstallRoot: plan.installRoot, Network: plan.legacy.Network, Ingress: plan.legacy.Ingress,
+	})
+	if !reflect.DeepEqual(runtimeInstanceConfig(current, metadata, plan.installRoot), expectedInstance) {
+		return repairRequired("AIFAR_RUNTIME_MIGRATION_METADATA_DIVERGED", nil)
 	}
 	services, err := exactMigrationMetadataServices(metadata)
 	if err != nil || !sameStringSet(services, plan.services) || !migrationDesiredReplicaKeysExact(metadata, plan.services) {

@@ -19,16 +19,82 @@ import (
 )
 
 type runtimeMigrationRemote struct {
-	mu               sync.Mutex
-	legacyJSON       []byte
-	states           map[string]runtimeagent.DeploymentState
-	agentInspection  string
-	commands         []string
-	uploadPaths      []string
-	uploadBodies     [][]byte
-	bootstrapCalls   int
-	archiveCalls     int
-	agentHasSwitched bool
+	mu                  sync.Mutex
+	legacyJSON          []byte
+	states              map[string]runtimeagent.DeploymentState
+	agentInspection     string
+	commands            []string
+	uploadPaths         []string
+	uploadBodies        [][]byte
+	bootstrapCalls      int
+	archiveCalls        int
+	durableArchiveCalls int
+	agentHasSwitched    bool
+	snapshotInstance    runtimeagent.InstanceConfig
+	snapshotStates      map[string]runtimeagent.DeploymentState
+}
+
+type secureRuntimeMigrationRemote struct {
+	*runtimeMigrationRemote
+	secureUploadCalls int
+}
+
+type migrationCASMutationStore struct {
+	*fakeStore
+	mutateOnce func(*fakeStore)
+}
+
+type migrationCancelAfterCommitStore struct {
+	*fakeStore
+	cancel context.CancelFunc
+}
+
+type migrationReleaseFailureStore struct {
+	*store.Store
+	failures int
+	calls    int
+}
+
+func (s *migrationReleaseFailureStore) ReleaseAIFAROrchestrationLockByID(id string) (bool, error) {
+	s.calls++
+	if s.calls <= s.failures {
+		return false, errors.New("injected exact lock release failure")
+	}
+	return s.Store.ReleaseAIFAROrchestrationLockByID(id)
+}
+
+func (s *migrationCancelAfterCommitStore) CommitAIFARRuntimeMigrationWithLock(commit store.AIFARRuntimeMigrationCommit) (store.AppInstance, error) {
+	saved, err := s.fakeStore.CommitAIFARRuntimeMigrationWithLock(commit)
+	if err == nil && s.cancel != nil {
+		s.cancel()
+	}
+	return saved, err
+}
+
+func (s *migrationCASMutationStore) CommitAIFARRuntimeMigrationWithLock(commit store.AIFARRuntimeMigrationCommit) (store.AppInstance, error) {
+	if s.mutateOnce != nil {
+		s.fakeStore.mu.Lock()
+		mutate := s.mutateOnce
+		s.mutateOnce = nil
+		mutate(s.fakeStore)
+		s.fakeStore.mu.Unlock()
+	}
+	return s.fakeStore.CommitAIFARRuntimeMigrationWithLock(commit)
+}
+
+func (r *secureRuntimeMigrationRemote) UploadFileAtomicVerified(_ context.Context, _ store.Server, localPath, remoteDir, finalName string, mode os.FileMode, expectedSize int64, expectedSHA256 string) (string, error) {
+	body, err := os.ReadFile(localPath)
+	if err != nil {
+		return "", err
+	}
+	if mode != 0o600 || int64(len(body)) != expectedSize || expectedSHA256 == "" {
+		return "", errors.New("invalid verified upload request")
+	}
+	r.secureUploadCalls++
+	remotePath := strings.TrimSuffix(remoteDir, "/") + "/.aifar-stage-random/" + finalName
+	r.uploadPaths = append(r.uploadPaths, remotePath)
+	r.uploadBodies = append(r.uploadBodies, body)
+	return remotePath, nil
 }
 
 func (f *fakeStore) CommitAIFARRuntimeMigrationWithLock(commit store.AIFARRuntimeMigrationCommit) (store.AppInstance, error) {
@@ -122,6 +188,23 @@ func (r *runtimeMigrationRemote) Run(ctx context.Context, _ store.Server, comman
 		}
 		data, _ := json.Marshal(acceptance)
 		return adapter.CommandResult{Stdout: string(data)}, nil
+	case strings.Contains(command, "aifar-agent get-instance-snapshot"):
+		states := r.snapshotStates
+		if states == nil {
+			states = r.states
+		}
+		ordered := make([]runtimeagent.RuntimeDeploymentSnapshot, 0, len(states))
+		for _, serviceName := range sortedMigrationStateNames(states) {
+			state := states[serviceName]
+			ordered = append(ordered, runtimeagent.RuntimeDeploymentSnapshot{
+				ServiceName: serviceName, ManifestGeneration: state.Generation,
+				ManifestSpecHash: state.SpecHash, StateGeneration: state.Generation,
+				ObservedGeneration: state.ObservedGeneration, StateSpecHash: state.SpecHash,
+				DesiredReplicas: state.DesiredReplicas,
+			})
+		}
+		data, _ := json.Marshal(map[string]any{"instance": r.snapshotInstance, "deployments": ordered})
+		return adapter.CommandResult{Stdout: string(data)}, nil
 	case strings.Contains(command, "aifar-agent get-deployment"):
 		for serviceName, state := range r.states {
 			if strings.Contains(command, "--service '"+serviceName+"'") {
@@ -130,6 +213,9 @@ func (r *runtimeMigrationRemote) Run(ctx context.Context, _ store.Server, comman
 			}
 		}
 		return adapter.CommandResult{}, errors.New("deployment not found")
+	case strings.Contains(command, "aifar-agent archive-legacy-runtime"):
+		r.durableArchiveCalls++
+		return adapter.CommandResult{Stdout: `{"archived":true}`}, nil
 	case strings.Contains(command, "AIFAR_RUNTIME_MIGRATION_ARCHIVE"):
 		r.archiveCalls++
 		return adapter.CommandResult{Stdout: "archived"}, nil
@@ -151,6 +237,22 @@ func (r *runtimeMigrationRemote) UploadFile(_ context.Context, _ store.Server, l
 	r.uploadPaths = append(r.uploadPaths, remotePath)
 	r.uploadBodies = append(r.uploadBodies, body)
 	return nil
+}
+
+func (r *runtimeMigrationRemote) UploadFileAtomicVerified(_ context.Context, _ store.Server, localPath, remoteDir, finalName string, mode os.FileMode, expectedSize int64, expectedSHA256 string) (string, error) {
+	body, err := os.ReadFile(localPath)
+	if err != nil {
+		return "", err
+	}
+	if mode != 0o600 || int64(len(body)) != expectedSize || expectedSHA256 == "" {
+		return "", errors.New("invalid verified upload request")
+	}
+	remotePath := strings.TrimSuffix(remoteDir, "/") + "/.aifar-stage-default/" + finalName
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.uploadPaths = append(r.uploadPaths, remotePath)
+	r.uploadBodies = append(r.uploadBodies, body)
+	return remotePath, nil
 }
 
 func (r *runtimeMigrationRemote) joinedCommands() string {
@@ -175,7 +277,7 @@ func runtimeMigrationAgentInspection() string {
 		"status": "running", "version": runtimeagent.DefaultAgentVersion,
 		"features": []string{
 			"service-manifest-v1", "service-generation-v1", "per-service-reconcile",
-			"per-service-restart", "service-conditions-v1",
+			"per-service-restart", "service-conditions-v1", "runtime-instance-snapshot-v1", "durable-legacy-archive-v1",
 		},
 	})
 	return "AIFAR_AGENT_CHECK\nagentFound=true\nstatus=" + string(status) + "\nsha256=" + strings.Repeat("a", 64) + "\n"
@@ -231,7 +333,10 @@ func runtimeMigrationFixture(t *testing.T, replicas int) (*fakeStore, *runtimeMi
 			InstanceID: instance.ID, ServiceName: serviceName, Generation: 1,
 			SpecHash: hash, DesiredReplicas: replicas,
 		},
-	}}
+	}, snapshotInstance: runtimeagent.NormalizeInstanceConfig(runtimeagent.InstanceConfig{
+		APIVersion: runtimeagent.ManifestAPIVersion, InstanceID: instance.ID, InstallRoot: installRoot,
+		Network: defaultNetworkName, Ingress: legacy.Ingress,
+	})}
 	control := &fakeStore{
 		servers: map[string]store.Server{server.ID: server}, instances: []store.AppInstance{instance},
 		deployments: []store.AIFARDeployment{current},
@@ -260,8 +365,8 @@ func TestRuntimeMigrationAdoptsExistingContainersWithoutRestart(t *testing.T) {
 	if got := stringFromMetadata(metadataFromInstance(saved), "orchestrationModel", ""); got != orchestrationModelServiceControllerV1 {
 		t.Fatalf("model=%q, want %q", got, orchestrationModelServiceControllerV1)
 	}
-	if remote.bootstrapCalls != 1 || remote.archiveCalls != 1 {
-		t.Fatalf("bootstrap=%d archive=%d, want one atomic switch and one archive", remote.bootstrapCalls, remote.archiveCalls)
+	if remote.bootstrapCalls != 1 || remote.durableArchiveCalls != 1 || remote.archiveCalls != 0 {
+		t.Fatalf("bootstrap=%d durable archive=%d shell archive=%d, want one atomic switch and one durable archive", remote.bootstrapCalls, remote.durableArchiveCalls, remote.archiveCalls)
 	}
 	if len(remote.uploadPaths) != 1 || !strings.HasSuffix(remote.uploadPaths[0], "/migration-legacy-spec.json") || !bytes.Equal(remote.uploadBodies[0], remote.legacyJSON) {
 		t.Fatalf("migration did not stage the exact validated legacy bytes: paths=%v", remote.uploadPaths)
@@ -282,6 +387,20 @@ func TestRuntimeMigrationAdoptsExistingContainersWithoutRestart(t *testing.T) {
 	}
 	if deployments[0].Generation != 1 || deployments[0].DesiredReplicas != 1 || deployments[0].SpecJSON == "" || deployments[0].Status != "Accepted" {
 		t.Fatalf("migration did not persist accepted generation/hash-bound desired state: %+v", deployments[0])
+	}
+}
+
+func TestRuntimeMigrationUsesVerifiedAtomicUploadInsteadOfConventionalOverwrite(t *testing.T) {
+	control, baseRemote, req := runtimeMigrationFixture(t, 1)
+	remote := &secureRuntimeMigrationRemote{runtimeMigrationRemote: baseRemote}
+	if err := NewService(control, remote).MigrateRuntimeModel(context.Background(), req, fakeLogger{}); err != nil {
+		t.Fatal(err)
+	}
+	if remote.secureUploadCalls != 1 {
+		t.Fatalf("verified atomic uploads=%d want=1", remote.secureUploadCalls)
+	}
+	if len(remote.uploadPaths) != 1 || !strings.Contains(remote.uploadPaths[0], "/.aifar-stage-random/") {
+		t.Fatalf("migration did not use isolated random staging: %v", remote.uploadPaths)
 	}
 }
 
@@ -327,6 +446,29 @@ func TestMigrationPreservesOfflineReplicaZero(t *testing.T) {
 	}
 }
 
+func TestMigrationPreservesObservedGenerationOneRuntimeProjection(t *testing.T) {
+	control, remote, req := runtimeMigrationFixture(t, 1)
+	originalTransition := time.Date(2026, 7, 1, 2, 3, 4, 0, time.UTC)
+	originalConditions := `[{"type":"Available","status":true,"reason":"ContainersReady","generation":1}]`
+	control.deployments[0].ObservedGeneration = 1
+	control.deployments[0].Status = "Available"
+	control.deployments[0].MetadataJSON = `{"runtime":"peer"}`
+	control.deployments[0].ConditionsJSON = originalConditions
+	control.deployments[0].LastTransitionAt = originalTransition
+	remote.states["permission"] = runtimeagent.DeploymentState{
+		InstanceID: req.Instance.ID, ServiceName: "permission", Generation: 1, ObservedGeneration: 1,
+		SpecHash: remote.states["permission"].SpecHash, DesiredReplicas: 1,
+	}
+	if err := NewService(control, remote).MigrateRuntimeModel(context.Background(), req, fakeLogger{}); err != nil {
+		t.Fatal(err)
+	}
+	deployments, _ := control.ListAIFARDeployments(req.Instance.ID)
+	got := deployments[0]
+	if got.Status != "Available" || got.MetadataJSON != `{"runtime":"peer"}` || got.ConditionsJSON != originalConditions || !got.LastTransitionAt.Equal(originalTransition) {
+		t.Fatalf("observed runtime projection regressed: %+v", got)
+	}
+}
+
 func TestMigrationResumesAfterAgentSwitchBeforeServerCommit(t *testing.T) {
 	control, remote, req := runtimeMigrationFixture(t, 1)
 	control.failSaveOn = 2 // lock metadata succeeds; final app metadata commit fails.
@@ -351,6 +493,251 @@ func TestMigrationResumesAfterAgentSwitchBeforeServerCommit(t *testing.T) {
 	if got := stringFromMetadata(metadataFromInstance(saved), "orchestrationModel", ""); got != orchestrationModelServiceControllerV1 {
 		t.Fatalf("repaired model=%q", got)
 	}
+}
+
+func TestRuntimeMigrationUsesAgentDurableArchiveInsteadOfShellMove(t *testing.T) {
+	control, remote, req := runtimeMigrationFixture(t, 1)
+	remote.agentHasSwitched = true
+	if err := NewService(control, remote).MigrateRuntimeModel(context.Background(), req, fakeLogger{}); err != nil {
+		t.Fatal(err)
+	}
+	if remote.durableArchiveCalls != 1 || remote.archiveCalls != 0 {
+		t.Fatalf("durable Agent archive=%d shell archive=%d", remote.durableArchiveCalls, remote.archiveCalls)
+	}
+}
+
+func TestMigrationSwitchedRepairRejectsUntrackedAgentSuccessor(t *testing.T) {
+	control, remote, req := runtimeMigrationFixture(t, 1)
+	remote.agentHasSwitched = true
+	remote.snapshotStates = map[string]runtimeagent.DeploymentState{}
+	for name, state := range remote.states {
+		remote.snapshotStates[name] = state
+	}
+	remote.snapshotStates["file"] = runtimeagent.DeploymentState{
+		InstanceID: req.Instance.ID, ServiceName: "file", Generation: 2, ObservedGeneration: 2,
+		SpecHash: strings.Repeat("b", 64), DesiredReplicas: 1,
+	}
+	err := NewService(control, remote).MigrateRuntimeModel(context.Background(), req, fakeLogger{})
+	if reasonCode(err) != "AIFAR_RUNTIME_MIGRATION_FORWARD_ONLY" {
+		t.Fatalf("extra Agent successor was not rejected: %v", err)
+	}
+	saved, _ := control.GetAppInstance(req.Instance.ID)
+	if got := stringFromMetadata(metadataFromInstance(saved), "orchestrationModel", ""); got != orchestrationModelK8sLikeV1 {
+		t.Fatalf("switched repair committed Server model after extra successor: %q", got)
+	}
+}
+
+func TestMigrationSwitchedRepairRejectsDivergentAgentInstanceConfig(t *testing.T) {
+	control, remote, req := runtimeMigrationFixture(t, 1)
+	remote.agentHasSwitched = true
+	remote.snapshotInstance.Network = "other-network"
+	err := NewService(control, remote).MigrateRuntimeModel(context.Background(), req, fakeLogger{})
+	if reasonCode(err) != "AIFAR_RUNTIME_MIGRATION_AGENT_INSTANCE_DIVERGED" {
+		t.Fatalf("divergent Agent instance config was not rejected: %v", err)
+	}
+	saved, _ := control.GetAppInstance(req.Instance.ID)
+	if got := stringFromMetadata(metadataFromInstance(saved), "orchestrationModel", ""); got != orchestrationModelK8sLikeV1 {
+		t.Fatalf("divergent Agent instance committed Server model: %q", got)
+	}
+}
+
+func TestMigrationSwitchedRepairRequiresExactAgentServiceSet(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(map[string]runtimeagent.DeploymentState)
+	}{
+		{name: "missing expected service", mutate: func(states map[string]runtimeagent.DeploymentState) { delete(states, "permission") }},
+		{name: "extra generation one service", mutate: func(states map[string]runtimeagent.DeploymentState) {
+			states["file"] = runtimeagent.DeploymentState{InstanceID: "aifar-legacy", ServiceName: "file", Generation: 1, SpecHash: strings.Repeat("b", 64), DesiredReplicas: 1}
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			control, remote, req := runtimeMigrationFixture(t, 1)
+			remote.agentHasSwitched = true
+			remote.snapshotStates = map[string]runtimeagent.DeploymentState{}
+			for name, state := range remote.states {
+				remote.snapshotStates[name] = state
+			}
+			test.mutate(remote.snapshotStates)
+			err := NewService(control, remote).MigrateRuntimeModel(context.Background(), req, fakeLogger{})
+			if reasonCode(err) != "AIFAR_RUNTIME_MIGRATION_AGENT_SERVICE_SET_DIVERGED" {
+				t.Fatalf("non-exact Agent service set was not rejected: %v", err)
+			}
+		})
+	}
+}
+
+func TestMigrationSwitchedRepairRejectsAnySuccessorObservation(t *testing.T) {
+	control, remote, req := runtimeMigrationFixture(t, 1)
+	remote.agentHasSwitched = true
+	state := remote.states["permission"]
+	state.ObservedGeneration = 2
+	remote.snapshotStates = map[string]runtimeagent.DeploymentState{"permission": state}
+	err := NewService(control, remote).MigrateRuntimeModel(context.Background(), req, fakeLogger{})
+	if reasonCode(err) != "AIFAR_RUNTIME_MIGRATION_FORWARD_ONLY" {
+		t.Fatalf("successor observation was not rejected: %v", err)
+	}
+}
+
+func TestMigrationSwitchedRepairChecksAllSharedInstanceFields(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*runtimeagent.InstanceConfig)
+	}{
+		{name: "install root", mutate: func(config *runtimeagent.InstanceConfig) { config.InstallRoot = "/aifar/apps/other" }},
+		{name: "ingress mode", mutate: func(config *runtimeagent.InstanceConfig) { config.Ingress.Mode = "disabled" }},
+		{name: "ingress gateway", mutate: func(config *runtimeagent.InstanceConfig) { config.Ingress.GatewayService = "other" }},
+		{name: "ingress port", mutate: func(config *runtimeagent.InstanceConfig) { config.Ingress.GatewayPort++ }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			control, remote, req := runtimeMigrationFixture(t, 1)
+			remote.agentHasSwitched = true
+			test.mutate(&remote.snapshotInstance)
+			err := NewService(control, remote).MigrateRuntimeModel(context.Background(), req, fakeLogger{})
+			if reasonCode(err) != "AIFAR_RUNTIME_MIGRATION_AGENT_INSTANCE_DIVERGED" {
+				t.Fatalf("divergent shared Agent field was not rejected: %v", err)
+			}
+		})
+	}
+}
+
+func TestMigrationMetadataCASRetryRevalidatesEveryManifestAuthority(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*store.AppInstance, map[string]any)
+	}{
+		{name: "server identity", mutate: func(instance *store.AppInstance, _ map[string]any) { instance.ServerID = "srv-successor" }},
+		{name: "install root", mutate: func(_ *store.AppInstance, metadata map[string]any) { metadata["installRoot"] = "/aifar/apps/changed" }},
+		{name: "runtime directory", mutate: func(_ *store.AppInstance, metadata map[string]any) {
+			metadata["runtimeDir"] = "/aifar/apps/changed/runtime"
+		}},
+		{name: "environment directory", mutate: func(_ *store.AppInstance, metadata map[string]any) {
+			metadata["envDir"] = "/aifar/apps/changed/runtime/env"
+		}},
+		{name: "network", mutate: func(_ *store.AppInstance, metadata map[string]any) { metadata["ingressNetwork"] = "changed-network" }},
+		{name: "gateway port", mutate: func(_ *store.AppInstance, metadata map[string]any) { metadata["gatewayPort"] = defaultGatewayPort + 1 }},
+		{name: "web port", mutate: func(_ *store.AppInstance, metadata map[string]any) { metadata["webPort"] = defaultWebPort + 1 }},
+		{name: "catalog", mutate: func(_ *store.AppInstance, metadata map[string]any) {
+			metadata["serviceCatalog"] = serviceCatalogMetadata([]serviceDefinition{{
+				Name: "permission", Kind: "java", ApplicationName: "alpha-permission", Port: defaultPermissionPort + 1,
+				HealthPath: "/actuator/health/readiness", AffinityPolicy: "round-robin",
+			}})
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			control, remote, req := runtimeMigrationFixture(t, 1)
+			wrapped := &migrationCASMutationStore{fakeStore: control}
+			wrapped.mutateOnce = func(db *fakeStore) {
+				instance := &db.instances[0]
+				metadata := metadataFromInstance(*instance)
+				test.mutate(instance, metadata)
+				instance.Metadata = mustMetadata(t, metadata)
+				instance.UpdatedAt = instance.UpdatedAt.Add(time.Second)
+			}
+			err := NewService(wrapped, remote).MigrateRuntimeModel(context.Background(), req, fakeLogger{})
+			if reasonCode(err) != "AIFAR_RUNTIME_MIGRATION_METADATA_DIVERGED" {
+				t.Fatalf("authoritative CAS change was not rejected: %v", err)
+			}
+		})
+	}
+}
+
+func TestMigrationMetadataCASRetryMergesLifecycleAndUnknownPeerFields(t *testing.T) {
+	control, remote, req := runtimeMigrationFixture(t, 1)
+	wrapped := &migrationCASMutationStore{fakeStore: control}
+	wrapped.mutateOnce = func(db *fakeStore) {
+		instance := &db.instances[0]
+		metadata := metadataFromInstance(*instance)
+		metadata["peerUnknown"] = map[string]any{"keep": true}
+		instance.Metadata = mustMetadata(t, metadata)
+		instance.Status = "install_warning"
+		instance.UpdatedAt = instance.UpdatedAt.Add(time.Second)
+	}
+	if err := NewService(wrapped, remote).MigrateRuntimeModel(context.Background(), req, fakeLogger{}); err != nil {
+		t.Fatal(err)
+	}
+	saved, _ := control.GetAppInstance(req.Instance.ID)
+	metadata := metadataFromInstance(saved)
+	peer, _ := metadata["peerUnknown"].(map[string]any)
+	if saved.Status != "install_warning" || peer["keep"] != true || stringFromMetadata(metadata, "orchestrationModel", "") != orchestrationModelServiceControllerV1 {
+		t.Fatalf("CAS merge lost lifecycle or unknown peer metadata: %+v metadata=%v", saved, metadata)
+	}
+}
+
+func TestMigrationDoesNotReportFailureWhenContextCancelsAfterDurableCommit(t *testing.T) {
+	control, remote, req := runtimeMigrationFixture(t, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	wrapped := &migrationCancelAfterCommitStore{fakeStore: control, cancel: cancel}
+	if err := NewService(wrapped, remote).MigrateRuntimeModel(ctx, req, fakeLogger{}); err != nil {
+		t.Fatalf("durably committed migration was reported failed: %v", err)
+	}
+	saved, _ := control.GetAppInstance(req.Instance.ID)
+	if got := stringFromMetadata(metadataFromInstance(saved), "orchestrationModel", ""); got != orchestrationModelServiceControllerV1 {
+		t.Fatalf("durable model marker=%q", got)
+	}
+}
+
+func TestMigrationRetriesExactLockReleaseAndReportsStableCleanupFailure(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		failures   int
+		wantReason string
+		wantCalls  int
+	}{
+		{name: "transient release failure", failures: 2, wantCalls: 3},
+		{name: "persistent release failure", failures: 3, wantReason: "AIFAR_RUNTIME_MIGRATION_LOCK_RELEASE_FAILED", wantCalls: 3},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture, remote, req := runtimeMigrationFixture(t, 1)
+			db := openAIFARTestStore(t)
+			instance, err := db.SaveAppInstance(fixture.instances[0])
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.SaveAIFARDeployment(fixture.deployments[0]); err != nil {
+				t.Fatal(err)
+			}
+			req.Instance = instance
+			wrapped := &migrationReleaseFailureStore{Store: db, failures: test.failures}
+			err = NewService(wrapped, remote).MigrateRuntimeModel(context.Background(), req, fakeLogger{})
+			if reasonCode(err) != test.wantReason {
+				t.Fatalf("release result reason=%q want=%q err=%v", reasonCode(err), test.wantReason, err)
+			}
+			if wrapped.calls != test.wantCalls {
+				t.Fatalf("exact release calls=%d want=%d", wrapped.calls, test.wantCalls)
+			}
+			locks, listErr := db.ListAIFAROrchestrationLocks(req.Instance.ID, true)
+			if listErr != nil {
+				t.Fatal(listErr)
+			}
+			if test.wantReason == "" && len(locks) != 0 {
+				t.Fatalf("transient cleanup left lock: %+v", locks)
+			}
+			if test.wantReason != "" && len(locks) != 1 {
+				t.Fatalf("persistent cleanup failure did not leave exact owner visible: %+v", locks)
+			}
+			audits, auditErr := db.ListAudit()
+			if auditErr != nil || len(audits) == 0 {
+				t.Fatalf("migration cleanup result was not audited: audits=%v err=%v", audits, auditErr)
+			}
+			wantAuditStatus := "success"
+			if test.wantReason != "" {
+				wantAuditStatus = "failed"
+			}
+			if audits[0].Status != wantAuditStatus {
+				t.Fatalf("audit status=%q want=%q", audits[0].Status, wantAuditStatus)
+			}
+		})
+	}
+}
+
+func reasonCode(err error) string {
+	var coded interface{ ReasonCode() string }
+	if errors.As(err, &coded) {
+		return coded.ReasonCode()
+	}
+	return ""
 }
 
 func TestRuntimeMigrationFailsClosedBeforeSwitchOnReplicaDivergence(t *testing.T) {
@@ -415,7 +802,7 @@ func TestInstallTemplateArchivesLegacySpecReadOnlyAfterAcceptance(t *testing.T) 
 		t.Fatal(err)
 	}
 	text := string(script)
-	for _, required := range []string{"runtime-spec.legacy-readonly.json", "chmod 0400", "AIFAR_BOOTSTRAP_ACCEPTANCE"} {
+	for _, required := range []string{"runtime-spec.legacy-readonly.json", "aifar-agent archive-legacy-runtime --instance", "--sha256", "chmod 0400", "AIFAR_BOOTSTRAP_ACCEPTANCE"} {
 		if !strings.Contains(text, required) {
 			t.Fatalf("install template is missing migration-safe legacy archive step %q", required)
 		}
