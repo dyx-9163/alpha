@@ -560,7 +560,13 @@ accept_runtime_manifests() {
     :
   fi
   acceptance="$(readback_bootstrap_acceptance)" || fail "aifar-agent could not prove the exact runtime Manifests"
-  rm -f "$spec"
+  legacy_backup="$AGENT_DIR/runtime-spec.legacy-readonly.json"
+  if [ -f "$legacy_backup" ]; then
+    rm -f "$spec"
+  else
+    mv "$spec" "$legacy_backup"
+  fi
+  chmod 0400 "$legacy_backup"
   printf 'AIFAR_BOOTSTRAP_ACCEPTANCE=%s\n' "$acceptance"
 }
 

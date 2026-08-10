@@ -622,6 +622,181 @@ func TestAcceptAIFARDeploymentWithLockRejectsExpiredOwnerAndWrongDesiredProof(t 
 	}
 }
 
+func TestCommitAIFARRuntimeMigrationRejectsSuccessorGenerationWithoutOverwrite(t *testing.T) {
+	db := openTestStore(t)
+	instance, err := db.SaveAppInstance(AppInstance{ID: "instance-1", App: "aifar", Version: "runtime-v2", ServerID: "srv-1", Status: "installed", Metadata: `{"orchestrationModel":"agent-runtime-v2","peer":"keep"}`})
+	if err != nil {
+		t.Fatal(err)
+	}
+	base, err := db.SaveAIFARDeployment(AIFARDeployment{InstanceID: instance.ID, ServiceName: "permission", DesiredReplicas: 1, CurrentRevision: "rev-1", Generation: 1, Status: "active"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner, err := db.AcquireAIFAROrchestrationLock(testAIFAROrchestrationLock(instance.ID, "", "migrate-runtime-model"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	successor := base
+	successor.Generation = 2
+	successor.DesiredReplicas = 2
+	successor.SpecJSON = `{"generation":2}`
+	successor.Status = "pending_acceptance"
+	if _, err := db.SaveAIFARDeployment(successor); err != nil {
+		t.Fatal(err)
+	}
+	next := base
+	next.SpecJSON = `{"generation":1}`
+	next.Status = "Accepted"
+	_, err = db.CommitAIFARRuntimeMigrationWithLock(AIFARRuntimeMigrationCommit{
+		LockID: owner.ID, InstanceID: instance.ID, ExpectedInstanceUpdatedAt: instance.UpdatedAt,
+		NextMetadata: `{"orchestrationModel":"agent-service-controller-v1"}`,
+		Deployments:  []AIFARRuntimeMigrationDeploymentCommit{{Expected: base, Next: next}},
+	})
+	if !errors.Is(err, ErrAIFARDeploymentGenerationConflict) {
+		t.Fatalf("successor generation error=%v, want generation conflict", err)
+	}
+	current := deploymentByName(t, db, instance.ID, "permission")
+	if current.Generation != 2 || current.DesiredReplicas != 2 || current.SpecJSON != successor.SpecJSON || current.Status != successor.Status {
+		t.Fatalf("migration overwrote successor desired state: %+v", current)
+	}
+	fresh, err := db.GetAppInstance(instance.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fresh.Metadata != instance.Metadata || fresh.Status != "installed" {
+		t.Fatalf("rejected migration changed app instance: %+v", fresh)
+	}
+}
+
+func TestCommitAIFARRuntimeMigrationRejectsReplacedGlobalOwner(t *testing.T) {
+	db := openTestStore(t)
+	instance, err := db.SaveAppInstance(AppInstance{ID: "instance-1", App: "aifar", Version: "runtime-v2", ServerID: "srv-1", Status: "install_failed", Metadata: `{"orchestrationModel":"agent-runtime-v2"}`})
+	if err != nil {
+		t.Fatal(err)
+	}
+	base, err := db.SaveAIFARDeployment(AIFARDeployment{InstanceID: instance.ID, ServiceName: "permission", DesiredReplicas: 1, CurrentRevision: "rev-1", Generation: 1, Status: "active"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	ownerA := testAIFAROrchestrationLock(instance.ID, "", "migrate-runtime-model")
+	ownerA.ID = "migration-owner-a"
+	ownerA.StartedAt = now.Add(-2 * time.Hour)
+	ownerA.ExpiresAt = now.Add(-time.Hour)
+	if _, err := db.AcquireAIFAROrchestrationLock(ownerA); err != nil {
+		t.Fatal(err)
+	}
+	ownerB := testAIFAROrchestrationLock(instance.ID, "", "migrate-runtime-model")
+	ownerB.ID = "migration-owner-b"
+	if _, err := db.AcquireAIFAROrchestrationLock(ownerB); err != nil {
+		t.Fatal(err)
+	}
+	next := base
+	next.SpecJSON = `{"generation":1}`
+	next.Status = "Accepted"
+	_, err = db.CommitAIFARRuntimeMigrationWithLock(AIFARRuntimeMigrationCommit{
+		LockID: ownerA.ID, InstanceID: instance.ID, ExpectedInstanceUpdatedAt: instance.UpdatedAt,
+		NextMetadata: `{"orchestrationModel":"agent-service-controller-v1"}`,
+		Deployments:  []AIFARRuntimeMigrationDeploymentCommit{{Expected: base, Next: next}},
+	})
+	if !errors.Is(err, ErrAIFAROrchestrationLockOwnership) {
+		t.Fatalf("replaced migration owner error=%v, want ownership conflict", err)
+	}
+	current := deploymentByName(t, db, instance.ID, "permission")
+	if current.SpecJSON != "" || current.Status != "active" {
+		t.Fatalf("replaced owner changed deployment: %+v", current)
+	}
+	fresh, _ := db.GetAppInstance(instance.ID)
+	if fresh.Metadata != instance.Metadata || fresh.Status != "install_failed" {
+		t.Fatalf("replaced owner changed app lifecycle or metadata: %+v", fresh)
+	}
+}
+
+func TestCommitAIFARRuntimeMigrationRollsBackCompleteSetOnOneServiceConflict(t *testing.T) {
+	db := openTestStore(t)
+	instance, err := db.SaveAppInstance(AppInstance{ID: "instance-1", App: "aifar", Version: "runtime-v2", ServerID: "srv-1", Status: "installed", Metadata: `{"orchestrationModel":"agent-runtime-v2","peer":{"keep":true}}`})
+	if err != nil {
+		t.Fatal(err)
+	}
+	permission, err := db.SaveAIFARDeployment(AIFARDeployment{InstanceID: instance.ID, ServiceName: "permission", DesiredReplicas: 1, CurrentRevision: "rev-1", Generation: 1, Status: "active"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	file, err := db.SaveAIFARDeployment(AIFARDeployment{InstanceID: instance.ID, ServiceName: "file", DesiredReplicas: 0, CurrentRevision: "rev-1", Generation: 1, Status: "offline"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner, err := db.AcquireAIFAROrchestrationLock(testAIFAROrchestrationLock(instance.ID, "", "migrate-runtime-model"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	permissionNext := permission
+	permissionNext.SpecJSON = `{"service":"permission"}`
+	permissionNext.Status = "Accepted"
+	fileExpected := file
+	fileExpected.DesiredReplicas = 1 // stale/wrong proof forces the second item to fail.
+	fileNext := file
+	fileNext.SpecJSON = `{"service":"file"}`
+	fileNext.Status = "Accepted"
+	_, err = db.CommitAIFARRuntimeMigrationWithLock(AIFARRuntimeMigrationCommit{
+		LockID: owner.ID, InstanceID: instance.ID, ExpectedInstanceUpdatedAt: instance.UpdatedAt,
+		NextMetadata: `{"orchestrationModel":"agent-service-controller-v1"}`,
+		Deployments: []AIFARRuntimeMigrationDeploymentCommit{
+			{Expected: permission, Next: permissionNext},
+			{Expected: fileExpected, Next: fileNext},
+		},
+	})
+	if !errors.Is(err, ErrAIFARDeploymentGenerationConflict) {
+		t.Fatalf("partial conflict error=%v, want generation conflict", err)
+	}
+	permissionAfter := deploymentByName(t, db, instance.ID, "permission")
+	fileAfter := deploymentByName(t, db, instance.ID, "file")
+	if permissionAfter.SpecJSON != "" || permissionAfter.Status != "active" || fileAfter.SpecJSON != "" || fileAfter.Status != "offline" || fileAfter.DesiredReplicas != 0 {
+		t.Fatalf("partial conflict did not roll back complete set: permission=%+v file=%+v", permissionAfter, fileAfter)
+	}
+	fresh, _ := db.GetAppInstance(instance.ID)
+	if fresh.Metadata != instance.Metadata || fresh.Status != "installed" {
+		t.Fatalf("partial rollback changed instance: %+v", fresh)
+	}
+}
+
+func TestCommitAIFARRuntimeMigrationAtomicallyPreservesLifecycleAndPeerMetadata(t *testing.T) {
+	db := openTestStore(t)
+	instance, err := db.SaveAppInstance(AppInstance{ID: "instance-1", App: "aifar", Version: "runtime-v2", ServerID: "srv-1", Status: "install_failed", Topology: "standalone", Metadata: `{"orchestrationModel":"agent-runtime-v2","peer":{"keep":true}}`})
+	if err != nil {
+		t.Fatal(err)
+	}
+	base, err := db.SaveAIFARDeployment(AIFARDeployment{InstanceID: instance.ID, ServiceName: "file", DesiredReplicas: 0, CurrentRevision: "rev-1", Generation: 1, Status: "offline", MetadataJSON: `{"peer":"keep"}`})
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner, err := db.AcquireAIFAROrchestrationLock(testAIFAROrchestrationLock(instance.ID, "", "migrate-runtime-model"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	next := base
+	next.SpecJSON = `{"service":"file","replicas":0}`
+	next.Status = "Accepted"
+	next.MetadataJSON = `{"model":"agent-service-controller-v1","specHash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`
+	next.ConditionsJSON = `[{"type":"Accepted","status":true,"generation":1}]`
+	next.LastTransitionAt = time.Now().UTC()
+	saved, err := db.CommitAIFARRuntimeMigrationWithLock(AIFARRuntimeMigrationCommit{
+		LockID: owner.ID, InstanceID: instance.ID, ExpectedInstanceUpdatedAt: instance.UpdatedAt,
+		NextMetadata: `{"orchestrationModel":"agent-service-controller-v1","peer":{"keep":true}}`,
+		Deployments:  []AIFARRuntimeMigrationDeploymentCommit{{Expected: base, Next: next}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if saved.Status != "install_failed" || saved.Version != instance.Version || saved.ServerID != instance.ServerID || saved.Topology != instance.Topology || saved.Metadata != `{"orchestrationModel":"agent-service-controller-v1","peer":{"keep":true}}` {
+		t.Fatalf("migration commit regressed lifecycle or peer metadata: %+v", saved)
+	}
+	committed := deploymentByName(t, db, instance.ID, "file")
+	if committed.Generation != 1 || committed.DesiredReplicas != 0 || committed.CurrentRevision != "rev-1" || committed.SpecJSON != next.SpecJSON || committed.Status != "Accepted" {
+		t.Fatalf("migration commit changed desired identity or lost offline=0: %+v", committed)
+	}
+}
+
 func testAIFAROrchestrationLock(instanceID, serviceName, operation string) AIFAROrchestrationLock {
 	now := time.Now().UTC()
 	return AIFAROrchestrationLock{

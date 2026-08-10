@@ -323,6 +323,14 @@ type RuntimeRestartRequest struct {
 	Reason   string
 }
 
+type RuntimeMigrationRequest struct {
+	Instance store.AppInstance
+	Server   store.Server
+	Actor    string
+	TaskID   string
+	Reason   string
+}
+
 type RuntimeCleanupRequest struct {
 	Instance store.AppInstance
 	Server   store.Server

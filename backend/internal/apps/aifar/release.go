@@ -10,13 +10,14 @@ import (
 )
 
 const (
-	releaseManifestSchemaV2     = "aifar-release-v2"
-	releasePhaseActive          = "active"
-	orchestrationModelK8sLikeV1 = "agent-runtime-v2"
-	legacyOrchestrationModel    = "legacy-release-v1"
-	releaseKeepCount            = 3
-	releaseEnvDirName           = "env"
-	runtimeSpecDirName          = "agent"
+	releaseManifestSchemaV2               = "aifar-release-v2"
+	releasePhaseActive                    = "active"
+	orchestrationModelK8sLikeV1           = "agent-runtime-v2"
+	orchestrationModelServiceControllerV1 = "agent-service-controller-v1"
+	legacyOrchestrationModel              = "legacy-release-v1"
+	releaseKeepCount                      = 3
+	releaseEnvDirName                     = "env"
+	runtimeSpecDirName                    = "agent"
 
 	defaultOauthPort      = 38001
 	defaultPermissionPort = 38010
@@ -30,6 +31,10 @@ const (
 
 func runtimeSpecPath(installRoot string) string {
 	return strings.TrimRight(installRoot, "/") + "/runtime/" + runtimeSpecDirName + "/runtime-spec.json"
+}
+
+func legacyRuntimeSpecBackupPath(installRoot string) string {
+	return strings.TrimRight(installRoot, "/") + "/runtime/" + runtimeSpecDirName + "/runtime-spec.legacy-readonly.json"
 }
 
 func releaseDirPath(installRoot, releaseID string) string {

@@ -18,12 +18,158 @@ type AIFAROrchestrationLockConflict struct {
 	Lock AIFAROrchestrationLock
 }
 
+// AIFARRuntimeMigrationDeploymentCommit fills the generation-1 per-service
+// manifest accepted by the Agent without advancing or replacing desired state.
+// Expected is the exact pre-commit proof; Next may change only the persisted
+// manifest and acceptance fields.
+type AIFARRuntimeMigrationDeploymentCommit struct {
+	Expected AIFARDeployment
+	Next     AIFARDeployment
+}
+
+// AIFARRuntimeMigrationCommit is the complete Server-side half of the
+// marker-last legacy migration. Deployments and app metadata are committed in
+// one SQLite transaction fenced by the exact global migration lease.
+type AIFARRuntimeMigrationCommit struct {
+	LockID                    string
+	InstanceID                string
+	ExpectedInstanceUpdatedAt time.Time
+	NextMetadata              string
+	Deployments               []AIFARRuntimeMigrationDeploymentCommit
+}
+
 func (e AIFAROrchestrationLockConflict) Error() string {
 	scope := strings.TrimSpace(e.Lock.ServiceName)
 	if scope == "" {
 		scope = "instance"
 	}
 	return fmt.Sprintf("active AIFAR orchestration lock exists for %s", scope)
+}
+
+// CommitAIFARRuntimeMigrationWithLock atomically records every Agent-accepted
+// generation-1 manifest and switches the app-instance metadata marker. It
+// never advances a generation and fails closed if the service set or any
+// expected desired field changed after migration preflight.
+func (s *Store) CommitAIFARRuntimeMigrationWithLock(commit AIFARRuntimeMigrationCommit) (AppInstance, error) {
+	commit.LockID = strings.TrimSpace(commit.LockID)
+	commit.InstanceID = strings.TrimSpace(commit.InstanceID)
+	if commit.LockID == "" || commit.InstanceID == "" || commit.ExpectedInstanceUpdatedAt.IsZero() || strings.TrimSpace(commit.NextMetadata) == "" || len(commit.Deployments) == 0 {
+		return AppInstance{}, ErrAIFARDeploymentGenerationConflict
+	}
+	serviceNames := make(map[string]bool, len(commit.Deployments))
+	for _, item := range commit.Deployments {
+		expected := item.Expected
+		next := item.Next
+		serviceName := strings.TrimSpace(expected.ServiceName)
+		if expected.InstanceID != commit.InstanceID || next.InstanceID != commit.InstanceID || serviceName == "" || strings.TrimSpace(next.ServiceName) != serviceName || serviceNames[serviceName] ||
+			expected.Generation != 1 || next.Generation != expected.Generation || expected.ObservedGeneration > 1 || next.DesiredReplicas != expected.DesiredReplicas || next.CurrentRevision != expected.CurrentRevision || strings.TrimSpace(next.SpecJSON) == "" {
+			return AppInstance{}, ErrAIFARDeploymentGenerationConflict
+		}
+		serviceNames[serviceName] = true
+	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return AppInstance{}, err
+	}
+	defer tx.Rollback()
+	if err := fenceActiveAIFARRuntimeMigrationLockTx(tx, commit.LockID, commit.InstanceID, time.Now().UTC()); err != nil {
+		return AppInstance{}, err
+	}
+
+	rows, err := tx.Query(`select service_name from aifar_deployments where instance_id=? order by service_name`, commit.InstanceID)
+	if err != nil {
+		return AppInstance{}, err
+	}
+	persistedServices := make(map[string]bool, len(serviceNames))
+	for rows.Next() {
+		var serviceName string
+		if err := rows.Scan(&serviceName); err != nil {
+			_ = rows.Close()
+			return AppInstance{}, err
+		}
+		persistedServices[serviceName] = true
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return AppInstance{}, err
+	}
+	if err := rows.Close(); err != nil {
+		return AppInstance{}, err
+	}
+	if len(persistedServices) != len(serviceNames) {
+		return AppInstance{}, ErrAIFARDeploymentGenerationConflict
+	}
+	for serviceName := range persistedServices {
+		if !serviceNames[serviceName] {
+			return AppInstance{}, ErrAIFARDeploymentGenerationConflict
+		}
+	}
+
+	now := time.Now().UTC()
+	for _, item := range commit.Deployments {
+		expected := item.Expected
+		next := item.Next
+		result, err := tx.Exec(`update aifar_deployments set
+			spec_json=?,status=?,metadata_json=?,conditions_json=?,last_transition_at=?,updated_at=?
+			where instance_id=? and service_name=? and generation=1 and observed_generation<=1
+				and desired_replicas=? and current_revision=? and coalesce(spec_json,'')=?`,
+			next.SpecJSON, next.Status, next.MetadataJSON, next.ConditionsJSON, nullableTime(next.LastTransitionAt), now,
+			commit.InstanceID, expected.ServiceName, expected.DesiredReplicas, expected.CurrentRevision, expected.SpecJSON)
+		if err != nil {
+			return AppInstance{}, err
+		}
+		affected, err := result.RowsAffected()
+		if err != nil {
+			return AppInstance{}, err
+		}
+		if affected != 1 {
+			return AppInstance{}, ErrAIFARDeploymentGenerationConflict
+		}
+	}
+
+	freshUpdatedAt := now
+	if freshUpdatedAt.Sub(commit.ExpectedInstanceUpdatedAt) < time.Millisecond {
+		freshUpdatedAt = commit.ExpectedInstanceUpdatedAt.Add(time.Millisecond)
+	}
+	result, err := tx.Exec(`update app_instances set metadata=?,updated_at=? where id=? and app='aifar' and updated_at=?`,
+		commit.NextMetadata, freshUpdatedAt, commit.InstanceID, commit.ExpectedInstanceUpdatedAt)
+	if err != nil {
+		return AppInstance{}, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return AppInstance{}, err
+	}
+	if affected != 1 {
+		return AppInstance{}, ErrAppInstanceConflict
+	}
+	var saved AppInstance
+	if err := tx.QueryRow(`select id,app,version,server_id,status,topology,metadata,created_at,updated_at from app_instances where id=?`, commit.InstanceID).
+		Scan(&saved.ID, &saved.App, &saved.Version, &saved.ServerID, &saved.Status, &saved.Topology, &saved.Metadata, &saved.CreatedAt, &saved.UpdatedAt); err != nil {
+		return AppInstance{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return AppInstance{}, err
+	}
+	return saved, nil
+}
+
+func fenceActiveAIFARRuntimeMigrationLockTx(tx *sql.Tx, lockID, instanceID string, now time.Time) error {
+	result, err := tx.Exec(`update aifar_orchestration_locks set updated_at=?
+		where id=? and instance_id=? and service_name='' and operation='migrate-runtime-model'
+			and status='active' and expires_at>?`, now, strings.TrimSpace(lockID), strings.TrimSpace(instanceID), now)
+	if err != nil {
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected != 1 {
+		return ErrAIFAROrchestrationLockOwnership
+	}
+	return nil
 }
 
 func (s *Store) SaveAIFARDeployment(v AIFARDeployment) (AIFARDeployment, error) {
