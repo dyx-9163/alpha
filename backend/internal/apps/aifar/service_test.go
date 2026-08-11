@@ -107,55 +107,12 @@ type barrierCASStore struct {
 	release   chan struct{}
 }
 
-type staleProjectionCASStore struct {
-	*store.Store
-	once    sync.Once
-	blocked chan struct{}
-	release chan struct{}
-}
-
 type firstProjectionCASStore struct {
 	*store.Store
 	mu       sync.Mutex
 	blocked  chan struct{}
 	release  chan struct{}
 	didBlock bool
-}
-
-type acceptedProjectionInterleavingStore struct {
-	*store.Store
-	aBlocked chan struct{}
-	aRelease chan struct{}
-	bBlocked chan struct{}
-	bRelease chan struct{}
-	aOnce    sync.Once
-	bOnce    sync.Once
-}
-
-func (s *acceptedProjectionInterleavingStore) blockProjection(next store.AppInstance) {
-	desired := desiredReplicasFromMetadata(metadataFromInstance(next))["permission"]
-	switch desired {
-	case 2:
-		s.aOnce.Do(func() {
-			close(s.aBlocked)
-			<-s.aRelease
-		})
-	case 3:
-		s.bOnce.Do(func() {
-			close(s.bBlocked)
-			<-s.bRelease
-		})
-	}
-}
-
-func (s *acceptedProjectionInterleavingStore) SaveAppInstanceIfUnchanged(next store.AppInstance, expectedUpdatedAt time.Time) (store.AppInstance, error) {
-	s.blockProjection(next)
-	return s.Store.SaveAppInstanceIfUnchanged(next, expectedUpdatedAt)
-}
-
-func (s *acceptedProjectionInterleavingStore) SaveAIFARAcceptedProjectionWithLock(lockID string, expected store.AIFARDeployment, next store.AppInstance, expectedUpdatedAt time.Time) (store.AppInstance, error) {
-	s.blockProjection(next)
-	return s.Store.SaveAIFARAcceptedProjectionWithLock(lockID, expected, next, expectedUpdatedAt)
 }
 
 type runtimeConfigPendingInterleavingStore struct {
@@ -205,26 +162,6 @@ func (s *firstProjectionCASStore) blockFirstProjection() {
 	s.mu.Unlock()
 	if block {
 		<-s.release
-	}
-}
-
-func (s *staleProjectionCASStore) SaveAppInstanceIfUnchanged(next store.AppInstance, expectedUpdatedAt time.Time) (store.AppInstance, error) {
-	s.blockStaleProjection(next)
-	return s.Store.SaveAppInstanceIfUnchanged(next, expectedUpdatedAt)
-}
-
-func (s *staleProjectionCASStore) SaveAIFARAcceptedProjectionWithLock(lockID string, expected store.AIFARDeployment, next store.AppInstance, expectedUpdatedAt time.Time) (store.AppInstance, error) {
-	s.blockStaleProjection(next)
-	return s.Store.SaveAIFARAcceptedProjectionWithLock(lockID, expected, next, expectedUpdatedAt)
-}
-
-func (s *staleProjectionCASStore) blockStaleProjection(next store.AppInstance) {
-	desired := desiredReplicasFromMetadata(metadataFromInstance(next))
-	if desired["permission"] == 2 {
-		s.once.Do(func() {
-			close(s.blocked)
-			<-s.release
-		})
 	}
 }
 
@@ -407,7 +344,7 @@ func TestUpdateAppInstanceMetadataExhaustsCASConflictsAsRepairRequired(t *testin
 	conflicts := &alwaysConflictCASStore{fakeStore: &fakeStore{instances: []store.AppInstance{instance}}}
 
 	_, err := NewService(conflicts, &fakeRemote{}).updateAppInstanceMetadata(instance.ID, "AIFAR_TEST_METADATA_REPAIR_REQUIRED", func(metadata map[string]any) error {
-		metadata["desiredReplicas"] = map[string]int{"permission": 2}
+		metadata["testMarker"] = "updated"
 		return nil
 	})
 	var controlErr *deploymentControlError
@@ -1776,7 +1713,7 @@ func TestAutoscalePolicyDefaultsAndTrigger(t *testing.T) {
 		MemoryPercent:    86,
 		MemoryLimitBytes: 2 * 1024 * 1024 * 1024,
 	}}}
-	next, decision := evaluateAutoscale(instance, metadata, status, autoscalePolicyFromMetadata(metadata), now)
+	next, decision := evaluateAutoscale(instance, metadata, map[string]int{"permission": 1}, status, autoscalePolicyFromMetadata(metadata), now)
 	if decision.Service != "permission" {
 		t.Fatalf("expected permission scale decision, got %+v", decision)
 	}
@@ -1807,7 +1744,7 @@ func TestAutoscaleDoesNotTriggerWithoutMemoryLimitOrDuringCooldown(t *testing.T)
 		MemoryPercent:    90,
 		MemoryLimitBytes: 2 * 1024 * 1024 * 1024,
 	}}}
-	_, decision := evaluateAutoscale(instance, metadata, status, autoscalePolicyFromMetadata(metadata), now)
+	_, decision := evaluateAutoscale(instance, metadata, map[string]int{"permission": 1}, status, autoscalePolicyFromMetadata(metadata), now)
 	if decision.Service != "" {
 		t.Fatalf("expected cooldown to suppress scale out, got %+v", decision)
 	}
@@ -1815,71 +1752,47 @@ func TestAutoscaleDoesNotTriggerWithoutMemoryLimitOrDuringCooldown(t *testing.T)
 		"permission": map[string]any{"since": now.Add(-10 * time.Minute).Format(time.RFC3339)},
 	}
 	status.Endpoints[0].MemoryLimitBytes = 0
-	_, decision = evaluateAutoscale(instance, metadata, status, autoscalePolicyFromMetadata(metadata), now)
+	_, decision = evaluateAutoscale(instance, metadata, map[string]int{"permission": 1}, status, autoscalePolicyFromMetadata(metadata), now)
 	if decision.Service != "" {
 		t.Fatalf("expected missing memory limit to suppress scale out, got %+v", decision)
 	}
 }
 
-func TestAutoscaleOutScriptUsesReplicaContainerAndEscapedDockerFormats(t *testing.T) {
-	script, err := renderAutoscaleOutScript(autoscaleOutScriptData{
-		InstallRoot:     "/aifar/apps/admin",
-		ServiceName:     "permission",
-		ReleaseID:       "rel-1",
-		ReplicaID:       2,
-		ContainerName:   "aifar-permission-rel-1-r2",
-		IngressNetwork:  "aifar-network",
-		MaxReplicas:     3,
-		DesiredReplicas: "gateway=1 file=0 permission=2",
-	})
+func TestAutoscaleOutScriptRejectsLegacyAggregateMutation(t *testing.T) {
+	content, err := templateFS.ReadFile("templates/autoscale-out.sh")
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{
-		`--format '{{.Names}}'`,
-		`"version": "runtime-v2"`,
-		`"mode": "web-nginx"`,
-		`CONTROL_PLANE_DESIRED_REPLICAS='gateway=1 file=0 permission=2'`,
-		`desired_replicas_from_pairs`,
-		`nacos_ephemeral`,
-		`"ephemeral": $(nacos_ephemeral)`,
-		`replicas_for_service`,
-		`service_pod_count "$service"`,
-		`if [ "$value" = "0" ]; then`,
-		`write_runtime_spec`,
-		`aifar-agent reconcile-runtime --spec "$spec"`,
-	} {
-		if !strings.Contains(script, want) {
-			t.Fatalf("autoscale script missing %q:\n%s", want, script)
-		}
+	script := string(content)
+	if !strings.Contains(script, "legacy autoscale helper is disabled") {
+		t.Fatalf("autoscale helper must fail closed:\n%s", script)
 	}
-	for _, legacy := range []string{`docker run -d`, `--name "$CONTAINER_NAME"`, `ephemeral=false`} {
+	for _, legacy := range []string{`AIFAR_DESIRED_REPLICAS`, `runtime-spec.json`, `reconcile-runtime`, `docker run -d`} {
 		if strings.Contains(script, legacy) {
-			t.Fatalf("autoscale script should not contain legacy direct runtime action %q:\n%s", legacy, script)
+			t.Fatalf("autoscale script should not contain aggregate runtime action %q:\n%s", legacy, script)
 		}
 	}
 }
 
-func TestScaleOutCreatesReplicaAndUpdatesEndpointMetadata(t *testing.T) {
-	withFakeRuntimeAgentBinary(t)
+func TestScaleOutAdvancesOnlyCanonicalDeployment(t *testing.T) {
+	agent := withFakeRuntimeAgentBinary(t)
+	sum, _, err := fileSHA256(agent)
+	if err != nil {
+		t.Fatal(err)
+	}
 	instance := installedAIFARInstance(t)
 	metadata := metadataFromInstance(instance)
-	desiredBefore := desiredReplicasFromMetadata(metadata)
-	desiredBefore["file"] = 0
-	metadata["desiredReplicas"] = desiredBefore
+	delete(metadata, "desiredReplicas")
 	instance.Metadata = mustMetadata(t, metadata)
+	deployments := seedPerServiceDeployments(t, instance, map[string]int{"permission": 1, "file": 0}, map[string]int64{"permission": 3, "file": 7})
 	s := &fakeStore{
-		servers: map[string]store.Server{"srv-1": {ID: "srv-1", Host: "10.0.0.10", DeployDir: "/aifar/apps"}},
-		instances: []store.AppInstance{
-			instance,
-		},
+		servers:     map[string]store.Server{"srv-1": {ID: "srv-1", Host: "10.0.0.10", DeployDir: "/aifar/apps"}},
+		instances:   []store.AppInstance{instance},
+		deployments: deployments,
 	}
-	remote := &fakeRemote{autoscaleStatusStdouts: []string{
-		"endpoint=permission|aifar-permission-rel|rel|1|38010|true|healthy|86|2147483648\nhostMemoryAvailableBytes=8589934592\n",
-		"endpoint=permission|aifar-permission-rel|rel|1|38010|true|healthy|50|2147483648\nendpoint=permission|aifar-permission-rel-r2|rel|2|38010|true|healthy|5|2147483648\nendpoint=file|aifar-file-stale|rel|1|38005|true|healthy|5|2147483648\nhostMemoryAvailableBytes=6442450944\n",
-	}}
+	remote := &fakeRemote{runtimeAgentCheckStdout: runtimeAgentCheckOutput(t, sum, requiredRuntimeAgentFeatures...)}
 	service := NewService(s, remote)
-	err := service.ScaleOut(context.Background(), ScaleOutRequest{
+	err = service.ScaleOut(context.Background(), ScaleOutRequest{
 		Instance:    instance,
 		Server:      s.servers["srv-1"],
 		Actor:       "system",
@@ -1889,46 +1802,19 @@ func TestScaleOutCreatesReplicaAndUpdatesEndpointMetadata(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(remote.autoscaleScript, "AIFAR_AUTOSCALE_OUT") || !strings.Contains(remote.autoscaleScript, "aifar-pod-admin-permission-20260701t010203.000000000z-runtime-v2-r2") {
-		t.Fatalf("expected autoscale remote script to run with replica container, got:\n%s", remote.autoscaleScript)
+	after := deploymentsByService(s.deployments)
+	if got := after["permission"]; got.Generation != 4 || got.DesiredReplicas != 2 || got.Status != "Accepted" {
+		t.Fatalf("permission autoscale mutation=%+v", got)
 	}
-	if !strings.Contains(remote.autoscaleScript, "CONTROL_PLANE_DESIRED_REPLICAS=") || !strings.Contains(remote.autoscaleScript, "file=0") || !strings.Contains(remote.autoscaleScript, "permission=2") {
-		t.Fatalf("expected autoscale script to carry control-plane desired replicas, got:\n%s", remote.autoscaleScript)
-	}
-	uploads := remote.joinedUploads()
-	if !strings.Contains(uploads, "aifar-agent-linux-amd64->/aifar/apps/_work/aifar-agent-runtime-v2-") {
-		t.Fatalf("expected scale-out to upload current runtime agent, uploads=%s", uploads)
-	}
-	commands := remote.joinedCommands()
-	upgradeIndex := strings.Index(commands, "AIFAR_AGENT_UPGRADE")
-	scaleIndex := strings.Index(commands, "AIFAR_AUTOSCALE_OUT")
-	if upgradeIndex < 0 || scaleIndex < 0 || upgradeIndex > scaleIndex {
-		t.Fatalf("expected scale-out to upgrade agent before autoscale script, commands:\n%s", commands)
+	if got, want := after["file"], deploymentsByService(deployments)["file"]; got.Generation != want.Generation || got.DesiredReplicas != 0 || got.SpecJSON != want.SpecJSON {
+		t.Fatalf("offline peer changed: before=%+v after=%+v", want, got)
 	}
 	saved, err := s.GetAppInstance(instance.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	savedMetadata := metadataFromInstance(saved)
-	desired := desiredReplicasFromMetadata(savedMetadata)
-	if desired["permission"] != 2 {
-		t.Fatalf("expected permission desired replicas 2, got %v metadata=%s", desired["permission"], saved.Metadata)
-	}
-	if desired["file"] != 0 {
-		t.Fatalf("expected offline file desired replicas to stay 0, got %v metadata=%s", desired["file"], saved.Metadata)
-	}
-	endpoints, ok := savedMetadata["activeEndpoints"].(map[string]any)
-	if !ok {
-		t.Fatalf("expected activeEndpoints metadata, got %s", saved.Metadata)
-	}
-	if endpointCount(endpoints["permission"]) != 2 {
-		t.Fatalf("expected two permission endpoints, got %s", saved.Metadata)
-	}
-	if endpointCount(endpoints["file"]) != 0 {
-		t.Fatalf("expected offline file endpoints to be ignored, got %s", saved.Metadata)
-	}
-	if _, locked := savedMetadata["orchestrationLock"]; locked {
-		t.Fatalf("expected orchestration lock to be released, got %s", saved.Metadata)
+	if _, ok := metadataFromInstance(saved)["desiredReplicas"]; ok {
+		t.Fatalf("autoscale must not project desired replicas into metadata: %s", saved.Metadata)
 	}
 }
 
@@ -1999,13 +1885,12 @@ func TestConcurrentDifferentServiceScalesPreserveBothDesiredContributions(t *tes
 			t.Fatal(err)
 		}
 	}
-	barrier := &barrierCASStore{Store: db, remaining: 2, ready: make(chan struct{}), release: make(chan struct{})}
 	server := store.Server{ID: "srv-1", Host: "10.0.0.10", DeployDir: "/aifar/apps"}
 	remote := &fakeRemote{
 		runtimeAgentCheckStdout: runtimeAgentCheckOutput(t, sum, requiredRuntimeAgentFeatures...),
 		autoscaleStatusFallback: "endpoint=permission|permission-pod-1|release-permission|1|38010|true|healthy|10|64\nendpoint=file|file-pod-1|release-file|1|38005|true|healthy|10|64\n",
 	}
-	service := NewService(barrier, remote)
+	service := NewService(db, remote)
 	errs := make(chan error, 2)
 	for _, request := range []ScaleRequest{
 		{Instance: instance, Server: server, Actor: "operator-permission", TaskID: "task-scale-permission", ServiceName: "permission", Replicas: 2},
@@ -2014,8 +1899,6 @@ func TestConcurrentDifferentServiceScalesPreserveBothDesiredContributions(t *tes
 		request := request
 		go func() { errs <- service.ScaleService(context.Background(), request, fakeLogger{}, nil) }()
 	}
-	<-barrier.ready
-	close(barrier.release)
 	for range 2 {
 		if err := <-errs; err != nil {
 			t.Fatal(err)
@@ -2028,229 +1911,16 @@ func TestConcurrentDifferentServiceScalesPreserveBothDesiredContributions(t *tes
 	if saved.Status != "install_failed" {
 		t.Fatalf("runtime scale changed lifecycle status to %q", saved.Status)
 	}
-	desired := desiredReplicasFromMetadata(metadataFromInstance(saved))
+	if _, ok := metadataFromInstance(saved)["desiredReplicas"]; ok {
+		t.Fatalf("concurrent scale must not write aggregate desired replicas: %s", saved.Metadata)
+	}
+	rows, err := db.ListAIFARDeployments(instance.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	desired := desiredReplicasFromDeployments(rows)
 	if desired["permission"] != 2 || desired["file"] != 3 {
-		t.Fatalf("concurrent desired replicas lost a service contribution: %v", desired)
-	}
-	if calls := barrier.callCount(); calls != 3 {
-		t.Fatalf("CAS calls=%d, want two initial attempts plus one conflict retry", calls)
-	}
-}
-
-func TestOlderSameServiceScaleCannotProjectOverAcceptedSuccessor(t *testing.T) {
-	db, err := store.Open(filepath.Join(t.TempDir(), "aifar.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-	instance := installedAIFARInstance(t)
-	instance.Status = "install_failed"
-	instance, err = db.SaveAppInstance(instance)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, deployment := range seedPerServiceDeployments(t, instance,
-		map[string]int{"permission": 1}, map[string]int64{"permission": 3},
-	) {
-		if _, err := db.SaveAIFARDeployment(deployment); err != nil {
-			t.Fatal(err)
-		}
-	}
-	blocking := &staleProjectionCASStore{Store: db, blocked: make(chan struct{}), release: make(chan struct{})}
-	server := store.Server{ID: "srv-1", Host: "10.0.0.10", DeployDir: "/aifar/apps"}
-	service := NewService(blocking, &fakeRemote{})
-	oldDone := make(chan error, 1)
-	go func() {
-		oldDone <- service.ScaleService(context.Background(), ScaleRequest{
-			Instance: instance, Server: server, Actor: "old-owner", TaskID: "task-scale-old",
-			ServiceName: "permission", Replicas: 2,
-		}, fakeLogger{}, nil)
-	}()
-	select {
-	case <-blocking.blocked:
-	case err := <-oldDone:
-		t.Fatalf("old operation ended before projection barrier: %v", err)
-	case <-time.After(2 * time.Second):
-		t.Fatal("old operation did not reach projection barrier")
-	}
-	if _, err := db.RecoverAIFAROrchestrationLocks(instance.ID, "test successor takeover"); err != nil {
-		t.Fatal(err)
-	}
-	if err := service.ScaleService(context.Background(), ScaleRequest{
-		Instance: instance, Server: server, Actor: "new-owner", TaskID: "task-scale-new",
-		ServiceName: "permission", Replicas: 3,
-	}, fakeLogger{}, nil); err != nil {
-		t.Fatal(err)
-	}
-	close(blocking.release)
-	oldErr := <-oldDone
-	var controlErr *deploymentControlError
-	if !errors.As(oldErr, &controlErr) || controlErr.StableCode() != runtimeControlPlaneRepairCode {
-		t.Fatalf("old operation error=%v, want forward-only repair-required", oldErr)
-	}
-	saved, err := db.GetAppInstance(instance.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if saved.Status != "install_failed" || desiredReplicasFromMetadata(metadataFromInstance(saved))["permission"] != 3 {
-		t.Fatalf("old projection regressed successor or lifecycle: %+v metadata=%s", saved, saved.Metadata)
-	}
-	deployments, err := db.ListAIFARDeployments(instance.ID)
-	if err != nil || len(deployments) != 1 || deployments[0].DesiredReplicas != 3 || deployments[0].Generation != 5 {
-		t.Fatalf("canonical successor desired state=%+v err=%v", deployments, err)
-	}
-}
-
-func TestAcceptedSuccessorBeforeProjectionAtomicallyRejectsOldScaleProjection(t *testing.T) {
-	db, err := store.Open(filepath.Join(t.TempDir(), "aifar.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-	instance := installedAIFARInstance(t)
-	instance.Status = "install_failed"
-	instance, err = db.SaveAppInstance(instance)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, deployment := range seedPerServiceDeployments(t, instance,
-		map[string]int{"permission": 1}, map[string]int64{"permission": 3},
-	) {
-		if _, err := db.SaveAIFARDeployment(deployment); err != nil {
-			t.Fatal(err)
-		}
-	}
-	barrier := &acceptedProjectionInterleavingStore{
-		Store: db, aBlocked: make(chan struct{}), aRelease: make(chan struct{}),
-		bBlocked: make(chan struct{}), bRelease: make(chan struct{}),
-	}
-	service := NewService(barrier, &fakeRemote{})
-	service.orchestrationLockHeartbeatInterval = time.Hour
-	server := store.Server{ID: "srv-1", Host: "10.0.0.10", DeployDir: "/aifar/apps"}
-	aDone := make(chan error, 1)
-	go func() {
-		aDone <- service.ScaleService(context.Background(), ScaleRequest{
-			Instance: instance, Server: server, Actor: "old-owner", TaskID: "task-scale-old-before-cas",
-			ServiceName: "permission", Replicas: 2,
-		}, fakeLogger{}, nil)
-	}()
-	select {
-	case <-barrier.aBlocked:
-	case err := <-aDone:
-		t.Fatalf("old operation ended before its projection CAS: %v", err)
-	case <-time.After(2 * time.Second):
-		t.Fatal("old operation did not reach projection CAS")
-	}
-	if _, err := db.RecoverAIFAROrchestrationLocks(instance.ID, "test accepted successor takeover"); err != nil {
-		t.Fatal(err)
-	}
-	bDone := make(chan error, 1)
-	go func() {
-		bDone <- service.ScaleService(context.Background(), ScaleRequest{
-			Instance: instance, Server: server, Actor: "new-owner", TaskID: "task-scale-new-before-projection",
-			ServiceName: "permission", Replicas: 3,
-		}, fakeLogger{}, nil)
-	}()
-	select {
-	case <-barrier.bBlocked:
-	case err := <-bDone:
-		t.Fatalf("successor ended before projection barrier: %v", err)
-	case <-time.After(2 * time.Second):
-		t.Fatal("successor did not accept before projection barrier")
-	}
-	close(barrier.aRelease)
-	aErr := <-aDone
-	beforeSuccessorProjection, err := db.GetAppInstance(instance.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	close(barrier.bRelease)
-	bErr := <-bDone
-	var controlErr *deploymentControlError
-	if !errors.As(aErr, &controlErr) || controlErr.StableCode() != runtimeControlPlaneRepairCode {
-		t.Fatalf("old operation error=%v, want repair-required", aErr)
-	}
-	if got := desiredReplicasFromMetadata(metadataFromInstance(beforeSuccessorProjection))["permission"]; got != 1 {
-		t.Fatalf("old owner projected after accepted successor: desired=%d metadata=%s", got, beforeSuccessorProjection.Metadata)
-	}
-	if bErr != nil {
-		t.Fatalf("successor projection failed: %v", bErr)
-	}
-	final, err := db.GetAppInstance(instance.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if final.Status != "install_failed" || desiredReplicasFromMetadata(metadataFromInstance(final))["permission"] != 3 {
-		t.Fatalf("successor projection/lifecycle=%+v metadata=%s", final, final.Metadata)
-	}
-}
-
-func TestScaleValidAgentAcceptanceThenLockLossRequiresRepairWithoutProjection(t *testing.T) {
-	db, err := store.Open(filepath.Join(t.TempDir(), "aifar.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-	instance := installedAIFARInstance(t)
-	instance.Status = "install_failed"
-	instance, err = db.SaveAppInstance(instance)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, deployment := range seedPerServiceDeployments(t, instance,
-		map[string]int{"permission": 1}, map[string]int64{"permission": 3},
-	) {
-		if _, err := db.SaveAIFARDeployment(deployment); err != nil {
-			t.Fatal(err)
-		}
-	}
-	wrapper := &postAcceptanceRenewalFailureStore{Store: db}
-	service := NewService(wrapper, &fakeRemote{})
-	service.orchestrationLockHeartbeatInterval = time.Hour
-	recorder := &targetStateRecorder{}
-	err = service.ScaleService(context.Background(), ScaleRequest{
-		Instance: instance, Server: store.Server{ID: "srv-1", Host: "10.0.0.10", DeployDir: "/aifar/apps"},
-		Language: "en", Actor: "old-owner", TaskID: "task-scale-lost-after-acceptance", ServiceName: "permission", Replicas: 2,
-	}, recorder, nil)
-	var controlErr *deploymentControlError
-	if !errors.As(err, &controlErr) || controlErr.StableCode() != runtimeControlPlaneRepairCode || controlErr.ReasonCode() != "AIFAR_RUNTIME_ORCHESTRATION_LOCK_LOST" {
-		t.Fatalf("error=%v, want lock-loss repair-required", err)
-	}
-	deployments, listErr := db.ListAIFARDeployments(instance.ID)
-	if listErr != nil || len(deployments) != 1 || deployments[0].Generation != 4 || deployments[0].DesiredReplicas != 2 || deployments[0].Status != "Accepted" {
-		t.Fatalf("forward-only canonical acceptance=%+v err=%v", deployments, listErr)
-	}
-	saved, getErr := db.GetAppInstance(instance.ID)
-	if getErr != nil {
-		t.Fatal(getErr)
-	}
-	if saved.Status != "install_failed" || desiredReplicasFromMetadata(metadataFromInstance(saved))["permission"] != 1 {
-		t.Fatalf("lost owner projected metadata or changed lifecycle: %+v metadata=%s", saved, saved.Metadata)
-	}
-	renewals, casCalls := wrapper.counts()
-	if renewals != 1 || casCalls != 0 {
-		t.Fatalf("renewals=%d CAS calls=%d, want one post-accept fence and no projection", renewals, casCalls)
-	}
-	statuses, _, _ := recorder.snapshot()
-	if statuses[instance.ID+":permission"] != "failed" {
-		t.Fatalf("lost owner target status=%q, want failed", statuses[instance.ID+":permission"])
-	}
-	locks, lockErr := db.ListAIFAROrchestrationLocks(instance.ID, true)
-	if lockErr != nil || len(locks) != 0 {
-		t.Fatalf("lost owner lock was not released: locks=%+v err=%v", locks, lockErr)
-	}
-	if err := NewService(db, &fakeRemote{}).ScaleService(context.Background(), ScaleRequest{
-		Instance: instance, Server: store.Server{ID: "srv-1", Host: "10.0.0.10", DeployDir: "/aifar/apps"},
-		Language: "en", Actor: "successor", TaskID: "task-scale-successor", ServiceName: "permission", Replicas: 3,
-	}, fakeLogger{}, nil); err != nil {
-		t.Fatalf("successor could not take over after stale owner failed: %v", err)
-	}
-	successor, err := db.GetAppInstance(instance.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if desiredReplicasFromMetadata(metadataFromInstance(successor))["permission"] != 3 {
-		t.Fatalf("successor projection missing after stale owner failure: %s", successor.Metadata)
+		t.Fatalf("concurrent Deployment desired replicas lost a service contribution: %v", desired)
 	}
 }
 
@@ -2552,7 +2222,7 @@ func TestServiceMigratesMetadataOrchestrationLocksToStructuredStore(t *testing.T
 	}
 }
 
-func TestRolloutOrchestrationPreservesDesiredReplicasForChangedService(t *testing.T) {
+func TestRolloutOrchestrationDoesNotFabricateDesiredOrObservedState(t *testing.T) {
 	current := map[string]any{
 		"releaseId":   "base-release",
 		"gatewayPort": float64(defaultGatewayPort),
@@ -2572,18 +2242,16 @@ func TestRolloutOrchestrationPreservesDesiredReplicasForChangedService(t *testin
 		},
 	}
 	next := rolloutOrchestrationMetadata(current, "/data/apps/admin", "new-release", defaultNetworkName, defaultGatewayPort, defaultWebPort, []string{"permission"})
-	desired := desiredReplicasFromMetadata(next)
-	if desired["permission"] != 2 {
-		t.Fatalf("expected changed service desired replicas to stay 2, got %+v", desired)
+	if _, ok := next["desiredReplicas"]; ok {
+		t.Fatalf("rollout metadata must not retain desired replicas: %#v", next)
 	}
 	endpoints := activeEndpointsFromMetadata(next)
 	if endpointCount(endpoints["permission"]) != 2 {
-		t.Fatalf("expected two new permission endpoints, got %+v", endpoints["permission"])
+		t.Fatalf("expected observed permission endpoints to be preserved, got %+v", endpoints["permission"])
 	}
 	data, _ := json.Marshal(endpoints["permission"])
-	if !strings.Contains(string(data), releaseContainerName("permission", "new-release")) ||
-		!strings.Contains(string(data), releaseReplicaContainerName("permission", "new-release", 2)) {
-		t.Fatalf("expected endpoints to point at new release replicas, got %s", data)
+	if strings.Contains(string(data), "new-release") || !strings.Contains(string(data), "base-release") {
+		t.Fatalf("rollout intent must not fabricate observed endpoints, got %s", data)
 	}
 }
 
@@ -2690,12 +2358,32 @@ func TestRuntimeMutationScriptsDoNotOwnAggregateDesiredState(t *testing.T) {
 	}
 }
 
-func TestRuntimeSpecTemplatesMountPerServiceLogVolume(t *testing.T) {
-	for _, name := range []string{
-		"install.sh",
-		"service-install.sh",
-		"autoscale-out.sh",
+func TestNewModelDoesNotWriteAggregatedDesiredReplicas(t *testing.T) {
+	for name, metadata := range map[string]map[string]any{
+		"instance": releaseOrchestrationMetadata("/aifar/apps/admin", "release-1", defaultNetworkName, defaultGatewayPort, defaultWebPort, serviceOrder),
+		"release":  releaseManifestFields("release-1", defaultNetworkName, defaultGatewayPort, defaultWebPort, serviceOrder),
 	} {
+		if _, ok := metadata["desiredReplicas"]; ok {
+			t.Fatalf("%s metadata still contains desiredReplicas: %#v", name, metadata)
+		}
+	}
+
+	for _, name := range []string{"install.sh", "service-install.sh", "autoscale-out.sh", "scale-service.sh"} {
+		content, err := templateFS.ReadFile("templates/" + name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		script := string(content)
+		for _, forbidden := range []string{"AIFAR_DESIRED_REPLICAS", "runtime-spec.json"} {
+			if strings.Contains(script, forbidden) {
+				t.Fatalf("new-model template %s still writes aggregate desired state %q:\n%s", name, forbidden, script)
+			}
+		}
+	}
+}
+
+func TestFreshInstallBootstrapInputMountsPerServiceLogVolume(t *testing.T) {
+	for _, name := range []string{"install.sh"} {
 		t.Run(name, func(t *testing.T) {
 			content, err := templateFS.ReadFile("templates/" + name)
 			if err != nil {
@@ -2748,7 +2436,6 @@ func TestRuntimeTemplatesUseReadinessForBackendHealthChecks(t *testing.T) {
 	for _, name := range []string{
 		"install.sh",
 		"service-install.sh",
-		"autoscale-out.sh",
 	} {
 		t.Run(name, func(t *testing.T) {
 			content, err := templateFS.ReadFile("templates/" + name)
@@ -2930,12 +2617,16 @@ func TestRecoveredRuntimeConfigOwnerCannotOverwriteSuccessorAfterPendingCASConfl
 
 func TestServiceAppliesRuntimeConfigAndRecordsVersion(t *testing.T) {
 	instance := installedAIFARInstance(t)
+	desired := make(map[string]int, len(serviceOrder))
+	for _, service := range serviceOrder {
+		desired[service] = 1
+	}
 	s := &fakeStore{
 		servers: map[string]store.Server{
 			"srv-1": {ID: "srv-1", Host: "10.0.0.10", DeployDir: "/aifar/apps"},
 		},
 		instances:   []store.AppInstance{instance},
-		deployments: seedPerServiceDeployments(t, instance, desiredReplicasFromMetadata(metadataFromInstance(instance)), nil),
+		deployments: seedPerServiceDeployments(t, instance, desired, nil),
 	}
 	remote := &fakeRemote{}
 	service := NewService(s, remote)
@@ -3030,8 +2721,8 @@ func TestServiceInstallsAIFARServiceFromRuntimeV2Bundle(t *testing.T) {
 	if metadata["releaseId"] == "" || metadata["runtimeService"] != "aifar-agent" || metadata["ingressNetwork"] != defaultNetworkName {
 		t.Fatalf("expected orchestration metadata, got %s", instance.Metadata)
 	}
-	if metadata["runtimeSpecPath"] != "/aifar/apps/admin/runtime/agent/runtime-spec.json" {
-		t.Fatalf("expected canonical runtime spec path, got %s", instance.Metadata)
+	if _, exists := metadata["runtimeSpecPath"]; exists {
+		t.Fatalf("new-model install metadata must not project a legacy aggregate runtime spec path: %s", instance.Metadata)
 	}
 	if metadata["orchestrationModel"] != orchestrationModelK8sLikeV1 || !strings.Contains(instance.Metadata, "agent-proxy") || strings.Contains(instance.Metadata, "aifar-svc-admin-gateway") || strings.Contains(instance.Metadata, "aifar-pod-admin-gateway") {
 		t.Fatalf("expected k8s-like agent proxy without fabricated pod metadata, got %s", instance.Metadata)
@@ -3069,7 +2760,7 @@ func TestServiceInstallsAIFARServiceFromRuntimeV2Bundle(t *testing.T) {
 		`aifar-agent bootstrap-runtime-stdin --instance "$INSTANCE_ID" --sha256 "$legacy_hash" < "$spec"`,
 		`aifar-agent get-deployment --instance "$INSTANCE_ID" --service "$service"`,
 		`AIFAR_BOOTSTRAP_ACCEPTANCE`,
-		`runtime-spec.json`,
+		`bootstrap-runtime.json`,
 		`"version": "runtime-v2"`,
 		`"deployments": [`,
 		`"deploymentName": "`,
@@ -3098,6 +2789,7 @@ func TestServiceInstallsAIFARServiceFromRuntimeV2Bundle(t *testing.T) {
 		t.Fatalf("AIFAR install script should not parse Docker health from the first JSON Status field:\n%s", remote.installScript)
 	}
 	for _, legacy := range []string{
+		`runtime-spec.json`,
 		`patch_web_nginx_gateway_target`,
 		`aifar-gateway`,
 		`proxy_pass http://aifar_gateway;`,
@@ -3920,8 +3612,11 @@ func TestServiceMarksAIFARInstallFailedWhenRemoteDeployFails(t *testing.T) {
 		t.Fatalf("expected install_failed status, got %+v", instance)
 	}
 	metadata := metadataFromInstance(instance)
-	if !aifarInstallFailedInstance(instance, metadata) || metadata["installState"] != "install_failed" || metadata["runtimeSpecPath"] != "/aifar/apps/admin/runtime/agent/runtime-spec.json" {
-		t.Fatalf("expected failed install metadata with runtime spec path, got %s", instance.Metadata)
+	if !aifarInstallFailedInstance(instance, metadata) || metadata["installState"] != "install_failed" {
+		t.Fatalf("expected failed install metadata, got %s", instance.Metadata)
+	}
+	if _, exists := metadata["runtimeSpecPath"]; exists {
+		t.Fatalf("failed new-model install must not project a legacy aggregate runtime spec path: %s", instance.Metadata)
 	}
 	if len(s.releases) != 0 || len(s.deployments) != len(serviceOrder) || len(s.replicaSets) != len(serviceOrder) || len(s.pods) != 0 || len(s.endpoints) != 0 {
 		t.Fatalf("failed Agent acceptance must retain pending desired state without observed runtime, releases=%d deployments=%d replicaSets=%d pods=%d endpoints=%d", len(s.releases), len(s.deployments), len(s.replicaSets), len(s.pods), len(s.endpoints))
@@ -4002,7 +3697,8 @@ func TestServiceInstallsMissingAIFARModulesAfterInitialInstall(t *testing.T) {
 		servers: map[string]store.Server{
 			"srv-1": {ID: "srv-1", Name: "app-1", Host: "10.0.0.10", DeployDir: "/aifar/apps"},
 		},
-		instances: []store.AppInstance{instance},
+		instances:   []store.AppInstance{instance},
+		deployments: seedPerServiceDeployments(t, instance, map[string]int{"gateway": 1, "web-vue3": 1}, map[string]int64{"gateway": 1, "web-vue3": 1}),
 	}
 	bundleParent := createAIFARBundle(t)
 	s := &resourceFakeStore{fakeStore: baseStore, resources: []store.Resource{{App: AppName, Part: "backend", Version: appBundleVersion, Path: filepath.Join(bundleParent, appBundleVersion, bundleManifestName)}}}
@@ -4052,17 +3748,17 @@ func TestServiceInstallsMissingAIFARModulesAfterInitialInstall(t *testing.T) {
 	if !ok || strings.Join(stringSliceFromAny(last["services"]), " ") != "file system" {
 		t.Fatalf("expected lastServiceInstall metadata, got %s", s.instances[0].Metadata)
 	}
-	desired := mapFromMetadataValue(next["desiredReplicas"])
+	if _, ok := next["desiredReplicas"]; ok {
+		t.Fatalf("service install must not write aggregate desired replicas: %s", s.instances[0].Metadata)
+	}
+	desired := desiredReplicasFromDeployments(s.deployments)
 	for _, serviceName := range []string{"system", "file", "gateway", "web-vue3"} {
-		if intFromAny(desired[serviceName], 0) != 1 {
-			t.Fatalf("expected desired replica for %s, got %#v in %s", serviceName, desired, s.instances[0].Metadata)
+		if desired[serviceName] != 1 {
+			t.Fatalf("expected canonical desired replica for %s, got %#v", serviceName, desired)
 		}
 	}
-	if _, ok := desired["oauth"]; ok {
-		t.Fatalf("metadata should not add uninstalled oauth desired replica: %#v", desired)
-	}
-	if len(s.deployments) != 2 || len(s.replicaSets) != 2 || len(s.pods) != 0 || len(s.endpoints) != 0 {
-		t.Fatalf("expected control-plane rows for two newly installed services, deployments=%d replicaSets=%d pods=%d endpoints=%d", len(s.deployments), len(s.replicaSets), len(s.pods), len(s.endpoints))
+	if len(s.deployments) != 4 || len(s.replicaSets) != 2 || len(s.pods) != 0 || len(s.endpoints) != 0 {
+		t.Fatalf("expected canonical rows for all services and new replica sets, deployments=%d replicaSets=%d pods=%d endpoints=%d", len(s.deployments), len(s.replicaSets), len(s.pods), len(s.endpoints))
 	}
 	if len(s.releases) != 1 || !strings.Contains(s.releases[0].ManifestJSON, `"kind":"service-install"`) || !strings.Contains(s.releases[0].ManifestJSON, `"installedServices":["file","system"]`) {
 		t.Fatalf("expected service-install release manifest, got %+v", s.releases)
@@ -6381,16 +6077,13 @@ func aifarModuleValidationParams() map[string]any {
 }
 
 func TestServiceExpectationsUseOnlyPositiveDesiredReplicas(t *testing.T) {
-	metadata := map[string]any{
-		"services": []any{"alpha-gateway", "alpha-oauth", "web-vue3", "alpha-unused"},
-		"desiredReplicas": map[string]any{
-			"alpha-gateway": 1,
-			"alpha-oauth":   2,
-			"web-vue3":      1,
-			"alpha-unused":  0,
-		},
+	deployments := []store.AIFARDeployment{
+		{ServiceName: "alpha-gateway", DesiredReplicas: 1},
+		{ServiceName: "alpha-oauth", DesiredReplicas: 2},
+		{ServiceName: "web-vue3", DesiredReplicas: 1},
+		{ServiceName: "alpha-unused", DesiredReplicas: 0},
 	}
-	got := serviceExpectations(metadata)
+	got := serviceExpectations(deployments)
 	want := []serviceExpectation{
 		{Name: "alpha-gateway", Replicas: 1},
 		{Name: "alpha-oauth", Replicas: 2},
@@ -6401,41 +6094,9 @@ func TestServiceExpectationsUseOnlyPositiveDesiredReplicas(t *testing.T) {
 	}
 }
 
-func TestServiceExpectationsIgnoreLegacyDesiredReplicasOutsideSelectedServices(t *testing.T) {
-	metadata := map[string]any{
-		"services": []any{"oauth", "permission", "system", "gateway", "web-vue3"},
-		"desiredReplicas": map[string]any{
-			"contacts": 1, "file": 1, "gateway": 1, "im": 1, "meeting": 1,
-			"message": 1, "oauth": 1, "permission": 1, "system": 1, "web-vue3": 1,
-		},
-	}
-	want := []serviceExpectation{
-		{Name: "oauth", Replicas: 1},
-		{Name: "permission", Replicas: 1},
-		{Name: "system", Replicas: 1},
-		{Name: "gateway", Replicas: 1},
-		{Name: "web-vue3", Replicas: 1},
-	}
-	if got := serviceExpectations(metadata); !reflect.DeepEqual(got, want) {
-		t.Fatalf("legacy replica entries outside selected services must be ignored: want %#v, got %#v", want, got)
-	}
-}
-
-func TestServiceExpectationsTreatExplicitEmptyDesiredReplicasAsOffline(t *testing.T) {
-	metadata := map[string]any{
-		"services":        []any{"alpha-gateway", "web-vue3"},
-		"desiredReplicas": map[string]any{},
-	}
-	if got := serviceExpectations(metadata); len(got) != 0 {
-		t.Fatalf("explicit empty desired replicas should be offline, got %#v", got)
-	}
-}
-
-func TestServiceExpectationsFallBackToSelectedServices(t *testing.T) {
-	metadata := map[string]any{"services": []any{"alpha-gateway", "web-vue3"}}
-	want := []serviceExpectation{{Name: "alpha-gateway", Replicas: 1}, {Name: "web-vue3", Replicas: 1}}
-	if got := serviceExpectations(metadata); !reflect.DeepEqual(got, want) {
-		t.Fatalf("expected selected-service fallback %#v, got %#v", want, got)
+func TestServiceExpectationsDoNotFallBackToLegacyMetadata(t *testing.T) {
+	if got := serviceExpectations(nil); len(got) != 0 {
+		t.Fatalf("missing canonical Deployments must not invent desired replicas, got %#v", got)
 	}
 }
 
@@ -6480,11 +6141,12 @@ func TestServiceCheckPassesSelectedServiceExpectationsToInspector(t *testing.T) 
 		Version:  "runtime-v2",
 		ServerID: "srv-1",
 		Status:   "installed",
-		Metadata: `{"installRoot":"/aifar/apps/admin","services":["alpha-gateway","web-vue3","alpha-unused"],"desiredReplicas":{"alpha-gateway":1,"web-vue3":1,"alpha-unused":0}}`,
+		Metadata: `{"installRoot":"/aifar/apps/admin","services":["alpha-gateway","web-vue3","alpha-unused"]}`,
 	}
 	s := &fakeStore{
-		servers:   map[string]store.Server{"srv-1": {ID: "srv-1", Name: "app-1", Host: "10.0.0.10", DeployDir: "/aifar/apps"}},
-		instances: []store.AppInstance{instance},
+		servers:     map[string]store.Server{"srv-1": {ID: "srv-1", Name: "app-1", Host: "10.0.0.10", DeployDir: "/aifar/apps"}},
+		instances:   []store.AppInstance{instance},
+		deployments: seedPerServiceDeployments(t, instance, map[string]int{"gateway": 1, "web-vue3": 1}, nil),
 	}
 	remote := &fakeRemote{statusStdout: strings.Join([]string{
 		"status=running",
@@ -6498,7 +6160,7 @@ func TestServiceCheckPassesSelectedServiceExpectationsToInspector(t *testing.T) 
 		t.Fatal(err)
 	}
 	command := remote.joinedCommands()
-	if !strings.Contains(command, `EXPECTED_SERVICES='alpha-gateway=1 web-vue3=1'`) {
+	if !strings.Contains(command, `EXPECTED_SERVICES='gateway=1 web-vue3=1'`) {
 		t.Fatalf("service check should pass only selected positive replicas to inspector:\n%s", command)
 	}
 	if strings.Contains(command, "alpha-unused=0") {
@@ -6513,12 +6175,13 @@ func TestModuleCollectorCheckSkipsAutoscaleMetricsCollection(t *testing.T) {
 		Version:  "runtime-v2",
 		ServerID: "srv-1",
 		Status:   "installed",
-		Metadata: `{"installRoot":"/aifar/apps/admin","services":["gateway","web-vue3"],"desiredReplicas":{"gateway":1,"web-vue3":1}}`,
+		Metadata: `{"installRoot":"/aifar/apps/admin","services":["gateway","web-vue3"]}`,
 	}
 	server := store.Server{ID: "srv-1", Name: "app-1", Host: "10.0.0.10", DeployDir: "/aifar/apps"}
 	s := &fakeStore{
-		servers:   map[string]store.Server{"srv-1": server},
-		instances: []store.AppInstance{instance},
+		servers:     map[string]store.Server{"srv-1": server},
+		instances:   []store.AppInstance{instance},
+		deployments: seedPerServiceDeployments(t, instance, map[string]int{"gateway": 1, "web-vue3": 1}, nil),
 	}
 	remote := &fakeRemote{statusStdout: strings.Join([]string{
 		"status=running",

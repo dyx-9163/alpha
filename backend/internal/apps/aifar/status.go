@@ -32,64 +32,22 @@ type serviceExpectation struct {
 	Replicas int
 }
 
-func serviceExpectations(metadata map[string]any) []serviceExpectation {
-	rawDesired, desiredDeclared := metadata["desiredReplicas"]
-	desiredReplicas := map[string]int{}
-	switch raw := rawDesired.(type) {
-	case map[string]int:
-		for name, replicas := range raw {
-			desiredReplicas[cleanAIFARServiceName(name)] = max(replicas, 0)
-		}
-	case map[string]any:
-		for name, value := range raw {
-			desiredReplicas[cleanAIFARServiceName(name)] = max(intFromAny(value, 0), 0)
-		}
-	}
-	selected := servicesFromMetadata(metadata)
-	if !desiredDeclared {
-		out := make([]serviceExpectation, 0, len(selected))
-		seen := map[string]struct{}{}
-		for _, name := range selected {
-			name = cleanAIFARServiceName(name)
-			if name == "" || !aifarServiceSupported(name) {
-				continue
-			}
-			if _, exists := seen[name]; exists {
-				continue
-			}
-			seen[name] = struct{}{}
-			out = append(out, serviceExpectation{Name: name, Replicas: 1})
-		}
-		return out
-	}
-
-	out := make([]serviceExpectation, 0, len(desiredReplicas))
+func serviceExpectations(deployments []store.AIFARDeployment) []serviceExpectation {
+	out := make([]serviceExpectation, 0, len(deployments))
 	seen := map[string]struct{}{}
-	appendExpected := func(name string) {
-		name = cleanAIFARServiceName(name)
-		replicas := desiredReplicas[name]
+	for _, deployment := range deployments {
+		name := cleanAIFARServiceName(deployment.ServiceName)
+		replicas := max(deployment.DesiredReplicas, 0)
 		if name == "" || replicas <= 0 || !aifarServiceSupported(name) {
-			return
+			continue
 		}
 		if _, exists := seen[name]; exists {
-			return
+			continue
 		}
 		seen[name] = struct{}{}
 		out = append(out, serviceExpectation{Name: name, Replicas: replicas})
 	}
-	for _, name := range selected {
-		appendExpected(name)
-	}
-	if len(selected) == 0 {
-		extra := make([]string, 0, len(desiredReplicas))
-		for name := range desiredReplicas {
-			extra = append(extra, name)
-		}
-		sort.Strings(extra)
-		for _, name := range extra {
-			appendExpected(name)
-		}
-	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out
 }
 

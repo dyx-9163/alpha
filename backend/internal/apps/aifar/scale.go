@@ -53,15 +53,6 @@ func (s Service) ScaleServices(ctx context.Context, req ScaleServicesRequest, lo
 				manifest.Spec.Replicas = replicas
 				return nil
 			},
-			Project: func(projectCtx context.Context, lock store.AIFAROrchestrationLock, accepted store.AIFARDeployment) error {
-				_, err := s.updateAcceptedDeploymentMetadata(projectCtx, lock, accepted, "AIFAR_RUNTIME_CONTROL_METADATA_WRITE_FAILED", func(nextMetadata map[string]any) error {
-					desired := desiredReplicasFromMetadata(nextMetadata)
-					desired[serviceName] = accepted.DesiredReplicas
-					nextMetadata["desiredReplicas"] = desired
-					return nil
-				})
-				return err
-			},
 		})
 	}
 	_, mutationErr := s.mutateDeploymentsFanOut(ctx, req.Instance, req.Server, req.Actor, fallbackTaskID(req.TaskID, log), req.Language, defaultRuntimeMutationConcurrency, plans, log, targetLog)

@@ -873,7 +873,15 @@ func (s Service) Install(ctx context.Context, req InstallRequest, resources []st
 		if !ok {
 			return repairRequired("AIFAR_RUNTIME_RELEASE_STORE_UNAVAILABLE", nil)
 		}
-		manifest, _ := json.Marshal(releaseManifest(bundle.Version, releaseID, releaseTime, configHash, ingressNetwork, options.GatewayPort, options.WebPort, options.SelectedServices))
+		control, ok := s.store.(aifarDeploymentControlStore)
+		if !ok {
+			return repairRequired("AIFAR_RUNTIME_DEPLOYMENT_STORE_UNAVAILABLE", nil)
+		}
+		deployments, err := control.ListAIFARDeployments(instance.ID)
+		if err != nil {
+			return err
+		}
+		manifest, _ := json.Marshal(releaseManifest(bundle.Version, releaseID, releaseTime, configHash, ingressNetwork, options.GatewayPort, options.WebPort, options.SelectedServices, deployments))
 		if _, err := releases.SaveAppRelease(store.AppRelease{
 			InstanceID:   instance.ID,
 			App:          AppName,
@@ -939,7 +947,6 @@ func installMetadata(server store.Server, installRoot, version, releaseID string
 		"configHash":            configHash,
 		"appDir":                runtimeDir + "/" + appBundleDir,
 		"envDir":                runtimeDir + "/" + releaseEnvDirName,
-		"runtimeSpecPath":       runtimeSpecPath(installRoot),
 		"networkName":           options.NetworkName,
 		"appCPUs":               options.AppCPUs,
 		"appMemoryLimit":        options.AppMemoryLimit,
@@ -953,7 +960,6 @@ func installMetadata(server store.Server, installRoot, version, releaseID string
 		"agent": map[string]any{
 			"systemdService": "aifar-agent",
 			"controlAddress": "127.0.0.1:18081",
-			"specPath":       runtimeSpecPath(installRoot),
 		},
 		"webPort":         options.WebPort,
 		"gatewayPort":     options.GatewayPort,
@@ -1345,7 +1351,6 @@ func rolloutOrchestrationMetadata(current map[string]any, installRoot, revision,
 	}
 	next["orchestrationModel"] = orchestrationModelK8sLikeV1
 	next["releasePhase"] = releasePhaseActive
-	desired := desiredReplicasFromMetadata(current)
 	activeEndpoints := activeEndpointsFromMetadata(current)
 	serviceRevisions := serviceRevisionsFromMetadata(current)
 	containers := mapFromMetadataValue(current["containers"])
@@ -1353,18 +1358,10 @@ func rolloutOrchestrationMetadata(current map[string]any, installRoot, revision,
 		containers = map[string]any{}
 	}
 	for _, service := range changedServices {
-		replicas := desired[service]
-		if replicas < 0 {
-			replicas = 0
-			desired[service] = replicas
-		}
-		activeEndpoints[service] = releaseEndpointsForService(service, revision, replicas, gatewayPort, webPort)
 		serviceRevisions[service] = revision
-		containers[service] = podContainerName(service, revision, 1)
 	}
-	next["desiredReplicas"] = desired
+	delete(next, "desiredReplicas")
 	next["activeEndpoints"] = activeEndpoints
-	next["activeServices"] = activeServicesFromEndpointsForServices(desired, activeEndpoints, servicesFromMetadata(next))
 	next["serviceRevisions"] = serviceRevisions
 	next["containers"] = containers
 	next["activeRoutes"] = releaseRoutes(gatewayPort, webPort)
@@ -1419,9 +1416,9 @@ func applyEffectiveReleaseFields(manifest map[string]any, orchestration map[stri
 	}
 }
 
-func releaseManifest(version, releaseID string, releaseTime time.Time, configHash, ingressNetwork string, gatewayPort, webPort int, services []string) map[string]any {
+func releaseManifest(version, releaseID string, releaseTime time.Time, configHash, ingressNetwork string, gatewayPort, webPort int, services []string, deployments []store.AIFARDeployment) map[string]any {
 	services = serviceListOrDefault(services)
-	desired := desiredReplicasForServices(services)
+	desired := desiredReplicasFromDeployments(deployments)
 	endpoints := releaseActiveEndpointsForServices(releaseID, gatewayPort, webPort, services)
 	manifest := map[string]any{
 		"app":             AppName,
@@ -1482,7 +1479,6 @@ func rolloutReleaseManifest(version, releaseID string, releaseTime time.Time, co
 			},
 		},
 		"snapshots": map[string]any{
-			"runtimeSpecBefore": releaseDirPath(installRoot, releaseID) + "/snapshot/before-runtime-spec.json",
 			"envBefore": map[string]string{
 				artifact.ServiceName: snapshotDir + "/before.env",
 			},
@@ -1537,8 +1533,7 @@ func rolloutBundleReleaseManifest(version, releaseID string, releaseTime time.Ti
 		"deploymentConcurrency":  concurrency,
 		"artifacts":              artifactMap,
 		"snapshots": map[string]any{
-			"runtimeSpecBefore": releaseDirPath(installRoot, releaseID) + "/snapshot/before-runtime-spec.json",
-			"envBefore":         envBefore,
+			"envBefore": envBefore,
 		},
 	}
 	for key, value := range releaseManifestFields(releaseID, ingressNetwork, gatewayPort, webPort, services) {
@@ -1745,7 +1740,6 @@ func (s Service) UpdateArtifact(ctx context.Context, req ArtifactUpdateRequest, 
 			CreatedAt:        releaseTime.Format(time.RFC3339),
 			ConfigHash:       configHash,
 			IngressNetwork:   ingressNetwork,
-			DesiredReplicas:  replicaAssignments(map[string]int{artifact.ServiceName: desiredReplicasFromMetadata(metadata)[artifact.ServiceName]}),
 		})
 		if err != nil {
 			return err
@@ -2354,9 +2348,19 @@ func (s Service) Check(ctx context.Context, req CheckRequest, log Logger, target
 	var status StatusResult
 	var scaleStatus autoscaleStatus
 	var scaleStatusOK bool
+	var deployments []store.AIFARDeployment
 	if err := step(1, func() error {
+		control, ok := s.store.(aifarDeploymentControlStore)
+		if !ok {
+			return errors.New("AIFAR Deployment store is unavailable")
+		}
+		var listErr error
+		deployments, listErr = control.ListAIFARDeployments(req.Instance.ID)
+		if listErr != nil {
+			return listErr
+		}
 		var checkErr error
-		status, checkErr = NewInspector(s.remote).Check(ctx, req.Server, installRoot, serviceExpectations(metadata), logForServer)
+		status, checkErr = NewInspector(s.remote).Check(ctx, req.Server, installRoot, serviceExpectations(deployments), logForServer)
 		if checkErr == nil && !strings.EqualFold(strings.TrimSpace(req.Actor), "collector") {
 			if collected, collectErr := collectAutoscaleStatus(ctx, s.remote, req.Server, installRoot); collectErr == nil {
 				scaleStatus = collected
@@ -2389,7 +2393,7 @@ func (s Service) Check(ctx context.Context, req CheckRequest, log Logger, target
 	}
 	if scaleStatusOK {
 		details["activeEndpoints"] = activeEndpointsFromMetrics(scaleStatus.Endpoints)
-		details["activeServices"] = activeServicesFromEndpoints(desiredReplicasFromMetadata(metadata), activeEndpointsFromMetrics(scaleStatus.Endpoints))
+		details["activeServices"] = activeServicesFromEndpoints(desiredReplicasFromDeployments(deployments), activeEndpointsFromMetrics(scaleStatus.Endpoints))
 		details["autoscaleMetrics"] = metricsMetadata(scaleStatus.Endpoints, time.Now().UTC())
 	}
 	if err := step(2, func() error {
@@ -2450,7 +2454,6 @@ type updateScriptData struct {
 	ReleaseDir       string
 	ServiceOrder     string
 	ServiceName      string
-	DesiredReplicas  string
 	ArtifactRemote   string
 	ReleaseArtifact  string
 	ArtifactFileName string
@@ -2478,7 +2481,6 @@ type bundleUpdateScriptData struct {
 	ReleaseDir      string
 	ServiceOrder    string
 	ChangedServices string
-	DesiredReplicas string
 	Artifacts       []bundleUpdateScriptArtifact
 	Version         string
 	ReleaseID       string
@@ -2494,7 +2496,6 @@ type rollbackScriptData struct {
 	RollbackDir      string
 	ServiceOrder     string
 	ServiceName      string
-	DesiredReplicas  string
 	ArtifactRemote   string
 	ArtifactFileName string
 	ArtifactSHA256   string
@@ -2503,28 +2504,6 @@ type rollbackScriptData struct {
 	CreatedAt        string
 	ConfigHash       string
 	IngressNetwork   string
-}
-
-type autoscaleOutScriptData struct {
-	InstallRoot     string
-	ServiceName     string
-	ReleaseID       string
-	ReplicaID       int
-	ContainerName   string
-	IngressNetwork  string
-	MaxReplicas     int
-	DesiredReplicas string
-}
-
-type scaleServiceScriptData struct {
-	InstallRoot           string
-	ServiceOrder          string
-	ServiceName           string
-	Replicas              int
-	IngressNetwork        string
-	TaskID                string
-	DesiredReplicas       string
-	TargetDesiredReplicas string
 }
 
 func renderInstallScript(data installScriptData) (string, error) {
@@ -2577,26 +2556,6 @@ func renderRollbackScript(data rollbackScriptData) (string, error) {
 	}, data)
 }
 
-func renderAutoscaleOutScript(data autoscaleOutScriptData) (string, error) {
-	content, err := templateFS.ReadFile("templates/autoscale-out.sh")
-	if err != nil {
-		return "", err
-	}
-	return installerkit.RenderTemplate(AppName, "autoscale-out.sh", "aifar-autoscale-out", string(content), template.FuncMap{
-		"quote": shellQuoteAny,
-	}, data)
-}
-
-func renderScaleServiceScript(data scaleServiceScriptData) (string, error) {
-	content, err := templateFS.ReadFile("templates/scale-service.sh")
-	if err != nil {
-		return "", err
-	}
-	return installerkit.RenderTemplate(AppName, "scale-service.sh", "aifar-scale-service", string(content), template.FuncMap{
-		"quote": shellQuoteAny,
-	}, data)
-}
-
 func renderRuntimeConfigScript(data runtimeConfigScriptData) (string, error) {
 	content, err := templateFS.ReadFile("templates/runtime-config.sh")
 	if err != nil {
@@ -2605,36 +2564,6 @@ func renderRuntimeConfigScript(data runtimeConfigScriptData) (string, error) {
 	return installerkit.RenderTemplate(AppName, "runtime-config.sh", "aifar-runtime-config", string(content), template.FuncMap{
 		"quote": shellQuoteAny,
 	}, data)
-}
-
-func replicaAssignmentsForServices(desired map[string]int, services []string) string {
-	selected := make(map[string]int, len(services))
-	for _, service := range services {
-		replicas := desired[service]
-		if replicas < 0 {
-			replicas = 0
-		}
-		selected[service] = replicas
-	}
-	return replicaAssignments(selected)
-}
-
-func replicaAssignments(desired map[string]int) string {
-	if len(desired) == 0 {
-		return ""
-	}
-	parts := make([]string, 0, len(desired))
-	for _, service := range serviceOrder {
-		replicas, ok := desired[service]
-		if !ok {
-			continue
-		}
-		if replicas < 0 {
-			replicas = 0
-		}
-		parts = append(parts, fmt.Sprintf("%s=%d", service, replicas))
-	}
-	return strings.Join(parts, " ")
 }
 
 func shellQuoteAny(value any) string {

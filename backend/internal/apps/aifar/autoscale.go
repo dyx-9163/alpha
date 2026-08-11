@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"aifar-deployment/backend/internal/installer/installerkit"
+	"aifar-deployment/backend/internal/runtimeagent"
 	"aifar-deployment/backend/internal/store"
 	"aifar-deployment/backend/internal/worker"
 )
@@ -126,7 +127,12 @@ func (a *Autoscaler) tick(ctx context.Context, now time.Time) {
 			a.recordScaleEvent(instance, "collect-failed", "", err.Error(), now)
 			continue
 		}
-		next, decision := evaluateAutoscale(instance, metadata, status, policy, now)
+		deployments, err := a.store.ListAIFARDeployments(instance.ID)
+		if err != nil {
+			a.recordScaleEvent(instance, "deployment-read-failed", "", err.Error(), now)
+			continue
+		}
+		next, decision := evaluateAutoscale(instance, metadata, desiredReplicasFromDeployments(deployments), status, policy, now)
 		if decision.Service == "" {
 			_ = saveMetadata(a.store, instance, next)
 			continue
@@ -172,17 +178,11 @@ type autoscaleDecision struct {
 	Reason  string
 }
 
-func evaluateAutoscale(instance store.AppInstance, metadata map[string]any, status autoscaleStatus, policy AutoscalePolicy, now time.Time) (map[string]any, autoscaleDecision) {
+func evaluateAutoscale(instance store.AppInstance, metadata map[string]any, desired map[string]int, status autoscaleStatus, policy AutoscalePolicy, now time.Time) (map[string]any, autoscaleDecision) {
 	next := copyMetadata(metadata)
 	signals := autoscaleSignalsFromMetadata(metadata)
 	activeEndpoints := activeEndpointsFromMetrics(status.Endpoints)
-	desired := desiredReplicasFromMetadata(metadata)
-	for service, endpoints := range activeEndpoints {
-		if count := endpointCount(endpoints); count > 0 {
-			desired[service] = count
-		}
-	}
-	next["desiredReplicas"] = desired
+	delete(next, "desiredReplicas")
 	next["activeEndpoints"] = activeEndpoints
 	next["activeServices"] = activeServicesFromEndpoints(desired, activeEndpoints)
 	next["autoscalePolicy"] = policy.metadata()
@@ -242,129 +242,32 @@ func (s Service) ScaleOut(ctx context.Context, req ScaleOutRequest, log Logger, 
 	if service == "" || !isAIFARService(service) {
 		return fmt.Errorf("unsupported AIFAR service for autoscale: %s", service)
 	}
-	target := req.Instance.ServerID
-	if target == "" {
-		target = req.Server.ID
+	maxReplicas := autoscaleDefaultMaxReplica
+	plan := deploymentMutationPlan{
+		ServiceName: service,
+		Operation:   "autoscale",
+		Validate: func(instance store.AppInstance, _ store.AIFARDeployment) error {
+			metadata := metadataFromInstance(instance)
+			if err := ensureK8sLikeMetadata(metadata, UpdateCopy{LegacyUpdateUnsupported: "legacy AIFAR orchestration model %s does not support autoscale; reinstall with k8s-like orchestration first"}); err != nil {
+				return err
+			}
+			policy := autoscalePolicyFromMetadata(metadata)
+			if !policy.Enabled {
+				return errors.New("AIFAR autoscale is disabled")
+			}
+			maxReplicas = policy.MaxReplicas
+			return nil
+		},
+		Mutate: func(manifest *runtimeagent.DeploymentManifest) error {
+			if manifest.Spec.Replicas >= maxReplicas {
+				return fmt.Errorf("AIFAR service %s already reached max replicas: %d", service, maxReplicas)
+			}
+			manifest.Spec.Replicas++
+			return nil
+		},
 	}
-	logForServer := logForTarget(log, targetLog, target)
-	recorder, _ := log.(stepRecorder)
-	if recorder != nil {
-		recorder.StartTarget(target)
-	}
-	current, lock, err := s.acquireOrchestrationLock(req.Instance.ID, "autoscale", service, req.Actor, fallbackTaskID(req.TaskID, log))
-	if err != nil {
-		finishTarget(recorder, target, "failed", err.Error())
-		return err
-	}
-	defer s.releaseOrchestrationLock(lock)
-
-	metadata := metadataFromInstance(current)
-	if err := ensureK8sLikeMetadata(metadata, UpdateCopy{LegacyUpdateUnsupported: "legacy AIFAR orchestration model %s does not support autoscale; reinstall with k8s-like orchestration first"}); err != nil {
-		finishTarget(recorder, target, "failed", err.Error())
-		return err
-	}
-	policy := autoscalePolicyFromMetadata(metadata)
-	if !policy.Enabled {
-		err := errors.New("AIFAR autoscale is disabled")
-		finishTarget(recorder, target, "failed", err.Error())
-		return err
-	}
-	installRoot := stringFromMetadata(metadata, "installRoot", installRootFromDeployDir(req.Server.DeployDir))
-	releaseID := currentRevisionForService(metadata, service)
-	if releaseID == "" {
-		err := errors.New("AIFAR service revision is missing")
-		finishTarget(recorder, target, "failed", err.Error())
-		return err
-	}
-	status, err := collectAutoscaleStatus(ctx, s.remote, req.Server, installRoot)
-	if err != nil {
-		finishTarget(recorder, target, "failed", err.Error())
-		return err
-	}
-	currentReplicas := len(metricsByService(status.Endpoints)[service])
-	if currentReplicas >= policy.MaxReplicas {
-		err := fmt.Errorf("AIFAR service %s already reached max replicas: %d", service, policy.MaxReplicas)
-		finishTarget(recorder, target, "failed", err.Error())
-		return err
-	}
-	replicaID := nextReplicaID(status.Endpoints, service)
-	if replicaID < 2 {
-		replicaID = currentReplicas + 1
-	}
-	desiredBeforeScale := desiredReplicasFromMetadata(metadata)
-	desiredBeforeScale[service] = replicaID
-	containerName := podContainerName(service, releaseID, replicaID)
-	workDir := installerkit.WorkDir(req.Server.DeployDir, AppName+"-agent", "runtime-v2", time.Now().UTC())
-	script, err := renderAutoscaleOutScript(autoscaleOutScriptData{
-		InstallRoot:     installRoot,
-		ServiceName:     service,
-		ReleaseID:       releaseID,
-		ReplicaID:       replicaID,
-		ContainerName:   containerName,
-		IngressNetwork:  stringFromMetadata(metadata, "ingressNetwork", stringFromMetadata(metadata, "networkName", defaultNetworkName)),
-		MaxReplicas:     policy.MaxReplicas,
-		DesiredReplicas: replicaAssignments(desiredBeforeScale),
-	})
-	if err != nil {
-		finishTarget(recorder, target, "failed", err.Error())
-		return err
-	}
-	if err := s.ensureRuntimeAgent(ctx, req.Server, workDir, req.Language, logForServer); err != nil {
-		finishTarget(recorder, target, "failed", err.Error())
-		return err
-	}
-	logForServer.Info("scaling out AIFAR service %s: %s", service, req.Reason)
-	if _, err := installerkit.Run(ctx, s.remote, req.Server, "sh -s <<'AIFAR_AUTOSCALE_OUT'\n"+script+"\nAIFAR_AUTOSCALE_OUT", logForServer, "AIFAR autoscale command failed"); err != nil {
-		finishTarget(recorder, target, "failed", err.Error())
-		return err
-	}
-	status, err = collectAutoscaleStatus(ctx, s.remote, req.Server, installRoot)
-	if err != nil {
-		finishTarget(recorder, target, "failed", err.Error())
-		return err
-	}
-	nextMetadata := metadataFromInstance(current)
-	desired := desiredReplicasFromMetadata(nextMetadata)
-	activeEndpoints := activeEndpointsFromMetrics(status.Endpoints)
-	for svc, endpoints := range activeEndpoints {
-		if svc != service && desired[svc] == 0 {
-			continue
-		}
-		if count := endpointCount(endpoints); count > 0 {
-			desired[svc] = count
-		}
-	}
-	for svc, replicas := range desired {
-		if svc != service && replicas == 0 {
-			delete(activeEndpoints, svc)
-		}
-	}
-	now := time.Now().UTC()
-	nextMetadata["desiredReplicas"] = desired
-	nextMetadata["activeEndpoints"] = activeEndpoints
-	nextMetadata["activeServices"] = activeServicesFromEndpoints(desired, activeEndpoints)
-	nextMetadata["serviceRevisions"] = serviceRevisionsFromMetadata(nextMetadata)
-	nextMetadata["autoscalePolicy"] = policy.metadata()
-	nextMetadata["autoscaleMetrics"] = metricsMetadata(status.Endpoints, now)
-	nextMetadata = recordAutoscaleEvent(nextMetadata, "scaled-out", service, containerName, now)
-	signals := autoscaleSignalsFromMetadata(nextMetadata)
-	signal := signals[service]
-	signal.LastScaledAt = now.Format(time.RFC3339)
-	signal.Since = ""
-	signals[service] = signal
-	nextMetadata["autoscaleSignals"] = signals
-	delete(nextMetadata, "orchestrationLock")
-	if err := saveMetadata(s.store, current, nextMetadata); err != nil {
-		finishTarget(recorder, target, "failed", err.Error())
-		return err
-	}
-	if err := s.saveRolloutControlPlane(current.ID, current.Version, releaseID, service, "", desired[service], intFromMetadata(nextMetadata, "gatewayPort", defaultGatewayPort), intFromMetadata(nextMetadata, "webPort", defaultWebPort), now); err != nil {
-		finishTarget(recorder, target, "failed", err.Error())
-		return err
-	}
-	logForServer.Info("AIFAR service %s scaled out with replica %s", service, containerName)
-	finishTarget(recorder, target, "success", "")
-	return nil
+	_, err := s.mutateDeploymentsFanOut(ctx, req.Instance, req.Server, req.Actor, fallbackTaskID(req.TaskID, log), req.Language, 1, []deploymentMutationPlan{plan}, log, targetLog)
+	return err
 }
 
 func collectAutoscaleStatus(ctx context.Context, remote Remote, server store.Server, installRoot string) (autoscaleStatus, error) {
@@ -564,9 +467,6 @@ func (p AutoscalePolicy) metadata() map[string]any {
 }
 
 func applyEffectiveServiceFields(manifest map[string]any, orchestration map[string]any) {
-	if desired, ok := orchestration["desiredReplicas"]; ok {
-		manifest["desiredReplicas"] = desired
-	}
 	if endpoints, ok := orchestration["activeEndpoints"]; ok {
 		manifest["endpoints"] = endpoints
 	}

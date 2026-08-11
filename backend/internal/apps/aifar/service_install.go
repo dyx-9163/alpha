@@ -632,21 +632,13 @@ func serviceInstallOrchestrationMetadata(current map[string]any, installRoot, in
 	next["runtimeService"] = "aifar-agent"
 	next["ingressNetwork"] = ingressNetwork
 	next["activeRoutes"] = releaseRoutes(gatewayPort, webPort)
-	next["runtimeSpecPath"] = runtimeSpecPath(installRoot)
-	desiredSource := desiredReplicasFromMetadata(current)
 	activeEndpointSource := activeEndpointsFromMetadata(current)
 	serviceRevisionSource := serviceRevisionsFromMetadata(current)
 	containerSource := mapFromMetadataValue(current["containers"])
-	desired := map[string]int{}
 	activeEndpoints := map[string]any{}
 	serviceRevisions := map[string]any{}
 	containers := map[string]any{}
 	for _, service := range allServices {
-		replicas := desiredSource[service]
-		if replicas < 0 {
-			replicas = 0
-		}
-		desired[service] = replicas
 		if value, ok := activeEndpointSource[service]; ok {
 			activeEndpoints[service] = value
 		}
@@ -660,14 +652,12 @@ func serviceInstallOrchestrationMetadata(current map[string]any, installRoot, in
 		}
 	}
 	for _, service := range installedServices {
-		desired[service] = 1
 		serviceRevisions[service] = acceptedRevisions[service]
 		delete(activeEndpoints, service)
 		delete(containers, service)
 	}
-	next["desiredReplicas"] = desired
+	delete(next, "desiredReplicas")
 	next["activeEndpoints"] = activeEndpoints
-	next["activeServices"] = activeServicesFromEndpointsForServices(desired, activeEndpoints, allServices)
 	next["serviceRevisions"] = serviceRevisions
 	next["containers"] = containers
 	next["autoscalePolicy"] = autoscalePolicyFromMetadata(current).metadata()

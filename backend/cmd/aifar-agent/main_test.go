@@ -581,7 +581,9 @@ func TestInstanceSnapshotHTTPReturnsCompleteProofWithoutManifestBody(t *testing.
 }
 
 func TestBootstrapHTTPDisablesLegacyReconcile(t *testing.T) {
-	manager := runtimeagent.NewManager(runtimeagent.ManagerOptions{StateDir: t.TempDir(), Runner: failingRestartRunner{}})
+	stateDir := t.TempDir()
+	manifestStore := &runtimeagent.ManifestStore{StateDir: stateDir}
+	manager := runtimeagent.NewManager(runtimeagent.ManagerOptions{StateDir: stateDir, ManifestStore: manifestStore, Runner: failingRestartRunner{}})
 	handler := newAgentHandler(manager, func(context.Context) error { return nil })
 	data, _ := json.Marshal(agentTestLegacySpec())
 	request := func(path string) *httptest.ResponseRecorder {
@@ -594,11 +596,22 @@ func TestBootstrapHTTPDisablesLegacyReconcile(t *testing.T) {
 	if got := request("/runtime/bootstrap"); got.Code != http.StatusAccepted {
 		t.Fatalf("bootstrap status=%d body=%s", got.Code, got.Body.String())
 	}
-	for _, path := range []string{"/runtime/reconcile", "/runtime/bootstrap"} {
+	successor := agentTestManifest(2, "permission:successor")
+	if _, err := manager.AcceptDeployment(context.Background(), successor); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{"/runtime/reconcile", "/runtime/bootstrap", "/runtime/restart-all"} {
 		got := request(path)
 		if got.Code != http.StatusConflict || !strings.Contains(got.Body.String(), "LEGACY_RUNTIME_SPEC_DISABLED") || strings.Contains(got.Body.String(), "SECRET-GROUP") {
 			t.Fatalf("%s status=%d body=%s", path, got.Code, got.Body.String())
 		}
+	}
+	accepted, err := manifestStore.Get("admin", "permission")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if accepted.Metadata.Generation != 2 {
+		t.Fatalf("legacy writer regressed accepted generation: %+v", accepted)
 	}
 }
 

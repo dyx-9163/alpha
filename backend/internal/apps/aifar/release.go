@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"aifar-deployment/backend/internal/store"
 )
 
 const (
@@ -171,15 +173,14 @@ func releaseContainersForServices(releaseID string, services []string) map[strin
 	return out
 }
 
-func defaultDesiredReplicas() map[string]int {
-	return desiredReplicasForServices(serviceOrder)
-}
-
-func desiredReplicasForServices(services []string) map[string]int {
-	services = serviceListOrDefault(services)
-	out := make(map[string]int, len(services))
-	for _, service := range services {
-		out[service] = 1
+func desiredReplicasFromDeployments(deployments []store.AIFARDeployment) map[string]int {
+	out := make(map[string]int, len(deployments))
+	for _, deployment := range deployments {
+		service := cleanAIFARServiceName(deployment.ServiceName)
+		if service == "" {
+			continue
+		}
+		out[service] = max(deployment.DesiredReplicas, 0)
 	}
 	return out
 }
@@ -256,40 +257,14 @@ func activeServicesFromEndpointsForServices(desired map[string]int, endpoints ma
 	services = serviceListOrDefault(services)
 	out := make(map[string]any, len(services))
 	for _, service := range services {
+		if desired[service] <= 0 {
+			continue
+		}
 		out[service] = map[string]any{
-			"desiredReplicas": desired[service],
 			"activeEndpoints": endpoints[service],
 		}
 	}
 	return out
-}
-
-func desiredReplicasFromMetadata(metadata map[string]any) map[string]int {
-	out := defaultDesiredReplicas()
-	switch raw := metadata["desiredReplicas"].(type) {
-	case map[string]int:
-		for key, value := range raw {
-			if value < 0 {
-				value = 0
-			}
-			out[key] = value
-		}
-		return out
-	case map[string]any:
-		for key, value := range raw {
-			n := intFromAny(value, 1)
-			if n < 0 {
-				n = 0
-			}
-			out[key] = n
-		}
-		return out
-	}
-	return out
-}
-
-func desiredReplicasFromAny(value any) map[string]int {
-	return desiredReplicasFromMetadata(map[string]any{"desiredReplicas": value})
 }
 
 func intFromAny(value any, fallback int) int {
@@ -350,7 +325,6 @@ func releaseOrchestrationMetadata(installRoot, releaseID, ingressNetwork string,
 	_ = installRoot
 	_ = releaseID
 	services = serviceListOrDefault(services)
-	desired := desiredReplicasForServices(services)
 	activeEndpoints := map[string]any{}
 	return map[string]any{
 		"orchestrationModel": orchestrationModelK8sLikeV1,
@@ -358,9 +332,8 @@ func releaseOrchestrationMetadata(installRoot, releaseID, ingressNetwork string,
 		"runtimeService":     "aifar-agent",
 		"activeRoutes":       releaseRoutes(gatewayPort, webPort),
 		"containers":         map[string]any{},
-		"desiredReplicas":    desired,
 		"activeEndpoints":    activeEndpoints,
-		"activeServices":     activeServicesFromEndpointsForServices(desired, activeEndpoints, services),
+		"activeServices":     map[string]any{},
 		"autoscalePolicy":    defaultAutoscalePolicy().metadata(),
 		"releasePhase":       releasePhaseActive,
 	}
@@ -369,16 +342,14 @@ func releaseOrchestrationMetadata(installRoot, releaseID, ingressNetwork string,
 func releaseManifestFields(releaseID, ingressNetwork string, gatewayPort, webPort int, services []string) map[string]any {
 	_ = releaseID
 	services = serviceListOrDefault(services)
-	desired := desiredReplicasForServices(services)
 	endpoints := map[string]any{}
 	return map[string]any{
 		"orchestrationModel": orchestrationModelK8sLikeV1,
 		"ingressNetwork":     ingressNetwork,
 		"containers":         map[string]any{},
 		"routes":             releaseRoutes(gatewayPort, webPort),
-		"desiredReplicas":    desired,
 		"endpoints":          endpoints,
-		"activeServices":     activeServicesFromEndpointsForServices(desired, endpoints, services),
+		"activeServices":     map[string]any{},
 	}
 }
 

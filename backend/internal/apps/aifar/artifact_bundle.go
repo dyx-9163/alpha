@@ -250,7 +250,6 @@ func (s Service) UpdateArtifactBundle(ctx context.Context, req ArtifactBundleUpd
 				ConfigHash:      configHash,
 				IngressNetwork:  ingressNetwork,
 				Concurrency:     concurrency,
-				DesiredReplicas: replicaAssignmentsForServices(desiredReplicasFromMetadata(metadata), []string{item.ServiceName}),
 			})
 			if err != nil {
 				return err

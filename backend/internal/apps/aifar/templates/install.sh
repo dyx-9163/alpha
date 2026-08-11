@@ -265,15 +265,6 @@ write_compose_env() {
   set_env JVM_INITIAL_RAM_PERCENTAGE "$JVM_INITIAL_RAM_PERCENTAGE" "$compose_env"
   set_env JVM_MAX_RAM_PERCENTAGE "$JVM_MAX_RAM_PERCENTAGE" "$compose_env"
   set_env AIFAR_NACOS_EPHEMERAL "true" "$compose_env"
-  desired_pairs=""
-  for service in $SERVICE_ORDER; do
-    if [ -z "$desired_pairs" ]; then
-      desired_pairs="$service=1"
-    else
-      desired_pairs="$desired_pairs $service=1"
-    fi
-  done
-  set_env AIFAR_DESIRED_REPLICAS "$desired_pairs" "$compose_env"
   set_env APP_RESTART_POLICY "$(read_env_value "$DEFAULT_ENV" APP_RESTART_POLICY unless-stopped)" "$compose_env"
   set_env APP_HEALTH_PROTOCOL "$(read_env_value "$DEFAULT_ENV" APP_HEALTH_PROTOCOL http)" "$compose_env"
   set_env APP_HEALTH_HOST "$(read_env_value "$DEFAULT_ENV" APP_HEALTH_HOST 127.0.0.1)" "$compose_env"
@@ -441,9 +432,9 @@ health_cmd_for_service() {
   fi
 }
 
-write_runtime_spec() {
-  spec="$AGENT_DIR/runtime-spec.json"
-  mkdir -p "$AGENT_DIR"
+write_bootstrap_input() {
+  spec="$WORK_DIR/bootstrap-runtime.json"
+  mkdir -p "$WORK_DIR"
   cat > "$spec" <<JSON
 {
   "version": "runtime-v2",
@@ -553,7 +544,7 @@ readback_bootstrap_acceptance() {
 
 accept_runtime_manifests() {
   check_agent_dependency
-  spec="$(write_runtime_spec)"
+  spec="$(write_bootstrap_input)"
   legacy_hash="$(sha256sum "$spec" | awk '{print $1}')"
   if aifar-agent bootstrap-runtime-stdin --instance "$INSTANCE_ID" --sha256 "$legacy_hash" < "$spec" >/dev/null 2>&1; then
     :
@@ -561,10 +552,6 @@ accept_runtime_manifests() {
     :
   fi
   acceptance="$(readback_bootstrap_acceptance)" || fail "aifar-agent could not prove the exact runtime Manifests"
-  legacy_backup="$AGENT_DIR/runtime-spec.legacy-readonly.json"
-  aifar-agent archive-legacy-runtime --instance "$INSTANCE_ID" --sha256 "$legacy_hash" >/dev/null 2>&1 || fail "aifar-agent could not durably archive the legacy runtime specification"
-  [ -f "$legacy_backup" ] || fail "legacy runtime archive is unavailable"
-  chmod 0400 "$legacy_backup"
   rm -f "$spec"
   printf 'AIFAR_BOOTSTRAP_ACCEPTANCE=%s\n' "$acceptance"
 }
@@ -586,7 +573,7 @@ JSON
 
 cleanup_failed_install() {
   [ "$INSTALL_SUCCEEDED" = "1" ] && return 0
-  rm -f "$AGENT_DIR/runtime-spec.json" >/dev/null 2>&1 || true
+  rm -f "$WORK_DIR/bootstrap-runtime.json" >/dev/null 2>&1 || true
   rm -rf "$TMP_DIR" >/dev/null 2>&1 || true
 }
 

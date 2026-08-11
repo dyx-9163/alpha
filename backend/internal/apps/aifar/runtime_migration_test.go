@@ -873,15 +873,20 @@ func TestRuntimeMigrationNeverDowngradesAcceptedGeneration(t *testing.T) {
 	}
 }
 
-func TestInstallTemplateArchivesLegacySpecReadOnlyAfterAcceptance(t *testing.T) {
+func TestFreshInstallUsesEphemeralBootstrapInputWithoutLegacySpec(t *testing.T) {
 	script, err := templateFS.ReadFile("templates/install.sh")
 	if err != nil {
 		t.Fatal(err)
 	}
 	text := string(script)
-	for _, required := range []string{"runtime-spec.legacy-readonly.json", "aifar-agent archive-legacy-runtime --instance", "--sha256", "chmod 0400", "AIFAR_BOOTSTRAP_ACCEPTANCE"} {
+	for _, required := range []string{"$WORK_DIR/bootstrap-runtime.json", "bootstrap-runtime-stdin", "AIFAR_BOOTSTRAP_ACCEPTANCE", `"nacos": {`} {
 		if !strings.Contains(text, required) {
-			t.Fatalf("install template is missing migration-safe legacy archive step %q", required)
+			t.Fatalf("install template is missing ephemeral typed bootstrap step %q", required)
+		}
+	}
+	for _, forbidden := range []string{"runtime-spec.json", "runtime-spec.legacy-readonly.json", "archive-legacy-runtime", "AIFAR_DESIRED_REPLICAS"} {
+		if strings.Contains(text, forbidden) {
+			t.Fatalf("fresh install must not create aggregate desired-state artifact %q", forbidden)
 		}
 	}
 }

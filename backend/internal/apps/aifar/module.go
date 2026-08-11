@@ -532,17 +532,6 @@ func (m Module) MutateRuntimeDeployment(ctx context.Context, req registry.Runtim
 			return nil
 		},
 	}
-	if replicas != nil {
-		plan.Project = func(projectCtx context.Context, lock store.AIFAROrchestrationLock, accepted store.AIFARDeployment) error {
-			_, projectErr := m.service.updateAcceptedDeploymentMetadata(projectCtx, lock, accepted, "AIFAR_RUNTIME_CONTROL_METADATA_WRITE_FAILED", func(metadata map[string]any) error {
-				desired := desiredReplicasFromMetadata(metadata)
-				desired[req.ServiceName] = accepted.DesiredReplicas
-				metadata["desiredReplicas"] = desired
-				return nil
-			})
-			return projectErr
-		}
-	}
 	_, err = m.service.mutateDeploymentsFanOut(ctx, instance, server, run.Actor, fallbackTaskID(run.TaskID, run.Log), run.Language, 1, []deploymentMutationPlan{plan}, run.Log, func(target string) Logger {
 		return run.LoggerForTarget(target)
 	})
