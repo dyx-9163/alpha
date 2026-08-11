@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"sort"
 	"strings"
@@ -829,6 +830,7 @@ func TestRuntimeMigrationAdoptsExistingPodsWithoutRestartAndEnablesTypedMutation
 		},
 	})
 	manifests := map[string]runtimeagent.DeploymentManifest{}
+	manifestHashes := map[string]string{}
 	for _, serviceName := range services {
 		definition, found := catalogDefinition(definitions, serviceName)
 		if !found {
@@ -839,7 +841,17 @@ func TestRuntimeMigrationAdoptsExistingPodsWithoutRestartAndEnablesTypedMutation
 		}
 		manifest := runtimeagent.NormalizeDeploymentManifest(runtimeManifestDefaults(instance.ID, installRoot, definition, deployment, 1, metadata))
 		manifest.Spec.Replicas = desired[serviceName]
+		manifest = runtimeagent.NormalizeDeploymentManifest(manifest)
 		manifests[serviceName] = manifest
+		hashPayload, err := json.Marshal(struct {
+			Spec    runtimeagent.DeploymentSpec `json:"spec"`
+			Service runtimeagent.ServiceSpec    `json:"service"`
+		}{Spec: manifest.Spec, Service: manifest.Service})
+		if err != nil {
+			t.Fatal(err)
+		}
+		hash := sha256.Sum256(hashPayload)
+		manifestHashes[serviceName] = fmt.Sprintf("%x", hash)
 		legacy.Deployments = append(legacy.Deployments, manifest.Spec)
 		legacy.Services = append(legacy.Services, manifest.Service)
 		if _, err := db.SaveAIFARDeployment(deployment); err != nil {
@@ -908,9 +920,77 @@ func TestRuntimeMigrationAdoptsExistingPodsWithoutRestartAndEnablesTypedMutation
 	if byService["permission"].Generation != 1 || byService["permission"].DesiredReplicas != 1 || byService["file"].Generation != 1 || byService["file"].DesiredReplicas != 0 {
 		t.Fatalf("migration changed generation or desired replicas: %+v", byService)
 	}
+	for _, serviceName := range services {
+		wantManifest := manifests[serviceName]
+		row, found := byService[serviceName]
+		if !found {
+			t.Fatalf("migration lost control-plane deployment %q: %+v", serviceName, byService)
+		}
+		if row.CurrentRevision != revision {
+			t.Fatalf("migration changed %s control-plane revision: got=%q want=%q", serviceName, row.CurrentRevision, revision)
+		}
+		wantSpecJSON, err := json.Marshal(wantManifest)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if row.SpecJSON != string(wantSpecJSON) {
+			t.Fatalf("migration changed %s canonical SpecJSON:\ngot:  %s\nwant: %s", serviceName, row.SpecJSON, wantSpecJSON)
+		}
+		var storedManifest runtimeagent.DeploymentManifest
+		if err := json.Unmarshal([]byte(row.SpecJSON), &storedManifest); err != nil {
+			t.Fatalf("decode migrated %s control-plane SpecJSON: %v", serviceName, err)
+		}
+		if !reflect.DeepEqual(storedManifest, wantManifest) {
+			t.Fatalf("migration changed %s parsed control-plane manifest:\ngot:  %+v\nwant: %+v", serviceName, storedManifest, wantManifest)
+		}
+
+		rawManifest, err := os.ReadFile(filepath.Join(stateDir, instance.ID, "deployments", serviceName+".json"))
+		if err != nil {
+			t.Fatalf("read migrated %s raw Agent manifest: %v", serviceName, err)
+		}
+		wantRawManifest, err := json.MarshalIndent(wantManifest, "", "  ")
+		if err != nil {
+			t.Fatal(err)
+		}
+		wantRawManifest = append(wantRawManifest, '\n')
+		if string(rawManifest) != string(wantRawManifest) {
+			t.Fatalf("migration changed %s raw Agent manifest:\ngot:  %s\nwant: %s", serviceName, rawManifest, wantRawManifest)
+		}
+		agentManifest, err := manifestStore.Get(instance.ID, serviceName)
+		if err != nil {
+			t.Fatalf("read migrated %s parsed Agent manifest: %v", serviceName, err)
+		}
+		if !reflect.DeepEqual(agentManifest, wantManifest) {
+			t.Fatalf("migration changed %s parsed Agent manifest:\ngot:  %+v\nwant: %+v", serviceName, agentManifest, wantManifest)
+		}
+	}
+	wantServiceRevisions := map[string]any{"permission": revision, "file": revision}
+	if got, ok := savedMetadata["serviceRevisions"].(map[string]any); !ok || !reflect.DeepEqual(got, wantServiceRevisions) {
+		t.Fatalf("migration changed service revisions metadata: got=%v want=%v", got, wantServiceRevisions)
+	}
 	snapshot, err := agent.RuntimeInstanceSnapshot(instance.ID)
-	if err != nil || len(snapshot.Deployments) != 2 {
+	if err != nil {
 		t.Fatalf("real Agent snapshot after migration: err=%v snapshot=%+v", err, snapshot)
+	}
+	snapshotByService := make(map[string]runtimeagent.RuntimeDeploymentSnapshot, len(snapshot.Deployments))
+	for _, deployment := range snapshot.Deployments {
+		if _, duplicate := snapshotByService[deployment.ServiceName]; duplicate {
+			t.Fatalf("real Agent snapshot duplicated service %q: %+v", deployment.ServiceName, snapshot.Deployments)
+		}
+		snapshotByService[deployment.ServiceName] = deployment
+	}
+	if len(snapshotByService) != len(services) {
+		t.Fatalf("real Agent snapshot service set changed: %+v", snapshot.Deployments)
+	}
+	for _, serviceName := range services {
+		want := runtimeagent.RuntimeDeploymentSnapshot{
+			ServiceName: serviceName, ManifestGeneration: 1, ManifestSpecHash: manifestHashes[serviceName],
+			StateGeneration: 1, ObservedGeneration: 1, StateSpecHash: manifestHashes[serviceName],
+			DesiredReplicas: desired[serviceName],
+		}
+		if got, found := snapshotByService[serviceName]; !found || !reflect.DeepEqual(got, want) {
+			t.Fatalf("real Agent snapshot changed %s desired-state proof: got=%+v found=%t want=%+v", serviceName, got, found, want)
+		}
 	}
 
 	lock, err := db.AcquireAIFAROrchestrationLock(store.AIFAROrchestrationLock{
