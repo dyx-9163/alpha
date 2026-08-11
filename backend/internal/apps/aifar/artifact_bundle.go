@@ -54,7 +54,7 @@ type artifactBundleItem struct {
 
 func (s Service) ValidateArtifactBundleUpdate(req ArtifactBundleUpdateRequest) error {
 	copy := updateCopyFor(req.Language)
-	if err := ensureK8sLikeInstance(req.Instance, copy); err != nil {
+	if err := ensureServiceControllerInstance(req.Instance, copy); err != nil {
 		return err
 	}
 	_, cleanup, err := s.artifactBundleItemsFromRequest(req, copy, false)
@@ -145,7 +145,7 @@ func (s Service) UpdateArtifactBundle(ctx context.Context, req ArtifactBundleUpd
 			return err
 		}
 		metadata = metadataFromInstance(req.Instance)
-		if err := ensureK8sLikeMetadata(metadata, copy); err != nil {
+		if err := ensureServiceControllerMetadata(metadata); err != nil {
 			return err
 		}
 		installRoot = stringFromMetadata(metadata, "installRoot", installRootFromDeployDir(req.Server.DeployDir))
@@ -295,7 +295,7 @@ func (s Service) UpdateArtifactBundle(ctx context.Context, req ArtifactBundleUpd
 				ExpectedRevision: expectedDeploymentRevisions[artifact.ServiceName],
 				Validate: func(instance store.AppInstance, _ store.AIFARDeployment) error {
 					freshMetadata := metadataFromInstance(instance)
-					if err := ensureK8sLikeMetadata(freshMetadata, copy); err != nil {
+					if err := ensureServiceControllerMetadata(freshMetadata); err != nil {
 						return err
 					}
 					if !serviceInList(artifact.ServiceName, servicesFromMetadata(freshMetadata)) {

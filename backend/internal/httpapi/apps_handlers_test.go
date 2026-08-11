@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
@@ -35,6 +36,82 @@ func TestAIFARArtifactUpdateRequiresPositiveExpectedGeneration(t *testing.T) {
 
 	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), `"code":"INVALID_AIFAR_ARTIFACT_EXPECTED_GENERATION"`) {
 		t.Fatalf("expected strict expectedGeneration rejection, got status=%d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestAIFARArtifactBundleAndRollbackRejectLegacyModelWithLocalizedMigrationContract(t *testing.T) {
+	api, db, secret := newAuthzTestAPI(t)
+	_, instance := seedAIFARRuntimeFixture(t, db, "unix:///var/run/docker.sock")
+	instance.Metadata = `{"orchestrationModel":"agent-runtime-v2","installRoot":"/aifar/apps/admin"}`
+	if _, err := db.SaveAppInstance(instance); err != nil {
+		t.Fatal(err)
+	}
+	token := issueTestToken(t, db, secret, "owner", "owner")
+	wantMessages := map[string]string{
+		"en": "This AIFAR instance has not migrated to agent-service-controller-v1; complete the runtime migration first.",
+		"zh": "当前 AIFAR 实例尚未迁移到 agent-service-controller-v1，请先完成运行时迁移。",
+	}
+
+	for _, language := range []string{"en", "zh"} {
+		for _, entry := range []struct {
+			name string
+			path string
+			body func() (io.Reader, string)
+		}{
+			{name: "single artifact", path: "/api/v2/apps/instances/" + instance.ID + "/aifar/update-artifact", body: func() (io.Reader, string) {
+				return aifarArtifactMultipart(t, "1", "permission", "permission.jar")
+			}},
+			{name: "artifact bundle", path: "/api/v2/apps/instances/" + instance.ID + "/aifar/update-artifact-bundle", body: func() (io.Reader, string) {
+				return aifarBundleMultipart(t, "runtime-bundle.zip")
+			}},
+			{name: "rollback", path: "/api/v2/apps/instances/" + instance.ID + "/aifar/rollback", body: func() (io.Reader, string) {
+				return strings.NewReader(`{"targetReleaseId":"release-old","reason":"operator rollback"}`), "application/json"
+			}},
+		} {
+			t.Run(language+"/"+entry.name, func(t *testing.T) {
+				body, contentType := entry.body()
+				req := httptest.NewRequest(http.MethodPost, entry.path, body)
+				req.Header.Set("Authorization", "Bearer "+token)
+				req.Header.Set("Content-Type", contentType)
+				req.Header.Set("X-AIFAR-Language", language)
+				rec := httptest.NewRecorder()
+
+				api.Router().ServeHTTP(rec, req)
+
+				assertAIFARRuntimeMigrationRequired(t, rec, instance.ID, wantMessages[language])
+			})
+		}
+	}
+}
+
+func TestAIFARArtifactUpdateRejectsEmptyAndUnknownModelsWithMigrationContract(t *testing.T) {
+	api, db, secret := newAuthzTestAPI(t)
+	_, instance := seedAIFARRuntimeFixture(t, db, "unix:///var/run/docker.sock")
+	token := issueTestToken(t, db, secret, "owner", "owner")
+	const wantMessage = "This AIFAR instance has not migrated to agent-service-controller-v1; complete the runtime migration first."
+	for _, model := range []struct {
+		name     string
+		metadata string
+	}{
+		{name: "empty", metadata: `{"installRoot":"/aifar/apps/admin"}`},
+		{name: "unknown", metadata: `{"orchestrationModel":"unknown-controller","installRoot":"/aifar/apps/admin"}`},
+	} {
+		t.Run(model.name, func(t *testing.T) {
+			instance.Metadata = model.metadata
+			if _, err := db.SaveAppInstance(instance); err != nil {
+				t.Fatal(err)
+			}
+			body, contentType := aifarArtifactMultipart(t, "1", "permission", "permission.jar")
+			req := httptest.NewRequest(http.MethodPost, "/api/v2/apps/instances/"+instance.ID+"/aifar/update-artifact", body)
+			req.Header.Set("Authorization", "Bearer "+token)
+			req.Header.Set("Content-Type", contentType)
+			req.Header.Set("X-AIFAR-Language", "en")
+			rec := httptest.NewRecorder()
+
+			api.Router().ServeHTTP(rec, req)
+
+			assertAIFARRuntimeMigrationRequired(t, rec, instance.ID, wantMessage)
+		})
 	}
 }
 
@@ -366,6 +443,41 @@ func aifarArtifactMultipart(t *testing.T, expectedGeneration, serviceName, fileN
 		t.Fatal(err)
 	}
 	return bytes.NewReader(body.Bytes()), writer.FormDataContentType()
+}
+
+func aifarBundleMultipart(t *testing.T, fileName string) (*bytes.Reader, string) {
+	t.Helper()
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	part, err := writer.CreateFormFile("bundle", fileName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := part.Write([]byte("legacy requests must be rejected before bundle parsing")); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return bytes.NewReader(body.Bytes()), writer.FormDataContentType()
+}
+
+func assertAIFARRuntimeMigrationRequired(t *testing.T, rec *httptest.ResponseRecorder, instanceID, wantMessage string) {
+	t.Helper()
+	var response struct {
+		Code    string         `json:"code"`
+		Message string         `json:"message"`
+		Details map[string]any `json:"details"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode migration response: %v body=%s", err, rec.Body.String())
+	}
+	if rec.Code != http.StatusConflict || response.Code != "AIFAR_RUNTIME_MIGRATION_REQUIRED" || response.Message != wantMessage {
+		t.Fatalf("unexpected migration response: status=%d response=%+v", rec.Code, response)
+	}
+	if len(response.Details) != 1 || response.Details["instanceId"] != instanceID {
+		t.Fatalf("migration response leaked or omitted details: %+v", response.Details)
+	}
 }
 
 func TestDecodeMySQLBackupRequestAcceptsOnlyPositiveKeepLastOverride(t *testing.T) {

@@ -26,6 +26,8 @@ const (
 	orchestrationLockTTL       = time.Hour
 )
 
+var errAutoscaleModelChanged = errors.New("AIFAR_AUTOSCALE_MODEL_CHANGED")
+
 type AutoscalePolicy struct {
 	Enabled         bool
 	MemoryThreshold float64
@@ -104,6 +106,11 @@ func (a *Autoscaler) tick(ctx context.Context, now time.Time) {
 		if ctx.Err() != nil {
 			return
 		}
+		fresh, err := a.store.GetAppInstance(instance.ID)
+		if err != nil {
+			continue
+		}
+		instance = fresh
 		if instance.App != AppName || strings.TrimSpace(instance.ServerID) == "" {
 			continue
 		}
@@ -111,6 +118,9 @@ func (a *Autoscaler) tick(ctx context.Context, now time.Time) {
 			continue
 		}
 		metadata := metadataFromInstance(instance)
+		if !IsServiceControllerModel(stringFromMetadata(metadata, "orchestrationModel", "")) {
+			continue
+		}
 		policy := autoscalePolicyFromMetadata(metadata)
 		if !policy.Enabled {
 			continue
@@ -251,7 +261,7 @@ func (s Service) ScaleOut(ctx context.Context, req ScaleOutRequest, log Logger, 
 		Operation:   "autoscale",
 		Validate: func(instance store.AppInstance, _ store.AIFARDeployment) error {
 			metadata := metadataFromInstance(instance)
-			if err := ensureK8sLikeMetadata(metadata, UpdateCopy{LegacyUpdateUnsupported: "legacy AIFAR orchestration model %s does not support autoscale; reinstall with k8s-like orchestration first"}); err != nil {
+			if err := ensureServiceControllerMetadata(metadata); err != nil {
 				return err
 			}
 			policy := autoscalePolicyFromMetadata(metadata)
@@ -589,6 +599,9 @@ type autoscaleMetadataEvent struct {
 
 func (a *Autoscaler) persistMetadata(instanceID string, projection map[string]any, event *autoscaleMetadataEvent) error {
 	_, err := NewService(a.store, a.remote).updateAppInstanceMetadata(instanceID, "AIFAR_AUTOSCALE_METADATA_REPAIR_REQUIRED", func(fresh map[string]any) error {
+		if !IsServiceControllerModel(stringFromMetadata(fresh, "orchestrationModel", "")) {
+			return errAutoscaleModelChanged
+		}
 		delete(fresh, "desiredReplicas")
 		for _, key := range []string{"activeEndpoints", "activeServices", "autoscaleMetrics", "autoscaleSignals"} {
 			if value, ok := projection[key]; ok {

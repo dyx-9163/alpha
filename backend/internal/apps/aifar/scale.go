@@ -30,7 +30,7 @@ func (s Service) ScaleServices(ctx context.Context, req ScaleServicesRequest, lo
 		return err
 	}
 	metadata := metadataFromInstance(req.Instance)
-	if err := ensureK8sLikeMetadata(metadata, UpdateCopy{LegacyUpdateUnsupported: "legacy AIFAR orchestration model %s does not support service scale; reinstall with k8s-like orchestration first"}); err != nil {
+	if err := ensureServiceControllerMetadata(metadata); err != nil {
 		return err
 	}
 	plans := make([]deploymentMutationPlan, 0, len(services))
@@ -41,7 +41,7 @@ func (s Service) ScaleServices(ctx context.Context, req ScaleServicesRequest, lo
 			Operation:   "scale",
 			Validate: func(instance store.AppInstance, _ store.AIFARDeployment) error {
 				freshMetadata := metadataFromInstance(instance)
-				if err := ensureK8sLikeMetadata(freshMetadata, UpdateCopy{LegacyUpdateUnsupported: "legacy AIFAR orchestration model %s does not support service scale; reinstall with k8s-like orchestration first"}); err != nil {
+				if err := ensureServiceControllerMetadata(freshMetadata); err != nil {
 					return err
 				}
 				if !serviceInList(serviceName, servicesFromMetadata(freshMetadata)) {

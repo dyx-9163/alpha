@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strings"
 
+	aifarapp "aifar-deployment/backend/internal/apps/aifar"
 	"aifar-deployment/backend/internal/apps/registry"
 	"aifar-deployment/backend/internal/i18n"
 	"aifar-deployment/backend/internal/store"
@@ -257,6 +258,10 @@ func (a *API) rollbackAIFARRelease(w http.ResponseWriter, r *http.Request) {
 		Force:           body.Force,
 	}
 	if err := rollbackModule.ValidateArtifactRollback(r.Context(), req); err != nil {
+		if errors.Is(err, aifarapp.ErrRuntimeMigrationRequired) {
+			writeAIFARRuntimeMigrationRequired(w, lang, instance.ID)
+			return
+		}
 		writeError(w, http.StatusBadRequest, "ARTIFACT_ROLLBACK_VALIDATE_FAILED", err.Error(), map[string]any{"app": instance.App, "releaseId": req.TargetReleaseID})
 		return
 	}

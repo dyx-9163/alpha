@@ -37,6 +37,8 @@ type RuntimeDiagnosticRequest = registry.RuntimeDiagnosticRequest
 type RuntimeDiagnosticDeleteRequest = registry.RuntimeDiagnosticDeleteRequest
 type RuntimeDiagnosticStreamRequest = registry.RuntimeDiagnosticStreamRequest
 
+var ErrRuntimeMigrationRequired = errors.New("AIFAR runtime migration is required")
+
 type Store interface {
 	GetServer(id string, includeSecret bool) (store.Server, error)
 	GetAppInstance(id string) (store.AppInstance, error)
@@ -1245,14 +1247,14 @@ func saveControlPlaneRevision(orch aifarOrchestrationStore, instanceID, version,
 	return nil
 }
 
-func ensureK8sLikeInstance(instance store.AppInstance, copy UpdateCopy) error {
+func ensureServiceControllerInstance(instance store.AppInstance, copy UpdateCopy) error {
 	if instance.App != AppName {
 		return errors.New(copy.UnsupportedInstance)
 	}
-	return ensureK8sLikeMetadata(metadataFromInstance(instance), copy)
+	return ensureServiceControllerMetadata(metadataFromInstance(instance))
 }
 
-func ensureK8sLikeMetadata(metadata map[string]any, copy UpdateCopy) error {
+func ensureServiceControllerMetadata(metadata map[string]any) error {
 	model := ""
 	if value, ok := metadata["orchestrationModel"]; ok {
 		model = strings.TrimSpace(fmt.Sprint(value))
@@ -1260,10 +1262,7 @@ func ensureK8sLikeMetadata(metadata map[string]any, copy UpdateCopy) error {
 	if IsServiceControllerModel(model) {
 		return nil
 	}
-	if model == "" {
-		model = legacyOrchestrationModel
-	}
-	return fmt.Errorf(copy.LegacyUpdateUnsupported, model)
+	return ErrRuntimeMigrationRequired
 }
 
 func currentRevisionForService(metadata map[string]any, serviceName string) string {
@@ -1570,7 +1569,7 @@ type artifactInfo struct {
 
 func (s Service) ValidateArtifactUpdate(req ArtifactUpdateRequest) error {
 	copy := updateCopyFor(req.Language)
-	if err := ensureK8sLikeInstance(req.Instance, copy); err != nil {
+	if err := ensureServiceControllerInstance(req.Instance, copy); err != nil {
 		return err
 	}
 	if req.ExpectedGeneration <= 0 {
@@ -1664,7 +1663,7 @@ func (s Service) UpdateArtifact(ctx context.Context, req ArtifactUpdateRequest, 
 			return err
 		}
 		metadata = metadataFromInstance(req.Instance)
-		if err := ensureK8sLikeMetadata(metadata, copy); err != nil {
+		if err := ensureServiceControllerMetadata(metadata); err != nil {
 			return err
 		}
 		installRoot = stringFromMetadata(metadata, "installRoot", installRootFromDeployDir(req.Server.DeployDir))

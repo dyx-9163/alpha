@@ -1076,15 +1076,32 @@ func TestAIFARRuntimeActionsRejectLegacyMigrationSourceModel(t *testing.T) {
 		t.Fatal(err)
 	}
 	token := issueTestToken(t, db, secret, "owner", "owner")
-	req := httptest.NewRequest(http.MethodPost, "/api/v2/containers/aifar/services/permission/scale-out?serverId="+server.ID, strings.NewReader(`{"instanceId":"`+instance.ID+`"}`))
-	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("Content-Type", "application/json")
-	rec := httptest.NewRecorder()
+	wantMessages := map[string]string{
+		"en": "This AIFAR instance has not migrated to agent-service-controller-v1; complete the runtime migration first.",
+		"zh": "当前 AIFAR 实例尚未迁移到 agent-service-controller-v1，请先完成运行时迁移。",
+	}
+	for _, language := range []string{"en", "zh"} {
+		for _, entry := range []struct {
+			name   string
+			method string
+			path   string
+			body   string
+		}{
+			{name: "typed action", method: http.MethodPost, path: "/api/v2/containers/aifar/services/permission/scale-out?serverId=" + server.ID, body: `{"instanceId":"` + instance.ID + `"}`},
+			{name: "runtime logs", method: http.MethodGet, path: "/api/v2/containers/aifar/runtime/logs?serverId=" + server.ID + "&instanceId=" + instance.ID + "&service=permission"},
+		} {
+			t.Run(language+"/"+entry.name, func(t *testing.T) {
+				req := httptest.NewRequest(entry.method, entry.path, strings.NewReader(entry.body))
+				req.Header.Set("Authorization", "Bearer "+token)
+				req.Header.Set("Content-Type", "application/json")
+				req.Header.Set("X-AIFAR-Language", language)
+				rec := httptest.NewRecorder()
 
-	api.Router().ServeHTTP(rec, req)
+				api.Router().ServeHTTP(rec, req)
 
-	if rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), "AIFAR_RUNTIME_MIGRATION_REQUIRED") {
-		t.Fatalf("expected migration-required conflict, got %d body=%s", rec.Code, rec.Body.String())
+				assertAIFARRuntimeMigrationRequired(t, rec, instance.ID, wantMessages[language])
+			})
+		}
 	}
 }
 

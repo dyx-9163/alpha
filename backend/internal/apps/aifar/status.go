@@ -315,38 +315,37 @@ type CheckCopy struct {
 }
 
 type UpdateCopy struct {
-	ValidateRequest         string
-	UploadArtifactStep      string
-	ApplyUpdate             string
-	RecordRelease           string
-	StepStart               string
-	StepDone                string
-	StepFailed              string
-	TargetRequired          string
-	UnsupportedInstance     string
-	UnsupportedService      string
-	ArtifactRequired        string
-	ArtifactTypeInvalid     string
-	BundleRequired          string
-	BundleManifestRequired  string
-	BundleEmpty             string
-	BundleInvalid           string
-	BundleDuplicateService  string
-	BundleArtifactMissing   string
-	LegacyUpdateUnsupported string
-	PrepareWorkDir          string
-	UploadArtifact          string
-	UploadArtifactFailed    string
-	UploadScript            string
-	UploadScriptFailed      string
-	Deploying               string
-	RemoteCommandFailed     string
-	UpdateFailed            string
-	RecordFailed            string
-	Updated                 string
-	BundleUpdating          string
-	BundleServiceUpdating   string
-	BundleUpdated           string
+	ValidateRequest        string
+	UploadArtifactStep     string
+	ApplyUpdate            string
+	RecordRelease          string
+	StepStart              string
+	StepDone               string
+	StepFailed             string
+	TargetRequired         string
+	UnsupportedInstance    string
+	UnsupportedService     string
+	ArtifactRequired       string
+	ArtifactTypeInvalid    string
+	BundleRequired         string
+	BundleManifestRequired string
+	BundleEmpty            string
+	BundleInvalid          string
+	BundleDuplicateService string
+	BundleArtifactMissing  string
+	PrepareWorkDir         string
+	UploadArtifact         string
+	UploadArtifactFailed   string
+	UploadScript           string
+	UploadScriptFailed     string
+	Deploying              string
+	RemoteCommandFailed    string
+	UpdateFailed           string
+	RecordFailed           string
+	Updated                string
+	BundleUpdating         string
+	BundleServiceUpdating  string
+	BundleUpdated          string
 }
 
 func copyFor(lang string) Copy {
@@ -421,73 +420,71 @@ func copyFor(lang string) Copy {
 func updateCopyFor(lang string) UpdateCopy {
 	if normalizeLanguage(lang) == "en" {
 		return UpdateCopy{
-			ValidateRequest:         "validate AIFAR service artifact",
-			UploadArtifactStep:      "upload service artifact",
-			ApplyUpdate:             "roll out AIFAR Deployment revision",
-			RecordRelease:           "record rollout revision",
-			StepStart:               "AIFAR update step %d/%d started: %s",
-			StepDone:                "AIFAR update step %d/%d completed: %s",
-			StepFailed:              "AIFAR update step %d/%d failed: %s: %v",
-			TargetRequired:          "AIFAR service update requires a target server",
-			UnsupportedInstance:     "only AIFAR service instances support artifact updates",
-			UnsupportedService:      "unsupported AIFAR service: %s",
-			ArtifactRequired:        "service artifact file is required",
-			ArtifactTypeInvalid:     "artifact type is invalid for %s",
-			BundleRequired:          "artifact bundle zip file is required",
-			BundleManifestRequired:  "artifact bundle manifest.json is required",
-			BundleEmpty:             "artifact bundle does not contain any service artifact",
-			BundleInvalid:           "artifact bundle is invalid: %v",
-			BundleDuplicateService:  "duplicate service in artifact bundle: %s",
-			BundleArtifactMissing:   "artifact file is missing from bundle: %s",
-			LegacyUpdateUnsupported: "legacy AIFAR orchestration model %s does not support rolling updates; reinstall with k8s-like orchestration first",
-			PrepareWorkDir:          "preparing remote update work directory: %s",
-			UploadArtifact:          "uploading %s artifact: %s",
-			UploadArtifactFailed:    "upload AIFAR service artifact",
-			UploadScript:            "uploading AIFAR service update script",
-			UploadScriptFailed:      "upload AIFAR service update script",
-			Deploying:               "rolling out AIFAR service %s",
-			RemoteCommandFailed:     "AIFAR rollout remote command failed",
-			UpdateFailed:            "AIFAR service update failed: %v",
-			RecordFailed:            "record AIFAR rollout revision failed: %v",
-			Updated:                 "AIFAR service rollout recorded: %s",
-			BundleUpdating:          "updating %d AIFAR service artifact(s) from bundle",
-			BundleServiceUpdating:   "bundle update service %d/%d: %s",
-			BundleUpdated:           "AIFAR artifact bundle update completed on %s, services: %d",
+			ValidateRequest:        "validate AIFAR service artifact",
+			UploadArtifactStep:     "upload service artifact",
+			ApplyUpdate:            "roll out AIFAR Deployment revision",
+			RecordRelease:          "record rollout revision",
+			StepStart:              "AIFAR update step %d/%d started: %s",
+			StepDone:               "AIFAR update step %d/%d completed: %s",
+			StepFailed:             "AIFAR update step %d/%d failed: %s: %v",
+			TargetRequired:         "AIFAR service update requires a target server",
+			UnsupportedInstance:    "only AIFAR service instances support artifact updates",
+			UnsupportedService:     "unsupported AIFAR service: %s",
+			ArtifactRequired:       "service artifact file is required",
+			ArtifactTypeInvalid:    "artifact type is invalid for %s",
+			BundleRequired:         "artifact bundle zip file is required",
+			BundleManifestRequired: "artifact bundle manifest.json is required",
+			BundleEmpty:            "artifact bundle does not contain any service artifact",
+			BundleInvalid:          "artifact bundle is invalid: %v",
+			BundleDuplicateService: "duplicate service in artifact bundle: %s",
+			BundleArtifactMissing:  "artifact file is missing from bundle: %s",
+			PrepareWorkDir:         "preparing remote update work directory: %s",
+			UploadArtifact:         "uploading %s artifact: %s",
+			UploadArtifactFailed:   "upload AIFAR service artifact",
+			UploadScript:           "uploading AIFAR service update script",
+			UploadScriptFailed:     "upload AIFAR service update script",
+			Deploying:              "rolling out AIFAR service %s",
+			RemoteCommandFailed:    "AIFAR rollout remote command failed",
+			UpdateFailed:           "AIFAR service update failed: %v",
+			RecordFailed:           "record AIFAR rollout revision failed: %v",
+			Updated:                "AIFAR service rollout recorded: %s",
+			BundleUpdating:         "updating %d AIFAR service artifact(s) from bundle",
+			BundleServiceUpdating:  "bundle update service %d/%d: %s",
+			BundleUpdated:          "AIFAR artifact bundle update completed on %s, services: %d",
 		}
 	}
 	return UpdateCopy{
-		ValidateRequest:         "校验 AIFAR 服务制品",
-		UploadArtifactStep:      "上传服务制品",
-		ApplyUpdate:             "滚动发布 AIFAR Deployment revision",
-		RecordRelease:           "记录滚动发布 revision",
-		StepStart:               "AIFAR 更新步骤 %d/%d 开始：%s",
-		StepDone:                "AIFAR 更新步骤 %d/%d 完成：%s",
-		StepFailed:              "AIFAR 更新步骤 %d/%d 失败：%s：%v",
-		TargetRequired:          "AIFAR 服务更新需要目标服务器",
-		UnsupportedInstance:     "只有 AIFAR 服务实例支持制品更新",
-		UnsupportedService:      "不支持的 AIFAR 服务：%s",
-		ArtifactRequired:        "请选择服务制品文件",
-		ArtifactTypeInvalid:     "%s 的制品类型不正确",
-		BundleRequired:          "请选择 AIFAR 制品批量包 zip 文件",
-		BundleManifestRequired:  "AIFAR 制品批量包缺少 manifest.json",
-		BundleEmpty:             "AIFAR 制品批量包没有包含任何服务制品",
-		BundleInvalid:           "AIFAR 制品批量包无效：%v",
-		BundleDuplicateService:  "AIFAR 制品批量包中服务重复：%s",
-		BundleArtifactMissing:   "AIFAR 制品批量包中缺少制品文件：%s",
-		LegacyUpdateUnsupported: "旧 AIFAR 编排模型 %s 不支持滚动更新，请先使用 k8s-like 编排重新安装",
-		PrepareWorkDir:          "准备远程更新工作目录：%s",
-		UploadArtifact:          "上传 %s 制品：%s",
-		UploadArtifactFailed:    "上传 AIFAR 服务制品失败",
-		UploadScript:            "上传 AIFAR 服务更新脚本",
-		UploadScriptFailed:      "上传 AIFAR 服务更新脚本失败",
-		Deploying:               "正在滚动发布 AIFAR 服务 %s",
-		RemoteCommandFailed:     "AIFAR 滚动发布远程命令执行失败",
-		UpdateFailed:            "AIFAR 服务更新失败：%v",
-		RecordFailed:            "记录 AIFAR 滚动发布 revision 失败：%v",
-		Updated:                 "AIFAR 服务滚动发布已记录：%s",
-		BundleUpdating:          "正在从批量包更新 %d 个 AIFAR 服务制品",
-		BundleServiceUpdating:   "批量更新服务 %d/%d：%s",
-		BundleUpdated:           "AIFAR 批量制品更新完成，目标：%s，服务数：%d",
+		ValidateRequest:        "校验 AIFAR 服务制品",
+		UploadArtifactStep:     "上传服务制品",
+		ApplyUpdate:            "滚动发布 AIFAR Deployment revision",
+		RecordRelease:          "记录滚动发布 revision",
+		StepStart:              "AIFAR 更新步骤 %d/%d 开始：%s",
+		StepDone:               "AIFAR 更新步骤 %d/%d 完成：%s",
+		StepFailed:             "AIFAR 更新步骤 %d/%d 失败：%s：%v",
+		TargetRequired:         "AIFAR 服务更新需要目标服务器",
+		UnsupportedInstance:    "只有 AIFAR 服务实例支持制品更新",
+		UnsupportedService:     "不支持的 AIFAR 服务：%s",
+		ArtifactRequired:       "请选择服务制品文件",
+		ArtifactTypeInvalid:    "%s 的制品类型不正确",
+		BundleRequired:         "请选择 AIFAR 制品批量包 zip 文件",
+		BundleManifestRequired: "AIFAR 制品批量包缺少 manifest.json",
+		BundleEmpty:            "AIFAR 制品批量包没有包含任何服务制品",
+		BundleInvalid:          "AIFAR 制品批量包无效：%v",
+		BundleDuplicateService: "AIFAR 制品批量包中服务重复：%s",
+		BundleArtifactMissing:  "AIFAR 制品批量包中缺少制品文件：%s",
+		PrepareWorkDir:         "准备远程更新工作目录：%s",
+		UploadArtifact:         "上传 %s 制品：%s",
+		UploadArtifactFailed:   "上传 AIFAR 服务制品失败",
+		UploadScript:           "上传 AIFAR 服务更新脚本",
+		UploadScriptFailed:     "上传 AIFAR 服务更新脚本失败",
+		Deploying:              "正在滚动发布 AIFAR 服务 %s",
+		RemoteCommandFailed:    "AIFAR 滚动发布远程命令执行失败",
+		UpdateFailed:           "AIFAR 服务更新失败：%v",
+		RecordFailed:           "记录 AIFAR 滚动发布 revision 失败：%v",
+		Updated:                "AIFAR 服务滚动发布已记录：%s",
+		BundleUpdating:         "正在从批量包更新 %d 个 AIFAR 服务制品",
+		BundleServiceUpdating:  "批量更新服务 %d/%d：%s",
+		BundleUpdated:          "AIFAR 批量制品更新完成，目标：%s，服务数：%d",
 	}
 }
 

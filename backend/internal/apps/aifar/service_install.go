@@ -113,7 +113,7 @@ func (s Service) InstallServices(ctx context.Context, req InstallServicesRequest
 		if err != nil {
 			return err
 		}
-		if err := ensureK8sLikeMetadata(metadata, UpdateCopy{LegacyUpdateUnsupported: "legacy AIFAR orchestration model %s does not support service installation; reinstall with k8s-like orchestration first"}); err != nil {
+		if err := ensureServiceControllerMetadata(metadata); err != nil {
 			return err
 		}
 		installed := servicesFromMetadata(metadata)

@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	aifarapp "aifar-deployment/backend/internal/apps/aifar"
 	"aifar-deployment/backend/internal/apps/registry"
 	"aifar-deployment/backend/internal/i18n"
 	"aifar-deployment/backend/internal/store"
@@ -101,6 +102,10 @@ func (a *API) updateAppInstanceArtifact(w http.ResponseWriter, r *http.Request) 
 		ArtifactFileName:   header.Filename,
 	}
 	if err := updateModule.ValidateArtifactUpdate(r.Context(), req); err != nil {
+		if errors.Is(err, aifarapp.ErrRuntimeMigrationRequired) {
+			writeAIFARRuntimeMigrationRequired(w, lang, instance.ID)
+			return
+		}
 		writeError(w, http.StatusBadRequest, "ARTIFACT_UPDATE_VALIDATE_FAILED", err.Error(), map[string]any{"app": instance.App, "service": serviceName})
 		return
 	}
@@ -293,6 +298,10 @@ func (a *API) updateAppInstanceArtifactBundle(w http.ResponseWriter, r *http.Req
 		BundleFileName:  header.Filename,
 	}
 	if err := updateModule.ValidateArtifactBundleUpdate(r.Context(), req); err != nil {
+		if errors.Is(err, aifarapp.ErrRuntimeMigrationRequired) {
+			writeAIFARRuntimeMigrationRequired(w, lang, instance.ID)
+			return
+		}
 		writeError(w, http.StatusBadRequest, "ARTIFACT_BUNDLE_UPDATE_VALIDATE_FAILED", err.Error(), map[string]any{"app": instance.App})
 		return
 	}

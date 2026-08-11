@@ -575,7 +575,7 @@ func (a *API) resolveAIFARRuntimeLogQuery(w http.ResponseWriter, r *http.Request
 		return store.Server{}, store.AppInstance{}, aifarRuntimeLogQuery{}, false
 	}
 	if !aifarapp.IsServiceControllerModel(runtimeString(runtimeMetadata(instance.Metadata), "orchestrationModel", "")) {
-		writeError(w, http.StatusConflict, "AIFAR_RUNTIME_MIGRATION_REQUIRED", "legacy AIFAR orchestration model must be migrated before runtime log aggregation", map[string]any{"instanceId": instance.ID})
+		writeAIFARRuntimeMigrationRequired(w, lang, instance.ID)
 		return store.Server{}, store.AppInstance{}, aifarRuntimeLogQuery{}, false
 	}
 	return server, instance, aifarRuntimeLogQuery{
@@ -1462,7 +1462,7 @@ func (a *API) resolveAIFARRuntimeActionTargetForInstanceWithAgent(w http.Respons
 	}
 	metadata := runtimeMetadata(instance.Metadata)
 	if !aifarapp.IsServiceControllerModel(runtimeString(metadata, "orchestrationModel", "")) {
-		writeError(w, http.StatusConflict, "AIFAR_RUNTIME_MIGRATION_REQUIRED", "legacy AIFAR orchestration model must be migrated before this runtime action", map[string]any{"instanceId": instance.ID})
+		writeAIFARRuntimeMigrationRequired(w, lang, instance.ID)
 		return store.Server{}, store.AppInstance{}, false
 	}
 	if requireAgent {
@@ -1584,7 +1584,7 @@ func (a *API) appendAIFARInstanceRuntime(response *aifarRuntimeResponse, instanc
 	})
 	if legacy {
 		response.RuntimeStatus = degradedIfReady(response.RuntimeStatus)
-		response.Warnings = append(response.Warnings, "legacy AIFAR instance "+instance.ID+" requires migration to agent-service-controller-v1")
+		response.Warnings = append(response.Warnings, i18n.Text(options.Language, "api.aifarRuntimeMigrationRequired"))
 		return
 	}
 	deployments, _ := a.store.ListAIFARDeployments(instance.ID)
@@ -1731,6 +1731,10 @@ func (a *API) appendAIFARInstanceRuntime(response *aifarRuntimeResponse, instanc
 		response.Services = append(response.Services, serviceRow)
 	}
 	response.Ingress = append(response.Ingress, runtimeIngressFromMetadata(instance.ID, metadata, response.Agent))
+}
+
+func writeAIFARRuntimeMigrationRequired(w http.ResponseWriter, lang, instanceID string) {
+	writeError(w, http.StatusConflict, "AIFAR_RUNTIME_MIGRATION_REQUIRED", i18n.Text(lang, "api.aifarRuntimeMigrationRequired"), map[string]any{"instanceId": strings.TrimSpace(instanceID)})
 }
 
 func runtimeDeploymentConditions(deployment store.AIFARDeployment, lang string) ([]runtimeagent.DeploymentCondition, string) {

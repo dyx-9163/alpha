@@ -40,7 +40,7 @@ func (s Service) CleanupRuntimeStalePods(ctx context.Context, req RuntimeCleanup
 	var existingContainers []string
 	if err := step(1, func() error {
 		metadata := metadataFromInstance(current)
-		if err := ensureK8sLikeMetadata(metadata, UpdateCopy{LegacyUpdateUnsupported: "legacy AIFAR orchestration model %s does not support runtime cleanup; reinstall with k8s-like orchestration first"}); err != nil {
+		if err := ensureServiceControllerMetadata(metadata); err != nil {
 			return err
 		}
 		installRoot = stringFromMetadata(metadata, "installRoot", installRootFromDeployDir(req.Server.DeployDir))
@@ -141,7 +141,7 @@ func (s Service) UninstallRuntimeAgent(ctx context.Context, req RuntimeAgentUnin
 	var specPath string
 	if err := step(1, func() error {
 		metadata := metadataFromInstance(current)
-		if err := ensureK8sLikeMetadata(metadata, UpdateCopy{LegacyUpdateUnsupported: "legacy AIFAR orchestration model %s does not support agent uninstall; reinstall with k8s-like orchestration first"}); err != nil {
+		if err := ensureServiceControllerMetadata(metadata); err != nil {
 			return err
 		}
 		installRoot = stringFromMetadata(metadata, "installRoot", installRootFromDeployDir(req.Server.DeployDir))

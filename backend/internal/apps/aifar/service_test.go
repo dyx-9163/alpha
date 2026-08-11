@@ -1065,15 +1065,13 @@ func stringSet(values []string) map[string]bool {
 	return out
 }
 
-func TestEnsureK8sLikeMetadataTreatsMissingModelAsLegacy(t *testing.T) {
-	err := ensureK8sLikeMetadata(map[string]any{}, UpdateCopy{
-		LegacyUpdateUnsupported: "legacy model %s",
-	})
-	if err == nil || !strings.Contains(err.Error(), legacyOrchestrationModel) {
-		t.Fatalf("expected missing orchestration model to be reported as legacy, got %v", err)
+func TestServiceControllerMetadataGateTreatsMissingModelAsMigrationRequired(t *testing.T) {
+	err := ensureServiceControllerMetadata(map[string]any{})
+	if !errors.Is(err, ErrRuntimeMigrationRequired) {
+		t.Fatalf("expected missing orchestration model to require migration, got %v", err)
 	}
-	if strings.Contains(err.Error(), "<nil>") {
-		t.Fatalf("missing orchestration model should not leak <nil>: %v", err)
+	if strings.Contains(err.Error(), legacyOrchestrationModel) {
+		t.Fatalf("migration gate leaked the underlying model: %v", err)
 	}
 }
 
@@ -2194,6 +2192,100 @@ func TestAutoscalerMetadataCASPreservesConcurrentFields(t *testing.T) {
 	}
 	if _, ok := savedMetadata["autoscaleMetrics"]; !ok {
 		t.Fatalf("autoscale projection was not persisted: %s", saved.Metadata)
+	}
+}
+
+func TestAutoscalerLegacyTickSkipsSuccessfulCollectionAndPreservesMigrationSource(t *testing.T) {
+	db, remote, legacyJSON, instance := legacyAutoscaleMigrationFixture(t)
+	remote.autoscaleStatusFallback = "hostMemoryAvailableBytes=8589934592\n"
+
+	NewAutoscaler(db, worker.NewManager(db), remote).tick(context.Background(), time.Now().UTC())
+
+	assertLegacyAutoscaleMigrationSourceUnchanged(t, db, remote, legacyJSON, instance)
+}
+
+func TestAutoscalerLegacyTickSkipsFailedCollectionAndPreservesMigrationSource(t *testing.T) {
+	db, remote, legacyJSON, instance := legacyAutoscaleMigrationFixture(t)
+	remote.failCommandContains = "AIFAR_AUTOSCALE_STATUS"
+
+	NewAutoscaler(db, worker.NewManager(db), remote).tick(context.Background(), time.Now().UTC())
+
+	assertLegacyAutoscaleMigrationSourceUnchanged(t, db, remote, legacyJSON, instance)
+}
+
+func TestAutoscalerMetadataCASRejectsConcurrentModelChangeWithoutWrite(t *testing.T) {
+	db := openAIFARTestStore(t)
+	instance := installedAIFARInstance(t)
+	if _, err := db.SaveAppInstance(instance); err != nil {
+		t.Fatal(err)
+	}
+	projection := metadataFromInstance(instance)
+	projection["autoscaleMetrics"] = map[string]any{"permission-r1": map[string]any{"memoryPercent": 91.0}}
+
+	fresh, err := db.GetAppInstance(instance.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy := metadataFromInstance(fresh)
+	legacy["orchestrationModel"] = orchestrationModelK8sLikeV1
+	legacy["desiredReplicas"] = map[string]any{"permission": float64(1)}
+	fresh.Metadata = mustMetadata(t, legacy)
+	fresh, err = db.SaveAppInstance(fresh)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := (&Autoscaler{store: db}).persistMetadata(instance.ID, projection, nil); err == nil {
+		t.Fatal("autoscale metadata CAS accepted a concurrent model change")
+	}
+	saved, err := db.GetAppInstance(instance.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if saved.Metadata != fresh.Metadata {
+		t.Fatalf("autoscale metadata CAS mutated legacy migration input: before=%s after=%s", fresh.Metadata, saved.Metadata)
+	}
+}
+
+func legacyAutoscaleMigrationFixture(t *testing.T) (*store.Store, *fakeRemote, []byte, store.AppInstance) {
+	t.Helper()
+	control, migrationRemote, req := runtimeMigrationFixture(t, 1)
+	db := openAIFARTestStore(t)
+	req.Server.Name = "legacy-node"
+	req.Server.Username = "root"
+	if _, err := db.SaveServer(req.Server); err != nil {
+		t.Fatal(err)
+	}
+	instance, err := db.SaveAppInstance(req.Instance)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deployments, err := control.ListAIFARDeployments(instance.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, deployment := range deployments {
+		if _, err := db.SaveAIFARDeployment(deployment); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return db, &fakeRemote{}, append([]byte(nil), migrationRemote.legacyJSON...), instance
+}
+
+func assertLegacyAutoscaleMigrationSourceUnchanged(t *testing.T, db *store.Store, remote *fakeRemote, legacyJSON []byte, before store.AppInstance) {
+	t.Helper()
+	if commands := remote.joinedCommands(); commands != "" {
+		t.Fatalf("legacy autoscale performed remote collection: %s", commands)
+	}
+	after, err := db.GetAppInstance(before.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Metadata != before.Metadata {
+		t.Fatalf("legacy autoscale wrote event or metadata: before=%s after=%s", before.Metadata, after.Metadata)
+	}
+	if _, err := NewService(db, remote).buildRuntimeMigrationPlan(after, legacyJSON, db); err != nil {
+		t.Fatalf("autoscale damaged a valid runtime migration source: %v", err)
 	}
 }
 
@@ -6437,12 +6529,15 @@ func TestServiceControllerModelPredicateRejectsLegacyMigrationSource(t *testing.
 }
 
 func TestServiceControllerMetadataGateAcceptsOnlyMigratedModel(t *testing.T) {
-	copy := UpdateCopy{LegacyUpdateUnsupported: "unsupported model %s"}
-	if err := ensureK8sLikeMetadata(map[string]any{"orchestrationModel": orchestrationModelServiceControllerV1}, copy); err != nil {
+	if err := ensureServiceControllerMetadata(map[string]any{"orchestrationModel": orchestrationModelServiceControllerV1}); err != nil {
 		t.Fatalf("migrated service-controller model was rejected: %v", err)
 	}
-	if err := ensureK8sLikeMetadata(map[string]any{"orchestrationModel": orchestrationModelK8sLikeV1}, copy); err == nil {
-		t.Fatal("legacy agent-runtime-v2 migration source must not enter ordinary service-controller mutations")
+	for _, model := range []string{"", orchestrationModelK8sLikeV1, "unknown-controller"} {
+		if err := ensureServiceControllerMetadata(map[string]any{"orchestrationModel": model}); !errors.Is(err, ErrRuntimeMigrationRequired) {
+			t.Fatalf("non-controller model %q must require migration, got %v", model, err)
+		} else if strings.Contains(err.Error(), model) && model != "" {
+			t.Fatalf("migration error leaked model %q: %v", model, err)
+		}
 	}
 }
 

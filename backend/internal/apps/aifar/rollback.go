@@ -81,7 +81,7 @@ func inspectArtifactRollback(instance store.AppInstance, release store.AppReleas
 
 func (s Service) ValidateArtifactRollback(req ArtifactRollbackRequest) error {
 	copy := updateCopyFor(req.Language)
-	if err := ensureK8sLikeInstance(req.Instance, copy); err != nil {
+	if err := ensureServiceControllerInstance(req.Instance, copy); err != nil {
 		return err
 	}
 	if strings.TrimSpace(req.TargetReleaseID) == "" {
@@ -174,7 +174,7 @@ func (s Service) RollbackArtifact(ctx context.Context, req ArtifactRollbackReque
 			return localizeArtifactRollbackSelectionError(err, req.Language)
 		}
 		metadata = metadataFromInstance(req.Instance)
-		if err := ensureK8sLikeMetadata(metadata, copy); err != nil {
+		if err := ensureServiceControllerMetadata(metadata); err != nil {
 			return err
 		}
 		installRoot = stringFromMetadata(metadata, "installRoot", installRootFromDeployDir(req.Server.DeployDir))
@@ -316,7 +316,7 @@ func (s Service) RollbackArtifact(ctx context.Context, req ArtifactRollbackReque
 				ExpectedRevision: expectedDeploymentRevisions[serviceName],
 				Validate: func(instance store.AppInstance, _ store.AIFARDeployment) error {
 					freshMetadata := metadataFromInstance(instance)
-					if err := ensureK8sLikeMetadata(freshMetadata, copy); err != nil {
+					if err := ensureServiceControllerMetadata(freshMetadata); err != nil {
 						return err
 					}
 					if !serviceInList(serviceName, servicesFromMetadata(freshMetadata)) || currentRevisionForService(freshMetadata, serviceName) != revisionsBefore[serviceName] {
