@@ -134,7 +134,7 @@ func (a *Autoscaler) tick(ctx context.Context, now time.Time) {
 		}
 		next, decision := evaluateAutoscale(instance, metadata, desiredReplicasFromDeployments(deployments), status, policy, now)
 		if decision.Service == "" {
-			_ = saveMetadata(a.store, instance, next)
+			_ = a.persistMetadata(instance.ID, next, nil)
 			continue
 		}
 		if serviceOrchestrationLocked(metadata, decision.Service, now) || a.orchestrationLocked(instance.ID, decision.Service, now) {
@@ -158,8 +158,7 @@ func (a *Autoscaler) tick(ctx context.Context, now time.Time) {
 			}, log, func(target string) Logger { return log.Target(target) })
 		})
 		if err != nil {
-			next = recordAutoscaleEvent(next, "task-failed", decision.Service, err.Error(), now)
-			_ = saveMetadata(a.store, instance, next)
+			_ = a.persistMetadata(instance.ID, next, &autoscaleMetadataEvent{Status: "task-failed", Service: decision.Service, Message: err.Error(), At: now})
 			continue
 		}
 		signals := autoscaleSignalsFromMetadata(next)
@@ -167,8 +166,7 @@ func (a *Autoscaler) tick(ctx context.Context, now time.Time) {
 		signal.LastScaledAt = now.Format(time.RFC3339)
 		signals[decision.Service] = signal
 		next["autoscaleSignals"] = signals
-		next = recordAutoscaleEvent(next, "task-started", decision.Service, decision.Reason, now)
-		_ = saveMetadata(a.store, instance, next)
+		_ = a.persistMetadata(instance.ID, next, &autoscaleMetadataEvent{Status: "task-started", Service: decision.Service, Message: decision.Reason, At: now})
 		_ = a.store.AddAudit(autoscaleActor, autoscaleTaskType, instance.ID+":"+decision.Service, "running", task.ID)
 	}
 }
@@ -190,12 +188,17 @@ func evaluateAutoscale(instance store.AppInstance, metadata map[string]any, desi
 
 	byService := metricsByService(status.Endpoints)
 	for _, service := range serviceOrder {
+		desiredReplicas, canonical := desired[service]
+		if !canonical || desiredReplicas <= 0 {
+			delete(signals, service)
+			continue
+		}
 		metrics := byService[service]
 		if len(metrics) == 0 {
 			delete(signals, service)
 			continue
 		}
-		if reachedMaxReplica(len(metrics), policy.MaxReplicas) {
+		if reachedMaxReplica(desiredReplicas, policy.MaxReplicas) {
 			continue
 		}
 		if anyEndpointWithoutMemoryLimit(metrics) {
@@ -574,8 +577,31 @@ func recordAutoscaleEvent(metadata map[string]any, status, service, message stri
 }
 
 func (a *Autoscaler) recordScaleEvent(instance store.AppInstance, status, service, message string, now time.Time) {
-	metadata := recordAutoscaleEvent(metadataFromInstance(instance), status, service, message, now)
-	_ = saveMetadata(a.store, instance, metadata)
+	_ = a.persistMetadata(instance.ID, nil, &autoscaleMetadataEvent{Status: status, Service: service, Message: message, At: now})
+}
+
+type autoscaleMetadataEvent struct {
+	Status  string
+	Service string
+	Message string
+	At      time.Time
+}
+
+func (a *Autoscaler) persistMetadata(instanceID string, projection map[string]any, event *autoscaleMetadataEvent) error {
+	_, err := NewService(a.store, a.remote).updateAppInstanceMetadata(instanceID, "AIFAR_AUTOSCALE_METADATA_REPAIR_REQUIRED", func(fresh map[string]any) error {
+		delete(fresh, "desiredReplicas")
+		for _, key := range []string{"activeEndpoints", "activeServices", "autoscaleMetrics", "autoscaleSignals"} {
+			if value, ok := projection[key]; ok {
+				fresh[key] = value
+			}
+		}
+		if event != nil {
+			withEvent := recordAutoscaleEvent(fresh, event.Status, event.Service, event.Message, event.At)
+			fresh["lastScaleEvents"] = withEvent["lastScaleEvents"]
+		}
+		return nil
+	})
+	return err
 }
 
 func saveMetadata(s interface {

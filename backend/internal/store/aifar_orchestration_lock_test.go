@@ -622,6 +622,67 @@ func TestAcceptAIFARDeploymentWithLockRejectsExpiredOwnerAndWrongDesiredProof(t 
 	}
 }
 
+func TestServiceInstallFencedWritesRejectExpiredPredecessor(t *testing.T) {
+	db := openTestStore(t)
+	instance, err := db.SaveAppInstance(AppInstance{ID: "instance-1", App: "aifar", Version: "runtime-v2", ServerID: "srv-1", Status: "installed", Metadata: `{"peer":"keep"}`})
+	if err != nil {
+		t.Fatal(err)
+	}
+	desired, err := db.SaveAIFARDeployment(AIFARDeployment{
+		InstanceID: instance.ID, ServiceName: "permission", DesiredReplicas: 1,
+		CurrentRevision: "rev-1", SpecJSON: `{"generation":1}`, Generation: 1,
+		ObservedGeneration: 1, Status: "Accepted",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	ownerA := testAIFAROrchestrationLock(instance.ID, "", "install-services")
+	ownerA.ID = "service-install-a"
+	ownerA.StartedAt = now.Add(-2 * time.Hour)
+	ownerA.ExpiresAt = now.Add(-time.Hour)
+	if _, err := db.AcquireAIFAROrchestrationLock(ownerA); err != nil {
+		t.Fatal(err)
+	}
+	ownerB := testAIFAROrchestrationLock(instance.ID, "", "install-services")
+	ownerB.ID = "service-install-b"
+	if _, err := db.AcquireAIFAROrchestrationLock(ownerB); err != nil {
+		t.Fatal(err)
+	}
+	initialDeployments, initialReplicaSets := testInitialDesiredSet(instance.ID, "wrong-initial", []string{"file"})
+	if err := db.SaveAIFARInitialDesiredWithLock(ownerB.ID, initialDeployments, initialReplicaSets); !errors.Is(err, ErrAIFAROrchestrationLockOwnership) {
+		t.Fatalf("service-install lease authorized initial install set: %v", err)
+	}
+	replicaSet := AIFARReplicaSet{InstanceID: instance.ID, ServiceName: "permission", Revision: "rev-1", Image: "aifar-permission:rev-1", DesiredPods: 1, Status: "pending"}
+	if _, err := db.SaveAIFARServiceInstallReplicaSetWithLock(ownerA.ID, desired, replicaSet); !errors.Is(err, ErrAIFAROrchestrationLockOwnership) {
+		t.Fatalf("expired predecessor ReplicaSet error=%v", err)
+	}
+	next := instance
+	next.Metadata = `{"peer":"keep","services":["permission"]}`
+	commit := AIFARServiceInstallCommit{
+		LockID: ownerA.ID, ExpectedDeployments: []AIFARDeployment{desired}, NextInstance: next,
+		ExpectedInstanceUpdatedAt: instance.UpdatedAt,
+		Release:                   AppRelease{InstanceID: instance.ID, App: "aifar", Version: "runtime-v2", ReleaseID: "rev-1", ServerID: "srv-1", Status: "success", ManifestJSON: `{}`},
+	}
+	if _, err := db.CommitAIFARServiceInstallWithLock(commit); !errors.Is(err, ErrAIFAROrchestrationLockOwnership) {
+		t.Fatalf("expired predecessor final commit error=%v", err)
+	}
+	fresh, _ := db.GetAppInstance(instance.ID)
+	if fresh.Metadata != instance.Metadata {
+		t.Fatalf("expired predecessor changed metadata: %s", fresh.Metadata)
+	}
+	if releases, _ := db.ListAppReleases(instance.ID); len(releases) != 0 {
+		t.Fatalf("expired predecessor wrote release: %+v", releases)
+	}
+	if _, err := db.SaveAIFARServiceInstallReplicaSetWithLock(ownerB.ID, desired, replicaSet); err != nil {
+		t.Fatal(err)
+	}
+	commit.LockID = ownerB.ID
+	if _, err := db.CommitAIFARServiceInstallWithLock(commit); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestCommitAIFARRuntimeMigrationRejectsSuccessorGenerationWithoutOverwrite(t *testing.T) {
 	db := openTestStore(t)
 	instance, err := db.SaveAppInstance(AppInstance{ID: "instance-1", App: "aifar", Version: "runtime-v2", ServerID: "srv-1", Status: "installed", Metadata: `{"orchestrationModel":"agent-runtime-v2","peer":"keep"}`})

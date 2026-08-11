@@ -305,7 +305,7 @@ func runtimeDiagnosticFixture(now time.Time) (*runtimeDiagnosticStore, store.App
 		ServerID: "server-1",
 		Status:   "running",
 		Topology: "standalone",
-		Metadata: `{"orchestrationModel":"agent-runtime-v2","installRoot":"/aifar/apps/admin","credential":"do-not-export","runtimeSpec":{"env":{"PASSWORD":"do-not-export-either"}}}`,
+		Metadata: `{"orchestrationModel":"agent-service-controller-v1","installRoot":"/aifar/apps/admin","credential":"do-not-export","runtimeSpec":{"env":{"PASSWORD":"do-not-export-either"}}}`,
 	}
 	server := store.Server{ID: "server-1", Name: "server", DeployDir: "/aifar/apps"}
 	export := store.DiagnosticExport{
@@ -2091,7 +2091,7 @@ func TestEstimateRuntimeDiagnosticsRejectsDisabledAndUnknownServices(t *testing.
 		ID:       "instance-1",
 		App:      AppName,
 		ServerID: "server-1",
-		Metadata: `{"orchestrationModel":"agent-runtime-v2","installRoot":"/aifar/apps/admin"}`,
+		Metadata: `{"orchestrationModel":"agent-service-controller-v1","installRoot":"/aifar/apps/admin"}`,
 	}
 	db := &runtimeDiagnosticStore{fakeStore: &fakeStore{deployments: []store.AIFARDeployment{
 		{InstanceID: instance.ID, ServiceName: "gateway", DesiredReplicas: 1},
@@ -2125,14 +2125,14 @@ func TestRuntimeDiagnosticEstimateRejectsHeredocDelimiterInjectionBeforeRemoteRu
 		ID:       "instance-1",
 		App:      AppName,
 		ServerID: "server-1",
-		Metadata: `{"orchestrationModel":"agent-runtime-v2","installRoot":"/aifar/apps/admin"}`,
+		Metadata: `{"orchestrationModel":"agent-service-controller-v1","installRoot":"/aifar/apps/admin"}`,
 	}
 	tests := map[string]func(*store.AppInstance){
 		"instance id": func(instance *store.AppInstance) {
 			instance.ID = "instance-1\nAIFAR_RUNTIME_DIAGNOSTIC_ESTIMATE\nprintf pwned"
 		},
 		"install root": func(instance *store.AppInstance) {
-			instance.Metadata = `{"orchestrationModel":"agent-runtime-v2","installRoot":"/aifar/apps/admin\nAIFAR_RUNTIME_DIAGNOSTIC_ESTIMATE\nprintf pwned"}`
+			instance.Metadata = `{"orchestrationModel":"agent-service-controller-v1","installRoot":"/aifar/apps/admin\nAIFAR_RUNTIME_DIAGNOSTIC_ESTIMATE\nprintf pwned"}`
 		},
 	}
 	for name, mutate := range tests {
@@ -2196,7 +2196,7 @@ func TestRuntimeDiagnosticEstimateScriptFailsClosedOnCandidateDiscovery(t *testi
 
 func TestEstimateRuntimeDiagnosticsRejectsInvalidDomainBeforeRemoteRun(t *testing.T) {
 	now := time.Now().UTC()
-	validInstance := store.AppInstance{ID: "instance-1", App: AppName, ServerID: "server-1", Metadata: `{"orchestrationModel":"agent-runtime-v2","installRoot":"/aifar/apps/admin"}`}
+	validInstance := store.AppInstance{ID: "instance-1", App: AppName, ServerID: "server-1", Metadata: `{"orchestrationModel":"agent-service-controller-v1","installRoot":"/aifar/apps/admin"}`}
 	db := &runtimeDiagnosticStore{fakeStore: &fakeStore{deployments: []store.AIFARDeployment{
 		{InstanceID: validInstance.ID, ServiceName: "gateway", DesiredReplicas: 1},
 	}}}
@@ -2237,7 +2237,7 @@ func TestEstimateRuntimeDiagnosticsRequiresDiagnosticStoreCapability(t *testing.
 	remote := &runtimeDiagnosticRemote{}
 	now := time.Now().UTC()
 	_, err := NewService(&fakeStore{}, remote).EstimateRuntimeDiagnostics(context.Background(), RuntimeDiagnosticRequest{
-		Instance: store.AppInstance{ID: "instance-1", App: AppName, ServerID: "server-1", Metadata: `{"orchestrationModel":"agent-runtime-v2","installRoot":"/aifar/apps/admin"}`},
+		Instance: store.AppInstance{ID: "instance-1", App: AppName, ServerID: "server-1", Metadata: `{"orchestrationModel":"agent-service-controller-v1","installRoot":"/aifar/apps/admin"}`},
 		Server:   store.Server{ID: "server-1"},
 		Services: []string{"gateway"},
 		SinceAt:  now.Add(-time.Hour),

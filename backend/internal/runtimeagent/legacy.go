@@ -231,6 +231,22 @@ func (m *Manager) ApplyLegacyRuntimeSpec(ctx context.Context, spec LegacyRuntime
 	return m.Apply(ctx, spec)
 }
 
+// RestartLegacyRuntimeSpec keeps the model marker gate and the complete legacy
+// stop/start operation in the same critical section. A successful model switch
+// therefore cannot interleave after the gate but before the remote mutation.
+func (m *Manager) RestartLegacyRuntimeSpec(ctx context.Context, spec LegacyRuntimeSpec) error {
+	legacyRuntimeBootstrapMu.Lock()
+	defer legacyRuntimeBootstrapMu.Unlock()
+	spec = NormalizeSpec(spec)
+	if err := m.ensureLegacyRuntimeSpecEnabledLocked(spec.InstanceID); err != nil {
+		return err
+	}
+	if err := validateRuntimeSpec(spec); err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidLegacyRuntimeSpec, err)
+	}
+	return m.RestartAll(ctx, spec)
+}
+
 func (m *Manager) ensureLegacyRuntimeSpecEnabledLocked(instanceID string) error {
 	instanceID = strings.TrimSpace(instanceID)
 	if err := validateInstanceManifestName(instanceID); err != nil {

@@ -244,8 +244,8 @@ func (s *Store) SaveAIFARDeploymentGeneration(next AIFARDeployment, expectedGene
 
 // SaveAIFARDeploymentGenerationWithLock publishes the exact next desired
 // generation only while lockID is the active unexpired owner for this service.
-// The Task 8 global install lock remains valid for initial installation; other
-// global maintenance locks cannot authorize a Runtime service mutation.
+// The Task 8 global install and the dedicated service-install leases are the
+// only global owners allowed to publish their respective desired generations.
 func (s *Store) SaveAIFARDeploymentGenerationWithLock(lockID string, next AIFARDeployment, expectedGeneration int64) (AIFARDeployment, error) {
 	next = prepareAIFARDeploymentGeneration(next, expectedGeneration)
 	tx, err := s.db.Begin()
@@ -582,6 +582,127 @@ func (s *Store) SaveAIFARAcceptedProjectionWithLock(lockID string, expected AIFA
 	return saved, nil
 }
 
+// SaveAIFARServiceInstallReplicaSetWithLock records the execution projection
+// only while the exact global service-install lease and accepted desired proof
+// remain current in the same transaction.
+func (s *Store) SaveAIFARServiceInstallReplicaSetWithLock(lockID string, expected AIFARDeployment, next AIFARReplicaSet) (AIFARReplicaSet, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return AIFARReplicaSet{}, err
+	}
+	defer tx.Rollback()
+	if err := fenceActiveAIFARServiceInstallLockTx(tx, lockID, expected.InstanceID, time.Now().UTC()); err != nil {
+		return AIFARReplicaSet{}, err
+	}
+	if err := proveAcceptedAIFARDeploymentTx(tx, expected); err != nil {
+		return AIFARReplicaSet{}, err
+	}
+	if next.InstanceID != expected.InstanceID || next.ServiceName != expected.ServiceName || next.Revision != expected.CurrentRevision {
+		return AIFARReplicaSet{}, ErrAIFARDeploymentGenerationConflict
+	}
+	saved, err := saveAIFARReplicaSetTx(tx, next)
+	if err != nil {
+		return AIFARReplicaSet{}, err
+	}
+	if _, err := tx.Exec(`delete from aifar_service_endpoints where instance_id=? and service_name=?`, expected.InstanceID, expected.ServiceName); err != nil {
+		return AIFARReplicaSet{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return AIFARReplicaSet{}, err
+	}
+	return saved, nil
+}
+
+type AIFARServiceInstallCommit struct {
+	LockID                    string
+	ExpectedDeployments       []AIFARDeployment
+	NextInstance              AppInstance
+	ExpectedInstanceUpdatedAt time.Time
+	Release                   AppRelease
+}
+
+// CommitAIFARServiceInstallWithLock atomically proves the complete accepted
+// service set, compare-and-swaps the fresh instance projection, and records the
+// corresponding historical release under the same exact lease fence.
+func (s *Store) CommitAIFARServiceInstallWithLock(commit AIFARServiceInstallCommit) (AppInstance, error) {
+	instanceID := strings.TrimSpace(commit.NextInstance.ID)
+	if instanceID == "" || len(commit.ExpectedDeployments) == 0 || commit.Release.InstanceID != instanceID {
+		return AppInstance{}, ErrAIFAROrchestrationLockOwnership
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return AppInstance{}, err
+	}
+	defer tx.Rollback()
+	if err := fenceActiveAIFARServiceInstallLockTx(tx, commit.LockID, instanceID, time.Now().UTC()); err != nil {
+		return AppInstance{}, err
+	}
+	seen := make(map[string]struct{}, len(commit.ExpectedDeployments))
+	for _, expected := range commit.ExpectedDeployments {
+		if expected.InstanceID != instanceID || strings.TrimSpace(expected.ServiceName) == "" {
+			return AppInstance{}, ErrAIFARDeploymentGenerationConflict
+		}
+		if _, duplicate := seen[expected.ServiceName]; duplicate {
+			return AppInstance{}, ErrAIFARDeploymentGenerationConflict
+		}
+		seen[expected.ServiceName] = struct{}{}
+		if err := proveAcceptedAIFARDeploymentTx(tx, expected); err != nil {
+			return AppInstance{}, err
+		}
+	}
+	saved, err := saveAppInstanceIfUnchangedTx(tx, commit.NextInstance, commit.ExpectedInstanceUpdatedAt)
+	if err != nil {
+		return AppInstance{}, err
+	}
+	release := commit.Release
+	now := time.Now().UTC()
+	if release.ID == "" {
+		release.ID = NewID("rel")
+	}
+	if release.CreatedAt.IsZero() {
+		release.CreatedAt = now
+	}
+	if release.ActivatedAt.IsZero() && release.Status == "success" {
+		release.ActivatedAt = now
+	}
+	if _, err := tx.Exec(`insert into app_releases(id,instance_id,app,version,release_id,server_id,status,manifest_json,config_hash,created_at,activated_at)
+		values(?,?,?,?,?,?,?,?,?,?,?)
+		on conflict(instance_id, release_id) do update set
+		version=excluded.version,server_id=excluded.server_id,status=excluded.status,
+		manifest_json=excluded.manifest_json,config_hash=excluded.config_hash,activated_at=excluded.activated_at`,
+		release.ID, release.InstanceID, release.App, release.Version, release.ReleaseID, release.ServerID, release.Status, release.ManifestJSON, release.ConfigHash, release.CreatedAt, nullableTime(release.ActivatedAt)); err != nil {
+		return AppInstance{}, err
+	}
+	if err := replaceAppReleaseAuxiliaryRecordsTx(tx, release); err != nil {
+		return AppInstance{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return AppInstance{}, err
+	}
+	return saved, nil
+}
+
+func proveAcceptedAIFARDeploymentTx(tx *sql.Tx, expected AIFARDeployment) error {
+	current, err := getAIFARDeployment(tx, expected.InstanceID, expected.ServiceName)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrAIFARDeploymentNotFound
+		}
+		return err
+	}
+	accepted := strings.EqualFold(current.Status, "Accepted")
+	if !accepted && current.ObservedGeneration >= current.Generation {
+		switch strings.ToLower(strings.TrimSpace(current.Status)) {
+		case "progressing", "available", "degraded", "offline":
+			accepted = true
+		}
+	}
+	if current.Generation != expected.Generation || current.CurrentRevision != expected.CurrentRevision || current.SpecJSON != expected.SpecJSON || !accepted {
+		return ErrAIFARDeploymentGenerationConflict
+	}
+	return nil
+}
+
 // fenceActiveAIFARInstallLockTx takes SQLite's write lock while proving that
 // the exact global install lease is still active. The lock remains held by tx,
 // so another connection cannot release, renew, or replace the persisted lease
@@ -590,19 +711,25 @@ func fenceActiveAIFARInstallLockTx(tx *sql.Tx, lockID string, now time.Time) (st
 	if err := fenceActiveAIFARMutationLockTx(tx, lockID, "", "", now); err != nil {
 		return "", err
 	}
-	var instanceID string
-	err := tx.QueryRow(`select instance_id from aifar_orchestration_locks where id=?`, strings.TrimSpace(lockID)).Scan(&instanceID)
+	var instanceID, operation string
+	err := tx.QueryRow(`select instance_id,operation from aifar_orchestration_locks where id=?`, strings.TrimSpace(lockID)).Scan(&instanceID, &operation)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", ErrAIFAROrchestrationLockOwnership
 	}
-	return instanceID, err
+	if err != nil {
+		return "", err
+	}
+	if operation != "install" {
+		return "", ErrAIFAROrchestrationLockOwnership
+	}
+	return instanceID, nil
 }
 
 // fenceActiveAIFARMutationLockTx takes SQLite's write lock while proving that
 // lockID still owns the target service. A global lock is accepted only for the
-// Task 8 install operation; runtime maintenance locks must name the exact
-// service. The transaction keeps this ownership stable through the caller's
-// desired or acceptance write.
+// Task 8 install or the dedicated service-install operation; runtime
+// maintenance locks must name the exact service. The transaction keeps this
+// ownership stable through the caller's desired or acceptance write.
 func fenceActiveAIFARMutationLockTx(tx *sql.Tx, lockID, instanceID, serviceName string, now time.Time) error {
 	result, err := tx.Exec(`update aifar_orchestration_locks set updated_at=?
 		where id=? and status='active' and expires_at>?`, now, strings.TrimSpace(lockID), now)
@@ -630,12 +757,29 @@ func fenceActiveAIFARMutationLockTx(tx *sql.Tx, lockID, instanceID, serviceName 
 	lockServiceName = strings.TrimSpace(lockServiceName)
 	serviceName = strings.TrimSpace(serviceName)
 	if lockServiceName == "" {
-		if operation != "install" {
+		if operation != "install" && operation != "install-services" {
 			return ErrAIFAROrchestrationLockOwnership
 		}
 		return nil
 	}
 	if lockServiceName != serviceName {
+		return ErrAIFAROrchestrationLockOwnership
+	}
+	return nil
+}
+
+func fenceActiveAIFARServiceInstallLockTx(tx *sql.Tx, lockID, instanceID string, now time.Time) error {
+	result, err := tx.Exec(`update aifar_orchestration_locks set updated_at=?
+		where id=? and instance_id=? and service_name='' and operation='install-services'
+			and status='active' and expires_at>?`, now, strings.TrimSpace(lockID), strings.TrimSpace(instanceID), now)
+	if err != nil {
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected != 1 {
 		return ErrAIFAROrchestrationLockOwnership
 	}
 	return nil
@@ -919,6 +1063,22 @@ func getAIFARDeployment(tx *sql.Tx, instanceID, serviceName string) (AIFARDeploy
 }
 
 func (s *Store) SaveAIFARReplicaSet(v AIFARReplicaSet) (AIFARReplicaSet, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return AIFARReplicaSet{}, err
+	}
+	defer tx.Rollback()
+	saved, err := saveAIFARReplicaSetTx(tx, v)
+	if err != nil {
+		return AIFARReplicaSet{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return AIFARReplicaSet{}, err
+	}
+	return saved, nil
+}
+
+func saveAIFARReplicaSetTx(tx *sql.Tx, v AIFARReplicaSet) (AIFARReplicaSet, error) {
 	now := time.Now()
 	if v.ID == "" {
 		v.ID = NewID("aifarrs")
@@ -931,7 +1091,7 @@ func (s *Store) SaveAIFARReplicaSet(v AIFARReplicaSet) (AIFARReplicaSet, error) 
 	if v.DesiredPods < 0 {
 		v.DesiredPods = 0
 	}
-	_, err := s.db.Exec(`insert into aifar_replicasets(id,instance_id,service_name,revision,image,artifact_hash,desired_pods,ready_pods,status,metadata_json,created_at,updated_at)
+	_, err := tx.Exec(`insert into aifar_replicasets(id,instance_id,service_name,revision,image,artifact_hash,desired_pods,ready_pods,status,metadata_json,created_at,updated_at)
 		values(?,?,?,?,?,?,?,?,?,?,?,?)
 		on conflict(instance_id, service_name, revision) do update set
 		image=excluded.image,artifact_hash=excluded.artifact_hash,desired_pods=excluded.desired_pods,

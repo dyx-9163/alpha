@@ -600,7 +600,7 @@ func TestAIFARRuntimeServiceSummaryPrunesResidualPodRecords(t *testing.T) {
 		Version:  "runtime-v2",
 		ServerID: "srv-1",
 		Status:   "installed",
-		Metadata: `{"orchestrationModel":"agent-runtime-v2","installRoot":"/aifar/apps/admin","serviceCatalog":[{"name":"file","kind":"java","applicationName":"alpha-file","port":38005,"artifactExtensions":[".jar"],"healthPath":"/actuator/health/readiness","affinityPolicy":"stable"}]}`,
+		Metadata: `{"orchestrationModel":"agent-service-controller-v1","installRoot":"/aifar/apps/admin","serviceCatalog":[{"name":"file","kind":"java","applicationName":"alpha-file","port":38005,"artifactExtensions":[".jar"],"healthPath":"/actuator/health/readiness","affinityPolicy":"stable"}]}`,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -897,7 +897,7 @@ func TestAIFARRuntimeRequiresServiceCatalogForDockerDiscovery(t *testing.T) {
 		Version:  "runtime-v2",
 		ServerID: server.ID,
 		Status:   "installed",
-		Metadata: `{"orchestrationModel":"agent-runtime-v2","installRoot":"/aifar/apps/admin","runtimeService":"aifar-agent"}`,
+		Metadata: `{"orchestrationModel":"agent-service-controller-v1","installRoot":"/aifar/apps/admin","runtimeService":"aifar-agent"}`,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1065,6 +1065,26 @@ func TestAIFARRuntimeScaleActionsRequireAgent(t *testing.T) {
 		if !strings.Contains(rec.Body.String(), "AIFAR_AGENT_REQUIRED") {
 			t.Fatalf("%s: expected agent-required error, got %s", path, rec.Body.String())
 		}
+	}
+}
+
+func TestAIFARRuntimeActionsRejectLegacyMigrationSourceModel(t *testing.T) {
+	api, db, secret := newAuthzTestAPI(t)
+	server, instance := seedAIFARRuntimeFixture(t, db, "unix:///var/run/docker.sock")
+	instance.Metadata = `{"orchestrationModel":"agent-runtime-v2","installRoot":"/aifar/apps/admin"}`
+	if _, err := db.SaveAppInstance(instance); err != nil {
+		t.Fatal(err)
+	}
+	token := issueTestToken(t, db, secret, "owner", "owner")
+	req := httptest.NewRequest(http.MethodPost, "/api/v2/containers/aifar/services/permission/scale-out?serverId="+server.ID, strings.NewReader(`{"instanceId":"`+instance.ID+`"}`))
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	api.Router().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), "AIFAR_RUNTIME_MIGRATION_REQUIRED") {
+		t.Fatalf("expected migration-required conflict, got %d body=%s", rec.Code, rec.Body.String())
 	}
 }
 
@@ -2169,7 +2189,7 @@ func seedAIFARRuntimeFixture(t *testing.T, db *store.Store, dockerHost string) (
 		t.Fatal(err)
 	}
 	metadata, err := json.Marshal(map[string]any{
-		"orchestrationModel": "agent-runtime-v2",
+		"orchestrationModel": aifarapp.ServiceControllerOrchestrationModel,
 		"installRoot":        "/aifar/apps/admin",
 		"endpoint":           "10.0.0.10:8080",
 		"gatewayEndpoint":    "10.0.0.10:38000",

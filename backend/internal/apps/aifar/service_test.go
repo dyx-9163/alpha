@@ -86,6 +86,45 @@ func (*rollbackLockRaceStore) RecoverAIFAROrchestrationLocks(string, string) (in
 type resourceFakeStore struct {
 	*fakeStore
 	resources []store.Resource
+	lock      store.AIFAROrchestrationLock
+}
+
+func (s *resourceFakeStore) AcquireAIFAROrchestrationLock(lock store.AIFAROrchestrationLock) (store.AIFAROrchestrationLock, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if lock.ID == "" {
+		lock.ID = store.NewID("aifarlock")
+	}
+	s.lock = lock
+	return lock, nil
+}
+
+func (s *resourceFakeStore) RenewAIFAROrchestrationLock(id string, expiresAt time.Time) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.lock.ID != id {
+		return false, nil
+	}
+	s.lock.ExpiresAt = expiresAt
+	return true, nil
+}
+
+func (s *resourceFakeStore) ReleaseAIFAROrchestrationLockByID(id string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.lock.ID != id {
+		return false, nil
+	}
+	s.lock = store.AIFAROrchestrationLock{}
+	return true, nil
+}
+
+func (s *resourceFakeStore) ReleaseAIFAROrchestrationLock(instanceID, operation, serviceName string) (bool, error) {
+	return s.ReleaseAIFAROrchestrationLockByID(s.lock.ID)
+}
+
+func (s *resourceFakeStore) RecoverAIFAROrchestrationLocks(string, string) (int, error) {
+	return 0, nil
 }
 
 type barrierListStore struct {
@@ -246,6 +285,26 @@ type heartbeatBlockingRemote struct {
 	armed         chan struct{}
 	reached       chan struct{}
 	once          sync.Once
+}
+
+type acceptedThenHeartbeatLossRemote struct {
+	*fakeRemote
+	armed   chan struct{}
+	reached chan struct{}
+	once    sync.Once
+}
+
+func (r *acceptedThenHeartbeatLossRemote) Run(ctx context.Context, server store.Server, command string) (adapter.CommandResult, error) {
+	result, err := r.fakeRemote.Run(ctx, server, command)
+	if err == nil && strings.Contains(command, "aifar-agent apply-deployment --manifest") {
+		r.once.Do(func() {
+			close(r.reached)
+			close(r.armed)
+		})
+		<-ctx.Done()
+		return result, nil
+	}
+	return result, err
 }
 
 func (r *heartbeatBlockingRemote) Run(ctx context.Context, server store.Server, command string) (adapter.CommandResult, error) {
@@ -674,6 +733,10 @@ func (f *fakeStore) SaveAIFARDeploymentGeneration(next store.AIFARDeployment, ex
 	return next, nil
 }
 
+func (f *fakeStore) SaveAIFARDeploymentGenerationWithLock(_ string, next store.AIFARDeployment, expectedGeneration int64) (store.AIFARDeployment, error) {
+	return f.SaveAIFARDeploymentGeneration(next, expectedGeneration)
+}
+
 func (f *fakeStore) AcceptAIFARDeployment(instanceID, serviceName string, generation int64, status, conditionsJSON string, at time.Time) (store.AIFARDeployment, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -790,6 +853,71 @@ func (f *fakeStore) AcceptAIFARDeploymentWithLock(_ string, expected store.AIFAR
 		return current, nil
 	}
 	return store.AIFARDeployment{}, store.ErrAIFARDeploymentNotFound
+}
+
+func (f *fakeStore) SaveAIFARServiceInstallReplicaSetWithLock(_ string, expected store.AIFARDeployment, next store.AIFARReplicaSet) (store.AIFARReplicaSet, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	proof := false
+	for _, current := range f.deployments {
+		if current.InstanceID == expected.InstanceID && current.ServiceName == expected.ServiceName && current.Generation == expected.Generation && current.CurrentRevision == expected.CurrentRevision && current.SpecJSON == expected.SpecJSON && (strings.EqualFold(current.Status, "Accepted") || current.ObservedGeneration >= current.Generation) {
+			proof = true
+			break
+		}
+	}
+	if !proof {
+		return store.AIFARReplicaSet{}, store.ErrAIFARDeploymentGenerationConflict
+	}
+	if next.ID == "" {
+		next.ID = store.NewID("aifarrs")
+	}
+	for idx, existing := range f.replicaSets {
+		if existing.InstanceID == next.InstanceID && existing.ServiceName == next.ServiceName && existing.Revision == next.Revision {
+			f.replicaSets[idx] = next
+			return next, nil
+		}
+	}
+	f.replicaSets = append(f.replicaSets, next)
+	return next, nil
+}
+
+func (f *fakeStore) CommitAIFARServiceInstallWithLock(commit store.AIFARServiceInstallCommit) (store.AppInstance, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, expected := range commit.ExpectedDeployments {
+		proof := false
+		for _, current := range f.deployments {
+			if current.InstanceID == expected.InstanceID && current.ServiceName == expected.ServiceName && current.Generation == expected.Generation && current.CurrentRevision == expected.CurrentRevision && current.SpecJSON == expected.SpecJSON && (strings.EqualFold(current.Status, "Accepted") || current.ObservedGeneration >= current.Generation) {
+				proof = true
+				break
+			}
+		}
+		if !proof {
+			return store.AppInstance{}, store.ErrAIFARDeploymentGenerationConflict
+		}
+	}
+	instancesBefore := append([]store.AppInstance(nil), f.instances...)
+	saved, err := f.saveAppInstanceIfUnchangedLocked(commit.NextInstance, commit.ExpectedInstanceUpdatedAt)
+	if err != nil {
+		return store.AppInstance{}, err
+	}
+	f.releaseSaveCalls++
+	if f.failReleaseSaveOn > 0 && f.releaseSaveCalls == f.failReleaseSaveOn {
+		f.instances = instancesBefore
+		return store.AppInstance{}, errors.New("required release persistence failed")
+	}
+	release := commit.Release
+	if release.ID == "" {
+		release.ID = store.NewID("rel")
+	}
+	for idx, existing := range f.releases {
+		if existing.InstanceID == release.InstanceID && existing.ReleaseID == release.ReleaseID {
+			f.releases[idx] = release
+			return saved, nil
+		}
+	}
+	f.releases = append(f.releases, release)
+	return saved, nil
 }
 
 func (f *fakeStore) ListAIFARDeployments(instanceID string) ([]store.AIFARDeployment, error) {
@@ -1758,6 +1886,39 @@ func TestAutoscaleDoesNotTriggerWithoutMemoryLimitOrDuringCooldown(t *testing.T)
 	}
 }
 
+func TestAutoscaleRequiresCanonicalOnlineDeployment(t *testing.T) {
+	now := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
+	instance := installedAIFARInstance(t)
+	status := autoscaleStatus{Endpoints: []autoscaleMetric{{
+		Service:          "permission",
+		Container:        "stale-permission-pod",
+		Running:          true,
+		MemoryPercent:    95,
+		MemoryLimitBytes: 2 * 1024 * 1024 * 1024,
+	}}}
+	for _, tc := range []struct {
+		name    string
+		desired map[string]int
+	}{
+		{name: "offline deployment", desired: map[string]int{"permission": 0}},
+		{name: "missing deployment", desired: map[string]int{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			metadata := metadataFromInstance(instance)
+			metadata["autoscaleSignals"] = map[string]any{
+				"permission": map[string]any{"since": now.Add(-10 * time.Minute).Format(time.RFC3339)},
+			}
+			next, decision := evaluateAutoscale(instance, metadata, tc.desired, status, autoscalePolicyFromMetadata(metadata), now)
+			if decision.Service != "" {
+				t.Fatalf("stale metrics resurrected %s: %+v", tc.name, decision)
+			}
+			if _, exists := autoscaleSignalsFromMetadata(next)["permission"]; exists {
+				t.Fatalf("stale autoscale signal survived %s", tc.name)
+			}
+		})
+	}
+}
+
 func TestAutoscaleOutScriptRejectsLegacyAggregateMutation(t *testing.T) {
 	content, err := templateFS.ReadFile("templates/autoscale-out.sh")
 	if err != nil {
@@ -1800,7 +1961,7 @@ func TestScaleOutAdvancesOnlyCanonicalDeployment(t *testing.T) {
 		Reason:      "test",
 	}, fakeLogger{}, nil)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("service install failed: %v deployments=%+v", err, s.deployments)
 	}
 	after := deploymentsByService(s.deployments)
 	if got := after["permission"]; got.Generation != 4 || got.DesiredReplicas != 2 || got.Status != "Accepted" {
@@ -1991,6 +2152,51 @@ func TestAutoscalerAllowsDifferentServiceMutation(t *testing.T) {
 	}
 }
 
+func TestAutoscalerMetadataCASPreservesConcurrentFields(t *testing.T) {
+	db := openAIFARTestStore(t)
+	instance := installedAIFARInstance(t)
+	if _, err := db.SaveAppInstance(instance); err != nil {
+		t.Fatal(err)
+	}
+	staleMetadata := metadataFromInstance(instance)
+	staleMetadata["autoscaleMetrics"] = map[string]any{"permission-1": map[string]any{"memoryPercent": 91.0}}
+	staleMetadata["autoscaleSignals"] = map[string]any{"permission": map[string]any{"since": time.Now().UTC().Format(time.RFC3339)}}
+
+	current, err := db.GetAppInstance(instance.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	concurrent := metadataFromInstance(current)
+	concurrent["serviceRevisions"] = map[string]any{"file": "rev-peer"}
+	concurrent["orchestrationLocks"] = map[string]any{"file": map[string]any{"operation": "scale-service"}}
+	current.Metadata = mustMetadata(t, concurrent)
+	current.Status = "maintenance"
+	if _, err := db.SaveAppInstance(current); err != nil {
+		t.Fatal(err)
+	}
+
+	autoscaler := &Autoscaler{store: db}
+	if err := autoscaler.persistMetadata(instance.ID, staleMetadata, nil); err != nil {
+		t.Fatal(err)
+	}
+	saved, err := db.GetAppInstance(instance.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	savedMetadata := metadataFromInstance(saved)
+	revisions, _ := savedMetadata["serviceRevisions"].(map[string]any)
+	if saved.Status != "maintenance" || stringFromMetadata(revisions, "file", "") != "rev-peer" {
+		t.Fatalf("autoscale overwrote concurrent lifecycle/revision fields: %+v %s", saved, saved.Metadata)
+	}
+	locks, _ := savedMetadata["orchestrationLocks"].(map[string]any)
+	if _, ok := locks["file"]; !ok {
+		t.Fatalf("autoscale overwrote concurrent service lock: %s", saved.Metadata)
+	}
+	if _, ok := savedMetadata["autoscaleMetrics"]; !ok {
+		t.Fatalf("autoscale projection was not persisted: %s", saved.Metadata)
+	}
+}
+
 func TestAutoscalerTickStartsUnrelatedServiceDespiteServiceLock(t *testing.T) {
 	db := openAIFARTestStore(t)
 	instance := installedAIFARInstance(t)
@@ -2004,6 +2210,11 @@ func TestAutoscalerTickStartsUnrelatedServiceDespiteServiceLock(t *testing.T) {
 	}
 	if _, err := db.SaveServer(store.Server{ID: instance.ServerID, Name: "node-1", Host: "127.0.0.1", Username: "root"}); err != nil {
 		t.Fatal(err)
+	}
+	for _, deployment := range seedPerServiceDeployments(t, instance, map[string]int{"permission": 1}, nil) {
+		if _, err := db.SaveAIFARDeployment(deployment); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if _, err := db.AcquireAIFAROrchestrationLock(store.AIFAROrchestrationLock{
 		InstanceID: instance.ID, ServiceName: "file", Operation: "scale-service", ExpiresAt: now.Add(time.Hour),
@@ -2724,7 +2935,7 @@ func TestServiceInstallsAIFARServiceFromRuntimeV2Bundle(t *testing.T) {
 	if _, exists := metadata["runtimeSpecPath"]; exists {
 		t.Fatalf("new-model install metadata must not project a legacy aggregate runtime spec path: %s", instance.Metadata)
 	}
-	if metadata["orchestrationModel"] != orchestrationModelK8sLikeV1 || !strings.Contains(instance.Metadata, "agent-proxy") || strings.Contains(instance.Metadata, "aifar-svc-admin-gateway") || strings.Contains(instance.Metadata, "aifar-pod-admin-gateway") {
+	if metadata["orchestrationModel"] != orchestrationModelServiceControllerV1 || !strings.Contains(instance.Metadata, "agent-proxy") || strings.Contains(instance.Metadata, "aifar-svc-admin-gateway") || strings.Contains(instance.Metadata, "aifar-pod-admin-gateway") {
 		t.Fatalf("expected k8s-like agent proxy without fabricated pod metadata, got %s", instance.Metadata)
 	}
 	if len(s.releases) != 1 || s.releases[0].InstanceID != instance.ID || s.releases[0].Status != "success" {
@@ -2737,7 +2948,7 @@ func TestServiceInstallsAIFARServiceFromRuntimeV2Bundle(t *testing.T) {
 		t.Fatalf("expected external Nacos endpoint metadata, got %s", instance.Metadata)
 	}
 	for _, want := range []string{
-		`ORCHESTRATION_MODEL="agent-runtime-v2"`,
+		`ORCHESTRATION_MODEL="agent-service-controller-v1"`,
 		`AGENT_BINARY='/aifar/apps/_work/aifar-runtime-v2-`,
 		`install -m 0755 "$AGENT_BINARY" /usr/local/bin/aifar-agent`,
 		`installing or upgrading AIFAR runtime agent`,
@@ -3135,7 +3346,7 @@ func TestInstallReleaseRetentionFailureIsBestEffort(t *testing.T) {
 	}
 }
 
-func TestInstallRetryFailsClosedWhenFailedServiceInstallLeftExtraDesired(t *testing.T) {
+func TestInstallRetryFailsClosedAfterServiceInstallAddsDesired(t *testing.T) {
 	withFakeRuntimeAgentBinary(t)
 	bundleParent := createAIFARBundle(t)
 	resource := store.Resource{
@@ -3173,8 +3384,8 @@ func TestInstallRetryFailsClosedWhenFailedServiceInstallLeftExtraDesired(t *test
 	if err := service.InstallServices(context.Background(), InstallServicesRequest{
 		Instance: failedInstance, Server: server, Language: "en", Actor: "admin", TaskID: "failed-add-service",
 		Services: []string{"system"}, Reason: "reproduce interrupted add-service",
-	}, fakeLogger{}, nil); err == nil {
-		t.Fatal("add-service attempt must fail after leaving its extra desired row")
+	}, fakeLogger{}, nil); err != nil {
+		t.Fatalf("fenced add-service should publish its exact generation-1 desired row: %v", err)
 	}
 	withExtra, err := db.ListAIFARDeployments(failedInstance.ID)
 	if err != nil || len(withExtra) != len(originalDeployments)+1 {
@@ -3192,8 +3403,12 @@ func TestInstallRetryFailsClosedWhenFailedServiceInstallLeftExtraDesired(t *test
 	request.TaskID = "same-attempt-retry"
 	err = service.Install(context.Background(), request, []store.Resource{resource}, fakeLogger{}, nil)
 	var controlErr *deploymentControlError
-	if !errors.As(err, &controlErr) || controlErr.ReasonCode() != "AIFAR_RUNTIME_INSTALL_RETRY_SET_CHANGED" {
-		t.Fatalf("same-attempt retry error=%v, want repair-required exact-set conflict", err)
+	if !errors.As(err, &controlErr) || controlErr.ReasonCode() != "AIFAR_RUNTIME_INSTALL_RETRY_CONFIG_CHANGED" {
+		reason := ""
+		if controlErr != nil {
+			reason = controlErr.ReasonCode()
+		}
+		t.Fatalf("same-attempt retry error=%v reason=%s, want repair-required changed-config conflict", err, reason)
 	}
 	current, getErr := db.GetAppInstance(failedInstance.ID)
 	if getErr != nil || current.Status != "install_failed" {
@@ -3713,7 +3928,7 @@ func TestServiceInstallsMissingAIFARModulesAfterInitialInstall(t *testing.T) {
 		Reason:   "install missed services",
 	}, fakeLogger{}, nil)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("service install failed: %v deployments=%+v", err, s.deployments)
 	}
 	for _, want := range []string{
 		`AIFAR_SERVICE_INSTALL`,
@@ -3762,6 +3977,122 @@ func TestServiceInstallsMissingAIFARModulesAfterInitialInstall(t *testing.T) {
 	}
 	if len(s.releases) != 1 || !strings.Contains(s.releases[0].ManifestJSON, `"kind":"service-install"`) || !strings.Contains(s.releases[0].ManifestJSON, `"installedServices":["file","system"]`) {
 		t.Fatalf("expected service-install release manifest, got %+v", s.releases)
+	}
+}
+
+func TestInstallServicesHeartbeatLossCancelsRemoteAndSkipsAuthoritativeWrites(t *testing.T) {
+	db := openAIFARTestStore(t)
+	instance := installedAIFARInstance(t)
+	metadata := metadataFromInstance(instance)
+	metadata["services"] = []string{"gateway", "web-vue3"}
+	metadata["serviceCatalog"] = serviceCatalogMetadataForInstall(legacyServiceDefinitions(), defaultGatewayPort, defaultWebPort)
+	instance.Metadata = mustMetadata(t, metadata)
+	var err error
+	instance, err = db.SaveAppInstance(instance)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, err := db.SaveServer(store.Server{ID: "srv-1", Name: "node-1", Host: "10.0.0.10", DeployDir: "/aifar/apps"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, deployment := range seedPerServiceDeployments(t, instance, map[string]int{"gateway": 1, "web-vue3": 1}, nil) {
+		if _, err := db.SaveAIFARDeployment(deployment); err != nil {
+			t.Fatal(err)
+		}
+	}
+	bundleParent := createAIFARBundle(t)
+	resource := store.Resource{App: AppName, Part: "backend", Version: appBundleVersion, Path: filepath.Join(bundleParent, appBundleVersion, bundleManifestName)}
+	if err := db.UpsertResource(resource); err != nil {
+		t.Fatal(err)
+	}
+	renewals := &renewalFailureStore{Store: db, renewed: make(chan struct{}), armed: make(chan struct{})}
+	remote := &heartbeatBlockingRemote{fakeRemote: &fakeRemote{}, blockContains: "AIFAR_SERVICE_INSTALL", armed: renewals.armed, reached: make(chan struct{})}
+	service := NewService(renewals, remote)
+	service.orchestrationLockHeartbeatInterval = 5 * time.Millisecond
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- service.InstallServices(ctx, InstallServicesRequest{
+			Instance: instance, Server: server, Actor: "operator", TaskID: "service-install-renewal-loss",
+			Services: []string{"permission"}, Reason: "test lease loss",
+		}, fakeLogger{}, nil)
+	}()
+	requireHeartbeatRenewalCancellation(t, renewals.renewed, remote.reached, done, cancel)
+	deployments, err := db.ListAIFARDeployments(instance.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(deployments) != 2 {
+		t.Fatalf("lost service-install owner wrote desired state: %+v", deployments)
+	}
+	if replicaSets, _ := db.ListAIFARReplicaSets(instance.ID); len(replicaSets) != 0 {
+		t.Fatalf("lost service-install owner wrote ReplicaSets: %+v", replicaSets)
+	}
+	if releases, _ := db.ListAppReleases(instance.ID); len(releases) != 0 {
+		t.Fatalf("lost service-install owner wrote release: %+v", releases)
+	}
+	fresh, _ := db.GetAppInstance(instance.ID)
+	if fresh.Metadata != instance.Metadata || fresh.Status != instance.Status {
+		t.Fatalf("lost service-install owner overwrote instance: %+v", fresh)
+	}
+}
+
+func TestInstallServicesAgentAcceptedThenLockLossStaysPendingForwardOnly(t *testing.T) {
+	db := openAIFARTestStore(t)
+	instance := installedAIFARInstance(t)
+	metadata := metadataFromInstance(instance)
+	metadata["services"] = []string{"gateway"}
+	metadata["serviceCatalog"] = serviceCatalogMetadataForInstall(legacyServiceDefinitions(), defaultGatewayPort, defaultWebPort)
+	instance.Metadata = mustMetadata(t, metadata)
+	var err error
+	instance, err = db.SaveAppInstance(instance)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, err := db.SaveServer(store.Server{ID: "srv-1", Name: "node-1", Host: "10.0.0.10", DeployDir: "/aifar/apps"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, deployment := range seedPerServiceDeployments(t, instance, map[string]int{"gateway": 1}, nil) {
+		if _, err := db.SaveAIFARDeployment(deployment); err != nil {
+			t.Fatal(err)
+		}
+	}
+	bundleParent := createAIFARBundle(t)
+	if err := db.UpsertResource(store.Resource{App: AppName, Part: "backend", Version: appBundleVersion, Path: filepath.Join(bundleParent, appBundleVersion, bundleManifestName)}); err != nil {
+		t.Fatal(err)
+	}
+	renewals := &renewalFailureStore{Store: db, renewed: make(chan struct{}), armed: make(chan struct{})}
+	remote := &acceptedThenHeartbeatLossRemote{fakeRemote: &fakeRemote{}, armed: renewals.armed, reached: make(chan struct{})}
+	service := NewService(renewals, remote)
+	service.orchestrationLockHeartbeatInterval = 5 * time.Millisecond
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- service.InstallServices(ctx, InstallServicesRequest{Instance: instance, Server: server, Actor: "operator", TaskID: "accepted-then-lost", Services: []string{"permission"}}, fakeLogger{}, nil)
+	}()
+	requireHeartbeatRenewalCancellation(t, renewals.renewed, remote.reached, done, cancel)
+	deployments, err := db.ListAIFARDeployments(instance.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byService := deploymentsByService(deployments)
+	pending := byService["permission"]
+	if pending.Generation != 1 || pending.Status != "pending_acceptance" || strings.TrimSpace(pending.SpecJSON) == "" {
+		t.Fatalf("Agent-accepted manifest was rolled back or promoted after lock loss: %+v", pending)
+	}
+	if replicaSets, _ := db.ListAIFARReplicaSets(instance.ID); len(replicaSets) != 0 {
+		t.Fatalf("lost owner wrote ReplicaSet after Agent acceptance: %+v", replicaSets)
+	}
+	if releases, _ := db.ListAppReleases(instance.ID); len(releases) != 0 {
+		t.Fatalf("lost owner wrote release after Agent acceptance: %+v", releases)
+	}
+	fresh, _ := db.GetAppInstance(instance.ID)
+	if fresh.Metadata != instance.Metadata || fresh.Status != instance.Status {
+		t.Fatalf("lost owner overwrote instance after Agent acceptance: %+v", fresh)
 	}
 }
 
@@ -6094,6 +6425,27 @@ func TestServiceExpectationsUseOnlyPositiveDesiredReplicas(t *testing.T) {
 	}
 }
 
+func TestServiceControllerModelPredicateRejectsLegacyMigrationSource(t *testing.T) {
+	if !IsServiceControllerModel(orchestrationModelServiceControllerV1) {
+		t.Fatal("service-controller model must enable ordinary runtime entry points")
+	}
+	for _, model := range []string{"", orchestrationModelK8sLikeV1, legacyOrchestrationModel} {
+		if IsServiceControllerModel(model) {
+			t.Fatalf("legacy migration source %q must not be classified as service-controller model", model)
+		}
+	}
+}
+
+func TestServiceControllerMetadataGateAcceptsOnlyMigratedModel(t *testing.T) {
+	copy := UpdateCopy{LegacyUpdateUnsupported: "unsupported model %s"}
+	if err := ensureK8sLikeMetadata(map[string]any{"orchestrationModel": orchestrationModelServiceControllerV1}, copy); err != nil {
+		t.Fatalf("migrated service-controller model was rejected: %v", err)
+	}
+	if err := ensureK8sLikeMetadata(map[string]any{"orchestrationModel": orchestrationModelK8sLikeV1}, copy); err == nil {
+		t.Fatal("legacy agent-runtime-v2 migration source must not enter ordinary service-controller mutations")
+	}
+}
+
 func TestServiceExpectationsDoNotFallBackToLegacyMetadata(t *testing.T) {
 	if got := serviceExpectations(nil); len(got) != 0 {
 		t.Fatalf("missing canonical Deployments must not invent desired replicas, got %#v", got)
@@ -6113,6 +6465,9 @@ func TestServiceChecksAIFARServiceAndUpdatesStatus(t *testing.T) {
 		servers:   map[string]store.Server{"srv-1": {ID: "srv-1", Name: "app-1", Host: "10.0.0.10", DeployDir: "/aifar/apps"}},
 		instances: []store.AppInstance{instance},
 	}
+	concurrentMetadata := metadataFromInstance(s.instances[0])
+	concurrentMetadata["serviceRevisions"] = map[string]any{"file": "rev-peer"}
+	s.instances[0].Metadata = mustMetadata(t, concurrentMetadata)
 	remote := &fakeRemote{statusStdout: strings.Join([]string{
 		"status=degraded",
 		"installRootExists=true",
@@ -6129,8 +6484,21 @@ func TestServiceChecksAIFARServiceAndUpdatesStatus(t *testing.T) {
 	if result.Status != "degraded" {
 		t.Fatalf("expected degraded status, got %+v", result)
 	}
-	if len(s.instances) != 1 || s.instances[0].Status != "degraded" || !strings.Contains(s.instances[0].Metadata, "aifar-gateway") {
-		t.Fatalf("expected status to be persisted: %+v", s.instances)
+	if len(s.instances) != 1 || s.instances[0].Status != "installed" || !strings.Contains(s.instances[0].Metadata, "aifar-gateway") || !strings.Contains(s.instances[0].Metadata, "rev-peer") {
+		t.Fatalf("runtime observation must preserve install lifecycle status: %+v", s.instances)
+	}
+}
+
+func TestServiceCheckErrorPreservesInstallLifecycle(t *testing.T) {
+	instance := store.AppInstance{ID: "app-check-error", App: AppName, Version: "runtime-v2", ServerID: "srv-1", Status: "installed", Metadata: `{"installRoot":"/aifar/apps/admin","peer":"keep"}`}
+	s := &fakeStore{servers: map[string]store.Server{"srv-1": {ID: "srv-1", DeployDir: "/aifar/apps"}}, instances: []store.AppInstance{instance}}
+	remote := &fakeRemote{failCommandContains: "AIFAR_SERVICE_STATUS"}
+	_, err := NewService(s, remote).Check(context.Background(), CheckRequest{Instance: instance, Server: s.servers["srv-1"], Language: "en"}, fakeLogger{}, nil)
+	if err == nil {
+		t.Fatal("runtime check error was not returned")
+	}
+	if s.instances[0].Status != "installed" || !strings.Contains(s.instances[0].Metadata, `"peer":"keep"`) || !strings.Contains(s.instances[0].Metadata, `"lastCheck"`) {
+		t.Fatalf("runtime error changed lifecycle or peer metadata: %+v", s.instances[0])
 	}
 }
 
@@ -6260,7 +6628,7 @@ func TestStatusCommandScansK8sLikePodsAndAgentRuntime(t *testing.T) {
 	command := statusCommand("/aifar/apps/admin", serviceExpectations(nil))
 	for _, want := range []string{
 		`MODEL_FILE="$INSTALL_ROOT/.aifar/model.json"`,
-		`[ "$MODEL" = "agent-runtime-v2" ]`,
+		`[ "$MODEL" = "agent-service-controller-v1" ]`,
 		`aifar-agent status`,
 		`label=aifar.component=pod`,
 	} {

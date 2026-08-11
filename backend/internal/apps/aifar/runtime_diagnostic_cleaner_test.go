@@ -517,7 +517,7 @@ func newRuntimeDiagnosticCleanerFixture(t *testing.T) (*store.Store, *worker.Man
 	if _, err := db.SaveServer(store.Server{ID: "server-1", Name: "server", Host: "192.0.2.10", Username: "root", DeployDir: "/aifar/apps"}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.SaveAppInstance(store.AppInstance{ID: "instance-1", App: AppName, Version: "runtime-v2", ServerID: "server-1", Status: "running", Topology: "standalone", Metadata: `{"orchestrationModel":"agent-runtime-v2","installRoot":"/aifar/apps/admin"}`}); err != nil {
+	if _, err := db.SaveAppInstance(store.AppInstance{ID: "instance-1", App: AppName, Version: "runtime-v2", ServerID: "server-1", Status: "running", Topology: "standalone", Metadata: `{"orchestrationModel":"agent-service-controller-v1","installRoot":"/aifar/apps/admin"}`}); err != nil {
 		t.Fatal(err)
 	}
 	return db, worker.NewManager(db), &runtimeDiagnosticCleanerRemote{}, time.Date(2026, 7, 27, 8, 0, 0, 0, time.UTC)

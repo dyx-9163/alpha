@@ -127,6 +127,12 @@ type aifarInitialInstallFencedStore interface {
 	AcceptAIFARDeploymentWithLock(lockID string, expected store.AIFARDeployment, status, conditionsJSON string, at time.Time) (store.AIFARDeployment, error)
 }
 
+type aifarServiceInstallFencedStore interface {
+	aifarDeploymentLockFencedStore
+	SaveAIFARServiceInstallReplicaSetWithLock(lockID string, expected store.AIFARDeployment, next store.AIFARReplicaSet) (store.AIFARReplicaSet, error)
+	CommitAIFARServiceInstallWithLock(commit store.AIFARServiceInstallCommit) (store.AppInstance, error)
+}
+
 type aifarRuntimeCleanupStore interface {
 	PruneAIFARPodRecords(instanceID string, existingContainerNames []string) (int, error)
 	PruneAIFARServiceEndpointRecords(instanceID string, existingContainerNames []string) (int, error)
@@ -938,7 +944,7 @@ func installMetadata(server store.Server, installRoot, version, releaseID string
 	metadata := map[string]any{
 		"installRoot":           installRoot,
 		"runtimeDir":            runtimeDir,
-		"orchestrationModel":    orchestrationModelK8sLikeV1,
+		"orchestrationModel":    orchestrationModelServiceControllerV1,
 		"releasePhase":          releasePhaseActive,
 		"currentRevision":       releaseID,
 		"releaseId":             releaseID,
@@ -1113,7 +1119,7 @@ func (s Service) saveInitialControlPlaneDesired(lockID string, instance store.Ap
 		deployment := store.AIFARDeployment{
 			InstanceID: instance.ID, ServiceName: serviceName, DesiredReplicas: 1, CurrentRevision: revision,
 			StrategyJSON: string(strategyJSON), SpecJSON: string(specJSON), Generation: 1, ObservedGeneration: 0,
-			Status: "pending_acceptance", MetadataJSON: `{"model":"` + orchestrationModelK8sLikeV1 + `"}`,
+			Status: "pending_acceptance", MetadataJSON: `{"model":"` + orchestrationModelServiceControllerV1 + `"}`,
 			ConditionsJSON: pendingConditions, LastTransitionAt: now, CreatedAt: now,
 		}
 		deployments = append(deployments, deployment)
@@ -1183,7 +1189,7 @@ func saveControlPlaneRevision(orch aifarOrchestrationStore, instanceID, version,
 			CurrentRevision: revision,
 			StrategyJSON:    strategy,
 			Status:          "active",
-			MetadataJSON:    `{"model":"` + orchestrationModelK8sLikeV1 + `"}`,
+			MetadataJSON:    `{"model":"` + orchestrationModelServiceControllerV1 + `"}`,
 			CreatedAt:       now,
 		}); err != nil {
 			return err
@@ -1251,7 +1257,7 @@ func ensureK8sLikeMetadata(metadata map[string]any, copy UpdateCopy) error {
 	if value, ok := metadata["orchestrationModel"]; ok {
 		model = strings.TrimSpace(fmt.Sprint(value))
 	}
-	if model == orchestrationModelK8sLikeV1 {
+	if IsServiceControllerModel(model) {
 		return nil
 	}
 	if model == "" {
@@ -1349,7 +1355,7 @@ func rolloutOrchestrationMetadata(current map[string]any, installRoot, revision,
 			next[key] = value
 		}
 	}
-	next["orchestrationModel"] = orchestrationModelK8sLikeV1
+	next["orchestrationModel"] = orchestrationModelServiceControllerV1
 	next["releasePhase"] = releasePhaseActive
 	activeEndpoints := activeEndpointsFromMetadata(current)
 	serviceRevisions := serviceRevisionsFromMetadata(current)
@@ -2372,7 +2378,7 @@ func (s Service) Check(ctx context.Context, req CheckRequest, log Logger, target
 		msg := fmt.Sprintf(copy.CheckFailed, err)
 		logForServer.Error("%s", msg)
 		finishTarget(recorder, target, "failed", msg)
-		_ = s.markInstanceStatus(req.Instance, "error", map[string]any{"message": msg})
+		_ = s.recordInstanceObservation(req.Instance.ID, map[string]any{"message": msg})
 		return CheckResult{Status: "error", Message: msg}, err
 	}
 	details := map[string]any{
@@ -2397,7 +2403,7 @@ func (s Service) Check(ctx context.Context, req CheckRequest, log Logger, target
 		details["autoscaleMetrics"] = metricsMetadata(scaleStatus.Endpoints, time.Now().UTC())
 	}
 	if err := step(2, func() error {
-		return s.markInstanceStatus(req.Instance, status.Status, details)
+		return s.recordInstanceObservation(req.Instance.ID, details)
 	}); err != nil {
 		msg := fmt.Sprintf(copy.CheckFailed, err)
 		logForServer.Error("%s", msg)
@@ -2409,13 +2415,11 @@ func (s Service) Check(ctx context.Context, req CheckRequest, log Logger, target
 	return CheckResult{Status: status.Status, Message: status.Message, Details: details}, nil
 }
 
-func (s Service) markInstanceStatus(instance store.AppInstance, status string, details map[string]any) error {
-	metadata := metadataFromInstance(instance)
-	metadata["lastCheck"] = details
-	next, _ := json.Marshal(metadata)
-	instance.Status = status
-	instance.Metadata = string(next)
-	_, err := s.store.SaveAppInstance(instance)
+func (s Service) recordInstanceObservation(instanceID string, details map[string]any) error {
+	_, err := s.updateAppInstanceMetadata(instanceID, "AIFAR_RUNTIME_CHECK_METADATA_REPAIR_REQUIRED", func(metadata map[string]any) error {
+		metadata["lastCheck"] = details
+		return nil
+	})
 	return err
 }
 

@@ -45,6 +45,7 @@ type DeploymentMutationRequest struct {
 	TaskID             string
 	Operation          string
 	LockID             string
+	InitialDeployment  *store.AIFARDeployment
 	Mutate             func(*runtimeagent.DeploymentManifest) error
 }
 
@@ -109,7 +110,15 @@ func (s Service) MutateDeployment(ctx context.Context, req DeploymentMutationReq
 
 	current, err := loadDeploymentForMutation(control, req.Instance.ID, req.ServiceName)
 	if err != nil {
-		return store.AIFARDeployment{}, err
+		var missing *deploymentControlError
+		if req.Operation != "install-service" || req.ExpectedGeneration != 0 || strings.TrimSpace(req.LockID) == "" || req.InitialDeployment == nil || !errors.As(err, &missing) || missing.ReasonCode() != "AIFAR_RUNTIME_DEPLOYMENT_NOT_FOUND" {
+			return store.AIFARDeployment{}, err
+		}
+		current = *req.InitialDeployment
+		current.InstanceID = req.Instance.ID
+		current.ServiceName = req.ServiceName
+		current.Generation = 0
+		current.ObservedGeneration = 0
 	}
 	if current.Generation != req.ExpectedGeneration {
 		return current, deploymentError(deploymentGenerationConflictCode, deploymentGenerationConflictCode, "aifar.deploymentControl.generationConflict")
@@ -203,6 +212,9 @@ func (s Service) MutateDeployment(ctx context.Context, req DeploymentMutationReq
 	}
 	if !acceptanceMatches(acceptance, nextGeneration, specHash) {
 		return saved, repairRequired("AIFAR_RUNTIME_AGENT_ACCEPTANCE_MISMATCH", nil)
+	}
+	if err := ctx.Err(); err != nil {
+		return saved, repairRequired("AIFAR_RUNTIME_ORCHESTRATION_LOCK_LOST", err)
 	}
 	var accepted store.AIFARDeployment
 	if strings.TrimSpace(req.LockID) != "" {

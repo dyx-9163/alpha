@@ -722,7 +722,7 @@ func (r *runtimeDiagnosticContextReader) Read(p []byte) (int, error) {
 }
 
 func validateRuntimeDiagnosticEstimateRequest(req RuntimeDiagnosticRequest, diagnostics runtimeDiagnosticsStore) (string, []string, error) {
-	if req.Instance.App != AppName || stringFromMetadata(metadataFromInstance(req.Instance), "orchestrationModel", "") != orchestrationModelK8sLikeV1 {
+	if req.Instance.App != AppName || !IsServiceControllerModel(stringFromMetadata(metadataFromInstance(req.Instance), "orchestrationModel", "")) {
 		return "", nil, errors.New(i18n.Text(req.Language, "aifar.diag.instanceUnsupported"))
 	}
 	if strings.TrimSpace(req.Instance.ID) == "" || strings.TrimSpace(req.Server.ID) == "" || req.Instance.ServerID != req.Server.ID {
@@ -877,7 +877,7 @@ func (s Service) loadRuntimeDiagnosticArtifact(exportID, requestInstanceID, requ
 		return store.DiagnosticExport{}, store.AppInstance{}, store.Server{}, "", errors.New(i18n.Text(lang, "aifar.diag.serverMismatch"))
 	}
 	metadata := metadataFromInstance(instance)
-	if instance.App != AppName || stringFromMetadata(metadata, "orchestrationModel", "") != orchestrationModelK8sLikeV1 {
+	if instance.App != AppName || !IsServiceControllerModel(stringFromMetadata(metadata, "orchestrationModel", "")) {
 		return store.DiagnosticExport{}, store.AppInstance{}, store.Server{}, "", errors.New(i18n.Text(lang, "aifar.diag.instanceUnsupported"))
 	}
 	installRoot := path.Clean(stringFromMetadata(metadata, "installRoot", ""))

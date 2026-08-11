@@ -17,7 +17,7 @@ CREATED_AT={{ quote .CreatedAt }}
 CONFIG_HASH={{ quote .ConfigHash }}
 INGRESS_NETWORK={{ quote .IngressNetwork }}
 SERVICE_INSTALL_SUCCEEDED=0
-ORCHESTRATION_MODEL="agent-runtime-v2"
+ORCHESTRATION_MODEL="agent-service-controller-v1"
 
 RUNTIME_DIR="$INSTALL_ROOT/runtime"
 APP_DIR="$RUNTIME_DIR/services"
@@ -257,8 +257,8 @@ docker info >/dev/null 2>&1 || fail "docker daemon is not available"
 check_agent_dependency
 [ -d "$APP_DIR" ] || fail "AIFAR runtime app directory is missing"
 [ -d "$ENV_DIR" ] || fail "AIFAR runtime env directory is missing"
-[ -f "$INSTALL_ROOT/.aifar/model.json" ] || fail "AIFAR agent-runtime-v2 model manifest is missing"
-grep -q '"model"[[:space:]]*:[[:space:]]*"agent-runtime-v2"' "$INSTALL_ROOT/.aifar/model.json" || fail "AIFAR_RUNTIME_REINSTALL_REQUIRED: reinstall AIFAR with agent-runtime-v2"
+[ -f "$INSTALL_ROOT/.aifar/model.json" ] || fail "AIFAR service-controller model manifest is missing"
+grep -q '"model"[[:space:]]*:[[:space:]]*"agent-service-controller-v1"' "$INSTALL_ROOT/.aifar/model.json" || fail "AIFAR_RUNTIME_MIGRATION_REQUIRED: migrate AIFAR to agent-service-controller-v1"
 
 trap 'cleanup_failed_service_install' EXIT INT TERM
 java_start_command > "$ENV_DIR/java-entrypoint.sh"

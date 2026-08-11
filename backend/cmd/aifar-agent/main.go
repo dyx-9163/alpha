@@ -310,15 +310,15 @@ func newAgentHandler(manager *runtimeagent.Manager, healthCheck func(context.Con
 		if !decodeAgentJSON(w, r, &spec) {
 			return
 		}
-		if err := manager.EnsureLegacyRuntimeSpecEnabled(spec.InstanceID); err != nil {
+		if err := manager.RestartLegacyRuntimeSpec(r.Context(), spec); err != nil {
 			if errors.Is(err, runtimeagent.ErrLegacyRuntimeSpecDisabled) {
 				writeAgentError(w, http.StatusConflict, "LEGACY_RUNTIME_SPEC_DISABLED", "legacy runtime spec is disabled", nil)
 				return
 			}
-			writeAgentError(w, http.StatusBadRequest, "INVALID_LEGACY_RUNTIME_SPEC", "legacy runtime spec is invalid", nil)
-			return
-		}
-		if err := manager.RestartAll(r.Context(), spec); err != nil {
+			if errors.Is(err, runtimeagent.ErrInvalidLegacyRuntimeSpec) {
+				writeAgentError(w, http.StatusBadRequest, "INVALID_LEGACY_RUNTIME_SPEC", "legacy runtime spec is invalid", nil)
+				return
+			}
 			writeAgentError(w, http.StatusInternalServerError, "RUNTIME_RESTART_FAILED", "runtime restart failed", nil)
 			return
 		}

@@ -226,6 +226,7 @@ import {
 import { runtimePodLoadArgs } from '../containers/runtime/runtimePodLoading'
 import { mergeRuntimePodMetrics } from '../containers/runtime/runtimePodMetrics'
 import { createRuntimePodMetricsScheduler } from '../containers/runtime/runtimePodMetricsScheduler'
+import { isAifarServiceControllerModel } from '../containers/runtime/model'
 import {
   buildAifarServiceOptions,
   buildRuntimeLogPodOptions,
@@ -270,7 +271,6 @@ const { t } = useI18n()
 const { can, deniedText } = usePermissions()
 const taskProgress = useTaskProgressStore()
 const realtime = useRealtimeStore()
-const AIFAR_RUNTIME_MODEL = 'agent-runtime-v2'
 const selectedServerId = ref('')
 const servers = ref<any[]>([])
 const appInstances = ref<AppInstance[]>([])
@@ -489,7 +489,9 @@ const missingRuntimeServiceOptions = computed(() => aifarServiceOptions.value.fi
 const runtimeInstanceManageDisabledReason = computed(() => {
   if (!canManageApps.value) return deniedText.value
   if (!selectedRuntimeInstance.value) return t('containers.selectAifarInstance')
-  if (selectedRuntimeInstance.value.legacy) return t('containers.legacyRuntimeDisabled')
+  if (selectedRuntimeInstance.value.legacy || !isAifarServiceControllerModel(selectedRuntimeInstance.value.orchestrationModel)) {
+    return t('containers.legacyRuntimeDisabled')
+  }
   if (String(selectedRuntimeInstance.value.status || '').trim() === 'maintenance') return t('containers.runtimeInstanceMaintenanceDisabled')
   return ''
 })

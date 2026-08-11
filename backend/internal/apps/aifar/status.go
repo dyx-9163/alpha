@@ -122,11 +122,11 @@ if [ -f "$MODEL_FILE" ]; then
   RELEASE_ID="$(manifest_json_value "$MODEL_FILE" revision || true)"
 fi
 
-if [ "$MODEL" = "` + orchestrationModelK8sLikeV1 + `" ] && [ -z "$EXPECTED_SERVICES" ]; then
+if [ "$MODEL" = "` + orchestrationModelServiceControllerV1 + `" ] && [ -z "$EXPECTED_SERVICES" ]; then
   STATUS="offline"
 fi
 
-if command -v docker >/dev/null 2>&1 && [ "$MODEL" = "` + orchestrationModelK8sLikeV1 + `" ]; then
+if command -v docker >/dev/null 2>&1 && [ "$MODEL" = "` + orchestrationModelServiceControllerV1 + `" ]; then
   if command -v aifar-agent >/dev/null 2>&1 && aifar-agent status >/dev/null 2>&1; then
     INGRESS_RUNNING="true"
   fi

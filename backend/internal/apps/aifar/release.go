@@ -16,6 +16,7 @@ const (
 	releasePhaseActive                    = "active"
 	orchestrationModelK8sLikeV1           = "agent-runtime-v2"
 	orchestrationModelServiceControllerV1 = "agent-service-controller-v1"
+	ServiceControllerOrchestrationModel   = orchestrationModelServiceControllerV1
 	legacyOrchestrationModel              = "legacy-release-v1"
 	releaseKeepCount                      = 3
 	releaseEnvDirName                     = "env"
@@ -30,6 +31,10 @@ const (
 	defaultContactsPort   = 38032
 	defaultMeetingPort    = 38033
 )
+
+func IsServiceControllerModel(model string) bool {
+	return strings.TrimSpace(model) == orchestrationModelServiceControllerV1
+}
 
 func runtimeSpecPath(installRoot string) string {
 	return strings.TrimRight(installRoot, "/") + "/runtime/" + runtimeSpecDirName + "/runtime-spec.json"
@@ -327,7 +332,7 @@ func releaseOrchestrationMetadata(installRoot, releaseID, ingressNetwork string,
 	services = serviceListOrDefault(services)
 	activeEndpoints := map[string]any{}
 	return map[string]any{
-		"orchestrationModel": orchestrationModelK8sLikeV1,
+		"orchestrationModel": orchestrationModelServiceControllerV1,
 		"ingressNetwork":     ingressNetwork,
 		"runtimeService":     "aifar-agent",
 		"activeRoutes":       releaseRoutes(gatewayPort, webPort),
@@ -344,7 +349,7 @@ func releaseManifestFields(releaseID, ingressNetwork string, gatewayPort, webPor
 	services = serviceListOrDefault(services)
 	endpoints := map[string]any{}
 	return map[string]any{
-		"orchestrationModel": orchestrationModelK8sLikeV1,
+		"orchestrationModel": orchestrationModelServiceControllerV1,
 		"ingressNetwork":     ingressNetwork,
 		"containers":         map[string]any{},
 		"routes":             releaseRoutes(gatewayPort, webPort),

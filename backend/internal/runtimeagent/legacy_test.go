@@ -128,6 +128,66 @@ func TestBootstrapRuntimeSplitsLegacySpecWithoutNacos(t *testing.T) {
 	}
 }
 
+func TestRestartLegacyRuntimeSpecIsSerializedWithModelSwitch(t *testing.T) {
+	stateDir := t.TempDir()
+	runner := &blockingLegacyRestartRunner{
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	manager := NewManager(ManagerOptions{StateDir: stateDir, Runner: runner})
+	spec := legacyBootstrapTestSpec()
+	restartDone := make(chan error, 1)
+	go func() {
+		restartDone <- manager.RestartLegacyRuntimeSpec(context.Background(), spec)
+	}()
+	select {
+	case <-runner.entered:
+	case <-time.After(time.Second):
+		t.Fatal("legacy restart did not enter the remote action")
+	}
+	bootstrapDone := make(chan error, 1)
+	go func() {
+		_, err := manager.BootstrapLegacyRuntime(context.Background(), spec)
+		bootstrapDone <- err
+	}()
+	select {
+	case err := <-bootstrapDone:
+		t.Fatalf("model switch interleaved with legacy restart: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(runner.release)
+	if err := <-restartDone; err == nil {
+		t.Fatal("fake runner unexpectedly satisfied restart verification")
+	}
+	if err := <-bootstrapDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
+type blockingLegacyRestartRunner struct {
+	once    sync.Once
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (r *blockingLegacyRestartRunner) Run(ctx context.Context, name string, args ...string) (CommandResult, error) {
+	r.once.Do(func() {
+		close(r.entered)
+		select {
+		case <-r.release:
+		case <-ctx.Done():
+		}
+	})
+	call := name + " " + strings.Join(args, " ")
+	if strings.Contains(call, " inspect ") {
+		return CommandResult{Stdout: "true|healthy\n"}, nil
+	}
+	if strings.Contains(call, " ps ") {
+		return CommandResult{}, nil
+	}
+	return CommandResult{Stdout: "ok\n"}, nil
+}
+
 func TestBootstrapRuntimeConcurrentOnlyOneSucceeds(t *testing.T) {
 	manager := NewManager(ManagerOptions{StateDir: t.TempDir(), Runner: &fakeRunner{}})
 	var successes atomic.Int32

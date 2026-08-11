@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"aifar-deployment/backend/internal/adapter"
+	aifarapp "aifar-deployment/backend/internal/apps/aifar"
 	"aifar-deployment/backend/internal/apps/registry"
 	"aifar-deployment/backend/internal/i18n"
 	"aifar-deployment/backend/internal/runtimeagent"
@@ -23,8 +24,6 @@ import (
 
 	"github.com/go-chi/chi/v5"
 )
-
-const aifarK8sLikeModel = "agent-runtime-v2"
 
 type aifarRuntimeServiceCatalogEntry struct {
 	ServiceName string
@@ -575,8 +574,8 @@ func (a *API) resolveAIFARRuntimeLogQuery(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusBadRequest, "AIFAR_INSTANCE_REQUIRED", err.Error(), nil)
 		return store.Server{}, store.AppInstance{}, aifarRuntimeLogQuery{}, false
 	}
-	if strings.TrimSpace(runtimeString(runtimeMetadata(instance.Metadata), "orchestrationModel", "")) != aifarK8sLikeModel {
-		writeError(w, http.StatusConflict, "AIFAR_RUNTIME_REINSTALL_REQUIRED", "legacy AIFAR orchestration model does not support runtime log aggregation; reinstall with agent-runtime-v2", map[string]any{"instanceId": instance.ID})
+	if !aifarapp.IsServiceControllerModel(runtimeString(runtimeMetadata(instance.Metadata), "orchestrationModel", "")) {
+		writeError(w, http.StatusConflict, "AIFAR_RUNTIME_MIGRATION_REQUIRED", "legacy AIFAR orchestration model must be migrated before runtime log aggregation", map[string]any{"instanceId": instance.ID})
 		return store.Server{}, store.AppInstance{}, aifarRuntimeLogQuery{}, false
 	}
 	return server, instance, aifarRuntimeLogQuery{
@@ -1462,8 +1461,8 @@ func (a *API) resolveAIFARRuntimeActionTargetForInstanceWithAgent(w http.Respons
 		return store.Server{}, store.AppInstance{}, false
 	}
 	metadata := runtimeMetadata(instance.Metadata)
-	if strings.TrimSpace(runtimeString(metadata, "orchestrationModel", "")) != aifarK8sLikeModel {
-		writeError(w, http.StatusConflict, "AIFAR_RUNTIME_REINSTALL_REQUIRED", "legacy AIFAR orchestration model does not support this runtime action; reinstall with agent-runtime-v2", map[string]any{"instanceId": instance.ID})
+	if !aifarapp.IsServiceControllerModel(runtimeString(metadata, "orchestrationModel", "")) {
+		writeError(w, http.StatusConflict, "AIFAR_RUNTIME_MIGRATION_REQUIRED", "legacy AIFAR orchestration model must be migrated before this runtime action", map[string]any{"instanceId": instance.ID})
 		return store.Server{}, store.AppInstance{}, false
 	}
 	if requireAgent {
@@ -1492,7 +1491,7 @@ func (a *API) findAIFARInstanceForRuntimeAction(serverID, requestedID string) (s
 			}
 			continue
 		}
-		if strings.TrimSpace(runtimeString(runtimeMetadata(instance.Metadata), "orchestrationModel", "")) == aifarK8sLikeModel {
+		if aifarapp.IsServiceControllerModel(runtimeString(runtimeMetadata(instance.Metadata), "orchestrationModel", "")) {
 			candidates = append(candidates, instance)
 		}
 	}
@@ -1503,9 +1502,9 @@ func (a *API) findAIFARInstanceForRuntimeAction(serverID, requestedID string) (s
 		return candidates[0], nil
 	}
 	if len(candidates) == 0 {
-		return store.AppInstance{}, fmt.Errorf("no agent-runtime-v2 AIFAR instance was found on this server")
+		return store.AppInstance{}, fmt.Errorf("no agent-service-controller-v1 AIFAR instance was found on this server")
 	}
-	return store.AppInstance{}, fmt.Errorf("multiple agent-runtime-v2 AIFAR instances were found; instanceId is required")
+	return store.AppInstance{}, fmt.Errorf("multiple agent-service-controller-v1 AIFAR instances were found; instanceId is required")
 }
 
 func (a *API) buildAIFARRuntime(ctx context.Context, server store.Server, options aifarRuntimeBuildOptions) (aifarRuntimeResponse, error) {
@@ -1571,7 +1570,7 @@ func (a *API) appendAIFARInstanceRuntime(response *aifarRuntimeResponse, instanc
 	metadata := runtimeMetadata(instance.Metadata)
 	installRoot := normalizeRuntimeInstallRoot(runtimeString(metadata, "installRoot", ""))
 	model := strings.TrimSpace(runtimeString(metadata, "orchestrationModel", ""))
-	legacy := model != aifarK8sLikeModel
+	legacy := !aifarapp.IsServiceControllerModel(model)
 	response.Instances = append(response.Instances, aifarRuntimeInstance{
 		ID:                 instance.ID,
 		Version:            instance.Version,
@@ -1585,7 +1584,7 @@ func (a *API) appendAIFARInstanceRuntime(response *aifarRuntimeResponse, instanc
 	})
 	if legacy {
 		response.RuntimeStatus = degradedIfReady(response.RuntimeStatus)
-		response.Warnings = append(response.Warnings, "legacy AIFAR instance "+instance.ID+" requires reinstall with agent-runtime-v2")
+		response.Warnings = append(response.Warnings, "legacy AIFAR instance "+instance.ID+" requires migration to agent-service-controller-v1")
 		return
 	}
 	deployments, _ := a.store.ListAIFARDeployments(instance.ID)
@@ -2334,62 +2333,6 @@ func aifarRuntimeDockerPodStatus(row adapter.DockerContainer) (string, bool) {
 	}
 }
 
-func runtimeApplyDiscoveredServiceMetadata(metadata map[string]any, service string, desired int, pods []discoveredAIFARPod, endpoints []store.AIFARServiceEndpoint, services []string) bool {
-	changed := false
-	services = runtimeMergeServices(services, []string{service})
-	if !runtimeStringSliceEqual(runtimeServicesFromMetadata(metadata), services) {
-		metadata["services"] = services
-		changed = true
-	}
-	desiredMap := runtimeDesiredReplicasFromMetadata(metadata)
-	if desiredMap[service] != desired {
-		desiredMap[service] = desired
-		metadata["desiredReplicas"] = desiredMap
-		changed = true
-	}
-	endpointItems := runtimeEndpointMetadataFromStore(endpoints)
-	activeEndpoints := runtimeMapFromAny(metadata["activeEndpoints"])
-	if !runtimeJSONEqual(activeEndpoints[service], endpointItems) {
-		activeEndpoints[service] = endpointItems
-		metadata["activeEndpoints"] = activeEndpoints
-		changed = true
-	}
-	containers := runtimeMapFromAny(metadata["containers"])
-	if first := runtimeFirstDiscoveredContainer(pods); first != "" && cleanRuntimeText(fmt.Sprint(containers[service])) != first {
-		containers[service] = first
-		metadata["containers"] = containers
-		changed = true
-	}
-	revisions := runtimeMapFromAny(metadata["serviceRevisions"])
-	if revision := runtimeDiscoveredRevision(pods); revision != "" && cleanRuntimeText(fmt.Sprint(revisions[service])) != revision {
-		revisions[service] = revision
-		metadata["serviceRevisions"] = revisions
-		changed = true
-	}
-	activeServices := runtimeActiveServicesFromEndpointsForServices(desiredMap, activeEndpoints, services)
-	if !runtimeJSONEqual(metadata["activeServices"], activeServices) {
-		metadata["activeServices"] = activeServices
-		changed = true
-	}
-	return changed
-}
-
-func runtimeEndpointMetadataFromStore(endpoints []store.AIFARServiceEndpoint) []map[string]any {
-	out := make([]map[string]any, 0, len(endpoints))
-	for _, endpoint := range endpoints {
-		out = append(out, map[string]any{
-			"container": endpoint.ContainerName,
-			"releaseId": endpoint.Revision,
-			"revision":  endpoint.Revision,
-			"podId":     endpoint.PodID,
-			"replicaId": runtimeReplicaIDFromPodID(endpoint.PodID),
-			"port":      endpoint.Port,
-			"state":     endpoint.State,
-		})
-	}
-	return out
-}
-
 func aifarRuntimeEndpointMetadata(pod discoveredAIFARPod, port int) map[string]any {
 	return map[string]any{
 		"container": pod.ContainerName,
@@ -2400,18 +2343,6 @@ func aifarRuntimeEndpointMetadata(pod discoveredAIFARPod, port int) map[string]a
 		"port":      port,
 		"state":     "active",
 	}
-}
-
-func runtimeActiveServicesFromEndpointsForServices(desired map[string]int, endpoints map[string]any, services []string) map[string]any {
-	services = runtimeMergeServices(services)
-	out := make(map[string]any, len(services))
-	for _, service := range services {
-		out[service] = map[string]any{
-			"desiredReplicas": desired[service],
-			"activeEndpoints": endpoints[service],
-		}
-	}
-	return out
 }
 
 func runtimeDiscoveredServiceStatus(desired, ready int) string {
@@ -2425,16 +2356,6 @@ func runtimeDiscoveredServiceStatus(desired, ready int) string {
 		return "degraded"
 	}
 	return "ready"
-}
-
-func runtimeDiscoveredDesiredReplicas(pods []discoveredAIFARPod) int {
-	desired := len(pods)
-	for _, pod := range pods {
-		if pod.ReplicaID > desired {
-			desired = pod.ReplicaID
-		}
-	}
-	return desired
 }
 
 func runtimeDiscoveredReadyReplicas(pods []discoveredAIFARPod) int {
@@ -2479,36 +2400,6 @@ func runtimeDiscoveredImage(pods []discoveredAIFARPod) string {
 	return ""
 }
 
-func runtimeFirstDiscoveredContainer(pods []discoveredAIFARPod) string {
-	for _, pod := range pods {
-		if pod.Ready {
-			if name := cleanRuntimeText(pod.ContainerName); name != "" {
-				return name
-			}
-		}
-	}
-	for _, pod := range pods {
-		if name := cleanRuntimeText(pod.ContainerName); name != "" {
-			return name
-		}
-	}
-	return ""
-}
-
-func runtimeServicesFromMetadata(metadata map[string]any) []string {
-	switch raw := metadata["services"].(type) {
-	case []string:
-		return runtimeMergeServices(raw)
-	case []any:
-		values := make([]string, 0, len(raw))
-		for _, item := range raw {
-			values = append(values, fmt.Sprint(item))
-		}
-		return runtimeMergeServices(values)
-	}
-	return nil
-}
-
 func runtimeDeploymentServiceNames(deployments []store.AIFARDeployment) []string {
 	out := make([]string, 0, len(deployments))
 	for _, deployment := range deployments {
@@ -2545,38 +2436,6 @@ func runtimeMergeServices(groups ...[]string) []string {
 		out = append(out, service)
 	}
 	sort.Strings(out)
-	return out
-}
-
-func runtimeDesiredReplicasFromMetadata(metadata map[string]any) map[string]int {
-	out := map[string]int{}
-	switch raw := metadata["desiredReplicas"].(type) {
-	case map[string]int:
-		for key, value := range raw {
-			if value < 0 {
-				value = 0
-			}
-			out[key] = value
-		}
-	case map[string]any:
-		for key, value := range raw {
-			n := runtimeIntFromAny(value, 0)
-			if n < 0 {
-				n = 0
-			}
-			out[key] = n
-		}
-	}
-	return out
-}
-
-func runtimeMapFromAny(value any) map[string]any {
-	out := map[string]any{}
-	if raw, ok := value.(map[string]any); ok {
-		for key, item := range raw {
-			out[key] = item
-		}
-	}
 	return out
 }
 
@@ -2716,15 +2575,6 @@ func runtimeRevisionFromImage(image string) string {
 	return ""
 }
 
-func runtimeReplicaIDFromPodID(podID string) int {
-	index := strings.LastIndex(podID, "-r")
-	if index < 0 || index+2 >= len(podID) {
-		return 0
-	}
-	n, _ := strconv.Atoi(podID[index+2:])
-	return n
-}
-
 func runtimePositiveInt(value string, fallback int) int {
 	n, err := strconv.Atoi(strings.TrimSpace(value))
 	if err != nil || n <= 0 {
@@ -2774,30 +2624,6 @@ func runtimeMarshalJSON(value any) string {
 		return "{}"
 	}
 	return string(raw)
-}
-
-func runtimeJSONEqual(a, b any) bool {
-	left, err := json.Marshal(a)
-	if err != nil {
-		return false
-	}
-	right, err := json.Marshal(b)
-	if err != nil {
-		return false
-	}
-	return string(left) == string(right)
-}
-
-func runtimeStringSliceEqual(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
 }
 
 func sanitizeRuntimeIdentifier(value string) string {

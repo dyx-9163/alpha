@@ -78,6 +78,7 @@ func (s Service) InstallServices(ctx context.Context, req InstallServicesRequest
 	var script string
 	var serviceDefinitions []serviceDefinition
 	var acceptedRevisions map[string]string
+	var acceptedDeployments []store.AIFARDeployment
 	var moduleArchiveLocal string
 	var moduleArchiveRemote string
 	var workDir string
@@ -151,6 +152,8 @@ func (s Service) InstallServices(ctx context.Context, req InstallServicesRequest
 		return err
 	}
 	defer s.releaseOrchestrationLock(lock)
+	lockedCtx, stopHeartbeat := s.startAIFAROrchestrationLockHeartbeat(ctx, lock)
+	defer stopHeartbeat()
 
 	if err := step(2, func() error {
 		var err error
@@ -205,23 +208,23 @@ func (s Service) InstallServices(ctx context.Context, req InstallServicesRequest
 	if err := step(3, func() error {
 		logForServer.Info("installing AIFAR services: %s", strings.Join(missing, ", "))
 		if moduleArchiveLocal != "" {
-			if _, err := installerkit.Run(ctx, s.remote, req.Server, "mkdir -p "+installerkit.ShellQuote(workDir)+" "+installerkit.ShellQuote(installRoot+"/runtime/services"), logForServer, "prepare AIFAR service module upload failed"); err != nil {
+			if _, err := installerkit.Run(lockedCtx, s.remote, req.Server, "mkdir -p "+installerkit.ShellQuote(workDir)+" "+installerkit.ShellQuote(installRoot+"/runtime/services"), logForServer, "prepare AIFAR service module upload failed"); err != nil {
 				return err
 			}
-			if err := uploadkit.Upload(ctx, s.remote, req.Server, uploadkit.File{LocalPath: moduleArchiveLocal, RemotePath: moduleArchiveRemote, LogMessage: "uploading AIFAR service modules", FailureMessage: "upload AIFAR service modules failed"}, logForServer); err != nil {
+			if err := uploadkit.Upload(lockedCtx, s.remote, req.Server, uploadkit.File{LocalPath: moduleArchiveLocal, RemotePath: moduleArchiveRemote, LogMessage: "uploading AIFAR service modules", FailureMessage: "upload AIFAR service modules failed"}, logForServer); err != nil {
 				return err
 			}
-			if _, err := installerkit.Run(ctx, s.remote, req.Server, "tar -xzf "+installerkit.ShellQuote(moduleArchiveRemote)+" -C "+installerkit.ShellQuote(installRoot+"/runtime/services"), logForServer, "extract AIFAR service modules failed"); err != nil {
+			if _, err := installerkit.Run(lockedCtx, s.remote, req.Server, "tar -xzf "+installerkit.ShellQuote(moduleArchiveRemote)+" -C "+installerkit.ShellQuote(installRoot+"/runtime/services"), logForServer, "extract AIFAR service modules failed"); err != nil {
 				return err
 			}
 		}
 		if len(prepareServices) > 0 {
-			if _, runErr := installerkit.Run(ctx, s.remote, req.Server, "sh -s <<'AIFAR_SERVICE_INSTALL'\n"+script+"\nAIFAR_SERVICE_INSTALL", logForServer, "AIFAR service installation failed"); runErr != nil {
+			if _, runErr := installerkit.Run(lockedCtx, s.remote, req.Server, "sh -s <<'AIFAR_SERVICE_INSTALL'\n"+script+"\nAIFAR_SERVICE_INSTALL", logForServer, "AIFAR service installation failed"); runErr != nil {
 				return runErr
 			}
 		}
 		var acceptErr error
-		acceptedRevisions, acceptErr = s.acceptInstalledServiceManifests(ctx, req, current, metadata, allServices, missing, serviceDefinitions, releaseID, version, configHash, releaseTime, logForServer)
+		acceptedRevisions, acceptedDeployments, acceptErr = s.acceptInstalledServiceManifests(lockedCtx, req, current, metadata, allServices, missing, serviceDefinitions, releaseID, version, configHash, releaseTime, lock, logForServer)
 		return acceptErr
 	}); err != nil {
 		finishTarget(recorder, target, "failed", err.Error())
@@ -229,48 +232,48 @@ func (s Service) InstallServices(ctx context.Context, req InstallServicesRequest
 	}
 
 	if err := step(4, func() error {
-		nextMetadata := metadataFromInstance(current)
-		nextMetadata["releaseId"] = releaseID
-		nextMetadata["currentRevision"] = releaseID
-		nextMetadata["releaseVersion"] = version
-		nextMetadata["releaseCreatedAt"] = releaseTime.Format(time.RFC3339)
-		nextMetadata["configHash"] = configHash
-		nextMetadata["serviceCatalog"] = serviceCatalogMetadataForInstall(serviceDefinitions, gatewayPort, webPort)
-		nextMetadata = serviceInstallOrchestrationMetadata(nextMetadata, installRoot, ingressNetwork, gatewayPort, webPort, missing, acceptedRevisions)
-		nextMetadata["lastServiceInstall"] = map[string]any{
-			"services":    missing,
-			"releaseId":   releaseID,
-			"installedAt": releaseTime.Format(time.RFC3339),
-			"reason":      strings.TrimSpace(req.Reason),
+		fenced, ok := s.store.(aifarServiceInstallFencedStore)
+		if !ok {
+			return repairRequired("AIFAR_RUNTIME_ORCHESTRATION_LOCK_FENCE_UNAVAILABLE", nil)
 		}
-		delete(nextMetadata, "orchestrationLock")
-		next := current
-		next.Status = "installed"
-		next.Version = version
-		if err := saveMetadata(s.store, next, nextMetadata); err != nil {
+		for attempt := 0; attempt < appInstanceMetadataCASAttempts; attempt++ {
+			if err := s.ensureAIFAROrchestrationLockOwnership(lockedCtx, lock); err != nil {
+				return err
+			}
+			fresh, err := s.store.GetAppInstance(current.ID)
+			if err != nil {
+				return err
+			}
+			nextMetadata := metadataFromInstance(fresh)
+			nextMetadata["releaseId"] = releaseID
+			nextMetadata["currentRevision"] = releaseID
+			nextMetadata["releaseVersion"] = version
+			nextMetadata["releaseCreatedAt"] = releaseTime.Format(time.RFC3339)
+			nextMetadata["configHash"] = configHash
+			nextMetadata["serviceCatalog"] = serviceCatalogMetadataForInstall(serviceDefinitions, gatewayPort, webPort)
+			nextMetadata = serviceInstallOrchestrationMetadata(nextMetadata, installRoot, ingressNetwork, gatewayPort, webPort, missing, acceptedRevisions)
+			nextMetadata["lastServiceInstall"] = map[string]any{"services": missing, "releaseId": releaseID, "installedAt": releaseTime.Format(time.RFC3339), "reason": strings.TrimSpace(req.Reason)}
+			delete(nextMetadata, "orchestrationLock")
+			next := fresh
+			next.Version = version
+			next.Metadata = mustJSONMetadata(nextMetadata)
+			manifest, _ := json.Marshal(serviceInstallReleaseManifest(version, releaseID, releaseTime, configHash, strings.TrimSpace(req.Reason), missing, nextMetadata))
+			_, err = fenced.CommitAIFARServiceInstallWithLock(store.AIFARServiceInstallCommit{
+				LockID: lock.ID, ExpectedDeployments: acceptedDeployments, NextInstance: next, ExpectedInstanceUpdatedAt: fresh.UpdatedAt,
+				Release: store.AppRelease{InstanceID: current.ID, App: AppName, Version: version, ReleaseID: releaseID, ServerID: target, Status: "success", ManifestJSON: string(manifest), ConfigHash: configHash, CreatedAt: releaseTime, ActivatedAt: releaseTime},
+			})
+			if err == nil {
+				return nil
+			}
+			if errors.Is(err, store.ErrAppInstanceConflict) {
+				continue
+			}
+			if errors.Is(err, store.ErrAIFAROrchestrationLockOwnership) {
+				return repairRequired("AIFAR_RUNTIME_ORCHESTRATION_LOCK_LOST", err)
+			}
 			return err
 		}
-		if releases, ok := s.store.(releaseStore); ok {
-			manifest, _ := json.Marshal(serviceInstallReleaseManifest(version, releaseID, releaseTime, configHash, strings.TrimSpace(req.Reason), missing, nextMetadata))
-			if _, err := releases.SaveAppRelease(store.AppRelease{
-				InstanceID:   current.ID,
-				App:          AppName,
-				Version:      version,
-				ReleaseID:    releaseID,
-				ServerID:     target,
-				Status:       "success",
-				ManifestJSON: string(manifest),
-				ConfigHash:   configHash,
-				CreatedAt:    releaseTime,
-				ActivatedAt:  releaseTime,
-			}); err != nil {
-				return err
-			}
-			if _, err := releases.DeleteOldAppReleases(current.ID, releaseKeepCount); err != nil {
-				return err
-			}
-		}
-		return nil
+		return repairRequired("AIFAR_SERVICE_INSTALL_METADATA_CONFLICT", store.ErrAppInstanceConflict)
 	}); err != nil {
 		finishTarget(recorder, target, "failed", err.Error())
 		return err
@@ -386,16 +389,17 @@ func (s Service) acceptInstalledServiceManifests(
 	definitions []serviceDefinition,
 	revision, version, configHash string,
 	now time.Time,
+	lock store.AIFAROrchestrationLock,
 	log Logger,
-) (map[string]string, error) {
+) (map[string]string, []store.AIFARDeployment, error) {
 	control, controlOK := s.store.(aifarDeploymentControlStore)
-	orch, orchOK := s.store.(aifarOrchestrationStore)
-	if !controlOK || !orchOK {
-		return nil, errors.New("AIFAR per-service deployment control store is unavailable")
+	fenced, fencedOK := s.store.(aifarServiceInstallFencedStore)
+	if !controlOK || !fencedOK {
+		return nil, nil, errors.New("AIFAR per-service deployment control store is unavailable")
 	}
 	deployments, err := control.ListAIFARDeployments(current.ID)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	byService := make(map[string]store.AIFARDeployment, len(deployments))
 	for _, deployment := range deployments {
@@ -408,47 +412,53 @@ func (s Service) acceptInstalledServiceManifests(
 	mutationInstance := current
 	mutationInstance.Metadata = mustJSONMetadata(mutationMetadata)
 	acceptedRevisions := make(map[string]string, len(missing))
+	acceptedDeployments := make([]store.AIFARDeployment, 0, len(missing))
 	for _, serviceName := range missing {
 		deployment, exists := byService[serviceName]
 		if exists && deploymentHasAcceptedDesired(deployment) {
 			acceptedRevisions[serviceName] = deployment.CurrentRevision
-			if err := saveAcceptedServiceReplicaSet(orch, current.ID, serviceName, deployment.CurrentRevision, version, configHash, now); err != nil {
-				return nil, err
+			acceptedDeployments = append(acceptedDeployments, deployment)
+			if err := ctx.Err(); err != nil {
+				return nil, nil, repairRequired("AIFAR_RUNTIME_ORCHESTRATION_LOCK_LOST", err)
+			}
+			if err := saveAcceptedServiceReplicaSet(fenced, lock.ID, deployment, version, configHash, now); err != nil {
+				return nil, nil, err
 			}
 			continue
 		}
 
 		if exists && deployment.Generation > 0 {
 			if deployment.Status != "pending_acceptance" || strings.TrimSpace(deployment.SpecJSON) == "" {
-				return nil, repairRequired("AIFAR_RUNTIME_INSTALL_RETRY_STATE_INVALID", nil)
+				return nil, nil, repairRequired("AIFAR_RUNTIME_INSTALL_RETRY_STATE_INVALID", nil)
 			}
-			accepted, err := s.resumePendingServiceInstall(ctx, req, mutationInstance, deployment, log)
+			accepted, err := s.resumePendingServiceInstall(ctx, req, mutationInstance, deployment, lock, log)
 			if err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 			byService[serviceName] = accepted
 			acceptedRevisions[serviceName] = accepted.CurrentRevision
-			if err := saveAcceptedServiceReplicaSet(orch, current.ID, serviceName, accepted.CurrentRevision, version, configHash, now); err != nil {
-				return nil, err
+			acceptedDeployments = append(acceptedDeployments, accepted)
+			if err := ctx.Err(); err != nil {
+				return nil, nil, repairRequired("AIFAR_RUNTIME_ORCHESTRATION_LOCK_LOST", err)
+			}
+			if err := saveAcceptedServiceReplicaSet(fenced, lock.ID, accepted, version, configHash, now); err != nil {
+				return nil, nil, err
 			}
 			continue
 		}
 
 		attemptMetadata, err := encodeServiceInstallAttempt(serviceInstallAttempt{Revision: revision, Version: version, ConfigHash: configHash, CreatedAt: now})
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		base := store.AIFARDeployment{
 			InstanceID: current.ID, ServiceName: serviceName, DesiredReplicas: 1,
 			CurrentRevision: revision, Status: "install_prepared", MetadataJSON: attemptMetadata, CreatedAt: now,
 		}
-		base, err = orch.SaveAIFARDeployment(base)
-		if err != nil {
-			return nil, err
-		}
 		accepted, err := s.MutateDeployment(ctx, DeploymentMutationRequest{
 			Instance: mutationInstance, Server: req.Server, ServiceName: serviceName,
 			ExpectedGeneration: 0, Actor: req.Actor, TaskID: req.TaskID, Operation: "install-service",
+			LockID: lock.ID, InitialDeployment: &base,
 			Mutate: func(manifest *runtimeagent.DeploymentManifest) error {
 				manifest.Spec.Replicas = 1
 				manifest.Spec.PodRevision = revision
@@ -457,19 +467,22 @@ func (s Service) acceptInstalledServiceManifests(
 			},
 		}, log)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		byService[serviceName] = accepted
 		acceptedRevisions[serviceName] = accepted.CurrentRevision
-		if err := saveAcceptedServiceReplicaSet(orch, current.ID, serviceName, accepted.CurrentRevision, version, configHash, now); err != nil {
-			return nil, err
+		acceptedDeployments = append(acceptedDeployments, accepted)
+		if err := ctx.Err(); err != nil {
+			return nil, nil, repairRequired("AIFAR_RUNTIME_ORCHESTRATION_LOCK_LOST", err)
+		}
+		if err := saveAcceptedServiceReplicaSet(fenced, lock.ID, accepted, version, configHash, now); err != nil {
+			return nil, nil, err
 		}
 	}
-	return acceptedRevisions, nil
+	return acceptedRevisions, acceptedDeployments, nil
 }
 
-func (s Service) resumePendingServiceInstall(ctx context.Context, req InstallServicesRequest, instance store.AppInstance, pending store.AIFARDeployment, log Logger) (store.AIFARDeployment, error) {
-	control := s.store.(aifarDeploymentControlStore)
+func (s Service) resumePendingServiceInstall(ctx context.Context, req InstallServicesRequest, instance store.AppInstance, pending store.AIFARDeployment, lock store.AIFAROrchestrationLock, log Logger) (store.AIFARDeployment, error) {
 	manifest, err := buildRuntimeManifest(instance, pending, pending.Generation)
 	if err != nil {
 		return pending, repairRequired("AIFAR_RUNTIME_MANIFEST_BUILD_FAILED", err)
@@ -495,7 +508,14 @@ func (s Service) resumePendingServiceInstall(ctx context.Context, req InstallSer
 	if !acceptanceMatches(acceptance, pending.Generation, hash) {
 		return pending, repairRequired("AIFAR_RUNTIME_AGENT_ACCEPTANCE_MISMATCH", nil)
 	}
-	accepted, err := markDeploymentAccepted(control, pending, pending.Generation)
+	if err := ctx.Err(); err != nil {
+		return pending, repairRequired("AIFAR_RUNTIME_ORCHESTRATION_LOCK_LOST", err)
+	}
+	fenced, ok := s.store.(aifarDeploymentLockFencedStore)
+	if !ok {
+		return pending, repairRequired("AIFAR_RUNTIME_ORCHESTRATION_LOCK_FENCE_UNAVAILABLE", nil)
+	}
+	accepted, err := markDeploymentAcceptedWithLock(fenced, lock.ID, pending, pending.Generation)
 	if err != nil {
 		return pending, repairRequired("AIFAR_RUNTIME_CONTROL_STORE_ACCEPT_FAILED", err)
 	}
@@ -505,16 +525,13 @@ func (s Service) resumePendingServiceInstall(ctx context.Context, req InstallSer
 	return accepted, nil
 }
 
-func saveAcceptedServiceReplicaSet(orch aifarOrchestrationStore, instanceID, serviceName, revision, version, configHash string, now time.Time) error {
-	_, err := orch.SaveAIFARReplicaSet(store.AIFARReplicaSet{
-		InstanceID: instanceID, ServiceName: serviceName, Revision: revision,
-		Image: "aifar-" + serviceName + ":" + revision, ArtifactHash: configHash,
+func saveAcceptedServiceReplicaSet(fenced aifarServiceInstallFencedStore, lockID string, expected store.AIFARDeployment, version, configHash string, now time.Time) error {
+	_, err := fenced.SaveAIFARServiceInstallReplicaSetWithLock(lockID, expected, store.AIFARReplicaSet{
+		InstanceID: expected.InstanceID, ServiceName: expected.ServiceName, Revision: expected.CurrentRevision,
+		Image: "aifar-" + expected.ServiceName + ":" + expected.CurrentRevision, ArtifactHash: configHash,
 		DesiredPods: 1, ReadyPods: 0, Status: "pending", MetadataJSON: fmt.Sprintf(`{"version":%q}`, version), CreatedAt: now,
 	})
-	if err != nil {
-		return err
-	}
-	return orch.ReplaceAIFARServiceEndpoints(instanceID, serviceName, nil)
+	return err
 }
 
 func mustJSONMetadata(metadata map[string]any) string {
@@ -627,7 +644,7 @@ func serviceInstallOrchestrationMetadata(current map[string]any, installRoot, in
 	existing := servicesFromMetadata(current)
 	allServices := mergeServices(existing, installedServices)
 	next["services"] = allServices
-	next["orchestrationModel"] = orchestrationModelK8sLikeV1
+	next["orchestrationModel"] = orchestrationModelServiceControllerV1
 	next["releasePhase"] = releasePhaseActive
 	next["runtimeService"] = "aifar-agent"
 	next["ingressNetwork"] = ingressNetwork
