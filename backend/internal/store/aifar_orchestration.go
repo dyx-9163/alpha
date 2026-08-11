@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -1213,7 +1214,6 @@ func (s *Store) PruneAIFARServiceEndpointRecords(instanceID string, existingCont
 }
 
 func (s *Store) AcquireAIFAROrchestrationLock(v AIFAROrchestrationLock) (AIFAROrchestrationLock, error) {
-	now := time.Now().UTC()
 	v.InstanceID = strings.TrimSpace(v.InstanceID)
 	v.ServiceName = strings.TrimSpace(v.ServiceName)
 	v.Operation = strings.TrimSpace(v.Operation)
@@ -1225,6 +1225,12 @@ func (s *Store) AcquireAIFAROrchestrationLock(v AIFAROrchestrationLock) (AIFAROr
 	if v.ID == "" {
 		v.ID = NewID("aifarlock")
 	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return v, err
+	}
+	defer tx.Rollback()
+	now := time.Now().UTC()
 	if v.StartedAt.IsZero() {
 		v.StartedAt = now
 	}
@@ -1236,12 +1242,6 @@ func (s *Store) AcquireAIFAROrchestrationLock(v AIFAROrchestrationLock) (AIFAROr
 	}
 	v.UpdatedAt = now
 	v.Status = "active"
-
-	tx, err := s.db.Begin()
-	if err != nil {
-		return v, err
-	}
-	defer tx.Rollback()
 	if err := expireAIFAROrchestrationLocks(tx, now); err != nil {
 		return v, err
 	}
@@ -1287,11 +1287,20 @@ func (s *Store) ReleaseAIFAROrchestrationLockByID(id string) (bool, error) {
 }
 
 func (s *Store) RenewAIFAROrchestrationLock(id string, expiresAt time.Time) (bool, error) {
+	conn, err := s.db.Conn(context.Background())
+	if err != nil {
+		return false, err
+	}
+	defer conn.Close()
 	now := time.Now().UTC()
-	res, err := s.db.Exec(`update aifar_orchestration_locks
+	expiresAt = expiresAt.UTC()
+	if !expiresAt.After(now) {
+		return false, nil
+	}
+	res, err := conn.ExecContext(context.Background(), `update aifar_orchestration_locks
 		set expires_at=?, updated_at=?
 		where id=? and status='active' and expires_at > ?`,
-		expiresAt.UTC(), now, strings.TrimSpace(id), now)
+		expiresAt, now, strings.TrimSpace(id), now)
 	if err != nil {
 		return false, err
 	}

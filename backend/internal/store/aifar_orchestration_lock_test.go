@@ -78,6 +78,122 @@ func TestAIFAROrchestrationLocksRenewOnlyActiveUnexpiredLocks(t *testing.T) {
 	}
 }
 
+func TestAIFAROrchestrationLockQueuedRenewalCannotReviveExpiredOwner(t *testing.T) {
+	db := openTestStore(t)
+	now := time.Now().UTC()
+	owner := testAIFAROrchestrationLock("instance-1", "permission", "scale")
+	owner.ID = "queued-renewal-owner"
+	owner.StartedAt = now.Add(-time.Hour)
+	owner.ExpiresAt = now.Add(2 * time.Second)
+	if _, err := db.AcquireAIFAROrchestrationLock(owner); err != nil {
+		t.Fatal(err)
+	}
+
+	// Reserve the Store's sole connection. WaitCount proves renewal queued while
+	// the lease was still live; releasing only after expiry exercises the actual
+	// execution boundary instead of an already-expired fast path.
+	blocker, err := db.db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	baselineWaitCount := db.db.Stats().WaitCount
+	type renewResult struct {
+		renewed bool
+		err     error
+	}
+	resultCh := make(chan renewResult, 1)
+	go func() {
+		renewed, renewErr := db.RenewAIFAROrchestrationLock(owner.ID, owner.ExpiresAt.Add(time.Hour))
+		resultCh <- renewResult{renewed: renewed, err: renewErr}
+	}()
+	deadline := owner.ExpiresAt.Add(-500 * time.Millisecond)
+	for db.db.Stats().WaitCount <= baselineWaitCount && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if db.db.Stats().WaitCount <= baselineWaitCount {
+		_ = blocker.Rollback()
+		<-resultCh
+		t.Fatal("renewal did not reach the sole-connection wait before expiry")
+	}
+	if observed := time.Now().UTC(); !observed.Before(owner.ExpiresAt) {
+		_ = blocker.Rollback()
+		<-resultCh
+		t.Fatalf("renewal reached the connection wait too late: observed=%s expires=%s", observed, owner.ExpiresAt)
+	}
+	if wait := time.Until(owner.ExpiresAt.Add(25 * time.Millisecond)); wait > 0 {
+		time.Sleep(wait)
+	}
+	if err := blocker.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	result := <-resultCh
+	if result.err != nil || result.renewed {
+		t.Fatalf("post-expiry queued renewal revived owner: renewed=%v err=%v", result.renewed, result.err)
+	}
+
+	successor := testAIFAROrchestrationLock(owner.InstanceID, owner.ServiceName, "offline")
+	successor.ID = "queued-renewal-successor"
+	acquired, err := db.AcquireAIFAROrchestrationLock(successor)
+	if err != nil {
+		t.Fatalf("successor could not acquire after expired renewal was rejected: %v", err)
+	}
+	if acquired.ID != successor.ID {
+		t.Fatalf("successor id=%q, want %q", acquired.ID, successor.ID)
+	}
+}
+
+func TestAIFAROrchestrationLockRenewalRejectsRequestedExpiryAtExecutionTime(t *testing.T) {
+	db := openTestStore(t)
+	now := time.Now().UTC()
+	owner := testAIFAROrchestrationLock("instance-1", "permission", "scale")
+	owner.ID = "queued-short-renewal-owner"
+	owner.StartedAt = now.Add(-time.Hour)
+	owner.ExpiresAt = now.Add(3 * time.Second)
+	if _, err := db.AcquireAIFAROrchestrationLock(owner); err != nil {
+		t.Fatal(err)
+	}
+
+	blocker, err := db.db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	baselineWaitCount := db.db.Stats().WaitCount
+	requestedExpiry := now.Add(1200 * time.Millisecond)
+	type renewResult struct {
+		renewed bool
+		err     error
+	}
+	resultCh := make(chan renewResult, 1)
+	go func() {
+		renewed, renewErr := db.RenewAIFAROrchestrationLock(owner.ID, requestedExpiry)
+		resultCh <- renewResult{renewed: renewed, err: renewErr}
+	}()
+	deadline := requestedExpiry.Add(-300 * time.Millisecond)
+	for db.db.Stats().WaitCount <= baselineWaitCount && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if db.db.Stats().WaitCount <= baselineWaitCount {
+		_ = blocker.Rollback()
+		<-resultCh
+		t.Fatal("short renewal did not reach the sole-connection wait before requested expiry")
+	}
+	if observed := time.Now().UTC(); !observed.Before(requestedExpiry) {
+		_ = blocker.Rollback()
+		<-resultCh
+		t.Fatalf("short renewal reached the connection wait too late: observed=%s requested=%s", observed, requestedExpiry)
+	}
+	if wait := time.Until(requestedExpiry.Add(25 * time.Millisecond)); wait > 0 {
+		time.Sleep(wait)
+	}
+	if err := blocker.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	result := <-resultCh
+	if result.err != nil || result.renewed {
+		t.Fatalf("renewal accepted an expiry already elapsed at execution: renewed=%v err=%v", result.renewed, result.err)
+	}
+}
+
 func TestAIFAROrchestrationLocksDoNotReleaseASuccessorByStaleID(t *testing.T) {
 	db := openTestStore(t)
 	now := time.Now().UTC()

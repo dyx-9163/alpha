@@ -148,6 +148,27 @@ type aifarOrchestrationLockStore interface {
 	RecoverAIFAROrchestrationLocks(instanceID, reason string) (int, error)
 }
 
+type orchestrationLockHeartbeatTicker interface {
+	C() <-chan time.Time
+	Stop()
+}
+
+type orchestrationLockHeartbeatClock interface {
+	Now() time.Time
+	NewTicker(time.Duration) orchestrationLockHeartbeatTicker
+}
+
+type realOrchestrationLockHeartbeatClock struct{}
+
+func (realOrchestrationLockHeartbeatClock) Now() time.Time { return time.Now().UTC() }
+func (realOrchestrationLockHeartbeatClock) NewTicker(interval time.Duration) orchestrationLockHeartbeatTicker {
+	return realOrchestrationLockHeartbeatTicker{Ticker: time.NewTicker(interval)}
+}
+
+type realOrchestrationLockHeartbeatTicker struct{ *time.Ticker }
+
+func (t realOrchestrationLockHeartbeatTicker) C() <-chan time.Time { return t.Ticker.C }
+
 func (s Service) startAIFAROrchestrationLockHeartbeat(ctx context.Context, lock store.AIFAROrchestrationLock) (context.Context, func()) {
 	lockStore, ok := s.store.(aifarOrchestrationLockStore)
 	if !ok || strings.TrimSpace(lock.ID) == "" {
@@ -163,7 +184,11 @@ func (s Service) startAIFAROrchestrationLockHeartbeat(ctx context.Context, lock 
 		if interval <= 0 {
 			interval = orchestrationLockTTL / 3
 		}
-		ticker := time.NewTicker(interval)
+		clock := s.orchestrationLockHeartbeatClock
+		if clock == nil {
+			clock = realOrchestrationLockHeartbeatClock{}
+		}
+		ticker := clock.NewTicker(interval)
 		defer ticker.Stop()
 		for {
 			select {
@@ -171,8 +196,8 @@ func (s Service) startAIFAROrchestrationLockHeartbeat(ctx context.Context, lock 
 				return
 			case <-stop:
 				return
-			case <-ticker.C:
-				renewed, err := lockStore.RenewAIFAROrchestrationLock(lock.ID, time.Now().UTC().Add(orchestrationLockTTL))
+			case <-ticker.C():
+				renewed, err := lockStore.RenewAIFAROrchestrationLock(lock.ID, clock.Now().UTC().Add(orchestrationLockTTL))
 				if err != nil || !renewed {
 					cancelTask()
 					return
@@ -370,6 +395,7 @@ type Service struct {
 	remote                             Remote
 	archives                           RuntimeDiagnosticArchiveStorage
 	orchestrationLockHeartbeatInterval time.Duration
+	orchestrationLockHeartbeatClock    orchestrationLockHeartbeatClock
 }
 
 type installStepDef struct {
@@ -400,11 +426,11 @@ var requiredRuntimeAgentFeatures = []string{
 }
 
 func NewService(s Store, remote Remote) Service {
-	return Service{store: s, remote: remote}
+	return Service{store: s, remote: remote, orchestrationLockHeartbeatClock: realOrchestrationLockHeartbeatClock{}}
 }
 
 func NewServiceWithDiagnosticStorage(s Store, remote Remote, archives RuntimeDiagnosticArchiveStorage) Service {
-	return Service{store: s, remote: remote, archives: archives}
+	return Service{store: s, remote: remote, archives: archives, orchestrationLockHeartbeatClock: realOrchestrationLockHeartbeatClock{}}
 }
 
 func fallbackTaskID(taskID string, log Logger) string {

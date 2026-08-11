@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -217,6 +218,188 @@ type renewalFailureStore struct {
 	armed     chan struct{}
 	mu        sync.Mutex
 	casCalls  int
+}
+
+type heartbeatLifecycleStore struct {
+	*fakeStore
+	mu       sync.Mutex
+	renewed  int
+	result   bool
+	err      error
+	expires  []time.Time
+	renewHit chan struct{}
+}
+
+func (s *heartbeatLifecycleStore) AcquireAIFAROrchestrationLock(lock store.AIFAROrchestrationLock) (store.AIFAROrchestrationLock, error) {
+	return lock, nil
+}
+
+func (s *heartbeatLifecycleStore) RenewAIFAROrchestrationLock(_ string, expiresAt time.Time) (bool, error) {
+	s.mu.Lock()
+	s.renewed++
+	s.expires = append(s.expires, expiresAt)
+	hit := s.renewHit
+	result, err := s.result, s.err
+	s.mu.Unlock()
+	if hit != nil {
+		select {
+		case hit <- struct{}{}:
+		default:
+		}
+	}
+	return result, err
+}
+
+func (*heartbeatLifecycleStore) ReleaseAIFAROrchestrationLockByID(string) (bool, error) {
+	return true, nil
+}
+
+func (*heartbeatLifecycleStore) ReleaseAIFAROrchestrationLock(string, string, string) (bool, error) {
+	return true, nil
+}
+
+func (*heartbeatLifecycleStore) RecoverAIFAROrchestrationLocks(string, string) (int, error) {
+	return 0, nil
+}
+
+func (s *heartbeatLifecycleStore) renewalCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.renewed
+}
+
+func (s *heartbeatLifecycleStore) renewalExpiries() []time.Time {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]time.Time(nil), s.expires...)
+}
+
+type manualHeartbeatTicker struct {
+	ticks   chan time.Time
+	stopped chan struct{}
+	once    sync.Once
+}
+
+func newManualHeartbeatTicker() *manualHeartbeatTicker {
+	return &manualHeartbeatTicker{ticks: make(chan time.Time, 8), stopped: make(chan struct{})}
+}
+
+func (t *manualHeartbeatTicker) C() <-chan time.Time { return t.ticks }
+func (t *manualHeartbeatTicker) Stop() {
+	t.once.Do(func() { close(t.stopped) })
+}
+
+type manualHeartbeatClock struct {
+	now    time.Time
+	ticker *manualHeartbeatTicker
+}
+
+func (c *manualHeartbeatClock) Now() time.Time { return c.now }
+func (c *manualHeartbeatClock) NewTicker(time.Duration) orchestrationLockHeartbeatTicker {
+	return c.ticker
+}
+
+func TestAIFAROrchestrationLockHeartbeatLifecycleMatrix(t *testing.T) {
+	baseNow := time.Date(2026, 8, 11, 1, 2, 3, 0, time.UTC)
+	newHarness := func(result bool, renewErr error) (Service, *heartbeatLifecycleStore, *manualHeartbeatTicker) {
+		lockStore := &heartbeatLifecycleStore{fakeStore: &fakeStore{}, result: result, err: renewErr, renewHit: make(chan struct{}, 8)}
+		ticker := newManualHeartbeatTicker()
+		service := NewService(lockStore, &fakeRemote{})
+		service.orchestrationLockHeartbeatClock = &manualHeartbeatClock{now: baseNow, ticker: ticker}
+		service.orchestrationLockHeartbeatInterval = time.Minute
+		return service, lockStore, ticker
+	}
+	lock := store.AIFAROrchestrationLock{ID: "heartbeat-owner", InstanceID: "instance-1", ServiceName: "permission", Operation: "scale"}
+
+	t.Run("successful renewal keeps task active", func(t *testing.T) {
+		service, lockStore, ticker := newHarness(true, nil)
+		taskCtx, stop := service.startAIFAROrchestrationLockHeartbeat(context.Background(), lock)
+		ticker.ticks <- baseNow
+		<-lockStore.renewHit
+		if err := taskCtx.Err(); err != nil {
+			t.Fatalf("successful renewal canceled task: %v", err)
+		}
+		if got := lockStore.renewalCount(); got != 1 {
+			t.Fatalf("renewals=%d, want 1", got)
+		}
+		if expiries := lockStore.renewalExpiries(); len(expiries) != 1 || !expiries[0].Equal(baseNow.Add(orchestrationLockTTL)) {
+			t.Fatalf("renewal expiries=%v, want fake-clock expiry %s", expiries, baseNow.Add(orchestrationLockTTL))
+		}
+		stop()
+		select {
+		case <-ticker.stopped:
+		default:
+			t.Fatal("heartbeat stop did not stop ticker")
+		}
+	})
+
+	t.Run("renewal rejection cancels only derived task", func(t *testing.T) {
+		service, lockStore, ticker := newHarness(false, nil)
+		parent := context.Background()
+		taskCtx, stop := service.startAIFAROrchestrationLockHeartbeat(parent, lock)
+		ticker.ticks <- baseNow
+		<-lockStore.renewHit
+		<-taskCtx.Done()
+		if parent.Err() != nil {
+			t.Fatalf("renewal rejection canceled parent: %v", parent.Err())
+		}
+		stop()
+	})
+
+	t.Run("renewal error cancels only derived task", func(t *testing.T) {
+		service, lockStore, ticker := newHarness(false, errors.New("renew failed"))
+		parent := context.Background()
+		taskCtx, stop := service.startAIFAROrchestrationLockHeartbeat(parent, lock)
+		ticker.ticks <- baseNow
+		<-lockStore.renewHit
+		<-taskCtx.Done()
+		if parent.Err() != nil {
+			t.Fatalf("renewal error canceled parent: %v", parent.Err())
+		}
+		stop()
+	})
+
+	t.Run("parent cancellation stops heartbeat", func(t *testing.T) {
+		service, lockStore, ticker := newHarness(true, nil)
+		parent, cancel := context.WithCancel(context.Background())
+		taskCtx, stop := service.startAIFAROrchestrationLockHeartbeat(parent, lock)
+		cancel()
+		<-taskCtx.Done()
+		stop()
+		if got := lockStore.renewalCount(); got != 0 {
+			t.Fatalf("renewals after parent cancellation=%d, want 0", got)
+		}
+		select {
+		case <-ticker.stopped:
+		default:
+			t.Fatal("parent cancellation did not stop ticker")
+		}
+	})
+
+	t.Run("stop before first tick is synchronous and repeatable", func(t *testing.T) {
+		service, lockStore, ticker := newHarness(true, nil)
+		_, stop := service.startAIFAROrchestrationLockHeartbeat(context.Background(), lock)
+		stop()
+		stop()
+		if got := lockStore.renewalCount(); got != 0 {
+			t.Fatalf("renewals before first tick=%d, want 0", got)
+		}
+		select {
+		case <-ticker.stopped:
+		default:
+			t.Fatal("repeated stop did not leave ticker stopped")
+		}
+	})
+
+	t.Run("no renewal occurs after stop", func(t *testing.T) {
+		service, lockStore, ticker := newHarness(true, nil)
+		_, stop := service.startAIFAROrchestrationLockHeartbeat(context.Background(), lock)
+		stop()
+		ticker.ticks <- baseNow.Add(time.Minute)
+		if got := lockStore.renewalCount(); got != 0 {
+			t.Fatalf("renewals after stop=%d, want 0", got)
+		}
+	})
 }
 
 type postAcceptanceRenewalFailureStore struct {
@@ -2613,7 +2796,9 @@ func TestRuntimeConfigScriptRendersDynamicJavaApply(t *testing.T) {
 	}
 	for _, want := range []string{
 		`AIFAR_RUNTIME_CONFIG_VERSION`,
-		`resource.%s.env`,
+		`runtime/config/versions`,
+		`AIFAR_RUNTIME_CONFIG_HASH`,
+		`cmp -s`,
 		`java-jvm.options`,
 		`java-jvm.$service.options`,
 		`java-entrypoint.sh`,
@@ -2622,10 +2807,75 @@ func TestRuntimeConfigScriptRendersDynamicJavaApply(t *testing.T) {
 			t.Fatalf("runtime config script missing %q:\n%s", want, script)
 		}
 	}
+	for _, forbidden := range []string{
+		`ENV_DIR="$INSTALL_ROOT/runtime/env"`,
+		`java-common.env`,
+		`java-secrets.env`,
+		`set_env`,
+	} {
+		if strings.Contains(script, forbidden) {
+			t.Fatalf("runtime config script must not mutate or copy fixed/secret env input %q:\n%s", forbidden, script)
+		}
+	}
 	for _, legacy := range []string{`docker update --cpus`, `docker restart`, `docker run -d`, `runtime-spec.json`, `reconcile-runtime`} {
 		if strings.Contains(script, legacy) {
 			t.Fatalf("runtime config script should not contain legacy direct container mutation %q:\n%s", legacy, script)
 		}
+	}
+}
+
+func TestRuntimeManifestDefaultsUseDurableAppliedConfigInsteadOfFailedDesiredConfig(t *testing.T) {
+	instance := installedAIFARInstance(t)
+	metadata := metadataFromInstance(instance)
+	metadata["services"] = []string{"permission"}
+	metadata["runtimeConfig"] = map[string]any{
+		"configVersion":   2,
+		"global":          map[string]any{"appCPUs": "4", "appMemoryLimit": "4GB", "jvmInitialRAMPercentage": 30, "jvmMaxRAMPercentage": 80},
+		"services":        map[string]any{},
+		"nacosEphemeral":  true,
+		"appliedVersion":  1,
+		"lastApplyStatus": runtimeConfigStatusFailed,
+		"appliedSnapshot": map[string]any{
+			"configVersion":  1,
+			"immutable":      true,
+			"global":         map[string]any{"appCPUs": "2", "appMemoryLimit": "2GB", "jvmInitialRAMPercentage": 20, "jvmMaxRAMPercentage": 70},
+			"services":       map[string]any{},
+			"nacosEphemeral": false,
+			"serviceHashes": map[string]any{
+				"permission": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+			},
+		},
+	}
+	instance.Metadata = mustMetadata(t, metadata)
+	manifest, err := buildRuntimeManifest(instance, store.AIFARDeployment{
+		InstanceID: instance.ID, ServiceName: "permission", DesiredReplicas: 1,
+		CurrentRevision: "release-permission", Generation: 1,
+	}, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if manifest.Spec.Resources.CPUs != "2" || manifest.Spec.Resources.Memory != "2GB" {
+		t.Fatalf("manifest read failed desired resources instead of applied snapshot: %+v", manifest.Spec.Resources)
+	}
+	if manifest.Spec.Environment["AIFAR_NACOS_EPHEMERAL"] != "false" {
+		t.Fatalf("manifest nacos ephemeral=%q, want durable applied false", manifest.Spec.Environment["AIFAR_NACOS_EPHEMERAL"])
+	}
+	hash := manifest.Spec.Environment["AIFAR_RUNTIME_CONFIG_HASH"]
+	if hash != "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" {
+		t.Fatalf("manifest config hash=%q, want durable applied hash", hash)
+	}
+	wantSource := "/aifar/apps/admin/runtime/config/versions/permission/v1-" + hash
+	found := false
+	for _, volume := range manifest.Spec.Volumes {
+		if volume.Target == "/opt/aifar/runtime/env" {
+			found = true
+			if volume.Source != wantSource {
+				t.Fatalf("manifest config source=%q, want %q", volume.Source, wantSource)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("manifest is missing immutable runtime config volume")
 	}
 }
 
@@ -2793,6 +3043,136 @@ func TestRuntimeConfigMutatesOnlyAffectedServiceGeneration(t *testing.T) {
 	}
 }
 
+func TestRuntimeConfigPartialFailureIdenticalRetryReappliesOnlyUnacceptedService(t *testing.T) {
+	instance := installedAIFARInstance(t)
+	metadata := metadataFromInstance(instance)
+	base := runtimeConfigFromOptions(InstallOptions{
+		SelectedServices:        []string{"file", "permission"},
+		AppCPUs:                 "1",
+		AppMemoryLimit:          "1GB",
+		JVMInitialRAMPercentage: 20,
+		JVMMaxRAMPercentage:     70,
+	}, "installer", time.Date(2026, 8, 11, 0, 0, 0, 0, time.UTC))
+	metadata["services"] = []string{"file", "permission"}
+	metadata["runtimeConfig"] = base
+	instance.Metadata = mustMetadata(t, metadata)
+	deployments := seedPerServiceDeployments(t, instance,
+		map[string]int{"permission": 1, "file": 1},
+		map[string]int64{"permission": 3, "file": 7},
+	)
+	before := deploymentsByService(deployments)
+	s := &fakeStore{
+		servers:     map[string]store.Server{"srv-1": {ID: "srv-1", Host: "10.0.0.10", DeployDir: "/aifar/apps"}},
+		instances:   []store.AppInstance{instance},
+		deployments: deployments,
+	}
+	remote := &fakeRemote{
+		deploymentApplyFailures: map[string]int{"permission": 1},
+		deploymentStates:        map[string]runtimeagent.DeploymentState{},
+	}
+	for serviceName, deployment := range before {
+		var manifest runtimeagent.DeploymentManifest
+		if err := json.Unmarshal([]byte(deployment.SpecJSON), &manifest); err != nil {
+			t.Fatal(err)
+		}
+		hash, err := runtimeagent.DeploymentManifestSpecHash(manifest)
+		if err != nil {
+			t.Fatal(err)
+		}
+		remote.deploymentStates[serviceName] = runtimeagent.DeploymentState{
+			InstanceID: instance.ID, ServiceName: serviceName,
+			Generation: deployment.Generation, SpecHash: hash, DesiredReplicas: deployment.DesiredReplicas,
+		}
+	}
+	service := NewService(s, remote)
+	payload := RuntimeConfigPayload{Global: RuntimeConfigValues{
+		AppCPUs: "3", AppMemoryLimit: "3GB", JVMInitialRAMPercentage: 25, JVMMaxRAMPercentage: 75,
+	}}
+	request := RuntimeConfigRequest{
+		Instance: instance, Server: s.servers["srv-1"], Actor: "operator", TaskID: "task-config-partial", Config: payload,
+	}
+	if err := service.ApplyRuntimeConfig(context.Background(), request, fakeLogger{}, nil); err == nil {
+		t.Fatal("first config apply unexpectedly succeeded despite one Agent persistence failure")
+	}
+	afterFailureInstance, err := s.GetAppInstance(instance.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	afterFailureState := runtimeConfigFromMetadata(metadataFromInstance(afterFailureInstance))
+	if afterFailureState.LastApplyStatus != runtimeConfigStatusFailed || afterFailureState.AppliedVersion != 1 {
+		t.Fatalf("partial failure advanced applied config: %+v", afterFailureState)
+	}
+	afterFailure := deploymentsByService(s.deployments)
+	if afterFailure["file"].Status != "Accepted" || afterFailure["permission"].Status != "pending_acceptance" {
+		t.Fatalf("unexpected partial acceptance state: file=%+v permission=%+v", afterFailure["file"], afterFailure["permission"])
+	}
+	oldPermissionState := remote.deploymentStates["permission"]
+	if oldPermissionState.Generation != before["permission"].Generation {
+		t.Fatalf("failed config became readable by old permission generation: before=%d agent=%d", before["permission"].Generation, oldPermissionState.Generation)
+	}
+
+	request.TaskID = "task-config-retry"
+	request.Instance = afterFailureInstance
+	if err := service.ApplyRuntimeConfig(context.Background(), request, fakeLogger{}, nil); err != nil {
+		t.Fatalf("identical config retry failed: %v", err)
+	}
+	if got := remote.deploymentApplyCounts["permission"]; got != 2 {
+		t.Fatalf("failed permission apply count=%d, want retry count 2", got)
+	}
+	if got := remote.deploymentApplyCounts["file"]; got != 1 {
+		t.Fatalf("already accepted file apply count=%d, want unchanged 1", got)
+	}
+	afterRetry := deploymentsByService(s.deployments)
+	if afterRetry["file"].Generation != afterFailure["file"].Generation {
+		t.Fatalf("identical retry advanced accepted peer generation: before=%d after=%d", afterFailure["file"].Generation, afterRetry["file"].Generation)
+	}
+	if afterRetry["permission"].Generation <= afterFailure["permission"].Generation {
+		t.Fatalf("identical retry did not advance failed service generation: before=%d after=%d", afterFailure["permission"].Generation, afterRetry["permission"].Generation)
+	}
+	for _, serviceName := range []string{"file", "permission"} {
+		deployment := afterRetry[serviceName]
+		var manifest runtimeagent.DeploymentManifest
+		if err := json.Unmarshal([]byte(deployment.SpecJSON), &manifest); err != nil {
+			t.Fatal(err)
+		}
+		hash, err := runtimeagent.DeploymentManifestSpecHash(manifest)
+		if err != nil {
+			t.Fatal(err)
+		}
+		agent := remote.deploymentStates[serviceName]
+		if deployment.Status != "Accepted" || agent.Generation != deployment.Generation || agent.SpecHash != hash {
+			t.Fatalf("config marked applied without exact %s acceptance: deployment=%+v agent=%+v hash=%s", serviceName, deployment, agent, hash)
+		}
+		configHash := manifest.Spec.Environment["AIFAR_RUNTIME_CONFIG_HASH"]
+		if len(configHash) != 64 {
+			t.Fatalf("%s manifest config hash=%q", serviceName, configHash)
+		}
+		if serviceName == "permission" {
+			wantFragment := "/runtime/config/versions/permission/v" + strconv.Itoa(afterFailureState.ConfigVersion) + "-" + configHash
+			found := false
+			for _, volume := range manifest.Spec.Volumes {
+				if volume.Target == "/opt/aifar/runtime/env" {
+					found = true
+					if !strings.Contains(volume.Source, wantFragment) {
+						t.Fatalf("permission config source=%q, want fragment %q", volume.Source, wantFragment)
+					}
+				}
+			}
+			if !found {
+				t.Fatal("permission manifest did not switch immutable config volume")
+			}
+		}
+	}
+	finalInstance, err := s.GetAppInstance(instance.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	finalState := runtimeConfigFromMetadata(metadataFromInstance(finalInstance))
+	if finalState.ConfigVersion != afterFailureState.ConfigVersion || finalState.AppliedVersion != finalState.ConfigVersion || finalState.LastApplyStatus != runtimeConfigStatusApplied {
+		t.Fatalf("identical retry did not reuse and exactly apply pending version: failed=%+v final=%+v", afterFailureState, finalState)
+	}
+}
+
 func TestRuntimeConfigLockRenewalFailureCancelsRemoteAndStopsMetadataCAS(t *testing.T) {
 	db, err := store.Open(filepath.Join(t.TempDir(), "aifar.db"))
 	if err != nil {
@@ -2952,7 +3332,7 @@ func TestServiceAppliesRuntimeConfigAndRecordsVersion(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(remote.runtimeConfigScript, "AIFAR_RUNTIME_CONFIG") || !strings.Contains(remote.runtimeConfigScript, "resource.%s.env") {
+	if !strings.Contains(remote.runtimeConfigScript, "AIFAR_RUNTIME_CONFIG") || !strings.Contains(remote.runtimeConfigScript, "resource.env") {
 		t.Fatalf("expected runtime config script to be executed, got:\n%s", remote.runtimeConfigScript)
 	}
 	saved, err := s.GetAppInstance(instance.ID)

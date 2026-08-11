@@ -7,6 +7,7 @@ import (
 	"io"
 	"path"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"aifar-deployment/backend/internal/runtimeagent"
@@ -63,12 +64,44 @@ func buildRuntimeManifest(instance store.AppInstance, current store.AIFARDeploym
 			manifest.Spec.PodRevision = revision
 		}
 	}
+	if err := applyDurableRuntimeConfigToManifest(metadata, installRoot, serviceName, &manifest); err != nil {
+		return runtimeagent.DeploymentManifest{}, err
+	}
 	manifest = runtimeagent.NormalizeDeploymentManifest(manifest)
 	config := runtimeInstanceConfig(instance, metadata, installRoot)
 	if err := runtimeagent.ValidateDeploymentManifest(config, manifest); err != nil {
 		return runtimeagent.DeploymentManifest{}, fmt.Errorf("AIFAR deployment manifest is invalid: %w", err)
 	}
 	return manifest, nil
+}
+
+func applyDurableRuntimeConfigToManifest(metadata map[string]any, installRoot, serviceName string, manifest *runtimeagent.DeploymentManifest) error {
+	state := runtimeConfigFromMetadata(metadata)
+	if state.AppliedSnapshot == nil {
+		return nil
+	}
+	snapshot := *state.AppliedSnapshot
+	values := effectiveRuntimeConfigForAppliedSnapshot(snapshot, serviceName)
+	manifest.Spec.Resources.CPUs = values.AppCPUs
+	manifest.Spec.Resources.Memory = values.AppMemoryLimit
+	if manifest.Spec.Environment == nil {
+		manifest.Spec.Environment = map[string]string{}
+	}
+	manifest.Spec.Environment["AIFAR_NACOS_EPHEMERAL"] = strconv.FormatBool(snapshot.NacosEphemeral)
+	configVersion, immutable := runtimeConfigAppliedServiceVersion(snapshot, serviceName)
+	if !immutable {
+		return nil
+	}
+	configHash := strings.TrimSpace(snapshot.ServiceHashes[serviceName])
+	if !deploymentSpecHashPattern.MatchString(configHash) {
+		return errors.New("stored AIFAR runtime config snapshot hash is invalid")
+	}
+	target := runtimeConfigTarget{
+		ServiceName: serviceName, ConfigVersion: configVersion, ConfigHash: configHash,
+		ConfigDir: runtimeConfigVersionDir(installRoot, serviceName, configVersion, configHash),
+		Values:    values, NacosEphemeral: snapshot.NacosEphemeral, Java: serviceName != "web-vue3",
+	}
+	return applyRuntimeConfigTarget(manifest, target)
 }
 
 func runtimeManifestDefaults(instanceID, installRoot string, definition serviceDefinition, current store.AIFARDeployment, generation int64, metadata map[string]any) runtimeagent.DeploymentManifest {
@@ -125,7 +158,7 @@ func runtimeManifestDefaults(instanceID, installRoot string, definition serviceD
 		spec.Command = []string{"/opt/aifar/runtime/env/java-entrypoint.sh"}
 		spec.Environment["AIFAR_SERVICE_NAME"] = serviceName
 	}
-	return runtimeagent.DeploymentManifest{
+	manifest := runtimeagent.DeploymentManifest{
 		APIVersion: runtimeagent.ManifestAPIVersion,
 		Kind:       runtimeagent.DeploymentManifestKind,
 		Metadata:   runtimeagent.DeploymentMetadata{InstanceID: instanceID, Name: serviceName, Generation: generation},
@@ -135,6 +168,8 @@ func runtimeManifestDefaults(instanceID, installRoot string, definition serviceD
 			ListenPort: port, TargetPort: port, AffinityPolicy: definition.AffinityPolicy,
 		},
 	}
+	_ = applyDurableRuntimeConfigToManifest(metadata, installRoot, serviceName, &manifest)
+	return manifest
 }
 
 func runtimeInstanceConfig(instance store.AppInstance, metadata map[string]any, installRoot string) runtimeagent.InstanceConfig {

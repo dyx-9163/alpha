@@ -3,78 +3,26 @@ set -eu
 
 INSTALL_ROOT={{ quote .InstallRoot }}
 CONFIG_VERSION={{ .ConfigVersion }}
-GLOBAL_APP_CPUS={{ quote .GlobalAppCPUs }}
-GLOBAL_APP_MEMORY_LIMIT={{ quote .GlobalAppMemoryLimit }}
-GLOBAL_JVM_INITIAL_RAM_PERCENTAGE={{ quote .GlobalJVMInitialRAMPercentage }}
-GLOBAL_JVM_MAX_RAM_PERCENTAGE={{ quote .GlobalJVMMaxRAMPercentage }}
-NACOS_EPHEMERAL={{ quote .NacosEphemeral }}
-
-ENV_DIR="$INSTALL_ROOT/runtime/env"
-LOG_DIR="$INSTALL_ROOT/runtime/logs"
+CONFIG_ROOT="$INSTALL_ROOT/runtime/config/versions"
+CURRENT_STAGE=""
+CURRENT_SERVICE=""
 
 fail() {
   echo "ERROR: $*" >&2
   exit 1
 }
 
-set_env() {
-  key="$1"
-  value="$2"
-  file="$3"
-  tmp="${file}.tmp"
-  [ -f "$file" ] || touch "$file"
-  grep -v "^${key}=" "$file" > "$tmp" || true
-  printf "%s=%s\n" "$key" "$value" >> "$tmp"
-  mv "$tmp" "$file"
+cleanup_stage() {
+  [ -n "$CURRENT_STAGE" ] || return 0
+  if [ -d "$CURRENT_STAGE" ]; then
+    rm -f -- "$CURRENT_STAGE/config.meta" "$CURRENT_STAGE/resource.env" "$CURRENT_STAGE/java-jvm.options" "$CURRENT_STAGE/java-jvm.$CURRENT_SERVICE.options" "$CURRENT_STAGE/java-entrypoint.sh"
+    rmdir -- "$CURRENT_STAGE" 2>/dev/null || true
+  fi
+  CURRENT_STAGE=""
+  CURRENT_SERVICE=""
 }
 
-service_order() {
-  printf "%s\n"{{ range .Services }} {{ quote .Name }}{{ end }}
-}
-
-service_cpus() {
-  case "$1" in
-{{- range .Services }}
-    {{ .Name }}) printf "%s" {{ quote .AppCPUs }} ;;
-{{- end }}
-    *) printf "%s" "$GLOBAL_APP_CPUS" ;;
-  esac
-}
-
-service_memory() {
-  case "$1" in
-{{- range .Services }}
-    {{ .Name }}) printf "%s" {{ quote .AppMemoryLimit }} ;;
-{{- end }}
-    *) printf "%s" "$GLOBAL_APP_MEMORY_LIMIT" ;;
-  esac
-}
-
-service_jvm_initial() {
-  case "$1" in
-{{- range .Services }}
-    {{ .Name }}) printf "%s" {{ quote .JVMInitialRAMPercentage }} ;;
-{{- end }}
-    *) printf "%s" "$GLOBAL_JVM_INITIAL_RAM_PERCENTAGE" ;;
-  esac
-}
-
-service_jvm_max() {
-  case "$1" in
-{{- range .Services }}
-    {{ .Name }}) printf "%s" {{ quote .JVMMaxRAMPercentage }} ;;
-{{- end }}
-    *) printf "%s" "$GLOBAL_JVM_MAX_RAM_PERCENTAGE" ;;
-  esac
-}
-
-is_java_service() {
-  [ "$1" != "web-vue3" ]
-}
-
-resource_file_for_service() {
-  printf "%s/resource.%s.env" "$ENV_DIR" "$1"
-}
+trap cleanup_stage EXIT HUP INT TERM
 
 write_jvm_options() {
   file="$1"
@@ -105,30 +53,57 @@ exec java $java_opts --add-opens=java.base/java.lang=ALL-UNNAMED --add-opens=jav
 EOF
 }
 
-write_runtime_files() {
-  mkdir -p "$ENV_DIR" "$LOG_DIR"
-  compose_env="$ENV_DIR/compose.env"
-  set_env AIFAR_RUNTIME_CONFIG_VERSION "$CONFIG_VERSION" "$compose_env"
-  set_env APP_CPUS "$GLOBAL_APP_CPUS" "$compose_env"
-  set_env APP_MEMORY_LIMIT "$GLOBAL_APP_MEMORY_LIMIT" "$compose_env"
-  set_env JVM_INITIAL_RAM_PERCENTAGE "$GLOBAL_JVM_INITIAL_RAM_PERCENTAGE" "$compose_env"
-  set_env JVM_MAX_RAM_PERCENTAGE "$GLOBAL_JVM_MAX_RAM_PERCENTAGE" "$compose_env"
-  set_env AIFAR_NACOS_EPHEMERAL "$NACOS_EPHEMERAL" "$compose_env"
-  write_jvm_options "$ENV_DIR/java-jvm.options" "$GLOBAL_JVM_INITIAL_RAM_PERCENTAGE" "$GLOBAL_JVM_MAX_RAM_PERCENTAGE"
-  for service in $(service_order); do
-    resource_file="$(resource_file_for_service "$service")"
-    : > "$resource_file"
-    set_env APP_CPUS "$(service_cpus "$service")" "$resource_file"
-    set_env APP_MEMORY_LIMIT "$(service_memory "$service")" "$resource_file"
-    chmod 0644 "$resource_file"
-    if is_java_service "$service"; then
-      write_jvm_options "$ENV_DIR/java-jvm.$service.options" "$(service_jvm_initial "$service")" "$(service_jvm_max "$service")"
+prepare_service_config() {
+  service="$1"
+  java="$2"
+  cpus="$3"
+  memory="$4"
+  jvm_initial="$5"
+  jvm_max="$6"
+  nacos_ephemeral="$7"
+  config_hash="$8"
+  final_dir="$9"
+  parent_dir="$CONFIG_ROOT/$service"
+  [ "$final_dir" = "$parent_dir/v${CONFIG_VERSION}-${config_hash}" ] || fail "runtime config destination is invalid"
+  mkdir -p -- "$parent_dir"
+  chmod 0755 -- "$CONFIG_ROOT" "$parent_dir"
+
+  CURRENT_STAGE="$parent_dir/.v${CONFIG_VERSION}-${config_hash}.tmp.$$"
+  CURRENT_SERVICE="$service"
+  [ ! -e "$CURRENT_STAGE" ] || fail "runtime config staging directory already exists"
+  mkdir -- "$CURRENT_STAGE"
+  chmod 0755 -- "$CURRENT_STAGE"
+  printf "service=%s\nversion=%s\nhash=%s\n" "$service" "$CONFIG_VERSION" "$config_hash" > "$CURRENT_STAGE/config.meta"
+  printf "APP_CPUS=%s\nAPP_MEMORY_LIMIT=%s\nAIFAR_RUNTIME_CONFIG_VERSION=%s\nAIFAR_RUNTIME_CONFIG_HASH=%s\nAIFAR_NACOS_EPHEMERAL=%s\n" \
+    "$cpus" "$memory" "$CONFIG_VERSION" "$config_hash" "$nacos_ephemeral" > "$CURRENT_STAGE/resource.env"
+  chmod 0644 -- "$CURRENT_STAGE/config.meta" "$CURRENT_STAGE/resource.env"
+  if [ "$java" = "true" ]; then
+    write_jvm_options "$CURRENT_STAGE/java-jvm.options" "$jvm_initial" "$jvm_max"
+    write_jvm_options "$CURRENT_STAGE/java-jvm.$service.options" "$jvm_initial" "$jvm_max"
+    java_start_command > "$CURRENT_STAGE/java-entrypoint.sh"
+    chmod 0755 -- "$CURRENT_STAGE/java-entrypoint.sh"
+  fi
+
+  if [ -e "$final_dir" ]; then
+    [ -d "$final_dir" ] || fail "runtime config destination is not a directory"
+    cmp -s "$CURRENT_STAGE/config.meta" "$final_dir/config.meta" || fail "immutable runtime config metadata mismatch"
+    cmp -s "$CURRENT_STAGE/resource.env" "$final_dir/resource.env" || fail "immutable runtime resource config mismatch"
+    if [ "$java" = "true" ]; then
+      cmp -s "$CURRENT_STAGE/java-jvm.options" "$final_dir/java-jvm.options" || fail "immutable runtime JVM config mismatch"
+      cmp -s "$CURRENT_STAGE/java-jvm.$service.options" "$final_dir/java-jvm.$service.options" || fail "immutable service JVM config mismatch"
+      cmp -s "$CURRENT_STAGE/java-entrypoint.sh" "$final_dir/java-entrypoint.sh" || fail "immutable Java entrypoint mismatch"
     fi
-  done
-  java_start_command > "$ENV_DIR/java-entrypoint.sh"
-  chmod 0755 "$ENV_DIR/java-entrypoint.sh"
+    cleanup_stage
+    return 0
+  fi
+  mv -- "$CURRENT_STAGE" "$final_dir"
+  CURRENT_STAGE=""
+  CURRENT_SERVICE=""
 }
 
-[ -d "$ENV_DIR" ] || fail "AIFAR runtime env directory is missing"
-write_runtime_files
+mkdir -p -- "$CONFIG_ROOT"
+chmod 0755 -- "$CONFIG_ROOT"
+{{ range .Services -}}
+prepare_service_config {{ quote .Name }} {{ if .Java }}true{{ else }}false{{ end }} {{ quote .AppCPUs }} {{ quote .AppMemoryLimit }} {{ quote .JVMInitialRAMPercentage }} {{ quote .JVMMaxRAMPercentage }} {{ quote .NacosEphemeral }} {{ quote .ConfigHash }} {{ quote .ConfigDir }}
+{{ end -}}
 echo "AIFAR runtime config prepared, version $CONFIG_VERSION"
