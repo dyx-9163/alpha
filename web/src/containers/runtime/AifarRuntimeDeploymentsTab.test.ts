@@ -52,6 +52,14 @@ describe('AifarRuntimeDeploymentsTab selection', () => {
     expect(wrapper.text()).toContain(formatDate('2026-08-10T08:09:10Z'))
     expect(wrapper.text()).not.toContain('Nacos')
   })
+
+  it('renders status-only legacy rows as unknown instead of inventing readiness', () => {
+    const wrapper = mountDeploymentTab(deployment('gateway', 1, { status: 'ready', conditions: [] }))
+
+    expect(wrapper.text()).toContain('containers.runtimePhase.unknown')
+    expect(wrapper.text()).not.toContain('>ready<')
+    expect(wrapper.text()).toContain('containers.conditionUnavailable')
+  })
 })
 
 const tableRowsKey = Symbol('runtime-deployment-rows')

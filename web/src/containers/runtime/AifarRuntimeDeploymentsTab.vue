@@ -23,9 +23,9 @@
       <el-table-column type="selection" width="44" :selectable="deploymentSelectable" reserve-selection />
       <el-table-column prop="deploymentName" :label="t('containers.deployment')" min-width="170" show-overflow-tooltip />
       <el-table-column prop="serviceName" :label="t('containers.service')" width="130" show-overflow-tooltip />
-      <el-table-column prop="status" :label="t('common.status')" width="120">
+      <el-table-column :label="t('common.status')" width="120">
         <template #default="{ row }">
-          <StatusTag :status="aifarRuntimeStatusKind(row.status)" :label="aifarRuntimeStatusLabel(row.status)" />
+          <StatusTag :status="aifarRuntimeStatusKind(runtimeDeploymentPhase(row))" :label="t(`containers.runtimePhase.${runtimeDeploymentPhase(row)}`)" />
         </template>
       </el-table-column>
       <el-table-column :label="t('containers.replicas')" width="150">
@@ -43,7 +43,7 @@
       <el-table-column :label="t('containers.condition')" min-width="190">
         <template #default="{ row }">
           <div v-if="runtimeConditionReason(row)" class="runtime-condition-cell">
-            <StatusTag :status="aifarRuntimeStatusKind(row.status)" :label="runtimeConditionReason(row)?.type || aifarRuntimeStatusLabel(row.status)" />
+            <StatusTag :status="aifarRuntimeStatusKind(runtimeDeploymentPhase(row))" :label="runtimeConditionReason(row)?.type || t('containers.runtimePhase.unknown')" />
             <strong>{{ runtimeConditionReason(row)?.reason }}</strong>
             <span v-if="runtimeConditionReason(row)?.message" :title="runtimeConditionReason(row)?.message">{{ runtimeConditionReason(row)?.message }}</span>
           </div>
@@ -89,13 +89,13 @@ import StatusTag from '../../components/StatusTag.vue'
 import { useAifarRuntimeContext } from './context'
 import { formatDate, runtimeConditionReason, runtimeGenerationText } from './format'
 import { normalizeBatchOfflineDeployments } from './runtimeDeploymentSelection'
+import { runtimeDeploymentPhase } from './selectors'
 import type { AifarRuntimeDeployment, AifarRuntimeService } from './types'
 
 const {
   t,
   selectedRuntimeDeployments,
   aifarRuntimeStatusKind,
-  aifarRuntimeStatusLabel,
   runtimeDeploymentReplicaText,
   runtimeServiceActionDisabledReason,
   openAifarRuntimeServiceUpdate,

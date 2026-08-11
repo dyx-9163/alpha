@@ -192,14 +192,15 @@ describe('AIFAR Runtime API service', () => {
   })
 
   it.each([
-    ['single', '/apps/instances/instance-1/aifar/update-artifact'],
-    ['bundle', '/apps/instances/instance-1/aifar/update-artifact-bundle']
-  ] as const)('uploads %s artifacts to the matching endpoint', async (mode, endpoint) => {
+    ['single', '/apps/instances/instance-1/aifar/update-artifact', 7],
+    ['bundle', '/apps/instances/instance-1/aifar/update-artifact-bundle', undefined]
+  ] as const)('uploads %s artifacts to the matching endpoint', async (mode, endpoint, expectedGeneration) => {
     const form = new FormData()
     form.append('language', 'zh')
     apiPostFormMock.mockResolvedValueOnce({ taskId: `task-${mode}` })
 
-    await expect(updateAifarArtifact('instance-1', form, mode)).resolves.toEqual({ taskId: `task-${mode}` })
+    await expect(updateAifarArtifact('instance-1', form, mode, expectedGeneration)).resolves.toEqual({ taskId: `task-${mode}` })
+    expect(form.get('expectedGeneration')).toBe(mode === 'single' ? '7' : null)
     expect(apiPostFormMock).toHaveBeenCalledWith(endpoint, form)
   })
 

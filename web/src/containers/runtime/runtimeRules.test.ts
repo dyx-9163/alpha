@@ -48,8 +48,11 @@ import {
   findRuntimeIngressByInstance,
   findSelectedRuntimeInstance,
   resolveRuntimeAppInstance,
+  reconcileRuntimeServiceTaskOwners,
+  runtimeDeploymentPhase,
   runtimeDeploymentPhaseCounts,
   runtimeDiscoveryTarget,
+  runtimeGlobalActionGate,
   runtimeServiceActionGate,
   summarizeRuntimeRestartScope,
   runtimeServiceForDeployment
@@ -322,8 +325,10 @@ describe('runtime configuration rules', () => {
 describe('runtime format rules', () => {
   it.each([
     ['ready', 'running'],
+    ['available', 'running'],
     ['ACTIVE', 'unknown'],
     ['rolling', 'pending'],
+    ['progressing', 'pending'],
     ['stale', 'degraded'],
     ['offline', 'degraded'],
     ['failed', 'failed'],
@@ -496,14 +501,16 @@ describe('runtime selectors', () => {
     ])).toEqual({ services: 2, replicas: 5 })
   })
 
-  it('counts service phases for display without using the aggregate runtime status as a gate', () => {
+  it('counts only reported Conditions and keeps legacy status-only rows unknown', () => {
     expect(runtimeDeploymentPhaseCounts([
       deployment({ serviceName: 'gateway', status: 'ready' }),
-      deployment({ serviceName: 'oauth', status: 'rolling' }),
-      deployment({ serviceName: 'file', status: 'degraded' }),
-      deployment({ serviceName: 'message', status: 'offline' }),
-      deployment({ serviceName: 'permission', status: 'failed' })
-    ])).toEqual({ available: 1, progressing: 1, degraded: 2, offline: 1 })
+      deployment({ serviceName: 'oauth', status: 'ready', conditions: [{ type: 'Progressing', status: true, reason: 'Rolling', generation: 1, lastTransitionTime: '' }] }),
+      deployment({ serviceName: 'file', status: 'ready', conditions: [{ type: 'Degraded', status: true, reason: 'Failed', generation: 1, lastTransitionTime: '' }] }),
+      deployment({ serviceName: 'message', status: 'ready', conditions: [{ type: 'Offline', status: true, reason: 'Stopped', generation: 1, lastTransitionTime: '' }] }),
+      deployment({ serviceName: 'permission', status: 'failed', conditions: [{ type: 'Available', status: true, reason: 'Ready', generation: 1, lastTransitionTime: '' }] })
+    ])).toEqual({ available: 1, progressing: 1, degraded: 1, offline: 1, unknown: 1 })
+    expect(runtimeDeploymentPhase(deployment({ status: 'ready', conditions: [] }))).toBe('unknown')
+    expect(runtimeDeploymentPhase(deployment({ status: 'failed' }))).toBe('unknown')
   })
 
   it('does not disable a healthy service when another service is degraded', () => {
@@ -514,7 +521,7 @@ describe('runtime selectors', () => {
       canManage: true,
       instanceStatus: 'installed',
       agentStatus: 'running',
-      agentFeatures: ['service-generation-v1', 'per-service-reconcile', 'per-service-restart', 'service-conditions-v1'],
+      agentFeatures: ['service-manifest-v1', 'service-generation-v1', 'per-service-reconcile', 'per-service-restart', 'service-conditions-v1'],
       activeTasks: []
     })).toEqual({ disabled: false, reason: '', ownerTaskId: '' })
   })
@@ -530,7 +537,7 @@ describe('runtime selectors', () => {
       canManage: true,
       instanceStatus: 'installed',
       agentStatus: 'running',
-      agentFeatures: ['service-generation-v1', 'per-service-reconcile', 'per-service-restart', 'service-conditions-v1'],
+      agentFeatures: ['service-manifest-v1', 'service-generation-v1', 'per-service-reconcile', 'per-service-restart', 'service-conditions-v1'],
       activeTasks: [],
       ...overrides
     })).toMatchObject({ disabled: true, reason: expectedReason })
@@ -542,7 +549,7 @@ describe('runtime selectors', () => {
       canManage: true,
       instanceStatus: 'installed',
       agentStatus: 'running',
-      agentFeatures: ['service-generation-v1', 'per-service-reconcile', 'per-service-restart', 'service-conditions-v1'],
+      agentFeatures: ['service-manifest-v1', 'service-generation-v1', 'per-service-reconcile', 'per-service-restart', 'service-conditions-v1'],
       activeTasks: [{ id: 'task-file', status: 'running', target: 'instance-1:file' }]
     }
     expect(runtimeServiceActionGate(row, [row], base)).toEqual({ disabled: false, reason: '', ownerTaskId: '' })
@@ -554,6 +561,46 @@ describe('runtime selectors', () => {
       reason: 'containers.runtimeServiceTaskDisabled',
       ownerTaskId: 'task-permission'
     })
+  })
+
+  it('requires the service manifest capability for per-service operations', () => {
+    const row = deployment({ serviceName: 'permission', generation: 1 })
+    expect(runtimeServiceActionGate(row, [row], {
+      canManage: true,
+      instanceStatus: 'installed',
+      agentStatus: 'running',
+      agentFeatures: ['service-generation-v1', 'per-service-reconcile', 'per-service-restart', 'service-conditions-v1'],
+      activeTasks: []
+    })).toMatchObject({ disabled: true, reason: 'containers.agentCapabilityDisabled' })
+  })
+
+  it('applies maintenance, Agent availability, and every required feature to global operations', () => {
+    const ready = {
+      canManage: true,
+      instanceStatus: 'installed',
+      agentStatus: 'running',
+      agentFeatures: ['service-manifest-v1', 'service-generation-v1', 'per-service-reconcile', 'per-service-restart', 'service-conditions-v1']
+    }
+    expect(runtimeGlobalActionGate(ready)).toBe('')
+    expect(runtimeGlobalActionGate({ ...ready, instanceStatus: 'maintenance' })).toBe('containers.runtimeInstanceMaintenanceDisabled')
+    expect(runtimeGlobalActionGate({ ...ready, agentStatus: 'offline' })).toBe('containers.agentUnavailableDisabled')
+    expect(runtimeGlobalActionGate({ ...ready, agentFeatures: ready.agentFeatures.filter((feature) => feature !== 'service-manifest-v1') })).toBe('containers.agentCapabilityDisabled')
+  })
+
+  it('prunes service owners when tasks terminate, are dismissed, or are absent after reload', () => {
+    const owners = {
+      'instance-1:permission': 'task-running',
+      'instance-1:file': 'task-finished',
+      'instance-1:gateway': 'task-dismissed'
+    }
+    expect(reconcileRuntimeServiceTaskOwners(owners, [
+      { id: 'task-running', status: 'running', target: 'instance-1:permission' },
+      { id: 'task-finished', status: 'success', target: 'instance-1:file' }
+    ])).toEqual({ 'instance-1:permission': 'task-running' })
+    expect(reconcileRuntimeServiceTaskOwners(owners, [])).toEqual({})
+    expect(reconcileRuntimeServiceTaskOwners({}, [
+      { id: 'task-running', status: 'running', target: 'instance-1:permission' }
+    ])).toEqual({})
   })
 
   it('maps services by name using the last duplicate and resolves discovery targets', () => {

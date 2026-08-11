@@ -264,25 +264,29 @@ func (m Module) ValidateArtifactUpdate(ctx context.Context, req registry.Artifac
 		return ctx.Err()
 	}
 	return m.service.ValidateArtifactUpdate(ArtifactUpdateRequest{
-		Instance:          req.Instance,
-		Server:            req.Server,
-		Language:          req.Language,
-		Actor:             req.Actor,
-		ServiceName:       req.ServiceName,
-		ArtifactLocalPath: req.ArtifactLocalPath,
-		ArtifactFileName:  req.ArtifactFileName,
+		Instance:           req.Instance,
+		Server:             req.Server,
+		Language:           req.Language,
+		Actor:              req.Actor,
+		ServiceName:        req.ServiceName,
+		ExpectedGeneration: req.ExpectedGeneration,
+		ArtifactLocalPath:  req.ArtifactLocalPath,
+		ArtifactFileName:   req.ArtifactFileName,
 	})
 }
 
 func (m Module) UpdateArtifact(ctx context.Context, req registry.ArtifactUpdateRequest, run registry.RunContext) error {
 	return m.service.UpdateArtifact(ctx, ArtifactUpdateRequest{
-		Instance:          req.Instance,
-		Server:            req.Server,
-		Language:          req.Language,
-		Actor:             req.Actor,
-		ServiceName:       req.ServiceName,
-		ArtifactLocalPath: req.ArtifactLocalPath,
-		ArtifactFileName:  req.ArtifactFileName,
+		Instance:           req.Instance,
+		Server:             req.Server,
+		Language:           req.Language,
+		Actor:              req.Actor,
+		TaskID:             run.TaskID,
+		ServiceName:        req.ServiceName,
+		ExpectedGeneration: req.ExpectedGeneration,
+		LockID:             run.LockID,
+		ArtifactLocalPath:  req.ArtifactLocalPath,
+		ArtifactFileName:   req.ArtifactFileName,
 	}, run.Log, func(target string) Logger {
 		return run.LoggerForTarget(target)
 	})

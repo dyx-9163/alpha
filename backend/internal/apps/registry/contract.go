@@ -256,13 +256,14 @@ type StorageCleanupPolicyResult struct {
 }
 
 type ArtifactUpdateRequest struct {
-	Instance          store.AppInstance
-	Server            store.Server
-	Language          string
-	Actor             string
-	ServiceName       string
-	ArtifactLocalPath string
-	ArtifactFileName  string
+	Instance           store.AppInstance
+	Server             store.Server
+	Language           string
+	Actor              string
+	ServiceName        string
+	ExpectedGeneration int64
+	ArtifactLocalPath  string
+	ArtifactFileName   string
 }
 
 type ArtifactBundleUpdateRequest struct {

@@ -1,12 +1,16 @@
 package httpapi
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -14,7 +18,355 @@ import (
 
 	"aifar-deployment/backend/internal/apps/registry"
 	"aifar-deployment/backend/internal/store"
+	"aifar-deployment/backend/internal/worker"
 )
+
+func TestAIFARArtifactUpdateRequiresPositiveExpectedGeneration(t *testing.T) {
+	api, db, secret := newAuthzTestAPI(t)
+	_, instance := seedAIFARRuntimeFixture(t, db, "unix:///var/run/docker.sock")
+	token := issueTestToken(t, db, secret, "owner", "owner")
+	body, contentType := aifarArtifactMultipart(t, "", "permission", "permission.jar")
+	req := httptest.NewRequest(http.MethodPost, "/api/v2/apps/instances/"+instance.ID+"/aifar/update-artifact", body)
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", contentType)
+	rec := httptest.NewRecorder()
+
+	api.Router().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), `"code":"INVALID_AIFAR_ARTIFACT_EXPECTED_GENERATION"`) {
+		t.Fatalf("expected strict expectedGeneration rejection, got status=%d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestAIFARArtifactUpdateUsesPrestartServiceLockAndReportsOnlyOwnerTask(t *testing.T) {
+	api, db, secret := newAuthzTestAPI(t)
+	_, instance := seedAIFARRuntimeFixture(t, db, "unix:///var/run/docker.sock")
+	if _, err := db.AcquireAIFAROrchestrationLock(store.AIFAROrchestrationLock{
+		InstanceID: instance.ID, ServiceName: "permission", Operation: "reconcile",
+		Actor: "other", TaskID: "task-owner", ExpiresAt: time.Now().UTC().Add(time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	token := issueTestToken(t, db, secret, "owner", "owner")
+	body, contentType := aifarArtifactMultipart(t, "1", "permission", "permission.jar")
+	req := httptest.NewRequest(http.MethodPost, "/api/v2/apps/instances/"+instance.ID+"/aifar/update-artifact", body)
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", contentType)
+	rec := httptest.NewRecorder()
+
+	api.Router().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("expected service-lock conflict, got status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var response struct {
+		Code    string         `json:"code"`
+		Details map[string]any `json:"details"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Code != "AIFAR_RUNTIME_SERVICE_LOCKED" || len(response.Details) != 1 || response.Details["ownerTaskId"] != "task-owner" {
+		t.Fatalf("unexpected stable conflict response: %+v", response)
+	}
+	tasks, err := db.ListTasks()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tasks) != 0 {
+		t.Fatalf("pre-start conflict must clean the unstarted task, got %+v", tasks)
+	}
+}
+
+func TestAIFARArtifactUpdateRevalidatesGenerationAfterPrestartLock(t *testing.T) {
+	api, db, secret := newAuthzTestAPI(t)
+	_, instance := seedAIFARRuntimeFixture(t, db, "unix:///var/run/docker.sock")
+	token := issueTestToken(t, db, secret, "owner", "owner")
+	body, contentType := aifarArtifactMultipart(t, "2", "permission", "permission.jar")
+	req := httptest.NewRequest(http.MethodPost, "/api/v2/apps/instances/"+instance.ID+"/aifar/update-artifact", body)
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", contentType)
+	rec := httptest.NewRecorder()
+
+	api.Router().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), `"code":"AIFAR_RUNTIME_DEPLOYMENT_GENERATION_CONFLICT"`) {
+		t.Fatalf("expected locked fresh-generation rejection, got status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	locks, err := db.ListAIFAROrchestrationLocks(instance.ID, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tasks, err := db.ListTasks()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(locks) != 0 || len(tasks) != 0 {
+		t.Fatalf("stale pre-start request leaked task or lock: tasks=%+v locks=%+v", tasks, locks)
+	}
+}
+
+func TestAIFARArtifactUpdateAllowsPeerLockAndLifecycleReleasesOnlyOwnedLock(t *testing.T) {
+	api, db, secret := newAuthzTestAPI(t)
+	_, instance := seedAIFARRuntimeFixture(t, db, "unix:///var/run/docker.sock")
+	peer, err := db.AcquireAIFAROrchestrationLock(store.AIFAROrchestrationLock{
+		InstanceID: instance.ID, ServiceName: "file", Operation: "update-artifact",
+		Actor: "other", TaskID: "task-file", ExpiresAt: time.Now().UTC().Add(time.Hour),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var capturedLifecycle worker.TaskLifecycle
+	api.runtime.startExistingTaskWithLifecycle = func(task store.Task, _ string, _ worker.Job, lifecycle worker.TaskLifecycle) (store.Task, error) {
+		capturedLifecycle = lifecycle
+		return task, nil
+	}
+	token := issueTestToken(t, db, secret, "owner", "owner")
+	body, contentType := aifarArtifactMultipart(t, "1", "permission", "permission.jar")
+	req := httptest.NewRequest(http.MethodPost, "/api/v2/apps/instances/"+instance.ID+"/aifar/update-artifact", body)
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", contentType)
+	rec := httptest.NewRecorder()
+
+	api.Router().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusAccepted || capturedLifecycle.Start == nil || capturedLifecycle.Finish == nil {
+		t.Fatalf("expected accepted task with lock lifecycle, status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	active, err := db.ListAIFAROrchestrationLocks(instance.ID, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(active) != 2 {
+		t.Fatalf("peer service lock must not block target service lock: %+v", active)
+	}
+	genericLocks, err := db.ListOperationLocks("app-instance", instance.ID, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(genericLocks) != 0 {
+		t.Fatalf("AIFAR single-service upload must not acquire a generic instance lock: %+v", genericLocks)
+	}
+	lifecycleCtx, cancelLifecycle := context.WithCancel(context.Background())
+	capturedLifecycle.Start(lifecycleCtx, cancelLifecycle)
+	if err := capturedLifecycle.Finish(); err != nil {
+		t.Fatal(err)
+	}
+	active, err = db.ListAIFAROrchestrationLocks(instance.ID, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(active) != 1 || active[0].ID != peer.ID {
+		t.Fatalf("task lifecycle must release only its exact target lock: %+v", active)
+	}
+}
+
+func TestAIFARArtifactUpdateQueuedCancellationRemovesExactTemporaryArtifact(t *testing.T) {
+	module := &fakeArtifactUpdateModule{fakePlannedLifecycleModule: &fakePlannedLifecycleModule{name: "aifar"}}
+	api, db, secret := newAuthzTestAPI(t)
+	api.apps = registry.New(module)
+	api.tasks = worker.NewManagerWithConcurrency(db, 1)
+	holderStarted := make(chan struct{})
+	holderRelease := make(chan struct{}, 1)
+	t.Cleanup(func() {
+		select {
+		case holderRelease <- struct{}{}:
+		default:
+		}
+	})
+	holderTask, err := api.tasks.Start("test.artifact-slot-holder", "holder", "owner", func(ctx context.Context, log worker.Logger) error {
+		close(holderStarted)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-holderRelease:
+			return nil
+		}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-holderStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("slot holder did not start")
+	}
+	_, instance := seedAIFARRuntimeFixture(t, db, "unix:///var/run/docker.sock")
+	token := issueTestToken(t, db, secret, "owner", "owner")
+	body, contentType := aifarArtifactMultipart(t, "1", "permission", "permission.jar")
+	req := httptest.NewRequest(http.MethodPost, "/api/v2/apps/instances/"+instance.ID+"/aifar/update-artifact", body)
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", contentType)
+	rec := httptest.NewRecorder()
+
+	api.Router().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("expected accepted queued upload, got status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	taskID := decodeTaskID(t, rec)
+	artifactPath := module.artifactPath
+	if artifactPath == "" {
+		t.Fatal("handler did not pass its exact temporary artifact path to validation")
+	}
+	if _, err := os.Stat(artifactPath); err != nil {
+		t.Fatalf("queued artifact must exist before cancellation: %v", err)
+	}
+	if !api.tasks.Cancel(taskID) {
+		t.Fatal("expected queued artifact task cancellation")
+	}
+	waitForTaskStatus(t, db, taskID, "cancelled")
+	if _, err := os.Stat(artifactPath); !os.IsNotExist(err) {
+		t.Fatalf("queued cancellation leaked exact temporary artifact %q: %v", artifactPath, err)
+	}
+	holderRelease <- struct{}{}
+	waitForTaskStatus(t, db, holderTask.ID, "success")
+}
+
+func TestAIFARArtifactUpdateSuccessRemovesExactTemporaryArtifact(t *testing.T) {
+	module := &fakeArtifactUpdateModule{fakePlannedLifecycleModule: &fakePlannedLifecycleModule{name: "aifar"}}
+	api, db, secret := newAuthzTestAPI(t)
+	api.apps = registry.New(module)
+	_, instance := seedAIFARRuntimeFixture(t, db, "unix:///var/run/docker.sock")
+	token := issueTestToken(t, db, secret, "owner", "owner")
+	body, contentType := aifarArtifactMultipart(t, "1", "permission", "permission.jar")
+	req := httptest.NewRequest(http.MethodPost, "/api/v2/apps/instances/"+instance.ID+"/aifar/update-artifact", body)
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", contentType)
+	rec := httptest.NewRecorder()
+
+	api.Router().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("expected accepted upload, got status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	taskID := decodeTaskID(t, rec)
+	waitForTaskStatus(t, db, taskID, "success")
+	if module.artifactPath == "" {
+		t.Fatal("module did not receive exact temporary artifact path")
+	}
+	if _, err := os.Stat(module.artifactPath); !os.IsNotExist(err) {
+		t.Fatalf("successful lifecycle leaked exact temporary artifact %q: %v", module.artifactPath, err)
+	}
+}
+
+func TestAIFARArtifactUpdateStartFailureFinishesLifecycleAndRemovesTemporaryArtifact(t *testing.T) {
+	module := &fakeArtifactUpdateModule{fakePlannedLifecycleModule: &fakePlannedLifecycleModule{name: "aifar"}}
+	api, db, secret := newAuthzTestAPI(t)
+	api.apps = registry.New(module)
+	var capturedLifecycle worker.TaskLifecycle
+	api.runtime.startExistingTaskWithLifecycle = func(task store.Task, _ string, _ worker.Job, lifecycle worker.TaskLifecycle) (store.Task, error) {
+		capturedLifecycle = lifecycle
+		return task, errors.New("start failed")
+	}
+	_, instance := seedAIFARRuntimeFixture(t, db, "unix:///var/run/docker.sock")
+	token := issueTestToken(t, db, secret, "owner", "owner")
+	body, contentType := aifarArtifactMultipart(t, "1", "permission", "permission.jar")
+	req := httptest.NewRequest(http.MethodPost, "/api/v2/apps/instances/"+instance.ID+"/aifar/update-artifact", body)
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", contentType)
+	rec := httptest.NewRecorder()
+
+	api.Router().ServeHTTP(rec, req)
+
+	if rec.Code == http.StatusAccepted || capturedLifecycle.Finish == nil {
+		t.Fatalf("expected synchronous start failure with lifecycle, got status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if module.artifactPath == "" {
+		t.Fatal("module did not receive exact temporary artifact path")
+	}
+	if _, err := os.Stat(module.artifactPath); !os.IsNotExist(err) {
+		t.Fatalf("start failure leaked exact temporary artifact %q: %v", module.artifactPath, err)
+	}
+	locks, err := db.ListAIFAROrchestrationLocks(instance.ID, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tasks, err := db.ListTasks()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(locks) != 0 || len(tasks) != 0 {
+		t.Fatalf("start failure leaked task or exact lock: tasks=%+v locks=%+v", tasks, locks)
+	}
+	finishDone := make(chan error, 1)
+	go func() { finishDone <- capturedLifecycle.Finish() }()
+	select {
+	case err := <-finishDone:
+		if err != nil {
+			t.Fatalf("handler must leave lifecycle finish idempotent: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("idempotent lifecycle finish blocked after synchronous start failure")
+	}
+}
+
+func TestRuntimeDeploymentLifecycleFinishBeforeStartCleansOnlyExactTemporaryArtifact(t *testing.T) {
+	api, db, _ := newAuthzTestAPI(t)
+	_, instance := seedAIFARRuntimeFixture(t, db, "unix:///var/run/docker.sock")
+	lock, err := db.AcquireAIFAROrchestrationLock(store.AIFAROrchestrationLock{
+		InstanceID: instance.ID, ServiceName: "permission", Operation: "update-artifact",
+		Actor: "owner", TaskID: "task-start-failure", ExpiresAt: time.Now().UTC().Add(time.Hour),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	artifactPath := filepath.Join(dir, "aifar-artifact-exact.jar")
+	neighborPath := filepath.Join(dir, "aifar-artifact-neighbor.jar")
+	if err := os.WriteFile(artifactPath, []byte("artifact"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(neighborPath, []byte("neighbor"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	lifecycle := api.runtime.runtimeDeploymentLockLifecycle(lock, "en", artifactPath)
+
+	if err := lifecycle.Finish(); err != nil {
+		t.Fatal(err)
+	}
+	if err := lifecycle.Finish(); err != nil {
+		t.Fatalf("lifecycle cleanup must be idempotent: %v", err)
+	}
+	if _, err := os.Stat(artifactPath); !os.IsNotExist(err) {
+		t.Fatalf("exact temporary artifact was not removed: %v", err)
+	}
+	if _, err := os.Stat(neighborPath); err != nil {
+		t.Fatalf("exact cleanup removed or damaged neighboring path: %v", err)
+	}
+	locks, err := db.ListAIFAROrchestrationLocks(instance.ID, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(locks) != 0 {
+		t.Fatalf("pre-start lifecycle finish leaked service lock: %+v", locks)
+	}
+}
+
+func aifarArtifactMultipart(t *testing.T, expectedGeneration, serviceName, fileName string) (*bytes.Reader, string) {
+	t.Helper()
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	if expectedGeneration != "" {
+		if err := writer.WriteField("expectedGeneration", expectedGeneration); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := writer.WriteField("service", serviceName); err != nil {
+		t.Fatal(err)
+	}
+	part, err := writer.CreateFormFile("artifact", fileName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := part.Write([]byte("test artifact")); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return bytes.NewReader(body.Bytes()), writer.FormDataContentType()
+}
 
 func TestDecodeMySQLBackupRequestAcceptsOnlyPositiveKeepLastOverride(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/api/v2/apps/instances/instance-1/backup", strings.NewReader(`{"name":"nightly","threads":4,"maxRateMBps":64,"keepLast":8,"schemas":["orders","billing"]}`))
@@ -886,6 +1238,25 @@ type fakePlannedLifecycleModule struct {
 	lastCleanupPolicyRetentionDays int
 	installStarted                 chan struct{}
 	installRelease                 chan struct{}
+}
+
+type fakeArtifactUpdateModule struct {
+	*fakePlannedLifecycleModule
+	artifactPath string
+}
+
+func (m *fakeArtifactUpdateModule) ValidateArtifactUpdate(_ context.Context, req registry.ArtifactUpdateRequest) error {
+	m.artifactPath = req.ArtifactLocalPath
+	return nil
+}
+
+func (m *fakeArtifactUpdateModule) PlanArtifactUpdate(_ context.Context, req registry.ArtifactUpdateRequest) ([]registry.InstallStepPlan, error) {
+	return []registry.InstallStepPlan{{Target: req.Instance.ID + ":" + req.ServiceName, Name: "update-artifact", Title: "Update artifact", Order: 1}}, nil
+}
+
+func (m *fakeArtifactUpdateModule) UpdateArtifact(_ context.Context, req registry.ArtifactUpdateRequest, _ registry.RunContext) error {
+	m.artifactPath = req.ArtifactLocalPath
+	return nil
 }
 
 func (m *fakePlannedLifecycleModule) Name() string { return m.name }

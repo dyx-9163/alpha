@@ -109,10 +109,13 @@ export function rollbackAifarRelease(instanceId: string, payload: RuntimeRollbac
   return apiPost<RuntimeTaskResponse>(`/apps/instances/${instanceId}/aifar/rollback`, payload)
 }
 
-export function updateAifarArtifact(instanceId: string, form: FormData, mode: 'single' | 'bundle') {
+export function updateAifarArtifact(instanceId: string, form: FormData, mode: 'single' | 'bundle', expectedGeneration?: number) {
   const endpoint = mode === 'bundle'
     ? `/apps/instances/${instanceId}/aifar/update-artifact-bundle`
     : `/apps/instances/${instanceId}/aifar/update-artifact`
+  if (mode === 'single' && Number.isFinite(expectedGeneration) && Number(expectedGeneration) > 0) {
+    form.set('expectedGeneration', String(expectedGeneration))
+  }
   return apiPostForm<RuntimeTaskResponse>(endpoint, form)
 }
 

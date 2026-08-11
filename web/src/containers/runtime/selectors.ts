@@ -39,6 +39,7 @@ export type RuntimeServiceActionGate = {
 }
 
 const requiredRuntimeServiceFeatures = [
+  'service-manifest-v1',
   'service-generation-v1',
   'per-service-reconcile',
   'per-service-restart',
@@ -107,7 +108,7 @@ export function summarizeRuntimeRestartScope(deployments: AifarRuntimeDeployment
 }
 
 export function runtimeDeploymentPhaseCounts(deployments: AifarRuntimeDeployment[]) {
-  const counts = { available: 0, progressing: 0, degraded: 0, offline: 0 }
+  const counts = { available: 0, progressing: 0, degraded: 0, offline: 0, unknown: 0 }
   for (const deployment of deployments) {
     counts[runtimeDeploymentPhase(deployment)] += 1
   }
@@ -119,28 +120,15 @@ export function runtimeServiceActionGate(
   deployments: AifarRuntimeDeployment[],
   context: RuntimeServiceGateContext
 ): RuntimeServiceActionGate {
-  if (!context.canManage) {
-    return disabledGate(context.permissionReason || 'containers.permissionDisabled')
-  }
+  if (!context.canManage) return disabledGate(context.permissionReason || 'containers.permissionDisabled')
   if (!deployments.some((deployment) => deployment.instanceId === target.instanceId && deployment.serviceName === target.serviceName)) {
     return disabledGate('containers.runtimeServiceMissingDisabled')
   }
   if (!Number.isFinite(Number(target.generation)) || Number(target.generation) <= 0) {
     return disabledGate('containers.runtimeGenerationUnavailableDisabled')
   }
-  if (normalize(context.instanceStatus) === 'maintenance') {
-    return disabledGate('containers.runtimeInstanceMaintenanceDisabled')
-  }
-  if (context.serverAvailable === false) {
-    return disabledGate('containers.runtimeServerUnavailableDisabled')
-  }
-  if (normalize(context.agentStatus) !== 'running') {
-    return disabledGate('containers.agentUnavailableDisabled')
-  }
-  const featureSet = new Set((context.agentFeatures || []).map(normalize).filter(Boolean))
-  if (context.agentError || requiredRuntimeServiceFeatures.some((feature) => !featureSet.has(feature))) {
-    return disabledGate('containers.agentCapabilityDisabled')
-  }
+  const globalReason = runtimeGlobalActionGate(context)
+  if (globalReason) return disabledGate(globalReason)
   const targetKey = `${target.instanceId}:${target.serviceName}`
   const owner = (context.activeTasks || []).find((task) => {
     const status = normalize(task.status)
@@ -154,6 +142,29 @@ export function runtimeServiceActionGate(
     }
   }
   return { disabled: false, reason: '', ownerTaskId: '' }
+}
+
+export function runtimeGlobalActionGate(context: RuntimeServiceGateContext) {
+  if (!context.canManage) return context.permissionReason || 'containers.permissionDisabled'
+  if (normalize(context.instanceStatus) === 'maintenance') return 'containers.runtimeInstanceMaintenanceDisabled'
+  if (context.serverAvailable === false) return 'containers.runtimeServerUnavailableDisabled'
+  if (normalize(context.agentStatus) !== 'running') return 'containers.agentUnavailableDisabled'
+  const featureSet = new Set((context.agentFeatures || []).map(normalize).filter(Boolean))
+  if (context.agentError || requiredRuntimeServiceFeatures.some((feature) => !featureSet.has(feature))) {
+    return 'containers.agentCapabilityDisabled'
+  }
+  return ''
+}
+
+export function reconcileRuntimeServiceTaskOwners(
+  owners: Record<string, string>,
+  tasks: RuntimeTrackedTask[]
+) {
+  const activeTaskIds = new Set(tasks
+    .filter((task) => !isTerminalTaskStatus(task.status))
+    .map((task) => normalize(task.id))
+    .filter(Boolean))
+  return Object.fromEntries(Object.entries(owners).filter(([, taskId]) => activeTaskIds.has(normalize(taskId))))
 }
 
 export function filterRuntimePodsByInstance(pods: AifarRuntimePod[], instanceId?: string) {
@@ -206,16 +217,15 @@ export function buildRuntimeLogPodOptions(pods: AifarRuntimePod[], serviceFilter
     }))
 }
 
-function runtimeDeploymentPhase(deployment: AifarRuntimeDeployment): 'available' | 'progressing' | 'degraded' | 'offline' {
+export function runtimeDeploymentPhase(deployment: AifarRuntimeDeployment): 'available' | 'progressing' | 'degraded' | 'offline' | 'unknown' {
   const activeTypes = new Set((deployment.conditions || [])
     .filter((condition) => condition.status === true)
     .map((condition) => condition.type))
-  const status = normalize(deployment.status)
-  if (activeTypes.has('Offline') || status === 'offline') return 'offline'
-  if (activeTypes.has('Degraded') || ['degraded', 'failed', 'unhealthy', 'missing', 'stale'].includes(status)) return 'degraded'
-  if (activeTypes.has('Progressing') || ['rolling', 'starting', 'pending', 'draining'].includes(status)) return 'progressing'
-  if (activeTypes.has('Available') || ['ready', 'running', 'available', 'active', 'success'].includes(status)) return 'available'
-  return 'degraded'
+  if (activeTypes.has('Offline')) return 'offline'
+  if (activeTypes.has('Degraded')) return 'degraded'
+  if (activeTypes.has('Progressing')) return 'progressing'
+  if (activeTypes.has('Available')) return 'available'
+  return 'unknown'
 }
 
 function disabledGate(reason: string): RuntimeServiceActionGate {
@@ -224,4 +234,8 @@ function disabledGate(reason: string): RuntimeServiceActionGate {
 
 function normalize(value?: string) {
   return String(value || '').trim()
+}
+
+function isTerminalTaskStatus(status?: string) {
+  return ['success', 'failed', 'cancelled'].includes(normalize(status))
 }

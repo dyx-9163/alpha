@@ -11,12 +11,14 @@ export function aifarRuntimeStatusKind(status?: string) {
   switch (String(status || '').trim()) {
     case 'ready':
     case 'running':
+    case 'available':
     case 'active':
     case 'success':
       return 'running'
     case 'starting':
     case 'rolling':
     case 'pending':
+    case 'progressing':
       return 'pending'
     case 'degraded':
     case 'draining':

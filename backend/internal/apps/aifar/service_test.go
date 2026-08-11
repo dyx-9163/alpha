@@ -4749,7 +4749,7 @@ func TestArtifactUpdateMutatesOnlyTargetServiceGeneration(t *testing.T) {
 
 	err := NewService(s, remote).UpdateArtifact(context.Background(), ArtifactUpdateRequest{
 		Instance: instance, Server: s.servers["srv-1"], Actor: "operator", TaskID: "task-update-oauth",
-		ServiceName: "oauth", ArtifactLocalPath: artifactPath, ArtifactFileName: "oauth.jar",
+		ServiceName: "oauth", ExpectedGeneration: 3, ArtifactLocalPath: artifactPath, ArtifactFileName: "oauth.jar",
 	}, fakeLogger{}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -4780,6 +4780,53 @@ func TestArtifactUpdateMutatesOnlyTargetServiceGeneration(t *testing.T) {
 		if strings.Contains(remote.updateScript, forbidden) {
 			t.Fatalf("artifact preparation script contains aggregate desired-state action %q:\n%s", forbidden, remote.updateScript)
 		}
+	}
+}
+
+func TestArtifactUpdateReusesPreheldExactLockAndRejectsStaleGenerationBeforeRemoteWork(t *testing.T) {
+	artifactPath := filepath.Join(t.TempDir(), "permission.jar")
+	if err := os.WriteFile(artifactPath, []byte("new permission jar"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	db, err := store.Open(filepath.Join(t.TempDir(), "aifar.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	instance, err := db.SaveAppInstance(installedAIFARInstance(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := store.Server{ID: "srv-1", Host: "10.0.0.10", DeployDir: "/aifar/apps"}
+	current := seedPerServiceDeployments(t, instance, map[string]int{"permission": 1}, map[string]int64{"permission": 4})[0]
+	if _, err := db.SaveAIFARDeployment(current); err != nil {
+		t.Fatal(err)
+	}
+	lock, err := db.AcquireAIFAROrchestrationLock(store.AIFAROrchestrationLock{
+		InstanceID: instance.ID, ServiceName: "permission", Operation: "update-artifact",
+		Actor: "operator", TaskID: "task-update", ExpiresAt: time.Now().UTC().Add(time.Hour),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	remote := &fakeRemote{}
+	err = NewService(db, remote).UpdateArtifact(context.Background(), ArtifactUpdateRequest{
+		Instance: instance, Server: server, Language: "en", Actor: "operator", TaskID: "task-update",
+		ServiceName: "permission", ArtifactLocalPath: artifactPath, ArtifactFileName: "permission.jar",
+		ExpectedGeneration: current.Generation - 1, LockID: lock.ID,
+	}, fakeLogger{}, nil)
+	if err == nil || !strings.Contains(err.Error(), deploymentGenerationConflictCode) {
+		t.Fatalf("expected stable stale-generation rejection, got %v", err)
+	}
+	if commands := remote.joinedCommands(); commands != "" {
+		t.Fatalf("stale generation performed remote work: %s", commands)
+	}
+	active, err := db.ListAIFAROrchestrationLocks(instance.ID, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(active) != 1 || active[0].ID != lock.ID {
+		t.Fatalf("service must not release handler-owned exact lock: %+v", active)
 	}
 }
 
@@ -4819,7 +4866,7 @@ func TestArtifactUpdateLockRenewalFailureCancelsPrepareAndSkipsMetadataCAS(t *te
 		done <- service.UpdateArtifact(ctx, ArtifactUpdateRequest{
 			Instance: instance, Server: store.Server{ID: "srv-1", Host: "10.0.0.10", DeployDir: "/aifar/apps"},
 			Language: "en", Actor: "operator", TaskID: "task-update-renewal-loss",
-			ServiceName: "permission", ArtifactLocalPath: artifactPath, ArtifactFileName: "permission.jar",
+			ServiceName: "permission", ExpectedGeneration: 1, ArtifactLocalPath: artifactPath, ArtifactFileName: "permission.jar",
 		}, fakeLogger{}, nil)
 	}()
 	requireHeartbeatRenewalCancellation(t, renewals.renewed, remote.reached, done, cancel)
@@ -4869,8 +4916,8 @@ func TestConcurrentDifferentServiceArtifactUpdatesPreserveMetadataAndLifecycleSt
 	service := NewService(barrier, &fakeRemote{})
 	errs := make(chan error, 2)
 	for _, request := range []ArtifactUpdateRequest{
-		{Instance: instance, Server: server, Language: "en", Actor: "operator-permission", TaskID: "task-update-permission", ServiceName: "permission", ArtifactLocalPath: permissionArtifact, ArtifactFileName: "permission.jar"},
-		{Instance: instance, Server: server, Language: "en", Actor: "operator-file", TaskID: "task-update-file", ServiceName: "file", ArtifactLocalPath: fileArtifact, ArtifactFileName: "file.jar"},
+		{Instance: instance, Server: server, Language: "en", Actor: "operator-permission", TaskID: "task-update-permission", ServiceName: "permission", ExpectedGeneration: 3, ArtifactLocalPath: permissionArtifact, ArtifactFileName: "permission.jar"},
+		{Instance: instance, Server: server, Language: "en", Actor: "operator-file", TaskID: "task-update-file", ServiceName: "file", ExpectedGeneration: 7, ArtifactLocalPath: fileArtifact, ArtifactFileName: "file.jar"},
 	} {
 		request := request
 		go func() {
@@ -4945,12 +4992,13 @@ func TestServiceUpdatesAIFARServiceArtifactAsPartialRelease(t *testing.T) {
 	remote := &fakeRemote{}
 	service := NewService(s, remote)
 	err := service.UpdateArtifact(context.Background(), ArtifactUpdateRequest{
-		Instance:          instance,
-		Server:            s.servers["srv-1"],
-		Language:          "en",
-		ServiceName:       "oauth",
-		ArtifactLocalPath: artifactPath,
-		ArtifactFileName:  "oauth.jar",
+		Instance:           instance,
+		Server:             s.servers["srv-1"],
+		Language:           "en",
+		ServiceName:        "oauth",
+		ExpectedGeneration: 1,
+		ArtifactLocalPath:  artifactPath,
+		ArtifactFileName:   "oauth.jar",
 	}, fakeLogger{}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -5010,17 +5058,19 @@ func TestServiceMarksFailedAIFARServiceArtifactRelease(t *testing.T) {
 		servers: map[string]store.Server{
 			"srv-1": {ID: "srv-1", Name: "app-1", Host: "10.0.0.10", DeployDir: "/aifar/apps"},
 		},
-		instances: []store.AppInstance{instance},
+		instances:   []store.AppInstance{instance},
+		deployments: seedPerServiceDeployments(t, instance, map[string]int{"oauth": 1}, nil),
 	}
 	service := NewService(s, &fakeRemote{failCommandContains: "update-aifar-artifact.sh"})
 	err := service.UpdateArtifact(context.Background(), ArtifactUpdateRequest{
-		Instance:          instance,
-		Server:            s.servers["srv-1"],
-		Language:          "en",
-		TaskID:            "task-single-failed",
-		ServiceName:       "oauth",
-		ArtifactLocalPath: artifactPath,
-		ArtifactFileName:  "oauth.jar",
+		Instance:           instance,
+		Server:             s.servers["srv-1"],
+		Language:           "en",
+		TaskID:             "task-single-failed",
+		ServiceName:        "oauth",
+		ExpectedGeneration: 1,
+		ArtifactLocalPath:  artifactPath,
+		ArtifactFileName:   "oauth.jar",
 	}, fakeLogger{}, nil)
 	if err == nil {
 		t.Fatal("expected artifact update to fail")
@@ -5958,12 +6008,13 @@ func TestServiceRejectsMismatchedJavaArtifactFileName(t *testing.T) {
 	}
 	service := Service{}
 	err := service.ValidateArtifactUpdate(ArtifactUpdateRequest{
-		Instance:          installedAIFARInstance(t),
-		Server:            store.Server{ID: "srv-1"},
-		Language:          "en",
-		ServiceName:       "gateway",
-		ArtifactLocalPath: artifactPath,
-		ArtifactFileName:  "alpha-oauth.jar",
+		Instance:           installedAIFARInstance(t),
+		Server:             store.Server{ID: "srv-1"},
+		Language:           "en",
+		ServiceName:        "gateway",
+		ExpectedGeneration: 1,
+		ArtifactLocalPath:  artifactPath,
+		ArtifactFileName:   "alpha-oauth.jar",
 	})
 	if err == nil {
 		t.Fatal("expected mismatched gateway/oauth artifact to be rejected")

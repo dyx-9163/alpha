@@ -7,7 +7,9 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"time"
 
 	"aifar-deployment/backend/internal/apps/registry"
 	"aifar-deployment/backend/internal/i18n"
@@ -56,6 +58,17 @@ func (a *API) updateAppInstanceArtifact(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusBadRequest, "INSTANCE_SERVER_REQUIRED", i18n.Text(lang, "api.instanceServerRequired"), map[string]any{"instanceId": id})
 		return
 	}
+	isAIFARSingleUpdate := strings.EqualFold(strings.TrimSpace(instance.App), "aifar")
+	var expectedGeneration int64
+	if isAIFARSingleUpdate {
+		serviceName = strings.ToLower(serviceName)
+		var valid bool
+		expectedGeneration, valid = strictPositiveMultipartInt64(r.FormValue("expectedGeneration"))
+		if !valid {
+			writeError(w, http.StatusBadRequest, "INVALID_AIFAR_ARTIFACT_EXPECTED_GENERATION", i18n.Text(lang, "api.aifarRuntimeDeploymentInvalid"), nil)
+			return
+		}
+	}
 	server, err := a.store.GetServer(instance.ServerID, true)
 	if err != nil {
 		respond(w, nil, err)
@@ -74,14 +87,18 @@ func (a *API) updateAppInstanceArtifact(w http.ResponseWriter, r *http.Request) 
 
 	actor := currentUser(r).Username
 	target := instance.ServerID
+	if isAIFARSingleUpdate {
+		target = instance.ID + ":" + serviceName
+	}
 	req := registry.ArtifactUpdateRequest{
-		Instance:          instance,
-		Server:            server,
-		Language:          lang,
-		Actor:             actor,
-		ServiceName:       serviceName,
-		ArtifactLocalPath: artifactPath,
-		ArtifactFileName:  header.Filename,
+		Instance:           instance,
+		Server:             server,
+		Language:           lang,
+		Actor:              actor,
+		ServiceName:        serviceName,
+		ExpectedGeneration: expectedGeneration,
+		ArtifactLocalPath:  artifactPath,
+		ArtifactFileName:   header.Filename,
 	}
 	if err := updateModule.ValidateArtifactUpdate(r.Context(), req); err != nil {
 		writeError(w, http.StatusBadRequest, "ARTIFACT_UPDATE_VALIDATE_FAILED", err.Error(), map[string]any{"app": instance.App, "service": serviceName})
@@ -102,17 +119,61 @@ func (a *API) updateAppInstanceArtifact(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusInternalServerError, "ARTIFACT_UPDATE_PLAN_STORE_FAILED", err.Error(), map[string]any{"app": instance.App, "service": serviceName})
 		return
 	}
-	locks, ok := a.acquireTaskOperationLocks(w, lang, task, appInstanceOperationLockSpecs("artifact-update", []store.AppInstance{instance}))
-	if !ok {
-		return
+	var (
+		operationLocks []store.OperationLock
+		runtimeLock    store.AIFAROrchestrationLock
+	)
+	if isAIFARSingleUpdate {
+		runtimeLock, err = a.store.AcquireAIFAROrchestrationLock(store.AIFAROrchestrationLock{
+			InstanceID: instance.ID, ServiceName: serviceName, Operation: "update-artifact",
+			Actor: actor, TaskID: task.ID, ExpiresAt: time.Now().UTC().Add(time.Hour),
+		})
+		if err != nil {
+			if cleanupErr := a.runtime.cleanupUnstartedRuntimeMutation(task.ID, "", lang); cleanupErr != nil {
+				a.runtime.writeRuntimePrestartCleanupError(w, lang)
+				return
+			}
+			var conflict store.AIFAROrchestrationLockConflict
+			if errors.As(err, &conflict) {
+				writeError(w, http.StatusConflict, "AIFAR_RUNTIME_SERVICE_LOCKED", i18n.Text(lang, "api.aifarRuntimeServiceLocked"), map[string]any{"ownerTaskId": conflict.Lock.TaskID})
+				return
+			}
+			writeError(w, http.StatusInternalServerError, "AIFAR_RUNTIME_SERVICE_LOCK_FAILED", i18n.Text(lang, "api.aifarRuntimeDeploymentTaskFailed"), nil)
+			return
+		}
+		freshDeployment, freshErr := a.currentAIFARDeployment(instance.ID, serviceName)
+		if freshErr != nil || freshDeployment.Generation != expectedGeneration {
+			if cleanupErr := a.runtime.cleanupUnstartedRuntimeMutation(task.ID, runtimeLock.ID, lang); cleanupErr != nil {
+				a.runtime.writeRuntimePrestartCleanupError(w, lang)
+				return
+			}
+			if freshErr != nil {
+				writeError(w, http.StatusBadRequest, "AIFAR_RUNTIME_DEPLOYMENT_NOT_FOUND", i18n.Text(lang, "api.aifarRuntimeDeploymentNotFound"), nil)
+				return
+			}
+			writeError(w, http.StatusConflict, "AIFAR_RUNTIME_DEPLOYMENT_GENERATION_CONFLICT", i18n.Text(lang, "aifar.deploymentControl.generationConflict"), map[string]any{"currentGeneration": freshDeployment.Generation})
+			return
+		}
+	} else {
+		var ok bool
+		operationLocks, ok = a.acquireTaskOperationLocks(w, lang, task, appInstanceOperationLockSpecs("artifact-update", []store.AppInstance{instance}))
+		if !ok {
+			return
+		}
 	}
 	removeArtifact = false
-	task, err = a.tasks.StartExistingWithLanguage(task, lang, func(ctx context.Context, log worker.Logger) error {
-		defer os.Remove(artifactPath)
+	taskID := task.ID
+	job := func(ctx context.Context, log worker.Logger) error {
+		if !isAIFARSingleUpdate {
+			defer os.Remove(artifactPath)
+		}
 		log.Info(i18n.Text(lang, "api.artifactUpdateRequested"), instance.App, instance.ID, serviceName)
 		if err := updateModule.UpdateArtifact(ctx, req, registry.RunContext{
-			TaskID: log.TaskID(),
-			Log:    log,
+			TaskID:   taskID,
+			Language: lang,
+			Actor:    actor,
+			LockID:   runtimeLock.ID,
+			Log:      log,
 			TargetLog: func(target string) registry.Logger {
 				return log.Target(target)
 			},
@@ -121,15 +182,47 @@ func (a *API) updateAppInstanceArtifact(w http.ResponseWriter, r *http.Request) 
 		}
 		log.Info(i18n.Text(lang, "api.artifactUpdateCompleted"), instance.App, instance.ID, serviceName)
 		return nil
-	})
+	}
+	var runtimeLifecycle worker.TaskLifecycle
+	if isAIFARSingleUpdate {
+		runtimeLifecycle = a.runtime.runtimeDeploymentLockLifecycle(runtimeLock, lang, artifactPath)
+		task, err = a.runtime.startExistingWithLanguageAndLifecycle(task, lang, job, runtimeLifecycle)
+	} else {
+		task, err = a.tasks.StartExistingWithLanguage(task, lang, job)
+	}
 	if err != nil {
-		a.releaseOperationLocks(locks)
-		_ = os.Remove(artifactPath)
+		if isAIFARSingleUpdate {
+			if finishErr := runtimeLifecycle.Finish(); finishErr != nil {
+				a.runtime.recordRuntimePrestartCleanupFailure(taskID, errors.New(i18n.Text(lang, "api.aifarRuntimePrestartCleanupFailed")))
+				a.runtime.writeRuntimePrestartCleanupError(w, lang)
+				return
+			}
+			if cleanupErr := a.runtime.cleanupUnstartedRuntimeMutation(taskID, "", lang); cleanupErr != nil {
+				a.runtime.writeRuntimePrestartCleanupError(w, lang)
+				return
+			}
+		} else {
+			a.releaseOperationLocks(operationLocks)
+			_ = os.Remove(artifactPath)
+		}
 	}
 	if err == nil {
 		a.audit(r, taskType, target, "running", task.ID)
 	}
 	respondTask(w, task, err)
+}
+
+func strictPositiveMultipartInt64(value string) (int64, bool) {
+	if value == "" || value != strings.TrimSpace(value) {
+		return 0, false
+	}
+	for _, char := range value {
+		if char < '0' || char > '9' {
+			return 0, false
+		}
+	}
+	parsed, err := strconv.ParseInt(value, 10, 64)
+	return parsed, err == nil && parsed > 0
 }
 
 func (a *API) updateAppInstanceArtifactBundle(w http.ResponseWriter, r *http.Request) {

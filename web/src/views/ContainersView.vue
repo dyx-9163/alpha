@@ -235,9 +235,11 @@ import {
   filterRuntimeServicesByInstance,
   findRuntimeIngressByInstance,
   findSelectedRuntimeInstance,
+  reconcileRuntimeServiceTaskOwners,
   resolveRuntimeAppInstance,
   runtimeDeploymentPhaseCounts,
   runtimeDiscoveryTarget,
+  runtimeGlobalActionGate,
   runtimeServiceActionGate,
   summarizeRuntimeRestartScope,
   runtimeServiceForDeployment as resolveRuntimeServiceForDeployment,
@@ -495,9 +497,16 @@ const runtimeMutationBusy = computed(() => runtimeRestartSubmitting.value || run
 const aifarRuntimeActionDisabledReason = computed(() => {
   if (runtimeInstanceManageDisabledReason.value) return runtimeInstanceManageDisabledReason.value
   if (runtimeMutationBusy.value) return t('containers.runtimeMutationInProgress')
-  if (String(aifarRuntime.value.agent?.status || '').trim() !== 'running') return t('containers.agentUnavailableDisabled')
-  if (String(aifarRuntime.value.agent?.error || '').trim()) return t('containers.agentCapabilityDisabled')
-  return ''
+  const reason = runtimeGlobalActionGate({
+    canManage: canManageApps.value,
+    permissionReason: deniedText.value,
+    instanceStatus: selectedRuntimeInstance.value?.status,
+    agentStatus: aifarRuntime.value.agent?.status,
+    agentError: aifarRuntime.value.agent?.error,
+    agentFeatures: aifarRuntime.value.agent?.features,
+    serverAvailable: Boolean(selectedServerId.value && selectedServer.value)
+  })
+  return reason ? t(reason) : ''
 })
 const runtimeRestartDisabledReason = computed(() => {
   if (aifarRuntimeActionDisabledReason.value) return aifarRuntimeActionDisabledReason.value
@@ -522,11 +531,27 @@ const runtimeServiceGateTasks = computed(() => {
     .map((target) => ({ id: `submitting:${target}`, status: 'pending', target }))
   const accepted = Object.entries(runtimeServiceTaskOwners.value).flatMap(([target, id]) => {
     const trackedOwner = taskProgress.items.find((item) => item.id === id)
-    if (trackedOwner && ['success', 'failed', 'cancelled'].includes(String(trackedOwner.status || '').trim())) return []
-    return [{ id, status: trackedOwner?.status || 'pending', target }]
+    if (!trackedOwner) return []
+    return [{ id, status: trackedOwner.status, target }]
   })
   return [...tracked, ...localSubmitting, ...accepted]
 })
+watch(
+  () => taskProgress.items.map((item) => ({ id: item.id, status: item.status, target: item.target })),
+  (tasks) => {
+    runtimeServiceTaskOwners.value = reconcileRuntimeServiceTaskOwners(runtimeServiceTaskOwners.value, tasks)
+  },
+  { deep: true, immediate: true }
+)
+async function refreshKnownRuntimeServiceTaskOwners() {
+  const tasks = taskProgress.items.map((item) => ({ id: item.id, status: item.status, target: item.target }))
+  runtimeServiceTaskOwners.value = reconcileRuntimeServiceTaskOwners(runtimeServiceTaskOwners.value, tasks)
+  const ownerTaskIds = Object.values(runtimeServiceTaskOwners.value)
+  if (!ownerTaskIds.length) return
+  await taskProgress.refreshKnownTasks(ownerTaskIds)
+  const refreshedTasks = taskProgress.items.map((item) => ({ id: item.id, status: item.status, target: item.target }))
+  runtimeServiceTaskOwners.value = reconcileRuntimeServiceTaskOwners(runtimeServiceTaskOwners.value, refreshedTasks)
+}
 const runtimeSummaryItems = computed(() => {
   const instance = selectedRuntimeInstance.value
   const config = selectedRuntimeConfig.value
@@ -535,6 +560,7 @@ const runtimeSummaryItems = computed(() => {
     { key: 'progressing', label: t('containers.runtimePhase.progressing'), value: runtimePhaseCounts.value.progressing, status: 'pending' },
     { key: 'degraded', label: t('containers.runtimePhase.degraded'), value: runtimePhaseCounts.value.degraded, status: 'failed' },
     { key: 'offline', label: t('containers.runtimePhase.offline'), value: runtimePhaseCounts.value.offline, status: 'degraded' },
+    { key: 'unknown', label: t('containers.runtimePhase.unknown'), value: runtimePhaseCounts.value.unknown, status: 'unknown' },
     { label: t('containers.aifarInstance'), value: instance ? runtimeInstanceLabel(instance) : '-' },
     { label: t('containers.installRoot'), value: instance?.installRoot || '-' },
     { label: t('containers.runtimeConfigVersion'), value: `${config.configVersion ?? '-'} / ${config.appliedVersion ?? '-'}`, status: config.lastApplyStatus || 'unknown' },
@@ -741,6 +767,7 @@ async function loadAifarRuntime(force = false, includePods = runtimeResourceTab.
     if (!query) {
       aifarRuntime.value = { runtimeStatus: 'unknown', agent: { status: 'unknown' }, instances: [], services: [], pods: [], ingress: [], warnings: [] }
       selectedRuntimeInstanceId.value = ''
+      runtimeServiceTaskOwners.value = {}
       return
     }
     const scope = includePods ? 'pods' : 'base'
@@ -776,6 +803,7 @@ async function loadAifarRuntime(force = false, includePods = runtimeResourceTab.
     if (!instances.some((instance) => instance.id === selectedRuntimeInstanceId.value)) {
       selectedRuntimeInstanceId.value = instances.find((instance) => !instance.legacy)?.id ?? instances[0]?.id ?? ''
     }
+    await refreshKnownRuntimeServiceTaskOwners()
   }
   return background ? execute() : withLoading(execute)
 }
@@ -1280,8 +1308,8 @@ function runtimeServiceForDeployment(row: AifarRuntimeDeployment): AifarRuntimeS
   return resolveRuntimeServiceForDeployment(row, runtimeServiceMap.value)
 }
 
-function runtimeDeploymentForService(serviceName: string) {
-  return selectedRuntimeDeployments.value.find((row) => row.serviceName === serviceName) ?? null
+function runtimeDeploymentForService(serviceName: string, instanceId = selectedRuntimeInstance.value?.id) {
+  return selectedRuntimeDeployments.value.find((row) => row.instanceId === instanceId && row.serviceName === serviceName) ?? null
 }
 
 function runtimeServiceActionGateResult(row: AifarRuntimeDeployment) {
@@ -1394,23 +1422,40 @@ async function submitAifarUpdate() {
     }))
     return
   }
-  const form = buildAifarArtifactForm(aifarUpdateMode.value, aifarUpdateService.value, aifarArtifactFile.value)
+  const mode = aifarUpdateMode.value
+  const deployment = mode === 'single' ? runtimeDeploymentForService(aifarUpdateService.value, instance.id) : null
+  if (mode === 'single') {
+    const reason = deployment ? runtimeServiceActionDisabledReason(deployment) : t('containers.runtimeServiceMissingDisabled')
+    if (reason) {
+      ElMessage.warning(reason)
+      return
+    }
+  }
+  const expectedGeneration = mode === 'single' ? Number(deployment?.generation || 0) : undefined
+  const target = deployment ? `${deployment.instanceId}:${deployment.serviceName}` : ''
+  const form = buildAifarArtifactForm(mode, aifarUpdateService.value, aifarArtifactFile.value)
+  if (target) runtimeServiceSubmitting.value = { ...runtimeServiceSubmitting.value, [target]: true }
   aifarUpdateSubmitting.value = true
   try {
-    const result = await updateAifarArtifact(instance.id, form, aifarUpdateMode.value)
+    const result = await updateAifarArtifact(instance.id, form, mode, expectedGeneration)
     aifarUpdateVisible.value = false
     aifarArtifactFile.value = null
     aifarUpdateInstanceOverride.value = null
     aifarUpdateTargetLabel.value = ''
-    const updatedServices = aifarUpdateMode.value === 'single'
-      ? selectedRuntimeDeployments.value.filter((row) => row.serviceName === aifarUpdateService.value)
+    const updatedServices = mode === 'single'
+      ? selectedRuntimeDeployments.value.filter((row) => row.instanceId === instance.id && row.serviceName === aifarUpdateService.value)
       : selectedRuntimeDeployments.value
-    recordRuntimeServiceTaskOwner(result.taskId, updatedServices)
     trackTask(result.taskId, t('apps.updateService'))
+    recordRuntimeServiceTaskOwner(result.taskId, updatedServices)
     ElMessage.success(t('apps.aifarUpdateAccepted'))
   } catch (err) {
-    ElMessage.error(err instanceof Error ? err.message : t('apps.aifarUpdateFailed'))
+    if (target && runtimeLockOwnerTaskId(err)) {
+      handleRuntimeMutationError(err, target, `${t('containers.updateService')} ${aifarUpdateService.value}`)
+    } else {
+      ElMessage.error(err instanceof Error ? err.message : t('apps.aifarUpdateFailed'))
+    }
   } finally {
+    if (target) runtimeServiceSubmitting.value = { ...runtimeServiceSubmitting.value, [target]: false }
     aifarUpdateSubmitting.value = false
   }
 }
@@ -1536,6 +1581,11 @@ async function restartAllAifarRuntime() {
       }
     )
   } catch {
+    return
+  }
+  const freshDisabledReason = runtimeRestartDisabledReason.value
+  if (freshDisabledReason) {
+    ElMessage.warning(freshDisabledReason)
     return
   }
   const query = targetQuery()
@@ -1770,7 +1820,7 @@ async function offlineAifarServices(rows: AifarRuntimeService[]) {
   } catch {
     return false
   }
-  const deployments = services.map(runtimeDeploymentForService).filter((row): row is AifarRuntimeDeployment => Boolean(row))
+  const deployments = services.map((serviceName) => runtimeDeploymentForService(serviceName)).filter((row): row is AifarRuntimeDeployment => Boolean(row))
   const results = await Promise.all(deployments.map((row) => submitRuntimeDeploymentMutation(row, {
     operation: 'offline',
     expectedGeneration: Number(row.generation || 0),
@@ -1876,8 +1926,8 @@ async function submitRuntimeDeploymentMutation(
   runtimeServiceSubmitting.value = { ...runtimeServiceSubmitting.value, [target]: true }
   try {
     const result = await mutateRuntimeDeployment(query, row.instanceId, row.serviceName, payload)
-    runtimeServiceTaskOwners.value = { ...runtimeServiceTaskOwners.value, [target]: result.taskId }
     trackTask(result.taskId, label)
+    runtimeServiceTaskOwners.value = { ...runtimeServiceTaskOwners.value, [target]: result.taskId }
     if (notify) ElMessage.success(t('containers.runtimeActionAccepted'))
     return true
   } catch (err) {
@@ -1901,8 +1951,8 @@ async function submitRuntimeDeploymentReconcile(row: AifarRuntimeDeployment, lab
       expectedGeneration: Number(row.generation || 0),
       reason: t('containers.reconcileServiceReason')
     })
-    runtimeServiceTaskOwners.value = { ...runtimeServiceTaskOwners.value, [target]: result.taskId }
     trackTask(result.taskId, label)
+    runtimeServiceTaskOwners.value = { ...runtimeServiceTaskOwners.value, [target]: result.taskId }
     if (notify) ElMessage.success(t('containers.runtimeActionAccepted'))
     return true
   } catch (err) {
@@ -1916,8 +1966,8 @@ async function submitRuntimeDeploymentReconcile(row: AifarRuntimeDeployment, lab
 function handleRuntimeMutationError(err: unknown, target: string, label: string) {
   const ownerTaskId = runtimeLockOwnerTaskId(err)
   if (ownerTaskId) {
-    runtimeServiceTaskOwners.value = { ...runtimeServiceTaskOwners.value, [target]: ownerTaskId }
     trackTask(ownerTaskId, label)
+    runtimeServiceTaskOwners.value = { ...runtimeServiceTaskOwners.value, [target]: ownerTaskId }
     ElMessage.warning(t('containers.runtimeServiceLockedByTask', { taskId: ownerTaskId }))
     return
   }
@@ -2083,6 +2133,7 @@ watch(runtimeResourceTab, (next) => {
   }
 })
 watch(selectedRuntimeInstanceId, () => {
+  runtimeServiceTaskOwners.value = {}
   runtimePodMetricsScheduler.stop()
   runtimePodServiceFilter.value = ''
   runtimeLogServiceFilter.value = []
@@ -2144,6 +2195,7 @@ watch([aifarUpdateService, aifarUpdateMode], () => {
   aifarArtifactFile.value = null
 })
 watch(selectedServerId, async () => {
+  runtimeServiceTaskOwners.value = {}
   runtimePodMetricsScheduler.stop()
   runtimeLogServiceFilter.value = []
   runtimeLogPodFilter.value = []
@@ -2166,6 +2218,7 @@ onMounted(async () => {
   await load()
 })
 onBeforeUnmount(() => {
+  runtimeServiceTaskOwners.value = {}
   runtimeStatusRefresh.dispose()
   runtimePodMetricsScheduler.dispose()
   closeRuntimeLogStream()

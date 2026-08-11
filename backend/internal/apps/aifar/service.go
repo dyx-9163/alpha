@@ -230,14 +230,16 @@ type CheckRequest struct {
 }
 
 type ArtifactUpdateRequest struct {
-	Instance          store.AppInstance
-	Server            store.Server
-	Language          string
-	Actor             string
-	TaskID            string
-	ServiceName       string
-	ArtifactLocalPath string
-	ArtifactFileName  string
+	Instance           store.AppInstance
+	Server             store.Server
+	Language           string
+	Actor              string
+	TaskID             string
+	ServiceName        string
+	ExpectedGeneration int64
+	LockID             string
+	ArtifactLocalPath  string
+	ArtifactFileName   string
 }
 
 type ArtifactBundleUpdateRequest struct {
@@ -1570,6 +1572,9 @@ func (s Service) ValidateArtifactUpdate(req ArtifactUpdateRequest) error {
 	if err := ensureK8sLikeInstance(req.Instance, copy); err != nil {
 		return err
 	}
+	if req.ExpectedGeneration <= 0 {
+		return errors.New(i18n.Text(req.Language, "aifar.runtimeDeployment.invalidRequest"))
+	}
 	_, err := artifactInfoFromRequest(req, copy)
 	return err
 }
@@ -1586,18 +1591,43 @@ func (s Service) UpdateArtifact(ctx context.Context, req ArtifactUpdateRequest, 
 		recorder.StartTarget(target)
 	}
 	step := newStepRunner(logForServer, recorder, target, updateSteps(copy), copy.StepStart, copy.StepDone, copy.StepFailed)
-	lockedInstance, lock, err := s.acquireOrchestrationLock(req.Instance.ID, "update-artifact", strings.TrimSpace(req.ServiceName), req.Actor, fallbackTaskID(req.TaskID, log))
+	serviceName := cleanAIFARServiceName(req.ServiceName)
+	lock := store.AIFAROrchestrationLock{ID: strings.TrimSpace(req.LockID), InstanceID: req.Instance.ID, ServiceName: serviceName, Operation: "update-artifact", TaskID: fallbackTaskID(req.TaskID, log)}
+	if lock.ID == "" {
+		lockedInstance, acquired, err := s.acquireOrchestrationLock(req.Instance.ID, lock.Operation, serviceName, req.Actor, lock.TaskID)
+		if err != nil {
+			msg := fmt.Sprintf(copy.UpdateFailed, err)
+			logForServer.Error("%s", msg)
+			finishTarget(recorder, target, "failed", msg)
+			return err
+		}
+		lock = acquired
+		defer s.releaseOrchestrationLock(lock)
+		lockedCtx, stopHeartbeat := s.startAIFAROrchestrationLockHeartbeat(ctx, lock)
+		defer stopHeartbeat()
+		ctx = lockedCtx
+		req.Instance = lockedInstance
+	} else {
+		if err := s.validatePreheldArtifactLock(ctx, lock); err != nil {
+			return err
+		}
+		freshInstance, err := s.store.GetAppInstance(req.Instance.ID)
+		if err != nil {
+			return err
+		}
+		req.Instance = freshInstance
+	}
+	control, ok := s.store.(aifarDeploymentControlStore)
+	if !ok {
+		return repairRequired("AIFAR_RUNTIME_CONTROL_STORE_UNAVAILABLE", nil)
+	}
+	currentDeployment, err := loadDeploymentForMutation(control, req.Instance.ID, serviceName)
 	if err != nil {
-		msg := fmt.Sprintf(copy.UpdateFailed, err)
-		logForServer.Error("%s", msg)
-		finishTarget(recorder, target, "failed", msg)
 		return err
 	}
-	defer s.releaseOrchestrationLock(lock)
-	lockedCtx, stopHeartbeat := s.startAIFAROrchestrationLockHeartbeat(ctx, lock)
-	defer stopHeartbeat()
-	ctx = lockedCtx
-	req.Instance = lockedInstance
+	if currentDeployment.Generation != req.ExpectedGeneration {
+		return deploymentError(deploymentGenerationConflictCode, deploymentGenerationConflictCode, "aifar.deploymentControl.generationConflict")
+	}
 
 	var artifact artifactInfo
 	var metadata map[string]any
@@ -1758,6 +1788,12 @@ func (s Service) UpdateArtifact(ctx context.Context, req ArtifactUpdateRequest, 
 			Operation:       "update-artifact",
 			LockAlreadyHeld: true,
 			LockID:          lock.ID,
+			Validate: func(_ store.AppInstance, deployment store.AIFARDeployment) error {
+				if deployment.Generation != req.ExpectedGeneration {
+					return deploymentError(deploymentGenerationConflictCode, deploymentGenerationConflictCode, "aifar.deploymentControl.generationConflict")
+				}
+				return nil
+			},
 			Mutate: func(manifest *runtimeagent.DeploymentManifest) error {
 				manifest.Spec.PodRevision = releaseID
 				manifest.Spec.Image = "aifar-" + artifact.ServiceName + ":" + releaseID
@@ -1824,6 +1860,28 @@ func (s Service) UpdateArtifact(ctx context.Context, req ArtifactUpdateRequest, 
 	logForServer.Info(copy.Updated, releaseID)
 	finishTarget(recorder, target, "success", "")
 	return nil
+}
+
+func (s Service) validatePreheldArtifactLock(ctx context.Context, expected store.AIFAROrchestrationLock) error {
+	inspector, ok := s.store.(interface {
+		ListAIFAROrchestrationLocks(instanceID string, activeOnly bool) ([]store.AIFAROrchestrationLock, error)
+	})
+	if !ok {
+		return repairRequired("AIFAR_RUNTIME_ORCHESTRATION_LOCK_FENCE_UNAVAILABLE", nil)
+	}
+	locks, err := inspector.ListAIFAROrchestrationLocks(expected.InstanceID, true)
+	if err != nil {
+		return repairRequired("AIFAR_RUNTIME_ORCHESTRATION_LOCK_LOST", err)
+	}
+	for _, lock := range locks {
+		if lock.ID == expected.ID && lock.InstanceID == expected.InstanceID &&
+			cleanAIFARServiceName(lock.ServiceName) == cleanAIFARServiceName(expected.ServiceName) &&
+			strings.TrimSpace(lock.Operation) == strings.TrimSpace(expected.Operation) &&
+			strings.TrimSpace(lock.TaskID) == strings.TrimSpace(expected.TaskID) {
+			return s.ensureAIFAROrchestrationLockOwnership(ctx, lock)
+		}
+	}
+	return repairRequired("AIFAR_RUNTIME_ORCHESTRATION_LOCK_LOST", store.ErrAIFAROrchestrationLockOwnership)
 }
 
 func artifactInfoFromRequest(req ArtifactUpdateRequest, copy UpdateCopy) (artifactInfo, error) {

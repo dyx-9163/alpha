@@ -118,6 +118,10 @@ export const useTaskProgressStore = defineStore('taskProgress', {
         const detail = await apiGet<TaskDetail>(`/tasks/${encodeURIComponent(id)}`)
         this.applyTaskDetail(id, detail)
       } catch (err) {
+        if (isNotFoundError(err)) {
+          this.dismiss(id)
+          return
+        }
         const item = this.items.find((entry) => entry.id === id)
         if (item) {
           item.error = err instanceof Error ? err.message : String(err)
@@ -125,6 +129,11 @@ export const useTaskProgressStore = defineStore('taskProgress', {
           this.persist()
         }
       }
+    },
+    async refreshKnownTasks(taskIds: string[]) {
+      const known = new Set(this.items.map((item) => item.id))
+      const ids = Array.from(new Set(taskIds.map(clean).filter((id) => id && known.has(id))))
+      await Promise.all(ids.map((id) => this.refreshTask(id)))
     },
     applyTaskDetail(taskId: string, detail: TaskDetail) {
       const task = detail.task
@@ -254,6 +263,10 @@ function isFloatingTask(item: Pick<TrackedTask, 'trackable'>) {
 
 function clean(value?: string) {
   return String(value ?? '').trim()
+}
+
+function isNotFoundError(err: unknown) {
+  return typeof err === 'object' && err !== null && Number((err as { status?: unknown }).status) === 404
 }
 
 function loadStoredTasks(): TrackedTask[] {

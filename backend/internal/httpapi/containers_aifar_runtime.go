@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -832,16 +833,36 @@ func (a *aifarRuntimeController) writeRuntimePrestartCleanupError(w http.Respons
 	writeError(w, http.StatusInternalServerError, "AIFAR_RUNTIME_PRESTART_CLEANUP_FAILED", i18n.Text(lang, "api.aifarRuntimePrestartCleanupFailed"), nil)
 }
 
-func (a *aifarRuntimeController) runtimeDeploymentLockLifecycle(lock store.AIFAROrchestrationLock, lang string) worker.TaskLifecycle {
+func (a *aifarRuntimeController) runtimeDeploymentLockLifecycle(lock store.AIFAROrchestrationLock, lang string, exactTemporaryPaths ...string) worker.TaskLifecycle {
 	stop := make(chan struct{})
 	done := make(chan struct{})
 	var startOnce sync.Once
 	var finishOnce sync.Once
+	var stateMu sync.Mutex
+	started := false
+	finished := false
 	var resultMu sync.Mutex
 	var lifecycleErr error
+	setLifecycleErr := func(err error) {
+		if err == nil {
+			return
+		}
+		resultMu.Lock()
+		if lifecycleErr == nil {
+			lifecycleErr = err
+		}
+		resultMu.Unlock()
+	}
 	return worker.TaskLifecycle{
 		Start: func(ctx context.Context, cancel context.CancelFunc) {
 			startOnce.Do(func() {
+				stateMu.Lock()
+				if finished {
+					stateMu.Unlock()
+					return
+				}
+				started = true
+				stateMu.Unlock()
 				go func() {
 					defer close(done)
 					ticker := time.NewTicker(a.aifarRuntimeLockHeartbeatInterval())
@@ -849,9 +870,7 @@ func (a *aifarRuntimeController) runtimeDeploymentLockLifecycle(lock store.AIFAR
 					for {
 						renewed, err := a.renewAIFARRuntimeLock(lock.ID, time.Now().UTC().Add(time.Hour))
 						if err != nil || !renewed {
-							resultMu.Lock()
-							lifecycleErr = errors.New(i18n.Text(lang, "api.aifarRuntimeServiceLockLost"))
-							resultMu.Unlock()
+							setLifecycleErr(errors.New(i18n.Text(lang, "api.aifarRuntimeServiceLockLost")))
 							cancel()
 							return
 						}
@@ -868,13 +887,25 @@ func (a *aifarRuntimeController) runtimeDeploymentLockLifecycle(lock store.AIFAR
 		},
 		Finish: func() error {
 			finishOnce.Do(func() {
+				stateMu.Lock()
+				finished = true
+				wasStarted := started
+				stateMu.Unlock()
 				close(stop)
-				<-done
+				if wasStarted {
+					<-done
+				}
 				released, err := a.releaseAIFARRuntimeLock(lock.ID)
 				if err != nil || !released {
-					resultMu.Lock()
-					lifecycleErr = errors.New(i18n.Text(lang, "api.aifarRuntimeServiceLockCleanupFailed"))
-					resultMu.Unlock()
+					setLifecycleErr(errors.New(i18n.Text(lang, "api.aifarRuntimeServiceLockCleanupFailed")))
+				}
+				for _, exactPath := range exactTemporaryPaths {
+					if strings.TrimSpace(exactPath) == "" {
+						continue
+					}
+					if err := os.Remove(exactPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+						setLifecycleErr(errors.New(i18n.Text(lang, "api.aifarRuntimeDeploymentTaskFailed")))
+					}
 				}
 			})
 			resultMu.Lock()
