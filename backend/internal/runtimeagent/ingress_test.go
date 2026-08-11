@@ -1,7 +1,6 @@
 package runtimeagent
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -171,12 +170,23 @@ func TestManagerLoadIsolatesCorruptManifestAndRecordsSpecRejected(t *testing.T) 
 	if err := os.WriteFile(filepath.Join(deploymentsDir, "Bad_Name.json"), []byte("super-secret-invalid-content"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	var logs bytes.Buffer
-	manager := NewManager(ManagerOptions{StateDir: stateDir, Runner: newControllerTestRunner(), ManifestStore: &store, Log: &logs})
+	var logs lockedBuffer
+	syncer := &fakeDiscoverySyncer{}
+	discovery := newDiscoveryController(discoveryControllerOptions{Syncer: syncer})
+	t.Cleanup(discovery.Stop)
+	manager := NewManager(ManagerOptions{
+		StateDir:            stateDir,
+		Runner:              newControllerTestRunner(),
+		ManifestStore:       &store,
+		Log:                 &logs,
+		discoveryController: discovery,
+	})
+	t.Cleanup(func() { manager.removeServiceControllers("admin") })
 	if err := manager.Load(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	waitForDeploymentCondition(t, manager, "permission", "Available", time.Second)
+	waitForDiscovery(t, time.Second, func() bool { return syncer.registered("permission") })
 	rejected := waitForDeploymentCondition(t, manager, "file", "Degraded", 250*time.Millisecond)
 	if condition := currentCondition(rejected); condition.Reason != "SpecRejected" {
 		t.Fatalf("corrupt manifest reason=%s, want SpecRejected", condition.Reason)

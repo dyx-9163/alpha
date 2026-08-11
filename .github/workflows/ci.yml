@@ -94,6 +94,6 @@ jobs:
       - name: Build backend
         run: pnpm backend:build
 
-      - name: Race-test worker and store
+      - name: Race-test runtime agent, worker, and store
         working-directory: backend
-        run: go test -race ./internal/worker ./internal/store
+        run: go test -race ./internal/runtimeagent ./internal/worker ./internal/store -count=1

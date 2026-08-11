@@ -13,6 +13,23 @@ import (
 	"time"
 )
 
+type lockedBuffer struct {
+	mu     sync.Mutex
+	buffer bytes.Buffer
+}
+
+func (buffer *lockedBuffer) Write(data []byte) (int, error) {
+	buffer.mu.Lock()
+	defer buffer.mu.Unlock()
+	return buffer.buffer.Write(data)
+}
+
+func (buffer *lockedBuffer) String() string {
+	buffer.mu.Lock()
+	defer buffer.mu.Unlock()
+	return buffer.buffer.String()
+}
+
 func TestReadyServiceQueuesRegistrationWithoutWaitingForPeers(t *testing.T) {
 	syncer := &fakeDiscoverySyncer{failFor: map[string]error{"file": errors.New("nacos down")}}
 	discovery := newDiscoveryController(discoveryControllerOptions{Syncer: syncer})
@@ -265,15 +282,16 @@ func TestDiscoveryWorkerPanicDoesNotKillPeersOrOwner(t *testing.T) {
 }
 
 func TestDiscoveryLogsStableReasonWithoutSecrets(t *testing.T) {
-	var log bytes.Buffer
+	var log lockedBuffer
 	syncer := &fakeDiscoverySyncer{failFor: map[string]error{"permission": errors.New("url=http://user:password@host token=secret")}}
-	discovery := newDiscoveryController(discoveryControllerOptions{Syncer: syncer, Log: &log})
+	discovery := newDiscoveryController(discoveryControllerOptions{Syncer: syncer, Clock: newFakeControllerClock(), Log: &log})
 	t.Cleanup(discovery.Stop)
 	discovery.EndpointChanged(readyDiscoveryEvent("permission", "permission-1"))
-	waitForDiscovery(t, time.Second, func() bool { return syncer.attempts("permission") == 1 })
+	want := "AIFAR discovery sync failed service=permission reason=RegistrationFailed\n"
+	waitForDiscovery(t, time.Second, func() bool { return log.String() == want })
 
 	got := log.String()
-	if got != "AIFAR discovery sync failed service=permission reason=RegistrationFailed\n" {
+	if got != want {
 		t.Fatalf("unexpected discovery log: %q", got)
 	}
 }
