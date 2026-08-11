@@ -2,6 +2,7 @@ package runtimeagent
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -9,6 +10,56 @@ import (
 	"testing"
 	"time"
 )
+
+func TestAgentStatusOmitsNacosWhileDiscoveryStillRegistersAndHeartbeats(t *testing.T) {
+	runner := newControllerTestRunner()
+	syncer := &fakeDiscoverySyncer{}
+	discovery := newDiscoveryController(discoveryControllerOptions{
+		Syncer: syncer, HeartbeatInterval: 5 * time.Millisecond,
+	})
+	t.Cleanup(discovery.Stop)
+	stateDir := t.TempDir()
+	manifestStore := &ManifestStore{StateDir: stateDir}
+	manager := NewManager(ManagerOptions{
+		StateDir: stateDir, Runner: runner, ManifestStore: manifestStore, discoveryController: discovery,
+	})
+	t.Cleanup(func() { _ = manager.Remove(context.Background(), "admin") })
+	manifest := controllerTestManifest("permission", 1, 1)
+	servicePort := freePort(t)
+	manifest.Service.Port = servicePort
+	manifest.Service.ListenPort = servicePort
+	manifest.Service.TargetPort = servicePort
+	legacy := runtimeSpecForDeployment(controllerTestConfig(), manifest)
+	legacy.Ingress.GatewayPort = freePort(t)
+	legacy.Ingress.WebPort = freePort(t)
+	if err := manager.Apply(context.Background(), legacy); err != nil {
+		t.Fatal(err)
+	}
+	if err := manifestStore.PutInstance(NormalizeInstanceConfig(InstanceConfig{
+		APIVersion: ManifestAPIVersion, InstanceID: legacy.InstanceID, InstallRoot: legacy.InstallRoot, Network: legacy.Network, Ingress: legacy.Ingress,
+	})); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.AcceptDeployment(context.Background(), manifest); err != nil {
+		t.Fatal(err)
+	}
+	waitForDiscovery(t, time.Second, func() bool {
+		return syncer.registered("permission") && syncer.count("heartbeat", "permission") > 0
+	})
+	statusJSON, err := json.Marshal(manager.Status())
+	if err != nil {
+		t.Fatal(err)
+	}
+	status := string(statusJSON)
+	for _, forbidden := range []string{"nacosRegistered", "nacosReady", "lastNacosHeartbeatAt", "lastNacosError", `"nacos"`} {
+		if strings.Contains(status, forbidden) {
+			t.Fatalf("ordinary Agent status leaked Nacos runtime field %q: %s", forbidden, status)
+		}
+	}
+	if !strings.Contains(status, `"serviceName":"permission"`) {
+		t.Fatalf("ordinary Agent status lost accepted service shape: %s", status)
+	}
+}
 
 func TestFiveMinuteFileFailureDoesNotDelayPermissionAvailabilityOrDiscovery(t *testing.T) {
 	runner := newControllerTestRunner()

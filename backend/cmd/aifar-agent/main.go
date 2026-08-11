@@ -29,6 +29,11 @@ const maxAgentRequestBodyBytes int64 = 1 << 20
 
 const verifiedRuntimeBootstrapPath = "/runtime/bootstrap-verified"
 
+const (
+	legacyReconcileRuntimeCommand = "reconcile-runtime"
+	legacyRestartRuntimeCommand   = "restart-runtime"
+)
+
 var (
 	agentInstancePattern  = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
 	agentServicePattern   = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,62}$`)
@@ -59,7 +64,7 @@ func main() {
 			os.Exit(1)
 		}
 		fmt.Println(string(data))
-	case "reconcile-runtime", "reconcile-ingress", "reconcile":
+	case legacyReconcileRuntimeCommand, "reconcile-ingress", "reconcile":
 		cmd := flag.NewFlagSet(os.Args[1], flag.ExitOnError)
 		specPath := cmd.String("spec", "", "path to runtime spec json")
 		addr := cmd.String("addr", "127.0.0.1:18081", "agent API address")
@@ -78,8 +83,8 @@ func main() {
 			os.Exit(1)
 		}
 		fmt.Println(`{"status":"reconciled"}`)
-	case "restart-runtime":
-		cmd := flag.NewFlagSet("restart-runtime", flag.ExitOnError)
+	case legacyRestartRuntimeCommand:
+		cmd := flag.NewFlagSet(legacyRestartRuntimeCommand, flag.ExitOnError)
 		specPath := cmd.String("spec", "", "path to runtime spec json")
 		addr := cmd.String("addr", "127.0.0.1:18081", "agent API address")
 		_ = cmd.Parse(os.Args[2:])
@@ -131,7 +136,12 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: aifar-agent health | status | apply-deployment --manifest <file> | get-deployment --instance <id> --service <name> | get-instance-snapshot --instance <id> | archive-legacy-runtime --instance <id> --sha256 <digest> | reconcile-deployment --instance <id> --service <name> | bootstrap-runtime --spec <file> | bootstrap-runtime-stdin --instance <id> --sha256 <digest> | reconcile-runtime --spec <file> | restart-runtime --spec <file> | reconcile-ingress --spec <file> | remove-instance [--instance admin] | register-nacos [--state-dir dir] | deregister-nacos [--state-dir dir] | serve [--addr 127.0.0.1:18081]")
+	fmt.Fprintln(os.Stderr, agentUsageText())
+}
+
+func agentUsageText() string {
+	return "usage: aifar-agent health | status | apply-deployment --manifest <file> | get-deployment --instance <id> --service <name> | get-instance-snapshot --instance <id> | archive-legacy-runtime --instance <id> --sha256 <digest> | reconcile-deployment --instance <id> --service <name> | bootstrap-runtime --spec <file> | bootstrap-runtime-stdin --instance <id> --sha256 <digest> | " +
+		legacyReconcileRuntimeCommand + " --spec <file> | " + legacyRestartRuntimeCommand + " --spec <file> | reconcile-ingress --spec <file> | remove-instance [--instance admin] | register-nacos [--state-dir dir] | deregister-nacos [--state-dir dir] | serve [--addr 127.0.0.1:18081]"
 }
 
 func readSpec(path string) (runtimeagent.RuntimeSpec, error) {

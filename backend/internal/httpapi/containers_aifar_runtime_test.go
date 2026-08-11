@@ -2,12 +2,14 @@ package httpapi
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -17,9 +19,115 @@ import (
 	"aifar-deployment/backend/internal/adapter"
 	aifarapp "aifar-deployment/backend/internal/apps/aifar"
 	"aifar-deployment/backend/internal/apps/registry"
+	"aifar-deployment/backend/internal/runtimeagent"
 	"aifar-deployment/backend/internal/store"
 	"aifar-deployment/backend/internal/worker"
 )
+
+type blockingTypedAgentRemote struct {
+	mu          sync.Mutex
+	agent       *runtimeagent.Manager
+	manifests   map[string]runtimeagent.DeploymentManifest
+	latest      runtimeagent.DeploymentManifest
+	started     chan struct{}
+	release     chan struct{}
+	startedOnce sync.Once
+	applyCalls  atomic.Int32
+	checkStdout string
+}
+
+func (r *blockingTypedAgentRemote) UploadFile(_ context.Context, _ store.Server, localPath, remotePath string, _ os.FileMode) error {
+	if !strings.Contains(remotePath, "/mutations/") || !strings.HasSuffix(remotePath, ".json") {
+		return nil
+	}
+	data, err := os.ReadFile(localPath)
+	if err != nil {
+		return err
+	}
+	var manifest runtimeagent.DeploymentManifest
+	if err := json.Unmarshal(data, &manifest); err != nil {
+		return err
+	}
+	r.mu.Lock()
+	r.manifests[remotePath] = manifest
+	r.mu.Unlock()
+	return nil
+}
+
+func (r *blockingTypedAgentRemote) Run(ctx context.Context, _ store.Server, command string) (adapter.CommandResult, error) {
+	switch {
+	case strings.Contains(command, "AIFAR_AGENT_CHECK"):
+		return adapter.CommandResult{Stdout: r.checkStdout}, nil
+	case strings.Contains(command, "apply-deployment"):
+		r.applyCalls.Add(1)
+		r.startedOnce.Do(func() { close(r.started) })
+		select {
+		case <-r.release:
+		case <-ctx.Done():
+			return adapter.CommandResult{}, ctx.Err()
+		}
+		r.mu.Lock()
+		var manifest runtimeagent.DeploymentManifest
+		found := false
+		for remotePath, candidate := range r.manifests {
+			if strings.Contains(command, remotePath) {
+				manifest, found = candidate, true
+				break
+			}
+		}
+		r.mu.Unlock()
+		if !found {
+			return adapter.CommandResult{}, errors.New("typed manifest was not uploaded")
+		}
+		accepted, err := r.agent.AcceptDeployment(ctx, manifest)
+		if err != nil {
+			return adapter.CommandResult{}, err
+		}
+		r.mu.Lock()
+		r.latest = manifest
+		r.mu.Unlock()
+		data, err := json.Marshal(accepted)
+		return adapter.CommandResult{Stdout: string(data)}, err
+	case strings.Contains(command, "aifar-agent get-deployment"):
+		r.mu.Lock()
+		manifest := r.latest
+		r.mu.Unlock()
+		state, ok := r.agent.DeploymentState(manifest.Metadata.InstanceID, manifest.Metadata.Name)
+		if !ok {
+			return adapter.CommandResult{}, errors.New("deployment not found")
+		}
+		data, err := json.Marshal(state)
+		return adapter.CommandResult{Stdout: string(data)}, err
+	case strings.Contains(command, "rm -f --"):
+		r.mu.Lock()
+		for remotePath := range r.manifests {
+			if strings.Contains(command, remotePath) {
+				delete(r.manifests, remotePath)
+			}
+		}
+		r.mu.Unlock()
+	}
+	return adapter.CommandResult{}, nil
+}
+
+type httpIntegrationAgentRunner struct{}
+
+func (httpIntegrationAgentRunner) Run(_ context.Context, name string, args ...string) (runtimeagent.CommandResult, error) {
+	if name != "docker" || len(args) == 0 {
+		return runtimeagent.CommandResult{}, nil
+	}
+	if args[0] == "run" {
+		for index := 0; index+1 < len(args); index++ {
+			if args[index] == "--name" {
+				return runtimeagent.CommandResult{Stdout: args[index+1]}, nil
+			}
+		}
+	}
+	if args[0] == "inspect" {
+		return runtimeagent.CommandResult{Stdout: "true|healthy|172.20.0.10"}, nil
+	}
+	return runtimeagent.CommandResult{}, nil
+}
 
 func TestAIFARRuntimeReturnsDegradedControlPlaneWhenAgentMissing(t *testing.T) {
 	api, db, secret := newAuthzTestAPI(t)
@@ -101,18 +209,19 @@ func TestAIFARRuntimeCanSkipPodsAndStats(t *testing.T) {
 
 func TestRuntimeResponseOmitsNacosStatusAndIncludesConditions(t *testing.T) {
 	api, db, secret := newAuthzTestAPI(t)
-	api.aifarAgentStatus = func(context.Context, store.Server) aifarRuntimeAgent {
-		return aifarRuntimeAgent{
-			Status: "running",
-			Instances: []aifarAgentInstanceStatus{{
-				InstanceID: "ignored",
-				ServiceStatus: []aifarAgentServiceStatus{{
-					ServiceName: "permission", EndpointCount: 1, ReadyEndpointCount: 1,
-				}},
-			}},
-		}
-	}
 	server, instance := seedAIFARRuntimeFixture(t, db, "unix:///var/run/docker.sock")
+	legacyAgentPayload := fmt.Sprintf(`{
+		"status":"running","nacos":{"password":"must-not-leak"},
+		"instances":[{"instanceId":%q,
+			"deploymentStatus":[{"serviceName":"permission","nacosRegistered":true,"nacosReady":true,"lastNacosHeartbeatAt":"must-not-leak","lastNacosError":"must-not-leak"}],
+			"serviceStatus":[{"serviceName":"permission","endpointCount":1,"readyEndpointCount":1,"nacosReady":true}]
+		}]
+	}`, instance.ID)
+	var parsedAgent aifarRuntimeAgent
+	if err := json.Unmarshal([]byte(legacyAgentPayload), &parsedAgent); err != nil {
+		t.Fatal(err)
+	}
+	api.aifarAgentStatus = func(context.Context, store.Server) aifarRuntimeAgent { return parsedAgent }
 	transitionAt := time.Date(2026, 8, 10, 1, 2, 3, 0, time.UTC)
 	if _, err := db.SaveAIFARDeployment(store.AIFARDeployment{
 		InstanceID: instance.ID, ServiceName: "permission", DesiredReplicas: 1,
@@ -1191,6 +1300,136 @@ func TestDifferentServiceTasksAcquireDifferentLocks(t *testing.T) {
 	}
 	if len(steps) != 1 || steps[0].Target != instance.ID+":permission" || steps[0].Name != "accept-service-intent" || steps[0].Status != "success" {
 		t.Fatalf("unexpected permission task steps: %+v", steps)
+	}
+}
+
+func TestSameServiceHTTPMutationConflictsBeforeSecondTaskStartsAcrossTypedAgent(t *testing.T) {
+	api, db, secret := newAuthzTestAPI(t)
+	server, instance := seedAIFARRuntimeFixture(t, db, "unix:///var/run/docker.sock")
+
+	manifest := runtimeagent.NormalizeDeploymentManifest(runtimeagent.DeploymentManifest{
+		APIVersion: runtimeagent.ManifestAPIVersion,
+		Kind:       runtimeagent.DeploymentManifestKind,
+		Metadata: runtimeagent.DeploymentMetadata{
+			InstanceID: instance.ID, Name: "permission", Generation: 1,
+		},
+		Spec: runtimeagent.DeploymentSpec{
+			ServiceName: "permission", DeploymentName: "alpha-permission", Image: "aifar-permission:rev-1",
+			PodRevision: "rev-1", Replicas: 1,
+		},
+		Service: runtimeagent.ServiceSpec{Name: "permission", AppName: "alpha-permission", Port: 38010, ListenPort: 38010, TargetPort: 38010},
+	})
+	rawManifest, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.SaveAIFARDeployment(store.AIFARDeployment{
+		InstanceID: instance.ID, ServiceName: "permission", DesiredReplicas: 1, CurrentRevision: "rev-1",
+		Generation: 1, ObservedGeneration: 1, Status: "Available", SpecJSON: string(rawManifest),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	stateDir := t.TempDir()
+	manifestStore := &runtimeagent.ManifestStore{StateDir: stateDir}
+	if err := manifestStore.PutInstance(runtimeagent.NormalizeInstanceConfig(runtimeagent.InstanceConfig{
+		APIVersion: runtimeagent.ManifestAPIVersion, InstanceID: instance.ID, InstallRoot: "/aifar/apps/admin", Network: "aifar-net",
+	})); err != nil {
+		t.Fatal(err)
+	}
+	agent := runtimeagent.NewManager(runtimeagent.ManagerOptions{StateDir: stateDir, Runner: httpIntegrationAgentRunner{}, ManifestStore: manifestStore})
+	if _, err := agent.AcceptDeployment(context.Background(), manifest); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = agent.Remove(context.Background(), instance.ID) })
+
+	agentPath := filepath.Join(t.TempDir(), "aifar-agent-linux-amd64")
+	if err := os.WriteFile(agentPath, []byte("agent"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("AIFAR_AGENT_BINARY", agentPath)
+	digest := sha256.Sum256([]byte("agent"))
+	status, _ := json.Marshal(map[string]any{
+		"status": "running", "version": "runtime-v2",
+		"features": []string{"reconcile-runtime", "local-runtime-controller", "endpoint-cache", "restart-runtime", "interactive-reconcile-priority", "runtime-delta-apply"},
+	})
+	remote := &blockingTypedAgentRemote{
+		agent: agent, manifests: map[string]runtimeagent.DeploymentManifest{}, started: make(chan struct{}), release: make(chan struct{}),
+		checkStdout: fmt.Sprintf("AIFAR_AGENT_CHECK\nagentFound=true\nagentPath=/usr/local/bin/aifar-agent\nstatus=%s\nsha256=%x\n", status, digest),
+	}
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(remote.release) }) }
+	t.Cleanup(release)
+	api.apps = registry.New(aifarapp.NewModule(db, remote))
+	api.aifarAgentStatus = func(context.Context, store.Server) aifarRuntimeAgent { return aifarRuntimeAgent{Status: "running"} }
+	token := issueTestToken(t, db, secret, "owner", "owner")
+	requestScale := func(replicas int) *httptest.ResponseRecorder {
+		t.Helper()
+		body := fmt.Sprintf(`{"operation":"scale","expectedGeneration":1,"replicas":%d,"reason":"integration"}`, replicas)
+		req := httptest.NewRequest(http.MethodPut, "/api/v2/apps/instances/"+instance.ID+"/runtime/deployments/permission?serverId="+server.ID, strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		api.Router().ServeHTTP(rec, req)
+		return rec
+	}
+
+	first := requestScale(2)
+	if first.Code != http.StatusAccepted {
+		t.Fatalf("first mutation: expected 202, got %d body=%s", first.Code, first.Body.String())
+	}
+	firstTaskID := responseTaskID(t, first)
+	select {
+	case <-remote.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first typed Agent acceptance did not start")
+	}
+	second := requestScale(3)
+	if second.Code != http.StatusConflict {
+		t.Fatalf("same service must conflict before starting a second task: got %d body=%s", second.Code, second.Body.String())
+	}
+	var conflict struct {
+		Code    string         `json:"code"`
+		Details map[string]any `json:"details"`
+	}
+	if err := json.Unmarshal(second.Body.Bytes(), &conflict); err != nil {
+		t.Fatal(err)
+	}
+	if conflict.Code != "AIFAR_RUNTIME_SERVICE_LOCKED" || len(conflict.Details) != 1 || conflict.Details["ownerTaskId"] != firstTaskID {
+		t.Fatalf("conflict did not expose only the owning task: %+v body=%s", conflict, second.Body.String())
+	}
+	if calls := remote.applyCalls.Load(); calls != 1 {
+		t.Fatalf("conflicting request reached the fake Agent: apply calls=%d", calls)
+	}
+
+	release()
+	waitForTaskStatus(t, db, firstTaskID, "success")
+	accepted, err := manifestStore.Get(instance.ID, "permission")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if accepted.Metadata.Generation != 2 || accepted.Spec.Replicas != 2 {
+		t.Fatalf("real Agent did not persist the first accepted desired state: %+v", accepted)
+	}
+	deployments, err := db.ListAIFARDeployments(instance.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(deployments) != 1 || deployments[0].Generation != 2 || deployments[0].DesiredReplicas != 2 || deployments[0].Status != "Accepted" {
+		t.Fatalf("control-plane acceptance mismatch: %+v", deployments)
+	}
+	locks, err := db.ListAIFAROrchestrationLocks(instance.ID, true)
+	if err != nil || len(locks) != 0 {
+		t.Fatalf("completed worker leaked lock: err=%v locks=%+v", err, locks)
+	}
+	assertAuditExists(t, db, "aifar.runtime.deployment.scale", "running", "owner", instance.ID+":permission")
+	targets, err := db.ListTaskTargets(firstTaskID)
+	if err != nil || len(targets) != 1 || targets[0].Target != instance.ID+":permission" || targets[0].Status != "success" {
+		t.Fatalf("task target evidence: err=%v targets=%+v", err, targets)
+	}
+	steps, err := db.ListTaskSteps(firstTaskID)
+	if err != nil || len(steps) != 1 || steps[0].Name != "accept-service-intent" || steps[0].Status != "success" {
+		t.Fatalf("task step evidence: err=%v steps=%+v", err, steps)
 	}
 }
 

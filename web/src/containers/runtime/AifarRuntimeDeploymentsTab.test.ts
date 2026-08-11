@@ -53,6 +53,24 @@ describe('AifarRuntimeDeploymentsTab selection', () => {
     expect(wrapper.text()).not.toContain('Nacos')
   })
 
+  it('does not render legacy Nacos fields even when an older API payload includes them', () => {
+    const legacyPayloadRow = {
+      ...deployment('permission', 1, { generation: 2, observedGeneration: 2 }),
+      nacosRegistered: true,
+      nacosReady: false,
+      lastNacosHeartbeatAt: 'must-not-render-heartbeat',
+      lastNacosError: 'must-not-render-error',
+      nacos: { password: 'must-not-render-secret' }
+    } as AifarRuntimeDeployment
+
+    const wrapper = mountDeploymentTab(legacyPayloadRow)
+
+    expect(wrapper.text()).toContain('permission')
+    for (const forbidden of ['Nacos', 'nacos', 'must-not-render-heartbeat', 'must-not-render-error', 'must-not-render-secret']) {
+      expect(wrapper.text()).not.toContain(forbidden)
+    }
+  })
+
   it('renders status-only legacy rows as unknown instead of inventing readiness', () => {
     const wrapper = mountDeploymentTab(deployment('gateway', 1, { status: 'ready', conditions: [] }))
 

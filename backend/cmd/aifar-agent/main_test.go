@@ -37,6 +37,18 @@ func TestStatusDoesNotRequireDockerHealth(t *testing.T) {
 	}
 }
 
+func TestLegacyRuntimeCLICommandsAreExplicitlyIsolated(t *testing.T) {
+	if legacyReconcileRuntimeCommand != "reconcile-runtime" || legacyRestartRuntimeCommand != "restart-runtime" {
+		t.Fatalf("legacy command names changed: reconcile=%q restart=%q", legacyReconcileRuntimeCommand, legacyRestartRuntimeCommand)
+	}
+	usageText := agentUsageText()
+	for _, command := range []string{legacyReconcileRuntimeCommand, legacyRestartRuntimeCommand} {
+		if !strings.Contains(usageText, command+" --spec <file>") {
+			t.Fatalf("legacy command %q missing from usage: %s", command, usageText)
+		}
+	}
+}
+
 func TestServeAddressMustBeLoopback(t *testing.T) {
 	for _, addr := range []string{"127.0.0.1:18081", "127.42.9.8:18081", "[::1]:18081", "localhost:18081", "LOCALHOST:18081"} {
 		if err := validateAgentListenAddress(addr); err != nil {

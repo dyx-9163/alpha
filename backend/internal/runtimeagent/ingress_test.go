@@ -1,13 +1,16 @@
 package runtimeagent
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"sort"
 	"strconv"
@@ -525,8 +528,9 @@ func dockerServiceFilter(args []string) string {
 }
 
 func TestManagerAppliesRuntimeSpecAsHostListeners(t *testing.T) {
-	gatewayPort := freePort(t)
-	webPort := freePort(t)
+	ports := []int{freePort(t), freePort(t)}
+	sort.Ints(ports)
+	gatewayPort, webPort := ports[1], ports[0]
 	runner := &fakeRunner{}
 	manager := NewManager(ManagerOptions{StateDir: t.TempDir(), Runner: runner})
 	spec := RuntimeSpec{
@@ -549,7 +553,7 @@ func TestManagerAppliesRuntimeSpecAsHostListeners(t *testing.T) {
 	}
 	status := manager.Status()
 	listeners, _ := status["listeners"].([]int)
-	if len(listeners) != 2 || listeners[0] != gatewayPort || listeners[1] != webPort {
+	if len(listeners) != 2 || !slices.Contains(listeners, gatewayPort) || !slices.Contains(listeners, webPort) {
 		t.Fatalf("expected host listeners on gateway/web ports, got %#v", status["listeners"])
 	}
 	if err := manager.Remove(context.Background(), "admin"); err != nil {
@@ -1369,11 +1373,50 @@ func TestReconcileRuntimeNacosFailureDoesNotMutateRuntimeServiceStatus(t *testin
 	if gateway.ServiceName == "" {
 		t.Fatalf("expected gateway runtime status, got %+v", statuses)
 	}
-	if gateway.LastNacosError != "" || gateway.NacosRegistered || gateway.NacosReady || gateway.LastNacosHeartbeatAt != "" {
-		t.Fatalf("Nacos failure mutated runtime service status: %+v", gateway)
+	raw, err := json.Marshal(gateway)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, forbidden := range []string{"nacosRegistered", "nacosReady", "lastNacosHeartbeatAt", "lastNacosError"} {
+		if bytes.Contains(raw, []byte(forbidden)) {
+			t.Fatalf("Nacos failure exposed Runtime service status %q: %s", forbidden, raw)
+		}
 	}
 	if err := manager.Remove(context.Background(), "admin"); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestManagerStatusOmitsNacosRuntimeStatusShape(t *testing.T) {
+	statusType := reflect.TypeOf(serviceRuntimeStatus{})
+	for _, forbidden := range []string{"NacosRegistered", "NacosReady", "LastNacosHeartbeatAt", "LastNacosError"} {
+		if _, exists := statusType.FieldByName(forbidden); exists {
+			t.Fatalf("ordinary Runtime service status still declares %s", forbidden)
+		}
+	}
+
+	manager := NewManager(ManagerOptions{StateDir: t.TempDir(), Runner: &fakeRunner{}})
+	servicePort := freePort(t)
+	spec := RuntimeSpec{
+		InstanceID:  "legacy-status-shape",
+		InstallRoot: t.TempDir(),
+		Network:     "aifar-network",
+		Services:    []ServiceSpec{{Name: "permission", AppName: "alpha-permission", Port: servicePort, ListenPort: servicePort, TargetPort: servicePort}},
+		Nacos:       NacosSpec{Namespace: "must-not-appear", Group: "must-not-appear"},
+		Ingress:     IngressSpec{GatewayPort: freePort(t), WebPort: freePort(t)},
+	}
+	if err := manager.Apply(context.Background(), spec); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = manager.Remove(context.Background(), spec.InstanceID) })
+	raw, err := json.Marshal(manager.Status())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, forbidden := range []string{`"nacos"`, "must-not-appear", "nacosRegistered", "nacosReady", "lastNacosHeartbeatAt", "lastNacosError"} {
+		if bytes.Contains(raw, []byte(forbidden)) {
+			t.Fatalf("ordinary Runtime status exposes %q: %s", forbidden, raw)
+		}
 	}
 }
 

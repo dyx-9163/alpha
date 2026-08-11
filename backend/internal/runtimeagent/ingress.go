@@ -131,10 +131,6 @@ type serviceRuntimeStatus struct {
 	AppName               string `json:"appName,omitempty"`
 	EndpointCount         int    `json:"endpointCount"`
 	ReadyEndpointCount    int    `json:"readyEndpointCount"`
-	NacosRegistered       bool   `json:"nacosRegistered,omitempty"`
-	NacosReady            bool   `json:"nacosReady,omitempty"`
-	LastNacosHeartbeatAt  string `json:"lastNacosHeartbeatAt,omitempty"`
-	LastNacosError        string `json:"lastNacosError,omitempty"`
 	Status                string `json:"status"`
 	LastEndpointRefreshAt string `json:"lastEndpointRefreshAt,omitempty"`
 }
@@ -639,7 +635,6 @@ func (m *Manager) Status() map[string]any {
 			"endpoints":        m.endpointsForInstanceLocked(spec.InstanceID),
 			"deploymentStatus": m.deploymentStatusForInstanceLocked(spec.InstanceID),
 			"serviceStatus":    m.serviceStatusForInstanceLocked(spec.InstanceID),
-			"nacos":            spec.Nacos,
 		})
 	}
 	return map[string]any{
@@ -1709,58 +1704,6 @@ func (m *Manager) setDeploymentStatusFromDocker(ctx context.Context, spec Runtim
 	m.mu.Lock()
 	m.deployments[endpointKey(spec.InstanceID, deployment.ServiceName)] = runtimeStatus
 	m.mu.Unlock()
-}
-
-func (m *Manager) MarkNacosProxyStatus(specs []RuntimeSpec, syncErr error) {
-	now := time.Now().Format(time.RFC3339)
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	for _, raw := range specs {
-		spec := NormalizeSpec(raw)
-		_, hasEnv := nacosEnvForSpec(spec)
-		for _, service := range spec.Services {
-			if !serviceRegistersInNacos(spec, service) {
-				continue
-			}
-			key := endpointKey(spec.InstanceID, service.Name)
-			status := m.services[key]
-			status.InstanceID = spec.InstanceID
-			status.ServiceName = service.Name
-			status.AppName = serviceAppName(service)
-			if replicas, ok := serviceDesiredReplicas(spec, service.Name); ok && replicas == 0 {
-				status.NacosRegistered = false
-				status.NacosReady = false
-				status.LastNacosError = ""
-				if status.Status == "" || status.Status == "ready" || status.Status == "no-endpoints" {
-					status.Status = "offline"
-				}
-				m.services[key] = status
-				continue
-			}
-			if !hasEnv {
-				status.NacosRegistered = false
-				status.NacosReady = false
-				status.LastNacosError = "nacos env is not configured"
-			} else if syncErr != nil {
-				status.NacosRegistered = false
-				status.NacosReady = false
-				status.LastNacosError = strings.TrimSpace(syncErr.Error())
-			} else {
-				status.NacosRegistered = true
-				status.NacosReady = true
-				status.LastNacosHeartbeatAt = now
-				status.LastNacosError = ""
-			}
-			if status.Status == "" {
-				if status.EndpointCount == 0 {
-					status.Status = "no-endpoints"
-				} else {
-					status.Status = "ready"
-				}
-			}
-			m.services[key] = status
-		}
-	}
 }
 
 func endpointKey(instanceID, service string) string {
