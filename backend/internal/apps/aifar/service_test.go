@@ -5249,8 +5249,10 @@ func TestServiceUninstallsRuntimeAgentWithoutRemovingBusinessPods(t *testing.T) 
 	}
 	for _, want := range []string{
 		`AIFAR_AGENT_UNINSTALL`,
+		`set -eu`,
 		`aifar-agent deregister-nacos --spec "$SPEC_PATH"`,
 		`aifar-agent remove-instance --instance "$INSTANCE_ID"`,
+		`[ ! -e "$INSTANCE_STATE" ]`,
 		`systemctl stop aifar-agent`,
 		`rm -f /etc/systemd/system/aifar-agent.service`,
 		`rm -f /usr/local/bin/aifar-agent`,
@@ -5265,6 +5267,9 @@ func TestServiceUninstallsRuntimeAgentWithoutRemovingBusinessPods(t *testing.T) 
 	}
 	if strings.Contains(remote.runtimeAgentUninstall, "docker rm") || strings.Contains(remote.runtimeAgentUninstall, "rm -rf \"$INSTALL_ROOT\"") {
 		t.Fatalf("agent uninstall should not remove business pods or install root:\n%s", remote.runtimeAgentUninstall)
+	}
+	if strings.Contains(remote.runtimeAgentUninstall, `remove-instance --instance "$INSTANCE_ID" >/dev/null 2>&1 || true`) || strings.Contains(remote.runtimeAgentUninstall, `rm -rf "/var/lib/aifar-agent/instances/$INSTANCE_ID"`) {
+		t.Fatalf("agent uninstall must require durable Agent retirement instead of masking or replacing it:\n%s", remote.runtimeAgentUninstall)
 	}
 }
 

@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -935,6 +936,196 @@ func TestControllerSpecRejectedDoesNotRetryUntilNewGeneration(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitForDeploymentCondition(t, manager, "permission", "Available", time.Second)
+}
+
+func TestControllerTransientManifestReadsRetrySameGeneration(t *testing.T) {
+	tests := []struct {
+		name      string
+		failureAt string
+		failure   error
+		retry     func(*testing.T, *Manager, *fakeControllerClock)
+	}{
+		{
+			name:      "manual retry after instance permission failure",
+			failureAt: "/aifar/apps/admin",
+			failure:   &os.PathError{Op: "lstat", Path: "/redacted", Err: os.ErrPermission},
+			retry: func(t *testing.T, manager *Manager, _ *fakeControllerClock) {
+				manager.ReconcileDeployment("admin", "permission")
+			},
+		},
+		{
+			name:      "automatic retry after deployment IO failure",
+			failureAt: "/aifar/apps/admin/env/permission.env",
+			failure:   &os.PathError{Op: "lstat", Path: "/redacted", Err: syscall.EIO},
+			retry: func(t *testing.T, _ *Manager, clock *fakeControllerClock) {
+				clock.fireNext(t)
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			stateDir := t.TempDir()
+			store := &ManifestStore{StateDir: stateDir}
+			var failNext atomic.Bool
+			store.manifestPathLstat = func(path string) (os.FileInfo, error) {
+				if path == test.failureAt && failNext.CompareAndSwap(true, false) {
+					return nil, test.failure
+				}
+				if path == "/" || path == "/aifar" || path == "/aifar/apps" || path == "/aifar/apps/admin" || path == "/aifar/apps/admin/env" {
+					return controllerPathInfo{mode: os.ModeDir}, nil
+				}
+				return nil, os.ErrNotExist
+			}
+			if err := store.PutInstance(controllerTestConfig()); err != nil {
+				t.Fatal(err)
+			}
+			clock := newFakeControllerClock()
+			var armOnce sync.Once
+			manager := NewManager(ManagerOptions{
+				StateDir:        stateDir,
+				Runner:          newControllerTestRunner(),
+				ManifestStore:   store,
+				controllerClock: clock,
+				controllerBeforeRead: func(_, _ string) {
+					armOnce.Do(func() { failNext.Store(true) })
+				},
+			})
+			manifest := controllerTestManifest("permission", 1, 1)
+			manifest.Spec.EnvFiles = []string{"/aifar/apps/admin/env/permission.env"}
+			if _, err := manager.AcceptDeployment(context.Background(), manifest); err != nil {
+				t.Fatal(err)
+			}
+			degraded := waitForDeploymentCondition(t, manager, "permission", deploymentConditionDegraded, time.Second)
+			initialReason := currentCondition(degraded).Reason
+			test.retry(t, manager, clock)
+			deadline := time.Now().Add(100 * time.Millisecond)
+			var available DeploymentState
+			for time.Now().Before(deadline) {
+				state, ok := manager.DeploymentState("admin", "permission")
+				if ok && currentCondition(state).Type == deploymentConditionAvailable {
+					available = state
+					break
+				}
+				time.Sleep(time.Millisecond)
+			}
+			if available.Generation == 0 {
+				state, _ := manager.DeploymentState("admin", "permission")
+				t.Fatalf("same-generation retry did not recover after transient read; initial_reason=%s state=%+v", initialReason, state)
+			}
+			if initialReason != "AgentUnavailable" {
+				t.Fatalf("transient read reason=%s, want AgentUnavailable", initialReason)
+			}
+			if available.Generation != 1 || available.ObservedGeneration != 1 {
+				t.Fatalf("same-generation retry state=%+v", available)
+			}
+		})
+	}
+}
+
+func TestAcceptDeploymentPostPutCannotRegressNewerManagerState(t *testing.T) {
+	stateDir := t.TempDir()
+	store := &ManifestStore{StateDir: stateDir}
+	if err := store.PutInstance(controllerTestConfig()); err != nil {
+		t.Fatal(err)
+	}
+	olderPutReturned := make(chan struct{})
+	releaseOlder := make(chan struct{})
+	controllerReadEntered := make(chan struct{})
+	releaseControllerRead := make(chan struct{})
+	var readOnce sync.Once
+	manager := NewManager(ManagerOptions{
+		StateDir:      stateDir,
+		Runner:        newControllerTestRunner(),
+		ManifestStore: store,
+		controllerAfterManifestPut: func(manifest DeploymentManifest) {
+			if manifest.Metadata.Generation == 1 {
+				close(olderPutReturned)
+				<-releaseOlder
+			}
+		},
+		controllerBeforeRead: func(_, _ string) {
+			readOnce.Do(func() {
+				close(controllerReadEntered)
+				<-releaseControllerRead
+			})
+		},
+	})
+	t.Cleanup(func() {
+		select {
+		case <-releaseOlder:
+		default:
+			close(releaseOlder)
+		}
+		select {
+		case <-releaseControllerRead:
+		default:
+			close(releaseControllerRead)
+		}
+	})
+
+	olderDone := make(chan error, 1)
+	go func() {
+		_, err := manager.AcceptDeployment(context.Background(), controllerTestManifest("permission", 1, 1))
+		olderDone <- err
+	}()
+	select {
+	case <-olderPutReturned:
+	case <-time.After(time.Second):
+		t.Fatal("generation 1 did not reach the post-Put barrier")
+	}
+	if _, err := manager.AcceptDeployment(context.Background(), controllerTestManifest("permission", 2, 0)); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-controllerReadEntered:
+	case <-time.After(time.Second):
+		t.Fatal("newer controller did not reach the read barrier")
+	}
+	persisted, err := store.Get("admin", "permission")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persisted.Metadata.Generation != 2 {
+		t.Fatalf("persisted generation=%d, want 2", persisted.Metadata.Generation)
+	}
+	close(releaseOlder)
+	if err := <-olderDone; err != nil {
+		t.Fatal(err)
+	}
+
+	key := endpointKey("admin", "permission")
+	manager.controllerMu.Lock()
+	cached := manager.manifestCache[key]
+	state := manager.controllerStates[key]
+	manager.controllerMu.Unlock()
+	if cached.Metadata.Generation != 2 || state.Generation != 2 {
+		t.Fatalf("post-Put completion regressed manager state: cache=%d state=%+v", cached.Metadata.Generation, state)
+	}
+	if currentCondition(state).Type != deploymentConditionAccepted {
+		t.Fatalf("newer acceptance condition was replaced: %+v", state)
+	}
+}
+
+func TestAcceptDeploymentSameGenerationPreservesAvailableObservation(t *testing.T) {
+	manager := newControllerTestManager(t, newControllerTestRunner())
+	manifest := controllerTestManifest("permission", 1, 1)
+	if _, err := manager.AcceptDeployment(context.Background(), manifest); err != nil {
+		t.Fatal(err)
+	}
+	before := waitForDeploymentCondition(t, manager, "permission", deploymentConditionAvailable, time.Second)
+	if _, err := manager.AcceptDeployment(context.Background(), manifest); err != nil {
+		t.Fatal(err)
+	}
+	after, ok := manager.DeploymentState("admin", "permission")
+	if !ok {
+		t.Fatal("same-generation acceptance removed deployment state")
+	}
+	if currentCondition(after).Type != deploymentConditionAvailable || after.ObservedGeneration != 1 || after.CurrentReplicas != 1 || after.ReadyReplicas != 1 {
+		t.Fatalf("same-generation acceptance reset observation: before=%+v after=%+v", before, after)
+	}
+	if !currentCondition(after).LastTransitionTime.Equal(currentCondition(before).LastTransitionTime) {
+		t.Fatalf("same-generation acceptance changed available transition time: before=%s after=%s", currentCondition(before).LastTransitionTime, currentCondition(after).LastTransitionTime)
+	}
 }
 
 func TestManifestStoreConcurrentSameGenerationAcceptsOnlyOneHash(t *testing.T) {

@@ -89,17 +89,32 @@ func (m *Manager) AcceptDeployment(ctx context.Context, manifest DeploymentManif
 	if err != nil {
 		return acceptance, err
 	}
+	if m.controllerAfterManifestPut != nil {
+		m.controllerAfterManifestPut(manifest)
+	}
 
 	key := endpointKey(manifest.Metadata.InstanceID, manifest.Metadata.Name)
 	m.controllerMu.Lock()
-	m.manifestCache[key] = manifest
+	cached, cachedOK := m.manifestCache[key]
+	previous, stateOK := m.controllerStates[key]
+	if (cachedOK && cached.Metadata.Generation > manifest.Metadata.Generation) || (stateOK && previous.Generation > manifest.Metadata.Generation) {
+		m.controllerMu.Unlock()
+		return acceptance, nil
+	}
 	controller := m.controllerForLocked(manifest.Metadata.InstanceID, manifest.Metadata.Name)
-	previous := m.controllerStates[key]
-	m.controllerStates[key] = transitionDeploymentState(previous, manifest, acceptance.SpecHash, deploymentConditionAccepted, "ManifestAccepted", 0, 0, m.controllerClock.Now())
+	alreadyObserved := cachedOK && cached.Metadata.Generation == manifest.Metadata.Generation && stateOK && previous.Generation == manifest.Metadata.Generation && previous.SpecHash == acceptance.SpecHash && previous.ObservedGeneration >= manifest.Metadata.Generation
+	if !cachedOK || cached.Metadata.Generation < manifest.Metadata.Generation {
+		m.manifestCache[key] = manifest
+	}
+	if !stateOK || previous.Generation < manifest.Metadata.Generation || previous.SpecHash != acceptance.SpecHash {
+		m.controllerStates[key] = transitionDeploymentState(previous, manifest, acceptance.SpecHash, deploymentConditionAccepted, "ManifestAccepted", 0, 0, m.controllerClock.Now())
+	}
 	m.controllerMu.Unlock()
 
 	controller.supersede(manifest.Metadata.Generation)
-	controller.enqueue()
+	if !alreadyObserved {
+		controller.enqueue()
+	}
 	return acceptance, nil
 }
 
@@ -606,15 +621,23 @@ func (controller *serviceController) reconcileOnce() reconcileResult {
 
 	manifest, err := manager.manifestStore.Get(controller.instanceID, controller.service)
 	if err != nil {
-		controller.markRejected(cachedGeneration)
-		manager.setControllerRejected(controller.instanceID, controller.service, err)
-		return reconcileResult{kind: reconcileSpecRejected}
+		if manifestReadFailureIsPermanent(err) {
+			controller.markRejected(cachedGeneration)
+			manager.setControllerRejected(controller.instanceID, controller.service, err)
+			return reconcileResult{kind: reconcileSpecRejected}
+		}
+		manager.setControllerReadUnavailable(controller.instanceID, controller.service)
+		return reconcileResult{kind: reconcileRetry}
 	}
 	config, err := manager.manifestStore.GetInstance(controller.instanceID)
 	if err != nil {
-		controller.markRejected(manifest.Metadata.Generation)
-		manager.setControllerRejected(controller.instanceID, controller.service, err)
-		return reconcileResult{kind: reconcileSpecRejected}
+		if manifestReadFailureIsPermanent(err) {
+			controller.markRejected(manifest.Metadata.Generation)
+			manager.setControllerRejected(controller.instanceID, controller.service, err)
+			return reconcileResult{kind: reconcileSpecRejected}
+		}
+		manager.setControllerReadUnavailable(controller.instanceID, controller.service)
+		return reconcileResult{kind: reconcileRetry}
 	}
 	if manager.controllerBeforeActivate != nil {
 		manager.controllerBeforeActivate(manifest)
@@ -667,6 +690,10 @@ func (controller *serviceController) reconcileOnce() reconcileResult {
 		manager.setControllerCondition(manifest, hash, deploymentConditionAvailable, "MinimumReplicasAvailable", true)
 	}
 	return reconcileResult{kind: reconcileStable}
+}
+
+func manifestReadFailureIsPermanent(err error) bool {
+	return errors.Is(err, errInvalidManifestStateContent) || errors.Is(err, errUnsafeManifestFilesystemShape)
 }
 
 func (controller *serviceController) rejectsGeneration(generation int64) bool {
@@ -736,6 +763,24 @@ func (m *Manager) setControllerRejected(instanceID, serviceName string, reconcil
 	m.controllerStates[key] = state
 	m.controllerMu.Unlock()
 	logf(m.log, "AIFAR deployment manifest rejected instance=%s service=%s error=%v\n", instanceID, serviceName, reconcileErr)
+}
+
+func (m *Manager) setControllerReadUnavailable(instanceID, serviceName string) {
+	key := endpointKey(instanceID, serviceName)
+	currentReplicas, readyReplicas := m.controllerReplicaCounts(key)
+	m.controllerMu.Lock()
+	manifest, ok := m.manifestCache[key]
+	state := m.controllerStates[key]
+	if ok {
+		state = transitionDeploymentState(state, manifest, state.SpecHash, deploymentConditionDegraded, "AgentUnavailable", currentReplicas, readyReplicas, m.controllerClock.Now())
+	} else {
+		state.InstanceID = instanceID
+		state.ServiceName = serviceName
+		state.Conditions = []DeploymentCondition{{Type: deploymentConditionDegraded, Status: true, Reason: "AgentUnavailable", Generation: state.Generation, LastTransitionTime: m.controllerClock.Now()}}
+	}
+	m.controllerStates[key] = state
+	m.controllerMu.Unlock()
+	logf(m.log, "AIFAR deployment state temporarily unavailable instance=%s service=%s\n", instanceID, serviceName)
 }
 
 func (m *Manager) setControllerPanic(owner *serviceController, generation int64) {
@@ -857,4 +902,23 @@ func (m *Manager) removeServiceControllers(instanceID string) {
 		delete(m.manifestCache, key)
 	}
 	m.controllerMu.Unlock()
+}
+
+func (m *Manager) cancelServiceControllerWork(instanceID string) {
+	prefix := strings.TrimSpace(instanceID) + "/"
+	m.controllerMu.Lock()
+	controllers := make([]*serviceController, 0)
+	for key, controller := range m.controllers {
+		if strings.HasPrefix(key, prefix) {
+			controllers = append(controllers, controller)
+		}
+	}
+	m.controllerMu.Unlock()
+	for _, controller := range controllers {
+		controller.mu.Lock()
+		if controller.cancel != nil {
+			controller.cancel()
+		}
+		controller.mu.Unlock()
+	}
 }

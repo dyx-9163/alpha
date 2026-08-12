@@ -1,6 +1,7 @@
 package runtimeagent
 
 import (
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,10 +13,12 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 )
 
 var (
 	manifestStoreWriteMu             sync.Mutex
+	errInvalidManifestStateContent   = errors.New("invalid manifest state content")
 	errUnsafeManifestFilesystemShape = errors.New("unsafe manifest filesystem shape")
 	errManifestFilesystemObservation = errors.New("manifest filesystem observation failed")
 )
@@ -26,6 +29,83 @@ type ManifestStore struct {
 	renameFile        func(string, string) error
 	syncDirectory     func(string) error
 	manifestPathLstat func(string) (os.FileInfo, error)
+	removeAll         func(string) error
+	renameRetryYield  func()
+}
+
+func (s ManifestStore) retireInstance(instanceID string) (string, error) {
+	instanceID = strings.TrimSpace(instanceID)
+	if err := validateInstanceManifestName(instanceID); err != nil {
+		return "", err
+	}
+	manifestStoreWriteMu.Lock()
+	defer manifestStoreWriteMu.Unlock()
+	stateDir := s.stateDir()
+	livePath := filepath.Join(stateDir, instanceID)
+	info, err := os.Lstat(livePath)
+	if errors.Is(err, os.ErrNotExist) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("inspect live instance state: %w", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return "", errors.New("live instance state path is not a directory")
+	}
+	token := make([]byte, 16)
+	if _, err := rand.Read(token); err != nil {
+		return "", errors.New("generate instance retirement token")
+	}
+	retiredPath := filepath.Join(stateDir, fmt.Sprintf(".retired-%s-%x", instanceID, token))
+	if err := s.retirementRename(livePath, retiredPath); err != nil {
+		return "", fmt.Errorf("retire live instance state: %w", err)
+	}
+	if err := s.directorySync(stateDir); err != nil {
+		rollbackErr := s.retirementRename(retiredPath, livePath)
+		if rollbackErr == nil {
+			rollbackErr = s.directorySync(stateDir)
+		}
+		if rollbackErr != nil {
+			return "", errors.Join(errors.New("sync retired instance state parent"), errors.New("restore live instance state after retirement failure"))
+		}
+		return "", errors.New("sync retired instance state parent")
+	}
+	return retiredPath, nil
+}
+
+func (s ManifestStore) retirementRename(oldPath, newPath string) error {
+	const maxAttempts = 4
+	var err error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		err = s.fileRename(oldPath, newPath)
+		if err == nil || !isTransientWindowsRenameError(err) {
+			return err
+		}
+		if attempt+1 < maxAttempts {
+			if s.renameRetryYield != nil {
+				s.renameRetryYield()
+			} else {
+				runtime.Gosched()
+			}
+		}
+	}
+	return err
+}
+
+func isTransientWindowsRenameError(err error) bool {
+	return runtime.GOOS == "windows" &&
+		(errors.Is(err, os.ErrPermission) || errors.Is(err, syscall.Errno(32)))
+}
+
+func (s ManifestStore) removeRetiredInstance(path string) error {
+	if s.removeAll != nil {
+		return s.removeAll(path)
+	}
+	return os.RemoveAll(path)
+}
+
+func isRetiredInstanceStateDirectory(name string) bool {
+	return strings.HasPrefix(name, ".retired-")
 }
 
 func (s ManifestStore) PutInstance(config InstanceConfig) error {
@@ -64,10 +144,10 @@ func (s ManifestStore) GetInstance(instanceID string) (InstanceConfig, error) {
 		return config, fmt.Errorf("read instance config: %w", err)
 	}
 	if config.InstanceID != instanceID {
-		return InstanceConfig{}, errors.New("instance config identity does not match state path")
+		return InstanceConfig{}, fmt.Errorf("%w: instance config identity does not match state path", errInvalidManifestStateContent)
 	}
 	if err := ValidateInstanceConfig(config); err != nil {
-		return InstanceConfig{}, fmt.Errorf("validate instance config: %w", err)
+		return InstanceConfig{}, fmt.Errorf("%w: validate instance config: %v", errInvalidManifestStateContent, err)
 	}
 	if err := s.validateInstanceFilesystem(config); err != nil {
 		return InstanceConfig{}, err
@@ -160,10 +240,10 @@ func (s ManifestStore) Get(instanceID, serviceName string) (DeploymentManifest, 
 		return DeploymentManifest{}, fmt.Errorf("read deployment manifest: %w", err)
 	}
 	if manifest.Metadata.Name != serviceName {
-		return DeploymentManifest{}, errors.New("deployment manifest identity does not match state path")
+		return DeploymentManifest{}, fmt.Errorf("%w: deployment manifest identity does not match state path", errInvalidManifestStateContent)
 	}
 	if err := ValidateDeploymentManifest(config, manifest); err != nil {
-		return DeploymentManifest{}, fmt.Errorf("validate deployment manifest: %w", err)
+		return DeploymentManifest{}, fmt.Errorf("%w: validate deployment manifest: %v", errInvalidManifestStateContent, err)
 	}
 	if err := s.validateDeploymentFilesystem(config, manifest); err != nil {
 		return DeploymentManifest{}, err
@@ -379,20 +459,40 @@ func (s ManifestStore) directorySync(path string) error {
 func readManifestJSON(path string, target any) error {
 	file, err := os.Open(path)
 	if err != nil {
-		return err
+		return fmt.Errorf("%w: open state file: %w", errManifestFilesystemObservation, err)
 	}
 	defer file.Close()
-	decoder := json.NewDecoder(file)
+	reader := &manifestStateReader{file: file}
+	decoder := json.NewDecoder(reader)
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(target); err != nil {
-		return err
+		if reader.err != nil {
+			return fmt.Errorf("%w: read state file: %w", errManifestFilesystemObservation, reader.err)
+		}
+		return fmt.Errorf("%w: decode state file: %v", errInvalidManifestStateContent, err)
 	}
 	var trailing any
 	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
-		if err == nil {
-			return errors.New("state file contains multiple JSON values")
+		if reader.err != nil {
+			return fmt.Errorf("%w: read trailing state data: %w", errManifestFilesystemObservation, reader.err)
 		}
-		return err
+		if err == nil {
+			return fmt.Errorf("%w: state file contains multiple JSON values", errInvalidManifestStateContent)
+		}
+		return fmt.Errorf("%w: decode trailing state data: %v", errInvalidManifestStateContent, err)
 	}
 	return nil
+}
+
+type manifestStateReader struct {
+	file *os.File
+	err  error
+}
+
+func (reader *manifestStateReader) Read(buffer []byte) (int, error) {
+	count, err := reader.file.Read(buffer)
+	if err != nil && !errors.Is(err, io.EOF) {
+		reader.err = err
+	}
+	return count, err
 }

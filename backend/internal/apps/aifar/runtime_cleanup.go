@@ -228,25 +228,29 @@ func parseRuntimePodContainerNames(output string) []string {
 
 func runtimeAgentUninstallCommand(installRoot, specPath string) string {
 	return "sh -s <<'AIFAR_AGENT_UNINSTALL'\n" + `#!/usr/bin/env sh
-set -u
+set -eu
 INSTALL_ROOT=` + installerkit.ShellQuote(installRoot) + `
 SPEC_PATH=` + installerkit.ShellQuote(specPath) + `
 INSTANCE_ID=admin
+INSTANCE_STATE="/var/lib/aifar-agent/instances/$INSTANCE_ID"
 
 if command -v aifar-agent >/dev/null 2>&1; then
   if [ -f "$SPEC_PATH" ]; then
     aifar-agent deregister-nacos --spec "$SPEC_PATH" >/dev/null 2>&1 || true
   fi
   aifar-agent deregister-nacos --state-dir /var/lib/aifar-agent/instances >/dev/null 2>&1 || true
-  aifar-agent remove-instance --instance "$INSTANCE_ID" >/dev/null 2>&1 || true
+  aifar-agent remove-instance --instance "$INSTANCE_ID" >/dev/null 2>&1
+elif [ -e "$INSTANCE_STATE" ]; then
+  echo "aifar-agent is required to retire existing Runtime state" >&2
+  exit 1
 fi
+[ ! -e "$INSTANCE_STATE" ] || { echo "AIFAR Runtime state retirement was not durable" >&2; exit 1; }
 
 if command -v systemctl >/dev/null 2>&1; then
   systemctl stop aifar-agent >/dev/null 2>&1 || true
   systemctl disable aifar-agent >/dev/null 2>&1 || true
 fi
 
-rm -rf "/var/lib/aifar-agent/instances/$INSTANCE_ID"
 rm -f /etc/systemd/system/aifar-agent.service
 rm -f /usr/local/bin/aifar-agent
 

@@ -56,44 +56,46 @@ func (r Reconciler) ReconcileIngress(ctx context.Context, spec RuntimeSpec) erro
 }
 
 type ManagerOptions struct {
-	StateDir                 string
-	Runner                   CommandRunner
-	Log                      io.Writer
-	ManifestStore            *ManifestStore
-	controllerClock          controllerClock
-	controllerBeforeActivate func(DeploymentManifest)
-	controllerBeforeRead     func(string, string)
-	discoveryController      *DiscoveryController
+	StateDir                   string
+	Runner                     CommandRunner
+	Log                        io.Writer
+	ManifestStore              *ManifestStore
+	controllerClock            controllerClock
+	controllerAfterManifestPut func(DeploymentManifest)
+	controllerBeforeActivate   func(DeploymentManifest)
+	controllerBeforeRead       func(string, string)
+	discoveryController        *DiscoveryController
 }
 
 type Manager struct {
-	mu                       sync.RWMutex
-	reconcileMu              sync.Mutex
-	backgroundMu             sync.Mutex
-	backgroundNext           uint64
-	backgroundCancels        map[uint64]context.CancelFunc
-	stateDir                 string
-	runner                   CommandRunner
-	log                      io.Writer
-	specs                    map[string]RuntimeSpec
-	routes                   map[int]proxyRoute
-	servers                  map[int]*http.Server
-	routeAttemptNext         uint64
-	next                     map[string]uint64
-	endpoints                map[string][]endpoint
-	deployments              map[string]deploymentRuntimeStatus
-	services                 map[string]serviceRuntimeStatus
-	controllerMu             sync.Mutex
-	controllers              map[string]*serviceController
-	controllerStates         map[string]DeploymentState
-	manifestCache            map[string]DeploymentManifest
-	manifestStore            ManifestStore
-	controllerClock          controllerClock
-	maintenanceMu            sync.Mutex
-	maintenanceLocks         map[string]*sync.RWMutex
-	controllerBeforeActivate func(DeploymentManifest)
-	controllerBeforeRead     func(string, string)
-	discoveryController      *DiscoveryController
+	mu                         sync.RWMutex
+	reconcileMu                sync.Mutex
+	backgroundMu               sync.Mutex
+	backgroundNext             uint64
+	backgroundCancels          map[uint64]context.CancelFunc
+	stateDir                   string
+	runner                     CommandRunner
+	log                        io.Writer
+	specs                      map[string]RuntimeSpec
+	routes                     map[int]proxyRoute
+	servers                    map[int]*http.Server
+	routeAttemptNext           uint64
+	next                       map[string]uint64
+	endpoints                  map[string][]endpoint
+	deployments                map[string]deploymentRuntimeStatus
+	services                   map[string]serviceRuntimeStatus
+	controllerMu               sync.Mutex
+	controllers                map[string]*serviceController
+	controllerStates           map[string]DeploymentState
+	manifestCache              map[string]DeploymentManifest
+	manifestStore              ManifestStore
+	controllerClock            controllerClock
+	controllerAfterManifestPut func(DeploymentManifest)
+	maintenanceMu              sync.Mutex
+	maintenanceLocks           map[string]*sync.RWMutex
+	controllerBeforeActivate   func(DeploymentManifest)
+	controllerBeforeRead       func(string, string)
+	discoveryController        *DiscoveryController
 }
 
 type proxyRoute struct {
@@ -154,24 +156,25 @@ func NewManager(options ManagerOptions) *Manager {
 		runner = ExecRunner{}
 	}
 	manager := &Manager{
-		stateDir:                 stateDir,
-		runner:                   runner,
-		log:                      options.Log,
-		backgroundCancels:        map[uint64]context.CancelFunc{},
-		specs:                    map[string]RuntimeSpec{},
-		routes:                   map[int]proxyRoute{},
-		servers:                  map[int]*http.Server{},
-		next:                     map[string]uint64{},
-		endpoints:                map[string][]endpoint{},
-		deployments:              map[string]deploymentRuntimeStatus{},
-		services:                 map[string]serviceRuntimeStatus{},
-		controllers:              map[string]*serviceController{},
-		controllerStates:         map[string]DeploymentState{},
-		manifestCache:            map[string]DeploymentManifest{},
-		controllerClock:          options.controllerClock,
-		maintenanceLocks:         map[string]*sync.RWMutex{},
-		controllerBeforeActivate: options.controllerBeforeActivate,
-		controllerBeforeRead:     options.controllerBeforeRead,
+		stateDir:                   stateDir,
+		runner:                     runner,
+		log:                        options.Log,
+		backgroundCancels:          map[uint64]context.CancelFunc{},
+		specs:                      map[string]RuntimeSpec{},
+		routes:                     map[int]proxyRoute{},
+		servers:                    map[int]*http.Server{},
+		next:                       map[string]uint64{},
+		endpoints:                  map[string][]endpoint{},
+		deployments:                map[string]deploymentRuntimeStatus{},
+		services:                   map[string]serviceRuntimeStatus{},
+		controllers:                map[string]*serviceController{},
+		controllerStates:           map[string]DeploymentState{},
+		manifestCache:              map[string]DeploymentManifest{},
+		controllerClock:            options.controllerClock,
+		controllerAfterManifestPut: options.controllerAfterManifestPut,
+		maintenanceLocks:           map[string]*sync.RWMutex{},
+		controllerBeforeActivate:   options.controllerBeforeActivate,
+		controllerBeforeRead:       options.controllerBeforeRead,
 	}
 	if manager.controllerClock == nil {
 		manager.controllerClock = realControllerClock{}
@@ -202,7 +205,7 @@ func (m *Manager) Load(ctx context.Context) error {
 		return err
 	}
 	for _, entry := range entries {
-		if !entry.IsDir() {
+		if !entry.IsDir() || isRetiredInstanceStateDirectory(entry.Name()) {
 			continue
 		}
 		instancePath := filepath.Join(m.stateDir, entry.Name(), "instance.json")
@@ -570,17 +573,18 @@ func (m *Manager) Remove(ctx context.Context, instanceID string) error {
 	if instanceID == "" {
 		instanceID = "admin"
 	}
-	if m.discoveryController != nil {
-		m.discoveryController.StopInstance(instanceID)
-	}
-	m.removeServiceControllers(instanceID)
+	m.cancelServiceControllerWork(instanceID)
 	maintenance := m.instanceMaintenanceLock(instanceID)
 	maintenance.Lock()
 	defer maintenance.Unlock()
-	m.removeServiceControllers(instanceID)
+	retiredPath, err := m.manifestStore.retireInstance(instanceID)
+	if err != nil {
+		return errors.New("retire AIFAR runtime instance state")
+	}
 	if m.discoveryController != nil {
 		m.discoveryController.StopInstance(instanceID)
 	}
+	m.removeServiceControllers(instanceID)
 	portsToStop := []int{}
 	var spec RuntimeSpec
 	var hasSpec bool
@@ -610,7 +614,11 @@ func (m *Manager) Remove(ctx context.Context, instanceID string) error {
 			logf(m.log, "sync AIFAR Nacos proxies after runtime remove failed: %v\n", err)
 		}
 	}
-	_ = os.RemoveAll(filepath.Join(m.stateDir, instanceID))
+	if retiredPath != "" {
+		if err := m.manifestStore.removeRetiredInstance(retiredPath); err != nil {
+			logf(m.log, "AIFAR retired instance quarantine cleanup failed instance=%s\n", instanceID)
+		}
+	}
 	return nil
 }
 
@@ -695,7 +703,7 @@ func (m *Manager) resyncNewModelDeployments(ctx context.Context) error {
 		return err
 	}
 	for _, entry := range entries {
-		if !entry.IsDir() {
+		if !entry.IsDir() || isRetiredInstanceStateDirectory(entry.Name()) {
 			continue
 		}
 		if err := ctx.Err(); err != nil {

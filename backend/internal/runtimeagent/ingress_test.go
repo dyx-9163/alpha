@@ -11,11 +11,14 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"slices"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -135,6 +138,279 @@ func TestManagerRemoveLinearizesConcurrentDeploymentAcceptance(t *testing.T) {
 	manager.controllerMu.Unlock()
 	if orphaned {
 		t.Fatal("concurrent acceptance left an orphaned controller")
+	}
+}
+
+func TestManagerRemoveRetirementFailurePreservesLiveControllerState(t *testing.T) {
+	tests := []struct {
+		name   string
+		inject func(*ManifestStore, string, *atomic.Bool)
+	}{
+		{
+			name: "rename failure",
+			inject: func(store *ManifestStore, stateDir string, fail *atomic.Bool) {
+				store.renameFile = func(oldPath, newPath string) error {
+					if oldPath == filepath.Join(stateDir, "admin") && fail.CompareAndSwap(true, false) {
+						return errors.New("injected durable retirement rename failure")
+					}
+					return os.Rename(oldPath, newPath)
+				}
+			},
+		},
+		{
+			name: "parent sync failure",
+			inject: func(store *ManifestStore, stateDir string, fail *atomic.Bool) {
+				store.syncDirectory = func(path string) error {
+					if path == stateDir && fail.CompareAndSwap(true, false) {
+						return errors.New("injected durable retirement parent sync failure")
+					}
+					if runtime.GOOS == "windows" {
+						return nil
+					}
+					directory, err := os.Open(path)
+					if err != nil {
+						return err
+					}
+					defer directory.Close()
+					return directory.Sync()
+				}
+			},
+		},
+		{
+			name: "parent sync failure with rollback rename failure",
+			inject: func(store *ManifestStore, stateDir string, fail *atomic.Bool) {
+				store.renameFile = func(oldPath, newPath string) error {
+					if strings.HasPrefix(filepath.Base(oldPath), ".retired-admin-") && newPath == filepath.Join(stateDir, "admin") {
+						return errors.New("injected rollback rename failure")
+					}
+					return os.Rename(oldPath, newPath)
+				}
+				store.syncDirectory = func(path string) error {
+					if path == stateDir && fail.CompareAndSwap(true, false) {
+						return errors.New("injected durable retirement parent sync failure")
+					}
+					return nil
+				}
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			stateDir := t.TempDir()
+			var fail atomic.Bool
+			store := &ManifestStore{StateDir: stateDir}
+			test.inject(store, stateDir, &fail)
+			if err := store.PutInstance(controllerTestConfig()); err != nil {
+				t.Fatal(err)
+			}
+			manager := NewManager(ManagerOptions{StateDir: stateDir, Runner: newControllerTestRunner(), ManifestStore: store})
+			if _, err := manager.AcceptDeployment(context.Background(), controllerTestManifest("permission", 1, 0)); err != nil {
+				t.Fatal(err)
+			}
+			waitForDeploymentCondition(t, manager, "permission", deploymentConditionOffline, time.Second)
+			key := endpointKey("admin", "permission")
+			manager.controllerMu.Lock()
+			controller := manager.controllers[key]
+			manager.controllerMu.Unlock()
+			if controller == nil {
+				t.Fatal("live controller missing before removal")
+			}
+			fail.Store(true)
+			if err := manager.Remove(context.Background(), "admin"); err == nil {
+				t.Fatal("remove reported success after durable retirement failure")
+			}
+			_, liveErr := os.Stat(filepath.Join(stateDir, "admin", "instance.json"))
+			if test.name != "parent sync failure with rollback rename failure" && liveErr != nil {
+				t.Fatalf("live instance state was not preserved: %v", liveErr)
+			}
+			state, ok := manager.DeploymentState("admin", "permission")
+			if !ok || currentCondition(state).Type != deploymentConditionOffline {
+				t.Fatalf("live deployment state was cleared: %+v ok=%v", state, ok)
+			}
+			manager.controllerMu.Lock()
+			retained := manager.controllers[key]
+			manager.controllerMu.Unlock()
+			controller.mu.Lock()
+			stopped := controller.stopped
+			controller.mu.Unlock()
+			if retained != controller || stopped {
+				t.Fatalf("live controller was stopped or replaced: retained=%p original=%p stopped=%v", retained, controller, stopped)
+			}
+		})
+	}
+}
+
+func TestManifestStoreRetirementRetriesOnlyTransientWindowsRenameFailures(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("Windows rename retry contract")
+	}
+	t.Run("access denied once", func(t *testing.T) {
+		stateDir := t.TempDir()
+		store := &ManifestStore{StateDir: stateDir, renameRetryYield: func() {}}
+		if err := store.PutInstance(controllerTestConfig()); err != nil {
+			t.Fatal(err)
+		}
+		calls := 0
+		store.renameFile = func(oldPath, newPath string) error {
+			calls++
+			if calls == 1 {
+				return &os.PathError{Op: "rename", Path: oldPath, Err: syscall.Errno(5)}
+			}
+			return os.Rename(oldPath, newPath)
+		}
+		retiredPath, err := store.retireInstance("admin")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if calls != 2 {
+			t.Fatalf("rename calls=%d, want 2", calls)
+		}
+		if _, err := os.Stat(retiredPath); err != nil {
+			t.Fatalf("retired state missing: %v", err)
+		}
+	})
+	t.Run("sharing violation once", func(t *testing.T) {
+		stateDir := t.TempDir()
+		store := &ManifestStore{StateDir: stateDir, renameRetryYield: func() {}}
+		if err := store.PutInstance(controllerTestConfig()); err != nil {
+			t.Fatal(err)
+		}
+		calls := 0
+		store.renameFile = func(oldPath, newPath string) error {
+			calls++
+			if calls == 1 {
+				return &os.LinkError{Op: "rename", Old: oldPath, New: newPath, Err: syscall.Errno(32)}
+			}
+			return os.Rename(oldPath, newPath)
+		}
+		if _, err := store.retireInstance("admin"); err != nil {
+			t.Fatal(err)
+		}
+		if calls != 2 {
+			t.Fatalf("rename calls=%d, want 2", calls)
+		}
+	})
+	t.Run("transient retries exhausted", func(t *testing.T) {
+		stateDir := t.TempDir()
+		store := &ManifestStore{StateDir: stateDir, renameRetryYield: func() {}}
+		if err := store.PutInstance(controllerTestConfig()); err != nil {
+			t.Fatal(err)
+		}
+		calls := 0
+		store.renameFile = func(oldPath, _ string) error {
+			calls++
+			return &os.PathError{Op: "rename", Path: oldPath, Err: syscall.Errno(5)}
+		}
+		if _, err := store.retireInstance("admin"); err == nil {
+			t.Fatal("retirement succeeded after exhausting transient rename retries")
+		}
+		if calls != 4 {
+			t.Fatalf("rename calls=%d, want 4", calls)
+		}
+		if _, err := os.Stat(filepath.Join(stateDir, "admin", "instance.json")); err != nil {
+			t.Fatalf("live state lost after exhausted rename retries: %v", err)
+		}
+	})
+	t.Run("unrecognized error", func(t *testing.T) {
+		stateDir := t.TempDir()
+		store := &ManifestStore{StateDir: stateDir}
+		if err := store.PutInstance(controllerTestConfig()); err != nil {
+			t.Fatal(err)
+		}
+		calls := 0
+		store.renameFile = func(_, _ string) error {
+			calls++
+			return errors.New("injected permanent rename failure")
+		}
+		if _, err := store.retireInstance("admin"); err == nil {
+			t.Fatal("retirement succeeded after permanent rename failure")
+		}
+		if calls != 1 {
+			t.Fatalf("rename calls=%d, want 1", calls)
+		}
+	})
+}
+
+func TestManagerRemoveQuarantineCannotBeResurrectedWhenCleanupFails(t *testing.T) {
+	stateDir := t.TempDir()
+	store := &ManifestStore{StateDir: stateDir}
+	if err := store.PutInstance(controllerTestConfig()); err != nil {
+		t.Fatal(err)
+	}
+	var cleanupAttempts atomic.Int32
+	store.removeAll = func(path string) error {
+		cleanupAttempts.Add(1)
+		return errors.New("injected quarantine cleanup secret")
+	}
+	runner := newControllerTestRunner()
+	manager := NewManager(ManagerOptions{StateDir: stateDir, Runner: runner, ManifestStore: store})
+	if _, err := manager.AcceptDeployment(context.Background(), controllerTestManifest("permission", 1, 1)); err != nil {
+		t.Fatal(err)
+	}
+	waitForDeploymentCondition(t, manager, "permission", deploymentConditionAvailable, time.Second)
+	if err := manager.Remove(context.Background(), "admin"); err != nil {
+		t.Fatal(err)
+	}
+	if cleanupAttempts.Load() != 1 {
+		t.Fatalf("quarantine cleanup attempts=%d, want 1", cleanupAttempts.Load())
+	}
+	if _, err := os.Stat(filepath.Join(stateDir, "admin")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("live instance path survived retirement: %v", err)
+	}
+	entries, err := os.ReadDir(stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	quarantines := 0
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), ".retired-admin-") {
+			quarantines++
+		}
+	}
+	if quarantines != 1 {
+		t.Fatalf("retired quarantine count=%d, want 1; entries=%v", quarantines, entries)
+	}
+	if _, ok := manager.DeploymentState("admin", "permission"); ok {
+		t.Fatal("retired deployment state remained in memory")
+	}
+	if err := manager.Resync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := manager.DeploymentState("admin", "permission"); ok {
+		t.Fatal("same-process resync recreated retired deployment")
+	}
+
+	restartRunner := newControllerTestRunner()
+	restartDiscoverySyncer := &fakeDiscoverySyncer{}
+	restartDiscovery := newDiscoveryController(discoveryControllerOptions{Syncer: restartDiscoverySyncer})
+	t.Cleanup(restartDiscovery.Stop)
+	var restartLogs lockedBuffer
+	restarted := NewManager(ManagerOptions{
+		StateDir:            stateDir,
+		Runner:              restartRunner,
+		Log:                 &restartLogs,
+		discoveryController: restartDiscovery,
+	})
+	if err := restarted.Load(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := restarted.Resync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := restarted.DeploymentState("admin", "permission"); ok {
+		t.Fatal("restart/load recreated retired deployment")
+	}
+	restartRunner.mu.Lock()
+	runAttempts := restartRunner.runAttempts
+	restartRunner.mu.Unlock()
+	if runAttempts != 0 {
+		t.Fatalf("restart/load issued Docker create attempts=%d", runAttempts)
+	}
+	if attempts := restartDiscoverySyncer.attempts("permission"); attempts != 0 {
+		t.Fatalf("restart/load issued Nacos attempts=%d", attempts)
+	}
+	if strings.Contains(restartLogs.String(), "cleanup secret") {
+		t.Fatalf("quarantine cleanup failure leaked into restart logs: %s", restartLogs.String())
 	}
 }
 
