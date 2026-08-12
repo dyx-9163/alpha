@@ -90,6 +90,24 @@ func applyDurableRuntimeConfigToManifest(metadata map[string]any, installRoot, s
 	manifest.Spec.Environment["AIFAR_NACOS_EPHEMERAL"] = strconv.FormatBool(snapshot.NacosEphemeral)
 	configVersion, immutable := runtimeConfigAppliedServiceVersion(snapshot, serviceName)
 	if !immutable {
+		delete(manifest.Spec.Environment, "AIFAR_RUNTIME_CONFIG_VERSION")
+		delete(manifest.Spec.Environment, "AIFAR_RUNTIME_CONFIG_HASH")
+		if serviceName != "web-vue3" {
+			fixedEnvDir := path.Join(installRoot, "runtime", releaseEnvDirName)
+			found := false
+			for idx := range manifest.Spec.Volumes {
+				if manifest.Spec.Volumes[idx].Target == "/opt/aifar/runtime/env" {
+					manifest.Spec.Volumes[idx].Source = fixedEnvDir
+					manifest.Spec.Volumes[idx].ReadOnly = true
+					found = true
+				}
+			}
+			if !found {
+				manifest.Spec.Volumes = append(manifest.Spec.Volumes, runtimeagent.VolumeMount{
+					Source: fixedEnvDir, Target: "/opt/aifar/runtime/env", ReadOnly: true,
+				})
+			}
+		}
 		return nil
 	}
 	configHash := strings.TrimSpace(snapshot.ServiceHashes[serviceName])

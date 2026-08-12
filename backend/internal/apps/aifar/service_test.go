@@ -316,13 +316,15 @@ func TestAIFAROrchestrationLockHeartbeatLifecycleMatrix(t *testing.T) {
 		taskCtx, stop := service.startAIFAROrchestrationLockHeartbeat(context.Background(), lock)
 		ticker.ticks <- baseNow
 		<-lockStore.renewHit
+		ticker.ticks <- baseNow.Add(time.Minute)
+		<-lockStore.renewHit
 		if err := taskCtx.Err(); err != nil {
 			t.Fatalf("successful renewal canceled task: %v", err)
 		}
-		if got := lockStore.renewalCount(); got != 1 {
-			t.Fatalf("renewals=%d, want 1", got)
+		if got := lockStore.renewalCount(); got != 2 {
+			t.Fatalf("renewals=%d, want 2 completed calls", got)
 		}
-		if expiries := lockStore.renewalExpiries(); len(expiries) != 1 || !expiries[0].Equal(baseNow.Add(orchestrationLockTTL)) {
+		if expiries := lockStore.renewalExpiries(); len(expiries) != 2 || !expiries[0].Equal(baseNow.Add(orchestrationLockTTL)) || !expiries[1].Equal(baseNow.Add(orchestrationLockTTL)) {
 			t.Fatalf("renewal expiries=%v, want fake-clock expiry %s", expiries, baseNow.Add(orchestrationLockTTL))
 		}
 		stop()
@@ -347,7 +349,7 @@ func TestAIFAROrchestrationLockHeartbeatLifecycleMatrix(t *testing.T) {
 	})
 
 	t.Run("renewal error cancels only derived task", func(t *testing.T) {
-		service, lockStore, ticker := newHarness(false, errors.New("renew failed"))
+		service, lockStore, ticker := newHarness(true, errors.New("renew failed"))
 		parent := context.Background()
 		taskCtx, stop := service.startAIFAROrchestrationLockHeartbeat(parent, lock)
 		ticker.ticks <- baseNow
@@ -365,15 +367,15 @@ func TestAIFAROrchestrationLockHeartbeatLifecycleMatrix(t *testing.T) {
 		taskCtx, stop := service.startAIFAROrchestrationLockHeartbeat(parent, lock)
 		cancel()
 		<-taskCtx.Done()
-		stop()
+		select {
+		case <-ticker.stopped:
+		case <-time.After(time.Second):
+			t.Fatal("heartbeat did not stop its ticker after parent cancellation")
+		}
 		if got := lockStore.renewalCount(); got != 0 {
 			t.Fatalf("renewals after parent cancellation=%d, want 0", got)
 		}
-		select {
-		case <-ticker.stopped:
-		default:
-			t.Fatal("parent cancellation did not stop ticker")
-		}
+		stop()
 	})
 
 	t.Run("stop before first tick is synchronous and repeatable", func(t *testing.T) {
@@ -2540,12 +2542,16 @@ func TestServiceReleaseOrchestrationLockDoesNotReleaseSuccessor(t *testing.T) {
 		t.Fatal(err)
 	}
 	now := time.Now().UTC()
+	ownerAExpiry := now.Add(100 * time.Millisecond)
 	ownerA, err := db.AcquireAIFAROrchestrationLock(store.AIFAROrchestrationLock{
 		ID: "owner-a", InstanceID: instance.ID, ServiceName: "file", Operation: "scale-service",
-		StartedAt: now.Add(-2 * time.Hour), ExpiresAt: now.Add(-time.Hour),
+		StartedAt: now, ExpiresAt: ownerAExpiry,
 	})
 	if err != nil {
 		t.Fatal(err)
+	}
+	if wait := time.Until(ownerAExpiry.Add(25 * time.Millisecond)); wait > 0 {
+		time.Sleep(wait)
 	}
 	ownerB, err := db.AcquireAIFAROrchestrationLock(store.AIFAROrchestrationLock{
 		ID: "owner-b", InstanceID: instance.ID, ServiceName: "file", Operation: "scale-service", ExpiresAt: now.Add(time.Hour),
@@ -3170,6 +3176,116 @@ func TestRuntimeConfigPartialFailureIdenticalRetryReappliesOnlyUnacceptedService
 	finalState := runtimeConfigFromMetadata(metadataFromInstance(finalInstance))
 	if finalState.ConfigVersion != afterFailureState.ConfigVersion || finalState.AppliedVersion != finalState.ConfigVersion || finalState.LastApplyStatus != runtimeConfigStatusApplied {
 		t.Fatalf("identical retry did not reuse and exactly apply pending version: failed=%+v final=%+v", afterFailureState, finalState)
+	}
+}
+
+func TestFailedFirstRuntimeConfigUnrelatedRestartRestoresLegacyAppliedInput(t *testing.T) {
+	instance := installedAIFARInstance(t)
+	metadata := metadataFromInstance(instance)
+	base := runtimeConfigFromOptions(InstallOptions{
+		SelectedServices:        []string{"permission"},
+		AppCPUs:                 "1",
+		AppMemoryLimit:          "1GB",
+		JVMInitialRAMPercentage: 20,
+		JVMMaxRAMPercentage:     70,
+	}, "installer", time.Date(2026, 8, 11, 0, 0, 0, 0, time.UTC))
+	metadata["services"] = []string{"permission"}
+	metadata["runtimeConfig"] = base
+	instance.Metadata = mustMetadata(t, metadata)
+	deployments := seedPerServiceDeployments(t, instance, map[string]int{"permission": 1}, map[string]int64{"permission": 3})
+	s := &fakeStore{
+		servers:   map[string]store.Server{"srv-1": {ID: "srv-1", Host: "10.0.0.10", DeployDir: "/aifar/apps"}},
+		instances: []store.AppInstance{instance}, deployments: deployments,
+	}
+	remote := &fakeRemote{
+		deploymentApplyFailures: map[string]int{"permission": 1},
+		deploymentStates:        map[string]runtimeagent.DeploymentState{},
+	}
+	initial := deploymentsByService(deployments)["permission"]
+	var initialManifest runtimeagent.DeploymentManifest
+	if err := json.Unmarshal([]byte(initial.SpecJSON), &initialManifest); err != nil {
+		t.Fatal(err)
+	}
+	initialHash, err := runtimeagent.DeploymentManifestSpecHash(initialManifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	remote.deploymentStates["permission"] = runtimeagent.DeploymentState{
+		InstanceID: instance.ID, ServiceName: "permission", Generation: initial.Generation,
+		SpecHash: initialHash, DesiredReplicas: initial.DesiredReplicas,
+	}
+	service := NewService(s, remote)
+	if err := service.ApplyRuntimeConfig(context.Background(), RuntimeConfigRequest{
+		Instance: instance, Server: s.servers["srv-1"], Actor: "operator", TaskID: "task-config-first-fails",
+		Config: RuntimeConfigPayload{Global: RuntimeConfigValues{
+			AppCPUs: "3", AppMemoryLimit: "3GB", JVMInitialRAMPercentage: 25, JVMMaxRAMPercentage: 75,
+		}},
+	}, fakeLogger{}, nil); err == nil {
+		t.Fatal("first runtime config unexpectedly succeeded")
+	}
+	afterFailureInstance, err := s.GetAppInstance(instance.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	afterFailureState := runtimeConfigFromMetadata(metadataFromInstance(afterFailureInstance))
+	if afterFailureState.ConfigVersion != 2 || afterFailureState.AppliedVersion != 1 || afterFailureState.LastApplyStatus != runtimeConfigStatusFailed {
+		t.Fatalf("unexpected failed runtime config state: %+v", afterFailureState)
+	}
+	pending := deploymentsByService(s.deployments)["permission"]
+	var pendingManifest runtimeagent.DeploymentManifest
+	if err := json.Unmarshal([]byte(pending.SpecJSON), &pendingManifest); err != nil {
+		t.Fatal(err)
+	}
+	if pendingManifest.Spec.Environment["AIFAR_RUNTIME_CONFIG_VERSION"] != "2" || pendingManifest.Spec.Environment["AIFAR_RUNTIME_CONFIG_HASH"] == "" {
+		t.Fatalf("failed first config did not leave the expected pending v2 proof: %+v", pendingManifest.Spec.Environment)
+	}
+
+	if err := service.RestartRuntime(context.Background(), RuntimeRestartRequest{
+		Instance: afterFailureInstance, Server: s.servers["srv-1"], Actor: "operator", TaskID: "task-restart-after-config-failure",
+	}, fakeLogger{}, nil); err != nil {
+		t.Fatalf("unrelated restart failed: %v", err)
+	}
+	restarted := deploymentsByService(s.deployments)["permission"]
+	var restartedManifest runtimeagent.DeploymentManifest
+	if err := json.Unmarshal([]byte(restarted.SpecJSON), &restartedManifest); err != nil {
+		t.Fatal(err)
+	}
+	if _, found := restartedManifest.Spec.Environment["AIFAR_RUNTIME_CONFIG_VERSION"]; found {
+		t.Fatalf("unrelated restart retained failed config version: %+v", restartedManifest.Spec.Environment)
+	}
+	if _, found := restartedManifest.Spec.Environment["AIFAR_RUNTIME_CONFIG_HASH"]; found {
+		t.Fatalf("unrelated restart retained failed config hash: %+v", restartedManifest.Spec.Environment)
+	}
+	if restartedManifest.Spec.Resources.CPUs != "1" || restartedManifest.Spec.Resources.Memory != "1GB" || restartedManifest.Spec.Environment["AIFAR_NACOS_EPHEMERAL"] != "true" {
+		t.Fatalf("restart did not restore durable legacy values: resources=%+v env=%+v", restartedManifest.Spec.Resources, restartedManifest.Spec.Environment)
+	}
+	foundFixedInput := false
+	for _, volume := range restartedManifest.Spec.Volumes {
+		if volume.Target == "/opt/aifar/runtime/env" {
+			foundFixedInput = true
+			if volume.Source != "/aifar/apps/admin/runtime/env" || !volume.ReadOnly {
+				t.Fatalf("restart retained failed immutable input: %+v", volume)
+			}
+		}
+	}
+	if !foundFixedInput {
+		t.Fatal("restart manifest is missing the legacy fixed runtime input")
+	}
+	restartedHash, err := runtimeagent.DeploymentManifestSpecHash(restartedManifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	agent := remote.deploymentStates["permission"]
+	if restarted.Status != "Accepted" || agent.Generation != restarted.Generation || agent.SpecHash != restartedHash {
+		t.Fatalf("restart was not exactly accepted: deployment=%+v agent=%+v hash=%s", restarted, agent, restartedHash)
+	}
+	finalInstance, err := s.GetAppInstance(instance.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	finalState := runtimeConfigFromMetadata(metadataFromInstance(finalInstance))
+	if finalState.ConfigVersion != 2 || finalState.AppliedVersion != 1 || finalState.LastApplyStatus != runtimeConfigStatusFailed {
+		t.Fatalf("unrelated restart changed failed runtime config lifecycle: %+v", finalState)
 	}
 }
 
@@ -4193,11 +4309,15 @@ func TestExpiredInstallOwnerCannotFinalizeFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	ownerExpiry := time.Now().UTC().Add(100 * time.Millisecond)
 	if _, err := db.AcquireAIFAROrchestrationLock(store.AIFAROrchestrationLock{
 		ID: "owner-a", InstanceID: instance.ID, Operation: "install",
-		StartedAt: time.Now().UTC().Add(-2 * time.Hour), ExpiresAt: time.Now().UTC().Add(-time.Hour),
+		ExpiresAt: ownerExpiry,
 	}); err != nil {
 		t.Fatal(err)
+	}
+	if wait := time.Until(ownerExpiry.Add(25 * time.Millisecond)); wait > 0 {
+		time.Sleep(wait)
 	}
 	if err := NewService(db, &fakeRemote{}).markInstallFailed(instance, metadata, errors.New("expired owner failure")); err != nil {
 		t.Fatal(err)

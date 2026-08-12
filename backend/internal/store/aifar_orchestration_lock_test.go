@@ -7,6 +7,24 @@ import (
 	"time"
 )
 
+func acquireThenExpireAIFAROrchestrationLock(t *testing.T, db *Store, lock AIFAROrchestrationLock) AIFAROrchestrationLock {
+	t.Helper()
+	now := time.Now().UTC()
+	lock.StartedAt = now
+	lock.ExpiresAt = now.Add(time.Hour)
+	acquired, err := db.AcquireAIFAROrchestrationLock(lock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expiredAt := now.Add(-time.Hour)
+	if _, err := db.db.Exec(`update aifar_orchestration_locks set expires_at=?, updated_at=? where id=?`, expiredAt, expiredAt, acquired.ID); err != nil {
+		t.Fatal(err)
+	}
+	acquired.ExpiresAt = expiredAt
+	acquired.UpdatedAt = expiredAt
+	return acquired
+}
+
 func TestAIFAROrchestrationLocksAllowDifferentServices(t *testing.T) {
 	db := openTestStore(t)
 	if _, err := db.AcquireAIFAROrchestrationLock(testAIFAROrchestrationLock("i1", "permission", "scale")); err != nil {
@@ -65,11 +83,7 @@ func TestAIFAROrchestrationLocksRenewOnlyActiveUnexpiredLocks(t *testing.T) {
 
 	expired := testAIFAROrchestrationLock("i1", "file", "offline")
 	expired.ID = "expired"
-	expired.StartedAt = now.Add(-2 * time.Hour)
-	expired.ExpiresAt = now.Add(-time.Hour)
-	if _, err := db.AcquireAIFAROrchestrationLock(expired); err != nil {
-		t.Fatal(err)
-	}
+	expired = acquireThenExpireAIFAROrchestrationLock(t, db, expired)
 	if _, err := db.AcquireAIFAROrchestrationLock(testAIFAROrchestrationLock("i1", "other", "scale")); err != nil {
 		t.Fatal(err)
 	}
@@ -194,16 +208,68 @@ func TestAIFAROrchestrationLockRenewalRejectsRequestedExpiryAtExecutionTime(t *t
 	}
 }
 
-func TestAIFAROrchestrationLocksDoNotReleaseASuccessorByStaleID(t *testing.T) {
+func TestAIFAROrchestrationLockQueuedAcquireRejectsCallerExpiryAtExecutionTime(t *testing.T) {
 	db := openTestStore(t)
 	now := time.Now().UTC()
-	ownerA := testAIFAROrchestrationLock("i1", "file", "scale")
-	ownerA.ID = "owner-a"
-	ownerA.StartedAt = now.Add(-2 * time.Hour)
-	ownerA.ExpiresAt = now.Add(-time.Hour)
-	if _, err := db.AcquireAIFAROrchestrationLock(ownerA); err != nil {
+	owner := testAIFAROrchestrationLock("instance-1", "permission", "scale")
+	owner.ID = "queued-expired-acquire-owner"
+	owner.StartedAt = now
+	owner.ExpiresAt = now.Add(1200 * time.Millisecond)
+
+	blocker, err := db.db.Begin()
+	if err != nil {
 		t.Fatal(err)
 	}
+	baselineWaitCount := db.db.Stats().WaitCount
+	type acquireResult struct {
+		lock AIFAROrchestrationLock
+		err  error
+	}
+	resultCh := make(chan acquireResult, 1)
+	go func() {
+		acquired, acquireErr := db.AcquireAIFAROrchestrationLock(owner)
+		resultCh <- acquireResult{lock: acquired, err: acquireErr}
+	}()
+	deadline := owner.ExpiresAt.Add(-300 * time.Millisecond)
+	for db.db.Stats().WaitCount <= baselineWaitCount && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if db.db.Stats().WaitCount <= baselineWaitCount {
+		_ = blocker.Rollback()
+		<-resultCh
+		t.Fatal("acquire did not reach the sole-connection wait before caller expiry")
+	}
+	if observed := time.Now().UTC(); !observed.Before(owner.ExpiresAt) {
+		_ = blocker.Rollback()
+		<-resultCh
+		t.Fatalf("acquire reached the connection wait too late: observed=%s expires=%s", observed, owner.ExpiresAt)
+	}
+	if wait := time.Until(owner.ExpiresAt.Add(25 * time.Millisecond)); wait > 0 {
+		time.Sleep(wait)
+	}
+	if err := blocker.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	result := <-resultCh
+	if result.err == nil {
+		t.Fatalf("queued acquire returned expired active owner: %+v", result.lock)
+	}
+	locks, err := db.ListAIFAROrchestrationLocks(owner.InstanceID, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, lock := range locks {
+		if lock.ID == owner.ID {
+			t.Fatalf("expired queued acquire inserted a row: %+v", lock)
+		}
+	}
+}
+
+func TestAIFAROrchestrationLocksDoNotReleaseASuccessorByStaleID(t *testing.T) {
+	db := openTestStore(t)
+	ownerA := testAIFAROrchestrationLock("i1", "file", "scale")
+	ownerA.ID = "owner-a"
+	ownerA = acquireThenExpireAIFAROrchestrationLock(t, db, ownerA)
 	ownerB := testAIFAROrchestrationLock("i1", "file", "scale")
 	ownerB.ID = "owner-b"
 	if _, err := db.AcquireAIFAROrchestrationLock(ownerB); err != nil {
@@ -221,7 +287,6 @@ func TestAIFAROrchestrationLocksDoNotReleaseASuccessorByStaleID(t *testing.T) {
 
 func TestSaveAIFARDeploymentGenerationWithLockRequiresExactActiveServiceOwner(t *testing.T) {
 	db := openTestStore(t)
-	now := time.Now().UTC()
 	base, err := db.SaveAIFARDeployment(AIFARDeployment{
 		InstanceID: "instance-1", ServiceName: "permission", DesiredReplicas: 1,
 		CurrentRevision: "rev-1", SpecJSON: `{"service":"permission","revision":"rev-1"}`,
@@ -259,11 +324,7 @@ func TestSaveAIFARDeploymentGenerationWithLockRequiresExactActiveServiceOwner(t 
 
 	ownerA := testAIFAROrchestrationLock("instance-1", "permission", "scale")
 	ownerA.ID = "runtime-owner-a"
-	ownerA.StartedAt = now.Add(-2 * time.Hour)
-	ownerA.ExpiresAt = now.Add(-time.Hour)
-	if _, err := db.AcquireAIFAROrchestrationLock(ownerA); err != nil {
-		t.Fatal(err)
-	}
+	ownerA = acquireThenExpireAIFAROrchestrationLock(t, db, ownerA)
 	ownerB := testAIFAROrchestrationLock("instance-1", "permission", "scale")
 	ownerB.ID = "runtime-owner-b"
 	if _, err := db.AcquireAIFAROrchestrationLock(ownerB); err != nil {
@@ -355,11 +416,7 @@ func TestAcceptAIFARDeploymentWithLockSupportsExactServiceOwnerAndRejectsPredece
 	}
 	ownerA := testAIFAROrchestrationLock("instance-1", "permission", "scale")
 	ownerA.ID = "accept-owner-a"
-	ownerA.StartedAt = now.Add(-2 * time.Hour)
-	ownerA.ExpiresAt = now.Add(-time.Hour)
-	if _, err := db.AcquireAIFAROrchestrationLock(ownerA); err != nil {
-		t.Fatal(err)
-	}
+	ownerA = acquireThenExpireAIFAROrchestrationLock(t, db, ownerA)
 	ownerB := testAIFAROrchestrationLock("instance-1", "permission", "scale")
 	ownerB.ID = "accept-owner-b"
 	if _, err := db.AcquireAIFAROrchestrationLock(ownerB); err != nil {
@@ -444,14 +501,9 @@ func TestSaveAIFARAcceptedProjectionWithLockAtomicallyRequiresOwnerProofAndInsta
 
 func TestSaveAIFARInitialDesiredWithLockRejectsExpiredOwnerAtomically(t *testing.T) {
 	db := openTestStore(t)
-	now := time.Now().UTC()
 	ownerA := testAIFAROrchestrationLock("instance-1", "", "install")
 	ownerA.ID = "owner-a"
-	ownerA.StartedAt = now.Add(-2 * time.Hour)
-	ownerA.ExpiresAt = now.Add(-time.Hour)
-	if _, err := db.AcquireAIFAROrchestrationLock(ownerA); err != nil {
-		t.Fatal(err)
-	}
+	ownerA = acquireThenExpireAIFAROrchestrationLock(t, db, ownerA)
 	ownerB := testAIFAROrchestrationLock("instance-1", "", "install")
 	ownerB.ID = "owner-b"
 	if _, err := db.AcquireAIFAROrchestrationLock(ownerB); err != nil {
@@ -697,11 +749,7 @@ func TestAcceptAIFARDeploymentWithLockRejectsExpiredOwnerAndWrongDesiredProof(t 
 	now := time.Now().UTC()
 	ownerA := testAIFAROrchestrationLock("instance-1", "", "install")
 	ownerA.ID = "owner-a"
-	ownerA.StartedAt = now.Add(-2 * time.Hour)
-	ownerA.ExpiresAt = now.Add(-time.Hour)
-	if _, err := db.AcquireAIFAROrchestrationLock(ownerA); err != nil {
-		t.Fatal(err)
-	}
+	ownerA = acquireThenExpireAIFAROrchestrationLock(t, db, ownerA)
 	ownerB := testAIFAROrchestrationLock("instance-1", "", "install")
 	ownerB.ID = "owner-b"
 	if _, err := db.AcquireAIFAROrchestrationLock(ownerB); err != nil {
@@ -752,14 +800,9 @@ func TestServiceInstallFencedWritesRejectExpiredPredecessor(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	now := time.Now().UTC()
 	ownerA := testAIFAROrchestrationLock(instance.ID, "", "install-services")
 	ownerA.ID = "service-install-a"
-	ownerA.StartedAt = now.Add(-2 * time.Hour)
-	ownerA.ExpiresAt = now.Add(-time.Hour)
-	if _, err := db.AcquireAIFAROrchestrationLock(ownerA); err != nil {
-		t.Fatal(err)
-	}
+	ownerA = acquireThenExpireAIFAROrchestrationLock(t, db, ownerA)
 	ownerB := testAIFAROrchestrationLock(instance.ID, "", "install-services")
 	ownerB.ID = "service-install-b"
 	if _, err := db.AcquireAIFAROrchestrationLock(ownerB); err != nil {
@@ -855,14 +898,9 @@ func TestCommitAIFARRuntimeMigrationRejectsReplacedGlobalOwner(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	now := time.Now().UTC()
 	ownerA := testAIFAROrchestrationLock(instance.ID, "", "migrate-runtime-model")
 	ownerA.ID = "migration-owner-a"
-	ownerA.StartedAt = now.Add(-2 * time.Hour)
-	ownerA.ExpiresAt = now.Add(-time.Hour)
-	if _, err := db.AcquireAIFAROrchestrationLock(ownerA); err != nil {
-		t.Fatal(err)
-	}
+	ownerA = acquireThenExpireAIFAROrchestrationLock(t, db, ownerA)
 	ownerB := testAIFAROrchestrationLock(instance.ID, "", "migrate-runtime-model")
 	ownerB.ID = "migration-owner-b"
 	if _, err := db.AcquireAIFAROrchestrationLock(ownerB); err != nil {

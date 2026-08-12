@@ -1214,6 +1214,7 @@ func (s *Store) PruneAIFARServiceEndpointRecords(instanceID string, existingCont
 }
 
 func (s *Store) AcquireAIFAROrchestrationLock(v AIFAROrchestrationLock) (AIFAROrchestrationLock, error) {
+	callerProvidedExpiry := !v.ExpiresAt.IsZero()
 	v.InstanceID = strings.TrimSpace(v.InstanceID)
 	v.ServiceName = strings.TrimSpace(v.ServiceName)
 	v.Operation = strings.TrimSpace(v.Operation)
@@ -1231,6 +1232,9 @@ func (s *Store) AcquireAIFAROrchestrationLock(v AIFAROrchestrationLock) (AIFAROr
 	}
 	defer tx.Rollback()
 	now := time.Now().UTC()
+	if callerProvidedExpiry && !v.ExpiresAt.After(now) {
+		return v, fmt.Errorf("AIFAR orchestration lock expiry must be in the future at acquisition")
+	}
 	if v.StartedAt.IsZero() {
 		v.StartedAt = now
 	}
