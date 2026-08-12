@@ -202,6 +202,9 @@ func (s Service) startAIFAROrchestrationLockHeartbeat(ctx context.Context, lock 
 					cancelTask()
 					return
 				}
+				if s.orchestrationLockHeartbeatRenewed != nil {
+					s.orchestrationLockHeartbeatRenewed()
+				}
 			}
 		}
 	}()
@@ -396,6 +399,7 @@ type Service struct {
 	archives                           RuntimeDiagnosticArchiveStorage
 	orchestrationLockHeartbeatInterval time.Duration
 	orchestrationLockHeartbeatClock    orchestrationLockHeartbeatClock
+	orchestrationLockHeartbeatRenewed  func()
 }
 
 type installStepDef struct {

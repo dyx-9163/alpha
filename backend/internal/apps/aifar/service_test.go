@@ -313,13 +313,27 @@ func TestAIFAROrchestrationLockHeartbeatLifecycleMatrix(t *testing.T) {
 
 	t.Run("successful renewal keeps task active", func(t *testing.T) {
 		service, lockStore, ticker := newHarness(true, nil)
+		completed := make(chan int, 2)
+		completedCount := 0
+		service.orchestrationLockHeartbeatRenewed = func() {
+			completedCount++
+			completed <- completedCount
+		}
 		taskCtx, stop := service.startAIFAROrchestrationLockHeartbeat(context.Background(), lock)
 		ticker.ticks <- baseNow
-		<-lockStore.renewHit
+		if got := <-completed; got != 1 {
+			t.Fatalf("first completed renewal=%d, want 1", got)
+		}
 		ticker.ticks <- baseNow.Add(time.Minute)
-		<-lockStore.renewHit
+		if got := <-completed; got != 2 {
+			t.Fatalf("second completed renewal=%d, want 2", got)
+		}
+		stop()
 		if err := taskCtx.Err(); err != nil {
 			t.Fatalf("successful renewal canceled task: %v", err)
+		}
+		if completedCount != 2 {
+			t.Fatalf("completed renewals=%d, want exactly 2", completedCount)
 		}
 		if got := lockStore.renewalCount(); got != 2 {
 			t.Fatalf("renewals=%d, want 2 completed calls", got)
@@ -327,7 +341,6 @@ func TestAIFAROrchestrationLockHeartbeatLifecycleMatrix(t *testing.T) {
 		if expiries := lockStore.renewalExpiries(); len(expiries) != 2 || !expiries[0].Equal(baseNow.Add(orchestrationLockTTL)) || !expiries[1].Equal(baseNow.Add(orchestrationLockTTL)) {
 			t.Fatalf("renewal expiries=%v, want fake-clock expiry %s", expiries, baseNow.Add(orchestrationLockTTL))
 		}
-		stop()
 		select {
 		case <-ticker.stopped:
 		default:
