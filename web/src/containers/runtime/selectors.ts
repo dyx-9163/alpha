@@ -190,7 +190,8 @@ export function runtimeDiscoveryTarget(row: AifarRuntimeService) {
 export function runtimeServiceForDeployment(row: AifarRuntimeDeployment, services: Map<string, AifarRuntimeService>) {
   const existing = services.get(row.serviceName)
   if (existing) {
-    return existing
+    if (existing.desiredReplicas === row.desiredReplicas) return existing
+    return { ...existing, desiredReplicas: row.desiredReplicas }
   }
   return {
     instanceId: row.instanceId,

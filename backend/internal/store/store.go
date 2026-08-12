@@ -215,12 +215,18 @@ func (s *Store) migrate() error {
 			id text primary key, instance_id text not null, service_name text not null,
 			desired_replicas integer not null, current_revision text not null, updating_revision text,
 			strategy_json text, spec_json text, generation integer not null default 1,
-			observed_generation integer not null default 0, status text not null, metadata_json text,
+			observed_generation integer not null default 0, observation_epoch integer not null default 0,
+			status text not null, metadata_json text,
 			conditions_json text, last_transition_at datetime,
 			created_at datetime not null, updated_at datetime not null,
 			unique(instance_id, service_name)
 		)`,
 		`create index if not exists aifar_deployments_instance on aifar_deployments(instance_id)`,
+		`create table if not exists aifar_runtime_observation_sequence (
+			singleton integer primary key check(singleton=1),
+			next_epoch integer not null
+		)`,
+		`insert into aifar_runtime_observation_sequence(singleton,next_epoch) values(1,0) on conflict(singleton) do nothing`,
 		`create table if not exists aifar_replicasets (
 			id text primary key, instance_id text not null, service_name text not null,
 			revision text not null, image text not null, artifact_hash text,

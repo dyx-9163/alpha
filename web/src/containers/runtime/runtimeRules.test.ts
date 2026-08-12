@@ -638,6 +638,19 @@ describe('runtime selectors', () => {
     })
   })
 
+  it.each([
+    { deploymentDesired: 1, staleServiceDesired: 0 },
+    { deploymentDesired: 0, staleServiceDesired: 1 }
+  ])('overlays canonical deployment desired replicas onto an existing service row %#', ({ deploymentDesired, staleServiceDesired }) => {
+    const row = deployment({ serviceName: 'permission', desiredReplicas: deploymentDesired })
+    const stale = service({ serviceName: 'permission', desiredReplicas: staleServiceDesired, readyReplicas: 1, status: 'ready' })
+
+    expect(runtimeServiceForDeployment(row, buildRuntimeServiceMap([stale]))).toEqual({
+      ...stale,
+      desiredReplicas: deploymentDesired
+    })
+  })
+
   it('builds log pod options in pod order and filters by selected services', () => {
     expect(buildRuntimeLogPodOptions(pods, ['gateway'])).toEqual([
       { value: 'gateway-1', label: 'gateway / gateway-1', serviceName: 'gateway', status: 'running' },

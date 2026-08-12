@@ -262,6 +262,22 @@ var storeMigrations = []storeMigration{
 		Name:    "mysql cluster authoritative topology",
 		Up:      backfillLegacyMySQLClusterTopologies,
 	},
+	{
+		Version: 2026081201,
+		Name:    "AIFAR runtime observation epochs",
+		Up: func(tx *sql.Tx) error {
+			if err := ensureColumnTx(tx, "aifar_deployments", "observation_epoch", `alter table aifar_deployments add column observation_epoch integer not null default 0`); err != nil {
+				return err
+			}
+			return execMigrationStatements(tx,
+				`create table if not exists aifar_runtime_observation_sequence (
+					singleton integer primary key check(singleton=1),
+					next_epoch integer not null
+				)`,
+				`insert into aifar_runtime_observation_sequence(singleton,next_epoch) values(1,0) on conflict(singleton) do nothing`,
+			)
+		},
+	},
 }
 
 func runStoreMigrations(db *sql.DB) error {

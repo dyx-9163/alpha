@@ -2,11 +2,189 @@ package store
 
 import (
 	"errors"
+	"math"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestAIFARRuntimeObservationEpochMigrationUpgradesExistingDatabase(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "aifar.db")
+	db, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.SaveAIFARDeployment(AIFARDeployment{
+		InstanceID: "instance-1", ServiceName: "permission", DesiredReplicas: 1,
+		CurrentRevision: "rev-1", Generation: 4, ObservedGeneration: 3, Status: "Progressing",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.Exec(`delete from schema_migrations where version=2026081201`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.Exec(`drop table aifar_runtime_observation_sequence`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.Exec(`alter table aifar_deployments drop column observation_epoch`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	upgraded, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = upgraded.Close() })
+	rows, err := upgraded.ListAIFARDeployments("instance-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].Generation != 4 || rows[0].ObservedGeneration != 3 || rows[0].ObservationEpoch != 0 {
+		t.Fatalf("existing deployment was not preserved with epoch zero: %+v", rows)
+	}
+	epoch, err := upgraded.AllocateAIFARRuntimeObservationEpoch()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if epoch != 1 {
+		t.Fatalf("first upgraded epoch=%d, want 1", epoch)
+	}
+	var migrations int
+	if err := upgraded.db.QueryRow(`select count(*) from schema_migrations where version=2026081201`).Scan(&migrations); err != nil {
+		t.Fatal(err)
+	}
+	if migrations != 1 {
+		t.Fatalf("observation epoch migration records=%d, want 1", migrations)
+	}
+}
+
+func TestAllocateAIFARRuntimeObservationEpochRejectsOverflowWithoutChangingSequence(t *testing.T) {
+	db := openTestStore(t)
+	if _, err := db.db.Exec(`update aifar_runtime_observation_sequence set next_epoch=? where singleton=1`, int64(math.MaxInt64)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.AllocateAIFARRuntimeObservationEpoch(); err == nil || !strings.Contains(strings.ToLower(err.Error()), "exhausted") {
+		t.Fatalf("expected explicit exhausted error, got %v", err)
+	}
+	var persisted int64
+	if err := db.db.QueryRow(`select next_epoch from aifar_runtime_observation_sequence where singleton=1`).Scan(&persisted); err != nil {
+		t.Fatal(err)
+	}
+	if persisted != math.MaxInt64 {
+		t.Fatalf("overflow changed sequence to %d, want %d", persisted, int64(math.MaxInt64))
+	}
+}
+
+func TestAllocateAIFARRuntimeObservationEpochIsPersistedAndStrictlyMonotonic(t *testing.T) {
+	db := openTestStore(t)
+	first, err := db.AllocateAIFARRuntimeObservationEpoch()
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := db.AllocateAIFARRuntimeObservationEpoch()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first != 1 || second != 2 {
+		t.Fatalf("epochs=(%d,%d), want (1,2)", first, second)
+	}
+	var persisted int64
+	if err := db.db.QueryRow(`select next_epoch from aifar_runtime_observation_sequence where singleton=1`).Scan(&persisted); err != nil {
+		t.Fatal(err)
+	}
+	if persisted != 2 {
+		t.Fatalf("persisted epoch=%d, want 2", persisted)
+	}
+	var defaultEpoch int64
+	if _, err := db.SaveAIFARDeploymentGeneration(AIFARDeployment{
+		InstanceID: "instance-1", ServiceName: "permission", DesiredReplicas: 1,
+		CurrentRevision: "rev-1", Status: "Accepted",
+	}, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.db.QueryRow(`select observation_epoch from aifar_deployments where instance_id=? and service_name=?`, "instance-1", "permission").Scan(&defaultEpoch); err != nil {
+		t.Fatal(err)
+	}
+	if defaultEpoch != 0 {
+		t.Fatalf("default observation epoch=%d, want 0", defaultEpoch)
+	}
+}
+
+func TestObserveAIFARRuntimeServiceIgnoresOlderEpochWithoutReplacingProjection(t *testing.T) {
+	db := openTestStore(t)
+	deployment, err := db.SaveAIFARDeploymentGeneration(AIFARDeployment{
+		InstanceID: "instance-1", ServiceName: "permission", DesiredReplicas: 1,
+		CurrentRevision: "rev-fresh", Status: "Accepted",
+	}, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldEpoch, err := db.AllocateAIFARRuntimeObservationEpoch()
+	if err != nil {
+		t.Fatal(err)
+	}
+	freshEpoch, err := db.AllocateAIFARRuntimeObservationEpoch()
+	if err != nil {
+		t.Fatal(err)
+	}
+	freshAt := time.Date(2026, time.August, 12, 10, 0, 0, 0, time.UTC)
+	fresh, applied, err := db.ObserveAIFARRuntimeService(AIFARRuntimeServiceObservation{
+		InstanceID: "instance-1", ServiceName: "permission", Generation: deployment.Generation,
+		ObservationEpoch: freshEpoch, Status: "Available",
+		ConditionsJSON: `[{"type":"Available","status":true,"reason":"Ready","generation":1}]`, ObservedAt: freshAt,
+		ReplicaSet: &AIFARReplicaSet{InstanceID: "instance-1", ServiceName: "permission", Revision: "rev-fresh", Image: "fresh:image", DesiredPods: 1, ReadyPods: 1, Status: "ready"},
+		Pods:       []AIFARPod{{InstanceID: "instance-1", ServiceName: "permission", Revision: "rev-fresh", PodID: "fresh-1", ContainerName: "fresh-container", Status: "running", Ready: true}},
+		Endpoints:  []AIFARServiceEndpoint{{InstanceID: "instance-1", ServiceName: "permission", Revision: "rev-fresh", PodID: "fresh-1", ContainerName: "fresh-container", State: "active", Ready: true}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !applied || fresh.ObservationEpoch != freshEpoch {
+		t.Fatalf("fresh observation applied=%v row=%+v", applied, fresh)
+	}
+	stale, applied, err := db.ObserveAIFARRuntimeService(AIFARRuntimeServiceObservation{
+		InstanceID: "instance-1", ServiceName: "permission", Generation: deployment.Generation,
+		ObservationEpoch: oldEpoch, Status: "Degraded",
+		ConditionsJSON: `[{"type":"Degraded","status":true,"reason":"OldSnapshot","generation":1}]`, ObservedAt: freshAt.Add(time.Minute),
+		ReplicaSet: &AIFARReplicaSet{InstanceID: "instance-1", ServiceName: "permission", Revision: "rev-old", Image: "old:image", DesiredPods: 1, ReadyPods: 0, Status: "degraded"},
+		Pods:       []AIFARPod{{InstanceID: "instance-1", ServiceName: "permission", Revision: "rev-old", PodID: "old-1", ContainerName: "old-container", Status: "exited"}},
+		Endpoints:  []AIFARServiceEndpoint{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if applied {
+		t.Fatalf("older observation unexpectedly applied: %+v", stale)
+	}
+	if stale.Status != "Available" || stale.ObservationEpoch != freshEpoch || stale.ConditionsJSON != fresh.ConditionsJSON || !stale.LastTransitionAt.Equal(freshAt) {
+		t.Fatalf("older observation changed deployment: fresh=%+v stale=%+v", fresh, stale)
+	}
+	replicaSets, err := db.ListAIFARReplicaSets("instance-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(replicaSets) != 1 || replicaSets[0].Revision != "rev-fresh" || replicaSets[0].Image != "fresh:image" || replicaSets[0].ReadyPods != 1 {
+		t.Fatalf("older observation changed replica sets: %+v", replicaSets)
+	}
+	pods, err := db.ListAIFARPods("instance-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pods) != 1 || pods[0].ContainerName != "fresh-container" || !pods[0].Ready {
+		t.Fatalf("older observation changed pods: %+v", pods)
+	}
+	endpoints, err := db.ListAIFARServiceEndpoints("instance-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(endpoints) != 1 || endpoints[0].ContainerName != "fresh-container" || !endpoints[0].Ready {
+		t.Fatalf("older observation changed endpoints: %+v", endpoints)
+	}
+}
 
 func openTestStore(t *testing.T) *Store {
 	t.Helper()
@@ -94,9 +272,10 @@ func TestObserveAIFARRuntimeServiceRejectsStaleGenerationWithoutChangingProjecti
 		t.Fatal(err)
 	}
 
-	_, err = db.ObserveAIFARRuntimeService(AIFARRuntimeServiceObservation{
+	_, _, err = db.ObserveAIFARRuntimeService(AIFARRuntimeServiceObservation{
 		InstanceID: "instance-1", ServiceName: "permission", Generation: gen1.Generation,
-		Status: "ready", ConditionsJSON: `[{"type":"Available","generation":1}]`, ObservedAt: time.Now().UTC(),
+		ObservationEpoch: 1,
+		Status:           "ready", ConditionsJSON: `[{"type":"Available","generation":1}]`, ObservedAt: time.Now().UTC(),
 		ReplicaSet: &AIFARReplicaSet{
 			InstanceID: "instance-1", ServiceName: "permission", Revision: "rev-old",
 			Image: "aifar-permission:rev-old", DesiredPods: 1, ReadyPods: 1, Status: "ready",
@@ -169,9 +348,10 @@ func TestObserveAIFARRuntimeServiceAtomicallyReplacesOnlyTargetProjection(t *tes
 		t.Fatal(err)
 	}
 	observedAt := time.Date(2026, time.August, 10, 12, 0, 0, 0, time.UTC)
-	observed, err := db.ObserveAIFARRuntimeService(AIFARRuntimeServiceObservation{
+	observed, applied, err := db.ObserveAIFARRuntimeService(AIFARRuntimeServiceObservation{
 		InstanceID: "instance-1", ServiceName: "permission", Generation: permission.Generation,
-		Status: "Available", ConditionsJSON: `[{"type":"Available","generation":1}]`, ObservedAt: observedAt,
+		ObservationEpoch: 1,
+		Status:           "Available", ConditionsJSON: `[{"type":"Available","generation":1}]`, ObservedAt: observedAt,
 		ReplicaSet: &AIFARReplicaSet{
 			InstanceID: "instance-1", ServiceName: "permission", Revision: "rev-new",
 			Image: "aifar-permission:rev-new", DesiredPods: 1, ReadyPods: 1, Status: "ready",
@@ -187,6 +367,9 @@ func TestObserveAIFARRuntimeServiceAtomicallyReplacesOnlyTargetProjection(t *tes
 	})
 	if err != nil {
 		t.Fatal(err)
+	}
+	if !applied {
+		t.Fatal("expected service observation to apply")
 	}
 	if observed.ObservedGeneration != permission.Generation || observed.Status != "Available" || !observed.LastTransitionAt.Equal(observedAt) {
 		t.Fatalf("unexpected deployment observation: %+v", observed)

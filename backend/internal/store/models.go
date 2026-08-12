@@ -291,6 +291,7 @@ type AIFARDeployment struct {
 	SpecJSON           string    `json:"specJson,omitempty"`
 	Generation         int64     `json:"generation"`
 	ObservedGeneration int64     `json:"observedGeneration"`
+	ObservationEpoch   int64     `json:"observationEpoch"`
 	Status             string    `json:"status"`
 	MetadataJSON       string    `json:"metadataJson,omitempty"`
 	ConditionsJSON     string    `json:"conditionsJson,omitempty"`

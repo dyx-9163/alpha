@@ -48,11 +48,13 @@ type aifarRuntimeResponse struct {
 }
 
 type aifarRuntimeBuildOptions struct {
-	IncludePods             bool
-	IncludeStats            bool
-	DockerUnavailable       bool
-	DockerUnavailableReason string
-	Language                string
+	IncludePods               bool
+	IncludeStats              bool
+	ObservationEpoch          int64
+	ObservationEpochAttempted bool
+	DockerUnavailable         bool
+	DockerUnavailableReason   string
+	Language                  string
 }
 
 type aifarRuntimeAgent struct {
@@ -264,11 +266,9 @@ func aifarRuntimeCleanupSteps() []simpleTaskStep {
 
 func aifarRuntimeRestartSteps(lang string) []simpleTaskStep {
 	return []simpleTaskStep{
-		{"load-instance", i18n.Text(lang, "aifar.runtimeRestart.stepLoadInstance")},
-		{"preflight-runtime", i18n.Text(lang, "aifar.runtimeRestart.stepPreflight")},
-		{"stop-all-pods", i18n.Text(lang, "aifar.runtimeRestart.stepStopAll")},
-		{"start-all-pods", i18n.Text(lang, "aifar.runtimeRestart.stepStartAll")},
-		{"verify-runtime", i18n.Text(lang, "aifar.runtimeRestart.stepVerify")},
+		{"enumerate-services", i18n.Text(lang, "aifar.runtimeRestart.stepEnumerateServices")},
+		{"apply-per-service", i18n.Text(lang, "aifar.runtimeRestart.stepApplyPerService")},
+		{"verify-services", i18n.Text(lang, "aifar.runtimeRestart.stepVerifyServices")},
 	}
 }
 
@@ -1540,6 +1540,14 @@ func (a *API) buildAIFARRuntime(ctx context.Context, server store.Server, option
 			response.Warnings = append(response.Warnings, "failed to read Docker containers: "+err.Error())
 		}
 	}
+	if options.IncludePods && !options.DockerUnavailable {
+		options.ObservationEpochAttempted = true
+		options.ObservationEpoch, err = a.store.AllocateAIFARRuntimeObservationEpoch()
+		if err != nil {
+			response.RuntimeStatus = degradedIfReady(response.RuntimeStatus)
+			response.Warnings = append(response.Warnings, "failed to allocate Docker observation epoch: "+err.Error())
+		}
+	}
 	containersByName := mapContainersByName(containers)
 	statsByName := map[string]adapter.DockerContainerStat{}
 	if options.IncludeStats {
@@ -1591,8 +1599,12 @@ func (a *API) appendAIFARInstanceRuntime(response *aifarRuntimeResponse, instanc
 	replicasets, _ := a.store.ListAIFARReplicaSets(instance.ID)
 	pods, _ := a.store.ListAIFARPods(instance.ID)
 	endpoints, _ := a.store.ListAIFARServiceEndpoints(instance.ID)
-	if options.IncludePods && !options.DockerUnavailable {
-		if a.reconcileAIFARRuntimeControlPlane(instance, metadata, deployments, pods, endpoints, containersByName) {
+	if options.IncludePods && !options.DockerUnavailable && (!options.ObservationEpochAttempted || options.ObservationEpoch > 0) {
+		observationEpoch := options.ObservationEpoch
+		if observationEpoch <= 0 {
+			observationEpoch, _ = a.store.AllocateAIFARRuntimeObservationEpoch()
+		}
+		if observationEpoch > 0 && a.reconcileAIFARRuntimeControlPlane(instance, metadata, deployments, pods, endpoints, containersByName, observationEpoch) {
 			if saved, err := a.store.GetAppInstance(instance.ID); err == nil {
 				instance = saved
 				metadata = runtimeMetadata(instance.Metadata)
@@ -1897,7 +1909,6 @@ func applyAgentStatusToRuntimeService(row *aifarRuntimeService, serviceStatus ai
 		}
 	}
 	if deploymentStatus.ServiceName != "" {
-		row.DesiredReplicas = deploymentStatus.DesiredReplicas
 		row.ReadyReplicas = deploymentStatus.ReadyReplicas
 		row.RolloutStatus = cleanRuntimeText(deploymentStatus.Status)
 		row.LastError = cleanRuntimeText(deploymentStatus.LastError)
@@ -1931,12 +1942,9 @@ func applyDockerUnavailableToRuntimeService(row *aifarRuntimeService, options ai
 	}
 }
 
-func (a *API) reconcileAIFARRuntimeControlPlane(instance store.AppInstance, metadata map[string]any, deployments []store.AIFARDeployment, pods []store.AIFARPod, endpoints []store.AIFARServiceEndpoint, containersByName map[string]adapter.DockerContainer) bool {
+func (a *API) reconcileAIFARRuntimeControlPlane(instance store.AppInstance, metadata map[string]any, deployments []store.AIFARDeployment, pods []store.AIFARPod, endpoints []store.AIFARServiceEndpoint, containersByName map[string]adapter.DockerContainer, observationEpoch int64) bool {
 	catalog := newAIFARRuntimeServiceCatalog(metadata)
 	discovered := discoverAIFARPodsFromDocker(metadata, containersByName, catalog)
-	if len(discovered) == 0 {
-		return false
-	}
 	changed := false
 	deploymentsByService := make(map[string]store.AIFARDeployment, len(deployments))
 	for _, deployment := range deployments {
@@ -1963,41 +1971,47 @@ func (a *API) reconcileAIFARRuntimeControlPlane(instance store.AppInstance, meta
 	for _, pod := range discovered {
 		grouped[pod.ServiceName] = append(grouped[pod.ServiceName], pod)
 	}
-	for service, servicePods := range grouped {
+	for service, existingDeployment := range deploymentsByService {
+		servicePods := grouped[service]
 		sort.Slice(servicePods, func(i, j int) bool {
 			if servicePods[i].ReplicaID == servicePods[j].ReplicaID {
 				return servicePods[i].ContainerName < servicePods[j].ContainerName
 			}
 			return servicePods[i].ReplicaID < servicePods[j].ReplicaID
 		})
-		existingDeployment, hasDeployment := deploymentsByService[service]
-		if !hasDeployment {
-			continue
-		}
 		desired := existingDeployment.DesiredReplicas
 		ready := runtimeDiscoveredReadyReplicas(servicePods)
 		revision := runtimeDiscoveredRevision(servicePods)
 		image := runtimeDiscoveredImage(servicePods)
 		status := runtimeDiscoveredServiceStatus(desired, ready)
+		conditionReason := "DockerObserved"
+		if len(servicePods) == 0 {
+			if desired == 0 {
+				status = "Offline"
+			} else {
+				status = "Degraded"
+				conditionReason = "NoEndpoints"
+			}
+		}
 		if desired == 0 && len(servicePods) > 0 {
 			status = "degraded"
 		}
 		conditionType := "Progressing"
-		switch status {
-		case "ready":
+		switch strings.ToLower(status) {
+		case "ready", "available":
 			conditionType = "Available"
 		case "offline":
 			conditionType = "Offline"
 		case "degraded", "failed":
 			conditionType = "Degraded"
 		}
-		needsObservation := existingDeployment.ObservedGeneration != existingDeployment.Generation || existingDeployment.Status != status || !runtimeDeploymentHasCondition(existingDeployment, conditionType, "DockerObserved")
+		needsObservation := existingDeployment.ObservedGeneration != existingDeployment.Generation || existingDeployment.Status != status || !runtimeDeploymentHasCondition(existingDeployment, conditionType, conditionReason)
 		conditionsJSON := existingDeployment.ConditionsJSON
 		observedAt := time.Time{}
 		if needsObservation {
 			observedAt = time.Now().UTC()
 			conditions, marshalErr := json.Marshal([]runtimeagent.DeploymentCondition{{
-				Type: conditionType, Status: true, Reason: "DockerObserved",
+				Type: conditionType, Status: true, Reason: conditionReason,
 				Generation: existingDeployment.Generation, LastTransitionTime: observedAt,
 			}})
 			if marshalErr != nil {
@@ -2006,6 +2020,9 @@ func (a *API) reconcileAIFARRuntimeControlPlane(instance store.AppInstance, meta
 			conditionsJSON = string(conditions)
 		}
 		var nextReplicaSet *store.AIFARReplicaSet
+		if revision == "" && len(servicePods) == 0 {
+			revision = cleanRuntimeText(existingDeployment.CurrentRevision)
+		}
 		if revision != "" {
 			existingReplicaSet := replicaSetsByKey[runtimeServiceRevisionKey(service, revision)]
 			artifactHash := cleanRuntimeText(existingReplicaSet.ArtifactHash)
@@ -2072,14 +2089,12 @@ func (a *API) reconcileAIFARRuntimeControlPlane(instance store.AppInstance, meta
 		}
 		replicaSetChanged := nextReplicaSet != nil && (nextReplicaSet.ID == "" || !runtimeReplicaSetEqual(replicaSetsByKey[runtimeServiceRevisionKey(service, revision)], *nextReplicaSet))
 		projectionChanged := replicaSetChanged || !runtimeServicePodsEqual(podsByService[service], nextPods) || !runtimeEndpointsEqual(endpointsByService[service], nextEndpoints)
-		if !needsObservation && !projectionChanged {
-			continue
-		}
-		if _, err := a.store.ObserveAIFARRuntimeService(store.AIFARRuntimeServiceObservation{
+		if _, applied, err := a.store.ObserveAIFARRuntimeService(store.AIFARRuntimeServiceObservation{
 			InstanceID: instance.ID, ServiceName: service, Generation: existingDeployment.Generation,
-			Status: status, ConditionsJSON: conditionsJSON, ObservedAt: observedAt,
+			ObservationEpoch: observationEpoch,
+			Status:           status, ConditionsJSON: conditionsJSON, ObservedAt: observedAt,
 			ReplicaSet: nextReplicaSet, Pods: nextPods, Endpoints: nextEndpoints,
-		}); err == nil {
+		}); err == nil && applied && (needsObservation || projectionChanged || existingDeployment.ObservationEpoch != observationEpoch) {
 			changed = true
 		}
 	}

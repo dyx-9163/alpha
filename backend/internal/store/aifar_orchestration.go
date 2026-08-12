@@ -194,22 +194,23 @@ func (s *Store) SaveAIFARDeployment(v AIFARDeployment) (AIFARDeployment, error) 
 	if v.Generation <= 0 {
 		v.Generation = 1
 	}
-	_, err := s.db.Exec(`insert into aifar_deployments(id,instance_id,service_name,desired_replicas,current_revision,updating_revision,strategy_json,spec_json,generation,observed_generation,status,metadata_json,conditions_json,last_transition_at,created_at,updated_at)
-		values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+	_, err := s.db.Exec(`insert into aifar_deployments(id,instance_id,service_name,desired_replicas,current_revision,updating_revision,strategy_json,spec_json,generation,observed_generation,observation_epoch,status,metadata_json,conditions_json,last_transition_at,created_at,updated_at)
+		values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		on conflict(instance_id, service_name) do update set
 		desired_replicas=excluded.desired_replicas,current_revision=excluded.current_revision,updating_revision=excluded.updating_revision,
 		strategy_json=excluded.strategy_json,spec_json=case when excluded.spec_json <> '' then excluded.spec_json else aifar_deployments.spec_json end,
 		generation=case when excluded.generation > aifar_deployments.generation then excluded.generation else aifar_deployments.generation end,
 		observed_generation=case when excluded.observed_generation > aifar_deployments.observed_generation then excluded.observed_generation else aifar_deployments.observed_generation end,
+		observation_epoch=case when excluded.observation_epoch > aifar_deployments.observation_epoch then excluded.observation_epoch else aifar_deployments.observation_epoch end,
 		status=excluded.status,metadata_json=excluded.metadata_json,
 		conditions_json=case when excluded.conditions_json <> '' then excluded.conditions_json else aifar_deployments.conditions_json end,
 		last_transition_at=coalesce(excluded.last_transition_at,aifar_deployments.last_transition_at),updated_at=excluded.updated_at`,
-		v.ID, v.InstanceID, v.ServiceName, v.DesiredReplicas, v.CurrentRevision, v.UpdatingRevision, v.StrategyJSON, v.SpecJSON, v.Generation, v.ObservedGeneration, v.Status, v.MetadataJSON, v.ConditionsJSON, nullableTime(v.LastTransitionAt), v.CreatedAt, v.UpdatedAt)
+		v.ID, v.InstanceID, v.ServiceName, v.DesiredReplicas, v.CurrentRevision, v.UpdatingRevision, v.StrategyJSON, v.SpecJSON, v.Generation, v.ObservedGeneration, v.ObservationEpoch, v.Status, v.MetadataJSON, v.ConditionsJSON, nullableTime(v.LastTransitionAt), v.CreatedAt, v.UpdatedAt)
 	return v, err
 }
 
 func (s *Store) ListAIFARDeployments(instanceID string) ([]AIFARDeployment, error) {
-	rows, err := s.db.Query(`select id,instance_id,service_name,desired_replicas,current_revision,coalesce(updating_revision,''),coalesce(strategy_json,''),coalesce(spec_json,''),coalesce(generation,1),coalesce(observed_generation,0),status,coalesce(metadata_json,''),coalesce(conditions_json,''),last_transition_at,created_at,updated_at
+	rows, err := s.db.Query(`select id,instance_id,service_name,desired_replicas,current_revision,coalesce(updating_revision,''),coalesce(strategy_json,''),coalesce(spec_json,''),coalesce(generation,1),coalesce(observed_generation,0),coalesce(observation_epoch,0),status,coalesce(metadata_json,''),coalesce(conditions_json,''),last_transition_at,created_at,updated_at
 		from aifar_deployments where instance_id=? order by service_name`, instanceID)
 	if err != nil {
 		return nil, err
@@ -280,20 +281,21 @@ func prepareAIFARDeploymentGeneration(next AIFARDeployment, expectedGeneration i
 	}
 	next.Generation = expectedGeneration + 1
 	next.ObservedGeneration = 0
+	next.ObservationEpoch = 0
 	next.UpdatedAt = now
 	return next
 }
 
 func saveAIFARDeploymentGenerationTx(tx *sql.Tx, next AIFARDeployment, expectedGeneration int64) (AIFARDeployment, error) {
-	result, err := tx.Exec(`insert into aifar_deployments(id,instance_id,service_name,desired_replicas,current_revision,updating_revision,strategy_json,spec_json,generation,observed_generation,status,metadata_json,conditions_json,last_transition_at,created_at,updated_at)
-		select ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
+	result, err := tx.Exec(`insert into aifar_deployments(id,instance_id,service_name,desired_replicas,current_revision,updating_revision,strategy_json,spec_json,generation,observed_generation,observation_epoch,status,metadata_json,conditions_json,last_transition_at,created_at,updated_at)
+		select ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
 		where ?=0 or exists(select 1 from aifar_deployments where instance_id=? and service_name=?)
 		on conflict(instance_id, service_name) do update set
 		desired_replicas=excluded.desired_replicas,current_revision=excluded.current_revision,updating_revision=excluded.updating_revision,
-		strategy_json=excluded.strategy_json,spec_json=excluded.spec_json,generation=excluded.generation,observed_generation=excluded.observed_generation,status=excluded.status,
+		strategy_json=excluded.strategy_json,spec_json=excluded.spec_json,generation=excluded.generation,observed_generation=excluded.observed_generation,observation_epoch=excluded.observation_epoch,status=excluded.status,
 		metadata_json=excluded.metadata_json,conditions_json=excluded.conditions_json,last_transition_at=excluded.last_transition_at,updated_at=excluded.updated_at
 		where aifar_deployments.generation=?`,
-		next.ID, next.InstanceID, next.ServiceName, next.DesiredReplicas, next.CurrentRevision, next.UpdatingRevision, next.StrategyJSON, next.SpecJSON, next.Generation, next.ObservedGeneration, next.Status, next.MetadataJSON, next.ConditionsJSON, nullableTime(next.LastTransitionAt), next.CreatedAt, next.UpdatedAt, expectedGeneration, next.InstanceID, next.ServiceName, expectedGeneration)
+		next.ID, next.InstanceID, next.ServiceName, next.DesiredReplicas, next.CurrentRevision, next.UpdatingRevision, next.StrategyJSON, next.SpecJSON, next.Generation, next.ObservedGeneration, next.ObservationEpoch, next.Status, next.MetadataJSON, next.ConditionsJSON, nullableTime(next.LastTransitionAt), next.CreatedAt, next.UpdatedAt, expectedGeneration, next.InstanceID, next.ServiceName, expectedGeneration)
 	if err != nil {
 		return AIFARDeployment{}, err
 	}
@@ -397,9 +399,9 @@ func (s *Store) SaveAIFARInitialDesiredWithLock(lockID string, deployments []AIF
 		return tx.Commit()
 	}
 	for _, deployment := range deployments {
-		if _, err := tx.Exec(`insert into aifar_deployments(id,instance_id,service_name,desired_replicas,current_revision,updating_revision,strategy_json,spec_json,generation,observed_generation,status,metadata_json,conditions_json,last_transition_at,created_at,updated_at)
-			values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) on conflict(instance_id,service_name) do nothing`,
-			deployment.ID, deployment.InstanceID, deployment.ServiceName, deployment.DesiredReplicas, deployment.CurrentRevision, deployment.UpdatingRevision, deployment.StrategyJSON, deployment.SpecJSON, deployment.Generation, deployment.ObservedGeneration, deployment.Status, deployment.MetadataJSON, deployment.ConditionsJSON, nullableTime(deployment.LastTransitionAt), deployment.CreatedAt, deployment.UpdatedAt); err != nil {
+		if _, err := tx.Exec(`insert into aifar_deployments(id,instance_id,service_name,desired_replicas,current_revision,updating_revision,strategy_json,spec_json,generation,observed_generation,observation_epoch,status,metadata_json,conditions_json,last_transition_at,created_at,updated_at)
+				values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) on conflict(instance_id,service_name) do nothing`,
+			deployment.ID, deployment.InstanceID, deployment.ServiceName, deployment.DesiredReplicas, deployment.CurrentRevision, deployment.UpdatingRevision, deployment.StrategyJSON, deployment.SpecJSON, deployment.Generation, deployment.ObservedGeneration, deployment.ObservationEpoch, deployment.Status, deployment.MetadataJSON, deployment.ConditionsJSON, nullableTime(deployment.LastTransitionAt), deployment.CreatedAt, deployment.UpdatedAt); err != nil {
 			return err
 		}
 		current, err := getAIFARDeployment(tx, deployment.InstanceID, deployment.ServiceName)
@@ -430,7 +432,7 @@ func (s *Store) SaveAIFARInitialDesiredWithLock(lockID string, deployments []AIF
 }
 
 func listAIFARDeploymentsTx(tx *sql.Tx, instanceID string) ([]AIFARDeployment, error) {
-	rows, err := tx.Query(`select id,instance_id,service_name,desired_replicas,current_revision,coalesce(updating_revision,''),coalesce(strategy_json,''),coalesce(spec_json,''),coalesce(generation,1),coalesce(observed_generation,0),status,coalesce(metadata_json,''),coalesce(conditions_json,''),last_transition_at,created_at,updated_at
+	rows, err := tx.Query(`select id,instance_id,service_name,desired_replicas,current_revision,coalesce(updating_revision,''),coalesce(strategy_json,''),coalesce(spec_json,''),coalesce(generation,1),coalesce(observed_generation,0),coalesce(observation_epoch,0),status,coalesce(metadata_json,''),coalesce(conditions_json,''),last_transition_at,created_at,updated_at
 		from aifar_deployments where instance_id=? order by service_name`, instanceID)
 	if err != nil {
 		return nil, err
@@ -915,45 +917,75 @@ func (s *Store) ObserveAIFARDeployment(instanceID, serviceName string, generatio
 }
 
 type AIFARRuntimeServiceObservation struct {
-	InstanceID     string
-	ServiceName    string
-	Generation     int64
-	Status         string
-	ConditionsJSON string
-	ObservedAt     time.Time
-	ReplicaSet     *AIFARReplicaSet
-	Pods           []AIFARPod
-	Endpoints      []AIFARServiceEndpoint
+	InstanceID       string
+	ServiceName      string
+	Generation       int64
+	ObservationEpoch int64
+	Status           string
+	ConditionsJSON   string
+	ObservedAt       time.Time
+	ReplicaSet       *AIFARReplicaSet
+	Pods             []AIFARPod
+	Endpoints        []AIFARServiceEndpoint
 }
 
-func (s *Store) ObserveAIFARRuntimeService(v AIFARRuntimeServiceObservation) (AIFARDeployment, error) {
+func (s *Store) AllocateAIFARRuntimeObservationEpoch() (int64, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	var epoch int64
+	if err := tx.QueryRow(`update aifar_runtime_observation_sequence set next_epoch=next_epoch+1 where singleton=1 and next_epoch < 9223372036854775807 returning next_epoch`).Scan(&epoch); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return 0, errors.New("AIFAR runtime observation epoch exhausted")
+		}
+		return 0, err
+	}
+	if epoch <= 0 {
+		return 0, errors.New("invalid AIFAR runtime observation epoch")
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return epoch, nil
+}
+
+func (s *Store) ObserveAIFARRuntimeService(v AIFARRuntimeServiceObservation) (AIFARDeployment, bool, error) {
 	if err := validateAIFARRuntimeServiceObservation(v); err != nil {
-		return AIFARDeployment{}, err
+		return AIFARDeployment{}, false, err
 	}
 	tx, err := s.db.Begin()
 	if err != nil {
-		return AIFARDeployment{}, err
+		return AIFARDeployment{}, false, err
 	}
 	defer tx.Rollback()
 	result, err := tx.Exec(`update aifar_deployments set
-		status=?, conditions_json=?, observed_generation=?, last_transition_at=coalesce(?,last_transition_at), updated_at=?
-		where instance_id=? and service_name=? and generation=?`,
-		v.Status, v.ConditionsJSON, v.Generation, nullableTime(v.ObservedAt), time.Now(), v.InstanceID, v.ServiceName, v.Generation)
+		status=?, conditions_json=?, observed_generation=?, observation_epoch=?, last_transition_at=coalesce(?,last_transition_at), updated_at=?
+		where instance_id=? and service_name=? and generation=? and observation_epoch<?`,
+		v.Status, v.ConditionsJSON, v.Generation, v.ObservationEpoch, nullableTime(v.ObservedAt), time.Now(), v.InstanceID, v.ServiceName, v.Generation, v.ObservationEpoch)
 	if err != nil {
-		return AIFARDeployment{}, err
+		return AIFARDeployment{}, false, err
 	}
 	affected, err := result.RowsAffected()
 	if err != nil {
-		return AIFARDeployment{}, err
+		return AIFARDeployment{}, false, err
 	}
 	if affected == 0 {
-		if _, getErr := getAIFARDeployment(tx, v.InstanceID, v.ServiceName); getErr != nil {
+		current, getErr := getAIFARDeployment(tx, v.InstanceID, v.ServiceName)
+		if getErr != nil {
 			if errors.Is(getErr, sql.ErrNoRows) {
-				return AIFARDeployment{}, ErrAIFARDeploymentNotFound
+				return AIFARDeployment{}, false, ErrAIFARDeploymentNotFound
 			}
-			return AIFARDeployment{}, getErr
+			return AIFARDeployment{}, false, getErr
 		}
-		return AIFARDeployment{}, ErrAIFARDeploymentGenerationConflict
+		if current.Generation == v.Generation && current.ObservationEpoch >= v.ObservationEpoch {
+			if err := tx.Commit(); err != nil {
+				return AIFARDeployment{}, false, err
+			}
+			return current, false, nil
+		}
+		return AIFARDeployment{}, false, ErrAIFARDeploymentGenerationConflict
 	}
 	now := time.Now()
 	if v.ReplicaSet != nil {
@@ -975,11 +1007,11 @@ func (s *Store) ObserveAIFARRuntimeService(v AIFARRuntimeServiceObservation) (AI
 			ready_pods=excluded.ready_pods,status=excluded.status,metadata_json=excluded.metadata_json,updated_at=excluded.updated_at`,
 			replicaSet.ID, replicaSet.InstanceID, replicaSet.ServiceName, replicaSet.Revision, replicaSet.Image, replicaSet.ArtifactHash,
 			replicaSet.DesiredPods, replicaSet.ReadyPods, replicaSet.Status, replicaSet.MetadataJSON, replicaSet.CreatedAt, replicaSet.UpdatedAt); err != nil {
-			return AIFARDeployment{}, err
+			return AIFARDeployment{}, false, err
 		}
 	}
 	if _, err := tx.Exec(`delete from aifar_pods where instance_id=? and service_name=?`, v.InstanceID, v.ServiceName); err != nil {
-		return AIFARDeployment{}, err
+		return AIFARDeployment{}, false, err
 	}
 	for _, pod := range v.Pods {
 		if pod.ID == "" {
@@ -992,11 +1024,11 @@ func (s *Store) ObserveAIFARRuntimeService(v AIFARRuntimeServiceObservation) (AI
 		if _, err := tx.Exec(`insert into aifar_pods(id,instance_id,service_name,revision,pod_id,container_name,port,status,ready,metadata_json,created_at,updated_at)
 			values(?,?,?,?,?,?,?,?,?,?,?,?)`, pod.ID, pod.InstanceID, pod.ServiceName, pod.Revision, pod.PodID,
 			pod.ContainerName, pod.Port, pod.Status, boolInt(pod.Ready), pod.MetadataJSON, pod.CreatedAt, pod.UpdatedAt); err != nil {
-			return AIFARDeployment{}, err
+			return AIFARDeployment{}, false, err
 		}
 	}
 	if _, err := tx.Exec(`delete from aifar_service_endpoints where instance_id=? and service_name=?`, v.InstanceID, v.ServiceName); err != nil {
-		return AIFARDeployment{}, err
+		return AIFARDeployment{}, false, err
 	}
 	for _, endpoint := range v.Endpoints {
 		if endpoint.ID == "" {
@@ -1010,23 +1042,23 @@ func (s *Store) ObserveAIFARRuntimeService(v AIFARRuntimeServiceObservation) (AI
 			values(?,?,?,?,?,?,?,?,?,?,?,?)`, endpoint.ID, endpoint.InstanceID, endpoint.ServiceName, endpoint.PodID,
 			endpoint.ContainerName, endpoint.Revision, endpoint.Port, endpoint.State, boolInt(endpoint.Ready), endpoint.MetadataJSON,
 			endpoint.CreatedAt, endpoint.UpdatedAt); err != nil {
-			return AIFARDeployment{}, err
+			return AIFARDeployment{}, false, err
 		}
 	}
 	observed, err := getAIFARDeployment(tx, v.InstanceID, v.ServiceName)
 	if err != nil {
-		return AIFARDeployment{}, err
+		return AIFARDeployment{}, false, err
 	}
 	if err := tx.Commit(); err != nil {
-		return AIFARDeployment{}, err
+		return AIFARDeployment{}, false, err
 	}
-	return observed, nil
+	return observed, true, nil
 }
 
 func validateAIFARRuntimeServiceObservation(v AIFARRuntimeServiceObservation) error {
 	instanceID := strings.TrimSpace(v.InstanceID)
 	serviceName := strings.TrimSpace(v.ServiceName)
-	if instanceID == "" || serviceName == "" || v.Generation <= 0 {
+	if instanceID == "" || serviceName == "" || v.Generation <= 0 || v.ObservationEpoch <= 0 {
 		return errors.New("invalid AIFAR runtime service observation target")
 	}
 	if v.ReplicaSet != nil && (v.ReplicaSet.InstanceID != instanceID || v.ReplicaSet.ServiceName != serviceName) {
@@ -1052,13 +1084,13 @@ type aifarDeploymentScanner interface {
 func scanAIFARDeployment(scanner aifarDeploymentScanner) (AIFARDeployment, error) {
 	var v AIFARDeployment
 	var lastTransitionAt sql.NullTime
-	err := scanner.Scan(&v.ID, &v.InstanceID, &v.ServiceName, &v.DesiredReplicas, &v.CurrentRevision, &v.UpdatingRevision, &v.StrategyJSON, &v.SpecJSON, &v.Generation, &v.ObservedGeneration, &v.Status, &v.MetadataJSON, &v.ConditionsJSON, &lastTransitionAt, &v.CreatedAt, &v.UpdatedAt)
+	err := scanner.Scan(&v.ID, &v.InstanceID, &v.ServiceName, &v.DesiredReplicas, &v.CurrentRevision, &v.UpdatingRevision, &v.StrategyJSON, &v.SpecJSON, &v.Generation, &v.ObservedGeneration, &v.ObservationEpoch, &v.Status, &v.MetadataJSON, &v.ConditionsJSON, &lastTransitionAt, &v.CreatedAt, &v.UpdatedAt)
 	v.LastTransitionAt = nullTime(lastTransitionAt)
 	return v, err
 }
 
 func getAIFARDeployment(tx *sql.Tx, instanceID, serviceName string) (AIFARDeployment, error) {
-	row := tx.QueryRow(`select id,instance_id,service_name,desired_replicas,current_revision,coalesce(updating_revision,''),coalesce(strategy_json,''),coalesce(spec_json,''),coalesce(generation,1),coalesce(observed_generation,0),status,coalesce(metadata_json,''),coalesce(conditions_json,''),last_transition_at,created_at,updated_at
+	row := tx.QueryRow(`select id,instance_id,service_name,desired_replicas,current_revision,coalesce(updating_revision,''),coalesce(strategy_json,''),coalesce(spec_json,''),coalesce(generation,1),coalesce(observed_generation,0),coalesce(observation_epoch,0),status,coalesce(metadata_json,''),coalesce(conditions_json,''),last_transition_at,created_at,updated_at
 		from aifar_deployments where instance_id=? and service_name=?`, instanceID, serviceName)
 	return scanAIFARDeployment(row)
 }
