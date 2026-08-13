@@ -3,6 +3,32 @@
 
 本文件记录后续对话的精简问题与结论。每次开始先读，结束前追加。禁止写入密码、token、私钥、完整连接串和长日志。
 
+## 2026-08-04
+- 问题：客户运行约两周后控制面 SQLite 占用约 1 GB，清除任务日志后文件仍未缩小。
+- 结论：当前 collector 默认每 15 秒运行；`app.instance` 快照 payload 含每轮变化的 `updatedAt`，会被判定为变化并持续追加 `status_snapshot_history`，告警证据中的快照时间/版本也会使开放告警持续追加 `alert_events`。这两张历史表未纳入现有审计/任务保留清理；删除 `task_logs` 既不清理它们，也不会自动缩小 SQLite 文件。当前工作区数据库只读核验中，247.6 MB 主库主要由 `status_snapshot_history` 及其索引、`alert_events` 及其索引构成，任务日志可忽略。现场应先用 `dbstat`、行数、`page_count/freelist_count` 和 `quick_check` 确认，再备份、停服、按保留窗口清理两张历史表并执行受控 `VACUUM`/`VACUUM INTO`；长期修复需消除快照 payload 的易变字段、只记录真实状态变化，并为两张历史表增加保留策略。
+- 问题：用户询问是否增加状态过程记录的定时清理，或像审计日志一样提供保留配置。
+- 结论：已确认当前审计/任务保留天数来自环境变量，并由设置页展示和手动维护任务执行；尚无通用后台定时保留调度器。设计应把 `status_snapshot_history` 与 `alert_events` 纳入可配置保留，并采用自动调度与现有手动清理共用同一服务；具体配置入口和默认值待用户确认。
+- 问题：用户追问状态历史的范围，以及告警事件是否全量存入 SQLite。
+- 结论：当前状态快照 scope 仅有 `server`、`docker.summary`、`app.instance`、`aifar.runtime`；最新状态分别保存在小型 `status_snapshots` 表，发生变化时另追加 `status_snapshot_history`。告警当前态按 fingerprint 保存在 `alerts`，生命周期事件写入 `alert_events`，字段只有 alert id、fingerprint、事件类型、actor、message、created_at，不含完整 evidence JSON；但当前易变快照证据导致开放告警频繁产生 `updated` 事件。现有生产 API/UI使用最新状态和当前告警，未读取两张历史表，因此自动清理只应作用于历史表，不删除当前态表。
+- 问题：用户询问若未来需要查看状态趋势和告警历史时间线，应如何设计。
+- 结论：推荐“语义状态变更 + 小时聚合 + 告警生命周期”模型，不保留每 15 秒原始全量快照：`status_snapshots`/`alerts` 继续保存当前态，`status_snapshot_history` 仅在规范化后的真实状态或关键字段变化时追加，新增按资源/小时 upsert 的趋势聚合用于可用率与数据完整度，`alert_events` 仅记录 created、severity_changed、acknowledged、muted/unmuted、resolved/reopened 等真实生命周期事件，`last_seen_at` 刷新不生成事件。历史分页查询、按权限过滤、每日批量保留清理和手工数据库压缩应分离；具体默认保留期和页面入口待用户批准设计。
+- 问题：用户询问频繁探测服务器和服务是否会给客户环境带来较大压力。
+- 结论：当前默认 15 秒一轮偏激进。服务器 SSH 探测和 Docker summary 分别最多 8 并发且超时 5 秒，但应用实例按实例直接启动 goroutine、没有独立全局并发上限、单实例超时 30 秒；经 SSH 的 Docker summary 会执行 info、images、networks、volumes 多个命令。Redis collector 已合并为一次轻量 SSH 命令；Nacos主要是本机 readiness/端口/systemd；MySQL 每个认证命令会准备远端目录、上传临时凭据、执行并清理，InnoDB Cluster 还额外查询 PRIMARY；MinIO collector 的运行状态探测同时执行 `mc find --older-than` 扫描对象以估算清理量，最可能形成实际对象存储压力。应拆分快速存活、服务健康、拓扑和容量扫描频率，移除健康轮询中的 MinIO 全量估算，增加全局/单机并发限制、抖动和失败确认；短期客户配置建议把周期由 15 秒调到至少 60 秒。
+- 问题：用户要求暂时不继续状态历史、告警时间线、定时清理和分层探测设计。
+- 结论：已暂停；未写设计文档、未修改功能代码、未执行客户数据库清理。后续收到“继续”后从当前设计确认点恢复。
+- 问题：用户需要一个可在 Windows 和 Linux 客户环境可视化查看 AIFAR SQLite 的工具。
+- 结论：桌面环境优先选 DB Browser for SQLite，Windows 可用免安装 ZIP/PortableApp，Linux 可用 AppImage；无桌面的 Linux 服务器可选 sqlite-web，但必须只读、仅绑定本机并通过受控通道访问。客户查看应针对 `Store.BackupDatabase`/`VACUUM INTO` 生成的一致性副本，不直接编辑运行中的 `data/aifar.db`，也不把包含客户数据的数据库上传到在线服务。
+- 问题：用户询问除 DB Browser for SQLite 和 sqlite-web 外的跨平台可视化工具。
+- 结论：桌面替代品可选 SQLiteStudio、DBeaver Community、Beekeeper Studio；无桌面 Linux 的只读浏览优先 Datasette，已有 PHP 环境可选 Adminer，但 Adminer 管理能力较强、需要额外隔离和鉴权。AIFAR 离线交付优先级为 DB Browser、SQLiteStudio、DBeaver；若目标是让多人用浏览器查看，则优先 Datasette 而非直接开放任意写 SQL。
+- 问题：用户询问是否应自研数据库管理客户端，以及不自研时的最佳选型。
+- 结论：不建议自研通用数据库管理客户端；其事务、锁/WAL、模式编辑、导入导出、安全只读、跨平台打包和升级维护成本不属于 AIFAR 核心能力。AIFAR 桌面/现场运维统一优先 DB Browser for SQLite；无桌面 Linux 多人浏览优先 Datasette。若未来产品内确有需求，只做受权限控制的 AIFAR 专用只读诊断页和受控导出，不提供任意写 SQL、表结构修改或直接编辑生产库。
+- 问题：用户补充需要管理 SQLite 之外的其他数据库。
+- 结论：若范围是 SQLite、MySQL、PostgreSQL、MariaDB、SQL Server、Oracle 等关系型数据库，主选 DBeaver Community；若 AIFAR 范围还包括 Redis，DBeaver Community 不提供 Redis，应采用 DBeaver Community 加官方 Redis Insight 的免费稳妥组合。若强制只装一个免费跨平台客户端，可 PoC DbGate Community，其官方列明支持 SQLite、MySQL、PostgreSQL、Redis 等；付费统一客户端可评估 DBeaver Enterprise/Ultimate。MinIO 是对象存储、Nacos 是配置/注册中心，不能因客户端列出连接类型就当作数据库统一管理。
+- 问题：用户明确工具只提供开源版本，并要求覆盖大部分关系型与非关系型数据库运维能力。
+- 结论：统一客户端基座优先 DbGate Community，而不是 DBeaver Community；DbGate GPL-3.0、支持 Windows/Linux/桌面与 Web，官方插件范围覆盖 MySQL/MariaDB、PostgreSQL、SQLite、SQL Server、Oracle、MongoDB、Redis、Cassandra、ClickHouse、DuckDB 等。但 DbGate 的通用查询/浏览/编辑不等于完整运维；AIFAR 应保留独立的数据库 adapter/worker 层，通过各数据库原生工具实现备份恢复、用户权限、复制/集群、健康检查和升级，并统一确认、任务步骤、审计和脱敏。若修改或集成 DbGate，需在确定分发方式前复核 GPL-3.0 与 AIFAR 许可证兼容性；优先以独立进程/组件集成，避免把第三方凭据库作为 AIFAR 的权威凭据源。
+- 问题：用户询问 DbGate Community 如何连接服务端 SQLite。
+- 结论：SQLite 是文件数据库，DbGate 不能通过服务器 IP/端口或 SSH 隧道直接连接远端 SQLite 文件。桌面方式应由 AIFAR `Store.BackupDatabase`/`VACUUM INTO` 生成一致性副本，再通过受控下载/SFTP复制到本机，以 SQLite 文件连接并启用只读；服务器方式可在同机运行 DbGate Community Web/Docker，把备份目录只读挂载到容器并用 `FILE_<id>`、`READONLY_<id>=1`、`ENGINE_<id>=sqlite@dbgate-plugin-sqlite` 配置。Community Web 的内置登录/用户管理不应视为可用开源能力，服务只绑定 `127.0.0.1` 并通过 SSH 隧道或 AIFAR 自身鉴权入口访问；不要使用不含 SQLite 支持的 alpine 镜像，也不要直接挂载编辑运行中的 `data/aifar.db`。
+
 ## 2026-08-03
 - 问题：用户询问数据库页面 MySQL、MySQL Router、Redis 节点在线/离线状态是否来源于服务器 SSH。
 - 结论：当前数据库实时状态由后端 collector 按配置周期对 `app.instance` 执行应用模块 Check；collector 使用实例关联服务器中保存的 SSH 凭据远程执行探测，所以 SSH 是传输和执行通道，但状态不是单纯复用服务器 SSH 可达性。MySQL 远端检查 systemd、mysqladmin 本机 TCP ping 和监听端口，InnoDB Cluster 还检测当前 PRIMARY；MySQL Router 检查 systemd 与 mysqlrouter 版本命令；Redis 检查 systemd、redis-cli PING，并按拓扑读取 ROLE/Sentinel 信息。SSH 或凭据失败会使组件检查失败并在前端映射为离线，即使组件本身可能仍在运行。
@@ -1374,3 +1400,126 @@
 - 结论：Linux 最小同版集合是 `bin/aifar-server-linux-amd64`、`bin/aifar-agent-linux-amd64`、完整 `web/dist/`、`checksums.txt`、`VERSION`，并建议同步同版 `start.sh`/`stop.sh`；每台 Runtime 节点还应以包内 agent 更新 `/usr/local/bin/aifar-agent` 并重启验收。禁止覆盖客户 `data/`、`aifar.db*` 和生产 `config/defaults.env`，配置只做差异合并；最稳妥是停 server 后用新目录部署完整解压包并继续指向原绝对数据库路径。
 - 问题：用户询问发布包 `checksums.txt` 的用途。
 - 结论：打包脚本为包内除 `checksums.txt` 自身外的每个文件生成 `SHA256  相对路径` 清单，`release:verify` 用它发现缺失、额外、被修改或混版文件；Linux 可手工执行 `sha256sum -c checksums.txt`。当前启动脚本和 Runtime 操作尚不会自动读取该文件，前述 server/agent 前置门禁仍处于设计阶段。该清单只证明相对可信清单的文件完整性，不提供签名级来源认证，也不检查包外 SQLite 的逻辑健康。
+- 问题：用户明确控制面过程记录的清理策略不能放在 `aifar-agent`，询问是否全部由 `aifar-server` 实现。
+- 结论：`status_snapshot_history`、`alert_events` 及任务/审计等控制面 SQLite 保留策略、定时调度、批量删除和审计均由 `aifar-server` 统一负责；`aifar-agent` 不连接或清理 `aifar.db`，无需因此升级或重启。若以后清理目标节点上的远端诊断归档，应由 server 发起受限远程任务，仍不让 agent 自主持有全局保留策略。
+- 问题：用户要求一个最简单的状态趋势和告警历史清理策略方案。
+- 结论：推荐仅按时间保留：`status_snapshot_history` 默认 7 天，`alert_events` 默认 90 天且未恢复告警的生命周期事件暂不删除；`status_snapshots` 和 `alerts` 当前态永不由该任务清理。由 `aifar-server` 启动后延迟执行一次并每 24 小时分批删除，记录任务结果和审计；首版只提供环境变量与手动立即执行，不改 agent、不自动 VACUUM，物理压缩继续作为备份后的独立维护动作。设计待用户确认，尚未实施。
+- 问题：用户担心清理功能数月后才交付，首次面对巨量历史数据时会不会拖垮或导致 `aifar-server` 崩溃。
+- 结论：该风险真实存在，当前 Store `SetMaxOpenConns(1)`，一次性大 DELETE、启动迁移创建大索引或自动 VACUUM 都可能长时间占用唯一连接、放大 journal/磁盘压力。修订设计必须先停止历史写放大，再由 server 后台以约 500 行短事务、批次间让步、单轮约 30 秒、失败即停止本轮的方式渐进追赶，禁止首次启动同步清理和自动 VACUUM；清理失败不得影响 server 启动与健康。上线前需在外部位置备份并校验、检查剩余磁盘；积压清完后如需物理缩小文件，再在维护窗口停服压缩。设计待用户确认，尚未实施。
+- 问题：用户改为本版本先提供手动清理按钮，要求明确清理哪些表且不影响当前业务。
+- 结论：推荐在设置/数据维护新增独立“清理运行历史”按钮，不改现有审计与任务保留按钮。仅批量删除 `status_snapshot_history` 的过期记录，以及 `alert_events` 中过期的高频 `updated` 事件；保留 created、acknowledged、muted/unmuted、resolved 等生命周期事件。绝不删除 `status_snapshots`、`alerts`、`collector_runs`、任务、审计、应用实例、发布与备份记录。按钮走 worker task、权限、确认与审计，每批约 500 行、单次设置删除上限、支持取消和幂等重跑，不自动 VACUUM。该操作不影响当前监测/告警业务，但会减少可查询的历史明细，设计待用户确认，尚未实施。
+- 问题：用户要求手动清理方案也覆盖历史数据达到数 TB 的极端情况。
+- 结论：TB 级积压不能用单次在线 DELETE 或自动 VACUUM。手动按钮应创建可暂停、可恢复、持久化游标的后台清理任务，按主键 keyset 顺序扫描，短事务自适应批次并限制数据库占用比例；禁止 COUNT 全表、OFFSET 分页、大索引启动迁移和逐批写任务日志。在线清理只释放 SQLite 内部可复用页，不保证数据库文件缩小；若必须归还 TB 级磁盘空间，需外部备份、停服、在另一磁盘重建/压缩并原子替换。超大库预检或资源不足时按钮应 fail-closed 并提示离线维护，不影响 server 运行；仍不涉及 agent。设计待用户确认，尚未实施。
+- 问题：用户询问设置/数据维护页面现有“执行保留清理”按钮的作用。
+- 结论：该按钮创建 `maintenance.retention.run` 异步任务并进入任务中心，按当前配置删除 180 天前的 `audit_logs`，以及 90 天前已结束且状态为 success/failed/cancelled/timeout 的任务；删除任务时同步删除其 `task_logs`、`task_steps`、`task_targets`。它不创建数据库备份，不清理 `status_snapshot_history`、`alert_events` 或当前状态/业务数据，也不执行 VACUUM，因此数据库文件不会立即缩小。当前实现对匹配记录使用非分批删除，超大积压场景仍有长事务风险。
+- 问题：用户确认在现有数据维护区域新增独立“清理运行历史”按钮。
+- 结论：已完成中文设计文档 `docs/superpowers/specs/2026-08-04-operational-history-cleanup-design.md` 并提交为 `4de47cac`。设计保持原“执行保留清理”不变；新按钮固定清理 7 天前的 `status_snapshot_history` 和 7 天前 `alert_events.updated`，保留当前态与告警生命周期；后端使用短事务、自适应小批量、互斥、取消、幂等重跑和低日志频率，TB 级在线清理只复用内部页，物理缩小仍需离线维护。待用户审阅设计后再编写实施计划，尚未修改功能代码。
+- 问题：用户确认运行历史清理设计，允许进入实施计划阶段。
+- 结论：已完成并提交实施计划 `docs/superpowers/plans/2026-08-04-operational-history-cleanup.md`，提交为 `d1cbb673`。计划分为 Store 固定语义批量删除、maintenance 自适应低占用编排、带 operation lock 的 worker/API/审计、数据维护按钮与双语确认、集成验证五个任务；采用 TDD 和分任务提交，设计系统要求在前端编辑前读取。尚未修改功能代码，等待用户选择执行方式。
+- 问题：用户选择子代理分任务执行实施计划。
+- 结论：将按 subagent-driven-development 流程执行 TDD、逐任务实现、任务级需求/质量复审及最终整体验证。当前仓库位于普通检出 `D:\workspace\aifar-deployment` 的 `codex/status-collector-realtime` 分支，不是 linked worktree，且仅 `memory.md` 有未提交记录；项目已有 `.worktrees` 目录，按隔离工作区规则需先取得用户同意再创建本功能 worktree。
+
+## 2026-08-07
+- 问题：用户询问 Runtime 服务是否把全部上下线状态写在一个配置文件中，以及多个服务同时上下线是否可能失败。
+- 结论：当前每个 AIFAR Runtime 实例聚合使用一份 `runtime-spec.json`，并在同实例 `compose.env` 的 `AIFAR_DESIRED_REPLICAS` 保存全部服务期望副本；不是全平台共用一份文件。单服务变更会携带并保留其他服务的权威期望值，任务先取得实例级 API operation lock 和实例级编排锁，多个独立上下线请求不会并发改文件，后续请求返回 409。多服务下线应使用 batch-offline，它将目标合并为一次 agent 调和和一次 staged/rollback/atomic promotion 提交；agent 对变更 deployment 并发执行且零副本优先，但任一调和失败会使整次任务失败并不提升 canonical 配置，已完成的远端动作仍可能出现短暂部分完成，故任务原子性不等于容器运行状态的数据库事务级全有或全无。
+- 问题：用户希望重新设计为每个服务上下线互不影响。
+- 结论：已开始服务级隔离设计，当前确认 RuntimeSpec 同时聚合 Deployment、Service、Ingress、Nacos，且 API、Store 与 Agent Apply 均以实例为主要互斥/提交边界；设计前需先确认“互不影响”是否要求不同服务真正并行执行，还是允许同实例排队但保证状态和失败隔离。尚未修改代码。
+- 问题：用户明确要求每个服务上下线都互不影响。
+- 结论：设计目标确定为不同服务可真正并行、各自提交、各自失败和回滚，不修改其他服务期望状态；仍需确认 Agent 升级、Runtime 网络、公共 Nacos/JVM 配置和全量重启等共享资源操作是否保留实例级维护锁，因为这些操作天然跨服务。
+- 问题：用户进一步明确希望采用 K8s 风格，各服务启动无编排依赖，业务依赖由业务自行定义。
+- 结论：设计应把每个业务服务建模为独立 Deployment/Service desired state，由 Agent 分服务调和副本、健康和端点；不设置服务启动顺序，不因依赖服务不健康阻塞其他服务。下一步需确认副本为 0 时 Service、本机代理端口和 Nacos 实例的保留/注销语义。
+- 问题：用户认为 Runtime 配置中的 Nacos 状态可以取消，因为 Nacos 不可用时业务服务本身也无法启动。
+- 结论：可考虑从 RuntimeSpec 和 UI 运行状态中移除 Nacos 编排字段，但当前不能直接取消 Agent 的 Nacos 代注册链路：安装脚本明确设置 `SPRING_CLOUD_NACOS_DISCOVERY_REGISTER_ENABLED=false`，当前由 Agent 将宿主机代理地址注册到 Nacos并转发到本机健康容器。若连代注册/心跳一起移除，必须先决定改为业务容器自注册并解决多主机容器网络可达性，或迁移到真正的 K3s/Kubernetes Service/Endpoint 数据面。
+- 问题：用户确认只移除 Runtime 配置和 UI 中的 Nacos 状态。
+- 结论：Agent 的 Nacos 代注册、注销和心跳继续作为后台服务发现职责，从服务 Endpoint 与共享 Nacos 连接配置派生；它不再属于单服务 desired state，也不应决定 Deployment 上下线任务成功与否。推荐架构方向是“实例级共享基础配置 + 每服务独立 manifest/持久状态/锁/调和队列”，并从 `compose.env` 和 `app_instances.metadata.desiredReplicas` 移除副本权威值，统一以 `aifar_deployments` 和 Agent 每服务持久 spec 为控制面与节点侧权威状态。
+- 问题：用户要求先记录选用方案二，并指出初始化安装或全部重启似乎要等所有服务启动后 Agent 才做服务注册，希望一并改进设计。
+- 结论：已确认选择方案二。当前初始化脚本一次提交全量 spec；`Reconciler.ReconcileRuntime` 先等待 `Manager.Apply` 的全部变更 Deployment 成功，之后才触发 Nacos 代理同步，所以一个慢/失败服务会延迟其他已就绪服务注册。当前 `RestartAll` 也持有实例全局锁，先删除全部 Runtime Pod，再启动并统一验证。新设计应将 desired-state 接受、每服务调和、Endpoint 发布和 Nacos 注册解耦：每个服务就绪后立即发布 Endpoint 并独立触发后台注册；全部重启仅作为多个独立服务重启的聚合入口，不再 stop-all 后统一启动。
+- 问题：用户认为 AIFAR 应用安装不应因容器初始化失败而进入失败状态，初始化问题可通过重新传包或调整 Nacos 后恢复。
+- 结论：建议采纳“安装状态与运行状态分离”：安装任务在资源校验、上传/解压、实例基础配置及各服务 Manifest 持久化并被 Agent 接受后成功，不等待容器 Ready；应用实例保持 `installed`，容器初始化失败只把对应 Deployment 标记为 `degraded`/`progressing` 并记录 Condition。包校验、上传、持久化或 Agent 接受 desired state 失败仍应属于安装失败，因为期望对象尚未可靠建立。修复使用目标服务重新传包形成新 revision、调整业务/Nacos 配置后定向重启或重新调和，不卸载其他服务。
+- 问题：用户确认采用安装状态与容器运行状态分离规则。
+- 结论：设计决策已确认：只有安装资源或服务 Manifest 未能可靠建立才算安装失败；Manifest 被 Agent 原子持久化并入队后，应用实例即为 `installed`，后续容器初始化、健康检查和业务/Nacos 配置问题只进入对应服务的 `progressing`/`degraded` Condition，不回退应用安装状态。
+- 问题：用户确认方案二第一部分的资源模型与锁边界符合预期。
+- 结论：已确认采用 `app_instances` 表达安装生命周期、`aifar_deployments` 按服务保存完整 spec/generation/observed generation/conditions、Agent 按实例基础配置加每服务 manifest 持久化；删除聚合 desired replicas 权威值。不同服务锁和调和队列可并行，同一服务串行；Agent 升级、网络修改、卸载等共享变更使用实例级独占维护锁，旧 generation 请求必须被拒绝。
+- 问题：用户确认方案二第二部分的安装、单服务调和、Endpoint/Nacos 和全部重启数据流符合预期。
+- 结论：已确认初始化安装并发提交独立服务 Manifest，Agent 原子持久化并入队后立即 Accepted；每服务控制器独立调和，Ready Endpoint 立即触发后台 Nacos 代理注册且注册失败不影响 Deployment。`restart-all` 改为为所有在线 Deployment 分发独立 `restartGeneration`，不再 stop-all；任务只汇总调和意图是否被接受，容器 Ready/Degraded 由后续运行状态表达。周期 Resync 与 Docker Event 也必须按服务隔离。
+- 问题：用户确认方案二第三部分的异常恢复与页面状态语义符合预期。
+- 结论：已确认容器运行异常使用按服务 Condition/Reason 与独立退避重试，不影响应用 `installed` 状态；人工修复仅作用于目标服务。Runtime UI 删除 Nacos状态和“整体 degraded 禁止所有变更”的全局门禁，改为服务级按钮、状态、诊断与告警；仅同服务任务、实例共享维护或 Agent 不可用/门禁失败时禁用相应操作。
+- 问题：用户确认方案二第四部分及整体设计符合预期，要求完成记录。
+- 结论：已完成并提交设计文档 `docs/superpowers/specs/2026-08-07-aifar-runtime-per-service-controller-design.md`，提交为 `0c119868`。设计确定采用现有 Docker 与 Agent 的每服务 Manifest/controller 模型，区分安装与运行状态，移除 Runtime 配置/API/UI 的 Nacos 状态但保留 Agent 后台代注册，按服务隔离 generation、锁、调和、Endpoint、重试与批量重启，并规定旧模型无主动容器重启迁移和防双写策略。尚未修改功能代码，等待用户审阅后再编写实施计划。
+- 问题：用户确认每服务独立控制器设计，允许进入实施计划阶段。
+- 结论：已完成并提交实施计划 `docs/superpowers/plans/2026-08-07-aifar-runtime-per-service-controller.md`，提交为 `7340b88c`。计划分为 Store generation/CAS、分层锁、Agent Manifest 与独立控制器、Endpoint/Nacos 解耦、Agent API、Server mutation/接收修复、安装状态分离、运行操作迁移、HTTP 状态、旧模型无重启迁移、Runtime UI、重复权威清理和全量验证 14 个 TDD 任务；尚未修改功能代码，等待用户选择子代理分任务执行或当前会话内分批执行。
+- 问题：用户选择子代理分任务执行每服务独立控制器实施计划。
+- 结论：将按 subagent-driven-development 执行逐任务实现、独立需求/质量复审和最终整体验证。当前 `D:\workspace\aifar-deployment` 是普通检出而非 linked worktree，分支为 `codex/status-collector-realtime`，HEAD 为 `7340b88c`，且 `memory.md` 有未提交记录；项目已有并忽略 `.worktrees/`。按隔离工作区规则，需用户明确同意后从当前 HEAD 创建 `codex/runtime-per-service-controller` worktree，再执行基线测试和 Task 1。
+- 问题：本地合并每服务 Runtime 控制器分支前，需要保留功能 worktree 中未提交的实现记忆。
+- 结论：Task 1–7 已建立 Deployment generation/CAS、精确分层锁与锁 ID 释放、Agent 每服务 Manifest 原子持久化、独立 controller/Condition/退避、Endpoint 与 Nacos discovery 解耦、严格 loopback HTTP/CLI 与 marker-last bootstrap，以及 Server 的 N+1 mutation/Agent acceptance/丢响应只读修复；相关审查发现的旧观测覆盖、symlink 路径、controller 代际/移除竞态、route attempt 覆盖、bootstrap swap 和 I/O 错误分类均已在后续 Fix 中关闭。Task 8–14、最终审查修复和完整门禁结论已由功能分支最终摘要记录。
+- 问题：用户选择将 `codex/runtime-per-service-controller` 本地合并回 `codex/status-collector-realtime`。
+- 结论：已在确认基线与远端一致后快进到 `39cdf712`，合并结果 fresh `pnpm test:local` 全通过；功能 worktree 与本地功能分支已清理，完整未提交功能 memory 原文保存在 `stash@{0}`，主工作区 `memory.md` 继续保持未提交，未执行 push 或真实部署。
+
+## 2026-08-12
+- 问题：用户指出应用商店页面进入后一直刷新、部署记录应删除、已安装状态把监控失败显示成安装失败。
+- 结论：应用商店“已安装”改回安装生命周期口径，不再把 `app.instance` 实时监控快照覆盖到安装记录；删除“部署记录”tab、部署服务区域、对应组件依赖和 zh/en 文案。`installState=installed` 的记录即使监控 `failed/unavailable` 也显示已安装；真实 `install_failed`/`installFailed=true` 仍显示失败。前端回归、全量 web 测试和 web build 均通过。
+- 问题：用户再次指出仪表盘进入后仍显示刷新，认为不应进入页面就刷新。
+- 结论：根因是 `DashboardView` 挂载时调用完整 `load()`，其中逐服务器请求 `/servers/{id}/telemetry`，该接口会执行远程 telemetry 探测。已改为进入仪表盘只加载持久化列表、任务、实例、告警并使用后台 realtime/status snapshots；只有用户手动点击右上角“刷新”才执行 telemetry。新增 Dashboard 组件测试锁定“进页面不请求 telemetry、手动刷新才请求”，全量 web 测试和 web build 均通过。
+- 问题：用户指出应用商店“已安装”列表中 MySQL/Redis 等状态不一致，运行检查失败仍显示成安装失败。
+- 结论：根因是安装页把行级 `status=failed` 当作安装失败，但该字段也会被应用健康检查/监控用于运行失败。已改为只认明确安装失败信号：`status=install_failed`、`metadata.installFailed=true` 或 `metadata.installState=failed/install_failed`；普通 `status=failed` 视为运行/监控失败，不影响“已安装”生命周期展示。新增旧实例监控失败回归测试，全量 web 测试和 web build 均通过。
+
+## 2026-08-12
+- 问题：用户要求数据维护中的日志清理统一设计，不再只覆盖当前保留清理的审计/任务，也不理解为 SQLite 备份文件清理。
+- 结论：后续设计必须把 SQLite 中所有日志/历史类数据统一纳入“数据维护”入口，并采用统一清理规则与统一保留日期；范围包括审计日志、任务历史及其日志/步骤/目标、状态采集历史、告警事件等历史流水。当前状态、当前告警、采集器当前摘要、应用实例、发布/备份记录、凭据、资源和设置等业务/当前态不得作为日志清理对象。页面文案必须明确这是 SQLite 内部日志/历史清理，在线清理只释放 SQLite 可复用空间，不保证数据库文件立即缩小。
+- 问题：用户确认将日志维护拆成独立页签，同时要求数据备份和备份清理能力继续保留。
+- 结论：设置页拆分为“数据维护”和“日志维护”：数据维护只负责控制面数据库备份、备份文件列表、校验、下载和删除；日志维护统一展示一个 `logRetentionDays`，并通过原 worker 任务入口清理 SQLite 内部审计日志、已结束任务及其日志/步骤/目标、状态历史和告警事件。后端保持 `/maintenance/retention/run` 兼容路由，但任务步骤扩展为四类日志历史清理；当前状态、当前告警、collector 当前摘要、备份、应用实例、凭据等不清理。
+- 问题：用户询问日志保留 90 天在哪里设置，希望清理一天之前的日志。
+- 结论：`90` 原为 `AIFAR_LOG_RETENTION_DAYS` 默认值，若未设置则兼容旧 `AIFAR_TASK_RETENTION_DAYS`，再默认 90。已接入 `/settings` 的持久化 `logRetentionDays`：设置页“日志维护”把保留天数改为 1 并保存后，`/maintenance/retention/run` 会优先读取 SQLite settings 中的 1 天，统一清理 1 天前的审计日志、已结束任务历史、状态历史和告警事件；数据库备份维护仍独立保留。
+- 问题：用户要求向所有日志表分别注入 5000 条数据，入库时间为 2026-08-10，用于验证日志维护清理。
+- 结论：已对 `data/aifar.db` 注入测试数据，范围为统一日志维护覆盖的 `audit_logs`、`tasks`、`task_logs`、`task_targets`、`task_steps`、`status_snapshot_history`、`alert_events`，每表 5000 条，时间统一为 `2026-08-10T00:00:00+08:00`，测试前生成 SQLite 备份 `data/aifar.db.before-log-seed-20260812-173400.bak`。一次误跑产生的第二批 seed 已按 run_id 精确回退，最终只读校验各表均为 5000 条。
+- 问题：用户询问此次日志维护功能是否新增配置或数据库表，以及已有环境升级是否有风险。
+- 结论：此次日志维护新增的是配置项 `AIFAR_LOG_RETENTION_DAYS` 和已有 `settings` 表中的持久化 key `logRetentionDays`；没有为日志维护新增专用数据库表，也没有改变现有日志表结构。清理范围扩展到既有 `audit_logs`、`tasks`/`task_logs`/`task_targets`/`task_steps`、`status_snapshot_history`、`alert_events`。已有环境升级时缺少 `logRetentionDays` 会回退到环境变量或默认 90 天，保存页面设置后才写入该 key；建议升级前照常备份 SQLite。
+- 问题：用户要求删除全服务里没用的刷新按钮。
+- 结论：经前端刷新入口盘点，保留资源重扫、备份列表刷新、用户/健康/任务/审计/存储/容器等具有明确重新加载或操作语义的按钮；删除仪表盘右上角冗余“刷新”按钮和对应手动 `/servers/{id}/telemetry` 探测链路，仪表盘只使用持久化列表、后台实时快照和低频实时恢复调度，不再提供容易误导为远程探测的手动刷新入口。新增/更新 Dashboard 回归测试，全量 web 测试与 web build 通过。
+- 问题：用户要求保留 Server 端 15 秒采集频率，但大部分服务连不上时各对象互不影响，且失败对象不能退避以免恢复后平台长期监控不到。
+- 结论：Server collector 保持 `AIFAR_COLLECTOR_INTERVAL_SECONDS=15` 的固定调度语义，不做失败退避；改为每轮 `servers`、`docker.summary`、`app.instances`、`aifar.runtime` 四类并发运行，并给每个采集对象增加 in-flight key（如 `server:<id>`、`docker.summary:<serverId>`、`app.instance:<instanceId>`、`aifar.runtime:<instanceId>`）。同一对象上一轮未结束时本轮仅跳过该对象，其他对象继续采集；对象自身仍按超时失败并在下一轮继续尝试。新增测试证明慢 server 不阻塞 docker，慢 app instance 不阻塞健康 peer，collector 包、相关 HTTP 测试与全量 web 测试通过。
+- 问题：用户截图指出仪表盘“服务器运行指标”显示服务器 1 未知，但服务器工作台显示同一服务器可用，怀疑第一个页面服务器探测有问题。
+- 结论：根因在仪表盘前端状态归一规则：删除 telemetry 手动探测后仍保留旧逻辑，把 `available/running/success/ok` 二次降级为 `unknown`，导致与服务器工作台不一致。已抽出 `web/src/dashboard/serverStatus.ts` 并改为把这些成功状态统一展示为 `available`，仪表盘使用服务器列表/实时 server snapshot 的同一权威口径；新增测试覆盖，Dashboard 测试、全量 web 测试和 web build 通过。
+
+## 2026-08-12
+- 问题：用户要求全局检查状态展示是否还有不一致或错误，重点是 Dashboard 与服务器工作台状态不一致。
+- 结论：确认 Dashboard 入场未主动加载持久 status snapshots，导致刚进页面可能显示旧服务器状态；已改为首次进入补一次 /status/snapshots，不触发服务器探测/遥测/轮询。服务器工作台与 Dashboard 统一复用服务器可达状态归一，running/success/ok 计为 available，failed/error/unavailable 等显示 unavailable；应用商店已安装仍只显示安装生命周期，数据库/存储/Nacos 才显示运行健康。验证：pnpm test:web 421/421 PASS，pnpm web:build PASS，git diff --check PASS。
+- 问题：用户指出仪表盘数据库状态中同一类运行异常一部分显示“失败”、一部分显示“服务不可用”，要求统一。
+- 结论：根因是 Dashboard 数据库/对象存储列表直接展示 app.instance 实时快照的原始 status，failed 被通用 StatusTag 显示为安装/任务语义的“失败”；已新增 Dashboard runtime 健康状态归一，failed/error/offline/down/no-endpoints/missing/stopped 等统一映射为 unavailable，healthy 状态统一为 running，installed/pending/checking 显示检查中，并接入数据库/对象存储列表和运行中计数。验证：pnpm test:web 434/434 PASS，pnpm web:build PASS，git diff --check PASS。
+- 问题：用户要求按模块只读检查代码，找出还有哪些值得优化的地方并给建议。
+- 结论：完成只读模块走查，重点建议包括：统一前端安装生命周期与运行健康状态归一工具，避免 Dashboard/Database/Storage/Nacos/Apps 各写映射造成“失败/服务不可用”不一致；日志维护底层删除应从大 DELETE 优化为分批 keyset 短事务并加清理互斥；日志维护和数据库备份任务创建后应接入任务进度追踪；settings 多 key 保存可改为事务；数据库/Nacos/存储页头刷新按钮需统一产品语义；Runtime/Agent 运行异常 Reason 建议形成统一中文分组与操作建议。未修改业务代码。
+- 问题：用户要求把全局模块优化建议记录到文档，并开始修复 P1。
+- 结论：已新增 `docs/superpowers/specs/2026-08-12-module-status-maintenance-p1.md`，记录 P1/P2/P3 建议与 P1 验收。P1 已完成三项：新增前端共享状态语义模块，区分安装生命周期、运行健康和服务器可达性；Store 增加审计、任务、状态历史、告警事件的 batch 删除方法，并让原保留清理入口循环短事务删除；日志维护页执行清理后会把返回的 taskId 纳入全局任务进度。验证：`go test ./internal/store ./internal/maintenance ./internal/httpapi -count=1` 通过；`pnpm test:web` 55 文件/437 测试通过；`pnpm web:build` 通过；`git diff --check` 通过。
+- 问题：用户要求继续修复全局模块优化建议中的 P2。
+- 结论：P2 已完成：Settings 多 key 保存改为 Store 事务批量提交，避免部分成功；Database/Nacos/Storage 三个 realtime-backed 页头删除无效刷新按钮，旧测试改为内部 load 语义；Runtime Deployment Condition reason 增加 Agent 通道、服务健康、制品版本、下线状态、调和中、运行诊断等分组及 zh/en 操作建议。验证：Go 受影响包 store/httpapi 通过，前端 focused 与全量 test:web 通过，web:build 通过，git diff --check 通过。
+- 问题：用户要求继续修复全局模块优化建议中的 P3。
+- 结论：P3 已完成：新增跨模块状态展示快照测试，锁定 Dashboard、Apps、Database、Storage、Nacos 对安装生命周期、运行健康和服务器可达性的统一语义；Database/Nacos/Storage 残留本地状态判断改为复用共享 status semantics。`/maintenance/retention/run` 增加 `maintenance/retention-cleanup/mutate` operation lock，已有清理任务运行时新请求返回 409 且不创建额外任务。验证：HTTP focused 与 httpapi 全包通过，Web 状态 focused 实际跑全 56 文件/441 测试通过，web:build 通过，git diff --check 通过。
+
+## 2026-08-13
+- 问题：用户要求在 P3 后继续只读扫描还有哪些可以修复。
+- 结论：只读扫描发现两个主要候选：Nacos 配置依赖候选仍按实时 item.status != failed 过滤，会把安装成功但运行监控 failed 的 MySQL/Redis/MinIO 排除；数据维护的数据库备份/校验返回 taskId 但前端未接入全局任务进度，与日志维护不一致。低优先级候选包括 Settings 调用 LogMaintenancePanel 的 no-op refresh，以及 DataMaintenancePanel 测试仍偏源码字符串契约。尚未修改业务代码。
+
+## 2026-08-13
+- 问题：用户要求按顺序修复继续扫描出的 P1/P2/P3：Nacos 配置依赖被实时失败状态隐藏、数据库备份/校验任务未进入全局任务进度、Settings 调用日志维护 no-op refresh。
+- 结论：已按顺序修复：Nacos 配置依赖改用安装生命周期可选性，安装成功但运行监控 failed 的 MySQL/Redis/MinIO 仍可作为配置依赖；数据维护的创建数据库备份和备份校验会把返回 taskId 纳入全局任务进度；Settings 不再引用/调用 LogMaintenancePanel 的 no-op refresh，LogMaintenancePanel 也不再暴露无意义 refresh。验证：focused web 实际 56 文件/444 测试通过，pnpm web:build 通过，git diff --check 通过。
+## 2026-08-13
+- 问题：用户在 P1/P2/P3 修复后要求继续全局扫描还有什么可以修复。
+- 结论：只读扫描发现下一批候选：服务器工作台“探测主机”虽由后端 worker 返回 taskId，但前端仍用 waitTaskDone 在页面内 800ms 轮询并阻塞，未纳入全局任务进度；数据维护创建数据库备份后虽已 track taskId，但仍有 800ms 固定延迟刷新备份列表，属于不可靠假刷新；资源重扫 /resources/rescan 仍是同步 HTTP handler，若资源目录较大容易表现为按钮卡住，后续可评估改为 worker task；Dashboard Docker 可用计数仍有 `snapshot.status !== failed` 的局部判断，建议后续统一到 runtime health 语义。尚未修改业务代码。
+
+## 2026-08-13
+- 问题：用户要求按顺序修复下一批候选：服务器探测页面内轮询、数据库备份假刷新、资源重扫同步阻塞、Dashboard Docker 状态局部判断。
+- 结论：已按顺序修复：服务器工作台探测提交后不再 waitTaskDone 页面内轮询，改为纳入全局任务进度并依赖实时状态；数据维护创建备份后删除 800ms 固定假刷新；资源重扫 /resources/rescan 改为 worker task，Apps/Toolbox 只提交并追踪任务，不再同步等待资源列表；Dashboard Docker 运行计数改用统一 runtime health 语义，error/unavailable 不会因 payload.available=true 被算作运行。验证：资源扫描 HTTP focused 与 httpapi 全包通过，pnpm test:web 57 文件/447 测试通过，pnpm web:build 通过，git diff --check 通过。
+
+## 2026-08-13
+- 问题：用户要求继续全局查询代码漏洞问题，确认只修实现缺陷，不修业务问题。
+- 结论：本轮修复三类代码级缺陷：collector 某类采集对象全部 in-flight 时不再把 collector_runs 覆盖成 success；登出或 API 401 会话失效时会清理全局任务进度轮询和持久 tracked task，且旧请求晚回包不能复活任务；任务日志面板快速切换任务时，旧详情请求或旧周期刷新晚回包不能再覆盖当前任务或重开旧 SSE。验证：collector 包、相关前端 focused、pnpm test:web、pnpm web:build、git diff --check 均通过。
+- 问题：用户指出应用安装弹窗里“选择服务器”和“安装类型/拓扑”的显示顺序可能有问题。
+- 结论：根因是通用安装弹窗固定按“版本 → 目标服务器 → 拓扑/安装类型”渲染，但 MySQL/Redis/MinIO/Nacos 的服务器选择方式由拓扑决定，用户会先看到服务器选择再在下方改安装类型，视觉和操作层级不合理。已将 `topology` 字段前置到服务器选择前，依赖已选服务器的字段仍保留在服务器选择之后；新增组件回归测试锁定顺序。验证：`pnpm test:web` 60 文件/454 测试通过，`pnpm web:build` 通过，相关 diff check 通过。
+- 问题：用户截图指出应用安装弹窗中长标签文字溢出到左侧，尤其是 MySQL 集群安装的“同时安装 MySQL Router”等字段。
+- 结论：根因是 `AppInstallDialog` 的 Element Plus 表单 label 固定 108px 且强制 `white-space: nowrap`，长字段名无法在标签区域内换行。已将安装弹窗 label 宽度调整为 136px，并允许 label 正常换行和长文本断行；新增样式契约测试防止回归。验证：focused 组件测试通过，`pnpm test:web` 60 文件/455 测试通过，`pnpm web:build` 通过，相关 diff check 通过。
+
+## 2026-08-13
+- 问题：用户暂缓业务库初始化和通用安装，要求先给凭证中心详细方案，并评估每服务/每 Pod 文件模型是否影响既有客户环境和平滑升级。
+- 结论：建议凭证中心升级为凭据版本、引用/影响范围、验证与显式应用任务的控制面方案；默认只改面板保存的加密凭据，不主动修改客户服务密码，客户外部改密后通过验证写新版本并由用户确认是否重生成配置或重启受影响服务。每服务文件模型应通过显式、fail-closed 的旧模型迁移保障平滑：升级前备份和只读扫描，校验 Agent 能力、旧 spec hash、容器 revision/spec-hash、desired=0；迁移仅在 Agent readback 一致后提交，匹配容器不重启。7 月 31 客户版本需要实测 labels/features 是否齐全，否则进入待验证/人工迁移路径。
+- 问题：用户要求把本地能删除的分支全部删除。
+- 结论：已先枚举当前分支、全部本地分支、worktree 占用与已合并状态，仅删除已合并且未被 worktree 占用的本地分支 `codex/aifar-agent-runtime-v2`、`codex/custom-orchestration`、`codex/enterprise-permission-ux`、`main`。保留当前分支 `codex/status-collector-realtime`，以及仍被 `.worktrees/` 占用的 5 个分支；工作区只剩 `memory.md` 本地修改。
