@@ -20,6 +20,7 @@ import (
 
 func (a *API) maintenanceService() maintenance.Service {
 	return maintenance.NewService(a.store, maintenance.RetentionConfig{
+		LogRetentionDays:   a.store.LogRetentionDays(a.cfg.LogRetentionDays),
 		AuditRetentionDays: a.cfg.AuditRetentionDays,
 		TaskRetentionDays:  a.cfg.TaskRetentionDays,
 	})
@@ -210,16 +211,7 @@ func (a *API) runRetentionCleanup(w http.ResponseWriter, r *http.Request) {
 	service := a.maintenanceService()
 	actor := currentUser(r).Username
 	taskType := "maintenance.retention.run"
-	task, err := a.store.CreateTask(store.Task{Type: taskType, Target: target, Status: "pending", CreatedBy: actor})
-	if err != nil {
-		respondTask(w, task, err)
-		return
-	}
-	if err := a.storeTaskPlanOrDelete(task.ID, simpleTaskPlan(target, retentionCleanupSteps(lang))); err != nil {
-		writeError(w, http.StatusInternalServerError, "MAINTENANCE_PLAN_STORE_FAILED", err.Error(), map[string]any{"target": target})
-		return
-	}
-	task, err = a.tasks.StartExistingWithLanguage(task, lang, func(ctx context.Context, log worker.Logger) error {
+	task, err, started := a.startSimplePlannedTaskWithLocks(w, taskType, target, actor, lang, target, retentionCleanupSteps(lang), []operationLockSpec{retentionCleanupOperationLockSpec()}, func(ctx context.Context, log worker.Logger) error {
 		plan := service.Plan(time.Now())
 		log.StartTarget(target)
 
@@ -252,9 +244,42 @@ func (a *API) runRetentionCleanup(w http.ResponseWriter, r *http.Request) {
 		}
 		log.Info(i18n.Text(lang, "maintenance.tasksDeleted"), tasksDeleted, formatRetentionCutoff(plan.TaskCutoff))
 		log.FinishStep(target, "cleanup-tasks", "success", "")
+
+		log.StartStep(target, "cleanup-status-history", i18n.Text(lang, "maintenance.cleanupStatusHistoryStep"), 3)
+		if err := ctx.Err(); err != nil {
+			log.FinishStep(target, "cleanup-status-history", "cancelled", err.Error())
+			log.FinishTarget(target, "cancelled", err.Error())
+			return err
+		}
+		statusHistoryDeleted, err := service.CleanupStatusHistory(plan)
+		if err != nil {
+			log.FinishStep(target, "cleanup-status-history", "failed", err.Error())
+			log.FinishTarget(target, "failed", err.Error())
+			return err
+		}
+		log.Info(i18n.Text(lang, "maintenance.statusHistoryDeleted"), statusHistoryDeleted, formatRetentionCutoff(plan.StatusHistoryCutoff))
+		log.FinishStep(target, "cleanup-status-history", "success", "")
+
+		log.StartStep(target, "cleanup-alert-events", i18n.Text(lang, "maintenance.cleanupAlertEventsStep"), 4)
+		if err := ctx.Err(); err != nil {
+			log.FinishStep(target, "cleanup-alert-events", "cancelled", err.Error())
+			log.FinishTarget(target, "cancelled", err.Error())
+			return err
+		}
+		alertEventsDeleted, err := service.CleanupAlertEvents(plan)
+		if err != nil {
+			log.FinishStep(target, "cleanup-alert-events", "failed", err.Error())
+			log.FinishTarget(target, "failed", err.Error())
+			return err
+		}
+		log.Info(i18n.Text(lang, "maintenance.alertEventsDeleted"), alertEventsDeleted, formatRetentionCutoff(plan.AlertEventCutoff))
+		log.FinishStep(target, "cleanup-alert-events", "success", "")
 		log.FinishTarget(target, "success", "")
 		return nil
 	})
+	if !started {
+		return
+	}
 	if err == nil {
 		a.audit(r, taskType, target, "running", i18n.Text(lang, "api.retentionCleanupStarted"))
 	}
@@ -281,6 +306,8 @@ func retentionCleanupSteps(lang string) []simpleTaskStep {
 	return []simpleTaskStep{
 		{"cleanup-audit", i18n.Text(lang, "maintenance.cleanupAuditStep")},
 		{"cleanup-tasks", i18n.Text(lang, "maintenance.cleanupTasksStep")},
+		{"cleanup-status-history", i18n.Text(lang, "maintenance.cleanupStatusHistoryStep")},
+		{"cleanup-alert-events", i18n.Text(lang, "maintenance.cleanupAlertEventsStep")},
 	}
 }
 

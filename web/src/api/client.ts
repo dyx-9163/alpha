@@ -3,6 +3,7 @@ import { getCurrentLocale } from '../i18n'
 export type ApiError = Error & { status?: number; details?: unknown }
 
 const API_PREFIX = '/api/v2'
+export const SESSION_CLEARED_EVENT = 'aifar-session-cleared'
 
 function headers(json = true) {
   const out = new Headers()
@@ -33,6 +34,7 @@ function clearLocalSession() {
   localStorage.removeItem('aifar-role')
   localStorage.removeItem('aifar-token-version')
   localStorage.removeItem('aifar-permissions')
+  window.dispatchEvent(new CustomEvent(SESSION_CLEARED_EVENT))
 }
 
 export function apiGet<T>(path: string) {

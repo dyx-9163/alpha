@@ -23,13 +23,14 @@ function storedPermissions(role: string) {
 
 export const useSessionStore = defineStore('session', {
   state: () => ({
+    token: localStorage.getItem('aifar-session-token') ?? '',
     username: localStorage.getItem('aifar-username') ?? '',
     role: localStorage.getItem('aifar-role') ?? '',
     tokenVersion: Number(localStorage.getItem('aifar-token-version') ?? '0'),
     permissions: storedPermissions(localStorage.getItem('aifar-role') ?? '') as Permission[]
   }),
   getters: {
-    isLoggedIn: () => Boolean(localStorage.getItem('aifar-session-token'))
+    isLoggedIn: (state) => Boolean(state.token)
   },
   actions: {
     async login(username: string, password: string) {
@@ -40,6 +41,7 @@ export const useSessionStore = defineStore('session', {
       localStorage.setItem('aifar-role', result.user.role)
       localStorage.setItem('aifar-token-version', String(result.user.tokenVersion ?? 0))
       localStorage.setItem('aifar-permissions', JSON.stringify(permissions))
+      this.token = result.token
       this.username = result.user.username
       this.role = result.user.role
       this.tokenVersion = result.user.tokenVersion ?? 0
@@ -54,6 +56,7 @@ export const useSessionStore = defineStore('session', {
       localStorage.removeItem('aifar-role')
       localStorage.removeItem('aifar-token-version')
       localStorage.removeItem('aifar-permissions')
+      this.token = ''
       this.username = ''
       this.role = ''
       this.tokenVersion = 0

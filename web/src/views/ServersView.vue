@@ -55,11 +55,13 @@ import ServerFormDrawer from '../servers/components/ServerFormDrawer.vue'
 import ServerInventoryList from '../servers/components/ServerInventoryList.vue'
 import { useServerWorkbench } from '../servers/useServerWorkbench'
 import { useRealtimeStore } from '../stores/realtime'
+import { useTaskProgressStore } from '../stores/taskProgress'
 
 const { t } = useI18n()
 const { can, deniedText } = usePermissions()
 const canManageServers = computed(() => can(permissions.serversManage))
 const realtime = useRealtimeStore()
+const taskProgress = useTaskProgressStore()
 const {
   filteredServers,
   selectedServer,
@@ -78,7 +80,7 @@ const {
   reorder,
   probe,
   applyStatusSnapshots
-} = useServerWorkbench(t, (serverId) => realtime.serverSnapshot(serverId))
+} = useServerWorkbench(t, (serverId) => realtime.serverSnapshot(serverId), (taskId, label) => taskProgress.track(taskId, label))
 
 const selectedProbing = computed(() => selectedServer.value ? probingIds.value.has(selectedServer.value.id) : false)
 const serverMetrics = computed(() => [

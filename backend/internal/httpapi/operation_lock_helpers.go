@@ -147,6 +147,17 @@ func aifarRuntimeMutationLockSpec(action string, instance store.AppInstance) ope
 	}
 }
 
+func retentionCleanupOperationLockSpec() operationLockSpec {
+	return operationLockSpec{
+		Scope:      "maintenance",
+		ResourceID: "retention-cleanup",
+		Operation:  operationLockMutation,
+		Metadata: operationLockMetadata(map[string]any{
+			"action": "retention-cleanup",
+		}),
+	}
+}
+
 func mysqlBackupOperationLockSpecs(instance store.AppInstance) []operationLockSpec {
 	if clusterID := mysqlClusterID(instance); clusterID != "" && strings.EqualFold(strings.TrimSpace(instance.Topology), "innodb-cluster") {
 		return []operationLockSpec{{

@@ -11,11 +11,49 @@
 
       <el-alert v-if="dialogCopy.hint" type="info" show-icon :closable="false" :title="dialogCopy.hint" />
 
-      <el-form label-width="108px" class="install-form">
+      <el-form label-width="136px" class="install-form">
         <el-form-item :label="dialogCopy.versionLabel">
           <el-select v-model="selectedVersion" :placeholder="dialogCopy.versionPlaceholder" style="width: 100%">
             <el-option v-for="version in versions" :key="version" :label="version" :value="version" />
           </el-select>
+        </el-form-item>
+
+        <el-form-item v-for="field in preTargetInstallFields" :key="field.name" :label="field.label" :required="field.required">
+          <el-select
+            v-if="field.type === 'select'"
+            v-model="fieldValues[field.name]"
+            :placeholder="field.placeholder"
+            :multiple="field.multiple"
+            :collapse-tags="field.multiple"
+            :collapse-tags-tooltip="field.multiple"
+            style="width: 100%"
+          >
+            <el-option
+              v-for="option in fieldOptions(field)"
+              :key="String(option.value)"
+              :label="option.label"
+              :value="option.value"
+              :disabled="option.disabled"
+            />
+          </el-select>
+          <el-switch v-else-if="field.type === 'switch'" v-model="fieldValues[field.name]" />
+          <el-input-number
+            v-else-if="field.type === 'number'"
+            v-model="fieldValues[field.name]"
+            :placeholder="field.placeholder"
+            :min="field.min"
+            :max="field.max"
+            :step="field.step"
+            style="width: 100%"
+          />
+          <el-input
+            v-else
+            v-model="fieldValues[field.name]"
+            :type="field.type === 'password' ? 'password' : 'text'"
+            :show-password="field.type === 'password'"
+            :placeholder="field.placeholder"
+          />
+          <div v-if="fieldValidationMessages[field.name]" class="field-error">{{ fieldValidationMessages[field.name] }}</div>
         </el-form-item>
 
         <el-form-item v-if="!targetSelectorHidden" :label="dialogCopy.serversLabel">
@@ -34,7 +72,7 @@
           />
         </el-form-item>
 
-        <el-form-item v-for="field in installFields" :key="field.name" :label="field.label" :required="field.required">
+        <el-form-item v-for="field in postTargetInstallFields" :key="field.name" :label="field.label" :required="field.required">
           <div v-if="field.type === 'server-disk-select'" class="server-disk-select-list">
             <div v-for="server in selectedTargetServers" :key="server.id" class="server-disk-row">
               <div class="server-disk-label">{{ serverLabel(server) }}</div>
@@ -167,6 +205,8 @@ const serverDiskStates = ref<Record<string, ServerDiskState>>({})
 const safeServers = computed(() => Array.isArray(props.servers) ? props.servers : [])
 const allFields = computed(() => Array.isArray(props.fields) ? props.fields : [])
 const installFields = computed(() => allFields.value.filter((field) => field.visibleWhen?.(fieldValues.value, validationContext.value) ?? true))
+const preTargetInstallFields = computed(() => installFields.value.filter(isPreTargetField))
+const postTargetInstallFields = computed(() => installFields.value.filter((field) => !isPreTargetField(field)))
 const defaultCopy = computed<AppInstallDialogCopy>(() => ({
   title: t('apps.install'),
   versionLabel: t('common.version'),
@@ -311,6 +351,10 @@ function serversByIds(ids: string[]) {
 
 function fieldOptions(field: AppInstallField) {
   return field.optionsResolver?.(fieldValues.value, validationContext.value) ?? field.options ?? []
+}
+
+function isPreTargetField(field: AppInstallField) {
+  return field.name === 'topology'
 }
 
 function normalizeFieldValue(value: unknown) {
@@ -621,8 +665,11 @@ function isSensitiveField(field: AppInstallField) {
 
 .install-form :deep(.el-form-item__label) {
   min-width: 0;
-  line-height: 32px;
-  white-space: nowrap;
+  min-height: 32px;
+  line-height: 18px;
+  padding-top: 7px;
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
 
 .install-form :deep(.el-form-item__content) {

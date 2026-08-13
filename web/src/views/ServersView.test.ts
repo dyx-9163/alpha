@@ -8,13 +8,11 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 const {
   getServerDefaultsMock,
   listServersMock,
-  probeServerMock,
-  waitTaskDoneMock
+  probeServerMock
 } = vi.hoisted(() => ({
   getServerDefaultsMock: vi.fn(),
   listServersMock: vi.fn(),
-  probeServerMock: vi.fn(),
-  waitTaskDoneMock: vi.fn()
+  probeServerMock: vi.fn()
 }))
 
 vi.mock('../i18n', () => ({
@@ -34,8 +32,7 @@ vi.mock('../servers/api', () => ({
   listServers: listServersMock,
   probeServer: probeServerMock,
   reorderServers: vi.fn(),
-  saveServer: vi.fn(),
-  waitTaskDone: waitTaskDoneMock
+  saveServer: vi.fn()
 }))
 
 import { useRealtimeStore } from '../stores/realtime'
@@ -57,11 +54,9 @@ describe('ServersView', () => {
     getServerDefaultsMock.mockReset()
     listServersMock.mockReset()
     probeServerMock.mockReset()
-    waitTaskDoneMock.mockReset()
     getServerDefaultsMock.mockResolvedValue({ defaultDeployDir: '/aifar/apps' })
     listServersMock.mockResolvedValue([server])
     probeServerMock.mockResolvedValue({ taskId: 'tsk-probe-1' })
-    waitTaskDoneMock.mockResolvedValue('success')
   })
 
   it('loads the server list without starting probe tasks', async () => {
@@ -100,7 +95,7 @@ describe('ServersView', () => {
 
     expect(wrapper.findComponent({ name: 'ServerDetailPanel' }).props('server')).toMatchObject({
       id: 'srv-1',
-      status: 'failed',
+      status: 'unavailable',
       lastError: 'connection refused'
     })
   })

@@ -8,16 +8,14 @@ const {
   listServersMock,
   probeServerMock,
   reorderServersMock,
-  saveServerMock,
-  waitTaskDoneMock
+  saveServerMock
 } = vi.hoisted(() => ({
   deleteServerMock: vi.fn(),
   getServerDefaultsMock: vi.fn(),
   listServersMock: vi.fn(),
   probeServerMock: vi.fn(),
   reorderServersMock: vi.fn(),
-  saveServerMock: vi.fn(),
-  waitTaskDoneMock: vi.fn()
+  saveServerMock: vi.fn()
 }))
 
 vi.mock('./api', () => ({
@@ -26,8 +24,7 @@ vi.mock('./api', () => ({
   listServers: listServersMock,
   probeServer: probeServerMock,
   reorderServers: reorderServersMock,
-  saveServer: saveServerMock,
-  waitTaskDone: waitTaskDoneMock
+  saveServer: saveServerMock
 }))
 
 import { useServerWorkbench } from './useServerWorkbench'
@@ -50,7 +47,6 @@ describe('useServerWorkbench realtime status', () => {
     probeServerMock.mockReset()
     reorderServersMock.mockReset()
     saveServerMock.mockReset()
-    waitTaskDoneMock.mockReset()
   })
 
   it('applies live snapshots without resetting workbench state', async () => {
@@ -76,7 +72,7 @@ describe('useServerWorkbench realtime status', () => {
     }))
     workbench.applyStatusSnapshots()
 
-    expect(workbench.servers.value[0]).toMatchObject({ status: 'failed', lastError: 'timeout' })
+    expect(workbench.servers.value[0]).toMatchObject({ status: 'unavailable', lastError: 'timeout' })
     expect(workbench.selectedId.value).toBe('srv-1')
     expect(workbench.search.value).toBe('one')
     expect(workbench.drawer.value).toBe(true)
@@ -84,34 +80,34 @@ describe('useServerWorkbench realtime status', () => {
     expect(workbench.form.name).toBe('draft name')
   })
 
-  it('keeps manual probing status through refresh until the probe task finishes', async () => {
+  it('tracks manual probe tasks globally without waiting inside the page', async () => {
     const snapshots = new Map<string, StatusSnapshot>()
-    const taskDone = deferred<string>()
+    const trackTask = vi.fn()
     listServersMock.mockResolvedValue([server])
     probeServerMock.mockResolvedValueOnce({ taskId: 'tsk-probe-1' })
-    waitTaskDoneMock.mockReturnValueOnce(taskDone.promise)
-    const workbench = useServerWorkbench((key) => key, (id) => snapshots.get(id))
+    const workbench = useServerWorkbench((key) => key, (id) => snapshots.get(id), trackTask)
     await workbench.load()
 
-    const probePromise = workbench.probe(workbench.servers.value[0])
-    await Promise.resolve()
+    await workbench.probe(workbench.servers.value[0])
     snapshots.set('srv-1', snapshot({ status: 'failed', lastError: 'timeout', version: 2 }))
     workbench.applyStatusSnapshots()
 
-    expect(workbench.probingIds.value.has('srv-1')).toBe(true)
-    expect(workbench.servers.value[0]).toMatchObject({ status: 'probing', lastError: '' })
+    expect(trackTask).toHaveBeenCalledWith('tsk-probe-1', 'servers.probe')
+    expect(workbench.probingIds.value.has('srv-1')).toBe(false)
+    expect(listServersMock).toHaveBeenCalledTimes(2)
+    expect(workbench.servers.value[0]).toMatchObject({ status: 'unavailable', lastError: 'timeout' })
+  })
+
+  it.each(['available', 'running', 'success', 'ok'])('counts %s server snapshots as available like the dashboard', async (status) => {
+    const snapshots = new Map<string, StatusSnapshot>()
+    listServersMock.mockResolvedValueOnce([server])
+    snapshots.set('srv-1', snapshot({ status, version: 1, collectedAt: '2026-08-03T10:00:00Z' }))
+    const workbench = useServerWorkbench((key) => key, (id) => snapshots.get(id))
 
     await workbench.load()
 
-    expect(workbench.probingIds.value.has('srv-1')).toBe(true)
-    expect(workbench.servers.value[0]).toMatchObject({ status: 'probing', lastError: '' })
-
-    taskDone.resolve('success')
-    await probePromise
-
-    expect(workbench.probingIds.value.has('srv-1')).toBe(false)
-    expect(listServersMock).toHaveBeenCalledTimes(3)
-    expect(workbench.servers.value[0]).toMatchObject({ status: 'failed', lastError: 'timeout' })
+    expect(workbench.servers.value[0].status).toBe('available')
+    expect(workbench.summary.value.available).toBe(1)
   })
 })
 
@@ -125,14 +121,4 @@ function snapshot(overrides: Partial<StatusSnapshot> = {}): StatusSnapshot {
     collectedAt: '2026-08-03T10:00:00Z',
     ...overrides
   }
-}
-
-function deferred<T>() {
-  let resolve!: (value: T) => void
-  let reject!: (reason?: unknown) => void
-  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
-    resolve = resolvePromise
-    reject = rejectPromise
-  })
-  return { promise, resolve, reject }
 }

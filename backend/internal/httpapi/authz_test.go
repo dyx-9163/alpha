@@ -2,7 +2,9 @@ package httpapi
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -56,7 +58,7 @@ func TestOwnerCanMutateSettings(t *testing.T) {
 	api, db, secret := newAuthzTestAPI(t)
 	token := issueTestToken(t, db, secret, "owner", "owner")
 
-	req := httptest.NewRequest(http.MethodPut, "/api/v2/settings", strings.NewReader(`{"language":"en"}`))
+	req := httptest.NewRequest(http.MethodPut, "/api/v2/settings", strings.NewReader(`{"language":"en","logRetentionDays":1}`))
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
@@ -65,6 +67,13 @@ func TestOwnerCanMutateSettings(t *testing.T) {
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body["logRetentionDays"] != "1" {
+		t.Fatalf("expected persisted logRetentionDays=1 in response, got %+v", body)
 	}
 }
 
@@ -432,6 +441,7 @@ func TestSettingsExposeSecurityLimits(t *testing.T) {
 	api.cfg.MaxRequestBodyBytes = 2048
 	api.cfg.AuthMaxFailures = 7
 	api.cfg.AuthLockoutSeconds = 60
+	api.cfg.LogRetentionDays = 30
 	api.cfg.AuditRetentionDays = 120
 	api.cfg.TaskRetentionDays = 45
 	api.cfg.DatabaseBackupDir = filepath.Join(t.TempDir(), "control-plane-backups")
@@ -453,7 +463,7 @@ func TestSettingsExposeSecurityLimits(t *testing.T) {
 		t.Fatal(err)
 	}
 	if body["maxRequestBodyBytes"] != float64(2048) || body["authMaxFailures"] != float64(7) || body["authLockoutSeconds"] != float64(60) ||
-		body["auditRetentionDays"] != float64(120) || body["taskRetentionDays"] != float64(45) || body["databaseBackupDir"] != api.cfg.DatabaseBackupDir ||
+		fmt.Sprint(body["logRetentionDays"]) != "30" || body["auditRetentionDays"] != float64(120) || body["taskRetentionDays"] != float64(45) || body["databaseBackupDir"] != api.cfg.DatabaseBackupDir ||
 		body["mysqlBackupDir"] != api.cfg.MySQLBackupDir || body["mysqlBackupKeepLast"] != float64(8) {
 		t.Fatalf("security limits missing from settings response: %+v", body)
 	}
@@ -560,9 +570,49 @@ func TestCannotDemoteLastOwner(t *testing.T) {
 
 func TestRetentionCleanupStartsTask(t *testing.T) {
 	api, db, secret := newAuthzTestAPI(t)
-	api.cfg.AuditRetentionDays = 1
-	api.cfg.TaskRetentionDays = 1
+	api.cfg.LogRetentionDays = 90
+	api.cfg.AuditRetentionDays = 180
+	api.cfg.TaskRetentionDays = 90
+	if err := db.SetSetting("logRetentionDays", "1"); err != nil {
+		t.Fatal(err)
+	}
 	token := issueTestToken(t, db, secret, "owner", "owner")
+	old := time.Now().Add(-48 * time.Hour)
+	recent := time.Now()
+	if err := db.AddAudit("owner", "old.audit", "control-plane", "success", "old"); err != nil {
+		t.Fatal(err)
+	}
+	raw := openAuthzRawDB(t, api.cfg.DatabasePath)
+	if _, err := raw.Exec(`update audit_logs set created_at=? where action='old.audit'`, old); err != nil {
+		t.Fatal(err)
+	}
+	oldTask, err := db.CreateTask(store.Task{Type: "old.task", Target: "control-plane", Status: "success", CreatedBy: "owner", CreatedAt: old, FinishedAt: old})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.AddTaskLog(oldTask.ID, "info", "old task log"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := db.UpsertStatusSnapshot(store.StatusSnapshot{Scope: "server", ResourceID: "srv-1", Status: "available", Payload: `{"old":true}`}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := db.UpsertStatusSnapshot(store.StatusSnapshot{Scope: "server", ResourceID: "srv-1", Status: "failed", Payload: `{"recent":true}`}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.Exec(`update status_snapshot_history set created_at=case when status='available' then ? else ? end where scope='server' and resource_id='srv-1'`, old, recent); err != nil {
+		t.Fatal(err)
+	}
+	alert, _, err := db.UpsertAlert(store.Alert{Fingerprint: "fp-maintenance", Severity: "critical", Scope: "server", ResourceID: "srv-1", Title: "server down"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldEvent, err := db.AddAlertEvent(store.AlertEvent{AlertID: alert.ID, Fingerprint: alert.Fingerprint, Event: "updated", Actor: "system", CreatedAt: old})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.AddAlertEvent(store.AlertEvent{AlertID: alert.ID, Fingerprint: alert.Fingerprint, Event: "resolved", Actor: "owner", CreatedAt: recent}); err != nil {
+		t.Fatal(err)
+	}
 
 	req := httptest.NewRequest(http.MethodPost, "/api/v2/maintenance/retention/run", nil)
 	req.Header.Set("Authorization", "Bearer "+token)
@@ -582,7 +632,117 @@ func TestRetentionCleanupStartsTask(t *testing.T) {
 		t.Fatalf("expected taskId in response: %+v", body)
 	}
 	waitForTaskStatus(t, db, taskID, "success")
+	steps, err := db.ListTaskSteps(taskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stepNames := []string{}
+	for _, step := range steps {
+		stepNames = append(stepNames, step.Name)
+	}
+	for _, want := range []string{"cleanup-audit", "cleanup-tasks", "cleanup-status-history", "cleanup-alert-events"} {
+		found := false
+		for _, got := range stepNames {
+			if got == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("cleanup task steps missing %s in %+v", want, stepNames)
+		}
+	}
+	if audits, err := db.ListAudit(); err != nil {
+		t.Fatal(err)
+	} else {
+		for _, item := range audits {
+			if item.Action == "old.audit" {
+				t.Fatalf("old audit log was not cleaned: %+v", audits)
+			}
+		}
+	}
+	if _, _, err := db.GetTask(oldTask.ID); !store.IsNotFound(err) {
+		t.Fatalf("old finished task was not cleaned: %v", err)
+	}
+	history, err := db.ListStatusSnapshotHistory("server", "srv-1", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(history) != 1 || history[0].Status != "failed" {
+		t.Fatalf("expected only recent status history to remain, got %+v", history)
+	}
+	if _, err := db.GetStatusSnapshot("server", "srv-1"); err != nil {
+		t.Fatalf("current status snapshot must remain: %v", err)
+	}
+	var oldEventCount int
+	if err := raw.QueryRow(`select count(*) from alert_events where id=?`, oldEvent.ID).Scan(&oldEventCount); err != nil {
+		t.Fatal(err)
+	}
+	if oldEventCount != 0 {
+		t.Fatalf("old alert event was not cleaned")
+	}
+	if _, err := db.GetAlert(alert.ID); err != nil {
+		t.Fatalf("current alert must remain: %v", err)
+	}
 	assertAuditExists(t, db, "maintenance.retention.run", "running", "owner", "control-plane")
+}
+
+func TestRetentionCleanupRequiresControlPlaneOperationLock(t *testing.T) {
+	api, db, secret := newAuthzTestAPI(t)
+	ownerTask, err := db.CreateTask(store.Task{Type: "maintenance.retention.run", Target: "control-plane", Status: "running", CreatedBy: "owner"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.AcquireOperationLock(store.OperationLock{
+		Scope:       "maintenance",
+		ResourceID:  "retention-cleanup",
+		Operation:   operationLockMutation,
+		OwnerTaskID: ownerTask.ID,
+		Owner:       "owner",
+		ExpiresAt:   time.Now().Add(time.Hour),
+		Metadata:    `{"action":"retention-cleanup"}`,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	token := issueTestToken(t, db, secret, "owner", "owner")
+	req := httptest.NewRequest(http.MethodPost, "/api/v2/maintenance/retention/run", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	rec := httptest.NewRecorder()
+
+	api.Router().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("expected 409, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	var body struct {
+		Code    string         `json:"code"`
+		Details map[string]any `json:"details"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body.Code != "OPERATION_LOCKED" || body.Details["scope"] != "maintenance" || body.Details["resourceId"] != "retention-cleanup" {
+		t.Fatalf("expected maintenance lock conflict details, got %+v", body)
+	}
+	raw := openAuthzRawDB(t, api.cfg.DatabasePath)
+	var cleanupTasks int
+	if err := raw.QueryRow(`select count(*) from tasks where type='maintenance.retention.run' and id<>?`, ownerTask.ID).Scan(&cleanupTasks); err != nil {
+		t.Fatal(err)
+	}
+	if cleanupTasks != 0 {
+		t.Fatalf("conflicted retention cleanup created %d extra task(s)", cleanupTasks)
+	}
+}
+
+func openAuthzRawDB(t *testing.T, path string) *sql.DB {
+	t.Helper()
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = raw.Close() })
+	return raw
 }
 
 func TestDatabaseBackupStartsTaskAndCreatesFile(t *testing.T) {
@@ -730,6 +890,7 @@ func newAuthzTestAPI(t *testing.T) (*API, *store.Store, string) {
 		MaxRequestBodyBytes:   1 << 20,
 		AuthMaxFailures:       5,
 		AuthLockoutSeconds:    300,
+		LogRetentionDays:      90,
 		AuditRetentionDays:    180,
 		TaskRetentionDays:     90,
 	}

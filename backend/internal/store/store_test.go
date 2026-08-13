@@ -963,6 +963,140 @@ func TestDeleteFinishedTasksBefore(t *testing.T) {
 	}
 }
 
+func TestDeleteSQLiteLogHistoryBeforeUsesUnifiedRetentionAndKeepsCurrentState(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "aifar.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	now := time.Now().UTC()
+	old := now.Add(-72 * time.Hour)
+	recent := now.Add(-2 * time.Hour)
+	cutoff := now.Add(-24 * time.Hour)
+
+	if err := db.AddAudit("owner", "old.audit", "target", "success", "old"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.Exec(`update audit_logs set created_at=? where action='old.audit'`, old); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AddAudit("owner", "recent.audit", "target", "success", "recent"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.Exec(`update audit_logs set created_at=? where action='recent.audit'`, recent); err != nil {
+		t.Fatal(err)
+	}
+
+	oldTask, err := db.CreateTask(Task{Type: "old.task", Target: "target", Status: "success", CreatedBy: "owner", CreatedAt: old, FinishedAt: old})
+	if err != nil {
+		t.Fatal(err)
+	}
+	recentTask, err := db.CreateTask(Task{Type: "recent.task", Target: "target", Status: "success", CreatedBy: "owner", CreatedAt: recent, FinishedAt: recent})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runningTask, err := db.CreateTask(Task{Type: "running.task", Target: "target", Status: "running", CreatedBy: "owner", CreatedAt: old, StartedAt: old})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.AddTaskLog(oldTask.ID, "info", "old log"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.UpsertTaskTarget(oldTask.ID, "target", "success", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.UpsertTaskStep(oldTask.ID, "target", "old-step", "old step", 1, "success", ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.AddTaskLog(recentTask.ID, "info", "recent log"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.AddTaskLog(runningTask.ID, "info", "running log"); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, _, err := db.UpsertStatusSnapshot(StatusSnapshot{Scope: "docker.summary", ResourceID: "srv-1", ServerID: "srv-1", Status: "available", Payload: `{"status":"available"}`}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := db.UpsertStatusSnapshot(StatusSnapshot{Scope: "docker.summary", ResourceID: "srv-1", ServerID: "srv-1", Status: "failed", Payload: `{"status":"failed"}`}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.Exec(`update status_snapshot_history set created_at=case when status='available' then ? else ? end where scope='docker.summary' and resource_id='srv-1'`, old, recent); err != nil {
+		t.Fatal(err)
+	}
+
+	alert, _, err := db.UpsertAlert(Alert{Fingerprint: "fp-1", Severity: "critical", Scope: "mysql", ResourceID: "mysql-1", Status: "open", Title: "mysql down"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldEvent, err := db.AddAlertEvent(AlertEvent{AlertID: alert.ID, Fingerprint: alert.Fingerprint, Event: "updated", Actor: "system", CreatedAt: old})
+	if err != nil {
+		t.Fatal(err)
+	}
+	recentEvent, err := db.AddAlertEvent(AlertEvent{AlertID: alert.ID, Fingerprint: alert.Fingerprint, Event: "resolved", Actor: "owner", CreatedAt: recent})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if oldEvent.ID == recentEvent.ID {
+		t.Fatal("expected distinct alert events")
+	}
+	if err := db.UpsertCollectorRun(CollectorRun{Name: "collector.run", Target: "servers", Status: "success", UpdatedAt: old}); err != nil {
+		t.Fatal(err)
+	}
+
+	auditsDeleted, err := db.DeleteAuditLogsBefore(cutoff)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tasksDeleted, err := db.DeleteFinishedTasksBefore(cutoff)
+	if err != nil {
+		t.Fatal(err)
+	}
+	statusHistoryDeleted, err := db.DeleteStatusSnapshotHistoryBefore(cutoff)
+	if err != nil {
+		t.Fatal(err)
+	}
+	alertEventsDeleted, err := db.DeleteAlertEventsBefore(cutoff)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if auditsDeleted != 1 || tasksDeleted != 1 || statusHistoryDeleted != 1 || alertEventsDeleted != 1 {
+		t.Fatalf("deleted audit/task/status/alert = %d/%d/%d/%d, want 1/1/1/1", auditsDeleted, tasksDeleted, statusHistoryDeleted, alertEventsDeleted)
+	}
+
+	if _, _, err := db.GetTask(oldTask.ID); !IsNotFound(err) {
+		t.Fatalf("expected old finished task deleted, got %v", err)
+	}
+	for _, id := range []string{recentTask.ID, runningTask.ID} {
+		if _, _, err := db.GetTask(id); err != nil {
+			t.Fatalf("expected task %s to remain, got %v", id, err)
+		}
+	}
+	history, err := db.ListStatusSnapshotHistory("docker.summary", "srv-1", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(history) != 1 || history[0].Status != "failed" {
+		t.Fatalf("expected only recent status history to remain, got %+v", history)
+	}
+	if _, err := db.GetStatusSnapshot("docker.summary", "srv-1"); err != nil {
+		t.Fatalf("current status snapshot must remain: %v", err)
+	}
+	var remainingAlertEvents int
+	if err := db.db.QueryRow(`select count(*) from alert_events where id in (?,?)`, oldEvent.ID, recentEvent.ID).Scan(&remainingAlertEvents); err != nil {
+		t.Fatal(err)
+	}
+	if remainingAlertEvents != 1 {
+		t.Fatalf("expected only recent alert event to remain, got %d", remainingAlertEvents)
+	}
+	if _, err := db.GetAlert(alert.ID); err != nil {
+		t.Fatalf("current alert must remain: %v", err)
+	}
+	if runs, err := db.ListCollectorRuns(); err != nil || len(runs) != 1 {
+		t.Fatalf("collector current summary must remain, runs=%+v err=%v", runs, err)
+	}
+}
+
 func TestTaskTargetsAndSteps(t *testing.T) {
 	db, err := Open(filepath.Join(t.TempDir(), "aifar.db"))
 	if err != nil {

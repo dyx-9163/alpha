@@ -27,9 +27,11 @@ import DataTable from '../components/DataTable.vue'
 import { usePermissions } from '../composables/usePermissions'
 import { useI18n } from '../i18n'
 import { permissions } from '../rbac'
+import { useTaskProgressStore } from '../stores/taskProgress'
 
 const { t } = useI18n()
 const { can, deniedText } = usePermissions()
+const taskProgress = useTaskProgressStore()
 const resources = ref<any[]>([])
 const canScanResources = computed(() => can(permissions.resourcesScan))
 const resourceColumns = computed(() => [
@@ -46,8 +48,10 @@ async function rescan() {
     ElMessage.warning(deniedText.value)
     return
   }
-  await apiPost('/resources/rescan')
-  await load()
+  const result = await apiPost<{ taskId?: string }>('/resources/rescan')
+  if (result.taskId) {
+    taskProgress.track(result.taskId, t('toolbox.rescan'))
+  }
 }
 onMounted(load)
 </script>

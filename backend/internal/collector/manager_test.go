@@ -223,6 +223,367 @@ func TestDockerSummaryCollectorTimeoutDoesNotBlockOtherHosts(t *testing.T) {
 	}
 }
 
+func TestRunOnceRunsCollectorFamiliesConcurrently(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "aifar.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	server, err := db.SaveServer(store.Server{Name: "node-1", Host: "10.0.0.10", DockerHost: "tcp://10.0.0.10:2375"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.SaveAppInstance(store.AppInstance{App: "aifar", Version: "runtime-v2", ServerID: server.ID, Status: "installed"}); err != nil {
+		t.Fatal(err)
+	}
+
+	manager := NewManager(db, nil, time.Minute)
+	serverProbeStarted := make(chan struct{})
+	releaseServerProbe := make(chan struct{})
+	manager.serverProbe = func(ctx context.Context, server store.Server) error {
+		close(serverProbeStarted)
+		select {
+		case <-releaseServerProbe:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	dockerStarted := make(chan struct{})
+	manager.dockerSummaryForServer = func(ctx context.Context, server store.Server) (adapter.DockerSummary, error) {
+		close(dockerStarted)
+		return adapter.DockerSummary{Containers: 1, Images: 1, Endpoint: server.DockerHost}, nil
+	}
+
+	done := make(chan struct{})
+	go func() {
+		manager.RunOnce(context.Background())
+		close(done)
+	}()
+	defer close(releaseServerProbe)
+
+	select {
+	case <-serverProbeStarted:
+	case <-time.After(time.Second):
+		t.Fatal("server probe did not start")
+	}
+	select {
+	case <-dockerStarted:
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("docker collector waited for the blocked server probe")
+	}
+	select {
+	case <-done:
+		t.Fatal("RunOnce finished while server probe was still blocked")
+	default:
+	}
+}
+
+func TestCollectorRunStatusRemainsRunningWhenFamilyHasInFlightWork(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "aifar.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.SaveServer(store.Server{Name: "node-1", Host: "10.0.0.10"}); err != nil {
+		t.Fatal(err)
+	}
+	manager := NewManager(db, nil, time.Minute)
+	probeStarted := make(chan struct{})
+	releaseProbe := make(chan struct{})
+	var startedOnce sync.Once
+	manager.serverProbe = func(ctx context.Context, server store.Server) error {
+		startedOnce.Do(func() { close(probeStarted) })
+		select {
+		case <-releaseProbe:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+
+	firstDone := make(chan error, 1)
+	go func() {
+		firstDone <- manager.collectServers(context.Background())
+	}()
+	defer close(releaseProbe)
+	select {
+	case <-probeStarted:
+	case <-time.After(time.Second):
+		t.Fatal("server collector did not start")
+	}
+	secondDone := make(chan error, 1)
+	go func() {
+		secondDone <- manager.runCollectServers(context.Background())
+	}()
+	select {
+	case err := <-secondDone:
+		if err != nil {
+			t.Fatalf("second servers run should only observe in-flight work, got %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("second servers run blocked behind in-flight server")
+	}
+
+	runs, err := db.ListCollectorRuns()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(runs) != 1 || runs[0].Name != "servers" {
+		t.Fatalf("expected one servers collector run, got %+v", runs)
+	}
+	if runs[0].Status != "running" || !runs[0].FinishedAt.IsZero() {
+		t.Fatalf("in-flight servers collector was incorrectly overwritten by a skipped run: %+v", runs[0])
+	}
+}
+
+func TestCollectorRunStatusRemainsRunningWhenEveryDockerHostIsInFlight(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "aifar.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	server, err := db.SaveServer(store.Server{Name: "node-1", Host: "10.0.0.10", DockerHost: "tcp://10.0.0.10:2375"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager := NewManager(db, nil, time.Minute)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var startedOnce sync.Once
+	manager.dockerSummaryForServer = func(ctx context.Context, server store.Server) (adapter.DockerSummary, error) {
+		startedOnce.Do(func() { close(started) })
+		select {
+		case <-release:
+			return adapter.DockerSummary{Endpoint: server.DockerHost}, nil
+		case <-ctx.Done():
+			return adapter.DockerSummary{}, ctx.Err()
+		}
+	}
+
+	firstDone := make(chan error, 1)
+	go func() {
+		firstDone <- manager.collectDockerSummaries(context.Background())
+	}()
+	defer close(release)
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("docker collector did not start")
+	}
+	if err := manager.runCollectDockerSummaries(context.Background()); err != nil {
+		t.Fatalf("second Docker run should only observe in-flight work, got %v", err)
+	}
+	assertCollectorRunStillRunning(t, db, "docker.summary")
+	_ = server
+}
+
+func TestCollectorRunStatusRemainsRunningWhenEveryAppInstanceIsInFlight(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "aifar.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	server, err := db.SaveServer(store.Server{Name: "node-1", Host: "10.0.0.10"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.SaveAppInstance(store.AppInstance{App: "mysql", Version: "8.0.36", ServerID: server.ID, Status: "running"}); err != nil {
+		t.Fatal(err)
+	}
+	manager := NewManager(db, nil, time.Minute)
+	manager.appInstanceTimeout = time.Second
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var startedOnce sync.Once
+	manager.SetAppRegistry(registry.New(fakeCheckModule{
+		name: "mysql",
+		check: func(ctx context.Context, req registry.CheckRequest) (registry.InstanceStatus, error) {
+			startedOnce.Do(func() { close(started) })
+			select {
+			case <-release:
+				return registry.InstanceStatus{Status: "running"}, nil
+			case <-ctx.Done():
+				return registry.InstanceStatus{}, ctx.Err()
+			}
+		},
+	}))
+
+	firstDone := make(chan error, 1)
+	go func() {
+		firstDone <- manager.collectAppInstances(context.Background())
+	}()
+	defer close(release)
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("app instance collector did not start")
+	}
+	if err := manager.runCollectAppInstances(context.Background()); err != nil {
+		t.Fatalf("second app instance run should only observe in-flight work, got %v", err)
+	}
+	assertCollectorRunStillRunning(t, db, "app.instances")
+}
+
+func TestCollectorRunStatusRemainsRunningWhenEveryAIFARRuntimeIsInFlight(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "aifar.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	server, err := db.SaveServer(store.Server{Name: "node-1", Host: "10.0.0.10"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	instance, err := db.SaveAppInstance(store.AppInstance{App: "aifar", Version: "runtime-v2", ServerID: server.ID, Status: "installed"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager := NewManager(db, nil, time.Minute)
+	if !manager.tryStart("aifar.runtime:" + instance.ID) {
+		t.Fatal("failed to mark runtime collector active")
+	}
+	defer manager.finish("aifar.runtime:" + instance.ID)
+	if err := db.UpsertCollectorRun(store.CollectorRun{Name: "aifar.runtime", Status: "running", StartedAt: time.Now(), UpdatedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := manager.runCollectAIFARRuntime(context.Background()); err != nil {
+		t.Fatalf("AIFAR runtime run should only observe in-flight work, got %v", err)
+	}
+	assertCollectorRunStillRunning(t, db, "aifar.runtime")
+}
+
+func assertCollectorRunStillRunning(t *testing.T, db *store.Store, name string) {
+	t.Helper()
+	runs, err := db.ListCollectorRuns()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, run := range runs {
+		if run.Name != name {
+			continue
+		}
+		if run.Status != "running" || !run.FinishedAt.IsZero() {
+			t.Fatalf("collector run %s was incorrectly overwritten by a skipped run: %+v", name, run)
+		}
+		return
+	}
+	t.Fatalf("collector run %s not found in %+v", name, runs)
+}
+
+func TestAppInstanceCollectorSkipsOnlyInFlightInstanceOnNextCycle(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "aifar.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	server, err := db.SaveServer(store.Server{Name: "node-1", Host: "10.0.0.10"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	slowInstance, err := db.SaveAppInstance(store.AppInstance{App: "mysql", Version: "8.0.36", ServerID: server.ID, Status: "running", Topology: "standalone"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fastInstance, err := db.SaveAppInstance(store.AppInstance{App: "mysql", Version: "8.0.36", ServerID: server.ID, Status: "running", Topology: "standalone"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager := NewManager(db, nil, time.Minute)
+	manager.appInstanceTimeout = time.Second
+	slowEntered := make(chan struct{})
+	fastFirstChecked := make(chan struct{})
+	releaseSlow := make(chan struct{})
+	var slowOnce sync.Once
+	var fastOnce sync.Once
+	var mu sync.Mutex
+	slowCalls := 0
+	fastCalls := 0
+	manager.SetAppRegistry(registry.New(fakeCheckModule{
+		name: "mysql",
+		check: func(ctx context.Context, req registry.CheckRequest) (registry.InstanceStatus, error) {
+			mu.Lock()
+			if req.Instance.ID == slowInstance.ID {
+				slowCalls++
+				mu.Unlock()
+				slowOnce.Do(func() { close(slowEntered) })
+				select {
+				case <-releaseSlow:
+				case <-ctx.Done():
+					return registry.InstanceStatus{}, ctx.Err()
+				}
+				return registry.InstanceStatus{Status: "running", Message: "slow ok"}, nil
+			}
+			if req.Instance.ID == fastInstance.ID {
+				fastCalls++
+				fastOnce.Do(func() { close(fastFirstChecked) })
+			}
+			mu.Unlock()
+			return registry.InstanceStatus{Status: "running", Message: "fast ok"}, nil
+		},
+	}))
+
+	firstDone := make(chan error, 1)
+	go func() {
+		firstDone <- manager.collectAppInstances(context.Background())
+	}()
+	defer close(releaseSlow)
+	select {
+	case <-slowEntered:
+	case <-time.After(time.Second):
+		t.Fatal("slow app instance check did not start")
+	}
+	select {
+	case <-fastFirstChecked:
+	case <-time.After(time.Second):
+		t.Fatal("fast app instance was not checked in the first cycle")
+	}
+	waitCollectorInactive(t, manager, "app.instance:"+fastInstance.ID)
+
+	secondDone := make(chan error, 1)
+	go func() {
+		secondDone <- manager.collectAppInstances(context.Background())
+	}()
+	select {
+	case err := <-secondDone:
+		if err != nil {
+			t.Fatalf("second cycle should collect the healthy peer without waiting for in-flight slow instance: %v", err)
+		}
+	case <-time.After(150 * time.Millisecond):
+		t.Fatal("second cycle waited for the same in-flight slow instance")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if slowCalls != 1 {
+		t.Fatalf("expected slow instance to be checked once while in flight, got %d", slowCalls)
+	}
+	if fastCalls < 2 {
+		t.Fatalf("expected fast peer to be checked in both cycles, got %d", fastCalls)
+	}
+}
+
+func waitCollectorInactive(t *testing.T, manager *Manager, key string) {
+	t.Helper()
+	deadline := time.After(time.Second)
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for {
+		manager.activeMu.Lock()
+		_, exists := manager.active[key]
+		manager.activeMu.Unlock()
+		if !exists {
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("collector key %s remained active", key)
+		case <-ticker.C:
+		}
+	}
+}
+
 func TestCollectorUsesSeparateRemoteCheckTimeoutBudgets(t *testing.T) {
 	manager := NewManager(nil, nil, time.Minute)
 

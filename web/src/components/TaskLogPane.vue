@@ -178,6 +178,7 @@ const selectedTaskIds = ref<string[]>([])
 const stopBusy = ref(false)
 let source: EventSource | null = null
 let refreshTimer: number | null = null
+let taskSelectionGeneration = 0
 
 const selectableTasks = computed(() => {
   const scoped = filterTasksByScope(tasks.value, props.typePrefix, props.taskTarget)
@@ -239,15 +240,30 @@ async function selectTask(taskId: string) {
   if (!taskId) {
     return
   }
+  const generation = taskSelectionGeneration + 1
+  taskSelectionGeneration = generation
   selectedTaskId.value = taskId
   closeSource()
-  await loadTaskDetail(taskId)
+  const next = await fetchTaskDetail(taskId)
+  if (generation !== taskSelectionGeneration || selectedTaskId.value !== taskId) {
+    return
+  }
+  detail.value = next
   openSource(taskId)
   startDetailRefresh(taskId)
 }
 
 async function loadTaskDetail(taskId: string) {
-  detail.value = await apiGet<TaskDetail>(`/tasks/${taskId}`).catch(() => null)
+  const generation = taskSelectionGeneration
+  const next = await fetchTaskDetail(taskId)
+  if (generation !== taskSelectionGeneration || selectedTaskId.value !== taskId) {
+    return
+  }
+  detail.value = next
+}
+
+async function fetchTaskDetail(taskId: string) {
+  return apiGet<TaskDetail>(`/tasks/${taskId}`).catch(() => null)
 }
 
 function openSource(taskId: string) {

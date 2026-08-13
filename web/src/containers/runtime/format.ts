@@ -89,18 +89,32 @@ export function runtimeGenerationText(row: AifarRuntimeDeployment) {
   return `${generationValue(row.generation, 1)} / ${generationValue(row.observedGeneration, 0)}`
 }
 
-export function runtimeConditionReason(row: AifarRuntimeDeployment) {
+export function runtimeConditionReason(row: AifarRuntimeDeployment, t?: RuntimeTranslate) {
   const conditions = Array.isArray(row.conditions) ? row.conditions : []
   const priority = ['Degraded', 'Progressing', 'Offline', 'Available', 'Accepted']
   const active = [...conditions]
     .filter((condition) => condition?.status === true)
     .sort((left, right) => priority.indexOf(left.type) - priority.indexOf(right.type))[0]
   if (!active) return null
+  const reason = active.reason || active.type
   return {
     type: active.type,
-    reason: active.reason || active.type,
+    reason,
     message: active.message || '',
-    lastTransitionTime: active.lastTransitionTime || row.lastTransitionAt || ''
+    lastTransitionTime: active.lastTransitionTime || row.lastTransitionAt || '',
+    ...(t ? { advice: runtimeConditionAdvice(reason, active.type, t) } : {})
+  }
+}
+
+export function runtimeConditionAdvice(reason: string | undefined, type: string | undefined, t: RuntimeTranslate) {
+  const bucket = runtimeConditionAdviceBucket(reason, type)
+  const groupKey = `containers.runtimeConditionGroup.${bucket}`
+  const suggestionKey = `containers.runtimeConditionAdvice.${bucket}`
+  return {
+    group: t(groupKey),
+    suggestion: t(suggestionKey),
+    groupKey,
+    suggestionKey
   }
 }
 
@@ -125,6 +139,26 @@ function translatedStatusLabel(key: string, rawValue: string | undefined, t: Run
 
 function normalizeStatus(value?: string) {
   return String(value || 'unknown').trim() || 'unknown'
+}
+
+function runtimeConditionAdviceBucket(reason?: string, type?: string) {
+  const value = `${reason || ''} ${type || ''}`.toLowerCase()
+  if (value.includes('agent') || value.includes('manifest') || value.includes('filesystem') || value.includes('instance') || value.includes('specrejected')) {
+    return 'agent'
+  }
+  if (value.includes('artifact') || value.includes('image') || value.includes('revision') || value.includes('hash') || value.includes('pull')) {
+    return 'artifact'
+  }
+  if (value.includes('offline') || value.includes('stopped') || value.includes('desiredreplicaszero')) {
+    return 'offline'
+  }
+  if (value.includes('progress') || value.includes('accepted') || value.includes('rolling')) {
+    return 'progressing'
+  }
+  if (value.includes('readiness') || value.includes('endpoint') || value.includes('health') || value.includes('probe') || value.includes('container') || value.includes('docker')) {
+    return 'service'
+  }
+  return 'unknown'
 }
 
 function arrayValue<T>(value?: T[]) {

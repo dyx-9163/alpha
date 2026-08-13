@@ -407,6 +407,33 @@ describe('runtime format rules', () => {
     expect(runtimeGenerationText(deployment())).toBe('- / -')
   })
 
+  it('groups runtime condition reasons into localized operation advice', () => {
+    const translate = (key: string) => ({
+      'containers.runtimeConditionGroup.agent': 'Agent 通道',
+      'containers.runtimeConditionAdvice.agent': '检查 aifar-agent 进程、实例状态目录和 Server-Agent 通道，恢复后执行单服务调和。',
+      'containers.runtimeConditionGroup.service': '服务健康',
+      'containers.runtimeConditionAdvice.service': '查看目标服务容器日志、健康检查和端口监听，修复后重启或调和该服务。'
+    }[key] ?? key)
+
+    expect(runtimeConditionReason(deployment({
+      conditions: [{ type: 'Degraded', status: true, reason: 'AgentUnavailable', generation: 1, lastTransitionTime: '' }]
+    }), translate)?.advice).toEqual({
+      group: 'Agent 通道',
+      suggestion: '检查 aifar-agent 进程、实例状态目录和 Server-Agent 通道，恢复后执行单服务调和。',
+      groupKey: 'containers.runtimeConditionGroup.agent',
+      suggestionKey: 'containers.runtimeConditionAdvice.agent'
+    })
+
+    expect(runtimeConditionReason(deployment({
+      conditions: [{ type: 'Degraded', status: true, reason: 'ReadinessFailed', generation: 1, lastTransitionTime: '' }]
+    }), translate)?.advice).toEqual({
+      group: '服务健康',
+      suggestion: '查看目标服务容器日志、健康检查和端口监听，修复后重启或调和该服务。',
+      groupKey: 'containers.runtimeConditionGroup.service',
+      suggestionKey: 'containers.runtimeConditionAdvice.service'
+    })
+  })
+
   it.each([
     [undefined, '-'],
     [0, '-'],

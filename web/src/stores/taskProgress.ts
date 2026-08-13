@@ -45,6 +45,7 @@ type TaskDetail = {
 }
 
 const timers = new Map<string, number>()
+let lifecycleGeneration = 0
 
 export const useTaskProgressStore = defineStore('taskProgress', {
   state: () => ({
@@ -114,10 +115,17 @@ export const useTaskProgressStore = defineStore('taskProgress', {
       if (!id) {
         return
       }
+      const generation = lifecycleGeneration
       try {
         const detail = await apiGet<TaskDetail>(`/tasks/${encodeURIComponent(id)}`)
+        if (generation !== lifecycleGeneration) {
+          return
+        }
         this.applyTaskDetail(id, detail)
       } catch (err) {
+        if (generation !== lifecycleGeneration) {
+          return
+        }
         if (isNotFoundError(err)) {
           this.dismiss(id)
           return
@@ -193,6 +201,15 @@ export const useTaskProgressStore = defineStore('taskProgress', {
         window.clearTimeout(timer)
         timers.delete(id)
       }
+    },
+    clearAll() {
+      lifecycleGeneration += 1
+      for (const timer of timers.values()) {
+        window.clearTimeout(timer)
+      }
+      timers.clear()
+      this.items = []
+      localStorage.removeItem(STORAGE_KEY)
     },
     dismiss(taskId: string) {
       const id = taskId.trim()

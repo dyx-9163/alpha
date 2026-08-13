@@ -118,6 +118,22 @@
   font-size: 12px;
 }
 
+.runtime-condition-cell .runtime-condition-advice {
+  display: block;
+  grid-column: 1 / -1;
+  color: var(--aifar-text-secondary);
+  font-size: 12px;
+  line-height: 18px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.runtime-condition-cell .runtime-condition-advice strong {
+  color: var(--aifar-ink);
+  font-weight: 600;
+}
+
 .runtime-condition-empty {
   display: grid;
   gap: 4px;

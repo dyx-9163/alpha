@@ -1,7 +1,8 @@
 import { computed, reactive, ref } from 'vue'
 import { confirmAction } from '../composables/useConfirmAction'
+import { normalizeDashboardServerStatus } from '../dashboard/serverStatus'
 import type { StatusSnapshot } from '../stores/realtime'
-import { deleteServer, getServerDefaults, listServers, probeServer, reorderServers, saveServer, waitTaskDone } from './api'
+import { deleteServer, getServerDefaults, listServers, probeServer, reorderServers, saveServer } from './api'
 import { applyRealtimeStatusToServer } from './realtimeStatus'
 import type { ServerFormModel, ServerRecord } from './types'
 
@@ -14,6 +15,7 @@ const fallbackServerDefaults: ServerDefaults = {
 }
 
 export type ServerSnapshotResolver = (serverId: string) => StatusSnapshot | undefined
+export type ServerTaskTracker = (taskId: string, label: string) => void
 
 export function createServerForm(row?: Partial<ServerRecord>, defaults: ServerDefaults = fallbackServerDefaults): ServerFormModel {
   return {
@@ -35,7 +37,8 @@ export function createServerForm(row?: Partial<ServerRecord>, defaults: ServerDe
 
 export function useServerWorkbench(
   t: (key: string, params?: Record<string, unknown>) => string,
-  resolveSnapshot: ServerSnapshotResolver = () => undefined
+  resolveSnapshot: ServerSnapshotResolver = () => undefined,
+  trackTask: ServerTaskTracker = () => undefined
 ) {
   const servers = ref<ServerRecord[]>([])
   const selectedId = ref('')
@@ -62,9 +65,10 @@ export function useServerWorkbench(
   }))
 
   function mergeLiveStatus(server: ServerRecord) {
-    return probingIds.value.has(server.id)
+    const merged = probingIds.value.has(server.id)
       ? { ...server, status: 'probing', lastError: '' }
       : applyRealtimeStatusToServer(server, resolveSnapshot(server.id))
+    return { ...merged, status: normalizeDashboardServerStatus(merged.status) }
   }
 
   async function load() {
@@ -144,7 +148,9 @@ export function useServerWorkbench(
     activeTab.value = 'overview'
     try {
       const result = await probeServer(row.id)
-      await waitTaskDone(result.taskId)
+      if (result.taskId) {
+        trackTask(result.taskId, t('servers.probe'))
+      }
     } finally {
       setProbing(row.id, false)
       await load()

@@ -10,7 +10,12 @@ import (
 	"time"
 )
 
-type fakeStore struct{}
+type fakeStore struct {
+	auditCutoff         time.Time
+	taskCutoff          time.Time
+	statusHistoryCutoff time.Time
+	alertEventCutoff    time.Time
+}
 
 func (fakeStore) BackupDatabase(path string) (int64, string, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
@@ -22,12 +27,75 @@ func (fakeStore) BackupDatabase(path string) (int64, string, error) {
 	return 6, strings.Repeat("a", 64), nil
 }
 
-func (fakeStore) DeleteAuditLogsBefore(time.Time) (int, error) {
+func (s *fakeStore) DeleteAuditLogsBefore(cutoff time.Time) (int, error) {
+	s.auditCutoff = cutoff
 	return 0, nil
 }
 
-func (fakeStore) DeleteFinishedTasksBefore(time.Time) (int, error) {
+func (s *fakeStore) DeleteFinishedTasksBefore(cutoff time.Time) (int, error) {
+	s.taskCutoff = cutoff
 	return 0, nil
+}
+
+func (s *fakeStore) DeleteStatusSnapshotHistoryBefore(cutoff time.Time) (int, error) {
+	s.statusHistoryCutoff = cutoff
+	return 0, nil
+}
+
+func (s *fakeStore) DeleteAlertEventsBefore(cutoff time.Time) (int, error) {
+	s.alertEventCutoff = cutoff
+	return 0, nil
+}
+
+func TestPlanUsesOneLogRetentionCutoffForAllSQLiteLogHistory(t *testing.T) {
+	now := time.Date(2026, 8, 12, 15, 0, 0, 0, time.UTC)
+	svc := NewService(&fakeStore{}, RetentionConfig{LogRetentionDays: 30, AuditRetentionDays: 180, TaskRetentionDays: 90})
+
+	plan := svc.Plan(now)
+	want := now.AddDate(0, 0, -30)
+	for name, got := range map[string]time.Time{
+		"audit":          plan.AuditCutoff,
+		"tasks":          plan.TaskCutoff,
+		"statusHistory":  plan.StatusHistoryCutoff,
+		"alertEvents":    plan.AlertEventCutoff,
+		"unifiedLogRule": plan.LogCutoff,
+	} {
+		if !got.Equal(want) {
+			t.Fatalf("%s cutoff = %s, want unified cutoff %s", name, got, want)
+		}
+	}
+}
+
+func TestCleanupLogsUsesUnifiedRetentionForAllSQLiteLogHistory(t *testing.T) {
+	now := time.Date(2026, 8, 12, 15, 0, 0, 0, time.UTC)
+	fake := &fakeStore{}
+	svc := NewService(fake, RetentionConfig{LogRetentionDays: 7})
+	plan := svc.Plan(now)
+
+	if _, err := svc.CleanupAudit(plan); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.CleanupTasks(plan); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.CleanupStatusHistory(plan); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.CleanupAlertEvents(plan); err != nil {
+		t.Fatal(err)
+	}
+
+	want := now.AddDate(0, 0, -7)
+	for name, got := range map[string]time.Time{
+		"audit":         fake.auditCutoff,
+		"tasks":         fake.taskCutoff,
+		"statusHistory": fake.statusHistoryCutoff,
+		"alertEvents":   fake.alertEventCutoff,
+	} {
+		if !got.Equal(want) {
+			t.Fatalf("%s cleanup cutoff = %s, want %s", name, got, want)
+		}
+	}
 }
 
 func TestListAndDeleteDatabaseBackups(t *testing.T) {
@@ -39,7 +107,7 @@ func TestListAndDeleteDatabaseBackups(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "notes.txt"), []byte("ignore"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	svc := NewService(fakeStore{}, RetentionConfig{})
+	svc := NewService(&fakeStore{}, RetentionConfig{})
 
 	backups, err := svc.ListDatabaseBackups(dir)
 	if err != nil {
@@ -83,7 +151,7 @@ func TestVerifyDatabaseBackup(t *testing.T) {
 	if _, _, err := db.BackupDatabase(filepath.Join(dir, name)); err != nil {
 		t.Fatal(err)
 	}
-	svc := NewService(fakeStore{}, RetentionConfig{})
+	svc := NewService(&fakeStore{}, RetentionConfig{})
 
 	verification, err := svc.VerifyDatabaseBackup(dir, name)
 	if err != nil {
@@ -98,7 +166,7 @@ func TestVerifyDatabaseBackup(t *testing.T) {
 }
 
 func TestDeleteDatabaseBackupsRejectsUnsafeNames(t *testing.T) {
-	svc := NewService(fakeStore{}, RetentionConfig{})
+	svc := NewService(&fakeStore{}, RetentionConfig{})
 	for _, name := range []string{"../aifar-control-plane-bad.db", "C:\\tmp\\aifar-control-plane-bad.db", "other.db"} {
 		if _, _, err := svc.DeleteDatabaseBackups(t.TempDir(), []string{name}); err == nil {
 			t.Fatalf("expected unsafe backup name %q to be rejected", name)

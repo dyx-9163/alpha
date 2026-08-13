@@ -42,16 +42,23 @@ func (m *Manager) collectLiveServers(ctx context.Context) error {
 	scheduled := 0
 schedule:
 	for _, server := range servers {
+		if !m.tryStart("server:" + server.ID) {
+			continue
+		}
 		select {
 		case jobs <- server:
 			scheduled++
 		case <-ctx.Done():
+			m.finish("server:" + server.ID)
 			break schedule
 		}
 	}
 	close(jobs)
 	wg.Wait()
 	close(results)
+	if scheduled == 0 {
+		return errCollectorFamilyInFlight
+	}
 
 	errs := make([]error, 0)
 	for index := 0; index < scheduled; index++ {
@@ -66,6 +73,7 @@ schedule:
 }
 
 func (m *Manager) collectOneServer(ctx context.Context, public store.Server) error {
+	defer m.finish("server:" + public.ID)
 	status := "available"
 	errText := ""
 	server, err := m.store.GetServer(public.ID, true)

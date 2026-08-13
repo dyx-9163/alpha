@@ -1000,23 +1000,9 @@ func (s *Store) DeleteFinishedTasksBefore(cutoff time.Time) (int, error) {
 	if cutoff.IsZero() {
 		return 0, nil
 	}
-	rows, err := s.db.Query(`select id from tasks where finished_at is not null and finished_at < ? and status in ('success','failed','cancelled','timeout')`, cutoff)
-	if err != nil {
-		return 0, err
-	}
-	defer rows.Close()
-	ids := []string{}
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			return 0, err
-		}
-		ids = append(ids, id)
-	}
-	if err := rows.Err(); err != nil {
-		return 0, err
-	}
-	return s.DeleteTasks(ids)
+	return deleteBeforeInBatches(func() (int, error) {
+		return s.DeleteFinishedTasksBeforeBatch(cutoff, retentionDeleteBatchDefault)
+	})
 }
 
 func (s *Store) ClearTaskLogs(taskID string) error {

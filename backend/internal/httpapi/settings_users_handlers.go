@@ -28,6 +28,7 @@ func (a *API) getSettings(w http.ResponseWriter, r *http.Request) {
 		"authMaxFailures":          a.cfg.AuthMaxFailures,
 		"authLockoutSeconds":       a.cfg.AuthLockoutSeconds,
 		"maxRequestBodyBytes":      a.cfg.MaxRequestBodyBytes,
+		"logRetentionDays":         a.store.GetSetting("logRetentionDays", fmt.Sprintf("%d", a.cfg.LogRetentionDays)),
 		"auditRetentionDays":       a.cfg.AuditRetentionDays,
 		"taskRetentionDays":        a.cfg.TaskRetentionDays,
 		"collectorIntervalSeconds": a.cfg.CollectorIntervalSecs,
@@ -45,14 +46,23 @@ func (a *API) putSettings(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &req) {
 		return
 	}
-	for _, key := range []string{"language", "deploymentConcurrency"} {
+	updates := map[string]string{}
+	for _, key := range []string{"language", "deploymentConcurrency", "logRetentionDays"} {
 		if value, ok := req[key]; ok {
 			if key == "deploymentConcurrency" {
-				_ = a.store.SetSetting(key, fmt.Sprintf("%d", store.NormalizeDeploymentConcurrency(fmt.Sprint(value), a.cfg.DeploymentConcurrency)))
+				updates[key] = fmt.Sprintf("%d", store.NormalizeDeploymentConcurrency(fmt.Sprint(value), a.cfg.DeploymentConcurrency))
 				continue
 			}
-			_ = a.store.SetSetting(key, fmt.Sprint(value))
+			if key == "logRetentionDays" {
+				updates[key] = fmt.Sprintf("%d", store.NormalizeLogRetentionDays(fmt.Sprint(value), a.cfg.LogRetentionDays))
+				continue
+			}
+			updates[key] = fmt.Sprint(value)
 		}
+	}
+	if err := a.store.SetSettings(updates); err != nil {
+		respond(w, nil, err)
+		return
 	}
 	a.audit(r, "settings.update", "panel", "success", i18n.Text(lang, "api.settingsUpdated"))
 	a.getSettings(w, r)

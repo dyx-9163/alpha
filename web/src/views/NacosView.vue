@@ -7,7 +7,6 @@
       </div>
       <div class="head-actions">
         <span v-if="visibleManagementHeaderActions.nacos.includes('connected')" class="status-pill success">{{ t('common.connected') }}</span>
-        <el-button v-if="visibleManagementHeaderActions.nacos.includes('refresh')" @click="load">{{ t('common.refresh') }}</el-button>
       </div>
     </div>
 
@@ -274,6 +273,7 @@ import StatusTag from '../components/StatusTag.vue'
 import { usePermissions } from '../composables/usePermissions'
 import { useI18n } from '../i18n'
 import { permissions } from '../rbac'
+import { installLifecycleDisplayStatus, isInstallLifecycleSelectable, moduleRuntimeGroupStatus, runtimeHealthDisplayStatus } from '../status/semantics'
 import { applyRealtimeStatusToAppInstance, useRealtimeStore } from '../stores/realtime'
 import { useTaskProgressStore } from '../stores/taskProgress'
 import { visibleManagementHeaderActions, visibleManagementTabs } from './managementEntries'
@@ -448,9 +448,9 @@ const nacosCredentials = computed(() => activeCredentials.value.filter((item) =>
 const mysqlCredentials = computed(() => activeCredentials.value.filter((item) => item.kind === 'mysql' || item.kind === 'generic'))
 const redisCredentials = computed(() => activeCredentials.value.filter((item) => item.kind === 'redis' || item.kind === 'generic'))
 const minioCredentials = computed(() => activeCredentials.value.filter((item) => item.kind === 'minio' || item.kind === 'generic'))
-const mysqlConfigInstances = computed(() => liveDatabaseInstances.value.filter((item) => ['mysql', 'mysql-router'].includes(item.app) && item.status !== 'failed'))
-const redisConfigInstances = computed(() => liveDatabaseInstances.value.filter((item) => item.app === 'redis' && item.status !== 'failed'))
-const minioConfigInstances = computed(() => liveStorageInstances.value.filter((item) => item.app === 'minio' && item.status !== 'failed'))
+const mysqlConfigInstances = computed(() => liveDatabaseInstances.value.filter((item) => ['mysql', 'mysql-router'].includes(item.app) && isInstallLifecycleSelectable({ status: item.status, metadata: metadataOf(item) })))
+const redisConfigInstances = computed(() => liveDatabaseInstances.value.filter((item) => item.app === 'redis' && isInstallLifecycleSelectable({ status: item.status, metadata: metadataOf(item) })))
+const minioConfigInstances = computed(() => liveStorageInstances.value.filter((item) => item.app === 'minio' && isInstallLifecycleSelectable({ status: item.status, metadata: metadataOf(item) })))
 const nacosConfigInstanceOptions = computed(() => nacosGroups.value.flatMap((group) => group.nodes.map((node) => ({
   value: node.instance.id,
   label: `${group.title} / ${node.endpoint}`
@@ -769,17 +769,7 @@ function nacosClusterKey(item: AppInstance, metadata: InstanceMetadata) {
 }
 
 function nacosGroupStatus(nodes: NacosNode[]) {
-  const statuses = nodes.map((node) => node.status)
-  if (!statuses.length) return 'unknown'
-  if (statuses.some((status) => ['checking', 'probing', 'pending', 'deploying'].includes(status))) return 'checking'
-  if (statuses.every(isHealthyStatus)) return 'running'
-  if (statuses.some(isHealthyStatus)) return 'degraded'
-  if (statuses.some((status) => ['unavailable', 'failed', 'error', 'missing', 'stopped'].includes(status))) return 'unavailable'
-  return statuses[0] || 'unknown'
-}
-
-function isHealthyStatus(status: string) {
-  return ['ok', 'success', 'installed', 'running', 'available'].includes(status)
+  return moduleRuntimeGroupStatus(nodes.map((node) => node.status))
 }
 
 function isUnavailable(status: string) {
@@ -791,10 +781,7 @@ function displayInstanceStatus(item: AppInstance) {
   if (isInstallFailedInstance(item, metadata)) {
     return 'failed'
   }
-  if (['running', 'failed', 'error', 'unavailable', 'stopped', 'missing'].includes(item.status)) {
-    return displayHealthStatus(item.status)
-  }
-  return item.status === 'installed' ? 'checking' : item.status || 'unknown'
+  return runtimeHealthDisplayStatus(item.status)
 }
 
 function isInstallFailedGroup(group: NacosGroup) {
@@ -802,15 +789,7 @@ function isInstallFailedGroup(group: NacosGroup) {
 }
 
 function isInstallFailedInstance(item: AppInstance, metadata: InstanceMetadata) {
-  return String(item.status || '').trim().toLowerCase() === 'install_failed' || truthyValue(metadata.installFailed)
-}
-
-function displayHealthStatus(status: unknown) {
-  const normalized = stringValue(status).toLowerCase()
-  if (['failed', 'error', 'missing', 'stopped', 'offline', 'unavailable', 'unhealthy', 'down'].includes(normalized)) {
-    return 'unavailable'
-  }
-  return normalized || 'unknown'
+  return installLifecycleDisplayStatus({ status: item.status, metadata }) === 'failed'
 }
 
 function nacosDatabaseSummary(metadata: InstanceMetadata) {

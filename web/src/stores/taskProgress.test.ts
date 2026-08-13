@@ -120,4 +120,21 @@ describe('task progress polling modes', () => {
     expect(apiGetMock).toHaveBeenCalledWith('/tasks/task-known')
     store.dismiss('task-known')
   })
+
+  it('does not recreate cleared task progress when an in-flight refresh resolves after logout', async () => {
+    let resolveRefresh: (value: unknown) => void = () => {}
+    apiGetMock.mockReturnValueOnce(new Promise((resolve) => {
+      resolveRefresh = resolve
+    }))
+    const store = useTaskProgressStore()
+
+    store.track('task-stale', 'stale task')
+    await vi.runAllTicks()
+    store.clearAll()
+    resolveRefresh({ task: { id: 'task-stale', status: 'running', trackable: true }, steps: [] })
+    await vi.runAllTicks()
+
+    expect(store.items).toEqual([])
+    expect(storage.get('aifar-tracked-tasks')).toBeUndefined()
+  })
 })

@@ -5,20 +5,13 @@
     <div class="retention-actions">
       <el-tooltip :content="disabledReason" :disabled="canManage" placement="top">
         <span>
-          <el-button :loading="backupRunning" :disabled="!canManage" @click="runDatabaseBackup">
+          <el-button data-testid="run-database-backup" :loading="backupRunning" :disabled="!canManage" @click="runDatabaseBackup">
             {{ t('settings.runDatabaseBackup') }}
           </el-button>
         </span>
       </el-tooltip>
-      <el-tooltip :content="disabledReason" :disabled="canManage" placement="top">
-        <span>
-          <el-button type="primary" :loading="retentionRunning" :disabled="!canManage" @click="runRetentionCleanup">
-            {{ t('settings.runRetentionCleanup') }}
-          </el-button>
-        </span>
-      </el-tooltip>
     </div>
-    <span class="subtle-note">{{ t('settings.retentionNote') }}</span>
+    <span class="subtle-note">{{ t('settings.databaseBackupNote') }}</span>
     <DataTable
       class="backup-table"
       :rows="backups as unknown as Record<string, unknown>[]"
@@ -43,7 +36,7 @@
         <div class="backup-actions">
           <el-tooltip :content="disabledReason" :disabled="canManage" placement="top">
             <span>
-              <el-button size="small" :disabled="!canManage" @click="verifyBackup(row.name)">
+              <el-button data-testid="verify-database-backup" size="small" :disabled="!canManage" @click="verifyBackup(row.name)">
                 {{ t('common.check') }}
               </el-button>
             </span>
@@ -82,14 +75,13 @@ import { computed, onMounted, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { apiDelete, apiDownload, apiGet, apiPost } from '../api/client'
 import { useI18n } from '../i18n'
+import { useTaskProgressStore } from '../stores/taskProgress'
 import ConfirmAction from './ConfirmAction.vue'
 import DataTable from './DataTable.vue'
 import KeyValueGrid from './KeyValueGrid.vue'
 
 const props = defineProps<{
   backupDir?: string
-  auditRetentionDays?: number | string
-  taskRetentionDays?: number | string
   canManage: boolean
   disabledReason: string
 }>()
@@ -103,15 +95,13 @@ type DatabaseBackup = {
 }
 
 const { t } = useI18n()
+const taskProgress = useTaskProgressStore()
 const backupRunning = ref(false)
 const backupsLoading = ref(false)
-const retentionRunning = ref(false)
 const backups = ref<DatabaseBackup[]>([])
 
 const maintenanceItems = computed(() => [
-  { key: 'databaseBackupDir', label: t('settings.databaseBackupDir'), value: props.backupDir },
-  { key: 'auditRetentionDays', label: t('settings.auditRetention'), value: formatRetentionDays(props.auditRetentionDays) },
-  { key: 'taskRetentionDays', label: t('settings.taskRetention'), value: formatRetentionDays(props.taskRetentionDays) }
+  { key: 'databaseBackupDir', label: t('settings.databaseBackupDir'), value: props.backupDir }
 ])
 const backupColumns = computed(() => [
   { prop: 'name', label: t('settings.backupName'), width: 280 },
@@ -137,22 +127,6 @@ async function refresh() {
   }
 }
 
-async function runRetentionCleanup() {
-  if (!props.canManage) {
-    ElMessage.warning(props.disabledReason)
-    return
-  }
-  retentionRunning.value = true
-  try {
-    await apiPost('/maintenance/retention/run')
-    ElMessage.success(t('settings.retentionCleanupAccepted'))
-  } catch (err) {
-    ElMessage.error(err instanceof Error ? err.message : t('settings.retentionCleanupFailed'))
-  } finally {
-    retentionRunning.value = false
-  }
-}
-
 async function runDatabaseBackup() {
   if (!props.canManage) {
     ElMessage.warning(props.disabledReason)
@@ -160,9 +134,11 @@ async function runDatabaseBackup() {
   }
   backupRunning.value = true
   try {
-    await apiPost('/maintenance/database-backup/run')
+    const result = await apiPost<{ taskId?: string }>('/maintenance/database-backup/run')
+    if (result.taskId) {
+      taskProgress.track(result.taskId, t('settings.databaseBackups'))
+    }
     ElMessage.success(t('settings.databaseBackupAccepted'))
-    window.setTimeout(() => void refresh(), 800)
   } catch (err) {
     ElMessage.error(err instanceof Error ? err.message : t('settings.databaseBackupFailed'))
   } finally {
@@ -211,19 +187,14 @@ async function verifyBackup(name: unknown) {
     return
   }
   try {
-    await apiPost(`/maintenance/database-backups/${encodeURIComponent(name)}/verify`)
+    const result = await apiPost<{ taskId?: string }>(`/maintenance/database-backups/${encodeURIComponent(name)}/verify`)
+    if (result.taskId) {
+      taskProgress.track(result.taskId, t('settings.databaseBackups'))
+    }
     ElMessage.success(t('settings.backupVerifyAccepted'))
   } catch (err) {
     ElMessage.error(err instanceof Error ? err.message : t('settings.backupVerifyFailed'))
   }
-}
-
-function formatRetentionDays(value: unknown) {
-  const count = Number(value)
-  if (!Number.isFinite(count) || count < 1) {
-    return '-'
-  }
-  return t('settings.days', { count })
 }
 
 function formatBytes(value: unknown) {

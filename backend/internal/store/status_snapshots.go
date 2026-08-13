@@ -174,3 +174,12 @@ func (s *Store) ListStatusSnapshotHistory(scope, resourceID string, limit int) (
 	}
 	return out, rows.Err()
 }
+
+func (s *Store) DeleteStatusSnapshotHistoryBefore(cutoff time.Time) (int, error) {
+	if cutoff.IsZero() {
+		return 0, nil
+	}
+	return deleteBeforeInBatches(func() (int, error) {
+		return s.DeleteStatusSnapshotHistoryBeforeBatch(cutoff, retentionDeleteBatchDefault)
+	})
+}

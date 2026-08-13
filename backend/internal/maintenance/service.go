@@ -18,16 +18,22 @@ type Store interface {
 	BackupDatabase(path string) (int64, string, error)
 	DeleteAuditLogsBefore(cutoff time.Time) (int, error)
 	DeleteFinishedTasksBefore(cutoff time.Time) (int, error)
+	DeleteStatusSnapshotHistoryBefore(cutoff time.Time) (int, error)
+	DeleteAlertEventsBefore(cutoff time.Time) (int, error)
 }
 
 type RetentionConfig struct {
+	LogRetentionDays   int
 	AuditRetentionDays int
 	TaskRetentionDays  int
 }
 
 type RetentionPlan struct {
-	AuditCutoff time.Time
-	TaskCutoff  time.Time
+	LogCutoff           time.Time
+	AuditCutoff         time.Time
+	TaskCutoff          time.Time
+	StatusHistoryCutoff time.Time
+	AlertEventCutoff    time.Time
 }
 
 type DatabaseBackup struct {
@@ -61,11 +67,19 @@ func (s Service) Plan(now time.Time) RetentionPlan {
 		now = time.Now()
 	}
 	plan := RetentionPlan{}
-	if s.cfg.AuditRetentionDays > 0 {
-		plan.AuditCutoff = now.AddDate(0, 0, -s.cfg.AuditRetentionDays)
+	retentionDays := s.cfg.LogRetentionDays
+	if retentionDays <= 0 {
+		retentionDays = s.cfg.TaskRetentionDays
 	}
-	if s.cfg.TaskRetentionDays > 0 {
-		plan.TaskCutoff = now.AddDate(0, 0, -s.cfg.TaskRetentionDays)
+	if retentionDays <= 0 {
+		retentionDays = s.cfg.AuditRetentionDays
+	}
+	if retentionDays > 0 {
+		plan.LogCutoff = now.AddDate(0, 0, -retentionDays)
+		plan.AuditCutoff = plan.LogCutoff
+		plan.TaskCutoff = plan.LogCutoff
+		plan.StatusHistoryCutoff = plan.LogCutoff
+		plan.AlertEventCutoff = plan.LogCutoff
 	}
 	return plan
 }
@@ -82,6 +96,20 @@ func (s Service) CleanupTasks(plan RetentionPlan) (int, error) {
 		return 0, nil
 	}
 	return s.store.DeleteFinishedTasksBefore(plan.TaskCutoff)
+}
+
+func (s Service) CleanupStatusHistory(plan RetentionPlan) (int, error) {
+	if plan.StatusHistoryCutoff.IsZero() {
+		return 0, nil
+	}
+	return s.store.DeleteStatusSnapshotHistoryBefore(plan.StatusHistoryCutoff)
+}
+
+func (s Service) CleanupAlertEvents(plan RetentionPlan) (int, error) {
+	if plan.AlertEventCutoff.IsZero() {
+		return 0, nil
+	}
+	return s.store.DeleteAlertEventsBefore(plan.AlertEventCutoff)
 }
 
 func (s Service) BackupDatabase(dir string, now time.Time) (DatabaseBackup, error) {

@@ -7,7 +7,6 @@
       </div>
       <div class="head-actions">
         <span v-if="visibleManagementHeaderActions.storage.includes('connected')" class="status-pill success">{{ t('common.connected') }}</span>
-        <el-button v-if="visibleManagementHeaderActions.storage.includes('refresh')" @click="load">{{ t('common.refresh') }}</el-button>
       </div>
     </div>
 
@@ -296,6 +295,7 @@ import StatusTag from '../components/StatusTag.vue'
 import { usePermissions } from '../composables/usePermissions'
 import { useI18n } from '../i18n'
 import { permissions } from '../rbac'
+import { installLifecycleDisplayStatus, moduleRuntimeGroupStatus, runtimeHealthDisplayStatus } from '../status/semantics'
 import {
   applyMinioCleanupPolicy,
   fetchMinioCleanupEstimate,
@@ -693,17 +693,8 @@ function bucketsFromMetadata(metadata: InstanceMetadata) {
 }
 
 function storageGroupStatus(nodes: StorageNode[]) {
-  const statuses = nodes.map((node) => node.status)
-  if (!statuses.length) return 'unknown'
-  if (statuses.some((status) => ['checking', 'probing', 'pending'].includes(status))) return 'checking'
-  if (statuses.every(isHealthyStatus)) return 'available'
-  if (statuses.some(isHealthyStatus)) return 'degraded'
-  if (statuses.some((status) => ['unavailable', 'failed', 'error', 'missing', 'stopped'].includes(status))) return 'unavailable'
-  return statuses[0] || 'unknown'
-}
-
-function isHealthyStatus(status: string) {
-  return ['ok', 'success', 'installed', 'running', 'available'].includes(status)
+  const status = moduleRuntimeGroupStatus(nodes.map((node) => node.status))
+  return status === 'running' ? 'available' : status
 }
 
 function isBucketReplication(group: StorageGroup) {
@@ -1007,15 +998,11 @@ function isInstallFailedGroup(group: StorageGroup) {
 }
 
 function isInstallFailedInstance(item: AppInstance, metadata: InstanceMetadata) {
-  return String(item.status || '').trim().toLowerCase() === 'install_failed' || truthyValue(metadata.installFailed)
+  return installLifecycleDisplayStatus({ status: item.status, metadata }) === 'failed'
 }
 
 function displayHealthStatus(status: unknown) {
-  const normalized = stringValue(status).toLowerCase()
-  if (['failed', 'error', 'missing', 'stopped', 'offline', 'unavailable', 'unhealthy', 'down'].includes(normalized)) {
-    return 'unavailable'
-  }
-  return normalized || 'unknown'
+  return runtimeHealthDisplayStatus(status)
 }
 
 function instanceLabel(item: AppInstance) {

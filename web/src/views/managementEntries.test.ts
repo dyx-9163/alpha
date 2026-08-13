@@ -11,11 +11,11 @@ describe('visible management tabs', () => {
     })
   })
 
-  it('uses connected status and refresh in every management page header', () => {
+  it('uses connected status without manual refresh in realtime-backed page headers', () => {
     expect(visibleManagementHeaderActions).toEqual({
-      database: ['connected', 'refresh'],
-      nacos: ['connected', 'refresh'],
-      storage: ['connected', 'refresh']
+      database: ['connected'],
+      nacos: ['connected'],
+      storage: ['connected']
     })
   })
 })

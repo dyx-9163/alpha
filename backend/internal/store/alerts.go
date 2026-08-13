@@ -244,6 +244,15 @@ func (s *Store) AddAlertEvent(event AlertEvent) (AlertEvent, error) {
 	return event, nil
 }
 
+func (s *Store) DeleteAlertEventsBefore(cutoff time.Time) (int, error) {
+	if cutoff.IsZero() {
+		return 0, nil
+	}
+	return deleteBeforeInBatches(func() (int, error) {
+		return s.DeleteAlertEventsBeforeBatch(cutoff, retentionDeleteBatchDefault)
+	})
+}
+
 func normalizeAlert(alert Alert) Alert {
 	alert.Fingerprint = strings.TrimSpace(alert.Fingerprint)
 	alert.Severity = normalizeAlertSeverity(alert.Severity)

@@ -42,10 +42,14 @@
       </el-table-column>
       <el-table-column :label="t('containers.condition')" min-width="190">
         <template #default="{ row }">
-          <div v-if="runtimeConditionReason(row)" class="runtime-condition-cell">
-            <StatusTag :status="aifarRuntimeStatusKind(runtimeDeploymentPhase(row))" :label="runtimeConditionReason(row)?.type || t('containers.runtimePhase.unknown')" />
-            <strong>{{ runtimeConditionReason(row)?.reason }}</strong>
-            <span v-if="runtimeConditionReason(row)?.message" :title="runtimeConditionReason(row)?.message">{{ runtimeConditionReason(row)?.message }}</span>
+          <div v-if="runtimeConditionReason(row, t)" class="runtime-condition-cell">
+            <StatusTag :status="aifarRuntimeStatusKind(runtimeDeploymentPhase(row))" :label="runtimeConditionReason(row, t)?.type || t('containers.runtimePhase.unknown')" />
+            <strong>{{ runtimeConditionReason(row, t)?.reason }}</strong>
+            <span v-if="runtimeConditionReason(row, t)?.message" :title="runtimeConditionReason(row, t)?.message">{{ runtimeConditionReason(row, t)?.message }}</span>
+            <span v-if="runtimeConditionReason(row, t)?.advice" class="runtime-condition-advice">
+              <strong>{{ runtimeConditionReason(row, t)?.advice?.group }}</strong>
+              {{ runtimeConditionReason(row, t)?.advice?.suggestion }}
+            </span>
           </div>
           <div v-else class="runtime-condition-empty">
             <span>{{ t('containers.conditionUnavailable') }}</span>
@@ -54,7 +58,7 @@
         </template>
       </el-table-column>
       <el-table-column :label="t('containers.lastTransition')" min-width="170">
-        <template #default="{ row }">{{ formatDate(runtimeConditionReason(row)?.lastTransitionTime || row.lastTransitionAt) }}</template>
+        <template #default="{ row }">{{ formatDate(runtimeConditionReason(row, t)?.lastTransitionTime || row.lastTransitionAt) }}</template>
       </el-table-column>
       <el-table-column prop="podRevision" :label="t('containers.revision')" min-width="180" show-overflow-tooltip />
       <el-table-column prop="image" :label="t('containers.image')" min-width="240" show-overflow-tooltip />

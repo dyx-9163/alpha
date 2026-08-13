@@ -52,3 +52,25 @@ func TestLoadFallsBackForInvalidMySQLBackupKeepLast(t *testing.T) {
 		})
 	}
 }
+
+func TestLoadDefaultsUnifiedSQLiteLogRetention(t *testing.T) {
+	t.Setenv("AIFAR_LOG_RETENTION_DAYS", "")
+	t.Setenv("AIFAR_AUDIT_RETENTION_DAYS", "")
+	t.Setenv("AIFAR_TASK_RETENTION_DAYS", "")
+
+	got := Load()
+	if got.LogRetentionDays != 90 {
+		t.Fatalf("LogRetentionDays = %d, want unified default 90", got.LogRetentionDays)
+	}
+}
+
+func TestLoadHonorsUnifiedSQLiteLogRetention(t *testing.T) {
+	t.Setenv("AIFAR_LOG_RETENTION_DAYS", "45")
+	t.Setenv("AIFAR_AUDIT_RETENTION_DAYS", "180")
+	t.Setenv("AIFAR_TASK_RETENTION_DAYS", "90")
+
+	got := Load()
+	if got.LogRetentionDays != 45 {
+		t.Fatalf("LogRetentionDays = %d, want configured unified retention", got.LogRetentionDays)
+	}
+}

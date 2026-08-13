@@ -11,7 +11,6 @@
     <el-tabs v-model="activeTab" class="aifar-panel top-tabs">
       <el-tab-pane :label="t('common.all')" name="all" />
       <el-tab-pane :label="t('apps.installed')" name="installed" />
-      <el-tab-pane :label="t('apps.tasks')" name="tasks" />
       <el-tab-pane :label="t('apps.settings')" name="settings" />
     </el-tabs>
 
@@ -100,27 +99,6 @@
       </el-table>
     </div>
 
-    <div v-else-if="activeTab === 'tasks'" class="deployment-records">
-      <section class="record-panel">
-        <div class="record-head">
-          <div>
-            <h2>{{ t('apps.deployedServices') }}</h2>
-            <p>{{ t('apps.deployedServicesHint') }}</p>
-          </div>
-          <el-button size="small" @click="load">{{ t('common.refresh') }}</el-button>
-        </div>
-        <AppInstanceTable
-          :instances="liveInstances"
-          :servers="servers"
-          show-actions
-          :show-check="false"
-          :can-delete="false"
-          :show-delete="false"
-          :disabled-reason="deniedText"
-        />
-      </section>
-    </div>
-
     <div v-else class="empty-panel">
       <p>{{ t('apps.settingsComing') }}</p>
     </div>
@@ -194,19 +172,16 @@ import { installedGroupStatus } from '../apps/installedStatus'
 import { frontendModuleFor } from '../apps/registry/loader'
 import { resolveAppLocale } from '../apps/registry/types'
 import type { AppFrontendModule, AppInstallDialogContext, AppInstallFieldValues, AppInstallModuleOption, AppInstallPayload, AppInstallValidationContext, CredentialOption, ServerOption } from '../apps/registry/contract'
-import AppInstanceTable from '../components/AppInstanceTable.vue'
 import PageShell from '../components/PageShell.vue'
 import StatusTag from '../components/StatusTag.vue'
 import { usePermissions } from '../composables/usePermissions'
 import { useI18n } from '../i18n'
 import { permissions } from '../rbac'
-import { applyRealtimeStatusToAppInstance, useRealtimeStore } from '../stores/realtime'
 import { useTaskProgressStore } from '../stores/taskProgress'
 
 const { t } = useI18n()
 const { can, deniedText } = usePermissions()
 const taskProgress = useTaskProgressStore()
-const realtime = useRealtimeStore()
 const backendCatalog = ref<AppCatalogResponse>({})
 const instances = ref<AppInstanceTableRecord[]>([])
 const servers = ref<ServerOption[]>([])
@@ -222,14 +197,13 @@ const moduleDialogModule = shallowRef<AppFrontendModule | null>(null)
 const locale = computed(() => resolveAppLocale())
 const canManageApps = computed(() => can(permissions.appsManage))
 const canScanResources = computed(() => can(permissions.resourcesScan))
-const liveInstances = computed(() => instances.value.map((instance) => applyRealtimeStatusToAppInstance(instance, realtime.appInstanceSnapshot(instance.id))))
 
 const apps = computed(() => pairedAppCatalog(backendCatalog.value, locale.value))
 const filteredApps = computed(() => (category.value === 'all' ? apps.value : apps.value.filter((app) => app.category === category.value)))
 const moduleDialogComponent = computed<Component | null>(() => moduleDialogModule.value?.installDialog ?? null)
 const installDialogContext = computed<AppInstallDialogContext>(() => ({
   servers: servers.value,
-  instances: liveInstances.value,
+  instances: instances.value,
   credentials: credentials.value,
   defaultDeployDir: appSettings.value.defaultDeployDir || '/aifar/apps',
   installModules: installModules.value
@@ -277,7 +251,7 @@ type UninstallServer = {
   label: string
 }
 
-const installedGroups = computed(() => buildInstalledGroups(liveInstances.value))
+const installedGroups = computed(() => buildInstalledGroups(instances.value))
 const uninstallDialogVisible = ref(false)
 const uninstallSubmitting = ref(false)
 const pendingUninstallGroup = ref<InstalledAppGroup | null>(null)
@@ -408,7 +382,7 @@ function installTargetConflictReason(app: AppStoreItem | null, context: AppInsta
   }
   const targetIds = new Set(context.selectedServers.map((server) => server.id))
   const relatedApps = lifecycleRawAppNames(app.installName || app.name)
-  const conflicts = liveInstances.value.filter((instance) => {
+  const conflicts = instances.value.filter((instance) => {
     return targetIds.has(String(instance.serverId || '')) && relatedApps.has(String(instance.app || '').toLowerCase())
   })
   if (!conflicts.length) {
@@ -509,9 +483,10 @@ async function rescan() {
     ElMessage.warning(deniedText.value)
     return
   }
-  await apiPost('/resources/rescan')
-  backendCatalog.value = await apiGet<AppCatalogResponse>(`/apps/catalog?lang=${locale.value}`).catch(() => ({}))
-  await loadInstallModules()
+  const result = await apiPost<{ taskId?: string }>('/resources/rescan')
+  if (result.taskId) {
+    taskProgress.track(result.taskId, t('toolbox.rescan'))
+  }
 }
 
 async function loadInstallModules() {
@@ -846,41 +821,12 @@ onMounted(load)
 }
 
 .table-panel,
-.empty-panel,
-.record-panel {
+.empty-panel {
   background: var(--aifar-surface);
   border: 1px solid var(--aifar-border);
   border-radius: var(--aifar-radius-lg);
   box-shadow: var(--aifar-shadow-card);
   padding: 10px;
-}
-
-.deployment-records {
-  display: grid;
-  gap: 12px;
-  min-width: 0;
-}
-
-.record-head {
-  display: flex;
-  justify-content: space-between;
-  align-items: flex-start;
-  gap: 12px;
-  margin-bottom: 10px;
-}
-
-.record-head h2 {
-  margin: 0;
-  color: var(--aifar-ink);
-  font-size: 15px;
-  line-height: 22px;
-  font-weight: 850;
-}
-
-.record-head p {
-  margin: 3px 0 0;
-  color: var(--aifar-text-secondary);
-  font-size: 12px;
 }
 
 .installed-groups-table {

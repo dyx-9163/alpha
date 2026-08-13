@@ -5,7 +5,6 @@
         <h1 class="page-title">{{ t('dashboard.title') }}</h1>
         <p class="page-subtitle">{{ t('dashboard.subtitle') }}</p>
       </div>
-      <el-button :loading="loading" @click="load">{{ t('common.refresh') }}</el-button>
     </div>
 
     <div class="snapshot-bar">
@@ -136,8 +135,10 @@ import { keepPreviousArrayOnLoadFailure } from '../api/resilientLoad'
 import MetricGrid from '../components/MetricGrid.vue'
 import StatusTag from '../components/StatusTag.vue'
 import { createDashboardRealtimeRefreshScheduler, shouldRefreshDashboardForRealtimeEvent } from '../dashboard/realtimeRefresh'
+import { normalizeDashboardRuntimeStatus, normalizeDashboardServerStatus } from '../dashboard/serverStatus'
 import { useI18n } from '../i18n'
 import { permissions } from '../rbac'
+import { applyRealtimeStatusToServer } from '../servers/realtimeStatus'
 import { useAlertsStore, type AlertItem } from '../stores/alerts'
 import { applyRealtimeStatusToAppInstance, useRealtimeStore } from '../stores/realtime'
 import { useSessionStore } from '../stores/session'
@@ -150,23 +151,22 @@ const servers = ref<any[]>([])
 const tasks = ref<any[]>([])
 const databaseInstances = ref<any[]>([])
 const storageInstances = ref<any[]>([])
-const telemetryByServer = ref<Record<string, any>>({})
 const loading = ref(false)
 const now = ref('')
 
-const serverRows = computed(() => servers.value.map((server) => {
-  const telemetry = telemetryByServer.value[server.id]
+const serverRows = computed(() => servers.value.map((rawServer) => {
+  const server = applyRealtimeStatusToServer(rawServer, realtime.serverSnapshot(rawServer.id))
   return {
     ...server,
-    status: dashboardServerStatus(server.status, telemetry),
-    cpu: telemetry?.cpu ?? 0,
-    cpuText: telemetry?.cpuText ?? '-',
-    memory: telemetry?.memory ?? 0,
-    memoryText: telemetry?.memoryText ?? '-',
-    disk: telemetry?.disk ?? 0,
-    diskText: telemetry?.diskText ?? '-',
-    diskPath: telemetry?.diskPath ?? server.deployDir ?? '-',
-    sampledAtText: formatTime(telemetry?.sampledAt)
+    status: normalizeDashboardServerStatus(server.status),
+    cpu: 0,
+    cpuText: '-',
+    memory: 0,
+    memoryText: '-',
+    disk: 0,
+    diskText: '-',
+    diskPath: server.deployDir ?? '-',
+    sampledAtText: '-'
   }
 }))
 const dockerRows = computed(() => servers.value
@@ -175,16 +175,17 @@ const dockerRows = computed(() => servers.value
     const snapshot = realtime.dockerSummarySnapshot(server.id)
     const result = snapshot?.payload ?? {}
     const summary = objectRecord(result.summary)
+    const runtimeStatus = normalizeDashboardRuntimeStatus(snapshot?.status || result.status)
     return {
       ...server,
-      available: Boolean(result.available) && snapshot?.status !== 'failed',
+      available: Boolean(result.available) && runtimeStatus === 'running',
       containers: summary.containers ?? 0,
       images: summary.images ?? 0,
       dockerHost: summary.endpoint || result.endpoint || server.dockerHost
     }
   }))
-const liveDatabaseInstances = computed(() => databaseInstances.value.map((instance) => applyRealtimeStatusToAppInstance(instance, realtime.appInstanceSnapshot(instance.id))))
-const liveStorageInstances = computed(() => storageInstances.value.map((instance) => applyRealtimeStatusToAppInstance(instance, realtime.appInstanceSnapshot(instance.id))))
+const liveDatabaseInstances = computed(() => databaseInstances.value.map((instance) => normalizeDashboardRuntimeInstance(applyRealtimeStatusToAppInstance(instance, realtime.appInstanceSnapshot(instance.id)))))
+const liveStorageInstances = computed(() => storageInstances.value.map((instance) => normalizeDashboardRuntimeInstance(applyRealtimeStatusToAppInstance(instance, realtime.appInstanceSnapshot(instance.id)))))
 const availableServers = computed(() => serverRows.value.filter((server) => server.status === 'available').length)
 const runningTasks = computed(() => tasks.value.filter((task) => task.status === 'running').length)
 const runningDockerHosts = computed(() => dockerRows.value.filter((row) => row.available).length)
@@ -216,7 +217,11 @@ function metricWidth(value: unknown) {
   return `${Math.min(Math.max(n, 0), 100)}%`
 }
 
-async function load() {
+type DashboardLoadOptions = {
+  hydrateSnapshots?: boolean
+}
+
+async function load(options: DashboardLoadOptions = {}) {
   loading.value = true
   now.value = new Date().toLocaleString()
   try {
@@ -230,53 +235,27 @@ async function load() {
     tasks.value = taskList
     databaseInstances.value = databaseList
     storageInstances.value = storageList
-    await Promise.all([
-      loadTelemetry(),
+    const loads: Array<Promise<unknown>> = [
+      options.hydrateSnapshots ? realtime.loadStatusSnapshots().catch(() => false) : Promise.resolve(),
       canViewAlerts.value ? alerts.load().catch(() => undefined) : Promise.resolve()
-    ])
+    ]
+    await Promise.all(loads)
   } finally {
     loading.value = false
   }
 }
 
-async function loadTelemetry() {
-  const entries = await Promise.all(servers.value.map(async (server) => {
-    const telemetry = await apiGet<any>(`/servers/${encodeURIComponent(server.id)}/telemetry`).catch((err) => ({
-      status: 'unavailable',
-      error: err?.message ?? String(err)
-    }))
-    return [server.id, telemetry] as const
-  }))
-  telemetryByServer.value = Object.fromEntries(entries)
-}
-
 const realtimeRefresh = createDashboardRealtimeRefreshScheduler(load)
 
-function dashboardServerStatus(status: unknown, telemetry: any) {
-  if (hasValidSampleTime(telemetry?.sampledAt)) return 'available'
-  if (telemetry) return 'unavailable'
-  const normalized = normalizeStatus(status)
-  if (isUnavailableStatus(normalized)) return 'unavailable'
-  if (['probing', 'checking'].includes(normalized)) return normalized
-  if (['available', 'running', 'success', 'ok'].includes(normalized)) return 'unknown'
-  return normalized || 'unknown'
-}
-
-function hasValidSampleTime(value: unknown) {
-  if (!value) return false
-  return !Number.isNaN(new Date(String(value)).getTime())
-}
-
-function normalizeStatus(status: unknown) {
-  return String(status ?? '').trim().toLowerCase()
-}
-
-function isUnavailableStatus(status: string) {
-  return ['failed', 'error', 'unavailable', 'unhealthy', 'no-endpoints', 'down', 'offline'].includes(status)
-}
-
 function isRunningStatus(status: unknown) {
-  return ['running', 'available', 'success'].includes(String(status ?? '').toLowerCase())
+  return normalizeDashboardRuntimeStatus(status) === 'running'
+}
+
+function normalizeDashboardRuntimeInstance<T extends { status?: unknown }>(instance: T) {
+  return {
+    ...instance,
+    status: normalizeDashboardRuntimeStatus(instance.status)
+  }
 }
 
 function objectRecord(value: unknown): Record<string, any> {
@@ -324,7 +303,9 @@ watch(() => realtime.connectedAt, () => {
   }
 })
 
-onMounted(load)
+onMounted(() => {
+  void load({ hydrateSnapshots: true })
+})
 onBeforeUnmount(() => {
   realtimeRefresh.dispose()
 })

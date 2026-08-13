@@ -5,7 +5,7 @@ export const visibleManagementTabs = {
 } as const
 
 export const visibleManagementHeaderActions = {
-  database: ['connected', 'refresh'],
-  nacos: ['connected', 'refresh'],
-  storage: ['connected', 'refresh']
+  database: ['connected'],
+  nacos: ['connected'],
+  storage: ['connected']
 } as const

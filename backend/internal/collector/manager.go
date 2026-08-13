@@ -24,6 +24,8 @@ type AlertEvaluator interface {
 	Evaluate(context.Context) error
 }
 
+var errCollectorFamilyInFlight = errors.New("collector family has in-flight work")
+
 type Manager struct {
 	store                  *store.Store
 	events                 Publisher
@@ -38,6 +40,8 @@ type Manager struct {
 	dockerSummaryForServer func(context.Context, store.Server) (adapter.DockerSummary, error)
 	dockerSummaryWorkers   int
 	startedCh              chan struct{}
+	activeMu               sync.Mutex
+	active                 map[string]struct{}
 }
 
 func NewManager(s *store.Store, events Publisher, interval time.Duration) *Manager {
@@ -56,6 +60,7 @@ func NewManager(s *store.Store, events Publisher, interval time.Duration) *Manag
 		dockerSummaryForServer: adapter.DockerSummaryForServer,
 		dockerSummaryWorkers:   8,
 		startedCh:              make(chan struct{}),
+		active:                 map[string]struct{}{},
 	}
 }
 
@@ -77,7 +82,7 @@ func (m *Manager) Start(ctx context.Context) {
 	}
 	go func() {
 		close(m.startedCh)
-		m.RunOnce(ctx)
+		go m.RunOnce(ctx)
 		ticker := time.NewTicker(m.interval)
 		defer ticker.Stop()
 		for {
@@ -85,7 +90,7 @@ func (m *Manager) Start(ctx context.Context) {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				m.RunOnce(ctx)
+				go m.RunOnce(ctx)
 			}
 		}
 	}()
@@ -95,22 +100,66 @@ func (m *Manager) RunOnce(ctx context.Context) {
 	if m == nil || m.store == nil {
 		return
 	}
-	m.run(ctx, "servers", m.collectServers)
-	m.run(ctx, "docker.summary", m.collectDockerSummaries)
-	m.run(ctx, "app.instances", m.collectAppInstances)
-	m.run(ctx, "aifar.runtime", m.collectAIFARRuntime)
+	var wg sync.WaitGroup
+	for _, item := range []struct {
+		name string
+		fn   func(context.Context) error
+	}{
+		{name: "servers", fn: m.collectServers},
+		{name: "docker.summary", fn: m.collectDockerSummaries},
+		{name: "app.instances", fn: m.collectAppInstances},
+		{name: "aifar.runtime", fn: m.collectAIFARRuntime},
+	} {
+		wg.Add(1)
+		go func(name string, fn func(context.Context) error) {
+			defer wg.Done()
+			m.run(ctx, name, fn)
+		}(item.name, item.fn)
+	}
+	wg.Wait()
 	if m.alerts != nil {
 		_ = m.alerts.Evaluate(ctx)
 	}
 }
 
-func (m *Manager) run(ctx context.Context, name string, fn func(context.Context) error) {
+func (m *Manager) tryStart(key string) bool {
+	if m == nil {
+		return false
+	}
+	m.activeMu.Lock()
+	defer m.activeMu.Unlock()
+	if m.active == nil {
+		m.active = map[string]struct{}{}
+	}
+	if _, exists := m.active[key]; exists {
+		return false
+	}
+	m.active[key] = struct{}{}
+	return true
+}
+
+func (m *Manager) finish(key string) {
+	if m == nil {
+		return
+	}
+	m.activeMu.Lock()
+	delete(m.active, key)
+	m.activeMu.Unlock()
+}
+
+func (m *Manager) run(ctx context.Context, name string, fn func(context.Context) error) error {
 	startedAt := time.Now()
 	_ = m.store.UpsertCollectorRun(store.CollectorRun{Name: name, Status: "running", StartedAt: startedAt, UpdatedAt: startedAt})
 	if m.events != nil {
 		m.events.Publish(realtime.Event{Type: "collector.run.started", Resource: name, Status: "running"})
 	}
 	err := fn(ctx)
+	if errors.Is(err, errCollectorFamilyInFlight) {
+		if m.events != nil {
+			m.events.Publish(realtime.Event{Type: "collector.run.skipped", Resource: name, Status: "running", Payload: map[string]any{"reason": "in-flight"}})
+		}
+		return nil
+	}
 	finishedAt := time.Now()
 	status := "success"
 	errText := ""
@@ -134,10 +183,27 @@ func (m *Manager) run(ctx context.Context, name string, fn func(context.Context)
 		}
 		m.events.Publish(realtime.Event{Type: eventType, Resource: name, Status: status, Payload: map[string]any{"durationMs": finishedAt.Sub(startedAt).Milliseconds(), "error": errText}})
 	}
+	return err
 }
 
 func (m *Manager) collectServers(ctx context.Context) error {
 	return m.collectLiveServers(ctx)
+}
+
+func (m *Manager) runCollectServers(ctx context.Context) error {
+	return m.run(ctx, "servers", m.collectServers)
+}
+
+func (m *Manager) runCollectDockerSummaries(ctx context.Context) error {
+	return m.run(ctx, "docker.summary", m.collectDockerSummaries)
+}
+
+func (m *Manager) runCollectAppInstances(ctx context.Context) error {
+	return m.run(ctx, "app.instances", m.collectAppInstances)
+}
+
+func (m *Manager) runCollectAIFARRuntime(ctx context.Context) error {
+	return m.run(ctx, "aifar.runtime", m.collectAIFARRuntime)
 }
 
 func (m *Manager) collectDockerSummaries(ctx context.Context) error {
@@ -167,7 +233,12 @@ func (m *Manager) collectDockerSummaries(ctx context.Context) error {
 	sem := make(chan struct{}, workers)
 	results := make(chan string, len(targets))
 	var wg sync.WaitGroup
+	scheduled := 0
 	for _, server := range targets {
+		if !m.tryStart("docker.summary:" + server.ID) {
+			continue
+		}
+		scheduled++
 		wg.Add(1)
 		go func(server store.Server) {
 			defer wg.Done()
@@ -182,6 +253,9 @@ func (m *Manager) collectDockerSummaries(ctx context.Context) error {
 	}
 	wg.Wait()
 	close(results)
+	if scheduled == 0 {
+		return errCollectorFamilyInFlight
+	}
 	var failures []string
 	for failure := range results {
 		if failure != "" {
@@ -195,6 +269,7 @@ func (m *Manager) collectDockerSummaries(ctx context.Context) error {
 }
 
 func (m *Manager) collectOneDockerSummary(ctx context.Context, server store.Server) string {
+	defer m.finish("docker.summary:" + server.ID)
 	child, cancel := context.WithTimeout(ctx, m.dockerSummaryTimeout)
 	summary, err := m.dockerSummaryForServer(child, server)
 	cancel()
@@ -238,6 +313,8 @@ func (m *Manager) collectAppInstances(ctx context.Context) error {
 	}
 	errCh := make(chan string, len(instances))
 	var wg sync.WaitGroup
+	candidates := 0
+	scheduled := 0
 	for _, instance := range instances {
 		app := strings.ToLower(strings.TrimSpace(instance.App))
 		if app == "" || strings.TrimSpace(instance.ServerID) == "" {
@@ -251,6 +328,11 @@ func (m *Manager) collectAppInstances(ctx context.Context) error {
 		if !ok {
 			continue
 		}
+		candidates++
+		if !m.tryStart("app.instance:" + instance.ID) {
+			continue
+		}
+		scheduled++
 		wg.Add(1)
 		go func(instance store.AppInstance, checkModule registry.CheckModule) {
 			defer wg.Done()
@@ -261,6 +343,9 @@ func (m *Manager) collectAppInstances(ctx context.Context) error {
 	}
 	wg.Wait()
 	close(errCh)
+	if candidates > 0 && scheduled == 0 {
+		return errCollectorFamilyInFlight
+	}
 	var failures []string
 	for failure := range errCh {
 		failures = append(failures, failure)
@@ -277,6 +362,7 @@ type appInstanceCheckResult struct {
 }
 
 func (m *Manager) collectOneAppInstance(ctx context.Context, instance store.AppInstance, checkModule registry.CheckModule) error {
+	defer m.finish("app.instance:" + instance.ID)
 	server, err := m.store.GetServer(instance.ServerID, true)
 	if err != nil {
 		errText := logmask.Mask(err.Error())
@@ -396,43 +482,61 @@ func (m *Manager) collectAIFARRuntime(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	candidates := 0
+	scheduled := 0
 	for _, instance := range instances {
 		if strings.TrimSpace(instance.App) != "aifar" {
 			continue
 		}
-		deployments, _ := m.store.ListAIFARDeployments(instance.ID)
-		pods, _ := m.store.ListAIFARPods(instance.ID)
-		endpoints, _ := m.store.ListAIFARServiceEndpoints(instance.ID)
-		status := summarizeAIFARStatus(instance.Status, deployments, pods, endpoints)
-		desiredReplicas := countDesiredReplicas(deployments)
-		if desiredReplicas > 0 {
-			if dockerSnapshot, err := m.store.GetStatusSnapshot("docker.summary", instance.ServerID); err == nil && strings.EqualFold(dockerSnapshot.Status, "failed") {
-				status = "no-endpoints"
-			}
+		candidates++
+		if !m.tryStart("aifar.runtime:" + instance.ID) {
+			continue
 		}
-		payload := map[string]any{
-			"instanceId":      instance.ID,
-			"serverId":        instance.ServerID,
-			"version":         instance.Version,
-			"status":          status,
-			"appStatus":       instance.Status,
-			"deployments":     len(deployments),
-			"pods":            len(pods),
-			"readyPods":       countReadyPods(pods),
-			"activeEndpoints": countActiveEndpoints(endpoints),
-			"desiredReplicas": desiredReplicas,
-			"updatedAt":       instance.UpdatedAt,
-		}
-		if err := m.saveSnapshot(ctx, store.StatusSnapshot{
-			Scope:       "aifar.runtime",
-			ResourceID:  instance.ID,
-			ServerID:    instance.ServerID,
-			Status:      status,
-			Payload:     marshalPayload(payload),
-			CollectedAt: time.Now(),
-		}); err != nil {
+		scheduled++
+		if err := m.collectOneAIFARRuntime(ctx, instance); err != nil {
 			return err
 		}
+	}
+	if candidates > 0 && scheduled == 0 {
+		return errCollectorFamilyInFlight
+	}
+	return nil
+}
+
+func (m *Manager) collectOneAIFARRuntime(ctx context.Context, instance store.AppInstance) error {
+	defer m.finish("aifar.runtime:" + instance.ID)
+	deployments, _ := m.store.ListAIFARDeployments(instance.ID)
+	pods, _ := m.store.ListAIFARPods(instance.ID)
+	endpoints, _ := m.store.ListAIFARServiceEndpoints(instance.ID)
+	status := summarizeAIFARStatus(instance.Status, deployments, pods, endpoints)
+	desiredReplicas := countDesiredReplicas(deployments)
+	if desiredReplicas > 0 {
+		if dockerSnapshot, err := m.store.GetStatusSnapshot("docker.summary", instance.ServerID); err == nil && strings.EqualFold(dockerSnapshot.Status, "failed") {
+			status = "no-endpoints"
+		}
+	}
+	payload := map[string]any{
+		"instanceId":      instance.ID,
+		"serverId":        instance.ServerID,
+		"version":         instance.Version,
+		"status":          status,
+		"appStatus":       instance.Status,
+		"deployments":     len(deployments),
+		"pods":            len(pods),
+		"readyPods":       countReadyPods(pods),
+		"activeEndpoints": countActiveEndpoints(endpoints),
+		"desiredReplicas": desiredReplicas,
+		"updatedAt":       instance.UpdatedAt,
+	}
+	if err := m.saveSnapshot(ctx, store.StatusSnapshot{
+		Scope:       "aifar.runtime",
+		ResourceID:  instance.ID,
+		ServerID:    instance.ServerID,
+		Status:      status,
+		Payload:     marshalPayload(payload),
+		CollectedAt: time.Now(),
+	}); err != nil {
+		return err
 	}
 	return nil
 }

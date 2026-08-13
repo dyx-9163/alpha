@@ -39,8 +39,16 @@
             <DataMaintenancePanel
               ref="maintenancePanel"
               :backup-dir="form.databaseBackupDir"
-              :audit-retention-days="form.auditRetentionDays"
-              :task-retention-days="form.taskRetentionDays"
+              :can-manage="canManageSettings"
+              :disabled-reason="deniedText"
+            />
+          </div>
+        </el-tab-pane>
+
+        <el-tab-pane :label="t('settings.logMaintenance')" name="logs">
+          <div class="settings-tab-pane">
+            <LogMaintenancePanel
+              :log-retention-days="form.logRetentionDays"
               :can-manage="canManageSettings"
               :disabled-reason="deniedText"
             />
@@ -99,6 +107,7 @@ import { apiGet, apiPut } from '../api/client'
 import ControlPlaneHealthPanel from '../components/ControlPlaneHealthPanel.vue'
 import DataMaintenancePanel from '../components/DataMaintenancePanel.vue'
 import KeyValueGrid from '../components/KeyValueGrid.vue'
+import LogMaintenancePanel from '../components/LogMaintenancePanel.vue'
 import UserManagementPanel from '../components/UserManagementPanel.vue'
 import { usePermissions } from '../composables/usePermissions'
 import { useI18n } from '../i18n'

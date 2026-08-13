@@ -458,7 +458,7 @@ describe('MySQL backup and restore surfaces', () => {
         recordedAt: '2026-07-28T02:00:00Z'
       }
     })
-    await action('Refresh').trigger('click')
+    await databaseSetupState(wrapper).load()
     await flushPromises()
     const backupDialog = wrapper.findComponent(MySQLBackupDialog)
     expect(backupDialog.props('submissionAllowed')).toBe(false)
@@ -562,8 +562,7 @@ describe('MySQL backup and restore surfaces', () => {
       const { clusterId: _clusterId, ...standaloneMarker } = confirmedMarker
       currentMarker = { ...standaloneMarker, scope: 'standalone' } as typeof confirmedMarker
     }
-    const refresh = wrapper.findAllComponents(ElButton).find((button) => button.text() === 'Refresh')!
-    await refresh.trigger('click')
+    await databaseSetupState(wrapper).load()
     await flushPromises()
     apiPost.mockReset()
     await clearActions().at(-1)!.trigger('click')

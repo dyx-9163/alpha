@@ -7,7 +7,6 @@
       </div>
       <div class="head-actions">
         <span v-if="visibleManagementHeaderActions.database.includes('connected')" class="status-pill success">{{ t('common.connected') }}</span>
-        <el-button v-if="visibleManagementHeaderActions.database.includes('refresh')" @click="load">{{ t('common.refresh') }}</el-button>
       </div>
     </div>
 
@@ -308,6 +307,7 @@ import {
 } from '../database/mysqlBackup'
 import { useI18n } from '../i18n'
 import { permissions } from '../rbac'
+import { installLifecycleDisplayStatus } from '../status/semantics'
 import { applyRealtimeStatusToAppInstance, useRealtimeStore } from '../stores/realtime'
 import { useSessionStore } from '../stores/session'
 import { useTaskProgressStore } from '../stores/taskProgress'
@@ -1212,8 +1212,7 @@ function isInstallFailedGroup(group: DatabaseGroup) {
 }
 
 function isInstallFailedInstance(instance: AppInstance, metadata: InstanceMetadata) {
-  const status = String(instance.status || '').trim().toLowerCase()
-  return status === 'install_failed' || metadataBool(metadata, 'installFailed')
+  return installLifecycleDisplayStatus({ status: instance.status, metadata }) === 'failed'
 }
 
 function databaseServiceUnavailableText(group: DatabaseGroup) {
