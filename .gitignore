@@ -3,6 +3,8 @@ node_modules/
 .pnpm-store/
 .cache/
 .gocache/
+.tmp-go-cache*/
+backend/.tmp-go-cache*/
 
 # IDE and local workspace files
 .idea/
