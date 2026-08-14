@@ -40,8 +40,7 @@ describe('AIFAR Runtime reconcile entries', () => {
     expect(renderedText.match(/同步运行时/g) ?? []).toHaveLength(1)
     expect(renderedText).toContain('/aifar/apps/admin')
     expect(renderedText).not.toContain('启动/恢复 Pods')
-    expect(renderedText).toContain('刷新')
-    expect(renderedText).toContain('aria-label="刷新"')
+    expect(renderedText).not.toContain('aria-label="刷新"')
     expect(renderedText).toContain('刷新指标')
     expect(renderedText).toContain('服务')
     expect(renderedText).toContain('Endpoint')
@@ -117,7 +116,6 @@ function runtimeContext(): AifarRuntimeContext {
     restartAllAifarRuntime: () => {},
     runtimeCleanupDisabledReason: computed(() => ''),
     cleanupAifarRuntimeStale: () => {},
-    loadAifarRuntime: async () => {},
     aifarRuntimeWarnings: computed(() => []),
     runtimeSummaryItems: computed(() => [
       { label: '实例', value: 'runtime-v2 / admin' },

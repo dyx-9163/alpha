@@ -15,7 +15,7 @@ import type {
   RuntimeLogRow
 } from './types'
 
-export type RuntimeResourceTab = 'deployments' | 'releases' | 'services' | 'pods' | 'logs' | 'ingress'
+export type RuntimeResourceTab = 'deployments' | 'services' | 'pods' | 'logs' | 'ingress'
 
 export type KeyValueItem = {
   key?: string
@@ -60,7 +60,6 @@ export type AifarRuntimeContext = {
   restartAllAifarRuntime: RuntimeAction
   runtimeCleanupDisabledReason: ComputedRef<string>
   cleanupAifarRuntimeStale: RuntimeAction
-  loadAifarRuntime: (force?: boolean, includePods?: boolean, includeStats?: boolean) => Promise<void>
   aifarRuntimeWarnings: ComputedRef<string[]>
   runtimeSummaryItems: ComputedRef<KeyValueItem[]>
   runtimeResourceTab: Ref<RuntimeResourceTab>

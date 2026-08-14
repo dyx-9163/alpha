@@ -17,13 +17,11 @@
           </el-menu-item>
         </el-menu>
         <div class="sidebar-footer">
-          <el-tag type="success" effect="light">{{ t('common.providerReal') }}</el-tag>
           <strong>{{ session.username || 'admin' }}</strong>
           <el-button class="logout-button" @click="logout">{{ t('auth.logout') }}</el-button>
         </div>
       </el-aside>
       <el-main class="content">
-        <GlobalTaskProgress />
         <GlobalAlerts />
         <GlobalRealtimeStatus />
         <div class="content-body">
@@ -44,7 +42,6 @@ import { Box, Coin, Connection, FolderOpened, Key, List, Monitor, Odometer, Oper
 import zhCn from 'element-plus/es/locale/lang/zh-cn'
 import en from 'element-plus/es/locale/lang/en'
 import { useRouter } from 'vue-router'
-import GlobalTaskProgress from './components/GlobalTaskProgress.vue'
 import GlobalAlerts from './components/GlobalAlerts.vue'
 import GlobalRealtimeStatus from './components/GlobalRealtimeStatus.vue'
 import { SESSION_CLEARED_EVENT } from './api/client'

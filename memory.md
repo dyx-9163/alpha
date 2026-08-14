@@ -3,6 +3,30 @@
 
 本文件记录后续对话的精简问题与结论。每次开始先读，结束前追加。禁止写入密码、token、私钥、完整连接串和长日志。
 
+## 2026-08-13
+- 问题：用户指出当前数据库/仪表盘实现与选定 UI 参考图不一致，希望对齐“左侧列表 + 右侧详情/总览卡片”的资源管理风格。
+- 结论：数据库页面补充顶部统计卡片并保留实例列表/详情结构；仪表盘运行状态改为资源类型卡片、选中资源列表和右侧详情区的布局，默认保持服务器类型视角，提醒仍只通过右侧铃铛展示。前端 Vitest 全量通过、`pnpm web:build` 通过；本轮未做浏览器视觉截图 QA，后续按实际截图继续微调。
+- 问题：用户指出数据库页面卡片尤其 MySQL 集群/Redis 单体并排时不美观，单体卡被集群卡高度撑出大量空白，且状态/事实信息显得重复。
+- 结论：数据库实例卡片改为紧凑摘要展示，移除大块事实宫格，卡片网格使用内容自适应高度避免单体被集群撑高；保留卡片右上总体状态和节点行状态，MySQL 集群与 Router 仍在同一组中展示。
+- 问题：用户指出服务器“连接/探测”动作出现在日志审计和任务列表中，且失败后审计状态长期显示运行中；自动探查不应作为人工操作日志。
+- 结论：服务器探测归类为诊断采集，不再写入审计；任务列表默认过滤 `Trackable=false` 的探测/遥测类任务；服务器工作台手动探测不再推送到全局任务提醒，只保留页面局部探测状态并依赖实时状态刷新。
+- 问题：用户要求去掉界面上所有“真实/Provider: 真实/真实模式”类展示。
+- 结论：已移除左侧 Provider 标签、审计 Provider 列、设置页 Provider 状态块，以及数据库/容器/Nacos/对象存储摘要中的 Provider 项；i18n 文案改为中性控制面描述，并用 providerPresentation 前端契约测试锁定不再展示。
+- 问题：用户指出数据库、Nacos、对象存储页面中“服务不可用/失败”状态重复展示，容器页顶部“检查主机/刷新”看起来不像实时状态，AIFAR 运行时不应把发布历史放在运行态页签内。
+- 结论：前端展示约定调整为卡片右上角保留唯一总体状态、节点行保留节点状态，中间事实区不再重复状态或把 endpoint 替换为状态；数据库/Nacos 去掉泛化不可用红色横幅，仅保留安装失败等可行动提示；容器页头去掉手动检查/刷新按钮，状态依赖实时事件和页面数据；AIFAR Runtime 运行态页签移除发布历史入口。
+- 问题：用户指出仪表盘运行状态仍不像阿里云控制台，当前下半区卡片堆叠感强，列表/详情层级不够统一。
+- 结论：仪表盘运行状态区进一步改为控制台式结构：资源类型使用紧凑页签，资源列表增加“资源名称/资源信息/状态”表头并按三列展示，右侧保留固定详情面板；默认服务器、模块顺序、提醒只在铃铛、统一“查看全部资源”等既有规则保持不变。前端 65 文件/487 用例通过，`pnpm web:build` 通过；未做浏览器截图 QA。
+- 问题：用户希望应用安装能力不要继续固定写在代码里，而是拆成可完全自定义的 sh + 配置模板，后续新增服务尽量不修改 AIFAR 核心代码。
+- 结论：推荐设计为“应用包规范 + 通用安装执行器 + 生命周期钩子”：核心只识别 manifest、表单 schema、资源校验、拓扑约束、脚本模板和状态采集契约；每个应用以目录包提供 install/uninstall/check/backup/restore/initdb 等脚本与模板，AIFAR 负责参数渲染、凭据注入、任务/审计/回滚/状态统一，不把具体 MySQL/Redis/Nacos/MinIO 安装逻辑继续写死在代码中。
+- 问题：用户进一步要求应用包设计必须考虑集群，询问是否应做一个类似 etcd 协调能力的独立二进制服务，用于联合安装、资源安装状态查看等。
+- 结论：集群场景不建议只靠单个 sh 模板，应拆成“应用包 + 中央编排器 + 每节点执行代理”。AIFAR Server 负责拓扑计划、锁、任务、审计和全局状态；每台服务器上的可选轻量 agent/runner 负责本地脚本执行、模板落地、资源校验和 15 秒状态上报；etcd 可作为高可用协调后端的可选方案，但不应成为离线单机交付的默认依赖。
+- 问题：用户询问除 etcd 外是否有同类型组件，以及最终应选什么。
+- 结论：对 AIFAR 的集群安装、扩缩容、desired/observed 状态协调、租约锁和 watch 场景，最终推荐集群控制模式选 etcd；Consul 更偏服务发现/健康检查，ZooKeeper 运维栈更重且 Java 依赖明显，NATS JetStream KV 更适合事件流/消息体系，不建议作为强一致协调核心。AIFAR 仍应保留轻量 SQLite 模式，etcd 作为集群控制模式的一等协调后端。
+- 问题：用户询问若服务器上已有 Kubernetes，AIFAR 二进制服务是否可以复用 Kubernetes 的 etcd 做强一致 KV。
+- 结论：技术上只要拿到 endpoint 和证书就能访问，但产品设计上不建议复用 Kubernetes 控制面的 etcd；K8s etcd 保存全部集群状态与敏感数据，访问等同高权限，AIFAR 读写会把两个控制面绑成同一故障域。推荐在同一批物理/虚拟服务器上另起独立 `aifar-etcd` 集群，使用独立端口、数据目录、证书、服务账号、备份和资源限制；仅 PoC 可短期复用并严格 key 前缀/权限/配额。
+- 问题：用户询问阿里云如何设计服务器与服务器内软件之间的纳管关系。
+- 结论：阿里云采用分层模型而非把软件状态直接挂在服务器状态上：ECS 资源控制面以实例 ID/地域/资源组/标签管理服务器生命周期；每台主机一个云助手 Agent 提供出站心跳、命令和文件执行通道；OOS 用模板、任务和扩展程序编排软件安装卸载；配置清单低频盘点应用、服务、文件和版本；云监控或产品专属控制面负责运行健康。AIFAR 可对应为 Server 资源、单个通用 Node Agent、声明式应用包、应用/集群实例及成员关系、独立监控采集与任务审计；软件与服务器是多对多成员关系，不为每个软件复制一个 Agent。
+
 ## 2026-08-04
 - 问题：客户运行约两周后控制面 SQLite 占用约 1 GB，清除任务日志后文件仍未缩小。
 - 结论：当前 collector 默认每 15 秒运行；`app.instance` 快照 payload 含每轮变化的 `updatedAt`，会被判定为变化并持续追加 `status_snapshot_history`，告警证据中的快照时间/版本也会使开放告警持续追加 `alert_events`。这两张历史表未纳入现有审计/任务保留清理；删除 `task_logs` 既不清理它们，也不会自动缩小 SQLite 文件。当前工作区数据库只读核验中，247.6 MB 主库主要由 `status_snapshot_history` 及其索引、`alert_events` 及其索引构成，任务日志可忽略。现场应先用 `dbstat`、行数、`page_count/freelist_count` 和 `quick_check` 确认，再备份、停服、按保留窗口清理两张历史表并执行受控 `VACUUM`/`VACUUM INTO`；长期修复需消除快照 payload 的易变字段、只记录真实状态变化，并为两张历史表增加保留策略。
@@ -1523,3 +1547,76 @@
 - 结论：建议凭证中心升级为凭据版本、引用/影响范围、验证与显式应用任务的控制面方案；默认只改面板保存的加密凭据，不主动修改客户服务密码，客户外部改密后通过验证写新版本并由用户确认是否重生成配置或重启受影响服务。每服务文件模型应通过显式、fail-closed 的旧模型迁移保障平滑：升级前备份和只读扫描，校验 Agent 能力、旧 spec hash、容器 revision/spec-hash、desired=0；迁移仅在 Agent readback 一致后提交，匹配容器不重启。7 月 31 客户版本需要实测 labels/features 是否齐全，否则进入待验证/人工迁移路径。
 - 问题：用户要求把本地能删除的分支全部删除。
 - 结论：已先枚举当前分支、全部本地分支、worktree 占用与已合并状态，仅删除已合并且未被 worktree 占用的本地分支 `codex/aifar-agent-runtime-v2`、`codex/custom-orchestration`、`codex/enterprise-permission-ux`、`main`。保留当前分支 `codex/status-collector-realtime`，以及仍被 `.worktrees/` 占用的 5 个分支；工作区只剩 `memory.md` 本地修改。
+- 问题：用户确认要求本地和远端都只保留 `status-collector-realtime` 分支，其他分支和 worktree 目录删除。
+- 结论：本地已只保留 `codex/status-collector-realtime`，注册 worktree 分支 `codex/operational-history-cleanup`、`codex/runtime-diagnostic-export` 已强制解除并删除本地分支，`.worktrees/` 下 5 个旧目录已清理，远端跟踪引用也只剩 `origin/codex/status-collector-realtime`。真实 GitHub 远端删除因当前机器连接 `github.com:443` 超时未完成；网络恢复后需执行 `git push origin --delete codex/aifar-agent-runtime-v2 codex/custom-orchestration codex/enterprise-permission-ux main`。
+- 问题：用户要求调整仪表盘整体布局，兼容大部分 PC 分辨率，不能遮挡，不能依赖左右滚轮查看数据。
+- 结论：Dashboard 改为响应式卡片/列表布局：顶部 KPI 自适应栅格，关键提醒行可折行，服务器运行指标从固定宽 Element Plus 表格改为每服务器卡片，Docker/数据库/对象存储从固定表格改为自适应小卡片列表；页面保持仅纵向滚动，文本和路径允许断行。新增回归测试锁定不再渲染固定宽表格，并通过全量 web 测试与 web build。
+- 问题：用户指出新版仪表盘服务器卡片不够美观，并建议数据库状态按数据库类型加页签。
+- 结论：Dashboard 第二版收紧视觉：服务器运行指标卡片改为紧凑清单风格，状态标签缩小到标题旁，指标保持等宽压缩展示；数据库状态增加轻量类型筛选，按 All/MySQL/Router/Redis 分组显示，默认全部，避免 MySQL Router、MySQL、Redis 混成长列表。新增数据库类型筛选与紧凑布局回归测试，全量 web 测试与 web build 通过。
+- 问题：用户担心 Dashboard 管理服务器很多时，“服务器运行指标”会随服务器数量一直向下占用页面。
+- 结论：Dashboard 服务器运行指标改为关注优先预览：默认最多显示 5 台服务器，排序优先不可用、未知、未配置 Docker，并显示剩余数量提示和“查看全部服务器”跳转服务器工作台；完整服务器清单交由服务器工作台承载，避免仪表盘被服务器数量无限拉长。验证：pnpm test:web 60 文件/458 测试通过，pnpm web:build 通过，git diff --check 通过。
+- 问题：用户认为 Dashboard 中间展示“关键提醒”明细与右上角铃铛提醒中心职责重复，建议只使用铃铛入口。
+- 结论：Dashboard 已删除“关键提醒”明细卡片和提醒列表，仅在顶部 KPI 保留提醒总数/严重数概览；提醒明细、确认、静默、恢复统一由右上角铃铛提醒中心承载。新增回归测试锁定 Dashboard 不渲染提醒明细，验证：pnpm test:web 60 文件/459 测试通过，pnpm web:build 通过，git diff --check 通过。
+- 问题：用户认为任务进度一直浮在右侧不合适，希望也放入右上角入口，但要和系统提醒区分开。
+- 结论：右上角铃铛升级为“消息中心”，抽屉内分为“系统提醒”和“任务提醒”两个页签；系统提醒保留告警确认/静默/恢复，任务提醒展示最近追踪任务、进度、状态、查看详情和收起，不再使用独立浮动任务条。验证：pnpm test:web 61 文件/460 测试通过，pnpm web:build 通过，git diff --check 通过。
+- 问题：用户要求读取系统提醒，找出与业务完全不符合的提醒并修复。
+- 结论：确认提醒管理器仍按 `app_instances.status=failed/error/unavailable` 直接生成 `app.instance` 不可用提醒，导致运行检查失败、SSH 超时、凭据上下文失败等被重复显示为应用实例系统提醒；同时 AIFAR Runtime 快照若状态为 `no-endpoints` 但 payload 显示 `readyPods >= desiredReplicas` 仍会产生自相矛盾提醒。已改为 `app.instance` 仅对明确安装失败信号（`install_failed`、`metadata.installFailed=true`、`metadata.installState=failed/install_failed`）生成“installation failed”提醒；运行健康问题交由 server/docker/aifar.runtime/collector 快照提醒；自相矛盾的 AIFAR Runtime no-endpoints/degraded 快照会被抑制并自动解析旧提醒。验证：alerts/store 后端包通过，前端消息中心测试、全量 web 测试和 web build 通过，git diff --check 通过。
+- 问题：用户追问系统提醒里的“警告”是否也与实际不符合。
+- 结论：读取当前 SQLite open warning 后确认仅剩 `collector:app.instances` 与 `collector:docker.summary` 两条采集批次失败提醒；这些是后台采集器批次运行噪音，业务对象本身已有 server/docker/app runtime 等独立状态提醒，放入系统提醒会造成重复和误导。已移除 collector run 生成系统提醒的逻辑，旧 collector warning 会在下一轮 Evaluate 中自动 resolved；用户触发的安装/卸载生命周期任务失败 warning 仍保留。验证：alerts/store 后端包通过，前端消息中心测试、全量 web 测试和 web build 通过，git diff --check 通过。
+
+## 2026-08-13
+- 问题：用户要求 Dashboard 底部 Docker、数据库、对象存储状态合并成一行页签展示，自动显示全部/运行中/不可用数量，加入 Nacos，并进一步要求服务器运行指标也合并进去，避免服务器多时继续撑高页面。
+- 结论：Dashboard 已将服务器、Docker、数据库、Nacos、对象存储合并为一个“运行状态”卡片，默认进入服务器页签；每个页签都有全部/运行中/不可用筛选计数。服务器页签只预览前 5 台关注优先主机，并提供“查看全部服务器”跳转，完整清单仍由服务器工作台承载。验证：Dashboard 相关 RED→GREEN 后，pnpm test:web 61 文件/460 测试通过，pnpm web:build 通过，git diff --check 通过。
+
+## 2026-08-13
+- 问题：用户截图指出 Dashboard 统一运行状态卡片里的页签和筛选按钮被撑成竖向大胶囊，样式明显异常。
+- 结论：根因是该卡片作为页面最后一个 workspace-card 被全局样式拉满剩余高度，卡片内部 grid 默认拉伸行高，按钮组又受 flex stretch 影响而被撑高。已为运行状态卡片设置 align-content:start，并给页签和筛选按钮明确横向居中与固定高度，防止再次被拉伸。验证：新增 CSS 契约测试先失败后通过，pnpm test:web 61 文件/461 测试通过，pnpm web:build 通过，git diff --check 通过。
+- 问题：用户确认 Dashboard 第一屏运行状态新设计，要求执行：进入页面即可看到所有运行资源的可用/不可用状态，而不是默认只看服务器页签。
+- 结论：Dashboard 运行状态改为默认“全部异常”视图，上方 6 个资源摘要 tile（全部、服务器、Docker、数据库、Nacos、对象存储）同时展示总数/运行中/不可用；下方预览跨资源不可用清单，分类页签仍可切换查看各类型明细，长列表跳转对应模块。验证：Dashboard 测试 61 文件/462 测试通过，web:build 通过，相关 diff-check 通过。
+- 问题：用户要求 Dashboard “全部”页签不要展示“查看全部资源”，切到具体资源页签后入口文案统一为“查看全部资源”，并且从资源页返回时回到对应页签。
+- 结论：Dashboard 已隐藏“全部”聚合页签的查看入口；服务器、Docker、数据库、Nacos、对象存储页签统一显示“查看全部资源”；切换具体页签会写入 `?runtime=<类型>`，从对应模块返回仪表盘时恢复该页签，切回“全部”会清除该 query。验证：Dashboard 测试 61 文件/463 测试通过，web:build 通过，相关 diff-check 通过。
+- 问题：用户指出 Dashboard 运行状态里单体资源逐条展示可以，但集群资源应按集群合并展示，避免 MySQL/Nacos/MinIO 等集群节点拆成多条重复资源。
+- 结论：Dashboard 已将数据库、Nacos、对象存储运行实例按明确集群身份（clusterId、replicationGroupId、replicaGroupId、groupId、clusterNodes）聚合成逻辑资源行；单体仍独立展示。聚合行显示拓扑、节点数、不可用节点数和服务器摘要，集群内任一节点不可用则该逻辑资源显示不可用；没有明确集群身份的 cluster-shaped 实例不会被误合并。验证：新增 RED→GREEN 聚合与不误合并测试，Dashboard 测试 61 文件/465 测试通过，web:build 通过，diff-check 通过。
+- 问题：用户补充 MySQL 集群和 MySQL Router 是一次安装，应在 Dashboard 同一个集群资源中展示。
+- 结论：Dashboard 聚合规则已调整为：只要有明确共享集群身份，`mysql` 数据节点与 `mysql-router` 会合并为同一逻辑集群资源，不再因 app 名不同拆开；标题展示 `mysql + mysql-router`，节点数包含 Router，不可用节点数按所有成员计算。没有共享集群身份的实例仍不合并。验证：新增 MySQL+Router RED→GREEN 测试，Dashboard 测试 61 文件/466 测试通过，web:build 通过，diff-check 通过。
+- 问题：用户认为 Dashboard 运行状态里的“全部”大卡片容易误认为一种资源类型，建议去掉但保留统计。
+- 结论：Dashboard 不再把“全部”渲染成可点击资源类型页签；入口默认仍展示跨资源不可用预览，上方改为轻量总览条展示总资源、运行中、不可用数量。资源类型页签仅保留服务器、Docker、数据库、Nacos、对象存储。验证：Dashboard 相关 web 测试 467/467 通过，web:build 通过，diff-check 通过。
+- 问题：用户要求 Dashboard 整页视觉与“运行状态”卡片统一，左侧导航也统一。
+- 结论：统一全局样式：左侧导航 active/hover 改为浅蓝选中卡片、主色边框和柔和阴影；顶部 KPI 卡片改为浅蓝边框/淡渐变和胶囊 note，整体视觉向运行状态卡片收敛。新增样式契约测试；web 测试 62 文件/469 测试通过，web build 通过，diff-check 通过。
+- 问题：用户要求 Dashboard 展示顺序与各模块一致、进入仪表盘默认选中服务器，并继续统一全局页面风格。
+- 结论：Dashboard 默认运行状态页签改为服务器；资源卡片顺序保持服务器、Docker、数据库、Nacos、对象存储，服务器列表按服务器工作台原顺序展示，不再异常优先重排；全局卡片面统一为浅蓝边框/淡渐变，左侧导航和 KPI/列表视觉继续向运行状态卡片收敛。新增/更新前端契约测试；web 测试 62 文件/473 测试通过，web build 通过，diff-check 通过。
+
+- 问题：用户指出容器页进入或切换时 Network 中持续出现 /containers/aifar/runtime、/containers?kind=images 等 pending 请求，要求不要浏览器实时刷新，而是按后端 15 秒采集推送更新。
+- 结论：容器页自动路径改为只读取 realtime store 中的 /status/snapshots 与 SSE 快照；onMounted、服务器切换、页签切换和 AIFAR runtime 状态事件不再主动调用 Docker/AIFAR 实时探测接口；AIFAR Runtime 工具条去掉手动刷新按钮，保留明确操作/日志/Pods 指标类入口的实时请求。
+- 问题：用户截图指出容器页 AIFAR 运行时下拉框出现大量 `runtime-v2 / 未知 / app_xxx` Agent 项。
+- 结论：根因是前端把 `status_snapshots` 中所有同服务器 `aifar.runtime` 历史/残留快照都投影成可选运行时实例。已改为以当前 `/apps/instances` 中可选择的已安装 AIFAR 实例为权威白名单，快照只覆盖这些实例的运行状态；明确安装失败的旧 AIFAR 记录不会进入下拉，运行监控失败但安装生命周期正常的实例仍保留。验证：新增 snapshotProjection 回归测试，相关 `pnpm test:web -- --run ...` 64 文件/481 测试通过，`pnpm web:build` 通过，`git diff --check` 通过。
+- 问题：用户确认 Nacos 和对象存储也应采用数据库页同款紧凑资源卡片，避免状态重复和单体卡被集群撑高。
+- 结论：Nacos/对象存储实例卡片改为轻量摘要标签展示，卡片网格按内容高度排列；整体状态只在卡片右上展示，节点级状态保留在节点行。验证：runtimeStatusPresentation 前端测试 65 文件/485 测试通过，`pnpm web:build` 通过，`git diff --check` 通过。
+- 问题：用户指出各模块里的“服务不可用”等状态标签文字看起来不居中，要求所有模块统一修复。
+- 结论：根因是 Element Plus `el-tag` 与项目自定义 `status-pill` 没有全局统一水平/垂直居中约束。已在全局样式中统一 `.el-tag`、`.el-tag__content`、`.status-pill` 的 inline-flex、justify-content、line-height 和 vertical-align，覆盖数据库、Nacos、对象存储、服务器、应用、任务等所有使用统一状态标签的模块。验证：styles contract 前端测试 65 文件/486 测试通过，`pnpm web:build` 通过，`git diff --check` 通过。
+
+## 2026-08-13
+- 问题：用户指出消息中心系统提醒只显示 Docker 和服务器，不显示 MySQL、Redis、MinIO、Nacos 等已安装服务的异常。
+- 结论：根因是提醒管理器只消费 server、docker.summary、aifar.runtime 三类运行快照，普通 app.instance 运行快照被安装失败防误报逻辑整体跳过。已新增已安装 MySQL、MySQL Router、Redis、MinIO、Nacos 的 app.instance 异常快照提醒；Docker/AIFAR 仍走专用提醒，安装失败提醒仍只由明确安装失败信号生成。验证：alerts 与 collector 后端包通过。
+
+## 2026-08-13
+- 问题：用户截图指出数据库/Nacos/对象存储资源卡片右上角“服务不可用”等状态标签仍然没有视觉居中。
+- 结论：根因是资源卡片头部 actions 区域的局部布局仍会影响 Element Plus tag 的垂直对齐，上一轮全局状态标签规则不足以覆盖这个嵌套场景。已为 Database/Nacos/Storage 卡片头部状态标签增加局部 inline-flex、固定最小高度与居中约束。验证：runtimeStatusPresentation 测试转绿，pnpm test:web 65 文件/487 测试通过，pnpm web:build 通过，git diff --check 通过。
+
+## 2026-08-14
+- 问题：用户要求数据库、Nacos、对象存储页面按主流资源管理平台重新表达，首页不要堆节点、容量、同步、备份等细节，需要更好地区分单体和集群。
+- 结论：采用“资源组列表 + 详情抽屉”交互：首页仅展示资源组状态、拓扑、版本、节点数等关键摘要，单体与集群都以一行资源进入；节点、Router、容量、同步、备份/恢复等细节移入详情抽屉，避免首页被集群撑高或单体/集群混排造成视觉噪音。
+- 问题：用户确认最终设计：Dashboard 采用运行资源指挥台，数据库/Nacos/对象存储采用资源列表与详情抽屉，并保持全局风格一致。
+- 结论：Dashboard 运行状态区域收敛为紧凑结构：标题/提示、轻量总统计、资源类型页签、状态筛选、有界资源列表；默认仍选服务器且顺序为服务器、Docker、数据库、Nacos、对象存储。数据库/Nacos/对象存储资源首页统一为紧凑列表行，详情保留在抽屉。验证：Dashboard 与 runtimeStatusPresentation 前端测试 65 文件/487 测试通过，pnpm web:build 通过，git diff --check 通过。
+- 问题：用户指出上一版仍和 UI 设计图不一致，资源页不应该只靠抽屉查看详情。
+- 结论：数据库、Nacos、对象存储页面已调整为更接近设计图的“左侧资源列表 + 右侧常驻详情面板”工作台；点击资源行只切换右侧详情，详情按钮仍可打开抽屉承载更深操作。Dashboard 没有把提醒中心加回页面，因为用户此前明确要求提醒集中到右上角铃铛。验证：runtimeStatusPresentation 与 Dashboard 前端测试 65 文件/487 测试通过，pnpm web:build 通过，git diff --check 通过。
+
+## 2026-08-15
+- 问题：用户要求在 `AGENTS.md` 中增加规则：每次代码更新完成后自动提交到 GitHub。
+- 结论：已在必读流程中新增约定：代码更新完成且必要验证通过后自动 `git add`、`git commit` 并推送当前 GitHub 远端分支；若存在未授权改动、暂停指令、分支/凭据/网络阻塞或推送风险，需先向用户说明并确认。
+- 问题：用户希望把 `aifar-agent` 和 `aifar` 应用安装完全分开，互相不影响，询问应如何设计。
+- 结论：推荐把 `aifar-agent` 设计为独立节点基础设施资源和独立生命周期任务，AIFAR 应用安装只消费 agent 能力并做只读 preflight，不再自动安装、升级、重启或卸载 agent；Runtime 操作遇到 agent 缺失、版本或能力不满足时 fail-closed，提示用户执行独立 agent 安装/升级任务。AIFAR 删除只删除业务 Runtime 实例，不删除共享 agent；agent 删除需先确认无依赖实例并单独审计。
+- 问题：用户希望重新设计一套与现有服务解耦的新平台，支持 AI 按模板生成任意服务部署包、Server/Agent 通用扩缩容、阿里云式资源控制台、AgentScope 和低代码能力，并补齐遗漏项。
+- 结论：该需求需拆成应用包协议、节点执行面、声明式编排、资源控制台、AgentScope AI 工作台、安全治理六个子系统；保留现有 desired/observed/generation、任务审计等业务语义但不直接复用绑定 AIFAR Runtime 的实现。AgentScope 定位为受控的生成、校验、解释和诊断层，不直接承担确定性扩缩容；下一步先确认首期运行底座是裸机/虚机、Kubernetes，还是双运行时驱动。
+- 问题：用户明确新产品不保留旧代码，希望重新建立分支；因缺少大型 Kubernetes 运维经验而更熟悉 Docker，并希望获得持续的架构建设建议。
+- 结论：新产品按代码零复用设计，首期推荐 Docker-first 的通用 Node Agent，资源模型预留 Runtime Driver 接口供未来接入 K3s/Kubernetes；不在当前存在大量未提交改动的工作区直接切普通分支。代码隔离优先选择新仓库，若必须共用仓库则使用 orphan 分支和独立 worktree，待用户确认后执行。

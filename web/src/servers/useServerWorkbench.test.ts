@@ -80,19 +80,17 @@ describe('useServerWorkbench realtime status', () => {
     expect(workbench.form.name).toBe('draft name')
   })
 
-  it('tracks manual probe tasks globally without waiting inside the page', async () => {
+  it('keeps manual probe local instead of tracking it globally', async () => {
     const snapshots = new Map<string, StatusSnapshot>()
-    const trackTask = vi.fn()
     listServersMock.mockResolvedValue([server])
     probeServerMock.mockResolvedValueOnce({ taskId: 'tsk-probe-1' })
-    const workbench = useServerWorkbench((key) => key, (id) => snapshots.get(id), trackTask)
+    const workbench = useServerWorkbench((key) => key, (id) => snapshots.get(id))
     await workbench.load()
 
     await workbench.probe(workbench.servers.value[0])
     snapshots.set('srv-1', snapshot({ status: 'failed', lastError: 'timeout', version: 2 }))
     workbench.applyStatusSnapshots()
 
-    expect(trackTask).toHaveBeenCalledWith('tsk-probe-1', 'servers.probe')
     expect(workbench.probingIds.value.has('srv-1')).toBe(false)
     expect(listServersMock).toHaveBeenCalledTimes(2)
     expect(workbench.servers.value[0]).toMatchObject({ status: 'unavailable', lastError: 'timeout' })

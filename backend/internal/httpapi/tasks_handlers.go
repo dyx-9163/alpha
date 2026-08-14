@@ -38,7 +38,11 @@ func (a *API) getTask(w http.ResponseWriter, r *http.Request) {
 func decorateTasks(tasks []store.Task) []store.Task {
 	out := make([]store.Task, 0, len(tasks))
 	for _, task := range tasks {
-		out = append(out, decorateTask(task))
+		decorated := decorateTask(task)
+		if !decorated.Trackable {
+			continue
+		}
+		out = append(out, decorated)
 	}
 	return out
 }

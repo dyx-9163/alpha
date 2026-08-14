@@ -180,28 +180,33 @@ section {
 .side-menu.el-menu {
   --el-menu-bg-color: transparent;
   --el-menu-text-color: #c7d4e8;
-  --el-menu-hover-bg-color: rgba(22, 119, 255, .12);
-  --el-menu-active-color: #8ce8f0;
+  --el-menu-hover-bg-color: rgba(230, 244, 255, .1);
+  --el-menu-active-color: var(--aifar-primary);
 }
 
 .side-menu .el-menu-item {
   height: 36px;
   line-height: 36px;
   border-radius: var(--aifar-radius);
+  border: 1px solid transparent;
   margin: 2px 0;
   padding: 0 9px !important;
   font-size: 13px;
   font-weight: 700;
+  transition: color .16s ease, background-color .16s ease, border-color .16s ease, box-shadow .16s ease;
 }
 
 .side-menu .el-menu-item:hover {
   color: #fff;
+  border-color: rgba(145, 202, 255, .22);
+  background: rgba(230, 244, 255, .1);
 }
 
 .side-menu .el-menu-item.is-active {
-  color: #dffbff;
-  background: rgba(19, 194, 194, .16);
-  box-shadow: inset 3px 0 0 #13c2c2, inset 0 0 0 1px rgba(19, 194, 194, .24);
+  color: var(--aifar-primary);
+  background: #e6f4ff;
+  border-color: #91caff;
+  box-shadow: inset 3px 0 0 var(--aifar-primary), 0 1px 2px rgba(31, 58, 95, .03);
 }
 
 .nav-icon {
@@ -417,8 +422,8 @@ section {
 .aifar-panel,
 .table-panel,
 .empty-panel {
-  background: rgba(255, 255, 255, .98);
-  border: 1px solid var(--aifar-border);
+  background: linear-gradient(180deg, rgba(255, 255, 255, .98), #f8fbff);
+  border: 1px solid #d6eaff;
   border-radius: var(--aifar-radius-lg);
   box-shadow: var(--aifar-shadow-card);
 }
@@ -479,7 +484,9 @@ section {
 .status-pill {
   display: inline-flex;
   align-items: center;
+  justify-content: center;
   height: 22px;
+  line-height: 1;
   border-radius: var(--aifar-radius-sm);
   padding: 0 8px;
   font-size: 11px;
@@ -508,8 +515,8 @@ section {
 }
 
 .metric-card {
-  background: #fff;
-  border: 1px solid var(--aifar-border);
+  background: linear-gradient(180deg, #fff, #f8fbff);
+  border: 1px solid #d6eaff;
   border-radius: var(--aifar-radius-lg);
   min-height: 70px;
   padding: 10px 12px;
@@ -522,8 +529,9 @@ section {
   content: "";
   position: absolute;
   inset: 0 auto 0 0;
-  width: 3px;
+  width: 2px;
   background: var(--aifar-primary);
+  opacity: .72;
 }
 
 .metric-card .label {
@@ -538,6 +546,20 @@ section {
   font-size: 21px;
   line-height: 27px;
   font-weight: 850;
+}
+
+.metric-card .subtle-note {
+  display: inline-flex;
+  align-items: center;
+  min-height: 22px;
+  margin-top: 3px;
+  padding: 0 8px;
+  border: 1px solid var(--aifar-border-soft);
+  border-radius: 999px;
+  background: #fff;
+  color: var(--aifar-text-secondary);
+  font-size: 11px;
+  font-weight: 700;
 }
 
 .small-value {
@@ -653,6 +675,21 @@ section {
   --el-button-hover-text-color: #fff;
   --el-button-active-bg-color: #0958d9;
   --el-button-active-border-color: #0958d9;
+}
+
+.el-tag {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  line-height: 1;
+  vertical-align: middle;
+}
+
+.el-tag__content {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  line-height: 1;
 }
 
 .el-input__wrapper,

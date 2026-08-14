@@ -52,9 +52,6 @@ func (m *Manager) Evaluate(ctx context.Context) error {
 		}
 		return nil
 	}
-	if err := m.evaluateCollectorRuns(upsert); err != nil {
-		return err
-	}
 	if err := m.evaluateSnapshots(upsert); err != nil {
 		return err
 	}
@@ -74,37 +71,6 @@ func (m *Manager) Evaluate(ctx context.Context) error {
 	return nil
 }
 
-func (m *Manager) evaluateCollectorRuns(upsert func(store.Alert) error) error {
-	runs, err := m.store.ListCollectorRuns()
-	if err != nil {
-		return err
-	}
-	for _, run := range runs {
-		if strings.ToLower(strings.TrimSpace(run.Status)) != "failed" {
-			continue
-		}
-		message := strings.TrimSpace(run.LastError)
-		if message == "" {
-			message = "collector failed"
-		}
-		if err := upsert(store.Alert{
-			Fingerprint:        "collector:" + run.Name + ":failed",
-			Severity:           "warning",
-			Scope:              "collector",
-			ResourceID:         run.Name,
-			Status:             "open",
-			Title:              "Collector " + run.Name + " failed",
-			Message:            message,
-			EvidenceJSON:       evidenceJSON(map[string]any{"run": run.Name, "target": run.Target, "finishedAt": run.FinishedAt, "durationMs": run.DurationMS}),
-			RequiredPermission: string(rbac.SettingsManage),
-			LastSeenAt:         run.UpdatedAt,
-		}); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
 func (m *Manager) evaluateSnapshots(upsert func(store.Alert) error) error {
 	snapshots, err := m.store.ListStatusSnapshots("", "")
 	if err != nil {
@@ -114,9 +80,9 @@ func (m *Manager) evaluateSnapshots(upsert func(store.Alert) error) error {
 	if err != nil {
 		return err
 	}
-	activeInstances := make(map[string]struct{}, len(instances))
+	activeInstances := make(map[string]store.AppInstance, len(instances))
 	for _, instance := range instances {
-		activeInstances[instance.ID] = struct{}{}
+		activeInstances[instance.ID] = instance
 	}
 	for _, snapshot := range snapshots {
 		status := strings.ToLower(strings.TrimSpace(snapshot.Status))
@@ -144,11 +110,51 @@ func (m *Manager) evaluateSnapshots(upsert func(store.Alert) error) error {
 					return err
 				}
 			}
+		case "app.instance":
+			instance, exists := activeInstances[snapshot.ResourceID]
+			if !exists {
+				continue
+			}
+			app := strings.ToLower(strings.TrimSpace(instance.App))
+			if !appInstanceRuntimeAlertsEnabled(app) {
+				continue
+			}
+			if status == "degraded" || isServiceUnavailableStatus(status) {
+				severity := "warning"
+				if isServiceUnavailableStatus(status) {
+					severity = "critical"
+				}
+				serverID := snapshot.ServerID
+				if strings.TrimSpace(serverID) == "" {
+					serverID = instance.ServerID
+				}
+				message := strings.TrimSpace(snapshot.LastError)
+				if message == "" {
+					message = app + " runtime status is " + status
+				}
+				if err := upsert(store.Alert{
+					Fingerprint:        "app.instance.runtime:" + snapshot.ResourceID + ":" + status,
+					Severity:           severity,
+					Scope:              snapshot.Scope,
+					ResourceID:         snapshot.ResourceID,
+					ServerID:           serverID,
+					App:                app,
+					InstanceID:         snapshot.ResourceID,
+					Status:             "open",
+					Title:              appAlertDisplayName(app) + " service is " + alertTitleStatus(status, false),
+					Message:            message,
+					EvidenceJSON:       snapshotEvidence(snapshot),
+					RequiredPermission: string(permissionForApp(app)),
+					LastSeenAt:         snapshot.UpdatedAt,
+				}); err != nil {
+					return err
+				}
+			}
 		case "aifar.runtime":
 			if _, exists := activeInstances[snapshot.ResourceID]; !exists {
 				continue
 			}
-			if status == "degraded" || isServiceUnavailableStatus(status) {
+			if (status == "degraded" || isServiceUnavailableStatus(status)) && runtimeSnapshotNeedsAlert(status, snapshot) {
 				severity := "warning"
 				if isServiceUnavailableStatus(status) {
 					severity = "critical"
@@ -198,6 +204,28 @@ func (m *Manager) evaluateSnapshots(upsert func(store.Alert) error) error {
 	return nil
 }
 
+func appInstanceRuntimeAlertsEnabled(app string) bool {
+	switch strings.ToLower(strings.TrimSpace(app)) {
+	case "mysql", "mysql-router", "mysqlrouter", "redis", "minio", "nacos":
+		return true
+	default:
+		return false
+	}
+}
+
+func appAlertDisplayName(app string) string {
+	switch strings.ToLower(strings.TrimSpace(app)) {
+	case "mysql-router", "mysqlrouter":
+		return "MYSQL-ROUTER"
+	case "minio":
+		return "MINIO"
+	case "nacos":
+		return "NACOS"
+	default:
+		return strings.ToUpper(strings.TrimSpace(app))
+	}
+}
+
 func (m *Manager) evaluateAppInstances(upsert func(store.Alert) error) error {
 	instances, err := m.store.ListAppInstances()
 	if err != nil {
@@ -206,8 +234,7 @@ func (m *Manager) evaluateAppInstances(upsert func(store.Alert) error) error {
 	for _, instance := range instances {
 		status := strings.ToLower(strings.TrimSpace(instance.Status))
 		metadata := metadataMap(instance.Metadata)
-		installFailed, _ := metadata["installFailed"].(bool)
-		if !alertableInstanceStatus(status) && !installFailed {
+		if !isInstallFailureInstance(status, metadata) {
 			continue
 		}
 		message := metadataString(metadata, "error")
@@ -218,17 +245,16 @@ func (m *Manager) evaluateAppInstances(upsert func(store.Alert) error) error {
 			message = "instance status is " + status
 		}
 		app := strings.ToLower(strings.TrimSpace(instance.App))
-		severity := instanceAlertSeverity(status, installFailed)
 		if err := upsert(store.Alert{
-			Fingerprint:        "app.instance:" + instance.ID + ":" + status,
-			Severity:           severity,
+			Fingerprint:        "app.instance:" + instance.ID + ":install_failed",
+			Severity:           "critical",
 			Scope:              "app.instance",
 			ResourceID:         instance.ID,
 			ServerID:           instance.ServerID,
 			App:                app,
 			InstanceID:         instance.ID,
 			Status:             "open",
-			Title:              strings.ToUpper(app) + " instance is " + alertTitleStatus(status, installFailed),
+			Title:              strings.ToUpper(app) + " installation failed",
 			Message:            message,
 			EvidenceJSON:       evidenceJSON(map[string]any{"app": app, "version": instance.Version, "topology": instance.Topology, "metadata": metadata}),
 			RequiredPermission: string(permissionForApp(app)),
@@ -238,14 +264,6 @@ func (m *Manager) evaluateAppInstances(upsert func(store.Alert) error) error {
 		}
 	}
 	return nil
-}
-
-func instanceAlertSeverity(status string, installFailed bool) string {
-	status = strings.ToLower(strings.TrimSpace(status))
-	if isServiceUnavailableStatus(status) || installFailed {
-		return "critical"
-	}
-	return "warning"
 }
 
 func alertTitleStatus(status string, installFailed bool) string {
@@ -325,21 +343,65 @@ func aifarRuntimeMessage(status string, snapshot store.StatusSnapshot) string {
 	}
 }
 
-func alertableInstanceStatus(status string) bool {
-	switch status {
-	case "failed", "error", "unavailable", "degraded", "unhealthy", "no-endpoints", "down", "offline":
-		return true
-	default:
-		return false
-	}
-}
-
 func isServiceUnavailableStatus(status string) bool {
 	switch strings.ToLower(strings.TrimSpace(status)) {
 	case "failed", "error", "unavailable", "unhealthy", "no-endpoints", "down", "offline":
 		return true
 	default:
 		return false
+	}
+}
+
+func isInstallFailureInstance(status string, metadata map[string]any) bool {
+	if installFailed, _ := metadata["installFailed"].(bool); installFailed {
+		return true
+	}
+	installState := strings.ToLower(strings.TrimSpace(metadataString(metadata, "installState")))
+	switch installState {
+	case "failed", "install_failed", "installation_failed":
+		return true
+	}
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "install_failed", "installation_failed":
+		return true
+	default:
+		return false
+	}
+}
+
+func runtimeSnapshotNeedsAlert(status string, snapshot store.StatusSnapshot) bool {
+	status = strings.ToLower(strings.TrimSpace(status))
+	if status != "degraded" && status != "no-endpoints" {
+		return true
+	}
+	payload := metadataMap(snapshot.Payload)
+	ready, readyOK := metadataNumber(payload, "readyPods")
+	desired, desiredOK := metadataNumber(payload, "desiredReplicas")
+	if !readyOK || !desiredOK {
+		return true
+	}
+	return desired > 0 && ready < desired
+}
+
+func metadataNumber(metadata map[string]any, key string) (float64, bool) {
+	value, ok := metadata[key]
+	if !ok {
+		return 0, false
+	}
+	switch typed := value.(type) {
+	case float64:
+		return typed, true
+	case float32:
+		return float64(typed), true
+	case int:
+		return float64(typed), true
+	case int64:
+		return float64(typed), true
+	case json.Number:
+		number, err := typed.Float64()
+		return number, err == nil
+	default:
+		return 0, false
 	}
 }
 

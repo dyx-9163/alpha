@@ -54,9 +54,6 @@
           </el-table-column>
           <el-table-column prop="action" :label="t('common.action')" min-width="180" show-overflow-tooltip />
           <el-table-column prop="target" :label="t('common.target')" min-width="180" show-overflow-tooltip />
-          <el-table-column :label="t('common.provider')" width="110">
-            <template #default>{{ t('common.real') }}</template>
-          </el-table-column>
           <el-table-column prop="status" :label="t('common.status')" width="110">
             <template #default="{ row }"><StatusTag :status="row.status" /></template>
           </el-table-column>

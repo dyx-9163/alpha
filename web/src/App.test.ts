@@ -54,6 +54,8 @@ describe('private route keep-alive contract', () => {
     expect(source).toContain('<keep-alive include="TerminalView">')
     expect(source).toContain('<component :is="Component" />')
     expect(source).toContain('<router-view v-if="$route.meta.public" />')
+    expect(source).toContain('<GlobalAlerts />')
+    expect(source).not.toContain('<GlobalTaskProgress />')
   })
 
   it('opens the realtime event stream immediately after login', async () => {
@@ -83,7 +85,6 @@ describe('private route keep-alive contract', () => {
           'el-button': { template: '<button><slot /></button>' },
           GlobalAlerts: true,
           GlobalRealtimeStatus: true,
-          GlobalTaskProgress: true,
           RouterView: { template: '<div />' }
         }
       }
@@ -143,7 +144,6 @@ describe('private route keep-alive contract', () => {
           'el-button': { template: `<button class="logout-button" @click="$emit('click')"><slot /></button>` },
           GlobalAlerts: true,
           GlobalRealtimeStatus: true,
-          GlobalTaskProgress: true,
           RouterView: { template: '<div />' }
         }
       }
@@ -202,7 +202,6 @@ describe('private route keep-alive contract', () => {
           'el-button': { template: '<button><slot /></button>' },
           GlobalAlerts: true,
           GlobalRealtimeStatus: true,
-          GlobalTaskProgress: true,
           RouterView: { template: '<div />' }
         }
       }

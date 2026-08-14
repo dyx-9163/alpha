@@ -67,29 +67,12 @@
 
         <el-tab-pane :label="t('settings.statusOverview')" name="status">
           <div class="settings-tab-pane">
-            <el-alert
-              :title="t('settings.realModeTitle')"
-              :description="t('settings.realModeDesc')"
-              type="warning"
-              :closable="false"
-              show-icon
-            />
-
             <ControlPlaneHealthPanel ref="healthPanel" />
-
-            <h2 class="settings-title">{{ t('settings.providerStatus') }}</h2>
-            <KeyValueGrid :items="providerItems" class="provider-grid">
-              <template #value="{ item }">
-                <span v-if="item.key === 'mode'" class="status-pill success">{{ item.value }}</span>
-                <span v-else>{{ item.value || '-' }}</span>
-              </template>
-            </KeyValueGrid>
 
             <h2 class="settings-title">{{ t('settings.moduleStatus') }}</h2>
             <el-table :data="moduleRows" :fit="false" style="width: 1150px; max-width: 100%;">
               <el-table-column prop="module" :label="t('common.module')" width="160" />
               <el-table-column :label="t('common.status')" width="140"><template #default><span class="status-pill success">{{ t('settings.connected') }}</span></template></el-table-column>
-              <el-table-column :label="t('common.provider')" width="140"><template #default>{{ t('common.real') }}</template></el-table-column>
               <el-table-column prop="message" :label="t('common.message')" width="520" show-overflow-tooltip />
               <el-table-column prop="time" :label="t('common.time')" width="190" />
             </el-table>
@@ -106,7 +89,6 @@ import { ElMessage } from 'element-plus'
 import { apiGet, apiPut } from '../api/client'
 import ControlPlaneHealthPanel from '../components/ControlPlaneHealthPanel.vue'
 import DataMaintenancePanel from '../components/DataMaintenancePanel.vue'
-import KeyValueGrid from '../components/KeyValueGrid.vue'
 import LogMaintenancePanel from '../components/LogMaintenancePanel.vue'
 import UserManagementPanel from '../components/UserManagementPanel.vue'
 import { usePermissions } from '../composables/usePermissions'
@@ -125,26 +107,12 @@ const now = ref('')
 const maintenancePanel = ref<RefreshablePanel | null>(null)
 const healthPanel = ref<RefreshablePanel | null>(null)
 const userPanel = ref<RefreshablePanel | null>(null)
-const platform = navigator.platform.toLowerCase().includes('win') ? 'windows' : 'linux'
-const providerModeLabel = computed(() => {
-  const mode = form.providerStatus || form.providerMode || 'real'
-  return mode === 'real' ? t('common.real') : mode
-})
 const canManageSettings = computed(() => can(permissions.settingsManage))
 const canManageUsers = computed(() => can(permissions.usersManage))
 const moduleRows = computed(() => {
   const modules = form.moduleStatus ?? {}
   return Object.keys(modules).map((module) => ({ module, message: moduleMessage(module), time: now.value }))
 })
-const providerItems = computed(() => [
-  { key: 'mode', label: t('settings.mode'), value: providerModeLabel.value },
-  { key: 'platform', label: t('settings.platform'), value: platform },
-  { key: 'message', label: t('common.message'), value: t('settings.providerMessage') },
-  { key: 'databasePath', label: t('settings.databasePath'), value: form.databasePath },
-  { key: 'resourcePath', label: t('settings.resourcePath'), value: form.resourcePath },
-  { key: 'defaultDeployDir', label: t('settings.defaultDeployDir'), value: form.defaultDeployDir },
-  { key: 'confirm', label: t('settings.dangerousActionsRequire'), value: t('settings.confirmTrue') }
-])
 
 function moduleMessage(module: string) {
   const key = `settings.moduleMessages.${module}`
@@ -226,13 +194,4 @@ onMounted(load)
   font-weight: 850;
 }
 
-.provider-grid {
-  grid-template-columns: minmax(150px, 180px) minmax(0, 1fr);
-}
-
-@media (max-width: 720px) {
-  .provider-grid {
-    grid-template-columns: 120px minmax(0, 1fr);
-  }
-}
 </style>

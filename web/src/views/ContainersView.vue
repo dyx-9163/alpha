@@ -7,8 +7,6 @@
       </div>
       <div class="head-actions">
         <ServerSelector v-model="selectedServerId" :servers="dockerServers" :placeholder="t('containers.selectDockerHost')" class="toolbar-control" />
-        <el-button :loading="loading" @click="load(true)">{{ t('containers.checkHost') }}</el-button>
-        <el-button :loading="loading" @click="loadActive(true)">{{ t('common.refresh') }}</el-button>
       </div>
     </div>
 
@@ -158,7 +156,7 @@ import {
   type DockerSummaryResponse
 } from '../containers/dockerApi'
 import { imageReference, imageRowKey, uniqueValues } from '../containers/dockerImages'
-import { mergeDockerSummarySnapshot } from '../containers/realtimeSummary'
+import { dockerSummaryFromStatusSnapshot, mergeDockerSummarySnapshot } from '../containers/realtimeSummary'
 import AifarRuntimeDialogs from '../containers/runtime/AifarRuntimeDialogs.vue'
 import AifarRuntimeWorkspace from '../containers/runtime/AifarRuntimeWorkspace.vue'
 import {
@@ -219,13 +217,10 @@ import {
   runtimeLogVisibleCount,
   type RuntimeLogParseContext
 } from '../containers/runtime/logs'
-import {
-  createRuntimeStatusRefreshScheduler,
-  isRuntimeStatusEventForSelection
-} from '../containers/runtime/runtimeStatusRefresh'
 import { runtimePodLoadArgs } from '../containers/runtime/runtimePodLoading'
 import { mergeRuntimePodMetrics } from '../containers/runtime/runtimePodMetrics'
 import { createRuntimePodMetricsScheduler } from '../containers/runtime/runtimePodMetricsScheduler'
+import { aifarRuntimeFromStatusSnapshots } from '../containers/runtime/snapshotProjection'
 import { isAifarServiceControllerModel } from '../containers/runtime/model'
 import {
   buildAifarServiceOptions,
@@ -300,7 +295,7 @@ const aifarUpdateService = ref('oauth')
 const aifarArtifactFile = ref<File | null>(null)
 const aifarRuntime = ref<AifarRuntimeResponse>({ runtimeStatus: 'unknown', agent: { status: 'unknown' }, instances: [], services: [], pods: [], ingress: [], warnings: [] })
 const selectedRuntimeInstanceId = ref('')
-const runtimeResourceTab = ref<'deployments' | 'releases' | 'services' | 'pods' | 'logs' | 'ingress'>('deployments')
+const runtimeResourceTab = ref<'deployments' | 'services' | 'pods' | 'logs' | 'ingress'>('deployments')
 const runtimePodServiceFilter = ref('')
 const runtimePodsLoaded = ref<Record<string, boolean>>({})
 const runtimePodStatsLoaded = ref<Record<string, boolean>>({})
@@ -364,8 +359,7 @@ const configSummaryItems = computed(() => [
 const settingsItems = computed(() => [
   { label: t('containers.dockerHost'), value: targetLabel.value },
   { label: t('containers.endpoint'), value: summaryData.value.endpoint || '-' },
-  { label: t('containers.rootDir'), value: summaryData.value.rootDir || '-' },
-  { label: t('common.provider'), value: t('common.real') }
+  { label: t('containers.rootDir'), value: summaryData.value.rootDir || '-' }
 ])
 const selectedImageIds = computed(() => uniqueValues(selectedImageRows.value.map(imageReference).filter(Boolean)))
 const batchImageRemoveDisabledReason = computed(() => {
@@ -418,11 +412,6 @@ const installedRuntimeServiceNames = computed(() => new Set(selectedRuntimeServi
 const runtimeServiceMap = computed(() => buildRuntimeServiceMap(selectedRuntimeServices.value))
 const runtimePodsLoadedForCurrentScope = computed(() => Boolean(runtimePodsLoaded.value[runtimeCacheKey('pods')]))
 const runtimePodStatsLoadedForCurrentScope = computed(() => Boolean(runtimePodStatsLoaded.value[runtimeCacheKey('pods')]))
-const runtimeStatusRefresh = createRuntimeStatusRefreshScheduler(() => {
-  const podsActive = runtimePodsActive()
-  const [force, includeStats, background] = runtimePodLoadArgs('status-event')
-  return loadAifarRuntime(force, podsActive, podsActive && includeStats, background)
-})
 const runtimePodMetricsScheduler = createRuntimePodMetricsScheduler(async () => {
   if (!runtimePodsActive()) return
   await ensureRuntimePodsLoaded(...runtimePodLoadArgs('metrics'))
@@ -728,6 +717,43 @@ function applyDockerSummaryEvent(event: unknown) {
     error.value = next.error
   }
   return true
+}
+
+function applyDockerSummarySnapshot() {
+  const next = dockerSummaryFromStatusSnapshot(realtime.dockerSummarySnapshot(selectedServerId.value), summary.value)
+  if (!next) {
+    summary.value = selectedServerId.value ? { available: false } : { available: false }
+    return false
+  }
+  summary.value = next
+  summaryCache.value = { ...summaryCache.value, [summaryCacheKey(false)]: next }
+  if (next.available === false && next.error) {
+    error.value = next.error
+  } else if (summary.value.available !== false) {
+    error.value = ''
+  }
+  return true
+}
+
+function applyAifarRuntimeSnapshots() {
+  const next = aifarRuntimeFromStatusSnapshots(realtime.statusSnapshots, selectedServerId.value, appInstances.value, aifarRuntime.value)
+  aifarRuntime.value = next
+  const instances = asArray<AifarRuntimeInstance>(next.instances)
+  if (!instances.some((instance) => instance.id === selectedRuntimeInstanceId.value)) {
+    selectedRuntimeInstanceId.value = instances.find((instance) => !instance.legacy)?.id ?? instances[0]?.id ?? ''
+  }
+}
+
+function applyPersistedContainerSnapshots() {
+  applyDockerSummarySnapshot()
+  applyAifarRuntimeSnapshots()
+}
+
+async function ensurePersistedContainerSnapshots() {
+  if (!realtime.snapshotsLoadedAt) {
+    await realtime.loadStatusSnapshots()
+  }
+  applyPersistedContainerSnapshots()
 }
 
 async function loadCollection(force = false) {
@@ -1110,8 +1136,6 @@ async function loadActive(force = false) {
     } else if (tab.value === 'aifar-runtime') {
       if (runtimeResourceTab.value === 'logs') {
         loadRuntimeLogs(force)
-      } else if (runtimeResourceTab.value === 'releases') {
-        await loadAifarReleases(force)
       } else {
         await loadAifarRuntime(force)
       }
@@ -2003,7 +2027,6 @@ useAifarRuntimeProvider({
   restartAllAifarRuntime,
   runtimeCleanupDisabledReason,
   cleanupAifarRuntimeStale,
-  loadAifarRuntime,
   aifarRuntimeWarnings,
   runtimeSummaryItems,
   runtimeResourceTab,
@@ -2106,23 +2129,17 @@ watch(tab, async (next) => {
     runtimePodMetricsScheduler.stop()
     closeRuntimeLogStream()
   }
-  await loadActive(false)
-  if (next === 'aifar-runtime' && runtimeResourceTab.value === 'pods') {
-    void activateRuntimePods('enter')
-  }
+  applyPersistedContainerSnapshots()
 })
 watch(resourceTab, () => {
   if (tab.value === 'images') {
-    void loadActive(false)
+    collection.value = []
+    selectedImageRows.value = []
   }
 })
 watch(runtimeResourceTab, (next) => {
   if (next === 'pods') {
     void activateRuntimePods('enter')
-  } else if (next === 'releases') {
-    runtimePodMetricsScheduler.stop()
-    closeRuntimeLogStream()
-    void loadAifarReleases(false)
   } else if (next === 'logs') {
     runtimePodMetricsScheduler.stop()
     void ensureRuntimePodsLoaded(...runtimePodLoadArgs('logs'))
@@ -2151,8 +2168,6 @@ watch(selectedRuntimeInstanceId, () => {
     void activateRuntimePods('scope-change')
   } else if (runtimeResourceTab.value === 'logs') {
     void ensureRuntimePodsLoaded(...runtimePodLoadArgs('logs'))
-  } else if (runtimeResourceTab.value === 'releases') {
-    void loadAifarReleases(false)
   }
 })
 watch(runtimeLogServiceFilter, () => {
@@ -2188,10 +2203,13 @@ watch(() => realtime.revision, () => {
     }
     return
   }
-  if (isRuntimeStatusEventForSelection(event, selectedServerId.value, tab.value === 'aifar-runtime')) {
+  if (event.resource === 'aifar.runtime' && event.serverId === selectedServerId.value) {
     runtimeCache.value = {}
-    runtimeStatusRefresh.request()
+    applyAifarRuntimeSnapshots()
   }
+})
+watch(() => realtime.statusRevision, () => {
+  applyPersistedContainerSnapshots()
 })
 watch([aifarUpdateService, aifarUpdateMode], () => {
   aifarArtifactFile.value = null
@@ -2208,20 +2226,16 @@ watch(selectedServerId, async () => {
   runtimeLogsLoaded.value = {}
   closeRuntimeLogStream()
   if (pageReady.value) {
-    await load(true)
-    if (runtimeResourceTab.value === 'pods') {
-      void activateRuntimePods('scope-change')
-    }
+    await ensurePersistedContainerSnapshots()
   }
 })
 onMounted(async () => {
   await loadServers()
+  await ensurePersistedContainerSnapshots()
   pageReady.value = true
-  await load()
 })
 onBeforeUnmount(() => {
   runtimeServiceTaskOwners.value = {}
-  runtimeStatusRefresh.dispose()
   runtimePodMetricsScheduler.dispose()
   closeRuntimeLogStream()
 })

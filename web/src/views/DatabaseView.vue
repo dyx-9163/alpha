@@ -16,6 +16,15 @@
       <span v-if="lastMonitorAt" class="subtle-note">{{ t('database.lastMonitoredAt') }} {{ lastMonitorAt }}</span>
     </div>
 
+    <div class="database-stat-grid">
+      <article v-for="card in databaseStatCards" :key="card.key" class="database-stat-card" :class="card.tone">
+        <span>{{ card.label }}</span>
+        <strong>{{ card.value }}</strong>
+        <small>{{ card.note }}</small>
+        <i />
+      </article>
+    </div>
+
     <el-tabs v-model="tab" class="tab-strip">
       <el-tab-pane v-for="tabName in visibleManagementTabs.database" :key="tabName" :label="t('database.instances')" :name="tabName" />
     </el-tabs>
@@ -36,153 +45,100 @@
           </div>
         </div>
 
-        <div class="db-card-grid" v-if="filteredGroups.length">
-          <article v-for="group in filteredGroups" :key="group.id" class="db-card">
-            <div class="db-head">
+        <div class="db-resource-shell" v-if="filteredGroups.length">
+          <div class="db-resource-list">
+            <article
+              v-for="group in filteredGroups"
+              :key="group.id"
+              class="db-resource-row"
+              :class="{ active: activeDatabaseWorkbenchGroup?.id === group.id }"
+              @click="selectDatabaseResource(group)"
+            >
+            <div class="db-resource-main">
               <div class="app-icon small">{{ group.app === 'redis' ? 'RE' : 'MY' }}</div>
               <div class="db-title-block">
                 <strong>{{ group.title }}</strong>
                 <span>{{ groupSubtitle(group) }}</span>
-              </div>
-              <div class="db-head-actions">
-                <StatusTag :status="group.status" />
-                <el-tooltip v-if="hasMysqlClusterStart(group)" :content="mysqlClusterStartReason(group)" :disabled="!isMysqlClusterStartDisabled(group)" placement="top">
-                  <span>
-                    <el-button
-                      size="small"
-                      type="primary"
-                      plain
-                      :loading="startingClusterId === group.id"
-                      :disabled="isMysqlClusterStartDisabled(group)"
-                      @click="startMysqlCluster(group)"
-                    >
-                      {{ t('database.startMysqlCluster') }}
-                    </el-button>
-                  </span>
-                </el-tooltip>
-              </div>
-            </div>
-            <div class="db-grid">
-              <div><span>{{ t('database.engine') }}</span><strong>{{ group.app }}</strong></div>
-              <div><span>{{ t('dashboard.topology') }}</span><strong>{{ group.topology || '-' }}</strong></div>
-              <div><span>{{ t('common.version') }}</span><strong>{{ group.version }}</strong></div>
-              <div><span>{{ t('database.nodes') }}</span><strong>{{ group.nodes.length }}</strong></div>
-              <div v-if="group.sentinels.length">
-                <span>{{ roleLabel('sentinel') }}</span>
-                <strong>{{ group.sentinels.length }}</strong>
-                <StatusTag class="db-grid-tag" :status="group.sentinelStatus" />
-              </div>
-              <div v-if="showGroupEndpoint(group)" class="db-grid-wide"><span>{{ groupEndpointLabel(group) }}</span><strong>{{ group.endpoint || '-' }}</strong></div>
-              <div><span>{{ t('common.status') }}</span><StatusTag :status="group.status" /></div>
-              <div v-if="group.routers.length">
-                <span>{{ t('database.mysqlRouter') }}</span>
-                <strong>{{ group.routers.length }}</strong>
-                <StatusTag class="db-grid-tag" :status="group.routerStatus" />
-              </div>
-            </div>
-            <div v-if="isInstallFailedGroup(group)" class="service-notice danger">{{ t('apps.installFailedCleanupHint') }}</div>
-            <div v-if="isUnavailable(group.nodeStatus)" class="service-notice danger">{{ databaseServiceUnavailableText(group) }}</div>
-            <div v-if="isUnavailable(group.routerStatus)" class="service-notice danger">{{ t('database.routerServiceUnavailable') }}</div>
-            <div
-              v-if="mysqlGroupReconciliation(group).kind === 'required'"
-              class="maintenance-banner reconciliation"
-              role="alert"
-              aria-live="polite"
-            >
-              <strong>{{ t('database.mysqlBackup.reconciliationTitle') }}</strong>
-              <span>{{ t('database.mysqlBackup.reconciliationBoundary') }}</span>
-              <span>{{ reconciliationSummary(group) }}</span>
-            </div>
-            <div
-              v-else-if="mysqlGroupReconciliation(group).kind === 'invalid' && group.app === 'mysql'"
-              class="maintenance-banner invalid"
-              role="alert"
-              aria-live="assertive"
-            >
-              <strong>{{ t('database.mysqlBackup.reconciliationInvalidTitle') }}</strong>
-              <span>{{ t('database.mysqlBackup.reconciliationInvalid') }}</span>
-            </div>
-            <div
-              v-if="mysqlGroupMaintenance(group).kind === 'required'"
-              class="maintenance-banner"
-              role="alert"
-              aria-live="polite"
-            >
-              <strong>{{ t('database.mysqlBackup.maintenanceTitle') }}</strong>
-              <span>{{ t('database.mysqlBackup.maintenanceExternalClients') }}</span>
-              <span>{{ maintenanceSummary(group) }}</span>
-            </div>
-            <div
-              v-else-if="mysqlGroupMaintenance(group).kind === 'invalid' && group.app === 'mysql'"
-              class="maintenance-banner invalid"
-              role="alert"
-              aria-live="assertive"
-            >
-              <strong>{{ t('database.mysqlBackup.maintenanceInvalidTitle') }}</strong>
-              <span>{{ t('database.mysqlBackup.maintenanceInvalid') }}</span>
-            </div>
-            <div v-if="group.nodes.length" class="node-list">
-              <div v-for="node in group.nodes" :key="node.instance.id" class="node-row">
-                <div class="node-main">
-                  <strong>{{ node.serverLabel }}</strong>
-                  <span>{{ node.endpoint || '-' }}</span>
-                </div>
-                <div class="node-tags">
-                  <el-tag size="small" :type="roleTagType(node.role)" effect="plain">{{ node.roleLabel }}</el-tag>
-                  <el-tag size="small" :type="nodeHealthType(node)">{{ nodeHealthLabel(node) }}</el-tag>
+                <div class="db-summary">
+                  <span><strong>{{ t('common.status') }}</strong>{{ statusText(group.status) }}</span>
+                  <span><strong>{{ t('common.version') }}</strong>{{ group.version }}</span>
+                  <span><strong>{{ t('dashboard.topology') }}</strong>{{ group.topology || '-' }}</span>
+                  <span><strong>{{ t('database.nodes') }}</strong>{{ group.nodes.length + group.routers.length + group.sentinels.length }}</span>
+                  <span v-if="showGroupEndpoint(group)" class="db-summary-wide"><strong>{{ groupEndpointLabel(group) }}</strong>{{ group.endpoint || '-' }}</span>
                 </div>
               </div>
             </div>
-            <div v-if="group.sentinels.length" class="router-list">
-              <div class="section-label">{{ roleLabel('sentinel') }}</div>
-              <div v-for="node in group.sentinels" :key="`sentinel-${node.instance.id}`" class="node-row router-row">
-                <div class="node-main">
-                  <strong>{{ node.serverLabel }}</strong>
-                  <span>{{ node.endpoint || '-' }}</span>
-                </div>
-                <div class="node-tags">
-                  <el-tag size="small" :type="roleTagType(node.role)" effect="plain">{{ node.roleLabel }}</el-tag>
-                  <el-tag size="small" :type="nodeHealthType(node)">{{ nodeHealthLabel(node) }}</el-tag>
-                </div>
-              </div>
-            </div>
-            <div v-if="group.routers.length" class="router-list">
-              <div class="section-label">{{ t('database.mysqlRouter') }}</div>
-              <div v-for="node in group.routers" :key="node.instance.id" class="node-row router-row">
-                <div class="node-main">
-                  <strong>{{ node.serverLabel }}</strong>
-                  <span>{{ node.endpoint || '-' }}</span>
-                </div>
-                <div class="node-tags">
-                  <el-tag size="small" :type="roleTagType(node.role)" effect="plain">{{ node.roleLabel }}</el-tag>
-                  <el-tag size="small" :type="nodeHealthType(node)">{{ nodeHealthLabel(node) }}</el-tag>
-                </div>
-              </div>
-            </div>
-            <div v-if="mysqlAvailability(group).visible" class="mysql-backup-actions" :aria-label="t('database.mysqlBackup.actionsLabel')">
-              <el-tooltip :content="mysqlActionReason(group)" :disabled="mysqlAvailability(group).backup" placement="top">
-                <span><el-button :disabled="!mysqlAvailability(group).backup" @click="openMySQLBackup(group)">{{ t('database.mysqlBackup.createAction') }}</el-button></span>
+            <div class="db-resource-actions" @click.stop>
+              <StatusTag :status="group.status" />
+              <el-button size="small" @click="openDatabaseResource(group)">{{ t('common.details') }}</el-button>
+              <el-tooltip v-if="hasMysqlClusterStart(group)" :content="mysqlClusterStartReason(group)" :disabled="!isMysqlClusterStartDisabled(group)" placement="top">
+                <span>
+                  <el-button
+                    size="small"
+                    type="primary"
+                    plain
+                    :loading="startingClusterId === group.id"
+                    :disabled="isMysqlClusterStartDisabled(group)"
+                    @click="startMysqlCluster(group)"
+                  >
+                    {{ t('database.startMysqlCluster') }}
+                  </el-button>
+                </span>
               </el-tooltip>
-              <el-button @click="openMySQLBackupRecords(group)">{{ t('database.mysqlBackup.recordsAction') }}</el-button>
-              <el-button @click="openMySQLRestoreRecords(group)">{{ t('database.mysqlBackup.restoreRecordsAction') }}</el-button>
-              <el-button v-if="mysqlAvailability(group).resumeRestore" type="danger" plain @click="openMySQLMaintenanceResume(group)">{{ t('database.mysqlBackup.resumeRestoreAction') }}</el-button>
-              <el-button v-if="mysqlAvailability(group).disaster" type="danger" plain @click="openLatestMySQLDisaster(group)">{{ t('database.mysqlBackup.disasterAction') }}</el-button>
-              <el-button
-                v-if="mysqlAvailability(group).reconcile"
-                type="warning"
-                plain
-                :loading="isReconciliationSubmitting(group)"
-                @click="runReconciliation(group)"
-              >{{ t('database.mysqlBackup.reconciliationAction') }}</el-button>
-              <el-button
-                v-if="mysqlGroupMaintenance(group).kind === 'required' && isOwner && canManageDatabase"
-                type="warning"
-                plain
-                :disabled="!mysqlAvailability(group).clearMaintenance"
-                @click="openMaintenanceClear(group)"
-              >{{ t('database.mysqlBackup.clearMaintenance') }}</el-button>
             </div>
           </article>
+          </div>
+          <aside v-if="activeDatabaseWorkbenchGroup" class="resource-inline-detail db-inline-detail">
+            <div class="db-head detail-head">
+              <div class="app-icon small">{{ activeDatabaseWorkbenchGroup.app === 'redis' ? 'RE' : 'MY' }}</div>
+              <div class="db-title-block">
+                <strong>{{ activeDatabaseWorkbenchGroup.title }}</strong>
+                <span>{{ groupSubtitle(activeDatabaseWorkbenchGroup) }}</span>
+              </div>
+              <div class="db-resource-actions">
+                <StatusTag :status="activeDatabaseWorkbenchGroup.status" />
+              </div>
+            </div>
+            <div class="db-summary detail-summary">
+              <span><strong>{{ t('common.version') }}</strong>{{ activeDatabaseWorkbenchGroup.version }}</span>
+              <span><strong>{{ t('dashboard.topology') }}</strong>{{ activeDatabaseWorkbenchGroup.topology || '-' }}</span>
+              <span><strong>{{ t('database.nodes') }}</strong>{{ activeDatabaseWorkbenchGroup.nodes.length }}</span>
+              <span v-if="activeDatabaseWorkbenchGroup.routers.length"><strong>{{ t('database.mysqlRouter') }}</strong>{{ activeDatabaseWorkbenchGroup.routers.length }}</span>
+              <span v-if="activeDatabaseWorkbenchGroup.sentinels.length"><strong>{{ roleLabel('sentinel') }}</strong>{{ activeDatabaseWorkbenchGroup.sentinels.length }}</span>
+              <span v-if="showGroupEndpoint(activeDatabaseWorkbenchGroup)" class="db-summary-wide"><strong>{{ groupEndpointLabel(activeDatabaseWorkbenchGroup) }}</strong>{{ activeDatabaseWorkbenchGroup.endpoint || '-' }}</span>
+              <span><strong>{{ t('common.time') }}</strong>{{ formatDate(activeDatabaseWorkbenchGroup.createdAt) }}</span>
+            </div>
+            <div v-if="activeDatabaseWorkbenchGroup.nodes.length" class="node-list">
+              <div class="section-label">{{ t('database.nodes') }}</div>
+              <div v-for="node in activeDatabaseWorkbenchGroup.nodes" :key="node.instance.id" class="node-row">
+                <div class="node-main">
+                  <strong>{{ node.serverLabel }}</strong>
+                  <span>{{ node.endpoint || '-' }}</span>
+                </div>
+                <div class="node-tags">
+                  <el-tag size="small" :type="roleTagType(node.role)" effect="plain">{{ node.roleLabel }}</el-tag>
+                  <el-tag size="small" :type="nodeHealthType(node)">{{ nodeHealthLabel(node) }}</el-tag>
+                </div>
+              </div>
+            </div>
+            <div v-if="activeDatabaseWorkbenchGroup.routers.length" class="router-list">
+              <div class="section-label">{{ t('database.mysqlRouter') }}</div>
+              <div v-for="node in activeDatabaseWorkbenchGroup.routers" :key="node.instance.id" class="node-row router-row">
+                <div class="node-main">
+                  <strong>{{ node.serverLabel }}</strong>
+                  <span>{{ node.endpoint || '-' }}</span>
+                </div>
+                <div class="node-tags">
+                  <el-tag size="small" :type="roleTagType(node.role)" effect="plain">{{ node.roleLabel }}</el-tag>
+                  <el-tag size="small" :type="nodeHealthType(node)">{{ nodeHealthLabel(node) }}</el-tag>
+                </div>
+              </div>
+            </div>
+            <div class="inline-detail-actions">
+              <el-button size="small" @click="openDatabaseResource(activeDatabaseWorkbenchGroup)">{{ t('common.details') }}</el-button>
+              <el-button v-if="mysqlAvailability(activeDatabaseWorkbenchGroup).visible" size="small" @click="openMySQLBackupRecords(activeDatabaseWorkbenchGroup)">{{ t('database.mysqlBackup.recordsAction') }}</el-button>
+            </div>
+          </aside>
         </div>
         <div v-else class="empty-state"><div><strong>{{ t('database.noInstancesTitle') }}</strong><span>{{ t('database.noInstancesDesc') }}</span></div></div>
       </template>
@@ -197,6 +153,135 @@
         </div>
       </template>
     </div>
+
+    <el-drawer
+      v-model="databaseDetailVisible"
+      :title="activeDatabaseGroup?.title || t('database.instances')"
+      size="min(760px, calc(100vw - 24px))"
+      class="database-detail-drawer"
+    >
+      <div v-if="activeDatabaseGroup" class="resource-detail-stack">
+        <div class="db-head detail-head">
+          <div class="app-icon small">{{ activeDatabaseGroup.app === 'redis' ? 'RE' : 'MY' }}</div>
+          <div class="db-title-block">
+            <strong>{{ activeDatabaseGroup.title }}</strong>
+            <span>{{ groupSubtitle(activeDatabaseGroup) }}</span>
+          </div>
+          <div class="db-resource-actions">
+            <StatusTag :status="activeDatabaseGroup.status" />
+          </div>
+        </div>
+        <div class="db-summary detail-summary">
+          <span><strong>{{ t('common.version') }}</strong>{{ activeDatabaseGroup.version }}</span>
+          <span><strong>{{ t('dashboard.topology') }}</strong>{{ activeDatabaseGroup.topology || '-' }}</span>
+          <span><strong>{{ t('database.nodes') }}</strong>{{ activeDatabaseGroup.nodes.length }}</span>
+          <span v-if="activeDatabaseGroup.routers.length"><strong>{{ t('database.mysqlRouter') }}</strong>{{ activeDatabaseGroup.routers.length }}</span>
+          <span v-if="activeDatabaseGroup.sentinels.length"><strong>{{ roleLabel('sentinel') }}</strong>{{ activeDatabaseGroup.sentinels.length }}</span>
+          <span v-if="showGroupEndpoint(activeDatabaseGroup)" class="db-summary-wide"><strong>{{ groupEndpointLabel(activeDatabaseGroup) }}</strong>{{ activeDatabaseGroup.endpoint || '-' }}</span>
+        </div>
+        <div v-if="isInstallFailedGroup(activeDatabaseGroup)" class="service-notice danger">{{ t('apps.installFailedCleanupHint') }}</div>
+        <div
+          v-if="mysqlGroupReconciliation(activeDatabaseGroup).kind === 'required'"
+          class="maintenance-banner reconciliation"
+          role="alert"
+          aria-live="polite"
+        >
+          <strong>{{ t('database.mysqlBackup.reconciliationTitle') }}</strong>
+          <span>{{ t('database.mysqlBackup.reconciliationBoundary') }}</span>
+          <span>{{ reconciliationSummary(activeDatabaseGroup) }}</span>
+        </div>
+        <div
+          v-else-if="mysqlGroupReconciliation(activeDatabaseGroup).kind === 'invalid' && activeDatabaseGroup.app === 'mysql'"
+          class="maintenance-banner invalid"
+          role="alert"
+          aria-live="assertive"
+        >
+          <strong>{{ t('database.mysqlBackup.reconciliationInvalidTitle') }}</strong>
+          <span>{{ t('database.mysqlBackup.reconciliationInvalid') }}</span>
+        </div>
+        <div
+          v-if="mysqlGroupMaintenance(activeDatabaseGroup).kind === 'required'"
+          class="maintenance-banner"
+          role="alert"
+          aria-live="polite"
+        >
+          <strong>{{ t('database.mysqlBackup.maintenanceTitle') }}</strong>
+          <span>{{ t('database.mysqlBackup.maintenanceExternalClients') }}</span>
+          <span>{{ maintenanceSummary(activeDatabaseGroup) }}</span>
+        </div>
+        <div
+          v-else-if="mysqlGroupMaintenance(activeDatabaseGroup).kind === 'invalid' && activeDatabaseGroup.app === 'mysql'"
+          class="maintenance-banner invalid"
+          role="alert"
+          aria-live="assertive"
+        >
+          <strong>{{ t('database.mysqlBackup.maintenanceInvalidTitle') }}</strong>
+          <span>{{ t('database.mysqlBackup.maintenanceInvalid') }}</span>
+        </div>
+        <div v-if="activeDatabaseGroup.nodes.length" class="node-list">
+          <div class="section-label">{{ t('database.nodes') }}</div>
+          <div v-for="node in activeDatabaseGroup.nodes" :key="node.instance.id" class="node-row">
+            <div class="node-main">
+              <strong>{{ node.serverLabel }}</strong>
+              <span>{{ node.endpoint || '-' }}</span>
+            </div>
+            <div class="node-tags">
+              <el-tag size="small" :type="roleTagType(node.role)" effect="plain">{{ node.roleLabel }}</el-tag>
+              <el-tag size="small" :type="nodeHealthType(node)">{{ nodeHealthLabel(node) }}</el-tag>
+            </div>
+          </div>
+        </div>
+        <div v-if="activeDatabaseGroup.sentinels.length" class="router-list">
+          <div class="section-label">{{ roleLabel('sentinel') }}</div>
+          <div v-for="node in activeDatabaseGroup.sentinels" :key="`sentinel-${node.instance.id}`" class="node-row router-row">
+            <div class="node-main">
+              <strong>{{ node.serverLabel }}</strong>
+              <span>{{ node.endpoint || '-' }}</span>
+            </div>
+            <div class="node-tags">
+              <el-tag size="small" :type="roleTagType(node.role)" effect="plain">{{ node.roleLabel }}</el-tag>
+              <el-tag size="small" :type="nodeHealthType(node)">{{ nodeHealthLabel(node) }}</el-tag>
+            </div>
+          </div>
+        </div>
+        <div v-if="activeDatabaseGroup.routers.length" class="router-list">
+          <div class="section-label">{{ t('database.mysqlRouter') }}</div>
+          <div v-for="node in activeDatabaseGroup.routers" :key="node.instance.id" class="node-row router-row">
+            <div class="node-main">
+              <strong>{{ node.serverLabel }}</strong>
+              <span>{{ node.endpoint || '-' }}</span>
+            </div>
+            <div class="node-tags">
+              <el-tag size="small" :type="roleTagType(node.role)" effect="plain">{{ node.roleLabel }}</el-tag>
+              <el-tag size="small" :type="nodeHealthType(node)">{{ nodeHealthLabel(node) }}</el-tag>
+            </div>
+          </div>
+        </div>
+        <div v-if="mysqlAvailability(activeDatabaseGroup).visible" class="mysql-backup-actions" :aria-label="t('database.mysqlBackup.actionsLabel')">
+          <el-tooltip :content="mysqlActionReason(activeDatabaseGroup)" :disabled="mysqlAvailability(activeDatabaseGroup).backup" placement="top">
+            <span><el-button :disabled="!mysqlAvailability(activeDatabaseGroup).backup" @click="openMySQLBackup(activeDatabaseGroup)">{{ t('database.mysqlBackup.createAction') }}</el-button></span>
+          </el-tooltip>
+          <el-button @click="openMySQLBackupRecords(activeDatabaseGroup)">{{ t('database.mysqlBackup.recordsAction') }}</el-button>
+          <el-button @click="openMySQLRestoreRecords(activeDatabaseGroup)">{{ t('database.mysqlBackup.restoreRecordsAction') }}</el-button>
+          <el-button v-if="mysqlAvailability(activeDatabaseGroup).resumeRestore" type="danger" plain @click="openMySQLMaintenanceResume(activeDatabaseGroup)">{{ t('database.mysqlBackup.resumeRestoreAction') }}</el-button>
+          <el-button v-if="mysqlAvailability(activeDatabaseGroup).disaster" type="danger" plain @click="openLatestMySQLDisaster(activeDatabaseGroup)">{{ t('database.mysqlBackup.disasterAction') }}</el-button>
+          <el-button
+            v-if="mysqlAvailability(activeDatabaseGroup).reconcile"
+            type="warning"
+            plain
+            :loading="isReconciliationSubmitting(activeDatabaseGroup)"
+            @click="runReconciliation(activeDatabaseGroup)"
+          >{{ t('database.mysqlBackup.reconciliationAction') }}</el-button>
+          <el-button
+            v-if="mysqlGroupMaintenance(activeDatabaseGroup).kind === 'required' && isOwner && canManageDatabase"
+            type="warning"
+            plain
+            :disabled="!mysqlAvailability(activeDatabaseGroup).clearMaintenance"
+            @click="openMaintenanceClear(activeDatabaseGroup)"
+          >{{ t('database.mysqlBackup.clearMaintenance') }}</el-button>
+        </div>
+      </div>
+    </el-drawer>
 
     <MySQLBackupDialog
       v-model="backupDialogVisible"
@@ -396,6 +481,8 @@ const sameDeletePassword = ref(false)
 const deleteSharedPassword = ref('')
 const startingClusterId = ref('')
 const activeMysqlGroupKey = ref('')
+const activeDatabaseGroupKey = ref('')
+const databaseDetailVisible = ref(false)
 const activeBackup = ref<MySQLBackupRecord | null>(null)
 const backupRecords = ref<MySQLBackupRecord[]>([])
 const backupListDefaults = ref<MySQLBackupDefaults>({ threads: 4, maxRateMBps: 0 })
@@ -413,11 +500,26 @@ const reconciliationSubmittingId = ref('')
 const liveInstances = computed(() => instances.value.map((instance) => applyRealtimeStatusToAppInstance(instance, realtime.appInstanceSnapshot(instance.id))))
 const instanceGroups = computed(() => groupDatabaseInstances(liveInstances.value))
 const activeMysqlGroup = computed(() => instanceGroups.value.find((group) => group.id === activeMysqlGroupKey.value) ?? null)
+const activeDatabaseGroup = computed(() => instanceGroups.value.find((group) => group.id === activeDatabaseGroupKey.value) ?? null)
 const mysqlGroupCount = computed(() => instanceGroups.value.filter((item) => item.app === 'mysql').length)
 const redisGroupCount = computed(() => instanceGroups.value.filter((item) => item.app === 'redis').length)
 const databaseNodeCount = computed(() => instanceGroups.value.reduce((total, group) => total + group.nodes.length, 0))
 const sentinelNodeCount = computed(() => instanceGroups.value.reduce((total, group) => total + group.sentinels.length, 0))
 const routerInstanceCount = computed(() => liveInstances.value.filter((item) => item.app === 'mysql-router').length)
+const databaseStatCards = computed(() => {
+  const total = instanceGroups.value.length
+  const running = instanceGroups.value.filter((group) => isRunningStatus(group.status)).length
+  const clusters = instanceGroups.value.filter((group) => isClusterDatabaseGroup(group)).length
+  const standalone = Math.max(total - clusters, 0)
+  const unavailable = Math.max(total - running, 0)
+  return [
+    { key: 'all', label: t('database.stat.all'), value: total, note: t('database.stat.comparedYesterday'), tone: '' },
+    { key: 'running', label: t('common.running'), value: running, note: percentageText(running, total), tone: 'success' },
+    { key: 'cluster', label: t('database.cluster'), value: clusters, note: percentageText(clusters, total), tone: '' },
+    { key: 'standalone', label: t('database.role.standalone'), value: standalone, note: percentageText(standalone, total), tone: '' },
+    { key: 'unavailable', label: t('database.stat.alerting'), value: unavailable, note: t('database.stat.pending'), tone: 'warning' }
+  ]
+})
 const canManageApps = computed(() => can(permissions.appsManage))
 const canManageDatabase = computed(() => can(permissions.databaseManage))
 const isOwner = computed(() => session.role.trim().toLowerCase() === 'owner')
@@ -468,6 +570,9 @@ const filteredGroups = computed(() => {
   if (!q) return instanceGroups.value
   return instanceGroups.value.filter((group) => groupSearchText(group).includes(q))
 })
+const activeDatabaseWorkbenchGroup = computed(() => {
+  return filteredGroups.value.find((group) => group.id === activeDatabaseGroupKey.value) ?? filteredGroups.value[0] ?? null
+})
 const runTasks = computed(() =>
   tasks.value.filter((item) =>
     item.type?.startsWith('apps.mysql.') ||
@@ -479,8 +584,7 @@ const runTasks = computed(() =>
 )
 const settingsItems = computed(() => [
   { label: 'MySQL', value: t('database.mysqlSettings') },
-  { label: 'Redis', value: t('database.redisSettings') },
-  { label: t('common.provider'), value: t('common.real') }
+  { label: 'Redis', value: t('database.redisSettings') }
 ])
 
 async function load() {
@@ -608,7 +712,7 @@ function groupDatabaseInstances(items: AppInstance[]) {
       const sentinelStatus = serviceStatus(normalizedGroup.sentinels)
       return {
         ...normalizedGroup,
-        endpoint: isUnavailable(nodeStatus) ? t('database.serviceUnavailable') : groupEndpoint(normalizedGroup),
+        endpoint: groupEndpoint(normalizedGroup),
         nodeStatus,
         routerStatus,
         sentinelStatus,
@@ -929,6 +1033,31 @@ function roleLabel(role: string) {
   }
 }
 
+function isRunningStatus(status: unknown) {
+  return ['running', 'available', 'success', 'ok', 'installed'].includes(String(status || '').trim().toLowerCase())
+}
+
+function isClusterDatabaseGroup(group: DatabaseGroup) {
+  return isClusterTopology(group.topology) || group.nodes.length > 1 || group.routers.length > 0 || group.sentinels.length > 0
+}
+
+function percentageText(value: number, total: number) {
+  if (total <= 0) return '-'
+  return `${Math.round((value / total) * 100)}%`
+}
+
+function statusText(status: unknown) {
+  return isRunningStatus(status) ? t('common.running') : t('database.serviceUnavailable')
+}
+
+function formatDate(value: unknown) {
+  const raw = String(value || '').trim()
+  if (!raw) return '-'
+  const date = new Date(raw)
+  if (Number.isNaN(date.getTime())) return raw
+  return date.toLocaleString()
+}
+
 function roleTagType(role: string) {
   switch (role) {
     case 'primary':
@@ -1215,10 +1344,6 @@ function isInstallFailedInstance(instance: AppInstance, metadata: InstanceMetada
   return installLifecycleDisplayStatus({ status: instance.status, metadata }) === 'failed'
 }
 
-function databaseServiceUnavailableText(group: DatabaseGroup) {
-  return group.app === 'redis' ? t('database.redisServiceUnavailable') : t('database.mysqlServiceUnavailable')
-}
-
 function groupSubtitle(group: DatabaseGroup) {
   const parts = [`${group.topology || '-'}`, `${t('database.nodes')} ${group.nodes.length}`]
   if (group.sentinels.length) {
@@ -1256,6 +1381,15 @@ function groupSearchText(group: DatabaseGroup) {
     ...group.routers.flatMap((node) => [node.serverLabel, node.endpoint, node.roleLabel]),
     ...group.sentinels.flatMap((node) => [node.serverLabel, node.endpoint, node.roleLabel])
   ].join(' ').toLowerCase()
+}
+
+function selectDatabaseResource(group: DatabaseGroup) {
+  activeDatabaseGroupKey.value = group.id
+}
+
+function openDatabaseResource(group: DatabaseGroup) {
+  selectDatabaseResource(group)
+  databaseDetailVisible.value = true
 }
 
 function defaultPort(app: string) {
@@ -1946,28 +2080,149 @@ onMounted(async () => {
   min-width: 0;
 }
 
-.db-card-grid {
+.database-stat-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(min(100%, 420px), 1fr));
-  gap: 16px;
-  padding: 24px;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 12px;
+}
+
+.database-stat-card {
+  position: relative;
+  min-height: 92px;
+  display: grid;
+  align-content: space-between;
+  gap: 8px;
+  overflow: hidden;
+  padding: 14px 16px;
+  border: 1px solid var(--aifar-border);
+  border-radius: var(--aifar-radius-lg);
+  background: rgba(255, 255, 255, .94);
+  box-shadow: var(--aifar-shadow-card);
+}
+
+.database-stat-card::before {
+  content: '';
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 3px;
+  background: var(--aifar-primary);
+}
+
+.database-stat-card span {
+  color: var(--aifar-text-secondary);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.database-stat-card strong {
+  color: var(--aifar-primary);
+  font-size: 28px;
+  line-height: 1;
+}
+
+.database-stat-card small {
+  color: var(--aifar-text-tertiary);
+  font-size: 12px;
+}
+
+.database-stat-card i {
+  position: absolute;
+  right: 14px;
+  bottom: 12px;
+  width: 54px;
+  height: 5px;
+  border-radius: 999px;
+  background: #edf4ff;
+}
+
+.database-stat-card.success::before {
+  background: #52c41a;
+}
+
+.database-stat-card.success strong {
+  color: #389e0d;
+}
+
+.database-stat-card.warning::before {
+  background: #faad14;
+}
+
+.database-stat-card.warning strong {
+  color: #d46b08;
+}
+
+.db-resource-shell {
+  display: grid;
+  grid-template-columns: minmax(0, 1.35fr) minmax(360px, .9fr);
+  gap: 14px;
+  min-height: 0;
+  padding: 12px;
+}
+
+.db-resource-list {
+  display: grid;
+  gap: 10px;
+  padding: 0;
   min-height: 0;
   overflow: auto;
 }
 
-.db-card {
+.db-resource-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
   border: 1px solid var(--aifar-border);
   border-radius: var(--aifar-radius-lg);
   background: #fff;
-  padding: 16px;
+  padding: 16px 18px;
   box-shadow: 0 1px 2px rgba(15, 35, 68, .03);
-  transition: border-color .16s ease, box-shadow .16s ease, transform .16s ease;
+  cursor: pointer;
+  transition: background .16s ease, border-color .16s ease, box-shadow .16s ease;
 }
 
-.db-card:hover {
+.db-resource-row:hover {
+  position: relative;
   border-color: #91caff;
-  box-shadow: var(--aifar-shadow-raised);
-  transform: translateY(-1px);
+  background: #f7fbff;
+  box-shadow: 0 2px 8px rgba(15, 35, 68, .06);
+  z-index: 1;
+}
+
+.db-resource-row.active {
+  border-color: #1677ff;
+  background: linear-gradient(90deg, #f0f8ff 0%, #fff 72%);
+  box-shadow: inset 3px 0 0 #1677ff, 0 2px 8px rgba(22, 119, 255, .08);
+}
+
+.resource-inline-detail {
+  min-width: 0;
+  max-height: min(640px, calc(100vh - 280px));
+  overflow: auto;
+  border: 1px solid var(--aifar-border);
+  border-radius: var(--aifar-radius-lg);
+  background: rgba(255, 255, 255, .96);
+  padding: 16px;
+  box-shadow: var(--aifar-shadow-card);
+}
+
+.inline-detail-actions {
+  display: flex;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--aifar-border-soft);
+}
+
+.db-resource-main {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  min-width: 0;
+  flex: 1;
 }
 
 .db-head {
@@ -1977,13 +2232,29 @@ onMounted(async () => {
   margin-bottom: 10px;
 }
 
-.db-head-actions {
+.db-resource-actions {
   display: flex;
   align-items: center;
   justify-content: flex-end;
   gap: 6px;
   flex-wrap: wrap;
   max-width: 320px;
+  flex: none;
+}
+
+.db-resource-actions :deep(.el-tag) {
+  min-height: 22px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  line-height: 1;
+}
+
+.db-resource-actions :deep(.el-tag__content) {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  line-height: 1;
 }
 
 .db-title-block {
@@ -1992,17 +2263,21 @@ onMounted(async () => {
 }
 
 .db-head strong,
-.db-head span {
+.db-head span,
+.db-resource-main strong,
+.db-resource-main span {
   display: block;
 }
 
-.db-head strong {
+.db-head strong,
+.db-resource-main strong {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.db-head span {
+.db-head span,
+.db-resource-main span {
   color: var(--aifar-text-tertiary);
   font-size: 12px;
 }
@@ -2019,48 +2294,43 @@ onMounted(async () => {
   font-weight: 850;
 }
 
-.db-grid {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 8px;
+.db-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 10px;
+  align-items: center;
+  margin-top: 12px;
+  color: var(--aifar-text-secondary);
+  font-size: 12px;
+  line-height: 20px;
 }
 
-.db-grid div {
-  min-height: 54px;
+.detail-summary {
+  padding: 12px;
   border: 1px solid var(--aifar-border-soft);
   border-radius: var(--aifar-radius);
-  background: #f7fbff;
-  padding: 8px;
+  background: #f8fbff;
+}
+
+.db-summary span {
+  display: inline-flex;
+  align-items: center;
   min-width: 0;
+  max-width: 100%;
 }
 
-.db-grid .db-grid-wide {
-  grid-column: 1 / -1;
-}
-
-.db-grid span {
-  display: block;
+.db-summary strong {
+  flex: none;
+  margin-right: 4px;
   color: var(--aifar-text-tertiary);
-  font-size: 11px;
+  font-weight: 650;
 }
 
-.db-grid strong {
-  display: block;
+.db-summary-wide {
+  width: 100%;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-}
-
-.db-grid-wide strong {
-  overflow: visible;
-  text-overflow: clip;
-  white-space: normal;
-  word-break: break-word;
-  line-height: 1.35;
-}
-
-.db-grid-tag {
-  margin-top: 6px;
 }
 
 .service-notice {
@@ -2111,6 +2381,17 @@ onMounted(async () => {
 
 .mysql-backup-actions :deep(.el-button + .el-button) {
   margin-left: 0;
+}
+
+.resource-detail-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.detail-head {
+  align-items: center;
+  margin-bottom: 0;
 }
 
 .maintenance-clear-confirm {
@@ -2196,16 +2477,21 @@ onMounted(async () => {
 }
 
 @media (max-width: 767px) {
+  .database-stat-grid {
+    grid-template-columns: 1fr;
+  }
+
   .monitor-actions {
     flex-wrap: wrap;
     justify-content: flex-start;
   }
 
-  .db-head {
+  .db-head,
+  .db-resource-row {
     flex-wrap: wrap;
   }
 
-  .db-head-actions {
+  .db-resource-actions {
     justify-content: flex-start;
     max-width: none;
     width: 100%;
@@ -2219,14 +2505,20 @@ onMounted(async () => {
     justify-content: flex-start;
   }
 
-  .db-card-grid {
-    grid-template-columns: 1fr;
-    padding: 16px;
+  .db-resource-list {
+    padding: 0;
   }
 
   .mysql-backup-actions {
     justify-content: flex-start;
   }
 
+  .db-resource-shell {
+    grid-template-columns: 1fr;
+  }
+
+  .resource-inline-detail {
+    max-height: none;
+  }
 }
 </style>

@@ -36,6 +36,7 @@ vi.mock('../servers/api', () => ({
 }))
 
 import { useRealtimeStore } from '../stores/realtime'
+import { useTaskProgressStore } from '../stores/taskProgress'
 import ServersView from './ServersView.vue'
 
 const server = {
@@ -71,6 +72,25 @@ describe('ServersView', () => {
 
     expect(listServersMock).toHaveBeenCalled()
     expect(probeServerMock).not.toHaveBeenCalled()
+  })
+
+  it('keeps manual probe out of the global task progress drawer', async () => {
+    const pinia = createPinia()
+    const wrapper = shallowMount(ServersView, {
+      global: {
+        plugins: [pinia],
+        stubs: { 'el-button': true, 'el-tooltip': true }
+      }
+    })
+    await flushPromises()
+    const progress = useTaskProgressStore(pinia)
+    const trackSpy = vi.spyOn(progress, 'track')
+
+    wrapper.findComponent({ name: 'ServerDetailPanel' }).vm.$emit('probe', server)
+    await flushPromises()
+
+    expect(probeServerMock).toHaveBeenCalledWith('srv-1')
+    expect(trackSpy).not.toHaveBeenCalled()
   })
 
   it('applies pushed server status snapshots through the realtime revision watcher', async () => {

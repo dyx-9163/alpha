@@ -4,12 +4,14 @@ import {
   runtimeIngressColumns,
   runtimeLogWorkspaceTabLabels,
   runtimeLogWorkspaceTabOrder,
+  runtimeResourceTabLabels,
   runtimeResourceTabOrder
 } from './surface'
 
 describe('AIFAR Runtime surface policy', () => {
-  it('places release history after every operational resource tab', () => {
-    expect(runtimeResourceTabOrder).toEqual(['deployments', 'services', 'pods', 'logs', 'ingress', 'releases'])
+  it('keeps release history out of the operational runtime tabs', () => {
+    expect(runtimeResourceTabOrder).toEqual(['deployments', 'services', 'pods', 'logs', 'ingress'])
+    expect(runtimeResourceTabLabels).not.toHaveProperty('releases')
   })
 
   it('keeps only operational routing columns in ingress discovery', () => {

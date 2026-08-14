@@ -114,9 +114,6 @@ func (a *API) probeServer(w http.ResponseWriter, r *http.Request) {
 	task, err := a.tasks.StartWithLanguage("servers.probe", id, actor, lang, func(ctx context.Context, log worker.Logger) error {
 		return a.servers.Probe(ctx, id, lang, log)
 	})
-	if err == nil {
-		a.audit(r, "servers.probe", id, "running", task.ID)
-	}
 	respondTask(w, task, err)
 }
 

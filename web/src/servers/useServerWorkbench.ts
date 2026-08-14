@@ -15,7 +15,6 @@ const fallbackServerDefaults: ServerDefaults = {
 }
 
 export type ServerSnapshotResolver = (serverId: string) => StatusSnapshot | undefined
-export type ServerTaskTracker = (taskId: string, label: string) => void
 
 export function createServerForm(row?: Partial<ServerRecord>, defaults: ServerDefaults = fallbackServerDefaults): ServerFormModel {
   return {
@@ -37,8 +36,7 @@ export function createServerForm(row?: Partial<ServerRecord>, defaults: ServerDe
 
 export function useServerWorkbench(
   t: (key: string, params?: Record<string, unknown>) => string,
-  resolveSnapshot: ServerSnapshotResolver = () => undefined,
-  trackTask: ServerTaskTracker = () => undefined
+  resolveSnapshot: ServerSnapshotResolver = () => undefined
 ) {
   const servers = ref<ServerRecord[]>([])
   const selectedId = ref('')
@@ -147,10 +145,7 @@ export function useServerWorkbench(
     patchServerStatus(row.id, 'probing', '')
     activeTab.value = 'overview'
     try {
-      const result = await probeServer(row.id)
-      if (result.taskId) {
-        trackTask(result.taskId, t('servers.probe'))
-      }
+      await probeServer(row.id)
     } finally {
       setProbing(row.id, false)
       await load()

@@ -14,8 +14,7 @@ export const runtimeResourceTabOrder = [
   'services',
   'pods',
   'logs',
-  'ingress',
-  'releases'
+  'ingress'
 ] as const satisfies readonly RuntimeResourceTab[]
 
 export const runtimeResourceTabLabels: Record<RuntimeResourceTab, string> = {
@@ -23,8 +22,7 @@ export const runtimeResourceTabLabels: Record<RuntimeResourceTab, string> = {
   services: 'containers.services',
   pods: 'containers.pods',
   logs: 'containers.logs',
-  ingress: 'containers.ingressAndNacos',
-  releases: 'containers.releases'
+  ingress: 'containers.ingressAndNacos'
 }
 
 export const runtimeIngressColumns = ['service', 'app', 'discoveryTarget', 'endpoint'] as const

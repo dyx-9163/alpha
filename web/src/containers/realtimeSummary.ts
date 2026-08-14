@@ -1,4 +1,5 @@
 import type { DockerSummaryResponse } from './dockerApi'
+import type { StatusSnapshot } from '../stores/realtime'
 
 export function mergeDockerSummarySnapshot(current: DockerSummaryResponse, event: unknown) {
   const envelope = realtimeSnapshotEnvelope(event)
@@ -10,6 +11,23 @@ export function mergeDockerSummarySnapshot(current: DockerSummaryResponse, event
     ...current,
     available: payload.available === true,
     error: typeof envelope?.lastError === 'string' ? envelope.lastError : current.error,
+    summary: objectPayload(payload.summary) ?? current.summary,
+    diskUsage: current.diskUsage
+  }
+}
+
+export function dockerSummaryFromStatusSnapshot(snapshot: StatusSnapshot | undefined, current: DockerSummaryResponse = {}) {
+  if (!snapshot || snapshot.scope !== 'docker.summary') {
+    return null
+  }
+  const payload = objectPayload(snapshot.payload)
+  if (!payload) {
+    return null
+  }
+  return {
+    ...current,
+    available: payload.available === true,
+    error: typeof snapshot.lastError === 'string' ? snapshot.lastError : current.error,
     summary: objectPayload(payload.summary) ?? current.summary,
     diskUsage: current.diskUsage
   }

@@ -34,60 +34,55 @@
           </div>
         </div>
 
-        <div v-if="filteredGroups.length" class="nacos-card-grid">
-          <article v-for="group in filteredGroups" :key="group.id" class="nacos-card">
+        <div v-if="filteredGroups.length" class="nacos-resource-shell">
+          <div class="nacos-resource-list">
+          <article
+            v-for="group in filteredGroups"
+            :key="group.id"
+            class="nacos-resource-row"
+            :class="{ active: activeNacosWorkbenchGroup?.id === group.id }"
+            @click="selectNacosResource(group)"
+          >
             <div class="nacos-head">
               <div class="app-icon small">NA</div>
               <div class="nacos-title-block">
                 <strong>{{ group.title }}</strong>
                 <span>{{ group.topology }} / {{ t('nacos.nodes') }} {{ group.nodes.length }}</span>
+                <div class="nacos-summary">
+                  <span><strong>{{ t('common.version') }}</strong>{{ group.version || '-' }}</span>
+                  <span><strong>{{ t('dashboard.topology') }}</strong>{{ group.topology || '-' }}</span>
+                  <span class="nacos-summary-wide"><strong>{{ t('nacos.consoleEndpoint') }}</strong>{{ group.endpoint || '-' }}</span>
+                </div>
               </div>
               <div class="nacos-head-actions">
                 <StatusTag :status="group.status" />
+                <el-button size="small" @click.stop="openNacosResource(group)">{{ t('common.details') }}</el-button>
               </div>
             </div>
-
-            <div class="nacos-info-grid">
-              <div>
-                <span>{{ t('nacos.service') }}</span>
-                <strong>nacos</strong>
+          </article>
+          </div>
+          <aside v-if="activeNacosWorkbenchGroup" class="resource-inline-detail nacos-inline-detail">
+            <div class="nacos-head detail-head">
+              <div class="app-icon small">NA</div>
+              <div class="nacos-title-block">
+                <strong>{{ activeNacosWorkbenchGroup.title }}</strong>
+                <span>{{ activeNacosWorkbenchGroup.topology }} / {{ t('nacos.nodes') }} {{ activeNacosWorkbenchGroup.nodes.length }}</span>
               </div>
-              <div>
-                <span>{{ t('common.version') }}</span>
-                <strong>{{ group.version || '-' }}</strong>
-              </div>
-              <div>
-                <span>{{ t('dashboard.topology') }}</span>
-                <strong>{{ group.topology || '-' }}</strong>
-              </div>
-              <div>
-                <span>{{ t('nacos.nodes') }}</span>
-                <strong>{{ group.nodes.length }}</strong>
-              </div>
-              <div>
-                <span>{{ t('nacos.auth') }}</span>
-                <strong>{{ group.authLabel }}</strong>
-              </div>
-              <div>
-                <span>{{ t('nacos.raftPort') }}</span>
-                <strong>{{ group.raftPort || '-' }}</strong>
-              </div>
-              <div class="nacos-info-wide">
-                <span>{{ t('nacos.consoleEndpoint') }}</span>
-                <strong>{{ group.endpoint || '-' }}</strong>
-              </div>
-              <div class="nacos-info-wide">
-                <span>{{ t('nacos.externalDatabase') }}</span>
-                <strong>{{ group.database || t('nacos.noDatabase') }}</strong>
+              <div class="nacos-head-actions">
+                <StatusTag :status="activeNacosWorkbenchGroup.status" />
               </div>
             </div>
-
-            <div v-if="isInstallFailedGroup(group)" class="service-notice danger">{{ t('apps.installFailedCleanupHint') }}</div>
-            <div v-if="isUnavailable(group.status)" class="service-notice danger">{{ t('nacos.serviceUnavailable') }}</div>
-
+            <div class="nacos-summary detail-summary">
+              <span><strong>{{ t('common.version') }}</strong>{{ activeNacosWorkbenchGroup.version || '-' }}</span>
+              <span><strong>{{ t('dashboard.topology') }}</strong>{{ activeNacosWorkbenchGroup.topology || '-' }}</span>
+              <span><strong>{{ t('nacos.nodes') }}</strong>{{ activeNacosWorkbenchGroup.nodes.length }}</span>
+              <span><strong>{{ t('nacos.auth') }}</strong>{{ activeNacosWorkbenchGroup.authLabel }}</span>
+              <span v-if="activeNacosWorkbenchGroup.raftPort"><strong>{{ t('nacos.raftPort') }}</strong>{{ activeNacosWorkbenchGroup.raftPort }}</span>
+              <span class="nacos-summary-wide"><strong>{{ t('nacos.consoleEndpoint') }}</strong>{{ activeNacosWorkbenchGroup.endpoint || '-' }}</span>
+            </div>
             <div class="nacos-node-list">
               <div class="section-label">{{ t('nacos.nodes') }}</div>
-              <div v-for="node in group.nodes" :key="node.instance.id" class="nacos-node-row">
+              <div v-for="node in activeNacosWorkbenchGroup.nodes" :key="node.instance.id" class="nacos-node-row">
                 <div class="nacos-node-main">
                   <strong>{{ node.serverLabel }}</strong>
                   <span>{{ node.endpoint }}</span>
@@ -99,7 +94,10 @@
                 </div>
               </div>
             </div>
-          </article>
+            <div class="inline-detail-actions">
+              <el-button size="small" @click="openNacosResource(activeNacosWorkbenchGroup)">{{ t('common.details') }}</el-button>
+            </div>
+          </aside>
         </div>
         <div v-else class="empty-state">
           <div>
@@ -257,6 +255,50 @@
         </div>
       </template>
     </div>
+
+    <el-drawer
+      v-model="nacosDetailVisible"
+      :title="activeNacosGroup?.title || t('nacos.instances')"
+      size="min(720px, calc(100vw - 24px))"
+      class="nacos-detail-drawer"
+    >
+      <div v-if="activeNacosGroup" class="resource-detail-stack">
+        <div class="nacos-head detail-head">
+          <div class="app-icon small">NA</div>
+          <div class="nacos-title-block">
+            <strong>{{ activeNacosGroup.title }}</strong>
+            <span>{{ activeNacosGroup.topology }} / {{ t('nacos.nodes') }} {{ activeNacosGroup.nodes.length }}</span>
+          </div>
+          <div class="nacos-head-actions">
+            <StatusTag :status="activeNacosGroup.status" />
+          </div>
+        </div>
+        <div class="nacos-summary detail-summary">
+          <span><strong>{{ t('common.version') }}</strong>{{ activeNacosGroup.version || '-' }}</span>
+          <span><strong>{{ t('dashboard.topology') }}</strong>{{ activeNacosGroup.topology || '-' }}</span>
+          <span><strong>{{ t('nacos.nodes') }}</strong>{{ activeNacosGroup.nodes.length }}</span>
+          <span><strong>{{ t('nacos.auth') }}</strong>{{ activeNacosGroup.authLabel }}</span>
+          <span v-if="activeNacosGroup.raftPort"><strong>{{ t('nacos.raftPort') }}</strong>{{ activeNacosGroup.raftPort }}</span>
+          <span class="nacos-summary-wide"><strong>{{ t('nacos.consoleEndpoint') }}</strong>{{ activeNacosGroup.endpoint || '-' }}</span>
+          <span class="nacos-summary-wide"><strong>{{ t('nacos.externalDatabase') }}</strong>{{ activeNacosGroup.database || t('nacos.noDatabase') }}</span>
+        </div>
+        <div v-if="isInstallFailedGroup(activeNacosGroup)" class="service-notice danger">{{ t('apps.installFailedCleanupHint') }}</div>
+        <div class="nacos-node-list">
+          <div class="section-label">{{ t('nacos.nodes') }}</div>
+          <div v-for="node in activeNacosGroup.nodes" :key="node.instance.id" class="nacos-node-row">
+            <div class="nacos-node-main">
+              <strong>{{ node.serverLabel }}</strong>
+              <span>{{ node.endpoint }}</span>
+            </div>
+            <div class="nacos-node-tags">
+              <el-tag size="small" type="info" effect="plain">{{ node.roleLabel }}</el-tag>
+              <el-tag size="small" type="info" effect="plain">{{ node.grpcPorts }}</el-tag>
+              <StatusTag :status="node.status" />
+            </div>
+          </div>
+        </div>
+      </div>
+    </el-drawer>
 
   </section>
 </template>
@@ -429,15 +471,21 @@ const pendingDeleteGroup = ref<NacosGroup | null>(null)
 const deletePasswords = ref<Record<string, string>>({})
 const sameDeletePassword = ref(false)
 const deleteSharedPassword = ref('')
+const activeNacosGroupKey = ref('')
+const nacosDetailVisible = ref(false)
 const canManageApps = computed(() => can(permissions.appsManage))
 const liveInstances = computed(() => instances.value.map((instance) => applyRealtimeStatusToAppInstance(instance, realtime.appInstanceSnapshot(instance.id))))
 const liveDatabaseInstances = computed(() => databaseInstances.value.map((instance) => applyRealtimeStatusToAppInstance(instance, realtime.appInstanceSnapshot(instance.id))))
 const liveStorageInstances = computed(() => storageInstances.value.map((instance) => applyRealtimeStatusToAppInstance(instance, realtime.appInstanceSnapshot(instance.id))))
 const nacosGroups = computed(() => buildNacosGroups(liveInstances.value))
+const activeNacosGroup = computed(() => nacosGroups.value.find((group) => group.id === activeNacosGroupKey.value) ?? null)
 const filteredGroups = computed(() => {
   const q = search.value.trim().toLowerCase()
   if (!q) return nacosGroups.value
   return nacosGroups.value.filter((group) => nacosGroupSearchText(group).includes(q))
+})
+const activeNacosWorkbenchGroup = computed(() => {
+  return filteredGroups.value.find((group) => group.id === activeNacosGroupKey.value) ?? filteredGroups.value[0] ?? null
 })
 const clusterGroupCount = computed(() => nacosGroups.value.filter((group) => group.topology === 'cluster').length)
 const standaloneGroupCount = computed(() => nacosGroups.value.filter((group) => group.topology !== 'cluster').length)
@@ -464,8 +512,7 @@ const monitoringStatusLabel = computed(() => {
 const settingsItems = computed(() => [
   { label: t('nacos.defaultPorts'), value: t('nacos.defaultPortsHint') },
   { label: t('nacos.cluster'), value: t('nacos.clusterSettings') },
-  { label: t('nacos.standalone'), value: t('nacos.standaloneSettings') },
-  { label: t('common.provider'), value: t('common.real') }
+  { label: t('nacos.standalone'), value: t('nacos.standaloneSettings') }
 ])
 const deletePromptMessage = computed(() => {
   const group = pendingDeleteGroup.value
@@ -772,10 +819,6 @@ function nacosGroupStatus(nodes: NacosNode[]) {
   return moduleRuntimeGroupStatus(nodes.map((node) => node.status))
 }
 
-function isUnavailable(status: string) {
-  return status === 'unavailable'
-}
-
 function displayInstanceStatus(item: AppInstance) {
   const metadata = metadataOf(item)
   if (isInstallFailedInstance(item, metadata)) {
@@ -914,6 +957,15 @@ function nacosGroupSearchText(group: NacosGroup) {
   ].join(' ').toLowerCase()
 }
 
+function selectNacosResource(group: NacosGroup) {
+  activeNacosGroupKey.value = group.id
+}
+
+function openNacosResource(group: NacosGroup) {
+  selectNacosResource(group)
+  nacosDetailVisible.value = true
+}
+
 function openTaskDetails(row: { id: string }) {
   void router.push({ path: '/tasks', query: { taskId: row.id } })
 }
@@ -1039,28 +1091,67 @@ onMounted(async () => {
   min-width: 0;
 }
 
-.nacos-card-grid {
+.nacos-resource-shell {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(min(100%, 420px), 1fr));
-  gap: 12px;
+  grid-template-columns: minmax(0, 1.35fr) minmax(340px, .9fr);
+  gap: 14px;
+  min-height: 0;
   padding: 12px;
+}
+
+.nacos-resource-list {
+  display: grid;
+  gap: 10px;
+  padding: 0;
   min-height: 0;
   overflow: auto;
 }
 
-.nacos-card {
+.nacos-resource-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
   border: 1px solid var(--aifar-border);
   border-radius: var(--aifar-radius-lg);
   background: #fff;
-  padding: 12px;
+  padding: 16px 18px;
   box-shadow: 0 1px 2px rgba(15, 35, 68, .03);
-  transition: border-color .16s ease, box-shadow .16s ease, transform .16s ease;
+  cursor: pointer;
+  transition: background .16s ease, border-color .16s ease, box-shadow .16s ease;
 }
 
-.nacos-card:hover {
+.nacos-resource-row:hover {
+  position: relative;
   border-color: #91caff;
-  box-shadow: var(--aifar-shadow-raised);
-  transform: translateY(-1px);
+  background: #f7fbff;
+  box-shadow: 0 2px 8px rgba(15, 35, 68, .06);
+  z-index: 1;
+}
+
+.nacos-resource-row.active {
+  border-color: #1677ff;
+  background: linear-gradient(90deg, #f0f8ff 0%, #fff 72%);
+  box-shadow: inset 3px 0 0 #1677ff, 0 2px 8px rgba(22, 119, 255, .08);
+}
+
+.resource-inline-detail {
+  min-width: 0;
+  max-height: min(640px, calc(100vh - 280px));
+  overflow: auto;
+  border: 1px solid var(--aifar-border);
+  border-radius: var(--aifar-radius-lg);
+  background: rgba(255, 255, 255, .96);
+  padding: 16px;
+  box-shadow: var(--aifar-shadow-card);
+}
+
+.inline-detail-actions {
+  display: flex;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--aifar-border-soft);
 }
 
 .nacos-head {
@@ -1100,6 +1191,21 @@ onMounted(async () => {
   max-width: 240px;
 }
 
+.nacos-head-actions :deep(.el-tag) {
+  min-height: 22px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  line-height: 1;
+}
+
+.nacos-head-actions :deep(.el-tag__content) {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  line-height: 1;
+}
+
 .app-icon.small {
   width: 34px;
   height: 34px;
@@ -1112,44 +1218,54 @@ onMounted(async () => {
   font-weight: 850;
 }
 
-.nacos-info-grid {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 8px;
+.nacos-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
 }
 
-.nacos-info-grid div {
-  min-height: 54px;
-  border: 1px solid var(--aifar-border-soft);
-  border-radius: var(--aifar-radius);
-  background: #f7fbff;
-  padding: 8px;
+.nacos-summary span {
   min-width: 0;
-}
-
-.nacos-info-grid .nacos-info-wide {
-  grid-column: 1 / -1;
-}
-
-.nacos-info-grid span {
-  display: block;
-  color: var(--aifar-text-tertiary);
-  font-size: 11px;
-}
-
-.nacos-info-grid strong {
-  display: block;
+  max-width: 100%;
+  border: 1px solid var(--aifar-border-soft);
+  border-radius: 999px;
+  background: #f7fbff;
+  color: var(--aifar-text-secondary);
+  padding: 4px 8px;
+  font-size: 12px;
+  line-height: 1.35;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.nacos-info-wide strong {
-  overflow: visible;
-  text-overflow: clip;
-  white-space: normal;
-  word-break: break-word;
-  line-height: 1.35;
+.nacos-summary strong {
+  margin-right: 4px;
+  color: var(--aifar-text-tertiary);
+  font-weight: 650;
+}
+
+.nacos-summary-wide {
+  flex: 1 1 100%;
+}
+
+.detail-summary {
+  padding: 12px;
+  border: 1px solid var(--aifar-border-soft);
+  border-radius: var(--aifar-radius);
+  background: #f8fbff;
+}
+
+.resource-detail-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.detail-head {
+  align-items: center;
+  margin-bottom: 0;
 }
 
 .service-notice {
@@ -1332,8 +1448,13 @@ onMounted(async () => {
 @media (max-width: 720px) {
   .config-publish-grid,
   .config-code-grid,
-  .config-field-row {
+  .config-field-row,
+  .nacos-resource-shell {
     grid-template-columns: 1fr;
+  }
+
+  .resource-inline-detail {
+    max-height: none;
   }
 
   .monitor-actions,

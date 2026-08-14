@@ -33,11 +33,6 @@
             </el-dropdown-menu>
           </template>
         </el-dropdown>
-        <el-tooltip :content="t('common.refresh')" placement="top">
-          <el-button size="small" circle :loading="loading" :aria-label="t('common.refresh')" @click="loadAifarRuntime(true)">
-            <el-icon><Refresh /></el-icon>
-          </el-button>
-        </el-tooltip>
       </div>
     </div>
     <el-alert
@@ -66,14 +61,12 @@
 
 <script setup lang="ts">
 import type { Component } from 'vue'
-import { Refresh } from '@element-plus/icons-vue'
 import StatusTag from '../../components/StatusTag.vue'
 import AifarRuntimeDeploymentsTab from './AifarRuntimeDeploymentsTab.vue'
 import AifarRuntimeIngressTab from './AifarRuntimeIngressTab.vue'
 import AifarRuntimeLogsTab from './AifarRuntimeLogsTab.vue'
 import AifarRuntimeOverflowAction from './AifarRuntimeOverflowAction.vue'
 import AifarRuntimePodsTab from './AifarRuntimePodsTab.vue'
-import AifarRuntimeReleasesTab from './AifarRuntimeReleasesTab.vue'
 import AifarRuntimeServicesTab from './AifarRuntimeServicesTab.vue'
 import AifarRuntimeSummary from './AifarRuntimeSummary.vue'
 import { useAifarRuntimeContext, type RuntimeResourceTab } from './context'
@@ -86,8 +79,7 @@ const runtimeResourceTabComponents: Record<RuntimeResourceTab, Component> = {
   services: AifarRuntimeServicesTab,
   pods: AifarRuntimePodsTab,
   logs: AifarRuntimeLogsTab,
-  ingress: AifarRuntimeIngressTab,
-  releases: AifarRuntimeReleasesTab
+  ingress: AifarRuntimeIngressTab
 }
 
 const {
@@ -110,7 +102,6 @@ const {
   restartAllAifarRuntime,
   runtimeCleanupDisabledReason,
   cleanupAifarRuntimeStale,
-  loadAifarRuntime,
   aifarRuntimeWarnings,
   runtimeSummaryItems,
   runtimeResourceTab

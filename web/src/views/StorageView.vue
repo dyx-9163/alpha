@@ -46,100 +46,64 @@
       </div>
 
       <template v-if="tab === 'instances'">
-        <div v-if="storageGroups.length" class="storage-card-grid">
-          <article v-for="group in storageGroups" :key="group.id" class="storage-card">
+        <div v-if="storageGroups.length" class="storage-resource-shell">
+          <div class="storage-resource-list">
+          <article
+            v-for="group in storageGroups"
+            :key="group.id"
+            class="storage-resource-row"
+            :class="{ active: activeStorageWorkbenchGroup?.id === group.id }"
+            @click="selectStorageResource(group)"
+          >
             <div class="storage-head">
               <div class="app-icon small">S3</div>
               <div class="storage-title-block">
                 <strong>{{ group.title }}</strong>
                 <span>{{ group.topology }} / {{ t('storage.minioNodes') }} {{ group.nodes.length }}</span>
+                <div class="storage-summary">
+                  <span><strong>{{ t('common.version') }}</strong>{{ group.version || '-' }}</span>
+                  <span><strong>{{ t('dashboard.topology') }}</strong>{{ group.topology || '-' }}</span>
+                  <span><strong>{{ t('storage.minioNodes') }}</strong>{{ group.nodes.length }}</span>
+                  <span class="storage-summary-wide"><strong>{{ t('storage.assignedCapacity') }}</strong>{{ groupCapacityText(group) }}</span>
+                </div>
               </div>
               <div class="storage-head-actions">
                 <StatusTag :status="group.status" />
+                <el-button size="small" @click.stop="openStorageResource(group)">{{ t('common.details') }}</el-button>
               </div>
             </div>
 
-            <div class="storage-info-grid">
-              <div>
-                <span>{{ t('storage.service') }}</span>
-                <strong>minio</strong>
+
+
+
+          </article>
+          </div>
+          <aside v-if="activeStorageWorkbenchGroup" class="resource-inline-detail storage-inline-detail">
+            <div class="storage-head detail-head">
+              <div class="app-icon small">S3</div>
+              <div class="storage-title-block">
+                <strong>{{ activeStorageWorkbenchGroup.title }}</strong>
+                <span>{{ activeStorageWorkbenchGroup.topology }} / {{ t('storage.minioNodes') }} {{ activeStorageWorkbenchGroup.nodes.length }}</span>
               </div>
-              <div>
-                <span>{{ t('common.version') }}</span>
-                <strong>{{ group.version || '-' }}</strong>
-              </div>
-              <div>
-                <span>{{ t('dashboard.topology') }}</span>
-                <strong>{{ group.topology || '-' }}</strong>
-              </div>
-              <div>
-                <span>{{ t('storage.minioNodes') }}</span>
-                <strong>{{ group.nodes.length }}</strong>
-              </div>
-              <div>
-                <span>{{ t('storage.assignedCapacity') }}</span>
-                <strong>{{ groupCapacityText(group) }}</strong>
-              </div>
-              <div>
-                <span>{{ t('storage.storageUsedAvailable') }}</span>
-                <strong>{{ groupUsedAvailableText(group) }}</strong>
-              </div>
-              <div>
-                <span>{{ t('storage.cleanupPolicy') }}</span>
-                <strong>{{ groupCleanupPolicyText(group) }}</strong>
-              </div>
-              <div>
-                <span>{{ t('storage.cleanupEstimate') }}</span>
-                <strong>{{ groupCleanupEstimateText(group) }}</strong>
-              </div>
-              <div class="storage-info-wide">
-                <span>{{ t('storage.replicationBuckets') }}</span>
-                <strong>{{ displayBuckets(group) }}</strong>
-              </div>
-              <div v-if="isBucketReplication(group)" class="storage-info-wide">
-                <span>{{ t('storage.replicationProfile') }}</span>
-                <strong>{{ replicationProfileText(group) }}</strong>
+              <div class="storage-head-actions">
+                <StatusTag :status="activeStorageWorkbenchGroup.status" />
               </div>
             </div>
-
-            <div v-if="isInstallFailedGroup(group)" class="service-notice danger">{{ t('apps.installFailedCleanupHint') }}</div>
-
-            <div v-if="isBucketReplication(group)" class="bucket-sync-list">
-              <div class="section-label">{{ t('storage.bucketSync') }}</div>
-              <div v-for="pair in replicationPairs(group)" :key="pair.key" class="sync-row">
-                <div class="sync-bucket">{{ pair.bucket }}</div>
-                <div class="sync-endpoint">
-                  <span>{{ pair.source?.roleLabel || '-' }}</span>
-                  <strong>{{ syncEndpointLabel(pair.source, pair.bucket) }}</strong>
-                </div>
-                <div class="sync-arrow">{{ t('storage.twoWaySync') }}</div>
-                <div class="sync-endpoint">
-                  <span>{{ pair.target?.roleLabel || '-' }}</span>
-                  <strong>{{ syncEndpointLabel(pair.target, pair.bucket) }}</strong>
-                </div>
-              </div>
+            <div class="storage-summary detail-summary">
+              <span><strong>{{ t('common.version') }}</strong>{{ activeStorageWorkbenchGroup.version || '-' }}</span>
+              <span><strong>{{ t('dashboard.topology') }}</strong>{{ activeStorageWorkbenchGroup.topology || '-' }}</span>
+              <span><strong>{{ t('storage.minioNodes') }}</strong>{{ activeStorageWorkbenchGroup.nodes.length }}</span>
+              <span><strong>{{ t('storage.assignedCapacity') }}</strong>{{ groupCapacityText(activeStorageWorkbenchGroup) }}</span>
+              <span><strong>{{ t('storage.storageUsedAvailable') }}</strong>{{ groupUsedAvailableText(activeStorageWorkbenchGroup) }}</span>
+              <span class="storage-summary-wide"><strong>{{ t('storage.replicationBuckets') }}</strong>{{ displayBuckets(activeStorageWorkbenchGroup) }}</span>
             </div>
-
             <div class="storage-node-list">
               <div class="section-label">{{ t('storage.minioNodes') }}</div>
-              <div v-for="node in group.nodes" :key="node.instance.id" class="storage-node-row">
+              <div v-for="node in activeStorageWorkbenchGroup.nodes" :key="node.instance.id" class="storage-node-row">
                 <div class="storage-node-main">
                   <strong>{{ node.serverLabel }}</strong>
                   <span>{{ node.endpoint }}</span>
                   <small>{{ nodeInsightText(node) }}</small>
-                  <div v-if="node.storageDisks.length" class="storage-disk-list">
-                    <div v-for="disk in node.storageDisks" :key="`${node.instance.id}:${disk.index}:${disk.path}`" class="storage-disk-row">
-                      <div>
-                        <strong>{{ diskLabel(disk) }}</strong>
-                        <span>{{ disk.device || '-' }}</span>
-                      </div>
-                      <div>
-                        <strong>{{ formatBytes(disk.totalBytes) }}</strong>
-                        <span>{{ diskUsageText(disk) }}</span>
-                      </div>
-                      <small>{{ disk.mountPoint || '-' }} · {{ disk.path }}</small>
-                    </div>
-                  </div>
                 </div>
                 <div class="storage-node-tags">
                   <el-tag size="small" type="info">{{ node.roleLabel }}</el-tag>
@@ -147,7 +111,10 @@
                 </div>
               </div>
             </div>
-          </article>
+            <div class="inline-detail-actions">
+              <el-button size="small" @click="openStorageResource(activeStorageWorkbenchGroup)">{{ t('common.details') }}</el-button>
+            </div>
+          </aside>
         </div>
         <div v-else class="empty-state storage-empty">
           <div>
@@ -256,6 +223,84 @@
         <div v-else class="empty-state"><div><strong>{{ t('storage.noInstanceSelected') }}</strong><span>{{ t('storage.emptyDesc') }}</span></div></div>
       </template>
     </div>
+
+    <el-drawer
+      v-model="storageDetailVisible"
+      :title="activeStorageGroup?.title || t('storage.instances')"
+      size="min(720px, calc(100vw - 24px))"
+      class="storage-detail-drawer"
+    >
+      <div v-if="activeStorageGroup" class="resource-detail-stack">
+        <div class="storage-head detail-head">
+          <div class="app-icon small">S3</div>
+          <div class="storage-title-block">
+            <strong>{{ activeStorageGroup.title }}</strong>
+            <span>{{ activeStorageGroup.topology }} / {{ t('storage.minioNodes') }} {{ activeStorageGroup.nodes.length }}</span>
+          </div>
+          <div class="storage-head-actions">
+            <StatusTag :status="activeStorageGroup.status" />
+          </div>
+        </div>
+
+        <div class="storage-summary detail-summary">
+          <span><strong>{{ t('common.version') }}</strong>{{ activeStorageGroup.version || '-' }}</span>
+          <span><strong>{{ t('dashboard.topology') }}</strong>{{ activeStorageGroup.topology || '-' }}</span>
+          <span><strong>{{ t('storage.minioNodes') }}</strong>{{ activeStorageGroup.nodes.length }}</span>
+          <span><strong>{{ t('storage.assignedCapacity') }}</strong>{{ groupCapacityText(activeStorageGroup) }}</span>
+          <span><strong>{{ t('storage.storageUsedAvailable') }}</strong>{{ groupUsedAvailableText(activeStorageGroup) }}</span>
+          <span><strong>{{ t('storage.cleanupPolicy') }}</strong>{{ groupCleanupPolicyText(activeStorageGroup) }}</span>
+          <span><strong>{{ t('storage.cleanupEstimate') }}</strong>{{ groupCleanupEstimateText(activeStorageGroup) }}</span>
+          <span class="storage-summary-wide"><strong>{{ t('storage.replicationBuckets') }}</strong>{{ displayBuckets(activeStorageGroup) }}</span>
+          <span v-if="isBucketReplication(activeStorageGroup)" class="storage-summary-wide"><strong>{{ t('storage.replicationProfile') }}</strong>{{ replicationProfileText(activeStorageGroup) }}</span>
+        </div>
+
+        <div v-if="isInstallFailedGroup(activeStorageGroup)" class="service-notice danger">{{ t('apps.installFailedCleanupHint') }}</div>
+
+        <div v-if="isBucketReplication(activeStorageGroup)" class="bucket-sync-list">
+          <div class="section-label">{{ t('storage.bucketSync') }}</div>
+          <div v-for="pair in replicationPairs(activeStorageGroup)" :key="pair.key" class="sync-row">
+            <div class="sync-bucket">{{ pair.bucket }}</div>
+            <div class="sync-endpoint">
+              <span>{{ pair.source?.roleLabel || '-' }}</span>
+              <strong>{{ syncEndpointLabel(pair.source, pair.bucket) }}</strong>
+            </div>
+            <div class="sync-arrow">{{ t('storage.twoWaySync') }}</div>
+            <div class="sync-endpoint">
+              <span>{{ pair.target?.roleLabel || '-' }}</span>
+              <strong>{{ syncEndpointLabel(pair.target, pair.bucket) }}</strong>
+            </div>
+          </div>
+        </div>
+
+        <div class="storage-node-list">
+          <div class="section-label">{{ t('storage.minioNodes') }}</div>
+          <div v-for="node in activeStorageGroup.nodes" :key="node.instance.id" class="storage-node-row">
+            <div class="storage-node-main">
+              <strong>{{ node.serverLabel }}</strong>
+              <span>{{ node.endpoint }}</span>
+              <small>{{ nodeInsightText(node) }}</small>
+              <div v-if="node.storageDisks.length" class="storage-disk-list">
+                <div v-for="disk in node.storageDisks" :key="`${node.instance.id}:${disk.index}:${disk.path}`" class="storage-disk-row">
+                  <div>
+                    <strong>{{ diskLabel(disk) }}</strong>
+                    <span>{{ disk.device || '-' }}</span>
+                  </div>
+                  <div>
+                    <strong>{{ formatBytes(disk.totalBytes) }}</strong>
+                    <span>{{ diskUsageText(disk) }}</span>
+                  </div>
+                  <small>{{ disk.mountPoint || '-' }} / {{ disk.path }}</small>
+                </div>
+              </div>
+            </div>
+            <div class="storage-node-tags">
+              <el-tag size="small" type="info">{{ node.roleLabel }}</el-tag>
+              <StatusTag :status="node.status" />
+            </div>
+          </div>
+        </div>
+      </div>
+    </el-drawer>
 
     <el-dialog v-model="itemDialogVisible" :title="dialogTitle" width="520px">
       <el-form label-position="top">
@@ -375,6 +420,8 @@ const tasks = ref<any[]>([])
 const selectedInstanceId = ref('')
 const tab = ref('instances')
 const search = ref('')
+const activeStorageGroupKey = ref('')
+const storageDetailVisible = ref(false)
 const itemDialogVisible = ref(false)
 const deleteDialogVisible = ref(false)
 const deleteSubmitting = ref(false)
@@ -415,10 +462,13 @@ const storageGroups = computed(() => {
   if (!q) return groups
   return groups.filter((group) => storageGroupSearchText(group).includes(q))
 })
+const activeStorageGroup = computed(() => storageGroups.value.find((group) => group.id === activeStorageGroupKey.value) ?? null)
+const activeStorageWorkbenchGroup = computed(() => {
+  return storageGroups.value.find((group) => group.id === activeStorageGroupKey.value) ?? storageGroups.value[0] ?? null
+})
 const runTasks = computed(() => tasks.value.filter((item) => item.type?.startsWith('apps.minio.') || item.type?.startsWith('storage.')))
 const settingsItems = computed(() => [
   { label: t('storage.instances'), value: instances.value.length },
-  { label: t('common.provider'), value: t('common.real') },
   { label: t('storage.settings'), value: t('storage.settingsHint') },
   { label: t('storage.selectInstance'), value: selectedInstanceId.value || '-' }
 ])
@@ -940,6 +990,15 @@ function storageGroupSearchText(group: StorageGroup) {
   ].join(' ').toLowerCase()
 }
 
+function selectStorageResource(group: StorageGroup) {
+  activeStorageGroupKey.value = group.id
+}
+
+function openStorageResource(group: StorageGroup) {
+  selectStorageResource(group)
+  storageDetailVisible.value = true
+}
+
 function uniqueValues(values: string[]) {
   return Array.from(new Set(values.map((value) => value.trim()).filter(Boolean)))
 }
@@ -1038,28 +1097,65 @@ onMounted(load)
   min-height: clamp(180px, 28vh, 260px);
 }
 
-.storage-card-grid {
+.storage-resource-shell {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(min(100%, 420px), 1fr));
-  gap: 12px;
+  grid-template-columns: minmax(0, 1.35fr) minmax(340px, .9fr);
+  gap: 14px;
+  min-height: 0;
   padding: 12px;
+}
+
+.storage-resource-list {
+  display: grid;
+  gap: 10px;
+  padding: 0;
   min-height: 0;
   overflow: auto;
 }
 
-.storage-card {
+.storage-resource-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
   border: 1px solid var(--aifar-border);
   border-radius: var(--aifar-radius-lg);
   background: #fff;
-  padding: 12px;
+  padding: 14px 16px;
   box-shadow: 0 1px 2px rgba(15, 35, 68, .03);
-  transition: border-color .16s ease, box-shadow .16s ease, transform .16s ease;
+  cursor: pointer;
+  transition: background .16s ease, border-color .16s ease, box-shadow .16s ease;
 }
 
-.storage-card:hover {
+.storage-resource-row:hover {
+  background: #f8fbff;
   border-color: #91caff;
   box-shadow: var(--aifar-shadow-raised);
-  transform: translateY(-1px);
+}
+
+.storage-resource-row.active {
+  border-color: #1677ff;
+  background: linear-gradient(90deg, #f0f8ff 0%, #fff 72%);
+  box-shadow: inset 3px 0 0 #1677ff, 0 2px 8px rgba(22, 119, 255, .08);
+}
+
+.resource-inline-detail {
+  min-width: 0;
+  max-height: min(640px, calc(100vh - 280px));
+  overflow: auto;
+  border: 1px solid var(--aifar-border);
+  border-radius: var(--aifar-radius-lg);
+  background: rgba(255, 255, 255, .96);
+  padding: 16px;
+  box-shadow: var(--aifar-shadow-card);
+}
+
+.inline-detail-actions {
+  display: flex;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--aifar-border-soft);
 }
 
 .storage-head {
@@ -1099,6 +1195,21 @@ onMounted(load)
   max-width: 240px;
 }
 
+.storage-head-actions :deep(.el-tag) {
+  min-height: 22px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  line-height: 1;
+}
+
+.storage-head-actions :deep(.el-tag__content) {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  line-height: 1;
+}
+
 .cleanup-retention-control {
   width: 128px;
 }
@@ -1123,44 +1234,53 @@ onMounted(load)
   font-weight: 850;
 }
 
-.storage-info-grid {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 8px;
+.storage-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
 }
 
-.storage-info-grid div {
-  min-height: 54px;
-  border: 1px solid var(--aifar-border-soft);
-  border-radius: var(--aifar-radius);
-  background: #f7fbff;
-  padding: 8px;
+.storage-summary span {
   min-width: 0;
-}
-
-.storage-info-grid .storage-info-wide {
-  grid-column: 1 / -1;
-}
-
-.storage-info-grid span {
-  display: block;
-  color: var(--aifar-text-tertiary);
-  font-size: 11px;
-}
-
-.storage-info-grid strong {
-  display: block;
+  max-width: 100%;
+  border: 1px solid var(--aifar-border-soft);
+  border-radius: 999px;
+  background: #f7fbff;
+  color: var(--aifar-text-secondary);
+  padding: 4px 8px;
+  font-size: 12px;
+  line-height: 1.35;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.storage-info-wide strong {
-  overflow: visible;
-  text-overflow: clip;
-  white-space: normal;
-  word-break: break-word;
-  line-height: 1.35;
+.storage-summary strong {
+  margin-right: 4px;
+  color: var(--aifar-text-tertiary);
+  font-weight: 650;
+}
+
+.storage-summary-wide {
+  flex: 1 1 100%;
+}
+
+.detail-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: flex-start;
+}
+
+.resource-detail-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.detail-summary {
+  margin-top: 0;
 }
 
 .bucket-sync-list,
@@ -1386,8 +1506,13 @@ onMounted(load)
 }
 
 @media (max-width: 1100px) {
-  .access-grid {
+  .access-grid,
+  .storage-resource-shell {
     grid-template-columns: 1fr;
+  }
+
+  .resource-inline-detail {
+    max-height: none;
   }
 
   .sync-row {

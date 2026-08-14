@@ -131,6 +131,13 @@ function databaseSetupState(wrapper: ReturnType<typeof mount>) {
   return (wrapper.vm as unknown as { $: { setupState: Record<string, any> } }).$.setupState
 }
 
+async function openFirstDatabaseDetails(wrapper: ReturnType<typeof mount>) {
+  const details = wrapper.findAllComponents(ElButton).find((button) => button.text() === 'Details')
+  expect(details).toBeTruthy()
+  await details!.trigger('click')
+  await flushPromises()
+}
+
 describe('MySQL backup and restore surfaces', () => {
   beforeEach(() => {
     apiPost.mockReset()
@@ -420,6 +427,7 @@ describe('MySQL backup and restore surfaces', () => {
       }
     })
     await flushPromises()
+    await openFirstDatabaseDetails(wrapper)
     const action = (label: string) => wrapper.findAllComponents(ElButton).find((button) => button.text() === label)!
     const cardActionLabels = wrapper.find('.mysql-backup-actions').findAll('button').map((button) => button.text())
     expect(cardActionLabels).toEqual(['Back up now', 'Backup records', 'Restore records'])
@@ -509,6 +517,7 @@ describe('MySQL backup and restore surfaces', () => {
       }
     })
     await flushPromises()
+    await openFirstDatabaseDetails(wrapper)
     const disaster = wrapper.findAllComponents(ElButton).find((button) => button.text() === 'Disaster rebuild')!
     await disaster.trigger('click')
     await flushPromises()
@@ -546,6 +555,7 @@ describe('MySQL backup and restore surfaces', () => {
       global: { plugins: [createPinia(), router, ElementPlus], stubs: { teleport: true, StatusTag: true, RunRecordTable: true, KeyValueGrid: true } }
     })
     await flushPromises()
+    await openFirstDatabaseDetails(wrapper)
     const clearActions = () => wrapper.findAllComponents(ElButton).filter((button) => button.text() === 'Clear maintenance gate')
     await clearActions()[0].trigger('click')
     await flushPromises()
@@ -645,6 +655,7 @@ describe('MySQL backup and restore surfaces', () => {
       global: { plugins: [createPinia(), router, ElementPlus], stubs: { teleport: true, StatusTag: true, RunRecordTable: true, KeyValueGrid: true } }
     })
     await flushPromises()
+    await openFirstDatabaseDetails(wrapper)
     expect(wrapper.text()).toContain('Affected instance mysql-primary')
     expect(wrapper.text()).toContain('Original value OFF')
     expect(wrapper.text()).toContain(`Source task ${taskId}`)
