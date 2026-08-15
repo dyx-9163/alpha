@@ -1620,3 +1620,41 @@
 - 结论：该需求需拆成应用包协议、节点执行面、声明式编排、资源控制台、AgentScope AI 工作台、安全治理六个子系统；保留现有 desired/observed/generation、任务审计等业务语义但不直接复用绑定 AIFAR Runtime 的实现。AgentScope 定位为受控的生成、校验、解释和诊断层，不直接承担确定性扩缩容；下一步先确认首期运行底座是裸机/虚机、Kubernetes，还是双运行时驱动。
 - 问题：用户明确新产品不保留旧代码，希望重新建立分支；因缺少大型 Kubernetes 运维经验而更熟悉 Docker，并希望获得持续的架构建设建议。
 - 结论：新产品按代码零复用设计，首期推荐 Docker-first 的通用 Node Agent，资源模型预留 Runtime Driver 接口供未来接入 K3s/Kubernetes；不在当前存在大量未提交改动的工作区直接切普通分支。代码隔离优先选择新仓库，若必须共用仓库则使用 orphan 分支和独立 worktree，待用户确认后执行。
+- 问题：用户确认新产品使用全新仓库。
+- 结论：后续规格和实现均在独立新仓库中开展，旧仓库只作为业务需求与事故经验参考，不复制旧源码、数据库迁移和发布历史；创建仓库前继续确认首版规模、控制面可用性及产品边界。
+- 问题：用户确认首版容量目标符合单套约 100 台服务器、1,000 个服务实例的客户场景。
+- 结论：首版按该容量设计，采用单控制面可恢复架构，不引入大型 Kubernetes、etcd 或控制面 HA；Node Agent 分布式执行，接口为未来横向扩展和 HA 保留边界。
+- 问题：用户确认新产品采用单企业租户、多用户、RBAC 和资源组的私有化权限模型。
+- 结论：一套部署对应一个客户组织，首版提供管理员、开发者、运维、审计员等角色及资源组隔离，不建设 SaaS 多租户、计费和跨租户数据隔离能力。
+- 问题：用户建议只提供一种统一部署方案，由平台提供模板，单体和集群均进入同一管理体系，仅使用不同参数，并要求覆盖所有服务。
+- 结论：认可统一入口和统一应用包协议，但不能使用一份万能脚本或统一扩缩容算法。推荐采用统一应用包协议、拓扑模板和生命周期工作流：核心平台只解释参数、组件、资源、工作流、探针、依赖和策略；单体、主从、分片、集群作为 topology profile，服务特有的安装、扩缩容、成员变更、备份恢复逻辑由应用包声明，新增服务不修改平台核心代码。
+- 问题：用户确认统一应用包方向，并强调基础的应用创建能力必须重点设计，平台页面需要与任意部署包完全适配。
+- 结论：应用包协议需同时提供执行 Schema 与 UI Schema；平台使用通用应用创建器、动态表单、拓扑配置、计划预览、资源列表、实例详情和动作页签渲染器，部署包只声明字段、联动、展示、状态和动作，不携带可执行前端代码，确保新增应用不修改平台页面源码。
+- 问题：用户同意通过浏览器可视化比较应用创建器和动态页面设计。
+- 结论：已展示分步向导、三栏低代码 Studio、Schema IDE 三种应用创建器线框；当前推荐三栏 Studio，支持 AI 生成初稿、结构/画布/属性协同编辑、Schema 校验及部署页实时预览，等待用户选择后继续设计部署向导与实例详情页。
+- 问题：用户认为应同时保留三栏低代码 Studio 与 Schema IDE，询问是否适合开发和运维人员。
+- 结论：推荐保留 B+C 但按角色分层：开发者/应用作者在同一 Application Studio 内切换可视化设计、Schema 源码、Diff、测试和发布；运维人员只使用已发布应用包自动生成的部署与资源控制台。Package Schema 是单一真源，发布版本不可变并签名，部署包仅声明白名单 UI Schema，不携带任意前端代码。
+- 问题：用户确认 B+C 角色分层方案。
+- 结论：Application Studio 正式采用可视化设计与 Schema IDE 双模式；运维侧采用独立的动态部署与资源控制台。下一设计节采用阿里云式全页动态部署向导，平台固定基本信息、资源组、版本、预检、计划、风险和审批壳层，应用包通过 Parameters、Topology、UI、Workflow、Probe Schema 动态生成拓扑、节点、参数和执行内容。
+- 问题：用户确认阿里云式全页动态部署向导。
+- 结论：统一部署向导正式采用平台固定壳层与部署包动态内容分离的设计。资源管理进一步设计为统一资源中心和独立详情页，左侧不写死数据库、存储、中间件等产品模块；详情页按稳定顺序提供概览、资源、监控、配置、访问与安全、数据保护、日志、任务与事件页签，并根据包能力隐藏或扩展标准页签内部内容，单体隐藏拓扑层级，集群按组件和成员聚合展示。
+- 问题：用户确认统一资源中心与能力驱动详情页设计。
+- 结论：总体架构进入四层方案确认：交互层；AgentScope 设计/辅助层；AIFAR Server 确定性控制面；AIFAR Agent 节点执行面。Server 维护唯一期望态、Planner/Scheduler、Workflow/Reconciler 和审计审批；Agent 通过出站 mTLS gRPC 长连接领取节点 Assignment，在受限 Runner 与 Docker Runtime Driver 中执行并回报 observedGeneration。AgentScope 只能经 Tool Gateway 调用脱敏、带 RBAC/审批的控制面工具，不能直连 Agent、读取明文凭据或进入生产调和闭环；Agent 生命周期与应用完全独立。
+- 问题：用户询问服务器上的 Agent 与实际 AI Agent 的关系。
+- 结论：两者没有运行时从属关系，只通过确定性控制面间接协作。节点侧程序是无模型的执行守护进程，领取签名 Assignment、操作 Docker 并回报实际态；AgentScope AI Agent 负责理解、生成、解释和诊断，经 Tool Gateway 调用 Server API，不能直连节点程序。新产品应避免同名，建议节点二进制和界面命名为 `aifar-node` / 节点执行器，AI 服务命名为 `aifar-ai` / AI 助手。
+- 问题：用户建议将节点 Agent 更名为 `aifar-runtime`，并询问该组件能力是否需要单独开发。
+- 结论：接受 `aifar-runtime` 命名，界面称“节点运行时”；它是独立二进制与 systemd 服务，需由平台单独开发、版本化、安装、升级和回滚，但只实现一次通用节点能力。新增业务服务通过应用包的参数、拓扑、工作流和探针接入，不修改 Runtime；仅新增 Docker 之外的底层运行引擎或新的受控原子能力时，才开发 Runtime Driver/平台能力。建议组件命名为 `aifar-server`、`aifar-runtime`、`aifar-ai`，Runner 作为 Runtime 内部受限执行单元。
+- 问题：用户询问 `aifar-runtime` 与 etcd 的区别，以及是否可复用开源二进制包减少独立开发。
+- 结论：etcd 是基于 Raft 的强一致 KV/租约/选举/锁协调存储，不能操作 Docker、执行应用工作流或替代节点 Runtime；首版单控制面不需要 etcd，未来控制面 HA 才评估独立 3 节点 etcd。推荐开发薄的 `aifar-runtime` 产品适配层，仅承担 mTLS Assignment、签名/策略、幂等调和和状态回报；复用 Docker Engine 或 containerd 处理容器生命周期，复用 OpenTelemetry Collector 处理遥测。K3s 可用单一开源二进制替代大量调度与运行时能力，但它仍是完整 Kubernetes，考虑用户运维能力不作为首版默认。
+- 问题：用户询问新设计中的 `aifar-runtime` 对标什么产品或组件。
+- 结论：核心职责对标 Kubernetes kubelet：每节点注册、接收期望规格、确保本机工作负载运行健康并回报节点状态；远程文件/命令、插件、自升级和批量运维体验参考阿里云 Cloud Assistant Agent。AIFAR Runtime 不是完整 kubelet 克隆，也不是 Docker/containerd、etcd 或 AI Agent；它是面向 AIFAR Application Package 的 Docker-first 节点执行与调和代理，Server 承担全局 API、调度和控制器职责，Runtime 不做跨节点调度或开放自由 Shell。
+- 问题：用户要求对比 Kubernetes kubelet、Cloud Assistant Agent 与拟设计的 `aifar-runtime` 能力。
+- 结论：`aifar-runtime` 采用 kubelet 式节点注册、期望态调和、健康探测和实际态回报，吸收 Cloud Assistant 的受控命令、文件分发、插件和自升级能力，并增加 AIFAR 应用包、拓扑工作流、签名校验与离线缓存；全局调度、扩缩容决策、审批审计和跨节点编排属于 Server，Runtime 不开放任意 Shell、不内置具体服务逻辑，也不建设 Kubernetes 的完整网络与存储插件体系。
+- 问题：用户认为产品最终仍需 Kubernetes，询问为何不从架构中正式纳入 K8s。
+- 结论：修正为“单一产品模型、双执行底座”：Kubernetes 从第一天作为一级 Execution Provider 纳入协议和数据模型，Docker 与 K8s 共用应用包、动态页面、任务、审批和资源详情。Docker 目标由节点模式 `aifar-runtime` 调和，K8s 目标由集群模式 Runtime/Controller 通过 Kubernetes API 提交 Deployment、StatefulSet、Service 等资源，节点调度和 Pod 自愈交给 scheduler/kubelet，避免重复控制。首期建议只认证一种平台托管发行版并支持导入标准集群；应用包提供 Docker 与 Kubernetes 渲染器及服务特有扩缩容策略，不能把有状态服务扩缩容简化为通用副本数。
+- 问题：用户要求把运维平台自身的部署、扩容及未来 SaaS 模式纳入设计，并参考阿里云方案，即使首期以单体交付也不能阻断后续演进。
+- 结论：建议采用阿里云托管控制面、ACK One 多集群 Fleet、Resource Directory 分层隔离的思想，设计为 Global Plane + 可横向增加的 Cell Control Plane + 客户 Data Plane。首期私有化单体就是一个包含默认租户的 Cell，使用模块化单体、无状态 API、独立 PostgreSQL/对象存储和可分离 Worker/Runtime Gateway；企业 HA 将同一 Cell 部署到平台托管 K3s；SaaS 增加全局租户目录、授权计量、Cell 路由和多区域 Cell。所有表、事件、对象路径及权限从第一天带 tenant/resource-group/cell 边界，普通租户可池化，强隔离客户可使用专属 Cell。平台安装升级由独立签名 Bootstrap/Operator 承担，避免平台只能依靠自身完成自救和升级。
+- 问题：用户确认平台自身采用兼容私有化单体、企业 HA 和 SaaS 的 Global Plane + Cell + 客户 Data Plane 模式。
+- 结论：该模式成为正式顶层约束：私有化单体等价于一个带默认租户的独立 Cell；SaaS 由 Global Plane 管理多区域、多隔离等级 Cell；客户侧 `aifar-runtime` 仅主动出站连接所属 Cell。下一步需要确认 SaaS 普通租户与高隔离租户的默认隔离和升级策略。
+- 问题：用户要求留存一份完整记录从调研到产品方案过程的文档。
+- 结论：已创建 `docs/superpowers/specs/2026-08-15-aifar-next-research-product-proposal.md` 评审稿，完整记录背景、官方调研来源、方案演进与替代、产品架构、应用包与低代码、Docker/Kubernetes 双底座、Runtime、AgentScope、Global Plane/Cell/SaaS、平台部署扩容、安全灾备、测试、路线图、风险和 ADR 待决项；该文件当前暂存在旧仓库，建立新仓库后应作为首批基线文档迁入。
