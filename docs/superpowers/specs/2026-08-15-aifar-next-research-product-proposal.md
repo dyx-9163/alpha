@@ -198,6 +198,67 @@ AgentScope 提供 ReAct Agent、工具、MCP、Agent Skill、会话与状态、�
 - [AgentScope Documentation](https://doc.agentscope.io/)
 - [AgentScope GitHub](https://github.com/agentscope-ai/agentscope)
 
+### 5.7 SxDevOps 开源参考实现评估
+
+2026-08-16 评估 [aiyiyi121/sxdevops](https://github.com/aiyiyi121/sxdevops)。该项目是面向监控、告警、任务和容器运维的 AI 运维平台，已实现 MCP、Skill、预检、待确认操作、RBAC、审计、结构化证据和二阶段应答等链路。其核心原则“模型负责理解和规划，平台负责权限、确认、执行与审计”与本方案的 `aifar-ai -> Tool Gateway -> aifar-server` 边界一致。
+
+本项目将它定位为 AI 运维治理层的参考实现，不是 AIFAR Next 的基座、依赖项或可直接 fork 的代码来源。
+
+可吸收并重新设计为 AIFAR 自有契约的内容：
+
+- `ActionDefinition`：AI 可申请的受控动作、风险等级、所需角色和参数 Schema。
+- `PreflightResult`：权限、租户范围、资源归属、目标健康度、影响范围和停止条件的预检结果。
+- `EvidenceBundle`：告警、指标、日志、资源状态和诊断结论的脱敏结构化证据。
+- `PendingAction`：审批前冻结动作、目标、参数摘要和预检快照，审批后重新校验，防止参数漂移。
+- `ToolExecutionAudit`：关联人员、模型、工具、策略版本、审批、任务和结果的完整审计链。
+
+不继承的实现边界：
+
+- 不采用其 Django/MySQL/Redis 单体和单机 Compose 部署模型；AIFAR 仍遵循 Global Plane + Cell、PostgreSQL、对象存储、事务 Outbox 与可分离 Worker/Runtime Gateway。
+- 不采用 SSH 直接命令作为生产执行主通道，也不沿用其凭据存储方式；节点变更必须通过 `aifar-runtime` 或 Kubernetes Execution Provider，并使用短期凭据、mTLS 和最小权限。
+- 不将 Kubernetes 仅实现为一次性任务操作；AIFAR 必须具有 Package 渲染、期望态、实际态、调和和 Provider 契约。
+- 不把自定义 AIOps Agent 替代 AgentScope；AIFAR 使用 AgentScope 编排 AI 能力，所有工具仍经 Tool Gateway 受控调用。
+- 不把该项目当作多租户实现参考；AIFAR 的所有资源、事件、对象路径和权限从第一天纳入 `tenant_id`、`resource_group_id` 和 `cell_id` 边界。
+
+若未来复用其 Apache-2.0 代码，必须建立第三方来源清单，保留许可证与 NOTICE、标记修改、完成凭据与权限安全审查，并以 AIFAR 的协议测试和威胁模型验收后方可进入产品代码。
+
+### 5.8 外部组件与参考实现能力矩阵
+
+下表中的“引入”分为三类：`候选依赖` 表示可通过 PoC 后作为产品组件使用；`协议参考` 表示学习模型、样例和测试，不将其安装为平台核心；`产品参考` 表示只借鉴资源工作流和交互。所有第三方代码复用均需分别完成许可证、供应链和安全审查。
+
+| 组件或项目 | 能力 | 在 AIFAR 中的接入位置 | 引入决策与阶段 | 不替代的能力或边界 |
+|---|---|---|---|---|
+| [Formily](https://github.com/alibaba/formily) | JSON Schema 表单渲染、字段联动、校验、表单构建器 | Application Studio、应用包部署向导、配置编辑页 | 候选依赖；阶段 0 验证 React + Ant Design 集成，阶段 1 通过后使用 | 只渲染平台白名单 UI Schema；不执行包内 JavaScript，不定义应用生命周期 |
+| [Open Policy Agent](https://github.com/open-policy-agent/opa) | 声明式策略判断；可判断授权、环境准入、风险级别、审批和标签规则 | Tool Gateway、Package Admission、Planner、Approval Policy | 候选依赖；阶段 0 完成策略 PoC，阶段 1 视结果嵌入或独立部署 | 不保存身份关系，不执行任务，不替代审计和工作流 |
+| [KubeVela](https://github.com/kubevela/kubevela) / OAM | 应用组件、Trait、Workflow、交付策略与多集群应用语义 | Kubernetes Application Package Renderer、Package SDK、Provider 契约 | 协议参考；阶段 0 映射语义和认证包，阶段 2 再评估集成 | 不在首期 Cell 内安装为第二套控制面；Docker 场景仍由 AIFAR Package/Runtime 管理 |
+| [AgentScope](https://github.com/agentscope-ai/agentscope) | Agent、MCP、Skill、会话、多 Agent 工作流、Tracing、Evaluation | `aifar-ai`，用于包草案生成、解释、只读诊断和受控变更建议 | 候选依赖；阶段 0 只读诊断 PoC，阶段 1 引入生成和解释 | 不直接连接 Runtime，不读取明文凭据，不绕过 Tool Gateway、策略或审批 |
+| [SxDevOps](https://github.com/aiyiyi121/sxdevops) | MCP/Skill 编排、预检、结构化证据、待确认操作、二阶段回答、审计 | AI 运维治理契约：`ActionDefinition`、`PreflightResult`、`EvidenceBundle`、`PendingAction`、`ToolExecutionAudit` | 协议与产品参考；阶段 0 按 AIFAR 模型重建 PoC | 不作为 AIFAR 基座或 AgentScope 替代，不继承其单体、SSH 直连和凭据模型 |
+| [Komodo](https://github.com/moghtech/komodo) | Control Plane + Periphery 节点执行、服务器接入、Stack/资源模型、升级体验 | `aifar-server` 与 `aifar-runtime` 的注册、下发、状态回报和安装体验参考 | 只读协议与产品参考；阶段 1 用于 Runtime 行为对照 | GPL-3.0，禁止复制或链接其源码；不采用其自由命令和 Compose-only 模型 |
+| [Portainer](https://github.com/portainer/portainer) | Docker/Kubernetes 环境接入、资源浏览、日志、生命周期操作与安全初始化 | 统一资源中心、节点/环境接入、Docker 资源详情与操作交互 | 产品参考；阶段 1 设计评审时对照 | 不替代 Package、Planner、Runtime 或租户 Cell；不按其产品模型扩展核心 |
+| [Argo CD](https://github.com/argoproj/argo-cd) | GitOps 同步、漂移检测、Kubernetes 应用状态和审计 | Kubernetes GitOps Execution Provider，可接收 AIFAR 渲染的声明式产物 | 后续可选 Provider；阶段 2 仅在客户需要 GitOps 时接入 | 不管理 Docker 主机，不定义 AIFAR 应用包，不替代审批和业务工作流 |
+| [OpenFGA](https://github.com/openfga/openfga) | 基于关系元组的细粒度授权，例如租户、资源组、应用、环境和操作之间的授权关系 | Global Plane/Cell 的授权服务与 Tool Gateway 授权查询 | SaaS 阶段候选；先保留授权抽象，规模和授权复杂度达到阈值后 PoC | 不承担策略判断、身份认证、租户数据隔离或审计 |
+| [KubeSphere](https://github.com/kubesphere/kubesphere) | 多租户 Kubernetes 控制台、工作空间、资源页签、应用商店、多集群视图 | 阿里云风格统一资源中心、租户资源工作台的信息架构参考 | 产品参考；阶段 1 UI 设计评审与阶段 2 多集群设计对照 | 不作为基础平台或微服务模板；不复制其完整 Kubernetes 发行版与扩展体系 |
+| [Backstage](https://github.com/backstage/backstage) | 软件目录、模板、自助开发者入口、插件化开发者门户 | 未来 Application Studio 的开发者目录、认证包目录、文档入口 | 后续产品参考；不进入首期控制面 | 不替代应用包、部署页面、资源控制台或运维工作流 |
+
+组件关系如下：
+
+```mermaid
+flowchart LR
+    U["开发人员与运维人员"] --> UI["AIFAR Console"]
+    UI --> F["Formily: 动态部署表单"]
+    UI --> S["aifar-server: Package / Planner / Workflow / Audit"]
+    AI["AgentScope: AI 设计与诊断"] --> O["OPA: 策略决策"]
+    O --> S
+    S --> R["aifar-runtime: Docker 节点调和"]
+    S --> K["Kubernetes Execution Provider"]
+    K -. "后续可选" .-> A["Argo CD: GitOps 调和"]
+    G["OpenFGA: SaaS 细粒度授权"] --> S
+    V["KubeVela / OAM: 应用语义参考"] -. "设计输入" .-> K
+    X["SxDevOps / Komodo / Portainer / KubeSphere / Backstage: 参考实现"] -. "协议或交互对照" .-> S
+```
+
+首期实际落地组合是 `aifar-server`、`aifar-runtime`、Formily、AgentScope 和 OPA PoC。KubeVela、SxDevOps、Komodo、Portainer、KubeSphere 与 Backstage 不作为首期运行依赖；Argo CD 和 OpenFGA 在 Kubernetes GitOps 与 SaaS 条件成熟后再进入认证流程。
+
 ## 6. 方案演进与决策记录
 
 本节保留决策变化，避免后续只看到最终图而不知道约束来源。
@@ -823,6 +884,10 @@ flowchart LR
 - 创建全新仓库。
 - 建立 ADR、威胁模型、API 与 Package Protocol 版本规则。
 - 定义资源、任务、Assignment、Event 和 Audit Schema。
+- 完成 Formily 与 React + Ant Design 的动态部署表单 PoC，验证 Package Schema、字段联动、校验和平台白名单组件的映射。
+- 完成 OPA 策略 PoC，覆盖 Package 准入、生产环境变更、AI Tool Gateway 和人工审批四类决策。
+- 以 KubeVela/OAM 作为语义输入，形成 Kubernetes Application Package 的 Component、Trait、Workflow 和多集群映射 ADR；不引入第二套控制面。
+- 基于 SxDevOps 的参考链路，定义 `ActionDefinition`、`PreflightResult`、`EvidenceBundle`、`PendingAction` 和 `ToolExecutionAudit`，并用 AgentScope + Tool Gateway 完成只读诊断 PoC。
 - 建立签名、SBOM、CI、离线构建和测试框架。
 
 退出条件：核心协议可以独立生成代码、验证兼容性，且没有具体服务名称进入平台核心接口。
@@ -833,9 +898,10 @@ flowchart LR
 - PostgreSQL、对象存储和事务 Outbox。
 - `aifar-runtime` Node Mode。
 - Docker Execution Provider。
-- Application Studio B+C 基础版。
-- 动态部署向导和统一资源中心。
+- Application Studio B+C 基础版，基于通过 PoC 的 Formily Schema UI 实现。
+- 动态部署向导和统一资源中心，交互分别参考 Portainer 与 KubeSphere，但不引入其运行依赖。
 - AgentScope 应用包草案生成、解释和只读诊断。
+- `aifar-runtime` 使用自有协议实现，运行行为和节点安装体验对照 Komodo，但不复用 GPL-3.0 代码。
 - 首批认证包用于验证协议，不作为核心特例。
 
 退出条件：一个 Cell 可稳定管理约 100 节点、1,000 实例，并完成断网、重试、备份恢复和升级演练。
@@ -848,6 +914,7 @@ flowchart LR
 - `aifar-bootstrap` 安装单 server 与 HA K3s。
 - Docker/Kubernetes 双渲染和一致资源视图。
 - Kubernetes 原生扩缩容与有状态包工作流。
+- 评估 Argo CD 作为可选 GitOps Execution Provider；仅在客户以 Git 为期望态来源时接入。
 
 退出条件：同一应用包在声明支持的前提下，可在 Docker 和 Kubernetes 环境完成生命周期与回滚验收。
 
@@ -864,6 +931,7 @@ flowchart LR
 
 - 租户目录、Cell Registry、Placement、Routing。
 - 授权、套餐、配额和计量。
+- 评估 OpenFGA 作为细粒度关系授权服务；仅在原生 RBAC 无法表达跨租户、资源组和动作授权时引入。
 - Standard、Enterprise、Dedicated Cell 隔离等级。
 - Cell 准入、扩容、迁移和区域容灾。
 - 全局应用包目录与审计索引。

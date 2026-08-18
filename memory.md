@@ -3,6 +3,34 @@
 
 本文件记录后续对话的精简问题与结论。每次开始先读，结束前追加。禁止写入密码、token、私钥、完整连接串和长日志。
 
+## 2026-08-17
+- 问题：用户询问通用 Agent 客户端若支持多模态和多子 Agent，还需要引入哪些组件。
+- 结论：多模态必须补充可声明能力的多模态模型端点和 `Artifact/Media Service`，复用 MinIO 保存图片、音频、视频、PDF、代码与生成制品，AG-UI 只传 MIME、元数据、权限化对象引用和状态，不传大块 base64；语音实时交互再按需增加 ASR/TTS 与 WebRTC/Realtime Gateway。多子 Agent 首期继续使用 AgentScope 已有的 Concurrent Agents、Routing、Handoffs，不新增编排框架；平台自研 Agent Registry、父子 Run Tree、上下文与工具权限隔离、并发/Token/时间预算、取消传播和 OpenTelemetry 追踪。A2A 仅在子 Agent 独立部署、跨框架/语言/组织，需要发现和远程委派时引入；同一 AgentScope 进程内不需要。分布式 Worker 成熟后再评估 NATS/RabbitMQ/Redis Streams，RAG 有明确需求后再选择向量库，均不作为多模态/多 Agent 的默认依赖。
+- 问题：用户要求将通用 Agent 客户端方案压缩为简短定案。
+- 结论：采用 Vue 3 自研通用 Agent Workbench 与内部 Agent Client Core，AG-UI + `@ag-ui/client` 作为首选且可替换的客户端到 Agent 协议；AgentScope 经 `AgentScopeAguiGateway` 接入，CopilotKit仅可选用于 PoC/通用交互。运维、代码开发、审查以插件接入；MCP/Tool Gateway 负责工具，AIFAR Server 负责权限、审批、任务和审计，大文件、代码、日志与终端使用独立通道。
+- 问题：用户确认 AG-UI 是否是通用 Agent 客户端最优、最适配的协议。
+- 结论：AG-UI 是当前最适合作为 AIFAR 通用 Agent Client 的首选前端到 Agent 主协议，但不是唯一协议，也不是完整平台。其 TypeScript `@ag-ui/client`、run/step、流式消息、工具调用、snapshot/delta、custom event 和 interrupt/resume 模型与通用 Workbench 高度匹配；客户端仍需自有 Canonical Event/Run/Artifact 模型及 Adapter，避免协议和 SDK 版本锁定。MCP 继续负责 Agent 到工具/资源，A2A 负责 Agent 到 Agent，OpenAI-compatible API 负责模型/基础聊天，大文件、代码制品、日志和终端应使用独立 Artifact/Blob/Terminal 通道而非塞入 AG-UI。当前未从 AgentScope 官方文档确认原生 AG-UI 集成，必须实现并 PoC 验证 `AgentScopeAguiGateway`，覆盖工具多轮历史、取消、断线续接、interrupt 幂等、顺序/重复事件和版本兼容；AIFAR Server 继续负责持久化、认证授权、审批、任务和审计。
+- 问题：用户明确最终产品是通用 Agent 客户端，部署运维、代码开发和审查只是不同使用场景。
+- 结论：架构核心应改为领域无关的 `Agent Client Core`，自研 Vue 3 Workbench、统一 `Connection/Agent/Workspace/Thread/Run/Step/ToolCall/Artifact/Approval/Evidence` 模型、协议适配层和插件注册表；AG-UI 作为首选 Agent 协议，CopilotKit 仅可封装在 `AgentProtocolAdapter` 后作为可选 Vue/headless 实现，不能成为核心数据模型或后端 Runtime 依赖。运维、代码、Review、CI/CD 通过 Workspace Provider、Tool Provider、Artifact Renderer 和 Policy Profile 插件接入。Web 端只操作远程工作区；若要像 Codex 一样直接访问本地仓库、终端和 Git，应复用同一 Vue UI 增加 Tauri/Electron 桌面壳或本地 Workspace Daemon，客户端不能让浏览器直接持有生产凭据或获得任意本地执行权。
+- 问题：用户补充 AIFAR 虽以部署运维为主，但后续还要接入代码开发与代码审查，要求前端 AI 架构提前兼容。
+- 结论：产品定位需从“运维平台 + AI 助手”提升为统一 Agent Workbench，并把当前仅以通用部署运维控制面为主的 AIFAR Next 方案补充代码域。Workbench 核心统一建模 `Workspace → Thread → Run → Step → ToolCall → Artifact → Approval → Evidence`，资源工作区与代码仓库/分支/PR 都是 Workspace Context；前端自研工作台壳层和 Artifact Renderer Registry，运维插件提供资源、日志、终端、配置和变更卡片，开发审查插件提供仓库树、搜索、Monaco 编辑/Diff、补丁、测试、CI、Review Comment 和提交/PR 卡片。CopilotKit 只作为可替换的 Vue Agent 交互 SDK，不能定义领域模型；内部 `AgentUIAdapter` 对接 AG-UI。工具按 `ops.*`、`code.*`、`git.*`、`ci.*`、`review.*` 分域并使用同一 Tool Gateway、策略、审批和审计链；读代码、生成补丁、写工作区、提交、推送和合并必须采用逐级风险授权，默认不允许 AI 自动 push/merge。
+- 问题：用户询问若把 AIFAR AI 助手做成类似 Codex 的 Agent 工作台，应对接 CopilotKit 还是完全自研。
+- 结论：不建议纯 CopilotKit，也不建议从零全自研；推荐“CopilotKit/AG-UI 作为可替换的 Agent 交互基础层，自研 AIFAR Agent Workspace 和全部生产控制能力”。Vue 中可先使用 `@copilotkit/vue/v2` 的 `useAgent`、流式消息、工具事件、interrupt 和 thread 等 headless 能力，默认 `CopilotChat` 仅用于 PoC；正式界面自研任务时间线、计划、工具与证据卡片、终端/日志、资源上下文、Diff、审批和恢复体验。后端 AgentScope 负责推理，AIFAR Server 继续权威管理 RBAC、审批、任务、审计与执行。通过内部 `AgentUIAdapter` 隔离 CopilotKit，保持可退回 `@ag-ui/client`，避免产品被框架的数据结构和 Runtime 锁定。
+- 问题：用户询问 CopilotKit 在 AIFAR 中的具体作用和能够带来的帮助。
+- 结论：CopilotKit 的价值是把 AG-UI Agent 事件转换为 Vue 可用的响应式状态和标准交互组件，减少消息流拼接、thread/run 状态、停止与重连、工具调用卡片、HITL/interrupt、共享页面上下文、建议项及生成式 UI 等前端胶水工程。它不负责模型推理、Agent 编排、工具真实执行、RBAC、审批授权、任务持久化或审计；AIFAR 中应只作为可替换的 Agent UI 层，AgentScope 负责后端推理和工具编排，AIFAR Server 保持生产操作权威。只有当产品需要深度 Agent 交互时才值得引入；若只是普通聊天框或少量流式文本，使用 `@ag-ui/client` 或现有 SSE 自研组件更轻。
+- 问题：用户询问当前 Vue 3 前端应该选择哪个 AI 前端框架。
+- 结论：若明确要求选择一个 Vue 3 成品 AI 前端框架，当前优先对 `@copilotkit/vue/v2` 做 PoC；官方 Vue 3 SDK 已提供 Provider、CopilotChat、AG-UI `AbstractAgent` composable、工具渲染、HITL/interrupt、共享状态和线程能力，且可通过 self-managed agent 或自托管 Runtime 对接 AG-UI。`assistant-ui` 是 React 优先，不适合现有 Vue 3；Vercel AI SDK UI 更适合只需要聊天流和基础工具调用的轻量场景。AIFAR 的整体架构最优仍是把框架限制在 UI 层，后端使用 AgentScope，RBAC、审批、任务和审计由 AIFAR Server 保持权威；PoC 需验证私有化、自定义 Element Plus 工具卡片、断线续接、包体和版本稳定性，失败时可退回 `@ag-ui/client + 自有 Vue 组件`。
+- 问题：用户询问 CopilotKit 之外的前端 AI 方案以及 AIFAR 的最佳选型。
+- 结论：AIFAR 整体最优不是把某个全栈 AI UI 框架设为架构核心，而是使用 `@ag-ui/client`（AG-UI 客户端/薄适配层）连接 AgentScope，并继续由 AIFAR 自有 Console 承载消息、工具卡片、审批、任务和审计；如果 AIFAR Next 的 React 前端必须选择一个成品 AI UI 框架，优先对 `assistant-ui` 做 PoC，它可直接连接 AG-UI 服务且更适合作为可替换的 UI 层，但其 AG-UI interrupts/多线程能力当前仍需验证，生产审批必须由 AIFAR 服务端重新校验和落审计。现有 Vue 端若追求快速增量，可评估 Vercel AI SDK UI，但它使用自己的 UIMessage stream，不应与 AG-UI 同时成为长期主协议；CopilotKit v2 适合希望快速获得 shared state、generative UI、HITL 等一体化能力并能接受额外 Runtime/代理层重叠的场景。
+- 问题：用户询问 AIFAR Next 是否适合同时引入 AG-UI Protocol 与 AgentScope，以及两者在架构中的最优落点。
+- 结论：推荐组合使用但严格分层：AG-UI 只作为 Console 与 `aifar-ai` 之间的 Agent-User 流式交互协议；AgentScope 只运行在独立 Python `aifar-ai` 服务中，负责包草案生成、解释、只读诊断和变更建议；所有工具调用经 Tool Gateway 进入 `aifar-server` 的 RBAC、租户、策略、预检、审批、任务和审计链，再由确定性 Workflow 调用 `aifar-runtime` 或 Kubernetes Provider。AG-UI interrupt 只承担交互暂停/恢复，不能作为后端授权凭据；现有任务 SSE 和平台事件流继续保留，不用 AG-UI 替代。首期采用单 Agent + 少量受控工具，不引入 AgentScope Runtime/Studio 为生产依赖，不开放自由 shell、直连节点或明文凭据。
+- 问题：用户追问 AG-UI 是否可替换，以及当前 `aifar-deployment` 如何复用 `D:\workspace\AI\aifar` 中的私有 Qwen3.5/llama.cpp。
+- 结论：AG-UI 必须保持为可替换边缘适配器，内部统一 `AgentRun`/`AgentEvent`/`Interrupt` 契约；可替换为 AIFAR 自有 SSE 或 Vercel AI SDK UI Stream，但 OpenAI-compatible 模型 API、MCP 工具协议和 AG-UI 属于不同层。最优对接是只复用模型服务与 AgentScope `OpenAIChatModel` 适配，不合并另一项目的 Control/Task/SSH 权威链：Console 经 AG-UI 到独立 `aifar-ai`，`aifar-ai` 用 `http://llama-server:8080/v1` 调 Qwen，再经 AIFAR Tool Gateway 调现有 Go 控制面。两个项目当前都占用主机 8080，且模型根 Compose 只公开 legacy `context-proxy`、原始 llama 服务仅 `expose`；生产应合并到私有 Docker 网络并给所选模型统一 `llama-server` alias，不公开模型端口。当前模型 factory 和 mock 工具流测试已存在，但 Control Service 仍只有 `/healthz`，Compose 当前未运行，真实 Qwen 工具调用与续接尚需 PoC 验证。
+- 问题：用户确认当前架构是否已经引入前端 AI 框架。
+- 结论：尚未引入。现有产品代码只有 Vue 3、Element Plus、Pinia 等普通前端框架；AIFAR Next 文档选择 React、Ant Design、Formily，其中 Formily 是 Schema 表单框架；AgentScope 是后端 Agent 框架；AG-UI 只是建议采用的可替换交互协议，且尚未写入当前基线或实现。CopilotKit、Vercel AI SDK、assistant-ui 等前端 AI 框架均未被选型或依赖。首期推荐保留自有 Console，仅使用 AG-UI Core/client 适配和自有组件，除非 PoC 证明完整前端 AI 框架能显著降低 HITL、工具卡片和会话状态开发成本。
+- 问题：用户询问如果选用 AI 框架，最终应该解决什么问题。
+- 结论：选型目标不能是“能调用大模型”，而应是减少 Agent 产品层的重复工程。后端 Agent 框架解决模型调用、ReAct/计划、工具编排、会话状态、暂停恢复、Tracing 和 Evaluation；前端 AI 框架只解决长期运行 Agent 到 UI 状态机的映射，包括异构流、thread/run、取消重连、工具卡片、HITL、共享状态和多模态。AIFAR 已有 Task/SSE/Approval/Audit 权威链，因此首期推荐 AgentScope + 可替换 AG-UI 适配器 + 自有 Console，不引入完整前端 AI 框架；只有当 Agent 交互成为主入口且工具卡片、恢复、共享状态等胶水代码显著增长时，再引入 CopilotKit 等框架。
+
 ## 2026-08-13
 - 问题：用户指出当前数据库/仪表盘实现与选定 UI 参考图不一致，希望对齐“左侧列表 + 右侧详情/总览卡片”的资源管理风格。
 - 结论：数据库页面补充顶部统计卡片并保留实例列表/详情结构；仪表盘运行状态改为资源类型卡片、选中资源列表和右侧详情区的布局，默认保持服务器类型视角，提醒仍只通过右侧铃铛展示。前端 Vitest 全量通过、`pnpm web:build` 通过；本轮未做浏览器视觉截图 QA，后续按实际截图继续微调。
@@ -1658,3 +1686,13 @@
 - 结论：该模式成为正式顶层约束：私有化单体等价于一个带默认租户的独立 Cell；SaaS 由 Global Plane 管理多区域、多隔离等级 Cell；客户侧 `aifar-runtime` 仅主动出站连接所属 Cell。下一步需要确认 SaaS 普通租户与高隔离租户的默认隔离和升级策略。
 - 问题：用户要求留存一份完整记录从调研到产品方案过程的文档。
 - 结论：已创建 `docs/superpowers/specs/2026-08-15-aifar-next-research-product-proposal.md` 评审稿，完整记录背景、官方调研来源、方案演进与替代、产品架构、应用包与低代码、Docker/Kubernetes 双底座、Runtime、AgentScope、Global Plane/Cell/SaaS、平台部署扩容、安全灾备、测试、路线图、风险和 ADR 待决项；该文件当前暂存在旧仓库，建立新仓库后应作为首批基线文档迁入。
+- 问题：用户询问 `aiyiyi121/sxdevops` 是否对 AIFAR Next 有帮助。
+- 结论：有帮助，但应定位为 AI 运维工作流参考实现，不作为 AIFAR Next 基座或直接 fork。可借鉴 Action/Preflight、MCP/Skill、Pending Action、证据包、二阶段回答、RBAC 与审计链路；不复用其 Django 单体、SSH 直接执行与凭据存储、单机 Compose、任务式 Kubernetes 管理等架构。该项目缺少统一 Application Package、desired/observed Runtime 调和、Global Plane/Cell、多租户隔离和 AgentScope 集成；代码复用前还需按 Apache-2.0 做许可证留痕并完成安全审查。
+- 问题：用户要求将 SxDevOps 评估纳入开发方案。
+- 结论：已在 AIFAR Next 过程性方案的调研章节增加“SxDevOps 开源参考实现评估”，明确其为 AI 运维治理层参考而非基座，固化五项待设计契约及不可继承的架构与安全边界；阶段 0 增加 AgentScope + Tool Gateway 只读诊断 PoC 和对应协议定义任务。
+- 问题：用户要求继续调研 GitHub 上可供 AIFAR Next 借鉴的源码项目。
+- 结论：优先形成三条验证线：Formily 作为 React + Ant Design 动态表单和 Application Studio 的候选依赖；OPA 作为 AI Tool Gateway、Package 准入和高风险操作的策略引擎候选；KubeVela 作为 Kubernetes Application Package 的 OAM、Workflow、Trait 和多集群语义参考。Komodo 是 Control Plane + 节点 Agent 的强参考但为 GPL-3.0，只读代码和行为、不复用；Portainer、KubeSphere、Argo CD、Backstage 分别参考 Docker/K8s 资源工作流、多租户控制台、Kubernetes GitOps Provider 与开发者目录，均不作为首期基座。OpenFGA 在 SaaS 阶段再评估，用于租户/资源/动作的细粒度关系授权。
+- 问题：用户要求解释推荐组合中各组件的职责。
+- 结论：这些项目分别覆盖应用包动态表单、策略决策、Kubernetes 应用模型、AI 运维治理、Docker 节点执行参考、GitOps 交付和 SaaS 细粒度授权；首期并非全部安装。首期优先验证 Formily、OPA、AgentScope 与自研 Runtime，KubeVela/Komodo/SxDevOps 以协议和产品行为参考为主，Argo CD/OpenFGA 延后到 Kubernetes GitOps 和 SaaS 需求成熟后再引入。
+- 问题：用户要求将外部组件纳入方案，并用文档展示每个组件的能力。
+- 结论：已在过程性方案新增“外部组件与参考实现能力矩阵”，覆盖 Formily、OPA、KubeVela/OAM、AgentScope、SxDevOps、Komodo、Portainer、Argo CD、OpenFGA、KubeSphere 与 Backstage 的能力、AIFAR 接入位置、阶段决策和边界，并增加组件关系图；阶段 0、1、2、4 已分别列出 Formily/OPA/KubeVela、Komodo/Portainer/KubeSphere、Argo CD 和 OpenFGA 的验证或引入条件。
