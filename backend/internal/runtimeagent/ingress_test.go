@@ -1464,6 +1464,24 @@ func TestManagerReplacesSameRevisionDriftAfterReplacementIsReady(t *testing.T) {
 	}
 }
 
+func TestDeploymentSpecHashChangesForRestartGeneration(t *testing.T) {
+	before := DeploymentSpec{
+		ServiceName:       "oauth",
+		DeploymentName:    "alpha-oauth",
+		Image:             "aifar-oauth:rev-1",
+		PodRevision:       "rev-1",
+		Replicas:          1,
+		RestartGeneration: 4,
+		EnvFiles:          []string{"/aifar/apps/admin/runtime/env/oauth.env"},
+	}
+	after := before
+	after.RestartGeneration++
+
+	if deploymentSpecHash(before) == deploymentSpecHash(after) {
+		t.Fatal("restart generation must change the container spec hash so env files are reloaded by replacement")
+	}
+}
+
 func TestManagerStartsStoppedDesiredPod(t *testing.T) {
 	deployment := DeploymentSpec{
 		ServiceName: "oauth",

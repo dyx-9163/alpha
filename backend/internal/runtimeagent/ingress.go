@@ -1991,34 +1991,36 @@ func sanitizeDockerName(value string) string {
 
 func deploymentSpecHash(deployment DeploymentSpec) string {
 	type hashDeployment struct {
-		ServiceName    string            `json:"serviceName"`
-		DeploymentName string            `json:"deploymentName,omitempty"`
-		Image          string            `json:"image,omitempty"`
-		PodRevision    string            `json:"podRevision,omitempty"`
-		Ports          []ContainerPort   `json:"ports,omitempty"`
-		EnvFiles       []string          `json:"envFiles,omitempty"`
-		Volumes        []VolumeMount     `json:"volumes,omitempty"`
-		Resources      ResourceSpec      `json:"resources,omitempty"`
-		HealthCheck    HealthCheckSpec   `json:"healthCheck,omitempty"`
-		Entrypoint     []string          `json:"entrypoint,omitempty"`
-		Command        []string          `json:"command,omitempty"`
-		Environment    map[string]string `json:"environment,omitempty"`
-		Labels         map[string]string `json:"labels,omitempty"`
+		ServiceName       string            `json:"serviceName"`
+		DeploymentName    string            `json:"deploymentName,omitempty"`
+		Image             string            `json:"image,omitempty"`
+		PodRevision       string            `json:"podRevision,omitempty"`
+		RestartGeneration int64             `json:"restartGeneration,omitempty"`
+		Ports             []ContainerPort   `json:"ports,omitempty"`
+		EnvFiles          []string          `json:"envFiles,omitempty"`
+		Volumes           []VolumeMount     `json:"volumes,omitempty"`
+		Resources         ResourceSpec      `json:"resources,omitempty"`
+		HealthCheck       HealthCheckSpec   `json:"healthCheck,omitempty"`
+		Entrypoint        []string          `json:"entrypoint,omitempty"`
+		Command           []string          `json:"command,omitempty"`
+		Environment       map[string]string `json:"environment,omitempty"`
+		Labels            map[string]string `json:"labels,omitempty"`
 	}
 	data, _ := json.Marshal(hashDeployment{
-		ServiceName:    deployment.ServiceName,
-		DeploymentName: deployment.DeploymentName,
-		Image:          deployment.Image,
-		PodRevision:    deployment.PodRevision,
-		Ports:          deployment.Ports,
-		EnvFiles:       deployment.EnvFiles,
-		Volumes:        deployment.Volumes,
-		Resources:      deployment.Resources,
-		HealthCheck:    deployment.HealthCheck,
-		Entrypoint:     deployment.Entrypoint,
-		Command:        deployment.Command,
-		Environment:    deployment.Environment,
-		Labels:         deployment.Labels,
+		ServiceName:       deployment.ServiceName,
+		DeploymentName:    deployment.DeploymentName,
+		Image:             deployment.Image,
+		PodRevision:       deployment.PodRevision,
+		RestartGeneration: deployment.RestartGeneration,
+		Ports:             deployment.Ports,
+		EnvFiles:          deployment.EnvFiles,
+		Volumes:           deployment.Volumes,
+		Resources:         deployment.Resources,
+		HealthCheck:       deployment.HealthCheck,
+		Entrypoint:        deployment.Entrypoint,
+		Command:           deployment.Command,
+		Environment:       deployment.Environment,
+		Labels:            deployment.Labels,
 	})
 	sum := sha256.Sum256(data)
 	return hex.EncodeToString(sum[:])
