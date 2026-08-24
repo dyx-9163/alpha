@@ -174,7 +174,6 @@ describe('runtime configuration rules', () => {
         jvmInitialRAMPercentage: 20,
         jvmMaxRAMPercentage: 70
       },
-      nacosEphemeral: true,
       services: {}
     })
   })
@@ -280,8 +279,7 @@ describe('runtime configuration rules', () => {
       appCPUs: '2.0',
       appMemoryLimit: '2GB',
       jvmInitialRAMPercentage: 20,
-      jvmMaxRAMPercentage: 70,
-      nacosEphemeral: true
+      jvmMaxRAMPercentage: 70
     }
 
     expect(buildRuntimeServiceOverrides(rows, global, t)).toEqual({
@@ -302,8 +300,7 @@ describe('runtime configuration rules', () => {
       appCPUs: '2.0',
       appMemoryLimit: '2GB',
       jvmInitialRAMPercentage: 20,
-      jvmMaxRAMPercentage: 70,
-      nacosEphemeral: true
+      jvmMaxRAMPercentage: 70
     }
 
     expect(() => buildRuntimeServiceOverrides(rows, global, t))

@@ -2876,8 +2876,8 @@ func TestRuntimeManifestDefaultsUseDurableAppliedConfigInsteadOfFailedDesiredCon
 	if manifest.Spec.Resources.CPUs != "2" || manifest.Spec.Resources.Memory != "2GB" {
 		t.Fatalf("manifest read failed desired resources instead of applied snapshot: %+v", manifest.Spec.Resources)
 	}
-	if manifest.Spec.Environment["AIFAR_NACOS_EPHEMERAL"] != "false" {
-		t.Fatalf("manifest nacos ephemeral=%q, want durable applied false", manifest.Spec.Environment["AIFAR_NACOS_EPHEMERAL"])
+	if _, found := manifest.Spec.Environment["AIFAR_NACOS_EPHEMERAL"]; found {
+		t.Fatalf("manifest must not expose the removed AIFAR_NACOS_EPHEMERAL variable: %+v", manifest.Spec.Environment)
 	}
 	hash := manifest.Spec.Environment["AIFAR_RUNTIME_CONFIG_HASH"]
 	if hash != "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" {
@@ -3269,8 +3269,11 @@ func TestFailedFirstRuntimeConfigUnrelatedRestartRestoresLegacyAppliedInput(t *t
 	if _, found := restartedManifest.Spec.Environment["AIFAR_RUNTIME_CONFIG_HASH"]; found {
 		t.Fatalf("unrelated restart retained failed config hash: %+v", restartedManifest.Spec.Environment)
 	}
-	if restartedManifest.Spec.Resources.CPUs != "1" || restartedManifest.Spec.Resources.Memory != "1GB" || restartedManifest.Spec.Environment["AIFAR_NACOS_EPHEMERAL"] != "true" {
+	if restartedManifest.Spec.Resources.CPUs != "1" || restartedManifest.Spec.Resources.Memory != "1GB" {
 		t.Fatalf("restart did not restore durable legacy values: resources=%+v env=%+v", restartedManifest.Spec.Resources, restartedManifest.Spec.Environment)
+	}
+	if _, found := restartedManifest.Spec.Environment["AIFAR_NACOS_EPHEMERAL"]; found {
+		t.Fatalf("restart must not restore the removed AIFAR_NACOS_EPHEMERAL variable: %+v", restartedManifest.Spec.Environment)
 	}
 	foundFixedInput := false
 	for _, volume := range restartedManifest.Spec.Volumes {
@@ -3581,9 +3584,8 @@ func TestServiceInstallsAIFARServiceFromRuntimeV2Bundle(t *testing.T) {
 		`"mode": "web-nginx"`,
 		`GATEWAY_SERVICE='gateway'`,
 		`"gatewayService": "${GATEWAY_SERVICE}"`,
-		`AIFAR_NACOS_EPHEMERAL true`,
-		`nacos_ephemeral`,
-		`"ephemeral": $(nacos_ephemeral)`,
+		`"ephemeral": true`,
+		`[ -n "$deployment_name" ] || deployment_name="aifar-$service"`,
 		`APP_BACKEND_HEALTH_PATH /actuator/health/readiness`,
 		`curl -fsS --connect-timeout 3 'http://127.0.0.1:%s%s' >/dev/null || exit 1`,
 	} {
@@ -3601,6 +3603,8 @@ func TestServiceInstallsAIFARServiceFromRuntimeV2Bundle(t *testing.T) {
 		t.Fatalf("AIFAR install script should not parse Docker health from the first JSON Status field:\n%s", remote.installScript)
 	}
 	for _, legacy := range []string{
+		`AIFAR_NACOS_EPHEMERAL`,
+		`nacos_ephemeral`,
 		`runtime-spec.json`,
 		`patch_web_nginx_gateway_target`,
 		`aifar-gateway`,

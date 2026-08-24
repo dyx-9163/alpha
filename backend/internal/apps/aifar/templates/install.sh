@@ -264,7 +264,6 @@ write_compose_env() {
   set_env APP_MEMORY_LIMIT "$APP_MEMORY_LIMIT" "$compose_env"
   set_env JVM_INITIAL_RAM_PERCENTAGE "$JVM_INITIAL_RAM_PERCENTAGE" "$compose_env"
   set_env JVM_MAX_RAM_PERCENTAGE "$JVM_MAX_RAM_PERCENTAGE" "$compose_env"
-  set_env AIFAR_NACOS_EPHEMERAL "true" "$compose_env"
   set_env APP_RESTART_POLICY "$(read_env_value "$DEFAULT_ENV" APP_RESTART_POLICY unless-stopped)" "$compose_env"
   set_env APP_HEALTH_PROTOCOL "$(read_env_value "$DEFAULT_ENV" APP_HEALTH_PROTOCOL http)" "$compose_env"
   set_env APP_HEALTH_HOST "$(read_env_value "$DEFAULT_ENV" APP_HEALTH_HOST 127.0.0.1)" "$compose_env"
@@ -348,14 +347,6 @@ write_runtime_resource_files() {
 
 json_escape() {
   printf "%s" "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
-}
-
-nacos_ephemeral() {
-  value="$(read_env_value "$ENV_DIR/compose.env" AIFAR_NACOS_EPHEMERAL true)"
-  case "$(printf "%s" "$value" | tr '[:upper:]' '[:lower:]')" in
-    false|0|no|off) printf "false" ;;
-    *) printf "true" ;;
-  esac
 }
 
 java_start_command() {
@@ -449,6 +440,7 @@ JSON
     [ -f "$service_env" ] || continue
     image="$(read_env_value "$service_env" APP_IMAGE "aifar-$service:$REVISION")"
     deployment_name="$(alpha_service_name "$service")"
+    [ -n "$deployment_name" ] || deployment_name="aifar-$service"
     port="$(service_port "$service")"
     health_cmd="$(health_cmd_for_service "$service")"
     app_cpus="$(resource_value "$service" APP_CPUS "$APP_CPUS")"
@@ -514,7 +506,7 @@ JSON
   "nacos": {
     "namespace": "${NACOS_NS}",
     "group": "DEFAULT_GROUP",
-    "ephemeral": $(nacos_ephemeral),
+    "ephemeral": true,
     "agentIPStrategy": "auto"
   }
 }

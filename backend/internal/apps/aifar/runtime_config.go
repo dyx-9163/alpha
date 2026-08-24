@@ -40,7 +40,6 @@ type RuntimeConfigState struct {
 	UpdatedBy       string                         `json:"updatedBy,omitempty"`
 	Global          RuntimeConfigValues            `json:"global"`
 	Services        map[string]RuntimeConfigValues `json:"services,omitempty"`
-	NacosEphemeral  bool                           `json:"nacosEphemeral"`
 	AppliedVersion  int                            `json:"appliedVersion,omitempty"`
 	LastAppliedAt   string                         `json:"lastAppliedAt,omitempty"`
 	LastApplyStatus string                         `json:"lastApplyStatus,omitempty"`
@@ -53,7 +52,6 @@ type RuntimeConfigAppliedSnapshot struct {
 	ConfigVersion   int                            `json:"configVersion"`
 	Global          RuntimeConfigValues            `json:"global"`
 	Services        map[string]RuntimeConfigValues `json:"services,omitempty"`
-	NacosEphemeral  bool                           `json:"nacosEphemeral"`
 	ServiceHashes   map[string]string              `json:"serviceHashes,omitempty"`
 	ServiceVersions map[string]int                 `json:"serviceVersions,omitempty"`
 	Immutable       bool                           `json:"immutable,omitempty"`
@@ -76,7 +74,6 @@ type runtimeConfigScriptService struct {
 	AppMemoryLimit          string
 	JVMInitialRAMPercentage string
 	JVMMaxRAMPercentage     string
-	NacosEphemeral          string
 	ConfigHash              string
 	ConfigDir               string
 }
@@ -88,13 +85,12 @@ type runtimeConfigScriptData struct {
 }
 
 type runtimeConfigTarget struct {
-	ServiceName    string
-	ConfigVersion  int
-	ConfigHash     string
-	ConfigDir      string
-	Values         RuntimeConfigValues
-	NacosEphemeral bool
-	Java           bool
+	ServiceName   string
+	ConfigVersion int
+	ConfigHash    string
+	ConfigDir     string
+	Values        RuntimeConfigValues
+	Java          bool
 }
 
 func runtimeConfigFromOptions(options InstallOptions, actor string, now time.Time) RuntimeConfigState {
@@ -108,7 +104,6 @@ func runtimeConfigFromOptions(options InstallOptions, actor string, now time.Tim
 			JVMInitialRAMPercentage: options.JVMInitialRAMPercentage,
 			JVMMaxRAMPercentage:     options.JVMMaxRAMPercentage,
 		}, defaultRuntimeConfigValues()),
-		NacosEphemeral:  true,
 		Services:        map[string]RuntimeConfigValues{},
 		AppliedVersion:  1,
 		LastAppliedAt:   now.Format(time.RFC3339),
@@ -133,19 +128,11 @@ func runtimeConfigFromMetadata(metadata map[string]any) RuntimeConfigState {
 	state := RuntimeConfigState{
 		Global:          defaultRuntimeConfigValues(),
 		Services:        map[string]RuntimeConfigValues{},
-		NacosEphemeral:  true,
 		AllowedServices: servicesFromMetadata(metadata),
 	}
 	if raw, ok := metadata["runtimeConfig"]; ok {
-		hasNacosEphemeral := false
-		if rawMap, ok := raw.(map[string]any); ok {
-			_, hasNacosEphemeral = rawMap["nacosEphemeral"]
-		}
 		data, _ := json.Marshal(raw)
 		_ = json.Unmarshal(data, &state)
-		if !hasNacosEphemeral {
-			state.NacosEphemeral = true
-		}
 	}
 	state.Global = normalizeRuntimeConfigValues(state.Global, defaultRuntimeConfigValues())
 	if state.Services == nil {
@@ -186,9 +173,7 @@ func normalizeRuntimeConfigAppliedSnapshot(snapshot *RuntimeConfigAppliedSnapsho
 	for _, serviceName := range serviceListOrDefault(services) {
 		hash := strings.TrimSpace(snapshot.ServiceHashes[serviceName])
 		if !deploymentSpecHashPattern.MatchString(hash) {
-			snapshot.ServiceHashes[serviceName] = runtimeConfigServiceHashValues(
-				effectiveRuntimeConfigForAppliedSnapshot(*snapshot, serviceName), snapshot.NacosEphemeral,
-			)
+			snapshot.ServiceHashes[serviceName] = runtimeConfigServiceHashValues(effectiveRuntimeConfigForAppliedSnapshot(*snapshot, serviceName))
 		}
 		if snapshot.Immutable && snapshot.ServiceVersions[serviceName] < 1 {
 			snapshot.ServiceVersions[serviceName] = snapshot.ConfigVersion
@@ -200,16 +185,14 @@ func runtimeConfigAppliedSnapshotFromState(state RuntimeConfigState, services []
 	snapshot := RuntimeConfigAppliedSnapshot{
 		ConfigVersion: state.ConfigVersion,
 		Global:        normalizeRuntimeConfigValues(state.Global, defaultRuntimeConfigValues()),
-		Services:      map[string]RuntimeConfigValues{}, NacosEphemeral: state.NacosEphemeral,
+		Services:      map[string]RuntimeConfigValues{},
 		ServiceHashes: map[string]string{}, ServiceVersions: map[string]int{}, Immutable: immutable,
 	}
 	for serviceName, values := range state.Services {
 		snapshot.Services[serviceName] = normalizeRuntimeConfigValues(values, snapshot.Global)
 	}
 	for _, serviceName := range serviceListOrDefault(services) {
-		snapshot.ServiceHashes[serviceName] = runtimeConfigServiceHashValues(
-			effectiveRuntimeConfigForAppliedSnapshot(snapshot, serviceName), snapshot.NacosEphemeral,
-		)
+		snapshot.ServiceHashes[serviceName] = runtimeConfigServiceHashValues(effectiveRuntimeConfigForAppliedSnapshot(snapshot, serviceName))
 		if immutable {
 			snapshot.ServiceVersions[serviceName] = state.ConfigVersion
 		}
@@ -226,14 +209,11 @@ func effectiveRuntimeConfigForAppliedSnapshot(snapshot RuntimeConfigAppliedSnaps
 }
 
 func runtimeConfigServiceHash(state RuntimeConfigState, service string) string {
-	return runtimeConfigServiceHashValues(effectiveRuntimeConfigForService(state, service), state.NacosEphemeral)
+	return runtimeConfigServiceHashValues(effectiveRuntimeConfigForService(state, service))
 }
 
-func runtimeConfigServiceHashValues(values RuntimeConfigValues, nacosEphemeral bool) string {
-	payload := struct {
-		Values         RuntimeConfigValues `json:"values"`
-		NacosEphemeral bool                `json:"nacosEphemeral"`
-	}{Values: normalizeRuntimeConfigValues(values, defaultRuntimeConfigValues()), NacosEphemeral: nacosEphemeral}
+func runtimeConfigServiceHashValues(values RuntimeConfigValues) string {
+	payload := normalizeRuntimeConfigValues(values, defaultRuntimeConfigValues())
 	data, _ := json.Marshal(payload)
 	sum := sha256.Sum256(data)
 	return fmt.Sprintf("%x", sum[:])
@@ -244,7 +224,7 @@ func runtimeConfigVersionDir(installRoot, service string, version int, configHas
 }
 
 func runtimeConfigIntentEqual(a, b RuntimeConfigState, services []string) bool {
-	if a.NacosEphemeral != b.NacosEphemeral || !runtimeConfigValuesEqual(a.Global, b.Global) {
+	if !runtimeConfigValuesEqual(a.Global, b.Global) {
 		return false
 	}
 	for _, serviceName := range serviceListOrDefault(services) {
@@ -265,8 +245,8 @@ func runtimeConfigTargetFromStateVersion(installRoot string, state RuntimeConfig
 	return runtimeConfigTarget{
 		ServiceName: serviceName, ConfigVersion: version, ConfigHash: configHash,
 		ConfigDir: runtimeConfigVersionDir(installRoot, serviceName, version, configHash),
-		Values:    effectiveRuntimeConfigForService(state, serviceName), NacosEphemeral: state.NacosEphemeral,
-		Java: serviceName != "web-vue3",
+		Values:    effectiveRuntimeConfigForService(state, serviceName),
+		Java:      serviceName != "web-vue3",
 	}
 }
 
@@ -285,7 +265,7 @@ func runtimeConfigTargetsForApply(installRoot string, previous, next RuntimeConf
 	for _, serviceName := range serviceListOrDefault(services) {
 		nextHash := runtimeConfigServiceHash(next, serviceName)
 		if previous.AppliedSnapshot == nil {
-			if runtimeConfigChangedForService(previous, next, serviceName) || previous.NacosEphemeral != next.NacosEphemeral {
+			if runtimeConfigChangedForService(previous, next, serviceName) {
 				targets[serviceName] = runtimeConfigTargetFromState(installRoot, next, serviceName)
 			}
 			continue
@@ -331,7 +311,6 @@ func applyRuntimeConfigTarget(manifest *runtimeagent.DeploymentManifest, target 
 	}
 	manifest.Spec.Environment["AIFAR_RUNTIME_CONFIG_VERSION"] = strconv.Itoa(target.ConfigVersion)
 	manifest.Spec.Environment["AIFAR_RUNTIME_CONFIG_HASH"] = target.ConfigHash
-	manifest.Spec.Environment["AIFAR_NACOS_EPHEMERAL"] = strconv.FormatBool(target.NacosEphemeral)
 	if !target.Java {
 		return nil
 	}
@@ -364,8 +343,7 @@ func runtimeConfigDeploymentProvesTarget(deployment store.AIFARDeployment, targe
 		cleanAIFARServiceName(manifest.Metadata.Name) != target.ServiceName || cleanAIFARServiceName(manifest.Spec.ServiceName) != target.ServiceName ||
 		manifest.Spec.Resources.CPUs != target.Values.AppCPUs || !strings.EqualFold(manifest.Spec.Resources.Memory, target.Values.AppMemoryLimit) ||
 		manifest.Spec.Environment["AIFAR_RUNTIME_CONFIG_VERSION"] != strconv.Itoa(target.ConfigVersion) ||
-		manifest.Spec.Environment["AIFAR_RUNTIME_CONFIG_HASH"] != target.ConfigHash ||
-		manifest.Spec.Environment["AIFAR_NACOS_EPHEMERAL"] != strconv.FormatBool(target.NacosEphemeral) {
+		manifest.Spec.Environment["AIFAR_RUNTIME_CONFIG_HASH"] != target.ConfigHash {
 		return false
 	}
 	if target.Java {
@@ -464,9 +442,6 @@ func normalizeRuntimeConfigPayload(payload RuntimeConfigPayload, base RuntimeCon
 	next := base
 	next.Global = global
 	next.Services = services
-	if payload.NacosEphemeral != nil {
-		next.NacosEphemeral = *payload.NacosEphemeral
-	}
 	return next, nil
 }
 
@@ -729,7 +704,6 @@ func runtimeConfigScriptDataFromState(installRoot string, previous, next Runtime
 			AppCPUs: target.Values.AppCPUs, AppMemoryLimit: target.Values.AppMemoryLimit,
 			JVMInitialRAMPercentage: formatRuntimePercent(target.Values.JVMInitialRAMPercentage),
 			JVMMaxRAMPercentage:     formatRuntimePercent(target.Values.JVMMaxRAMPercentage),
-			NacosEphemeral:          strconv.FormatBool(target.NacosEphemeral),
 			ConfigHash:              target.ConfigHash, ConfigDir: target.ConfigDir,
 		})
 	}

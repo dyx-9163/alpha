@@ -60,9 +60,8 @@ prepare_service_config() {
   memory="$4"
   jvm_initial="$5"
   jvm_max="$6"
-  nacos_ephemeral="$7"
-  config_hash="$8"
-  final_dir="$9"
+  config_hash="$7"
+  final_dir="$8"
   parent_dir="$CONFIG_ROOT/$service"
   [ "$final_dir" = "$parent_dir/v${CONFIG_VERSION}-${config_hash}" ] || fail "runtime config destination is invalid"
   mkdir -p -- "$parent_dir"
@@ -74,8 +73,8 @@ prepare_service_config() {
   mkdir -- "$CURRENT_STAGE"
   chmod 0755 -- "$CURRENT_STAGE"
   printf "service=%s\nversion=%s\nhash=%s\n" "$service" "$CONFIG_VERSION" "$config_hash" > "$CURRENT_STAGE/config.meta"
-  printf "APP_CPUS=%s\nAPP_MEMORY_LIMIT=%s\nAIFAR_RUNTIME_CONFIG_VERSION=%s\nAIFAR_RUNTIME_CONFIG_HASH=%s\nAIFAR_NACOS_EPHEMERAL=%s\n" \
-    "$cpus" "$memory" "$CONFIG_VERSION" "$config_hash" "$nacos_ephemeral" > "$CURRENT_STAGE/resource.env"
+  printf "APP_CPUS=%s\nAPP_MEMORY_LIMIT=%s\nAIFAR_RUNTIME_CONFIG_VERSION=%s\nAIFAR_RUNTIME_CONFIG_HASH=%s\n" \
+    "$cpus" "$memory" "$CONFIG_VERSION" "$config_hash" > "$CURRENT_STAGE/resource.env"
   chmod 0644 -- "$CURRENT_STAGE/config.meta" "$CURRENT_STAGE/resource.env"
   if [ "$java" = "true" ]; then
     write_jvm_options "$CURRENT_STAGE/java-jvm.options" "$jvm_initial" "$jvm_max"
@@ -104,6 +103,6 @@ prepare_service_config() {
 mkdir -p -- "$CONFIG_ROOT"
 chmod 0755 -- "$CONFIG_ROOT"
 {{ range .Services -}}
-prepare_service_config {{ quote .Name }} {{ if .Java }}true{{ else }}false{{ end }} {{ quote .AppCPUs }} {{ quote .AppMemoryLimit }} {{ quote .JVMInitialRAMPercentage }} {{ quote .JVMMaxRAMPercentage }} {{ quote .NacosEphemeral }} {{ quote .ConfigHash }} {{ quote .ConfigDir }}
+prepare_service_config {{ quote .Name }} {{ if .Java }}true{{ else }}false{{ end }} {{ quote .AppCPUs }} {{ quote .AppMemoryLimit }} {{ quote .JVMInitialRAMPercentage }} {{ quote .JVMMaxRAMPercentage }} {{ quote .ConfigHash }} {{ quote .ConfigDir }}
 {{ end -}}
 echo "AIFAR runtime config prepared, version $CONFIG_VERSION"

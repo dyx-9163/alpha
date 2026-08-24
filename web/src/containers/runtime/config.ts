@@ -17,7 +17,6 @@ export function defaultRuntimeConfigState(): RuntimeConfigState {
       jvmInitialRAMPercentage: 20,
       jvmMaxRAMPercentage: 70
     },
-    nacosEphemeral: true,
     services: {}
   }
 }

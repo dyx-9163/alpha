@@ -72,9 +72,6 @@
         <el-form-item :label="t('containers.jvmMaxRam')" required>
           <el-input-number v-model="runtimeConfigForm.jvmMaxRAMPercentage" :min="1" :max="90" :step="1" controls-position="right" />
         </el-form-item>
-        <el-form-item :label="t('containers.nacosEphemeral')">
-          <el-switch v-model="runtimeConfigForm.nacosEphemeral" inline-prompt active-text="true" inactive-text="false" />
-        </el-form-item>
       </el-form>
       <div class="runtime-config-section-title">{{ t('containers.runtimeConfigOverrides') }}</div>
       <el-table :data="runtimeConfigRows" max-height="300" row-key="serviceName" class="runtime-config-table">

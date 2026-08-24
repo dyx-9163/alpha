@@ -2670,6 +2670,24 @@ func (m *fakeAIFARRuntimeActionModule) RestartRuntime(ctx context.Context, req r
 	return m.restartErr
 }
 
+func TestRuntimeConfigResponseOmitsRemovedNacosEphemeralSetting(t *testing.T) {
+	legacy := runtimeConfigFromRuntimeMetadata(map[string]any{
+		"runtimeConfig": map[string]any{
+			"configVersion":  2,
+			"nacosEphemeral": false,
+			"global":         map[string]any{"appCPUs": "2.0"},
+		},
+	})
+	if _, found := legacy["nacosEphemeral"]; found {
+		t.Fatalf("legacy runtime config response must omit removed nacosEphemeral setting: %+v", legacy)
+	}
+
+	defaults := runtimeConfigFromRuntimeMetadata(map[string]any{})
+	if _, found := defaults["nacosEphemeral"]; found {
+		t.Fatalf("default runtime config response must omit removed nacosEphemeral setting: %+v", defaults)
+	}
+}
+
 func seedAIFARRuntimeFixture(t *testing.T, db *store.Store, dockerHost string) (store.Server, store.AppInstance) {
 	t.Helper()
 	server, err := db.SaveServer(store.Server{Name: "docker-1", Host: "10.0.0.10", DockerHost: dockerHost, DeployDir: "/aifar/apps"})

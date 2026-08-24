@@ -369,9 +369,8 @@ type RuntimeConfigValues struct {
 }
 
 type RuntimeConfigPayload struct {
-	Global         RuntimeConfigValues            `json:"global"`
-	Services       map[string]RuntimeConfigValues `json:"services,omitempty"`
-	NacosEphemeral *bool                          `json:"nacosEphemeral,omitempty"`
+	Global   RuntimeConfigValues            `json:"global"`
+	Services map[string]RuntimeConfigValues `json:"services,omitempty"`
 }
 
 type RuntimeConfigRequest struct {

@@ -21,7 +21,6 @@ export type RuntimeConfigPayload = {
   instanceId: string
   global: Required<RuntimeConfigValues>
   services: Record<string, RuntimeConfigValues>
-  nacosEphemeral: boolean
 }
 
 export type RuntimeRollbackPayload = {

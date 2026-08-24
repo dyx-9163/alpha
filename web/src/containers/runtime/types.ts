@@ -23,16 +23,13 @@ export type RuntimeConfigState = {
   updatedBy?: string
   global?: RuntimeConfigValues
   services?: Record<string, RuntimeConfigValues>
-  nacosEphemeral?: boolean
   appliedVersion?: number
   lastAppliedAt?: string
   lastApplyStatus?: string
   lastApplyError?: string
 }
 
-export type RuntimeConfigFormValues = Required<RuntimeConfigValues> & {
-  nacosEphemeral: boolean
-}
+export type RuntimeConfigFormValues = Required<RuntimeConfigValues>
 
 export type RuntimeConfigServiceRow = {
   serviceName: string

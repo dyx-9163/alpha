@@ -249,11 +249,10 @@ type aifarRuntimeBatchOfflineRequest struct {
 }
 
 type aifarRuntimeConfigApplyRequest struct {
-	InstanceID     string                                  `json:"instanceId"`
-	Reason         string                                  `json:"reason"`
-	Global         registry.RuntimeConfigValues            `json:"global"`
-	Services       map[string]registry.RuntimeConfigValues `json:"services,omitempty"`
-	NacosEphemeral *bool                                   `json:"nacosEphemeral,omitempty"`
+	InstanceID string                                  `json:"instanceId"`
+	Reason     string                                  `json:"reason"`
+	Global     registry.RuntimeConfigValues            `json:"global"`
+	Services   map[string]registry.RuntimeConfigValues `json:"services,omitempty"`
 }
 
 func aifarRuntimeCleanupSteps() []simpleTaskStep {
@@ -1166,9 +1165,8 @@ func (a *aifarRuntimeController) configure(w http.ResponseWriter, r *http.Reques
 		Actor:    actor,
 		Reason:   strings.TrimSpace(req.Reason),
 		Config: registry.RuntimeConfigPayload{
-			Global:         req.Global,
-			Services:       req.Services,
-			NacosEphemeral: req.NacosEphemeral,
+			Global:   req.Global,
+			Services: req.Services,
 		},
 	}
 	if err := configModule.ValidateRuntimeConfig(r.Context(), configReq); err != nil {
@@ -1192,9 +1190,8 @@ func (a *aifarRuntimeController) configure(w http.ResponseWriter, r *http.Reques
 			Actor:    actor,
 			Reason:   strings.TrimSpace(req.Reason),
 			Config: registry.RuntimeConfigPayload{
-				Global:         req.Global,
-				Services:       req.Services,
-				NacosEphemeral: req.NacosEphemeral,
+				Global:   req.Global,
+				Services: req.Services,
 			},
 		}, registry.RunContext{
 			TaskID: log.TaskID(),
@@ -3155,10 +3152,10 @@ func runtimeConfigFromRuntimeMetadata(metadata map[string]any) map[string]any {
 	if raw, ok := metadata["runtimeConfig"].(map[string]any); ok && len(raw) > 0 {
 		out := map[string]any{}
 		for key, value := range raw {
+			if key == "nacosEphemeral" {
+				continue
+			}
 			out[key] = value
-		}
-		if _, ok := out["nacosEphemeral"]; !ok {
-			out["nacosEphemeral"] = true
 		}
 		return out
 	}
@@ -3166,7 +3163,6 @@ func runtimeConfigFromRuntimeMetadata(metadata map[string]any) map[string]any {
 		"configVersion":   1,
 		"appliedVersion":  1,
 		"lastApplyStatus": "applied",
-		"nacosEphemeral":  true,
 		"global": map[string]any{
 			"appCPUs":                 runtimeString(metadata, "appCPUs", "2.0"),
 			"appMemoryLimit":          runtimeString(metadata, "appMemoryLimit", "2GB"),

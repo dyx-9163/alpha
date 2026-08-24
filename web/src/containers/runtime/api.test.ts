@@ -213,8 +213,7 @@ describe('AIFAR Runtime API service', () => {
         jvmInitialRAMPercentage: 20,
         jvmMaxRAMPercentage: 70
       },
-      services: { gateway: { appCPUs: '1.0' } },
-      nacosEphemeral: true
+      services: { gateway: { appCPUs: '1.0' } }
     }
     apiPutMock.mockResolvedValueOnce({ taskId: 'task-config' })
 

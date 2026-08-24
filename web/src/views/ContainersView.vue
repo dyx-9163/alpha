@@ -327,8 +327,7 @@ const runtimeConfigForm = ref<RuntimeConfigFormValues>({
   appCPUs: '2.0',
   appMemoryLimit: '2GB',
   jvmInitialRAMPercentage: 20,
-  jvmMaxRAMPercentage: 70,
-  nacosEphemeral: true
+  jvmMaxRAMPercentage: 70
 })
 const runtimeConfigRows = ref<RuntimeConfigServiceRow[]>([])
 const serviceInstallVisible = ref(false)
@@ -1366,7 +1365,7 @@ function openRuntimeConfigDialog() {
   }
   const state = selectedRuntimeConfig.value
   const global = normalizedRuntimeValues(state.global)
-  runtimeConfigForm.value = { ...global, nacosEphemeral: state.nacosEphemeral !== false }
+  runtimeConfigForm.value = { ...global }
   const overrides = state.services || {}
   const services = selectedRuntimeServices.value.length
     ? selectedRuntimeServices.value.map((item) => item.serviceName)
@@ -1525,8 +1524,7 @@ async function submitRuntimeConfig() {
     const result = await applyRuntimeConfig(query, {
       instanceId,
       global,
-      services,
-      nacosEphemeral: runtimeConfigForm.value.nacosEphemeral
+      services
     })
     runtimeConfigVisible.value = false
     ElMessage.success(t('containers.runtimeConfigApplyStarted'))

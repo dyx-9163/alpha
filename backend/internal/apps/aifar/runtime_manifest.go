@@ -7,7 +7,6 @@ import (
 	"io"
 	"path"
 	"regexp"
-	"strconv"
 	"strings"
 
 	"aifar-deployment/backend/internal/runtimeagent"
@@ -87,7 +86,6 @@ func applyDurableRuntimeConfigToManifest(metadata map[string]any, installRoot, s
 	if manifest.Spec.Environment == nil {
 		manifest.Spec.Environment = map[string]string{}
 	}
-	manifest.Spec.Environment["AIFAR_NACOS_EPHEMERAL"] = strconv.FormatBool(snapshot.NacosEphemeral)
 	configVersion, immutable := runtimeConfigAppliedServiceVersion(snapshot, serviceName)
 	if !immutable {
 		delete(manifest.Spec.Environment, "AIFAR_RUNTIME_CONFIG_VERSION")
@@ -117,7 +115,7 @@ func applyDurableRuntimeConfigToManifest(metadata map[string]any, installRoot, s
 	target := runtimeConfigTarget{
 		ServiceName: serviceName, ConfigVersion: configVersion, ConfigHash: configHash,
 		ConfigDir: runtimeConfigVersionDir(installRoot, serviceName, configVersion, configHash),
-		Values:    values, NacosEphemeral: snapshot.NacosEphemeral, Java: serviceName != "web-vue3",
+		Values:    values, Java: serviceName != "web-vue3",
 	}
 	return applyRuntimeConfigTarget(manifest, target)
 }
