@@ -542,16 +542,31 @@ readback_bootstrap_acceptance() {
   printf '%s]}' "$response"
 }
 
+wait_bootstrap_acceptance() {
+  attempt=0
+  while [ "$attempt" -lt 120 ]; do
+    if acceptance="$(readback_bootstrap_acceptance)"; then
+      printf "%s" "$acceptance"
+      return 0
+    fi
+    attempt=$((attempt + 1))
+    sleep 1
+  done
+  return 1
+}
+
 accept_runtime_manifests() {
   check_agent_dependency
   spec="$(write_bootstrap_input)"
   legacy_hash="$(sha256sum "$spec" | awk '{print $1}')"
-  if aifar-agent bootstrap-runtime-stdin --instance "$INSTANCE_ID" --sha256 "$legacy_hash" < "$spec" >/dev/null 2>&1; then
-    :
-  else
-    :
+  if ! aifar-agent bootstrap-runtime-stdin --instance "$INSTANCE_ID" --sha256 "$legacy_hash" < "$spec" >/dev/null; then
+    rm -f "$spec"
+    fail "aifar-agent rejected the runtime bootstrap"
   fi
-  acceptance="$(readback_bootstrap_acceptance)" || fail "aifar-agent could not prove the exact runtime Manifests"
+  if ! acceptance="$(wait_bootstrap_acceptance)"; then
+    rm -f "$spec"
+    fail "aifar-agent could not prove the exact runtime Manifests within 120 seconds"
+  fi
   rm -f "$spec"
   printf 'AIFAR_BOOTSTRAP_ACCEPTANCE=%s\n' "$acceptance"
 }

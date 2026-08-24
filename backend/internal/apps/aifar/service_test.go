@@ -3729,10 +3729,13 @@ func TestInstallSucceedsAfterManifestAcceptanceWithoutObservedRuntime(t *testing
 			t.Fatalf("install script must not execute readiness gate %q", forbidden)
 		}
 	}
-	for _, required := range []string{"aifar-agent bootstrap-runtime-stdin --instance", "--sha256 \"$legacy_hash\" < \"$spec\"", "AIFAR_BOOTSTRAP_ACCEPTANCE", "SERVICE_SPEC_HASHES", "expected_hash"} {
+	for _, required := range []string{"aifar-agent bootstrap-runtime-stdin --instance", "--sha256 \"$legacy_hash\" < \"$spec\"", "AIFAR_BOOTSTRAP_ACCEPTANCE", "SERVICE_SPEC_HASHES", "expected_hash", "wait_bootstrap_acceptance"} {
 		if !strings.Contains(remote.installScript, required) {
 			t.Fatalf("install script must validate manifest acceptance with %q", required)
 		}
+	}
+	if strings.Contains(remote.installScript, `bootstrap-runtime-stdin --instance "$INSTANCE_ID" --sha256 "$legacy_hash" < "$spec" >/dev/null 2>&1`) {
+		t.Fatal("install script must not discard the Agent bootstrap rejection reason")
 	}
 	for _, forbidden := range []string{"aifar-agent bootstrap-runtime --spec", ".aifar-stage-", "migration-legacy-spec.json"} {
 		if strings.Contains(remote.installScript, forbidden) {
