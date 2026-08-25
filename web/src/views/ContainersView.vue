@@ -2133,6 +2133,9 @@ watch(tab, async (next) => {
   if (next !== 'aifar-runtime') {
     runtimePodMetricsScheduler.stop()
     closeRuntimeLogStream()
+    if (next === 'images' && pageReady.value) {
+      await load(false)
+    }
   } else if (pageReady.value) {
     if (runtimeResourceTab.value === 'pods') {
       await activateRuntimePods('enter')
@@ -2146,10 +2149,13 @@ watch(tab, async (next) => {
     }
   }
 })
-watch(resourceTab, () => {
+watch(resourceTab, async () => {
   if (tab.value === 'images') {
     collection.value = []
     selectedImageRows.value = []
+    if (pageReady.value) {
+      await loadCollection(false)
+    }
   }
 })
 watch(runtimeResourceTab, (next) => {
@@ -2230,6 +2236,8 @@ watch([aifarUpdateService, aifarUpdateMode], () => {
   aifarArtifactFile.value = null
 })
 watch(selectedServerId, async () => {
+  collection.value = []
+  selectedImageRows.value = []
   runtimeServiceTaskOwners.value = {}
   runtimePodMetricsScheduler.stop()
   runtimeLogServiceFilter.value = []
@@ -2242,6 +2250,13 @@ watch(selectedServerId, async () => {
   closeRuntimeLogStream()
   if (pageReady.value) {
     await ensurePersistedContainerSnapshots()
+    if (tab.value === 'overview') {
+      await loadSummary(true, false)
+    } else if (tab.value === 'aifar-runtime') {
+      await loadAifarRuntime(false)
+    } else {
+      await Promise.all([loadSummary(false, false), loadCollection(false)])
+    }
   }
 })
 onMounted(async () => {

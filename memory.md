@@ -15,3 +15,5 @@
 - 结论：按用户明确授权，将当前工作区剩余改动统一纳入本地提交；不推送远端。
 - 问题：容器页 AIFAR Runtime 中 aifar-agent 已断开/缺失时仍展示缓存或响应中的 Deployments/Pods/服务/入口发现等部署运行时数据。
 - 结论：新增 agent running 硬门禁；agent 非 running 时 Runtime 派生实例、部署、服务、Pods、入口发现均归零，Workspace 仅显示 agent 不可用提示，不再渲染部署相关标签页；补充回归测试。
+- 问题：容器页切到“镜像”页或在镜像页切换服务器时表格为空，没有主动加载 Docker images collection。
+- 结论：在进入“镜像”大页、切换镜像/网络/卷子页、以及镜像页切换服务器时主动加载当前 Docker collection；保留容器页入口使用 15 秒状态快照的策略，并补充回归测试。

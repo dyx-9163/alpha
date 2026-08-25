@@ -49,6 +49,14 @@ const server = {
   deployDir: '/aifar/apps'
 }
 
+const secondServer = {
+  id: 'srv-2',
+  name: 'node-2',
+  host: '192.168.74.142',
+  dockerHost: 'ssh://root@192.168.74.142',
+  deployDir: '/aifar/apps'
+}
+
 function mountContainersView() {
   return shallowMount(ContainersView, {
     global: {
@@ -86,6 +94,8 @@ describe('ContainersView AIFAR runtime loading', () => {
     apiGetMock.mockImplementation(async (path: string) => {
       if (path === '/apps/aifar/install-modules?version=runtime-v2') return []
       if (path === '/servers') return [server]
+      if (path === '/containers/summary?serverId=srv-1') return { available: true, summary: { images: 1 } }
+      if (path === '/containers/summary?serverId=srv-2') return { available: true, summary: { images: 1 } }
       if (path === '/apps/instances') {
         return [{
           id: 'app-aifar',
@@ -98,6 +108,12 @@ describe('ContainersView AIFAR runtime loading', () => {
       }
       if (path === '/settings') return {}
       if (path === '/status/snapshots') return { items: [] }
+      if (path === '/containers?kind=images&serverId=srv-1') {
+        return [{ id: 'sha256:image-1', repository: 'aifar-gateway', tag: 'latest' }]
+      }
+      if (path === '/containers?kind=images&serverId=srv-2') {
+        return [{ id: 'sha256:image-2', repository: 'aifar-oauth', tag: 'latest' }]
+      }
       if (path === '/containers/aifar/runtime?serverId=srv-1&includePods=0&includeStats=0') {
         return {
           runtimeStatus: 'running',
@@ -124,6 +140,54 @@ describe('ContainersView AIFAR runtime loading', () => {
     await flushPromises()
 
     expect(requestedPaths()).toContain('/containers/aifar/runtime?serverId=srv-1&includePods=0&includeStats=0')
+  })
+
+  it('loads Docker images when entering the images tab', async () => {
+    const wrapper = mountContainersView()
+    await flushPromises()
+
+    expect(requestedPaths()).not.toContain('/containers?kind=images&serverId=srv-1')
+
+    ;(wrapper.vm as unknown as { tab: string }).tab = 'images'
+    await flushPromises()
+
+    expect(requestedPaths()).toContain('/containers?kind=images&serverId=srv-1')
+    expect((wrapper.vm as unknown as { collection: unknown[] }).collection).toEqual([
+      expect.objectContaining({ id: 'sha256:image-1', repository: 'aifar-gateway' })
+    ])
+  })
+
+  it('reloads Docker image rows for the newly selected server while staying on the images tab', async () => {
+    apiGetMock.mockImplementation(async (path: string) => {
+      if (path === '/apps/aifar/install-modules?version=runtime-v2') return []
+      if (path === '/servers') return [server, secondServer]
+      if (path === '/containers/summary?serverId=srv-1') return { available: true, summary: { images: 1 } }
+      if (path === '/containers/summary?serverId=srv-2') return { available: true, summary: { images: 1 } }
+      if (path === '/apps/instances') return []
+      if (path === '/settings') return {}
+      if (path === '/status/snapshots') return { items: [] }
+      if (path === '/containers?kind=images&serverId=srv-1') {
+        return [{ id: 'sha256:image-1', repository: 'aifar-gateway', tag: 'latest' }]
+      }
+      if (path === '/containers?kind=images&serverId=srv-2') {
+        return [{ id: 'sha256:image-2', repository: 'aifar-oauth', tag: 'latest' }]
+      }
+      return null
+    })
+
+    const wrapper = mountContainersView()
+    await flushPromises()
+
+    const vm = wrapper.vm as unknown as { tab: string; selectedServerId: string; collection: unknown[] }
+    vm.tab = 'images'
+    await flushPromises()
+    vm.selectedServerId = 'srv-2'
+    await flushPromises()
+
+    expect(requestedPaths()).toContain('/containers?kind=images&serverId=srv-2')
+    expect(vm.collection).toEqual([
+      expect.objectContaining({ id: 'sha256:image-2', repository: 'aifar-oauth' })
+    ])
   })
 
   it('hides all deployment runtime data when aifar-agent is unavailable', async () => {
