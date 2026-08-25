@@ -42,7 +42,13 @@
       show-icon
       :title="aifarRuntimeWarnings.join('；')"
     />
-    <div v-if="!aifarRuntimeInstances.length" class="empty-state">
+    <div v-if="!aifarRuntimeDataAvailable" class="empty-state">
+      <div>
+        <strong>{{ t('containers.aifarRuntime') }}</strong>
+        <span>{{ t('containers.runtimeAgentUnavailableEmpty') }}</span>
+      </div>
+    </div>
+    <div v-else-if="!aifarRuntimeInstances.length" class="empty-state">
       <div>
         <strong>{{ t('containers.aifarRuntime') }}</strong>
         <span>{{ t('containers.noAifarRuntime') }}</span>
@@ -89,6 +95,7 @@ const {
   aifarRuntimeStatusKind,
   aifarRuntimeStatusLabel,
   selectedRuntimeInstanceId,
+  aifarRuntimeDataAvailable,
   aifarRuntimeInstances,
   runtimeInstanceLabel,
   aifarRuntimeActionDisabledReason,

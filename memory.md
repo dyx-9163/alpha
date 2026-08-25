@@ -13,3 +13,5 @@
 - 结论：隐藏 Dashboard 顶部 KPI strip，运行状态卡改为固定全高标准布局，列表/详情区域撑满并滚动；移除 Dashboard 对 tasks/alerts KPI 数据的加载，补充对应前端回归测试。
 - 问题：用户要求将当前所有未提交文件提交到本地仓库。
 - 结论：按用户明确授权，将当前工作区剩余改动统一纳入本地提交；不推送远端。
+- 问题：容器页 AIFAR Runtime 中 aifar-agent 已断开/缺失时仍展示缓存或响应中的 Deployments/Pods/服务/入口发现等部署运行时数据。
+- 结论：新增 agent running 硬门禁；agent 非 running 时 Runtime 派生实例、部署、服务、Pods、入口发现均归零，Workspace 仅显示 agent 不可用提示，不再渲染部署相关标签页；补充回归测试。

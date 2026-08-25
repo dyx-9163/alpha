@@ -125,4 +125,59 @@ describe('ContainersView AIFAR runtime loading', () => {
 
     expect(requestedPaths()).toContain('/containers/aifar/runtime?serverId=srv-1&includePods=0&includeStats=0')
   })
+
+  it('hides all deployment runtime data when aifar-agent is unavailable', async () => {
+    apiGetMock.mockImplementation(async (path: string) => {
+      if (path === '/apps/aifar/install-modules?version=runtime-v2') return []
+      if (path === '/servers') return [server]
+      if (path === '/apps/instances') {
+        return [{
+          id: 'app-aifar',
+          app: 'aifar',
+          serverId: 'srv-1',
+          status: 'installed',
+          version: 'runtime-v2',
+          metadata: JSON.stringify({ installRoot: '/aifar/apps/admin', orchestrationModel: 'agent-service-controller-v1' })
+        }]
+      }
+      if (path === '/settings') return {}
+      if (path === '/status/snapshots') return { items: [] }
+      if (path === '/containers/aifar/runtime?serverId=srv-1&includePods=0&includeStats=0') {
+        return {
+          runtimeStatus: 'degraded',
+          agent: { status: 'missing', error: 'agent disconnected' },
+          instances: [{ id: 'app-aifar', status: 'running', version: 'runtime-v2' }],
+          deployments: [{ instanceId: 'app-aifar', serviceName: 'permission', deploymentName: 'permission' }],
+          services: [{ instanceId: 'app-aifar', serviceName: 'permission', status: 'running' }],
+          pods: [{ instanceId: 'app-aifar', serviceName: 'permission', containerName: 'permission-1', status: 'running' }],
+          ingress: [{ instanceId: 'app-aifar', status: 'running', webRoute: 'http://example.local' }],
+          warnings: ['agent disconnected']
+        }
+      }
+      return null
+    })
+
+    const wrapper = mountContainersView()
+    await flushPromises()
+
+    ;(wrapper.vm as unknown as { tab: string }).tab = 'aifar-runtime'
+    await flushPromises()
+
+    const vm = wrapper.vm as unknown as {
+      aifarRuntimeDataAvailable: boolean
+      aifarRuntimeInstances: unknown[]
+      selectedRuntimeInstanceId: string
+      selectedRuntimeDeployments: unknown[]
+      selectedRuntimeServices: unknown[]
+      selectedRuntimePods: unknown[]
+      runtimeEntryRoutes: Array<{ route: string; port: string }>
+    }
+    expect(vm.aifarRuntimeDataAvailable).toBe(false)
+    expect(vm.aifarRuntimeInstances).toEqual([])
+    expect(vm.selectedRuntimeInstanceId).toBe('')
+    expect(vm.selectedRuntimeDeployments).toEqual([])
+    expect(vm.selectedRuntimeServices).toEqual([])
+    expect(vm.selectedRuntimePods).toEqual([])
+    expect(vm.runtimeEntryRoutes.every((route) => route.route === '-' || route.port.endsWith('-'))).toBe(true)
+  })
 })

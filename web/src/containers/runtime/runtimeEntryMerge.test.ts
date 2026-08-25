@@ -103,6 +103,7 @@ function runtimeContext(): AifarRuntimeContext {
     aifarRuntimeStatusKind: (status?: string) => status ?? 'unknown',
     aifarRuntimeStatusLabel: (status?: string) => status ?? 'unknown',
     selectedRuntimeInstanceId: ref('runtime-v2'),
+    aifarRuntimeDataAvailable: computed(() => true),
     aifarRuntimeInstances: computed(() => [{ id: 'runtime-v2' }]),
     runtimeInstanceLabel: () => 'runtime-v2 / admin',
     aifarRuntimeActionDisabledReason: computed(() => ''),

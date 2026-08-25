@@ -47,6 +47,7 @@ export type AifarRuntimeContext = {
   aifarRuntimeStatusLabel: RuntimeStatusLabel
   selectedRuntimeInstanceId: Ref<string>
   runtimeTargetQuery: () => string
+  aifarRuntimeDataAvailable: ComputedRef<boolean>
   aifarRuntimeInstances: ComputedRef<AifarRuntimeInstance[]>
   runtimeInstanceLabel: (instance: AifarRuntimeInstance) => string
   aifarRuntimeActionDisabledReason: ComputedRef<string>

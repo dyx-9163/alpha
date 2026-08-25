@@ -391,7 +391,8 @@ const selectedAifarInstanceLabel = computed(() => {
 })
 const aifarArtifactAccept = computed(() => resolveAifarArtifactAccept(aifarUpdateMode.value, aifarUpdateService.value))
 const aifarArtifactHint = computed(() => t(aifarArtifactHintKey(aifarUpdateMode.value, aifarUpdateService.value)))
-const aifarRuntimeInstances = computed(() => asArray<AifarRuntimeInstance>(aifarRuntime.value.instances))
+const aifarRuntimeDataAvailable = computed(() => runtimeAgentCanReportDeploymentData(aifarRuntime.value.agent?.status))
+const aifarRuntimeInstances = computed(() => aifarRuntimeDataAvailable.value ? asArray<AifarRuntimeInstance>(aifarRuntime.value.instances) : [])
 const selectedRuntimeInstance = computed(() => findSelectedRuntimeInstance(aifarRuntimeInstances.value, selectedRuntimeInstanceId.value))
 const selectedRuntimeConfig = computed(() => selectedRuntimeInstance.value?.runtimeConfig ?? defaultRuntimeConfigState())
 const selectedRuntimeAppInstance = computed(() => resolveRuntimeAppInstance(selectedRuntimeInstance.value, appInstances.value, selectedServerId.value))
@@ -591,6 +592,10 @@ function targetQuery() {
     return `serverId=${encodeURIComponent(selectedServerId.value)}`
   }
   return ''
+}
+
+function runtimeAgentCanReportDeploymentData(status?: string) {
+  return String(status || '').trim().toLowerCase() === 'running'
 }
 
 function cacheScope() {
@@ -826,7 +831,7 @@ async function loadAifarRuntime(force = false, includePods = runtimeResourceTab.
       runtimePodStatsLoaded.value = { ...runtimePodStatsLoaded.value, [podsKey]: includeStats || Boolean(runtimePodStatsLoaded.value[podsKey]) }
       runtimeCache.value = { ...runtimeCache.value, [runtimeCacheKey('base')]: { ...merged, pods: [] } }
     }
-    const instances = asArray<AifarRuntimeInstance>(aifarRuntime.value.instances)
+    const instances = aifarRuntimeDataAvailable.value ? asArray<AifarRuntimeInstance>(aifarRuntime.value.instances) : []
     if (!instances.some((instance) => instance.id === selectedRuntimeInstanceId.value)) {
       selectedRuntimeInstanceId.value = instances.find((instance) => !instance.legacy)?.id ?? instances[0]?.id ?? ''
     }
@@ -2012,6 +2017,7 @@ useAifarRuntimeProvider({
   aifarRuntimeStatusLabel,
   selectedRuntimeInstanceId,
   runtimeTargetQuery: targetQuery,
+  aifarRuntimeDataAvailable,
   aifarRuntimeInstances,
   runtimeInstanceLabel,
   aifarRuntimeActionDisabledReason,
