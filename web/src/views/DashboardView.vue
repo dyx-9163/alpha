@@ -12,8 +12,6 @@
       <strong>{{ now }}</strong>
     </div>
 
-    <MetricGrid :items="kpis" class="dashboard-kpis" />
-
     <div class="workspace-card dashboard-section-card dashboard-component-health">
       <div class="dashboard-section-head">
         <div>
@@ -31,7 +29,7 @@
         <span class="success">{{ t('common.running') }} {{ aggregateComponentSummary.running }}</span>
         <span class="danger">{{ t('common.unavailable') }} {{ aggregateComponentSummary.unavailable }}</span>
       </div>
-      <div class="dashboard-command-shell">
+      <div class="dashboard-command-shell dashboard-command-shell--standard">
         <div class="dashboard-command-list">
           <div class="dashboard-component-tabs" role="tablist" :aria-label="t('dashboard.componentHealth')">
             <button
@@ -116,27 +114,20 @@
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { apiGet } from '../api/client'
 import { keepPreviousArrayOnLoadFailure } from '../api/resilientLoad'
-import MetricGrid from '../components/MetricGrid.vue'
 import StatusTag from '../components/StatusTag.vue'
 import { createDashboardRealtimeRefreshScheduler, shouldRefreshDashboardForRealtimeEvent } from '../dashboard/realtimeRefresh'
 import { normalizeDashboardRuntimeStatus, normalizeDashboardServerStatus } from '../dashboard/serverStatus'
 import { useI18n } from '../i18n'
-import { permissions } from '../rbac'
 import { applyRealtimeStatusToServer } from '../servers/realtimeStatus'
-import { useAlertsStore } from '../stores/alerts'
 import { applyRealtimeStatusToAppInstance, useRealtimeStore } from '../stores/realtime'
-import { useSessionStore } from '../stores/session'
 import { useRoute, useRouter } from 'vue-router'
 
 const { t } = useI18n()
 const route = useRoute()
 const router = useRouter()
-const session = useSessionStore()
-const alerts = useAlertsStore()
 const realtime = useRealtimeStore()
 const dashboardServerPreviewLimit = 5
 const servers = ref<any[]>([])
-const tasks = ref<any[]>([])
 const databaseInstances = ref<any[]>([])
 const nacosInstances = ref<any[]>([])
 const storageInstances = ref<any[]>([])
@@ -260,29 +251,6 @@ const filteredComponentRows = computed(() => {
   return rows
 })
 const activeDashboardRow = computed(() => filteredComponentRows.value.find((row) => dashboardRowKey(row) === selectedDashboardRowKey.value) ?? filteredComponentRows.value[0] ?? null)
-const availableServers = computed(() => serverRows.value.filter((server) => server.status === 'available').length)
-const runningTasks = computed(() => tasks.value.filter((task) => task.status === 'running').length)
-const runningDockerHosts = computed(() => dockerRows.value.filter((row) => row.available).length)
-const runningDatabaseInstances = computed(() => liveDatabaseInstances.value.filter((instance) => isRunningStatus(instance.status)).length)
-const runningStorageInstances = computed(() => liveStorageInstances.value.filter((instance) => isRunningStatus(instance.status)).length)
-const canViewAlerts = computed(() => session.hasPermission(permissions.alertsView))
-const kpis = computed(() => {
-  const items = [
-    { label: t('nav.servers'), value: servers.value.length, note: `${t('common.available')} ${availableServers.value}` },
-    { label: t('toolbox.tasks'), value: tasks.value.length, note: `${t('common.running')} ${runningTasks.value}` },
-    { label: 'Docker', value: dockerRows.value.length, note: `${t('common.running')} ${runningDockerHosts.value}` },
-    { label: t('nav.database'), value: liveDatabaseInstances.value.length, note: `${t('common.running')} ${runningDatabaseInstances.value}` },
-    { label: t('nav.storage'), value: liveStorageInstances.value.length, note: `${t('common.running')} ${runningStorageInstances.value}` }
-  ]
-  if (canViewAlerts.value) {
-    items.splice(1, 0, {
-      label: t('alerts.title'),
-      value: alerts.openCount,
-      note: `${t('alerts.severity.critical')} ${alerts.criticalCount}`
-    })
-  }
-  return items
-})
 
 function filterComponentRows(rows: DashboardComponentRow[]) {
   if (selectedComponentHealthFilter.value === 'running') {
@@ -332,21 +300,18 @@ async function load(options: DashboardLoadOptions = {}) {
   loading.value = true
   now.value = new Date().toLocaleString()
   try {
-    const [serverList, taskList, databaseList, nacosList, storageList] = await Promise.all([
+    const [serverList, databaseList, nacosList, storageList] = await Promise.all([
       keepPreviousArrayOnLoadFailure(apiGet<any[] | null>('/servers'), servers.value),
-      keepPreviousArrayOnLoadFailure(apiGet<any[] | null>('/tasks'), tasks.value),
       keepPreviousArrayOnLoadFailure(apiGet<any[] | null>('/database/instances'), databaseInstances.value),
       keepPreviousArrayOnLoadFailure(apiGet<any[] | null>('/nacos/instances'), nacosInstances.value),
       keepPreviousArrayOnLoadFailure(apiGet<any[] | null>('/storage/instances'), storageInstances.value)
     ])
     servers.value = serverList
-    tasks.value = taskList
     databaseInstances.value = databaseList
     nacosInstances.value = nacosList
     storageInstances.value = storageList
     const loads: Array<Promise<unknown>> = [
-      options.hydrateSnapshots ? realtime.loadStatusSnapshots().catch(() => false) : Promise.resolve(),
-      canViewAlerts.value ? alerts.load().catch(() => undefined) : Promise.resolve()
+      options.hydrateSnapshots ? realtime.loadStatusSnapshots().catch(() => false) : Promise.resolve()
     ]
     await Promise.all(loads)
   } finally {
@@ -601,6 +566,10 @@ onBeforeUnmount(() => {
 .dashboard-page {
   width: 100%;
   max-width: 100%;
+  min-height: calc(100vh - 48px);
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
   overflow-x: hidden;
   overflow-y: scroll;
   padding-right: 6px;
@@ -620,14 +589,6 @@ onBeforeUnmount(() => {
 
 .dashboard-page::-webkit-scrollbar-track {
   background: rgba(238, 243, 249, .68);
-}
-
-.dashboard-kpis {
-  margin-bottom: 0;
-}
-
-.dashboard-page :deep(.metric-grid) {
-  grid-template-columns: repeat(auto-fit, minmax(min(100%, 180px), 1fr));
 }
 
 .dashboard-section-card {
@@ -689,21 +650,26 @@ onBeforeUnmount(() => {
 }
 
 .dashboard-component-health {
-  display: grid;
-  align-content: start;
+  min-height: calc(100vh - 180px);
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
   gap: 0;
 }
 
 .dashboard-command-shell {
+  flex: 1 1 auto;
   display: grid;
-  grid-template-columns: minmax(620px, 1.35fr) minmax(380px, .65fr);
+  grid-template-columns: minmax(0, 1fr) minmax(360px, 30%);
   gap: 0;
-  min-height: 0;
+  min-height: 520px;
   padding: 0;
   border-top: 1px solid var(--aifar-border-soft);
 }
 
 .dashboard-command-list {
+  display: grid;
+  grid-template-rows: auto auto auto minmax(0, 1fr);
   min-width: 0;
   overflow: hidden;
   border-right: 1px solid var(--aifar-border-soft);
@@ -711,10 +677,11 @@ onBeforeUnmount(() => {
 }
 
 .dashboard-entity-list {
-  max-height: min(430px, 45vh);
   display: grid;
+  align-content: start;
   gap: 0;
   min-width: 0;
+  min-height: 0;
   overflow: auto;
 }
 
@@ -814,7 +781,7 @@ onBeforeUnmount(() => {
   align-content: start;
   gap: 14px;
   min-width: 0;
-  min-height: 100%;
+  min-height: 0;
   padding: 18px 20px 20px;
   background: linear-gradient(180deg, #fbfdff, #f7fbff);
 }

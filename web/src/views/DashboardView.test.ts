@@ -165,10 +165,11 @@ describe('DashboardView refresh behavior', () => {
 
     expect(requestedPaths()).toEqual(expect.arrayContaining([
       '/servers',
-      '/tasks',
       '/database/instances',
+      '/nacos/instances',
       '/storage/instances'
     ]))
+    expect(requestedPaths()).not.toContain('/tasks')
     expect(requestedPaths()).not.toContain('/servers/srv-1/telemetry')
   })
 
@@ -178,6 +179,27 @@ describe('DashboardView refresh behavior', () => {
 
     expect(wrapper.text()).not.toContain('common.refresh')
     expect(requestedPaths()).not.toContain('/servers/srv-1/telemetry')
+  })
+
+  it('does not render the compact KPI summary strip above resource health', async () => {
+    const wrapper = mountDashboard()
+    await flushPromises()
+
+    expect(wrapper.find('.dashboard-kpis').exists()).toBe(false)
+    expect(wrapper.find('.metric-grid-stub').exists()).toBe(false)
+    expect(normalizedDashboardViewSource).not.toContain('<MetricGrid')
+  })
+
+  it('uses a fixed full-height resource health workspace independent of row count', async () => {
+    const wrapper = mountDashboard()
+    await flushPromises()
+
+    expect(wrapper.find('.dashboard-component-health').exists()).toBe(true)
+    expect(wrapper.find('.dashboard-command-shell').classes()).toContain('dashboard-command-shell--standard')
+    expect(normalizedDashboardViewSource).toContain('min-height: calc(100vh - 180px)')
+    expect(normalizedDashboardViewSource).toContain('grid-template-rows: auto auto auto minmax(0, 1fr)')
+    expect(normalizedDashboardViewSource).toContain('overflow: auto')
+    expect(normalizedDashboardViewSource).not.toContain('max-height: min(430px, 45vh)')
   })
 
   it('uses wrapping dashboard lists instead of fixed-width tables', async () => {
@@ -543,19 +565,20 @@ describe('DashboardView refresh behavior', () => {
   })
 
   it('keeps dashboard runtime summaries compact when the card stretches to fill the viewport', () => {
-    expect(normalizedDashboardViewSource).toContain('.dashboard-component-health {\n  display: grid;\n  align-content: start;\n  gap: 0;')
+    expect(normalizedDashboardViewSource).toContain('.dashboard-component-health {\n  min-height: calc(100vh - 180px);')
     expect(normalizedDashboardViewSource).toContain('.dashboard-section-head {\n  padding: 14px 14px 12px;')
-    expect(normalizedDashboardViewSource).toContain('.dashboard-command-shell {\n  display: grid;\n  grid-template-columns: minmax(620px, 1.35fr) minmax(380px, .65fr);')
+    expect(normalizedDashboardViewSource).toContain('.dashboard-command-shell {\n  flex: 1 1 auto;\n  display: grid;')
+    expect(normalizedDashboardViewSource).toContain('grid-template-columns: minmax(0, 1fr) minmax(360px, 30%);')
     expect(normalizedDashboardViewSource).toContain('.dashboard-component-tabs {\n  display: flex;\n  flex-wrap: wrap;')
     expect(normalizedDashboardViewSource).toContain('.dashboard-component-tabs button {\n  min-height: 30px;')
     expect(normalizedDashboardViewSource).toContain('.dashboard-health-filter {\n  display: flex;\n  align-items: center;')
     expect(normalizedDashboardViewSource).toContain('.dashboard-health-filter button {\n  height: 28px;')
     expect(normalizedDashboardViewSource).toContain('.dashboard-entity-table-head {\n  display: grid;\n  grid-template-columns: minmax(180px, .85fr) minmax(260px, 1.45fr) auto;')
-    expect(normalizedDashboardViewSource).toContain('.dashboard-entity-list {\n  max-height: min(430px, 45vh);')
+    expect(normalizedDashboardViewSource).toContain('.dashboard-command-list {\n  display: grid;\n  grid-template-rows: auto auto auto minmax(0, 1fr);')
     expect(normalizedDashboardViewSource).toContain('.dashboard-entity-row {\n  display: grid;\n  grid-template-columns: minmax(180px, .85fr) minmax(260px, 1.45fr) auto;')
   })
 
-  it('keeps alert details out of the dashboard and leaves alert counts in the KPI bar', async () => {
+  it('keeps alert details and compact alert KPI counts out of the dashboard', async () => {
     apiGetMock.mockImplementation(async (path: string) => {
       if (path === '/servers') return [server]
       if (path === '/tasks') return []
@@ -582,8 +605,8 @@ describe('DashboardView refresh behavior', () => {
     const wrapper = mountDashboard()
     await flushPromises()
 
-    const kpiText = wrapper.find('.metric-grid-stub').text()
-    expect(kpiText).toContain('"label":"alerts.title","value":1')
+    expect(requestedPaths()).not.toContain('/alerts?status=open')
+    expect(wrapper.find('.metric-grid-stub').exists()).toBe(false)
     expect(wrapper.find('.dashboard-alerts').exists()).toBe(false)
     expect(wrapper.find('.dashboard-alert-row').exists()).toBe(false)
     expect(wrapper.text()).not.toContain('MYSQL instance is unavailable')
@@ -601,7 +624,7 @@ describe('DashboardView refresh behavior', () => {
     expect(normalizeDashboardRuntimeStatus(status)).toBe('running')
   })
 
-  it('hydrates persisted status snapshots on entry so server KPI matches the server workbench', async () => {
+  it('hydrates persisted status snapshots on entry so server resource status matches the server workbench', async () => {
     apiGetMock.mockImplementation(async (path: string) => {
       if (path === '/servers') return [server]
       if (path === '/tasks') return []
@@ -629,7 +652,8 @@ describe('DashboardView refresh behavior', () => {
     expect(requestedPaths()).toContain('/status/snapshots')
     expect(useRealtimeStore().serverSnapshot('srv-1')?.status).toBe('available')
     await vi.waitFor(() => {
-      expect(wrapper.find('.metric-grid-stub').text()).toContain('common.available 1')
+      expect(wrapper.find('.dashboard-entity-row.active').classes()).toContain('active')
+      expect(wrapper.text()).toContain('one')
     })
   })
 
@@ -667,7 +691,7 @@ describe('DashboardView refresh behavior', () => {
     await flushPromises()
 
     await vi.waitFor(() => {
-      expect(wrapper.find('.metric-grid-stub').text()).toContain('"label":"Docker","value":1,"note":"common.running 0"')
+      expect(wrapper.find('[data-dashboard-component-tab="docker"]').text()).toContain('common.running 0')
     })
   })
 })
