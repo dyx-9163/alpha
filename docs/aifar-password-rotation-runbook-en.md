@@ -2,9 +2,7 @@
 
 This runbook describes how to rotate passwords for MySQL, MinIO, Redis, Nacos, and AIFAR Runtime.
 
-> The commands in this document follow the field-verified procedure. The Markdown formatting and placeholders are normalized, but the command semantics and execution order are preserved.
-
-> Values in `<...>` must be replaced with environment-specific values. Do not commit real passwords to Git, tickets, or chat records.
+> Values in `<...>` must be replaced with environment-specific values. 
 
 ## 1. Deployment Topology
 
