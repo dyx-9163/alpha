@@ -2,7 +2,7 @@
 
 This runbook describes how to rotate passwords for MySQL, MinIO, Redis, Nacos, and AIFAR Runtime.
 
-> The commands in this document follow the field-tested procedure. The Markdown formatting and placeholders are normalized, but the command semantics and execution order are preserved.
+> The commands in this document follow the field-verified procedure. The Markdown formatting and placeholders are normalized, but the command semantics and execution order are preserved.
 
 > Values in `<...>` must be replaced with environment-specific values. Do not commit real passwords to Git, tickets, or chat records.
 
@@ -13,21 +13,6 @@ This runbook describes how to rotate passwords for MySQL, MinIO, Redis, Nacos, a
 | 31, 32 | Application services, AIFAR Runtime | Update the Nacos password used by Runtime and synchronize application configuration |
 | 41, 42 | MySQL, Redis, and Nacos cluster nodes; MinIO nodes | Rotate MySQL, Redis, and Nacos cluster passwords; rotate MinIO password and update bidirectional replication |
 | Arbiter node | MySQL, Redis, and Nacos cluster node | Rotate MySQL, Redis, and Nacos cluster passwords |
-
-Execution scope:
-
-- MySQL, Redis, and Nacos: node 41, node 42, and the arbiter node.
-- MinIO: node 41 and node 42.
-- Application services and AIFAR Runtime: node 31 and node 32.
-
-Field test topology example:
-
-| Runbook role | Node used in this automated test | Notes |
-| --- | --- | --- |
-| Node 41 | 192.168.74.141 | MySQL, Redis, Nacos, MinIO |
-| Node 42 | 192.168.74.142 | MySQL, Redis, Nacos, MinIO |
-| Arbiter node | 192.168.74.143 | MySQL, Redis, Nacos |
-| Application node | 192.168.74.143 | To save resources, this test deployed the application and AIFAR Runtime only on node 143 |
 
 ## 2. Parameters
 
@@ -397,7 +382,7 @@ Open the Nacos Web page and update the following Data IDs under the correspondin
 
 Synchronize the MySQL cluster and Redis cluster passwords in those files.
 
-> Field note: Update only the password fields that actually exist in the configuration. Do not add missing fields just for this rotation. In this test, `datasource.yaml` contained `password:` lines that needed to be changed, while `resources.yaml` had no `password:` lines and did not need new password fields.
+> Field note: Update only the password fields that actually exist in the configuration. Do not add missing fields just for this rotation. If `resources.yaml` does not contain MySQL or Redis password fields, do not add new password fields just for this procedure.
 
 ## 7. AIFAR Runtime Servers
 

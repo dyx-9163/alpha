@@ -2,7 +2,7 @@
 
 本文整理 MySQL、MinIO、Redis、Nacos 及 AIFAR Runtime 的密码修改步骤。
 
-> 本文中的执行命令以现场已经完整测试通过的命令为准，只做 Markdown 排版和占位符统一，不改变命令语义与执行顺序。
+> 本文中的执行命令以现场已经完整验证通过的命令为准，只做 Markdown 排版和占位符统一，不改变命令语义与执行顺序。
 
 > `<...>` 表示必须替换的现场参数。不要把真实密码提交到 Git、工单或聊天记录中。
 
@@ -19,15 +19,6 @@
 - MySQL、Redis、Nacos：41、42及仲裁节点。
 - MinIO：41、42节点。
 - 应用服务和 AIFAR Runtime：31、32节点。
-
-现场测试拓扑示例：
-
-| 文档角色 | 本次自动化测试节点 | 说明 |
-| --- | --- | --- |
-| 41 节点 | 192.168.74.141 | MySQL、Redis、Nacos、MinIO |
-| 42 节点 | 192.168.74.142 | MySQL、Redis、Nacos、MinIO |
-| 仲裁节点 | 192.168.74.143 | MySQL、Redis、Nacos |
-| 应用节点 | 192.168.74.143 | 本次为节省资源，仅在 143 部署应用和 AIFAR Runtime |
 
 ## 2. 参数说明
 
@@ -397,7 +388,7 @@ systemctl restart aifar-nacos
 
 同步修改其中 MySQL 集群和 Redis 集群对应的密码。
 
-> 现场验证注意：按实际配置内容修改即可，不要强行新增不存在的字段。本次测试中 `datasource.yaml` 存在需要修改的 `password:` 行，`resources.yaml` 中没有 `password:` 行，因此 `resources.yaml` 无需强行补密码。
+> 现场验证注意：按实际配置内容修改即可，不要强行新增不存在的字段。如果 `resources.yaml` 中没有 MySQL 或 Redis 密码字段，则无需强行补密码。
 
 ## 7. AIFAR Runtime 服务器
 
