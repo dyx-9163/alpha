@@ -2123,11 +2123,22 @@ useAifarRuntimeProvider({
 })
 
 watch(tab, async (next) => {
+  applyPersistedContainerSnapshots()
   if (next !== 'aifar-runtime') {
     runtimePodMetricsScheduler.stop()
     closeRuntimeLogStream()
+  } else if (pageReady.value) {
+    if (runtimeResourceTab.value === 'pods') {
+      await activateRuntimePods('enter')
+    } else if (runtimeResourceTab.value === 'logs') {
+      await ensureRuntimePodsLoaded(...runtimePodLoadArgs('logs'))
+      if (runtimeLogSelectionReady.value) {
+        loadRuntimeLogs(false)
+      }
+    } else {
+      await loadAifarRuntime(false)
+    }
   }
-  applyPersistedContainerSnapshots()
 })
 watch(resourceTab, () => {
   if (tab.value === 'images') {
