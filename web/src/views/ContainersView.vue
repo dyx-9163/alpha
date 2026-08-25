@@ -58,19 +58,28 @@
                 </div>
               </div>
               <div class="container-table-body">
-                <el-table :data="collection" height="100%" :row-key="imageRowKey" @selection-change="onImageSelectionChange">
-                  <el-table-column type="selection" width="44" />
-                  <el-table-column prop="repository" :label="t('containers.repository')" min-width="220" show-overflow-tooltip />
-                  <el-table-column prop="tag" :label="t('containers.tag')" width="140" show-overflow-tooltip />
-                  <el-table-column prop="id" label="ID" min-width="150" show-overflow-tooltip />
-                  <el-table-column prop="size" :label="t('containers.size')" width="120" />
-                  <el-table-column prop="digest" :label="t('containers.digest')" min-width="220" show-overflow-tooltip />
-                  <el-table-column prop="createdAt" :label="t('containers.created')" min-width="170" show-overflow-tooltip />
-                  <el-table-column :label="t('common.operation')" width="110" fixed="right">
+                <el-table border :data="collection" height="100%" :row-key="imageRowKey" @selection-change="onImageSelectionChange">
+                  <el-table-column type="selection" width="44" :selectable="imageSelectable" :resizable="true" />
+                  <el-table-column prop="repository" :label="t('containers.repository')" min-width="220" show-overflow-tooltip :resizable="true" />
+                  <el-table-column prop="tag" :label="t('containers.tag')" width="140" show-overflow-tooltip :resizable="true" />
+                  <el-table-column prop="id" label="ID" min-width="150" show-overflow-tooltip :resizable="true" />
+                  <el-table-column prop="size" :label="t('containers.size')" width="120" :resizable="true" />
+                  <el-table-column prop="digest" :label="t('containers.digest')" min-width="220" show-overflow-tooltip :resizable="true" />
+                  <el-table-column :label="t('containers.imageDeleteAdvice')" min-width="220" show-overflow-tooltip :resizable="true">
                     <template #default="{ row }">
-                      <el-tooltip :content="deniedText" :disabled="canManageContainers" placement="top">
+                      <el-tooltip :content="imageDeleteAdvice(row).hint" placement="top" :disabled="!imageDeleteAdvice(row).hint">
+                        <el-tag :type="imageDeleteAdvice(row).type" effect="light">
+                          {{ imageDeleteAdvice(row).label }}
+                        </el-tag>
+                      </el-tooltip>
+                    </template>
+                  </el-table-column>
+                  <el-table-column prop="createdAt" :label="t('containers.created')" min-width="170" show-overflow-tooltip :resizable="true" />
+                  <el-table-column :label="t('common.operation')" width="110" fixed="right" :resizable="true">
+                    <template #default="{ row }">
+                      <el-tooltip :content="imageDeleteDisabledReason(row)" :disabled="!imageDeleteDisabledReason(row)" placement="top">
                         <span>
-                          <el-button size="small" type="danger" plain :disabled="!canManageContainers" @click="deleteImage(row)">{{ t('containers.deleteImage') }}</el-button>
+                          <el-button size="small" type="danger" plain :disabled="Boolean(imageDeleteDisabledReason(row))" @click="deleteImage(row)">{{ t('containers.deleteImage') }}</el-button>
                         </span>
                       </el-tooltip>
                     </template>
@@ -81,22 +90,22 @@
           </el-tab-pane>
           <el-tab-pane :label="t('containers.network')" name="networks">
             <div class="resource-panel">
-              <el-table :data="collection" height="100%">
-                <el-table-column prop="name" :label="t('containers.name')" min-width="180" />
-                <el-table-column prop="id" label="ID" min-width="150" show-overflow-tooltip />
-                <el-table-column prop="driver" :label="t('containers.driver')" min-width="150" />
-                <el-table-column prop="scope" :label="t('containers.scope')" min-width="120" />
+              <el-table border :data="collection" height="100%">
+                <el-table-column prop="name" :label="t('containers.name')" min-width="180" :resizable="true" />
+                <el-table-column prop="id" label="ID" min-width="150" show-overflow-tooltip :resizable="true" />
+                <el-table-column prop="driver" :label="t('containers.driver')" min-width="150" :resizable="true" />
+                <el-table-column prop="scope" :label="t('containers.scope')" min-width="120" :resizable="true" />
               </el-table>
             </div>
           </el-tab-pane>
           <el-tab-pane :label="t('containers.volumes')" name="volumes">
             <div class="resource-panel">
-              <el-table :data="collection" height="100%">
-                <el-table-column prop="name" :label="t('containers.name')" min-width="180" show-overflow-tooltip />
-                <el-table-column prop="driver" :label="t('containers.driver')" width="140" />
-                <el-table-column prop="scope" :label="t('containers.scope')" width="120" />
-                <el-table-column prop="mountpoint" :label="t('containers.mountpoint')" min-width="260" show-overflow-tooltip />
-                <el-table-column prop="size" :label="t('containers.size')" width="120" />
+              <el-table border :data="collection" height="100%">
+                <el-table-column prop="name" :label="t('containers.name')" min-width="180" show-overflow-tooltip :resizable="true" />
+                <el-table-column prop="driver" :label="t('containers.driver')" width="140" :resizable="true" />
+                <el-table-column prop="scope" :label="t('containers.scope')" width="120" :resizable="true" />
+                <el-table-column prop="mountpoint" :label="t('containers.mountpoint')" min-width="260" show-overflow-tooltip :resizable="true" />
+                <el-table-column prop="size" :label="t('containers.size')" width="120" :resizable="true" />
               </el-table>
             </div>
           </el-tab-pane>
@@ -155,7 +164,7 @@ import {
   removeDockerImages,
   type DockerSummaryResponse
 } from '../containers/dockerApi'
-import { imageReference, imageRowKey, uniqueValues } from '../containers/dockerImages'
+import { imageReference, imageRowKey, imageUsageKnown, imageUsedByContainers, uniqueValues } from '../containers/dockerImages'
 import { dockerSummaryFromStatusSnapshot, mergeDockerSummarySnapshot } from '../containers/realtimeSummary'
 import AifarRuntimeDialogs from '../containers/runtime/AifarRuntimeDialogs.vue'
 import AifarRuntimeWorkspace from '../containers/runtime/AifarRuntimeWorkspace.vue'
@@ -361,9 +370,48 @@ const settingsItems = computed(() => [
   { label: t('containers.rootDir'), value: summaryData.value.rootDir || '-' }
 ])
 const selectedImageIds = computed(() => uniqueValues(selectedImageRows.value.map(imageReference).filter(Boolean)))
+function imageDeleteDisabledReason(row: any) {
+  if (!canManageContainers.value) return deniedText.value
+  if (!imageReference(row)) return t('containers.imageDeleteMissingReference')
+  const usedBy = imageUsedByContainers(row)
+  if (usedBy.length) {
+    return t('containers.imageDeleteBlockedInUse', { containers: usedBy.join(', ') })
+  }
+  return ''
+}
+
+function imageDeleteAdvice(row: any) {
+  const reason = imageDeleteDisabledReason(row)
+  if (reason) {
+    return {
+      type: 'danger',
+      label: t('containers.imageDeleteBlocked'),
+      hint: reason
+    }
+  }
+  if (!imageUsageKnown(row)) {
+    return {
+      type: 'warning',
+      label: t('containers.imageDeleteUnknown'),
+      hint: t('containers.imageDeleteUnknownHint')
+    }
+  }
+  return {
+    type: 'success',
+    label: t('containers.imageDeleteAllowed'),
+    hint: t('containers.imageDeleteAllowedHint')
+  }
+}
+
+function imageSelectable(row: any) {
+  return !imageDeleteDisabledReason(row)
+}
+
 const batchImageRemoveDisabledReason = computed(() => {
   if (!canManageContainers.value) return deniedText.value
   if (!selectedImageIds.value.length) return t('containers.selectImages')
+  const blocked = selectedImageRows.value.map(imageDeleteDisabledReason).find(Boolean)
+  if (blocked) return blocked
   return ''
 })
 const batchImageRemoveDisabled = computed(() => Boolean(batchImageRemoveDisabledReason.value))
@@ -1168,6 +1216,11 @@ async function removeImages(rows: any[], mode: 'single' | 'batch') {
     ElMessage.warning(deniedText.value)
     return
   }
+  const blocked = rows.map(imageDeleteDisabledReason).find(Boolean)
+  if (blocked) {
+    ElMessage.warning(blocked)
+    return
+  }
   const query = targetQuery()
   if (!query) {
     ElMessage.warning(t('containers.selectDockerHost'))
@@ -1205,7 +1258,7 @@ async function removeImages(rows: any[], mode: 'single' | 'batch') {
 }
 
 function onImageSelectionChange(rows: any[]) {
-  selectedImageRows.value = rows.filter((row) => imageReference(row))
+  selectedImageRows.value = rows.filter(imageSelectable)
 }
 
 function aifarRuntimeStatusLabel(status?: string) {

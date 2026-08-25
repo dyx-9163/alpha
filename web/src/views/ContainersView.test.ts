@@ -40,6 +40,7 @@ vi.mock('element-plus', () => ({
 }))
 
 import ContainersView from './ContainersView.vue'
+import containersViewSource from './ContainersView.vue?raw'
 
 const server = {
   id: 'srv-1',
@@ -78,6 +79,7 @@ function mountContainersView() {
         'el-table-column': true,
         'el-tab-pane': true,
         'el-tabs': true,
+        'el-tag': true,
         'el-tooltip': true
       }
     }
@@ -155,6 +157,56 @@ describe('ContainersView AIFAR runtime loading', () => {
     expect((wrapper.vm as unknown as { collection: unknown[] }).collection).toEqual([
       expect.objectContaining({ id: 'sha256:image-1', repository: 'aifar-gateway' })
     ])
+  })
+
+  it('classifies Docker image delete availability from container usage evidence', async () => {
+    const wrapper = mountContainersView()
+    await flushPromises()
+
+    const vm = wrapper.vm as unknown as {
+      imageDeleteDisabledReason: (row: unknown) => string
+      imageDeleteAdvice: (row: unknown) => { type: string; label: string; hint: string }
+      imageSelectable: (row: unknown) => boolean
+    }
+    const usedImage = {
+      id: 'sha256:used',
+      repository: 'aifar-gateway',
+      tag: 'latest',
+      usedByContainers: ['gateway-1', 'gateway-2']
+    }
+    const unusedImage = {
+      id: 'sha256:unused',
+      repository: 'aifar-oauth',
+      tag: 'latest',
+      usedByContainers: []
+    }
+    const unknownUsageImage = {
+      id: 'sha256:unknown',
+      repository: 'aifar-system',
+      tag: 'latest'
+    }
+
+    expect(vm.imageDeleteDisabledReason(usedImage)).toBe('containers.imageDeleteBlockedInUse')
+    expect(vm.imageDeleteAdvice(usedImage)).toEqual(expect.objectContaining({ type: 'danger', label: 'containers.imageDeleteBlocked' }))
+    expect(vm.imageSelectable(usedImage)).toBe(false)
+    expect(vm.imageDeleteDisabledReason(unusedImage)).toBe('')
+    expect(vm.imageDeleteAdvice(unusedImage)).toEqual(expect.objectContaining({ type: 'success', label: 'containers.imageDeleteAllowed' }))
+    expect(vm.imageSelectable(unusedImage)).toBe(true)
+    expect(vm.imageDeleteDisabledReason(unknownUsageImage)).toBe('')
+    expect(vm.imageDeleteAdvice(unknownUsageImage)).toEqual(expect.objectContaining({ type: 'warning', label: 'containers.imageDeleteUnknown' }))
+  })
+
+  it('keeps Docker resource tables bordered and column-resizable', () => {
+    const resourceTables = [
+      /<el-table\s+border[\s\S]*?@selection-change="onImageSelectionChange"[\s\S]*?<\/el-table>/,
+      /<el-table\s+border[\s\S]*?<el-table-column prop="scope" :label="t\('containers.scope'\)" min-width="120" :resizable="true" \/>[\s\S]*?<\/el-table>/,
+      /<el-table\s+border[\s\S]*?<el-table-column prop="size" :label="t\('containers.size'\)" width="120" :resizable="true" \/>[\s\S]*?<\/el-table>/
+    ]
+
+    for (const pattern of resourceTables) {
+      const match = containersViewSource.match(pattern)
+      expect(match?.[0]).toContain(':resizable="true"')
+    }
   })
 
   it('reloads Docker image rows for the newly selected server while staying on the images tab', async () => {

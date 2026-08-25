@@ -175,6 +175,7 @@ func dockerAPIContainers(ctx context.Context, host string) ([]DockerContainer, e
 		ID              string `json:"Id"`
 		Names           []string
 		Image           string
+		ImageID         string
 		State           string
 		Status          string
 		Created         int64
@@ -198,6 +199,7 @@ func dockerAPIContainers(ctx context.Context, host string) ([]DockerContainer, e
 			ID:        row.ID,
 			Name:      name,
 			Image:     row.Image,
+			ImageID:   strings.TrimPrefix(row.ImageID, "sha256:"),
 			State:     row.State,
 			Status:    row.Status,
 			Ports:     formatDockerAPIPorts(row.Ports),

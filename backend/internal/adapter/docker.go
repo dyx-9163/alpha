@@ -30,6 +30,7 @@ type DockerContainer struct {
 	ID        string            `json:"id"`
 	Name      string            `json:"name"`
 	Image     string            `json:"image"`
+	ImageID   string            `json:"imageId,omitempty"`
 	State     string            `json:"state"`
 	Status    string            `json:"status"`
 	Ports     string            `json:"ports"`
@@ -39,12 +40,13 @@ type DockerContainer struct {
 }
 
 type DockerImage struct {
-	ID         string `json:"id"`
-	Repository string `json:"repository"`
-	Tag        string `json:"tag"`
-	Size       string `json:"size"`
-	CreatedAt  string `json:"createdAt"`
-	Digest     string `json:"digest"`
+	ID               string   `json:"id"`
+	Repository       string   `json:"repository"`
+	Tag              string   `json:"tag"`
+	Size             string   `json:"size"`
+	CreatedAt        string   `json:"createdAt"`
+	Digest           string   `json:"digest"`
+	UsedByContainers []string `json:"usedByContainers"`
 }
 
 type DockerNetwork struct {
@@ -259,6 +261,30 @@ func DockerImagesForServer(ctx context.Context, server store.Server) ([]DockerIm
 	return parseDockerImages(out)
 }
 
+func DockerImagesWithUsage(ctx context.Context, host string) ([]DockerImage, error) {
+	images, err := DockerImages(ctx, host)
+	if err != nil {
+		return nil, err
+	}
+	containers, err := DockerContainers(ctx, host)
+	if err != nil {
+		return images, nil
+	}
+	return annotateDockerImageUsage(images, containers), nil
+}
+
+func DockerImagesWithUsageForServer(ctx context.Context, server store.Server) ([]DockerImage, error) {
+	images, err := DockerImagesForServer(ctx, server)
+	if err != nil {
+		return nil, err
+	}
+	containers, err := DockerContainersForServer(ctx, server)
+	if err != nil {
+		return images, nil
+	}
+	return annotateDockerImageUsage(images, containers), nil
+}
+
 func DockerImageRemove(ctx context.Context, host, id string) error {
 	if dockerAPIHost(host) {
 		return dockerAPIImageRemove(ctx, host, id)
@@ -293,6 +319,79 @@ func parseDockerImages(out []byte) ([]DockerImage, error) {
 		})
 	}
 	return items, nil
+}
+
+func annotateDockerImageUsage(images []DockerImage, containers []DockerContainer) []DockerImage {
+	for i := range images {
+		usedBy := make([]string, 0)
+		for _, container := range containers {
+			if !dockerContainerUsesImage(container, images[i]) {
+				continue
+			}
+			name := strings.TrimSpace(container.Name)
+			if name == "" {
+				name = strings.TrimSpace(container.ID)
+			}
+			usedBy = append(usedBy, name)
+		}
+		images[i].UsedByContainers = uniqueDockerStrings(usedBy)
+	}
+	return images
+}
+
+func dockerContainerUsesImage(container DockerContainer, image DockerImage) bool {
+	candidates := dockerImageCandidates(image)
+	for _, value := range []string{container.Image, container.ImageID} {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		if candidates[value] {
+			return true
+		}
+		trimmed := strings.TrimPrefix(value, "sha256:")
+		if candidates[trimmed] || candidates["sha256:"+trimmed] {
+			return true
+		}
+	}
+	return false
+}
+
+func dockerImageCandidates(image DockerImage) map[string]bool {
+	candidates := map[string]bool{}
+	repository := strings.TrimSpace(image.Repository)
+	tag := strings.TrimSpace(image.Tag)
+	if repository != "" && repository != "<none>" && tag != "" && tag != "<none>" {
+		candidates[repository+":"+tag] = true
+	}
+	digest := strings.TrimSpace(image.Digest)
+	if digest != "" && digest != "<none>" {
+		candidates[digest] = true
+	}
+	id := strings.TrimPrefix(strings.TrimSpace(image.ID), "sha256:")
+	if id != "" {
+		candidates[id] = true
+		candidates["sha256:"+id] = true
+		if len(id) > 12 {
+			candidates[id[:12]] = true
+			candidates["sha256:"+id[:12]] = true
+		}
+	}
+	return candidates
+}
+
+func uniqueDockerStrings(values []string) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		out = append(out, value)
+	}
+	return out
 }
 
 func DockerNetworks(ctx context.Context, host string) ([]DockerNetwork, error) {

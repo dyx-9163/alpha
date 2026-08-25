@@ -145,6 +145,32 @@ func TestParseDockerContainersIncludesLabels(t *testing.T) {
 	}
 }
 
+func TestAnnotateDockerImageUsageMarksReferencedImages(t *testing.T) {
+	images := []DockerImage{
+		{ID: "755e177c4284cd957b90c5b1d9a1d24661636ecc27312", Repository: "aifar-gateway", Tag: "20260824T1519"},
+		{ID: "ed9744045d5698815a776c49cd22750cf2aa4dc3c7ce2", Repository: "aifar-system", Tag: "20260824T1500"},
+		{ID: "orphan", Repository: "<none>", Tag: "<none>"},
+	}
+	containers := []DockerContainer{
+		{ID: "c1", Name: "gateway-1", Image: "aifar-gateway:20260824T1519"},
+		{ID: "c2", Name: "gateway-2", ImageID: "sha256:755e177c4284cd957b90c5b1d9a1d24661636ecc27312"},
+		{ID: "c3", Name: "oauth-1", Image: "aifar-oauth:20260824T1500"},
+		{ID: "c4", Name: "system-1", Image: "sha256:ed9744045d56"},
+	}
+
+	got := annotateDockerImageUsage(images, containers)
+
+	if strings.Join(got[0].UsedByContainers, ",") != "gateway-1,gateway-2" {
+		t.Fatalf("gateway usedBy = %+v", got[0].UsedByContainers)
+	}
+	if strings.Join(got[1].UsedByContainers, ",") != "system-1" {
+		t.Fatalf("system usedBy = %+v", got[1].UsedByContainers)
+	}
+	if len(got[2].UsedByContainers) != 0 {
+		t.Fatalf("orphan usedBy = %+v, want empty", got[2].UsedByContainers)
+	}
+}
+
 func TestDockerLogArgsFollowKeepsTailZero(t *testing.T) {
 	since := time.Unix(1710000000, 0)
 	args := strings.Join(dockerLogArgs("abc123", DockerLogOptions{

@@ -119,9 +119,9 @@ func (a *API) containers(w http.ResponseWriter, r *http.Request) {
 		}
 	case "images":
 		if useServer {
-			out, err = adapter.DockerImagesForServer(r.Context(), server)
+			out, err = adapter.DockerImagesWithUsageForServer(r.Context(), server)
 		} else {
-			out, err = adapter.DockerImages(r.Context(), host)
+			out, err = adapter.DockerImagesWithUsage(r.Context(), host)
 		}
 	case "networks", "network":
 		if useServer {

@@ -9,7 +9,7 @@ import {
   runtimeLogCacheKey,
   summaryCacheKey
 } from './cacheKeys'
-import { imageReference, imageRowKey, uniqueValues } from './dockerImages'
+import { imageReference, imageRowKey, imageUsageKnown, imageUsedByContainers, uniqueValues } from './dockerImages'
 import { mergeDockerSummarySnapshot } from './realtimeSummary'
 
 describe('container cache keys', () => {
@@ -64,6 +64,14 @@ describe('Docker image helpers', () => {
   it('provides a stable fallback row key when no image reference exists', () => {
     expect(imageRowKey({ repository: ' repo ', tag: '', id: '' })).toBe('repo::')
     expect(imageRowKey({})).toBe('::')
+  })
+
+  it('normalizes image container usage evidence', () => {
+    expect(imageUsageKnown({ usedByContainers: ['gateway'] })).toBe(true)
+    expect(imageUsageKnown({})).toBe(false)
+    expect(imageUsedByContainers({ usedByContainers: [' gateway ', 'oauth', 'gateway', ''] }))
+      .toEqual(['gateway', 'oauth'])
+    expect(imageUsedByContainers({ usedByContainers: null })).toEqual([])
   })
 
   it('trims, removes blanks, and deduplicates without changing first-seen order', () => {
