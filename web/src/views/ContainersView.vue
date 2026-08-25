@@ -164,7 +164,7 @@ import {
   removeDockerImages,
   type DockerSummaryResponse
 } from '../containers/dockerApi'
-import { imageReference, imageRowKey, imageUsageKnown, imageUsedByContainers, uniqueValues } from '../containers/dockerImages'
+import { imageReference, imageRowKey, imageUsageKnown, imageUsedByContainers, imageUsedByImages, uniqueValues } from '../containers/dockerImages'
 import { dockerSummaryFromStatusSnapshot, mergeDockerSummarySnapshot } from '../containers/realtimeSummary'
 import AifarRuntimeDialogs from '../containers/runtime/AifarRuntimeDialogs.vue'
 import AifarRuntimeWorkspace from '../containers/runtime/AifarRuntimeWorkspace.vue'
@@ -376,6 +376,10 @@ function imageDeleteDisabledReason(row: any) {
   const usedBy = imageUsedByContainers(row)
   if (usedBy.length) {
     return t('containers.imageDeleteBlockedInUse', { containers: usedBy.join(', ') })
+  }
+  const usedByImages = imageUsedByImages(row)
+  if (usedByImages.length) {
+    return t('containers.imageDeleteBlockedByImages', { images: usedByImages.join(', ') })
   }
   return ''
 }

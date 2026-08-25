@@ -185,10 +185,19 @@ describe('ContainersView AIFAR runtime loading', () => {
       repository: 'aifar-system',
       tag: 'latest'
     }
+    const parentImage = {
+      id: 'sha256:parent',
+      repository: 'nginx',
+      tag: 'stable-alpine',
+      usedByContainers: [],
+      usedByImages: ['aifar-web-vue3:latest']
+    }
 
     expect(vm.imageDeleteDisabledReason(usedImage)).toBe('containers.imageDeleteBlockedInUse')
     expect(vm.imageDeleteAdvice(usedImage)).toEqual(expect.objectContaining({ type: 'danger', label: 'containers.imageDeleteBlocked' }))
     expect(vm.imageSelectable(usedImage)).toBe(false)
+    expect(vm.imageDeleteDisabledReason(parentImage)).toBe('containers.imageDeleteBlockedByImages')
+    expect(vm.imageSelectable(parentImage)).toBe(false)
     expect(vm.imageDeleteDisabledReason(unusedImage)).toBe('')
     expect(vm.imageDeleteAdvice(unusedImage)).toEqual(expect.objectContaining({ type: 'success', label: 'containers.imageDeleteAllowed' }))
     expect(vm.imageSelectable(unusedImage)).toBe(true)

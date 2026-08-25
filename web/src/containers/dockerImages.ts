@@ -3,6 +3,7 @@ export type DockerImageRow = {
   tag?: string
   id?: string
   usedByContainers?: unknown
+  usedByImages?: unknown
 }
 
 export function imageReference(row: DockerImageRow) {
@@ -20,12 +21,17 @@ export function imageRowKey(row: DockerImageRow) {
 }
 
 export function imageUsageKnown(row: DockerImageRow) {
-  return Array.isArray(row?.usedByContainers)
+  return Array.isArray(row?.usedByContainers) || Array.isArray(row?.usedByImages)
 }
 
 export function imageUsedByContainers(row: DockerImageRow) {
   if (!Array.isArray(row?.usedByContainers)) return []
   return uniqueValues(row.usedByContainers.map((value) => String(value)))
+}
+
+export function imageUsedByImages(row: DockerImageRow) {
+  if (!Array.isArray(row?.usedByImages)) return []
+  return uniqueValues(row.usedByImages.map((value) => String(value)))
 }
 
 export function uniqueValues(values: string[]) {

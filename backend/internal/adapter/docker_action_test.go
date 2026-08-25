@@ -171,6 +171,28 @@ func TestAnnotateDockerImageUsageMarksReferencedImages(t *testing.T) {
 	}
 }
 
+func TestAnnotateDockerImageUsageMarksParentImages(t *testing.T) {
+	images := []DockerImage{
+		{ID: "base-nginx", Repository: "nginx", Tag: "stable-alpine", RootFSLayers: []string{"layer-a", "layer-b"}},
+		{ID: "base-jre", Repository: "bellsoft/liberica-openjre-rocky", Tag: "21"},
+		{ID: "web", Repository: "aifar-web-vue3", Tag: "20260824T1127", RootFSLayers: []string{"layer-a", "layer-b", "layer-web"}},
+		{ID: "gateway", Repository: "aifar-gateway", Tag: "20260824T1519", ParentID: "base-jre"},
+		{ID: "orphan", Repository: "aifar-orphan", Tag: "latest"},
+	}
+
+	got := annotateDockerImageUsage(images, nil)
+
+	if strings.Join(got[0].UsedByImages, ",") != "aifar-web-vue3:20260824T1127" {
+		t.Fatalf("nginx usedByImages = %+v", got[0].UsedByImages)
+	}
+	if strings.Join(got[1].UsedByImages, ",") != "aifar-gateway:20260824T1519" {
+		t.Fatalf("jre usedByImages = %+v", got[1].UsedByImages)
+	}
+	if len(got[4].UsedByImages) != 0 {
+		t.Fatalf("orphan usedByImages = %+v, want empty", got[4].UsedByImages)
+	}
+}
+
 func TestDockerLogArgsFollowKeepsTailZero(t *testing.T) {
 	since := time.Unix(1710000000, 0)
 	args := strings.Join(dockerLogArgs("abc123", DockerLogOptions{

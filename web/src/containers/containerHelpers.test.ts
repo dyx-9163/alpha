@@ -9,7 +9,7 @@ import {
   runtimeLogCacheKey,
   summaryCacheKey
 } from './cacheKeys'
-import { imageReference, imageRowKey, imageUsageKnown, imageUsedByContainers, uniqueValues } from './dockerImages'
+import { imageReference, imageRowKey, imageUsageKnown, imageUsedByContainers, imageUsedByImages, uniqueValues } from './dockerImages'
 import { mergeDockerSummarySnapshot } from './realtimeSummary'
 
 describe('container cache keys', () => {
@@ -72,6 +72,13 @@ describe('Docker image helpers', () => {
     expect(imageUsedByContainers({ usedByContainers: [' gateway ', 'oauth', 'gateway', ''] }))
       .toEqual(['gateway', 'oauth'])
     expect(imageUsedByContainers({ usedByContainers: null })).toEqual([])
+  })
+
+  it('treats child image dependency evidence as known usage', () => {
+    expect(imageUsageKnown({ usedByImages: ['aifar-web-vue3:latest'] })).toBe(true)
+    expect(imageUsedByImages({ usedByImages: [' aifar-web-vue3:latest ', 'aifar-gateway:rev', 'aifar-web-vue3:latest'] }))
+      .toEqual(['aifar-web-vue3:latest', 'aifar-gateway:rev'])
+    expect(imageUsedByImages({ usedByImages: null })).toEqual([])
   })
 
   it('trims, removes blanks, and deduplicates without changing first-seen order', () => {

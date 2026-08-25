@@ -356,6 +356,7 @@ func formatDockerAPIPorts(ports []dockerAPIPort) string {
 func dockerAPIImages(ctx context.Context, host string) ([]DockerImage, error) {
 	var rows []struct {
 		ID          string `json:"Id"`
+		ParentID    string `json:"ParentId"`
 		RepoTags    []string
 		RepoDigests []string
 		Size        int64
@@ -370,12 +371,27 @@ func dockerAPIImages(ctx context.Context, host string) ([]DockerImage, error) {
 		repo, tag := splitImageTag(firstNonEmpty(row.RepoTags, "<none>:<none>"))
 		out = append(out, DockerImage{
 			ID:         strings.TrimPrefix(row.ID, "sha256:"),
+			ParentID:   strings.TrimPrefix(row.ParentID, "sha256:"),
 			Repository: repo,
 			Tag:        tag,
 			Size:       formatBytes(row.Size),
 			CreatedAt:  formatUnix(row.Created),
 			Digest:     firstNonEmpty(row.RepoDigests, ""),
 		})
+	}
+	return out, nil
+}
+
+func dockerAPIImageInspects(ctx context.Context, host string, refs []string) ([]dockerImageInspectRow, error) {
+	refs = normalizeDockerArgs(refs)
+	out := make([]dockerImageInspectRow, 0, len(refs))
+	for _, ref := range refs {
+		var row dockerImageInspectRow
+		path := "/images/" + url.PathEscape(ref) + "/json"
+		if err := dockerAPIJSON(ctx, http.MethodGet, host, path, nil, &row); err != nil {
+			return nil, err
+		}
+		out = append(out, row)
 	}
 	return out, nil
 }

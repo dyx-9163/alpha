@@ -41,12 +41,15 @@ type DockerContainer struct {
 
 type DockerImage struct {
 	ID               string   `json:"id"`
+	ParentID         string   `json:"parentId,omitempty"`
 	Repository       string   `json:"repository"`
 	Tag              string   `json:"tag"`
 	Size             string   `json:"size"`
 	CreatedAt        string   `json:"createdAt"`
 	Digest           string   `json:"digest"`
 	UsedByContainers []string `json:"usedByContainers"`
+	UsedByImages     []string `json:"usedByImages"`
+	RootFSLayers     []string `json:"-"`
 }
 
 type DockerNetwork struct {
@@ -266,21 +269,34 @@ func DockerImagesWithUsage(ctx context.Context, host string) ([]DockerImage, err
 	if err != nil {
 		return nil, err
 	}
+	if dockerAPIHost(host) {
+		if inspected, err := dockerAPIImageInspects(ctx, host, dockerImageInspectReferences(images)); err == nil {
+			images = mergeDockerImageInspect(images, inspected)
+		}
+	} else if inspected, err := dockerImageInspects(ctx, host, images); err == nil {
+		images = mergeDockerImageInspect(images, inspected)
+	}
 	containers, err := DockerContainers(ctx, host)
 	if err != nil {
-		return images, nil
+		return annotateDockerImageUsage(images, nil), nil
 	}
 	return annotateDockerImageUsage(images, containers), nil
 }
 
 func DockerImagesWithUsageForServer(ctx context.Context, server store.Server) ([]DockerImage, error) {
+	if dockerAPIHost(server.DockerHost) {
+		return DockerImagesWithUsage(ctx, server.DockerHost)
+	}
 	images, err := DockerImagesForServer(ctx, server)
 	if err != nil {
 		return nil, err
 	}
+	if inspected, err := dockerImageInspectsForServer(ctx, server, images); err == nil {
+		images = mergeDockerImageInspect(images, inspected)
+	}
 	containers, err := DockerContainersForServer(ctx, server)
 	if err != nil {
-		return images, nil
+		return annotateDockerImageUsage(images, nil), nil
 	}
 	return annotateDockerImageUsage(images, containers), nil
 }
@@ -335,8 +351,115 @@ func annotateDockerImageUsage(images []DockerImage, containers []DockerContainer
 			usedBy = append(usedBy, name)
 		}
 		images[i].UsedByContainers = uniqueDockerStrings(usedBy)
+		usedByImages := make([]string, 0)
+		for _, child := range images {
+			if !dockerImageDependsOn(child, images[i]) {
+				continue
+			}
+			usedByImages = append(usedByImages, dockerImageDisplayName(child))
+		}
+		images[i].UsedByImages = uniqueDockerStrings(usedByImages)
 	}
 	return images
+}
+
+type dockerImageInspectRow struct {
+	ID       string `json:"Id"`
+	ParentID string `json:"Parent"`
+	RootFS   struct {
+		Layers []string `json:"Layers"`
+	} `json:"RootFS"`
+}
+
+func dockerImageInspects(ctx context.Context, host string, images []DockerImage) ([]dockerImageInspectRow, error) {
+	refs := dockerImageInspectReferences(images)
+	if len(refs) == 0 {
+		return nil, nil
+	}
+	args := append([]string{"image", "inspect", "--format", "{{json .}}"}, refs...)
+	out, err := dockerCommand(ctx, host, args...).Output()
+	if err != nil {
+		return nil, err
+	}
+	var rows []dockerImageInspectRow
+	if err := parseDockerJSONLines(out, &rows); err != nil {
+		return nil, err
+	}
+	return rows, nil
+}
+
+func dockerImageInspectsForServer(ctx context.Context, server store.Server, images []DockerImage) ([]dockerImageInspectRow, error) {
+	refs := dockerImageInspectReferences(images)
+	if len(refs) == 0 {
+		return nil, nil
+	}
+	args := append([]string{"image", "inspect", "--format", "{{json .}}"}, refs...)
+	out, err := dockerSSHOutput(ctx, server, args...)
+	if err != nil {
+		return nil, err
+	}
+	var rows []dockerImageInspectRow
+	if err := parseDockerJSONLines(out, &rows); err != nil {
+		return nil, err
+	}
+	return rows, nil
+}
+
+func dockerImageInspectReferences(images []DockerImage) []string {
+	refs := make([]string, 0, len(images))
+	for _, image := range images {
+		ref := strings.TrimSpace(image.ID)
+		if ref == "" {
+			ref = dockerImageReference(image)
+		}
+		if ref != "" {
+			refs = append(refs, ref)
+		}
+	}
+	return uniqueDockerStrings(refs)
+}
+
+func mergeDockerImageInspect(images []DockerImage, inspected []dockerImageInspectRow) []DockerImage {
+	byID := map[string]dockerImageInspectRow{}
+	for _, row := range inspected {
+		id := normalizeDockerImageID(row.ID)
+		if id != "" {
+			byID[id] = row
+		}
+	}
+	for i := range images {
+		row, ok := byID[normalizeDockerImageID(images[i].ID)]
+		if !ok {
+			continue
+		}
+		images[i].ParentID = normalizeDockerImageID(firstNonEmptyString(images[i].ParentID, row.ParentID))
+		images[i].RootFSLayers = uniqueDockerStrings(row.RootFS.Layers)
+	}
+	return images
+}
+
+func dockerImageDependsOn(child DockerImage, parent DockerImage) bool {
+	if normalizeDockerImageID(child.ID) == normalizeDockerImageID(parent.ID) {
+		return false
+	}
+	if dockerImageCandidates(parent)[normalizeDockerImageID(child.ParentID)] {
+		return true
+	}
+	parentLayers := uniqueDockerStrings(parent.RootFSLayers)
+	childLayers := uniqueDockerStrings(child.RootFSLayers)
+	if len(parentLayers) == 0 || len(childLayers) <= len(parentLayers) {
+		return false
+	}
+	childLayerSet := map[string]bool{}
+	for _, layer := range childLayers {
+		childLayerSet[layer] = true
+	}
+	for _, layer := range parentLayers {
+		if !childLayerSet[layer] {
+			return false
+		}
+	}
+	return true
 }
 
 func dockerContainerUsesImage(container DockerContainer, image DockerImage) bool {
@@ -368,7 +491,7 @@ func dockerImageCandidates(image DockerImage) map[string]bool {
 	if digest != "" && digest != "<none>" {
 		candidates[digest] = true
 	}
-	id := strings.TrimPrefix(strings.TrimSpace(image.ID), "sha256:")
+	id := normalizeDockerImageID(image.ID)
 	if id != "" {
 		candidates[id] = true
 		candidates["sha256:"+id] = true
@@ -378,6 +501,31 @@ func dockerImageCandidates(image DockerImage) map[string]bool {
 		}
 	}
 	return candidates
+}
+
+func dockerImageReference(image DockerImage) string {
+	repository := strings.TrimSpace(image.Repository)
+	tag := strings.TrimSpace(image.Tag)
+	if repository != "" && repository != "<none>" && tag != "" && tag != "<none>" {
+		return repository + ":" + tag
+	}
+	return strings.TrimSpace(image.ID)
+}
+
+func dockerImageDisplayName(image DockerImage) string {
+	ref := dockerImageReference(image)
+	if ref != "" {
+		return ref
+	}
+	id := normalizeDockerImageID(image.ID)
+	if len(id) > 12 {
+		return id[:12]
+	}
+	return id
+}
+
+func normalizeDockerImageID(value string) string {
+	return strings.TrimPrefix(strings.TrimSpace(value), "sha256:")
 }
 
 func uniqueDockerStrings(values []string) []string {
