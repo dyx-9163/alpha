@@ -20,6 +20,15 @@
 - MinIO：41、42节点。
 - 应用服务和 AIFAR Runtime：31、32节点。
 
+现场测试拓扑示例：
+
+| 文档角色 | 本次自动化测试节点 | 说明 |
+| --- | --- | --- |
+| 41 节点 | 192.168.74.141 | MySQL、Redis、Nacos、MinIO |
+| 42 节点 | 192.168.74.142 | MySQL、Redis、Nacos、MinIO |
+| 仲裁节点 | 192.168.74.143 | MySQL、Redis、Nacos |
+| 应用节点 | 192.168.74.143 | 本次为节省资源，仅在 143 部署应用和 AIFAR Runtime |
+
 ## 2. 参数说明
 
 | 占位符 | 说明 |
@@ -157,6 +166,8 @@ MC_CONFIG_DIR=/aifar/apps/minio/conf/mc \
 systemctl restart aifar-minio
 ```
 
+> 现场验证注意：`systemctl is-active aifar-minio` 返回 `active` 后，9000 端口可能还需要短暂时间才真正可访问。如果下面执行 `mc replicate ls` 出现 `127.0.0.1:9000 connection refused`，先等待端口就绪后重试，例如确认 `ss -ltn | grep ':9000'` 已有监听。
+
 设置 `mc` 路径：
 
 ```bash
@@ -217,6 +228,8 @@ MC_CONFIG_DIR=/aifar/apps/minio/conf/mc \
 ```bash
 systemctl restart aifar-minio
 ```
+
+> 现场验证注意：`systemctl is-active aifar-minio` 返回 `active` 后，9000 端口可能还需要短暂时间才真正可访问。如果下面执行 `mc replicate ls` 出现 `127.0.0.1:9000 connection refused`，先等待端口就绪后重试，例如确认 `ss -ltn | grep ':9000'` 已有监听。
 
 设置 `mc` 路径：
 
@@ -323,6 +336,58 @@ systemctl restart aifar-nacos
 
 修改完成后，还需要同步修改应用使用的 Nacos 账号和密码配置。
 
+如果无法进入 Nacos Web 页面，但可以使用 MySQL root 账号连接 Nacos 后端库，可使用 Nacos 自带的 `PasswordEncoderUtil` 生成兼容密码摘要后更新 `users` 表。以下为管理员兜底方式，执行前先确认 Nacos 后端库名和用户表；本环境库名为 `aifar_nacos`。
+
+在任意一台 Nacos/MySQL 节点上准备临时工具：
+
+```bash
+rm -rf /tmp/aifar-nacos-auth-jars
+mkdir -p /tmp/aifar-nacos-auth-jars
+cd /tmp/aifar-nacos-auth-jars
+
+/aifar/apps/nacos/jdk/bin/jar xf \
+  /aifar/apps/nacos/nacos/target/nacos-server.jar \
+  BOOT-INF/lib
+
+cat > GenNacosPassword.java <<'EOF'
+public class GenNacosPassword {
+  public static void main(String[] args) {
+    if (args.length != 1) throw new IllegalArgumentException("password required");
+    System.out.print(com.alibaba.nacos.plugin.auth.impl.utils.PasswordEncoderUtil.encode(args[0]));
+  }
+}
+EOF
+
+/aifar/apps/nacos/jdk/bin/javac \
+  -cp "BOOT-INF/lib/*" \
+  GenNacosPassword.java
+```
+
+生成新密码摘要并更新 Nacos 用户密码：
+
+```bash
+NACOS_HASH=$(/aifar/apps/nacos/jdk/bin/java \
+  -cp "/tmp/aifar-nacos-auth-jars:/tmp/aifar-nacos-auth-jars/BOOT-INF/lib/*" \
+  GenNacosPassword "<NACOS_PASSWORD>")
+
+cd /aifar/apps/mysql/mysql-shell/bin
+
+./mysqlsh --credential-store-helper='<disabled>' \
+  --save-passwords=never \
+  --sql \
+  --host=<PRIMARY_IP> \
+  --port=3306 \
+  --user=root \
+  --password \
+  --execute "UPDATE aifar_nacos.users SET password = '${NACOS_HASH}' WHERE username = 'nacos';"
+```
+
+更新后重启三台 Nacos，并重新登录 Web 页面验证：
+
+```bash
+systemctl restart aifar-nacos
+```
+
 ### 6.3 修改 Nacos 中的业务配置
 
 进入 Nacos Web 页面，在对应 namespace、group 和 Data ID 下修改：
@@ -331,6 +396,8 @@ systemctl restart aifar-nacos
 - `resources.yaml`
 
 同步修改其中 MySQL 集群和 Redis 集群对应的密码。
+
+> 现场验证注意：按实际配置内容修改即可，不要强行新增不存在的字段。本次测试中 `datasource.yaml` 存在需要修改的 `password:` 行，`resources.yaml` 中没有 `password:` 行，因此 `resources.yaml` 无需强行补密码。
 
 ## 7. AIFAR Runtime 服务器
 
@@ -346,6 +413,8 @@ vi /aifar/apps/admin/runtime/env/java-secrets.env
 NACOS_PASSWORD=<NACOS_PASSWORD>
 ```
 
+> 现场验证注意：修改 `java-secrets.env` 只会更新后续创建容器使用的配置文件，已经运行的 Docker 容器不会自动获得新的环境变量。修改后需要通过 AIFAR Runtime/Agent 重新发布或重建应用容器；仅修改文件或执行 `docker restart` 不能改变已创建容器的环境变量。
+
 ## 8. 完成确认
 
 - [ ] MySQL 使用新密码可以重新登录。
@@ -358,3 +427,4 @@ NACOS_PASSWORD=<NACOS_PASSWORD>
 - [ ] Nacos 登录密码已经修改。
 - [ ] `datasource.yaml`、`resources.yaml` 中的 MySQL、Redis 密码已经更新。
 - [ ] 31、32应用节点的 `java-secrets.env` 已更新。
+- [ ] 应用容器已通过 AIFAR Runtime/Agent 重新发布或重建，并确认运行中容器已使用新的 Nacos 密码。
