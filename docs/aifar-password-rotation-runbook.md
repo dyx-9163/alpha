@@ -6,7 +6,21 @@
 
 > `<...>` 表示必须替换的现场参数。不要把真实密码提交到 Git、工单或聊天记录中。
 
-## 1. 参数说明
+## 1. 部署拓扑
+
+| 节点 | 部署内容 | 本手册涉及的操作 |
+| --- | --- | --- |
+| 31、32 | 应用服务、AIFAR Runtime | 修改 Runtime 使用的 Nacos 密码，并同步应用配置 |
+| 41、42 | MySQL、Redis、Nacos 集群节点；MinIO 节点 | 修改 MySQL、Redis、Nacos 集群密码；修改 MinIO 密码及双向复制配置 |
+| 仲裁节点 | MySQL、Redis、Nacos 集群节点 | 修改 MySQL、Redis、Nacos 集群密码 |
+
+执行范围：
+
+- MySQL、Redis、Nacos：41、42及仲裁节点。
+- MinIO：41、42节点。
+- 应用服务和 AIFAR Runtime：31、32节点。
+
+## 2. 参数说明
 
 | 占位符 | 说明 |
 | --- | --- |
@@ -20,19 +34,23 @@
 | `<REDIS_PASSWORD>` | Redis 与 Redis Sentinel 共用的新密码 |
 | `<NACOS_PASSWORD>` | Nacos 新密码 |
 
-## 2. MySQL
+## 3. MySQL
 
-### 2.1 查看当前 PRIMARY
+MySQL 集群部署在 41、42及仲裁节点。账号密码在当前 PRIMARY 上修改，MySQL Shell 可以从任意一台正在运行 MySQL 的集群节点进入。
+
+### 3.1 查看当前 PRIMARY
 
 进入 AIFAR 管理平台，查看当前 MySQL PRIMARY 节点并记录其 IP。
 
-### 2.2 进入任意一台正在运行 MySQL 的服务器
+### 3.2 进入任意一台正在运行 MySQL 的集群节点
+
+在 41、42或仲裁节点中任选一台正在运行 MySQL 的服务器执行：
 
 ```bash
 cd /aifar/apps/mysql/mysql-shell/bin
 ```
 
-### 2.3 使用 MySQL Shell 连接 PRIMARY
+### 3.3 使用 MySQL Shell 连接 PRIMARY
 
 ```bash
 ./mysqlsh root@<PRIMARY_IP>:3306 --sql
@@ -40,19 +58,19 @@ cd /aifar/apps/mysql/mysql-shell/bin
 
 根据提示输入当前 MySQL root 密码。
 
-#### 2.3.1 确认当前节点可读写
+#### 3.3.1 确认当前节点可读写
 
 ```sql
 SELECT CURRENT_USER(), @@hostname, @@read_only, @@super_read_only;
 ```
 
-#### 2.3.2 查看 root 账号信息
+#### 3.3.2 查看 root 账号信息
 
 ```sql
 SELECT User, Host FROM mysql.user WHERE User = 'root';
 ```
 
-#### 2.3.3 修改密码
+#### 3.3.3 修改密码
 
 根据上一步查询结果，对实际存在的 `root@Host` 账号执行对应语句：
 
@@ -67,7 +85,7 @@ ALTER USER 'root'@'localhost' IDENTIFIED BY '<MYSQL_PASSWORD>'
 RETAIN CURRENT PASSWORD;
 ```
 
-### 2.4 验证新密码是否生效
+### 3.4 验证新密码是否生效
 
 退出当前 MySQL Shell，然后重新执行：
 
@@ -83,11 +101,11 @@ RETAIN CURRENT PASSWORD;
 
 根据提示输入 MySQL 新密码，确认可以正常登录。
 
-## 3. MinIO
+## 4. MinIO
 
 修改 41、42 两个节点的 MinIO 配置，并更新 `aifar` 桶的双向复制配置。
 
-### 3.1 修改两个节点的 MinIO 密码
+### 4.1 修改两个节点的 MinIO 密码
 
 分别在 41、42 节点执行：
 
@@ -101,7 +119,7 @@ vi /aifar/apps/minio/conf/minio.env
 MINIO_ROOT_PASSWORD="<MINIO_PASSWORD>"
 ```
 
-### 3.2 在 41 节点执行
+### 4.2 在 41 节点执行
 
 进入 MinIO 命令目录：
 
@@ -162,7 +180,7 @@ CFG=/aifar/apps/minio/conf/mc
   "http://admin:<MINIO_PASSWORD>@<MINIO_42_IP>:9000/aifar"
 ```
 
-### 3.3 在 42 节点执行
+### 4.3 在 42 节点执行
 
 进入 MinIO 命令目录：
 
@@ -223,24 +241,26 @@ CFG=/aifar/apps/minio/conf/mc
   "http://admin:<MINIO_PASSWORD>@<MINIO_41_IP>:9000/aifar"
 ```
 
-### 3.4 验证双向同步
+### 4.4 验证双向同步
 
 进入 MinIO 页面上传文件，分别查看 41、42 两个节点的同步结果。
 
-## 4. Redis
+## 5. Redis
 
-Redis 数据服务与 Redis Sentinel 使用相同的新密码。
+Redis 集群部署在 41、42及仲裁节点。三个节点的 Redis 数据服务与 Redis Sentinel 使用相同的新密码。
 
-### 4.1 停止 Redis 和 Sentinel
+### 5.1 停止 Redis 和 Sentinel
 
-在相关 Redis 节点执行：
+在 41、42及仲裁节点分别执行：
 
 ```bash
 systemctl stop aifar-redis
 systemctl stop aifar-redis-sentinel
 ```
 
-### 4.2 修改 Redis 配置
+### 5.2 修改 Redis 配置
+
+在 41、42及仲裁节点分别执行：
 
 ```bash
 cd /aifar/apps/redis/conf
@@ -254,7 +274,9 @@ requirepass <REDIS_PASSWORD>
 masterauth <REDIS_PASSWORD>
 ```
 
-### 4.3 修改 Sentinel 配置
+### 5.3 修改 Sentinel 配置
+
+在 41、42及仲裁节点分别执行：
 
 ```bash
 vi sentinel.conf
@@ -271,9 +293,13 @@ sentinel sentinel-pass <REDIS_PASSWORD>
 
 `user default` 行中的 `>` 是 Redis ACL 密码规则的一部分。替换后应为 `>实际密码`，`>` 与密码之间没有空格。
 
-## 5. Nacos
+## 6. Nacos
 
-### 5.1 修改 Nacos 使用的 MySQL 密码
+Nacos 集群部署在 41、42及仲裁节点。
+
+### 6.1 修改 Nacos 使用的 MySQL 密码
+
+在 41、42及仲裁节点分别执行：
 
 ```bash
 vi /aifar/apps/nacos/nacos/conf/application.properties
@@ -291,13 +317,13 @@ db.password.0=<MYSQL_PASSWORD>
 systemctl restart aifar-nacos
 ```
 
-### 5.2 修改 Nacos 登录密码
+### 6.2 修改 Nacos 登录密码
 
 进入 Nacos Web 页面修改 Nacos 登录密码。
 
 修改完成后，还需要同步修改应用使用的 Nacos 账号和密码配置。
 
-### 5.3 修改 Nacos 中的业务配置
+### 6.3 修改 Nacos 中的业务配置
 
 进入 Nacos Web 页面，在对应 namespace、group 和 Data ID 下修改：
 
@@ -306,9 +332,9 @@ systemctl restart aifar-nacos
 
 同步修改其中 MySQL 集群和 Redis 集群对应的密码。
 
-## 6. AIFAR Runtime 服务器
+## 7. AIFAR Runtime 服务器
 
-在每台 AIFAR Runtime 服务器修改：
+应用服务和 AIFAR Runtime 部署在 31、32节点。在 31、32两台服务器分别修改：
 
 ```bash
 vi /aifar/apps/admin/runtime/env/java-secrets.env
@@ -320,14 +346,15 @@ vi /aifar/apps/admin/runtime/env/java-secrets.env
 NACOS_PASSWORD=<NACOS_PASSWORD>
 ```
 
-## 7. 完成确认
+## 8. 完成确认
 
 - [ ] MySQL 使用新密码可以重新登录。
+- [ ] MySQL、Redis、Nacos 的操作范围已覆盖 41、42及仲裁节点。
 - [ ] 41 节点的 `aifar-peer` 指向 42。
 - [ ] 42 节点的 `aifar-peer` 指向 41。
 - [ ] MinIO 页面上传文件后，双向同步结果正常。
-- [ ] Redis 与 Sentinel 配置已使用同一个新密码。
-- [ ] Nacos `db.password.0` 已更新并完成重启。
+- [ ] 41、42及仲裁节点的 Redis 与 Sentinel 配置已使用同一个新密码。
+- [ ] 41、42及仲裁节点的 Nacos `db.password.0` 已更新并完成重启。
 - [ ] Nacos 登录密码已经修改。
 - [ ] `datasource.yaml`、`resources.yaml` 中的 MySQL、Redis 密码已经更新。
-- [ ] 所有 Runtime 服务器的 `java-secrets.env` 已更新。
+- [ ] 31、32应用节点的 `java-secrets.env` 已更新。
