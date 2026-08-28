@@ -696,7 +696,7 @@ func proveAcceptedAIFARDeploymentTx(tx *sql.Tx, expected AIFARDeployment) error 
 	accepted := strings.EqualFold(current.Status, "Accepted")
 	if !accepted && current.ObservedGeneration >= current.Generation {
 		switch strings.ToLower(strings.TrimSpace(current.Status)) {
-		case "progressing", "available", "degraded", "offline":
+		case "progressing", "available", "ready", "no-endpoints", "degraded", "offline":
 			accepted = true
 		}
 	}

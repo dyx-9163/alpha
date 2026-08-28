@@ -842,6 +842,66 @@ func TestServiceInstallFencedWritesRejectExpiredPredecessor(t *testing.T) {
 	}
 }
 
+func TestCommitAIFARServiceInstallAcceptsRuntimeObservationAfterAgentAcceptance(t *testing.T) {
+	tests := []struct {
+		name       string
+		status     string
+		conditions string
+	}{
+		{name: "ready", status: "ready", conditions: `[{"type":"Available","status":true,"generation":1}]`},
+		{name: "no endpoints", status: "no-endpoints", conditions: `[{"type":"Progressing","status":true,"generation":1}]`},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			db := openTestStore(t)
+			instance, err := db.SaveAppInstance(AppInstance{
+				ID: "instance-1", App: "aifar", Version: "runtime-v2", ServerID: "srv-1",
+				Status: "installed", Metadata: `{"services":["gateway"]}`,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			accepted, err := db.SaveAIFARDeployment(AIFARDeployment{
+				InstanceID: instance.ID, ServiceName: "contacts", DesiredReplicas: 1,
+				CurrentRevision: "rev-1", SpecJSON: `{"service":"contacts","generation":1}`,
+				Generation: 1, Status: "Accepted",
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			owner := testAIFAROrchestrationLock(instance.ID, "", "install-services")
+			owner.ID = "service-install"
+			if _, err := db.AcquireAIFAROrchestrationLock(owner); err != nil {
+				t.Fatal(err)
+			}
+			if _, applied, err := db.ObserveAIFARRuntimeService(AIFARRuntimeServiceObservation{
+				InstanceID: instance.ID, ServiceName: "contacts", Generation: 1,
+				ObservationEpoch: 1, Status: tc.status, ConditionsJSON: tc.conditions,
+				ObservedAt: time.Now().UTC(),
+			}); err != nil || !applied {
+				t.Fatalf("%s observation: applied=%v err=%v", tc.status, applied, err)
+			}
+
+			next := instance
+			next.Metadata = `{"services":["gateway","contacts"]}`
+			saved, err := db.CommitAIFARServiceInstallWithLock(AIFARServiceInstallCommit{
+				LockID: owner.ID, ExpectedDeployments: []AIFARDeployment{accepted}, NextInstance: next,
+				ExpectedInstanceUpdatedAt: instance.UpdatedAt,
+				Release: AppRelease{
+					InstanceID: instance.ID, App: "aifar", Version: "runtime-v2", ReleaseID: "rev-1",
+					ServerID: "srv-1", Status: "success", ManifestJSON: `{}`,
+				},
+			})
+			if err != nil {
+				t.Fatalf("%s runtime observation invalidated accepted service install: %v", tc.status, err)
+			}
+			if saved.Metadata != next.Metadata {
+				t.Fatalf("service install metadata=%s, want %s", saved.Metadata, next.Metadata)
+			}
+		})
+	}
+}
+
 func TestCommitAIFARRuntimeMigrationRejectsSuccessorGenerationWithoutOverwrite(t *testing.T) {
 	db := openTestStore(t)
 	instance, err := db.SaveAppInstance(AppInstance{ID: "instance-1", App: "aifar", Version: "runtime-v2", ServerID: "srv-1", Status: "installed", Metadata: `{"orchestrationModel":"agent-runtime-v2","peer":"keep"}`})

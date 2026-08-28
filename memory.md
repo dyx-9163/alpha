@@ -9,3 +9,5 @@
 - 结论：16:02:01 root Bash 执行 `systemctl stop firewalld` 后 Docker 的 `DOCKER-*`、FORWARD 和 NAT/MASQUERADE 规则被清空，现场仅剩 `FORWARD DROP`，容器无法访问 `.141/.142:26379` 和外部 DNS，而宿主机可达，导致 Java 服务等待 Redis Sentinel、健康端口不监听并被 Agent 反复自愈；`oauth/permission/system` 另因目标镜像标签已不存在而保持 0/1，Docker 尝试从公网拉取失败。修复应先恢复 Docker 网络规则并验证容器出站，再通过受控制品更新重建缺失镜像；不要直接归因于 Agent 或 OOM。
 - 问题：AIFAR Runtime 安装或重装过程中 Agent 暂时不可用时，页面整块隐藏部署信息，用户无法观察安装进度。
 - 结论：提交 `b4918440` 显式引入了 Agent 非 `running` 时清空运行时实例并隐藏工作区的逻辑；现已改为保留并展示最近一次运行时数据、明确标注数据可能暂时过期，同时继续通过既有门禁禁用所有变更操作。回归测试先在旧逻辑上失败，修复后完整前端 498 项测试及生产构建通过。
+- 问题：新增 AIFAR Runtime 服务已被 Agent 接收并运行后，安装任务最终提交仍报 `AIFAR deployment generation conflict`，后续整包更新又误报部分服务未被 Agent 接收。
+- 结论：实时 Docker 采集会把已接收 Deployment 的状态投影为 `ready` 或 `no-endpoints`，而最终提交证明未识别这两个真实状态，导致实例服务目录未原子提交；现已在保持 generation、revision、spec 精确校验的前提下认可当前代际的两种运行时投影，并让批量失败摘要展示真实首因而非统一误报 Agent 拒绝。

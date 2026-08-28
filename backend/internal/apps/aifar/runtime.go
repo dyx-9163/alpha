@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"sort"
 	"strings"
 	"sync"
@@ -402,7 +401,7 @@ func aggregateServiceActionFailures(language string, failures []serviceActionFai
 		causes = append(causes, failure.err)
 	}
 	return serviceActionAggregateError{
-		message: fmt.Sprintf("%s: %s", i18n.Text(language, "aifar.runtimeMutation.batchFailed"), strings.Join(services, ",")),
+		message: i18n.Text(language, "aifar.runtimeMutation.batchFailed", strings.Join(services, ","), failures[0].err.Error()),
 		errors:  causes,
 	}
 }
