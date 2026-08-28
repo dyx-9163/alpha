@@ -251,7 +251,7 @@ describe('ContainersView AIFAR runtime loading', () => {
     ])
   })
 
-  it('hides all deployment runtime data when aifar-agent is unavailable', async () => {
+  it('keeps the last deployment runtime data available when aifar-agent is unavailable', async () => {
     apiGetMock.mockImplementation(async (path: string) => {
       if (path === '/apps/aifar/install-modules?version=runtime-v2') return []
       if (path === '/servers') return [server]
@@ -298,11 +298,17 @@ describe('ContainersView AIFAR runtime loading', () => {
       runtimeEntryRoutes: Array<{ route: string; port: string }>
     }
     expect(vm.aifarRuntimeDataAvailable).toBe(false)
-    expect(vm.aifarRuntimeInstances).toEqual([])
-    expect(vm.selectedRuntimeInstanceId).toBe('')
-    expect(vm.selectedRuntimeDeployments).toEqual([])
-    expect(vm.selectedRuntimeServices).toEqual([])
+    expect(vm.aifarRuntimeInstances).toEqual([
+      expect.objectContaining({ id: 'app-aifar', status: 'running', version: 'runtime-v2' })
+    ])
+    expect(vm.selectedRuntimeInstanceId).toBe('app-aifar')
+    expect(vm.selectedRuntimeDeployments).toEqual([
+      expect.objectContaining({ instanceId: 'app-aifar', serviceName: 'permission' })
+    ])
+    expect(vm.selectedRuntimeServices).toEqual([
+      expect.objectContaining({ instanceId: 'app-aifar', serviceName: 'permission' })
+    ])
     expect(vm.selectedRuntimePods).toEqual([])
-    expect(vm.runtimeEntryRoutes.every((route) => route.route === '-' || route.port.endsWith('-'))).toBe(true)
+    expect(vm.runtimeEntryRoutes).toContainEqual(expect.objectContaining({ route: 'http://example.local' }))
   })
 })

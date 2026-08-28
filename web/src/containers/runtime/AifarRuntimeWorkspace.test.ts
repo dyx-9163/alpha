@@ -141,7 +141,7 @@ function runtimeContext(overrides: Partial<AifarRuntimeContext> = {}) {
 }
 
 describe('AifarRuntimeWorkspace', () => {
-  it('does not render deployment runtime tabs when aifar-agent is unavailable', () => {
+  it('keeps the last runtime data visible with a stale-data warning when aifar-agent is unavailable', () => {
     const wrapper = shallowMount(AifarRuntimeWorkspace, {
       global: {
         provide: {
@@ -169,9 +169,8 @@ describe('AifarRuntimeWorkspace', () => {
       }
     })
 
-    expect(wrapper.find('.runtime-resource-tabs').exists()).toBe(false)
-    expect(wrapper.text()).toContain('containers.runtimeAgentUnavailableEmpty')
-    expect(wrapper.text()).not.toContain('containers.deployments')
-    expect(wrapper.text()).not.toContain('containers.pods')
+    expect(wrapper.find('.runtime-resource-tabs').exists()).toBe(true)
+    expect(wrapper.text()).toContain('containers.runtimeAgentUnavailableStale')
+    expect(wrapper.text()).not.toContain('containers.runtimeAgentUnavailableEmpty')
   })
 })
