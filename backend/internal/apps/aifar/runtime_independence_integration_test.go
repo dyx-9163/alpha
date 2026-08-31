@@ -100,6 +100,8 @@ func (r *agentBridgeRemote) Run(ctx context.Context, _ store.Server, command str
 	r.commands = append(r.commands, command)
 	r.mu.Unlock()
 	switch {
+	case strings.Contains(command, "AIFAR_UPLOAD_VERIFY"):
+		return adapter.CommandResult{Stdout: "AIFAR_UPLOAD_VERIFY " + scriptAssignment(command, "expected_sha256") + " " + scriptAssignment(command, "expected_size") + "\n"}, nil
 	case strings.Contains(command, "AIFAR_AGENT_CHECK"):
 		r.mu.Lock()
 		stdout := r.agentCheckStdout
