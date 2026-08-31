@@ -277,12 +277,17 @@ type Copy struct {
 	SingleTargetOnly      string
 	TopologyUnsupported   string
 	PrepareWorkDir        string
+	PrepareStage          string
 	UploadBundle          string
 	UploadBundleFailed    string
 	UploadAgent           string
 	UploadAgentFailed     string
 	UploadScript          string
 	UploadScriptFailed    string
+	VerifyUpload          string
+	ChecksumMismatch      string
+	VerificationFailed    string
+	StageCleanupFailed    string
 	Deploying             string
 	RemoteCommandFailed   string
 	InstallFailed         string
@@ -370,12 +375,17 @@ func copyFor(lang string) Copy {
 			SingleTargetOnly:      "AIFAR service deployment supports only one target server per task",
 			TopologyUnsupported:   "AIFAR service topology is not supported: %s",
 			PrepareWorkDir:        "preparing remote work directory: %s",
+			PrepareStage:          "prepare isolated AIFAR install staging directory",
 			UploadBundle:          "uploading AIFAR service bundle: %s",
 			UploadBundleFailed:    "upload AIFAR service bundle",
 			UploadAgent:           "uploading AIFAR runtime agent",
 			UploadAgentFailed:     "upload AIFAR runtime agent",
 			UploadScript:          "uploading AIFAR service install script",
 			UploadScriptFailed:    "upload AIFAR service install script",
+			VerifyUpload:          "verified uploaded file on target server: %s",
+			ChecksumMismatch:      "the uploaded AIFAR file failed the target SHA-256 or size check",
+			VerificationFailed:    "the uploaded AIFAR file could not be verified on the target server",
+			StageCleanupFailed:    "clean up AIFAR install staging directory failed: %v",
 			Deploying:             "deploying AIFAR runtime Pods through aifar-agent",
 			RemoteCommandFailed:   "AIFAR remote command failed",
 			InstallFailed:         "AIFAR service install failed: %v",
@@ -403,12 +413,17 @@ func copyFor(lang string) Copy {
 		SingleTargetOnly:      "AIFAR 服务每次部署任务只支持一台目标服务器",
 		TopologyUnsupported:   "AIFAR 服务不支持该拓扑：%s",
 		PrepareWorkDir:        "准备远程工作目录：%s",
+		PrepareStage:          "准备隔离的 AIFAR 安装暂存目录",
 		UploadBundle:          "上传 AIFAR 服务包：%s",
 		UploadBundleFailed:    "上传 AIFAR 服务包失败",
 		UploadAgent:           "上传 AIFAR runtime agent",
 		UploadAgentFailed:     "上传 AIFAR runtime agent 失败",
 		UploadScript:          "上传 AIFAR 服务安装脚本",
 		UploadScriptFailed:    "上传 AIFAR 服务安装脚本失败",
+		VerifyUpload:          "目标服务器上传文件校验通过：%s",
+		ChecksumMismatch:      "上传的 AIFAR 文件未通过目标端 SHA-256 或大小校验",
+		VerificationFailed:    "无法在目标服务器上验证上传的 AIFAR 文件",
+		StageCleanupFailed:    "清理 AIFAR 安装暂存目录失败：%v",
 		Deploying:             "正在通过 aifar-agent 部署 AIFAR Runtime Pod",
 		RemoteCommandFailed:   "AIFAR 远程命令执行失败",
 		InstallFailed:         "AIFAR 服务安装失败：%v",

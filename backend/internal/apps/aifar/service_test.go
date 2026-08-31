@@ -1407,6 +1407,10 @@ type fakeRemote struct {
 	runtimeAgentCheckStdout string
 	installStdout           string
 	installRuns             int
+	verificationRuns        int
+	verificationMismatchAt  int
+	verificationFailureAt   int
+	verificationEvents      []string
 	bootstrapHashOverrides  map[string]string
 	bootstrapNameOverrides  map[string]string
 	deploymentManifests     map[string]runtimeagent.DeploymentManifest
@@ -1468,6 +1472,17 @@ func (f *fakeRemote) Run(ctx context.Context, server store.Server, command strin
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.commands = append(f.commands, command)
+	if strings.Contains(command, "AIFAR_UPLOAD_VERIFY") {
+		f.verificationRuns++
+		f.verificationEvents = append(f.verificationEvents, fmt.Sprintf("verify-%d", f.verificationRuns))
+		if f.verificationMismatchAt == f.verificationRuns {
+			return adapter.CommandResult{Stdout: "AIFAR_UPLOAD_VERIFY " + strings.Repeat("0", 64) + " 0\n"}, errors.New("target checksum mismatch")
+		}
+		if f.verificationFailureAt == f.verificationRuns {
+			return adapter.CommandResult{}, errors.New("target verification failed")
+		}
+		return adapter.CommandResult{Stdout: "AIFAR_UPLOAD_VERIFY " + scriptAssignment(command, "expected_sha256") + " " + scriptAssignment(command, "expected_size") + "\n"}, nil
+	}
 	if strings.Contains(command, "AIFAR_SCALE_SERVICE") {
 		f.scaleServiceScript = command
 		f.scaleServiceRuns++
@@ -1618,6 +1633,7 @@ func (f *fakeRemote) UploadFile(ctx context.Context, server store.Server, localP
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.uploads = append(f.uploads, filepath.Base(localPath)+"->"+remotePath)
+	f.verificationEvents = append(f.verificationEvents, fmt.Sprintf("upload-%d", len(f.uploads)))
 	if strings.Contains(remotePath, "/mutations/") && strings.HasSuffix(remotePath, ".json") {
 		data, err := os.ReadFile(localPath)
 		if err != nil {
@@ -3553,7 +3569,7 @@ func TestServiceInstallsAIFARServiceFromRuntimeV2Bundle(t *testing.T) {
 	}
 	for _, want := range []string{
 		`ORCHESTRATION_MODEL="agent-service-controller-v1"`,
-		`AGENT_BINARY='/aifar/apps/_work/aifar-runtime-v2-`,
+		`AGENT_BINARY='/aifar/apps/admin/.aifar-lifecycle/install-`,
 		`install -m 0755 "$AGENT_BINARY" /usr/local/bin/aifar-agent`,
 		`installing or upgrading AIFAR runtime agent`,
 		`ExecStart=/usr/local/bin/aifar-agent serve --addr $AGENT_LISTEN_ADDR`,
@@ -3596,7 +3612,7 @@ func TestServiceInstallsAIFARServiceFromRuntimeV2Bundle(t *testing.T) {
 	if strings.LastIndex(remote.installScript, "check_agent_dependency") > strings.LastIndex(remote.installScript, "build_images") {
 		t.Fatalf("AIFAR install script should check aifar-agent before building images:\n%s", remote.installScript)
 	}
-	if !strings.Contains(remote.joinedUploads(), "aifar-agent-linux-amd64->/aifar/apps/_work/aifar-runtime-v2-") {
+	if !strings.Contains(remote.joinedUploads(), "aifar-agent-linux-amd64->/aifar/apps/admin/.aifar-lifecycle/install-") {
 		t.Fatalf("AIFAR install should upload runtime agent, uploads=%s", remote.joinedUploads())
 	}
 	if strings.Contains(remote.installScript, `/"Status"/ {print $4; exit}`) {
@@ -3681,6 +3697,114 @@ func TestServiceInstallsAIFARServiceFromRuntimeV2Bundle(t *testing.T) {
 	} {
 		if !strings.Contains(remote.installScript, want) {
 			t.Fatalf("AIFAR install script should force alpha service names with %q:\n%s", want, remote.installScript)
+		}
+	}
+}
+
+func TestInstallRejectsTargetChecksumMismatchBeforeRemoteExecution(t *testing.T) {
+	withFakeRuntimeAgentBinary(t)
+	root := createAIFARBundle(t)
+	db := &fakeStore{servers: map[string]store.Server{
+		"srv-1": {ID: "srv-1", Host: "10.0.0.10", DeployDir: "/aifar/apps"},
+	}}
+	remote := &fakeRemote{verificationMismatchAt: 1}
+	service := NewService(db, remote)
+	err := service.Install(context.Background(), InstallRequest{
+		Version: "latest", ServerID: "srv-1", Language: "en", TaskID: "task-checksum-mismatch",
+		Parameters: map[string]any{"nacosHost": "10.0.0.50"},
+	}, aifarModuleValidationResources(root), fakeLogger{}, nil)
+	if err == nil || !strings.Contains(err.Error(), "AIFAR_ARTIFACT_CHECKSUM_MISMATCH") {
+		t.Fatalf("expected stable checksum mismatch, got %v", err)
+	}
+	if remote.installRuns != 0 {
+		t.Fatalf("install script ran %d times after checksum mismatch", remote.installRuns)
+	}
+	commands := strings.Join(remote.commands, "\n")
+	for _, forbidden := range []string{"tar -xzf", "docker load", "systemctl restart aifar-agent", "sh '/aifar/apps/admin/.aifar-lifecycle/"} {
+		if strings.Contains(commands, forbidden) {
+			t.Fatalf("remote mutation %q ran after mismatch:\n%s", forbidden, commands)
+		}
+	}
+	if len(db.releases) != 0 {
+		t.Fatalf("release must not be committed after mismatch: %+v", db.releases)
+	}
+	for _, instance := range db.instances {
+		if instance.Status == "installed" {
+			t.Fatalf("checksum mismatch must not leave an installed instance: %+v", instance)
+		}
+	}
+}
+
+func TestInstallVerifiesBundleAgentAndScriptBeforeExecution(t *testing.T) {
+	withFakeRuntimeAgentBinary(t)
+	root := createAIFARBundle(t)
+	db := &fakeStore{servers: map[string]store.Server{
+		"srv-1": {ID: "srv-1", Host: "10.0.0.10", DeployDir: "/aifar/apps"},
+	}}
+	remote := &fakeRemote{}
+	err := NewService(db, remote).Install(context.Background(), InstallRequest{
+		Version: "latest", ServerID: "srv-1", Language: "en", Parameters: map[string]any{"nacosHost": "10.0.0.50"},
+	}, aifarModuleValidationResources(root), fakeLogger{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if remote.verificationRuns != 3 || strings.Join(remote.verificationEvents, ",") != "upload-1,verify-1,upload-2,verify-2,upload-3,verify-3" {
+		t.Fatalf("expected ordered verification proofs for bundle, agent, and script, runs=%d events=%v", remote.verificationRuns, remote.verificationEvents)
+	}
+	if remote.installRuns != 1 {
+		t.Fatalf("expected install script after all proofs, ran %d times", remote.installRuns)
+	}
+	for _, upload := range remote.uploads {
+		if !strings.Contains(upload, "->/aifar/apps/admin/.aifar-lifecycle/install-") || !strings.Contains(upload, "/stage/") {
+			t.Fatalf("upload was not staged under the install lifecycle directory: %s", upload)
+		}
+		if strings.Contains(upload, "/aifar/apps/_work/") {
+			t.Fatalf("upload used legacy work path: %s", upload)
+		}
+	}
+}
+
+func TestInstallRejectsMissingTargetVerificationProofBeforeExecution(t *testing.T) {
+	withFakeRuntimeAgentBinary(t)
+	root := createAIFARBundle(t)
+	db := &fakeStore{servers: map[string]store.Server{
+		"srv-1": {ID: "srv-1", Host: "10.0.0.10", DeployDir: "/aifar/apps"},
+	}}
+	remote := &fakeRemote{verificationFailureAt: 1}
+	err := NewService(db, remote).Install(context.Background(), InstallRequest{
+		Version: "latest", ServerID: "srv-1", Language: "en", Parameters: map[string]any{"nacosHost": "10.0.0.50"},
+	}, aifarModuleValidationResources(root), fakeLogger{}, nil)
+	if err == nil || !strings.Contains(err.Error(), "AIFAR_ARTIFACT_VERIFICATION_FAILED") || !strings.Contains(err.Error(), "could not be verified") {
+		t.Fatalf("expected localized stable verification failure, got %v", err)
+	}
+	if remote.installRuns != 0 {
+		t.Fatalf("install script ran %d times after missing verification proof", remote.installRuns)
+	}
+	commands := strings.Join(remote.commands, "\n")
+	if !strings.Contains(commands, "AIFAR_INSTALL_STAGE_CLEANED") {
+		t.Fatalf("expected exact operation stage cleanup command, commands=%s", commands)
+	}
+	if strings.Contains(commands, "rm -rf -- \"$install_root\"") {
+		t.Fatalf("active Runtime directory must not be a cleanup target: %s", commands)
+	}
+}
+
+func TestInstallStagingPathIsUnderInstallRootLifecycleDirectory(t *testing.T) {
+	withFakeRuntimeAgentBinary(t)
+	root := createAIFARBundle(t)
+	db := &fakeStore{servers: map[string]store.Server{
+		"srv-1": {ID: "srv-1", Host: "10.0.0.10", DeployDir: "/aifar/apps"},
+	}}
+	remote := &fakeRemote{}
+	err := NewService(db, remote).Install(context.Background(), InstallRequest{
+		Version: "latest", ServerID: "srv-1", Language: "en", Parameters: map[string]any{"nacosHost": "10.0.0.50"},
+	}, aifarModuleValidationResources(root), fakeLogger{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, upload := range remote.uploads {
+		if !strings.Contains(upload, "->/aifar/apps/admin/.aifar-lifecycle/install-") || !strings.Contains(upload, "/stage/") || strings.Contains(upload, "/aifar/apps/_work/") {
+			t.Fatalf("unexpected install artifact path: %s", upload)
 		}
 	}
 }

@@ -684,15 +684,8 @@ func (s Service) Install(ctx context.Context, req InstallRequest, resources []st
 	releaseID := newReleaseID(bundle.Version, releaseTime)
 	configHash := installConfigHash(options)
 	ingressNetwork := options.NetworkName
-	workDir := installerkit.WorkDir(deployDir, AppName, bundle.Version, releaseTime)
 	installRoot := installRootFromDeployDir(deployDir)
-	archiveRemote := workDir + "/" + filepath.Base(archiveLocal)
 	agentLocal := agentdist.FindBinary()
-	agentRemote := ""
-	if agentLocal != "" {
-		agentRemote = workDir + "/" + filepath.Base(agentLocal)
-	}
-	scriptRemote := workDir + "/install-aifar.sh"
 	metadata := installMetadata(server, installRoot, bundle.Version, releaseID, releaseTime, configHash, options, req.Actor)
 	metadata["serviceCatalog"] = serviceCatalogMetadataForInstall(serviceDefinitions, options.GatewayPort, options.WebPort)
 	metadata["installState"] = "installing"
@@ -788,29 +781,51 @@ func (s Service) Install(ctx context.Context, req InstallRequest, resources []st
 		installCtx, stopHeartbeat = s.startAIFAROrchestrationLockHeartbeat(ctx, installLock)
 		defer stopHeartbeat()
 	}
+	agentName := ""
+	if agentLocal != "" {
+		agentName = filepath.Base(agentLocal)
+	}
+	stage, err := newInstallArtifactStage(installRoot, releaseID, filepath.Base(archiveLocal), agentName)
+	if err != nil {
+		_ = s.markInstallFailed(instance, metadata, err)
+		msg := fmt.Sprintf(copy.InstallFailed, err)
+		logForServer.Error("%s", msg)
+		finishTarget(recorder, target, "failed", msg)
+		return err
+	}
+	stagePrepared := false
+	defer func() {
+		if !stagePrepared {
+			return
+		}
+		if err := cleanupInstallArtifactStage(installCtx, s.remote, server, installRoot, stage, nil); err != nil {
+			logForServer.Error(copy.StageCleanupFailed, err)
+		}
+	}()
 
 	if err := step(4, func() error {
-		logForServer.Info(copy.PrepareWorkDir, workDir)
-		if _, err := installerkit.Run(installCtx, s.remote, server, "mkdir -p "+installerkit.ShellQuote(workDir), logForServer, copy.RemoteCommandFailed); err != nil {
+		logForServer.Info(copy.PrepareStage)
+		if err := prepareInstallArtifactStage(installCtx, s.remote, server, installRoot, stage, nil); err != nil {
 			return err
 		}
-		if err := uploadkit.Upload(installCtx, s.remote, server, uploadkit.File{
+		stagePrepared = true
+		if err := verifiedInstallUpload(installCtx, s.remote, server, stage, uploadkit.File{
 			LocalPath:      archiveLocal,
-			RemotePath:     archiveRemote,
+			RemotePath:     stage.ArchiveRemote,
 			LogMessage:     copy.UploadBundle,
 			LogArgs:        []any{bundle.Root},
 			FailureMessage: copy.UploadBundleFailed,
-		}, logForServer); err != nil {
+		}, copy, logForServer); err != nil {
 			return err
 		}
 		if agentLocal != "" {
-			if err := uploadkit.Upload(installCtx, s.remote, server, uploadkit.File{
+			if err := verifiedInstallUpload(installCtx, s.remote, server, stage, uploadkit.File{
 				LocalPath:      agentLocal,
-				RemotePath:     agentRemote,
+				RemotePath:     stage.AgentRemote,
 				Mode:           0o755,
 				LogMessage:     copy.UploadAgent,
 				FailureMessage: copy.UploadAgentFailed,
-			}, logForServer); err != nil {
+			}, copy, logForServer); err != nil {
 				return err
 			}
 		}
@@ -827,9 +842,9 @@ func (s Service) Install(ctx context.Context, req InstallRequest, resources []st
 		script, err := renderInstallScript(installScriptData{
 			InstallRoot:         installRoot,
 			InstanceID:          instance.ID,
-			WorkDir:             workDir,
-			ArchiveRemote:       archiveRemote,
-			AgentBinaryRemote:   agentRemote,
+			WorkDir:             stage.Root,
+			ArchiveRemote:       stage.ArchiveRemote,
+			AgentBinaryRemote:   stage.AgentRemote,
 			ServiceOrder:        strings.Join(options.SelectedServices, " "),
 			ServiceApplications: serviceCatalogPairs(serviceDefinitions, options.SelectedServices, func(definition serviceDefinition) string { return definition.ApplicationName }),
 			ServicePorts: serviceCatalogPairs(serviceDefinitions, options.SelectedServices, func(definition serviceDefinition) string {
@@ -862,13 +877,13 @@ func (s Service) Install(ctx context.Context, req InstallRequest, resources []st
 			return err
 		}
 		defer os.Remove(scriptLocal)
-		if err := uploadkit.Upload(installCtx, s.remote, server, uploadkit.File{
+		if err := verifiedInstallUpload(installCtx, s.remote, server, stage, uploadkit.File{
 			LocalPath:      scriptLocal,
-			RemotePath:     scriptRemote,
+			RemotePath:     stage.ScriptRemote,
 			Mode:           0o755,
 			LogMessage:     copy.UploadScript,
 			FailureMessage: copy.UploadScriptFailed,
-		}, logForServer); err != nil {
+		}, copy, logForServer); err != nil {
 			return err
 		}
 		return nil
@@ -882,7 +897,7 @@ func (s Service) Install(ctx context.Context, req InstallRequest, resources []st
 
 	if err := step(5, func() error {
 		logForServer.Info(copy.Deploying)
-		result, err := installerkit.Run(installCtx, s.remote, server, "sh "+installerkit.ShellQuote(scriptRemote), logForServer, copy.RemoteCommandFailed)
+		result, err := installerkit.Run(installCtx, s.remote, server, "sh "+installerkit.ShellQuote(stage.ScriptRemote), logForServer, copy.RemoteCommandFailed)
 		if err != nil {
 			return err
 		}
@@ -969,6 +984,23 @@ func (s Service) Install(ctx context.Context, req InstallRequest, resources []st
 	logForServer.Info(copy.Installed, instance.ID)
 	finishTarget(recorder, target, "success", "")
 	return nil
+}
+
+func verifiedInstallUpload(ctx context.Context, remote installerkit.Remote, server store.Server, stage installArtifactStage, file uploadkit.File, copy Copy, log Logger) error {
+	_, err := uploadkit.UploadVerified(ctx, remote, server, uploadkit.VerifiedFile{
+		File:                   file,
+		StageRoot:              stage.Root,
+		VerificationLogMessage: copy.VerifyUpload,
+		VerificationLogArgs:    []any{filepath.Base(file.LocalPath)},
+	}, log)
+	switch {
+	case errors.Is(err, uploadkit.ErrChecksumMismatch):
+		return fmt.Errorf("AIFAR_ARTIFACT_CHECKSUM_MISMATCH: %s", copy.ChecksumMismatch)
+	case errors.Is(err, uploadkit.ErrVerificationFailed):
+		return fmt.Errorf("AIFAR_ARTIFACT_VERIFICATION_FAILED: %s", copy.VerificationFailed)
+	default:
+		return err
+	}
 }
 
 func installMetadata(server store.Server, installRoot, version, releaseID string, releaseTime time.Time, configHash string, options InstallOptions, actor string) map[string]any {
