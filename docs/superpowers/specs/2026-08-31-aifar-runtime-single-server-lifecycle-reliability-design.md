@@ -794,7 +794,7 @@ Planner 必须为每个目标服务生成不可变 `verificationProfile` 并写�
 
 | 阶段 | 功能 | 漏洞编号 | 当前状态 | 实际修复/文件/API/Schema | 自动化验证 | Commit/Push | 用户验证 | 剩余风险 |
 |---:|---|---|---|---|---|---|---|---|
-| 1 | 目标端 checksum 与安全暂存 | AIFAR-LC-001 | implemented-awaiting-user-validation | 操作级 `.aifar-lifecycle/install-<release>/stage` 暂存、bundle/Agent/script 目标端 SHA-256 与大小 fail-closed 校验；`uploadkit`、`apps/aifar` 初装路径及测试 | `pnpm test` exit 0；`pnpm test:scripts` 293/293 pass、exit 0（88,867ms）；`git diff --check` exit 0。Keepalived SHA256SUMS 先从索引恢复 LF 工作副本以消除 autocrlf 假阳性 | 3790ec89、7fd3be4d、476b77a7、ea2dad9f、1a26adae；已推送 `origin/codex/aifar-runtime-stage1-artifact-staging` | 等待用户按阶段 1 清单验证 | 平台 SSH 主机身份校验仍为残余风险；活动目录原子切换属阶段 3 |
+| 1 | 目标端 checksum 与安全暂存 | AIFAR-LC-001 | implemented-awaiting-user-validation | 操作级 `.aifar-lifecycle/install-<release>/stage` 暂存；安装根与暂存层级逐组件拒绝符号链接/非目录、非递归创建并复验精确 realpath；bundle/Agent/script 目标端 SHA-256 与大小 fail-closed 校验；上传失败与取消/超时使用稳定脱敏语义 | 最终修复后新鲜执行：`pnpm test` exit 0（AIFAR 207.113s）；`pnpm test:scripts` 293/293 pass、exit 0（85,720ms）；`git diff --check` exit 0。Keepalived SHA256SUMS 使用索引 LF 工作副本消除 autocrlf 假阳性 | 3790ec89、7fd3be4d、476b77a7、ea2dad9f、1a26adae、591b6279、f7e3c90a；已推送 `origin/codex/aifar-runtime-stage1-artifact-staging` | 等待用户按阶段 1 清单验证 | 平台 SSH 主机身份校验仍为残余风险；特权并发替换路径仍有 path-based TOCTOU 残余；真实 POSIX 符号链接行为测试仅在 Linux CI 执行；活动目录原子切换属阶段 3 |
 | 2 | 持久状态机与重启恢复 | AIFAR-LC-003、AIFAR-LC-004、AIFAR-LC-011、AIFAR-LC-012 | planned | 尚未实施 | 尚未执行阶段测试 | 尚未产生 | 尚未开始 | 单实例 SQLite 控制面仍非 HA |
 | 3 | 原子安装/重装 | AIFAR-LC-002、AIFAR-LC-003 | planned | 尚未实施 | 尚未执行阶段测试 | 尚未产生 | 尚未开始 | 业务专属深度烟测依赖服务能力 |
 | 4 | 原子单服务升级 | AIFAR-LC-005 | planned | 尚未实施 | 尚未执行阶段测试 | 尚未产生 | 尚未开始 | 单机资源不足仍可能导致补偿耗时 |
