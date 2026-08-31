@@ -2,8 +2,12 @@ package uploadkit
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
+	"fmt"
 	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"aifar-deployment/backend/internal/adapter"
@@ -11,16 +15,22 @@ import (
 )
 
 type fakeRemote struct {
-	local   string
-	remote  string
-	mode    os.FileMode
-	err     error
-	errs    []error
-	uploads int
+	local     string
+	remote    string
+	mode      os.FileMode
+	err       error
+	errs      []error
+	uploads   int
+	commands  []string
+	runResult adapter.CommandResult
+	runErr    error
+	events    []string
 }
 
 func (f *fakeRemote) Run(ctx context.Context, server store.Server, command string) (adapter.CommandResult, error) {
-	return adapter.CommandResult{}, nil
+	f.commands = append(f.commands, command)
+	f.events = append(f.events, "verify")
+	return f.runResult, f.runErr
 }
 
 func (f *fakeRemote) UploadFile(ctx context.Context, server store.Server, localPath, remotePath string, mode os.FileMode) error {
@@ -28,12 +38,110 @@ func (f *fakeRemote) UploadFile(ctx context.Context, server store.Server, localP
 	f.remote = remotePath
 	f.mode = mode
 	f.uploads++
+	f.events = append(f.events, "upload")
 	if len(f.errs) > 0 {
 		err := f.errs[0]
 		f.errs = f.errs[1:]
 		return err
 	}
 	return f.err
+}
+
+func TestUploadVerifiedProvesRemoteSHA256AndSizeAfterUpload(t *testing.T) {
+	local := filepath.Join(t.TempDir(), "bundle.tar.gz")
+	payload := []byte("verified-payload")
+	if err := os.WriteFile(local, payload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(payload)
+	remote := &fakeRemote{runResult: adapter.CommandResult{
+		Stdout: fmt.Sprintf("AIFAR_UPLOAD_VERIFY %x %d\n", sum, len(payload)),
+	}}
+	got, err := UploadVerified(context.Background(), remote, store.Server{}, VerifiedFile{
+		File:      File{LocalPath: local, RemotePath: "/aifar/apps/admin/.aifar-lifecycle/install-r1/stage/bundle.tar.gz"},
+		StageRoot: "/aifar/apps/admin/.aifar-lifecycle/install-r1/stage",
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.SHA256 != fmt.Sprintf("%x", sum) || got.Size != int64(len(payload)) {
+		t.Fatalf("unexpected verification: %+v", got)
+	}
+	if strings.Join(remote.events, ",") != "upload,verify" {
+		t.Fatalf("events=%v", remote.events)
+	}
+}
+
+func TestUploadVerifiedRejectsChecksumMismatchAndCommandsExactFileCleanup(t *testing.T) {
+	local := filepath.Join(t.TempDir(), "bundle.tar.gz")
+	if err := os.WriteFile(local, []byte("payload"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	remote := &fakeRemote{runResult: adapter.CommandResult{Stdout: "AIFAR_UPLOAD_VERIFY " + strings.Repeat("0", 64) + " 7\n"}}
+	_, err := UploadVerified(context.Background(), remote, store.Server{}, VerifiedFile{
+		File: File{LocalPath: local, RemotePath: "/stage/file"}, StageRoot: "/stage",
+	}, nil)
+	if !errors.Is(err, ErrChecksumMismatch) {
+		t.Fatalf("expected checksum mismatch, got %v", err)
+	}
+	if len(remote.commands) != 1 || !strings.Contains(remote.commands[0], `rm -f -- "$target"`) || !strings.Contains(remote.commands[0], "AIFAR_UPLOAD_VERIFY") {
+		t.Fatalf("unexpected verification command: %q", remote.commands)
+	}
+	if strings.Contains(remote.commands[0], "rm -rf") || strings.Contains(remote.commands[0], "rm -r ") {
+		t.Fatalf("recursive delete in command: %q", remote.commands[0])
+	}
+}
+
+func TestUploadVerifiedRejectsSizeMismatch(t *testing.T) {
+	local := filepath.Join(t.TempDir(), "bundle")
+	if err := os.WriteFile(local, []byte("payload"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256([]byte("payload"))
+	remote := &fakeRemote{runResult: adapter.CommandResult{Stdout: fmt.Sprintf("AIFAR_UPLOAD_VERIFY %x 8\n", sum)}}
+	_, err := UploadVerified(context.Background(), remote, store.Server{}, VerifiedFile{File: File{LocalPath: local, RemotePath: "/stage/file"}, StageRoot: "/stage"}, nil)
+	if !errors.Is(err, ErrChecksumMismatch) {
+		t.Fatalf("expected checksum mismatch, got %v", err)
+	}
+}
+
+func TestUploadVerifiedRejectsMalformedProof(t *testing.T) {
+	local := filepath.Join(t.TempDir(), "bundle")
+	if err := os.WriteFile(local, []byte("payload"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	remote := &fakeRemote{runResult: adapter.CommandResult{Stdout: "AIFAR_UPLOAD_VERIFY bad 7\n"}}
+	_, err := UploadVerified(context.Background(), remote, store.Server{}, VerifiedFile{File: File{LocalPath: local, RemotePath: "/stage/file"}, StageRoot: "/stage"}, nil)
+	if !errors.Is(err, ErrVerificationFailed) {
+		t.Fatalf("expected verification failure, got %v", err)
+	}
+}
+
+func TestUploadVerifiedRejectsRemoteVerificationFailureWithoutProof(t *testing.T) {
+	local := filepath.Join(t.TempDir(), "bundle")
+	if err := os.WriteFile(local, []byte("payload"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	remote := &fakeRemote{runErr: errors.New("remote failed")}
+	_, err := UploadVerified(context.Background(), remote, store.Server{}, VerifiedFile{File: File{LocalPath: local, RemotePath: "/stage/file"}, StageRoot: "/stage"}, nil)
+	if !errors.Is(err, ErrVerificationFailed) {
+		t.Fatalf("expected verification failure, got %v", err)
+	}
+}
+
+func TestUploadVerifiedRejectsPathOutsideStageBeforeUpload(t *testing.T) {
+	local := filepath.Join(t.TempDir(), "bundle")
+	if err := os.WriteFile(local, []byte("payload"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	remote := &fakeRemote{}
+	_, err := UploadVerified(context.Background(), remote, store.Server{}, VerifiedFile{File: File{LocalPath: local, RemotePath: "/stage-escape/file"}, StageRoot: "/stage"}, nil)
+	if !errors.Is(err, ErrVerificationFailed) {
+		t.Fatalf("expected verification failure, got %v", err)
+	}
+	if remote.uploads != 0 || len(remote.commands) != 0 {
+		t.Fatalf("remote was used: uploads=%d commands=%v", remote.uploads, remote.commands)
+	}
 }
 
 type fakeLogger struct {
