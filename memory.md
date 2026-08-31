@@ -9,3 +9,9 @@
 - 结论：标准 SDD 已写入 `docs/superpowers/specs/2026-08-31-aifar-runtime-single-server-lifecycle-reliability-design.md`，包含范围、现状证据、12 项风险、目标架构、专用事务表、状态机、成功门禁、重启恢复、十类数据流、API/前端/安全/测试、九阶段人工验收和修复台账；自审已消除占位符与既有 Runtime SDD 的成功语义冲突。当前仅形成设计文档，尚未修改业务代码，须待用户书面复核后再制定实施计划。
 - 问题：在用户确认标准 SDD 后制定可执行实施计划，同时保持每阶段人工验收暂停边界。
 - 结论：九阶段按顺序分别制定计划，当前仅形成阶段一 `docs/superpowers/plans/2026-08-31-aifar-runtime-stage-1-artifact-staging.md`。计划以 TDD 拆为 AIFAR 隔离暂存边界、目标端 SHA-256/大小校验、初装集成、回归与证据台账四个任务；bundle、agent 和安装脚本全部校验通过前禁止执行安装脚本。本阶段不修改 Agent Accepted/Ready 成功语义、生命周期新表、更新/回滚路径或 `install.sh` 活动目录切换；执行完成后必须通知用户并暂停验证。
+- 问题：实现阶段一 Task 1 的 AIFAR 初装操作级隔离暂存边界。
+- 结论：新增严格路径构造、目标端 realpath containment 校验、权限收紧、精确清理和成功标记；focused 测试与 git diff --check 通过。
+- 问题：实现阶段一 Task 2 目标端 fail-closed SHA-256/大小校验上传原语。
+- 结论：`uploadkit.UploadVerified` 已完成流式本地摘要、严格 POSIX 暂存路径校验、单行 proof 解析、目标端校验与单文件清理；新增 focused/package 测试通过并提交 `7fd3be4d`。
+- 问题：完成 AIFAR Runtime 阶段 1 的完整自动化门禁与证据台账。
+- 结论：阶段 1 已实现并等待用户验证；初装 bundle、Agent 与脚本均在操作级隔离暂存目录完成目标端 SHA-256/大小校验后才执行。`pnpm test`、`pnpm test:scripts`（293/293）和 diff 检查均通过；保留 SSH 主机身份与阶段 3 活动目录原子切换风险。
