@@ -994,6 +994,8 @@ func verifiedInstallUpload(ctx context.Context, remote installerkit.Remote, serv
 		VerificationLogArgs:    []any{filepath.Base(file.LocalPath)},
 	}, log)
 	switch {
+	case errors.Is(err, uploadkit.ErrUploadFailed):
+		return fmt.Errorf("AIFAR_ARTIFACT_UPLOAD_FAILED: %s", copy.UploadFailed)
 	case errors.Is(err, uploadkit.ErrChecksumMismatch):
 		return fmt.Errorf("AIFAR_ARTIFACT_CHECKSUM_MISMATCH: %s", copy.ChecksumMismatch)
 	case errors.Is(err, uploadkit.ErrVerificationFailed):

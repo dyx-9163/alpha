@@ -4,6 +4,9 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -14,6 +17,22 @@ import (
 type stagingRemote struct {
 	commands []string
 	err      error
+}
+
+type shellStagingRemote struct{}
+
+func (shellStagingRemote) Run(ctx context.Context, _ store.Server, command string) (adapter.CommandResult, error) {
+	cmd := exec.CommandContext(ctx, "sh", "-c", command)
+	stdout, err := cmd.Output()
+	result := adapter.CommandResult{Stdout: string(stdout)}
+	if exitErr, ok := err.(*exec.ExitError); ok {
+		result.Stderr = string(exitErr.Stderr)
+	}
+	return result, err
+}
+
+func (shellStagingRemote) UploadFile(context.Context, store.Server, string, string, os.FileMode) error {
+	return nil
 }
 
 func (r *stagingRemote) Run(_ context.Context, _ store.Server, command string) (adapter.CommandResult, error) {
@@ -86,6 +105,81 @@ func TestPrepareInstallArtifactStageChecksResolvedContainment(t *testing.T) {
 		if !strings.Contains(command, want) {
 			t.Fatalf("prepare command missing %q:\n%s", want, command)
 		}
+	}
+}
+
+func TestPrepareInstallArtifactStageCreatesAndValidatesOneComponentAtATime(t *testing.T) {
+	remote := &stagingRemote{}
+	stage, err := newInstallArtifactStage("/aifar/apps/admin", "release-1", "bundle.tar.gz", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := prepareInstallArtifactStage(context.Background(), remote, store.Server{}, "/aifar/apps/admin", stage, nil); err != nil {
+		t.Fatal(err)
+	}
+	command := strings.Join(remote.commands, "\n")
+	if strings.Contains(command, `mkdir -p "$install_root" "$stage_root"`) {
+		t.Fatalf("prepare recursively creates unchecked descendants:\n%s", command)
+	}
+	wants := []string{
+		`install_parent_real="$(readlink -f "$install_parent")"`,
+		`mkdir -- "$install_root"`,
+		`install_real="$(readlink -f "$install_root")"`,
+		`mkdir -- "$lifecycle_root"`,
+		`lifecycle_real="$(readlink -f "$lifecycle_root")"`,
+		`mkdir -- "$operation_root"`,
+		`operation_real="$(readlink -f "$operation_root")"`,
+		`mkdir -- "$stage_root"`,
+		`stage_real="$(readlink -f "$stage_root")"`,
+	}
+	last := -1
+	for _, want := range wants {
+		index := strings.Index(command, want)
+		if index < 0 || index <= last {
+			t.Fatalf("prepare command does not validate components in order at %q:\n%s", want, command)
+		}
+		last = index
+	}
+}
+
+func TestPrepareInstallArtifactStageRejectsParentSymlinksWithoutCreatingOutsideInstallRoot(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("requires POSIX symlink and shell semantics; the cross-platform command-order test remains active")
+	}
+	for _, tc := range []struct {
+		name         string
+		linkRelative string
+		escapedParts []string
+	}{
+		{name: "lifecycle", linkRelative: ".aifar-lifecycle", escapedParts: []string{"install-release-1", "stage"}},
+		{name: "operation", linkRelative: ".aifar-lifecycle/install-release-1", escapedParts: []string{"stage"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			parent := t.TempDir()
+			installRoot := filepath.ToSlash(filepath.Join(parent, "admin"))
+			outside := filepath.Join(parent, "outside")
+			link := filepath.Join(filepath.FromSlash(installRoot), filepath.FromSlash(tc.linkRelative))
+			if err := os.MkdirAll(filepath.Dir(link), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.MkdirAll(outside, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(outside, link); err != nil {
+				t.Fatal(err)
+			}
+			stage, err := newInstallArtifactStage(installRoot, "release-1", "bundle.tar.gz", "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := prepareInstallArtifactStage(context.Background(), shellStagingRemote{}, store.Server{}, installRoot, stage, nil); err == nil {
+				t.Fatalf("expected %s symlink to be rejected", tc.name)
+			}
+			escapedStage := filepath.Join(append([]string{outside}, tc.escapedParts...)...)
+			if _, err := os.Lstat(escapedStage); !os.IsNotExist(err) {
+				t.Fatalf("prepare created an outside descendant through the %s symlink: %s (err=%v)", tc.name, escapedStage, err)
+			}
+		})
 	}
 }
 

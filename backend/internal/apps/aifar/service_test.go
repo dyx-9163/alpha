@@ -1411,6 +1411,7 @@ type fakeRemote struct {
 	verificationMismatchAt  int
 	verificationFailureAt   int
 	verificationEvents      []string
+	uploadErr               error
 	bootstrapHashOverrides  map[string]string
 	bootstrapNameOverrides  map[string]string
 	deploymentManifests     map[string]runtimeagent.DeploymentManifest
@@ -1634,6 +1635,9 @@ func (f *fakeRemote) UploadFile(ctx context.Context, server store.Server, localP
 	defer f.mu.Unlock()
 	f.uploads = append(f.uploads, filepath.Base(localPath)+"->"+remotePath)
 	f.verificationEvents = append(f.verificationEvents, fmt.Sprintf("upload-%d", len(f.uploads)))
+	if f.uploadErr != nil {
+		return f.uploadErr
+	}
 	if strings.Contains(remotePath, "/mutations/") && strings.HasSuffix(remotePath, ".json") {
 		data, err := os.ReadFile(localPath)
 		if err != nil {
@@ -3735,6 +3739,51 @@ func TestInstallRejectsTargetChecksumMismatchBeforeRemoteExecution(t *testing.T)
 	}
 }
 
+func TestInstallRedactsVerifiedUploadFailureFromErrorTaskLogAndMetadata(t *testing.T) {
+	withFakeRuntimeAgentBinary(t)
+	root := createAIFARBundle(t)
+	secretLocal := "/control/private/build/bundle.tar.gz"
+	secretRemote := "/aifar/apps/admin/.aifar-lifecycle/install-secret/stage/bundle.tar.gz"
+	rawFailure := "permission denied copying " + secretLocal + " to " + secretRemote
+	for _, tc := range []struct {
+		language string
+		wantText string
+	}{
+		{language: "en", wantText: "could not be uploaded"},
+		{language: "zh", wantText: "无法将 AIFAR 文件上传到目标服务器"},
+	} {
+		t.Run(tc.language, func(t *testing.T) {
+			db := &fakeStore{servers: map[string]store.Server{
+				"srv-1": {ID: "srv-1", Host: "10.0.0.10", DeployDir: "/aifar/apps"},
+			}}
+			remote := &fakeRemote{uploadErr: errors.New(rawFailure)}
+			log := &messageLogger{}
+			err := NewService(db, remote).Install(context.Background(), InstallRequest{
+				Version: "latest", ServerID: "srv-1", Language: tc.language, TaskID: "task-safe-upload-failure",
+				Parameters: map[string]any{"nacosHost": "10.0.0.50"},
+			}, aifarModuleValidationResources(root), log, nil)
+			if err == nil || !strings.Contains(err.Error(), "AIFAR_ARTIFACT_UPLOAD_FAILED") || !strings.Contains(err.Error(), tc.wantText) {
+				t.Fatalf("expected stable localized upload failure, got %v", err)
+			}
+			if len(db.instances) != 1 || db.instances[0].Status != "install_failed" {
+				t.Fatalf("expected stored failed install, instances=%+v", db.instances)
+			}
+			metadataError := fmt.Sprint(metadataFromInstance(db.instances[0])["error"])
+			for label, output := range map[string]string{
+				"returned error": err.Error(),
+				"task logger":    log.joined(),
+				"metadata":       metadataError,
+			} {
+				for _, forbidden := range []string{secretLocal, secretRemote, rawFailure, "permission denied"} {
+					if strings.Contains(output, forbidden) {
+						t.Fatalf("%s leaked %q: %s", label, forbidden, output)
+					}
+				}
+			}
+		})
+	}
+}
+
 func TestInstallVerifiesBundleAgentAndScriptBeforeExecution(t *testing.T) {
 	withFakeRuntimeAgentBinary(t)
 	root := createAIFARBundle(t)
@@ -4312,7 +4361,7 @@ func TestConcurrentFailedInstallRetriesHaveOnePersistentAttemptOwner(t *testing.
 		Version: "latest", ServerID: "srv-1", Language: "en", TaskID: "initial-failure",
 		Parameters: map[string]any{"nacosHost": "10.0.0.50", "selectedServices": []string{"gateway"}, "appMemoryLimit": "2GB"},
 	}
-	remote := &fakeRemote{failCommandContains: "mkdir -p"}
+	remote := &fakeRemote{failCommandContains: `mkdir -- "$stage_root"`}
 	if err := NewService(db, remote).Install(context.Background(), baseRequest, resources, fakeLogger{}, nil); err == nil {
 		t.Fatal("initial attempt must fail before generation-1 desired state is created")
 	}

@@ -285,6 +285,7 @@ type Copy struct {
 	UploadScript          string
 	UploadScriptFailed    string
 	VerifyUpload          string
+	UploadFailed          string
 	ChecksumMismatch      string
 	VerificationFailed    string
 	StageCleanupFailed    string
@@ -383,6 +384,7 @@ func copyFor(lang string) Copy {
 			UploadScript:          "uploading AIFAR service install script",
 			UploadScriptFailed:    "upload AIFAR service install script",
 			VerifyUpload:          "verified uploaded file on target server: %s",
+			UploadFailed:          "the AIFAR file could not be uploaded to the target server",
 			ChecksumMismatch:      "the uploaded AIFAR file failed the target SHA-256 or size check",
 			VerificationFailed:    "the uploaded AIFAR file could not be verified on the target server",
 			StageCleanupFailed:    "clean up AIFAR install staging directory failed: %v",
@@ -421,6 +423,7 @@ func copyFor(lang string) Copy {
 		UploadScript:          "上传 AIFAR 服务安装脚本",
 		UploadScriptFailed:    "上传 AIFAR 服务安装脚本失败",
 		VerifyUpload:          "目标服务器上传文件校验通过：%s",
+		UploadFailed:          "无法将 AIFAR 文件上传到目标服务器",
 		ChecksumMismatch:      "上传的 AIFAR 文件未通过目标端 SHA-256 或大小校验",
 		VerificationFailed:    "无法在目标服务器上验证上传的 AIFAR 文件",
 		StageCleanupFailed:    "清理 AIFAR 安装暂存目录失败：%v",

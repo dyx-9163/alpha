@@ -35,6 +35,7 @@ var uploadRetryDelay = 2 * time.Second
 var (
 	ErrChecksumMismatch   = errors.New("uploaded file checksum mismatch")
 	ErrVerificationFailed = errors.New("uploaded file verification failed")
+	ErrUploadFailed       = errors.New("uploaded file transfer failed")
 )
 
 type VerifiedFile struct {
@@ -57,8 +58,8 @@ func UploadVerified(ctx context.Context, remote installerkit.Remote, server stor
 	if err != nil {
 		return Verification{}, fmt.Errorf("%w: calculate local checksum", ErrVerificationFailed)
 	}
-	if err := Upload(ctx, remote, server, file.File, log); err != nil {
-		return Verification{}, err
+	if err := upload(ctx, remote, server, file.File, log, false); err != nil {
+		return Verification{}, ErrUploadFailed
 	}
 	result, runErr := remote.Run(ctx, server, verificationCommand(file.StageRoot, file.RemotePath, expectedSHA, expectedSize))
 	proof, proofErr := parseVerificationMarker(result.Stdout)
@@ -153,6 +154,10 @@ func verificationCommand(stageRoot, remotePath, expectedSHA string, expectedSize
 }
 
 func Upload(ctx context.Context, remote installerkit.Remote, server store.Server, file File, log installerkit.Logger) error {
+	return upload(ctx, remote, server, file, log, true)
+}
+
+func upload(ctx context.Context, remote installerkit.Remote, server store.Server, file File, log installerkit.Logger, logRawRetryError bool) error {
 	if file.Mode == 0 {
 		file.Mode = 0o644
 	}
@@ -174,7 +179,11 @@ func Upload(ctx context.Context, remote installerkit.Remote, server store.Server
 			break
 		}
 		if log != nil {
-			log.Info("upload failed, retrying (%d/%d): %v", attempt+1, maxAttempts, err)
+			if logRawRetryError {
+				log.Info("upload failed, retrying (%d/%d): %v", attempt+1, maxAttempts, err)
+			} else {
+				log.Info("upload failed, retrying (%d/%d)", attempt+1, maxAttempts)
+			}
 		}
 		if err := sleepContext(ctx, uploadRetryDelay); err != nil {
 			lastErr = err

@@ -181,6 +181,72 @@ func TestUploadVerifiedDoesNotLogProofOutputOrTargetErrors(t *testing.T) {
 	}
 }
 
+func TestUploadVerifiedReturnsTypedSafeErrorForPathBearingUploadFailures(t *testing.T) {
+	local := filepath.Join(t.TempDir(), "bundle")
+	if err := os.WriteFile(local, []byte("payload"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name   string
+		secret string
+	}{
+		{name: "local path", secret: "/control/private/build/bundle.tar.gz"},
+		{name: "remote path", secret: "/aifar/apps/admin/.aifar-lifecycle/install-secret/stage/bundle.tar.gz"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			remote := &fakeRemote{err: fmt.Errorf("permission denied copying %s", tc.secret)}
+			_, err := UploadVerified(context.Background(), remote, store.Server{}, VerifiedFile{
+				File: File{LocalPath: local, RemotePath: "/stage/file", MaxAttempts: 1}, StageRoot: "/stage",
+			}, nil)
+			if !errors.Is(err, ErrUploadFailed) {
+				t.Fatalf("expected typed safe upload failure, got %v", err)
+			}
+			if strings.Contains(err.Error(), tc.secret) || strings.Contains(err.Error(), "permission denied") {
+				t.Fatalf("raw upload failure leaked from verified upload: %v", err)
+			}
+		})
+	}
+}
+
+func TestUploadVerifiedRetriesTransientFailureWithoutLoggingPaths(t *testing.T) {
+	oldDelay := uploadRetryDelay
+	uploadRetryDelay = 0
+	t.Cleanup(func() { uploadRetryDelay = oldDelay })
+
+	local := filepath.Join(t.TempDir(), "bundle")
+	payload := []byte("payload")
+	if err := os.WriteFile(local, payload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(payload)
+	secretLocal := "/control/private/build/bundle.tar.gz"
+	secretRemote := "/aifar/apps/admin/.aifar-lifecycle/install-secret/stage/bundle.tar.gz"
+	remote := &fakeRemote{
+		errs: []error{fmt.Errorf("EOF copying %s to %s", secretLocal, secretRemote), nil},
+		runResult: adapter.CommandResult{
+			Stdout: fmt.Sprintf("AIFAR_UPLOAD_VERIFY %x %d\n", sum, len(payload)),
+		},
+	}
+	log := &fakeLogger{}
+	if _, err := UploadVerified(context.Background(), remote, store.Server{}, VerifiedFile{
+		File: File{LocalPath: local, RemotePath: "/stage/file"}, StageRoot: "/stage",
+	}, log); err != nil {
+		t.Fatal(err)
+	}
+	if remote.uploads != 2 {
+		t.Fatalf("expected verified upload to retain retry behavior, attempts=%d", remote.uploads)
+	}
+	output := strings.Join(append(log.infos, log.errors...), "\n")
+	for _, forbidden := range []string{secretLocal, secretRemote, "EOF copying"} {
+		if strings.Contains(output, forbidden) {
+			t.Fatalf("verified upload retry log leaked %q: %s", forbidden, output)
+		}
+	}
+	if !strings.Contains(output, "upload failed, retrying (2/3)") {
+		t.Fatalf("safe retry diagnostic missing: %s", output)
+	}
+}
+
 type fakeLogger struct {
 	message string
 	args    []any
