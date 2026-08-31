@@ -2,12 +2,8 @@
 
 本文件只保留**当天（YYYY-MM-DD）**的精简问题与结论。每次写入前必须执行"写入守卫"流程（见 AGENTS.md）。历史条目自动归档到 `memory/YYYY-MM-DD.md`。禁止写入密码、token、私钥、完整连接串和长日志。
 
-## 2026-08-28
-- 问题：现场批量更新 9 个 AIFAR Runtime 服务在步骤 1 报 `AIFAR_RUNTIME_DEPLOYMENT_GENERATION_CONFLICT`，随后安装缺失模块后部分服务仍为 `NoEndpoints`。
-- 结论：批量任务执行时仅存在 gateway、oauth、permission、system 四个后端 Deployment，contacts、file、im、meeting、message 后续才以 generation 1 创建；`loadDeploymentForMutation` 将目标 Deployment 不存在复用为 generation-conflict 机器码和文案，因此本次“被其他任务更新”是误导提示，任务在上传/发布前失败且未造成部分批量发布。Agent 恢复后 oauth、permission、system 已观察到目标 generation 但 0/1、`NoEndpoints`，属于容器/健康端点问题，需查 Docker 状态、日志、Agent 持久 spec 与 journal，不能再归因于 Agent 断连。
-- 问题：远程只读排查 192.168.74.143 上 Runtime 重启后大面积 `NoEndpoints`、服务不健康及三个服务无法创建容器。
-- 结论：16:02:01 root Bash 执行 `systemctl stop firewalld` 后 Docker 的 `DOCKER-*`、FORWARD 和 NAT/MASQUERADE 规则被清空，现场仅剩 `FORWARD DROP`，容器无法访问 `.141/.142:26379` 和外部 DNS，而宿主机可达，导致 Java 服务等待 Redis Sentinel、健康端口不监听并被 Agent 反复自愈；`oauth/permission/system` 另因目标镜像标签已不存在而保持 0/1，Docker 尝试从公网拉取失败。修复应先恢复 Docker 网络规则并验证容器出站，再通过受控制品更新重建缺失镜像；不要直接归因于 Agent 或 OOM。
-- 问题：AIFAR Runtime 安装或重装过程中 Agent 暂时不可用时，页面整块隐藏部署信息，用户无法观察安装进度。
-- 结论：提交 `b4918440` 显式引入了 Agent 非 `running` 时清空运行时实例并隐藏工作区的逻辑；现已改为保留并展示最近一次运行时数据、明确标注数据可能暂时过期，同时继续通过既有门禁禁用所有变更操作。回归测试先在旧逻辑上失败，修复后完整前端 498 项测试及生产构建通过。
-- 问题：新增 AIFAR Runtime 服务已被 Agent 接收并运行后，安装任务最终提交仍报 `AIFAR deployment generation conflict`，后续整包更新又误报部分服务未被 Agent 接收。
-- 结论：实时 Docker 采集会把已接收 Deployment 的状态投影为 `ready` 或 `no-endpoints`，而最终提交证明未识别这两个真实状态，导致实例服务目录未原子提交；现已在保持 generation、revision、spec 精确校验的前提下认可当前代际的两种运行时投影，并让批量失败摘要展示真实首因而非统一误报 Agent 拒绝。
+## 2026-08-31
+- 问题：审计 AIFAR 应用部署运维整体代码，并根据代码漏洞形成标准 SDD 与后续修复方案。
+- 结论：本次 SDD 仅覆盖单服务器 AIFAR Runtime 完整生命周期，采用事务化生命周期控制器、目标状态验收失败自动恢复、默认可恢复卸载与独立高风险彻底清除。实施按已确认的九阶段顺序且一次只修复一个功能；每项完成后将修复内容、测试、提交和人工验证状态写入 SDD，通知用户并暂停，用户明确“继续”后才进入下一项。现状审计确认：成功门禁仅证明 Agent 接收期望状态，未证明目标 revision Ready/Available 或业务健康；初装缺少目标端 SHA-256 复验并提前替换运行目录；运行中任务重启后直接失败。关键后端包和前端 498 项测试通过，但未覆盖这些一致性风险。用户已确认新增 `aifar_lifecycle_operations` 持久事务日志，并以目标端 checksum、精确 generation/specHash、ObservedGeneration、目标 revision、全部 Ready/Available、服务烟测及连续稳定窗口作为成功门禁；Panel 重启按检查点观察后继续或补偿，无法证明时进入 `needs_attention`。安装、单服务升级、整包升级、扩缩容/下线/重启、回滚/对账恢复、可恢复卸载和彻底清除均采用“预检与不可变暂存—目标端校验—保存前态—切换—健康验收—提交”，失败时恢复最近已验证状态；进入提交或补偿阶段后不可取消。
+- 问题：把已确认的 AIFAR Runtime 单服务器生命周期可靠闭环设计固化为可评审、可实施和可逐阶段验收的标准 SDD。
+- 结论：标准 SDD 已写入 `docs/superpowers/specs/2026-08-31-aifar-runtime-single-server-lifecycle-reliability-design.md`，包含范围、现状证据、12 项风险、目标架构、专用事务表、状态机、成功门禁、重启恢复、十类数据流、API/前端/安全/测试、九阶段人工验收和修复台账；自审已消除占位符与既有 Runtime SDD 的成功语义冲突。当前仅形成设计文档，尚未修改业务代码，须待用户书面复核后再制定实施计划。
