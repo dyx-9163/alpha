@@ -122,8 +122,9 @@ func TestPrepareInstallArtifactStageCreatesAndValidatesOneComponentAtATime(t *te
 		t.Fatalf("prepare recursively creates unchecked descendants:\n%s", command)
 	}
 	wants := []string{
-		`install_parent_real="$(readlink -f "$install_parent")"`,
-		`mkdir -- "$install_root"`,
+		`root_real="$(readlink -f "/")"`,
+		`mkdir -- "$next"`,
+		`next_real="$(readlink -f "$next")"`,
 		`install_real="$(readlink -f "$install_root")"`,
 		`mkdir -- "$lifecycle_root"`,
 		`lifecycle_real="$(readlink -f "$lifecycle_root")"`,
@@ -139,6 +140,78 @@ func TestPrepareInstallArtifactStageCreatesAndValidatesOneComponentAtATime(t *te
 			t.Fatalf("prepare command does not validate components in order at %q:\n%s", want, command)
 		}
 		last = index
+	}
+}
+
+func TestPrepareInstallArtifactStageWalksInstallRootFromValidatedRoot(t *testing.T) {
+	remote := &stagingRemote{}
+	stage, err := newInstallArtifactStage("/aifar/apps/admin", "release-1", "bundle.tar.gz", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := prepareInstallArtifactStage(context.Background(), remote, store.Server{}, "/aifar/apps/admin", stage, nil); err != nil {
+		t.Fatal(err)
+	}
+	command := strings.Join(remote.commands, "\n")
+	for _, want := range []string{
+		`remaining="${install_root#/}"`,
+		`next="$current/$component"`,
+		`if [ -e "$next" ] || [ -L "$next" ]; then`,
+		`mkdir -- "$next"`,
+		`next_real="$(readlink -f "$next")"`,
+		`[ "$next_real" = "$next" ]`,
+	} {
+		if !strings.Contains(command, want) {
+			t.Fatalf("install-root walk missing %q:\n%s", want, command)
+		}
+	}
+	if strings.Contains(command, `install_parent="${install_root%/*}"`) {
+		t.Fatalf("prepare still requires the immediate install-root parent to exist:\n%s", command)
+	}
+}
+
+func TestPrepareInstallArtifactStageCreatesMissingInstallRootHierarchy(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("requires POSIX shell semantics; the cross-platform root-walk contract remains active")
+	}
+	parent := t.TempDir()
+	installRoot := filepath.ToSlash(filepath.Join(parent, "aifar", "apps", "admin"))
+	stage, err := newInstallArtifactStage(installRoot, "release-1", "bundle.tar.gz", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := prepareInstallArtifactStage(context.Background(), shellStagingRemote{}, store.Server{}, installRoot, stage, nil); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Lstat(filepath.FromSlash(stage.Root))
+	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		t.Fatalf("missing install hierarchy was not safely created: info=%v err=%v", info, err)
+	}
+}
+
+func TestPrepareInstallArtifactStageRejectsSymlinkAncestorWithoutCreatingOutsideInstallRoot(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("requires POSIX symlink and shell semantics; the cross-platform root-walk contract remains active")
+	}
+	parent := t.TempDir()
+	outside := filepath.Join(parent, "outside")
+	if err := os.MkdirAll(outside, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(parent, "aifar")); err != nil {
+		t.Fatal(err)
+	}
+	installRoot := filepath.ToSlash(filepath.Join(parent, "aifar", "apps", "admin"))
+	stage, err := newInstallArtifactStage(installRoot, "release-1", "bundle.tar.gz", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := prepareInstallArtifactStage(context.Background(), shellStagingRemote{}, store.Server{}, installRoot, stage, nil); err == nil {
+		t.Fatal("expected install-root symlink ancestor to be rejected")
+	}
+	escapedInstallRoot := filepath.Join(outside, "apps", "admin")
+	if _, err := os.Lstat(escapedInstallRoot); !os.IsNotExist(err) {
+		t.Fatalf("prepare created an install hierarchy through a symlink ancestor: %s (err=%v)", escapedInstallRoot, err)
 	}
 }
 

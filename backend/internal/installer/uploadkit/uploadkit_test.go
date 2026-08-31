@@ -247,6 +247,45 @@ func TestUploadVerifiedRetriesTransientFailureWithoutLoggingPaths(t *testing.T) 
 	}
 }
 
+func TestUploadVerifiedPreservesSafeContextIdentity(t *testing.T) {
+	local := filepath.Join(t.TempDir(), "bundle")
+	payload := []byte("payload")
+	if err := os.WriteFile(local, payload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	secret := "/control/private/build/bundle.tar.gz"
+	for _, tc := range []struct {
+		name       string
+		phase      string
+		contextErr error
+		fallback   error
+	}{
+		{name: "upload canceled", phase: "upload", contextErr: context.Canceled, fallback: ErrUploadFailed},
+		{name: "upload deadline", phase: "upload", contextErr: context.DeadlineExceeded, fallback: ErrUploadFailed},
+		{name: "verification canceled", phase: "verify", contextErr: context.Canceled, fallback: ErrVerificationFailed},
+		{name: "verification deadline", phase: "verify", contextErr: context.DeadlineExceeded, fallback: ErrVerificationFailed},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rawErr := fmt.Errorf("operation on %s: %w", secret, tc.contextErr)
+			remote := &fakeRemote{}
+			if tc.phase == "upload" {
+				remote.err = rawErr
+			} else {
+				remote.runErr = rawErr
+			}
+			_, err := UploadVerified(context.Background(), remote, store.Server{}, VerifiedFile{
+				File: File{LocalPath: local, RemotePath: "/stage/file", MaxAttempts: 1}, StageRoot: "/stage",
+			}, nil)
+			if !errors.Is(err, tc.contextErr) || !errors.Is(err, tc.fallback) {
+				t.Fatalf("context/fallback identity lost: err=%v context=%v fallback=%v", err, tc.contextErr, tc.fallback)
+			}
+			if strings.Contains(err.Error(), secret) || strings.Contains(err.Error(), "operation on") {
+				t.Fatalf("context error leaked raw path text: %v", err)
+			}
+		})
+	}
+}
+
 type fakeLogger struct {
 	message string
 	args    []any

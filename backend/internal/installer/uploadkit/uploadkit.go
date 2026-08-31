@@ -59,9 +59,21 @@ func UploadVerified(ctx context.Context, remote installerkit.Remote, server stor
 		return Verification{}, fmt.Errorf("%w: calculate local checksum", ErrVerificationFailed)
 	}
 	if err := upload(ctx, remote, server, file.File, log, false); err != nil {
-		return Verification{}, ErrUploadFailed
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			err = ctxErr
+		}
+		return Verification{}, safeFailureWithContext(ErrUploadFailed, err)
 	}
 	result, runErr := remote.Run(ctx, server, verificationCommand(file.StageRoot, file.RemotePath, expectedSHA, expectedSize))
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		runErr = ctxErr
+	}
+	if errors.Is(runErr, context.Canceled) || errors.Is(runErr, context.DeadlineExceeded) {
+		if log != nil {
+			log.Error("uploaded file verification failed")
+		}
+		return Verification{}, safeFailureWithContext(ErrVerificationFailed, runErr)
+	}
 	proof, proofErr := parseVerificationMarker(result.Stdout)
 	if proofErr != nil {
 		if log != nil {
@@ -85,6 +97,17 @@ func UploadVerified(ctx context.Context, remote installerkit.Remote, server stor
 		log.Info(file.VerificationLogMessage, file.VerificationLogArgs...)
 	}
 	return proof, nil
+}
+
+func safeFailureWithContext(fallback, err error) error {
+	switch {
+	case errors.Is(err, context.Canceled):
+		return fmt.Errorf("%w: %w", fallback, context.Canceled)
+	case errors.Is(err, context.DeadlineExceeded):
+		return fmt.Errorf("%w: %w", fallback, context.DeadlineExceeded)
+	default:
+		return fallback
+	}
 }
 
 func localSHA256(pathname string) (string, int64, error) {

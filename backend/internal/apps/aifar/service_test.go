@@ -3784,6 +3784,50 @@ func TestInstallRedactsVerifiedUploadFailureFromErrorTaskLogAndMetadata(t *testi
 	}
 }
 
+func TestInstallPreservesSafeVerifiedUploadContextInErrorTaskLogAndMetadata(t *testing.T) {
+	withFakeRuntimeAgentBinary(t)
+	root := createAIFARBundle(t)
+	secretLocal := "/control/private/build/bundle.tar.gz"
+	secretRemote := "/aifar/apps/admin/.aifar-lifecycle/install-secret/stage/bundle.tar.gz"
+	for _, tc := range []struct {
+		name       string
+		contextErr error
+	}{
+		{name: "canceled", contextErr: context.Canceled},
+		{name: "deadline", contextErr: context.DeadlineExceeded},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db := &fakeStore{servers: map[string]store.Server{
+				"srv-1": {ID: "srv-1", Host: "10.0.0.10", DeployDir: "/aifar/apps"},
+			}}
+			rawFailure := fmt.Errorf("copy %s to %s: %w", secretLocal, secretRemote, tc.contextErr)
+			log := &messageLogger{}
+			err := NewService(db, &fakeRemote{uploadErr: rawFailure}).Install(context.Background(), InstallRequest{
+				Version: "latest", ServerID: "srv-1", Language: "en", TaskID: "task-safe-upload-context",
+				Parameters: map[string]any{"nacosHost": "10.0.0.50"},
+			}, aifarModuleValidationResources(root), log, nil)
+			if !errors.Is(err, tc.contextErr) {
+				t.Fatalf("expected context identity, got %v", err)
+			}
+			if len(db.instances) != 1 || db.instances[0].Status != "install_failed" {
+				t.Fatalf("expected stored failed install, instances=%+v", db.instances)
+			}
+			metadataError := fmt.Sprint(metadataFromInstance(db.instances[0])["error"])
+			for label, output := range map[string]string{
+				"returned error": err.Error(),
+				"task logger":    log.joined(),
+				"metadata":       metadataError,
+			} {
+				for _, forbidden := range []string{secretLocal, secretRemote, "copy " + secretLocal, "AIFAR_ARTIFACT_UPLOAD_FAILED"} {
+					if strings.Contains(output, forbidden) {
+						t.Fatalf("%s leaked or mislabeled %q: %s", label, forbidden, output)
+					}
+				}
+			}
+		})
+	}
+}
+
 func TestInstallVerifiesBundleAgentAndScriptBeforeExecution(t *testing.T) {
 	withFakeRuntimeAgentBinary(t)
 	root := createAIFARBundle(t)
