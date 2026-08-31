@@ -55,21 +55,29 @@ func UploadVerified(ctx context.Context, remote installerkit.Remote, server stor
 	}
 	expectedSHA, expectedSize, err := localSHA256(file.LocalPath)
 	if err != nil {
-		return Verification{}, fmt.Errorf("%w: calculate local checksum: %v", ErrVerificationFailed, err)
+		return Verification{}, fmt.Errorf("%w: calculate local checksum", ErrVerificationFailed)
 	}
 	if err := Upload(ctx, remote, server, file.File, log); err != nil {
 		return Verification{}, err
 	}
 	result, runErr := remote.Run(ctx, server, verificationCommand(file.StageRoot, file.RemotePath, expectedSHA, expectedSize))
-	installerkit.LogCommandResult(result, runErr, log)
 	proof, proofErr := parseVerificationMarker(result.Stdout)
 	if proofErr != nil {
+		if log != nil {
+			log.Error("uploaded file verification failed")
+		}
 		return Verification{}, fmt.Errorf("%w: target did not return a valid proof", ErrVerificationFailed)
 	}
 	if proof.SHA256 != expectedSHA || proof.Size != expectedSize {
+		if log != nil {
+			log.Error("uploaded file verification failed")
+		}
 		return Verification{}, fmt.Errorf("%w", ErrChecksumMismatch)
 	}
 	if runErr != nil {
+		if log != nil {
+			log.Error("uploaded file verification failed")
+		}
 		return Verification{}, fmt.Errorf("%w: target verification command failed", ErrVerificationFailed)
 	}
 	if log != nil && strings.TrimSpace(file.VerificationLogMessage) != "" {

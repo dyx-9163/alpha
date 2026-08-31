@@ -144,17 +144,59 @@ func TestUploadVerifiedRejectsPathOutsideStageBeforeUpload(t *testing.T) {
 	}
 }
 
+func TestUploadVerifiedRedactsLocalChecksumPathOnFailure(t *testing.T) {
+	local := filepath.Join(t.TempDir(), "missing-bundle.tar.gz")
+	_, err := UploadVerified(context.Background(), &fakeRemote{}, store.Server{}, VerifiedFile{
+		File: File{LocalPath: local, RemotePath: "/stage/file"}, StageRoot: "/stage",
+	}, nil)
+	if !errors.Is(err, ErrVerificationFailed) {
+		t.Fatalf("expected verification failure, got %v", err)
+	}
+	if strings.Contains(err.Error(), local) {
+		t.Fatalf("local path leaked in error: %v", err)
+	}
+}
+
+func TestUploadVerifiedDoesNotLogProofOutputOrTargetErrors(t *testing.T) {
+	local := filepath.Join(t.TempDir(), "bundle")
+	payload := []byte("payload")
+	if err := os.WriteFile(local, payload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(payload)
+	target := "/stage/secret/bundle"
+	remote := &fakeRemote{runResult: adapter.CommandResult{
+		Stdout: fmt.Sprintf("AIFAR_UPLOAD_VERIFY %x %d\n", sum, len(payload)),
+		Stderr: "stat: cannot read " + target,
+	}}
+	log := &fakeLogger{}
+	if _, err := UploadVerified(context.Background(), remote, store.Server{}, VerifiedFile{
+		File: File{LocalPath: local, RemotePath: target}, StageRoot: "/stage",
+	}, log); err != nil {
+		t.Fatal(err)
+	}
+	output := strings.Join(append(log.infos, log.errors...), "\n")
+	if strings.Contains(output, fmt.Sprintf("%x", sum)) || strings.Contains(output, target) || strings.Contains(output, "AIFAR_UPLOAD_VERIFY") {
+		t.Fatalf("proof output leaked to logger: %q", output)
+	}
+}
+
 type fakeLogger struct {
 	message string
 	args    []any
+	infos   []string
+	errors  []string
 }
 
 func (f *fakeLogger) Info(format string, args ...any) {
 	f.message = format
 	f.args = args
+	f.infos = append(f.infos, fmt.Sprintf(format, args...))
 }
 
-func (f *fakeLogger) Error(format string, args ...any) {}
+func (f *fakeLogger) Error(format string, args ...any) {
+	f.errors = append(f.errors, fmt.Sprintf(format, args...))
+}
 
 func TestUploadLogsAndDefaultsMode(t *testing.T) {
 	remote := &fakeRemote{}
