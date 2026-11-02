@@ -362,11 +362,14 @@ type RuntimeRestartRequest struct {
 }
 
 type RuntimeMigrationRequest struct {
-	Instance store.AppInstance
-	Server   store.Server
-	Actor    string
-	TaskID   string
-	Reason   string
+	Instance  store.AppInstance
+	Server    store.Server
+	Actor     string
+	TaskID    string
+	Reason    string
+	Language  string
+	OnPhase   func(string)
+	TryCommit func() bool
 }
 
 type RuntimeCleanupRequest struct {

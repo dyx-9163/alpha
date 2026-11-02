@@ -77,6 +77,17 @@ func (s *Store) CommitAIFARRuntimeMigrationWithLock(commit AIFARRuntimeMigration
 	if err := fenceActiveAIFARRuntimeMigrationLockTx(tx, commit.LockID, commit.InstanceID, time.Now().UTC()); err != nil {
 		return AppInstance{}, err
 	}
+	// Legacy versions persisted time.Time.String(), including a monotonic suffix.
+	// Compare instants, then fence the write with the exact persisted token within
+	// this transaction; re-encoding the scanned time would never match that text.
+	var persistedUpdatedAt time.Time
+	var updatedAtToken string
+	if err := tx.QueryRow(`select updated_at, cast(updated_at as text) from app_instances where id=? and app='aifar'`, commit.InstanceID).Scan(&persistedUpdatedAt, &updatedAtToken); err != nil {
+		return AppInstance{}, err
+	}
+	if !persistedUpdatedAt.Equal(commit.ExpectedInstanceUpdatedAt) {
+		return AppInstance{}, ErrAppInstanceConflict
+	}
 
 	rows, err := tx.Query(`select service_name from aifar_deployments where instance_id=? order by service_name`, commit.InstanceID)
 	if err != nil {
@@ -139,7 +150,7 @@ func (s *Store) CommitAIFARRuntimeMigrationWithLock(commit AIFARRuntimeMigration
 		freshUpdatedAt = commit.ExpectedInstanceUpdatedAt.Add(time.Millisecond)
 	}
 	result, err := tx.Exec(`update app_instances set metadata=?,updated_at=? where id=? and app='aifar' and updated_at=?`,
-		commit.NextMetadata, freshUpdatedAt, commit.InstanceID, commit.ExpectedInstanceUpdatedAt)
+		commit.NextMetadata, freshUpdatedAt, commit.InstanceID, updatedAtToken)
 	if err != nil {
 		return AppInstance{}, err
 	}

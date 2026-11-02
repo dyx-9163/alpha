@@ -572,6 +572,29 @@ func TestMigrationResumesAfterAgentSwitchBeforeServerCommit(t *testing.T) {
 	}
 }
 
+func TestRuntimeMigrationCancellationWinsBeforeControlCommit(t *testing.T) {
+	control, remote, req := runtimeMigrationFixture(t, 1)
+	req.TryCommit = func() bool { return false }
+	err := NewService(control, remote).MigrateRuntimeModel(context.Background(), req, fakeLogger{})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected cancellation, got %v", err)
+	}
+	if !remote.agentHasSwitched {
+		t.Fatal("expected resumable post-switch boundary")
+	}
+	saved, _ := control.GetAppInstance(req.Instance.ID)
+	if IsServiceControllerModel(stringFromMetadata(metadataFromInstance(saved), "orchestrationModel", "")) {
+		t.Fatal("committed after cancellation won")
+	}
+	req.TryCommit = func() bool { return true }
+	if err := NewService(control, remote).MigrateRuntimeModel(context.Background(), req, fakeLogger{}); err != nil {
+		t.Fatal(err)
+	}
+	if remote.bootstrapCalls != 1 {
+		t.Fatal("resume replayed bootstrap")
+	}
+}
+
 func TestRuntimeMigrationUsesAgentDurableArchiveInsteadOfShellMove(t *testing.T) {
 	control, remote, req := runtimeMigrationFixture(t, 1)
 	remote.agentHasSwitched = true

@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"aifar-deployment/backend/internal/adapter"
+	"aifar-deployment/backend/internal/i18n"
 	"aifar-deployment/backend/internal/installer/installerkit"
 	"aifar-deployment/backend/internal/runtimeagent"
 	"aifar-deployment/backend/internal/store"
@@ -76,6 +77,12 @@ type runtimeMigrationRemoteState struct {
 // from exact generation/spec-hash readback and never by replaying an older
 // desired generation.
 func (s Service) MigrateRuntimeModel(ctx context.Context, req RuntimeMigrationRequest, log Logger) (returnedErr error) {
+	phase := func(name string) {
+		if req.OnPhase != nil {
+			req.OnPhase(name)
+		}
+	}
+	phase("preflight")
 	if strings.TrimSpace(req.Instance.ID) == "" || req.Instance.App != AppName || strings.TrimSpace(req.Server.ID) == "" || req.Instance.ServerID != req.Server.ID {
 		return repairRequired("AIFAR_RUNTIME_MIGRATION_TARGET_INVALID", nil)
 	}
@@ -149,9 +156,10 @@ func (s Service) MigrateRuntimeModel(ctx context.Context, req RuntimeMigrationRe
 		return err
 	}
 	if log != nil {
-		log.Info("AIFAR runtime migration preflight passed: services=%d", len(plan.services))
+		log.Info(i18n.Text(req.Language, "aifar.migration.preflightPassed"), len(plan.services))
 	}
 
+	phase("bootstrap")
 	if remoteState.model == "legacy" {
 		bootstrapErr := s.bootstrapRuntimeMigrationLegacy(taskCtx, req.Server, plan)
 		if taskCtx.Err() != nil {
@@ -163,18 +171,27 @@ func (s Service) MigrateRuntimeModel(ctx context.Context, req RuntimeMigrationRe
 		_ = bootstrapErr
 	}
 
+	phase("readback")
 	states, err := s.readRuntimeMigrationDeployments(taskCtx, req.Server, plan)
 	if err != nil {
 		return err
 	}
+	phase("archive")
 	if err := s.archiveLegacyRuntimeSpec(taskCtx, req.Server, plan); err != nil {
 		return err
+	}
+	phase("commit")
+	if err := taskCtx.Err(); err != nil {
+		return err
+	}
+	if req.TryCommit != nil && !req.TryCommit() {
+		return context.Canceled
 	}
 	if err := s.commitRuntimeMigrationControlPlane(control, lock.ID, plan, states, req); err != nil {
 		return err
 	}
 	if log != nil {
-		log.Info("AIFAR runtime migration committed: services=%d model=%s", len(plan.services), orchestrationModelServiceControllerV1)
+		log.Info(i18n.Text(req.Language, "aifar.migration.committed"), len(plan.services), orchestrationModelServiceControllerV1)
 	}
 	return nil
 }

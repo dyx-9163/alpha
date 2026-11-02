@@ -11,7 +11,9 @@ mkdirSync(binDir, { recursive: true })
 const targets = [
   { goos: 'linux', goarch: 'amd64', out: 'aifar-server-linux-amd64', pkg: './cmd/aifar-server' },
   { goos: 'windows', goarch: 'amd64', out: 'aifar-server-windows-amd64.exe', pkg: './cmd/aifar-server' },
-  { goos: 'linux', goarch: 'amd64', out: 'aifar-agent-linux-amd64', pkg: './cmd/aifar-agent' }
+  { goos: 'linux', goarch: 'amd64', out: 'aifar-agent-linux-amd64', pkg: './cmd/aifar-agent' },
+  { goos: 'linux', goarch: 'amd64', out: 'aifar-admin-linux-amd64', pkg: './cmd/aifar-admin' },
+  { goos: 'windows', goarch: 'amd64', out: 'aifar-admin-windows-amd64.exe', pkg: './cmd/aifar-admin' }
 ]
 
 for (const target of targets) {

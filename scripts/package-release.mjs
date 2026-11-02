@@ -76,7 +76,7 @@ const targets = [
     arch: 'amd64',
     binary: 'aifar-server-linux-amd64',
     archive: 'tar.gz',
-    extraBinaries: ['aifar-agent-linux-amd64'],
+    extraBinaries: ['aifar-agent-linux-amd64', 'aifar-admin-linux-amd64'],
     packageEntries: [keepalivedEntry, selinuxEntry],
     runtimeFiles: [
       { source: 'scripts/start.sh', target: 'start.sh', executable: true },
@@ -87,6 +87,7 @@ const targets = [
     platform: 'windows',
     arch: 'amd64',
     binary: 'aifar-server-windows-amd64.exe',
+    extraBinaries: ['aifar-admin-windows-amd64.exe'],
     archive: 'zip',
     packageEntries: [],
     runtimeFiles: [

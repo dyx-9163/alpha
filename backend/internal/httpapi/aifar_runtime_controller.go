@@ -103,6 +103,8 @@ func (a *aifarRuntimeController) terminalizeDiagnosticTaskByID(taskID, status, e
 }
 
 func (a *aifarRuntimeController) mount(r chi.Router) {
+	r.Get("/apps/instances/{id}/runtime/migration", a.requirePermission(rbac.AppsManage, a.runtimeMigrationStatus))
+	r.Post("/apps/instances/{id}/runtime/migration", a.requirePermission(rbac.AppsManage, a.migrateRuntime))
 	r.Get("/containers/aifar/runtime", a.runtime)
 	r.Put("/apps/instances/{id}/runtime/deployments/{service}", a.requirePermission(rbac.AppsManage, a.mutateRuntimeDeployment))
 	r.Post("/apps/instances/{id}/runtime/deployments/{service}/reconcile", a.requirePermission(rbac.AppsManage, a.reconcileRuntimeDeployment))

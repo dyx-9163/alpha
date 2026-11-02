@@ -47,6 +47,8 @@ function releaseFixture(t, { safeDefaults = true, buildOutputs = true, binaries 
   if (binaries) {
     write(root, 'deploy/bin/aifar-server-linux-amd64', 'linux-server')
     write(root, 'deploy/bin/aifar-agent-linux-amd64', 'linux-agent')
+    write(root, 'deploy/bin/aifar-admin-linux-amd64', 'linux-admin')
+    write(root, 'deploy/bin/aifar-admin-windows-amd64.exe', 'windows-admin')
     write(root, 'deploy/bin/aifar-server-windows-amd64.exe', 'windows-server')
   }
   return root
@@ -83,6 +85,17 @@ function stagingEntries(root) {
   const stage = path.join(root, 'deploy', '.stage')
   return existsSync(stage) ? readdirSync(stage) : []
 }
+
+test('release ships the runtime migration admin CLI with both platforms', (t) => {
+  const root = releaseFixture(t)
+  const result = runRelease(root)
+  assert.equal(result.status, 0, result.stderr)
+  for (const [platform, binary] of [['linux', 'aifar-admin-linux-amd64'], ['windows', 'aifar-admin-windows-amd64.exe']]) {
+    const dir = path.join(root, `deploy/deployment/aifar-fixture-9.8.7-${platform}-amd64`)
+    assert.equal(existsSync(path.join(dir, 'bin', binary)), true, `missing ${binary}`)
+    assert.ok(readFileSync(path.join(dir, 'checksums.txt'), 'utf8').includes(`bin/${binary}`))
+  }
+})
 
 test('release validates source defaults before requiring or copying build outputs', (t) => {
   const root = releaseFixture(t, { safeDefaults: false, buildOutputs: false, binaries: false })

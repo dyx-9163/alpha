@@ -10,6 +10,13 @@ import (
 )
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "migrate-runtime" {
+		if err := runRuntimeMigrationCLI(os.Args[2:], os.Stdout); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
 	cfg := config.Load()
 	cmd := "inspect"
 	if len(os.Args) > 1 {
@@ -39,7 +46,7 @@ func main() {
 		}
 		fmt.Printf("admin credential ready: username=%s password=<not printed>\n", username)
 	default:
-		fmt.Fprintf(os.Stderr, "usage: aifar-admin [inspect|reset-admin [username password]]\n")
+		fmt.Fprintf(os.Stderr, "usage: aifar-admin [inspect|reset-admin [username password]|migrate-runtime --instance ID --server URL [--wait] [--resume-task ID] [--status]]\n")
 		os.Exit(2)
 	}
 }

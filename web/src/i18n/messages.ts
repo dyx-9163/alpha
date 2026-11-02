@@ -4,6 +4,10 @@ export type I18nValue = string | ((params?: Record<string, unknown>) => string)
 
 export const messages: Record<LocaleCode, Record<string, I18nValue>> = {
   zh: {
+    'containers.migrationTitle': '升级运行时管理模型',
+    'containers.migrationAction': '迁移 / 继续迁移',
+    'containers.migrationHint': '请先升级目标服务器 Agent 到兼容版本。此任务校验旧配置并迁移到独立服务控制器，保留业务容器；若上次已切换 Agent，将核对实际状态后继续提交面板记录。切换后只能向前修复，不能直接用旧版回退。',
+    'containers.migrationAccepted': '迁移请求已处理，请在任务中心查看结果',
     'database.mysqlBackup.resumeRestoreAction': '继续未完成恢复',
     'database.mysqlBackup.resumeRestoreImpact': '仅使用维护标记指定的原备份继续未完成恢复；恢复完成并通过校验前，普通操作仍保持关闭。',
     'database.mysqlBackup.resumeBackupMissing': '维护标记指定的原备份不存在、不可用或与当前实例不兼容，无法继续恢复。',
@@ -1196,6 +1200,10 @@ export const messages: Record<LocaleCode, Record<string, I18nValue>> = {
     'table.version': '版本'
   },
   en: {
+    'containers.migrationTitle': 'Upgrade runtime management model',
+    'containers.migrationAction': 'Migrate / resume migration',
+    'containers.migrationHint': 'Upgrade the target Agent to a compatible version first. This task validates legacy configuration and migrates to independent service controllers while retaining business containers. If the Agent already switched, it reconciles actual state and completes panel records. After switching, recovery is forward only; directly reverting to the old version is unsupported.',
+    'containers.migrationAccepted': 'Migration request processed; check the task center for results',
     'containers.batchOfflineDeployments': 'Batch offline',
     'containers.selectedDeploymentCount': ({ count } = {}) => `${count ?? 0} service(s) selected`,
     'containers.selectDeploymentsToOffline': 'Select services to offline',

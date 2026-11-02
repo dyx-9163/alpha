@@ -41,6 +41,10 @@
       </template>
 
       <template v-else-if="tab === 'aifar-runtime'">
+        <el-alert v-if="selectedRuntimeInstance?.orchestrationModel === 'agent-runtime-v2'" :title="t('containers.migrationTitle')" type="warning" :closable="false" show-icon>
+          <p>{{ t('containers.migrationHint') }}</p>
+          <el-button type="primary" size="small" :loading="runtimeMigrationSubmitting" :disabled="!canManageApps" @click="migrateAifarRuntime">{{ t('containers.migrationAction') }}</el-button>
+        </el-alert>
         <AifarRuntimeWorkspace />
       </template>
       <template v-else-if="tab === 'images'">
@@ -137,7 +141,7 @@
 
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import { apiGet, asArray } from '../api/client'
+import { apiGet, apiPost, asArray } from '../api/client'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import type { UploadFile } from 'element-plus'
 import KeyValueGrid from '../components/KeyValueGrid.vue'
@@ -330,6 +334,7 @@ const runtimeLogParseContexts = new Map<string, RuntimeLogParseContext>()
 const runtimeConfigVisible = ref(false)
 const runtimeConfigSubmitting = ref(false)
 const runtimeRestartSubmitting = ref(false)
+const runtimeMigrationSubmitting = ref(false)
 const runtimeServiceSubmitting = ref<Record<string, boolean>>({})
 const runtimeServiceTaskOwners = ref<Record<string, string>>({})
 const runtimeConfigForm = ref<RuntimeConfigFormValues>({
@@ -1640,6 +1645,33 @@ async function submitRuntimeReconcile(labelKey: string, confirmKey: string) {
 
 async function reconcileAifarRuntime() {
   await submitRuntimeReconcile('containers.reconcileRuntime', 'containers.confirmReconcileRuntime')
+}
+
+async function migrateAifarRuntime() {
+  const id = selectedRuntimeInstance.value?.id
+  if (!id || !canManageApps.value || runtimeMigrationSubmitting.value) return
+  const path = `/apps/instances/${encodeURIComponent(id)}/runtime/migration`
+  runtimeMigrationSubmitting.value = true
+  try {
+    const status = await apiGet<{ status: string; lastTask?: { id: string; status: string } }>(path)
+    if (status.lastTask && ['pending', 'running'].includes(status.lastTask.status)) {
+      trackTask(status.lastTask.id, t('containers.migrationTitle'))
+      return
+    }
+    try {
+      await ElMessageBox.confirm(t('containers.migrationHint'), t('containers.migrationTitle'), { type: 'warning', confirmButtonText: t('containers.migrationAction'), cancelButtonText: t('common.cancel') })
+    } catch { return }
+    const result = await apiPost<{ taskId?: string; status: string }>(path, {
+      reason: t('containers.migrationTitle'),
+      resumeTaskId: status.lastTask?.id || ''
+    })
+    if (result.taskId) trackTask(result.taskId, t('containers.migrationTitle'))
+    ElMessage.success(t('containers.migrationAccepted'))
+    runtimeCache.value = {}
+    void loadAifarRuntime(true)
+  } catch (err) {
+    ElMessage.error(err instanceof Error ? err.message : t('containers.runtimeActionFailed'))
+  } finally { runtimeMigrationSubmitting.value = false }
 }
 
 async function restartAllAifarRuntime() {

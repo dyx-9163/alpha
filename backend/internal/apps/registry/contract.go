@@ -590,6 +590,11 @@ type RunContext struct {
 	Concurrency int
 }
 
+// RuntimeMigrationModule owns the one-way runtime model transition and recovery.
+type RuntimeMigrationModule interface {
+	MigrateRuntimeInstance(context.Context, string, string, RunContext) error
+}
+
 func (r RunContext) LoggerForTarget(target string) Logger {
 	if r.TargetLog != nil {
 		return r.TargetLog(target)
