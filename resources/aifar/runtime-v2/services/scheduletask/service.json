@@ -1,0 +1,1 @@
+{"schema":"aifar-runtime-service-v1","name":"scheduletask","displayName":{"zh":"定时任务 scheduletask","en":"Scheduled Tasks"},"kind":"java","applicationName":"alpha-scheduletask","port":38009,"required":false,"artifactExtensions":[".jar"],"healthPath":"/actuator/health/readiness","affinityPolicy":"round-robin"}
