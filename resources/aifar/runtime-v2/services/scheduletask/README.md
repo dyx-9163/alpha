@@ -6,7 +6,8 @@ This Java 21 module uses application name `alpha-scheduletask` and HTTP port
 Before packaging or installing, place exactly one executable Spring Boot JAR
 in `target/`. The source module is
 `alpha-scheduletask/alpha-scheduletask-server` in `alpha-java-cloud`.
-No JAR is included by this configuration change.
+The JAR is an offline build artifact and is not tracked in Git. Build it from
+the source module before packaging; Dockerfile copies it from `target/`.
 
 Use the same offline Java 21 base image as the other Java services. Rescan
 resources after delivering the updated bundle, then install the new service
