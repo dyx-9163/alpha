@@ -571,6 +571,7 @@ type InstanceStatus struct {
 
 type RunContext struct {
 	TaskID      string
+	Language    string
 	Resources   []store.Resource
 	Log         Logger
 	TargetLog   func(target string) Logger

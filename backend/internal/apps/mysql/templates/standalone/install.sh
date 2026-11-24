@@ -190,7 +190,8 @@ binlog_format=ROW
 log_replica_updates=ON
 gtid_mode=ON
 enforce_gtid_consistency=ON
-binlog_transaction_dependency_tracking=WRITESET
+{{if ne .Version "8.4.13"}}binlog_transaction_dependency_tracking=WRITESET
+{{end -}}
 mysqlx=0
 skip_name_resolve=ON
 character-set-server=utf8mb4

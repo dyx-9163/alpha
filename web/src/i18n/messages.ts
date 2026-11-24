@@ -4,6 +4,12 @@ export type I18nValue = string | ((params?: Record<string, unknown>) => string)
 
 export const messages: Record<LocaleCode, Record<string, I18nValue>> = {
   zh: {
+    'middlewareUpgrade.mysql.action': '升级 MySQL 集群',
+    'middlewareUpgrade.mysql.impact': '任务会冷备各节点，升级 Shell 和 Router，再依次切换从节点和主节点。切主期间连接可能短暂中断。',
+    'middlewareUpgrade.minio.action': '迁移到 Silo',
+    'middlewareUpgrade.minio.impact': '两端会在同一维护窗口停机备份，并保留数据目录和复制规则切换至 Silo。',
+    'middlewareUpgrade.confirm': '已暂停所有写入和定时任务',
+    'middlewareUpgrade.submit': '开始升级',
     'database.mysqlBackup.resumeRestoreAction': '继续未完成恢复',
     'database.mysqlBackup.resumeRestoreImpact': '仅使用维护标记指定的原备份继续未完成恢复；恢复完成并通过校验前，普通操作仍保持关闭。',
     'database.mysqlBackup.resumeBackupMissing': '维护标记指定的原备份不存在、不可用或与当前实例不兼容，无法继续恢复。',
@@ -1130,6 +1136,12 @@ export const messages: Record<LocaleCode, Record<string, I18nValue>> = {
     'table.version': '版本'
   },
   en: {
+    'middlewareUpgrade.mysql.action': 'Upgrade MySQL cluster',
+    'middlewareUpgrade.mysql.impact': 'The task takes cold backups, upgrades Shell and Router, then upgrades the secondaries and the primary in order. Connections may drop briefly during failover.',
+    'middlewareUpgrade.minio.action': 'Migrate to Silo',
+    'middlewareUpgrade.minio.impact': 'Both sites stop for backup in the same maintenance window. The migration retains data directories and replication rules.',
+    'middlewareUpgrade.confirm': 'All writes and scheduled jobs are paused',
+    'middlewareUpgrade.submit': 'Start upgrade',
     'containers.batchOfflineDeployments': 'Batch offline',
     'containers.selectedDeploymentCount': ({ count } = {}) => `${count ?? 0} service(s) selected`,
     'containers.selectDeploymentsToOffline': 'Select services to offline',

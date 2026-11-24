@@ -475,14 +475,31 @@ func (a *API) checkAppInstance(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var locks []store.OperationLock
-	if strings.EqualFold(strings.TrimSpace(instance.App), "mysql") {
+	var checkLocks []operationLockSpec
+	switch strings.ToLower(strings.TrimSpace(instance.App)) {
+	case "mysql":
+		checkLocks = mysqlClusterOperationLockSpecs("mysql-check", instance)
+	case "minio":
+		checkLocks = appInstanceOperationLockSpecs("minio-check", []store.AppInstance{instance})
+	}
+	if len(checkLocks) > 0 {
 		var acquired bool
-		locks, acquired = a.acquireTaskOperationLocks(w, lang, task, mysqlClusterOperationLockSpecs("mysql-check", instance))
+		locks, acquired = a.acquireTaskOperationLocks(w, lang, task, checkLocks)
 		if !acquired {
 			return
 		}
 	}
 	task, err = a.tasks.StartExistingWithLanguage(task, lang, func(ctx context.Context, log worker.Logger) error {
+		if instance.App == "minio" {
+			current, err := a.store.GetAppInstance(id)
+			if err != nil {
+				return err
+			}
+			if current.ServerID != instance.ServerID || current.App != instance.App {
+				return errors.New(i18n.MiddlewareUpgradeText(lang, "group"))
+			}
+			checkReq.Instance = current
+		}
 		log.Info(i18n.Text(lang, "api.checkInstanceRequested"), instance.App, instance.ID)
 		status, err := checkModule.Check(ctx, checkReq, registry.RunContext{
 			TaskID: task.ID,

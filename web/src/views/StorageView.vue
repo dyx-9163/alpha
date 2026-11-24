@@ -57,6 +57,12 @@
               </div>
               <div class="storage-head-actions">
                 <StatusTag :status="group.status" />
+                <MiddlewareUpgradeButton
+                  app="minio"
+                  :title="group.title"
+                  :instances="group.nodes.map(node => node.instance)"
+                  :disabled="!canManageStorage"
+                />
               </div>
             </div>
 
@@ -291,6 +297,7 @@ import { apiDelete, apiGet, apiPost, asArray } from '../api/client'
 import { keepPreviousArrayOnLoadFailure } from '../api/resilientLoad'
 import ConfirmAction from '../components/ConfirmAction.vue'
 import KeyValueGrid from '../components/KeyValueGrid.vue'
+import MiddlewareUpgradeButton from '../components/MiddlewareUpgradeButton.vue'
 import RunRecordTable from '../components/RunRecordTable.vue'
 import StatusTag from '../components/StatusTag.vue'
 import { usePermissions } from '../composables/usePermissions'

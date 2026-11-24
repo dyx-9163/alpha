@@ -166,6 +166,12 @@
               </el-tooltip>
               <el-button @click="openMySQLBackupRecords(group)">{{ t('database.mysqlBackup.recordsAction') }}</el-button>
               <el-button @click="openMySQLRestoreRecords(group)">{{ t('database.mysqlBackup.restoreRecordsAction') }}</el-button>
+              <MiddlewareUpgradeButton
+                app="mysql"
+                :title="group.title"
+                :instances="group.nodes.map(node => node.instance)"
+                :disabled="!mysqlAvailability(group).backup"
+              />
               <el-button v-if="mysqlAvailability(group).resumeRestore" type="danger" plain @click="openMySQLMaintenanceResume(group)">{{ t('database.mysqlBackup.resumeRestoreAction') }}</el-button>
               <el-button v-if="mysqlAvailability(group).disaster" type="danger" plain @click="openLatestMySQLDisaster(group)">{{ t('database.mysqlBackup.disasterAction') }}</el-button>
               <el-button
@@ -273,6 +279,7 @@ import { useRouter } from 'vue-router'
 import { apiGet, apiPost, asArray } from '../api/client'
 import { keepPreviousArrayOnLoadFailure } from '../api/resilientLoad'
 import KeyValueGrid from '../components/KeyValueGrid.vue'
+import MiddlewareUpgradeButton from '../components/MiddlewareUpgradeButton.vue'
 import RunRecordTable from '../components/RunRecordTable.vue'
 import StatusTag from '../components/StatusTag.vue'
 import { usePermissions } from '../composables/usePermissions'

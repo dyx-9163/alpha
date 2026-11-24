@@ -119,6 +119,7 @@ func NewWithRealtime(cfg config.Config, s *store.Store, tasks *worker.Manager, e
 			r.Get("/apps/instances/{id}/backups", api.listMySQLBackups)
 			r.Get("/apps/instances/{id}/backup-schemas", api.listMySQLBackupSchemas)
 			r.Post("/apps/{app}/install", api.requirePermission(rbac.AppsManage, api.installApp))
+			r.Post("/apps/instances/{id}/upgrade", api.requireOwner(api.startMiddlewareUpgrade))
 			r.Post("/apps/instances/{id}/backup", api.requirePermission(rbac.AppsManage, api.startMySQLBackup))
 			r.Post("/apps/instances/{id}/restore", api.requireOwner(api.startMySQLRestore))
 			r.Post("/apps/instances/{id}/mysql/maintenance/clear", api.requireOwner(api.clearMySQLMaintenance))
