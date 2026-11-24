@@ -84,6 +84,7 @@ fi
 if ! id "$ROUTER_USER" >/dev/null 2>&1; then
   $SUDO useradd --system --home-dir "$INSTALL_ROOT" --shell "$NOLOGIN" "$ROUTER_USER"
 fi
+label_selinux_service_tree "$INSTALL_ROOT"
 
 echo "bootstrapping MySQL Router from InnoDB Cluster"
 BOOTSTRAP_URI="$BOOTSTRAP_USER@$BOOTSTRAP_HOST:$BOOTSTRAP_PORT"

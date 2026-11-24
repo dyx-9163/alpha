@@ -171,6 +171,12 @@ func TestMySQLStandaloneScriptsRenderTemplates(t *testing.T) {
 	if !strings.Contains(install, "server-id=12345") || !strings.Contains(install, "gtid_mode=ON") || !strings.Contains(install, "binlog_transaction_dependency_tracking=WRITESET") {
 		t.Fatalf("install script did not render InnoDB Cluster bootstrap-friendly config:\n%s", install)
 	}
+	copyTree := strings.Index(install, `cp -a "$MYSQL_SRC"/.`)
+	label := strings.Index(install, `label_selinux_service_tree "$INSTALL_ROOT"`)
+	initialize := strings.Index(install, `--initialize-insecure --user="$MYSQL_USER"`)
+	if copyTree < 0 || label <= copyTree || initialize <= label {
+		t.Fatal("MySQL must label the installed tree after copying the archive and before initializing data")
+	}
 	bootstrap, err := bootstrapInnoDBClusterScript(InnoDBClusterBootstrapScriptRequest{
 		ClusterName:           "aifarCluster",
 		InstallRoot:           "/aifar/apps/mysql",

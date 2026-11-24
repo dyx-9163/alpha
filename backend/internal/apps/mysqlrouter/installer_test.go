@@ -105,6 +105,12 @@ func TestMySQLRouterScriptsRenderTemplates(t *testing.T) {
 	if !strings.Contains(install, "BASE_PORT=6446") || !strings.Contains(install, "BOOTSTRAP_HOST='10.0.0.1'") {
 		t.Fatalf("router install script did not render core variables:\n%s", install)
 	}
+	copyTree := strings.Index(install, `cp -a "$ROUTER_SRC"/.`)
+	label := strings.Index(install, `label_selinux_service_tree "$INSTALL_ROOT"`)
+	bootstrap := strings.Index(install, `--bootstrap "$BOOTSTRAP_URI"`)
+	if copyTree < 0 || label <= copyTree || bootstrap <= label {
+		t.Fatal("Router must label the installed tree after copying the archive and before bootstrap")
+	}
 	uninstall, err := uninstallRouterScript("8.0.36", "/aifar/apps/mysql-router", "/aifar/apps/mysql-router/8.0.36", 6446)
 	if err != nil {
 		t.Fatal(err)

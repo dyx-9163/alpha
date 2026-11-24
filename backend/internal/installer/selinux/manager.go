@@ -190,6 +190,32 @@ restore_selinux_context() {
   done
 }
 
+label_selinux_service_tree() (
+  if ! selinux_is_enabled; then
+    return 0
+  fi
+  service_tree="$1"
+  case "$service_tree" in
+    /*) ;;
+    *) echo "SELinux labeling requires an absolute installation path" >&2; return 1 ;;
+  esac
+  if [ "$service_tree" = "/" ] || [ "$service_tree" = "/." ] || [ ! -d "$service_tree" ] || [ -L "$service_tree" ]; then
+    echo "Invalid installation directory for SELinux labeling: $service_tree" >&2
+    return 1
+  fi
+  if ! command -v chcon >/dev/null 2>&1; then
+    echo "chcon is required to label the installation directory on an SELinux-enabled host" >&2
+    return 1
+  fi
+  # Generic tarball files use the usr_t type. Keep existing policy-specific labels.
+  if ! $SUDO find -P "$service_tree" -xdev \( -context '*:default_t:*' -o -context '*:unlabeled_t:*' \) \
+    -exec chcon -h -t usr_t -- {} +; then
+    echo "Failed to apply SELinux file labels under $service_tree" >&2
+    return 1
+  fi
+  echo "SELinux file labels prepared under $service_tree"
+)
+
 set_selinux_boolean() {
   boolean_name="$1"
   boolean_value="$2"

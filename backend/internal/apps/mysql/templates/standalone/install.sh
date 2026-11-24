@@ -206,6 +206,7 @@ default-character-set=utf8mb4
 CONF
 $SUDO install -m 0644 "$WORK_DIR/my.cnf" "$CONFIG_FILE"
 $SUDO chown -R "$MYSQL_USER:$MYSQL_USER" "$INSTALL_ROOT"
+label_selinux_service_tree "$INSTALL_ROOT"
 
 NEED_SECURE=0
 if [ ! -d "$DATA_DIR/mysql" ]; then
