@@ -3,7 +3,9 @@ package mysql
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"fmt"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -267,6 +269,47 @@ func TestOfflineUpgradeRollsLivePrimaryLastAndRecordsOnlyVerifiedVersions(t *tes
 	}
 }
 
+func TestOfflineUpgradeRecordsVersionsAcrossRuntimeChecks(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "panel.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	node, err := db.SaveAppInstance(store.AppInstance{
+		App: "mysql", Version: OfflineUpgradeSourceVersion, ServerID: "server-1",
+		Topology: "innodb-cluster", Status: "running",
+		Metadata: `{"clusterId":"cluster-test","endpoint":"10.0.0.1:3306","role":"secondary"}`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := NewService(db, nil)
+	u := offlineUpgrade{
+		data: db, bundle: Bundle{ArchivePath: "target.tar"},
+		run:      registry.RunContext{TaskID: "tsk_0123456789abcdef01234567"},
+		verified: map[string]store.AppInstanceVersionUpdate{},
+	}
+	u.markVerified(upgradeNode{instance: node, backup: "/backups/mysql"}, false)
+	if err := service.markInnoDBClusterPrimary(node, "10.0.0.1:3306", map[string]any{"observed": "latest"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := u.saveVerified(); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.markInstanceStatus(node, "failed", nil); err != nil {
+		t.Fatal(err)
+	}
+	actual, err := db.GetAppInstance(node.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if actual.Version != OfflineUpgradeTargetVersion || actual.Status != "running" ||
+		!strings.Contains(actual.Metadata, `"role":"primary"`) || !strings.Contains(actual.Metadata, `"observed":"latest"`) ||
+		!strings.Contains(actual.Metadata, `"mysqlShellVersion":"26.10.0"`) {
+		t.Fatalf("registration or latest runtime observation was lost: %+v", actual)
+	}
+}
+
 func TestOfflineUpgradeStopsBeforeFurtherServersWhenCutoverFails(t *testing.T) {
 	data, remote, resources, run := newOfflineUpgradeFixture(t)
 	remote.failServer = 2
@@ -293,8 +336,16 @@ func (s *offlineUpgradeFakeStore) GetAppInstance(id string) (store.AppInstance, 
 	return instance, err
 }
 
-func (s *offlineUpgradeFakeStore) SaveAppInstancesIfUnchanged(items []store.AppInstance) error {
-	for _, item := range items {
+func (s *offlineUpgradeFakeStore) SaveAppInstanceVersionsIfUnchanged(updates []store.AppInstanceVersionUpdate) error {
+	for _, update := range updates {
+		item := update.Expected
+		metadata := appMetadata(item)
+		maps.Copy(metadata, update.Metadata)
+		encoded, err := json.Marshal(metadata)
+		if err != nil {
+			return err
+		}
+		item.Version, item.Metadata = update.Version, string(encoded)
 		s.updated[item.ID] = item
 	}
 	return nil

@@ -16,6 +16,7 @@ import (
 type Store interface {
 	GetServer(id string, includeSecret bool) (store.Server, error)
 	SaveAppInstance(v store.AppInstance) (store.AppInstance, error)
+	SaveAppInstanceObservation(store.AppInstance, store.AppInstanceObservation) error
 	ListAppInstances() ([]store.AppInstance, error)
 	DeleteAppInstance(id string) error
 }

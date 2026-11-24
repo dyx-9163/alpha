@@ -8,6 +8,41 @@ import (
 
 var ErrAppInstanceConflict = errors.New("app instance changed concurrently")
 
+type AppInstanceVersionUpdate struct {
+	Expected AppInstance
+	Version  string
+	Metadata map[string]any
+}
+
+// SaveAppInstanceVersionsIfUnchanged commits verified versions as one
+// transaction and preserves runtime observations made during the upgrade.
+func (s *Store) SaveAppInstanceVersionsIfUnchanged(updates []AppInstanceVersionUpdate) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, update := range updates {
+		current, err := appInstanceMetadataAtRevision(tx, update.Expected)
+		if err != nil {
+			return err
+		}
+		metadata, err := mergeAppInstanceMetadata(current, update.Metadata)
+		if err != nil {
+			return err
+		}
+		updatedAt := time.Now().UTC()
+		if updatedAt.Sub(update.Expected.UpdatedAt) < time.Millisecond {
+			updatedAt = update.Expected.UpdatedAt.Add(time.Millisecond)
+		}
+		if _, err = tx.Exec(`update app_instances set version=?,metadata=?,updated_at=? where id=?`,
+			update.Version, metadata, updatedAt, update.Expected.ID); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
 // SaveAppInstancesIfUnchanged commits verified member changes as one transaction.
 func (s *Store) SaveAppInstancesIfUnchanged(instances []AppInstance) error {
 	tx, err := s.db.Begin()

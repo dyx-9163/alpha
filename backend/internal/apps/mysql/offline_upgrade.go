@@ -67,7 +67,7 @@ func upgradeText(language, en, zh string) string {
 
 type offlineUpgradeStore interface {
 	maintenanceReader
-	SaveAppInstancesIfUnchanged([]store.AppInstance) error
+	SaveAppInstanceVersionsIfUnchanged([]store.AppInstanceVersionUpdate) error
 }
 
 type upgradeNode struct {
@@ -105,7 +105,7 @@ type offlineUpgrade struct {
 	primary  int
 	baseline []upgradeView
 	versions map[int]string
-	verified map[string]store.AppInstance
+	verified map[string]store.AppInstanceVersionUpdate
 	prepared []upgradeNode
 	secrets  []string
 }
@@ -119,7 +119,7 @@ func (s Service) RunOfflineUpgrade(ctx context.Context, seed store.AppInstance, 
 	if !ok || !validLogicalTaskID(run.TaskID) || OfflineUpgradeClusterID(seed) == "" {
 		return errors.New(upgradeText(run.Language, "Invalid MySQL upgrade task or cluster", "MySQL 升级任务或集群无效"))
 	}
-	u := offlineUpgrade{service: s, data: data, run: run, seed: seed, versions: map[int]string{}, verified: map[string]store.AppInstance{}}
+	u := offlineUpgrade{service: s, data: data, run: run, seed: seed, versions: map[int]string{}, verified: map[string]store.AppInstanceVersionUpdate{}}
 	target := OfflineUpgradeClusterID(seed)
 	recorder, _ := run.Log.(taskrun.Recorder)
 	taskrun.StartTarget(recorder, target)
@@ -455,9 +455,7 @@ func (u *offlineUpgrade) upgradeTools(ctx context.Context) error {
 		return err
 	}
 	for _, router := range u.routers {
-		if err := u.markVerified(router, true); err != nil {
-			return err
-		}
+		u.markVerified(router, true)
 	}
 	return nil
 }
@@ -512,7 +510,8 @@ func (u *offlineUpgrade) upgradeServer(ctx context.Context, index int) error {
 	if _, _, err := u.waitForViews(ctx); err != nil {
 		return err
 	}
-	return u.markVerified(node, false)
+	u.markVerified(node, false)
+	return nil
 }
 
 func (u *offlineUpgrade) verifyAndRecord(ctx context.Context) error {
@@ -538,35 +537,33 @@ func (u *offlineUpgrade) verifyRouters(ctx context.Context, primary int) error {
 	return nil
 }
 
-func (u *offlineUpgrade) markVerified(node upgradeNode, router bool) error {
-	item := node.instance
-	metadata := appMetadata(item)
-	metadata["resourcePath"] = u.bundle.ArchivePath
-	metadata["offlineUpgradeBackupPath"] = node.backup
-	metadata["offlineUpgradeTaskId"] = u.run.TaskID
+func (u *offlineUpgrade) markVerified(node upgradeNode, router bool) {
+	metadata := map[string]any{
+		"resourcePath":             u.bundle.ArchivePath,
+		"offlineUpgradeBackupPath": node.backup,
+		"offlineUpgradeTaskId":     u.run.TaskID,
+	}
 	if router {
 		metadata["routerVersion"] = offlineUpgradeToolsVersion
 	} else {
 		metadata["mysqlShellVersion"] = offlineUpgradeToolsVersion
 	}
-	encoded, err := json.Marshal(metadata)
-	if err != nil {
-		return err
+	u.verified[node.instance.ID] = store.AppInstanceVersionUpdate{
+		Expected: node.instance,
+		Version:  OfflineUpgradeTargetVersion,
+		Metadata: metadata,
 	}
-	item.Metadata, item.Version = string(encoded), OfflineUpgradeTargetVersion
-	u.verified[item.ID] = item
-	return nil
 }
 
 func (u *offlineUpgrade) saveVerified() error {
 	if len(u.verified) == 0 {
 		return nil
 	}
-	items := make([]store.AppInstance, 0, len(u.verified))
+	items := make([]store.AppInstanceVersionUpdate, 0, len(u.verified))
 	for _, item := range u.verified {
 		items = append(items, item)
 	}
-	if err := u.data.SaveAppInstancesIfUnchanged(items); err != nil {
+	if err := u.data.SaveAppInstanceVersionsIfUnchanged(items); err != nil {
 		return errors.New(upgradeText(u.run.Language, "Could not record verified MySQL versions because Panel instance records changed or could not be written", "面板实例记录已变化或写入失败，无法登记已校验的 MySQL 版本"))
 	}
 	clear(u.verified)

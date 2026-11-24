@@ -187,6 +187,11 @@ func (s Service) markInnoDBClusterPrimary(instance store.AppInstance, primaryEnd
 	if err != nil {
 		return err
 	}
+	for _, current := range instances {
+		if current.ID == instance.ID && !current.UpdatedAt.Equal(instance.UpdatedAt) {
+			return nil
+		}
+	}
 	matched := false
 	detectedAt := time.Now().UTC().Format(time.RFC3339)
 	for _, candidate := range instances {
@@ -194,16 +199,19 @@ func (s Service) markInnoDBClusterPrimary(instance store.AppInstance, primaryEnd
 			continue
 		}
 		matched = true
-		metadata := appMetadata(candidate)
-		metadata["currentPrimaryEndpoint"] = primaryEndpoint
-		metadata["primaryEndpoint"] = primaryEndpoint
-		metadata["primaryDetectedAt"] = detectedAt
-		if normalizeEndpoint(metadataString(metadata, "endpoint")) == normalizeEndpoint(primaryEndpoint) {
+		current := appMetadata(candidate)
+		metadata := map[string]any{
+			"currentPrimaryEndpoint": primaryEndpoint,
+			"primaryEndpoint":        primaryEndpoint,
+			"primaryDetectedAt":      detectedAt,
+		}
+		observation := store.AppInstanceObservation{DefaultTopology: "innodb-cluster", Metadata: metadata}
+		if normalizeEndpoint(metadataString(current, "endpoint")) == normalizeEndpoint(primaryEndpoint) {
 			metadata["role"] = "primary"
 		} else {
 			metadata["role"] = "secondary"
 		}
-		if metadataString(metadata, "topology") == "" {
+		if metadataString(current, "topology") == "" {
 			metadata["topology"] = "innodb-cluster"
 		}
 		if candidate.ID == instance.ID {
@@ -212,15 +220,10 @@ func (s Service) markInnoDBClusterPrimary(instance store.AppInstance, primaryEnd
 				"checkedAt": detectedAt,
 				"details":   details,
 			}
-			clearRecoveredInstallFailure(metadata, "running")
-			candidate.Status = "running"
+			observation.ClearInstallFailure = true
+			observation.Status = "running"
 		}
-		data, _ := json.Marshal(metadata)
-		candidate.Metadata = string(data)
-		if candidate.Topology == "" {
-			candidate.Topology = "innodb-cluster"
-		}
-		if _, err := s.store.SaveAppInstance(candidate); err != nil {
+		if err := s.store.SaveAppInstanceObservation(candidate, observation); err != nil {
 			return err
 		}
 	}
@@ -275,18 +278,16 @@ func (s Service) markInnoDBClusterStarted(instance store.AppInstance, primaryEnd
 }
 
 func (s Service) markInstanceStatus(instance store.AppInstance, status string, details map[string]any) error {
-	metadata := appMetadata(instance)
-	metadata["lastCheck"] = map[string]any{
+	lastCheck := map[string]any{
 		"status":    status,
 		"checkedAt": time.Now().UTC().Format(time.RFC3339),
 		"details":   details,
 	}
-	clearRecoveredInstallFailure(metadata, status)
-	data, _ := json.Marshal(metadata)
-	instance.Metadata = string(data)
-	instance.Status = status
-	_, err := s.store.SaveAppInstance(instance)
-	return err
+	return s.store.SaveAppInstanceObservation(instance, store.AppInstanceObservation{
+		Status:              status,
+		Metadata:            map[string]any{"lastCheck": lastCheck},
+		ClearInstallFailure: normalizeRuntimeProbeStatus(status) == "running",
+	})
 }
 
 func clearRecoveredInstallFailure(metadata map[string]any, status string) {

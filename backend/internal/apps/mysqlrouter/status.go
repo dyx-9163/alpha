@@ -26,29 +26,17 @@ func (s Service) checkRuntime(ctx context.Context, server store.Server, instance
 }
 
 func (s Service) markInstanceStatus(instance store.AppInstance, status string, details map[string]any) error {
-	metadata := appMetadata(instance)
-	metadata["lastCheck"] = map[string]any{
+	lastCheck := map[string]any{
 		"status":    status,
 		"checkedAt": time.Now().UTC().Format(time.RFC3339),
 		"details":   details,
 	}
-	clearRecoveredInstallFailure(metadata, status)
-	data, _ := json.Marshal(metadata)
-	instance.Metadata = string(data)
-	instance.Status = status
-	_, err := s.store.SaveAppInstance(instance)
-	return err
-}
-
-func clearRecoveredInstallFailure(metadata map[string]any, status string) {
+	observation := store.AppInstanceObservation{Status: status, Metadata: map[string]any{"lastCheck": lastCheck}}
 	switch strings.ToLower(strings.TrimSpace(status)) {
 	case "ok", "success", "running", "available":
-	default:
-		return
+		observation.ClearInstallFailure = true
 	}
-	for _, key := range []string{"installFailed", "failedAt", "taskId", "error"} {
-		delete(metadata, key)
-	}
+	return s.store.SaveAppInstanceObservation(instance, observation)
 }
 
 func innoDBClusters(instances []store.AppInstance) []clusterInfo {

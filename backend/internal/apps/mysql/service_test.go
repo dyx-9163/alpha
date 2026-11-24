@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"strings"
@@ -66,6 +67,32 @@ func (f *fakeStore) ListAppInstances() ([]store.AppInstance, error) {
 	out := make([]store.AppInstance, len(f.instances))
 	copy(out, f.instances)
 	return out, nil
+}
+
+func (f *fakeStore) SaveAppInstanceObservation(instance store.AppInstance, observation store.AppInstanceObservation) error {
+	for index, current := range f.instances {
+		if current.ID != instance.ID || !current.UpdatedAt.Equal(instance.UpdatedAt) {
+			continue
+		}
+		metadata := appMetadata(current)
+		maps.Copy(metadata, observation.Metadata)
+		if observation.ClearInstallFailure {
+			clearRecoveredInstallFailure(metadata, observation.Status)
+		}
+		encoded, err := json.Marshal(metadata)
+		if err != nil {
+			return err
+		}
+		current.Metadata = string(encoded)
+		if observation.Status != "" {
+			current.Status = observation.Status
+		}
+		if current.Topology == "" {
+			current.Topology = observation.DefaultTopology
+		}
+		f.instances[index] = current
+	}
+	return nil
 }
 
 func (f *fakeStore) DeleteAppInstance(id string) error {

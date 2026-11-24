@@ -1056,6 +1056,9 @@ func (s *backupFakeStore) GetAppInstance(id string) (store.AppInstance, error) {
 func (s *backupFakeStore) SaveAppInstance(v store.AppInstance) (store.AppInstance, error) {
 	return v, nil
 }
+func (s *backupFakeStore) SaveAppInstanceObservation(store.AppInstance, store.AppInstanceObservation) error {
+	return nil
+}
 func (s *backupFakeStore) ListAppInstances() ([]store.AppInstance, error) {
 	if s.instances != nil {
 		return append([]store.AppInstance(nil), s.instances...), nil
