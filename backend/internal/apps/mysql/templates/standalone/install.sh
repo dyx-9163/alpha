@@ -129,7 +129,7 @@ if [ -z "$MYSQL_ARCHIVE" ] || [ ! -f "$MYSQL_ARCHIVE" ]; then
 fi
 
 echo "extracting MySQL server binary archive: $MYSQL_ARCHIVE"
-(umask 022; tar -xf "$MYSQL_ARCHIVE" -C "$WORK_DIR/unpacked")
+tar -xf "$MYSQL_ARCHIVE" -C "$WORK_DIR/unpacked"
 MYSQL_SRC="$(find "$WORK_DIR/unpacked" -maxdepth 1 -type d -name 'mysql-*' | sort | head -n 1)"
 if [ -z "$MYSQL_SRC" ] || [ ! -x "$MYSQL_SRC/bin/mysqld" ]; then
   echo "mysqld not found after extraction"
@@ -149,7 +149,7 @@ if [ -n "$MYSQL_SHELL_ARCHIVE" ] && [ -f "$MYSQL_SHELL_ARCHIVE" ]; then
   echo "extracting MySQL Shell archive: $MYSQL_SHELL_ARCHIVE"
   rm -rf "$WORK_DIR/unpacked-shell"
   mkdir -p "$WORK_DIR/unpacked-shell"
-  (umask 022; tar -xf "$MYSQL_SHELL_ARCHIVE" -C "$WORK_DIR/unpacked-shell")
+  tar -xf "$MYSQL_SHELL_ARCHIVE" -C "$WORK_DIR/unpacked-shell"
   MYSQL_SHELL_SRC="$(find "$WORK_DIR/unpacked-shell" -maxdepth 1 -type d -name 'mysql-shell-*' | sort | head -n 1)"
   if [ -n "$MYSQL_SHELL_SRC" ] && [ -x "$MYSQL_SHELL_SRC/bin/mysqlsh" ]; then
     echo "installing MySQL Shell"
@@ -206,8 +206,6 @@ default-character-set=utf8mb4
 CONF
 $SUDO install -m 0644 "$WORK_DIR/my.cnf" "$CONFIG_FILE"
 $SUDO chown -R "$MYSQL_USER:$MYSQL_USER" "$INSTALL_ROOT"
-# The SSH user runs the clients under this directory. Keep private subdirectories restricted.
-$SUDO chmod a+x "$INSTALL_ROOT"
 
 NEED_SECURE=0
 if [ ! -d "$DATA_DIR/mysql" ]; then
