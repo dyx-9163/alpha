@@ -346,8 +346,21 @@ case "$phase" in
   probe) probe "${args[0]}" ;;
   stage) stage "${args[0]}" ;;
   checker)
+    member=$(direct_sql "
+SELECT CONCAT(MEMBER_ROLE, ':', (@@global.read_only OR @@global.super_read_only)) AS checker_member
+FROM performance_schema.replication_group_members
+WHERE MEMBER_ID = @@server_uuid AND MEMBER_STATE = 'ONLINE'")
+    checker_args=()
+    case "${args[0]}:$member" in
+      PRIMARY:$'checker_member\nPRIMARY:0'|PRIMARY:$'checker_member\nPRIMARY:1'|SECONDARY:$'checker_member\nSECONDARY:0') ;;
+      SECONDARY:$'checker_member\nSECONDARY:1')
+        # The primary still runs CHECK TABLE FOR UPGRADE for the replicated tables.
+        checker_args+=(--exclude=checkTableCommand)
+        ;;
+      *) fail 'MySQL upgrade checker could not confirm the expected online member role' ;;
+    esac
     if ! mysqlsh "$shell_next/bin/mysqlsh" --host=127.0.0.1 --port="$port" -- util check-for-server-upgrade \
-      --target-version=8.4.13 --output-format=JSON --config-path="$candidate" > "$work/upgrade-check.json"; then
+      --target-version=8.4.13 --output-format=JSON --config-path="$candidate" "${checker_args[@]}" > "$work/upgrade-check.json"; then
       cat -- "$work/upgrade-check.json"
       fail 'MySQL Shell Upgrade Checker failed'
     fi

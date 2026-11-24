@@ -355,12 +355,12 @@ func (u *offlineUpgrade) stage(ctx context.Context) error {
 			}
 		}
 	}
-	views, _, err := u.views(ctx)
+	views, primary, err := u.views(ctx)
 	if err != nil {
 		return err
 	}
 	u.baseline = views
-	for _, node := range slices.Concat(u.nodes, u.routers) {
+	for i, node := range slices.Concat(u.nodes, u.routers) {
 		if err := u.service.remote.UploadFile(ctx, node.server, u.bundle.ArchivePath, path.Join(node.work, "bundle.tar"), 0o600); err != nil {
 			return u.phaseError(node, "upload-bundle")
 		}
@@ -370,7 +370,11 @@ func (u *offlineUpgrade) stage(ctx context.Context) error {
 		if node.instance.App == "mysql-router" {
 			continue
 		}
-		output, err := u.script(ctx, node, "checker")
+		role := "SECONDARY"
+		if i == primary {
+			role = "PRIMARY"
+		}
+		output, err := u.script(ctx, node, "checker", role)
 		if err != nil || !upgradeCheckerPassed(output) {
 			return u.phaseError(node, "upgrade-checker")
 		}

@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -67,6 +68,69 @@ func TestOfflineUpgradeCandidateKeepsInPlacePathsAndRemovedOptionHandling(t *tes
 	}
 }
 
+func TestOfflineUpgradeCheckerOnReadOnlySecondary(t *testing.T) {
+	requireLinuxDescriptors(t)
+	for _, tc := range []struct {
+		name, expectedRole, localStatus, errorCount string
+		wantPass, wantExclude                       bool
+	}{
+		{"read-only secondary", "SECONDARY", "SECONDARY:1", "0", true, true},
+		{"writable secondary", "SECONDARY", "SECONDARY:0", "0", true, false},
+		{"primary", "PRIMARY", "PRIMARY:0", "0", true, false},
+		{"role changed", "SECONDARY", "PRIMARY:0", "0", false, false},
+		{"member not online", "SECONDARY", "", "0", false, false},
+		{"secondary has another error", "SECONDARY", "SECONDARY:1", "1", false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			work := filepath.Join(root, "work")
+			mustMkdirLogical(t, work, 0o700)
+			writeLogicalTestFile(t, filepath.Join(work, "upgrade.sh"), offlineUpgradeScript, 0o700)
+			writeLogicalTestFile(t, filepath.Join(work, "credential.cnf"), "", 0o600)
+			clientDir := filepath.Join(root, "mysql-shell", "bin")
+			mustMkdirLogical(t, clientDir, 0o700)
+			writeLogicalTestFile(t, filepath.Join(clientDir, "mysqlsh"), `#!/usr/bin/env bash
+for query in "$@"; do
+  if [[ "$query" == *'SELECT'*'replication_group_members'* && "$query" != *'SET GLOBAL'* ]]; then
+    printf 'checker_member\n%s\n' "$TEST_LOCAL_STATUS"
+    exit 0
+  fi
+done
+exit 1
+`, 0o700)
+			checkerDir := filepath.Join(root, "mysql-shell.next-test", "bin")
+			mustMkdirLogical(t, checkerDir, 0o700)
+			writeLogicalTestFile(t, filepath.Join(checkerDir, "mysqlsh"), `#!/usr/bin/env bash
+printf '%s\n' "$@" > "$TEST_CHECKER_ARGS"
+if [[ "$TEST_LOCAL_STATUS" == 'SECONDARY:1' && " $* " != *' --exclude=checkTableCommand '* ]]; then
+  exit 1
+fi
+printf '{"targetVersion":"8.4.13","errorCount":%s,"checksPerformed":[{}]}\n' "$TEST_ERROR_COUNT"
+`, 0o700)
+			argsPath := filepath.Join(work, "checker-args")
+			cmd := exec.Command("bash", filepath.Join(work, "upgrade.sh"), "checker", "mysql", root, work, root, "test", "3306", tc.expectedRole)
+			cmd.Env = append(os.Environ(), "TEST_LOCAL_STATUS="+tc.localStatus, "TEST_CHECKER_ARGS="+argsPath, "TEST_ERROR_COUNT="+tc.errorCount)
+			output, err := cmd.Output()
+			if passed := err == nil && upgradeCheckerPassed(string(output)); passed != tc.wantPass {
+				t.Errorf("precheck passed = %t, want %t, script error = %v", passed, tc.wantPass, err)
+			}
+			args, err := os.ReadFile(argsPath)
+			if tc.localStatus == "" || !strings.HasPrefix(tc.localStatus, tc.expectedRole+":") {
+				if !os.IsNotExist(err) {
+					t.Fatal("checker ran without the expected online member role")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if excluded := strings.Contains(string(args), "--exclude=checkTableCommand\n"); excluded != tc.wantExclude {
+				t.Errorf("table check excluded = %t, want %t", excluded, tc.wantExclude)
+			}
+		})
+	}
+}
+
 func TestInstallTemplateKeepsWriteSetOptionOnlyForSourceVersion(t *testing.T) {
 	for _, tt := range []struct {
 		version string
@@ -91,6 +155,9 @@ func TestOfflineUpgradeRollsLivePrimaryLastAndRecordsOnlyVerifiedVersions(t *tes
 	}
 	if !slices.Equal(remote.rolled, []int{0, 2, 1}) || remote.firstRollBeforeTools {
 		t.Fatalf("unexpected rollout order or premature server switch: %v", remote.rolled)
+	}
+	if !slices.Equal(remote.checkerRoles, []string{"SECONDARY", "PRIMARY", "SECONDARY"}) {
+		t.Fatalf("upgrade checker did not use validated member roles: %v", remote.checkerRoles)
 	}
 	if len(data.updated) != 4 {
 		t.Fatalf("recorded %d versions, expected three MySQL Server records and one Router record", len(data.updated))
@@ -139,6 +206,7 @@ type upgradeFakeRemote struct {
 	views                    []upgradeView
 	servers                  []store.Server
 	rolled                   []int
+	checkerRoles             []string
 	metadata, routerUpgraded bool
 	firstRollBeforeTools     bool
 	failServer               int
@@ -164,6 +232,8 @@ func (r *upgradeFakeRemote) Run(_ context.Context, server store.Server, command 
 		}
 		result.Stdout = output.String()
 	case strings.Contains(command, " 'checker' "):
+		lastArg := command[strings.LastIndexByte(command, ' ')+1:]
+		r.checkerRoles = append(r.checkerRoles, strings.Trim(lastArg, "'"))
 		result.Stdout = `{"targetVersion":"8.4.13","errorCount":0,"checksPerformed":[{}]}`
 	case strings.Contains(command, " 'metadata-upgrade' "):
 		r.metadata = true
