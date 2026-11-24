@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -560,9 +561,33 @@ func TestCannotDemoteLastOwner(t *testing.T) {
 
 func TestRetentionCleanupStartsTask(t *testing.T) {
 	api, db, secret := newAuthzTestAPI(t)
-	api.cfg.AuditRetentionDays = 1
+	api.cfg.AuditRetentionDays = 30
 	api.cfg.TaskRetentionDays = 1
 	token := issueTestToken(t, db, secret, "owner", "owner")
+
+	snapshot := store.StatusSnapshot{Scope: "server", ResourceID: "srv-retention", Status: "ready", Payload: "{}"}
+	if _, _, err := db.UpsertStatusSnapshot(snapshot); err != nil {
+		t.Fatal(err)
+	}
+	alert, _, err := db.UpsertAlert(store.Alert{Fingerprint: "retention-alert", Scope: "server", Title: "Test alert"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rawDB, err := sql.Open("sqlite", api.cfg.DatabasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rawDB.Close()
+	old := time.Now().AddDate(0, 0, -2)
+	const seed = `with recursive records(n) as (values(1) union all select n+1 from records where n < 501) `
+	if _, err := rawDB.Exec(seed+`insert into status_snapshot_history(scope,resource_id,status,payload,version,collected_at,created_at)
+		select ?,?,'stale','{}',1,?,? from records`, snapshot.Scope, snapshot.ResourceID, old, old); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rawDB.Exec(seed+`insert into alert_events(alert_id,fingerprint,event,created_at)
+		select ?,?,'updated',? from records`, alert.ID, alert.Fingerprint, old); err != nil {
+		t.Fatal(err)
+	}
 
 	req := httptest.NewRequest(http.MethodPost, "/api/v2/maintenance/retention/run", nil)
 	req.Header.Set("Authorization", "Bearer "+token)
@@ -583,6 +608,35 @@ func TestRetentionCleanupStartsTask(t *testing.T) {
 	}
 	waitForTaskStatus(t, db, taskID, "success")
 	assertAuditExists(t, db, "maintenance.retention.run", "running", "owner", "control-plane")
+	for _, table := range []string{"status_snapshot_history", "alert_events"} {
+		var count, recent int
+		query := "select count(*), count(case when created_at >= ? then 1 end) from " + table
+		if err := rawDB.QueryRow(query, time.Now().AddDate(0, 0, -1)).Scan(&count, &recent); err != nil {
+			t.Fatal(err)
+		}
+		if count != 1 || recent != 1 {
+			t.Errorf("%s has %d rows (%d recent), want only the recent row", table, count, recent)
+		}
+	}
+	if current, err := db.GetStatusSnapshot(snapshot.Scope, snapshot.ResourceID); err != nil || current.Status != snapshot.Status {
+		t.Errorf("current snapshot changed: status=%q err=%v", current.Status, err)
+	}
+	if current, err := db.GetAlert(alert.ID); err != nil || current.Status != "open" {
+		t.Errorf("open alert changed: status=%q err=%v", current.Status, err)
+	}
+	steps, err := db.ListTaskSteps(taskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantSteps := []string{"cleanup-audit", "cleanup-tasks", "cleanup-status-history", "cleanup-alert-events"}
+	if len(steps) != len(wantSteps) {
+		t.Fatalf("cleanup has %d steps, want %d", len(steps), len(wantSteps))
+	}
+	for i, step := range steps {
+		if step.Name != wantSteps[i] || step.Status != "success" {
+			t.Errorf("step %d = %s (%s), want %s (success)", i+1, step.Name, step.Status, wantSteps[i])
+		}
+	}
 }
 
 func TestDatabaseBackupStartsTaskAndCreatesFile(t *testing.T) {

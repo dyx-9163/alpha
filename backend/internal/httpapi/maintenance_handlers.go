@@ -215,7 +215,30 @@ func (a *API) runRetentionCleanup(w http.ResponseWriter, r *http.Request) {
 		respondTask(w, task, err)
 		return
 	}
-	if err := a.storeTaskPlanOrDelete(task.ID, simpleTaskPlan(target, retentionCleanupSteps(lang))); err != nil {
+	historyCleanups := []struct {
+		step      simpleTaskStep
+		resultKey string
+		run       func(context.Context, maintenance.RetentionPlan) (int, error)
+	}{
+		{
+			step:      simpleTaskStep{"cleanup-status-history", i18n.Text(lang, "maintenance.cleanupStatusHistoryStep")},
+			resultKey: "maintenance.statusHistoryDeleted",
+			run:       service.CleanupStatusHistory,
+		},
+		{
+			step:      simpleTaskStep{"cleanup-alert-events", i18n.Text(lang, "maintenance.cleanupAlertEventsStep")},
+			resultKey: "maintenance.alertEventsDeleted",
+			run:       service.CleanupAlertEvents,
+		},
+	}
+	steps := []simpleTaskStep{
+		{"cleanup-audit", i18n.Text(lang, "maintenance.cleanupAuditStep")},
+		{"cleanup-tasks", i18n.Text(lang, "maintenance.cleanupTasksStep")},
+	}
+	for _, cleanup := range historyCleanups {
+		steps = append(steps, cleanup.step)
+	}
+	if err := a.storeTaskPlanOrDelete(task.ID, simpleTaskPlan(target, steps)); err != nil {
 		writeError(w, http.StatusInternalServerError, "MAINTENANCE_PLAN_STORE_FAILED", err.Error(), map[string]any{"target": target})
 		return
 	}
@@ -252,6 +275,24 @@ func (a *API) runRetentionCleanup(w http.ResponseWriter, r *http.Request) {
 		}
 		log.Info(i18n.Text(lang, "maintenance.tasksDeleted"), tasksDeleted, formatRetentionCutoff(plan.TaskCutoff))
 		log.FinishStep(target, "cleanup-tasks", "success", "")
+
+		for i, cleanup := range historyCleanups {
+			name := cleanup.step.name
+			log.StartStep(target, name, cleanup.step.title, i+3)
+			deleted, err := cleanup.run(ctx, plan)
+			if cancelErr := ctx.Err(); cancelErr != nil {
+				log.FinishStep(target, name, "cancelled", cancelErr.Error())
+				log.FinishTarget(target, "cancelled", cancelErr.Error())
+				return cancelErr
+			}
+			if err != nil {
+				log.FinishStep(target, name, "failed", err.Error())
+				log.FinishTarget(target, "failed", err.Error())
+				return err
+			}
+			log.Info(i18n.Text(lang, cleanup.resultKey), deleted, formatRetentionCutoff(plan.TaskCutoff))
+			log.FinishStep(target, name, "success", "")
+		}
 		log.FinishTarget(target, "success", "")
 		return nil
 	})
@@ -274,13 +315,6 @@ func databaseBackupSteps(lang string) []simpleTaskStep {
 		{"prepare-backup", i18n.Text(lang, "maintenance.prepareBackupStep")},
 		{"backup-database", i18n.Text(lang, "maintenance.backupDatabaseStep")},
 		{"verify-backup", i18n.Text(lang, "maintenance.verifyBackupStep")},
-	}
-}
-
-func retentionCleanupSteps(lang string) []simpleTaskStep {
-	return []simpleTaskStep{
-		{"cleanup-audit", i18n.Text(lang, "maintenance.cleanupAuditStep")},
-		{"cleanup-tasks", i18n.Text(lang, "maintenance.cleanupTasksStep")},
 	}
 }
 

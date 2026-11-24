@@ -1,13 +1,14 @@
 package maintenance
 
 import (
-	"aifar-deployment/backend/internal/store"
-
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"aifar-deployment/backend/internal/store"
 )
 
 type fakeStore struct{}
@@ -27,6 +28,14 @@ func (fakeStore) DeleteAuditLogsBefore(time.Time) (int, error) {
 }
 
 func (fakeStore) DeleteFinishedTasksBefore(time.Time) (int, error) {
+	return 0, nil
+}
+
+func (fakeStore) DeleteStatusSnapshotHistoryBefore(context.Context, time.Time) (int, error) {
+	return 0, nil
+}
+
+func (fakeStore) DeleteAlertEventsBefore(context.Context, time.Time) (int, error) {
 	return 0, nil
 }
 

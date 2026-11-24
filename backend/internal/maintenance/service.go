@@ -1,6 +1,7 @@
 package maintenance
 
 import (
+	"context"
 	"crypto/sha256"
 	"database/sql"
 	"fmt"
@@ -18,6 +19,8 @@ type Store interface {
 	BackupDatabase(path string) (int64, string, error)
 	DeleteAuditLogsBefore(cutoff time.Time) (int, error)
 	DeleteFinishedTasksBefore(cutoff time.Time) (int, error)
+	DeleteStatusSnapshotHistoryBefore(ctx context.Context, cutoff time.Time) (int, error)
+	DeleteAlertEventsBefore(ctx context.Context, cutoff time.Time) (int, error)
 }
 
 type RetentionConfig struct {
@@ -82,6 +85,14 @@ func (s Service) CleanupTasks(plan RetentionPlan) (int, error) {
 		return 0, nil
 	}
 	return s.store.DeleteFinishedTasksBefore(plan.TaskCutoff)
+}
+
+func (s Service) CleanupStatusHistory(ctx context.Context, plan RetentionPlan) (int, error) {
+	return s.store.DeleteStatusSnapshotHistoryBefore(ctx, plan.TaskCutoff)
+}
+
+func (s Service) CleanupAlertEvents(ctx context.Context, plan RetentionPlan) (int, error) {
+	return s.store.DeleteAlertEventsBefore(ctx, plan.TaskCutoff)
 }
 
 func (s Service) BackupDatabase(dir string, now time.Time) (DatabaseBackup, error) {
