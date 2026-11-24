@@ -68,6 +68,59 @@ func TestOfflineUpgradeCandidateKeepsInPlacePathsAndRemovedOptionHandling(t *tes
 	}
 }
 
+func TestOfflineUpgradeExtractsServiceTreesWithRuntimeOwner(t *testing.T) {
+	requireLinuxDescriptors(t)
+	script, _, found := strings.Cut(offlineUpgradeScript, "\ncase \"$phase\" in\n")
+	if !found {
+		t.Fatal("could not load upgrade shell functions")
+	}
+	for _, tc := range []struct {
+		binary, owner string
+	}{
+		{"mysqld", "aifar-mysql:aifar-mysql"},
+		{"mysqlrouter", "aifar-router:aifar-router"},
+		{"mysqlsh", ""},
+	} {
+		t.Run(tc.binary, func(t *testing.T) {
+			work := t.TempDir()
+			source := filepath.Join(work, "source")
+			mustMkdirLogical(t, filepath.Join(source, "bin"), 0o700)
+			writeLogicalTestFile(t, filepath.Join(source, "bin", tc.binary), "", 0o700)
+			mustMkdirLogical(t, filepath.Join(work, "bundles"), 0o700)
+			archive := exec.Command("tar", "-cf", filepath.Join(work, "bundles", "test.tar"), "-C", work, "source")
+			if output, err := archive.CombinedOutput(); err != nil {
+				t.Fatalf("create fixture archive: %v\n%s", err, output)
+			}
+			scriptPath := filepath.Join(work, "test.sh")
+			writeLogicalTestFile(t, scriptPath, script+`
+as_root() {
+  if [[ "$1" == chown ]]; then
+    printf '%s\n' "$@" > "$work/ownership-args"
+  else
+    "$@"
+  fi
+}
+extract_tree test.tar "$work/expanded" source "bin/${args[0]}" "$work/target"
+`, 0o700)
+			extract := exec.Command("bash", scriptPath, "stage", "mysql", work, work, work, "test", "3306", tc.binary)
+			if output, err := extract.CombinedOutput(); err != nil {
+				t.Fatalf("extract upgrade tree: %v\n%s", err, output)
+			}
+			args, err := os.ReadFile(filepath.Join(work, "ownership-args"))
+			if tc.owner == "" {
+				if !os.IsNotExist(err) {
+					t.Fatal("admin-only MySQL Shell tree ownership should be preserved")
+				}
+				return
+			}
+			want := strings.Join([]string{"chown", "-hR", "--", tc.owner, filepath.Join(work, "target"), ""}, "\n")
+			if err != nil || string(args) != want {
+				t.Errorf("candidate ownership command = %q, error = %v, want %q", args, err, want)
+			}
+		})
+	}
+}
+
 func TestOfflineUpgradeCheckerOnReadOnlySecondary(t *testing.T) {
 	requireLinuxDescriptors(t)
 	for _, tc := range []struct {

@@ -152,14 +152,18 @@ restore_labels() {
 }
 
 check_version() {
-  local binary=$1 libraries=$2 version=$3 pattern report
+  local binary=$1 libraries=$2 version=$3 principal=${4:-} pattern report
+  local -a command=(env "LD_LIBRARY_PATH=$libraries")
+  if [[ -n "$principal" ]]; then
+    command=(as_root runuser -u "$principal" -- "${command[@]}")
+  fi
   pattern=${version//./\\.}
-  report=$(env LD_LIBRARY_PATH="$libraries" ldd "$binary")
+  report=$("${command[@]}" ldd "$binary")
   if grep -Fq 'not found' <<< "$report"; then
     printf '%s\n' "$report" >&2
     fail "Missing runtime library for $binary"
   fi
-  report=$(env LD_LIBRARY_PATH="$libraries" "$binary" --version)
+  report=$("${command[@]}" "$binary" --version)
   grep -Eq "(^|[^0-9.])$pattern([^0-9.]|$)" <<< "$report"
 }
 
@@ -221,6 +225,11 @@ extract_tree() {
   test "${#dirs[@]}" = 1 && test -d "${dirs[0]}" && test -x "${dirs[0]}/$binary"
   test ! -e "$target" && test ! -L "$target"
   as_root cp -a -- "${dirs[0]}" "$target"
+  # Keep the archive modes, including private directories created under umask 077.
+  case "$binary" in
+    bin/mysqld) as_root chown -hR -- aifar-mysql:aifar-mysql "$target" ;;
+    bin/mysqlrouter) as_root chown -hR -- aifar-router:aifar-router "$target" ;;
+  esac
 }
 
 check_config() {
@@ -255,7 +264,7 @@ stage() {
       0e6f5e69d2bf1e5c1dcdfb31dff3b43c4731ef94d391d7d1a87fa28649e75106 "$work/bundles/$shell_archive" | sha256sum --check --status
     extract_tree "$server_archive" "$work/server" 'mysql-8.4.13-*' bin/mysqld "$server_next"
     extract_tree "$shell_archive" "$work/shell" 'mysql-shell-26.10.0-*' bin/mysqlsh "$shell_next"
-    check_version "$server_next/bin/mysqld" "$server_next/lib" 8.4.13
+    check_version "$server_next/bin/mysqld" "$server_next/lib" 8.4.13 aifar-mysql
     check_version "$shell_next/bin/mysqlsh" "$shell_next/lib" 26.10.0
     check_config
   else
@@ -269,7 +278,7 @@ stage() {
     printf '%s  %s\n' 5074914158bcf6da8c034b6202bf86d566d7c0f175d438279d8d218c6580b025 \
       "$work/bundles/$router_archive" | sha256sum --check --status
     extract_tree "$router_archive" "$work/router" 'mysql-router-26.10.0-*' bin/mysqlrouter "$router_next"
-    check_version "$router_next/bin/mysqlrouter" "$(router_libs "$router_next")" 26.10.0
+    check_version "$router_next/bin/mysqlrouter" "$(router_libs "$router_next")" 26.10.0 aifar-router
   fi
   rm -rf -- "$work/bundles" "$work/server" "$work/shell" "$work/router"
   rm -f -- "$work/bundle.tar"
@@ -383,7 +392,7 @@ WHERE MEMBER_ID = @@server_uuid AND MEMBER_STATE = 'ONLINE'")
     ;;
   verify-router)
     check_process "$router_base/bin/mysqlrouter"
-    check_version "$router_base/bin/mysqlrouter" "$(router_libs "$router_base")" 26.10.0
+    check_version "$router_base/bin/mysqlrouter" "$(router_libs "$router_base")" 26.10.0 aifar-router
     ;;
   route-sql)
     expected=$'__AIFAR_UPGRADE_ROUTER__\t'"${args[2]}"$'\t0'
