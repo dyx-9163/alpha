@@ -7,6 +7,10 @@ var middlewareUpgradeMessages = map[string][2]string{
 	"resources":   {"缺少目标版本的完整离线介质，请重新扫描资源", "The offline upgrade artifacts are incomplete. Rescan the resources."},
 	"unavailable": {"升级模块不可用", "The upgrade module is unavailable."},
 	"execute":     {"备份、切换和验证升级组", "Back up, upgrade, and verify the group"},
+	"mysqlWriteSetHandled": {
+		"节点 %s 的预检查报告了旧版 MySQL 的 WRITESET 配置。已从 MySQL 8.4 候选配置移除该参数，并通过配置校验。",
+		"The upgrade checker on %s reported the old MySQL WRITESET setting. The MySQL 8.4 candidate configuration omits the setting and passed validation.",
+	},
 }
 
 func MiddlewareUpgradeText(language, key string) string {

@@ -111,7 +111,8 @@ printf '{"targetVersion":"8.4.13","errorCount":%s,"checksPerformed":[{}]}\n' "$T
 			cmd := exec.Command("bash", filepath.Join(work, "upgrade.sh"), "checker", "mysql", root, work, root, "test", "3306", tc.expectedRole)
 			cmd.Env = append(os.Environ(), "TEST_LOCAL_STATUS="+tc.localStatus, "TEST_CHECKER_ARGS="+argsPath, "TEST_ERROR_COUNT="+tc.errorCount)
 			output, err := cmd.Output()
-			if passed := err == nil && upgradeCheckerPassed(string(output)); passed != tc.wantPass {
+			reportPassed, _ := upgradeCheckerPassed(string(output))
+			if passed := err == nil && reportPassed; passed != tc.wantPass {
 				t.Errorf("precheck passed = %t, want %t, script error = %v", passed, tc.wantPass, err)
 			}
 			args, err := os.ReadFile(argsPath)
@@ -126,6 +127,49 @@ printf '{"targetVersion":"8.4.13","errorCount":%s,"checksPerformed":[{}]}\n' "$T
 			}
 			if excluded := strings.Contains(string(args), "--exclude=checkTableCommand\n"); excluded != tc.wantExclude {
 				t.Errorf("table check excluded = %t, want %t", excluded, tc.wantExclude)
+			}
+		})
+	}
+}
+
+const writeSetCheckerReport = `{
+  "targetVersion":"8.4.13",
+  "errorCount":1,
+  "checksPerformed":[
+    {"id":"sysVars","status":"OK","detectedProblems":[
+      {"level":"Error","dbObject":"binlog_transaction_dependency_tracking","dbObjectType":"SystemVariable",
+       "description":"variable removed at version 8.4.0 is set to WRITESET (EXPLICIT).."},
+      {"level":"Warning","dbObject":"another_variable","dbObjectType":"SystemVariable"}
+    ]},
+    {"id":"columnDefinition","status":"OK"}
+  ]
+}`
+
+func TestOfflineUpgradeCheckerAcceptsOnlyRemediatedWriteSet(t *testing.T) {
+	for _, tc := range []struct {
+		name, from, to string
+		want           bool
+	}{
+		{"known explicit WRITESET", "", "", true},
+		{"another error", `"Warning"`, `"Error"`, false},
+		{"other variable", "binlog_transaction_dependency_tracking", "another_variable", false},
+		{"other check", "sysVars", "otherCheck", false},
+		{"persisted value", "(EXPLICIT)", "(PERSISTED)", false},
+		{"other replication behavior", "WRITESET (", "WRITESET_SESSION (", false},
+		{"unexpected report target", "8.4.13", "8.4.12", false},
+		{"unaccounted error", `"errorCount":1`, `"errorCount":2`, false},
+		{"missing error count", `"errorCount":1,`, "", false},
+		{"check could not run", `"columnDefinition","status":"OK"`, `"columnDefinition","status":"ERROR"`, false},
+		{"check configuration error", `"columnDefinition","status":"OK"`, `"columnDefinition","status":"CONFIGURATION_ERROR"`, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			report := writeSetCheckerReport
+			if tc.from != "" {
+				report = strings.Replace(report, tc.from, tc.to, 1)
+			}
+			passed, handled := upgradeCheckerPassed(report)
+			if passed != tc.want || handled != tc.want {
+				t.Errorf("checker passed = %t, WRITESET handled = %t, want both %t", passed, handled, tc.want)
 			}
 		})
 	}
@@ -149,6 +193,7 @@ func TestInstallTemplateKeepsWriteSetOptionOnlyForSourceVersion(t *testing.T) {
 
 func TestOfflineUpgradeRollsLivePrimaryLastAndRecordsOnlyVerifiedVersions(t *testing.T) {
 	data, remote, resources, run := newOfflineUpgradeFixture(t)
+	remote.checkerReport = writeSetCheckerReport
 	service := NewService(data, remote)
 	if err := service.RunOfflineUpgrade(context.Background(), data.instances[0], resources, run); err != nil {
 		t.Fatal(err)
@@ -207,6 +252,7 @@ type upgradeFakeRemote struct {
 	servers                  []store.Server
 	rolled                   []int
 	checkerRoles             []string
+	checkerReport            string
 	metadata, routerUpgraded bool
 	firstRollBeforeTools     bool
 	failServer               int
@@ -235,6 +281,9 @@ func (r *upgradeFakeRemote) Run(_ context.Context, server store.Server, command 
 		lastArg := command[strings.LastIndexByte(command, ' ')+1:]
 		r.checkerRoles = append(r.checkerRoles, strings.Trim(lastArg, "'"))
 		result.Stdout = `{"targetVersion":"8.4.13","errorCount":0,"checksPerformed":[{}]}`
+		if r.checkerReport != "" {
+			result.Stdout = r.checkerReport
+		}
 	case strings.Contains(command, " 'metadata-upgrade' "):
 		r.metadata = true
 	case strings.Contains(command, " 'tools' 'mysql-router' "):

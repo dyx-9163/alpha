@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"aifar-deployment/backend/internal/apps/registry"
+	"aifar-deployment/backend/internal/i18n"
 	"aifar-deployment/backend/internal/installer/installerkit"
 	"aifar-deployment/backend/internal/store"
 	"aifar-deployment/backend/internal/taskrun"
@@ -243,14 +244,50 @@ func validateUpgradeViews(views []upgradeView, versions map[int]string, baseline
 	return primary, nil
 }
 
-func upgradeCheckerPassed(output string) bool {
+func upgradeCheckerPassed(output string) (passed, handledWriteSet bool) {
 	var report struct {
-		TargetVersion   string            `json:"targetVersion"`
-		ErrorCount      *int              `json:"errorCount"`
-		ChecksPerformed []json.RawMessage `json:"checksPerformed"`
+		TargetVersion   string `json:"targetVersion"`
+		ErrorCount      *int   `json:"errorCount"`
+		ChecksPerformed []struct {
+			ID               string `json:"id"`
+			Status           string `json:"status"`
+			DetectedProblems []struct {
+				Level        string `json:"level"`
+				DBObject     string `json:"dbObject"`
+				DBObjectType string `json:"dbObjectType"`
+				Description  string `json:"description"`
+			} `json:"detectedProblems"`
+		} `json:"checksPerformed"`
 	}
-	return json.Unmarshal([]byte(output), &report) == nil && report.TargetVersion == OfflineUpgradeTargetVersion &&
-		report.ErrorCount != nil && *report.ErrorCount == 0 && len(report.ChecksPerformed) > 0
+	if json.Unmarshal([]byte(output), &report) != nil || report.TargetVersion != OfflineUpgradeTargetVersion ||
+		report.ErrorCount == nil || len(report.ChecksPerformed) == 0 {
+		return false, false
+	}
+	if *report.ErrorCount == 0 {
+		return true, false
+	}
+	if *report.ErrorCount != 1 {
+		return false, false
+	}
+	// The stage command removes this option from the candidate file and runs
+	// mysqld --validate-config before the checker reads the live 8.0 server.
+	for _, check := range report.ChecksPerformed {
+		if check.Status != "OK" {
+			return false, false
+		}
+		for _, problem := range check.DetectedProblems {
+			if problem.Level == "Warning" || problem.Level == "Notice" {
+				continue
+			}
+			if handledWriteSet || check.ID != "sysVars" || problem.Level != "Error" ||
+				problem.DBObject != "binlog_transaction_dependency_tracking" || problem.DBObjectType != "SystemVariable" ||
+				problem.Description != "variable removed at version 8.4.0 is set to WRITESET (EXPLICIT).." {
+				return false, false
+			}
+			handledWriteSet = true
+		}
+	}
+	return handledWriteSet, handledWriteSet
 }
 
 func (u *offlineUpgrade) preflight(ctx context.Context, resources []store.Resource) error {
@@ -375,8 +412,13 @@ func (u *offlineUpgrade) stage(ctx context.Context) error {
 			role = "PRIMARY"
 		}
 		output, err := u.script(ctx, node, "checker", role)
-		if err != nil || !upgradeCheckerPassed(output) {
+		passed, handledWriteSet := upgradeCheckerPassed(output)
+		if err != nil || !passed {
 			return u.phaseError(node, "upgrade-checker")
+		}
+		if handledWriteSet {
+			log := u.run.LoggerForTarget(OfflineUpgradeClusterID(u.seed))
+			log.Info(i18n.MiddlewareUpgradeText(u.run.Language, "mysqlWriteSetHandled"), node.endpoint)
 		}
 	}
 	return nil
