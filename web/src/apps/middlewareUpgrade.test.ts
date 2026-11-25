@@ -19,4 +19,12 @@ describe('middleware upgrade eligibility', () => {
     expect(middlewareUpgradeTarget('minio', [minio('a'), minio('a')])).toBeNull()
     expect(middlewareUpgradeTarget('mysql', [mysql('a'), mysql('b'), mysql('c', '8.4.13')])).toBeNull()
   })
+
+  it('offers to resume a pending MySQL upgrade for mixed or fully upgraded members', () => {
+    const pending = { ...mysql('a', '8.4.13'), metadata: '{"offlineUpgradePending":true}' }
+    expect(middlewareUpgradeTarget('mysql', [pending, mysql('b'), mysql('c')])?.resume).toBe(true)
+    expect(middlewareUpgradeTarget('mysql', [pending, mysql('b', '8.4.13'), mysql('c', '8.4.13')])?.resume).toBe(true)
+    expect(middlewareUpgradeTarget('mysql', [pending, mysql('b', '8.4.12'), mysql('c')])).toBeNull()
+    expect(middlewareUpgradeTarget('mysql', [{ ...pending, metadata: '{"offlineUpgradePending":"true"}' }, mysql('b'), mysql('c')])).toBeNull()
+  })
 })

@@ -3,6 +3,7 @@ package mysql
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -171,6 +172,7 @@ as_root() {
   case "$1" in tar|sha256sum|sync) return 0 ;; esac
   "$@"
 }
+check_backup_source() { :; }
 check_tree() { test -d "$1"; }
 stop_cleanly() { :; }
 findmnt() { printf 'test mount\n'; }
@@ -427,14 +429,12 @@ func TestOfflineUpgradeRecordsVersionsAcrossRuntimeChecks(t *testing.T) {
 	service := NewService(db, nil)
 	u := offlineUpgrade{
 		data: db, bundle: Bundle{ArchivePath: "target.tar"},
-		run:      registry.RunContext{TaskID: "tsk_0123456789abcdef01234567"},
-		verified: map[string]store.AppInstanceVersionUpdate{},
+		run: registry.RunContext{TaskID: "tsk_0123456789abcdef01234567"},
 	}
-	u.markVerified(upgradeNode{instance: node, backup: "/backups/mysql"}, false)
 	if err := service.markInnoDBClusterPrimary(node, "10.0.0.1:3306", map[string]any{"observed": "latest"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := u.saveVerified(); err != nil {
+	if err := u.recordVerified(upgradeNode{instance: node, backup: "/backups/mysql"}, false); err != nil {
 		t.Fatal(err)
 	}
 	if err := service.markInstanceStatus(node, "failed", nil); err != nil {
@@ -467,14 +467,150 @@ func TestOfflineUpgradeStopsBeforeFurtherServersWhenCutoverFails(t *testing.T) {
 	}
 }
 
+func TestOfflineUpgradeRouterFailureRestoresRouterBeforeContinuing(t *testing.T) {
+	data, remote, resources, run := newOfflineUpgradeFixture(t)
+	first := data.instances[3]
+	next := first
+	next.ID = first.ID + "-2"
+	next.ServerID = remote.servers[1].ID
+	data.instances = append(data.instances, next)
+	remote.failRoute = true
+	service := NewService(data, remote)
+	if err := service.RunOfflineUpgrade(context.Background(), data.instances[0], resources, run); err == nil {
+		t.Fatal("broken router SQL route returned success")
+	}
+	if !slices.Equal(remote.routerSwitches, []int{0}) || !slices.Equal(remote.routerReverts, []int{0}) {
+		t.Fatalf("expected only the broken Router to be switched and restored, got %v, %v", remote.routerSwitches, remote.routerReverts)
+	}
+}
+
+func TestOfflineUpgradeBoundsUploadAndRemoteCalls(t *testing.T) {
+	data, remote, resources, run := newOfflineUpgradeFixture(t)
+	service := NewService(data, remote)
+	if err := service.RunOfflineUpgrade(context.Background(), data.instances[0], resources, run); err != nil {
+		t.Fatal(err)
+	}
+	if remote.unboundedCall {
+		t.Fatal("upgrade executed an upload or remote command without a deadline")
+	}
+}
+
+func TestOfflineUpgradeResumesWithOriginalBackupsAndSkipsUpgradedMembers(t *testing.T) {
+	data, remote, resources, run := newOfflineUpgradeFixture(t)
+	remote.failServer = 2
+	service := NewService(data, remote)
+	if err := service.RunOfflineUpgrade(context.Background(), data.instances[0], resources, run); err == nil {
+		t.Fatal("expected the second server to fail before switching")
+	}
+	origin := run.TaskID
+	if data.checkpoint.TaskID != origin {
+		t.Fatalf("expected checkpoint for %s, got %+v", origin, data.checkpoint)
+	}
+	firstBackupCount := remote.coldBackups
+	firstUploadCount := remote.bundleUploads
+	remote.failServer = -1
+	run.TaskID = "tsk_1234567890abcdef01234567"
+	if err := service.RunOfflineUpgrade(context.Background(), data.instances[0], resources, run); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(remote.rolled, []int{0, 2, 1}) || remote.coldBackups != firstBackupCount ||
+		remote.bundleUploads != firstUploadCount || remote.resumeBackupChecks != firstBackupCount {
+		t.Fatalf("expected remaining two servers to roll with the original %d verified backups, got rolls %v, cold backups %d, resume checks %d, uploads %d",
+			firstBackupCount, remote.rolled, remote.coldBackups, remote.resumeBackupChecks, remote.bundleUploads)
+	}
+	if data.checkpoint.TaskID != "" {
+		t.Fatal("completed task left its checkpoint active")
+	}
+	for _, instance := range data.updated {
+		if !strings.Contains(instance.Metadata, origin) || !strings.Contains(instance.Metadata, `"offlineUpgradePending":false`) {
+			t.Fatalf("completed instance lost backup provenance: %+v", instance)
+		}
+	}
+}
+
+func TestOfflineUpgradeResumeRejectsChangedServerWithoutRemoteMutation(t *testing.T) {
+	data, remote, resources, run := newOfflineUpgradeFixture(t)
+	remote.failServer = 2
+	service := NewService(data, remote)
+	if err := service.RunOfflineUpgrade(context.Background(), data.instances[0], resources, run); err == nil {
+		t.Fatal("expected a partial upgrade")
+	}
+	id := data.instances[2].ServerID
+	server := data.servers[id]
+	server.Host = "192.0.2.100"
+	data.servers[id] = server
+	run.TaskID = "tsk_1234567890abcdef01234567"
+	remote.failServer = -1
+	if err := service.RunOfflineUpgrade(context.Background(), data.instances[0], resources, run); err == nil {
+		t.Fatal("resume accepted a changed server address")
+	}
+	if !slices.Equal(remote.rolled, []int{0}) || remote.resumeBackupChecks > 0 || data.checkpoint.TaskID == "" {
+		t.Fatal("resume touched the new address or cleared the original checkpoint")
+	}
+}
+
+func TestOfflineUpgradePersistsServerVersionWhenPostStartCleanupFails(t *testing.T) {
+	data, remote, resources, run := newOfflineUpgradeFixture(t)
+	remote.failAfterStart = true
+	service := NewService(data, remote)
+	if err := service.RunOfflineUpgrade(context.Background(), data.instances[0], resources, run); err == nil {
+		t.Fatal("post-start cleanup failure was not reported")
+	}
+	instance := data.updated[data.instances[0].ID]
+	if !slices.Equal(remote.rolled, []int{0}) || instance.Version != OfflineUpgradeTargetVersion ||
+		!strings.Contains(instance.Metadata, `"offlineUpgradePending":true`) {
+		t.Fatalf("expected a verified but incomplete upgrade, got %+v, %v", instance, remote.rolled)
+	}
+}
+
 type offlineUpgradeFakeStore struct {
 	*backupFakeStore
-	updated map[string]store.AppInstance
+	updated    map[string]store.AppInstance
+	checkpoint store.MySQLOfflineUpgradeCheckpoint
 }
 
 func (s *offlineUpgradeFakeStore) GetAppInstance(id string) (store.AppInstance, error) {
+	if updated, ok := s.updated[id]; ok {
+		return updated, nil
+	}
 	instance, _, err := clusterFixtureInstance(s.instances, id)
 	return instance, err
+}
+
+func (s *offlineUpgradeFakeStore) ListAppInstances() ([]store.AppInstance, error) {
+	result := slices.Clone(s.instances)
+	for i, instance := range result {
+		if updated, ok := s.updated[instance.ID]; ok {
+			result[i] = updated
+		}
+	}
+	return result, nil
+}
+
+func (s *offlineUpgradeFakeStore) GetMySQLOfflineUpgradeCheckpoint(string) (store.MySQLOfflineUpgradeCheckpoint, error) {
+	if s.checkpoint.TaskID == "" {
+		return s.checkpoint, sql.ErrNoRows
+	}
+	return s.checkpoint, nil
+}
+
+func (s *offlineUpgradeFakeStore) CreateMySQLOfflineUpgradeCheckpoint(_ string, checkpoint store.MySQLOfflineUpgradeCheckpoint) error {
+	if s.checkpoint.TaskID != "" {
+		return store.ErrMySQLOfflineUpgradeCheckpointConflict
+	}
+	s.checkpoint = checkpoint
+	return nil
+}
+
+func (s *offlineUpgradeFakeStore) CompleteMySQLOfflineUpgrade(_, taskID string, updates []store.AppInstanceVersionUpdate) error {
+	if s.checkpoint.TaskID != taskID {
+		return store.ErrMySQLOfflineUpgradeCheckpointConflict
+	}
+	if err := s.SaveAppInstanceVersionsIfUnchanged(updates); err != nil {
+		return err
+	}
+	s.checkpoint = store.MySQLOfflineUpgradeCheckpoint{}
+	return nil
 }
 
 func (s *offlineUpgradeFakeStore) SaveAppInstanceVersionsIfUnchanged(updates []store.AppInstanceVersionUpdate) error {
@@ -493,21 +629,33 @@ func (s *offlineUpgradeFakeStore) SaveAppInstanceVersionsIfUnchanged(updates []s
 }
 
 type upgradeFakeRemote struct {
-	views                    []upgradeView
-	servers                  []store.Server
-	rolled                   []int
-	checkerRoles             []string
-	checkerReport            string
-	metadata, routerUpgraded bool
-	firstRollBeforeTools     bool
-	failServer               int
+	views                                          []upgradeView
+	servers                                        []store.Server
+	rolled                                         []int
+	checkerRoles                                   []string
+	checkerReport                                  string
+	metadata, routerUpgraded                       bool
+	firstRollBeforeTools                           bool
+	failServer                                     int
+	failRoute                                      bool
+	routerSwitches, routerReverts                  []int
+	unboundedCall                                  bool
+	failAfterStart                                 bool
+	coldBackups, resumeBackupChecks, bundleUploads int
 }
 
-func (r *upgradeFakeRemote) UploadFile(_ context.Context, _ store.Server, _, _ string, _ os.FileMode) error {
+func (r *upgradeFakeRemote) UploadFile(ctx context.Context, _ store.Server, _, destination string, _ os.FileMode) error {
+	if strings.HasSuffix(destination, "/bundle.tar") {
+		r.bundleUploads++
+	}
+	_, bounded := ctx.Deadline()
+	r.unboundedCall = r.unboundedCall || !bounded
 	return nil
 }
 
-func (r *upgradeFakeRemote) Run(_ context.Context, server store.Server, command string) (adapter.CommandResult, error) {
+func (r *upgradeFakeRemote) Run(ctx context.Context, server store.Server, command string) (adapter.CommandResult, error) {
+	_, bounded := ctx.Deadline()
+	r.unboundedCall = r.unboundedCall || !bounded
 	var result adapter.CommandResult
 	index := slices.IndexFunc(r.servers, func(registered store.Server) bool { return registered.ID == server.ID })
 	switch {
@@ -529,11 +677,24 @@ func (r *upgradeFakeRemote) Run(_ context.Context, server store.Server, command 
 		if r.checkerReport != "" {
 			result.Stdout = r.checkerReport
 		}
+	case strings.Contains(command, " 'backup' "):
+		r.coldBackups++
+	case strings.Contains(command, " 'resume-backup-check' "):
+		r.resumeBackupChecks++
+	case strings.Contains(command, " 'resume-tools-probe' "):
+		result.Stdout = "__AIFAR_UPGRADE_TOOL__\t26.10.0\n"
 	case strings.Contains(command, " 'metadata-upgrade' "):
 		r.metadata = true
 	case strings.Contains(command, " 'tools' 'mysql-router' "):
 		r.routerUpgraded = true
+		r.routerSwitches = append(r.routerSwitches, index)
+	case strings.Contains(command, " 'revert-router' "):
+		r.routerReverts = append(r.routerReverts, index)
 	case strings.Contains(command, " 'route-sql' "):
+		if r.failRoute {
+			result.ExitCode = 1
+			return result, nil
+		}
 		result.Stdout = "__AIFAR_UPGRADE_ROUTER__\t" + r.views[index].uuid + "\t0\n"
 	case strings.Contains(command, " 'server' "):
 		if index == r.failServer {
@@ -547,6 +708,10 @@ func (r *upgradeFakeRemote) Run(_ context.Context, server store.Server, command 
 		if index == 1 {
 			r.views[0].members[0].role = "PRIMARY"
 			r.views[0].members[1].role = "SECONDARY"
+		}
+		if r.failAfterStart {
+			result.Stdout = "__AIFAR_UPGRADE_SERVER_STARTED__\n"
+			return result, fmt.Errorf("systemd daemon-reload failed")
 		}
 	}
 	return result, nil

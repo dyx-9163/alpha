@@ -81,6 +81,11 @@ func (a *API) saveServer(w http.ResponseWriter, r *http.Request) {
 	if id := chi.URLParam(r, "id"); id != "" {
 		req.ID = id
 	}
+	release, acquired := a.lockServerConfigMutation(w, r, "servers.save", req.ID)
+	if !acquired {
+		return
+	}
+	defer release()
 	input := req.toStoreServer()
 	if req.DockerHost == nil && input.ID != "" {
 		if current, currentErr := a.store.GetServer(input.ID, false); currentErr == nil {
@@ -100,11 +105,32 @@ func (a *API) saveServer(w http.ResponseWriter, r *http.Request) {
 
 func (a *API) deleteServer(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
+	release, acquired := a.lockServerConfigMutation(w, r, "servers.delete", id)
+	if !acquired {
+		return
+	}
+	defer release()
 	err := a.servers.Delete(id)
 	if err == nil {
 		a.audit(r, "servers.delete", id, "success", i18n.Text(languageFromRequest(r), "servers.deleted"))
 	}
 	respond(w, map[string]any{"deleted": id}, err)
+}
+
+func (a *API) lockServerConfigMutation(w http.ResponseWriter, r *http.Request, action, id string) (func(), bool) {
+	if strings.TrimSpace(id) == "" {
+		return func() {}, true
+	}
+	spec := serverConfigOperationLockSpec(action, id)
+	lock, err := a.store.AcquireOperationLock(store.OperationLock{
+		Scope: spec.Scope, ResourceID: spec.ResourceID, Operation: spec.Operation,
+		Owner: currentUser(r).Username, Metadata: spec.Metadata,
+	})
+	if err != nil {
+		writeOperationLockError(w, languageFromRequest(r), err)
+		return nil, false
+	}
+	return func() { _, _ = a.store.ReleaseOperationLock(lock.ID) }, true
 }
 
 func (a *API) probeServer(w http.ResponseWriter, r *http.Request) {

@@ -13,6 +13,7 @@ type Copy struct {
 	CredentialMissing  string
 	ProbingServer      string
 	ProbeSucceeded     string
+	ProbeObsolete      string
 	RuntimePlaceholder string
 	Saved              string
 	Deleted            string
@@ -28,6 +29,7 @@ func CopyFor(lang string) Copy {
 		CredentialMissing:  i18n.Text(lang, "servers.credentialMissing"),
 		ProbingServer:      i18n.Text(lang, "servers.probingServer"),
 		ProbeSucceeded:     i18n.Text(lang, "servers.probeSucceeded"),
+		ProbeObsolete:      i18n.Text(lang, "servers.probeObsolete"),
 		RuntimePlaceholder: i18n.Text(lang, "servers.runtimePlaceholder"),
 		Saved:              i18n.Text(lang, "servers.saved"),
 		Deleted:            i18n.Text(lang, "servers.deleted"),

@@ -55,18 +55,7 @@ func (a *API) acquireTaskOperationLocks(w http.ResponseWriter, lang string, task
 		if err != nil {
 			a.releaseOperationLocks(locks)
 			_ = a.store.DeleteTask(task.ID)
-			var conflict store.OperationLockConflict
-			if errors.As(err, &conflict) {
-				writeError(w, http.StatusConflict, "OPERATION_LOCKED", i18n.Text(lang, "api.operationLocked", conflict.Lock.ResourceID), map[string]any{
-					"scope":       conflict.Lock.Scope,
-					"resourceId":  conflict.Lock.ResourceID,
-					"operation":   conflict.Lock.Operation,
-					"ownerTaskId": conflict.Lock.OwnerTaskID,
-					"expiresAt":   conflict.Lock.ExpiresAt,
-				})
-				return nil, false
-			}
-			writeError(w, http.StatusInternalServerError, "OPERATION_LOCK_FAILED", err.Error(), nil)
+			writeOperationLockError(w, lang, err)
 			return nil, false
 		}
 		locks = append(locks, lock)
@@ -74,9 +63,31 @@ func (a *API) acquireTaskOperationLocks(w http.ResponseWriter, lang string, task
 	return locks, true
 }
 
+func writeOperationLockError(w http.ResponseWriter, lang string, err error) {
+	var conflict store.OperationLockConflict
+	if errors.As(err, &conflict) {
+		writeError(w, http.StatusConflict, "OPERATION_LOCKED", i18n.Text(lang, "api.operationLocked", conflict.Lock.ResourceID), map[string]any{
+			"scope":       conflict.Lock.Scope,
+			"resourceId":  conflict.Lock.ResourceID,
+			"operation":   conflict.Lock.Operation,
+			"ownerTaskId": conflict.Lock.OwnerTaskID,
+			"expiresAt":   conflict.Lock.ExpiresAt,
+		})
+		return
+	}
+	writeError(w, http.StatusInternalServerError, "OPERATION_LOCK_FAILED", err.Error(), nil)
+}
+
 func (a *API) releaseOperationLocks(locks []store.OperationLock) {
 	for _, lock := range locks {
 		_, _ = a.store.ReleaseOperationLock(lock.ID)
+	}
+}
+
+func serverConfigOperationLockSpec(action, serverID string) operationLockSpec {
+	return operationLockSpec{
+		Scope: "server-config", ResourceID: serverID, Operation: operationLockMutation,
+		Metadata: operationLockMetadata(map[string]any{"action": action, "serverId": serverID}),
 	}
 }
 

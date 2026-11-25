@@ -589,6 +589,42 @@ func (s *Store) SaveServer(v Server) (Server, error) {
 	return v, err
 }
 
+func (s *Store) UpdateServerProbeStatus(server Server, status, lastError string) (bool, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	var updatedAt time.Time
+	err = tx.QueryRow(`select updated_at from servers where id=?`, server.ID).Scan(&updatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil || !updatedAt.Equal(server.UpdatedAt) {
+		return false, err
+	}
+	if _, err := tx.Exec(`update servers set status=?, last_error=?, updated_at=? where id=?`, status, logmask.Mask(lastError), time.Now(), server.ID); err != nil {
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (s *Store) UpdateServerDockerHost(server Server, dockerHost, status string) (bool, error) {
+	result, err := s.db.Exec(`update servers
+		set docker_host=?, status=coalesce(nullif(?,''),status),
+			last_error=case when ? <> '' then '' else last_error end, updated_at=?
+		where id=? and host=? and port=? and username=? and deploy_dir=? and docker_host=?`,
+		dockerHost, status, status, time.Now(), server.ID, server.Host, server.Port, server.Username, server.DeployDir, server.DockerHost)
+	if err != nil {
+		return false, err
+	}
+	updated, err := result.RowsAffected()
+	return updated == 1, err
+}
+
 func (s *Store) nextServerSortOrder() (int, error) {
 	var sortOrder int
 	err := s.db.QueryRow(`select coalesce(max(sort_order),0) + 1 from servers`).Scan(&sortOrder)

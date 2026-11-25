@@ -11,6 +11,12 @@ var middlewareUpgradeMessages = map[string][2]string{
 		"节点 %s 的预检查报告了旧版 MySQL 的 WRITESET 配置。已从 MySQL 8.4 候选配置移除该参数，并通过配置校验。",
 		"The upgrade checker on %s reported the old MySQL WRITESET setting. The MySQL 8.4 candidate configuration omits the setting and passed validation.",
 	},
+	"mysqlCheckpointRead":     {"读取 MySQL 升级断点失败", "Could not read the MySQL upgrade checkpoint."},
+	"mysqlCheckpointWrite":    {"保存 MySQL 升级断点或完成状态失败，请保留原冷备", "Could not save the MySQL upgrade checkpoint or final status. Keep the original cold backups."},
+	"mysqlCheckpointInvalid":  {"MySQL 升级断点与当前节点、拓扑或离线包不一致，请保留原冷备并检查现场", "The MySQL upgrade checkpoint does not match the current nodes, topology, or offline bundle. Keep the original cold backups and inspect the deployment."},
+	"mysqlCheckpointChanged":  {"面板中的 MySQL 升级记录已变化，无法结束断点", "The MySQL upgrade records changed and the checkpoint could not be completed."},
+	"mysqlCheckpointResuming": {"正在核对并续跑原 MySQL 升级任务 %s，将继续使用其冷备目录", "Checking and resuming MySQL upgrade %s using its original cold backups."},
+	"mysqlPhaseTimeout":       {"远程升级阶段超时，请检查当前服务状态和原冷备", "The remote upgrade phase reached its deadline. Check the current service state and original cold backups."},
 	"mysqlProbeNotListening": {
 		"MySQL 节点 %s 暂未接受连接。",
 		"MySQL on %s is not accepting connections yet.",

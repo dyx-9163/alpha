@@ -1,12 +1,12 @@
 <template>
   <template v-if="eligible">
-    <el-button type="warning" plain :disabled="disabled" @click="open">
-      {{ t(`middlewareUpgrade.${app}.action`) }}
+    <el-button type="warning" plain :disabled="isDisabled" @click="open">
+      {{ actionLabel }}
     </el-button>
 
     <el-dialog
       v-model="visible"
-      :title="t(`middlewareUpgrade.${app}.action`)"
+      :title="actionLabel"
       width="min(94vw, 520px)"
       append-to-body
       :close-on-click-modal="false"
@@ -23,7 +23,7 @@
       </el-space>
       <template #footer>
         <el-button :disabled="submitting" @click="visible = false">{{ t('common.cancel') }}</el-button>
-        <el-button type="warning" :disabled="!confirmed || disabled" :loading="submitting" @click="submit">
+        <el-button type="warning" :disabled="!confirmed || isDisabled" :loading="submitting" @click="submit">
           {{ t('middlewareUpgrade.submit') }}
         </el-button>
       </template>
@@ -44,6 +44,7 @@ const props = defineProps<{
   title: string
   instances: MiddlewareUpgradeInstance[]
   disabled?: boolean
+  resumeDisabled?: boolean
 }>()
 
 const router = useRouter()
@@ -51,6 +52,8 @@ const session = useSessionStore()
 const { t } = useI18n()
 const target = computed(() => middlewareUpgradeTarget(props.app, props.instances))
 const eligible = computed(() => session.role.trim().toLowerCase() === 'owner' && target.value !== null)
+const isDisabled = computed(() => target.value?.resume ? (props.resumeDisabled ?? props.disabled) : props.disabled)
+const actionLabel = computed(() => t(target.value?.resume ? 'middlewareUpgrade.mysql.resume' : `middlewareUpgrade.${props.app}.action`))
 const visible = ref(false)
 const confirmed = ref(false)
 const submitting = ref(false)
@@ -64,7 +67,7 @@ function open() {
 
 async function submit() {
   const selected = target.value
-  if (!selected || !eligible.value || !confirmed.value || submitting.value || props.disabled) return
+  if (!selected || !eligible.value || !confirmed.value || submitting.value || isDisabled.value) return
   submitting.value = true
   error.value = ''
   try {

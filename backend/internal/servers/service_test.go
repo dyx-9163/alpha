@@ -3,6 +3,7 @@ package servers
 import (
 	"context"
 	"errors"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -27,6 +28,15 @@ func (f *fakeStore) SaveServer(v store.Server) (store.Server, error) {
 	return v, nil
 }
 
+func (f *fakeStore) UpdateServerProbeStatus(server store.Server, status, lastError string) (bool, error) {
+	if f.server.ID != server.ID || !f.server.UpdatedAt.Equal(server.UpdatedAt) {
+		return false, nil
+	}
+	f.server.Status = status
+	f.server.LastError = lastError
+	return true, nil
+}
+
 func (f *fakeStore) ReorderServers(ids []string) error {
 	return nil
 }
@@ -37,10 +47,14 @@ func (f *fakeStore) DeleteServer(id string) error {
 }
 
 type fakeProber struct {
-	err error
+	err          error
+	beforeReturn func()
 }
 
 func (f fakeProber) Probe(ctx context.Context, server store.Server) error {
+	if f.beforeReturn != nil {
+		f.beforeReturn()
+	}
 	return f.err
 }
 
@@ -127,6 +141,68 @@ func TestProbeFailureUpdatesServerStatus(t *testing.T) {
 	}
 	if s.server.LastError != probeErr.Error() {
 		t.Fatalf("expected last error %q, got %q", probeErr.Error(), s.server.LastError)
+	}
+}
+
+func TestProbeUpdatesOnlyTheRegistrationItObserved(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		edit     bool
+		delete   bool
+		probeErr error
+	}{
+		{name: "unchanged"},
+		{name: "edited", edit: true},
+		{name: "edited after failed probe", edit: true, probeErr: errors.New("SSH unavailable")},
+		{name: "deleted", delete: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db, err := store.Open(filepath.Join(t.TempDir(), "panel.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = db.Close() })
+			server, err := db.SaveServer(store.Server{
+				Name: "mysql", Host: "192.0.2.1", Username: "root", Password: "test", DeployDir: "/aifar/apps",
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			service := NewService(db, fakeProber{err: tc.probeErr, beforeReturn: func() {
+				switch {
+				case tc.edit:
+					edited := server
+					edited.Host = "192.0.2.2"
+					edited.DeployDir = "/new/apps"
+					if _, err := db.SaveServer(edited); err != nil {
+						t.Fatal(err)
+					}
+				case tc.delete:
+					if err := db.DeleteServer(server.ID); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}})
+			probeErr := service.Probe(context.Background(), server.ID, "en", &fakeLogger{})
+			current, err := db.GetServer(server.ID, false)
+			switch {
+			case tc.edit:
+				if err != nil || current.Host != "192.0.2.2" || current.DeployDir != "/new/apps" || current.Status != "unknown" {
+					t.Fatalf("stale probe changed the edited server: %+v (%v)", current, err)
+				}
+			case tc.delete:
+				if !store.IsNotFound(err) {
+					t.Fatalf("stale probe restored a deleted server: %+v (%v)", current, err)
+				}
+			default:
+				if err != nil || current.Status != "available" || current.Host != server.Host || probeErr != nil {
+					t.Fatalf("fresh probe did not update the server: %+v (%v, %v)", current, err, probeErr)
+				}
+			}
+			if (tc.edit || tc.delete) && probeErr == nil {
+				t.Fatal("probe reported success for a stale server registration")
+			}
+		})
 	}
 }
 

@@ -262,6 +262,18 @@ var storeMigrations = []storeMigration{
 		Name:    "mysql cluster authoritative topology",
 		Up:      backfillLegacyMySQLClusterTopologies,
 	},
+	{
+		Version: 2026112501,
+		Name:    "mysql offline upgrade checkpoints",
+		Up: func(tx *sql.Tx) error {
+			return execMigrationStatements(tx, `create table if not exists mysql_offline_upgrade_checkpoints (
+				cluster_id text not null primary key,
+				task_id text not null,
+				bundle_sha256 text not null,
+				nodes text not null
+			)`)
+		},
+	},
 }
 
 func runStoreMigrations(db *sql.DB) error {

@@ -13,6 +13,7 @@ type Store interface {
 	ListServers() ([]store.Server, error)
 	GetServer(id string, includeSecret bool) (store.Server, error)
 	SaveServer(v store.Server) (store.Server, error)
+	UpdateServerProbeStatus(server store.Server, status, lastError string) (bool, error)
 	ReorderServers(ids []string) error
 	DeleteServer(id string) error
 }
@@ -138,9 +139,11 @@ func (s Service) Probe(ctx context.Context, id string, lang string, log Logger) 
 		}
 		log.FinishStep(id, step.name, "success", "")
 	}
-	server.Status = "available"
-	server.LastError = ""
-	if _, err := s.store.SaveServer(server); err != nil {
+	updated, err := s.store.UpdateServerProbeStatus(server, "available", "")
+	if err == nil && !updated {
+		err = errors.New(copy.ProbeObsolete)
+	}
+	if err != nil {
 		log.FinishTarget(id, "failed", err.Error())
 		return err
 	}
@@ -153,9 +156,7 @@ func (s Service) markProbeFailed(server store.Server, err error) {
 	if server.ID == "" || err == nil {
 		return
 	}
-	server.Status = "failed"
-	server.LastError = err.Error()
-	_, _ = s.store.SaveServer(server)
+	_, _ = s.store.UpdateServerProbeStatus(server, "failed", err.Error())
 }
 
 func normalize(server store.Server, defaultDeployDir string) store.Server {

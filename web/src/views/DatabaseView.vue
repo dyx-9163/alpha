@@ -171,6 +171,7 @@
                 :title="group.title"
                 :instances="group.nodes.map(node => node.instance)"
                 :disabled="!mysqlAvailability(group).backup"
+                :resume-disabled="!canManageDatabase || mysqlAvailability(group).lifecycleBlocked"
               />
               <el-button v-if="mysqlAvailability(group).resumeRestore" type="danger" plain @click="openMySQLMaintenanceResume(group)">{{ t('database.mysqlBackup.resumeRestoreAction') }}</el-button>
               <el-button v-if="mysqlAvailability(group).disaster" type="danger" plain @click="openLatestMySQLDisaster(group)">{{ t('database.mysqlBackup.disasterAction') }}</el-button>

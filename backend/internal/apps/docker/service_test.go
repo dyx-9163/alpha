@@ -27,11 +27,20 @@ func (f *fakeStore) GetServer(id string, includeSecret bool) (store.Server, erro
 	return f.servers[id], nil
 }
 
-func (f *fakeStore) SaveServer(v store.Server) (store.Server, error) {
+func (f *fakeStore) UpdateServerDockerHost(server store.Server, dockerHost, status string) (bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.servers[v.ID] = v
-	return v, nil
+	current, found := f.servers[server.ID]
+	if !found {
+		return false, nil
+	}
+	current.DockerHost = dockerHost
+	if status != "" {
+		current.Status = status
+		current.LastError = ""
+	}
+	f.servers[server.ID] = current
+	return true, nil
 }
 
 func (f *fakeStore) SaveAppInstance(v store.AppInstance) (store.AppInstance, error) {
@@ -153,6 +162,56 @@ func TestServiceInstallsDockerOnMultipleServers(t *testing.T) {
 	}
 	if s.servers["srv-1"].DockerHost != "tcp://10.0.0.1:2375" {
 		t.Fatalf("expected remote docker API host to be recorded, got %s", s.servers["srv-1"].DockerHost)
+	}
+}
+
+func TestServiceDoesNotOverwriteServerReconfiguredDuringDockerInstall(t *testing.T) {
+	withFakeAgentBinary(t)
+	root := t.TempDir()
+	archive := filepath.Join(root, "aifar-docker-static-24.0.9-linux-x86_64.tar")
+	if err := os.WriteFile(archive, []byte("bundle"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	db, err := store.Open(filepath.Join(root, "panel.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	server, err := db.SaveServer(store.Server{Name: "docker", Host: "192.0.2.1", Username: "root"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	remote := &fakeRemote{blockInstall: true, installStarted: make(chan string, 1), releaseInstall: make(chan struct{})}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	result := make(chan error, 1)
+	go func() {
+		result <- NewService(db, remote).Install(ctx, InstallRequest{
+			Version: "24.0.9", ServerIDs: []string{server.ID}, Language: "en",
+		}, []store.Resource{{App: "docker", Part: "backend", Version: "24.0.9", Path: archive}}, fakeLogger{}, nil)
+	}()
+	select {
+	case <-remote.installStarted:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Docker installation did not start")
+	}
+	server.Host = "192.0.2.2"
+	server.DeployDir = "/new/apps"
+	if _, err := db.SaveServer(server); err != nil {
+		t.Fatal(err)
+	}
+	close(remote.releaseInstall)
+	select {
+	case err = <-result:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Docker installation did not finish")
+	}
+	current, readErr := db.GetServer(server.ID, false)
+	if readErr != nil || current.Host != server.Host || current.DeployDir != server.DeployDir || current.DockerHost != "" {
+		t.Fatalf("stale Docker install overwrote the edited registration: host=%s directory=%s dockerHost=%s err=%v", current.Host, current.DeployDir, current.DockerHost, readErr)
+	}
+	if err == nil {
+		t.Fatal("Docker installation reported that it updated the stale registration")
 	}
 }
 

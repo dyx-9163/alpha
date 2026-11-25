@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -65,7 +66,7 @@ func (a *API) startMiddlewareUpgrade(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	spec, found := middlewareUpgradePaths[instance.App]
-	if !found || req.TargetVersion != spec.to || instance.Version != spec.from || instance.Topology != spec.topology {
+	if !found || req.TargetVersion != spec.to || !a.middlewareUpgradeVersionAllowed(instance, spec) || instance.Topology != spec.topology {
 		writeError(w, http.StatusConflict, "UPGRADE_PATH_UNSUPPORTED", i18n.MiddlewareUpgradeText(lang, "path"), nil)
 		return
 	}
@@ -102,18 +103,10 @@ func (a *API) startMiddlewareUpgrade(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	participants := peers
-	if instance.App == "mysql" {
-		instances, err := a.store.ListAppInstances()
-		if err != nil {
-			respondTask(w, store.Task{}, err)
-			return
-		}
-		for _, candidate := range instances {
-			if candidate.App == "mysql-router" && mysqlClusterID(candidate) == group {
-				participants = append(participants, candidate)
-			}
-		}
+	participants, err := a.middlewareUpgradeParticipants(instance.App, group, peers)
+	if err != nil {
+		respondTask(w, store.Task{}, err)
+		return
 	}
 
 	actor := currentUser(r).Username
@@ -145,6 +138,7 @@ func (a *API) startMiddlewareUpgrade(w http.ResponseWriter, r *http.Request) {
 	if instance.App == "mysql" {
 		specs = append(mysqlClusterOperationLockSpecs("mysql-upgrade", instance), specs...)
 		for _, participant := range participants {
+			specs = append(specs, serverConfigOperationLockSpec("mysql-upgrade", participant.ServerID))
 			if participant.App == "mysql-router" {
 				specs = append(specs, appInstallOperationLockSpecs(participant.App, []string{participant.ServerID})...)
 			}
@@ -164,6 +158,10 @@ func (a *API) startMiddlewareUpgrade(w http.ResponseWriter, r *http.Request) {
 			return errors.New(i18n.MiddlewareUpgradeText(lang, "group"))
 		}
 		if fresh.App == "mysql" {
+			freshParticipants, err := a.middlewareUpgradeParticipants(fresh.App, group, freshPeers)
+			if err != nil || !sameMiddlewareUpgradePeers(participants, freshParticipants) {
+				return errors.New(i18n.MiddlewareUpgradeText(lang, "group"))
+			}
 			if code := a.mysqlOrdinaryLifecycleGate(fresh); code != "" {
 				return errors.New(i18n.MySQLBackupErrorText(lang, code))
 			}
@@ -214,14 +212,50 @@ func (p middlewareUpgradePath) hasResources(resources []store.Resource) bool {
 	return true
 }
 
+func (a *API) middlewareUpgradeParticipants(app, group string, peers []store.AppInstance) ([]store.AppInstance, error) {
+	if app != "mysql" {
+		return peers, nil
+	}
+	instances, err := a.store.ListAppInstances()
+	if err != nil {
+		return nil, err
+	}
+	participants := append([]store.AppInstance(nil), peers...)
+	for _, candidate := range instances {
+		if candidate.App == "mysql-router" && mysqlClusterID(candidate) == group {
+			participants = append(participants, candidate)
+		}
+	}
+	return participants, nil
+}
+
+func (a *API) middlewareUpgradeVersionAllowed(instance store.AppInstance, spec middlewareUpgradePath) bool {
+	if instance.Version == spec.from {
+		return true
+	}
+	if instance.App != "mysql" || instance.Version != spec.to {
+		return false
+	}
+	_, err := a.store.GetMySQLOfflineUpgradeCheckpoint(middlewareUpgradeGroup(instance))
+	return err == nil
+}
+
 func (a *API) middlewareUpgradePeers(seed store.AppInstance, spec middlewareUpgradePath) (string, []store.AppInstance, error) {
 	group := middlewareUpgradeGroup(seed)
-	if group == "" || seed.Version != spec.from || seed.Topology != spec.topology {
+	if group == "" || !a.middlewareUpgradeVersionAllowed(seed, spec) || seed.Topology != spec.topology {
 		return "", nil, errors.New("invalid middleware upgrade source")
 	}
 	instances, err := a.store.ListAppInstances()
 	if err != nil {
 		return "", nil, err
+	}
+	resume := false
+	if seed.App == "mysql" {
+		_, checkpointErr := a.store.GetMySQLOfflineUpgradeCheckpoint(group)
+		if checkpointErr != nil && !errors.Is(checkpointErr, sql.ErrNoRows) {
+			return "", nil, checkpointErr
+		}
+		resume = checkpointErr == nil
 	}
 	peers := make([]store.AppInstance, 0, spec.members)
 	servers := make(map[string]bool)
@@ -229,7 +263,7 @@ func (a *API) middlewareUpgradePeers(seed store.AppInstance, spec middlewareUpgr
 		if instance.App != seed.App || middlewareUpgradeGroup(instance) != group {
 			continue
 		}
-		if instance.Version != spec.from || instance.Topology != spec.topology || instance.ServerID == "" || servers[instance.ServerID] {
+		if (instance.Version != spec.from && !(resume && instance.Version == spec.to)) || instance.Topology != spec.topology || instance.ServerID == "" || servers[instance.ServerID] {
 			return "", nil, errors.New("middleware upgrade group has incompatible members")
 		}
 		servers[instance.ServerID] = true

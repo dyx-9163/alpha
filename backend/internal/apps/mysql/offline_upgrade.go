@@ -2,6 +2,7 @@ package mysql
 
 import (
 	"context"
+	"database/sql"
 	_ "embed"
 	"encoding/hex"
 	"encoding/json"
@@ -25,9 +26,13 @@ import (
 )
 
 const (
-	OfflineUpgradeSourceVersion = "8.0.36"
-	OfflineUpgradeTargetVersion = "8.4.13"
-	offlineUpgradeToolsVersion  = "26.10.0"
+	OfflineUpgradeSourceVersion   = "8.0.36"
+	OfflineUpgradeTargetVersion   = "8.4.13"
+	offlineUpgradeToolsVersion    = "26.10.0"
+	offlineUpgradeTransferTimeout = 2 * time.Hour
+	offlineUpgradeBackupTimeout   = 6 * time.Hour
+	offlineUpgradeCommandTimeout  = 10 * time.Minute
+	offlineUpgradeRecoveryGrace   = 15 * time.Minute
 )
 
 //go:embed templates/innodb-cluster/offline-upgrade.sh
@@ -68,6 +73,9 @@ func upgradeText(language, en, zh string) string {
 type offlineUpgradeStore interface {
 	maintenanceReader
 	SaveAppInstanceVersionsIfUnchanged([]store.AppInstanceVersionUpdate) error
+	GetMySQLOfflineUpgradeCheckpoint(string) (store.MySQLOfflineUpgradeCheckpoint, error)
+	CreateMySQLOfflineUpgradeCheckpoint(string, store.MySQLOfflineUpgradeCheckpoint) error
+	CompleteMySQLOfflineUpgrade(string, string, []store.AppInstanceVersionUpdate) error
 }
 
 type upgradeNode struct {
@@ -103,19 +111,20 @@ func (e upgradeProbeConnectionRefused) Error() string { return e.message + "\n" 
 func (e upgradeProbeConnectionRefused) Unwrap() error { return e.cause }
 
 type offlineUpgrade struct {
-	service  Service
-	data     offlineUpgradeStore
-	run      registry.RunContext
-	seed     store.AppInstance
-	nodes    []upgradeNode
-	routers  []upgradeNode
-	bundle   Bundle
-	primary  int
-	baseline []upgradeView
-	versions map[int]string
-	verified map[string]store.AppInstanceVersionUpdate
-	prepared []upgradeNode
-	secrets  []string
+	service    Service
+	data       offlineUpgradeStore
+	run        registry.RunContext
+	seed       store.AppInstance
+	nodes      []upgradeNode
+	routers    []upgradeNode
+	bundle     Bundle
+	primary    int
+	baseline   []upgradeView
+	versions   map[int]string
+	checkpoint store.MySQLOfflineUpgradeCheckpoint
+	resume     bool
+	prepared   []upgradeNode
+	secrets    []string
 }
 
 func (m Module) RunOfflineUpgrade(ctx context.Context, seed store.AppInstance, resources []store.Resource, run registry.RunContext) error {
@@ -127,17 +136,13 @@ func (s Service) RunOfflineUpgrade(ctx context.Context, seed store.AppInstance, 
 	if !ok || !validLogicalTaskID(run.TaskID) || OfflineUpgradeClusterID(seed) == "" {
 		return errors.New(upgradeText(run.Language, "Invalid MySQL upgrade task or cluster", "MySQL 升级任务或集群无效"))
 	}
-	u := offlineUpgrade{service: s, data: data, run: run, seed: seed, versions: map[int]string{}, verified: map[string]store.AppInstanceVersionUpdate{}}
+	u := offlineUpgrade{service: s, data: data, run: run, seed: seed, versions: map[int]string{}}
 	target := OfflineUpgradeClusterID(seed)
 	recorder, _ := run.Log.(taskrun.Recorder)
 	taskrun.StartTarget(recorder, target)
 	defer func() {
 		retErr = errors.Join(retErr, u.cleanup(ctx))
 		if retErr != nil {
-			// Persist only the nodes whose target version and identity were confirmed.
-			if err := u.saveVerified(); err != nil {
-				retErr = errors.Join(retErr, err)
-			}
 			taskrun.FinishTarget(recorder, target, "failed", retErr.Error())
 			return
 		}
@@ -314,6 +319,20 @@ func (u *offlineUpgrade) preflight(ctx context.Context, resources []store.Resour
 	if err := u.service.requireNoMySQLReconciliation(current, u.run.Language); err != nil {
 		return err
 	}
+	checkpoint, err := u.data.GetMySQLOfflineUpgradeCheckpoint(OfflineUpgradeClusterID(current))
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return errors.New(i18n.MiddlewareUpgradeText(u.run.Language, "mysqlCheckpointRead"))
+	}
+	if err == nil {
+		if !validLogicalTaskID(checkpoint.TaskID) {
+			return errors.New(i18n.MiddlewareUpgradeText(u.run.Language, "mysqlCheckpointInvalid"))
+		}
+		u.checkpoint = checkpoint
+		u.resume = true
+	}
+	eligibleVersion := func(version string) bool {
+		return version == OfflineUpgradeSourceVersion || (u.resuming() && version == OfflineUpgradeTargetVersion)
+	}
 	all, err := u.data.ListAppInstances()
 	if err != nil {
 		return badCluster
@@ -323,7 +342,7 @@ func (u *offlineUpgrade) preflight(ctx context.Context, resources []store.Resour
 		if instance.App != "mysql-router" || OfflineUpgradeClusterID(instance) != OfflineUpgradeClusterID(current) {
 			continue
 		}
-		if instance.Version != OfflineUpgradeSourceVersion || seenRouters[instance.ServerID] || instanceTopology(instance) != "router" {
+		if !eligibleVersion(instance.Version) || seenRouters[instance.ServerID] || instanceTopology(instance) != "router" {
 			return badCluster
 		}
 		seenRouters[instance.ServerID] = true
@@ -334,7 +353,7 @@ func (u *offlineUpgrade) preflight(ctx context.Context, resources []store.Resour
 		u.routers = append(u.routers, node)
 	}
 	for i, instance := range instances {
-		if instance.Version != OfflineUpgradeSourceVersion {
+		if !eligibleVersion(instance.Version) {
 			return badCluster
 		}
 		node, err := u.loadNode(instance, instancePort(instance))
@@ -361,6 +380,9 @@ func (u *offlineUpgrade) preflight(ctx context.Context, resources []store.Resour
 	if len(candidates) != 1 || err != nil || digestErr != nil || len(digest) != 32 || VerifyBundle(u.bundle) != nil {
 		return errors.New(upgradeText(u.run.Language, "A verified offline MySQL 8.4.13 bundle with a SHA-256 digest is required", "需要带 SHA-256 且校验通过的 MySQL 8.4.13 离线包"))
 	}
+	if u.resuming() {
+		return u.matchCheckpoint()
+	}
 	return ctx.Err()
 }
 
@@ -372,33 +394,59 @@ func (u *offlineUpgrade) loadNode(instance store.AppInstance, port int) (upgrade
 	}
 	return upgradeNode{
 		instance: instance, server: server, root: path.Join(deploy, instance.App),
-		work:     path.Join(deploy, "_work", "mysql-offline-upgrade-"+u.run.TaskID+"-"+instance.App),
-		backup:   path.Join(deploy, "_backups", "mysql-offline-upgrade", u.run.TaskID, instance.App),
+		work:     path.Join(deploy, "_work", "mysql-offline-upgrade-"+u.operationID()+"-"+instance.App),
+		backup:   path.Join(deploy, "_backups", "mysql-offline-upgrade", u.operationID(), instance.App),
 		endpoint: net.JoinHostPort(server.Host, strconv.Itoa(port)), port: port,
 	}, nil
 }
 
-func (u *offlineUpgrade) stage(ctx context.Context) error {
+func (u *offlineUpgrade) prepareNodes(ctx context.Context) error {
 	script, err := installerkit.WriteTempScript("aifar-mysql-offline-upgrade-*.sh", offlineUpgradeScript)
 	if err != nil {
 		return err
 	}
 	defer os.Remove(script)
 	for _, node := range slices.Concat(u.nodes, u.routers) {
-		parent := path.Dir(node.work)
-		command := "set -eu; umask 077; install -d " + installerkit.ShellQuote(parent) + "; test \"$(realpath -e " + installerkit.ShellQuote(parent) + ")\" = " + installerkit.ShellQuote(parent) + "; mkdir -m 700 -- " + installerkit.ShellQuote(node.work)
+		work := installerkit.ShellQuote(node.work)
+		parent := installerkit.ShellQuote(path.Dir(node.work))
+		command := "set -eu; umask 077; install -d " + parent + "; test \"$(realpath -e " + parent + ")\" = " + parent + "; mkdir -m 700 -- " + work
+		if u.resuming() {
+			scriptPath := installerkit.ShellQuote(path.Join(node.work, "upgrade.sh"))
+			command = "set -eu; flock -n " + installerkit.ShellQuote(node.root) + " true; test \"$(realpath -e " + work + ")\" = " + work +
+				"; test \"$(stat -c '%a:%u' -- " + work + ")\" = \"700:$(id -u)\"; test -f " + scriptPath + "; test ! -L " + scriptPath
+		}
 		if _, err := u.remote(ctx, node, "prepare", command, false); err != nil {
 			return err
 		}
 		u.prepared = append(u.prepared, node)
-		if err := u.service.remote.UploadFile(ctx, node.server, script, path.Join(node.work, "upgrade.sh"), 0o600); err != nil {
-			return u.phaseError(node, "upload-script")
+		// A resume reuses the staged work. Replace the script atomically so an
+		// interrupted upload cannot corrupt that workspace.
+		scriptUpload := "upgrade.sh.upload"
+		if err := u.upload(ctx, node, script, scriptUpload); err != nil {
+			return err
+		}
+		command = "mv -T -- " + installerkit.ShellQuote(path.Join(node.work, scriptUpload)) + " " + installerkit.ShellQuote(path.Join(node.work, "upgrade.sh"))
+		if _, err := u.remote(ctx, node, "prepare-script", command, false); err != nil {
+			return err
 		}
 		if node.instance.App == "mysql" {
-			if err := uploadMySQLCredentialContext(ctx, u.service.remote, node.server, node.credential, node.port, path.Join(node.work, "credential.cnf")); err != nil {
+			uploadCtx, cancel := context.WithTimeout(ctx, offlineUpgradeCommandTimeout)
+			err := uploadMySQLCredentialContext(uploadCtx, u.service.remote, node.server, node.credential, node.port, path.Join(node.work, "credential.cnf"))
+			cancel()
+			if err != nil {
 				return localizedMySQLOperationError(u.run.Language, MySQLCredentialUnavailable)
 			}
 		}
+	}
+	return nil
+}
+
+func (u *offlineUpgrade) stage(ctx context.Context) error {
+	if err := u.prepareNodes(ctx); err != nil {
+		return err
+	}
+	if u.resuming() {
+		return u.resumeNodes(ctx)
 	}
 	views, primary, err := u.views(ctx)
 	if err != nil {
@@ -406,8 +454,8 @@ func (u *offlineUpgrade) stage(ctx context.Context) error {
 	}
 	u.baseline = views
 	for i, node := range slices.Concat(u.nodes, u.routers) {
-		if err := u.service.remote.UploadFile(ctx, node.server, u.bundle.ArchivePath, path.Join(node.work, "bundle.tar"), 0o600); err != nil {
-			return u.phaseError(node, "upload-bundle")
+		if err := u.upload(ctx, node, u.bundle.ArchivePath, "bundle.tar"); err != nil {
+			return err
 		}
 		if _, err := u.script(ctx, node, "stage", u.bundle.ArchiveSHA256); err != nil {
 			return err
@@ -433,6 +481,15 @@ func (u *offlineUpgrade) stage(ctx context.Context) error {
 }
 
 func (u *offlineUpgrade) backup(ctx context.Context) error {
+	if u.resuming() {
+		for _, node := range slices.Concat(u.nodes, u.routers) {
+			if _, err := u.script(ctx, node, "resume-backup-check"); err != nil {
+				return err
+			}
+			u.logBackup(node)
+		}
+		return nil
+	}
 	for _, node := range slices.Concat(u.nodes, u.routers) {
 		if node.instance.App == "mysql" {
 			if _, _, err := u.waitForViews(ctx); err != nil {
@@ -442,30 +499,60 @@ func (u *offlineUpgrade) backup(ctx context.Context) error {
 		if _, err := u.script(ctx, node, "backup"); err != nil {
 			return err
 		}
-		mysqlSanitizedLogger{base: u.run.Log, secrets: u.secrets}.Info(upgradeText(u.run.Language,
-			"Verified cold backup on %s at %s", "已校验 %s 上的冷备份 %s"), node.endpoint, node.backup)
+		u.logBackup(node)
 	}
-	_, _, err := u.waitForViews(ctx)
-	return err
+	if _, _, err := u.waitForViews(ctx); err != nil {
+		return err
+	}
+	return u.createCheckpoint()
+}
+
+func (u *offlineUpgrade) logBackup(node upgradeNode) {
+	mysqlSanitizedLogger{base: u.run.Log, secrets: u.secrets}.Info(upgradeText(u.run.Language,
+		"Verified cold backup on %s at %s", "已校验 %s 上的冷备份 %s"), node.endpoint, node.backup)
 }
 
 func (u *offlineUpgrade) upgradeTools(ctx context.Context) error {
-	for _, node := range slices.Concat(u.nodes, u.routers) {
-		if _, err := u.script(ctx, node, "tools"); err != nil {
+	for _, node := range u.nodes {
+		if _, err := u.switchTools(ctx, node); err != nil {
 			return err
 		}
 	}
-	_, primary, err := u.waitForViews(ctx)
-	if err != nil {
-		return err
-	}
-	if err := u.verifyRouters(ctx, primary); err != nil {
-		return err
-	}
 	for _, router := range u.routers {
-		u.markVerified(router, true)
+		switched, err := u.switchTools(ctx, router)
+		if err != nil {
+			return err
+		}
+		if err = u.verifyRouterAgainstLiveCluster(ctx, router); err != nil {
+			if switched {
+				_, revertErr := u.script(context.WithoutCancel(ctx), router, "revert-router")
+				return errors.Join(err, revertErr)
+			}
+			return err
+		}
+		if err := u.recordVerified(router, true); err != nil {
+			return err
+		}
 	}
 	return nil
+}
+
+func (u *offlineUpgrade) switchTools(ctx context.Context, node upgradeNode) (bool, error) {
+	if u.resuming() {
+		output, err := u.script(ctx, node, "resume-tools-probe")
+		if err != nil {
+			return false, err
+		}
+		switch strings.TrimSpace(output) {
+		case "__AIFAR_UPGRADE_TOOL__\t" + offlineUpgradeToolsVersion:
+			return false, nil
+		case "__AIFAR_UPGRADE_TOOL__\t" + OfflineUpgradeSourceVersion:
+		default:
+			return false, u.phaseError(node, "resume-tools-probe")
+		}
+	}
+	_, err := u.script(ctx, node, "tools")
+	return err == nil, err
 }
 
 func (u *offlineUpgrade) upgradeMetadata(ctx context.Context) error {
@@ -479,11 +566,7 @@ func (u *offlineUpgrade) upgradeMetadata(ctx context.Context) error {
 	if _, err := u.script(ctx, u.nodes[primary], "metadata-upgrade"); err != nil {
 		return err
 	}
-	_, primary, err = u.waitForViews(ctx)
-	if err != nil {
-		return err
-	}
-	return u.verifyRouters(ctx, primary)
+	return u.verifyRouters(ctx)
 }
 
 func (u *offlineUpgrade) upgradeSecondaries(ctx context.Context) error {
@@ -508,73 +591,117 @@ func (u *offlineUpgrade) upgradeServer(ctx context.Context, index int) error {
 	if err != nil {
 		return err
 	}
+	if u.versions[index] == OfflineUpgradeTargetVersion {
+		return u.recordVerified(node, false)
+	}
 	if primary != u.primary || u.versions[index] != OfflineUpgradeSourceVersion {
 		return u.phaseError(node, "primary-changed")
 	}
-	if _, err := u.script(ctx, node, "server", u.baseline[index].uuid); err != nil {
-		return err
+	known := make([]string, 0, len(u.baseline))
+	for _, view := range u.baseline {
+		known = append(known, view.uuid)
+	}
+	output, switchErr := u.script(ctx, node, "server", u.baseline[index].uuid, u.baseline[primary].uuid, strings.Join(known, ","))
+	if switchErr != nil && !slices.Contains(strings.Split(strings.TrimSpace(output), "\n"), "__AIFAR_UPGRADE_SERVER_STARTED__") {
+		return switchErr
 	}
 	u.versions[index] = OfflineUpgradeTargetVersion
 	if _, _, err := u.waitForViews(ctx); err != nil {
-		return err
+		return errors.Join(switchErr, err)
 	}
-	u.markVerified(node, false)
-	return nil
+	return errors.Join(switchErr, u.recordVerified(node, false))
 }
 
 func (u *offlineUpgrade) verifyAndRecord(ctx context.Context) error {
-	_, primary, err := u.waitForViews(ctx)
-	if err != nil {
+	if !u.allServersUpgraded() {
+		return errors.New(i18n.MiddlewareUpgradeText(u.run.Language, "mysqlCheckpointInvalid"))
+	}
+	if _, _, err := u.waitForViews(ctx); err != nil {
 		return err
 	}
-	if err := u.verifyRouters(ctx, primary); err != nil {
+	if err := u.verifyRouters(ctx); err != nil {
 		return err
 	}
-	return u.saveVerified()
+	if err := u.cleanup(ctx); err != nil {
+		return err
+	}
+	u.prepared = nil
+	return u.completeCheckpoint()
 }
 
-func (u *offlineUpgrade) verifyRouters(ctx context.Context, primary int) error {
+func (u *offlineUpgrade) verifyRouters(ctx context.Context) error {
 	for _, router := range u.routers {
-		if _, err := u.script(ctx, router, "verify-router"); err != nil {
+		if err := u.verifyRouterAgainstLiveCluster(ctx, router); err != nil {
 			return err
-		}
-		if _, err := u.script(ctx, u.nodes[primary], "route-sql", router.server.Host, strconv.Itoa(router.port), u.baseline[primary].uuid); err != nil {
-			return u.phaseError(router, "verify-router-rw")
 		}
 	}
 	return nil
 }
 
-func (u *offlineUpgrade) markVerified(node upgradeNode, router bool) {
+func (u *offlineUpgrade) verifyRouterAgainstLiveCluster(ctx context.Context, router upgradeNode) error {
+	if _, err := u.script(ctx, router, "verify-router"); err != nil {
+		return err
+	}
+	views, primary, err := u.waitForViews(ctx)
+	if err != nil {
+		return err
+	}
+	err = u.verifyRouterRoutes(ctx, router, views, primary)
+	if err == nil {
+		return nil
+	}
+	// A primary election during a route probe invalidates the expected backend.
+	newViews, newPrimary, probeErr := u.views(ctx)
+	if probeErr == nil && newPrimary != primary {
+		return u.verifyRouterRoutes(ctx, router, newViews, newPrimary)
+	}
+	return err
+}
+
+func (u *offlineUpgrade) verifyRouterRoutes(ctx context.Context, router upgradeNode, views []upgradeView, primary int) error {
+	from := u.nodes[primary]
+	if _, err := u.script(ctx, from, "route-sql", router.server.Host, strconv.Itoa(router.port), views[primary].uuid); err != nil {
+		return u.phaseError(router, "verify-router-rw")
+	}
+	roPort := intParameter(appMetadata(router.instance), "readOnlyPort")
+	if roPort == 0 {
+		roPort = router.port + 1
+	}
+	if roPort < 1 || roPort > 65535 || roPort == router.port {
+		return u.phaseError(router, "verify-router-ro")
+	}
+	var secondaryUUIDs []string
+	for i, view := range views {
+		if i != primary {
+			secondaryUUIDs = append(secondaryUUIDs, view.uuid)
+		}
+	}
+	if _, err := u.script(ctx, from, "route-sql-ro", router.server.Host, strconv.Itoa(roPort), strings.Join(secondaryUUIDs, ",")); err != nil {
+		return u.phaseError(router, "verify-router-ro")
+	}
+	return nil
+}
+
+func (u *offlineUpgrade) recordVerified(node upgradeNode, router bool) error {
 	metadata := map[string]any{
 		"resourcePath":             u.bundle.ArchivePath,
 		"offlineUpgradeBackupPath": node.backup,
-		"offlineUpgradeTaskId":     u.run.TaskID,
+		"offlineUpgradeTaskId":     u.operationID(),
+		"offlineUpgradePending":    true,
 	}
 	if router {
 		metadata["routerVersion"] = offlineUpgradeToolsVersion
 	} else {
 		metadata["mysqlShellVersion"] = offlineUpgradeToolsVersion
 	}
-	u.verified[node.instance.ID] = store.AppInstanceVersionUpdate{
+	update := store.AppInstanceVersionUpdate{
 		Expected: node.instance,
 		Version:  OfflineUpgradeTargetVersion,
 		Metadata: metadata,
 	}
-}
-
-func (u *offlineUpgrade) saveVerified() error {
-	if len(u.verified) == 0 {
-		return nil
-	}
-	items := make([]store.AppInstanceVersionUpdate, 0, len(u.verified))
-	for _, item := range u.verified {
-		items = append(items, item)
-	}
-	if err := u.data.SaveAppInstanceVersionsIfUnchanged(items); err != nil {
+	if err := u.data.SaveAppInstanceVersionsIfUnchanged([]store.AppInstanceVersionUpdate{update}); err != nil {
 		return errors.New(upgradeText(u.run.Language, "Could not record verified MySQL versions because Panel instance records changed or could not be written", "面板实例记录已变化或写入失败，无法登记已校验的 MySQL 版本"))
 	}
-	clear(u.verified)
 	return nil
 }
 
@@ -586,6 +713,10 @@ func (u *offlineUpgrade) waitForViews(ctx context.Context) ([]upgradeView, int, 
 		views, primary, err := u.views(deadline)
 		if err == nil {
 			return views, primary, nil
+		}
+		var blocker upgradeProbeBlocker
+		if errors.As(err, &blocker) && blocker != "replication-queues" {
+			return nil, -1, err
 		}
 		var refused upgradeProbeConnectionRefused
 		if errors.As(err, &refused) && refused.message != lastNotice {
@@ -604,6 +735,18 @@ func (u *offlineUpgrade) waitForViews(ctx context.Context) ([]upgradeView, int, 
 }
 
 func (u *offlineUpgrade) views(ctx context.Context) ([]upgradeView, int, error) {
+	views, known, err := u.readViews(ctx)
+	if err != nil {
+		return nil, -1, err
+	}
+	primary, err := validateUpgradeViews(views, u.versions, known)
+	if err != nil {
+		return nil, -1, errors.New(upgradeText(u.run.Language, "The three direct MySQL observations disagree on members, roles, versions, or recovery state", "三台 MySQL 直连视图的成员、角色、版本或恢复状态不一致"))
+	}
+	return views, primary, nil
+}
+
+func (u *offlineUpgrade) readViews(ctx context.Context) ([]upgradeView, []string, error) {
 	var views []upgradeView
 	var known []string
 	for i, node := range u.nodes {
@@ -614,23 +757,19 @@ func (u *offlineUpgrade) views(ctx context.Context) ([]upgradeView, int, error) 
 		}
 		output, err := u.script(ctx, node, "probe", baseline)
 		if err != nil {
-			return nil, -1, err
+			return nil, nil, err
 		}
 		view, err := parseUpgradeView(output, node.endpoint)
 		if err != nil || (u.baseline != nil && view.group != u.baseline[i].group) {
 			var blocker upgradeProbeBlocker
 			if errors.As(err, &blocker) {
-				return nil, -1, u.phaseError(node, string(blocker))
+				return nil, nil, errors.Join(blocker, u.phaseError(node, string(blocker)))
 			}
-			return nil, -1, u.phaseError(node, "replication-view")
+			return nil, nil, u.phaseError(node, "replication-view")
 		}
 		views = append(views, view)
 	}
-	primary, err := validateUpgradeViews(views, u.versions, known)
-	if err != nil {
-		return nil, -1, errors.New(upgradeText(u.run.Language, "The three direct MySQL observations disagree on members, roles, versions, or recovery state", "三台 MySQL 直连视图的成员、角色、版本或恢复状态不一致"))
-	}
-	return views, primary, nil
+	return views, known, nil
 }
 
 func (u *offlineUpgrade) phaseError(node upgradeNode, phase string) error {
@@ -638,16 +777,45 @@ func (u *offlineUpgrade) phaseError(node upgradeNode, phase string) error {
 }
 
 func (u *offlineUpgrade) script(ctx context.Context, node upgradeNode, phase string, args ...string) (string, error) {
-	params := []string{path.Join(node.work, "upgrade.sh"), phase, node.instance.App, node.root, node.work, node.backup, u.run.TaskID, strconv.Itoa(node.port)}
+	params := []string{path.Join(node.work, "upgrade.sh"), phase, node.instance.App, node.root, node.work, node.backup, u.operationID(), strconv.Itoa(node.port)}
 	params = append(params, args...)
 	for i := range params {
 		params[i] = installerkit.ShellQuote(params[i])
 	}
-	return u.remote(ctx, node, phase, "bash "+strings.Join(params, " "), phase == "probe" || phase == "route-sql")
+	budget := offlineUpgradeCommandTimeout
+	switch phase {
+	case "backup", "server", "tools", "resume-backup-check":
+		budget = offlineUpgradeBackupTimeout
+	}
+	// Deliver TERM on the host before an SSH deadline can force-close the session.
+	command := fmt.Sprintf("timeout --signal=TERM %ds bash %s", int64(budget/time.Second), strings.Join(params, " "))
+	deadline, cancel := context.WithTimeout(ctx, budget+offlineUpgradeRecoveryGrace)
+	defer cancel()
+	protocolOutput := phase == "probe" || phase == "route-sql" || phase == "route-sql-ro" || phase == "resume-tools-probe"
+	return u.remote(deadline, node, phase, command, protocolOutput)
+}
+
+func (u *offlineUpgrade) upload(ctx context.Context, node upgradeNode, local, name string) error {
+	deadline, cancel := context.WithTimeout(ctx, offlineUpgradeTransferTimeout)
+	defer cancel()
+	if err := u.service.remote.UploadFile(deadline, node.server, local, path.Join(node.work, name), 0o600); err != nil {
+		stageErr := u.phaseError(node, "upload-"+name)
+		if deadline.Err() != nil {
+			return errors.Join(errors.New(i18n.MiddlewareUpgradeText(u.run.Language, "mysqlPhaseTimeout")), stageErr)
+		}
+		return stageErr
+	}
+	return nil
 }
 
 func (u *offlineUpgrade) remote(ctx context.Context, node upgradeNode, phase, command string, protocolOutput bool) (string, error) {
-	result, err := u.service.remote.Run(ctx, node.server, command)
+	deadline := ctx
+	if _, bounded := ctx.Deadline(); !bounded {
+		var cancel context.CancelFunc
+		deadline, cancel = context.WithTimeout(ctx, offlineUpgradeCommandTimeout)
+		defer cancel()
+	}
+	result, err := u.service.remote.Run(deadline, node.server, command)
 	failed := err != nil || result.ExitCode != 0
 	if failed && phase == "probe" {
 		refused := fmt.Sprintf("MySQL Error 2003 (HY000): Can't connect to MySQL server on '127.0.0.1:%d' (111)", node.port)
@@ -663,7 +831,15 @@ func (u *offlineUpgrade) remote(ctx context.Context, node upgradeNode, phase, co
 		installerkit.LogCommandResult(result, err, log)
 	}
 	if failed {
-		return "", u.phaseError(node, phase)
+		exit := result.ExitCode
+		var sshStatus interface{ ExitStatus() int }
+		if errors.As(err, &sshStatus) {
+			exit = sshStatus.ExitStatus()
+		}
+		if errors.Is(deadline.Err(), context.DeadlineExceeded) || exit == 124 || exit == 143 {
+			return result.Stdout, errors.Join(errors.New(i18n.MiddlewareUpgradeText(u.run.Language, "mysqlPhaseTimeout")), u.phaseError(node, phase))
+		}
+		return result.Stdout, u.phaseError(node, phase)
 	}
 	return result.Stdout, nil
 }
@@ -672,7 +848,8 @@ func (u *offlineUpgrade) cleanup(ctx context.Context) (result error) {
 	for _, node := range u.prepared {
 		cleanupCtx, cancel := mysqlCredentialCleanupContext(ctx)
 		// Keep reports, staged trees, and backups. The archive and CNF were uploads for this task only.
-		command := "rm -f -- " + installerkit.ShellQuote(path.Join(node.work, "credential.cnf")) + " " + installerkit.ShellQuote(path.Join(node.work, "bundle.tar"))
+		command := "rm -f -- " + installerkit.ShellQuote(path.Join(node.work, "credential.cnf")) + " " +
+			installerkit.ShellQuote(path.Join(node.work, "bundle.tar")) + " " + installerkit.ShellQuote(path.Join(node.work, "upgrade.sh.upload"))
 		if output, err := u.service.remote.Run(cleanupCtx, node.server, command); err != nil || output.ExitCode != 0 {
 			result = errors.Join(result, u.phaseError(node, "cleanup-credentials"))
 			mysqlSanitizedLogger{base: u.run.Log, secrets: u.secrets}.Error(upgradeText(u.run.Language,

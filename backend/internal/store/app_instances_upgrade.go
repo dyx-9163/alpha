@@ -22,6 +22,13 @@ func (s *Store) SaveAppInstanceVersionsIfUnchanged(updates []AppInstanceVersionU
 		return err
 	}
 	defer tx.Rollback()
+	if err := saveAppInstanceVersionsIfUnchanged(tx, updates); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func saveAppInstanceVersionsIfUnchanged(tx *sql.Tx, updates []AppInstanceVersionUpdate) error {
 	for _, update := range updates {
 		current, err := appInstanceMetadataAtRevision(tx, update.Expected)
 		if err != nil {
@@ -40,7 +47,7 @@ func (s *Store) SaveAppInstanceVersionsIfUnchanged(updates []AppInstanceVersionU
 			return err
 		}
 	}
-	return tx.Commit()
+	return nil
 }
 
 // SaveAppInstancesIfUnchanged commits verified member changes as one transaction.

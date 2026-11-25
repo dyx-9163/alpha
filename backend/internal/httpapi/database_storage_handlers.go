@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 
@@ -23,12 +24,57 @@ func (a *API) databaseInstances(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var out []store.AppInstance
+	checkpoints := make(map[string][]store.MySQLOfflineUpgradeNode)
 	for _, instance := range instances {
-		if instance.App == "mysql" || instance.App == "redis" || instance.App == "mysql-router" {
+		switch instance.App {
+		case "mysql":
+			pending := a.databaseMySQLOfflineUpgradePending(instance, checkpoints)
+			instance.Metadata = projectMySQLOfflineUpgradePending(instance.Metadata, pending)
+			out = append(out, instance)
+		case "redis", "mysql-router":
 			out = append(out, instance)
 		}
 	}
 	writeJSON(w, http.StatusOK, out)
+}
+
+func (a *API) databaseMySQLOfflineUpgradePending(instance store.AppInstance, checkpoints map[string][]store.MySQLOfflineUpgradeNode) bool {
+	group := middlewareUpgradeGroup(instance)
+	if group == "" || instance.Topology != "innodb-cluster" || instance.ServerID == "" {
+		return false
+	}
+	nodes, ok := checkpoints[group]
+	if !ok {
+		// A checkpoint read failure must not suppress existing status observations.
+		checkpoint, err := a.store.GetMySQLOfflineUpgradeCheckpoint(group)
+		if err == nil {
+			nodes = checkpoint.Nodes
+		}
+		checkpoints[group] = nodes
+	}
+	return slices.ContainsFunc(nodes, func(node store.MySQLOfflineUpgradeNode) bool {
+		return node.InstanceID == instance.ID && node.ServerID == instance.ServerID
+	})
+}
+
+func projectMySQLOfflineUpgradePending(metadata string, pending bool) string {
+	const key = "offlineUpgradePending"
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(metadata), &fields); err != nil || fields == nil {
+		return metadata
+	}
+	if pending {
+		fields[key] = json.RawMessage("true")
+	} else if _, exists := fields[key]; exists {
+		delete(fields, key)
+	} else {
+		return metadata
+	}
+	encoded, err := json.Marshal(fields)
+	if err != nil {
+		return metadata
+	}
+	return string(encoded)
 }
 
 func (a *API) startMySQLCluster(w http.ResponseWriter, r *http.Request) {

@@ -136,3 +136,34 @@ func TestOfflineUpgradeRequiresOwnerConfirmationAndLocksBothStoragePeers(t *test
 		t.Fatalf("committed upgrade can be cancelled: status=%d body=%s", rec.Code, rec.Body.String())
 	}
 }
+
+func TestMiddlewareMySQLUpgradeAllowsMixedVersionsOnlyWithCheckpoint(t *testing.T) {
+	api, db, secret := newAuthzTestAPI(t)
+	owner := issueTestToken(t, db, secret, "owner", "owner")
+	const clusterID = "cluster_aabbccddeeff001122334455"
+	_, instances := saveHTTPTestMySQLCluster(t, db, clusterID, "test")
+	seed := instances[0]
+	seed.Version = "8.4.13"
+	seed, err := db.SaveAppInstance(seed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	post := func() *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/api/v2/apps/instances/"+seed.ID+"/upgrade", strings.NewReader(`{"targetVersion":"8.4.13","confirmed":true}`))
+		req.Header.Set("Authorization", "Bearer "+owner)
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		api.Router().ServeHTTP(rec, req)
+		return rec
+	}
+	if rec := post(); rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), "UPGRADE_PATH_UNSUPPORTED") {
+		t.Fatalf("mixed cluster admitted without checkpoint: %d %s", rec.Code, rec.Body)
+	}
+	checkpoint := store.MySQLOfflineUpgradeCheckpoint{TaskID: "original-upgrade"}
+	if err := db.CreateMySQLOfflineUpgradeCheckpoint(clusterID, checkpoint); err != nil {
+		t.Fatal(err)
+	}
+	if rec := post(); rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), "UPGRADE_RESOURCES_MISSING") {
+		t.Fatalf("mixed cluster should pass source-version gating and check resources: %d %s", rec.Code, rec.Body)
+	}
+}

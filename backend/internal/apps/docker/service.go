@@ -1,6 +1,7 @@
 package docker
 
 import (
+	"aifar-deployment/backend/internal/i18n"
 	"aifar-deployment/backend/internal/installflow"
 	"aifar-deployment/backend/internal/store"
 	"aifar-deployment/backend/internal/taskrun"
@@ -13,7 +14,7 @@ import (
 
 type Store interface {
 	GetServer(id string, includeSecret bool) (store.Server, error)
-	SaveServer(v store.Server) (store.Server, error)
+	UpdateServerDockerHost(server store.Server, dockerHost, status string) (bool, error)
 	SaveAppInstance(v store.AppInstance) (store.AppInstance, error)
 	DeleteAppInstance(id string) error
 }
@@ -58,6 +59,14 @@ type stepRecorder = installflow.Recorder
 
 func NewService(s Store, remote Remote) Service {
 	return Service{store: s, remote: remote}
+}
+
+func (s Service) updateServerDockerHost(server store.Server, dockerHost, status, language string) error {
+	updated, err := s.store.UpdateServerDockerHost(server, dockerHost, status)
+	if err == nil && !updated {
+		err = errors.New(i18n.Text(language, "servers.dockerUpdateObsolete"))
+	}
+	return err
 }
 
 func (s Service) Install(ctx context.Context, req InstallRequest, resources []store.Resource, log Logger, targetLog targetLogger) error {
@@ -109,12 +118,9 @@ func (s Service) Install(ctx context.Context, req InstallRequest, resources []st
 			finishTarget(recorder, serverID, "failed", msg)
 			return errors.New(msg)
 		}
-		server.DockerHost = RemoteAPIHost(server.Host, options.RemoteAPIPort)
-		server.Status = "available"
-		server.LastError = ""
+		dockerHost := RemoteAPIHost(server.Host, options.RemoteAPIPort)
 		if err := step(3, copy.UpdateServer, func() error {
-			_, err := s.store.SaveServer(server)
-			return err
+			return s.updateServerDockerHost(server, dockerHost, "available", req.Language)
 		}); err != nil {
 			msg := fmt.Sprintf("%s: %v", server.Name, err)
 			logForServer.Error(copy.UpdateFailed, idx, total, msg)
@@ -122,7 +128,7 @@ func (s Service) Install(ctx context.Context, req InstallRequest, resources []st
 			return errors.New(msg)
 		}
 		metadata, _ := json.Marshal(map[string]any{
-			"dockerHost":       server.DockerHost,
+			"dockerHost":       dockerHost,
 			"dockerBridgeCIDR": options.BridgeCIDR,
 			"remoteAPIPort":    options.RemoteAPIPort,
 			"archivePath":      bundle.ArchivePath,
@@ -187,10 +193,8 @@ func (s Service) Delete(ctx context.Context, req DeleteRequest, log Logger, targ
 		finishTarget(recorder, target, "failed", msg)
 		return err
 	}
-	server.DockerHost = ""
 	if err := step(3, "update-server", copy.UpdateServer, func() error {
-		_, err := s.store.SaveServer(server)
-		return err
+		return s.updateServerDockerHost(server, "", "", req.Language)
 	}); err != nil {
 		msg := fmt.Sprintf("%s: %v", server.Name, err)
 		logForServer.Error(copy.DeleteFailed, msg)

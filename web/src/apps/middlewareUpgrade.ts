@@ -6,6 +6,7 @@ export type MiddlewareUpgradeInstance = {
   serverId: string
   version: string
   topology: string
+  metadata?: string
 }
 
 const paths = {
@@ -13,15 +14,26 @@ const paths = {
   minio: { sourceVersion: '2025-10-15T17-29-55Z', version: '20261112', topology: 'bucket-replication', count: 2 }
 } as const
 
+function isPendingMySQLUpgrade(instance: MiddlewareUpgradeInstance) {
+  if (!instance.metadata) return false
+  try {
+    return JSON.parse(instance.metadata)?.offlineUpgradePending === true
+  } catch {
+    return false
+  }
+}
+
 export function middlewareUpgradeTarget(app: MiddlewareUpgradeApp, instances: readonly MiddlewareUpgradeInstance[]) {
   const path = paths[app]
   if (instances.length !== path.count || new Set(instances.map(instance => instance.serverId)).size !== path.count) {
     return null
   }
-  if (instances.some(instance =>
-    instance.app !== app || instance.version !== path.sourceVersion || instance.topology !== path.topology || !instance.serverId || !instance.id
-  )) {
+  const resume = app === 'mysql' && instances.some(isPendingMySQLUpgrade)
+  if (instances.some(instance => {
+    const supportedVersion = instance.version === path.sourceVersion || (resume && instance.version === path.version)
+    return instance.app !== app || !supportedVersion || instance.topology !== path.topology || !instance.serverId || !instance.id
+  })) {
     return null
   }
-  return { instanceId: instances[0].id, sourceVersion: path.sourceVersion, version: path.version }
+  return { instanceId: instances[0].id, sourceVersion: path.sourceVersion, version: path.version, ...(resume ? { resume } : {}) }
 }

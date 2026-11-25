@@ -5,6 +5,7 @@ export type I18nValue = string | ((params?: Record<string, unknown>) => string)
 export const messages: Record<LocaleCode, Record<string, I18nValue>> = {
   zh: {
     'middlewareUpgrade.mysql.action': '升级 MySQL 集群',
+    'middlewareUpgrade.mysql.resume': '继续升级 MySQL 集群',
     'middlewareUpgrade.mysql.impact': '任务会冷备各节点，升级 Shell 和 Router，再依次切换从节点和主节点。切主期间连接可能短暂中断。',
     'middlewareUpgrade.minio.action': '迁移到 Silo',
     'middlewareUpgrade.minio.impact': '两端会在同一维护窗口停机备份，并保留数据目录和复制规则切换至 Silo。',
@@ -1137,6 +1138,7 @@ export const messages: Record<LocaleCode, Record<string, I18nValue>> = {
   },
   en: {
     'middlewareUpgrade.mysql.action': 'Upgrade MySQL cluster',
+    'middlewareUpgrade.mysql.resume': 'Resume MySQL cluster upgrade',
     'middlewareUpgrade.mysql.impact': 'The task takes cold backups, upgrades Shell and Router, then upgrades the secondaries and the primary in order. Connections may drop briefly during failover.',
     'middlewareUpgrade.minio.action': 'Migrate to Silo',
     'middlewareUpgrade.minio.impact': 'Both sites stop for backup in the same maintenance window. The migration retains data directories and replication rules.',
