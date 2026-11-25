@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"maps"
 	"os"
@@ -32,6 +33,77 @@ func TestOfflineUpgradeOrderUsesLivePrimary(t *testing.T) {
 	if err != nil || primary != 1 {
 		t.Fatalf("live primary = %d, error = %v", primary, err)
 	}
+}
+
+func TestOfflineUpgradeWaitForViewsLogsConnectionRefusedAsReadiness(t *testing.T) {
+	const refused = "MySQL Error 2003 (HY000): Can't connect to MySQL server on '127.0.0.1:3306' (111)"
+	const accessDenied = "MySQL Error 1045 (28000): Access denied for user"
+	for _, tc := range []struct {
+		name, stderr    string
+		recovers, waits bool
+	}{
+		{"restart recovers", refused, true, true},
+		{"wait ends before recovery", refused, false, true},
+		{"authentication fails", accessDenied, false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, remote, _, run := newOfflineUpgradeFixture(t)
+			log := &upgradeProbeLog{}
+			run.Log = log
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			probe := &upgradeProbeFake{upgradeFakeRemote: remote, failOnce: func() (adapter.CommandResult, error) {
+				if !tc.recovers {
+					cancel()
+				}
+				return adapter.CommandResult{Stderr: "\x1b[31mERROR: \x1b[0m" + tc.stderr}, errors.New("remote command exited")
+			}}
+			upgrade := offlineUpgrade{
+				service:  NewService(nil, probe),
+				run:      run,
+				versions: map[int]string{0: "8.0.36", 1: "8.0.36", 2: "8.0.36"},
+			}
+			for i, server := range remote.servers[:3] {
+				upgrade.nodes = append(upgrade.nodes, upgradeNode{server: server, port: 3306, endpoint: remote.views[i].endpoint})
+			}
+			if _, _, err := upgrade.waitForViews(ctx); tc.recovers {
+				if err != nil {
+					t.Fatal(err)
+				}
+			} else if !errors.Is(err, context.Canceled) || (tc.waits && !strings.Contains(err.Error(), "not accepting connections")) {
+				t.Fatalf("terminal error lost the probe diagnosis: %v", err)
+			}
+			if got := strings.Contains(strings.Join(log.messages, "\n"), "not accepting connections"); got != tc.waits {
+				t.Errorf("readiness message logged = %t, want %t", got, tc.waits)
+			}
+			if got := strings.Contains(strings.Join(log.errors, "\n"), tc.stderr); got == tc.waits {
+				t.Errorf("raw probe error logged as error = %t, want %t", got, !tc.waits)
+			}
+		})
+	}
+}
+
+type upgradeProbeLog struct {
+	backupRecorder
+	errors []string
+}
+
+func (l *upgradeProbeLog) Error(format string, args ...any) {
+	l.errors = append(l.errors, fmt.Sprintf(format, args...))
+}
+
+type upgradeProbeFake struct {
+	*upgradeFakeRemote
+	failOnce func() (adapter.CommandResult, error)
+}
+
+func (r *upgradeProbeFake) Run(ctx context.Context, server store.Server, command string) (adapter.CommandResult, error) {
+	if r.failOnce != nil && strings.Contains(command, " 'probe' ") {
+		fail := r.failOnce
+		r.failOnce = nil
+		return fail()
+	}
+	return r.upgradeFakeRemote.Run(ctx, server, command)
 }
 
 func TestOfflineUpgradeRejectsNodeReturningWithDifferentIdentity(t *testing.T) {

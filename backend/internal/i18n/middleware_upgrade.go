@@ -11,6 +11,10 @@ var middlewareUpgradeMessages = map[string][2]string{
 		"节点 %s 的预检查报告了旧版 MySQL 的 WRITESET 配置。已从 MySQL 8.4 候选配置移除该参数，并通过配置校验。",
 		"The upgrade checker on %s reported the old MySQL WRITESET setting. The MySQL 8.4 candidate configuration omits the setting and passed validation.",
 	},
+	"mysqlProbeNotListening": {
+		"MySQL 节点 %s 暂未接受连接。",
+		"MySQL on %s is not accepting connections yet.",
+	},
 }
 
 func MiddlewareUpgradeText(language, key string) string {

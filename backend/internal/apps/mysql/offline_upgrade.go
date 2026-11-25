@@ -94,6 +94,14 @@ type upgradeProbeBlocker string
 
 func (b upgradeProbeBlocker) Error() string { return string(b) }
 
+type upgradeProbeConnectionRefused struct {
+	message string
+	cause   error
+}
+
+func (e upgradeProbeConnectionRefused) Error() string { return e.message + "\n" + e.cause.Error() }
+func (e upgradeProbeConnectionRefused) Unwrap() error { return e.cause }
+
 type offlineUpgrade struct {
 	service  Service
 	data     offlineUpgradeStore
@@ -573,10 +581,17 @@ func (u *offlineUpgrade) saveVerified() error {
 func (u *offlineUpgrade) waitForViews(ctx context.Context) ([]upgradeView, int, error) {
 	deadline, cancel := context.WithTimeout(ctx, 20*time.Minute)
 	defer cancel()
+	var lastNotice string
 	for {
 		views, primary, err := u.views(deadline)
 		if err == nil {
 			return views, primary, nil
+		}
+		var refused upgradeProbeConnectionRefused
+		if errors.As(err, &refused) && refused.message != lastNotice {
+			log := mysqlSanitizedLogger{base: u.run.LoggerForTarget(OfflineUpgradeClusterID(u.seed)), secrets: u.secrets}
+			log.Info("%s", refused.message)
+			lastNotice = refused.message
 		}
 		timer := time.NewTimer(5 * time.Second)
 		select {
@@ -633,11 +648,21 @@ func (u *offlineUpgrade) script(ctx context.Context, node upgradeNode, phase str
 
 func (u *offlineUpgrade) remote(ctx context.Context, node upgradeNode, phase, command string, protocolOutput bool) (string, error) {
 	result, err := u.service.remote.Run(ctx, node.server, command)
+	failed := err != nil || result.ExitCode != 0
+	if failed && phase == "probe" {
+		refused := fmt.Sprintf("MySQL Error 2003 (HY000): Can't connect to MySQL server on '127.0.0.1:%d' (111)", node.port)
+		if strings.Contains(result.Stderr, refused) {
+			return "", upgradeProbeConnectionRefused{
+				message: fmt.Sprintf(i18n.MiddlewareUpgradeText(u.run.Language, "mysqlProbeNotListening"), node.endpoint),
+				cause:   u.phaseError(node, phase),
+			}
+		}
+	}
 	log := mysqlSanitizedLogger{base: u.run.LoggerForTarget(OfflineUpgradeClusterID(u.seed)), secrets: u.secrets}
 	if !protocolOutput || err != nil {
 		installerkit.LogCommandResult(result, err, log)
 	}
-	if err != nil || result.ExitCode != 0 {
+	if failed {
 		return "", u.phaseError(node, phase)
 	}
 	return result.Stdout, nil
