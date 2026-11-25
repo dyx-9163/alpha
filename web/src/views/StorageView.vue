@@ -53,7 +53,7 @@
               <div class="app-icon small">S3</div>
               <div class="storage-title-block">
                 <strong>{{ group.title }}</strong>
-                <span>{{ group.topology }} / {{ t('storage.minioNodes') }} {{ group.nodes.length }}</span>
+                <span>{{ group.topology }} / {{ t('storage.productNodes', { product: group.product }) }} {{ group.nodes.length }}</span>
               </div>
               <div class="storage-head-actions">
                 <StatusTag :status="group.status" />
@@ -69,7 +69,7 @@
             <div class="storage-info-grid">
               <div>
                 <span>{{ t('storage.service') }}</span>
-                <strong>minio</strong>
+                <strong>{{ group.product }}</strong>
               </div>
               <div>
                 <span>{{ t('common.version') }}</span>
@@ -80,7 +80,7 @@
                 <strong>{{ group.topology || '-' }}</strong>
               </div>
               <div>
-                <span>{{ t('storage.minioNodes') }}</span>
+                <span>{{ t('storage.productNodes', { product: group.product }) }}</span>
                 <strong>{{ group.nodes.length }}</strong>
               </div>
               <div>
@@ -128,7 +128,7 @@
             </div>
 
             <div class="storage-node-list">
-              <div class="section-label">{{ t('storage.minioNodes') }}</div>
+              <div class="section-label">{{ t('storage.productNodes', { product: group.product }) }}</div>
               <div v-for="node in group.nodes" :key="node.instance.id" class="storage-node-row">
                 <div class="storage-node-main">
                   <strong>{{ node.serverLabel }}</strong>
@@ -319,6 +319,7 @@ import {
   minioStorageInsightFromMetadata
 } from '../storage/minioInsights'
 import { filterMinioInstances, latestSnapshotTime } from '../storage/monitoringStatus'
+import { objectStorageProduct } from '../storage/product'
 import { applyRealtimeStatusToAppInstance, useRealtimeStore } from '../stores/realtime'
 import { useTaskProgressStore } from '../stores/taskProgress'
 import { visibleManagementHeaderActions, visibleManagementTabs } from './managementEntries'
@@ -338,6 +339,7 @@ type InstanceMetadata = Record<string, any>
 type StorageNode = {
   instance: AppInstance
   metadata: InstanceMetadata
+  product: string
   serverLabel: string
   endpoint: string
   status: string
@@ -351,6 +353,7 @@ type StorageNode = {
 type StorageGroup = {
   id: string
   title: string
+  product: string
   version: string
   topology: string
   status: string
@@ -607,7 +610,7 @@ function collectionKey(kind: StorageKind) {
 
 function metadataOf(item: AppInstance) {
   try {
-    return JSON.parse(item.metadata || '{}') as InstanceMetadata
+    return (JSON.parse(item.metadata || '{}') ?? {}) as InstanceMetadata
   } catch {
     return {}
   }
@@ -635,9 +638,13 @@ function createStorageGroup(id: string, items: AppInstance[], metas: Map<string,
   const buckets = uniqueValues(sortedItems.flatMap((item) => bucketsFromMetadata(metas.get(item.id) ?? metadataOf(item))))
   const nodes = sortedItems.map((item, index) => createStorageNode(item, metas.get(item.id) ?? metadataOf(item), topology, index))
   const versions = uniqueValues(sortedItems.map((item) => item.version).filter(Boolean))
+  const products = uniqueValues(nodes.map((node) => node.product))
+  const product = products.join(' / ')
+  const titlePrefix = products.length === 1 ? product.toLowerCase() : 'object-storage'
   return {
     id,
-    title: storageGroupTitle(id, topology, first),
+    title: storageGroupTitle(id, topology, titlePrefix, first),
+    product,
     version: versions.join(', '),
     topology,
     status: storageGroupStatus(nodes),
@@ -651,13 +658,15 @@ function createStorageGroup(id: string, items: AppInstance[], metas: Map<string,
 }
 
 function createStorageNode(item: AppInstance, metadata: InstanceMetadata, topology: string, index: number): StorageNode {
+  const product = objectStorageProduct(metadata)
   return {
     instance: item,
     metadata,
+    product,
     serverLabel: serverName(item.serverId),
     endpoint: stringValue(metadata.endpoint) || endpointFromServer(item, metadata),
     status: displayInstanceStatus(item),
-    roleLabel: storageNodeRole(topology, index),
+    roleLabel: storageNodeRole(topology, index, product),
     storageInsight: minioStorageInsightFromMetadata(metadata),
     storageDisks: minioStorageDisksFromMetadata(metadata),
     cleanupEstimate: minioCleanupEstimateFromMetadata(metadata),
@@ -665,24 +674,24 @@ function createStorageNode(item: AppInstance, metadata: InstanceMetadata, topolo
   }
 }
 
-function storageGroupTitle(id: string, topology: string, first?: AppInstance) {
+function storageGroupTitle(id: string, topology: string, prefix: string, first?: AppInstance) {
   if (isBucketReplicationTopology(topology)) {
     const suffix = id.startsWith('replication:') ? id.replace('replication:', '').slice(-6) : first?.id.slice(-6)
-    return suffix ? `minio-bucket-replication-${suffix}` : 'minio-bucket-replication'
+    return suffix ? `${prefix}-bucket-replication-${suffix}` : `${prefix}-bucket-replication`
   }
   if (topology === 'distributed') {
-    return 'minio-distributed'
+    return `${prefix}-distributed`
   }
-  return first ? `minio-${serverName(first.serverId)}` : 'minio'
+  return first ? `${prefix}-${serverName(first.serverId)}` : prefix
 }
 
-function storageNodeRole(topology: string, index: number) {
+function storageNodeRole(topology: string, index: number, product: string) {
   if (isBucketReplicationTopology(topology)) {
     if (index === 0) return t('storage.siteA')
     if (index === 1) return t('storage.siteB')
     return `${t('storage.site')} ${index + 1}`
   }
-  return `${t('storage.minioNode')} ${index + 1}`
+  return `${t('storage.productNode', { product })} ${index + 1}`
 }
 
 function endpointFromServer(item: AppInstance, metadata: InstanceMetadata) {
@@ -830,7 +839,7 @@ function groupCapacityText(group: StorageGroup) {
   if (summary.nodeCount === 1) {
     return `${disks} / ${formatBytes(summary.aggregateTotalBytes)}`
   }
-  return `${summary.nodeCount} ${t('storage.minioNodes')} / ${disks} / ${t('storage.physicalCapacity')} ${formatBytes(summary.aggregateTotalBytes)}`
+  return `${summary.nodeCount} ${t('storage.productNodes', { product: group.product })} / ${disks} / ${t('storage.physicalCapacity')} ${formatBytes(summary.aggregateTotalBytes)}`
 }
 
 function groupUsedAvailableText(group: StorageGroup) {
@@ -949,6 +958,7 @@ function syncEndpointLabel(node: StorageNode | undefined, bucket: string) {
 function storageGroupSearchText(group: StorageGroup) {
   return [
     group.title,
+    group.product,
     group.version,
     group.topology,
     ...group.buckets,

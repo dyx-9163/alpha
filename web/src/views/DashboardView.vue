@@ -118,7 +118,7 @@
           <span class="status-pill success">{{ t('common.running') }} {{ runningStorageInstances }}</span>
         </div>
         <el-table :data="liveStorageInstances" :empty-text="t('dashboard.noStorageInstances')">
-          <el-table-column prop="app" :label="t('dashboard.instance')" />
+          <el-table-column :label="t('dashboard.instance')"><template #default="{ row }">{{ objectStorageProduct(row.metadata) }}</template></el-table-column>
           <el-table-column :label="t('storage.server')" min-width="150"><template #default="{ row }">{{ serverName(row.serverId) }}</template></el-table-column>
           <el-table-column prop="version" :label="t('common.version')" />
           <el-table-column prop="topology" :label="t('dashboard.topology')" />
@@ -138,6 +138,7 @@ import StatusTag from '../components/StatusTag.vue'
 import { createDashboardRealtimeRefreshScheduler, shouldRefreshDashboardForRealtimeEvent } from '../dashboard/realtimeRefresh'
 import { useI18n } from '../i18n'
 import { permissions } from '../rbac'
+import { objectStorageProduct } from '../storage/product'
 import { useAlertsStore, type AlertItem } from '../stores/alerts'
 import { applyRealtimeStatusToAppInstance, useRealtimeStore } from '../stores/realtime'
 import { useSessionStore } from '../stores/session'
