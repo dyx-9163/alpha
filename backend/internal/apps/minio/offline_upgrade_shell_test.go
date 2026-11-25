@@ -137,6 +137,24 @@ func TestOfflineSiloShellRecoveryDoesNotStopIntactMinIO(t *testing.T) {
 	assertSiloPathMissing(t, filepath.Join(backup, "..", "..", "..", "stop-called"), output)
 }
 
+func TestOfflineSiloShellComparesBootIDAsAStream(t *testing.T) {
+	const procfsCmp = `
+cmp() {
+  # Some cmp versions reject the reported zero-size procfs file before reading.
+  if [[ "${@: -1}" = /proc/sys/kernel/random/boot_id ]]; then return 1; fi
+  command cmp "$@"
+}
+`
+	_, output, err := runSiloUpgradeShell(t, "state", procfsCmp)
+	if err != nil || !strings.Contains(output, "old-running") {
+		t.Fatalf("same boot ID did not preserve the running MinIO state: %v\n%s", err, output)
+	}
+	_, output, err = runSiloUpgradeShell(t, "state", procfsCmp+`printf 'different-boot-id\n' > "$backup/boot-id"`)
+	if err == nil || strings.Contains(output, "old-running") {
+		t.Fatalf("changed boot ID did not block resumption: %v\n%s", err, output)
+	}
+}
+
 func TestOfflineSiloShellBackupRejectsLateNestedMount(t *testing.T) {
 	backup, output, err := runSiloUpgradeShell(t, "backup", `
 printf 'inactive\n' > "$state_file"

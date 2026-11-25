@@ -143,7 +143,8 @@ check_stopped() {
 }
 
 check_boot() {
-  cmp --silent -- "$backup/boot-id" /proc/sys/kernel/random/boot_id
+  # The procfs file reports zero size despite having content.
+  cat /proc/sys/kernel/random/boot_id | cmp --silent -- "$backup/boot-id" -
 }
 
 verify_mount() {
