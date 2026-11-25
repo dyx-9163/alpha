@@ -80,10 +80,28 @@ check_stop_layout() {
 
 check_process() {
   local binary=$1 pid
-  as_root systemctl is-active --quiet "$unit"
-  pid=$(as_root systemctl show -p MainPID --value "$unit")
-  test "$pid" -gt 0
+  as_root systemctl is-active --quiet "$unit" || return 1
+  pid=$(as_root systemctl show -p MainPID --value "$unit") || return 1
+  [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
   test "$(as_root readlink -f -- "/proc/$pid/exe")" = "$binary"
+}
+
+start_and_check_process() {
+  local binary=$1 attempt pid
+  as_root systemctl start "$unit" || return 1
+  # Type=simple can report a successful start before the service calls exec.
+  for attempt in {1..30}; do
+    if check_process "$binary"; then
+      return 0
+    fi
+    if (( attempt < 30 )); then sleep 1; fi
+  done
+  as_root systemctl show -p ActiveState -p SubState -p MainPID -p Result -p ExecMainStatus "$unit" >&2 || true
+  pid=$(as_root systemctl show -p MainPID --value "$unit" || true)
+  if [[ "$pid" =~ ^[1-9][0-9]*$ ]]; then
+    as_root readlink -f -- "/proc/$pid/exe" >&2 || true
+  fi
+  fail "Service $unit did not start the expected process $binary"
 }
 
 stop_cleanly() {
@@ -317,8 +335,7 @@ write_backup() {
   done
   as_root cp --archive -- "$unit_file" "$backup/$unit"
   as_root sync -f "$backup"
-  as_root systemctl start "$unit"
-  check_process "$prior_binary"
+  start_and_check_process "$prior_binary"
   as_root touch -- "$backup/complete"
   restart_unchanged=0
 }
@@ -386,8 +403,7 @@ WHERE MEMBER_ID = @@server_uuid AND MEMBER_STATE = 'ONLINE'")
       restart_unchanged=1
       stop_cleanly
       activate_tree "$router_base" "$router_next"
-      as_root systemctl start "$unit"
-      check_process "$router_base/bin/mysqlrouter"
+      start_and_check_process "$router_base/bin/mysqlrouter"
     fi
     ;;
   verify-router)
@@ -431,8 +447,7 @@ WHERE MEMBER_ID = @@server_uuid AND MEMBER_STATE = 'ONLINE'")
     as_root cp --archive -- "$config" "$config.next-$task"
     as_root tee "$config.next-$task" < "$candidate" >/dev/null
     as_root mv -T -- "$config.next-$task" "$config"
-    as_root systemctl start "$unit"
-    check_process "$base/bin/mysqld"
+    start_and_check_process "$base/bin/mysqld"
     ;;
   *) fail 'Unknown upgrade phase' ;;
 esac

@@ -142,6 +142,75 @@ func TestOfflineUpgradeCandidateKeepsInPlacePathsAndRemovedOptionHandling(t *tes
 	}
 }
 
+func TestOfflineUpgradeColdBackupWaitsForExpectedProcess(t *testing.T) {
+	requireLinuxDescriptors(t)
+	helpers, _, ok := strings.Cut(offlineUpgradeScript, "\ncase \"$phase\" in\n")
+	if !ok {
+		t.Fatal("could not load upgrade shell functions")
+	}
+	for _, tc := range []struct {
+		mode         string
+		wantComplete bool
+	}{
+		{"delayed-exec", true},
+		{"wrong-binary", false},
+		{"inactive", false},
+	} {
+		t.Run(tc.mode, func(t *testing.T) {
+			root := t.TempDir()
+			work := filepath.Join(root, "work")
+			backup := filepath.Join(root, "backup")
+			for _, dir := range []string{work, filepath.Join(root, "mysql-router"), filepath.Join(root, "router")} {
+				mustMkdirLogical(t, dir, 0o700)
+			}
+			scriptPath := filepath.Join(work, "test.sh")
+			writeLogicalTestFile(t, scriptPath, helpers+`
+unit_file="$work/router.service"
+touch "$unit_file"
+as_root() {
+  case "$1" in tar|sha256sum|sync) return 0 ;; esac
+  "$@"
+}
+check_tree() { test -d "$1"; }
+stop_cleanly() { :; }
+findmnt() { printf 'test mount\n'; }
+df() { printf 'Avail\n1073741824\n'; }
+sleep() { :; }
+systemctl() {
+  case "$1" in
+    start) return 0 ;;
+    is-active) [[ "$TEST_MODE" != inactive ]] ;;
+    show) printf '42\n' ;;
+  esac
+}
+readlink() {
+  local attempt=0
+  if [[ -f "$work/probes" ]]; then read -r attempt < "$work/probes"; fi
+  attempt=$((attempt + 1))
+  printf '%s\n' "$attempt" > "$work/probes"
+  if [[ "$TEST_MODE" == inactive ]] || [[ "$TEST_MODE" == delayed-exec && "$attempt" -ge 3 ]]; then
+    printf '%s\n' "$router_base/bin/mysqlrouter"
+  else
+    printf '/usr/lib/systemd/systemd-executor\n'
+  fi
+}
+write_backup
+`, 0o700)
+			cmd := exec.Command("bash", scriptPath, "backup", "mysql-router", root, work, backup, "test", "6446")
+			cmd.Env = append(os.Environ(), "TEST_MODE="+tc.mode)
+			output, err := cmd.CombinedOutput()
+			_, markerErr := os.Stat(filepath.Join(backup, "complete"))
+			if tc.wantComplete {
+				if err != nil || markerErr != nil {
+					t.Fatalf("backup did not wait for Router startup: error %v, marker %v\n%s", err, markerErr, output)
+				}
+			} else if err == nil || !os.IsNotExist(markerErr) {
+				t.Fatalf("backup accepted a wrong or inactive Router: error %v, marker %v\n%s", err, markerErr, output)
+			}
+		})
+	}
+}
+
 func TestOfflineUpgradeExtractsServiceTreesWithRuntimeOwner(t *testing.T) {
 	requireLinuxDescriptors(t)
 	script, _, found := strings.Cut(offlineUpgradeScript, "\ncase \"$phase\" in\n")
