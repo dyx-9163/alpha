@@ -722,13 +722,13 @@ func (s *Store) UpdateTaskStatus(id, status, errText string) error {
 	errText = logmask.Mask(errText)
 	switch status {
 	case "running":
-		_, err := s.db.Exec(`update tasks set status=?, started_at=? where id=?`, status, now, id)
+		_, err := s.db.Exec(`update tasks set status=?, started_at=?, interrupted_by_restart=0 where id=?`, status, now, id)
 		return err
 	case "success", "failed", "cancelled", "timeout":
-		_, err := s.db.Exec(`update tasks set status=?, error=?, lease_owner='', lease_expires_at=null, finished_at=? where id=?`, status, errText, now, id)
+		_, err := s.db.Exec(`update tasks set status=?, error=?, lease_owner='', lease_expires_at=null, finished_at=?, interrupted_by_restart=0 where id=?`, status, errText, now, id)
 		return err
 	default:
-		_, err := s.db.Exec(`update tasks set status=?, error=? where id=?`, status, errText, id)
+		_, err := s.db.Exec(`update tasks set status=?, error=?, interrupted_by_restart=0 where id=?`, status, errText, id)
 		return err
 	}
 }
@@ -773,7 +773,8 @@ func (s *Store) RecoverInterruptedTasks(errText string) ([]Task, error) {
 
 	for idx := range tasks {
 		taskID := tasks[idx].ID
-		if _, err := tx.Exec(`update tasks set status='failed', error=?, lease_owner='', lease_expires_at=null, finished_at=? where id=?`, errText, now, taskID); err != nil {
+		if _, err := tx.Exec(`update tasks set status='failed', error=?, lease_owner='', lease_expires_at=null, finished_at=?, interrupted_by_restart=? where id=?`,
+			errText, now, tasks[idx].Status == "running", taskID); err != nil {
 			return nil, err
 		}
 		if _, err := tx.Exec(`insert into task_logs(task_id,target,level,message,created_at) values(?,?,?,?,?)`, taskID, "", "error", errText, now); err != nil {

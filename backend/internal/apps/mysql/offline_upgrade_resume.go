@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"slices"
-	"strings"
+	"time"
 
+	"aifar-deployment/backend/internal/apps/registry"
 	"aifar-deployment/backend/internal/i18n"
+	"aifar-deployment/backend/internal/installer/installerkit"
 	"aifar-deployment/backend/internal/store"
 )
 
@@ -56,8 +58,7 @@ func (u *offlineUpgrade) createCheckpoint() error {
 
 func (u *offlineUpgrade) matchCheckpoint() error {
 	invalid := errors.New(i18n.MiddlewareUpgradeText(u.run.Language, "mysqlCheckpointInvalid"))
-	if !strings.EqualFold(u.checkpoint.BundleSHA256, u.bundle.ArchiveSHA256) ||
-		len(u.checkpoint.Nodes) != len(u.nodes)+len(u.routers) {
+	if len(u.checkpoint.Nodes) != len(u.nodes)+len(u.routers) {
 		return invalid
 	}
 	byID := make(map[string]store.MySQLOfflineUpgradeNode, len(u.checkpoint.Nodes))
@@ -80,6 +81,41 @@ func (u *offlineUpgrade) matchCheckpoint() error {
 				return invalid
 			}
 			u.baseline[i] = upgradeView{uuid: saved.UUID, group: saved.Group, gtid: saved.GTID, endpoint: saved.Endpoint}
+		}
+	}
+	return nil
+}
+
+// CheckOfflineUpgradeResumeIdle runs before a replacement worker takes over
+// the interrupted worker's Panel locks. Each mutating phase holds the same
+// exclusive directory lock from entry through its recovery trap.
+func (m Module) CheckOfflineUpgradeResumeIdle(ctx context.Context, seed store.AppInstance, checkpointTaskID string, run registry.RunContext) error {
+	data, ok := m.service.store.(offlineUpgradeStore)
+	invalid := errors.New(i18n.MiddlewareUpgradeText(run.Language, "mysqlCheckpointInvalid"))
+	if !ok || !validLogicalTaskID(checkpointTaskID) || OfflineUpgradeClusterID(seed) == "" {
+		return invalid
+	}
+	u := offlineUpgrade{service: m.service, data: data, run: run, seed: seed, versions: map[int]string{}}
+	if err := u.loadUpgradeTopology(); err != nil {
+		return err
+	}
+	if u.checkpoint.TaskID != checkpointTaskID {
+		return invalid
+	}
+	if err := u.matchCheckpoint(); err != nil {
+		return err
+	}
+
+	deadline, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	for _, node := range slices.Concat(u.nodes, u.routers) {
+		root := installerkit.ShellQuote(node.root)
+		command := "set -eu; test \"$(realpath -e -- " + root + ")\" = " + root + "; flock -n -- " + root + " true"
+		probeCtx, done := context.WithTimeout(deadline, 6*time.Second)
+		_, err := u.remote(probeCtx, node, "resume-idle-check", command, false)
+		done()
+		if err != nil {
+			return errors.Join(errors.New(i18n.MiddlewareUpgradeText(run.Language, "mysqlResumeOldPhaseNotIdle")), err)
 		}
 	}
 	return nil

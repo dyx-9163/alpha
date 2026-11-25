@@ -26,6 +26,7 @@ shell_next="$shell_base.next-$task"
 router_next="$router_base.next-$task"
 stop_override=''
 restart_unchanged=0
+router_revert_started=0
 swapped_tree=''
 pending_config=''
 pending_config_dir=''
@@ -62,6 +63,9 @@ finish() {
       printf 'Could not remove the staging directory %s\n' "$pending_config_dir" >&2
     fi
   fi
+  if (( status != 0 && router_revert_started )) && router_revert_restored_old_tree; then
+    restart_unchanged=1
+  fi
   if (( status != 0 && restart_unchanged )); then
     if restart_original_service "$binary"; then
       printf 'Recovered the original service %s\n' "$unit"
@@ -91,20 +95,25 @@ check_tree() {
   fi
 }
 
-check_stop_layout() {
-  local binary=$1 expected_args=$2 exec principal
-  test "$(as_root systemctl show -p FragmentPath --value "$unit")" = "$unit_file"
-  test -z "$(as_root systemctl show -p DropInPaths --value "$unit")"
-  test -f "$unit_file" && test ! -L "$unit_file"
-  exec=$(as_root systemctl show -p ExecStart --value "$unit")
-  [[ "$exec" == *"path=$binary ; argv[]=$binary $expected_args ;"* ]]
-  principal=$(as_root systemctl show -p User --value "$unit")
+check_service_layout() {
+  local binary=$1 expected_args=$2 exec principal dropins
+  test "$(as_root systemctl show -p FragmentPath --value "$unit")" = "$unit_file" || return 1
+  dropins=$(as_root systemctl show -p DropInPaths --value "$unit") || return 1
+  test -z "$dropins" || return 1
+  [[ -f "$unit_file" && ! -L "$unit_file" ]] || return 1
+  exec=$(as_root systemctl show -p ExecStart --value "$unit") || return 1
+  [[ "$exec" == *"path=$binary ; argv[]=$binary $expected_args ;"* ]] || return 1
+  principal=$(as_root systemctl show -p User --value "$unit") || return 1
   if [[ "$app" == mysql ]]; then
     test "$principal" = aifar-mysql
   else
     test "$principal" = aifar-router
   fi
-  check_process "$binary"
+}
+
+check_stop_layout() {
+  check_service_layout "$1" "$2" || return 1
+  check_process "$1"
 }
 
 check_process() {
@@ -471,6 +480,14 @@ restore_swapped_tree() {
   return 1
 }
 
+router_revert_restored_old_tree() {
+  # The original tree may have landed just before the TERM trap fired.
+  local old="$router_base.old-$task"
+  [[ ! -e "$old" && ! -L "$old" ]] &&
+    check_tree "$router_base" && check_tree "$router_next" &&
+    check_tool_version "$router_base" 8.0.36 && check_tool_version "$router_next" 26.10.0
+}
+
 lock_phase() {
   test "$(as_root realpath -e -- "$root")" = "$root"
   exec {phase_lock}< "$root"
@@ -487,15 +504,23 @@ check_tool_version() {
 }
 
 tool_version() {
-  local tree=$1
+  local tree=$1 state router_stopped=0
   check_tree "$tree" || return 1
-  if [[ "$app" == mysql-router ]]; then check_process "$tree/bin/mysqlrouter" || return 1; fi
+  if [[ "$app" == mysql-router ]] && ! check_process "$tree/bin/mysqlrouter"; then
+    [[ "$phase" == resume-tools-probe ]] || return 1
+    check_service_layout "$tree/bin/mysqlrouter" "-c $router_config" || return 1
+    state=$(as_root systemctl show -p ActiveState --value "$unit") || return 1
+    [[ "$state" == inactive || "$state" == failed ]] || return 1
+    test "$(as_root systemctl show -p MainPID --value "$unit")" = 0 || return 1
+    router_stopped=1
+  fi
   if check_tool_version "$tree" 26.10.0; then
     check_tree "$tree.old-$task" || return 1
     check_tool_version "$tree.old-$task" 8.0.36 || return 1
     [[ ! -e "$tree.next-$task" && ! -L "$tree.next-$task" ]] || return 1
     printf '26.10.0\n'
   else
+    (( ! router_stopped )) || return 1
     check_tool_version "$tree" 8.0.36 || return 1
     [[ ! -e "$tree.old-$task" && ! -L "$tree.old-$task" ]] || return 1
     check_tree "$tree.next-$task" || return 1
@@ -631,12 +656,14 @@ WHERE MEMBER_ID = @@server_uuid AND MEMBER_STATE = 'ONLINE'")
     [[ "$app" == mysql-router ]]
     verify_tool_backup
     # A failed routing check can occur while the new Router is already exiting.
-    # Validate both trees before stopping the current unit.
+    # Validate the unit and both trees before stopping the current process.
+    check_service_layout "$router_base/bin/mysqlrouter" "-c $router_config"
     check_tree "$router_base"
     check_tree "$router_base.old-$task"
     check_tool_version "$router_base" 26.10.0
     check_tool_version "$router_base.old-$task" 8.0.36
     [[ ! -e "$router_next" && ! -L "$router_next" ]]
+    router_revert_started=1
     restore_swapped_tree "$router_base" || fail 'Could not restore the original Router tree; preserve the cold backup'
     start_and_check_process "$router_base/bin/mysqlrouter" || fail 'Restored the original Router tree but its process did not start'
     ;;

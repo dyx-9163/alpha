@@ -274,6 +274,13 @@ var storeMigrations = []storeMigration{
 			)`)
 		},
 	},
+	{
+		Version: 2026112502,
+		Name:    "task startup interruption state",
+		Up: func(tx *sql.Tx) error {
+			return ensureColumnTx(tx, "tasks", "interrupted_by_restart", `alter table tasks add column interrupted_by_restart integer not null default 0`)
+		},
+	},
 }
 
 func runStoreMigrations(db *sql.DB) error {

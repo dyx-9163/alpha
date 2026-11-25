@@ -304,6 +304,41 @@ func upgradeCheckerPassed(output string) (passed, handledWriteSet bool) {
 }
 
 func (u *offlineUpgrade) preflight(ctx context.Context, resources []store.Resource) error {
+	if err := u.loadUpgradeTopology(); err != nil {
+		return err
+	}
+	for i := range u.nodes {
+		node := &u.nodes[i]
+		credential, err := resolveMySQLAdminCredential(u.data, node.instance)
+		if err != nil {
+			return localizedMySQLOperationError(u.run.Language, MySQLCredentialUnavailable)
+		}
+		node.credential = credential
+		u.secrets = append(u.secrets, credential.Secret["password"])
+	}
+	var candidates []store.Resource
+	for _, resource := range resources {
+		if filepath.Base(resource.Path) == "mysql-aifar-8.4.13-official-bundle.tar" &&
+			resource.App == "mysql" && resource.Part == "backend" && resource.Version == OfflineUpgradeTargetVersion {
+			candidates = append(candidates, resource)
+		}
+	}
+	bundle, err := SelectBundle(candidates, OfflineUpgradeTargetVersion)
+	u.bundle = bundle
+	digest, digestErr := hex.DecodeString(u.bundle.ArchiveSHA256)
+	if len(candidates) != 1 || err != nil || digestErr != nil || len(digest) != 32 || VerifyBundle(u.bundle) != nil {
+		return errors.New(upgradeText(u.run.Language, "A verified offline MySQL 8.4.13 bundle with a SHA-256 digest is required", "需要带 SHA-256 且校验通过的 MySQL 8.4.13 离线包"))
+	}
+	if u.resuming() {
+		if !strings.EqualFold(u.checkpoint.BundleSHA256, u.bundle.ArchiveSHA256) {
+			return errors.New(i18n.MiddlewareUpgradeText(u.run.Language, "mysqlCheckpointInvalid"))
+		}
+		return u.matchCheckpoint()
+	}
+	return ctx.Err()
+}
+
+func (u *offlineUpgrade) loadUpgradeTopology() error {
 	badCluster := errors.New(upgradeText(u.run.Language, "The recorded cluster and all three MySQL 8.0.36 members must be eligible for upgrade", "登记的集群和三台 MySQL 8.0.36 成员均须满足升级条件"))
 	current, err := u.data.GetAppInstance(u.seed.ID)
 	if err != nil || current.ServerID != u.seed.ServerID || OfflineUpgradeClusterID(current) != OfflineUpgradeClusterID(u.seed) {
@@ -360,30 +395,10 @@ func (u *offlineUpgrade) preflight(ctx context.Context, resources []store.Resour
 		if err != nil {
 			return err
 		}
-		node.credential, err = resolveMySQLAdminCredential(u.data, instance)
-		if err != nil {
-			return localizedMySQLOperationError(u.run.Language, MySQLCredentialUnavailable)
-		}
-		u.secrets = append(u.secrets, node.credential.Secret["password"])
 		u.nodes = append(u.nodes, node)
 		u.versions[i] = OfflineUpgradeSourceVersion
 	}
-	var candidates []store.Resource
-	for _, resource := range resources {
-		if filepath.Base(resource.Path) == "mysql-aifar-8.4.13-official-bundle.tar" &&
-			resource.App == "mysql" && resource.Part == "backend" && resource.Version == OfflineUpgradeTargetVersion {
-			candidates = append(candidates, resource)
-		}
-	}
-	u.bundle, err = SelectBundle(candidates, OfflineUpgradeTargetVersion)
-	digest, digestErr := hex.DecodeString(u.bundle.ArchiveSHA256)
-	if len(candidates) != 1 || err != nil || digestErr != nil || len(digest) != 32 || VerifyBundle(u.bundle) != nil {
-		return errors.New(upgradeText(u.run.Language, "A verified offline MySQL 8.4.13 bundle with a SHA-256 digest is required", "需要带 SHA-256 且校验通过的 MySQL 8.4.13 离线包"))
-	}
-	if u.resuming() {
-		return u.matchCheckpoint()
-	}
-	return ctx.Err()
+	return nil
 }
 
 func (u *offlineUpgrade) loadNode(instance store.AppInstance, port int) (upgradeNode, error) {
@@ -524,7 +539,10 @@ func (u *offlineUpgrade) upgradeTools(ctx context.Context) error {
 			return err
 		}
 		if err = u.verifyRouterAgainstLiveCluster(ctx, router); err != nil {
-			if switched {
+			// A previous task may have switched the Router without recording a
+			// successful SQL check. Metadata cannot have advanced past that gate.
+			unverifiedSwitch := u.resuming() && router.instance.Version == OfflineUpgradeSourceVersion
+			if switched || unverifiedSwitch {
 				_, revertErr := u.script(context.WithoutCancel(ctx), router, "revert-router")
 				return errors.Join(err, revertErr)
 			}
@@ -547,6 +565,9 @@ func (u *offlineUpgrade) switchTools(ctx context.Context, node upgradeNode) (boo
 		case "__AIFAR_UPGRADE_TOOL__\t" + offlineUpgradeToolsVersion:
 			return false, nil
 		case "__AIFAR_UPGRADE_TOOL__\t" + OfflineUpgradeSourceVersion:
+			if node.instance.App == "mysql-router" && node.instance.Version == OfflineUpgradeTargetVersion {
+				return false, u.phaseError(node, "resume-router-version")
+			}
 		default:
 			return false, u.phaseError(node, "resume-tools-probe")
 		}

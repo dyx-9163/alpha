@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net/http"
 	"path/filepath"
+	"time"
 
 	"aifar-deployment/backend/internal/apps/registry"
 	"aifar-deployment/backend/internal/i18n"
@@ -18,6 +19,10 @@ import (
 
 type offlineUpgrader interface {
 	RunOfflineUpgrade(context.Context, store.AppInstance, []store.Resource, registry.RunContext) error
+}
+
+type offlineUpgradeResumeIdleChecker interface {
+	CheckOfflineUpgradeResumeIdle(context.Context, store.AppInstance, string, registry.RunContext) error
 }
 
 type offlineUpgradePlanner interface {
@@ -108,6 +113,22 @@ func (a *API) startMiddlewareUpgrade(w http.ResponseWriter, r *http.Request) {
 		respondTask(w, store.Task{}, err)
 		return
 	}
+	var recovery store.MySQLOfflineUpgradeLockRecovery
+	var idleChecker offlineUpgradeResumeIdleChecker
+	if instance.App == "mysql" {
+		recovery, err = a.store.GetInterruptedMySQLOfflineUpgradeLock(group)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			respondTask(w, store.Task{}, err)
+			return
+		}
+		if err == nil {
+			idleChecker, ok = module.(offlineUpgradeResumeIdleChecker)
+			if !ok {
+				writeError(w, http.StatusConflict, "UPGRADE_MODULE_UNAVAILABLE", i18n.MiddlewareUpgradeText(lang, "unavailable"), nil)
+				return
+			}
+		}
+	}
 
 	actor := currentUser(r).Username
 	taskType := "apps." + instance.App + ".upgrade"
@@ -144,39 +165,69 @@ func (a *API) startMiddlewareUpgrade(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	locks, acquired := a.acquireTaskOperationLocks(w, lang, task, specs)
-	if !acquired {
-		return
+	var locks []store.OperationLock
+	if idleChecker == nil {
+		var acquired bool
+		locks, acquired = a.acquireTaskOperationLocks(w, lang, task, specs)
+		if !acquired {
+			return
+		}
 	}
-	task, err = a.tasks.StartExistingWithLanguage(task, lang, func(ctx context.Context, log worker.Logger) error {
+	refresh := func() (store.AppInstance, error) {
 		fresh, err := a.store.GetAppInstance(instance.ID)
 		if err != nil {
-			return err
+			return store.AppInstance{}, err
 		}
 		freshGroup, freshPeers, err := a.middlewareUpgradePeers(fresh, spec)
 		if err != nil || freshGroup != group || !sameMiddlewareUpgradePeers(peers, freshPeers) {
-			return errors.New(i18n.MiddlewareUpgradeText(lang, "group"))
+			return store.AppInstance{}, errors.New(i18n.MiddlewareUpgradeText(lang, "group"))
 		}
 		if fresh.App == "mysql" {
 			freshParticipants, err := a.middlewareUpgradeParticipants(fresh.App, group, freshPeers)
 			if err != nil || !sameMiddlewareUpgradePeers(participants, freshParticipants) {
-				return errors.New(i18n.MiddlewareUpgradeText(lang, "group"))
+				return store.AppInstance{}, errors.New(i18n.MiddlewareUpgradeText(lang, "group"))
 			}
 			if code := a.mysqlOrdinaryLifecycleGate(fresh); code != "" {
-				return errors.New(i18n.MySQLBackupErrorText(lang, code))
+				return store.AppInstance{}, errors.New(i18n.MySQLBackupErrorText(lang, code))
+			}
+		}
+		return fresh, nil
+	}
+	task, err = a.tasks.StartExistingWithLanguage(task, lang, func(ctx context.Context, log worker.Logger) error {
+		fresh, err := refresh()
+		if err != nil {
+			return err
+		}
+		run := registry.RunContext{
+			TaskID: log.TaskID(), Language: lang, Log: log,
+			Resources: resources, TargetLog: func(target string) registry.Logger { return log.Target(target) },
+		}
+		if idleChecker != nil {
+			if err := checkMySQLOfflineUpgradeIdle(ctx, idleChecker, fresh, recovery, run); err != nil {
+				return err
+			}
+			fresh, err = refresh()
+			if err != nil {
+				return err
 			}
 		}
 		if !log.TryEnterCommit() {
 			return context.Canceled
 		}
+		if idleChecker != nil {
+			requested := make([]store.OperationLock, 0, len(specs))
+			for _, spec := range specs {
+				requested = append(requested, store.OperationLock{Scope: spec.Scope, ResourceID: spec.ResourceID, Operation: spec.Operation, Metadata: spec.Metadata})
+			}
+			if err := a.store.TakeOverInterruptedMySQLOfflineUpgradeLocks(recovery, log.TaskID(), requested); err != nil {
+				return errors.Join(errors.New(i18n.MiddlewareUpgradeText(lang, "mysqlResumeTakeoverFailed")), err)
+			}
+		}
 		if fallbackPlan {
 			log.StartTarget(group)
 			log.StartStep(group, "upgrade", title, 1)
 		}
-		err = upgrader.RunOfflineUpgrade(ctx, fresh, resources, registry.RunContext{
-			TaskID: log.TaskID(), Language: lang, Log: log,
-			Resources: resources, TargetLog: func(target string) registry.Logger { return log.Target(target) },
-		})
+		err = upgrader.RunOfflineUpgrade(ctx, fresh, resources, run)
 		if !fallbackPlan {
 			return err
 		}
@@ -191,10 +242,23 @@ func (a *API) startMiddlewareUpgrade(w http.ResponseWriter, r *http.Request) {
 	})
 	if err != nil {
 		a.releaseOperationLocks(locks)
+		if idleChecker != nil {
+			_ = a.store.DeleteTask(task.ID)
+		}
 	} else {
 		a.audit(r, taskType, instance.ID, "running", task.ID)
 	}
 	respondTask(w, task, err)
+}
+
+func checkMySQLOfflineUpgradeIdle(ctx context.Context, checker offlineUpgradeResumeIdleChecker, instance store.AppInstance, recovery store.MySQLOfflineUpgradeLockRecovery, run registry.RunContext) error {
+	run.Log.Info(i18n.MiddlewareUpgradeText(run.Language, "mysqlResumeCheckingIdle"), recovery.OwnerTaskID)
+	guardCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	if err := checker.CheckOfflineUpgradeResumeIdle(guardCtx, instance, recovery.CheckpointTaskID, run); err != nil {
+		return err
+	}
+	return guardCtx.Err()
 }
 
 func (p middlewareUpgradePath) hasResources(resources []store.Resource) bool {

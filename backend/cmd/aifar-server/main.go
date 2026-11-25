@@ -50,6 +50,12 @@ func main() {
 		log.Printf("WARNING: insecure development credentials are explicitly allowed; do not use this mode in production")
 	}
 
+	processLock, err := store.AcquirePanelProcessLock(cfg.DatabasePath)
+	if err != nil {
+		log.Fatalf("acquire Panel database lock: %v", err)
+	}
+	defer processLock.Close()
+	cfg.DatabasePath = processLock.DatabasePath()
 	db, err := store.OpenWithSecrets(cfg.DatabasePath, cfg.CredentialSecret, cfg.PreviousCredentialSecret)
 	if err != nil {
 		log.Fatalf("open database: %v", err)

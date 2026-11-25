@@ -1,9 +1,12 @@
 package store
 
 import (
+	"database/sql"
 	"encoding/json"
 	"errors"
 )
+
+const selectMySQLOfflineUpgradeCheckpoint = `select task_id, bundle_sha256, nodes from mysql_offline_upgrade_checkpoints where cluster_id=?`
 
 var ErrMySQLOfflineUpgradeCheckpointConflict = errors.New("MySQL offline upgrade checkpoint conflict")
 
@@ -18,10 +21,13 @@ type MySQLOfflineUpgradeNode struct {
 }
 
 func (s *Store) GetMySQLOfflineUpgradeCheckpoint(clusterID string) (MySQLOfflineUpgradeCheckpoint, error) {
+	return scanMySQLOfflineUpgradeCheckpoint(s.db.QueryRow(selectMySQLOfflineUpgradeCheckpoint, clusterID))
+}
+
+func scanMySQLOfflineUpgradeCheckpoint(row *sql.Row) (MySQLOfflineUpgradeCheckpoint, error) {
 	var checkpoint MySQLOfflineUpgradeCheckpoint
 	var nodes string
-	err := s.db.QueryRow(`select task_id, bundle_sha256, nodes from mysql_offline_upgrade_checkpoints where cluster_id=?`, clusterID).
-		Scan(&checkpoint.TaskID, &checkpoint.BundleSHA256, &nodes)
+	err := row.Scan(&checkpoint.TaskID, &checkpoint.BundleSHA256, &nodes)
 	if err != nil {
 		return MySQLOfflineUpgradeCheckpoint{}, err
 	}

@@ -89,6 +89,7 @@ mkdir "$router_next"
 printf 'new\n' > "$router_next/version"
 as_root() { "$@"; }
 verify_backup() { :; }
+check_service_layout() { :; }
 restore_labels() { :; }
 sleep() { :; }
 stop_cleanly() { rm -f "$work/running"; }
@@ -246,6 +247,47 @@ verify_backup() { test -f "$backup/complete"; }
 	for _, change := range []string{`rm "$backup/complete"`, `mv -T "$router_base.old-$task" "$work/lost"`} {
 		if _, output, err := runOfflineUpgradeShell(t, "resume-tools-probe", "mysql-router", fixture+"\n"+change+"\n"); err == nil {
 			t.Fatalf("recognized upgraded Router after evidence was removed (%s):\n%s", change, output)
+		}
+	}
+}
+
+func TestOfflineUpgradeShellRestartsRestoredRouterOnTerm(t *testing.T) {
+	root, output, err := runOfflineUpgradeShell(t, "revert-router", "mysql-router", offlineUpgradeRouterFixture+`
+mv -T "$router_base" "$router_base.old-$task"
+mv -T "$router_next" "$router_base"
+mv() {
+  command mv "$@" || return
+  if [[ "$*" == *"$router_base.old-$task $router_base" ]]; then
+    kill -TERM "$$"
+  fi
+}
+`)
+	if err == nil {
+		t.Fatal("terminated recovery unexpectedly succeeded")
+	}
+	running, readErr := os.ReadFile(filepath.Join(root, "work", "running"))
+	if readErr != nil || string(running) != "old\n" {
+		t.Fatalf("restored Router did not restart when recovery received TERM: %q %v\n%s", running, readErr, output)
+	}
+}
+
+func TestOfflineUpgradeShellResumeIdentifiesInterruptedRouterEvenWhenStopped(t *testing.T) {
+	fixture := offlineUpgradeRouterFixture + `
+mv -T "$router_base" "$router_base.old-$task"
+mv -T "$router_next" "$router_base"
+rm "$work/running"
+check_process() { return 1; }
+`
+	if _, output, err := runOfflineUpgradeShell(t, "resume-tools-probe", "mysql-router", fixture); err != nil ||
+		!strings.Contains(output, "__AIFAR_UPGRADE_TOOL__\t26.10.0\n") {
+		t.Fatalf("could not classify the stopped Router with a verified prior tree: %v\n%s", err, output)
+	}
+	for _, bad := range []string{
+		`check_service_layout() { return 1; }`,
+		`systemctl() { if [[ "$3" == ActiveState ]]; then printf 'active\n'; else printf '100\n'; fi; }`,
+	} {
+		if _, output, err := runOfflineUpgradeShell(t, "resume-tools-probe", "mysql-router", fixture+"\n"+bad+"\n"); err == nil {
+			t.Fatalf("resume accepted a changed service definition or another running executable: %s", output)
 		}
 	}
 }

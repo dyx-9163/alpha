@@ -59,12 +59,17 @@ func (s *Store) AcquireOperationLock(lock OperationLock) (OperationLock, error) 
 	if found {
 		return lock, OperationLockConflict{Lock: conflict}
 	}
-	if _, err := tx.Exec(`insert into operation_locks(id,scope,resource_id,operation,owner_task_id,owner,status,expires_at,heartbeat_at,released_at,metadata,created_at,updated_at)
-		values(?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		lock.ID, lock.Scope, lock.ResourceID, lock.Operation, lock.OwnerTaskID, lock.Owner, lock.Status, lock.ExpiresAt, lock.HeartbeatAt, nullableTime(lock.ReleasedAt), lock.Metadata, lock.CreatedAt, lock.UpdatedAt); err != nil {
+	if err := insertOperationLock(tx, lock); err != nil {
 		return lock, err
 	}
 	return lock, tx.Commit()
+}
+
+func insertOperationLock(tx *sql.Tx, lock OperationLock) error {
+	_, err := tx.Exec(`insert into operation_locks(id,scope,resource_id,operation,owner_task_id,owner,status,expires_at,heartbeat_at,released_at,metadata,created_at,updated_at)
+		values(?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		lock.ID, lock.Scope, lock.ResourceID, lock.Operation, lock.OwnerTaskID, lock.Owner, lock.Status, lock.ExpiresAt, lock.HeartbeatAt, nullableTime(lock.ReleasedAt), lock.Metadata, lock.CreatedAt, lock.UpdatedAt)
+	return err
 }
 
 func (s *Store) HeartbeatOperationLock(id string, ttl time.Duration) (OperationLock, error) {
