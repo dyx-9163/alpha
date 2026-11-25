@@ -282,6 +282,25 @@ func TestMinIOStandaloneScriptsRenderTemplates(t *testing.T) {
 		!strings.Contains(distributed, `allow_selinux_ports http_port_t "$API_PORT" "$CONSOLE_PORT"`) {
 		t.Fatalf("distributed script should open firewall and SELinux rules for MinIO ports:\n%s", distributed)
 	}
+	tests := []struct {
+		name         string
+		script       string
+		writeEnv     string
+		startService string
+	}{
+		{"standalone", install, `install -m 0600 "$WORK_DIR/minio.env" "$ENV_FILE"`, `systemctl enable --now "$SERVICE_NAME"`},
+		{"distributed", distributed, `install -m 0600 "$ENV_TEMP" "$ENV_FILE"`, `systemctl restart "$SERVICE_NAME"`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			writeEnv := strings.Index(tt.script, tt.writeEnv)
+			labelTree := strings.Index(tt.script, `label_selinux_service_tree "$INSTALL_ROOT"`)
+			startService := strings.Index(tt.script, tt.startService)
+			if writeEnv < 0 || labelTree <= writeEnv || startService <= labelTree {
+				t.Fatal("script must label the MinIO service tree after writing the environment file and before starting systemd")
+			}
+		})
+	}
 	replication, err := configureBucketReplicationScript(BucketReplicationConfig{
 		InstallRoot:      "/aifar/apps/minio",
 		APIPort:          9000,

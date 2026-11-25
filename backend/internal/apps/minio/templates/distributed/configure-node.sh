@@ -21,13 +21,18 @@ fi
 MINIO_VOLUMES="{{range .Volumes}}http://{{.Host}}:{{.Port}}{{.Path}} {{end}}"
 
 echo "configuring MinIO distributed service"
-cat > "$INSTALL_ROOT/conf/minio.env.tmp" <<CONF
+ENV_TEMP="$(mktemp)"
+trap 'rm -f "$ENV_TEMP"' 0
+cat > "$ENV_TEMP" <<CONF
 MINIO_ROOT_USER="$ROOT_USER"
 MINIO_ROOT_PASSWORD="$ROOT_PASSWORD"
 MINIO_VOLUMES="$MINIO_VOLUMES"
 MINIO_OPTS="--address :$API_PORT --console-address :$CONSOLE_PORT"
 CONF
-$SUDO install -m 0600 "$INSTALL_ROOT/conf/minio.env.tmp" "$ENV_FILE"
+$SUDO install -m 0600 "$ENV_TEMP" "$ENV_FILE"
+rm -f "$ENV_TEMP"
+trap - 0
+label_selinux_service_tree "$INSTALL_ROOT"
 
 $SUDO systemctl daemon-reload
 if ! $SUDO systemctl restart "$SERVICE_NAME"; then

@@ -122,6 +122,7 @@ MINIO_OPTS="--address :$API_PORT --console-address :$CONSOLE_PORT"
 {{if gt .ReplicationMaxLargeWorkers 0}}MINIO_API_REPLICATION_MAX_LRG_WORKERS={{.ReplicationMaxLargeWorkers}}{{end}}
 CONF
 $SUDO install -m 0600 "$WORK_DIR/minio.env" "$ENV_FILE"
+label_selinux_service_tree "$INSTALL_ROOT"
 
 echo "writing MinIO systemd unit"
 cat > "$WORK_DIR/$SERVICE_NAME.service" <<SERVICE
