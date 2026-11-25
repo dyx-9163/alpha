@@ -111,6 +111,24 @@ func TestOfflineSiloShellMarksOnlyAnActualStopAttempt(t *testing.T) {
 	}
 }
 
+func TestOfflineSiloShellAcceptsOnlyTheVerifiedLegacyMinIOBuild(t *testing.T) {
+	const fixture = `
+printf '#!/bin/bash\nprintf "minio version DEVELOPMENT.GOGET (fixture)\\n"\n' > "$server_bin"
+verify_checksum() {
+  [[ "$1" = "42ff331ae6dd701aaa25b8bec27c0a4dc381cdca13174f6a9aff42a4485d34e4" ]]
+}
+verify_version "$server_bin" "$old_release"
+if verify_version "$server_bin" "$silo_release"; then exit 20; fi
+verify_checksum() { return 1; }
+if verify_version "$server_bin" "$old_release"; then exit 21; fi
+exit 0
+`
+	_, output, err := runSiloUpgradeShell(t, "before", fixture)
+	if err != nil {
+		t.Fatalf("legacy MinIO release verification failed: %v\n%s", err, output)
+	}
+}
+
 func TestOfflineSiloShellRecoveryDoesNotStopIntactMinIO(t *testing.T) {
 	backup, output, err := runSiloUpgradeShell(t, "stop-for-recovery", "")
 	if err != nil {

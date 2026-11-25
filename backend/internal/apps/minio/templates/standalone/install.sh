@@ -51,9 +51,6 @@ if [ -d "$WORK_DIR/rpms" ] && ls "$WORK_DIR"/rpms/*.rpm >/dev/null 2>&1; then
 fi
 
 echo "preparing MinIO install directories"
-$SUDO systemctl disable --now "$SERVICE_NAME" >/dev/null 2>&1 || true
-$SUDO systemctl disable --now "$LEGACY_SERVICE_NAME" >/dev/null 2>&1 || true
-$SUDO rm -f "/etc/systemd/system/$LEGACY_SERVICE_NAME.service"
 $SUDO mkdir -p "$INSTALL_ROOT/bin" "$CONFIG_DIR" "$LOG_DIR" "$RUN_DIR" /etc/systemd/system
 {{range .DataDirs}}
 $SUDO mkdir -p {{shq .}}
@@ -91,17 +88,33 @@ export GOARCH=amd64
 
 echo "building MinIO from source"
 cd "$SRC_DIR"
-LDFLAGS="$(go run buildscripts/gen-ldflags.go 2>/dev/null || true)"
-if command -v make >/dev/null 2>&1 && make build; then
-  echo "MinIO built with make"
-else
-  echo "make build unavailable or failed, using direct go build"
-  go build -tags kqueue -trimpath --ldflags "$LDFLAGS" -o "$SRC_DIR/minio"
-fi
-if [ ! -x "$SRC_DIR/minio" ]; then
-  echo "MinIO binary was not produced"
+RELEASE_TIME=$(printf '%s\n' "$VERSION" | sed -nE 's/^([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2})-([0-9]{2})-([0-9]{2}Z)$/\1:\2:\3/p')
+if [ -z "$RELEASE_TIME" ]; then
+  echo "Invalid MinIO release version: $VERSION" >&2
   exit 1
 fi
+
+# The offline tarball has no Git working tree for MinIO's flag generator.
+SOURCE_COMMIT=$(gzip -dc "$ARCHIVE" | git get-tar-commit-id 2>/dev/null) || SOURCE_COMMIT=''
+LDFLAGS="-s -w -X github.com/minio/minio/cmd.Version=$RELEASE_TIME -X github.com/minio/minio/cmd.CopyrightYear=${VERSION%%-*} -X github.com/minio/minio/cmd.ReleaseTag=RELEASE.$VERSION"
+if printf '%s\n' "$SOURCE_COMMIT" | grep -Eq '^[0-9a-f]{40}$'; then
+  SHORT_COMMIT=$(printf '%.12s' "$SOURCE_COMMIT")
+  LDFLAGS="$LDFLAGS -X github.com/minio/minio/cmd.CommitID=$SOURCE_COMMIT -X github.com/minio/minio/cmd.ShortCommitID=$SHORT_COMMIT"
+else
+  LDFLAGS="$LDFLAGS -X github.com/minio/minio/cmd.CommitID=source-archive -X github.com/minio/minio/cmd.ShortCommitID=source-archive"
+fi
+go build -buildvcs=false -tags kqueue -trimpath -ldflags "$LDFLAGS" -o "$SRC_DIR/minio"
+BUILT_VERSION=$("$SRC_DIR/minio" --version)
+BUILT_VERSION=$(printf '%s\n' "$BUILT_VERSION" | head -n 1)
+case "$BUILT_VERSION" in
+  *" RELEASE.$VERSION "*) ;;
+  *) echo "Built MinIO release does not match $VERSION: $BUILT_VERSION" >&2
+     exit 1 ;;
+esac
+
+$SUDO systemctl disable --now "$SERVICE_NAME" >/dev/null 2>&1 || true
+$SUDO systemctl disable --now "$LEGACY_SERVICE_NAME" >/dev/null 2>&1 || true
+$SUDO rm -f "/etc/systemd/system/$LEGACY_SERVICE_NAME.service"
 $SUDO install -m 0755 "$SRC_DIR/minio" "$INSTALL_ROOT/bin/minio"
 
 if [ -n "$MC_BINARY" ] && [ -f "$MC_BINARY" ]; then

@@ -108,8 +108,8 @@ func TestInstallerUploadsResourcesAndRunsMinioScript(t *testing.T) {
 	if !strings.Contains(strings.Join(remote.commands, "\n"), "install-minio.sh") {
 		t.Fatalf("install command missing: %+v", remote.commands)
 	}
-	if !strings.Contains(remote.installScript, `go build -tags kqueue -trimpath`) {
-		t.Fatalf("installer should build minio from source:\n%s", remote.installScript)
+	if !strings.Contains(remote.installScript, `go build -buildvcs=false -tags kqueue -trimpath -ldflags "$LDFLAGS"`) {
+		t.Fatal("installer should build MinIO from the offline source with explicit linker flags")
 	}
 	if !strings.Contains(remote.installScript, `MINIO_ROOT_PASSWORD="$ROOT_PASSWORD"`) {
 		t.Fatalf("installer should write root password into env file:\n%s", remote.installScript)
@@ -241,6 +241,13 @@ func TestMinIOStandaloneScriptsRenderTemplates(t *testing.T) {
 	}
 	if !strings.Contains(install, "VERSION='2025-10-15T17-29-55Z'") || !strings.Contains(install, "API_PORT=9000") || !strings.Contains(install, "CONSOLE_PORT=9001") {
 		t.Fatalf("install script did not render core standalone variables:\n%s", install)
+	}
+	linkRelease := strings.Index(install, `-X github.com/minio/minio/cmd.ReleaseTag=RELEASE.$VERSION`)
+	verifyRelease := strings.Index(install, `*" RELEASE.$VERSION "*)`)
+	stopService := strings.Index(install, `systemctl disable --now "$SERVICE_NAME"`)
+	installBinary := strings.Index(install, `install -m 0755 "$SRC_DIR/minio"`)
+	if linkRelease < 0 || verifyRelease <= linkRelease || stopService <= verifyRelease || installBinary <= stopService {
+		t.Fatal("script must link and verify the selected MinIO release before stopping or replacing the service")
 	}
 	replicationInstall, err := installStandaloneScript(InstallScriptRequest{
 		Version:                    "2025-10-15T17-29-55Z",

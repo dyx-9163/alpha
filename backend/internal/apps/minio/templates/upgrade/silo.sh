@@ -71,7 +71,13 @@ verify_version() {
   local first
   first=$("$1" --version) || return 1
   first=${first%%$'\n'*}
-  [[ " $first " == *" RELEASE.$2 "* ]]
+  if [[ " $first " == *" RELEASE.$2 "* ]]; then
+    return 0
+  fi
+  # Reproduced from the RELEASE.2025-10-15T17-29-55Z source tarball using
+  # the original Panel installer and its bundled Go 1.24.8 and module cache.
+  [[ "$2" = "2025-10-15T17-29-55Z" && " $first " == *" DEVELOPMENT.GOGET "* ]] &&
+    verify_checksum "42ff331ae6dd701aaa25b8bec27c0a4dc381cdca13174f6a9aff42a4485d34e4" "$1"
 }
 
 readiness() {
