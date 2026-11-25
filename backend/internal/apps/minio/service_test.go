@@ -2,6 +2,7 @@ package minio
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -49,6 +50,28 @@ func (f *fakeStore) SaveAppInstance(v store.AppInstance) (store.AppInstance, err
 	v.UpdatedAt = time.Now()
 	f.instances = append(f.instances, v)
 	return v, nil
+}
+
+func (f *fakeStore) SaveAppInstanceObservation(instance store.AppInstance, observation store.AppInstanceObservation) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for i, current := range f.instances {
+		if current.ID != instance.ID || current.Version != instance.Version || !current.UpdatedAt.Equal(instance.UpdatedAt) {
+			continue
+		}
+		metadata := appMetadata(current)
+		for key, value := range observation.Metadata {
+			metadata[key] = value
+		}
+		encoded, err := json.Marshal(metadata)
+		if err != nil {
+			return err
+		}
+		current.Metadata, current.Status = string(encoded), observation.Status
+		f.instances[i] = current
+		return nil
+	}
+	return nil
 }
 
 func (f *fakeStore) DeleteAppInstance(id string) error {

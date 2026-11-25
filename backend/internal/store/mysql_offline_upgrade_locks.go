@@ -9,9 +9,11 @@ import (
 
 var ErrMySQLOfflineUpgradeLockChanged = errors.New("interrupted MySQL upgrade lock or checkpoint changed")
 
-type MySQLOfflineUpgradeLockRecovery struct {
+type OfflineUpgradeLockRecovery struct {
 	ClusterID, LockID, OwnerTaskID, CheckpointTaskID string
 }
+
+type MySQLOfflineUpgradeLockRecovery = OfflineUpgradeLockRecovery
 
 const selectInterruptedMySQLOfflineUpgradeLock = `select locks.id, tasks.id, checkpoint.task_id, locks.heartbeat_at, tasks.finished_at
 	from operation_locks locks
@@ -21,19 +23,19 @@ const selectInterruptedMySQLOfflineUpgradeLock = `select locks.id, tasks.id, che
 		and tasks.type='apps.mysql.upgrade' and tasks.target=locks.resource_id and tasks.status='failed' and tasks.interrupted_by_restart=1`
 
 func (s *Store) GetInterruptedMySQLOfflineUpgradeLock(clusterID string) (MySQLOfflineUpgradeLockRecovery, error) {
-	recovery, _, err := scanInterruptedMySQLOfflineUpgradeLock(s.db.QueryRow(selectInterruptedMySQLOfflineUpgradeLock, clusterID), clusterID)
+	recovery, _, err := scanInterruptedOfflineUpgradeLock(s.db.QueryRow(selectInterruptedMySQLOfflineUpgradeLock, clusterID), clusterID)
 	return recovery, err
 }
 
-func scanInterruptedMySQLOfflineUpgradeLock(row *sql.Row, clusterID string) (MySQLOfflineUpgradeLockRecovery, time.Time, error) {
-	recovery := MySQLOfflineUpgradeLockRecovery{ClusterID: clusterID}
+func scanInterruptedOfflineUpgradeLock(row *sql.Row, clusterID string) (OfflineUpgradeLockRecovery, time.Time, error) {
+	recovery := OfflineUpgradeLockRecovery{ClusterID: clusterID}
 	var heartbeat, interruptedAt time.Time
 	err := row.Scan(&recovery.LockID, &recovery.OwnerTaskID, &recovery.CheckpointTaskID, &heartbeat, &interruptedAt)
 	if err != nil {
-		return MySQLOfflineUpgradeLockRecovery{}, time.Time{}, err
+		return OfflineUpgradeLockRecovery{}, time.Time{}, err
 	}
 	if heartbeat.After(interruptedAt) || recovery.CheckpointTaskID == "" {
-		return MySQLOfflineUpgradeLockRecovery{}, time.Time{}, sql.ErrNoRows
+		return OfflineUpgradeLockRecovery{}, time.Time{}, sql.ErrNoRows
 	}
 	return recovery, interruptedAt, nil
 }
@@ -42,31 +44,44 @@ func scanInterruptedMySQLOfflineUpgradeLock(row *sql.Row, clusterID string) (MyS
 // idle checks pass. It preserves other owners and transfers the full lock set
 // in one transaction.
 func (s *Store) TakeOverInterruptedMySQLOfflineUpgradeLocks(recovery MySQLOfflineUpgradeLockRecovery, taskID string, requested []OperationLock) error {
+	return s.takeOverInterruptedOfflineUpgradeLocks(recovery, taskID, "apps.mysql.upgrade", selectInterruptedMySQLOfflineUpgradeLock, ErrMySQLOfflineUpgradeLockChanged, func(tx *sql.Tx) ([]OperationLock, error) {
+		checkpoint, err := scanMySQLOfflineUpgradeCheckpoint(tx.QueryRow(selectMySQLOfflineUpgradeCheckpoint, recovery.ClusterID))
+		if err != nil {
+			return nil, err
+		}
+		if len(checkpoint.Nodes) < 3 {
+			return nil, ErrMySQLOfflineUpgradeLockChanged
+		}
+		nodes := make([]offlineUpgradeLockNode, 0, len(checkpoint.Nodes))
+		for _, node := range checkpoint.Nodes {
+			nodes = append(nodes, offlineUpgradeLockNode{node.InstanceID, node.ServerID})
+		}
+		return offlineUpgradeLockSet(recovery.ClusterID, "mysql", nodes, requested, ErrMySQLOfflineUpgradeLockChanged)
+	})
+}
+
+func (s *Store) takeOverInterruptedOfflineUpgradeLocks(recovery OfflineUpgradeLockRecovery, taskID, taskType, selectInterruptedLock string, lockChanged error, lockSet func(*sql.Tx) ([]OperationLock, error)) error {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	current, interruptedAt, err := scanInterruptedMySQLOfflineUpgradeLock(tx.QueryRow(selectInterruptedMySQLOfflineUpgradeLock, recovery.ClusterID), recovery.ClusterID)
+	current, interruptedAt, err := scanInterruptedOfflineUpgradeLock(tx.QueryRow(selectInterruptedLock, recovery.ClusterID), recovery.ClusterID)
 	if errors.Is(err, sql.ErrNoRows) || err == nil && current != recovery {
-		return ErrMySQLOfflineUpgradeLockChanged
+		return lockChanged
 	}
 	if err != nil {
 		return err
 	}
 	var actor string
-	err = tx.QueryRow(`select created_by from tasks where id=? and type='apps.mysql.upgrade' and target=? and status='running'`, taskID, recovery.ClusterID).Scan(&actor)
+	err = tx.QueryRow(`select created_by from tasks where id=? and type=? and target=? and status='running'`, taskID, taskType, recovery.ClusterID).Scan(&actor)
 	if errors.Is(err, sql.ErrNoRows) {
-		return ErrMySQLOfflineUpgradeLockChanged
+		return lockChanged
 	}
 	if err != nil {
 		return err
 	}
-	checkpoint, err := scanMySQLOfflineUpgradeCheckpoint(tx.QueryRow(selectMySQLOfflineUpgradeCheckpoint, recovery.ClusterID))
-	if err != nil {
-		return err
-	}
-	locks, err := mysqlOfflineUpgradeLockSet(recovery.ClusterID, checkpoint.Nodes, requested)
+	locks, err := lockSet(tx)
 	if err != nil {
 		return err
 	}
@@ -93,20 +108,19 @@ func (s *Store) TakeOverInterruptedMySQLOfflineUpgradeLocks(recovery MySQLOfflin
 	return tx.Commit()
 }
 
-func mysqlOfflineUpgradeLockSet(clusterID string, nodes []MySQLOfflineUpgradeNode, requested []OperationLock) ([]OperationLock, error) {
-	if len(nodes) < 3 {
-		return nil, ErrMySQLOfflineUpgradeLockChanged
-	}
+type offlineUpgradeLockNode struct{ instanceID, serverID string }
+
+func offlineUpgradeLockSet(clusterLockID, app string, nodes []offlineUpgradeLockNode, requested []OperationLock, lockChanged error) ([]OperationLock, error) {
 	type lockKey struct{ scope, resourceID string }
-	expected := map[lockKey]bool{{"app-cluster", clusterID}: true}
+	expected := map[lockKey]bool{{"app-cluster", clusterLockID}: true}
 	for _, node := range nodes {
-		instance := lockKey{"app-instance", node.InstanceID}
-		if node.InstanceID == "" || node.ServerID == "" || expected[instance] {
-			return nil, ErrMySQLOfflineUpgradeLockChanged
+		instance := lockKey{"app-instance", node.instanceID}
+		if node.instanceID == "" || node.serverID == "" || expected[instance] {
+			return nil, lockChanged
 		}
 		expected[instance] = true
-		expected[lockKey{"app-target", "mysql:" + node.ServerID}] = true
-		expected[lockKey{"server-config", node.ServerID}] = true
+		expected[lockKey{"app-target", app + ":" + node.serverID}] = true
+		expected[lockKey{"server-config", node.serverID}] = true
 	}
 	locks := make([]OperationLock, 0, len(expected))
 	seen := make(map[lockKey]bool, len(expected))
@@ -114,7 +128,7 @@ func mysqlOfflineUpgradeLockSet(clusterID string, nodes []MySQLOfflineUpgradeNod
 		lock.Scope, lock.ResourceID = strings.TrimSpace(lock.Scope), strings.TrimSpace(lock.ResourceID)
 		key := lockKey{lock.Scope, lock.ResourceID}
 		if !expected[key] || lock.Operation != "mutate" {
-			return nil, ErrMySQLOfflineUpgradeLockChanged
+			return nil, lockChanged
 		}
 		if !seen[key] {
 			locks = append(locks, lock)
@@ -122,7 +136,7 @@ func mysqlOfflineUpgradeLockSet(clusterID string, nodes []MySQLOfflineUpgradeNod
 		}
 	}
 	if len(locks) != len(expected) {
-		return nil, ErrMySQLOfflineUpgradeLockChanged
+		return nil, lockChanged
 	}
 	return locks, nil
 }

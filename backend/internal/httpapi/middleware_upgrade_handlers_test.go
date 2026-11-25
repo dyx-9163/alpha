@@ -116,6 +116,13 @@ func TestOfflineUpgradeRequiresOwnerConfirmationAndLocksBothStoragePeers(t *test
 		if err != nil || len(locks) != 1 || locks[0].OwnerTaskID != reply.TaskID {
 			t.Fatalf("instance %s locks=%+v err=%v", peer.ID, locks, err)
 		}
+		edit := httptest.NewRequest(http.MethodDelete, "/api/v2/servers/"+peer.ServerID, nil)
+		edit.Header.Set("Authorization", "Bearer "+owner)
+		editResult := httptest.NewRecorder()
+		api.Router().ServeHTTP(editResult, edit)
+		if editResult.Code != http.StatusConflict || !strings.Contains(editResult.Body.String(), "OPERATION_LOCKED") {
+			t.Fatalf("migration peer server can be deleted: status=%d body=%s", editResult.Code, editResult.Body.String())
+		}
 	}
 	if rec := post(peers[1].ID, owner, confirmed); rec.Code != http.StatusConflict {
 		t.Fatalf("peer duplicate status=%d body=%s", rec.Code, rec.Body.String())

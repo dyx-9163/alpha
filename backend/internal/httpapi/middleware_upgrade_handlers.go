@@ -101,7 +101,8 @@ func (a *API) startMiddlewareUpgrade(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, "UPGRADE_MODULE_UNAVAILABLE", i18n.MiddlewareUpgradeText(lang, "unavailable"), nil)
 		return
 	}
-	if resolver, ok := module.(offlineUpgradeGroupResolver); ok {
+	resolver, hasResolver := module.(offlineUpgradeGroupResolver)
+	if hasResolver {
 		resolved, err := resolver.ResolveOfflineUpgradeGroup(instance)
 		if err != nil || !sameMiddlewareUpgradePeers(peers, resolved) {
 			writeError(w, http.StatusConflict, "UPGRADE_GROUP_INVALID", i18n.MiddlewareUpgradeText(lang, "group"), nil)
@@ -113,10 +114,21 @@ func (a *API) startMiddlewareUpgrade(w http.ResponseWriter, r *http.Request) {
 		respondTask(w, store.Task{}, err)
 		return
 	}
-	var recovery store.MySQLOfflineUpgradeLockRecovery
+	var findInterrupted func(string) (store.OfflineUpgradeLockRecovery, error)
+	var takeOver func(store.OfflineUpgradeLockRecovery, string, []store.OperationLock) error
+	var checkingIdleKey, takeoverFailedKey string
+	switch instance.App {
+	case "mysql":
+		findInterrupted, takeOver = a.store.GetInterruptedMySQLOfflineUpgradeLock, a.store.TakeOverInterruptedMySQLOfflineUpgradeLocks
+		checkingIdleKey, takeoverFailedKey = "mysqlResumeCheckingIdle", "mysqlResumeTakeoverFailed"
+	case "minio":
+		findInterrupted, takeOver = a.store.GetInterruptedSiloOfflineUpgradeLock, a.store.TakeOverInterruptedSiloOfflineUpgradeLocks
+		checkingIdleKey, takeoverFailedKey = "siloResumeCheckingIdle", "siloResumeTakeoverFailed"
+	}
+	var recovery store.OfflineUpgradeLockRecovery
 	var idleChecker offlineUpgradeResumeIdleChecker
-	if instance.App == "mysql" {
-		recovery, err = a.store.GetInterruptedMySQLOfflineUpgradeLock(group)
+	if findInterrupted != nil {
+		recovery, err = findInterrupted(group)
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
 			respondTask(w, store.Task{}, err)
 			return
@@ -156,14 +168,22 @@ func (a *API) startMiddlewareUpgrade(w http.ResponseWriter, r *http.Request) {
 		targets = append(targets, peer.ServerID)
 	}
 	specs = append(specs, appInstallOperationLockSpecs(instance.App, targets)...)
+	for _, participant := range participants {
+		specs = append(specs, serverConfigOperationLockSpec(instance.App+"-upgrade", participant.ServerID))
+	}
 	if instance.App == "mysql" {
 		specs = append(mysqlClusterOperationLockSpecs("mysql-upgrade", instance), specs...)
 		for _, participant := range participants {
-			specs = append(specs, serverConfigOperationLockSpec("mysql-upgrade", participant.ServerID))
 			if participant.App == "mysql-router" {
 				specs = append(specs, appInstallOperationLockSpecs(participant.App, []string{participant.ServerID})...)
 			}
 		}
+	}
+	if instance.App == "minio" {
+		specs = append([]operationLockSpec{{
+			Scope: "app-cluster", ResourceID: store.SiloOfflineUpgradeLockResourceID(group), Operation: operationLockMutation,
+			Metadata: operationLockMetadata(map[string]any{"action": "minio-silo-upgrade", "app": "minio", "replicationGroupId": group}),
+		}}, specs...)
 	}
 	var locks []store.OperationLock
 	if idleChecker == nil {
@@ -181,6 +201,12 @@ func (a *API) startMiddlewareUpgrade(w http.ResponseWriter, r *http.Request) {
 		freshGroup, freshPeers, err := a.middlewareUpgradePeers(fresh, spec)
 		if err != nil || freshGroup != group || !sameMiddlewareUpgradePeers(peers, freshPeers) {
 			return store.AppInstance{}, errors.New(i18n.MiddlewareUpgradeText(lang, "group"))
+		}
+		if hasResolver {
+			resolved, err := resolver.ResolveOfflineUpgradeGroup(fresh)
+			if err != nil || !sameMiddlewareUpgradePeers(freshPeers, resolved) {
+				return store.AppInstance{}, errors.New(i18n.MiddlewareUpgradeText(lang, "group"))
+			}
 		}
 		if fresh.App == "mysql" {
 			freshParticipants, err := a.middlewareUpgradeParticipants(fresh.App, group, freshPeers)
@@ -203,7 +229,7 @@ func (a *API) startMiddlewareUpgrade(w http.ResponseWriter, r *http.Request) {
 			Resources: resources, TargetLog: func(target string) registry.Logger { return log.Target(target) },
 		}
 		if idleChecker != nil {
-			if err := checkMySQLOfflineUpgradeIdle(ctx, idleChecker, fresh, recovery, run); err != nil {
+			if err := checkOfflineUpgradeIdle(ctx, idleChecker, fresh, recovery, run, checkingIdleKey); err != nil {
 				return err
 			}
 			fresh, err = refresh()
@@ -219,8 +245,8 @@ func (a *API) startMiddlewareUpgrade(w http.ResponseWriter, r *http.Request) {
 			for _, spec := range specs {
 				requested = append(requested, store.OperationLock{Scope: spec.Scope, ResourceID: spec.ResourceID, Operation: spec.Operation, Metadata: spec.Metadata})
 			}
-			if err := a.store.TakeOverInterruptedMySQLOfflineUpgradeLocks(recovery, log.TaskID(), requested); err != nil {
-				return errors.Join(errors.New(i18n.MiddlewareUpgradeText(lang, "mysqlResumeTakeoverFailed")), err)
+			if err := takeOver(recovery, log.TaskID(), requested); err != nil {
+				return errors.Join(errors.New(i18n.MiddlewareUpgradeText(lang, takeoverFailedKey)), err)
 			}
 		}
 		if fallbackPlan {
@@ -251,8 +277,8 @@ func (a *API) startMiddlewareUpgrade(w http.ResponseWriter, r *http.Request) {
 	respondTask(w, task, err)
 }
 
-func checkMySQLOfflineUpgradeIdle(ctx context.Context, checker offlineUpgradeResumeIdleChecker, instance store.AppInstance, recovery store.MySQLOfflineUpgradeLockRecovery, run registry.RunContext) error {
-	run.Log.Info(i18n.MiddlewareUpgradeText(run.Language, "mysqlResumeCheckingIdle"), recovery.OwnerTaskID)
+func checkOfflineUpgradeIdle(ctx context.Context, checker offlineUpgradeResumeIdleChecker, instance store.AppInstance, recovery store.OfflineUpgradeLockRecovery, run registry.RunContext, checkingIdleKey string) error {
+	run.Log.Info(i18n.MiddlewareUpgradeText(run.Language, checkingIdleKey), recovery.OwnerTaskID)
 	guardCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	if err := checker.CheckOfflineUpgradeResumeIdle(guardCtx, instance, recovery.CheckpointTaskID, run); err != nil {

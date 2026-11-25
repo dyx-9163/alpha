@@ -2,6 +2,7 @@ package minio
 
 import (
 	"context"
+	"database/sql"
 	_ "embed"
 	"encoding/json"
 	"errors"
@@ -43,9 +44,16 @@ type offlineUpgradeGroupStore interface {
 	ListAppInstances() ([]store.AppInstance, error)
 }
 
+type offlineSiloCheckpointReader interface {
+	GetSiloOfflineUpgradeCheckpoint(string) (store.SiloOfflineUpgradeCheckpoint, error)
+}
+
 type offlineUpgradeDataStore interface {
 	offlineUpgradeGroupStore
-	SaveAppInstancesIfUnchanged([]store.AppInstance) error
+	offlineSiloCheckpointReader
+	CreateSiloOfflineUpgradeCheckpoint(string, store.SiloOfflineUpgradeCheckpoint) error
+	DiscardSiloOfflineUpgradeCheckpoint(string, string) error
+	CompleteSiloOfflineUpgrade(string, string, []store.AppInstanceVersionUpdate) error
 }
 
 type offlineSiloMetadata struct {
@@ -120,6 +128,14 @@ func (s Service) ResolveOfflineUpgradeGroup(seed store.AppInstance) ([]store.App
 	if seed.App != "minio" || seed.ID == "" || json.Unmarshal([]byte(seed.Metadata), &seedMeta) != nil || strings.TrimSpace(seedMeta.GroupID) == "" {
 		return nil, errors.New("MinIO bucket replication group identity missing")
 	}
+	resuming := false
+	if journal, ok := s.store.(offlineSiloCheckpointReader); ok {
+		_, err := journal.GetSiloOfflineUpgradeCheckpoint(seedMeta.GroupID)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return nil, err
+		}
+		resuming = err == nil
+	}
 	all, err := data.ListAppInstances()
 	if err != nil {
 		return nil, err
@@ -137,7 +153,7 @@ func (s Service) ResolveOfflineUpgradeGroup(seed store.AppInstance) ([]store.App
 		if json.Unmarshal([]byte(instance.Metadata), &membership) != nil || membership.GroupID != seedMeta.GroupID {
 			continue
 		}
-		meta, err := parseOfflineSiloMember(instance)
+		meta, err := parseOfflineSiloMember(instance, resuming)
 		if err != nil {
 			return nil, err
 		}
@@ -154,7 +170,7 @@ func (s Service) ResolveOfflineUpgradeGroup(seed store.AppInstance) ([]store.App
 		if member.ID != seed.ID {
 			continue
 		}
-		if member.ServerID != seed.ServerID || member.Metadata != seed.Metadata || member.Version != seed.Version {
+		if member.ServerID != seed.ServerID || !member.UpdatedAt.Equal(seed.UpdatedAt) || member.Version != seed.Version {
 			break
 		}
 		if index == 1 {
@@ -165,9 +181,9 @@ func (s Service) ResolveOfflineUpgradeGroup(seed store.AppInstance) ([]store.App
 	return nil, errors.New("the selected MinIO instance has changed")
 }
 
-func parseOfflineSiloMember(instance store.AppInstance) (offlineSiloMetadata, error) {
+func parseOfflineSiloMember(instance store.AppInstance, resuming bool) (offlineSiloMetadata, error) {
 	var m offlineSiloMetadata
-	if instance.Version != offlineMinioVersion || (instance.Status != "installed" && instance.Status != "available") || instance.ServerID == "" ||
+	if instance.Version != offlineMinioVersion || (!resuming && instance.Status != "installed" && instance.Status != "available") || instance.ServerID == "" ||
 		normalizeTopology(instance.Topology) != "bucket-replication" ||
 		json.Unmarshal([]byte(instance.Metadata), &m) != nil ||
 		m.Mode != "bucket" || m.Service != "aifar-minio" ||
@@ -247,57 +263,55 @@ func (s Service) RunOfflineUpgrade(ctx context.Context, seed store.AppInstance, 
 }
 
 func (s Service) runOfflineUpgrade(ctx context.Context, data offlineUpgradeDataStore, group []store.AppInstance, bundle offlineSiloBundle, run registry.RunContext) (resultErr error) {
-	nodes := make([]offlineSiloNode, len(group))
-	for i, instance := range group {
-		meta, err := parseOfflineSiloMember(instance)
-		if err != nil {
+	var seedMeta offlineSiloMetadata
+	if len(group) != 2 || json.Unmarshal([]byte(group[0].Metadata), &seedMeta) != nil || seedMeta.GroupID == "" {
+		return errors.New("invalid Silo upgrade group")
+	}
+	checkpoint, err := data.GetSiloOfflineUpgradeCheckpoint(seedMeta.GroupID)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	resuming := err == nil
+	operationID := run.TaskID
+	if resuming {
+		operationID = checkpoint.TaskID
+	}
+	nodes, err := s.loadOfflineSiloNodes(group, operationID, resuming)
+	if err != nil {
+		return err
+	}
+	if resuming {
+		if err := matchSiloCheckpoint(nodes, checkpoint); err != nil {
 			return err
 		}
-		server, err := s.store.GetServer(instance.ServerID, true)
-		endpoint := minioEndpoint(server.Host, meta.APIPort)
-		if err != nil || server.ID != instance.ServerID || endpoint != meta.Endpoint {
-			return errors.New("could not match a MinIO member to its recorded SSH host and endpoint")
+		if log := run.LoggerForTarget(nodes[0].server.ID); log != nil {
+			log.Info(siloText(run.Language, "正在复核原迁移任务 %s 并复用其冷备", "Checking original migration %s and reusing its cold backups"), operationID)
 		}
-		root := remoteInstallRoot(server, "minio", offlineMinioVersion)
-		backup := path.Join(path.Dir(root), "_backups", "minio-silo", run.TaskID)
-		if !validSiloPath(root) || !validSiloPath(backup) {
-			return errors.New("unsupported MinIO install or backup path")
-		}
-		for _, volume := range meta.DataDirs {
-			if siloPathsOverlap(volume, backup) || siloPathsOverlap(volume, path.Join(root, "bin")) ||
-				siloPathsOverlap(volume, path.Join(root, "conf")) {
-				return errors.New("MinIO data paths overlap the backup, configuration, or program files")
-			}
-		}
-		nodes[i] = offlineSiloNode{instance: instance, server: server, meta: meta, root: root, backup: backup}
-	}
-	if strings.EqualFold(nodes[0].server.Host, nodes[1].server.Host) {
-		return errors.New("MinIO replication members must run on separate SSH hosts")
 	}
 
 	recorder, _ := run.Log.(stepRecorder)
-	stopped, siloMayHaveStarted := false, false
-	cutoverVerified := false
+	var resumedStates []offlineSiloState
+	var recoverOnError, cutoverVerified bool
 	defer func() {
-		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 8*time.Minute)
-		defer cancel()
+		cleanup := context.WithoutCancel(ctx)
 		if resultErr != nil {
 			switch {
 			case cutoverVerified:
-				message := siloText(run.Language,
-					"两端 Silo 已通过验收并保持运行。请核对面板实例记录后再放行业务写入。冷备保留在",
-					"Both Silo services verified and remain running. Reconcile the Panel instance records before reopening writes. The cold backups are retained at")
-				resultErr = fmt.Errorf("%s %s=%s, %s=%s (%w)", message,
-					nodes[0].server.ID, nodes[0].backup, nodes[1].server.ID, nodes[1].backup, resultErr)
-			case stopped:
-				if recoveryErr := s.recoverOfflineSiloGroup(cleanupCtx, nodes, siloMayHaveStarted, run.Language); recoveryErr != nil {
-					resultErr = errors.Join(resultErr, recoveryErr)
-				}
+				resultErr = errors.Join(resultErr, errors.New(siloText(run.Language,
+					"两端 Silo 已通过验收并保持运行。请通过原断点重试面板登记后再放行业务写入。",
+					"Both Silo services remain running after verification. Retry registration from the original checkpoint before reopening writes.")))
+			case recoverOnError:
+				resultErr = errors.Join(resultErr, s.recoverOfflineSiloGroup(cleanup, data, seedMeta.GroupID, operationID, nodes, run.Language))
+			}
+			if recoverOnError || cutoverVerified || resuming {
+				resultErr = fmt.Errorf("%w [%s: %s=%s, %s=%s]", resultErr,
+					siloText(run.Language, "原冷备目录", "Original cold backup directories"),
+					nodes[0].server.ID, nodes[0].backup, nodes[1].server.ID, nodes[1].backup)
 			}
 		}
 		for _, node := range nodes {
 			if node.stage != "" {
-				_, _ = s.runOfflineSiloCommand(cleanupCtx, node, "clean-stage", run.Language)
+				_, _ = s.runOfflineSiloCommand(cleanup, node, "clean-stage", run.Language)
 			}
 			if resultErr != nil {
 				finishTarget(recorder, node.server.ID, "failed", resultErr.Error())
@@ -310,6 +324,21 @@ func (s Service) runOfflineUpgrade(ctx context.Context, data offlineUpgradeDataS
 		installflow.StartTarget(recorder, node.server.ID)
 	}
 
+	if resuming {
+		resumedStates, err = s.readOfflineSiloStates(ctx, nodes, run.Language)
+		if err != nil {
+			return err
+		}
+		for _, state := range resumedStates {
+			if state.restoreAttempted || (state.runtime == "old-running" && state.backupComplete) {
+				return s.recoverOfflineSiloGroup(context.WithoutCancel(ctx), data, seedMeta.GroupID, operationID, nodes, run.Language)
+			}
+		}
+		if err := validateSiloResumeBarrier(resumedStates); err != nil {
+			return err
+		}
+	}
+
 	steps := siloUpgradeSteps(run.Language)
 	for stepIndex, step := range steps {
 		for index := range nodes {
@@ -319,28 +348,31 @@ func (s Service) runOfflineUpgrade(ctx context.Context, data offlineUpgradeDataS
 				if err := ctx.Err(); err != nil {
 					return err
 				}
-				switch step.Name {
-				case "stage":
+				if resuming && resumedStates[index].skip(step.Name) {
+					return nil
+				}
+				if step.Name == "stage" {
 					return s.stageOfflineSiloAssets(ctx, node, bundle, run)
-				case "stop":
-					stopped = true
-				case "start":
-					siloMayHaveStarted = true
+				}
+				if step.Name == "stop" {
+					recoverOnError = true
 				}
 				raw, err := s.runOfflineSiloCommand(ctx, *node, step.Name, run.Language)
 				if err != nil {
 					return err
 				}
-				switch step.Name {
-				case "before", "after":
+				if step.Name == "before" || step.Name == "after" {
 					state, err := parseOfflineSiloReplication(raw, node.meta)
 					if err != nil {
-						return errors.New(siloText(run.Language, "无法核对复制规则或复制积压未清空", "Could not confirm replication rules and a drained replication queue"))
+						return errors.New(siloText(run.Language, "无法核对桶清单、复制规则或复制积压", "Could not confirm the bucket inventory, replication rules or drained queue"))
+					}
+					if err := s.validateOfflineSiloInventory(ctx, *node, state, run.Language); err != nil {
+						return err
 					}
 					if step.Name == "before" {
 						node.before = state
 					} else if !slices.Equal(node.before, state) {
-						return errors.New(siloText(run.Language, "复制规则或版本化配置发生变化", "Replication rules or bucket versioning changed"))
+						return errors.New(siloText(run.Language, "桶清单、复制规则或版本化配置发生变化", "Bucket inventory, replication rules or bucket versioning changed"))
 					}
 				}
 				return nil
@@ -348,60 +380,35 @@ func (s Service) runOfflineUpgrade(ctx context.Context, data offlineUpgradeDataS
 				return err
 			}
 		}
-		if step.Name == "before" && (nodes[0].before[0] == nodes[1].before[0] ||
-			nodes[0].before[0] != nodes[1].before[1] || nodes[1].before[0] != nodes[0].before[1]) {
-			return errors.New(siloText(run.Language, "两端 MinIO 部署标识与对端不一致", "MinIO deployment identities did not match the two reciprocal endpoints"))
+		if step.Name == "before" && !resuming {
+			if !reciprocalSiloBaselines(nodes) {
+				return errors.New(siloText(run.Language, "两端 MinIO 部署标识与对端不一致", "MinIO deployment identities did not match the two reciprocal endpoints"))
+			}
+			checkpoint = newSiloCheckpoint(operationID, nodes)
+			if err := data.CreateSiloOfflineUpgradeCheckpoint(seedMeta.GroupID, checkpoint); err != nil {
+				return err
+			}
 		}
+		if resuming && step.Name == "before" {
+			// The original attempt may already have shut down either node.
+			recoverOnError = true
+		}
+	}
+	if err := s.verifyOfflineSiloReplication(ctx, nodes, operationID, run.Language); err != nil {
+		return err
 	}
 	cutoverVerified = true
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	next := make([]store.AppInstance, 0, len(group))
+	updates := make([]store.AppInstanceVersionUpdate, 0, len(nodes))
 	for _, node := range nodes {
-		instance := node.instance
-		instance.Version = offlineSiloVersion
-		var metadata map[string]json.RawMessage
-		if err := json.Unmarshal([]byte(instance.Metadata), &metadata); err != nil {
-			return err
-		}
-		metadata["serverProduct"] = json.RawMessage(`"silo"`)
-		metadata["offlineUpgradeTaskId"], _ = json.Marshal(run.TaskID)
-		metadata["offlineUpgradeBackupDir"], _ = json.Marshal(node.backup)
-		encoded, err := json.Marshal(metadata)
-		if err != nil {
-			return err
-		}
-		instance.Metadata = string(encoded)
-		next = append(next, instance)
+		updates = append(updates, store.AppInstanceVersionUpdate{
+			Expected: node.instance, Version: offlineSiloVersion,
+			Metadata: map[string]any{"serverProduct": "silo", "offlineUpgradeTaskId": operationID, "offlineUpgradeBackupDir": node.backup},
+		})
 	}
-	return data.SaveAppInstancesIfUnchanged(next)
-}
-
-func (s Service) recoverOfflineSiloGroup(ctx context.Context, nodes []offlineSiloNode, started bool, language string) error {
-	recoverPhase := func(phase string) error {
-		var failure error
-		for _, node := range nodes {
-			if _, err := s.runOfflineSiloCommand(ctx, node, phase, language); err != nil {
-				failure = errors.Join(failure, err)
-			}
-		}
-		return failure
-	}
-	if started {
-		err := recoverPhase("stop-for-recovery")
-		return errors.Join(err, errors.New(siloText(language,
-			"Silo 可能已写入存储。继续停写，核对两端状态，并按维护手册使用两份切换前冷备恢复。",
-			"Silo may have written to storage. Keep writes frozen, check both nodes, and follow the runbook to recover from both pre-cutover backups.")))
-	}
-	if err := recoverPhase("restore-minio"); err != nil {
-		stopErr := recoverPhase("stop-for-recovery")
-		return errors.Join(err, stopErr, errors.New(siloText(language, "恢复原二进制失败，请保持停写并检查两端。", "MinIO binary restoration failed. Keep writes frozen and check both nodes.")))
-	}
-	if err := recoverPhase("start-old"); err != nil {
-		return errors.Join(err, errors.New(siloText(language, "原 MinIO 未完全恢复，请保持停写。", "MinIO did not recover on both nodes. Keep writes frozen.")))
-	}
-	return errors.New(siloText(language, "原 MinIO 服务已恢复。", "The original MinIO services were restarted."))
+	return data.CompleteSiloOfflineUpgrade(seedMeta.GroupID, operationID, updates)
 }
 
 func (s Service) stageOfflineSiloAssets(ctx context.Context, node *offlineSiloNode, bundle offlineSiloBundle, run registry.RunContext) error {
@@ -415,12 +422,20 @@ func (s Service) stageOfflineSiloAssets(ctx context.Context, node *offlineSiloNo
 		return errors.New(siloText(run.Language, "暂存目录无效", "Invalid remote staging directory"))
 	}
 	for index, asset := range offlineSiloFiles {
-		if err := s.remote.UploadFile(ctx, node.server, bundle[index], path.Join(node.stage, asset.name), 0600); err != nil {
+		uploadCtx, cancel := context.WithTimeout(ctx, 45*time.Minute)
+		err := s.remote.UploadFile(uploadCtx, node.server, bundle[index], path.Join(node.stage, asset.name), 0600)
+		cancel()
+		if err != nil {
 			return fmt.Errorf("%s %s", siloText(run.Language, "无法上传离线资源", "Could not upload offline asset"), asset.name)
 		}
 	}
 	if _, err := s.runOfflineSiloCommand(ctx, *node, "stage", run.Language); err != nil {
 		return err
+	}
+	// The root-owned candidate copy is complete. Drop the upload before
+	// any stoppage so a later Panel exit does not strand these archives.
+	if _, err := s.runOfflineSiloCommand(ctx, *node, "clean-stage", run.Language); err == nil {
+		node.stage = ""
 	}
 	if log := run.LoggerForTarget(node.server.ID); log != nil {
 		log.Info("%s %s", siloText(run.Language, "冷备目录", "Cold backup directory"), node.backup)
@@ -430,6 +445,7 @@ func (s Service) stageOfflineSiloAssets(ctx context.Context, node *offlineSiloNo
 
 func (s Service) runOfflineSiloCommand(ctx context.Context, node offlineSiloNode, phase, language string) (string, error) {
 	header := "# aifar-silo " + phase + "\n"
+	budget := siloPhaseBudget(phase, len(node.meta.Buckets))
 	var command string
 	switch phase {
 	case "stage-dir":
@@ -449,18 +465,44 @@ func (s Service) runOfflineSiloCommand(ctx context.Context, node offlineSiloNode
 			args[i] = installerkit.ShellQuote(args[i])
 		}
 		command = header + "aifar_sudo=\nif [ \"$(id -u)\" -ne 0 ]; then aifar_sudo='sudo -n'; fi\n" +
-			"$aifar_sudo bash -s -- " + strings.Join(args, " ") + " <<'AIFAR_SILO_SCRIPT'\n" + offlineSiloScript + "\nAIFAR_SILO_SCRIPT"
+			fmt.Sprintf("$aifar_sudo timeout --signal=TERM %ds bash -s -- ", int64(budget/time.Second)) +
+			strings.Join(args, " ") + " <<'AIFAR_SILO_SCRIPT'\n" + offlineSiloScript + "\nAIFAR_SILO_SCRIPT"
 	}
-	result, err := s.remote.Run(ctx, node.server, command)
-	if err != nil {
+	phaseCtx, cancel := context.WithTimeout(ctx, budget+30*time.Second)
+	defer cancel()
+	result, err := s.remote.Run(phaseCtx, node.server, command)
+	if err != nil || result.ExitCode != 0 {
 		// The old mc may include credential-bearing remote targets in its output.
 		message := fmt.Sprintf("%s (%s, %s)", siloText(language, "远程升级步骤失败", "Remote upgrade step failed"), node.server.ID, phase)
+		var exit interface{ ExitStatus() int }
+		if errors.Is(phaseCtx.Err(), context.DeadlineExceeded) || result.ExitCode == 124 || (errors.As(err, &exit) && exit.ExitStatus() == 124) {
+			message += " " + siloText(language, "已到阶段截止时间", "phase deadline reached")
+		}
 		if match := siloErrorPattern.FindStringSubmatch(result.Stderr); match != nil {
 			message += " [" + match[1] + "]"
 		}
 		return "", errors.New(message)
 	}
 	return result.Stdout, nil
+}
+
+func siloPhaseBudget(phase string, buckets int) time.Duration {
+	switch phase {
+	case "state", "idle":
+		return 10 * time.Second
+	case "stage-dir", "clean-stage":
+		return 30 * time.Second
+	case "backup", "verify-backup":
+		return 6 * time.Hour
+	case "before":
+		return 5*time.Minute + time.Duration(buckets)*3*time.Minute
+	case "after":
+		return 20*time.Minute + time.Duration(buckets)*3*time.Minute
+	case "start", "start-old", "verify-old":
+		return 12 * time.Minute
+	default:
+		return 5 * time.Minute
+	}
 }
 
 func siloText(language, zh, en string) string {

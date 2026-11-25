@@ -2,7 +2,6 @@ package minio
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"strconv"
@@ -66,6 +65,8 @@ const defaultMinioCleanupRetentionDays = 30
 
 type minioRuntimeProbe struct {
 	RuntimeStatus                string
+	RuntimeProduct               string
+	RuntimeVersion               string
 	HealthStatus                 string
 	ServiceStatus                string
 	PortStatus                   string
@@ -101,6 +102,10 @@ func (p minioRuntimeProbe) details() map[string]any {
 		"minioServiceStatus": normalizeMinioProbeStatus(p.ServiceStatus),
 		"minioPortStatus":    normalizeMinioProbeStatus(p.PortStatus),
 		"minioRuntimeSource": strings.TrimSpace(p.RuntimeSource),
+	}
+	if p.RuntimeVersion != "" {
+		details["runtimeProduct"] = p.RuntimeProduct
+		details["runtimeVersion"] = p.RuntimeVersion
 	}
 	if p.StoragePathCount > 0 || p.StorageTotalBytes > 0 {
 		details["minioStorageTotalBytes"] = p.StorageTotalBytes
@@ -139,6 +144,20 @@ func (p minioRuntimeProbe) available() bool {
 	return normalizeMinioProbeStatus(p.RuntimeStatus) == "available"
 }
 
+func (p minioRuntimeProbe) versionStatus(registeredProduct, registeredVersion string) string {
+	if p.RuntimeProduct == "" || p.RuntimeVersion == "" || registeredVersion == "" {
+		return "unknown"
+	}
+	wantRelease := strings.TrimPrefix(registeredVersion, "RELEASE.")
+	if registeredProduct == "silo" && registeredVersion == offlineSiloVersion {
+		wantRelease = offlineSiloRelease
+	}
+	if p.RuntimeProduct != registeredProduct || p.RuntimeVersion != wantRelease {
+		return "mismatch"
+	}
+	return "match"
+}
+
 func (s Service) Check(ctx context.Context, req CheckRequest, log Logger, targetLog targetLogger) (CheckResult, error) {
 	copy := CheckCopyFor(req.Language)
 	target := req.Instance.ServerID
@@ -149,11 +168,19 @@ func (s Service) Check(ctx context.Context, req CheckRequest, log Logger, target
 	recorder, _ := log.(stepRecorder)
 	installflow.StartTarget(recorder, target)
 	step := newCheckStepRunner(logForServer, recorder, target, copy)
+	metadata := appMetadata(req.Instance)
+	registeredProduct := strings.ToLower(strings.TrimSpace(metadataString(metadata, "serverProduct")))
+	if registeredProduct == "" {
+		registeredProduct = "minio"
+	}
 	details := map[string]any{
-		"checkedAt": time.Now().UTC().Format(time.RFC3339),
-		"topology":  normalizeTopology(req.Instance.Topology),
-		"apiPort":   instanceAPIPort(req.Instance),
-		"endpoint":  metadataString(appMetadata(req.Instance), "endpoint"),
+		"checkedAt":            time.Now().UTC().Format(time.RFC3339),
+		"topology":             normalizeTopology(req.Instance.Topology),
+		"apiPort":              instanceAPIPort(req.Instance),
+		"endpoint":             metadataString(metadata, "endpoint"),
+		"registeredProduct":    registeredProduct,
+		"registeredVersion":    req.Instance.Version,
+		"runtimeVersionStatus": "unknown",
 	}
 
 	fail := func(err error) (CheckResult, error) {
@@ -171,6 +198,14 @@ func (s Service) Check(ctx context.Context, req CheckRequest, log Logger, target
 		var checkErr error
 		runtime, checkErr = s.probeMinIORuntime(ctx, req.Server, req.Instance, logForServer)
 		mergeMinioDetails(details, runtime.details())
+		versionStatus := runtime.versionStatus(registeredProduct, req.Instance.Version)
+		details["runtimeVersionStatus"] = versionStatus
+		if checkErr == nil && versionStatus == "mismatch" {
+			return fmt.Errorf(copy.VersionMismatch, runtime.RuntimeProduct, runtime.RuntimeVersion, registeredProduct, req.Instance.Version)
+		}
+		if checkErr == nil && registeredProduct == "silo" && versionStatus == "unknown" {
+			return errors.New(copy.VersionUnverified)
+		}
 		return checkErr
 	}); err != nil {
 		return fail(err)
@@ -347,6 +382,8 @@ health_status="failed"
 service_status="unknown"
 port_status="unknown"
 runtime_source="none"
+runtime_product=""
+runtime_version_line=""
 storage_total=0
 storage_used=0
 storage_available=0
@@ -361,6 +398,24 @@ if command -v systemctl >/dev/null 2>&1; then
   else
     service_status="offline"
   fi
+fi
+if [ "$service_status" = "running" ] && command -v timeout >/dev/null 2>&1; then
+  for unit in "$SERVICE_NAME" "$LEGACY_SERVICE_NAME"; do
+    pid=$(systemctl show --property=MainPID --value "$unit" 2>/dev/null) || continue
+    case "$pid" in ''|0|*[!0-9]*) continue ;; esac
+    version_output=$(NO_COLOR=1 timeout 3 "/proc/$pid/exe" --version 2>/dev/null) ||
+      version_output=$(timeout 3 sudo -n env NO_COLOR=1 "/proc/$pid/exe" --version 2>/dev/null) || continue
+    # These executables use argv[0] as their product name, which is "exe" here.
+    if printf '%%s\n' "$version_output" | grep -Eq '^Modifications: Copyright [0-9-]+ PGSTY$'; then
+      runtime_product="silo"
+    elif printf '%%s\n' "$version_output" | grep -Eq '^Copyright: [0-9-]+ MinIO, Inc\.$'; then
+      runtime_product="minio"
+    else
+      continue
+    fi
+    runtime_version_line=$(printf '%%s\n' "$version_output" | awk 'NR == 1 && $2 == "version" && $3 ~ /^RELEASE\.[0-9-]+T[0-9-]+Z$/ { print $1, $2, $3 }')
+    break
+  done
 fi
 if command -v ss >/dev/null 2>&1; then
   if ss -ltn 2>/dev/null | awk '{print $4}' | grep -Eq '(^|[^0-9])'"$API_PORT"'$'; then
@@ -465,6 +520,8 @@ if [ "$runtime_status" = "available" ] && [ -x "$MC" ] && [ -r "$ENV_FILE" ]; th
   fi
 fi
 printf 'runtimeStatus=%%s\n' "$runtime_status"
+printf 'runtimeProduct=%%s\n' "$runtime_product"
+printf 'runtimeVersionLine=%%s\n' "$runtime_version_line"
 printf 'minioHealthStatus=%%s\n' "$health_status"
 printf 'minioServiceStatus=%%s\n' "$service_status"
 printf 'minioPortStatus=%%s\n' "$port_status"
@@ -559,6 +616,15 @@ func parseMinIORuntimeProbe(stdout string) minioRuntimeProbe {
 	}
 	if probe.RuntimeStatus == "" {
 		probe.RuntimeStatus = "unavailable"
+	}
+	product := values["runtimeProduct"]
+	fields := strings.Fields(values["runtimeVersionLine"])
+	if (product == "minio" || product == "silo") && len(fields) >= 3 && fields[1] == "version" {
+		if release, ok := strings.CutPrefix(fields[2], "RELEASE."); ok {
+			if _, err := time.Parse("2006-01-02T15-04-05Z", release); err == nil {
+				probe.RuntimeProduct, probe.RuntimeVersion = product, release
+			}
+		}
 	}
 	return probe
 }
@@ -712,7 +778,6 @@ func newCheckStepRunner(log Logger, recorder stepRecorder, target string, copy C
 }
 
 func (s Service) markInstanceStatus(instance store.AppInstance, status string, details map[string]any) error {
-	metadata := appMetadata(instance)
 	checkedAt := time.Now().UTC().Format(time.RFC3339)
 	if details == nil {
 		details = map[string]any{}
@@ -720,16 +785,14 @@ func (s Service) markInstanceStatus(instance store.AppInstance, status string, d
 	if _, ok := details["checkedAt"]; !ok {
 		details["checkedAt"] = checkedAt
 	}
-	metadata["lastCheck"] = map[string]any{
+	lastCheck := map[string]any{
 		"status":    status,
 		"checkedAt": checkedAt,
 		"details":   details,
 	}
-	data, _ := json.Marshal(metadata)
-	instance.Metadata = string(data)
-	instance.Status = status
-	_, err := s.store.SaveAppInstance(instance)
-	return err
+	return s.store.SaveAppInstanceObservation(instance, store.AppInstanceObservation{
+		Status: status, Metadata: map[string]any{"lastCheck": lastCheck},
+	})
 }
 
 func mergeMinioDetails(dst map[string]any, src map[string]any) {

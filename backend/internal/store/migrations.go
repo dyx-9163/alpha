@@ -281,6 +281,17 @@ var storeMigrations = []storeMigration{
 			return ensureColumnTx(tx, "tasks", "interrupted_by_restart", `alter table tasks add column interrupted_by_restart integer not null default 0`)
 		},
 	},
+	{
+		Version: 2026112503,
+		Name:    "silo offline upgrade checkpoints",
+		Up: func(tx *sql.Tx) error {
+			return execMigrationStatements(tx, `create table if not exists silo_offline_upgrade_checkpoints (
+				group_id text not null primary key,
+				task_id text not null,
+				nodes text not null
+			)`)
+		},
+	},
 }
 
 func runStoreMigrations(db *sql.DB) error {

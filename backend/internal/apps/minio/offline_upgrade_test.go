@@ -2,11 +2,18 @@ package minio
 
 import (
 	"context"
+	"crypto/sha256"
+	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
+	"path"
 	"reflect"
+	"regexp"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
 
 	"aifar-deployment/backend/internal/adapter"
@@ -16,20 +23,56 @@ import (
 
 type offlineUpgradeStore struct {
 	fakeStore
-	instances []store.AppInstance
-	saved     []store.AppInstance
-	saveErr   error
+	instances  []store.AppInstance
+	saved      []store.AppInstance
+	saveErr    error
+	checkpoint store.SiloOfflineUpgradeCheckpoint
 }
 
 func (s *offlineUpgradeStore) ListAppInstances() ([]store.AppInstance, error) {
 	return s.instances, nil
 }
 
-func (s *offlineUpgradeStore) SaveAppInstancesIfUnchanged(items []store.AppInstance) error {
+func (s *offlineUpgradeStore) GetSiloOfflineUpgradeCheckpoint(string) (store.SiloOfflineUpgradeCheckpoint, error) {
+	if s.checkpoint.TaskID == "" {
+		return s.checkpoint, sql.ErrNoRows
+	}
+	return s.checkpoint, nil
+}
+
+func (s *offlineUpgradeStore) CreateSiloOfflineUpgradeCheckpoint(_ string, checkpoint store.SiloOfflineUpgradeCheckpoint) error {
+	if s.checkpoint.TaskID != "" {
+		return store.ErrSiloOfflineUpgradeCheckpointConflict
+	}
+	s.checkpoint = checkpoint
+	return nil
+}
+
+func (s *offlineUpgradeStore) DiscardSiloOfflineUpgradeCheckpoint(_, taskID string) error {
+	if taskID != s.checkpoint.TaskID {
+		return store.ErrSiloOfflineUpgradeCheckpointConflict
+	}
+	s.checkpoint = store.SiloOfflineUpgradeCheckpoint{}
+	return nil
+}
+
+func (s *offlineUpgradeStore) CompleteSiloOfflineUpgrade(groupID, taskID string, updates []store.AppInstanceVersionUpdate) error {
 	if s.saveErr != nil {
 		return s.saveErr
 	}
-	s.saved = items
+	if err := s.DiscardSiloOfflineUpgradeCheckpoint(groupID, taskID); err != nil {
+		return err
+	}
+	for _, update := range updates {
+		item := update.Expected
+		item.Version = update.Version
+		raw, err := json.Marshal(update.Metadata)
+		if err != nil {
+			return err
+		}
+		item.Metadata = string(raw)
+		s.saved = append(s.saved, item)
+	}
 	return nil
 }
 
@@ -73,21 +116,69 @@ func TestResolveOfflineUpgradeGroupAcceptsSuccessfullyCheckedMembers(t *testing.
 }
 
 type offlineUpgradeRemote struct {
-	calls []string
-	fail  string
+	mu         sync.Mutex
+	calls      []string
+	commands   []string
+	states     map[string]offlineSiloState
+	probes     map[string]offlineFixtureProbe
+	fail       string
+	noDeadline bool
 }
 
-func (r *offlineUpgradeRemote) Run(_ context.Context, node store.Server, command string) (adapter.CommandResult, error) {
-	phase := strings.SplitN(command, "\n", 2)[0]
-	phase = strings.TrimPrefix(phase, "# aifar-silo ")
-	r.calls = append(r.calls, phase+":"+node.ID)
-	switch phase + ":" + node.ID {
-	case r.fail:
+func (r *offlineUpgradeRemote) Run(ctx context.Context, node store.Server, command string) (adapter.CommandResult, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, bounded := ctx.Deadline(); !bounded {
+		r.noDeadline = true
+	}
+	header := strings.SplitN(command, "\n", 2)[0]
+	if strings.HasPrefix(header, "# aifar-silo-probe ") {
+		return r.runProbe(node, command, strings.TrimPrefix(header, "# aifar-silo-probe "))
+	}
+	phase := strings.TrimPrefix(header, "# aifar-silo ")
+	event := phase + ":" + node.ID
+	r.calls = append(r.calls, event)
+	r.commands = append(r.commands, command)
+	if r.states == nil {
+		r.states = map[string]offlineSiloState{}
+	}
+	state := r.states[node.ID]
+	if state.runtime == "" {
+		state.runtime = "old-running"
+	}
+	defer func() { r.states[node.ID] = state }()
+	if phase == "start" {
+		state.startAttempted = true
+	}
+	if r.fail == event {
 		return adapter.CommandResult{Stderr: "SECRET REMOTE OUTPUT"}, errors.New("SECRET ERROR")
-	case "stage-dir:one", "stage-dir:two":
-		return adapter.CommandResult{Stdout: "/tmp/aifar-silo.ABCD1234\n"}, nil
 	}
 	switch phase {
+	case "stage-dir":
+		return adapter.CommandResult{Stdout: "/tmp/aifar-silo.ABCD1234\n"}, nil
+	case "state":
+		n := func(flag bool) int {
+			if flag {
+				return 1
+			}
+			return 0
+		}
+		return adapter.CommandResult{Stdout: fmt.Sprintf("AIFAR_SILO_STATE\t%s\t%d\t%d\t%d\t%d\t%d\n",
+			state.runtime, n(state.stopAttempted), n(state.backupComplete), n(state.switchAttempted), n(state.startAttempted), n(state.restoreAttempted))}, nil
+	case "stop":
+		state.stopAttempted, state.runtime = true, "old-stopped"
+	case "backup":
+		state.backupComplete = true
+	case "switch":
+		state.switchAttempted, state.runtime = true, "silo-stopped"
+	case "start":
+		state.runtime = "silo-running"
+	case "restore-minio":
+		state.restoreAttempted, state.runtime = true, "old-stopped"
+	case "start-old":
+		state.runtime = "old-running"
+	case "stop-for-recovery":
+		state.runtime = "silo-stopped"
 	case "before", "after":
 		peer := "one"
 		if node.ID == "one" {
@@ -102,9 +193,62 @@ func (r *offlineUpgradeRemote) Run(_ context.Context, node store.Server, command
 	return adapter.CommandResult{}, nil
 }
 
+type offlineFixtureProbe struct {
+	body    string
+	removed map[string]bool
+}
+
+var fixtureProbeArg = regexp.MustCompile(`'([^']*)'`)
+
+func (r *offlineUpgradeRemote) runProbe(node store.Server, command, phase string) (adapter.CommandResult, error) {
+	r.calls = append(r.calls, "probe:"+phase+":"+node.ID)
+	if phase == "retention" {
+		return adapter.CommandResult{Stdout: `{"status":"error","error":{"message":"Remote bucket ` + "`%s`" + ` does not support locking","cause":{"message":"","error":{}},"type":"fatal"}}`}, nil
+	}
+	for _, line := range strings.Split(command, "\n") {
+		args, _, ok := strings.Cut(line, "<<'AIFAR_SILO_REPLICATION_PROBE'")
+		if !ok {
+			continue
+		}
+		fields := fixtureProbeArg.FindAllStringSubmatch(args, -1)
+		if len(fields) != 6 {
+			break
+		}
+		url, bucket, key, value := fields[2][1], fields[3][1], fields[4][1], fields[5][1]
+		probeID := bucket + "/" + key
+		probe, found := r.probes[probeID]
+		const version = "ba91b4f1-7f39-4416-aea1-cf1560349709"
+		switch phase {
+		case "list":
+			if !found || probe.removed[node.ID] {
+				return adapter.CommandResult{}, nil
+			}
+			return adapter.CommandResult{Stdout: fmt.Sprintf(`{"status":"success","type":"file","key":%q,"versionId":%q,"isDeleteMarker":false,"url":%q}`, path.Base(key), version, url+"/"+probeID)}, nil
+		case "put":
+			if r.probes == nil {
+				r.probes = map[string]offlineFixtureProbe{}
+			}
+			r.probes[probeID] = offlineFixtureProbe{body: value, removed: map[string]bool{}}
+		case "stat":
+			return adapter.CommandResult{Stdout: fmt.Sprintf(`{"status":"success","versionID":%q,"replicationStatus":"REPLICA"}`, version)}, nil
+		case "hash":
+			return adapter.CommandResult{Stdout: fmt.Sprintf("%x\n", sha256.Sum256([]byte(probe.body)))}, nil
+		case "remove":
+			probe.removed[node.ID] = true
+		default:
+			return adapter.CommandResult{}, fmt.Errorf("unexpected probe phase %s", phase)
+		}
+		return adapter.CommandResult{}, nil
+	}
+	return adapter.CommandResult{}, errors.New("unexpected probe invocation")
+}
+
 func offlineUpgradeReplicationOutput(node, peer string) string {
 	return fmt.Sprintf(`{"status":"success","info":{"deploymentID":%q,"servers":[{"state":"online","drives":[{"state":"ok"}]}]}}
 {"status":"success","info":{"deploymentID":%q,"servers":[{"state":"online","drives":[{"state":"ok"}]}]}}
+AIFAR_SILO_BUCKET_INVENTORY_BEGIN
+{"status":"success","type":"folder","key":"aifar/"}
+AIFAR_SILO_BUCKET_INVENTORY_END
 {"status":"success","url":"aifar-local/aifar","versioning":{"status":"Enabled"}}
 {"status":"success","url":"","rule":{"ID":"rule","Status":"Enabled","Destination":{"Bucket":"arn:rule"}}}
 {"status":"success","url":"aifar-local/aifar","remoteTargets":[{"arn":"arn:rule","type":"replication","endpoint":"%s:9000","sourcebucket":"aifar","targetBucket":"aifar","isOnline":false,"lastOnline":"0001-01-01T00:00:00Z","credentials":{"secretKey":"secret"}}],"replicationstats":{"currStats":{"queued":{"curr":{"count":0,"bytes":0}}}}}
@@ -112,7 +256,7 @@ func offlineUpgradeReplicationOutput(node, peer string) string {
 }
 
 func TestOfflineUpgradeRejectsQueuedOrMisdirectedReplication(t *testing.T) {
-	meta, err := parseOfflineSiloMember(offlineUpgradeInstance("one", "two"))
+	meta, err := parseOfflineSiloMember(offlineUpgradeInstance("one", "two"), false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -132,22 +276,28 @@ func TestOfflineUpgradeRejectsQueuedOrMisdirectedReplication(t *testing.T) {
 	}
 }
 
-func (r *offlineUpgradeRemote) UploadFile(_ context.Context, node store.Server, _, _ string, _ os.FileMode) error {
+func (r *offlineUpgradeRemote) UploadFile(ctx context.Context, node store.Server, _, _ string, _ os.FileMode) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, bounded := ctx.Deadline(); !bounded {
+		r.noDeadline = true
+	}
 	r.calls = append(r.calls, "upload:"+node.ID)
 	return nil
 }
 
 func TestOfflineUpgradeGroupBarriersAndFailureRecovery(t *testing.T) {
 	for _, tt := range []struct {
-		name, fail  string
-		wantOrdered []string
+		name, fail   string
+		wantOrdered  []string
+		wantRecovery []string
 	}{
-		{"success", "", []string{"stop:one", "stop:two", "backup:one", "backup:two", "verify-backup:one", "verify-backup:two", "switch:one", "switch:two", "start:one", "start:two", "after:one", "after:two"}},
-		{"failed backup", "backup:two", []string{"backup:one", "backup:two", "restore-minio:one", "restore-minio:two", "start-old:one", "start-old:two"}},
-		{"failed verification", "verify-backup:two", []string{"verify-backup:one", "verify-backup:two", "restore-minio:one", "restore-minio:two", "start-old:one", "start-old:two"}},
-		{"failed Silo start", "start:two", []string{"start:one", "start:two", "stop-for-recovery:one", "stop-for-recovery:two"}},
-		{"changed replication rule", "changed rule", []string{"after:one", "after:two", "stop-for-recovery:one", "stop-for-recovery:two"}},
-		{"failed Panel version update", "panel save", []string{"after:one", "after:two"}},
+		{"success", "", []string{"stop:one", "stop:two", "backup:one", "backup:two", "verify-backup:one", "verify-backup:two", "switch:one", "switch:two", "start:one", "start:two", "after:one", "after:two"}, nil},
+		{"failed backup", "backup:two", []string{"backup:one", "backup:two"}, []string{"restore-minio:one", "restore-minio:two", "start-old:one", "start-old:two"}},
+		{"failed verification", "verify-backup:two", []string{"verify-backup:one", "verify-backup:two"}, []string{"restore-minio:one", "restore-minio:two", "start-old:one", "start-old:two"}},
+		{"failed Silo start", "start:two", []string{"start:one", "start:two"}, []string{"stop-for-recovery:one", "stop-for-recovery:two"}},
+		{"changed replication rule", "changed rule", []string{"after:one", "after:two"}, []string{"stop-for-recovery:one", "stop-for-recovery:two"}},
+		{"failed Panel version update", "panel save", []string{"after:one", "after:two"}, nil},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			first, second := offlineUpgradeInstance("one", "two"), offlineUpgradeInstance("two", "one")
@@ -177,6 +327,14 @@ func TestOfflineUpgradeGroupBarriersAndFailureRecovery(t *testing.T) {
 			}
 			if len(remaining) > 0 {
 				t.Fatalf("missing ordered calls %v after %v", remaining, remote.calls)
+			}
+			for _, event := range tt.wantRecovery {
+				if !slices.Contains(remote.calls, event) {
+					t.Fatalf("missing recovery call %s in %v", event, remote.calls)
+				}
+			}
+			if remote.noDeadline {
+				t.Fatal("migration remote call or upload ran without a deadline")
 			}
 			if tt.fail == "" {
 				if len(db.saved) != 2 || db.saved[0].Version != "20261112" || db.saved[1].Version != "20261112" {
